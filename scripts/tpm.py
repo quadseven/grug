@@ -512,6 +512,17 @@ def cmd_label_stale() -> int:
     exempt = {x.strip() for x in exempt_raw.split(",") if x.strip()}
     ops_cap = int(os.environ.get("STALE_OPS_PER_RUN", "30"))
 
+    # Ensure the label exists. `gh label create` fails if present, but we
+    # ignore that case — first run on a fresh repo creates it; subsequent
+    # runs no-op.
+    try:
+        _gh("label", "create", stale_label, "-R", repo,
+            "--color", "ededed",
+            "--description", f"Open ≥ {stale_days} days without activity. Auto-applied by Grug.")
+        print(f"created `{stale_label}` label on {repo}")
+    except RuntimeError:
+        pass  # already exists; harmless
+
     open_issues = _gh(
         "issue", "list", "-R", repo, "--state", "open",
         "--json", "number,title,updatedAt,labels",
