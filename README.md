@@ -60,10 +60,29 @@ jobs:
 3. `GITHUB_TOKEN` auto-provided.
 4. (Optional) Create label `grug-pulse` so the weekly issue is
    filterable; the workflow soft-warns + creates on first run if absent.
-5. (Optional) **Grugboard auto-add**: set `GRUGBOARD_PROJECT_TOKEN` env
-   secret (PAT with `project:write`). Pass through in the pulse caller
-   as `grugboard_pat`. Pulse issues land in the Grugboard "Triage"
-   column on issue creation. If unset, pulse just opens the issue.
+5. (Optional) **Project v2 auto-add**: pass your project's `owner` +
+   `number` (and a PAT with `project:write` as `project_pat`). Pulse
+   issues are added to that project on creation. If you also want them
+   to land in a specific column (e.g. "Triage"), pass
+   `project_status_field_id` + `project_status_option_id`.
+
+   ```yaml
+   with:
+     issue_label: "grug-pulse"
+     mode: "weekly"
+     project_owner: "<your-user-or-org>"
+     project_number: 1                          # /projects/<N> in URL
+     project_status_field_id: "PVTSSF_..."      # optional
+     project_status_option_id: "<option-id>"    # optional, paired
+   secrets:
+     poolside_api_key: ${{ secrets.POOLSIDE_API_KEY }}
+     project_pat: ${{ secrets.PROJECT_PAT }}
+   ```
+
+   Find field + option IDs via `gh project field-list <N> --owner <owner> --format json`.
+
+   If any of `project_owner` / `project_number` / `project_pat` is
+   unset, the project step no-ops (silent + safe).
 
 ## What Grug checks (Definition of Ready)
 
