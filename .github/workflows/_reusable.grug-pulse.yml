@@ -99,6 +99,10 @@ jobs:
           STATUS_FIELD_ID: PVTSSF_lAHOA4Uvvc4A8kYPzgwh4fE
           TRIAGE_OPTION_ID: 3e0a104b
         run: |
+          # Same set+e rationale as pr-gate wrapper: GitHub Actions runs
+          # with implicit `set -eo pipefail`. We branch on RC manually +
+          # always exit 0 (Grugboard add is best-effort, never blocks).
+          set +e
           set -uo pipefail
           if [[ -z "${GH_TOKEN}" ]]; then
             echo "Grugboard PAT not provided; skipping project add. Set 'grugboard_pat' secret to enable."
