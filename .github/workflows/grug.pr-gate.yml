@@ -18,6 +18,6 @@ jobs:
     name: Grug · self check
     uses: ./.github/workflows/_reusable.grug-pr-gate.yml
     with:
-      strict: false
+      strict: true
     secrets:
       poolside_api_key: ${{ secrets.POOLSIDE_API_KEY }}

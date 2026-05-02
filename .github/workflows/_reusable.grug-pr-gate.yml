@@ -78,10 +78,12 @@ jobs:
           PR_NUMBER: ${{ github.event.pull_request.number }}
           STRICT: ${{ inputs.strict }}
         run: |
+          # GitHub Actions runs `run:` with implicit `set -eo pipefail`.
+          # Setting just `-uo pipefail` does NOT clear `-e`, so the python
+          # call below would terminate the script before $? could be read.
+          # Explicitly disable -e here; we branch on RC manually.
+          set +e
           set -uo pipefail
-          # NOT using -e because we need to inspect $? and branch on
-          # exit code 1 (DoR fail; user-fixable) vs 2 (script crash;
-          # not user-fixable — degrade to soft warning).
           python grug/scripts/tpm.py pr-gate "$PR_NUMBER"
           RC=$?
           if [ "$RC" -eq 0 ]; then

@@ -22,3 +22,4 @@ jobs:
       mode: "weekly"
     secrets:
       poolside_api_key: ${{ secrets.POOLSIDE_API_KEY }}
+      grugboard_pat: ${{ secrets.GRUGBOARD_PROJECT_TOKEN }}

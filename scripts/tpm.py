@@ -320,9 +320,9 @@ def render_comment(checks: list[DoRCheck], llm_review: str | None) -> tuple[str,
     sections.extend(
         [
             "",
-            "<sub>Static checks are blocking. LLM read is advisory. "
-            "Re-runs on every push. Edit PR body, push empty commit, or "
-            "comment `/grug recheck` to re-trigger.</sub>",
+            "<sub>Static checks are blocking when caller sets "
+            "`strict: true`. LLM read is advisory. Re-runs on every push: "
+            "edit PR body or push an empty commit to re-trigger.</sub>",
         ]
     )
     return "\n".join(sections), overall_pass
