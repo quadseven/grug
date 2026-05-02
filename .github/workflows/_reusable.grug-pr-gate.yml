@@ -1,0 +1,100 @@
+name: Grug · PR-gate (reusable)
+
+# Reusable workflow — Definition-of-Ready check on PRs.
+#
+# Consumer repos add a thin caller workflow:
+#
+#   on:
+#     pull_request:
+#       types: [opened, edited, synchronize, ready_for_review]
+#   jobs:
+#     grug:
+#       uses: githumps/grug/.github/workflows/_reusable.grug-pr-gate.yml@main
+#       with:
+#         strict: true   # exit 1 on DoR fail (default true; set false for advisory-only)
+#       secrets:
+#         poolside_api_key: ${{ secrets.POOLSIDE_API_KEY }}
+#         gh_token: ${{ secrets.GITHUB_TOKEN }}
+#
+# Static DoR checks are always blocking (when strict=true). LLM review
+# from Poolside is advisory — falls back to "skipped" on rate-limit or
+# missing key.
+
+on:
+  workflow_call:
+    inputs:
+      strict:
+        description: "Block merge on DoR fail. False = advisory comment only."
+        required: false
+        type: boolean
+        default: true
+    secrets:
+      poolside_api_key:
+        description: "Poolside API key for Grug's LLM scope review (free tier)."
+        required: false
+      gh_token:
+        description: "GH token with PR read + comment write. Defaults to GITHUB_TOKEN."
+        required: false
+
+permissions:
+  contents: read
+  pull-requests: write
+  issues: write
+
+jobs:
+  grug-pr-gate:
+    name: Grug — Definition of Ready
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    # DD MEDIUM: scope secrets to a dedicated environment so an unrelated
+    # workflow on the same runner can't consume them. Consumer repos must
+    # create the `grug-bot` environment (no protection rules required;
+    # existence alone scopes the secret).
+    environment: grug-bot
+    steps:
+      - name: Checkout grug
+        uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+        with:
+          repository: githumps/grug
+          ref: main
+          path: grug
+          # grug is public — GITHUB_TOKEN of the caller repo can read it
+          # without a PAT. If we ever flip grug private, consumers must
+          # supply a PAT secret with `contents: read` on grug.
+
+      - name: Set up Python
+        uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065 # v5
+        with:
+          python-version: "3.13"
+
+      - name: Install OpenAI SDK
+        run: pip install --quiet "openai>=1.0,<2.0"
+
+      - name: Run Grug DoR check
+        env:
+          GH_TOKEN: ${{ secrets.gh_token != '' && secrets.gh_token || secrets.GITHUB_TOKEN }}
+          GH_REPOSITORY: ${{ github.repository }}
+          POOLSIDE_API_KEY: ${{ secrets.poolside_api_key }}
+          PR_NUMBER: ${{ github.event.pull_request.number }}
+          STRICT: ${{ inputs.strict }}
+        run: |
+          set -uo pipefail
+          # NOT using -e because we need to inspect $? and branch on
+          # exit code 1 (DoR fail; user-fixable) vs 2 (script crash;
+          # not user-fixable — degrade to soft warning).
+          python grug/scripts/tpm.py pr-gate "$PR_NUMBER"
+          RC=$?
+          if [ "$RC" -eq 0 ]; then
+            exit 0
+          elif [ "$RC" -eq 1 ]; then
+            if [ "${STRICT}" = "true" ]; then
+              echo "::error::Grug DoR check failed. See the sticky 'Grug — automated TPM check' comment on this PR for the failing checks. Edit PR body + push, or set strict=false in caller workflow."
+              exit 1
+            fi
+            echo "::warning::Grug DoR check failed (advisory only — strict=false)."
+            exit 0
+          else
+            # RC=2 or other: script crash, not user-fixable. Don't block merge.
+            echo "::warning::Grug script crashed (exit code $RC). DoR check skipped this run; not blocking merge."
+            exit 0
+          fi

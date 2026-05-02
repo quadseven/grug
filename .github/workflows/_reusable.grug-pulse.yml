@@ -1,0 +1,86 @@
+name: Grug · Pulse (reusable)
+
+# Scheduled iteration health summary. Caller workflow opens a daily /
+# weekly summary issue with the output. Cross-repo callable.
+#
+# Consumer caller:
+#
+#   on:
+#     schedule:
+#       - cron: '0 13 * * 1'   # Monday 13:00 UTC weekly groom signal
+#     workflow_dispatch:
+#   jobs:
+#     pulse:
+#       uses: githumps/grug/.github/workflows/_reusable.grug-pulse.yml@main
+#       with:
+#         issue_label: "grug-pulse"   # findable later
+#       secrets:
+#         gh_token: ${{ secrets.GITHUB_TOKEN }}
+#         poolside_api_key: ${{ secrets.POOLSIDE_API_KEY }}
+
+on:
+  workflow_call:
+    inputs:
+      issue_label:
+        description: "Label applied to the auto-created pulse issue. Use a single label so it's filterable."
+        required: false
+        type: string
+        default: "grug-pulse"
+      mode:
+        description: "Pulse mode: 'daily' (terse) or 'weekly' (full triage report). Caller sets via schedule cron."
+        required: false
+        type: string
+        default: "weekly"
+    secrets:
+      gh_token:
+        required: false
+      poolside_api_key:
+        required: false
+
+permissions:
+  contents: read
+  issues: write
+  # Pulse fetches open PRs to compute stuck-PR count; without this perm
+  # `gh pr list` returns 0 results and the pulse silently misses PRs.
+  pull-requests: read
+
+jobs:
+  grug-pulse:
+    name: Grug — iteration pulse
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    # DD MEDIUM: same `grug-bot` environment as the pr-gate job for
+    # secret-scope parity.
+    environment: grug-bot
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+        with:
+          repository: githumps/grug
+          ref: main
+          path: grug
+
+      - uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065 # v5
+        with:
+          python-version: "3.13"
+
+      - run: pip install --quiet "openai>=1.0,<2.0"
+
+      - name: Compute pulse + open issue
+        env:
+          GH_TOKEN: ${{ secrets.gh_token != '' && secrets.gh_token || secrets.GITHUB_TOKEN }}
+          GH_REPOSITORY: ${{ github.repository }}
+          POOLSIDE_API_KEY: ${{ secrets.poolside_api_key }}
+          PULSE_LABEL: ${{ inputs.issue_label }}
+          MODE: ${{ inputs.mode }}
+        run: |
+          set -euo pipefail
+          PULSE_BODY=$(python grug/scripts/tpm.py pulse)
+          DATE=$(date -u +%Y-%m-%d)
+          TITLE="Grug pulse · ${MODE} · ${DATE}"
+          echo "$PULSE_BODY" > /tmp/pulse.md
+          gh issue create \
+            --repo "$GH_REPOSITORY" \
+            --title "$TITLE" \
+            --body-file /tmp/pulse.md \
+            --label "$PULSE_LABEL" \
+            || echo "::warning::Failed to create pulse issue (label may not exist; will create on first manual run)"
