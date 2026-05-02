@@ -60,6 +60,10 @@ jobs:
 3. `GITHUB_TOKEN` auto-provided.
 4. (Optional) Create label `grug-pulse` so the weekly issue is
    filterable; the workflow soft-warns + creates on first run if absent.
+5. (Optional) **Grugboard auto-add**: set `GRUGBOARD_PROJECT_TOKEN` env
+   secret (PAT with `project:write`). Pass through in the pulse caller
+   as `grugboard_pat`. Pulse issues land in the Grugboard "Triage"
+   column on issue creation. If unset, pulse just opens the issue.
 
 ## What Grug checks (Definition of Ready)
 

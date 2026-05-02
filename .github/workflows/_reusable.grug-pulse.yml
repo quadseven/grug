@@ -36,6 +36,9 @@ on:
         required: false
       poolside_api_key:
         required: false
+      grugboard_pat:
+        description: "Optional PAT with project:write scope. If set, auto-adds the pulse issue to GitHub Project #1 (Grugboard) and lands it in the Triage column."
+        required: false
 
 permissions:
   contents: read
@@ -78,9 +81,39 @@ jobs:
           DATE=$(date -u +%Y-%m-%d)
           TITLE="Grug pulse · ${MODE} · ${DATE}"
           echo "$PULSE_BODY" > /tmp/pulse.md
-          gh issue create \
+          ISSUE_URL=$(gh issue create \
             --repo "$GH_REPOSITORY" \
             --title "$TITLE" \
             --body-file /tmp/pulse.md \
-            --label "$PULSE_LABEL" \
-            || echo "::warning::Failed to create pulse issue (label may not exist; will create on first manual run)"
+            --label "$PULSE_LABEL" 2>&1) \
+            || { echo "::warning::Failed to create pulse issue: $ISSUE_URL"; exit 0; }
+          echo "issue_url=$ISSUE_URL" >> "$GITHUB_OUTPUT"
+          echo "$ISSUE_URL" > /tmp/issue_url.txt
+        id: open_issue
+
+      - name: Land pulse issue on Grugboard (Triage column)
+        env:
+          GH_TOKEN: ${{ secrets.grugboard_pat }}
+          PROJECT_OWNER: githumps
+          PROJECT_NUMBER: 1
+          STATUS_FIELD_ID: PVTSSF_lAHOA4Uvvc4A8kYPzgwh4fE
+          TRIAGE_OPTION_ID: 3e0a104b
+        run: |
+          set -uo pipefail
+          if [[ -z "${GH_TOKEN}" ]]; then
+            echo "Grugboard PAT not provided; skipping project add. Set 'grugboard_pat' secret to enable."
+            exit 0
+          fi
+          ISSUE_URL=$(cat /tmp/issue_url.txt 2>/dev/null) || { echo "::warning::No issue URL captured; skipping Grugboard add."; exit 0; }
+          # Add to project + capture item id.
+          ITEM_ID=$(gh project item-add "$PROJECT_NUMBER" --owner "$PROJECT_OWNER" --url "$ISSUE_URL" --format json --jq '.id' 2>/dev/null) \
+            || { echo "::warning::Grugboard item-add failed (PAT may lack project:write or repo not in scope). Skipping."; exit 0; }
+          PROJECT_ID=$(gh project list --owner "$PROJECT_OWNER" --format json --jq ".projects[] | select(.number == $PROJECT_NUMBER) | .id")
+          gh project item-edit \
+            --id "$ITEM_ID" \
+            --project-id "$PROJECT_ID" \
+            --field-id "$STATUS_FIELD_ID" \
+            --single-select-option-id "$TRIAGE_OPTION_ID" \
+            >/dev/null 2>&1 \
+            || echo "::warning::Grugboard status set to Triage failed (added to project but column not set)."
+          echo "✓ Pulse issue landed on Grugboard Triage: $ISSUE_URL"
