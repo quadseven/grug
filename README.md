@@ -110,6 +110,23 @@ LLM scope review (advisory) — Poolside `laguna-m.1`:
 
 Grug is the **process gate**, not the **code review gate**.
 
+## Stale issue labelling
+
+Pulse also labels stale open issues by default (subsumes `actions/stale`
+so all TPM mutation lives in one bot). Tunable via caller inputs:
+
+```yaml
+with:
+  label_stale: true            # set false to disable
+  stale_days: 90               # threshold
+  stale_label: "stale"         # label name
+  stale_exempt_labels: "epic,pinned,security,grug-pulse"
+```
+
+Behavior is idempotent — already-stale issues skip; exempt-labelled
+issues skip; mutations cap at 30/run to stay under API limits. Never
+auto-closes anything.
+
 ## Degradation behavior
 
 Poolside outage / rate limit / missing key → LLM section shows
