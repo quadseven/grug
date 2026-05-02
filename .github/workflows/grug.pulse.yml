@@ -20,6 +20,13 @@ jobs:
     with:
       issue_label: "grug-pulse"
       mode: "weekly"
+      # Project auto-add (optional). Values below match the maintainer's
+      # Grugboard project; fork consumers can pass their own (or omit
+      # all four to skip auto-add).
+      project_owner: "githumps"
+      project_number: 1
+      project_status_field_id: "PVTSSF_lAHOA4Uvvc4A8kYPzgwh4fE"
+      project_status_option_id: "3e0a104b"   # Triage column
     secrets:
       poolside_api_key: ${{ secrets.POOLSIDE_API_KEY }}
-      grugboard_pat: ${{ secrets.GRUGBOARD_PROJECT_TOKEN }}
+      project_pat: ${{ secrets.GRUGBOARD_PROJECT_TOKEN }}
