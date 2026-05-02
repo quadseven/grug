@@ -1,0 +1,23 @@
+name: Grug · self DoR check
+
+# Self-host: PRs into this repo get the same DoR sweep we ship to
+# consumer repos. Calls reusable via relative path to avoid @main
+# resolution lag on the very repo that hosts main.
+
+on:
+  pull_request:
+    types: [opened, edited, synchronize, ready_for_review]
+
+permissions:
+  contents: read
+  pull-requests: write
+  issues: write
+
+jobs:
+  grug:
+    name: Grug · self check
+    uses: ./.github/workflows/_reusable.grug-pr-gate.yml
+    with:
+      strict: false
+    secrets:
+      poolside_api_key: ${{ secrets.POOLSIDE_API_KEY }}

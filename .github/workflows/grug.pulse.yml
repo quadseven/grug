@@ -1,0 +1,24 @@
+name: Grug · weekly self pulse
+
+# Mondays 13:00 UTC — opens an issue on this repo summarizing iteration
+# health. Calls reusable via relative path.
+
+on:
+  schedule:
+    - cron: '0 13 * * 1'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  issues: write
+  pull-requests: read
+
+jobs:
+  pulse:
+    name: Grug · self pulse
+    uses: ./.github/workflows/_reusable.grug-pulse.yml
+    with:
+      issue_label: "grug-pulse"
+      mode: "weekly"
+    secrets:
+      poolside_api_key: ${{ secrets.POOLSIDE_API_KEY }}
