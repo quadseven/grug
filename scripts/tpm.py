@@ -485,6 +485,101 @@ def cmd_pulse() -> int:
     return 0
 
 
+# ─── label-stale: per-issue mutator ──────────────────────────────────────
+
+
+def cmd_label_stale() -> int:
+    """Walk open issues; label each ≥ STALE_DAYS quiet with STALE_LABEL.
+
+    Idempotent: skips issues already carrying the stale label or any
+    label in STALE_EXEMPT_LABELS. Caps mutations at STALE_OPS_PER_RUN.
+
+    Subsumes the standalone `actions/stale` workflow so all TPM-side
+    mutation lives in Grug.
+    """
+    from datetime import datetime, timezone
+
+    repo = os.environ.get("GH_REPOSITORY", "")
+    if not repo:
+        print("ERROR: GH_REPOSITORY env unset", file=sys.stderr)
+        return 2
+
+    stale_days = int(os.environ.get("STALE_DAYS", "90"))
+    stale_label = os.environ.get("STALE_LABEL", "stale")
+    exempt_raw = os.environ.get(
+        "STALE_EXEMPT_LABELS", "epic,pinned,security,grug-pulse"
+    )
+    exempt = {x.strip() for x in exempt_raw.split(",") if x.strip()}
+    ops_cap = int(os.environ.get("STALE_OPS_PER_RUN", "30"))
+
+    # Ensure the label exists. `gh label create` fails if present, but we
+    # ignore that case — first run on a fresh repo creates it; subsequent
+    # runs no-op.
+    try:
+        _gh("label", "create", stale_label, "-R", repo,
+            "--color", "ededed",
+            "--description", f"Open ≥ {stale_days} days without activity. Auto-applied by Grug.")
+        print(f"created `{stale_label}` label on {repo}")
+    except RuntimeError:
+        pass  # already exists; harmless
+
+    open_issues = _gh(
+        "issue", "list", "-R", repo, "--state", "open",
+        "--json", "number,title,updatedAt,labels",
+        "--limit", "200",
+        json_out=True,
+    )
+
+    now = datetime.now(timezone.utc)
+    threshold_seconds = stale_days * 86400
+    labelled = 0
+    skipped_exempt = 0
+    skipped_already = 0
+    skipped_fresh = 0
+
+    for issue in open_issues:
+        if labelled >= ops_cap:
+            print(f"reached ops cap ({ops_cap}); deferring rest to next run")
+            break
+
+        label_names = {l["name"] for l in issue.get("labels", [])}
+        if stale_label in label_names:
+            skipped_already += 1
+            continue
+        if label_names & exempt:
+            skipped_exempt += 1
+            continue
+
+        updated = datetime.fromisoformat(issue["updatedAt"].replace("Z", "+00:00"))
+        if (now - updated).total_seconds() < threshold_seconds:
+            skipped_fresh += 1
+            continue
+
+        try:
+            _gh("issue", "edit", str(issue["number"]), "-R", repo,
+                "--add-label", stale_label)
+            comment = (
+                f"This issue has been quiet for {stale_days} days. "
+                f"Adding the `{stale_label}` label so triage views can sort it.\n\n"
+                "If still relevant: comment to refresh the activity timestamp + remove the label.\n"
+                "If obsolete: close with reason `not planned`.\n"
+                "If parking-lot: classify on the project board so it's visible in the long-term backlog view."
+            )
+            _gh("issue", "comment", str(issue["number"]), "-R", repo, "--body", comment)
+            labelled += 1
+            print(f"  labelled #{issue['number']}: {issue['title'][:60]}")
+        except RuntimeError as e:
+            # Single failure doesn't stop the sweep.
+            print(f"::warning::failed to label #{issue['number']}: {e}", file=sys.stderr)
+
+    print(
+        f"\nlabel-stale done — labelled={labelled} "
+        f"already-stale={skipped_already} exempt={skipped_exempt} "
+        f"fresh={skipped_fresh}"
+    )
+    return 0
+
+
 # ─── CLI dispatch ────────────────────────────────────────────────────────
 
 
@@ -493,13 +588,17 @@ def main(argv: list[str]) -> int:
 
     Exit-code contract (Sentry MEDIUM — caller workflow used to
     treat any non-zero exit as DoR fail):
-      0  — DoR pass (mode pr-gate) OR pulse complete (mode pulse)
+      0  — DoR pass (mode pr-gate) OR pulse complete (mode pulse) OR
+           stale-labelling complete (mode label-stale)
       1  — DoR fail (mode pr-gate ONLY); PR has fixable structural gaps
       2  — Unexpected script error (bad args, missing env, gh/poolside
            crash). Caller workflow MUST treat exit 2 differently from 1.
     """
     if len(argv) < 2:
-        print("usage: tpm.py {pr-gate <pr#> | pulse}", file=sys.stderr)
+        print(
+            "usage: tpm.py {pr-gate <pr#> | pulse | label-stale}",
+            file=sys.stderr,
+        )
         return 2
     mode = argv[1]
     try:
@@ -514,6 +613,8 @@ def main(argv: list[str]) -> int:
             return cmd_pr_gate(repo, int(argv[2]))
         if mode == "pulse":
             return cmd_pulse()
+        if mode == "label-stale":
+            return cmd_label_stale()
         print(f"unknown mode: {mode}", file=sys.stderr)
         return 2
     except Exception as e:

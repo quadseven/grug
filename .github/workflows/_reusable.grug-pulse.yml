@@ -31,6 +31,26 @@ on:
         required: false
         type: string
         default: "weekly"
+      label_stale:
+        description: "If true, runs label-stale before the pulse summary — labels open issues quiet ≥ stale_days with stale_label."
+        required: false
+        type: boolean
+        default: true
+      stale_days:
+        description: "Days of inactivity before an issue is considered stale."
+        required: false
+        type: number
+        default: 90
+      stale_label:
+        description: "Label to apply to stale issues."
+        required: false
+        type: string
+        default: "stale"
+      stale_exempt_labels:
+        description: "Comma-separated labels that exempt an issue from stale-labelling."
+        required: false
+        type: string
+        default: "epic,pinned,security,grug-pulse"
       project_owner:
         description: "GitHub user or org that owns the target Project v2 board. Required for project auto-add."
         required: false
@@ -87,6 +107,21 @@ jobs:
           python-version: "3.13"
 
       - run: pip install --quiet "openai>=1.0,<2.0"
+
+      - name: Label stale issues (subsumes actions/stale)
+        if: ${{ inputs.label_stale }}
+        env:
+          GH_TOKEN: ${{ secrets.gh_token != '' && secrets.gh_token || secrets.GITHUB_TOKEN }}
+          GH_REPOSITORY: ${{ github.repository }}
+          STALE_DAYS: ${{ inputs.stale_days }}
+          STALE_LABEL: ${{ inputs.stale_label }}
+          STALE_EXEMPT_LABELS: ${{ inputs.stale_exempt_labels }}
+        run: |
+          # Best-effort: never blocks pulse summary.
+          set +e
+          set -uo pipefail
+          python grug/scripts/tpm.py label-stale \
+            || echo "::warning::label-stale exited non-zero; pulse continues"
 
       - name: Compute pulse + open issue
         env:
