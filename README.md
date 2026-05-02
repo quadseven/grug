@@ -17,6 +17,7 @@ on:
 permissions:
   contents: read
   pull-requests: write
+  issues: write   # PR comments live under issues API
 jobs:
   grug:
     uses: githumps/grug/.github/workflows/_reusable.grug-pr-gate.yml@main
