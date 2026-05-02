@@ -60,18 +60,17 @@ jobs:
 3. `GITHUB_TOKEN` auto-provided.
 4. (Optional) Create label `grug-pulse` so the weekly issue is
    filterable; the workflow soft-warns + creates on first run if absent.
-5. (Optional) **Project v2 auto-add**: pass your project's `owner` +
-   `number` (and a PAT with `project:write` as `project_pat`). Pulse
-   issues are added to that project on creation. If you also want them
-   to land in a specific column (e.g. "Triage"), pass
+5. (Optional) **Project v2 auto-add**: pass your project's GraphQL node
+   ID (`project_id`) and a PAT with `project` scope (`project_pat`).
+   Pulse issues are added to that project on creation. If you also want
+   them to land in a specific column (e.g. "Triage"), pass
    `project_status_field_id` + `project_status_option_id`.
 
    ```yaml
    with:
      issue_label: "grug-pulse"
      mode: "weekly"
-     project_owner: "<your-user-or-org>"
-     project_number: 1                          # /projects/<N> in URL
+     project_id: "PVT_..."                      # GraphQL node ID
      project_status_field_id: "PVTSSF_..."      # optional
      project_status_option_id: "<option-id>"    # optional, paired
    secrets:
@@ -79,10 +78,19 @@ jobs:
      project_pat: ${{ secrets.PROJECT_PAT }}
    ```
 
-   Find field + option IDs via `gh project field-list <N> --owner <owner> --format json`.
+   **Find IDs:**
+   - `project_id`: `gh api graphql -f query='query{user(login:"<owner>"){projectV2(number:N){id}}}'`
+   - `project_status_field_id` + option IDs: `gh project field-list <N> --owner <owner> --format json` (works locally where gh CLI has interactive auth; for CI use direct GraphQL or copy the IDs)
 
-   If any of `project_owner` / `project_number` / `project_pat` is
-   unset, the project step no-ops (silent + safe).
+   **Why GraphQL IDs and not owner+number?** Earlier revision used
+   `gh project item-add --owner X --number N` which does an owner-type
+   detection probe inside gh CLI. That probe fails with `unknown owner type`
+   on classic PATs that have `project` scope but lack `read:user`/`read:org`.
+   Direct GraphQL mutations (`addProjectV2ItemById`) skip the probe — same
+   auth, fewer scope requirements.
+
+   If any of `project_id` / `project_pat` is unset, the project step
+   no-ops (silent + safe).
 
 ## What Grug checks (Definition of Ready)
 

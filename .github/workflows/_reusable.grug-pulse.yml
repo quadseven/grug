@@ -51,16 +51,11 @@ on:
         required: false
         type: string
         default: "epic,pinned,security,grug-pulse"
-      project_owner:
-        description: "GitHub user or org that owns the target Project v2 board. Required for project auto-add."
+      project_id:
+        description: "Project v2 GraphQL node ID (e.g. PVT_kwHOA4Uvvc4A8kYP). Required for project auto-add. Find via `gh api graphql -f query='query{user(login:\"<owner>\"){projectV2(number:N){id}}}'`."
         required: false
         type: string
         default: ""
-      project_number:
-        description: "Project v2 board number (the digit in the project URL: /projects/<N>)."
-        required: false
-        type: number
-        default: 0
       project_status_field_id:
         description: "Optional. Project v2 single-select field ID for Status. If both this and project_status_option_id are set, the pulse issue is moved to that column after add."
         required: false
@@ -149,45 +144,67 @@ jobs:
       - name: Auto-add pulse issue to Project v2 (optional)
         env:
           GH_TOKEN: ${{ secrets.project_pat }}
-          PROJECT_OWNER: ${{ inputs.project_owner }}
-          PROJECT_NUMBER: ${{ inputs.project_number }}
+          GH_REPOSITORY: ${{ github.repository }}
+          PROJECT_ID: ${{ inputs.project_id }}
           STATUS_FIELD_ID: ${{ inputs.project_status_field_id }}
           STATUS_OPTION_ID: ${{ inputs.project_status_option_id }}
         run: |
-          # Same set+e rationale as pr-gate wrapper: GitHub Actions runs
-          # with implicit `set -eo pipefail`. Branch on RC manually +
-          # always exit 0 (project add is best-effort, never blocks).
+          # Best-effort: never blocks pulse summary.
+          # Uses direct GraphQL (`gh api graphql`) instead of `gh project
+          # item-add` because the latter does an owner-type-detection probe
+          # that returns "unknown owner type" with classic PATs that have
+          # `project` scope but lack `read:user`. GraphQL mutations skip
+          # that probe — same auth, fewer scope requirements. Verified
+          # against PVT_kwHOA4Uvvc4A8kYP / GRUGBOARD_PROJECT_TOKEN.
           set +e
           set -uo pipefail
-          if [[ -z "${GH_TOKEN}" || -z "${PROJECT_OWNER}" || "${PROJECT_NUMBER}" == "0" ]]; then
-            echo "Project auto-add not configured; skipping. To enable, set inputs.project_owner + inputs.project_number on the caller and pass a PAT as secrets.project_pat."
+          if [[ -z "${GH_TOKEN}" || -z "${PROJECT_ID}" ]]; then
+            echo "Project auto-add not configured; skipping. To enable, set inputs.project_id on the caller and pass a PAT as secrets.project_pat."
             exit 0
           fi
           ISSUE_URL=$(cat /tmp/issue_url.txt 2>/dev/null) || { echo "::warning::No issue URL captured; skipping project add."; exit 0; }
-          # Capture stderr to surface real errors. Earlier `2>/dev/null` form
-          # masked PAT-scope misconfigurations behind a generic warning,
-          # making it impossible to distinguish "missing project:write"
-          # from "wrong owner/number" from "network error" without
-          # locally retrying.
-          ITEM_ADD_OUT=$(gh project item-add "$PROJECT_NUMBER" --owner "$PROJECT_OWNER" --url "$ISSUE_URL" --format json --jq '.id' 2>&1)
-          ITEM_ADD_RC=$?
-          if [[ $ITEM_ADD_RC -ne 0 ]]; then
-            echo "::warning::project item-add failed (rc=$ITEM_ADD_RC). Output: ${ITEM_ADD_OUT}"
+
+          # Resolve the issue's GraphQL node ID — needed as `contentId` on
+          # the addProjectV2ItemById mutation.
+          ISSUE_NUMBER=$(echo "$ISSUE_URL" | grep -oE '/issues/[0-9]+$' | grep -oE '[0-9]+$')
+          if [[ -z "$ISSUE_NUMBER" ]]; then
+            echo "::warning::Could not parse issue number from $ISSUE_URL"
             exit 0
           fi
-          ITEM_ID="$ITEM_ADD_OUT"
-          echo "✓ Pulse issue added to project ${PROJECT_OWNER}/${PROJECT_NUMBER}: $ISSUE_URL (item=$ITEM_ID)"
+          NODE_OUT=$(gh api "repos/${GH_REPOSITORY}/issues/${ISSUE_NUMBER}" --jq '.node_id' 2>&1)
+          NODE_RC=$?
+          if [[ $NODE_RC -ne 0 ]]; then
+            echo "::warning::issue node_id fetch failed (rc=$NODE_RC). Output: ${NODE_OUT}"
+            exit 0
+          fi
+          ISSUE_NODE_ID="$NODE_OUT"
+
+          # addProjectV2ItemById mutation. Returns the new item's id.
+          ADD_OUT=$(gh api graphql \
+            -f query='mutation($p:ID!,$c:ID!){addProjectV2ItemById(input:{projectId:$p,contentId:$c}){item{id}}}' \
+            -f p="$PROJECT_ID" \
+            -f c="$ISSUE_NODE_ID" \
+            --jq '.data.addProjectV2ItemById.item.id' 2>&1)
+          ADD_RC=$?
+          if [[ $ADD_RC -ne 0 ]]; then
+            echo "::warning::addProjectV2ItemById failed (rc=$ADD_RC). Output: ${ADD_OUT}"
+            exit 0
+          fi
+          ITEM_ID="$ADD_OUT"
+          echo "✓ Pulse issue added to project: $ISSUE_URL (item=$ITEM_ID)"
+
+          # Optional: move to specific status column.
           if [[ -n "${STATUS_FIELD_ID}" && -n "${STATUS_OPTION_ID}" ]]; then
-            PROJECT_ID=$(gh project list --owner "$PROJECT_OWNER" --format json --jq ".projects[] | select(.number == $PROJECT_NUMBER) | .id" 2>&1)
-            EDIT_OUT=$(gh project item-edit \
-              --id "$ITEM_ID" \
-              --project-id "$PROJECT_ID" \
-              --field-id "$STATUS_FIELD_ID" \
-              --single-select-option-id "$STATUS_OPTION_ID" 2>&1)
+            EDIT_OUT=$(gh api graphql \
+              -f query='mutation($p:ID!,$i:ID!,$f:ID!,$o:String!){updateProjectV2ItemFieldValue(input:{projectId:$p,itemId:$i,fieldId:$f,value:{singleSelectOptionId:$o}}){projectV2Item{id}}}' \
+              -f p="$PROJECT_ID" \
+              -f i="$ITEM_ID" \
+              -f f="$STATUS_FIELD_ID" \
+              -f o="$STATUS_OPTION_ID" 2>&1)
             EDIT_RC=$?
             if [[ $EDIT_RC -eq 0 ]]; then
               echo "✓ Status set on item."
             else
-              echo "::warning::Status field set failed (rc=$EDIT_RC). Output: ${EDIT_OUT}"
+              echo "::warning::updateProjectV2ItemFieldValue failed (rc=$EDIT_RC). Output: ${EDIT_OUT}"
             fi
           fi
