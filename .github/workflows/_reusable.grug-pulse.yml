@@ -164,17 +164,30 @@ jobs:
             exit 0
           fi
           ISSUE_URL=$(cat /tmp/issue_url.txt 2>/dev/null) || { echo "::warning::No issue URL captured; skipping project add."; exit 0; }
-          ITEM_ID=$(gh project item-add "$PROJECT_NUMBER" --owner "$PROJECT_OWNER" --url "$ISSUE_URL" --format json --jq '.id' 2>/dev/null) \
-            || { echo "::warning::project item-add failed (PAT may lack project:write, or owner/number wrong). Skipping."; exit 0; }
-          echo "✓ Pulse issue added to project ${PROJECT_OWNER}/${PROJECT_NUMBER}: $ISSUE_URL"
+          # Capture stderr to surface real errors. Earlier `2>/dev/null` form
+          # masked PAT-scope misconfigurations behind a generic warning,
+          # making it impossible to distinguish "missing project:write"
+          # from "wrong owner/number" from "network error" without
+          # locally retrying.
+          ITEM_ADD_OUT=$(gh project item-add "$PROJECT_NUMBER" --owner "$PROJECT_OWNER" --url "$ISSUE_URL" --format json --jq '.id' 2>&1)
+          ITEM_ADD_RC=$?
+          if [[ $ITEM_ADD_RC -ne 0 ]]; then
+            echo "::warning::project item-add failed (rc=$ITEM_ADD_RC). Output: ${ITEM_ADD_OUT}"
+            exit 0
+          fi
+          ITEM_ID="$ITEM_ADD_OUT"
+          echo "✓ Pulse issue added to project ${PROJECT_OWNER}/${PROJECT_NUMBER}: $ISSUE_URL (item=$ITEM_ID)"
           if [[ -n "${STATUS_FIELD_ID}" && -n "${STATUS_OPTION_ID}" ]]; then
-            PROJECT_ID=$(gh project list --owner "$PROJECT_OWNER" --format json --jq ".projects[] | select(.number == $PROJECT_NUMBER) | .id")
-            gh project item-edit \
+            PROJECT_ID=$(gh project list --owner "$PROJECT_OWNER" --format json --jq ".projects[] | select(.number == $PROJECT_NUMBER) | .id" 2>&1)
+            EDIT_OUT=$(gh project item-edit \
               --id "$ITEM_ID" \
               --project-id "$PROJECT_ID" \
               --field-id "$STATUS_FIELD_ID" \
-              --single-select-option-id "$STATUS_OPTION_ID" \
-              >/dev/null 2>&1 \
-              && echo "✓ Status set on item." \
-              || echo "::warning::Status field set failed (added to project but column not moved)."
+              --single-select-option-id "$STATUS_OPTION_ID" 2>&1)
+            EDIT_RC=$?
+            if [[ $EDIT_RC -eq 0 ]]; then
+              echo "✓ Status set on item."
+            else
+              echo "::warning::Status field set failed (rc=$EDIT_RC). Output: ${EDIT_OUT}"
+            fi
           fi
