@@ -1,4 +1,4 @@
-"""Grug — automated TPM for Grugboard-managed projects.
+"""Grug — automated TPM bot for GitHub PRs + iteration pulse.
 
 Two modes:
   pr-gate <pr-number>      Check a PR against the Definition of Ready.
@@ -8,7 +8,6 @@ Reads:
   - GH_TOKEN env (or auth via `gh auth status` from runner)
   - POOLSIDE_API_KEY env (LLM reasoning; if unset → static checks only)
   - GH_REPOSITORY env (owner/repo)
-  - GRUGBOARD_PROJECT (default 1, the user's "Grugboard" project)
 
 Writes:
   - PR-gate: sticky comment on PR + sets check status (via exit code)
@@ -223,9 +222,9 @@ def poolside_review(pr: dict[str, Any]) -> str | None:
     prompt = textwrap.dedent(
         f"""
         You are Grug, an automated TPM bot that reviews PRs for a solo
-        developer's project board (Grugboard). Your job is NOT to review
-        code correctness — that's Sentry's job. Your job is to flag
-        process/scope issues:
+        or small-team project board. Your job is NOT to review code
+        correctness — that's Sentry's / Seer's / DD's job. Your job is
+        to flag process/scope issues:
 
         - Is the PR scope sane? (XL = should be split; <3 file changes
           but described as L = inflated estimate)
