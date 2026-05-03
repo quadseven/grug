@@ -19,5 +19,9 @@ jobs:
     uses: ./.github/workflows/_reusable.grug-pr-gate.yml
     with:
       strict: true
+      # Self-test: run the PR's branch script, not main, so PR-branch
+      # changes to tpm.py / render_comment / etc. are visible BEFORE
+      # merge instead of being invisible until they're already shipped.
+      script_ref: ${{ github.head_ref }}
     secrets:
       poolside_api_key: ${{ secrets.POOLSIDE_API_KEY }}

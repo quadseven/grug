@@ -150,10 +150,17 @@ def static_dor_checks(pr: dict[str, Any]) -> list[DoRCheck]:
         )
     )
 
-    # 5. Linked issue
+    # 5. Linked issue. Accept either:
+    #   - Closing keyword: `closes #N`, `fixes #N`, `resolves #N` (any case)
+    #   - Plain reference: `refs #N`, `see #N`, `(#N)`, or bare `#N`
+    # Earlier `\b#\d{2,}\b` failed on standalone `#16` because `#` is a
+    # non-word char + leading space is non-word → no `\b` between them.
+    # Use `(?<!\w)#\d+\b` (negative-lookbehind for word) so we DON'T
+    # match `bug#16`-style accidental SHA-prefix collisions while still
+    # matching real-world `refs #16` / ` #16 ` / `(#16)`.
     has_link = bool(
         re.search(r"\b(closes|fixes|resolves)\s+#\d+", body, re.IGNORECASE)
-        or re.search(r"\b#\d{2,}\b", body)
+        or re.search(r"(?<!\w)#\d+\b", body)
     )
     checks.append(
         DoRCheck(
@@ -376,12 +383,18 @@ def render_comment(
     avatar = GRUG_AVATAR_HAPPY if overall_pass else GRUG_AVATAR_ANGRY
     alt = "Grug (happy)" if overall_pass else "Grug (angry)"
 
+    def _pluralize(n: int, singular: str) -> str:
+        return f"{n} {singular}{'' if n == 1 else 's'}"
+
     icon = "✅" if overall_pass else "❌"
-    headline = (
+    headline_parts = [
         f"{icon} **Definition of Ready** — {len(checks) - fail_count - warn_count}/{len(checks)} pass"
-        f"{f', {fail_count} blocking' if fail_count else ''}"
-        f"{f', {warn_count} warnings' if warn_count else ''}"
-    )
+    ]
+    if fail_count:
+        headline_parts.append(_pluralize(fail_count, "blocking"))
+    if warn_count:
+        headline_parts.append(_pluralize(warn_count, "warning"))
+    headline = ", ".join(headline_parts)
 
     rows = [
         f"| {'✅' if c.passed else ('⚠️' if c.name in ('scope-fence', 'issue-link') else '❌')} | "

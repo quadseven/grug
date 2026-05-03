@@ -28,6 +28,15 @@ on:
         required: false
         type: boolean
         default: true
+      script_ref:
+        description: |
+          Ref of `githumps/grug` to check out for the script. Defaults to
+          `main`. Override to the PR's head ref when grug self-checks
+          itself so PR-branch script changes can be tested before merge
+          (avoids the bootstrap problem where `@main` always wins).
+        required: false
+        type: string
+        default: "main"
     secrets:
       poolside_api_key:
         description: "Poolside API key for Grug's LLM scope review (free tier)."
@@ -56,7 +65,7 @@ jobs:
         uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
         with:
           repository: githumps/grug
-          ref: main
+          ref: ${{ inputs.script_ref }}
           path: grug
           # grug is public — GITHUB_TOKEN of the caller repo can read it
           # without a PAT. If we ever flip grug private, consumers must
