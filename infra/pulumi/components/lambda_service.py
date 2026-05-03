@@ -156,7 +156,17 @@ def create(
         environment=aws.lambda_.FunctionEnvironmentArgs(
             variables=env_vars,
         ),
-        tags={"app": "grug", "service": name},
+        # `env` tag is what DD monitors filter on (matches DD_ENV).
+        # Lambda CloudWatch metrics propagate the resource's `env` tag
+        # to DD, so without it `aws.lambda.duration{env:dev}` returns
+        # zero series. Sourced from GRUG_ENV env var which Lambda always
+        # gets (set in __main__.py).
+        tags={
+            "app": "grug",
+            "service": name,
+            "env": env_vars.get("GRUG_ENV", "unknown"),
+            "team": "grug",
+        },
     )
 
     # Lambda Function URL CORS — preflight handled by AWS *before* the
