@@ -279,16 +279,60 @@ def poolside_review(pr: dict[str, Any]) -> str | None:
 
 
 GRUG_MARKER = "<!-- grug-tpm-bot:sticky -->"
-GRUG_AVATAR = (
+GRUG_AVATAR_HAPPY = (
     "https://raw.githubusercontent.com/githumps/grug/main/assets/grug.png"
 )
+GRUG_AVATAR_ANGRY = (
+    "https://raw.githubusercontent.com/githumps/grug/main/assets/grug-angry.png"
+)
+# Per-state state-tag stamped into the sticky comment so subsequent runs can
+# detect transitions (was-failing -> now-passing) and surface a "resolved"
+# banner. Stays inside an HTML comment so it doesn't render to the user.
+_STATE_TAG_RE = re.compile(r"<!-- grug-state:(pass|fail) -->")
 
 
-def render_comment(checks: list[DoRCheck], llm_review: str | None) -> tuple[str, bool]:
-    """Return (markdown body, all-pass)."""
+def _previous_state(repo: str, pr_number: int) -> str | None:
+    """Return prior `pass` / `fail` from the existing sticky comment, or None
+    if no comment exists yet (first run on this PR)."""
+    existing = find_existing_comment(repo, pr_number)
+    if not existing:
+        return None
+    try:
+        body = _gh(
+            "api",
+            f"repos/{repo}/issues/comments/{existing}",
+            "--jq",
+            ".body",
+        ).strip()
+    except RuntimeError:
+        return None
+    m = _STATE_TAG_RE.search(body)
+    return m.group(1) if m else None
+
+
+def render_comment(
+    checks: list[DoRCheck],
+    llm_review: str | None,
+    *,
+    prior_state: str | None = None,
+) -> tuple[str, bool]:
+    """Return (markdown body, all-pass).
+
+    `prior_state` is `pass` / `fail` / `None` from the previous sticky
+    comment (so we can render a "resolved — back to happy" banner on the
+    fail->pass transition). When `None`, treat as first run + skip the
+    banner.
+    """
     fail_count = sum(1 for c in checks if not c.passed and c.name != "scope-fence" and c.name != "issue-link")
     warn_count = sum(1 for c in checks if not c.passed and (c.name == "scope-fence" or c.name == "issue-link"))
     overall_pass = fail_count == 0
+    state_tag = "pass" if overall_pass else "fail"
+
+    # Avatar swaps with mood. Happy on pass (warnings still pass), angry
+    # on blocking-fail. Same image renders to ~80px so file size of the
+    # angry asset doesn't matter for PR comment perf.
+    avatar = GRUG_AVATAR_HAPPY if overall_pass else GRUG_AVATAR_ANGRY
+    alt = "Grug (happy)" if overall_pass else "Grug (angry)"
 
     icon = "✅" if overall_pass else "❌"
     headline = (
@@ -304,16 +348,37 @@ def render_comment(checks: list[DoRCheck], llm_review: str | None) -> tuple[str,
     ]
     table = "| | Check | Detail |\n|---|---|---|\n" + "\n".join(rows)
 
-    sections = [
-        GRUG_MARKER,
-        f'<img src="{GRUG_AVATAR}" width="80" align="right" alt="Grug">',
-        "",
-        "## Grug — automated TPM check",
-        "",
-        headline,
-        "",
-        table,
-    ]
+    # Transition banner: prior fail -> now pass surfaces a "resolved"
+    # callout above the headline so reviewers notice the flip without
+    # re-reading the entire comment. Pass->fail (regression) gets its
+    # own callout. No banner on first run or pass->pass / fail->fail.
+    transition_banner: str | None = None
+    if prior_state == "fail" and overall_pass:
+        transition_banner = (
+            "> ✨ **Resolved.** Grug back to happy — all blocking checks now pass. "
+            "Previous failures fixed in the latest push."
+        )
+    elif prior_state == "pass" and not overall_pass:
+        transition_banner = (
+            "> 💢 **Regressed.** Grug got upset — at least one previously-passing "
+            "blocking check is now failing. Edit the PR body + push to fix."
+        )
+
+    sections: list[str] = [GRUG_MARKER, f"<!-- grug-state:{state_tag} -->"]
+    if transition_banner:
+        sections.extend(["", transition_banner])
+    sections.extend(
+        [
+            "",
+            f'<img src="{avatar}" width="80" align="right" alt="{alt}">',
+            "",
+            "## Grug — automated TPM check",
+            "",
+            headline,
+            "",
+            table,
+        ]
+    )
     if llm_review:
         sections.extend(["", "### Grug's read on scope", "", llm_review.strip()])
     sections.extend(
@@ -400,7 +465,10 @@ def cmd_pr_gate(repo: str, pr_number: int, post_comment: bool = True) -> int:
     pr = fetch_pr(repo, pr_number)
     checks = static_dor_checks(pr)
     llm_review = poolside_review(pr)
-    body, ok = render_comment(checks, llm_review)
+    # Read prior state BEFORE we render so the transition banner can fire.
+    # Done here (not in render) to keep render_comment pure for testability.
+    prior_state = _previous_state(repo, pr_number) if post_comment else None
+    body, ok = render_comment(checks, llm_review, prior_state=prior_state)
     print(body)
     if post_comment:
         upsert_comment(repo, pr_number, body)
