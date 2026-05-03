@@ -12,6 +12,7 @@ on:
     branches:
       - main
       - 'feat/22-*'
+      - 'feat/23-*'
     tags: ['v*']
   workflow_dispatch:
     inputs:
@@ -90,26 +91,30 @@ jobs:
             docker login --username AWS --password-stdin \
             ${{ vars.AWS_ACCOUNT_ID }}.dkr.ecr.us-east-1.amazonaws.com
 
-      - name: Build + push webhook image
+      - name: Build + push webhook + api images
         id: build
         run: |
           IMAGE_TAG="${GITHUB_SHA::8}"
-          REPO="${{ vars.AWS_ACCOUNT_ID }}.dkr.ecr.us-east-1.amazonaws.com/grug-webhook"
+          ECR="${{ vars.AWS_ACCOUNT_ID }}.dkr.ecr.us-east-1.amazonaws.com"
+
           # Lambda Image-mode rejects OCI media types + buildx provenance
           # attestations. Force Docker manifest schema 2 + disable
           # attestations so the manifest is a single arm64 image, not a
           # provenance-wrapped manifest list.
-          docker buildx build \
-            --platform linux/arm64 \
-            --provenance=false \
-            --sbom=false \
-            --file services/webhook/Dockerfile.lambda \
-            --build-arg DD_GIT_REPOSITORY_URL=https://github.com/${{ github.repository }} \
-            --build-arg DD_GIT_COMMIT_SHA=${{ github.sha }} \
-            --tag "$REPO:$IMAGE_TAG" \
-            --tag "$REPO:latest" \
-            --push \
-            services/webhook
+          for service in webhook api; do
+            REPO="$ECR/grug-$service"
+            docker buildx build \
+              --platform linux/arm64 \
+              --provenance=false \
+              --sbom=false \
+              --file services/$service/Dockerfile.lambda \
+              --build-arg DD_GIT_REPOSITORY_URL=https://github.com/${{ github.repository }} \
+              --build-arg DD_GIT_COMMIT_SHA=${{ github.sha }} \
+              --tag "$REPO:$IMAGE_TAG" \
+              --tag "$REPO:latest" \
+              --push \
+              "services/$service"
+          done
           echo "tag=$IMAGE_TAG" >> $GITHUB_OUTPUT
 
       - uses: pulumi/actions@v6
@@ -119,3 +124,9 @@ jobs:
           work-dir: infra/pulumi
           config-map: |
             webhook_image_tag: { value: "${{ steps.build.outputs.tag }}" }
+            api_image_tag:     { value: "${{ steps.build.outputs.tag }}" }
+
+      - name: Deploy CF Workers (host-rewrite proxies)
+        run: bash infra/cloudflare/deploy.sh
+        env:
+          PULUMI_CWD: infra/pulumi
