@@ -1,6 +1,4 @@
-import { useState } from "react";
-import { Link, useNavigate } from "react-router-dom";
-import { useQueryClient } from "@tanstack/react-query";
+import { Link } from "react-router-dom";
 import { useMe } from "../lib/me";
 import { API_BASE } from "../lib/api";
 
@@ -20,7 +18,12 @@ export function Shell({ children }: { children: React.ReactNode }) {
                 <Link to="/admin" className="text-stone-300 hover:text-amber-400">admin</Link>
               )}
               <span className="text-stone-500 font-mono text-xs">{me.data.login}</span>
-              <SignOutButton />
+              <a
+                href={`${API_BASE}/api/v1/auth/logout`}
+                className="text-stone-500 hover:text-amber-400"
+              >
+                sign out
+              </a>
             </>
           ) : (
             <Link to="/signin" className="text-amber-400 hover:underline">sign in</Link>
@@ -32,34 +35,5 @@ export function Shell({ children }: { children: React.ReactNode }) {
         grug boss · open source · agpl-3.0
       </footer>
     </div>
-  );
-}
-
-// API defines logout as POST; an `<a href>` triggers GET → 405. Use
-// fetch to issue the POST, then navigate. Codex post-review #56.
-function SignOutButton() {
-  const nav = useNavigate();
-  const qc = useQueryClient();
-  const [pending, setPending] = useState(false);
-  return (
-    <button
-      type="button"
-      disabled={pending}
-      onClick={async () => {
-        setPending(true);
-        try {
-          await fetch(`${API_BASE}/api/v1/auth/logout`, {
-            method: "POST",
-            credentials: "include",
-          });
-        } finally {
-          await qc.invalidateQueries({ queryKey: ["me"] });
-          nav("/", { replace: true });
-        }
-      }}
-      className="text-stone-500 hover:text-amber-400 disabled:opacity-50"
-    >
-      {pending ? "signing out…" : "sign out"}
-    </button>
   );
 }
