@@ -120,3 +120,48 @@ def test_record_idempotent(_ddb_table):
             installed_by_user_id=200,
         )
     assert mod.get_installation(10)["account_login"] == "bob"
+
+
+# Slice 7 (#28) — per-repo persona toggles
+
+
+def test_list_user_installations_via_gsi1(_ddb_table):
+    mod = _ddb_table
+    mod.record_installation(install_id=1, account_login="a", account_type="User",
+                            installed_by_user_id=100)
+    mod.record_installation(install_id=2, account_login="b", account_type="User",
+                            installed_by_user_id=100)
+    mod.record_installation(install_id=3, account_login="c", account_type="User",
+                            installed_by_user_id=999)
+    rows = mod.list_user_installations("100")
+    ids = sorted(int(r["PK"].split("#")[1]) for r in rows)
+    assert ids == [1, 2]
+
+
+def test_repo_config_default_is_tpm_enabled_true(_ddb_table):
+    mod = _ddb_table
+    cfg = mod.get_repo_config(install_id=1, repo_id=42)
+    assert cfg == {"tpm_enabled": True}
+
+
+def test_set_then_get_repo_config(_ddb_table):
+    mod = _ddb_table
+    mod.set_repo_config(install_id=1, repo_id=42, repo_full_name="x/y",
+                        tpm_enabled=False, updated_by_user_id="100")
+    assert mod.get_repo_config(1, 42) == {"tpm_enabled": False}
+
+
+def test_is_persona_enabled_default_true(_ddb_table):
+    assert _ddb_table.is_persona_enabled(1, 42, "tpm") is True
+
+
+def test_is_persona_enabled_after_disable(_ddb_table):
+    mod = _ddb_table
+    mod.set_repo_config(install_id=1, repo_id=42, repo_full_name="x/y",
+                        tpm_enabled=False, updated_by_user_id="100")
+    assert mod.is_persona_enabled(1, 42, "tpm") is False
+
+
+def test_is_persona_enabled_unknown_persona_defaults_true(_ddb_table):
+    """v1 default policy: unrecognized personas don't gate via this fn."""
+    assert _ddb_table.is_persona_enabled(1, 42, "release-manager") is True

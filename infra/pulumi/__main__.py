@@ -226,6 +226,14 @@ api_lambda = lambda_service.create(
     },
     timeout_seconds=15,
     memory_mb=512,
+    # SPA at https://grug.lol calls api.grug.lol with credentials cookie.
+    # Browser rejects wildcard origin when credentials=True, so the
+    # apex must be enumerated. Methods enumerated to match every verb
+    # FastAPI routers expose (Slice 7 #28 added PUT for repo config).
+    cors_allow_origins=[f"https://{domain}"],
+    cors_allow_methods=["GET", "POST", "PUT", "DELETE"],
+    cors_allow_headers=["content-type", "authorization"],
+    cors_allow_credentials=True,
 )
 
 # Per IAM split (Slice 2 acceptance criterion): api Lambda CAN decrypt
