@@ -81,18 +81,34 @@ If missing (somatic-scripts deploys should have created it), Pulumi will create 
 
 ## 5. Cloudflare API token for Pulumi
 
-Pulumi's `cloudflare` provider needs a token. Create one at <https://dash.cloudflare.com/profile/api-tokens>:
+Pulumi's `cloudflare` provider, the worker-deploy script, AND the
+Pages-bootstrap script all read the same token from
+SSM `/grug/cloudflare-api-token`. Create one at <https://dash.cloudflare.com/profile/api-tokens>
+with these permissions (combine into a single token — adding a
+permission to an existing token is faster than rotating):
 
-- Permissions: `Zone:DNS:Edit` for `grug.lol`
-- Account resources: include the account that owns `grug.lol`
+| Scope | Permission | Why |
+|---|---|---|
+| Zone | DNS:Edit (grug.lol) | Pulumi creates `webhook.grug.lol` + `api.grug.lol` CNAMEs |
+| Account | Workers Scripts:Edit | `infra/cloudflare/deploy.sh` PUTs the host-rewrite Workers |
+| Account | Workers Routes:Edit | same script binds `webhook.grug.lol/*` + `api.grug.lol/*` to the workers |
+| Account | Cloudflare Pages:Edit | `infra/cloudflare/pages-bootstrap.sh` creates the `grug-web` project + binds apex `grug.lol`; `web.deploy.yml` calls `wrangler pages deploy` |
 
-Save it locally (do NOT commit) and set as Pulumi config:
+Save under SSM SecureString:
 
 ```bash
-cd infra/pulumi
-pulumi config set --secret cloudflare:apiToken <token>
-pulumi config set cloudflare_zone_id <zone-id-for-grug.lol>
+aws ssm put-parameter --region us-east-1 \
+  --name /grug/cloudflare-api-token --type SecureString --value "<token>"
+aws ssm put-parameter --region us-east-1 \
+  --name /grug/cloudflare-account-id --type String --value "<account-id>"
+aws ssm put-parameter --region us-east-1 \
+  --name /grug/cloudflare-zone-id --type String --value "<zone-id-for-grug.lol>"
 ```
+
+After token is in SSM, run `infra/cloudflare/pages-bootstrap.sh` ONCE
+to create the Pages project + apex domain binding (idempotent — safe
+to re-run if you forget). After that, the `web.deploy.yml` workflow
+handles every subsequent build/deploy via `wrangler pages deploy`.
 
 ## When done
 
