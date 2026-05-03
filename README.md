@@ -1,7 +1,20 @@
-# Grug — automated TPM bot
+# Grug
 
-Runs Definition-of-Ready checks on PRs + scheduled iteration pulse.
-Cross-repo callable via two reusable workflows in this repo.
+Modular GitHub bot. Different personas across the SDLC — TPM today
+(Definition-of-Ready check + scheduled iteration pulse), with code-reviewer,
+release-manager, and stuck-PR-pulse personas planned.
+
+Two consumption surfaces (in transition):
+
+1. **Hosted SaaS at `grug.lol` (preferred — under construction):** install
+   the `Grug Boss` GitHub App once at your account, get every persona
+   on every repo automatically. PRD #21 + slice issues #22-#34 track v1.
+2. **Reusable GitHub Actions workflow (legacy):** drop a caller workflow
+   into each repo (described below). Deprecated when SaaS ships;
+   self-hosters keep this path via AGPL-3.0.
+
+For the SaaS path, see `docs/RUNBOOK.md` (operations) and
+`docs/HITL_PREREQUISITES.md` (one-time setup).
 
 ## Quick start (consumer repo)
 
@@ -121,7 +134,7 @@ Grug is the **process gate**, not the **code review gate**.
 ## Stale issue labelling
 
 Pulse also labels stale open issues by default (subsumes `actions/stale`
-so all TPM mutation lives in one bot). Tunable via caller inputs:
+so all backlog grooming lives in one bot). Tunable via caller inputs:
 
 ```yaml
 with:

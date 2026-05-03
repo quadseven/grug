@@ -99,7 +99,7 @@ jobs:
             exit 0
           elif [ "$RC" -eq 1 ]; then
             if [ "${STRICT}" = "true" ]; then
-              echo "::error::Grug DoR check failed. See the sticky 'Grug — automated TPM check' comment on this PR for the failing checks. Edit PR body + push, or set strict=false in caller workflow."
+              echo "::error::Grug DoR check failed. See the sticky 'Grug · TPM · DoR check' comment on this PR for the failing checks. Edit PR body + push, or set strict=false in caller workflow."
               exit 1
             fi
             echo "::warning::Grug DoR check failed (advisory only — strict=false)."

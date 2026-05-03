@@ -1,0 +1,17 @@
+[project]
+name = "grug-infra"
+version = "0.1.0"
+description = "Pulumi IaC for Grug — modular GitHub bot SaaS (PRD githumps/grug#21)"
+requires-python = ">=3.11"
+dependencies = [
+    "pulumi>=3.120.0,<4.0.0",
+    "pulumi-aws>=6.50.0,<7.0.0",
+    "pulumi-cloudflare>=5.0.0,<6.0.0",
+    "pulumi-datadog>=5.0.0,<6.0.0",
+]
+
+[tool.uv]
+dev-dependencies = [
+    "pytest>=8.0",
+    "pulumi-policy>=1.0,<2.0",
+]
