@@ -5,7 +5,7 @@ from __future__ import annotations
 import logging
 from typing import Any
 
-from github_app_auth import with_install_token_retry
+from github_app_auth import get_install_token
 from github_checks_client import CheckRunResult, post_check_run
 from personas.tpm.dor_checks import CheckResult, run_all
 
@@ -50,23 +50,19 @@ def evaluate_pull_request(
     title, summary = _summary(results)
     conclusion = "success" if not failed else "failure"
 
-    # Retry once on 401 — handles tokens revoked out-of-band (App
-    # reinstall, perm change, secret rotation). Codex post-review #50.
-    with_install_token_retry(
-        installation_id,
-        lambda token: post_check_run(
-            install_token=token,
-            owner=owner, repo=repo,
-            result=CheckRunResult(
-                name=_CHECK_NAME,
-                head_sha=head_sha,
-                status="completed",
-                conclusion=conclusion,
-                title=title,
-                summary=summary,
-            ),
-            external_id=f"grug-tpm:{owner}/{repo}#{pr_number}:{head_sha}",
+    install_token = get_install_token(installation_id)
+    post_check_run(
+        install_token=install_token,
+        owner=owner, repo=repo,
+        result=CheckRunResult(
+            name=_CHECK_NAME,
+            head_sha=head_sha,
+            status="completed",
+            conclusion=conclusion,
+            title=title,
+            summary=summary,
         ),
+        external_id=f"grug-tpm:{owner}/{repo}#{pr_number}:{head_sha}",
     )
     log.info(
         "tpm_evaluated",

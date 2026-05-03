@@ -25,19 +25,11 @@ class CachedToken:
 
 
 class TokenCache(Protocol):
-    """Get/put/invalidate for short-lived auth tokens.
-
-    Callers MUST invalidate on 401 — GitHub can revoke tokens before
-    TTL expiry (App reinstall, perm change, secret rotation). Without
-    invalidate, a warm Lambda keeps reusing the bad token until TTL.
-    Codex post-review #50.
-    """
+    """Get/put for short-lived auth tokens. Implementations decide TTL handling."""
 
     def get(self, key: str) -> CachedToken | None: ...
 
     def put(self, key: str, token: str, ttl_seconds: float) -> None: ...
-
-    def invalidate(self, key: str) -> None: ...
 
 
 class InMemoryTokenCache:
@@ -56,6 +48,3 @@ class InMemoryTokenCache:
         self._store[key] = CachedToken(
             value=token, expires_at_unix=time.time() + ttl_seconds,
         )
-
-    def invalidate(self, key: str) -> None:
-        self._store.pop(key, None)

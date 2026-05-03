@@ -101,8 +101,4 @@ async def receive_github_webhook(
         "webhook_dispatched",
         extra={"delivery_id": x_github_delivery, **outcome},
     )
-    # `**outcome` always contains a `status` key — its value (dispatched/
-    # no_op/skip/recorded) is more specific than a literal "ok" and so
-    # supersedes it. Don't include the dead "ok" literal — Sentry MED on
-    # PR #40 flagged it as dead code and the dictionary-spread hides intent.
-    return {"delivery_id": x_github_delivery, **outcome}
+    return {"status": "ok", "delivery_id": x_github_delivery, **outcome}
