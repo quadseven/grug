@@ -93,7 +93,7 @@ gha_deploy_role = oidc_role.create(
     repo="githumps/grug",
     # `main` and SaaS-conversion feature branches (epic-grug-saas).
     # Tighten back to `main` only once Slice 13 (#34) ships.
-    branches=["main", "feat/22-*", "feat/23-*"],
+    branches=["main", "feat/22-*", "feat/23-*", "feat/24-*"],
     tags_pattern="v*",
 )
 
@@ -194,8 +194,10 @@ api_lambda = lambda_service.create(
         "GRUG_ENV": env,
         "GRUG_LOG_LEVEL": "INFO",
         "GRUG_BUILD_SHA": api_image_tag,
+        "GRUG_DOMAIN": domain,
         "GRUG_DDB_TABLE": grug_main_table.name,
         "GRUG_KMS_CMK_ARN": grug_tokens_cmk.arn,
+        "GITHUB_APP_WEBHOOK_SECRET_SSM": secrets["github-app-webhook-secret"].name,
         # OAuth (Slice 3 #24 consumes)
         "GITHUB_APP_CLIENT_ID_SSM": secrets["github-app-client-id"].name,
         "GITHUB_APP_CLIENT_SECRET_SSM": secrets["github-app-client-secret"].name,

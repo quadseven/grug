@@ -18,6 +18,7 @@ from datetime import datetime, timezone
 
 from fastapi import FastAPI
 
+from auth.github_oauth import router as github_oauth_router
 from observability import configure_logging
 
 configure_logging()
@@ -45,6 +46,9 @@ def livez() -> dict[str, str]:
 def readyz() -> dict[str, str]:
     """Readiness — downstream deps reachable. v2 always ready (no deps)."""
     return {"status": "ready", "service": "grug-api"}
+
+
+app.include_router(github_oauth_router)
 
 
 @app.get("/api/v1/health")
