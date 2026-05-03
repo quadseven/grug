@@ -1,1 +1,0 @@
-{"root":["./src/main.tsx","./src/vite-env.d.ts","./src/components/shell.tsx","./src/lib/api.ts","./src/lib/me.ts","./src/routes/admin.tsx","./src/routes/dashboard.tsx","./src/routes/notfound.tsx","./src/routes/signin.tsx","./src/routes/splash.tsx"],"version":"5.9.3"}
