@@ -22,7 +22,9 @@ import pulumi_cloudflare as cloudflare
 
 from components import (
     cloudflare_dns,
+    ddb_table,
     ecr_repo,
+    kms_cmk,
     lambda_service,
     oidc_role,
     ssm_secrets,
@@ -91,9 +93,13 @@ gha_deploy_role = oidc_role.create(
     repo="githumps/grug",
     # `main` and SaaS-conversion feature branches (epic-grug-saas).
     # Tighten back to `main` only once Slice 13 (#34) ships.
-    branches=["main", "feat/22-slice1-bare-webhook-receiver"],
+    branches=["main", "feat/22-*", "feat/23-*"],
     tags_pattern="v*",
 )
+
+# Slice 2 (#23) — DDB single-table + KMS CMK + api Lambda
+grug_main_table = ddb_table.create("grug-main")
+grug_tokens_cmk = kms_cmk.create("grug-tokens")
 
 # ECR repo for the webhook Lambda image. Lifecycle: untagged images expire
 # after 14 days (avoids ~$0.10/GB/mo image graveyard).
@@ -169,7 +175,109 @@ cloudflare_dns.create_proxied_cname(
     proxied=True,
 )
 
+# API Lambda — separate ECR + Function URL from webhook (per Q10
+# topology decision; independent concurrency reservations so webhook
+# bursts can't starve user-interactive API).
+api_ecr = ecr_repo.create(
+    name="grug-api",
+    untagged_expire_days=14,
+)
+
+api_image_tag = config.get("api_image_tag") or "bootstrap"
+api_lambda = lambda_service.create(
+    name="grug-api",
+    ecr_repo=api_ecr,
+    image_tag=api_image_tag,
+    secrets=secrets,
+    extra_ssm_secrets=[_dd_api_key],
+    env_vars={
+        "GRUG_ENV": env,
+        "GRUG_LOG_LEVEL": "INFO",
+        "GRUG_BUILD_SHA": api_image_tag,
+        "GRUG_DDB_TABLE": grug_main_table.name,
+        "GRUG_KMS_CMK_ARN": grug_tokens_cmk.arn,
+        # OAuth (Slice 3 #24 consumes)
+        "GITHUB_APP_CLIENT_ID_SSM": secrets["github-app-client-id"].name,
+        "GITHUB_APP_CLIENT_SECRET_SSM": secrets["github-app-client-secret"].name,
+        # GitHub App auth for personas dispatch (Slice 4 #25 consumes)
+        "GITHUB_APP_ID_SSM": secrets["github-app-id"].name,
+        "GITHUB_APP_PRIVATE_KEY_SSM": secrets["github-app-private-key"].name,
+        # DD APM
+        "DD_LAMBDA_HANDLER": "lambda_handler.handler",
+        "DD_SITE": "datadoghq.com",
+        "DD_API_KEY": _dd_api_key.value,
+        "DD_ENV": env,
+        "DD_SERVICE": "grug-api",
+        "DD_VERSION": api_image_tag,
+        "DD_TRACE_ENABLED": "true",
+        "DD_LOGS_INJECTION": "true",
+        "DD_PATCH_MODULES": "asgi:false",
+        "DD_TRACE_ASGI_ENABLED": "false",
+    },
+    timeout_seconds=15,
+    memory_mb=512,
+)
+
+# Per IAM split (Slice 2 acceptance criterion): api Lambda CAN decrypt
+# user OAuth tokens via KMS envelope. Webhook Lambda cannot — it never
+# reads user tokens (uses GitHub App JWT instead).
+kms_cmk.grant_use_to_role(
+    cmk=grug_tokens_cmk,
+    role=api_lambda.role,
+    statement_id="grug-api-kms-policy",
+)
+
+# DDB IAM for api Lambda (read+write for v1; tighten per access pattern
+# in later slices if needed).
+import json as _json
+import pulumi_aws as _aws
+_aws.iam.RolePolicy(
+    "grug-api-ddb-policy",
+    role=api_lambda.role.id,
+    policy=grug_main_table.arn.apply(
+        lambda arn: _json.dumps(
+            {
+                "Version": "2012-10-17",
+                "Statement": [
+                    {
+                        "Effect": "Allow",
+                        "Action": [
+                            "dynamodb:GetItem",
+                            "dynamodb:PutItem",
+                            "dynamodb:UpdateItem",
+                            "dynamodb:DeleteItem",
+                            "dynamodb:Query",
+                            "dynamodb:BatchGetItem",
+                            "dynamodb:BatchWriteItem",
+                        ],
+                        "Resource": [arn, f"{arn}/index/*"],
+                    },
+                ],
+            },
+        ),
+    ),
+)
+
+# CF DNS — api.grug.lol → api Lambda Function URL (proxied; Worker
+# rewrites Host header just like webhook). Worker deployed via
+# infra/cloudflare/deploy.sh.
+cloudflare_dns.create_proxied_cname(
+    zone_id=_cf_zone_id.value,
+    name="api",
+    domain=domain,
+    target_url=api_lambda.function_url,
+    provider=cf_provider,
+    proxied=True,
+)
+
 pulumi.export("webhook_function_url", webhook.function_url)
 pulumi.export("webhook_public_url", f"https://webhook.{domain}/webhook/github")
+pulumi.export("api_function_url", api_lambda.function_url)
+pulumi.export("api_public_url", f"https://api.{domain}")
 pulumi.export("gha_deploy_role_arn", gha_deploy_role.arn)
 pulumi.export("ecr_webhook_repo_url", webhook_ecr.repository_url)
+pulumi.export("ecr_api_repo_url", api_ecr.repository_url)
+pulumi.export("ddb_table_name", grug_main_table.name)
+pulumi.export("ddb_table_arn", grug_main_table.arn)
+pulumi.export("kms_cmk_arn", grug_tokens_cmk.arn)
+pulumi.export("kms_cmk_alias", grug_tokens_cmk.alias.name)
