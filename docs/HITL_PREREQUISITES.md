@@ -110,40 +110,6 @@ to create the Pages project + apex domain binding (idempotent — safe
 to re-run if you forget). After that, the `web.deploy.yml` workflow
 handles every subsequent build/deploy via `wrangler pages deploy`.
 
-## 6. Datadog notify handle (Slice 9 #30)
-
-DD monitors fire on Lambda 5xx, sig-verify failures, etc. Notification
-target lives in SSM `/grug/dd-notify-handle`.
-
-Format: any string DD knows how to route — Discord webhook handle
-(`@webhook-grug`), email mention (`@evan@grug.lol`), PagerDuty
-integration name (`@pagerduty-grug-prod`), or `@slack-channel-grug`.
-
-```bash
-aws ssm put-parameter --region us-east-1 \
-  --name /grug/dd-notify-handle --type String \
-  --value "<handle>"
-```
-
-**Important — handle is baked into monitor messages at `pulumi up`
-time.** If you change the SSM value later, you MUST re-run `pulumi up`
-for the new handle to take effect on existing monitors. The Pulumi
-diff will show every monitor's `message` field changing. (For more
-flexible routing without re-deploys, set the SSM handle to a stable
-DD notification target — e.g. `@webhook-grug-router` — and change
-the routing inside DD's notification settings.)
-
-DD also needs the App key (in addition to the API key) for monitor
-creation:
-
-```bash
-aws ssm put-parameter --region us-east-1 \
-  --name /shared/datadog-app-key --type SecureString --value "<app key>"
-```
-
-(API key already loaded for the Lambda extension; App key is
-admin-scoped and only needed by the deploy role.)
-
 ## When done
 
 Tell me "HITL done" and I'll run `pulumi up` to provision the dev stack.
