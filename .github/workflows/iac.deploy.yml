@@ -13,6 +13,7 @@ on:
       - main
       - 'feat/22-*'
       - 'feat/23-*'
+      - 'feat/24-*'
     tags: ['v*']
   workflow_dispatch:
     inputs:
