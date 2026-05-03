@@ -93,7 +93,7 @@ gha_deploy_role = oidc_role.create(
     repo="githumps/grug",
     # `main` and SaaS-conversion feature branches (epic-grug-saas).
     # Tighten back to `main` only once Slice 13 (#34) ships.
-    branches=["main", "feat/22-*", "feat/23-*", "feat/24-*", "feat/25-*"],
+    branches=["main", "feat/22-*", "feat/23-*", "feat/24-*", "feat/25-*", "feat/26-*"],
     tags_pattern="v*",
 )
 
@@ -137,6 +137,9 @@ webhook = lambda_service.create(
         # Lambda has IAM read on the params already; safe to inject.
         "GITHUB_APP_CLIENT_ID_SSM": secrets["github-app-client-id"].name,
         "GITHUB_APP_CLIENT_SECRET_SSM": secrets["github-app-client-secret"].name,
+        # DDB allowlist gate (Slice 5 #26). Webhook reads INST# + USER#
+        # rows directly (no KMS — token blobs are api-Lambda-only).
+        "GRUG_DDB_TABLE": grug_main_table.name,
         # Datadog APM (datadog_lambda wrapper finds real handler via
         # DD_LAMBDA_HANDLER; layer adds the trace agent + log forwarder).
         "DD_LAMBDA_HANDLER": "lambda_handler.handler",
@@ -253,6 +256,34 @@ _aws.iam.RolePolicy(
                             "dynamodb:BatchWriteItem",
                         ],
                         "Resource": [arn, f"{arn}/index/*"],
+                    },
+                ],
+            },
+        ),
+    ),
+)
+
+# DDB IAM for webhook Lambda (Slice 5 #26 allowlist gate). Tighter
+# scope than api: GetItem + PutItem + DeleteItem only (no Query, no
+# UpdateItem — webhook only records install rows + reads INST/USER for
+# allowlist checks). Explicitly NO KMS perms — token blobs stay
+# api-Lambda-only per locked encryption decision.
+_aws.iam.RolePolicy(
+    "grug-webhook-ddb-policy",
+    role=webhook.role.id,
+    policy=grug_main_table.arn.apply(
+        lambda arn: _json.dumps(
+            {
+                "Version": "2012-10-17",
+                "Statement": [
+                    {
+                        "Effect": "Allow",
+                        "Action": [
+                            "dynamodb:GetItem",
+                            "dynamodb:PutItem",
+                            "dynamodb:DeleteItem",
+                        ],
+                        "Resource": [arn],
                     },
                 ],
             },
