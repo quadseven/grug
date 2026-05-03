@@ -390,8 +390,11 @@ def render_comment(
     headline_parts = [
         f"{icon} **Definition of Ready** — {len(checks) - fail_count - warn_count}/{len(checks)} pass"
     ]
+    # `blocking` is an adjective being used as a count noun ("3 blocking
+    # checks") — it doesn't take an `s`. Don't run it through
+    # _pluralize. (Sentry-flagged on tpm.py:394 round 2.)
     if fail_count:
-        headline_parts.append(_pluralize(fail_count, "blocking"))
+        headline_parts.append(f"{fail_count} blocking")
     if warn_count:
         headline_parts.append(_pluralize(warn_count, "warning"))
     headline = ", ".join(headline_parts)
