@@ -17,6 +17,7 @@ on:
       - 'feat/25-*'
       - 'feat/26-*'
       - 'feat/27-*'
+      - 'feat/28-*'
     tags: ['v*']
   workflow_dispatch:
     inputs:
