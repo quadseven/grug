@@ -1,0 +1,4 @@
+config:
+  aws:region: us-east-1
+  grug:env: dev
+  grug:domain: grug.lol
