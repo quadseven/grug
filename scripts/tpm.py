@@ -150,10 +150,17 @@ def static_dor_checks(pr: dict[str, Any]) -> list[DoRCheck]:
         )
     )
 
-    # 5. Linked issue
+    # 5. Linked issue. Accept either:
+    #   - Closing keyword: `closes #N`, `fixes #N`, `resolves #N` (any case)
+    #   - Plain reference: `refs #N`, `see #N`, `(#N)`, or bare `#N`
+    # Earlier `\b#\d{2,}\b` failed on standalone `#16` because `#` is a
+    # non-word char + leading space is non-word → no `\b` between them.
+    # Use `(?<!\w)#\d+\b` (negative-lookbehind for word) so we DON'T
+    # match `bug#16`-style accidental SHA-prefix collisions while still
+    # matching real-world `refs #16` / ` #16 ` / `(#16)`.
     has_link = bool(
         re.search(r"\b(closes|fixes|resolves)\s+#\d+", body, re.IGNORECASE)
-        or re.search(r"\b#\d{2,}\b", body)
+        or re.search(r"(?<!\w)#\d+\b", body)
     )
     checks.append(
         DoRCheck(
@@ -279,23 +286,118 @@ def poolside_review(pr: dict[str, Any]) -> str | None:
 
 
 GRUG_MARKER = "<!-- grug-tpm-bot:sticky -->"
-GRUG_AVATAR = (
+GRUG_AVATAR_HAPPY = (
     "https://raw.githubusercontent.com/githumps/grug/main/assets/grug.png"
 )
+GRUG_AVATAR_ANGRY = (
+    "https://raw.githubusercontent.com/githumps/grug/main/assets/grug-angry.png"
+)
+# Per-state state-tag stamped into the sticky comment so subsequent runs can
+# detect transitions (was-failing -> now-passing) and surface a "resolved"
+# banner. Stays inside an HTML comment so it doesn't render to the user.
+_STATE_TAG_RE = re.compile(r"<!-- grug-state:(pass|fail) -->")
+# Per-check pass/fail map embedded as JSON in a hidden comment so the next
+# run can diff against it and render a per-check changelog (e.g. "estimate:
+# ❌ → ✅") in the comment body. Pattern: stateless cross-run state via the
+# sticky comment itself.
+_CHECKS_TAG_RE = re.compile(r"<!-- grug-checks-state: ({.*?}) -->")
+# UTC timestamp stamped on every render so reviewers see when grug last
+# ran without scrolling to GitHub's "edited X minutes ago" metadata.
+_TS_TAG_RE = re.compile(r"<!-- grug-rendered-at: ([\dTZ:.-]+) -->")
 
 
-def render_comment(checks: list[DoRCheck], llm_review: str | None) -> tuple[str, bool]:
-    """Return (markdown body, all-pass)."""
+@dataclass
+class PriorRun:
+    """Previous-render snapshot read from the existing sticky comment.
+    Used to render transition banner + per-check changelog. All-None on
+    first run (no comment exists yet)."""
+
+    overall_state: str | None  # 'pass' / 'fail' / None
+    check_states: dict[str, bool]  # name -> passed
+    rendered_at: str | None  # ISO-8601 UTC
+
+
+def _read_prior_run(repo: str, pr_number: int) -> PriorRun:
+    """Fetch the existing sticky comment + parse the embedded state tags.
+    Returns a PriorRun with None / empty fields if no prior comment exists
+    or if tags are absent (older comments before mood-aware rollout)."""
+    existing = find_existing_comment(repo, pr_number)
+    if not existing:
+        return PriorRun(None, {}, None)
+    try:
+        body = _gh(
+            "api",
+            f"repos/{repo}/issues/comments/{existing}",
+            "--jq",
+            ".body",
+        ).strip()
+    except RuntimeError:
+        return PriorRun(None, {}, None)
+
+    state_m = _STATE_TAG_RE.search(body)
+    overall_state = state_m.group(1) if state_m else None
+
+    checks_m = _CHECKS_TAG_RE.search(body)
+    check_states: dict[str, bool] = {}
+    if checks_m:
+        try:
+            check_states = json.loads(checks_m.group(1))
+        except json.JSONDecodeError:
+            check_states = {}
+
+    ts_m = _TS_TAG_RE.search(body)
+    rendered_at = ts_m.group(1) if ts_m else None
+
+    return PriorRun(overall_state, check_states, rendered_at)
+
+
+def render_comment(
+    checks: list[DoRCheck],
+    llm_review: str | None,
+    *,
+    prior: PriorRun | None = None,
+) -> tuple[str, bool]:
+    """Return (markdown body, all-pass).
+
+    `prior` is the parsed snapshot from the previous sticky comment so
+    this render can:
+      - prepend a transition banner on overall pass<->fail flip
+      - prepend a per-check changelog ("estimate: ❌ -> ✅") on any
+        check whose state flipped since last run
+      - render a "Last updated" timestamp footer
+    Pass `None` (or default-empty PriorRun) on first run.
+    """
+    from datetime import datetime, timezone
+
+    if prior is None:
+        prior = PriorRun(None, {}, None)
+
     fail_count = sum(1 for c in checks if not c.passed and c.name != "scope-fence" and c.name != "issue-link")
     warn_count = sum(1 for c in checks if not c.passed and (c.name == "scope-fence" or c.name == "issue-link"))
     overall_pass = fail_count == 0
+    state_tag = "pass" if overall_pass else "fail"
+
+    # Avatar swaps with mood. Happy on pass (warnings still pass), angry
+    # on blocking-fail. Same image renders to ~80px so file size of the
+    # angry asset doesn't matter for PR comment perf.
+    avatar = GRUG_AVATAR_HAPPY if overall_pass else GRUG_AVATAR_ANGRY
+    alt = "Grug (happy)" if overall_pass else "Grug (angry)"
+
+    def _pluralize(n: int, singular: str) -> str:
+        return f"{n} {singular}{'' if n == 1 else 's'}"
 
     icon = "✅" if overall_pass else "❌"
-    headline = (
+    headline_parts = [
         f"{icon} **Definition of Ready** — {len(checks) - fail_count - warn_count}/{len(checks)} pass"
-        f"{f', {fail_count} blocking' if fail_count else ''}"
-        f"{f', {warn_count} warnings' if warn_count else ''}"
-    )
+    ]
+    # `blocking` is an adjective being used as a count noun ("3 blocking
+    # checks") — it doesn't take an `s`. Don't run it through
+    # _pluralize. (Sentry-flagged on tpm.py:394 round 2.)
+    if fail_count:
+        headline_parts.append(f"{fail_count} blocking")
+    if warn_count:
+        headline_parts.append(_pluralize(warn_count, "warning"))
+    headline = ", ".join(headline_parts)
 
     rows = [
         f"| {'✅' if c.passed else ('⚠️' if c.name in ('scope-fence', 'issue-link') else '❌')} | "
@@ -304,24 +406,86 @@ def render_comment(checks: list[DoRCheck], llm_review: str | None) -> tuple[str,
     ]
     table = "| | Check | Detail |\n|---|---|---|\n" + "\n".join(rows)
 
-    sections = [
+    # Transition banner on overall pass<->fail flip.
+    transition_banner: str | None = None
+    if prior.overall_state == "fail" and overall_pass:
+        transition_banner = (
+            "> ✨ **Resolved.** Grug back to happy — all blocking checks now pass. "
+            "Previous failures fixed in the latest push."
+        )
+    elif prior.overall_state == "pass" and not overall_pass:
+        transition_banner = (
+            "> 💢 **Regressed.** Grug got upset — at least one previously-passing "
+            "blocking check is now failing. Edit the PR body + push to fix."
+        )
+
+    # Per-check changelog: list every check whose pass/fail flipped since
+    # the prior run. Empty when nothing changed (or first run). Renders
+    # in a collapsible <details> so happy steady-state PRs aren't noisy.
+    diffs: list[str] = []
+    if prior.check_states:  # only if we have a prior to diff against
+        for c in checks:
+            was = prior.check_states.get(c.name)
+            if was is None or was == c.passed:
+                continue
+            arrow = "❌ → ✅" if c.passed else "✅ → ❌"
+            diffs.append(f"- `{c.name}`: {arrow} — {c.detail}")
+    changelog: str | None = None
+    if diffs:
+        changelog_summary = (
+            f"**What grug changed this run:** {len(diffs)} check"
+            f"{'s' if len(diffs) > 1 else ''} flipped"
+        )
+        changelog = (
+            "<details open>\n"
+            f"<summary>{changelog_summary}</summary>\n\n"
+            + "\n".join(diffs)
+            + "\n\n</details>"
+        )
+
+    # Hidden state-tags consumed by the next run.
+    now_iso = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+    check_state_json = json.dumps(
+        {c.name: c.passed for c in checks}, separators=(",", ":")
+    )
+
+    sections: list[str] = [
         GRUG_MARKER,
-        f'<img src="{GRUG_AVATAR}" width="80" align="right" alt="Grug">',
-        "",
-        "## Grug — automated TPM check",
-        "",
-        headline,
-        "",
-        table,
+        f"<!-- grug-state:{state_tag} -->",
+        f"<!-- grug-checks-state: {check_state_json} -->",
+        f"<!-- grug-rendered-at: {now_iso} -->",
     ]
-    if llm_review:
-        sections.extend(["", "### Grug's read on scope", "", llm_review.strip()])
+    if transition_banner:
+        sections.extend(["", transition_banner])
+    if changelog:
+        sections.extend(["", changelog])
     sections.extend(
         [
             "",
-            "<sub>Static checks are blocking when caller sets "
-            "`strict: true`. LLM read is advisory. Re-runs on every push: "
-            "edit PR body or push an empty commit to re-trigger.</sub>",
+            f'<img src="{avatar}" width="80" align="right" alt="{alt}">',
+            "",
+            "## Grug — automated TPM check",
+            "",
+            headline,
+            "",
+            table,
+        ]
+    )
+    if llm_review:
+        sections.extend(["", "### Grug's read on scope", "", llm_review.strip()])
+
+    # Footer: last-rendered timestamp + previous-render timestamp (if any)
+    # so reviewers can see at a glance how stale the comment is.
+    footer_parts = [f"Last updated: `{now_iso}`"]
+    if prior.rendered_at:
+        footer_parts.append(f"previous: `{prior.rendered_at}`")
+    sections.extend(
+        [
+            "",
+            "<sub>" + " · ".join(footer_parts) + " · "
+            "Static checks blocking when caller sets `strict: true`. "
+            "LLM read is advisory. Re-runs on every push: edit PR body or "
+            "push an empty commit to re-trigger.</sub>",
         ]
     )
     return "\n".join(sections), overall_pass
@@ -400,7 +564,11 @@ def cmd_pr_gate(repo: str, pr_number: int, post_comment: bool = True) -> int:
     pr = fetch_pr(repo, pr_number)
     checks = static_dor_checks(pr)
     llm_review = poolside_review(pr)
-    body, ok = render_comment(checks, llm_review)
+    # Read prior snapshot BEFORE we render so the transition banner +
+    # per-check changelog can fire. Done here (not in render) to keep
+    # render_comment pure for testability.
+    prior = _read_prior_run(repo, pr_number) if post_comment else PriorRun(None, {}, None)
+    body, ok = render_comment(checks, llm_review, prior=prior)
     print(body)
     if post_comment:
         upsert_comment(repo, pr_number, body)

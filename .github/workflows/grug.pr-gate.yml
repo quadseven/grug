@@ -19,5 +19,15 @@ jobs:
     uses: ./.github/workflows/_reusable.grug-pr-gate.yml
     with:
       strict: true
+      # Self-test: run the PR's branch script, not main, so PR-branch
+      # changes to tpm.py / render_comment / etc. are visible BEFORE
+      # merge instead of being invisible until they're already shipped.
+      #
+      # Use `pull_request.head.sha` (not `head_ref`) so the checkout
+      # works for fork PRs too — `head_ref` is the branch name on the
+      # fork, which doesn't exist in the upstream repo. The SHA is
+      # always reachable as `refs/pull/<n>/head` on the upstream side.
+      # Sentry-flagged HIGH on grug.pr-gate.yml:24 round 2.
+      script_ref: ${{ github.event.pull_request.head.sha }}
     secrets:
       poolside_api_key: ${{ secrets.POOLSIDE_API_KEY }}
