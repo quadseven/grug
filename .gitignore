@@ -2,3 +2,26 @@ __pycache__/
 *.pyc
 .venv/
 .DS_Store
+
+# Pulumi local-only state. Stack configs (Pulumi.<stack>.yaml) ARE
+# committed — Pulumi natively encrypts any --secret values via stack
+# secrets-provider. Plaintext values are intentional.
+infra/pulumi/.pulumi/
+infra/pulumi/uv.lock
+infra/pulumi/venv/
+
+# Service-level
+.pytest_cache/
+*.egg-info/
+dist/
+build/
+*.pem
+*.private-key
+
+# Docker / build artifacts
+docker-bake.hcl.local
+
+# Editor / IDE
+.vscode/
+.idea/
+*.swp

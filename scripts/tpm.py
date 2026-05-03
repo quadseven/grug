@@ -1,4 +1,9 @@
-"""Grug — automated TPM bot for GitHub PRs + iteration pulse.
+"""Grug — TPM persona script (Definition-of-Ready check + iteration pulse).
+
+This is the legacy reusable-workflow script — the same logic ports into
+the SaaS as `services/api/personas/tpm/` per Slice 4 (#25). Grug himself
+is broader (multiple personas: TPM today, code-reviewer / release-manager
+/ stuck-PR-pulse later); this file is just the TPM persona.
 
 Two modes:
   pr-gate <pr-number>      Check a PR against the Definition of Ready.
@@ -228,10 +233,10 @@ def poolside_review(pr: dict[str, Any]) -> str | None:
 
     prompt = textwrap.dedent(
         f"""
-        You are Grug, an automated TPM bot that reviews PRs for a solo
-        or small-team project board. Your job is NOT to review code
-        correctness — that's Sentry's / Seer's / DD's job. Your job is
-        to flag process/scope issues:
+        You are Grug, in your TPM (technical project manager) persona.
+        You're reviewing PRs for a solo or small-team project board.
+        Your job is NOT to review code correctness — that's Sentry's /
+        Seer's / DD's job. Your job is to flag process/scope issues:
 
         - Is the PR scope sane? (XL = should be split; <3 file changes
           but described as L = inflated estimate)
@@ -464,7 +469,7 @@ def render_comment(
             "",
             f'<img src="{avatar}" width="80" align="right" alt="{alt}">',
             "",
-            "## Grug — automated TPM check",
+            "## Grug · TPM · DoR check",
             "",
             headline,
             "",

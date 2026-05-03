@@ -1,0 +1,37 @@
+# Webhook Lambda container image for grug-webhook (arm64 / Graviton).
+#
+# Slice 1 (#22): minimal image — FastAPI + Mangum + httpx + cryptography.
+# Multi-stage shared base (`grug-base`) deferred to Slice 2 when the api
+# Lambda also needs the same deps; rule-of-two before extracting.
+#
+# DD source code integration — `DD_GIT_REPOSITORY_URL` + `DD_GIT_COMMIT_SHA`
+# baked at build time so DD links traces to the exact commit.
+
+# Datadog Lambda Extension — Lambda Container images cannot attach
+# layers, so we COPY the extension binary directly into the runtime
+# image. Pinned by version, bump in lockstep with somatic-scripts
+# (currently :96 in infra/docker/macchina-base/Dockerfile).
+FROM public.ecr.aws/datadog/lambda-extension:96 AS dd-ext
+
+FROM public.ecr.aws/lambda/python:3.13-arm64 AS runtime
+
+ARG DD_GIT_REPOSITORY_URL=""
+ARG DD_GIT_COMMIT_SHA=""
+ENV DD_GIT_REPOSITORY_URL=${DD_GIT_REPOSITORY_URL}
+ENV DD_GIT_COMMIT_SHA=${DD_GIT_COMMIT_SHA}
+
+# DD extension binary lives at /opt/extensions/datadog-agent. Lambda
+# auto-discovers extensions in /opt/extensions when the function starts.
+COPY --from=dd-ext /opt/extensions/datadog-agent /opt/extensions/datadog-agent
+
+WORKDIR /var/task
+
+COPY requirements.txt .
+RUN pip install --no-cache-dir --target . -r requirements.txt
+
+COPY . .
+
+# Lambda Container handler entry point — datadog_lambda wrapper finds
+# our real handler via env var `DD_LAMBDA_HANDLER=lambda_handler.handler`
+# (set in Pulumi). Wrapper instruments tracing then delegates.
+CMD ["datadog_lambda.handler.handler"]

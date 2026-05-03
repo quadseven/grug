@@ -1,0 +1,24 @@
+# Copy this file to Pulumi.dev.yaml and fill in the secrets.
+# Pulumi.dev.yaml is gitignored; Pulumi.dev.yaml.example is the template.
+#
+# After editing, run:
+#   pulumi config set aws:region us-east-1
+#   pulumi config set --secret cloudflare:apiToken <token>
+#   pulumi config set cloudflare_zone_id <grug.lol-zone-id>
+
+config:
+  aws:region: us-east-1
+  grug:domain: grug.lol
+  grug:env: dev
+
+  # Cloudflare zone for grug.lol — get via:
+  #   curl -s -H "Authorization: Bearer $CF_TOKEN" \
+  #     "https://api.cloudflare.com/client/v4/zones?name=grug.lol" | jq -r '.result[0].id'
+  cloudflare_zone_id: REPLACE_ME
+
+  # Cloudflare API token (Zone:DNS:Edit on grug.lol). Set via:
+  #   pulumi config set --secret cloudflare:apiToken <token>
+  # cloudflare:apiToken: SET_AS_SECRET
+
+  # Datadog notification handle for monitor pages (Slice 9).
+  grug:dd_notification_handle: "@evan@example.com"
