@@ -48,7 +48,7 @@ jobs:
       - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
 
       - name: Configure AWS via OIDC
-        uses: aws-actions/configure-aws-credentials@ff717079ee2060e4bcee96c4779b553acc87447c # v4.0.2
+        uses: aws-actions/configure-aws-credentials@7474bc4690e29a8392af63c5b98e7449536d5c3a # v4.3.1
         with:
           role-to-assume: arn:aws:iam::${{ secrets.AWS_ACCOUNT_ID }}:role/grug-gha-deploy
           aws-region: us-east-1
@@ -85,12 +85,12 @@ jobs:
           uv --version
 
       - name: Set up QEMU (arm64 cross-build emulation on x86 runners)
-        uses: docker/setup-qemu-action@c7c53464625b32c7a7e944ae62b3e17d2b600130 # v3.2.0
+        uses: docker/setup-qemu-action@c7c53464625b32c7a7e944ae62b3e17d2b600130 # v3.7.0
         with:
           platforms: arm64
 
       - name: Set up Docker Buildx
-        uses: docker/setup-buildx-action@8d2750c68a42422c14e847fe6c8ac0403b4cbd6f # v3.6.1
+        uses: docker/setup-buildx-action@8d2750c68a42422c14e847fe6c8ac0403b4cbd6f # v3.12.0
 
       - name: Login to ECR
         run: |
@@ -124,7 +124,7 @@ jobs:
           done
           echo "tag=$IMAGE_TAG" >> $GITHUB_OUTPUT
 
-      - uses: pulumi/actions@8582a9e8cc630786854029b4e09281acd6794b58 # v6.5.0
+      - uses: pulumi/actions@8582a9e8cc630786854029b4e09281acd6794b58 # v6.6.1
         with:
           command: up
           stack-name: pulumi_ehumps_me/grug/${{ steps.stack.outputs.stack }}
