@@ -143,3 +143,49 @@ def test_installation_no_id_skips():
 def test_installation_unhandled_action():
     out = dispatch("installation", {"action": "suspend", "installation": {"id": 1}})
     assert out["status"] == "no_op" and "suspend" in out["reason"]
+
+
+# Codex post-review #51 — preserve installer on perm-accept / unsuspend
+
+
+def test_new_permissions_accepted_preserves_existing_installer():
+    payload = {
+        "action": "new_permissions_accepted",
+        "installation": {
+            "id": 555,
+            "account": {"login": "acme-org", "type": "Organization", "id": 9},
+        },
+        "sender": {"id": 999, "login": "different-admin"},  # NOT original installer
+    }
+    with patch("dispatcher.get_installation", return_value={"PK": "INST#555"}), \
+         patch("dispatcher.record_installation") as mock_rec:
+        out = dispatch("installation", payload)
+    assert out["status"] == "no_op" and "preserved" in out["reason"]
+    mock_rec.assert_not_called()
+
+
+def test_unsuspend_preserves_existing_installer():
+    payload = {
+        "action": "unsuspend",
+        "installation": {"id": 555, "account": {"login": "acme", "type": "User", "id": 1}},
+        "sender": {"id": 999, "login": "another-user"},
+    }
+    with patch("dispatcher.get_installation", return_value={"PK": "INST#555"}), \
+         patch("dispatcher.record_installation") as mock_rec:
+        out = dispatch("installation", payload)
+    assert out["status"] == "no_op"
+    mock_rec.assert_not_called()
+
+
+def test_new_permissions_accepted_backfills_when_no_existing_row():
+    """Edge case: missed the `created` event somehow → record now."""
+    payload = {
+        "action": "new_permissions_accepted",
+        "installation": {"id": 555, "account": {"login": "evan", "type": "User", "id": 100}},
+        "sender": {"id": 100, "login": "evan"},
+    }
+    with patch("dispatcher.get_installation", return_value=None), \
+         patch("dispatcher.record_installation") as mock_rec:
+        out = dispatch("installation", payload)
+    assert out["status"] == "recorded" and "backfill" in out["action"]
+    mock_rec.assert_called_once()

@@ -127,8 +127,13 @@ def static_dor_checks(pr: dict[str, Any]) -> list[DoRCheck]:
         )
     )
 
-    # 3. Estimate / Size — title or body should signal size
-    size_pat = r"\b(XS|S|M|L|XL)\b|size:\s*(XS|S|M|L|XL)"
+    # 3. Estimate / Size — title or body should signal size.
+    # Sentry MED on PR #40 — earlier `\b(XS|S|M|L|XL)\b` matched bare
+    # letters in random prose ("M&Ms", "the L key", "XL t-shirts").
+    # Require an explicit `Size` token followed by punctuation/whitespace/
+    # markdown-emphasis (`:` `**` `_` etc.) and then the value. Prefix
+    # `(?:^|[^A-Za-z])` stops `mySize` from matching.
+    size_pat = r"(?:^|[^A-Za-z])Size[:\s\*_]+(XS|S|M|L|XL)\b"
     has_size = bool(re.search(size_pat, body, re.IGNORECASE)) or any(
         l["name"].lower().startswith("size:")
         for l in pr.get("labels", [])
