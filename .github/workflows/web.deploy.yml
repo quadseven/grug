@@ -37,13 +37,22 @@ jobs:
         with:
           node-version: '20'
 
+      - name: Configure AWS via OIDC
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: arn:aws:iam::${{ secrets.AWS_ACCOUNT_ID }}:role/grug-gha-deploy
+          aws-region: us-east-1
+
       - name: Resolve secrets from SSM
         id: secrets
         env:
           AWS_REGION: us-east-1
         run: |
           set -euo pipefail
-          # OIDC into AWS to read CF creds from SSM (same pattern as iac.deploy)
+          # OIDC must be configured BEFORE this step — earlier ordering
+          # called aws sts/ssm before configure-creds and failed on
+          # fresh self-hosted runners with no ambient AWS creds. Codex
+          # post-review #53.
           aws sts get-caller-identity > /dev/null
           CF_API_TOKEN=$(aws ssm get-parameter \
             --name /grug/cloudflare-api-token --with-decryption \
@@ -54,12 +63,6 @@ jobs:
           echo "::add-mask::$CF_API_TOKEN"
           echo "CLOUDFLARE_API_TOKEN=$CF_API_TOKEN" >> "$GITHUB_ENV"
           echo "CLOUDFLARE_ACCOUNT_ID=$CF_ACCOUNT_ID" >> "$GITHUB_ENV"
-
-      - name: Configure AWS via OIDC
-        uses: aws-actions/configure-aws-credentials@v4
-        with:
-          role-to-assume: arn:aws:iam::${{ secrets.AWS_ACCOUNT_ID }}:role/grug-gha-deploy
-          aws-region: us-east-1
 
       - name: Install deps
         working-directory: web
