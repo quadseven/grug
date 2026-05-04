@@ -78,17 +78,10 @@ def _verify_state(state: str) -> bool:
     return True
 
 
-# ---------------------------------------------------------------------------
-# Session token (separate format from CSRF state)
-# ---------------------------------------------------------------------------
-# Token = `<rand>.<ts>.<gh_id>.<hmac(rand.ts.gh_id)>`. Critical: gh_id is
-# bound INSIDE the signed payload — without that, a holder of any valid
-# session can swap the trailing component to impersonate any user. (Codex
-# post-hoc P1 + Sentry CRITICAL on PR #39 / Slice 3.)
-#
-# Also separates session TTL (7 days) from the 10-minute CSRF state TTL.
-# Earlier code used `_verify_state` for sessions which silently truncated
-# the cookie's intended 7-day lifetime to 10 minutes (Sentry CRITICAL).
+# Session token format = `<rand>.<ts>.<gh_id>.<hmac(rand.ts.gh_id)>`.
+# Critical: `gh_id` is in the signed payload — without that, a holder of
+# any valid session can swap the trailing component to impersonate any
+# user. (Codex P1 review of Slice 7 #28.)
 _SESSION_TTL_SECONDS = 86400 * 7  # 7 days
 
 
@@ -216,9 +209,8 @@ def callback(
                "allowlisted": user.allowlisted, "role": user.role},
     )
 
-    # Set session cookie. Format binds gh_id INSIDE the HMAC payload —
-    # see _make_session docstring for the impersonation attack the
-    # earlier `_make_state() + "." + gh_id` was vulnerable to.
+    # Set session cookie. Format: rand.ts.gh_id.sig where sig HMAC-binds
+    # gh_id (else the trailing component is swappable; Codex P1 in Slice 7).
     session_value = _make_session(gh_id)
     target = _DASHBOARD_URL if user.allowlisted else _WAITLIST_URL
     resp = RedirectResponse(url=target, status_code=302)

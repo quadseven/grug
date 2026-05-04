@@ -114,3 +114,77 @@ def is_install_allowlisted(install_id: int) -> bool:
             extra={"install_id": install_id, "user_id": user_id},
         )
     return allowlisted
+
+
+# ---------------------------------------------------------------------------
+# Slice 7 (#28) — per-repo persona toggles
+# ---------------------------------------------------------------------------
+
+# Default for v1: TPM enabled on every repo unless an override row says
+# otherwise. (Newly-installed users get value out-of-the-box; opt-out is
+# explicit per repo.)
+_DEFAULT_PERSONA_CONFIG = {"tpm_enabled": True}
+
+
+def _repo_sk(repo_id: int | str) -> str:
+    return f"REPO#{repo_id}"
+
+
+def list_user_installations(github_user_id: str) -> list[dict[str, Any]]:
+    """Return INST# rows installed by this user via the GSI1 index."""
+    resp = _table.query(
+        IndexName="GSI1",
+        KeyConditionExpression="GSI1PK = :pk AND begins_with(GSI1SK, :sk)",
+        ExpressionAttributeValues={
+            ":pk": str(github_user_id),
+            ":sk": "INST#",
+        },
+    )
+    return resp.get("Items", [])
+
+
+def get_repo_config(install_id: int, repo_id: int) -> dict[str, Any]:
+    """Per-repo persona override; returns defaults if no row exists."""
+    resp = _table.get_item(
+        Key={"PK": _inst_pk(install_id), "SK": _repo_sk(repo_id)},
+    )
+    item = resp.get("Item")
+    if not item:
+        return dict(_DEFAULT_PERSONA_CONFIG)
+    return {
+        "tpm_enabled": bool(item.get("tpm_enabled", _DEFAULT_PERSONA_CONFIG["tpm_enabled"])),
+    }
+
+
+def set_repo_config(
+    *,
+    install_id: int,
+    repo_id: int,
+    repo_full_name: str,
+    tpm_enabled: bool,
+    updated_by_user_id: str,
+) -> dict[str, Any]:
+    """Upsert per-repo override. Returns the resolved config."""
+    now = datetime.now(timezone.utc).isoformat()
+    item = {
+        "PK": _inst_pk(install_id),
+        "SK": _repo_sk(repo_id),
+        "repo_full_name": repo_full_name,
+        "tpm_enabled": bool(tpm_enabled),
+        "updated_at": now,
+        "updated_by_user_id": str(updated_by_user_id),
+    }
+    _table.put_item(Item=item)
+    return {"tpm_enabled": item["tpm_enabled"]}
+
+
+def is_persona_enabled(install_id: int, repo_id: int, persona: str) -> bool:
+    """Webhook-style check: is `persona` enabled for this repo?
+
+    Mirrored into services/webhook/adapters/install_store.py — the
+    webhook calls this before TPM dispatch so a user can disable Grug
+    on a noisy repo without uninstalling.
+    """
+    cfg = get_repo_config(install_id, repo_id)
+    key = f"{persona}_enabled"
+    return bool(cfg.get(key, _DEFAULT_PERSONA_CONFIG.get(key, True)))

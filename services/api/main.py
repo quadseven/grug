@@ -19,6 +19,7 @@ from datetime import datetime, timezone
 from fastapi import FastAPI
 
 from auth.github_oauth import router as github_oauth_router
+from installations import router as installations_router
 from observability import configure_logging
 
 configure_logging()
@@ -49,6 +50,7 @@ def readyz() -> dict[str, str]:
 
 
 app.include_router(github_oauth_router)
+app.include_router(installations_router)
 
 
 @app.get("/api/v1/health")

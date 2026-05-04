@@ -18,6 +18,7 @@ from typing import Any
 from adapters.install_store import (
     delete_installation,
     is_install_allowlisted,
+    is_persona_enabled,
     record_installation,
 )
 
@@ -108,6 +109,23 @@ def _handle_pull_request(payload: dict[str, Any]) -> dict[str, str]:
             },
         )
         return {"status": "no_op", "reason": "installer not allowlisted"}
+
+    # Per-repo persona toggle (Slice 7 #28). Lets users disable Grug on
+    # noisy repos without uninstalling the App entirely. Defaults to
+    # enabled — explicit opt-out per repo via dashboard.
+    repo_id = repo.get("id")
+    if repo_id is not None and not is_persona_enabled(
+        int(installation_id), int(repo_id), "tpm",
+    ):
+        log.info(
+            "persona_disabled_skip",
+            extra={
+                "installation_id": installation_id,
+                "owner": owner, "repo": repo_name, "pr_number": pr_number,
+                "persona": "tpm",
+            },
+        )
+        return {"status": "no_op", "reason": "tpm disabled for this repo"}
 
     # Lazy import — keeps cold-start cheap when only non-PR events fire
     from personas.tpm.persona import evaluate_pull_request  # type: ignore
