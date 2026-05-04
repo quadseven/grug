@@ -4,6 +4,9 @@ name: Drift lint · paired services/ files
 # services/webhook/ duplicate-file pattern (PRD #21 v1 trade-off) drifts.
 # Replace with a real shared-package extraction at v1.5.
 
+permissions:
+  contents: read
+
 on:
   pull_request:
     paths:
