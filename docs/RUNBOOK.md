@@ -247,3 +247,19 @@ Webhook handler `receive_github_webhook` is **sync `def`**, NOT `async def`.
 **Why**: every downstream call is sync I/O (boto3 DynamoDB, sync httpx GitHub posts, sync KMS via `crypto.kms_envelope`). An `async def` handler would block the event loop on each ~30-500ms call. FastAPI runs sync `def` handlers in a threadpool via Starlette's `run_in_threadpool`, so concurrent invocations don't starve each other.
 
 **Re-evaluate when**: we add genuine concurrent-fan-out (e.g. parallel GitHub calls for multi-repo PR scans via `asyncio.gather`). At that point migrate the relevant section to `httpx.AsyncClient` + `aioboto3` and switch the handler back to `async def`. Closes #68.
+
+### Mirrored files between services/api/ + services/webhook/
+
+Both Lambda services duplicate ~12 modules (adapters, ports, personas,
+github_app_auth, etc.) until the v1.5 shared-package extraction lands.
+
+`.github/workflows/drift-lint.yml` runs `scripts/check-mirrored-files.sh`
+on every PR touching either service. The script byte-compares each file
+in `MIRRORED_FILES` and fails with a clear diff when they diverge.
+
+When you patch a mirrored file, ALWAYS apply the same change to both
+copies. The lint catches misses at PR time.
+
+Files that intentionally diverge (FastAPI app, Lambda handler entrypoint,
+logger name) are simply not in `MIRRORED_FILES` — the allowlist is
+opt-in by omission. Closes #66.
