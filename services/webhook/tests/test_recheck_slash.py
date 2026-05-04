@@ -183,3 +183,35 @@ def test_tpm_disabled_per_repo_no_ops(monkeypatch):
     out = d.dispatch("issue_comment", payload)
     assert out["status"] == "no_op"
     assert "tpm disabled" in out["reason"]
+
+
+def test_perm_lookup_transport_error_returns_skip(_no_install_lookups):
+    """async-blocker-hunter F-01: transport error during perm lookup
+    must return skip + log, not 500."""
+    payload = _comment_payload(body="/grug recheck", sender_login="bob", pr_author="evan")
+
+    def _raise_transport(*args, **kwargs):
+        raise httpx.ConnectError("DNS failure")
+
+    with patch("github_app_auth.with_install_token_retry", side_effect=lambda _i, fn: fn("tok")):
+        with patch("httpx.get", side_effect=_raise_transport):
+            out = d.dispatch("issue_comment", payload)
+
+    assert out["status"] == "skip"
+    assert "transport" in out["reason"]
+
+
+def test_pr_fetch_transport_error_returns_skip(_no_install_lookups):
+    """async-blocker-hunter F-01: transport error during PR re-fetch
+    must return skip + log, not 500."""
+    payload = _comment_payload(body="/grug recheck", sender_login="evan", pr_author="evan")
+
+    def _raise_timeout(*args, **kwargs):
+        raise httpx.ReadTimeout("github.com slow")
+
+    with patch("github_app_auth.with_install_token_retry", side_effect=lambda _i, fn: fn("tok")):
+        with patch("httpx.get", side_effect=_raise_timeout):
+            out = d.dispatch("issue_comment", payload)
+
+    assert out["status"] == "skip"
+    assert "transport" in out["reason"]
