@@ -24,6 +24,11 @@ def create(
             scan_on_push=True,
         ),
         image_tag_mutability="MUTABLE",
+        # `pulumi destroy` fails on non-empty ECR repos by default —
+        # force_delete=true lets Slice 10 #31 `make rebuild` work
+        # against a deployed stack with bootstrap + CI images present.
+        # Codex post-review of Slice 10 tooling.
+        force_delete=True,
         tags={"app": "grug", "managed-by": "pulumi"},
     )
 

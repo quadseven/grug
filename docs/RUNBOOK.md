@@ -155,3 +155,77 @@ All grug DD entities tagged:
 - `env:dev` or `env:prod`
 - `version:<image-tag>` (typically commit SHA)
 - `app:grug` (resource tag on AWS resources)
+
+## Disaster recovery — full tear-down + cold rebuild
+
+Slice 10 (#31) acceptance proof. The "ready to tear down + build" requirement is load-bearing for AWS-org migration AND any-region failover. Verified via `make rebuild` round-trip against dev.
+
+### What survives `pulumi destroy`
+
+| Persists | Where |
+|---|---|
+| App registration (App ID, slug, OAuth client ID/secret) | github.com/settings/apps |
+| Webhook URL setting | github.com (matches DNS recreated by Pulumi) |
+| App webhook secret + private key | SSM SecureString `/grug/github-app-{webhook-secret,private-key}` |
+| OAuth client secret | SSM `/grug/github-app-client-secret` |
+| Existing installations | github.com (install_id 129256114 etc.) |
+| Branch protection on installed repos | github.com (referencing check-run name `Grug — Definition of Ready`) |
+| Datadog API + App keys | SSM `/shared/datadog-{api,app}-key` |
+| Cloudflare API token | SSM `/grug/cloudflare-api-token` |
+
+### What gets destroyed + recreated
+
+- Lambdas (`grug-webhook`, `grug-api`)
+- ECR repositories (untagged-14d lifecycle policy)
+- DDB table `grug-main` — incl. INST# rows + USER# rows (admin row + per-repo configs ALL LOST)
+- KMS CMK `alias/grug-tokens` (7-day deletion delay; new key takes same alias but different KeyID)
+- CF DNS records (`webhook.grug.lol`, `api.grug.lol`)
+- CF Workers (`grug-webhook-host-rewrite`, `grug-api-host-rewrite`)
+- DD monitors + synthetic uptime test
+- IAM roles + policies
+- CloudWatch log groups (14d retention)
+
+### Procedure
+
+```bash
+make rebuild
+```
+
+The target chains:
+
+1. `make tear-down` — `pulumi destroy --yes` (~5min)
+2. `pulumi up --yes` — recreates ECR + Lambdas with `:bootstrap` python:3.13 base
+3. `gh workflow run iac.deploy.yml` + `gh run watch` — CI builds + pushes real images, then re-runs `pulumi up` to swap imageUri (~5-7min)
+4. `bash infra/cloudflare/deploy.sh` — re-deploys Workers (Function URL host changes on recreate per `reference_lambda_function_url_host_volatile`)
+5. `python infra/scripts/seed-admin.py` — re-creates admin USER# + INST# rows (without these, allowlist gate no_ops every PR)
+6. `make smoke` — asserts `webhook.grug.lol/livez`, `api.grug.lol/livez`, `api.grug.lol/api/v1/health`, `grug.lol`, and `POST /webhook/github` (no-sig) all respond as expected
+
+Wall-clock: ~12-15 min. PR check-runs queue + retry post-rebuild (GitHub auto-retries 3× over ~30min on 5xx/connection-refused).
+
+### Tear-down only
+
+When you want to stop incurring AWS costs (e.g. before a long break) without rebuild:
+
+```bash
+make tear-down
+```
+
+Note: KMS CMK enters 7-day pending-deletion. Within that window, `pulumi up` against the same stack will recreate the alias on a new key (the old DEKs become unrecoverable, but no DDB data depends on them after destroy).
+
+### What `make rebuild` does NOT recover
+
+- **Encrypted OAuth tokens in old DDB rows** — if a user OAuth'd before tear-down, their tokens were encrypted with the OLD KMS DEK. Rows deleted; new sign-in re-encrypts with new DEK. Acceptable: zero impact for v1 admin-only user base.
+- **Per-repo persona overrides** — REPO# rows under INST# get nuked. Admins reconfigure via dashboard or via DDB CLI from a saved snapshot.
+- **In-flight CI runs** — workflows that triggered against the destroyed Lambda will 5xx. Re-trigger after rebuild.
+
+### Recovery override variables
+
+`make rebuild` reads these env vars (defaults match Evan's GitHub identity):
+
+| Var | Default | Use |
+|---|---|---|
+| `GRUG_ADMIN_USER_ID` | 59060157 | Numeric GitHub user ID for admin USER# row |
+| `GRUG_ADMIN_LOGIN` | githumps | login for the row |
+| `GRUG_ADMIN_INSTALL_ID` | 129256114 | INST# row to backfill (skip on org-account migrations where install_id changed) |
+
+Override per-recovery: `GRUG_ADMIN_USER_ID=123 make rebuild`
