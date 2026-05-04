@@ -92,7 +92,7 @@ _dd_extension_version = config.get("dd_extension_version") or "65"
 
 # OIDC trust for GitHub Actions deploys from githumps/grug. Per
 # `feedback_prefer_ssm_over_1p` — no long-lived AWS creds in the repo.
-gha_deploy_role = oidc_role.create(
+_deploy_role_bundle = oidc_role.create(
     name="grug-gha-deploy",
     repo="githumps/grug",
     # `main` and SaaS-conversion feature branches (epic-grug-saas).
@@ -105,6 +105,11 @@ gha_deploy_role = oidc_role.create(
     branches=["main", "feat/*", "fix/*", "hotfix/*"],
     tags_pattern="v*",
 )
+gha_deploy_role = _deploy_role_bundle.role
+# Sleep waiter that gates KMS-using Lambda Function ops on the deploy
+# role's IAM policy having propagated. Closes #88 — replaces workflow-
+# layer retry hack with in-IaC dependency edge.
+_iam_propagation_wait = _deploy_role_bundle.iam_propagation_wait
 
 # Slice 2 (#23) — DDB single-table + KMS CMK + api Lambda
 grug_main_table = ddb_table.create("grug-main")
@@ -185,6 +190,10 @@ webhook = lambda_service.create(
     # plaintext API key. Closes #60. Webhook role granted kms:Decrypt
     # via the additional inline policy below.
     env_vars_kms_key_arn=grug_tokens_cmk.arn,
+    # Wait 45s after deploy-role policy update so AWS auth-checks see
+    # `kms:Encrypt` + `kms:GenerateDataKey` before this Function update
+    # runs. Closes #88.
+    iam_propagation_wait=_iam_propagation_wait,
 )
 
 # Webhook role gains kms:Decrypt on the grug-tokens CMK — required so
@@ -294,6 +303,8 @@ api_lambda = lambda_service.create(
     # OAuth tokens), so the additional Lambda-runtime decrypt at cold
     # start is covered by the existing grant. Closes #60.
     env_vars_kms_key_arn=grug_tokens_cmk.arn,
+    # See webhook above. Closes #88.
+    iam_propagation_wait=_iam_propagation_wait,
 )
 
 # Per IAM split (Slice 2 acceptance criterion): api Lambda CAN decrypt

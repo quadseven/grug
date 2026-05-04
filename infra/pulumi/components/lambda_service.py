@@ -41,6 +41,7 @@ def create(
     cors_allow_headers: list[str] | None = None,
     cors_allow_credentials: bool = False,
     env_vars_kms_key_arn: pulumi.Input[str] | None = None,
+    iam_propagation_wait: pulumi.Resource | None = None,
 ) -> LambdaService:
     log_group = aws.cloudwatch.LogGroup(
         f"{name}-logs",
@@ -152,6 +153,16 @@ def create(
     # plaintext-visible to anyone with default ReadOnlyAccess Lambda
     # perms. Lambda runtime decrypts before extension boot, so DD ext
     # still reads DD_API_KEY normally.
+    # `iam_propagation_wait` (issue #88) defers Lambda create/update
+    # until the GHA deploy role's RolePolicy has propagated through
+    # AWS IAM (10-30s typical). Without this, an in-same-plan addition
+    # of `kms:Encrypt` + `kms:GenerateDataKey` to the deploy role +
+    # Lambda kms_key_arn-touching update collides on AWS auth-check.
+    function_opts = (
+        pulumi.ResourceOptions(depends_on=[iam_propagation_wait])
+        if iam_propagation_wait is not None
+        else None
+    )
     function = aws.lambda_.Function(
         name,
         name=name,
@@ -178,6 +189,7 @@ def create(
             "env": env_vars["GRUG_ENV"],
             "team": "grug",
         },
+        opts=function_opts,
     )
 
     # Lambda Function URL CORS — preflight handled by AWS *before* the

@@ -5,14 +5,25 @@ secrets. GHA assumes this role via OIDC each deploy.
 
 Trust is scoped to a specific repo + ref pattern (branches + tags) so a
 fork or PR from a different repo can't assume the role.
+
+IAM eventual-consistency: when this role's RolePolicy is updated AND in
+the same `pulumi up` run a Lambda is configured to use the new perms
+(e.g. kms_key_arn requires kms:Encrypt + kms:GenerateDataKey on the
+caller), AWS auth checks may still see the old policy for 10-30s. Closes
+issue #88 — replaces the workflow-layer retry hack with an in-IaC
+`pulumiverse_time.Sleep` whose triggers re-fire on policy content
+change. Local + CI pulumi-up share the same waiter.
 """
 
 from __future__ import annotations
 
+import hashlib
 import json
+from dataclasses import dataclass
 
 import pulumi
 import pulumi_aws as aws
+import pulumiverse_time as ptime
 
 
 def _ensure_oidc_provider() -> str:
@@ -35,12 +46,21 @@ def _ensure_oidc_provider() -> str:
     )
 
 
+@dataclass
+class DeployRole:
+    """Bundle returned by `create()` so the composition root can wire the
+    `iam_propagation_wait` resource into Lambda Function `depends_on`."""
+
+    role: aws.iam.Role
+    iam_propagation_wait: ptime.Sleep
+
+
 def create(
     name: str,
     repo: str,
     branches: list[str],
     tags_pattern: str | None = None,
-) -> aws.iam.Role:
+) -> DeployRole:
     provider_arn = _ensure_oidc_provider()
 
     sub_patterns = [f"repo:{repo}:ref:refs/heads/{b}" for b in branches]
@@ -87,10 +107,7 @@ def create(
     # SSM read explicitly includes `/shared/*` so CI can fetch the
     # cross-repo Pulumi access token (per githumps/infrastructure#164
     # SSM convention — `/shared/<token>` is the cross-cutting namespace).
-    aws.iam.RolePolicy(
-        f"{name}-policy",
-        role=role.id,
-        policy=json.dumps(
+    deploy_policy_doc = json.dumps(
             {
                 "Version": "2012-10-17",
                 "Statement": [
@@ -138,6 +155,28 @@ def create(
                     },
                 ],
             },
-        ),
+        )
+    deploy_policy = aws.iam.RolePolicy(
+        f"{name}-policy",
+        role=role.id,
+        policy=deploy_policy_doc,
     )
-    return role
+
+    # Hash the policy doc so a content change re-triggers the Sleep
+    # (which forces a 45s wait before any depends_on Lambda update).
+    # Per pulumiverse_time docs, `triggers` change → resource replace →
+    # `create_duration` re-fires.
+    policy_hash = hashlib.sha256(deploy_policy_doc.encode()).hexdigest()
+    iam_propagation_wait = ptime.Sleep(
+        f"{name}-iam-propagation",
+        create_duration="45s",
+        triggers={
+            "role_policy_id": deploy_policy.id,
+            # Content hash so policy edits (not just resource id) refresh
+            # the wait. Without this, in-place policy.update wouldn't
+            # cause the Sleep to refire.
+            "policy_sha256": policy_hash,
+        },
+    )
+
+    return DeployRole(role=role, iam_propagation_wait=iam_propagation_wait)
