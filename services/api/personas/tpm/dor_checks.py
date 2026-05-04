@@ -34,8 +34,15 @@ _BULLET_PAT = re.compile(
 )
 _SECTION_PAT = re.compile(r"^##+\s+(.+?)\s*$", re.MULTILINE)
 _SIZE_PAT = re.compile(r"\b(?:Size:?\s*)?(XS|S|M|L|XL)\b", re.IGNORECASE)
+# Accept the closing keywords + reference keywords + bare `#N` at line
+# start (the legacy gate's behavior). Codex post-review #49 — earlier
+# regex regressed valid PR bodies using `Refs #N` / `Blocked by #N`.
 _ISSUE_LINK_PAT = re.compile(
-    r"\b(?:closes|fixes|resolves|part\s+of)\s+#\d+", re.IGNORECASE,
+    r"(?:"
+    r"\b(?:closes|fixes|resolves|part\s+of|refs|relates\s+to|blocked\s+by)\s+#\d+"
+    r"|^\s*#\d+\b"
+    r")",
+    re.IGNORECASE | re.MULTILINE,
 )
 
 
