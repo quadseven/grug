@@ -183,19 +183,22 @@ webhook = lambda_service.create(
 # BEFORE the DD extension or our handler boots. Scoped via
 # `kms:ViaService = lambda` so this perm can't be reused for other
 # KMS-protected resources. Closes #60.
+# Region resolved from the active aws provider so a future multi-region
+# deploy doesn't silently break this condition. Greptile P2 PR #79.
+_aws_region = aws.get_region().name
 aws.iam.RolePolicy(
     "grug-webhook-envvar-kms-policy",
     role=webhook.role.id,
-    policy=grug_tokens_cmk.arn.apply(
-        lambda arn: json.dumps({
+    policy=pulumi.Output.all(grug_tokens_cmk.arn, _aws_region).apply(
+        lambda args: json.dumps({
             "Version": "2012-10-17",
             "Statement": [{
                 "Effect": "Allow",
                 "Action": "kms:Decrypt",
-                "Resource": arn,
+                "Resource": args[0],
                 "Condition": {
                     "StringEquals": {
-                        "kms:ViaService": "lambda.us-east-1.amazonaws.com",
+                        "kms:ViaService": f"lambda.{args[1]}.amazonaws.com",
                     },
                 },
             }],

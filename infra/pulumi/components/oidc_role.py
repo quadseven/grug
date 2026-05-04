@@ -111,7 +111,16 @@ def create(
                             # is set on the function. Without kms:Encrypt
                             # on the deployer role, UpdateFunctionConfig
                             # 403s. Closes #60.
+                            #
+                            # kms:CreateGrant — required by AWS docs
+                            # for "configuring a customer managed key on
+                            # a Lambda function". Lambda needs the grant
+                            # to encrypt/decrypt during invocations.
+                            # Greptile P1 PR #79 (defensive: pulumi up
+                            # works without it, but AWS docs are
+                            # explicit it should be present).
                             "kms:Encrypt",
+                            "kms:CreateGrant",
                             "kms:DescribeKey",
                         ],
                         # NOTE: tightening to specific resource ARNs is a
