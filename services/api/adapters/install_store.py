@@ -64,20 +64,34 @@ def record_installation(
 
     On `installation:deleted` callers should use `delete_installation`
     instead — this function only writes.
+
+    Uses an atomic UpdateExpression with `if_not_exists(installed_at)`
+    so concurrent duplicate webhook deliveries can't race-overwrite
+    the original install timestamp (Codex P2 follow-up to Greptile P2
+    on PR #41 — read-then-put had a race window between two concurrent
+    Lambda invocations).
     """
     now = datetime.now(timezone.utc).isoformat()
-    _table.put_item(
-        Item={
-            "PK": _inst_pk(install_id),
-            "SK": "META",
-            "account_login": account_login,
-            "account_type": account_type,
-            "installed_at": now,
-            "installed_by_user_id": str(installed_by_user_id),
-            # GSI1 — list installations by user (per PRD #21 schema).
-            "GSI1PK": str(installed_by_user_id),
-            "GSI1SK": _inst_pk(install_id),
-        }
+    _table.update_item(
+        Key={"PK": _inst_pk(install_id), "SK": "META"},
+        UpdateExpression=(
+            "SET account_login = :login, "
+            "account_type = :atype, "
+            "installed_by_user_id = :by, "
+            "GSI1PK = :gsi1pk, "
+            "GSI1SK = :gsi1sk, "
+            # if_not_exists preserves the original timestamp when the
+            # row already has one — concurrent-safe.
+            "installed_at = if_not_exists(installed_at, :now)"
+        ),
+        ExpressionAttributeValues={
+            ":login": account_login,
+            ":atype": account_type,
+            ":by": str(installed_by_user_id),
+            ":gsi1pk": str(installed_by_user_id),
+            ":gsi1sk": _inst_pk(install_id),
+            ":now": now,
+        },
     )
 
 
