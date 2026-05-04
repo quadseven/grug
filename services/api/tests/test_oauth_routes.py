@@ -112,3 +112,47 @@ def test_logout_returns_204_and_clears_cookie(_oauth_mod):
     assert "grug_session=" in set_cookie
     # delete_cookie sets max-age=0 OR expires in the past
     assert "Max-Age=0" in set_cookie or "max-age=0" in set_cookie or "expires=" in set_cookie.lower()
+
+
+# ── TestClient end-to-end tests cover FastAPI router wiring ──
+# code-reviewer flagged that direct-handler-call tests bypass the
+# router (a typo'd @router.get path would still pass). At least one
+# happy-path TestClient call per route catches that drift.
+
+def test_logout_via_test_client(_oauth_mod):
+    """Real router round-trip — catches @router.post path typos +
+    middleware regressions."""
+    from fastapi.testclient import TestClient
+    from main import app
+    client = TestClient(app)
+    r = client.post("/api/v1/auth/logout")
+    assert r.status_code == 204
+    # cookie cleared via Set-Cookie header (TestClient strips on ack)
+    assert any(
+        c.lower().startswith("grug_session=")
+        for c in r.headers.get_list("set-cookie")
+    )
+
+
+def test_me_anonymous_via_test_client(_oauth_mod):
+    """Real router round-trip — anonymous /me returns the documented shape."""
+    from fastapi.testclient import TestClient
+    from main import app
+    client = TestClient(app)
+    r = client.get("/api/v1/me")
+    assert r.status_code == 200
+    assert r.json() == {"authenticated": False}
+
+
+def test_login_via_test_client(_oauth_mod):
+    """Real router round-trip — login redirects + sets cookie."""
+    from fastapi.testclient import TestClient
+    from main import app
+    client = TestClient(app)
+    r = client.get("/api/v1/auth/github/login", follow_redirects=False)
+    assert r.status_code == 302
+    assert r.headers["location"].startswith("https://github.com/login/oauth/authorize?")
+    assert any(
+        c.startswith("grug_oauth_state=")
+        for c in r.headers.get_list("set-cookie")
+    )

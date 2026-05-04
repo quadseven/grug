@@ -38,12 +38,29 @@ def test_no_healthz_endpoint() -> None:
     assert r.status_code == 404
 
 
-def test_livez_does_no_io():
+def test_livez_does_no_io(monkeypatch):
     """Liveness must be cheap — no DDB, KMS, or HTTPX call. If it ever
-    starts depending on downstream, move it to /readyz semantics."""
-    import inspect
-    import main as webhook_main
-    src = inspect.getsource(webhook_main.livez)
-    forbidden = ("get_item", "decrypt", "httpx.", "_table.", "boto3.")
-    assert not any(token in src for token in forbidden), \
-        f"livez must not do IO; found one of {forbidden} in source"
+    starts depending on downstream, move it to /readyz semantics.
+
+    Runtime sentinel: patch every potential IO surface with a noisy
+    mock that records calls. After hitting /livez, assert zero calls
+    to ANY of them. Catches more than the prior source-string scan
+    (helper functions, renamed variables, future deps)."""
+    from unittest.mock import MagicMock
+    import boto3
+    import httpx
+
+    boto3_client_calls: list = []
+    boto3_resource_calls: list = []
+    httpx_calls: list = []
+
+    monkeypatch.setattr(boto3, "client", MagicMock(side_effect=lambda *a, **k: boto3_client_calls.append((a, k)) or MagicMock()))
+    monkeypatch.setattr(boto3, "resource", MagicMock(side_effect=lambda *a, **k: boto3_resource_calls.append((a, k)) or MagicMock()))
+    for verb in ("get", "post", "put", "delete", "patch"):
+        monkeypatch.setattr(httpx, verb, MagicMock(side_effect=lambda *a, **k: httpx_calls.append((verb, a, k)) or MagicMock()))
+
+    r = client.get("/livez")
+    assert r.status_code == 200
+    assert boto3_client_calls == [], "livez triggered boto3.client()"
+    assert boto3_resource_calls == [], "livez triggered boto3.resource()"
+    assert httpx_calls == [], f"livez triggered httpx call: {httpx_calls}"
