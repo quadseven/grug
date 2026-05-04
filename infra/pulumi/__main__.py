@@ -93,7 +93,12 @@ gha_deploy_role = oidc_role.create(
     repo="githumps/grug",
     # `main` and SaaS-conversion feature branches (epic-grug-saas).
     # Tighten back to `main` only once Slice 13 (#34) ships.
-    branches=["main", "feat/22-*", "feat/23-*", "feat/24-*", "feat/25-*", "feat/26-*"],
+    # Permissive `feat/*` + `fix/*` during the SaaS conversion (closes #64).
+    # Tighten back to `main` only at Slice 13 cutover (#34). Earlier
+    # per-slice patterns required local pulumi up after every new branch
+    # AND silently narrowed back whenever main re-deployed without the
+    # wider list.
+    branches=["main", "feat/*", "fix/*", "hotfix/*"],
     tags_pattern="v*",
 )
 
