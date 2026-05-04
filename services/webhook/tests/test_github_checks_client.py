@@ -106,26 +106,22 @@ def test_post_check_run_includes_external_id_when_provided():
     assert body["external_id"] == "trace-id-7"
 
 
-def test_post_check_run_401_propagates_for_retry_helper():
+def test_post_check_run_401_propagates_for_retry_helper(mock_transport_client):
     """post_check_run does NOT swallow 401 — the with_install_token_retry
     wrapper at the call site is responsible for invalidating the cache
-    + retrying. Closes #50."""
+    + retrying. Closes #50.
+
+    Real-transport-backed (issue #105): exception comes from
+    `resp.raise_for_status()` on a real `httpx.Response(401)`, not from
+    a hand-built `HTTPStatusError`.
+    """
     result = CheckRunResult(
         name="dor", head_sha="abc", status="completed",
         conclusion="success", title="x", summary="y",
     )
+    client = mock_transport_client(status_codes=[401])
 
-    def _raise_401():
-        raise httpx.HTTPStatusError(
-            "401",
-            request=httpx.Request("POST", "https://api.github.com/..."),
-            response=httpx.Response(401),
-        )
-
-    bad = _ok_response()
-    bad.raise_for_status = _raise_401
-
-    with patch("httpx.post", return_value=bad):
+    with patch("httpx.post", side_effect=lambda *a, **kw: client.post(*a, **kw)):
         with pytest.raises(httpx.HTTPStatusError) as exc:
             post_check_run("stale-tok", "o", "r", result)
     assert exc.value.response.status_code == 401
@@ -150,23 +146,31 @@ def test_check_run_result_rejects_in_progress_with_conclusion():
         )
 
 
-def test_post_check_run_500_propagates_unwrapped():
+def test_post_check_run_500_propagates_unwrapped(mock_transport_client):
+    """Real-transport-backed (issue #105) — 500 raised via raise_for_status."""
     result = CheckRunResult(
         name="dor", head_sha="abc", status="completed",
         conclusion="success", title="x", summary="y",
     )
+    client = mock_transport_client(status_codes=[500])
 
-    def _raise_500():
-        raise httpx.HTTPStatusError(
-            "500",
-            request=httpx.Request("POST", "https://api.github.com/..."),
-            response=httpx.Response(500),
-        )
-
-    bad = _ok_response()
-    bad.raise_for_status = _raise_500
-
-    with patch("httpx.post", return_value=bad):
+    with patch("httpx.post", side_effect=lambda *a, **kw: client.post(*a, **kw)):
         with pytest.raises(httpx.HTTPStatusError) as exc:
             post_check_run("tok", "o", "r", result)
     assert exc.value.response.status_code == 500
+
+
+def test_post_check_run_connect_error_propagates(mock_transport_client):
+    """Transport-level ConnectError must propagate (not get caught by an
+    httpx.HTTPStatusError-only handler). Closes mock-vs-real gap from
+    issue #105 / async-blocker-hunter F-01.
+    """
+    result = CheckRunResult(
+        name="dor", head_sha="abc", status="completed",
+        conclusion="success", title="x", summary="y",
+    )
+    client = mock_transport_client(raise_exc=httpx.ConnectError("dns down"))
+
+    with patch("httpx.post", side_effect=lambda *a, **kw: client.post(*a, **kw)):
+        with pytest.raises(httpx.ConnectError):
+            post_check_run("tok", "o", "r", result)
