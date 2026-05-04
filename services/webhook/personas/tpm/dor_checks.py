@@ -87,7 +87,16 @@ def check_why(body: str) -> CheckResult:
 
 
 def check_acceptance(body: str) -> CheckResult:
-    text = _section_text(body, "Acceptance criteria", "Test plan")
+    # Track which heading name actually matched so the failure message
+    # references the section the author used. Greptile P2 on PR #40 —
+    # earlier code always said "Acceptance criteria" even when only
+    # "Test plan" was present, sending users hunting for a section that
+    # doesn't exist.
+    matched_name = "Acceptance criteria"
+    text = _section_text(body, "Acceptance criteria")
+    if text is None:
+        text = _section_text(body, "Test plan")
+        matched_name = "Test plan"
     if text is None:
         return CheckResult(
             "acceptance", False,
@@ -97,7 +106,7 @@ def check_acceptance(body: str) -> CheckResult:
     if len(bullets) < 3:
         return CheckResult(
             "acceptance", False,
-            f"## Acceptance criteria has {len(bullets)} non-empty bullets; need ≥3",
+            f"## {matched_name} has {len(bullets)} non-empty bullets; need ≥3",
         )
     return CheckResult("acceptance", True, f"{len(bullets)} bullets")
 
