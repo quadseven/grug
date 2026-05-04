@@ -131,7 +131,15 @@ Verify-as-acceptance criterion per PRD (Slice 10 #31). Should reproduce in <15 m
 # Destroy
 cd infra/pulumi && pulumi destroy --yes
 
-# Rebuild from clean (re-do first-time-deploy steps 2-6)
+# Rebuild from clean — 7-step round trip (Makefile `rebuild` target):
+#   1. tear-down
+#   2. pulumi up --target ECR repos only (Lambda image-mode prereq)
+#   3. bootstrap-images (crane copy public python:3.13 → private ECR)
+#   4. pulumi up — full stack (Lambdas resolve image_uri)
+#   5. trigger CI to build + push real images, swap imageUri
+#   6. CF Workers re-deploy + admin re-seed (Function URL host churn)
+#   7. smoke test
+make rebuild
 ```
 
 State that lives outside Pulumi (and persists across destroy):

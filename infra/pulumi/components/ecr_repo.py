@@ -15,8 +15,15 @@ import pulumi_aws as aws
 def create(
     name: str,
     untagged_expire_days: int = 14,
+    force_delete: bool = False,
 ) -> aws.ecr.Repository:
-    """Create a private ECR repo with lifecycle pruning."""
+    """Create a private ECR repo with lifecycle pruning.
+
+    `force_delete` is opt-in per stack. Slice 10 #31 `make rebuild`
+    needs it for the dev stack so `pulumi destroy` can wipe non-empty
+    repos; prod must default to False so `pulumi destroy --stack prod`
+    cannot silently delete production images. Greptile P2 PR #59.
+    """
     repo = aws.ecr.Repository(
         name,
         name=name,
@@ -24,11 +31,7 @@ def create(
             scan_on_push=True,
         ),
         image_tag_mutability="MUTABLE",
-        # `pulumi destroy` fails on non-empty ECR repos by default —
-        # force_delete=true lets Slice 10 #31 `make rebuild` work
-        # against a deployed stack with bootstrap + CI images present.
-        # Codex post-review of Slice 10 tooling.
-        force_delete=True,
+        force_delete=force_delete,
         tags={"app": "grug", "managed-by": "pulumi"},
     )
 
