@@ -16,6 +16,8 @@ provider config).
 
 from __future__ import annotations
 
+import json
+
 import pulumi
 import pulumi_aws as aws
 import pulumi_cloudflare as cloudflare
@@ -178,6 +180,39 @@ webhook = lambda_service.create(
     },
     timeout_seconds=15,
     memory_mb=512,
+    # Encrypt env vars (DD_API_KEY in particular) at rest so a reader
+    # with `lambda:GetFunctionConfiguration` alone can't recover the
+    # plaintext API key. Closes #60. Webhook role granted kms:Decrypt
+    # via the additional inline policy below.
+    env_vars_kms_key_arn=grug_tokens_cmk.arn,
+)
+
+# Webhook role gains kms:Decrypt on the grug-tokens CMK — required so
+# the Lambda runtime can unwrap encrypted env vars at cold start
+# BEFORE the DD extension or our handler boots. Scoped via
+# `kms:ViaService = lambda` so this perm can't be reused for other
+# KMS-protected resources. Closes #60.
+# Region resolved from the active aws provider so a future multi-region
+# deploy doesn't silently break this condition. Greptile P2 PR #79.
+_aws_region = aws.get_region().name
+aws.iam.RolePolicy(
+    "grug-webhook-envvar-kms-policy",
+    role=webhook.role.id,
+    policy=pulumi.Output.all(grug_tokens_cmk.arn, _aws_region).apply(
+        lambda args: json.dumps({
+            "Version": "2012-10-17",
+            "Statement": [{
+                "Effect": "Allow",
+                "Action": "kms:Decrypt",
+                "Resource": args[0],
+                "Condition": {
+                    "StringEquals": {
+                        "kms:ViaService": f"lambda.{args[1]}.amazonaws.com",
+                    },
+                },
+            }],
+        }),
+    ),
 )
 
 # Cloudflare DNS — webhook.grug.lol → Lambda Function URL host
@@ -254,6 +289,11 @@ api_lambda = lambda_service.create(
     cors_allow_methods=["GET", "POST", "PUT", "DELETE"],
     cors_allow_headers=["content-type", "authorization"],
     cors_allow_credentials=True,
+    # Encrypt env vars at rest — api role already has kms:Decrypt on
+    # this CMK via kms_cmk.grant_use_to_role below (envelope-encrypted
+    # OAuth tokens), so the additional Lambda-runtime decrypt at cold
+    # start is covered by the existing grant. Closes #60.
+    env_vars_kms_key_arn=grug_tokens_cmk.arn,
 )
 
 # Per IAM split (Slice 2 acceptance criterion): api Lambda CAN decrypt

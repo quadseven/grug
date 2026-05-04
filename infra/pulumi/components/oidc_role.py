@@ -106,6 +106,22 @@ def create(
                             "cloudwatch:*",
                             "sts:GetCallerIdentity",
                             "kms:Decrypt",
+                            # Lambda eagerly encrypts env vars on the
+                            # CALLING principal's behalf when kms_key_arn
+                            # is set on the function. Without kms:Encrypt
+                            # on the deployer role, UpdateFunctionConfig
+                            # 403s. Closes #60.
+                            #
+                            # kms:CreateGrant — required by AWS docs
+                            # for "configuring a customer managed key on
+                            # a Lambda function". Lambda needs the grant
+                            # to encrypt/decrypt during invocations.
+                            # Greptile P1 PR #79 (defensive: pulumi up
+                            # works without it, but AWS docs are
+                            # explicit it should be present).
+                            "kms:Encrypt",
+                            "kms:CreateGrant",
+                            "kms:DescribeKey",
                         ],
                         # NOTE: tightening to specific resource ARNs is a
                         # follow-up. Slice 1 prioritizes "deploy works".
