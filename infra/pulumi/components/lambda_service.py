@@ -40,6 +40,7 @@ def create(
     cors_allow_methods: list[str] | None = None,
     cors_allow_headers: list[str] | None = None,
     cors_allow_credentials: bool = False,
+    env_vars_kms_key_arn: pulumi.Input[str] | None = None,
 ) -> LambdaService:
     log_group = aws.cloudwatch.LogGroup(
         f"{name}-logs",
@@ -143,6 +144,14 @@ def create(
         ecr_repo.repository_url, ":", image_tag,
     )
 
+    # When env_vars_kms_key_arn is set, Lambda encrypts ALL env vars
+    # with that CMK at rest. `aws lambda get-function-configuration`
+    # returns ciphertext blobs instead of plaintext, so a reader needs
+    # BOTH `lambda:GetFunctionConfiguration` AND `kms:Decrypt` on the
+    # CMK to recover values. Closes #60 — DD_API_KEY was previously
+    # plaintext-visible to anyone with default ReadOnlyAccess Lambda
+    # perms. Lambda runtime decrypts before extension boot, so DD ext
+    # still reads DD_API_KEY normally.
     function = aws.lambda_.Function(
         name,
         name=name,
@@ -153,6 +162,7 @@ def create(
         memory_size=memory_mb,
         architectures=["arm64"],
         layers=layers or [],
+        kms_key_arn=env_vars_kms_key_arn,
         environment=aws.lambda_.FunctionEnvironmentArgs(
             variables=env_vars,
         ),
