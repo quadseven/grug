@@ -33,7 +33,15 @@ _BULLET_PAT = re.compile(
     re.MULTILINE,
 )
 _SECTION_PAT = re.compile(r"^##+\s+(.+?)\s*$", re.MULTILINE)
-_SIZE_PAT = re.compile(r"\b(?:Size:?\s*)?(XS|S|M|L|XL)\b", re.IGNORECASE)
+# Sentry MED on PR #40 — earlier `(?:Size:?\s*)?` made the prefix
+# OPTIONAL, so a body like "use the M&Ms" would match `M` and falsely
+# satisfy the estimate check. Require an explicit `Size` token followed
+# by punctuation/whitespace/markdown-emphasis (`:` `**` `_` etc.) and
+# then the value. Prefix `(?:^|[^A-Za-z])` stops `mySize` from matching.
+_SIZE_PAT = re.compile(
+    r"(?:^|[^A-Za-z])Size[:\s\*_]+(XS|S|M|L|XL)\b",
+    re.IGNORECASE,
+)
 # Accept the closing keywords + reference keywords + bare `#N` at line
 # start (the legacy gate's behavior). Codex post-review #49 — earlier
 # regex regressed valid PR bodies using `Refs #N` / `Blocked by #N`.

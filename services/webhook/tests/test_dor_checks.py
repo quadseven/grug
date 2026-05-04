@@ -71,6 +71,31 @@ def test_estimate_missing():
     assert not check_estimate("no size here").passed
 
 
+# Sentry MED on PR #40 — _SIZE_PAT must require Size: prefix, NOT match
+# bare letters in random prose.
+def test_estimate_rejects_bare_letter_in_prose():
+    """`M&Ms` / `the M key` / `XL t-shirts` must NOT satisfy estimate."""
+    for body in [
+        "use the M key",
+        "lots of M&Ms",
+        "XL t-shirts on sale",
+        "sentence with L in it",
+        "Size is fine but no value supplied",  # `Size` alone w/o letter
+    ]:
+        assert not check_estimate(body).passed, f"falsely accepted: {body!r}"
+
+
+def test_estimate_accepts_explicit_size_prefix_variants():
+    for body in [
+        "Size: M",
+        "Size:M",
+        "Size M",
+        "**Size:** S",
+        "size: l",  # lowercase
+    ]:
+        assert check_estimate(body).passed, f"should accept: {body!r}"
+
+
 def test_scope_fence_pass():
     assert check_scope_fence("## Out of scope\nstuff").passed
 
