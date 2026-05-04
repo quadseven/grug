@@ -3,12 +3,31 @@
 from __future__ import annotations
 
 import logging
-from typing import Any
+from dataclasses import dataclass
+from typing import Any, Literal
 
 from github_app_auth import with_install_token_retry
-from github_checks_client import CheckRunResult, post_check_run
+from github_checks_client import CheckConclusion, CheckRunResult, post_check_run
 from personas.tpm.dor_checks import CheckResult, run_all
 
+
+@dataclass(frozen=True)
+class TpmEvaluation:
+    """Persona-level rollup of dor_checks results.
+
+    Distinct from CheckResult (per-check name + passed + detail) so
+    callers don't have to know the magic name='overall' string. The
+    `conclusion` field aligns with github_checks_client's
+    CheckConclusion vocabulary so the GH POST shape stays explicit.
+    Closes #104.
+    """
+    passed: bool
+    results: tuple[CheckResult, ...]
+    conclusion: CheckConclusion
+
+# Logger uses the `grug.api.*` namespace; webhook-side copy uses
+# `grug.webhook.*`. The single-line divergence is intentional + the
+# only reason this file isn't in MIRRORED_FILES (drift-lint).
 log = logging.getLogger("grug.api.persona.tpm")
 
 _CHECK_NAME = "Grug — Definition of Ready"
@@ -38,17 +57,12 @@ def evaluate_pull_request(
     head_sha: str,
     pr_body: str,
     pr_number: int,
-) -> CheckResult:
-    """Run TPM checks on the PR body + post check-run. Returns overall result."""
+) -> TpmEvaluation:
+    """Run TPM checks on the PR body + post check-run. Returns rollup."""
     results = run_all(pr_body)
     failed = [r for r in results if not r.passed]
-    overall = CheckResult(
-        name="overall",
-        passed=not failed,
-        detail=("all pass" if not failed else f"{len(failed)} blocking"),
-    )
     title, summary = _summary(results)
-    conclusion = "success" if not failed else "failure"
+    conclusion: CheckConclusion = "success" if not failed else "failure"
 
     # Retry once on 401 — handles tokens revoked out-of-band (App
     # reinstall, perm change, secret rotation). Codex post-review #50.
@@ -75,8 +89,12 @@ def evaluate_pull_request(
             "repo": f"{owner}/{repo}",
             "pr_number": pr_number,
             "head_sha": head_sha[:8],
-            "passed": overall.passed,
+            "passed": not failed,
             "failed_checks": [r.name for r in failed],
         },
     )
-    return overall
+    return TpmEvaluation(
+        passed=not failed,
+        results=tuple(results),
+        conclusion=conclusion,
+    )
