@@ -9,7 +9,11 @@ from github_app_auth import with_install_token_retry
 from github_checks_client import CheckRunResult, post_check_run
 from personas.tpm.dor_checks import CheckResult, run_all
 
-log = logging.getLogger("grug.api.persona.tpm")
+# Logger uses the `grug.webhook.*` namespace because this file is the
+# webhook-side copy (mirrored from services/api/personas/tpm/persona.py).
+# Greptile P2 on PR #40 — earlier `grug.api.persona.tpm` would route DD
+# logs/queries to the wrong service.
+log = logging.getLogger("grug.webhook.persona.tpm")
 
 _CHECK_NAME = "Grug — Definition of Ready"
 

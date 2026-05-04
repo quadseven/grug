@@ -122,6 +122,22 @@ def test_record_idempotent(_ddb_table):
     assert mod.get_installation(10)["account_login"] == "bob"
 
 
+def test_record_preserves_installed_at_on_rewrite(_ddb_table):
+    """Greptile P2 on PR #41 — re-record must NOT overwrite installed_at.
+    Without this guard, a permissions-accept event months later would
+    silently re-stamp the row with that day's date, losing the original
+    install date forever."""
+    import time
+    mod = _ddb_table
+    mod.record_installation(install_id=42, account_login="a", account_type="User",
+                            installed_by_user_id=100)
+    first_ts = mod.get_installation(42)["installed_at"]
+    time.sleep(0.05)
+    mod.record_installation(install_id=42, account_login="a", account_type="User",
+                            installed_by_user_id=100)
+    assert mod.get_installation(42)["installed_at"] == first_ts
+
+
 # Slice 7 (#28) — per-repo persona toggles
 
 
