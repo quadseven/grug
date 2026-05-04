@@ -83,11 +83,11 @@ def test_me_session_valid_but_user_missing_returns_authenticated_false(_oauth_mo
 
 
 def test_me_returns_user_fields(_oauth_mod):
-    from adapters.user_store import User
-    user = User(
+    from adapters.user_store import UserIdentity
+    user = UserIdentity(
         github_user_id="100", login="evan", role="admin", tier="lifetime",
-        allowlisted=True, oauth_access_token="x", oauth_refresh_token=None,
-        created_at="",
+        allowlisted=True, created_at="",
+        allowlisted_at=None, allowlisted_by=None,
     )
     with patch.object(_oauth_mod, "_verify_session", return_value="100"):
         with patch.object(_oauth_mod, "get_user", return_value=user):

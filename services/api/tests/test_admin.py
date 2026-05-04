@@ -56,12 +56,11 @@ def _seed_user(github_user_id, login="evan", role="admin", allowlisted=True):
 
 
 def _admin_user(github_user_id="100", login="admin"):
-    from adapters.user_store import User
-    return User(
+    from adapters.user_store import UserIdentity
+    return UserIdentity(
         github_user_id=github_user_id, login=login, role="admin",
-        tier="lifetime", allowlisted=True, oauth_access_token="",
-        oauth_refresh_token=None, created_at="", allowlisted_at=None,
-        allowlisted_by=None,
+        tier="lifetime", allowlisted=True,
+        created_at="", allowlisted_at=None, allowlisted_by=None,
     )
 
 
