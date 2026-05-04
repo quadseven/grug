@@ -100,8 +100,16 @@ def receive_github_webhook(
     try:
         payload = _json.loads(body)
     except _json.JSONDecodeError:
-        log.warning("webhook_body_not_json", extra={"delivery_id": x_github_delivery})
-        return {"status": "skip", "reason": "body_not_json"}
+        # Body already passed HMAC verify — non-JSON here is GitHub
+        # bug, our own header-stripping middleware, or attack payload
+        # that got past sig verify (shouldn't happen). 400 stops GH
+        # retries while bumping severity above the 200 'skip' bucket
+        # so DD alerts fire. silent-failure-hunter P1 #1.
+        log.error(
+            "webhook_body_not_json_after_hmac_pass",
+            extra={"delivery_id": x_github_delivery, "body_len": len(body)},
+        )
+        raise HTTPException(status_code=400, detail="body_not_json")
 
     outcome = dispatch(x_github_event, payload)
     log.info(

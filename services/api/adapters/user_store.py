@@ -12,6 +12,7 @@ EncryptionContext bound (anti-row-transplant defense).
 
 from __future__ import annotations
 
+import logging
 import os
 import time
 from dataclasses import dataclass
@@ -20,6 +21,8 @@ from typing import Any
 
 import boto3
 from botocore.exceptions import ClientError
+
+log = logging.getLogger("grug.api.adapters.user_store")
 
 _TABLE_NAME = os.environ.get("GRUG_DDB_TABLE", "grug-main")
 
@@ -66,10 +69,26 @@ def get_user(github_user_id: str) -> User | None:
     """
     from crypto.kms_envelope import decrypt_for_user  # lazy import
 
-    resp = _table.get_item(
-        Key={"PK": _user_pk(github_user_id), "SK": "META"},
-        ConsistentRead=True,
-    )
+    try:
+        resp = _table.get_item(
+            Key={"PK": _user_pk(github_user_id), "SK": "META"},
+            ConsistentRead=True,
+        )
+    except ClientError as e:
+        # Distinguish DDB throttle/transient/IAM from a legitimate miss
+        # (resp.get("Item") absent). Without this, a transient
+        # ProvisionedThroughputExceededException would surface as a
+        # generic 500 with no DDB context — and worse, get_current_user
+        # would return None, spuriously logging the user out.
+        # silent-failure-hunter P1 #2.
+        log.error(
+            "user_store_get_item_failed",
+            extra={
+                "github_user_id": github_user_id,
+                "code": e.response.get("Error", {}).get("Code", "unknown"),
+            },
+        )
+        raise
     item = resp.get("Item")
     if not item:
         return None
