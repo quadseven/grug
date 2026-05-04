@@ -122,6 +122,15 @@ def create(
                             "kms:Encrypt",
                             "kms:CreateGrant",
                             "kms:DescribeKey",
+                            # Lambda's UpdateFunctionConfiguration on a
+                            # CMK-protected function performs an upfront
+                            # GenerateDataKey check using the calling
+                            # principal's perms. Verified mid-loop on
+                            # run 25310220972 (failed step 10, succeeded
+                            # step 10c after IAM-retry sleep). Adding
+                            # defensively so cold-account first deploys
+                            # don't repeat the chicken-egg.
+                            "kms:GenerateDataKey",
                         ],
                         # NOTE: tightening to specific resource ARNs is a
                         # follow-up. Slice 1 prioritizes "deploy works".
