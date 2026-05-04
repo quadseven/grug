@@ -78,6 +78,54 @@ def _verify_state(state: str) -> bool:
     return True
 
 
+# ---------------------------------------------------------------------------
+# Session token (separate format from CSRF state)
+# ---------------------------------------------------------------------------
+# Token = `<rand>.<ts>.<gh_id>.<hmac(rand.ts.gh_id)>`. Critical: gh_id is
+# bound INSIDE the signed payload — without that, a holder of any valid
+# session can swap the trailing component to impersonate any user. (Codex
+# post-hoc P1 + Sentry CRITICAL on PR #39 / Slice 3.)
+#
+# Also separates session TTL (7 days) from the 10-minute CSRF state TTL.
+# Earlier code used `_verify_state` for sessions which silently truncated
+# the cookie's intended 7-day lifetime to 10 minutes (Sentry CRITICAL).
+_SESSION_TTL_SECONDS = 86400 * 7  # 7 days
+
+
+def _make_session(gh_id: str) -> str:
+    rand = secrets.token_urlsafe(16)
+    ts = str(int(time.time()))
+    sig = hmac.new(
+        _state_secret().encode(),
+        f"{rand}.{ts}.{gh_id}".encode(),
+        hashlib.sha256,
+    ).hexdigest()
+    return f"{rand}.{ts}.{gh_id}.{sig}"
+
+
+def _verify_session(token: str) -> str | None:
+    """Returns the GitHub user id on success, None on any failure."""
+    if not token:
+        return None
+    parts = token.split(".")
+    if len(parts) != 4:
+        return None
+    rand, ts, gh_id, sig = parts
+    expected = hmac.new(
+        _state_secret().encode(),
+        f"{rand}.{ts}.{gh_id}".encode(),
+        hashlib.sha256,
+    ).hexdigest()
+    if not hmac.compare_digest(expected, sig):
+        return None
+    try:
+        if int(time.time()) - int(ts) > _SESSION_TTL_SECONDS:
+            return None
+    except ValueError:
+        return None
+    return gh_id
+
+
 def _client_id() -> str:
     from secrets_loader import _get_ssm_secure_string  # type: ignore
     name = os.environ.get("GITHUB_APP_CLIENT_ID_SSM", "")
@@ -168,14 +216,17 @@ def callback(
                "allowlisted": user.allowlisted, "role": user.role},
     )
 
-    # Set session cookie (signed gh_id + ts; stateless)
-    session_value = _make_state() + "." + gh_id  # rand.ts.sig.gh_id
+    # Set session cookie. Format binds gh_id INSIDE the HMAC payload —
+    # see _make_session docstring for the impersonation attack the
+    # earlier `_make_state() + "." + gh_id` was vulnerable to.
+    session_value = _make_session(gh_id)
     target = _DASHBOARD_URL if user.allowlisted else _WAITLIST_URL
     resp = RedirectResponse(url=target, status_code=302)
     resp.delete_cookie("grug_oauth_state")
     resp.set_cookie(
         "grug_session", session_value,
-        max_age=86400 * 7, httponly=True, secure=True, samesite="lax",
+        max_age=_SESSION_TTL_SECONDS,
+        httponly=True, secure=True, samesite="lax",
     )
     return resp
 
@@ -183,13 +234,8 @@ def callback(
 @router.get("/me")
 def me(grug_session: str = Cookie(default="")) -> dict[str, str | bool]:
     """Current user. Always 200 (auth'd or anon). SPA routes by `allowlisted`."""
-    if not grug_session:
-        return {"authenticated": False}
-    parts = grug_session.split(".")
-    if len(parts) != 4:
-        return {"authenticated": False}
-    rand, ts, sig, gh_id = parts
-    if not _verify_state(f"{rand}.{ts}.{sig}"):
+    gh_id = _verify_session(grug_session)
+    if gh_id is None:
         return {"authenticated": False}
 
     user = get_user(gh_id)
