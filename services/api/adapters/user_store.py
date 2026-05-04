@@ -22,8 +22,22 @@ import boto3
 from botocore.exceptions import ClientError
 
 _TABLE_NAME = os.environ.get("GRUG_DDB_TABLE", "grug-main")
-_ddb = boto3.resource("dynamodb")
-_table = _ddb.Table(_TABLE_NAME)
+
+# Lazy init — see install_store.py for rationale (Codex post-review #52).
+_ddb = None
+_table_real = None
+
+
+class _LazyTable:
+    def __getattr__(self, name):
+        global _ddb, _table_real
+        if _table_real is None:
+            _ddb = boto3.resource("dynamodb")
+            _table_real = _ddb.Table(_TABLE_NAME)
+        return getattr(_table_real, name)
+
+
+_table = _LazyTable()
 
 
 @dataclass
