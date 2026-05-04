@@ -25,7 +25,7 @@ from typing import Any
 
 import httpx
 from fastapi import APIRouter, Depends, HTTPException, status
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, ConfigDict, Field
 
 from adapters.install_store import (
     get_installation,
@@ -45,6 +45,13 @@ _GH_API = "https://api.github.com"
 
 
 class RepoConfigPayload(BaseModel):
+    """SPA → api PUT /repo/{id}/config payload.
+
+    `extra='forbid'` catches SPA typos (e.g. `tmp_enabled=true`) at
+    request-validation time so they 422 rather than silently dropping
+    the toggle. type-design-analyzer P3.
+    """
+    model_config = ConfigDict(extra="forbid")
     tpm_enabled: bool = Field(default=True)
 
 
