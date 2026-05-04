@@ -32,38 +32,41 @@ def _stub_token(monkeypatch: pytest.MonkeyPatch):
     return counter
 
 
-def test_retry_on_401_invalidates_and_refetches(_stub_token):
+def test_retry_on_401_invalidates_and_refetches(_stub_token, mock_transport_client):
+    """First call: 401 from real httpx machinery. Second call: 200.
+
+    Closes mock-vs-real gap from async-blocker-hunter F-01 (issue #105) —
+    direct construction of `httpx.HTTPStatusError(...)` keeps tests green
+    even if production `except` clause narrows to a sub-class. With
+    MockTransport, the exception comes from `resp.raise_for_status()`.
+    """
+    client = mock_transport_client(status_codes=[401, 200], json_bodies=[{}, {"ok": True}])
     calls: list[str] = []
 
     def fn(token: str) -> str:
         calls.append(token)
-        if len(calls) == 1:
-            raise httpx.HTTPStatusError(
-                "401",
-                request=httpx.Request("GET", "https://api.github.com/repos"),
-                response=httpx.Response(401),
-            )
-        return "ok"
+        resp = client.get("https://api.github.com/repos")
+        resp.raise_for_status()
+        return resp.json()["ok"]
 
     result = gh_auth.with_install_token_retry(123, fn)
 
-    assert result == "ok"
+    assert result is True
     assert len(calls) == 2, "fn must be called twice (once + retry)"
     assert calls[0] == "token-1-refresh=False", "first call uses cached token"
     assert calls[1] == "token-2-refresh=True", \
         "retry must force_refresh — otherwise cache returns same bad token"
 
 
-def test_non_401_status_propagates_without_retry(_stub_token):
+def test_non_401_status_propagates_without_retry(_stub_token, mock_transport_client):
+    client = mock_transport_client(status_codes=[500])
     calls: list[str] = []
 
     def fn(token: str) -> str:
         calls.append(token)
-        raise httpx.HTTPStatusError(
-            "500",
-            request=httpx.Request("GET", "https://api.github.com/repos"),
-            response=httpx.Response(500),
-        )
+        resp = client.get("https://api.github.com/repos")
+        resp.raise_for_status()
+        return None
 
     with pytest.raises(httpx.HTTPStatusError) as ei:
         gh_auth.with_install_token_retry(123, fn)
