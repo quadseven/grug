@@ -14,7 +14,7 @@ from __future__ import annotations
 import logging
 import os
 
-from fastapi import FastAPI, Header, HTTPException, Request, status
+from fastapi import Body, FastAPI, Header, HTTPException, status
 
 from hmac_verify import verify_signature
 from observability import configure_logging
@@ -51,13 +51,20 @@ def readyz() -> dict[str, str]:
 
 
 @app.post("/webhook/github")
-async def receive_github_webhook(
-    request: Request,
+def receive_github_webhook(
+    body: bytes = Body(...),
     x_github_event: str = Header(default=""),
     x_github_delivery: str = Header(default=""),
     x_hub_signature_256: str = Header(default=""),
 ) -> dict[str, str]:
-    body = await request.body()
+    # Handler is `def`, not `async def`. Every downstream call (DDB
+    # boto3, httpx GitHub posts, KMS) is sync I/O — running them on
+    # the asyncio event loop blocks every other coroutine in the
+    # process. FastAPI runs sync `def` handlers in a threadpool via
+    # Starlette's run_in_threadpool, so concurrent invocations don't
+    # starve each other. Mangum supports both signatures.
+    # Body injected via `bytes = Body(...)` (raw body, no JSON parse)
+    # because HMAC verify needs the exact wire bytes. Closes #68.
 
     secret = get_webhook_secret()
     if not verify_signature(secret, body, x_hub_signature_256):

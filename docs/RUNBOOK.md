@@ -237,3 +237,13 @@ Note: KMS CMK enters 7-day pending-deletion. Within that window, `pulumi up` aga
 | `GRUG_ADMIN_INSTALL_ID` | 129256114 | INST# row to backfill (skip on org-account migrations where install_id changed) |
 
 Override per-recovery: `GRUG_ADMIN_USER_ID=123 make rebuild`
+
+## Architecture decisions
+
+### Sync-vs-async route handlers
+
+Webhook handler `receive_github_webhook` is **sync `def`**, NOT `async def`.
+
+**Why**: every downstream call is sync I/O (boto3 DynamoDB, sync httpx GitHub posts, sync KMS via `crypto.kms_envelope`). An `async def` handler would block the event loop on each ~30-500ms call. FastAPI runs sync `def` handlers in a threadpool via Starlette's `run_in_threadpool`, so concurrent invocations don't starve each other.
+
+**Re-evaluate when**: we add genuine concurrent-fan-out (e.g. parallel GitHub calls for multi-repo PR scans via `asyncio.gather`). At that point migrate the relevant section to `httpx.AsyncClient` + `aioboto3` and switch the handler back to `async def`. Closes #68.
