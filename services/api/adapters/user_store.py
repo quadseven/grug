@@ -151,6 +151,12 @@ def upsert_oauth_user(
     }
     if encrypted_refresh:
         item["oauth_refresh_token_blob"] = encrypted_refresh
+    elif existing and "oauth_refresh_token_blob" in existing:
+        # Sentry HIGH on PR #39 — GitHub OAuth re-auth may return access
+        # token without rotating refresh. put_item overwrites the whole
+        # row, so without preserving the existing refresh blob we'd
+        # silently nuke it and break refresh on next access expiry.
+        item["oauth_refresh_token_blob"] = existing["oauth_refresh_token_blob"]
 
     if existing:
         # Preserve admin / tier / allowlist state
@@ -167,6 +173,21 @@ def upsert_oauth_user(
 
     _table.put_item(Item=item)
 
+    # If we preserved an existing refresh blob (re-auth without rotation),
+    # decrypt it so the returned User reflects what's now in the row.
+    # Otherwise callers using the return value would think refresh is
+    # gone even though the row still has it. Codex follow-up to the
+    # PR #39 Sentry HIGH fix.
+    returned_refresh = oauth_refresh_token
+    if returned_refresh is None and existing and "oauth_refresh_token_blob" in existing:
+        from crypto.kms_envelope import decrypt_for_user
+        blob = existing["oauth_refresh_token_blob"]
+        blob_bytes = blob.value if hasattr(blob, "value") else blob
+        returned_refresh = decrypt_for_user(
+            blob=blob_bytes, user_id=github_user_id,
+            item_type="oauth_refresh_token",
+        )
+
     return User(
         github_user_id=github_user_id,
         login=login,
@@ -174,7 +195,7 @@ def upsert_oauth_user(
         tier=item["tier"],
         allowlisted=bool(item["allowlisted"]),
         oauth_access_token=oauth_access_token,
-        oauth_refresh_token=oauth_refresh_token,
+        oauth_refresh_token=returned_refresh,
         created_at=item["created_at"],
         allowlisted_at=item.get("allowlisted_at"),
         allowlisted_by=item.get("allowlisted_by"),
