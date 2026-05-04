@@ -15,6 +15,17 @@ export function Admin() {
     );
   }
 
+  // Distinguish fetch error from unauthenticated. Greptile P2 on PR #42.
+  if (me.isError) {
+    return (
+      <Shell>
+        <div className="px-6 py-24 text-center text-red-400 font-mono text-sm">
+          failed to load profile · check connection or try again
+        </div>
+      </Shell>
+    );
+  }
+
   if (!me.data?.authenticated) {
     return <Navigate to="/signin" replace />;
   }

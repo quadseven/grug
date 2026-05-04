@@ -14,10 +14,17 @@ export class ApiError extends Error {
 }
 
 export async function api<T>(path: string, init?: RequestInit): Promise<T> {
+  // Use Headers ctor so callers can pass a plain object, Headers, or
+  // tuple-array — spreading would drop the latter two. Then enforce
+  // Accept default + force credentials=include LAST so callers can't
+  // override (e.g. by passing `{credentials: "omit"}`). Sentry MED +
+  // Codex follow-up on PR #42.
+  const headers = new Headers(init?.headers);
+  if (!headers.has("Accept")) headers.set("Accept", "application/json");
   const res = await fetch(`${API_BASE}${path}`, {
-    credentials: "include",
-    headers: { Accept: "application/json", ...(init?.headers ?? {}) },
     ...init,
+    headers,
+    credentials: "include",
   });
   if (!res.ok) {
     let body = "";

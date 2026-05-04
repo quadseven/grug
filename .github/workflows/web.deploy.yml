@@ -1,13 +1,14 @@
 name: Web · Cloudflare Pages deploy
 
 on:
+  # No `paths` filter — Greptile P2 on PR #42 noted that `paths` under
+  # `push` applies to tags too, silently suppressing v* tag deploys
+  # when the tag commit doesn't touch web/**. Web build is ~3min and
+  # cheap; let every relevant push deploy.
   push:
     branches:
       - main
       - 'feat/27-*'
-    paths:
-      - 'web/**'
-      - '.github/workflows/web.deploy.yml'
     tags: ['v*']
   workflow_dispatch:
     inputs:
@@ -37,13 +38,22 @@ jobs:
         with:
           node-version: '20'
 
+      - name: Configure AWS via OIDC
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: arn:aws:iam::${{ vars.AWS_ACCOUNT_ID }}:role/grug-gha-deploy
+          aws-region: us-east-1
+
       - name: Resolve secrets from SSM
         id: secrets
         env:
           AWS_REGION: us-east-1
         run: |
           set -euo pipefail
-          # OIDC into AWS to read CF creds from SSM (same pattern as iac.deploy)
+          # OIDC must be configured BEFORE this step. Earlier ordering
+          # called aws sts/ssm before configure-creds and failed on
+          # fresh self-hosted runners with no ambient AWS creds. Codex
+          # P1 + Greptile P1 on PR #42.
           aws sts get-caller-identity > /dev/null
           CF_API_TOKEN=$(aws ssm get-parameter \
             --name /grug/cloudflare-api-token --with-decryption \
@@ -54,12 +64,6 @@ jobs:
           echo "::add-mask::$CF_API_TOKEN"
           echo "CLOUDFLARE_API_TOKEN=$CF_API_TOKEN" >> "$GITHUB_ENV"
           echo "CLOUDFLARE_ACCOUNT_ID=$CF_ACCOUNT_ID" >> "$GITHUB_ENV"
-
-      - name: Configure AWS via OIDC
-        uses: aws-actions/configure-aws-credentials@v4
-        with:
-          role-to-assume: arn:aws:iam::${{ vars.AWS_ACCOUNT_ID }}:role/grug-gha-deploy
-          aws-region: us-east-1
 
       - name: Install deps
         working-directory: web
