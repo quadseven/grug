@@ -128,6 +128,10 @@ webhook_ecr = ecr_repo.create(
 # is live, CF DNS resolves. CI's first build replaces the image tag
 # with the real SHA, second `pulumi up` swaps imageUri.
 webhook_image_tag = config.get("webhook_image_tag") or "bootstrap"
+# Full 40-char commit SHA — separate from image_tag (8-char short)
+# because DD source-code linking requires the full SHA. Greptile P1
+# PR #81. CI passes via config; bootstrap deploys fall back to short.
+_full_commit_sha = config.get("full_commit_sha") or webhook_image_tag
 webhook = lambda_service.create(
     name="grug-webhook",
     ecr_repo=webhook_ecr,
@@ -163,7 +167,7 @@ webhook = lambda_service.create(
         # instead of --build-arg so commit SHA churn doesn't bust
         # buildx layer cache (which made every deploy a cold rebuild).
         "DD_GIT_REPOSITORY_URL": "https://github.com/githumps/grug",
-        "DD_GIT_COMMIT_SHA": webhook_image_tag,
+        "DD_GIT_COMMIT_SHA": _full_commit_sha,
         "DD_TRACE_ENABLED": "true",
         "DD_LOGS_INJECTION": "true",
         # Disable noisy ASGI integration that collapses every FastAPI
@@ -234,7 +238,7 @@ api_lambda = lambda_service.create(
         # See webhook above — DD_GIT_* moved from build-arg to runtime
         # env var so layer cache survives commit-SHA churn. Closes #70.
         "DD_GIT_REPOSITORY_URL": "https://github.com/githumps/grug",
-        "DD_GIT_COMMIT_SHA": api_image_tag,
+        "DD_GIT_COMMIT_SHA": _full_commit_sha,
         "DD_TRACE_ENABLED": "true",
         "DD_LOGS_INJECTION": "true",
         "DD_PATCH_MODULES": "asgi:false",

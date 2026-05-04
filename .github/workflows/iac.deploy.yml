@@ -118,11 +118,16 @@ jobs:
           # DD_GIT_* env vars now set on the Lambda Function (in
           # __main__.py) instead of via --build-arg, so commit-SHA
           # changes don't bust every layer.
+          set -euo pipefail
           mkdir -p /tmp/buildx-cache-grug
           for service in webhook api; do
             REPO="$ECR/grug-$service"
             CACHE_DIR="/tmp/buildx-cache-grug/$service"
             mkdir -p "$CACHE_DIR"
+            # Atomic swap path: write new layers to -new, then promote
+            # ONLY if buildx exits 0 (set -e + && guard). A partial /
+            # corrupted dest never overwrites the working cache. Greptile
+            # P2 PR #81.
             docker buildx build \
               --platform linux/arm64 \
               --provenance=false \
@@ -133,10 +138,9 @@ jobs:
               --tag "$REPO:$IMAGE_TAG" \
               --tag "$REPO:latest" \
               --push \
-              "services/$service"
-            # Atomic swap so a failed build doesn't poison the cache
-            rm -rf "$CACHE_DIR"
-            mv "$CACHE_DIR-new" "$CACHE_DIR"
+              "services/$service" \
+            && rm -rf "$CACHE_DIR" \
+            && mv "$CACHE_DIR-new" "$CACHE_DIR"
           done
           echo "tag=$IMAGE_TAG" >> $GITHUB_OUTPUT
 
@@ -146,9 +150,13 @@ jobs:
           command: up
           stack-name: pulumi_ehumps_me/grug/${{ steps.stack.outputs.stack }}
           work-dir: infra/pulumi
+          # full_commit_sha = 40-char SHA used for DD source-code linking
+          # (image_tag is 8-char short SHA; DD source UI requires full).
+          # Greptile P1 PR #81.
           config-map: |
             webhook_image_tag: { value: "${{ steps.build.outputs.tag }}" }
             api_image_tag:     { value: "${{ steps.build.outputs.tag }}" }
+            full_commit_sha:   { value: "${{ github.sha }}" }
 
       - name: 11. Deploy CF Workers (host-rewrite proxies)
         run: bash infra/cloudflare/deploy.sh
