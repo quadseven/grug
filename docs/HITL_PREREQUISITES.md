@@ -17,7 +17,7 @@ URL: <https://github.com/settings/apps/new>
 | Repository permissions — Contents | **Read** |
 | Repository permissions — Metadata | **Read** *(default, required)* |
 | Repository permissions — Checks | **Read & write** |
-| Subscribe to events | `pull_request`, `pull_request_review` |
+| Subscribe to events | `pull_request`, `pull_request_review`, `issue_comment` *(closes #2 — `/grug recheck` slash command)* |
 | Where can this app be installed? | **Any account** |
 
 After creating:
