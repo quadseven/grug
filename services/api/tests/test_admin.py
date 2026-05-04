@@ -106,7 +106,9 @@ def test_patch_user_flips_allowlist(_ddb):
     assert out["before"]["allowlisted"] is False
     assert out["after"]["allowlisted"] is True
     assert out["changed"] is True
-    assert out["user"]["allowlisted_by"] == "admin"
+    # allowlisted_by records the immutable github_user_id, not login.
+    # _admin_user() in this fixture is github_user_id="100".
+    assert out["user"]["allowlisted_by"] == "100"
 
 
 def test_patch_user_404_unknown(_ddb):
