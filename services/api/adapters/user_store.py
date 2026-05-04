@@ -8,6 +8,12 @@ oauth_access_token + oauth_refresh_token are encrypted via the KMS
 envelope (services/api/crypto/kms_envelope.py) BEFORE write. DDB sees
 opaque ciphertext; CloudTrail logs every kms.Decrypt with the
 EncryptionContext bound (anti-row-transplant defense).
+
+Type split (issue #103): callers that don't need OAuth tokens get a
+`UserIdentity` — never carries plaintext token material. Callers that
+do (OAuth refresh path, future App-on-behalf-of-user calls) explicitly
+opt in via `UserWithTokens` + the `_with_tokens` getter. Both types are
+`frozen=True` so a stray `user.role = 'admin'` write fails loudly.
 """
 
 from __future__ import annotations
@@ -43,32 +49,43 @@ class _LazyTable:
 _table = _LazyTable()
 
 
-@dataclass
-class User:
+@dataclass(frozen=True)
+class UserIdentity:
+    """Identity-only projection of a user row. NO token material.
+
+    Default for `Depends(require_authenticated)` so a stray
+    `log.info("user", extra=user.__dict__)` cannot leak a plaintext
+    OAuth token. Routes that need tokens use `UserWithTokens` + the
+    explicit `get_user_with_tokens` / `require_authenticated_with_tokens`
+    getter.
+    """
+
     github_user_id: str
     login: str
     role: str  # "admin" | "user"
     tier: str  # "lifetime" | "free" | "paid"
     allowlisted: bool
-    oauth_access_token: str  # plaintext after decrypt
-    oauth_refresh_token: str | None
     created_at: str
     allowlisted_at: str | None
     allowlisted_by: str | None
+
+
+@dataclass(frozen=True)
+class UserWithTokens:
+    """Identity + decrypted OAuth tokens. Used only on the OAuth callback
+    + token-refresh paths. KMS Decrypt happened during construction.
+    """
+
+    identity: UserIdentity
+    oauth_access_token: str
+    oauth_refresh_token: str | None
 
 
 def _user_pk(github_user_id: str) -> str:
     return f"USER#{github_user_id}"
 
 
-def get_user(github_user_id: str) -> User | None:
-    """Return the user row (with decrypted OAuth tokens) or None.
-
-    KMS Decrypt happens here (no plaintext caching per the envelope
-    contract). Returns None when the user has never signed in.
-    """
-    from crypto.kms_envelope import decrypt_for_user  # lazy import
-
+def _fetch_item(github_user_id: str) -> dict[str, Any] | None:
     try:
         resp = _table.get_item(
             Key={"PK": _user_pk(github_user_id), "SK": "META"},
@@ -89,7 +106,43 @@ def get_user(github_user_id: str) -> User | None:
             },
         )
         raise
-    item = resp.get("Item")
+    return resp.get("Item")
+
+
+def _identity_from_item(github_user_id: str, item: dict[str, Any]) -> UserIdentity:
+    return UserIdentity(
+        github_user_id=github_user_id,
+        login=item.get("login", ""),
+        role=item.get("role", "user"),
+        tier=item.get("tier", "free"),
+        allowlisted=bool(item.get("allowlisted", False)),
+        created_at=item.get("created_at", ""),
+        allowlisted_at=item.get("allowlisted_at"),
+        allowlisted_by=item.get("allowlisted_by"),
+    )
+
+
+def get_user(github_user_id: str) -> UserIdentity | None:
+    """Return identity-only user row, or None.
+
+    No KMS Decrypt — token material is never read on this path. Use
+    `get_user_with_tokens` for OAuth-refresh / on-behalf-of-user paths.
+    """
+    item = _fetch_item(github_user_id)
+    if not item:
+        return None
+    return _identity_from_item(github_user_id, item)
+
+
+def get_user_with_tokens(github_user_id: str) -> UserWithTokens | None:
+    """Return identity + decrypted OAuth tokens, or None.
+
+    KMS Decrypt happens here (no plaintext caching per the envelope
+    contract). Restricted to OAuth-refresh + on-behalf-of-user routes.
+    """
+    from crypto.kms_envelope import decrypt_for_user  # lazy import
+
+    item = _fetch_item(github_user_id)
     if not item:
         return None
 
@@ -112,17 +165,10 @@ def get_user(github_user_id: str) -> User | None:
             blob=blob, user_id=github_user_id, item_type="oauth_refresh_token",
         )
 
-    return User(
-        github_user_id=github_user_id,
-        login=item.get("login", ""),
-        role=item.get("role", "user"),
-        tier=item.get("tier", "free"),
-        allowlisted=bool(item.get("allowlisted", False)),
+    return UserWithTokens(
+        identity=_identity_from_item(github_user_id, item),
         oauth_access_token=access_token,
         oauth_refresh_token=refresh_token,
-        created_at=item.get("created_at", ""),
-        allowlisted_at=item.get("allowlisted_at"),
-        allowlisted_by=item.get("allowlisted_by"),
     )
 
 
@@ -132,7 +178,7 @@ def upsert_oauth_user(
     login: str,
     oauth_access_token: str,
     oauth_refresh_token: str | None = None,
-) -> User:
+) -> UserIdentity:
     """Create-or-update a user row from the OAuth callback flow.
 
     Defaults:
@@ -193,29 +239,16 @@ def upsert_oauth_user(
 
     _table.put_item(Item=item)
 
-    # If we preserved an existing refresh blob (re-auth without rotation),
-    # decrypt it so the returned User reflects what's now in the row.
-    # Otherwise callers using the return value would think refresh is
-    # gone even though the row still has it. Codex follow-up to the
-    # PR #39 Sentry HIGH fix.
-    returned_refresh = oauth_refresh_token
-    if returned_refresh is None and existing and "oauth_refresh_token_blob" in existing:
-        from crypto.kms_envelope import decrypt_for_user
-        blob = existing["oauth_refresh_token_blob"]
-        blob_bytes = blob.value if hasattr(blob, "value") else blob
-        returned_refresh = decrypt_for_user(
-            blob=blob_bytes, user_id=github_user_id,
-            item_type="oauth_refresh_token",
-        )
-
-    return User(
+    # Return identity only — current callers (OAuth callback) only read
+    # role/login/allowlisted. Removed the post-upsert refresh-blob
+    # decrypt that earlier callers used to populate the returned User.
+    # Token-needing routes use `get_user_with_tokens` explicitly.
+    return UserIdentity(
         github_user_id=github_user_id,
         login=login,
         role=item["role"],
         tier=item["tier"],
         allowlisted=bool(item["allowlisted"]),
-        oauth_access_token=oauth_access_token,
-        oauth_refresh_token=returned_refresh,
         created_at=item["created_at"],
         allowlisted_at=item.get("allowlisted_at"),
         allowlisted_by=item.get("allowlisted_by"),

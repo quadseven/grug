@@ -23,7 +23,7 @@ from typing import Any
 from fastapi import APIRouter, Depends, HTTPException, status
 from pydantic import BaseModel
 
-from adapters.user_store import User, _table  # type: ignore[reportPrivateUsage]
+from adapters.user_store import UserIdentity, _table  # type: ignore[reportPrivateUsage]
 from auth.dependencies import require_admin
 
 log = logging.getLogger("grug.api.admin")
@@ -95,13 +95,13 @@ def _scan_all(*, pk_prefix: str) -> list[dict[str, Any]]:
 
 
 @router.get("/users")
-def list_users(_: User = Depends(require_admin)) -> dict[str, Any]:
+def list_users(_: UserIdentity = Depends(require_admin)) -> dict[str, Any]:
     """All USER# rows."""
     return {"users": [_user_to_admin_view(it) for it in _scan_all(pk_prefix="USER#")]}
 
 
 @router.get("/installations")
-def list_all_installations(_: User = Depends(require_admin)) -> dict[str, Any]:
+def list_all_installations(_: UserIdentity = Depends(require_admin)) -> dict[str, Any]:
     """All INST# rows across all users."""
     return {
         "installations": [_inst_to_admin_view(it) for it in _scan_all(pk_prefix="INST#")],
@@ -122,7 +122,7 @@ _VALID_TIERS = {"lifetime", "free", "paid"}
 def patch_user(
     user_id: str,
     payload: UserPatchPayload,
-    actor: User = Depends(require_admin),
+    actor: UserIdentity = Depends(require_admin),
 ) -> dict[str, Any]:
     """Flip allowlisted / role / tier on a user. Audit log to DD."""
     if payload.role is not None and payload.role not in _VALID_ROLES:

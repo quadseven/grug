@@ -51,27 +51,22 @@ def test_re_auth_without_new_refresh_preserves_existing(_ddb_table):
     us = _ddb_table
 
     # First sign-in supplies BOTH access + refresh.
-    u1 = us.upsert_oauth_user(
+    us.upsert_oauth_user(
         github_user_id="100", login="evan",
         oauth_access_token="initial-access",
         oauth_refresh_token="initial-refresh",
     )
-    assert u1.oauth_refresh_token == "initial-refresh"
 
     # Re-auth supplies access only — refresh from prior sign-in must remain.
-    u2_direct = us.upsert_oauth_user(
+    # upsert_oauth_user returns UserIdentity (no tokens) per issue #103;
+    # use get_user_with_tokens to verify the persisted blobs survived.
+    us.upsert_oauth_user(
         github_user_id="100", login="evan",
         oauth_access_token="rotated-access",
         oauth_refresh_token=None,
     )
-    # Returned dataclass MUST already reflect the preserved refresh —
-    # otherwise the decrypt-of-existing-blob branch in user_store could
-    # regress without this test catching it. Greptile P2 PR #61.
-    assert u2_direct.oauth_access_token == "rotated-access"
-    assert u2_direct.oauth_refresh_token == "initial-refresh", \
-        "returned User dropped refresh on re-auth — Greptile P2 PR #61"
 
-    u2 = us.get_user("100")
+    u2 = us.get_user_with_tokens("100")
     assert u2.oauth_access_token == "rotated-access"
     assert u2.oauth_refresh_token == "initial-refresh", \
         "refresh token wiped on re-auth without new refresh — Sentry HIGH PR #39"
@@ -87,7 +82,7 @@ def test_re_auth_with_new_refresh_replaces(_ddb_table):
         github_user_id="100", login="evan",
         oauth_access_token="a2", oauth_refresh_token="r2",
     )
-    u = us.get_user("100")
+    u = us.get_user_with_tokens("100")
     assert u.oauth_access_token == "a2"
     assert u.oauth_refresh_token == "r2"
 
@@ -95,12 +90,10 @@ def test_re_auth_with_new_refresh_replaces(_ddb_table):
 def test_first_signin_with_no_refresh_works(_ddb_table):
     """Edge case: first OAuth grant supplies no refresh (some providers)."""
     us = _ddb_table
-    u = us.upsert_oauth_user(
+    us.upsert_oauth_user(
         github_user_id="100", login="evan",
         oauth_access_token="a1", oauth_refresh_token=None,
     )
-    assert u.oauth_access_token == "a1"
-    assert u.oauth_refresh_token is None
-
-    fetched = us.get_user("100")
+    fetched = us.get_user_with_tokens("100")
+    assert fetched.oauth_access_token == "a1"
     assert fetched.oauth_refresh_token is None
