@@ -22,6 +22,7 @@ import pulumi_cloudflare as cloudflare
 
 from components import (
     cloudflare_dns,
+    dd_monitors,
     ddb_table,
     ecr_repo,
     kms_cmk,
@@ -316,6 +317,32 @@ cloudflare_dns.create_proxied_cname(
     proxied=True,
 )
 
+# Datadog monitors (Slice 9 #30). Provider reads DD creds from SSM
+# `/shared/datadog-{api,app}-key` per #164 cross-repo convention.
+import pulumi_datadog as _datadog
+
+_dd_app_key = aws.ssm.get_parameter(
+    name="/shared/datadog-app-key", with_decryption=True,
+)
+_dd_provider = _datadog.Provider(
+    "datadog-grug",
+    api_key=pulumi.Output.secret(_dd_api_key.value),
+    app_key=pulumi.Output.secret(_dd_app_key.value),
+    api_url="https://api.datadoghq.com/",
+)
+
+# Notification handle. SSM param `/grug/dd-notify-handle` MUST exist
+# before first pulumi up — pre-load it via HITL_PREREQUISITES.md §6.
+_dd_notify = aws.ssm.get_parameter(name="/grug/dd-notify-handle").value
+
+monitors = dd_monitors.create_all(
+    env=env,
+    notify_handle=_dd_notify,
+    webhook_public_url=f"https://webhook.{domain}/webhook/github",
+    api_public_url=f"https://api.{domain}",
+    provider=_dd_provider,
+)
+
 pulumi.export("webhook_function_url", webhook.function_url)
 pulumi.export("webhook_public_url", f"https://webhook.{domain}/webhook/github")
 pulumi.export("api_function_url", api_lambda.function_url)
@@ -327,3 +354,8 @@ pulumi.export("ddb_table_name", grug_main_table.name)
 pulumi.export("ddb_table_arn", grug_main_table.arn)
 pulumi.export("kms_cmk_arn", grug_tokens_cmk.arn)
 pulumi.export("kms_cmk_alias", grug_tokens_cmk.alias.name)
+pulumi.export("monitor_webhook_5xx_id", monitors.webhook_5xx.id)
+pulumi.export("monitor_api_5xx_id", monitors.api_5xx.id)
+pulumi.export("monitor_sig_verify_fail_id", monitors.sig_verify_fail.id)
+pulumi.export("monitor_cold_start_p99_id", monitors.cold_start_p99.id)
+pulumi.export("synthetic_uptime_id", monitors.uptime.id)
