@@ -65,17 +65,28 @@ def list_installations(user: User = Depends(require_authenticated)) -> dict[str,
     """Installs owned by the current user (admin sees only own here too;
     cross-user listing is admin-only and lives at /api/v1/admin/users)."""
     items = list_user_installations(user.github_user_id)
-    return {
-        "installations": [
-            {
-                "install_id": int(it["PK"].split("#", 1)[1]),
-                "account_login": it.get("account_login", ""),
-                "account_type": it.get("account_type", "User"),
-                "installed_at": it.get("installed_at", ""),
-            }
-            for it in items
-        ],
-    }
+    out: list[dict[str, Any]] = []
+    for it in items:
+        # Defensive: GSI1 row with corrupt/missing PK shouldn't 500
+        # the whole list endpoint. Skip + log so we surface the
+        # corruption without breaking the user's dashboard.
+        # silent-failure-hunter P2 #6.
+        pk = it.get("PK", "")
+        try:
+            install_id = int(pk.split("#", 1)[1])
+        except (IndexError, ValueError):
+            log.error(
+                "list_installations_corrupt_pk",
+                extra={"pk": pk, "user": user.login},
+            )
+            continue
+        out.append({
+            "install_id": install_id,
+            "account_login": it.get("account_login", ""),
+            "account_type": it.get("account_type", "User"),
+            "installed_at": it.get("installed_at", ""),
+        })
+    return {"installations": out}
 
 
 @router.get("/installations/{install_id}/repos")
@@ -110,7 +121,20 @@ def list_install_repos(
                 )
                 resp.raise_for_status()
                 body = resp.json()
-                for r in body.get("repositories", []):
+                if "repositories" not in body:
+                    # GH returned 200 but malformed payload — distinguish
+                    # from "0 repos" so the caller doesn't show an empty
+                    # dashboard for what's really upstream broken.
+                    # silent-failure-hunter P1 #3.
+                    log.error(
+                        "gh_install_repos_malformed",
+                        extra={"install_id": install_id, "page": page},
+                    )
+                    raise HTTPException(
+                        status_code=status.HTTP_502_BAD_GATEWAY,
+                        detail="gh_upstream_malformed",
+                    )
+                for r in body["repositories"]:
                     cfg = get_repo_config(install_id, r["id"])
                     out.append({
                         "repo_id": r["id"],
@@ -119,7 +143,7 @@ def list_install_repos(
                         "default_branch": r.get("default_branch", "main"),
                         "config": cfg,
                     })
-                if len(body.get("repositories", [])) < 100:
+                if len(body["repositories"]) < 100:
                     break
                 page += 1
                 if page > 10:  # 1000 repos is plenty for v1
@@ -170,10 +194,20 @@ def update_repo_config(
                 )
                 resp.raise_for_status()
                 body_json = resp.json()
-                for r in body_json.get("repositories", []):
+                if "repositories" not in body_json:
+                    log.error(
+                        "gh_install_repos_malformed",
+                        extra={"install_id": install_id, "page": page,
+                               "context": "update_repo_config"},
+                    )
+                    raise HTTPException(
+                        status_code=status.HTTP_502_BAD_GATEWAY,
+                        detail="gh_upstream_malformed",
+                    )
+                for r in body_json["repositories"]:
                     if r["id"] == repo_id:
                         return True, r["full_name"]
-                if len(body_json.get("repositories", [])) < 100:
+                if len(body_json["repositories"]) < 100:
                     return False, ""
                 page += 1
                 # No page cap — single-repo membership lookup must scan

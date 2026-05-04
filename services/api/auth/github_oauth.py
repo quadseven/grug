@@ -224,8 +224,18 @@ def callback(
         )
         raise HTTPException(status_code=502, detail="oauth_upstream_failed") from e
     gh_user = user_resp.json()
-    gh_id = str(gh_user["id"])
-    login_name = gh_user["login"]
+    # Defensive: GH can return {} or partial body if the access_token
+    # was revoked between the token-exchange call and this user-info
+    # call. KeyError → 500 with no log. silent-failure-hunter P2 #5.
+    raw_id = gh_user.get("id")
+    login_name = gh_user.get("login")
+    if not raw_id or not login_name:
+        log.warning(
+            "oauth_user_payload_missing_fields",
+            extra={"keys": list(gh_user.keys())},
+        )
+        raise HTTPException(status_code=502, detail="oauth_user_malformed")
+    gh_id = str(raw_id)
 
     user = upsert_oauth_user(
         github_user_id=gh_id,
