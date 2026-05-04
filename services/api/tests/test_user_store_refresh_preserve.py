@@ -59,11 +59,18 @@ def test_re_auth_without_new_refresh_preserves_existing(_ddb_table):
     assert u1.oauth_refresh_token == "initial-refresh"
 
     # Re-auth supplies access only — refresh from prior sign-in must remain.
-    us.upsert_oauth_user(
+    u2_direct = us.upsert_oauth_user(
         github_user_id="100", login="evan",
         oauth_access_token="rotated-access",
         oauth_refresh_token=None,
     )
+    # Returned dataclass MUST already reflect the preserved refresh —
+    # otherwise the decrypt-of-existing-blob branch in user_store could
+    # regress without this test catching it. Greptile P2 PR #61.
+    assert u2_direct.oauth_access_token == "rotated-access"
+    assert u2_direct.oauth_refresh_token == "initial-refresh", \
+        "returned User dropped refresh on re-auth — Greptile P2 PR #61"
+
     u2 = us.get_user("100")
     assert u2.oauth_access_token == "rotated-access"
     assert u2.oauth_refresh_token == "initial-refresh", \
