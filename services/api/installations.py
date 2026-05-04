@@ -102,7 +102,11 @@ def list_install_repos(
     user: User = Depends(require_authenticated),
 ) -> dict[str, Any]:
     """List repos visible to this install (live from GitHub) merged with
-    DDB per-repo config so the SPA can render toggle state."""
+    DDB per-repo config so the SPA can render toggle state.
+
+    Capped at 1000 repos (10 × 100 per page); larger orgs log
+    `list_repos_pagination_cap` and silently truncate. Raise the cap
+    if any v1 install hits it."""
     install = get_installation(install_id)
     if not install:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="install not found")

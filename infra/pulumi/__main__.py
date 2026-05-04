@@ -150,8 +150,8 @@ webhook = lambda_service.create(
         "GITHUB_APP_ID_SSM": secrets["github-app-id"].name,
         "GITHUB_APP_PRIVATE_KEY_SSM": secrets["github-app-private-key"].name,
         "GITHUB_APP_WEBHOOK_SECRET_SSM": secrets["github-app-webhook-secret"].name,
-        # OAuth refs included now (Slice 3 #24 will consume them).
-        # Lambda has IAM read on the params already; safe to inject.
+        # OAuth refs — webhook itself doesn't read them; included so a
+        # future merged webhook+api Lambda has them available.
         "GITHUB_APP_CLIENT_ID_SSM": secrets["github-app-client-id"].name,
         "GITHUB_APP_CLIENT_SECRET_SSM": secrets["github-app-client-secret"].name,
         # DDB allowlist gate (Slice 5 #26). Webhook reads INST# + USER#

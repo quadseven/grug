@@ -95,7 +95,8 @@ def get_user(github_user_id: str) -> User | None:
 
     encrypted_token = item.get("oauth_access_token_blob")
     if encrypted_token:
-        # Boto3 returns DDB Binary as bytes
+        # boto3 may return DDB Binary as a Binary wrapper (with .value)
+        # or raw bytes depending on resource-vs-client mode — handle both.
         blob = encrypted_token.value if hasattr(encrypted_token, "value") else encrypted_token
         access_token = decrypt_for_user(
             blob=blob, user_id=github_user_id, item_type="oauth_access_token",
