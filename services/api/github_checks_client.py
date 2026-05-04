@@ -18,7 +18,7 @@ CheckConclusion = Literal[
 ]
 
 
-@dataclass
+@dataclass(frozen=True)
 class CheckRunResult:
     name: str
     head_sha: str
@@ -27,6 +27,20 @@ class CheckRunResult:
     title: str
     summary: str
     text: str | None = None
+
+    def __post_init__(self) -> None:
+        # type-design-analyzer: enforce GitHub's cross-field invariant
+        # "status=='completed' iff conclusion is set". Earlier code
+        # allowed CheckRunResult(status='queued', conclusion='success')
+        # which GitHub 422s — fail at construction instead.
+        is_terminal = self.status == "completed"
+        has_conclusion = self.conclusion is not None
+        if is_terminal != has_conclusion:
+            raise ValueError(
+                "CheckRunResult: status=='completed' iff conclusion is "
+                f"not None (got status={self.status!r}, "
+                f"conclusion={self.conclusion!r})"
+            )
 
 
 def post_check_run(

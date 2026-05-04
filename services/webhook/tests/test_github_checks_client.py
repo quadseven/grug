@@ -131,6 +131,25 @@ def test_post_check_run_401_propagates_for_retry_helper():
     assert exc.value.response.status_code == 401
 
 
+def test_check_run_result_rejects_completed_without_conclusion():
+    """type-design-analyzer: GitHub 422s status=completed + conclusion=None.
+    Reject at construction instead."""
+    with pytest.raises(ValueError, match="iff conclusion"):
+        CheckRunResult(
+            name="x", head_sha="abc", status="completed",
+            conclusion=None, title="t", summary="s",
+        )
+
+
+def test_check_run_result_rejects_in_progress_with_conclusion():
+    """Inverse: status=queued + conclusion=success is also a 422 from GH."""
+    with pytest.raises(ValueError, match="iff conclusion"):
+        CheckRunResult(
+            name="x", head_sha="abc", status="queued",
+            conclusion="success", title="t", summary="s",
+        )
+
+
 def test_post_check_run_500_propagates_unwrapped():
     result = CheckRunResult(
         name="dor", head_sha="abc", status="completed",

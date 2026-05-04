@@ -15,10 +15,19 @@ from dataclasses import dataclass
 from typing import Protocol
 
 
-@dataclass
+@dataclass(frozen=True)
 class CachedToken:
     value: str
     expires_at_unix: float
+
+    def __post_init__(self) -> None:
+        # type-design-analyzer: prevent constructing junk that pollutes
+        # the cache. `value=""` would mask "no token" as "fresh empty
+        # token"; `expires_at_unix <= 0` would always look expired.
+        if not self.value:
+            raise ValueError("CachedToken.value must be non-empty")
+        if self.expires_at_unix <= 0:
+            raise ValueError("CachedToken.expires_at_unix must be > 0")
 
     def is_fresh(self, skew_seconds: float = 30) -> bool:
         return time.time() < self.expires_at_unix - skew_seconds
