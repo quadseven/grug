@@ -238,11 +238,19 @@ def _handle_issue_comment(payload: dict[str, Any]) -> dict[str, str]:
     from personas.tpm.persona import evaluate_pull_request  # type: ignore
     import httpx  # type: ignore
 
+    # URL-encode user-controlled path components. GitHub repo + login
+    # rules forbid most URL-special chars but `+`, `.`, etc. round-trip
+    # safely; defensive `quote(safe="")` guards against future weirdness
+    # + matches the async-blocker-hunter agent's "URL-encoding gaps in
+    # interpolated query strings" pattern.
+    from urllib.parse import quote as _q
+
     if sender_login != pr_author_login:
         def _check_perm(token: str) -> str:
             r = httpx.get(
-                f"https://api.github.com/repos/{owner}/{repo_name}"
-                f"/collaborators/{sender_login}/permission",
+                f"https://api.github.com/repos/{_q(owner, safe='')}/"
+                f"{_q(repo_name, safe='')}/collaborators/"
+                f"{_q(sender_login, safe='')}/permission",
                 headers={
                     "Authorization": f"token {token}",
                     "Accept": "application/vnd.github+json",
@@ -275,7 +283,8 @@ def _handle_issue_comment(payload: dict[str, Any]) -> dict[str, str]:
     # the issue mirror, not the PR head). One API call per recheck.
     def _fetch_pr(token: str) -> dict[str, Any]:
         r = httpx.get(
-            f"https://api.github.com/repos/{owner}/{repo_name}/pulls/{pr_number}",
+            f"https://api.github.com/repos/{_q(owner, safe='')}/"
+            f"{_q(repo_name, safe='')}/pulls/{int(pr_number)}",
             headers={
                 "Authorization": f"token {token}",
                 "Accept": "application/vnd.github+json",
