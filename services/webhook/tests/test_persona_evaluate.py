@@ -87,7 +87,9 @@ def test_evaluate_pull_request_passes_on_good_body():
             )
 
     assert overall.passed is True
-    assert overall.detail == "all pass"
+    assert overall.conclusion == "success"
+    assert len(overall.results) == 5  # 5 dor checks
+    assert all(r.passed for r in overall.results)
     assert captured["status"] == "completed"
     assert captured["conclusion"] == "success"
     assert captured["external_id"] == f"grug-tpm:myorg/myrepo#42:{'abc123def456' + '0' * 28}"
@@ -114,7 +116,8 @@ def test_evaluate_pull_request_fails_on_empty_body():
             )
 
     assert overall.passed is False
-    assert "blocking" in overall.detail
+    assert overall.conclusion == "failure"
+    assert any(not r.passed for r in overall.results)
     assert captured["conclusion"] == "failure"
     assert "❌" in captured["title"]
 
@@ -138,6 +141,30 @@ def test_evaluate_pull_request_uses_grug_check_name():
     # Branch protection ruleset relies on this exact string. Drift = silent
     # cutover regression.
     assert captured["name"] == "Grug — Definition of Ready"
+
+
+def test_tpm_evaluation_is_frozen():
+    """TpmEvaluation is frozen so callers can't mutate the rollup."""
+    from dataclasses import FrozenInstanceError
+    e = persona.TpmEvaluation(
+        passed=True,
+        results=(CheckResult("why", True, "ok"),),
+        conclusion="success",
+    )
+    with pytest.raises(FrozenInstanceError):
+        e.passed = False  # type: ignore[misc]
+
+
+def test_tpm_evaluation_results_is_tuple():
+    """results is a tuple (immutable) — caller can iterate but not append."""
+    e = persona.TpmEvaluation(
+        passed=True,
+        results=(CheckResult("why", True, "ok"),),
+        conclusion="success",
+    )
+    assert isinstance(e.results, tuple)
+    with pytest.raises(AttributeError):
+        e.results.append(CheckResult("x", False, "y"))  # type: ignore[attr-defined]
 
 
 def test_evaluate_pull_request_external_id_format():
