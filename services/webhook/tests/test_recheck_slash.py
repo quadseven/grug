@@ -1,0 +1,185 @@
+"""Tests for #2 — `/grug recheck` slash command via issue_comment.
+
+Covers:
+- Trigger pattern matches case-insensitively + with surrounding whitespace
+- Non-PR comments no_op
+- Non-trigger comments no_op
+- PR author always authorized
+- Non-author with admin/maintain/write authorized
+- Non-author with read/triage/none REJECTED
+- Non-allowlisted install no_op
+- Per-repo TPM disable no_op
+- Successful path re-fetches PR + dispatches to TPM persona
+"""
+
+from __future__ import annotations
+
+from unittest.mock import patch
+
+import pytest
+
+import dispatcher as d
+
+
+def _comment_payload(
+    *,
+    body: str,
+    is_pr: bool = True,
+    sender_login: str = "evan",
+    pr_author: str = "evan",
+    install_id: int = 1,
+    repo_id: int = 100,
+):
+    return {
+        "action": "created",
+        "issue": {
+            "number": 42,
+            "user": {"login": pr_author},
+            "pull_request": {"url": "..."} if is_pr else None,
+        },
+        "comment": {"body": body},
+        "repository": {
+            "id": repo_id, "name": "myrepo",
+            "owner": {"login": "myorg"}, "full_name": "myorg/myrepo",
+        },
+        "installation": {"id": install_id},
+        "sender": {"login": sender_login},
+    }
+
+
+@pytest.fixture
+def _no_install_lookups(monkeypatch):
+    """Skip allowlist + persona toggle DDB calls."""
+    monkeypatch.setattr(d, "is_install_allowlisted", lambda _id: True)
+    monkeypatch.setattr(d, "is_persona_enabled", lambda *_: True)
+
+
+def test_recheck_pattern_matches_case_insensitive():
+    assert d._RECHECK_PAT.search("/grug recheck")
+    assert d._RECHECK_PAT.search("/Grug Recheck")
+    assert d._RECHECK_PAT.search("  /grug   recheck please  ")
+
+
+def test_recheck_pattern_rejects_other_commands():
+    assert not d._RECHECK_PAT.search("/grug status")
+    assert not d._RECHECK_PAT.search("grug recheck")  # missing /
+    assert not d._RECHECK_PAT.search("nope")
+
+
+def test_no_trigger_text_no_ops(_no_install_lookups):
+    payload = _comment_payload(body="lgtm")
+    out = d.dispatch("issue_comment", payload)
+    assert out["status"] == "no_op"
+    assert "no /grug recheck trigger" in out["reason"]
+
+
+def test_non_pr_issue_comment_no_ops(_no_install_lookups):
+    payload = _comment_payload(body="/grug recheck", is_pr=False)
+    out = d.dispatch("issue_comment", payload)
+    assert out["status"] == "no_op"
+    assert "non-PR" in out["reason"]
+
+
+def test_non_created_action_no_ops(_no_install_lookups):
+    payload = _comment_payload(body="/grug recheck")
+    payload["action"] = "edited"
+    out = d.dispatch("issue_comment", payload)
+    assert out["status"] == "no_op"
+    assert "issue_comment action=edited" in out["reason"]
+
+
+def test_pr_author_authorized_path_dispatches(_no_install_lookups):
+    payload = _comment_payload(body="/grug recheck", sender_login="evan", pr_author="evan")
+    fake_pr = {"head": {"sha": "abc123"}, "body": "## Why\nbecause closes #1\n## Acceptance criteria\n- [x] one\n- [x] two\n- [x] three\n## Out of scope\nnone\n\n**Size:** S"}
+
+    class _Result:
+        passed = True
+
+    with patch("github_app_auth.with_install_token_retry", side_effect=lambda _i, fn: fn("tok")):
+        with patch("httpx.get") as get_mock, \
+             patch("personas.tpm.persona.evaluate_pull_request", return_value=_Result()) as eval_mock:
+            get_mock.return_value.raise_for_status = lambda: None
+            get_mock.return_value.json.return_value = fake_pr
+            out = d.dispatch("issue_comment", payload)
+
+    assert out["status"] == "dispatched"
+    assert out["trigger"] == "recheck"
+    assert out["result"] == "pass"
+    eval_mock.assert_called_once()
+    kwargs = eval_mock.call_args.kwargs
+    assert kwargs["head_sha"] == "abc123"
+    assert kwargs["pr_number"] == 42
+
+
+def test_non_author_with_write_perm_authorized(_no_install_lookups):
+    payload = _comment_payload(body="/grug recheck", sender_login="bob", pr_author="evan")
+    fake_pr = {"head": {"sha": "def456"}, "body": ""}
+
+    class _Result:
+        passed = False
+
+    perm_responses = [
+        # First call: permission lookup
+        {"raise_for_status": None, "json": {"permission": "write"}},
+        # Second call: PR fetch
+        {"raise_for_status": None, "json": fake_pr},
+    ]
+    call_idx = [0]
+
+    def _httpx_get(*args, **kwargs):
+        resp = perm_responses[call_idx[0]]
+        call_idx[0] += 1
+
+        class _R:
+            def raise_for_status(self_inner):
+                pass
+
+            def json(self_inner):
+                return resp["json"]
+        return _R()
+
+    with patch("github_app_auth.with_install_token_retry", side_effect=lambda _i, fn: fn("tok")):
+        with patch("httpx.get", side_effect=_httpx_get), \
+             patch("personas.tpm.persona.evaluate_pull_request", return_value=_Result()):
+            out = d.dispatch("issue_comment", payload)
+
+    assert out["status"] == "dispatched"
+    assert out["result"] == "fail"
+
+
+def test_non_author_with_read_perm_rejected(_no_install_lookups):
+    payload = _comment_payload(body="/grug recheck", sender_login="random", pr_author="evan")
+
+    def _httpx_get(*args, **kwargs):
+        class _R:
+            def raise_for_status(self_inner):
+                pass
+
+            def json(self_inner):
+                return {"permission": "read"}
+        return _R()
+
+    with patch("github_app_auth.with_install_token_retry", side_effect=lambda _i, fn: fn("tok")):
+        with patch("httpx.get", side_effect=_httpx_get):
+            out = d.dispatch("issue_comment", payload)
+
+    assert out["status"] == "no_op"
+    assert "lacks write perm" in out["reason"]
+
+
+def test_non_allowlisted_install_no_ops(monkeypatch):
+    monkeypatch.setattr(d, "is_install_allowlisted", lambda _id: False)
+    monkeypatch.setattr(d, "is_persona_enabled", lambda *_: True)
+    payload = _comment_payload(body="/grug recheck")
+    out = d.dispatch("issue_comment", payload)
+    assert out["status"] == "no_op"
+    assert "not allowlisted" in out["reason"]
+
+
+def test_tpm_disabled_per_repo_no_ops(monkeypatch):
+    monkeypatch.setattr(d, "is_install_allowlisted", lambda _id: True)
+    monkeypatch.setattr(d, "is_persona_enabled", lambda *_: False)
+    payload = _comment_payload(body="/grug recheck")
+    out = d.dispatch("issue_comment", payload)
+    assert out["status"] == "no_op"
+    assert "tpm disabled" in out["reason"]
