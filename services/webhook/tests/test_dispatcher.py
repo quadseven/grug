@@ -48,13 +48,14 @@ def _full_pr_payload():
             "body": "## Why\nbecause we need it badly\n## Acceptance criteria\n- a\n- b\n- c\n## Out of scope\nx\nSize: S\ncloses #1",
             "head": {"sha": "abc123def456"},
         },
-        "repository": {"name": "infra", "owner": {"login": "githumps"}, "full_name": "githumps/infra"},
+        "repository": {"id": 7777, "name": "infra", "owner": {"login": "githumps"}, "full_name": "githumps/infra"},
         "installation": {"id": 999},
     }
 
 
 def test_pull_request_dispatches_when_allowlisted():
     with patch("dispatcher.is_install_allowlisted", return_value=True), \
+         patch("dispatcher.is_persona_enabled", return_value=True), \
          patch("personas.tpm.persona.evaluate_pull_request") as mock_eval:
         mock_eval.return_value = type("R", (), {"passed": True})()
         out = dispatch("pull_request", _full_pr_payload())
@@ -64,8 +65,19 @@ def test_pull_request_dispatches_when_allowlisted():
     mock_eval.assert_called_once()
 
 
+def test_pull_request_blocked_when_tpm_disabled_for_repo():
+    """Slice 7 #28 — per-repo opt-out short-circuits AFTER allowlist."""
+    with patch("dispatcher.is_install_allowlisted", return_value=True), \
+         patch("dispatcher.is_persona_enabled", return_value=False), \
+         patch("personas.tpm.persona.evaluate_pull_request") as mock_eval:
+        out = dispatch("pull_request", _full_pr_payload())
+    assert out["status"] == "no_op" and "tpm disabled" in out["reason"]
+    mock_eval.assert_not_called()
+
+
 def test_pull_request_fail_propagates():
     with patch("dispatcher.is_install_allowlisted", return_value=True), \
+         patch("dispatcher.is_persona_enabled", return_value=True), \
          patch("personas.tpm.persona.evaluate_pull_request") as mock_eval:
         mock_eval.return_value = type("R", (), {"passed": False})()
         out = dispatch("pull_request", _full_pr_payload())

@@ -36,6 +36,10 @@ def create(
     memory_mb: int = 512,
     layers: list[str] | None = None,
     extra_ssm_secrets: list[aws.ssm.GetParameterResult] | None = None,
+    cors_allow_origins: list[str] | None = None,
+    cors_allow_methods: list[str] | None = None,
+    cors_allow_headers: list[str] | None = None,
+    cors_allow_credentials: bool = False,
 ) -> LambdaService:
     log_group = aws.cloudwatch.LogGroup(
         f"{name}-logs",
@@ -155,19 +159,29 @@ def create(
         tags={"app": "grug", "service": name},
     )
 
+    # Lambda Function URL CORS — preflight handled by AWS *before* the
+    # Lambda invokes (per memory `reference_lambda_cors_method_limit`),
+    # so we must enumerate every method the SPA uses. Webhook defaults
+    # to POST-only + wildcard origin (GitHub fires from many IPs);
+    # api Lambda overrides with explicit origin + credentials so the
+    # session cookie + cross-origin PUT (from grug.lol → api.grug.lol)
+    # works. Browser rejects allow_origins=["*"] when credentials=True,
+    # so the explicit-origin path is mandatory for the SPA.
     function_url = aws.lambda_.FunctionUrl(
         f"{name}-url",
         function_name=function.name,
         authorization_type="NONE",
         cors=aws.lambda_.FunctionUrlCorsArgs(
-            allow_origins=["*"],
-            allow_methods=["POST"],
-            allow_headers=[
+            allow_origins=cors_allow_origins or ["*"],
+            allow_methods=cors_allow_methods or ["POST"],
+            allow_headers=cors_allow_headers or [
                 "content-type",
                 "x-github-event",
                 "x-github-delivery",
                 "x-hub-signature-256",
             ],
+            allow_credentials=cors_allow_credentials,
+            max_age=86400,
         ),
     )
 

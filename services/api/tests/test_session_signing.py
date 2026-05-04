@@ -1,14 +1,13 @@
-"""Regression tests for session HMAC binding.
+"""Regression tests for session HMAC binding (Codex P1, Slice 7 #28).
 
 Earlier session format `rand.ts.sig.gh_id` left gh_id outside the HMAC,
 so any holder of a valid session could swap the trailing component to
 impersonate any user. New format binds gh_id into the signature.
-
-Sentry CRITICAL + Codex P1 on PR #39 / Slice 3.
 """
 
 from __future__ import annotations
 
+import os
 from unittest.mock import patch
 
 import pytest
