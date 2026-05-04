@@ -32,7 +32,11 @@ _BULLET_PAT = re.compile(
     r"^[ \t]*-[ \t]+(?:\[[ x]\][ \t]+\S|(?!\[)\S)",
     re.MULTILINE,
 )
-_SECTION_PAT = re.compile(r"^##+\s+(.+?)\s*$", re.MULTILINE)
+# Match `## Heading` only — NOT `### Sub`. Earlier `##+` ate H3+
+# headings as section dividers, so any H3 inside `## Acceptance
+# criteria` truncated the section to empty and the bullet check failed
+# on legitimate PR bodies. Closes #45.
+_SECTION_PAT = re.compile(r"^##(?!#)\s+(.+?)\s*$", re.MULTILINE)
 # Sentry MED on PR #40 — earlier `(?:Size:?\s*)?` made the prefix
 # OPTIONAL, so a body like "use the M&Ms" would match `M` and falsely
 # satisfy the estimate check. Require an explicit `Size` token followed
