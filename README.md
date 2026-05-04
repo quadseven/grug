@@ -1,109 +1,29 @@
 # Grug
 
 Modular GitHub bot. Different personas across the SDLC — TPM today
-(Definition-of-Ready check + scheduled iteration pulse), with code-reviewer,
-release-manager, and stuck-PR-pulse personas planned.
+(Definition-of-Ready check + scheduled iteration pulse), with
+code-reviewer, release-manager, and stuck-PR-pulse personas planned.
 
-Two consumption surfaces (in transition):
+## Install
 
-1. **Hosted SaaS at `grug.lol` (preferred — under construction):** install
-   the `Grug Boss` GitHub App once at your account, get every persona
-   on every repo automatically. PRD #21 + slice issues #22-#34 track v1.
-2. **Reusable GitHub Actions workflow (legacy):** drop a caller workflow
-   into each repo (described below). Deprecated when SaaS ships;
-   self-hosters keep this path via AGPL-3.0.
+### Hosted SaaS — recommended
 
-For the SaaS path, see `docs/RUNBOOK.md` (operations) and
-`docs/HITL_PREREQUISITES.md` (one-time setup).
+1. Sign in at https://grug.lol with GitHub
+2. Install the **Grug Boss** GitHub App on the repos you want gated
+3. Toggle personas per-repo in the dashboard
 
-## Quick start (consumer repo)
+That's it. Webhook is wired, check-runs post on every PR.
 
-### 1. PR-gate (every PR)
+> Note: the hosted instance is **allowlist-gated** — request access
+> from `@evan` if you're new. Self-host (below) is the open path.
 
-`.github/workflows/grug.pr-gate.yml`:
+### Self-host
 
-```yaml
-name: Grug · PR DoR check
-on:
-  pull_request:
-    types: [opened, edited, synchronize, ready_for_review]
-permissions:
-  contents: read
-  pull-requests: write
-  issues: write   # PR comments live under issues API
-jobs:
-  grug:
-    uses: githumps/grug/.github/workflows/_reusable.grug-pr-gate.yml@main
-    with:
-      strict: true   # block merge on DoR fail; false = advisory only
-    secrets:
-      poolside_api_key: ${{ secrets.POOLSIDE_API_KEY }}
-```
+Grug is AGPL-3.0. Deploy your own instance against your own AWS account
++ Cloudflare account. Step-by-step in [`docs/SELF_HOST.md`](docs/SELF_HOST.md).
 
-### 2. Scheduled pulse
-
-`.github/workflows/grug.pulse.yml`:
-
-```yaml
-name: Grug · weekly pulse
-on:
-  schedule:
-    - cron: '0 13 * * 1'   # Monday 13:00 UTC = ~05:00 PT
-  workflow_dispatch:
-permissions:
-  contents: read
-  issues: write
-jobs:
-  pulse:
-    uses: githumps/grug/.github/workflows/_reusable.grug-pulse.yml@main
-    with:
-      issue_label: "grug-pulse"
-      mode: "weekly"
-    secrets:
-      poolside_api_key: ${{ secrets.POOLSIDE_API_KEY }}
-```
-
-### 3. Required prereqs (per consumer repo)
-
-1. **Create environment** `grug-bot` (Settings → Environments → New). No
-   protection rules required — existence alone scopes the secret away
-   from unrelated workflows on the same runner.
-2. **Add secret** to that environment: `POOLSIDE_API_KEY` (Poolside free
-   tier, OpenAI-compatible).
-3. `GITHUB_TOKEN` auto-provided.
-4. (Optional) Create label `grug-pulse` so the weekly issue is
-   filterable; the workflow soft-warns + creates on first run if absent.
-5. (Optional) **Project v2 auto-add**: pass your project's GraphQL node
-   ID (`project_id`) and a PAT with `project` scope (`project_pat`).
-   Pulse issues are added to that project on creation. If you also want
-   them to land in a specific column (e.g. "Triage"), pass
-   `project_status_field_id` + `project_status_option_id`.
-
-   ```yaml
-   with:
-     issue_label: "grug-pulse"
-     mode: "weekly"
-     project_id: "PVT_..."                      # GraphQL node ID
-     project_status_field_id: "PVTSSF_..."      # optional
-     project_status_option_id: "<option-id>"    # optional, paired
-   secrets:
-     poolside_api_key: ${{ secrets.POOLSIDE_API_KEY }}
-     project_pat: ${{ secrets.PROJECT_PAT }}
-   ```
-
-   **Find IDs:**
-   - `project_id`: `gh api graphql -f query='query{user(login:"<owner>"){projectV2(number:N){id}}}'`
-   - `project_status_field_id` + option IDs: `gh project field-list <N> --owner <owner> --format json` (works locally where gh CLI has interactive auth; for CI use direct GraphQL or copy the IDs)
-
-   **Why GraphQL IDs and not owner+number?** Earlier revision used
-   `gh project item-add --owner X --number N` which does an owner-type
-   detection probe inside gh CLI. That probe fails with `unknown owner type`
-   on classic PATs that have `project` scope but lack `read:user`/`read:org`.
-   Direct GraphQL mutations (`addProjectV2ItemById`) skip the probe — same
-   auth, fewer scope requirements.
-
-   If any of `project_id` / `project_pat` is unset, the project step
-   no-ops (silent + safe).
+Roughly: pre-load App secrets into AWS SSM → `pulumi up` → point your
+GitHub App webhook URL at `webhook.<your-domain>/webhook/github`.
 
 ## What Grug checks (Definition of Ready)
 
@@ -113,7 +33,7 @@ Static checks on PR body — all blocking when `strict: true`:
 |---|---|
 | `why` | Has `## Why` (or `## Summary`) section ≥5 words |
 | `acceptance` | Has `## Acceptance criteria` (or `## Test plan`) with ≥3 bullets |
-| `estimate` | Body or label includes a Size: XS/S/M/L (XL must be split) |
+| `estimate` | Body or label includes `Size: XS/S/M/L` (XL must be split) |
 | `scope-fence` | Has `## Out of scope` (advisory; warning only) |
 | `issue-link` | Body links an issue via `closes #N` (advisory) |
 
@@ -131,40 +51,38 @@ LLM scope review (advisory) — Poolside `laguna-m.1`:
 
 Grug is the **process gate**, not the **code review gate**.
 
-## Stale issue labelling
+## Pulse (scheduled)
 
-Pulse also labels stale open issues by default (subsumes `actions/stale`
-so all backlog grooming lives in one bot). Tunable via caller inputs:
+Weekly issue-grooming sweep:
+- Re-prefixes Grugboard items with `[<repo>]`
+- Labels stale issues (>90d, idempotent, capped at 30/run)
+- Posts iteration-metrics summary to a configured Discord/Slack channel
 
-```yaml
-with:
-  label_stale: true            # set false to disable
-  stale_days: 90               # threshold
-  stale_label: "stale"         # label name
-  stale_exempt_labels: "epic,pinned,security,grug-pulse"
-```
+## Architecture (SaaS)
 
-Behavior is idempotent — already-stale issues skip; exempt-labelled
-issues skip; mutations cap at 30/run to stay under API limits. Never
-auto-closes anything.
+| Component | What |
+|---|---|
+| `services/webhook/` | FastAPI Lambda receiving GitHub webhooks → HMAC verify → persona dispatch |
+| `services/api/` | FastAPI Lambda backing the dashboard (OAuth, /me, /installations, /admin) |
+| `web/` | React + Vite SPA on Cloudflare Pages |
+| `infra/pulumi/` | Account-agnostic IaC (AWS Lambda + DDB + KMS + Cloudflare DNS/Workers + Datadog monitors) |
+| `services/api/personas/tpm/` | TPM persona (DoR check + Poolside LLM scope review + Checks API post) |
 
-## Degradation behavior
+PRD #21 + slice issues #22-#34 track v1.
 
-Poolside outage / rate limit / missing key → LLM section shows
-"degraded" message; static checks still run + still gate. The bot
-fails-soft on the LLM, not on structure.
+## License
 
-## Re-run
+[AGPL-3.0](LICENSE) — see [`docs/SELF_HOST.md`](docs/SELF_HOST.md) for
+network-service compliance notes if you self-host.
 
-Every PR push re-triggers. Manual re-run: comment `/grug recheck`
-(future) or push empty commit:
+## Contributing
 
-```bash
-git commit --allow-empty -m "trigger grug recheck"
-git push
-```
+Issues + PRs welcome. Use the DoR template (PR body must have
+`## Why`, `## Acceptance criteria`, `Size:`, `closes #N`) — Grug will
+gate your own PR.
 
-## Sticky comment
+## Related docs
 
-Grug uses an HTML-comment marker (`<!-- grug-tpm-bot:sticky -->`) so
-each run patches the same comment instead of stacking new ones.
+- [`docs/RUNBOOK.md`](docs/RUNBOOK.md) — operations (first deploy, secret rotation, tear-down + rebuild)
+- [`docs/SELF_HOST.md`](docs/SELF_HOST.md) — step-by-step self-host setup
+- [`docs/HITL_PREREQUISITES.md`](docs/HITL_PREREQUISITES.md) — one-time GitHub App registration walkthrough
