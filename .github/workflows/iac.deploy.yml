@@ -17,6 +17,8 @@ on:
       - 'feat/25-*'
       - 'feat/26-*'
       - 'feat/27-*'
+      - 'feat/28-*'
+      - 'feat/29-*'
     tags: ['v*']
   workflow_dispatch:
     inputs:
@@ -47,7 +49,7 @@ jobs:
       - name: Configure AWS via OIDC
         uses: aws-actions/configure-aws-credentials@v4
         with:
-          role-to-assume: arn:aws:iam::${{ vars.AWS_ACCOUNT_ID }}:role/grug-gha-deploy
+          role-to-assume: arn:aws:iam::${{ secrets.AWS_ACCOUNT_ID }}:role/grug-gha-deploy
           aws-region: us-east-1
 
       - name: Set stack
@@ -93,13 +95,13 @@ jobs:
         run: |
           aws ecr get-login-password --region us-east-1 | \
             docker login --username AWS --password-stdin \
-            ${{ vars.AWS_ACCOUNT_ID }}.dkr.ecr.us-east-1.amazonaws.com
+            ${{ secrets.AWS_ACCOUNT_ID }}.dkr.ecr.us-east-1.amazonaws.com
 
       - name: Build + push webhook + api images
         id: build
         run: |
           IMAGE_TAG="${GITHUB_SHA::8}"
-          ECR="${{ vars.AWS_ACCOUNT_ID }}.dkr.ecr.us-east-1.amazonaws.com"
+          ECR="${{ secrets.AWS_ACCOUNT_ID }}.dkr.ecr.us-east-1.amazonaws.com"
 
           # Lambda Image-mode rejects OCI media types + buildx provenance
           # attestations. Force Docker manifest schema 2 + disable
