@@ -113,6 +113,10 @@ grug_tokens_cmk = kms_cmk.create("grug-tokens")
 webhook_ecr = ecr_repo.create(
     name="grug-webhook",
     untagged_expire_days=14,
+    # dev needs force_delete=True for `make rebuild` (Slice 10 #31).
+    # prod stays False so `pulumi destroy --stack prod` cannot wipe
+    # production images. Greptile P2 PR #59.
+    force_delete=(env == "dev"),
 )
 
 # Webhook Lambda + Function URL. Image tag wired in via CI build step
@@ -191,6 +195,7 @@ cloudflare_dns.create_proxied_cname(
 api_ecr = ecr_repo.create(
     name="grug-api",
     untagged_expire_days=14,
+    force_delete=(env == "dev"),  # See webhook_ecr above.
 )
 
 api_image_tag = config.get("api_image_tag") or "bootstrap"

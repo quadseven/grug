@@ -20,6 +20,7 @@ on:
       - 'feat/28-*'
       - 'feat/29-*'
       - 'feat/30-*'
+      - 'feat/31-*'
     tags: ['v*']
   workflow_dispatch:
     inputs:
