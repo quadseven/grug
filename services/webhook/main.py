@@ -14,7 +14,7 @@ from __future__ import annotations
 import logging
 import os
 
-from fastapi import Body, FastAPI, Header, HTTPException, status
+from fastapi import FastAPI, Header, HTTPException, Request, status
 
 from hmac_verify import verify_signature
 from observability import configure_logging
@@ -51,20 +51,25 @@ def readyz() -> dict[str, str]:
 
 
 @app.post("/webhook/github")
-def receive_github_webhook(
-    body: bytes = Body(...),
+async def receive_github_webhook(
+    request: Request,
     x_github_event: str = Header(default=""),
     x_github_delivery: str = Header(default=""),
     x_hub_signature_256: str = Header(default=""),
 ) -> dict[str, str]:
-    # Handler is `def`, not `async def`. Every downstream call (DDB
-    # boto3, httpx GitHub posts, KMS) is sync I/O — running them on
-    # the asyncio event loop blocks every other coroutine in the
-    # process. FastAPI runs sync `def` handlers in a threadpool via
-    # Starlette's run_in_threadpool, so concurrent invocations don't
-    # starve each other. Mangum supports both signatures.
-    # Body injected via `bytes = Body(...)` (raw body, no JSON parse)
-    # because HMAC verify needs the exact wire bytes. Closes #68.
+    # Handler is async because reading raw body via Starlette's Request
+    # requires `await request.body()`. Earlier sync version used
+    # `body: bytes = Body(...)` but FastAPI 0.115 / Pydantic-v2
+    # JSON-decodes the body BEFORE bytes-validation when the
+    # Content-Type is application/json (GitHub's default), then 422s
+    # on the parsed dict not being bytes — so HMAC verify never runs.
+    # Using `Request` keeps the wire bytes intact for HMAC verify.
+    #
+    # Lambda concurrency is per-container (one in-flight request per
+    # warm container). Sync boto3 / httpx calls below don't starve
+    # other coroutines because there are none. Closes #68 (the
+    # original spirit) and the pre-Slice-11 422 regression.
+    body = await request.body()
 
     secret = get_webhook_secret()
     if not verify_signature(secret, body, x_hub_signature_256):
