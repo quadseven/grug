@@ -164,24 +164,44 @@ def callback(
     state: str = Query(...),
     grug_oauth_state: str = Cookie(default=""),
 ) -> RedirectResponse:
-    """OAuth callback — exchange code → user-token + upsert DDB."""
+    """OAuth callback — exchange code → user-token + upsert DDB.
+
+    Handler is `def`, NOT `async def` — every downstream call is sync
+    httpx + sync boto3 KMS + sync DDB. FastAPI runs sync defs in a
+    threadpool so concurrent requests don't starve each other. Don't
+    flip this to `async def` without converting the httpx + boto3
+    paths to their async equivalents (re-eval at v1.5 if fan-out
+    behavior lands). See main.py:60-67 + RUNBOOK 'Sync-vs-async
+    route handlers'. Closes async-blocker-hunter F-03.
+    """
     # CSRF
     if not state or state != grug_oauth_state or not _verify_state(state):
         raise HTTPException(status_code=400, detail="invalid_state")
 
-    # Exchange code → user-access-token
-    token_resp = httpx.post(
-        _GH_TOKEN_URL,
-        data={
-            "client_id": _client_id(),
-            "client_secret": _client_secret(),
-            "code": code,
-            "redirect_uri": f"https://api.{_DOMAIN}/api/v1/auth/github/callback",
-        },
-        headers={"Accept": "application/json"},
-        timeout=10,
-    )
-    token_resp.raise_for_status()
+    # Exchange code → user-access-token. Catch BOTH HTTPStatusError
+    # (4xx/5xx from GitHub) AND RequestError (transport: timeout, DNS,
+    # connection-reset). Without the RequestError catch, a transient
+    # network blip surfaces as a 500 with no actionable log line —
+    # async-blocker-hunter F-02.
+    try:
+        token_resp = httpx.post(
+            _GH_TOKEN_URL,
+            data={
+                "client_id": _client_id(),
+                "client_secret": _client_secret(),
+                "code": code,
+                "redirect_uri": f"https://api.{_DOMAIN}/api/v1/auth/github/callback",
+            },
+            headers={"Accept": "application/json"},
+            timeout=10,
+        )
+        token_resp.raise_for_status()
+    except (httpx.HTTPStatusError, httpx.RequestError) as e:
+        log.warning(
+            "oauth_token_endpoint_failed",
+            extra={"err": str(e), "kind": type(e).__name__},
+        )
+        raise HTTPException(status_code=502, detail="oauth_upstream_failed") from e
     token_payload = token_resp.json()
     access_token = token_payload.get("access_token")
     refresh_token = token_payload.get("refresh_token")
@@ -189,13 +209,20 @@ def callback(
         log.warning("oauth_token_missing", extra={"err": token_payload.get("error")})
         raise HTTPException(status_code=400, detail="oauth_token_exchange_failed")
 
-    # Identity
-    user_resp = httpx.get(
-        _GH_USER_URL,
-        headers={"Authorization": f"Bearer {access_token}", "Accept": "application/vnd.github+json"},
-        timeout=10,
-    )
-    user_resp.raise_for_status()
+    # Identity — same transport-error wrap. F-02.
+    try:
+        user_resp = httpx.get(
+            _GH_USER_URL,
+            headers={"Authorization": f"Bearer {access_token}", "Accept": "application/vnd.github+json"},
+            timeout=10,
+        )
+        user_resp.raise_for_status()
+    except (httpx.HTTPStatusError, httpx.RequestError) as e:
+        log.warning(
+            "oauth_user_endpoint_failed",
+            extra={"err": str(e), "kind": type(e).__name__},
+        )
+        raise HTTPException(status_code=502, detail="oauth_upstream_failed") from e
     gh_user = user_resp.json()
     gh_id = str(gh_user["id"])
     login_name = gh_user["login"]
