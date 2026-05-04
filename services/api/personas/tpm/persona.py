@@ -4,7 +4,6 @@ from __future__ import annotations
 
 import logging
 from dataclasses import dataclass
-from typing import Any, Literal
 
 from github_app_auth import with_install_token_retry
 from github_checks_client import CheckConclusion, CheckRunResult, post_check_run
