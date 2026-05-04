@@ -19,7 +19,9 @@ on:
 
 concurrency:
   group: web-deploy-${{ github.ref }}
-  cancel-in-progress: true
+  # Deploys serialize, never cancel — partially-deployed Cloudflare
+  # Pages state is worse than queued runs. Closes #63.
+  cancel-in-progress: false
 
 permissions:
   contents: read
@@ -30,21 +32,23 @@ jobs:
     runs-on: [self-hosted, Linux, X64, srv-unraid-gha]
     timeout-minutes: 15
     steps:
-      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+      - name: 01. Checkout
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
         with:
           ref: ${{ inputs.ref || github.ref }}
 
-      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4.4.0
+      - name: 02. Setup Node 20
+        uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4.4.0
         with:
           node-version: '20'
 
-      - name: Configure AWS via OIDC
+      - name: 03. Configure AWS via OIDC
         uses: aws-actions/configure-aws-credentials@7474bc4690e29a8392af63c5b98e7449536d5c3a # v4.3.1
         with:
           role-to-assume: arn:aws:iam::${{ vars.AWS_ACCOUNT_ID }}:role/grug-gha-deploy
           aws-region: us-east-1
 
-      - name: Resolve secrets from SSM
+      - name: 04. Resolve secrets from SSM
         id: secrets
         env:
           AWS_REGION: us-east-1
@@ -65,19 +69,19 @@ jobs:
           echo "CLOUDFLARE_API_TOKEN=$CF_API_TOKEN" >> "$GITHUB_ENV"
           echo "CLOUDFLARE_ACCOUNT_ID=$CF_ACCOUNT_ID" >> "$GITHUB_ENV"
 
-      - name: Install deps
+      - name: 05. Install deps
         working-directory: web
         run: npm ci --no-audit --no-fund
 
-      - name: Type check
+      - name: 06. Type check
         working-directory: web
         run: npm run typecheck
 
-      - name: Build
+      - name: 07. Build
         working-directory: web
         run: npm run build
 
-      - name: Deploy to Cloudflare Pages
+      - name: 08. Deploy to Cloudflare Pages
         working-directory: web
         env:
           CLOUDFLARE_API_TOKEN: ${{ env.CLOUDFLARE_API_TOKEN }}
