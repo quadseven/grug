@@ -45,18 +45,14 @@ tear-down:
 	cd infra/pulumi && pulumi destroy --stack dev --yes
 
 # Round-trip verifier per Slice 10 #31. Steps:
-#   1. tear-down (pulumi destroy --stack dev)
-#   2. pulumi up --target ECR repos only (Lambda image-mode needs the
-#      ECR repo URL to exist + a :bootstrap image present BEFORE its
-#      first create succeeds)
-#   3. bootstrap-images (crane copy public python:3.13 → private ECR)
-#   4. pulumi up — full stack (Lambdas now resolve image_uri)
-#   5. trigger CI to build + push real images, swap imageUri
-#   6. CF Workers re-deploy + admin USER# + INST# re-seed (Slice 5
-#      #26 allowlist gate requires at least one allowlisted user
-#      before any PR check) — also picks up Function URL host churn
-#      per reference_lambda_function_url_host_volatile
-#   7. smoke test all three public URLs
+#   1. destroy
+#   2. up (creates ECR + Lambdas with :bootstrap python:3.13 base)
+#   3. trigger CI to build + push real images, then re-up to swap imageUri
+#   4. CF Workers re-deploy via deploy.sh (Function URL host changed
+#      on recreate per reference_lambda_function_url_host_volatile)
+#   5. re-seed admin USER# + INST# rows (Slice 5 #26 allowlist gate
+#      requires at least one allowlisted user before any PR check)
+#   6. smoke test all three public URLs
 #
 # Total wall-clock: ~12-15min. PR check-runs queue + retry post-rebuild.
 rebuild: tear-down
@@ -72,7 +68,7 @@ rebuild: tear-down
 	gh workflow run iac.deploy.yml --ref $$(git branch --show-current) --repo githumps/grug
 	@echo ">>   waiting for run to start..."
 	@sleep 10
-	@RUN_ID=$$(gh run list --workflow=iac.deploy.yml --branch=$$(git branch --show-current) --repo githumps/grug --limit=1 --json databaseId --jq '.[0].databaseId'); \
+	@RUN_ID=$$(gh run list --workflow=iac.deploy.yml --branch=$$(git branch --show-current) --limit=1 --json databaseId --jq '.[0].databaseId'); \
 	  echo ">>   following run $$RUN_ID"; \
 	  gh run watch $$RUN_ID --exit-status --repo githumps/grug
 	@echo ">> step 6/7: CF Workers re-deploy + admin re-seed"

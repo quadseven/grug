@@ -20,6 +20,9 @@ on:
       - 'feat/28-*'
       - 'feat/29-*'
       - 'feat/30-*'
+      - 'feat/31-*'
+      - 'fix/codex-postreview-49-56'
+      - 'fix/44-45-sha-pins-and-section-regex'
     tags: ['v*']
   workflow_dispatch:
     inputs:
