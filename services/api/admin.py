@@ -171,7 +171,10 @@ def patch_user(
         if payload.allowlisted and not before["allowlisted"]:
             update_parts.append("allowlisted_at = :at, allowlisted_by = :by")
             expr_vals[":at"] = now
-            expr_vals[":by"] = actor.login
+            # Record the immutable github_user_id, not the (mutable) login.
+            # GitHub usernames can be renamed; the audit trail must survive
+            # a username change.
+            expr_vals[":by"] = actor.github_user_id
     if payload.role is not None:
         # `role` is a DDB reserved word — must alias.
         update_parts.append("#r = :r")
