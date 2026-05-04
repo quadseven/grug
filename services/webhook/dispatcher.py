@@ -260,6 +260,11 @@ def _handle_issue_comment(payload: dict[str, Any]) -> dict[str, str]:
             r.raise_for_status()
             return (r.json() or {}).get("permission", "")
 
+        # Catch BOTH HTTPStatusError (4xx/5xx from GH) AND RequestError
+        # (transport: timeout, DNS, connection-reset). Earlier code only
+        # caught HTTPStatusError; transport blips surfaced as webhook
+        # 500 → GitHub retries the delivery → duplicate work.
+        # async-blocker-hunter F-01.
         try:
             perm = with_install_token_retry(int(installation_id), _check_perm)
         except httpx.HTTPStatusError as e:
@@ -268,6 +273,12 @@ def _handle_issue_comment(payload: dict[str, Any]) -> dict[str, str]:
                 extra={"sender": sender_login, "status": e.response.status_code},
             )
             return {"status": "skip", "reason": "perm_lookup_failed"}
+        except httpx.RequestError as e:
+            log.warning(
+                "recheck_perm_lookup_transport_failed",
+                extra={"sender": sender_login, "kind": type(e).__name__},
+            )
+            return {"status": "skip", "reason": "perm_lookup_transport_failed"}
 
         if perm not in _AUTHORIZED_ROLES:
             log.info(
@@ -302,6 +313,14 @@ def _handle_issue_comment(payload: dict[str, Any]) -> dict[str, str]:
             extra={"pr_number": pr_number, "status": e.response.status_code},
         )
         return {"status": "skip", "reason": "pr_fetch_failed"}
+    except httpx.RequestError as e:
+        # Transport-level failure (timeout, DNS, connection-reset).
+        # Same rationale as the perm-lookup catch above. F-01.
+        log.warning(
+            "recheck_pr_fetch_transport_failed",
+            extra={"pr_number": pr_number, "kind": type(e).__name__},
+        )
+        return {"status": "skip", "reason": "pr_fetch_transport_failed"}
 
     head_sha = ((pr.get("head") or {}).get("sha")) or ""
     pr_body = pr.get("body") or ""
