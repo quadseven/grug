@@ -106,6 +106,13 @@ def create(
                             "cloudwatch:*",
                             "sts:GetCallerIdentity",
                             "kms:Decrypt",
+                            # Lambda eagerly encrypts env vars on the
+                            # CALLING principal's behalf when kms_key_arn
+                            # is set on the function. Without kms:Encrypt
+                            # on the deployer role, UpdateFunctionConfig
+                            # 403s. Closes #60.
+                            "kms:Encrypt",
+                            "kms:DescribeKey",
                         ],
                         # NOTE: tightening to specific resource ARNs is a
                         # follow-up. Slice 1 prioritizes "deploy works".
