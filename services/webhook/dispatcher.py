@@ -32,7 +32,7 @@ def dispatch(event_name: str, payload: dict[str, Any]) -> dict[str, str]:
         return _handle_installation(payload)
     if event_name == "installation_repositories":
         # Repo-list change on an existing install — install row already
-        # exists; nothing to record (per-repo config lands in Slice 7+).
+        # exists; per-repo config lives in services/api/installations.py.
         return {"status": "no_op", "reason": "installation_repositories acknowledged"}
     if event_name == "pull_request":
         return _handle_pull_request(payload)

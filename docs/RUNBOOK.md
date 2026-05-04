@@ -159,7 +159,7 @@ State that lives outside Pulumi (and persists across destroy):
 ## Service tags
 
 All grug DD entities tagged:
-- `service:grug-webhook` (or `grug-api` for the API Lambda once Slice 2 ships)
+- `service:grug-webhook` and `service:grug-api`
 - `env:dev` or `env:prod`
 - `version:<image-tag>` (typically commit SHA)
 - `app:grug` (resource tag on AWS resources)
