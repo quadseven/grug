@@ -19,8 +19,10 @@ def _oauth_mod(monkeypatch):
     monkeypatch.setenv("GITHUB_APP_CLIENT_SECRET_SSM", "/grug/test-client-secret")
     monkeypatch.setenv("GRUG_DOMAIN", "grug.lol")
     import auth.github_oauth as mod
+    # State CSRF + session cookie signing both use `_state_secret` —
+    # no separate `_session_secret` function exists. The session HMAC
+    # binds gh_id (Codex P1 fix in Slice 7) but uses the same key.
     monkeypatch.setattr(mod, "_state_secret", lambda: "test-secret-v1")
-    monkeypatch.setattr(mod, "_session_secret", lambda: "test-session-v1")
     monkeypatch.setattr(mod, "_client_id", lambda: "Iv1.testclientid")
     monkeypatch.setattr(mod, "_client_secret", lambda: "test-client-secret")
     return mod
