@@ -86,5 +86,19 @@ async def receive_github_webhook(
         },
     )
 
-    # Slice 1 — no-op after verify. Slice 4 dispatches into personas here.
-    return {"status": "received", "delivery_id": x_github_delivery}
+    # Dispatch to personas (Slice 4 #25). v1: pull_request → TPM.
+    import json as _json
+    from dispatcher import dispatch  # lazy import keeps cold-start cheap
+
+    try:
+        payload = _json.loads(body)
+    except _json.JSONDecodeError:
+        log.warning("webhook_body_not_json", extra={"delivery_id": x_github_delivery})
+        return {"status": "skip", "reason": "body_not_json"}
+
+    outcome = dispatch(x_github_event, payload)
+    log.info(
+        "webhook_dispatched",
+        extra={"delivery_id": x_github_delivery, **outcome},
+    )
+    return {"status": "ok", "delivery_id": x_github_delivery, **outcome}

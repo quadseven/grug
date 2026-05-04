@@ -93,7 +93,7 @@ gha_deploy_role = oidc_role.create(
     repo="githumps/grug",
     # `main` and SaaS-conversion feature branches (epic-grug-saas).
     # Tighten back to `main` only once Slice 13 (#34) ships.
-    branches=["main", "feat/22-*", "feat/23-*", "feat/24-*"],
+    branches=["main", "feat/22-*", "feat/23-*", "feat/24-*", "feat/25-*"],
     tags_pattern="v*",
 )
 
