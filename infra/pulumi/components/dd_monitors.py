@@ -138,8 +138,14 @@ def create_all(
             "Consider provisioned concurrency if growth demands.\n"
             "Runbook: docs/RUNBOOK.md#cold-start"
         ),
+        # Greptile P1 PR #48 — `aws.lambda.duration` measures total
+        # invocation time (warm + cold); cold-start spikes get drowned
+        # by warm calls. DD-extension-instrumented Lambdas emit init
+        # duration as `aws.lambda.enhanced.init_duration` (Codex P2
+        # follow-up; AWS-native `aws.lambda.init_duration` is empty on
+        # DD-extension Lambdas).
         query=(
-            "avg(last_15m):p99:aws.lambda.duration"
+            "avg(last_15m):p99:aws.lambda.enhanced.init_duration"
             "{functionname:grug-webhook,env:" + env + "} > 3000"
         ),
         tags=_common_tags(env, "grug-webhook"),
@@ -162,7 +168,7 @@ def create_all(
         locations=["aws:us-east-1"],
         message=(
             f"{notify_handle}\n"
-            "Synthetic uptime check on https://webhook.grug.lol/livez "
+            f"Synthetic uptime check on {livez_url} "
             "failing. GitHub webhook deliveries may be dropping.\n"
             "Runbook: docs/RUNBOOK.md#uptime-fail"
         ),

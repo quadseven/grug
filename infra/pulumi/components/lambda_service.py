@@ -159,12 +159,13 @@ def create(
         # `env` tag is what DD monitors filter on (matches DD_ENV).
         # Lambda CloudWatch metrics propagate the resource's `env` tag
         # to DD, so without it `aws.lambda.duration{env:dev}` returns
-        # zero series. Sourced from GRUG_ENV env var which Lambda always
-        # gets (set in __main__.py).
+        # zero series. Greptile P2 PR #48 — silent fallback to
+        # `unknown` would have caused all DD monitors to flip to
+        # `No Data` without visible error. Fail-fast at deploy time.
         tags={
             "app": "grug",
             "service": name,
-            "env": env_vars.get("GRUG_ENV", "unknown"),
+            "env": env_vars["GRUG_ENV"],
             "team": "grug",
         },
     )

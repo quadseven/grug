@@ -19,6 +19,7 @@ from __future__ import annotations
 import pulumi
 import pulumi_aws as aws
 import pulumi_cloudflare as cloudflare
+import pulumi_datadog as _datadog
 
 from components import (
     cloudflare_dns,
@@ -319,8 +320,6 @@ cloudflare_dns.create_proxied_cname(
 
 # Datadog monitors (Slice 9 #30). Provider reads DD creds from SSM
 # `/shared/datadog-{api,app}-key` per #164 cross-repo convention.
-import pulumi_datadog as _datadog
-
 _dd_app_key = aws.ssm.get_parameter(
     name="/shared/datadog-app-key", with_decryption=True,
 )
