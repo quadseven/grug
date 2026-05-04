@@ -17,6 +17,7 @@ from typing import Any
 
 from adapters.install_store import (
     delete_installation,
+    get_installation,
     is_install_allowlisted,
     is_persona_enabled,
     record_installation,
@@ -51,7 +52,7 @@ def _handle_installation(payload: dict[str, Any]) -> dict[str, str]:
         delete_installation(int(install_id))
         return {"status": "recorded", "action": "deleted"}
 
-    if action in {"created", "new_permissions_accepted", "unsuspend"}:
+    if action == "created":
         account = install.get("account") or {}
         sender = payload.get("sender") or {}
         installed_by = sender.get("id") or account.get("id")
@@ -64,6 +65,31 @@ def _handle_installation(payload: dict[str, Any]) -> dict[str, str]:
             installed_by_user_id=int(installed_by),
         )
         return {"status": "recorded", "action": action}
+
+    if action in {"new_permissions_accepted", "unsuspend"}:
+        # Codex post-review #51 — preserve the original installer.
+        # Sender on these events can be a different org admin than the
+        # one who originally clicked Install. Overwriting installed_by
+        # would shift allowlist resolution to a user who never agreed
+        # to be the install owner.
+        existing = get_installation(int(install_id))
+        if not existing:
+            # Edge case: we missed the `created` event somehow. Fall
+            # back to record using sender so allowlist gate has SOME
+            # owner to resolve against.
+            account = install.get("account") or {}
+            sender = payload.get("sender") or {}
+            installed_by = sender.get("id") or account.get("id")
+            if not installed_by:
+                return {"status": "skip", "reason": "no sender.id or account.id"}
+            record_installation(
+                install_id=int(install_id),
+                account_login=account.get("login", ""),
+                account_type=account.get("type", "User"),
+                installed_by_user_id=int(installed_by),
+            )
+            return {"status": "recorded", "action": f"{action}_backfill"}
+        return {"status": "no_op", "reason": f"{action} ack — installer preserved"}
 
     return {"status": "no_op", "reason": f"installation action={action} unhandled"}
 

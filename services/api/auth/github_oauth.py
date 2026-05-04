@@ -40,8 +40,11 @@ _GH_AUTHORIZE_URL = "https://github.com/login/oauth/authorize"
 _GH_TOKEN_URL = "https://github.com/login/oauth/access_token"
 _GH_USER_URL = "https://api.github.com/user"
 _DOMAIN = os.environ.get("GRUG_DOMAIN", "grug.lol")
+# All authed users land on /dashboard regardless of allowlist state —
+# the dashboard renders the awaiting-allowlist banner inline (Slice 7).
+# Earlier callback split allowlisted vs not into /dashboard vs /waitlist
+# but the SPA never had a /waitlist route → 404. Codex post-review #55.
 _DASHBOARD_URL = f"https://{_DOMAIN}/dashboard"
-_WAITLIST_URL = f"https://{_DOMAIN}/waitlist"
 _STATE_TTL_SECONDS = 600  # 10 min
 
 
@@ -212,7 +215,7 @@ def callback(
     # Set session cookie. Format: rand.ts.gh_id.sig where sig HMAC-binds
     # gh_id (else the trailing component is swappable; Codex P1 in Slice 7).
     session_value = _make_session(gh_id)
-    target = _DASHBOARD_URL if user.allowlisted else _WAITLIST_URL
+    target = _DASHBOARD_URL  # Codex post-review #55 — see _DASHBOARD_URL note above.
     resp = RedirectResponse(url=target, status_code=302)
     resp.delete_cookie("grug_oauth_state")
     resp.set_cookie(

@@ -23,8 +23,26 @@ import boto3
 log = logging.getLogger("grug.webhook.install_store")
 
 _TABLE_NAME = os.environ.get("GRUG_DDB_TABLE", "grug-main")
-_ddb = boto3.resource("dynamodb")
-_table = _ddb.Table(_TABLE_NAME)
+
+# Lazy init — boto3 resource construction at import time would require
+# AWS_DEFAULT_REGION to be set BEFORE the first import, which breaks
+# tests that monkeypatch the env after collection. Codex post-review
+# #52. The descriptor on `_table` lets old call sites (`_table.scan`,
+# `_table.get_item`, etc.) keep working unchanged.
+_ddb = None
+_table_real = None
+
+
+class _LazyTable:
+    def __getattr__(self, name):
+        global _ddb, _table_real
+        if _table_real is None:
+            _ddb = boto3.resource("dynamodb")
+            _table_real = _ddb.Table(_TABLE_NAME)
+        return getattr(_table_real, name)
+
+
+_table = _LazyTable()
 
 
 def _inst_pk(install_id: int | str) -> str:
