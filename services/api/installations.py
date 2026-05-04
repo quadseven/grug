@@ -35,7 +35,7 @@ from adapters.install_store import (
 )
 from adapters.user_store import User
 from auth.dependencies import require_authenticated
-from github_app_auth import get_install_token
+from github_app_auth import get_install_token, with_install_token_retry
 
 log = logging.getLogger("grug.api.installations")
 
@@ -90,40 +90,47 @@ def list_install_repos(
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="install not found")
     _ensure_can_access(install, user)
 
-    token = get_install_token(install_id)
-    repos: list[dict[str, Any]] = []
-    page = 1
-    with httpx.Client(timeout=10) as client:
-        while True:
-            resp = client.get(
-                f"{_GH_API}/installation/repositories",
-                headers={
-                    "Authorization": f"token {token}",
-                    "Accept": "application/vnd.github+json",
-                },
-                params={"per_page": 100, "page": page},
-            )
-            resp.raise_for_status()
-            body = resp.json()
-            for r in body.get("repositories", []):
-                cfg = get_repo_config(install_id, r["id"])
-                repos.append({
-                    "repo_id": r["id"],
-                    "full_name": r["full_name"],
-                    "private": r.get("private", False),
-                    "default_branch": r.get("default_branch", "main"),
-                    "config": cfg,
-                })
-            if len(body.get("repositories", [])) < 100:
-                break
-            page += 1
-            if page > 10:  # 1000 repos is plenty for v1
-                log.warning(
-                    "list_repos_pagination_cap",
-                    extra={"install_id": install_id, "user": user.login},
+    # Wrapped in with_install_token_retry so a 401 from GitHub
+    # (App reinstall, perm change, secret rotation revoking the cached
+    # token mid-warm-container) invalidates the cache + re-fetches
+    # before retry. Otherwise the warm Lambda burns the bad token for
+    # up to 55min. Closes #50.
+    def _fetch(token: str) -> list[dict[str, Any]]:
+        out: list[dict[str, Any]] = []
+        page = 1
+        with httpx.Client(timeout=10) as client:
+            while True:
+                resp = client.get(
+                    f"{_GH_API}/installation/repositories",
+                    headers={
+                        "Authorization": f"token {token}",
+                        "Accept": "application/vnd.github+json",
+                    },
+                    params={"per_page": 100, "page": page},
                 )
-                break
+                resp.raise_for_status()
+                body = resp.json()
+                for r in body.get("repositories", []):
+                    cfg = get_repo_config(install_id, r["id"])
+                    out.append({
+                        "repo_id": r["id"],
+                        "full_name": r["full_name"],
+                        "private": r.get("private", False),
+                        "default_branch": r.get("default_branch", "main"),
+                        "config": cfg,
+                    })
+                if len(body.get("repositories", [])) < 100:
+                    break
+                page += 1
+                if page > 10:  # 1000 repos is plenty for v1
+                    log.warning(
+                        "list_repos_pagination_cap",
+                        extra={"install_id": install_id, "user": user.login},
+                    )
+                    break
+        return out
 
+    repos = with_install_token_retry(install_id, _fetch)
     return {"repos": repos}
 
 
@@ -148,34 +155,33 @@ def update_repo_config(
     # Now enumerate via `GET /installation/repositories` (the dedicated
     # endpoint that lists ONLY this install's repos) and verify
     # membership.
-    token = get_install_token(install_id)
-    full_name = ""
-    found = False
-    page = 1
-    with httpx.Client(timeout=10) as client:
-        while not found:
-            resp = client.get(
-                f"{_GH_API}/installation/repositories",
-                headers={
-                    "Authorization": f"token {token}",
-                    "Accept": "application/vnd.github+json",
-                },
-                params={"per_page": 100, "page": page},
-            )
-            resp.raise_for_status()
-            body_json = resp.json()
-            for r in body_json.get("repositories", []):
-                if r["id"] == repo_id:
-                    found = True
-                    full_name = r["full_name"]
-                    break
-            if found or len(body_json.get("repositories", [])) < 100:
-                break
-            page += 1
-            # No page cap — single-repo membership lookup must scan all
-            # pages on large org installs (>1000 repos). Codex P2
-            # follow-up to the Sentry CRITICAL fix. Worst case ~Npages*
-            # 100ms; acceptable for an admin write path.
+    # Wrapped in with_install_token_retry — see list_repos above.
+    def _lookup(token: str) -> tuple[bool, str]:
+        page = 1
+        with httpx.Client(timeout=10) as client:
+            while True:
+                resp = client.get(
+                    f"{_GH_API}/installation/repositories",
+                    headers={
+                        "Authorization": f"token {token}",
+                        "Accept": "application/vnd.github+json",
+                    },
+                    params={"per_page": 100, "page": page},
+                )
+                resp.raise_for_status()
+                body_json = resp.json()
+                for r in body_json.get("repositories", []):
+                    if r["id"] == repo_id:
+                        return True, r["full_name"]
+                if len(body_json.get("repositories", [])) < 100:
+                    return False, ""
+                page += 1
+                # No page cap — single-repo membership lookup must scan
+                # all pages on large org installs (>1000 repos). Codex
+                # P2 follow-up to the Sentry CRITICAL fix. Worst case
+                # ~Npages*100ms; acceptable for an admin write path.
+
+    found, full_name = with_install_token_retry(install_id, _lookup)
     if not found:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="repo not visible to install")
 
