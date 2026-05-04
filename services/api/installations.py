@@ -33,7 +33,7 @@ from adapters.install_store import (
     list_user_installations,
     set_repo_config,
 )
-from adapters.user_store import User
+from adapters.user_store import UserIdentity
 from auth.dependencies import require_authenticated
 from github_app_auth import get_install_token, with_install_token_retry
 
@@ -55,7 +55,7 @@ class RepoConfigPayload(BaseModel):
     tpm_enabled: bool = Field(default=True)
 
 
-def _ensure_can_access(install: dict[str, Any], user: User) -> None:
+def _ensure_can_access(install: dict[str, Any], user: UserIdentity) -> None:
     """Caller must own the install OR be admin. Raises 403 otherwise."""
     if user.role == "admin":
         return
@@ -68,7 +68,7 @@ def _ensure_can_access(install: dict[str, Any], user: User) -> None:
 
 
 @router.get("/installations")
-def list_installations(user: User = Depends(require_authenticated)) -> dict[str, Any]:
+def list_installations(user: UserIdentity = Depends(require_authenticated)) -> dict[str, Any]:
     """Installs owned by the current user (admin sees only own here too;
     cross-user listing is admin-only and lives at /api/v1/admin/users)."""
     items = list_user_installations(user.github_user_id)
@@ -99,7 +99,7 @@ def list_installations(user: User = Depends(require_authenticated)) -> dict[str,
 @router.get("/installations/{install_id}/repos")
 def list_install_repos(
     install_id: int,
-    user: User = Depends(require_authenticated),
+    user: UserIdentity = Depends(require_authenticated),
 ) -> dict[str, Any]:
     """List repos visible to this install (live from GitHub) merged with
     DDB per-repo config so the SPA can render toggle state.
@@ -174,7 +174,7 @@ def update_repo_config(
     install_id: int,
     repo_id: int,
     body: RepoConfigPayload,
-    user: User = Depends(require_authenticated),
+    user: UserIdentity = Depends(require_authenticated),
 ) -> dict[str, Any]:
     """Upsert per-repo persona toggle. Caller must own the install."""
     install = get_installation(install_id)

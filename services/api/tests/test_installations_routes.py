@@ -58,11 +58,11 @@ def _mod(monkeypatch):
 
 
 def _user(user_id="100", role="user"):
-    from adapters.user_store import User
-    return User(
+    from adapters.user_store import UserIdentity
+    return UserIdentity(
         github_user_id=user_id, login="evan", role=role, tier="free",
-        allowlisted=True, oauth_access_token="x", oauth_refresh_token=None,
-        created_at="",
+        allowlisted=True, created_at="",
+        allowlisted_at=None, allowlisted_by=None,
     )
 
 
