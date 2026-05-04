@@ -46,15 +46,16 @@ jobs:
     runs-on: [self-hosted, Linux, X64, srv-unraid-gha]
     timeout-minutes: 20
     steps:
-      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+      - name: 01. Checkout
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
 
-      - name: Configure AWS via OIDC
+      - name: 02. Configure AWS via OIDC
         uses: aws-actions/configure-aws-credentials@7474bc4690e29a8392af63c5b98e7449536d5c3a # v4.3.1
         with:
           role-to-assume: arn:aws:iam::${{ secrets.AWS_ACCOUNT_ID }}:role/grug-gha-deploy
           aws-region: us-east-1
 
-      - name: Set stack
+      - name: 03. Resolve stack name
         id: stack
         run: |
           if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
@@ -70,7 +71,7 @@ jobs:
       # at deploy time using OIDC role's ssm:GetParameter on /shared/*.
       # Mask the value so it never leaks into job logs even if a step
       # echoes it accidentally.
-      - name: Fetch Pulumi access token from SSM
+      - name: 04. Fetch Pulumi access token from SSM
         run: |
           TOKEN=$(aws ssm get-parameter --name /shared/pulumi-access-token \
             --with-decryption --query 'Parameter.Value' --output text)
@@ -80,26 +81,26 @@ jobs:
       # Runner has system Python 3.14 + uv (installed at /usr/local/bin/uv
       # via the runner-tooling bootstrap). Pyproject requires >=3.11 so
       # 3.14 satisfies. actions/setup-python lacks Ubuntu 26.04 prebuilds.
-      - name: Verify Python + uv
+      - name: 05. Verify Python + uv
         run: |
           python3 --version
           uv --version
 
-      - name: Set up QEMU (arm64 cross-build emulation on x86 runners)
+      - name: 06. Setup QEMU (arm64 cross-build emulation on x86)
         uses: docker/setup-qemu-action@c7c53464625b32c7a7e944ae62b3e17d2b600130 # v3.7.0
         with:
           platforms: arm64
 
-      - name: Set up Docker Buildx
+      - name: 07. Setup Docker Buildx
         uses: docker/setup-buildx-action@8d2750c68a42422c14e847fe6c8ac0403b4cbd6f # v3.12.0
 
-      - name: Login to ECR
+      - name: 08. Login to ECR
         run: |
           aws ecr get-login-password --region us-east-1 | \
             docker login --username AWS --password-stdin \
             ${{ secrets.AWS_ACCOUNT_ID }}.dkr.ecr.us-east-1.amazonaws.com
 
-      - name: Build + push webhook + api images
+      - name: 09. Build + push webhook + api images
         id: build
         run: |
           IMAGE_TAG="${GITHUB_SHA::8}"
@@ -125,7 +126,8 @@ jobs:
           done
           echo "tag=$IMAGE_TAG" >> $GITHUB_OUTPUT
 
-      - uses: pulumi/actions@8582a9e8cc630786854029b4e09281acd6794b58 # v6.6.1
+      - name: 10. Pulumi up
+        uses: pulumi/actions@8582a9e8cc630786854029b4e09281acd6794b58 # v6.6.1
         with:
           command: up
           stack-name: pulumi_ehumps_me/grug/${{ steps.stack.outputs.stack }}
@@ -134,7 +136,7 @@ jobs:
             webhook_image_tag: { value: "${{ steps.build.outputs.tag }}" }
             api_image_tag:     { value: "${{ steps.build.outputs.tag }}" }
 
-      - name: Deploy CF Workers (host-rewrite proxies)
+      - name: 11. Deploy CF Workers (host-rewrite proxies)
         run: bash infra/cloudflare/deploy.sh
         env:
           PULUMI_CWD: infra/pulumi

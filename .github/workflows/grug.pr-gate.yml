@@ -8,6 +8,12 @@ on:
   pull_request:
     types: [opened, edited, synchronize, ready_for_review]
 
+# Cancel older runs on same PR — newer push obsoletes prior gating
+# attempt. Closes #63.
+concurrency:
+  group: grug-pr-gate-${{ github.ref }}
+  cancel-in-progress: true
+
 permissions:
   contents: read
   pull-requests: write
