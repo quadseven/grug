@@ -19,6 +19,10 @@ permissions:
   pull-requests: write
   issues: write
 
+# Force JS actions to Node 24. See iac.deploy.yml. Closes #71.
+env:
+  FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: "true"
+
 jobs:
   grug:
     name: Grug · self check
