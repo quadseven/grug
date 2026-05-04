@@ -151,7 +151,9 @@ jobs:
           echo "tag=$IMAGE_TAG" >> $GITHUB_OUTPUT
 
       - name: 10. Pulumi up
+        id: pulumi_up_first
         uses: pulumi/actions@8582a9e8cc630786854029b4e09281acd6794b58 # v6.6.1
+        continue-on-error: true
         with:
           command: up
           stack-name: pulumi_ehumps_me/grug/${{ steps.stack.outputs.stack }}
@@ -159,6 +161,31 @@ jobs:
           # full_commit_sha = 40-char SHA used for DD source-code linking
           # (image_tag is 8-char short SHA; DD source UI requires full).
           # Greptile P1 PR #81.
+          config-map: |
+            webhook_image_tag: { value: "${{ steps.build.outputs.tag }}" }
+            api_image_tag:     { value: "${{ steps.build.outputs.tag }}" }
+            full_commit_sha:   { value: "${{ github.sha }}" }
+
+      # IAM eventual consistency: when pulumi up adds new RolePolicy
+      # statements (e.g. kms:Encrypt for env-var encryption) AND in the
+      # same plan tries to use those perms (Lambda UpdateFunctionConfig),
+      # AWS auth checks may still see the old policy for 10-30s after
+      # the RolePolicy update returns success. The first run's IAM update
+      # propagates by the time the retry kicks off. Closes #60 deploy
+      # flakiness on env-var-encrypt-touching diffs.
+      - name: 10b. Wait for IAM propagation if pulumi-up failed
+        if: steps.pulumi_up_first.outcome == 'failure'
+        run: |
+          echo "::warning::pulumi up #1 failed — sleeping 45s for IAM consistency, retrying"
+          sleep 45
+
+      - name: 10c. Pulumi up (retry on IAM-consistency failure)
+        if: steps.pulumi_up_first.outcome == 'failure'
+        uses: pulumi/actions@8582a9e8cc630786854029b4e09281acd6794b58 # v6.6.1
+        with:
+          command: up
+          stack-name: pulumi_ehumps_me/grug/${{ steps.stack.outputs.stack }}
+          work-dir: infra/pulumi
           config-map: |
             webhook_image_tag: { value: "${{ steps.build.outputs.tag }}" }
             api_image_tag:     { value: "${{ steps.build.outputs.tag }}" }
