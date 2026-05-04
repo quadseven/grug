@@ -25,10 +25,9 @@ class TpmEvaluation:
     results: tuple[CheckResult, ...]
     conclusion: CheckConclusion
 
-# Logger uses the `grug.webhook.*` namespace because this file is the
-# webhook-side copy (mirrored from services/api/personas/tpm/persona.py).
-# Greptile P2 on PR #40 — earlier `grug.api.persona.tpm` would route DD
-# logs/queries to the wrong service.
+# Logger uses the `grug.webhook.*` namespace; api-side copy uses
+# `grug.api.*`. The single-line divergence is intentional + the
+# only reason this file isn't in MIRRORED_FILES (drift-lint).
 log = logging.getLogger("grug.webhook.persona.tpm")
 
 _CHECK_NAME = "Grug — Definition of Ready"
