@@ -16,6 +16,7 @@ from __future__ import annotations
 
 from unittest.mock import patch
 
+import httpx
 import pytest
 
 import dispatcher as d
@@ -185,32 +186,36 @@ def test_tpm_disabled_per_repo_no_ops(monkeypatch):
     assert "tpm disabled" in out["reason"]
 
 
-def test_perm_lookup_transport_error_returns_skip(_no_install_lookups):
+def test_perm_lookup_transport_error_returns_skip(_no_install_lookups, mock_transport_client):
     """async-blocker-hunter F-01: transport error during perm lookup
-    must return skip + log, not 500."""
-    payload = _comment_payload(body="/grug recheck", sender_login="bob", pr_author="evan")
+    must return skip + log, not 500.
 
-    def _raise_transport(*args, **kwargs):
-        raise httpx.ConnectError("DNS failure")
+    Real-transport-backed (issue #105): ConnectError comes from
+    httpx.MockTransport handler raising.
+    """
+    payload = _comment_payload(body="/grug recheck", sender_login="bob", pr_author="evan")
+    client = mock_transport_client(raise_exc=httpx.ConnectError("DNS failure"))
 
     with patch("github_app_auth.with_install_token_retry", side_effect=lambda _i, fn: fn("tok")):
-        with patch("httpx.get", side_effect=_raise_transport):
+        with patch("httpx.get", side_effect=lambda *a, **kw: client.get(*a, **kw)):
             out = d.dispatch("issue_comment", payload)
 
     assert out["status"] == "skip"
     assert "transport" in out["reason"]
 
 
-def test_pr_fetch_transport_error_returns_skip(_no_install_lookups):
+def test_pr_fetch_transport_error_returns_skip(_no_install_lookups, mock_transport_client):
     """async-blocker-hunter F-01: transport error during PR re-fetch
-    must return skip + log, not 500."""
-    payload = _comment_payload(body="/grug recheck", sender_login="evan", pr_author="evan")
+    must return skip + log, not 500.
 
-    def _raise_timeout(*args, **kwargs):
-        raise httpx.ReadTimeout("github.com slow")
+    Real-transport-backed (issue #105): ReadTimeout comes from
+    httpx.MockTransport handler raising.
+    """
+    payload = _comment_payload(body="/grug recheck", sender_login="evan", pr_author="evan")
+    client = mock_transport_client(raise_exc=httpx.ReadTimeout("github.com slow"))
 
     with patch("github_app_auth.with_install_token_retry", side_effect=lambda _i, fn: fn("tok")):
-        with patch("httpx.get", side_effect=_raise_timeout):
+        with patch("httpx.get", side_effect=lambda *a, **kw: client.get(*a, **kw)):
             out = d.dispatch("issue_comment", payload)
 
     assert out["status"] == "skip"
