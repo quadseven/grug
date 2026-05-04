@@ -140,20 +140,44 @@ def update_repo_config(
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="install not found")
     _ensure_can_access(install, user)
 
-    # Verify repo really belongs to the install before writing — stops a
-    # caller from setting overrides for repos they can't reach.
+    # Verify repo really belongs to the install — stops a caller from
+    # setting overrides for repos they can't reach.
+    #
+    # Sentry CRITICAL on PR #43: earlier check used `GET /repositories/{id}`
+    # which returns 200 for ANY public repo regardless of install access.
+    # Now enumerate via `GET /installation/repositories` (the dedicated
+    # endpoint that lists ONLY this install's repos) and verify
+    # membership.
     token = get_install_token(install_id)
+    full_name = ""
+    found = False
+    page = 1
     with httpx.Client(timeout=10) as client:
-        resp = client.get(
-            f"{_GH_API}/repositories/{repo_id}",
-            headers={
-                "Authorization": f"token {token}",
-                "Accept": "application/vnd.github+json",
-            },
-        )
-    if resp.status_code != 200:
+        while not found:
+            resp = client.get(
+                f"{_GH_API}/installation/repositories",
+                headers={
+                    "Authorization": f"token {token}",
+                    "Accept": "application/vnd.github+json",
+                },
+                params={"per_page": 100, "page": page},
+            )
+            resp.raise_for_status()
+            body_json = resp.json()
+            for r in body_json.get("repositories", []):
+                if r["id"] == repo_id:
+                    found = True
+                    full_name = r["full_name"]
+                    break
+            if found or len(body_json.get("repositories", [])) < 100:
+                break
+            page += 1
+            # No page cap — single-repo membership lookup must scan all
+            # pages on large org installs (>1000 repos). Codex P2
+            # follow-up to the Sentry CRITICAL fix. Worst case ~Npages*
+            # 100ms; acceptable for an admin write path.
+    if not found:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="repo not visible to install")
-    full_name = resp.json().get("full_name", "")
 
     cfg = set_repo_config(
         install_id=install_id, repo_id=repo_id,
