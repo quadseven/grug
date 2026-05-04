@@ -159,6 +159,11 @@ webhook = lambda_service.create(
         "DD_ENV": env,
         "DD_SERVICE": "grug-webhook",
         "DD_VERSION": webhook_image_tag,
+        # Closes #70 — set DD source-code link via runtime env vars
+        # instead of --build-arg so commit SHA churn doesn't bust
+        # buildx layer cache (which made every deploy a cold rebuild).
+        "DD_GIT_REPOSITORY_URL": "https://github.com/githumps/grug",
+        "DD_GIT_COMMIT_SHA": webhook_image_tag,
         "DD_TRACE_ENABLED": "true",
         "DD_LOGS_INJECTION": "true",
         # Disable noisy ASGI integration that collapses every FastAPI
@@ -226,6 +231,10 @@ api_lambda = lambda_service.create(
         "DD_ENV": env,
         "DD_SERVICE": "grug-api",
         "DD_VERSION": api_image_tag,
+        # See webhook above — DD_GIT_* moved from build-arg to runtime
+        # env var so layer cache survives commit-SHA churn. Closes #70.
+        "DD_GIT_REPOSITORY_URL": "https://github.com/githumps/grug",
+        "DD_GIT_COMMIT_SHA": api_image_tag,
         "DD_TRACE_ENABLED": "true",
         "DD_LOGS_INJECTION": "true",
         "DD_PATCH_MODULES": "asgi:false",

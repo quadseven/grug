@@ -110,19 +110,33 @@ jobs:
           # attestations. Force Docker manifest schema 2 + disable
           # attestations so the manifest is a single arm64 image, not a
           # provenance-wrapped manifest list.
+          #
+          # Closes #70: --cache-from + --cache-to type=local on the
+          # self-hosted runner's filesystem persists buildx layers
+          # between runs. Skips re-pulling python:3.13-arm64 base
+          # (~90s × 2 services) on warm-cache deploys.
+          # DD_GIT_* env vars now set on the Lambda Function (in
+          # __main__.py) instead of via --build-arg, so commit-SHA
+          # changes don't bust every layer.
+          mkdir -p /tmp/buildx-cache-grug
           for service in webhook api; do
             REPO="$ECR/grug-$service"
+            CACHE_DIR="/tmp/buildx-cache-grug/$service"
+            mkdir -p "$CACHE_DIR"
             docker buildx build \
               --platform linux/arm64 \
               --provenance=false \
               --sbom=false \
               --file services/$service/Dockerfile.lambda \
-              --build-arg DD_GIT_REPOSITORY_URL=https://github.com/${{ github.repository }} \
-              --build-arg DD_GIT_COMMIT_SHA=${{ github.sha }} \
+              --cache-from "type=local,src=$CACHE_DIR" \
+              --cache-to "type=local,dest=$CACHE_DIR-new,mode=max" \
               --tag "$REPO:$IMAGE_TAG" \
               --tag "$REPO:latest" \
               --push \
               "services/$service"
+            # Atomic swap so a failed build doesn't poison the cache
+            rm -rf "$CACHE_DIR"
+            mv "$CACHE_DIR-new" "$CACHE_DIR"
           done
           echo "tag=$IMAGE_TAG" >> $GITHUB_OUTPUT
 
