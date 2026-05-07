@@ -182,6 +182,18 @@ webhook = lambda_service.create(
         # `reference_dd_apm_asgi_resource_grouping`).
         "DD_PATCH_MODULES": "asgi:false",
         "DD_TRACE_ASGI_ENABLED": "false",
+        # Kill DD Lambda Extension's inferred-spans feature. Without
+        # this, the Extension synthesizes an `aws.lambda.url` root
+        # span per Function URL invocation tagged with the lambda-url
+        # FQDN as `service`, creating a phantom DD APM service entry
+        # like `<id>.lambda-url.us-east-1.on.aws` alongside the real
+        # `grug-webhook` / `grug-api` entries. Canonical kill-switch
+        # per https://docs.datadoghq.com/tracing/services/inferred_services/.
+        # Verified via DD spans 2026-05-07: 64 phantom spans/2h all
+        # carry `service:jikcel...lambda-url.us-east-1.on.aws` AND
+        # `base_service:grug-webhook` — same shape pasto-api faced
+        # before PR somatic-scripts#235 fixed it.
+        "DD_TRACE_MANAGED_SERVICES": "false",
     },
     timeout_seconds=15,
     memory_mb=512,
@@ -287,6 +299,18 @@ api_lambda = lambda_service.create(
         "DD_LOGS_INJECTION": "true",
         "DD_PATCH_MODULES": "asgi:false",
         "DD_TRACE_ASGI_ENABLED": "false",
+        # Kill DD Lambda Extension's inferred-spans feature. Without
+        # this, the Extension synthesizes an `aws.lambda.url` root
+        # span per Function URL invocation tagged with the lambda-url
+        # FQDN as `service`, creating a phantom DD APM service entry
+        # like `<id>.lambda-url.us-east-1.on.aws` alongside the real
+        # `grug-webhook` / `grug-api` entries. Canonical kill-switch
+        # per https://docs.datadoghq.com/tracing/services/inferred_services/.
+        # Verified via DD spans 2026-05-07: 64 phantom spans/2h all
+        # carry `service:jikcel...lambda-url.us-east-1.on.aws` AND
+        # `base_service:grug-webhook` — same shape pasto-api faced
+        # before PR somatic-scripts#235 fixed it.
+        "DD_TRACE_MANAGED_SERVICES": "false",
     },
     timeout_seconds=15,
     memory_mb=512,
