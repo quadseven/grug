@@ -17,7 +17,7 @@ from functools import lru_cache
 
 import boto3
 
-log = logging.getLogger("grug.webhook.secrets")
+log = logging.getLogger(f"{os.getenv('DD_SERVICE', 'grug')}.secrets")
 _ssm = boto3.client("ssm")
 
 
