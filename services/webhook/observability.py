@@ -1,3 +1,4 @@
+# MIRRORED — sibling at services/api/observability.py; keep in lockstep. See docs/adr/0001-mirror-with-rule-of-three-deferral.md.
 """Structured JSON logging configuration.
 
 DD Lambda extension layer (added in Slice 9 via Pulumi) auto-ships

@@ -1,3 +1,4 @@
+# MIRRORED — sibling at services/api/personas/tpm/dor_checks.py; keep in lockstep. See docs/adr/0001-mirror-with-rule-of-three-deferral.md.
 """Static DoR checks for PR bodies.
 
 Ported from scripts/tpm.py with the bullet-count regex tightened per

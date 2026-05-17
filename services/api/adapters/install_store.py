@@ -1,3 +1,4 @@
+# MIRRORED — sibling at services/webhook/adapters/install_store.py; keep in lockstep. See docs/adr/0001-mirror-with-rule-of-three-deferral.md.
 """Webhook-side install store + allowlist gate.
 
 Webhook Lambda has DDB read+write perms but NO KMS perms — it never
