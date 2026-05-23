@@ -1,3 +1,4 @@
+# MIRRORED — sibling at services/api/github_checks_client.py; keep in lockstep. See docs/adr/0001-mirror-with-rule-of-three-deferral.md.
 """GitHub Checks API client — post + update check-runs.
 
 Wraps the two endpoints we need for TPM persona's PR-gate. Tokens

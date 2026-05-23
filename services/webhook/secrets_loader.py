@@ -1,3 +1,4 @@
+# MIRRORED — sibling at services/api/secrets_loader.py; keep in lockstep. See docs/adr/0001-mirror-with-rule-of-three-deferral.md.
 """SSM SecureString loader with module-scope cache.
 
 Lambda warm container reuses the same SSM-fetched secret across
