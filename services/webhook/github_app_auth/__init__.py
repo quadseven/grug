@@ -12,9 +12,9 @@ from datetime import datetime, timedelta, timezone
 import httpx
 import jwt
 
-from ports.token_cache import InMemoryTokenCache, TokenCache
+from ports.token_cache import InMemoryTokenCache
 
-_cache: TokenCache = InMemoryTokenCache()
+_cache = InMemoryTokenCache()
 _GH_API = "https://api.github.com"
 _JWT_TTL_SECONDS = 9 * 60  # GitHub allows up to 10min; refresh at 9min
 
