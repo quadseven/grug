@@ -1,0 +1,152 @@
+# spec 0006 — DorCheck I/O Automaton
+#
+# Models the contract surface of the 5 Definition-of-Ready check rules
+# (`why`, `acceptance`, `estimate`, `scope-fence`, `issue-link`).
+# Rules live in `services/{api,webhook}/personas/tpm/dor_checks.py` as
+# module-level functions returning `CheckResult` — pass/fail only, no
+# third "warn" state. They aggregate into `TpmEvaluation` (spec 0002).
+#
+# Source of truth: DESIGN.md § "Process-gate concepts".
+#
+# Verified by `temper verify -s specs/0006-dor-check/`.
+
+[automaton]
+name = "DorCheck"
+states = ["Drafted", "Evaluated", "Composed", "Retired"]
+initial = "Drafted"
+
+# --- Rule-set contract bools ---
+
+[[state]]
+name = "five_rules_exactly_no_more_no_less_per_process_gate_concepts"
+type = "bool"
+initial = "false"
+
+[[state]]
+name = "name_field_is_one_of_five_canonical_rule_names_per_process_gate_concepts"
+type = "bool"
+initial = "false"
+
+# --- Result shape contract bools ---
+
+[[state]]
+name = "result_is_pass_or_fail_only_no_warn_state_per_process_gate_concepts"
+type = "bool"
+initial = "false"
+
+[[state]]
+name = "check_result_is_frozen_dataclass_per_process_gate_concepts"
+type = "bool"
+initial = "false"
+
+# --- Function-shape contract bools (no DoRCheck class; rules are functions) ---
+
+[[state]]
+name = "rule_function_returns_check_result_not_class_method_per_process_gate_concepts"
+type = "bool"
+initial = "false"
+
+[[state]]
+name = "rules_are_pure_no_io_during_evaluation_per_process_gate_concepts"
+type = "bool"
+initial = "false"
+
+# --- Mirror discipline bool (cross-service) ---
+
+[[state]]
+name = "dor_checks_byte_identical_modulo_first_line_per_cross_service_primitives"
+type = "bool"
+initial = "false"
+
+[[action]]
+name = "AttestRuleSetContract"
+kind = "input"
+from = ["Drafted"]
+params = ["attestor"]
+guard = "is_false name_field_is_one_of_five_canonical_rule_names_per_process_gate_concepts"
+effect = [
+  { type = "set_bool", var = "five_rules_exactly_no_more_no_less_per_process_gate_concepts", value = true },
+  { type = "set_bool", var = "name_field_is_one_of_five_canonical_rule_names_per_process_gate_concepts", value = true },
+]
+hint = "Adding a sixth rule requires updating dor_checks.py + tpm/persona.py + this spec in lockstep."
+
+[[action]]
+name = "AttestResultShapeContract"
+kind = "input"
+from = ["Drafted"]
+params = ["attestor"]
+guard = "is_false check_result_is_frozen_dataclass_per_process_gate_concepts"
+effect = [
+  { type = "set_bool", var = "result_is_pass_or_fail_only_no_warn_state_per_process_gate_concepts", value = true },
+  { type = "set_bool", var = "check_result_is_frozen_dataclass_per_process_gate_concepts", value = true },
+]
+hint = "Two-state pass/fail only — adding a 'warn' breaks the aggregate_passed biconditional in TpmEvaluation (spec 0002)."
+
+[[action]]
+name = "AttestFunctionShapeContract"
+kind = "input"
+from = ["Drafted"]
+params = ["attestor"]
+guard = "is_false rules_are_pure_no_io_during_evaluation_per_process_gate_concepts"
+effect = [
+  { type = "set_bool", var = "rule_function_returns_check_result_not_class_method_per_process_gate_concepts", value = true },
+  { type = "set_bool", var = "rules_are_pure_no_io_during_evaluation_per_process_gate_concepts", value = true },
+]
+hint = "Rules are functions, not class methods — there is no DoRCheck class. Pure (no IO) so they can be retested deterministically."
+
+[[action]]
+name = "AttestMirrorContract"
+kind = "input"
+from = ["Drafted"]
+params = ["attestor"]
+guard = "is_false dor_checks_byte_identical_modulo_first_line_per_cross_service_primitives"
+effect = [
+  { type = "set_bool", var = "dor_checks_byte_identical_modulo_first_line_per_cross_service_primitives", value = true },
+]
+hint = "Per ADR-0001: dor_checks.py is byte-identical between services/api/ and services/webhook/ MODULO the line-1 `# MIRRORED — sibling at <path>` header (commit 641eba5), which by construction names the other sibling. Body-level drift = bug. Verified by infra/scripts/attest_dor_checks_mirror.py."
+
+[[action]]
+name = "Evaluate"
+kind = "input"
+from = ["Drafted"]
+to = "Evaluated"
+params = ["pr_body_hash"]
+guard = [
+  { type = "is_true", var = "five_rules_exactly_no_more_no_less_per_process_gate_concepts" },
+  { type = "is_true", var = "name_field_is_one_of_five_canonical_rule_names_per_process_gate_concepts" },
+  { type = "is_true", var = "result_is_pass_or_fail_only_no_warn_state_per_process_gate_concepts" },
+  { type = "is_true", var = "check_result_is_frozen_dataclass_per_process_gate_concepts" },
+  { type = "is_true", var = "rule_function_returns_check_result_not_class_method_per_process_gate_concepts" },
+  { type = "is_true", var = "rules_are_pure_no_io_during_evaluation_per_process_gate_concepts" },
+  { type = "is_true", var = "dor_checks_byte_identical_modulo_first_line_per_cross_service_primitives" },
+]
+hint = "Rule function runs over PR body, returns CheckResult."
+
+[[action]]
+name = "Compose"
+kind = "input"
+from = ["Evaluated"]
+to = "Composed"
+params = ["evaluation_id"]
+hint = "CheckResult is folded into the per-PR TpmEvaluation (spec 0002)."
+
+[[action]]
+name = "Retire"
+kind = "input"
+from = ["Composed"]
+to = "Retired"
+params = ["successor_pr_head_sha"]
+hint = "Newer commit supersedes this CheckResult."
+
+[[invariant]]
+name = "MustEvaluateBeforeCompose"
+assert = "ordering(Evaluated, Composed)"
+
+[[invariant]]
+name = "MustComposeBeforeRetire"
+assert = "ordering(Composed, Retired)"
+
+[[invariant]]
+name = "RetiredIsTerminal"
+when = ["Retired"]
+assert = "no_further_transitions"

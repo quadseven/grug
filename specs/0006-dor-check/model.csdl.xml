@@ -1,0 +1,106 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!-- Spec 0006 DorCheck — CSDL companion. Filename must be `model.csdl.xml`. -->
+<edmx:Edmx Version="4.0" xmlns:edmx="http://docs.oasis-open.org/odata/ns/edmx">
+  <edmx:DataServices>
+
+    <Schema Namespace="Temper.Vocab" xmlns="http://docs.oasis-open.org/odata/ns/edm">
+      <Term Name="StateMachine.States" Type="Collection(Edm.String)" AppliesTo="EntityType"/>
+      <Term Name="StateMachine.InitialState" Type="Edm.String" AppliesTo="EntityType"/>
+      <Term Name="StateMachine.ValidFromStates" Type="Collection(Edm.String)" AppliesTo="Action"/>
+      <Term Name="StateMachine.TargetState" Type="Edm.String" AppliesTo="Action"/>
+      <Term Name="Agent.Hint" Type="Edm.String" AppliesTo="Action EntityType"/>
+      <Term Name="ShardKey" Type="Edm.String" AppliesTo="EntityType"/>
+      <Term Name="AuthZ.CedarPolicy" Type="Edm.String" AppliesTo="EntityType Action"/>
+    </Schema>
+
+    <Schema Namespace="Grug.DorCheck" xmlns="http://docs.oasis-open.org/odata/ns/edm">
+
+      <EnumType Name="DorCheckStatus">
+        <Member Name="Drafted" Value="0"/>
+        <Member Name="Evaluated" Value="1"/>
+        <Member Name="Composed" Value="2"/>
+        <Member Name="Retired" Value="3"/>
+      </EnumType>
+
+      <EntityType Name="DorCheck">
+        <Key><PropertyRef Name="DorCheckId"/></Key>
+        <Property Name="DorCheckId" Type="Edm.String" Nullable="false"/>
+        <Property Name="RuleName" Type="Edm.String" Nullable="false"/>
+        <Property Name="Status" Type="Grug.DorCheck.DorCheckStatus" Nullable="false"/>
+
+        <Property Name="five_rules_exactly_no_more_no_less_per_process_gate_concepts" Type="Edm.Boolean" DefaultValue="false"/>
+        <Property Name="name_field_is_one_of_five_canonical_rule_names_per_process_gate_concepts" Type="Edm.Boolean" DefaultValue="false"/>
+        <Property Name="result_is_pass_or_fail_only_no_warn_state_per_process_gate_concepts" Type="Edm.Boolean" DefaultValue="false"/>
+        <Property Name="check_result_is_frozen_dataclass_per_process_gate_concepts" Type="Edm.Boolean" DefaultValue="false"/>
+        <Property Name="rule_function_returns_check_result_not_class_method_per_process_gate_concepts" Type="Edm.Boolean" DefaultValue="false"/>
+        <Property Name="rules_are_pure_no_io_during_evaluation_per_process_gate_concepts" Type="Edm.Boolean" DefaultValue="false"/>
+        <Property Name="dor_checks_byte_identical_modulo_first_line_per_cross_service_primitives" Type="Edm.Boolean" DefaultValue="false"/>
+
+        <Annotation Term="Temper.Vocab.StateMachine.States">
+          <Collection>
+            <String>Drafted</String><String>Evaluated</String><String>Composed</String><String>Retired</String>
+          </Collection>
+        </Annotation>
+        <Annotation Term="Temper.Vocab.StateMachine.InitialState" String="Drafted"/>
+        <Annotation Term="Temper.Vocab.ShardKey" String="RuleName"/>
+        <Annotation Term="Temper.Vocab.AuthZ.CedarPolicy" String="policies/dor-check.cedar"/>
+      </EntityType>
+
+      <Action Name="AttestRuleSetContract" IsBound="true">
+        <Parameter Name="bindingParameter" Type="Grug.DorCheck.DorCheck"/>
+        <Parameter Name="attestor" Type="Edm.String" Nullable="false"/>
+        <ReturnType Type="Grug.DorCheck.DorCheck"/>
+        <Annotation Term="Temper.Vocab.StateMachine.ValidFromStates"><Collection><String>Drafted</String></Collection></Annotation>
+      </Action>
+
+      <Action Name="AttestResultShapeContract" IsBound="true">
+        <Parameter Name="bindingParameter" Type="Grug.DorCheck.DorCheck"/>
+        <Parameter Name="attestor" Type="Edm.String" Nullable="false"/>
+        <ReturnType Type="Grug.DorCheck.DorCheck"/>
+        <Annotation Term="Temper.Vocab.StateMachine.ValidFromStates"><Collection><String>Drafted</String></Collection></Annotation>
+      </Action>
+
+      <Action Name="AttestFunctionShapeContract" IsBound="true">
+        <Parameter Name="bindingParameter" Type="Grug.DorCheck.DorCheck"/>
+        <Parameter Name="attestor" Type="Edm.String" Nullable="false"/>
+        <ReturnType Type="Grug.DorCheck.DorCheck"/>
+        <Annotation Term="Temper.Vocab.StateMachine.ValidFromStates"><Collection><String>Drafted</String></Collection></Annotation>
+      </Action>
+
+      <Action Name="AttestMirrorContract" IsBound="true">
+        <Parameter Name="bindingParameter" Type="Grug.DorCheck.DorCheck"/>
+        <Parameter Name="attestor" Type="Edm.String" Nullable="false"/>
+        <ReturnType Type="Grug.DorCheck.DorCheck"/>
+        <Annotation Term="Temper.Vocab.StateMachine.ValidFromStates"><Collection><String>Drafted</String></Collection></Annotation>
+      </Action>
+
+      <Action Name="Evaluate" IsBound="true">
+        <Parameter Name="bindingParameter" Type="Grug.DorCheck.DorCheck"/>
+        <Parameter Name="pr_body_hash" Type="Edm.String" Nullable="false"/>
+        <ReturnType Type="Grug.DorCheck.DorCheck"/>
+        <Annotation Term="Temper.Vocab.StateMachine.ValidFromStates"><Collection><String>Drafted</String></Collection></Annotation>
+        <Annotation Term="Temper.Vocab.StateMachine.TargetState" String="Evaluated"/>
+      </Action>
+
+      <Action Name="Compose" IsBound="true">
+        <Parameter Name="bindingParameter" Type="Grug.DorCheck.DorCheck"/>
+        <Parameter Name="evaluation_id" Type="Edm.String" Nullable="false"/>
+        <ReturnType Type="Grug.DorCheck.DorCheck"/>
+        <Annotation Term="Temper.Vocab.StateMachine.ValidFromStates"><Collection><String>Evaluated</String></Collection></Annotation>
+        <Annotation Term="Temper.Vocab.StateMachine.TargetState" String="Composed"/>
+      </Action>
+
+      <Action Name="Retire" IsBound="true">
+        <Parameter Name="bindingParameter" Type="Grug.DorCheck.DorCheck"/>
+        <Parameter Name="successor_pr_head_sha" Type="Edm.String" Nullable="false"/>
+        <ReturnType Type="Grug.DorCheck.DorCheck"/>
+        <Annotation Term="Temper.Vocab.StateMachine.ValidFromStates"><Collection><String>Composed</String></Collection></Annotation>
+        <Annotation Term="Temper.Vocab.StateMachine.TargetState" String="Retired"/>
+      </Action>
+
+      <EntityContainer Name="DorCheckService">
+        <EntitySet Name="DorChecks" EntityType="Grug.DorCheck.DorCheck"/>
+      </EntityContainer>
+    </Schema>
+  </edmx:DataServices>
+</edmx:Edmx>

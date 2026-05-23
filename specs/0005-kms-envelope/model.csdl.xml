@@ -1,0 +1,107 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!-- Spec 0005 KmsEnvelope — CSDL companion. Filename must be `model.csdl.xml`. -->
+<edmx:Edmx Version="4.0" xmlns:edmx="http://docs.oasis-open.org/odata/ns/edmx">
+  <edmx:DataServices>
+
+    <Schema Namespace="Temper.Vocab" xmlns="http://docs.oasis-open.org/odata/ns/edm">
+      <Term Name="StateMachine.States" Type="Collection(Edm.String)" AppliesTo="EntityType"/>
+      <Term Name="StateMachine.InitialState" Type="Edm.String" AppliesTo="EntityType"/>
+      <Term Name="StateMachine.ValidFromStates" Type="Collection(Edm.String)" AppliesTo="Action"/>
+      <Term Name="StateMachine.TargetState" Type="Edm.String" AppliesTo="Action"/>
+      <Term Name="Agent.Hint" Type="Edm.String" AppliesTo="Action EntityType"/>
+      <Term Name="ShardKey" Type="Edm.String" AppliesTo="EntityType"/>
+      <Term Name="AuthZ.CedarPolicy" Type="Edm.String" AppliesTo="EntityType Action"/>
+    </Schema>
+
+    <Schema Namespace="Grug.KmsEnvelope" xmlns="http://docs.oasis-open.org/odata/ns/edm">
+
+      <EnumType Name="KmsEnvelopeStatus">
+        <Member Name="Drafted" Value="0"/>
+        <Member Name="Encrypted" Value="1"/>
+        <Member Name="Decrypted" Value="2"/>
+        <Member Name="Corrupt" Value="3"/>
+        <Member Name="Purged" Value="4"/>
+      </EnumType>
+
+      <EntityType Name="KmsEnvelope">
+        <Key><PropertyRef Name="UserId"/></Key>
+        <Property Name="UserId" Type="Edm.String" Nullable="false"/>
+        <Property Name="Status" Type="Grug.KmsEnvelope.KmsEnvelopeStatus" Nullable="false"/>
+
+        <Property Name="dek_is_aes_gcm_96bit_nonce_per_persistence_concepts" Type="Edm.Boolean" DefaultValue="false"/>
+        <Property Name="dek_is_wrapped_by_kms_cmk_per_persistence_concepts" Type="Edm.Boolean" DefaultValue="false"/>
+        <Property Name="wrapped_dek_stored_alongside_ciphertext_per_persistence_concepts" Type="Edm.Boolean" DefaultValue="false"/>
+        <Property Name="webhook_never_decrypts_user_tokens_per_persistence_concepts" Type="Edm.Boolean" DefaultValue="false"/>
+        <Property Name="only_api_lambda_calls_kms_at_app_level_per_persistence_concepts" Type="Edm.Boolean" DefaultValue="false"/>
+        <Property Name="credential_blob_corrupt_triggers_idempotent_cleanup_per_persistence_concepts" Type="Edm.Boolean" DefaultValue="false"/>
+        <Property Name="idempotency_check_after_corruption_empty_fallthrough_per_persistence_concepts" Type="Edm.Boolean" DefaultValue="false"/>
+
+        <Annotation Term="Temper.Vocab.StateMachine.States">
+          <Collection>
+            <String>Drafted</String><String>Encrypted</String><String>Decrypted</String><String>Corrupt</String><String>Purged</String>
+          </Collection>
+        </Annotation>
+        <Annotation Term="Temper.Vocab.StateMachine.InitialState" String="Drafted"/>
+        <Annotation Term="Temper.Vocab.ShardKey" String="UserId"/>
+        <Annotation Term="Temper.Vocab.AuthZ.CedarPolicy" String="policies/kms-envelope.cedar"/>
+      </EntityType>
+
+      <Action Name="AttestCryptoContract" IsBound="true">
+        <Parameter Name="bindingParameter" Type="Grug.KmsEnvelope.KmsEnvelope"/>
+        <Parameter Name="attestor" Type="Edm.String" Nullable="false"/>
+        <ReturnType Type="Grug.KmsEnvelope.KmsEnvelope"/>
+        <Annotation Term="Temper.Vocab.StateMachine.ValidFromStates"><Collection><String>Drafted</String></Collection></Annotation>
+      </Action>
+
+      <Action Name="AttestServiceScopeContract" IsBound="true">
+        <Parameter Name="bindingParameter" Type="Grug.KmsEnvelope.KmsEnvelope"/>
+        <Parameter Name="attestor" Type="Edm.String" Nullable="false"/>
+        <ReturnType Type="Grug.KmsEnvelope.KmsEnvelope"/>
+        <Annotation Term="Temper.Vocab.StateMachine.ValidFromStates"><Collection><String>Drafted</String></Collection></Annotation>
+      </Action>
+
+      <Action Name="AttestCorruptionHandlerContract" IsBound="true">
+        <Parameter Name="bindingParameter" Type="Grug.KmsEnvelope.KmsEnvelope"/>
+        <Parameter Name="attestor" Type="Edm.String" Nullable="false"/>
+        <ReturnType Type="Grug.KmsEnvelope.KmsEnvelope"/>
+        <Annotation Term="Temper.Vocab.StateMachine.ValidFromStates"><Collection><String>Drafted</String></Collection></Annotation>
+      </Action>
+
+      <Action Name="Encrypt" IsBound="true">
+        <Parameter Name="bindingParameter" Type="Grug.KmsEnvelope.KmsEnvelope"/>
+        <Parameter Name="user_id" Type="Edm.String" Nullable="false"/>
+        <ReturnType Type="Grug.KmsEnvelope.KmsEnvelope"/>
+        <Annotation Term="Temper.Vocab.StateMachine.ValidFromStates"><Collection><String>Drafted</String></Collection></Annotation>
+        <Annotation Term="Temper.Vocab.StateMachine.TargetState" String="Encrypted"/>
+      </Action>
+
+      <Action Name="Decrypt" IsBound="true">
+        <Parameter Name="bindingParameter" Type="Grug.KmsEnvelope.KmsEnvelope"/>
+        <Parameter Name="user_id" Type="Edm.String" Nullable="false"/>
+        <ReturnType Type="Grug.KmsEnvelope.KmsEnvelope"/>
+        <Annotation Term="Temper.Vocab.StateMachine.ValidFromStates"><Collection><String>Encrypted</String></Collection></Annotation>
+        <Annotation Term="Temper.Vocab.StateMachine.TargetState" String="Decrypted"/>
+      </Action>
+
+      <Action Name="ObserveCorrupt" IsBound="true">
+        <Parameter Name="bindingParameter" Type="Grug.KmsEnvelope.KmsEnvelope"/>
+        <Parameter Name="user_id" Type="Edm.String" Nullable="false"/>
+        <ReturnType Type="Grug.KmsEnvelope.KmsEnvelope"/>
+        <Annotation Term="Temper.Vocab.StateMachine.ValidFromStates"><Collection><String>Encrypted</String></Collection></Annotation>
+        <Annotation Term="Temper.Vocab.StateMachine.TargetState" String="Corrupt"/>
+      </Action>
+
+      <Action Name="PurgeCorrupt" IsBound="true">
+        <Parameter Name="bindingParameter" Type="Grug.KmsEnvelope.KmsEnvelope"/>
+        <Parameter Name="user_id" Type="Edm.String" Nullable="false"/>
+        <ReturnType Type="Grug.KmsEnvelope.KmsEnvelope"/>
+        <Annotation Term="Temper.Vocab.StateMachine.ValidFromStates"><Collection><String>Corrupt</String></Collection></Annotation>
+        <Annotation Term="Temper.Vocab.StateMachine.TargetState" String="Purged"/>
+      </Action>
+
+      <EntityContainer Name="KmsEnvelopeService">
+        <EntitySet Name="KmsEnvelopes" EntityType="Grug.KmsEnvelope.KmsEnvelope"/>
+      </EntityContainer>
+    </Schema>
+  </edmx:DataServices>
+</edmx:Edmx>

@@ -1,0 +1,146 @@
+name: Check · temper · spec verification cascade
+
+# Runs the temper kernel's L0 (Z3 SMT) + L1 (model check) + L2
+# (simulation) + L3 (proptest) cascade against each spec under
+# `specs/`. Fails the PR if any spec stops being kernel-acceptable.
+#
+# Temper is a research tool; there is no published binary, so this
+# workflow builds the CLI from source at a pinned SHA. Self-hosted
+# runners can bake the binary at /opt/temper/<sha>/temper for the
+# fast path; ubuntu-latest cold-builds with cargo (~3-4 min).
+#
+# Pinning policy: bump TEMPER_REPO_SHA below in lockstep with
+# install-temper.sh in the skill repo. The cascade may surface new
+# lints or stricter parses after a bump.
+
+on:
+  pull_request:
+    branches: [main]
+    paths:
+      - 'specs/**'
+      # Attesters PROVE spec bools against real source. Re-run them
+      # whenever the source under attestation changes — otherwise spec
+      # claims would drift silently from the implementation.
+      - 'infra/scripts/attest_*.py'
+      - 'services/**/personas/tpm/**'
+      - 'services/**/adapters/**'
+      - 'services/**/github_checks_client.py'
+      - '.github/workflows/check.temper-specs.yml'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: check-temper-specs-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  TEMPER_REPO: nerdsane/temper
+  TEMPER_REPO_SHA: 3c2e6267ec179f94ef67da00e373eccf577f23ca
+
+jobs:
+  verify:
+    name: temper verify
+    runs-on: ubuntu-latest
+    # Swap to self-hosted runner for faster builds if you have one:
+    # runs-on: [self-hosted, <your-runner-label>]
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Locate or build temper binary
+        id: temper-locate
+        # Fast path: pre-built binary at /opt/temper/<sha>/temper
+        # (only present on self-hosted runners that baked it).
+        # Cold path: cargo build from source.
+        run: |
+          BAKED=/opt/temper/${{ env.TEMPER_REPO_SHA }}/temper
+          if [[ -x $BAKED ]]; then
+            echo "Using pre-built temper at $BAKED"
+            echo "binary=$BAKED" >> "$GITHUB_OUTPUT"
+            echo "needs_build=false" >> "$GITHUB_OUTPUT"
+          else
+            echo "No pre-built temper found; will build from source"
+            echo "binary=/tmp/temper/target/release/temper" >> "$GITHUB_OUTPUT"
+            echo "needs_build=true" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Install Rust toolchain
+        if: steps.temper-locate.outputs.needs_build == 'true'
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Install temper build deps (cold-path only)
+        if: steps.temper-locate.outputs.needs_build == 'true'
+        run: |
+          missing=()
+          pkg-config --exists openssl || missing+=("libssl-dev" "pkg-config")
+          dpkg -s libz3-dev >/dev/null 2>&1 || missing+=("libz3-dev")
+          dpkg -s libclang-dev >/dev/null 2>&1 || missing+=("libclang-dev")
+          if (( ${#missing[@]} > 0 )); then
+            sudo apt-get update -qq
+            sudo apt-get install -y -qq "${missing[@]}"
+          fi
+
+      - name: Clone + build temper (cold-path only)
+        if: steps.temper-locate.outputs.needs_build == 'true'
+        run: |
+          rm -rf /tmp/temper
+          git clone https://github.com/${{ env.TEMPER_REPO }}.git /tmp/temper
+          cd /tmp/temper
+          git checkout ${{ env.TEMPER_REPO_SHA }}
+          cargo build --release --bin temper
+
+      # Per-spec verify steps land below this line. The add-spec-to-workflow.sh
+      # script appends one step per spec dir. Manual edits welcome — just keep
+      # the format consistent so future appends slot in cleanly.
+
+      - name: Verify spec 0001 (CheckRunResult)
+        run: ${{ steps.temper-locate.outputs.binary }} verify -s specs/0001-check-run-result/
+
+      - name: Verify spec 0002 (TpmEvaluation)
+        run: ${{ steps.temper-locate.outputs.binary }} verify -s specs/0002-tpm-evaluation/
+
+      - name: Verify spec 0003 (Installation)
+        run: ${{ steps.temper-locate.outputs.binary }} verify -s specs/0003-installation/
+
+      - name: Verify spec 0004 (TokenCache)
+        run: ${{ steps.temper-locate.outputs.binary }} verify -s specs/0004-token-cache/
+
+      - name: Verify spec 0005 (KmsEnvelope)
+        run: ${{ steps.temper-locate.outputs.binary }} verify -s specs/0005-kms-envelope/
+
+      - name: Verify spec 0006 (DorCheck)
+        run: ${{ steps.temper-locate.outputs.binary }} verify -s specs/0006-dor-check/
+
+      # ────────────── Grounding attesters ──────────────
+      # Each attester PROVES a spec bool against real source. Temper
+      # verifies the IOA is internally consistent; attesters close the
+      # gap between "bool is attested" and "the implementation actually
+      # obeys it." Stdlib-only — no pip install needed. The behavioral
+      # check inside attest_check_run_result_post_init.py auto-skips
+      # when httpx isn't available.
+
+      - name: Attester · DoR-checks five canonical rules (spec 0006)
+        run: python3 infra/scripts/attest_dor_checks_five_rules.py
+
+      - name: Attester · DoR-checks mirror byte-identity modulo line 1 (spec 0006)
+        run: python3 infra/scripts/attest_dor_checks_mirror.py
+
+      - name: Attester · evaluate_pull_request purity (spec 0002)
+        run: python3 infra/scripts/attest_persona_purity.py
+
+      - name: Attester · KMS-envelope CredentialBlobCorrupt cleanup (spec 0005)
+        run: python3 infra/scripts/attest_kms_corruption_cleanup.py
+
+      - name: Attester · CheckRunResult.__post_init__ cross-field invariant (spec 0001)
+        # Behavioral check inside the attester needs httpx to import
+        # github_checks_client; install before running so we get both
+        # the AST check AND the runtime ValueError assertions (not just
+        # the AST half). The attester gracefully skips behavioral if
+        # httpx is missing — this just upgrades to "both checks run".
+        run: |
+          pip install --quiet 'httpx>=0.27'
+          python3 infra/scripts/attest_check_run_result_post_init.py
+
+      - name: Attester · DDB-handle double-checked locking (infra invariant)
+        run: python3 infra/scripts/attest_ddb_handle_thread_safe.py
