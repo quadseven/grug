@@ -33,16 +33,27 @@ log = logging.getLogger("grug.api.adapters.user_store")
 _TABLE_NAME = os.environ.get("GRUG_DDB_TABLE", "grug-main")
 
 # Lazy init — see install_store.py for rationale (Codex post-review #52).
+# Thread-safety via double-checked locking: a warm Lambda handling two
+# concurrent invocations could race the unguarded check; both would call
+# boto3.resource() and one of the two resource handles would leak. The
+# lock + re-check after acquire is the canonical fix and adds zero cost
+# after the first call (the outer `is None` short-circuits without
+# touching the lock). Peer-review HIGH (openrouter).
+import threading
+
 _ddb = None
 _table_real = None
+_init_lock = threading.Lock()
 
 
 class _LazyTable:
     def __getattr__(self, name):
         global _ddb, _table_real
         if _table_real is None:
-            _ddb = boto3.resource("dynamodb")
-            _table_real = _ddb.Table(_TABLE_NAME)
+            with _init_lock:
+                if _table_real is None:
+                    _ddb = boto3.resource("dynamodb")
+                    _table_real = _ddb.Table(_TABLE_NAME)
         return getattr(_table_real, name)
 
 
@@ -134,36 +145,66 @@ def get_user(github_user_id: str) -> UserIdentity | None:
     return _identity_from_item(github_user_id, item)
 
 
+def delete_user_state(github_user_id: str) -> None:
+    """Idempotently remove the user row from DDB.
+
+    Used by the spec 0005 `KmsEnvelope.PurgeCorrupt` audit pattern:
+    when `decrypt_for_user` raises `CredentialBlobCorrupt` (key-version
+    drift, tampering, AAD mismatch), the encrypted blob is unrecoverable
+    and the row must go so the next OAuth login can repopulate cleanly.
+    """
+    _table.delete_item(Key={"PK": _user_pk(github_user_id), "SK": "META"})
+
+
 def get_user_with_tokens(github_user_id: str) -> UserWithTokens | None:
     """Return identity + decrypted OAuth tokens, or None.
 
     KMS Decrypt happens here (no plaintext caching per the envelope
     contract). Restricted to OAuth-refresh + on-behalf-of-user routes.
+
+    `CredentialBlobCorrupt` is the documented escape hatch: per spec 0005
+    `credential_blob_corrupt_triggers_idempotent_cleanup_per_persistence_concepts`,
+    a corrupt blob triggers row deletion + a clean miss return so the
+    next sign-in repopulates. Caller sees `None` and routes to /signin.
     """
-    from crypto.kms_envelope import decrypt_for_user  # lazy import
+    from crypto.kms_envelope import CredentialBlobCorrupt, decrypt_for_user  # lazy import
 
     item = _fetch_item(github_user_id)
     if not item:
         return None
 
-    encrypted_token = item.get("oauth_access_token_blob")
-    if encrypted_token:
-        # boto3 may return DDB Binary as a Binary wrapper (with .value)
-        # or raw bytes depending on resource-vs-client mode — handle both.
-        blob = encrypted_token.value if hasattr(encrypted_token, "value") else encrypted_token
-        access_token = decrypt_for_user(
-            blob=blob, user_id=github_user_id, item_type="oauth_access_token",
-        )
-    else:
-        access_token = ""
+    try:
+        encrypted_token = item.get("oauth_access_token_blob")
+        if encrypted_token:
+            # boto3 may return DDB Binary as a Binary wrapper (with .value)
+            # or raw bytes depending on resource-vs-client mode — handle both.
+            blob = encrypted_token.value if hasattr(encrypted_token, "value") else encrypted_token
+            access_token = decrypt_for_user(
+                blob=blob, user_id=github_user_id, item_type="oauth_access_token",
+            )
+        else:
+            access_token = ""
 
-    encrypted_refresh = item.get("oauth_refresh_token_blob")
-    refresh_token: str | None = None
-    if encrypted_refresh:
-        blob = encrypted_refresh.value if hasattr(encrypted_refresh, "value") else encrypted_refresh
-        refresh_token = decrypt_for_user(
-            blob=blob, user_id=github_user_id, item_type="oauth_refresh_token",
+        encrypted_refresh = item.get("oauth_refresh_token_blob")
+        refresh_token: str | None = None
+        if encrypted_refresh:
+            blob = encrypted_refresh.value if hasattr(encrypted_refresh, "value") else encrypted_refresh
+            refresh_token = decrypt_for_user(
+                blob=blob, user_id=github_user_id, item_type="oauth_refresh_token",
+            )
+    except CredentialBlobCorrupt as exc:
+        # Spec 0005 PurgeCorrupt: cleanup is idempotent — safe to call
+        # repeatedly even if the row is already gone. The corrupt blob
+        # is unrecoverable; surface a clean miss + force re-auth.
+        log.error(
+            "credential_blob_corrupt_purging_row",
+            extra={
+                "github_user_id": github_user_id,
+                "reason": str(exc),
+            },
         )
+        delete_user_state(github_user_id)
+        return None
 
     return UserWithTokens(
         identity=_identity_from_item(github_user_id, item),

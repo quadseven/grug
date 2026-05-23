@@ -30,16 +30,28 @@ _TABLE_NAME = os.environ.get("GRUG_DDB_TABLE", "grug-main")
 # tests that monkeypatch the env after collection. Codex post-review
 # #52. The descriptor on `_table` lets old call sites (`_table.scan`,
 # `_table.get_item`, etc.) keep working unchanged.
+#
+# Thread-safety via double-checked locking: a warm Lambda handling two
+# concurrent invocations could race the unguarded check; both would call
+# boto3.resource() and one of the two resource handles would leak. The
+# lock + re-check after acquire is the canonical fix and adds zero cost
+# after the first call (the outer `is None` short-circuits without
+# touching the lock). Peer-review HIGH (openrouter).
+import threading
+
 _ddb = None
 _table_real = None
+_init_lock = threading.Lock()
 
 
 class _LazyTable:
     def __getattr__(self, name):
         global _ddb, _table_real
         if _table_real is None:
-            _ddb = boto3.resource("dynamodb")
-            _table_real = _ddb.Table(_TABLE_NAME)
+            with _init_lock:
+                if _table_real is None:
+                    _ddb = boto3.resource("dynamodb")
+                    _table_real = _ddb.Table(_TABLE_NAME)
         return getattr(_table_real, name)
 
 
