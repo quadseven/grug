@@ -1,3 +1,4 @@
+# MIRRORED — sibling at services/webhook/ports/token_cache.py; keep in lockstep. See docs/adr/0001-mirror-with-rule-of-three-deferral.md.
 """In-memory token cache for App JWTs + install tokens.
 
 Module-scope dict cache, lifetime = warm Lambda container. Per PRD #21
