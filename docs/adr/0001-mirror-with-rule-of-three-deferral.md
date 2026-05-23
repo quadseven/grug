@@ -22,7 +22,7 @@ Both Lambdas need the same building blocks:
 | `ports/token_cache.py` | `InMemoryTokenCache` for App JWT + installation tokens |
 | `personas/tpm/dor_checks.py` | Static DoR rule definitions (why ≥30 words, acceptance, scope-fence, etc.) |
 
-These six modules currently exist as **byte-identical copies** under `services/api/` and `services/webhook/`. Total: ~245 LOC duplicated across the pair.
+These six modules currently exist as **byte-identical copies** under `services/api/` and `services/webhook/`. Total per service: 615 LOC (50 + 45 + 80 + 222 + 70 + 148) — i.e. 615 lines of code maintained in lockstep across the two service trees.
 
 A naive architecture-review pass reads "duplicate code → extract a shared module" and proposes a `services/_shared/` Python package. We considered this, then rejected it (for now) based on the constraints below.
 
@@ -64,7 +64,7 @@ The React SPA at `web/` does **not** count toward the rule-of-three — it ships
 
 ### Negative
 
-- **245 LOC duplicated.** Every cross-cutting change (e.g. new logger formatter, new SSM secret name convention) is two edits.
+- **615 LOC duplicated per service.** Every cross-cutting change (e.g. new logger formatter, new SSM secret name convention) is two edits and the surface to keep in sync grows linearly with each new mirrored file.
 - **Drift risk if discipline lapses.** A contributor edits one copy and forgets the other → behavior diverges silently. Mitigated by the CI gate + MIRRORED header (above), but mitigation is only as strong as the script's MIRRORED_FILES allowlist — a file omitted from that list can drift silently by design.
 - **Cross-attribution bugs from copy-paste.** `services/api/secrets_loader.py:20` currently hardcodes `logging.getLogger("grug.webhook.secrets")` — wrong namespace in the api copy. Tracked separately (see issue #140); fix it without re-architecting.
 - **Security-surface duplication.** Four of the six mirrored modules (`secrets_loader`, `install_store`, `token_cache`, `github_checks_client`) handle credentials, OAuth tokens, or external-API calls. A CVE in a vendor library, an SDK upgrade, or a security patch must be applied to TWO files in lockstep. The CI gate catches the lockstep failure mode, but it does NOT prioritize security-sensitive mirrors — a future improvement.
