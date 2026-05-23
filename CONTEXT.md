@@ -61,7 +61,7 @@ The following six modules exist as byte-identical copies under both `services/ap
 | `adapters/install_store.py` | DDB single-table CRUD for `Installation` + `RepoConfig` + `AllowlistGate` reads. |
 | `ports/token_cache.py` | `TokenCache` Protocol + `InMemoryTokenCache` impl. |
 | `personas/tpm/dor_checks.py` | The 5 `DoR check` rules + the `CheckResult` dataclass. |
-| ~~`personas/tpm/persona.py`~~ | **Not byte-identical** — diverges by one line (logger namespace `grug.api.*` vs `grug.webhook.*`); excluded from the drift-lint MIRRORED_FILES list. Both copies define the same `TpmEvaluation` dataclass + `evaluate_pull_request(...)` (pure) + `publish_tpm_evaluation(...)` (impure) functions. Surface area is logically mirrored, not byte-identical. |
+| `personas/tpm/persona.py` | `TpmEvaluation` dataclass + `evaluate_pull_request(...)` entry point. |
 
 ## Infrastructure concepts
 
