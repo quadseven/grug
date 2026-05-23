@@ -156,20 +156,21 @@ def _handle_pull_request(payload: dict[str, Any]) -> dict[str, str]:
         return {"status": "no_op", "reason": "tpm disabled for this repo"}
 
     # Lazy import — keeps cold-start cheap when only non-PR events fire
-    from personas.tpm.persona import evaluate_pull_request  # type: ignore
+    from personas.tpm.persona import evaluate_pull_request, publish_tpm_evaluation  # type: ignore
 
-    result = evaluate_pull_request(
+    evaluation = evaluate_pull_request(pr_body)
+    publish_tpm_evaluation(
+        evaluation,
         installation_id=int(installation_id),
         owner=owner,
         repo=repo_name,
         head_sha=head_sha,
-        pr_body=pr_body,
         pr_number=int(pr_number),
     )
     return {
         "status": "dispatched",
         "persona": "tpm",
-        "result": "pass" if result.passed else "fail",
+        "result": "pass" if evaluation.passed else "fail",
     }
 
 
@@ -235,7 +236,7 @@ def _handle_issue_comment(payload: dict[str, Any]) -> dict[str, str]:
     # commenters can't spam re-evaluations. Lazy imports keep cold-start
     # cheap when only PR events fire.
     from github_app_auth import with_install_token_retry  # type: ignore
-    from personas.tpm.persona import evaluate_pull_request  # type: ignore
+    from personas.tpm.persona import evaluate_pull_request, publish_tpm_evaluation  # type: ignore
     import httpx  # type: ignore
 
     # URL-encode user-controlled path components. GitHub repo + login
@@ -327,14 +328,16 @@ def _handle_issue_comment(payload: dict[str, Any]) -> dict[str, str]:
     if not head_sha:
         return {"status": "skip", "reason": "pr_has_no_head_sha"}
 
-    result = evaluate_pull_request(
+    evaluation = evaluate_pull_request(pr_body)
+    publish_tpm_evaluation(
+        evaluation,
         installation_id=int(installation_id),
         owner=owner,
         repo=repo_name,
         head_sha=head_sha,
-        pr_body=pr_body,
         pr_number=int(pr_number),
     )
+    result = evaluation
     log.info(
         "recheck_dispatched",
         extra={

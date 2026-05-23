@@ -1,4 +1,12 @@
-"""TPM persona evaluator — runs static DoR + posts check-run."""
+"""TPM persona — pure DoR rollup + GitHub Checks publisher.
+
+Per spec 0002 (`evaluate_pull_request_is_pure_function_per_process_gate_concepts`):
+`evaluate_pull_request(pr_body)` is pure (no IO). The GitHub POST lives
+in `publish_tpm_evaluation(evaluation, *, ...)`, which is the only
+impure surface. Split lets us replay/fuzz/test the rollup without
+GitHub or AWS round-trips, and lets the spec's purity attestation
+actually be true.
+"""
 
 from __future__ import annotations
 
@@ -34,7 +42,6 @@ _CHECK_NAME = "Grug — Definition of Ready"
 
 def _summary(results: list[CheckResult]) -> tuple[str, str]:
     """Build (title, summary) markdown for the check-run output."""
-    passed = [r for r in results if r.passed]
     failed = [r for r in results if not r.passed]
     title = (
         f"✅ DoR pass — all {len(results)} checks"
@@ -48,23 +55,37 @@ def _summary(results: list[CheckResult]) -> tuple[str, str]:
     return title, "\n".join(lines)
 
 
-def evaluate_pull_request(
+def evaluate_pull_request(pr_body: str) -> TpmEvaluation:
+    """Pure: run all 5 DoR rules over pr_body and return the rollup.
+
+    No network IO, no AWS calls, no logging side-effects. Callers wrap
+    the result in `publish_tpm_evaluation(...)` to POST the check-run.
+    """
+    results = run_all(pr_body)
+    failed = [r for r in results if not r.passed]
+    conclusion: CheckConclusion = "success" if not failed else "failure"
+    return TpmEvaluation(
+        passed=not failed,
+        results=tuple(results),
+        conclusion=conclusion,
+    )
+
+
+def publish_tpm_evaluation(
+    evaluation: TpmEvaluation,
     *,
     installation_id: int,
     owner: str,
     repo: str,
     head_sha: str,
-    pr_body: str,
     pr_number: int,
-) -> TpmEvaluation:
-    """Run TPM checks on the PR body + post check-run. Returns rollup."""
-    results = run_all(pr_body)
-    failed = [r for r in results if not r.passed]
-    title, summary = _summary(results)
-    conclusion: CheckConclusion = "success" if not failed else "failure"
+) -> None:
+    """Impure: POST `evaluation` to GitHub's Checks API.
 
-    # Retry once on 401 — handles tokens revoked out-of-band (App
-    # reinstall, perm change, secret rotation). Codex post-review #50.
+    Retry once on 401 — handles tokens revoked out-of-band (App
+    reinstall, perm change, secret rotation). Codex post-review #50.
+    """
+    title, summary = _summary(list(evaluation.results))
     with_install_token_retry(
         installation_id,
         lambda token: post_check_run(
@@ -74,7 +95,7 @@ def evaluate_pull_request(
                 name=_CHECK_NAME,
                 head_sha=head_sha,
                 status="completed",
-                conclusion=conclusion,
+                conclusion=evaluation.conclusion,
                 title=title,
                 summary=summary,
             ),
@@ -82,18 +103,13 @@ def evaluate_pull_request(
         ),
     )
     log.info(
-        "tpm_evaluated",
+        "tpm_published",
         extra={
             "installation_id": installation_id,
             "repo": f"{owner}/{repo}",
             "pr_number": pr_number,
             "head_sha": head_sha[:8],
-            "passed": not failed,
-            "failed_checks": [r.name for r in failed],
+            "passed": evaluation.passed,
+            "failed_checks": [r.name for r in evaluation.results if not r.passed],
         },
-    )
-    return TpmEvaluation(
-        passed=not failed,
-        results=tuple(results),
-        conclusion=conclusion,
     )
