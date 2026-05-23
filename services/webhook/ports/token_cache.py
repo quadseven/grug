@@ -1,3 +1,4 @@
+# MIRRORED — sibling at services/api/ports/token_cache.py; keep in lockstep. See docs/adr/0001-mirror-with-rule-of-three-deferral.md.
 """TokenCache port — swappable cache for App JWTs + install tokens.
 
 v1 = InMemoryTokenCache (module-scope dict in warm Lambda container).
