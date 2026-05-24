@@ -34,9 +34,10 @@ _TABLE_NAME = os.environ.get("GRUG_DDB_TABLE", "grug-main")
 # Thread-safety via double-checked locking: a warm Lambda handling two
 # concurrent invocations could race the unguarded check; both would call
 # boto3.resource() and one of the two resource handles would leak. The
-# lock + re-check after acquire is the canonical fix and adds zero cost
-# after the first call (the outer `is None` short-circuits without
-# touching the lock). Peer-review HIGH (openrouter).
+# lock + re-check after acquire is the canonical fix and adds zero
+# LOCK cost after the first call — the outer `is None` short-circuits
+# without acquiring the lock; per-attribute `__getattr__` indirection
+# remains. Peer-review HIGH (openrouter).
 import threading
 
 _ddb = None
