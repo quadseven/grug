@@ -15,7 +15,9 @@ const queryClient = new QueryClient({
   },
 });
 
-// `/` is owned by web/public/Grug.html via Cloudflare Pages _redirects.
+// `/` is owned by web/public/index.html (the static landing). The Vite
+// SPA entry is web/app.html — see vite.config.ts. /signin, /dashboard,
+// /admin rewrite onto /app.html via web/public/_redirects.
 // The React SPA only handles auth-gated dashboard surfaces below.
 const router = createBrowserRouter([
   { path: "/signin", element: <Signin /> },
