@@ -93,10 +93,20 @@ jobs:
           echo "::add-mask::$TOKEN"
           echo "PULUMI_ACCESS_TOKEN=$TOKEN" >> $GITHUB_ENV
 
-      # Runner has system Python 3.14 + uv (installed at /usr/local/bin/uv
-      # via the runner-tooling bootstrap). Pyproject requires >=3.11 so
-      # 3.14 satisfies. actions/setup-python lacks Ubuntu 26.04 prebuilds.
-      - name: 05. Verify Python + uv
+      # ubuntu-latest ships system Python 3.12 but does NOT include uv.
+      # (The previous comment here claimed uv came from the runner-tooling
+      # bootstrap — that was true for srv-unraid-gha; ubuntu-latest needs
+      # it installed explicitly. PR #156's runner swap silently broke
+      # every iac.deploy from 2026-05-24 until this hotfix because uv was
+      # missing.) Use astral-sh/setup-uv for the cached, pinned install.
+      # Pinned to the same SHA used across infrastructure/.github/workflows/
+      # iac.pulumi.*.yml — keeps the uv version in lockstep with sibling
+      # Pulumi projects so a bump (or known-good rollback) is one greppable
+      # edit across all repos.
+      - name: 05a. Install uv
+        uses: astral-sh/setup-uv@d4b2f3b6ecc6e67c4457f6d3e41ec42d3d0fcb86 # v5
+
+      - name: 05b. Verify Python + uv
         run: |
           python3 --version
           uv --version
