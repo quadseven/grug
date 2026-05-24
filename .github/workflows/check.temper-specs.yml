@@ -99,13 +99,29 @@ jobs:
             sudo apt-get install -y -qq "${missing[@]}"
           fi
 
-      - name: Clone + build temper (cold-path only)
+      - name: Clone temper (cold-path only)
         if: steps.temper-locate.outputs.needs_build == 'true'
         run: |
           rm -rf /tmp/temper
           git clone https://github.com/${{ env.TEMPER_REPO }}.git /tmp/temper
           cd /tmp/temper
           git checkout ${{ env.TEMPER_REPO_SHA }}
+
+      # Cache the temper cargo registry + target/ between runs. Keyed on
+      # the pinned TEMPER_REPO_SHA so a kernel bump invalidates the cache.
+      # Cuts the cold ~3-4 min cargo build to ~10-30s on warm cache. Free
+      # for public repos.
+      - name: Cache temper cargo build
+        if: steps.temper-locate.outputs.needs_build == 'true'
+        uses: Swatinem/rust-cache@23869a5bd66c73db3c0ac40331f3206eb23791dc # v2.9.1
+        with:
+          workspaces: /tmp/temper
+          prefix-key: temper-${{ env.TEMPER_REPO_SHA }}
+
+      - name: Build temper (cold-path only)
+        if: steps.temper-locate.outputs.needs_build == 'true'
+        run: |
+          cd /tmp/temper
           cargo build --release --bin temper
 
       # Per-spec verify steps land below this line. The add-spec-to-workflow.sh
