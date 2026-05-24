@@ -4,7 +4,6 @@ import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
 import { createBrowserRouter, RouterProvider } from "react-router-dom";
 
 import "./index.css";
-import { Splash } from "./routes/Splash";
 import { Signin } from "./routes/Signin";
 import { Dashboard } from "./routes/Dashboard";
 import { Admin } from "./routes/Admin";
@@ -16,8 +15,9 @@ const queryClient = new QueryClient({
   },
 });
 
+// `/` is owned by web/public/Grug.html via Cloudflare Pages _redirects.
+// The React SPA only handles auth-gated dashboard surfaces below.
 const router = createBrowserRouter([
-  { path: "/", element: <Splash /> },
   { path: "/signin", element: <Signin /> },
   { path: "/dashboard", element: <Dashboard /> },
   { path: "/admin", element: <Admin /> },
