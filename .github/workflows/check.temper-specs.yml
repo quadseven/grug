@@ -31,6 +31,9 @@ on:
       - 'services/**/crypto/**'
       - 'services/**/github_app_auth/**'  # spec 0004 attester (token cache retry)
       - 'services/**/dispatcher.py'        # spec 0003 attester (installation lifecycle)
+      # New attesters from the max-SDD push:
+      - 'scripts/check-mirrored-files.sh'  # spec 0010 attester (mirror policy)
+      - '.github/workflows/drift-lint.yml' # spec 0010 attester (drift-lint wiring)
       - '.github/workflows/check.temper-specs.yml'
   workflow_dispatch:
 
@@ -127,6 +130,21 @@ jobs:
       - name: Verify spec 0006 (DorCheck)
         run: ${{ steps.temper-locate.outputs.binary }} verify -s specs/0006-dor-check/
 
+      - name: Verify spec 0007 (UserIdentity)
+        run: ${{ steps.temper-locate.outputs.binary }} verify -s specs/0007-user-identity/
+
+      - name: Verify spec 0008 (UserWithTokens)
+        run: ${{ steps.temper-locate.outputs.binary }} verify -s specs/0008-user-with-tokens/
+
+      - name: Verify spec 0009 (RepoConfig)
+        run: ${{ steps.temper-locate.outputs.binary }} verify -s specs/0009-repo-config/
+
+      - name: Verify spec 0010 (MirrorDiscipline)
+        run: ${{ steps.temper-locate.outputs.binary }} verify -s specs/0010-mirror-discipline/
+
+      - name: Verify spec 0011 (DdbHandle)
+        run: ${{ steps.temper-locate.outputs.binary }} verify -s specs/0011-ddb-handle/
+
       # ────────────── Grounding attesters ──────────────
       # Each attester PROVES a spec bool against real source. Temper
       # verifies the IOA is internally consistent; attesters close the
@@ -168,3 +186,15 @@ jobs:
 
       - name: Attester · TokenCache 401-then-retry-once semantics (spec 0004)
         run: python3 infra/scripts/attest_token_cache_retry.py
+
+      - name: Attester · UserIdentity frozen + no token fields (spec 0007)
+        run: python3 infra/scripts/attest_user_identity_no_tokens.py
+
+      - name: Attester · UserWithTokens decrypt-boundary + service-scope wall (spec 0008)
+        run: python3 infra/scripts/attest_user_with_tokens_decrypt_boundary.py
+
+      - name: Attester · RepoConfig _DEFAULT_PERSONA_CONFIG + is_persona_enabled (spec 0009)
+        run: python3 infra/scripts/attest_repo_config_default_dict.py
+
+      - name: Attester · MirrorDiscipline policy + drift-lint wiring (spec 0010)
+        run: python3 infra/scripts/attest_mirror_policy_consistency.py

@@ -1,0 +1,127 @@
+# spec 0008 — UserWithTokens I/O Automaton
+#
+# Models the identity + decrypted-OAuth-tokens projection. Per CONTEXT.md
+# § "Identity & authorization concepts" + § "Persistence concepts":
+# UserWithTokens is constructed ONLY on the OAuth-refresh / on-behalf-of-
+# user paths in the api Lambda. The webhook Lambda has no KMS permissions
+# and MUST NEVER construct this type (enforced both at the IAM plane and
+# at the spec layer here).
+#
+# Verified by `temper verify -s specs/0008-user-with-tokens/`.
+
+[automaton]
+name = "UserWithTokens"
+states = ["Drafted", "Decrypted", "Discarded"]
+initial = "Drafted"
+
+# --- Construction-boundary contract bools ---
+
+[[state]]
+name = "frozen_dataclass_no_post_construction_mutation_per_identity_concepts"
+type = "bool"
+initial = "false"
+
+[[state]]
+name = "only_constructed_by_api_lambda_get_user_with_tokens_per_identity_concepts"
+type = "bool"
+initial = "false"
+
+[[state]]
+name = "webhook_never_constructs_user_with_tokens_per_persistence_concepts"
+type = "bool"
+initial = "false"
+
+# --- Decrypt-boundary contract bools (cross-cuts spec 0005) ---
+
+[[state]]
+name = "kms_decrypt_only_through_decrypt_for_user_per_identity_concepts"
+type = "bool"
+initial = "false"
+
+[[state]]
+name = "credential_blob_corrupt_returns_none_not_userwithtokens_per_identity_concepts"
+type = "bool"
+initial = "false"
+
+# --- Field-presence contract bools ---
+
+[[state]]
+name = "oauth_access_token_required_oauth_refresh_token_optional_per_identity_concepts"
+type = "bool"
+initial = "false"
+
+[[state]]
+name = "no_plaintext_caching_after_decrypt_per_identity_concepts"
+type = "bool"
+initial = "false"
+
+[[action]]
+name = "AttestConstructionContract"
+kind = "input"
+from = ["Drafted"]
+params = ["attestor"]
+guard = "is_false webhook_never_constructs_user_with_tokens_per_persistence_concepts"
+effect = [
+  { type = "set_bool", var = "frozen_dataclass_no_post_construction_mutation_per_identity_concepts", value = true },
+  { type = "set_bool", var = "only_constructed_by_api_lambda_get_user_with_tokens_per_identity_concepts", value = true },
+  { type = "set_bool", var = "webhook_never_constructs_user_with_tokens_per_persistence_concepts", value = true },
+]
+hint = "Only `services/api/adapters/user_store.py:get_user_with_tokens` returns this type. Webhook code path has no import; IAM denies KMS decrypt anyway."
+
+[[action]]
+name = "AttestDecryptBoundary"
+kind = "input"
+from = ["Drafted"]
+params = ["attestor"]
+guard = "is_false credential_blob_corrupt_returns_none_not_userwithtokens_per_identity_concepts"
+effect = [
+  { type = "set_bool", var = "kms_decrypt_only_through_decrypt_for_user_per_identity_concepts", value = true },
+  { type = "set_bool", var = "credential_blob_corrupt_returns_none_not_userwithtokens_per_identity_concepts", value = true },
+]
+hint = "Cross-cuts spec 0005: decrypt failures route to PurgeCorrupt → None, NEVER produce a UserWithTokens with partial fields."
+
+[[action]]
+name = "AttestFieldContract"
+kind = "input"
+from = ["Drafted"]
+params = ["attestor"]
+guard = "is_false no_plaintext_caching_after_decrypt_per_identity_concepts"
+effect = [
+  { type = "set_bool", var = "oauth_access_token_required_oauth_refresh_token_optional_per_identity_concepts", value = true },
+  { type = "set_bool", var = "no_plaintext_caching_after_decrypt_per_identity_concepts", value = true },
+]
+hint = "access_token always present (decrypted from oauth_access_token_blob). refresh_token is None when provider never issued one. No module-level plaintext cache."
+
+[[action]]
+name = "Decrypt"
+kind = "input"
+from = ["Drafted"]
+to = "Decrypted"
+params = ["github_user_id"]
+guard = [
+  { type = "is_true", var = "frozen_dataclass_no_post_construction_mutation_per_identity_concepts" },
+  { type = "is_true", var = "only_constructed_by_api_lambda_get_user_with_tokens_per_identity_concepts" },
+  { type = "is_true", var = "webhook_never_constructs_user_with_tokens_per_persistence_concepts" },
+  { type = "is_true", var = "kms_decrypt_only_through_decrypt_for_user_per_identity_concepts" },
+  { type = "is_true", var = "credential_blob_corrupt_returns_none_not_userwithtokens_per_identity_concepts" },
+  { type = "is_true", var = "oauth_access_token_required_oauth_refresh_token_optional_per_identity_concepts" },
+  { type = "is_true", var = "no_plaintext_caching_after_decrypt_per_identity_concepts" },
+]
+hint = "api Lambda calls kms.Decrypt → AESGCM.decrypt → constructs UserWithTokens. In-memory only for the duration of one request."
+
+[[action]]
+name = "Discard"
+kind = "input"
+from = ["Decrypted"]
+to = "Discarded"
+params = ["github_user_id"]
+hint = "Request scope ends; instance falls out of scope. GC reclaims; tokens are not cached."
+
+[[invariant]]
+name = "MustDecryptBeforeDiscard"
+assert = "ordering(Decrypted, Discarded)"
+
+[[invariant]]
+name = "DiscardedIsTerminal"
+when = ["Discarded"]
+assert = "no_further_transitions"
