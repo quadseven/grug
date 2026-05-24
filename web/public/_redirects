@@ -25,6 +25,7 @@
 # via in-app navigation, and unknown root paths SHOULD 404.
 
 /Grug       /           301
+/grug       /           301
 /privacy    /Privacy    200
 /terms      /Terms      200
 /signin     /app        200
