@@ -86,6 +86,16 @@ def publish_tpm_evaluation(
     reinstall, perm change, secret rotation). Codex post-review #50.
     """
     title, summary = _summary(list(evaluation.results))
+    log.info(
+        "tpm_publishing",
+        extra={
+            "installation_id": installation_id,
+            "repo": f"{owner}/{repo}",
+            "pr_number": pr_number,
+            "head_sha": head_sha[:8],
+            "passed": evaluation.passed,
+        },
+    )
     with_install_token_retry(
         installation_id,
         lambda token: post_check_run(
