@@ -92,3 +92,52 @@ These terms exist in the codebase but are inconsistent or under-named. Resolving
 ---
 
 *This file is alive. Add terms as the codebase grows. Renaming a concept = update CONTEXT.md in the same PR. See [ADR-0001](docs/adr/0001-mirror-with-rule-of-three-deferral.md) for the mirror-discipline architecture decision.*
+
+---
+
+## Appendix — Slice plan tracking convention (post `/temper-improve`)
+
+SDD slices are planned + executed against the temper specs above. Slice
+plans live **in the repo** under
+`specs/<NNNN-spec-slug>/plans/<YYYY-MM-DD>-<slice>.md`, not in `/tmp/`
+or chat scrollback. Every shipped plan gets an `## Outcome` postscript
+capturing the v1→v2 transition (what was proposed, what peer-review
+flagged, what shipped). The historical record is the only way future-you
+can ask "why does the adapter do X instead of Y?" and get an answer.
+
+**Template:** `specs/SLICE_PLAN_TEMPLATE.md` — copy when starting a new
+slice. Bakes the recurring patterns peer-review catches (IOA atomicity,
+runtime attester allowlist-not-denylist, cross-user defense at storage
+layer, single transactional mutation, clock injection, explicit
+deferral checklist, mirror discipline, storage-side scope of mutation)
+as required sections so the v1→v2 ceremonial round collapses to
+substantive review.
+
+**Workflow:**
+1. Copy `specs/SLICE_PLAN_TEMPLATE.md` to
+   `specs/<NNNN>/plans/<date>-<slice>.md`.
+2. Fill all required sections (or explicit `N/A — <reason>`).
+3. Optional but recommended for first slice on a new IOA action: submit
+   to `/peer-review` chain. If BLOCK'd, rewrite to v2 in the same file
+   with the v1 narrative + v2 deltas preserved as a transition record.
+4. Implement against the plan; spec edits are spec-first (TOML → temper
+   verify → grounding attester → code).
+5. After commit, add `## Outcome` postscript with shipped SHA +
+   reviewer-finding pre-emption matrix.
+
+**When a recurring CRIT class becomes mechanically detectable** (e.g.
+the over-broad-DELETE pattern from PR #151 could become an AST-walking
+attester that flags `delete_item` calls outside test fixtures), the rule
+moves OUT of the template INTO a CI gate or grounding attester. Until
+then, template + per-slice peer-review are the human-layer enforcement.
+
+**PII guard:** `services/{api,webhook}/tests/test_log_pii_guard.py`
+scans for raw secret-bearing field names in log calls (OAuth plaintext
+tokens, KMS plaintext keys, App private keys). Does NOT scan for
+`github_user_id` / `install_id` — those are intentionally logged with
+DD as the authorized sink + support flow needing the raw id. Migrating
+identifiers to `observability.fingerprint()` is a deliberate future
+call, not a CI blocker today. New log calls referencing the secret-set
+field names get red-X'd at PR time unless wrapped with
+`observability.fingerprint()` or logging the `_blob` / `_encrypted`
+form.
