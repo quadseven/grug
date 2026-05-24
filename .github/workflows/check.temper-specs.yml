@@ -34,6 +34,14 @@ on:
       # New attesters from the max-SDD push:
       - 'scripts/check-mirrored-files.sh'  # spec 0010 attester (mirror policy)
       - '.github/workflows/drift-lint.yml' # spec 0010 attester (drift-lint wiring)
+      # Spec 0012 (Landing) attesters DOM-parse the actual marketing
+      # HTML and the Vite/_redirects shape. Re-run on any web/ touch so
+      # design dumps don't smuggle regressions (mailto: CTAs, broken
+      # install URL slug, CF Pretty-URLs slug trap) past CI.
+      - 'web/public/**'
+      - 'web/index.html'
+      - 'web/app.html'
+      - 'web/vite.config.ts'
       - '.github/workflows/check.temper-specs.yml'
   workflow_dispatch:
 
@@ -161,6 +169,9 @@ jobs:
       - name: Verify spec 0011 (DdbHandle)
         run: ${{ steps.temper-locate.outputs.binary }} verify -s specs/0011-ddb-handle/
 
+      - name: Verify spec 0012 (Landing)
+        run: ${{ steps.temper-locate.outputs.binary }} verify -s specs/0012-landing/
+
       # ────────────── Grounding attesters ──────────────
       # Each attester PROVES a spec bool against real source. Temper
       # verifies the IOA is internally consistent; attesters close the
@@ -214,3 +225,12 @@ jobs:
 
       - name: Attester · MirrorDiscipline policy + drift-lint wiring (spec 0010)
         run: python3 infra/scripts/attest_mirror_policy_consistency.py
+
+      - name: Attester · Landing install URL canonical (spec 0012)
+        run: python3 infra/scripts/attest_landing_install_url_canonical.py
+
+      - name: Attester · Landing CTA routing — no mailto on primary, Sign in → /signin (spec 0012)
+        run: python3 infra/scripts/attest_landing_cta_routing.py
+
+      - name: Attester · Landing URL-slug canonical — /index.html owns root, no CF Pretty-URLs trap (spec 0012)
+        run: python3 infra/scripts/attest_landing_url_slug_canonical.py

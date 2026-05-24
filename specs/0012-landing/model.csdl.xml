@@ -1,0 +1,94 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!-- Spec 0012 Landing — CSDL companion. -->
+<edmx:Edmx Version="4.0" xmlns:edmx="http://docs.oasis-open.org/odata/ns/edmx">
+  <edmx:DataServices>
+
+    <Schema Namespace="Temper.Vocab" xmlns="http://docs.oasis-open.org/odata/ns/edm">
+      <Term Name="StateMachine.States" Type="Collection(Edm.String)" AppliesTo="EntityType"/>
+      <Term Name="StateMachine.InitialState" Type="Edm.String" AppliesTo="EntityType"/>
+      <Term Name="StateMachine.ValidFromStates" Type="Collection(Edm.String)" AppliesTo="Action"/>
+      <Term Name="StateMachine.TargetState" Type="Edm.String" AppliesTo="Action"/>
+      <Term Name="Agent.Hint" Type="Edm.String" AppliesTo="Action EntityType"/>
+      <Term Name="ShardKey" Type="Edm.String" AppliesTo="EntityType"/>
+      <Term Name="AuthZ.CedarPolicy" Type="Edm.String" AppliesTo="EntityType Action"/>
+    </Schema>
+
+    <Schema Namespace="Grug.Landing" xmlns="http://docs.oasis-open.org/odata/ns/edm">
+
+      <EnumType Name="LandingStatus">
+        <Member Name="Drafted" Value="0"/>
+        <Member Name="Attested" Value="1"/>
+        <Member Name="Built" Value="2"/>
+        <Member Name="Live" Value="3"/>
+      </EnumType>
+
+      <EntityType Name="Landing">
+        <Key><PropertyRef Name="CommitSha"/></Key>
+        <Property Name="CommitSha" Type="Edm.String" Nullable="false"/>
+        <Property Name="Status" Type="Grug.Landing.LandingStatus" Nullable="false"/>
+
+        <Property Name="install_url_uses_canonical_grug_tribe_slug_per_app_settings" Type="Edm.Boolean" DefaultValue="false"/>
+        <Property Name="primary_ctas_never_use_mailto_protocol_per_design_intent" Type="Edm.Boolean" DefaultValue="false"/>
+        <Property Name="signin_button_points_to_react_signin_route_per_design_intent" Type="Edm.Boolean" DefaultValue="false"/>
+        <Property Name="canonical_landing_owns_root_index_html_per_cf_pretty_urls" Type="Edm.Boolean" DefaultValue="false"/>
+        <Property Name="cross_doc_paths_use_absolute_root_routes_per_design_intent" Type="Edm.Boolean" DefaultValue="false"/>
+
+        <Annotation Term="Temper.Vocab.StateMachine.States">
+          <Collection><String>Drafted</String><String>Attested</String><String>Built</String><String>Live</String></Collection>
+        </Annotation>
+        <Annotation Term="Temper.Vocab.StateMachine.InitialState" String="Drafted"/>
+        <Annotation Term="Temper.Vocab.ShardKey" String="CommitSha"/>
+        <Annotation Term="Temper.Vocab.AuthZ.CedarPolicy" String="policies/landing.cedar"/>
+      </EntityType>
+
+      <Action Name="AttestInstallUrlCanonical" IsBound="true">
+        <Parameter Name="bindingParameter" Type="Grug.Landing.Landing"/>
+        <Parameter Name="attestor" Type="Edm.String" Nullable="false"/>
+        <ReturnType Type="Grug.Landing.Landing"/>
+        <Annotation Term="Temper.Vocab.StateMachine.ValidFromStates"><Collection><String>Drafted</String></Collection></Annotation>
+      </Action>
+
+      <Action Name="AttestCtaRouting" IsBound="true">
+        <Parameter Name="bindingParameter" Type="Grug.Landing.Landing"/>
+        <Parameter Name="attestor" Type="Edm.String" Nullable="false"/>
+        <ReturnType Type="Grug.Landing.Landing"/>
+        <Annotation Term="Temper.Vocab.StateMachine.ValidFromStates"><Collection><String>Drafted</String></Collection></Annotation>
+      </Action>
+
+      <Action Name="AttestUrlSlugCanonical" IsBound="true">
+        <Parameter Name="bindingParameter" Type="Grug.Landing.Landing"/>
+        <Parameter Name="attestor" Type="Edm.String" Nullable="false"/>
+        <ReturnType Type="Grug.Landing.Landing"/>
+        <Annotation Term="Temper.Vocab.StateMachine.ValidFromStates"><Collection><String>Drafted</String></Collection></Annotation>
+      </Action>
+
+      <Action Name="Build" IsBound="true">
+        <Parameter Name="bindingParameter" Type="Grug.Landing.Landing"/>
+        <Parameter Name="commit_sha" Type="Edm.String" Nullable="false"/>
+        <ReturnType Type="Grug.Landing.Landing"/>
+        <Annotation Term="Temper.Vocab.StateMachine.ValidFromStates"><Collection><String>Drafted</String></Collection></Annotation>
+        <Annotation Term="Temper.Vocab.StateMachine.TargetState" String="Attested"/>
+      </Action>
+
+      <Action Name="Bundle" IsBound="true">
+        <Parameter Name="bindingParameter" Type="Grug.Landing.Landing"/>
+        <Parameter Name="commit_sha" Type="Edm.String" Nullable="false"/>
+        <ReturnType Type="Grug.Landing.Landing"/>
+        <Annotation Term="Temper.Vocab.StateMachine.ValidFromStates"><Collection><String>Attested</String></Collection></Annotation>
+        <Annotation Term="Temper.Vocab.StateMachine.TargetState" String="Built"/>
+      </Action>
+
+      <Action Name="Publish" IsBound="true">
+        <Parameter Name="bindingParameter" Type="Grug.Landing.Landing"/>
+        <Parameter Name="commit_sha" Type="Edm.String" Nullable="false"/>
+        <ReturnType Type="Grug.Landing.Landing"/>
+        <Annotation Term="Temper.Vocab.StateMachine.ValidFromStates"><Collection><String>Built</String></Collection></Annotation>
+        <Annotation Term="Temper.Vocab.StateMachine.TargetState" String="Live"/>
+      </Action>
+
+      <EntityContainer Name="LandingService">
+        <EntitySet Name="Landings" EntityType="Grug.Landing.Landing"/>
+      </EntityContainer>
+    </Schema>
+  </edmx:DataServices>
+</edmx:Edmx>

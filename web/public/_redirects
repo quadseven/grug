@@ -1,21 +1,23 @@
 # Cloudflare Pages redirects. First-match-wins, static files take precedence.
 #
 # Routes:
-#   /         → static Grug.html (Caveman Editorial landing per the
-#               Claude Design handoff)
-#   /privacy  → static Privacy.html (two-column doc layout)
+#   /         → static index.html (the Caveman Editorial landing). No rewrite
+#               needed — Cloudflare serves the file directly. Earlier shape
+#               used `/ /Grug.html 200` which CF's Pretty URLs silently
+#               degraded to a 301 → /Grug.
+#   /privacy  → static Privacy.html (clean URL preserved)
 #   /terms    → static Terms.html
-#   /Grug.html, /Privacy.html, /Terms.html  → served directly as static
-#                                              files (no rewrite needed)
-#   /signin, /dashboard, /admin, /<anything-else>  → SPA fallback to
-#                                                     /index.html where
-#                                                     React Router takes over
+#   /signin, /dashboard, /admin, /<anything-else-not-on-disk>
+#             → React SPA at /app.html (Vite build output). React Router
+#               takes over from there.
 #
-# The React app no longer carries a `/` Splash route — Grug.html owns
-# the homepage. Auth-gated routes (/dashboard, /admin) still live in
-# the React SPA.
+# The Vite SPA entry is `web/app.html` (not `web/index.html`) precisely so
+# `public/index.html` can own the homepage URL without colliding with the
+# bundler output. See vite.config.ts.
 
-/          /Grug.html       200
 /privacy   /Privacy.html    200
 /terms     /Terms.html      200
-/*         /index.html      200
+/signin    /app.html        200
+/dashboard /app.html        200
+/admin     /app.html        200
+/*         /app.html        200
