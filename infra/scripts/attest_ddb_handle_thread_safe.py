@@ -78,20 +78,30 @@ def _check_lazy_table_getattr(tree: ast.Module) -> str | None:
                     if isinstance(sub, ast.If) and isinstance(sub.test, ast.Compare):
                         ops = sub.test.ops
                         comps = sub.test.comparators
-                        if (
+                        # Peer-review MED (4x): only accept the re-check when the
+                        # name being tested is `_table_real` — a spurious
+                        # `if other_var is None:` would otherwise false-pass.
+                        if not (
                             len(ops) == 1
                             and isinstance(ops[0], ast.Is)
                             and len(comps) == 1
                             and isinstance(comps[0], ast.Constant)
                             and comps[0].value is None
                         ):
-                            return None
-            return "`with <lock>:` block has no inner `if ... is None:` re-check (double-checked locking incomplete)"
+                            continue
+                        if not (isinstance(sub.test.left, ast.Name) and sub.test.left.id == "_table_real"):
+                            continue
+                        return None
+            return "`with <lock>:` block has no inner `if _table_real is None:` re-check (double-checked locking incomplete or testing wrong variable)"
         return "_LazyTable has no __getattr__"
     return "no _LazyTable class found"
 
 
 def main() -> int:
+    # Vacuous-pass guard.
+    if not LAZY_TABLE_PATHS:
+        print("FAIL: LAZY_TABLE_PATHS is empty — refusing to pass vacuously")
+        return 1
     failures: list[str] = []
     for path in LAZY_TABLE_PATHS:
         if not path.exists():

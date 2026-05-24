@@ -96,6 +96,10 @@ def _behavioral_check(path: Path) -> str | None:
 
 
 def main() -> int:
+    # Vacuous-pass guard: zero CLIENT_PATHS = "OK ... in 0 modules" is a lie.
+    if not CLIENT_PATHS:
+        print("FAIL: CLIENT_PATHS is empty — refusing to pass vacuously")
+        return 1
     failures: list[str] = []
     skipped_behavioral: list[str] = []
 

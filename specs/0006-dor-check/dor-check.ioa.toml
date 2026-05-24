@@ -68,7 +68,7 @@ effect = [
   { type = "set_bool", var = "five_rules_exactly_no_more_no_less_per_process_gate_concepts", value = true },
   { type = "set_bool", var = "name_field_is_one_of_five_canonical_rule_names_per_process_gate_concepts", value = true },
 ]
-hint = "Adding a sixth rule requires updating dor_checks.py + tpm/persona.py + this spec in lockstep."
+hint = "Adding a sixth rule requires updating dor_checks.py (`check_*` function + `ALL_CHECKS` tuple) + this spec + infra/scripts/attest_dor_checks_five_rules.py (`CANONICAL_RULES`) in lockstep. persona.py is rule-agnostic — it calls `run_all()`."
 
 [[action]]
 name = "AttestResultShapeContract"

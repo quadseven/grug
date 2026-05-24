@@ -1,19 +1,20 @@
 #!/usr/bin/env python3
 """Grounding attester for spec 0002.TpmEvaluation.
 
-Proves the bool:
+Proves a NECESSARY condition for the bool:
 
   - `evaluate_pull_request_is_pure_function_per_process_gate_concepts`
 
-Asserts that in both `services/{api,webhook}/personas/tpm/persona.py`,
-the body of `evaluate_pull_request` does NOT call any of the known
-side-effect surfaces (`with_install_token_retry`, `post_check_run`,
-`log.*`, `httpx.*`, `boto3.*`). Those calls belong in
-`publish_tpm_evaluation` per the spec's pure/impure split.
+(Sufficiency requires runtime/property testing — this static attester
+only checks the call graph at the AST level. Spec 0002's bool implies
+"pure"; this script implies "no direct call to non-allowlisted target
+inside evaluate_pull_request's body" — proves not-impure, not "pure".)
 
-Uses Python's ast module so a reformatting of the function body (line
-wraps, parenthesization) won't false-alarm — we're checking the call
-graph, not byte-level text.
+The check uses an **allowlist** of permitted call targets, not a
+denylist. A future contributor cannot escape by importing a new IO
+surface (`requests`, `aiohttp`, `subprocess`, `socket`) — every call
+target must be explicitly permitted. Denylist version was caught by
+peer-review HIGH (4x); flipped to allowlist after audit.
 """
 from __future__ import annotations
 
@@ -28,40 +29,55 @@ PERSONA_PATHS: tuple[Path, ...] = (
     REPO_ROOT / "services/webhook/personas/tpm/persona.py",
 )
 
-# Names that, if invoked anywhere inside evaluate_pull_request, prove
-# the function is not pure. log.* is included because logging.handlers
-# can fan out to network sinks (DD-Forwarder, OTel).
-FORBIDDEN_CALL_NAMES: frozenset[str] = frozenset({
-    "with_install_token_retry",
-    "post_check_run",
-    "httpx",
-    "boto3",
+# Allowlist of permitted call-target roots inside `evaluate_pull_request`.
+# Adding a new entry is a deliberate spec change — it must be defensible
+# as pure (or as pure-modulo-the-allowlist) when reviewing.
+ALLOWED_CALL_NAMES: frozenset[str] = frozenset({
+    # The 5 DoR rules + the rollup helper (all defined in dor_checks.py)
+    "run_all",
+    "check_why", "check_acceptance", "check_estimate", "check_scope_fence", "check_issue_link",
+    # Pure dataclass constructor
+    "TpmEvaluation",
+    # Stdlib pure builtins commonly used in rollup logic
+    "tuple", "list", "len", "all", "any", "isinstance", "sorted", "filter", "map",
 })
-# Attribute-access prefixes that are also banned (e.g. log.info, log.error).
-FORBIDDEN_ATTR_ROOTS: frozenset[str] = frozenset({"log", "logger", "logging"})
+
+
+def _call_target_name(call: ast.Call) -> str | None:
+    """Return the leftmost-name of the call target, e.g. `httpx.post(...)` → `httpx`,
+    `_summary(...)` → `_summary`, `obj.method()` → `obj`. Returns None for calls
+    on call-results (`foo()()` etc.)."""
+    target = call.func
+    if isinstance(target, ast.Name):
+        return target.id
+    if isinstance(target, ast.Attribute):
+        root = target
+        while isinstance(root.value, ast.Attribute):
+            root = root.value
+        if isinstance(root.value, ast.Name):
+            return root.value.id
+    return None
 
 
 def _violations_in_function(func: ast.FunctionDef | ast.AsyncFunctionDef) -> list[str]:
     found: list[str] = []
     for node in ast.walk(func):
-        if isinstance(node, ast.Call):
-            target = node.func
-            if isinstance(target, ast.Name) and target.id in FORBIDDEN_CALL_NAMES:
-                found.append(f"call to {target.id}() at line {node.lineno}")
-            elif isinstance(target, ast.Attribute):
-                root = target
-                # Walk to the leftmost Name in the attribute chain
-                while isinstance(root.value, ast.Attribute):
-                    root = root.value
-                if isinstance(root.value, ast.Name):
-                    if root.value.id in FORBIDDEN_CALL_NAMES:
-                        found.append(f"call to {root.value.id}.* at line {node.lineno}")
-                    elif root.value.id in FORBIDDEN_ATTR_ROOTS:
-                        found.append(f"call to {root.value.id}.{target.attr}(...) at line {node.lineno}")
+        if not isinstance(node, ast.Call):
+            continue
+        name = _call_target_name(node)
+        if name is None:
+            found.append(f"non-name call target at line {node.lineno} (e.g. `foo()()`) — refuse to prove pure")
+            continue
+        if name not in ALLOWED_CALL_NAMES:
+            found.append(f"call to non-allowlisted `{name}` at line {node.lineno}")
     return found
 
 
 def main() -> int:
+    # Vacuous-pass guard: empty PERSONA_PATHS = vacuous OK is a lie.
+    if not PERSONA_PATHS:
+        print("FAIL: PERSONA_PATHS is empty — refusing to pass vacuously")
+        return 1
     failures: list[str] = []
     for path in PERSONA_PATHS:
         if not path.exists():

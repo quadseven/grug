@@ -25,6 +25,12 @@ on:
       - 'services/**/personas/tpm/**'
       - 'services/**/adapters/**'
       - 'services/**/github_checks_client.py'
+      # Spec 0005 attester imports `CredentialBlobCorrupt` from crypto/.
+      # Without this trigger, renaming the exception silently un-pairs
+      # the import and the workflow wouldn't re-run. Peer-review HIGH (4x).
+      - 'services/**/crypto/**'
+      - 'services/**/github_app_auth/**'  # spec 0004 attester (token cache retry)
+      - 'services/**/dispatcher.py'        # spec 0003 attester (installation lifecycle)
       - '.github/workflows/check.temper-specs.yml'
   workflow_dispatch:
 
@@ -46,7 +52,14 @@ jobs:
     # Swap to self-hosted runner for faster builds if you have one:
     # runs-on: [self-hosted, <your-runner-label>]
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+
+      # Pinned Python for the attester behavioral check + any pip install steps.
+      # Avoids PEP-668 EXTERNALLY-MANAGED failures on Ubuntu 24.04+ runner images.
+      # Peer-review HIGH (4x).
+      - uses: actions/setup-python@a309ff8b426b58ec0e2a45f0f869d46889d02405 # v6.2.0
+        with:
+          python-version: '3.13'
 
       - name: Locate or build temper binary
         id: temper-locate
@@ -67,7 +80,9 @@ jobs:
 
       - name: Install Rust toolchain
         if: steps.temper-locate.outputs.needs_build == 'true'
-        uses: dtolnay/rust-toolchain@stable
+        uses: dtolnay/rust-toolchain@e97e2d8cc328f1b50210efc529dca0028893a2d9 # v1
+        with:
+          toolchain: stable
 
       - name: Install temper build deps (cold-path only)
         if: steps.temper-locate.outputs.needs_build == 'true'
@@ -136,11 +151,20 @@ jobs:
         # Behavioral check inside the attester needs httpx to import
         # github_checks_client; install before running so we get both
         # the AST check AND the runtime ValueError assertions (not just
-        # the AST half). The attester gracefully skips behavioral if
-        # httpx is missing — this just upgrades to "both checks run".
+        # the AST half). `set -euo pipefail` ensures pip install failures
+        # propagate (peer-review HIGH 4x — masked install was silently
+        # degrading the attester to AST-only).
         run: |
+          set -euo pipefail
           pip install --quiet 'httpx>=0.27'
+          python3 -c "import httpx; assert httpx.__version__ >= '0.27', f'got {httpx.__version__}'"
           python3 infra/scripts/attest_check_run_result_post_init.py
 
       - name: Attester · DDB-handle double-checked locking (infra invariant)
         run: python3 infra/scripts/attest_ddb_handle_thread_safe.py
+
+      - name: Attester · Installation lifecycle dispatch (spec 0003)
+        run: python3 infra/scripts/attest_installation_lifecycle.py
+
+      - name: Attester · TokenCache 401-then-retry-once semantics (spec 0004)
+        run: python3 infra/scripts/attest_token_cache_retry.py

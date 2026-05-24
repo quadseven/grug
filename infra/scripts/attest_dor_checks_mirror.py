@@ -62,6 +62,11 @@ def _body_sha512(path: Path) -> str:
 
 
 def main() -> int:
+    # Vacuous-pass guard: zero pairs configured = "OK 0 verified" is a lie.
+    # Peer-review HIGH — refuse to pass on an empty target set.
+    if not MIRRORED_PAIRS:
+        print("FAIL: MIRRORED_PAIRS is empty — refusing to pass vacuously")
+        return 1
     failures: list[str] = []
     for api_path, webhook_path in MIRRORED_PAIRS:
         if not api_path.exists():
