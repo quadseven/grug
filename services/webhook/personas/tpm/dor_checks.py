@@ -19,7 +19,7 @@ import re
 from dataclasses import dataclass
 
 
-@dataclass
+@dataclass(frozen=True)
 class CheckResult:
     name: str
     passed: bool

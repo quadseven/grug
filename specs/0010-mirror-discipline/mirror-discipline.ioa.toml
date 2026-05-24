@@ -1,0 +1,148 @@
+# spec 0010 — MirrorDiscipline I/O Automaton
+#
+# Models the ADR-0001 rule-of-three-deferral policy for files duplicated
+# between services/api/ and services/webhook/. Per CONTEXT.md
+# § "Cross-service primitives (mirrored)": six modules are intentionally
+# byte-identical (modulo line-1 MIRRORED-from header per PR #138). When
+# the rule of three triggers (3rd copy needed) the module graduates to
+# services/_shared/. Until then, scripts/check-mirrored-files.sh
+# enforces no-drift on every PR.
+#
+# Verified by `temper verify -s specs/0010-mirror-discipline/`.
+
+[automaton]
+name = "MirrorDiscipline"
+states = ["Copied", "Drifted", "Synced", "Extracted"]
+initial = "Copied"
+
+# --- Header-discipline contract bools ---
+
+[[state]]
+name = "mirror_with_header_files_carry_line1_mirrored_at_per_cross_service_primitives"
+type = "bool"
+initial = "false"
+
+[[state]]
+name = "line1_header_names_correct_sibling_path_per_cross_service_primitives"
+type = "bool"
+initial = "false"
+
+# --- Body-identity contract bools ---
+
+[[state]]
+name = "mirror_with_header_files_body_byte_identical_modulo_line1_per_cross_service_primitives"
+type = "bool"
+initial = "false"
+
+[[state]]
+name = "mirror_byte_identical_files_full_byte_identical_per_cross_service_primitives"
+type = "bool"
+initial = "false"
+
+# --- Enforcement contract bools ---
+
+[[state]]
+name = "drift_lint_runs_on_every_pr_per_cross_service_primitives"
+type = "bool"
+initial = "false"
+
+[[state]]
+name = "scripts_check_mirrored_files_sh_is_authoritative_list_per_cross_service_primitives"
+type = "bool"
+initial = "false"
+
+# --- Extraction-trigger contract bool ---
+
+[[state]]
+name = "rule_of_three_triggers_extraction_to_services_underscore_shared_per_cross_service_primitives"
+type = "bool"
+initial = "false"
+
+[[action]]
+name = "AttestHeaderContract"
+kind = "input"
+from = ["Copied"]
+params = ["attestor"]
+guard = "is_false line1_header_names_correct_sibling_path_per_cross_service_primitives"
+effect = [
+  { type = "set_bool", var = "mirror_with_header_files_carry_line1_mirrored_at_per_cross_service_primitives", value = true },
+  { type = "set_bool", var = "line1_header_names_correct_sibling_path_per_cross_service_primitives", value = true },
+]
+hint = "MIRRORED_WITH_HEADER files carry `# MIRRORED — sibling at services/<other>/<path>; keep in lockstep. See docs/adr/0001-...` on line 1 (added PR #138). Header names the OTHER side's path."
+
+[[action]]
+name = "AttestBodyIdentityContract"
+kind = "input"
+from = ["Copied"]
+params = ["attestor"]
+guard = "is_false mirror_byte_identical_files_full_byte_identical_per_cross_service_primitives"
+effect = [
+  { type = "set_bool", var = "mirror_with_header_files_body_byte_identical_modulo_line1_per_cross_service_primitives", value = true },
+  { type = "set_bool", var = "mirror_byte_identical_files_full_byte_identical_per_cross_service_primitives", value = true },
+]
+hint = "MIRRORED_WITH_HEADER body (line 2+) byte-identical. MIRRORED_BYTE_IDENTICAL list (empty __init__.py etc) byte-identical full-file."
+
+[[action]]
+name = "AttestEnforcementContract"
+kind = "input"
+from = ["Copied"]
+params = ["attestor"]
+guard = "is_false scripts_check_mirrored_files_sh_is_authoritative_list_per_cross_service_primitives"
+effect = [
+  { type = "set_bool", var = "drift_lint_runs_on_every_pr_per_cross_service_primitives", value = true },
+  { type = "set_bool", var = "scripts_check_mirrored_files_sh_is_authoritative_list_per_cross_service_primitives", value = true },
+]
+hint = "drift-lint workflow gates every PR via .github/workflows/drift-lint.yml. Script's MIRRORED_WITH_HEADER + MIRRORED_BYTE_IDENTICAL arrays are the authoritative source of truth."
+
+[[action]]
+name = "AttestExtractionContract"
+kind = "input"
+from = ["Copied"]
+params = ["attestor"]
+guard = "is_false rule_of_three_triggers_extraction_to_services_underscore_shared_per_cross_service_primitives"
+effect = [
+  { type = "set_bool", var = "rule_of_three_triggers_extraction_to_services_underscore_shared_per_cross_service_primitives", value = true },
+]
+hint = "ADR-0001: extract to services/_shared/ ONLY when a 3rd consumer arrives. 2 copies = mirror discipline; 3 = extract. Avoids speculative seams."
+
+[[action]]
+name = "Sync"
+kind = "input"
+from = ["Copied", "Drifted"]
+to = "Synced"
+params = ["pr_number"]
+guard = [
+  { type = "is_true", var = "mirror_with_header_files_carry_line1_mirrored_at_per_cross_service_primitives" },
+  { type = "is_true", var = "line1_header_names_correct_sibling_path_per_cross_service_primitives" },
+  { type = "is_true", var = "mirror_with_header_files_body_byte_identical_modulo_line1_per_cross_service_primitives" },
+  { type = "is_true", var = "mirror_byte_identical_files_full_byte_identical_per_cross_service_primitives" },
+  { type = "is_true", var = "drift_lint_runs_on_every_pr_per_cross_service_primitives" },
+  { type = "is_true", var = "scripts_check_mirrored_files_sh_is_authoritative_list_per_cross_service_primitives" },
+  { type = "is_true", var = "rule_of_three_triggers_extraction_to_services_underscore_shared_per_cross_service_primitives" },
+]
+hint = "drift-lint passed — both copies aligned."
+
+[[action]]
+name = "Drift"
+kind = "input"
+from = ["Synced"]
+to = "Drifted"
+params = ["pr_number"]
+hint = "PR edits ONE side only — drift-lint will red-X this PR until the sibling is also edited."
+
+[[action]]
+name = "Extract"
+kind = "input"
+from = ["Synced"]
+to = "Extracted"
+params = ["consumer_count"]
+hint = "Rule of three fired — module moves to services/_shared/, removed from MIRRORED_FILES, all 3 consumers import."
+
+[[invariant]]
+name = "MustSyncBeforeExtract"
+assert = "ordering(Synced, Extracted)"
+
+[[invariant]]
+name = "ExtractedIsTerminal"
+when = ["Extracted"]
+assert = "no_further_transitions"

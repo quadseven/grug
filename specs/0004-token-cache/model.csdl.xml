@@ -1,0 +1,106 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!-- Spec 0004 TokenCache — CSDL companion. Filename must be `model.csdl.xml`. -->
+<edmx:Edmx Version="4.0" xmlns:edmx="http://docs.oasis-open.org/odata/ns/edmx">
+  <edmx:DataServices>
+
+    <Schema Namespace="Temper.Vocab" xmlns="http://docs.oasis-open.org/odata/ns/edm">
+      <Term Name="StateMachine.States" Type="Collection(Edm.String)" AppliesTo="EntityType"/>
+      <Term Name="StateMachine.InitialState" Type="Edm.String" AppliesTo="EntityType"/>
+      <Term Name="StateMachine.ValidFromStates" Type="Collection(Edm.String)" AppliesTo="Action"/>
+      <Term Name="StateMachine.TargetState" Type="Edm.String" AppliesTo="Action"/>
+      <Term Name="Agent.Hint" Type="Edm.String" AppliesTo="Action EntityType"/>
+      <Term Name="ShardKey" Type="Edm.String" AppliesTo="EntityType"/>
+      <Term Name="AuthZ.CedarPolicy" Type="Edm.String" AppliesTo="EntityType Action"/>
+    </Schema>
+
+    <Schema Namespace="Grug.TokenCache" xmlns="http://docs.oasis-open.org/odata/ns/edm">
+
+      <EnumType Name="TokenCacheStatus">
+        <Member Name="Empty" Value="0"/>
+        <Member Name="Fresh" Value="1"/>
+        <Member Name="Stale" Value="2"/>
+        <Member Name="Invalidated" Value="3"/>
+      </EnumType>
+
+      <EntityType Name="TokenCache">
+        <Key><PropertyRef Name="InstallationId"/></Key>
+        <Property Name="InstallationId" Type="Edm.String" Nullable="false"/>
+        <Property Name="Status" Type="Grug.TokenCache.TokenCacheStatus" Nullable="false"/>
+
+        <Property Name="app_jwt_ttl_is_ten_minutes_per_identity_concepts" Type="Edm.Boolean" DefaultValue="false"/>
+        <Property Name="install_token_ttl_is_about_one_hour_per_identity_concepts" Type="Edm.Boolean" DefaultValue="false"/>
+        <Property Name="with_install_token_retry_invalidates_then_refetches_once_per_identity_concepts" Type="Edm.Boolean" DefaultValue="false"/>
+        <Property Name="retry_does_not_loop_on_repeated_401_per_identity_concepts" Type="Edm.Boolean" DefaultValue="false"/>
+        <Property Name="token_cache_is_per_installation_keyed_per_identity_concepts" Type="Edm.Boolean" DefaultValue="false"/>
+        <Property Name="app_jwt_cached_separately_from_install_tokens_per_identity_concepts" Type="Edm.Boolean" DefaultValue="false"/>
+        <Property Name="active_refresh_count" Type="Edm.Int32" DefaultValue="0"/>
+
+        <Annotation Term="Temper.Vocab.StateMachine.States">
+          <Collection>
+            <String>Empty</String><String>Fresh</String><String>Stale</String><String>Invalidated</String>
+          </Collection>
+        </Annotation>
+        <Annotation Term="Temper.Vocab.StateMachine.InitialState" String="Empty"/>
+        <Annotation Term="Temper.Vocab.ShardKey" String="InstallationId"/>
+        <Annotation Term="Temper.Vocab.AuthZ.CedarPolicy" String="policies/token-cache.cedar"/>
+      </EntityType>
+
+      <Action Name="AttestTtlContract" IsBound="true">
+        <Parameter Name="bindingParameter" Type="Grug.TokenCache.TokenCache"/>
+        <Parameter Name="attestor" Type="Edm.String" Nullable="false"/>
+        <ReturnType Type="Grug.TokenCache.TokenCache"/>
+        <Annotation Term="Temper.Vocab.StateMachine.ValidFromStates"><Collection><String>Empty</String></Collection></Annotation>
+      </Action>
+
+      <Action Name="AttestRetryContract" IsBound="true">
+        <Parameter Name="bindingParameter" Type="Grug.TokenCache.TokenCache"/>
+        <Parameter Name="attestor" Type="Edm.String" Nullable="false"/>
+        <ReturnType Type="Grug.TokenCache.TokenCache"/>
+        <Annotation Term="Temper.Vocab.StateMachine.ValidFromStates"><Collection><String>Empty</String></Collection></Annotation>
+      </Action>
+
+      <Action Name="AttestKeyingContract" IsBound="true">
+        <Parameter Name="bindingParameter" Type="Grug.TokenCache.TokenCache"/>
+        <Parameter Name="attestor" Type="Edm.String" Nullable="false"/>
+        <ReturnType Type="Grug.TokenCache.TokenCache"/>
+        <Annotation Term="Temper.Vocab.StateMachine.ValidFromStates"><Collection><String>Empty</String></Collection></Annotation>
+      </Action>
+
+      <Action Name="Refresh" IsBound="true">
+        <Parameter Name="bindingParameter" Type="Grug.TokenCache.TokenCache"/>
+        <Parameter Name="installation_id" Type="Edm.String" Nullable="false"/>
+        <ReturnType Type="Grug.TokenCache.TokenCache"/>
+        <Annotation Term="Temper.Vocab.StateMachine.ValidFromStates"><Collection><String>Empty</String><String>Stale</String><String>Invalidated</String></Collection></Annotation>
+        <Annotation Term="Temper.Vocab.StateMachine.TargetState" String="Fresh"/>
+      </Action>
+
+      <Action Name="Settle" IsBound="true">
+        <Parameter Name="bindingParameter" Type="Grug.TokenCache.TokenCache"/>
+        <Parameter Name="installation_id" Type="Edm.String" Nullable="false"/>
+        <ReturnType Type="Grug.TokenCache.TokenCache"/>
+        <Annotation Term="Temper.Vocab.StateMachine.ValidFromStates"><Collection><String>Fresh</String></Collection></Annotation>
+        <Annotation Term="Temper.Vocab.StateMachine.TargetState" String="Fresh"/>
+      </Action>
+
+      <Action Name="Expire" IsBound="true">
+        <Parameter Name="bindingParameter" Type="Grug.TokenCache.TokenCache"/>
+        <Parameter Name="installation_id" Type="Edm.String" Nullable="false"/>
+        <ReturnType Type="Grug.TokenCache.TokenCache"/>
+        <Annotation Term="Temper.Vocab.StateMachine.ValidFromStates"><Collection><String>Fresh</String></Collection></Annotation>
+        <Annotation Term="Temper.Vocab.StateMachine.TargetState" String="Stale"/>
+      </Action>
+
+      <Action Name="Invalidate" IsBound="true">
+        <Parameter Name="bindingParameter" Type="Grug.TokenCache.TokenCache"/>
+        <Parameter Name="installation_id" Type="Edm.String" Nullable="false"/>
+        <ReturnType Type="Grug.TokenCache.TokenCache"/>
+        <Annotation Term="Temper.Vocab.StateMachine.ValidFromStates"><Collection><String>Fresh</String><String>Stale</String></Collection></Annotation>
+        <Annotation Term="Temper.Vocab.StateMachine.TargetState" String="Invalidated"/>
+      </Action>
+
+      <EntityContainer Name="TokenCacheService">
+        <EntitySet Name="TokenCaches" EntityType="Grug.TokenCache.TokenCache"/>
+      </EntityContainer>
+    </Schema>
+  </edmx:DataServices>
+</edmx:Edmx>

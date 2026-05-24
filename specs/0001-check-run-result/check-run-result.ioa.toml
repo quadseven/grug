@@ -1,0 +1,173 @@
+# spec 0001 — CheckRunResult I/O Automaton
+#
+# Models the lifecycle of a single GitHub Check Run payload from
+# construction in `services/{api,webhook}/github_checks_client.py`
+# through publication to the GitHub Checks API and eventual retirement
+# when a newer commit supersedes it.
+#
+# Source of truth: DESIGN.md § "Process-gate concepts" — the
+# `CheckRunResult` row defines the cross-field invariant
+# (`status="completed"` ⇔ `conclusion` is set) enforced in
+# `__post_init__`. Bools below encode the §-contracts; flipping any
+# means a malformed payload reaches GitHub or a frozen-dataclass
+# assumption silently breaks.
+#
+# Verified by `temper verify -s specs/0001-check-run-result/`.
+
+[automaton]
+name = "CheckRunResult"
+states = ["Drafted", "Composed", "Posted", "Retired"]
+initial = "Drafted"
+
+# ─────────────────────────── State variables ───────────────────────────
+#
+# Each bool names a single decidable §-contract on the GitHub Checks
+# payload shape or the dataclass that carries it. Names are verbose so
+# drift is visible in diff review — but every Compose guard must list
+# EVERY bool, not one-per-group, or the kernel will green-light a
+# silently-broken contract.
+
+# --- Cross-field invariant (the load-bearing one) ---
+
+[[state]]
+name = "conclusion_present_iff_status_completed_per_process_gate_concepts"
+type = "bool"
+initial = "false"
+
+[[state]]
+name = "post_init_raises_on_cross_field_violation_per_process_gate_concepts"
+type = "bool"
+initial = "false"
+
+# --- Schema / payload-shape contracts ---
+
+[[state]]
+name = "name_field_equals_grug_definition_of_ready_per_process_gate_concepts"
+type = "bool"
+initial = "false"
+
+[[state]]
+name = "head_sha_is_pr_head_not_base_per_process_gate_concepts"
+type = "bool"
+initial = "false"
+
+[[state]]
+name = "payload_shape_matches_github_checks_api_per_process_gate_concepts"
+type = "bool"
+initial = "false"
+
+# --- Dataclass / mutation contracts ---
+
+[[state]]
+name = "frozen_dataclass_no_post_construction_mutation_per_process_gate_concepts"
+type = "bool"
+initial = "false"
+
+[[state]]
+name = "output_title_and_summary_required_when_completed_per_process_gate_concepts"
+type = "bool"
+initial = "false"
+
+# --- Publication counter (at most one in-flight POST per CRR) ---
+
+[[state]]
+name = "active_post_count"
+type = "counter"
+initial = "0"
+
+# ─────────────────────────── Actions ───────────────────────────
+
+# Attestations grouped so each Attest action sets a logically-coherent
+# bool group. Compose guards on EVERY bool so a missing attestation
+# blocks the lifecycle.
+
+[[action]]
+name = "AttestCrossFieldInvariant"
+kind = "input"
+from = ["Drafted"]
+params = ["attestor"]
+guard = "is_false post_init_raises_on_cross_field_violation_per_process_gate_concepts"
+effect = [
+  { type = "set_bool", var = "conclusion_present_iff_status_completed_per_process_gate_concepts", value = true },
+  { type = "set_bool", var = "post_init_raises_on_cross_field_violation_per_process_gate_concepts", value = true },
+]
+hint = "ChecksClientAttester asserts the status/conclusion biconditional + __post_init__ enforcement per DESIGN.md § Process-gate concepts."
+
+[[action]]
+name = "AttestSchemaContract"
+kind = "input"
+from = ["Drafted"]
+params = ["attestor"]
+guard = "is_false payload_shape_matches_github_checks_api_per_process_gate_concepts"
+effect = [
+  { type = "set_bool", var = "name_field_equals_grug_definition_of_ready_per_process_gate_concepts", value = true },
+  { type = "set_bool", var = "head_sha_is_pr_head_not_base_per_process_gate_concepts", value = true },
+  { type = "set_bool", var = "payload_shape_matches_github_checks_api_per_process_gate_concepts", value = true },
+]
+hint = "Asserts the payload maps onto POST /repos/{owner}/{repo}/check-runs with the canonical name + head_sha source."
+
+[[action]]
+name = "AttestDataclassContract"
+kind = "input"
+from = ["Drafted"]
+params = ["attestor"]
+guard = "is_false output_title_and_summary_required_when_completed_per_process_gate_concepts"
+effect = [
+  { type = "set_bool", var = "frozen_dataclass_no_post_construction_mutation_per_process_gate_concepts", value = true },
+  { type = "set_bool", var = "output_title_and_summary_required_when_completed_per_process_gate_concepts", value = true },
+]
+hint = "Frozen dataclass; once Composed the CRR cannot be edited. Completed runs must surface a human-readable output block."
+
+[[action]]
+name = "Compose"
+kind = "input"
+from = ["Drafted"]
+to = "Composed"
+params = ["compose_id"]
+guard = [
+  { type = "is_true", var = "conclusion_present_iff_status_completed_per_process_gate_concepts" },
+  { type = "is_true", var = "post_init_raises_on_cross_field_violation_per_process_gate_concepts" },
+  { type = "is_true", var = "name_field_equals_grug_definition_of_ready_per_process_gate_concepts" },
+  { type = "is_true", var = "head_sha_is_pr_head_not_base_per_process_gate_concepts" },
+  { type = "is_true", var = "payload_shape_matches_github_checks_api_per_process_gate_concepts" },
+  { type = "is_true", var = "frozen_dataclass_no_post_construction_mutation_per_process_gate_concepts" },
+  { type = "is_true", var = "output_title_and_summary_required_when_completed_per_process_gate_concepts" },
+]
+hint = "All seven contracts attested → CRR can be constructed (post_check_run is allowed to send)."
+
+[[action]]
+name = "Post"
+kind = "input"
+from = ["Composed"]
+to = "Posted"
+params = ["check_run_id"]
+effect = { type = "increment", var = "active_post_count" }
+hint = "post_check_run publishes the CRR to GitHub. Counter tracks in-flight HTTP calls per CRR."
+
+[[action]]
+name = "Retire"
+kind = "input"
+from = ["Posted"]
+to = "Retired"
+params = ["successor_check_run_id"]
+effect = { type = "decrement", var = "active_post_count" }
+hint = "Superseded by a newer commit's CRR; this row becomes historical."
+
+# ─────────────────────────── Invariants ───────────────────────────
+
+[[invariant]]
+name = "AtMostOneActivePost"
+assert = "active_post_count <= 1"
+
+[[invariant]]
+name = "MustComposeBeforePost"
+assert = "ordering(Composed, Posted)"
+
+[[invariant]]
+name = "MustPostBeforeRetire"
+assert = "ordering(Posted, Retired)"
+
+[[invariant]]
+name = "RetiredIsTerminal"
+when = ["Retired"]
+assert = "no_further_transitions"

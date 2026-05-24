@@ -1,0 +1,341 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>Terms — Grug</title>
+  <link rel="preconnect" href="https://fonts.googleapis.com">
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+  <link href="https://fonts.googleapis.com/css2?family=Instrument+Serif:ital@0;1&family=JetBrains+Mono:wght@400;500;700&family=Space+Grotesk:wght@400;500;600;700&display=swap" rel="stylesheet">
+  <link rel="icon" type="image/x-icon" href="/favicon.ico">
+  <link rel="icon" type="image/png" sizes="32x32" href="/favicon-32.png">
+  <link rel="icon" type="image/png" sizes="16x16" href="/favicon-16.png">
+  <link rel="apple-touch-icon" sizes="180x180" href="/favicon-180.png">
+  <meta name="theme-color" content="#faf6ee">
+  <style>
+    :root{
+      --bg:#faf6ee; --bg-2:#f3ecdb; --ink:#181613; --ink-2:#3a342c; --muted:#7a7064;
+      --amber:#fbbf24; --amber-deep:#d97706; --tomato:#e0502a; --moss:#3f6b3a; --paper:#fffbf2;
+      --shadow:6px 6px 0 0 var(--ink); --shadow-sm:3px 3px 0 0 var(--ink); --shadow-lg:10px 10px 0 0 var(--ink);
+    }
+    *{box-sizing:border-box}
+    html,body{margin:0;padding:0; overflow-x:hidden;}
+    body{ background:var(--bg); color:var(--ink); font-family:'Space Grotesk', system-ui, sans-serif; font-size:16px; line-height:1.55; -webkit-font-smoothing:antialiased; }
+    .mono{font-family:'JetBrains Mono', ui-monospace, monospace;}
+
+    .tape{ background:var(--ink); color:var(--bg); font-family:'JetBrains Mono', monospace; font-size:12px; padding:8px 0; overflow:hidden; white-space:nowrap; border-bottom:2px solid var(--ink); }
+    .tape-track{ display:inline-block; padding-left:100%; animation:scroll 40s linear infinite; }
+    .tape span{ margin:0 24px; }
+    .tape .dot{ color:var(--amber); margin:0 12px; }
+    @keyframes scroll{ from{transform:translateX(0)} to{transform:translateX(-100%)} }
+
+    header.nav{ position:sticky; top:0; z-index:40; background:var(--bg); border-bottom:2px solid var(--ink); }
+    .nav-inner{ max-width:1240px; margin:0 auto; padding:14px 28px; display:flex; align-items:center; gap:24px; }
+    .brand{ display:flex; align-items:center; gap:10px; font-family:'Instrument Serif', serif; font-size:30px; line-height:1; letter-spacing:-0.02em; color:var(--ink); text-decoration:none; }
+    .brand-mark{ width:36px; height:36px; background:var(--amber); border:2px solid var(--ink); border-radius:50%; overflow:hidden; display:grid; place-items:center; }
+    .brand-mark img{ width:36px; height:36px; object-fit:cover; transform:translateY(2px) scale(1.4); }
+    nav.links{ display:flex; gap:22px; margin-left:auto; align-items:center; }
+    nav.links a{ font-family:'JetBrains Mono', monospace; font-size:13px; font-weight:500; color:var(--ink); text-decoration:none; padding:6px 2px; border-bottom:2px solid transparent; }
+    nav.links a:hover{ border-bottom-color:var(--ink); }
+    .btn{ display:inline-flex; align-items:center; gap:8px; font-family:'JetBrains Mono', monospace; font-weight:700; font-size:13px; padding:10px 16px; background:var(--ink); color:var(--bg); border:2px solid var(--ink); box-shadow:var(--shadow-sm); cursor:pointer; text-decoration:none; transition:transform .08s, box-shadow .08s; }
+    .btn:hover{ transform:translate(-1px,-1px); box-shadow:4px 4px 0 0 var(--ink); }
+    .btn.primary{ background:var(--amber); color:var(--ink); }
+
+    main{ max-width:920px; margin:0 auto; padding:0 28px; }
+
+    .page-head{
+      padding:72px 0 48px;
+      display:grid; grid-template-columns: 1fr auto; gap:32px; align-items:end;
+      border-bottom:2px solid var(--ink);
+    }
+    .eyebrow{ font-family:'JetBrains Mono', monospace; font-size:12px; font-weight:700; text-transform:uppercase; letter-spacing:0.12em; color:var(--ink); display:inline-flex; align-items:center; gap:10px; padding:6px 12px; background:var(--amber); border:2px solid var(--ink); }
+    .eyebrow .blob{ width:8px; height:8px; background:var(--ink); border-radius:50%; }
+    h1.title{ font-family:'Instrument Serif', serif; font-weight:400; font-size:clamp(56px, 7vw, 104px); line-height:0.94; letter-spacing:-0.022em; margin:22px 0 0; }
+    h1.title em{ color:var(--amber-deep); font-style:italic; }
+    .lede{ font-size:18px; line-height:1.55; max-width:540px; color:var(--ink-2); margin:20px 0 0; }
+    .stamp{
+      font-family:'JetBrains Mono', monospace; font-size:11px;
+      padding:8px 14px; border:2px solid var(--ink); background:var(--paper);
+      box-shadow:var(--shadow-sm); transform:rotate(-1.5deg);
+      white-space:nowrap;
+    }
+    .stamp b{ display:block; font-size:13px; color:var(--amber-deep); }
+
+    .doc{
+      padding:48px 0 96px;
+      display:grid;
+      grid-template-columns: minmax(0, 1.05fr) minmax(0, 0.95fr);
+      gap:0;
+      border-bottom:2px solid var(--ink);
+    }
+    .doc-grug, .doc-human{ padding:0 28px 0 0; }
+    .doc-grug{ border-right:2px dashed var(--ink); }
+    .doc-human{ padding:0 0 0 28px; }
+    .doc h3{ font-family:'Instrument Serif', serif; font-weight:400; font-size:34px; line-height:1.04; letter-spacing:-0.02em; margin:0 0 6px; }
+    .doc h3 em{ color:var(--amber-deep); font-style:italic; }
+    .doc .num{ font-family:'JetBrains Mono', monospace; font-size:11px; letter-spacing:0.12em; text-transform:uppercase; color:var(--muted); }
+    .doc .stack{ display:grid; gap:36px; }
+    .doc-grug p{ font-family:'Instrument Serif', serif; font-size:22px; line-height:1.35; margin:8px 0 0; color:var(--ink); }
+    .doc-grug p em{ font-style:italic; color:var(--amber-deep); }
+    .doc-human p{ font-family:'JetBrains Mono', monospace; font-size:13px; line-height:1.6; margin:8px 0 0; color:var(--ink-2); }
+    .doc-human ul{ font-family:'JetBrains Mono', monospace; font-size:13px; line-height:1.6; color:var(--ink-2); margin:8px 0 0; padding:0; list-style:none; }
+    .doc-human ul li{ padding-left:16px; position:relative; }
+    .doc-human ul li::before{ content:"+"; position:absolute; left:0; color:var(--amber-deep); font-weight:700; }
+
+    .col-header{
+      position:sticky; top:62px; z-index:5;
+      background:var(--bg);
+      padding:14px 0;
+      border-bottom:2px solid var(--ink);
+      display:flex; align-items:center; gap:10px;
+      font-family:'JetBrains Mono', monospace; font-size:11px; letter-spacing:0.12em; text-transform:uppercase;
+      margin-bottom:36px;
+    }
+    .col-header .dot{ width:8px; height:8px; background:var(--ink); border-radius:50%; }
+    .col-header.grug-h .dot{ background:var(--amber-deep); }
+    .col-header.human-h .dot{ background:var(--moss); }
+
+    .ascii{
+      font-family:'JetBrains Mono', monospace; font-size:11px; line-height:1.45; color:var(--ink-2);
+      background:var(--paper); border:2px solid var(--ink); padding:16px; margin-top:16px;
+      box-shadow:var(--shadow-sm); white-space:pre; overflow-x:auto;
+    }
+
+    .cta{ padding:80px 0; border-bottom:none; }
+    .cta-grid{ display:grid; grid-template-columns: 1fr auto; gap:32px; align-items:center; }
+    .cta h2{ font-family:'Instrument Serif', serif; font-weight:400; font-size:clamp(40px, 5vw, 72px); line-height:0.96; letter-spacing:-0.02em; margin:0; max-width:18ch; }
+    .cta h2 em{ font-style:italic; color:var(--amber-deep); }
+    .cta .ctas{ display:flex; gap:14px; flex-wrap:wrap; }
+    .btn.lg{ padding:14px 22px; font-size:14px; box-shadow:var(--shadow); }
+    .btn.ghost{ background:var(--bg); color:var(--ink); }
+
+    footer{ background:var(--ink); color:var(--bg); padding:48px 0 24px; }
+    .foot-inner{ max-width:1240px; margin:0 auto; padding:0 28px; }
+    .foot-bottom{ display:flex; justify-content:space-between; align-items:center; flex-wrap:wrap; gap:14px; font-family:'JetBrains Mono', monospace; font-size:11px; color:#cdc2ad; }
+    .foot-bottom a{ color:var(--amber); text-decoration:none; }
+    .foot-bottom a:hover{ text-decoration:underline; }
+
+    @media (max-width: 820px){
+      .page-head{ grid-template-columns: 1fr; }
+      .doc{ grid-template-columns: 1fr; }
+      .doc-grug{ border-right:none; border-bottom:2px dashed var(--ink); padding:0 0 32px; margin-bottom:32px; }
+      .doc-human{ padding:0; }
+      .col-header{ position:static; }
+      .cta-grid{ grid-template-columns: 1fr; }
+    }
+    @media (max-width: 640px){ nav.links{ display:none; } }
+  </style>
+</head>
+<body>
+  <div class="tape">
+    <div class="tape-track">
+      <span>YOU INSTALL GRUG. GRUG WORK.</span><span class="dot">●</span>
+      <span>YOU PAY GRUG. GRUG GUARD.</span><span class="dot">●</span>
+      <span>YOU STOP PAY. GRUG STOP GUARD.</span><span class="dot">●</span>
+      <span>GRUG NOT LAWYER. THIS IS DEAL.</span><span class="dot">●</span>
+      <span>YOU INSTALL GRUG. GRUG WORK.</span><span class="dot">●</span>
+      <span>YOU PAY GRUG. GRUG GUARD.</span><span class="dot">●</span>
+      <span>YOU STOP PAY. GRUG STOP GUARD.</span><span class="dot">●</span>
+    </div>
+  </div>
+
+  <header class="nav">
+    <div class="nav-inner">
+      <a class="brand" href="Grug.html" aria-label="Grug home">
+        <span class="brand-mark"><img src="assets/grug-angry.png" alt=""></span>
+        <span>grug</span>
+      </a>
+      <nav class="links">
+        <a href="Grug.html#features">What Grug do</a>
+        <a href="Grug.html#skills">Skills</a>
+        <a href="Grug.html#dashboard">Dashboard</a>
+        <a href="Grug.html#pricing">Pricing</a>
+        <a href="Privacy.html">Privacy</a>
+      </nav>
+      <a class="btn primary" href="Grug.html">← Back to Grug</a>
+    </div>
+  </header>
+
+  <main>
+    <section class="page-head">
+      <div>
+        <span class="eyebrow"><span class="blob"></span> Terms · the deal</span>
+        <h1 class="title">You ship. <em>Grug guard.</em><br>This how Grug <em>guard</em>.</h1>
+        <p class="lede">// The deal between you and Grug. Pay Grug, Grug crush bug. Don't pay, Grug stop crushing. Don't sue Grug, Grug not lawyer. Don't make Grug do crime, Grug walk away with club.</p>
+      </div>
+      <div class="stamp">
+        EFFECTIVE
+        <b>22 MAY 2026</b>
+        Version 1.2
+      </div>
+    </section>
+
+    <section class="doc">
+      <div class="doc-grug">
+        <div class="col-header grug-h"><span class="dot"></span> Grug speak</div>
+        <div class="stack">
+          <div>
+            <div class="num">01 · the deal</div>
+            <h3>The <em>deal</em>.</h3>
+            <p>You install Grug on your repo. Grug read your PR. Grug crush bug. Grug block evil CVE. Grug post Check Run.</p>
+            <p>You pay Grug little money each month. Grug keep guarding. Easy.</p>
+          </div>
+
+          <div>
+            <div class="num">02 · who can use</div>
+            <h3>Who can <em>summon Grug</em>.</h3>
+            <p>You must be old enough to sign cave contract. Eighteen sun-cycle in most lands. Your organization must allow Grug to enter. If you not own the repo, ask the chief first.</p>
+          </div>
+
+          <div>
+            <div class="num">03 · pay</div>
+            <h3>How <em>pay</em>.</h3>
+            <p>Pay monthly. Stripe collect. If you not pay, Grug sit down. After fourteen sun, Grug pack club and leave. You can wake Grug again any time. Grug not hold grudge.</p>
+            <p>Refund within seven sun if Grug not work. After that, no refund. Grug already eat the bone.</p>
+          </div>
+
+          <div>
+            <div class="num">04 · what you not do</div>
+            <h3>What you <em>not do</em>.</h3>
+            <p>You not use Grug to make malware. You not use Grug to attack other tribe. You not scrape Grug API to feed cousin LLM. You not pretend you are Grug. You not let other tribe use your Grug account.</p>
+            <p>If you do bad thing, Grug walk away. Account closed. No refund. Grug also tell GitHub.</p>
+          </div>
+
+          <div>
+            <div class="num">05 · grug not perfect</div>
+            <h3>Grug <em>not perfect</em>.</h3>
+            <p>Grug try hard. But Grug is caveman. Sometimes bug slip past Grug. Sometimes Grug yell "block" when no need block. <em>You</em> still own your code. <em>You</em> still ship the bug if you ship the bug. Grug is helper, not god.</p>
+          </div>
+
+          <div>
+            <div class="num">06 · your code is your code</div>
+            <h3>Your code is <em>your code</em>.</h3>
+            <p>Grug never claim your code. Your repo, your IP, your problem if it crash. Grug just look and yell. Grug not steal. Grug not train cousin LLM on private code. Grug pinky promise (see Privacy).</p>
+          </div>
+
+          <div>
+            <div class="num">07 · grug change deal</div>
+            <h3>If Grug change deal.</h3>
+            <p>Grug shout from cave at least <em>thirty sun</em> before change. If you not like new deal, you walk away. No hard feeling. You take your data with you.</p>
+          </div>
+
+          <div>
+            <div class="num">08 · law</div>
+            <h3>If <em>fight</em>.</h3>
+            <p>If you and Grug fight, both go to cave-court in Delaware. English language. No class action. Try email first: <em>grug@grug.lol</em>. Most fight end with apology and coffee.</p>
+          </div>
+
+          <div>
+            <div class="num">09 · open source</div>
+            <h3>Or just <em>be Grug</em>.</h3>
+            <p>Don't like this deal? Run Grug yourself. AGPL-3.0. Source in cave. Your rules apply, not Grug rules. Only restriction: if you change Grug and let others use, you share back. Fair trade.</p>
+          </div>
+        </div>
+      </div>
+
+      <div class="doc-human">
+        <div class="col-header human-h"><span class="dot"></span> Human speak</div>
+        <div class="stack">
+          <div>
+            <div class="num">01 · agreement</div>
+            <h3>The <em>contract</em>.</h3>
+            <p>By installing the Grug GitHub App or using grug.lol, you agree to these Terms and the linked Privacy Policy. If you don't agree, uninstall and stop using the service.</p>
+          </div>
+
+          <div>
+            <div class="num">02 · eligibility</div>
+            <h3>Who may <em>use</em>.</h3>
+            <ul>
+              <li>You are 18+ or have parental consent in your jurisdiction</li>
+              <li>You have authority to install Grug on the repos you select</li>
+              <li>Your use does not violate any law applicable to you</li>
+            </ul>
+          </div>
+
+          <div>
+            <div class="num">03 · billing</div>
+            <h3>Subscriptions &amp; <em>refunds</em>.</h3>
+            <ul>
+              <li>Monthly billing via Stripe, renewing automatically</li>
+              <li>Failed payments retry for 14 days, after which the account is suspended</li>
+              <li>7-day money-back guarantee from first payment; pro-rata only thereafter</li>
+              <li>You may cancel any time from <span class="mono">/billing</span>; access continues to period end</li>
+            </ul>
+          </div>
+
+          <div>
+            <div class="num">04 · acceptable use</div>
+            <h3>What you <em>must not</em> do.</h3>
+            <ul>
+              <li>Develop, host, or distribute malware via Grug</li>
+              <li>Probe or attack systems you don't own</li>
+              <li>Scrape, fine-tune on, or resell Grug output or models</li>
+              <li>Impersonate Grug or its operators</li>
+              <li>Share credentials or resell seats outside your org</li>
+            </ul>
+            <p>Violations may result in immediate suspension, forfeiture of pre-paid fees, and notification to GitHub and law enforcement where warranted.</p>
+          </div>
+
+          <div>
+            <div class="num">05 · warranties</div>
+            <h3>Service is <em>"as is"</em>.</h3>
+            <p>Grug is provided without warranty of any kind. We do not guarantee that the service will catch every bug, every CVE, or remain bug-free itself. You remain responsible for the code you merge and ship. Aggregate liability is capped at fees paid in the prior 12 months.</p>
+          </div>
+
+          <div>
+            <div class="num">06 · IP &amp; data</div>
+            <h3>Intellectual <em>property</em>.</h3>
+            <p>You retain all rights to your code and content. You grant Grug a non-exclusive, time-limited license to process it solely to deliver the service. Grug is and remains the property of its authors and is licensed under AGPL-3.0 — see the source repository for license terms.</p>
+          </div>
+
+          <div>
+            <div class="num">07 · changes</div>
+            <h3>Modifications to <em>these terms</em>.</h3>
+            <p>Material changes will be announced via email and a banner in the dashboard at least 30 days in advance. Continued use after the effective date constitutes acceptance. You may terminate without penalty before changes take effect.</p>
+          </div>
+
+          <div>
+            <div class="num">08 · governing law</div>
+            <h3>Disputes &amp; <em>venue</em>.</h3>
+            <p>These Terms are governed by the laws of the State of Delaware, USA. Disputes go to the state and federal courts in New Castle County, Delaware. Class actions are waived; individual arbitration is encouraged. EU/UK consumers retain their mandatory local-law rights.</p>
+          </div>
+
+          <div>
+            <div class="num">09 · open source</div>
+            <h3>The <em>self-host escape</em>.</h3>
+            <p>Grug is published under the GNU Affero General Public License v3.0. You may inspect, modify, and redistribute the source. If you offer modified versions as a network service, you must also offer the source. See <span class="mono">github.com/githumps/grug</span>.</p>
+          </div>
+        </div>
+
+        <pre class="ascii">// summary
+license          :: AGPL-3.0 (source available)
+billing          :: monthly via Stripe, 7-day refund
+acceptable_use   :: no malware, no scraping, no impersonation
+warranty         :: as-is, liability capped at 12mo fees
+governing_law    :: Delaware, USA
+notice_period    :: 30 days for material changes
+contact          :: grug@grug.lol</pre>
+      </div>
+    </section>
+
+    <section class="cta">
+      <div class="cta-grid">
+        <h2>Read deal.<br>Sign nothing. <em>Just install.</em></h2>
+        <div class="ctas">
+          <a class="btn primary lg" href="https://github.com/apps/grug/installations/new">Install Grug on GitHub →</a>
+          <a class="btn ghost lg" href="Privacy.html">Read the Privacy →</a>
+        </div>
+      </div>
+    </section>
+  </main>
+
+  <footer>
+    <div class="foot-inner">
+      <div class="foot-bottom">
+        <span>AGPL-3.0. Made in a cave. <a href="Privacy.html">Privacy</a> · <a href="Terms.html">Terms</a></span>
+        <span>Questions? <a href="mailto:grug@grug.lol">grug@grug.lol</a></span>
+      </div>
+    </div>
+  </footer>
+</body>
+</html>

@@ -1,0 +1,134 @@
+# spec 0009 — RepoConfig I/O Automaton
+#
+# Models the per-repo persona-toggle row. Per CONTEXT.md § "Identity &
+# authorization concepts": today's schema has exactly one field
+# (`tpm_enabled: bool`, default True). As personas ship, _DEFAULT_PERSONA_
+# CONFIG gains keys and the schema grows. Storage lives at
+# `PK=INST#<id>, SK=REPO#<repo_id>`.
+#
+# Verified by `temper verify -s specs/0009-repo-config/`.
+
+[automaton]
+name = "RepoConfig"
+states = ["Defaulted", "Overridden", "Reset", "Retired"]
+initial = "Defaulted"
+
+# --- Default-state contract bools ---
+
+[[state]]
+name = "default_persona_config_dict_is_source_of_truth_per_identity_concepts"
+type = "bool"
+initial = "false"
+
+[[state]]
+name = "missing_row_returns_defaults_not_none_per_identity_concepts"
+type = "bool"
+initial = "false"
+
+[[state]]
+name = "defaults_enabled_explicit_optout_per_identity_concepts"
+type = "bool"
+initial = "false"
+
+# --- Storage-shape contract bools ---
+
+[[state]]
+name = "repo_config_one_row_per_repo_under_install_pk_per_persistence_concepts"
+type = "bool"
+initial = "false"
+
+[[state]]
+name = "set_repo_config_persists_updated_by_user_id_per_identity_concepts"
+type = "bool"
+initial = "false"
+
+# --- Extension-rule contract bools ---
+
+[[state]]
+name = "adding_persona_extends_default_config_dict_per_identity_concepts"
+type = "bool"
+initial = "false"
+
+[[state]]
+name = "is_persona_enabled_lookup_by_persona_underscore_enabled_key_per_identity_concepts"
+type = "bool"
+initial = "false"
+
+[[action]]
+name = "AttestDefaultsContract"
+kind = "input"
+from = ["Defaulted"]
+params = ["attestor"]
+guard = "is_false defaults_enabled_explicit_optout_per_identity_concepts"
+effect = [
+  { type = "set_bool", var = "default_persona_config_dict_is_source_of_truth_per_identity_concepts", value = true },
+  { type = "set_bool", var = "missing_row_returns_defaults_not_none_per_identity_concepts", value = true },
+  { type = "set_bool", var = "defaults_enabled_explicit_optout_per_identity_concepts", value = true },
+]
+hint = "_DEFAULT_PERSONA_CONFIG = {tpm_enabled: True} is the canonical source. get_repo_config returns dict(_DEFAULT_PERSONA_CONFIG) on missing row — users get value out-of-the-box."
+
+[[action]]
+name = "AttestStorageContract"
+kind = "input"
+from = ["Defaulted"]
+params = ["attestor"]
+guard = "is_false set_repo_config_persists_updated_by_user_id_per_identity_concepts"
+effect = [
+  { type = "set_bool", var = "repo_config_one_row_per_repo_under_install_pk_per_persistence_concepts", value = true },
+  { type = "set_bool", var = "set_repo_config_persists_updated_by_user_id_per_identity_concepts", value = true },
+]
+hint = "Storage shape: PK=INST#<install_id>, SK=REPO#<repo_id>. set_repo_config records updated_by_user_id for audit."
+
+[[action]]
+name = "AttestExtensionContract"
+kind = "input"
+from = ["Defaulted"]
+params = ["attestor"]
+guard = "is_false is_persona_enabled_lookup_by_persona_underscore_enabled_key_per_identity_concepts"
+effect = [
+  { type = "set_bool", var = "adding_persona_extends_default_config_dict_per_identity_concepts", value = true },
+  { type = "set_bool", var = "is_persona_enabled_lookup_by_persona_underscore_enabled_key_per_identity_concepts", value = true },
+]
+hint = "Adding a persona means adding `<name>_enabled: True` to _DEFAULT_PERSONA_CONFIG. is_persona_enabled looks up `f'{persona}_enabled'` in the resolved config."
+
+[[action]]
+name = "Override"
+kind = "input"
+from = ["Defaulted", "Reset"]
+to = "Overridden"
+params = ["install_id", "repo_id"]
+guard = [
+  { type = "is_true", var = "default_persona_config_dict_is_source_of_truth_per_identity_concepts" },
+  { type = "is_true", var = "missing_row_returns_defaults_not_none_per_identity_concepts" },
+  { type = "is_true", var = "defaults_enabled_explicit_optout_per_identity_concepts" },
+  { type = "is_true", var = "repo_config_one_row_per_repo_under_install_pk_per_persistence_concepts" },
+  { type = "is_true", var = "set_repo_config_persists_updated_by_user_id_per_identity_concepts" },
+  { type = "is_true", var = "adding_persona_extends_default_config_dict_per_identity_concepts" },
+  { type = "is_true", var = "is_persona_enabled_lookup_by_persona_underscore_enabled_key_per_identity_concepts" },
+]
+hint = "User explicitly opts out via dashboard PUT /repos/{id}/config — set_repo_config writes the REPO# row."
+
+[[action]]
+name = "Reset"
+kind = "input"
+from = ["Overridden"]
+to = "Reset"
+params = ["install_id", "repo_id"]
+hint = "User toggles back to defaults via dashboard. Row is deleted; subsequent get_repo_config returns the default dict again."
+
+[[action]]
+name = "Retire"
+kind = "input"
+from = ["Defaulted", "Overridden", "Reset"]
+to = "Retired"
+params = ["install_id"]
+hint = "Parent Installation Uninstalled — all REPO# rows under INST#<id> deleted via the install cascade."
+
+[[invariant]]
+name = "MustOverrideBeforeReset"
+assert = "ordering(Overridden, Reset)"
+
+[[invariant]]
+name = "RetiredIsTerminal"
+when = ["Retired"]
+assert = "no_further_transitions"

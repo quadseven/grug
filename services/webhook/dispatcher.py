@@ -156,20 +156,44 @@ def _handle_pull_request(payload: dict[str, Any]) -> dict[str, str]:
         return {"status": "no_op", "reason": "tpm disabled for this repo"}
 
     # Lazy import — keeps cold-start cheap when only non-PR events fire
-    from personas.tpm.persona import evaluate_pull_request  # type: ignore
+    import httpx  # type: ignore
+    from personas.tpm.persona import evaluate_pull_request, publish_tpm_evaluation  # type: ignore
 
-    result = evaluate_pull_request(
-        installation_id=int(installation_id),
-        owner=owner,
-        repo=repo_name,
-        head_sha=head_sha,
-        pr_body=pr_body,
-        pr_number=int(pr_number),
-    )
+    evaluation = evaluate_pull_request(pr_body)
+    # Wrap publish so a GH 5xx / RequestError doesn't propagate uncaught
+    # into main.py and turn the webhook into a 500 (which triggers GH
+    # retries → duplicate work, no install/repo/PR coords in the error
+    # log). Peer-review CRITICAL (4x). Mirrors the recheck-path catch
+    # at line ~309. We still re-raise after logging so GH can retry the
+    # delivery, but at least the operator can correlate via structured
+    # fields in DD/Sentry.
+    try:
+        publish_tpm_evaluation(
+            evaluation,
+            installation_id=int(installation_id),
+            owner=owner,
+            repo=repo_name,
+            head_sha=head_sha,
+            pr_number=int(pr_number),
+        )
+    except (httpx.HTTPStatusError, httpx.RequestError) as e:
+        log.error(
+            "tpm_publish_failed",
+            extra={
+                "installation_id": int(installation_id),
+                "owner": owner,
+                "repo": repo_name,
+                "pr_number": int(pr_number),
+                "head_sha": head_sha[:8],
+                "kind": type(e).__name__,
+                "status": getattr(getattr(e, "response", None), "status_code", None),
+            },
+        )
+        return {"status": "skip", "persona": "tpm", "reason": "publish_failed"}
     return {
         "status": "dispatched",
         "persona": "tpm",
-        "result": "pass" if result.passed else "fail",
+        "result": "pass" if evaluation.passed else "fail",
     }
 
 
@@ -235,7 +259,7 @@ def _handle_issue_comment(payload: dict[str, Any]) -> dict[str, str]:
     # commenters can't spam re-evaluations. Lazy imports keep cold-start
     # cheap when only PR events fire.
     from github_app_auth import with_install_token_retry  # type: ignore
-    from personas.tpm.persona import evaluate_pull_request  # type: ignore
+    from personas.tpm.persona import evaluate_pull_request, publish_tpm_evaluation  # type: ignore
     import httpx  # type: ignore
 
     # URL-encode user-controlled path components. GitHub repo + login
@@ -327,24 +351,41 @@ def _handle_issue_comment(payload: dict[str, Any]) -> dict[str, str]:
     if not head_sha:
         return {"status": "skip", "reason": "pr_has_no_head_sha"}
 
-    result = evaluate_pull_request(
-        installation_id=int(installation_id),
-        owner=owner,
-        repo=repo_name,
-        head_sha=head_sha,
-        pr_body=pr_body,
-        pr_number=int(pr_number),
-    )
+    evaluation = evaluate_pull_request(pr_body)
+    # Same wrap pattern as the pull_request handler — peer-review CRITICAL.
+    try:
+        publish_tpm_evaluation(
+            evaluation,
+            installation_id=int(installation_id),
+            owner=owner,
+            repo=repo_name,
+            head_sha=head_sha,
+            pr_number=int(pr_number),
+        )
+    except (httpx.HTTPStatusError, httpx.RequestError) as e:
+        log.error(
+            "recheck_publish_failed",
+            extra={
+                "installation_id": int(installation_id),
+                "owner": owner,
+                "repo": repo_name,
+                "pr_number": int(pr_number),
+                "head_sha": head_sha[:8],
+                "kind": type(e).__name__,
+                "status": getattr(getattr(e, "response", None), "status_code", None),
+            },
+        )
+        return {"status": "skip", "trigger": "recheck", "reason": "publish_failed"}
     log.info(
         "recheck_dispatched",
         extra={
             "owner": owner, "repo": repo_name, "pr_number": pr_number,
-            "sender": sender_login, "result": "pass" if result.passed else "fail",
+            "sender": sender_login, "result": "pass" if evaluation.passed else "fail",
         },
     )
     return {
         "status": "dispatched",
         "persona": "tpm",
         "trigger": "recheck",
-        "result": "pass" if result.passed else "fail",
+        "result": "pass" if evaluation.passed else "fail",
     }

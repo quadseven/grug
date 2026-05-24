@@ -1,0 +1,151 @@
+# spec 0005 — KmsEnvelope I/O Automaton
+#
+# Models the per-`UserIdentity` envelope-encryption lifecycle for OAuth
+# token blobs in DDB. A data-encryption-key (DEK) is generated via
+# `kms:GenerateDataKey`, used (AES-GCM, 96-bit nonce) to encrypt the
+# tokens, then wrapped and stored alongside the ciphertext.
+#
+# `CredentialBlobCorrupt` is raised if the ciphertext can't be
+# decrypted (key-version drift, tampering, deliberate test fixture);
+# the handler must idempotently clean up the corrupt row.
+#
+# Source of truth: DESIGN.md § "Persistence concepts".
+#
+# Verified by `temper verify -s specs/0005-kms-envelope/`.
+
+[automaton]
+name = "KmsEnvelope"
+states = ["Drafted", "Encrypted", "Decrypted", "Corrupt", "Purged"]
+initial = "Drafted"
+
+# --- Cryptography contract bools ---
+
+[[state]]
+name = "dek_is_aes_gcm_96bit_nonce_per_persistence_concepts"
+type = "bool"
+initial = "false"
+
+[[state]]
+name = "dek_is_wrapped_by_kms_cmk_per_persistence_concepts"
+type = "bool"
+initial = "false"
+
+[[state]]
+name = "wrapped_dek_stored_alongside_ciphertext_per_persistence_concepts"
+type = "bool"
+initial = "false"
+
+# --- Service-scope contract bools ---
+
+[[state]]
+name = "webhook_never_decrypts_user_tokens_per_persistence_concepts"
+type = "bool"
+initial = "false"
+
+[[state]]
+name = "only_api_lambda_calls_kms_at_app_level_per_persistence_concepts"
+type = "bool"
+initial = "false"
+
+# --- Corruption-handling contract bools ---
+
+[[state]]
+name = "credential_blob_corrupt_triggers_idempotent_cleanup_per_persistence_concepts"
+type = "bool"
+initial = "false"
+
+[[state]]
+name = "idempotency_check_after_corruption_empty_fallthrough_per_persistence_concepts"
+type = "bool"
+initial = "false"
+
+[[action]]
+name = "AttestCryptoContract"
+kind = "input"
+from = ["Drafted"]
+params = ["attestor"]
+guard = "is_false wrapped_dek_stored_alongside_ciphertext_per_persistence_concepts"
+effect = [
+  { type = "set_bool", var = "dek_is_aes_gcm_96bit_nonce_per_persistence_concepts", value = true },
+  { type = "set_bool", var = "dek_is_wrapped_by_kms_cmk_per_persistence_concepts", value = true },
+  { type = "set_bool", var = "wrapped_dek_stored_alongside_ciphertext_per_persistence_concepts", value = true },
+]
+hint = "AES-GCM-256 with 96-bit nonce; wrapped DEK travels with the ciphertext, no separate KMS lookup on decrypt."
+
+[[action]]
+name = "AttestServiceScopeContract"
+kind = "input"
+from = ["Drafted"]
+params = ["attestor"]
+guard = "is_false only_api_lambda_calls_kms_at_app_level_per_persistence_concepts"
+effect = [
+  { type = "set_bool", var = "webhook_never_decrypts_user_tokens_per_persistence_concepts", value = true },
+  { type = "set_bool", var = "only_api_lambda_calls_kms_at_app_level_per_persistence_concepts", value = true },
+]
+hint = "Webhook Lambda has no KMS decrypt permission — IAM-enforced. Only api Lambda decrypts."
+
+[[action]]
+name = "AttestCorruptionHandlerContract"
+kind = "input"
+from = ["Drafted"]
+params = ["attestor"]
+guard = "is_false idempotency_check_after_corruption_empty_fallthrough_per_persistence_concepts"
+effect = [
+  { type = "set_bool", var = "credential_blob_corrupt_triggers_idempotent_cleanup_per_persistence_concepts", value = true },
+  { type = "set_bool", var = "idempotency_check_after_corruption_empty_fallthrough_per_persistence_concepts", value = true },
+]
+hint = "Corruption-handler audit pattern: on CredentialBlobCorrupt, idempotently delete the row, then re-check before continuing."
+
+[[action]]
+name = "Encrypt"
+kind = "input"
+from = ["Drafted"]
+to = "Encrypted"
+params = ["user_id"]
+guard = [
+  { type = "is_true", var = "dek_is_aes_gcm_96bit_nonce_per_persistence_concepts" },
+  { type = "is_true", var = "dek_is_wrapped_by_kms_cmk_per_persistence_concepts" },
+  { type = "is_true", var = "wrapped_dek_stored_alongside_ciphertext_per_persistence_concepts" },
+  { type = "is_true", var = "webhook_never_decrypts_user_tokens_per_persistence_concepts" },
+  { type = "is_true", var = "only_api_lambda_calls_kms_at_app_level_per_persistence_concepts" },
+  { type = "is_true", var = "credential_blob_corrupt_triggers_idempotent_cleanup_per_persistence_concepts" },
+  { type = "is_true", var = "idempotency_check_after_corruption_empty_fallthrough_per_persistence_concepts" },
+]
+hint = "Generate DEK via kms:GenerateDataKey, encrypt tokens, store ciphertext + wrapped DEK in DDB."
+
+[[action]]
+name = "Decrypt"
+kind = "input"
+from = ["Encrypted"]
+to = "Decrypted"
+params = ["user_id"]
+hint = "api Lambda unwraps the DEK via kms:Decrypt and decrypts the ciphertext in-memory."
+
+[[action]]
+name = "ObserveCorrupt"
+kind = "input"
+from = ["Encrypted"]
+to = "Corrupt"
+params = ["user_id"]
+hint = "Decryption raised CredentialBlobCorrupt (key drift / tampering / fixture)."
+
+[[action]]
+name = "PurgeCorrupt"
+kind = "input"
+from = ["Corrupt"]
+to = "Purged"
+params = ["user_id"]
+hint = "Idempotent cleanup: delete the row; safe to call repeatedly."
+
+[[invariant]]
+name = "MustEncryptBeforeDecrypt"
+assert = "ordering(Encrypted, Decrypted)"
+
+[[invariant]]
+name = "MustObserveCorruptBeforePurge"
+assert = "ordering(Corrupt, Purged)"
+
+[[invariant]]
+name = "PurgedIsTerminal"
+when = ["Purged"]
+assert = "no_further_transitions"

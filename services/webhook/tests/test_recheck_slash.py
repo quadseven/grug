@@ -98,7 +98,8 @@ def test_pr_author_authorized_path_dispatches(_no_install_lookups):
 
     with patch("github_app_auth.with_install_token_retry", side_effect=lambda _i, fn: fn("tok")):
         with patch("httpx.get") as get_mock, \
-             patch("personas.tpm.persona.evaluate_pull_request", return_value=_Result()) as eval_mock:
+             patch("personas.tpm.persona.evaluate_pull_request", return_value=_Result()) as eval_mock, \
+             patch("personas.tpm.persona.publish_tpm_evaluation") as _pub_mock:
             get_mock.return_value.raise_for_status = lambda: None
             get_mock.return_value.json.return_value = fake_pr
             out = d.dispatch("issue_comment", payload)
@@ -107,9 +108,11 @@ def test_pr_author_authorized_path_dispatches(_no_install_lookups):
     assert out["trigger"] == "recheck"
     assert out["result"] == "pass"
     eval_mock.assert_called_once()
-    kwargs = eval_mock.call_args.kwargs
-    assert kwargs["head_sha"] == "abc123"
-    assert kwargs["pr_number"] == 42
+    # Pure evaluate now takes only pr_body; head_sha / pr_number flow
+    # to publish_tpm_evaluation per spec 0002's pure/impure split.
+    pub_kwargs = _pub_mock.call_args.kwargs
+    assert pub_kwargs["head_sha"] == "abc123"
+    assert pub_kwargs["pr_number"] == 42
 
 
 def test_non_author_with_write_perm_authorized(_no_install_lookups):
@@ -141,7 +144,8 @@ def test_non_author_with_write_perm_authorized(_no_install_lookups):
 
     with patch("github_app_auth.with_install_token_retry", side_effect=lambda _i, fn: fn("tok")):
         with patch("httpx.get", side_effect=_httpx_get), \
-             patch("personas.tpm.persona.evaluate_pull_request", return_value=_Result()):
+             patch("personas.tpm.persona.evaluate_pull_request", return_value=_Result()), \
+             patch("personas.tpm.persona.publish_tpm_evaluation"):
             out = d.dispatch("issue_comment", payload)
 
     assert out["status"] == "dispatched"

@@ -1,0 +1,95 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!-- Spec 0007 UserIdentity — CSDL companion. Filename must be `model.csdl.xml`. -->
+<edmx:Edmx Version="4.0" xmlns:edmx="http://docs.oasis-open.org/odata/ns/edmx">
+  <edmx:DataServices>
+
+    <Schema Namespace="Temper.Vocab" xmlns="http://docs.oasis-open.org/odata/ns/edm">
+      <Term Name="StateMachine.States" Type="Collection(Edm.String)" AppliesTo="EntityType"/>
+      <Term Name="StateMachine.InitialState" Type="Edm.String" AppliesTo="EntityType"/>
+      <Term Name="StateMachine.ValidFromStates" Type="Collection(Edm.String)" AppliesTo="Action"/>
+      <Term Name="StateMachine.TargetState" Type="Edm.String" AppliesTo="Action"/>
+      <Term Name="Agent.Hint" Type="Edm.String" AppliesTo="Action EntityType"/>
+      <Term Name="ShardKey" Type="Edm.String" AppliesTo="EntityType"/>
+      <Term Name="AuthZ.CedarPolicy" Type="Edm.String" AppliesTo="EntityType Action"/>
+    </Schema>
+
+    <Schema Namespace="Grug.UserIdentity" xmlns="http://docs.oasis-open.org/odata/ns/edm">
+
+      <EnumType Name="UserIdentityStatus">
+        <Member Name="Drafted" Value="0"/>
+        <Member Name="Created" Value="1"/>
+        <Member Name="Promoted" Value="2"/>
+        <Member Name="Revoked" Value="3"/>
+      </EnumType>
+
+      <EntityType Name="UserIdentity">
+        <Key><PropertyRef Name="GithubUserId"/></Key>
+        <Property Name="GithubUserId" Type="Edm.String" Nullable="false"/>
+        <Property Name="Status" Type="Grug.UserIdentity.UserIdentityStatus" Nullable="false"/>
+
+        <Property Name="frozen_dataclass_no_post_construction_mutation_per_identity_concepts" Type="Edm.Boolean" DefaultValue="false"/>
+        <Property Name="identity_only_projection_has_no_token_fields_per_identity_concepts" Type="Edm.Boolean" DefaultValue="false"/>
+        <Property Name="defaults_role_user_tier_free_allowlisted_false_per_identity_concepts" Type="Edm.Boolean" DefaultValue="false"/>
+        <Property Name="created_at_immutable_after_first_write_per_identity_concepts" Type="Edm.Boolean" DefaultValue="false"/>
+        <Property Name="admin_promotion_via_atomic_update_item_per_identity_concepts" Type="Edm.Boolean" DefaultValue="false"/>
+        <Property Name="upsert_oauth_user_preserves_promoted_state_via_if_not_exists_per_identity_concepts" Type="Edm.Boolean" DefaultValue="false"/>
+
+        <Annotation Term="Temper.Vocab.StateMachine.States">
+          <Collection><String>Drafted</String><String>Created</String><String>Promoted</String><String>Revoked</String></Collection>
+        </Annotation>
+        <Annotation Term="Temper.Vocab.StateMachine.InitialState" String="Drafted"/>
+        <Annotation Term="Temper.Vocab.ShardKey" String="GithubUserId"/>
+        <Annotation Term="Temper.Vocab.AuthZ.CedarPolicy" String="policies/user-identity.cedar"/>
+      </EntityType>
+
+      <Action Name="AttestProjectionContract" IsBound="true">
+        <Parameter Name="bindingParameter" Type="Grug.UserIdentity.UserIdentity"/>
+        <Parameter Name="attestor" Type="Edm.String" Nullable="false"/>
+        <ReturnType Type="Grug.UserIdentity.UserIdentity"/>
+        <Annotation Term="Temper.Vocab.StateMachine.ValidFromStates"><Collection><String>Drafted</String></Collection></Annotation>
+      </Action>
+
+      <Action Name="AttestDefaultsContract" IsBound="true">
+        <Parameter Name="bindingParameter" Type="Grug.UserIdentity.UserIdentity"/>
+        <Parameter Name="attestor" Type="Edm.String" Nullable="false"/>
+        <ReturnType Type="Grug.UserIdentity.UserIdentity"/>
+        <Annotation Term="Temper.Vocab.StateMachine.ValidFromStates"><Collection><String>Drafted</String></Collection></Annotation>
+      </Action>
+
+      <Action Name="AttestPromotionContract" IsBound="true">
+        <Parameter Name="bindingParameter" Type="Grug.UserIdentity.UserIdentity"/>
+        <Parameter Name="attestor" Type="Edm.String" Nullable="false"/>
+        <ReturnType Type="Grug.UserIdentity.UserIdentity"/>
+        <Annotation Term="Temper.Vocab.StateMachine.ValidFromStates"><Collection><String>Drafted</String></Collection></Annotation>
+      </Action>
+
+      <Action Name="Create" IsBound="true">
+        <Parameter Name="bindingParameter" Type="Grug.UserIdentity.UserIdentity"/>
+        <Parameter Name="github_user_id" Type="Edm.String" Nullable="false"/>
+        <ReturnType Type="Grug.UserIdentity.UserIdentity"/>
+        <Annotation Term="Temper.Vocab.StateMachine.ValidFromStates"><Collection><String>Drafted</String></Collection></Annotation>
+        <Annotation Term="Temper.Vocab.StateMachine.TargetState" String="Created"/>
+      </Action>
+
+      <Action Name="Promote" IsBound="true">
+        <Parameter Name="bindingParameter" Type="Grug.UserIdentity.UserIdentity"/>
+        <Parameter Name="github_user_id" Type="Edm.String" Nullable="false"/>
+        <ReturnType Type="Grug.UserIdentity.UserIdentity"/>
+        <Annotation Term="Temper.Vocab.StateMachine.ValidFromStates"><Collection><String>Created</String></Collection></Annotation>
+        <Annotation Term="Temper.Vocab.StateMachine.TargetState" String="Promoted"/>
+      </Action>
+
+      <Action Name="Revoke" IsBound="true">
+        <Parameter Name="bindingParameter" Type="Grug.UserIdentity.UserIdentity"/>
+        <Parameter Name="github_user_id" Type="Edm.String" Nullable="false"/>
+        <ReturnType Type="Grug.UserIdentity.UserIdentity"/>
+        <Annotation Term="Temper.Vocab.StateMachine.ValidFromStates"><Collection><String>Created</String><String>Promoted</String></Collection></Annotation>
+        <Annotation Term="Temper.Vocab.StateMachine.TargetState" String="Revoked"/>
+      </Action>
+
+      <EntityContainer Name="UserIdentityService">
+        <EntitySet Name="UserIdentities" EntityType="Grug.UserIdentity.UserIdentity"/>
+      </EntityContainer>
+    </Schema>
+  </edmx:DataServices>
+</edmx:Edmx>

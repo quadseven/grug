@@ -1,0 +1,133 @@
+# spec 0011 — DdbHandle I/O Automaton
+#
+# Models the _LazyTable lazy-init pattern shared by user_store +
+# install_store. Promoted from attester-only to a full spec per
+# peer-review (4/4 reviewers MED). The double-checked locking + the
+# implicit module-level (_ddb, _table_real, _init_lock) triplet
+# invariant become first-class kernel-verified contracts.
+#
+# Verified by `temper verify -s specs/0011-ddb-handle/`.
+
+[automaton]
+name = "DdbHandle"
+states = ["Empty", "Initializing", "Initialized", "Active"]
+initial = "Empty"
+
+# --- Lazy-init contract bools ---
+
+[[state]]
+name = "lazy_init_avoids_aws_default_region_at_import_per_persistence_concepts"
+type = "bool"
+initial = "false"
+
+[[state]]
+name = "init_lock_is_threading_lock_at_module_scope_per_persistence_concepts"
+type = "bool"
+initial = "false"
+
+# --- Double-checked-locking contract bools ---
+
+[[state]]
+name = "outer_is_none_check_short_circuits_without_lock_per_persistence_concepts"
+type = "bool"
+initial = "false"
+
+[[state]]
+name = "inner_re_check_after_acquire_tests_table_real_specifically_per_persistence_concepts"
+type = "bool"
+initial = "false"
+
+# --- Coverage contract bools ---
+
+[[state]]
+name = "lazy_table_pattern_present_in_api_user_store_per_persistence_concepts"
+type = "bool"
+initial = "false"
+
+[[state]]
+name = "lazy_table_pattern_present_in_api_install_store_per_persistence_concepts"
+type = "bool"
+initial = "false"
+
+[[state]]
+name = "lazy_table_pattern_present_in_webhook_install_store_per_persistence_concepts"
+type = "bool"
+initial = "false"
+
+[[action]]
+name = "AttestLazyInitContract"
+kind = "input"
+from = ["Empty"]
+params = ["attestor"]
+guard = "is_false init_lock_is_threading_lock_at_module_scope_per_persistence_concepts"
+effect = [
+  { type = "set_bool", var = "lazy_init_avoids_aws_default_region_at_import_per_persistence_concepts", value = true },
+  { type = "set_bool", var = "init_lock_is_threading_lock_at_module_scope_per_persistence_concepts", value = true },
+]
+hint = "boto3.resource() at import time would require AWS_DEFAULT_REGION pre-set (breaks tests that monkeypatch env). _init_lock = threading.Lock() at module scope guards the lazy init."
+
+[[action]]
+name = "AttestDoubleCheckedContract"
+kind = "input"
+from = ["Empty"]
+params = ["attestor"]
+guard = "is_false inner_re_check_after_acquire_tests_table_real_specifically_per_persistence_concepts"
+effect = [
+  { type = "set_bool", var = "outer_is_none_check_short_circuits_without_lock_per_persistence_concepts", value = true },
+  { type = "set_bool", var = "inner_re_check_after_acquire_tests_table_real_specifically_per_persistence_concepts", value = true },
+]
+hint = "__getattr__ pattern: outer `if _table_real is None` short-circuits; inner re-check after `with _init_lock:` tests `_table_real` specifically (not any None-check — peer-review MED 4x)."
+
+[[action]]
+name = "AttestCoverageContract"
+kind = "input"
+from = ["Empty"]
+params = ["attestor"]
+guard = "is_false lazy_table_pattern_present_in_webhook_install_store_per_persistence_concepts"
+effect = [
+  { type = "set_bool", var = "lazy_table_pattern_present_in_api_user_store_per_persistence_concepts", value = true },
+  { type = "set_bool", var = "lazy_table_pattern_present_in_api_install_store_per_persistence_concepts", value = true },
+  { type = "set_bool", var = "lazy_table_pattern_present_in_webhook_install_store_per_persistence_concepts", value = true },
+]
+hint = "All three module sites have the same _LazyTable pattern. attest_ddb_handle_thread_safe.py walks the AST of each."
+
+[[action]]
+name = "Initialize"
+kind = "input"
+from = ["Empty"]
+to = "Initializing"
+params = ["table_name"]
+guard = [
+  { type = "is_true", var = "lazy_init_avoids_aws_default_region_at_import_per_persistence_concepts" },
+  { type = "is_true", var = "init_lock_is_threading_lock_at_module_scope_per_persistence_concepts" },
+  { type = "is_true", var = "outer_is_none_check_short_circuits_without_lock_per_persistence_concepts" },
+  { type = "is_true", var = "inner_re_check_after_acquire_tests_table_real_specifically_per_persistence_concepts" },
+  { type = "is_true", var = "lazy_table_pattern_present_in_api_user_store_per_persistence_concepts" },
+  { type = "is_true", var = "lazy_table_pattern_present_in_api_install_store_per_persistence_concepts" },
+  { type = "is_true", var = "lazy_table_pattern_present_in_webhook_install_store_per_persistence_concepts" },
+]
+hint = "First __getattr__ call from cold; lock acquired."
+
+[[action]]
+name = "Activate"
+kind = "input"
+from = ["Initializing"]
+to = "Initialized"
+params = ["table_name"]
+hint = "boto3.resource + .Table built; _table_real assigned; lock released."
+
+[[action]]
+name = "Serve"
+kind = "input"
+from = ["Initialized", "Active"]
+to = "Active"
+params = ["table_name"]
+hint = "Subsequent __getattr__ short-circuits (no lock); returns directly. Steady state for warm container lifetime."
+
+[[invariant]]
+name = "MustInitializeBeforeActivate"
+assert = "ordering(Initializing, Initialized)"
+
+[[invariant]]
+name = "MustActivateBeforeServe"
+assert = "ordering(Initialized, Active)"
