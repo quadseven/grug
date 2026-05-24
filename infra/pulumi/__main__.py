@@ -26,6 +26,7 @@ import pulumi_datadog as _datadog
 from components import (
     cloudflare_dns,
     dd_monitors,
+    dd_rum,
     ddb_table,
     ecr_repo,
     kms_cmk,
@@ -439,6 +440,14 @@ monitors = dd_monitors.create_all(
     provider=_dd_provider,
 )
 
+# DD RUM Application for grug.lol (spec 0013 RumInstrumentation).
+# `name="grug-web"` is the canonical service tag the browser SDK must
+# pass to DD_RUM.init(...) — same name used in attest_rum_*.py.
+# Application ID + client token exported to SSM so web.deploy.yml can
+# substitute them into the build at deploy time without committing
+# either value to the repo.
+rum = dd_rum.create(name="grug-web", provider=_dd_provider)
+
 pulumi.export("webhook_function_url", webhook.function_url)
 pulumi.export("webhook_public_url", f"https://webhook.{domain}/webhook/github")
 pulumi.export("api_function_url", api_lambda.function_url)
@@ -455,3 +464,8 @@ pulumi.export("monitor_api_5xx_id", monitors.api_5xx.id)
 pulumi.export("monitor_sig_verify_fail_id", monitors.sig_verify_fail.id)
 pulumi.export("monitor_cold_start_p99_id", monitors.cold_start_p99.id)
 pulumi.export("synthetic_uptime_id", monitors.uptime.id)
+
+# DD RUM (spec 0013). Outputs are non-sensitive references — the actual
+# values live in SSM SecureStrings managed by the same component.
+pulumi.export("rum_application_id_ssm_name", rum.ssm_application_id.name)
+pulumi.export("rum_client_token_ssm_name", rum.ssm_client_token.name)
