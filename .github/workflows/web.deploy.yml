@@ -33,7 +33,10 @@ env:
 
 jobs:
   build-and-deploy:
-    runs-on: [self-hosted, Linux, X64, srv-unraid-gha]
+    # Public repo → GitHub-hosted ubuntu-latest is free + unmetered + no
+    # nightly auto-reboot interruption risk. Swapped from
+    # [self-hosted, srv-unraid-gha] 2026-05-24.
+    runs-on: ubuntu-latest
     timeout-minutes: 15
     steps:
       - name: 01. Checkout
