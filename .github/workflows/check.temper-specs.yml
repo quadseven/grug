@@ -178,6 +178,9 @@ jobs:
       - name: Attester · evaluate_pull_request purity (spec 0002)
         run: python3 infra/scripts/attest_persona_purity.py
 
+      - name: Attester · aggregate_passed iff all blocking checks passed (spec 0002)
+        run: python3 infra/scripts/attest_aggregate_passed_advisory.py
+
       - name: Attester · Installation lifecycle dispatch (spec 0003)
         run: python3 infra/scripts/attest_installation_lifecycle.py
 
