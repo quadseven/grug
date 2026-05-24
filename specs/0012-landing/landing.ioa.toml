@@ -1,0 +1,134 @@
+# spec 0012 — Landing I/O Automaton
+#
+# Encodes the contract between the Claude Design handoff (web/public/*.html)
+# and the live grug.lol surface. Five bools were promoted from "fix in
+# PR review" to first-class kernel-verified contracts after a 2026-05-24
+# live audit caught three regressions that human review missed across
+# four prior PRs:
+#
+#   - Install URL hardcoded `/apps/grug` (returns 404 — real slug is
+#     `/apps/grug-tribe`). Repeated on 5 separate CTAs across 2 files.
+#   - Sign-in + pricing CTAs used `mailto:grug@grug.lol?subject=...`
+#     instead of the actual /signin React route + install URL. The Org
+#     "Talk to Grug" sales CTA + footer contacts legitimately use mailto;
+#     the spec encodes the exception explicitly.
+#   - Cloudflare Pages 301-stripped `.html` from any rewrite target that
+#     resolved to a real file, defeating `_redirects` `200`-rewrite of
+#     `/` → `/Grug.html` and surfacing the canonical URL as `/Grug`.
+#
+# Verified by `temper verify -s specs/0012-landing/`.
+# Grounded by three stdlib-only attesters under infra/scripts/.
+
+[automaton]
+name = "Landing"
+states = ["Drafted", "Attested", "Built", "Live"]
+initial = "Drafted"
+
+# --- Install-CTA contract bools ---
+
+[[state]]
+name = "install_url_uses_canonical_grug_tribe_slug_per_app_settings"
+type = "bool"
+initial = "false"
+
+# --- Routing/CTA contract bools ---
+
+[[state]]
+name = "primary_ctas_never_use_mailto_protocol_per_design_intent"
+type = "bool"
+initial = "false"
+
+[[state]]
+name = "signin_button_points_to_react_signin_route_per_design_intent"
+type = "bool"
+initial = "false"
+
+# --- URL-slug contract bools (CF Pages Pretty URLs trap) ---
+
+[[state]]
+name = "canonical_landing_owns_root_index_html_per_cf_pretty_urls"
+type = "bool"
+initial = "false"
+
+[[state]]
+name = "cross_doc_paths_use_absolute_root_routes_per_design_intent"
+type = "bool"
+initial = "false"
+
+[[action]]
+name = "AttestInstallUrlCanonical"
+kind = "input"
+from = ["Drafted"]
+params = ["attestor"]
+guard = "is_false install_url_uses_canonical_grug_tribe_slug_per_app_settings"
+effect = [
+  { type = "set_bool", var = "install_url_uses_canonical_grug_tribe_slug_per_app_settings", value = true },
+]
+hint = "Every `<a href*='installations/new'>` across web/public/*.html matches `/apps/grug-tribe/installations/new`. The bare `grug` slug 404s; the canonical slug comes from the App registration's `Public link` field, NOT the repo name."
+
+[[action]]
+name = "AttestCtaRouting"
+kind = "input"
+from = ["Drafted"]
+params = ["attestor"]
+guard = "is_false signin_button_points_to_react_signin_route_per_design_intent"
+effect = [
+  { type = "set_bool", var = "primary_ctas_never_use_mailto_protocol_per_design_intent", value = true },
+  { type = "set_bool", var = "signin_button_points_to_react_signin_route_per_design_intent", value = true },
+]
+hint = "Anchors with class containing `btn primary` or `btn pick` MUST NOT have `href^=mailto:`. The Sign in button (class `btn` without `primary`/`pick`) MUST point at `/signin`. Allowed mailto exceptions: Org sales contact (`btn ghost pick` Talk to Grug), footer Questions contact, Privacy DSAR contact."
+
+[[action]]
+name = "AttestUrlSlugCanonical"
+kind = "input"
+from = ["Drafted"]
+params = ["attestor"]
+guard = "is_false cross_doc_paths_use_absolute_root_routes_per_design_intent"
+effect = [
+  { type = "set_bool", var = "canonical_landing_owns_root_index_html_per_cf_pretty_urls", value = true },
+  { type = "set_bool", var = "cross_doc_paths_use_absolute_root_routes_per_design_intent", value = true },
+]
+hint = "`web/public/index.html` MUST be the landing (CF Pages serves it directly at `/` with no rewrite). `web/public/Grug.html` MUST NOT exist. `_redirects` MUST NOT have a 200-rewrite of `/` to any `*.html` path (CF Pretty URLs strips `.html` → 301). Privacy/Terms cross-doc `<a href>` MUST be absolute `/`, `/privacy`, `/terms` — never relative `Grug.html`/`Privacy.html`/`Terms.html`."
+
+[[action]]
+name = "Build"
+kind = "input"
+from = ["Drafted"]
+to = "Attested"
+params = ["commit_sha"]
+guard = [
+  { type = "is_true", var = "install_url_uses_canonical_grug_tribe_slug_per_app_settings" },
+  { type = "is_true", var = "primary_ctas_never_use_mailto_protocol_per_design_intent" },
+  { type = "is_true", var = "signin_button_points_to_react_signin_route_per_design_intent" },
+  { type = "is_true", var = "canonical_landing_owns_root_index_html_per_cf_pretty_urls" },
+  { type = "is_true", var = "cross_doc_paths_use_absolute_root_routes_per_design_intent" },
+]
+hint = "All five contract bools attested. `npm run build` produces dist/{index.html,app.html,assets/}. Only reachable once every grounding attester passes."
+
+[[action]]
+name = "Bundle"
+kind = "input"
+from = ["Attested"]
+to = "Built"
+params = ["commit_sha"]
+hint = "Vite emits dist/app.html (SPA) + copies public/index.html (landing). Both share the favicon set."
+
+[[action]]
+name = "Publish"
+kind = "input"
+from = ["Built"]
+to = "Live"
+params = ["commit_sha"]
+hint = "wrangler pages deploy dist/ promotes the bundle to the grug-web project. Served at grug.lol via the CF Pages -> custom domain binding."
+
+[[invariant]]
+name = "MustAttestBeforeBuild"
+assert = "ordering(Drafted, Attested)"
+
+[[invariant]]
+name = "MustBuildBeforePublish"
+assert = "ordering(Attested, Built)"
+
+[[invariant]]
+name = "MustBundleBeforeLive"
+assert = "ordering(Built, Live)"
