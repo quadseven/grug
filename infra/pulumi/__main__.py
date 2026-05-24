@@ -412,9 +412,13 @@ cloudflare_dns.create_proxied_cname(
 )
 
 # Datadog monitors (Slice 9 #30). Provider reads DD creds from SSM
-# `/shared/datadog-{api,app}-key` per #164 cross-repo convention.
+# DD APP key: per-project path under `/shared/datadog-app-key/` so a
+# rotation here doesn't clobber sibling repos (somatic-scripts etc.)
+# that may use the un-nested `/shared/datadog-app-key` path. Note: DD
+# API key remains at the shared cross-repo path above (it's submit-only,
+# safe to share + cheaper to rotate once globally).
 _dd_app_key = aws.ssm.get_parameter(
-    name="/shared/datadog-app-key", with_decryption=True,
+    name="/shared/datadog-app-key/github-grug", with_decryption=True,
 )
 _dd_provider = _datadog.Provider(
     "datadog-grug",
