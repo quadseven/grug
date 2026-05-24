@@ -148,7 +148,7 @@ def static_dor_checks(pr: dict[str, Any]) -> list[DoRCheck]:
         )
     )
 
-    # 4. Out-of-scope section (warning, not blocker)
+    # 4. Out-of-scope section (blocking)
     has_scope, _ = has_section(body, "Out of scope")
     checks.append(
         DoRCheck(
@@ -156,7 +156,7 @@ def static_dor_checks(pr: dict[str, Any]) -> list[DoRCheck]:
             has_scope,
             "Out-of-scope section present"
             if has_scope
-            else "MISSING `## Out of scope` — recommended for L+ items to prevent scope creep",
+            else "MISSING `## Out of scope` — required to prevent scope creep",
         )
     )
 
@@ -382,8 +382,8 @@ def render_comment(
     if prior is None:
         prior = PriorRun(None, {}, None)
 
-    fail_count = sum(1 for c in checks if not c.passed and c.name != "scope-fence" and c.name != "issue-link")
-    warn_count = sum(1 for c in checks if not c.passed and (c.name == "scope-fence" or c.name == "issue-link"))
+    fail_count = sum(1 for c in checks if not c.passed and c.name != "issue-link")
+    warn_count = sum(1 for c in checks if not c.passed and c.name == "issue-link")
     overall_pass = fail_count == 0
     state_tag = "pass" if overall_pass else "fail"
 
@@ -410,7 +410,7 @@ def render_comment(
     headline = ", ".join(headline_parts)
 
     rows = [
-        f"| {'✅' if c.passed else ('⚠️' if c.name in ('scope-fence', 'issue-link') else '❌')} | "
+        f"| {'✅' if c.passed else ('⚠️' if c.name == 'issue-link' else '❌')} | "
         f"`{c.name}` | {c.detail} |"
         for c in checks
     ]

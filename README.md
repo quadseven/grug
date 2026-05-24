@@ -27,15 +27,15 @@ GitHub App webhook URL at `webhook.<your-domain>/webhook/github`.
 
 ## What Grug checks (Definition of Ready)
 
-Static checks on PR body — all blocking when `strict: true`:
+Static checks on PR body — 4 blocking, 1 advisory:
 
 | Check | Pass when |
 |---|---|
 | `why` | Has `## Why` (or `## Summary`) section ≥5 words |
 | `acceptance` | Has `## Acceptance criteria` (or `## Test plan`) with ≥3 bullets |
 | `estimate` | Body or label includes `Size: XS/S/M/L` (XL must be split) |
-| `scope-fence` | Has `## Out of scope` (advisory; warning only) |
-| `issue-link` | Body links an issue via `closes #N` (advisory) |
+| `scope-fence` | Has `## Out of scope` section (blocking) |
+| `issue-link` | Body links an issue via `closes #N` (advisory; warning only) |
 
 LLM scope review (advisory) — Poolside `laguna-m.1`:
 - Title ↔ body match
