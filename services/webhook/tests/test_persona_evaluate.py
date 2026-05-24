@@ -32,6 +32,44 @@ closes #1
 **Size:** S
 """
 
+_BODY_MISSING_ISSUE_LINK = """## Why
+We need this for the launch tomorrow morning, fixes a Sentry HIGH.
+
+## Acceptance criteria
+- [x] one
+- [x] two
+- [x] three
+
+## Out of scope
+nothing
+
+**Size:** S
+"""
+
+_BODY_MISSING_SCOPE_FENCE = """## Why
+We need this for the launch tomorrow morning, fixes a Sentry HIGH.
+
+## Acceptance criteria
+- [x] one
+- [x] two
+- [x] three
+
+closes #1
+
+**Size:** S
+"""
+
+_BODY_MISSING_SCOPE_AND_LINK = """## Why
+We need this for the launch tomorrow morning, fixes a Sentry HIGH.
+
+## Acceptance criteria
+- [x] one
+- [x] two
+- [x] three
+
+**Size:** S
+"""
+
 
 def test_summary_pass_renders_check_count():
     results = [
@@ -80,6 +118,55 @@ def test_evaluate_pull_request_fails_on_empty_body():
     assert evaluation.passed is False
     assert evaluation.conclusion == "failure"
     assert any(not r.passed for r in evaluation.results)
+
+
+def test_evaluate_issue_link_only_fail_is_advisory():
+    """issue-link is advisory — missing it should NOT block the PR."""
+    evaluation = persona.evaluate_pull_request(_BODY_MISSING_ISSUE_LINK)
+
+    assert evaluation.passed is True
+    assert evaluation.conclusion == "success"
+    issue_link_result = next(r for r in evaluation.results if r.name == "issue-link")
+    assert issue_link_result.passed is False  # check itself failed...
+    # ...but overall evaluation still passes
+
+
+def test_evaluate_scope_fence_fail_is_blocking():
+    """scope-fence is blocking — missing it MUST block the PR."""
+    evaluation = persona.evaluate_pull_request(_BODY_MISSING_SCOPE_FENCE)
+
+    assert evaluation.passed is False
+    assert evaluation.conclusion == "failure"
+    scope_result = next(r for r in evaluation.results if r.name == "scope-fence")
+    assert scope_result.passed is False
+
+
+def test_evaluate_mixed_advisory_and_blocking_failure():
+    """When both advisory (issue-link) and blocking (scope-fence) fail,
+    the blocking check determines the verdict; the advisory failure
+    should NOT inflate the blocking count in the summary."""
+    evaluation = persona.evaluate_pull_request(_BODY_MISSING_SCOPE_AND_LINK)
+
+    assert evaluation.passed is False
+    assert evaluation.conclusion == "failure"
+    scope = next(r for r in evaluation.results if r.name == "scope-fence")
+    link = next(r for r in evaluation.results if r.name == "issue-link")
+    assert scope.passed is False
+    assert link.passed is False
+    title, summary = persona._summary(list(evaluation.results))
+    assert "1/5 blocking" in title  # only scope-fence counts, not issue-link
+
+
+def test_summary_advisory_check_renders_warning_icon():
+    """Advisory checks that fail should render ⚠️ not ❌ in the summary."""
+    results = [
+        CheckResult("why", True, "ok"),
+        CheckResult("issue-link", False, "no link"),
+    ]
+    title, summary = persona._summary(results)
+    assert "✅" in title  # overall pass (issue-link is advisory)
+    assert "⚠️" in summary
+    assert "❌" not in summary
 
 
 def test_evaluate_pull_request_is_pure_no_external_calls():

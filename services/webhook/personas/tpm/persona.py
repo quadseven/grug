@@ -38,19 +38,25 @@ class TpmEvaluation:
 log = logging.getLogger("grug.webhook.persona.tpm")
 
 _CHECK_NAME = "Grug — Definition of Ready"
+_ADVISORY_CHECKS: frozenset[str] = frozenset({"issue-link"})
 
 
 def _summary(results: list[CheckResult]) -> tuple[str, str]:
     """Build (title, summary) markdown for the check-run output."""
-    failed = [r for r in results if not r.passed]
+    blocking = [r for r in results if not r.passed and r.name not in _ADVISORY_CHECKS]
     title = (
         f"✅ DoR pass — all {len(results)} checks"
-        if not failed
-        else f"❌ DoR fail — {len(failed)}/{len(results)} blocking"
+        if not blocking
+        else f"❌ DoR fail — {len(blocking)}/{len(results)} blocking"
     )
     lines = ["| Check | Status | Detail |", "|---|---|---|"]
     for r in results:
-        icon = "✅" if r.passed else "❌"
+        if r.passed:
+            icon = "✅"
+        elif r.name in _ADVISORY_CHECKS:
+            icon = "⚠️"
+        else:
+            icon = "❌"
         lines.append(f"| {r.name} | {icon} | {r.detail} |")
     return title, "\n".join(lines)
 
@@ -62,10 +68,10 @@ def evaluate_pull_request(pr_body: str) -> TpmEvaluation:
     the result in `publish_tpm_evaluation(...)` to POST the check-run.
     """
     results = run_all(pr_body)
-    failed = [r for r in results if not r.passed]
-    conclusion: CheckConclusion = "success" if not failed else "failure"
+    blocking = [r for r in results if not r.passed and r.name not in _ADVISORY_CHECKS]
+    conclusion: CheckConclusion = "success" if not blocking else "failure"
     return TpmEvaluation(
-        passed=not failed,
+        passed=not blocking,
         results=tuple(results),
         conclusion=conclusion,
     )
