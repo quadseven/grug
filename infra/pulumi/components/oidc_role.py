@@ -153,6 +153,31 @@ def create(
                         # follow-up. Slice 1 prioritizes "deploy works".
                         "Resource": "*",
                     },
+                    {
+                        # Pulumi-managed SSM writes. Scoped tighter than
+                        # the general policy above: only `/grug/*` paths
+                        # the grug stack owns, never the cross-cutting
+                        # `/shared/*` namespace (which is read-only from
+                        # this role's POV — Pulumi for `/shared/*` lives
+                        # in infrastructure/pulumi/aws-cicd-bootstrap).
+                        #
+                        # Spec 0013 (RumInstrumentation) needs PutParameter
+                        # so the dd_rum component can persist the
+                        # `datadog.RumApplication` ID + client token to
+                        # SSM after creation. Caught when Pulumi #166's
+                        # iac.deploy got past the DD scope check but
+                        # failed with `AccessDeniedException: ssm:PutParameter`.
+                        "Effect": "Allow",
+                        "Action": [
+                            "ssm:PutParameter",
+                            "ssm:DeleteParameter",
+                            "ssm:AddTagsToResource",
+                            "ssm:RemoveTagsFromResource",
+                            "ssm:ListTagsForResource",
+                            "ssm:LabelParameterVersion",
+                        ],
+                        "Resource": "arn:aws:ssm:*:*:parameter/grug/*",
+                    },
                 ],
             },
         )
