@@ -49,7 +49,16 @@ concurrency:
 
 jobs:
   pulumi-up:
-    runs-on: [self-hosted, Linux, X64, srv-unraid-gha]
+    # Public repo → GitHub-hosted ubuntu-latest is free + unmetered + no
+    # nightly auto-reboot interruption risk. Swapped from
+    # [self-hosted, srv-unraid-gha] 2026-05-24.
+    #
+    # Trade-off: the docker buildx `type=local,src=/tmp/buildx-cache-grug/`
+    # cache below survived across runs on the self-hosted runner but
+    # resets on every fresh ubuntu-latest VM. Each deploy will cold-build
+    # the 2 ECR images (~90s × 2 = ~3 min extra). Follow-up: swap
+    # `type=local` → `type=gha,mode=max` for GitHub's native cache.
+    runs-on: ubuntu-latest
     timeout-minutes: 20
     steps:
       - name: 01. Checkout
