@@ -1,1 +1,21 @@
-/*    /index.html   200
+# Cloudflare Pages redirects. First-match-wins, static files take precedence.
+#
+# Routes:
+#   /         → static Grug.html (Caveman Editorial landing per the
+#               Claude Design handoff)
+#   /privacy  → static Privacy.html (two-column doc layout)
+#   /terms    → static Terms.html
+#   /Grug.html, /Privacy.html, /Terms.html  → served directly as static
+#                                              files (no rewrite needed)
+#   /signin, /dashboard, /admin, /<anything-else>  → SPA fallback to
+#                                                     /index.html where
+#                                                     React Router takes over
+#
+# The React app no longer carries a `/` Splash route — Grug.html owns
+# the homepage. Auth-gated routes (/dashboard, /admin) still live in
+# the React SPA.
+
+/          /Grug.html       200
+/privacy   /Privacy.html    200
+/terms     /Terms.html      200
+/*         /index.html      200
