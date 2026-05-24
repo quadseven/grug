@@ -1,0 +1,150 @@
+# spec 0013 — RumInstrumentation I/O Automaton
+#
+# Closes the single observability gap surfaced by the 2026-05-24 DD
+# audit (docs/NETWORK-TOPOLOGY.md): zero RUM events from grug.lol
+# despite APM + Logs being fully wired on the AWS Lambdas.
+#
+# Encodes the contract between the Datadog RUM Application resource
+# (Pulumi-managed) and the browser SDK initialization across all four
+# user-facing HTML surfaces:
+#
+#   - web/app.html                 (Vite React SPA entry — npm package init)
+#   - web/public/index.html        (static landing — CDN snippet)
+#   - web/public/Privacy.html      (static doc — CDN snippet)
+#   - web/public/Terms.html        (static doc — CDN snippet)
+#
+# Five contract bools attest distinct invariants. Combined, they
+# prevent silent regressions of the entire RUM pipeline:
+#   - Pulumi forgets to declare the RumApplication resource → no
+#     attribution back to a tracked DD project.
+#   - Credentials drift from SSM to hardcoded → rotation breaks.
+#   - A redesign drops the init snippet from one of the static
+#     surfaces → silent coverage loss without alarm.
+#   - Service tag gets renamed → DD catalog splits the same project
+#     across two service identities.
+#
+# Verified by `temper verify -s specs/0013-rum-instrumentation/`.
+
+[automaton]
+name = "RumInstrumentation"
+states = ["NotInstrumented", "Attested", "Built", "Live"]
+initial = "NotInstrumented"
+
+# --- Pulumi-side contract bools ---
+
+[[state]]
+name = "rum_application_declared_in_pulumi_per_iac_invariant"
+type = "bool"
+initial = "false"
+
+[[state]]
+name = "rum_credentials_exported_to_ssm_per_secret_handling_invariant"
+type = "bool"
+initial = "false"
+
+# --- Browser-side contract bools ---
+
+[[state]]
+name = "rum_sdk_loaded_on_react_spa_entry_per_observability_intent"
+type = "bool"
+initial = "false"
+
+[[state]]
+name = "rum_sdk_loaded_on_static_landing_entries_per_observability_intent"
+type = "bool"
+initial = "false"
+
+# --- Cross-cutting naming invariant ---
+
+[[state]]
+name = "rum_service_tag_is_grug_web_canonical_per_dd_naming_canon"
+type = "bool"
+initial = "false"
+
+[[action]]
+name = "AttestPulumiRegistration"
+kind = "input"
+from = ["NotInstrumented"]
+params = ["attestor"]
+guard = "is_false rum_credentials_exported_to_ssm_per_secret_handling_invariant"
+effect = [
+  { type = "set_bool", var = "rum_application_declared_in_pulumi_per_iac_invariant", value = true },
+  { type = "set_bool", var = "rum_credentials_exported_to_ssm_per_secret_handling_invariant", value = true },
+]
+hint = "infra/pulumi/__main__.py declares a `datadog.RumApplication` resource for grug.lol AND writes its applicationId + clientToken to `/grug/dd-rum-application-id` and `/grug/dd-rum-client-token` SSM SecureStrings. Credentials are NOT hardcoded in any web/** file; build-time injection reads from SSM via the web.deploy.yml workflow."
+
+[[action]]
+name = "AttestSpaSdkLoaded"
+kind = "input"
+from = ["NotInstrumented"]
+params = ["attestor"]
+guard = "is_false rum_sdk_loaded_on_react_spa_entry_per_observability_intent"
+effect = [
+  { type = "set_bool", var = "rum_sdk_loaded_on_react_spa_entry_per_observability_intent", value = true },
+]
+hint = "web/app.html is the Vite SPA entry. RUM init happens via `@datadog/browser-rum` npm package imported from web/src/rum.ts, which is imported by web/src/main.tsx BEFORE the React tree mounts. Verified by grep + AST parse of the entry chain — not just `<script>` tag presence."
+
+[[action]]
+name = "AttestStaticSdkLoaded"
+kind = "input"
+from = ["NotInstrumented"]
+params = ["attestor"]
+guard = "is_false rum_sdk_loaded_on_static_landing_entries_per_observability_intent"
+effect = [
+  { type = "set_bool", var = "rum_sdk_loaded_on_static_landing_entries_per_observability_intent", value = true },
+]
+hint = "All three static HTML files (web/public/{index,Privacy,Terms}.html) contain the DD RUM CDN init snippet. The snippet references `datadoghq-browser-agent.com`, calls `DD_RUM.init(...)`, and uses build-time-substituted placeholders (`__DD_RUM_APPLICATION_ID__`, `__DD_RUM_CLIENT_TOKEN__`, `__DD_RUM_ENV__`, `__DD_RUM_VERSION__`) replaced by web.deploy.yml during the Vite build copy step. Missing on ANY of the three = fail."
+
+[[action]]
+name = "AttestServiceTagCanonical"
+kind = "input"
+from = ["NotInstrumented"]
+params = ["attestor"]
+guard = "is_false rum_service_tag_is_grug_web_canonical_per_dd_naming_canon"
+effect = [
+  { type = "set_bool", var = "rum_service_tag_is_grug_web_canonical_per_dd_naming_canon", value = true },
+]
+hint = "Both the SPA init (web/src/rum.ts) AND every static-HTML CDN snippet pass `service: 'grug-web'` to DD_RUM.init(). Wrong/missing service tag causes DD to split the project across phantom service identities in the APM catalog (peer to the `aws.lambda.url` inferred-spans trap closed in 2026-05-07)."
+
+[[action]]
+name = "Bundle"
+kind = "input"
+from = ["NotInstrumented"]
+to = "Attested"
+params = ["commit_sha"]
+guard = [
+  { type = "is_true", var = "rum_application_declared_in_pulumi_per_iac_invariant" },
+  { type = "is_true", var = "rum_credentials_exported_to_ssm_per_secret_handling_invariant" },
+  { type = "is_true", var = "rum_sdk_loaded_on_react_spa_entry_per_observability_intent" },
+  { type = "is_true", var = "rum_sdk_loaded_on_static_landing_entries_per_observability_intent" },
+  { type = "is_true", var = "rum_service_tag_is_grug_web_canonical_per_dd_naming_canon" },
+]
+hint = "All five contract bools attested. `npm run build` produces dist/{index,Privacy,Terms,app}.html with RUM snippets containing real credential values (placeholders replaced via sed in web.deploy.yml). Only reachable once every grounding attester passes."
+
+[[action]]
+name = "Deploy"
+kind = "input"
+from = ["Attested"]
+to = "Built"
+params = ["commit_sha"]
+hint = "wrangler pages deploy dist/ ships the RUM-instrumented bundle to the grug-web CF Pages project."
+
+[[action]]
+name = "Emit"
+kind = "input"
+from = ["Built"]
+to = "Live"
+params = ["commit_sha"]
+hint = "First real browser visit fires `DD_RUM.init()`, opens a session, starts emitting view / action / error / resource events to https://browser-intake-datadoghq.com. DD APM catalog now shows `service:grug-web` alongside `grug-api` and `grug-webhook`."
+
+[[invariant]]
+name = "MustAttestBeforeBundle"
+assert = "ordering(NotInstrumented, Attested)"
+
+[[invariant]]
+name = "MustBundleBeforeDeploy"
+assert = "ordering(Attested, Built)"
+
+[[invariant]]
+name = "MustDeployBeforeEmit"
+assert = "ordering(Built, Live)"

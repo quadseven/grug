@@ -4,6 +4,36 @@
   <meta charset="utf-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1" />
   <title>Privacy — Grug</title>
+  <!-- Datadog RUM (spec 0013 RumInstrumentation). Placeholders are
+       replaced at build time by web.deploy.yml using values read from
+       SSM /grug/dd-rum-*. When placeholders remain (local preview /
+       missing SSM), init is skipped so the page works either way. -->
+  <script>
+    (function(h,o,u,n,d){h=h[d]=h[d]||{q:[],onReady:function(c){h.q.push(c)}};d=o.createElement(u);d.async=1;d.src=n;n=o.getElementsByTagName(u)[0];n.parentNode.insertBefore(d,n)})(window,document,'script','https://www.datadoghq-browser-agent.com/us1/v6/datadog-rum.js','DD_RUM');
+    window.DD_RUM.onReady(function () {
+      var appId = '__DD_RUM_APPLICATION_ID__';
+      var clientToken = '__DD_RUM_CLIENT_TOKEN__';
+      if (appId.indexOf('__DD_') === 0 || clientToken.indexOf('__DD_') === 0) {
+        console.info('[rum] init skipped — placeholders not substituted (local preview or SSM unset)');
+        return;
+      }
+      window.DD_RUM.init({
+        applicationId: appId,
+        clientToken: clientToken,
+        site: 'datadoghq.com',
+        service: 'grug-web',
+        env: '__DD_RUM_ENV__',
+        version: '__DD_RUM_VERSION__',
+        sessionSampleRate: 100,
+        sessionReplaySampleRate: 100,
+        defaultPrivacyLevel: 'mask-user-input',
+        trackUserInteractions: true,
+        trackResources: true,
+        trackLongTasks: true
+      });
+      window.DD_RUM.startSessionReplayRecording();
+    });
+  </script>
   <link rel="preconnect" href="https://fonts.googleapis.com">
   <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
   <link href="https://fonts.googleapis.com/css2?family=Instrument+Serif:ital@0;1&family=JetBrains+Mono:wght@400;500;700&family=Space+Grotesk:wght@400;500;600;700&display=swap" rel="stylesheet">
