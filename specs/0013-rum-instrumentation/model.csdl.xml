@@ -1,0 +1,101 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!-- Spec 0013 RumInstrumentation — CSDL companion. -->
+<edmx:Edmx Version="4.0" xmlns:edmx="http://docs.oasis-open.org/odata/ns/edmx">
+  <edmx:DataServices>
+
+    <Schema Namespace="Temper.Vocab" xmlns="http://docs.oasis-open.org/odata/ns/edm">
+      <Term Name="StateMachine.States" Type="Collection(Edm.String)" AppliesTo="EntityType"/>
+      <Term Name="StateMachine.InitialState" Type="Edm.String" AppliesTo="EntityType"/>
+      <Term Name="StateMachine.ValidFromStates" Type="Collection(Edm.String)" AppliesTo="Action"/>
+      <Term Name="StateMachine.TargetState" Type="Edm.String" AppliesTo="Action"/>
+      <Term Name="Agent.Hint" Type="Edm.String" AppliesTo="Action EntityType"/>
+      <Term Name="ShardKey" Type="Edm.String" AppliesTo="EntityType"/>
+      <Term Name="AuthZ.CedarPolicy" Type="Edm.String" AppliesTo="EntityType Action"/>
+    </Schema>
+
+    <Schema Namespace="Grug.RumInstrumentation" xmlns="http://docs.oasis-open.org/odata/ns/edm">
+
+      <EnumType Name="RumInstrumentationStatus">
+        <Member Name="NotInstrumented" Value="0"/>
+        <Member Name="Attested" Value="1"/>
+        <Member Name="Built" Value="2"/>
+        <Member Name="Live" Value="3"/>
+      </EnumType>
+
+      <EntityType Name="RumInstrumentation">
+        <Key><PropertyRef Name="CommitSha"/></Key>
+        <Property Name="CommitSha" Type="Edm.String" Nullable="false"/>
+        <Property Name="Status" Type="Grug.RumInstrumentation.RumInstrumentationStatus" Nullable="false"/>
+
+        <Property Name="rum_application_declared_in_pulumi_per_iac_invariant" Type="Edm.Boolean" DefaultValue="false"/>
+        <Property Name="rum_credentials_exported_to_ssm_per_secret_handling_invariant" Type="Edm.Boolean" DefaultValue="false"/>
+        <Property Name="rum_sdk_loaded_on_react_spa_entry_per_observability_intent" Type="Edm.Boolean" DefaultValue="false"/>
+        <Property Name="rum_sdk_loaded_on_static_landing_entries_per_observability_intent" Type="Edm.Boolean" DefaultValue="false"/>
+        <Property Name="rum_service_tag_is_grug_web_canonical_per_dd_naming_canon" Type="Edm.Boolean" DefaultValue="false"/>
+
+        <Annotation Term="Temper.Vocab.StateMachine.States">
+          <Collection><String>NotInstrumented</String><String>Attested</String><String>Built</String><String>Live</String></Collection>
+        </Annotation>
+        <Annotation Term="Temper.Vocab.StateMachine.InitialState" String="NotInstrumented"/>
+        <Annotation Term="Temper.Vocab.ShardKey" String="CommitSha"/>
+        <Annotation Term="Temper.Vocab.AuthZ.CedarPolicy" String="policies/rum.cedar"/>
+      </EntityType>
+
+      <Action Name="AttestPulumiRegistration" IsBound="true">
+        <Parameter Name="bindingParameter" Type="Grug.RumInstrumentation.RumInstrumentation"/>
+        <Parameter Name="attestor" Type="Edm.String" Nullable="false"/>
+        <ReturnType Type="Grug.RumInstrumentation.RumInstrumentation"/>
+        <Annotation Term="Temper.Vocab.StateMachine.ValidFromStates"><Collection><String>NotInstrumented</String></Collection></Annotation>
+      </Action>
+
+      <Action Name="AttestSpaSdkLoaded" IsBound="true">
+        <Parameter Name="bindingParameter" Type="Grug.RumInstrumentation.RumInstrumentation"/>
+        <Parameter Name="attestor" Type="Edm.String" Nullable="false"/>
+        <ReturnType Type="Grug.RumInstrumentation.RumInstrumentation"/>
+        <Annotation Term="Temper.Vocab.StateMachine.ValidFromStates"><Collection><String>NotInstrumented</String></Collection></Annotation>
+      </Action>
+
+      <Action Name="AttestStaticSdkLoaded" IsBound="true">
+        <Parameter Name="bindingParameter" Type="Grug.RumInstrumentation.RumInstrumentation"/>
+        <Parameter Name="attestor" Type="Edm.String" Nullable="false"/>
+        <ReturnType Type="Grug.RumInstrumentation.RumInstrumentation"/>
+        <Annotation Term="Temper.Vocab.StateMachine.ValidFromStates"><Collection><String>NotInstrumented</String></Collection></Annotation>
+      </Action>
+
+      <Action Name="AttestServiceTagCanonical" IsBound="true">
+        <Parameter Name="bindingParameter" Type="Grug.RumInstrumentation.RumInstrumentation"/>
+        <Parameter Name="attestor" Type="Edm.String" Nullable="false"/>
+        <ReturnType Type="Grug.RumInstrumentation.RumInstrumentation"/>
+        <Annotation Term="Temper.Vocab.StateMachine.ValidFromStates"><Collection><String>NotInstrumented</String></Collection></Annotation>
+      </Action>
+
+      <Action Name="Bundle" IsBound="true">
+        <Parameter Name="bindingParameter" Type="Grug.RumInstrumentation.RumInstrumentation"/>
+        <Parameter Name="commit_sha" Type="Edm.String" Nullable="false"/>
+        <ReturnType Type="Grug.RumInstrumentation.RumInstrumentation"/>
+        <Annotation Term="Temper.Vocab.StateMachine.ValidFromStates"><Collection><String>NotInstrumented</String></Collection></Annotation>
+        <Annotation Term="Temper.Vocab.StateMachine.TargetState" String="Attested"/>
+      </Action>
+
+      <Action Name="Deploy" IsBound="true">
+        <Parameter Name="bindingParameter" Type="Grug.RumInstrumentation.RumInstrumentation"/>
+        <Parameter Name="commit_sha" Type="Edm.String" Nullable="false"/>
+        <ReturnType Type="Grug.RumInstrumentation.RumInstrumentation"/>
+        <Annotation Term="Temper.Vocab.StateMachine.ValidFromStates"><Collection><String>Attested</String></Collection></Annotation>
+        <Annotation Term="Temper.Vocab.StateMachine.TargetState" String="Built"/>
+      </Action>
+
+      <Action Name="Emit" IsBound="true">
+        <Parameter Name="bindingParameter" Type="Grug.RumInstrumentation.RumInstrumentation"/>
+        <Parameter Name="commit_sha" Type="Edm.String" Nullable="false"/>
+        <ReturnType Type="Grug.RumInstrumentation.RumInstrumentation"/>
+        <Annotation Term="Temper.Vocab.StateMachine.ValidFromStates"><Collection><String>Built</String></Collection></Annotation>
+        <Annotation Term="Temper.Vocab.StateMachine.TargetState" String="Live"/>
+      </Action>
+
+      <EntityContainer Name="RumInstrumentationService">
+        <EntitySet Name="RumInstrumentations" EntityType="Grug.RumInstrumentation.RumInstrumentation"/>
+      </EntityContainer>
+    </Schema>
+  </edmx:DataServices>
+</edmx:Edmx>

@@ -42,6 +42,13 @@ on:
       - 'web/index.html'
       - 'web/app.html'
       - 'web/vite.config.ts'
+      # Spec 0013 (RumInstrumentation) attesters scan the SPA entry chain
+      # + the static HTML CDN snippets + the Pulumi RUM component.
+      - 'web/src/main.tsx'
+      - 'web/src/rum.ts'
+      - 'web/package.json'
+      - 'infra/pulumi/components/dd_rum.py'
+      - 'infra/pulumi/__main__.py'
       - '.github/workflows/check.temper-specs.yml'
   workflow_dispatch:
 
@@ -172,6 +179,9 @@ jobs:
       - name: Verify spec 0012 (Landing)
         run: ${{ steps.temper-locate.outputs.binary }} verify -s specs/0012-landing/
 
+      - name: Verify spec 0013 (RumInstrumentation)
+        run: ${{ steps.temper-locate.outputs.binary }} verify -s specs/0013-rum-instrumentation/
+
       # ────────────── Grounding attesters ──────────────
       # Each attester PROVES a spec bool against real source. Temper
       # verifies the IOA is internally consistent; attesters close the
@@ -234,3 +244,9 @@ jobs:
 
       - name: Attester · Landing URL-slug canonical — /index.html owns root, no CF Pretty-URLs trap (spec 0012)
         run: python3 infra/scripts/attest_landing_url_slug_canonical.py
+
+      - name: Attester · RUM Pulumi registration + SSM secret-wrap (spec 0013)
+        run: python3 infra/scripts/attest_rum_pulumi_registration.py
+
+      - name: Attester · RUM SDK loaded — SPA chain + 3 static HTML snippets + service:'grug-web' (spec 0013)
+        run: python3 infra/scripts/attest_rum_sdk_in_html.py

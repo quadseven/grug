@@ -4,10 +4,16 @@ import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
 import { createBrowserRouter, RouterProvider } from "react-router-dom";
 
 import "./index.css";
+// Spec 0013: RUM init MUST run before React mounts so the SDK captures
+// the initial view event and any cold-start errors. No-op when env
+// vars are absent (local dev path).
+import { initRum } from "./rum";
 import { Signin } from "./routes/Signin";
 import { Dashboard } from "./routes/Dashboard";
 import { Admin } from "./routes/Admin";
 import { NotFound } from "./routes/NotFound";
+
+initRum();
 
 const queryClient = new QueryClient({
   defaultOptions: {

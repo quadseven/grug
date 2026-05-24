@@ -76,6 +76,24 @@ jobs:
           echo "CLOUDFLARE_API_TOKEN=$CF_API_TOKEN" >> "$GITHUB_ENV"
           echo "CLOUDFLARE_ACCOUNT_ID=$CF_ACCOUNT_ID" >> "$GITHUB_ENV"
 
+          # DD RUM credentials (spec 0013). Both are public-by-design
+          # (they live in the browser bundle) but sourced from SSM so a
+          # rotation is `pulumi up`, not a git commit. Pulumi component
+          # dd_rum.py owns the SSM values. If missing, the build still
+          # succeeds — the RUM init checks for placeholders and no-ops.
+          DD_RUM_APP_ID=$(aws ssm get-parameter \
+            --name /grug/dd-rum-application-id --with-decryption \
+            --query 'Parameter.Value' --output text 2>/dev/null || echo "")
+          DD_RUM_TOKEN=$(aws ssm get-parameter \
+            --name /grug/dd-rum-client-token --with-decryption \
+            --query 'Parameter.Value' --output text 2>/dev/null || echo "")
+          # Mask both — they're not high-sensitivity but masking
+          # prevents accidental log leaks.
+          [ -n "$DD_RUM_APP_ID" ] && echo "::add-mask::$DD_RUM_APP_ID"
+          [ -n "$DD_RUM_TOKEN" ] && echo "::add-mask::$DD_RUM_TOKEN"
+          echo "DD_RUM_APP_ID=$DD_RUM_APP_ID" >> "$GITHUB_ENV"
+          echo "DD_RUM_TOKEN=$DD_RUM_TOKEN" >> "$GITHUB_ENV"
+
       - name: 05. Install deps
         working-directory: web
         run: npm ci --no-audit --no-fund
@@ -84,9 +102,54 @@ jobs:
         working-directory: web
         run: npm run typecheck
 
+      # Vite build consumes VITE_DD_RUM_* env vars and inlines them into
+      # the SPA bundle via web/src/rum.ts (spec 0013). Resolve the deploy
+      # env from the branch: `main` and tags = prod, anything else = dev.
       - name: 07. Build
         working-directory: web
+        env:
+          VITE_DD_RUM_APPLICATION_ID: ${{ env.DD_RUM_APP_ID }}
+          VITE_DD_RUM_CLIENT_TOKEN: ${{ env.DD_RUM_TOKEN }}
+          VITE_DD_RUM_ENV: ${{ (github.ref == 'refs/heads/main' || startsWith(github.ref, 'refs/tags/v')) && 'prod' || 'dev' }}
+          VITE_DD_RUM_VERSION: ${{ github.sha }}
         run: npm run build
+
+      # Substitute the same RUM credentials into the static HTML files
+      # in dist/ (index.html, Privacy.html, Terms.html — the landing +
+      # docs that don't go through Vite's HTML bundling). Spec 0013 bool
+      # `rum_sdk_loaded_on_static_landing_entries_per_observability_intent`.
+      # No-op when DD_RUM_APP_ID is empty so local-preview builds work
+      # without breaking the deploy.
+      - name: 07b. Inject DD RUM credentials into static HTML
+        if: env.DD_RUM_APP_ID != ''
+        working-directory: web/dist
+        env:
+          DD_RUM_ENV: ${{ (github.ref == 'refs/heads/main' || startsWith(github.ref, 'refs/tags/v')) && 'prod' || 'dev' }}
+        run: |
+          set -euo pipefail
+          for html in index.html Privacy.html Terms.html; do
+            if [ ! -f "$html" ]; then
+              echo "::warning::$html missing from dist/ — skipping RUM substitution"
+              continue
+            fi
+            # `|` as sed delimiter so application-id values containing `/`
+            # don't break the regex. -i.bak for macOS portability; .bak
+            # files removed below.
+            sed -i.bak \
+              -e "s|__DD_RUM_APPLICATION_ID__|${DD_RUM_APP_ID}|g" \
+              -e "s|__DD_RUM_CLIENT_TOKEN__|${DD_RUM_TOKEN}|g" \
+              -e "s|__DD_RUM_ENV__|${DD_RUM_ENV}|g" \
+              -e "s|__DD_RUM_VERSION__|${GITHUB_SHA}|g" \
+              "$html"
+            rm -f "$html.bak"
+            # Sanity check — fail loudly if any placeholder survived.
+            if grep -q '__DD_RUM_' "$html"; then
+              echo "::error::placeholder substitution incomplete in $html"
+              grep -n '__DD_RUM_' "$html" | head -5
+              exit 1
+            fi
+          done
+          echo "✓ DD RUM credentials substituted into 3 static HTML files"
 
       - name: 08. Deploy to Cloudflare Pages
         working-directory: web
