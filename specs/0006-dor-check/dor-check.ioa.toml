@@ -80,7 +80,7 @@ effect = [
   { type = "set_bool", var = "result_is_pass_or_fail_only_no_warn_state_per_process_gate_concepts", value = true },
   { type = "set_bool", var = "check_result_is_frozen_dataclass_per_process_gate_concepts", value = true },
 ]
-hint = "Two-state pass/fail only — adding a 'warn' breaks the aggregate_passed biconditional in TpmEvaluation (spec 0002)."
+hint = "Two-state pass/fail only at the CheckResult level. Advisory classification is a rollup-time concern in persona.py (_ADVISORY_CHECKS), not a CheckResult state."
 
 [[action]]
 name = "AttestFunctionShapeContract"
