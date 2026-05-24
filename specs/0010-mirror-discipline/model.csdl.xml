@@ -1,0 +1,103 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!-- Spec 0010 MirrorDiscipline — CSDL companion. -->
+<edmx:Edmx Version="4.0" xmlns:edmx="http://docs.oasis-open.org/odata/ns/edmx">
+  <edmx:DataServices>
+
+    <Schema Namespace="Temper.Vocab" xmlns="http://docs.oasis-open.org/odata/ns/edm">
+      <Term Name="StateMachine.States" Type="Collection(Edm.String)" AppliesTo="EntityType"/>
+      <Term Name="StateMachine.InitialState" Type="Edm.String" AppliesTo="EntityType"/>
+      <Term Name="StateMachine.ValidFromStates" Type="Collection(Edm.String)" AppliesTo="Action"/>
+      <Term Name="StateMachine.TargetState" Type="Edm.String" AppliesTo="Action"/>
+      <Term Name="Agent.Hint" Type="Edm.String" AppliesTo="Action EntityType"/>
+      <Term Name="ShardKey" Type="Edm.String" AppliesTo="EntityType"/>
+      <Term Name="AuthZ.CedarPolicy" Type="Edm.String" AppliesTo="EntityType Action"/>
+    </Schema>
+
+    <Schema Namespace="Grug.MirrorDiscipline" xmlns="http://docs.oasis-open.org/odata/ns/edm">
+
+      <EnumType Name="MirrorDisciplineStatus">
+        <Member Name="Copied" Value="0"/>
+        <Member Name="Drifted" Value="1"/>
+        <Member Name="Synced" Value="2"/>
+        <Member Name="Extracted" Value="3"/>
+      </EnumType>
+
+      <EntityType Name="MirrorDiscipline">
+        <Key><PropertyRef Name="ModulePath"/></Key>
+        <Property Name="ModulePath" Type="Edm.String" Nullable="false"/>
+        <Property Name="Status" Type="Grug.MirrorDiscipline.MirrorDisciplineStatus" Nullable="false"/>
+
+        <Property Name="mirror_with_header_files_carry_line1_mirrored_at_per_cross_service_primitives" Type="Edm.Boolean" DefaultValue="false"/>
+        <Property Name="line1_header_names_correct_sibling_path_per_cross_service_primitives" Type="Edm.Boolean" DefaultValue="false"/>
+        <Property Name="mirror_with_header_files_body_byte_identical_modulo_line1_per_cross_service_primitives" Type="Edm.Boolean" DefaultValue="false"/>
+        <Property Name="mirror_byte_identical_files_full_byte_identical_per_cross_service_primitives" Type="Edm.Boolean" DefaultValue="false"/>
+        <Property Name="drift_lint_runs_on_every_pr_per_cross_service_primitives" Type="Edm.Boolean" DefaultValue="false"/>
+        <Property Name="scripts_check_mirrored_files_sh_is_authoritative_list_per_cross_service_primitives" Type="Edm.Boolean" DefaultValue="false"/>
+        <Property Name="rule_of_three_triggers_extraction_to_services_underscore_shared_per_cross_service_primitives" Type="Edm.Boolean" DefaultValue="false"/>
+
+        <Annotation Term="Temper.Vocab.StateMachine.States">
+          <Collection><String>Copied</String><String>Drifted</String><String>Synced</String><String>Extracted</String></Collection>
+        </Annotation>
+        <Annotation Term="Temper.Vocab.StateMachine.InitialState" String="Copied"/>
+        <Annotation Term="Temper.Vocab.ShardKey" String="ModulePath"/>
+        <Annotation Term="Temper.Vocab.AuthZ.CedarPolicy" String="policies/mirror-discipline.cedar"/>
+      </EntityType>
+
+      <Action Name="AttestHeaderContract" IsBound="true">
+        <Parameter Name="bindingParameter" Type="Grug.MirrorDiscipline.MirrorDiscipline"/>
+        <Parameter Name="attestor" Type="Edm.String" Nullable="false"/>
+        <ReturnType Type="Grug.MirrorDiscipline.MirrorDiscipline"/>
+        <Annotation Term="Temper.Vocab.StateMachine.ValidFromStates"><Collection><String>Copied</String></Collection></Annotation>
+      </Action>
+
+      <Action Name="AttestBodyIdentityContract" IsBound="true">
+        <Parameter Name="bindingParameter" Type="Grug.MirrorDiscipline.MirrorDiscipline"/>
+        <Parameter Name="attestor" Type="Edm.String" Nullable="false"/>
+        <ReturnType Type="Grug.MirrorDiscipline.MirrorDiscipline"/>
+        <Annotation Term="Temper.Vocab.StateMachine.ValidFromStates"><Collection><String>Copied</String></Collection></Annotation>
+      </Action>
+
+      <Action Name="AttestEnforcementContract" IsBound="true">
+        <Parameter Name="bindingParameter" Type="Grug.MirrorDiscipline.MirrorDiscipline"/>
+        <Parameter Name="attestor" Type="Edm.String" Nullable="false"/>
+        <ReturnType Type="Grug.MirrorDiscipline.MirrorDiscipline"/>
+        <Annotation Term="Temper.Vocab.StateMachine.ValidFromStates"><Collection><String>Copied</String></Collection></Annotation>
+      </Action>
+
+      <Action Name="AttestExtractionContract" IsBound="true">
+        <Parameter Name="bindingParameter" Type="Grug.MirrorDiscipline.MirrorDiscipline"/>
+        <Parameter Name="attestor" Type="Edm.String" Nullable="false"/>
+        <ReturnType Type="Grug.MirrorDiscipline.MirrorDiscipline"/>
+        <Annotation Term="Temper.Vocab.StateMachine.ValidFromStates"><Collection><String>Copied</String></Collection></Annotation>
+      </Action>
+
+      <Action Name="Sync" IsBound="true">
+        <Parameter Name="bindingParameter" Type="Grug.MirrorDiscipline.MirrorDiscipline"/>
+        <Parameter Name="pr_number" Type="Edm.String" Nullable="false"/>
+        <ReturnType Type="Grug.MirrorDiscipline.MirrorDiscipline"/>
+        <Annotation Term="Temper.Vocab.StateMachine.ValidFromStates"><Collection><String>Copied</String><String>Drifted</String></Collection></Annotation>
+        <Annotation Term="Temper.Vocab.StateMachine.TargetState" String="Synced"/>
+      </Action>
+
+      <Action Name="Drift" IsBound="true">
+        <Parameter Name="bindingParameter" Type="Grug.MirrorDiscipline.MirrorDiscipline"/>
+        <Parameter Name="pr_number" Type="Edm.String" Nullable="false"/>
+        <ReturnType Type="Grug.MirrorDiscipline.MirrorDiscipline"/>
+        <Annotation Term="Temper.Vocab.StateMachine.ValidFromStates"><Collection><String>Synced</String></Collection></Annotation>
+        <Annotation Term="Temper.Vocab.StateMachine.TargetState" String="Drifted"/>
+      </Action>
+
+      <Action Name="Extract" IsBound="true">
+        <Parameter Name="bindingParameter" Type="Grug.MirrorDiscipline.MirrorDiscipline"/>
+        <Parameter Name="consumer_count" Type="Edm.String" Nullable="false"/>
+        <ReturnType Type="Grug.MirrorDiscipline.MirrorDiscipline"/>
+        <Annotation Term="Temper.Vocab.StateMachine.ValidFromStates"><Collection><String>Synced</String></Collection></Annotation>
+        <Annotation Term="Temper.Vocab.StateMachine.TargetState" String="Extracted"/>
+      </Action>
+
+      <EntityContainer Name="MirrorDisciplineService">
+        <EntitySet Name="MirrorDisciplines" EntityType="Grug.MirrorDiscipline.MirrorDiscipline"/>
+      </EntityContainer>
+    </Schema>
+  </edmx:DataServices>
+</edmx:Edmx>

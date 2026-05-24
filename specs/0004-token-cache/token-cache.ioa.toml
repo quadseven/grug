@@ -1,0 +1,145 @@
+# spec 0004 — TokenCache I/O Automaton
+#
+# Models the AppJWT + InstallToken cache lifecycle. Today's only impl
+# is `InMemoryTokenCache` (per-process); the same lifecycle applies to
+# the planned `DdbTokenCache` (PRD #21 Q17). `with_install_token_retry`
+# is the helper that, on 401, invalidates the cached token, fetches a
+# fresh one, and retries the GitHub API call exactly once.
+#
+# Source of truth: DESIGN.md § "Identity & authorization concepts".
+#
+# Verified by `temper verify -s specs/0004-token-cache/`.
+
+[automaton]
+name = "TokenCache"
+states = ["Empty", "Fresh", "Stale", "Invalidated"]
+initial = "Empty"
+
+# --- TTL contract bools ---
+
+[[state]]
+name = "app_jwt_ttl_is_ten_minutes_per_identity_concepts"
+type = "bool"
+initial = "false"
+
+[[state]]
+name = "install_token_ttl_is_about_one_hour_per_identity_concepts"
+type = "bool"
+initial = "false"
+
+# --- Retry contract bools ---
+
+[[state]]
+name = "with_install_token_retry_invalidates_then_refetches_once_per_identity_concepts"
+type = "bool"
+initial = "false"
+
+[[state]]
+name = "retry_does_not_loop_on_repeated_401_per_identity_concepts"
+type = "bool"
+initial = "false"
+
+# --- Cache key contract bools ---
+
+[[state]]
+name = "token_cache_is_per_installation_keyed_per_identity_concepts"
+type = "bool"
+initial = "false"
+
+[[state]]
+name = "app_jwt_cached_separately_from_install_tokens_per_identity_concepts"
+type = "bool"
+initial = "false"
+
+# --- In-flight refresh counter (at most one refresh per install at a time) ---
+
+[[state]]
+name = "active_refresh_count"
+type = "counter"
+initial = "0"
+
+[[action]]
+name = "AttestTtlContract"
+kind = "input"
+from = ["Empty"]
+params = ["attestor"]
+guard = "is_false install_token_ttl_is_about_one_hour_per_identity_concepts"
+effect = [
+  { type = "set_bool", var = "app_jwt_ttl_is_ten_minutes_per_identity_concepts", value = true },
+  { type = "set_bool", var = "install_token_ttl_is_about_one_hour_per_identity_concepts", value = true },
+]
+hint = "Cache TTLs match GitHub's max (AppJWT=10min, InstallToken≈1h). Cache hands back nothing past TTL."
+
+[[action]]
+name = "AttestRetryContract"
+kind = "input"
+from = ["Empty"]
+params = ["attestor"]
+guard = "is_false retry_does_not_loop_on_repeated_401_per_identity_concepts"
+effect = [
+  { type = "set_bool", var = "with_install_token_retry_invalidates_then_refetches_once_per_identity_concepts", value = true },
+  { type = "set_bool", var = "retry_does_not_loop_on_repeated_401_per_identity_concepts", value = true },
+]
+hint = "with_install_token_retry retries at most ONCE per call. A second 401 propagates — no infinite loop."
+
+[[action]]
+name = "AttestKeyingContract"
+kind = "input"
+from = ["Empty"]
+params = ["attestor"]
+guard = "is_false app_jwt_cached_separately_from_install_tokens_per_identity_concepts"
+effect = [
+  { type = "set_bool", var = "token_cache_is_per_installation_keyed_per_identity_concepts", value = true },
+  { type = "set_bool", var = "app_jwt_cached_separately_from_install_tokens_per_identity_concepts", value = true },
+]
+hint = "One AppJWT shared across all installations; per-install-id InstallToken entries."
+
+[[action]]
+name = "Refresh"
+kind = "input"
+from = ["Empty", "Stale", "Invalidated"]
+to = "Fresh"
+params = ["installation_id"]
+guard = [
+  { type = "is_true", var = "app_jwt_ttl_is_ten_minutes_per_identity_concepts" },
+  { type = "is_true", var = "install_token_ttl_is_about_one_hour_per_identity_concepts" },
+  { type = "is_true", var = "with_install_token_retry_invalidates_then_refetches_once_per_identity_concepts" },
+  { type = "is_true", var = "retry_does_not_loop_on_repeated_401_per_identity_concepts" },
+  { type = "is_true", var = "token_cache_is_per_installation_keyed_per_identity_concepts" },
+  { type = "is_true", var = "app_jwt_cached_separately_from_install_tokens_per_identity_concepts" },
+]
+effect = { type = "increment", var = "active_refresh_count" }
+hint = "POST /app/installations/{id}/access_tokens; populates the cache."
+
+[[action]]
+name = "Settle"
+kind = "input"
+from = ["Fresh"]
+to = "Fresh"
+params = ["installation_id"]
+effect = { type = "decrement", var = "active_refresh_count" }
+hint = "Refresh completed; counter decrements."
+
+[[action]]
+name = "Expire"
+kind = "input"
+from = ["Fresh"]
+to = "Stale"
+params = ["installation_id"]
+hint = "TTL elapsed; cache hands back nothing on the next get."
+
+[[action]]
+name = "Invalidate"
+kind = "input"
+from = ["Fresh", "Stale"]
+to = "Invalidated"
+params = ["installation_id"]
+hint = "with_install_token_retry observed a 401 and explicitly evicted the entry."
+
+[[invariant]]
+name = "AtMostOneInFlightRefresh"
+assert = "active_refresh_count <= 1"
+
+[[invariant]]
+name = "MustRefreshBeforeExpire"
+assert = "ordering(Fresh, Stale)"

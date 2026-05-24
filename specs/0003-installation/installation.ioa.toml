@@ -1,0 +1,145 @@
+# spec 0003 — Installation I/O Automaton
+#
+# Models the GitHub App installation lifecycle. An `Installation` is
+# Grug's grant to act on a GitHub account/org's PRs; the webhook
+# `installation` event drives state. `AllowlistGate` is defense-in-
+# depth: even an active install whose `installed_by_user_id` is not on
+# the allowlist gets refused by the webhook.
+#
+# Source of truth: DESIGN.md § "Identity & authorization concepts" and
+# § "Persistence concepts" (DDB single-table layout).
+#
+# Verified by `temper verify -s specs/0003-installation/`.
+
+[automaton]
+name = "Installation"
+states = ["Pending", "Active", "Suspended", "Uninstalled"]
+initial = "Pending"
+
+# --- Identity contract bools ---
+
+[[state]]
+name = "install_id_is_github_issued_integer_per_identity_concepts"
+type = "bool"
+initial = "false"
+
+[[state]]
+name = "account_type_is_user_or_organization_per_identity_concepts"
+type = "bool"
+initial = "false"
+
+[[state]]
+name = "installed_by_user_id_required_for_allowlist_gate_per_identity_concepts"
+type = "bool"
+initial = "false"
+
+# --- AllowlistGate contract bools ---
+
+[[state]]
+name = "allowlist_gate_blocks_non_allowlisted_user_per_identity_concepts"
+type = "bool"
+initial = "false"
+
+[[state]]
+name = "allowlist_check_is_per_request_not_per_install_per_identity_concepts"
+type = "bool"
+initial = "false"
+
+# --- RepoConfig / persona-toggle contract bools ---
+
+[[state]]
+name = "default_persona_config_dict_is_source_of_truth_per_identity_concepts"
+type = "bool"
+initial = "false"
+
+[[state]]
+name = "repo_config_one_row_per_repo_under_install_pk_per_persistence_concepts"
+type = "bool"
+initial = "false"
+
+[[action]]
+name = "AttestIdentityContract"
+kind = "input"
+from = ["Pending"]
+params = ["attestor"]
+guard = "is_false installed_by_user_id_required_for_allowlist_gate_per_identity_concepts"
+effect = [
+  { type = "set_bool", var = "install_id_is_github_issued_integer_per_identity_concepts", value = true },
+  { type = "set_bool", var = "account_type_is_user_or_organization_per_identity_concepts", value = true },
+  { type = "set_bool", var = "installed_by_user_id_required_for_allowlist_gate_per_identity_concepts", value = true },
+]
+hint = "Installation row fields from the GitHub webhook payload. installed_by_user_id is the join key for AllowlistGate."
+
+[[action]]
+name = "AttestAllowlistGateContract"
+kind = "input"
+from = ["Pending"]
+params = ["attestor"]
+guard = "is_false allowlist_check_is_per_request_not_per_install_per_identity_concepts"
+effect = [
+  { type = "set_bool", var = "allowlist_gate_blocks_non_allowlisted_user_per_identity_concepts", value = true },
+  { type = "set_bool", var = "allowlist_check_is_per_request_not_per_install_per_identity_concepts", value = true },
+]
+hint = "AllowlistGate runs on every webhook request, not once at install-time — allowlist mutations take effect immediately."
+
+[[action]]
+name = "AttestRepoConfigContract"
+kind = "input"
+from = ["Pending"]
+params = ["attestor"]
+guard = "is_false repo_config_one_row_per_repo_under_install_pk_per_persistence_concepts"
+effect = [
+  { type = "set_bool", var = "default_persona_config_dict_is_source_of_truth_per_identity_concepts", value = true },
+  { type = "set_bool", var = "repo_config_one_row_per_repo_under_install_pk_per_persistence_concepts", value = true },
+]
+hint = "RepoConfig schema lives in install_store.py; new personas add a key to _DEFAULT_PERSONA_CONFIG."
+
+[[action]]
+name = "Activate"
+kind = "input"
+from = ["Pending"]
+to = "Active"
+params = ["webhook_delivery_id"]
+guard = [
+  { type = "is_true", var = "install_id_is_github_issued_integer_per_identity_concepts" },
+  { type = "is_true", var = "account_type_is_user_or_organization_per_identity_concepts" },
+  { type = "is_true", var = "installed_by_user_id_required_for_allowlist_gate_per_identity_concepts" },
+  { type = "is_true", var = "allowlist_gate_blocks_non_allowlisted_user_per_identity_concepts" },
+  { type = "is_true", var = "allowlist_check_is_per_request_not_per_install_per_identity_concepts" },
+  { type = "is_true", var = "default_persona_config_dict_is_source_of_truth_per_identity_concepts" },
+  { type = "is_true", var = "repo_config_one_row_per_repo_under_install_pk_per_persistence_concepts" },
+]
+hint = "All contracts attested; webhook accepts events for this install."
+
+[[action]]
+name = "Suspend"
+kind = "input"
+from = ["Active"]
+to = "Suspended"
+params = ["webhook_delivery_id"]
+hint = "GitHub `installation.suspend` webhook — Grug stops processing but row remains for re-activation."
+
+[[action]]
+name = "Reactivate"
+kind = "input"
+from = ["Suspended"]
+to = "Active"
+params = ["webhook_delivery_id"]
+hint = "GitHub `installation.unsuspend` webhook."
+
+[[action]]
+name = "Uninstall"
+kind = "input"
+from = ["Active", "Suspended"]
+to = "Uninstalled"
+params = ["webhook_delivery_id"]
+hint = "GitHub `installation.deleted` webhook; row stays but is terminal."
+
+[[invariant]]
+name = "MustActivateBeforeSuspend"
+assert = "ordering(Active, Suspended)"
+
+[[invariant]]
+name = "UninstalledIsTerminal"
+when = ["Uninstalled"]
+assert = "no_further_transitions"

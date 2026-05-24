@@ -56,7 +56,8 @@ def _full_pr_payload():
 def test_pull_request_dispatches_when_allowlisted():
     with patch("dispatcher.is_install_allowlisted", return_value=True), \
          patch("dispatcher.is_persona_enabled", return_value=True), \
-         patch("personas.tpm.persona.evaluate_pull_request") as mock_eval:
+         patch("personas.tpm.persona.evaluate_pull_request") as mock_eval, \
+         patch("personas.tpm.persona.publish_tpm_evaluation") as _mock_pub:
         mock_eval.return_value = type("R", (), {"passed": True})()
         out = dispatch("pull_request", _full_pr_payload())
     assert out["status"] == "dispatched"
@@ -69,7 +70,8 @@ def test_pull_request_blocked_when_tpm_disabled_for_repo():
     """Slice 7 #28 — per-repo opt-out short-circuits AFTER allowlist."""
     with patch("dispatcher.is_install_allowlisted", return_value=True), \
          patch("dispatcher.is_persona_enabled", return_value=False), \
-         patch("personas.tpm.persona.evaluate_pull_request") as mock_eval:
+         patch("personas.tpm.persona.evaluate_pull_request") as mock_eval, \
+         patch("personas.tpm.persona.publish_tpm_evaluation") as _mock_pub:
         out = dispatch("pull_request", _full_pr_payload())
     assert out["status"] == "no_op" and "tpm disabled" in out["reason"]
     mock_eval.assert_not_called()
@@ -78,7 +80,8 @@ def test_pull_request_blocked_when_tpm_disabled_for_repo():
 def test_pull_request_fail_propagates():
     with patch("dispatcher.is_install_allowlisted", return_value=True), \
          patch("dispatcher.is_persona_enabled", return_value=True), \
-         patch("personas.tpm.persona.evaluate_pull_request") as mock_eval:
+         patch("personas.tpm.persona.evaluate_pull_request") as mock_eval, \
+         patch("personas.tpm.persona.publish_tpm_evaluation") as _mock_pub:
         mock_eval.return_value = type("R", (), {"passed": False})()
         out = dispatch("pull_request", _full_pr_payload())
     assert out["result"] == "fail"
@@ -88,10 +91,49 @@ def test_pull_request_blocked_when_not_allowlisted():
     """Defense-in-depth: non-allowlisted installs no_op silently and
     NEVER reach the TPM evaluator (no GitHub API call, no check-run)."""
     with patch("dispatcher.is_install_allowlisted", return_value=False), \
-         patch("personas.tpm.persona.evaluate_pull_request") as mock_eval:
+         patch("personas.tpm.persona.evaluate_pull_request") as mock_eval, \
+         patch("personas.tpm.persona.publish_tpm_evaluation") as _mock_pub:
         out = dispatch("pull_request", _full_pr_payload())
     assert out["status"] == "no_op" and "not allowlisted" in out["reason"]
     mock_eval.assert_not_called()
+
+
+def test_pull_request_publish_failure_returns_skip_with_log_context():
+    """Peer-review CRITICAL (4x): publish_tpm_evaluation exceptions must
+    NOT propagate uncaught into main.py (which would 500 the webhook
+    with no install/repo/PR coords in the error log). The dispatcher
+    must catch HTTPStatusError + RequestError, log structured fields,
+    and return a `{"status": "skip", "reason": "publish_failed"}` dict."""
+    import httpx
+
+    fake_response = httpx.Response(status_code=502, request=httpx.Request("POST", "https://api.github.com/repos/githumps/infra/check-runs"))
+    publish_error = httpx.HTTPStatusError("502 Bad Gateway", request=fake_response.request, response=fake_response)
+
+    with patch("dispatcher.is_install_allowlisted", return_value=True), \
+         patch("dispatcher.is_persona_enabled", return_value=True), \
+         patch("personas.tpm.persona.evaluate_pull_request") as mock_eval, \
+         patch("personas.tpm.persona.publish_tpm_evaluation", side_effect=publish_error):
+        mock_eval.return_value = type("R", (), {"passed": True})()
+        out = dispatch("pull_request", _full_pr_payload())
+
+    assert out["status"] == "skip"
+    assert out["reason"] == "publish_failed"
+    assert out["persona"] == "tpm"
+
+
+def test_pull_request_publish_transport_error_returns_skip():
+    """Same shape as above for transport-level errors (timeout, DNS, connection-reset)."""
+    import httpx
+
+    with patch("dispatcher.is_install_allowlisted", return_value=True), \
+         patch("dispatcher.is_persona_enabled", return_value=True), \
+         patch("personas.tpm.persona.evaluate_pull_request") as mock_eval, \
+         patch("personas.tpm.persona.publish_tpm_evaluation",
+               side_effect=httpx.ConnectTimeout("timed out", request=None)):
+        mock_eval.return_value = type("R", (), {"passed": True})()
+        out = dispatch("pull_request", _full_pr_payload())
+
+    assert out["status"] == "skip" and out["reason"] == "publish_failed"
 
 
 def test_installation_created_records_row():

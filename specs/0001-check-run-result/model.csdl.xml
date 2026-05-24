@@ -1,0 +1,126 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!--
+  Spec 0001 CheckRunResult — CSDL companion to check-run-result.ioa.toml.
+
+  IMPORTANT: This file MUST be named literally `model.csdl.xml`. The
+  temper kernel hard-codes the filename.
+
+  Mirrors every [[state]] from the IOA as a <Property> and every
+  [[action]] as an <Action>.
+-->
+<edmx:Edmx Version="4.0" xmlns:edmx="http://docs.oasis-open.org/odata/ns/edmx">
+  <edmx:DataServices>
+
+    <Schema Namespace="Temper.Vocab" xmlns="http://docs.oasis-open.org/odata/ns/edm">
+      <Term Name="StateMachine.States" Type="Collection(Edm.String)" AppliesTo="EntityType"/>
+      <Term Name="StateMachine.InitialState" Type="Edm.String" AppliesTo="EntityType"/>
+      <Term Name="StateMachine.ValidFromStates" Type="Collection(Edm.String)" AppliesTo="Action"/>
+      <Term Name="StateMachine.TargetState" Type="Edm.String" AppliesTo="Action"/>
+      <Term Name="Agent.Hint" Type="Edm.String" AppliesTo="Action EntityType"/>
+      <Term Name="ShardKey" Type="Edm.String" AppliesTo="EntityType"/>
+      <Term Name="AuthZ.CedarPolicy" Type="Edm.String" AppliesTo="EntityType Action"/>
+    </Schema>
+
+    <Schema Namespace="Grug.CheckRunResult" xmlns="http://docs.oasis-open.org/odata/ns/edm">
+
+      <EnumType Name="CheckRunResultStatus">
+        <Member Name="Drafted" Value="0"/>
+        <Member Name="Composed" Value="1"/>
+        <Member Name="Posted" Value="2"/>
+        <Member Name="Retired" Value="3"/>
+      </EnumType>
+
+      <EntityType Name="CheckRunResult">
+        <Key>
+          <PropertyRef Name="CheckRunResultId"/>
+        </Key>
+        <Property Name="CheckRunResultId" Type="Edm.String" Nullable="false"/>
+        <Property Name="InstallationId" Type="Edm.String" Nullable="false"/>
+        <Property Name="Status" Type="Grug.CheckRunResult.CheckRunResultStatus" Nullable="false"/>
+
+        <Property Name="conclusion_present_iff_status_completed_per_process_gate_concepts" Type="Edm.Boolean" DefaultValue="false"/>
+        <Property Name="post_init_raises_on_cross_field_violation_per_process_gate_concepts" Type="Edm.Boolean" DefaultValue="false"/>
+        <Property Name="name_field_equals_grug_definition_of_ready_per_process_gate_concepts" Type="Edm.Boolean" DefaultValue="false"/>
+        <Property Name="head_sha_is_pr_head_not_base_per_process_gate_concepts" Type="Edm.Boolean" DefaultValue="false"/>
+        <Property Name="payload_shape_matches_github_checks_api_per_process_gate_concepts" Type="Edm.Boolean" DefaultValue="false"/>
+        <Property Name="frozen_dataclass_no_post_construction_mutation_per_process_gate_concepts" Type="Edm.Boolean" DefaultValue="false"/>
+        <Property Name="output_title_and_summary_required_when_completed_per_process_gate_concepts" Type="Edm.Boolean" DefaultValue="false"/>
+        <Property Name="active_post_count" Type="Edm.Int32" DefaultValue="0"/>
+
+        <Annotation Term="Temper.Vocab.StateMachine.States">
+          <Collection>
+            <String>Drafted</String>
+            <String>Composed</String>
+            <String>Posted</String>
+            <String>Retired</String>
+          </Collection>
+        </Annotation>
+        <Annotation Term="Temper.Vocab.StateMachine.InitialState" String="Drafted"/>
+        <Annotation Term="Temper.Vocab.ShardKey" String="InstallationId"/>
+        <Annotation Term="Temper.Vocab.AuthZ.CedarPolicy" String="policies/check-run-result.cedar"/>
+      </EntityType>
+
+      <Action Name="AttestCrossFieldInvariant" IsBound="true">
+        <Parameter Name="bindingParameter" Type="Grug.CheckRunResult.CheckRunResult"/>
+        <Parameter Name="attestor" Type="Edm.String" Nullable="false"/>
+        <ReturnType Type="Grug.CheckRunResult.CheckRunResult"/>
+        <Annotation Term="Temper.Vocab.StateMachine.ValidFromStates">
+          <Collection><String>Drafted</String></Collection>
+        </Annotation>
+      </Action>
+
+      <Action Name="AttestSchemaContract" IsBound="true">
+        <Parameter Name="bindingParameter" Type="Grug.CheckRunResult.CheckRunResult"/>
+        <Parameter Name="attestor" Type="Edm.String" Nullable="false"/>
+        <ReturnType Type="Grug.CheckRunResult.CheckRunResult"/>
+        <Annotation Term="Temper.Vocab.StateMachine.ValidFromStates">
+          <Collection><String>Drafted</String></Collection>
+        </Annotation>
+      </Action>
+
+      <Action Name="AttestDataclassContract" IsBound="true">
+        <Parameter Name="bindingParameter" Type="Grug.CheckRunResult.CheckRunResult"/>
+        <Parameter Name="attestor" Type="Edm.String" Nullable="false"/>
+        <ReturnType Type="Grug.CheckRunResult.CheckRunResult"/>
+        <Annotation Term="Temper.Vocab.StateMachine.ValidFromStates">
+          <Collection><String>Drafted</String></Collection>
+        </Annotation>
+      </Action>
+
+      <Action Name="Compose" IsBound="true">
+        <Parameter Name="bindingParameter" Type="Grug.CheckRunResult.CheckRunResult"/>
+        <Parameter Name="compose_id" Type="Edm.String" Nullable="false"/>
+        <ReturnType Type="Grug.CheckRunResult.CheckRunResult"/>
+        <Annotation Term="Temper.Vocab.StateMachine.ValidFromStates">
+          <Collection><String>Drafted</String></Collection>
+        </Annotation>
+        <Annotation Term="Temper.Vocab.StateMachine.TargetState" String="Composed"/>
+      </Action>
+
+      <Action Name="Post" IsBound="true">
+        <Parameter Name="bindingParameter" Type="Grug.CheckRunResult.CheckRunResult"/>
+        <Parameter Name="check_run_id" Type="Edm.String" Nullable="false"/>
+        <ReturnType Type="Grug.CheckRunResult.CheckRunResult"/>
+        <Annotation Term="Temper.Vocab.StateMachine.ValidFromStates">
+          <Collection><String>Composed</String></Collection>
+        </Annotation>
+        <Annotation Term="Temper.Vocab.StateMachine.TargetState" String="Posted"/>
+      </Action>
+
+      <Action Name="Retire" IsBound="true">
+        <Parameter Name="bindingParameter" Type="Grug.CheckRunResult.CheckRunResult"/>
+        <Parameter Name="successor_check_run_id" Type="Edm.String" Nullable="false"/>
+        <ReturnType Type="Grug.CheckRunResult.CheckRunResult"/>
+        <Annotation Term="Temper.Vocab.StateMachine.ValidFromStates">
+          <Collection><String>Posted</String></Collection>
+        </Annotation>
+        <Annotation Term="Temper.Vocab.StateMachine.TargetState" String="Retired"/>
+      </Action>
+
+      <EntityContainer Name="CheckRunResultService">
+        <EntitySet Name="CheckRunResults" EntityType="Grug.CheckRunResult.CheckRunResult"/>
+      </EntityContainer>
+
+    </Schema>
+  </edmx:DataServices>
+</edmx:Edmx>

@@ -1,0 +1,128 @@
+# spec 0007 — UserIdentity I/O Automaton
+#
+# Models the identity-only projection of a Grug user row (no token
+# material). Per CONTEXT.md § "Identity & authorization concepts":
+# UserIdentity is the default for `Depends(require_authenticated)` so
+# a stray `log.info("user", extra=user.__dict__)` cannot leak a
+# plaintext OAuth token. Routes that need tokens use UserWithTokens
+# (spec 0008) + the explicit `get_user_with_tokens` getter.
+#
+# Verified by `temper verify -s specs/0007-user-identity/`.
+
+[automaton]
+name = "UserIdentity"
+states = ["Drafted", "Created", "Promoted", "Revoked"]
+initial = "Drafted"
+
+# --- Frozen-dataclass + projection contract bools ---
+
+[[state]]
+name = "frozen_dataclass_no_post_construction_mutation_per_identity_concepts"
+type = "bool"
+initial = "false"
+
+[[state]]
+name = "identity_only_projection_has_no_token_fields_per_identity_concepts"
+type = "bool"
+initial = "false"
+
+# --- Default-state contract bools ---
+
+[[state]]
+name = "defaults_role_user_tier_free_allowlisted_false_per_identity_concepts"
+type = "bool"
+initial = "false"
+
+[[state]]
+name = "created_at_immutable_after_first_write_per_identity_concepts"
+type = "bool"
+initial = "false"
+
+# --- Promotion contract bools ---
+
+[[state]]
+name = "admin_promotion_via_atomic_update_item_per_identity_concepts"
+type = "bool"
+initial = "false"
+
+[[state]]
+name = "upsert_oauth_user_preserves_promoted_state_via_if_not_exists_per_identity_concepts"
+type = "bool"
+initial = "false"
+
+[[action]]
+name = "AttestProjectionContract"
+kind = "input"
+from = ["Drafted"]
+params = ["attestor"]
+guard = "is_false identity_only_projection_has_no_token_fields_per_identity_concepts"
+effect = [
+  { type = "set_bool", var = "frozen_dataclass_no_post_construction_mutation_per_identity_concepts", value = true },
+  { type = "set_bool", var = "identity_only_projection_has_no_token_fields_per_identity_concepts", value = true },
+]
+hint = "UserIdentity is frozen + carries no oauth_*_token attrs. Per #103: routes default to identity-only to make plaintext-token leakage type-impossible."
+
+[[action]]
+name = "AttestDefaultsContract"
+kind = "input"
+from = ["Drafted"]
+params = ["attestor"]
+guard = "is_false created_at_immutable_after_first_write_per_identity_concepts"
+effect = [
+  { type = "set_bool", var = "defaults_role_user_tier_free_allowlisted_false_per_identity_concepts", value = true },
+  { type = "set_bool", var = "created_at_immutable_after_first_write_per_identity_concepts", value = true },
+]
+hint = "New rows default role=user/tier=free/allowlisted=false (gated until admin promotes). created_at is set once via if_not_exists and never overwritten."
+
+[[action]]
+name = "AttestPromotionContract"
+kind = "input"
+from = ["Drafted"]
+params = ["attestor"]
+guard = "is_false upsert_oauth_user_preserves_promoted_state_via_if_not_exists_per_identity_concepts"
+effect = [
+  { type = "set_bool", var = "admin_promotion_via_atomic_update_item_per_identity_concepts", value = true },
+  { type = "set_bool", var = "upsert_oauth_user_preserves_promoted_state_via_if_not_exists_per_identity_concepts", value = true },
+]
+hint = "Admin flips role/tier/allowlisted via update_item with SET (not put_item). upsert_oauth_user uses if_not_exists() on identity fields so concurrent OAuth refresh cannot revert promotion (peer-review CRITICAL — lost-update fix)."
+
+[[action]]
+name = "Create"
+kind = "input"
+from = ["Drafted"]
+to = "Created"
+params = ["github_user_id"]
+guard = [
+  { type = "is_true", var = "frozen_dataclass_no_post_construction_mutation_per_identity_concepts" },
+  { type = "is_true", var = "identity_only_projection_has_no_token_fields_per_identity_concepts" },
+  { type = "is_true", var = "defaults_role_user_tier_free_allowlisted_false_per_identity_concepts" },
+  { type = "is_true", var = "created_at_immutable_after_first_write_per_identity_concepts" },
+  { type = "is_true", var = "admin_promotion_via_atomic_update_item_per_identity_concepts" },
+  { type = "is_true", var = "upsert_oauth_user_preserves_promoted_state_via_if_not_exists_per_identity_concepts" },
+]
+hint = "OAuth callback path: row written via atomic update_item with defaults."
+
+[[action]]
+name = "Promote"
+kind = "input"
+from = ["Created"]
+to = "Promoted"
+params = ["github_user_id"]
+hint = "Admin grants allowlist / lifetime tier / admin role via direct DDB update_item — preserved across OAuth re-auth."
+
+[[action]]
+name = "Revoke"
+kind = "input"
+from = ["Created", "Promoted"]
+to = "Revoked"
+params = ["github_user_id"]
+hint = "Account deletion / hard ban. Row removed; user cannot return without re-OAuth (which lands them back in Created defaults)."
+
+[[invariant]]
+name = "MustCreateBeforePromote"
+assert = "ordering(Created, Promoted)"
+
+[[invariant]]
+name = "RevokedIsTerminal"
+when = ["Revoked"]
+assert = "no_further_transitions"

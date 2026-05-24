@@ -1,0 +1,99 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!-- Spec 0002 TpmEvaluation — CSDL companion. Filename must be `model.csdl.xml`. -->
+<edmx:Edmx Version="4.0" xmlns:edmx="http://docs.oasis-open.org/odata/ns/edmx">
+  <edmx:DataServices>
+
+    <Schema Namespace="Temper.Vocab" xmlns="http://docs.oasis-open.org/odata/ns/edm">
+      <Term Name="StateMachine.States" Type="Collection(Edm.String)" AppliesTo="EntityType"/>
+      <Term Name="StateMachine.InitialState" Type="Edm.String" AppliesTo="EntityType"/>
+      <Term Name="StateMachine.ValidFromStates" Type="Collection(Edm.String)" AppliesTo="Action"/>
+      <Term Name="StateMachine.TargetState" Type="Edm.String" AppliesTo="Action"/>
+      <Term Name="Agent.Hint" Type="Edm.String" AppliesTo="Action EntityType"/>
+      <Term Name="ShardKey" Type="Edm.String" AppliesTo="EntityType"/>
+      <Term Name="AuthZ.CedarPolicy" Type="Edm.String" AppliesTo="EntityType Action"/>
+    </Schema>
+
+    <Schema Namespace="Grug.TpmEvaluation" xmlns="http://docs.oasis-open.org/odata/ns/edm">
+
+      <EnumType Name="TpmEvaluationStatus">
+        <Member Name="Drafted" Value="0"/>
+        <Member Name="Evaluated" Value="1"/>
+        <Member Name="Composed" Value="2"/>
+        <Member Name="Retired" Value="3"/>
+      </EnumType>
+
+      <EntityType Name="TpmEvaluation">
+        <Key><PropertyRef Name="TpmEvaluationId"/></Key>
+        <Property Name="TpmEvaluationId" Type="Edm.String" Nullable="false"/>
+        <Property Name="InstallationId" Type="Edm.String" Nullable="false"/>
+        <Property Name="Status" Type="Grug.TpmEvaluation.TpmEvaluationStatus" Nullable="false"/>
+
+        <Property Name="all_five_dor_checks_executed_per_process_gate_concepts" Type="Edm.Boolean" DefaultValue="false"/>
+        <Property Name="aggregate_passed_iff_all_five_passed_per_process_gate_concepts" Type="Edm.Boolean" DefaultValue="false"/>
+        <Property Name="evaluate_pull_request_is_pure_function_per_process_gate_concepts" Type="Edm.Boolean" DefaultValue="false"/>
+        <Property Name="frozen_dataclass_no_post_construction_mutation_per_process_gate_concepts" Type="Edm.Boolean" DefaultValue="false"/>
+        <Property Name="composes_into_check_run_result_per_process_gate_concepts" Type="Edm.Boolean" DefaultValue="false"/>
+        <Property Name="scope_review_is_advisory_only_does_not_block_per_process_gate_concepts" Type="Edm.Boolean" DefaultValue="false"/>
+        <Property Name="scope_review_absence_does_not_change_aggregate_passed_per_process_gate_concepts" Type="Edm.Boolean" DefaultValue="false"/>
+
+        <Annotation Term="Temper.Vocab.StateMachine.States">
+          <Collection>
+            <String>Drafted</String><String>Evaluated</String><String>Composed</String><String>Retired</String>
+          </Collection>
+        </Annotation>
+        <Annotation Term="Temper.Vocab.StateMachine.InitialState" String="Drafted"/>
+        <Annotation Term="Temper.Vocab.ShardKey" String="InstallationId"/>
+        <Annotation Term="Temper.Vocab.AuthZ.CedarPolicy" String="policies/tpm-evaluation.cedar"/>
+      </EntityType>
+
+      <Action Name="AttestEvaluationContract" IsBound="true">
+        <Parameter Name="bindingParameter" Type="Grug.TpmEvaluation.TpmEvaluation"/>
+        <Parameter Name="attestor" Type="Edm.String" Nullable="false"/>
+        <ReturnType Type="Grug.TpmEvaluation.TpmEvaluation"/>
+        <Annotation Term="Temper.Vocab.StateMachine.ValidFromStates"><Collection><String>Drafted</String></Collection></Annotation>
+      </Action>
+
+      <Action Name="AttestComposeContract" IsBound="true">
+        <Parameter Name="bindingParameter" Type="Grug.TpmEvaluation.TpmEvaluation"/>
+        <Parameter Name="attestor" Type="Edm.String" Nullable="false"/>
+        <ReturnType Type="Grug.TpmEvaluation.TpmEvaluation"/>
+        <Annotation Term="Temper.Vocab.StateMachine.ValidFromStates"><Collection><String>Drafted</String></Collection></Annotation>
+      </Action>
+
+      <Action Name="AttestScopeReviewAdvisoryContract" IsBound="true">
+        <Parameter Name="bindingParameter" Type="Grug.TpmEvaluation.TpmEvaluation"/>
+        <Parameter Name="attestor" Type="Edm.String" Nullable="false"/>
+        <ReturnType Type="Grug.TpmEvaluation.TpmEvaluation"/>
+        <Annotation Term="Temper.Vocab.StateMachine.ValidFromStates"><Collection><String>Drafted</String></Collection></Annotation>
+      </Action>
+
+      <Action Name="Evaluate" IsBound="true">
+        <Parameter Name="bindingParameter" Type="Grug.TpmEvaluation.TpmEvaluation"/>
+        <Parameter Name="pr_number" Type="Edm.String" Nullable="false"/>
+        <ReturnType Type="Grug.TpmEvaluation.TpmEvaluation"/>
+        <Annotation Term="Temper.Vocab.StateMachine.ValidFromStates"><Collection><String>Drafted</String></Collection></Annotation>
+        <Annotation Term="Temper.Vocab.StateMachine.TargetState" String="Evaluated"/>
+      </Action>
+
+      <Action Name="Compose" IsBound="true">
+        <Parameter Name="bindingParameter" Type="Grug.TpmEvaluation.TpmEvaluation"/>
+        <Parameter Name="compose_id" Type="Edm.String" Nullable="false"/>
+        <ReturnType Type="Grug.TpmEvaluation.TpmEvaluation"/>
+        <Annotation Term="Temper.Vocab.StateMachine.ValidFromStates"><Collection><String>Evaluated</String></Collection></Annotation>
+        <Annotation Term="Temper.Vocab.StateMachine.TargetState" String="Composed"/>
+      </Action>
+
+      <Action Name="Retire" IsBound="true">
+        <Parameter Name="bindingParameter" Type="Grug.TpmEvaluation.TpmEvaluation"/>
+        <Parameter Name="successor_pr_head_sha" Type="Edm.String" Nullable="false"/>
+        <ReturnType Type="Grug.TpmEvaluation.TpmEvaluation"/>
+        <Annotation Term="Temper.Vocab.StateMachine.ValidFromStates"><Collection><String>Composed</String></Collection></Annotation>
+        <Annotation Term="Temper.Vocab.StateMachine.TargetState" String="Retired"/>
+      </Action>
+
+      <EntityContainer Name="TpmEvaluationService">
+        <EntitySet Name="TpmEvaluations" EntityType="Grug.TpmEvaluation.TpmEvaluation"/>
+      </EntityContainer>
+    </Schema>
+  </edmx:DataServices>
+</edmx:Edmx>

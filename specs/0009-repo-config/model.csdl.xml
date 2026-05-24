@@ -1,0 +1,100 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!-- Spec 0009 RepoConfig — CSDL companion. -->
+<edmx:Edmx Version="4.0" xmlns:edmx="http://docs.oasis-open.org/odata/ns/edmx">
+  <edmx:DataServices>
+
+    <Schema Namespace="Temper.Vocab" xmlns="http://docs.oasis-open.org/odata/ns/edm">
+      <Term Name="StateMachine.States" Type="Collection(Edm.String)" AppliesTo="EntityType"/>
+      <Term Name="StateMachine.InitialState" Type="Edm.String" AppliesTo="EntityType"/>
+      <Term Name="StateMachine.ValidFromStates" Type="Collection(Edm.String)" AppliesTo="Action"/>
+      <Term Name="StateMachine.TargetState" Type="Edm.String" AppliesTo="Action"/>
+      <Term Name="Agent.Hint" Type="Edm.String" AppliesTo="Action EntityType"/>
+      <Term Name="ShardKey" Type="Edm.String" AppliesTo="EntityType"/>
+      <Term Name="AuthZ.CedarPolicy" Type="Edm.String" AppliesTo="EntityType Action"/>
+    </Schema>
+
+    <Schema Namespace="Grug.RepoConfig" xmlns="http://docs.oasis-open.org/odata/ns/edm">
+
+      <EnumType Name="RepoConfigStatus">
+        <Member Name="Defaulted" Value="0"/>
+        <Member Name="Overridden" Value="1"/>
+        <Member Name="Reset" Value="2"/>
+        <Member Name="Retired" Value="3"/>
+      </EnumType>
+
+      <EntityType Name="RepoConfig">
+        <Key><PropertyRef Name="InstallationRepoKey"/></Key>
+        <Property Name="InstallationRepoKey" Type="Edm.String" Nullable="false"/>
+        <Property Name="InstallationId" Type="Edm.String" Nullable="false"/>
+        <Property Name="RepoId" Type="Edm.String" Nullable="false"/>
+        <Property Name="Status" Type="Grug.RepoConfig.RepoConfigStatus" Nullable="false"/>
+
+        <Property Name="default_persona_config_dict_is_source_of_truth_per_identity_concepts" Type="Edm.Boolean" DefaultValue="false"/>
+        <Property Name="missing_row_returns_defaults_not_none_per_identity_concepts" Type="Edm.Boolean" DefaultValue="false"/>
+        <Property Name="defaults_enabled_explicit_optout_per_identity_concepts" Type="Edm.Boolean" DefaultValue="false"/>
+        <Property Name="repo_config_one_row_per_repo_under_install_pk_per_persistence_concepts" Type="Edm.Boolean" DefaultValue="false"/>
+        <Property Name="set_repo_config_persists_updated_by_user_id_per_identity_concepts" Type="Edm.Boolean" DefaultValue="false"/>
+        <Property Name="adding_persona_extends_default_config_dict_per_identity_concepts" Type="Edm.Boolean" DefaultValue="false"/>
+        <Property Name="is_persona_enabled_lookup_by_persona_underscore_enabled_key_per_identity_concepts" Type="Edm.Boolean" DefaultValue="false"/>
+
+        <Annotation Term="Temper.Vocab.StateMachine.States">
+          <Collection><String>Defaulted</String><String>Overridden</String><String>Reset</String><String>Retired</String></Collection>
+        </Annotation>
+        <Annotation Term="Temper.Vocab.StateMachine.InitialState" String="Defaulted"/>
+        <Annotation Term="Temper.Vocab.ShardKey" String="InstallationId"/>
+        <Annotation Term="Temper.Vocab.AuthZ.CedarPolicy" String="policies/repo-config.cedar"/>
+      </EntityType>
+
+      <Action Name="AttestDefaultsContract" IsBound="true">
+        <Parameter Name="bindingParameter" Type="Grug.RepoConfig.RepoConfig"/>
+        <Parameter Name="attestor" Type="Edm.String" Nullable="false"/>
+        <ReturnType Type="Grug.RepoConfig.RepoConfig"/>
+        <Annotation Term="Temper.Vocab.StateMachine.ValidFromStates"><Collection><String>Defaulted</String></Collection></Annotation>
+      </Action>
+
+      <Action Name="AttestStorageContract" IsBound="true">
+        <Parameter Name="bindingParameter" Type="Grug.RepoConfig.RepoConfig"/>
+        <Parameter Name="attestor" Type="Edm.String" Nullable="false"/>
+        <ReturnType Type="Grug.RepoConfig.RepoConfig"/>
+        <Annotation Term="Temper.Vocab.StateMachine.ValidFromStates"><Collection><String>Defaulted</String></Collection></Annotation>
+      </Action>
+
+      <Action Name="AttestExtensionContract" IsBound="true">
+        <Parameter Name="bindingParameter" Type="Grug.RepoConfig.RepoConfig"/>
+        <Parameter Name="attestor" Type="Edm.String" Nullable="false"/>
+        <ReturnType Type="Grug.RepoConfig.RepoConfig"/>
+        <Annotation Term="Temper.Vocab.StateMachine.ValidFromStates"><Collection><String>Defaulted</String></Collection></Annotation>
+      </Action>
+
+      <Action Name="Override" IsBound="true">
+        <Parameter Name="bindingParameter" Type="Grug.RepoConfig.RepoConfig"/>
+        <Parameter Name="install_id" Type="Edm.String" Nullable="false"/>
+        <Parameter Name="repo_id" Type="Edm.String" Nullable="false"/>
+        <ReturnType Type="Grug.RepoConfig.RepoConfig"/>
+        <Annotation Term="Temper.Vocab.StateMachine.ValidFromStates"><Collection><String>Defaulted</String><String>Reset</String></Collection></Annotation>
+        <Annotation Term="Temper.Vocab.StateMachine.TargetState" String="Overridden"/>
+      </Action>
+
+      <Action Name="Reset" IsBound="true">
+        <Parameter Name="bindingParameter" Type="Grug.RepoConfig.RepoConfig"/>
+        <Parameter Name="install_id" Type="Edm.String" Nullable="false"/>
+        <Parameter Name="repo_id" Type="Edm.String" Nullable="false"/>
+        <ReturnType Type="Grug.RepoConfig.RepoConfig"/>
+        <Annotation Term="Temper.Vocab.StateMachine.ValidFromStates"><Collection><String>Overridden</String></Collection></Annotation>
+        <Annotation Term="Temper.Vocab.StateMachine.TargetState" String="Reset"/>
+      </Action>
+
+      <Action Name="Retire" IsBound="true">
+        <Parameter Name="bindingParameter" Type="Grug.RepoConfig.RepoConfig"/>
+        <Parameter Name="install_id" Type="Edm.String" Nullable="false"/>
+        <ReturnType Type="Grug.RepoConfig.RepoConfig"/>
+        <Annotation Term="Temper.Vocab.StateMachine.ValidFromStates"><Collection><String>Defaulted</String><String>Overridden</String><String>Reset</String></Collection></Annotation>
+        <Annotation Term="Temper.Vocab.StateMachine.TargetState" String="Retired"/>
+      </Action>
+
+      <EntityContainer Name="RepoConfigService">
+        <EntitySet Name="RepoConfigs" EntityType="Grug.RepoConfig.RepoConfig"/>
+      </EntityContainer>
+    </Schema>
+  </edmx:DataServices>
+</edmx:Edmx>

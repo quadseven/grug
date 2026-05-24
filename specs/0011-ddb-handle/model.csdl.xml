@@ -1,0 +1,96 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!-- Spec 0011 DdbHandle — CSDL companion. -->
+<edmx:Edmx Version="4.0" xmlns:edmx="http://docs.oasis-open.org/odata/ns/edmx">
+  <edmx:DataServices>
+
+    <Schema Namespace="Temper.Vocab" xmlns="http://docs.oasis-open.org/odata/ns/edm">
+      <Term Name="StateMachine.States" Type="Collection(Edm.String)" AppliesTo="EntityType"/>
+      <Term Name="StateMachine.InitialState" Type="Edm.String" AppliesTo="EntityType"/>
+      <Term Name="StateMachine.ValidFromStates" Type="Collection(Edm.String)" AppliesTo="Action"/>
+      <Term Name="StateMachine.TargetState" Type="Edm.String" AppliesTo="Action"/>
+      <Term Name="Agent.Hint" Type="Edm.String" AppliesTo="Action EntityType"/>
+      <Term Name="ShardKey" Type="Edm.String" AppliesTo="EntityType"/>
+      <Term Name="AuthZ.CedarPolicy" Type="Edm.String" AppliesTo="EntityType Action"/>
+    </Schema>
+
+    <Schema Namespace="Grug.DdbHandle" xmlns="http://docs.oasis-open.org/odata/ns/edm">
+
+      <EnumType Name="DdbHandleStatus">
+        <Member Name="Empty" Value="0"/>
+        <Member Name="Initializing" Value="1"/>
+        <Member Name="Initialized" Value="2"/>
+        <Member Name="Active" Value="3"/>
+      </EnumType>
+
+      <EntityType Name="DdbHandle">
+        <Key><PropertyRef Name="ModulePath"/></Key>
+        <Property Name="ModulePath" Type="Edm.String" Nullable="false"/>
+        <Property Name="Status" Type="Grug.DdbHandle.DdbHandleStatus" Nullable="false"/>
+
+        <Property Name="lazy_init_avoids_aws_default_region_at_import_per_persistence_concepts" Type="Edm.Boolean" DefaultValue="false"/>
+        <Property Name="init_lock_is_threading_lock_at_module_scope_per_persistence_concepts" Type="Edm.Boolean" DefaultValue="false"/>
+        <Property Name="outer_is_none_check_short_circuits_without_lock_per_persistence_concepts" Type="Edm.Boolean" DefaultValue="false"/>
+        <Property Name="inner_re_check_after_acquire_tests_table_real_specifically_per_persistence_concepts" Type="Edm.Boolean" DefaultValue="false"/>
+        <Property Name="lazy_table_pattern_present_in_api_user_store_per_persistence_concepts" Type="Edm.Boolean" DefaultValue="false"/>
+        <Property Name="lazy_table_pattern_present_in_api_install_store_per_persistence_concepts" Type="Edm.Boolean" DefaultValue="false"/>
+        <Property Name="lazy_table_pattern_present_in_webhook_install_store_per_persistence_concepts" Type="Edm.Boolean" DefaultValue="false"/>
+
+        <Annotation Term="Temper.Vocab.StateMachine.States">
+          <Collection><String>Empty</String><String>Initializing</String><String>Initialized</String><String>Active</String></Collection>
+        </Annotation>
+        <Annotation Term="Temper.Vocab.StateMachine.InitialState" String="Empty"/>
+        <Annotation Term="Temper.Vocab.ShardKey" String="ModulePath"/>
+        <Annotation Term="Temper.Vocab.AuthZ.CedarPolicy" String="policies/ddb-handle.cedar"/>
+      </EntityType>
+
+      <Action Name="AttestLazyInitContract" IsBound="true">
+        <Parameter Name="bindingParameter" Type="Grug.DdbHandle.DdbHandle"/>
+        <Parameter Name="attestor" Type="Edm.String" Nullable="false"/>
+        <ReturnType Type="Grug.DdbHandle.DdbHandle"/>
+        <Annotation Term="Temper.Vocab.StateMachine.ValidFromStates"><Collection><String>Empty</String></Collection></Annotation>
+      </Action>
+
+      <Action Name="AttestDoubleCheckedContract" IsBound="true">
+        <Parameter Name="bindingParameter" Type="Grug.DdbHandle.DdbHandle"/>
+        <Parameter Name="attestor" Type="Edm.String" Nullable="false"/>
+        <ReturnType Type="Grug.DdbHandle.DdbHandle"/>
+        <Annotation Term="Temper.Vocab.StateMachine.ValidFromStates"><Collection><String>Empty</String></Collection></Annotation>
+      </Action>
+
+      <Action Name="AttestCoverageContract" IsBound="true">
+        <Parameter Name="bindingParameter" Type="Grug.DdbHandle.DdbHandle"/>
+        <Parameter Name="attestor" Type="Edm.String" Nullable="false"/>
+        <ReturnType Type="Grug.DdbHandle.DdbHandle"/>
+        <Annotation Term="Temper.Vocab.StateMachine.ValidFromStates"><Collection><String>Empty</String></Collection></Annotation>
+      </Action>
+
+      <Action Name="Initialize" IsBound="true">
+        <Parameter Name="bindingParameter" Type="Grug.DdbHandle.DdbHandle"/>
+        <Parameter Name="table_name" Type="Edm.String" Nullable="false"/>
+        <ReturnType Type="Grug.DdbHandle.DdbHandle"/>
+        <Annotation Term="Temper.Vocab.StateMachine.ValidFromStates"><Collection><String>Empty</String></Collection></Annotation>
+        <Annotation Term="Temper.Vocab.StateMachine.TargetState" String="Initializing"/>
+      </Action>
+
+      <Action Name="Activate" IsBound="true">
+        <Parameter Name="bindingParameter" Type="Grug.DdbHandle.DdbHandle"/>
+        <Parameter Name="table_name" Type="Edm.String" Nullable="false"/>
+        <ReturnType Type="Grug.DdbHandle.DdbHandle"/>
+        <Annotation Term="Temper.Vocab.StateMachine.ValidFromStates"><Collection><String>Initializing</String></Collection></Annotation>
+        <Annotation Term="Temper.Vocab.StateMachine.TargetState" String="Initialized"/>
+      </Action>
+
+      <Action Name="Serve" IsBound="true">
+        <Parameter Name="bindingParameter" Type="Grug.DdbHandle.DdbHandle"/>
+        <Parameter Name="table_name" Type="Edm.String" Nullable="false"/>
+        <ReturnType Type="Grug.DdbHandle.DdbHandle"/>
+        <Annotation Term="Temper.Vocab.StateMachine.ValidFromStates"><Collection><String>Initialized</String><String>Active</String></Collection></Annotation>
+        <Annotation Term="Temper.Vocab.StateMachine.TargetState" String="Active"/>
+      </Action>
+
+      <EntityContainer Name="DdbHandleService">
+        <EntitySet Name="DdbHandles" EntityType="Grug.DdbHandle.DdbHandle"/>
+      </EntityContainer>
+    </Schema>
+  </edmx:DataServices>
+</edmx:Edmx>

@@ -1,0 +1,87 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!-- Spec 0008 UserWithTokens — CSDL companion. -->
+<edmx:Edmx Version="4.0" xmlns:edmx="http://docs.oasis-open.org/odata/ns/edmx">
+  <edmx:DataServices>
+
+    <Schema Namespace="Temper.Vocab" xmlns="http://docs.oasis-open.org/odata/ns/edm">
+      <Term Name="StateMachine.States" Type="Collection(Edm.String)" AppliesTo="EntityType"/>
+      <Term Name="StateMachine.InitialState" Type="Edm.String" AppliesTo="EntityType"/>
+      <Term Name="StateMachine.ValidFromStates" Type="Collection(Edm.String)" AppliesTo="Action"/>
+      <Term Name="StateMachine.TargetState" Type="Edm.String" AppliesTo="Action"/>
+      <Term Name="Agent.Hint" Type="Edm.String" AppliesTo="Action EntityType"/>
+      <Term Name="ShardKey" Type="Edm.String" AppliesTo="EntityType"/>
+      <Term Name="AuthZ.CedarPolicy" Type="Edm.String" AppliesTo="EntityType Action"/>
+    </Schema>
+
+    <Schema Namespace="Grug.UserWithTokens" xmlns="http://docs.oasis-open.org/odata/ns/edm">
+
+      <EnumType Name="UserWithTokensStatus">
+        <Member Name="Drafted" Value="0"/>
+        <Member Name="Decrypted" Value="1"/>
+        <Member Name="Discarded" Value="2"/>
+      </EnumType>
+
+      <EntityType Name="UserWithTokens">
+        <Key><PropertyRef Name="GithubUserId"/></Key>
+        <Property Name="GithubUserId" Type="Edm.String" Nullable="false"/>
+        <Property Name="Status" Type="Grug.UserWithTokens.UserWithTokensStatus" Nullable="false"/>
+
+        <Property Name="frozen_dataclass_no_post_construction_mutation_per_identity_concepts" Type="Edm.Boolean" DefaultValue="false"/>
+        <Property Name="only_constructed_by_api_lambda_get_user_with_tokens_per_identity_concepts" Type="Edm.Boolean" DefaultValue="false"/>
+        <Property Name="webhook_never_constructs_user_with_tokens_per_persistence_concepts" Type="Edm.Boolean" DefaultValue="false"/>
+        <Property Name="kms_decrypt_only_through_decrypt_for_user_per_identity_concepts" Type="Edm.Boolean" DefaultValue="false"/>
+        <Property Name="credential_blob_corrupt_returns_none_not_userwithtokens_per_identity_concepts" Type="Edm.Boolean" DefaultValue="false"/>
+        <Property Name="oauth_access_token_required_oauth_refresh_token_optional_per_identity_concepts" Type="Edm.Boolean" DefaultValue="false"/>
+        <Property Name="no_plaintext_caching_after_decrypt_per_identity_concepts" Type="Edm.Boolean" DefaultValue="false"/>
+
+        <Annotation Term="Temper.Vocab.StateMachine.States">
+          <Collection><String>Drafted</String><String>Decrypted</String><String>Discarded</String></Collection>
+        </Annotation>
+        <Annotation Term="Temper.Vocab.StateMachine.InitialState" String="Drafted"/>
+        <Annotation Term="Temper.Vocab.ShardKey" String="GithubUserId"/>
+        <Annotation Term="Temper.Vocab.AuthZ.CedarPolicy" String="policies/user-with-tokens.cedar"/>
+      </EntityType>
+
+      <Action Name="AttestConstructionContract" IsBound="true">
+        <Parameter Name="bindingParameter" Type="Grug.UserWithTokens.UserWithTokens"/>
+        <Parameter Name="attestor" Type="Edm.String" Nullable="false"/>
+        <ReturnType Type="Grug.UserWithTokens.UserWithTokens"/>
+        <Annotation Term="Temper.Vocab.StateMachine.ValidFromStates"><Collection><String>Drafted</String></Collection></Annotation>
+      </Action>
+
+      <Action Name="AttestDecryptBoundary" IsBound="true">
+        <Parameter Name="bindingParameter" Type="Grug.UserWithTokens.UserWithTokens"/>
+        <Parameter Name="attestor" Type="Edm.String" Nullable="false"/>
+        <ReturnType Type="Grug.UserWithTokens.UserWithTokens"/>
+        <Annotation Term="Temper.Vocab.StateMachine.ValidFromStates"><Collection><String>Drafted</String></Collection></Annotation>
+      </Action>
+
+      <Action Name="AttestFieldContract" IsBound="true">
+        <Parameter Name="bindingParameter" Type="Grug.UserWithTokens.UserWithTokens"/>
+        <Parameter Name="attestor" Type="Edm.String" Nullable="false"/>
+        <ReturnType Type="Grug.UserWithTokens.UserWithTokens"/>
+        <Annotation Term="Temper.Vocab.StateMachine.ValidFromStates"><Collection><String>Drafted</String></Collection></Annotation>
+      </Action>
+
+      <Action Name="Decrypt" IsBound="true">
+        <Parameter Name="bindingParameter" Type="Grug.UserWithTokens.UserWithTokens"/>
+        <Parameter Name="github_user_id" Type="Edm.String" Nullable="false"/>
+        <ReturnType Type="Grug.UserWithTokens.UserWithTokens"/>
+        <Annotation Term="Temper.Vocab.StateMachine.ValidFromStates"><Collection><String>Drafted</String></Collection></Annotation>
+        <Annotation Term="Temper.Vocab.StateMachine.TargetState" String="Decrypted"/>
+      </Action>
+
+      <Action Name="Discard" IsBound="true">
+        <Parameter Name="bindingParameter" Type="Grug.UserWithTokens.UserWithTokens"/>
+        <Parameter Name="github_user_id" Type="Edm.String" Nullable="false"/>
+        <ReturnType Type="Grug.UserWithTokens.UserWithTokens"/>
+        <Annotation Term="Temper.Vocab.StateMachine.ValidFromStates"><Collection><String>Decrypted</String></Collection></Annotation>
+        <Annotation Term="Temper.Vocab.StateMachine.TargetState" String="Discarded"/>
+      </Action>
+
+      <EntityContainer Name="UserWithTokensService">
+        <EntitySet Name="UserWithTokenss" EntityType="Grug.UserWithTokens.UserWithTokens"/>
+      </EntityContainer>
+    </Schema>
+  </edmx:DataServices>
+</edmx:Edmx>

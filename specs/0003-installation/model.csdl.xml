@@ -1,0 +1,107 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!-- Spec 0003 Installation — CSDL companion. Filename must be `model.csdl.xml`. -->
+<edmx:Edmx Version="4.0" xmlns:edmx="http://docs.oasis-open.org/odata/ns/edmx">
+  <edmx:DataServices>
+
+    <Schema Namespace="Temper.Vocab" xmlns="http://docs.oasis-open.org/odata/ns/edm">
+      <Term Name="StateMachine.States" Type="Collection(Edm.String)" AppliesTo="EntityType"/>
+      <Term Name="StateMachine.InitialState" Type="Edm.String" AppliesTo="EntityType"/>
+      <Term Name="StateMachine.ValidFromStates" Type="Collection(Edm.String)" AppliesTo="Action"/>
+      <Term Name="StateMachine.TargetState" Type="Edm.String" AppliesTo="Action"/>
+      <Term Name="Agent.Hint" Type="Edm.String" AppliesTo="Action EntityType"/>
+      <Term Name="ShardKey" Type="Edm.String" AppliesTo="EntityType"/>
+      <Term Name="AuthZ.CedarPolicy" Type="Edm.String" AppliesTo="EntityType Action"/>
+    </Schema>
+
+    <Schema Namespace="Grug.Installation" xmlns="http://docs.oasis-open.org/odata/ns/edm">
+
+      <EnumType Name="InstallationStatus">
+        <Member Name="Pending" Value="0"/>
+        <Member Name="Active" Value="1"/>
+        <Member Name="Suspended" Value="2"/>
+        <Member Name="Uninstalled" Value="3"/>
+      </EnumType>
+
+      <EntityType Name="Installation">
+        <Key><PropertyRef Name="InstallationId"/></Key>
+        <Property Name="InstallationId" Type="Edm.String" Nullable="false"/>
+        <Property Name="InstalledByUserId" Type="Edm.String" Nullable="false"/>
+        <Property Name="Status" Type="Grug.Installation.InstallationStatus" Nullable="false"/>
+
+        <Property Name="install_id_is_github_issued_integer_per_identity_concepts" Type="Edm.Boolean" DefaultValue="false"/>
+        <Property Name="account_type_is_user_or_organization_per_identity_concepts" Type="Edm.Boolean" DefaultValue="false"/>
+        <Property Name="installed_by_user_id_required_for_allowlist_gate_per_identity_concepts" Type="Edm.Boolean" DefaultValue="false"/>
+        <Property Name="allowlist_gate_blocks_non_allowlisted_user_per_identity_concepts" Type="Edm.Boolean" DefaultValue="false"/>
+        <Property Name="allowlist_check_is_per_request_not_per_install_per_identity_concepts" Type="Edm.Boolean" DefaultValue="false"/>
+        <Property Name="default_persona_config_dict_is_source_of_truth_per_identity_concepts" Type="Edm.Boolean" DefaultValue="false"/>
+        <Property Name="repo_config_one_row_per_repo_under_install_pk_per_persistence_concepts" Type="Edm.Boolean" DefaultValue="false"/>
+
+        <Annotation Term="Temper.Vocab.StateMachine.States">
+          <Collection>
+            <String>Pending</String><String>Active</String><String>Suspended</String><String>Uninstalled</String>
+          </Collection>
+        </Annotation>
+        <Annotation Term="Temper.Vocab.StateMachine.InitialState" String="Pending"/>
+        <Annotation Term="Temper.Vocab.ShardKey" String="InstallationId"/>
+        <Annotation Term="Temper.Vocab.AuthZ.CedarPolicy" String="policies/installation.cedar"/>
+      </EntityType>
+
+      <Action Name="AttestIdentityContract" IsBound="true">
+        <Parameter Name="bindingParameter" Type="Grug.Installation.Installation"/>
+        <Parameter Name="attestor" Type="Edm.String" Nullable="false"/>
+        <ReturnType Type="Grug.Installation.Installation"/>
+        <Annotation Term="Temper.Vocab.StateMachine.ValidFromStates"><Collection><String>Pending</String></Collection></Annotation>
+      </Action>
+
+      <Action Name="AttestAllowlistGateContract" IsBound="true">
+        <Parameter Name="bindingParameter" Type="Grug.Installation.Installation"/>
+        <Parameter Name="attestor" Type="Edm.String" Nullable="false"/>
+        <ReturnType Type="Grug.Installation.Installation"/>
+        <Annotation Term="Temper.Vocab.StateMachine.ValidFromStates"><Collection><String>Pending</String></Collection></Annotation>
+      </Action>
+
+      <Action Name="AttestRepoConfigContract" IsBound="true">
+        <Parameter Name="bindingParameter" Type="Grug.Installation.Installation"/>
+        <Parameter Name="attestor" Type="Edm.String" Nullable="false"/>
+        <ReturnType Type="Grug.Installation.Installation"/>
+        <Annotation Term="Temper.Vocab.StateMachine.ValidFromStates"><Collection><String>Pending</String></Collection></Annotation>
+      </Action>
+
+      <Action Name="Activate" IsBound="true">
+        <Parameter Name="bindingParameter" Type="Grug.Installation.Installation"/>
+        <Parameter Name="webhook_delivery_id" Type="Edm.String" Nullable="false"/>
+        <ReturnType Type="Grug.Installation.Installation"/>
+        <Annotation Term="Temper.Vocab.StateMachine.ValidFromStates"><Collection><String>Pending</String></Collection></Annotation>
+        <Annotation Term="Temper.Vocab.StateMachine.TargetState" String="Active"/>
+      </Action>
+
+      <Action Name="Suspend" IsBound="true">
+        <Parameter Name="bindingParameter" Type="Grug.Installation.Installation"/>
+        <Parameter Name="webhook_delivery_id" Type="Edm.String" Nullable="false"/>
+        <ReturnType Type="Grug.Installation.Installation"/>
+        <Annotation Term="Temper.Vocab.StateMachine.ValidFromStates"><Collection><String>Active</String></Collection></Annotation>
+        <Annotation Term="Temper.Vocab.StateMachine.TargetState" String="Suspended"/>
+      </Action>
+
+      <Action Name="Reactivate" IsBound="true">
+        <Parameter Name="bindingParameter" Type="Grug.Installation.Installation"/>
+        <Parameter Name="webhook_delivery_id" Type="Edm.String" Nullable="false"/>
+        <ReturnType Type="Grug.Installation.Installation"/>
+        <Annotation Term="Temper.Vocab.StateMachine.ValidFromStates"><Collection><String>Suspended</String></Collection></Annotation>
+        <Annotation Term="Temper.Vocab.StateMachine.TargetState" String="Active"/>
+      </Action>
+
+      <Action Name="Uninstall" IsBound="true">
+        <Parameter Name="bindingParameter" Type="Grug.Installation.Installation"/>
+        <Parameter Name="webhook_delivery_id" Type="Edm.String" Nullable="false"/>
+        <ReturnType Type="Grug.Installation.Installation"/>
+        <Annotation Term="Temper.Vocab.StateMachine.ValidFromStates"><Collection><String>Active</String><String>Suspended</String></Collection></Annotation>
+        <Annotation Term="Temper.Vocab.StateMachine.TargetState" String="Uninstalled"/>
+      </Action>
+
+      <EntityContainer Name="InstallationService">
+        <EntitySet Name="Installations" EntityType="Grug.Installation.Installation"/>
+      </EntityContainer>
+    </Schema>
+  </edmx:DataServices>
+</edmx:Edmx>

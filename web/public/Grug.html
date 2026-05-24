@@ -1,0 +1,1764 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>Grug — Grug crush bug. Grug guard code. Grug run project.</title>
+  <link rel="preconnect" href="https://fonts.googleapis.com">
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+  <link href="https://fonts.googleapis.com/css2?family=Instrument+Serif:ital@0;1&family=JetBrains+Mono:wght@400;500;700&family=Space+Grotesk:wght@400;500;600;700&display=swap" rel="stylesheet">
+  <link rel="icon" type="image/x-icon" href="/favicon.ico">
+  <link rel="icon" type="image/png" sizes="32x32" href="/favicon-32.png">
+  <link rel="icon" type="image/png" sizes="16x16" href="/favicon-16.png">
+  <link rel="apple-touch-icon" sizes="180x180" href="/favicon-180.png">
+  <meta name="theme-color" content="#faf6ee">
+  <style>
+    :root{
+      --bg:#faf6ee;
+      --bg-2:#f3ecdb;
+      --ink:#181613;
+      --ink-2:#3a342c;
+      --muted:#7a7064;
+      --line:#181613;
+      --amber:#fbbf24;
+      --amber-deep:#d97706;
+      --tomato:#e0502a;
+      --moss:#3f6b3a;
+      --sky:#2e5d8a;
+      --paper:#fffbf2;
+      --shadow: 6px 6px 0 0 var(--ink);
+      --shadow-sm: 3px 3px 0 0 var(--ink);
+      --shadow-lg: 10px 10px 0 0 var(--ink);
+    }
+    *{box-sizing:border-box}
+    html,body{margin:0;padding:0}
+    body{
+      background:var(--bg);
+      color:var(--ink);
+      font-family:'Space Grotesk', system-ui, sans-serif;
+      font-size:16px;
+      line-height:1.5;
+      -webkit-font-smoothing:antialiased;
+    }
+    .mono{font-family:'JetBrains Mono', ui-monospace, monospace;}
+    .serif{font-family:'Instrument Serif', 'Times New Roman', serif; font-weight:400; letter-spacing:-0.01em;}
+
+    /* ---------- Top tape ---------- */
+    .tape{
+      background:var(--ink); color:var(--bg);
+      font-family:'JetBrains Mono', monospace;
+      font-size:12px;
+      padding:8px 0;
+      overflow:hidden;
+      white-space:nowrap;
+      border-bottom:2px solid var(--ink);
+    }
+    .tape-track{ display:inline-block; padding-left:100%; animation:scroll 40s linear infinite; }
+    .tape span{ margin:0 24px; }
+    .tape .dot{color:var(--amber); margin:0 12px;}
+    @keyframes scroll{ from{transform:translateX(0)} to{transform:translateX(-100%)} }
+
+    /* ---------- Header ---------- */
+    header.nav{
+      position:sticky; top:0; z-index:40;
+      background:var(--bg);
+      border-bottom:2px solid var(--ink);
+    }
+    .nav-inner{
+      max-width:1240px; margin:0 auto;
+      padding:14px 28px;
+      display:flex; align-items:center; gap:24px;
+    }
+    .brand{
+      display:flex; align-items:center; gap:10px;
+      font-family:'Instrument Serif', serif; font-size:30px; line-height:1;
+      letter-spacing:-0.02em;
+      color:var(--ink); text-decoration:none;
+    }
+    .brand-mark{
+      width:36px; height:36px;
+      background:var(--amber);
+      border:2px solid var(--ink);
+      border-radius:50%;
+      overflow:hidden;
+      display:grid; place-items:center;
+    }
+    .brand-mark img{width:36px; height:36px; object-fit:cover; transform:translateY(2px) scale(1.4);}
+    nav.links{ display:flex; gap:22px; margin-left:auto; align-items:center; }
+    nav.links a{
+      font-family:'JetBrains Mono', monospace;
+      font-size:13px; font-weight:500;
+      color:var(--ink); text-decoration:none;
+      padding:6px 2px;
+      border-bottom:2px solid transparent;
+    }
+    nav.links a:hover{ border-bottom-color:var(--ink); }
+    .btn{
+      display:inline-flex; align-items:center; gap:8px;
+      font-family:'JetBrains Mono', monospace;
+      font-weight:700; font-size:13px;
+      padding:10px 16px;
+      background:var(--ink); color:var(--bg);
+      border:2px solid var(--ink);
+      box-shadow:var(--shadow-sm);
+      cursor:pointer;
+      text-decoration:none;
+      transition: transform .08s, box-shadow .08s;
+    }
+    .btn:hover{ transform:translate(-1px,-1px); box-shadow:4px 4px 0 0 var(--ink); }
+    .btn:active{ transform:translate(2px,2px); box-shadow:1px 1px 0 0 var(--ink); }
+    .btn.primary{ background:var(--amber); color:var(--ink); }
+    .btn.ghost{ background:var(--bg); color:var(--ink); }
+    .btn.lg{ padding:14px 22px; font-size:14px; box-shadow:var(--shadow); }
+    .btn .ico{ width:14px; height:14px; }
+
+    /* ---------- Layout ---------- */
+    html, body{ overflow-x:hidden; }
+    main{ max-width:1240px; margin:0 auto; padding:0 28px; }
+    section{ padding:80px 0; border-bottom:2px solid var(--ink); }
+    section:last-of-type{ border-bottom:none; }
+
+    .eyebrow{
+      font-family:'JetBrains Mono', monospace;
+      font-size:12px; font-weight:700;
+      text-transform:uppercase;
+      letter-spacing:0.12em;
+      color:var(--ink);
+      display:inline-flex; align-items:center; gap:10px;
+      padding:6px 12px;
+      background:var(--amber);
+      border:2px solid var(--ink);
+    }
+    .eyebrow .blob{
+      width:8px; height:8px; background:var(--ink); border-radius:50%;
+      animation: blink 1.6s ease-in-out infinite;
+    }
+    @keyframes blink{ 0%,100%{opacity:1} 50%{opacity:0.2} }
+
+    h1.headline{
+      font-family:'Instrument Serif', serif;
+      font-weight:400;
+      font-size: clamp(48px, 5.2vw, 88px);
+      line-height:0.98;
+      letter-spacing:-0.022em;
+      margin: 22px 0 22px;
+    }
+    h1 .em{ font-style:italic; color:var(--amber-deep); }
+    h1 .strike{
+      position:relative; display:inline-block; color:var(--ink);
+    }
+    h1 .strike::after{
+      content:""; position:absolute; left:-2%; right:-2%; top:55%;
+      height:6px; background:var(--ink); transform:rotate(-2deg);
+    }
+    .lede{
+      font-size:19px; line-height:1.55;
+      max-width:560px;
+      color:var(--ink-2);
+    }
+    .lede .grug-speak{ font-family:'JetBrains Mono', monospace; font-size:14px; background:var(--bg-2); padding:1px 6px; border:1px solid var(--ink); }
+
+    /* ---------- HERO ---------- */
+    .hero{
+      display:grid;
+      grid-template-columns: 1fr 1fr;
+      gap:40px;
+      align-items:center;
+      padding:64px 0 96px;
+      border-bottom:2px solid var(--ink);
+    }
+    .hero > div:first-child{ min-width:0; }
+    .hero-cta{ display:flex; gap:14px; flex-wrap:wrap; margin-top:30px; }
+    .hero-meta{
+      margin-top:28px;
+      display:flex; gap:22px; flex-wrap:wrap;
+      font-family:'JetBrains Mono', monospace; font-size:12px;
+      color:var(--muted);
+    }
+    .hero-meta b{ color:var(--ink); font-weight:700; }
+    .hero-meta .pill{
+      background:var(--bg-2); padding:6px 10px; border:1.5px solid var(--ink);
+    }
+
+    .hero-stage{
+      position:relative;
+      width:100%;
+      aspect-ratio: 1 / 1.05;
+      max-width:520px;
+      margin-left:auto;
+      margin-right:24px;
+    }
+    .hero-bg{
+      position:absolute; inset:0;
+      background:
+        repeating-linear-gradient(45deg, var(--amber) 0 18px, transparent 18px 36px),
+        var(--paper);
+      border:2px solid var(--ink);
+      box-shadow: var(--shadow-lg);
+      overflow:hidden;
+    }
+    .hero-bg::before{
+      content:""; position:absolute; inset:14px;
+      border:2px solid var(--ink);
+      background:var(--paper);
+    }
+    .grug-img{
+      position:absolute;
+      left:50%; top:54%;
+      transform: translate(-50%, -50%) rotate(-2deg);
+      width:88%;
+      filter: drop-shadow(8px 10px 0 rgba(0,0,0,0.15));
+      z-index:2;
+      pointer-events:none;
+    }
+
+    /* angry sticker */
+    .angry-sticker{
+      position:absolute; z-index:3;
+      top:-22px; left:-22px;
+      background:var(--tomato); color:#fff;
+      font-family:'JetBrains Mono', monospace;
+      font-weight:700; font-size:13px;
+      padding:10px 14px;
+      border:2px solid var(--ink);
+      box-shadow:var(--shadow-sm);
+      transform:rotate(-8deg);
+    }
+    .angry-sticker::after{
+      content:""; position:absolute; right:14px; bottom:-10px;
+      width:0;height:0;
+      border-left:10px solid transparent;
+      border-right:10px solid transparent;
+      border-top:10px solid var(--tomato);
+      filter: drop-shadow(0 1px 0 var(--ink));
+    }
+
+    /* DoR card floats over Grug */
+    .dor-card{
+      position:absolute; z-index:4;
+      left:-44px; bottom:-36px;
+      width:380px; max-width:80%;
+      background:var(--paper);
+      border:2px solid var(--ink);
+      box-shadow:var(--shadow);
+      transform: rotate(-1.5deg);
+    }
+    .dor-head{
+      display:flex; align-items:center; gap:10px;
+      padding:10px 14px;
+      border-bottom:2px solid var(--ink);
+      background:var(--bg-2);
+      font-family:'JetBrains Mono', monospace; font-size:12px; font-weight:700;
+    }
+    .dor-head .traffic{ display:flex; gap:6px; }
+    .dor-head .traffic i{ width:10px;height:10px;border:1.5px solid var(--ink);border-radius:50%; }
+    .dor-head .traffic i:nth-child(1){background:#ff5f57}
+    .dor-head .traffic i:nth-child(2){background:#febc2e}
+    .dor-head .traffic i:nth-child(3){background:#28c840}
+    .dor-head .breadcrumb{ color:var(--muted); margin-left:auto; }
+    .dor-title{
+      padding:14px 14px 8px;
+      display:flex; align-items:baseline; gap:10px;
+      font-family:'JetBrains Mono', monospace;
+    }
+    .dor-title .icn{
+      width:18px;height:18px; border:2px solid var(--ink); display:inline-grid; place-items:center;
+      background:var(--tomato); color:#fff; font-weight:700; font-size:12px;
+    }
+    .dor-title h4{ margin:0; font-size:14px; font-weight:700; }
+    .dor-title .stat{ margin-left:auto; font-size:12px; color:var(--ink-2); }
+    .dor-title .stat b{color:var(--tomato);}
+    .dor-table{ width:100%; border-collapse:collapse; font-family:'JetBrains Mono', monospace; font-size:12px; }
+    .dor-table th, .dor-table td{
+      text-align:left; padding:8px 14px;
+      border-top:1px dashed var(--ink);
+    }
+    .dor-table th{ font-size:10px; text-transform:uppercase; letter-spacing:0.1em; color:var(--muted); border-top:2px solid var(--ink); }
+    .dor-table td.k{ width:108px; }
+    .dor-table .tag{
+      display:inline-block; font-size:10px; font-weight:700;
+      padding:2px 6px; margin-left:6px;
+      border:1.5px solid var(--ink);
+      vertical-align:1px;
+    }
+    .tag.block{ background:var(--tomato); color:#fff; }
+    .tag.warn{ background:var(--amber); color:var(--ink); }
+    .tag.ok{ background:var(--moss); color:#fff; }
+    .check{ width:14px; height:14px; display:inline-block; vertical-align:-2px; margin-right:6px; }
+
+    .floaty{
+      position:absolute; z-index:5;
+      font-family:'JetBrains Mono', monospace;
+      background:var(--paper); border:2px solid var(--ink);
+      padding:6px 10px; font-size:12px; box-shadow:var(--shadow-sm);
+    }
+    .floaty.top-r{ top:32px; right:-18px; transform:rotate(4deg); background:var(--amber); z-index:6; }
+    .floaty.mid-r{ top:46%; right:-24px; transform:rotate(-3deg); z-index:6; }
+
+    /* ---------- Logos strip ---------- */
+    .logos{
+      padding:28px 0;
+      border-top:2px solid var(--ink);
+      border-bottom:2px solid var(--ink);
+      display:flex; align-items:center; gap:36px; flex-wrap:wrap;
+      font-family:'JetBrains Mono', monospace; font-size:12px;
+      color:var(--ink-2);
+    }
+    .logos b{ color:var(--ink); }
+    .logos .sep{ width:6px; height:6px; background:var(--ink); border-radius:50%; }
+
+    /* ---------- Section heads ---------- */
+    .sec-head{ display:flex; align-items:end; justify-content:space-between; gap:24px; flex-wrap:wrap; margin-bottom:48px; }
+    .sec-head h2{
+      font-family:'Instrument Serif', serif; font-weight:400;
+      font-size: clamp(40px, 5vw, 72px);
+      line-height:0.96; letter-spacing:-0.02em;
+      margin:14px 0 0 0;
+      max-width:760px;
+    }
+    .sec-head h2 em{ color:var(--amber-deep); }
+    .sec-head .aside{
+      max-width:340px; font-size:14px; color:var(--ink-2);
+      font-family:'JetBrains Mono', monospace;
+    }
+
+    /* ---------- Features grid ---------- */
+    .feat-grid{
+      display:grid; grid-template-columns: repeat(12, 1fr); gap:0;
+      border:2px solid var(--ink);
+      box-shadow:var(--shadow);
+      background:var(--paper);
+    }
+    .feat{
+      padding:32px 30px;
+      border-right:2px solid var(--ink);
+      border-bottom:2px solid var(--ink);
+      position:relative;
+      min-height:280px;
+      display:flex; flex-direction:column;
+    }
+    .feat:nth-child(1){ grid-column: span 7; background:var(--paper); }
+    .feat:nth-child(2){ grid-column: span 5; background:var(--bg-2); border-right:none; }
+    .feat:nth-child(3){ grid-column: span 5; background:var(--ink); color:var(--bg); border-bottom:none; }
+    .feat:nth-child(4){ grid-column: span 7; background:var(--amber); border-right:none; border-bottom:none; }
+    .feat .num{
+      font-family:'JetBrains Mono', monospace; font-size:11px; letter-spacing:0.1em;
+      text-transform:uppercase; opacity:0.8;
+    }
+    .feat h3{
+      font-family:'Instrument Serif', serif; font-weight:400;
+      font-size:36px; line-height:1.05; letter-spacing:-0.02em;
+      margin:8px 0 12px;
+    }
+    .feat p{ font-size:14.5px; line-height:1.55; max-width:46ch; margin:0 0 18px; }
+    .feat .visual{ margin-top:auto; }
+
+    /* DoR mini list */
+    .dor-mini{ display:grid; gap:6px; font-family:'JetBrains Mono', monospace; font-size:12.5px; }
+    .dor-mini .row{ display:flex; align-items:center; gap:10px; padding:6px 10px; border:1.5px solid var(--ink); background:var(--paper); }
+    .dor-mini .row.fail{ background:#fde6df; }
+    .dor-mini .row.warn{ background:#fff2cc; }
+    .dor-mini .row.ok{ background:#dff0d6; }
+    .dor-mini .k{ font-weight:700; min-width:96px; }
+    .dor-mini .v{ color:var(--ink-2); flex:1; }
+    .dor-mini .badge{ font-size:10px; padding:2px 6px; border:1.5px solid var(--ink); font-weight:700; }
+
+    /* persona toggles */
+    .persona-list{ display:grid; gap:10px; }
+    .persona{
+      display:flex; align-items:center; gap:14px;
+      padding:12px 14px;
+      background:var(--paper); border:2px solid var(--ink);
+      font-family:'JetBrains Mono', monospace; font-size:13px;
+    }
+    .persona .av{
+      width:34px;height:34px; border:2px solid var(--ink); display:grid; place-items:center;
+      font-size:18px;
+    }
+    .persona .name{ font-weight:700; }
+    .persona .desc{ color:var(--muted); font-size:11px; }
+    .persona .switch{
+      margin-left:auto;
+      width:44px; height:22px; border:2px solid var(--ink); position:relative; background:var(--bg-2);
+    }
+    .persona.on .switch{ background:var(--amber); }
+    .persona .switch::after{
+      content:""; position:absolute; top:1px; left:1px; width:16px; height:16px; background:var(--ink);
+      transition: left .15s;
+    }
+    .persona.on .switch::after{ left:23px; }
+    .persona.soon{ opacity:0.6; }
+    .persona.soon .pill{ font-size:10px; background:var(--ink); color:var(--bg); padding:2px 6px; }
+
+    /* check-run preview (dark feat) */
+    .checkrun{
+      background:#0e0c0a; border:2px solid var(--bg);
+      padding:14px;
+      font-family:'JetBrains Mono', monospace; font-size:12px;
+      color:var(--bg);
+    }
+    .checkrun .ln{ display:flex; gap:10px; padding:3px 0; }
+    .checkrun .ln .ts{ color:#8a7f6f; min-width:46px; }
+    .checkrun .ln.fail{ color:#ff8a6e; }
+    .checkrun .ln.ok{ color:#9fd58a; }
+    .checkrun .ln.amber{ color:var(--amber); }
+
+    /* self-host code block */
+    .codebx{
+      background:var(--paper);
+      border:2px solid var(--ink);
+      padding:14px;
+      font-family:'JetBrains Mono', monospace; font-size:12.5px;
+      box-shadow:var(--shadow-sm);
+    }
+    .codebx .c{ color:var(--muted); }
+    .codebx .k{ color:var(--tomato); font-weight:700; }
+    .codebx .s{ color:var(--moss); }
+
+    /* ---------- Skills marketplace ---------- */
+    .market{ background:var(--bg-2); }
+    .market-grid{
+      display:grid; grid-template-columns: repeat(4, 1fr); gap:24px;
+    }
+    .skill{
+      background:var(--paper);
+      border:2px solid var(--ink);
+      box-shadow:var(--shadow-sm);
+      display:flex; flex-direction:column;
+      transition: transform .12s, box-shadow .12s;
+    }
+    .skill:hover{ transform:translate(-2px,-2px); box-shadow:var(--shadow); }
+    .skill .art{
+      aspect-ratio: 1/1;
+      border-bottom:2px solid var(--ink);
+      position:relative; overflow:hidden;
+      display:grid; place-items:center;
+    }
+    .skill .body{ padding:16px; display:flex; flex-direction:column; gap:6px; flex:1; }
+    .skill .row1{ display:flex; align-items:center; gap:8px; }
+    .skill h4{ font-family:'Instrument Serif', serif; font-size:24px; font-weight:400; margin:0; line-height:1.05; }
+    .skill .tag-mini{
+      font-family:'JetBrains Mono', monospace; font-size:10px; padding:2px 6px;
+      border:1.5px solid var(--ink); font-weight:700;
+    }
+    .skill p{ font-family:'JetBrains Mono', monospace; font-size:12px; color:var(--ink-2); margin:4px 0 0; line-height:1.45; }
+    .skill .foot{
+      display:flex; align-items:center; justify-content:space-between;
+      padding:12px 16px; border-top:2px dashed var(--ink);
+      font-family:'JetBrains Mono', monospace;
+    }
+    .skill .price{ font-weight:700; font-size:14px; }
+    .skill .price.free{ color:var(--moss); }
+    .skill .add{
+      font-size:11px; font-weight:700;
+      padding:6px 10px; border:2px solid var(--ink); background:var(--ink); color:var(--bg);
+      cursor:pointer;
+    }
+    .skill .add:hover{ background:var(--amber); color:var(--ink); }
+
+    /* MANIFESTO STRIP */
+    .manifesto{
+      background:var(--ink); color:var(--bg);
+      border-top:2px solid var(--ink); border-bottom:2px solid var(--ink);
+    }
+    .manifesto-inner{
+      max-width:1240px; margin:0 auto; padding:36px 28px;
+    }
+    .manifesto-eyebrow{
+      display:block; font-family:'JetBrains Mono', monospace;
+      font-size:12px; letter-spacing:0.12em; color:var(--amber);
+      margin-bottom:18px;
+    }
+    .manifesto-grid{
+      display:grid; grid-template-columns:repeat(4,1fr); gap:0;
+      border:2px solid var(--bg);
+    }
+    .manifesto-cell{
+      padding:20px; border-right:2px solid var(--bg);
+    }
+    .manifesto-cell:last-child{ border-right:none; }
+    .manifesto-cell .num{
+      display:block; font-family:'JetBrains Mono', monospace;
+      font-size:11px; color:var(--amber); margin-bottom:10px;
+    }
+    .manifesto-cell h5{
+      margin:0 0 8px; font-family:'Instrument Serif', serif;
+      font-size:24px; font-weight:400; letter-spacing:-0.01em;
+    }
+    .manifesto-cell p{
+      margin:0; font-size:13px; color:#d4cdbf; line-height:1.5;
+    }
+    @media (max-width:760px){
+      .manifesto-grid{ grid-template-columns:repeat(2,1fr); }
+      .manifesto-cell:nth-child(2){ border-right:none; }
+      .manifesto-cell:nth-child(1), .manifesto-cell:nth-child(2){ border-bottom:2px solid var(--bg); }
+    }
+
+    /* mascot variants drawn fresh w/ original components from photo */
+    .mascot{
+      width:80%; aspect-ratio:1/1;
+      position:relative;
+    }
+    .mascot .head{
+      position:absolute; inset:14% 14% 14% 14%;
+      background:#f4e3c4;
+      border:3px solid var(--ink);
+      border-radius:46% 46% 38% 38%;
+    }
+    .mascot .brow{
+      position:absolute; top:36%; left:20%; right:20%; height:6px;
+      background:var(--ink); border-radius:3px;
+      transform:rotate(-4deg);
+    }
+    .mascot .eye{
+      position:absolute; width:8px; height:8px; background:var(--ink); border-radius:50%; top:42%;
+    }
+    .mascot .eye.l{ left:34%; }
+    .mascot .eye.r{ right:34%; }
+    .mascot .mouth{
+      position:absolute; left:42%; right:42%; bottom:30%; height:6px; background:var(--ink); border-radius:3px;
+    }
+    .mascot .vest{
+      position:absolute; left:18%; right:18%; bottom:6%; height:18%;
+      background:var(--tomato); border:3px solid var(--ink);
+      border-radius:50% 50% 0 0 / 80% 80% 0 0;
+    }
+    .mascot .vest::before, .mascot .vest::after{
+      content:""; position:absolute; width:6px; height:6px; background:#7a2410; border-radius:50%;
+      top:30%;
+    }
+    .mascot .vest::before{ left:30%; }
+    .mascot .vest::after{ right:35%; }
+    .mascot.classic{ background: #fff3d6; }
+    .mascot.classic .head{ transform:rotate(-2deg); }
+
+    /* alt variants - we'll layer different accessories */
+    .mascot.pro .vest{ background:#1f2937; border-color:var(--ink); border-radius:0; height:22%; }
+    .mascot.pro .tie{ position:absolute; left:48%; bottom:6%; width:6%; height:18%; background:var(--tomato); border:2px solid var(--ink); }
+    .mascot.pro .mouth{ height:4px; }
+    .mascot.pro{ background:#dde7f0; }
+
+    .mascot.mullet .hair{
+      position:absolute; left:8%; right:8%; top:8%; height:24%;
+      background:var(--ink); border:3px solid var(--ink);
+      border-radius:50% 50% 12% 12%;
+    }
+    .mascot.mullet .tail{
+      position:absolute; right:6%; top:30%; width:14%; height:34%;
+      background:var(--ink); border-radius:8px 30% 8px 8px;
+      transform:rotate(8deg);
+    }
+    .mascot.mullet{ background:#ffe8cf; }
+
+    .mascot.custom{ background:#e8e0ff; }
+    .mascot.custom .crown{
+      position:absolute; left:24%; right:24%; top:6%; height:14%;
+      background:var(--amber); border:3px solid var(--ink);
+      clip-path: polygon(0 100%, 12% 30%, 25% 70%, 38% 10%, 50% 70%, 62% 10%, 75% 70%, 88% 30%, 100% 100%);
+    }
+    .mascot.custom .star{
+      position:absolute; right:8%; top:14%; width:18%; height:18%;
+      background:var(--tomato); border:3px solid var(--ink);
+      clip-path: polygon(50% 0,61% 35%,98% 35%,68% 57%,79% 91%,50% 70%,21% 91%,32% 57%,2% 35%,39% 35%);
+    }
+
+    /* ---------- Dashboard mock ---------- */
+    .dash-section{ background:var(--paper); }
+    .dash-frame{
+      border:2px solid var(--ink);
+      box-shadow:var(--shadow-lg);
+      background:var(--bg);
+      overflow:hidden;
+    }
+    .dash-titlebar{
+      display:flex; align-items:center; gap:10px;
+      padding:10px 16px;
+      border-bottom:2px solid var(--ink);
+      background:var(--ink); color:var(--bg);
+      font-family:'JetBrains Mono', monospace; font-size:12px;
+    }
+    .dash-titlebar .traffic{ display:flex; gap:6px; }
+    .dash-titlebar .traffic i{ width:10px; height:10px; border:1.5px solid var(--bg); border-radius:50%; background:transparent; }
+    .dash-titlebar .url{ background:#2a2520; padding:4px 10px; border:1.5px solid #3a342c; flex:1; max-width:520px; margin-left:8px; color:#cdc2ad; }
+    .dash-titlebar .user{ margin-left:auto; display:flex; align-items:center; gap:8px; }
+    .dash-titlebar .user .av{ width:22px; height:22px; border:1.5px solid var(--bg); border-radius:50%; background:var(--amber); overflow:hidden; }
+    .dash-titlebar .user .av img{width:100%; height:100%; object-fit:cover; transform: scale(1.4) translateY(2px);}
+
+    .dash-grid{
+      display:grid; grid-template-columns: 280px 1fr 320px;
+      min-height:520px;
+    }
+    .dash-col{ padding:18px; border-right:2px solid var(--ink); }
+    .dash-col:last-child{ border-right:none; }
+    .dash-col h5{
+      margin:0 0 14px; font-family:'JetBrains Mono', monospace;
+      font-size:11px; letter-spacing:0.12em; text-transform:uppercase; color:var(--muted);
+      display:flex; align-items:center; justify-content:space-between;
+    }
+    .dash-col h5 .count{
+      background:var(--amber); color:var(--ink); padding:2px 6px; border:1.5px solid var(--ink); font-size:10px;
+    }
+    .repo{
+      display:flex; align-items:center; gap:10px; padding:10px;
+      border:1.5px solid var(--ink); background:var(--paper); margin-bottom:8px;
+      font-family:'JetBrains Mono', monospace; font-size:12px;
+    }
+    .repo .org{
+      width:22px; height:22px; background:var(--ink); color:var(--bg);
+      display:grid; place-items:center; font-size:10px; font-weight:700;
+    }
+    .repo .name{ flex:1; }
+    .repo .name b{ font-weight:700; }
+    .repo .name span{ color:var(--muted); display:block; font-size:10px; }
+    .repo .sw{
+      width:32px; height:18px; border:1.5px solid var(--ink); position:relative; background:var(--bg-2);
+    }
+    .repo.on .sw{ background:var(--moss); }
+    .repo .sw::after{ content:""; position:absolute; top:1px; left:1px; width:13px; height:13px; background:#fff; border:1px solid var(--ink); }
+    .repo.on .sw::after{ left:16px; }
+    .repo.active{ outline: 2px solid var(--amber); outline-offset:1px; }
+
+    .dash-mid{ background:var(--bg-2); }
+    .repo-banner{
+      display:flex; align-items:center; gap:10px; padding:12px 14px;
+      background:var(--paper); border:2px solid var(--ink); margin-bottom:14px;
+      font-family:'JetBrains Mono', monospace; font-size:12.5px;
+    }
+    .repo-banner .badge{ background:var(--amber); padding:2px 8px; border:1.5px solid var(--ink); font-size:11px; font-weight:700; }
+    .persona-card{
+      background:var(--paper); border:2px solid var(--ink); padding:14px; margin-bottom:12px;
+      display:flex; gap:12px; align-items:flex-start;
+    }
+    .persona-card .ic{
+      width:40px; height:40px; border:2px solid var(--ink); background:var(--amber); display:grid; place-items:center;
+      font-family:'Instrument Serif', serif; font-size:22px;
+    }
+    .persona-card .body{ flex:1; }
+    .persona-card .name{ font-family:'JetBrains Mono', monospace; font-weight:700; font-size:13px; }
+    .persona-card .desc{ font-family:'JetBrains Mono', monospace; font-size:11px; color:var(--muted); margin-top:3px; }
+    .persona-card .meta{ display:flex; gap:8px; margin-top:8px; flex-wrap:wrap; font-family:'JetBrains Mono', monospace; font-size:10px; }
+    .persona-card .meta span{ padding:2px 6px; border:1.5px solid var(--ink); }
+    .persona-card .sw{
+      width:38px; height:22px; border:2px solid var(--ink); position:relative; flex-shrink:0; background:var(--bg-2);
+    }
+    .persona-card.on .sw{ background:var(--moss); }
+    .persona-card .sw::after{ content:""; position:absolute; top:1px; left:1px; width:16px; height:16px; background:#fff; border:1px solid var(--ink); }
+    .persona-card.on .sw::after{ left:18px; }
+    .persona-card.soon{ opacity:0.7; }
+
+    .config-card{
+      background:var(--paper); border:2px solid var(--ink); padding:14px; margin-bottom:12px;
+      font-family:'JetBrains Mono', monospace; font-size:12px;
+    }
+    .config-card .label{ font-size:10px; color:var(--muted); text-transform:uppercase; letter-spacing:0.1em; }
+    .config-card .skin-pick{ display:flex; gap:8px; margin-top:8px; flex-wrap:wrap; }
+    .skin-chip{
+      width:48px; aspect-ratio:1/1; border:2px solid var(--ink); cursor:pointer;
+      display:grid; place-items:center; background:var(--paper);
+    }
+    .skin-chip.act{ outline:2px solid var(--amber); outline-offset:2px; }
+    .skin-chip .mascot{ width:130%; }
+    .budget{
+      margin-top:6px; height:14px; background:var(--bg-2); border:1.5px solid var(--ink); position:relative;
+    }
+    .budget i{ display:block; height:100%; background:var(--amber); width:38%; border-right:1.5px solid var(--ink); }
+    .budget span{ position:absolute; right:6px; top:0; line-height:14px; font-size:10px; }
+
+    /* ---------- Pricing ---------- */
+    .pricing{ background:var(--bg-2); }
+    .price-grid{
+      display:grid; grid-template-columns: repeat(4, 1fr); gap:0;
+      border:2px solid var(--ink); box-shadow:var(--shadow);
+      background:var(--paper);
+    }
+    .tier{
+      padding:28px 24px;
+      border-right:2px solid var(--ink);
+      display:flex; flex-direction:column; gap:14px;
+      position:relative;
+    }
+    .tier:last-child{ border-right:none; }
+    .tier.pop{ background:var(--amber); }
+    .tier.pop .stamp{
+      position:absolute; top:-14px; right:18px;
+      background:var(--ink); color:var(--bg);
+      font-family:'JetBrains Mono', monospace; font-size:10px; font-weight:700;
+      padding:4px 10px; border:2px solid var(--ink);
+      transform:rotate(-3deg);
+    }
+    .tier .name{ font-family:'Instrument Serif', serif; font-size:32px; line-height:1; }
+    .tier .price{
+      font-family:'JetBrains Mono', monospace; font-weight:700;
+      display:flex; align-items:baseline; gap:6px;
+    }
+    .tier .price b{ font-size:38px; font-family:'Instrument Serif', serif; font-weight:400; }
+    .tier .price span{ font-size:12px; color:var(--ink-2); }
+    .tier .feats{ list-style:none; padding:0; margin:0; display:grid; gap:8px; font-family:'JetBrains Mono', monospace; font-size:12.5px; }
+    .tier .feats li{ display:flex; gap:8px; align-items:flex-start; }
+    .tier .feats li::before{ content:"+"; font-weight:700; color:var(--ink); }
+    .tier .feats li.no::before{ content:"−"; opacity:0.5; }
+    .tier .feats li.no{ color:var(--muted); }
+    .tier .pick{ margin-top:auto; }
+
+    /* ---------- Testimonials / quotes from Grug ---------- */
+    .grug-quotes{ background:var(--ink); color:var(--bg); }
+    .grug-quotes .sec-head h2{ color:var(--bg); }
+    .grug-quotes .sec-head .aside{ color:#cdc2ad; }
+    .quote-grid{ display:grid; grid-template-columns: repeat(3, 1fr); gap:0; border:2px solid var(--bg); }
+    .quote{ padding:26px; border-right:2px solid var(--bg); }
+    .quote:last-child{ border-right:none; }
+    .quote .q{ font-family:'Instrument Serif', serif; font-style:italic; font-size:24px; line-height:1.2; letter-spacing:-0.01em; }
+    .quote .who{ margin-top:14px; font-family:'JetBrains Mono', monospace; font-size:11px; color:var(--amber); }
+
+    /* ---------- Footer ---------- */
+    footer{
+      background:var(--ink); color:var(--bg);
+      padding:64px 0 24px;
+    }
+    .foot-inner{ max-width:1240px; margin:0 auto; padding:0 28px; }
+    .foot-top{ display:grid; grid-template-columns: 1.4fr 1fr 1fr 1fr; gap:32px; padding-bottom:48px; border-bottom:1px solid #3a342c; }
+    .foot-brand{ font-family:'Instrument Serif', serif; font-size:64px; line-height:1; letter-spacing:-0.02em; }
+    .foot-brand p{ font-family:'JetBrains Mono', monospace; font-size:12px; color:#cdc2ad; max-width:280px; margin:14px 0 0; line-height:1.5; }
+    .foot-col h6{ font-family:'JetBrains Mono', monospace; font-size:11px; letter-spacing:0.12em; text-transform:uppercase; color:var(--amber); margin:0 0 14px; }
+    .foot-col a{ display:block; color:var(--bg); text-decoration:none; font-family:'JetBrains Mono', monospace; font-size:13px; padding:4px 0; }
+    .foot-col a:hover{ color:var(--amber); }
+    .foot-bottom{
+      display:flex; justify-content:space-between; align-items:center;
+      padding-top:20px; flex-wrap:wrap; gap:14px;
+      font-family:'JetBrains Mono', monospace; font-size:11px; color:#cdc2ad;
+    }
+    .foot-bottom a{ color:var(--amber); text-decoration:none; }
+
+    /* ---------- responsive ---------- */
+    @media (max-width: 760px){
+      .hero{ grid-template-columns: 1fr; }
+      .hero-stage{ margin-left:0; margin-right:0; max-width:none; }
+      .floaty.top-r{ right:8px; top:18px; }
+      .floaty.mid-r{ right:8px; top:42%; }
+      .dor-card{ left:8px; right:8px; width:auto; max-width:none; bottom:-24px; }
+      .feat-grid{ grid-template-columns: 1fr; }
+      .feat{ grid-column: span 12 !important; border-right:none !important; }
+      .market-grid{ grid-template-columns: repeat(2,1fr); }
+      .dash-grid{ grid-template-columns: 1fr; }
+      .dash-col{ border-right:none; border-bottom:2px solid var(--ink); }
+      .price-grid{ grid-template-columns: 1fr 1fr; }
+      .tier{ border-bottom:2px solid var(--ink); }
+      .tier:nth-child(odd){ border-right:2px solid var(--ink); }
+      .tier:nth-child(even){ border-right:none; }
+      .quote-grid{ grid-template-columns: 1fr; }
+      .quote{ border-right:none; border-bottom:2px solid var(--bg); }
+      .foot-top{ grid-template-columns: 1fr 1fr; }
+    }
+    @media (max-width: 640px){
+      nav.links{ display:none; }
+      section{ padding:56px 0; }
+      .market-grid{ grid-template-columns: 1fr; }
+      .price-grid{ grid-template-columns: 1fr; }
+      .tier{ border-right:none; }
+    }
+
+    /* SVG checks */
+    .svg-x{ color:var(--tomato); }
+    .svg-ok{ color:var(--moss); }
+    .svg-warn{ color:var(--amber-deep); }
+
+    /* persona roster */
+    .persona-roster{
+      display:grid; grid-template-columns: repeat(3, 1fr); gap:0;
+      border:2px solid var(--ink); box-shadow:var(--shadow);
+      background:var(--paper);
+    }
+    .proster{
+      display:flex; flex-direction:column;
+      border-right:2px solid var(--ink);
+      border-bottom:2px solid var(--ink);
+      background:var(--paper);
+    }
+    .proster:nth-child(3n){ border-right:none; }
+    .proster:nth-last-child(-n+3){ border-bottom:none; }
+    .proster-art{
+      aspect-ratio: 4/2.4;
+      border-bottom:2px solid var(--ink);
+      display:grid; place-items:center; position:relative;
+    }
+    .proster-icon{ width:64px; height:64px; color:var(--ink); display:grid; place-items:center; }
+    .proster-icon svg{ width:100%; height:100%; }
+    .proster-art{ overflow:hidden; }
+    .proster-art img.persona-portrait{
+      width:88%; max-height:108%; object-fit:contain;
+      transform: translateY(8%) rotate(-2deg);
+      filter: drop-shadow(6px 8px 0 rgba(0,0,0,0.12));
+      pointer-events:none;
+    }
+    .proster-art .persona-stamp{
+      position:absolute; top:10px; right:10px;
+      font-family:'JetBrains Mono', monospace; font-size:10px; font-weight:700;
+      padding:3px 8px; background:var(--paper); border:1.5px solid var(--ink);
+      letter-spacing:0.08em;
+    }
+    .proster-body{ padding:20px 22px 22px; display:flex; flex-direction:column; gap:8px; }
+    .proster-tag{ font-family:'JetBrains Mono', monospace; font-size:10px; letter-spacing:0.12em; color:var(--muted); }
+    .proster h3{ font-family:'Instrument Serif', serif; font-weight:400; font-size:30px; line-height:1; letter-spacing:-0.02em; margin:2px 0 4px; }
+    .proster p{ font-size:13.5px; line-height:1.5; color:var(--ink-2); margin:0 0 8px; }
+    .proster-list{ list-style:none; padding:0; margin:0; display:grid; gap:4px; font-family:'JetBrains Mono', monospace; font-size:11.5px; color:var(--ink-2); }
+    .proster-list li{ padding-left:14px; position:relative; }
+    .proster-list li::before{ content:"+"; position:absolute; left:0; color:var(--amber-deep); font-weight:700; }
+    .proster-add{ background:var(--bg-2); }
+    @media (max-width: 980px){
+      .persona-roster{ grid-template-columns: 1fr 1fr; }
+      .proster{ border-right:2px solid var(--ink) !important; border-bottom:2px solid var(--ink) !important; }
+      .proster:nth-child(2n){ border-right:none !important; }
+    }
+    @media (max-width: 640px){
+      .persona-roster{ grid-template-columns: 1fr; }
+      .proster{ border-right:none !important; }
+    }
+  </style>
+</head>
+<body>
+  <!-- scrolling tape -->
+  <div class="tape">
+    <div class="tape-track">
+      <span>GRUG CRUSH BUG.</span><span class="dot">●</span>
+      <span>GRUG BLOCK EVIL CVE.</span><span class="dot">●</span>
+      <span>GRUG GUARD STRONG CODE.</span><span class="dot">●</span>
+      <span>GRUG RUN PROJECT SMOOTH LIKE ROCK.</span><span class="dot">●</span>
+      <span>GRUG KNOW SDLC.</span><span class="dot">●</span>
+      <span>GRUG OPEN SOURCE.</span><span class="dot">●</span>
+      <span>GRUG SELF-HOSTABLE.</span><span class="dot">●</span>
+      <span>GRUG CRUSH BUG.</span><span class="dot">●</span>
+      <span>GRUG BLOCK EVIL CVE.</span><span class="dot">●</span>
+      <span>GRUG GUARD STRONG CODE.</span><span class="dot">●</span>
+      <span>GRUG RUN PROJECT SMOOTH LIKE ROCK.</span><span class="dot">●</span>
+      <span>GRUG KNOW SDLC.</span><span class="dot">●</span>
+    </div>
+  </div>
+
+  <!-- HEADER -->
+  <header class="nav">
+    <div class="nav-inner">
+      <a class="brand" href="#hero" aria-label="Grug home" data-comment-anchor="3189c62282-a">
+        <span class="brand-mark"><img src="assets/grug-angry.png" alt=""></span>
+        <span data-comment-anchor="f26918c072-span">grug</span>
+      </a>
+      <nav class="links">
+        <a href="#features">What Grug do</a>
+        <a href="#personas">Personas</a>
+        <a href="#skills">Skills</a>
+        <a href="#dashboard">Dashboard</a>
+        <a href="#pricing">Pricing</a>
+        <a href="https://github.com/githumps/grug">Docs</a>
+      </nav>
+      <a class="btn" href="mailto:grug@grug.lol?subject=Sign%20in%20to%20Grug">
+        <svg class="ico" viewBox="0 0 24 24" fill="currentColor"><path d="M12 .5C5.65.5.5 5.65.5 12c0 5.08 3.29 9.39 7.86 10.92.58.11.79-.25.79-.56 0-.27-.01-1-.02-1.97-3.2.7-3.87-1.54-3.87-1.54-.52-1.32-1.27-1.67-1.27-1.67-1.04-.71.08-.7.08-.7 1.15.08 1.76 1.18 1.76 1.18 1.02 1.75 2.69 1.24 3.34.95.1-.74.4-1.24.72-1.53-2.55-.29-5.24-1.27-5.24-5.66 0-1.25.45-2.27 1.18-3.07-.12-.29-.51-1.46.11-3.04 0 0 .96-.31 3.16 1.17a11 11 0 0 1 5.76 0c2.2-1.48 3.16-1.17 3.16-1.17.62 1.58.23 2.75.11 3.04.74.8 1.18 1.82 1.18 3.07 0 4.4-2.7 5.36-5.27 5.65.41.35.78 1.05.78 2.13 0 1.54-.01 2.78-.01 3.16 0 .31.21.68.8.56A11.51 11.51 0 0 0 23.5 12C23.5 5.65 18.35.5 12 .5z"/></svg>
+        Sign in
+      </a>
+      <a class="btn primary" href="https://github.com/apps/grug/installations/new">Install Grug →</a>
+    </div>
+  </header>
+
+  <!-- HERO -->
+  <main>
+    <section class="hero" id="hero">
+      <div>
+        <div class="eyebrow" data-comment-anchor="c8268d3633-div">v0.7.0</div>
+        <h1 class="headline">
+          Grug <span class="strike">code monkey</span>.<br>
+          Grug <span class="em">whole <em class="serif" style="font-style:italic">cave</em></span>.
+        </h1>
+        <p class="lede">
+          One grumpy caveman. Whole software lifecycle. Grug crush bug, block evil CVE, gate weak code,
+          run project smooth like rock. <span class="grug-speak">Grug know SDLC.</span> Grug live in
+          GitHub, post Check Runs, never spam comments. <b>You ship. Grug guard.</b>
+        </p>
+        <div class="hero-cta">
+          <a class="btn primary lg" href="https://github.com/apps/grug/installations/new">
+            <svg class="ico" viewBox="0 0 24 24" fill="currentColor"><path d="M12 .5C5.65.5.5 5.65.5 12c0 5.08 3.29 9.39 7.86 10.92.58.11.79-.25.79-.56 0-.27-.01-1-.02-1.97-3.2.7-3.87-1.54-3.87-1.54-.52-1.32-1.27-1.67-1.27-1.67-1.04-.71.08-.7.08-.7 1.15.08 1.76 1.18 1.76 1.18 1.02 1.75 2.69 1.24 3.34.95.1-.74.4-1.24.72-1.53-2.55-.29-5.24-1.27-5.24-5.66 0-1.25.45-2.27 1.18-3.07-.12-.29-.51-1.46.11-3.04 0 0 .96-.31 3.16 1.17a11 11 0 0 1 5.76 0c2.2-1.48 3.16-1.17 3.16-1.17.62 1.58.23 2.75.11 3.04.74.8 1.18 1.82 1.18 3.07 0 4.4-2.7 5.36-5.27 5.65.41.35.78 1.05.78 2.13 0 1.54-.01 2.78-.01 3.16 0 .31.21.68.8.56A11.51 11.51 0 0 0 23.5 12C23.5 5.65 18.35.5 12 .5z"/></svg>
+            Install Grug on GitHub
+          </a>
+          <a class="btn ghost lg" href="#dashboard">Open dashboard →</a>
+        </div>
+        <div class="hero-meta">
+          <span class="pill">AGPL-3.0</span>
+          <span>Posts as GitHub <b>Check Runs</b></span>
+          <span data-comment-anchor="a4a6e32355-span">Many personas, one app</span>
+          <span><b>$0</b> to self-host</span>
+        </div>
+      </div>
+
+      <div class="hero-stage">
+        <div class="hero-bg"></div>
+        <div class="angry-sticker">GRUG.MOOD = ANGRY</div>
+        <img class="grug-img" src="assets/grug-clean.png" alt="Grug, the grumpy caveman, holding a wooden club">
+        <div class="floaty top-r">+ 4 personas active</div>
+        <div class="floaty mid-r">CLUB.SWING() ←</div>
+
+        <div class="dor-card">
+          <div class="dor-head">
+            <div class="traffic"><i></i><i></i><i></i></div>
+            <span>checks/grug</span>
+            <span class="breadcrumb">PR #358 · main ← graphify</span>
+          </div>
+          <div class="dor-title">
+            <span class="icn">×</span>
+            <h4>Grug · 4 of 5 personas blocking</h4>
+            <span class="stat"><b>11/16 pass</b> · 3 blocking</span>
+          </div>
+          <table class="dor-table">
+            <thead>
+              <tr><th class="k">Persona</th><th>Verdict</th></tr>
+            </thead>
+            <tbody>
+              <tr>
+                <td class="k">
+                  <svg class="check svg-x" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="3"><path d="M18 6L6 18M6 6l12 12"/></svg>
+                  <b>smasher</b>
+                </td>
+                <td>2 null-deref paths in <span class="mono">parser.go</span><span class="tag block">block</span></td>
+              </tr>
+              <tr>
+                <td class="k">
+                  <svg class="check svg-x" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="3"><path d="M18 6L6 18M6 6l12 12"/></svg>
+                  <b>guard</b>
+                </td>
+                <td>CVE-2026-1144 in lodash@4.17.20<span class="tag block">block</span></td>
+              </tr>
+              <tr>
+                <td class="k">
+                  <svg class="check svg-warn" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="3"><path d="M12 2L2 22h20L12 2zm0 7v6m0 3v.01"/></svg>
+                  <b>elder</b>
+                </td>
+                <td>complexity 18 in <span class="mono">resolveTree()</span><span class="tag warn">warn</span></td>
+              </tr>
+              <tr>
+                <td class="k">
+                  <svg class="check svg-x" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="3"><path d="M18 6L6 18M6 6l12 12"/></svg>
+                  <b>chief</b>
+                </td>
+                <td>missing acceptance criteria<span class="tag block">block</span></td>
+              </tr>
+              <tr>
+                <td class="k">
+                  <svg class="check svg-ok" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="3"><path d="M20 6L9 17l-5-5"/></svg>
+                  <b>warder</b>
+                </td>
+                <td>changelog · semver hint <span class="mono">minor</span><span class="tag ok">pass</span></td>
+              </tr>
+            </tbody>
+          </table>
+        </div>
+      </div>
+    </section>
+
+    <!-- MANIFESTO STRIP: what's in the cave -->
+    <div class="manifesto">
+      <div class="manifesto-inner">
+        <span class="manifesto-eyebrow">// what's in grug's cave</span>
+        <div class="manifesto-grid">
+          <div class="manifesto-cell">
+            <span class="num">01</span>
+            <h5>Grug crush bug</h5>
+            <p>Static analysis, symbolic execution, and LLM diff review on every PR.</p>
+          </div>
+          <div class="manifesto-cell">
+            <span class="num">02</span>
+            <h5>Grug block evil CVE</h5>
+            <p>Vulnerable dependencies and known exploits get gated before merge.</p>
+          </div>
+          <div class="manifesto-cell">
+            <span class="num">03</span>
+            <h5>Strong code only</h5>
+            <p>Complexity, coverage, dead code, and review hygiene held to a line.</p>
+          </div>
+          <div class="manifesto-cell">
+            <span class="num">04</span>
+            <h5>Grug run project</h5>
+            <p>Stale PRs, sprint burndown, changelog drafts, semver hints. No yaml.</p>
+          </div>
+        </div>
+      </div>
+    </div>
+
+    <!-- FEATURES -->
+    <section id="features">
+      <div class="sec-head">
+        <div>
+          <span class="eyebrow">02 · what grug do</span>
+          <h2>Grug do <em>whole cave</em>.<br>From <em>idea</em> to <em>ship</em>.</h2>
+        </div>
+        <p class="aside" data-comment-anchor="0cddcf814f-p">// One GitHub App. Many personas. Posts as Check Runs so branch-protection rules can require any of them. Toggle the ones your team needs.</p>
+      </div>
+
+      <div class="feat-grid">
+        <!-- 1: Bug Hunter -->
+        <div class="feat">
+          <div class="num">F-01 / smasher</div>
+          <h3>Grug crush bug before bug ship.</h3>
+          <p>Static analysis + symbolic execution + LLM diff review. Finds null-derefs, race conditions, off-by-ones, and the sneaky logic bugs your linter misses.</p>
+          <div class="visual">
+            <div class="dor-mini">
+              <div class="row fail"><span class="k">null-deref</span><span class="v">parser.go:142 · req.body may be nil</span><span class="badge" style="background:var(--tomato);color:#fff;">block</span></div>
+              <div class="row fail"><span class="k">race</span><span class="v">cache.go:88 · concurrent map write</span><span class="badge" style="background:var(--tomato);color:#fff;">block</span></div>
+              <div class="row warn"><span class="k">off-by-one</span><span class="v">slice[i+1] when len-1</span><span class="badge">warn</span></div>
+              <div class="row ok"><span class="k">err-check</span><span class="v">all returns handled</span><span class="badge">pass</span></div>
+            </div>
+          </div>
+        </div>
+
+        <!-- 2: Guard / Security -->
+        <div class="feat">
+          <div class="num">F-02 / guard</div>
+          <h3>Grug block evil virus at gate.</h3>
+          <p>SCA on every dependency, secret scanning, SAST on the diff, and a CVE database refreshed hourly. Evil shall not pass.</p>
+          <div class="visual">
+            <div class="dor-mini" style="--paper:#fffbf2;">
+              <div class="row fail"><span class="k">CVE-2026-1144</span><span class="v">lodash 4.17.20 · prototype pollution · CVSS 8.8</span><span class="badge" style="background:var(--tomato);color:#fff;">block</span></div>
+              <div class="row fail"><span class="k">secret</span><span class="v">AWS_SECRET_ACCESS_KEY in .env.example</span><span class="badge" style="background:var(--tomato);color:#fff;">block</span></div>
+              <div class="row warn"><span class="k">SAST</span><span class="v">SQL string concat · users.go:201</span><span class="badge">warn</span></div>
+              <div class="row ok"><span class="k">deps</span><span class="v">317 packages · 0 unmaintained</span><span class="badge">pass</span></div>
+            </div>
+          </div>
+        </div>
+
+        <!-- 3: Code Reviewer -->
+        <div class="feat">
+          <div class="num">F-03 / elder</div>
+          <h3>Strong code only. Grug not approve weak loop.</h3>
+          <p>Line-by-line review for naming, complexity, test coverage and dead code. Posts inline suggestions you can accept with one click.</p>
+          <div class="visual">
+            <div class="checkrun">
+              <div class="ln"><span class="ts">parser.go</span> @@ -142,7 +142,12 @@</div>
+              <div class="ln fail"><span class="ts">  -</span> for i := 0; i &lt; len(items); i++ {</div>
+              <div class="ln ok"><span class="ts">  +</span> for i, item := range items {</div>
+              <div class="ln amber"><span class="ts">grug</span> Grug see C-style loop. Go have range. Use range.</div>
+              <div class="ln"><span class="ts"></span></div>
+              <div class="ln fail"><span class="ts">  ×</span> resolveTree() · cyclomatic 18 (max 10)</div>
+              <div class="ln amber"><span class="ts">  !</span> coverage 67% on changed lines (target 80%)</div>
+              <div class="ln ok"><span class="ts">  ✓</span> 0 dead exports · 0 unused vars</div>
+            </div>
+          </div>
+        </div>
+
+        <!-- 4: TPM / SDLC -->
+        <div class="feat">
+          <div class="num">F-04 / chief + warder</div>
+          <h3>Grug run project. Grug ward off bad release.</h3>
+          <p>Definition-of-Ready on every PR. Stale-PR pulse. Auto-changelog with semver hint. Sprint burndown that lives in your repo, not a Jira tab. Warder gates the deploy before virus infect tribe.</p>
+          <div class="visual">
+            <div class="codebx">
+<span class="c"># on PR open</span><br>
+<span class="k">grug.chief</span>   ✓ acceptance · ✓ estimate · ✗ rollback plan<br>
+<span class="k">grug.sprint</span>  burndown · 12 / 18 pts · on track<br>
+<span class="k">grug.warder</span> changelog drafted · semver: <span class="s">minor</span><br>
+<span class="k">grug.pulse</span>   3 PRs stale &gt; 4d · review blocked<br>
+<span class="c"># merge gated until rollback plan present</span>
+            </div>
+          </div>
+        </div>
+      </div>
+    </section>
+
+    <!-- PERSONA ROSTER -->
+    <section id="personas">
+      <div class="sec-head">
+        <div>
+          <span class="eyebrow">03 · the personas</span>
+          <h2 data-comment-anchor="9554ceb741-h2">Five Grugs. One <em>cave</em>.</h2>
+        </div>
+        <p class="aside">// Each persona is its own Check Run. Require any of them in branch protection. Toggle per-repo. BYO model key on Pro.</p>
+      </div>
+
+      <div class="persona-roster">
+        <article class="proster">
+          <div class="proster-art" style="background:#fde6df;" data-comment-anchor="8cdd74632c-div">
+            <span class="persona-stamp">F-01</span>
+            <img class="persona-portrait" src="assets/grug_smasher.png" alt="Smasher Grug, holding a stone club">
+          </div>
+          <div class="proster-body">
+            <div class="proster-tag">F-01 · SMASHER</div>
+            <h3>Smasher</h3>
+            <p>Static analysis, symbolic exec, LLM diff review. Catches null-derefs, races, off-by-ones, sloppy error handling.</p>
+            <ul class="proster-list">
+              <li>Languages: Go, TS, Py, Rust, Java, Ruby</li>
+              <li>Posts inline suggestions you can accept</li>
+              <li>Blocks merge on critical findings</li>
+            </ul>
+          </div>
+        </article>
+
+        <article class="proster">
+          <div class="proster-art" style="background:#dde7f0;" data-comment-anchor="c8b7f883af-div">
+            <span class="persona-stamp">F-02</span>
+            <img class="persona-portrait" src="assets/grug_guard.png" alt="Guard Grug, wearing a stone helmet, arms crossed">
+          </div>
+          <div class="proster-body">
+            <div class="proster-tag">F-02 · GUARD</div>
+            <h3>Guard</h3>
+            <p>SCA, secret scanning, SAST on the diff, hourly CVE feed. Quarantines evil dependencies before they reach main.</p>
+            <ul class="proster-list">
+              <li>NIST + OSV + GHSA feeds merged</li>
+              <li>Inline secret revoke + rotate hint</li>
+              <li>License compliance gate (GPL/AGPL/MIT/...)</li>
+            </ul>
+          </div>
+        </article>
+
+        <article class="proster">
+          <div class="proster-art" style="background:#dff0d6;" data-comment-anchor="57c5d83c0e-div">
+            <span class="persona-stamp">F-03</span>
+            <img class="persona-portrait" src="assets/grug_elder.png" alt="Elder Grug, grizzled with white hair">
+          </div>
+          <div class="proster-body">
+            <div class="proster-tag">F-03 · ELDER</div>
+            <h3>Elder</h3>
+            <p>Style, naming, complexity, test coverage, dead code. "Strong code only" is the motto. Grumpy but fair.</p>
+            <ul class="proster-list">
+              <li>Cyclomatic + cognitive complexity caps</li>
+              <li>Per-file test coverage thresholds</li>
+              <li>Style profiles or BYO ruleset</li>
+            </ul>
+          </div>
+        </article>
+
+        <article class="proster">
+          <div class="proster-art" style="background:#fff2cc;" data-comment-anchor="58c1a40347-div">
+            <span class="persona-stamp">F-04</span>
+            <img class="persona-portrait" src="assets/grug_chief.png" alt="Chief Grug, wearing a skull-and-feather crown">
+          </div>
+          <div class="proster-body">
+            <div class="proster-tag">F-04 · CHIEF</div>
+            <h3>Chief</h3>
+            <p>Definition of Ready, sprint burndown, stale-PR pulse, milestone roll-ups. Project management without leaving the repo.</p>
+            <ul class="proster-list">
+              <li>5-check DoR · strict / lenient modes</li>
+              <li>Burndown chart on every release branch</li>
+              <li>Auto-pings reviewers blocked &gt; 48h</li>
+            </ul>
+          </div>
+        </article>
+
+        <article class="proster">
+          <div class="proster-art" style="background:#e8e0ff;" data-comment-anchor="30bb1560c7-div">
+            <span class="persona-stamp">F-05</span>
+            <img class="persona-portrait" src="assets/grug_mystic.png" alt="Warder Grug, shaman with a glowing staff">
+          </div>
+          <div class="proster-body">
+            <div class="proster-tag">F-05 · WARDER</div>
+            <h3>Warder</h3>
+            <p>Stand at cave mouth. Drafts the changelog from merged PRs, picks semver, gates the deploy on staging health, posts release notes to Slack. Bad release not get past warder. Virus not infect tribe.</p>
+            <ul class="proster-list">
+              <li>Conventional Commits or freeform</li>
+              <li>Semver hint: <span class="mono">major / minor / patch</span></li>
+              <li>Deploy gate on Datadog SLO breach</li>
+            </ul>
+          </div>
+        </article>
+
+        <article class="proster proster-add">
+          <div class="proster-art" style="background:var(--bg-2);">
+            <span class="persona-stamp">BYOG</span>
+            <img class="persona-portrait" src="assets/grug_byog.png" alt="Hooded Grug — bring your own persona">
+          </div>
+          <div class="proster-body">
+            <div class="proster-tag">CUSTOM</div>
+            <h3>Bring your own Grug.</h3>
+            <p>Define a persona in YAML or TS. Hook into the same Check Run pipeline. Grug ecosystem, your rules.</p>
+            <ul class="proster-list">
+              <li><span class="mono">grug.config.ts</span> in repo root</li>
+              <li>Reuse Grug's diff parser + GitHub plumbing</li>
+              <li>Publish to the marketplace if you want</li>
+            </ul>
+          </div>
+        </article>
+      </div>
+    </section>
+    <section id="skills" class="market" style="margin: 0 -28px; padding-left:28px; padding-right:28px;">
+      <div class="sec-head">
+        <div>
+          <span class="eyebrow">04 · skill marketplace</span>
+          <h2>Teach Grug a <em>new trick</em>.<br>Or a <em>new tie</em>.</h2>
+        </div>
+        <p class="aside">// Drop-in skills extend Grug. Some are capabilities (Terraform plan review, GraphQL breaking-change). Some are cosmetic skins. Classic Grug is free forever.</p>
+      </div>
+
+      <p class="aside" style="max-width:780px; margin:0 0 22px; font-family:'JetBrains Mono', monospace; font-size:13px; color:var(--ink-2);">
+        // Two kinds of skills. <b>Capabilities</b> are extra checks Grug runs on your PRs — turn them on and Grug starts reviewing that thing too. <b>Skins</b> just change how Grug looks and talks.
+      </p>
+      <div class="market-grid">
+        <!-- Terraform -->
+        <article class="skill">
+          <div class="body">
+            <div class="row1">
+              <span class="tag-mini" style="background:var(--moss); color:#fff;">CAPABILITY</span>
+            </div>
+            <h4 data-comment-anchor="99cfbe340f-h4">Terraform Reviewer</h4>
+            <p>Grug reads your Terraform changes before you apply them. Yells if you're about to delete a database, change permissions, or break something already running.</p>
+          </div>
+          <div class="foot">
+            <span class="price">$6/mo</span>
+            <button class="add">+ ADD</button>
+          </div>
+        </article>
+
+        <!-- GraphQL -->
+        <article class="skill">
+          <div class="body">
+            <div class="row1" data-comment-anchor="fd2469f278-div">
+              <span class="tag-mini" style="background:var(--moss); color:#fff;">CAPABILITY</span>
+            </div>
+            <h4>API Breaking-Change Guard</h4>
+            <p>Watches your GraphQL or OpenAPI schema. If a PR removes a field or renames a type that callers still use, Grug blocks the merge until someone owns the migration.</p>
+          </div>
+          <div class="foot">
+            <span class="price">$5/mo</span>
+            <button class="add">+ ADD</button>
+          </div>
+        </article>
+
+        <!-- A11y -->
+        <article class="skill">
+          <div class="body">
+            <div class="row1" data-comment-anchor="abd482fb4c-div">
+              <span class="tag-mini" style="background:var(--moss); color:#fff;">CAPABILITY</span>
+            </div>
+            <h4>Accessibility Checker</h4>
+            <p>Renders any UI components your PR touched and checks contrast, labels, and screen-reader behaviour. Won't let you ship a button no one can read.</p>
+          </div>
+          <div class="foot">
+            <span class="price">$4/mo</span>
+            <button class="add">+ ADD</button>
+          </div>
+        </article>
+
+        <!-- Migration -->
+        <article class="skill">
+          <div class="body">
+            <div class="row1">
+              <span class="tag-mini" style="background:var(--moss); color:#fff;">CAPABILITY</span>
+            </div>
+            <h4>Database Migration Sitter</h4>
+            <p data-comment-anchor="95924f301c-p">Reads your Postgres or MySQL migrations and warns about ones that lock big tables, can't be re-run, or have no rollback. Catches the migrations that take prod down at 2am.</p>
+          </div>
+          <div class="foot">
+            <span class="price">$5/mo</span>
+            <button class="add">+ ADD</button>
+          </div>
+        </article>
+
+        <!-- Classic -->
+        <article class="skill">
+          <div class="art" style="background:#fff3d6;">
+            <img src="assets/grug.png" alt="Classic Grug" style="width:92%; transform:rotate(-3deg); filter: drop-shadow(6px 7px 0 rgba(0,0,0,0.12));" data-comment-anchor="e4ae0eb0d1-img">
+          </div>
+          <div class="body">
+            <div class="row1">
+              <span class="tag-mini" style="background:var(--amber);">SKIN</span>
+              <span class="tag-mini" style="background:var(--moss); color:#fff;">INCLUDED</span>
+            </div>
+            <h4>Classic Grug</h4>
+            <p>Caveman. Wooden club. Orange polka-dot vest. The Grug your repo deserves.</p>
+          </div>
+          <div class="foot">
+            <span class="price free">FREE</span>
+            <button class="add">INSTALLED ✓</button>
+          </div>
+        </article>
+
+        <!-- Pro -->
+        <article class="skill">
+          <div class="art" style="background:#dde7f0;">
+            <img src="assets/grug_professional.png" alt="Professional Grug, suit and tie" style="width:92%; transform:rotate(2deg); filter: drop-shadow(6px 7px 0 rgba(0,0,0,0.12));">
+          </div>
+          <div class="body">
+            <div class="row1">
+              <span class="tag-mini" style="background:var(--ink); color:var(--bg);">SKIN</span>
+            </div>
+            <h4>Professional Grug</h4>
+            <p>Suit and tie. Replaces caveman speak with passive-aggressive memos. For repos that take themselves seriously.</p>
+          </div>
+          <div class="foot">
+            <span class="price">$4/mo</span>
+            <button class="add">+ ADD</button>
+          </div>
+        </article>
+
+        <!-- Mullet -->
+        <article class="skill">
+          <div class="art" style="background:#ffe8cf;">
+            <img src="assets/grug_mullet.png" alt="Mullet Grug, business in front, party in back" style="width:92%; transform:rotate(-2deg); filter: drop-shadow(6px 7px 0 rgba(0,0,0,0.12));">
+          </div>
+          <div class="body">
+            <div class="row1">
+              <span class="tag-mini" style="background:var(--amber);">SKIN PACK</span>
+            </div>
+            <h4>Mullet, Mohawk, Bald</h4>
+            <p>Three haircuts and a leather jacket. Includes a "club smash" reaction GIF.</p>
+          </div>
+          <div class="foot">
+            <span class="price">$9 once</span>
+            <button class="add">+ ADD</button>
+          </div>
+        </article>
+
+        <!-- Custom -->
+        <article class="skill">
+          <div class="art" style="background:#e8e0ff;">
+            <img src="assets/grug_smile.png" alt="Custom Grug" style="width:92%; transform:rotate(3deg); filter: drop-shadow(6px 7px 0 rgba(0,0,0,0.12));" data-comment-anchor="c1ca69c95d-svg">
+          </div>
+          <div class="body">
+            <div class="row1">
+              <span class="tag-mini" style="background:var(--tomato); color:#fff;">CUSTOM</span>
+            </div>
+            <h4>Custom Reactions</h4>
+            <p>Bring your own emoji set and override Grug's failure copy. For in-jokes and angrier teams.</p>
+          </div>
+          <div class="foot">
+            <span class="price">$3/mo</span>
+            <button class="add">+ ADD</button>
+          </div>
+        </article>
+      </div>
+    </section>
+
+    <!-- DASHBOARD -->
+    <section id="dashboard" class="dash-section">
+      <div class="sec-head">
+        <div>
+          <span class="eyebrow">05 · the dashboard</span>
+          <h2>Sign in. Toggle. <em>Done.</em></h2>
+        </div>
+        <p class="aside">// After GitHub OAuth you land here. Three columns: repos, personas, configuration. No yaml. No setup wizard.</p>
+      </div>
+
+      <div class="dash-frame">
+        <div class="dash-titlebar">
+          <div class="traffic"><i></i><i></i><i></i></div>
+          <span class="url">grug.lol/dashboard</span>
+          <div class="user">
+            <span>signed in as @you</span>
+            <span class="av"><img src="assets/grug-angry.png" alt=""></span>
+          </div>
+        </div>
+
+        <div class="dash-grid">
+          <!-- Repos -->
+          <div class="dash-col">
+            <h5>Installed repos <span class="count">7</span></h5>
+            <div class="repo on active">
+              <div class="org">GH</div>
+              <div class="name"><b>somatic-scripts</b><span>githumps/ · 142 PRs</span></div>
+              <div class="sw"></div>
+            </div>
+            <div class="repo on">
+              <div class="org">GH</div>
+              <div class="name"><b>grug</b><span>githumps/ · 38 PRs</span></div>
+              <div class="sw"></div>
+            </div>
+            <div class="repo on">
+              <div class="org">YO</div>
+              <div class="name"><b>edge-router</b><span>your-org/ · main</span></div>
+              <div class="sw"></div>
+            </div>
+            <div class="repo">
+              <div class="org">YO</div>
+              <div class="name"><b>platform-api</b><span>your-org/ · paused</span></div>
+              <div class="sw"></div>
+            </div>
+            <div class="repo on">
+              <div class="org">YO</div>
+              <div class="name"><b>retro-archive</b><span>your-org/ · main</span></div>
+              <div class="sw"></div>
+            </div>
+            <a class="btn ghost" style="margin-top:14px; width:100%; justify-content:center;" href="#dashboard">+ Add repository</a>
+          </div>
+
+          <!-- Personas -->
+          <div class="dash-col dash-mid">
+            <h5>Active personas <span class="count">somatic-scripts</span></h5>
+
+            <div class="repo-banner">
+              <span>📁</span>
+              <span><b>githumps/somatic-scripts</b></span>
+              <span class="badge">main</span>
+            </div>
+
+            <div class="persona-card on">
+              <div class="ic">T</div>
+              <div class="body">
+                <div class="name">Chief — Definition of Ready</div>
+                <div class="desc">Blocks merge until DoR passes. 5 checks · strict mode</div>
+                <div class="meta">
+                  <span>312 runs / mo</span><span>98% pass-rate</span><span>1 blocking now</span>
+                </div>
+              </div>
+              <div class="sw"></div>
+            </div>
+
+            <div class="persona-card">
+              <div class="ic">R</div>
+              <div class="body">
+                <div class="name">Elder · <span style="color:var(--muted);">beta waitlist</span></div>
+                <div class="desc">Comment-style review for naming, tests, complexity</div>
+                <div class="meta">
+                  <span>est. release · Q3</span><span>BYO model key</span>
+                </div>
+              </div>
+              <div class="sw"></div>
+            </div>
+
+            <div class="persona-card soon">
+              <div class="ic">M</div>
+              <div class="body">
+                <div class="name">Warder</div>
+                <div class="desc">Ward off bad release · changelog, semver, deploy gate</div>
+                <div class="meta"><span>coming soon</span></div>
+              </div>
+              <div class="sw"></div>
+            </div>
+
+            <div class="persona-card soon">
+              <div class="ic">P</div>
+              <div class="body">
+                <div class="name">Stuck-PR Pulse</div>
+                <div class="desc">Nudges stale PRs · highlights blocked reviewers</div>
+                <div class="meta"><span>coming soon</span></div>
+              </div>
+              <div class="sw"></div>
+            </div>
+          </div>
+
+          <!-- Config -->
+          <div class="dash-col">
+            <h5>Grug configuration</h5>
+
+            <div class="config-card" data-comment-anchor="1e94c5bd23-div">
+              <div class="label">Active skin</div>
+              <div class="skin-pick">
+                <div class="skin-chip act" title="Classic Grug" style="overflow:hidden;">
+                  <img src="assets/grug-angry.png" alt="" style="width:140%; transform:translateY(6px);">
+                </div>
+                <div class="skin-chip" title="Professional" style="overflow:hidden;">
+                  <img src="assets/grug_professional.png" alt="" style="width:140%; transform:translateY(6px);">
+                </div>
+                <div class="skin-chip" title="Mullet" style="overflow:hidden;">
+                  <img src="assets/grug_mullet.png" alt="" style="width:140%; transform:translateY(6px);">
+                </div>
+                <div class="skin-chip" title="BYOG" style="overflow:hidden;">
+                  <img src="assets/grug_byog.png" alt="" style="width:140%; transform:translateY(6px);">
+                </div>
+              </div>
+            </div>
+
+            <div class="config-card">
+              <div class="label">Daily PR-check budget</div>
+              <div style="display:flex; align-items:baseline; gap:8px; margin-top:4px;"><b style="font-size:18px;">19</b><span style="color:var(--muted);">/ 50 used today</span></div>
+              <div class="budget"><i></i><span>38%</span></div>
+            </div>
+
+            <div class="config-card">
+              <div class="label">Failure tone</div>
+              <div style="display:flex; gap:6px; margin-top:8px; flex-wrap:wrap;">
+                <span class="tag-mini" style="background:var(--amber);">CAVEMAN</span>
+                <span class="tag-mini">PROFESSIONAL</span>
+                <span class="tag-mini">DEADPAN</span>
+                <span class="tag-mini">CUSTOM…</span>
+              </div>
+            </div>
+
+            <a class="btn primary" style="width:100%; justify-content:center; margin-top:8px;" href="#skills">Customize Grug →</a>
+          </div>
+        </div>
+      </div>
+    </section>
+
+    <!-- PRICING -->
+    <section id="pricing" class="pricing" style="margin: 0 -28px; padding-left:28px; padding-right:28px;">
+      <div class="sec-head">
+        <div>
+          <span class="eyebrow">06 · pricing</span>
+          <h2>Pay Grug, or <em>be Grug.</em></h2>
+        </div>
+        <p class="aside">// Self-host is free forever — Grug is AGPL-3.0. SaaS tiers exist because someone has to pay the AWS bill.</p>
+      </div>
+
+      <div class="price-grid">
+        <div class="tier">
+          <div class="name">Free</div>
+          <div class="price"><b>$0</b><span>/forever</span></div>
+          <ul class="feats">
+            <li>50 PR checks / day</li>
+            <li>Classic Grug skin</li>
+            <li>1 persona (Chief)</li>
+            <li>1 repo</li>
+            <li class="no">Custom reactions</li>
+            <li class="no">Multi-org</li>
+          </ul>
+          <a class="btn ghost pick" href="mailto:grug@grug.lol?subject=Sign%20up%20for%20Grug%20Free">Sign up →</a>
+        </div>
+
+        <div class="tier pop">
+          <span class="stamp">GRUG PICK</span>
+          <div class="name">Pro</div>
+          <div class="price"><b>$12</b><span>/mo · per seat</span></div>
+          <ul class="feats">
+            <li>Unlimited PR checks</li>
+            <li>All personas</li>
+            <li>Up to 10 repos</li>
+            <li>Professional Grug skin</li>
+            <li>Custom reactions add-on</li>
+            <li class="no">Audit logs</li>
+          </ul>
+          <a class="btn pick" href="mailto:grug@grug.lol?subject=Start%20Grug%20Pro">Start Pro →</a>
+        </div>
+
+        <div class="tier">
+          <div class="name">Org</div>
+          <div class="price"><b>$48</b><span>/mo · org</span></div>
+          <ul class="feats">
+            <li>Everything in Pro</li>
+            <li>Unlimited repos</li>
+            <li>Multi-org</li>
+            <li>Audit logs · SAML</li>
+            <li>Priority support</li>
+            <li>Custom personas (beta)</li>
+          </ul>
+          <a class="btn ghost pick" href="mailto:grug@grug.lol?subject=Grug%20Org%20plan">Talk to Grug →</a>
+        </div>
+
+        <div class="tier">
+          <div class="name serif" style="font-style:italic;">Self-host</div>
+          <div class="price"><b>$0</b><span>+ AWS bill (~$2/mo)</span></div>
+          <ul class="feats">
+            <li>AGPL-3.0 source</li>
+            <li>Pulumi up · 15 min</li>
+            <li>Your data, your VPC</li>
+            <li>All features unlocked</li>
+            <li class="no">Hosted SLA</li>
+            <li class="no">Skill marketplace</li>
+          </ul>
+          <a class="btn ghost pick" href="https://github.com/githumps/grug">Read the docs →</a>
+        </div>
+      </div>
+    </section>
+
+    <!-- GRUG QUOTES -->
+    <section class="grug-quotes" style="margin: 0 -28px; padding-left:28px; padding-right:28px;">
+      <div class="sec-head">
+        <div>
+          <span class="eyebrow" style="background:var(--amber);">07 · grug speak</span>
+          <h2>What <em>Grug</em> say.</h2>
+        </div>
+        <p class="aside">// Lifted verbatim from real check-run output. Unedited.</p>
+      </div>
+      <div class="quote-grid">
+        <div class="quote">
+          <div class="q">"You import lodash 4.17.20. Lodash 4.17.20 have hole. Hole let bad man in cave. Grug not let bad man in cave. Grug block."</div>
+          <div class="who">— GUARD persona · CVE-2026-1144 · blocking</div>
+        </div>
+        <div class="quote">
+          <div class="q">"resolveTree() have eighteen branch. Grug brain have ten branch. If Grug brain explode, you fix. Refactor."</div>
+          <div class="who">— ELDER persona · run #20114 · warning</div>
+        </div>
+        <div class="quote">
+          <div class="q">"Bug in parser.go line 142. Body of request maybe nil. You crash on Tuesday. Grug fix Monday. Grug heroic."</div>
+          <div class="who">— SMASHER persona · run #20119 · blocking</div>
+        </div>
+      </div>
+    </section>
+
+    <!-- CTA STRIP -->
+    <section style="border-bottom:none; padding:96px 0 80px;">
+      <div style="display:grid; grid-template-columns: 1fr auto; gap:32px; align-items:center; flex-wrap:wrap;">
+        <h2 class="serif" style="font-size:clamp(48px, 6vw, 88px); line-height:0.95; margin:0; max-width:14ch;">
+          Stop merging <em style="font-style:italic; color:var(--amber-deep)">half-baked</em> PRs.
+        </h2>
+        <div style="display:flex; gap:14px; flex-wrap:wrap;">
+          <a class="btn primary lg" href="https://github.com/apps/grug/installations/new">Install Grug on GitHub →</a>
+          <a class="btn ghost lg" href="https://github.com/githumps/grug">Read the source</a>
+        </div>
+      </div>
+    </section>
+  </main>
+
+  <!-- FOOTER -->
+  <footer>
+    <div class="foot-inner">
+      <div class="foot-top">
+        <div>
+          <div class="foot-brand">grug.</div>
+          <p>Open-source GitHub App. Five caveman personas guarding your repo. Built for teams who keep merging PRs that aren't ready.</p>
+        </div>
+        <div class="foot-col">
+          <h6>Product</h6>
+          <a href="#features">Features</a>
+          <a href="#skills">Skills marketplace</a>
+          <a href="#dashboard">Dashboard</a>
+          <a href="#pricing">Pricing</a>
+        </div>
+        <div class="foot-col">
+          <h6>Open source</h6>
+          <a href="https://github.com/githumps/grug">github.com/githumps/grug</a>
+          <a href="https://www.gnu.org/licenses/agpl-3.0.html">AGPL-3.0 license</a>
+          <a href="https://github.com/githumps/grug#self-hosting">Self-host guide</a>
+          <a href="https://github.com/githumps/grug/releases">Changelog</a>
+        </div>
+        <div class="foot-col">
+          <h6>Contact</h6>
+          <a href="mailto:grug@grug.lol">grug@grug.lol</a>
+          <a href="mailto:grug@grug.lol?subject=Grug%20status">Status</a>
+          <a href="Privacy.html">Privacy</a>
+          <a href="Terms.html">Terms</a>
+        </div>
+      </div>
+      <div class="foot-bottom">
+        <span>AGPL-3.0. Made in a cave. <a href="Privacy.html">Privacy</a> · <a href="Terms.html">Terms</a></span>
+        <span>Grug see you scroll. Grug satisfied.</span>
+      </div>
+    </div>
+  </footer>
+
+  <!-- TWEAKS -->
+  <script type="application/json" id="__tweaks_defaults">
+  {}
+  </script>
+  <script>
+  (function(){
+    const TWEAKS = /*EDITMODE-BEGIN*/{
+      "accent": "sky",
+      "background": "warm",
+      "moodSticker": "ANGRY",
+      "headline": "caveman",
+      "tapeOn": true
+    }/*EDITMODE-END*/;
+
+    const accents = {
+      amber: { '--amber':'#fbbf24', '--amber-deep':'#d97706' },
+      tomato:{ '--amber':'#e0502a', '--amber-deep':'#a8341a' },
+      moss:  { '--amber':'#7aa15a', '--amber-deep':'#3f6b3a' },
+      sky:   { '--amber':'#7fb0d6', '--amber-deep':'#2e5d8a' }
+    };
+    const bgs = {
+      warm:    { '--bg':'#faf6ee', '--bg-2':'#f3ecdb', '--paper':'#fffbf2' },
+      paper:   { '--bg':'#ffffff', '--bg-2':'#f4f4f0', '--paper':'#ffffff' },
+      stone:   { '--bg':'#181613', '--bg-2':'#242018', '--paper':'#1f1c17', '--ink':'#faf6ee', '--ink-2':'#cdc2ad', '--muted':'#8a7f6f', '--line':'#faf6ee' }
+    };
+
+    function applyTweaks(t){
+      const r = document.documentElement;
+      // reset stone overrides if not stone
+      if(t.background !== 'stone'){
+        r.style.removeProperty('--ink'); r.style.removeProperty('--ink-2'); r.style.removeProperty('--muted'); r.style.removeProperty('--line');
+      }
+      Object.entries(bgs[t.background]||{}).forEach(([k,v])=>r.style.setProperty(k,v));
+      Object.entries(accents[t.accent]||{}).forEach(([k,v])=>r.style.setProperty(k,v));
+      const sticker = document.querySelector('.angry-sticker');
+      if(sticker) sticker.textContent = 'GRUG.MOOD = ' + (t.moodSticker||'ANGRY');
+      const tape = document.querySelector('.tape');
+      if(tape) tape.style.display = t.tapeOn ? '' : 'none';
+      // headline variant
+      const h1 = document.querySelector('h1.headline');
+      if(h1){
+        if(t.headline === 'plain'){
+          h1.innerHTML = 'Grug crush bug. Block CVE.<br><span class="em">Run whole cave</span>.';
+        } else if(t.headline === 'caveman'){
+          h1.innerHTML = 'Grug see bug.<br><span class="em">Grug crush</span>.';
+        } else {
+          h1.innerHTML = 'Grug <span class="strike">code monkey</span>.<br>Grug <span class="em">whole <em class="serif" style="font-style:italic">cave</em></span>.';
+        }
+      }
+    }
+
+    let state = {...TWEAKS};
+    applyTweaks(state);
+
+    // Edit-mode panel
+    let panel = null;
+    function setKey(k,v){
+      state = {...state, [k]:v};
+      applyTweaks(state);
+      try{ window.parent.postMessage({type:'__edit_mode_set_keys', edits:{[k]:v}}, '*'); }catch(e){}
+      if(panel) renderPanel();
+    }
+    function renderPanel(){
+      if(!panel) return;
+      panel.innerHTML = `
+        <div class="tw-head">
+          <span class="serif">Tweaks</span>
+          <button class="tw-x" aria-label="Close">×</button>
+        </div>
+        <div class="tw-body">
+          <div class="tw-row"><label>Accent</label>
+            <div class="tw-seg">
+              ${['amber','tomato','moss','sky'].map(a=>`<button data-k="accent" data-v="${a}" class="${state.accent===a?'on':''}">${a}</button>`).join('')}
+            </div>
+          </div>
+          <div class="tw-row"><label>Background</label>
+            <div class="tw-seg">
+              ${['warm','paper','stone'].map(a=>`<button data-k="background" data-v="${a}" class="${state.background===a?'on':''}">${a}</button>`).join('')}
+            </div>
+          </div>
+          <div class="tw-row"><label>Headline</label>
+            <div class="tw-seg">
+              ${[['strikeout','strike'],['plain','plain'],['caveman','caveman']].map(([l,a])=>`<button data-k="headline" data-v="${a}" class="${state.headline===a?'on':''}">${l}</button>`).join('')}
+            </div>
+          </div>
+          <div class="tw-row"><label>Mood sticker text</label>
+            <input type="text" value="${state.moodSticker||''}" data-k="moodSticker" />
+          </div>
+          <div class="tw-row"><label>Top news tape</label>
+            <button class="tw-toggle ${state.tapeOn?'on':''}" data-k="tapeOn" data-v="${!state.tapeOn}">${state.tapeOn?'ON':'OFF'}</button>
+          </div>
+        </div>
+      `;
+      panel.querySelector('.tw-x').onclick = ()=>{
+        panel.style.display='none';
+        try{ window.parent.postMessage({type:'__edit_mode_dismissed'}, '*'); }catch(e){}
+      };
+      panel.querySelectorAll('[data-k][data-v]').forEach(b=>{
+        b.onclick = ()=>{
+          let v = b.dataset.v;
+          if(v==='true') v=true; else if(v==='false') v=false;
+          setKey(b.dataset.k, v);
+        };
+      });
+      panel.querySelectorAll('input[data-k]').forEach(inp=>{
+        inp.oninput = ()=> setKey(inp.dataset.k, inp.value);
+      });
+    }
+    function ensurePanel(){
+      if(panel) return panel;
+      panel = document.createElement('div');
+      panel.className = 'tw-panel';
+      panel.innerHTML = '';
+      document.body.appendChild(panel);
+      const style = document.createElement('style');
+      style.textContent = `
+        .tw-panel{ position:fixed; right:18px; bottom:18px; z-index:9999; width:280px; background:#fffbf2; color:#181613; border:2px solid #181613; box-shadow:6px 6px 0 0 #181613; font-family:'JetBrains Mono', monospace; font-size:12px;}
+        .tw-head{ display:flex; align-items:center; justify-content:space-between; padding:10px 14px; border-bottom:2px solid #181613; background:#fbbf24;}
+        .tw-head .serif{ font-family:'Instrument Serif', serif; font-size:22px; }
+        .tw-x{ background:#181613; color:#fffbf2; border:none; width:24px; height:24px; cursor:pointer; font-size:18px; line-height:1; font-family:inherit;}
+        .tw-body{ padding:14px; display:grid; gap:14px; }
+        .tw-row label{ display:block; font-size:10px; letter-spacing:0.1em; text-transform:uppercase; color:#7a7064; margin-bottom:6px;}
+        .tw-seg{ display:flex; flex-wrap:wrap; gap:0; border:1.5px solid #181613;}
+        .tw-seg button{ flex:1; padding:6px 8px; background:#fffbf2; border:none; border-right:1.5px solid #181613; cursor:pointer; font-family:inherit; font-size:11px; text-transform:uppercase;}
+        .tw-seg button:last-child{ border-right:none;}
+        .tw-seg button.on{ background:#181613; color:#fffbf2; }
+        .tw-row input{ width:100%; padding:8px 10px; border:1.5px solid #181613; background:#faf6ee; font-family:inherit; font-size:12px;}
+        .tw-toggle{ padding:6px 12px; border:1.5px solid #181613; background:#faf6ee; cursor:pointer; font-family:inherit; font-size:11px; }
+        .tw-toggle.on{ background:#7aa15a; color:#fff; }
+      `;
+      document.head.appendChild(style);
+      renderPanel();
+      return panel;
+    }
+
+    window.addEventListener('message', (e)=>{
+      const d = e.data || {};
+      if(d.type === '__activate_edit_mode'){ ensurePanel().style.display=''; renderPanel(); }
+      if(d.type === '__deactivate_edit_mode'){ if(panel) panel.style.display='none'; }
+    });
+    try{ window.parent.postMessage({type:'__edit_mode_available'}, '*'); }catch(e){}
+  })();
+  </script>
+</body>
+</html>
