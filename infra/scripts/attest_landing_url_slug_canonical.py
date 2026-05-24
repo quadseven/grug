@@ -19,11 +19,23 @@ Rules:
 
   3. `web/app.html` MUST exist (renamed SPA entry).
 
-  4. `web/public/_redirects` MUST NOT contain a `200`-status rewrite
-     whose destination is `*.html` AND whose source is `/`. CF Pages
-     Pretty URLs canonicalizes `.html` away — the 200 rewrite is
-     silently degraded to a 301 redirect that surfaces the
-     destination filename in the address bar.
+  4. `web/public/_redirects` MUST NOT contain ANY `200`-status
+     rewrite whose destination ends in `.html`. CF Pages Pretty URLs
+     canonicalizes `*.html` → `*` via 308 even on rewrite
+     destinations — silently converting our `200 rewrite`
+     (URL-preserving) into a `308 redirect` (URL-changing) that
+     surfaces the destination filename in the address bar.
+
+     Originally written as "src=`/` AND dest=`*.html`". Broadened to
+     "any source AND dest=`*.html`" after the first PR #157 deploy:
+     a `/* /app.html 200` catchall hijacked `/` (matching before
+     static-asset precedence) and the `.html`-strip on the dest
+     produced a 308 → `/app`. The blast radius is the whole rewrite
+     table, not just the root rule.
+
+     Additionally rule out any rewrite whose SOURCE is `/*` (catchall)
+     — even with an extension-less dest, `/*` matches `/` and steals
+     it from `/index.html`'s static-asset precedence.
 
   5. Every `<a href>` in `web/public/{Privacy,Terms}.html` that
      navigates back to the landing MUST use an absolute root path
@@ -48,8 +60,8 @@ PUBLIC_DIR = WEB_DIR / "public"
 LEGACY_RELATIVE_HREFS = {"Grug.html", "Privacy.html", "Terms.html"}
 
 # _redirects line format: `<source> <destination> <status>` (whitespace-separated).
-# We flag any line where source is "/" AND destination ends in ".html".
-_ROOT_REWRITE_RE = re.compile(r"^\s*/\s+(\S+\.html)\s+(\d{3})\s*$")
+# Source and destination are non-whitespace tokens; status is 3 digits.
+_REDIRECT_LINE_RE = re.compile(r"^\s*(\S+)\s+(\S+)\s+(\d{3})\s*$")
 
 
 class _HrefCollector(HTMLParser):
@@ -98,13 +110,25 @@ def _check_redirects(failures: list[str]) -> None:
         stripped = line.strip()
         if not stripped or stripped.startswith("#"):
             continue
-        match = _ROOT_REWRITE_RE.match(line)
-        if match:
-            dest, status = match.group(1), match.group(2)
+        match = _REDIRECT_LINE_RE.match(line)
+        if not match:
+            continue
+        src, dest, status = match.group(1), match.group(2), match.group(3)
+
+        if status == "200" and dest.endswith(".html"):
             failures.append(
-                f"web/public/_redirects:{lineno}: `/ {dest} {status}` — "
-                f"CF Pages Pretty URLs strips `.html` from rewrite targets that "
-                f"resolve to real files, degrading the 200 to a 301 → /{dest[:-5]}"
+                f"web/public/_redirects:{lineno}: `{src} {dest} {status}` — "
+                f"CF Pages Pretty URLs strips `.html` from 200-rewrite "
+                f"destinations, converting the rewrite to a 308 → {dest[:-5]}. "
+                f"Use `{dest[:-5]}` (no extension) instead."
+            )
+
+        if src == "/*":
+            failures.append(
+                f"web/public/_redirects:{lineno}: `/* {dest} {status}` "
+                f"catchall matches `/` and hijacks the static `/index.html` "
+                f"landing (matches before static-asset precedence). Drop the "
+                f"catchall and enumerate SPA routes explicitly."
             )
 
 
