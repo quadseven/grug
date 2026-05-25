@@ -4,10 +4,9 @@ name: Check · temper · spec verification cascade
 # (simulation) + L3 (proptest) cascade against each spec under
 # `specs/`. Fails the PR if any spec stops being kernel-acceptable.
 #
-# Temper is a research tool; there is no published binary, so this
-# workflow builds the CLI from source at a pinned SHA. Self-hosted
-# runners can bake the binary at /opt/temper/<sha>/temper for the
-# fast path; ubuntu-latest cold-builds with cargo (~3-4 min).
+# Architecture: build temper once → upload as artifact → 3 parallel
+# verify jobs download it and run their spec subset. ~5 min wall
+# clock instead of ~16 min sequential. Free for public repos.
 #
 # Pinning policy: bump TEMPER_REPO_SHA below in lockstep with
 # install-temper.sh in the skill repo. The cascade may surface new
@@ -18,32 +17,19 @@ on:
     branches: [main]
     paths:
       - 'specs/**'
-      # Attesters PROVE spec bools against real source. Re-run them
-      # whenever the source under attestation changes — otherwise spec
-      # claims would drift silently from the implementation.
       - 'infra/scripts/attest_*.py'
       - 'services/**/personas/tpm/**'
       - 'services/**/adapters/**'
       - 'services/**/github_checks_client.py'
-      # Spec 0005 attester imports `CredentialBlobCorrupt` from crypto/.
-      # Without this trigger, renaming the exception silently un-pairs
-      # the import and the workflow wouldn't re-run. Peer-review HIGH (4x).
       - 'services/**/crypto/**'
-      - 'services/**/github_app_auth/**'  # spec 0004 attester (token cache retry)
-      - 'services/**/dispatcher.py'        # spec 0003 attester (installation lifecycle)
-      # New attesters from the max-SDD push:
-      - 'scripts/check-mirrored-files.sh'  # spec 0010 attester (mirror policy)
-      - '.github/workflows/drift-lint.yml' # spec 0010 attester (drift-lint wiring)
-      # Spec 0012 (Landing) attesters DOM-parse the actual marketing
-      # HTML and the Vite/_redirects shape. Re-run on any web/ touch so
-      # design dumps don't smuggle regressions (mailto: CTAs, broken
-      # install URL slug, CF Pretty-URLs slug trap) past CI.
+      - 'services/**/github_app_auth/**'
+      - 'services/**/dispatcher.py'
+      - 'scripts/check-mirrored-files.sh'
+      - '.github/workflows/drift-lint.yml'
       - 'web/public/**'
       - 'web/index.html'
       - 'web/app.html'
       - 'web/vite.config.ts'
-      # Spec 0013 (RumInstrumentation) attesters scan the SPA entry chain
-      # + the static HTML CDN snippets + the Pulumi RUM component.
       - 'web/src/main.tsx'
       - 'web/src/rum.ts'
       - 'web/package.json'
@@ -64,35 +50,21 @@ env:
   TEMPER_REPO_SHA: 3c2e6267ec179f94ef67da00e373eccf577f23ca
 
 jobs:
-  verify:
-    name: temper verify
+  # ─── Stage 1: build temper binary once ──────────────────────────
+  build:
+    name: build temper
     runs-on: ubuntu-latest
-    # Swap to self-hosted runner for faster builds if you have one:
-    # runs-on: [self-hosted, <your-runner-label>]
+    timeout-minutes: 10
     steps:
-      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
-
-      # Pinned Python for the attester behavioral check + any pip install steps.
-      # Avoids PEP-668 EXTERNALLY-MANAGED failures on Ubuntu 24.04+ runner images.
-      # Peer-review HIGH (4x).
-      - uses: actions/setup-python@a309ff8b426b58ec0e2a45f0f869d46889d02405 # v6.2.0
-        with:
-          python-version: '3.13'
-
       - name: Locate or build temper binary
         id: temper-locate
-        # Fast path: pre-built binary at /opt/temper/<sha>/temper
-        # (only present on self-hosted runners that baked it).
-        # Cold path: cargo build from source.
         run: |
           BAKED=/opt/temper/${{ env.TEMPER_REPO_SHA }}/temper
           if [[ -x $BAKED ]]; then
             echo "Using pre-built temper at $BAKED"
-            echo "binary=$BAKED" >> "$GITHUB_OUTPUT"
+            cp "$BAKED" /tmp/temper-bin
             echo "needs_build=false" >> "$GITHUB_OUTPUT"
           else
-            echo "No pre-built temper found; will build from source"
-            echo "binary=/tmp/temper/target/release/temper" >> "$GITHUB_OUTPUT"
             echo "needs_build=true" >> "$GITHUB_OUTPUT"
           fi
 
@@ -102,7 +74,7 @@ jobs:
         with:
           toolchain: stable
 
-      - name: Install temper build deps (cold-path only)
+      - name: Install temper build deps
         if: steps.temper-locate.outputs.needs_build == 'true'
         run: |
           missing=()
@@ -114,7 +86,7 @@ jobs:
             sudo apt-get install -y -qq "${missing[@]}"
           fi
 
-      - name: Clone temper (cold-path only)
+      - name: Clone temper
         if: steps.temper-locate.outputs.needs_build == 'true'
         run: |
           rm -rf /tmp/temper
@@ -122,10 +94,6 @@ jobs:
           cd /tmp/temper
           git checkout ${{ env.TEMPER_REPO_SHA }}
 
-      # Cache the temper cargo registry + target/ between runs. Keyed on
-      # the pinned TEMPER_REPO_SHA so a kernel bump invalidates the cache.
-      # Cuts the cold ~3-4 min cargo build to ~10-30s on warm cache. Free
-      # for public repos.
       - name: Cache temper cargo build
         if: steps.temper-locate.outputs.needs_build == 'true'
         uses: Swatinem/rust-cache@23869a5bd66c73db3c0ac40331f3206eb23791dc # v2.9.1
@@ -133,96 +101,127 @@ jobs:
           workspaces: /tmp/temper
           prefix-key: temper-${{ env.TEMPER_REPO_SHA }}
 
-      - name: Build temper (cold-path only)
+      - name: Build temper
         if: steps.temper-locate.outputs.needs_build == 'true'
         run: |
           cd /tmp/temper
           cargo build --release --bin temper
+          cp target/release/temper /tmp/temper-bin
 
-      # Per-spec verify steps land below this line. The add-spec-to-workflow.sh
-      # script appends one step per spec dir. Manual edits welcome — just keep
-      # the format consistent so future appends slot in cleanly.
+      - name: Upload temper binary
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: temper-binary
+          path: /tmp/temper-bin
+          retention-days: 1
+
+  # ─── Stage 2: verify specs in parallel ──────────────────────────
+  #
+  # 3 groups split by domain area. Each downloads the temper binary
+  # artifact (~5MB) instead of rebuilding from the 946MB cargo cache.
+  #
+  #   Group A: infrastructure specs (0001-0005) + their attesters
+  #   Group B: domain specs (0006-0010) + their attesters
+  #   Group C: web/landing specs (0011-0013) + their attesters
+
+  verify-infra:
+    name: "temper verify · infra (0001-0005)"
+    needs: build
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+
+      - uses: actions/setup-python@a309ff8b426b58ec0e2a45f0f869d46889d02405 # v6.2.0
+        with:
+          python-version: '3.13'
+
+      - name: Download temper binary
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
+        with:
+          name: temper-binary
+          path: /tmp
+
+      - name: Make temper executable
+        run: chmod +x /tmp/temper-bin
 
       - name: Verify spec 0001 (CheckRunResult)
-        run: ${{ steps.temper-locate.outputs.binary }} verify -s specs/0001-check-run-result/
+        run: /tmp/temper-bin verify -s specs/0001-check-run-result/
 
       - name: Verify spec 0002 (TpmEvaluation)
-        run: ${{ steps.temper-locate.outputs.binary }} verify -s specs/0002-tpm-evaluation/
+        run: /tmp/temper-bin verify -s specs/0002-tpm-evaluation/
 
       - name: Verify spec 0003 (Installation)
-        run: ${{ steps.temper-locate.outputs.binary }} verify -s specs/0003-installation/
+        run: /tmp/temper-bin verify -s specs/0003-installation/
 
       - name: Verify spec 0004 (TokenCache)
-        run: ${{ steps.temper-locate.outputs.binary }} verify -s specs/0004-token-cache/
+        run: /tmp/temper-bin verify -s specs/0004-token-cache/
 
       - name: Verify spec 0005 (KmsEnvelope)
-        run: ${{ steps.temper-locate.outputs.binary }} verify -s specs/0005-kms-envelope/
+        run: /tmp/temper-bin verify -s specs/0005-kms-envelope/
 
-      - name: Verify spec 0006 (DorCheck)
-        run: ${{ steps.temper-locate.outputs.binary }} verify -s specs/0006-dor-check/
-
-      - name: Verify spec 0007 (UserIdentity)
-        run: ${{ steps.temper-locate.outputs.binary }} verify -s specs/0007-user-identity/
-
-      - name: Verify spec 0008 (UserWithTokens)
-        run: ${{ steps.temper-locate.outputs.binary }} verify -s specs/0008-user-with-tokens/
-
-      - name: Verify spec 0009 (RepoConfig)
-        run: ${{ steps.temper-locate.outputs.binary }} verify -s specs/0009-repo-config/
-
-      - name: Verify spec 0010 (MirrorDiscipline)
-        run: ${{ steps.temper-locate.outputs.binary }} verify -s specs/0010-mirror-discipline/
-
-      - name: Verify spec 0011 (DdbHandle)
-        run: ${{ steps.temper-locate.outputs.binary }} verify -s specs/0011-ddb-handle/
-
-      - name: Verify spec 0012 (Landing)
-        run: ${{ steps.temper-locate.outputs.binary }} verify -s specs/0012-landing/
-
-      - name: Verify spec 0013 (RumInstrumentation)
-        run: ${{ steps.temper-locate.outputs.binary }} verify -s specs/0013-rum-instrumentation/
-
-      # ────────────── Grounding attesters ──────────────
-      # Each attester PROVES a spec bool against real source. Temper
-      # verifies the IOA is internally consistent; attesters close the
-      # gap between "bool is attested" and "the implementation actually
-      # obeys it." Stdlib-only — no pip install needed. The behavioral
-      # check inside attest_check_run_result_post_init.py auto-skips
-      # when httpx isn't available.
-
-      - name: Attester · DoR-checks five canonical rules (spec 0006)
-        run: python3 infra/scripts/attest_dor_checks_five_rules.py
-
-      - name: Attester · DoR-checks mirror byte-identity modulo line 1 (spec 0006)
-        run: python3 infra/scripts/attest_dor_checks_mirror.py
+      - name: Attester · CheckRunResult.__post_init__ cross-field invariant (spec 0001)
+        run: |
+          set -euo pipefail
+          pip install --quiet 'httpx>=0.27'
+          python3 infra/scripts/attest_check_run_result_post_init.py
 
       - name: Attester · evaluate_pull_request purity (spec 0002)
         run: python3 infra/scripts/attest_persona_purity.py
 
-      - name: Attester · KMS-envelope CredentialBlobCorrupt cleanup (spec 0005)
-        run: python3 infra/scripts/attest_kms_corruption_cleanup.py
-
-      - name: Attester · CheckRunResult.__post_init__ cross-field invariant (spec 0001)
-        # Behavioral check inside the attester needs httpx to import
-        # github_checks_client; install before running so we get both
-        # the AST check AND the runtime ValueError assertions (not just
-        # the AST half). `set -euo pipefail` ensures pip install failures
-        # propagate (peer-review HIGH 4x — masked install was silently
-        # degrading the attester to AST-only).
-        run: |
-          set -euo pipefail
-          pip install --quiet 'httpx>=0.27'
-          python3 -c "import httpx; assert httpx.__version__ >= '0.27', f'got {httpx.__version__}'"
-          python3 infra/scripts/attest_check_run_result_post_init.py
-
-      - name: Attester · DDB-handle double-checked locking (infra invariant)
-        run: python3 infra/scripts/attest_ddb_handle_thread_safe.py
+      - name: Attester · aggregate_passed iff all blocking checks passed (spec 0002)
+        run: python3 infra/scripts/attest_aggregate_passed_advisory.py
 
       - name: Attester · Installation lifecycle dispatch (spec 0003)
         run: python3 infra/scripts/attest_installation_lifecycle.py
 
       - name: Attester · TokenCache 401-then-retry-once semantics (spec 0004)
         run: python3 infra/scripts/attest_token_cache_retry.py
+
+      - name: Attester · KMS-envelope CredentialBlobCorrupt cleanup (spec 0005)
+        run: python3 infra/scripts/attest_kms_corruption_cleanup.py
+
+  verify-domain:
+    name: "temper verify · domain (0006-0010)"
+    needs: build
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+
+      - uses: actions/setup-python@a309ff8b426b58ec0e2a45f0f869d46889d02405 # v6.2.0
+        with:
+          python-version: '3.13'
+
+      - name: Download temper binary
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
+        with:
+          name: temper-binary
+          path: /tmp
+
+      - name: Make temper executable
+        run: chmod +x /tmp/temper-bin
+
+      - name: Verify spec 0006 (DorCheck)
+        run: /tmp/temper-bin verify -s specs/0006-dor-check/
+
+      - name: Verify spec 0007 (UserIdentity)
+        run: /tmp/temper-bin verify -s specs/0007-user-identity/
+
+      - name: Verify spec 0008 (UserWithTokens)
+        run: /tmp/temper-bin verify -s specs/0008-user-with-tokens/
+
+      - name: Verify spec 0009 (RepoConfig)
+        run: /tmp/temper-bin verify -s specs/0009-repo-config/
+
+      - name: Verify spec 0010 (MirrorDiscipline)
+        run: /tmp/temper-bin verify -s specs/0010-mirror-discipline/
+
+      - name: Attester · DoR-checks five canonical rules (spec 0006)
+        run: python3 infra/scripts/attest_dor_checks_five_rules.py
+
+      - name: Attester · DoR-checks mirror byte-identity modulo line 1 (spec 0006)
+        run: python3 infra/scripts/attest_dor_checks_mirror.py
 
       - name: Attester · UserIdentity frozen + no token fields (spec 0007)
         run: python3 infra/scripts/attest_user_identity_no_tokens.py
@@ -235,6 +234,39 @@ jobs:
 
       - name: Attester · MirrorDiscipline policy + drift-lint wiring (spec 0010)
         run: python3 infra/scripts/attest_mirror_policy_consistency.py
+
+      - name: Attester · DDB-handle double-checked locking (infra invariant)
+        run: python3 infra/scripts/attest_ddb_handle_thread_safe.py
+
+  verify-web:
+    name: "temper verify · web (0011-0013)"
+    needs: build
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+
+      - uses: actions/setup-python@a309ff8b426b58ec0e2a45f0f869d46889d02405 # v6.2.0
+        with:
+          python-version: '3.13'
+
+      - name: Download temper binary
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
+        with:
+          name: temper-binary
+          path: /tmp
+
+      - name: Make temper executable
+        run: chmod +x /tmp/temper-bin
+
+      - name: Verify spec 0011 (DdbHandle)
+        run: /tmp/temper-bin verify -s specs/0011-ddb-handle/
+
+      - name: Verify spec 0012 (Landing)
+        run: /tmp/temper-bin verify -s specs/0012-landing/
+
+      - name: Verify spec 0013 (RumInstrumentation)
+        run: /tmp/temper-bin verify -s specs/0013-rum-instrumentation/
 
       - name: Attester · Landing install URL canonical (spec 0012)
         run: python3 infra/scripts/attest_landing_install_url_canonical.py
