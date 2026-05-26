@@ -224,6 +224,35 @@ def set_repo_config(
     return {"tpm_enabled": item["tpm_enabled"]}
 
 
+def get_enforcement_id(install_id: int, repo_id: int) -> int | None:
+    """Return the stored Grug-managed ruleset ID, or None."""
+    resp = _table.get_item(
+        Key={"PK": _inst_pk(install_id), "SK": _repo_sk(repo_id)},
+    )
+    item = resp.get("Item")
+    if not item:
+        return None
+    val = item.get("enforcement_ruleset_id")
+    return int(val) if val is not None else None
+
+
+def set_enforcement_id(
+    install_id: int, repo_id: int, ruleset_id: int | None,
+) -> None:
+    """Update only the enforcement_ruleset_id field on a RepoConfig row."""
+    if ruleset_id is not None:
+        _table.update_item(
+            Key={"PK": _inst_pk(install_id), "SK": _repo_sk(repo_id)},
+            UpdateExpression="SET enforcement_ruleset_id = :rid",
+            ExpressionAttributeValues={":rid": ruleset_id},
+        )
+    else:
+        _table.update_item(
+            Key={"PK": _inst_pk(install_id), "SK": _repo_sk(repo_id)},
+            UpdateExpression="REMOVE enforcement_ruleset_id",
+        )
+
+
 def is_persona_enabled(install_id: int, repo_id: int, persona: str) -> bool:
     """Webhook-style check: is `persona` enabled for this repo?
 
