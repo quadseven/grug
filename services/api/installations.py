@@ -227,7 +227,7 @@ def update_repo_config(
     # endpoint that lists ONLY this install's repos) and verify
     # membership.
     # Wrapped in with_install_token_retry — see list_repos above.
-    def _lookup(token: str) -> tuple[bool, str]:
+    def _lookup(token: str) -> tuple[bool, str, str]:
         page = 1
         with httpx.Client(timeout=10) as client:
             while True:

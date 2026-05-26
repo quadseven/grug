@@ -7,10 +7,7 @@ best-effort error handling.
 
 from __future__ import annotations
 
-from unittest.mock import patch, MagicMock, call
-
-import httpx
-import pytest
+from unittest.mock import patch
 
 from enforcement import (
     ensure_enforcement,
@@ -20,24 +17,10 @@ from enforcement import (
 )
 
 
-# ── helpers ──────────────────────────────────────────────────────────
-
-def _ok_response(json_body=None, status_code=200):
-    r = MagicMock(spec=httpx.Response)
-    r.status_code = status_code
-    r.raise_for_status = MagicMock()
-    r.json = MagicMock(return_value=json_body if json_body is not None else {})
-    return r
-
-
 # ── ensure_enforcement ───────────────────────────────────────────────
 
 def test_ensure_creates_ruleset_when_none():
     """No enforcement → create ruleset + store ID in DDB."""
-    rulesets_resp = _ok_response([])
-    legacy_resp = _ok_response({"contexts": []})
-    create_resp = _ok_response({"id": 42}, 201)
-
     with patch("enforcement.detect_enforcement", return_value="none") as mock_detect, \
          patch("enforcement.create_ruleset", return_value={"id": 42}) as mock_create, \
          patch("adapters.install_store.set_enforcement_id") as mock_set:
