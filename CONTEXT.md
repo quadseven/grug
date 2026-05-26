@@ -26,6 +26,16 @@ The vocabulary used in `services/`, `infra/`, and `web/`. Terms map to identifie
 | **`post_check_run` (publisher)** | Module-level function in `github_checks_client.py` that POSTs a `CheckRunResult` to GitHub. The acceptance-criteria spelling "CheckRunPublisher" is the *concept name* — the actual identifier is a function, not a class. |
 | **Scope review (roadmap)** | Advisory LLM pass over PR title + body. Wired as a `poolside_client.py` hook called from `evaluate_pull_request(...)` per the `personas/tpm/__init__.py` docstring, but **`poolside_client.py` does not exist in the repo today** — feature is roadmap-only. Intended behavior: flag title↔body mismatch, AC testability, scope-creep, XL inflation; posted as a comment, never blocking. |
 
+## Enforcement concepts
+
+| Term | Definition |
+|---|---|
+| **GitHub Ruleset** | A GitHub Repository Ruleset that requires specific status checks to pass before merging. Grug creates rulesets to enforce its DoR check on the default branch. Managed via the Repository Rulesets API (`POST/GET/DELETE /repos/{owner}/{repo}/rulesets`). See [`services/{api,webhook}/github_rulesets_client.py`](services/api/github_rulesets_client.py) (mirrored — see ADR-0001). |
+| **Grug-managed ruleset** | A ruleset whose `name` starts with the prefix `Grug —`. This prefix is the ownership marker: `detect_enforcement()` uses it to distinguish rulesets Grug created from externally-managed ones. |
+| **EnforcementState** | Literal type — `"grug_managed" \| "external" \| "none"`. Returned by `detect_enforcement()`. `grug_managed`: at least one `Grug —`-prefixed ruleset exists with `required_status_checks` matching the check name. `external`: no grug-managed ruleset, but the check is enforced via a non-Grug ruleset or legacy branch protection. `none`: check is not enforced anywhere. |
+| **`detect_enforcement()`** | Module-level function in `github_rulesets_client.py` that determines the enforcement state for a given status check. Queries both the Rulesets API and the legacy Branch Protection API (`GET /repos/{owner}/{repo}/branches/{branch}/protection/required_status_checks`) to cover repos that haven't migrated to rulesets. |
+| **Legacy branch protection** | Pre-rulesets mechanism for requiring status checks. Still active on many repos. `detect_enforcement()` checks this as a fallback when no ruleset-based enforcement is found. |
+
 ## Identity & authorization concepts
 
 | Term | Definition |
@@ -51,13 +61,14 @@ The vocabulary used in `services/`, `infra/`, and `web/`. Terms map to identifie
 
 ## Cross-service primitives (mirrored)
 
-The following six modules exist as byte-identical copies under both `services/api/` and `services/webhook/`. See [ADR-0001](docs/adr/0001-mirror-with-rule-of-three-deferral.md) for the load-bearing reasoning.
+The following seven modules exist as byte-identical copies under both `services/api/` and `services/webhook/`. See [ADR-0001](docs/adr/0001-mirror-with-rule-of-three-deferral.md) for the load-bearing reasoning.
 
 | Module | Purpose |
 |---|---|
 | `observability.py` | DD-extension-aware logger + JSON formatter. Reads `DD_SERVICE`, `DD_ENV`, `GRUG_LOG_LEVEL`. |
 | `secrets_loader.py` | SSM SecureString reads at cold start (`GITHUB_APP_ID_SSM`, `GITHUB_APP_WEBHOOK_SECRET_SSM`, etc.). |
 | `github_checks_client.py` | Thin `httpx`-based wrapper over GitHub's Checks API; carries the `CheckRunResult` dataclass. |
+| `github_rulesets_client.py` | Thin `httpx`-based wrapper over GitHub's Repository Rulesets API + legacy branch protection; carries `EnforcementState` type and `detect_enforcement()`. |
 | `adapters/install_store.py` | DDB single-table CRUD for `Installation` + `RepoConfig` + `AllowlistGate` reads. |
 | `ports/token_cache.py` | `TokenCache` Protocol + `InMemoryTokenCache` impl. |
 | `personas/tpm/dor_checks.py` | The 5 `DoR check` rules + the `CheckResult` dataclass. |
