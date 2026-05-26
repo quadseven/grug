@@ -463,6 +463,7 @@ pulumi.export("monitor_webhook_5xx_id", monitors.webhook_5xx.id)
 pulumi.export("monitor_api_5xx_id", monitors.api_5xx.id)
 pulumi.export("monitor_sig_verify_fail_id", monitors.sig_verify_fail.id)
 pulumi.export("monitor_cold_start_p99_id", monitors.cold_start_p99.id)
+pulumi.export("monitor_enforcement_gap_id", monitors.enforcement_gap.id)
 pulumi.export("synthetic_uptime_id", monitors.uptime.id)
 
 # DD RUM (spec 0013). Outputs are non-sensitive references — the actual
