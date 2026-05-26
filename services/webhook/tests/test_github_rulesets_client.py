@@ -32,11 +32,6 @@ def _ok_response(json_body=None, status_code=200):
     return r
 
 
-def _404_response():
-    resp = httpx.Response(404)
-    return resp
-
-
 # ── create_ruleset ───────────────────────────────────────────────────
 
 def test_create_ruleset_url_and_auth():
@@ -281,8 +276,42 @@ def test_grug_ruleset_prefix_value():
 
 
 def test_detect_connect_error_propagates(mock_transport_client):
-    """Transport-level ConnectError must propagate."""
+    """Transport-level ConnectError on rulesets API must propagate."""
     client = mock_transport_client(raise_exc=httpx.ConnectError("dns down"))
     with patch("httpx.get", side_effect=lambda *a, **kw: client.get(*a, **kw)):
         with pytest.raises(httpx.ConnectError):
             detect_enforcement("tok", "o", "r", "main", "check")
+
+
+def test_detect_external_via_legacy_checks_array():
+    """Legacy endpoint returns newer 'checks' array format instead of 'contexts'."""
+    rulesets_resp = _ok_response([])
+    legacy_resp = _ok_response({
+        "contexts": [],
+        "checks": [
+            {"context": "Grug — Definition of Ready", "app_id": None},
+        ],
+    })
+
+    with patch("httpx.get", side_effect=[rulesets_resp, legacy_resp]):
+        result = detect_enforcement("tok", "o", "r", "main", "Grug — Definition of Ready")
+
+    assert result == "external"
+
+
+def test_detect_legacy_transport_error_returns_none():
+    """Transport failure on legacy endpoint (after rulesets returned nothing)
+    logs a warning and returns 'none' — does not crash (F-01 pattern)."""
+    rulesets_resp = _ok_response([])
+    call_count = {"n": 0}
+
+    def side_effect(*a, **kw):
+        call_count["n"] += 1
+        if call_count["n"] == 1:
+            return rulesets_resp
+        raise httpx.ConnectError("legacy endpoint unreachable")
+
+    with patch("httpx.get", side_effect=side_effect):
+        result = detect_enforcement("tok", "o", "r", "main", "check")
+
+    assert result == "none"

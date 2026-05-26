@@ -8,6 +8,7 @@ Tokens fetched per-installation via github_app_auth.
 
 from __future__ import annotations
 
+import logging
 from typing import Literal
 
 import httpx
@@ -17,6 +18,8 @@ _GH_API = "https://api.github.com"
 GRUG_RULESET_PREFIX = "Grug — "
 
 EnforcementState = Literal["grug_managed", "external", "none"]
+
+log = logging.getLogger("grug.rulesets")
 
 _HEADERS_TEMPLATE = {
     "Accept": "application/vnd.github+json",
@@ -110,6 +113,16 @@ def _check_name_in_ruleset(ruleset: dict, check_name: str) -> bool:
     return False
 
 
+def _check_name_in_legacy(legacy_data: dict, check_name: str) -> bool:
+    """Check both legacy ``contexts`` and newer ``checks`` array formats."""
+    if check_name in legacy_data.get("contexts", []):
+        return True
+    for check in legacy_data.get("checks", []):
+        if isinstance(check, dict) and check.get("context") == check_name:
+            return True
+    return False
+
+
 def detect_enforcement(
     install_token: str,
     owner: str,
@@ -141,7 +154,6 @@ def detect_enforcement(
     if external_match:
         return "external"
 
-    # Fall back to legacy branch protection.
     try:
         legacy_resp = httpx.get(
             f"{_GH_API}/repos/{owner}/{repo}/branches/{branch}/protection/required_status_checks",
@@ -149,11 +161,24 @@ def detect_enforcement(
             timeout=10,
         )
         legacy_resp.raise_for_status()
-        contexts = legacy_resp.json().get("contexts", [])
-        if check_name in contexts:
+        if _check_name_in_legacy(legacy_resp.json(), check_name):
             return "external"
     except httpx.HTTPStatusError as e:
         if e.response.status_code != 404:
             raise
+        log.debug(
+            "legacy_branch_protection_not_configured",
+            extra={"owner": owner, "repo": repo, "branch": branch},
+        )
+    except httpx.RequestError as e:
+        log.warning(
+            "legacy_branch_protection_transport_failed",
+            extra={
+                "owner": owner,
+                "repo": repo,
+                "branch": branch,
+                "kind": type(e).__name__,
+            },
+        )
 
     return "none"
