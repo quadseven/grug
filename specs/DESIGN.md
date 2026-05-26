@@ -43,6 +43,8 @@ The vocabulary used in `services/`, `infra/`, and `web/`. Terms map to identifie
 | **`heal_enforcement()`** | Module-level function in `enforcement.py`. Called from dispatcher when a `repository_ruleset` deleted event fires for a Grug-managed ruleset. Clears the stale `enforcement_ruleset_id`, delegates to `ensure_enforcement()` for idempotent re-creation, and emits an `enforcement_healed` structured log with old + new ruleset IDs. Skipped when `force_disable_enforcement` is `True` or TPM persona is disabled. |
 | **Self-healing** | Reconciliation loop: when a Grug-managed ruleset is externally deleted, the webhook re-creates it if the repo still wants enforcement. Triggered by `repository_ruleset` webhook event with `action=deleted`. The `force_disable_enforcement` flag on `RepoConfig` is the opt-out. |
 | **Enforcement migration** | One-time backfill script (`scripts/migrate_enforcement.py`) that scans all installations for TPM-enabled repos and creates Grug-managed rulesets where none exist. Handles the grug repo's legacy branch protection → ruleset migration. Supports `--dry-run`. Idempotent. |
+| **`grug.enforcement.state`** | DogStatsD gauge metric emitted by `emit_enforcement_metric()` in `observability.py` on every enforcement state change. Value: 1.0 (grug_managed), 0.5 (external), 0.0 (none). Tags: `repo`, `persona`, `enforcement_type`. Used by the enforcement gap monitor. |
+| **Enforcement gap monitor** | DD monitor `grug-enforcement-gap` that alerts when any repo has `enforcement_type:none` for >1 hour. Routes to the DD monitoring Discord webhook. |
 
 ## Identity & authorization concepts
 
