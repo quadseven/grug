@@ -6,6 +6,8 @@ import {
   useInstallRepos,
   useInstallations,
   useSetRepoConfig,
+  useEnforcement,
+  useFixEnforcement,
   type Repo,
 } from "../lib/installations";
 
@@ -105,6 +107,7 @@ export function Dashboard() {
 function RepoPanel({ installId }: { installId: number | null }) {
   const repos = useInstallRepos(installId ?? undefined);
   const setConfig = useSetRepoConfig(installId ?? 0);
+  const fixEnforcement = useFixEnforcement(installId ?? 0);
 
   if (installId == null) {
     return (
@@ -126,10 +129,13 @@ function RepoPanel({ installId }: { installId: number | null }) {
           <RepoRow
             key={r.repo_id}
             repo={r}
+            installId={installId}
             onToggle={(enabled) =>
               setConfig.mutate({ repo_id: r.repo_id, tpm_enabled: enabled })
             }
+            onFix={() => fixEnforcement.mutate(r.repo_id)}
             pending={setConfig.isPending && setConfig.variables?.repo_id === r.repo_id}
+            fixPending={fixEnforcement.isPending && fixEnforcement.variables === r.repo_id}
           />
         ))}
       </div>
@@ -138,15 +144,25 @@ function RepoPanel({ installId }: { installId: number | null }) {
 }
 
 function RepoRow({
-  repo, onToggle, pending,
+  repo, installId, onToggle, onFix, pending, fixPending,
 }: {
   repo: Repo;
+  installId: number;
   onToggle: (enabled: boolean) => void;
+  onFix: () => void;
   pending: boolean;
+  fixPending: boolean;
 }) {
+  const enforcement = useEnforcement(
+    repo.config.tpm_enabled ? installId : undefined,
+    repo.config.tpm_enabled ? repo.repo_id : undefined,
+  );
+  const state = enforcement.data?.enforcement_state;
+  const hasStoredId = repo.config.enforcement_ruleset_id != null;
+
   return (
     <div className="flex items-center justify-between px-4 py-3">
-      <div>
+      <div className="flex items-center gap-3">
         <a
           href={`https://github.com/${repo.full_name}`}
           className="font-mono text-sm text-stone-200 hover:text-amber-400"
@@ -154,19 +170,74 @@ function RepoRow({
           {repo.full_name}
         </a>
         {repo.private && (
-          <span className="ml-2 text-xs text-stone-500 uppercase tracking-wider">private</span>
+          <span className="text-xs text-stone-500 uppercase tracking-wider">private</span>
         )}
+        {repo.config.tpm_enabled && <EnforcementBadge state={state} hasStoredId={hasStoredId} loading={enforcement.isLoading} />}
       </div>
-      <label className="flex items-center gap-2 text-xs font-mono text-stone-400 select-none cursor-pointer">
-        <input
-          type="checkbox"
-          className="accent-amber-400"
-          checked={repo.config.tpm_enabled}
-          disabled={pending}
-          onChange={(e) => onToggle(e.target.checked)}
-        />
-        tpm
-      </label>
+      <div className="flex items-center gap-3">
+        {repo.config.tpm_enabled && state === "none" && !fixPending && (
+          <button
+            type="button"
+            onClick={onFix}
+            className="text-xs font-mono px-2 py-1 rounded-sm border border-amber-600 text-amber-400 hover:bg-amber-950/50"
+          >
+            fix
+          </button>
+        )}
+        {fixPending && (
+          <span className="text-xs font-mono text-stone-500">fixing…</span>
+        )}
+        <label className="flex items-center gap-2 text-xs font-mono text-stone-400 select-none cursor-pointer">
+          <input
+            type="checkbox"
+            className="accent-amber-400"
+            checked={repo.config.tpm_enabled}
+            disabled={pending}
+            onChange={(e) => onToggle(e.target.checked)}
+          />
+          tpm
+        </label>
+      </div>
     </div>
   );
+}
+
+function EnforcementBadge({
+  state, hasStoredId, loading,
+}: {
+  state: string | undefined;
+  hasStoredId: boolean;
+  loading: boolean;
+}) {
+  if (loading && !hasStoredId) {
+    return <span className="text-xs text-stone-500 font-mono">checking…</span>;
+  }
+
+  const resolved = state ?? (hasStoredId ? "grug_managed" : undefined);
+
+  if (resolved === "grug_managed") {
+    return (
+      <span className="text-xs font-mono text-emerald-400" title="Grug-enforced ruleset active">
+        ✓ enforced
+      </span>
+    );
+  }
+  if (resolved === "external") {
+    return (
+      <span className="text-xs font-mono text-blue-400" title="Enforced via external ruleset or branch protection">
+        ✓ external
+      </span>
+    );
+  }
+  if (resolved === "none") {
+    return (
+      <span className="text-xs font-mono text-amber-400" title="TPM enabled but check is not required to merge">
+        ⚠ not enforced
+      </span>
+    );
+  }
+  if (loading) {
+    return <span className="text-xs text-stone-500 font-mono">checking…</span>;
+  }
+  return null;
 }
