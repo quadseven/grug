@@ -157,14 +157,14 @@ def test_list_user_installations_via_gsi1(_ddb_table):
 def test_repo_config_default_is_tpm_enabled_true(_ddb_table):
     mod = _ddb_table
     cfg = mod.get_repo_config(install_id=1, repo_id=42)
-    assert cfg == {"tpm_enabled": True}
+    assert cfg == {"tpm_enabled": True, "enforcement_ruleset_id": None, "force_disable_enforcement": False}
 
 
 def test_set_then_get_repo_config(_ddb_table):
     mod = _ddb_table
     mod.set_repo_config(install_id=1, repo_id=42, repo_full_name="x/y",
                         tpm_enabled=False, updated_by_user_id="100")
-    assert mod.get_repo_config(1, 42) == {"tpm_enabled": False}
+    assert mod.get_repo_config(1, 42) == {"tpm_enabled": False, "enforcement_ruleset_id": None, "force_disable_enforcement": False}
 
 
 def test_is_persona_enabled_default_true(_ddb_table):

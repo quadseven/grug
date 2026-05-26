@@ -18,6 +18,7 @@ from typing import Any
 from adapters.install_store import (
     delete_installation,
     get_installation,
+    get_repo_config,
     is_install_allowlisted,
     is_persona_enabled,
     record_installation,
@@ -40,6 +41,8 @@ def dispatch(event_name: str, payload: dict[str, Any]) -> dict[str, str]:
         return {"status": "no_op", "reason": "no persona for pull_request_review yet"}
     if event_name == "issue_comment":
         return _handle_issue_comment(payload)
+    if event_name == "repository_ruleset":
+        return _handle_repository_ruleset(payload)
     return {"status": "no_op", "reason": f"no handler for event {event_name}"}
 
 
@@ -98,6 +101,78 @@ def _handle_installation(payload: dict[str, Any]) -> dict[str, str]:
         return {"status": "no_op", "reason": f"{action} ack — installer preserved"}
 
     return {"status": "no_op", "reason": f"installation action={action} unhandled"}
+
+
+def _handle_repository_ruleset(payload: dict[str, Any]) -> dict[str, str]:
+    action = payload.get("action", "")
+    if action != "deleted":
+        return {"status": "no_op", "reason": f"repository_ruleset action={action} not gated"}
+
+    ruleset = payload.get("repository_ruleset") or {}
+    ruleset_name = ruleset.get("name", "")
+    ruleset_id = ruleset.get("id")
+
+    from github_rulesets_client import GRUG_RULESET_PREFIX  # type: ignore
+    if not ruleset_name.startswith(GRUG_RULESET_PREFIX):
+        return {"status": "no_op", "reason": "not grug-managed ruleset"}
+
+    repo = payload.get("repository") or {}
+    installation = payload.get("installation") or {}
+    install_id = installation.get("id")
+    repo_id = repo.get("id")
+    owner = (repo.get("owner") or {}).get("login", "")
+    repo_name = repo.get("name", "")
+    default_branch = repo.get("default_branch", "main")
+
+    if not all([install_id, repo_id, owner, repo_name]):
+        return {"status": "skip", "reason": "incomplete_payload"}
+
+    if not is_install_allowlisted(int(install_id)):
+        return {"status": "no_op", "reason": "installer not allowlisted"}
+
+    if not is_persona_enabled(int(install_id), int(repo_id), "tpm"):
+        log.info(
+            "self_heal_skip_tpm_disabled",
+            extra={"install_id": install_id, "repo": f"{owner}/{repo_name}"},
+        )
+        return {"status": "no_op", "reason": "tpm disabled for this repo"}
+
+    cfg = get_repo_config(int(install_id), int(repo_id))
+    if cfg.get("force_disable_enforcement", False):
+        log.info(
+            "self_heal_skip_force_disable",
+            extra={"install_id": install_id, "repo": f"{owner}/{repo_name}"},
+        )
+        return {"status": "no_op", "reason": "force_disable_enforcement is set"}
+
+    _heal_enforcement_on_repo(
+        int(install_id), int(repo_id), owner, repo_name,
+        default_branch, int(ruleset_id),
+    )
+    return {"status": "healed", "old_ruleset_id": str(ruleset_id)}
+
+
+def _heal_enforcement_on_repo(
+    install_id: int, repo_id: int, owner: str, repo_name: str,
+    default_branch: str, old_ruleset_id: int,
+) -> None:
+    from github_app_auth import with_install_token_retry  # type: ignore
+    from enforcement import heal_enforcement  # type: ignore
+
+    try:
+        with_install_token_retry(
+            install_id,
+            lambda token, o=owner, r=repo_name, db=default_branch, iid=install_id, rid=repo_id, old=old_ruleset_id: (
+                heal_enforcement(token, o, r, db, iid, rid, old_ruleset_id=old)
+            ),
+        )
+    except Exception:
+        log.warning(
+            "self_heal_failed",
+            extra={"install_id": install_id, "repo": f"{owner}/{repo_name}",
+                   "old_ruleset_id": old_ruleset_id},
+            exc_info=True,
+        )
 
 
 def _enforce_on_repos(install_id: int, repositories: list[dict]) -> None:
