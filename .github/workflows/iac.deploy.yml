@@ -81,17 +81,9 @@ jobs:
             echo "stack=dev" >> $GITHUB_OUTPUT
           fi
 
-      # Pulumi access token + DD API key + other cross-repo tokens live
-      # in SSM `/shared/*` per githumps/infrastructure#164. Fetched
-      # at deploy time using OIDC role's ssm:GetParameter on /shared/*.
-      # Mask the value so it never leaks into job logs even if a step
-      # echoes it accidentally.
-      - name: 04. Fetch Pulumi access token from SSM
+      - name: 04. Pulumi login (S3 backend)
         run: |
-          TOKEN=$(aws ssm get-parameter --name /shared/pulumi-access-token \
-            --with-decryption --query 'Parameter.Value' --output text)
-          echo "::add-mask::$TOKEN"
-          echo "PULUMI_ACCESS_TOKEN=$TOKEN" >> $GITHUB_ENV
+          pulumi login s3://pulumi-state-mizu-cloud-castle
 
       # ubuntu-latest ships system Python 3.12 but does NOT include uv.
       # (The previous comment here claimed uv came from the runner-tooling
@@ -178,7 +170,8 @@ jobs:
         uses: pulumi/actions@8582a9e8cc630786854029b4e09281acd6794b58 # v6.6.1
         with:
           command: up
-          stack-name: pulumi_ehumps_me/grug/${{ steps.stack.outputs.stack }}
+          stack-name: ${{ steps.stack.outputs.stack }}
+          cloud-url: s3://pulumi-state-mizu-cloud-castle
           work-dir: infra/pulumi
           # full_commit_sha = 40-char SHA used for DD source-code linking
           # (image_tag is 8-char short SHA; DD source UI requires full).
