@@ -1,4 +1,4 @@
-"""Tests for github_rulesets_client — CRUD + enforcement detection.
+"""Tests for github_rulesets_client — create/list/delete + enforcement detection.
 
 Covers request shape (URL, auth header, API version, body fields),
 enforcement detection across Rulesets API + legacy branch protection,
@@ -315,3 +315,49 @@ def test_detect_legacy_transport_error_returns_none():
         result = detect_enforcement("tok", "o", "r", "main", "check")
 
     assert result == "none"
+
+
+def test_detect_legacy_url_encodes_branch_with_slash():
+    """Branch names like 'feat/foo' must be URL-encoded in the path segment."""
+    rulesets_resp = _ok_response([])
+    legacy_resp = _ok_response({"contexts": ["check-a"]})
+
+    calls = []
+    def capture_get(*a, **kw):
+        calls.append(a[0])
+        if len(calls) == 1:
+            return rulesets_resp
+        return legacy_resp
+
+    with patch("httpx.get", side_effect=capture_get):
+        detect_enforcement("tok", "o", "r", "feat/my-branch", "check-a")
+
+    assert "feat%2Fmy-branch" in calls[1]
+
+
+def test_detect_enforcement_401_propagates(mock_transport_client):
+    """401 from rulesets list_rulesets must propagate so
+    with_install_token_retry can invalidate + refresh."""
+    client = mock_transport_client(status_codes=[401])
+    with patch("httpx.get", side_effect=lambda *a, **kw: client.get(*a, **kw)):
+        with pytest.raises(httpx.HTTPStatusError) as exc:
+            detect_enforcement("stale", "o", "r", "main", "check")
+    assert exc.value.response.status_code == 401
+
+
+def test_detect_legacy_non_404_error_propagates(mock_transport_client):
+    """500 from the legacy branch protection endpoint must re-raise."""
+    rulesets_resp = _ok_response([])
+    legacy_client = mock_transport_client(status_codes=[500])
+    call_count = {"n": 0}
+
+    def side_effect(*a, **kw):
+        call_count["n"] += 1
+        if call_count["n"] == 1:
+            return rulesets_resp
+        return legacy_client.get(*a, **kw)
+
+    with patch("httpx.get", side_effect=side_effect):
+        with pytest.raises(httpx.HTTPStatusError) as exc:
+            detect_enforcement("tok", "o", "r", "main", "check")
+    assert exc.value.response.status_code == 500
