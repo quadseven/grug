@@ -165,11 +165,12 @@ def detect_enforcement(
         if _check_name_in_legacy(legacy_resp.json(), check_name):
             return "external"
     except httpx.HTTPStatusError as e:
-        if e.response.status_code != 404:
+        if e.response.status_code not in (404, 403):
             raise
         log.debug(
-            "legacy_branch_protection_not_configured",
-            extra={"owner": owner, "repo": repo, "branch": branch},
+            "legacy_branch_protection_unavailable",
+            extra={"owner": owner, "repo": repo, "branch": branch,
+                   "status": e.response.status_code},
         )
     except httpx.RequestError as e:
         log.warning(

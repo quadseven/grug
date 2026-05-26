@@ -317,6 +317,23 @@ def test_detect_legacy_transport_error_returns_none():
     assert result == "none"
 
 
+def test_detect_none_when_legacy_403s():
+    """No rulesets, legacy endpoint 403s (insufficient perms) → none, not crash.
+    Peer-review finding: GitHub returns 403 when App lacks administration:read."""
+    rulesets_resp = _ok_response([])
+    legacy_403 = MagicMock(spec=httpx.Response)
+    legacy_403.status_code = 403
+    legacy_403.raise_for_status = MagicMock(
+        side_effect=httpx.HTTPStatusError("forbidden", request=MagicMock(), response=legacy_403)
+    )
+
+    responses = [rulesets_resp, legacy_403]
+    with patch("httpx.get", side_effect=responses):
+        result = detect_enforcement("tok", "o", "r", "main", "Grug — Definition of Ready")
+
+    assert result == "none"
+
+
 def test_detect_legacy_url_encodes_branch_with_slash():
     """Branch names like 'feat/foo' must be URL-encoded in the path segment."""
     rulesets_resp = _ok_response([])
