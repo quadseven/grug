@@ -23,15 +23,6 @@ on:
       - 'feat/31-*'
     tags: ['v*']
   workflow_dispatch:
-    inputs:
-      stack:
-        description: "Pulumi stack to deploy (dev|prod)"
-        required: true
-        default: dev
-        type: choice
-        options:
-          - dev
-          - prod
 
 permissions:
   contents: read
@@ -70,16 +61,9 @@ jobs:
           role-to-assume: arn:aws:iam::${{ secrets.AWS_ACCOUNT_ID }}:role/grug-gha-deploy
           aws-region: us-east-1
 
-      - name: 03. Resolve stack name
+      - name: 03. Stack name (single env)
         id: stack
-        run: |
-          if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
-            echo "stack=${{ inputs.stack }}" >> $GITHUB_OUTPUT
-          elif [ "${{ github.ref_type }}" = "tag" ]; then
-            echo "stack=prod" >> $GITHUB_OUTPUT
-          else
-            echo "stack=dev" >> $GITHUB_OUTPUT
-          fi
+        run: echo "stack=prod" >> $GITHUB_OUTPUT
 
       - name: 04. Pulumi login (S3 backend)
         run: |
