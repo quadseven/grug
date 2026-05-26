@@ -10,6 +10,7 @@ export interface Installation {
 
 export interface RepoConfig {
   tpm_enabled: boolean;
+  enforcement_ruleset_id: number | null;
 }
 
 export interface Repo {
@@ -32,6 +33,31 @@ export function useInstallRepos(installId: number | undefined) {
     queryKey: ["installations", installId, "repos"],
     queryFn: () => api(`/api/v1/installations/${installId}/repos`),
     enabled: installId != null,
+  });
+}
+
+export type EnforcementState = "grug_managed" | "external" | "none";
+
+export function useEnforcement(installId: number | undefined, repoId: number | undefined) {
+  return useQuery<{ repo_id: number; enforcement_state: EnforcementState }>({
+    queryKey: ["enforcement", installId, repoId],
+    queryFn: () => api(`/api/v1/installations/${installId}/repos/${repoId}/enforcement`),
+    enabled: installId != null && repoId != null,
+    staleTime: 60_000,
+  });
+}
+
+export function useFixEnforcement(installId: number) {
+  const qc = useQueryClient();
+  return useMutation({
+    mutationFn: (repoId: number) =>
+      api(`/api/v1/installations/${installId}/repos/${repoId}/enforcement`, {
+        method: "POST",
+      }),
+    onSuccess: (_data, repoId) => {
+      qc.invalidateQueries({ queryKey: ["enforcement", installId, repoId] });
+      qc.invalidateQueries({ queryKey: ["installations", installId, "repos"] });
+    },
   });
 }
 
