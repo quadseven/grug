@@ -1,5 +1,5 @@
 # MIRRORED — sibling at services/api/github_rulesets_client.py; keep in lockstep. See docs/adr/0001-mirror-with-rule-of-three-deferral.md.
-"""GitHub Repository Rulesets API client — CRUD + enforcement detection.
+"""GitHub Repository Rulesets API client — create/list/delete + enforcement detection.
 
 Wraps the Rulesets endpoints Grug needs for automatic DoR enforcement.
 Also queries legacy branch protection for repos that haven't migrated.
@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import logging
 from typing import Literal
+from urllib.parse import quote
 
 import httpx
 
@@ -156,7 +157,7 @@ def detect_enforcement(
 
     try:
         legacy_resp = httpx.get(
-            f"{_GH_API}/repos/{owner}/{repo}/branches/{branch}/protection/required_status_checks",
+            f"{_GH_API}/repos/{owner}/{repo}/branches/{quote(branch, safe='')}/protection/required_status_checks",
             headers=_auth_headers(install_token),
             timeout=10,
         )
