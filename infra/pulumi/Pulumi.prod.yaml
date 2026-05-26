@@ -2,5 +2,5 @@ secretsprovider: awskms://alias/pulumi-secrets?region=us-east-1
 encryptedkey: AQICAHhjW4kuB5Y5Y/O/7WODHZsdeqg+NIKyRB1FUcpCkpgCyAG+mp/fpMiKxwV5DaRBcgpHAAAAfjB8BgkqhkiG9w0BBwagbzBtAgEAMGgGCSqGSIb3DQEHATAeBglghkgBZQMEAS4wEQQMwo2cBozsx7dga87bAgEQgDuhTDeboTQo7VwwT5sJQ4MMo1UtwrsCcenx5D1JxUDv2BJwAGXlksL2iZgLh5+Cp1yXB9WQaz4WH7LKWg==
 config:
   aws:region: us-east-1
-  grug:env: dev
+  grug:env: prod
   grug:domain: grug.lol
