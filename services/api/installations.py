@@ -289,3 +289,81 @@ def update_repo_config(
         _toggle_enforcement(install_id, repo_id, full_name, default_branch, enable=False)
 
     return {"repo_id": repo_id, "full_name": full_name, "config": cfg}
+
+
+@router.get("/installations/{install_id}/repos/{repo_id}/enforcement")
+def get_enforcement(
+    install_id: int,
+    repo_id: int,
+    user: UserIdentity = Depends(require_authenticated),
+) -> dict[str, Any]:
+    """Live enforcement detection — queries GitHub Rulesets + legacy BP."""
+    install = get_installation(install_id)
+    if not install:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="install not found")
+    _ensure_can_access(install, user)
+
+    from github_rulesets_client import detect_enforcement  # type: ignore
+    from enforcement import GRUG_DOR_CHECK_NAME  # type: ignore
+
+    def _detect(token: str) -> dict[str, Any]:
+        repos = _resolve_repo(token, install_id, repo_id)
+        if not repos:
+            raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="repo not found")
+        full_name, default_branch = repos
+        owner, repo_name = full_name.split("/", 1)
+        state = detect_enforcement(token, owner, repo_name, default_branch, GRUG_DOR_CHECK_NAME)
+        return {"repo_id": repo_id, "enforcement_state": state}
+
+    return with_install_token_retry(install_id, _detect)
+
+
+@router.post("/installations/{install_id}/repos/{repo_id}/enforcement")
+def fix_enforcement(
+    install_id: int,
+    repo_id: int,
+    user: UserIdentity = Depends(require_authenticated),
+) -> dict[str, Any]:
+    """Create Grug-managed enforcement ruleset (the "Fix" button)."""
+    install = get_installation(install_id)
+    if not install:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="install not found")
+    _ensure_can_access(install, user)
+
+    from enforcement import ensure_enforcement  # type: ignore
+
+    def _fix(token: str) -> dict[str, Any]:
+        repos = _resolve_repo(token, install_id, repo_id)
+        if not repos:
+            raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="repo not found")
+        full_name, default_branch = repos
+        owner, repo_name = full_name.split("/", 1)
+        state = ensure_enforcement(token, owner, repo_name, default_branch, install_id, repo_id)
+        return {"repo_id": repo_id, "enforcement_state": state}
+
+    return with_install_token_retry(install_id, _fix)
+
+
+def _resolve_repo(
+    token: str, install_id: int, repo_id: int,
+) -> tuple[str, str] | None:
+    """Find repo full_name + default_branch from the installation's repos."""
+    with httpx.Client(timeout=10) as client:
+        page = 1
+        while True:
+            resp = client.get(
+                f"{_GH_API}/installation/repositories",
+                headers={
+                    "Authorization": f"token {token}",
+                    "Accept": "application/vnd.github+json",
+                },
+                params={"per_page": 100, "page": page},
+            )
+            resp.raise_for_status()
+            body = resp.json()
+            for r in body.get("repositories", []):
+                if r["id"] == repo_id:
+                    return r["full_name"], r.get("default_branch", "main")
+            if len(body.get("repositories", [])) < 100:
+                return None
+            page += 1
