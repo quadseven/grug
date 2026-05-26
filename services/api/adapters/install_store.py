@@ -196,11 +196,12 @@ def get_repo_config(install_id: int, repo_id: int) -> dict[str, Any]:
     )
     item = resp.get("Item")
     if not item:
-        return {**_DEFAULT_PERSONA_CONFIG, "enforcement_ruleset_id": None}
+        return {**_DEFAULT_PERSONA_CONFIG, "enforcement_ruleset_id": None, "force_disable_enforcement": False}
     rid = item.get("enforcement_ruleset_id")
     return {
         "tpm_enabled": bool(item.get("tpm_enabled", _DEFAULT_PERSONA_CONFIG["tpm_enabled"])),
         "enforcement_ruleset_id": int(rid) if rid is not None else None,
+        "force_disable_enforcement": bool(item.get("force_disable_enforcement", False)),
     }
 
 

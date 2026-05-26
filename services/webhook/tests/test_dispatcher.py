@@ -231,3 +231,81 @@ def test_new_permissions_accepted_backfills_when_no_existing_row():
         out = dispatch("installation", payload)
     assert out["status"] == "recorded" and "backfill" in out["action"]
     mock_rec.assert_called_once()
+
+
+# ── repository_ruleset (self-healing) ───────────────────────────────
+
+
+def _ruleset_deleted_payload(
+    *,
+    ruleset_name: str = "Grug — TPM Enforcement",
+    ruleset_id: int = 42,
+    install_id: int = 999,
+    repo_id: int = 7777,
+    repo_full_name: str = "githumps/infra",
+    default_branch: str = "main",
+):
+    return {
+        "action": "deleted",
+        "repository_ruleset": {"id": ruleset_id, "name": ruleset_name},
+        "repository": {
+            "id": repo_id,
+            "name": repo_full_name.split("/")[1],
+            "full_name": repo_full_name,
+            "owner": {"login": repo_full_name.split("/")[0]},
+            "default_branch": default_branch,
+        },
+        "installation": {"id": install_id},
+    }
+
+
+def test_repository_ruleset_non_delete_action_noop():
+    out = dispatch("repository_ruleset", {"action": "created", "repository_ruleset": {"id": 1, "name": "x"}})
+    assert out["status"] == "no_op"
+
+
+def test_repository_ruleset_non_grug_ruleset_noop():
+    payload = _ruleset_deleted_payload(ruleset_name="CI Required")
+    out = dispatch("repository_ruleset", payload)
+    assert out["status"] == "no_op" and "not grug-managed" in out["reason"]
+
+
+def test_repository_ruleset_heals_when_tpm_enabled():
+    payload = _ruleset_deleted_payload()
+    with patch("dispatcher.is_install_allowlisted", return_value=True), \
+         patch("dispatcher.is_persona_enabled", return_value=True), \
+         patch("dispatcher.get_repo_config", return_value={
+             "tpm_enabled": True, "enforcement_ruleset_id": 42,
+             "force_disable_enforcement": False,
+         }), \
+         patch("dispatcher._heal_enforcement_on_repo") as mock_heal:
+        out = dispatch("repository_ruleset", payload)
+    assert out["status"] == "healed"
+    mock_heal.assert_called_once()
+
+
+def test_repository_ruleset_skips_when_not_allowlisted():
+    payload = _ruleset_deleted_payload()
+    with patch("dispatcher.is_install_allowlisted", return_value=False):
+        out = dispatch("repository_ruleset", payload)
+    assert out["status"] == "no_op" and "not allowlisted" in out["reason"]
+
+
+def test_repository_ruleset_skips_when_tpm_disabled():
+    payload = _ruleset_deleted_payload()
+    with patch("dispatcher.is_install_allowlisted", return_value=True), \
+         patch("dispatcher.is_persona_enabled", return_value=False):
+        out = dispatch("repository_ruleset", payload)
+    assert out["status"] == "no_op" and "tpm disabled" in out["reason"]
+
+
+def test_repository_ruleset_skips_when_force_disable():
+    payload = _ruleset_deleted_payload()
+    with patch("dispatcher.is_install_allowlisted", return_value=True), \
+         patch("dispatcher.is_persona_enabled", return_value=True), \
+         patch("dispatcher.get_repo_config", return_value={
+             "tpm_enabled": True, "enforcement_ruleset_id": 42,
+             "force_disable_enforcement": True,
+         }):
+        out = dispatch("repository_ruleset", payload)
+    assert out["status"] == "no_op" and "force_disable" in out["reason"]
