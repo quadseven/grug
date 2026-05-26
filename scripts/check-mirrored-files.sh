@@ -29,6 +29,7 @@ cd "$(dirname "$0")/.."
 
 MIRRORED_WITH_HEADER=(
   "adapters/install_store.py"
+  "enforcement.py"
   "github_checks_client.py"
   "github_rulesets_client.py"
   "observability.py"

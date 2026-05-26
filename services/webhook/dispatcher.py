@@ -66,6 +66,10 @@ def _handle_installation(payload: dict[str, Any]) -> dict[str, str]:
             account_type=account.get("type", "User"),
             installed_by_user_id=int(installed_by),
         )
+
+        if is_install_allowlisted(int(install_id)):
+            _enforce_on_repos(int(install_id), payload.get("repositories") or [])
+
         return {"status": "recorded", "action": action}
 
     if action in {"new_permissions_accepted", "unsuspend"}:
@@ -94,6 +98,34 @@ def _handle_installation(payload: dict[str, Any]) -> dict[str, str]:
         return {"status": "no_op", "reason": f"{action} ack — installer preserved"}
 
     return {"status": "no_op", "reason": f"installation action={action} unhandled"}
+
+
+def _enforce_on_repos(install_id: int, repositories: list[dict]) -> None:
+    """Best-effort enforcement creation for repos in an install payload."""
+    from github_app_auth import with_install_token_retry  # type: ignore
+    from enforcement import ensure_enforcement  # type: ignore
+
+    for repo in repositories:
+        repo_id = repo.get("id")
+        full_name = repo.get("full_name", "")
+        default_branch = repo.get("default_branch", "main")
+        parts = full_name.split("/", 1)
+        if len(parts) != 2 or not repo_id:
+            continue
+        owner, repo_name = parts
+        try:
+            with_install_token_retry(
+                install_id,
+                lambda token, o=owner, r=repo_name, db=default_branch, iid=install_id, rid=int(repo_id): (
+                    ensure_enforcement(token, o, r, db, iid, rid)
+                ),
+            )
+        except Exception:
+            log.warning(
+                "enforcement_create_failed",
+                extra={"install_id": install_id, "repo": full_name},
+                exc_info=True,
+            )
 
 
 def _handle_pull_request(payload: dict[str, Any]) -> dict[str, str]:

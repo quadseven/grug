@@ -35,6 +35,10 @@ The vocabulary used in `services/`, `infra/`, and `web/`. Terms map to identifie
 | **EnforcementState** | Literal type — `"grug_managed" \| "external" \| "none"`. Returned by `detect_enforcement()`. `grug_managed`: at least one `Grug —`-prefixed ruleset exists with `required_status_checks` matching the check name. `external`: no grug-managed ruleset, but the check is enforced via a non-Grug ruleset or legacy branch protection. `none`: check is not enforced anywhere. |
 | **`detect_enforcement()`** | Module-level function in `github_rulesets_client.py` that determines the enforcement state for a given status check. Queries both the Rulesets API and the legacy Branch Protection API (`GET /repos/{owner}/{repo}/branches/{branch}/protection/required_status_checks`) to cover repos that haven't migrated to rulesets. |
 | **Legacy branch protection** | Pre-rulesets mechanism for requiring status checks. Still active on many repos. `detect_enforcement()` checks this as a fallback when no ruleset-based enforcement is found. |
+| **`enforcement.py`** | Mirrored module containing enforcement lifecycle functions. `ensure_enforcement()` detects current state and creates a Grug-managed ruleset if none exists; `remove_enforcement()` deletes it. Both persist the `enforcement_ruleset_id` on the `RepoConfig` DDB row. See [`services/{api,webhook}/enforcement.py`](services/api/enforcement.py). |
+| **`ensure_enforcement()`** | Idempotent function: detect → skip if `grug_managed` or `external` → create ruleset → store `enforcement_ruleset_id`. Called on installation created (webhook) and persona enable (API toggle). |
+| **`remove_enforcement()`** | Deletes the Grug-managed ruleset by ID (read from `RepoConfig`) and clears the stored `enforcement_ruleset_id`. Called on persona disable (API toggle). |
+| **`enforcement_ruleset_id`** | Optional integer field on `RepoConfig` DDB row. Stores the GitHub ruleset ID of the Grug-managed enforcement ruleset for quick lookup during delete. `None` means no Grug-managed ruleset exists. |
 
 ## Identity & authorization concepts
 
@@ -43,7 +47,7 @@ The vocabulary used in `services/`, `infra/`, and `web/`. Terms map to identifie
 | **UserIdentity** | The GitHub user behind a session. Identifier: `github_user_id` (integer, stable across login renames). Definitions in `services/api/adapters/user_store.py`. |
 | **UserWithTokens** | `UserIdentity` plus an attached `oauth_*_blob` (KMS-envelope-encrypted access + refresh tokens). Used only by the api Lambda — webhook never needs it. |
 | **Installation** | A `Grug` install on one GitHub account or organization. Identified by `install_id` (GitHub-issued integer). Carries metadata: `account_login`, `account_type` (User/Organization), `installed_at`, `installed_by_user_id`. |
-| **RepoConfig** | Per-repo settings stored under an `Installation`. Today the schema has exactly one field: `tpm_enabled: bool` (default `True`). Storage shape in [`services/{api,webhook}/adapters/install_store.py`](services/api/adapters/install_store.py). When more personas ship, the field set grows (e.g. `code_reviewer_enabled`); the `_DEFAULT_PERSONA_CONFIG` dict is the source of truth. |
+| **RepoConfig** | Per-repo settings stored under an `Installation`. Fields: `tpm_enabled: bool` (default `True`) and `enforcement_ruleset_id: int \| None` (GitHub ruleset ID managed by Grug, default `None`). Storage shape in [`services/{api,webhook}/adapters/install_store.py`](services/api/adapters/install_store.py). When more personas ship, the field set grows (e.g. `code_reviewer_enabled`); the `_DEFAULT_PERSONA_CONFIG` dict is the source of truth. |
 | **AllowlistGate** | Defense-in-depth check: webhook handler refuses to act on any `Installation` whose `installed_by_user_id` is not in the `allowlist` set on the user's DDB row. Independent of GitHub App's public/private listing. Bypass guard for the hosted SaaS while ramp is closed. |
 | **AppJWT** | RSA-signed JWT identifying Grug as a GitHub App (10-min TTL). Generated from the App private key (loaded from SSM SecureString `/grug/github-app-private-key`). Used to exchange for installation tokens. |
 | **InstallToken** | Short-lived (~1h TTL) token returned by `POST /app/installations/{id}/access_tokens`. Lets Grug act on behalf of the installation against the GitHub API. Cached per-`Installation` in `TokenCache`. |
@@ -61,7 +65,7 @@ The vocabulary used in `services/`, `infra/`, and `web/`. Terms map to identifie
 
 ## Cross-service primitives (mirrored)
 
-The following seven modules exist as byte-identical copies under both `services/api/` and `services/webhook/`. See [ADR-0001](docs/adr/0001-mirror-with-rule-of-three-deferral.md) for the load-bearing reasoning.
+The following eight modules exist as byte-identical copies under both `services/api/` and `services/webhook/`. See [ADR-0001](docs/adr/0001-mirror-with-rule-of-three-deferral.md) for the load-bearing reasoning.
 
 | Module | Purpose |
 |---|---|
@@ -69,6 +73,7 @@ The following seven modules exist as byte-identical copies under both `services/
 | `secrets_loader.py` | SSM SecureString reads at cold start (`GITHUB_APP_ID_SSM`, `GITHUB_APP_WEBHOOK_SECRET_SSM`, etc.). |
 | `github_checks_client.py` | Thin `httpx`-based wrapper over GitHub's Checks API; carries the `CheckRunResult` dataclass. |
 | `github_rulesets_client.py` | Thin `httpx`-based wrapper over GitHub's Repository Rulesets API + legacy branch protection; carries `EnforcementState` type and `detect_enforcement()`. |
+| `enforcement.py` | Enforcement lifecycle — `ensure_enforcement()` and `remove_enforcement()` wired from dispatcher + API. |
 | `adapters/install_store.py` | DDB single-table CRUD for `Installation` + `RepoConfig` + `AllowlistGate` reads. |
 | `ports/token_cache.py` | `TokenCache` Protocol + `InMemoryTokenCache` impl. |
 | `personas/tpm/dor_checks.py` | The 5 `DoR check` rules + the `CheckResult` dataclass. |
