@@ -39,6 +39,9 @@ The vocabulary used in `services/`, `infra/`, and `web/`. Terms map to identifie
 | **`ensure_enforcement()`** | Idempotent function: detect → skip if `grug_managed` or `external` → create ruleset → store `enforcement_ruleset_id`. Called on installation created (webhook) and persona enable (API toggle). |
 | **`remove_enforcement()`** | Deletes the Grug-managed ruleset by ID (read from `RepoConfig`) and clears the stored `enforcement_ruleset_id`. Called on persona disable (API toggle). |
 | **`enforcement_ruleset_id`** | Optional integer field on `RepoConfig` DDB row. Stores the GitHub ruleset ID of the Grug-managed enforcement ruleset for quick lookup during delete. `None` means no Grug-managed ruleset exists. |
+| **`force_disable_enforcement`** | Optional boolean field on `RepoConfig` DDB row, default `False`. When `True`, the self-healing loop skips re-creation of a deleted Grug-managed ruleset. Escape hatch for users who intentionally remove enforcement without disabling the TPM persona. |
+| **`heal_enforcement()`** | Module-level function in `enforcement.py`. Called from dispatcher when a `repository_ruleset` deleted event fires for a Grug-managed ruleset. Clears the stale `enforcement_ruleset_id`, delegates to `ensure_enforcement()` for idempotent re-creation, and emits an `enforcement_healed` structured log with old + new ruleset IDs. Skipped when `force_disable_enforcement` is `True` or TPM persona is disabled. |
+| **Self-healing** | Reconciliation loop: when a Grug-managed ruleset is externally deleted, the webhook re-creates it if the repo still wants enforcement. Triggered by `repository_ruleset` webhook event with `action=deleted`. The `force_disable_enforcement` flag on `RepoConfig` is the opt-out. |
 
 ## Identity & authorization concepts
 
