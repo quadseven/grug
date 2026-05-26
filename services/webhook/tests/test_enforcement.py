@@ -1,8 +1,8 @@
-"""Tests for enforcement lifecycle — ensure/remove enforcement.
+"""Tests for enforcement lifecycle — ensure/remove/heal enforcement.
 
 Covers the enable → create → disable → delete lifecycle, idempotent
-skip on existing enforcement, DDB persistence of ruleset_id, and
-best-effort error handling.
+skip on existing enforcement, DDB persistence of ruleset_id,
+self-healing on external delete, and best-effort error handling.
 """
 
 from __future__ import annotations
@@ -11,6 +11,7 @@ from unittest.mock import patch
 
 from enforcement import (
     ensure_enforcement,
+    heal_enforcement,
     remove_enforcement,
     GRUG_TPM_RULESET_NAME,
     GRUG_DOR_CHECK_NAME,
@@ -141,3 +142,40 @@ def test_ruleset_name():
 
 def test_check_name():
     assert GRUG_DOR_CHECK_NAME == "Grug — Definition of Ready"
+
+
+# ── heal_enforcement ────────────────────────────────────────────────
+
+def test_heal_clears_stale_id_and_recreates():
+    """Deleted Grug ruleset → clear old ID → ensure creates a new one."""
+    with patch("adapters.install_store.set_enforcement_id") as mock_set, \
+         patch("enforcement.detect_enforcement", return_value="none"), \
+         patch("enforcement.create_ruleset", return_value={"id": 99}), \
+         patch("adapters.install_store.set_enforcement_id") as mock_set:
+        result = heal_enforcement("tok", "o", "r", "main", 1, 2, old_ruleset_id=42)
+
+    assert result == "grug_managed"
+    calls = mock_set.call_args_list
+    assert calls[0].args == (1, 2, None)
+    assert calls[1].args == (1, 2, 99)
+
+
+def test_heal_returns_new_state():
+    """heal_enforcement returns the EnforcementState from ensure."""
+    with patch("adapters.install_store.set_enforcement_id"), \
+         patch("enforcement.detect_enforcement", return_value="none"), \
+         patch("enforcement.create_ruleset", return_value={"id": 50}):
+        result = heal_enforcement("tok", "o", "r", "main", 1, 2, old_ruleset_id=10)
+
+    assert result == "grug_managed"
+
+
+def test_heal_noop_when_external_enforcement_exists():
+    """If someone added an external ruleset before we heal, skip creation."""
+    with patch("adapters.install_store.set_enforcement_id") as mock_set, \
+         patch("enforcement.detect_enforcement", return_value="external"), \
+         patch("enforcement.create_ruleset") as mock_create:
+        result = heal_enforcement("tok", "o", "r", "main", 1, 2, old_ruleset_id=42)
+
+    assert result == "external"
+    mock_create.assert_not_called()

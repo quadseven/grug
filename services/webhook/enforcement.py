@@ -72,6 +72,44 @@ def ensure_enforcement(
     return "grug_managed"
 
 
+def heal_enforcement(
+    install_token: str,
+    owner: str,
+    repo: str,
+    default_branch: str,
+    install_id: int,
+    repo_id: int,
+    *,
+    old_ruleset_id: int,
+) -> EnforcementState:
+    """Re-create a Grug-managed ruleset after external deletion.
+
+    Clears the stale enforcement_ruleset_id first, then delegates to
+    ensure_enforcement for idempotent re-creation.
+    """
+    from adapters.install_store import set_enforcement_id  # type: ignore
+    set_enforcement_id(install_id, repo_id, None)
+
+    new_state = ensure_enforcement(
+        install_token, owner, repo, default_branch, install_id, repo_id,
+    )
+
+    if new_state == "grug_managed":
+        from adapters.install_store import get_enforcement_id  # type: ignore
+        new_ruleset_id = get_enforcement_id(install_id, repo_id)
+        log.info(
+            "enforcement_healed",
+            extra={
+                "owner": owner, "repo": repo,
+                "install_id": install_id, "repo_id": repo_id,
+                "old_ruleset_id": old_ruleset_id,
+                "new_ruleset_id": new_ruleset_id,
+            },
+        )
+
+    return new_state
+
+
 def remove_enforcement(
     install_token: str,
     owner: str,
