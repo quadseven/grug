@@ -169,6 +169,42 @@ def list_install_repos(
     return {"repos": repos}
 
 
+def _toggle_enforcement(
+    install_id: int, repo_id: int,
+    full_name: str, default_branch: str,
+    *, enable: bool,
+) -> None:
+    """Best-effort enforcement create/delete on persona toggle."""
+    from enforcement import ensure_enforcement, remove_enforcement  # type: ignore
+
+    parts = full_name.split("/", 1)
+    if len(parts) != 2:
+        return
+    owner, repo_name = parts
+    try:
+        if enable:
+            with_install_token_retry(
+                install_id,
+                lambda token: ensure_enforcement(
+                    token, owner, repo_name, default_branch, install_id, repo_id,
+                ),
+            )
+        else:
+            with_install_token_retry(
+                install_id,
+                lambda token: remove_enforcement(
+                    token, owner, repo_name, install_id, repo_id,
+                ),
+            )
+    except Exception:
+        log.warning(
+            "enforcement_toggle_failed",
+            extra={"install_id": install_id, "repo_id": repo_id,
+                   "full_name": full_name, "enable": enable},
+            exc_info=True,
+        )
+
+
 @router.put("/installations/{install_id}/repos/{repo_id}/config")
 def update_repo_config(
     install_id: int,
@@ -191,7 +227,7 @@ def update_repo_config(
     # endpoint that lists ONLY this install's repos) and verify
     # membership.
     # Wrapped in with_install_token_retry — see list_repos above.
-    def _lookup(token: str) -> tuple[bool, str]:
+    def _lookup(token: str) -> tuple[bool, str, str]:
         page = 1
         with httpx.Client(timeout=10) as client:
             while True:
@@ -217,19 +253,20 @@ def update_repo_config(
                     )
                 for r in body_json["repositories"]:
                     if r["id"] == repo_id:
-                        return True, r["full_name"]
+                        return True, r["full_name"], r.get("default_branch", "main")
                 if len(body_json["repositories"]) < 100:
-                    return False, ""
+                    return False, "", ""
                 page += 1
                 # No page cap — single-repo membership lookup must scan
                 # all pages on large org installs (>1000 repos). Codex
                 # P2 follow-up to the Sentry CRITICAL fix. Worst case
                 # ~Npages*100ms; acceptable for an admin write path.
 
-    found, full_name = with_install_token_retry(install_id, _lookup)
+    found, full_name, default_branch = with_install_token_retry(install_id, _lookup)
     if not found:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="repo not visible to install")
 
+    previous_cfg = get_repo_config(install_id, repo_id)
     cfg = set_repo_config(
         install_id=install_id, repo_id=repo_id,
         repo_full_name=full_name, tpm_enabled=body.tpm_enabled,
@@ -243,4 +280,12 @@ def update_repo_config(
             **cfg,
         },
     )
+
+    was_enabled = previous_cfg.get("tpm_enabled", True)
+    now_enabled = body.tpm_enabled
+    if now_enabled and not was_enabled:
+        _toggle_enforcement(install_id, repo_id, full_name, default_branch, enable=True)
+    elif was_enabled and not now_enabled:
+        _toggle_enforcement(install_id, repo_id, full_name, default_branch, enable=False)
+
     return {"repo_id": repo_id, "full_name": full_name, "config": cfg}
