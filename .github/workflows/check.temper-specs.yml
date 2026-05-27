@@ -56,26 +56,32 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 25
     steps:
-      - name: Locate or build temper binary
-        id: temper-locate
+      - name: Download pre-built temper from GH Release
+        id: temper-download
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
-          BAKED=/opt/temper/${{ env.TEMPER_REPO_SHA }}/temper
-          if [[ -x $BAKED ]]; then
-            echo "Using pre-built temper at $BAKED"
-            cp "$BAKED" /tmp/temper-bin
+          TAG="temper-${{ env.TEMPER_REPO_SHA }}"
+          if gh release download "$TAG" \
+               --repo "${{ github.repository }}" \
+               --pattern "temper-bin" \
+               --dir /tmp 2>/dev/null; then
+            chmod +x /tmp/temper-bin
+            echo "Pre-built temper downloaded from release $TAG"
             echo "needs_build=false" >> "$GITHUB_OUTPUT"
           else
+            echo "No release found for $TAG — will build from source"
             echo "needs_build=true" >> "$GITHUB_OUTPUT"
           fi
 
       - name: Install Rust toolchain
-        if: steps.temper-locate.outputs.needs_build == 'true'
+        if: steps.temper-download.outputs.needs_build == 'true'
         uses: dtolnay/rust-toolchain@e97e2d8cc328f1b50210efc529dca0028893a2d9 # v1
         with:
           toolchain: stable
 
       - name: Install temper build deps
-        if: steps.temper-locate.outputs.needs_build == 'true'
+        if: steps.temper-download.outputs.needs_build == 'true'
         run: |
           missing=()
           pkg-config --exists openssl || missing+=("libssl-dev" "pkg-config")
@@ -87,7 +93,7 @@ jobs:
           fi
 
       - name: Clone temper
-        if: steps.temper-locate.outputs.needs_build == 'true'
+        if: steps.temper-download.outputs.needs_build == 'true'
         run: |
           rm -rf /tmp/temper
           git clone https://github.com/${{ env.TEMPER_REPO }}.git /tmp/temper
@@ -95,14 +101,14 @@ jobs:
           git checkout ${{ env.TEMPER_REPO_SHA }}
 
       - name: Cache temper cargo build
-        if: steps.temper-locate.outputs.needs_build == 'true'
+        if: steps.temper-download.outputs.needs_build == 'true'
         uses: Swatinem/rust-cache@23869a5bd66c73db3c0ac40331f3206eb23791dc # v2.9.1
         with:
           workspaces: /tmp/temper
           prefix-key: temper-${{ env.TEMPER_REPO_SHA }}
 
       - name: Build temper
-        if: steps.temper-locate.outputs.needs_build == 'true'
+        if: steps.temper-download.outputs.needs_build == 'true'
         run: |
           cd /tmp/temper
           cargo build --release --bin temper
