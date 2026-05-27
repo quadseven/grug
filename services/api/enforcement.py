@@ -50,6 +50,8 @@ def ensure_enforcement(
                 "state": state,
             },
         )
+        from observability import emit_enforcement_metric  # type: ignore
+        emit_enforcement_metric(f"{owner}/{repo}", state)
         return state
 
     result = create_ruleset(
@@ -69,6 +71,8 @@ def ensure_enforcement(
             "ruleset_id": ruleset_id,
         },
     )
+    from observability import emit_enforcement_metric  # type: ignore
+    emit_enforcement_metric(f"{owner}/{repo}", "grug_managed")
     return "grug_managed"
 
 
@@ -152,3 +156,5 @@ def remove_enforcement(
             "ruleset_id": ruleset_id,
         },
     )
+    from observability import emit_enforcement_metric  # type: ignore
+    emit_enforcement_metric(f"{owner}/{repo}", "none")

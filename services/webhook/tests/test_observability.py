@@ -19,7 +19,7 @@ import sys
 
 import pytest
 
-from observability import JsonFormatter, configure_logging
+from observability import JsonFormatter, configure_logging, emit_enforcement_metric
 
 
 def _format_record(level=logging.INFO, msg="hello", **extra):
@@ -97,3 +97,33 @@ def test_configure_logging_replaces_existing_handlers():
     configure_logging()
     handler_count_second = len(logging.getLogger().handlers)
     assert handler_count_first == handler_count_second == 1
+
+
+# ── emit_enforcement_metric ─────────────────────────────────────────
+
+def test_emit_enforcement_metric_calls_lambda_metric():
+    from unittest.mock import patch, MagicMock
+    mock_metric = MagicMock()
+    with patch.dict("sys.modules", {"datadog_lambda": MagicMock(), "datadog_lambda.metric": MagicMock(lambda_metric=mock_metric)}):
+        with patch("observability.lambda_metric", mock_metric, create=True):
+            emit_enforcement_metric("githumps/infra", "grug_managed")
+
+
+def test_emit_enforcement_metric_value_mapping():
+    from unittest.mock import patch, MagicMock, call
+    mock_metric = MagicMock()
+    with patch("datadog_lambda.metric.lambda_metric", mock_metric):
+        emit_enforcement_metric("o/r", "grug_managed")
+        emit_enforcement_metric("o/r", "external")
+        emit_enforcement_metric("o/r", "none")
+
+    calls = mock_metric.call_args_list
+    assert calls[0] == call("grug.enforcement.state", 1.0, tags=["repo:o/r", "persona:tpm", "enforcement_type:grug_managed"])
+    assert calls[1] == call("grug.enforcement.state", 0.5, tags=["repo:o/r", "persona:tpm", "enforcement_type:external"])
+    assert calls[2] == call("grug.enforcement.state", 0.0, tags=["repo:o/r", "persona:tpm", "enforcement_type:none"])
+
+
+def test_emit_enforcement_metric_does_not_raise_on_import_failure():
+    from unittest.mock import patch
+    with patch("builtins.__import__", side_effect=ImportError("no datadog_lambda")):
+        emit_enforcement_metric("o/r", "grug_managed")
