@@ -61,16 +61,17 @@ jobs:
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
+          echo "::notice::step started at $(date -u '+%Y-%m-%dT%H:%M:%SZ')"
           TAG="temper-${{ env.TEMPER_REPO_SHA }}"
           if gh release download "$TAG" \
                --repo "${{ github.repository }}" \
                --pattern "temper-bin" \
                --dir /tmp 2>/dev/null; then
             chmod +x /tmp/temper-bin
-            echo "Pre-built temper downloaded from release $TAG"
+            echo "::notice::pre-built temper downloaded at $(date -u '+%Y-%m-%dT%H:%M:%SZ')"
             echo "needs_build=false" >> "$GITHUB_OUTPUT"
           else
-            echo "No release found for $TAG — will build from source"
+            echo "::notice::no release found — will build from source at $(date -u '+%Y-%m-%dT%H:%M:%SZ')"
             echo "needs_build=true" >> "$GITHUB_OUTPUT"
           fi
 
@@ -110,8 +111,10 @@ jobs:
       - name: Build temper
         if: steps.temper-download.outputs.needs_build == 'true'
         run: |
+          echo "::notice::cargo build started at $(date -u '+%Y-%m-%dT%H:%M:%SZ')"
           cd /tmp/temper
           cargo build --release --bin temper
+          echo "::notice::cargo build finished at $(date -u '+%Y-%m-%dT%H:%M:%SZ')"
           cp target/release/temper /tmp/temper-bin
 
       - name: Upload temper binary
