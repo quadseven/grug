@@ -23,7 +23,7 @@ type = "bool"
 initial = "false"
 
 [[state]]
-name = "aggregate_passed_iff_all_five_passed_per_process_gate_concepts"
+name = "aggregate_passed_iff_all_blocking_checks_passed_per_process_gate_concepts"
 type = "bool"
 initial = "false"
 
@@ -64,10 +64,10 @@ params = ["attestor"]
 guard = "is_false evaluate_pull_request_is_pure_function_per_process_gate_concepts"
 effect = [
   { type = "set_bool", var = "all_five_dor_checks_executed_per_process_gate_concepts", value = true },
-  { type = "set_bool", var = "aggregate_passed_iff_all_five_passed_per_process_gate_concepts", value = true },
+  { type = "set_bool", var = "aggregate_passed_iff_all_blocking_checks_passed_per_process_gate_concepts", value = true },
   { type = "set_bool", var = "evaluate_pull_request_is_pure_function_per_process_gate_concepts", value = true },
 ]
-hint = "All 5 DoR rules ran; aggregate pass requires every rule pass; function is pure (no IO during evaluation)."
+hint = "All 5 DoR rules ran; aggregate pass requires every BLOCKING rule pass (advisory checks like issue-link may fail without blocking); function is pure (no IO during evaluation)."
 
 [[action]]
 name = "AttestComposeContract"
@@ -101,7 +101,7 @@ to = "Evaluated"
 params = ["pr_number"]
 guard = [
   { type = "is_true", var = "all_five_dor_checks_executed_per_process_gate_concepts" },
-  { type = "is_true", var = "aggregate_passed_iff_all_five_passed_per_process_gate_concepts" },
+  { type = "is_true", var = "aggregate_passed_iff_all_blocking_checks_passed_per_process_gate_concepts" },
   { type = "is_true", var = "evaluate_pull_request_is_pure_function_per_process_gate_concepts" },
   { type = "is_true", var = "scope_review_is_advisory_only_does_not_block_per_process_gate_concepts" },
   { type = "is_true", var = "scope_review_absence_does_not_change_aggregate_passed_per_process_gate_concepts" },
