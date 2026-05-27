@@ -20,7 +20,7 @@ env:
 jobs:
   build-and-release:
     name: build temper + publish release
-    runs-on: [self-hosted, srv-unraid-gha]
+    runs-on: ubuntu-latest-xl
     timeout-minutes: 45
     steps:
       - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
