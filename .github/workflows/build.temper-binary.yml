@@ -1,0 +1,69 @@
+name: Build · temper · publish pre-built binary
+
+# Builds the temper binary from source and publishes it as a GitHub
+# Release artifact. Run this once per TEMPER_REPO_SHA bump. The PR
+# workflow (check.temper-specs.yml) downloads the release binary
+# instead of compiling from source (~5s vs ~18min).
+#
+# Usage: Actions → Build · temper → Run workflow → main
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+env:
+  TEMPER_REPO: nerdsane/temper
+  TEMPER_REPO_SHA: 3c2e6267ec179f94ef67da00e373eccf577f23ca
+
+jobs:
+  build-and-release:
+    name: build temper + publish release
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@e97e2d8cc328f1b50210efc529dca0028893a2d9 # v1
+        with:
+          toolchain: stable
+
+      - name: Install build deps
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq libssl-dev pkg-config libz3-dev libclang-dev
+
+      - name: Clone temper
+        run: |
+          git clone https://github.com/${{ env.TEMPER_REPO }}.git /tmp/temper
+          cd /tmp/temper
+          git checkout ${{ env.TEMPER_REPO_SHA }}
+
+      - name: Build temper (release)
+        run: |
+          cd /tmp/temper
+          cargo build --release --bin temper
+          cp target/release/temper /tmp/temper-bin
+          chmod +x /tmp/temper-bin
+          /tmp/temper-bin --version || echo "(no --version flag)"
+
+      - name: Create or update release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          TAG="temper-${{ env.TEMPER_REPO_SHA }}"
+          SHORT_SHA="${{ env.TEMPER_REPO_SHA }}"
+          SHORT_SHA="${SHORT_SHA:0:12}"
+
+          # Delete existing release if re-running
+          gh release delete "$TAG" --repo "${{ github.repository }}" --yes 2>/dev/null || true
+          git tag -d "$TAG" 2>/dev/null || true
+          git push origin ":refs/tags/$TAG" 2>/dev/null || true
+
+          # Create release with binary
+          gh release create "$TAG" \
+            --repo "${{ github.repository }}" \
+            --title "temper binary (${SHORT_SHA})" \
+            --notes "Pre-built temper binary for linux/amd64. SHA: ${{ env.TEMPER_REPO_SHA }}" \
+            --latest=false \
+            /tmp/temper-bin
