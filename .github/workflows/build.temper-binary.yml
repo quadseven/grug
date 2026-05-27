@@ -50,8 +50,10 @@ jobs:
 
       - name: Build temper (release)
         run: |
+          echo "::notice::build started at $(date -u '+%Y-%m-%dT%H:%M:%SZ')"
           cd /tmp/temper
           cargo build --release --bin temper
+          echo "::notice::build finished at $(date -u '+%Y-%m-%dT%H:%M:%SZ')"
           cp target/release/temper /tmp/temper-bin
           chmod +x /tmp/temper-bin
           /tmp/temper-bin --version || echo "(no --version flag)"
