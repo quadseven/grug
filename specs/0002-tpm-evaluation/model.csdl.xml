@@ -29,7 +29,7 @@
         <Property Name="Status" Type="Grug.TpmEvaluation.TpmEvaluationStatus" Nullable="false"/>
 
         <Property Name="all_five_dor_checks_executed_per_process_gate_concepts" Type="Edm.Boolean" DefaultValue="false"/>
-        <Property Name="aggregate_passed_iff_all_five_passed_per_process_gate_concepts" Type="Edm.Boolean" DefaultValue="false"/>
+        <Property Name="aggregate_passed_iff_all_blocking_checks_passed_per_process_gate_concepts" Type="Edm.Boolean" DefaultValue="false"/>
         <Property Name="evaluate_pull_request_is_pure_function_per_process_gate_concepts" Type="Edm.Boolean" DefaultValue="false"/>
         <Property Name="frozen_dataclass_no_post_construction_mutation_per_process_gate_concepts" Type="Edm.Boolean" DefaultValue="false"/>
         <Property Name="composes_into_check_run_result_per_process_gate_concepts" Type="Edm.Boolean" DefaultValue="false"/>
