@@ -78,3 +78,26 @@ def configure_logging() -> None:
     root = logging.getLogger()
     root.handlers = [handler]
     root.setLevel(level)
+
+
+def emit_enforcement_metric(
+    repo: str,
+    enforcement_type: str,
+    *,
+    persona: str = "tpm",
+) -> None:
+    """Emit grug.enforcement.state gauge via DD Lambda Extension DogStatsD.
+
+    Tags: repo, persona, enforcement_type (grug_managed|external|none).
+    Value: 1.0 for grug_managed, 0.5 for external, 0.0 for none.
+    """
+    value_map = {"grug_managed": 1.0, "external": 0.5, "none": 0.0}
+    value = value_map.get(enforcement_type, 0.0)
+    tags = [f"repo:{repo}", f"persona:{persona}", f"enforcement_type:{enforcement_type}"]
+    try:
+        from datadog_lambda.metric import lambda_metric
+        lambda_metric("grug.enforcement.state", value, tags=tags)
+    except Exception:
+        logging.getLogger("grug.observability").debug(
+            "enforcement_metric_emit_failed", extra={"repo": repo},
+        )

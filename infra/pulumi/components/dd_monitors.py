@@ -30,6 +30,7 @@ class _MonitorBundle:
     api_5xx: datadog.Monitor
     sig_verify_fail: datadog.Monitor
     cold_start_p99: datadog.Monitor
+    enforcement_gap: datadog.Monitor
     uptime: datadog.SyntheticsTest
 
 
@@ -154,7 +155,30 @@ def create_all(
         opts=opts,
     )
 
-    # 5) Synthetic uptime — hit GET /livez (no IO, returns 200). Earlier
+    # 5) Enforcement gap detector — any repo with enforcement_type:none
+    #    for >1h means a TPM-enabled repo has no merge gate. DogStatsD
+    #    metric emitted by enforcement.py on every state change.
+    enforcement_gap = datadog.Monitor(
+        "grug-enforcement-gap",
+        type="metric alert",
+        name="[grug] Enforcement gap — repo with enforcement_type:none > 1h",
+        message=(
+            f"{notify_handle}\n"
+            "A TPM-enabled repo has had no enforcement for >1 hour. "
+            "PRs can merge without passing the DoR check.\n"
+            "Runbook: docs/RUNBOOK.md#enforcement-gap"
+        ),
+        query=(
+            "min(last_1h):min:grug.enforcement.state"
+            "{enforcement_type:none,env:" + env + "} by {repo} < 0.5"
+        ),
+        tags=_common_tags(env, "grug-webhook") + ["enforcement:gap"],
+        notify_no_data=False,
+        priority=2,
+        opts=opts,
+    )
+
+    # 6) Synthetic uptime — hit GET /livez (no IO, returns 200). Earlier
     #    design POSTed a fake-sig body expecting 401, but that triggered
     #    webhook_signature_invalid every 5 min → false-positive infinite
     #    alert loop on monitor #3 (Codex P1, Slice 9).
@@ -201,5 +225,6 @@ def create_all(
         api_5xx=api_5xx,
         sig_verify_fail=sig_verify_fail,
         cold_start_p99=cold_start_p99,
+        enforcement_gap=enforcement_gap,
         uptime=uptime,
     )
