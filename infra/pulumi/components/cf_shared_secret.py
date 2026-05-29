@@ -5,6 +5,12 @@ slice #232) and the Lambda middleware (sibling slice #233) consume.
 Sourcing both sides from one SSM param means rotation = bump
 `keepers["version"]` then `pulumi up` + re-run
 `infra/cloudflare/deploy.sh`.
+
+**Rotation ordering trap:** `pulumi up` updates the SSM value
+immediately. Lambdas re-read at next cold start (often within seconds
+of a deploy). The CF Worker binding only updates when deploy.sh runs.
+Run deploy.sh BEFORE forcing a Lambda cold-start to avoid a 401 window.
+Sibling slice #233 documents the full runbook.
 """
 from __future__ import annotations
 
