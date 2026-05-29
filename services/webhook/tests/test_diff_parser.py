@@ -1,7 +1,9 @@
 """Tests for personas/code_reviewer/diff_parser.py."""
 from __future__ import annotations
 
-from personas.code_reviewer.diff_parser import DiffHunk, parse_diff
+import pytest
+
+from personas.code_reviewer.diff_parser import DiffHunk, DiffParseError, parse_diff
 
 
 _SIMPLE_DIFF = """diff --git a/src/x.py b/src/x.py
@@ -140,3 +142,35 @@ def test_hunk_body_preserved_for_llm_consumption() -> None:
     hunks = parse_diff(_SIMPLE_DIFF)
     assert "+new1" in hunks[0].body
     assert "-old" in hunks[0].body
+
+
+def test_malformed_at_at_header_raises_diff_parse_error() -> None:
+    """A garbled @@ header is more likely a fetcher bug or GitHub
+    format drift than a real hunk we should partially extract. Silent
+    skip would let evaluate_diff return a clean "success" verdict —
+    false pass. Caller catches DiffParseError → advisory neutral."""
+    diff = """diff --git a/x.py b/x.py
+--- a/x.py
++++ b/x.py
+@@ this is not a valid hunk header @@
+ keep
++new
+"""
+    with pytest.raises(DiffParseError, match="malformed `@@` hunk header"):
+        parse_diff(diff)
+
+
+def test_malformed_diff_git_header_raises_diff_parse_error() -> None:
+    """`diff --git` line missing the `a/<old> b/<new>` shape — refuse
+    to silently swallow. The prior behavior set current_file=None and
+    dropped every subsequent hunk in this file."""
+    diff = """diff --git not_a_valid_path_format
+--- a/x.py
++++ b/x.py
+@@ -1,2 +1,2 @@
+ keep
+-old
++new
+"""
+    with pytest.raises(DiffParseError, match="malformed `diff --git`"):
+        parse_diff(diff)
