@@ -190,16 +190,18 @@ jobs:
             --data '{"purge_everything":true}')
           status=$(tail -n1 <<<"$response")
           body=$(sed '$d' <<<"$response")
+          # Warn-only: HTML is already uncached by web/public/_headers
+          # so a missing purge scope doesn't break the deploy. Surface
+          # the actionable HITL clearly when the scope IS missing so
+          # the operator can add it on their own schedule.
           if [ "$status" = "200" ]; then
             echo "✓ CF cache purged"
-          elif [ "$status" = "403" ]; then
-            echo "::error::CF cache purge returned 403 — token missing Zone:Cache Purge scope. Add it at dashboard.cloudflare.com → My Profile → API Tokens → edit the grug deploy token → add Zone:Cache Purge → save. Token value does NOT change; no SSM update needed."
+          elif [ "$status" = "401" ] || [ "$status" = "403" ]; then
+            echo "::warning::CF cache purge returned HTTP $status — token missing Zone:Cache Purge scope. Add it at dashboard.cloudflare.com → My Profile → API Tokens → edit the grug deploy token → add Zone:Cache Purge → save. Token value does NOT change; no SSM update needed. Deploy continues — HTML is no-cache via web/public/_headers."
             echo "$body"
-            exit 1
           else
-            echo "::error::CF cache purge returned HTTP $status"
+            echo "::warning::CF cache purge returned HTTP $status — non-auth failure, deploy continues."
             echo "$body"
-            exit 1
           fi
 
       # Production smoke test — only runs for prod-eligible refs (main +
