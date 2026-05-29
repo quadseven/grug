@@ -46,6 +46,14 @@ class Finding:
     Distinct from `llm_client.Finding` (the wire-format from the LLM).
     `evaluate_diff` translates from the wire shape and validates that
     `(file, line)` references a line the LLM actually saw.
+
+    `suggestion: str | None` — None means the LLM didn't supply a fix
+    hint. Using `None` rather than `""` removes the "empty-vs-absent"
+    ambiguity before any consumer ships against it.
+
+    Invariant: `line >= 1` (GitHub's inline-comment API rejects line=0
+    with a 422). Checked in `__post_init__` so a malformed wire-format
+    finding fails loudly at parse time, not at the GH POST.
     """
 
     file: str
@@ -53,7 +61,13 @@ class Finding:
     severity: Severity
     rule_name: str
     message: str
-    suggestion: str
+    suggestion: str | None
+
+    def __post_init__(self) -> None:
+        assert self.line >= 1, (
+            f"Finding.line must be >= 1 (got {self.line}); "
+            "GitHub's inline-comment API rejects line=0"
+        )
 
 
 @dataclass(frozen=True, slots=True)
@@ -63,16 +77,25 @@ class CodeReviewEvaluation:
     `conclusion` follows `CheckConclusion` (spec 0001) so this dataclass
     composes 1:1 into a `CheckRunResult` for GitHub's Checks API.
 
-    `passed` semantics: zero high+critical findings. Medium+low are
-    advisory — they appear in `findings` but don't flip `passed`. When
-    the LLM call itself failed (`no_diff`, `all_failed`, `parse_failed`
-    on the input `LlmReviewResponse`), `passed=True` + `conclusion=neutral`
-    keeps the PR un-blocked — Elder is advisory-first.
+    `passed` is **derived** from `conclusion` (`passed = conclusion != "failure"`)
+    so the two encodings can't drift. The producer (`evaluate_diff`)
+    builds `conclusion` from severity + LLM kind:
+      - LLM didn't produce content (`no_diff` / `all_failed` /
+        `parse_failed`): `conclusion=neutral`, passed=True. Elder is
+        advisory-first — infra flakiness must not block PRs.
+      - At least one high+critical finding: `conclusion=failure`,
+        passed=False.
+      - Otherwise: `conclusion=success`, passed=True. Medium+low
+        findings are advisory — reported in the check-run summary but
+        don't flip the verdict.
     """
 
     findings: tuple[Finding, ...]
-    passed: bool
     conclusion: CheckConclusion
+
+    @property
+    def passed(self) -> bool:
+        return self.conclusion != "failure"
 
 
 def _hunk_line_index(hunks: tuple[DiffHunk, ...]) -> dict[str, frozenset[int]]:
@@ -92,9 +115,7 @@ def evaluate_diff(
     """
     # LLM did not return reviewable content — advisory neutral.
     if llm_response.kind != "reviewed":
-        return CodeReviewEvaluation(
-            findings=(), passed=True, conclusion="neutral",
-        )
+        return CodeReviewEvaluation(findings=(), conclusion="neutral")
 
     line_index = _hunk_line_index(hunks)
     kept: list[Finding] = []
@@ -114,16 +135,12 @@ def evaluate_diff(
                 rule_name=raw.rule,
                 message=raw.message,
                 # The LLM client's wire-format Finding doesn't carry a
-                # `suggestion` field today — leave empty until the
-                # prompt is extended in a future slice. Stable field so
-                # the inline-comment publisher has a place to read.
-                suggestion="",
+                # `suggestion` field today. `None` (not "") so consumers
+                # don't conflate "absent" with "empty hint".
+                suggestion=None,
             )
         )
 
     blocking = [f for f in kept if f.severity in _BLOCKING_SEVERITIES]
-    passed = not blocking
-    conclusion: CheckConclusion = "success" if passed else "failure"
-    return CodeReviewEvaluation(
-        findings=tuple(kept), passed=passed, conclusion=conclusion,
-    )
+    conclusion: CheckConclusion = "failure" if blocking else "success"
+    return CodeReviewEvaluation(findings=tuple(kept), conclusion=conclusion)
