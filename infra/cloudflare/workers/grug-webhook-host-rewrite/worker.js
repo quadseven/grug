@@ -15,19 +15,18 @@
 // `reference_lambda_function_url_host_volatile` — host changes on every
 // recreate, single-source via Pulumi output).
 //
-// `X-Grug-CF-Secret` (parent issue #173) is the CF→AWS auth-boundary
-// tightening: the value is sourced from the `GRUG_CF_SECRET` Worker
-// secret binding, which `deploy.sh` PUTs from SSM `/grug/cf-shared-secret`
-// after every script upload. Lambda middleware validates the header on
-// every non-`/livez` request. Webhook payloads remain HMAC-protected
-// by GitHub end-to-end; this header is additive defense against direct
-// Function-URL access bypassing CF entirely.
+// `X-Grug-CF-Secret` is the CF→AWS auth-boundary tightening: the value
+// is sourced from the `GRUG_CF_SECRET` Worker secret binding, which
+// `deploy.sh` PUTs from SSM `/grug/cf-shared-secret` after every script
+// upload. Lambda middleware validates the header on every non-`/livez`
+// request. Webhook payloads remain HMAC-protected by GitHub end-to-end;
+// this header is additive defense against direct Function-URL access
+// bypassing CF entirely.
 
 // Three placeholders are sed-substituted by infra/cloudflare/deploy.sh
 // at upload time so deploy.sh is the single source of truth for both
-// the binding name and the header name. Lambda middleware (#233) must
-// match SECRET_HEADER exactly — that cross-link is enforced by spec
-// 0014's attester, not by any compile-time link here.
+// the binding name and the header name. Lambda middleware must match
+// SECRET_HEADER exactly.
 const ORIGIN = "__UPSTREAM_HOST__";
 const SECRET_HEADER = "__SECRET_HEADER__";
 const BINDING_NAME = "__BINDING_NAME__";
