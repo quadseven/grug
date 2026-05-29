@@ -22,10 +22,12 @@ from __future__ import annotations
 import hmac
 import logging
 import os
+import time
 from functools import lru_cache
 from typing import Callable
 
 import boto3
+from botocore.exceptions import BotoCoreError, ClientError
 from starlette.middleware.base import BaseHTTPMiddleware
 from starlette.requests import Request
 from starlette.responses import JSONResponse, Response
@@ -38,6 +40,17 @@ _ssm = boto3.client("ssm")
 
 SECRET_HEADER = "X-Grug-CF-Secret"
 LIVEZ_PATH = "/livez"
+
+# Narrow set of exceptions that put the middleware into fail-open mode.
+# Anything outside this set propagates as a 500 — a programmer bug or
+# unexpected runtime error should NOT silently disable the auth boundary.
+_FAIL_OPEN_ERRORS = (LookupError, ClientError, BotoCoreError)
+
+# Per-process throttle for the "unconfigured" warning log. Unconfigured
+# state is a STATIC misconfig — logging it on every request floods DD
+# with millions of identical warnings during the rollout window.
+_LOG_THROTTLE_SECONDS = 60.0
+_last_unconfigured_log_at: dict[str, float] = {}
 
 
 @lru_cache(maxsize=1)
@@ -91,33 +104,35 @@ class CfAuthMiddleware(BaseHTTPMiddleware):
         self, request: Request, call_next: Callable
     ) -> Response:
         # Liveness probe stays open so DD synthetics + smoke tests work
-        # whether or not CF is in front of us.
-        if request.url.path == LIVEZ_PATH:
+        # whether or not CF is in front of us. Normalize trailing slash
+        # + case so `/livez/` and `/LIVEZ` also bypass — FastAPI's
+        # auto-redirect on trailing slash issues 307 from the route
+        # layer, but the middleware sees the raw path first.
+        if request.url.path.rstrip("/").lower() == LIVEZ_PATH:
             return await call_next(request)
 
         try:
             expected = self._secret_loader()
-        except Exception as e:
-            # Fail-open: log once per request at WARNING. Operator will
-            # see the rate in DD logs and can react.
-            log.warning(
-                "cf_shared_secret_unconfigured",
-                extra={"reason": type(e).__name__, "path": request.url.path},
-            )
+        except _FAIL_OPEN_ERRORS as e:
+            # Known misconfig classes — fail-open with throttled log.
+            # Programmer bugs (AttributeError, NameError, TypeError, etc.)
+            # are NOT in _FAIL_OPEN_ERRORS and propagate as 500 so the
+            # boundary doesn't silently disable on unexpected failures.
+            _log_unconfigured_throttled(type(e).__name__, request.url.path)
             return await call_next(request)
 
         if not expected:
             # Same fail-open behavior for empty-string. Distinguishing
             # from "unconfigured" only matters for the log signal.
-            log.warning(
-                "cf_shared_secret_empty",
-                extra={"path": request.url.path},
-            )
+            _log_unconfigured_throttled("empty_ssm_value", request.url.path)
             return await call_next(request)
 
         # Strict mode from here on.
         received = request.headers.get(SECRET_HEADER, "")
         if not hmac.compare_digest(received, expected):
+            # Per-request log is intentional — this is the audit trail
+            # for the auth boundary. Volume is naturally bounded by
+            # attacker probing rate and surfaces in the DD monitor.
             log.info(
                 "cf_shared_secret_mismatch",
                 extra={
@@ -131,3 +146,22 @@ class CfAuthMiddleware(BaseHTTPMiddleware):
             )
 
         return await call_next(request)
+
+
+def _log_unconfigured_throttled(reason: str, path: str) -> None:
+    """Emit `cf_shared_secret_unconfigured` at most once per
+    `_LOG_THROTTLE_SECONDS` per reason. Unconfigured is a STATIC misconfig
+    — logging on every request floods DD with identical warnings during
+    a rollout window. The reason key prevents one fail mode from
+    starving another (`empty_ssm_value` and `LookupError` log
+    independently).
+    """
+    now = time.monotonic()
+    last = _last_unconfigured_log_at.get(reason, 0.0)
+    if now - last < _LOG_THROTTLE_SECONDS:
+        return
+    _last_unconfigured_log_at[reason] = now
+    log.warning(
+        "cf_shared_secret_unconfigured",
+        extra={"reason": reason, "path": path},
+    )
