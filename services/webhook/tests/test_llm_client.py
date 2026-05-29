@@ -1,14 +1,4 @@
-"""Tests for the LLM client abstraction (issue #184).
-
-Covers:
-- review_diff returns LlmReviewResponse with backend_used + model_name
-- Round-robin selection via installation_id % 2 (even → Poolside, odd → OpenRouter)
-- 429 retry with backoff on OpenRouter
-- Graceful fallback when primary backend errors
-- Timeout handling
-- OpenAI-compatible request shape (system + user message, JSON response format)
-- Empty hunks → no LLM call (cheap return)
-"""
+"""Tests for the LLM client abstraction."""
 from __future__ import annotations
 
 from unittest.mock import patch
@@ -365,6 +355,93 @@ def test_parse_failed_attributes_secondary_backend(monkeypatch) -> None:
     assert out.kind == "parse_failed"
     assert out.backend_used == Backend.OPENROUTER
     assert "parse" in out.error.lower()
+
+
+def test_non_dict_finding_entries_dropped() -> None:
+    """Under JSON-mode pressure, LLMs sometimes emit a string or scalar
+    where the schema asks for a dict. Drop the entry rather than crashing
+    on attribute access downstream."""
+    findings_json = (
+        '{"findings": ['
+        '"just a string",'
+        'null,'
+        '42,'
+        '{"path": "y", "line": 5, "rule": "ok", "severity": "low", "message": ""}'
+        ']}'
+    )
+    response = httpx.Response(200, json=_openai_json_response(findings_json))
+
+    with patch.object(httpx, "post", return_value=response):
+        out = review_diff([_hunk()], installation_id=1)
+
+    assert out.kind == "reviewed"
+    assert len(out.findings) == 1
+    assert out.findings[0].rule == "ok"
+
+
+def test_bad_type_finding_entry_dropped() -> None:
+    """`line` is non-coercible (a list, not int-castable). `_coerce_finding`
+    must catch TypeError/ValueError and drop, not crash."""
+    findings_json = (
+        '{"findings": ['
+        '{"path": "x", "line": [1, 2], "rule": "bad", "severity": "high", "message": ""},'
+        '{"path": "y", "line": 5, "rule": "ok", "severity": "low", "message": ""}'
+        ']}'
+    )
+    response = httpx.Response(200, json=_openai_json_response(findings_json))
+
+    with patch.object(httpx, "post", return_value=response):
+        out = review_diff([_hunk()], installation_id=1)
+
+    assert out.kind == "reviewed"
+    assert len(out.findings) == 1
+    assert out.findings[0].rule == "ok"
+
+
+def test_envelope_json_array_returns_parse_failed() -> None:
+    """200 with a JSON array (not a dict) — provider edge case where the
+    response shape is wrong. Must not AttributeError on `body['choices']`."""
+    response = httpx.Response(200, json=["not", "a", "dict"])
+
+    with patch.object(httpx, "post", return_value=response):
+        out = review_diff([_hunk()], installation_id=1)
+
+    assert out.kind == "parse_failed"
+    assert "envelope" in out.error.lower() or "dict" in out.error.lower()
+
+
+def test_envelope_missing_choices_returns_parse_failed() -> None:
+    """Both providers return `{"error": {"code": "..."}}` on bad payloads —
+    a valid JSON dict without `choices`. Must surface as parse_failed,
+    not raise."""
+    response = httpx.Response(
+        200, json={"error": {"code": "invalid_request", "message": "bad"}}
+    )
+
+    with patch.object(httpx, "post", return_value=response):
+        out = review_diff([_hunk()], installation_id=1)
+
+    assert out.kind == "parse_failed"
+    assert "choices" in out.error.lower() or "missing" in out.error.lower()
+
+
+def test_non_retryable_5xx_does_not_burn_retry_budget(monkeypatch) -> None:
+    """500/502/504 exit the retry loop immediately. A regression that
+    adds them to `_RETRYABLE_STATUSES` would 3x latency before fallback —
+    catch it by asserting only 1 attempt per backend."""
+    monkeypatch.setattr(lc, "_RETRY_SLEEP", lambda s: None)
+    call_log: list[str] = []
+
+    def staged(url, *args, **kwargs):
+        call_log.append(url)
+        return httpx.Response(502, text="bad gateway")
+
+    with patch.object(httpx, "post", side_effect=staged):
+        out = review_diff([_hunk()], installation_id=2)
+
+    assert out.kind == "all_failed"
+    # 1 attempt per backend × 2 backends = 2 calls. Not 6 (would be retried).
+    assert len(call_log) == 2
 
 
 def test_envelope_non_json_returns_parse_failed(monkeypatch) -> None:
