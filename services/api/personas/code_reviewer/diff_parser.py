@@ -31,12 +31,27 @@ class DiffHunk:
 
     `body` retains the raw @@-prefixed hunk text for feeding back to
     the LLM as review context (matches `llm_client.Hunk(path, body)`).
+
+    Invariants enforced in `__post_init__`: non-empty `file_path`,
+    `new_start >= 1` (1-based line numbers per unified-diff spec),
+    `body` starts with `@@`. Each invariant catches a parser regression
+    at the boundary rather than letting a malformed hunk reach the LLM.
     """
 
     file_path: str
     new_start: int
     new_lines: frozenset[int]
     body: str
+
+    def __post_init__(self) -> None:
+        assert self.file_path, "DiffHunk.file_path must be non-empty"
+        assert self.new_start >= 1, (
+            f"DiffHunk.new_start must be >= 1 (got {self.new_start}); "
+            "unified-diff line numbers are 1-based"
+        )
+        assert self.body.startswith("@@"), (
+            "DiffHunk.body must start with the @@ hunk header"
+        )
 
 
 # Captures `+++ b/<path>` or `+++ /dev/null` (deletion). Group 1 is the
