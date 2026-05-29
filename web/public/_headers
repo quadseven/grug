@@ -1,0 +1,13 @@
+# Cloudflare Pages headers.
+# https://developers.cloudflare.com/pages/configuration/headers/
+#
+# HTML files must NOT be cached by the CDN — a stale HTML response served from
+# CF cache can point at JS/CSS bundles that were removed by the next deploy,
+# producing a "ghost route" 404 chain until the cache expires. Assets are
+# content-hashed (vite default) so they remain safe to cache aggressively.
+
+/*.html
+  Cache-Control: public, max-age=0, must-revalidate
+
+/
+  Cache-Control: public, max-age=0, must-revalidate
