@@ -98,6 +98,7 @@ def parse_diff(unified_diff: str) -> tuple[DiffHunk, ...]:
     hunks: list[DiffHunk] = []
     current_file: str | None = None
     binary_skip = False
+    deletion_skip = False
     i = 0
 
     while i < len(lines):
@@ -121,6 +122,7 @@ def parse_diff(unified_diff: str) -> tuple[DiffHunk, ...]:
             # below if it disagrees (e.g. mode-only files have no +++).
             current_file = m.group(2)
             binary_skip = False
+            deletion_skip = False
             i += 1
             continue
 
@@ -131,12 +133,20 @@ def parse_diff(unified_diff: str) -> tuple[DiffHunk, ...]:
 
         if line.startswith("+++ "):
             m = _NEW_FILE_RE.match(line)
-            if m and m.group(1) != "/dev/null":
+            if m and m.group(1) == "/dev/null":
+                # File deletion. Hunks follow with `@@ ... +0,0 @@`
+                # (new-side start = 0). There's nothing on the new
+                # side to review — skip the hunk block entirely.
+                # Without this, DiffHunk.__post_init__ asserts on
+                # new_start >= 1 and parse_diff crashes on real
+                # GitHub-emitted deletion diffs.
+                deletion_skip = True
+            elif m:
                 current_file = m.group(1)
             i += 1
             continue
 
-        if binary_skip or current_file is None:
+        if binary_skip or deletion_skip or current_file is None:
             i += 1
             continue
 

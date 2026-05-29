@@ -205,6 +205,25 @@ index abc..0000000
     assert parse_diff(diff) == ()
 
 
+def test_real_deletion_with_content_hunk_yields_zero_hunks() -> None:
+    """The realistic shape GitHub emits for a deleted text file: a
+    full `@@ -1,N +0,0 @@` hunk with each removed line. new_start=0
+    would trip DiffHunk.__post_init__ (new_start >= 1) and crash
+    parse_diff. The deletion_skip flag must suppress this hunk."""
+    diff = """diff --git a/old.py b/old.py
+deleted file mode 100644
+index abc..0000000
+--- a/old.py
++++ /dev/null
+@@ -1,3 +0,0 @@
+-line_one
+-line_two
+-line_three
+"""
+    # Must not raise + must produce zero hunks (nothing to review).
+    assert parse_diff(diff) == ()
+
+
 def test_single_line_hunk_without_count_parses() -> None:
     """GitHub emits `@@ -1 +1 @@` (no `,N` count) for single-line hunks.
     Tests should exercise the optional `,m` branch — without this, a
