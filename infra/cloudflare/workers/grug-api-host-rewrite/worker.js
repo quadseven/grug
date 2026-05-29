@@ -10,10 +10,10 @@
 // `X-Grug-CF-Secret` (parent issue #173) is the CF→AWS auth-boundary
 // tightening: the value is sourced from the `GRUG_CF_SECRET` Worker
 // secret binding, which `deploy.sh` PUTs from SSM `/grug/cf-shared-secret`
-// after every script upload. Lambda middleware (sibling slice #233)
-// validates the header on every non-`/livez` request. The api Lambda
-// has un-authenticated endpoints (`/livez`, `/api/v1/auth/github/callback`)
-// where this header is the only second-layer auth.
+// after every script upload. Lambda middleware validates the header on
+// every non-`/livez` request. The api Lambda has un-authenticated
+// endpoints (`/livez`, `/api/v1/auth/github/callback`) where this
+// header is the only second-layer auth.
 
 // Three placeholders are sed-substituted by infra/cloudflare/deploy.sh
 // at upload time so deploy.sh is the single source of truth. See

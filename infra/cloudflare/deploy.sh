@@ -15,7 +15,7 @@
 #                                            + Zone:Cache Purge + Account
 #                                            Settings:Read + User Memberships:Read
 #                                            + Workers Secrets:Edit (for the
-#                                            GRUG_CF_SECRET binding per #232))
+#                                            CF→AWS auth-boundary binding))
 #   - SSM `/grug/cloudflare-account-id`
 #   - SSM `/grug/cloudflare-zone-id`
 #   - SSM `/grug/cf-shared-secret`          (CF→AWS auth boundary; PUT as
@@ -130,17 +130,18 @@ deploy_one() {
     rm -f /tmp/worker.js
 
     local success
-    success=$(echo "$upload" | python3 -c "import json,sys; print(json.load(sys.stdin)['success'])")
+    success=$(echo "$upload" | parse_cf_success)
     if [ "$success" != "True" ]; then
-        echo "  ✗ Upload FAILED:"; echo "$upload" | python3 -m json.tool; exit 1
+        echo "  ✗ Upload FAILED. Raw response:"
+        echo "$upload"
+        exit 1
     fi
     echo "  ✓ Worker script uploaded"
 
-    # PUT the GRUG_CF_SECRET binding so worker.js can inject the
-    # X-Grug-CF-Secret header (parent #173 / this slice #232). The
-    # PUT-on-secrets endpoint is upsert semantics, so re-runs are safe.
-    # Skipped when the SSM secret hasn't been provisioned yet (see top
-    # of file for the rollout-order rationale).
+    # PUT the secret binding so worker.js can inject the auth-boundary
+    # header. The PUT-on-secrets endpoint is upsert semantics, so
+    # re-runs are safe. Skipped when the SSM secret hasn't been
+    # provisioned yet (see top of file for the rollout-order rationale).
     if [ -n "$CF_SHARED_SECRET" ]; then
         local secret_response
         secret_response=$(curl -sS -X PUT \
@@ -165,15 +166,25 @@ deploy_one() {
         -d "{\"pattern\":\"$route_pattern\",\"script\":\"$worker_name\"}")
 
     local route_success err_code
-    route_success=$(echo "$route_response" | python3 -c "import json,sys; print(json.load(sys.stdin)['success'])")
+    route_success=$(echo "$route_response" | parse_cf_success)
     if [ "$route_success" = "True" ]; then
         echo "  ✓ Route created: $route_pattern → $worker_name"
     else
-        err_code=$(echo "$route_response" | python3 -c "import json,sys; d=json.load(sys.stdin); print(d['errors'][0]['code'] if d.get('errors') else '')")
+        err_code=$(echo "$route_response" | python3 -c "
+import json, sys
+try:
+    d = json.load(sys.stdin)
+    errs = d.get('errors') or []
+    print(errs[0].get('code', '') if errs else '')
+except (json.JSONDecodeError, ValueError):
+    print('')
+")
         if [ "$err_code" = "10020" ]; then
             echo "  ✓ Route already exists: $route_pattern"
         else
-            echo "  ✗ Route POST FAILED:"; echo "$route_response" | python3 -m json.tool; exit 1
+            echo "  ✗ Route POST FAILED. Raw response:"
+            echo "$route_response"
+            exit 1
         fi
     fi
 }
@@ -185,7 +196,7 @@ echo "Done. Smoke:"
 echo "  curl -i -X POST https://webhook.grug.lol/webhook/github -H 'X-Hub-Signature-256: sha256=invalid' -d '{}'  # → 401 (HMAC)"
 echo "  curl -i https://api.grug.lol/livez                                                                          # → 200 ok"
 if [ -n "$CF_SHARED_SECRET" ]; then
-    echo "  # After sibling slice #233's middleware deploys:"
-    echo "  curl -i \"\$(pulumi -C $PULUMI_DIR stack output api_function_url)\"        # direct hit → 401 (X-Grug-CF-Secret missing)"
-    echo "  curl -i https://api.grug.lol/some-path                                                                    # via CF → reaches Lambda"
+    echo "  # Boundary check (after middleware enforces): direct must 401, via-CF must 200."
+    echo "  curl -i \"\$(pulumi -C $PULUMI_DIR stack output api_function_url)\"livez   # direct hit → 401 (header missing)"
+    echo "  curl -i https://api.grug.lol/livez                                                                       # via CF → 200"
 fi

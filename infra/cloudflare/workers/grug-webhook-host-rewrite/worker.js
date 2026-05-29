@@ -18,10 +18,10 @@
 // `X-Grug-CF-Secret` (parent issue #173) is the CF→AWS auth-boundary
 // tightening: the value is sourced from the `GRUG_CF_SECRET` Worker
 // secret binding, which `deploy.sh` PUTs from SSM `/grug/cf-shared-secret`
-// after every script upload. Lambda middleware (sibling slice #233)
-// validates the header on every non-`/livez` request. Webhook payloads
-// remain HMAC-protected by GitHub end-to-end; this header is additive
-// defense against direct Function-URL access bypassing CF entirely.
+// after every script upload. Lambda middleware validates the header on
+// every non-`/livez` request. Webhook payloads remain HMAC-protected
+// by GitHub end-to-end; this header is additive defense against direct
+// Function-URL access bypassing CF entirely.
 
 // Three placeholders are sed-substituted by infra/cloudflare/deploy.sh
 // at upload time so deploy.sh is the single source of truth for both
@@ -53,10 +53,9 @@ export default {
     if (typeof bindingValue === "string" && bindingValue.length > 0) {
       headers.set(SECRET_HEADER, bindingValue);
     } else {
-      // No binding deployed yet (undefined) — strip any client-supplied
-      // value so downstream sees the "unconfigured" path cleanly.
-      // Middleware in sibling slice #233 fail-opens when the SSM secret
-      // is empty, so strip-only here is safe during the rollout window.
+      // Strip any client-supplied value when no binding is configured.
+      // Middleware fail-opens when the binding is absent, so strip-only
+      // is safe.
       //
       // Empty-string is impossible-by-accident (CF API rejects empty
       // `text` on the binding PUT). If we see it here, the binding was
