@@ -86,6 +86,15 @@ _dd_api_key = aws.ssm.get_parameter(
     with_decryption=True,
 )
 
+# OpenRouter API key — pre-loaded by the operator (see docs/HITL_PREREQUISITES.md).
+# Consumed by the webhook Lambda only — Elder persona dispatches the LLM
+# call from the same path that handles `pull_request:opened`. api Lambda
+# never needs it; scoping to webhook keeps the IAM blast radius small.
+_openrouter_api_key = aws.ssm.get_parameter(
+    name="/grug/openrouter-api-key",
+    with_decryption=True,
+)
+
 # DD extension version baked into the Lambda image (per Dockerfile.lambda).
 # Lambda Container package_type can't attach layers; extension binary is
 # COPYd from public.ecr.aws/datadog/lambda-extension-arm:<v>. Bump here
@@ -157,7 +166,7 @@ webhook = lambda_service.create(
     # lambda_service already wraps the arn list in `Output.all(...).apply()`,
     # so Output[str] arns resolve correctly. Issue #235 tracks tightening
     # the type contract via a structural Protocol.
-    extra_ssm_secrets=[_dd_api_key, cf_secret.ssm_parameter],
+    extra_ssm_secrets=[_dd_api_key, cf_secret.ssm_parameter, _openrouter_api_key],
     # NOTE: DD extension is BAKED into the Lambda container image
     # (services/webhook/Dockerfile.lambda copies from
     # public.ecr.aws/datadog/lambda-extension-arm:<v>). Lambda Container
@@ -175,6 +184,8 @@ webhook = lambda_service.create(
         # DDB allowlist gate (Slice 5 #26). Webhook reads INST# + USER#
         # rows directly (no KMS — token blobs are api-Lambda-only).
         "GRUG_DDB_TABLE": grug_main_table.name,
+        # Elder persona LLM client — webhook-only (api never calls LLMs).
+        "GRUG_OPENROUTER_API_KEY_SSM": _openrouter_api_key.name,
         # CF→AWS auth boundary — middleware reads at cold start (#173).
         "GRUG_CF_SHARED_SECRET_SSM": cf_secret.ssm_parameter.name,
         # Datadog APM (datadog_lambda wrapper finds real handler via

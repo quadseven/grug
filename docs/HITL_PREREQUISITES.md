@@ -59,13 +59,20 @@ aws ssm put-parameter --region us-east-1 \
   --name /grug/github-app-webhook-secret \
   --type SecureString \
   --value "<the openssl rand -hex 32 output>"
+
+# OpenRouter API key — for Elder persona LLM calls (PRD #181). Mint at
+# https://openrouter.ai/settings/keys. Webhook Lambda only.
+aws ssm put-parameter --region us-east-1 \
+  --name /grug/openrouter-api-key \
+  --type SecureString \
+  --value "sk-or-v1-..."
 ```
 
 Verify:
 
 ```bash
 aws ssm get-parameters-by-path --region us-east-1 --path /grug --recursive --query 'Parameters[].Name'
-# Expected: ["/grug/github-app-id", "/grug/github-app-private-key", "/grug/github-app-webhook-secret"]
+# Expected: ["/grug/github-app-id", "/grug/github-app-private-key", "/grug/github-app-webhook-secret", "/grug/openrouter-api-key"]
 ```
 
 ## 4. Reserve the OIDC role for GitHub Actions deploy
