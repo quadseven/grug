@@ -24,6 +24,7 @@ import pulumi_cloudflare as cloudflare
 import pulumi_datadog as _datadog
 
 from components import (
+    cf_shared_secret,
     cloudflare_dns,
     dd_monitors,
     dd_rum,
@@ -116,6 +117,14 @@ _iam_propagation_wait = _deploy_role_bundle.iam_propagation_wait
 grug_main_table = ddb_table.create("grug-main")
 grug_tokens_cmk = kms_cmk.create("grug-tokens")
 
+# CF→AWS auth boundary (issue #231 / parent #173). SSM SecureString
+# holding the shared secret CF Workers inject as X-Grug-CF-Secret. Both
+# Lambdas receive the param name as an env var and the IAM grant via
+# extra_ssm_secrets — middleware (sibling #233) reads at cold start. Safe
+# to deploy alone: until #232 + #233 land, the env var is loaded but
+# nothing validates against it. Production traffic unchanged.
+cf_secret = cf_shared_secret.create()
+
 # ECR repo for the webhook Lambda image. Lifecycle: untagged images expire
 # after 14 days (avoids ~$0.10/GB/mo image graveyard).
 webhook_ecr = ecr_repo.create(
@@ -145,7 +154,12 @@ webhook = lambda_service.create(
     ecr_repo=webhook_ecr,
     image_tag=webhook_image_tag,
     secrets=secrets,
-    extra_ssm_secrets=[_dd_api_key],
+    # The CF-shared-secret SSM param is a Pulumi-managed resource (not a
+    # pre-loaded GetParameterResult) but lambda_service only accesses
+    # `.arn` / `.name`, both of which the Parameter resource exposes
+    # directly. Duck-typed pass-through avoids a circular get_parameter
+    # lookup that would fail on the first `pulumi up`.
+    extra_ssm_secrets=[_dd_api_key, cf_secret.ssm_parameter],
     # NOTE: DD extension is BAKED into the Lambda container image
     # (services/webhook/Dockerfile.lambda copies from
     # public.ecr.aws/datadog/lambda-extension-arm:<v>). Lambda Container
@@ -163,6 +177,11 @@ webhook = lambda_service.create(
         # DDB allowlist gate (Slice 5 #26). Webhook reads INST# + USER#
         # rows directly (no KMS — token blobs are api-Lambda-only).
         "GRUG_DDB_TABLE": grug_main_table.name,
+        # CF→AWS auth boundary (issue #231 / parent #173). Middleware
+        # (sibling #233) reads this env var to locate the SSM param.
+        # Until sibling slices land, the env var is loaded but no path
+        # validates against it — safe rollout.
+        "GRUG_CF_SHARED_SECRET_SSM": cf_secret.ssm_parameter.name,
         # Datadog APM (datadog_lambda wrapper finds real handler via
         # DD_LAMBDA_HANDLER; layer adds the trace agent + log forwarder).
         "DD_LAMBDA_HANDLER": "lambda_handler.handler",
@@ -270,7 +289,9 @@ api_lambda = lambda_service.create(
     ecr_repo=api_ecr,
     image_tag=api_image_tag,
     secrets=secrets,
-    extra_ssm_secrets=[_dd_api_key],
+    # See webhook above for the cf_secret.ssm_parameter duck-typed
+    # pass-through rationale (issue #231 / parent #173).
+    extra_ssm_secrets=[_dd_api_key, cf_secret.ssm_parameter],
     env_vars={
         "GRUG_ENV": env,
         "GRUG_LOG_LEVEL": "INFO",
@@ -278,6 +299,8 @@ api_lambda = lambda_service.create(
         "GRUG_DOMAIN": domain,
         "GRUG_DDB_TABLE": grug_main_table.name,
         "GRUG_KMS_CMK_ARN": grug_tokens_cmk.arn,
+        # CF→AWS auth boundary — see webhook block above (issue #231).
+        "GRUG_CF_SHARED_SECRET_SSM": cf_secret.ssm_parameter.name,
         "GITHUB_APP_WEBHOOK_SECRET_SSM": secrets["github-app-webhook-secret"].name,
         # OAuth (Slice 3 #24 consumes)
         "GITHUB_APP_CLIENT_ID_SSM": secrets["github-app-client-id"].name,
@@ -470,3 +493,8 @@ pulumi.export("synthetic_uptime_id", monitors.uptime.id)
 # values live in SSM SecureStrings managed by the same component.
 pulumi.export("rum_application_id_ssm_name", rum.ssm_application_id.name)
 pulumi.export("rum_client_token_ssm_name", rum.ssm_client_token.name)
+
+# CF→AWS auth boundary (issue #231 / parent #173). Sibling slice #232
+# (infra/cloudflare/deploy.sh) reads this SSM param name and PUTs the
+# value as the GRUG_CF_SECRET binding on both host-rewrite Workers.
+pulumi.export("cf_shared_secret_ssm_name", cf_secret.ssm_parameter.name)
