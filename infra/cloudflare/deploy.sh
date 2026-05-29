@@ -13,9 +13,14 @@
 #   - SSM `/grug/cloudflare-api-token`     (Zone:DNS:Edit + Workers
 #                                            Scripts:Edit + Workers Routes:Edit
 #                                            + Zone:Cache Purge + Account
-#                                            Settings:Read + User Memberships:Read)
+#                                            Settings:Read + User Memberships:Read
+#                                            + Workers Secrets:Edit (for the
+#                                            GRUG_CF_SECRET binding per #232))
 #   - SSM `/grug/cloudflare-account-id`
 #   - SSM `/grug/cloudflare-zone-id`
+#   - SSM `/grug/cf-shared-secret`          (CF→AWS auth boundary; PUT as
+#                                            GRUG_CF_SECRET Worker binding
+#                                            after each script upload)
 #   - Pulumi stack output `webhook_function_url` (from `pulumi stack output`)
 #
 # Re-run after every `pulumi up` that recreated the Lambda (Function
@@ -35,6 +40,20 @@ CF_ACCOUNT=$(aws ssm get-parameter --region us-east-1 \
 CF_ZONE=$(aws ssm get-parameter --region us-east-1 \
     --name /grug/cloudflare-zone-id \
     --query 'Parameter.Value' --output text)
+
+# CF→AWS auth boundary (parent #173 / this slice #232). Optional: deploy
+# can run before sibling slice #234's SSM param exists. If absent, we
+# skip the binding-set step and the Worker's `env.GRUG_CF_SECRET` is
+# undefined → worker.js falls through to its strip-only branch, Lambda
+# middleware (#233) fail-opens. Once the operator runs `pulumi up` on
+# #234, re-run this script to publish the binding.
+CF_SHARED_SECRET=$(aws ssm get-parameter --region us-east-1 \
+    --name /grug/cf-shared-secret --with-decryption \
+    --query 'Parameter.Value' --output text 2>/dev/null || echo "")
+if [ -z "$CF_SHARED_SECRET" ]; then
+    echo "  ⚠ /grug/cf-shared-secret missing in SSM — skipping GRUG_CF_SECRET binding."
+    echo "    Run \`pulumi up\` on the grug stack first (creates the secret), then re-run this script."
+fi
 
 # Pull current Lambda Function URLs from Pulumi stack output.
 PULUMI_DIR="${PULUMI_CWD:-$(dirname "$0")/../pulumi}"
@@ -78,6 +97,26 @@ deploy_one() {
     fi
     echo "  ✓ Worker script uploaded"
 
+    # PUT the GRUG_CF_SECRET binding so worker.js can inject the
+    # X-Grug-CF-Secret header (parent #173 / this slice #232). The
+    # PUT-on-secrets endpoint is upsert semantics, so re-runs are safe.
+    # Skipped when the SSM secret hasn't been provisioned yet (see top
+    # of file for the rollout-order rationale).
+    if [ -n "$CF_SHARED_SECRET" ]; then
+        local secret_response
+        secret_response=$(curl -sS -X PUT \
+            -H "Authorization: Bearer $CF_TOKEN" \
+            -H "Content-Type: application/json" \
+            -d "{\"name\":\"GRUG_CF_SECRET\",\"type\":\"secret_text\",\"text\":\"$CF_SHARED_SECRET\"}" \
+            "https://api.cloudflare.com/client/v4/accounts/$CF_ACCOUNT/workers/scripts/$worker_name/secrets")
+        local secret_success
+        secret_success=$(echo "$secret_response" | python3 -c "import json,sys; print(json.load(sys.stdin)['success'])")
+        if [ "$secret_success" != "True" ]; then
+            echo "  ✗ GRUG_CF_SECRET binding FAILED:"; echo "$secret_response" | python3 -m json.tool; exit 1
+        fi
+        echo "  ✓ GRUG_CF_SECRET binding set"
+    fi
+
     local route_response
     route_response=$(curl -sS -X POST \
         "https://api.cloudflare.com/client/v4/zones/$CF_ZONE/workers/routes" \
@@ -102,5 +141,10 @@ deploy_one "grug-webhook-host-rewrite" "webhook.grug.lol/*" "webhook_function_ur
 deploy_one "grug-api-host-rewrite"     "api.grug.lol/*"     "api_function_url"
 
 echo "Done. Smoke:"
-echo "  curl -i -X POST https://webhook.grug.lol/webhook/github -H 'X-Hub-Signature-256: sha256=invalid' -d '{}'  # → 401"
+echo "  curl -i -X POST https://webhook.grug.lol/webhook/github -H 'X-Hub-Signature-256: sha256=invalid' -d '{}'  # → 401 (HMAC)"
 echo "  curl -i https://api.grug.lol/livez                                                                          # → 200 ok"
+if [ -n "$CF_SHARED_SECRET" ]; then
+    echo "  # After sibling slice #233's middleware deploys:"
+    echo "  curl -i \"\$(pulumi -C $PULUMI_DIR stack output api_function_url)\"        # direct hit → 401 (X-Grug-CF-Secret missing)"
+    echo "  curl -i https://api.grug.lol/some-path                                                                    # via CF → reaches Lambda"
+fi
