@@ -20,7 +20,7 @@ ADR-0001 (rule-of-three deferred shared package).
 """
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import asdict, dataclass
 from typing import Literal
 
 import httpx
@@ -117,18 +117,14 @@ def post_review(
     call site is responsible for invalidating the cache and retrying.
     Same pattern as `post_check_run`.
     """
-    body = {
-        "commit_id": result.commit_id,
-        "event": result.event,
-        "body": result.body,
-        "comments": [
-            {"path": c.path, "line": c.line, "body": c.body}
-            for c in result.comments
-        ],
-    }
+    # `asdict` recursively converts ReviewResult + nested InlineComments
+    # into the exact dict shape GitHub expects (commit_id/event/body
+    # /comments with path/line/body). Manual marshalling would have to
+    # stay in lockstep with field renames; this stays correct by
+    # construction.
     resp = httpx.post(
         f"{_GH_API}/repos/{owner}/{repo}/pulls/{pull_number}/reviews",
-        json=body,
+        json=asdict(result),
         headers={
             "Authorization": f"Bearer {install_token}",
             "Accept": "application/vnd.github+json",
