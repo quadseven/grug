@@ -16,6 +16,7 @@ import os
 
 from fastapi import FastAPI, Header, HTTPException, Request, status
 
+from cf_auth import CfAuthMiddleware
 from hmac_verify import verify_signature
 from observability import configure_logging
 from secrets_loader import get_webhook_secret
@@ -30,6 +31,13 @@ app = FastAPI(
     redoc_url=None,
     openapi_url=None,
 )
+
+# CF→AWS auth boundary — reject direct Function URL hits that bypass
+# Cloudflare. Fail-open when the env var/SSM secret isn't configured
+# yet so deploy ordering across Pulumi + Workers + service can race
+# without breaking production traffic. GitHub webhook HMAC is end-to-end
+# and independent of this header — both must pass for delivery.
+app.add_middleware(CfAuthMiddleware)
 
 
 @app.get("/livez")
