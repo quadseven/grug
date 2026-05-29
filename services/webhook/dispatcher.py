@@ -330,15 +330,19 @@ def _dispatch_tpm(
     *, installation_id: int, owner: str, repo_name: str, head_sha: str,
     pr_number: int, pr_body: str,
 ) -> dict[str, str]:
-    """TPM persona dispatch — pure evaluate + publish. Catches publish
-    errors locally so the Elder dispatch can still run."""
+    """TPM persona dispatch — pure evaluate + publish. Catches BOTH
+    evaluate-time and publish-time exceptions locally so the Elder
+    dispatch (which runs after this) can still execute. Without the
+    broad final-guard, a future bug in `evaluate_pull_request` or an
+    import-time failure of personas.tpm would propagate, skipping
+    Elder entirely and violating the independence acceptance criterion.
+    """
     import httpx  # type: ignore
-    from personas.tpm.persona import (  # type: ignore
-        evaluate_pull_request, publish_tpm_evaluation,
-    )
-
-    evaluation = evaluate_pull_request(pr_body)
     try:
+        from personas.tpm.persona import (  # type: ignore
+            evaluate_pull_request, publish_tpm_evaluation,
+        )
+        evaluation = evaluate_pull_request(pr_body)
         publish_tpm_evaluation(
             evaluation,
             installation_id=installation_id,
@@ -347,6 +351,10 @@ def _dispatch_tpm(
             head_sha=head_sha,
             pr_number=pr_number,
         )
+        return {
+            "persona": "tpm",
+            "result": "pass" if evaluation.passed else "fail",
+        }
     except (httpx.HTTPStatusError, httpx.RequestError) as e:
         log.error(
             "tpm_publish_failed",
@@ -361,10 +369,22 @@ def _dispatch_tpm(
             },
         )
         return {"persona": "tpm", "result": "publish_failed"}
-    return {
-        "persona": "tpm",
-        "result": "pass" if evaluation.passed else "fail",
-    }
+    except Exception as e:  # noqa: BLE001 — final guard
+        # Broad catch mirrors _dispatch_code_reviewer's final-guard
+        # pattern. Without it, an unexpected exception in
+        # evaluate_pull_request (or its import) would propagate up and
+        # skip Elder entirely, violating the independence criterion.
+        # exc_info=True carries the traceback to DD/Sentry.
+        log.error(
+            "tpm_dispatch_unhandled",
+            extra={
+                "installation_id": installation_id,
+                "owner": owner, "repo": repo_name, "pr_number": pr_number,
+                "kind": type(e).__name__,
+            },
+            exc_info=True,
+        )
+        return {"persona": "tpm", "result": "unhandled_error"}
 
 
 def _dispatch_code_reviewer(
