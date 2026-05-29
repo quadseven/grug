@@ -19,6 +19,7 @@ can reach the Lambda without a header.
 """
 from __future__ import annotations
 
+import asyncio
 import hmac
 import logging
 import os
@@ -49,6 +50,12 @@ _FAIL_OPEN_ERRORS = (LookupError, ClientError, BotoCoreError)
 # Per-process throttle for the "unconfigured" warning log. Unconfigured
 # state is a STATIC misconfig — logging it on every request floods DD
 # with millions of identical warnings during the rollout window.
+#
+# Unlocked dict mutation is safe under Mangum's one-event-per-container
+# model. If/when this code moves to a multi-coroutine ASGI server
+# (uvicorn workers in-process), the race becomes benign-but-real (a
+# duplicate log at a throttle boundary). Add a `threading.Lock` then,
+# or migrate to `contextvars` if per-request semantics are needed.
 _LOG_THROTTLE_SECONDS = 60.0
 _last_unconfigured_log_at: dict[str, float] = {}
 
@@ -112,7 +119,13 @@ class CfAuthMiddleware(BaseHTTPMiddleware):
             return await call_next(request)
 
         try:
-            expected = self._secret_loader()
+            # Cold-start path calls sync boto3 ssm.get_parameter — wrap
+            # in asyncio.to_thread to keep the event loop unblocked.
+            # Warm-path is a memoized dict lookup, ~microseconds, so the
+            # thread hop is wasted but negligible. Mangum runs one event
+            # per container; this matters most for any future lifespan
+            # or background-task coroutines that would otherwise stall.
+            expected = await asyncio.to_thread(self._secret_loader)
         except _FAIL_OPEN_ERRORS as e:
             # Known misconfig classes — fail-open with throttled log.
             # Programmer bugs (AttributeError, NameError, TypeError, etc.)
