@@ -44,3 +44,8 @@ def get_app_id() -> str:
 def get_app_private_key() -> str:
     name = os.getenv("GITHUB_APP_PRIVATE_KEY_SSM", "")
     return _get_ssm_secure_string(name)
+
+
+def get_openrouter_api_key() -> str:
+    name = os.getenv("GRUG_OPENROUTER_API_KEY_SSM", "")
+    return _get_ssm_secure_string(name)
