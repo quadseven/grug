@@ -13,7 +13,7 @@ on:
       - 'services/api/**'
       - 'services/webhook/**'
       - 'scripts/check-mirrored-files.sh'
-      - '.github/workflows/drift-lint.yml'
+      - '.github/workflows/check.drift-lint.yml'
   push:
     branches: [main]
     paths:

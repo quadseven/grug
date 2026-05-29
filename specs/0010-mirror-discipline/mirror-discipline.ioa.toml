@@ -92,7 +92,7 @@ effect = [
   { type = "set_bool", var = "drift_lint_runs_on_every_pr_per_cross_service_primitives", value = true },
   { type = "set_bool", var = "scripts_check_mirrored_files_sh_is_authoritative_list_per_cross_service_primitives", value = true },
 ]
-hint = "drift-lint workflow gates every PR via .github/workflows/drift-lint.yml. Script's MIRRORED_WITH_HEADER + MIRRORED_BYTE_IDENTICAL arrays are the authoritative source of truth."
+hint = "drift-lint workflow gates every PR via .github/workflows/check.drift-lint.yml. Script's MIRRORED_WITH_HEADER + MIRRORED_BYTE_IDENTICAL arrays are the authoritative source of truth."
 
 [[action]]
 name = "AttestExtractionContract"
