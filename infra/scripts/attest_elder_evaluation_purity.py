@@ -43,6 +43,19 @@ ALLOWED_IN_PARSE_DIFF: frozenset[str] = frozenset({
     "tuple", "list", "set", "frozenset", "int", "str", "len", "range",
 })
 
+# Per-function explicit parameter-method allowlist. ONLY these specific
+# `<param>.<method>` chains are pure-by-construction. Without the explicit
+# allowlist, `_local_or_attribute_safe` previously treated every parameter
+# as a safe call root — meaning `llm_response.some_io_call()` inside
+# evaluate_diff would silently pass the purity attester despite spec 0015's
+# no-IO claim. Caught by codex peer-review.
+ALLOWED_PARAM_METHODS_PARSE_DIFF: frozenset[tuple[str, str]] = frozenset({
+    # `unified_diff` is typed `str`; `.splitlines()` is pure.
+    ("unified_diff", "splitlines"),
+})
+
+ALLOWED_PARAM_METHODS_EVALUATE_DIFF: frozenset[tuple[str, str]] = frozenset()
+
 # Allowlist for `evaluate_diff` body.
 ALLOWED_IN_EVALUATE_DIFF: frozenset[str] = frozenset({
     "_hunk_line_index",
@@ -54,60 +67,84 @@ ALLOWED_IN_EVALUATE_DIFF: frozenset[str] = frozenset({
 _STRING_LITERAL_METHOD_SAFE = "<string_literal_method>"
 
 
-def _call_target_name(call: ast.Call) -> str | None:
-    """Return the leftmost-name of the call target. For `re.compile(...)`
-    returns `re`; for `_helper(...)` returns `_helper`. For
-    `"\\n".join(...)` returns a sentinel (string-literal methods are
-    pure). None for `foo()()` (refuse to prove pure on call-of-call)."""
+def _call_target(call: ast.Call) -> tuple[str | None, str | None]:
+    """Return `(root_name, method_or_None)` for a call target.
+
+    `foo(...)` → `("foo", None)`. `obj.method()` → `("obj", "method")`.
+    `"\\n".join(...)` → `(_STRING_LITERAL_METHOD_SAFE, None)`.
+    `foo()()` → `(None, None)` (refuse to prove pure).
+    """
     target = call.func
     if isinstance(target, ast.Name):
-        return target.id
+        return target.id, None
     if isinstance(target, ast.Attribute):
         root = target
         while isinstance(root.value, ast.Attribute):
             root = root.value
         if isinstance(root.value, ast.Name):
-            return root.value.id
+            return root.value.id, target.attr
         if isinstance(root.value, ast.Constant):
             # Method call on a constant literal (e.g. "\n".join(...)).
             # These are pure-by-construction for builtin types.
-            return _STRING_LITERAL_METHOD_SAFE
-    return None
+            return _STRING_LITERAL_METHOD_SAFE, None
+    return None, None
 
 
 def _violations_in_function(
-    func: ast.FunctionDef | ast.AsyncFunctionDef, allowed: frozenset[str],
+    func: ast.FunctionDef | ast.AsyncFunctionDef,
+    allowed: frozenset[str],
+    allowed_param_methods: frozenset[tuple[str, str]],
 ) -> list[str]:
     found: list[str] = []
+    params = {arg.arg for arg in func.args.args}
+    locals_built = _locals_built_in(func)
     for node in ast.walk(func):
         if not isinstance(node, ast.Call):
             continue
-        name = _call_target_name(node)
-        if name is None:
+        root, method = _call_target(node)
+        if root is None:
             found.append(
                 f"non-name call target at line {node.lineno} (e.g. `foo()()`) "
                 f"— refuse to prove pure"
             )
             continue
-        if name == _STRING_LITERAL_METHOD_SAFE:
+        if root == _STRING_LITERAL_METHOD_SAFE:
             continue
-        if name not in allowed:
-            # Method calls on parameters or locals (e.g. `body_lines.append(...)`)
-            # are pure-by-construction for builtin types. The attester can't
-            # distinguish param-method from module-fn without type info; we
-            # accept method-on-Attribute as a known-pure pattern.
-            # But only when the root name is a local variable, not a module.
-            # Heuristic: if `name` is lowercase + matches a known stdlib
-            # module (`os`, `sys`, `httpx`, etc.), this is an import call
-            # and must be allowlisted.
-            if _looks_like_stdlib_module(name):
+        # Module-level allowlist (functions, dataclass constructors,
+        # builtins).
+        if root in allowed:
+            continue
+        # Param methods — must be explicitly allowlisted as a
+        # `(<param>, <method>)` pair. Without this, `llm_response.io()`
+        # would silently pass.
+        if root in params:
+            if method is None:
                 found.append(
-                    f"call to non-allowlisted module `{name}` at line {node.lineno}"
+                    f"direct call on parameter `{root}` at line {node.lineno} "
+                    f"— params are not call-roots; only specific "
+                    f"`(param, method)` pairs are permitted"
                 )
-            elif name not in _local_or_attribute_safe(func):
+                continue
+            if (root, method) not in allowed_param_methods:
                 found.append(
-                    f"call to non-allowlisted `{name}` at line {node.lineno}"
+                    f"call `{root}.{method}` on parameter at line "
+                    f"{node.lineno} — not in ALLOWED_PARAM_METHODS"
                 )
+            continue
+        # Method calls on locals built up inside the function are
+        # pure-by-construction (the local was either a list/set/dict
+        # literal or assignment of a pure expression).
+        if root in locals_built:
+            continue
+        # Known impure module → clearer error message.
+        if _looks_like_stdlib_module(root):
+            found.append(
+                f"call to impure module `{root}` at line {node.lineno}"
+            )
+        else:
+            found.append(
+                f"call to non-allowlisted `{root}` at line {node.lineno}"
+            )
     return found
 
 
@@ -124,13 +161,14 @@ def _looks_like_stdlib_module(name: str) -> bool:
     return name in _IMPURE_MODULES
 
 
-def _local_or_attribute_safe(func: ast.FunctionDef | ast.AsyncFunctionDef) -> set[str]:
-    """Names that are function-local (params, assignments) — calls on
-    these are assumed pure-by-construction (param method calls on
-    builtin types like `list.append`)."""
+def _locals_built_in(func: ast.FunctionDef | ast.AsyncFunctionDef) -> set[str]:
+    """Names introduced by an assignment INSIDE the function body
+    (`body_lines = []`, `kept: list[Finding] = []`). NOT parameters —
+    those are caller-controlled and could be IO-bearing objects, so
+    method calls on them require explicit allowlisting (see
+    ALLOWED_PARAM_METHODS_*).
+    """
     names: set[str] = set()
-    for arg in func.args.args:
-        names.add(arg.arg)
     for node in ast.walk(func):
         if isinstance(node, ast.Assign):
             for tgt in node.targets:
@@ -139,18 +177,17 @@ def _local_or_attribute_safe(func: ast.FunctionDef | ast.AsyncFunctionDef) -> se
         elif isinstance(node, ast.AugAssign) and isinstance(node.target, ast.Name):
             names.add(node.target.id)
         elif isinstance(node, ast.AnnAssign) and isinstance(node.target, ast.Name):
-            # `body_lines: list[str] = [line]` — typed assignment that
-            # introduces a local. Without this branch the attester
-            # mistakes method calls on the local for module-level calls.
             names.add(node.target.id)
         elif isinstance(node, ast.For) and isinstance(node.target, ast.Name):
-            # `for h in hunks:` — loop variable is a local.
             names.add(node.target.id)
     return names
 
 
 def _check_function(
-    paths: tuple[Path, ...], fn_name: str, allowed: frozenset[str],
+    paths: tuple[Path, ...],
+    fn_name: str,
+    allowed: frozenset[str],
+    allowed_param_methods: frozenset[tuple[str, str]],
 ) -> list[str]:
     failures: list[str] = []
     for path in paths:
@@ -171,7 +208,7 @@ def _check_function(
                 f"FAIL: {path} has {len(fns)} {fn_name} defs (expected 1)"
             )
             continue
-        viols = _violations_in_function(fns[0], allowed)
+        viols = _violations_in_function(fns[0], allowed, allowed_param_methods)
         if viols:
             failures.append(
                 f"FAIL: {path} — {fn_name} is not pure:\n"
@@ -189,10 +226,16 @@ def main() -> int:
         return 1
     failures: list[str] = []
     failures.extend(
-        _check_function(PARSE_DIFF_PATHS, "parse_diff", ALLOWED_IN_PARSE_DIFF)
+        _check_function(
+            PARSE_DIFF_PATHS, "parse_diff",
+            ALLOWED_IN_PARSE_DIFF, ALLOWED_PARAM_METHODS_PARSE_DIFF,
+        )
     )
     failures.extend(
-        _check_function(EVALUATE_DIFF_PATHS, "evaluate_diff", ALLOWED_IN_EVALUATE_DIFF)
+        _check_function(
+            EVALUATE_DIFF_PATHS, "evaluate_diff",
+            ALLOWED_IN_EVALUATE_DIFF, ALLOWED_PARAM_METHODS_EVALUATE_DIFF,
+        )
     )
     if failures:
         print("\n".join(failures))
