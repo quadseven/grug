@@ -12,6 +12,7 @@ The vocabulary used in `services/`, `infra/`, and `web/`. Terms map to identifie
 | **Grug Boss** | Public-facing name of the GitHub App users install on their repos. Same product as Grug; "Grug Boss" is the GitHub Marketplace listing handle. |
 | **Persona** | A bounded behavior surface Grug applies per PR. v1 ships exactly one: **TPM** (static Definition-of-Ready check). v1.5+ roadmap (per PRD #21) adds `code-reviewer`, `release-manager`, `stuck-PR-pulse`, and the LLM scope-review half of TPM. Personas are per-repo togglable. |
 | **TPM persona** | Today's only persona. Static **Definition-of-Ready (DoR) check** that blocks merge if PR body is malformed. The companion **Scope review** half is wired as a `poolside_client.py` hook in `evaluate()` per the `__init__.py` docstring but is NOT shipped — see "Roadmap" rows. See [`services/{api,webhook}/personas/tpm/`](services/api/personas/tpm/). |
+| **Elder persona (in-progress)** | The code-reviewer persona. Reads the PR diff and posts inline review comments. v1 ships pure foundations: `personas/code_reviewer/diff_parser.py` (unified-diff → `DiffHunk`s) + `personas/code_reviewer/persona.py` (`evaluate_diff` rollup). LLM-driven via `llm_client.py` (Poolside + OpenRouter round-robin). Advisory by default; blocking-flip lives in the publisher slice. See spec 0015 + [`services/{api,webhook}/personas/code_reviewer/`](services/api/personas/code_reviewer/). |
 | **Pulse (roadmap)** | Scheduled (non-PR-triggered) persona work, named `stuck-PR-pulse` in the future-persona list in `services/webhook/main.py`. Not implemented. Intent: weekly issue-grooming sweep against Grugboard. |
 
 ## Process-gate concepts
@@ -25,6 +26,16 @@ The vocabulary used in `services/`, `infra/`, and `web/`. Terms map to identifie
 | **CheckRunResult** | Frozen dataclass that maps directly onto GitHub's Checks API `POST /repos/{owner}/{repo}/check-runs` payload. Carries the `status=completed` ↔ `conclusion` cross-field invariant — enforced in `__post_init__`. See [`services/{api,webhook}/github_checks_client.py`](services/api/github_checks_client.py). |
 | **`post_check_run` (publisher)** | Module-level function in `github_checks_client.py` that POSTs a `CheckRunResult` to GitHub. The acceptance-criteria spelling "CheckRunPublisher" is the *concept name* — the actual identifier is a function, not a class. |
 | **Scope review (roadmap)** | Advisory LLM pass over PR title + body. Wired as a `poolside_client.py` hook called from `evaluate_pull_request(...)` per the `personas/tpm/__init__.py` docstring, but **`poolside_client.py` does not exist in the repo today** — feature is roadmap-only. Intended behavior: flag title↔body mismatch, AC testability, scope-creep, XL inflation; posted as a comment, never blocking. |
+
+## Elder persona — code review
+
+| Term | Definition |
+|---|---|
+| **`parse_diff`** | Pure function in `personas/code_reviewer/diff_parser.py` (mirrored — ADR-0001) that takes a unified-diff string and returns `tuple[DiffHunk, ...]`. Hand-rolled (no `unidiff` dep) — the subset we need is small and Lambda cold-start cost of the dep wouldn't pay back. Handles multi-file diffs, skips binary blocks, picks the new-side path on renames. Spec 0015 §Parse contract attests purity. |
+| **`DiffHunk`** | Frozen dataclass — fields `file_path: str`, `new_start: int`, `new_lines: frozenset[int]`, `body: str`. `new_lines` is the set of new-file line numbers that were added or are context-with-a-removed-neighbor; the Elder anti-hallucination filter rejects LLM findings whose `(file, line)` is not in this set. `body` retains the raw @@-prefixed text for feeding back to the LLM as review context. |
+| **`evaluate_diff`** | Pure function in `personas/code_reviewer/persona.py` (mirrored) that consumes `tuple[DiffHunk, ...]` + `LlmReviewResponse` (from `llm_client.py`) and produces a `CodeReviewEvaluation`. Drops findings outside the diff (anti-hallucination); maps the wire-format `llm_client.Finding` (`path`, `rule`) to the persona-level `Finding` (`file`, `rule_name`, plus `suggestion`). Spec 0015 §Evaluate contract attests purity. |
+| **`Finding` (persona-level)** | Frozen dataclass distinct from `llm_client.Finding`. Fields: `file`, `line`, `severity: Literal["low","medium","high","critical"]`, `rule_name`, `message`, `suggestion`. Posted as GitHub inline review comments by the publisher slice. |
+| **`CodeReviewEvaluation`** | Aggregate verdict from one Elder pass. Frozen dataclass — fields `findings: tuple[Finding, ...]`, `passed: bool`, `conclusion: CheckConclusion`. `passed = no high+critical findings`; medium+low are advisory. When the LLM didn't produce content (`kind in {no_diff, all_failed, parse_failed}`), `passed=True` + `conclusion=neutral` — Elder is advisory-first, infra flakiness must not block PRs. Composes 1:1 into a `CheckRunResult` (spec 0001). |
 
 ## Enforcement concepts
 
@@ -84,6 +95,8 @@ The following eight modules exist as byte-identical copies under both `services/
 | `ports/token_cache.py` | `TokenCache` Protocol + `InMemoryTokenCache` impl. |
 | `personas/tpm/dor_checks.py` | The 5 `DoR check` rules + the `CheckResult` dataclass. |
 | `personas/tpm/persona.py` | `TpmEvaluation` dataclass + `evaluate_pull_request(...)` entry point. |
+| `personas/code_reviewer/diff_parser.py` | `DiffHunk` dataclass + pure `parse_diff(unified_diff)` for the Elder persona. |
+| `personas/code_reviewer/persona.py` | `Finding` + `CodeReviewEvaluation` dataclasses + pure `evaluate_diff(hunks, llm_response)`. |
 
 ## Infrastructure concepts
 
