@@ -34,6 +34,19 @@ MAIN_PATHS = (
     REPO_ROOT / "services/webhook/main.py",
 )
 
+# Cross-source structural-drift guard: the header literal must match
+# across the Lambda middleware, the CF Worker code, the deploy script
+# that templates the Workers, and the DD monitor that alerts on
+# mismatches. If any side renames the header without the others, the
+# auth boundary silently fails and the monitor stops alerting.
+HEADER_LITERAL = "X-Grug-CF-Secret"
+HEADER_LITERAL_SOURCES = (
+    REPO_ROOT / "services/api/cf_auth.py",
+    REPO_ROOT / "services/webhook/cf_auth.py",
+    REPO_ROOT / "infra/cloudflare/deploy.sh",
+    REPO_ROOT / "infra/pulumi/components/dd_monitors.py",
+)
+
 
 def _registers_middleware(tree: ast.Module) -> bool:
     """Return True iff `app.add_middleware(CfAuthMiddleware)` is called."""
@@ -119,6 +132,18 @@ def main() -> int:
                 f"FAIL: {path} — app.add_middleware(CfAuthMiddleware) not found"
             )
 
+    # 1a. Cross-source header-literal drift guard.
+    for path in HEADER_LITERAL_SOURCES:
+        if not path.exists():
+            failures.append(f"FAIL: {path} missing (header drift guard)")
+            continue
+        if HEADER_LITERAL not in path.read_text():
+            failures.append(
+                f"FAIL: {path} — missing header literal '{HEADER_LITERAL}'. "
+                "Renaming the header requires updating ALL of: "
+                "cf_auth.py (both copies), deploy.sh, dd_monitors.py."
+            )
+
     # 2 + 3. cf_auth.py-side bools
     for path in CF_AUTH_PATHS:
         if not path.exists():
@@ -145,10 +170,13 @@ def main() -> int:
         return 1
 
     print(
-        "OK: CfSharedSecret middleware contract grounded — "
-        "registered in both services/{api,webhook}/main.py, secret sourced "
-        "from SSM via GRUG_CF_SHARED_SECRET_SSM env var with WithDecryption=True, "
-        "/livez exempt, hmac.compare_digest used for header validation."
+        "OK: CfSharedSecret middleware contract grounded — registered in "
+        "both services/{api,webhook}/main.py, secret sourced from SSM via "
+        "GRUG_CF_SHARED_SECRET_SSM env var with WithDecryption=True, /livez "
+        "exempt, hmac.compare_digest used for header validation, and the "
+        f"'{HEADER_LITERAL}' literal is present in all "
+        f"{len(HEADER_LITERAL_SOURCES)} cross-source sites "
+        "(cf_auth.py x2, deploy.sh, dd_monitors.py)."
     )
     return 0
 

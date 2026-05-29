@@ -74,6 +74,16 @@ class CfAuthMiddleware(BaseHTTPMiddleware):
         app,
         secret_loader: Callable[[], str] = _default_secret_loader,
     ) -> None:
+        """
+        Args:
+          secret_loader: zero-arg callable returning the SSM secret value.
+            Three outcomes are treated uniformly as fail-open:
+              - returns a non-empty `str` → strict mode for this request
+              - returns `""` → fail-open + `cf_shared_secret_empty` log
+              - raises any `Exception` → fail-open + `cf_shared_secret_unconfigured` log
+            Any subclass of `BaseException` that is NOT an `Exception`
+            (KeyboardInterrupt, SystemExit) propagates as normal.
+        """
         super().__init__(app)
         self._secret_loader = secret_loader
 
