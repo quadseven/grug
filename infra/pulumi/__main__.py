@@ -24,6 +24,7 @@ import pulumi_cloudflare as cloudflare
 import pulumi_datadog as _datadog
 
 from components import (
+    cf_shared_secret,
     cloudflare_dns,
     dd_monitors,
     dd_rum,
@@ -116,6 +117,11 @@ _iam_propagation_wait = _deploy_role_bundle.iam_propagation_wait
 grug_main_table = ddb_table.create("grug-main")
 grug_tokens_cmk = kms_cmk.create("grug-tokens")
 
+# CF→AWS auth boundary (parent #173). Provisioned before the Lambdas so
+# both can receive the SSM param name via env var on first creation —
+# avoids a second `pulumi up` to wire the env var after the secret lands.
+cf_secret = cf_shared_secret.create()
+
 # ECR repo for the webhook Lambda image. Lifecycle: untagged images expire
 # after 14 days (avoids ~$0.10/GB/mo image graveyard).
 webhook_ecr = ecr_repo.create(
@@ -145,7 +151,13 @@ webhook = lambda_service.create(
     ecr_repo=webhook_ecr,
     image_tag=webhook_image_tag,
     secrets=secrets,
-    extra_ssm_secrets=[_dd_api_key],
+    # cf_secret.ssm_parameter is `aws.ssm.Parameter` (Pulumi resource)
+    # while the others are `GetParameterResult` (sync data lookup). Both
+    # expose `.arn` and `.name`, and the consuming IAM policy in
+    # lambda_service already wraps the arn list in `Output.all(...).apply()`,
+    # so Output[str] arns resolve correctly. Issue #235 tracks tightening
+    # the type contract via a structural Protocol.
+    extra_ssm_secrets=[_dd_api_key, cf_secret.ssm_parameter],
     # NOTE: DD extension is BAKED into the Lambda container image
     # (services/webhook/Dockerfile.lambda copies from
     # public.ecr.aws/datadog/lambda-extension-arm:<v>). Lambda Container
@@ -163,6 +175,8 @@ webhook = lambda_service.create(
         # DDB allowlist gate (Slice 5 #26). Webhook reads INST# + USER#
         # rows directly (no KMS — token blobs are api-Lambda-only).
         "GRUG_DDB_TABLE": grug_main_table.name,
+        # CF→AWS auth boundary — middleware reads at cold start (#173).
+        "GRUG_CF_SHARED_SECRET_SSM": cf_secret.ssm_parameter.name,
         # Datadog APM (datadog_lambda wrapper finds real handler via
         # DD_LAMBDA_HANDLER; layer adds the trace agent + log forwarder).
         "DD_LAMBDA_HANDLER": "lambda_handler.handler",
@@ -270,7 +284,7 @@ api_lambda = lambda_service.create(
     ecr_repo=api_ecr,
     image_tag=api_image_tag,
     secrets=secrets,
-    extra_ssm_secrets=[_dd_api_key],
+    extra_ssm_secrets=[_dd_api_key, cf_secret.ssm_parameter],
     env_vars={
         "GRUG_ENV": env,
         "GRUG_LOG_LEVEL": "INFO",
@@ -278,6 +292,7 @@ api_lambda = lambda_service.create(
         "GRUG_DOMAIN": domain,
         "GRUG_DDB_TABLE": grug_main_table.name,
         "GRUG_KMS_CMK_ARN": grug_tokens_cmk.arn,
+        "GRUG_CF_SHARED_SECRET_SSM": cf_secret.ssm_parameter.name,
         "GITHUB_APP_WEBHOOK_SECRET_SSM": secrets["github-app-webhook-secret"].name,
         # OAuth (Slice 3 #24 consumes)
         "GITHUB_APP_CLIENT_ID_SSM": secrets["github-app-client-id"].name,
@@ -470,3 +485,8 @@ pulumi.export("synthetic_uptime_id", monitors.uptime.id)
 # values live in SSM SecureStrings managed by the same component.
 pulumi.export("rum_application_id_ssm_name", rum.ssm_application_id.name)
 pulumi.export("rum_client_token_ssm_name", rum.ssm_client_token.name)
+
+# CF→AWS auth boundary (issue #231 / parent #173). Sibling slice #232
+# (infra/cloudflare/deploy.sh) reads this SSM param name and PUTs the
+# value as the GRUG_CF_SECRET binding on both host-rewrite Workers.
+pulumi.export("cf_shared_secret_ssm_name", cf_secret.ssm_parameter.name)
