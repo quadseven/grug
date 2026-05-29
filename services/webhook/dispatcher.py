@@ -203,7 +203,15 @@ def _enforce_on_repos(install_id: int, repositories: list[dict]) -> None:
             )
 
 
-def _handle_pull_request(payload: dict[str, Any]) -> dict[str, str]:
+def _handle_pull_request(
+    payload: dict[str, Any],
+) -> dict[str, Any]:
+    """Returns either a short {status, reason} dict (allowlist or
+    payload skip) OR an aggregated {status, personas: [...]} dict
+    when at least one persona dispatched. The return-type union is
+    intentional — dispatcher consumers only read `.get("status")` and
+    optional list-shaped `.get("personas")`. Honest `dict[str, Any]`
+    over the prior `dict[str, str]` + `# type: ignore`."""
     action = payload.get("action", "")
     if action not in {"opened", "edited", "synchronize", "ready_for_review", "reopened"}:
         return {"status": "no_op", "reason": f"pull_request action={action} not gated"}
@@ -309,7 +317,7 @@ def _handle_pull_request(payload: dict[str, Any]) -> dict[str, str]:
 
     if not results:
         return {"status": "no_op", "reason": "all personas disabled"}
-    return {"status": "dispatched", "personas": results}  # type: ignore[dict-item]
+    return {"status": "dispatched", "personas": results}
 
 
 def _dispatch_tpm(

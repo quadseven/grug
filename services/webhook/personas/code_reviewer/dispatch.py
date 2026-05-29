@@ -24,7 +24,7 @@ from __future__ import annotations
 
 import logging
 import os
-from typing import Any
+from typing import Any, Literal
 
 import httpx
 
@@ -45,6 +45,19 @@ log = logging.getLogger(f"{os.getenv('DD_SERVICE', 'grug')}.persona.code_reviewe
 
 _CHECK_NAME = "Grug — Code Review"
 _DIFF_FETCH_TIMEOUT = 30
+
+# Advisory vs blocking mode threaded through publish-shape decisions.
+# Promoted from a bare `bool` so future "degraded" or "experimental"
+# modes can be added without an inversion bug at every call site (e.g.
+# `if not blocking` flipping wrong when a third mode appears).
+ReviewMode = Literal["advisory", "blocking"]
+
+# Per-persona result string. Promoted to Literal so a new return site
+# can't silently introduce an undocumented value (e.g. dispatcher.py's
+# `unhandled_error` was previously documented only by source-grep).
+PersonaResultStr = Literal[
+    "pass", "fail", "skipped", "publish_failed", "unhandled_error",
+]
 
 
 def _fetch_pr_diff(
@@ -114,20 +127,35 @@ def _inline_comment_body(f: Finding) -> str:
     return head
 
 
+def _publish_shape(
+    evaluation: CodeReviewEvaluation, *, mode: ReviewMode,
+) -> tuple[CheckConclusion, ReviewEvent]:
+    """Single source of truth for the advisory-vs-blocking gate.
+
+    Returns (check_conclusion, review_event) — both encode the same
+    mode toggle and must stay aligned. Centralising avoids the class
+    of bug where the check-run says "failure" but the inline review
+    says "COMMENT" (or vice-versa) because the two if/else branches
+    drifted.
+    """
+    # Degraded LLM responses always degrade to advisory regardless of
+    # mode — Elder cannot block a PR on infrastructure flakiness.
+    if mode == "advisory" or evaluation.degraded_reason:
+        return "neutral", "COMMENT"
+    if evaluation.conclusion == "failure":
+        return "failure", "REQUEST_CHANGES"
+    return evaluation.conclusion, "COMMENT"
+
+
 def _build_review_result(
-    evaluation: CodeReviewEvaluation, *, head_sha: str, blocking: bool,
+    evaluation: CodeReviewEvaluation, *, head_sha: str, event: ReviewEvent,
 ) -> ReviewResult | None:
     """Build the ReviewResult, or None if nothing to post.
 
-    Advisory mode (default): always COMMENT. Blocking mode: REQUEST_CHANGES
-    when findings exist, else COMMENT. Skips entirely on empty findings
-    OR degraded responses (no point posting an empty review)."""
+    Skips entirely on empty findings OR degraded responses (no point
+    posting an empty review)."""
     if evaluation.degraded_reason or not evaluation.findings:
         return None
-    event: ReviewEvent = (
-        "REQUEST_CHANGES" if (blocking and evaluation.conclusion == "failure")
-        else "COMMENT"
-    )
     comments = tuple(
         InlineComment(path=f.file, line=f.line, body=_inline_comment_body(f))
         for f in evaluation.findings
@@ -140,32 +168,22 @@ def _build_review_result(
     )
 
 
-def _resolve_conclusion(
-    evaluation: CodeReviewEvaluation, *, blocking: bool,
-) -> CheckConclusion:
-    """Advisory mode flattens to `neutral` regardless of severity. In
-    blocking mode the persona's verdict survives. This is the
-    advisory-vs-blocking gate operators flip per repo."""
-    if not blocking or evaluation.degraded_reason:
-        return "neutral"
-    return evaluation.conclusion
-
-
 def dispatch_code_review(
     payload: dict[str, Any], *, blocking: bool,
 ) -> dict[str, str]:
     """Entry point — orchestrate one Elder review pass.
 
-    `blocking` comes from RepoConfig.code_reviewer_blocking. The
-    advisory-first contract is enforced here: when False, every
-    publication is forced to neutral/COMMENT shape regardless of
-    the evaluation verdict. When True, the verdict survives.
+    `blocking` comes from RepoConfig.code_reviewer_blocking. False ⇒
+    advisory mode: every publication is forced to neutral/COMMENT
+    regardless of the evaluation verdict. True ⇒ blocking mode: the
+    verdict survives.
 
     Returns a structured-log dict; never raises a wire-level
     exception — LLM outages, parse errors, and publish failures all
     degrade to advisory neutral so this persona cannot 500 the
     webhook handler.
     """
+    mode: ReviewMode = "blocking" if blocking else "advisory"
     pr = payload["pull_request"]
     repo = payload["repository"]
     installation = payload["installation"]
@@ -208,12 +226,13 @@ def dispatch_code_review(
 
     # 5+6. Publish. Both clients are independent — a 5xx on review
     # post must not skip the check-run post.
+    conclusion, event = _publish_shape(evaluation, mode=mode)
     title, summary = _summary_markdown(evaluation)
     check_result = CheckRunResult(
         name=_CHECK_NAME,
         head_sha=head_sha,
         status="completed",
-        conclusion=_resolve_conclusion(evaluation, blocking=blocking),
+        conclusion=conclusion,
         title=title,
         summary=summary,
     )
@@ -237,7 +256,7 @@ def dispatch_code_review(
         # Continue to attempt the review post — independent surface.
 
     review_result = _build_review_result(
-        evaluation, head_sha=head_sha, blocking=blocking,
+        evaluation, head_sha=head_sha, event=event,
     )
     if review_result is not None:
         try:
