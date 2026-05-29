@@ -322,6 +322,51 @@ def test_503_retried_alongside_429(monkeypatch) -> None:
     assert idx["n"] == 2  # one retry + one success
 
 
+def test_transport_failure_on_both_backends_returns_all_failed(monkeypatch) -> None:
+    """Covers the retry-loop terminal `raise` (final attempt without a
+    fallback continue). Without this test, a future off-by-one on the
+    `attempt < _RETRY_ATTEMPTS - 1` guard would ship green."""
+    monkeypatch.setattr(lc, "_RETRY_SLEEP", lambda s: None)
+    call_log: list[str] = []
+
+    def always_timeout(url, *args, **kwargs):
+        call_log.append(url)
+        raise httpx.ReadTimeout("timeout")
+
+    with patch.object(httpx, "post", side_effect=always_timeout):
+        out = review_diff([_hunk()], installation_id=1)
+
+    assert out.kind == "all_failed"
+    assert out.backend_used is None
+    # 3 retries × 2 backends = 6 attempts total.
+    assert len(call_log) == 6
+    # Both backends represented (one of each URL).
+    assert any("poolside" in u for u in call_log)
+    assert any("openrouter" in u for u in call_log)
+
+
+def test_parse_failed_attributes_secondary_backend(monkeypatch) -> None:
+    """If the primary backend transport-fails and the secondary returns
+    200 + non-JSON content, parse_failed must report the secondary as
+    `backend_used`. Comment in review_diff explicitly says don't fall
+    back further; verify the attribution still points at whoever actually
+    responded."""
+    monkeypatch.setattr(lc, "_RETRY_SLEEP", lambda s: None)
+    parse_fail_envelope = _openai_json_response("sorry, I cannot do that")
+
+    def staged(url, *args, **kwargs):
+        if "poolside" in url:
+            raise httpx.ReadTimeout("primary down")
+        return httpx.Response(200, json=parse_fail_envelope)
+
+    with patch.object(httpx, "post", side_effect=staged):
+        out = review_diff([_hunk()], installation_id=2)  # even → Poolside primary
+
+    assert out.kind == "parse_failed"
+    assert out.backend_used == Backend.OPENROUTER
+    assert "parse" in out.error.lower()
+
+
 def test_envelope_non_json_returns_parse_failed(monkeypatch) -> None:
     """200 + Cloudflare HTML interstitial (not JSON) must not crash.
     Previously `_parse_response` called `resp.json()` unguarded — the

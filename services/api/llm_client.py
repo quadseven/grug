@@ -2,12 +2,15 @@
 """LLM client abstraction for the Code-Reviewer (Elder) persona.
 
 Sends review prompts to either Poolside (Laguna) or OpenRouter and
-returns a structured response. Backend selection is round-robin via
-`installation_id % 2` so traffic splits evenly across the two and DD
-LLM Obs can A/B prompt variants. If the primary backend errors hard
-(post-retry), the other backend is tried before surfacing an empty
-response — the caller posts an advisory check-run rather than 500ing
-the webhook handler on transient LLM failures.
+returns a structured response. Backend selection is stable per-install
+via `installation_id % 2`: two PRs on the same install always hit the
+same backend, which lets DD LLM Obs A/B-compare prompt variants without
+cross-install noise. Traffic distribution across the two backends
+depends on how installs are sized — it is NOT a true even split.
+If the primary backend errors hard (post-retry), the other backend is
+tried before surfacing an empty response — the caller posts an advisory
+check-run rather than 500ing the webhook handler on transient LLM
+failures.
 
 Both backends use the OpenAI-compatible chat-completions API so the
 request shape is identical. Only the base URL, auth header, and
@@ -27,7 +30,7 @@ import os
 import time
 from dataclasses import dataclass, field
 from enum import Enum
-from typing import Any, Callable, Literal, Optional
+from typing import Any, Callable, Literal, Optional, get_args
 
 import httpx
 
@@ -43,7 +46,9 @@ _OPENROUTER_MODEL = "anthropic/claude-haiku-4.5"
 
 _TIMEOUT_SECONDS = 30
 _RETRY_ATTEMPTS = 3
-_RETRY_BASE_DELAY = 0.5  # exponential: 0.5s, 1.0s, 2.0s
+# Backoff applies on attempts 0 and 1 only (attempt 2 either succeeds or
+# raises). Worst-case sleep per backend: 0.5s + 1.0s = 1.5s.
+_RETRY_BASE_DELAY = 0.5
 
 # 429 (rate limit) + 503 (CF edge blip / temporary backend overload)
 # are routinely transient on both Poolside and OpenRouter. Other 5xx
@@ -61,7 +66,10 @@ class Backend(str, Enum):
 
 
 Severity = Literal["low", "medium", "high", "critical"]
-_VALID_SEVERITIES: frozenset[str] = frozenset(("low", "medium", "high", "critical"))
+# Derived from the Literal so adding a level (e.g. "info") in one place
+# also updates parse-time validation. Without `get_args`, the two lists
+# silently drift.
+_VALID_SEVERITIES: frozenset[str] = frozenset(get_args(Severity))
 
 
 @dataclass(frozen=True, slots=True)
@@ -150,10 +158,12 @@ _BACKEND_CONFIGS: dict[Backend, BackendConfig] = {
         backend=Backend.POOLSIDE,
         url=_POOLSIDE_URL,
         model=_POOLSIDE_MODEL,
-        # Lambda (not bare ref) defers name lookup to call time so tests
-        # can `monkeypatch.setattr(lc, "_load_poolside_key", ...)`. With
-        # a bare reference, `_BACKEND_CONFIGS` captures the original
-        # function at import time and ignores the patch.
+        # Lambda (not bare ref) defers the name lookup to call time so
+        # `monkeypatch.setattr(lc, "_load_poolside_key", ...)` in tests
+        # actually reaches the dispatch. A bare reference captures the
+        # original function at import; the patch then mutates only
+        # `lc._load_poolside_key`, which `_BACKEND_CONFIGS` no longer
+        # consults.
         key_loader=lambda: _load_poolside_key(),
     ),
     Backend.OPENROUTER: BackendConfig(
@@ -166,12 +176,20 @@ _BACKEND_CONFIGS: dict[Backend, BackendConfig] = {
 
 
 def select_backend(installation_id: int) -> Backend:
-    """Round-robin via `installation_id % 2`.
+    """Stable per-install backend pick via `installation_id % 2`.
 
-    Stable per-install — two PRs on the same install always hit the
-    same backend, which lets DD LLM Obs compare prompt variants without
-    cross-install noise.
+    Two PRs on the same install always hit the same backend, which lets
+    DD LLM Obs compare prompt variants without cross-install noise.
+
+    Coupled to a 2-backend `Backend` enum. The assert is the only thing
+    that fails loudly when a third backend is added — the modulo math
+    would silently keep returning Poolside/OpenRouter and the new
+    backend would never be picked.
     """
+    assert len(Backend) == 2, (
+        "select_backend assumes a 2-backend enum; add a real selector "
+        "before extending Backend."
+    )
     return Backend.POOLSIDE if installation_id % 2 == 0 else Backend.OPENROUTER
 
 
@@ -316,7 +334,10 @@ def _parse_response(
                 extra={
                     "reason": reason,
                     "model": model_name,
-                    "raw_truncated": str(raw)[:200],
+                    # repr() not str() so a partial multibyte char at the
+                    # 200-byte boundary becomes `\xNN` rather than an
+                    # invalid UTF-8 sequence DD log ingest may reject.
+                    "raw_truncated": repr(raw)[:200],
                 },
             )
             continue
