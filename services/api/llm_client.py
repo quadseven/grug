@@ -46,14 +46,15 @@ _OPENROUTER_MODEL = "anthropic/claude-haiku-4.5"
 
 _TIMEOUT_SECONDS = 30
 _RETRY_ATTEMPTS = 3
-# Backoff applies on attempts 0 and 1 only (attempt 2 either succeeds or
-# raises). Worst-case sleep per backend: 0.5s + 1.0s = 1.5s.
+# Exponential backoff applies on every attempt except the final one,
+# which either returns the response or raises.
 _RETRY_BASE_DELAY = 0.5
 
 # 429 (rate limit) + 503 (CF edge blip / temporary backend overload)
 # are routinely transient on both Poolside and OpenRouter. Other 5xx
-# (500, 502, 504) get one shot then fall back to the secondary backend
-# rather than burning retries on what may be a permanent issue.
+# (500, 502, 504) return immediately; review_diff then falls back to
+# the secondary backend rather than burning retries on what may be a
+# permanent issue.
 _RETRYABLE_STATUSES: frozenset[int] = frozenset((429, 503))
 
 
