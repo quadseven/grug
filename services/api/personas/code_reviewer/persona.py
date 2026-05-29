@@ -24,7 +24,7 @@ publisher (next slice) has a stable place to read the fix hint.
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Literal
+from typing import Literal, get_args
 
 from github_checks_client import CheckConclusion
 from llm_client import LlmReviewResponse
@@ -36,7 +36,15 @@ Severity = Literal["low", "medium", "high", "critical"]
 # Medium + low remain advisory: reported in the check-run summary but
 # `passed=True` so the PR isn't blocked. Mirrors TPM's advisory split
 # (issue-link rule fails without blocking).
+#
+# The assert ties the blocking set to the Literal — adding a level to
+# `Severity` (e.g. `"blocker"`) without also classifying it as blocking
+# or advisory will fail at import time, not silently default to advisory.
 _BLOCKING_SEVERITIES: frozenset[Severity] = frozenset(("high", "critical"))
+_ADVISORY_SEVERITIES: frozenset[Severity] = frozenset(("low", "medium"))
+assert frozenset(get_args(Severity)) == _BLOCKING_SEVERITIES | _ADVISORY_SEVERITIES, (
+    "Severity Literal drifted from blocking/advisory partition"
+)
 
 
 @dataclass(frozen=True, slots=True)
