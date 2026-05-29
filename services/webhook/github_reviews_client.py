@@ -21,7 +21,7 @@ ADR-0001 (rule-of-three deferred shared package).
 from __future__ import annotations
 
 from dataclasses import asdict, dataclass
-from typing import Literal
+from typing import Literal, get_args
 
 import httpx
 
@@ -30,7 +30,10 @@ _GH_API = "https://api.github.com"
 # Subset of GitHub's `event` enum the Elder persona uses. APPROVE +
 # PENDING omitted on purpose — see module docstring.
 ReviewEvent = Literal["COMMENT", "REQUEST_CHANGES"]
-_VALID_EVENTS: frozenset[str] = frozenset(("COMMENT", "REQUEST_CHANGES"))
+# Derived from the Literal so adding a future event (e.g. "DISMISS")
+# updates runtime validation automatically. Without `get_args`, the
+# allowlist and the Literal silently drift.
+_VALID_EVENTS: frozenset[str] = frozenset(get_args(ReviewEvent))
 
 # GitHub's PR Reviews API caps the review body at 65536 characters
 # (UTF-8). Longer payloads are 422'd. Guarded at ReviewResult
@@ -38,7 +41,7 @@ _VALID_EVENTS: frozenset[str] = frozenset(("COMMENT", "REQUEST_CHANGES"))
 _MAX_BODY_CHARS: int = 65536
 
 
-@dataclass(frozen=True, slots=True)
+@dataclass(frozen=True)
 class InlineComment:
     """One inline review comment, pinned to a file + new-side line.
 
@@ -65,7 +68,7 @@ class InlineComment:
             raise ValueError("InlineComment.path must be non-empty")
 
 
-@dataclass(frozen=True, slots=True)
+@dataclass(frozen=True)
 class ReviewResult:
     """A complete PR review payload — top-level body + inline comments.
 
@@ -115,7 +118,14 @@ def post_review(
 
     Does NOT catch 401 — the `with_install_token_retry` wrapper at the
     call site is responsible for invalidating the cache and retrying.
-    Same pattern as `post_check_run`.
+    Same 401-propagation pattern as `post_check_run`.
+
+    `pull_number` and `result` are keyword-only on purpose —
+    `post_check_run` takes a `head_sha` baked into `CheckRunResult`,
+    but `pull_number` is an extra positional int we don't want to
+    confuse with `result`. The kw-only barrier is a deliberate ADR-0001
+    divergence (the only one) that prevents the
+    `post_review("tok", "o", "r", 42)` foot-gun.
     """
     # `asdict` recursively converts ReviewResult + nested InlineComments
     # into the exact dict shape GitHub expects (commit_id/event/body
