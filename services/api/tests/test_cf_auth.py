@@ -202,13 +202,51 @@ def test_default_secret_loader_reads_env_then_ssm(monkeypatch) -> None:
     fake_response = {"Parameter": {"Value": "ssm-value-here"}}
 
     with patch("cf_auth._ssm.get_parameter", return_value=fake_response) as mock_get:
-        from cf_auth import _default_secret_loader
+        from cf_auth import _default_secret_loader, _ssm_cache_clear
+        _ssm_cache_clear()
         # First call hits SSM
         val = _default_secret_loader()
         assert val == "ssm-value-here"
         mock_get.assert_called_once_with(
             Name="/grug/cf-shared-secret", WithDecryption=True,
         )
+
+
+def test_default_secret_loader_caches_warm_path(monkeypatch) -> None:
+    """lru_cache must memoize the successful SSM read — guards against
+    a refactor that drops the @lru_cache decorator or breaks
+    memoization, which would silently re-hit SSM on every request and
+    blow through the SSM quota at production concurrency.
+    """
+    monkeypatch.setenv("GRUG_CF_SHARED_SECRET_SSM", "/grug/cf-shared-secret")
+    fake_response = {"Parameter": {"Value": "ssm-value-here"}}
+
+    with patch("cf_auth._ssm.get_parameter", return_value=fake_response) as mock_get:
+        from cf_auth import _default_secret_loader, _ssm_cache_clear
+        _ssm_cache_clear()
+        v1 = _default_secret_loader()
+        v2 = _default_secret_loader()
+        v3 = _default_secret_loader()
+
+    assert v1 == v2 == v3 == "ssm-value-here"
+    assert mock_get.call_count == 1, (
+        f"lru_cache regressed — SSM hit {mock_get.call_count} times"
+    )
+
+
+def test_header_is_case_insensitive() -> None:
+    """Starlette Headers is case-insensitive per HTTP spec, but CF
+    Workers emit lowercase headers under HTTP/2. If a future refactor
+    swaps `request.headers.get(...)` for `request.scope['headers']`
+    iteration (a common perf optimization), case sensitivity silently
+    regresses and every CF→Lambda request 401s.
+    """
+    app = _build_app(secret_loader=lambda: "real-secret")
+    client = TestClient(app)
+
+    for header_name in ("X-Grug-CF-Secret", "x-grug-cf-secret", "X-GRUG-CF-SECRET"):
+        r = client.get("/protected", headers={header_name: "real-secret"})
+        assert r.status_code == 200, f"case '{header_name}' failed"
 
 
 def test_default_secret_loader_raises_when_env_unset(monkeypatch) -> None:
