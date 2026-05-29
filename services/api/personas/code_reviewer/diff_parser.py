@@ -1,0 +1,148 @@
+# MIRRORED — sibling at services/webhook/personas/code_reviewer/diff_parser.py; keep in lockstep. See docs/adr/0001-mirror-with-rule-of-three-deferral.md.
+"""Pure unified-diff parser for the Elder (code-reviewer) persona.
+
+Takes a unified-diff string fetched from `GET .../pulls/{n}` (Accept:
+application/vnd.github.diff) and extracts structured hunks. Pure: no IO,
+no logging side-effects, no hidden globals. Spec 0015 §Parse contract.
+
+Why a hand-rolled parser and not unidiff/pypatch:
+- Both services ship as Lambda images; every dep adds cold-start weight.
+  The unified-diff subset we actually need is small (~80 lines) — fewer
+  than the dep would add to requirements.
+- We need to track new-side line numbers for hallucination filtering
+  (see `new_lines`), which most third-party parsers expose awkwardly.
+- Pure-function purity is attestable by spec; an opaque dep wouldn't be.
+"""
+from __future__ import annotations
+
+import re
+from dataclasses import dataclass
+
+
+@dataclass(frozen=True, slots=True)
+class DiffHunk:
+    """One @@ ... @@ block in one file's portion of the diff.
+
+    `new_lines` is the set of new-side line numbers that are added OR
+    context-with-a-removed-neighbor. The Elder persona's anti-
+    hallucination filter (`evaluate_diff`) rejects LLM findings whose
+    `(file, line)` is not in any hunk's `new_lines` — a finding on a
+    line the LLM couldn't have seen is almost certainly invented.
+
+    `body` retains the raw @@-prefixed hunk text for feeding back to
+    the LLM as review context (matches `llm_client.Hunk(path, body)`).
+    """
+
+    file_path: str
+    new_start: int
+    new_lines: frozenset[int]
+    body: str
+
+
+# Captures `+++ b/<path>` or `+++ /dev/null` (deletion). Group 1 is the
+# path with the leading `b/` stripped, or "/dev/null" verbatim.
+_NEW_FILE_RE = re.compile(r"^\+\+\+ (?:b/)?(.+)$")
+# `diff --git a/<old> b/<new>` — fallback when --- / +++ are absent
+# (pure renames have no @@ block at all).
+_DIFF_GIT_RE = re.compile(r"^diff --git a/(.+) b/(.+)$")
+# `@@ -<old>,<n> +<new>,<m> @@` — captures the new-side start + count.
+# Count is optional (defaults to 1 when absent per the diff spec).
+_HUNK_HEADER_RE = re.compile(r"^@@ -\d+(?:,\d+)? \+(\d+)(?:,(\d+))? @@")
+# `Binary files a/... and b/... differ` — skip these entirely.
+_BINARY_RE = re.compile(r"^Binary files .+ and .+ differ$")
+
+
+def parse_diff(unified_diff: str) -> tuple[DiffHunk, ...]:
+    """Parse a unified diff into structured hunks.
+
+    Pure: no logging, no IO. Empty input → empty tuple. Binary file
+    blocks produce no hunks. Pure renames (no @@ block) produce no
+    hunks. The new path is used as `file_path` for rename+edit cases."""
+    if not unified_diff:
+        return ()
+
+    lines = unified_diff.splitlines()
+    hunks: list[DiffHunk] = []
+    current_file: str | None = None
+    binary_skip = False
+    i = 0
+
+    while i < len(lines):
+        line = lines[i]
+
+        if line.startswith("diff --git "):
+            m = _DIFF_GIT_RE.match(line)
+            # Default to the post-rename / 'b/' side; +++ overrides
+            # below if it disagrees (e.g. mode-only files have no +++).
+            current_file = m.group(2) if m else None
+            binary_skip = False
+            i += 1
+            continue
+
+        if _BINARY_RE.match(line):
+            # Binary block; nothing in this file produces hunks.
+            binary_skip = True
+            i += 1
+            continue
+
+        if line.startswith("+++ "):
+            m = _NEW_FILE_RE.match(line)
+            if m and m.group(1) != "/dev/null":
+                current_file = m.group(1)
+            i += 1
+            continue
+
+        if binary_skip or current_file is None:
+            i += 1
+            continue
+
+        if line.startswith("@@"):
+            m = _HUNK_HEADER_RE.match(line)
+            if not m:
+                # Malformed header — skip. Erring conservative: a
+                # garbled @@ line is more likely a parser drift than
+                # a real hunk we should partially extract.
+                i += 1
+                continue
+            new_start = int(m.group(1))
+            # Walk the hunk body collecting added + context-with-removed
+            # lines. Body capture starts at the @@ header so the LLM
+            # gets full context.
+            body_lines: list[str] = [line]
+            new_lines_set: set[int] = set()
+            new_cursor = new_start
+            i += 1
+            while i < len(lines):
+                hline = lines[i]
+                if (
+                    hline.startswith("diff --git ")
+                    or hline.startswith("@@")
+                    or hline.startswith("+++ ")
+                    or hline.startswith("--- ")
+                ):
+                    break
+                body_lines.append(hline)
+                if hline.startswith("+") and not hline.startswith("+++"):
+                    new_lines_set.add(new_cursor)
+                    new_cursor += 1
+                elif hline.startswith("-") and not hline.startswith("---"):
+                    pass  # removed — no new-side advance
+                else:
+                    # Context line (possibly empty `\` no-newline marker
+                    # or trailing blank). Advance the new cursor; don't
+                    # mark as a reviewable line since it wasn't changed.
+                    new_cursor += 1
+                i += 1
+            hunks.append(
+                DiffHunk(
+                    file_path=current_file,
+                    new_start=new_start,
+                    new_lines=frozenset(new_lines_set),
+                    body="\n".join(body_lines),
+                )
+            )
+            continue
+
+        i += 1
+
+    return tuple(hunks)

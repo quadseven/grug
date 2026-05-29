@@ -35,6 +35,8 @@ MIRRORED_WITH_HEADER=(
   "github_rulesets_client.py"
   "llm_client.py"
   "observability.py"
+  "personas/code_reviewer/diff_parser.py"
+  "personas/code_reviewer/persona.py"
   "personas/tpm/dor_checks.py"
   "ports/token_cache.py"
   "secrets_loader.py"
@@ -45,6 +47,7 @@ MIRRORED_BYTE_IDENTICAL=(
   "conftest.py"
   "github_app_auth/__init__.py"
   "personas/__init__.py"
+  "personas/code_reviewer/__init__.py"
   "personas/tpm/__init__.py"
   "ports/__init__.py"
 )
