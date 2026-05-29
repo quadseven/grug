@@ -305,13 +305,21 @@ def _handle_pull_request(
             owner=owner, repo_name=repo_name, pr_number=int(pr_number),
             blocking=bool(cfg.get("code_reviewer_blocking", False)),
         ))
-    elif repo_id is not None:
+    else:
+        # Either explicitly disabled per-repo OR `repo_id is None`
+        # (rare payload-shape glitch). Both produce a `disabled_skip`
+        # log so the operator can tell the difference from "Elder ran
+        # and found nothing." TPM treats missing repo_id as enabled by
+        # legacy — the asymmetry is deliberate: Elder requires repo_id
+        # to call is_persona_enabled, so a missing one is treated as
+        # opt-out rather than blanket-enabled.
         log.info(
             "persona_disabled_skip",
             extra={
                 "installation_id": installation_id,
                 "owner": owner, "repo": repo_name, "pr_number": pr_number,
                 "persona": "code_reviewer",
+                "reason": "no_repo_id" if repo_id is None else "toggle_off",
             },
         )
 

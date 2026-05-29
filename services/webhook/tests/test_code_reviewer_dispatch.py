@@ -95,8 +95,7 @@ def test_dispatch_advisory_mode_posts_neutral_check_and_comment_review(monkeypat
             _payload(), blocking=False,
         )
 
-    assert out["status"] == "dispatched"
-    assert out["persona"] == "code_reviewer"
+    assert out == {"persona": "code_reviewer", "result": "pass"}
     assert len(posted_check) == 1
     assert posted_check[0]["result"].conclusion == "neutral"  # advisory
     assert len(posted_review) == 1
@@ -189,8 +188,7 @@ def test_dispatch_llm_outage_does_not_block_pr(monkeypatch):
     # advisory-first contract.
     assert posted_check[0].conclusion == "neutral"
     assert posted_review == []
-    assert out["status"] == "dispatched"
-    assert out["result"] == "skipped"
+    assert out == {"persona": "code_reviewer", "result": "skipped"}
 
 
 def test_dispatch_unparseable_diff_yields_neutral(monkeypatch):

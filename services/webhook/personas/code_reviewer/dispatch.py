@@ -155,8 +155,9 @@ def _publish_shape(
     says "COMMENT" (or vice-versa) because the two if/else branches
     drifted.
     """
-    # Degraded LLM responses always degrade to advisory regardless of
-    # mode — Elder cannot block a PR on infrastructure flakiness.
+    # Any degraded evaluation (LLM outage, parse failure, empty diff)
+    # forces advisory regardless of mode — Elder cannot block a PR on
+    # infrastructure flakiness or a non-reviewable shape.
     if mode == "advisory" or evaluation.degraded_reason:
         return "neutral", "COMMENT"
     if evaluation.conclusion == "failure":
@@ -217,7 +218,7 @@ def dispatch_code_review(
             lambda token: _fetch_pr_diff(token, owner, repo_name, pull_number),
         )
         hunks = parse_diff(diff_text)
-    except (httpx.HTTPError, DiffParseError) as e:
+    except (httpx.HTTPStatusError, httpx.RequestError, DiffParseError) as e:
         log.warning(
             "code_review_fetch_or_parse_failed",
             extra={
@@ -276,7 +277,7 @@ def dispatch_code_review(
                 external_id=f"grug-cr:{owner}/{repo_name}#{pull_number}:{head_sha}",
             ),
         )
-    except (httpx.HTTPError,) as e:
+    except (httpx.HTTPStatusError, httpx.RequestError) as e:
         log.error(
             "code_review_check_run_publish_failed",
             extra={
@@ -300,7 +301,7 @@ def dispatch_code_review(
                     pull_number=pull_number, result=review_result,
                 ),
             )
-        except (httpx.HTTPError,) as e:
+        except (httpx.HTTPStatusError, httpx.RequestError) as e:
             log.error(
                 "code_review_review_publish_failed",
                 extra={
@@ -310,8 +311,9 @@ def dispatch_code_review(
                 },
             )
 
+    # Result shape mirrors TPM's `{persona, result}` so dispatcher can
+    # treat both uniformly. The outer dispatcher wraps with `status`.
     return {
-        "status": "dispatched",
         "persona": "code_reviewer",
         "result": _resolve_result(
             evaluation, check_publish_failed=check_publish_failed,
@@ -346,7 +348,7 @@ def _publish_degraded(
                 ),
             ),
         )
-    except (httpx.HTTPError,) as e:
+    except (httpx.HTTPStatusError, httpx.RequestError) as e:
         # No recovery path beyond logging — but a silent miss here
         # means the PR shows NO check-run at all, indistinguishable
         # from persona-disabled. Surface as a discrete signal so the
@@ -362,6 +364,6 @@ def _publish_degraded(
         )
         publish_failed = True
     return {
-        "status": "dispatched", "persona": "code_reviewer",
+        "persona": "code_reviewer",
         "result": "publish_failed" if publish_failed else "skipped",
     }

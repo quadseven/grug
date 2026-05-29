@@ -236,7 +236,9 @@ def set_repo_config(
     code_reviewer_enabled: bool | None = None,
     code_reviewer_blocking: bool | None = None,
 ) -> dict[str, Any]:
-    """Upsert per-repo override. Returns the resolved config.
+    """Upsert per-repo override. Returns the FIELDS THAT WERE UPDATED
+    (not the full resolved RepoConfig — callers needing that should
+    follow up with `get_repo_config`).
 
     Uses update_item (not put_item) to preserve fields managed by
     other writers — e.g. enforcement_ruleset_id set by enforcement.py.
@@ -273,12 +275,12 @@ def set_repo_config(
         UpdateExpression="SET " + ", ".join(set_clauses),
         ExpressionAttributeValues=values,
     )
-    resolved = {"tpm_enabled": bool(tpm_enabled)}
+    updated_fields = {"tpm_enabled": bool(tpm_enabled)}
     if code_reviewer_enabled is not None:
-        resolved["code_reviewer_enabled"] = bool(code_reviewer_enabled)
+        updated_fields["code_reviewer_enabled"] = bool(code_reviewer_enabled)
     if code_reviewer_blocking is not None:
-        resolved["code_reviewer_blocking"] = bool(code_reviewer_blocking)
-    return resolved
+        updated_fields["code_reviewer_blocking"] = bool(code_reviewer_blocking)
+    return updated_fields
 
 
 def get_enforcement_id(install_id: int, repo_id: int) -> int | None:
