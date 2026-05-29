@@ -6,11 +6,24 @@
 // Per memory `reference_lambda_function_url_host_volatile`: Function URL
 // host changes on every recreate; deploy.sh re-templates `__UPSTREAM_HOST__`
 // each time so the Worker stays in sync.
+//
+// `X-Grug-CF-Secret` is the CF→AWS auth-boundary tightening: the value
+// is sourced from the `GRUG_CF_SECRET` Worker secret binding, which
+// `deploy.sh` PUTs from SSM `/grug/cf-shared-secret` after every script
+// upload. Lambda middleware validates the header on every non-`/livez`
+// request. The api Lambda has un-authenticated endpoints (`/livez`,
+// `/api/v1/auth/github/callback`) where this header is the only
+// second-layer auth.
 
+// Three placeholders are sed-substituted by infra/cloudflare/deploy.sh
+// at upload time so deploy.sh is the single source of truth. See
+// webhook worker for the cross-link rationale.
 const ORIGIN = "__UPSTREAM_HOST__";
+const SECRET_HEADER = "__SECRET_HEADER__";
+const BINDING_NAME = "__BINDING_NAME__";
 
 export default {
-  async fetch(request) {
+  async fetch(request, env) {
     const url = new URL(request.url);
     url.hostname = ORIGIN;
     url.protocol = "https:";
@@ -18,6 +31,17 @@ export default {
 
     const headers = new Headers(request.headers);
     headers.set("Host", ORIGIN);
+
+    // See webhook worker for the binding-presence + tampering logic.
+    const bindingValue = env ? env[BINDING_NAME] : undefined;
+    if (typeof bindingValue === "string" && bindingValue.length > 0) {
+      headers.set(SECRET_HEADER, bindingValue);
+    } else {
+      if (bindingValue === "") {
+        console.error("GRUG_CF_SECRET binding is an empty string — tampered or corrupted");
+      }
+      headers.delete(SECRET_HEADER);
+    }
 
     const init = {
       method: request.method,
