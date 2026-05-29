@@ -217,3 +217,56 @@ def test_default_secret_loader_raises_when_env_unset(monkeypatch) -> None:
     _ssm_cache_clear()  # purge any leakage from prior tests
     with pytest.raises(LookupError):
         _default_secret_loader()
+
+
+def test_unconfigured_warning_throttled_within_window() -> None:
+    """Load-bearing property of the throttle: two back-to-back fail-open
+    requests must emit ONE WARN log, not two. Without this guard a
+    refactor that swaps `time.monotonic()` for `time.time()` or flips
+    the sign comparison would silently regress to per-request flooding
+    — the exact bug the throttle was introduced to prevent.
+    """
+    def raise_unconfigured():
+        raise LookupError("env var unset")
+
+    app = _build_app(secret_loader=raise_unconfigured)
+    client = TestClient(app)
+
+    with patch.object(cf_auth.log, "warning") as mock_warn:
+        # First request: should log.
+        r1 = client.get("/protected")
+        assert r1.status_code == 200
+        # Second request immediately after: throttle suppresses.
+        r2 = client.get("/protected")
+        assert r2.status_code == 200
+
+    assert mock_warn.call_count == 1, (
+        f"throttle did not suppress duplicate log: {mock_warn.call_count} calls"
+    )
+
+
+def test_throttle_distinguishes_reasons() -> None:
+    """Different fail-open reasons throttle independently — an
+    unconfigured-env-var WARN and an empty-ssm-value WARN are separate
+    signals, each deserving its own first log.
+    """
+    # Custom loader: first call raises LookupError, second returns "".
+    state = {"calls": 0}
+
+    def loader_two_reasons():
+        state["calls"] += 1
+        if state["calls"] == 1:
+            raise LookupError("env var unset")
+        return ""
+
+    app = _build_app(secret_loader=loader_two_reasons)
+    client = TestClient(app)
+
+    with patch.object(cf_auth.log, "warning") as mock_warn:
+        r1 = client.get("/protected")
+        r2 = client.get("/protected")
+        assert r1.status_code == 200
+        assert r2.status_code == 200
+
+    # Two distinct reasons → two distinct first-logs.
+    assert mock_warn.call_count == 2

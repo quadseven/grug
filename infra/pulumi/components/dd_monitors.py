@@ -188,7 +188,7 @@ def create_all(
     cf_secret_mismatch = datadog.Monitor(
         "grug-cf-secret-mismatch",
         type="log alert",
-        name="[grug] CF auth-boundary mismatch rate > 1/min (10min)",
+        name="[grug] CF auth-boundary mismatch > 10 in 10min",
         message=(
             f"{notify_handle}\n"
             "X-Grug-CF-Secret mismatches detected on non-/livez requests. "
@@ -196,8 +196,12 @@ def create_all(
             "progress?) or someone is probing the Function URL directly.\n"
             "Runbook: docs/RUNBOOK.md#cf-secret-mismatch"
         ),
+        # Parenthesize the OR explicitly so DD scopes the env filter to
+        # both services. Without parens, DD reads "service:grug-api OR
+        # (service:grug-webhook AND env:<env> AND ...)" and grug-api
+        # alerts fire across ALL envs.
         query=(
-            f'logs("service:grug-api OR service:grug-webhook env:{env} '
+            f'logs("(service:grug-api OR service:grug-webhook) env:{env} '
             'cf_shared_secret_mismatch").index("*").rollup("count").last("10m") > 10'
         ),
         tags=_common_tags(env, "grug-api") + ["auth:cf-boundary"],

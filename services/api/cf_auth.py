@@ -64,8 +64,12 @@ _last_unconfigured_log_at: dict[str, float] = {}
 def _default_secret_loader() -> str:
     """Read the SSM param named by `GRUG_CF_SHARED_SECRET_SSM`.
 
-    Cached for the warm container's lifetime. `LookupError` if the env
-    var is unset — middleware fails-open on that.
+    Successful reads are cached for the warm container's lifetime.
+    Exceptions (LookupError when the env var is unset, ClientError on
+    SSM failures) are NOT cached — `functools.lru_cache` only memoizes
+    return values. Every fail-open request re-enters this function. The
+    middleware's `_log_unconfigured_throttled` throttle is what prevents
+    log flooding during a sustained misconfig.
     """
     ssm_name = os.getenv("GRUG_CF_SHARED_SECRET_SSM", "")
     if not ssm_name:
