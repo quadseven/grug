@@ -1,0 +1,99 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!-- Spec 0014 CfSharedSecret — CSDL companion. -->
+<edmx:Edmx Version="4.0" xmlns:edmx="http://docs.oasis-open.org/odata/ns/edmx">
+  <edmx:DataServices>
+
+    <Schema Namespace="Temper.Vocab" xmlns="http://docs.oasis-open.org/odata/ns/edm">
+      <Term Name="StateMachine.States" Type="Collection(Edm.String)" AppliesTo="EntityType"/>
+      <Term Name="StateMachine.InitialState" Type="Edm.String" AppliesTo="EntityType"/>
+      <Term Name="StateMachine.ValidFromStates" Type="Collection(Edm.String)" AppliesTo="Action"/>
+      <Term Name="StateMachine.TargetState" Type="Edm.String" AppliesTo="Action"/>
+      <Term Name="Agent.Hint" Type="Edm.String" AppliesTo="Action EntityType"/>
+      <Term Name="ShardKey" Type="Edm.String" AppliesTo="EntityType"/>
+      <Term Name="AuthZ.CedarPolicy" Type="Edm.String" AppliesTo="EntityType Action"/>
+    </Schema>
+
+    <Schema Namespace="Grug.CfSharedSecret" xmlns="http://docs.oasis-open.org/odata/ns/edm">
+
+      <EnumType Name="CfSharedSecretStatus">
+        <Member Name="NotProvisioned" Value="0"/>
+        <Member Name="Attested" Value="1"/>
+        <Member Name="Live" Value="2"/>
+      </EnumType>
+
+      <EntityType Name="CfSharedSecret">
+        <Key><PropertyRef Name="CommitSha"/></Key>
+        <Property Name="CommitSha" Type="Edm.String" Nullable="false"/>
+        <Property Name="Status" Type="Grug.CfSharedSecret.CfSharedSecretStatus" Nullable="false"/>
+
+        <Property Name="shared_secret_provisioned_in_pulumi_per_iac_invariant" Type="Edm.Boolean" DefaultValue="false"/>
+        <Property Name="workers_inject_header_from_secret_binding_per_auth_boundary_contract" Type="Edm.Boolean" DefaultValue="false"/>
+        <Property Name="middleware_registered_in_both_services_per_auth_boundary_contract" Type="Edm.Boolean" DefaultValue="false"/>
+        <Property Name="middleware_secret_sourced_from_ssm_per_secret_handling_invariant" Type="Edm.Boolean" DefaultValue="false"/>
+        <Property Name="middleware_exempts_livez_and_uses_constant_time_compare_per_security_invariant" Type="Edm.Boolean" DefaultValue="false"/>
+
+        <Annotation Term="Temper.Vocab.StateMachine.States">
+          <Collection><String>NotProvisioned</String><String>Attested</String><String>Live</String></Collection>
+        </Annotation>
+        <Annotation Term="Temper.Vocab.StateMachine.InitialState" String="NotProvisioned"/>
+        <Annotation Term="Temper.Vocab.ShardKey" String="CommitSha"/>
+        <Annotation Term="Temper.Vocab.AuthZ.CedarPolicy" String="policies/cf-shared-secret.cedar"/>
+      </EntityType>
+
+      <Action Name="AttestPulumiProvisioning" IsBound="true">
+        <Parameter Name="bindingParameter" Type="Grug.CfSharedSecret.CfSharedSecret"/>
+        <Parameter Name="attestor" Type="Edm.String" Nullable="false"/>
+        <ReturnType Type="Grug.CfSharedSecret.CfSharedSecret"/>
+        <Annotation Term="Temper.Vocab.StateMachine.ValidFromStates"><Collection><String>NotProvisioned</String></Collection></Annotation>
+      </Action>
+
+      <Action Name="AttestWorkerInjection" IsBound="true">
+        <Parameter Name="bindingParameter" Type="Grug.CfSharedSecret.CfSharedSecret"/>
+        <Parameter Name="attestor" Type="Edm.String" Nullable="false"/>
+        <ReturnType Type="Grug.CfSharedSecret.CfSharedSecret"/>
+        <Annotation Term="Temper.Vocab.StateMachine.ValidFromStates"><Collection><String>NotProvisioned</String></Collection></Annotation>
+      </Action>
+
+      <Action Name="AttestMiddlewareRegistered" IsBound="true">
+        <Parameter Name="bindingParameter" Type="Grug.CfSharedSecret.CfSharedSecret"/>
+        <Parameter Name="attestor" Type="Edm.String" Nullable="false"/>
+        <ReturnType Type="Grug.CfSharedSecret.CfSharedSecret"/>
+        <Annotation Term="Temper.Vocab.StateMachine.ValidFromStates"><Collection><String>NotProvisioned</String></Collection></Annotation>
+      </Action>
+
+      <Action Name="AttestMiddlewareSecretSourcedFromSsm" IsBound="true">
+        <Parameter Name="bindingParameter" Type="Grug.CfSharedSecret.CfSharedSecret"/>
+        <Parameter Name="attestor" Type="Edm.String" Nullable="false"/>
+        <ReturnType Type="Grug.CfSharedSecret.CfSharedSecret"/>
+        <Annotation Term="Temper.Vocab.StateMachine.ValidFromStates"><Collection><String>NotProvisioned</String></Collection></Annotation>
+      </Action>
+
+      <Action Name="AttestMiddlewareBehavior" IsBound="true">
+        <Parameter Name="bindingParameter" Type="Grug.CfSharedSecret.CfSharedSecret"/>
+        <Parameter Name="attestor" Type="Edm.String" Nullable="false"/>
+        <ReturnType Type="Grug.CfSharedSecret.CfSharedSecret"/>
+        <Annotation Term="Temper.Vocab.StateMachine.ValidFromStates"><Collection><String>NotProvisioned</String></Collection></Annotation>
+      </Action>
+
+      <Action Name="Attested" IsBound="true">
+        <Parameter Name="bindingParameter" Type="Grug.CfSharedSecret.CfSharedSecret"/>
+        <Parameter Name="commit_sha" Type="Edm.String" Nullable="false"/>
+        <ReturnType Type="Grug.CfSharedSecret.CfSharedSecret"/>
+        <Annotation Term="Temper.Vocab.StateMachine.ValidFromStates"><Collection><String>NotProvisioned</String></Collection></Annotation>
+        <Annotation Term="Temper.Vocab.StateMachine.TargetState" String="Attested"/>
+      </Action>
+
+      <Action Name="Deploy" IsBound="true">
+        <Parameter Name="bindingParameter" Type="Grug.CfSharedSecret.CfSharedSecret"/>
+        <Parameter Name="commit_sha" Type="Edm.String" Nullable="false"/>
+        <ReturnType Type="Grug.CfSharedSecret.CfSharedSecret"/>
+        <Annotation Term="Temper.Vocab.StateMachine.ValidFromStates"><Collection><String>Attested</String></Collection></Annotation>
+        <Annotation Term="Temper.Vocab.StateMachine.TargetState" String="Live"/>
+      </Action>
+
+      <EntityContainer Name="CfSharedSecretService">
+        <EntitySet Name="CfSharedSecrets" EntityType="Grug.CfSharedSecret.CfSharedSecret"/>
+      </EntityContainer>
+    </Schema>
+  </edmx:DataServices>
+</edmx:Edmx>

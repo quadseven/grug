@@ -184,7 +184,7 @@ sequenceDiagram
 | Boundary | Outside | Inside | Mechanism |
 |---|---|---|---|
 | **Public → CF** | Internet | Cloudflare edge | TLS termination + WAF / bot mgmt at CF tier |
-| **CF → AWS** | CF Workers | Lambda Function URL | Worker rewrites `Host:` header. Function URL AuthType=NONE → CF is the implicit auth boundary. Calling the Lambda URL directly bypasses CF (relies on hostname obscurity; tighten with shared-secret header check eventually) |
+| **CF → AWS** | CF Workers | Lambda Function URL | Worker rewrites `Host:` header AND injects `X-Grug-CF-Secret` from a Worker secret binding sourced from SSM `/grug/cf-shared-secret`. Lambda middleware (`services/{api,webhook}/cf_auth.py`) validates the header on every non-`/livez` request via `hmac.compare_digest`; direct hits on the Function URL return 401. Spec 0014 (CfSharedSecret) encodes the contract. DD monitor `grug-cf-secret-mismatch` alerts on >1/min mismatches over 10min (catches rotation drift or direct probing) |
 | **AWS → Lambda env vars** | Lambda env (plaintext to the function) | KMS-encrypted at rest | `env_vars_kms_key_arn=grug-tokens-cmk`. `kms:Decrypt` scoped via `kms:ViaService = lambda.us-east-1.amazonaws.com` so the perm can't be reused for other KMS resources |
 | **api Lambda → user OAuth tokens** | DDB encrypted blob | Plaintext access/refresh token | KMS envelope decrypt. Only `grug-api` role has `kms:Decrypt` on `grug-tokens-cmk`. `grug-webhook` does NOT — webhook uses GitHub App JWT |
 | **Webhook payload** | GitHub | grug-webhook handler | HMAC-SHA256 verify against `/grug/github-app-webhook-secret`. 401 on mismatch. DD monitor on >0.1/min |

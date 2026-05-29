@@ -1,0 +1,188 @@
+# MIRRORED — sibling at services/webhook/cf_auth.py; keep in lockstep. See docs/adr/0001-mirror-with-rule-of-three-deferral.md.
+"""CF→AWS auth-boundary middleware.
+
+CF Workers inject `X-Grug-CF-Secret` from a Worker secret binding on
+every upstream request. This middleware validates the header against
+the same value sourced from SSM `/grug/cf-shared-secret`. Direct hits
+on the Lambda Function URL that bypass CF arrive without the header
+and get 401.
+
+Fail-open is the safe default during deploy churn — if the env var is
+unset OR the SSM lookup fails (ParameterNotFound, empty value), the
+middleware logs the misconfiguration and lets requests through. The
+Worker side mirrors this: when its `GRUG_CF_SECRET` binding is absent,
+no header is injected, so a strict-mode middleware would 401 every
+legitimate request. Pulumi-first rollout depends on this symmetry.
+
+`/livez` is always exempt so DD synthetics and post-deploy smoke tests
+can reach the Lambda without a header.
+"""
+from __future__ import annotations
+
+import asyncio
+import hmac
+import logging
+import os
+import time
+from functools import lru_cache
+from typing import Callable
+
+import boto3
+from botocore.exceptions import BotoCoreError, ClientError
+from starlette.middleware.base import BaseHTTPMiddleware
+from starlette.requests import Request
+from starlette.responses import JSONResponse, Response
+
+log = logging.getLogger(f"{os.getenv('DD_SERVICE', 'grug')}.cf_auth")
+
+# Module-scope clients + cache mirror secrets_loader.py so warm-container
+# semantics match the rest of the secret-loading surface.
+_ssm = boto3.client("ssm")
+
+SECRET_HEADER = "X-Grug-CF-Secret"
+LIVEZ_PATH = "/livez"
+
+# Narrow set of exceptions that put the middleware into fail-open mode.
+# Anything outside this set propagates as a 500 — a programmer bug or
+# unexpected runtime error should NOT silently disable the auth boundary.
+_FAIL_OPEN_ERRORS = (LookupError, ClientError, BotoCoreError)
+
+# Per-process throttle for the "unconfigured" warning log. Unconfigured
+# state is a STATIC misconfig — logging it on every request floods DD
+# with millions of identical warnings during the rollout window.
+#
+# Unlocked dict mutation is safe under Mangum's one-event-per-container
+# model. If/when this code moves to a multi-coroutine ASGI server
+# (uvicorn workers in-process), the race becomes benign-but-real (a
+# duplicate log at a throttle boundary). Add a `threading.Lock` then,
+# or migrate to `contextvars` if per-request semantics are needed.
+_LOG_THROTTLE_SECONDS = 60.0
+_last_unconfigured_log_at: dict[str, float] = {}
+
+
+@lru_cache(maxsize=1)
+def _default_secret_loader() -> str:
+    """Read the SSM param named by `GRUG_CF_SHARED_SECRET_SSM`.
+
+    Successful reads are cached for the warm container's lifetime.
+    Exceptions (LookupError when the env var is unset, ClientError on
+    SSM failures) are NOT cached — `functools.lru_cache` only memoizes
+    return values. Every fail-open request re-enters this function. The
+    middleware's `_log_unconfigured_throttled` throttle is what prevents
+    log flooding during a sustained misconfig.
+    """
+    ssm_name = os.getenv("GRUG_CF_SHARED_SECRET_SSM", "")
+    if not ssm_name:
+        raise LookupError("GRUG_CF_SHARED_SECRET_SSM env var unset")
+    resp = _ssm.get_parameter(Name=ssm_name, WithDecryption=True)
+    return resp["Parameter"]["Value"]
+
+
+def _ssm_cache_clear() -> None:
+    """Test hook — purges the loader cache so monkeypatched env vars
+    take effect between tests."""
+    _default_secret_loader.cache_clear()
+
+
+class CfAuthMiddleware(BaseHTTPMiddleware):
+    """Starlette/FastAPI middleware that enforces the auth boundary.
+
+    `secret_loader` is injected for tests (default: read SSM via env
+    var). The loader is expected to either return the secret string OR
+    raise — any raise puts the middleware into fail-open mode for that
+    request and logs the misconfiguration.
+    """
+
+    def __init__(
+        self,
+        app,
+        secret_loader: Callable[[], str] = _default_secret_loader,
+    ) -> None:
+        """
+        Args:
+          secret_loader: zero-arg callable returning the SSM secret value.
+            - returns a non-empty `str` → strict mode for this request
+            - returns `""` → fail-open + `cf_shared_secret_unconfigured`
+              log with `reason="empty_ssm_value"` (throttled per reason)
+            - raises any exception in `_FAIL_OPEN_ERRORS` (LookupError,
+              ClientError, BotoCoreError) → fail-open + same log with
+              `reason=<type name>` (throttled per reason)
+            Anything else (`AttributeError`, `NameError`, `TypeError`,
+            …) propagates as 500. Programmer bugs MUST NOT silently
+            disable the auth boundary — see `_FAIL_OPEN_ERRORS` for the
+            whitelist rationale.
+        """
+        super().__init__(app)
+        self._secret_loader = secret_loader
+
+    async def dispatch(
+        self, request: Request, call_next: Callable
+    ) -> Response:
+        # Liveness probe stays open so DD synthetics + smoke tests work
+        # whether or not CF is in front of us. Normalize trailing slash
+        # + case so `/livez/` and `/LIVEZ` also bypass — FastAPI's
+        # auto-redirect on trailing slash issues 307 from the route
+        # layer, but the middleware sees the raw path first.
+        if request.url.path.rstrip("/").lower() == LIVEZ_PATH:
+            return await call_next(request)
+
+        try:
+            # Cold-start path calls sync boto3 ssm.get_parameter — wrap
+            # in asyncio.to_thread to keep the event loop unblocked.
+            # Warm-path is a memoized dict lookup, ~microseconds, so the
+            # thread hop is wasted but negligible. Mangum runs one event
+            # per container; this matters most for any future lifespan
+            # or background-task coroutines that would otherwise stall.
+            expected = await asyncio.to_thread(self._secret_loader)
+        except _FAIL_OPEN_ERRORS as e:
+            # Known misconfig classes — fail-open with throttled log.
+            # Programmer bugs (AttributeError, NameError, TypeError, etc.)
+            # are NOT in _FAIL_OPEN_ERRORS and propagate as 500 so the
+            # boundary doesn't silently disable on unexpected failures.
+            _log_unconfigured_throttled(type(e).__name__, request.url.path)
+            return await call_next(request)
+
+        if not expected:
+            # Same fail-open behavior for empty-string. Distinguishing
+            # from "unconfigured" only matters for the log signal.
+            _log_unconfigured_throttled("empty_ssm_value", request.url.path)
+            return await call_next(request)
+
+        # Strict mode from here on.
+        received = request.headers.get(SECRET_HEADER, "")
+        if not hmac.compare_digest(received, expected):
+            # Per-request log is intentional — this is the audit trail
+            # for the auth boundary. Volume is naturally bounded by
+            # attacker probing rate and surfaces in the DD monitor.
+            log.info(
+                "cf_shared_secret_mismatch",
+                extra={
+                    "path": request.url.path,
+                    "had_header": bool(received),
+                },
+            )
+            return JSONResponse(
+                {"detail": "Unauthorized"},
+                status_code=401,
+            )
+
+        return await call_next(request)
+
+
+def _log_unconfigured_throttled(reason: str, path: str) -> None:
+    """Emit `cf_shared_secret_unconfigured` at most once per
+    `_LOG_THROTTLE_SECONDS` per reason. Unconfigured is a STATIC misconfig
+    — logging on every request floods DD with identical warnings during
+    a rollout window. The reason key prevents one fail mode from
+    starving another (`empty_ssm_value` and `LookupError` log
+    independently).
+    """
+    now = time.monotonic()
+    last = _last_unconfigured_log_at.get(reason, 0.0)
+    if now - last < _LOG_THROTTLE_SECONDS:
+        return
+    _last_unconfigured_log_at[reason] = now
+    log.warning(
+        "cf_shared_secret_unconfigured",
+        extra={"reason": reason, "path": path},
+    )

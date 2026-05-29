@@ -31,6 +31,7 @@ class _MonitorBundle:
     sig_verify_fail: datadog.Monitor
     cold_start_p99: datadog.Monitor
     enforcement_gap: datadog.Monitor
+    cf_secret_mismatch: datadog.Monitor
     uptime: datadog.SyntheticsTest
 
 
@@ -178,7 +179,38 @@ def create_all(
         opts=opts,
     )
 
-    # 6) Synthetic uptime — hit GET /livez (no IO, returns 200). Earlier
+    # 6) CF→AWS auth-boundary header-mismatch rate. A burst means the
+    #    secret got out of sync between the CF Worker binding and the
+    #    SSM param the Lambda middleware reads — usually a rotation
+    #    where deploy.sh ran but the Lambda hasn't cold-cycled yet, OR
+    #    a real attacker probing the Function URL directly. Catches
+    #    both. Excludes /livez since that path is always-exempt.
+    cf_secret_mismatch = datadog.Monitor(
+        "grug-cf-secret-mismatch",
+        type="log alert",
+        name="[grug] CF auth-boundary mismatch > 10 in 10min",
+        message=(
+            f"{notify_handle}\n"
+            "X-Grug-CF-Secret mismatches detected on non-/livez requests. "
+            "Either CF Worker binding ↔ SSM param drifted (rotation in "
+            "progress?) or someone is probing the Function URL directly.\n"
+            "Runbook: docs/RUNBOOK.md#cf-secret-mismatch"
+        ),
+        # Parenthesize the OR explicitly so DD scopes the env filter to
+        # both services. Without parens, DD reads "service:grug-api OR
+        # (service:grug-webhook AND env:<env> AND ...)" and grug-api
+        # alerts fire across ALL envs.
+        query=(
+            f'logs("(service:grug-api OR service:grug-webhook) env:{env} '
+            'cf_shared_secret_mismatch").index("*").rollup("count").last("10m") > 10'
+        ),
+        tags=_common_tags(env, "grug-api") + ["auth:cf-boundary"],
+        notify_no_data=False,
+        priority=2,
+        opts=opts,
+    )
+
+    # 7) Synthetic uptime — hit GET /livez (no IO, returns 200). Earlier
     #    design POSTed a fake-sig body expecting 401, but that triggered
     #    webhook_signature_invalid every 5 min → false-positive infinite
     #    alert loop on monitor #3 (Codex P1, Slice 9).
@@ -226,5 +258,6 @@ def create_all(
         sig_verify_fail=sig_verify_fail,
         cold_start_p99=cold_start_p99,
         enforcement_gap=enforcement_gap,
+        cf_secret_mismatch=cf_secret_mismatch,
         uptime=uptime,
     )
