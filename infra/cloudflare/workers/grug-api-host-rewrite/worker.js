@@ -15,8 +15,12 @@
 // has un-authenticated endpoints (`/livez`, `/api/v1/auth/github/callback`)
 // where this header is the only second-layer auth.
 
+// Three placeholders are sed-substituted by infra/cloudflare/deploy.sh
+// at upload time so deploy.sh is the single source of truth. See
+// webhook worker for the cross-link rationale.
 const ORIGIN = "__UPSTREAM_HOST__";
-const SECRET_HEADER = "X-Grug-CF-Secret";
+const SECRET_HEADER = "__SECRET_HEADER__";
+const BINDING_NAME = "__BINDING_NAME__";
 
 export default {
   async fetch(request, env) {
@@ -31,8 +35,9 @@ export default {
     // Inject the shared secret. `set` (not `append`) so a client-supplied
     // header is overwritten — clients cannot smuggle a forged value past
     // the Lambda middleware.
-    if (env && env.GRUG_CF_SECRET) {
-      headers.set(SECRET_HEADER, env.GRUG_CF_SECRET);
+    const bindingValue = env && env[BINDING_NAME];
+    if (bindingValue) {
+      headers.set(SECRET_HEADER, bindingValue);
     } else {
       // No binding deployed yet — strip any client-supplied value so
       // downstream sees the "unconfigured" path cleanly. Middleware in

@@ -31,6 +31,14 @@ set -euo pipefail
 
 SCRIPT_DIR="$(dirname "$0")"
 
+# CF→AWS auth boundary contract (parent #173). Single source of truth
+# for the header name and the Worker secret binding name — both are
+# sed-substituted into worker.js placeholders below. Lambda middleware
+# in sibling slice #233 must read the same SECRET_HEADER string;
+# spec 0014's attester enforces that cross-link.
+SECRET_HEADER="X-Grug-CF-Secret"
+BINDING_NAME="GRUG_CF_SECRET"
+
 CF_TOKEN=$(aws ssm get-parameter --region us-east-1 \
     --name /grug/cloudflare-api-token --with-decryption \
     --query 'Parameter.Value' --output text)
@@ -80,7 +88,11 @@ deploy_one() {
 
     # Use /tmp/worker.js so the upload filename matches metadata.main_module
     # per memory: reference_cf_worker_upload_module_filename.
-    sed "s|__UPSTREAM_HOST__|$upstream_host|" "$worker_src" > /tmp/worker.js
+    sed \
+      -e "s|__UPSTREAM_HOST__|$upstream_host|" \
+      -e "s|__SECRET_HEADER__|$SECRET_HEADER|" \
+      -e "s|__BINDING_NAME__|$BINDING_NAME|" \
+      "$worker_src" > /tmp/worker.js
 
     local upload
     upload=$(curl -sS -X PUT \
@@ -107,14 +119,14 @@ deploy_one() {
         secret_response=$(curl -sS -X PUT \
             -H "Authorization: Bearer $CF_TOKEN" \
             -H "Content-Type: application/json" \
-            -d "{\"name\":\"GRUG_CF_SECRET\",\"type\":\"secret_text\",\"text\":\"$CF_SHARED_SECRET\"}" \
+            -d "{\"name\":\"$BINDING_NAME\",\"type\":\"secret_text\",\"text\":\"$CF_SHARED_SECRET\"}" \
             "https://api.cloudflare.com/client/v4/accounts/$CF_ACCOUNT/workers/scripts/$worker_name/secrets")
         local secret_success
         secret_success=$(echo "$secret_response" | python3 -c "import json,sys; print(json.load(sys.stdin)['success'])")
         if [ "$secret_success" != "True" ]; then
-            echo "  ✗ GRUG_CF_SECRET binding FAILED:"; echo "$secret_response" | python3 -m json.tool; exit 1
+            echo "  ✗ $BINDING_NAME binding FAILED:"; echo "$secret_response" | python3 -m json.tool; exit 1
         fi
-        echo "  ✓ GRUG_CF_SECRET binding set"
+        echo "  ✓ $BINDING_NAME binding set"
     fi
 
     local route_response
