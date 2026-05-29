@@ -66,8 +66,6 @@ def test_post_review_body_comment_event_no_findings():
     assert body["commit_id"] == "abc"
     assert body["event"] == "COMMENT"
     assert body["body"] == "No findings"
-    # `asdict` preserves tuple → tuple; JSON-serializes to `[]`. The
-    # wire payload is identical to a list-of-dicts.
     assert list(body["comments"]) == []
 
 
@@ -145,6 +143,59 @@ def test_review_result_accepts_body_at_github_limit():
     assert len(r.body) == 65536
 
 
+def test_inline_comment_rejects_negative_line():
+    """A buggy diff-parser could emit a negative line. Guard is
+    `line < 1`, so only `line=0` would have hit it in the prior test
+    set — a future refactor to `line == 0` would regress silently."""
+    with pytest.raises(ValueError, match="line must be >= 1"):
+        InlineComment(path="x.py", line=-5, body="msg")
+
+
+def test_review_result_rejects_pending_event():
+    """PENDING is explicitly called out in the module docstring as
+    rejected (creates a draft review that never publishes — the persona
+    has no use for it). Only APPROVE was previously tested; this covers
+    the second documented rejection."""
+    with pytest.raises(ValueError, match="event must be one of"):
+        ReviewResult(  # type: ignore[arg-type]
+            commit_id="abc", event="PENDING", body="x", comments=(),
+        )
+
+
+def test_post_review_pull_number_flows_into_url_distinctly():
+    """`pull_number` must end up as the int path segment in
+    /pulls/{pull_number}/reviews — distinct from `repo`. A bug that
+    swapped them would build `/pulls/myrepo/reviews` and 404. Guard
+    against an accidental f-string field-swap regression."""
+    result = ReviewResult(
+        commit_id="abc", event="COMMENT", body="", comments=(),
+    )
+    with patch("httpx.post", return_value=_ok_response()) as mock_post:
+        post_review("tok", "myorg", "myrepo", pull_number=42, result=result)
+
+    url = mock_post.call_args.args[0]
+    assert "/pulls/42/" in url
+    assert "/myrepo/" in url
+    # And critically, the segment after `/pulls/` is the int, not the repo:
+    assert "/pulls/myrepo" not in url
+
+
+def test_post_review_422_propagates_unwrapped(mock_transport_client):
+    """422 is GitHub's "payload accepted but rejected by validation"
+    response — e.g. unknown commit_id, line outside the diff. The
+    caller may want to distinguish 422 from 401 (no token-refresh
+    helps) and 5xx (transient). Confirm the unwrapped-propagation
+    contract holds for the status code that's most actionable."""
+    result = ReviewResult(
+        commit_id="abc", event="COMMENT", body="x", comments=(),
+    )
+    client = mock_transport_client(status_codes=[422])
+    with patch("httpx.post", side_effect=lambda *a, **kw: client.post(*a, **kw)):
+        with pytest.raises(httpx.HTTPStatusError) as exc:
+            post_review("tok", "o", "r", pull_number=1, result=result)
+    assert exc.value.response.status_code == 422
+
+
 def test_inline_comment_is_frozen():
     import dataclasses
     c = InlineComment(path="x.py", line=1, body="msg")
@@ -187,8 +238,7 @@ def test_post_review_500_propagates_unwrapped(mock_transport_client):
 
 def test_post_review_connect_error_propagates(mock_transport_client):
     """Transport-level ConnectError must propagate (not be caught by a
-    too-narrow `httpx.HTTPStatusError` handler). Mirrors the gap from
-    issue #105 / async-blocker-hunter F-01."""
+    too-narrow `httpx.HTTPStatusError` handler)."""
     result = ReviewResult(
         commit_id="abc", event="COMMENT", body="x", comments=(),
     )
