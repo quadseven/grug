@@ -1,4 +1,4 @@
-"""pytest config for services/webhook/ tests.
+"""pytest config for services/{api,webhook}/ tests.
 
 Adds the parent directory to sys.path so tests can `from hmac_verify
 import ...` without a package install (handler files live alongside the
