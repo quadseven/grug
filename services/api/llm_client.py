@@ -45,6 +45,12 @@ _TIMEOUT_SECONDS = 30
 _RETRY_ATTEMPTS = 3
 _RETRY_BASE_DELAY = 0.5  # exponential: 0.5s, 1.0s, 2.0s
 
+# 429 (rate limit) + 503 (CF edge blip / temporary backend overload)
+# are routinely transient on both Poolside and OpenRouter. Other 5xx
+# (500, 502, 504) get one shot then fall back to the secondary backend
+# rather than burning retries on what may be a permanent issue.
+_RETRYABLE_STATUSES: frozenset[int] = frozenset((429, 503))
+
 
 class Backend(str, Enum):
     """LLM backends. String-valued so DD LLM Obs tags + structured logs
@@ -186,64 +192,83 @@ def _build_messages(hunks: list[Hunk]) -> list[dict[str, str]]:
     ]
 
 
+class _BackendConfigError(Exception):
+    """Backend is misconfigured (empty key, missing env var, SSM
+    failure). Distinct from transport errors so the caller can fall
+    back to the other backend without retry-burning the broken one."""
+
+
 def _call_backend(
     config: BackendConfig, messages: list[dict[str, str]]
 ) -> httpx.Response:
-    """Single backend call with 429 retry + backoff. Raises httpx errors
-    on the LAST attempt — caller catches and falls back."""
+    """Single backend call with 429/503 retry + backoff. Raises
+    `httpx.RequestError`/`httpx.TimeoutException` on transport failure
+    or `_BackendConfigError` on misconfig — caller catches and falls
+    back. Narrow exception scope deliberately: `httpx.InvalidURL`,
+    `httpx.UnsupportedProtocol`, `httpx.CookieConflict` are config
+    bugs that should crash loudly, not retry silently."""
+    try:
+        key = config.key_loader()
+    except Exception as e:
+        # secrets_loader.RuntimeError("SSM parameter name is empty…")
+        # or boto3 ClientError on a missing param. Wrap so the caller's
+        # except clause is uniform.
+        raise _BackendConfigError(
+            f"{config.backend.value} key_loader failed: {type(e).__name__}: {e}"
+        ) from e
+    if not key:
+        raise _BackendConfigError(
+            f"{config.backend.value} key_loader returned empty string"
+        )
+
     body = {
         "model": config.model,
         "messages": messages,
         "response_format": {"type": "json_object"},
     }
-    headers = {"Authorization": f"Bearer {config.key_loader()}"}
+    headers = {"Authorization": f"Bearer {key}"}
 
-    last_exc: Exception | None = None
     for attempt in range(_RETRY_ATTEMPTS):
         try:
             resp = httpx.post(
                 config.url, json=body, headers=headers, timeout=_TIMEOUT_SECONDS,
             )
-        except (httpx.RequestError, httpx.HTTPError) as e:
-            last_exc = e
+        except (httpx.RequestError, httpx.TimeoutException) as e:
             if attempt < _RETRY_ATTEMPTS - 1:
                 _RETRY_SLEEP(_RETRY_BASE_DELAY * (2 ** attempt))
                 continue
             raise
-        if resp.status_code == 429 and attempt < _RETRY_ATTEMPTS - 1:
+        if resp.status_code in _RETRYABLE_STATUSES and attempt < _RETRY_ATTEMPTS - 1:
             _RETRY_SLEEP(_RETRY_BASE_DELAY * (2 ** attempt))
             continue
         return resp
-    # Defense-in-depth; the loop body returns or raises in every branch.
-    if last_exc:
-        raise last_exc
-    raise RuntimeError("retry loop exited without producing a response")
+    # Unreachable: every iteration either returns, continues, or raises.
+    raise AssertionError("retry loop exited without producing a response")
 
 
-def _coerce_finding(raw: Any) -> Optional[Finding]:
+def _coerce_finding(raw: Any) -> tuple[Optional[Finding], str]:
     """Validate one raw dict from the LLM into a `Finding`. Returns
-    None and lets the caller drop the entry on any shape violation.
-
-    Defense-in-depth: the system prompt declares the contract, but
-    hallucinating models occasionally return bogus severity strings
-    or non-string fields. Dropping malformed entries is preferable to
-    iterating over `Any` downstream.
+    `(finding, "")` on success or `(None, reason)` on rejection so
+    the caller can log per-entry context (defense against a hostile
+    LLM hiding a critical finding by mixing it with malformed ones).
     """
     if not isinstance(raw, dict):
-        return None
+        return None, "non_dict"
     try:
         path = str(raw["path"])
         line = int(raw["line"])
         rule = str(raw["rule"])
         severity = str(raw["severity"])
         message = str(raw.get("message", ""))
-    except (KeyError, TypeError, ValueError):
-        return None
+    except KeyError as e:
+        return None, f"missing_field:{e.args[0]}"
+    except (TypeError, ValueError) as e:
+        return None, f"bad_type:{type(e).__name__}"
     if severity not in _VALID_SEVERITIES:
-        return None
+        return None, f"invalid_severity:{severity[:32]}"
     return Finding(
         path=path, line=line, rule=rule, severity=severity, message=message,  # type: ignore[arg-type]
-    )
+    ), ""
 
 
 def _parse_response(
@@ -253,7 +278,15 @@ def _parse_response(
     ((), model_name, error_message)."""
     if resp.status_code != 200:
         return (), "", f"http_{resp.status_code}"
-    body = resp.json()
+    try:
+        body = resp.json()
+    except (json.JSONDecodeError, ValueError):
+        # Cloudflare HTML interstitial, gateway error page, truncated
+        # body — all return 200 + non-JSON. Surface as parse failure
+        # instead of crashing the webhook handler.
+        return (), "", "envelope_json_decode_failed"
+    if not isinstance(body, dict):
+        return (), "", "envelope_not_a_dict"
     model_name = body.get("model", "")
     try:
         content = body["choices"][0]["message"]["content"]
@@ -266,14 +299,25 @@ def _parse_response(
     raw_findings = parsed.get("findings", [])
     if not isinstance(raw_findings, list):
         return (), model_name, "findings field is not a list"
-    coerced = tuple(f for f in (_coerce_finding(r) for r in raw_findings) if f)
-    dropped = len(raw_findings) - len(coerced)
-    if dropped:
-        log.warning(
-            "llm_findings_malformed_dropped",
-            extra={"dropped": dropped, "kept": len(coerced), "model": model_name},
-        )
-    return coerced, model_name, ""
+    coerced: list[Finding] = []
+    for raw in raw_findings:
+        finding, reason = _coerce_finding(raw)
+        if finding is None:
+            # Log per-drop with truncated raw so a hostile/hallucinating
+            # LLM can't hide a critical finding by surrounding it with
+            # malformed noise. `reason` carries the failure class +
+            # offending field value so triage is mechanical.
+            log.warning(
+                "llm_finding_dropped",
+                extra={
+                    "reason": reason,
+                    "model": model_name,
+                    "raw_truncated": str(raw)[:200],
+                },
+            )
+            continue
+        coerced.append(finding)
+    return tuple(coerced), model_name, ""
 
 
 def review_diff(
@@ -301,7 +345,14 @@ def review_diff(
         config = _BACKEND_CONFIGS[backend]
         try:
             resp = _call_backend(config, messages)
-        except (httpx.RequestError, httpx.HTTPError) as e:
+        except _BackendConfigError as e:
+            log.error(
+                "llm_backend_misconfigured",
+                extra={"backend": backend.value, "detail": str(e)},
+            )
+            last_error = f"{backend.value} misconfigured: {e}"
+            continue
+        except (httpx.RequestError, httpx.TimeoutException) as e:
             log.warning(
                 "llm_backend_transport_failed",
                 extra={"backend": backend.value, "kind": type(e).__name__},
