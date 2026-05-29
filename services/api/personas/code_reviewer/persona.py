@@ -91,7 +91,7 @@ class CodeReviewEvaluation:
       - LLM didn't produce content (`no_diff` / `all_failed` /
         `parse_failed`): `conclusion=neutral`, passed=True. Elder is
         advisory-first — infra flakiness must not block PRs.
-      - At least one high+critical finding: `conclusion=failure`,
+      - At least one high or critical finding: `conclusion=failure`,
         passed=False.
       - Otherwise: `conclusion=success`, passed=True. Medium+low
         findings are advisory — reported in the check-run summary but
@@ -139,7 +139,6 @@ def evaluate_diff(
 
     No IO, no logging side-effects. Spec 0015 attests purity.
     """
-    # LLM did not return reviewable content — advisory neutral.
     # Preserve `kind` as the degraded_reason so the caller can tell
     # "empty PR" from "every backend failed" (both yield findings=()).
     if llm_response.kind != "reviewed":
@@ -169,9 +168,8 @@ def evaluate_diff(
                 severity=raw.severity,
                 rule_name=raw.rule,
                 message=raw.message,
-                # The LLM client's wire-format Finding doesn't carry a
-                # `suggestion` field today. `None` (not "") so consumers
-                # don't conflate "absent" with "empty hint".
+                # `None` (not "") so consumers don't conflate "LLM
+                # supplied no hint" with "LLM supplied an empty hint."
                 suggestion=None,
             )
         )

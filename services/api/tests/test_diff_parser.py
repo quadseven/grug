@@ -192,7 +192,37 @@ def test_realistic_multi_hunk_shape_with_correct_line_numbers() -> None:
     assert 52 not in hunks[0].new_lines
 
 
-def test_malformed_at_at_header_raises_diff_parse_error() -> None:
+def test_pure_deletion_dev_null_yields_zero_hunks() -> None:
+    """A file deletion has `+++ /dev/null` and no @@ block. Must produce
+    no hunks and not mis-attribute anything to the deleted path. Guards
+    against a regression where the `!= "/dev/null"` guard flips."""
+    diff = """diff --git a/x.py b/x.py
+deleted file mode 100644
+index abc..0000000
+--- a/x.py
++++ /dev/null
+"""
+    assert parse_diff(diff) == ()
+
+
+def test_single_line_hunk_without_count_parses() -> None:
+    """GitHub emits `@@ -1 +1 @@` (no `,N` count) for single-line hunks.
+    Tests should exercise the optional `,m` branch — without this, a
+    regression that makes `,m` mandatory would `DiffParseError` on
+    legitimate single-line diffs."""
+    diff = """diff --git a/x.py b/x.py
+--- a/x.py
++++ b/x.py
+@@ -1 +1 @@
+-old
++new
+"""
+    hunks = parse_diff(diff)
+    assert len(hunks) == 1
+    assert 1 in hunks[0].new_lines
+
+
+def test_no_newline_marker_does_not_shift_line_numbers() -> None:
     """A garbled @@ header is more likely a fetcher bug or GitHub
     format drift than a real hunk we should partially extract. Silent
     skip would let evaluate_diff return a clean "success" verdict —

@@ -249,6 +249,62 @@ def test_finding_rejects_zero_line() -> None:
         Finding(file="x.py", line=0, severity="low", rule_name="r", message="m", suggestion=None)
 
 
+def test_low_severity_kept_but_advisory() -> None:
+    """Low severity is reported, kept in `findings`, but doesn't flip
+    `passed`. Without this, a refactor that excluded low from `kept`
+    would ship green (`success` + `findings=()` looks like clean PR)."""
+    hunks = parse_diff(_DIFF)
+    llm = LlmReviewResponse(
+        kind="reviewed",
+        findings=(_llm_finding(severity="low", line=2),),
+        backend_used=Backend.POOLSIDE,
+    )
+    out = evaluate_diff(hunks, llm)
+    assert out.passed is True
+    assert out.conclusion == "success"
+    assert len(out.findings) == 1
+    assert out.findings[0].severity == "low"
+
+
+def test_mixed_blocking_and_advisory_kept_together() -> None:
+    """A critical + a low coexist: both retained in `findings`, but
+    `conclusion=failure` driven by the critical. Catches a regression
+    that drops non-blocking findings when blocking ones exist."""
+    hunks = parse_diff(_DIFF)
+    llm = LlmReviewResponse(
+        kind="reviewed",
+        findings=(
+            _llm_finding(severity="critical", line=2, rule="crit"),
+            _llm_finding(severity="low", line=3, rule="info"),
+        ),
+        backend_used=Backend.POOLSIDE,
+    )
+    out = evaluate_diff(hunks, llm)
+    assert out.conclusion == "failure"
+    assert out.passed is False
+    assert len(out.findings) == 2
+    assert {f.rule_name for f in out.findings} == {"crit", "info"}
+
+
+def test_hallucination_wrong_file_does_not_raise() -> None:
+    """A finding whose `path` is not in the line index must take the
+    `allowed_lines is None` branch and increment dropped. Catches a
+    regression that uses `dict[path]` (KeyError) instead of `.get()`."""
+    hunks = parse_diff(_DIFF)
+    llm = LlmReviewResponse(
+        kind="reviewed",
+        findings=(
+            _llm_finding(path="totally-unseen.py", line=1, rule="ghost"),
+        ),
+        backend_used=Backend.POOLSIDE,
+    )
+    # Must not raise — if it does, `_hunk_line_index` switched to a
+    # KeyError shape and the wrong-file path stopped being graceful.
+    out = evaluate_diff(hunks, llm)
+    assert out.findings == ()
+    assert out.dropped_hallucinations == 1
+
+
 def test_dropped_hallucinations_count_surfaced() -> None:
     """Two hallucinated findings + one real → dropped_hallucinations=2.
     Distinguishes "100% hallucination" from "no findings at all" — both

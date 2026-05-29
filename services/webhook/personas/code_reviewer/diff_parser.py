@@ -125,7 +125,6 @@ def parse_diff(unified_diff: str) -> tuple[DiffHunk, ...]:
             continue
 
         if _BINARY_RE.match(line):
-            # Binary block; nothing in this file produces hunks.
             binary_skip = True
             i += 1
             continue
