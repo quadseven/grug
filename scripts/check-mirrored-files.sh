@@ -37,6 +37,7 @@ MIRRORED_WITH_HEADER=(
   "llm_client.py"
   "observability.py"
   "personas/code_reviewer/diff_parser.py"
+  "personas/code_reviewer/dispatch.py"
   "personas/code_reviewer/persona.py"
   "personas/tpm/dor_checks.py"
   "ports/token_cache.py"

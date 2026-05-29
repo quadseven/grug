@@ -53,38 +53,48 @@ def _full_pr_payload():
     }
 
 
+def _only_tpm(persona: str) -> bool:
+    """is_persona_enabled stub — keep TPM-only behavior for legacy
+    test cases that predate the Elder persona (so they assert TPM-only
+    response shapes)."""
+    return persona == "tpm"
+
+
 def test_pull_request_dispatches_when_allowlisted():
     with patch("dispatcher.is_install_allowlisted", return_value=True), \
-         patch("dispatcher.is_persona_enabled", return_value=True), \
+         patch("dispatcher.is_persona_enabled", side_effect=lambda *a: _only_tpm(a[2])), \
          patch("personas.tpm.persona.evaluate_pull_request") as mock_eval, \
          patch("personas.tpm.persona.publish_tpm_evaluation") as _mock_pub:
         mock_eval.return_value = type("R", (), {"passed": True})()
         out = dispatch("pull_request", _full_pr_payload())
     assert out["status"] == "dispatched"
-    assert out["persona"] == "tpm"
-    assert out["result"] == "pass"
+    assert len(out["personas"]) == 1
+    assert out["personas"][0]["persona"] == "tpm"
+    assert out["personas"][0]["result"] == "pass"
     mock_eval.assert_called_once()
 
 
-def test_pull_request_blocked_when_tpm_disabled_for_repo():
-    """Slice 7 #28 — per-repo opt-out short-circuits AFTER allowlist."""
+def test_pull_request_no_op_when_all_personas_disabled():
+    """Per-repo opt-out — all personas disabled short-circuits AFTER
+    allowlist with `no_op`. Previously only TPM existed; now an opt-out
+    must cover both."""
     with patch("dispatcher.is_install_allowlisted", return_value=True), \
          patch("dispatcher.is_persona_enabled", return_value=False), \
          patch("personas.tpm.persona.evaluate_pull_request") as mock_eval, \
          patch("personas.tpm.persona.publish_tpm_evaluation") as _mock_pub:
         out = dispatch("pull_request", _full_pr_payload())
-    assert out["status"] == "no_op" and "tpm disabled" in out["reason"]
+    assert out["status"] == "no_op" and "all personas disabled" in out["reason"]
     mock_eval.assert_not_called()
 
 
 def test_pull_request_fail_propagates():
     with patch("dispatcher.is_install_allowlisted", return_value=True), \
-         patch("dispatcher.is_persona_enabled", return_value=True), \
+         patch("dispatcher.is_persona_enabled", side_effect=lambda *a: _only_tpm(a[2])), \
          patch("personas.tpm.persona.evaluate_pull_request") as mock_eval, \
          patch("personas.tpm.persona.publish_tpm_evaluation") as _mock_pub:
         mock_eval.return_value = type("R", (), {"passed": False})()
         out = dispatch("pull_request", _full_pr_payload())
-    assert out["result"] == "fail"
+    assert out["personas"][0]["result"] == "fail"
 
 
 def test_pull_request_blocked_when_not_allowlisted():
@@ -110,15 +120,16 @@ def test_pull_request_publish_failure_returns_skip_with_log_context():
     publish_error = httpx.HTTPStatusError("502 Bad Gateway", request=fake_response.request, response=fake_response)
 
     with patch("dispatcher.is_install_allowlisted", return_value=True), \
-         patch("dispatcher.is_persona_enabled", return_value=True), \
+         patch("dispatcher.is_persona_enabled", side_effect=lambda *a: _only_tpm(a[2])), \
          patch("personas.tpm.persona.evaluate_pull_request") as mock_eval, \
          patch("personas.tpm.persona.publish_tpm_evaluation", side_effect=publish_error):
         mock_eval.return_value = type("R", (), {"passed": True})()
         out = dispatch("pull_request", _full_pr_payload())
 
-    assert out["status"] == "skip"
-    assert out["reason"] == "publish_failed"
-    assert out["persona"] == "tpm"
+    # Publish failure no longer short-circuits the whole dispatcher —
+    # it's recorded per-persona so the other persona can still run.
+    assert out["status"] == "dispatched"
+    assert out["personas"][0] == {"persona": "tpm", "result": "publish_failed"}
 
 
 def test_pull_request_publish_transport_error_returns_skip():
@@ -126,14 +137,95 @@ def test_pull_request_publish_transport_error_returns_skip():
     import httpx
 
     with patch("dispatcher.is_install_allowlisted", return_value=True), \
-         patch("dispatcher.is_persona_enabled", return_value=True), \
+         patch("dispatcher.is_persona_enabled", side_effect=lambda *a: _only_tpm(a[2])), \
          patch("personas.tpm.persona.evaluate_pull_request") as mock_eval, \
          patch("personas.tpm.persona.publish_tpm_evaluation",
                side_effect=httpx.ConnectTimeout("timed out", request=None)):
         mock_eval.return_value = type("R", (), {"passed": True})()
         out = dispatch("pull_request", _full_pr_payload())
 
-    assert out["status"] == "skip" and out["reason"] == "publish_failed"
+    assert out["personas"][0]["result"] == "publish_failed"
+
+
+def test_pull_request_dispatches_both_personas_independently():
+    """Acceptance criterion (#185): TPM and Elder run on the same event,
+    producing independent verdicts. Both must appear in the results
+    list. Order: TPM first, Elder second."""
+    with patch("dispatcher.is_install_allowlisted", return_value=True), \
+         patch("dispatcher.is_persona_enabled", return_value=True), \
+         patch("dispatcher.get_repo_config", return_value={"code_reviewer_blocking": False}), \
+         patch("personas.tpm.persona.evaluate_pull_request") as mock_eval, \
+         patch("personas.tpm.persona.publish_tpm_evaluation"), \
+         patch("personas.code_reviewer.dispatch.dispatch_code_review",
+               return_value={"persona": "code_reviewer", "result": "pass"}):
+        mock_eval.return_value = type("R", (), {"passed": True})()
+        out = dispatch("pull_request", _full_pr_payload())
+
+    assert out["status"] == "dispatched"
+    assert len(out["personas"]) == 2
+    assert out["personas"][0]["persona"] == "tpm"
+    assert out["personas"][1]["persona"] == "code_reviewer"
+
+
+def test_pull_request_tpm_failure_does_not_skip_elder():
+    """One persona failing must not skip the other — independence is
+    the load-bearing property."""
+    import httpx
+
+    with patch("dispatcher.is_install_allowlisted", return_value=True), \
+         patch("dispatcher.is_persona_enabled", return_value=True), \
+         patch("dispatcher.get_repo_config", return_value={"code_reviewer_blocking": False}), \
+         patch("personas.tpm.persona.evaluate_pull_request") as mock_eval, \
+         patch("personas.tpm.persona.publish_tpm_evaluation",
+               side_effect=httpx.ConnectError("dns down")), \
+         patch("personas.code_reviewer.dispatch.dispatch_code_review",
+               return_value={"persona": "code_reviewer", "result": "pass"}) as mock_cr:
+        mock_eval.return_value = type("R", (), {"passed": True})()
+        out = dispatch("pull_request", _full_pr_payload())
+
+    # TPM publish failed → recorded but did not skip the dispatcher.
+    assert out["personas"][0] == {"persona": "tpm", "result": "publish_failed"}
+    # Elder still ran.
+    mock_cr.assert_called_once()
+    assert out["personas"][1]["result"] == "pass"
+
+
+def test_pull_request_elder_unhandled_exception_does_not_skip_tpm_status():
+    """Inverse: Elder raising an unhandled exception must not corrupt
+    the TPM result. Elder's status becomes `unhandled_error`."""
+    with patch("dispatcher.is_install_allowlisted", return_value=True), \
+         patch("dispatcher.is_persona_enabled", return_value=True), \
+         patch("dispatcher.get_repo_config", return_value={"code_reviewer_blocking": False}), \
+         patch("personas.tpm.persona.evaluate_pull_request") as mock_eval, \
+         patch("personas.tpm.persona.publish_tpm_evaluation"), \
+         patch("personas.code_reviewer.dispatch.dispatch_code_review",
+               side_effect=RuntimeError("unexpected")):
+        mock_eval.return_value = type("R", (), {"passed": True})()
+        out = dispatch("pull_request", _full_pr_payload())
+
+    assert out["personas"][0]["result"] == "pass"  # TPM unaffected
+    assert out["personas"][1] == {
+        "persona": "code_reviewer", "result": "unhandled_error",
+    }
+
+
+def test_pull_request_code_reviewer_disabled_skips_only_elder():
+    """When `code_reviewer_enabled=False`, the Elder dispatch is skipped
+    but TPM still runs (and vice versa)."""
+    def _only_tpm_enabled(install_id, repo_id, persona):
+        return persona == "tpm"
+
+    with patch("dispatcher.is_install_allowlisted", return_value=True), \
+         patch("dispatcher.is_persona_enabled", side_effect=_only_tpm_enabled), \
+         patch("personas.tpm.persona.evaluate_pull_request") as mock_eval, \
+         patch("personas.tpm.persona.publish_tpm_evaluation"), \
+         patch("personas.code_reviewer.dispatch.dispatch_code_review") as mock_cr:
+        mock_eval.return_value = type("R", (), {"passed": True})()
+        out = dispatch("pull_request", _full_pr_payload())
+
+    assert len(out["personas"]) == 1
+    assert out["personas"][0]["persona"] == "tpm"
+    mock_cr.assert_not_called()
 
 
 def test_installation_created_records_row():

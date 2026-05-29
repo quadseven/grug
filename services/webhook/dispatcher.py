@@ -245,13 +245,31 @@ def _handle_pull_request(payload: dict[str, Any]) -> dict[str, str]:
         )
         return {"status": "no_op", "reason": "installer not allowlisted"}
 
-    # Per-repo persona toggle (Slice 7 #28). Lets users disable Grug on
-    # noisy repos without uninstalling the App entirely. Defaults to
-    # enabled — explicit opt-out per repo via dashboard.
+    # Lazy import — keeps cold-start cheap when only non-PR events fire
+    import httpx  # type: ignore
+    from adapters.install_store import get_repo_config  # type: ignore
+
     repo_id = repo.get("id")
-    if repo_id is not None and not is_persona_enabled(
-        int(installation_id), int(repo_id), "tpm",
-    ):
+
+    # Both TPM and Elder dispatch from this handler on the same event,
+    # producing INDEPENDENT verdicts. One failing must not skip the
+    # other — that's the load-bearing property the test suite asserts.
+    # Each persona's exceptions are caught locally so a transient GH
+    # 5xx on one doesn't 500 the webhook or starve the other.
+    results: list[dict[str, str]] = []
+
+    tpm_enabled = (
+        repo_id is None
+        or is_persona_enabled(int(installation_id), int(repo_id), "tpm")
+    )
+    if tpm_enabled:
+        results.append(_dispatch_tpm(
+            installation_id=int(installation_id),
+            owner=owner, repo_name=repo_name,
+            head_sha=head_sha, pr_number=int(pr_number),
+            pr_body=pr_body,
+        ))
+    else:
         log.info(
             "persona_disabled_skip",
             extra={
@@ -260,48 +278,108 @@ def _handle_pull_request(payload: dict[str, Any]) -> dict[str, str]:
                 "persona": "tpm",
             },
         )
-        return {"status": "no_op", "reason": "tpm disabled for this repo"}
 
-    # Lazy import — keeps cold-start cheap when only non-PR events fire
+    code_reviewer_enabled = (
+        repo_id is not None
+        and is_persona_enabled(
+            int(installation_id), int(repo_id), "code_reviewer",
+        )
+    )
+    if code_reviewer_enabled:
+        # `code_reviewer_blocking` controls advisory-vs-blocking mode.
+        # Defaults False; operator flips via dashboard once trust is
+        # established. Fetched alongside the toggle since both come
+        # from the same RepoConfig row.
+        cfg = get_repo_config(int(installation_id), int(repo_id))
+        results.append(_dispatch_code_reviewer(
+            payload=payload,
+            installation_id=int(installation_id),
+            owner=owner, repo_name=repo_name, pr_number=int(pr_number),
+            blocking=bool(cfg.get("code_reviewer_blocking", False)),
+        ))
+    elif repo_id is not None:
+        log.info(
+            "persona_disabled_skip",
+            extra={
+                "installation_id": installation_id,
+                "owner": owner, "repo": repo_name, "pr_number": pr_number,
+                "persona": "code_reviewer",
+            },
+        )
+
+    if not results:
+        return {"status": "no_op", "reason": "all personas disabled"}
+    return {"status": "dispatched", "personas": results}  # type: ignore[dict-item]
+
+
+def _dispatch_tpm(
+    *, installation_id: int, owner: str, repo_name: str, head_sha: str,
+    pr_number: int, pr_body: str,
+) -> dict[str, str]:
+    """TPM persona dispatch — pure evaluate + publish. Catches publish
+    errors locally so the Elder dispatch can still run."""
     import httpx  # type: ignore
-    from personas.tpm.persona import evaluate_pull_request, publish_tpm_evaluation  # type: ignore
+    from personas.tpm.persona import (  # type: ignore
+        evaluate_pull_request, publish_tpm_evaluation,
+    )
 
     evaluation = evaluate_pull_request(pr_body)
-    # Wrap publish so a GH 5xx / RequestError doesn't propagate uncaught
-    # into main.py and turn the webhook into a 500 (which triggers GH
-    # retries → duplicate work, no install/repo/PR coords in the error
-    # log). Peer-review CRITICAL (4x). Mirrors the recheck-path catch
-    # at line ~309. We still re-raise after logging so GH can retry the
-    # delivery, but at least the operator can correlate via structured
-    # fields in DD/Sentry.
     try:
         publish_tpm_evaluation(
             evaluation,
-            installation_id=int(installation_id),
+            installation_id=installation_id,
             owner=owner,
             repo=repo_name,
             head_sha=head_sha,
-            pr_number=int(pr_number),
+            pr_number=pr_number,
         )
     except (httpx.HTTPStatusError, httpx.RequestError) as e:
         log.error(
             "tpm_publish_failed",
             extra={
-                "installation_id": int(installation_id),
+                "installation_id": installation_id,
                 "owner": owner,
                 "repo": repo_name,
-                "pr_number": int(pr_number),
+                "pr_number": pr_number,
                 "head_sha": head_sha[:8],
                 "kind": type(e).__name__,
                 "status": getattr(getattr(e, "response", None), "status_code", None),
             },
         )
-        return {"status": "skip", "persona": "tpm", "reason": "publish_failed"}
+        return {"persona": "tpm", "result": "publish_failed"}
     return {
-        "status": "dispatched",
         "persona": "tpm",
         "result": "pass" if evaluation.passed else "fail",
     }
+
+
+def _dispatch_code_reviewer(
+    *, payload: dict[str, Any], installation_id: int, owner: str,
+    repo_name: str, pr_number: int, blocking: bool,
+) -> dict[str, str]:
+    """Elder persona dispatch — fetch+parse+LLM+evaluate+publish.
+
+    Catches every exception locally and degrades to a "skipped" result
+    rather than propagating. Advisory-first contract is enforced
+    inside `dispatch_code_review`; this wrapper exists to keep TPM and
+    Elder dispatches symmetric in `_handle_pull_request`.
+    """
+    from personas.code_reviewer.dispatch import (  # type: ignore
+        dispatch_code_review,
+    )
+    try:
+        return dispatch_code_review(payload, blocking=blocking)
+    except Exception as e:  # noqa: BLE001 — explicit final guard
+        log.error(
+            "code_review_dispatch_unhandled",
+            extra={
+                "installation_id": installation_id,
+                "owner": owner, "repo": repo_name, "pr_number": pr_number,
+                "kind": type(e).__name__,
+            },
+            exc_info=True,
+        )
+        return {"persona": "code_reviewer", "result": "unhandled_error"}
 
 
 # Closes #2 — `/grug recheck` slash command. PR comments containing
