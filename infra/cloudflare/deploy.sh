@@ -31,11 +31,9 @@ set -euo pipefail
 
 SCRIPT_DIR="$(dirname "$0")"
 
-# CF→AWS auth boundary contract (parent #173). Single source of truth
-# for the header name and the Worker secret binding name — both are
-# sed-substituted into worker.js placeholders below. Lambda middleware
-# in sibling slice #233 must read the same SECRET_HEADER string;
-# spec 0014's attester enforces that cross-link.
+# Single source of truth for the auth-boundary header name + Worker
+# secret binding name. Both are sed-substituted into worker.js
+# placeholders below; Lambda middleware must read the same SECRET_HEADER.
 SECRET_HEADER="X-Grug-CF-Secret"
 BINDING_NAME="GRUG_CF_SECRET"
 
@@ -49,18 +47,12 @@ CF_ZONE=$(aws ssm get-parameter --region us-east-1 \
     --name /grug/cloudflare-zone-id \
     --query 'Parameter.Value' --output text)
 
-# CF→AWS auth boundary (parent #173 / this slice #232). Optional: deploy
-# can run before sibling slice #234's SSM param exists. If absent, we
-# skip the binding-set step and the Worker's `env.GRUG_CF_SECRET` is
-# undefined → worker.js falls through to its strip-only branch, Lambda
-# middleware (#233) fail-opens. Once the operator runs `pulumi up` on
-# #234, re-run this script to publish the binding.
-#
-# Discriminate ParameterNotFound (expected during rollout window) from
-# every other failure mode (IAM regression, region misconfig, throttle,
-# network). Silently swallowing all errors as "not configured" would
-# leave the binding unset while SSM has the value — a security regression
-# the operator wouldn't see until manually checking the CF dashboard.
+# SSM param may not exist yet on first deploy; skip the binding step
+# so the Worker falls through to strip-only and Lambda fail-opens.
+# Discriminate ParameterNotFound from other failure modes (IAM, region,
+# throttle, network). Swallowing all errors as "not configured" would
+# leave the binding unset while SSM has the value — a security
+# regression the operator wouldn't see until manually checking CF.
 CF_SHARED_SECRET=""
 if cf_secret_raw=$(aws ssm get-parameter --region us-east-1 \
         --name /grug/cf-shared-secret --with-decryption \
@@ -139,9 +131,7 @@ deploy_one() {
     echo "  ✓ Worker script uploaded"
 
     # PUT the secret binding so worker.js can inject the auth-boundary
-    # header. The PUT-on-secrets endpoint is upsert semantics, so
-    # re-runs are safe. Skipped when the SSM secret hasn't been
-    # provisioned yet (see top of file for the rollout-order rationale).
+    # header. The endpoint is upsert semantics so re-runs are safe.
     if [ -n "$CF_SHARED_SECRET" ]; then
         local secret_response
         secret_response=$(curl -sS -X PUT \
@@ -170,6 +160,8 @@ deploy_one() {
     if [ "$route_success" = "True" ]; then
         echo "  ✓ Route created: $route_pattern → $worker_name"
     else
+        # Inlined rather than helper-extracted: need a multi-field
+        # extraction (errors[0].code) that diverges from parse_cf_success.
         err_code=$(echo "$route_response" | python3 -c "
 import json, sys
 try:
