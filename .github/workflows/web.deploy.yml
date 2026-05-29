@@ -163,12 +163,51 @@ jobs:
             --branch "${GITHUB_REF_NAME}" \
             --commit-hash "${GITHUB_SHA}"
 
+      # Purge CF edge cache so the new build is visible immediately, even
+      # if a path-rule somewhere keeps an HTML response cached. Asset
+      # files are content-hashed and unaffected by purge.
+      #
+      # Token must include `Zone:Cache Purge` scope. If purge returns 403
+      # (Authentication error), the operator needs to add the scope to
+      # `/grug/cloudflare-api-token` via the CF dashboard one-shot:
+      #   dashboard.cloudflare.com → My Profile → API Tokens →
+      #   edit the grug deploy token → add Zone:Cache Purge → save.
+      # The token VALUE doesn't change; no SSM update needed.
+      - name: 09. Purge Cloudflare cache
+        if: github.ref == 'refs/heads/main' || startsWith(github.ref, 'refs/tags/v')
+        env:
+          CF_API_TOKEN: ${{ env.CLOUDFLARE_API_TOKEN }}
+        run: |
+          set -euo pipefail
+          ZONE_ID=$(aws ssm get-parameter \
+            --name /grug/cloudflare-zone-id \
+            --query 'Parameter.Value' --output text)
+          response=$(curl --silent --show-error --max-time 15 \
+            -w "\n%{http_code}" \
+            -X POST "https://api.cloudflare.com/client/v4/zones/${ZONE_ID}/purge_cache" \
+            -H "Authorization: Bearer ${CF_API_TOKEN}" \
+            -H "Content-Type: application/json" \
+            --data '{"purge_everything":true}')
+          status=$(tail -n1 <<<"$response")
+          body=$(sed '$d' <<<"$response")
+          if [ "$status" = "200" ]; then
+            echo "✓ CF cache purged"
+          elif [ "$status" = "403" ]; then
+            echo "::error::CF cache purge returned 403 — token missing Zone:Cache Purge scope. Add it at dashboard.cloudflare.com → My Profile → API Tokens → edit the grug deploy token → add Zone:Cache Purge → save. Token value does NOT change; no SSM update needed."
+            echo "$body"
+            exit 1
+          else
+            echo "::error::CF cache purge returned HTTP $status"
+            echo "$body"
+            exit 1
+          fi
+
       # Production smoke test — only runs for prod-eligible refs (main +
       # version tags). Asserts that the deploy actually took effect by
       # checking three load-bearing strings in the landing page response.
       # Catches the "wrangler succeeded but CF cache served the previous
       # build" failure mode and any URL-canon drift.
-      - name: 09. Smoke test grug.lol
+      - name: 10. Smoke test grug.lol
         if: github.ref == 'refs/heads/main' || startsWith(github.ref, 'refs/tags/v')
         run: |
           set -euo pipefail
