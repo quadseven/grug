@@ -21,7 +21,7 @@ import pulumi_aws as aws
 import pulumi_random as random
 
 
-@dataclass
+@dataclass(frozen=True, slots=True)
 class CfSharedSecretBundle:
     """`ssm_parameter` duck-types as `GetParameterResult` for
     lambda_service.extra_ssm_secrets (both expose `.arn` + `.name`).
@@ -50,9 +50,9 @@ def create(*, name: str = "grug-cf-shared-secret") -> CfSharedSecretBundle:
         f"{name}-ssm",
         name="/grug/cf-shared-secret",
         type="SecureString",
-        # Defense-in-depth re-wrap. RandomPassword.result is already
-        # secret-marked but the explicit wrap survived a leak incident
-        # on PR #164's RUM credentials rollout (preview output drift).
+        # Explicit Output.secret wrap guarantees secret-marking on the
+        # Parameter value even if a future provider version drops the
+        # marker from RandomPassword.result.
         value=pulumi.Output.secret(random_value.result),
         description=(
             "CF→AWS auth-boundary shared secret. CF Workers inject the "
