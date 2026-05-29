@@ -190,6 +190,28 @@ def test_pull_request_tpm_failure_does_not_skip_elder():
     assert out["personas"][1]["result"] == "pass"
 
 
+def test_pull_request_tpm_evaluator_exception_does_not_skip_elder():
+    """Codex peer-review concern: `_dispatch_tpm` previously called
+    `evaluate_pull_request` OUTSIDE its try block. An unhandled
+    exception there (TPM evaluator bug or import-time failure) would
+    propagate up `_handle_pull_request` and skip Elder entirely,
+    violating the independence acceptance criterion. The broad final
+    guard in _dispatch_tpm now catches this."""
+    with patch("dispatcher.is_install_allowlisted", return_value=True), \
+         patch("dispatcher.is_persona_enabled", return_value=True), \
+         patch("dispatcher.get_repo_config", return_value={"code_reviewer_blocking": False}), \
+         patch("personas.tpm.persona.evaluate_pull_request",
+               side_effect=RuntimeError("evaluator regression")), \
+         patch("personas.code_reviewer.dispatch.dispatch_code_review",
+               return_value={"persona": "code_reviewer", "result": "pass"}) as mock_cr:
+        out = dispatch("pull_request", _full_pr_payload())
+
+    # TPM unhandled — but Elder still ran.
+    assert out["personas"][0] == {"persona": "tpm", "result": "unhandled_error"}
+    mock_cr.assert_called_once()
+    assert out["personas"][1]["result"] == "pass"
+
+
 def test_pull_request_elder_unhandled_exception_does_not_skip_tpm_status():
     """Inverse: Elder raising an unhandled exception must not corrupt
     the TPM result. Elder's status becomes `unhandled_error`."""
