@@ -175,6 +175,55 @@ def _post_review_url_matches(tree: ast.Module) -> bool:
     return False
 
 
+# GitHub's create-review API requires these top-level keys (event +
+# commit_id + body + comments) plus inline-comment objects with
+# {path, line, body}. The dataclass field names must match exactly —
+# `asdict(result)` only produces the right shape if the field names
+# are exactly these.
+EXPECTED_REVIEW_FIELDS: frozenset[str] = frozenset(
+    ("commit_id", "event", "body", "comments")
+)
+EXPECTED_INLINE_COMMENT_FIELDS: frozenset[str] = frozenset(
+    ("path", "line", "body")
+)
+
+
+def _dataclass_field_names(class_def: ast.ClassDef) -> frozenset[str]:
+    """Extract the field names declared as `name: type [= default]` in a
+    dataclass body — skips methods and class-level constants."""
+    names: set[str] = set()
+    for node in class_def.body:
+        if isinstance(node, ast.AnnAssign) and isinstance(node.target, ast.Name):
+            names.add(node.target.id)
+    return frozenset(names)
+
+
+def _post_review_uses_asdict(tree: ast.Module) -> bool:
+    """Confirm `httpx.post(... json=asdict(result) ...)` — the codex
+    peer-review finding pointed out that the URL check alone doesn't
+    prove the payload shape. Verify `asdict(...)` is the value passed
+    to `json=` on the httpx.post call inside post_review."""
+    for node in ast.walk(tree):
+        if isinstance(node, ast.FunctionDef) and node.name == "post_review":
+            for n in ast.walk(node):
+                if (
+                    isinstance(n, ast.Call)
+                    and isinstance(n.func, ast.Attribute)
+                    and n.func.attr == "post"
+                    and isinstance(n.func.value, ast.Name)
+                    and n.func.value.id == "httpx"
+                ):
+                    for kw in n.keywords:
+                        if (
+                            kw.arg == "json"
+                            and isinstance(kw.value, ast.Call)
+                            and isinstance(kw.value.func, ast.Name)
+                            and kw.value.func.id == "asdict"
+                        ):
+                            return True
+    return False
+
+
 def _post_review_uses_bearer_auth(tree: ast.Module) -> bool:
     """Confirm the request carries `Authorization: Bearer <token>`."""
     for node in ast.walk(tree):
@@ -203,13 +252,43 @@ def _check(path: Path) -> list[str]:
             f"(got {sorted(events) if events else 'unparseable'})"
         )
 
-    # ReviewResult must be frozen
-    if _find_frozen_dataclass(tree, "ReviewResult") is None:
+    # ReviewResult must be frozen + carry the GH-required field names.
+    # `asdict()` only produces a valid GH payload if these names match
+    # the API's keys exactly. A field rename (e.g. `commit_id` → `sha`)
+    # would silently 422 in production — catch at PR time.
+    review_class = _find_frozen_dataclass(tree, "ReviewResult")
+    if review_class is None:
         failures.append(f"{path}: ReviewResult is not a frozen dataclass")
+    else:
+        fields = _dataclass_field_names(review_class)
+        if fields != EXPECTED_REVIEW_FIELDS:
+            failures.append(
+                f"{path}: ReviewResult fields must equal "
+                f"{sorted(EXPECTED_REVIEW_FIELDS)} for asdict() to produce "
+                f"the GH-required payload (got {sorted(fields)})"
+            )
 
-    # InlineComment must be frozen
-    if _find_frozen_dataclass(tree, "InlineComment") is None:
+    inline_class = _find_frozen_dataclass(tree, "InlineComment")
+    if inline_class is None:
         failures.append(f"{path}: InlineComment is not a frozen dataclass")
+    else:
+        fields = _dataclass_field_names(inline_class)
+        if fields != EXPECTED_INLINE_COMMENT_FIELDS:
+            failures.append(
+                f"{path}: InlineComment fields must equal "
+                f"{sorted(EXPECTED_INLINE_COMMENT_FIELDS)} for asdict() to "
+                f"produce GH's comments[] shape (got {sorted(fields)})"
+            )
+
+    # `httpx.post` must pass `json=asdict(result)` — the URL+auth check
+    # alone doesn't prove the payload shape. A regression that swapped
+    # to manual dict marshalling could rename a key undetected.
+    if not _post_review_uses_asdict(tree):
+        failures.append(
+            f"{path}: post_review must call httpx.post(... json=asdict(result) ...) "
+            "so the payload shape is locked to the dataclass field names. "
+            "Manual marshalling reintroduces the drift class this attester guards against."
+        )
 
     # post_review must call resp.raise_for_status() and NOT wrap it in try/except
     if not _has_raise_for_status_in_post_review(tree):
