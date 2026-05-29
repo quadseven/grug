@@ -49,14 +49,21 @@ export default {
     // Inject the shared secret. `set` (not `append`) so a client-supplied
     // header is overwritten — clients cannot smuggle a forged value past
     // the Lambda middleware.
-    const bindingValue = env && env[BINDING_NAME];
-    if (bindingValue) {
+    const bindingValue = env ? env[BINDING_NAME] : undefined;
+    if (typeof bindingValue === "string" && bindingValue.length > 0) {
       headers.set(SECRET_HEADER, bindingValue);
     } else {
-      // No binding deployed yet — strip any client-supplied value so
-      // downstream sees the "unconfigured" path cleanly. Middleware in
-      // sibling slice #233 fail-opens when the SSM secret is empty, so
-      // strip-only here is safe during the rollout window.
+      // No binding deployed yet (undefined) — strip any client-supplied
+      // value so downstream sees the "unconfigured" path cleanly.
+      // Middleware in sibling slice #233 fail-opens when the SSM secret
+      // is empty, so strip-only here is safe during the rollout window.
+      //
+      // Empty-string is impossible-by-accident (CF API rejects empty
+      // `text` on the binding PUT). If we see it here, the binding was
+      // tampered with or corrupted — log to Logpush + strip.
+      if (bindingValue === "") {
+        console.error("GRUG_CF_SECRET binding is an empty string — tampered or corrupted");
+      }
       headers.delete(SECRET_HEADER);
     }
 
