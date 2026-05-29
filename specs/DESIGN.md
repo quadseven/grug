@@ -12,7 +12,7 @@ The vocabulary used in `services/`, `infra/`, and `web/`. Terms map to identifie
 | **Grug Boss** | Public-facing name of the GitHub App users install on their repos. Same product as Grug; "Grug Boss" is the GitHub Marketplace listing handle. |
 | **Persona** | A bounded behavior surface Grug applies per PR. v1 ships exactly one: **TPM** (static Definition-of-Ready check). v1.5+ roadmap (per PRD #21) adds `code-reviewer`, `release-manager`, `stuck-PR-pulse`, and the LLM scope-review half of TPM. Personas are per-repo togglable. |
 | **TPM persona** | Today's only persona. Static **Definition-of-Ready (DoR) check** that blocks merge if PR body is malformed. The companion **Scope review** half is wired as a `poolside_client.py` hook in `evaluate()` per the `__init__.py` docstring but is NOT shipped — see "Roadmap" rows. See [`services/{api,webhook}/personas/tpm/`](services/api/personas/tpm/). |
-| **Elder persona (in-progress)** | The code-reviewer persona. Reads the PR diff and posts inline review comments. v1 ships pure foundations: `personas/code_reviewer/diff_parser.py` (unified-diff → `DiffHunk`s) + `personas/code_reviewer/persona.py` (`evaluate_diff` rollup). LLM-driven via `llm_client.py` (Poolside + OpenRouter round-robin). Advisory by default; blocking-flip lives in the publisher slice. See spec 0015 + [`services/{api,webhook}/personas/code_reviewer/`](services/api/personas/code_reviewer/). |
+| **Elder persona (in-progress)** | The code-reviewer persona. Reads the PR diff and posts inline review comments. v1 ships pure foundations: `personas/code_reviewer/diff_parser.py` (unified-diff → `DiffHunk`s) + `personas/code_reviewer/persona.py` (`evaluate_diff` rollup) + `github_reviews_client.py` (PR Reviews API client). LLM-driven via `llm_client.py` (Poolside + OpenRouter round-robin). Advisory by default; blocking-flip lives in the dispatcher wire-up slice. See specs 0015 + 0016 + [`services/{api,webhook}/personas/code_reviewer/`](services/api/personas/code_reviewer/). |
 | **Pulse (roadmap)** | Scheduled (non-PR-triggered) persona work, named `stuck-PR-pulse` in the future-persona list in `services/webhook/main.py`. Not implemented. Intent: weekly issue-grooming sweep against Grugboard. |
 
 ## Process-gate concepts
@@ -36,6 +36,10 @@ The vocabulary used in `services/`, `infra/`, and `web/`. Terms map to identifie
 | **`evaluate_diff`** | Pure function in `personas/code_reviewer/persona.py` (mirrored) that consumes `tuple[DiffHunk, ...]` + `LlmReviewResponse` (from `llm_client.py`) and produces a `CodeReviewEvaluation`. Drops findings outside the diff (anti-hallucination); maps the wire-format `llm_client.Finding` (`path`, `rule`) to the persona-level `Finding` (`file`, `rule_name`, plus `suggestion`). Spec 0015 §Evaluate contract attests purity. |
 | **`Finding` (persona-level)** | Frozen dataclass distinct from `llm_client.Finding`. Fields: `file`, `line`, `severity: Literal["low","medium","high","critical"]`, `rule_name`, `message`, `suggestion`. Posted as GitHub inline review comments by the publisher slice. |
 | **`CodeReviewEvaluation`** | Aggregate verdict from one Elder pass. Frozen dataclass — fields `findings: tuple[Finding, ...]`, `passed: bool`, `conclusion: CheckConclusion`. `passed = no high+critical findings`; medium+low are advisory. When the LLM didn't produce content (`kind in {no_diff, all_failed, parse_failed}`), `passed=True` + `conclusion=neutral` — Elder is advisory-first, infra flakiness must not block PRs. Composes 1:1 into a `CheckRunResult` (spec 0001). |
+| **`post_review`** | Module-level function in `github_reviews_client.py` (mirrored) that POSTs a `ReviewResult` to `POST /repos/{owner}/{repo}/pulls/{pull_number}/reviews`. Same pattern as `post_check_run`: no retry/no swallow — `with_install_token_retry` is the caller's responsibility. Spec 0016 §Schema + §Retry contracts. |
+| **`ReviewResult`** | Frozen dataclass — fields `commit_id: str`, `event: Literal["COMMENT", "REQUEST_CHANGES"]`, `body: str`, `comments: tuple[InlineComment, ...]`. `event=COMMENT` is the advisory mode; `event=REQUEST_CHANGES` blocks merge. APPROVE + PENDING are intentionally not modeled (an LLM-backed reviewer should not auto-approve, and draft reviews don't publish). `commit_id` pins the review to a specific PR head so it cannot race against new pushes. |
+| **`InlineComment`** | Frozen dataclass — fields `path: str`, `line: int` (NEW-side line, matches `DiffHunk.new_lines`), `body: str`. Constructor asserts `line >= 1` because GitHub's PR Reviews API 422s on `line=0`. |
+| **`ReviewEvent`** | Literal type — `"COMMENT" \| "REQUEST_CHANGES"`. Restricted subset of GitHub's full enum (APPROVE/COMMENT/REQUEST_CHANGES/PENDING) — see `ReviewResult` for why. |
 
 ## Enforcement concepts
 
@@ -97,6 +101,7 @@ The following eight modules exist as byte-identical copies under both `services/
 | `personas/tpm/persona.py` | `TpmEvaluation` dataclass + `evaluate_pull_request(...)` entry point. |
 | `personas/code_reviewer/diff_parser.py` | `DiffHunk` dataclass + pure `parse_diff(unified_diff)` for the Elder persona. |
 | `personas/code_reviewer/persona.py` | `Finding` + `CodeReviewEvaluation` dataclasses + pure `evaluate_diff(hunks, llm_response)`. |
+| `github_reviews_client.py` | `ReviewResult` + `InlineComment` frozen dataclasses + `post_review(...)` PR Reviews API client. |
 
 ## Infrastructure concepts
 
