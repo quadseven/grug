@@ -266,3 +266,73 @@ def test_findings_with_missing_fields_are_dropped() -> None:
     assert out.kind == "reviewed"
     assert len(out.findings) == 1
     assert out.findings[0].rule == "ok"
+
+
+def test_empty_api_key_falls_back_not_crashes(monkeypatch) -> None:
+    """Empty key → _BackendConfigError → fall back to the other backend.
+    Without the narrow exception split, a misconfig would 500 the
+    webhook handler instead of degrading to advisory mode."""
+    monkeypatch.setattr(lc, "_load_poolside_key", lambda: "")  # broken
+    monkeypatch.setattr(lc, "_load_openrouter_key", lambda: "real-or-key")
+
+    response = httpx.Response(
+        200,
+        json=_openai_json_response(
+            '{"findings": [{"path": "x", "line": 1, "rule": "ok", '
+            '"severity": "low", "message": ""}]}'
+        ),
+    )
+    with patch.object(httpx, "post", return_value=response):
+        out = review_diff([_hunk()], installation_id=2)  # primary = Poolside
+
+    assert out.kind == "reviewed"
+    assert out.backend_used == Backend.OPENROUTER  # fallback
+
+
+def test_both_backends_misconfigured_returns_all_failed(monkeypatch) -> None:
+    monkeypatch.setattr(lc, "_load_poolside_key", lambda: "")
+    monkeypatch.setattr(lc, "_load_openrouter_key", lambda: "")
+    with patch.object(httpx, "post") as mock_post:
+        out = review_diff([_hunk()], installation_id=1)
+    assert out.kind == "all_failed"
+    assert "misconfigured" in out.error.lower()
+    mock_post.assert_not_called()  # never made an HTTP call
+
+
+def test_503_retried_alongside_429(monkeypatch) -> None:
+    """503 is routinely transient on CF edge; retry once before falling
+    back. Previous behavior burned the whole backend on a 1-second blip."""
+    monkeypatch.setattr(lc, "_RETRY_SLEEP", lambda s: None)
+    seq = [
+        httpx.Response(503, json={"error": "service unavailable"}),
+        httpx.Response(200, json=_openai_json_response('{"findings":[]}')),
+    ]
+    idx = {"n": 0}
+
+    def staged_post(*args, **kwargs):
+        i = idx["n"]
+        idx["n"] += 1
+        return seq[i]
+
+    with patch.object(httpx, "post", side_effect=staged_post):
+        out = review_diff([_hunk()], installation_id=1)
+
+    assert out.kind == "reviewed"
+    assert out.backend_used == Backend.OPENROUTER
+    assert idx["n"] == 2  # one retry + one success
+
+
+def test_envelope_non_json_returns_parse_failed(monkeypatch) -> None:
+    """200 + Cloudflare HTML interstitial (not JSON) must not crash.
+    Previously `_parse_response` called `resp.json()` unguarded — the
+    JSONDecodeError would bubble through `review_diff` and 500 the
+    webhook handler. Now it returns a parse_failed envelope so the
+    caller can post an advisory check-run."""
+    monkeypatch.setattr(lc, "_RETRY_SLEEP", lambda s: None)
+    response = httpx.Response(200, text="<html>error</html>")
+    with patch.object(httpx, "post", return_value=response):
+        out = review_diff([_hunk()], installation_id=1)
+    # 200+non-JSON short-circuits to parse_failed (no fallback — the
+    # other backend would likely return the same edge HTML).
+    assert out.kind == "parse_failed"
+    assert "envelope" in out.error.lower() or "json" in out.error.lower()
