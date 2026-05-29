@@ -58,6 +58,9 @@ except Exception:
     - Account → Workers Scripts → Edit
     - Account → Workers Routes → Edit
     - Account → Cloudflare Pages → Edit  ← easy to miss
+    - Zone → Cache Purge → Purge          ← easy to miss
+    - Account → Account Settings → Read
+    - User → Memberships → Read
 
   Fix:
     1. https://dash.cloudflare.com/profile/api-tokens
