@@ -253,7 +253,7 @@ Webhook handler `receive_github_webhook` is **sync `def`**, NOT `async def`.
 Both Lambda services duplicate ~12 modules (adapters, ports, personas,
 github_app_auth, etc.) until the v1.5 shared-package extraction lands.
 
-`.github/workflows/drift-lint.yml` runs `scripts/check-mirrored-files.sh`
+`.github/workflows/check.drift-lint.yml` runs `scripts/check-mirrored-files.sh`
 on every PR touching either service. The script byte-compares each file
 in `MIRRORED_FILES` and fails with a clear diff when they diverge.
 
