@@ -88,10 +88,23 @@ class CodeReviewEvaluation:
       - Otherwise: `conclusion=success`, passed=True. Medium+low
         findings are advisory — reported in the check-run summary but
         don't flip the verdict.
+
+    `dropped_hallucinations` is the count of LLM findings rejected
+    because their `(file, line)` was not inside any hunk's `new_lines`.
+    Surfacing the count (vs silently dropping) means the dispatch layer
+    can emit a metric and tell "100% hallucination" from "no findings"
+    — both yield `findings=()` but only one is a real clean PR.
+
+    `degraded_reason` carries the `LlmReviewResponse.kind` value when
+    not `"reviewed"` (`no_diff`, `all_failed`, `parse_failed`). All three
+    map to `conclusion="neutral"` but the cause is preserved so caller
+    metrics can distinguish empty PR vs LLM provider outage.
     """
 
     findings: tuple[Finding, ...]
     conclusion: CheckConclusion
+    dropped_hallucinations: int = 0
+    degraded_reason: str | None = None
 
     @property
     def passed(self) -> bool:
@@ -114,18 +127,27 @@ def evaluate_diff(
     No IO, no logging side-effects. Spec 0015 attests purity.
     """
     # LLM did not return reviewable content — advisory neutral.
+    # Preserve `kind` as the degraded_reason so the caller can tell
+    # "empty PR" from "every backend failed" (both yield findings=()).
     if llm_response.kind != "reviewed":
-        return CodeReviewEvaluation(findings=(), conclusion="neutral")
+        return CodeReviewEvaluation(
+            findings=(),
+            conclusion="neutral",
+            degraded_reason=llm_response.kind,
+        )
 
     line_index = _hunk_line_index(hunks)
     kept: list[Finding] = []
+    dropped = 0
     for raw in llm_response.findings:
         allowed_lines = line_index.get(raw.path)
         if allowed_lines is None or raw.line not in allowed_lines:
             # Anti-hallucination: the LLM named a file/line that isn't
-            # in the diff. Drop silently — caller can compare
-            # `len(llm_response.findings)` vs `len(out.findings)` to
-            # surface a metric (next slice's concern, not evaluate's).
+            # in the diff. Drop + count. Count is surfaced on the
+            # evaluation so the dispatch layer can metric and tell
+            # "100% hallucination" from "no findings at all" — both
+            # yield findings=() but only one is a real clean PR.
+            dropped += 1
             continue
         kept.append(
             Finding(
@@ -143,4 +165,8 @@ def evaluate_diff(
 
     blocking = [f for f in kept if f.severity in _BLOCKING_SEVERITIES]
     conclusion: CheckConclusion = "failure" if blocking else "success"
-    return CodeReviewEvaluation(findings=tuple(kept), conclusion=conclusion)
+    return CodeReviewEvaluation(
+        findings=tuple(kept),
+        conclusion=conclusion,
+        dropped_hallucinations=dropped,
+    )

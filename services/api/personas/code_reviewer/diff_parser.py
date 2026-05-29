@@ -19,6 +19,18 @@ import re
 from dataclasses import dataclass
 
 
+class DiffParseError(ValueError):
+    """Parser refused to silently swallow malformed diff input.
+
+    Distinct from `parse_diff("")` returning `()` — empty input is a
+    valid "no changes" case (e.g. PR body that touches nothing). This
+    exception fires only when the input *looks* like a diff but a
+    header (`diff --git ...` or `@@ ... @@`) failed to match the
+    expected shape. Silently skipping would let an upstream fetcher
+    bug or a GitHub format change masquerade as "clean PR" — caller
+    should catch and treat as `parse_failed` (advisory neutral)."""
+
+
 @dataclass(frozen=True, slots=True)
 class DiffHunk:
     """One @@ ... @@ block in one file's portion of the diff.
@@ -87,9 +99,21 @@ def parse_diff(unified_diff: str) -> tuple[DiffHunk, ...]:
 
         if line.startswith("diff --git "):
             m = _DIFF_GIT_RE.match(line)
+            if not m:
+                # `diff --git` header that doesn't match the standard
+                # `a/<old> b/<new>` shape — refuse to silently swallow.
+                # Earlier behavior set `current_file=None`, which
+                # silently dropped every subsequent hunk in this file:
+                # the LLM saw nothing, evaluate_diff returned a clean
+                # "success" verdict — a false pass. Raise instead so
+                # the caller treats this as parse_failed.
+                raise DiffParseError(
+                    f"malformed `diff --git` header at line {i + 1}: "
+                    f"{line!r}"
+                )
             # Default to the post-rename / 'b/' side; +++ overrides
             # below if it disagrees (e.g. mode-only files have no +++).
-            current_file = m.group(2) if m else None
+            current_file = m.group(2)
             binary_skip = False
             i += 1
             continue
@@ -114,11 +138,15 @@ def parse_diff(unified_diff: str) -> tuple[DiffHunk, ...]:
         if line.startswith("@@"):
             m = _HUNK_HEADER_RE.match(line)
             if not m:
-                # Malformed header — skip. Erring conservative: a
-                # garbled @@ line is more likely a parser drift than
-                # a real hunk we should partially extract.
-                i += 1
-                continue
+                # Malformed @@ header — refuse to silently skip. A
+                # garbled hunk header is most likely a parser drift
+                # (GitHub format change) or upstream-fetcher corruption.
+                # Silently skipping let every hunk in the PR vanish
+                # → evaluate_diff returned clean success → false pass.
+                # Caller catches DiffParseError → advisory neutral.
+                raise DiffParseError(
+                    f"malformed `@@` hunk header at line {i + 1}: {line!r}"
+                )
             new_start = int(m.group(1))
             # Walk the hunk body collecting added + context-with-removed
             # lines. Body capture starts at the @@ header so the LLM

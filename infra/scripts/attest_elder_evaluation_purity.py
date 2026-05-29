@@ -36,8 +36,9 @@ EVALUATE_DIFF_PATHS: tuple[Path, ...] = (
 ALLOWED_IN_PARSE_DIFF: frozenset[str] = frozenset({
     # The module-level compiled patterns we walk
     "_NEW_FILE_RE", "_DIFF_GIT_RE", "_HUNK_HEADER_RE", "_BINARY_RE",
-    # Pure dataclass constructors
-    "DiffHunk",
+    # Pure dataclass constructors + the parse error we raise on
+    # malformed input (refusal-to-silently-swallow guard).
+    "DiffHunk", "DiffParseError",
     # Stdlib pure builtins
     "tuple", "list", "set", "frozenset", "int", "str", "len", "range",
 })

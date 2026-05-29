@@ -249,6 +249,58 @@ def test_finding_rejects_zero_line() -> None:
         Finding(file="x.py", line=0, severity="low", rule_name="r", message="m", suggestion=None)
 
 
+def test_dropped_hallucinations_count_surfaced() -> None:
+    """Two hallucinated findings + one real → dropped_hallucinations=2.
+    Distinguishes "100% hallucination" from "no findings at all" — both
+    yield findings=() under the old shape, only one is a real clean PR."""
+    hunks = parse_diff(_DIFF)
+    llm = LlmReviewResponse(
+        kind="reviewed",
+        findings=(
+            _llm_finding(line=2),     # real
+            _llm_finding(line=999),   # hallucination
+            _llm_finding(path="not-in-diff.py", line=2),  # hallucination
+        ),
+        backend_used=Backend.POOLSIDE,
+    )
+    out = evaluate_diff(hunks, llm)
+    assert len(out.findings) == 1
+    assert out.dropped_hallucinations == 2
+
+
+def test_all_failed_preserves_degraded_reason() -> None:
+    """`degraded_reason` carries the LlmReviewResponse.kind so dispatch
+    metrics can tell "LLM provider outage" from "empty PR"."""
+    llm = LlmReviewResponse(kind="all_failed", error="poolside: timeout")
+    out = evaluate_diff((), llm)
+    assert out.degraded_reason == "all_failed"
+
+
+def test_no_diff_preserves_degraded_reason() -> None:
+    llm = LlmReviewResponse(kind="no_diff")
+    out = evaluate_diff((), llm)
+    assert out.degraded_reason == "no_diff"
+
+
+def test_parse_failed_preserves_degraded_reason() -> None:
+    llm = LlmReviewResponse(
+        kind="parse_failed", error="non-json", backend_used=Backend.POOLSIDE,
+    )
+    out = evaluate_diff((), llm)
+    assert out.degraded_reason == "parse_failed"
+
+
+def test_reviewed_response_has_no_degraded_reason() -> None:
+    hunks = parse_diff(_DIFF)
+    llm = LlmReviewResponse(
+        kind="reviewed",
+        findings=(_llm_finding(line=2),),
+        backend_used=Backend.POOLSIDE,
+    )
+    out = evaluate_diff(hunks, llm)
+    assert out.degraded_reason is None
+
+
 def test_diff_hunk_rejects_missing_at_at_in_body() -> None:
     """Boundary check — catches a parser regression that loses the @@
     header before the body string is captured."""
