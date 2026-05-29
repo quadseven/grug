@@ -33,6 +33,7 @@ MIRRORED_WITH_HEADER=(
   "enforcement.py"
   "github_checks_client.py"
   "github_rulesets_client.py"
+  "llm_client.py"
   "observability.py"
   "personas/tpm/dor_checks.py"
   "ports/token_cache.py"
