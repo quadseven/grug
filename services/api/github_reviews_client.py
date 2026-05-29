@@ -15,8 +15,9 @@ a draft review that never publishes, which the persona has no use for.
 Reject both shapes at construction so the bad payload never leaves the
 process (GH 422s on submit either way, but failing locally is faster).
 
-Mirrors `github_checks_client.py` for transport + retry shape per
-ADR-0001 (rule-of-three deferred shared package).
+Mirrors `github_checks_client.py` transport shape per ADR-0001;
+retry/401-handling lives in the `with_install_token_retry` caller,
+not here.
 """
 from __future__ import annotations
 
@@ -95,10 +96,8 @@ class ReviewResult:
             )
         if not self.commit_id:
             raise ValueError("ReviewResult.commit_id must be non-empty")
-        # GitHub caps review body at 65536 chars; longer payloads 422.
-        # The Elder summary builder is well under this today, but a
-        # future verbose-mode prompt could spill over — guard at
-        # construction so the bad payload never crosses the wire.
+        # GitHub caps review body at 65536 chars; guard at construction
+        # so the bad payload never crosses the wire.
         if len(self.body) > _MAX_BODY_CHARS:
             raise ValueError(
                 f"ReviewResult.body length {len(self.body)} exceeds "
