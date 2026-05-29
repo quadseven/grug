@@ -166,10 +166,17 @@ def is_install_allowlisted(install_id: int) -> bool:
 # Slice 7 (#28) — per-repo persona toggles
 # ---------------------------------------------------------------------------
 
-# Default for v1: TPM enabled on every repo unless an override row says
-# otherwise. (Newly-installed users get value out-of-the-box; opt-out is
-# explicit per repo.)
-_DEFAULT_PERSONA_CONFIG = {"tpm_enabled": True}
+# Default for v1: TPM + Elder enabled on every repo unless an override
+# row says otherwise. Newly-installed users get value out-of-the-box;
+# opt-out is explicit per repo. `code_reviewer_blocking` defaults False
+# (advisory mode: check-run conclusion=neutral, review event=COMMENT)
+# so a noisy false-positive LLM run doesn't block PR velocity. Operator
+# flips to blocking via dashboard once trust is established.
+_DEFAULT_PERSONA_CONFIG = {
+    "tpm_enabled": True,
+    "code_reviewer_enabled": True,
+    "code_reviewer_blocking": False,
+}
 
 
 def _repo_sk(repo_id: int | str) -> str:
@@ -196,10 +203,24 @@ def get_repo_config(install_id: int, repo_id: int) -> dict[str, Any]:
     )
     item = resp.get("Item")
     if not item:
-        return {**_DEFAULT_PERSONA_CONFIG, "enforcement_ruleset_id": None, "force_disable_enforcement": False}
+        return {
+            **_DEFAULT_PERSONA_CONFIG,
+            "enforcement_ruleset_id": None,
+            "force_disable_enforcement": False,
+        }
     rid = item.get("enforcement_ruleset_id")
     return {
-        "tpm_enabled": bool(item.get("tpm_enabled", _DEFAULT_PERSONA_CONFIG["tpm_enabled"])),
+        "tpm_enabled": bool(item.get(
+            "tpm_enabled", _DEFAULT_PERSONA_CONFIG["tpm_enabled"]
+        )),
+        "code_reviewer_enabled": bool(item.get(
+            "code_reviewer_enabled",
+            _DEFAULT_PERSONA_CONFIG["code_reviewer_enabled"],
+        )),
+        "code_reviewer_blocking": bool(item.get(
+            "code_reviewer_blocking",
+            _DEFAULT_PERSONA_CONFIG["code_reviewer_blocking"],
+        )),
         "enforcement_ruleset_id": int(rid) if rid is not None else None,
         "force_disable_enforcement": bool(item.get("force_disable_enforcement", False)),
     }
@@ -212,27 +233,52 @@ def set_repo_config(
     repo_full_name: str,
     tpm_enabled: bool,
     updated_by_user_id: str,
+    code_reviewer_enabled: bool | None = None,
+    code_reviewer_blocking: bool | None = None,
 ) -> dict[str, Any]:
     """Upsert per-repo override. Returns the resolved config.
 
     Uses update_item (not put_item) to preserve fields managed by
     other writers — e.g. enforcement_ruleset_id set by enforcement.py.
+
+    `code_reviewer_*` kwargs are Optional so callers that only toggle
+    TPM (e.g. legacy dashboard endpoints) don't have to pass them —
+    None means "don't update this field." Falls back to the value
+    already stored on the row, or to _DEFAULT_PERSONA_CONFIG.
     """
     now = datetime.now(timezone.utc).isoformat()
+
+    # Build SET expression dynamically — the kwargs are sparse.
+    set_clauses = [
+        "repo_full_name = :fn",
+        "tpm_enabled = :te",
+        "updated_at = :ua",
+        "updated_by_user_id = :ub",
+    ]
+    values: dict[str, Any] = {
+        ":fn": repo_full_name,
+        ":te": bool(tpm_enabled),
+        ":ua": now,
+        ":ub": str(updated_by_user_id),
+    }
+    if code_reviewer_enabled is not None:
+        set_clauses.append("code_reviewer_enabled = :cre")
+        values[":cre"] = bool(code_reviewer_enabled)
+    if code_reviewer_blocking is not None:
+        set_clauses.append("code_reviewer_blocking = :crb")
+        values[":crb"] = bool(code_reviewer_blocking)
+
     _table.update_item(
         Key={"PK": _inst_pk(install_id), "SK": _repo_sk(repo_id)},
-        UpdateExpression=(
-            "SET repo_full_name = :fn, tpm_enabled = :te,"
-            " updated_at = :ua, updated_by_user_id = :ub"
-        ),
-        ExpressionAttributeValues={
-            ":fn": repo_full_name,
-            ":te": bool(tpm_enabled),
-            ":ua": now,
-            ":ub": str(updated_by_user_id),
-        },
+        UpdateExpression="SET " + ", ".join(set_clauses),
+        ExpressionAttributeValues=values,
     )
-    return {"tpm_enabled": bool(tpm_enabled)}
+    resolved = {"tpm_enabled": bool(tpm_enabled)}
+    if code_reviewer_enabled is not None:
+        resolved["code_reviewer_enabled"] = bool(code_reviewer_enabled)
+    if code_reviewer_blocking is not None:
+        resolved["code_reviewer_blocking"] = bool(code_reviewer_blocking)
+    return resolved
 
 
 def get_enforcement_id(install_id: int, repo_id: int) -> int | None:
