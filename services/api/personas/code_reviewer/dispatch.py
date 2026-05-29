@@ -127,6 +127,23 @@ def _inline_comment_body(f: Finding) -> str:
     return head
 
 
+def _resolve_result(
+    evaluation: CodeReviewEvaluation, *, check_publish_failed: bool,
+) -> PersonaResultStr:
+    """Pick the per-persona result string. Symmetric twin of
+    `_publish_shape` (publish state ↔ verdict mapping). Centralising
+    avoids the drift class where check-run says one thing and the
+    persona result says another."""
+    if check_publish_failed:
+        # Check-run is the load-bearing GH surface (the one that flips
+        # mergeability under blocking mode). If it failed, the operator
+        # needs to see this regardless of the underlying evaluation.
+        return "publish_failed"
+    if evaluation.degraded_reason:
+        return "skipped"
+    return "pass" if evaluation.passed else "fail"
+
+
 def _publish_shape(
     evaluation: CodeReviewEvaluation, *, mode: ReviewMode,
 ) -> tuple[CheckConclusion, ReviewEvent]:
@@ -293,20 +310,12 @@ def dispatch_code_review(
                 },
             )
 
-    if check_publish_failed:
-        # Check-run is the load-bearing GH surface (the one that flips
-        # mergeability under blocking mode). If THAT failed, the
-        # operator needs to see "publish_failed" not "pass" regardless
-        # of the underlying evaluation.
-        result: PersonaResultStr = "publish_failed"
-    elif evaluation.degraded_reason:
-        result = "skipped"
-    else:
-        result = "pass" if evaluation.passed else "fail"
     return {
         "status": "dispatched",
         "persona": "code_reviewer",
-        "result": result,
+        "result": _resolve_result(
+            evaluation, check_publish_failed=check_publish_failed,
+        ),
     }
 
 
