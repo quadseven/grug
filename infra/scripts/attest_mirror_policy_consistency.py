@@ -10,7 +10,7 @@ Proves NECESSARY conditions for these bools:
 Asserts:
   1. `scripts/check-mirrored-files.sh` exists.
   2. It defines BOTH `MIRRORED_WITH_HEADER` and `MIRRORED_BYTE_IDENTICAL` arrays.
-  3. `.github/workflows/drift-lint.yml` exists and invokes the script.
+  3. `.github/workflows/check.drift-lint.yml` exists and invokes the script.
   4. Every file listed in `MIRRORED_WITH_HEADER` exists at both
      `services/api/<relpath>` AND `services/webhook/<relpath>`.
   5. Each of those files starts with the line-1 MIRRORED header pattern
@@ -24,7 +24,7 @@ from pathlib import Path
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
 SCRIPT = REPO_ROOT / "scripts/check-mirrored-files.sh"
-DRIFT_LINT_WORKFLOW = REPO_ROOT / ".github/workflows/drift-lint.yml"
+DRIFT_LINT_WORKFLOW = REPO_ROOT / ".github/workflows/check.drift-lint.yml"
 
 _ARRAY_RE = re.compile(
     r"(?P<name>MIRRORED_WITH_HEADER|MIRRORED_BYTE_IDENTICAL)=\(\s*(?P<body>[^)]*)\)",

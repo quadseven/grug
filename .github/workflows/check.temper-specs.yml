@@ -25,7 +25,7 @@ on:
       - 'services/**/github_app_auth/**'
       - 'services/**/dispatcher.py'
       - 'scripts/check-mirrored-files.sh'
-      - '.github/workflows/drift-lint.yml'
+      - '.github/workflows/check.drift-lint.yml'
       - 'web/public/**'
       - 'web/index.html'
       - 'web/app.html'
