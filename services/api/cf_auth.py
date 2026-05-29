@@ -101,12 +101,16 @@ class CfAuthMiddleware(BaseHTTPMiddleware):
         """
         Args:
           secret_loader: zero-arg callable returning the SSM secret value.
-            Three outcomes are treated uniformly as fail-open:
-              - returns a non-empty `str` → strict mode for this request
-              - returns `""` → fail-open + `cf_shared_secret_empty` log
-              - raises any `Exception` → fail-open + `cf_shared_secret_unconfigured` log
-            Any subclass of `BaseException` that is NOT an `Exception`
-            (KeyboardInterrupt, SystemExit) propagates as normal.
+            - returns a non-empty `str` → strict mode for this request
+            - returns `""` → fail-open + `cf_shared_secret_unconfigured`
+              log with `reason="empty_ssm_value"` (throttled per reason)
+            - raises any exception in `_FAIL_OPEN_ERRORS` (LookupError,
+              ClientError, BotoCoreError) → fail-open + same log with
+              `reason=<type name>` (throttled per reason)
+            Anything else (`AttributeError`, `NameError`, `TypeError`,
+            …) propagates as 500. Programmer bugs MUST NOT silently
+            disable the auth boundary — see `_FAIL_OPEN_ERRORS` for the
+            whitelist rationale.
         """
         super().__init__(app)
         self._secret_loader = secret_loader
