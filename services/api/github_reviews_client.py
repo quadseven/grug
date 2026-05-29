@@ -32,6 +32,11 @@ _GH_API = "https://api.github.com"
 ReviewEvent = Literal["COMMENT", "REQUEST_CHANGES"]
 _VALID_EVENTS: frozenset[str] = frozenset(("COMMENT", "REQUEST_CHANGES"))
 
+# GitHub's PR Reviews API caps the review body at 65536 characters
+# (UTF-8). Longer payloads are 422'd. Guarded at ReviewResult
+# construction.
+_MAX_BODY_CHARS: int = 65536
+
 
 @dataclass(frozen=True, slots=True)
 class InlineComment:
@@ -39,8 +44,11 @@ class InlineComment:
 
     `line` references the NEW side of the diff per the Elder
     hallucination filter (`DiffHunk.new_lines`). GitHub 422s on
-    line=0, so the assertion catches a malformed payload at parse
-    time rather than at the POST.
+    line=0.
+
+    Uses `raise ValueError` (not `assert`) so `python -O` can't strip
+    the guard — payloads built from LLM output cross a trust boundary
+    and the guard must survive optimization.
     """
 
     path: str
@@ -48,11 +56,13 @@ class InlineComment:
     body: str
 
     def __post_init__(self) -> None:
-        assert self.line >= 1, (
-            f"InlineComment.line must be >= 1 (got {self.line}); "
-            "GitHub's PR Reviews API 422s on line=0"
-        )
-        assert self.path, "InlineComment.path must be non-empty"
+        if self.line < 1:
+            raise ValueError(
+                f"InlineComment.line must be >= 1 (got {self.line}); "
+                "GitHub's PR Reviews API 422s on line=0"
+            )
+        if not self.path:
+            raise ValueError("InlineComment.path must be non-empty")
 
 
 @dataclass(frozen=True, slots=True)
@@ -80,7 +90,17 @@ class ReviewResult:
                 f"(got {self.event!r}). APPROVE/PENDING are not supported "
                 "for the Elder persona."
             )
-        assert self.commit_id, "ReviewResult.commit_id must be non-empty"
+        if not self.commit_id:
+            raise ValueError("ReviewResult.commit_id must be non-empty")
+        # GitHub caps review body at 65536 chars; longer payloads 422.
+        # The Elder summary builder is well under this today, but a
+        # future verbose-mode prompt could spill over — guard at
+        # construction so the bad payload never crosses the wire.
+        if len(self.body) > _MAX_BODY_CHARS:
+            raise ValueError(
+                f"ReviewResult.body length {len(self.body)} exceeds "
+                f"GitHub's {_MAX_BODY_CHARS}-char limit"
+            )
 
 
 def post_review(
