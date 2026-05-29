@@ -32,6 +32,7 @@ MIRRORED_WITH_HEADER=(
   "cf_auth.py"
   "enforcement.py"
   "github_checks_client.py"
+  "github_reviews_client.py"
   "github_rulesets_client.py"
   "llm_client.py"
   "observability.py"

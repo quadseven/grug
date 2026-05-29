@@ -1,0 +1,107 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!-- Spec 0016 PrReviewResult — CSDL companion. Filename must be `model.csdl.xml`. -->
+<edmx:Edmx Version="4.0" xmlns:edmx="http://docs.oasis-open.org/odata/ns/edmx">
+  <edmx:DataServices>
+
+    <Schema Namespace="Temper.Vocab" xmlns="http://docs.oasis-open.org/odata/ns/edm">
+      <Term Name="StateMachine.States" Type="Collection(Edm.String)" AppliesTo="EntityType"/>
+      <Term Name="StateMachine.InitialState" Type="Edm.String" AppliesTo="EntityType"/>
+      <Term Name="StateMachine.ValidFromStates" Type="Collection(Edm.String)" AppliesTo="Action"/>
+      <Term Name="StateMachine.TargetState" Type="Edm.String" AppliesTo="Action"/>
+      <Term Name="Agent.Hint" Type="Edm.String" AppliesTo="Action EntityType"/>
+      <Term Name="ShardKey" Type="Edm.String" AppliesTo="EntityType"/>
+      <Term Name="AuthZ.CedarPolicy" Type="Edm.String" AppliesTo="EntityType Action"/>
+    </Schema>
+
+    <Schema Namespace="Grug.PrReviewResult" xmlns="http://docs.oasis-open.org/odata/ns/edm">
+
+      <EnumType Name="PrReviewResultStatus">
+        <Member Name="Drafted" Value="0"/>
+        <Member Name="Composed" Value="1"/>
+        <Member Name="Posted" Value="2"/>
+        <Member Name="Retired" Value="3"/>
+      </EnumType>
+
+      <EntityType Name="PrReviewResult">
+        <Key><PropertyRef Name="PrReviewResultId"/></Key>
+        <Property Name="PrReviewResultId" Type="Edm.String" Nullable="false"/>
+        <Property Name="InstallationId" Type="Edm.String" Nullable="false"/>
+        <Property Name="Status" Type="Grug.PrReviewResult.PrReviewResultStatus" Nullable="false"/>
+
+        <Property Name="event_is_comment_or_request_changes_per_elder_persona" Type="Edm.Boolean" DefaultValue="false"/>
+        <Property Name="inline_comments_target_new_side_lines_per_elder_persona" Type="Edm.Boolean" DefaultValue="false"/>
+        <Property Name="post_init_raises_on_invalid_event_per_elder_persona" Type="Edm.Boolean" DefaultValue="false"/>
+        <Property Name="payload_shape_matches_github_pulls_reviews_api_per_elder_persona" Type="Edm.Boolean" DefaultValue="false"/>
+        <Property Name="request_uses_install_token_bearer_auth_per_elder_persona" Type="Edm.Boolean" DefaultValue="false"/>
+        <Property Name="review_result_is_frozen_dataclass_no_mutation_per_elder_persona" Type="Edm.Boolean" DefaultValue="false"/>
+        <Property Name="inline_comment_is_frozen_dataclass_no_mutation_per_elder_persona" Type="Edm.Boolean" DefaultValue="false"/>
+        <Property Name="post_review_does_not_swallow_401_per_elder_persona" Type="Edm.Boolean" DefaultValue="false"/>
+
+        <Annotation Term="Temper.Vocab.StateMachine.States">
+          <Collection>
+            <String>Drafted</String><String>Composed</String><String>Posted</String><String>Retired</String>
+          </Collection>
+        </Annotation>
+        <Annotation Term="Temper.Vocab.StateMachine.InitialState" String="Drafted"/>
+        <Annotation Term="Temper.Vocab.ShardKey" String="InstallationId"/>
+        <Annotation Term="Temper.Vocab.AuthZ.CedarPolicy" String="policies/pr-review-result.cedar"/>
+      </EntityType>
+
+      <Action Name="AttestEventContract" IsBound="true">
+        <Parameter Name="bindingParameter" Type="Grug.PrReviewResult.PrReviewResult"/>
+        <Parameter Name="attestor" Type="Edm.String" Nullable="false"/>
+        <ReturnType Type="Grug.PrReviewResult.PrReviewResult"/>
+        <Annotation Term="Temper.Vocab.StateMachine.ValidFromStates"><Collection><String>Drafted</String></Collection></Annotation>
+      </Action>
+
+      <Action Name="AttestSchemaContract" IsBound="true">
+        <Parameter Name="bindingParameter" Type="Grug.PrReviewResult.PrReviewResult"/>
+        <Parameter Name="attestor" Type="Edm.String" Nullable="false"/>
+        <ReturnType Type="Grug.PrReviewResult.PrReviewResult"/>
+        <Annotation Term="Temper.Vocab.StateMachine.ValidFromStates"><Collection><String>Drafted</String></Collection></Annotation>
+      </Action>
+
+      <Action Name="AttestDataclassContract" IsBound="true">
+        <Parameter Name="bindingParameter" Type="Grug.PrReviewResult.PrReviewResult"/>
+        <Parameter Name="attestor" Type="Edm.String" Nullable="false"/>
+        <ReturnType Type="Grug.PrReviewResult.PrReviewResult"/>
+        <Annotation Term="Temper.Vocab.StateMachine.ValidFromStates"><Collection><String>Drafted</String></Collection></Annotation>
+      </Action>
+
+      <Action Name="AttestRetryContract" IsBound="true">
+        <Parameter Name="bindingParameter" Type="Grug.PrReviewResult.PrReviewResult"/>
+        <Parameter Name="attestor" Type="Edm.String" Nullable="false"/>
+        <ReturnType Type="Grug.PrReviewResult.PrReviewResult"/>
+        <Annotation Term="Temper.Vocab.StateMachine.ValidFromStates"><Collection><String>Drafted</String></Collection></Annotation>
+      </Action>
+
+      <Action Name="Compose" IsBound="true">
+        <Parameter Name="bindingParameter" Type="Grug.PrReviewResult.PrReviewResult"/>
+        <Parameter Name="pr_number" Type="Edm.String" Nullable="false"/>
+        <ReturnType Type="Grug.PrReviewResult.PrReviewResult"/>
+        <Annotation Term="Temper.Vocab.StateMachine.ValidFromStates"><Collection><String>Drafted</String></Collection></Annotation>
+        <Annotation Term="Temper.Vocab.StateMachine.TargetState" String="Composed"/>
+      </Action>
+
+      <Action Name="Post" IsBound="true">
+        <Parameter Name="bindingParameter" Type="Grug.PrReviewResult.PrReviewResult"/>
+        <Parameter Name="request_id" Type="Edm.String" Nullable="false"/>
+        <ReturnType Type="Grug.PrReviewResult.PrReviewResult"/>
+        <Annotation Term="Temper.Vocab.StateMachine.ValidFromStates"><Collection><String>Composed</String></Collection></Annotation>
+        <Annotation Term="Temper.Vocab.StateMachine.TargetState" String="Posted"/>
+      </Action>
+
+      <Action Name="Retire" IsBound="true">
+        <Parameter Name="bindingParameter" Type="Grug.PrReviewResult.PrReviewResult"/>
+        <Parameter Name="successor_pr_head_sha" Type="Edm.String" Nullable="false"/>
+        <ReturnType Type="Grug.PrReviewResult.PrReviewResult"/>
+        <Annotation Term="Temper.Vocab.StateMachine.ValidFromStates"><Collection><String>Posted</String></Collection></Annotation>
+        <Annotation Term="Temper.Vocab.StateMachine.TargetState" String="Retired"/>
+      </Action>
+
+      <EntityContainer Name="PrReviewResultService">
+        <EntitySet Name="PrReviewResults" EntityType="Grug.PrReviewResult.PrReviewResult"/>
+      </EntityContainer>
+    </Schema>
+  </edmx:DataServices>
+</edmx:Edmx>

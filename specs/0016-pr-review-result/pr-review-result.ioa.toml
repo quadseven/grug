@@ -1,0 +1,163 @@
+# spec 0016 — PrReviewResult I/O Automaton
+#
+# Models the lifecycle of a single GitHub PR Review payload from
+# construction in `services/{api,webhook}/github_reviews_client.py`
+# through publication to `POST /repos/{owner}/{repo}/pulls/{n}/reviews`
+# and eventual retirement when a newer commit supersedes it.
+#
+# Source of truth: DESIGN.md § "Elder persona — code review".
+#
+# Verified by `temper verify -s specs/0016-pr-review-result/`.
+
+[automaton]
+name = "PrReviewResult"
+states = ["Drafted", "Composed", "Posted", "Retired"]
+initial = "Drafted"
+
+# --- Cross-field invariant (load-bearing) ---
+#
+# GitHub's Reviews API requires `event` to be one of APPROVE,
+# REQUEST_CHANGES, COMMENT. For an advisory-first persona only the
+# latter two are used. Inline comment line numbers must reference the
+# new-side of the diff or the API rejects with 422.
+
+[[state]]
+name = "event_is_comment_or_request_changes_per_elder_persona"
+type = "bool"
+initial = "false"
+
+[[state]]
+name = "inline_comments_target_new_side_lines_per_elder_persona"
+type = "bool"
+initial = "false"
+
+[[state]]
+name = "post_init_raises_on_invalid_event_per_elder_persona"
+type = "bool"
+initial = "false"
+
+# --- Schema / payload-shape contracts ---
+
+[[state]]
+name = "payload_shape_matches_github_pulls_reviews_api_per_elder_persona"
+type = "bool"
+initial = "false"
+
+[[state]]
+name = "request_uses_install_token_bearer_auth_per_elder_persona"
+type = "bool"
+initial = "false"
+
+# --- Dataclass contracts ---
+
+[[state]]
+name = "review_result_is_frozen_dataclass_no_mutation_per_elder_persona"
+type = "bool"
+initial = "false"
+
+[[state]]
+name = "inline_comment_is_frozen_dataclass_no_mutation_per_elder_persona"
+type = "bool"
+initial = "false"
+
+# --- 401-retry contract (mirrors checks client) ---
+
+[[state]]
+name = "post_review_does_not_swallow_401_per_elder_persona"
+type = "bool"
+initial = "false"
+
+[[action]]
+name = "AttestEventContract"
+kind = "input"
+from = ["Drafted"]
+params = ["attestor"]
+guard = "is_false post_init_raises_on_invalid_event_per_elder_persona"
+effect = [
+  { type = "set_bool", var = "event_is_comment_or_request_changes_per_elder_persona", value = true },
+  { type = "set_bool", var = "inline_comments_target_new_side_lines_per_elder_persona", value = true },
+  { type = "set_bool", var = "post_init_raises_on_invalid_event_per_elder_persona", value = true },
+]
+hint = "Event ∈ {COMMENT, REQUEST_CHANGES}. Inline comments reference new-side line numbers (matches evaluate_diff's hallucination filter)."
+
+[[action]]
+name = "AttestSchemaContract"
+kind = "input"
+from = ["Drafted"]
+params = ["attestor"]
+guard = "is_false payload_shape_matches_github_pulls_reviews_api_per_elder_persona"
+effect = [
+  { type = "set_bool", var = "payload_shape_matches_github_pulls_reviews_api_per_elder_persona", value = true },
+  { type = "set_bool", var = "request_uses_install_token_bearer_auth_per_elder_persona", value = true },
+]
+hint = "POST /repos/{owner}/{repo}/pulls/{n}/reviews. Auth via Bearer <install_token>."
+
+[[action]]
+name = "AttestDataclassContract"
+kind = "input"
+from = ["Drafted"]
+params = ["attestor"]
+guard = "is_false review_result_is_frozen_dataclass_no_mutation_per_elder_persona"
+effect = [
+  { type = "set_bool", var = "review_result_is_frozen_dataclass_no_mutation_per_elder_persona", value = true },
+  { type = "set_bool", var = "inline_comment_is_frozen_dataclass_no_mutation_per_elder_persona", value = true },
+]
+hint = "ReviewResult + InlineComment are frozen; no post-construction mutation."
+
+[[action]]
+name = "AttestRetryContract"
+kind = "input"
+from = ["Drafted"]
+params = ["attestor"]
+guard = "is_false post_review_does_not_swallow_401_per_elder_persona"
+effect = [
+  { type = "set_bool", var = "post_review_does_not_swallow_401_per_elder_persona", value = true },
+]
+hint = "401 propagates as httpx.HTTPStatusError so with_install_token_retry can invalidate the cache + retry. Same pattern as github_checks_client."
+
+[[action]]
+name = "Compose"
+kind = "input"
+from = ["Drafted"]
+to = "Composed"
+params = ["pr_number"]
+guard = [
+  { type = "is_true", var = "event_is_comment_or_request_changes_per_elder_persona" },
+  { type = "is_true", var = "inline_comments_target_new_side_lines_per_elder_persona" },
+  { type = "is_true", var = "post_init_raises_on_invalid_event_per_elder_persona" },
+  { type = "is_true", var = "payload_shape_matches_github_pulls_reviews_api_per_elder_persona" },
+  { type = "is_true", var = "request_uses_install_token_bearer_auth_per_elder_persona" },
+  { type = "is_true", var = "review_result_is_frozen_dataclass_no_mutation_per_elder_persona" },
+  { type = "is_true", var = "inline_comment_is_frozen_dataclass_no_mutation_per_elder_persona" },
+  { type = "is_true", var = "post_review_does_not_swallow_401_per_elder_persona" },
+]
+hint = "ReviewResult constructed; all field contracts verified."
+
+[[action]]
+name = "Post"
+kind = "input"
+from = ["Composed"]
+to = "Posted"
+params = ["request_id"]
+hint = "post_review() POSTs the payload to the GitHub PR Reviews API."
+
+[[action]]
+name = "Retire"
+kind = "input"
+from = ["Posted"]
+to = "Retired"
+params = ["successor_pr_head_sha"]
+hint = "PR head moves; this review is now historical."
+
+[[invariant]]
+name = "MustComposeBeforePost"
+assert = "ordering(Composed, Posted)"
+
+[[invariant]]
+name = "MustPostBeforeRetire"
+assert = "ordering(Posted, Retired)"
+
+[[invariant]]
+name = "RetiredIsTerminal"
+when = ["Retired"]
+assert = "no_further_transitions"

@@ -21,6 +21,9 @@ on:
       - 'services/**/personas/tpm/**'
       - 'services/**/adapters/**'
       - 'services/**/github_checks_client.py'
+      - 'services/**/github_reviews_client.py'
+      - 'services/**/personas/code_reviewer/**'
+      - 'services/**/llm_client.py'
       - 'services/**/crypto/**'
       - 'services/**/github_app_auth/**'
       - 'services/**/dispatcher.py'
@@ -191,7 +194,7 @@ jobs:
         run: python3 infra/scripts/attest_kms_corruption_cleanup.py
 
   verify-domain:
-    name: "temper verify · domain (0006-0010, 0014-0015)"
+    name: "temper verify · domain (0006-0010, 0014-0016)"
     needs: build
     runs-on: ubuntu-latest
     timeout-minutes: 10
@@ -258,6 +261,12 @@ jobs:
 
       - name: Attester · parse_diff + evaluate_diff purity (spec 0015)
         run: python3 infra/scripts/attest_elder_evaluation_purity.py
+
+      - name: Verify spec 0016 (PrReviewResult)
+        run: /tmp/temper-bin verify -s specs/0016-pr-review-result/
+
+      - name: Attester · github_reviews_client contracts (spec 0016)
+        run: python3 infra/scripts/attest_github_reviews_client.py
 
   verify-web:
     name: "temper verify · web (0011-0013)"
