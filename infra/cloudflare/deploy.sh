@@ -11,7 +11,9 @@
 #
 # Reads:
 #   - SSM `/grug/cloudflare-api-token`     (Zone:DNS:Edit + Workers
-#                                            Scripts:Edit + Workers Routes:Edit)
+#                                            Scripts:Edit + Workers Routes:Edit
+#                                            + Zone:Cache Purge + Account
+#                                            Settings:Read + User Memberships:Read)
 #   - SSM `/grug/cloudflare-account-id`
 #   - SSM `/grug/cloudflare-zone-id`
 #   - Pulumi stack output `webhook_function_url` (from `pulumi stack output`)
