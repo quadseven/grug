@@ -23,8 +23,14 @@
 // remain HMAC-protected by GitHub end-to-end; this header is additive
 // defense against direct Function-URL access bypassing CF entirely.
 
+// Three placeholders are sed-substituted by infra/cloudflare/deploy.sh
+// at upload time so deploy.sh is the single source of truth for both
+// the binding name and the header name. Lambda middleware (#233) must
+// match SECRET_HEADER exactly — that cross-link is enforced by spec
+// 0014's attester, not by any compile-time link here.
 const ORIGIN = "__UPSTREAM_HOST__";
-const SECRET_HEADER = "X-Grug-CF-Secret";
+const SECRET_HEADER = "__SECRET_HEADER__";
+const BINDING_NAME = "__BINDING_NAME__";
 
 export default {
   async fetch(request, env) {
@@ -43,8 +49,9 @@ export default {
     // Inject the shared secret. `set` (not `append`) so a client-supplied
     // header is overwritten — clients cannot smuggle a forged value past
     // the Lambda middleware.
-    if (env && env.GRUG_CF_SECRET) {
-      headers.set(SECRET_HEADER, env.GRUG_CF_SECRET);
+    const bindingValue = env && env[BINDING_NAME];
+    if (bindingValue) {
+      headers.set(SECRET_HEADER, bindingValue);
     } else {
       // No binding deployed yet — strip any client-supplied value so
       // downstream sees the "unconfigured" path cleanly. Middleware in
