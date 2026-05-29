@@ -1,20 +1,10 @@
-"""Cloudflare → AWS shared-secret provisioning (per spec 0014 / issue #173).
+"""Cloudflare → AWS shared-secret provisioning (parent #173).
 
-Provisions the random secret value the CF Worker injects on every upstream
-request and the Lambda middleware validates at the handler entry. Sourcing
-both sides from the same SSM SecureString makes the rotation story trivial:
-bump `keepers["version"]` and run `pulumi up`, then re-run
-`infra/cloudflare/deploy.sh` to sync the new value into the CF Worker
-secret bindings.
-
-Acceptance criteria gate (issue #231):
-  * SecureString param exists at `/grug/cf-shared-secret`
-  * Value is 64 lowercase alphanumeric chars (random.RandomPassword)
-  * Lambda IAM grant via the existing lambda_service.extra_ssm_secrets path
-
-The Lambda middleware is sibling work (#233); the CF Worker injection is
-sibling work (#232). This component is safe to deploy alone — until #233
-ships, the env var is loaded but no path validates against it.
+Generates a random SSM SecureString that both the CF Worker (sibling
+slice #232) and the Lambda middleware (sibling slice #233) consume.
+Sourcing both sides from one SSM param means rotation = bump
+`keepers["version"]` then `pulumi up` + re-run
+`infra/cloudflare/deploy.sh`.
 """
 from __future__ import annotations
 
@@ -27,16 +17,10 @@ import pulumi_random as random
 
 @dataclass
 class CfSharedSecretBundle:
-    """Outputs from `cf_shared_secret.create()`.
-
-    `ssm_parameter` is the SSM SecureString resource — its `.arn` and
-    `.name` are duck-compatible with the `GetParameterResult` shape used
-    by lambda_service.extra_ssm_secrets, so the caller can pass it
-    directly into both Lambda definitions.
-
-    `secret_value` is the raw random string, marked secret. Surfaced so
-    the deploy.sh flow can publish it as a CF Worker secret binding via
-    the Pulumi → SSM → deploy.sh chain (sibling slice #232).
+    """`ssm_parameter` duck-types as `GetParameterResult` for
+    lambda_service.extra_ssm_secrets (both expose `.arn` + `.name`).
+    `secret_value` is the raw random string, marked secret — surfaced so
+    sibling slice #232's deploy.sh can publish it as a CF Worker binding.
     """
     ssm_parameter: aws.ssm.Parameter
     secret_value: pulumi.Output[str]
@@ -44,18 +28,15 @@ class CfSharedSecretBundle:
 
 def create(*, name: str = "grug-cf-shared-secret") -> CfSharedSecretBundle:
     """Provision the SSM SecureString backing the CF→AWS auth boundary."""
-    # 64-char lowercase alphanumeric. ~380 bits of entropy — overkill for
-    # a constant-time header compare but cheap. Excluding upper + special
-    # keeps the value safe to inline in CF Worker secret binding HTTP
-    # bodies and round-trip through SSM without any escaping concerns.
+    # Excluding upper + special keeps the value round-trippable through
+    # SSM + CF Worker secret-binding HTTP bodies without escaping.
     random_value = random.RandomPassword(
         f"{name}-value",
         length=64,
         special=False,
         upper=False,
-        # Rotate by bumping `version` and `pulumi up` — random provider
-        # replaces the resource. We don't rotate on every up; only when
-        # an operator deliberately retires the value.
+        # Bump version + pulumi up = the random provider replaces the
+        # resource. Without `keepers`, every up would re-roll the value.
         keepers={"version": "v1"},
     )
 
@@ -63,10 +44,9 @@ def create(*, name: str = "grug-cf-shared-secret") -> CfSharedSecretBundle:
         f"{name}-ssm",
         name="/grug/cf-shared-secret",
         type="SecureString",
-        # Output.secret-wrap so the value never appears in `pulumi preview`
-        # diffs. The random provider's `.result` is already marked secret
-        # but the extra wrap is defense-in-depth per the leak-guard memory
-        # from PR #164's RUM credentials rollout.
+        # Defense-in-depth re-wrap. RandomPassword.result is already
+        # secret-marked but the explicit wrap survived a leak incident
+        # on PR #164's RUM credentials rollout (preview output drift).
         value=pulumi.Output.secret(random_value.result),
         description=(
             "CF→AWS auth-boundary shared secret. CF Workers inject the "
