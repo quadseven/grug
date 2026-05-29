@@ -55,16 +55,43 @@ CF_ZONE=$(aws ssm get-parameter --region us-east-1 \
 # undefined → worker.js falls through to its strip-only branch, Lambda
 # middleware (#233) fail-opens. Once the operator runs `pulumi up` on
 # #234, re-run this script to publish the binding.
-CF_SHARED_SECRET=$(aws ssm get-parameter --region us-east-1 \
-    --name /grug/cf-shared-secret --with-decryption \
-    --query 'Parameter.Value' --output text 2>/dev/null || echo "")
-if [ -z "$CF_SHARED_SECRET" ]; then
+#
+# Discriminate ParameterNotFound (expected during rollout window) from
+# every other failure mode (IAM regression, region misconfig, throttle,
+# network). Silently swallowing all errors as "not configured" would
+# leave the binding unset while SSM has the value — a security regression
+# the operator wouldn't see until manually checking the CF dashboard.
+CF_SHARED_SECRET=""
+if cf_secret_raw=$(aws ssm get-parameter --region us-east-1 \
+        --name /grug/cf-shared-secret --with-decryption \
+        --query 'Parameter.Value' --output text 2>&1); then
+    CF_SHARED_SECRET="$cf_secret_raw"
+elif echo "$cf_secret_raw" | grep -q "ParameterNotFound"; then
     echo "  ⚠ /grug/cf-shared-secret missing in SSM — skipping GRUG_CF_SECRET binding."
     echo "    Run \`pulumi up\` on the grug stack first (creates the secret), then re-run this script."
+else
+    echo "  ✗ SSM get-parameter failed for /grug/cf-shared-secret:"
+    echo "    $cf_secret_raw"
+    exit 1
 fi
 
 # Pull current Lambda Function URLs from Pulumi stack output.
 PULUMI_DIR="${PULUMI_CWD:-$(dirname "$0")/../pulumi}"
+
+# Defensive `success` extraction for CF API responses. CF sometimes
+# returns HTML on 5xx and stack traces on transport hiccups, both of
+# which crash a naive `json.load(...)['success']` under `set -euo pipefail`.
+# This helper prints "False" on any parse failure so callers get the
+# raw response in their error message instead of a Python traceback.
+parse_cf_success() {
+    python3 -c "
+import json, sys
+try:
+    print(json.load(sys.stdin).get('success', False))
+except (json.JSONDecodeError, ValueError):
+    print('False')
+"
+}
 
 deploy_one() {
     local worker_name="$1" route_pattern="$2" pulumi_output="$3"
@@ -122,9 +149,11 @@ deploy_one() {
             -d "{\"name\":\"$BINDING_NAME\",\"type\":\"secret_text\",\"text\":\"$CF_SHARED_SECRET\"}" \
             "https://api.cloudflare.com/client/v4/accounts/$CF_ACCOUNT/workers/scripts/$worker_name/secrets")
         local secret_success
-        secret_success=$(echo "$secret_response" | python3 -c "import json,sys; print(json.load(sys.stdin)['success'])")
+        secret_success=$(echo "$secret_response" | parse_cf_success)
         if [ "$secret_success" != "True" ]; then
-            echo "  ✗ $BINDING_NAME binding FAILED:"; echo "$secret_response" | python3 -m json.tool; exit 1
+            echo "  ✗ $BINDING_NAME binding FAILED. Raw response:"
+            echo "$secret_response"
+            exit 1
         fi
         echo "  ✓ $BINDING_NAME binding set"
     fi

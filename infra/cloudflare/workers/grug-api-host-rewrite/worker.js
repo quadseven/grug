@@ -32,17 +32,14 @@ export default {
     const headers = new Headers(request.headers);
     headers.set("Host", ORIGIN);
 
-    // Inject the shared secret. `set` (not `append`) so a client-supplied
-    // header is overwritten — clients cannot smuggle a forged value past
-    // the Lambda middleware.
-    const bindingValue = env && env[BINDING_NAME];
-    if (bindingValue) {
+    // See webhook worker for the binding-presence + tampering logic.
+    const bindingValue = env ? env[BINDING_NAME] : undefined;
+    if (typeof bindingValue === "string" && bindingValue.length > 0) {
       headers.set(SECRET_HEADER, bindingValue);
     } else {
-      // No binding deployed yet — strip any client-supplied value so
-      // downstream sees the "unconfigured" path cleanly. Middleware in
-      // sibling slice #233 fail-opens when the SSM secret is empty, so
-      // strip-only here is safe during the rollout window.
+      if (bindingValue === "") {
+        console.error("GRUG_CF_SECRET binding is an empty string — tampered or corrupted");
+      }
       headers.delete(SECRET_HEADER);
     }
 
