@@ -236,6 +236,27 @@ def test_set_repo_config_persists_code_reviewer_fields(_ddb_table):
     assert cfg["tpm_enabled"] is True
 
 
+def test_get_repo_config_legacy_row_falls_back_to_defaults(_ddb_table):
+    """Pre-Elder rows (tpm_enabled only) must surface code_reviewer_*
+    defaults from _DEFAULT_PERSONA_CONFIG. A regression that read the
+    missing field as `None` then `bool(None) is False` would silently
+    flip Elder OFF for every legacy repo on the first webhook event."""
+    mod = _ddb_table
+    table = boto3.resource(
+        "dynamodb", region_name="us-east-1",
+    ).Table("grug-main-test")
+    table.put_item(Item={
+        "PK": "INST#1", "SK": "REPO#42",
+        "repo_full_name": "x/y",
+        "tpm_enabled": False,
+        # Intentionally no code_reviewer_enabled / code_reviewer_blocking.
+    })
+    cfg = mod.get_repo_config(1, 42)
+    assert cfg["tpm_enabled"] is False
+    assert cfg["code_reviewer_enabled"] is True   # default
+    assert cfg["code_reviewer_blocking"] is False  # default
+
+
 def test_set_repo_config_blocking_mode_round_trips(_ddb_table):
     """Operator flips advisory→blocking via dashboard. Must persist."""
     mod = _ddb_table

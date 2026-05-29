@@ -209,6 +209,29 @@ def test_pull_request_elder_unhandled_exception_does_not_skip_tpm_status():
     }
 
 
+def test_pull_request_missing_repo_id_skips_elder_but_runs_tpm():
+    """Asymmetric contract documented in `_handle_pull_request`:
+    missing `repo_id` (payload-shape glitch) → TPM dispatches anyway
+    (legacy enabled-by-default), Elder skips with reason=no_repo_id
+    since it can't call is_persona_enabled without a repo_id. A
+    refactor unifying the two branches would silently flip Elder to
+    enabled-by-default. This test pins the asymmetry."""
+    payload = _full_pr_payload()
+    payload["repository"].pop("id", None)
+
+    with patch("dispatcher.is_install_allowlisted", return_value=True), \
+         patch("dispatcher.is_persona_enabled", return_value=True), \
+         patch("personas.tpm.persona.evaluate_pull_request") as mock_eval, \
+         patch("personas.tpm.persona.publish_tpm_evaluation"), \
+         patch("personas.code_reviewer.dispatch.dispatch_code_review") as mock_cr:
+        mock_eval.return_value = type("R", (), {"passed": True})()
+        out = dispatch("pull_request", payload)
+
+    assert len(out["personas"]) == 1
+    assert out["personas"][0]["persona"] == "tpm"
+    mock_cr.assert_not_called()
+
+
 def test_pull_request_code_reviewer_disabled_skips_only_elder():
     """When `code_reviewer_enabled=False`, the Elder dispatch is skipped
     but TPM still runs (and vice versa)."""

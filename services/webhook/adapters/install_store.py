@@ -163,7 +163,7 @@ def is_install_allowlisted(install_id: int) -> bool:
 
 
 # ---------------------------------------------------------------------------
-# Slice 7 (#28) — per-repo persona toggles
+# Per-repo persona toggles
 # ---------------------------------------------------------------------------
 
 # Default for v1: TPM + Elder enabled on every repo unless an override
@@ -197,7 +197,8 @@ def list_user_installations(github_user_id: str) -> list[dict[str, Any]]:
 
 
 def get_repo_config(install_id: int, repo_id: int) -> dict[str, Any]:
-    """Per-repo persona override; returns defaults if no row exists."""
+    """Resolved RepoConfig (persona toggles + enforcement state fields);
+    defaults from `_DEFAULT_PERSONA_CONFIG` when no row exists."""
     resp = _table.get_item(
         Key={"PK": _inst_pk(install_id), "SK": _repo_sk(repo_id)},
     )
