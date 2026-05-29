@@ -150,6 +150,10 @@ _BACKEND_CONFIGS: dict[Backend, BackendConfig] = {
         backend=Backend.POOLSIDE,
         url=_POOLSIDE_URL,
         model=_POOLSIDE_MODEL,
+        # Lambda (not bare ref) defers name lookup to call time so tests
+        # can `monkeypatch.setattr(lc, "_load_poolside_key", ...)`. With
+        # a bare reference, `_BACKEND_CONFIGS` captures the original
+        # function at import time and ignores the patch.
         key_loader=lambda: _load_poolside_key(),
     ),
     Backend.OPENROUTER: BackendConfig(
