@@ -20,6 +20,7 @@ from fastapi import FastAPI
 
 from admin import router as admin_router
 from auth.github_oauth import router as github_oauth_router
+from cf_auth import CfAuthMiddleware
 from installations import router as installations_router
 from observability import configure_logging
 
@@ -36,6 +37,12 @@ app = FastAPI(
     redoc_url=None,
     openapi_url=None,
 )
+
+# CF→AWS auth boundary — reject direct Function URL hits that bypass
+# Cloudflare. Fail-open when the env var/SSM secret isn't configured
+# yet so deploy ordering across Pulumi + Workers + service can race
+# without breaking production traffic.
+app.add_middleware(CfAuthMiddleware)
 
 
 @app.get("/livez")

@@ -191,7 +191,7 @@ jobs:
         run: python3 infra/scripts/attest_kms_corruption_cleanup.py
 
   verify-domain:
-    name: "temper verify · domain (0006-0010)"
+    name: "temper verify · domain (0006-0010, 0014)"
     needs: build
     runs-on: ubuntu-latest
     timeout-minutes: 10
@@ -246,6 +246,12 @@ jobs:
 
       - name: Attester · DDB-handle double-checked locking (infra invariant)
         run: python3 infra/scripts/attest_ddb_handle_thread_safe.py
+
+      - name: Verify spec 0014 (CfSharedSecret)
+        run: /tmp/temper-bin verify -s specs/0014-cf-shared-secret/
+
+      - name: Attester · CfSharedSecret middleware contract (spec 0014)
+        run: python3 infra/scripts/attest_cf_shared_secret_middleware.py
 
   verify-web:
     name: "temper verify · web (0011-0013)"

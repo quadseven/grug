@@ -66,12 +66,22 @@ The vocabulary used in `services/`, `infra/`, and `web/`. Terms map to identifie
 | **CredentialBlobCorrupt** | Exception raised when an encrypted blob in DDB can't be decrypted (key-version drift, tampering, deliberate test fixture). Handler must idempotently clean up — see the "idempotency check after corruption-empty fallthrough" audit pattern. |
 | **UserStateCorrupt** | Same shape as `CredentialBlobCorrupt`, but for non-secret user state fields that fail invariant checks at read time. |
 
+## Auth-boundary concepts
+
+| Term | Definition |
+|---|---|
+| **`X-Grug-CF-Secret`** | HTTP request header injected by the CF Workers (`infra/cloudflare/workers/grug-{api,webhook}-host-rewrite/worker.js`) on every upstream request to the Lambda Function URLs. Validated by `CfAuthMiddleware` on the Lambda side. The header name is templated into the worker.js by `deploy.sh` so deploy.sh is the single source of truth. |
+| **`GRUG_CF_SECRET`** | CF Worker secret binding name. The Workers read `env.GRUG_CF_SECRET` and inject it as the `X-Grug-CF-Secret` header. `deploy.sh` PUTs the binding from SSM `/grug/cf-shared-secret` on every Worker script upload. |
+| **`/grug/cf-shared-secret`** | SSM SecureString holding the CF→AWS auth-boundary shared secret. Pulumi-managed via `infra/pulumi/components/cf_shared_secret.py` (`random.RandomPassword`, 64-char lowercase alphanumeric). Rotation: bump `keepers["version"]`, `pulumi up`, re-run `deploy.sh`. |
+| **`CfAuthMiddleware`** | Starlette/FastAPI middleware in mirrored module `cf_auth.py`. Reads the SSM secret at cold start via the `GRUG_CF_SHARED_SECRET_SSM` env var, validates `X-Grug-CF-Secret` on every non-`/livez` request using `hmac.compare_digest`. Fail-open on unconfigured env var or empty SSM value (rollout-safety property). |
+
 ## Cross-service primitives (mirrored)
 
-The following eight modules exist as byte-identical copies under both `services/api/` and `services/webhook/`. See [ADR-0001](docs/adr/0001-mirror-with-rule-of-three-deferral.md) for the load-bearing reasoning.
+The following nine modules exist as byte-identical copies under both `services/api/` and `services/webhook/`. See [ADR-0001](docs/adr/0001-mirror-with-rule-of-three-deferral.md) for the load-bearing reasoning.
 
 | Module | Purpose |
 |---|---|
+| `cf_auth.py` | CF→AWS auth-boundary middleware. Validates `X-Grug-CF-Secret` header against the SSM-loaded shared secret; `/livez` exempt; fail-open on unconfigured env var or empty SSM value (rollout-safety property). |
 | `observability.py` | DD-extension-aware logger + JSON formatter. Reads `DD_SERVICE`, `DD_ENV`, `GRUG_LOG_LEVEL`. |
 | `secrets_loader.py` | SSM SecureString reads at cold start (`GITHUB_APP_ID_SSM`, `GITHUB_APP_WEBHOOK_SECRET_SSM`, etc.). |
 | `github_checks_client.py` | Thin `httpx`-based wrapper over GitHub's Checks API; carries the `CheckRunResult` dataclass. |
