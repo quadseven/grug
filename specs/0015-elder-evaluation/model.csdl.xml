@@ -1,0 +1,110 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!-- Spec 0015 ElderEvaluation — CSDL companion. Filename must be `model.csdl.xml`. -->
+<edmx:Edmx Version="4.0" xmlns:edmx="http://docs.oasis-open.org/odata/ns/edmx">
+  <edmx:DataServices>
+
+    <Schema Namespace="Temper.Vocab" xmlns="http://docs.oasis-open.org/odata/ns/edm">
+      <Term Name="StateMachine.States" Type="Collection(Edm.String)" AppliesTo="EntityType"/>
+      <Term Name="StateMachine.InitialState" Type="Edm.String" AppliesTo="EntityType"/>
+      <Term Name="StateMachine.ValidFromStates" Type="Collection(Edm.String)" AppliesTo="Action"/>
+      <Term Name="StateMachine.TargetState" Type="Edm.String" AppliesTo="Action"/>
+      <Term Name="Agent.Hint" Type="Edm.String" AppliesTo="Action EntityType"/>
+      <Term Name="ShardKey" Type="Edm.String" AppliesTo="EntityType"/>
+      <Term Name="AuthZ.CedarPolicy" Type="Edm.String" AppliesTo="EntityType Action"/>
+    </Schema>
+
+    <Schema Namespace="Grug.ElderEvaluation" xmlns="http://docs.oasis-open.org/odata/ns/edm">
+
+      <EnumType Name="ElderEvaluationStatus">
+        <Member Name="Drafted" Value="0"/>
+        <Member Name="Parsed" Value="1"/>
+        <Member Name="Evaluated" Value="2"/>
+        <Member Name="Composed" Value="3"/>
+        <Member Name="Retired" Value="4"/>
+      </EnumType>
+
+      <EntityType Name="ElderEvaluation">
+        <Key><PropertyRef Name="ElderEvaluationId"/></Key>
+        <Property Name="ElderEvaluationId" Type="Edm.String" Nullable="false"/>
+        <Property Name="InstallationId" Type="Edm.String" Nullable="false"/>
+        <Property Name="Status" Type="Grug.ElderEvaluation.ElderEvaluationStatus" Nullable="false"/>
+
+        <Property Name="parse_diff_handles_multi_file_diffs_per_elder_persona" Type="Edm.Boolean" DefaultValue="false"/>
+        <Property Name="parse_diff_skips_binary_files_per_elder_persona" Type="Edm.Boolean" DefaultValue="false"/>
+        <Property Name="parse_diff_handles_renames_per_elder_persona" Type="Edm.Boolean" DefaultValue="false"/>
+        <Property Name="parse_diff_is_pure_function_no_io_per_elder_persona" Type="Edm.Boolean" DefaultValue="false"/>
+        <Property Name="evaluate_diff_is_pure_function_no_io_per_elder_persona" Type="Edm.Boolean" DefaultValue="false"/>
+        <Property Name="evaluate_diff_drops_findings_outside_diff_lines_per_elder_persona" Type="Edm.Boolean" DefaultValue="false"/>
+        <Property Name="aggregate_passed_iff_no_high_or_critical_findings_per_elder_persona" Type="Edm.Boolean" DefaultValue="false"/>
+        <Property Name="code_review_evaluation_frozen_dataclass_no_mutation_per_elder_persona" Type="Edm.Boolean" DefaultValue="false"/>
+        <Property Name="code_review_evaluation_composes_into_check_run_result_per_elder_persona" Type="Edm.Boolean" DefaultValue="false"/>
+
+        <Annotation Term="Temper.Vocab.StateMachine.States">
+          <Collection>
+            <String>Drafted</String><String>Parsed</String><String>Evaluated</String><String>Composed</String><String>Retired</String>
+          </Collection>
+        </Annotation>
+        <Annotation Term="Temper.Vocab.StateMachine.InitialState" String="Drafted"/>
+        <Annotation Term="Temper.Vocab.ShardKey" String="InstallationId"/>
+        <Annotation Term="Temper.Vocab.AuthZ.CedarPolicy" String="policies/elder-evaluation.cedar"/>
+      </EntityType>
+
+      <Action Name="AttestParseDiffContract" IsBound="true">
+        <Parameter Name="bindingParameter" Type="Grug.ElderEvaluation.ElderEvaluation"/>
+        <Parameter Name="attestor" Type="Edm.String" Nullable="false"/>
+        <ReturnType Type="Grug.ElderEvaluation.ElderEvaluation"/>
+        <Annotation Term="Temper.Vocab.StateMachine.ValidFromStates"><Collection><String>Drafted</String></Collection></Annotation>
+      </Action>
+
+      <Action Name="AttestEvaluateDiffContract" IsBound="true">
+        <Parameter Name="bindingParameter" Type="Grug.ElderEvaluation.ElderEvaluation"/>
+        <Parameter Name="attestor" Type="Edm.String" Nullable="false"/>
+        <ReturnType Type="Grug.ElderEvaluation.ElderEvaluation"/>
+        <Annotation Term="Temper.Vocab.StateMachine.ValidFromStates"><Collection><String>Drafted</String></Collection></Annotation>
+      </Action>
+
+      <Action Name="AttestComposeContract" IsBound="true">
+        <Parameter Name="bindingParameter" Type="Grug.ElderEvaluation.ElderEvaluation"/>
+        <Parameter Name="attestor" Type="Edm.String" Nullable="false"/>
+        <ReturnType Type="Grug.ElderEvaluation.ElderEvaluation"/>
+        <Annotation Term="Temper.Vocab.StateMachine.ValidFromStates"><Collection><String>Drafted</String></Collection></Annotation>
+      </Action>
+
+      <Action Name="Parse" IsBound="true">
+        <Parameter Name="bindingParameter" Type="Grug.ElderEvaluation.ElderEvaluation"/>
+        <Parameter Name="pr_number" Type="Edm.String" Nullable="false"/>
+        <ReturnType Type="Grug.ElderEvaluation.ElderEvaluation"/>
+        <Annotation Term="Temper.Vocab.StateMachine.ValidFromStates"><Collection><String>Drafted</String></Collection></Annotation>
+        <Annotation Term="Temper.Vocab.StateMachine.TargetState" String="Parsed"/>
+      </Action>
+
+      <Action Name="Evaluate" IsBound="true">
+        <Parameter Name="bindingParameter" Type="Grug.ElderEvaluation.ElderEvaluation"/>
+        <Parameter Name="llm_response_id" Type="Edm.String" Nullable="false"/>
+        <ReturnType Type="Grug.ElderEvaluation.ElderEvaluation"/>
+        <Annotation Term="Temper.Vocab.StateMachine.ValidFromStates"><Collection><String>Parsed</String></Collection></Annotation>
+        <Annotation Term="Temper.Vocab.StateMachine.TargetState" String="Evaluated"/>
+      </Action>
+
+      <Action Name="Compose" IsBound="true">
+        <Parameter Name="bindingParameter" Type="Grug.ElderEvaluation.ElderEvaluation"/>
+        <Parameter Name="compose_id" Type="Edm.String" Nullable="false"/>
+        <ReturnType Type="Grug.ElderEvaluation.ElderEvaluation"/>
+        <Annotation Term="Temper.Vocab.StateMachine.ValidFromStates"><Collection><String>Evaluated</String></Collection></Annotation>
+        <Annotation Term="Temper.Vocab.StateMachine.TargetState" String="Composed"/>
+      </Action>
+
+      <Action Name="Retire" IsBound="true">
+        <Parameter Name="bindingParameter" Type="Grug.ElderEvaluation.ElderEvaluation"/>
+        <Parameter Name="successor_pr_head_sha" Type="Edm.String" Nullable="false"/>
+        <ReturnType Type="Grug.ElderEvaluation.ElderEvaluation"/>
+        <Annotation Term="Temper.Vocab.StateMachine.ValidFromStates"><Collection><String>Composed</String></Collection></Annotation>
+        <Annotation Term="Temper.Vocab.StateMachine.TargetState" String="Retired"/>
+      </Action>
+
+      <EntityContainer Name="ElderEvaluationService">
+        <EntitySet Name="ElderEvaluations" EntityType="Grug.ElderEvaluation.ElderEvaluation"/>
+      </EntityContainer>
+    </Schema>
+  </edmx:DataServices>
+</edmx:Edmx>

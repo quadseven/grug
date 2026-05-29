@@ -191,7 +191,7 @@ jobs:
         run: python3 infra/scripts/attest_kms_corruption_cleanup.py
 
   verify-domain:
-    name: "temper verify · domain (0006-0010, 0014)"
+    name: "temper verify · domain (0006-0010, 0014-0015)"
     needs: build
     runs-on: ubuntu-latest
     timeout-minutes: 10
@@ -252,6 +252,12 @@ jobs:
 
       - name: Attester · CfSharedSecret middleware contract (spec 0014)
         run: python3 infra/scripts/attest_cf_shared_secret_middleware.py
+
+      - name: Verify spec 0015 (ElderEvaluation)
+        run: /tmp/temper-bin verify -s specs/0015-elder-evaluation/
+
+      - name: Attester · parse_diff + evaluate_diff purity (spec 0015)
+        run: python3 infra/scripts/attest_elder_evaluation_purity.py
 
   verify-web:
     name: "temper verify · web (0011-0013)"

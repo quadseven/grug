@@ -1,0 +1,170 @@
+# spec 0015 — Elder (Code Reviewer) Evaluation I/O Automaton
+#
+# Models the diff parser + `evaluate_diff` rollup for the Elder persona.
+# Both are pure functions: `parse_diff(unified_diff)` extracts
+# structured hunks; `evaluate_diff(hunks, llm_response)` consumes the
+# LLM's findings and produces a `CodeReviewEvaluation` for publication
+# into a `CheckRunResult` (spec 0001).
+#
+# Source of truth: DESIGN.md § "Elder persona — code review".
+#
+# Verified by `temper verify -s specs/0015-elder-evaluation/`.
+
+[automaton]
+name = "ElderEvaluation"
+states = ["Drafted", "Parsed", "Evaluated", "Composed", "Retired"]
+initial = "Drafted"
+
+# --- Diff parser contract bools ---
+
+[[state]]
+name = "parse_diff_handles_multi_file_diffs_per_elder_persona"
+type = "bool"
+initial = "false"
+
+[[state]]
+name = "parse_diff_skips_binary_files_per_elder_persona"
+type = "bool"
+initial = "false"
+
+[[state]]
+name = "parse_diff_handles_renames_per_elder_persona"
+type = "bool"
+initial = "false"
+
+[[state]]
+name = "parse_diff_is_pure_function_no_io_per_elder_persona"
+type = "bool"
+initial = "false"
+
+# --- Evaluate contract bools ---
+
+[[state]]
+name = "evaluate_diff_is_pure_function_no_io_per_elder_persona"
+type = "bool"
+initial = "false"
+
+[[state]]
+name = "evaluate_diff_drops_findings_outside_diff_lines_per_elder_persona"
+type = "bool"
+initial = "false"
+
+[[state]]
+name = "aggregate_passed_iff_no_high_or_critical_findings_per_elder_persona"
+type = "bool"
+initial = "false"
+
+# --- Compose contract bools (composes into a CheckRunResult) ---
+
+[[state]]
+name = "code_review_evaluation_frozen_dataclass_no_mutation_per_elder_persona"
+type = "bool"
+initial = "false"
+
+[[state]]
+name = "code_review_evaluation_composes_into_check_run_result_per_elder_persona"
+type = "bool"
+initial = "false"
+
+[[action]]
+name = "AttestParseDiffContract"
+kind = "input"
+from = ["Drafted"]
+params = ["attestor"]
+guard = "is_false parse_diff_is_pure_function_no_io_per_elder_persona"
+effect = [
+  { type = "set_bool", var = "parse_diff_handles_multi_file_diffs_per_elder_persona", value = true },
+  { type = "set_bool", var = "parse_diff_skips_binary_files_per_elder_persona", value = true },
+  { type = "set_bool", var = "parse_diff_handles_renames_per_elder_persona", value = true },
+  { type = "set_bool", var = "parse_diff_is_pure_function_no_io_per_elder_persona", value = true },
+]
+hint = "Unified diff string in; structured hunks out. Multi-file boundary at `diff --git`; binary blocks skipped; renames carry the new path. No IO during parse."
+
+[[action]]
+name = "AttestEvaluateDiffContract"
+kind = "input"
+from = ["Drafted"]
+params = ["attestor"]
+guard = "is_false evaluate_diff_is_pure_function_no_io_per_elder_persona"
+effect = [
+  { type = "set_bool", var = "evaluate_diff_is_pure_function_no_io_per_elder_persona", value = true },
+  { type = "set_bool", var = "evaluate_diff_drops_findings_outside_diff_lines_per_elder_persona", value = true },
+  { type = "set_bool", var = "aggregate_passed_iff_no_high_or_critical_findings_per_elder_persona", value = true },
+]
+hint = "evaluate_diff(hunks, llm_response) is pure. Findings whose (file, line) is not within any hunk's added-or-changed line set are dropped as LLM hallucinations. Aggregate `passed` requires zero high+critical findings; medium+low are advisory."
+
+[[action]]
+name = "AttestComposeContract"
+kind = "input"
+from = ["Drafted"]
+params = ["attestor"]
+guard = "is_false code_review_evaluation_composes_into_check_run_result_per_elder_persona"
+effect = [
+  { type = "set_bool", var = "code_review_evaluation_frozen_dataclass_no_mutation_per_elder_persona", value = true },
+  { type = "set_bool", var = "code_review_evaluation_composes_into_check_run_result_per_elder_persona", value = true },
+]
+hint = "CodeReviewEvaluation is a frozen dataclass; composes 1:1 into a CheckRunResult (spec 0001) for the `Grug — Code Review` check-run."
+
+[[action]]
+name = "Parse"
+kind = "input"
+from = ["Drafted"]
+to = "Parsed"
+params = ["pr_number"]
+guard = [
+  { type = "is_true", var = "parse_diff_handles_multi_file_diffs_per_elder_persona" },
+  { type = "is_true", var = "parse_diff_skips_binary_files_per_elder_persona" },
+  { type = "is_true", var = "parse_diff_handles_renames_per_elder_persona" },
+  { type = "is_true", var = "parse_diff_is_pure_function_no_io_per_elder_persona" },
+]
+hint = "parse_diff(unified_diff) runs and emits structured hunks."
+
+[[action]]
+name = "Evaluate"
+kind = "input"
+from = ["Parsed"]
+to = "Evaluated"
+params = ["llm_response_id"]
+guard = [
+  { type = "is_true", var = "evaluate_diff_is_pure_function_no_io_per_elder_persona" },
+  { type = "is_true", var = "evaluate_diff_drops_findings_outside_diff_lines_per_elder_persona" },
+  { type = "is_true", var = "aggregate_passed_iff_no_high_or_critical_findings_per_elder_persona" },
+]
+hint = "evaluate_diff(hunks, llm_response) runs and produces a CodeReviewEvaluation."
+
+[[action]]
+name = "Compose"
+kind = "input"
+from = ["Evaluated"]
+to = "Composed"
+params = ["compose_id"]
+guard = [
+  { type = "is_true", var = "code_review_evaluation_frozen_dataclass_no_mutation_per_elder_persona" },
+  { type = "is_true", var = "code_review_evaluation_composes_into_check_run_result_per_elder_persona" },
+]
+hint = "Hands the verdict to github_checks_client.post_check_run via a CheckRunResult."
+
+[[action]]
+name = "Retire"
+kind = "input"
+from = ["Composed"]
+to = "Retired"
+params = ["successor_pr_head_sha"]
+hint = "PR head moves; this evaluation is now historical."
+
+[[invariant]]
+name = "MustParseBeforeEvaluate"
+assert = "ordering(Parsed, Evaluated)"
+
+[[invariant]]
+name = "MustEvaluateBeforeCompose"
+assert = "ordering(Evaluated, Composed)"
+
+[[invariant]]
+name = "MustComposeBeforeRetire"
+assert = "ordering(Composed, Retired)"
+
+[[invariant]]
+name = "RetiredIsTerminal"
+when = ["Retired"]
+assert = "no_further_transitions"
