@@ -112,9 +112,36 @@ def test_review_result_rejects_invalid_event():
 
 def test_review_result_rejects_zero_line_in_inline_comment():
     """GitHub's PR Reviews API 422s on line=0. Catch at construction
-    so the bad payload never leaves the process."""
-    with pytest.raises((AssertionError, ValueError)):
+    so the bad payload never leaves the process. Uses ValueError (not
+    AssertionError) so `python -O` cannot strip the guard."""
+    with pytest.raises(ValueError, match="line must be >= 1"):
         InlineComment(path="x.py", line=0, body="msg")
+
+
+def test_review_result_rejects_empty_commit_id():
+    with pytest.raises(ValueError, match="commit_id must be non-empty"):
+        ReviewResult(commit_id="", event="COMMENT", body="x", comments=())
+
+
+def test_review_result_rejects_empty_path_in_inline_comment():
+    with pytest.raises(ValueError, match="path must be non-empty"):
+        InlineComment(path="", line=1, body="msg")
+
+
+def test_review_result_rejects_body_over_github_limit():
+    """GitHub 422s on review body > 65536 chars. A verbose-mode prompt
+    could spill over in a future slice; guard at construction so the
+    bad payload never crosses the wire."""
+    big = "x" * 65537
+    with pytest.raises(ValueError, match="exceeds GitHub's"):
+        ReviewResult(commit_id="abc", event="COMMENT", body=big, comments=())
+
+
+def test_review_result_accepts_body_at_github_limit():
+    """The boundary case — exactly 65536 chars must NOT raise."""
+    body = "x" * 65536
+    r = ReviewResult(commit_id="abc", event="COMMENT", body=body, comments=())
+    assert len(r.body) == 65536
 
 
 def test_inline_comment_is_frozen():
