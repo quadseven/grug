@@ -375,6 +375,11 @@ def _dispatch_code_reviewer(
     from personas.code_reviewer.dispatch import (  # type: ignore
         dispatch_code_review,
     )
+    # Final guard MUST be broad — TPM has already dispatched by the
+    # time this runs, and propagating an Elder exception would 500
+    # the webhook with no way to surface TPM's result. The
+    # `exc_info=True` log carries the full traceback to DD/Sentry, so
+    # unknown exception types are not buried, just not propagated.
     try:
         return dispatch_code_review(payload, blocking=blocking)
     except Exception as e:  # noqa: BLE001 — explicit final guard

@@ -211,6 +211,48 @@ def test_dispatch_unparseable_diff_yields_neutral(monkeypatch):
     assert out["result"] == "skipped"
 
 
+def test_dispatch_check_run_publish_failure_returns_publish_failed(monkeypatch):
+    """Check-run is the load-bearing GH surface (flips mergeability in
+    blocking mode). If it fails to publish, the persona result must be
+    `publish_failed` not `pass`/`fail` — operator needs to see the
+    distinct state to triage."""
+    llm = LlmReviewResponse(
+        kind="reviewed", findings=(), backend_used=Backend.POOLSIDE,
+    )
+    monkeypatch.setattr(cr_dispatch, "review_diff", lambda *a, **kw: llm)
+    monkeypatch.setattr(cr_dispatch, "post_review", lambda *a, **kw: {})
+
+    def _raise(*a, **kw):
+        raise httpx.ConnectError("checks API down")
+
+    monkeypatch.setattr(cr_dispatch, "post_check_run", _raise)
+
+    with patch("httpx.get", return_value=_diff_response()):
+        out = cr_dispatch.dispatch_code_review(_payload(), blocking=False)
+
+    assert out["result"] == "publish_failed"
+
+
+def test_dispatch_llm_degraded_logs_warning(monkeypatch, caplog):
+    """A 100% LLM-outage rate must produce a distinct log signal so
+    DD/dashboards can monitor backend health per-install. Without
+    this, all_failed looks identical to "no findings" in logs."""
+    llm = LlmReviewResponse(
+        kind="all_failed", error="poolside: timeout",
+    )
+    monkeypatch.setattr(cr_dispatch, "review_diff", lambda *a, **kw: llm)
+    monkeypatch.setattr(cr_dispatch, "post_check_run", lambda *a, **kw: {})
+    monkeypatch.setattr(cr_dispatch, "post_review", lambda *a, **kw: {})
+
+    with caplog.at_level("WARNING"):
+        with patch("httpx.get", return_value=_diff_response()):
+            cr_dispatch.dispatch_code_review(_payload(), blocking=False)
+
+    assert any(
+        "code_review_llm_degraded" in r.message for r in caplog.records
+    )
+
+
 def test_dispatch_fetches_diff_with_diff_accept_header(monkeypatch):
     """Confirms the GH API call uses `Accept: application/vnd.github.diff`
     so we get the unified-diff body rather than the JSON metadata."""

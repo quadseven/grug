@@ -220,6 +220,20 @@ def dispatch_code_review(
     llm_response: LlmReviewResponse = review_diff(
         _to_llm_hunks(hunks), installation_id=installation_id,
     )
+    if llm_response.kind != "reviewed":
+        # Without this log, a 100% LLM-outage rate looks identical to
+        # "no findings" in operational dashboards — both yield
+        # findings=(). Surface the degraded kind so DD can monitor
+        # backend health per-install.
+        log.warning(
+            "code_review_llm_degraded",
+            extra={
+                "installation_id": installation_id,
+                "pr": f"{owner}/{repo_name}#{pull_number}",
+                "kind": llm_response.kind,
+                "error": llm_response.error,
+            },
+        )
 
     # 4. Pure evaluate.
     evaluation = evaluate_diff(hunks, llm_response)
@@ -236,6 +250,7 @@ def dispatch_code_review(
         title=title,
         summary=summary,
     )
+    check_publish_failed = False
     try:
         with_install_token_retry(
             installation_id,
@@ -253,6 +268,7 @@ def dispatch_code_review(
                 "kind": type(e).__name__,
             },
         )
+        check_publish_failed = True
         # Continue to attempt the review post — independent surface.
 
     review_result = _build_review_result(
@@ -277,13 +293,20 @@ def dispatch_code_review(
                 },
             )
 
+    if check_publish_failed:
+        # Check-run is the load-bearing GH surface (the one that flips
+        # mergeability under blocking mode). If THAT failed, the
+        # operator needs to see "publish_failed" not "pass" regardless
+        # of the underlying evaluation.
+        result: PersonaResultStr = "publish_failed"
+    elif evaluation.degraded_reason:
+        result = "skipped"
+    else:
+        result = "pass" if evaluation.passed else "fail"
     return {
         "status": "dispatched",
         "persona": "code_reviewer",
-        "result": (
-            "skipped" if evaluation.degraded_reason
-            else ("pass" if evaluation.passed else "fail")
-        ),
+        "result": result,
     }
 
 
@@ -299,6 +322,7 @@ def _publish_degraded(
         f"Elder could not run this pass: `{reason}`. Advisory neutral "
         "— PR merge is not blocked."
     )
+    publish_failed = False
     try:
         with_install_token_retry(
             installation_id,
@@ -313,10 +337,22 @@ def _publish_degraded(
                 ),
             ),
         )
-    except (httpx.HTTPError,):
-        # Best-effort — no recovery path beyond this.
-        pass
+    except (httpx.HTTPError,) as e:
+        # No recovery path beyond logging — but a silent miss here
+        # means the PR shows NO check-run at all, indistinguishable
+        # from persona-disabled. Surface as a discrete signal so the
+        # dispatcher result reflects it.
+        log.error(
+            "code_review_degraded_publish_failed",
+            extra={
+                "installation_id": installation_id,
+                "pr": f"{owner}/{repo_name}#{pull_number}",
+                "kind": type(e).__name__,
+                "reason": reason,
+            },
+        )
+        publish_failed = True
     return {
         "status": "dispatched", "persona": "code_reviewer",
-        "result": "skipped",
+        "result": "publish_failed" if publish_failed else "skipped",
     }
