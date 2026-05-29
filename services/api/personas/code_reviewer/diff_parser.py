@@ -171,10 +171,16 @@ def parse_diff(unified_diff: str) -> tuple[DiffHunk, ...]:
                     new_cursor += 1
                 elif hline.startswith("-") and not hline.startswith("---"):
                     pass  # removed — no new-side advance
+                elif hline.startswith("\\"):
+                    # `\ No newline at end of file` — a unified-diff
+                    # annotation, NOT a content line. Including it in
+                    # the cursor advance shifts every subsequent +line's
+                    # number by 1, so the hallucination filter would
+                    # then reject real findings as "outside the diff."
+                    pass
                 else:
-                    # Context line (possibly empty `\` no-newline marker
-                    # or trailing blank). Advance the new cursor; don't
-                    # mark as a reviewable line since it wasn't changed.
+                    # Context line. Advance the new cursor; don't mark
+                    # as reviewable since it wasn't changed.
                     new_cursor += 1
                 i += 1
             hunks.append(

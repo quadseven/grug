@@ -138,6 +138,60 @@ def test_hunk_body_preserved_for_llm_consumption() -> None:
     assert "-old" in hunks[0].body
 
 
+def test_no_newline_marker_does_not_shift_line_numbers() -> None:
+    """A diff that ends with `\\ No newline at end of file` must not
+    advance the new-line cursor on that annotation line — otherwise
+    every subsequent +line gets a wrong number and the hallucination
+    filter rejects real findings."""
+    diff = """diff --git a/x.py b/x.py
+--- a/x.py
++++ b/x.py
+@@ -1,2 +1,3 @@
+ keep
+-old
+\\ No newline at end of file
++new_a
++new_b
+"""
+    hunks = parse_diff(diff)
+    assert len(hunks) == 1
+    # `keep` is line 1 (context); `old` removed; `new_a` added at 2,
+    # `new_b` at 3. If the `\` marker shifted the cursor, new_a would
+    # be 3 and new_b would be 4 → off-by-one for every finding.
+    assert 2 in hunks[0].new_lines
+    assert 3 in hunks[0].new_lines
+    assert 4 not in hunks[0].new_lines
+
+
+def test_realistic_multi_hunk_shape_with_correct_line_numbers() -> None:
+    """A second hunk header `@@ -50,3 +51,4 @@` advances the new-side
+    base to 51 — the second hunk's +lines start at 51, not at 1 +
+    (count from first hunk). Catches a regression where the parser
+    naively continued line numbering across hunks."""
+    diff = """diff --git a/src/x.py b/src/x.py
+--- a/src/x.py
++++ b/src/x.py
+@@ -1,3 +1,4 @@
+ first_keep
++first_add
+ second_keep
+ third_keep
+@@ -50,3 +51,4 @@
+ fiftieth_keep
++added_at_52
+ fifty_first_keep
+ fifty_second_keep
+"""
+    hunks = parse_diff(diff)
+    assert len(hunks) == 2
+    # First hunk: +first_add is on new-side line 2 (after first_keep@1).
+    assert 2 in hunks[0].new_lines
+    # Second hunk: +added_at_52 is on new-side line 52.
+    assert 52 in hunks[1].new_lines
+    # Numbering MUST NOT bleed across hunks.
+    assert 52 not in hunks[0].new_lines
+
+
 def test_malformed_at_at_header_raises_diff_parse_error() -> None:
     """A garbled @@ header is more likely a fetcher bug or GitHub
     format drift than a real hunk we should partially extract. Silent
