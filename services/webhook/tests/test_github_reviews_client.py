@@ -67,7 +67,9 @@ def test_post_review_body_comment_event_no_findings():
     assert body["commit_id"] == "abc"
     assert body["event"] == "COMMENT"
     assert body["body"] == "No findings"
-    assert body["comments"] == []
+    # `asdict` preserves tuple → tuple; JSON-serializes to `[]`. The
+    # wire payload is identical to a list-of-dicts.
+    assert list(body["comments"]) == []
 
 
 def test_post_review_body_request_changes_with_inline_comments():
