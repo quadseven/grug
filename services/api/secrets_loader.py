@@ -49,3 +49,8 @@ def get_app_private_key() -> str:
 def get_openrouter_api_key() -> str:
     name = os.getenv("GRUG_OPENROUTER_API_KEY_SSM", "")
     return _get_ssm_secure_string(name)
+
+
+def get_poolside_api_key() -> str:
+    name = os.getenv("GRUG_POOLSIDE_API_KEY_SSM", "")
+    return _get_ssm_secure_string(name)

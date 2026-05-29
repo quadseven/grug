@@ -95,6 +95,15 @@ _openrouter_api_key = aws.ssm.get_parameter(
     with_decryption=True,
 )
 
+# Poolside API key — same scoping rationale as OpenRouter (webhook-only).
+# The Elder persona round-robins via `installation_id % 2`; both keys
+# must be present for the round-robin to work without permanent fallback
+# to the other backend.
+_poolside_api_key = aws.ssm.get_parameter(
+    name="/grug/poolside-api-key",
+    with_decryption=True,
+)
+
 # DD extension version baked into the Lambda image (per Dockerfile.lambda).
 # Lambda Container package_type can't attach layers; extension binary is
 # COPYd from public.ecr.aws/datadog/lambda-extension-arm:<v>. Bump here
@@ -166,7 +175,7 @@ webhook = lambda_service.create(
     # lambda_service already wraps the arn list in `Output.all(...).apply()`,
     # so Output[str] arns resolve correctly. Issue #235 tracks tightening
     # the type contract via a structural Protocol.
-    extra_ssm_secrets=[_dd_api_key, cf_secret.ssm_parameter, _openrouter_api_key],
+    extra_ssm_secrets=[_dd_api_key, cf_secret.ssm_parameter, _openrouter_api_key, _poolside_api_key],
     # NOTE: DD extension is BAKED into the Lambda container image
     # (services/webhook/Dockerfile.lambda copies from
     # public.ecr.aws/datadog/lambda-extension-arm:<v>). Lambda Container
@@ -186,6 +195,7 @@ webhook = lambda_service.create(
         "GRUG_DDB_TABLE": grug_main_table.name,
         # Elder persona LLM client — webhook-only (api never calls LLMs).
         "GRUG_OPENROUTER_API_KEY_SSM": _openrouter_api_key.name,
+        "GRUG_POOLSIDE_API_KEY_SSM": _poolside_api_key.name,
         # CF→AWS auth boundary — middleware reads at cold start (#173).
         "GRUG_CF_SHARED_SECRET_SSM": cf_secret.ssm_parameter.name,
         # Datadog APM (datadog_lambda wrapper finds real handler via
