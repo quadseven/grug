@@ -68,9 +68,14 @@ def _find_assignment(tree: ast.Module, name: str) -> ast.AST | None:
     return None
 
 
-def _str_set_from_node(node: ast.AST | None) -> frozenset[str] | None:
-    """Extract a constant set of strings from `frozenset((...))` or
-    `frozenset({...})` style literals."""
+def _str_set_from_node(
+    node: ast.AST | None, tree: ast.Module,
+) -> frozenset[str] | None:
+    """Extract a constant set of strings from `frozenset((...))`,
+    `frozenset({...})`, or `frozenset(get_args(<Literal>))` style
+    expressions. The `get_args(Literal[...])` form is what we recommend
+    in code-reviewer fixes, so the attester must follow it back to the
+    Literal's args."""
     if node is None:
         return None
     if isinstance(node, ast.Call) and isinstance(node.func, ast.Name) and node.func.id == "frozenset":
@@ -86,6 +91,44 @@ def _str_set_from_node(node: ast.AST | None) -> frozenset[str] | None:
                 )
             except Exception:
                 return None
+        # `get_args(<Name>)` — resolve to the Literal's args at the
+        # named alias (e.g. `ReviewEvent = Literal["COMMENT", ...]`).
+        if (
+            isinstance(arg, ast.Call)
+            and isinstance(arg.func, ast.Name)
+            and arg.func.id == "get_args"
+            and arg.args
+            and isinstance(arg.args[0], ast.Name)
+        ):
+            return _literal_args(tree, arg.args[0].id)
+    return None
+
+
+def _literal_args(tree: ast.Module, name: str) -> frozenset[str] | None:
+    """Resolve `<name> = Literal["a", "b"]` to {"a", "b"}."""
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Assign):
+            for tgt in node.targets:
+                if isinstance(tgt, ast.Name) and tgt.id == name:
+                    val = node.value
+                    if (
+                        isinstance(val, ast.Subscript)
+                        and isinstance(val.value, ast.Name)
+                        and val.value.id == "Literal"
+                    ):
+                        slice_node = val.slice
+                        elts = (
+                            slice_node.elts if isinstance(slice_node, ast.Tuple)
+                            else [slice_node]
+                        )
+                        try:
+                            return frozenset(
+                                e.value for e in elts
+                                if isinstance(e, ast.Constant)
+                                and isinstance(e.value, str)
+                            )
+                        except Exception:
+                            return None
     return None
 
 
@@ -153,7 +196,7 @@ def _check(path: Path) -> list[str]:
 
     # event allowlist must exactly equal {COMMENT, REQUEST_CHANGES}
     valid_events_node = _find_assignment(tree, "_VALID_EVENTS")
-    events = _str_set_from_node(valid_events_node)
+    events = _str_set_from_node(valid_events_node, tree)
     if events != EXPECTED_EVENTS:
         failures.append(
             f"{path}: _VALID_EVENTS must equal {sorted(EXPECTED_EVENTS)} "

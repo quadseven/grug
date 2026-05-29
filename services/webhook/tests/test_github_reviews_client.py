@@ -15,7 +15,6 @@ import pytest
 
 from github_reviews_client import (
     InlineComment,
-    ReviewEvent,
     ReviewResult,
     post_review,
 )
@@ -199,9 +198,3 @@ def test_post_review_connect_error_propagates(mock_transport_client):
             post_review("tok", "o", "r", pull_number=1, result=result)
 
 
-def test_event_literal_only_accepts_documented_values():
-    """`ReviewEvent` is a Literal — runtime construction with a typo
-    must surface at __post_init__ rather than reaching GH (which would
-    422)."""
-    valid: ReviewEvent = "COMMENT"
-    assert valid in ("COMMENT", "REQUEST_CHANGES")
