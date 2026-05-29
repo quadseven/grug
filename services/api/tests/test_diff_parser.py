@@ -124,15 +124,9 @@ def test_diff_with_multiple_hunks_per_file_returns_each() -> None:
 def test_diff_hunk_is_frozen() -> None:
     """`DiffHunk` must be immutable so callers can hash/share it."""
     import dataclasses
-    assert dataclasses.is_dataclass(DiffHunk)
-    field = next(f for f in dataclasses.fields(DiffHunk) if f.name == "file_path")
-    assert field is not None
     h = parse_diff(_SIMPLE_DIFF)[0]
-    try:
+    with pytest.raises(dataclasses.FrozenInstanceError):
         h.file_path = "other.py"  # type: ignore[misc]
-    except dataclasses.FrozenInstanceError:
-        return
-    raise AssertionError("DiffHunk should be frozen")
 
 
 def test_hunk_body_preserved_for_llm_consumption() -> None:

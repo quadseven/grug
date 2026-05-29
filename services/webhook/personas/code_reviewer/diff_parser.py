@@ -78,6 +78,12 @@ _HUNK_HEADER_RE = re.compile(r"^@@ -\d+(?:,\d+)? \+(\d+)(?:,(\d+))? @@")
 # `Binary files a/... and b/... differ` — skip these entirely.
 _BINARY_RE = re.compile(r"^Binary files .+ and .+ differ$")
 
+# Prefixes that end one hunk's body and start the next file / hunk /
+# header section. Tuple so a single `startswith(_BOUNDARY)` call covers all four.
+_HUNK_BOUNDARY_PREFIXES: tuple[str, ...] = (
+    "diff --git ", "@@", "+++ ", "--- ",
+)
+
 
 def parse_diff(unified_diff: str) -> tuple[DiffHunk, ...]:
     """Parse a unified diff into structured hunks.
@@ -157,12 +163,7 @@ def parse_diff(unified_diff: str) -> tuple[DiffHunk, ...]:
             i += 1
             while i < len(lines):
                 hline = lines[i]
-                if (
-                    hline.startswith("diff --git ")
-                    or hline.startswith("@@")
-                    or hline.startswith("+++ ")
-                    or hline.startswith("--- ")
-                ):
+                if hline.startswith(_HUNK_BOUNDARY_PREFIXES):
                     break
                 body_lines.append(hline)
                 if hline.startswith("+") and not hline.startswith("+++"):
