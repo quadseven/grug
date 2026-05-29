@@ -111,12 +111,17 @@ class CodeReviewEvaluation:
         return self.conclusion != "failure"
 
 
-def _hunk_line_index(hunks: tuple[DiffHunk, ...]) -> dict[str, frozenset[int]]:
-    """Build {file_path: union(new_lines)} for O(1) hallucination check."""
+def _hunk_line_index(hunks: tuple[DiffHunk, ...]) -> dict[str, set[int]]:
+    """Build {file_path: union(new_lines)} for O(1) hallucination check.
+
+    Returns plain `set` (not `frozenset`) — the index is built fresh
+    per `evaluate_diff` call, never shared or hashed, so the immutable
+    wrap was overhead without payoff.
+    """
     index: dict[str, set[int]] = {}
     for h in hunks:
         index.setdefault(h.file_path, set()).update(h.new_lines)
-    return {k: frozenset(v) for k, v in index.items()}
+    return index
 
 
 def evaluate_diff(
@@ -163,8 +168,8 @@ def evaluate_diff(
             )
         )
 
-    blocking = [f for f in kept if f.severity in _BLOCKING_SEVERITIES]
-    conclusion: CheckConclusion = "failure" if blocking else "success"
+    has_blocking = any(f.severity in _BLOCKING_SEVERITIES for f in kept)
+    conclusion: CheckConclusion = "failure" if has_blocking else "success"
     return CodeReviewEvaluation(
         findings=tuple(kept),
         conclusion=conclusion,
