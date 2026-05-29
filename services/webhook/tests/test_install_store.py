@@ -157,14 +157,28 @@ def test_list_user_installations_via_gsi1(_ddb_table):
 def test_repo_config_default_is_tpm_enabled_true(_ddb_table):
     mod = _ddb_table
     cfg = mod.get_repo_config(install_id=1, repo_id=42)
-    assert cfg == {"tpm_enabled": True, "enforcement_ruleset_id": None, "force_disable_enforcement": False}
+    assert cfg == {
+        "tpm_enabled": True,
+        "code_reviewer_enabled": True,
+        "code_reviewer_blocking": False,
+        "enforcement_ruleset_id": None,
+        "force_disable_enforcement": False,
+    }
 
 
 def test_set_then_get_repo_config(_ddb_table):
     mod = _ddb_table
     mod.set_repo_config(install_id=1, repo_id=42, repo_full_name="x/y",
                         tpm_enabled=False, updated_by_user_id="100")
-    assert mod.get_repo_config(1, 42) == {"tpm_enabled": False, "enforcement_ruleset_id": None, "force_disable_enforcement": False}
+    # code_reviewer_* kwargs not passed → row carries no override →
+    # `.get()` falls back to _DEFAULT_PERSONA_CONFIG (True/False).
+    assert mod.get_repo_config(1, 42) == {
+        "tpm_enabled": False,
+        "code_reviewer_enabled": True,
+        "code_reviewer_blocking": False,
+        "enforcement_ruleset_id": None,
+        "force_disable_enforcement": False,
+    }
 
 
 def test_is_persona_enabled_default_true(_ddb_table):
@@ -181,3 +195,75 @@ def test_is_persona_enabled_after_disable(_ddb_table):
 def test_is_persona_enabled_unknown_persona_defaults_true(_ddb_table):
     """v1 default policy: unrecognized personas don't gate via this fn."""
     assert _ddb_table.is_persona_enabled(1, 42, "release-manager") is True
+
+
+def test_default_persona_config_includes_code_reviewer(_ddb_table):
+    """Elder (code_reviewer) persona ships enabled by default. Newly-
+    installed users get inline review comments out-of-the-box; opt-out
+    is explicit per repo. `code_reviewer_blocking` defaults False —
+    advisory mode (event=COMMENT, conclusion=neutral) so false-positives
+    don't block velocity."""
+    cfg = _ddb_table._DEFAULT_PERSONA_CONFIG
+    assert cfg.get("code_reviewer_enabled") is True
+    assert cfg.get("code_reviewer_blocking") is False
+
+
+def test_is_persona_enabled_code_reviewer_default_true(_ddb_table):
+    assert _ddb_table.is_persona_enabled(1, 42, "code_reviewer") is True
+
+
+def test_get_repo_config_surfaces_code_reviewer_fields(_ddb_table):
+    """No row exists → defaults dict carries all persona keys (TPM +
+    Elder) + the two enforcement-state fields."""
+    cfg = _ddb_table.get_repo_config(1, 42)
+    assert cfg.get("code_reviewer_enabled") is True
+    assert cfg.get("code_reviewer_blocking") is False
+
+
+def test_set_repo_config_persists_code_reviewer_fields(_ddb_table):
+    """Disabling Elder via set_repo_config must round-trip through
+    DDB. Same shape as tpm_enabled — kwarg-driven update."""
+    mod = _ddb_table
+    mod.set_repo_config(
+        install_id=1, repo_id=42, repo_full_name="x/y",
+        tpm_enabled=True, code_reviewer_enabled=False,
+        code_reviewer_blocking=False, updated_by_user_id="100",
+    )
+    cfg = mod.get_repo_config(1, 42)
+    assert cfg["code_reviewer_enabled"] is False
+    assert cfg["code_reviewer_blocking"] is False
+    # TPM unchanged (kwarg sent True).
+    assert cfg["tpm_enabled"] is True
+
+
+def test_get_repo_config_legacy_row_falls_back_to_defaults(_ddb_table):
+    """Pre-Elder rows (tpm_enabled only) must surface code_reviewer_*
+    defaults from _DEFAULT_PERSONA_CONFIG. A regression that read the
+    missing field as `None` then `bool(None) is False` would silently
+    flip Elder OFF for every legacy repo on the first webhook event."""
+    mod = _ddb_table
+    table = boto3.resource(
+        "dynamodb", region_name="us-east-1",
+    ).Table("grug-main-test")
+    table.put_item(Item={
+        "PK": "INST#1", "SK": "REPO#42",
+        "repo_full_name": "x/y",
+        "tpm_enabled": False,
+        # Intentionally no code_reviewer_enabled / code_reviewer_blocking.
+    })
+    cfg = mod.get_repo_config(1, 42)
+    assert cfg["tpm_enabled"] is False
+    assert cfg["code_reviewer_enabled"] is True   # default
+    assert cfg["code_reviewer_blocking"] is False  # default
+
+
+def test_set_repo_config_blocking_mode_round_trips(_ddb_table):
+    """Operator flips advisory→blocking via dashboard. Must persist."""
+    mod = _ddb_table
+    mod.set_repo_config(
+        install_id=1, repo_id=42, repo_full_name="x/y",
+        tpm_enabled=True, code_reviewer_enabled=True,
+        code_reviewer_blocking=True, updated_by_user_id="100",
+    )
+    cfg = mod.get_repo_config(1, 42)
+    assert cfg["code_reviewer_blocking"] is True
