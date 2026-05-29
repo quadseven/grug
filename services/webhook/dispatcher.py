@@ -239,7 +239,7 @@ def _handle_pull_request(
         )
         return {"status": "skip", "reason": "incomplete_payload"}
 
-    # Allowlist gate (Slice 5 #26). Defense-in-depth — non-allowlisted
+    # Allowlist gate — defense-in-depth — non-allowlisted
     # installs no_op silently. Avoids any GitHub API calls (no install
     # token request, no check-run post) so we don't leak Grug presence
     # to repos whose installer hasn't been admin-approved.
@@ -260,10 +260,9 @@ def _handle_pull_request(
     repo_id = repo.get("id")
 
     # Both TPM and Elder dispatch from this handler on the same event,
-    # producing INDEPENDENT verdicts. One failing must not skip the
-    # other — that's the load-bearing property the test suite asserts.
-    # Each persona's exceptions are caught locally so a transient GH
-    # 5xx on one doesn't 500 the webhook or starve the other.
+    # producing INDEPENDENT verdicts. Each persona's exceptions are
+    # caught locally so a transient GH 5xx on one doesn't 500 the
+    # webhook or starve the other.
     results: list[dict[str, str]] = []
 
     tpm_enabled = (
@@ -294,10 +293,9 @@ def _handle_pull_request(
         )
     )
     if code_reviewer_enabled:
-        # `code_reviewer_blocking` controls advisory-vs-blocking mode.
-        # Defaults False; operator flips via dashboard once trust is
-        # established. Fetched alongside the toggle since both come
-        # from the same RepoConfig row.
+        # `code_reviewer_blocking` defaults False; operator flips via
+        # dashboard once LLM-finding trust is established. Advisory-
+        # first prevents false-positives from blocking velocity.
         cfg = get_repo_config(int(installation_id), int(repo_id))
         results.append(_dispatch_code_reviewer(
             payload=payload,

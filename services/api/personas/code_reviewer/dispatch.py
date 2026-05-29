@@ -46,15 +46,11 @@ log = logging.getLogger(f"{os.getenv('DD_SERVICE', 'grug')}.persona.code_reviewe
 _CHECK_NAME = "Grug — Code Review"
 _DIFF_FETCH_TIMEOUT = 30
 
-# Advisory vs blocking mode threaded through publish-shape decisions.
-# Promoted from a bare `bool` so future "degraded" or "experimental"
-# modes can be added without an inversion bug at every call site (e.g.
-# `if not blocking` flipping wrong when a third mode appears).
+# Literal (not bool) so a future "degraded"/"experimental" mode can't
+# silently invert `if not blocking` call sites.
 ReviewMode = Literal["advisory", "blocking"]
 
-# Per-persona result string. Promoted to Literal so a new return site
-# can't silently introduce an undocumented value (e.g. dispatcher.py's
-# `unhandled_error` was previously documented only by source-grep).
+# Closed set so a new return site can't introduce an undocumented value.
 PersonaResultStr = Literal[
     "pass", "fail", "skipped", "publish_failed", "unhandled_error",
 ]
@@ -211,7 +207,8 @@ def dispatch_code_review(
     head_sha = pr["head"]["sha"]
     installation_id = int(installation["id"])
 
-    # 1+2. Fetch + parse. DiffParseError → advisory neutral.
+    # DiffParseError → advisory neutral so a fetcher bug or GitHub
+    # format drift cannot 500 the webhook.
     try:
         diff_text = with_install_token_retry(
             installation_id,
@@ -232,9 +229,8 @@ def dispatch_code_review(
             reason="fetch_or_parse_failed",
         )
 
-    # 3. LLM. review_diff already swallows backend failures into
-    # discriminated `LlmReviewResponse.kind` values; no extra try
-    # needed.
+    # review_diff already swallows backend failures into discriminated
+    # `LlmReviewResponse.kind` values; no extra try needed.
     llm_response: LlmReviewResponse = review_diff(
         _to_llm_hunks(hunks), installation_id=installation_id,
     )
@@ -253,11 +249,10 @@ def dispatch_code_review(
             },
         )
 
-    # 4. Pure evaluate.
     evaluation = evaluate_diff(hunks, llm_response)
 
-    # 5+6. Publish. Both clients are independent — a 5xx on review
-    # post must not skip the check-run post.
+    # Both clients are independent — a 5xx on review post must not
+    # skip the check-run post.
     conclusion, event = _publish_shape(evaluation, mode=mode)
     title, summary = _summary_markdown(evaluation)
     check_result = CheckRunResult(

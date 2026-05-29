@@ -251,6 +251,73 @@ def test_dispatch_llm_degraded_logs_warning(monkeypatch, caplog):
     )
 
 
+def test_dispatch_degraded_publish_failure_returns_publish_failed(monkeypatch):
+    """Fetch fails AND the degraded check-run publish also fails →
+    result must be `publish_failed`, not `skipped`. Without this, a
+    regression that silently swallows the degraded publish would mask
+    a "no check-run at all" production state as a benign "skipped"."""
+    # Make the diff fetch raise so we enter the _publish_degraded path.
+    def _fetch_raises(*a, **kw):
+        raise httpx.ConnectError("github down")
+
+    def _post_raises(*a, **kw):
+        raise httpx.ConnectError("checks API also down")
+
+    monkeypatch.setattr(cr_dispatch, "post_check_run", _post_raises)
+
+    with patch("httpx.get", side_effect=_fetch_raises):
+        out = cr_dispatch.dispatch_code_review(_payload(), blocking=False)
+
+    assert out["result"] == "publish_failed"
+
+
+def test_blocking_mode_failure_produces_request_changes(monkeypatch):
+    """The ONLY path that actually blocks a merge:
+    mode=blocking + evaluation.conclusion=failure →
+    (check.conclusion=failure, review.event=REQUEST_CHANGES).
+    Advisory + degraded tests cover the other branches; this is the
+    one that makes blocking-mode mean something."""
+    llm = LlmReviewResponse(
+        kind="reviewed",
+        findings=(LlmFinding(
+            path="src/x.py", line=2, rule="critical-rule",
+            severity="critical", message="secret leak",  # type: ignore[arg-type]
+        ),),
+        backend_used=Backend.POOLSIDE,
+    )
+    posted_check, posted_review = [], []
+    monkeypatch.setattr(cr_dispatch, "review_diff", lambda *a, **kw: llm)
+    monkeypatch.setattr(
+        cr_dispatch, "post_check_run",
+        lambda *a, **kw: posted_check.append(kw.get("result") or a[3]) or {},
+    )
+    monkeypatch.setattr(
+        cr_dispatch, "post_review",
+        lambda *a, **kw: posted_review.append(kw["result"]) or {},
+    )
+
+    with patch("httpx.get", return_value=_diff_response()):
+        out = cr_dispatch.dispatch_code_review(_payload(), blocking=True)
+
+    assert posted_check[0].conclusion == "failure"
+    assert posted_review[0].event == "REQUEST_CHANGES"
+    assert out["result"] == "fail"
+
+
+def test_resolve_result_publish_failed_wins_over_skipped():
+    """When check-run publish fails AND the evaluation is degraded
+    (e.g. all_failed LLM), publish_failed must win. Operator needs to
+    see the publish failure (production-visible) over the skip reason
+    (already implied by neutral conclusion)."""
+    from personas.code_reviewer.persona import CodeReviewEvaluation
+    degraded = CodeReviewEvaluation(
+        findings=(), conclusion="neutral", degraded_reason="all_failed",
+    )
+    assert cr_dispatch._resolve_result(
+        degraded, check_publish_failed=True,
+    ) == "publish_failed"
+
+
 def test_dispatch_fetches_diff_with_diff_accept_header(monkeypatch):
     """Confirms the GH API call uses `Accept: application/vnd.github.diff`
     so we get the unified-diff body rather than the JSON metadata."""
