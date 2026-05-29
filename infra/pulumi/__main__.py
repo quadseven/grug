@@ -151,11 +151,12 @@ webhook = lambda_service.create(
     ecr_repo=webhook_ecr,
     image_tag=webhook_image_tag,
     secrets=secrets,
-    # cf_secret.ssm_parameter is `aws.ssm.Parameter` (Pulumi-managed
-    # resource) where the other entries are `GetParameterResult` (sync
-    # data lookups). Both expose `.arn` and `.name`, and the consuming
-    # IAM policy at lambda_service.py:104 already wraps the list in
-    # `Output.all(...).apply()`, so Output[str] arns resolve correctly.
+    # cf_secret.ssm_parameter is `aws.ssm.Parameter` (Pulumi resource)
+    # while the others are `GetParameterResult` (sync data lookup). Both
+    # expose `.arn` and `.name`, and the consuming IAM policy in
+    # lambda_service already wraps the arn list in `Output.all(...).apply()`,
+    # so Output[str] arns resolve correctly. Issue #235 tracks tightening
+    # the type contract via a structural Protocol.
     extra_ssm_secrets=[_dd_api_key, cf_secret.ssm_parameter],
     # NOTE: DD extension is BAKED into the Lambda container image
     # (services/webhook/Dockerfile.lambda copies from
