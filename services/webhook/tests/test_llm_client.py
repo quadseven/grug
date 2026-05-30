@@ -965,6 +965,23 @@ def test_judge_unparseable_response_logs_warning(monkeypatch, caplog) -> None:
     assert any("judge_verdicts_unparseable" in r.message for r in caplog.records)
 
 
+def test_judge_unparseable_log_redacts_secrets(monkeypatch, caplog) -> None:
+    """The drop-path log captures raw judge content — which (the judge
+    saw the diff) may echo a secret. It MUST route through
+    `_redact_secrets` before landing in DD logs, same as the span."""
+    _capture_llmobs(monkeypatch)
+    # 200 + non-JSON content that contains a fake AWS key.
+    leaky = "prose not json AKIAIOSFODNN7EXAMPLE trailing"
+    response = httpx.Response(200, json=_openai_json_response(leaky))
+    fr = [{"rule_name": "r", "file": "x.py", "line": 2, "message": "m"}]
+    with caplog.at_level("WARNING"):
+        with patch.object(httpx, "post", return_value=response):
+            lc.judge_findings(fr, [_hunk()], installation_id=1)
+    rec = next(r for r in caplog.records if r.message == "judge_verdicts_unparseable")
+    assert "AKIAIOSFODNN7EXAMPLE" not in rec.__dict__["raw"]
+    assert "[REDACTED:aws-access-key]" in rec.__dict__["raw"]
+
+
 def test_judge_partial_drop_logs_count(monkeypatch, caplog) -> None:
     """Some verdicts valid, some malformed → logged drop count so a
     creeping malformation rate is visible."""
