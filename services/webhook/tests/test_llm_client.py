@@ -1107,6 +1107,37 @@ def test_judge_empty_content_on_200_logs_warning(monkeypatch, caplog) -> None:
     assert any("judge_empty_content" in r.message for r in caplog.records)
 
 
+def test_submit_reaction_annotation_maps_human_verdict(monkeypatch) -> None:
+    """A developer reaction → `human_verdict` categorical eval (distinct
+    label from the judge's is_real_bug), attached to the review span."""
+    eval_calls: list[dict] = []
+    monkeypatch.setattr(
+        lc, "_llmobs_submit_evaluation", lambda **kw: eval_calls.append(kw),
+    )
+    lc.submit_reaction_annotation(
+        verdict="false_positive",
+        review_span_context={"span_id": "s", "trace_id": "t"},
+        tags={"rule_name": "r"},
+    )
+    assert len(eval_calls) == 1
+    call = eval_calls[0]
+    assert call["label"] == "human_verdict"
+    assert call["metric_type"] == "categorical"
+    assert call["value"] == "false_positive"
+    assert call["span"] == {"span_id": "s", "trace_id": "t"}
+
+
+def test_submit_reaction_annotation_skips_when_no_span(monkeypatch) -> None:
+    eval_calls: list[dict] = []
+    monkeypatch.setattr(
+        lc, "_llmobs_submit_evaluation", lambda **kw: eval_calls.append(kw),
+    )
+    lc.submit_reaction_annotation(
+        verdict="confirmed", review_span_context=None, tags={},
+    )
+    assert eval_calls == []
+
+
 def test_submit_finding_evaluation_skips_when_no_span_context(monkeypatch) -> None:
     """No review span context (review degraded / span export failed) →
     can't attach an eval; skip silently rather than crash."""

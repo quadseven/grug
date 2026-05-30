@@ -267,3 +267,109 @@ def test_set_repo_config_blocking_mode_round_trips(_ddb_table):
     )
     cfg = mod.get_repo_config(1, 42)
     assert cfg["code_reviewer_blocking"] is True
+
+
+# Elder reaction-poll comment records (#245a)
+
+
+def test_put_then_list_comment_record(_ddb_table):
+    """A Grug-posted inline comment is persisted so the reaction poller
+    can later read its reactions + attribute the annotation to the
+    review span."""
+    mod = _ddb_table
+    mod.put_comment_record(
+        install_id=1, comment_id=555, repo="o/r", pr_number=7,
+        review_span_context={"trace_id": "t1", "span_id": "s1"},
+        finding_tags={"rule_name": "null-deref", "file": "x.py", "line": "2"},
+    )
+    recs = mod.list_comment_records(1)
+    assert len(recs) == 1
+    r = recs[0]
+    assert r["comment_id"] == 555
+    assert r["repo"] == "o/r"
+    assert r["pr_number"] == 7
+    assert r["review_span_context"] == {"trace_id": "t1", "span_id": "s1"}
+    assert r["finding_tags"]["rule_name"] == "null-deref"
+    # last_verdict starts unset — nothing submitted yet (dedup baseline).
+    assert r["last_verdict"] is None
+
+
+def test_list_comment_records_scoped_to_install(_ddb_table):
+    """Comment records are listed per-install; another install's records
+    must not leak into the poll batch."""
+    mod = _ddb_table
+    mod.put_comment_record(
+        install_id=1, comment_id=1, repo="o/r", pr_number=1,
+        review_span_context={"trace_id": "t", "span_id": "s"}, finding_tags={},
+    )
+    mod.put_comment_record(
+        install_id=2, comment_id=2, repo="o/r", pr_number=1,
+        review_span_context={"trace_id": "t", "span_id": "s"}, finding_tags={},
+    )
+    assert [r["comment_id"] for r in mod.list_comment_records(1)] == [1]
+    assert [r["comment_id"] for r in mod.list_comment_records(2)] == [2]
+
+
+def test_put_comment_record_sets_ttl(_ddb_table):
+    """Records carry a `ttl` epoch ~30 days out so DDB auto-expires them
+    (the deploy slice enables table TTL) — bounds the poll partition as
+    PRs close."""
+    import time as _time
+    mod = _ddb_table
+    before = int(_time.time())
+    mod.put_comment_record(
+        install_id=1, comment_id=1, repo="o/r", pr_number=1,
+        review_span_context={"trace_id": "t", "span_id": "s"}, finding_tags={},
+    )
+    table = boto3.resource("dynamodb", region_name="us-east-1").Table("grug-main-test")
+    item = table.get_item(Key={"PK": "INST#1", "SK": "CRCOMMENT#1"})["Item"]
+    ttl = int(item["ttl"])
+    # ~30 days out (allow a generous window for clock + test slowness).
+    assert before + 29 * 86400 < ttl < before + 31 * 86400
+
+
+def test_list_comment_records_paginates(_ddb_table, monkeypatch):
+    """list_comment_records must follow LastEvaluatedKey — a single DDB
+    page caps at 1MB, so a busy install would silently truncate the
+    poll batch without the pagination loop."""
+    mod = _ddb_table
+    # Two records; stub _table.query to return them across TWO pages so
+    # the LastEvaluatedKey loop is exercised regardless of real sizes.
+    real_items = [
+        {"PK": "INST#1", "SK": "CRCOMMENT#1", "comment_id": 1, "repo": "o/r",
+         "pr_number": 1, "review_span_context": {}, "finding_tags": {}},
+        {"PK": "INST#1", "SK": "CRCOMMENT#2", "comment_id": 2, "repo": "o/r",
+         "pr_number": 1, "review_span_context": {}, "finding_tags": {}},
+    ]
+    pages = [
+        {"Items": real_items[:1], "LastEvaluatedKey": {"PK": "INST#1", "SK": "CRCOMMENT#1"}},
+        {"Items": real_items[1:]},  # no LastEvaluatedKey → loop ends
+    ]
+    calls = {"n": 0}
+
+    def fake_query(**kwargs):
+        i = calls["n"]
+        calls["n"] += 1
+        # Second call must carry the ExclusiveStartKey from page 1.
+        if i == 1:
+            assert kwargs.get("ExclusiveStartKey") == {"PK": "INST#1", "SK": "CRCOMMENT#1"}
+        return pages[i]
+
+    monkeypatch.setattr(mod._table, "query", fake_query)
+    recs = mod.list_comment_records(1)
+    assert [r["comment_id"] for r in recs] == [1, 2]
+    assert calls["n"] == 2  # both pages fetched
+
+
+def test_update_comment_record_reaction_dedup_baseline(_ddb_table):
+    """Recording the last-submitted verdict is the dedup baseline — the
+    poller compares the current reaction against it and only submits on
+    change."""
+    mod = _ddb_table
+    mod.put_comment_record(
+        install_id=1, comment_id=9, repo="o/r", pr_number=1,
+        review_span_context={"trace_id": "t", "span_id": "s"}, finding_tags={},
+    )
+    mod.update_comment_record_reaction(install_id=1, comment_id=9, verdict="false_positive")
+    rec = mod.list_comment_records(1)[0]
+    assert rec["last_verdict"] == "false_positive"

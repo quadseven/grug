@@ -934,3 +934,38 @@ def submit_finding_evaluation(
         tags=tags,
         reasoning=reasoning,
     )
+
+
+# Human ground-truth label (#245) — sourced from a developer's 👍/👎
+# reaction on a Grug inline comment, NOT from the LLM judge. Distinct
+# label so DD can compare the human verdict against the judge's
+# `is_real_bug` (calibrates the judge). Categorical, same out-of-band
+# attach to the review span.
+_REACTION_EVAL_LABEL = "human_verdict"
+
+# Canonical verdict vocabulary, defined here (the shared-Literal home
+# alongside `Severity`/`PrContext`) so both the persona reaction engine
+# and this DD seam reference one source. The exact strings are the DD
+# `human_verdict` facet values — a typo would split the facet.
+ReactionVerdict = Literal["confirmed", "false_positive"]
+
+
+def submit_reaction_annotation(
+    *,
+    verdict: ReactionVerdict,
+    review_span_context: Optional[dict],
+    tags: dict[str, str],
+) -> None:
+    """Submit one `human_verdict` annotation to DD LLM Obs from a
+    developer reaction, attached to the review span that produced the
+    finding. `verdict` is "confirmed" (👍) or "false_positive" (👎).
+    No-op when `review_span_context` is None — nowhere to attach."""
+    if review_span_context is None:
+        return
+    _llmobs_submit_evaluation(
+        label=_REACTION_EVAL_LABEL,
+        metric_type="categorical",
+        value=verdict,
+        span=review_span_context,
+        tags=tags,
+    )
