@@ -518,8 +518,10 @@ def review_diff(
             findings, model, err = _parse_response(resp)
             # Annotate AFTER the response is parsed so we capture the
             # raw content + token counts. resp.json() was already
-            # consumed inside _parse_response; re-call it here for the
-            # span input — httpx caches the parsed body so this is cheap.
+            # consumed inside _parse_response; re-call here for the
+            # span input. httpx.Response.json() re-parses every call,
+            # but review response bodies are small — re-parse cost is
+            # negligible vs the LLM round-trip we just paid.
             try:
                 body = resp.json() if resp.status_code == 200 else {}
             except (ValueError, json.JSONDecodeError):
