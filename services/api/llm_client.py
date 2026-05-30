@@ -68,6 +68,15 @@ except ImportError:  # pragma: no cover — local dev without ddtrace
     def _llmobs_annotate(**kwargs: Any) -> None:
         return None
 
+    # Loud signal so a layer-drift / partial-install in Lambda doesn't
+    # silently turn off DD LLM Obs. AWS_LAMBDA_FUNCTION_NAME is the
+    # canonical Lambda-environment marker; in local dev it's unset.
+    if os.environ.get("AWS_LAMBDA_FUNCTION_NAME"):
+        log.warning(
+            "llmobs_import_failed_falling_back_to_noop",
+            extra={"lambda_fn": os.environ["AWS_LAMBDA_FUNCTION_NAME"]},
+        )
+
 _LLMOBS_NAME = "elder_code_review"
 _LLMOBS_HEAD_SHA_TAG_LEN = 8  # truncated to keep tag cardinality bounded
 
@@ -514,6 +523,19 @@ def review_diff(
             try:
                 body = resp.json() if resp.status_code == 200 else {}
             except (ValueError, json.JSONDecodeError):
+                # The first parse succeeded (otherwise err would be
+                # truthy and we'd skip the body fields); a re-parse
+                # failure here means httpx cache mutation or a real
+                # divergence. Log so DD can alert on the rate —
+                # silently emitting `kind=reviewed` with empty
+                # content would undercount token cost in dashboards.
+                log.warning(
+                    "llm_body_reparse_failed",
+                    extra={
+                        "backend": backend.value,
+                        "status_code": resp.status_code,
+                    },
+                )
                 body = {}
             content = ""
             if isinstance(body, dict):
