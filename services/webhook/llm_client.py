@@ -35,6 +35,7 @@ from typing import Any, Callable, Literal, Optional, TypedDict, get_args
 
 import httpx
 
+from code_review_prompt import build_system_prompt
 from secrets_loader import get_openrouter_api_key, get_poolside_api_key
 
 log = logging.getLogger(f"{os.getenv('DD_SERVICE', 'grug')}.llm_client")
@@ -338,15 +339,11 @@ def select_backend(installation_id: int) -> Backend:
     return Backend.POOLSIDE if installation_id % 2 == 0 else Backend.OPENROUTER
 
 
-_SYSTEM_PROMPT = (
-    "You are a senior code reviewer for the Grug bot. Review the supplied "
-    "diff hunks and return JSON of shape "
-    '{"findings": [{"path": str, "line": int, "rule": str, "severity": '
-    '"low"|"medium"|"high"|"critical", "message": str}]}. '
-    "Only flag concrete, actionable bugs (silent failures, secret leakage, "
-    "obvious correctness errors). If the diff has no issues, return "
-    '{"findings": []}. Do not include prose outside the JSON object.'
-)
+# Built once at import from the structured rule library (#188). The
+# placeholder one-paragraph prompt is gone — the rule set + good/bad
+# examples live in code_review_prompt.py (a sibling module, so no
+# import cycle) for A/B testing without touching the dispatch path.
+_SYSTEM_PROMPT = build_system_prompt()
 
 
 def _build_messages(hunks: list[Hunk]) -> list[dict[str, str]]:
