@@ -124,16 +124,23 @@ def _inline_comment_body(f: Finding) -> str:
 
 
 def _resolve_result(
-    evaluation: CodeReviewEvaluation, *, check_publish_failed: bool,
+    evaluation: CodeReviewEvaluation,
+    *,
+    check_publish_failed: bool,
+    review_publish_failed: bool = False,
 ) -> PersonaResultStr:
     """Pick the per-persona result string. Symmetric twin of
     `_publish_shape` (publish state ↔ verdict mapping). Centralising
     avoids the drift class where check-run says one thing and the
-    persona result says another."""
-    if check_publish_failed:
-        # Check-run is the load-bearing GH surface (the one that flips
-        # mergeability under blocking mode). If it failed, the operator
-        # needs to see this regardless of the underlying evaluation.
+    persona result says another.
+
+    Either publish surface failing → `publish_failed`. The
+    `code_reviewer_dispatched` log uses this result; without
+    consulting `review_publish_failed`, an inline-comment publish 5xx
+    would let the log fire with `result="pass"` while comments never
+    reached GitHub — DD dashboards would overstate success rate.
+    """
+    if check_publish_failed or review_publish_failed:
         return "publish_failed"
     if evaluation.degraded_reason:
         return "skipped"
@@ -284,6 +291,7 @@ def dispatch_code_review(
         check_publish_failed = True
         # Continue to attempt the review post — independent surface.
 
+    review_publish_failed = False
     review_result = _build_review_result(
         evaluation, head_sha=head_sha, event=event,
     )
@@ -305,14 +313,40 @@ def dispatch_code_review(
                     "kind": type(e).__name__,
                 },
             )
+            review_publish_failed = True
 
+    result = _resolve_result(
+        evaluation,
+        check_publish_failed=check_publish_failed,
+        review_publish_failed=review_publish_failed,
+    )
+    # Structured log carries everything needed to verify the persona
+    # ran end-to-end on a real PR (operator AC). Backend + model
+    # attribution lets DD LLM Obs slice metrics by which LLM produced
+    # the verdict; degraded_reason correlates dispatch volume with
+    # backend health.
+    log.info(
+        "code_reviewer_dispatched",
+        extra={
+            "installation_id": installation_id,
+            "pr": f"{owner}/{repo_name}#{pull_number}",
+            "head_sha": head_sha[:8],
+            "backend": (
+                llm_response.backend_used.value
+                if llm_response.backend_used is not None else None
+            ),
+            "model": llm_response.model_name,
+            "findings_count": len(evaluation.findings),
+            "dropped_hallucinations": evaluation.dropped_hallucinations,
+            "degraded_reason": evaluation.degraded_reason,
+            "result": result,
+        },
+    )
     # Result shape mirrors TPM's `{persona, result}` so dispatcher can
     # treat both uniformly. The outer dispatcher wraps with `status`.
     return {
         "persona": "code_reviewer",
-        "result": _resolve_result(
-            evaluation, check_publish_failed=check_publish_failed,
-        ),
+        "result": result,
     }
 
 
