@@ -267,3 +267,58 @@ def test_set_repo_config_blocking_mode_round_trips(_ddb_table):
     )
     cfg = mod.get_repo_config(1, 42)
     assert cfg["code_reviewer_blocking"] is True
+
+
+# Elder reaction-poll comment records (#245a)
+
+
+def test_put_then_list_comment_record(_ddb_table):
+    """A Grug-posted inline comment is persisted so the reaction poller
+    can later read its reactions + attribute the annotation to the
+    review span."""
+    mod = _ddb_table
+    mod.put_comment_record(
+        install_id=1, comment_id=555, repo="o/r", pr_number=7,
+        review_span_context={"trace_id": "t1", "span_id": "s1"},
+        finding_tags={"rule_name": "null-deref", "file": "x.py", "line": "2"},
+    )
+    recs = mod.list_comment_records(1)
+    assert len(recs) == 1
+    r = recs[0]
+    assert r["comment_id"] == 555
+    assert r["repo"] == "o/r"
+    assert r["pr_number"] == 7
+    assert r["review_span_context"] == {"trace_id": "t1", "span_id": "s1"}
+    assert r["finding_tags"]["rule_name"] == "null-deref"
+    # last_verdict starts unset — nothing submitted yet (dedup baseline).
+    assert r["last_verdict"] is None
+
+
+def test_list_comment_records_scoped_to_install(_ddb_table):
+    """Comment records are listed per-install; another install's records
+    must not leak into the poll batch."""
+    mod = _ddb_table
+    mod.put_comment_record(
+        install_id=1, comment_id=1, repo="o/r", pr_number=1,
+        review_span_context={"trace_id": "t", "span_id": "s"}, finding_tags={},
+    )
+    mod.put_comment_record(
+        install_id=2, comment_id=2, repo="o/r", pr_number=1,
+        review_span_context={"trace_id": "t", "span_id": "s"}, finding_tags={},
+    )
+    assert [r["comment_id"] for r in mod.list_comment_records(1)] == [1]
+    assert [r["comment_id"] for r in mod.list_comment_records(2)] == [2]
+
+
+def test_update_comment_record_reaction_dedup_baseline(_ddb_table):
+    """Recording the last-submitted verdict is the dedup baseline — the
+    poller compares the current reaction against it and only submits on
+    change."""
+    mod = _ddb_table
+    mod.put_comment_record(
+        install_id=1, comment_id=9, repo="o/r", pr_number=1,
+        review_span_context={"trace_id": "t", "span_id": "s"}, finding_tags={},
+    )
+    mod.update_comment_record_reaction(install_id=1, comment_id=9, verdict="false_positive")
+    rec = mod.list_comment_records(1)[0]
+    assert rec["last_verdict"] == "false_positive"

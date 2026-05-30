@@ -1,0 +1,138 @@
+# MIRRORED — sibling at services/api/personas/code_reviewer/reactions.py; keep in lockstep. See docs/adr/0001-mirror-with-rule-of-three-deferral.md.
+"""Reaction-poll engine for the Elder persona (#245).
+
+The second of the two #190 quality-feedback loops: a developer's 👍/👎
+on a Grug inline review comment is the HUMAN ground-truth label that
+calibrates the LLM judge's `is_real_bug` guess. GitHub does not webhook
+comment reactions, so a scheduled poller (#245b) reads them via the
+reactions REST API and pipes the signal into DD LLM Obs as a
+`human_verdict` annotation attached to the review span.
+
+This module is the engine: classify reactions → verdict, poll a
+comment's reactions, and `poll_and_annotate` a batch with dedup. The
+scheduled trigger (Lambda + EventBridge) + the persist-on-publish
+wiring live in #245b — this layer is pure logic + GH/DD I/O, fully
+unit-testable.
+
+Dedup: each comment record carries `last_verdict` (the verdict last
+submitted to DD). We only submit when the current classification
+differs — so a 👎 that's been sitting for days doesn't re-submit every
+poll cycle, but a developer flipping 👎→👍 (changed their mind) does.
+"""
+from __future__ import annotations
+
+import logging
+import os
+from typing import Any, Callable, Literal, Optional
+
+import httpx
+
+from adapters.install_store import update_comment_record_reaction
+from llm_client import submit_reaction_annotation
+
+log = logging.getLogger(f"{os.getenv('DD_SERVICE', 'grug')}.persona.code_reviewer.reactions")
+
+ReactionVerdict = Literal["confirmed", "false_positive"]
+
+_GH_API = "https://api.github.com"
+_REACTIONS_TIMEOUT = 10
+
+
+def _classify_reactions(reactions: list[dict]) -> Optional[ReactionVerdict]:
+    """Map a comment's reactions to a single verdict, or None.
+
+    👎 (`-1`) → false_positive; 👍 (`+1`) → confirmed. When BOTH are
+    present, 👎 wins: a developer flagging a false positive is the
+    higher-value correction (it tells us the reviewer was wrong, which
+    is what prompt-optimization needs most). Non-thumbs reactions
+    (heart/rocket/eyes) carry no verdict signal → None.
+    """
+    contents = {r.get("content") for r in reactions}
+    if "-1" in contents:
+        return "false_positive"
+    if "+1" in contents:
+        return "confirmed"
+    return None
+
+
+def poll_comment_reactions(
+    install_token: str, owner: str, repo: str, comment_id: int,
+) -> list[dict]:
+    """GET the reactions on one PR review comment. Raises on transport /
+    HTTP error — the batch caller catches per-record so one failure
+    doesn't abort the cycle."""
+    resp = httpx.get(
+        f"{_GH_API}/repos/{owner}/{repo}/pulls/comments/{comment_id}/reactions",
+        headers={
+            "Authorization": f"Bearer {install_token}",
+            "Accept": "application/vnd.github+json",
+            "X-GitHub-Api-Version": "2022-11-28",
+        },
+        timeout=_REACTIONS_TIMEOUT,
+    )
+    resp.raise_for_status()
+    body = resp.json()
+    return body if isinstance(body, list) else []
+
+
+def poll_and_annotate(
+    records: list[dict[str, Any]],
+    *,
+    install_id: int,
+    fetch_token: Callable[[], str],
+) -> int:
+    """Poll reactions for each comment record and submit changed
+    verdicts to DD. Returns the count submitted.
+
+    Best-effort per-record: a single comment's poll failing (GH 5xx,
+    deleted comment) logs + continues — one bad comment must not abort
+    the whole poll cycle. `fetch_token` is a thunk so the caller owns
+    install-token acquisition (and we don't re-fetch per record beyond
+    what the thunk caches).
+    """
+    submitted = 0
+    for rec in records:
+        comment_id = rec["comment_id"]
+        span_context = rec.get("review_span_context")
+        if span_context is None:
+            # Review was degraded at publish — no span to attach an
+            # annotation to. Skip (the record shouldn't have been
+            # persisted, but tolerate it).
+            continue
+        try:
+            reactions = poll_comment_reactions(
+                fetch_token(), *rec["repo"].split("/", 1), comment_id,
+            )
+        except (httpx.HTTPStatusError, httpx.RequestError) as e:
+            log.warning(
+                "reaction_poll_failed",
+                extra={
+                    "install_id": install_id, "comment_id": comment_id,
+                    "kind": type(e).__name__,
+                },
+            )
+            continue
+        verdict = _classify_reactions(reactions)
+        if verdict is None:
+            continue
+        if verdict == rec.get("last_verdict"):
+            # Dedup: already submitted this verdict for this comment.
+            continue
+        submit_reaction_annotation(
+            verdict=verdict,
+            review_span_context=span_context,
+            tags=rec.get("finding_tags", {}),
+        )
+        update_comment_record_reaction(
+            install_id=install_id, comment_id=comment_id, verdict=verdict,
+        )
+        submitted += 1
+    log.info(
+        "reaction_poll_cycle",
+        extra={
+            "install_id": install_id,
+            "records": len(records),
+            "submitted": submitted,
+        },
+    )
+    return submitted
