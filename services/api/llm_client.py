@@ -697,6 +697,21 @@ _JUDGE_SYSTEM_PROMPT = (
 )
 
 
+class JudgeFindingRepr(TypedDict):
+    """Primitive finding shape the judge LLM call consumes. Defined here
+    (the lower layer) so `judge_findings` has a typed key contract
+    WITHOUT importing the persona `Finding` (layering: persona imports
+    down, never up). `total=True` — the persona producer
+    (`_finding_to_repr`) must supply every key, which type-checks the
+    producer↔`_build_judge_messages` consumer pair that previously
+    drifted silently behind `.get(..., '?')` defaults."""
+    rule_name: str
+    file: str
+    line: int
+    severity: str
+    message: str
+
+
 @dataclass(frozen=True, slots=True)
 class FindingJudgement:
     """One adjudicated finding. `finding_index` ties back to the caller's
@@ -710,7 +725,7 @@ class FindingJudgement:
 
 
 def _build_judge_messages(
-    findings_repr: list[dict], hunks: list[Hunk],
+    findings_repr: list[JudgeFindingRepr], hunks: list[Hunk],
 ) -> list[dict[str, str]]:
     """Compose the judge prompt: the diff hunks + a numbered finding list.
     `findings_repr` is a primitive list-of-dicts (NOT persona `Finding`)
@@ -759,7 +774,7 @@ def _parse_judge_verdicts(content: str) -> tuple[FindingJudgement, ...]:
 
 
 def judge_findings(
-    findings_repr: list[dict],
+    findings_repr: list[JudgeFindingRepr],
     hunks: list[Hunk],
     installation_id: int,
     pr_context: Optional[PrContext] = None,

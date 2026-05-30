@@ -25,6 +25,7 @@ from typing import Optional
 
 from llm_client import (
     FindingJudgement,
+    JudgeFindingRepr,
     PrContext,
     judge_findings,
     submit_finding_evaluation,
@@ -35,10 +36,12 @@ from personas.code_reviewer.persona import CodeReviewEvaluation, Finding
 log = logging.getLogger(f"{os.getenv('DD_SERVICE', 'grug')}.persona.code_reviewer.judge")
 
 
-def _finding_to_repr(f: Finding) -> dict:
-    """Persona Finding → primitive dict for the judge LLM call.
-    `llm_client` is a lower layer and must not import the persona
-    `Finding`, so the boundary is plain dicts."""
+def _finding_to_repr(f: Finding) -> JudgeFindingRepr:
+    """Persona Finding → primitive `JudgeFindingRepr` for the judge LLM
+    call. `llm_client` is a lower layer and must not import the persona
+    `Finding`; the TypedDict (defined down there) is the typed boundary,
+    so a key typo here fails type-check rather than degrading to `?` in
+    the judge prompt."""
     return {
         "rule_name": f.rule_name,
         "file": f.file,
