@@ -27,6 +27,7 @@ from __future__ import annotations
 import json
 import logging
 import os
+import re
 import time
 from dataclasses import dataclass, field
 from enum import Enum
@@ -79,6 +80,63 @@ except ImportError:  # pragma: no cover — local dev without ddtrace
 
 _LLMOBS_NAME = "elder_code_review"
 _LLMOBS_HEAD_SHA_TAG_LEN = 8  # truncated to keep tag cardinality bounded
+
+# Per-payload cap on input/output captured in LLM Obs spans. Bounded
+# because PR diffs can contain massive blobs (PEM files, lockfiles,
+# generated code) — without this, a single .env-touching PR could
+# persist KB of secrets in DD storage. 16 KB is large enough to keep
+# typical review context but small enough to bound exposure.
+_LLMOBS_PAYLOAD_TRUNC_BYTES = 16 * 1024
+
+# Best-effort redaction patterns applied BEFORE payloads leave the
+# process. Defense-in-depth atop DD's org-level sensitive data scanner
+# — the scanner runs on ingest, but we should not be shipping raw
+# secrets across the wire in the first place. Pattern order: anchored
+# format-specific first (AWS, GitHub, Slack), then the generic
+# "key=value" sweeps. False positives are acceptable; missing a real
+# secret is not.
+_SECRET_PATTERNS: tuple[tuple[re.Pattern[str], str], ...] = (
+    (re.compile(r"AKIA[0-9A-Z]{16}"), "[REDACTED:aws-access-key]"),
+    (re.compile(r"ghp_[A-Za-z0-9]{36,}"), "[REDACTED:github-pat]"),
+    (re.compile(r"ghs_[A-Za-z0-9]{36,}"), "[REDACTED:github-app-token]"),
+    (re.compile(r"github_pat_[A-Za-z0-9_]{82,}"), "[REDACTED:github-fine-grained-pat]"),
+    (re.compile(r"xox[baprs]-[A-Za-z0-9-]{10,}"), "[REDACTED:slack-token]"),
+    (re.compile(r"sk-[A-Za-z0-9]{32,}"), "[REDACTED:openai-style-key]"),
+    (re.compile(r"sk-or-v1-[A-Za-z0-9]{32,}"), "[REDACTED:openrouter-key]"),
+    (re.compile(r"-----BEGIN [A-Z ]*PRIVATE KEY-----[\s\S]*?-----END [A-Z ]*PRIVATE KEY-----"), "[REDACTED:pem-private-key]"),
+    # Generic `KEY=VALUE` env-var leak inside an added diff line.
+    # Min-length 8 catches `secret=hunter22` but not `key=42`; longer
+    # is too strict (real secrets like `secret12345` would slip).
+    (re.compile(
+        r'((?:password|passwd|secret|api[-_]?key|token|access[-_]?key)\s*[:=]\s*)["\']?[A-Za-z0-9_\-+/=]{8,}["\']?',
+        re.IGNORECASE,
+    ), r"\1[REDACTED:env-secret]"),
+)
+
+
+def _redact_secrets(text: str) -> str:
+    """Apply best-effort secret-pattern redaction. False positives are
+    acceptable (an `AKIA...`-shaped string in code that isn't an AWS
+    key still gets masked); missing a real secret is not. Patterns
+    target shapes most likely to appear in a PR diff: AWS/GH tokens,
+    Slack bot tokens, PEM private keys, `KEY=VALUE` env lines."""
+    for pattern, repl in _SECRET_PATTERNS:
+        text = pattern.sub(repl, text)
+    return text
+
+
+def _redact_payload(payload: Any) -> Any:
+    """Walk a payload (str | list-of-message-dicts | dict) and apply
+    `_redact_secrets` to every string value. Truncates each string to
+    `_LLMOBS_PAYLOAD_TRUNC_BYTES` AFTER redaction so a trailing PEM
+    fragment can't survive a mid-string cut."""
+    if isinstance(payload, str):
+        return _redact_secrets(payload)[:_LLMOBS_PAYLOAD_TRUNC_BYTES]
+    if isinstance(payload, list):
+        return [_redact_payload(item) for item in payload]
+    if isinstance(payload, dict):
+        return {k: _redact_payload(v) for k, v in payload.items()}
+    return payload
 
 
 class PrContext(TypedDict, total=False):
@@ -497,7 +555,7 @@ def review_diff(
                     extra={"backend": backend.value, "detail": str(e)},
                 )
                 _llmobs_annotate(
-                    span=span, input_data=messages,
+                    span=span, input_data=_redact_payload(messages),
                     metadata={"backend": backend.value, "error": "config"},
                     metrics={"latency_ms": _elapsed_ms(start_ns)},
                     tags=pr_tags,
@@ -510,7 +568,7 @@ def review_diff(
                     extra={"backend": backend.value, "kind": type(e).__name__},
                 )
                 _llmobs_annotate(
-                    span=span, input_data=messages,
+                    span=span, input_data=_redact_payload(messages),
                     metadata={"backend": backend.value, "error": type(e).__name__},
                     metrics={"latency_ms": _elapsed_ms(start_ns)},
                     tags=pr_tags,
@@ -547,8 +605,8 @@ def review_diff(
             usage_metrics = _extract_usage_metrics(body)
             _llmobs_annotate(
                 span=span,
-                input_data=messages,
-                output_data=content or None,
+                input_data=_redact_payload(messages),
+                output_data=_redact_payload(content) if content else None,
                 metadata={
                     "backend": backend.value,
                     "status_code": resp.status_code,
