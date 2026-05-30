@@ -74,6 +74,48 @@ def test_prompt_demands_json_only_no_prose():
     assert "prose" in prompt or "only" in prompt or "no text" in prompt
 
 
+def test_rule_post_init_rejects_bad_severity():
+    with pytest.raises(ValueError, match="severity"):
+        crp.ReviewRule(
+            name="x", bug_class="correctness", description="desc here long",
+            bad_example="b", good_example="g", severity="hgih",
+        )
+
+
+def test_rule_post_init_rejects_name_with_spaces():
+    with pytest.raises(ValueError, match="space-free"):
+        crp.ReviewRule(
+            name="has spaces", bug_class="correctness",
+            description="desc here long", bad_example="b", good_example="g",
+            severity="low",
+        )
+
+
+def test_rule_post_init_rejects_unknown_bug_class():
+    with pytest.raises(ValueError, match="taxonomy"):
+        crp.ReviewRule(
+            name="x", bug_class="made-up-class", description="desc here long",
+            bad_example="b", good_example="g", severity="low",
+        )
+
+
+def test_rule_post_init_rejects_empty_example():
+    with pytest.raises(ValueError, match="example"):
+        crp.ReviewRule(
+            name="x", bug_class="correctness", description="desc here long",
+            bad_example="b", good_example="   ", severity="low",
+        )
+
+
+def test_severity_set_matches_llm_client_no_drift():
+    """The prompt's local `_SEVERITIES` must equal llm_client's parser
+    set — a rule advertising a severity the parser would drop is a
+    silent calibration bug. (The two are separate today to avoid an
+    import cycle; this test is the guard until they share a leaf module.)"""
+    import llm_client
+    assert crp._SEVERITIES == llm_client._VALID_SEVERITIES
+
+
 def test_covers_core_audit_bug_classes():
     """AC names specific bug classes from the audit stages — spot-check
     the load-bearing ones are present by rule name or description."""
