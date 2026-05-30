@@ -23,16 +23,14 @@ from __future__ import annotations
 
 import logging
 import os
-from typing import Any, Callable, Literal, Optional
+from typing import Any, Callable, Optional
 
 import httpx
 
-from adapters.install_store import update_comment_record_reaction
-from llm_client import submit_reaction_annotation
+from adapters.install_store import CommentRecord, update_comment_record_reaction
+from llm_client import ReactionVerdict, submit_reaction_annotation
 
 log = logging.getLogger(f"{os.getenv('DD_SERVICE', 'grug')}.persona.code_reviewer.reactions")
-
-ReactionVerdict = Literal["confirmed", "false_positive"]
 
 _GH_API = "https://api.github.com"
 _REACTIONS_TIMEOUT = 10
@@ -76,7 +74,7 @@ def poll_comment_reactions(
 
 
 def poll_and_annotate(
-    records: list[dict[str, Any]],
+    records: list[CommentRecord],
     *,
     install_id: int,
     fetch_token: Callable[[], str],
@@ -99,9 +97,21 @@ def poll_and_annotate(
             # annotation to. Skip (the record shouldn't have been
             # persisted, but tolerate it).
             continue
+        # `partition` (not `split` + splat): a malformed persisted repo
+        # without a "/" would make `*split("/",1)` a 1-element splat →
+        # uncaught TypeError → aborts the whole batch, breaking the
+        # per-record best-effort contract. Guard + skip instead.
+        owner, sep, name = rec["repo"].partition("/")
+        if not sep:
+            log.warning(
+                "reaction_record_malformed_repo",
+                extra={"install_id": install_id, "comment_id": comment_id,
+                       "repo": rec["repo"]},
+            )
+            continue
         try:
             reactions = poll_comment_reactions(
-                fetch_token(), *rec["repo"].split("/", 1), comment_id,
+                fetch_token(), owner, name, comment_id,
             )
         except (httpx.HTTPStatusError, httpx.RequestError) as e:
             log.warning(

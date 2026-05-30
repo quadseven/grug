@@ -166,6 +166,22 @@ def test_poll_and_annotate_skips_record_without_span_context(monkeypatch, _patch
     assert submitted == []
 
 
+def test_poll_and_annotate_skips_malformed_repo_without_aborting(monkeypatch, _patch_store):
+    """A persisted record whose `repo` lacks a '/' must skip (logged),
+    not raise a TypeError that aborts the batch. The next record still
+    processes."""
+    submitted = _patch_annotate(monkeypatch)
+    bad = _record(comment_id=1)
+    bad["repo"] = "no-slash-here"
+    good = _record(comment_id=2)
+    with patch("httpx.get", return_value=_reactions_response(["-1"])):
+        n = cr_reactions.poll_and_annotate(
+            [bad, good], install_id=1, fetch_token=lambda: "tok",
+        )
+    assert n == 1  # only the well-formed record submitted
+    assert submitted[0]["verdict"] == "false_positive"
+
+
 def test_poll_comment_reactions_uses_reactions_endpoint(monkeypatch):
     """Confirm the GH reactions REST path + preview Accept header."""
     captured = {}

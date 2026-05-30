@@ -17,7 +17,7 @@ from __future__ import annotations
 import logging
 import os
 from datetime import datetime, timezone
-from typing import Any
+from typing import Any, NotRequired, Optional, TypedDict
 
 import boto3
 
@@ -337,6 +337,23 @@ def is_persona_enabled(install_id: int, repo_id: int, persona: str) -> bool:
 # annotation when the current reaction classification differs from it.
 
 
+class CommentRecord(TypedDict):
+    """A persisted Grug inline-comment, read by the reaction poller.
+
+    Defined in this adapter (the lowest layer) so the persona engine
+    imports the shape DOWN — same precedent as `JudgeFindingRepr` in
+    llm_client. `last_verdict` is `NotRequired` (absent until the first
+    reaction is polled) + a plain `Optional[str]`: the adapter persists
+    the verdict opaquely and stays agnostic of the `ReactionVerdict`
+    vocabulary (that lives in the LLM layer)."""
+    comment_id: int
+    repo: str
+    pr_number: int
+    review_span_context: Optional[dict]
+    finding_tags: dict
+    last_verdict: NotRequired[Optional[str]]
+
+
 def _comment_record_sk(comment_id: int | str) -> str:
     return f"CRCOMMENT#{comment_id}"
 
@@ -365,7 +382,7 @@ def put_comment_record(
     })
 
 
-def list_comment_records(install_id: int) -> list[dict[str, Any]]:
+def list_comment_records(install_id: int) -> list[CommentRecord]:
     """Return all Grug comment records for an install (the poll batch).
     Scoped to the install PK + `CRCOMMENT#` SK prefix so another
     install's records can't leak into the batch."""
@@ -378,7 +395,7 @@ def list_comment_records(install_id: int) -> list[dict[str, Any]]:
             ":sk": "CRCOMMENT#",
         },
     )
-    out: list[dict[str, Any]] = []
+    out: list[CommentRecord] = []
     for item in resp.get("Items", []):
         out.append({
             "comment_id": int(item["comment_id"]),

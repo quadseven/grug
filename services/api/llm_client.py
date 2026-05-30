@@ -943,10 +943,16 @@ def submit_finding_evaluation(
 # attach to the review span.
 _REACTION_EVAL_LABEL = "human_verdict"
 
+# Canonical verdict vocabulary, defined here (the shared-Literal home
+# alongside `Severity`/`PrContext`) so both the persona reaction engine
+# and this DD seam reference one source. The exact strings are the DD
+# `human_verdict` facet values — a typo would split the facet.
+ReactionVerdict = Literal["confirmed", "false_positive"]
+
 
 def submit_reaction_annotation(
     *,
-    verdict: str,
+    verdict: ReactionVerdict,
     review_span_context: Optional[dict],
     tags: dict[str, str],
 ) -> None:
