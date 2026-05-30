@@ -576,6 +576,55 @@ def test_review_diff_llmobs_span_handles_missing_usage(monkeypatch) -> None:
     assert metrics.get("output_tokens") is None
 
 
+def test_llmobs_span_annotate_called_exactly_once_per_backend_attempt(monkeypatch) -> None:
+    """Per backend attempt, the `with _llmobs_llm(...)` block must call
+    `_llmobs_annotate` exactly ONCE — no double-annotation across the
+    success/config-error/transport-error branches. Future refactors
+    adding an early `continue` could double-annotate; lock the count."""
+    monkeypatch.setattr(lc, "_RETRY_SLEEP", lambda s: None)
+    annotate_calls = _capture_llmobs(monkeypatch)
+    # Primary backend exhausts its 3 retries on timeout (3 httpx.post
+    # calls), then secondary backend succeeds.
+    seq: list = [
+        httpx.ReadTimeout("p1"), httpx.ReadTimeout("p2"), httpx.ReadTimeout("p3"),
+        httpx.Response(200, json=_openai_json_response('{"findings":[]}')),
+    ]
+    idx = {"n": 0}
+
+    def staged(*a, **kw):
+        i = idx["n"]; idx["n"] += 1
+        x = seq[i]
+        if isinstance(x, Exception): raise x
+        return x
+
+    with patch.object(httpx, "post", side_effect=staged):
+        review_diff([_hunk()], installation_id=1)
+
+    # Exactly 2 spans (one per backend attempt — primary timeout +
+    # secondary success). Not 4 (one per httpx.post retry) — the span
+    # wraps the whole `_call_backend`, not each retry.
+    assert len(annotate_calls) == 2
+
+
+def test_llmobs_tags_match_pr_context_keys(monkeypatch) -> None:
+    """Lock the tag-key set so a future `PrContext` field addition is
+    a deliberate edit to _llmobs_tags, not a silent drop. If PrContext
+    grows a `branch` key but _llmobs_tags doesn't, this test fails."""
+    annotate_calls = _capture_llmobs(monkeypatch)
+    response = httpx.Response(200, json=_openai_json_response('{"findings":[]}'))
+    with patch.object(httpx, "post", return_value=response):
+        review_diff(
+            [_hunk()], installation_id=42,
+            pr_context={
+                "installation_id": 42, "repo": "o/r", "pr_number": 1,
+                "head_sha": "abc123def456",
+            },
+        )
+    assert set(annotate_calls[0]["tags"].keys()) == {
+        "installation_id", "repo", "pr_number", "head_sha",
+    }
+
+
 def test_no_diff_short_circuit_does_not_emit_llmobs_span(monkeypatch) -> None:
     """Empty hunks short-circuit before any LLM call — no span should
     be emitted (no LLM call happened)."""
