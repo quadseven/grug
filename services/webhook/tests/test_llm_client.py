@@ -812,3 +812,310 @@ def test_no_diff_short_circuit_does_not_emit_llmobs_span(monkeypatch) -> None:
     out = review_diff([], installation_id=1)
     assert out.kind == "no_diff"
     assert annotate_calls == []
+
+
+def test_review_diff_carries_exported_span_context_on_success(monkeypatch) -> None:
+    """The review span is exported onto the response so the LLM-as-a-
+    judge (slice #190) can attach per-finding `is_real_bug` evaluations
+    to the exact span whose output produced the findings."""
+    _capture_llmobs(monkeypatch)
+    monkeypatch.setattr(
+        lc, "_llmobs_export", lambda span: {"span_id": "s1", "trace_id": "t1"},
+    )
+    response = httpx.Response(200, json=_openai_json_response('{"findings":[]}'))
+    with patch.object(httpx, "post", return_value=response):
+        out = review_diff([_hunk()], installation_id=1)
+    assert out.kind == "reviewed"
+    assert out.review_span_context == {"span_id": "s1", "trace_id": "t1"}
+
+
+# ---------------------------------------------------------------------------
+# LLM-as-a-judge (#190) — second LLM call scores each finding is_real_bug.
+# ---------------------------------------------------------------------------
+
+def test_judge_findings_makes_second_llm_call_and_parses_verdicts(monkeypatch) -> None:
+    """judge_findings sends the findings + diff to a second LLM call and
+    parses a verdicts array into FindingJudgement objects."""
+    _capture_llmobs(monkeypatch)
+    verdicts_json = (
+        '{"verdicts": ['
+        '{"index": 0, "is_real_bug": true, "reasoning": "real null deref"},'
+        '{"index": 1, "is_real_bug": false, "reasoning": "style nit, not a bug"}'
+        ']}'
+    )
+    response = httpx.Response(200, json=_openai_json_response(verdicts_json))
+    findings_repr = [
+        {"rule_name": "null-deref", "file": "x.py", "line": 2, "message": "m1"},
+        {"rule_name": "style", "file": "x.py", "line": 3, "message": "m2"},
+    ]
+    with patch.object(httpx, "post", return_value=response):
+        out = lc.judge_findings(findings_repr, [_hunk()], installation_id=1)
+
+    assert len(out) == 2
+    assert out[0].finding_index == 0
+    assert out[0].is_real_bug is True
+    assert out[1].finding_index == 1
+    assert out[1].is_real_bug is False
+    assert "style nit" in out[1].reasoning
+
+
+def test_judge_findings_emits_its_own_llmobs_span(monkeypatch) -> None:
+    """The judge LLM call is itself traced (own span, name elder_judge)
+    so its prompt/latency/tokens/cost show up in DD distinct from the
+    review call."""
+    annotate_calls = _capture_llmobs(monkeypatch)
+    response = httpx.Response(200, json=_openai_json_response('{"verdicts":[]}'))
+    findings_repr = [{"rule_name": "r", "file": "x.py", "line": 2, "message": "m"}]
+    with patch.object(httpx, "post", return_value=response):
+        lc.judge_findings(findings_repr, [_hunk()], installation_id=1)
+    # judge call emits a span tagged judge=True (distinct from the
+    # review span) even when the LLM returns zero verdicts.
+    assert len(annotate_calls) == 1
+    assert annotate_calls[0]["metadata"]["judge"] is True
+
+
+def test_judge_findings_returns_empty_on_llm_failure(monkeypatch) -> None:
+    """If the judge LLM call fails (transport / parse), return empty —
+    the judge is best-effort observability, never blocks the review."""
+    monkeypatch.setattr(lc, "_RETRY_SLEEP", lambda s: None)
+    _capture_llmobs(monkeypatch)
+
+    def _timeout(*a, **kw):
+        raise httpx.ReadTimeout("judge backend down")
+
+    findings_repr = [{"rule_name": "r", "file": "x.py", "line": 2, "message": "m"}]
+    with patch.object(httpx, "post", side_effect=_timeout):
+        out = lc.judge_findings(findings_repr, [_hunk()], installation_id=1)
+    assert out == ()
+
+
+def test_judge_findings_skips_above_max_findings(monkeypatch, caplog) -> None:
+    """Cost guard: a firehose review (> _JUDGE_MAX_FINDINGS) skips the
+    judge LLM call entirely — no second-call token spend, logged so the
+    skip is visible."""
+    _capture_llmobs(monkeypatch)
+    too_many = [
+        {"rule_name": f"r{i}", "file": "x.py", "line": i + 1, "message": "m"}
+        for i in range(lc._JUDGE_MAX_FINDINGS + 1)
+    ]
+    with caplog.at_level("INFO"):
+        with patch.object(httpx, "post") as mock_post:
+            out = lc.judge_findings(too_many, [_hunk()], installation_id=1)
+    assert out == ()
+    mock_post.assert_not_called()
+    assert any(
+        "judge_skipped_too_many_findings" in r.message for r in caplog.records
+    )
+
+
+def test_judge_findings_at_max_findings_still_runs(monkeypatch) -> None:
+    """Exactly _JUDGE_MAX_FINDINGS findings is within budget — the
+    judge still runs (boundary is `>`, not `>=`)."""
+    _capture_llmobs(monkeypatch)
+    at_limit = [
+        {"rule_name": f"r{i}", "file": "x.py", "line": i + 1, "message": "m"}
+        for i in range(lc._JUDGE_MAX_FINDINGS)
+    ]
+    response = httpx.Response(200, json=_openai_json_response('{"verdicts":[]}'))
+    with patch.object(httpx, "post", return_value=response) as mock_post:
+        lc.judge_findings(at_limit, [_hunk()], installation_id=1)
+    mock_post.assert_called()
+
+
+def test_judge_findings_empty_findings_short_circuits(monkeypatch) -> None:
+    """No findings → no judge call (nothing to evaluate)."""
+    annotate_calls = _capture_llmobs(monkeypatch)
+    with patch.object(httpx, "post") as mock_post:
+        out = lc.judge_findings([], [_hunk()], installation_id=1)
+    # Empty findings is a legit "nothing to judge" — skip the LLM call.
+    assert out == ()
+    mock_post.assert_not_called()
+    assert annotate_calls == []
+
+
+def test_judge_findings_redacts_secrets_in_judge_span(monkeypatch) -> None:
+    """The judge prompt embeds the diff too — must redact before the
+    span leaves the process, same as the review span."""
+    annotate_calls = _capture_llmobs(monkeypatch)
+    response = httpx.Response(200, json=_openai_json_response('{"verdicts":[]}'))
+    leaky_hunk = lc.Hunk(path="x.py", body="+key='AKIAIOSFODNN7EXAMPLE'")
+    findings_repr = [{"rule_name": "r", "file": "x.py", "line": 1, "message": "m"}]
+    with patch.object(httpx, "post", return_value=response):
+        lc.judge_findings(findings_repr, [leaky_hunk], installation_id=1)
+    span_input = json.dumps(annotate_calls[0]["input_data"])
+    assert "AKIAIOSFODNN7EXAMPLE" not in span_input
+    assert "[REDACTED:aws-access-key]" in span_input
+
+
+def test_submit_finding_evaluation_calls_dd_seam(monkeypatch) -> None:
+    """submit_finding_evaluation maps is_real_bug → a DD LLM Obs
+    categorical evaluation attached to the review span."""
+    eval_calls: list[dict] = []
+    monkeypatch.setattr(
+        lc, "_llmobs_submit_evaluation", lambda **kw: eval_calls.append(kw),
+    )
+    span_ctx = {"span_id": "s1", "trace_id": "t1"}
+    lc.submit_finding_evaluation(
+        is_real_bug=True,
+        reasoning="real bug",
+        review_span_context=span_ctx,
+        tags={"rule_name": "null-deref", "file": "x.py", "line": "2"},
+    )
+    assert len(eval_calls) == 1
+    call = eval_calls[0]
+    assert call["label"] == "is_real_bug"
+    assert call["metric_type"] == "categorical"
+    assert call["value"] == "true"
+    assert call["span"] == span_ctx
+    assert call["tags"]["rule_name"] == "null-deref"
+    # reasoning surfaced for the annotation-queue reviewer.
+    assert call["reasoning"] == "real bug"
+
+
+def test_submit_finding_evaluation_false_maps_to_string_false(monkeypatch) -> None:
+    eval_calls: list[dict] = []
+    monkeypatch.setattr(
+        lc, "_llmobs_submit_evaluation", lambda **kw: eval_calls.append(kw),
+    )
+    lc.submit_finding_evaluation(
+        is_real_bug=False, reasoning="fp",
+        review_span_context={"span_id": "s"}, tags={},
+    )
+    assert eval_calls[0]["value"] == "false"
+
+
+def test_judge_unparseable_response_logs_warning(monkeypatch, caplog) -> None:
+    """A judge whose every response is non-JSON must be distinguishable
+    in logs from a judge that legitimately returned zero verdicts —
+    else the ground-truth dataset stops growing invisibly."""
+    _capture_llmobs(monkeypatch)
+    response = httpx.Response(200, json=_openai_json_response("not json prose"))
+    findings_repr = [{"rule_name": "r", "file": "x.py", "line": 2, "message": "m"}]
+    with caplog.at_level("WARNING"):
+        with patch.object(httpx, "post", return_value=response):
+            out = lc.judge_findings(findings_repr, [_hunk()], installation_id=1)
+    assert out == ()
+    assert any("judge_verdicts_unparseable" in r.message for r in caplog.records)
+
+
+def test_judge_unparseable_log_redacts_secrets(monkeypatch, caplog) -> None:
+    """The drop-path log captures raw judge content — which (the judge
+    saw the diff) may echo a secret. It MUST route through
+    `_redact_secrets` before landing in DD logs, same as the span."""
+    _capture_llmobs(monkeypatch)
+    # 200 + non-JSON content that contains a fake AWS key.
+    leaky = "prose not json AKIAIOSFODNN7EXAMPLE trailing"
+    response = httpx.Response(200, json=_openai_json_response(leaky))
+    fr = [{"rule_name": "r", "file": "x.py", "line": 2, "message": "m"}]
+    with caplog.at_level("WARNING"):
+        with patch.object(httpx, "post", return_value=response):
+            lc.judge_findings(fr, [_hunk()], installation_id=1)
+    rec = next(r for r in caplog.records if r.message == "judge_verdicts_unparseable")
+    assert "AKIAIOSFODNN7EXAMPLE" not in rec.__dict__["raw"]
+    assert "[REDACTED:aws-access-key]" in rec.__dict__["raw"]
+
+
+def test_judge_partial_drop_logs_count(monkeypatch, caplog) -> None:
+    """Some verdicts valid, some malformed → logged drop count so a
+    creeping malformation rate is visible."""
+    _capture_llmobs(monkeypatch)
+    verdicts = (
+        '{"verdicts": ['
+        '{"index": 0, "is_real_bug": true, "reasoning": "ok"},'
+        '{"garbage": "no index"},'
+        '"a string not a dict"'
+        ']}'
+    )
+    response = httpx.Response(200, json=_openai_json_response(verdicts))
+    fr = [{"rule_name": "r", "file": "x.py", "line": 2, "message": "m"}]
+    with caplog.at_level("WARNING"):
+        with patch.object(httpx, "post", return_value=response):
+            out = lc.judge_findings(fr, [_hunk()], installation_id=1)
+    assert len(out) == 1
+    rec = next(r for r in caplog.records if r.message == "judge_verdicts_partial_drop")
+    assert rec.__dict__["dropped"] == 2
+    assert rec.__dict__["kept"] == 1
+
+
+def test_judge_non_200_returns_empty_no_empty_content_warning(monkeypatch, caplog) -> None:
+    """A non-200 judge response (rate-limited / 5xx) → body={}, no
+    content, returns (). The `judge_empty_content` warning is gated on
+    status==200 so it must NOT fire here (that warning means '200 but
+    garbage', a different failure)."""
+    monkeypatch.setattr(lc, "_RETRY_SLEEP", lambda s: None)
+    _capture_llmobs(monkeypatch)
+    # 500 on both retries — _call_backend returns the 500 response.
+    response = httpx.Response(500, json={"error": "down"})
+    fr = [{"rule_name": "r", "file": "x.py", "line": 2, "message": "m"}]
+    with caplog.at_level("WARNING"):
+        with patch.object(httpx, "post", return_value=response):
+            out = lc.judge_findings(fr, [_hunk()], installation_id=1)
+    assert out == ()
+    assert not any("judge_empty_content" in r.message for r in caplog.records)
+
+
+def test_judge_verdicts_envelope_non_dict_logs_warning(monkeypatch, caplog) -> None:
+    """Judge returns valid JSON that decodes to a LIST (not a dict
+    envelope) → judge_verdicts_envelope_not_dict warning + ()."""
+    _capture_llmobs(monkeypatch)
+    response = httpx.Response(200, json=_openai_json_response('[1, 2, 3]'))
+    fr = [{"rule_name": "r", "file": "x.py", "line": 2, "message": "m"}]
+    with caplog.at_level("WARNING"):
+        with patch.object(httpx, "post", return_value=response):
+            out = lc.judge_findings(fr, [_hunk()], installation_id=1)
+    assert out == ()
+    assert any(
+        "judge_verdicts_envelope_not_dict" in r.message for r in caplog.records
+    )
+
+
+def test_judge_verdicts_not_a_list_logs_warning(monkeypatch, caplog) -> None:
+    """`{"verdicts": "a string"}` → verdicts-not-a-list warning + ()."""
+    _capture_llmobs(monkeypatch)
+    response = httpx.Response(200, json=_openai_json_response('{"verdicts": "nope"}'))
+    fr = [{"rule_name": "r", "file": "x.py", "line": 2, "message": "m"}]
+    with caplog.at_level("WARNING"):
+        with patch.object(httpx, "post", return_value=response):
+            out = lc.judge_findings(fr, [_hunk()], installation_id=1)
+    assert out == ()
+    assert any(
+        "judge_verdicts_not_a_list" in r.message for r in caplog.records
+    )
+
+
+def test_judge_200_with_non_json_body_does_not_crash(monkeypatch) -> None:
+    """200 but the envelope body itself isn't JSON (CF interstitial) →
+    resp.json() raises, caught, body={}, content empty, returns ()."""
+    _capture_llmobs(monkeypatch)
+    response = httpx.Response(200, text="<html>not json</html>")
+    fr = [{"rule_name": "r", "file": "x.py", "line": 2, "message": "m"}]
+    with patch.object(httpx, "post", return_value=response):
+        out = lc.judge_findings(fr, [_hunk()], installation_id=1)
+    assert out == ()
+
+
+def test_judge_empty_content_on_200_logs_warning(monkeypatch, caplog) -> None:
+    """200 + empty content (broken backend) logs judge_empty_content,
+    distinct from a transport failure or a legit empty verdict list."""
+    _capture_llmobs(monkeypatch)
+    # 200 envelope with no choices → content stays empty.
+    response = httpx.Response(200, json={"model": "x", "choices": []})
+    fr = [{"rule_name": "r", "file": "x.py", "line": 2, "message": "m"}]
+    with caplog.at_level("WARNING"):
+        with patch.object(httpx, "post", return_value=response):
+            lc.judge_findings(fr, [_hunk()], installation_id=1)
+    assert any("judge_empty_content" in r.message for r in caplog.records)
+
+
+def test_submit_finding_evaluation_skips_when_no_span_context(monkeypatch) -> None:
+    """No review span context (review degraded / span export failed) →
+    can't attach an eval; skip silently rather than crash."""
+    eval_calls: list[dict] = []
+    monkeypatch.setattr(
+        lc, "_llmobs_submit_evaluation", lambda **kw: eval_calls.append(kw),
+    )
+    lc.submit_finding_evaluation(
+        is_real_bug=True, reasoning="x",
+        review_span_context=None, tags={},
+    )
+    assert eval_calls == []
