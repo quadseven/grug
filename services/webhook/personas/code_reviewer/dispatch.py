@@ -306,13 +306,36 @@ def dispatch_code_review(
                 },
             )
 
+    result = _resolve_result(
+        evaluation, check_publish_failed=check_publish_failed,
+    )
+    # Structured log carries everything needed to verify the persona
+    # ran end-to-end on a real PR (operator AC). Backend + model
+    # attribution lets DD LLM Obs slice metrics by which LLM produced
+    # the verdict; degraded_reason correlates dispatch volume with
+    # backend health.
+    log.info(
+        "code_reviewer_dispatched",
+        extra={
+            "installation_id": installation_id,
+            "pr": f"{owner}/{repo_name}#{pull_number}",
+            "head_sha": head_sha[:8],
+            "backend": (
+                llm_response.backend_used.value
+                if llm_response.backend_used is not None else None
+            ),
+            "model": llm_response.model_name,
+            "findings_count": len(evaluation.findings),
+            "dropped_hallucinations": evaluation.dropped_hallucinations,
+            "degraded_reason": evaluation.degraded_reason,
+            "result": result,
+        },
+    )
     # Result shape mirrors TPM's `{persona, result}` so dispatcher can
     # treat both uniformly. The outer dispatcher wraps with `status`.
     return {
         "persona": "code_reviewer",
-        "result": _resolve_result(
-            evaluation, check_publish_failed=check_publish_failed,
-        ),
+        "result": result,
     }
 
 
