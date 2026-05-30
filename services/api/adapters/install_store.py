@@ -358,6 +358,14 @@ def _comment_record_sk(comment_id: int | str) -> str:
     return f"CRCOMMENT#{comment_id}"
 
 
+# Comment records auto-expire so the per-install CRCOMMENT# partition
+# doesn't grow unbounded as PRs close (the poller queries it every
+# cycle). 30 days comfortably outlives an open PR's active-review
+# window; the table's DDB TTL is enabled in the deploy slice (#247),
+# which reads this `ttl` attribute.
+_COMMENT_RECORD_TTL_DAYS = 30
+
+
 def put_comment_record(
     *,
     install_id: int,
@@ -370,7 +378,13 @@ def put_comment_record(
     """Persist a Grug inline-comment for later reaction polling. Idempotent
     upsert — re-posting the same comment_id overwrites (the span context
     + finding identity are stable per comment). `last_verdict` is left
-    unset (None) so the first poll that sees a reaction always submits."""
+    unset (None) so the first poll that sees a reaction always submits.
+    `ttl` (epoch seconds) lets DDB auto-expire the record ~30 days out
+    so the poll partition stays bounded as PRs close."""
+    ttl = int(
+        datetime.now(timezone.utc).timestamp()
+        + _COMMENT_RECORD_TTL_DAYS * 86400
+    )
     _table.put_item(Item={
         "PK": _inst_pk(install_id),
         "SK": _comment_record_sk(comment_id),
@@ -379,33 +393,44 @@ def put_comment_record(
         "pr_number": int(pr_number),
         "review_span_context": review_span_context,
         "finding_tags": finding_tags,
+        "ttl": ttl,
     })
 
 
 def list_comment_records(install_id: int) -> list[CommentRecord]:
     """Return all Grug comment records for an install (the poll batch).
     Scoped to the install PK + `CRCOMMENT#` SK prefix so another
-    install's records can't leak into the batch."""
-    resp = _table.query(
-        KeyConditionExpression=(
-            "PK = :pk AND begins_with(SK, :sk)"
-        ),
-        ExpressionAttributeValues={
+    install's records can't leak into the batch.
+
+    Paginates via `LastEvaluatedKey`: a single DDB query page caps at
+    1MB, so a busy install with many open-PR comments would silently
+    truncate the poll batch (some 👎 never seen) without this loop. The
+    TTL on write bounds the partition, but a burst can still exceed one
+    page between expirations."""
+    out: list[CommentRecord] = []
+    kwargs: dict[str, Any] = {
+        "KeyConditionExpression": "PK = :pk AND begins_with(SK, :sk)",
+        "ExpressionAttributeValues": {
             ":pk": _inst_pk(install_id),
             ":sk": "CRCOMMENT#",
         },
-    )
-    out: list[CommentRecord] = []
-    for item in resp.get("Items", []):
-        out.append({
-            "comment_id": int(item["comment_id"]),
-            "repo": item["repo"],
-            "pr_number": int(item["pr_number"]),
-            "review_span_context": item.get("review_span_context"),
-            "finding_tags": item.get("finding_tags", {}),
-            # None until the first reaction is polled + submitted.
-            "last_verdict": item.get("last_verdict"),
-        })
+    }
+    while True:
+        resp = _table.query(**kwargs)
+        for item in resp.get("Items", []):
+            out.append({
+                "comment_id": int(item["comment_id"]),
+                "repo": item["repo"],
+                "pr_number": int(item["pr_number"]),
+                "review_span_context": item.get("review_span_context"),
+                "finding_tags": item.get("finding_tags", {}),
+                # None until the first reaction is polled + submitted.
+                "last_verdict": item.get("last_verdict"),
+            })
+        last_key = resp.get("LastEvaluatedKey")
+        if not last_key:
+            break
+        kwargs["ExclusiveStartKey"] = last_key
     return out
 
 
