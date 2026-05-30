@@ -889,6 +889,39 @@ def test_judge_findings_returns_empty_on_llm_failure(monkeypatch) -> None:
     assert out == ()
 
 
+def test_judge_findings_skips_above_max_findings(monkeypatch, caplog) -> None:
+    """Cost guard: a firehose review (> _JUDGE_MAX_FINDINGS) skips the
+    judge LLM call entirely — no second-call token spend, logged so the
+    skip is visible."""
+    _capture_llmobs(monkeypatch)
+    too_many = [
+        {"rule_name": f"r{i}", "file": "x.py", "line": i + 1, "message": "m"}
+        for i in range(lc._JUDGE_MAX_FINDINGS + 1)
+    ]
+    with caplog.at_level("INFO"):
+        with patch.object(httpx, "post") as mock_post:
+            out = lc.judge_findings(too_many, [_hunk()], installation_id=1)
+    assert out == ()
+    mock_post.assert_not_called()
+    assert any(
+        "judge_skipped_too_many_findings" in r.message for r in caplog.records
+    )
+
+
+def test_judge_findings_at_max_findings_still_runs(monkeypatch) -> None:
+    """Exactly _JUDGE_MAX_FINDINGS findings is within budget — the
+    judge still runs (boundary is `>`, not `>=`)."""
+    _capture_llmobs(monkeypatch)
+    at_limit = [
+        {"rule_name": f"r{i}", "file": "x.py", "line": i + 1, "message": "m"}
+        for i in range(lc._JUDGE_MAX_FINDINGS)
+    ]
+    response = httpx.Response(200, json=_openai_json_response('{"verdicts":[]}'))
+    with patch.object(httpx, "post", return_value=response) as mock_post:
+        lc.judge_findings(at_limit, [_hunk()], installation_id=1)
+    mock_post.assert_called()
+
+
 def test_judge_findings_empty_findings_short_circuits(monkeypatch) -> None:
     """No findings → no judge call (nothing to evaluate)."""
     annotate_calls = _capture_llmobs(monkeypatch)

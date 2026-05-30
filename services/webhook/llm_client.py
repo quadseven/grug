@@ -60,7 +60,12 @@ try:  # pragma: no cover — import-time guard
         return _LLMObs.export_span(span=span)
 
     def _llmobs_submit_evaluation(**kwargs: Any) -> None:
-        _LLMObs.submit_evaluation_for(**kwargs)
+        # `submit_evaluation` (NOT the deprecated `submit_evaluation_for`,
+        # removed in ddtrace 4.0). The `span=` param takes the
+        # `{'span_id','trace_id'}` dict returned by `export_span` — the
+        # documented out-of-band attach: it lands the eval on the prior
+        # (closed) review span, no active-context requirement.
+        _LLMObs.submit_evaluation(**kwargs)
 except ImportError:  # pragma: no cover — local dev without ddtrace
 
     class _NoopSpan:
@@ -686,6 +691,14 @@ def review_diff(
 _LLMOBS_JUDGE_NAME = "elder_judge"
 _JUDGE_EVAL_LABEL = "is_real_bug"
 
+# Cost/latency guard. The judge is a SECOND full LLM call per review,
+# and its prompt scales with finding count. Above this threshold the PR
+# is firehose-noisy (a 40-finding review is rarely worth grading every
+# entry) and the judge call would bloat token cost + handler latency for
+# marginal ground-truth value. Skip the judge entirely above it — the
+# review itself is unaffected (already published).
+_JUDGE_MAX_FINDINGS = 25
+
 _JUDGE_SYSTEM_PROMPT = (
     "You are an adjudicator grading a code reviewer's findings to build a "
     "ground-truth dataset. For each numbered finding, decide whether it "
@@ -813,6 +826,15 @@ def judge_findings(
     separately from the review call.
     """
     if not findings_repr:
+        return ()
+    if len(findings_repr) > _JUDGE_MAX_FINDINGS:
+        # Cost guard — don't double the LLM spend grading a firehose
+        # review. Logged so the skip is visible (not silent), and the
+        # threshold can be tuned against observed cost.
+        log.info(
+            "judge_skipped_too_many_findings",
+            extra={"count": len(findings_repr), "max": _JUDGE_MAX_FINDINGS},
+        )
         return ()
 
     # WHY the backend loop here is NOT shared with review_diff's: the
