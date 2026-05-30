@@ -951,6 +951,55 @@ def test_submit_finding_evaluation_false_maps_to_string_false(monkeypatch) -> No
     assert eval_calls[0]["value"] == "false"
 
 
+def test_judge_unparseable_response_logs_warning(monkeypatch, caplog) -> None:
+    """A judge whose every response is non-JSON must be distinguishable
+    in logs from a judge that legitimately returned zero verdicts —
+    else the ground-truth dataset stops growing invisibly."""
+    _capture_llmobs(monkeypatch)
+    response = httpx.Response(200, json=_openai_json_response("not json prose"))
+    findings_repr = [{"rule_name": "r", "file": "x.py", "line": 2, "message": "m"}]
+    with caplog.at_level("WARNING"):
+        with patch.object(httpx, "post", return_value=response):
+            out = lc.judge_findings(findings_repr, [_hunk()], installation_id=1)
+    assert out == ()
+    assert any("judge_verdicts_unparseable" in r.message for r in caplog.records)
+
+
+def test_judge_partial_drop_logs_count(monkeypatch, caplog) -> None:
+    """Some verdicts valid, some malformed → logged drop count so a
+    creeping malformation rate is visible."""
+    _capture_llmobs(monkeypatch)
+    verdicts = (
+        '{"verdicts": ['
+        '{"index": 0, "is_real_bug": true, "reasoning": "ok"},'
+        '{"garbage": "no index"},'
+        '"a string not a dict"'
+        ']}'
+    )
+    response = httpx.Response(200, json=_openai_json_response(verdicts))
+    fr = [{"rule_name": "r", "file": "x.py", "line": 2, "message": "m"}]
+    with caplog.at_level("WARNING"):
+        with patch.object(httpx, "post", return_value=response):
+            out = lc.judge_findings(fr, [_hunk()], installation_id=1)
+    assert len(out) == 1
+    rec = next(r for r in caplog.records if r.message == "judge_verdicts_partial_drop")
+    assert rec.__dict__["dropped"] == 2
+    assert rec.__dict__["kept"] == 1
+
+
+def test_judge_empty_content_on_200_logs_warning(monkeypatch, caplog) -> None:
+    """200 + empty content (broken backend) logs judge_empty_content,
+    distinct from a transport failure or a legit empty verdict list."""
+    _capture_llmobs(monkeypatch)
+    # 200 envelope with no choices → content stays empty.
+    response = httpx.Response(200, json={"model": "x", "choices": []})
+    fr = [{"rule_name": "r", "file": "x.py", "line": 2, "message": "m"}]
+    with caplog.at_level("WARNING"):
+        with patch.object(httpx, "post", return_value=response):
+            lc.judge_findings(fr, [_hunk()], installation_id=1)
+    assert any("judge_empty_content" in r.message for r in caplog.records)
+
+
 def test_submit_finding_evaluation_skips_when_no_span_context(monkeypatch) -> None:
     """No review span context (review degraded / span export failed) →
     can't attach an eval; skip silently rather than crash."""
