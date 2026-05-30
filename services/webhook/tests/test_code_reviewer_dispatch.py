@@ -382,6 +382,90 @@ def test_dispatch_emits_structured_log_on_success(monkeypatch, caplog):
     assert extra.get("result") == "pass"
 
 
+def test_structured_log_handles_none_backend_without_attributeerror(monkeypatch, caplog):
+    """The conditional `backend_used.value if not None else None`
+    guards against an AttributeError on degraded responses where
+    `backend_used is None` (e.g. no_diff). This is the exact path
+    operators care about monitoring — a NoneType crash here would
+    silently break the degraded-backend log."""
+    llm = LlmReviewResponse(kind="no_diff")  # backend_used defaults None
+    monkeypatch.setattr(cr_dispatch, "review_diff", lambda *a, **kw: llm)
+    monkeypatch.setattr(cr_dispatch, "post_check_run", lambda *a, **kw: {})
+    monkeypatch.setattr(cr_dispatch, "post_review", lambda *a, **kw: {})
+
+    with caplog.at_level("INFO"):
+        with patch("httpx.get", return_value=_diff_response()):
+            cr_dispatch.dispatch_code_review(_payload(), blocking=False)
+
+    rec = next(
+        r for r in caplog.records if r.message == "code_reviewer_dispatched"
+    )
+    # backend is None when no LLM call ran.
+    assert rec.__dict__.get("backend") is None
+
+
+def test_structured_log_carries_dropped_hallucinations_count(monkeypatch, caplog):
+    """The `dropped_hallucinations` field on the log lets DD slice the
+    LLM hallucination rate per backend. A regression renaming the
+    attribute or substituting `len(llm_response.findings)` would
+    silently break that observability slice."""
+    llm = LlmReviewResponse(
+        kind="reviewed",
+        findings=(
+            LlmFinding(path="src/x.py", line=2, rule="real", severity="medium", message="m"),  # type: ignore[arg-type]
+            # Two hallucinations the filter will drop:
+            LlmFinding(path="src/x.py", line=9999, rule="ghost1", severity="low", message="m"),  # type: ignore[arg-type]
+            LlmFinding(path="absent.py", line=2, rule="ghost2", severity="low", message="m"),  # type: ignore[arg-type]
+        ),
+        backend_used=Backend.POOLSIDE,
+        model_name="laguna",
+    )
+    monkeypatch.setattr(cr_dispatch, "review_diff", lambda *a, **kw: llm)
+    monkeypatch.setattr(cr_dispatch, "post_check_run", lambda *a, **kw: {})
+    monkeypatch.setattr(cr_dispatch, "post_review", lambda *a, **kw: {})
+
+    with caplog.at_level("INFO"):
+        with patch("httpx.get", return_value=_diff_response()):
+            cr_dispatch.dispatch_code_review(_payload(), blocking=False)
+
+    rec = next(
+        r for r in caplog.records if r.message == "code_reviewer_dispatched"
+    )
+    assert rec.__dict__.get("dropped_hallucinations") == 2
+    # findings_count is the POST-drop kept count, not the raw LLM count.
+    assert rec.__dict__.get("findings_count") == 1
+
+
+def test_resolve_result_both_publishes_failed_returns_publish_failed():
+    """Both publish failures coalesce to a single `publish_failed` (not
+    double-counted, no separate `both_failed` state). Also covers the
+    `review_publish_failed=True` + `evaluation.passed=False` path —
+    `fail` must NOT mask the publish-failure signal."""
+    from personas.code_reviewer.persona import CodeReviewEvaluation, Finding
+    # Build an evaluation where evaluation.passed=False (a critical).
+    failing_eval = CodeReviewEvaluation(
+        findings=(Finding(
+            file="x.py", line=1, severity="critical", rule_name="c",
+            message="m", suggestion=None,
+        ),),
+        conclusion="failure",
+    )
+    out = cr_dispatch._resolve_result(
+        failing_eval,
+        check_publish_failed=True,
+        review_publish_failed=True,
+    )
+    assert out == "publish_failed"
+    # Single-publish-failure ALSO returns publish_failed (not "fail")
+    # even when verdict is failure.
+    out_review_only = cr_dispatch._resolve_result(
+        failing_eval,
+        check_publish_failed=False,
+        review_publish_failed=True,
+    )
+    assert out_review_only == "publish_failed"
+
+
 def test_dispatch_structured_log_carries_degraded_reason(monkeypatch, caplog):
     """When LLM all_failed → degraded_reason on the log so DD can
     correlate dispatch volume with backend health."""
