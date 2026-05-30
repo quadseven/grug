@@ -209,6 +209,32 @@ def test_dispatch_unparseable_diff_yields_neutral(monkeypatch):
     assert out["result"] == "skipped"
 
 
+def test_dispatch_review_publish_failure_returns_publish_failed(monkeypatch):
+    """Inline-review publish 5xx must surface as `publish_failed`, not
+    silently `pass`. Without this, DD dashboards would overstate
+    success — inline comments never reached GitHub yet the log fires
+    with result=pass and findings_count=N."""
+    llm = LlmReviewResponse(
+        kind="reviewed",
+        findings=(LlmFinding(
+            path="src/x.py", line=2, rule="x", severity="medium", message="m",  # type: ignore[arg-type]
+        ),),
+        backend_used=Backend.POOLSIDE,
+    )
+    monkeypatch.setattr(cr_dispatch, "review_diff", lambda *a, **kw: llm)
+    monkeypatch.setattr(cr_dispatch, "post_check_run", lambda *a, **kw: {})
+
+    def _raise(*a, **kw):
+        raise httpx.ConnectError("reviews API down")
+
+    monkeypatch.setattr(cr_dispatch, "post_review", _raise)
+
+    with patch("httpx.get", return_value=_diff_response()):
+        out = cr_dispatch.dispatch_code_review(_payload(), blocking=False)
+
+    assert out["result"] == "publish_failed"
+
+
 def test_dispatch_check_run_publish_failure_returns_publish_failed(monkeypatch):
     """Check-run is the load-bearing GH surface (flips mergeability in
     blocking mode). If it fails to publish, the persona result must be
