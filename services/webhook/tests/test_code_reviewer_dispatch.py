@@ -485,6 +485,59 @@ def test_dispatch_structured_log_carries_degraded_reason(monkeypatch, caplog):
     assert rec.__dict__.get("result") == "skipped"
 
 
+def test_dispatch_runs_judge_after_publish_with_review_span(monkeypatch):
+    """When the review carries a span context, the LLM-as-a-judge is
+    invoked AFTER publishing — with the evaluation, hunks, install id,
+    and the review's span context for eval attribution."""
+    llm = LlmReviewResponse(
+        kind="reviewed",
+        findings=(LlmFinding(
+            path="src/x.py", line=2, rule="r", severity="medium", message="m",  # type: ignore[arg-type]
+        ),),
+        backend_used=Backend.POOLSIDE,
+        review_span_context={"span_id": "rs1"},
+    )
+    monkeypatch.setattr(cr_dispatch, "review_diff", lambda *a, **kw: llm)
+    monkeypatch.setattr(cr_dispatch, "post_check_run", lambda *a, **kw: {})
+    monkeypatch.setattr(cr_dispatch, "post_review", lambda *a, **kw: {})
+
+    judge_calls: list[dict] = []
+    monkeypatch.setattr(
+        cr_dispatch, "run_judge",
+        lambda evaluation, hunks, **kw: judge_calls.append(kw),
+    )
+
+    with patch("httpx.get", return_value=_diff_response()):
+        cr_dispatch.dispatch_code_review(_payload(), blocking=False)
+
+    assert len(judge_calls) == 1
+    assert judge_calls[0]["review_span_context"] == {"span_id": "rs1"}
+    assert judge_calls[0]["pr_context"]["repo"] == "myorg/myrepo"
+
+
+def test_dispatch_judge_failure_does_not_change_result(monkeypatch):
+    """The judge is pure observability — even if run_judge raises (past
+    its own internal guard), the dispatch result must stand."""
+    llm = LlmReviewResponse(
+        kind="reviewed", findings=(), backend_used=Backend.POOLSIDE,
+        review_span_context={"span_id": "rs1"},
+    )
+    monkeypatch.setattr(cr_dispatch, "review_diff", lambda *a, **kw: llm)
+    monkeypatch.setattr(cr_dispatch, "post_check_run", lambda *a, **kw: {})
+    monkeypatch.setattr(cr_dispatch, "post_review", lambda *a, **kw: {})
+
+    def _boom(*a, **kw):
+        raise RuntimeError("judge exploded past its guard")
+
+    monkeypatch.setattr(cr_dispatch, "run_judge", _boom)
+
+    with patch("httpx.get", return_value=_diff_response()):
+        out = cr_dispatch.dispatch_code_review(_payload(), blocking=False)
+
+    # No findings → clean pass; judge explosion must not change it.
+    assert out["result"] == "pass"
+
+
 def test_dispatch_passes_pr_context_to_review_diff(monkeypatch):
     """The PR coords flow into review_diff(pr_context=...) so DD LLM
     Obs spans carry tags that filter by repo / PR / install. Without
