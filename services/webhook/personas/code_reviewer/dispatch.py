@@ -236,9 +236,7 @@ def dispatch_code_review(
             reason="fetch_or_parse_failed",
         )
 
-    # review_diff already swallows backend failures into discriminated
-    # `LlmReviewResponse.kind` values; no extra try needed. The
-    # `pr_context` dict flows into DD LLM Obs span tags so traces are
+    # `pr_context` flows into DD LLM Obs span tags so traces are
     # filterable by repo / PR / installation in the LLM Obs UI.
     llm_response: LlmReviewResponse = review_diff(
         _to_llm_hunks(hunks),

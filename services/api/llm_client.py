@@ -98,8 +98,7 @@ class PrContext(TypedDict, total=False):
 
 
 def _elapsed_ms(start_ns: int) -> int:
-    """Wall-clock elapsed in ms since `start_ns` (monotonic). Used for
-    LLM Obs latency metrics — `time.monotonic_ns` avoids clock-skew."""
+    """`time.monotonic_ns` avoids clock-skew during the span."""
     return (time.monotonic_ns() - start_ns) // 1_000_000
 
 # Per-backend endpoints + default models.
@@ -479,8 +478,11 @@ def review_diff(
     for backend in (primary, secondary):
         config = _BACKEND_CONFIGS[backend]
         # Open one LLM Obs span per backend attempt. Annotate on every
-        # exit path (success + failures) so DD captures latency tails
-        # and error rates per-backend.
+        # CAUGHT exit path (success + the three explicit `except` arms)
+        # so DD captures latency tails and per-backend error rates. A
+        # surprise exception escaping `_call_backend` would propagate
+        # without annotation — that's intentional (it's a bug worth
+        # seeing in Sentry, not a routine signal).
         start_ns = time.monotonic_ns()
         with _llmobs_llm(
             model_name=config.model,
@@ -516,21 +518,19 @@ def review_diff(
                 last_error = f"{backend.value}: {type(e).__name__}"
                 continue
             findings, model, err = _parse_response(resp)
-            # Annotate AFTER the response is parsed so we capture the
-            # raw content + token counts. resp.json() was already
-            # consumed inside _parse_response; re-call here for the
-            # span input. httpx.Response.json() re-parses every call,
-            # but review response bodies are small — re-parse cost is
-            # negligible vs the LLM round-trip we just paid.
+            # Annotate AFTER the response so we capture the raw content
+            # + token counts. httpx.Response.json() re-parses from the
+            # cached .content bytes; review response bodies are small,
+            # so the cost is negligible vs the LLM round-trip.
             try:
                 body = resp.json() if resp.status_code == 200 else {}
             except (ValueError, json.JSONDecodeError):
-                # The first parse succeeded (otherwise err would be
-                # truthy and we'd skip the body fields); a re-parse
-                # failure here means httpx cache mutation or a real
-                # divergence. Log so DD can alert on the rate —
-                # silently emitting `kind=reviewed` with empty
-                # content would undercount token cost in dashboards.
+                # Triggered when the first parse also failed (CF HTML
+                # interstitial, truncated body) OR — rarely — when
+                # the cache diverges. Either way the LLM Obs span
+                # would otherwise silently emit kind=reviewed with
+                # empty content and undercount DD token-cost
+                # dashboards.
                 log.warning(
                     "llm_body_reparse_failed",
                     extra={

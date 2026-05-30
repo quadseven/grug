@@ -625,6 +625,106 @@ def test_llmobs_tags_match_pr_context_keys(monkeypatch) -> None:
     }
 
 
+def test_llmobs_config_error_annotates_with_error_config(monkeypatch) -> None:
+    """_BackendConfigError path must annotate with metadata.error=`config`.
+    Without this signal DD dashboards see only transport errors and
+    can't tell `secret missing` from `backend down`."""
+    monkeypatch.setattr(lc, "_RETRY_SLEEP", lambda s: None)
+    monkeypatch.setattr(lc, "_load_poolside_key", lambda: "")
+    monkeypatch.setattr(lc, "_load_openrouter_key", lambda: "")
+    annotate_calls = _capture_llmobs(monkeypatch)
+
+    with patch.object(httpx, "post") as mock_post:
+        out = review_diff([_hunk()], installation_id=1)
+
+    assert out.kind == "all_failed"
+    mock_post.assert_not_called()
+    # Two backends each fail config check → 2 spans, both error=config.
+    assert len(annotate_calls) == 2
+    for call in annotate_calls:
+        assert call["metadata"].get("error") == "config"
+        # output_data absent on config error.
+        assert call.get("output_data") is None
+
+
+def test_llmobs_metadata_kind_parse_failed_on_200_with_bad_content(monkeypatch) -> None:
+    """When the LLM returns 200 + non-JSON content, the span metadata
+    must tag kind="parse_failed" (not "reviewed", not "http_error").
+    Locks the ternary order on the success-annotate path."""
+    annotate_calls = _capture_llmobs(monkeypatch)
+    # 200 envelope is valid JSON, but the message.content is not JSON.
+    response = httpx.Response(200, json=_openai_json_response("sorry I cannot"))
+    with patch.object(httpx, "post", return_value=response):
+        out = review_diff([_hunk()], installation_id=1)
+    assert out.kind == "parse_failed"
+    assert annotate_calls[0]["metadata"]["kind"] == "parse_failed"
+
+
+def test_llmobs_metadata_kind_http_error_on_non_200(monkeypatch) -> None:
+    """Non-200 status → metadata.kind="http_error" (not "parse_failed"
+    or "reviewed"). DD dashboards aggregate by this facet — a
+    mislabel would undercount backend health rate."""
+    monkeypatch.setattr(lc, "_RETRY_SLEEP", lambda s: None)
+    annotate_calls = _capture_llmobs(monkeypatch)
+    # 500 with no retryable status; both backends will return 500.
+    response = httpx.Response(500, json={"error": "down"})
+    with patch.object(httpx, "post", return_value=response):
+        review_diff([_hunk()], installation_id=1)
+    # Both backends tagged http_error.
+    for call in annotate_calls:
+        assert call["metadata"]["kind"] == "http_error"
+        assert call["metadata"]["status_code"] == 500
+
+
+def test_extract_usage_metrics_handles_non_dict_usage() -> None:
+    """A future backend that returns `usage` as a string or list must
+    not crash. The `isinstance(usage, dict)` guard is the load-bearing
+    one — removing it would AttributeError on `.get()`."""
+    # body with usage=list (degenerate).
+    out = lc._extract_usage_metrics({"usage": [1, 2, 3]})
+    assert out == {"input_tokens": None, "output_tokens": None}
+    # body that itself isn't a dict.
+    out = lc._extract_usage_metrics("not a dict")
+    assert out == {"input_tokens": None, "output_tokens": None}
+    # body=None (defensive — the upstream re-parse fallback sets body={}
+    # but a future caller might pass None).
+    out = lc._extract_usage_metrics(None)
+    assert out == {"input_tokens": None, "output_tokens": None}
+
+
+def test_llmobs_body_reparse_failure_logs_warning(monkeypatch, caplog) -> None:
+    """The re-parse except branch logs `llm_body_reparse_failed`. A
+    regression that drops the log line (or that swaps `except` to
+    `Exception` and masks an unrelated bug) silently misses the DD
+    alert. Pin the log emission to a discriminator the test can read."""
+    annotate_calls = _capture_llmobs(monkeypatch)
+
+    # Build a Response where the first .json() succeeds (during
+    # _parse_response — invalid `choices` shape returns err=missing
+    # choices) AND the second .json() (the re-parse) also returns 200.
+    # We force a divergence by stubbing _parse_response to return
+    # success (err="") but stubbing .json() the second time to raise.
+    call_count = {"n": 0}
+
+    def fake_json(self):
+        call_count["n"] += 1
+        if call_count["n"] == 1:
+            # First call from _parse_response — return a valid envelope.
+            return _openai_json_response('{"findings":[]}')
+        raise ValueError("divergent")
+
+    response = httpx.Response(200, json=_openai_json_response('{"findings":[]}'))
+    monkeypatch.setattr(httpx.Response, "json", fake_json)
+    with caplog.at_level("WARNING"):
+        with patch.object(httpx, "post", return_value=response):
+            review_diff([_hunk()], installation_id=1)
+    assert any(
+        "llm_body_reparse_failed" in r.message for r in caplog.records
+    )
+    # Span still emitted, just with empty output.
+    assert annotate_calls[0]["metadata"]["backend"] == "openrouter"
+
+
 def test_no_diff_short_circuit_does_not_emit_llmobs_span(monkeypatch) -> None:
     """Empty hunks short-circuit before any LLM call — no span should
     be emitted (no LLM call happened)."""
