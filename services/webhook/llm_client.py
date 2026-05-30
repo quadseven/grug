@@ -765,14 +765,14 @@ def _parse_judge_verdicts(content: str) -> tuple[FindingJudgement, ...]:
     try:
         parsed = json.loads(content)
     except json.JSONDecodeError:
-        log.warning("judge_verdicts_unparseable", extra={"raw": content[:200]})
+        log.warning("judge_verdicts_unparseable", extra={"raw": _redact_secrets(content)[:200]})
         return ()
     if not isinstance(parsed, dict):
-        log.warning("judge_verdicts_envelope_not_dict", extra={"raw": content[:200]})
+        log.warning("judge_verdicts_envelope_not_dict", extra={"raw": _redact_secrets(content)[:200]})
         return ()
     raw = parsed.get("verdicts", [])
     if not isinstance(raw, list):
-        log.warning("judge_verdicts_not_a_list", extra={"raw": content[:200]})
+        log.warning("judge_verdicts_not_a_list", extra={"raw": _redact_secrets(content)[:200]})
         return ()
     out: list[FindingJudgement] = []
     dropped = 0
