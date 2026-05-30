@@ -18,6 +18,12 @@ Dedup: each comment record carries `last_verdict` (the verdict last
 submitted to DD). We only submit when the current classification
 differs — so a 👎 that's been sitting for days doesn't re-submit every
 poll cycle, but a developer flipping 👎→👍 (changed their mind) does.
+Dedup is at-least-once, NOT exactly-once: if the DD submit succeeds but
+the baseline write then fails, the next cycle re-submits. That's
+deliberate — DD `submit_evaluation` on the same (span, label) is an
+upsert, so a re-submit is benign, and re-submitting is strictly better
+than losing a human 👍/👎 forever (which is what advancing the baseline
+before a confirmed submit would risk).
 """
 from __future__ import annotations
 
@@ -128,15 +134,45 @@ def poll_and_annotate(
         if verdict == rec.get("last_verdict"):
             # Dedup: already submitted this verdict for this comment.
             continue
-        submit_reaction_annotation(
-            verdict=verdict,
-            review_span_context=span_context,
-            tags=rec.get("finding_tags", {}),
-        )
-        update_comment_record_reaction(
-            install_id=install_id, comment_id=comment_id, verdict=verdict,
-        )
-        submitted += 1
+        # Mixed-signal observability: a comment with BOTH 👍 and 👎 is a
+        # developer disagreement — the highest-information calibration
+        # case, force-classified to false_positive. Log it (with the
+        # verdict tag below) so DD can filter contested verdicts out of
+        # the ground-truth set rather than have them silently flatten.
+        contents = {r.get("content") for r in reactions}
+        if "+1" in contents and "-1" in contents:
+            log.info(
+                "reaction_mixed_signal",
+                extra={"install_id": install_id, "comment_id": comment_id,
+                       "verdict": verdict},
+            )
+        # Guard the DD-submit + baseline-write as a unit. Broad catch:
+        # both the ddtrace seam (internal/intake errors, a stale
+        # malformed span dict) and the DDB update (botocore ClientError:
+        # throttle, timeout) can raise, and a best-effort poller must
+        # not let one bad record abort the rest of the batch. Submit
+        # FIRST, advance the baseline only after — so on a partial
+        # failure we re-submit next cycle rather than lose the human
+        # signal forever. DD `submit_evaluation` on the same span+label
+        # is an upsert, so a re-submit is benign (see module docstring:
+        # dedup is at-least-once, not exactly-once, under failure).
+        try:
+            submit_reaction_annotation(
+                verdict=verdict,
+                review_span_context=span_context,
+                tags=rec.get("finding_tags", {}),
+            )
+            update_comment_record_reaction(
+                install_id=install_id, comment_id=comment_id, verdict=verdict,
+            )
+            submitted += 1
+        except Exception as e:  # noqa: BLE001 — best-effort per-record
+            log.warning(
+                "reaction_submit_or_persist_failed",
+                extra={"install_id": install_id, "comment_id": comment_id,
+                       "kind": type(e).__name__},
+            )
+            continue
     log.info(
         "reaction_poll_cycle",
         extra={

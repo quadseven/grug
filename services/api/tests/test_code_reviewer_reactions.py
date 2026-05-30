@@ -182,6 +182,57 @@ def test_poll_and_annotate_skips_malformed_repo_without_aborting(monkeypatch, _p
     assert submitted[0]["verdict"] == "false_positive"
 
 
+def test_poll_and_annotate_submit_failure_does_not_abort_batch(monkeypatch, _patch_store):
+    """A DD-submit or DDB-baseline raise on one record must be caught +
+    logged + skipped — the next record still processes (best-effort).
+    The baseline is NOT advanced on failure, so the signal re-submits
+    next cycle rather than being lost."""
+    monkeypatch.setattr(
+        cr_reactions, "submit_reaction_annotation",
+        MagicMock(side_effect=[RuntimeError("DD intake 500"), None]),
+    )
+    updates: list[dict] = []
+    monkeypatch.setattr(
+        cr_reactions, "update_comment_record_reaction",
+        lambda **kw: updates.append(kw),
+    )
+    with patch("httpx.get", return_value=_reactions_response(["-1"])):
+        n = cr_reactions.poll_and_annotate(
+            [_record(comment_id=1), _record(comment_id=2)],
+            install_id=1, fetch_token=lambda: "tok",
+        )
+    # record 1 submit raised → skipped, no baseline update; record 2 ok.
+    assert n == 1
+    assert [u["comment_id"] for u in updates] == [2]
+
+
+def test_poll_and_annotate_baseline_write_failure_skips_count(monkeypatch):
+    """submit succeeds but the baseline DDB write fails → not counted as
+    submitted-and-recorded; re-submits next cycle (at-least-once)."""
+    monkeypatch.setattr(cr_reactions, "submit_reaction_annotation", lambda **kw: None)
+    monkeypatch.setattr(
+        cr_reactions, "update_comment_record_reaction",
+        MagicMock(side_effect=RuntimeError("DDB throttle")),
+    )
+    with patch("httpx.get", return_value=_reactions_response(["-1"])):
+        n = cr_reactions.poll_and_annotate(
+            [_record(comment_id=1)], install_id=1, fetch_token=lambda: "tok",
+        )
+    assert n == 0  # baseline never advanced → will retry next cycle
+
+
+def test_poll_and_annotate_logs_mixed_signal(monkeypatch, _patch_store, caplog):
+    """A comment with both 👍 and 👎 (developer disagreement) logs
+    reaction_mixed_signal so contested verdicts are filterable in DD."""
+    _patch_annotate(monkeypatch)
+    with caplog.at_level("INFO"):
+        with patch("httpx.get", return_value=_reactions_response(["+1", "-1"])):
+            cr_reactions.poll_and_annotate(
+                [_record(comment_id=5)], install_id=1, fetch_token=lambda: "tok",
+            )
+    assert any("reaction_mixed_signal" in r.message for r in caplog.records)
+
+
 def test_poll_comment_reactions_uses_reactions_endpoint(monkeypatch):
     """Confirm the GH reactions REST path + preview Accept header."""
     captured = {}
