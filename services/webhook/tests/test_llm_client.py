@@ -458,3 +458,128 @@ def test_envelope_non_json_returns_parse_failed(monkeypatch) -> None:
     # other backend would likely return the same edge HTML).
     assert out.kind == "parse_failed"
     assert "envelope" in out.error.lower() or "json" in out.error.lower()
+
+
+# ---------------------------------------------------------------------------
+# DD LLM Obs tracing — every successful LLM call emits a trace span with
+# prompt/response/latency/tokens; failures emit a span with error metadata.
+# ---------------------------------------------------------------------------
+
+def _capture_llmobs(monkeypatch):
+    """Patch LLMObs.llm + LLMObs.annotate; return a list of all
+    annotate calls so tests can introspect the trace shape."""
+    from unittest.mock import MagicMock as _MM
+
+    annotate_calls: list[dict] = []
+
+    class _FakeSpan:
+        def __enter__(self): return self
+        def __exit__(self, *a): return False
+
+    monkeypatch.setattr(lc, "_llmobs_llm", lambda **kw: _FakeSpan())
+    monkeypatch.setattr(
+        lc, "_llmobs_annotate",
+        lambda **kw: annotate_calls.append(kw),
+    )
+    return annotate_calls
+
+
+def test_review_diff_emits_llmobs_span_on_success(monkeypatch) -> None:
+    """Every successful LLM call must emit a DD LLM Obs span carrying
+    prompt + response + latency_ms + tokens + model + backend."""
+    annotate_calls = _capture_llmobs(monkeypatch)
+    body = _openai_json_response('{"findings":[]}')
+    body["usage"] = {"prompt_tokens": 100, "completion_tokens": 25}
+    response = httpx.Response(200, json=body)
+    with patch.object(httpx, "post", return_value=response):
+        out = review_diff([_hunk()], installation_id=1)
+
+    assert out.kind == "reviewed"
+    assert len(annotate_calls) == 1
+    call = annotate_calls[0]
+    # Prompt = the messages array (system + user).
+    assert isinstance(call["input_data"], list)
+    assert call["input_data"][0]["role"] == "system"
+    # Response = the model's content string.
+    assert call["output_data"] == '{"findings":[]}'
+    # Metrics include tokens + latency.
+    metrics = call["metrics"]
+    assert metrics["input_tokens"] == 100
+    assert metrics["output_tokens"] == 25
+    assert "latency_ms" in metrics
+    assert metrics["latency_ms"] >= 0
+    # Metadata names the backend.
+    assert call["metadata"]["backend"] == "openrouter"  # installation_id=1 → odd
+
+
+def test_review_diff_llmobs_span_carries_pr_context_tags(monkeypatch) -> None:
+    """The PR coords (install_id, repo, pr_number, head_sha) must flow
+    into span tags so DD LLM Obs can filter traces by repo or PR."""
+    annotate_calls = _capture_llmobs(monkeypatch)
+    response = httpx.Response(200, json=_openai_json_response('{"findings":[]}'))
+    pr_context = {
+        "installation_id": 42,
+        "repo": "myorg/myrepo",
+        "pr_number": 7,
+        "head_sha": "abc123def456",
+    }
+    with patch.object(httpx, "post", return_value=response):
+        review_diff(
+            [_hunk()], installation_id=42, pr_context=pr_context,
+        )
+
+    tags = annotate_calls[0]["tags"]
+    assert tags["installation_id"] == "42"
+    assert tags["repo"] == "myorg/myrepo"
+    assert tags["pr_number"] == "7"
+    # head_sha truncated to 8 chars to keep tag cardinality bounded.
+    assert tags["head_sha"] == "abc123de"
+
+
+def test_review_diff_emits_llmobs_span_on_transport_failure(monkeypatch) -> None:
+    """A backend timeout must STILL emit an LLM Obs span so the failure
+    is visible in DD (latency tail, error rate). Span metadata names
+    the error class; output_data is absent."""
+    monkeypatch.setattr(lc, "_RETRY_SLEEP", lambda s: None)
+    annotate_calls = _capture_llmobs(monkeypatch)
+
+    def _timeout(*a, **kw):
+        raise httpx.ReadTimeout("hung")
+
+    with patch.object(httpx, "post", side_effect=_timeout):
+        out = review_diff([_hunk()], installation_id=1)
+
+    assert out.kind == "all_failed"
+    # Two backends tried → two spans.
+    assert len(annotate_calls) == 2
+    for call in annotate_calls:
+        # Error class captured in metadata.
+        assert call["metadata"].get("error") == "ReadTimeout"
+        # No output content on a transport failure.
+        assert call.get("output_data") is None
+
+
+def test_review_diff_llmobs_span_handles_missing_usage(monkeypatch) -> None:
+    """OpenRouter free-tier sometimes omits the `usage` field. Span
+    must not crash — token metrics surface as None."""
+    annotate_calls = _capture_llmobs(monkeypatch)
+    # OpenAI shape but NO usage key.
+    body = {"choices": [{"message": {"content": '{"findings":[]}'}}], "model": "x"}
+    response = httpx.Response(200, json=body)
+    with patch.object(httpx, "post", return_value=response):
+        out = review_diff([_hunk()], installation_id=1)
+    assert out.kind == "reviewed"
+    metrics = annotate_calls[0]["metrics"]
+    # latency must still be present even when tokens are missing.
+    assert "latency_ms" in metrics
+    assert metrics.get("input_tokens") is None
+    assert metrics.get("output_tokens") is None
+
+
+def test_no_diff_short_circuit_does_not_emit_llmobs_span(monkeypatch) -> None:
+    """Empty hunks short-circuit before any LLM call — no span should
+    be emitted (no LLM call happened)."""
+    annotate_calls = _capture_llmobs(monkeypatch)
+    out = review_diff([], installation_id=1)
+    assert out.kind == "no_diff"
+    assert annotate_calls == []

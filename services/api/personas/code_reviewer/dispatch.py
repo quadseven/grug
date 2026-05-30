@@ -237,9 +237,18 @@ def dispatch_code_review(
         )
 
     # review_diff already swallows backend failures into discriminated
-    # `LlmReviewResponse.kind` values; no extra try needed.
+    # `LlmReviewResponse.kind` values; no extra try needed. The
+    # `pr_context` dict flows into DD LLM Obs span tags so traces are
+    # filterable by repo / PR / installation in the LLM Obs UI.
     llm_response: LlmReviewResponse = review_diff(
-        _to_llm_hunks(hunks), installation_id=installation_id,
+        _to_llm_hunks(hunks),
+        installation_id=installation_id,
+        pr_context={
+            "installation_id": installation_id,
+            "repo": f"{owner}/{repo_name}",
+            "pr_number": pull_number,
+            "head_sha": head_sha,
+        },
     )
     if llm_response.kind != "reviewed":
         # Without this log, a 100% LLM-outage rate looks identical to
