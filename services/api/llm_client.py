@@ -38,6 +38,45 @@ from secrets_loader import get_openrouter_api_key, get_poolside_api_key
 
 log = logging.getLogger(f"{os.getenv('DD_SERVICE', 'grug')}.llm_client")
 
+# DD LLM Observability seams. Imported lazily and wrapped behind module-
+# level indirection so:
+#   1. Tests can monkeypatch `_llmobs_llm` / `_llmobs_annotate` without
+#      touching the real ddtrace.llmobs SDK.
+#   2. Cold-start cost of `ddtrace.llmobs` is paid once on first call,
+#      not at import time.
+#   3. If `DD_LLMOBS_ENABLED` is unset (local dev, tests), the span
+#      becomes a no-op rather than failing loudly.
+try:  # pragma: no cover — import-time guard
+    from ddtrace.llmobs import LLMObs as _LLMObs
+
+    def _llmobs_llm(**kwargs: Any) -> Any:
+        return _LLMObs.llm(**kwargs)
+
+    def _llmobs_annotate(**kwargs: Any) -> None:
+        _LLMObs.annotate(**kwargs)
+except ImportError:  # pragma: no cover — local dev without ddtrace
+
+    class _NoopSpan:
+        def __enter__(self) -> "_NoopSpan":
+            return self
+        def __exit__(self, *a: Any) -> bool:
+            return False
+
+    def _llmobs_llm(**kwargs: Any) -> Any:
+        return _NoopSpan()
+
+    def _llmobs_annotate(**kwargs: Any) -> None:
+        return None
+
+_LLMOBS_NAME = "elder_code_review"
+_LLMOBS_HEAD_SHA_TAG_LEN = 8  # truncated to keep tag cardinality bounded
+
+
+def _elapsed_ms(start_ns: int) -> int:
+    """Wall-clock elapsed in ms since `start_ns` (monotonic). Used for
+    LLM Obs latency metrics — `time.monotonic_ns` avoids clock-skew."""
+    return (time.monotonic_ns() - start_ns) // 1_000_000
+
 # Per-backend endpoints + default models.
 _POOLSIDE_URL = "https://inference.poolside.ai/v1/chat/completions"
 _POOLSIDE_MODEL = "poolside/laguna-m.1"
@@ -346,8 +385,48 @@ def _parse_response(
     return tuple(coerced), model_name, ""
 
 
+def _llmobs_tags(pr_context: Optional[dict]) -> dict[str, str]:
+    """Build the tag dict for an LLM Obs span from `pr_context`.
+
+    Tags are stringified because DD facet types are inferred from the
+    first value seen — keeping all coords as strings prevents schema
+    drift if a future call passes an int where another passed a string.
+    `head_sha` is truncated to 8 chars so the tag-cardinality budget
+    isn't blown by full 40-char hashes.
+    """
+    if not pr_context:
+        return {}
+    tags: dict[str, str] = {}
+    if "installation_id" in pr_context:
+        tags["installation_id"] = str(pr_context["installation_id"])
+    if "repo" in pr_context:
+        tags["repo"] = str(pr_context["repo"])
+    if "pr_number" in pr_context:
+        tags["pr_number"] = str(pr_context["pr_number"])
+    if "head_sha" in pr_context:
+        tags["head_sha"] = str(pr_context["head_sha"])[:_LLMOBS_HEAD_SHA_TAG_LEN]
+    return tags
+
+
+def _extract_usage_metrics(body: Any) -> dict[str, Optional[int]]:
+    """Pull token counts from an OpenAI-compat response body. Missing
+    `usage` is normal (OpenRouter free-tier omits it sometimes) and
+    must not crash the span emission."""
+    if not isinstance(body, dict):
+        return {"input_tokens": None, "output_tokens": None}
+    usage = body.get("usage") or {}
+    if not isinstance(usage, dict):
+        return {"input_tokens": None, "output_tokens": None}
+    return {
+        "input_tokens": usage.get("prompt_tokens"),
+        "output_tokens": usage.get("completion_tokens"),
+    }
+
+
 def review_diff(
-    hunks: list[Hunk], installation_id: int
+    hunks: list[Hunk],
+    installation_id: int,
+    pr_context: Optional[dict] = None,
 ) -> LlmReviewResponse:
     """Send `hunks` to the round-robin-selected LLM and return findings.
 
@@ -356,6 +435,10 @@ def review_diff(
       - `reviewed`: at least one backend returned a parseable payload.
       - `parse_failed`: LLM responded but the content wasn't usable JSON.
       - `all_failed`: every backend errored or timed out.
+
+    `pr_context` (Optional dict) carries the PR coords for DD LLM Obs
+    tags. Keys consumed: installation_id, repo, pr_number, head_sha.
+    Omitted ⇒ traces still emit but without filterable PR tags.
     """
     if not hunks:
         return LlmReviewResponse(kind="no_diff")
@@ -365,27 +448,80 @@ def review_diff(
         Backend.OPENROUTER if primary == Backend.POOLSIDE else Backend.POOLSIDE
     )
     messages = _build_messages(hunks)
+    pr_tags = _llmobs_tags(pr_context)
 
     last_error = ""
     for backend in (primary, secondary):
         config = _BACKEND_CONFIGS[backend]
-        try:
-            resp = _call_backend(config, messages)
-        except _BackendConfigError as e:
-            log.error(
-                "llm_backend_misconfigured",
-                extra={"backend": backend.value, "detail": str(e)},
+        # Open one LLM Obs span per backend attempt. Annotate on every
+        # exit path (success + failures) so DD captures latency tails
+        # and error rates per-backend.
+        start_ns = time.monotonic_ns()
+        with _llmobs_llm(
+            model_name=config.model,
+            model_provider=backend.value,
+            name=_LLMOBS_NAME,
+        ) as span:
+            try:
+                resp = _call_backend(config, messages)
+            except _BackendConfigError as e:
+                log.error(
+                    "llm_backend_misconfigured",
+                    extra={"backend": backend.value, "detail": str(e)},
+                )
+                _llmobs_annotate(
+                    span=span, input_data=messages,
+                    metadata={"backend": backend.value, "error": "config"},
+                    metrics={"latency_ms": _elapsed_ms(start_ns)},
+                    tags=pr_tags,
+                )
+                last_error = f"{backend.value} misconfigured: {e}"
+                continue
+            except (httpx.RequestError, httpx.TimeoutException) as e:
+                log.warning(
+                    "llm_backend_transport_failed",
+                    extra={"backend": backend.value, "kind": type(e).__name__},
+                )
+                _llmobs_annotate(
+                    span=span, input_data=messages,
+                    metadata={"backend": backend.value, "error": type(e).__name__},
+                    metrics={"latency_ms": _elapsed_ms(start_ns)},
+                    tags=pr_tags,
+                )
+                last_error = f"{backend.value}: {type(e).__name__}"
+                continue
+            findings, model, err = _parse_response(resp)
+            # Annotate AFTER the response is parsed so we capture the
+            # raw content + token counts. resp.json() was already
+            # consumed inside _parse_response; re-call it here for the
+            # span input — httpx caches the parsed body so this is cheap.
+            try:
+                body = resp.json() if resp.status_code == 200 else {}
+            except (ValueError, json.JSONDecodeError):
+                body = {}
+            content = ""
+            if isinstance(body, dict):
+                choices = body.get("choices") or []
+                if choices and isinstance(choices[0], dict):
+                    content = (choices[0].get("message") or {}).get("content", "")
+            usage_metrics = _extract_usage_metrics(body)
+            _llmobs_annotate(
+                span=span,
+                input_data=messages,
+                output_data=content or None,
+                metadata={
+                    "backend": backend.value,
+                    "status_code": resp.status_code,
+                    "kind": "reviewed" if not err else (
+                        "parse_failed" if resp.status_code == 200 else "http_error"
+                    ),
+                },
+                metrics={
+                    "latency_ms": _elapsed_ms(start_ns),
+                    **usage_metrics,
+                },
+                tags=pr_tags,
             )
-            last_error = f"{backend.value} misconfigured: {e}"
-            continue
-        except (httpx.RequestError, httpx.TimeoutException) as e:
-            log.warning(
-                "llm_backend_transport_failed",
-                extra={"backend": backend.value, "kind": type(e).__name__},
-            )
-            last_error = f"{backend.value}: {type(e).__name__}"
-            continue
-        findings, model, err = _parse_response(resp)
         if not err:
             return LlmReviewResponse(
                 kind="reviewed",
