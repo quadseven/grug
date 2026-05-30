@@ -55,6 +55,17 @@ try:  # pragma: no cover — import-time guard
 
     def _llmobs_annotate(**kwargs: Any) -> None:
         _LLMObs.annotate(**kwargs)
+
+    def _llmobs_export(span: Any) -> Optional[dict]:
+        return _LLMObs.export_span(span=span)
+
+    def _llmobs_submit_evaluation(**kwargs: Any) -> None:
+        # `submit_evaluation` (NOT the deprecated `submit_evaluation_for`,
+        # removed in ddtrace 4.0). The `span=` param takes the
+        # `{'span_id','trace_id'}` dict returned by `export_span` — the
+        # documented out-of-band attach: it lands the eval on the prior
+        # (closed) review span, no active-context requirement.
+        _LLMObs.submit_evaluation(**kwargs)
 except ImportError:  # pragma: no cover — local dev without ddtrace
 
     class _NoopSpan:
@@ -67,6 +78,12 @@ except ImportError:  # pragma: no cover — local dev without ddtrace
         return _NoopSpan()
 
     def _llmobs_annotate(**kwargs: Any) -> None:
+        return None
+
+    def _llmobs_export(span: Any) -> Optional[dict]:
+        return None
+
+    def _llmobs_submit_evaluation(**kwargs: Any) -> None:
         return None
 
     # Loud signal so a layer-drift / partial-install in Lambda doesn't
@@ -255,6 +272,12 @@ class LlmReviewResponse:
     backend_used: Optional[Backend] = None
     model_name: Optional[str] = None
     error: str = ""
+    # Exported DD LLM Obs span of the successful review call. The
+    # LLM-as-a-judge (#190) attaches per-finding `is_real_bug`
+    # evaluations to THIS span — the one whose output produced the
+    # findings — so the eval shows on the right trace. None when the
+    # review degraded or ddtrace is absent.
+    review_span_context: Optional[dict] = None
 
 
 # Test hook — replaced with a no-op in unit tests to avoid real sleeps.
@@ -620,12 +643,16 @@ def review_diff(
                 },
                 tags=pr_tags,
             )
+            # Export inside the `with` block — the span must be active
+            # for export to capture its trace/span IDs.
+            span_context = _llmobs_export(span) if not err else None
         if not err:
             return LlmReviewResponse(
                 kind="reviewed",
                 findings=findings,
                 backend_used=backend,
                 model_name=model,
+                review_span_context=span_context,
             )
         if resp.status_code == 200:
             # 200 + parse failure — the LLM returned but we can't use
@@ -651,4 +678,259 @@ def review_diff(
     return LlmReviewResponse(
         kind="all_failed",
         error=last_error or "both backends failed",
+    )
+
+
+# ---------------------------------------------------------------------------
+# LLM-as-a-judge (#190) — a second LLM call scores each finding as a real
+# bug or a false positive. Verdicts feed DD LLM Obs evaluations, building a
+# ground-truth dataset for prompt optimization. Best-effort: a judge
+# failure never blocks or alters the review the developer already saw.
+# ---------------------------------------------------------------------------
+
+_LLMOBS_JUDGE_NAME = "elder_judge"
+_JUDGE_EVAL_LABEL = "is_real_bug"
+
+# Cost/latency guard. The judge is a SECOND full LLM call per review,
+# and its prompt scales with finding count. Above this threshold the PR
+# is firehose-noisy (a 40-finding review is rarely worth grading every
+# entry) and the judge call would bloat token cost + handler latency for
+# marginal ground-truth value. Skip the judge entirely above it — the
+# review itself is unaffected (already published).
+_JUDGE_MAX_FINDINGS = 25
+
+_JUDGE_SYSTEM_PROMPT = (
+    "You are an adjudicator grading a code reviewer's findings to build a "
+    "ground-truth dataset. For each numbered finding, decide whether it "
+    "identifies a REAL, actionable bug (true) or is a false positive / "
+    "style nit / hallucination (false). Judge each finding ON THE EVIDENCE "
+    "in the diff — do not assume either way. Calibrated accuracy matters "
+    "more than caution: a wrong label in either direction corrupts the "
+    "dataset. Return JSON of shape "
+    '{"verdicts": [{"index": int, "is_real_bug": bool, "reasoning": str}]}. '
+    "One verdict per finding, matching its index. No prose outside the JSON."
+)
+
+
+class JudgeFindingRepr(TypedDict):
+    """Primitive finding shape the judge LLM call consumes. Defined here
+    (the lower layer) so `judge_findings` has a typed key contract
+    WITHOUT importing the persona `Finding` (layering: persona imports
+    down, never up). TypedDict totality (the default) means the producer
+    (`_finding_to_repr`) supplies every key and mypy catches a typo at
+    the boundary. `_build_judge_messages` ALSO uses `.get(..., '?')`
+    defaults as a runtime belt — the TypedDict is static-only, so an
+    untyped or future caller can't crash the best-effort judge on a
+    missing key. Static + runtime layers are complementary, not
+    redundant."""
+    rule_name: str
+    file: str
+    line: int
+    severity: str
+    message: str
+
+
+@dataclass(frozen=True, slots=True)
+class FindingJudgement:
+    """One adjudicated finding. `finding_index` ties back to the caller's
+    finding list position; `is_real_bug` is the categorical verdict;
+    `reasoning` is the judge's one-line justification (surfaced in the DD
+    annotation-queue UI for human review)."""
+
+    finding_index: int
+    is_real_bug: bool
+    reasoning: str
+
+
+def _build_judge_messages(
+    findings_repr: list[JudgeFindingRepr], hunks: list[Hunk],
+) -> list[dict[str, str]]:
+    """Compose the judge prompt: the diff hunks + a numbered finding list.
+    `findings_repr` is a primitive list-of-dicts (NOT persona `Finding`)
+    so this lower-layer module doesn't import the persona package."""
+    diff_block = "\n\n".join(
+        f"### {h.path}\n```diff\n{h.body}\n```" for h in hunks
+    )
+    finding_lines = "\n".join(
+        f"{i}. [{f.get('severity', '?')}] {f.get('rule_name', '?')} "
+        f"@ {f.get('file', '?')}:{f.get('line', '?')} — {f.get('message', '')}"
+        for i, f in enumerate(findings_repr)
+    )
+    user = f"Diff under review:\n{diff_block}\n\nFindings to grade:\n{finding_lines}"
+    return [
+        {"role": "system", "content": _JUDGE_SYSTEM_PROMPT},
+        {"role": "user", "content": user},
+    ]
+
+
+def _parse_judge_verdicts(content: str) -> tuple[FindingJudgement, ...]:
+    """Parse the judge LLM's JSON into FindingJudgements. Malformed
+    entries are dropped (best-effort — a judge parse failure must not
+    crash the review path).
+
+    Every drop path logs — same discipline as the review path's
+    `_coerce_finding`. A judge whose every response is unparseable
+    (prompt drift, model swap returning prose) must be distinguishable
+    in logs from a judge that legitimately returned zero verdicts;
+    without these warnings both look identical and the ground-truth
+    dataset silently stops growing.
+    """
+    try:
+        parsed = json.loads(content)
+    except json.JSONDecodeError:
+        log.warning("judge_verdicts_unparseable", extra={"raw": _redact_secrets(content)[:200]})
+        return ()
+    if not isinstance(parsed, dict):
+        log.warning("judge_verdicts_envelope_not_dict", extra={"raw": _redact_secrets(content)[:200]})
+        return ()
+    raw = parsed.get("verdicts", [])
+    if not isinstance(raw, list):
+        log.warning("judge_verdicts_not_a_list", extra={"raw": _redact_secrets(content)[:200]})
+        return ()
+    out: list[FindingJudgement] = []
+    dropped = 0
+    for entry in raw:
+        if not isinstance(entry, dict):
+            dropped += 1
+            continue
+        try:
+            idx = int(entry["index"])
+            is_real = bool(entry["is_real_bug"])
+        except (KeyError, TypeError, ValueError):
+            dropped += 1
+            continue
+        out.append(FindingJudgement(
+            finding_index=idx,
+            is_real_bug=is_real,
+            reasoning=str(entry.get("reasoning", "")),
+        ))
+    if dropped:
+        log.warning(
+            "judge_verdicts_partial_drop",
+            extra={"dropped": dropped, "kept": len(out)},
+        )
+    return tuple(out)
+
+
+def judge_findings(
+    findings_repr: list[JudgeFindingRepr],
+    hunks: list[Hunk],
+    installation_id: int,
+    pr_context: Optional[PrContext] = None,
+) -> tuple[FindingJudgement, ...]:
+    """Second LLM call: grade each finding as real-bug vs false-positive.
+
+    Returns () on any failure: the judge is best-effort observability,
+    never blocks the review. Emits its own DD LLM Obs span (name
+    `elder_judge`) so the judge's prompt/latency/token-cost is traceable
+    separately from the review call.
+    """
+    if not findings_repr:
+        return ()
+    if len(findings_repr) > _JUDGE_MAX_FINDINGS:
+        # Cost guard — don't double the LLM spend grading a firehose
+        # review. Logged so the skip is visible (not silent), and the
+        # threshold can be tuned against observed cost.
+        log.info(
+            "judge_skipped_too_many_findings",
+            extra={"count": len(findings_repr), "max": _JUDGE_MAX_FINDINGS},
+        )
+        return ()
+
+    # WHY the backend loop here is NOT shared with review_diff's: the
+    # judge hits a SINGLE backend (no fallback — a judge outage is
+    # acceptable, the review already shipped), tags its span `judge:
+    # True`, and returns () on any error. review_diff iterates two
+    # backends with fallback + parse-failed semantics. Extracting a
+    # shared helper would need callbacks for the divergent annotate
+    # metadata + fallback control flow — more complex than the ~25-line
+    # overlap. Extract at the 3rd backend (rule-of-three), not now.
+    backend = select_backend(installation_id)
+    config = _BACKEND_CONFIGS[backend]
+    messages = _build_judge_messages(findings_repr, hunks)
+    pr_tags = _llmobs_tags(pr_context)
+    start_ns = time.monotonic_ns()
+
+    with _llmobs_llm(
+        model_name=config.model,
+        model_provider=backend.value,
+        name=_LLMOBS_JUDGE_NAME,
+    ) as span:
+        try:
+            resp = _call_backend(config, messages)
+        except (_BackendConfigError, httpx.RequestError, httpx.TimeoutException) as e:
+            log.warning(
+                "judge_backend_failed",
+                extra={"backend": backend.value, "kind": type(e).__name__},
+            )
+            _llmobs_annotate(
+                span=span, input_data=_redact_payload(messages),
+                metadata={"backend": backend.value, "judge": True,
+                          "error": type(e).__name__},
+                metrics={"latency_ms": _elapsed_ms(start_ns)},
+                tags=pr_tags,
+            )
+            return ()
+        content = ""
+        try:
+            body = resp.json() if resp.status_code == 200 else {}
+        except (ValueError, json.JSONDecodeError):
+            body = {}
+        if isinstance(body, dict):
+            choices = body.get("choices") or []
+            if choices and isinstance(choices[0], dict):
+                content = (choices[0].get("message") or {}).get("content", "")
+        if resp.status_code == 200 and not content:
+            # 200 but no usable content (empty body, wrong envelope
+            # shape, CF interstitial). Without this log, a persistently
+            # broken backend looks identical to "judge graded zero
+            # verdicts" — the ground-truth dataset stops growing
+            # invisibly. Distinct from judge_backend_failed (transport).
+            log.warning(
+                "judge_empty_content",
+                extra={"backend": backend.value, "status_code": resp.status_code},
+            )
+        _llmobs_annotate(
+            span=span,
+            input_data=_redact_payload(messages),
+            output_data=_redact_payload(content) if content else None,
+            metadata={
+                "backend": backend.value, "judge": True,
+                "status_code": resp.status_code,
+            },
+            metrics={
+                "latency_ms": _elapsed_ms(start_ns),
+                **_extract_usage_metrics(body),
+            },
+            tags=pr_tags,
+        )
+    return _parse_judge_verdicts(content)
+
+
+def submit_finding_evaluation(
+    *,
+    is_real_bug: bool,
+    reasoning: str,
+    review_span_context: Optional[dict],
+    tags: dict[str, str],
+) -> None:
+    """Submit one per-finding `is_real_bug` evaluation to DD LLM Obs,
+    attached to the REVIEW span (the call whose output produced the
+    finding). No-op when `review_span_context` is None — without a span
+    to attach to, DD would reject the eval; skipping is correct since
+    the review degraded (no findings to judge anyway).
+
+    `categorical` metric type (string "true"/"false") rather than a
+    score so the DD annotation-queue UI renders it as a label a human
+    reviewer can confirm/override.
+    """
+    if review_span_context is None:
+        return
+    _llmobs_submit_evaluation(
+        label=_JUDGE_EVAL_LABEL,
+        metric_type="categorical",
+        value="true" if is_real_bug else "false",
+        span=review_span_context,
+        tags=tags,
+        reasoning=reasoning,
     )
