@@ -263,3 +263,86 @@ copies. The lint catches misses at PR time.
 Files that intentionally diverge (FastAPI app, Lambda handler entrypoint,
 logger name) are simply not in `MIRRORED_FILES` — the allowlist is
 opt-in by omission. Closes #66.
+
+## Elder (code-reviewer) persona — end-to-end verification
+
+The Elder persona ships in advisory mode by default. After a deploy
+that includes a new dispatcher/dispatch.py/llm_client.py change, run
+this verification to confirm the full pipeline works on a real PR.
+
+### Prerequisites
+
+1. SSM parameters loaded per `docs/HITL_PREREQUISITES.md` step 3:
+   - `/grug/poolside-api-key` (SecureString)
+   - `/grug/openrouter-api-key` (SecureString)
+2. `pulumi up` against the target stack — confirm the webhook Lambda
+   environment has both keys mounted.
+3. `code_reviewer_enabled=True` and `code_reviewer_blocking=False` on
+   the test repo's RepoConfig (defaults, no action needed for a new
+   install).
+
+### Steps
+
+1. Open a small test PR on a Grug-installed repo (e.g. githumps/grug
+   itself). Touch one file with a trivially-reviewable diff (e.g. add
+   a function that swallows a broad `except Exception: pass`).
+
+2. Wait ~30 seconds for the webhook → diff fetch → LLM round-trip.
+
+3. **Verify the check-run** — in the PR's "Checks" tab, look for:
+   - `Grug — Code Review` (separate from `Grug — Definition of Ready`)
+   - Conclusion: `neutral` (advisory mode)
+   - Summary: a Markdown table with at least one finding row OR
+     "Elder reviewed the diff and found nothing actionable."
+
+4. **Verify the inline review** — in the "Files changed" tab, look
+   for at least one `Grug` review comment pinned to a specific
+   `(file, line)`. Comment body should include severity, rule name,
+   and the LLM's message.
+
+5. **Verify the structured log** — in DD logs, query
+   `service:grug-webhook @event:code_reviewer_dispatched`. The most
+   recent entry should carry: `installation_id`, `pr`, `head_sha`,
+   `backend` (poolside or openrouter), `model`, `findings_count`,
+   `result` (pass/fail/skipped).
+
+6. **Verify both backends fire** (round-robin by `installation_id %
+   2`): open one PR from an even-`install_id` repo + one from an
+   odd-`install_id` repo. DD logs should show `backend:poolside` for
+   the even one and `backend:openrouter` for the odd one.
+
+### Failure-mode checks
+
+- **No check-run appears at all** → query DD for
+  `@event:code_review_fetch_or_parse_failed` or
+  `@event:code_review_check_run_publish_failed` or
+  `@event:code_review_degraded_publish_failed`. Each names the
+  specific surface that failed.
+- **Check-run appears with conclusion=neutral + "skipped" title** →
+  LLM degraded. Query DD for
+  `@event:code_review_llm_degraded` to see which backend kind
+  (`no_diff` / `all_failed` / `parse_failed`) triggered.
+- **Check-run shows findings but no inline review** → review-post
+  failed; see `@event:code_review_review_publish_failed`. Check-run
+  conclusion is unaffected by review-post failure — independent
+  surface by design.
+- **Webhook 500s entirely** → query Sentry for `tpm_dispatch_unhandled`
+  or `code_review_dispatch_unhandled`. Both are last-resort guards
+  that should be empty in steady-state.
+
+### Rollback
+
+If Elder produces too many false positives or operationally misbehaves,
+disable per-repo via:
+
+```bash
+# Flip code_reviewer_enabled=False on a specific repo
+aws dynamodb update-item --region us-east-1 --table-name grug-main \
+  --key '{"PK":{"S":"INST#<install_id>"},"SK":{"S":"REPO#<repo_id>"}}' \
+  --update-expression 'SET code_reviewer_enabled = :f' \
+  --expression-attribute-values '{":f":{"BOOL":false}}'
+```
+
+Global kill switch (all repos) — set the SSM parameter
+`/grug/<env>/elder-disabled` to `true` and redeploy
+(future-roadmap; not implemented in this slice).
