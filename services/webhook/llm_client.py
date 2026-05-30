@@ -703,9 +703,9 @@ class JudgeFindingRepr(TypedDict):
     """Primitive finding shape the judge LLM call consumes. Defined here
     (the lower layer) so `judge_findings` has a typed key contract
     WITHOUT importing the persona `Finding` (layering: persona imports
-    down, never up). `total=True` documents that the producer
-    (`_finding_to_repr`) supplies every key and lets mypy catch a typo
-    at the boundary. `_build_judge_messages` ALSO uses `.get(..., '?')`
+    down, never up). TypedDict totality (the default) means the producer
+    (`_finding_to_repr`) supplies every key and mypy catches a typo at
+    the boundary. `_build_judge_messages` ALSO uses `.get(..., '?')`
     defaults as a runtime belt — the TypedDict is static-only, so an
     untyped or future caller can't crash the best-effort judge on a
     missing key. Static + runtime layers are complementary, not
@@ -807,14 +807,10 @@ def judge_findings(
 ) -> tuple[FindingJudgement, ...]:
     """Second LLM call: grade each finding as real-bug vs false-positive.
 
-    `findings_repr` is a list of dicts (rule_name/file/line/message/
-    severity) — the persona's surviving findings. Empty list short-
-    circuits (nothing to grade). Returns () on any failure: the judge
-    is best-effort observability, never blocks the review.
-
-    Emits its own DD LLM Obs span (name `elder_judge`) so the judge's
-    own prompt/latency/token-cost is traceable separately from the
-    review call. Reuses the same round-robin backend selection.
+    Returns () on any failure: the judge is best-effort observability,
+    never blocks the review. Emits its own DD LLM Obs span (name
+    `elder_judge`) so the judge's prompt/latency/token-cost is traceable
+    separately from the review call.
     """
     if not findings_repr:
         return ()

@@ -1004,6 +1004,63 @@ def test_judge_partial_drop_logs_count(monkeypatch, caplog) -> None:
     assert rec.__dict__["kept"] == 1
 
 
+def test_judge_non_200_returns_empty_no_empty_content_warning(monkeypatch, caplog) -> None:
+    """A non-200 judge response (rate-limited / 5xx) → body={}, no
+    content, returns (). The `judge_empty_content` warning is gated on
+    status==200 so it must NOT fire here (that warning means '200 but
+    garbage', a different failure)."""
+    monkeypatch.setattr(lc, "_RETRY_SLEEP", lambda s: None)
+    _capture_llmobs(monkeypatch)
+    # 500 on both retries — _call_backend returns the 500 response.
+    response = httpx.Response(500, json={"error": "down"})
+    fr = [{"rule_name": "r", "file": "x.py", "line": 2, "message": "m"}]
+    with caplog.at_level("WARNING"):
+        with patch.object(httpx, "post", return_value=response):
+            out = lc.judge_findings(fr, [_hunk()], installation_id=1)
+    assert out == ()
+    assert not any("judge_empty_content" in r.message for r in caplog.records)
+
+
+def test_judge_verdicts_envelope_non_dict_logs_warning(monkeypatch, caplog) -> None:
+    """Judge returns valid JSON that decodes to a LIST (not a dict
+    envelope) → judge_verdicts_envelope_not_dict warning + ()."""
+    _capture_llmobs(monkeypatch)
+    response = httpx.Response(200, json=_openai_json_response('[1, 2, 3]'))
+    fr = [{"rule_name": "r", "file": "x.py", "line": 2, "message": "m"}]
+    with caplog.at_level("WARNING"):
+        with patch.object(httpx, "post", return_value=response):
+            out = lc.judge_findings(fr, [_hunk()], installation_id=1)
+    assert out == ()
+    assert any(
+        "judge_verdicts_envelope_not_dict" in r.message for r in caplog.records
+    )
+
+
+def test_judge_verdicts_not_a_list_logs_warning(monkeypatch, caplog) -> None:
+    """`{"verdicts": "a string"}` → verdicts-not-a-list warning + ()."""
+    _capture_llmobs(monkeypatch)
+    response = httpx.Response(200, json=_openai_json_response('{"verdicts": "nope"}'))
+    fr = [{"rule_name": "r", "file": "x.py", "line": 2, "message": "m"}]
+    with caplog.at_level("WARNING"):
+        with patch.object(httpx, "post", return_value=response):
+            out = lc.judge_findings(fr, [_hunk()], installation_id=1)
+    assert out == ()
+    assert any(
+        "judge_verdicts_not_a_list" in r.message for r in caplog.records
+    )
+
+
+def test_judge_200_with_non_json_body_does_not_crash(monkeypatch) -> None:
+    """200 but the envelope body itself isn't JSON (CF interstitial) →
+    resp.json() raises, caught, body={}, content empty, returns ()."""
+    _capture_llmobs(monkeypatch)
+    response = httpx.Response(200, text="<html>not json</html>")
+    fr = [{"rule_name": "r", "file": "x.py", "line": 2, "message": "m"}]
+    with patch.object(httpx, "post", return_value=response):
+        out = lc.judge_findings(fr, [_hunk()], installation_id=1)
+    assert out == ()
+
+
 def test_judge_empty_content_on_200_logs_warning(monkeypatch, caplog) -> None:
     """200 + empty content (broken backend) logs judge_empty_content,
     distinct from a transport failure or a legit empty verdict list."""

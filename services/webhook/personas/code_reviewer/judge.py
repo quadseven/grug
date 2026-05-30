@@ -52,8 +52,9 @@ def _finding_to_repr(f: Finding) -> JudgeFindingRepr:
 
 
 def _eval_tags(f: Finding) -> dict[str, str]:
-    """DD evaluation tags — stringified (facet stability) finding
-    identity so the annotation-queue UI can group + filter."""
+    """DD evaluation tags — finding identity for the annotation-queue
+    UI to group + filter. `line` is stringified so all tag values are
+    str (DD infers facet type from the first value seen)."""
     return {
         "rule_name": f.rule_name,
         "file": f.file,
@@ -72,9 +73,9 @@ def run_judge(
 ) -> None:
     """Grade the evaluation's findings and submit DD LLM Obs evals.
 
-    No-op (no LLM call) when there are no findings or no review span to
-    attach to. Never raises — wraps the whole body so a judge failure
-    can't disturb the already-published review.
+    Wraps the whole body so a judge failure can't disturb the
+    already-published review (the load-bearing best-effort contract;
+    gating + no-op rationale in the module docstring).
     """
     if not evaluation.findings:
         return
