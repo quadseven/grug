@@ -412,9 +412,10 @@ def list_comment_records(install_id: int) -> list[CommentRecord]:
 def update_comment_record_reaction(
     *, install_id: int, comment_id: int, verdict: str,
 ) -> None:
-    """Record the last-submitted verdict — the dedup baseline. The poller
-    compares the current reaction classification against `last_verdict`
-    and only submits a DD annotation when it changed."""
+    """Advance the dedup baseline AFTER a successful DD submit. The
+    compare (current classification vs `last_verdict`) + the submit-
+    first/advance-after ordering live in the reactions.py module
+    docstring; this function only writes the baseline."""
     _table.update_item(
         Key={"PK": _inst_pk(install_id), "SK": _comment_record_sk(comment_id)},
         UpdateExpression="SET last_verdict = :v",

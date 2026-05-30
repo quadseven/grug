@@ -116,9 +116,9 @@ def poll_and_annotate(
         comment_id = rec["comment_id"]
         span_context = rec.get("review_span_context")
         if span_context is None:
-            # No span to attach the annotation to. `put_comment_record`
-            # types this non-None, so this is a defensive guard against
-            # a legacy/hand-written row, not an expected path.
+            # `CommentRecord` types this `Optional[dict]`: None means the
+            # review span never exported (degraded review at publish), so
+            # there's nothing to attach the annotation to. Skip.
             continue
         # `partition` (not `split` + splat): a malformed persisted repo
         # without a "/" would make `*split("/",1)` a 1-element splat →
@@ -154,8 +154,8 @@ def poll_and_annotate(
         # Mixed-signal observability: a comment with BOTH 👍 and 👎 is a
         # developer disagreement — the highest-information calibration
         # case, force-classified to false_positive. Log it (with the
-        # verdict tag below) so DD can filter contested verdicts out of
-        # the ground-truth set rather than have them silently flatten.
+        # verdict) so the calibration set can DOWN-WEIGHT contested rows
+        # rather than have them silently flatten into the verdict.
         contents = {r.get("content") for r in reactions}
         if "+1" in contents and "-1" in contents:
             log.info(
