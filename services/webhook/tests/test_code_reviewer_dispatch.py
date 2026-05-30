@@ -75,7 +75,7 @@ def test_dispatch_advisory_mode_posts_neutral_check_and_comment_review(monkeypat
     posted_check = []
     posted_review = []
 
-    def _fake_review_diff(hunks, installation_id):
+    def _fake_review_diff(hunks, installation_id, pr_context=None):
         return llm
 
     def _fake_post_check_run(install_token, owner, repo, result, external_id=None):
@@ -483,6 +483,33 @@ def test_dispatch_structured_log_carries_degraded_reason(monkeypatch, caplog):
     )
     assert rec.__dict__.get("degraded_reason") == "all_failed"
     assert rec.__dict__.get("result") == "skipped"
+
+
+def test_dispatch_passes_pr_context_to_review_diff(monkeypatch):
+    """The PR coords flow into review_diff(pr_context=...) so DD LLM
+    Obs spans carry tags that filter by repo / PR / install. Without
+    this, all traces would look identical in the LLM Obs UI."""
+    captured = []
+
+    def _fake_review_diff(hunks, installation_id, pr_context=None):
+        captured.append(pr_context)
+        return LlmReviewResponse(kind="no_diff")
+
+    monkeypatch.setattr(cr_dispatch, "review_diff", _fake_review_diff)
+    monkeypatch.setattr(cr_dispatch, "post_check_run", lambda *a, **kw: {})
+    monkeypatch.setattr(cr_dispatch, "post_review", lambda *a, **kw: {})
+
+    with patch("httpx.get", return_value=_diff_response()):
+        cr_dispatch.dispatch_code_review(_payload(), blocking=False)
+
+    assert len(captured) == 1
+    ctx = captured[0]
+    assert ctx == {
+        "installation_id": 11,
+        "repo": "myorg/myrepo",
+        "pr_number": 7,
+        "head_sha": "abcd1234efgh",
+    }
 
 
 def test_dispatch_fetches_diff_with_diff_accept_header(monkeypatch):

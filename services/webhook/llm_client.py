@@ -27,16 +27,137 @@ from __future__ import annotations
 import json
 import logging
 import os
+import re
 import time
 from dataclasses import dataclass, field
 from enum import Enum
-from typing import Any, Callable, Literal, Optional, get_args
+from typing import Any, Callable, Literal, Optional, TypedDict, get_args
 
 import httpx
 
 from secrets_loader import get_openrouter_api_key, get_poolside_api_key
 
 log = logging.getLogger(f"{os.getenv('DD_SERVICE', 'grug')}.llm_client")
+
+# DD LLM Observability seams. Imported lazily and wrapped behind module-
+# level indirection so:
+#   1. Tests can monkeypatch `_llmobs_llm` / `_llmobs_annotate` without
+#      touching the real ddtrace.llmobs SDK.
+#   2. Cold-start cost of `ddtrace.llmobs` is paid once on first call,
+#      not at import time.
+#   3. If `DD_LLMOBS_ENABLED` is unset (local dev, tests), the span
+#      becomes a no-op rather than failing loudly.
+try:  # pragma: no cover — import-time guard
+    from ddtrace.llmobs import LLMObs as _LLMObs
+
+    def _llmobs_llm(**kwargs: Any) -> Any:
+        return _LLMObs.llm(**kwargs)
+
+    def _llmobs_annotate(**kwargs: Any) -> None:
+        _LLMObs.annotate(**kwargs)
+except ImportError:  # pragma: no cover — local dev without ddtrace
+
+    class _NoopSpan:
+        def __enter__(self) -> "_NoopSpan":
+            return self
+        def __exit__(self, *a: Any) -> bool:
+            return False
+
+    def _llmobs_llm(**kwargs: Any) -> Any:
+        return _NoopSpan()
+
+    def _llmobs_annotate(**kwargs: Any) -> None:
+        return None
+
+    # Loud signal so a layer-drift / partial-install in Lambda doesn't
+    # silently turn off DD LLM Obs. AWS_LAMBDA_FUNCTION_NAME is the
+    # canonical Lambda-environment marker; in local dev it's unset.
+    if os.environ.get("AWS_LAMBDA_FUNCTION_NAME"):
+        log.warning(
+            "llmobs_import_failed_falling_back_to_noop",
+            extra={"lambda_fn": os.environ["AWS_LAMBDA_FUNCTION_NAME"]},
+        )
+
+_LLMOBS_NAME = "elder_code_review"
+_LLMOBS_HEAD_SHA_TAG_LEN = 8  # truncated to keep tag cardinality bounded
+
+# Per-payload cap on input/output captured in LLM Obs spans. Bounded
+# because PR diffs can contain massive blobs (PEM files, lockfiles,
+# generated code) — without this, a single .env-touching PR could
+# persist KB of secrets in DD storage. 16 KB is large enough to keep
+# typical review context but small enough to bound exposure.
+_LLMOBS_PAYLOAD_TRUNC_BYTES = 16 * 1024
+
+# Best-effort redaction patterns applied BEFORE payloads leave the
+# process. Defense-in-depth atop DD's org-level sensitive data scanner
+# — the scanner runs on ingest, but we should not be shipping raw
+# secrets across the wire in the first place. Pattern order: anchored
+# format-specific first (AWS, GitHub, Slack), then the generic
+# "key=value" sweeps. False positives are acceptable; missing a real
+# secret is not.
+_SECRET_PATTERNS: tuple[tuple[re.Pattern[str], str], ...] = (
+    (re.compile(r"AKIA[0-9A-Z]{16}"), "[REDACTED:aws-access-key]"),
+    (re.compile(r"ghp_[A-Za-z0-9]{36,}"), "[REDACTED:github-pat]"),
+    (re.compile(r"ghs_[A-Za-z0-9]{36,}"), "[REDACTED:github-app-token]"),
+    (re.compile(r"github_pat_[A-Za-z0-9_]{82,}"), "[REDACTED:github-fine-grained-pat]"),
+    (re.compile(r"xox[baprs]-[A-Za-z0-9-]{10,}"), "[REDACTED:slack-token]"),
+    (re.compile(r"sk-[A-Za-z0-9]{32,}"), "[REDACTED:openai-style-key]"),
+    (re.compile(r"sk-or-v1-[A-Za-z0-9]{32,}"), "[REDACTED:openrouter-key]"),
+    (re.compile(r"-----BEGIN [A-Z ]*PRIVATE KEY-----[\s\S]*?-----END [A-Z ]*PRIVATE KEY-----"), "[REDACTED:pem-private-key]"),
+    # Generic `KEY=VALUE` env-var leak inside an added diff line.
+    # Min-length 8 catches `secret=hunter22` but not `key=42`; longer
+    # is too strict (real secrets like `secret12345` would slip).
+    (re.compile(
+        r'((?:password|passwd|secret|api[-_]?key|token|access[-_]?key)\s*[:=]\s*)["\']?[A-Za-z0-9_\-+/=]{8,}["\']?',
+        re.IGNORECASE,
+    ), r"\1[REDACTED:env-secret]"),
+)
+
+
+def _redact_secrets(text: str) -> str:
+    """Apply best-effort secret-pattern redaction. False positives are
+    acceptable (an `AKIA...`-shaped string in code that isn't an AWS
+    key still gets masked); missing a real secret is not. Patterns
+    target shapes most likely to appear in a PR diff: AWS/GH tokens,
+    Slack bot tokens, PEM private keys, `KEY=VALUE` env lines."""
+    for pattern, repl in _SECRET_PATTERNS:
+        text = pattern.sub(repl, text)
+    return text
+
+
+def _redact_payload(payload: Any) -> Any:
+    """Walk a payload (str | list-of-message-dicts | dict) and apply
+    `_redact_secrets` to every string value. Truncates each string to
+    `_LLMOBS_PAYLOAD_TRUNC_BYTES` AFTER redaction so a trailing PEM
+    fragment can't survive a mid-string cut."""
+    if isinstance(payload, str):
+        return _redact_secrets(payload)[:_LLMOBS_PAYLOAD_TRUNC_BYTES]
+    if isinstance(payload, list):
+        return [_redact_payload(item) for item in payload]
+    if isinstance(payload, dict):
+        return {k: _redact_payload(v) for k, v in payload.items()}
+    return payload
+
+
+class PrContext(TypedDict, total=False):
+    """PR coords threaded into DD LLM Obs span tags.
+
+    `total=False` (every key optional) because callers without GH
+    coords (e.g. ad-hoc tests, future REPL probes) still need to be
+    able to call `review_diff` — they just get traces without
+    PR-filterable tags. Promoting from a bare `dict` makes typos like
+    `pr_num` fail at type-check time rather than silently dropping the
+    tag in DD.
+    """
+    installation_id: int
+    repo: str
+    pr_number: int
+    head_sha: str
+
+
+def _elapsed_ms(start_ns: int) -> int:
+    """`time.monotonic_ns` avoids clock-skew during the span."""
+    return (time.monotonic_ns() - start_ns) // 1_000_000
 
 # Per-backend endpoints + default models.
 _POOLSIDE_URL = "https://inference.poolside.ai/v1/chat/completions"
@@ -346,8 +467,48 @@ def _parse_response(
     return tuple(coerced), model_name, ""
 
 
+def _llmobs_tags(pr_context: Optional[PrContext]) -> dict[str, str]:
+    """Build the tag dict for an LLM Obs span from `pr_context`.
+
+    Tags are stringified because DD facet types are inferred from the
+    first value seen — keeping all coords as strings prevents schema
+    drift if a future call passes an int where another passed a string.
+    `head_sha` is truncated to 8 chars so the tag-cardinality budget
+    isn't blown by full 40-char hashes.
+    """
+    if not pr_context:
+        return {}
+    tags: dict[str, str] = {}
+    if "installation_id" in pr_context:
+        tags["installation_id"] = str(pr_context["installation_id"])
+    if "repo" in pr_context:
+        tags["repo"] = str(pr_context["repo"])
+    if "pr_number" in pr_context:
+        tags["pr_number"] = str(pr_context["pr_number"])
+    if "head_sha" in pr_context:
+        tags["head_sha"] = str(pr_context["head_sha"])[:_LLMOBS_HEAD_SHA_TAG_LEN]
+    return tags
+
+
+def _extract_usage_metrics(body: Any) -> dict[str, Optional[int]]:
+    """Pull token counts from an OpenAI-compat response body. Missing
+    `usage` is normal (OpenRouter free-tier omits it sometimes) and
+    must not crash the span emission."""
+    if not isinstance(body, dict):
+        return {"input_tokens": None, "output_tokens": None}
+    usage = body.get("usage") or {}
+    if not isinstance(usage, dict):
+        return {"input_tokens": None, "output_tokens": None}
+    return {
+        "input_tokens": usage.get("prompt_tokens"),
+        "output_tokens": usage.get("completion_tokens"),
+    }
+
+
 def review_diff(
-    hunks: list[Hunk], installation_id: int
+    hunks: list[Hunk],
+    installation_id: int,
+    pr_context: Optional[PrContext] = None,
 ) -> LlmReviewResponse:
     """Send `hunks` to the round-robin-selected LLM and return findings.
 
@@ -356,6 +517,10 @@ def review_diff(
       - `reviewed`: at least one backend returned a parseable payload.
       - `parse_failed`: LLM responded but the content wasn't usable JSON.
       - `all_failed`: every backend errored or timed out.
+
+    `pr_context` (Optional dict) carries the PR coords for DD LLM Obs
+    tags. Keys consumed: installation_id, repo, pr_number, head_sha.
+    Omitted ⇒ traces still emit but without filterable PR tags.
     """
     if not hunks:
         return LlmReviewResponse(kind="no_diff")
@@ -365,27 +530,96 @@ def review_diff(
         Backend.OPENROUTER if primary == Backend.POOLSIDE else Backend.POOLSIDE
     )
     messages = _build_messages(hunks)
+    pr_tags = _llmobs_tags(pr_context)
 
     last_error = ""
     for backend in (primary, secondary):
         config = _BACKEND_CONFIGS[backend]
-        try:
-            resp = _call_backend(config, messages)
-        except _BackendConfigError as e:
-            log.error(
-                "llm_backend_misconfigured",
-                extra={"backend": backend.value, "detail": str(e)},
+        # Open one LLM Obs span per backend attempt. Annotate on every
+        # CAUGHT exit path (success + the three explicit `except` arms)
+        # so DD captures latency tails and per-backend error rates. A
+        # surprise exception escaping `_call_backend` would propagate
+        # without annotation — that's intentional (it's a bug worth
+        # seeing in Sentry, not a routine signal).
+        start_ns = time.monotonic_ns()
+        with _llmobs_llm(
+            model_name=config.model,
+            model_provider=backend.value,
+            name=_LLMOBS_NAME,
+        ) as span:
+            try:
+                resp = _call_backend(config, messages)
+            except _BackendConfigError as e:
+                log.error(
+                    "llm_backend_misconfigured",
+                    extra={"backend": backend.value, "detail": str(e)},
+                )
+                _llmobs_annotate(
+                    span=span, input_data=_redact_payload(messages),
+                    metadata={"backend": backend.value, "error": "config"},
+                    metrics={"latency_ms": _elapsed_ms(start_ns)},
+                    tags=pr_tags,
+                )
+                last_error = f"{backend.value} misconfigured: {e}"
+                continue
+            except (httpx.RequestError, httpx.TimeoutException) as e:
+                log.warning(
+                    "llm_backend_transport_failed",
+                    extra={"backend": backend.value, "kind": type(e).__name__},
+                )
+                _llmobs_annotate(
+                    span=span, input_data=_redact_payload(messages),
+                    metadata={"backend": backend.value, "error": type(e).__name__},
+                    metrics={"latency_ms": _elapsed_ms(start_ns)},
+                    tags=pr_tags,
+                )
+                last_error = f"{backend.value}: {type(e).__name__}"
+                continue
+            findings, model, err = _parse_response(resp)
+            # Annotate AFTER the response so we capture the raw content
+            # + token counts. httpx.Response.json() re-parses from the
+            # cached .content bytes; review response bodies are small,
+            # so the cost is negligible vs the LLM round-trip.
+            try:
+                body = resp.json() if resp.status_code == 200 else {}
+            except (ValueError, json.JSONDecodeError):
+                # Triggered when the first parse also failed (CF HTML
+                # interstitial, truncated body) OR — rarely — when
+                # the cache diverges. Either way the LLM Obs span
+                # would otherwise silently emit kind=reviewed with
+                # empty content and undercount DD token-cost
+                # dashboards.
+                log.warning(
+                    "llm_body_reparse_failed",
+                    extra={
+                        "backend": backend.value,
+                        "status_code": resp.status_code,
+                    },
+                )
+                body = {}
+            content = ""
+            if isinstance(body, dict):
+                choices = body.get("choices") or []
+                if choices and isinstance(choices[0], dict):
+                    content = (choices[0].get("message") or {}).get("content", "")
+            usage_metrics = _extract_usage_metrics(body)
+            _llmobs_annotate(
+                span=span,
+                input_data=_redact_payload(messages),
+                output_data=_redact_payload(content) if content else None,
+                metadata={
+                    "backend": backend.value,
+                    "status_code": resp.status_code,
+                    "kind": "reviewed" if not err else (
+                        "parse_failed" if resp.status_code == 200 else "http_error"
+                    ),
+                },
+                metrics={
+                    "latency_ms": _elapsed_ms(start_ns),
+                    **usage_metrics,
+                },
+                tags=pr_tags,
             )
-            last_error = f"{backend.value} misconfigured: {e}"
-            continue
-        except (httpx.RequestError, httpx.TimeoutException) as e:
-            log.warning(
-                "llm_backend_transport_failed",
-                extra={"backend": backend.value, "kind": type(e).__name__},
-            )
-            last_error = f"{backend.value}: {type(e).__name__}"
-            continue
-        findings, model, err = _parse_response(resp)
         if not err:
             return LlmReviewResponse(
                 kind="reviewed",

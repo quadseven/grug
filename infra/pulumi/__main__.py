@@ -213,6 +213,11 @@ webhook = lambda_service.create(
         "DD_GIT_COMMIT_SHA": _full_commit_sha,
         "DD_TRACE_ENABLED": "true",
         "DD_LOGS_INJECTION": "true",
+        # DD LLM Observability for the Elder code-reviewer persona.
+        # Webhook-only: api Lambda never makes LLM calls so these env
+        # vars are omitted from the api section below.
+        "DD_LLMOBS_ENABLED": "true",
+        "DD_LLMOBS_ML_APP": "grug-elder",
         # Disable noisy ASGI integration that collapses every FastAPI
         # request into a single "ASGI request" trace span (per memory
         # `reference_dd_apm_asgi_resource_grouping`).
