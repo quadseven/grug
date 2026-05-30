@@ -350,10 +350,16 @@ def dispatch_code_review(
             "result": result,
         },
     )
-    # LLM-as-a-judge (#190) runs AFTER the review is published so the
-    # developer sees the review without waiting on the second LLM call.
-    # `run_judge` is fully self-guarding (never raises), but wrap it
-    # anyway — the judge is pure observability and must never affect
+    # LLM-as-a-judge (#190) runs AFTER the review + check-run are POSTed
+    # to GitHub, so the developer sees the review immediately regardless
+    # of the judge. NOTE the webhook HANDLER, however, still blocks on
+    # the judge's LLM round-trip before returning to GitHub — this is a
+    # deliberate tradeoff for v1: true async (Lambda self-invoke / SQS)
+    # is deferred to #245's scheduled-poller infra. The judge inherits
+    # the 30s `_TIMEOUT_SECONDS` and the `_JUDGE_MAX_FINDINGS` cost guard
+    # bounds the worst case; revisit if webhook-delivery timeouts appear
+    # in DD. `run_judge` is fully self-guarding (never raises), but wrap
+    # it anyway — the judge is pure observability and must never affect
     # the dispatch result the developer already has.
     try:
         run_judge(
