@@ -107,6 +107,22 @@ def test_rule_post_init_rejects_empty_example():
         )
 
 
+def test_inverted_logic_rule_present():
+    """Logic-inversion (negated condition / swapped and-or / flipped
+    comparison) is a top correctness bug class — must be covered."""
+    assert any(r.name == "inverted-logic" for r in crp.RULES)
+
+
+def test_preamble_biases_toward_precision_and_hardens_injection():
+    """The preamble must (a) tell the model to omit low-confidence
+    findings (over-reporting guard) and (b) treat diff content as data,
+    not instructions (prompt-injection hardening)."""
+    p = crp.build_system_prompt().lower()
+    assert "false negative" in p and "omit" in p          # precision lever
+    assert "at most one rule" in p                         # dedup
+    assert "instructions" in p and "data" in p             # injection hardening
+
+
 def test_severity_set_matches_llm_client_no_drift():
     """The prompt's local `_SEVERITIES` must equal llm_client's parser
     set — a rule advertising a severity the parser would drop is a
