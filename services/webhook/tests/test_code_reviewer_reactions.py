@@ -233,6 +233,47 @@ def test_poll_and_annotate_logs_mixed_signal(monkeypatch, _patch_store, caplog):
     assert any("reaction_mixed_signal" in r.message for r in caplog.records)
 
 
+def test_poll_comment_reactions_non_list_body_returns_empty(monkeypatch):
+    """GitHub returning a dict error body (not a list) → []  — never
+    hand a dict to _classify_reactions, which would iterate its keys
+    and silently misclassify."""
+    r = MagicMock(spec=httpx.Response)
+    r.status_code = 200
+    r.raise_for_status = MagicMock()
+    r.json = MagicMock(return_value={"message": "Not Found"})
+    with patch("httpx.get", return_value=r):
+        out = cr_reactions.poll_comment_reactions("tok", "o", "r", 1)
+    assert out == []
+
+
+def test_poll_and_annotate_first_poll_with_no_last_verdict_submits(monkeypatch, _patch_store):
+    """First poll of a freshly-persisted record (no `last_verdict` key
+    at all — NotRequired absent) must submit: None != verdict."""
+    submitted = _patch_annotate(monkeypatch)
+    rec = _record(comment_id=5)
+    del rec["last_verdict"]  # NotRequired — absent on a fresh row
+    with patch("httpx.get", return_value=_reactions_response(["+1"])):
+        n = cr_reactions.poll_and_annotate(
+            [rec], install_id=1, fetch_token=lambda: "tok",
+        )
+    assert n == 1
+    assert submitted[0]["verdict"] == "confirmed"
+
+
+def test_poll_and_annotate_flip_confirmed_to_false_positive(monkeypatch, _patch_store):
+    """The 👍→👎 flip direction (developer reconsiders, decides it WAS a
+    real issue's inverse — a false positive after all). Mirror of the
+    👎→👍 test so both flip directions exercise the resubmit branch."""
+    submitted = _patch_annotate(monkeypatch)
+    with patch("httpx.get", return_value=_reactions_response(["-1"])):
+        n = cr_reactions.poll_and_annotate(
+            [_record(comment_id=5, last_verdict="confirmed")],
+            install_id=1, fetch_token=lambda: "tok",
+        )
+    assert n == 1
+    assert submitted[0]["verdict"] == "false_positive"
+
+
 def test_poll_comment_reactions_uses_reactions_endpoint(monkeypatch):
     """Confirm the GH reactions REST path + preview Accept header."""
     captured = {}
