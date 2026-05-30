@@ -748,28 +748,49 @@ def _build_judge_messages(
 def _parse_judge_verdicts(content: str) -> tuple[FindingJudgement, ...]:
     """Parse the judge LLM's JSON into FindingJudgements. Malformed
     entries are dropped (best-effort — a judge parse failure must not
-    crash the review path)."""
+    crash the review path).
+
+    Every drop path logs — same discipline as the review path's
+    `_coerce_finding`. A judge whose every response is unparseable
+    (prompt drift, model swap returning prose) must be distinguishable
+    in logs from a judge that legitimately returned zero verdicts;
+    without these warnings both look identical and the ground-truth
+    dataset silently stops growing.
+    """
     try:
         parsed = json.loads(content)
     except json.JSONDecodeError:
+        log.warning("judge_verdicts_unparseable", extra={"raw": content[:200]})
         return ()
-    raw = parsed.get("verdicts", []) if isinstance(parsed, dict) else []
+    if not isinstance(parsed, dict):
+        log.warning("judge_verdicts_envelope_not_dict", extra={"raw": content[:200]})
+        return ()
+    raw = parsed.get("verdicts", [])
     if not isinstance(raw, list):
+        log.warning("judge_verdicts_not_a_list", extra={"raw": content[:200]})
         return ()
     out: list[FindingJudgement] = []
+    dropped = 0
     for entry in raw:
         if not isinstance(entry, dict):
+            dropped += 1
             continue
         try:
             idx = int(entry["index"])
             is_real = bool(entry["is_real_bug"])
         except (KeyError, TypeError, ValueError):
+            dropped += 1
             continue
         out.append(FindingJudgement(
             finding_index=idx,
             is_real_bug=is_real,
             reasoning=str(entry.get("reasoning", "")),
         ))
+    if dropped:
+        log.warning(
+            "judge_verdicts_partial_drop",
+            extra={"dropped": dropped, "kept": len(out)},
+        )
     return tuple(out)
 
 
@@ -828,6 +849,16 @@ def judge_findings(
             choices = body.get("choices") or []
             if choices and isinstance(choices[0], dict):
                 content = (choices[0].get("message") or {}).get("content", "")
+        if resp.status_code == 200 and not content:
+            # 200 but no usable content (empty body, wrong envelope
+            # shape, CF interstitial). Without this log, a persistently
+            # broken backend looks identical to "judge graded zero
+            # verdicts" — the ground-truth dataset stops growing
+            # invisibly. Distinct from judge_backend_failed (transport).
+            log.warning(
+                "judge_empty_content",
+                extra={"backend": backend.value, "status_code": resp.status_code},
+            )
         _llmobs_annotate(
             span=span,
             input_data=_redact_payload(messages),
