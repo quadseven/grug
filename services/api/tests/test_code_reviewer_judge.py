@@ -164,6 +164,39 @@ def test_run_judge_ignores_out_of_range_verdict_index(monkeypatch):
     assert submitted == []
 
 
+def test_run_judge_dedupes_duplicate_verdict_indices(monkeypatch):
+    """A misbehaving judge emitting two verdicts for the same finding
+    index must submit only ONE eval (first wins) — duplicate evals
+    would skew the ground-truth dataset toward that finding."""
+    evaluation = CodeReviewEvaluation(
+        findings=(_finding(rule="a"), _finding(rule="b", line=3)),
+        conclusion="success",
+    )
+    monkeypatch.setattr(
+        cr_judge, "judge_findings",
+        lambda *a, **kw: (
+            FindingJudgement(0, True, "first"),
+            FindingJudgement(0, False, "dup"),   # duplicate index 0
+            FindingJudgement(1, True, "ok"),
+        ),
+    )
+    submitted: list[dict] = []
+    monkeypatch.setattr(
+        cr_judge, "submit_finding_evaluation",
+        lambda **kw: submitted.append(kw),
+    )
+    cr_judge.run_judge(
+        evaluation, parse_diff(_DIFF), installation_id=1,
+        review_span_context={"span_id": "s"},
+    )
+    # 2 evals (one per finding index), not 3 — the duplicate index-0
+    # verdict is dropped; first wins (is_real_bug=True).
+    assert len(submitted) == 2
+    idx0 = [s for s in submitted if s["tags"]["rule_name"] == "a"]
+    assert len(idx0) == 1
+    assert idx0[0]["is_real_bug"] is True
+
+
 def test_run_judge_never_raises_on_submit_failure(monkeypatch):
     """A DD submit failure must not propagate — the judge is best-effort
     and the review is already published."""

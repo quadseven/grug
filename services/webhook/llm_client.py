@@ -687,11 +687,13 @@ _LLMOBS_JUDGE_NAME = "elder_judge"
 _JUDGE_EVAL_LABEL = "is_real_bug"
 
 _JUDGE_SYSTEM_PROMPT = (
-    "You are an adjudicator grading a code reviewer's findings. For each "
-    "numbered finding, decide whether it identifies a REAL, actionable bug "
-    "(true) or is a false positive / style nit / hallucination (false). "
-    "Be skeptical: prefer false unless the finding names a concrete defect "
-    "supported by the diff. Return JSON of shape "
+    "You are an adjudicator grading a code reviewer's findings to build a "
+    "ground-truth dataset. For each numbered finding, decide whether it "
+    "identifies a REAL, actionable bug (true) or is a false positive / "
+    "style nit / hallucination (false). Judge each finding ON THE EVIDENCE "
+    "in the diff — do not assume either way. Calibrated accuracy matters "
+    "more than caution: a wrong label in either direction corrupts the "
+    "dataset. Return JSON of shape "
     '{"verdicts": [{"index": int, "is_real_bug": bool, "reasoning": str}]}. '
     "One verdict per finding, matching its index. No prose outside the JSON."
 )
@@ -701,10 +703,13 @@ class JudgeFindingRepr(TypedDict):
     """Primitive finding shape the judge LLM call consumes. Defined here
     (the lower layer) so `judge_findings` has a typed key contract
     WITHOUT importing the persona `Finding` (layering: persona imports
-    down, never up). `total=True` — the persona producer
-    (`_finding_to_repr`) must supply every key, which type-checks the
-    producer↔`_build_judge_messages` consumer pair that previously
-    drifted silently behind `.get(..., '?')` defaults."""
+    down, never up). `total=True` documents that the producer
+    (`_finding_to_repr`) supplies every key and lets mypy catch a typo
+    at the boundary. `_build_judge_messages` ALSO uses `.get(..., '?')`
+    defaults as a runtime belt — the TypedDict is static-only, so an
+    untyped or future caller can't crash the best-effort judge on a
+    missing key. Static + runtime layers are complementary, not
+    redundant."""
     rule_name: str
     file: str
     line: int
@@ -814,6 +819,14 @@ def judge_findings(
     if not findings_repr:
         return ()
 
+    # WHY the backend loop here is NOT shared with review_diff's: the
+    # judge hits a SINGLE backend (no fallback — a judge outage is
+    # acceptable, the review already shipped), tags its span `judge:
+    # True`, and returns () on any error. review_diff iterates two
+    # backends with fallback + parse-failed semantics. Extracting a
+    # shared helper would need callbacks for the divergent annotate
+    # metadata + fallback control flow — more complex than the ~25-line
+    # overlap. Extract at the 3rd backend (rule-of-three), not now.
     backend = select_backend(installation_id)
     config = _BACKEND_CONFIGS[backend]
     messages = _build_judge_messages(findings_repr, hunks)

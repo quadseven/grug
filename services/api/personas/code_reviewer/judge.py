@@ -11,8 +11,8 @@ Best-effort contract: the developer already saw the review before this
 runs. A judge failure — LLM down, parse error, DD submit error — must
 never raise, never alter the review outcome. Every exit path swallows.
 
-The judge is gated on three preconditions, all of which mean "nothing
-useful to record":
+The judge is gated on two preconditions, both meaning "nothing useful
+to record":
   - no findings (clean review — nothing to grade)
   - no review_span_context (review degraded or span export failed —
     nowhere to attach the eval)
@@ -98,10 +98,17 @@ def run_judge(
         )
         # Map verdict.finding_index → finding. A verdict whose index is
         # out of range (hallucinated) or absent is dropped — only
-        # findings the judge actually graded get an eval.
+        # findings the judge actually graded get an eval. Dedupe on
+        # index (first verdict wins): a misbehaving judge that emits two
+        # verdicts for one finding would otherwise submit two evals for
+        # it, skewing the ground-truth dataset toward that finding.
+        seen_indices: set[int] = set()
         for v in verdicts:
             if not (0 <= v.finding_index < len(findings)):
                 continue
+            if v.finding_index in seen_indices:
+                continue
+            seen_indices.add(v.finding_index)
             f = findings[v.finding_index]
             submit_finding_evaluation(
                 is_real_bug=v.is_real_bug,
