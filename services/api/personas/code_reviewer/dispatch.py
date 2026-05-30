@@ -37,6 +37,7 @@ from llm_client import Hunk as LlmHunk, LlmReviewResponse, review_diff
 from personas.code_reviewer.diff_parser import (
     DiffHunk, DiffParseError, parse_diff,
 )
+from personas.code_reviewer.judge import run_judge
 from personas.code_reviewer.persona import (
     CodeReviewEvaluation, Finding, evaluate_diff,
 )
@@ -349,6 +350,32 @@ def dispatch_code_review(
             "result": result,
         },
     )
+    # LLM-as-a-judge (#190) runs AFTER the review is published so the
+    # developer sees the review without waiting on the second LLM call.
+    # `run_judge` is fully self-guarding (never raises), but wrap it
+    # anyway — the judge is pure observability and must never affect
+    # the dispatch result the developer already has.
+    try:
+        run_judge(
+            evaluation, hunks, installation_id=installation_id,
+            review_span_context=llm_response.review_span_context,
+            pr_context={
+                "installation_id": installation_id,
+                "repo": f"{owner}/{repo_name}",
+                "pr_number": pull_number,
+                "head_sha": head_sha,
+            },
+        )
+    except Exception as e:  # noqa: BLE001 — defense-in-depth over run_judge's own guard
+        log.error(
+            "code_review_judge_dispatch_failed",
+            extra={
+                "installation_id": installation_id,
+                "pr": f"{owner}/{repo_name}#{pull_number}",
+                "kind": type(e).__name__,
+            },
+        )
+
     # Result shape mirrors TPM's `{persona, result}` so dispatcher can
     # treat both uniformly. The outer dispatcher wraps with `status`.
     return {

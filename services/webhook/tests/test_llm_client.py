@@ -812,3 +812,154 @@ def test_no_diff_short_circuit_does_not_emit_llmobs_span(monkeypatch) -> None:
     out = review_diff([], installation_id=1)
     assert out.kind == "no_diff"
     assert annotate_calls == []
+
+
+def test_review_diff_carries_exported_span_context_on_success(monkeypatch) -> None:
+    """The review span is exported onto the response so the LLM-as-a-
+    judge (slice #190) can attach per-finding `is_real_bug` evaluations
+    to the exact span whose output produced the findings."""
+    _capture_llmobs(monkeypatch)
+    monkeypatch.setattr(
+        lc, "_llmobs_export", lambda span: {"span_id": "s1", "trace_id": "t1"},
+    )
+    response = httpx.Response(200, json=_openai_json_response('{"findings":[]}'))
+    with patch.object(httpx, "post", return_value=response):
+        out = review_diff([_hunk()], installation_id=1)
+    assert out.kind == "reviewed"
+    assert out.review_span_context == {"span_id": "s1", "trace_id": "t1"}
+
+
+# ---------------------------------------------------------------------------
+# LLM-as-a-judge (#190) — second LLM call scores each finding is_real_bug.
+# ---------------------------------------------------------------------------
+
+def test_judge_findings_makes_second_llm_call_and_parses_verdicts(monkeypatch) -> None:
+    """judge_findings sends the findings + diff to a second LLM call and
+    parses a verdicts array into FindingJudgement objects."""
+    _capture_llmobs(monkeypatch)
+    verdicts_json = (
+        '{"verdicts": ['
+        '{"index": 0, "is_real_bug": true, "reasoning": "real null deref"},'
+        '{"index": 1, "is_real_bug": false, "reasoning": "style nit, not a bug"}'
+        ']}'
+    )
+    response = httpx.Response(200, json=_openai_json_response(verdicts_json))
+    findings_repr = [
+        {"rule_name": "null-deref", "file": "x.py", "line": 2, "message": "m1"},
+        {"rule_name": "style", "file": "x.py", "line": 3, "message": "m2"},
+    ]
+    with patch.object(httpx, "post", return_value=response):
+        out = lc.judge_findings(findings_repr, [_hunk()], installation_id=1)
+
+    assert len(out) == 2
+    assert out[0].finding_index == 0
+    assert out[0].is_real_bug is True
+    assert out[1].finding_index == 1
+    assert out[1].is_real_bug is False
+    assert "style nit" in out[1].reasoning
+
+
+def test_judge_findings_emits_its_own_llmobs_span(monkeypatch) -> None:
+    """The judge LLM call is itself traced (own span, name elder_judge)
+    so its prompt/latency/tokens/cost show up in DD distinct from the
+    review call."""
+    annotate_calls = _capture_llmobs(monkeypatch)
+    response = httpx.Response(200, json=_openai_json_response('{"verdicts":[]}'))
+    findings_repr = [{"rule_name": "r", "file": "x.py", "line": 2, "message": "m"}]
+    with patch.object(httpx, "post", return_value=response):
+        lc.judge_findings(findings_repr, [_hunk()], installation_id=1)
+    # judge call emits a span tagged judge=True (distinct from the
+    # review span) even when the LLM returns zero verdicts.
+    assert len(annotate_calls) == 1
+    assert annotate_calls[0]["metadata"]["judge"] is True
+
+
+def test_judge_findings_returns_empty_on_llm_failure(monkeypatch) -> None:
+    """If the judge LLM call fails (transport / parse), return empty —
+    the judge is best-effort observability, never blocks the review."""
+    monkeypatch.setattr(lc, "_RETRY_SLEEP", lambda s: None)
+    _capture_llmobs(monkeypatch)
+
+    def _timeout(*a, **kw):
+        raise httpx.ReadTimeout("judge backend down")
+
+    findings_repr = [{"rule_name": "r", "file": "x.py", "line": 2, "message": "m"}]
+    with patch.object(httpx, "post", side_effect=_timeout):
+        out = lc.judge_findings(findings_repr, [_hunk()], installation_id=1)
+    assert out == ()
+
+
+def test_judge_findings_empty_findings_short_circuits(monkeypatch) -> None:
+    """No findings → no judge call (nothing to evaluate)."""
+    annotate_calls = _capture_llmobs(monkeypatch)
+    with patch.object(httpx, "post") as mock_post:
+        out = lc.judge_findings([], [_hunk()], installation_id=1)
+    # Empty findings is a legit "nothing to judge" — skip the LLM call.
+    assert out == ()
+    mock_post.assert_not_called()
+    assert annotate_calls == []
+
+
+def test_judge_findings_redacts_secrets_in_judge_span(monkeypatch) -> None:
+    """The judge prompt embeds the diff too — must redact before the
+    span leaves the process, same as the review span."""
+    annotate_calls = _capture_llmobs(monkeypatch)
+    response = httpx.Response(200, json=_openai_json_response('{"verdicts":[]}'))
+    leaky_hunk = lc.Hunk(path="x.py", body="+key='AKIAIOSFODNN7EXAMPLE'")
+    findings_repr = [{"rule_name": "r", "file": "x.py", "line": 1, "message": "m"}]
+    with patch.object(httpx, "post", return_value=response):
+        lc.judge_findings(findings_repr, [leaky_hunk], installation_id=1)
+    span_input = json.dumps(annotate_calls[0]["input_data"])
+    assert "AKIAIOSFODNN7EXAMPLE" not in span_input
+    assert "[REDACTED:aws-access-key]" in span_input
+
+
+def test_submit_finding_evaluation_calls_dd_seam(monkeypatch) -> None:
+    """submit_finding_evaluation maps is_real_bug → a DD LLM Obs
+    categorical evaluation attached to the review span."""
+    eval_calls: list[dict] = []
+    monkeypatch.setattr(
+        lc, "_llmobs_submit_evaluation", lambda **kw: eval_calls.append(kw),
+    )
+    span_ctx = {"span_id": "s1", "trace_id": "t1"}
+    lc.submit_finding_evaluation(
+        is_real_bug=True,
+        reasoning="real bug",
+        review_span_context=span_ctx,
+        tags={"rule_name": "null-deref", "file": "x.py", "line": "2"},
+    )
+    assert len(eval_calls) == 1
+    call = eval_calls[0]
+    assert call["label"] == "is_real_bug"
+    assert call["metric_type"] == "categorical"
+    assert call["value"] == "true"
+    assert call["span"] == span_ctx
+    assert call["tags"]["rule_name"] == "null-deref"
+    # reasoning surfaced for the annotation-queue reviewer.
+    assert call["reasoning"] == "real bug"
+
+
+def test_submit_finding_evaluation_false_maps_to_string_false(monkeypatch) -> None:
+    eval_calls: list[dict] = []
+    monkeypatch.setattr(
+        lc, "_llmobs_submit_evaluation", lambda **kw: eval_calls.append(kw),
+    )
+    lc.submit_finding_evaluation(
+        is_real_bug=False, reasoning="fp",
+        review_span_context={"span_id": "s"}, tags={},
+    )
+    assert eval_calls[0]["value"] == "false"
+
+
+def test_submit_finding_evaluation_skips_when_no_span_context(monkeypatch) -> None:
+    """No review span context (review degraded / span export failed) →
+    can't attach an eval; skip silently rather than crash."""
+    eval_calls: list[dict] = []
+    monkeypatch.setattr(
+        lc, "_llmobs_submit_evaluation", lambda **kw: eval_calls.append(kw),
+    )
+    lc.submit_finding_evaluation(
+        is_real_bug=True, reasoning="x",
+        review_span_context=None, tags={},
+    )
+    assert eval_calls == []
