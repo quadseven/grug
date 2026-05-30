@@ -237,7 +237,7 @@ def test_poll_comment_reactions_uses_reactions_endpoint(monkeypatch):
     """Confirm the GH reactions REST path + preview Accept header."""
     captured = {}
 
-    def capture(url, *, headers, timeout):
+    def capture(url, *, params, headers, timeout):
         captured["url"] = url
         captured["headers"] = headers
         return _reactions_response(["+1"])
@@ -249,3 +249,27 @@ def test_poll_comment_reactions_uses_reactions_endpoint(monkeypatch):
     )
     assert captured["headers"]["Authorization"] == "Bearer tok"
     assert out == [{"content": "+1"}]
+
+
+def test_poll_comment_reactions_requests_max_page_size(monkeypatch):
+    """per_page=100 so a 👎 past the default 30-per-page boundary on a
+    heavily-reacted comment isn't silently dropped (would misclassify
+    as confirmed and poison the calibration set)."""
+    captured = {}
+
+    def capture(url, *, params, headers, timeout):
+        captured["params"] = params
+        return _reactions_response(["+1"])
+
+    with patch("httpx.get", side_effect=capture):
+        cr_reactions.poll_comment_reactions("tok", "o", "r", 99)
+    assert captured["params"]["per_page"] == 100
+
+
+def test_classify_finds_thumbs_down_among_many_reactions():
+    """A 👎 mixed into a large reaction list (e.g. 40 hearts + 1 👎)
+    must still classify false_positive — the set-membership check
+    doesn't depend on position, but lock it so a future refactor to
+    'first N' slicing can't reintroduce the miss."""
+    reactions = [{"content": "heart"}] * 40 + [{"content": "-1"}]
+    assert cr_reactions._classify_reactions(reactions) == "false_positive"

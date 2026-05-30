@@ -50,6 +50,14 @@ def _classify_reactions(reactions: list[dict]) -> Optional[ReactionVerdict]:
     higher-value correction (it tells us the reviewer was wrong, which
     is what prompt-optimization needs most). Non-thumbs reactions
     (heart/rocket/eyes) carry no verdict signal → None.
+
+    This classifies WHATEVER reactions it's handed — it does NOT filter
+    by who reacted. A passerby's 👎 currently counts the same as the PR
+    author's. Filtering to author/collaborator reactions needs the PR
+    author identity (captured at persist time) and is tracked in the
+    dispatch-wiring slice (#247). Until then the asymmetric 👎-wins rule
+    is bias-prone: the mixed-signal log (below) marks contested rows so
+    the calibration set can DOWN-WEIGHT them, not merely filter.
     """
     contents = {r.get("content") for r in reactions}
     if "-1" in contents:
@@ -64,9 +72,18 @@ def poll_comment_reactions(
 ) -> list[dict]:
     """GET the reactions on one PR review comment. Raises on transport /
     HTTP error — the batch caller catches per-record so one failure
-    doesn't abort the cycle."""
+    doesn't abort the cycle.
+
+    `per_page=100` (the max) — the endpoint defaults to 30/page and
+    returns reactions in created_at order. Without this, a 👎 sitting
+    past position 30 on a heavily-reacted comment would never be seen
+    and the comment would misclassify as confirmed/None — defeating the
+    "👎 wins" calibration premise. 100 makes a miss effectively
+    impossible for a single review comment (full Link-header pagination
+    would be over-engineering at that ceiling)."""
     resp = httpx.get(
         f"{_GH_API}/repos/{owner}/{repo}/pulls/comments/{comment_id}/reactions",
+        params={"per_page": 100},
         headers={
             "Authorization": f"Bearer {install_token}",
             "Accept": "application/vnd.github+json",
@@ -99,9 +116,9 @@ def poll_and_annotate(
         comment_id = rec["comment_id"]
         span_context = rec.get("review_span_context")
         if span_context is None:
-            # Review was degraded at publish — no span to attach an
-            # annotation to. Skip (the record shouldn't have been
-            # persisted, but tolerate it).
+            # No span to attach the annotation to. `put_comment_record`
+            # types this non-None, so this is a defensive guard against
+            # a legacy/hand-written row, not an expected path.
             continue
         # `partition` (not `split` + splat): a malformed persisted repo
         # without a "/" would make `*split("/",1)` a 1-element splat →

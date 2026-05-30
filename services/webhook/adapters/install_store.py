@@ -350,7 +350,7 @@ class CommentRecord(TypedDict):
     repo: str
     pr_number: int
     review_span_context: Optional[dict]
-    finding_tags: dict
+    finding_tags: dict[str, str]
     last_verdict: NotRequired[Optional[str]]
 
 
