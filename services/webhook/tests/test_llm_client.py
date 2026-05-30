@@ -1,6 +1,7 @@
 """Tests for the LLM client abstraction."""
 from __future__ import annotations
 
+import json
 from unittest.mock import patch
 
 import httpx
@@ -723,6 +724,85 @@ def test_llmobs_body_reparse_failure_logs_warning(monkeypatch, caplog) -> None:
     )
     # Span still emitted, just with empty output.
     assert annotate_calls[0]["metadata"]["backend"] == "openrouter"
+
+
+def test_redact_secrets_strips_aws_github_pem_env_patterns() -> None:
+    """Defense-in-depth atop the DD org-level sensitive data scanner.
+    We must not ship raw secrets across the wire in the first place —
+    a PR diff that touches a .env or accidentally commits a key file
+    should not persist in DD storage as plaintext."""
+    raw = (
+        "AKIAIOSFODNN7EXAMPLE in some code "
+        "and ghp_1234567890abcdefghijklmnopqrstuvwxyzAB github token "
+        "and PASSWORD=supersecretvalue12345 env line "
+        "and -----BEGIN RSA PRIVATE KEY-----\nMIIEpAIB\n-----END RSA PRIVATE KEY----- pem"
+    )
+    out = lc._redact_secrets(raw)
+    assert "AKIAIOSFODNN7EXAMPLE" not in out
+    assert "[REDACTED:aws-access-key]" in out
+    assert "ghp_1234567890" not in out
+    assert "[REDACTED:github-pat]" in out
+    assert "supersecretvalue" not in out
+    assert "[REDACTED:env-secret]" in out
+    assert "MIIEpAIB" not in out
+    assert "[REDACTED:pem-private-key]" in out
+
+
+def test_redact_payload_walks_message_list_structure() -> None:
+    """The OpenAI-compat `messages` payload is `list[dict[str, str]]`.
+    Redaction must walk the structure — not just stringify it — so
+    nested string values get scrubbed without losing the shape."""
+    messages = [
+        {"role": "system", "content": "You are a reviewer"},
+        {"role": "user", "content": "diff: PASSWORD=secret12345 line"},
+    ]
+    out = lc._redact_payload(messages)
+    assert isinstance(out, list)
+    assert out[0]["role"] == "system"
+    assert "secret12345" not in out[1]["content"]
+    assert "[REDACTED:env-secret]" in out[1]["content"]
+
+
+def test_redact_payload_truncates_after_redaction() -> None:
+    """Truncation runs AFTER redaction so a trailing PEM fragment can't
+    survive a mid-string cut. Bound exposure even when no patterns
+    match (massive lockfile diff)."""
+    huge = "x" * 100_000
+    out = lc._redact_payload(huge)
+    assert len(out) == lc._LLMOBS_PAYLOAD_TRUNC_BYTES
+
+
+def test_llmobs_input_data_is_redacted_on_success(monkeypatch) -> None:
+    """End-to-end: a diff containing a fake AWS key reaches the span
+    redacted. Catches a regression where _redact_payload is dropped
+    from the input_data argument."""
+    annotate_calls = _capture_llmobs(monkeypatch)
+    leaky_hunk = lc.Hunk(
+        path="bad.py",
+        body="+AWS_KEY = 'AKIAIOSFODNN7EXAMPLE'  # oops",
+    )
+    response = httpx.Response(200, json=_openai_json_response('{"findings":[]}'))
+    with patch.object(httpx, "post", return_value=response):
+        review_diff([leaky_hunk], installation_id=1)
+    span_input_str = json.dumps(annotate_calls[0]["input_data"])
+    assert "AKIAIOSFODNN7EXAMPLE" not in span_input_str
+    assert "[REDACTED:aws-access-key]" in span_input_str
+
+
+def test_llmobs_output_data_is_redacted_on_success(monkeypatch) -> None:
+    """A hallucinating LLM might echo a secret back in its response.
+    output_data must also pass through _redact_payload."""
+    annotate_calls = _capture_llmobs(monkeypatch)
+    leaky_content = (
+        '{"findings": [{"path": "x", "line": 1, "rule": "leak", '
+        '"severity": "critical", "message": "found AKIAIOSFODNN7EXAMPLE"}]}'
+    )
+    response = httpx.Response(200, json=_openai_json_response(leaky_content))
+    with patch.object(httpx, "post", return_value=response):
+        review_diff([_hunk()], installation_id=1)
+    out_str = str(annotate_calls[0]["output_data"])
+    assert "AKIAIOSFODNN7EXAMPLE" not in out_str
+    assert "[REDACTED:aws-access-key]" in out_str
 
 
 def test_no_diff_short_circuit_does_not_emit_llmobs_span(monkeypatch) -> None:
