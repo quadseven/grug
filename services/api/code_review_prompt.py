@@ -22,13 +22,36 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 
+# Local severity set — NOT imported from llm_client (that would cycle:
+# llm_client imports this module). A drift-guard test asserts this
+# equals llm_client's `_VALID_SEVERITIES`. (The proper fix — one
+# `Severity` Literal in a shared leaf module that both import — is
+# tracked separately; it spans persona.py + llm_client + both mirrors.)
+_SEVERITIES: frozenset[str] = frozenset(("low", "medium", "high", "critical"))
+
+# Closed taxonomy of bug classes (display labels rendered into the
+# prompt). Closed so a typo'd class fails at import rather than shipping
+# a one-off label that fragments the rule taxonomy.
+_BUG_CLASSES: frozenset[str] = frozenset((
+    "silent failure", "correctness", "async blocker", "concurrency",
+    "test fidelity", "robustness", "security", "type design",
+    "maintainability", "test coverage",
+))
+
 
 @dataclass(frozen=True, slots=True)
 class ReviewRule:
     """One named bug-class rule. `name` doubles as the `rule` field on
     emitted findings, so it must be a space-free identifier. `severity`
     is the DEFAULT severity hint for this class — the LLM may adjust
-    per-instance, but it anchors calibration."""
+    per-instance, but it anchors calibration.
+
+    `__post_init__` enforces the field invariants at import time: `RULES`
+    is hand-authored and `build_system_prompt()` runs at import, so a
+    typo (bad severity, spaces in a name, empty example) would silently
+    poison the live system prompt. The guard turns that into an
+    immediate ImportError instead — complementing, not replacing, the
+    suite's well-formedness tests."""
 
     name: str
     bug_class: str
@@ -36,6 +59,31 @@ class ReviewRule:
     bad_example: str
     good_example: str
     severity: str
+
+    def __post_init__(self) -> None:
+        if not self.name or " " in self.name:
+            raise ValueError(
+                f"ReviewRule.name must be a non-empty space-free identifier "
+                f"(it becomes the `rule` field): {self.name!r}"
+            )
+        if self.severity not in _SEVERITIES:
+            raise ValueError(
+                f"ReviewRule[{self.name}].severity {self.severity!r} not in "
+                f"{sorted(_SEVERITIES)} — would instruct a severity the "
+                "parser drops"
+            )
+        if self.bug_class not in _BUG_CLASSES:
+            raise ValueError(
+                f"ReviewRule[{self.name}].bug_class {self.bug_class!r} not in "
+                f"the closed taxonomy {sorted(_BUG_CLASSES)}"
+            )
+        if not self.description.strip():
+            raise ValueError(f"ReviewRule[{self.name}] has empty description")
+        if not self.bad_example.strip() or not self.good_example.strip():
+            raise ValueError(
+                f"ReviewRule[{self.name}] needs both a bad and good example "
+                "(the concrete anchor is the point of the rule)"
+            )
 
 
 # Seeded from the /audit skill stages (silent-failure-hunter,
