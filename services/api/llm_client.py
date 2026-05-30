@@ -30,7 +30,7 @@ import os
 import time
 from dataclasses import dataclass, field
 from enum import Enum
-from typing import Any, Callable, Literal, Optional, get_args
+from typing import Any, Callable, Literal, Optional, TypedDict, get_args
 
 import httpx
 
@@ -70,6 +70,22 @@ except ImportError:  # pragma: no cover — local dev without ddtrace
 
 _LLMOBS_NAME = "elder_code_review"
 _LLMOBS_HEAD_SHA_TAG_LEN = 8  # truncated to keep tag cardinality bounded
+
+
+class PrContext(TypedDict, total=False):
+    """PR coords threaded into DD LLM Obs span tags.
+
+    `total=False` (every key optional) because callers without GH
+    coords (e.g. ad-hoc tests, future REPL probes) still need to be
+    able to call `review_diff` — they just get traces without
+    PR-filterable tags. Promoting from a bare `dict` makes typos like
+    `pr_num` fail at type-check time rather than silently dropping the
+    tag in DD.
+    """
+    installation_id: int
+    repo: str
+    pr_number: int
+    head_sha: str
 
 
 def _elapsed_ms(start_ns: int) -> int:
@@ -385,7 +401,7 @@ def _parse_response(
     return tuple(coerced), model_name, ""
 
 
-def _llmobs_tags(pr_context: Optional[dict]) -> dict[str, str]:
+def _llmobs_tags(pr_context: Optional[PrContext]) -> dict[str, str]:
     """Build the tag dict for an LLM Obs span from `pr_context`.
 
     Tags are stringified because DD facet types are inferred from the
@@ -426,7 +442,7 @@ def _extract_usage_metrics(body: Any) -> dict[str, Optional[int]]:
 def review_diff(
     hunks: list[Hunk],
     installation_id: int,
-    pr_context: Optional[dict] = None,
+    pr_context: Optional[PrContext] = None,
 ) -> LlmReviewResponse:
     """Send `hunks` to the round-robin-selected LLM and return findings.
 
