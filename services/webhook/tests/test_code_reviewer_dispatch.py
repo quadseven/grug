@@ -318,6 +318,63 @@ def test_resolve_result_publish_failed_wins_over_skipped():
     ) == "publish_failed"
 
 
+def test_dispatch_emits_structured_log_on_success(monkeypatch, caplog):
+    """Acceptance criterion (#186): "Grug webhook logs show
+    `code_reviewer_dispatched` structured log entry." Operator uses
+    this to confirm Elder ran on a real PR end-to-end. Must include
+    pr, installation_id, backend, model, finding count, and result."""
+    llm = LlmReviewResponse(
+        kind="reviewed",
+        findings=(LlmFinding(
+            path="src/x.py", line=2, rule="silent-failure",
+            severity="medium", message="catches Exception silently",  # type: ignore[arg-type]
+        ),),
+        backend_used=Backend.POOLSIDE,
+        model_name="poolside/laguna-m.1",
+    )
+    monkeypatch.setattr(cr_dispatch, "review_diff", lambda *a, **kw: llm)
+    monkeypatch.setattr(cr_dispatch, "post_check_run", lambda *a, **kw: {})
+    monkeypatch.setattr(cr_dispatch, "post_review", lambda *a, **kw: {})
+
+    with caplog.at_level("INFO"):
+        with patch("httpx.get", return_value=_diff_response()):
+            cr_dispatch.dispatch_code_review(_payload(), blocking=False)
+
+    dispatched_records = [
+        r for r in caplog.records if r.message == "code_reviewer_dispatched"
+    ]
+    assert len(dispatched_records) == 1
+    extra = dispatched_records[0].__dict__
+    # Operator must be able to filter by install + PR coords.
+    assert extra.get("installation_id") == 11
+    assert extra.get("pr") == "myorg/myrepo#7"
+    # Backend + model attribution for DD LLM Obs / per-backend dashboards.
+    assert extra.get("backend") == "poolside"
+    assert extra.get("model") == "poolside/laguna-m.1"
+    # Finding count + result for at-a-glance triage.
+    assert extra.get("findings_count") == 1
+    assert extra.get("result") == "pass"
+
+
+def test_dispatch_structured_log_carries_degraded_reason(monkeypatch, caplog):
+    """When LLM all_failed → degraded_reason on the log so DD can
+    correlate dispatch volume with backend health."""
+    llm = LlmReviewResponse(kind="all_failed", error="poolside: timeout")
+    monkeypatch.setattr(cr_dispatch, "review_diff", lambda *a, **kw: llm)
+    monkeypatch.setattr(cr_dispatch, "post_check_run", lambda *a, **kw: {})
+    monkeypatch.setattr(cr_dispatch, "post_review", lambda *a, **kw: {})
+
+    with caplog.at_level("INFO"):
+        with patch("httpx.get", return_value=_diff_response()):
+            cr_dispatch.dispatch_code_review(_payload(), blocking=False)
+
+    rec = next(
+        r for r in caplog.records if r.message == "code_reviewer_dispatched"
+    )
+    assert rec.__dict__.get("degraded_reason") == "all_failed"
+    assert rec.__dict__.get("result") == "skipped"
+
+
 def test_dispatch_fetches_diff_with_diff_accept_header(monkeypatch):
     """Confirms the GH API call uses `Accept: application/vnd.github.diff`
     so we get the unified-diff body rather than the JSON metadata."""
