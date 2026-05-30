@@ -323,3 +323,83 @@ def is_persona_enabled(install_id: int, repo_id: int, persona: str) -> bool:
     cfg = get_repo_config(install_id, repo_id)
     key = f"{persona}_enabled"
     return bool(cfg.get(key, _DEFAULT_PERSONA_CONFIG.get(key, True)))
+
+
+# ---------------------------------------------------------------------------
+# Elder reaction-poll comment records (#245)
+# ---------------------------------------------------------------------------
+#
+# Each Grug-posted inline review comment is persisted so a scheduled
+# poller (#245b) can later read its 👍/👎 reactions and attribute a
+# `human_verdict` DD LLM Obs annotation to the review span that produced
+# the finding. SK shape: `CRCOMMENT#<comment_id>` under the install PK.
+# `last_verdict` is the dedup baseline — the poller only submits an
+# annotation when the current reaction classification differs from it.
+
+
+def _comment_record_sk(comment_id: int | str) -> str:
+    return f"CRCOMMENT#{comment_id}"
+
+
+def put_comment_record(
+    *,
+    install_id: int,
+    comment_id: int,
+    repo: str,
+    pr_number: int,
+    review_span_context: dict,
+    finding_tags: dict,
+) -> None:
+    """Persist a Grug inline-comment for later reaction polling. Idempotent
+    upsert — re-posting the same comment_id overwrites (the span context
+    + finding identity are stable per comment). `last_verdict` is left
+    unset (None) so the first poll that sees a reaction always submits."""
+    _table.put_item(Item={
+        "PK": _inst_pk(install_id),
+        "SK": _comment_record_sk(comment_id),
+        "comment_id": int(comment_id),
+        "repo": repo,
+        "pr_number": int(pr_number),
+        "review_span_context": review_span_context,
+        "finding_tags": finding_tags,
+    })
+
+
+def list_comment_records(install_id: int) -> list[dict[str, Any]]:
+    """Return all Grug comment records for an install (the poll batch).
+    Scoped to the install PK + `CRCOMMENT#` SK prefix so another
+    install's records can't leak into the batch."""
+    resp = _table.query(
+        KeyConditionExpression=(
+            "PK = :pk AND begins_with(SK, :sk)"
+        ),
+        ExpressionAttributeValues={
+            ":pk": _inst_pk(install_id),
+            ":sk": "CRCOMMENT#",
+        },
+    )
+    out: list[dict[str, Any]] = []
+    for item in resp.get("Items", []):
+        out.append({
+            "comment_id": int(item["comment_id"]),
+            "repo": item["repo"],
+            "pr_number": int(item["pr_number"]),
+            "review_span_context": item.get("review_span_context"),
+            "finding_tags": item.get("finding_tags", {}),
+            # None until the first reaction is polled + submitted.
+            "last_verdict": item.get("last_verdict"),
+        })
+    return out
+
+
+def update_comment_record_reaction(
+    *, install_id: int, comment_id: int, verdict: str,
+) -> None:
+    """Record the last-submitted verdict — the dedup baseline. The poller
+    compares the current reaction classification against `last_verdict`
+    and only submits a DD annotation when it changed."""
+    _table.update_item(
+        Key={"PK": _inst_pk(install_id), "SK": _comment_record_sk(comment_id)},
+        UpdateExpression="SET last_verdict = :v",
+        ExpressionAttributeValues={":v": verdict},
+    )
