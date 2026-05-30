@@ -19,11 +19,15 @@ submitted to DD). We only submit when the current classification
 differs — so a 👎 that's been sitting for days doesn't re-submit every
 poll cycle, but a developer flipping 👎→👍 (changed their mind) does.
 Dedup is at-least-once, NOT exactly-once: if the DD submit succeeds but
-the baseline write then fails, the next cycle re-submits. That's
-deliberate — DD `submit_evaluation` on the same (span, label) is an
-upsert, so a re-submit is benign, and re-submitting is strictly better
-than losing a human 👍/👎 forever (which is what advancing the baseline
-before a confirmed submit would risk).
+the baseline write then fails, the next cycle re-submits. DD LLM Obs
+evaluations are time-series events (each `submit_evaluation` carries a
+generation timestamp), so a re-submit APPENDS a second `human_verdict`
+event on the span — it does NOT overwrite. We accept that: a rare
+duplicate (only on a submit-ok / baseline-write-fail partial failure,
+which needs a DDB fault) is strictly better than advancing the baseline
+before a confirmed submit and losing a human 👍/👎 forever. The
+calibration consumer MUST dedup by (span, label) taking the latest
+timestamp — do not assume one eval per comment.
 """
 from __future__ import annotations
 
@@ -170,9 +174,9 @@ def poll_and_annotate(
         # not let one bad record abort the rest of the batch. Submit
         # FIRST, advance the baseline only after — so on a partial
         # failure we re-submit next cycle rather than lose the human
-        # signal forever. DD `submit_evaluation` on the same span+label
-        # is an upsert, so a re-submit is benign (see module docstring:
-        # dedup is at-least-once, not exactly-once, under failure).
+        # signal forever. A re-submit APPENDS a duplicate eval (DD evals
+        # are time-series, not upserts) — accepted; the calibration
+        # consumer dedups by (span, label). See module docstring.
         try:
             submit_reaction_annotation(
                 verdict=verdict,
