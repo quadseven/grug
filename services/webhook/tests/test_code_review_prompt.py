@@ -99,11 +99,37 @@ def test_rule_post_init_rejects_unknown_bug_class():
         )
 
 
-def test_rule_post_init_rejects_empty_example():
+def test_rule_post_init_rejects_empty_good_example():
     with pytest.raises(ValueError, match="example"):
         crp.ReviewRule(
             name="x", bug_class="correctness", description="desc here long",
             bad_example="b", good_example="   ", severity="low",
+        )
+
+
+def test_rule_post_init_rejects_empty_bad_example():
+    """Left operand of the example guard (bad_example blank, good ok)."""
+    with pytest.raises(ValueError, match="example"):
+        crp.ReviewRule(
+            name="x", bug_class="correctness", description="desc here long",
+            bad_example="   ", good_example="g", severity="low",
+        )
+
+
+def test_rule_post_init_rejects_empty_name():
+    """`not self.name` operand (distinct from the spaces operand)."""
+    with pytest.raises(ValueError, match="space-free"):
+        crp.ReviewRule(
+            name="", bug_class="correctness", description="desc here long",
+            bad_example="b", good_example="g", severity="low",
+        )
+
+
+def test_rule_post_init_rejects_empty_description():
+    with pytest.raises(ValueError, match="description"):
+        crp.ReviewRule(
+            name="x", bug_class="correctness", description="   ",
+            bad_example="b", good_example="g", severity="low",
         )
 
 

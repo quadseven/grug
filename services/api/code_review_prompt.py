@@ -86,10 +86,10 @@ class ReviewRule:
             )
 
 
-# Seeded from the /audit skill stages (silent-failure-hunter,
-# async-blocker-hunter, type-design-analyzer, code-reviewer, etc.).
-# Adding a rule here automatically flows into the prompt via
-# `build_system_prompt` — no other edit needed.
+# Seeded from the /audit bug-class stages (type-design, silent-failure,
+# async-blocker, simplifier, code-reviewer, ...). Adding a rule here
+# automatically flows into the prompt via `build_system_prompt` — no
+# other edit needed.
 RULES: tuple[ReviewRule, ...] = (
     ReviewRule(
         name="silent-exception-swallow",
@@ -271,8 +271,8 @@ _PREAMBLE = (
     "diff hunks against the rules below. Flag ONLY concrete, actionable "
     "instances you can point to a specific changed line for — not stylistic "
     "preferences. If the diff is clean, return an empty findings list.\n"
-    # Precision lever: with this many vivid bad-examples a small model
-    # tends to pattern-match and over-report. Bias it toward recall-loss
+    # Precision lever: a small model tends to over-report by pattern-
+    # matching against the vivid bad-examples. Bias it toward recall-loss
     # over noise — an advisory reviewer that cries wolf gets muted.
     "Prefer a false negative over a false positive: when you are not "
     "confident a line is genuinely defective, OMIT it. Report each line "
