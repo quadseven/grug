@@ -49,6 +49,11 @@ log = logging.getLogger(f"{os.getenv('DD_SERVICE', 'grug')}.persona.code_reviewe
 
 _CHECK_NAME = "Grug — Code Review"
 _DIFF_FETCH_TIMEOUT = 30
+# Hard cap on review-comment pages (100/page) — a runaway pagination
+# (malformed/proxy response always returning a full page) can't spin
+# inside the timeout budget. 50 pages = 5000 comments, far beyond any
+# real PR.
+_MAX_COMMENT_PAGES = 50
 
 # Literal (not bool) so a future "degraded"/"experimental" mode can't
 # silently invert `if not blocking` call sites.
@@ -85,8 +90,7 @@ def _fetch_pr_review_comments(
     findings already posted on a prior review pass (#189). Returns the
     raw comment dicts (each carries `path`, `line`, `body`)."""
     out: list[dict] = []
-    page = 1
-    while True:
+    for page in range(1, _MAX_COMMENT_PAGES + 1):
         resp = httpx.get(
             f"https://api.github.com/repos/{owner}/{repo}/pulls/{pull_number}/comments",
             params={"per_page": 100, "page": page},
@@ -99,22 +103,40 @@ def _fetch_pr_review_comments(
         )
         resp.raise_for_status()
         body = resp.json()
-        batch = body if isinstance(body, list) else []
-        out.extend(batch)
-        # GitHub returns a short (<per_page) final page; stop there.
-        if len(batch) < 100:
+        if not isinstance(body, list):
+            # A non-list 200 (proxy interstitial / error envelope) is
+            # NOT "no comments" — log it rather than silently treating
+            # it as empty (which would let stale findings re-post).
+            log.warning(
+                "code_review_comments_non_list_body",
+                extra={"repo": f"{owner}/{repo}", "pr": pull_number},
+            )
             break
-        page += 1
+        out.extend(body)
+        # GitHub returns a short (<per_page) final page; stop there.
+        if len(body) < 100:
+            break
+    else:
+        # Hit the page cap without a short page — a PR with >5000 review
+        # comments is implausible; log so a runaway pagination is visible
+        # rather than silently capping the dedup set.
+        log.warning(
+            "code_review_comments_page_cap_hit",
+            extra={"repo": f"{owner}/{repo}", "pr": pull_number,
+                   "max_pages": _MAX_COMMENT_PAGES},
+        )
     return out
 
 
 def _prior_finding_keys(
     installation_id: int, owner: str, repo_name: str, pull_number: int,
-) -> frozenset[str]:
+) -> tuple[frozenset[str], bool]:
     """Fetch prior Grug review comments and build the dedup key set.
-    Best-effort: a fetch failure returns an empty set (so we fall back
-    to posting everything — a duplicate comment is a lesser evil than
-    skipping the whole review)."""
+    Returns `(keys, degraded)`. Best-effort: a fetch failure returns
+    `(frozenset(), True)` — we fall back to posting everything (a
+    duplicate comment is a lesser evil than skipping the whole review).
+    `degraded` lets the caller distinguish "fetch failed → empty" from
+    the legitimate "no prior comments → empty" in the dispatch log."""
     try:
         comments = with_install_token_retry(
             installation_id,
@@ -131,8 +153,8 @@ def _prior_finding_keys(
                 "kind": type(e).__name__,
             },
         )
-        return frozenset()
-    return frozenset(prior_keys_from_comments(comments))
+        return frozenset(), True
+    return frozenset(prior_keys_from_comments(comments)), False
 
 
 def _to_llm_hunks(hunks: tuple[DiffHunk, ...]) -> list[LlmHunk]:
@@ -379,8 +401,9 @@ def dispatch_code_review(
     # (opened/ready_for_review) there are no prior Grug comments, so
     # skip the fetch entirely.
     prior_keys: frozenset[str] = frozenset()
+    dedup_degraded = False
     if action in {"synchronize", "reopened"}:
-        prior_keys = _prior_finding_keys(
+        prior_keys, dedup_degraded = _prior_finding_keys(
             installation_id, owner, repo_name, pull_number,
         )
     review_result = _build_review_result(
@@ -430,6 +453,10 @@ def dispatch_code_review(
             "findings_count": len(evaluation.findings),
             "dropped_hallucinations": evaluation.dropped_hallucinations,
             "degraded_reason": evaluation.degraded_reason,
+            # True when the prior-comments fetch failed on a re-review:
+            # dedup fell back to post-everything, so duplicate comments
+            # this cycle are a fetch artifact, not new findings.
+            "dedup_degraded": dedup_degraded,
             "result": result,
         },
     )
