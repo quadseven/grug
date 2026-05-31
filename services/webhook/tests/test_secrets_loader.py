@@ -91,10 +91,10 @@ def test_get_openrouter_api_key_reads_env_var(monkeypatch):
     """Elder persona LLM client (#184) calls this; needs the same
     env-var-to-SSM shape as the GitHub App secrets."""
     _clear_cache()
-    monkeypatch.setenv("GRUG_OPENROUTER_API_KEY_SSM", "/grug/openrouter-api-key")
+    monkeypatch.setenv("GRUG_OPENROUTER_API_KEY_SSM", "/infra/llm/openrouter_api_key")
     monkeypatch.setattr(
         sl._ssm, "get_parameter",
-        _stub_ssm({"/grug/openrouter-api-key": "sk-or-test-value"}),
+        _stub_ssm({"/infra/llm/openrouter_api_key": "sk-or-test-value"}),
     )
     assert sl.get_openrouter_api_key() == "sk-or-test-value"
 

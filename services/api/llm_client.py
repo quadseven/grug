@@ -18,8 +18,8 @@ default model name differ. Response is constrained to JSON via
 `response_format={"type": "json_object"}` and parsed defensively —
 malformed JSON or refusals degrade to empty findings rather than crash.
 
-Secrets are loaded via secrets_loader.py (`/grug/poolside-api-key` +
-`/grug/openrouter-api-key`); api Lambda has no IAM grant on these
+Secrets are loaded via secrets_loader.py (`/infra/llm/poolside_api_key` +
+`/infra/llm/openrouter_api_key`); api Lambda has no IAM grant on these
 paths so this module only ever runs from the webhook process.
 """
 from __future__ import annotations
