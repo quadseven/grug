@@ -107,3 +107,36 @@ def test_dedup_mixed_keep_and_skip():
 def test_dedup_empty_prior_keeps_all():
     findings = (_finding(line=2), _finding(line=3))
     assert dedup.dedup_findings(findings, set()) == findings
+
+
+def test_prior_keys_skips_comment_without_path():
+    """A comment missing `path` (malformed payload) is skipped, not a
+    KeyError — uniform with the line-less guard."""
+    comments = [{"line": 2, "body": dedup.rule_marker("r")}]
+    assert dedup.prior_keys_from_comments(comments) == set()
+
+
+def test_rule_name_charset_enforced_at_source():
+    """code_review_prompt.ReviewRule rejects a rule name outside the
+    marker charset — guarantees every real rule round-trips the dedup
+    marker so finding-side and prior-side keys can't diverge."""
+    import code_review_prompt as crp
+    import pytest as _pytest
+    with _pytest.raises(ValueError, match=r"\[A-Za-z0-9_-\]"):
+        crp.ReviewRule(
+            name="weird@rule", bug_class="correctness",
+            description="long enough desc", bad_example="b",
+            good_example="g", severity="low",
+        )
+
+
+def test_dedup_hallucinated_rule_fails_safe_posts():
+    """A finding with an out-of-charset rule (only possible from a
+    hallucinated LLM rule, since real rules are charset-enforced) can't
+    match a marker-parsed prior key → it POSTS (safe direction: a
+    duplicate, never a skipped real finding)."""
+    weird = _finding(line=2, rule="weird@rule")
+    # Even if a prior key existed for the truncated form, the
+    # finding-side key uses the full raw rule → no match → kept.
+    prior = {dedup.finding_key("x.py", 2, "weird")}
+    assert dedup.dedup_findings((weird,), prior) == (weird,)
