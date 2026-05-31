@@ -39,8 +39,11 @@ wire 5xx). This version asserts AST *shape and reachability*:
           (httpx.*/DiffParseError/Exception), and `_publish_degraded`
           exists as the fetch/parse fallback.
 
-Static half only — runtime sufficiency is exercised by
-`tests/test_code_reviewer_dispatch.py`.
+Static half only — runtime sufficiency (the gate actually returning neutral
+in advisory mode, the review post still firing after a check-run 5xx) is
+exercised by `services/webhook/tests/test_code_reviewer_dispatch.py`. That
+runtime suite lives on the webhook side only; this attester covers BOTH
+mirrored source modules statically.
 """
 from __future__ import annotations
 
@@ -242,6 +245,66 @@ def _check_publish_shape(tree: ast.AST, path: Path) -> list[str]:
     return fails
 
 
+def _kwarg_value(call: ast.Call, name: str) -> ast.expr | None:
+    for kw in call.keywords:
+        if kw.arg == name:
+            return kw.value
+    return None
+
+
+def _check_ssot_flow(
+    f: ast.FunctionDef, path: Path, ps_calls: list[ast.Call],
+) -> list[str]:
+    """The (conclusion, event) tuple from `_publish_shape` must be unpacked
+    into two Names, and THOSE names must reach the two publish surfaces —
+    conclusion → CheckRunResult(conclusion=), event → _build_review_result(
+    event=). Proves the no-drift "single source of truth" property."""
+    # Find the assignment `<a>, <b> = _publish_shape(...)`.
+    conclusion_name = event_name = None
+    for n in ast.walk(f):
+        if (
+            isinstance(n, ast.Assign)
+            and isinstance(n.value, ast.Call)
+            and n.value in ps_calls
+            and len(n.targets) == 1
+            and isinstance(n.targets[0], ast.Tuple)
+            and len(n.targets[0].elts) == 2
+            and all(isinstance(e, ast.Name) for e in n.targets[0].elts)
+        ):
+            conclusion_name = n.targets[0].elts[0].id  # type: ignore[attr-defined]
+            event_name = n.targets[0].elts[1].id  # type: ignore[attr-defined]
+            break
+    if conclusion_name is None:
+        return [
+            f"FAIL: {path} — _publish_shape result is not unpacked into "
+            "`(conclusion, event)`; can't prove single-source-of-truth flow"
+        ]
+    fails: list[str] = []
+    # conclusion → CheckRunResult(conclusion=<conclusion_name>)
+    crr = _calls_named(f, "CheckRunResult")
+    if not any(
+        isinstance(_kwarg_value(c, "conclusion"), ast.Name)
+        and _kwarg_value(c, "conclusion").id == conclusion_name  # type: ignore[union-attr]
+        for c in crr
+    ):
+        fails.append(
+            f"FAIL: {path} — CheckRunResult(conclusion=) is not the `{conclusion_name}` "
+            "from _publish_shape; check-run conclusion may drift from the gate"
+        )
+    # event → _build_review_result(event=<event_name>)
+    brr = _calls_named(f, "_build_review_result")
+    if not any(
+        isinstance(_kwarg_value(c, "event"), ast.Name)
+        and _kwarg_value(c, "event").id == event_name  # type: ignore[union-attr]
+        for c in brr
+    ):
+        fails.append(
+            f"FAIL: {path} — _build_review_result(event=) is not the `{event_name}` "
+            "from _publish_shape; review event may drift from the gate"
+        )
+    return fails
+
+
 def _check_dispatch(tree: ast.AST, path: Path) -> list[str]:
     f = _find_funcdef(tree, "dispatch_code_review")
     if f is None:
@@ -290,6 +353,12 @@ def _check_dispatch(tree: ast.AST, path: Path) -> list[str]:
                 f"FAIL: {path} — _publish_shape called with a non-`mode` argument at "
                 f"line {c.lineno}; the gate must consume the derived mode"
             )
+
+    # SSOT no-drift: the (conclusion, event) pair _publish_shape returns must
+    # be the SAME values published — conclusion into CheckRunResult(conclusion=),
+    # event into _build_review_result(event=). Without this, a mutation could
+    # recompute `event` independently and the two surfaces would drift.
+    fails.extend(_check_ssot_flow(f, path, ps_calls))
 
     # check-run + review on independent surfaces.
     check_tries = _try_blocks_containing(f, "post_check_run")
