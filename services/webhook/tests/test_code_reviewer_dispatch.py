@@ -248,6 +248,26 @@ def test_fetch_pr_review_comments_non_list_body_breaks(monkeypatch, caplog):
     assert any("comments_non_list_body" in rec.message for rec in caplog.records)
 
 
+def test_fetch_pr_review_comments_uses_short_timeout(monkeypatch):
+    """The dedup fetch is on the synchronous 15s webhook path and is
+    best-effort — it must use a tight timeout (not the 30s diff
+    timeout) so it can't exhaust the Lambda budget before degrading."""
+    captured = {}
+
+    def cap(url, *, params, headers, timeout):
+        captured["timeout"] = timeout
+        r = MagicMock(spec=httpx.Response)
+        r.status_code = 200
+        r.raise_for_status = MagicMock()
+        r.json = MagicMock(return_value=[])
+        return r
+
+    with patch("httpx.get", side_effect=cap):
+        cr_dispatch._fetch_pr_review_comments("tok", "o", "r", 7)
+    assert captured["timeout"] == cr_dispatch._COMMENT_FETCH_TIMEOUT
+    assert cr_dispatch._COMMENT_FETCH_TIMEOUT < cr_dispatch._DIFF_FETCH_TIMEOUT
+
+
 def test_fetch_pr_review_comments_accumulates_across_pages(monkeypatch):
     """A full page (100) followed by a short page must accumulate BOTH —
     guards against a per-page `out` reset or an off-by-one short-page
