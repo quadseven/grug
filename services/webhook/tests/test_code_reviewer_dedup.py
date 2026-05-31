@@ -1,0 +1,109 @@
+"""Tests for personas/code_reviewer/dedup.py.
+
+On a `synchronize` push, Grug must not re-post a finding it already
+commented on an unchanged line. Findings key on (file, line, rule);
+prior Grug comments are identified by a hidden rule-marker in the
+comment body. A moved/changed line yields a different key → posts as
+new (the desired behavior)."""
+from __future__ import annotations
+
+from personas.code_reviewer import dedup
+from personas.code_reviewer.persona import Finding
+
+
+def _finding(file="x.py", line=2, rule="null-deref", sev="high") -> Finding:
+    return Finding(
+        file=file, line=line, severity=sev, rule_name=rule,
+        message="m", suggestion=None,
+    )
+
+
+# --- key + marker ---
+
+def test_finding_key_combines_rule_file_line():
+    k = dedup.finding_key("src/x.py", 10, "null-deref")
+    assert "null-deref" in k and "src/x.py" in k and "10" in k
+
+
+def test_finding_key_differs_on_line():
+    assert dedup.finding_key("x.py", 10, "r") != dedup.finding_key("x.py", 11, "r")
+
+
+def test_finding_key_differs_on_rule():
+    assert dedup.finding_key("x.py", 10, "a") != dedup.finding_key("x.py", 10, "b")
+
+
+def test_rule_marker_round_trips():
+    body = "some comment\n\n" + dedup.rule_marker("silent-exception-swallow")
+    assert dedup.parse_rule(body) == "silent-exception-swallow"
+
+
+def test_parse_rule_returns_none_without_marker():
+    assert dedup.parse_rule("a human comment with no marker") is None
+
+
+# --- prior_keys_from_comments ---
+
+def test_prior_keys_extracts_grug_findings():
+    comments = [
+        {"path": "x.py", "line": 2, "body": "review\n" + dedup.rule_marker("null-deref")},
+        {"path": "y.py", "line": 9, "body": "review\n" + dedup.rule_marker("race-condition")},
+    ]
+    keys = dedup.prior_keys_from_comments(comments)
+    assert dedup.finding_key("x.py", 2, "null-deref") in keys
+    assert dedup.finding_key("y.py", 9, "race-condition") in keys
+
+
+def test_prior_keys_skips_non_grug_comments():
+    """A human review comment (no marker) contributes no key — we only
+    dedup against our OWN prior findings."""
+    comments = [
+        {"path": "x.py", "line": 2, "body": "looks good to me"},
+        {"path": "x.py", "line": 3, "body": "m\n" + dedup.rule_marker("dead-code")},
+    ]
+    keys = dedup.prior_keys_from_comments(comments)
+    assert keys == {dedup.finding_key("x.py", 3, "dead-code")}
+
+
+def test_prior_keys_tolerates_missing_line():
+    """A comment with no `line` (e.g. a file-level or outdated comment)
+    can't form a (file,line,rule) key — skip it, don't crash."""
+    comments = [{"path": "x.py", "line": None, "body": dedup.rule_marker("r")}]
+    assert dedup.prior_keys_from_comments(comments) == set()
+
+
+# --- dedup_findings ---
+
+def test_dedup_skips_finding_already_commented_same_line():
+    findings = (_finding(line=2, rule="null-deref"),)
+    prior = {dedup.finding_key("x.py", 2, "null-deref")}
+    assert dedup.dedup_findings(findings, prior) == ()
+
+
+def test_dedup_keeps_finding_on_moved_line():
+    """Same file+rule but the line shifted (surrounding edit) → different
+    key → treated as NEW, re-posted. AC: moved-line detection."""
+    findings = (_finding(line=5, rule="null-deref"),)
+    prior = {dedup.finding_key("x.py", 2, "null-deref")}  # was line 2
+    assert dedup.dedup_findings(findings, prior) == findings
+
+
+def test_dedup_keeps_new_rule_on_same_line():
+    """A different rule firing on a line that already has a Grug comment
+    IS posted — two distinct findings can share a line."""
+    findings = (_finding(line=2, rule="race-condition"),)
+    prior = {dedup.finding_key("x.py", 2, "null-deref")}
+    assert dedup.dedup_findings(findings, prior) == findings
+
+
+def test_dedup_mixed_keep_and_skip():
+    keep = _finding(line=5, rule="null-deref")
+    skip = _finding(line=2, rule="dead-code")
+    prior = {dedup.finding_key("x.py", 2, "dead-code")}
+    out = dedup.dedup_findings((keep, skip), prior)
+    assert out == (keep,)
+
+
+def test_dedup_empty_prior_keeps_all():
+    findings = (_finding(line=2), _finding(line=3))
+    assert dedup.dedup_findings(findings, set()) == findings

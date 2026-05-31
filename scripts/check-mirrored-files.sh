@@ -37,6 +37,7 @@ MIRRORED_WITH_HEADER=(
   "github_rulesets_client.py"
   "llm_client.py"
   "observability.py"
+  "personas/code_reviewer/dedup.py"
   "personas/code_reviewer/diff_parser.py"
   "personas/code_reviewer/dispatch.py"
   "personas/code_reviewer/judge.py"
