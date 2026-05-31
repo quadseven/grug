@@ -83,7 +83,7 @@ def test_rule_post_init_rejects_bad_severity():
 
 
 def test_rule_post_init_rejects_name_with_spaces():
-    with pytest.raises(ValueError, match="space-free"):
+    with pytest.raises(ValueError, match=r"\[A-Za-z0-9_-\]"):
         crp.ReviewRule(
             name="has spaces", bug_class="correctness",
             description="desc here long", bad_example="b", good_example="g",
@@ -118,7 +118,7 @@ def test_rule_post_init_rejects_empty_bad_example():
 
 def test_rule_post_init_rejects_empty_name():
     """`not self.name` operand (distinct from the spaces operand)."""
-    with pytest.raises(ValueError, match="space-free"):
+    with pytest.raises(ValueError, match=r"\[A-Za-z0-9_-\]"):
         crp.ReviewRule(
             name="", bug_class="correctness", description="desc here long",
             bad_example="b", good_example="g", severity="low",

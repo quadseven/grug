@@ -105,6 +105,260 @@ def test_dispatch_advisory_mode_posts_neutral_check_and_comment_review(monkeypat
     assert len(inline) == 1
     assert inline[0].path == "src/x.py"
     assert inline[0].line == 2
+    # #189: inline body carries the hidden grug-rule marker so a later
+    # synchronize can dedup it.
+    assert "<!-- grug-rule:silent-failure -->" in inline[0].body
+
+
+def test_dispatch_synchronize_dedups_already_commented_finding(monkeypatch):
+    """On synchronize, a finding already commented on an unchanged line
+    is NOT re-posted — prior Grug comments are fetched + matched (#189)."""
+    llm = LlmReviewResponse(
+        kind="reviewed",
+        findings=(LlmFinding(
+            path="src/x.py", line=2, rule="silent-failure",
+            severity="medium", message="m",  # type: ignore[arg-type]
+        ),),
+        backend_used=Backend.POOLSIDE,
+    )
+    posted_review = []
+    monkeypatch.setattr(cr_dispatch, "review_diff", lambda *a, **kw: llm)
+    monkeypatch.setattr(cr_dispatch, "post_check_run", lambda *a, **kw: {})
+    monkeypatch.setattr(
+        cr_dispatch, "post_review",
+        lambda *a, **kw: posted_review.append(kw["result"]) or {},
+    )
+
+    # The diff GET and the prior-comments GET both go through httpx.get;
+    # route by URL.
+    prior_comment = {
+        "path": "src/x.py", "line": 2,
+        "body": "old\n\n<!-- grug-rule:silent-failure -->",
+    }
+
+    def staged_get(url, **kw):
+        if "/comments" in url:
+            r = MagicMock(spec=httpx.Response)
+            r.status_code = 200
+            r.raise_for_status = MagicMock()
+            r.json = MagicMock(return_value=[prior_comment])
+            return r
+        return _diff_response()
+
+    with patch("httpx.get", side_effect=staged_get):
+        out = cr_dispatch.dispatch_code_review(_payload(action="synchronize"), blocking=False)
+
+    # The single finding was already commented → no inline review posted.
+    assert posted_review == []
+    # Check-run still ran (the bug is still there) — result reflects it.
+    assert out["result"] == "pass"
+
+
+def test_dispatch_synchronize_posts_new_finding_on_changed_line(monkeypatch):
+    """A finding whose line differs from the prior comment IS posted
+    (moved/changed line → new). The prior comment was on line 2; the new
+    finding is on line 9."""
+    llm = LlmReviewResponse(
+        kind="reviewed",
+        findings=(LlmFinding(
+            path="src/x.py", line=9, rule="silent-failure",
+            severity="medium", message="m",  # type: ignore[arg-type]
+        ),),
+        backend_used=Backend.POOLSIDE,
+    )
+    posted_review = []
+    monkeypatch.setattr(cr_dispatch, "review_diff", lambda *a, **kw: llm)
+    monkeypatch.setattr(cr_dispatch, "post_check_run", lambda *a, **kw: {})
+    monkeypatch.setattr(
+        cr_dispatch, "post_review",
+        lambda *a, **kw: posted_review.append(kw["result"]) or {},
+    )
+
+    def staged_get(url, **kw):
+        if "/comments" in url:
+            r = MagicMock(spec=httpx.Response)
+            r.status_code = 200
+            r.raise_for_status = MagicMock()
+            r.json = MagicMock(return_value=[
+                {"path": "src/x.py", "line": 2,
+                 "body": "<!-- grug-rule:silent-failure -->"},
+            ])
+            return r
+        # The diff must contain line 9 so the hallucination filter keeps
+        # the finding.
+        return _diff_response(
+            "diff --git a/src/x.py b/src/x.py\n--- a/src/x.py\n+++ b/src/x.py\n"
+            "@@ -1,2 +1,10 @@\n a\n+l2\n+l3\n+l4\n+l5\n+l6\n+l7\n+l8\n+new9\n b\n"
+        )
+
+    with patch("httpx.get", side_effect=staged_get):
+        cr_dispatch.dispatch_code_review(_payload(action="synchronize"), blocking=False)
+
+    assert len(posted_review) == 1
+    assert posted_review[0].comments[0].line == 9
+
+
+def test_dispatch_synchronize_dedup_fetch_failure_posts_all_and_flags(monkeypatch, caplog):
+    """Prior-comments fetch failing on synchronize → dedup degrades to
+    post-everything, and the dispatch log carries dedup_degraded=True so
+    the duplicate comments are attributable to the fetch, not new
+    findings."""
+    llm = LlmReviewResponse(
+        kind="reviewed",
+        findings=(LlmFinding(
+            path="src/x.py", line=2, rule="silent-failure",
+            severity="medium", message="m",  # type: ignore[arg-type]
+        ),),
+        backend_used=Backend.POOLSIDE,
+    )
+    posted_review = []
+    monkeypatch.setattr(cr_dispatch, "review_diff", lambda *a, **kw: llm)
+    monkeypatch.setattr(cr_dispatch, "post_check_run", lambda *a, **kw: {})
+    monkeypatch.setattr(
+        cr_dispatch, "post_review",
+        lambda *a, **kw: posted_review.append(kw["result"]) or {},
+    )
+
+    def staged_get(url, **kw):
+        if "/comments" in url:
+            raise httpx.ReadTimeout("prior fetch down")
+        return _diff_response()
+
+    with caplog.at_level("INFO"):
+        with patch("httpx.get", side_effect=staged_get):
+            cr_dispatch.dispatch_code_review(_payload(action="synchronize"), blocking=False)
+
+    # Fetch failed → posted anyway (post-everything fallback).
+    assert len(posted_review) == 1
+    rec = next(r for r in caplog.records if r.message == "code_reviewer_dispatched")
+    assert rec.__dict__["dedup_degraded"] is True
+
+
+def test_fetch_pr_review_comments_non_list_body_breaks(monkeypatch, caplog):
+    """A non-list 200 (proxy/error envelope) is logged + treated as
+    end-of-pages, not silently as empty without trace."""
+    r = MagicMock(spec=httpx.Response)
+    r.status_code = 200
+    r.raise_for_status = MagicMock()
+    r.json = MagicMock(return_value={"message": "Moved"})
+    with caplog.at_level("WARNING"):
+        with patch("httpx.get", return_value=r):
+            out = cr_dispatch._fetch_pr_review_comments("tok", "o", "r", 7)
+    assert out == []
+    assert any("comments_non_list_body" in rec.message for rec in caplog.records)
+
+
+def test_fetch_pr_review_comments_uses_short_timeout(monkeypatch):
+    """The dedup fetch is on the synchronous 15s webhook path and is
+    best-effort — it must use a tight timeout (not the 30s diff
+    timeout) so it can't exhaust the Lambda budget before degrading."""
+    captured = {}
+
+    def cap(url, *, params, headers, timeout):
+        captured["timeout"] = timeout
+        r = MagicMock(spec=httpx.Response)
+        r.status_code = 200
+        r.raise_for_status = MagicMock()
+        r.json = MagicMock(return_value=[])
+        return r
+
+    with patch("httpx.get", side_effect=cap):
+        cr_dispatch._fetch_pr_review_comments("tok", "o", "r", 7)
+    assert captured["timeout"] == cr_dispatch._COMMENT_FETCH_TIMEOUT
+    assert cr_dispatch._COMMENT_FETCH_TIMEOUT < cr_dispatch._DIFF_FETCH_TIMEOUT
+
+
+def test_fetch_pr_review_comments_accumulates_across_pages(monkeypatch):
+    """A full page (100) followed by a short page must accumulate BOTH —
+    guards against a per-page `out` reset or an off-by-one short-page
+    break that would silently drop prior keys on a >100-comment PR
+    (→ duplicate floods, the exact bug #189 fixes)."""
+    pages = [
+        [{"path": "x.py", "line": i, "body": "b"} for i in range(100)],  # full
+        [{"path": "x.py", "line": 999, "body": "b"}],                    # short
+    ]
+    idx = {"n": 0}
+
+    def staged(url, **kw):
+        r = MagicMock(spec=httpx.Response)
+        r.status_code = 200
+        r.raise_for_status = MagicMock()
+        r.json = MagicMock(return_value=pages[idx["n"]])
+        idx["n"] += 1
+        return r
+
+    with patch("httpx.get", side_effect=staged):
+        out = cr_dispatch._fetch_pr_review_comments("tok", "o", "r", 7)
+    assert len(out) == 101  # both pages accumulated, not reset
+    assert idx["n"] == 2
+
+
+def test_inline_comment_body_includes_suggestion_block(monkeypatch):
+    """A finding WITH a suggestion renders the Suggested-fix block (the
+    suggestion!=None arm) — all other tests use suggestion=None."""
+    from personas.code_reviewer.persona import Finding
+    f = Finding(
+        file="x.py", line=1, severity="high", rule_name="null-deref",
+        message="m", suggestion="add a None guard",
+    )
+    body = cr_dispatch._inline_comment_body(f)
+    assert "Suggested fix" in body and "add a None guard" in body
+    assert "<!-- grug-rule:null-deref -->" in body  # marker still appended
+
+
+def test_summary_markdown_renders_findings_table():
+    """The findings table (severity icons + blocking count) is otherwise
+    only reached on a real review; assert the row format + high/critical
+    count directly."""
+    from personas.code_reviewer.persona import CodeReviewEvaluation, Finding
+    ev = CodeReviewEvaluation(
+        findings=(
+            Finding(file="x.py", line=1, severity="critical", rule_name="secret-in-log-or-trace", message="key", suggestion=None),
+            Finding(file="y.py", line=2, severity="low", rule_name="dead-code", message="unused", suggestion=None),
+        ),
+        conclusion="failure",
+    )
+    title, summary = cr_dispatch._summary_markdown(ev)
+    assert "1 blocking" in title  # one critical, one low
+    assert "secret-in-log-or-trace" in summary and "dead-code" in summary
+    assert "`x.py`" in summary
+
+
+def test_fetch_pr_review_comments_caps_pages(monkeypatch, caplog):
+    """Pagination can't spin forever — a backend always returning a full
+    page hits the cap + logs rather than looping inside the timeout."""
+    def full_page(url, **kw):
+        r = MagicMock(spec=httpx.Response)
+        r.status_code = 200
+        r.raise_for_status = MagicMock()
+        r.json = MagicMock(return_value=[{"path": "x", "line": 1, "body": "b"}] * 100)
+        return r
+    with caplog.at_level("WARNING"):
+        with patch("httpx.get", side_effect=full_page):
+            out = cr_dispatch._fetch_pr_review_comments("tok", "o", "r", 7)
+    # Exactly _MAX_COMMENT_PAGES pages fetched, then cap.
+    assert len(out) == cr_dispatch._MAX_COMMENT_PAGES * 100
+    assert any("page_cap_hit" in rec.message for rec in caplog.records)
+
+
+def test_dispatch_opened_skips_prior_comment_fetch(monkeypatch):
+    """First pass (opened) — no prior Grug comments exist, so skip the
+    comments fetch entirely (only the diff GET happens)."""
+    llm = LlmReviewResponse(kind="no_diff")
+    monkeypatch.setattr(cr_dispatch, "review_diff", lambda *a, **kw: llm)
+    monkeypatch.setattr(cr_dispatch, "post_check_run", lambda *a, **kw: {})
+    monkeypatch.setattr(cr_dispatch, "post_review", lambda *a, **kw: {})
+
+    urls = []
+
+    def staged_get(url, **kw):
+        urls.append(url)
+        return _diff_response()
+
+    with patch("httpx.get", side_effect=staged_get):
+        cr_dispatch.dispatch_code_review(_payload(action="opened"), blocking=False)
+
+    assert not any("/comments" in u for u in urls)
 
 
 def test_dispatch_blocking_mode_uses_failure_conclusion_and_request_changes(monkeypatch):
