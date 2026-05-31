@@ -1,0 +1,73 @@
+"""Scheduled reaction-poll Lambda entry point (#247b).
+
+An EventBridge cron invokes this every ~15 min (NOT the webhook HTTP path —
+there's no FastAPI/Mangum, no signature check; the trigger is IAM-gated
+EventBridge). Per allowlisted install it polls 👍/👎 reactions on Grug review
+comments and submits `human_verdict` DD LLM Obs evals — the human ground-truth
+that calibrates the LLM judge.
+
+Reuses the webhook container image (same `reactions` / `install_store` /
+`llm_client` / `github_app_auth` code); the `scheduled_lambda` Pulumi
+component (#261) overrides the image CMD to `poller_handler.handler`.
+
+Best-effort by construction: one install's failure (GH 5xx, token error) logs
+and continues — a single bad install must never abort the whole poll cycle.
+The reaction engine itself dedups via `CommentRecord.last_verdict`, so a
+stale verdict isn't re-submitted every cycle.
+"""
+from __future__ import annotations
+
+import logging
+import os
+from typing import Any
+
+from adapters.install_store import (  # type: ignore
+    list_allowlisted_installs,
+    list_comment_records,
+)
+from github_app_auth import with_install_token_retry
+from personas.code_reviewer.reactions import poll_and_annotate
+
+log = logging.getLogger(f"{os.getenv('DD_SERVICE', 'grug')}.poller")
+
+
+def handler(event: dict[str, Any], context: Any) -> dict[str, int]:
+    """Poll reactions for every allowlisted install. Returns a summary
+    dict (installs scanned, records polled, verdicts submitted) — also
+    the structured-log payload an operator/DD reads to confirm the cron
+    ran end-to-end."""
+    installs = list_allowlisted_installs()
+    polled_records = 0
+    submitted = 0
+    failed_installs = 0
+
+    for install_id in installs:
+        records = list_comment_records(install_id)
+        if not records:
+            continue
+        polled_records += len(records)
+        try:
+            submitted += with_install_token_retry(
+                install_id,
+                lambda token: poll_and_annotate(
+                    records,
+                    install_id=install_id,
+                    fetch_token=lambda: token,
+                ),
+            ) or 0
+        except Exception as e:  # noqa: BLE001 — per-install best-effort: one
+            # install's GH/token failure must not abort the whole cron cycle.
+            log.warning(
+                "reaction_poll_install_failed",
+                extra={"install_id": install_id, "kind": type(e).__name__},
+            )
+            failed_installs += 1
+
+    result = {
+        "installs": len(installs),
+        "records": polled_records,
+        "submitted": submitted,
+        "failed_installs": failed_installs,
+    }
+    log.info("reaction_poll_cycle_complete", extra=result)
+    return result

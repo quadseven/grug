@@ -373,3 +373,52 @@ def test_update_comment_record_reaction_dedup_baseline(_ddb_table):
     mod.update_comment_record_reaction(install_id=1, comment_id=9, verdict="false_positive")
     rec = mod.list_comment_records(1)[0]
     assert rec["last_verdict"] == "false_positive"
+
+
+# --- list_allowlisted_installs (#247b poller batch) ---
+
+def _put_user(mod, user_id, allowlisted):
+    mod._table.put_item(Item={
+        "PK": mod._user_pk(user_id), "SK": "META", "allowlisted": allowlisted,
+    })
+
+
+def test_list_allowlisted_installs_returns_only_allowlisted(_ddb_table):
+    mod = _ddb_table
+    for iid, uid in [(1, 100), (2, 200), (3, 300)]:
+        mod.record_installation(
+            install_id=iid, account_login=f"u{uid}", account_type="User",
+            installed_by_user_id=uid,
+        )
+    _put_user(mod, 100, True)
+    _put_user(mod, 200, False)   # installer not allowlisted
+    _put_user(mod, 300, True)
+    assert sorted(mod.list_allowlisted_installs()) == [1, 3]
+
+
+def test_list_allowlisted_installs_empty_when_none(_ddb_table):
+    assert _ddb_table.list_allowlisted_installs() == []
+
+
+def test_list_allowlisted_installs_paginates(_ddb_table, monkeypatch):
+    """A >1MB scan returns LastEvaluatedKey; the loop must accumulate across
+    pages, not truncate at page 1."""
+    mod = _ddb_table
+    # Two scan pages: page1 has INST#1 + a continuation key, page2 has INST#2.
+    pages = [
+        {"Items": [{"PK": "INST#1"}], "LastEvaluatedKey": {"PK": "INST#1", "SK": "META"}},
+        {"Items": [{"PK": "INST#2"}]},
+    ]
+    calls = {"n": 0}
+
+    def _scan(**kwargs):
+        i = calls["n"]
+        calls["n"] += 1
+        # page 2 must be requested with the continuation key
+        if i == 1:
+            assert kwargs.get("ExclusiveStartKey") == {"PK": "INST#1", "SK": "META"}
+        return pages[i]
+    monkeypatch.setattr(mod._table, "scan", _scan)
+    monkeypatch.setattr(mod, "is_install_allowlisted", lambda iid: True)
+    assert sorted(mod.list_allowlisted_installs()) == [1, 2]
+    assert calls["n"] == 2   # both pages fetched
