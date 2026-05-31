@@ -237,7 +237,7 @@ flowchart LR
 | `/grug/cloudflare-api-token` SSM | Web deploys read this at workflow time (NOT a GitHub Actions secret — intentional). Rotate via SSM put; no code changes |
 | `/shared/datadog-app-key/github-grug` SSM | Per-project DD APP key. Needs `monitors_write` + `logs_read_data` + `rum_apps_read` + `rum_apps_write` + `product_analytics_apps_write` scopes — every scope earned a 403 during the RUM cascade until added |
 | `grug-gha-deploy` IAM role | OIDC-trust-scoped to `githumps/grug`. Policy must allow `ssm:PutParameter` on `/grug/*` (added PR #171 after RUM `dd_rum` component became the first Pulumi-managed SSM writer) |
-| `iam_propagation_wait` (`pulumiverse_time.Sleep`) | Gates KMS-using Lambda updates on IAM policy propagation. **Does NOT yet gate non-Lambda resources** — RUM SSM Put raced ahead of policy update on first attempt; one-shot re-trigger cleared it (follow-up: extend wait to SSM Params + KMS Grants) |
+| `iam_propagation_wait` (`pulumiverse_time.Sleep`) | Gates resources whose create/update runs an upfront AWS auth check against a freshly-updated deploy-role policy, so the policy has ~45s to propagate. Threaded via an `iam_propagation_wait=` kwarg into the factories that create them (#172): **Lambda** Functions (`lambda_service` / `scheduled_lambda`, KMS encrypt check), **SSM Params** (`dd_rum`, `ssm:PutParameter` — the RUM cascade race), and **EventBridge rules** (`scheduled_lambda`, `events:TagResource` — the #261 poller race). Any new resource class that depends on a same-run role-policy grant should take the kwarg + add it to `opts.depends_on` (grep `iam_propagation_wait=`). |
 | `DD Lambda Extension 96-next` (baked into ECR image) | Cold-start path loads this binary. Version bump = full image rebuild |
 
 ---

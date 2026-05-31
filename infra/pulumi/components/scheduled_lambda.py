@@ -188,13 +188,22 @@ def create(
         opts=function_opts,
     )
 
-    # EventBridge schedule → invoke the Lambda on a fixed cadence.
+    # EventBridge schedule → invoke the Lambda on a fixed cadence. Gated on
+    # iam_propagation_wait (#172): a TAGGED rule create needs the deploy
+    # role's `events:TagResource` grant, and a deploy that adds `events:*` in
+    # the SAME `pulumi up` races propagation → AccessDenied (hit on #261's
+    # first deploy, needed a re-run). The wait makes it one-shot. The target +
+    # permission depend on the rule, so gating the rule covers the chain.
     rule = aws.cloudwatch.EventRule(
         f"{name}-schedule",
         name=f"{name}-schedule",
         schedule_expression=schedule_expression,
         description=f"grug {name} cron ({schedule_expression})",
         tags={"app": "grug", "service": name},
+        opts=(
+            pulumi.ResourceOptions(depends_on=[iam_propagation_wait])
+            if iam_propagation_wait is not None else None
+        ),
     )
     aws.cloudwatch.EventTarget(
         f"{name}-target",

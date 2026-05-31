@@ -536,7 +536,10 @@ monitors = dd_monitors.create_all(
 # Application ID + client token exported to SSM so web.deploy.yml can
 # substitute them into the build at deploy time without committing
 # either value to the repo.
-rum = dd_rum.create(name="grug-web", provider=_dd_provider)
+rum = dd_rum.create(
+    name="grug-web", provider=_dd_provider,
+    iam_propagation_wait=_iam_propagation_wait,
+)
 
 # Elder code-review health dashboard (#192). LLM Obs span metrics +
 # dispatch-log outcomes; eval-based surfaces deep-link to the LLM Obs
