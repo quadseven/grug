@@ -86,21 +86,23 @@ _dd_api_key = aws.ssm.get_parameter(
     with_decryption=True,
 )
 
-# OpenRouter API key — pre-loaded by the operator (see docs/HITL_PREREQUISITES.md).
-# Consumed by the webhook Lambda only — Elder persona dispatches the LLM
-# call from the same path that handles `pull_request:opened`. api Lambda
-# never needs it; scoping to webhook keeps the IAM blast radius small.
+# OpenRouter API key — shared cross-project SecureString at the canonical
+# `/infra/llm/<provider>_api_key` path (not a grug-specific copy), so the
+# key is minted/rotated once. Consumed by the webhook Lambda only — Elder
+# persona dispatches the LLM call from the same path that handles
+# `pull_request:opened`. api Lambda never needs it; scoping to webhook
+# keeps the IAM blast radius small.
 _openrouter_api_key = aws.ssm.get_parameter(
-    name="/grug/openrouter-api-key",
+    name="/infra/llm/openrouter_api_key",
     with_decryption=True,
 )
 
-# Poolside API key — same scoping rationale as OpenRouter (webhook-only).
+# Poolside API key — same shared-path + webhook-only rationale as OpenRouter.
 # The Elder persona round-robins via `installation_id % 2`; both keys
 # must be present for the round-robin to work without permanent fallback
 # to the other backend.
 _poolside_api_key = aws.ssm.get_parameter(
-    name="/grug/poolside-api-key",
+    name="/infra/llm/poolside_api_key",
     with_decryption=True,
 )
 

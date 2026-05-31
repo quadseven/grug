@@ -273,8 +273,8 @@ this verification to confirm the full pipeline works on a real PR.
 ### Prerequisites
 
 1. SSM parameters loaded per `docs/HITL_PREREQUISITES.md` step 3:
-   - `/grug/poolside-api-key` (SecureString)
-   - `/grug/openrouter-api-key` (SecureString)
+   - `/infra/llm/poolside_api_key` (SecureString, shared cross-project)
+   - `/infra/llm/openrouter_api_key` (SecureString, shared cross-project)
 2. `pulumi up` against the target stack — confirm the webhook Lambda
    environment has both keys mounted.
 3. `code_reviewer_enabled=True` and `code_reviewer_blocking=False` on
