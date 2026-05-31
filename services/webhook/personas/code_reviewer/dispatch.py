@@ -261,8 +261,8 @@ def _build_review_result(
     """Build the ReviewResult, or None if nothing NEW to post.
 
     Skips entirely on degraded responses. `prior_keys` (non-empty only
-    on a synchronize push) dedups findings already commented on
-    unchanged lines (#189) — so a re-review doesn't flood the PR with
+    on a synchronize/reopened push) dedups findings already commented
+    on unchanged lines (#189) — so a re-review doesn't flood the PR with
     duplicate inline comments. If every finding was already posted,
     returns None (nothing new). NOTE: dedup affects only the inline
     REVIEW; the check-run summary/conclusion still reflect ALL current

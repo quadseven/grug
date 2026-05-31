@@ -72,21 +72,19 @@ def prior_keys_from_comments(comments: list[dict]) -> set[str]:
     """Build the set of finding-keys already posted, from the PR's
     review comments. Each comment dict carries `path`, `line`, `side`,
     `body` (the GitHub PR-review-comment shape). Comments are skipped
-    when they: lack a Grug marker; lack a usable `line` (file-level /
-    outdated comments report `line: null`); are LEFT-side (Grug only
-    ever posts RIGHT-side new-file comments, so a LEFT comment with a
-    coincidental marker is not ours); or carry a non-numeric `line`
-    (malformed payload). Every skip biases toward a SMALLER key set →
-    post-extra, never skip-a-real-finding."""
+    when they: lack a usable `line` (file-level / outdated comments
+    report `line: null`) or `path`; are LEFT-side (Grug only ever posts
+    RIGHT-side new-file comments, so a LEFT comment with a coincidental
+    marker is not ours); lack a Grug marker; or carry a non-numeric
+    `line` (malformed payload). Every skip biases toward a SMALLER key
+    set → post-extra, never skip-a-real-finding."""
     keys: set[str] = set()
     for c in comments:
         line = c.get("line")
         path = c.get("path")
         if line is None or path is None:
             continue
-        # Grug posts RIGHT-side (new-file) comments; `side` defaults to
-        # RIGHT when absent. A LEFT comment can't be one of ours.
-        if c.get("side", "RIGHT") == "LEFT":
+        if c.get("side", "RIGHT") == "LEFT":  # see docstring: not ours
             continue
         rule = parse_rule(c.get("body", ""))
         if rule is None:
