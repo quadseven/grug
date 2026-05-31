@@ -271,7 +271,10 @@ def create_elder_health(
         ),
         "layout_type": "ordered",
         "reflow_type": "auto",
-        "tags": [f"env:{env}", "team:grug", "service:grug-webhook"],
+        # This DD org restricts DASHBOARD tag keys to `team` + `ai` (enforced
+        # only at POST /api/v1/dashboard — not by pulumi preview). env/service
+        # scoping lives in the widget queries, not dashboard tags.
+        "tags": ["team:grug"],
         "widgets": widgets,
     }
 
