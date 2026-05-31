@@ -473,6 +473,10 @@ poller = scheduled_lambda.create(
         "DD_ENV": env,
         "DD_SERVICE": "grug-poller",
         "DD_VERSION": _full_commit_sha,
+        # Parity with the webhook for trace/log correlation (the poller's
+        # structured logs carry trace_id; spans enabled).
+        "DD_TRACE_ENABLED": "true",
+        "DD_LOGS_INJECTION": "true",
         # human_verdict evals attach to the Elder review spans, so the
         # poller submits under the SAME ML app as the webhook.
         "DD_LLMOBS_ENABLED": "true",
