@@ -3,6 +3,13 @@
 Spec note: dashboards are observability CONFIG, not a behavioral domain
 contract — like `dd_monitors.py` / `dd_rum.py`, they carry no temper spec.
 
+The Elder persona is instrumented with native DD LLM Observability (the
+`LLMObs` SDK — spans + evaluations), so DD's out-of-the-box "LLM Obs
+Operational Insights" dashboard already covers the generic LLM view
+(latency, tokens, errors). This board does NOT reinvent that — it links to
+it and adds the Elder-SPECIFIC lens: review outcomes from the dispatch log
++ the judge/human evaluations the OOTB board doesn't surface.
+
 `create_elder_health(...)` builds "Grug Elder — Code Review Health" via
 `datadog.DashboardJson` (raw DD dashboard spec). The typed
 `datadog.Dashboard` resource models widget args as deeply-nested Pulumi
@@ -87,6 +94,14 @@ def create_elder_health(
         "https://app.datadoghq.com/llm/evaluations?query=%40ml_app%3A"
         f"{_ML_APP}"
     )
+    # DD's native out-of-the-box LLM Obs dashboard — the deep generic LLM
+    # view (trace/span metrics, error rates, latency, token trends), filtered
+    # to the Elder ML app. THIS dashboard complements it with Elder-specific
+    # review outcomes + the evaluations the OOTB board doesn't surface.
+    ootb_llmobs_dash = (
+        "https://app.datadoghq.com/dash/integration/llm_operational_insights"
+        f"?tpl_var_ml_app={_ML_APP}"
+    )
 
     widgets: list[dict] = [
         # Header note — orients the operator + records the data-source caveat.
@@ -94,11 +109,13 @@ def create_elder_health(
             "type": "note",
             "content": (
                 "# Grug Elder — Code Review Health\n"
-                "Operational health of the code-reviewer (Elder) persona. "
+                "Elder-specific complement to Datadog's native "
+                f"[LLM Obs Operational Insights dashboard]({ootb_llmobs_dash}) "
+                "(the deep generic LLM view). This board adds the review "
+                "outcomes + evaluations that the OOTB one doesn't surface.\n\n"
                 "Span metrics scoped to `ml_app:grug-elder`, split by "
                 "`model_provider` (poolside vs openrouter). Volume/outcome "
-                "widgets from the "
-                "`code_reviewer_dispatched` webhook log.\n\n"
+                "widgets from the `code_reviewer_dispatched` webhook log.\n\n"
                 "**Judge accuracy / false-positive rate / annotation backlog** "
                 "use LLM Obs *evaluations* (`is_real_bug`, `human_verdict`), "
                 "which are not dashboard metrics — see the deep-link widget."
