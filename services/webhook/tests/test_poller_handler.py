@@ -34,9 +34,13 @@ def test_poller_polls_each_allowlisted_install(monkeypatch):
     assert out == {"installs": 2, "records": 2, "submitted": 4, "failed_installs": 0}
 
 
-def test_poller_one_install_failure_does_not_abort_cycle(monkeypatch):
+def test_poller_one_install_failure_does_not_abort_cycle(monkeypatch, caplog):
     """A single install's token/GH failure is logged + counted, and the
-    cycle continues to the next install (best-effort per install)."""
+    cycle continues to the next install (best-effort per install). A PARTIAL
+    failure must NOT escalate to error (else a status:error monitor false-
+    fires every time one of many installs hiccups)."""
+    import logging as _logging
+
     def _retry(iid, fn):
         if iid == 1:
             raise RuntimeError("install 1 token fetch failed")
@@ -48,10 +52,16 @@ def test_poller_one_install_failure_does_not_abort_cycle(monkeypatch):
         retry=_retry,
         poll=lambda records, *, install_id, fetch_token: 3,
     )
-    out = poller_handler.handler({}, None)
+    with caplog.at_level(_logging.INFO):
+        out = poller_handler.handler({}, None)
     assert out["installs"] == 2
     assert out["failed_installs"] == 1
     assert out["submitted"] == 3   # install 2 still polled despite install 1 failing
+    assert out["records"] == 2     # both installs' records counted as attempted
+    # partial failure → cycle-complete at INFO, NOT the all-failed error.
+    cycle = [r for r in caplog.records if r.msg == "reaction_poll_cycle_complete"]
+    assert cycle and cycle[0].levelno == _logging.INFO
+    assert not any(r.levelno >= _logging.ERROR for r in caplog.records)
 
 
 def test_poller_skips_installs_with_no_records(monkeypatch):
