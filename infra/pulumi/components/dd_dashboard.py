@@ -40,8 +40,8 @@ import pulumi
 import pulumi_datadog as datadog
 
 # Scope every LLM Obs query to the Elder ML app (DD_LLMOBS_ML_APP on the
-# webhook Lambda). The standard `model` tag distinguishes backends since
-# poolside + openrouter dispatch with different default model names.
+# webhook Lambda). The standard `model_provider` tag distinguishes backends
+# (it's `backend.value` — poolside vs openrouter); there is no `model` tag.
 _ML_APP = "grug-elder"
 _WEBHOOK_SERVICE = "grug-webhook"
 
@@ -95,8 +95,9 @@ def create_elder_health(
             "content": (
                 "# Grug Elder — Code Review Health\n"
                 "Operational health of the code-reviewer (Elder) persona. "
-                "Span metrics scoped to `ml_app:grug-elder`, split by `model` "
-                "(poolside vs openrouter). Volume/outcome widgets from the "
+                "Span metrics scoped to `ml_app:grug-elder`, split by "
+                "`model_provider` (poolside vs openrouter). Volume/outcome "
+                "widgets from the "
                 "`code_reviewer_dispatched` webhook log.\n\n"
                 "**Judge accuracy / false-positive rate / annotation backlog** "
                 "use LLM Obs *evaluations* (`is_real_bug`, `human_verdict`), "
