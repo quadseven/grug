@@ -42,6 +42,11 @@ def test_parse_rule_returns_none_without_marker():
     assert dedup.parse_rule("a human comment with no marker") is None
 
 
+def test_parse_rule_handles_none_body():
+    """A comment dict with `body: None` must not blow up the regex."""
+    assert dedup.parse_rule(None) is None  # type: ignore[arg-type]
+
+
 # --- prior_keys_from_comments ---
 
 def test_prior_keys_extracts_grug_findings():

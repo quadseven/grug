@@ -248,6 +248,62 @@ def test_fetch_pr_review_comments_non_list_body_breaks(monkeypatch, caplog):
     assert any("comments_non_list_body" in rec.message for rec in caplog.records)
 
 
+def test_fetch_pr_review_comments_accumulates_across_pages(monkeypatch):
+    """A full page (100) followed by a short page must accumulate BOTH —
+    guards against a per-page `out` reset or an off-by-one short-page
+    break that would silently drop prior keys on a >100-comment PR
+    (→ duplicate floods, the exact bug #189 fixes)."""
+    pages = [
+        [{"path": "x.py", "line": i, "body": "b"} for i in range(100)],  # full
+        [{"path": "x.py", "line": 999, "body": "b"}],                    # short
+    ]
+    idx = {"n": 0}
+
+    def staged(url, **kw):
+        r = MagicMock(spec=httpx.Response)
+        r.status_code = 200
+        r.raise_for_status = MagicMock()
+        r.json = MagicMock(return_value=pages[idx["n"]])
+        idx["n"] += 1
+        return r
+
+    with patch("httpx.get", side_effect=staged):
+        out = cr_dispatch._fetch_pr_review_comments("tok", "o", "r", 7)
+    assert len(out) == 101  # both pages accumulated, not reset
+    assert idx["n"] == 2
+
+
+def test_inline_comment_body_includes_suggestion_block(monkeypatch):
+    """A finding WITH a suggestion renders the Suggested-fix block (the
+    suggestion!=None arm) — all other tests use suggestion=None."""
+    from personas.code_reviewer.persona import Finding
+    f = Finding(
+        file="x.py", line=1, severity="high", rule_name="null-deref",
+        message="m", suggestion="add a None guard",
+    )
+    body = cr_dispatch._inline_comment_body(f)
+    assert "Suggested fix" in body and "add a None guard" in body
+    assert "<!-- grug-rule:null-deref -->" in body  # marker still appended
+
+
+def test_summary_markdown_renders_findings_table():
+    """The findings table (severity icons + blocking count) is otherwise
+    only reached on a real review; assert the row format + high/critical
+    count directly."""
+    from personas.code_reviewer.persona import CodeReviewEvaluation, Finding
+    ev = CodeReviewEvaluation(
+        findings=(
+            Finding(file="x.py", line=1, severity="critical", rule_name="secret-in-log-or-trace", message="key", suggestion=None),
+            Finding(file="y.py", line=2, severity="low", rule_name="dead-code", message="unused", suggestion=None),
+        ),
+        conclusion="failure",
+    )
+    title, summary = cr_dispatch._summary_markdown(ev)
+    assert "1 blocking" in title  # one critical, one low
+    assert "secret-in-log-or-trace" in summary and "dead-code" in summary
+    assert "`x.py`" in summary
+
+
 def test_fetch_pr_review_comments_caps_pages(monkeypatch, caplog):
     """Pagination can't spin forever — a backend always returning a full
     page hits the cap + logs rather than looping inside the timeout."""
