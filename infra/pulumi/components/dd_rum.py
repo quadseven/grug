@@ -42,6 +42,7 @@ def create(
     *,
     name: str,
     provider: datadog.Provider,
+    iam_propagation_wait: pulumi.Resource | None = None,
 ) -> RumBundle:
     """Provision the DD RUM Application + export its credentials to SSM.
 
@@ -51,7 +52,18 @@ def create(
         `rum_service_tag_is_grug_web_canonical_per_dd_naming_canon`).
       provider: The pre-configured `datadog.Provider` from `__main__.py`
         — same one used by `dd_monitors`.
+      iam_propagation_wait: gates the `ssm:PutParameter` creates on the
+        deploy-role policy having propagated (#172). Without it, a deploy
+        that adds `ssm:PutParameter` to the role in the SAME `pulumi up`
+        races the param creates → transient AccessDenied (the RUM cascade,
+        PRs #164→#171). `None` keeps the resources ungated (dev/tests).
     """
+    # SSM param creates depend on the freshly-granted deploy-role policy;
+    # gate them on its propagation when the wait is supplied.
+    param_opts = (
+        pulumi.ResourceOptions(depends_on=[iam_propagation_wait])
+        if iam_propagation_wait is not None else None
+    )
     app = datadog.RumApplication(
         f"{name}-rum-app",
         name=name,
@@ -77,6 +89,7 @@ def create(
         value=pulumi.Output.secret(app.id),
         description="DD RUM Application ID for grug-web. Public by design (lives in browser bundle); sourced from SSM so rotation is `pulumi up` not a git commit.",
         tags={"managed_by": "pulumi", "scope": "grug", "service": "grug-web"},
+        opts=param_opts,
     )
     ssm_client_token = aws.ssm.Parameter(
         f"{name}-rum-client-token",
@@ -85,6 +98,7 @@ def create(
         value=pulumi.Output.secret(app.client_token),
         description="DD RUM client token for grug-web. Public by design; sourced from SSM so rotation is `pulumi up` not a git commit.",
         tags={"managed_by": "pulumi", "scope": "grug", "service": "grug-web"},
+        opts=param_opts,
     )
 
     return RumBundle(
