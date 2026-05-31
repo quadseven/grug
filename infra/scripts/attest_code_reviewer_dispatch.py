@@ -451,6 +451,29 @@ def _check_dispatch(tree: ast.AST, path: Path) -> list[str]:
                     f"FAIL: {path} — _resolve_result not passed `{needed}`; result "
                     "rollup must consult both independent publish surfaces"
                 )
+
+    # #247a comment-capture is BEST-EFFORT post-publish: a `_capture_comment_records`
+    # helper exists, and the capture fetch (get_review_comments) is wrapped in its
+    # own try/except catching a wire exception — a capture failure can't alter the
+    # review outcome.
+    if _find_funcdef(tree, "_capture_comment_records") is None:
+        fails.append(
+            f"FAIL: {path} — _capture_comment_records helper missing (#247 capture)"
+        )
+    capture_tries = _try_blocks_containing(f, "get_review_comments")
+    if not capture_tries:
+        fails.append(
+            f"FAIL: {path} — comment capture (get_review_comments) is not wrapped in "
+            "try/except; it must be best-effort post-publish"
+        )
+    for tnode in capture_tries:
+        for handler in tnode.handlers:
+            names = _handler_exc_names(handler)
+            if not (names & ALLOWED_WIRE_EXC):
+                fails.append(
+                    f"FAIL: {path} — capture except catches {sorted(names) or 'nothing'}; "
+                    "must catch a wire exception (best-effort)"
+                )
     return fails
 
 

@@ -51,7 +51,7 @@ def _finding_to_repr(f: Finding) -> JudgeFindingRepr:
     }
 
 
-def _eval_tags(f: Finding) -> dict[str, str]:
+def eval_tags(f: Finding) -> dict[str, str]:
     """DD evaluation tags — finding identity for the annotation-queue
     UI to group + filter. `line` is stringified so all tag values are
     str (DD infers facet type from the first value seen)."""
@@ -115,7 +115,7 @@ def run_judge(
                 is_real_bug=v.is_real_bug,
                 reasoning=v.reasoning,
                 review_span_context=review_span_context,
-                tags=_eval_tags(f),
+                tags=eval_tags(f),
             )
         log.info(
             "judge_completed",

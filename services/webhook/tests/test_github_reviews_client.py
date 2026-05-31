@@ -248,3 +248,90 @@ def test_post_review_connect_error_propagates(mock_transport_client):
             post_review("tok", "o", "r", pull_number=1, result=result)
 
 
+
+
+# --- get_review_comments (#247a — capture inline-comment IDs) ---
+
+def _list_response(items):
+    r = MagicMock(spec=httpx.Response)
+    r.status_code = 200
+    r.raise_for_status = MagicMock()
+    r.json = MagicMock(return_value=items)
+    return r
+
+
+def test_get_review_comments_url_and_auth():
+    """GET /repos/{o}/{r}/pulls/{n}/reviews/{review_id}/comments + Bearer.
+    The create-review response doesn't surface per-comment IDs, so reaction
+    capture fetches them here."""
+    from github_reviews_client import get_review_comments
+    body = [{"id": 1, "path": "a.py", "line": 2}, {"id": 5, "path": "b.py", "line": 9}]
+    with patch("httpx.get", return_value=_list_response(body)) as mg:
+        out = get_review_comments("tok-x", "o", "r", pull_number=42, review_id=999)
+    args, kwargs = mg.call_args
+    assert args[0] == "https://api.github.com/repos/o/r/pulls/42/reviews/999/comments"
+    assert kwargs["headers"]["Authorization"] == "Bearer tok-x"
+    assert kwargs["headers"]["X-GitHub-Api-Version"] == "2022-11-28"
+    assert out == body
+
+
+def test_get_review_comments_propagates_401():
+    """Like post_review/post_check_run, 401 is NOT swallowed — the
+    with_install_token_retry wrapper owns cache-invalidate + retry."""
+    from github_reviews_client import get_review_comments
+    resp = MagicMock(spec=httpx.Response)
+    resp.status_code = 401
+    resp.raise_for_status = MagicMock(
+        side_effect=httpx.HTTPStatusError("401", request=MagicMock(), response=resp)
+    )
+    with patch("httpx.get", return_value=resp):
+        with pytest.raises(httpx.HTTPStatusError):
+            get_review_comments("tok", "o", "r", pull_number=1, review_id=2)
+
+
+def test_get_review_comments_paginates_until_short_page():
+    """>100 comments are NOT silently truncated — paginate until a short
+    page (the #189 lesson)."""
+    from github_reviews_client import get_review_comments
+    page1 = [{"id": i, "path": "a.py", "line": i} for i in range(100)]
+    page2 = [{"id": 999, "path": "b.py", "line": 1}]
+    seen_pages = []
+
+    def _staged(url, **kw):
+        pg = kw["params"]["page"]
+        seen_pages.append(pg)
+        return _list_response(page1 if pg == 1 else page2)
+
+    with patch("httpx.get", side_effect=_staged):
+        out = get_review_comments("tok", "o", "r", pull_number=1, review_id=2)
+    assert len(out) == 101
+    assert seen_pages == [1, 2]   # stopped after the short final page
+
+
+def test_get_review_comments_non_list_body_breaks():
+    """A non-list 200 body (error envelope that passed raise_for_status)
+    breaks the loop rather than raising on .extend — returns what accrued."""
+    from github_reviews_client import get_review_comments
+    with patch("httpx.get", return_value=_list_response({"message": "boom"})):
+        out = get_review_comments("tok", "o", "r", pull_number=1, review_id=2)
+    assert out == []
+
+
+def test_get_review_comments_page_cap_logs(caplog):
+    """10 consecutive full pages hit the cap → warning fires (silent-
+    truncation guard, #189 lesson) and exactly _MAX_REVIEW_COMMENT_PAGES
+    requests are made."""
+    import logging as _logging
+    from github_reviews_client import get_review_comments, _MAX_REVIEW_COMMENT_PAGES
+    full = [{"id": i, "path": "a.py", "line": 1} for i in range(100)]
+    calls = []
+
+    def _full(url, **kw):
+        calls.append(kw["params"]["page"])
+        return _list_response(full)
+
+    with patch("httpx.get", side_effect=_full), caplog.at_level(_logging.WARNING):
+        out = get_review_comments("tok", "o", "r", pull_number=1, review_id=2)
+    assert len(calls) == _MAX_REVIEW_COMMENT_PAGES
+    assert len(out) == 100 * _MAX_REVIEW_COMMENT_PAGES
+    assert any(r.msg == "get_review_comments_page_cap_hit" for r in caplog.records)
