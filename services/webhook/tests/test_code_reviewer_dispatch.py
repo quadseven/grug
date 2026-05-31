@@ -198,6 +198,73 @@ def test_dispatch_synchronize_posts_new_finding_on_changed_line(monkeypatch):
     assert posted_review[0].comments[0].line == 9
 
 
+def test_dispatch_synchronize_dedup_fetch_failure_posts_all_and_flags(monkeypatch, caplog):
+    """Prior-comments fetch failing on synchronize → dedup degrades to
+    post-everything, and the dispatch log carries dedup_degraded=True so
+    the duplicate comments are attributable to the fetch, not new
+    findings."""
+    llm = LlmReviewResponse(
+        kind="reviewed",
+        findings=(LlmFinding(
+            path="src/x.py", line=2, rule="silent-failure",
+            severity="medium", message="m",  # type: ignore[arg-type]
+        ),),
+        backend_used=Backend.POOLSIDE,
+    )
+    posted_review = []
+    monkeypatch.setattr(cr_dispatch, "review_diff", lambda *a, **kw: llm)
+    monkeypatch.setattr(cr_dispatch, "post_check_run", lambda *a, **kw: {})
+    monkeypatch.setattr(
+        cr_dispatch, "post_review",
+        lambda *a, **kw: posted_review.append(kw["result"]) or {},
+    )
+
+    def staged_get(url, **kw):
+        if "/comments" in url:
+            raise httpx.ReadTimeout("prior fetch down")
+        return _diff_response()
+
+    with caplog.at_level("INFO"):
+        with patch("httpx.get", side_effect=staged_get):
+            cr_dispatch.dispatch_code_review(_payload(action="synchronize"), blocking=False)
+
+    # Fetch failed → posted anyway (post-everything fallback).
+    assert len(posted_review) == 1
+    rec = next(r for r in caplog.records if r.message == "code_reviewer_dispatched")
+    assert rec.__dict__["dedup_degraded"] is True
+
+
+def test_fetch_pr_review_comments_non_list_body_breaks(monkeypatch, caplog):
+    """A non-list 200 (proxy/error envelope) is logged + treated as
+    end-of-pages, not silently as empty without trace."""
+    r = MagicMock(spec=httpx.Response)
+    r.status_code = 200
+    r.raise_for_status = MagicMock()
+    r.json = MagicMock(return_value={"message": "Moved"})
+    with caplog.at_level("WARNING"):
+        with patch("httpx.get", return_value=r):
+            out = cr_dispatch._fetch_pr_review_comments("tok", "o", "r", 7)
+    assert out == []
+    assert any("comments_non_list_body" in rec.message for rec in caplog.records)
+
+
+def test_fetch_pr_review_comments_caps_pages(monkeypatch, caplog):
+    """Pagination can't spin forever — a backend always returning a full
+    page hits the cap + logs rather than looping inside the timeout."""
+    def full_page(url, **kw):
+        r = MagicMock(spec=httpx.Response)
+        r.status_code = 200
+        r.raise_for_status = MagicMock()
+        r.json = MagicMock(return_value=[{"path": "x", "line": 1, "body": "b"}] * 100)
+        return r
+    with caplog.at_level("WARNING"):
+        with patch("httpx.get", side_effect=full_page):
+            out = cr_dispatch._fetch_pr_review_comments("tok", "o", "r", 7)
+    # Exactly _MAX_COMMENT_PAGES pages fetched, then cap.
+    assert len(out) == cr_dispatch._MAX_COMMENT_PAGES * 100
+    assert any("page_cap_hit" in rec.message for rec in caplog.records)
+
+
 def test_dispatch_opened_skips_prior_comment_fetch(monkeypatch):
     """First pass (opened) — no prior Grug comments exist, so skip the
     comments fetch entirely (only the diff GET happens)."""
