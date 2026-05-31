@@ -93,7 +93,17 @@ def _const_tuple(node: ast.AST) -> tuple[object, ...] | None:
 
 
 def _is_falsy_const(node: ast.AST) -> bool:
-    return isinstance(node, ast.Constant) and not node.value
+    """A statically-falsy literal usable as a dead-code guard: a falsy
+    constant (`False`, `0`, `None`, `""`) OR an empty collection literal
+    (`[]`, `()`, `{}`, set/dict). Covers the AST forms an `if <X>:` guard
+    can take to be unreachable at runtime while still parsing."""
+    if isinstance(node, ast.Constant):
+        return not node.value
+    if isinstance(node, (ast.List, ast.Tuple, ast.Set)):
+        return len(node.elts) == 0
+    if isinstance(node, ast.Dict):
+        return len(node.keys) == 0
+    return False
 
 
 def _walk_no_nested(node: ast.AST):
