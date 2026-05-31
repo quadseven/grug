@@ -162,6 +162,44 @@ def is_install_allowlisted(install_id: int) -> bool:
     return allowlisted
 
 
+def list_allowlisted_installs() -> list[int]:
+    """Return the install_ids whose installer is allowlisted — the
+    reaction poller's per-cycle batch (#247b).
+
+    There is no single partition for installs (`PK=INST#<id>`), so this
+    SCANs for `SK=META AND begins_with(PK, "INST#")` and re-checks each
+    via `is_install_allowlisted`. Paginated over `LastEvaluatedKey` so a
+    >1MB page can't silently truncate the batch (same guard as
+    `list_comment_records`). Scale note: a SCAN + per-install two-hop
+    allowlist check is fine for a homelab's handful of installs; revisit
+    (a GSI on an `allowlisted` attribute) if the install count grows large.
+    """
+    install_ids: list[int] = []
+    kwargs: dict[str, Any] = {
+        "FilterExpression": "SK = :meta AND begins_with(PK, :inst)",
+        "ExpressionAttributeValues": {":meta": "META", ":inst": "INST#"},
+        "ProjectionExpression": "PK",
+    }
+    while True:
+        resp = _table.scan(**kwargs)
+        for item in resp.get("Items", []):
+            pk = item.get("PK", "")
+            _, sep, id_str = pk.partition("#")
+            if not sep:
+                continue
+            try:
+                iid = int(id_str)
+            except (TypeError, ValueError):
+                continue
+            if is_install_allowlisted(iid):
+                install_ids.append(iid)
+        lek = resp.get("LastEvaluatedKey")
+        if not lek:
+            break
+        kwargs["ExclusiveStartKey"] = lek
+    return install_ids
+
+
 # ---------------------------------------------------------------------------
 # Per-repo persona toggles
 # ---------------------------------------------------------------------------
