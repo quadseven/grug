@@ -80,10 +80,13 @@ cf_provider = cloudflare.Provider(
     api_token=_cf_token.value,
 )
 
-# Datadog API key — shared across projects per #164 SSM convention.
-# Lambda extension layer reads DD_API_KEY env var to ship traces/logs.
+# Datadog API key — the shared INFRA DD key (`/infra/datadog/api_key`), the
+# same pair the homelab infrastructure Pulumi uses. Consolidated here (#258
+# follow-up) so grug doesn't maintain its own DD credentials: the prior
+# `/shared/datadog-*` keys were revoked out-of-band and grug had no reason to
+# carry a separate key. Lambda extension reads DD_API_KEY to ship traces/logs.
 _dd_api_key = aws.ssm.get_parameter(
-    name="/shared/datadog-api-key",
+    name="/infra/datadog/api_key",
     with_decryption=True,
 )
 
@@ -456,14 +459,13 @@ cloudflare_dns.create_proxied_cname(
     proxied=True,
 )
 
-# Datadog monitors (Slice 9 #30). Provider reads DD creds from SSM
-# DD APP key: per-project path under `/shared/datadog-app-key/` so a
-# rotation here doesn't clobber sibling repos (somatic-scripts etc.)
-# that may use the un-nested `/shared/datadog-app-key` path. Note: DD
-# API key remains at the shared cross-repo path above (it's submit-only,
-# safe to share + cheaper to rotate once globally).
+# Datadog monitors (Slice 9 #30). Provider reads DD creds from SSM — the
+# shared INFRA DD app key (`/infra/datadog/app_key`), paired with the infra
+# API key above. One DD key pair for the homelab rather than a grug-specific
+# one (the old per-project `/shared/datadog-app-key/github-grug` was revoked
+# out-of-band; consolidating removes a key grug had no reason to own).
 _dd_app_key = aws.ssm.get_parameter(
-    name="/shared/datadog-app-key/github-grug", with_decryption=True,
+    name="/infra/datadog/app_key", with_decryption=True,
 )
 _dd_provider = _datadog.Provider(
     "datadog-grug",
