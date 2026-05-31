@@ -1,0 +1,142 @@
+# spec 0017 — Code-Reviewer Dispatch I/O Automaton
+#
+# Models the ORCHESTRATION contract of `dispatch_code_review` — the layer
+# above spec 0015 (ElderEvaluation: parse + evaluate) and spec 0016
+# (PrReviewResult: the review payload). Dispatch is where:
+#   - RepoConfig.code_reviewer_blocking becomes a review `mode`
+#     (advisory | blocking);
+#   - `_publish_shape(evaluation, mode)` collapses that mode into a single
+#     aligned (check_conclusion, review_event) pair — the SINGLE SOURCE OF
+#     TRUTH for the advisory-vs-blocking gate;
+#   - the check-run and the PR review are published on INDEPENDENT surfaces
+#     (a 5xx on one must not skip the other);
+#   - every failure mode (fetch, parse, LLM outage, publish 5xx) degrades to
+#     advisory-neutral so the persona can never 500 the webhook handler.
+#
+# This closes the gap left by 0015/0016, which model the artifacts but not
+# the gate that decides whether a finding actually blocks a merge.
+#
+# Source of truth: services/{api,webhook}/personas/code_reviewer/dispatch.py
+# (`_publish_shape`, `_resolve_result`, `dispatch_code_review`) +
+# DESIGN.md § "Elder persona — code review".
+#
+# Verified by `temper verify -s specs/0017-code-reviewer-dispatch/`.
+
+[automaton]
+name = "CodeReviewerDispatch"
+states = ["Drafted", "Gated", "Published", "Retired"]
+initial = "Drafted"
+
+# --- Advisory/blocking gate bools (the _publish_shape contract) ---
+
+[[state]]
+name = "mode_derives_from_repo_config_blocking_flag_per_dispatch"
+type = "bool"
+initial = "false"
+
+[[state]]
+name = "advisory_mode_forces_neutral_and_comment_per_dispatch"
+type = "bool"
+initial = "false"
+
+[[state]]
+name = "degraded_evaluation_forces_advisory_regardless_of_mode_per_dispatch"
+type = "bool"
+initial = "false"
+
+[[state]]
+name = "blocking_failure_yields_failure_and_request_changes_per_dispatch"
+type = "bool"
+initial = "false"
+
+[[state]]
+name = "publish_shape_single_source_of_truth_for_conclusion_and_event_per_dispatch"
+type = "bool"
+initial = "false"
+
+# --- Dual-publish independence + total-degradation bools ---
+
+[[state]]
+name = "check_run_and_review_publish_independently_per_dispatch"
+type = "bool"
+initial = "false"
+
+[[state]]
+name = "dispatch_never_raises_wire_exception_degrades_to_neutral_per_dispatch"
+type = "bool"
+initial = "false"
+
+[[action]]
+name = "AttestGateContract"
+kind = "input"
+from = ["Drafted"]
+params = ["attestor"]
+guard = "is_false publish_shape_single_source_of_truth_for_conclusion_and_event_per_dispatch"
+effect = [
+  { type = "set_bool", var = "mode_derives_from_repo_config_blocking_flag_per_dispatch", value = true },
+  { type = "set_bool", var = "advisory_mode_forces_neutral_and_comment_per_dispatch", value = true },
+  { type = "set_bool", var = "degraded_evaluation_forces_advisory_regardless_of_mode_per_dispatch", value = true },
+  { type = "set_bool", var = "blocking_failure_yields_failure_and_request_changes_per_dispatch", value = true },
+  { type = "set_bool", var = "publish_shape_single_source_of_truth_for_conclusion_and_event_per_dispatch", value = true },
+]
+hint = "mode = 'blocking' if RepoConfig.code_reviewer_blocking else 'advisory'. _publish_shape(evaluation, mode) returns ONE (check_conclusion, review_event) pair: advisory OR any degraded_reason → ('neutral','COMMENT'); blocking + conclusion=='failure' → ('failure','REQUEST_CHANGES'); else (conclusion,'COMMENT'). Both surfaces read the same toggle so they can't drift."
+
+[[action]]
+name = "AttestPublishIndependenceContract"
+kind = "input"
+from = ["Drafted"]
+params = ["attestor"]
+guard = "is_false check_run_and_review_publish_independently_per_dispatch"
+effect = [
+  { type = "set_bool", var = "check_run_and_review_publish_independently_per_dispatch", value = true },
+  { type = "set_bool", var = "dispatch_never_raises_wire_exception_degrades_to_neutral_per_dispatch", value = true },
+]
+hint = "post_check_run and post_review sit in SEPARATE try/except blocks; the check-run handler sets check_publish_failed and falls through to attempt the review (no early return). _resolve_result consults BOTH flags. Fetch/parse/LLM/publish errors are all caught and degrade to advisory-neutral — dispatch_code_review never raises a wire-level exception that could 500 the webhook."
+
+[[action]]
+name = "Gate"
+kind = "input"
+from = ["Drafted"]
+to = "Gated"
+params = ["pr_number"]
+guard = [
+  { type = "is_true", var = "mode_derives_from_repo_config_blocking_flag_per_dispatch" },
+  { type = "is_true", var = "advisory_mode_forces_neutral_and_comment_per_dispatch" },
+  { type = "is_true", var = "degraded_evaluation_forces_advisory_regardless_of_mode_per_dispatch" },
+  { type = "is_true", var = "blocking_failure_yields_failure_and_request_changes_per_dispatch" },
+  { type = "is_true", var = "publish_shape_single_source_of_truth_for_conclusion_and_event_per_dispatch" },
+]
+hint = "Resolve mode from RepoConfig and compute (conclusion, event) via _publish_shape."
+
+[[action]]
+name = "Publish"
+kind = "input"
+from = ["Gated"]
+to = "Published"
+params = ["request_id"]
+guard = [
+  { type = "is_true", var = "check_run_and_review_publish_independently_per_dispatch" },
+  { type = "is_true", var = "dispatch_never_raises_wire_exception_degrades_to_neutral_per_dispatch" },
+]
+hint = "post_check_run + (optionally) post_review on independent surfaces; result rolled up by _resolve_result."
+
+[[action]]
+name = "Retire"
+kind = "input"
+from = ["Published"]
+to = "Retired"
+params = ["successor_pr_head_sha"]
+hint = "PR head moves; this dispatch is now historical."
+
+[[invariant]]
+name = "MustGateBeforePublish"
+assert = "ordering(Gated, Published)"
+
+[[invariant]]
+name = "MustPublishBeforeRetire"
+assert = "ordering(Published, Retired)"
+
+[[invariant]]
+name = "RetiredIsTerminal"
+when = ["Retired"]
+assert = "no_further_transitions"
