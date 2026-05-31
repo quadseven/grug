@@ -17,6 +17,8 @@ from dataclasses import dataclass
 import pulumi
 import pulumi_aws as aws
 
+from components._types import SsmSecretRef
+
 
 @dataclass
 class LambdaService:
@@ -35,7 +37,7 @@ def create(
     timeout_seconds: int = 15,
     memory_mb: int = 512,
     layers: list[str] | None = None,
-    extra_ssm_secrets: list[aws.ssm.GetParameterResult] | None = None,
+    extra_ssm_secrets: list[SsmSecretRef] | None = None,
     cors_allow_origins: list[str] | None = None,
     cors_allow_methods: list[str] | None = None,
     cors_allow_headers: list[str] | None = None,
