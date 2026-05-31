@@ -48,7 +48,15 @@ def parse_rule(body: str) -> str | None:
 
 def finding_key(file: str, line: int, rule: str) -> str:
     """Canonical dedup key. `rule@file:line` — stable, human-readable
-    in logs, and unique per (file, line, rule) triple."""
+    in logs, unique per (file, line, rule) triple, only ever used for
+    set membership (never re-parsed, so a `:` in a path is harmless).
+
+    Both sides build the key via THIS function, so they agree as long as
+    `rule` agrees. The prior side gets `rule` from the marker regex
+    (`[A-Za-z0-9_-]+`); `code_review_prompt.ReviewRule` enforces the
+    same charset on every real rule name, so they match. A hallucinated
+    LLM rule outside that charset would mismatch — which fails SAFE
+    (posts a duplicate comment, never skips a real finding)."""
     return f"{rule}@{file}:{line}"
 
 
@@ -61,17 +69,18 @@ def prior_keys_from_comments(comments: list[dict]) -> set[str]:
     keys: set[str] = set()
     for c in comments:
         line = c.get("line")
-        if line is None:
+        path = c.get("path")
+        if line is None or path is None:
             continue
         rule = parse_rule(c.get("body", ""))
         if rule is None:
             continue
-        keys.add(finding_key(c["path"], int(line), rule))
+        keys.add(finding_key(path, int(line), rule))
     return keys
 
 
 def dedup_findings(
-    findings: tuple[Finding, ...], prior_keys: set[str],
+    findings: tuple[Finding, ...], prior_keys: frozenset[str] | set[str],
 ) -> tuple[Finding, ...]:
     """Drop findings whose (file, line, rule) key is already present in
     `prior_keys` (a Grug comment exists on that exact line for that

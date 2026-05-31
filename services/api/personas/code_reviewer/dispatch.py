@@ -247,7 +247,7 @@ def _build_review_result(
     findings (the bugs are still there)."""
     if evaluation.degraded_reason:
         return None
-    new_findings = dedup_findings(evaluation.findings, set(prior_keys))
+    new_findings = dedup_findings(evaluation.findings, prior_keys)
     if not new_findings:
         return None
     comments = tuple(

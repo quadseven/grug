@@ -20,7 +20,13 @@ llm_client's parser.
 """
 from __future__ import annotations
 
+import re
 from dataclasses import dataclass
+
+# Rule-name charset — must equal the dedup marker's capture class
+# (dedup._MARKER_RE) so a name round-trips through the comment marker
+# without the finding-side and prior-side dedup keys diverging.
+_RULE_NAME_RE = re.compile(r"[A-Za-z0-9_-]+")
 
 # Local severity set — NOT imported from llm_client (that would cycle:
 # llm_client imports this module). A drift-guard test asserts this
@@ -61,10 +67,16 @@ class ReviewRule:
     severity: str
 
     def __post_init__(self) -> None:
-        if not self.name or " " in self.name:
+        # `[A-Za-z0-9_-]+` (not merely space-free): the name becomes the
+        # `rule` field AND is round-tripped through the dedup marker
+        # regex `<!-- grug-rule:[A-Za-z0-9_-]+ -->` (#189). A name with
+        # `@`/`:`/other chars would make the finding-side dedup key
+        # diverge from the parsed prior-side key. Tying the charset to
+        # the marker here guarantees every real rule dedups correctly.
+        if not _RULE_NAME_RE.fullmatch(self.name):
             raise ValueError(
-                f"ReviewRule.name must be a non-empty space-free identifier "
-                f"(it becomes the `rule` field): {self.name!r}"
+                f"ReviewRule.name must match [A-Za-z0-9_-]+ (it becomes the "
+                f"`rule` field + dedup marker): {self.name!r}"
             )
         if self.severity not in _SEVERITIES:
             raise ValueError(
