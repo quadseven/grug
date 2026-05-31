@@ -176,7 +176,7 @@ webhook = lambda_service.create(
     # (sync data lookup, plain-str arns). Both satisfy the `SsmSecretRef`
     # Protocol (components/_types.py) — they expose `.arn`/`.name`, and the
     # consuming IAM policy wraps the arn list in `Output.all(...).apply()`,
-    # so either arm resolves correctly (#235 tightened this contract).
+    # so either arm resolves correctly (#235 named this contract).
     extra_ssm_secrets=[_dd_api_key, cf_secret.ssm_parameter, _openrouter_api_key, _poolside_api_key],
     # NOTE: DD extension is BAKED into the Lambda container image
     # (services/webhook/Dockerfile.lambda copies from
