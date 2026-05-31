@@ -419,6 +419,8 @@ def test_list_allowlisted_installs_paginates(_ddb_table, monkeypatch):
             assert kwargs.get("ExclusiveStartKey") == {"PK": "INST#1", "SK": "META"}
         return pages[i]
     monkeypatch.setattr(mod._table, "scan", _scan)
-    monkeypatch.setattr(mod, "is_install_allowlisted", lambda iid: True)
-    assert sorted(mod.list_allowlisted_installs()) == [1, 2]
+    # Filter applies ACROSS the page boundary: install 1 (page 1) not
+    # allowlisted, install 2 (page 2) is → only [2] survives.
+    monkeypatch.setattr(mod, "is_install_allowlisted", lambda iid: iid == 2)
+    assert mod.list_allowlisted_installs() == [2]
     assert calls["n"] == 2   # both pages fetched
