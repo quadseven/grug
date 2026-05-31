@@ -69,5 +69,12 @@ def handler(event: dict[str, Any], context: Any) -> dict[str, int]:
         "submitted": submitted,
         "failed_installs": failed_installs,
     }
-    log.info("reaction_poll_cycle_complete", extra=result)
+    # Total failure (auth/config drift, GitHub down) errors EVERY install and
+    # would otherwise look identical to a healthy idle cycle (submitted:0) —
+    # both are `info`. Escalate the all-failed case to `error` so a
+    # `status:error` monitor fires; the #261 infra slice arms the monitor.
+    if installs and failed_installs == len(installs):
+        log.error("reaction_poll_all_installs_failed", extra=result)
+    else:
+        log.info("reaction_poll_cycle_complete", extra=result)
     return result

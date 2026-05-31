@@ -69,6 +69,31 @@ def test_poller_skips_installs_with_no_records(monkeypatch):
     assert out == {"installs": 1, "records": 0, "submitted": 0, "failed_installs": 0}
 
 
+def test_poller_all_installs_fail_logs_error(monkeypatch, caplog):
+    """A SYSTEMIC failure (every install errors — auth/config drift) must
+    escalate to log.error, not hide as info — else a status:error monitor
+    never fires and it looks like a healthy idle cycle."""
+    import logging as _logging
+
+    def _retry(iid, fn):
+        raise RuntimeError("systemic token failure")
+    _wire(
+        monkeypatch,
+        installs=[1, 2],
+        records_for=lambda iid: [{"comment_id": iid}],
+        retry=_retry,
+        poll=lambda *a, **k: 0,
+    )
+    with caplog.at_level(_logging.WARNING):
+        out = poller_handler.handler({}, None)
+    assert out == {"installs": 2, "records": 2, "submitted": 0, "failed_installs": 2}
+    errs = [r for r in caplog.records if r.msg == "reaction_poll_all_installs_failed"]
+    assert errs and errs[0].levelno == _logging.ERROR
+    # a partial failure (not ALL) must NOT escalate to error
+    assert not any(r.msg == "reaction_poll_cycle_complete" and r.levelno >= _logging.ERROR
+                   for r in caplog.records)
+
+
 def test_poller_no_installs_is_a_clean_noop(monkeypatch):
     _wire(
         monkeypatch,
