@@ -46,6 +46,14 @@ def handler(event: dict[str, Any], context: Any) -> dict[str, int]:
         if not records:
             continue
         polled_records += len(records)
+        # `with_install_token_retry` is used here for its token ACQUISITION;
+        # its 401-refresh path is intentionally unreachable from the poller —
+        # `poll_and_annotate` catches per-record GH 401s internally (best-
+        # effort), so none propagates back to trigger a refresh. A revoked
+        # cached token therefore self-heals on a later cron tick once the
+        # token-cache TTL expires, not mid-cycle. Acceptable for best-effort
+        # calibration data; surfacing first-call 401s would be #245a engine
+        # surgery for marginal benefit.
         try:
             submitted += with_install_token_retry(
                 install_id,
