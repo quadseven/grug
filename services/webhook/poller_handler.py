@@ -8,7 +8,8 @@ that calibrates the LLM judge.
 
 Reuses the webhook container image (same `reactions` / `install_store` /
 `llm_client` / `github_app_auth` code); the `scheduled_lambda` Pulumi
-component (#261) overrides the image CMD to `poller_handler.handler`.
+component (#261) points `DD_LAMBDA_HANDLER` at `poller_handler.handler` (the
+image CMD stays the `datadog_lambda` wrapper, which dispatches to it).
 
 Best-effort by construction: one install's failure (GH 5xx, token error) logs
 and continues — a single bad install must never abort the whole poll cycle.

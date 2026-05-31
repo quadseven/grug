@@ -34,6 +34,7 @@ from components import (
     kms_cmk,
     lambda_service,
     oidc_role,
+    scheduled_lambda,
     ssm_secrets,
 )
 # NOTE: CF Worker (grug-webhook-host-rewrite) is managed OUT OF BAND
@@ -447,6 +448,49 @@ _aws.iam.RolePolicy(
     ),
 )
 
+# Reaction-poll scheduled Lambda (#247b). Reuses the WEBHOOK image — the
+# datadog_lambda CMD dispatches to DD_LAMBDA_HANDLER, so pointing it at
+# `poller_handler.handler` runs the cron entrypoint (#266) from the same
+# image with DD APM tracing. NO Function URL (EventBridge is the only
+# trigger). Needs the GitHub-App SecureStrings (install-token minting) +
+# DDB read/update; NOT the LLM keys (the reaction annotation is a DD-SDK
+# call, no inference). DD_SERVICE=grug-poller for a distinct o11y surface.
+poller = scheduled_lambda.create(
+    "grug-poller",
+    ecr_repo=webhook_ecr,
+    image_tag=webhook_image_tag,
+    schedule_expression="rate(15 minutes)",
+    env=env,
+    env_vars={
+        "GRUG_ENV": env,
+        "GRUG_LOG_LEVEL": "INFO",
+        "GRUG_DDB_TABLE": grug_main_table.name,
+        "GITHUB_APP_ID_SSM": secrets["github-app-id"].name,
+        "GITHUB_APP_PRIVATE_KEY_SSM": secrets["github-app-private-key"].name,
+        "DD_LAMBDA_HANDLER": "poller_handler.handler",
+        "DD_SITE": "datadoghq.com",
+        "DD_API_KEY": _dd_api_key.value,
+        "DD_ENV": env,
+        "DD_SERVICE": "grug-poller",
+        "DD_VERSION": _full_commit_sha,
+        # Parity with the webhook for trace/log correlation (the poller's
+        # structured logs carry trace_id; spans enabled).
+        "DD_TRACE_ENABLED": "true",
+        "DD_LOGS_INJECTION": "true",
+        # human_verdict evals attach to the Elder review spans, so the
+        # poller submits under the SAME ML app as the webhook.
+        "DD_LLMOBS_ENABLED": "true",
+        "DD_LLMOBS_ML_APP": "grug-elder",
+    },
+    table_arn=grug_main_table.arn,
+    extra_ssm_secrets=[
+        secrets["github-app-id"],
+        secrets["github-app-private-key"],
+    ],
+    env_vars_kms_key_arn=grug_tokens_cmk.arn,
+    iam_propagation_wait=_iam_propagation_wait,
+)
+
 # CF DNS — api.grug.lol → api Lambda Function URL (proxied; Worker
 # rewrites Host header just like webhook). Worker deployed via
 # infra/cloudflare/deploy.sh.
@@ -498,6 +542,49 @@ rum = dd_rum.create(name="grug-web", provider=_dd_provider)
 # dispatch-log outcomes; eval-based surfaces deep-link to the LLM Obs
 # explorer (evaluations aren't dashboard metrics — see component docstring).
 elder_dashboard = dd_dashboard.create_elder_health(env=env, provider=_dd_provider)
+
+# Poller error monitor (#247b, Phase 3.6 — a cron with no monitor isn't
+# "done"). poller_handler is best-effort (never raises), so any
+# aws.lambda.errors means a real crash (import error, OOM, timeout). Defined
+# here (not dd_monitors) to stay next to the poller + reuse _dd_provider /
+# _dd_notify which are created just above.
+monitor_poller_errors = _datadog.Monitor(
+    "grug-poller-errors",
+    type="metric alert",
+    name="[grug-poller] Lambda errors > 0 (15min)",
+    query=(
+        f"sum(last_15m):sum:aws.lambda.errors{{functionname:grug-poller,env:{env}}}"
+        ".as_count() > 0"
+    ),
+    message=(
+        "grug-poller (reaction-poll cron) is erroring — the handler is "
+        f"best-effort, so a Lambda error is a real crash. {_dd_notify}"
+    ),
+    tags=[f"env:{env}", "service:grug-poller", "team:grug"],
+    opts=pulumi.ResourceOptions(provider=_dd_provider),
+)
+# The handler SWALLOWS per-install failures (returns success → aws.lambda.errors
+# stays 0), so the metric monitor above can't see a SYSTEMIC outage. The
+# all-installs-failed path logs `reaction_poll_all_installs_failed` at error
+# (#266) precisely so a LOG monitor can catch it — this is that monitor.
+monitor_poller_all_failed = _datadog.Monitor(
+    "grug-poller-all-failed",
+    type="log alert",
+    name="[grug-poller] all installs failed (systemic)",
+    query=(
+        f'logs("service:grug-poller env:{env} reaction_poll_all_installs_failed")'
+        '.index("*").rollup("count").last("15m") > 0'
+    ),
+    message=(
+        "grug-poller: EVERY install failed to poll this cycle — systemic "
+        f"auth/config/GitHub failure, the human-verdict feed is dark. {_dd_notify}"
+    ),
+    tags=[f"env:{env}", "service:grug-poller", "team:grug"],
+    opts=pulumi.ResourceOptions(provider=_dd_provider),
+)
+pulumi.export("poller_function_name", poller.function.name)
+pulumi.export("monitor_poller_errors_id", monitor_poller_errors.id)
+pulumi.export("monitor_poller_all_failed_id", monitor_poller_all_failed.id)
 
 pulumi.export("webhook_function_url", webhook.function_url)
 pulumi.export("webhook_public_url", f"https://webhook.{domain}/webhook/github")
