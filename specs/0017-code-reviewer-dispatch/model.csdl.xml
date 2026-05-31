@@ -1,0 +1,92 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!-- Spec 0017 CodeReviewerDispatch — CSDL companion. Filename must be `model.csdl.xml`. -->
+<edmx:Edmx Version="4.0" xmlns:edmx="http://docs.oasis-open.org/odata/ns/edmx">
+  <edmx:DataServices>
+
+    <Schema Namespace="Temper.Vocab" xmlns="http://docs.oasis-open.org/odata/ns/edm">
+      <Term Name="StateMachine.States" Type="Collection(Edm.String)" AppliesTo="EntityType"/>
+      <Term Name="StateMachine.InitialState" Type="Edm.String" AppliesTo="EntityType"/>
+      <Term Name="StateMachine.ValidFromStates" Type="Collection(Edm.String)" AppliesTo="Action"/>
+      <Term Name="StateMachine.TargetState" Type="Edm.String" AppliesTo="Action"/>
+      <Term Name="Agent.Hint" Type="Edm.String" AppliesTo="Action EntityType"/>
+      <Term Name="ShardKey" Type="Edm.String" AppliesTo="EntityType"/>
+      <Term Name="AuthZ.CedarPolicy" Type="Edm.String" AppliesTo="EntityType Action"/>
+    </Schema>
+
+    <Schema Namespace="Grug.CodeReviewerDispatch" xmlns="http://docs.oasis-open.org/odata/ns/edm">
+
+      <EnumType Name="CodeReviewerDispatchStatus">
+        <Member Name="Drafted" Value="0"/>
+        <Member Name="Gated" Value="1"/>
+        <Member Name="Published" Value="2"/>
+        <Member Name="Retired" Value="3"/>
+      </EnumType>
+
+      <EntityType Name="CodeReviewerDispatch">
+        <Key><PropertyRef Name="CodeReviewerDispatchId"/></Key>
+        <Property Name="CodeReviewerDispatchId" Type="Edm.String" Nullable="false"/>
+        <Property Name="InstallationId" Type="Edm.String" Nullable="false"/>
+        <Property Name="Status" Type="Grug.CodeReviewerDispatch.CodeReviewerDispatchStatus" Nullable="false"/>
+
+        <Property Name="mode_derives_from_repo_config_blocking_flag_per_dispatch" Type="Edm.Boolean" DefaultValue="false"/>
+        <Property Name="advisory_mode_forces_neutral_and_comment_per_dispatch" Type="Edm.Boolean" DefaultValue="false"/>
+        <Property Name="degraded_evaluation_forces_advisory_regardless_of_mode_per_dispatch" Type="Edm.Boolean" DefaultValue="false"/>
+        <Property Name="blocking_failure_yields_failure_and_request_changes_per_dispatch" Type="Edm.Boolean" DefaultValue="false"/>
+        <Property Name="publish_shape_single_source_of_truth_for_conclusion_and_event_per_dispatch" Type="Edm.Boolean" DefaultValue="false"/>
+        <Property Name="check_run_and_review_publish_independently_per_dispatch" Type="Edm.Boolean" DefaultValue="false"/>
+        <Property Name="dispatch_never_raises_wire_exception_degrades_to_neutral_per_dispatch" Type="Edm.Boolean" DefaultValue="false"/>
+
+        <Annotation Term="Temper.Vocab.StateMachine.States">
+          <Collection>
+            <String>Drafted</String><String>Gated</String><String>Published</String><String>Retired</String>
+          </Collection>
+        </Annotation>
+        <Annotation Term="Temper.Vocab.StateMachine.InitialState" String="Drafted"/>
+        <Annotation Term="Temper.Vocab.ShardKey" String="InstallationId"/>
+        <Annotation Term="Temper.Vocab.AuthZ.CedarPolicy" String="policies/code-reviewer-dispatch.cedar"/>
+      </EntityType>
+
+      <Action Name="AttestGateContract" IsBound="true">
+        <Parameter Name="bindingParameter" Type="Grug.CodeReviewerDispatch.CodeReviewerDispatch"/>
+        <Parameter Name="attestor" Type="Edm.String" Nullable="false"/>
+        <ReturnType Type="Grug.CodeReviewerDispatch.CodeReviewerDispatch"/>
+        <Annotation Term="Temper.Vocab.StateMachine.ValidFromStates"><Collection><String>Drafted</String></Collection></Annotation>
+      </Action>
+
+      <Action Name="AttestPublishIndependenceContract" IsBound="true">
+        <Parameter Name="bindingParameter" Type="Grug.CodeReviewerDispatch.CodeReviewerDispatch"/>
+        <Parameter Name="attestor" Type="Edm.String" Nullable="false"/>
+        <ReturnType Type="Grug.CodeReviewerDispatch.CodeReviewerDispatch"/>
+        <Annotation Term="Temper.Vocab.StateMachine.ValidFromStates"><Collection><String>Drafted</String></Collection></Annotation>
+      </Action>
+
+      <Action Name="Gate" IsBound="true">
+        <Parameter Name="bindingParameter" Type="Grug.CodeReviewerDispatch.CodeReviewerDispatch"/>
+        <Parameter Name="pr_number" Type="Edm.String" Nullable="false"/>
+        <ReturnType Type="Grug.CodeReviewerDispatch.CodeReviewerDispatch"/>
+        <Annotation Term="Temper.Vocab.StateMachine.ValidFromStates"><Collection><String>Drafted</String></Collection></Annotation>
+        <Annotation Term="Temper.Vocab.StateMachine.TargetState" String="Gated"/>
+      </Action>
+
+      <Action Name="Publish" IsBound="true">
+        <Parameter Name="bindingParameter" Type="Grug.CodeReviewerDispatch.CodeReviewerDispatch"/>
+        <Parameter Name="request_id" Type="Edm.String" Nullable="false"/>
+        <ReturnType Type="Grug.CodeReviewerDispatch.CodeReviewerDispatch"/>
+        <Annotation Term="Temper.Vocab.StateMachine.ValidFromStates"><Collection><String>Gated</String></Collection></Annotation>
+        <Annotation Term="Temper.Vocab.StateMachine.TargetState" String="Published"/>
+      </Action>
+
+      <Action Name="Retire" IsBound="true">
+        <Parameter Name="bindingParameter" Type="Grug.CodeReviewerDispatch.CodeReviewerDispatch"/>
+        <Parameter Name="successor_pr_head_sha" Type="Edm.String" Nullable="false"/>
+        <ReturnType Type="Grug.CodeReviewerDispatch.CodeReviewerDispatch"/>
+        <Annotation Term="Temper.Vocab.StateMachine.ValidFromStates"><Collection><String>Published</String></Collection></Annotation>
+        <Annotation Term="Temper.Vocab.StateMachine.TargetState" String="Retired"/>
+      </Action>
+
+      <EntityContainer Name="CodeReviewerDispatchService">
+        <EntitySet Name="CodeReviewerDispatches" EntityType="Grug.CodeReviewerDispatch.CodeReviewerDispatch"/>
+      </EntityContainer>
+    </Schema>
+  </edmx:DataServices>
+</edmx:Edmx>
