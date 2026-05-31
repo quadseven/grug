@@ -553,7 +553,7 @@ monitor_poller_errors = _datadog.Monitor(
     type="metric alert",
     name="[grug-poller] Lambda errors > 0 (15min)",
     query=(
-        "sum(last_15m):sum:aws.lambda.errors{functionname:grug-poller}"
+        f"sum(last_15m):sum:aws.lambda.errors{{functionname:grug-poller,env:{env}}}"
         ".as_count() > 0"
     ),
     message=(
@@ -563,8 +563,28 @@ monitor_poller_errors = _datadog.Monitor(
     tags=[f"env:{env}", "service:grug-poller", "team:grug"],
     opts=pulumi.ResourceOptions(provider=_dd_provider),
 )
+# The handler SWALLOWS per-install failures (returns success → aws.lambda.errors
+# stays 0), so the metric monitor above can't see a SYSTEMIC outage. The
+# all-installs-failed path logs `reaction_poll_all_installs_failed` at error
+# (#266) precisely so a LOG monitor can catch it — this is that monitor.
+monitor_poller_all_failed = _datadog.Monitor(
+    "grug-poller-all-failed",
+    type="log alert",
+    name="[grug-poller] all installs failed (systemic)",
+    query=(
+        f'logs("service:grug-poller env:{env} reaction_poll_all_installs_failed")'
+        '.index("*").rollup("count").last("15m") > 0'
+    ),
+    message=(
+        "grug-poller: EVERY install failed to poll this cycle — systemic "
+        f"auth/config/GitHub failure, the human-verdict feed is dark. {_dd_notify}"
+    ),
+    tags=[f"env:{env}", "service:grug-poller", "team:grug"],
+    opts=pulumi.ResourceOptions(provider=_dd_provider),
+)
 pulumi.export("poller_function_name", poller.function.name)
 pulumi.export("monitor_poller_errors_id", monitor_poller_errors.id)
+pulumi.export("monitor_poller_all_failed_id", monitor_poller_all_failed.id)
 
 pulumi.export("webhook_function_url", webhook.function_url)
 pulumi.export("webhook_public_url", f"https://webhook.{domain}/webhook/github")
