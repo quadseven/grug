@@ -21,12 +21,18 @@ not here.
 """
 from __future__ import annotations
 
+import logging
 from dataclasses import asdict, dataclass
 from typing import Literal, get_args
 
 import httpx
 
 _GH_API = "https://api.github.com"
+_log = logging.getLogger(__name__)
+# A single review's inline comments are finding-bounded, but paginate anyway
+# so a large diff's >100 comments aren't silently dropped (the #189 lesson).
+# 10 × 100 = 1000 comments in one review is implausible; a cap-hit is logged.
+_MAX_REVIEW_COMMENT_PAGES = 10
 
 # Subset of GitHub's `event` enum the Elder persona uses. APPROVE +
 # PENDING omitted on purpose — see module docstring.
@@ -143,3 +149,52 @@ def post_review(
     )
     resp.raise_for_status()
     return resp.json()
+
+
+def get_review_comments(
+    install_token: str,
+    owner: str,
+    repo: str,
+    *,
+    pull_number: int,
+    review_id: int,
+) -> list[dict]:
+    """List the inline comments a posted review created.
+
+    `post_review` returns the review object (with its `id`) but NOT the
+    per-comment IDs, which reaction-polling (#247) needs to key each
+    `CommentRecord`. This fetches them via
+    `GET /repos/{o}/{r}/pulls/{n}/reviews/{review_id}/comments`.
+
+    Paginates (`per_page=100`, stops on a short page) up to
+    `_MAX_REVIEW_COMMENT_PAGES` — so a large diff's >100 inline comments are
+    NOT silently truncated (the #189 lesson; mirrors `_fetch_pr_review_comments`).
+    Does NOT catch 401: `with_install_token_retry` at the call site owns
+    invalidate + retry, same pattern as `post_review` / `post_check_run`.
+    """
+    out: list[dict] = []
+    for page in range(1, _MAX_REVIEW_COMMENT_PAGES + 1):
+        resp = httpx.get(
+            f"{_GH_API}/repos/{owner}/{repo}/pulls/{pull_number}/reviews/{review_id}/comments",
+            params={"per_page": 100, "page": page},
+            headers={
+                "Authorization": f"Bearer {install_token}",
+                "Accept": "application/vnd.github+json",
+                "X-GitHub-Api-Version": "2022-11-28",
+            },
+            timeout=10,
+        )
+        resp.raise_for_status()
+        body = resp.json()
+        if not isinstance(body, list):
+            break
+        out.extend(body)
+        if len(body) < 100:
+            break
+    else:
+        _log.warning(
+            "get_review_comments_page_cap_hit",
+            extra={"repo": f"{owner}/{repo}", "review_id": review_id,
+                   "max_pages": _MAX_REVIEW_COMMENT_PAGES},
+        )
+    return out

@@ -842,3 +842,288 @@ def test_dispatch_fetches_diff_with_diff_accept_header(monkeypatch):
     assert "myorg/myrepo" in captured[0]["url"]
     assert "/pulls/7" in captured[0]["url"]
     assert captured[0]["timeout"] == 30
+
+
+# --- #247a: capture inline-comment IDs on publish (best-effort) ---
+
+def _llm_with_span():
+    return LlmReviewResponse(
+        kind="reviewed",
+        findings=(LlmFinding(
+            path="src/x.py", line=2, rule="silent-failure",
+            severity="medium", message="m",  # type: ignore[arg-type]
+        ),),
+        backend_used=Backend.POOLSIDE,
+        review_span_context={"span_id": "s1", "trace_id": "t1"},
+    )
+
+
+def test_dispatch_captures_comment_records_on_publish(monkeypatch):
+    """After the review posts, fetch its inline-comment IDs and persist a
+    CommentRecord per comment — keyed to the review span + the finding's
+    eval_tags — so the reaction poller (#247) can later attach human_verdict."""
+    captured = []
+    monkeypatch.setattr(cr_dispatch, "review_diff", lambda *a, **kw: _llm_with_span())
+    monkeypatch.setattr(cr_dispatch, "post_check_run", lambda *a, **kw: {"id": 1})
+    monkeypatch.setattr(cr_dispatch, "post_review", lambda *a, **kw: {"id": 77})
+    monkeypatch.setattr(
+        cr_dispatch, "get_review_comments",
+        lambda *a, **kw: [{
+            "id": 555, "path": "src/x.py", "line": 2,
+            "body": "m\n<!-- grug-rule:silent-failure -->",
+        }],
+    )
+    monkeypatch.setattr(
+        cr_dispatch, "put_comment_record",
+        lambda **kw: captured.append(kw),
+    )
+    with patch("httpx.get", return_value=_diff_response()):
+        out = cr_dispatch.dispatch_code_review(_payload(), blocking=False)
+
+    assert out["result"] == "pass"
+    assert len(captured) == 1
+    rec = captured[0]
+    assert rec["comment_id"] == 555
+    assert rec["repo"] == "myorg/myrepo"
+    assert rec["pr_number"] == 7
+    assert rec["review_span_context"] == {"span_id": "s1", "trace_id": "t1"}
+    # finding_tags are the judge's eval_tags shape (shared finding identity).
+    assert rec["finding_tags"]["rule_name"] == "silent-failure"
+    assert rec["finding_tags"]["file"] == "src/x.py"
+    assert rec["finding_tags"]["line"] == "2"
+
+
+def test_dispatch_capture_failure_does_not_affect_review(monkeypatch):
+    """A capture failure (GH 5xx fetching review comments) is swallowed —
+    the review already posted, so dispatch still returns its real result and
+    never raises (the best-effort, post-publish contract)."""
+    monkeypatch.setattr(cr_dispatch, "review_diff", lambda *a, **kw: _llm_with_span())
+    monkeypatch.setattr(cr_dispatch, "post_check_run", lambda *a, **kw: {"id": 1})
+    monkeypatch.setattr(cr_dispatch, "post_review", lambda *a, **kw: {"id": 77})
+
+    def _boom(*a, **kw):
+        raise httpx.RequestError("comment fetch down")
+    monkeypatch.setattr(cr_dispatch, "get_review_comments", _boom)
+    persisted = []
+    monkeypatch.setattr(cr_dispatch, "put_comment_record", lambda **kw: persisted.append(kw))
+
+    with patch("httpx.get", return_value=_diff_response()):
+        out = cr_dispatch.dispatch_code_review(_payload(), blocking=False)
+
+    assert out["result"] == "pass"   # review outcome unaffected
+    assert persisted == []            # nothing captured, no crash
+
+
+def test_dispatch_capture_ddb_error_does_not_500_dispatch(monkeypatch):
+    """A NON-httpx error in capture (e.g. a DDB put_comment_record failure)
+    must also be swallowed — capture touches both GH and DDB, so the guard is
+    broad. Otherwise a DDB blip would 500 the webhook (spec 0017 never-raise)."""
+    monkeypatch.setattr(cr_dispatch, "review_diff", lambda *a, **kw: _llm_with_span())
+    monkeypatch.setattr(cr_dispatch, "post_check_run", lambda *a, **kw: {"id": 1})
+    monkeypatch.setattr(cr_dispatch, "post_review", lambda *a, **kw: {"id": 77})
+    monkeypatch.setattr(
+        cr_dispatch, "get_review_comments",
+        lambda *a, **kw: [{
+            "id": 9, "path": "src/x.py", "line": 2,
+            "body": "m\n<!-- grug-rule:silent-failure -->",
+        }],
+    )
+
+    def _ddb_boom(**kw):
+        raise RuntimeError("DDB ProvisionedThroughputExceeded")
+    monkeypatch.setattr(cr_dispatch, "put_comment_record", _ddb_boom)
+
+    with patch("httpx.get", return_value=_diff_response()):
+        out = cr_dispatch.dispatch_code_review(_payload(), blocking=False)
+
+    assert out["result"] == "pass"   # dispatch did not raise
+
+
+def test_dispatch_capture_partial_batch_persists_the_rest(monkeypatch):
+    """A single comment's DDB put failing must NOT drop the rest of the batch
+    — capture is per-comment best-effort (one throttle ≠ lose every record)."""
+    llm = LlmReviewResponse(
+        kind="reviewed",
+        findings=(
+            LlmFinding(path="src/x.py", line=2, rule="r1", severity="medium", message="m"),  # type: ignore[arg-type]
+            LlmFinding(path="src/x.py", line=3, rule="r2", severity="low", message="m"),  # type: ignore[arg-type]
+        ),
+        backend_used=Backend.POOLSIDE,
+        review_span_context={"span_id": "s", "trace_id": "t"},
+    )
+    monkeypatch.setattr(cr_dispatch, "review_diff", lambda *a, **kw: llm)
+    monkeypatch.setattr(cr_dispatch, "post_check_run", lambda *a, **kw: {"id": 1})
+    monkeypatch.setattr(cr_dispatch, "post_review", lambda *a, **kw: {"id": 77})
+    monkeypatch.setattr(
+        cr_dispatch, "get_review_comments",
+        lambda *a, **kw: [
+            {"id": 1, "path": "src/x.py", "line": 2,
+             "body": "m\n<!-- grug-rule:r1 -->"},
+            {"id": 2, "path": "src/x.py", "line": 3,
+             "body": "m\n<!-- grug-rule:r2 -->"},
+        ],
+    )
+    persisted = []
+
+    def _put(**kw):
+        if kw["comment_id"] == 1:
+            raise RuntimeError("DDB throttle on first")
+        persisted.append(kw["comment_id"])
+    monkeypatch.setattr(cr_dispatch, "put_comment_record", _put)
+
+    with patch("httpx.get", return_value=_diff_response()):
+        out = cr_dispatch.dispatch_code_review(_payload(), blocking=False)
+
+    assert out["result"] == "pass"
+    assert persisted == [2]   # comment 1 threw, comment 2 still persisted
+
+
+def test_dispatch_capture_two_rules_same_line_keep_distinct_tags(monkeypatch):
+    """Two distinct rules can comment the SAME (file, line) — capture must
+    key by rule (via the comment's grug-rule marker), NOT collapse to one
+    finding, so each record carries its own rule's tags (matches dedup)."""
+    llm = LlmReviewResponse(
+        kind="reviewed",
+        findings=(
+            LlmFinding(path="src/x.py", line=2, rule="null-deref", severity="high", message="m"),  # type: ignore[arg-type]
+            LlmFinding(path="src/x.py", line=2, rule="race-condition", severity="high", message="m"),  # type: ignore[arg-type]
+        ),
+        backend_used=Backend.POOLSIDE,
+        review_span_context={"span_id": "s", "trace_id": "t"},
+    )
+    captured = []
+    monkeypatch.setattr(cr_dispatch, "review_diff", lambda *a, **kw: llm)
+    monkeypatch.setattr(cr_dispatch, "post_check_run", lambda *a, **kw: {"id": 1})
+    monkeypatch.setattr(cr_dispatch, "post_review", lambda *a, **kw: {"id": 77})
+    monkeypatch.setattr(
+        cr_dispatch, "get_review_comments",
+        lambda *a, **kw: [
+            {"id": 1, "path": "src/x.py", "line": 2, "body": "m\n<!-- grug-rule:null-deref -->"},
+            {"id": 2, "path": "src/x.py", "line": 2, "body": "m\n<!-- grug-rule:race-condition -->"},
+        ],
+    )
+    monkeypatch.setattr(cr_dispatch, "put_comment_record", lambda **kw: captured.append(kw))
+    with patch("httpx.get", return_value=_diff_response()):
+        cr_dispatch.dispatch_code_review(_payload(), blocking=False)
+
+    by_id = {c["comment_id"]: c["finding_tags"]["rule_name"] for c in captured}
+    assert by_id == {1: "null-deref", 2: "race-condition"}  # NOT collapsed
+
+
+def test_dispatch_no_capture_when_review_span_absent(monkeypatch):
+    """When the review span never exported (degraded review), skip capture
+    entirely — the poller would skip a null-span record anyway, so persisting
+    it just wastes the poll batch. get_review_comments must NOT be called."""
+    llm = LlmReviewResponse(
+        kind="reviewed",
+        findings=(LlmFinding(
+            path="src/x.py", line=2, rule="silent-failure",
+            severity="medium", message="m",  # type: ignore[arg-type]
+        ),),
+        backend_used=Backend.POOLSIDE,
+        review_span_context=None,  # span never exported
+    )
+    fetched = []
+    monkeypatch.setattr(cr_dispatch, "review_diff", lambda *a, **kw: llm)
+    monkeypatch.setattr(cr_dispatch, "post_check_run", lambda *a, **kw: {"id": 1})
+    monkeypatch.setattr(cr_dispatch, "post_review", lambda *a, **kw: {"id": 77})
+    monkeypatch.setattr(
+        cr_dispatch, "get_review_comments",
+        lambda *a, **kw: fetched.append(1) or [],
+    )
+    monkeypatch.setattr(cr_dispatch, "put_comment_record", lambda **kw: None)
+    with patch("httpx.get", return_value=_diff_response()):
+        out = cr_dispatch.dispatch_code_review(_payload(), blocking=False)
+    assert out["result"] == "pass"
+    assert fetched == []  # capture skipped
+
+
+def test_dispatch_capture_skips_unmarked_human_comment(monkeypatch):
+    """LOAD-BEARING: a human reply with no grug-rule marker that happens to
+    land on a finding's (file,line) must NOT be captured — only OUR marked
+    comments become CommentRecords. A marked sibling in the same batch IS."""
+    captured = []
+    monkeypatch.setattr(cr_dispatch, "review_diff", lambda *a, **kw: _llm_with_span())
+    monkeypatch.setattr(cr_dispatch, "post_check_run", lambda *a, **kw: {"id": 1})
+    monkeypatch.setattr(cr_dispatch, "post_review", lambda *a, **kw: {"id": 77})
+    monkeypatch.setattr(
+        cr_dispatch, "get_review_comments",
+        lambda *a, **kw: [
+            {"id": 100, "path": "src/x.py", "line": 2, "body": "looks fine to me"},  # human, no marker
+            {"id": 200, "path": "src/x.py", "line": 2,
+             "body": "m\n<!-- grug-rule:silent-failure -->"},                          # ours
+        ],
+    )
+    monkeypatch.setattr(cr_dispatch, "put_comment_record", lambda **kw: captured.append(kw["comment_id"]))
+    with patch("httpx.get", return_value=_diff_response()):
+        cr_dispatch.dispatch_code_review(_payload(), blocking=False)
+    assert captured == [200]  # human comment 100 NOT captured
+
+
+def test_dispatch_capture_skips_marked_comment_with_no_matching_finding(monkeypatch):
+    """A marked comment whose (file,line,rule) matches no current finding
+    (stale prior-review comment, renamed rule) is skipped — not persisted."""
+    captured = []
+    monkeypatch.setattr(cr_dispatch, "review_diff", lambda *a, **kw: _llm_with_span())  # finding: silent-failure@2
+    monkeypatch.setattr(cr_dispatch, "post_check_run", lambda *a, **kw: {"id": 1})
+    monkeypatch.setattr(cr_dispatch, "post_review", lambda *a, **kw: {"id": 77})
+    monkeypatch.setattr(
+        cr_dispatch, "get_review_comments",
+        lambda *a, **kw: [{"id": 9, "path": "src/x.py", "line": 2,
+                           "body": "m\n<!-- grug-rule:some-other-rule -->"}],
+    )
+    monkeypatch.setattr(cr_dispatch, "put_comment_record", lambda **kw: captured.append(kw))
+    with patch("httpx.get", return_value=_diff_response()):
+        cr_dispatch.dispatch_code_review(_payload(), blocking=False)
+    assert captured == []
+
+
+def test_dispatch_capture_zero_alarm_logged(monkeypatch, caplog):
+    """0-of-N capture (non-empty fetch, nothing matched) fires the
+    code_review_comment_capture_zero alarm — the only signal that a
+    comment↔finding shape regression silently emptied the poller batch."""
+    import logging as _logging
+    monkeypatch.setattr(cr_dispatch, "review_diff", lambda *a, **kw: _llm_with_span())
+    monkeypatch.setattr(cr_dispatch, "post_check_run", lambda *a, **kw: {"id": 1})
+    monkeypatch.setattr(cr_dispatch, "post_review", lambda *a, **kw: {"id": 77})
+    monkeypatch.setattr(
+        cr_dispatch, "get_review_comments",
+        lambda *a, **kw: [{"id": 1, "path": "src/x.py", "line": 2, "body": "no marker"}],
+    )
+    monkeypatch.setattr(cr_dispatch, "put_comment_record", lambda **kw: None)
+    with patch("httpx.get", return_value=_diff_response()), caplog.at_level(_logging.WARNING):
+        cr_dispatch.dispatch_code_review(_payload(), blocking=False)
+    zero = [r for r in caplog.records if r.msg == "code_review_comment_capture_zero"]
+    assert zero and getattr(zero[0], "fetched", None) == 1
+
+
+def test_dispatch_no_capture_when_review_publish_failed(monkeypatch):
+    """If the review post FAILED, capture must not run (nothing to attach to,
+    and get_review_comments on a non-existent review_id would 404)."""
+    fetched = []
+    monkeypatch.setattr(cr_dispatch, "review_diff", lambda *a, **kw: _llm_with_span())
+    monkeypatch.setattr(cr_dispatch, "post_check_run", lambda *a, **kw: {"id": 1})
+
+    def _raise(*a, **kw):
+        raise httpx.RequestError("review post down")
+    monkeypatch.setattr(cr_dispatch, "post_review", _raise)
+    monkeypatch.setattr(cr_dispatch, "get_review_comments", lambda *a, **kw: fetched.append(1) or [])
+    monkeypatch.setattr(cr_dispatch, "put_comment_record", lambda **kw: None)
+    with patch("httpx.get", return_value=_diff_response()):
+        out = cr_dispatch.dispatch_code_review(_payload(), blocking=False)
+    assert out["result"] == "publish_failed"
+    assert fetched == []  # capture skipped — review never posted
+
+
+def test_dispatch_no_capture_when_review_resp_has_no_id(monkeypatch):
+    """A post_review response shape without `id` short-circuits capture
+    (can't build the reviews/{id}/comments URL)."""
+    fetched = []
+    monkeypatch.setattr(cr_dispatch, "review_diff", lambda *a, **kw: _llm_with_span())
+    monkeypatch.setattr(cr_dispatch, "post_check_run", lambda *a, **kw: {"id": 1})
+    monkeypatch.setattr(cr_dispatch, "post_review", lambda *a, **kw: {})  # no id
+    monkeypatch.setattr(cr_dispatch, "get_review_comments", lambda *a, **kw: fetched.append(1) or [])
+    monkeypatch.setattr(cr_dispatch, "put_comment_record", lambda **kw: None)
+    with patch("httpx.get", return_value=_diff_response()):
+        cr_dispatch.dispatch_code_review(_payload(), blocking=False)
+    assert fetched == []
