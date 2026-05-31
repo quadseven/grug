@@ -92,17 +92,35 @@ def _const_tuple(node: ast.AST) -> tuple[object, ...] | None:
     return None
 
 
+# Zero-arg builtin constructors that yield a falsy value — `set()`, `dict()`,
+# `int()`, `str()`, etc. — another way to write a statically-dead `if` guard.
+_FALSY_ZERO_ARG_CTORS: frozenset[str] = frozenset({
+    "list", "tuple", "set", "frozenset", "dict",
+    "str", "bytes", "bytearray", "int", "float", "complex",
+})
+
+
 def _is_falsy_const(node: ast.AST) -> bool:
-    """A statically-falsy literal usable as a dead-code guard: a falsy
-    constant (`False`, `0`, `None`, `""`) OR an empty collection literal
-    (`[]`, `()`, `{}`, set/dict). Covers the AST forms an `if <X>:` guard
-    can take to be unreachable at runtime while still parsing."""
+    """A statically-falsy expression usable as a dead-code guard: a falsy
+    constant (`False`, `0`, `None`, `""`); an empty collection literal
+    (`[]`, `()`, `{}`, set/dict); or a zero-arg falsy builtin constructor
+    call (`set()`, `dict()`, `int()`, ...). Covers the AST forms an
+    `if <X>:` guard can take to be unreachable at runtime while still
+    parsing — the vacuous-pass class this attester exists to close."""
     if isinstance(node, ast.Constant):
         return not node.value
     if isinstance(node, (ast.List, ast.Tuple, ast.Set)):
         return len(node.elts) == 0
     if isinstance(node, ast.Dict):
         return len(node.keys) == 0
+    if (
+        isinstance(node, ast.Call)
+        and isinstance(node.func, ast.Name)
+        and node.func.id in _FALSY_ZERO_ARG_CTORS
+        and not node.args
+        and not node.keywords
+    ):
+        return True
     return False
 
 
