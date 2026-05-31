@@ -194,7 +194,7 @@ jobs:
         run: python3 infra/scripts/attest_kms_corruption_cleanup.py
 
   verify-domain:
-    name: "temper verify · domain (0006-0010, 0014-0016)"
+    name: "temper verify · domain (0006-0010, 0014-0017)"
     needs: build
     runs-on: ubuntu-latest
     timeout-minutes: 10
