@@ -121,6 +121,15 @@ def create(
                             "ssm:GetParameter*",
                             "ssm:DescribeParameters",
                             "cloudwatch:*",
+                            # EventBridge (events:*) is a DISTINCT namespace
+                            # from cloudwatch:* (metrics/alarms). The reaction-
+                            # poll scheduled Lambda (#261) is the first
+                            # EventBridge resource; creating a TAGGED rule needs
+                            # events:TagResource + PutRule/PutTargets/etc. Broad
+                            # like the lambda:*/cloudwatch:* grants above
+                            # (Slice-1 "deploy works"; ARN-scoping is the
+                            # deferred follow-up).
+                            "events:*",
                             "sts:GetCallerIdentity",
                             "kms:Decrypt",
                             # Lambda eagerly encrypts env vars on the
