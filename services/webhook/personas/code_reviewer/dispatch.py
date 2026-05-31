@@ -31,19 +31,21 @@ import httpx
 from github_app_auth import with_install_token_retry
 from github_checks_client import CheckConclusion, CheckRunResult, post_check_run
 from github_reviews_client import (
-    InlineComment, ReviewEvent, ReviewResult, post_review,
+    InlineComment, ReviewEvent, ReviewResult, get_review_comments, post_review,
 )
 from llm_client import Hunk as LlmHunk, LlmReviewResponse, review_diff
 from personas.code_reviewer.dedup import (
-    dedup_findings, prior_keys_from_comments, rule_marker,
+    dedup_findings, finding_key, parse_rule, prior_keys_from_comments,
+    rule_marker,
 )
 from personas.code_reviewer.diff_parser import (
     DiffHunk, DiffParseError, parse_diff,
 )
-from personas.code_reviewer.judge import run_judge
+from personas.code_reviewer.judge import eval_tags, run_judge
 from personas.code_reviewer.persona import (
     CodeReviewEvaluation, Finding, evaluate_diff,
 )
+from adapters.install_store import put_comment_record  # type: ignore
 
 log = logging.getLogger(f"{os.getenv('DD_SERVICE', 'grug')}.persona.code_reviewer")
 
@@ -290,6 +292,67 @@ def _build_review_result(
     )
 
 
+def _capture_comment_records(
+    comments: list[dict],
+    findings: tuple[Finding, ...],
+    *,
+    install_id: int,
+    repo: str,
+    pr_number: int,
+    review_span_context: dict,
+) -> int:
+    """Persist each posted inline comment as a CommentRecord for later
+    reaction polling (#247). Matches each comment to the Finding that
+    produced it by (file, line, RULE) so the stored `finding_tags` are the
+    SAME `eval_tags` the judge used — the poller's `human_verdict` then
+    shares finding identity with the judge's `is_real_bug`.
+
+    Keying includes the rule (not just file+line): two distinct rules can
+    post two comments on the SAME line (dedup keys on rule for exactly this
+    reason), so a (file, line) map would collapse them and mis-tag one. The
+    rule is recovered from each comment body's hidden `<!-- grug-rule:NAME -->`
+    marker (the same marker dedup parses), so a comment with no marker (not
+    ours) or no matching finding is skipped. Best-effort per comment: a
+    malformed dict or a single DDB blip is skipped, never raised. Returns
+    count persisted.
+    """
+    by_key: dict[str, Finding] = {
+        finding_key(f.file, f.line, f.rule_name): f for f in findings
+    }
+    persisted = 0
+    for c in comments:
+        cid, path, line = c.get("id"), c.get("path"), c.get("line")
+        if cid is None or path is None or line is None:
+            continue
+        rule = parse_rule(c.get("body", ""))
+        if rule is None:
+            continue
+        try:
+            finding = by_key.get(finding_key(path, int(line), rule))
+        except (TypeError, ValueError):
+            continue
+        if finding is None:
+            continue
+        try:
+            put_comment_record(
+                install_id=install_id,
+                comment_id=int(cid),
+                repo=repo,
+                pr_number=pr_number,
+                review_span_context=review_span_context,
+                finding_tags=eval_tags(finding),
+            )
+            persisted += 1
+        except Exception as e:  # noqa: BLE001 — per-comment: one DDB blip
+            # (throttle) must not drop the rest of the batch.
+            log.warning(
+                "comment_record_put_failed",
+                extra={"install_id": install_id, "comment_id": cid,
+                       "kind": type(e).__name__},
+            )
+    return persisted
+
+
 def dispatch_code_review(
     payload: dict[str, Any], *, blocking: bool,
 ) -> dict[str, str]:
@@ -415,9 +478,10 @@ def dispatch_code_review(
     review_result = _build_review_result(
         evaluation, head_sha=head_sha, event=event, prior_keys=prior_keys,
     )
+    review_resp: dict[str, Any] | None = None
     if review_result is not None:
         try:
-            with_install_token_retry(
+            review_resp = with_install_token_retry(
                 installation_id,
                 lambda token: post_review(
                     token, owner, repo_name,
@@ -434,6 +498,69 @@ def dispatch_code_review(
                 },
             )
             review_publish_failed = True
+
+    # Capture inline-comment IDs for later reaction polling (#247). BEST-
+    # EFFORT, post-publish, own try/except — a capture failure must never
+    # change the review outcome (`result` is computed below, unaffected).
+    # Gated on: the review actually posted, AND a review span exists to
+    # attach future `human_verdict` annotations to (else the poller would
+    # skip the record anyway, so persisting it just wastes the poll batch).
+    if (
+        review_resp is not None
+        and not review_publish_failed
+        and llm_response.review_span_context is not None
+    ):
+        review_id = review_resp.get("id")
+        if review_id is not None:
+            try:
+                comments = with_install_token_retry(
+                    installation_id,
+                    lambda token: get_review_comments(
+                        token, owner, repo_name,
+                        pull_number=pull_number, review_id=int(review_id),
+                    ),
+                )
+                persisted = _capture_comment_records(
+                    comments, evaluation.findings,
+                    install_id=installation_id,
+                    repo=f"{owner}/{repo_name}",
+                    pr_number=pull_number,
+                    review_span_context=llm_response.review_span_context,
+                )
+                # Observability: a 0-of-N capture (e.g. a comment↔finding
+                # shape regression) silently empties the poller's batch with
+                # no other signal — alarm on it; otherwise record the count.
+                if comments and persisted == 0:
+                    log.warning(
+                        "code_review_comment_capture_zero",
+                        extra={
+                            "installation_id": installation_id,
+                            "pr": f"{owner}/{repo_name}#{pull_number}",
+                            "fetched": len(comments),
+                        },
+                    )
+                else:
+                    log.info(
+                        "code_review_comments_captured",
+                        extra={
+                            "installation_id": installation_id,
+                            "pr": f"{owner}/{repo_name}#{pull_number}",
+                            "fetched": len(comments),
+                            "persisted": persisted,
+                        },
+                    )
+            except Exception as e:  # noqa: BLE001 — capture is best-effort; a
+                # GH 5xx (get_review_comments) OR a DDB error (put_comment_record)
+                # must never 500 dispatch. Broad like run_judge's guard below.
+                log.error(
+                    "code_review_comment_capture_failed",
+                    extra={
+                        "installation_id": installation_id,
+                        "pr": f"{owner}/{repo_name}#{pull_number}",
+                        "kind": type(e).__name__,
+                    },
+                    exc_info=True,
+                )
 
     result = _resolve_result(
         evaluation,

@@ -66,6 +66,14 @@ name = "dispatch_never_raises_wire_exception_degrades_to_neutral_per_dispatch"
 type = "bool"
 initial = "false"
 
+# #247a — capturing inline-comment IDs for later reaction polling is a
+# best-effort step AFTER the review publishes; a capture failure must never
+# change the review outcome (sibling to run_judge).
+[[state]]
+name = "comment_capture_is_best_effort_post_publish_per_dispatch"
+type = "bool"
+initial = "false"
+
 [[action]]
 name = "AttestGateContract"
 kind = "input"
@@ -90,8 +98,9 @@ guard = "is_false check_run_and_review_publish_independently_per_dispatch"
 effect = [
   { type = "set_bool", var = "check_run_and_review_publish_independently_per_dispatch", value = true },
   { type = "set_bool", var = "dispatch_never_raises_wire_exception_degrades_to_neutral_per_dispatch", value = true },
+  { type = "set_bool", var = "comment_capture_is_best_effort_post_publish_per_dispatch", value = true },
 ]
-hint = "post_check_run and post_review sit in SEPARATE try/except blocks; the check-run handler sets check_publish_failed and falls through to attempt the review (no early return). _resolve_result consults BOTH flags. Fetch/parse/LLM/publish errors are all caught and degrade to advisory-neutral — dispatch_code_review never raises a wire-level exception that could 500 the webhook."
+hint = "post_check_run and post_review sit in SEPARATE try/except blocks; the check-run handler sets check_publish_failed and falls through to attempt the review (no early return). _resolve_result consults BOTH flags. Fetch/parse/LLM/publish errors are all caught and degrade to advisory-neutral — dispatch_code_review never raises a wire-level exception that could 500 the webhook. Capturing inline-comment IDs for reaction polling (#247) runs AFTER the review publish in its OWN try/except — a capture failure never alters the review outcome (sibling to run_judge)."
 
 [[action]]
 name = "Gate"
