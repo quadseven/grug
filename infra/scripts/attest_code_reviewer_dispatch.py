@@ -174,8 +174,13 @@ def _handler_exc_names(handler: ast.ExceptHandler) -> set[str]:
 
 
 def _handler_assigns_true(handler: ast.ExceptHandler, name: str) -> bool:
+    # `_walk_no_nested` (not ast.walk) so a `name = True` buried in a
+    # never-called nested def/lambda doesn't count — same value-flow guard
+    # as the early-return scan. Matches `ast.Assign` only (not AnnAssign);
+    # a `check_publish_failed: bool = True` would not satisfy this — an
+    # intentionally strict constraint, the handler assigns plainly today.
     for stmt in handler.body:
-        for n in ast.walk(stmt):
+        for n in _walk_no_nested(stmt):
             if isinstance(n, ast.Assign) and isinstance(n.value, ast.Constant) and n.value.value is True:
                 if any(isinstance(t, ast.Name) and t.id == name for t in n.targets):
                     return True
@@ -228,7 +233,8 @@ def _check_publish_shape(tree: ast.AST, path: Path) -> list[str]:
         test_src = ast.unparse(fail_if.test)
         if _is_falsy_const(fail_if.test):
             fails.append(f"FAIL: {path} — blocking-failure branch is dead (constant test)")
-        if "conclusion" not in test_src or '"failure"' not in test_src and "'failure'" not in test_src:
+        has_failure_literal = '"failure"' in test_src or "'failure'" in test_src
+        if "conclusion" not in test_src or not has_failure_literal:
             fails.append(
                 f"FAIL: {path} — blocking-failure branch does not test "
                 "`conclusion == 'failure'`"
