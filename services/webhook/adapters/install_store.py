@@ -190,6 +190,10 @@ def list_allowlisted_installs() -> list[int]:
             try:
                 iid = int(id_str)
             except (TypeError, ValueError):
+                # Unreachable under the write path (_inst_pk formats an int);
+                # if it fires it's data corruption — log rather than silently
+                # drop an install that should be polled.
+                log.warning("install_pk_unparsable", extra={"pk": pk})
                 continue
             if is_install_allowlisted(iid):
                 install_ids.append(iid)
