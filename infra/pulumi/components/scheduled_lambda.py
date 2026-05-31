@@ -78,7 +78,10 @@ def create(
         tags={"app": "grug", "service": name},
     )
 
-    aws.iam.RolePolicy(
+    region = aws.get_region().name
+
+    policies: list[aws.iam.RolePolicy] = []
+    policies.append(aws.iam.RolePolicy(
         f"{name}-logs-policy",
         role=role.id,
         policy=log_group.arn.apply(lambda arn: json.dumps({
@@ -89,12 +92,12 @@ def create(
                 "Resource": [arn, f"{arn}:*"],
             }],
         })),
-    )
+    ))
 
     # SSM read on the GitHub-App SecureStrings the poller needs for install
     # token minting (+ decrypt via the AWS-managed aws/ssm key).
     secret_arns = [s.arn for s in extra_ssm_secrets]
-    aws.iam.RolePolicy(
+    policies.append(aws.iam.RolePolicy(
         f"{name}-ssm-policy",
         role=role.id,
         policy=pulumi.Output.all(*secret_arns).apply(lambda arns: json.dumps({
@@ -110,18 +113,18 @@ def create(
                     "Action": "kms:Decrypt",
                     "Resource": "*",
                     "Condition": {"StringEquals": {
-                        "kms:ViaService": "ssm.us-east-1.amazonaws.com",
+                        "kms:ViaService": f"ssm.{region}.amazonaws.com",
                     }},
                 },
             ],
         })),
-    )
+    ))
 
     # DDB read+update — Scan (list_allowlisted_installs), Query
     # (list_comment_records), GetItem (is_install_allowlisted), UpdateItem
     # (update_comment_record_reaction). No Put/Delete (the poller never
-    # creates or removes rows).
-    aws.iam.RolePolicy(
+    # creates or removes rows); base table only — no GSI is queried.
+    policies.append(aws.iam.RolePolicy(
         f"{name}-ddb-policy",
         role=role.id,
         policy=pulumi.Output.from_input(table_arn).apply(lambda arn: json.dumps({
@@ -134,16 +137,42 @@ def create(
                     "dynamodb:Scan",
                     "dynamodb:UpdateItem",
                 ],
-                "Resource": [arn, f"{arn}/index/*"],
+                "Resource": [arn],
             }],
         })),
-    )
+    ))
+
+    # When env vars are CMK-encrypted, the Lambda SERVICE must kms:Decrypt
+    # them via `kms:ViaService = lambda.<region>` to unwrap at COLD START,
+    # before the runtime/DD-extension/handler boot. This is a DISTINCT grant
+    # from the SSM-ViaService decrypt above; without it the function fails to
+    # initialize on every invocation (invisible to `pulumi preview`).
+    if env_vars_kms_key_arn is not None:
+        policies.append(aws.iam.RolePolicy(
+            f"{name}-envvar-kms-policy",
+            role=role.id,
+            policy=pulumi.Output.from_input(env_vars_kms_key_arn).apply(
+                lambda arn: json.dumps({
+                    "Version": "2012-10-17",
+                    "Statement": [{
+                        "Effect": "Allow",
+                        "Action": "kms:Decrypt",
+                        "Resource": arn,
+                        "Condition": {"StringEquals": {
+                            "kms:ViaService": f"lambda.{region}.amazonaws.com",
+                        }},
+                    }],
+                }),
+            ),
+        ))
 
     image_uri = pulumi.Output.concat(ecr_repo.repository_url, ":", image_tag)
-    function_opts = (
-        pulumi.ResourceOptions(depends_on=[iam_propagation_wait])
-        if iam_propagation_wait is not None else None
-    )
+    # Gate the Function on its own role policies (so the first cron tick can't
+    # AccessDenied before they propagate) + the deploy-role propagation wait.
+    depends = list(policies)
+    if iam_propagation_wait is not None:
+        depends.append(iam_propagation_wait)
+    function_opts = pulumi.ResourceOptions(depends_on=depends)
     function = aws.lambda_.Function(
         name,
         name=name,
@@ -170,6 +199,7 @@ def create(
     aws.cloudwatch.EventTarget(
         f"{name}-target",
         rule=rule.name,
+        target_id=f"{name}-lambda",
         arn=function.arn,
     )
     # Without this, EventBridge silently fails to invoke (AccessDenied) — the
