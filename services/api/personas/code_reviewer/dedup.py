@@ -17,10 +17,13 @@ The dedup key is (file, line, rule_name) — exactly the AC's
     line; only the exact (line, rule) pair dedups.
 
 Prior Grug findings are identified by a hidden HTML-comment marker
-appended to each inline-comment body (`rule_marker`). Parsing our OWN
-marker — not scraping human-readable markdown — keeps the rule
-extraction unambiguous and robust to body-format changes. A PR comment
-without the marker is a human comment and contributes no key.
+appended to each inline-comment body (`rule_marker`). The marker is
+invisible in GitHub's rendered web view (so it doesn't clutter the
+developer's PR) AND preserved verbatim in the REST `body` field — which
+is the surface dedup actually reads (`_fetch_pr_review_comments`).
+Parsing our OWN marker — not scraping human-readable markdown — keeps
+the rule extraction unambiguous and robust to body-format changes. A PR
+comment without the marker is a human comment and contributes no key.
 """
 from __future__ import annotations
 
@@ -41,9 +44,14 @@ def rule_marker(rule_name: str) -> str:
 
 def parse_rule(body: str) -> str | None:
     """Extract the rule name from a comment body's marker, or None if
-    the comment carries no Grug marker (i.e. a human comment)."""
-    m = _MARKER_RE.search(body or "")
-    return m.group(1) if m else None
+    the comment carries no Grug marker (i.e. a human comment).
+
+    Returns the LAST marker match: `_inline_comment_body` always appends
+    the real marker at the very end, so if a finding's message text
+    happens to quote a literal `<!-- grug-rule:X -->` (e.g. Elder
+    flagging a prior comment), the trailing real marker still wins."""
+    matches = _MARKER_RE.findall(body or "")
+    return matches[-1] if matches else None
 
 
 def finding_key(file: str, line: int, rule: str) -> str:
@@ -62,20 +70,34 @@ def finding_key(file: str, line: int, rule: str) -> str:
 
 def prior_keys_from_comments(comments: list[dict]) -> set[str]:
     """Build the set of finding-keys already posted, from the PR's
-    review comments. Each comment dict carries `path`, `line`, `body`
-    (the GitHub PR-review-comment shape). Comments without a Grug
-    marker, or without a usable `line` (file-level / outdated comments
-    report `line: null`), contribute nothing."""
+    review comments. Each comment dict carries `path`, `line`, `side`,
+    `body` (the GitHub PR-review-comment shape). Comments are skipped
+    when they: lack a Grug marker; lack a usable `line` (file-level /
+    outdated comments report `line: null`); are LEFT-side (Grug only
+    ever posts RIGHT-side new-file comments, so a LEFT comment with a
+    coincidental marker is not ours); or carry a non-numeric `line`
+    (malformed payload). Every skip biases toward a SMALLER key set →
+    post-extra, never skip-a-real-finding."""
     keys: set[str] = set()
     for c in comments:
         line = c.get("line")
         path = c.get("path")
         if line is None or path is None:
             continue
+        # Grug posts RIGHT-side (new-file) comments; `side` defaults to
+        # RIGHT when absent. A LEFT comment can't be one of ours.
+        if c.get("side", "RIGHT") == "LEFT":
+            continue
         rule = parse_rule(c.get("body", ""))
         if rule is None:
             continue
-        keys.add(finding_key(path, int(line), rule))
+        try:
+            line_int = int(line)
+        except (TypeError, ValueError):
+            # Malformed comment dict — don't let it escape best-effort
+            # dedup (the caller only catches httpx errors).
+            continue
+        keys.add(finding_key(path, line_int, rule))
     return keys
 
 

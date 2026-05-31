@@ -65,6 +65,46 @@ def test_prior_keys_skips_non_grug_comments():
     assert keys == {dedup.finding_key("x.py", 3, "dead-code")}
 
 
+def test_parse_rule_takes_last_marker():
+    """A message quoting a literal marker, then the real trailing one →
+    the real (last) marker wins, not the embedded fake."""
+    body = (
+        "Found a dupe of <!-- grug-rule:fake-embedded -->\n\n"
+        + dedup.rule_marker("real-rule")
+    )
+    assert dedup.parse_rule(body) == "real-rule"
+
+
+def test_prior_keys_skips_left_side_comment():
+    """A LEFT-side comment can't be Grug's (we post RIGHT-side) — even
+    with a coincidental marker it must not contribute a key."""
+    comments = [{
+        "path": "x.py", "line": 2, "side": "LEFT",
+        "body": dedup.rule_marker("null-deref"),
+    }]
+    assert dedup.prior_keys_from_comments(comments) == set()
+
+
+def test_prior_keys_keeps_right_side_and_absent_side():
+    """RIGHT-side (and side-absent, defaulting RIGHT) comments count."""
+    comments = [
+        {"path": "x.py", "line": 2, "side": "RIGHT", "body": dedup.rule_marker("a")},
+        {"path": "y.py", "line": 3, "body": dedup.rule_marker("b")},  # no side
+    ]
+    keys = dedup.prior_keys_from_comments(comments)
+    assert keys == {
+        dedup.finding_key("x.py", 2, "a"), dedup.finding_key("y.py", 3, "b"),
+    }
+
+
+def test_prior_keys_skips_non_numeric_line():
+    """A malformed `line` must be skipped, not raise out of best-effort
+    dedup (the caller only catches httpx errors)."""
+    comments = [{"path": "x.py", "line": "not-a-number",
+                 "body": dedup.rule_marker("r")}]
+    assert dedup.prior_keys_from_comments(comments) == set()
+
+
 def test_prior_keys_tolerates_missing_line():
     """A comment with no `line` (e.g. a file-level or outdated comment)
     can't form a (file,line,rule) key — skip it, don't crash."""
