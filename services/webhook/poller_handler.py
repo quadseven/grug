@@ -42,10 +42,9 @@ def handler(event: dict[str, Any], context: Any) -> dict[str, int]:
     failed_installs = 0
 
     for install_id in installs:
-        records = list_comment_records(install_id)
-        if not records:
-            continue
-        polled_records += len(records)
+        # The ENTIRE per-install body — the CommentRecord listing AND the
+        # poll — is inside this try, so a DDB listing failure for one install
+        # can't abort the cron either (best-effort per install).
         # `with_install_token_retry` is used here for its token ACQUISITION;
         # its 401-refresh path is intentionally unreachable from the poller —
         # `poll_and_annotate` catches per-record GH 401s internally (best-
@@ -55,6 +54,10 @@ def handler(event: dict[str, Any], context: Any) -> dict[str, int]:
         # calibration data; surfacing first-call 401s would be #245a engine
         # surgery for marginal benefit.
         try:
+            records = list_comment_records(install_id)
+            if not records:
+                continue
+            polled_records += len(records)
             submitted += with_install_token_retry(
                 install_id,
                 lambda token: poll_and_annotate(
@@ -64,7 +67,7 @@ def handler(event: dict[str, Any], context: Any) -> dict[str, int]:
                 ),
             ) or 0
         except Exception as e:  # noqa: BLE001 — per-install best-effort: one
-            # install's GH/token failure must not abort the whole cron cycle.
+            # install's listing/GH/token failure must not abort the cron cycle.
             log.warning(
                 "reaction_poll_install_failed",
                 extra={"install_id": install_id, "kind": type(e).__name__},

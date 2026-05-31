@@ -64,6 +64,27 @@ def test_poller_one_install_failure_does_not_abort_cycle(monkeypatch, caplog):
     assert not any(r.levelno >= _logging.ERROR for r in caplog.records)
 
 
+def test_poller_records_listing_failure_is_best_effort(monkeypatch):
+    """A CommentRecord LISTING failure (DDB error) for one install must be
+    caught too — it's inside the per-install try — so the cron counts it
+    failed and continues to the next install (codex BLOCK regression)."""
+    def _records(iid):
+        if iid == 1:
+            raise RuntimeError("DDB list failure")
+        return [{"comment_id": iid}]
+    _wire(
+        monkeypatch,
+        installs=[1, 2],
+        records_for=_records,
+        retry=lambda iid, fn: fn("tok"),
+        poll=lambda records, *, install_id, fetch_token: 5,
+    )
+    out = poller_handler.handler({}, None)
+    assert out["installs"] == 2
+    assert out["failed_installs"] == 1   # install 1 listing failed
+    assert out["submitted"] == 5         # install 2 still polled
+
+
 def test_poller_skips_installs_with_no_records(monkeypatch):
     """An install with no CommentRecords is skipped — no token fetch, no poll."""
     touched = []
