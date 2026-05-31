@@ -49,11 +49,17 @@ log = logging.getLogger(f"{os.getenv('DD_SERVICE', 'grug')}.persona.code_reviewe
 
 _CHECK_NAME = "Grug — Code Review"
 _DIFF_FETCH_TIMEOUT = 30
-# Hard cap on review-comment pages (100/page) — a runaway pagination
-# (malformed/proxy response always returning a full page) can't spin
-# inside the timeout budget. 50 pages = 5000 comments, far beyond any
-# real PR.
-_MAX_COMMENT_PAGES = 50
+# The dedup comments-fetch is on the SYNCHRONOUS webhook path (15s
+# Lambda budget) and is best-effort: it must not be able to exhaust the
+# budget before its own try/except degrades to post-everything. So it
+# gets a tight per-request timeout + a low page cap — distinct from the
+# 30s diff fetch. 3 pages × 100 = 300 comments covers virtually every
+# PR; beyond that, dedup degrades to partial (a few duplicate comments —
+# the safe direction) rather than risking a hard handler timeout.
+# (The broader "30s httpx timeouts vs 15s Lambda" mismatch on the diff
+# fetch + LLM call predates this slice — tracked separately.)
+_COMMENT_FETCH_TIMEOUT = 4
+_MAX_COMMENT_PAGES = 3
 
 # Literal (not bool) so a future "degraded"/"experimental" mode can't
 # silently invert `if not blocking` call sites.
@@ -99,7 +105,7 @@ def _fetch_pr_review_comments(
                 "Accept": "application/vnd.github+json",
                 "X-GitHub-Api-Version": "2022-11-28",
             },
-            timeout=_DIFF_FETCH_TIMEOUT,
+            timeout=_COMMENT_FETCH_TIMEOUT,
         )
         resp.raise_for_status()
         body = resp.json()

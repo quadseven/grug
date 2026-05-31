@@ -24,6 +24,21 @@ is the surface dedup actually reads (`_fetch_pr_review_comments`).
 Parsing our OWN marker — not scraping human-readable markdown — keeps
 the rule extraction unambiguous and robust to body-format changes. A PR
 comment without the marker is a human comment and contributes no key.
+
+Known limitations (accepted for v1):
+  - Reintroduced finding: if a bug is fixed (Grug's comment goes
+    outdated → GitHub nulls its `line` → skipped by the line-None
+    guard) then later reintroduced at the SAME line number with the
+    comment somehow still line-bound, dedup would suppress the
+    re-report. The line-None skip covers the common fix-then-shift
+    case; identical-line reintroduction is a rare under-report (a
+    missed comment, not a flood — the safe direction). A recency-
+    bounded horizon (dedup only vs the most recent completed review)
+    would close it; deferred.
+  - The marker is invisible in the rendered PR view, but GitHub email
+    digests send raw markdown, so `<!-- grug-rule:NAME -->` can appear
+    as a trailing line of text in notification emails. Minor noise,
+    accepted as the cost of robust (non-markdown-scraping) dedup.
 """
 from __future__ import annotations
 
