@@ -26,6 +26,7 @@ import pulumi_datadog as _datadog
 from components import (
     cf_shared_secret,
     cloudflare_dns,
+    dd_dashboard,
     dd_monitors,
     dd_rum,
     ddb_table,
@@ -491,6 +492,11 @@ monitors = dd_monitors.create_all(
 # either value to the repo.
 rum = dd_rum.create(name="grug-web", provider=_dd_provider)
 
+# Elder code-review health dashboard (#192). LLM Obs span metrics +
+# dispatch-log outcomes; eval-based surfaces deep-link to the LLM Obs
+# explorer (evaluations aren't dashboard metrics — see component docstring).
+elder_dashboard = dd_dashboard.create_elder_health(env=env, provider=_dd_provider)
+
 pulumi.export("webhook_function_url", webhook.function_url)
 pulumi.export("webhook_public_url", f"https://webhook.{domain}/webhook/github")
 pulumi.export("api_function_url", api_lambda.function_url)
@@ -502,6 +508,7 @@ pulumi.export("ddb_table_name", grug_main_table.name)
 pulumi.export("ddb_table_arn", grug_main_table.arn)
 pulumi.export("kms_cmk_arn", grug_tokens_cmk.arn)
 pulumi.export("kms_cmk_alias", grug_tokens_cmk.alias.name)
+pulumi.export("elder_dashboard_url", elder_dashboard.url)
 pulumi.export("monitor_webhook_5xx_id", monitors.webhook_5xx.id)
 pulumi.export("monitor_api_5xx_id", monitors.api_5xx.id)
 pulumi.export("monitor_sig_verify_fail_id", monitors.sig_verify_fail.id)
