@@ -2,26 +2,45 @@
 """Grounding attester for spec 0017.CodeReviewerDispatch.
 
 Proves NECESSARY (static, AST-based) conditions for the dispatch
-orchestration bools against the real mirrored `dispatch.py`:
+orchestration bools against the real mirrored `dispatch.py`.
+
+Design note — value-flow, not token-presence. An earlier draft checked
+that string literals / call names merely *appeared* in the function; a
+silent-failure audit (PR #256) showed every such check was defeatable by a
+one-line mutation that kept the token while breaking behavior (dead `if
+False` branch, `mode="advisory"` literal threaded into the gate, a flag
+logged-as-string but never set, an `except ValueError` that can't catch a
+wire 5xx). This version asserts AST *shape and reachability*:
 
   Gate contract (`_publish_shape` + mode derivation):
     - mode_derives_from_repo_config_blocking_flag_per_dispatch
+        → `mode` is assigned the `"blocking" if blocking else "advisory"`
+          ternary and NEVER reassigned to a constant; the value passed to
+          `_publish_shape` is the `mode` Name, not a literal.
     - advisory_mode_forces_neutral_and_comment_per_dispatch
+      + degraded_evaluation_forces_advisory_regardless_of_mode_per_dispatch
+        → the branch returning ("neutral","COMMENT") is guarded by an
+          OR over `mode == "advisory"` and `…degraded_reason`.
     - blocking_failure_yields_failure_and_request_changes_per_dispatch
+        → ("failure","REQUEST_CHANGES") is returned under a non-constant
+          test referencing `conclusion`/`"failure"`.
     - publish_shape_single_source_of_truth_for_conclusion_and_event_per_dispatch
+        → exactly one `_publish_shape`, returning 2-tuples; no dead
+          (`if False`) branches anywhere in the gate or dispatch.
 
   Publish-independence contract (`dispatch_code_review`):
     - check_run_and_review_publish_independently_per_dispatch
+        → post_check_run + post_review each in their own try; the
+          check-run handler sets `check_publish_failed = True` (an Assign,
+          not a string) and does NOT early-return; `_resolve_result` is
+          passed both publish-failed kwargs.
     - dispatch_never_raises_wire_exception_degrades_to_neutral_per_dispatch
+        → every wire-call try catches an allowed wire exception type
+          (httpx.*/DiffParseError/Exception), and `_publish_degraded`
+          exists as the fetch/parse fallback.
 
-Static half only — these are necessary, not sufficient. Runtime
-sufficiency (the gate actually returning neutral in advisory mode, the
-review post still firing after a check-run 5xx) is exercised by
-`tests/test_code_reviewer_dispatch.py`. The point of the static check is
-to trip at PR time the moment the code drifts from the spec — e.g. someone
-adds an early `return` to the check-run except handler (which would make a
-check-run 5xx silently skip the review post) or collapses `_publish_shape`'s
-two-literal gate.
+Static half only — runtime sufficiency is exercised by
+`tests/test_code_reviewer_dispatch.py`.
 """
 from __future__ import annotations
 
@@ -36,6 +55,15 @@ DISPATCH_PATHS: tuple[Path, ...] = (
     REPO_ROOT / "services/webhook/personas/code_reviewer/dispatch.py",
 )
 
+# Exception types that legitimately wrap a wire/IO call so dispatch can
+# degrade instead of raising. `except ValueError` around post_check_run
+# would NOT catch a GitHub 5xx → rejected.
+ALLOWED_WIRE_EXC: frozenset[str] = frozenset({
+    "HTTPStatusError", "RequestError", "DiffParseError", "Exception",
+})
+
+NESTED_SCOPES = (ast.FunctionDef, ast.AsyncFunctionDef, ast.Lambda)
+
 
 def _find_funcdef(tree: ast.AST, name: str) -> ast.FunctionDef | None:
     defs = [
@@ -46,8 +74,6 @@ def _find_funcdef(tree: ast.AST, name: str) -> ast.FunctionDef | None:
 
 
 def _calls_named(node: ast.AST | list[ast.stmt], name: str) -> list[ast.Call]:
-    """All Call nodes under `node` (a node or a list of stmts) whose callee
-    is the bare name `name`."""
     roots = node if isinstance(node, list) else [node]
     out: list[ast.Call] = []
     for root in roots:
@@ -58,35 +84,74 @@ def _calls_named(node: ast.AST | list[ast.stmt], name: str) -> list[ast.Call]:
 
 
 def _const_tuple(node: ast.AST) -> tuple[object, ...] | None:
-    """A literal tuple of constants, e.g. ("neutral", "COMMENT") → that
-    pair. Anything else → None."""
     if isinstance(node, ast.Tuple) and all(isinstance(e, ast.Constant) for e in node.elts):
         return tuple(e.value for e in node.elts)  # type: ignore[attr-defined]
     return None
 
 
-def _return_tuples(func: ast.FunctionDef) -> set[tuple[object, ...]]:
-    out: set[tuple[object, ...]] = set()
+def _is_falsy_const(node: ast.AST) -> bool:
+    return isinstance(node, ast.Constant) and not node.value
+
+
+def _walk_no_nested(node: ast.AST):
+    """ast.walk but pruning nested def/lambda subtrees — so a helper or
+    lambda inside a handler doesn't leak its `return` into our scan. A node
+    that IS itself a nested scope is pruned entirely (yields nothing)."""
+    if isinstance(node, NESTED_SCOPES):
+        return
+    todo = [node]
+    while todo:
+        n = todo.pop()
+        yield n
+        for child in ast.iter_child_nodes(n):
+            if isinstance(child, NESTED_SCOPES):
+                continue
+            todo.append(child)
+
+
+def _if_returning(func: ast.FunctionDef, want: tuple[object, ...]) -> ast.If | None:
+    """The `if` whose direct body returns the literal tuple `want`."""
     for n in ast.walk(func):
-        if isinstance(n, ast.Return) and n.value is not None:
-            t = _const_tuple(n.value)
-            if t is not None:
-                out.add(t)
+        if isinstance(n, ast.If):
+            for stmt in n.body:
+                if isinstance(stmt, ast.Return) and _const_tuple(stmt.value) == want:
+                    return n
+    return None
+
+
+def _dead_branch_tests(func: ast.FunctionDef) -> list[int]:
+    """Line numbers of `if`/bool tests that are a falsy constant or an AND/OR
+    operand that is a falsy constant — dead-code guards (`if False`,
+    `... and False`)."""
+    hits: list[int] = []
+    for n in ast.walk(func):
+        if isinstance(n, ast.If):
+            t = n.test
+            if _is_falsy_const(t):
+                hits.append(t.lineno)
+            elif isinstance(t, ast.BoolOp) and any(_is_falsy_const(v) for v in t.values):
+                hits.append(t.lineno)
+    return hits
+
+
+def _mode_values(func: ast.FunctionDef) -> list[ast.expr]:
+    out: list[ast.expr] = []
+    for n in ast.walk(func):
+        if isinstance(n, ast.AnnAssign) and isinstance(n.target, ast.Name) and n.target.id == "mode":
+            if n.value is not None:
+                out.append(n.value)
+        elif isinstance(n, ast.Assign):
+            for tgt in n.targets:
+                if isinstance(tgt, ast.Name) and tgt.id == "mode":
+                    out.append(n.value)
     return out
 
 
-def _has_blocking_ternary(func: ast.FunctionDef) -> bool:
-    """A `... "blocking" if blocking else "advisory" ...` IfExp whose test
-    is the `blocking` param — proving mode derives from the flag."""
-    for n in ast.walk(func):
-        if isinstance(n, ast.IfExp) and isinstance(n.test, ast.Name) and n.test.id == "blocking":
-            vals = {
-                getattr(n.body, "value", None),
-                getattr(n.orelse, "value", None),
-            }
-            if {"blocking", "advisory"} <= vals:
-                return True
-    return False
+def _is_blocking_ternary(node: ast.expr) -> bool:
+    if not (isinstance(node, ast.IfExp) and isinstance(node.test, ast.Name) and node.test.id == "blocking"):
+        return False
+    vals = {getattr(node.body, "value", None), getattr(node.orelse, "value", None)}
+    return {"blocking", "advisory"} <= vals
 
 
 def _try_blocks_containing(func: ast.FunctionDef, callee: str) -> list[ast.Try]:
@@ -96,31 +161,78 @@ def _try_blocks_containing(func: ast.FunctionDef, callee: str) -> list[ast.Try]:
     ]
 
 
+def _handler_exc_names(handler: ast.ExceptHandler) -> set[str]:
+    t = handler.type
+    nodes = t.elts if isinstance(t, ast.Tuple) else ([t] if t is not None else [])
+    names: set[str] = set()
+    for n in nodes:
+        if isinstance(n, ast.Name):
+            names.add(n.id)
+        elif isinstance(n, ast.Attribute):
+            names.add(n.attr)
+    return names
+
+
+def _handler_assigns_true(handler: ast.ExceptHandler, name: str) -> bool:
+    for stmt in handler.body:
+        for n in ast.walk(stmt):
+            if isinstance(n, ast.Assign) and isinstance(n.value, ast.Constant) and n.value.value is True:
+                if any(isinstance(t, ast.Name) and t.id == name for t in n.targets):
+                    return True
+    return False
+
+
 def _check_publish_shape(tree: ast.AST, path: Path) -> list[str]:
     f = _find_funcdef(tree, "_publish_shape")
     if f is None:
         return [f"FAIL: {path} — exactly one `_publish_shape` expected (gate SSOT)"]
     fails: list[str] = []
-    rets = _return_tuples(f)
-    if ("neutral", "COMMENT") not in rets:
+
+    dead = _dead_branch_tests(f)
+    if dead:
         fails.append(
-            f"FAIL: {path} — _publish_shape never returns ('neutral','COMMENT'); "
-            "advisory/degraded must force neutral+COMMENT"
+            f"FAIL: {path} — _publish_shape has dead-code branch test(s) at line(s) "
+            f"{dead}; a constant-false guard fakes a reachable gate path"
         )
-    if ("failure", "REQUEST_CHANGES") not in rets:
+
+    # advisory/degraded → ("neutral","COMMENT"), guarded by OR over the two.
+    neutral_if = _if_returning(f, ("neutral", "COMMENT"))
+    if neutral_if is None:
         fails.append(
-            f"FAIL: {path} — _publish_shape never returns ('failure','REQUEST_CHANGES'); "
-            "blocking failure must request changes"
+            f"FAIL: {path} — no `if` returns ('neutral','COMMENT'); advisory/degraded "
+            "must force neutral+COMMENT"
         )
-    # advisory/degraded guard must reference BOTH the mode and degraded_reason
-    src = ast.unparse(f)
-    if '"advisory"' not in src and "'advisory'" not in src:
-        fails.append(f"FAIL: {path} — _publish_shape does not gate on advisory mode")
-    if "degraded_reason" not in src:
+    else:
+        test_src = ast.unparse(neutral_if.test)
+        if not isinstance(neutral_if.test, ast.BoolOp) or not isinstance(neutral_if.test.op, ast.Or):
+            fails.append(
+                f"FAIL: {path} — neutral branch is not an OR; it must fire for "
+                "advisory mode OR a degraded evaluation"
+            )
+        if '"advisory"' not in test_src and "'advisory'" not in test_src:
+            fails.append(f"FAIL: {path} — neutral branch does not gate on advisory mode")
+        if "degraded_reason" not in test_src:
+            fails.append(
+                f"FAIL: {path} — neutral branch ignores degraded_reason; a degraded "
+                "evaluation must force advisory regardless of mode"
+            )
+
+    # blocking failure → ("failure","REQUEST_CHANGES"), reachable + on conclusion.
+    fail_if = _if_returning(f, ("failure", "REQUEST_CHANGES"))
+    if fail_if is None:
         fails.append(
-            f"FAIL: {path} — _publish_shape ignores degraded_reason; a degraded "
-            "evaluation must force advisory regardless of mode"
+            f"FAIL: {path} — no `if` returns ('failure','REQUEST_CHANGES'); blocking "
+            "failure must request changes"
         )
+    else:
+        test_src = ast.unparse(fail_if.test)
+        if _is_falsy_const(fail_if.test):
+            fails.append(f"FAIL: {path} — blocking-failure branch is dead (constant test)")
+        if "conclusion" not in test_src or '"failure"' not in test_src and "'failure'" not in test_src:
+            fails.append(
+                f"FAIL: {path} — blocking-failure branch does not test "
+                "`conclusion == 'failure'`"
+            )
     return fails
 
 
@@ -130,48 +242,101 @@ def _check_dispatch(tree: ast.AST, path: Path) -> list[str]:
         return [f"FAIL: {path} — exactly one `dispatch_code_review` expected"]
     fails: list[str] = []
 
-    # mode derives from the blocking flag
-    blocking_params = {a.arg for a in (f.args.args + f.args.kwonlyargs)}
-    if "blocking" not in blocking_params:
-        fails.append(f"FAIL: {path} — dispatch_code_review has no `blocking` param")
-    elif not _has_blocking_ternary(f):
+    # No dead-code guards anywhere (kills `... and False` around post_review etc).
+    dead = _dead_branch_tests(f)
+    if dead:
         fails.append(
-            f"FAIL: {path} — mode is not derived as "
+            f"FAIL: {path} — dispatch_code_review has dead-code branch test(s) at "
+            f"line(s) {dead}; a constant-false guard hides a skipped publish surface"
+        )
+
+    # mode derives from the blocking flag and is never reassigned to a constant.
+    params = {a.arg for a in (f.args.args + f.args.kwonlyargs)}
+    if "blocking" not in params:
+        fails.append(f"FAIL: {path} — dispatch_code_review has no `blocking` param")
+    mode_vals = _mode_values(f)
+    if not mode_vals:
+        fails.append(f"FAIL: {path} — `mode` is never assigned")
+    elif not any(_is_blocking_ternary(v) for v in mode_vals):
+        fails.append(
+            f"FAIL: {path} — `mode` not derived as "
             "`'blocking' if blocking else 'advisory'`"
         )
+    if any(isinstance(v, ast.Constant) for v in mode_vals):
+        fails.append(
+            f"FAIL: {path} — `mode` is reassigned to a constant, overriding the "
+            "RepoConfig-derived value"
+        )
 
-    # check-run publish + review publish exist on independent surfaces
-    check_tries = _try_blocks_containing(f, "post_check_run")
-    if not check_tries:
-        fails.append(f"FAIL: {path} — post_check_run is not wrapped in try/except")
-    if not _calls_named(f, "post_review"):
-        fails.append(f"FAIL: {path} — no post_review call (independent surface missing)")
-
-    # INDEPENDENCE: the check-run except handler must NOT early-return, or a
-    # check-run 5xx would skip the review post. It must record the failure.
-    for tnode in check_tries:
-        for handler in tnode.handlers:
-            if any(
-                isinstance(n, ast.Return)
-                for stmt in handler.body for n in ast.walk(stmt)
-            ):
-                fails.append(
-                    f"FAIL: {path} — check-run except handler returns early; a "
-                    "check-run publish failure would skip the independent review post"
-                )
-        handler_src = "".join(ast.unparse(h) for h in tnode.handlers)
-        if "check_publish_failed" not in handler_src:
+    # the value handed to _publish_shape must be the `mode` Name, not a literal.
+    ps_calls = _calls_named(f, "_publish_shape")
+    if not ps_calls:
+        fails.append(f"FAIL: {path} — _publish_shape is never called in dispatch")
+    for c in ps_calls:
+        mode_arg: ast.expr | None = None
+        for kw in c.keywords:
+            if kw.arg == "mode":
+                mode_arg = kw.value
+        if mode_arg is None and len(c.args) >= 2:
+            mode_arg = c.args[1]
+        if not (isinstance(mode_arg, ast.Name) and mode_arg.id == "mode"):
             fails.append(
-                f"FAIL: {path} — check-run except does not record check_publish_failed"
+                f"FAIL: {path} — _publish_shape called with a non-`mode` argument at "
+                f"line {c.lineno}; the gate must consume the derived mode"
             )
 
-    # never-raise: fetch/parse degrade path present (_publish_degraded) and
-    # _resolve_result consults BOTH publish-failed flags.
+    # check-run + review on independent surfaces.
+    check_tries = _try_blocks_containing(f, "post_check_run")
+    review_tries = _try_blocks_containing(f, "post_review")
+    if not check_tries:
+        fails.append(f"FAIL: {path} — post_check_run is not wrapped in try/except")
+    if not review_tries:
+        fails.append(
+            f"FAIL: {path} — post_review not wrapped in its own try (independent surface)"
+        )
+
+    for tnode in check_tries:
+        # handler types must be able to catch a wire 5xx
+        for handler in tnode.handlers:
+            names = _handler_exc_names(handler)
+            if not (names & ALLOWED_WIRE_EXC):
+                fails.append(
+                    f"FAIL: {path} — check-run except catches {sorted(names) or 'nothing'}; "
+                    f"must catch a wire exception {sorted(ALLOWED_WIRE_EXC)}"
+                )
+            # must NOT early-return (would skip the independent review post)
+            if any(
+                isinstance(n, ast.Return)
+                for stmt in handler.body for n in _walk_no_nested(stmt)
+            ):
+                fails.append(
+                    f"FAIL: {path} — check-run except returns early; a check-run "
+                    "failure would skip the independent review post"
+                )
+            # must RECORD the failure (Assign True, not a logged string)
+            if not _handler_assigns_true(handler, "check_publish_failed"):
+                fails.append(
+                    f"FAIL: {path} — check-run except does not set "
+                    "`check_publish_failed = True`"
+                )
+
+    for tnode in review_tries:
+        for handler in tnode.handlers:
+            names = _handler_exc_names(handler)
+            if not (names & ALLOWED_WIRE_EXC):
+                fails.append(
+                    f"FAIL: {path} — review except catches {sorted(names) or 'nothing'}; "
+                    f"must catch a wire exception"
+                )
+
+    # never-raise: fetch/parse degrade fallback present.
     if not _calls_named(f, "_publish_degraded"):
         fails.append(
-            f"FAIL: {path} — no _publish_degraded fallback; fetch/parse errors "
-            "must degrade to advisory-neutral, not raise"
+            f"FAIL: {path} — no _publish_degraded fallback; fetch/parse errors must "
+            "degrade to advisory-neutral, not raise"
         )
+
+    # result rollup consults BOTH independent publish surfaces.
     resolve_calls = _calls_named(f, "_resolve_result")
     if not resolve_calls:
         fails.append(f"FAIL: {path} — _resolve_result not called")
@@ -203,8 +368,8 @@ def main() -> int:
         print("\nSpec 0017 attests the dispatch gate + dual-publish independence.")
         return 1
     print(
-        f"OK: _publish_shape gate + dual-publish independence verified in "
-        f"{len(DISPATCH_PATHS)} mirrored dispatch module(s)"
+        f"OK: _publish_shape gate (reachable branches + mode flow) + dual-publish "
+        f"independence verified in {len(DISPATCH_PATHS)} mirrored dispatch module(s)"
     )
     return 0
 
