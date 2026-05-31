@@ -121,6 +121,7 @@ The following eight modules exist as byte-identical copies under both `services/
 | **Cloudflare Worker proxy** | Per-service `<service>-host-rewrite` Worker that rewrites incoming `<service>.grug.lol` requests to the Lambda Function URL. Lets us use friendly domains + WAF in front of Lambda. |
 | **Pulumi stack** | One stack per environment. Today: `dev` only. Stack name and project structure under [`infra/pulumi/`](infra/pulumi/). |
 | **Grugboard** | GitHub Projects (v2) board at https://github.com/users/githumps/projects/1. Target of the future `Pulse (roadmap)` persona's label sync + issue reprefixing. |
+| **Elder health dashboard** | DD dashboard "Grug Elder — Code Review Health" (#192), Pulumi-managed via [`infra/pulumi/components/dd_dashboard.py`](infra/pulumi/components/dd_dashboard.py) (`datadog.DashboardJson`). Widgets graph LLM Obs span metrics (`ml_obs.span.*` scoped `ml_app:grug-elder`, split by `model`) — latency p50/p95, token usage, cost — plus `code_reviewer_dispatched`-log outcomes (reviews/backend, findings p50/p95, result breakdown, dropped hallucinations). Judge `is_real_bug` + human `human_verdict` are LLM Obs **evaluations** (not dashboard metrics) → deep-link note to the evaluations explorer; a future eval→metric export would make them native widgets. |
 
 ## Operational concepts
 
