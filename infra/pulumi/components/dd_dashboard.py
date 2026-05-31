@@ -14,9 +14,11 @@ Data sources are grounded against what the Elder ACTUALLY emits (verified
 against services/webhook/llm_client.py + personas/code_reviewer/dispatch.py
 and the live DD metric catalog), NOT guessed:
 
-  - LLM Obs span metrics `ml_obs.span.*` (count, duration, llm.*.tokens,
+  - LLM Obs span metrics `ml_obs.span.*` (duration, llm.*.tokens,
     llm.total.cost) — scoped `ml_app:grug-elder`, split by the standard
-    `model` tag (poolside vs openrouter use distinct default models).
+    `model_provider` tag (the poolside-vs-openrouter backend distinction;
+    verified against live span tags — there is NO `model` tag). Duration is
+    nanoseconds + cost is nanodollars, scaled in-formula to ms / USD.
   - The `code_reviewer_dispatched` structured log (service:grug-webhook)
     whose `extra={...}` fields surface as `@backend`, `@findings_count`,
     `@result`, `@dropped_hallucinations`, `@degraded_reason`.
@@ -44,8 +46,13 @@ _ML_APP = "grug-elder"
 _WEBHOOK_SERVICE = "grug-webhook"
 
 
-def _metric_q(name: str, *, agg: str = "avg", by: str = "model") -> str:
-    return f"{agg}:{name}{{ml_app:{_ML_APP}}} by {{{by}}}"
+def _metric_q(name: str, env: str, *, agg: str = "avg",
+              by: str = "model_provider") -> str:
+    # `model_provider` IS the backend distinction (poolside vs openrouter) —
+    # verified against live `ml_obs.span.duration{ml_app:grug-elder}` tags
+    # (there is no `model` tag; LLM Obs to-metrics emits `model_name` +
+    # `model_provider`). env-scoped so the dev stack doesn't graph prod data.
+    return f"{agg}:{name}{{ml_app:{_ML_APP},env:{env}}} by {{{by}}}"
 
 
 def _dispatch_log_query(env: str, extra: str = "") -> str:
@@ -146,35 +153,37 @@ def create_elder_health(
                 "display_type": "line",
             }],
         }},
-        # Prompt latency p50/p95 by model (backend) — LLM Obs span metric.
+        # Prompt latency p50/p95 by backend — LLM Obs span metric. Duration is
+        # emitted in NANOSECONDS; /1e6 → ms to match the title.
         _ts_metric(
-            "Prompt latency p50 / p95 by model (ms)",
-            formulas=[{"formula": "p50"}, {"formula": "p95"}],
+            "Prompt latency p50 / p95 by backend (ms)",
+            formulas=[{"formula": "p50 / 1000000"}, {"formula": "p95 / 1000000"}],
             queries=[
                 {"data_source": "metrics", "name": "p50",
-                 "query": _metric_q("ml_obs.span.duration", agg="p50")},
+                 "query": _metric_q("ml_obs.span.duration", env, agg="p50")},
                 {"data_source": "metrics", "name": "p95",
-                 "query": _metric_q("ml_obs.span.duration", agg="p95")},
+                 "query": _metric_q("ml_obs.span.duration", env, agg="p95")},
             ],
         ),
-        # Token usage by model (backend) — input + output.
+        # Token usage by backend — input + output (unitless counts).
         _ts_metric(
-            "Token usage by model (input + output)",
+            "Token usage by backend (input + output)",
             formulas=[{"formula": "in"}, {"formula": "out"}],
             queries=[
                 {"data_source": "metrics", "name": "in",
-                 "query": _metric_q("ml_obs.span.llm.input.tokens", agg="sum")},
+                 "query": _metric_q("ml_obs.span.llm.input.tokens", env, agg="sum")},
                 {"data_source": "metrics", "name": "out",
-                 "query": _metric_q("ml_obs.span.llm.output.tokens", agg="sum")},
+                 "query": _metric_q("ml_obs.span.llm.output.tokens", env, agg="sum")},
             ],
         ),
-        # LLM cost by model (backend) — operational $ visibility.
+        # LLM cost by backend — operational $ visibility. Cost is emitted in
+        # NANODOLLARS; /1e9 → USD to match the title.
         _ts_metric(
-            "LLM cost by model (USD)",
-            formulas=[{"formula": "cost"}],
+            "LLM cost by backend (USD)",
+            formulas=[{"formula": "cost / 1000000000"}],
             queries=[
                 {"data_source": "metrics", "name": "cost",
-                 "query": _metric_q("ml_obs.span.llm.total.cost", agg="sum")},
+                 "query": _metric_q("ml_obs.span.llm.total.cost", env, agg="sum")},
             ],
         ),
         # Review outcomes — pass / fail / neutral / publish_failed / degraded.
