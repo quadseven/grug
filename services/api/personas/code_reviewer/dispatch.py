@@ -34,6 +34,9 @@ from github_reviews_client import (
     InlineComment, ReviewEvent, ReviewResult, post_review,
 )
 from llm_client import Hunk as LlmHunk, LlmReviewResponse, review_diff
+from personas.code_reviewer.dedup import (
+    dedup_findings, prior_keys_from_comments, rule_marker,
+)
 from personas.code_reviewer.diff_parser import (
     DiffHunk, DiffParseError, parse_diff,
 )
@@ -73,6 +76,63 @@ def _fetch_pr_diff(
     )
     resp.raise_for_status()
     return resp.text
+
+
+def _fetch_pr_review_comments(
+    install_token: str, owner: str, repo: str, pull_number: int,
+) -> list[dict]:
+    """GET the PR's inline review comments (paginated). Used to dedup
+    findings already posted on a prior review pass (#189). Returns the
+    raw comment dicts (each carries `path`, `line`, `body`)."""
+    out: list[dict] = []
+    page = 1
+    while True:
+        resp = httpx.get(
+            f"https://api.github.com/repos/{owner}/{repo}/pulls/{pull_number}/comments",
+            params={"per_page": 100, "page": page},
+            headers={
+                "Authorization": f"Bearer {install_token}",
+                "Accept": "application/vnd.github+json",
+                "X-GitHub-Api-Version": "2022-11-28",
+            },
+            timeout=_DIFF_FETCH_TIMEOUT,
+        )
+        resp.raise_for_status()
+        body = resp.json()
+        batch = body if isinstance(body, list) else []
+        out.extend(batch)
+        # GitHub returns a short (<per_page) final page; stop there.
+        if len(batch) < 100:
+            break
+        page += 1
+    return out
+
+
+def _prior_finding_keys(
+    installation_id: int, owner: str, repo_name: str, pull_number: int,
+) -> frozenset[str]:
+    """Fetch prior Grug review comments and build the dedup key set.
+    Best-effort: a fetch failure returns an empty set (so we fall back
+    to posting everything — a duplicate comment is a lesser evil than
+    skipping the whole review)."""
+    try:
+        comments = with_install_token_retry(
+            installation_id,
+            lambda token: _fetch_pr_review_comments(
+                token, owner, repo_name, pull_number,
+            ),
+        )
+    except (httpx.HTTPStatusError, httpx.RequestError) as e:
+        log.warning(
+            "code_review_prior_comments_fetch_failed",
+            extra={
+                "installation_id": installation_id,
+                "pr": f"{owner}/{repo_name}#{pull_number}",
+                "kind": type(e).__name__,
+            },
+        )
+        return frozenset()
+    return frozenset(prior_keys_from_comments(comments))
 
 
 def _to_llm_hunks(hunks: tuple[DiffHunk, ...]) -> list[LlmHunk]:
@@ -117,11 +177,14 @@ def _summary_markdown(evaluation: CodeReviewEvaluation) -> tuple[str, str]:
 
 
 def _inline_comment_body(f: Finding) -> str:
-    """Format one finding as an inline-comment Markdown body."""
+    """Format one finding as an inline-comment Markdown body.
+
+    Appends a hidden `grug-rule` marker (rendered invisibly by GitHub)
+    so a later `synchronize` push can recognise this comment as a Grug
+    finding for dedup (#189) — see dedup.parse_rule."""
     head = f"**{f.severity.upper()} · `{f.rule_name}`**\n\n{f.message}"
-    if f.suggestion:
-        return f"{head}\n\n**Suggested fix:**\n{f.suggestion}"
-    return head
+    body = f"{head}\n\n**Suggested fix:**\n{f.suggestion}" if f.suggestion else head
+    return f"{body}\n\n{rule_marker(f.rule_name)}"
 
 
 def _resolve_result(
@@ -171,16 +234,25 @@ def _publish_shape(
 
 def _build_review_result(
     evaluation: CodeReviewEvaluation, *, head_sha: str, event: ReviewEvent,
+    prior_keys: frozenset[str] = frozenset(),
 ) -> ReviewResult | None:
-    """Build the ReviewResult, or None if nothing to post.
+    """Build the ReviewResult, or None if nothing NEW to post.
 
-    Skips entirely on empty findings OR degraded responses (no point
-    posting an empty review)."""
-    if evaluation.degraded_reason or not evaluation.findings:
+    Skips entirely on degraded responses. `prior_keys` (non-empty only
+    on a synchronize push) dedups findings already commented on
+    unchanged lines (#189) — so a re-review doesn't flood the PR with
+    duplicate inline comments. If every finding was already posted,
+    returns None (nothing new). NOTE: dedup affects only the inline
+    REVIEW; the check-run summary/conclusion still reflect ALL current
+    findings (the bugs are still there)."""
+    if evaluation.degraded_reason:
+        return None
+    new_findings = dedup_findings(evaluation.findings, set(prior_keys))
+    if not new_findings:
         return None
     comments = tuple(
         InlineComment(path=f.file, line=f.line, body=_inline_comment_body(f))
-        for f in evaluation.findings
+        for f in new_findings
     )
     return ReviewResult(
         commit_id=head_sha,
@@ -206,6 +278,7 @@ def dispatch_code_review(
     webhook handler.
     """
     mode: ReviewMode = "blocking" if blocking else "advisory"
+    action = payload.get("action", "")
     pr = payload["pull_request"]
     repo = payload["repository"]
     installation = payload["installation"]
@@ -300,8 +373,18 @@ def dispatch_code_review(
         # Continue to attempt the review post — independent surface.
 
     review_publish_failed = False
+    # On a re-review (synchronize/reopened), dedup findings already
+    # commented on unchanged lines so the PR isn't flooded with
+    # duplicate inline comments on every push (#189). On the first pass
+    # (opened/ready_for_review) there are no prior Grug comments, so
+    # skip the fetch entirely.
+    prior_keys: frozenset[str] = frozenset()
+    if action in {"synchronize", "reopened"}:
+        prior_keys = _prior_finding_keys(
+            installation_id, owner, repo_name, pull_number,
+        )
     review_result = _build_review_result(
-        evaluation, head_sha=head_sha, event=event,
+        evaluation, head_sha=head_sha, event=event, prior_keys=prior_keys,
     )
     if review_result is not None:
         try:
