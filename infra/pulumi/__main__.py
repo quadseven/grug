@@ -251,6 +251,9 @@ webhook = lambda_service.create(
     # run ~180s and still exceed 60s before publish. No sane sync budget bounds
     # that — the real fix is to move the LLM call off the ACK path (async
     # offload, #272). 60s buys the common case; #272 buys the worst case.
+    # Cost note: a timeout-HIT invocation now bills up to 4× the GB-s (≈$0.30/
+    # 1k hits at 512MB arm64) and holds a concurrency slot 4× longer — fine at
+    # grug's volume; the poller-style error monitor + #272 bound the downside.
     timeout_seconds=60,
     memory_mb=512,
     # Encrypt env vars (DD_API_KEY in particular) at rest so a reader
