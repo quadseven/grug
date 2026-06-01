@@ -250,6 +250,22 @@ def create(
         ),
     )
 
+    # Disable AWS's default async-invoke retries when this function
+    # self-invokes (#272). The Elder worker already has its own
+    # idempotency (delivery_id claim) + advisory-degrade contract, so an
+    # AWS retry of a deterministically-failing async invocation adds no
+    # value and risks a retry-storm. `EventInvokeConfig` governs ALL async
+    # invocations of the function — safe here because the webhook's only
+    # async invocations ARE these self-invokes (GitHub traffic is sync via
+    # the Function URL). Belt-and-suspenders alongside `run_elder_job`'s
+    # never-reraise guard.
+    if allow_self_invoke:
+        aws.lambda_.FunctionEventInvokeConfig(
+            f"{name}-async-no-retry",
+            function_name=function.name,
+            maximum_retry_attempts=0,
+        )
+
     return LambdaService(
         function=function,
         function_url=function_url.function_url,

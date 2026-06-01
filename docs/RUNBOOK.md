@@ -330,6 +330,30 @@ this verification to confirm the full pipeline works on a real PR.
   or `code_review_dispatch_unhandled`. Both are last-resort guards
   that should be empty in steady-state.
 
+### Elder async offload
+
+<a id="elder-async-offload"></a>
+Since #272 the Elder LLM review runs **off** the webhook ACK path: the
+sync handler ACKs GitHub (<10s) and self-invokes the `grug-webhook`
+Lambda asynchronously (`InvocationType="Event"`) to run the review. The
+async worker (`async_dispatch.run_elder_job`) is idempotent on the
+`X-GitHub-Delivery` id (a `DELIVERY#<id>` DDB row, 24h TTL).
+
+- **Monitor `[grug-webhook] Elder async-offload failures`** fires on
+  `elder_enqueue_failed` (the self-invoke `lambda.invoke` threw — usually
+  a Lambda throttle) or `elder_job_unhandled` (the async worker crashed).
+  Both mean **that review was dropped** — by design we do NOT sync-fall-
+  back (it would re-block the ACK). Recovery: the review re-posts when the
+  PR is pushed again, or trigger it manually by closing+reopening the PR
+  (re-fires `pull_request`). Grab the `delivery_id` from the log line to
+  trace the specific delivery.
+- **Review never appears, no failure log** → check for
+  `elder_job_duplicate_skipped` (a GitHub redelivery / AWS retry was
+  correctly deduped — the FIRST delivery already ran it) and confirm the
+  original ran via `elder_job_done`.
+- AWS async retries are disabled (`maximum_retry_attempts=0`) — the worker
+  owns idempotency + degrade, so AWS retries would only risk a storm.
+
 ### Rollback
 
 If Elder produces too many false positives or operationally misbehaves,
