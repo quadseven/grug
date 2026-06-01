@@ -31,7 +31,7 @@ import re
 import time
 from dataclasses import dataclass, field
 from enum import Enum
-from typing import Any, Callable, Literal, Optional, TypedDict
+from typing import Any, Callable, Literal, Optional, TypedDict, get_args
 
 import httpx
 
@@ -349,9 +349,8 @@ def select_backend(installation_id: int) -> Backend:
 # Built once per variant at import (#191 A/B). v1 is the precision-biased
 # default; v2 the recall-biased experiment arm. Per-variant caching keeps the
 # prompt-cache key + DD experiment arm stable.
-_SYSTEM_PROMPTS: dict[str, str] = {
-    "v1": build_system_prompt("v1"),
-    "v2": build_system_prompt("v2"),
+_SYSTEM_PROMPTS: dict[PromptVariant, str] = {
+    v: build_system_prompt(v) for v in get_args(PromptVariant)
 }
 
 

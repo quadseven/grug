@@ -15,6 +15,7 @@ from __future__ import annotations
 import logging
 import os
 from functools import lru_cache
+from typing import Literal, cast, get_args
 
 import boto3
 
@@ -25,7 +26,10 @@ _ssm = boto3.client("ssm")
 # (operator typo / stray whitespace) is treated as "off" — same safe default as
 # a missing param — but is LOGGED (unlike the silent "off" default) so a
 # fat-fingered toggle is distinguishable from an intentional disable.
-_EXPERIMENT_MODES = frozenset({"off", "split", "all_v2"})
+# `Mode` is the single source: the runtime allow-list is derived from it, so
+# adding an arm updates both the type and the validation at once.
+Mode = Literal["off", "split", "all_v2"]
+_EXPERIMENT_MODES = frozenset(get_args(Mode))
 
 
 @lru_cache(maxsize=8)
@@ -63,7 +67,7 @@ def get_poolside_api_key() -> str:
 
 
 @lru_cache(maxsize=1)
-def get_prompt_experiment_mode() -> str:
+def get_prompt_experiment_mode() -> Mode:
     """The Elder prompt-A/B experiment mode (#191), from the
     `/grug/elder-prompt-experiment` SSM param (plain String). One of
     `off` (all installs → v1), `split` (orthogonal-to-backend per-install
@@ -99,4 +103,5 @@ def get_prompt_experiment_mode() -> str:
             extra={"param": name, "mode": value},
         )
         return "off"
-    return value
+    # Narrowed: `value` passed the `_EXPERIMENT_MODES` (== get_args(Mode)) gate.
+    return cast("Mode", value)
