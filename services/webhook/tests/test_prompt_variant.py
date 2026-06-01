@@ -128,6 +128,31 @@ def test_mode_reads_ssm_value(monkeypatch) -> None:
     assert sl.get_prompt_experiment_mode() == "split"
 
 
+def test_mode_unrecognized_value_degrades_to_off(monkeypatch) -> None:
+    """A fetched-but-garbage value (operator typo) degrades to off — and the
+    loader, not just select_prompt_variant, rejects it so the warning fires."""
+    sl.get_prompt_experiment_mode.cache_clear()
+    monkeypatch.setenv("GRUG_PROMPT_EXPERIMENT_SSM", "/grug/elder-prompt-experiment")
+    monkeypatch.setattr(
+        sl._ssm, "get_parameter",
+        lambda *, Name: {"Parameter": {"Value": "splitt"}},
+    )
+    assert sl.get_prompt_experiment_mode() == "off"
+    sl.get_prompt_experiment_mode.cache_clear()
+
+
+def test_mode_value_is_stripped(monkeypatch) -> None:
+    """A console-pasted value with trailing whitespace still matches its arm."""
+    sl.get_prompt_experiment_mode.cache_clear()
+    monkeypatch.setenv("GRUG_PROMPT_EXPERIMENT_SSM", "/grug/elder-prompt-experiment")
+    monkeypatch.setattr(
+        sl._ssm, "get_parameter",
+        lambda *, Name: {"Parameter": {"Value": "  all_v2\n"}},
+    )
+    assert sl.get_prompt_experiment_mode() == "all_v2"
+    sl.get_prompt_experiment_mode.cache_clear()
+
+
 def test_mode_ssm_error_degrades_to_off(monkeypatch) -> None:
     """The #253 lesson: a missing/unreadable param must degrade, not raise —
     the experiment must never break a review."""
