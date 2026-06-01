@@ -511,6 +511,19 @@ def test_review_diff_emits_llmobs_span_on_success(monkeypatch) -> None:
     assert metrics["latency_ms"] >= 0
     # Metadata names the backend.
     assert call["metadata"]["backend"] == "openrouter"  # installation_id=1 → odd
+    # #191: and the prompt experiment arm, so DD can slice eval results by it.
+    assert call["metadata"]["variant_id"] == "v1"  # default mode off → v1
+
+
+def test_review_diff_llmobs_span_variant_id_reflects_experiment(monkeypatch) -> None:
+    """When the experiment forces v2, the span metadata must carry it on the
+    success path — the variant_id is what makes the A/B analyzable in DD."""
+    monkeypatch.setattr(lc, "get_prompt_experiment_mode", lambda: "all_v2")
+    annotate_calls = _capture_llmobs(monkeypatch)
+    response = httpx.Response(200, json=_openai_json_response('{"findings":[]}'))
+    with patch.object(httpx, "post", return_value=response):
+        review_diff([_hunk()], installation_id=1)
+    assert annotate_calls[0]["metadata"]["variant_id"] == "v2"
 
 
 def test_review_diff_llmobs_span_carries_pr_context_tags(monkeypatch) -> None:

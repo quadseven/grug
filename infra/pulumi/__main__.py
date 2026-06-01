@@ -171,6 +171,23 @@ webhook_image_tag = config.get("webhook_image_tag") or "bootstrap"
 # because DD source-code linking requires the full SHA. Greptile P1
 # PR #81. CI passes via config; bootstrap deploys fall back to short.
 _full_commit_sha = config.get("full_commit_sha") or webhook_image_tag
+# Elder prompt A/B experiment mode (#191). A plain String (NOT SecureString —
+# it's a non-secret operational toggle): one of "off" | "split" | "all_v2".
+# Pulumi OWNS the parameter's existence + the "off" default (all-Pulumi rule),
+# but `ignore_changes=["value"]` hands the *value* to the operator so they can
+# flip arms from the console/CLI during the experiment WITHOUT a redeploy and
+# WITHOUT Pulumi reverting it on the next `up`. The webhook reads it
+# fallback-safe (secrets_loader.get_prompt_experiment_mode → "off" on any
+# error), so a missing/garbage value degrades to the shipped v1 prompt.
+_prompt_experiment = aws.ssm.Parameter(
+    "grug-elder-prompt-experiment",
+    name="/grug/elder-prompt-experiment",
+    type="String",
+    value="off",
+    description="Elder code-review prompt A/B arm: off | split | all_v2 (#191).",
+    opts=pulumi.ResourceOptions(ignore_changes=["value"]),
+)
+
 webhook = lambda_service.create(
     name="grug-webhook",
     ecr_repo=webhook_ecr,
@@ -182,7 +199,7 @@ webhook = lambda_service.create(
     # Protocol (components/_types.py) — they expose `.arn`/`.name`, and the
     # consuming IAM policy wraps the arn list in `Output.all(...).apply()`,
     # so either arm resolves correctly (#235 named this contract).
-    extra_ssm_secrets=[_dd_api_key, cf_secret.ssm_parameter, _openrouter_api_key, _poolside_api_key],
+    extra_ssm_secrets=[_dd_api_key, cf_secret.ssm_parameter, _openrouter_api_key, _poolside_api_key, _prompt_experiment],
     # NOTE: DD extension is BAKED into the Lambda container image
     # (services/webhook/Dockerfile.lambda copies from
     # public.ecr.aws/datadog/lambda-extension-arm:<v>). Lambda Container
@@ -203,6 +220,9 @@ webhook = lambda_service.create(
         # Elder persona LLM client — webhook-only (api never calls LLMs).
         "GRUG_OPENROUTER_API_KEY_SSM": _openrouter_api_key.name,
         "GRUG_POOLSIDE_API_KEY_SSM": _poolside_api_key.name,
+        # Elder prompt A/B arm selector (#191). Carries the param NAME only;
+        # the value (off|split|all_v2) is read fallback-safe at cold start.
+        "GRUG_PROMPT_EXPERIMENT_SSM": _prompt_experiment.name,
         # CF→AWS auth boundary — middleware reads at cold start (#173).
         "GRUG_CF_SHARED_SECRET_SSM": cf_secret.ssm_parameter.name,
         # Datadog APM (datadog_lambda wrapper finds real handler via
