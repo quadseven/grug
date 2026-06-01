@@ -13,6 +13,7 @@ import hashlib
 import hmac
 import json
 import os
+from unittest.mock import patch
 
 import pytest
 from fastapi.testclient import TestClient
@@ -96,3 +97,30 @@ def test_signed_valid_json_dispatches(_client):
     assert body_json["delivery_id"] == "deadbeef-1234"
     assert body_json["status"] == "no_op"
     assert body_json["reason"] == "stubbed"
+
+
+def test_receiver_threads_delivery_id_into_dispatch(_client):
+    """The X-GitHub-Delivery header must be PASSED to dispatch (not just
+    echoed in the response) — the async Elder idempotency claim keys on it
+    (#272). The response-echo above can't catch a dropped kwarg; this does."""
+    import dispatcher
+
+    captured = {}
+
+    def _capture(event, payload, *, delivery_id=""):
+        captured["delivery_id"] = delivery_id
+        return {"status": "no_op", "reason": "stub"}
+
+    body = b'{"action":"opened"}'
+    with patch.object(dispatcher, "dispatch", _capture):
+        r = _client.post(
+            "/webhook/github",
+            content=body,
+            headers={
+                "X-GitHub-Event": "pull_request",
+                "X-GitHub-Delivery": "deliv-xyz",
+                "X-Hub-Signature-256": _sign(_WEBHOOK_SECRET, body),
+            },
+        )
+    assert r.status_code == 200
+    assert captured["delivery_id"] == "deliv-xyz"

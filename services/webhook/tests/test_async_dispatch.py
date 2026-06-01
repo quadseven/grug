@@ -11,7 +11,9 @@ ACK path:
 from __future__ import annotations
 
 import json
-from unittest.mock import patch
+from unittest.mock import MagicMock, patch
+
+import httpx
 
 import async_dispatch as ad
 import adapters.install_store as ins
@@ -140,6 +142,63 @@ def test_run_elder_job_never_reraises_on_dispatch_error():
                side_effect=RuntimeError("boom")):
         out = ad.run_elder_job(_JOB)
     assert out == {"persona": "code_reviewer", "result": "unhandled_error"}
+
+
+def test_two_jobs_same_delivery_dispatch_once():
+    """Integrated idempotency: two run_elder_job calls for the SAME delivery
+    (first claim wins, second loses) → dispatch_code_review runs exactly
+    once. The anti-double-review invariant, not just branch handling."""
+    with patch("adapters.install_store.claim_delivery", side_effect=[True, False]), \
+         patch("personas.code_reviewer.dispatch.dispatch_code_review",
+               return_value={"persona": "code_reviewer", "result": "pass"}) as mock_d:
+        first = ad.run_elder_job(_JOB)
+        second = ad.run_elder_job(_JOB)
+    assert mock_d.call_count == 1
+    assert first == {"persona": "code_reviewer", "result": "pass"}
+    assert second == {"status": "skipped", "reason": "duplicate_delivery"}
+
+
+# --- THE contract test: _slim_payload output must satisfy the REAL consumer.
+# Both are hand-maintained; if _slim_payload drops a field dispatch_code_review
+# reads (bracket access → KeyError at runtime, never recovers), the per-half
+# unit tests stay green but prod async invocations crash on every PR. This
+# wires the real projection into the real consumer so the contract is
+# load-bearing, not coincidental.
+
+def test_slim_payload_satisfies_dispatch_code_review_consumer(monkeypatch):
+    from personas.code_reviewer import dispatch as cr_dispatch
+    from llm_client import Backend, LlmReviewResponse
+
+    full = _full_gh_payload(body="x" * 4000)
+    slim = ad._slim_payload(full)
+
+    # Stub dispatch_code_review's IO so it runs offline but exercises EVERY
+    # payload field read (fetch→parse→review→publish) against the slim dict.
+    monkeypatch.setattr(
+        cr_dispatch, "with_install_token_retry",
+        lambda inst_id, fn: fn("fake-token"),
+    )
+    diff_resp = MagicMock(spec=httpx.Response)
+    diff_resp.status_code = 200
+    diff_resp.raise_for_status = MagicMock()
+    diff_resp.text = "diff --git a/x.py b/x.py\n@@ -0,0 +1 @@\n+pass\n"
+    monkeypatch.setattr(
+        cr_dispatch, "review_diff",
+        lambda *a, **kw: LlmReviewResponse(
+            kind="reviewed", findings=(), backend_used=Backend.POOLSIDE,
+        ),
+    )
+    posted = []
+    monkeypatch.setattr(cr_dispatch, "post_check_run", lambda *a, **kw: posted.append("check") or {"id": 1})
+    monkeypatch.setattr(cr_dispatch, "post_review", lambda *a, **kw: {"id": 2})
+
+    with patch("httpx.get", return_value=diff_resp):
+        # If _slim_payload dropped a field the consumer brackets-into, this
+        # raises KeyError instead of returning a result.
+        out = cr_dispatch.dispatch_code_review(slim, blocking=False)
+
+    assert out["persona"] == "code_reviewer"
+    assert posted == ["check"]  # reached publish — every read resolved
 
 
 def test_run_elder_job_fails_open_when_claim_errors():
