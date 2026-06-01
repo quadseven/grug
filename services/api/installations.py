@@ -364,7 +364,25 @@ def fix_enforcement(
         state = ensure_enforcement(token, owner, repo_name, default_branch, install_id, repo_id)
         return {"repo_id": repo_id, "enforcement_state": state}
 
-    return with_install_token_retry(install_id, _fix)
+    try:
+        return with_install_token_retry(install_id, _fix)
+    except httpx.HTTPStatusError as e:
+        # GitHub rejected the ruleset create/update (e.g. 422 validation:
+        # duplicate name, invalid rule, or the App lacks administration:write).
+        # Surface an ACTIONABLE error instead of a raw 500 — the old behavior
+        # made the dashboard "fix" button silently do nothing. The GitHub body
+        # carries the reason; pass a trimmed version through to the client.
+        gh_status = e.response.status_code
+        detail = (e.response.text or "")[:300]
+        log.warning(
+            "fix_enforcement_github_rejected",
+            extra={"install_id": install_id, "repo_id": repo_id,
+                   "gh_status": gh_status, "detail": detail},
+        )
+        raise HTTPException(
+            status_code=status.HTTP_502_BAD_GATEWAY,
+            detail=f"GitHub rejected the ruleset ({gh_status}): {detail}",
+        ) from e
 
 
 def _resolve_repo(
