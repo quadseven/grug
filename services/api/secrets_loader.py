@@ -54,3 +54,30 @@ def get_openrouter_api_key() -> str:
 def get_poolside_api_key() -> str:
     name = os.getenv("GRUG_POOLSIDE_API_KEY_SSM", "")
     return _get_ssm_secure_string(name)
+
+
+@lru_cache(maxsize=1)
+def get_prompt_experiment_mode() -> str:
+    """The Elder prompt-A/B experiment mode (#191), from the
+    `/grug/elder-prompt-experiment` SSM param (plain String). One of
+    `off` (all installs → v1), `split` (orthogonal-to-backend per-install
+    v1/v2), or `all_v2`. Cached per warm container.
+
+    FALLBACK-SAFE: returns `off` (the safe default — everyone on the
+    shipped v1 prompt) on a missing/unreadable param or any SSM error.
+    The experiment must never break a review (the #253 lesson: a missing
+    SSM param should degrade, not raise). `no redeploy` switching takes
+    effect on the next cold start / container recycle (the cache is
+    warm-container-scoped)."""
+    name = os.getenv("GRUG_PROMPT_EXPERIMENT_SSM", "")
+    if not name:
+        return "off"
+    try:
+        resp = _ssm.get_parameter(Name=name)
+        return resp["Parameter"]["Value"]
+    except Exception as e:  # noqa: BLE001 — best-effort config; never break review
+        log.warning(
+            "prompt_experiment_mode_fetch_failed",
+            extra={"param": name, "kind": type(e).__name__},
+        )
+        return "off"
