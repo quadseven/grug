@@ -139,7 +139,9 @@ gha_deploy_role = _deploy_role_bundle.role
 _iam_propagation_wait = _deploy_role_bundle.iam_propagation_wait
 
 # Slice 2 (#23) — DDB single-table + KMS CMK + api Lambda
-grug_main_table = ddb_table.create("grug-main")
+grug_main_table = ddb_table.create(
+    "grug-main", iam_propagation_wait=_iam_propagation_wait,
+)
 grug_tokens_cmk = kms_cmk.create("grug-tokens")
 
 # CF→AWS auth boundary (parent #173). Provisioned before the Lambdas so
