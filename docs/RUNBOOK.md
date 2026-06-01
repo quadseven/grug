@@ -369,6 +369,59 @@ async worker (`async_dispatch.run_elder_job`) is idempotent on the
 - AWS async retries are disabled (`maximum_retry_attempts=0`) — the worker
   owns idempotency + degrade, so AWS retries would only risk a storm.
 
+### Elder prompt A/B experiment (#191)
+
+<a id="elder-prompt-experiment"></a>
+The Elder review prompt has two arms: **v1** (precision-biased, byte-identical
+to the shipped prompt — the control) and **v2** (recall-biased). The arm per
+install is chosen by `select_prompt_variant`, driven by the SSM String
+`/grug/elder-prompt-experiment` (one of `off` | `split` | `all_v2`). The chosen
+arm rides each review's DD LLM-Obs span as `variant_id`, so eval results
+(`is_real_bug` judge verdict, `human_verdict` reactions) slice by arm.
+
+**Before flipping — check cell balance.** The variant split `(id // 2) % 2` is
+orthogonal to the backend split `id % 2`, giving a 2×2 grid (v1/v2 × poolside/
+openrouter). It's balanced over each block of 4 consecutive install IDs, but a
+skewed live install-ID population can starve a cell. Verify the spread first:
+
+```bash
+# List allowlisted install IDs, then bucket each into its (backend, variant) cell.
+aws dynamodb scan --table-name grug-main --region us-east-1 \
+  --filter-expression 'begins_with(PK, :p) AND SK = :m' \
+  --expression-attribute-values '{":p":{"S":"INST#"},":m":{"S":"META"}}' \
+  --projection-expression 'PK' --query 'Items[].PK.S' --output text \
+| tr '\t' '\n' | sed 's/INST#//' \
+| awk '{b=($1%2==0)?"poolside":"openrouter"; v=(int($1/2)%2==1)?"v2":"v1"; print b" "v}' \
+| sort | uniq -c
+```
+
+Aim for all four cells populated and roughly even before trusting a result. If
+a cell is starved (few installs), the arm comparison for that backend is weak —
+note it when reading results.
+
+**Flip the arm** (no redeploy needed; `ignore_changes=["value"]` means Pulumi
+won't revert it):
+
+```bash
+aws ssm put-parameter --name /grug/elder-prompt-experiment --region us-east-1 \
+  --type String --overwrite --value split   # or: all_v2 | off
+```
+
+**Mixed-mode window.** The mode is `lru_cache`d per warm container, so a flip
+takes effect on the **next cold start** of each webhook container — warm
+containers keep the old arm until they recycle. Expect a mixed window of
+minutes-to-~1h depending on traffic. To force a fast cutover, publish a new
+image tag (any `pulumi up` that bumps `webhook_image_tag` cold-starts all
+containers), or simply **wait ≥1h before trusting the DD eval split** so the
+fleet has fully transitioned. A garbage value (typo) logs
+`prompt_experiment_mode_unrecognized` and degrades to `off` (control).
+
+**Reading results** is operator/DD-console work: build (or filter) an LLM-Obs
+view faceted on `@variant_id`, comparing the judge `is_real_bug` rate and the
+👍/👎 `human_verdict` rate between `v1` and `v2`. Promoting a winning arm to the
+default is a future code slice (bake the winner into `build_system_prompt`'s
+default), not a toggle flip.
+
 ### Rollback
 
 If Elder produces too many false positives or operationally misbehaves,
