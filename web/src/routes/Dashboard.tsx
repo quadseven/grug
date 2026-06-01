@@ -236,6 +236,17 @@ function EnforcementBadge({
       </span>
     );
   }
+  // "unknown" = GitHub was rate-limited and we had no stored state. Show a
+  // muted, honest "status unknown" — NOT a false "not enforced" — so the
+  // operator isn't misled, and the "fix" button (gated on state === "none")
+  // stays hidden.
+  if (resolved === "unknown") {
+    return (
+      <span className="text-xs font-mono text-stone-500" title="Couldn't reach GitHub (rate-limited) and no stored state — try refreshing">
+        status unknown
+      </span>
+    );
+  }
   if (loading) {
     return <span className="text-xs text-stone-500 font-mono">checking…</span>;
   }
