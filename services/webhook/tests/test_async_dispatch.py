@@ -167,13 +167,13 @@ def test_two_jobs_same_delivery_dispatch_once():
 
 def test_slim_payload_satisfies_dispatch_code_review_consumer(monkeypatch):
     from personas.code_reviewer import dispatch as cr_dispatch
-    from llm_client import Backend, LlmReviewResponse
+    from llm_client import Backend, Finding as LlmFinding, LlmReviewResponse
 
     full = _full_gh_payload(body="x" * 4000)
     slim = ad._slim_payload(full)
 
     # Stub dispatch_code_review's IO so it runs offline but exercises EVERY
-    # payload field read (fetch→parse→review→publish) against the slim dict.
+    # payload field read (fetch→parse→review→PUBLISH) against the slim dict.
     monkeypatch.setattr(
         cr_dispatch, "with_install_token_retry",
         lambda inst_id, fn: fn("fake-token"),
@@ -182,23 +182,37 @@ def test_slim_payload_satisfies_dispatch_code_review_consumer(monkeypatch):
     diff_resp.status_code = 200
     diff_resp.raise_for_status = MagicMock()
     diff_resp.text = "diff --git a/x.py b/x.py\n@@ -0,0 +1 @@\n+pass\n"
+    # Return a REAL finding (on a line in the diff) so the publish path —
+    # post_review + comment capture, which read owner/repo/pull_number/
+    # head_sha from the slim payload — is actually traversed, not skipped
+    # by an empty-findings early return (codex WARN-3).
     monkeypatch.setattr(
         cr_dispatch, "review_diff",
         lambda *a, **kw: LlmReviewResponse(
-            kind="reviewed", findings=(), backend_used=Backend.POOLSIDE,
+            kind="reviewed",
+            findings=(LlmFinding(
+                path="x.py", line=1, rule="silent-failure",
+                severity="medium", message="m",  # type: ignore[arg-type]
+            ),),
+            backend_used=Backend.POOLSIDE,
         ),
     )
     posted = []
     monkeypatch.setattr(cr_dispatch, "post_check_run", lambda *a, **kw: posted.append("check") or {"id": 1})
-    monkeypatch.setattr(cr_dispatch, "post_review", lambda *a, **kw: {"id": 2})
+    monkeypatch.setattr(cr_dispatch, "post_review", lambda *a, **kw: posted.append("review") or {"id": 2})
+    # Comment-capture (best-effort, post-publish) also reads the payload-
+    # derived ids before short-circuiting on an empty comment list; stub its
+    # GH fetch so it runs without network.
+    monkeypatch.setattr(cr_dispatch, "get_review_comments", lambda *a, **kw: [])
 
     with patch("httpx.get", return_value=diff_resp):
-        # If _slim_payload dropped a field the consumer brackets-into, this
-        # raises KeyError instead of returning a result.
+        # If _slim_payload dropped a field the consumer (or its publish/
+        # capture callees) brackets-into, this raises KeyError instead of
+        # returning a result.
         out = cr_dispatch.dispatch_code_review(slim, blocking=False)
 
     assert out["persona"] == "code_reviewer"
-    assert posted == ["check"]  # reached publish — every read resolved
+    assert "check" in posted and "review" in posted  # reached BOTH publishes
 
 
 def test_run_elder_job_fails_open_when_claim_errors():
