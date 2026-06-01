@@ -146,11 +146,12 @@ def create(
     # than referencing the Function resource, which would be a circular
     # dependency (role → policy → function → role). The runtime targets
     # the same name via the auto-set `AWS_LAMBDA_FUNCTION_NAME` env.
+    self_invoke_policy: aws.iam.RolePolicy | None = None
     if allow_self_invoke:
         _ident = aws.get_caller_identity()
         _region = aws.get_region()
         _self_arn = f"arn:aws:lambda:{_region.name}:{_ident.account_id}:function:{name}"
-        aws.iam.RolePolicy(
+        self_invoke_policy = aws.iam.RolePolicy(
             f"{name}-self-invoke-policy",
             role=role.id,
             policy=json.dumps(
@@ -190,9 +191,17 @@ def create(
     # AWS IAM (10-30s typical). Without this, an in-same-plan addition
     # of `kms:Encrypt` + `kms:GenerateDataKey` to the deploy role +
     # Lambda kms_key_arn-touching update collides on AWS auth-check.
+    # Gate the Function create/update behind both the IAM-propagation wait
+    # (#88) AND the self-invoke RolePolicy (#272) — so new image code is never
+    # live before the lambda:InvokeFunction-on-self grant lands (else the
+    # first self-invokes AccessDeny → dropped reviews until the policy
+    # propagates). codex peer-review WARN-4.
+    _function_deps = [
+        d for d in (iam_propagation_wait, self_invoke_policy) if d is not None
+    ]
     function_opts = (
-        pulumi.ResourceOptions(depends_on=[iam_propagation_wait])
-        if iam_propagation_wait is not None
+        pulumi.ResourceOptions(depends_on=_function_deps)
+        if _function_deps
         else None
     )
     function = aws.lambda_.Function(
