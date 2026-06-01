@@ -445,6 +445,11 @@ _aws.iam.RolePolicy(
                             "dynamodb:UpdateItem",
                             "dynamodb:DeleteItem",
                             "dynamodb:Query",
+                            # Scan backs the admin endpoints (_scan_all over
+                            # USER#/INST# rows). Its absence 500'd
+                            # GET /admin/users + /admin/installations with
+                            # AccessDeniedException — admin never worked.
+                            "dynamodb:Scan",
                             "dynamodb:BatchGetItem",
                             "dynamodb:BatchWriteItem",
                         ],
