@@ -99,12 +99,15 @@ def run_elder_job(event: dict[str, Any]) -> dict[str, str]:
     status dict instead.
     """
     delivery_id = str(event.get("delivery_id", ""))
-    # Lazy imports keep the cold-start of the SYNC (HTTP) path cheap — the
-    # Elder dependency graph (LLM client, diff parser) only loads in the
-    # async invocation that actually needs it.
-    from adapters.install_store import claim_delivery
-
     try:
+        # Lazy import INSIDE the guard (#272): keeps the SYNC (HTTP) cold-start
+        # cheap (the Elder dep graph only loads in the async invocation), AND
+        # — load-bearing — an import failure here must NOT escape and trigger
+        # AWS's 2 default async retries (the retry-storm this function exists
+        # to prevent). A failed import degrades to running, same as a DDB
+        # hiccup on the claim.
+        from adapters.install_store import claim_delivery
+
         if not claim_delivery(delivery_id):
             log.info("elder_job_duplicate_skipped", extra={"delivery_id": delivery_id})
             return {"status": "skipped", "reason": "duplicate_delivery"}
