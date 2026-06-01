@@ -31,13 +31,17 @@ import re
 import time
 from dataclasses import dataclass, field
 from enum import Enum
-from typing import Any, Callable, Literal, Optional, TypedDict
+from typing import Any, Callable, Literal, Optional, TypedDict, get_args
 
 import httpx
 
-from code_review_prompt import build_system_prompt
+from code_review_prompt import PromptVariant, build_system_prompt
 from review_types import SEVERITIES, Severity
-from secrets_loader import get_openrouter_api_key, get_poolside_api_key
+from secrets_loader import (
+    get_openrouter_api_key,
+    get_poolside_api_key,
+    get_prompt_experiment_mode,
+)
 
 log = logging.getLogger(f"{os.getenv('DD_SERVICE', 'grug')}.llm_client")
 
@@ -342,15 +346,36 @@ def select_backend(installation_id: int) -> Backend:
 # placeholder one-paragraph prompt is gone — the rule set + good/bad
 # examples live in code_review_prompt.py (a sibling module, so no
 # import cycle) for A/B testing without touching the dispatch path.
-_SYSTEM_PROMPT = build_system_prompt()
+# Built once per variant at import (#191 A/B). v1 is the precision-biased
+# default; v2 the recall-biased experiment arm. Per-variant caching keeps the
+# prompt-cache key + DD experiment arm stable.
+_SYSTEM_PROMPTS: dict[PromptVariant, str] = {
+    v: build_system_prompt(v) for v in get_args(PromptVariant)
+}
 
 
-def _build_messages(hunks: list[Hunk]) -> list[dict[str, str]]:
+def select_prompt_variant(installation_id: int) -> PromptVariant:
+    """Assign the prompt A/B arm (#191) from the SSM experiment mode:
+    `off`→v1 (everyone on the shipped prompt), `all_v2`→v2, `split`→
+    per-install v1/v2. The split keys on `(installation_id // 2) % 2`, NOT
+    `% 2` — `% 2` is already `select_backend`'s axis, so reusing it would
+    CONFOUND prompt-effect with backend-effect. `// 2 % 2` is orthogonal, so
+    every backend×variant cell is populated and the arms are comparable.
+    Unknown/typo'd mode → v1 (safe default)."""
+    mode = get_prompt_experiment_mode()
+    if mode == "all_v2":
+        return "v2"
+    if mode == "split":
+        return "v2" if (installation_id // 2) % 2 == 1 else "v1"
+    return "v1"
+
+
+def _build_messages(hunks: list[Hunk], variant: PromptVariant) -> list[dict[str, str]]:
     user = "\n\n".join(
         f"### {h.path}\n```diff\n{h.body}\n```" for h in hunks
     )
     return [
-        {"role": "system", "content": _SYSTEM_PROMPT},
+        {"role": "system", "content": _SYSTEM_PROMPTS[variant]},
         {"role": "user", "content": user},
     ]
 
@@ -548,7 +573,8 @@ def review_diff(
     secondary = (
         Backend.OPENROUTER if primary == Backend.POOLSIDE else Backend.POOLSIDE
     )
-    messages = _build_messages(hunks)
+    variant = select_prompt_variant(installation_id)  # #191 A/B arm
+    messages = _build_messages(hunks, variant)
     pr_tags = _llmobs_tags(pr_context)
 
     last_error = ""
@@ -575,7 +601,7 @@ def review_diff(
                 )
                 _llmobs_annotate(
                     span=span, input_data=_redact_payload(messages),
-                    metadata={"backend": backend.value, "error": "config"},
+                    metadata={"backend": backend.value, "variant_id": variant, "error": "config"},
                     metrics={"latency_ms": _elapsed_ms(start_ns)},
                     tags=pr_tags,
                 )
@@ -588,7 +614,7 @@ def review_diff(
                 )
                 _llmobs_annotate(
                     span=span, input_data=_redact_payload(messages),
-                    metadata={"backend": backend.value, "error": type(e).__name__},
+                    metadata={"backend": backend.value, "variant_id": variant, "error": type(e).__name__},
                     metrics={"latency_ms": _elapsed_ms(start_ns)},
                     tags=pr_tags,
                 )
@@ -628,6 +654,7 @@ def review_diff(
                 output_data=_redact_payload(content) if content else None,
                 metadata={
                     "backend": backend.value,
+                    "variant_id": variant,  # #191 prompt A/B arm
                     "status_code": resp.status_code,
                     "kind": "reviewed" if not err else (
                         "parse_failed" if resp.status_code == 200 else "http_error"
