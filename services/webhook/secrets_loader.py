@@ -21,6 +21,12 @@ import boto3
 log = logging.getLogger(f"{os.getenv('DD_SERVICE', 'grug')}.secrets")
 _ssm = boto3.client("ssm")
 
+# The recognized Elder prompt-experiment arms (#191). A value outside this set
+# (operator typo / stray whitespace) is treated as "off" — same safe default as
+# a missing param — but is LOGGED (unlike the silent "off" default) so a
+# fat-fingered toggle is distinguishable from an intentional disable.
+_EXPERIMENT_MODES = frozenset({"off", "split", "all_v2"})
+
 
 @lru_cache(maxsize=8)
 def _get_ssm_secure_string(name: str) -> str:
@@ -74,10 +80,23 @@ def get_prompt_experiment_mode() -> str:
         return "off"
     try:
         resp = _ssm.get_parameter(Name=name)
-        return resp["Parameter"]["Value"]
+        # Strip so a console-pasted value with a trailing newline ("split\n")
+        # still matches — otherwise it would silently degrade to v1.
+        value = resp["Parameter"]["Value"].strip()
     except Exception as e:  # noqa: BLE001 — best-effort config; never break review
         log.warning(
             "prompt_experiment_mode_fetch_failed",
             extra={"param": name, "kind": type(e).__name__},
         )
         return "off"
+    if value not in _EXPERIMENT_MODES:
+        # Fetched fine, but the value is not a known arm — an operator typo.
+        # Degrade to "off" (control) but LOG it: otherwise the operator sees
+        # 100% v1 in DD and can't tell a typo'd "split" from an intentional
+        # disable (the silent-failure trap silent-failure-hunter flagged).
+        log.warning(
+            "prompt_experiment_mode_unrecognized",
+            extra={"param": name, "mode": value},
+        )
+        return "off"
+    return value
