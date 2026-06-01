@@ -124,7 +124,7 @@ async def receive_github_webhook(
         )
         raise HTTPException(status_code=400, detail="body_not_json")
 
-    outcome = dispatch(x_github_event, payload)
+    outcome = dispatch(x_github_event, payload, delivery_id=x_github_delivery)
     log.info(
         "webhook_dispatched",
         extra={"delivery_id": x_github_delivery, **outcome},
