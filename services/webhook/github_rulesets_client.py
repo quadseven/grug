@@ -189,6 +189,19 @@ def create_ruleset(
         headers=_auth_headers(install_token),
         timeout=10,
     )
+    if resp.status_code >= 400:
+        # Log GitHub's validation detail before raising — a 422 here is
+        # otherwise opaque (raise_for_status drops the body), and it's exactly
+        # what the dashboard "fix" button hit. The body names the real cause
+        # (duplicate ruleset name / invalid rule param / missing perm).
+        log.warning(
+            "create_ruleset_rejected",
+            extra={
+                "owner": owner, "repo": repo, "ruleset_name": name,
+                "status": resp.status_code,
+                "body": resp.text[:600],
+            },
+        )
     resp.raise_for_status()
     return resp.json()
 
