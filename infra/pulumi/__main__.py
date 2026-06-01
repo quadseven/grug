@@ -263,19 +263,22 @@ webhook = lambda_service.create(
         # before PR somatic-scripts#235 fixed it.
         "DD_TRACE_MANAGED_SERVICES": "false",
     },
-    # 60s (was 15s) so the REALISTIC synchronous Elder path — diff fetch (10s)
-    # + ONE review LLM attempt (≤30s) + publish — completes instead of being
-    # killed mid-call (#252; a normal 16s review was killed by the old 15s).
-    # This does NOT bound the retry-storm: review_diff retries
-    # `_RETRY_ATTEMPTS` per backend across 2 backends, so a HUNG backend can
-    # run ~180s and still exceed 60s before publish. No sane sync budget bounds
-    # that — the real fix is to move the LLM call off the ACK path (async
-    # offload, #272). 60s buys the common case; #272 buys the worst case.
-    # Cost note: a timeout-HIT invocation now bills up to 4× the GB-s (≈$0.30/
-    # 1k hits at 512MB arm64) and holds a concurrency slot 4× longer — fine at
-    # grug's volume; the poller-style error monitor + #272 bound the downside.
-    timeout_seconds=60,
+    # 420s (#272 — was 60s in #252). The Elder LLM review is now OFFLOADED
+    # off the ACK path: the sync invocation does HMAC + TPM + a fire-and-
+    # forget self-invoke (returns in ~1–2s), and a SEPARATE async invocation
+    # of THIS function runs the Elder dispatch. This one timeout governs both
+    # shapes, so it must cover Elder's worst case: review_diff retries
+    # `_RETRY_ATTEMPTS`(3) per backend × 2 backends × `_TIMEOUT_SECONDS`(30) +
+    # backoff + the judge call ≈ 300s. 420s gives headroom. The sync ACK path
+    # is unaffected by the high ceiling — its httpx calls are each individually
+    # bounded (≤30s), so it provably can't run 420s; the ceiling only ever
+    # bites the async Elder invocation. Lambda bills actual duration, so the
+    # headroom is free except for the rare hung-call concurrency hold.
+    timeout_seconds=420,
     memory_mb=512,
+    # Grant lambda:InvokeFunction on its own ARN so the sync handler can
+    # self-invoke the async Elder worker (#272).
+    allow_self_invoke=True,
     # Encrypt env vars (DD_API_KEY in particular) at rest so a reader
     # with `lambda:GetFunctionConfiguration` alone can't recover the
     # plaintext API key. Closes #60. Webhook role granted kms:Decrypt
