@@ -48,5 +48,13 @@ def create(name: str = "grug-main") -> aws.dynamodb.Table:
         point_in_time_recovery=aws.dynamodb.TablePointInTimeRecoveryArgs(
             enabled=True,
         ),
+        # DDB TTL on the `ttl` attribute (epoch seconds). Bounds the
+        # ever-growing partitions whose rows write a `ttl`: `CRCOMMENT#`
+        # (reaction-poll comment records, #247) and `DELIVERY#` (async-Elder
+        # idempotency claims, #272). Without this, those `ttl` attributes are
+        # inert and the partitions grow unbounded (runtime-trace audit on
+        # #272: TTL was asserted-but-never-enabled — live table was DISABLED).
+        # Enabling is an in-place UpdateTimeToLive — non-destructive. Free.
+        ttl=aws.dynamodb.TableTtlArgs(attribute_name="ttl", enabled=True),
         tags={"app": "grug", "managed-by": "pulumi"},
     )

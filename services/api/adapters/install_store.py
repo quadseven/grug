@@ -404,8 +404,10 @@ def _comment_record_sk(comment_id: int | str) -> str:
 # Comment records auto-expire so the per-install CRCOMMENT# partition
 # doesn't grow unbounded as PRs close (the poller queries it every
 # cycle). 30 days comfortably outlives an open PR's active-review
-# window; the table's DDB TTL is enabled in the deploy slice (#247),
-# which reads this `ttl` attribute.
+# window; the table's DDB TTL (on the `ttl` attribute) is enabled in
+# ddb_table.py — #272 actually turned it on (it had been asserted here
+# since #247 but was never enabled; the runtime-trace audit caught the
+# live table at DISABLED).
 _COMMENT_RECORD_TTL_DAYS = 30
 
 
