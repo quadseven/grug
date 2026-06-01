@@ -841,7 +841,20 @@ def test_dispatch_fetches_diff_with_diff_accept_header(monkeypatch):
     assert captured[0]["headers"]["Accept"] == "application/vnd.github.diff"
     assert "myorg/myrepo" in captured[0]["url"]
     assert "/pulls/7" in captured[0]["url"]
-    assert captured[0]["timeout"] == 30
+    assert captured[0]["timeout"] == cr_dispatch._DIFF_FETCH_TIMEOUT
+
+
+def test_diff_fetch_timeout_fits_webhook_lambda_budget():
+    """#252 budget invariant: no single synchronous httpx timeout on the
+    webhook path may reach the webhook Lambda's 60s budget — else a hung
+    upstream kills the handler mid-flight before the in-code degrade fires.
+    (Lambda timeout lives in infra/pulumi/__main__.py:webhook; kept here as a
+    documented ceiling so a future bump to a per-request timeout trips this.)"""
+    import llm_client
+    _WEBHOOK_LAMBDA_BUDGET = 60
+    assert cr_dispatch._DIFF_FETCH_TIMEOUT < _WEBHOOK_LAMBDA_BUDGET
+    assert cr_dispatch._COMMENT_FETCH_TIMEOUT < _WEBHOOK_LAMBDA_BUDGET
+    assert llm_client._TIMEOUT_SECONDS < _WEBHOOK_LAMBDA_BUDGET
 
 
 # --- #247a: capture inline-comment IDs on publish (best-effort) ---
