@@ -44,6 +44,36 @@ ELDER_REVIEW_JOB = "elder_review"
 _lambda = boto3.client("lambda")
 
 
+def _slim_payload(payload: dict[str, Any]) -> dict[str, Any]:
+    """Project the GitHub PR payload to ONLY the fields the Elder worker
+    (`dispatch_code_review`) reads: `action`, the PR number + head sha,
+    the repo owner/name, and the installation id. The worker re-fetches
+    the diff from GitHub by those IDs, so forwarding the full payload is
+    not just unnecessary — it's DANGEROUS: an async (`InvocationType=
+    "Event"`) invoke caps the request payload at 256 KB, and a large PR
+    (long body + two full repo objects + sender/org) can blow past that
+    → `InvalidRequestContentException` → the review is dropped, and since
+    every re-push re-sends the same oversized payload it NEVER recovers.
+    The slim projection keeps the event tiny and bounded regardless of PR
+    size. Mirrors `dispatch_code_review`'s reads — keep in sync if that
+    function starts consuming new payload fields.
+    """
+    pr = payload.get("pull_request") or {}
+    repo = payload.get("repository") or {}
+    return {
+        "action": payload.get("action", ""),
+        "pull_request": {
+            "number": pr.get("number"),
+            "head": {"sha": (pr.get("head") or {}).get("sha")},
+        },
+        "repository": {
+            "owner": {"login": (repo.get("owner") or {}).get("login")},
+            "name": repo.get("name"),
+        },
+        "installation": {"id": (payload.get("installation") or {}).get("id")},
+    }
+
+
 def enqueue_elder_review(
     *, payload: dict[str, Any], delivery_id: str, blocking: bool,
 ) -> bool:
@@ -68,7 +98,9 @@ def enqueue_elder_review(
         ASYNC_JOB_KEY: ELDER_REVIEW_JOB,
         "delivery_id": delivery_id,
         "blocking": blocking,
-        "payload": payload,
+        # Slim projection — NOT the full payload (256 KB Event cap). See
+        # _slim_payload.
+        "payload": _slim_payload(payload),
     }
     try:
         _lambda.invoke(
@@ -78,8 +110,11 @@ def enqueue_elder_review(
         )
         return True
     except Exception as e:  # noqa: BLE001 — best-effort enqueue; never break the ACK
+        # Distinct token from the caller's `elder_enqueue_failed` so the
+        # offload-failure monitor (which watches the caller's log) counts
+        # one line per dropped review, not two. This line adds the cause.
         log.error(
-            "elder_enqueue_failed",
+            "elder_enqueue_invoke_error",
             extra={"delivery_id": delivery_id, "kind": type(e).__name__},
         )
         return False

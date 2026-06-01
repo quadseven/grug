@@ -19,11 +19,31 @@ import adapters.install_store as ins
 
 # --- enqueue_elder_review --------------------------------------------------
 
-def test_enqueue_invokes_self_async_with_job_payload(monkeypatch):
+def _full_gh_payload(body=""):
+    """A GitHub pull_request payload with the bulky fields that must NOT be
+    forwarded (the 256 KB Event cap)."""
+    return {
+        "action": "opened",
+        "pull_request": {
+            "number": 7,
+            "head": {"sha": "abc123"},
+            "body": body,  # can be ~65 KB of markdown — must be dropped
+        },
+        "repository": {
+            "owner": {"login": "githumps", "id": 999, "url": "https://x"},
+            "name": "grug",
+            "description": "x" * 1000,  # bulky — must be dropped
+        },
+        "installation": {"id": 555},
+        "sender": {"login": "someone", "id": 1, "avatar_url": "y" * 1000},
+    }
+
+
+def test_enqueue_invokes_self_async_with_slim_job_payload(monkeypatch):
     monkeypatch.setenv("AWS_LAMBDA_FUNCTION_NAME", "grug-webhook")
     with patch.object(ad._lambda, "invoke") as mock_invoke:
         ok = ad.enqueue_elder_review(
-            payload={"pull_request": {"number": 7}},
+            payload=_full_gh_payload(body="m" * 5000),
             delivery_id="d-1",
             blocking=True,
         )
@@ -35,7 +55,29 @@ def test_enqueue_invokes_self_async_with_job_payload(monkeypatch):
     assert job[ad.ASYNC_JOB_KEY] == ad.ELDER_REVIEW_JOB
     assert job["delivery_id"] == "d-1"
     assert job["blocking"] is True
-    assert job["payload"] == {"pull_request": {"number": 7}}
+    # Only the fields dispatch_code_review reads survive (256 KB Event cap).
+    assert job["payload"] == {
+        "action": "opened",
+        "pull_request": {"number": 7, "head": {"sha": "abc123"}},
+        "repository": {"owner": {"login": "githumps"}, "name": "grug"},
+        "installation": {"id": 555},
+    }
+
+
+def test_enqueue_drops_bulky_payload_fields(monkeypatch):
+    """The PR body, sender, and extra repo metadata (the parts that can
+    push a payload past the 256 KB async-invoke cap) must NOT be forwarded."""
+    monkeypatch.setenv("AWS_LAMBDA_FUNCTION_NAME", "grug-webhook")
+    huge_body = "z" * 200_000  # would blow the 256 KB cap if forwarded
+    with patch.object(ad._lambda, "invoke") as mock_invoke:
+        ad.enqueue_elder_review(
+            payload=_full_gh_payload(body=huge_body),
+            delivery_id="d-big", blocking=False,
+        )
+    raw = mock_invoke.call_args.kwargs["Payload"]
+    assert len(raw) < 1000  # slim, bounded — not ~200 KB
+    assert b"zzz" not in raw  # the huge body is gone
+    assert b"avatar_url" not in raw  # sender stripped
 
 
 def test_enqueue_returns_false_without_function_name(monkeypatch):
