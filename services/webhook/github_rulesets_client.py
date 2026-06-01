@@ -9,6 +9,8 @@ Tokens fetched per-installation via github_app_auth.
 from __future__ import annotations
 
 import logging
+import random
+import time
 from typing import Literal
 from urllib.parse import quote
 
@@ -27,9 +29,127 @@ _HEADERS_TEMPLATE = {
     "X-GitHub-Api-Version": "2022-11-28",
 }
 
+# --- Resilient GET (#272 follow-up: dashboard 429 storm) -------------------
+# The dashboard fans out one /enforcement request per repo in parallel, each
+# of which calls GitHub's rulesets API; the burst trips GitHub's secondary
+# rate limit (429, sometimes 403 + Retry-After). A bare raise_for_status made
+# the whole enforcement check fail → the UI showed a false "not enforced".
+#
+# Budget note: these GETs run inside the grug-api Lambda (15s timeout), so the
+# retry budget is deliberately SMALL — a few jittered, short backoffs to ride
+# out a transient burst. A SUSTAINED rate limit is NOT waited out here; it
+# exhausts fast and the caller (get_enforcement) falls back to the last-known
+# stored state. Resilience = small retries + jitter + graceful fallback, not
+# long blocking waits on a user-facing request.
+_GET_RETRY_ATTEMPTS = 3          # 1 initial + 2 retries
+_GET_RETRY_BASE_DELAY = 0.3      # seconds; grows 0.3 → 0.6 → ...
+_GET_RETRY_MAX_DELAY = 2.0       # cap per-attempt sleep (+ caps honored Retry-After)
+_GET_RETRYABLE_STATUSES = frozenset((429, 502, 503, 504))
+
 
 def _auth_headers(install_token: str) -> dict[str, str]:
     return {**_HEADERS_TEMPLATE, "Authorization": f"Bearer {install_token}"}
+
+
+def _RETRY_SLEEP(seconds: float) -> None:  # noqa: N802 — mockable seam (matches llm_client)
+    """Indirection so tests can stub the wait without real time passing."""
+    time.sleep(seconds)
+
+
+def _is_rate_limited(resp: httpx.Response) -> bool:
+    """Retryable rate-limit / transient signal. 429 + 5xx always; a 403 only
+    when it carries a rate-limit signal (Retry-After, or exhausted primary
+    quota via X-RateLimit-Remaining: 0) — NOT a plain permission 403."""
+    if resp.status_code in _GET_RETRYABLE_STATUSES:
+        return True
+    if resp.status_code == 403:
+        return (
+            "retry-after" in resp.headers
+            or resp.headers.get("x-ratelimit-remaining") == "0"
+        )
+    return False
+
+
+def _retry_delay(attempt: int, resp: httpx.Response | None) -> float:
+    """Equal-jitter exponential backoff, honoring (capped) Retry-After.
+
+    Equal jitter (`base/2 + rand(0, base/2)`) de-syncs the dashboard's
+    parallel retries so they don't re-collide into a fresh burst, while
+    still guaranteeing a meaningful minimum wait. Retry-After (seconds) is
+    respected but capped at _GET_RETRY_MAX_DELAY to stay inside the Lambda
+    budget — a longer limit is handled by the caller's fallback, not a wait.
+    """
+    base = min(_GET_RETRY_BASE_DELAY * (2 ** attempt), _GET_RETRY_MAX_DELAY)
+    if resp is not None:
+        retry_after = resp.headers.get("retry-after")
+        if retry_after:
+            try:
+                base = min(max(base, float(int(retry_after))), _GET_RETRY_MAX_DELAY)
+            except (TypeError, ValueError):
+                pass  # HTTP-date form (rare for GH) — fall back to backoff
+    return base / 2 + random.uniform(0, base / 2)
+
+
+def _get_with_retry(
+    url: str, *, install_token: str, timeout: float = 10.0, op: str,
+) -> httpx.Response:
+    """GET with bounded jittered retries on rate-limit / transient errors.
+
+    Returns the final response (caller decides on `raise_for_status`). Retries
+    a rate-limited (429 / rate-limit-403) or 5xx response, and transport
+    errors, up to `_GET_RETRY_ATTEMPTS`; logs each retry + an exhausted line so
+    the storm is visible in DD. Does NOT swallow — a non-retryable status is
+    returned as-is, and a transport error on the final attempt re-raises.
+    """
+    headers = _auth_headers(install_token)
+    last_exc: httpx.RequestError | None = None
+    resp: httpx.Response | None = None
+    for attempt in range(_GET_RETRY_ATTEMPTS):
+        last = attempt == _GET_RETRY_ATTEMPTS - 1
+        try:
+            resp = httpx.get(url, headers=headers, timeout=timeout)
+        except httpx.RequestError as e:
+            last_exc = e
+            if last:
+                log.warning(
+                    "rulesets_get_retry_exhausted",
+                    extra={"op": op, "attempts": _GET_RETRY_ATTEMPTS,
+                           "kind": type(e).__name__},
+                )
+                raise
+            delay = _retry_delay(attempt, None)
+            log.warning(
+                "rulesets_get_retry",
+                extra={"op": op, "attempt": attempt + 1, "kind": type(e).__name__,
+                       "delay_s": round(delay, 3)},
+            )
+            _RETRY_SLEEP(delay)
+            continue
+        if not last and _is_rate_limited(resp):
+            delay = _retry_delay(attempt, resp)
+            log.warning(
+                "rulesets_get_retry",
+                extra={"op": op, "attempt": attempt + 1,
+                       "status": resp.status_code,
+                       "retry_after": resp.headers.get("retry-after"),
+                       "delay_s": round(delay, 3)},
+            )
+            _RETRY_SLEEP(delay)
+            continue
+        if _is_rate_limited(resp):
+            # Out of attempts on a rate-limited response — surface it (the
+            # caller's fallback handles sustained limits). Make it visible.
+            log.warning(
+                "rulesets_get_retry_exhausted",
+                extra={"op": op, "attempts": _GET_RETRY_ATTEMPTS,
+                       "status": resp.status_code},
+            )
+        return resp
+    # Unreachable (loop always returns/raises), but satisfies type checkers.
+    if resp is not None:
+        return resp
+    assert last_exc is not None
+    raise last_exc
 
 
 def create_ruleset(
@@ -93,11 +213,12 @@ def list_rulesets(
     owner: str,
     repo: str,
 ) -> list[dict]:
-    """List all rulesets for a repository."""
-    resp = httpx.get(
+    """List all rulesets for a repository. Resilient to GitHub's secondary
+    rate limit (the dashboard fan-out burst) via bounded jittered retries."""
+    resp = _get_with_retry(
         f"{_GH_API}/repos/{owner}/{repo}/rulesets",
-        headers=_auth_headers(install_token),
-        timeout=10,
+        install_token=install_token,
+        op="list_rulesets",
     )
     resp.raise_for_status()
     return resp.json()
@@ -156,10 +277,10 @@ def detect_enforcement(
         return "external"
 
     try:
-        legacy_resp = httpx.get(
+        legacy_resp = _get_with_retry(
             f"{_GH_API}/repos/{owner}/{repo}/branches/{quote(branch, safe='')}/protection/required_status_checks",
-            headers=_auth_headers(install_token),
-            timeout=10,
+            install_token=install_token,
+            op="legacy_branch_protection",
         )
         legacy_resp.raise_for_status()
         if _check_name_in_legacy(legacy_resp.json(), check_name):

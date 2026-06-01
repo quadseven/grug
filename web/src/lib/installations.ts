@@ -36,14 +36,33 @@ export function useInstallRepos(installId: number | undefined) {
   });
 }
 
-export type EnforcementState = "grug_managed" | "external" | "none";
+// "unknown" = the server couldn't reach GitHub (rate-limited) even after its
+// own retries and had no stored state to fall back to. Distinct from "none"
+// so the UI never renders a FALSE "not enforced" off a missing answer.
+export type EnforcementState = "grug_managed" | "external" | "none" | "unknown";
+
+// Jittered exponential backoff for the client retry. The dashboard fires one
+// of these per repo in parallel; without jitter their retries re-sync into a
+// fresh burst against the same rate-limited endpoint. Equal jitter spreads
+// them out. Capped so a flaky endpoint doesn't leave a spinner up forever.
+function jitteredBackoff(attempt: number): number {
+  const base = Math.min(400 * 2 ** attempt, 4_000); // 400ms → 800 → 1600 …, cap 4s
+  return base / 2 + Math.random() * (base / 2);
+}
 
 export function useEnforcement(installId: number | undefined, repoId: number | undefined) {
-  return useQuery<{ repo_id: number; enforcement_state: EnforcementState }>({
+  return useQuery<{ repo_id: number; enforcement_state: EnforcementState; degraded?: boolean }>({
     queryKey: ["enforcement", installId, repoId],
     queryFn: () => api(`/api/v1/installations/${installId}/repos/${repoId}/enforcement`),
     enabled: installId != null && repoId != null,
     staleTime: 60_000,
+    // Resilience (dashboard 429 storm): the server now absorbs GitHub rate
+    // limits and returns a 200 degraded fallback, so most calls succeed — but
+    // if the api itself is briefly unavailable, retry a few times with
+    // JITTERED backoff (not React Query's no-jitter default) to avoid the
+    // parallel-retry re-burst.
+    retry: 3,
+    retryDelay: jitteredBackoff,
   });
 }
 

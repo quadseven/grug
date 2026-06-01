@@ -24,11 +24,15 @@ from github_rulesets_client import (
 
 # ── helpers ──────────────────────────────────────────────────────────
 
-def _ok_response(json_body=None, status_code=200):
+def _ok_response(json_body=None, status_code=200, headers=None):
     r = MagicMock(spec=httpx.Response)
     r.status_code = status_code
     r.raise_for_status = MagicMock()
     r.json = MagicMock(return_value=json_body if json_body is not None else {})
+    # Real httpx responses always carry headers; the resilient GET inspects
+    # them (Retry-After / X-RateLimit-Remaining) on rate-limit statuses, so the
+    # mock must too — `spec=httpx.Response` omits `headers` (an instance attr).
+    r.headers = headers or {}
     return r
 
 
@@ -323,6 +327,7 @@ def test_detect_none_when_legacy_403s():
     rulesets_resp = _ok_response([])
     legacy_403 = MagicMock(spec=httpx.Response)
     legacy_403.status_code = 403
+    legacy_403.headers = {}  # permission 403, not rate-limited → no retry
     legacy_403.raise_for_status = MagicMock(
         side_effect=httpx.HTTPStatusError("forbidden", request=MagicMock(), response=legacy_403)
     )
@@ -378,3 +383,86 @@ def test_detect_legacy_non_404_error_propagates(mock_transport_client):
         with pytest.raises(httpx.HTTPStatusError) as exc:
             detect_enforcement("tok", "o", "r", "main", "check")
     assert exc.value.response.status_code == 500
+
+
+# ── resilient GET: retry / jitter / fallback (dashboard 429 storm) ────
+import github_rulesets_client as grc  # noqa: E402 — module handle for internals
+
+
+def _resp(status, *, headers=None, json_body=None):
+    """Real httpx.Response (request attached so raise_for_status works)."""
+    req = httpx.Request("GET", "https://api.github.com/x")
+    return httpx.Response(
+        status, request=req, headers=headers or {},
+        json=json_body if json_body is not None else [],
+    )
+
+
+def test_list_rulesets_retries_on_429_then_succeeds(monkeypatch):
+    monkeypatch.setattr(grc, "_RETRY_SLEEP", lambda s: None)
+    seq = [_resp(429, headers={"retry-after": "1"}), _resp(200, json_body=[{"name": "x"}])]
+    calls = {"n": 0}
+
+    def fake(*a, **kw):
+        r = seq[calls["n"]]
+        calls["n"] += 1
+        return r
+
+    with patch("httpx.get", side_effect=fake):
+        out = list_rulesets("tok", "o", "r")
+    assert out == [{"name": "x"}]
+    assert calls["n"] == 2  # retried once, then succeeded
+
+
+def test_list_rulesets_exhausts_then_raises(monkeypatch):
+    slept = []
+    monkeypatch.setattr(grc, "_RETRY_SLEEP", lambda s: slept.append(s))
+    with patch("httpx.get", return_value=_resp(429)) as mock_get:
+        with pytest.raises(httpx.HTTPStatusError) as exc:
+            list_rulesets("tok", "o", "r")
+    assert exc.value.response.status_code == 429
+    assert mock_get.call_count == grc._GET_RETRY_ATTEMPTS       # all attempts used
+    assert len(slept) == grc._GET_RETRY_ATTEMPTS - 1            # slept between, not after last
+
+
+def test_permission_403_not_retried(monkeypatch):
+    """A bare 403 (permission) is NOT a rate-limit → must not waste retries."""
+    monkeypatch.setattr(grc, "_RETRY_SLEEP", lambda s: None)
+    with patch("httpx.get", return_value=_resp(403)) as mock_get:
+        with pytest.raises(httpx.HTTPStatusError):
+            list_rulesets("tok", "o", "r")
+    assert mock_get.call_count == 1
+
+
+def test_ratelimit_403_is_retried(monkeypatch):
+    """A 403 carrying a rate-limit signal (X-RateLimit-Remaining: 0) IS retried."""
+    monkeypatch.setattr(grc, "_RETRY_SLEEP", lambda s: None)
+    seq = [_resp(403, headers={"x-ratelimit-remaining": "0"}), _resp(200, json_body=[])]
+    calls = {"n": 0}
+
+    def fake(*a, **kw):
+        r = seq[min(calls["n"], 1)]
+        calls["n"] += 1
+        return r
+
+    with patch("httpx.get", side_effect=fake):
+        out = list_rulesets("tok", "o", "r")
+    assert out == []
+    assert calls["n"] == 2
+
+
+def test_transport_error_retried_then_raises(monkeypatch):
+    monkeypatch.setattr(grc, "_RETRY_SLEEP", lambda s: None)
+    with patch("httpx.get", side_effect=httpx.ConnectError("boom")) as mock_get:
+        with pytest.raises(httpx.ConnectError):
+            list_rulesets("tok", "o", "r")
+    assert mock_get.call_count == grc._GET_RETRY_ATTEMPTS
+
+
+def test_retry_delay_bounded_and_caps_retry_after():
+    # No Retry-After header: equal-jittered backoff stays within [0, cap].
+    for attempt in range(4):
+        assert 0 <= grc._retry_delay(attempt, None) <= grc._GET_RETRY_MAX_DELAY
+    # A huge Retry-After is capped — never block a user request that long.
+    big = _resp(429, headers={"retry-after": "600"})
+    assert grc._retry_delay(0, big) <= grc._GET_RETRY_MAX_DELAY

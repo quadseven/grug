@@ -315,7 +315,30 @@ def get_enforcement(
         state = detect_enforcement(token, owner, repo_name, default_branch, GRUG_DOR_CHECK_NAME)
         return {"repo_id": repo_id, "enforcement_state": state}
 
-    return with_install_token_retry(install_id, _detect)
+    try:
+        return with_install_token_retry(install_id, _detect)
+    except (httpx.HTTPStatusError, httpx.RequestError) as e:
+        # Resilient fallback (dashboard 429 storm). GitHub rate-limited the
+        # LIVE detection even after the client's bounded jittered retries.
+        # Rather than 500 — or let the UI render a false "⚠ not enforced" off
+        # a missing answer — degrade to the last-known STORED state: if Grug
+        # has a stored ruleset id it created, report grug_managed; otherwise
+        # we genuinely don't know → "unknown" (the badge shows "checking…",
+        # never a false warning). `degraded` flags it for the client + DD.
+        cfg = get_repo_config(install_id, repo_id)
+        stored_id = cfg.get("enforcement_ruleset_id")
+        fallback_state = "grug_managed" if stored_id is not None else "unknown"
+        log.warning(
+            "enforcement_detect_fallback",
+            extra={
+                "install_id": install_id,
+                "repo_id": repo_id,
+                "kind": type(e).__name__,
+                "status": getattr(getattr(e, "response", None), "status_code", None),
+                "fallback_state": fallback_state,
+            },
+        )
+        return {"repo_id": repo_id, "enforcement_state": fallback_state, "degraded": True}
 
 
 @router.post("/installations/{install_id}/repos/{repo_id}/enforcement")
