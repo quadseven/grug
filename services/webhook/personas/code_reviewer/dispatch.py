@@ -50,7 +50,10 @@ from adapters.install_store import put_comment_record  # type: ignore
 log = logging.getLogger(f"{os.getenv('DD_SERVICE', 'grug')}.persona.code_reviewer")
 
 _CHECK_NAME = "Grug — Code Review"
-_DIFF_FETCH_TIMEOUT = 30
+# 10s (was 30s) — a GitHub diff fetch is fast; the over-generous 30s let a
+# hung fetch eat most of the webhook Lambda budget (#252). Kept well under the
+# 60s budget so diff + the 30s review LLM call + publish fit with margin.
+_DIFF_FETCH_TIMEOUT = 10
 # The dedup comments-fetch is on the SYNCHRONOUS webhook path (15s
 # Lambda budget) and is best-effort: it must not be able to exhaust the
 # budget before its own try/except degrades to post-everything. So it
