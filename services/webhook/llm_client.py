@@ -31,11 +31,12 @@ import re
 import time
 from dataclasses import dataclass, field
 from enum import Enum
-from typing import Any, Callable, Literal, Optional, TypedDict, get_args
+from typing import Any, Callable, Literal, Optional, TypedDict
 
 import httpx
 
 from code_review_prompt import build_system_prompt
+from review_types import SEVERITIES, Severity
 from secrets_loader import get_openrouter_api_key, get_poolside_api_key
 
 log = logging.getLogger(f"{os.getenv('DD_SERVICE', 'grug')}.llm_client")
@@ -205,11 +206,9 @@ class Backend(str, Enum):
     OPENROUTER = "openrouter"
 
 
-Severity = Literal["low", "medium", "high", "critical"]
-# Derived from the Literal so adding a level (e.g. "info") in one place
-# also updates parse-time validation. Without `get_args`, the two lists
-# silently drift.
-_VALID_SEVERITIES: frozenset[str] = frozenset(get_args(Severity))
+# `Severity` + `SEVERITIES` now live in the shared leaf `review_types` (#250)
+# — imported above so this module, persona.py, and code_review_prompt.py all
+# share ONE definition.
 
 
 @dataclass(frozen=True, slots=True)
@@ -428,7 +427,7 @@ def _coerce_finding(raw: Any) -> tuple[Optional[Finding], str]:
         return None, f"missing_field:{e.args[0]}"
     except (TypeError, ValueError) as e:
         return None, f"bad_type:{type(e).__name__}"
-    if severity not in _VALID_SEVERITIES:
+    if severity not in SEVERITIES:
         return None, f"invalid_severity:{severity[:32]}"
     return Finding(
         path=path, line=line, rule=rule, severity=severity, message=message,  # type: ignore[arg-type]
