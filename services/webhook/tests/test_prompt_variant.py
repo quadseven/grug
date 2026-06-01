@@ -54,6 +54,15 @@ def test_both_variants_keep_shared_head_and_tail() -> None:
         assert "instruction" in prompt.lower()   # injection hardening
 
 
+def test_confidence_clauses_cover_exactly_the_variants() -> None:
+    """Pin the one hand-maintained variant-set source: every `PromptVariant`
+    member has a confidence clause and vice-versa. Mirrors the SEVERITIES /
+    Severity pin in test_review_types — locks the import-time assert so a
+    deleted guard or a new arm-without-a-clause fails a test, not just import."""
+    from typing import get_args
+    assert set(crp._CONFIDENCE_CLAUSES) == set(get_args(crp.PromptVariant))
+
+
 def test_unknown_variant_raises() -> None:
     """A typo'd arm must fail loudly at call time, not silently fall back to
     v1 (which would make a misconfigured experiment look like it's running)."""
@@ -97,10 +106,10 @@ def test_split_is_orthogonal_to_backend(monkeypatch) -> None:
     _force_mode(monkeypatch, "split")
     from collections import Counter
     cells: Counter = Counter()
-    for i in range(16):
+    for i in range(64):  # 16 full periods — robust to a later period change
         backend = "even" if i % 2 == 0 else "odd"   # mirrors select_backend
         cells[(backend, lc.select_prompt_variant(i))] += 1
-    assert set(cells.values()) == {4}, cells  # 2x2 grid, 4 each → independent
+    assert set(cells.values()) == {16}, cells  # 2x2 grid, equal cells → independent
 
 
 def test_unknown_mode_falls_back_to_v1(monkeypatch) -> None:

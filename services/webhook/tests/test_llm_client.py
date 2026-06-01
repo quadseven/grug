@@ -571,6 +571,9 @@ def test_review_diff_emits_llmobs_span_on_transport_failure(monkeypatch) -> None
         assert call["metadata"].get("error") == "ReadTimeout"
         # No output content on a transport failure.
         assert call.get("output_data") is None
+        # #191: the A/B arm must ride the ERROR span too, or failure-rate-by-arm
+        # is unattributable in DD (default mode off → v1).
+        assert call["metadata"]["variant_id"] == "v1"
 
 
 def test_review_diff_llmobs_span_handles_missing_usage(monkeypatch) -> None:
@@ -646,6 +649,9 @@ def test_llmobs_config_error_annotates_with_error_config(monkeypatch) -> None:
     monkeypatch.setattr(lc, "_RETRY_SLEEP", lambda s: None)
     monkeypatch.setattr(lc, "_load_poolside_key", lambda: "")
     monkeypatch.setattr(lc, "_load_openrouter_key", lambda: "")
+    # Force the v2 arm so we assert the experiment arm rides the config-error
+    # span too (not just success) — #191 failure-rate-by-arm depends on it.
+    monkeypatch.setattr(lc, "get_prompt_experiment_mode", lambda: "all_v2")
     annotate_calls = _capture_llmobs(monkeypatch)
 
     with patch.object(httpx, "post") as mock_post:
@@ -659,6 +665,8 @@ def test_llmobs_config_error_annotates_with_error_config(monkeypatch) -> None:
         assert call["metadata"].get("error") == "config"
         # output_data absent on config error.
         assert call.get("output_data") is None
+        # #191: arm attribution present on the config-error path.
+        assert call["metadata"]["variant_id"] == "v2"
 
 
 def test_llmobs_metadata_kind_parse_failed_on_200_with_bad_content(monkeypatch) -> None:
