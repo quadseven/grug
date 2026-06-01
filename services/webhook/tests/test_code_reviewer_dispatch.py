@@ -845,11 +845,13 @@ def test_dispatch_fetches_diff_with_diff_accept_header(monkeypatch):
 
 
 def test_no_single_webhook_timeout_reaches_lambda_budget():
-    """#252 AC: per-request httpx timeouts are reconciled with the webhook
-    Lambda budget — no SINGLE synchronous call's timeout reaches it, so one
-    hung upstream can't, by itself, consume the whole budget and kill the
-    handler mid-flight (a 16s review was killed by the old 15s budget). This
-    is the bound this PR makes.
+    """#252 AC: the code-review per-request httpx timeout CONSTANTS are
+    reconciled with the webhook Lambda budget — none reaches it, so one hung
+    upstream on these paths can't, by itself, consume the whole budget and
+    kill the handler mid-flight (a 16s review was killed by the old 15s
+    budget). This is the bound this PR makes. (The post_check_run/post_review
+    clients also carry 10s literals — well under 60s — not tracked as named
+    constants here.)
 
     It deliberately does NOT assert the PATH SUM (diff + review + publish +
     dedup + capture + judge, ×`_RETRY_ATTEMPTS` ×2 backends) fits 60s — it
