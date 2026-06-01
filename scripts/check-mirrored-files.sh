@@ -39,6 +39,7 @@ MIRRORED_WITH_HEADER=(
   "observability.py"
   "personas/code_reviewer/dedup.py"
   "personas/code_reviewer/diff_parser.py"
+  "review_types.py"
   "personas/code_reviewer/dispatch.py"
   "personas/code_reviewer/judge.py"
   "personas/code_reviewer/persona.py"
