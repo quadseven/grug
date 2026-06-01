@@ -29,6 +29,7 @@ class _MonitorBundle:
     webhook_5xx: datadog.Monitor
     api_5xx: datadog.Monitor
     sig_verify_fail: datadog.Monitor
+    elder_offload_fail: datadog.Monitor
     cold_start_p99: datadog.Monitor
     enforcement_gap: datadog.Monitor
     cf_secret_mismatch: datadog.Monitor
@@ -124,6 +125,37 @@ def create_all(
         tags=_common_tags(env, "grug-webhook"),
         notify_no_data=False,
         priority=3,
+        opts=opts,
+    )
+
+    # 3b) Async Elder offload failures (#272). The Elder review runs off
+    #     the ACK path via self-invoke; if the enqueue throttles
+    #     (`elder_enqueue_failed`) or the async worker crashes
+    #     (`elder_job_unhandled`), that review is DROPPED — by design we
+    #     don't sync-fall-back (it would re-block the <10s ACK) and rely on
+    #     the next push re-triggering. That "drop + re-trigger" is only safe
+    #     if the drop is VISIBLE, so alert on any occurrence. (The duplicate-
+    #     skip + claim-fail-open paths are NOT errors and are excluded.)
+    elder_offload_fail = datadog.Monitor(
+        "grug-webhook-elder-offload-fail",
+        type="log alert",
+        name="[grug-webhook] Elder async-offload failures > 0 (15min)",
+        message=(
+            f"{notify_handle}\n"
+            "An Elder code-review was DROPPED off the async path — either the "
+            "self-invoke enqueue failed (Lambda throttle) or the async worker "
+            "hit an unhandled error. The review will not post until the PR is "
+            "pushed again. Check grug-webhook logs for the delivery_id.\n"
+            "Runbook: docs/RUNBOOK.md#elder-async-offload"
+        ),
+        query=(
+            f'logs("service:grug-webhook env:{env} '
+            '(elder_enqueue_failed OR elder_job_unhandled)").index("*")'
+            '.rollup("count").last("15m") > 0'
+        ),
+        tags=_common_tags(env, "grug-webhook"),
+        notify_no_data=False,
+        priority=2,
         opts=opts,
     )
 
@@ -256,6 +288,7 @@ def create_all(
         webhook_5xx=webhook_5xx,
         api_5xx=api_5xx,
         sig_verify_fail=sig_verify_fail,
+        elder_offload_fail=elder_offload_fail,
         cold_start_p99=cold_start_p99,
         enforcement_gap=enforcement_gap,
         cf_secret_mismatch=cf_secret_mismatch,

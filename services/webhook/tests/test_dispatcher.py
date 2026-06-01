@@ -156,20 +156,22 @@ def test_pull_request_dispatches_both_personas_independently():
          patch("dispatcher.get_repo_config", return_value={"code_reviewer_blocking": False}), \
          patch("personas.tpm.persona.evaluate_pull_request") as mock_eval, \
          patch("personas.tpm.persona.publish_tpm_evaluation"), \
-         patch("personas.code_reviewer.dispatch.dispatch_code_review",
-               return_value={"persona": "code_reviewer", "result": "pass"}):
+         patch("async_dispatch.enqueue_elder_review", return_value=True) as mock_enq:
         mock_eval.return_value = type("R", (), {"passed": True})()
         out = dispatch("pull_request", _full_pr_payload())
 
     assert out["status"] == "dispatched"
     assert len(out["personas"]) == 2
     assert out["personas"][0]["persona"] == "tpm"
-    assert out["personas"][1]["persona"] == "code_reviewer"
+    # Elder is now OFFLOADED (#272): the sync path enqueues, not runs.
+    assert out["personas"][1] == {"persona": "code_reviewer", "result": "queued"}
+    mock_enq.assert_called_once()
 
 
-def test_pull_request_tpm_failure_does_not_skip_elder():
+def test_pull_request_tpm_failure_does_not_skip_elder_enqueue():
     """One persona failing must not skip the other — independence is
-    the load-bearing property."""
+    the load-bearing property. With #272, "Elder runs" means "Elder is
+    enqueued": a TPM publish failure must not stop the self-invoke."""
     import httpx
 
     with patch("dispatcher.is_install_allowlisted", return_value=True), \
@@ -178,57 +180,70 @@ def test_pull_request_tpm_failure_does_not_skip_elder():
          patch("personas.tpm.persona.evaluate_pull_request") as mock_eval, \
          patch("personas.tpm.persona.publish_tpm_evaluation",
                side_effect=httpx.ConnectError("dns down")), \
-         patch("personas.code_reviewer.dispatch.dispatch_code_review",
-               return_value={"persona": "code_reviewer", "result": "pass"}) as mock_cr:
+         patch("async_dispatch.enqueue_elder_review", return_value=True) as mock_enq:
         mock_eval.return_value = type("R", (), {"passed": True})()
         out = dispatch("pull_request", _full_pr_payload())
 
     # TPM publish failed → recorded but did not skip the dispatcher.
     assert out["personas"][0] == {"persona": "tpm", "result": "publish_failed"}
-    # Elder still ran.
-    mock_cr.assert_called_once()
-    assert out["personas"][1]["result"] == "pass"
+    # Elder still enqueued.
+    mock_enq.assert_called_once()
+    assert out["personas"][1] == {"persona": "code_reviewer", "result": "queued"}
 
 
-def test_pull_request_tpm_evaluator_exception_does_not_skip_elder():
-    """Codex peer-review concern: `_dispatch_tpm` previously called
-    `evaluate_pull_request` OUTSIDE its try block. An unhandled
-    exception there (TPM evaluator bug or import-time failure) would
-    propagate up `_handle_pull_request` and skip Elder entirely,
-    violating the independence acceptance criterion. The broad final
-    guard in _dispatch_tpm now catches this."""
+def test_pull_request_tpm_evaluator_exception_does_not_skip_elder_enqueue():
+    """An unhandled exception in `evaluate_pull_request` (TPM evaluator
+    bug) must not propagate up `_handle_pull_request` and skip the Elder
+    enqueue. The broad final guard in _dispatch_tpm catches it."""
     with patch("dispatcher.is_install_allowlisted", return_value=True), \
          patch("dispatcher.is_persona_enabled", return_value=True), \
          patch("dispatcher.get_repo_config", return_value={"code_reviewer_blocking": False}), \
          patch("personas.tpm.persona.evaluate_pull_request",
                side_effect=RuntimeError("evaluator regression")), \
-         patch("personas.code_reviewer.dispatch.dispatch_code_review",
-               return_value={"persona": "code_reviewer", "result": "pass"}) as mock_cr:
+         patch("async_dispatch.enqueue_elder_review", return_value=True) as mock_enq:
         out = dispatch("pull_request", _full_pr_payload())
 
-    # TPM unhandled — but Elder still ran.
+    # TPM unhandled — but Elder still enqueued.
     assert out["personas"][0] == {"persona": "tpm", "result": "unhandled_error"}
-    mock_cr.assert_called_once()
-    assert out["personas"][1]["result"] == "pass"
+    mock_enq.assert_called_once()
+    assert out["personas"][1] == {"persona": "code_reviewer", "result": "queued"}
 
 
-def test_pull_request_elder_unhandled_exception_does_not_skip_tpm_status():
-    """Inverse: Elder raising an unhandled exception must not corrupt
-    the TPM result. Elder's status becomes `unhandled_error`."""
+def test_pull_request_elder_enqueue_failure_does_not_skip_tpm_status():
+    """Inverse: a failed Elder ENQUEUE (rare Lambda throttle) must not
+    corrupt the TPM result. Elder's status becomes `enqueue_failed`; the
+    sync path does NOT fall back to a synchronous Elder run (that would
+    re-block the <10s ACK guarantee, #272)."""
     with patch("dispatcher.is_install_allowlisted", return_value=True), \
          patch("dispatcher.is_persona_enabled", return_value=True), \
          patch("dispatcher.get_repo_config", return_value={"code_reviewer_blocking": False}), \
          patch("personas.tpm.persona.evaluate_pull_request") as mock_eval, \
          patch("personas.tpm.persona.publish_tpm_evaluation"), \
-         patch("personas.code_reviewer.dispatch.dispatch_code_review",
-               side_effect=RuntimeError("unexpected")):
+         patch("async_dispatch.enqueue_elder_review", return_value=False):
         mock_eval.return_value = type("R", (), {"passed": True})()
         out = dispatch("pull_request", _full_pr_payload())
 
     assert out["personas"][0]["result"] == "pass"  # TPM unaffected
     assert out["personas"][1] == {
-        "persona": "code_reviewer", "result": "unhandled_error",
+        "persona": "code_reviewer", "result": "enqueue_failed",
     }
+
+
+def test_pull_request_threads_delivery_id_to_enqueue():
+    """The X-GitHub-Delivery id must reach the enqueue so the async
+    worker can key its idempotency claim on it (#272)."""
+    with patch("dispatcher.is_install_allowlisted", return_value=True), \
+         patch("dispatcher.is_persona_enabled", return_value=True), \
+         patch("dispatcher.get_repo_config", return_value={"code_reviewer_blocking": True}), \
+         patch("personas.tpm.persona.evaluate_pull_request") as mock_eval, \
+         patch("personas.tpm.persona.publish_tpm_evaluation"), \
+         patch("async_dispatch.enqueue_elder_review", return_value=True) as mock_enq:
+        mock_eval.return_value = type("R", (), {"passed": True})()
+        dispatch("pull_request", _full_pr_payload(), delivery_id="deliv-abc")
+
+    _, kwargs = mock_enq.call_args
+    assert kwargs["delivery_id"] == "deliv-abc"
+    assert kwargs["blocking"] is True  # plumbed from code_reviewer_blocking
 
 
 def test_pull_request_missing_repo_id_skips_elder_but_runs_tpm():
@@ -245,13 +260,13 @@ def test_pull_request_missing_repo_id_skips_elder_but_runs_tpm():
          patch("dispatcher.is_persona_enabled", return_value=True), \
          patch("personas.tpm.persona.evaluate_pull_request") as mock_eval, \
          patch("personas.tpm.persona.publish_tpm_evaluation"), \
-         patch("personas.code_reviewer.dispatch.dispatch_code_review") as mock_cr:
+         patch("async_dispatch.enqueue_elder_review") as mock_enq:
         mock_eval.return_value = type("R", (), {"passed": True})()
         out = dispatch("pull_request", payload)
 
     assert len(out["personas"]) == 1
     assert out["personas"][0]["persona"] == "tpm"
-    mock_cr.assert_not_called()
+    mock_enq.assert_not_called()
 
 
 def test_pull_request_code_reviewer_disabled_skips_only_elder():
@@ -264,13 +279,13 @@ def test_pull_request_code_reviewer_disabled_skips_only_elder():
          patch("dispatcher.is_persona_enabled", side_effect=_only_tpm_enabled), \
          patch("personas.tpm.persona.evaluate_pull_request") as mock_eval, \
          patch("personas.tpm.persona.publish_tpm_evaluation"), \
-         patch("personas.code_reviewer.dispatch.dispatch_code_review") as mock_cr:
+         patch("async_dispatch.enqueue_elder_review") as mock_enq:
         mock_eval.return_value = type("R", (), {"passed": True})()
         out = dispatch("pull_request", _full_pr_payload())
 
     assert len(out["personas"]) == 1
     assert out["personas"][0]["persona"] == "tpm"
-    mock_cr.assert_not_called()
+    mock_enq.assert_not_called()
 
 
 def test_installation_created_records_row():

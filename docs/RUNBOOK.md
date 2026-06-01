@@ -242,11 +242,26 @@ Override per-recovery: `GRUG_ADMIN_USER_ID=123 make rebuild`
 
 ### Sync-vs-async route handlers
 
-Webhook handler `receive_github_webhook` is **sync `def`**, NOT `async def`.
+Webhook handler `receive_github_webhook` is **`async def`** (it `await
+request.body()` so HMAC verifies the raw wire bytes — a sync `def` with
+`Body(...)` lets Pydantic JSON-decode before bytes-validation and 422 before
+HMAC runs; see the comment in `main.py`). Its downstream calls — boto3
+DynamoDB, sync httpx GitHub posts, sync KMS, and the #272
+`lambda.invoke` self-invoke — are all **sync I/O running directly on the
+event loop** (an `async def` handler does NOT get Starlette's
+`run_in_threadpool` offload; only sync `def` handlers do).
 
-**Why**: every downstream call is sync I/O (boto3 DynamoDB, sync httpx GitHub posts, sync KMS via `crypto.kms_envelope`). An `async def` handler would block the event loop on each ~30-500ms call. FastAPI runs sync `def` handlers in a threadpool via Starlette's `run_in_threadpool`, so concurrent invocations don't starve each other.
+**Why that's safe today**: AWS Lambda runs ONE invocation per warm
+container, so while the handler runs there are no peer request-coroutines to
+starve — the sync calls block a loop that has nothing else to do. This is an
+invariant of the execution model, NOT a threadpool guarantee.
 
-**Re-evaluate when**: we add genuine concurrent-fan-out (e.g. parallel GitHub calls for multi-repo PR scans via `asyncio.gather`). At that point migrate the relevant section to `httpx.AsyncClient` + `aioboto3` and switch the handler back to `async def`. Closes #68.
+**Re-evaluate when**: anything introduces concurrent coroutines on that loop
+— `asyncio.gather` fan-out (e.g. parallel multi-repo GitHub calls), a
+streaming response, or a background task. At that point wrap the sync calls
+in `await asyncio.to_thread(...)` (the pattern `cf_auth.py`'s middleware
+already uses for its sync `ssm.get_parameter`), or migrate to
+`httpx.AsyncClient` + `aioboto3`. Closes #68.
 
 ### Mirrored files between services/api/ + services/webhook/
 
@@ -329,6 +344,30 @@ this verification to confirm the full pipeline works on a real PR.
 - **Webhook 500s entirely** → query Sentry for `tpm_dispatch_unhandled`
   or `code_review_dispatch_unhandled`. Both are last-resort guards
   that should be empty in steady-state.
+
+### Elder async offload
+
+<a id="elder-async-offload"></a>
+Since #272 the Elder LLM review runs **off** the webhook ACK path: the
+sync handler ACKs GitHub (<10s) and self-invokes the `grug-webhook`
+Lambda asynchronously (`InvocationType="Event"`) to run the review. The
+async worker (`async_dispatch.run_elder_job`) is idempotent on the
+`X-GitHub-Delivery` id (a `DELIVERY#<id>` DDB row, 24h TTL).
+
+- **Monitor `[grug-webhook] Elder async-offload failures`** fires on
+  `elder_enqueue_failed` (the self-invoke `lambda.invoke` threw — usually
+  a Lambda throttle) or `elder_job_unhandled` (the async worker crashed).
+  Both mean **that review was dropped** — by design we do NOT sync-fall-
+  back (it would re-block the ACK). Recovery: the review re-posts when the
+  PR is pushed again, or trigger it manually by closing+reopening the PR
+  (re-fires `pull_request`). Grab the `delivery_id` from the log line to
+  trace the specific delivery.
+- **Review never appears, no failure log** → check for
+  `elder_job_duplicate_skipped` (a GitHub redelivery / AWS retry was
+  correctly deduped — the FIRST delivery already ran it) and confirm the
+  original ran via `elder_job_done`.
+- AWS async retries are disabled (`maximum_retry_attempts=0`) — the worker
+  owns idempotency + degrade, so AWS retries would only risk a storm.
 
 ### Rollback
 

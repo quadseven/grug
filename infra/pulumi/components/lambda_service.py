@@ -44,6 +44,7 @@ def create(
     cors_allow_credentials: bool = False,
     env_vars_kms_key_arn: pulumi.Input[str] | None = None,
     iam_propagation_wait: pulumi.Resource | None = None,
+    allow_self_invoke: bool = False,
 ) -> LambdaService:
     log_group = aws.cloudwatch.LogGroup(
         f"{name}-logs",
@@ -137,6 +138,36 @@ def create(
         ),
     )
 
+    # Self-invoke grant (#272): the webhook offloads the Elder LLM review
+    # off the ACK path by invoking ITSELF asynchronously
+    # (InvocationType="Event"). The execution role therefore needs
+    # `lambda:InvokeFunction` on its own ARN. We construct the ARN from
+    # the function NAME (== `name`, set below) + account + region rather
+    # than referencing the Function resource, which would be a circular
+    # dependency (role → policy → function → role). The runtime targets
+    # the same name via the auto-set `AWS_LAMBDA_FUNCTION_NAME` env.
+    self_invoke_policy: aws.iam.RolePolicy | None = None
+    if allow_self_invoke:
+        _ident = aws.get_caller_identity()
+        _region = aws.get_region()
+        _self_arn = f"arn:aws:lambda:{_region.name}:{_ident.account_id}:function:{name}"
+        self_invoke_policy = aws.iam.RolePolicy(
+            f"{name}-self-invoke-policy",
+            role=role.id,
+            policy=json.dumps(
+                {
+                    "Version": "2012-10-17",
+                    "Statement": [
+                        {
+                            "Effect": "Allow",
+                            "Action": "lambda:InvokeFunction",
+                            "Resource": _self_arn,
+                        },
+                    ],
+                },
+            ),
+        )
+
     # Lambda Image-mode requires the source image live in a PRIVATE ECR
     # repo (rejects public.ecr.aws/* URIs). For first-ever deploy we
     # `crane copy public.ecr.aws/lambda/python:3.13-arm64 →
@@ -160,9 +191,17 @@ def create(
     # AWS IAM (10-30s typical). Without this, an in-same-plan addition
     # of `kms:Encrypt` + `kms:GenerateDataKey` to the deploy role +
     # Lambda kms_key_arn-touching update collides on AWS auth-check.
+    # Gate the Function create/update behind both the IAM-propagation wait
+    # (#88) AND the self-invoke RolePolicy (#272) — so new image code is never
+    # live before the lambda:InvokeFunction-on-self grant lands (else the
+    # first self-invokes AccessDeny → dropped reviews until the policy
+    # propagates). codex peer-review WARN-4.
+    _function_deps = [
+        d for d in (iam_propagation_wait, self_invoke_policy) if d is not None
+    ]
     function_opts = (
-        pulumi.ResourceOptions(depends_on=[iam_propagation_wait])
-        if iam_propagation_wait is not None
+        pulumi.ResourceOptions(depends_on=_function_deps)
+        if _function_deps
         else None
     )
     function = aws.lambda_.Function(
@@ -219,6 +258,22 @@ def create(
             max_age=86400,
         ),
     )
+
+    # Disable AWS's default async-invoke retries when this function
+    # self-invokes (#272). The Elder worker already has its own
+    # idempotency (delivery_id claim) + advisory-degrade contract, so an
+    # AWS retry of a deterministically-failing async invocation adds no
+    # value and risks a retry-storm. `EventInvokeConfig` governs ALL async
+    # invocations of the function — safe here because the webhook's only
+    # async invocations ARE these self-invokes (GitHub traffic is sync via
+    # the Function URL). Belt-and-suspenders alongside `run_elder_job`'s
+    # never-reraise guard.
+    if allow_self_invoke:
+        aws.lambda_.FunctionEventInvokeConfig(
+            f"{name}-async-no-retry",
+            function_name=function.name,
+            maximum_retry_attempts=0,
+        )
 
     return LambdaService(
         function=function,
