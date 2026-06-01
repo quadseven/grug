@@ -1,6 +1,38 @@
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import { api } from "./api";
 
+// Client-side concurrency gate. The dashboard mounts one useEnforcement per
+// repo and React Query fires them ALL at once; 14 parallel calls each
+// cold-start the grug-api Lambda (~2.8s/slot) and blow past its concurrency →
+// AWS throttles the overflow with 429 (verified: aws.lambda Throttles metric),
+// which the UI then had to paper over. Capping the in-flight enforcement
+// fetches PREVENTS the burst instead of retrying after it — the "slowdown"
+// that fixes the storm at the source. A tiny promise-pool, no dependency.
+function createLimiter(max: number) {
+  let active = 0;
+  const queue: Array<() => void> = [];
+  const next = () => {
+    if (active >= max || queue.length === 0) return;
+    active++;
+    queue.shift()!();
+  };
+  return function run<T>(task: () => Promise<T>): Promise<T> {
+    return new Promise<T>((resolve, reject) => {
+      queue.push(() => {
+        task().then(resolve, reject).finally(() => {
+          active--;
+          next();
+        });
+      });
+      next();
+    });
+  };
+}
+
+// 5 keeps the dashboard responsive while staying under the api's effective
+// concurrency (≈9 succeeded before throttling in the observed burst).
+const enforcementGate = createLimiter(5);
+
 export interface Installation {
   install_id: number;
   account_login: string;
@@ -53,7 +85,10 @@ function jitteredBackoff(attempt: number): number {
 export function useEnforcement(installId: number | undefined, repoId: number | undefined) {
   return useQuery<{ repo_id: number; enforcement_state: EnforcementState; degraded?: boolean }>({
     queryKey: ["enforcement", installId, repoId],
-    queryFn: () => api(`/api/v1/installations/${installId}/repos/${repoId}/enforcement`),
+    queryFn: () =>
+      enforcementGate(() =>
+        api(`/api/v1/installations/${installId}/repos/${repoId}/enforcement`),
+      ),
     enabled: installId != null && repoId != null,
     staleTime: 60_000,
     // Resilience (dashboard 429 storm): the server now absorbs GitHub rate
