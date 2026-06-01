@@ -50,16 +50,19 @@ from adapters.install_store import put_comment_record  # type: ignore
 log = logging.getLogger(f"{os.getenv('DD_SERVICE', 'grug')}.persona.code_reviewer")
 
 _CHECK_NAME = "Grug — Code Review"
-_DIFF_FETCH_TIMEOUT = 30
-# The dedup comments-fetch is on the SYNCHRONOUS webhook path (15s
-# Lambda budget) and is best-effort: it must not be able to exhaust the
+# 10s (was 30s) — a GitHub diff fetch is fast; the over-generous 30s let a
+# hung fetch alone eat most of the webhook Lambda budget (#252). Well under
+# the 60s budget. NOTE: the FULL synchronous path (diff + review LLM + publish
+# + dedup + capture + judge, ×retries ×2 backends) is NOT bounded by 60s — a
+# hung backend can blow it; the real fix is async offload (#272).
+_DIFF_FETCH_TIMEOUT = 10
+# The dedup comments-fetch is on the SYNCHRONOUS webhook path (now a 60s
+# Lambda budget, #252) and is best-effort: it must not be able to exhaust the
 # budget before its own try/except degrades to post-everything. So it
 # gets a tight per-request timeout + a low page cap — distinct from the
-# 30s diff fetch. 3 pages × 100 = 300 comments covers virtually every
+# 10s diff fetch. 3 pages × 100 = 300 comments covers virtually every
 # PR; beyond that, dedup degrades to partial (a few duplicate comments —
 # the safe direction) rather than risking a hard handler timeout.
-# (The broader "30s httpx timeouts vs 15s Lambda" mismatch on the diff
-# fetch + LLM call predates this slice — tracked separately.)
 _COMMENT_FETCH_TIMEOUT = 4
 _MAX_COMMENT_PAGES = 3
 
