@@ -22,7 +22,7 @@ from __future__ import annotations
 
 import re
 from dataclasses import dataclass
-from typing import Literal
+from typing import Literal, get_args
 
 from review_types import SEVERITIES, Severity  # shared leaf — no cycle (#250)
 
@@ -302,7 +302,13 @@ _CONFIDENCE_V2 = (
     "plausibly defective and you can name the rule — the downstream judge "
     "and developer reactions filter out false positives. "
 )
-_CONFIDENCE_CLAUSES: dict[str, str] = {"v1": _CONFIDENCE_V1, "v2": _CONFIDENCE_V2}
+_CONFIDENCE_CLAUSES: dict[PromptVariant, str] = {"v1": _CONFIDENCE_V1, "v2": _CONFIDENCE_V2}
+# Fail at import if a variant gains a `PromptVariant` member without a clause
+# (or vice-versa) — the clause map is the one variant-set source that can't be
+# derived (each member maps to distinct text), so pin it to the Literal here.
+assert set(_CONFIDENCE_CLAUSES) == set(get_args(PromptVariant)), (
+    "_CONFIDENCE_CLAUSES keys drifted from PromptVariant members"
+)
 
 _PREAMBLE_TAIL = (
     "Report each line under AT MOST ONE rule (pick the most specific). "
