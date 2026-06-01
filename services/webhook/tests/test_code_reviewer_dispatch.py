@@ -249,8 +249,8 @@ def test_fetch_pr_review_comments_non_list_body_breaks(monkeypatch, caplog):
 
 
 def test_fetch_pr_review_comments_uses_short_timeout(monkeypatch):
-    """The dedup fetch is on the synchronous 15s webhook path and is
-    best-effort — it must use a tight timeout (not the 30s diff
+    """The dedup fetch is on the synchronous webhook path (60s budget, #252)
+    and is best-effort — it must use a tight timeout (not the 10s diff
     timeout) so it can't exhaust the Lambda budget before degrading."""
     captured = {}
 
@@ -844,28 +844,22 @@ def test_dispatch_fetches_diff_with_diff_accept_header(monkeypatch):
     assert captured[0]["timeout"] == cr_dispatch._DIFF_FETCH_TIMEOUT
 
 
-def test_single_attempt_critical_path_fits_webhook_lambda_budget():
-    """#252: the REALISTIC pre-publish critical path — diff fetch + ONE review
-    LLM attempt — fits the webhook Lambda's 60s budget with headroom for the
-    publish calls, so a normal (fast-responding) review posts before the
-    handler is killed. The 60s bump fixes the common case (a 16s review was
-    killed by the old 15s budget).
+def test_no_single_webhook_timeout_reaches_lambda_budget():
+    """#252 AC: per-request httpx timeouts are reconciled with the webhook
+    Lambda budget — no SINGLE synchronous call's timeout reaches it, so one
+    hung upstream can't, by itself, consume the whole budget and kill the
+    handler mid-flight (a 16s review was killed by the old 15s budget). This
+    is the bound this PR makes.
 
-    NOT bounded here (deliberately): the retry-storm worst case — review_diff
-    retries `_RETRY_ATTEMPTS` per backend across 2 backends, so a HUNG backend
-    can run ~`_RETRY_ATTEMPTS * _TIMEOUT_SECONDS * 2` (~180s) and still exceed
-    60s before publish. No sane sync budget bounds that; the fix is to move the
-    LLM call off the ACK path (async offload, #272). This test asserts the
-    guarantee we DO make, not a false one."""
+    It deliberately does NOT assert the PATH SUM (diff + review + publish +
+    dedup + capture + judge, ×`_RETRY_ATTEMPTS` ×2 backends) fits 60s — it
+    does NOT under a slow/hung backend (~180s), and no sane synchronous budget
+    bounds that. The only real fix is moving the LLM call off the ACK path
+    (async offload, #272). Asserting a path-sum bound here would be false."""
     import llm_client
     _WEBHOOK_LAMBDA_BUDGET = 60  # keep in sync w/ infra/pulumi/__main__ webhook
-    _PUBLISH_HEADROOM = 15       # check-run + review POSTs (timeout=10 each)
-    single_attempt_critical = (
-        cr_dispatch._DIFF_FETCH_TIMEOUT + llm_client._TIMEOUT_SECONDS
-    )
-    assert single_attempt_critical + _PUBLISH_HEADROOM <= _WEBHOOK_LAMBDA_BUDGET
-    # And no single per-request timeout alone reaches the budget.
     assert cr_dispatch._DIFF_FETCH_TIMEOUT < _WEBHOOK_LAMBDA_BUDGET
+    assert cr_dispatch._COMMENT_FETCH_TIMEOUT < _WEBHOOK_LAMBDA_BUDGET
     assert llm_client._TIMEOUT_SECONDS < _WEBHOOK_LAMBDA_BUDGET
 
 
