@@ -136,6 +136,11 @@ function RepoPanel({ installId }: { installId: number | null }) {
             onFix={() => fixEnforcement.mutate(r.repo_id)}
             pending={setConfig.isPending && setConfig.variables?.repo_id === r.repo_id}
             fixPending={fixEnforcement.isPending && fixEnforcement.variables === r.repo_id}
+            fixError={
+              fixEnforcement.isError && fixEnforcement.variables === r.repo_id
+                ? ((fixEnforcement.error as Error)?.message ?? "fix failed")
+                : undefined
+            }
           />
         ))}
       </div>
@@ -144,7 +149,7 @@ function RepoPanel({ installId }: { installId: number | null }) {
 }
 
 function RepoRow({
-  repo, installId, onToggle, onFix, pending, fixPending,
+  repo, installId, onToggle, onFix, pending, fixPending, fixError,
 }: {
   repo: Repo;
   installId: number;
@@ -152,6 +157,7 @@ function RepoRow({
   onFix: () => void;
   pending: boolean;
   fixPending: boolean;
+  fixError?: string;
 }) {
   const enforcement = useEnforcement(
     repo.config.tpm_enabled ? installId : undefined,
@@ -187,6 +193,14 @@ function RepoRow({
         )}
         {fixPending && (
           <span className="text-xs font-mono text-stone-500">fixing…</span>
+        )}
+        {fixError && !fixPending && (
+          <span
+            className="text-xs font-mono text-red-400 max-w-[14rem] truncate"
+            title={fixError}
+          >
+            ⚠ fix failed
+          </span>
         )}
         <label className="flex items-center gap-2 text-xs font-mono text-stone-400 select-none cursor-pointer">
           <input
