@@ -23,17 +23,12 @@ from __future__ import annotations
 import re
 from dataclasses import dataclass
 
+from review_types import SEVERITIES, Severity  # shared leaf — no cycle (#250)
+
 # Rule-name charset — must equal the dedup marker's capture class
 # (dedup._MARKER_RE) so a name round-trips through the comment marker
 # without the finding-side and prior-side dedup keys diverging.
 _RULE_NAME_RE = re.compile(r"[A-Za-z0-9_-]+")
-
-# Local severity set — NOT imported from llm_client (that would cycle:
-# llm_client imports this module). A drift-guard test asserts this
-# equals llm_client's `_VALID_SEVERITIES`. (The proper fix — one
-# `Severity` Literal in a shared leaf module that both import — is
-# tracked separately; it spans persona.py + llm_client + both mirrors.)
-_SEVERITIES: frozenset[str] = frozenset(("low", "medium", "high", "critical"))
 
 # Closed taxonomy of bug classes (display labels rendered into the
 # prompt). Closed so a typo'd class fails at import rather than shipping
@@ -64,7 +59,7 @@ class ReviewRule:
     description: str
     bad_example: str
     good_example: str
-    severity: str
+    severity: Severity
 
     def __post_init__(self) -> None:
         # `[A-Za-z0-9_-]+` (not merely space-free): the name becomes the
@@ -78,10 +73,10 @@ class ReviewRule:
                 f"ReviewRule.name must match [A-Za-z0-9_-]+ (it becomes the "
                 f"`rule` field + dedup marker): {self.name!r}"
             )
-        if self.severity not in _SEVERITIES:
+        if self.severity not in SEVERITIES:
             raise ValueError(
                 f"ReviewRule[{self.name}].severity {self.severity!r} not in "
-                f"{sorted(_SEVERITIES)} — would instruct a severity the "
+                f"{sorted(SEVERITIES)} — would instruct a severity the "
                 "parser drops"
             )
         if self.bug_class not in _BUG_CLASSES:

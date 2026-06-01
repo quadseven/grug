@@ -24,13 +24,12 @@ publisher (next slice) has a stable place to read the fix hint.
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Literal, get_args
+from typing import get_args
 
 from github_checks_client import CheckConclusion
 from llm_client import LlmReviewResponse
 from personas.code_reviewer.diff_parser import DiffHunk
-
-Severity = Literal["low", "medium", "high", "critical"]
+from review_types import Severity  # single source (#250)
 
 # A finding at one of these severities flips the aggregate verdict.
 # Medium + low remain advisory: reported in the check-run summary but

@@ -7,9 +7,7 @@ from __future__ import annotations
 import pytest
 
 import code_review_prompt as crp
-
-
-_VALID_SEVERITIES = {"low", "medium", "high", "critical"}
+from review_types import SEVERITIES  # single source (#250)
 
 
 def test_at_least_15_rules():
@@ -31,7 +29,7 @@ def test_every_rule_is_well_formed():
         assert r.description and len(r.description) > 10, f"thin description: {r.name}"
         assert r.bad_example and r.bad_example.strip(), f"no bad example: {r.name}"
         assert r.good_example and r.good_example.strip(), f"no good example: {r.name}"
-        assert r.severity in _VALID_SEVERITIES, f"bad severity: {r.name}={r.severity}"
+        assert r.severity in SEVERITIES, f"bad severity: {r.name}={r.severity}"
 
 
 def test_rule_is_frozen():
@@ -56,7 +54,7 @@ def test_build_system_prompt_carries_finding_json_contract():
     for token in ("findings", "path", "line", "rule", "severity", "message"):
         assert token in prompt, f"prompt missing Finding field: {token}"
     # All four severities documented so the LLM knows the enum.
-    for sev in _VALID_SEVERITIES:
+    for sev in SEVERITIES:
         assert sev in prompt
 
 
@@ -148,14 +146,6 @@ def test_preamble_biases_toward_precision_and_hardens_injection():
     assert "at most one rule" in p                         # dedup
     assert "instructions" in p and "data" in p             # injection hardening
 
-
-def test_severity_set_matches_llm_client_no_drift():
-    """The prompt's local `_SEVERITIES` must equal llm_client's parser
-    set — a rule advertising a severity the parser would drop is a
-    silent calibration bug. (The two are separate today to avoid an
-    import cycle; this test is the guard until they share a leaf module.)"""
-    import llm_client
-    assert crp._SEVERITIES == llm_client._VALID_SEVERITIES
 
 
 def test_covers_core_audit_bug_classes():
