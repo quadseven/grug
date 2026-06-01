@@ -73,10 +73,18 @@ async def receive_github_webhook(
     # on the parsed dict not being bytes — so HMAC verify never runs.
     # Using `Request` keeps the wire bytes intact for HMAC verify.
     #
-    # Lambda concurrency is per-container (one in-flight request per
-    # warm container). Sync boto3 / httpx calls below don't starve
-    # other coroutines because there are none. Closes #68 (the
-    # original spirit) and the pre-Slice-11 422 regression.
+    # This is `async def`, so the sync boto3 / httpx calls below (and the
+    # #272 `lambda.invoke` self-invoke in dispatch) run directly on the
+    # event loop — async handlers do NOT get Starlette's run_in_threadpool
+    # offload. That's safe ONLY because AWS Lambda runs one invocation per
+    # warm container: while this handler runs there are no peer request-
+    # coroutines to starve. It is an invariant of the execution model, not
+    # a guarantee — if anything ever adds concurrent coroutines to this loop
+    # (asyncio.gather fan-out, a streaming response, a background task), wrap
+    # the sync calls in `await asyncio.to_thread(...)` (as cf_auth.py's
+    # middleware already does for its sync ssm.get_parameter). See
+    # docs/RUNBOOK.md#sync-vs-async-route-handlers. Closes #68 (spirit) + the
+    # pre-Slice-11 422 regression.
     body = await request.body()
 
     secret = get_webhook_secret()
