@@ -27,8 +27,16 @@ from adapters.install_store import (
 log = logging.getLogger("grug.webhook.dispatcher")
 
 
-def dispatch(event_name: str, payload: dict[str, Any]) -> dict[str, str]:
-    """Route a webhook event to its persona handlers. Returns audit dict."""
+def dispatch(
+    event_name: str, payload: dict[str, Any], *, delivery_id: str = "",
+) -> dict[str, str]:
+    """Route a webhook event to its persona handlers. Returns audit dict.
+
+    `delivery_id` is the GitHub `X-GitHub-Delivery` UUID; it is threaded
+    to the pull_request handler so the async Elder offload (#272) can key
+    its idempotency claim on it. Defaults to "" for non-PR events (which
+    don't enqueue async work) and for older call sites/tests.
+    """
     if event_name == "installation":
         return _handle_installation(payload)
     if event_name == "installation_repositories":
@@ -36,7 +44,7 @@ def dispatch(event_name: str, payload: dict[str, Any]) -> dict[str, str]:
         # exists; per-repo config lives in services/api/installations.py.
         return {"status": "no_op", "reason": "installation_repositories acknowledged"}
     if event_name == "pull_request":
-        return _handle_pull_request(payload)
+        return _handle_pull_request(payload, delivery_id=delivery_id)
     if event_name == "pull_request_review":
         return {"status": "no_op", "reason": "no persona for pull_request_review yet"}
     if event_name == "issue_comment":
@@ -204,7 +212,7 @@ def _enforce_on_repos(install_id: int, repositories: list[dict]) -> None:
 
 
 def _handle_pull_request(
-    payload: dict[str, Any],
+    payload: dict[str, Any], *, delivery_id: str = "",
 ) -> dict[str, Any]:
     """Returns either a short {status, reason} dict (allowlist or
     payload skip) OR an aggregated {status, personas: [...]} dict
@@ -253,10 +261,11 @@ def _handle_pull_request(
         )
         return {"status": "no_op", "reason": "installer not allowlisted"}
 
-    # Lazy import — keeps cold-start cheap when only non-PR events fire
-    import httpx  # type: ignore
-    from adapters.install_store import get_repo_config  # type: ignore
-
+    # `get_repo_config` is already imported at module scope (top of file);
+    # the former function-local re-import here shadowed it, silently
+    # defeating `patch("dispatcher.get_repo_config")` in tests — removed
+    # (#272). `httpx` is no longer used in this handler now that the Elder
+    # branch enqueues instead of running inline (TPM imports its own).
     repo_id = repo.get("id")
 
     # Both TPM and Elder dispatch from this handler on the same event,
@@ -296,13 +305,34 @@ def _handle_pull_request(
         # `code_reviewer_blocking` defaults False; operator flips via
         # dashboard once LLM-finding trust is established. Advisory-
         # first prevents false-positives from blocking velocity.
+        #
+        # Elder makes 1–2 LLM calls (worst case ~300s) — far over
+        # GitHub's ~10s delivery timeout — so it is OFFLOADED off the
+        # ACK path (#272): self-invoke the Lambda async and return
+        # `queued` immediately. TPM (fast, no LLM) already ran inline
+        # above. Idempotency keys on `delivery_id` inside the worker.
+        # Enqueue failure does NOT fall back to a sync run — that would
+        # re-block the ACK; a dropped review re-triggers on next push.
         cfg = get_repo_config(int(installation_id), int(repo_id))
-        results.append(_dispatch_code_reviewer(
+        from async_dispatch import enqueue_elder_review  # lazy: keeps boto3 lambda client off non-PR cold starts
+        enqueued = enqueue_elder_review(
             payload=payload,
-            installation_id=int(installation_id),
-            owner=owner, repo_name=repo_name, pr_number=int(pr_number),
+            delivery_id=delivery_id,
             blocking=bool(cfg.get("code_reviewer_blocking", False)),
-        ))
+        )
+        if not enqueued:
+            log.error(
+                "elder_enqueue_failed",
+                extra={
+                    "installation_id": installation_id,
+                    "owner": owner, "repo": repo_name, "pr_number": pr_number,
+                    "delivery_id": delivery_id,
+                },
+            )
+        results.append({
+            "persona": "code_reviewer",
+            "result": "queued" if enqueued else "enqueue_failed",
+        })
     else:
         # Either explicitly disabled per-repo OR `repo_id is None`
         # (rare payload-shape glitch). Both produce a `disabled_skip`
@@ -370,8 +400,9 @@ def _dispatch_tpm(
         )
         return {"persona": "tpm", "result": "publish_failed"}
     except Exception as e:  # noqa: BLE001 — final guard
-        # Broad catch mirrors _dispatch_code_reviewer's final-guard
-        # pattern. Without it, an unexpected exception in
+        # Broad catch mirrors the async Elder worker's final-guard
+        # pattern (async_dispatch.run_elder_job). Without it, an
+        # unexpected exception in
         # evaluate_pull_request (or its import) would propagate up and
         # skip Elder entirely, violating the independence criterion.
         # exc_info=True carries the traceback to DD/Sentry.
@@ -387,38 +418,12 @@ def _dispatch_tpm(
         return {"persona": "tpm", "result": "unhandled_error"}
 
 
-def _dispatch_code_reviewer(
-    *, payload: dict[str, Any], installation_id: int, owner: str,
-    repo_name: str, pr_number: int, blocking: bool,
-) -> dict[str, str]:
-    """Elder persona dispatch — fetch+parse+LLM+evaluate+publish.
-
-    Catches every exception locally and degrades to a "skipped" result
-    rather than propagating. Advisory-first contract is enforced
-    inside `dispatch_code_review`; this wrapper exists to keep TPM and
-    Elder dispatches symmetric in `_handle_pull_request`.
-    """
-    from personas.code_reviewer.dispatch import (  # type: ignore
-        dispatch_code_review,
-    )
-    # Final guard MUST be broad — TPM has already dispatched by the
-    # time this runs, and propagating an Elder exception would 500
-    # the webhook with no way to surface TPM's result. The
-    # `exc_info=True` log carries the full traceback to DD/Sentry, so
-    # unknown exception types are not buried, just not propagated.
-    try:
-        return dispatch_code_review(payload, blocking=blocking)
-    except Exception as e:  # noqa: BLE001 — explicit final guard
-        log.error(
-            "code_review_dispatch_unhandled",
-            extra={
-                "installation_id": installation_id,
-                "owner": owner, "repo": repo_name, "pr_number": pr_number,
-                "kind": type(e).__name__,
-            },
-            exc_info=True,
-        )
-        return {"persona": "code_reviewer", "result": "unhandled_error"}
+# NOTE (#272): the former `_dispatch_code_reviewer` wrapper was removed —
+# Elder no longer runs synchronously in this handler. The Elder review is
+# enqueued via `async_dispatch.enqueue_elder_review` (see the
+# `code_reviewer_enabled` branch above) and executed off the ACK path by
+# `async_dispatch.run_elder_job`, which calls `dispatch_code_review`
+# directly with its own broad final-guard.
 
 
 # Closes #2 — `/grug recheck` slash command. PR comments containing

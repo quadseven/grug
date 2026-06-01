@@ -37,7 +37,7 @@ def _client(monkeypatch):
     import dispatcher
     monkeypatch.setattr(
         dispatcher, "dispatch",
-        lambda event, payload: {"status": "no_op", "reason": "stubbed"},
+        lambda event, payload, *, delivery_id="": {"status": "no_op", "reason": "stubbed"},
     )
     return TestClient(webhook_main.app)
 

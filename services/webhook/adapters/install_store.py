@@ -20,6 +20,7 @@ from datetime import datetime, timezone
 from typing import Any, NotRequired, Optional, TypedDict
 
 import boto3
+from botocore.exceptions import ClientError
 
 log = logging.getLogger("grug.webhook.install_store")
 
@@ -437,6 +438,57 @@ def put_comment_record(
         "finding_tags": finding_tags,
         "ttl": ttl,
     })
+
+
+# Async-Elder idempotency claim (#272). Keyed on the GitHub
+# X-GitHub-Delivery UUID so a redelivery OR an AWS async-invoke retry of
+# the same delivery claims-and-skips instead of double-posting a review.
+# 24h comfortably outlives GitHub's redelivery window + AWS's async retry
+# horizon; the `ttl` auto-expires the claim so the DELIVERY# partition
+# stays bounded.
+_DELIVERY_CLAIM_TTL_HOURS = 24
+
+
+def _delivery_pk(delivery_id: str) -> str:
+    return f"DELIVERY#{delivery_id}"
+
+
+def claim_delivery(delivery_id: str) -> bool:
+    """Win-once idempotency claim for an async Elder job.
+
+    Returns ``True`` if THIS caller won the claim (first time this
+    delivery is processed → proceed) and ``False`` if the delivery was
+    already claimed (a GitHub redelivery or an AWS async-invoke retry →
+    the caller must SKIP to avoid a duplicate review).
+
+    Implemented as a conditional ``PutItem`` with
+    ``attribute_not_exists(PK)`` — atomic at the DDB layer, so two
+    concurrent invocations for the same delivery can't both win. A
+    ``ConditionalCheckFailedException`` means already-claimed.
+
+    Fails OPEN on an empty ``delivery_id`` (shouldn't happen post-HMAC,
+    since GitHub always sends ``X-GitHub-Delivery``): without an id we
+    can't dedup, and a possible double-review beats a silently-skipped
+    one. Any non-conditional DDB error propagates — the caller
+    (`run_elder_job`) catches it and degrades, but we do NOT swallow it
+    here into a false "claimed" that would drop the review.
+    """
+    if not delivery_id:
+        return True
+    ttl = int(
+        datetime.now(timezone.utc).timestamp()
+        + _DELIVERY_CLAIM_TTL_HOURS * 3600
+    )
+    try:
+        _table.put_item(
+            Item={"PK": _delivery_pk(delivery_id), "SK": "META", "ttl": ttl},
+            ConditionExpression="attribute_not_exists(PK)",
+        )
+        return True
+    except ClientError as e:
+        if e.response.get("Error", {}).get("Code") == "ConditionalCheckFailedException":
+            return False
+        raise
 
 
 def list_comment_records(install_id: int) -> list[CommentRecord]:

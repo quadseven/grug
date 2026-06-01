@@ -44,6 +44,7 @@ def create(
     cors_allow_credentials: bool = False,
     env_vars_kms_key_arn: pulumi.Input[str] | None = None,
     iam_propagation_wait: pulumi.Resource | None = None,
+    allow_self_invoke: bool = False,
 ) -> LambdaService:
     log_group = aws.cloudwatch.LogGroup(
         f"{name}-logs",
@@ -136,6 +137,35 @@ def create(
             ),
         ),
     )
+
+    # Self-invoke grant (#272): the webhook offloads the Elder LLM review
+    # off the ACK path by invoking ITSELF asynchronously
+    # (InvocationType="Event"). The execution role therefore needs
+    # `lambda:InvokeFunction` on its own ARN. We construct the ARN from
+    # the function NAME (== `name`, set below) + account + region rather
+    # than referencing the Function resource, which would be a circular
+    # dependency (role → policy → function → role). The runtime targets
+    # the same name via the auto-set `AWS_LAMBDA_FUNCTION_NAME` env.
+    if allow_self_invoke:
+        _ident = aws.get_caller_identity()
+        _region = aws.get_region()
+        _self_arn = f"arn:aws:lambda:{_region.name}:{_ident.account_id}:function:{name}"
+        aws.iam.RolePolicy(
+            f"{name}-self-invoke-policy",
+            role=role.id,
+            policy=json.dumps(
+                {
+                    "Version": "2012-10-17",
+                    "Statement": [
+                        {
+                            "Effect": "Allow",
+                            "Action": "lambda:InvokeFunction",
+                            "Resource": _self_arn,
+                        },
+                    ],
+                },
+            ),
+        )
 
     # Lambda Image-mode requires the source image live in a PRIVATE ECR
     # repo (rejects public.ecr.aws/* URIs). For first-ever deploy we
