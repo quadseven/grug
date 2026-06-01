@@ -23,9 +23,24 @@ import pulumi
 import pulumi_aws as aws
 
 
-def create(name: str = "grug-main") -> aws.dynamodb.Table:
+def create(
+    name: str = "grug-main",
+    *,
+    iam_propagation_wait: pulumi.Resource | None = None,
+) -> aws.dynamodb.Table:
+    # Gate table create/update behind the deploy-role IAM-propagation wait
+    # (#272): the dynamodb:* grant is added to grug-gha-deploy in the SAME
+    # plan as the first table mutation (TTL enable), so without the 45s wait
+    # the UpdateTable/UpdateTimeToLive call can fire before the grant
+    # propagates → AccessDenied (same race the Lambda/dd_rum gating solves).
+    opts = (
+        pulumi.ResourceOptions(depends_on=[iam_propagation_wait])
+        if iam_propagation_wait is not None
+        else None
+    )
     return aws.dynamodb.Table(
         name,
+        opts=opts,
         name=name,
         billing_mode="PAY_PER_REQUEST",
         hash_key="PK",

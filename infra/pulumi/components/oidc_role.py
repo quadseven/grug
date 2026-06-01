@@ -187,6 +187,23 @@ def create(
                         ],
                         "Resource": "arn:aws:ssm:*:*:parameter/grug/*",
                     },
+                    {
+                        # Pulumi-managed DynamoDB table lifecycle. The deploy
+                        # role had NO dynamodb perms — the grug-main table's
+                        # create/PITR/GSI predate this role (broader bootstrap
+                        # principal), so the gap stayed latent until #272's
+                        # TTL-enable became the FIRST table MUTATION this role
+                        # attempted → AccessDeniedException: UpdateTimeToLive
+                        # (deploy run 26735432997; preview can't catch an
+                        # apply-time auth check). Scoped to the grug-main table
+                        # + its sub-resources (indexes/streams), not "*".
+                        "Effect": "Allow",
+                        "Action": "dynamodb:*",
+                        "Resource": [
+                            "arn:aws:dynamodb:*:*:table/grug-main",
+                            "arn:aws:dynamodb:*:*:table/grug-main/*",
+                        ],
+                    },
                 ],
             },
         )
