@@ -243,14 +243,14 @@ webhook = lambda_service.create(
         # before PR somatic-scripts#235 fixed it.
         "DD_TRACE_MANAGED_SERVICES": "false",
     },
-    # 60s (was 15s) so the SYNCHRONOUS Elder dispatch path — diff fetch +
-    # review LLM call + check-run/review publish — completes gracefully and
-    # the in-code degrade paths can fire, instead of the handler being killed
-    # mid-LLM-call (#252). No single per-request httpx timeout (diff 10s, LLM
-    # 30s) reaches this budget. The realistic critical path is ~20s; the judge
-    # (#190, post-publish, best-effort) runs in the remaining budget. NOTE:
-    # the absolute worst case (two LLM calls at their 30s ceiling) can't be
-    # bounded on the sync ACK path — async offload is the proper fix (#272).
+    # 60s (was 15s) so the REALISTIC synchronous Elder path — diff fetch (10s)
+    # + ONE review LLM attempt (≤30s) + publish — completes instead of being
+    # killed mid-call (#252; a normal 16s review was killed by the old 15s).
+    # This does NOT bound the retry-storm: review_diff retries
+    # `_RETRY_ATTEMPTS` per backend across 2 backends, so a HUNG backend can
+    # run ~180s and still exceed 60s before publish. No sane sync budget bounds
+    # that — the real fix is to move the LLM call off the ACK path (async
+    # offload, #272). 60s buys the common case; #272 buys the worst case.
     timeout_seconds=60,
     memory_mb=512,
     # Encrypt env vars (DD_API_KEY in particular) at rest so a reader

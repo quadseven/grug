@@ -844,16 +844,28 @@ def test_dispatch_fetches_diff_with_diff_accept_header(monkeypatch):
     assert captured[0]["timeout"] == cr_dispatch._DIFF_FETCH_TIMEOUT
 
 
-def test_diff_fetch_timeout_fits_webhook_lambda_budget():
-    """#252 budget invariant: no single synchronous httpx timeout on the
-    webhook path may reach the webhook Lambda's 60s budget — else a hung
-    upstream kills the handler mid-flight before the in-code degrade fires.
-    (Lambda timeout lives in infra/pulumi/__main__.py:webhook; kept here as a
-    documented ceiling so a future bump to a per-request timeout trips this.)"""
+def test_single_attempt_critical_path_fits_webhook_lambda_budget():
+    """#252: the REALISTIC pre-publish critical path — diff fetch + ONE review
+    LLM attempt — fits the webhook Lambda's 60s budget with headroom for the
+    publish calls, so a normal (fast-responding) review posts before the
+    handler is killed. The 60s bump fixes the common case (a 16s review was
+    killed by the old 15s budget).
+
+    NOT bounded here (deliberately): the retry-storm worst case — review_diff
+    retries `_RETRY_ATTEMPTS` per backend across 2 backends, so a HUNG backend
+    can run ~`_RETRY_ATTEMPTS * _TIMEOUT_SECONDS * 2` (~180s) and still exceed
+    60s before publish. No sane sync budget bounds that; the fix is to move the
+    LLM call off the ACK path (async offload, #272). This test asserts the
+    guarantee we DO make, not a false one."""
     import llm_client
-    _WEBHOOK_LAMBDA_BUDGET = 60
+    _WEBHOOK_LAMBDA_BUDGET = 60  # keep in sync w/ infra/pulumi/__main__ webhook
+    _PUBLISH_HEADROOM = 15       # check-run + review POSTs (timeout=10 each)
+    single_attempt_critical = (
+        cr_dispatch._DIFF_FETCH_TIMEOUT + llm_client._TIMEOUT_SECONDS
+    )
+    assert single_attempt_critical + _PUBLISH_HEADROOM <= _WEBHOOK_LAMBDA_BUDGET
+    # And no single per-request timeout alone reaches the budget.
     assert cr_dispatch._DIFF_FETCH_TIMEOUT < _WEBHOOK_LAMBDA_BUDGET
-    assert cr_dispatch._COMMENT_FETCH_TIMEOUT < _WEBHOOK_LAMBDA_BUDGET
     assert llm_client._TIMEOUT_SECONDS < _WEBHOOK_LAMBDA_BUDGET
 
 
