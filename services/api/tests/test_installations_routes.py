@@ -150,3 +150,49 @@ def test_list_installations_skips_corrupt_pk_rows(_mod):
     out = _mod.list_installations(user)
     install_ids = sorted(i["install_id"] for i in out["installations"])
     assert install_ids == [1001]  # corrupt row skipped, dashboard not blank
+
+
+# ── get_enforcement resilient fallback (dashboard 429 storm) ──────────
+
+def test_get_enforcement_fallback_grug_managed_when_stored(_mod, monkeypatch):
+    """GitHub rate-limited live detection (httpx error after retries) + a
+    stored ruleset id → degrade to grug_managed, never 500 / false 'none'."""
+    import httpx
+    inst = _mod
+    monkeypatch.setattr(inst, "get_installation", lambda i: {"installed_by_user_id": "999"})
+    req = httpx.Request("GET", "https://api.github.com/x")
+    err = httpx.HTTPStatusError("rate limited", request=req, response=httpx.Response(429, request=req))
+    monkeypatch.setattr(inst, "with_install_token_retry", lambda iid, fn: (_ for _ in ()).throw(err))
+    monkeypatch.setattr(inst, "get_repo_config", lambda i, r: {"enforcement_ruleset_id": 555})
+
+    out = inst.get_enforcement(1, 2, user=_user(role="admin"))
+    assert out == {"repo_id": 2, "enforcement_state": "grug_managed", "degraded": True}
+
+
+def test_get_enforcement_fallback_unknown_when_no_stored(_mod, monkeypatch):
+    """Rate-limited AND no stored state → 'unknown' (NOT a false 'none')."""
+    import httpx
+    inst = _mod
+    monkeypatch.setattr(inst, "get_installation", lambda i: {"installed_by_user_id": "999"})
+    monkeypatch.setattr(inst, "with_install_token_retry",
+                        lambda iid, fn: (_ for _ in ()).throw(httpx.ConnectError("dns")))
+    monkeypatch.setattr(inst, "get_repo_config", lambda i, r: {})
+
+    out = inst.get_enforcement(1, 2, user=_user(role="admin"))
+    assert out == {"repo_id": 2, "enforcement_state": "unknown", "degraded": True}
+
+
+def test_get_enforcement_404_propagates_not_swallowed(_mod, monkeypatch):
+    """A legitimate 404 (repo not found) must NOT be caught by the httpx
+    fallback — only rate-limit/transport errors degrade."""
+    from fastapi import HTTPException
+    inst = _mod
+    monkeypatch.setattr(inst, "get_installation", lambda i: {"installed_by_user_id": "999"})
+
+    def _raise_404(iid, fn):
+        raise HTTPException(status_code=404, detail="repo not found")
+
+    monkeypatch.setattr(inst, "with_install_token_retry", _raise_404)
+    with pytest.raises(HTTPException) as exc:
+        inst.get_enforcement(1, 2, user=_user(role="admin"))
+    assert exc.value.status_code == 404

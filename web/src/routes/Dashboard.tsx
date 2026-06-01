@@ -158,6 +158,7 @@ function RepoRow({
     repo.config.tpm_enabled ? repo.repo_id : undefined,
   );
   const state = enforcement.data?.enforcement_state;
+  const degraded = enforcement.data?.degraded === true;
   const hasStoredId = repo.config.enforcement_ruleset_id != null;
 
   return (
@@ -172,7 +173,7 @@ function RepoRow({
         {repo.private && (
           <span className="text-xs text-stone-500 uppercase tracking-wider">private</span>
         )}
-        {repo.config.tpm_enabled && <EnforcementBadge state={state} hasStoredId={hasStoredId} loading={enforcement.isLoading} />}
+        {repo.config.tpm_enabled && <EnforcementBadge state={state} degraded={degraded} hasStoredId={hasStoredId} loading={enforcement.isLoading} />}
       </div>
       <div className="flex items-center gap-3">
         {repo.config.tpm_enabled && state === "none" && !fixPending && (
@@ -203,9 +204,10 @@ function RepoRow({
 }
 
 function EnforcementBadge({
-  state, hasStoredId, loading,
+  state, degraded = false, hasStoredId, loading,
 }: {
   state: string | undefined;
+  degraded?: boolean;
   hasStoredId: boolean;
   loading: boolean;
 }) {
@@ -214,6 +216,21 @@ function EnforcementBadge({
   }
 
   const resolved = state ?? (hasStoredId ? "grug_managed" : undefined);
+
+  // `degraded` = the server returned a last-known fallback because GitHub
+  // couldn't be reached (rate-limited). The state is UNCONFIRMED — render it
+  // muted with "· unconfirmed" so a stale "grug_managed" never reads as a
+  // confident green "enforced" (the ruleset may have since been deleted).
+  if (degraded && (resolved === "grug_managed" || resolved === "external")) {
+    return (
+      <span
+        className="text-xs font-mono text-stone-400"
+        title="Last-known state — GitHub was rate-limited and couldn't confirm. Refresh to re-check."
+      >
+        {resolved === "grug_managed" ? "enforced" : "external"} · unconfirmed
+      </span>
+    );
+  }
 
   if (resolved === "grug_managed") {
     return (
@@ -233,6 +250,17 @@ function EnforcementBadge({
     return (
       <span className="text-xs font-mono text-amber-400" title="TPM enabled but check is not required to merge">
         ⚠ not enforced
+      </span>
+    );
+  }
+  // "unknown" = GitHub was rate-limited and we had no stored state. Show a
+  // muted, honest "status unknown" — NOT a false "not enforced" — so the
+  // operator isn't misled, and the "fix" button (gated on state === "none")
+  // stays hidden.
+  if (resolved === "unknown") {
+    return (
+      <span className="text-xs font-mono text-stone-500" title="Couldn't reach GitHub (rate-limited) and no stored state — try refreshing">
+        status unknown
       </span>
     );
   }
