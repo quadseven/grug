@@ -25,6 +25,7 @@ from typing import Optional
 
 from llm_client import (
     FindingJudgement,
+    Hunk,
     JudgeFindingRepr,
     PrContext,
     judge_findings,
@@ -91,9 +92,14 @@ def run_judge(
 
     try:
         findings = evaluation.findings
+        # Convert parser DiffHunks → wire `Hunk`s (path/body) the SAME way the
+        # review path does (dispatch._to_llm_hunks). judge_findings is typed
+        # `list[Hunk]` and reads `.path`; passing raw DiffHunks (field is
+        # `file_path`) crashed the judge with AttributeError on EVERY review
+        # with findings, silently killing all `is_real_bug` LLM-Obs evals.
         verdicts = judge_findings(
             [_finding_to_repr(f) for f in findings],
-            list(hunks),
+            [Hunk(path=h.file_path, body=h.body) for h in hunks],
             installation_id=installation_id,
             pr_context=pr_context,
         )
