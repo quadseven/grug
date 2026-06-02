@@ -1,12 +1,14 @@
-import { Navigate } from "react-router-dom";
-import { Shell } from "../components/Shell";
+import { useState } from "react";
+import { Navigate, Link, useNavigate } from "react-router-dom";
 import { useMe } from "../lib/me";
+import { API_BASE } from "../lib/api";
 import {
   useAdminInstallations,
   useAdminUsers,
   usePatchUser,
   type AdminUser,
 } from "../lib/admin";
+import "./dashboard-grug.css";
 
 export function Admin() {
   const me = useMe();
@@ -15,11 +17,7 @@ export function Admin() {
   const patch = usePatchUser();
 
   if (me.isLoading) {
-    return (
-      <Shell>
-        <div className="px-6 py-24 text-center text-stone-500 font-mono text-sm">loading…</div>
-      </Shell>
-    );
+    return <div className="grug-dash"><div style={{ padding: 80, textAlign: "center", fontFamily: "'JetBrains Mono',monospace", color: "var(--muted)" }}>loading…</div></div>;
   }
   if (!me.data?.authenticated) return <Navigate to="/signin" replace />;
   if (me.data.role !== "admin") return <Navigate to="/dashboard" replace />;
@@ -28,128 +26,141 @@ export function Admin() {
   const installList = installs.data?.installations ?? [];
 
   return (
-    <Shell>
-      <section className="px-6 py-12 max-w-6xl mx-auto space-y-10">
-        <h1 className="font-mono text-2xl text-stone-100">admin</h1>
+    <div className="grug-dash">
+      <div className="tape">
+        <div className="tape-track">
+          {["GRUG SEE ALL.", "GRUG GUARD THE TRIBE.", "ADMIN IS BIG GRUG.",
+            "GRUG SEE ALL.", "GRUG GUARD THE TRIBE.", "ADMIN IS BIG GRUG."].map((t, i) => (
+            <span key={i}>{t}<span className="dot"> ● </span></span>
+          ))}
+        </div>
+      </div>
 
-        <div>
-          <h2 className="text-stone-500 font-mono text-xs uppercase tracking-wider mb-3">
-            users · {userList.length}
-          </h2>
-          {users.isLoading && <div className="text-stone-500 text-sm">loading…</div>}
-          {users.isError && <div className="text-red-400 text-sm">failed to load</div>}
-          {userList.length > 0 && (
-            <div className="border border-stone-800 rounded-sm overflow-x-auto">
-              <table className="w-full text-sm font-mono">
-                <thead className="text-stone-500 text-xs uppercase tracking-wider">
-                  <tr className="border-b border-stone-800">
-                    <th className="text-left px-3 py-2">login</th>
-                    <th className="text-left px-3 py-2">id</th>
-                    <th className="text-left px-3 py-2">role</th>
-                    <th className="text-left px-3 py-2">tier</th>
-                    <th className="text-left px-3 py-2">allowlisted</th>
-                    <th className="text-left px-3 py-2">last login</th>
-                  </tr>
-                </thead>
-                <tbody>
-                  {userList.map((u) => (
-                    <UserRow
-                      key={u.github_user_id}
-                      user={u}
-                      isSelf={u.github_user_id === me.data?.github_user_id}
-                      pending={patch.isPending && patch.variables?.user_id === u.github_user_id}
-                      onPatch={(p) => patch.mutate({ user_id: u.github_user_id, patch: p })}
-                    />
-                  ))}
-                </tbody>
-              </table>
-            </div>
-          )}
+      <header className="nav">
+        <div className="nav-inner">
+          <Link className="brand" to="/">
+            <span className="brand-mark"><img src="/assets/grug-angry.png" alt="" /></span>
+            <span>grug</span>
+          </Link>
+          <nav className="links">
+            <Link to="/dashboard">Dashboard</Link>
+            <Link to="/admin" className="active">Admin</Link>
+            <a href="https://github.com/githumps/grug">Docs</a>
+          </nav>
+          <div className="userchip">
+            <div className="who"><b>@{me.data.login}</b><span>admin</span></div>
+            <span className="av"><img src="/assets/grug-angry.png" alt="" /></span>
+            <SignOut />
+          </div>
+        </div>
+      </header>
+
+      <div className="shell">
+        <div className="pagehead">
+          <div>
+            <span className="eyebrow"><span className="blob"></span>big grug · admin</span>
+            <h1>Grug <em>see all</em>.<br />Grug guard the tribe.</h1>
+          </div>
+          <p className="sub">// Every user and every install across the cave. Flip allowlist + role. Grug remember.</p>
         </div>
 
-        <div>
-          <h2 className="text-stone-500 font-mono text-xs uppercase tracking-wider mb-3">
-            installations · {installList.length}
-          </h2>
-          {installs.isLoading && <div className="text-stone-500 text-sm">loading…</div>}
-          {installList.length > 0 && (
-            <div className="border border-stone-800 rounded-sm overflow-x-auto">
-              <table className="w-full text-sm font-mono">
-                <thead className="text-stone-500 text-xs uppercase tracking-wider">
-                  <tr className="border-b border-stone-800">
-                    <th className="text-left px-3 py-2">install id</th>
-                    <th className="text-left px-3 py-2">account</th>
-                    <th className="text-left px-3 py-2">type</th>
-                    <th className="text-left px-3 py-2">installed by (user id)</th>
-                    <th className="text-left px-3 py-2">installed at</th>
-                  </tr>
-                </thead>
-                <tbody>
-                  {installList.map((inst) => (
-                    <tr key={inst.install_id} className="border-b border-stone-900 last:border-0">
-                      <td className="px-3 py-2 text-stone-200">{inst.install_id}</td>
-                      <td className="px-3 py-2 text-stone-200">{inst.account_login}</td>
-                      <td className="px-3 py-2 text-stone-400 text-xs uppercase tracking-wider">
-                        {inst.account_type === "Organization" ? "org" : "user"}
-                      </td>
-                      <td className="px-3 py-2 text-stone-400">{inst.installed_by_user_id}</td>
-                      <td className="px-3 py-2 text-stone-500 text-xs">{inst.installed_at}</td>
-                    </tr>
-                  ))}
-                </tbody>
-              </table>
+        <div style={{ paddingBottom: 80 }}>
+          <div className="card">
+            <div className="card-head">Users <span className="count">{userList.length}</span></div>
+            <div className="card-body">
+              {users.isLoading && <div className="mono" style={{ fontSize: 12, color: "var(--muted)" }}>loading…</div>}
+              {users.isError && <div className="err">⚠ failed to load users</div>}
+              {userList.length > 0 && (
+                <table className="gtable">
+                  <thead><tr><th>login</th><th>id</th><th>role</th><th>tier</th><th>allowlisted</th><th>last login</th></tr></thead>
+                  <tbody>
+                    {userList.map((u) => (
+                      <UserRow key={u.github_user_id} user={u}
+                        isSelf={u.github_user_id === me.data?.github_user_id}
+                        pending={patch.isPending && patch.variables?.user_id === u.github_user_id}
+                        onPatch={(p) => patch.mutate({ user_id: u.github_user_id, patch: p })} />
+                    ))}
+                  </tbody>
+                </table>
+              )}
             </div>
-          )}
+          </div>
+
+          <div className="card">
+            <div className="card-head">Installations <span className="count">{installList.length}</span></div>
+            <div className="card-body">
+              {installs.isLoading && <div className="mono" style={{ fontSize: 12, color: "var(--muted)" }}>loading…</div>}
+              {installs.isError && <div className="err">⚠ failed to load installations</div>}
+              {installList.length > 0 && (
+                <table className="gtable">
+                  <thead><tr><th>install id</th><th>account</th><th>type</th><th>installed by</th><th>installed at</th></tr></thead>
+                  <tbody>
+                    {installList.map((inst) => (
+                      <tr key={inst.install_id}>
+                        <td>{inst.install_id}</td>
+                        <td><b>{inst.account_login}</b></td>
+                        <td>{inst.account_type === "Organization" ? "org" : "user"}</td>
+                        <td>{inst.installed_by_user_id}</td>
+                        <td style={{ color: "var(--muted)" }}>{inst.installed_at}</td>
+                      </tr>
+                    ))}
+                  </tbody>
+                </table>
+              )}
+            </div>
+          </div>
         </div>
-      </section>
-    </Shell>
+      </div>
+
+      <footer>
+        <div className="foot-inner">
+          <span className="brand serif">grug.</span>
+          <span>AGPL-3.0. Made in a cave. <a href="/privacy">Privacy</a> · <a href="/terms">Terms</a></span>
+          <span>Grug see all. Grug fair.</span>
+        </div>
+      </footer>
+    </div>
   );
 }
 
-function UserRow({
-  user, isSelf, pending, onPatch,
-}: {
+function SignOut() {
+  const nav = useNavigate();
+  const [busy, setBusy] = useState(false);
+  return (
+    <a className="btn sm ghost" onClick={async () => {
+      setBusy(true);
+      try { await fetch(`${API_BASE}/api/v1/auth/logout`, { method: "POST", credentials: "include" }); } catch { /* ignore */ }
+      nav("/", { replace: true });
+    }} aria-disabled={busy}>Sign out</a>
+  );
+}
+
+function UserRow({ user, isSelf, pending, onPatch }: {
   user: AdminUser;
   isSelf: boolean;
   pending: boolean;
   onPatch: (p: { allowlisted?: boolean; role?: "admin" | "user" }) => void;
 }) {
   return (
-    <tr className="border-b border-stone-900 last:border-0">
-      <td className="px-3 py-2 text-stone-200">
-        {user.login}
-        {isSelf && (
-          <span className="ml-2 text-xs text-amber-400 uppercase tracking-wider">you</span>
-        )}
-      </td>
-      <td className="px-3 py-2 text-stone-500">{user.github_user_id}</td>
-      <td className="px-3 py-2">
-        <select
-          className="bg-stone-950 border border-stone-800 px-2 py-1 text-stone-200 disabled:opacity-50"
-          value={user.role}
-          disabled={pending || isSelf}
-          onChange={(e) => onPatch({ role: e.target.value as "admin" | "user" })}
-        >
+    <tr className={isSelf ? "self" : undefined}>
+      <td><b>{user.login}</b>{isSelf && <span className="pill admin" style={{ marginLeft: 8 }}>YOU</span>}</td>
+      <td style={{ color: "var(--muted)" }}>{user.github_user_id}</td>
+      <td>
+        <select className="text" style={{ minWidth: 0, padding: "4px 8px" }}
+          value={user.role} disabled={pending || isSelf}
+          onChange={(e) => onPatch({ role: e.target.value as "admin" | "user" })}>
           <option value="user">user</option>
           <option value="admin">admin</option>
         </select>
       </td>
-      <td className="px-3 py-2 text-stone-400">{user.tier}</td>
-      <td className="px-3 py-2">
-        <label className="inline-flex items-center gap-2 cursor-pointer">
-          <input
-            type="checkbox"
-            className="accent-amber-400"
-            checked={user.allowlisted}
-            disabled={pending}
-            onChange={(e) => onPatch({ allowlisted: e.target.checked })}
-          />
-          <span className="text-stone-300 text-xs">
-            {user.allowlisted_by ? `by ${user.allowlisted_by}` : "—"}
-          </span>
+      <td>{user.tier}</td>
+      <td>
+        <label style={{ display: "inline-flex", alignItems: "center", gap: 8, cursor: "pointer" }}>
+          <div className={`sw${user.allowlisted ? " on" : ""}`} onClick={() => !pending && onPatch({ allowlisted: !user.allowlisted })} role="switch" aria-checked={user.allowlisted} />
+          <span style={{ color: "var(--muted)" }}>{user.allowlisted_by ? `by ${user.allowlisted_by}` : "—"}</span>
         </label>
       </td>
-      <td className="px-3 py-2 text-stone-500 text-xs">{user.last_login_at || "—"}</td>
+      <td style={{ color: "var(--muted)" }}>{user.last_login_at || "—"}</td>
     </tr>
   );
 }
