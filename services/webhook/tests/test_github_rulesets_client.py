@@ -68,6 +68,10 @@ def test_create_ruleset_body_shape():
     checks = rules[0]["parameters"]["required_status_checks"]
     assert len(checks) == 1
     assert checks[0]["context"] == "Grug — Definition of Ready"
+    # integration_id must be OMITTED, not null: GitHub's ruleset schema 422s
+    # on `integration_id: null` ("data matches no possible input"), which
+    # broke every enforcement "fix".
+    assert "integration_id" not in checks[0]
 
 
 def test_create_ruleset_multiple_contexts():

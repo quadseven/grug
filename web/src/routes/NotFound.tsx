@@ -1,4 +1,3 @@
-import { Link } from "react-router-dom";
 import "./dashboard-grug.css";
 
 export function NotFound() {
@@ -6,12 +5,12 @@ export function NotFound() {
     <div className="grug-dash">
       <header className="nav">
         <div className="nav-inner">
-          <Link className="brand" to="/">
+          <a className="brand" href="/">
             <span className="brand-mark"><img src="/assets/grug-angry.png" alt="" /></span>
             <span>grug</span>
-          </Link>
+          </a>
           <nav className="links">
-            <Link to="/">Home</Link>
+            <a href="/">Home</a>
             <a href="https://github.com/githumps/grug">Docs</a>
           </nav>
         </div>
@@ -22,7 +21,7 @@ export function NotFound() {
           <span className="eyebrow"><span className="blob"></span>404 · lost in cave</span>
           <h1>Grug <em>no find</em> page.</h1>
           <p className="signin-sub">// This path not in cave. Maybe bad link. Maybe Grug eat it. Go back to safe ground.</p>
-          <Link className="btn primary lg signin-cta" to="/">← Back to splash</Link>
+          <a className="btn primary lg signin-cta" href="/">← Back to splash</a>
         </div>
       </div>
 

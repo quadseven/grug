@@ -1,5 +1,4 @@
 import { useEffect } from "react";
-import { Link } from "react-router-dom";
 import { API_BASE } from "../lib/api";
 import "./dashboard-grug.css";
 
@@ -25,12 +24,12 @@ export function Signin() {
 
       <header className="nav">
         <div className="nav-inner">
-          <Link className="brand" to="/">
+          <a className="brand" href="/">
             <span className="brand-mark"><img src="/assets/grug-angry.png" alt="" /></span>
             <span>grug</span>
-          </Link>
+          </a>
           <nav className="links">
-            <Link to="/">Home</Link>
+            <a href="/">Home</a>
             <a href="https://github.com/githumps/grug">Docs</a>
           </nav>
         </div>
