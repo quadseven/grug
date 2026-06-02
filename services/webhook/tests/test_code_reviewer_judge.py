@@ -76,6 +76,36 @@ def test_run_judge_submits_one_eval_per_finding(monkeypatch):
     assert submitted[1]["tags"]["rule_name"] == "style"
 
 
+def test_run_judge_converts_diffhunks_to_wire_hunks(monkeypatch):
+    """Regression: run_judge must convert parser DiffHunks → wire `Hunk`s
+    (field `path`) before judge_findings, which reads `.path`. Passing raw
+    DiffHunks (field `file_path`) crashed the judge with AttributeError on
+    EVERY review with findings — silently killing all is_real_bug LLM-Obs
+    evals — while the fully-mocked judge_findings tests stayed green."""
+    evaluation = CodeReviewEvaluation(findings=(_finding(),), conclusion="success")
+    review = _reviewed(evaluation.findings)
+    captured: dict = {}
+    monkeypatch.setattr(
+        cr_judge, "judge_findings",
+        lambda fr, h, installation_id, pr_context=None: (
+            captured.update(hunks=list(h)) or (FindingJudgement(0, True, "real"),)
+        ),
+    )
+    monkeypatch.setattr(cr_judge, "submit_finding_evaluation", lambda **kw: None)
+
+    cr_judge.run_judge(
+        evaluation, parse_diff(_DIFF), installation_id=1,
+        review_span_context=review.review_span_context, pr_context={"repo": "o/r"},
+    )
+
+    hunks = captured.get("hunks")
+    assert hunks, "judge_findings received no hunks"
+    # Each must expose `.path` (the wire-Hunk contract _build_judge_messages
+    # reads) — a raw DiffHunk (`.file_path`) would fail this and crash judge.
+    assert all(hasattr(h, "path") for h in hunks)
+    assert hunks[0].path == "src/x.py"
+
+
 def test_run_judge_skips_when_no_findings(monkeypatch):
     """Clean review (no findings) → no judge call, no evals."""
     evaluation = CodeReviewEvaluation(findings=(), conclusion="success")
