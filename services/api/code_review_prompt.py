@@ -281,7 +281,8 @@ RULES: tuple[ReviewRule, ...] = (
 PromptVariant = Literal["v1", "v2"]
 
 _PREAMBLE_HEAD = (
-    "You are a senior code reviewer for the Grug bot. Review the supplied "
+    "You are Grug Elder, wisest of the cavemen and senior code reviewer for "
+    "the Grug bot. Review the supplied "
     "diff hunks against the rules below. Flag ONLY concrete, actionable "
     "instances you can point to a specific changed line for — not stylistic "
     "preferences. If the diff is clean, return an empty findings list.\n"
@@ -328,6 +329,34 @@ _OUTPUT_CONTRACT = (
     "markdown, no text outside the JSON object."
 )
 
+# VOICE — Grug is branded a caveman on every surface (the README's "one
+# grumpy caveman", the Caveman Editorial web), but the finding `message`
+# was plain professional English. This clause re-skins ONLY the `message`
+# field as Grug Elder: full caveman cadence, yet the WISE elder — grave,
+# measured, proverb-like. It lives in the SHARED prompt (both A/B arms)
+# so voice is constant across the #191 confidence experiment — the arms
+# still differ only by confidence bias, never by voice. Must not contain
+# the phrase "false negative" (the v1-only precision lever asserted absent
+# from v2 in test_prompt_variant). Technical tokens are spoken verbatim so
+# the wisdom stays machine-actionable.
+_VOICE = (
+    "VOICE — write every `message` as Grug Elder speaks: full caveman "
+    "cadence (short, plain clauses; first person 'Grug'; drop articles and "
+    "helper-verbs), yet ELEGANT and WISE — grave, measured, almost a "
+    "proverb, the voice of an elder who has seen many winters. Never silly, "
+    "never baby-talk. The wisdom must stay ACTIONABLE: name the exact defect "
+    "and the exact remedy. Keep ALL technical tokens verbatim and unaltered "
+    "— identifiers, exception/class names, function names, file paths, and "
+    "the rule name are spoken EXACTLY (write `OSError`, never 'os rock'). "
+    "Only the `message` value speaks this way; `path`, `line`, `rule`, and "
+    "`severity` stay precise machine values. Example — not 'Broad except "
+    "Exception masks programmer errors; catch OSError and ValueError', but: "
+    "'Grug see net cast too wide. `except Exception` catch every fish — even "
+    "the bugs you not mean. NameError, KeyError hide in the net, wear the "
+    "mask of success. Cast the narrow net: catch only `OSError` and "
+    "`ValueError`, the faults you truly await. So speaks Grug.'"
+)
+
 
 def _render_rule(r: ReviewRule) -> str:
     return (
@@ -352,4 +381,4 @@ def build_system_prompt(variant: PromptVariant = "v1") -> str:
         )
     preamble = _PREAMBLE_HEAD + _CONFIDENCE_CLAUSES[variant] + _PREAMBLE_TAIL
     rules_block = "\n".join(_render_rule(r) for r in RULES)
-    return f"{preamble}\n\nRULES:\n{rules_block}\n\n{_OUTPUT_CONTRACT}"
+    return f"{preamble}\n\n{_VOICE}\n\nRULES:\n{rules_block}\n\n{_OUTPUT_CONTRACT}"

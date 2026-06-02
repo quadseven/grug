@@ -189,15 +189,18 @@ def _summary_markdown(evaluation: CodeReviewEvaluation) -> tuple[str, str]:
     by severity. Operators read this when triaging in GH's Checks tab.
     """
     if evaluation.degraded_reason:
-        title = f"⚠️ Code review skipped ({evaluation.degraded_reason})"
+        title = f"⚠️ Grug eyes clouded ({evaluation.degraded_reason})"
         return title, (
-            "Elder code-reviewer could not run this pass. Reason: "
-            f"`{evaluation.degraded_reason}`. Advisory neutral — PR "
-            "merge is not blocked."
+            "Grug Elder could not see the diff this pass. The mist: "
+            f"`{evaluation.degraded_reason}`. Grug stay his club — this "
+            "only counsel, merge not blocked."
         )
     if not evaluation.findings:
-        title = "✅ Code review pass — no findings"
-        return title, "Elder reviewed the diff and found nothing actionable."
+        title = "✅ Grug find nothing — code good"
+        return title, (
+            "Grug Elder look long upon the diff and find nothing to fear. "
+            "Code walk steady. Grug nod."
+        )
 
     severity_icon = {
         "critical": "🛑", "high": "❌", "medium": "⚠️", "low": "ℹ️",
@@ -205,7 +208,10 @@ def _summary_markdown(evaluation: CodeReviewEvaluation) -> tuple[str, str]:
     blocking = sum(
         1 for f in evaluation.findings if f.severity in ("high", "critical")
     )
-    title = f"❌ {blocking} blocking · {len(evaluation.findings)} total findings"
+    title = (
+        f"❌ Grug see trouble — {blocking} blocking · "
+        f"{len(evaluation.findings)} finding(s) in all"
+    )
     rows = ["| Severity | File | Line | Rule | Message |", "|---|---|---|---|---|"]
     for f in evaluation.findings:
         icon = severity_icon.get(f.severity, "•")
@@ -299,7 +305,7 @@ def _build_review_result(
         event=event,
         body=(
             f'<img src="{_PERSONA_PORTRAIT}" width="46" align="left" alt="Grug {_PERSONA}" />'
-            f"\n\n**Grug {_PERSONA}** reviewed your PR · {len(comments)} finding(s)"
+            f"\n\n**Grug {_PERSONA}** gaze upon your PR · {len(comments)} finding(s)"
         ),
         comments=comments,
     )
