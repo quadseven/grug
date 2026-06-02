@@ -175,8 +175,14 @@ def create_ruleset(
                 "type": "required_status_checks",
                 "parameters": {
                     "strict_required_status_checks_policy": False,
+                    # OMIT integration_id — GitHub's ruleset schema rejects a
+                    # null integration_id ("Invalid property /rules/0: data
+                    # matches no possible input", 422), which broke every
+                    # enforcement "fix". integration_id is optional; sending
+                    # just {context} requires the check by name regardless of
+                    # which app reports it.
                     "required_status_checks": [
-                        {"context": ctx, "integration_id": None}
+                        {"context": ctx}
                         for ctx in status_check_contexts
                     ],
                 },
