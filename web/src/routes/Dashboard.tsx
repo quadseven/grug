@@ -139,10 +139,10 @@ export function Dashboard() {
 
       <header className="nav">
         <div className="nav-inner">
-          <Link className="brand" to="/">
+          <a className="brand" href="/">
             <span className="brand-mark"><img src="/assets/grug-angry.png" alt="" /></span>
             <span>grug</span>
-          </Link>
+          </a>
           <nav className="links">
             <a className={panel !== "activity" ? "active" : ""} onClick={() => setPanel("repos")}>Dashboard</a>
             <a className={panel === "activity" ? "active" : ""} onClick={() => setPanel("activity")}>Activity</a>
@@ -289,24 +289,24 @@ function RepoRow({ repo, installId, onToggle, onFix, fixPending, fixError }: {
   const state = enforcement.data?.enforcement_state;
   const degraded = enforcement.data?.degraded === true;
 
-  let enf: { cls: string; label: string } | null = null;
+  let enf: { cls: string; label: string; title: string } | null = null;
   if (on) {
-    if (degraded && (state === "grug_managed" || state === "external")) enf = { cls: "unknown", label: "unconfirmed" };
-    else if (state === "grug_managed") enf = { cls: "live", label: "ENFORCED" };
-    else if (state === "external") enf = { cls: "live", label: "EXTERNAL" };
-    else if (state === "none") enf = { cls: "warn", label: "⚠ not enforced" };
-    else if (state === "unknown") enf = { cls: "unknown", label: "unknown" };
+    if (degraded && (state === "grug_managed" || state === "external")) enf = { cls: "unknown", label: "unconfirmed", title: "Last-known state — GitHub was rate-limited and couldn't confirm. Refresh to re-check." };
+    else if (state === "grug_managed") enf = { cls: "live", label: "ENFORCED", title: "Grug's DoR check is REQUIRED to merge — a Grug-managed ruleset blocks PRs that fail it." };
+    else if (state === "external") enf = { cls: "live", label: "EXTERNAL", title: "The check is required by a non-Grug ruleset or branch protection." };
+    else if (state === "none") enf = { cls: "warn", label: "⚠ not enforced", title: "Grug reviews PRs here, but its check is NOT required to merge — a failing PR can still be merged. Click 'fix' to make it required (blocking)." };
+    else if (state === "unknown") enf = { cls: "unknown", label: "unknown", title: "Couldn't reach GitHub to determine enforcement. Refresh." };
   }
 
   return (
     <div className="repo">
       <div className="org">{(owner || "?").slice(0, 2).toUpperCase()}</div>
       <div className="name"><b>{name}</b><span>{owner}/ · {repo.private ? "private" : "public"}</span></div>
-      {enf && <span className={`state ${enf.cls}`}>{enf.label}</span>}
-      {on && state === "none" && !fixPending && <button className="fixbtn" onClick={onFix}>fix</button>}
+      {enf && <span className={`state ${enf.cls}`} title={enf.title}>{enf.label}</span>}
+      {on && state === "none" && !fixPending && <button className="fixbtn" onClick={onFix} title="Create a branch ruleset that REQUIRES Grug's check to pass before a PR can merge.">fix</button>}
       {fixPending && <span className="state paused">fixing…</span>}
       {fixError && !fixPending && <span className="fixerr" title={fixError}>⚠ fix failed</span>}
-      <span className={`state ${on ? "live" : "paused"}`}>{on ? "GUARDED" : "PAUSED"}</span>
+      <span className={`state ${on ? "live" : "paused"}`} title={on ? "GUARDED: Grug watches this repo and posts a Check Run on every PR. Toggle off to silence Grug here." : "PAUSED: Grug is asleep on this repo. Toggle on to guard it."}>{on ? "GUARDED" : "PAUSED"}</span>
       <div className={`sw${on ? " on" : ""}`} onClick={() => onToggle(!on)} role="switch" aria-checked={on}></div>
     </div>
   );
