@@ -49,6 +49,13 @@ from adapters.install_store import put_comment_record  # type: ignore
 
 log = logging.getLogger(f"{os.getenv('DD_SERVICE', 'grug')}.persona.code_reviewer")
 
+# Grug's face on the review comment. This dispatch IS the Elder (code-reviewer)
+# persona, so it leads with the Elder portrait — hosted at grug.lol/assets and
+# rendered via an <img> (GitHub markdown allows width/align) so it's a little
+# face, not a giant banner.
+_PERSONA = "Elder"
+_PERSONA_PORTRAIT = "https://grug.lol/assets/grug_elder.png"
+
 _CHECK_NAME = "Grug — Code Review"
 # 10s (was 30s) — a GitHub diff fetch is fast; the over-generous 30s let a
 # hung fetch alone eat most of the webhook Lambda budget (#252). Well under
@@ -290,7 +297,10 @@ def _build_review_result(
     return ReviewResult(
         commit_id=head_sha,
         event=event,
-        body=f"Grug code review · {len(comments)} finding(s)",
+        body=(
+            f'<img src="{_PERSONA_PORTRAIT}" width="46" align="left" alt="Grug {_PERSONA}" />'
+            f"\n\n**Grug {_PERSONA}** reviewed your PR · {len(comments)} finding(s)"
+        ),
         comments=comments,
     )
 
