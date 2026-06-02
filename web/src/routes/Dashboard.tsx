@@ -14,9 +14,16 @@ import "./dashboard-grug.css";
 
 // ── Grug Caveman Editorial dashboard (design bundle Dashboard.html). The
 // Repositories panel is wired to the real API (installs / tpm toggle /
-// enforcement / fix); the other six panels are the design's interactive
-// local-state mock until backends exist (no fake "saved to server" — state
-// persists to localStorage so the controls feel live, like the prototype).
+// enforcement / fix). The remaining panels are the design's interactive
+// local-state mock until their backends exist (no fake "saved to server" —
+// state persists to localStorage so the controls feel live).
+//
+// "NO LIES" rule (per the design chat): every DISPLAYED stat is real or an
+// honest empty state — never a fabricated number. Where no backend exists
+// yet (checks-today, now-blocking, usage/billing $, the Activity check-run
+// feed) we render "—" / "no data yet", NOT the prototype's invented figures.
+// The interactive localStorage toggles (skin/tone/notif/persona mode) stay —
+// they're settings, not fabricated readouts.
 
 type Panel =
   | "repos" | "personas" | "appearance" | "usage" | "notifications" | "account" | "activity";
@@ -28,12 +35,12 @@ const PANELS: { id: Panel; idx: string; label: string; badge?: string }[] = [
   { id: "usage", idx: "04", label: "Usage & billing" },
   { id: "notifications", idx: "05", label: "Notifications" },
   { id: "account", idx: "06", label: "Account & org" },
-  { id: "activity", idx: "07", label: "Activity", badge: "live" },
+  { id: "activity", idx: "07", label: "Activity" },
 ];
 
 const PERSONAS = [
-  { id: "smasher", code: "F-01", name: "Smasher", img: "grug_smasher.png", desc: "Static analysis + symbolic exec + LLM diff review. Null-derefs, races, off-by-ones.", meta: ["312 runs / mo", "98% pass"] },
-  { id: "guard", code: "F-02", name: "Guard", img: "grug_guard.png", desc: "SCA, secret scanning, SAST on the diff, hourly CVE feed. Evil shall not pass.", meta: ["hourly CVE feed", "1 blocking now"] },
+  { id: "smasher", code: "F-01", name: "Smasher", img: "grug_smasher.png", desc: "Static analysis + symbolic exec + LLM diff review. Null-derefs, races, off-by-ones.", meta: ["static analysis", "diff review"] },
+  { id: "guard", code: "F-02", name: "Guard", img: "grug_guard.png", desc: "SCA, secret scanning, SAST on the diff, hourly CVE feed. Evil shall not pass.", meta: ["SCA + secrets", "SAST on diff"] },
   { id: "elder", code: "F-03", name: "Elder", img: "grug_elder.png", desc: "Line-by-line review for naming, complexity, coverage, dead code.", meta: ["BYO model key", "inline suggestions"] },
   { id: "chief", code: "F-04", name: "Chief", img: "grug_chief.png", desc: "Definition-of-Ready on every PR. Acceptance criteria, estimate, rollback plan.", meta: ["5 checks", "strict mode"] },
   { id: "warder", code: "F-05", name: "Warder", img: "grug_mystic.png", desc: "Ward off bad release. Auto-changelog, semver hint, deploy gate.", meta: ["beta", "coming soon"], soon: true },
@@ -54,16 +61,6 @@ const NOTIF = [
   { id: "stale", name: "Stale-PR pulse", desc: "Daily nudge for PRs sitting unreviewed more than 4 days." },
   { id: "weekly", name: "Weekly digest", desc: "Monday summary of what Grug crushed last week." },
 ];
-
-const ACTIVITY = [
-  { persona: "Guard", repo: "githumps/somatic-scripts", pr: "#358", v: "block", msg: "CVE-2026-1144 in lodash@4.17.20 · prototype pollution", ago: "2m" },
-  { persona: "Smasher", repo: "githumps/somatic-scripts", pr: "#358", v: "block", msg: "2 null-deref paths in parser.go:142", ago: "2m" },
-  { persona: "Chief", repo: "githumps/somatic-scripts", pr: "#358", v: "block", msg: "missing rollback plan · DoR fail", ago: "2m" },
-  { persona: "Elder", repo: "githumps/somatic-scripts", pr: "#358", v: "warn", msg: "complexity 18 in resolveTree() · coverage 67%", ago: "2m" },
-  { persona: "Smasher", repo: "githumps/grug", pr: "#142", v: "pass", msg: "0 critical findings · all error returns handled", ago: "11m" },
-  { persona: "Elder", repo: "your-org/edge-router", pr: "#77", v: "warn", msg: "C-style loop · suggest range · 1 inline fix", ago: "1h" },
-  { persona: "Smasher", repo: "your-org/retro-archive", pr: "#19", v: "pass", msg: "clean diff · no regressions detected", ago: "3h" },
-] as const;
 
 type PMode = "block" | "warn" | "off";
 const LS = "grug_dash_v2";
@@ -178,19 +175,22 @@ export function Dashboard() {
                 </button>
               ))}
             </div>
-            <div className="rail-foot">
-              <div className="plan"><span>PLAN</span><b>PRO</b></div>
-              <div className="muted">19 / 50 checks today</div>
-              <div className="meter"><i style={{ width: "38%" }}></i></div>
-              <div className="muted">Resets 00:00 UTC · 6 seats</div>
-            </div>
+            {installList[0] && (
+              <div className="rail-foot">
+                <div className="plan">
+                  <span>{installList[0].account_type === "Organization" ? "ORG" : "USER"}</span>
+                  <b>{installList[0].account_login}</b>
+                </div>
+                <div className="muted">installed {new Date(installList[0].installed_at).toLocaleDateString()}</div>
+              </div>
+            )}
           </aside>
 
           <main className="main">
             <ReposPanel show={panel === "repos"} installId={installId} reposLoading={installs.isLoading} fireToast={fireToast} />
             <PersonasPanel show={panel === "personas"} modes={local.personas} setMode={(id, v) => { setLocal({ personas: { ...local.personas, [id]: v } }); fireToast(`${id.toUpperCase()} → <span class="am">${v.toUpperCase()}</span>`); }} />
             <AppearancePanel show={panel === "appearance"} local={local} setLocal={setLocal} fireToast={fireToast} />
-            <UsagePanel show={panel === "usage"} cap={local.cap} setCap={(c) => { setLocal({ cap: c }); fireToast(`Daily cap → <span class="am">${c === "0" ? "∞" : c}</span>`); }} />
+            <UsagePanel show={panel === "usage"} />
             <NotificationsPanel show={panel === "notifications"} notif={local.notif} toggle={(id) => setLocal({ notif: { ...local.notif, [id]: !local.notif[id] } })} />
             <AccountPanel show={panel === "account"} me={{ login: me.data.login ?? "you", role: me.data.role ?? "user" }} pauseAll={local.pauseAll} setPause={(v) => { setLocal({ pauseAll: v }); fireToast(v ? 'All personas <span class="am">PAUSED</span>. Grug nap.' : 'Grug <span class="am">AWAKE</span>. Back to work.'); }} />
             <ActivityPanel show={panel === "activity"} />
@@ -227,12 +227,28 @@ function StatStrip({ installId }: { installId?: number }) {
   const repos = useInstallRepos(installId);
   const list = repos.data?.repos ?? [];
   const guarded = list.filter((r) => r.config.tpm_enabled).length;
+  const reposReady = !repos.isLoading && !repos.isError && installId != null;
+  // "no lies": only Repos-guarded has a real backend today. Active-personas,
+  // checks-today and now-blocking have no real source yet, so they render an
+  // honest em-dash (data unavailable) rather than a fabricated figure. Each is
+  // wired as its backend lands (per-persona config, a usage counter, a
+  // check-run history store).
+  const NA = (
+    <span className="v" title="Not wired yet — Grug not count this. Shows real number once the backend lands.">
+      —
+    </span>
+  );
   return (
     <div className="statstrip">
-      <div className="cell"><div className="k">Repos guarded</div><div className="v">{guarded}<small> / {list.length} installed</small></div></div>
-      <div className="cell"><div className="k">Personas active</div><div className="v">2<small> active</small></div></div>
-      <div className="cell amber"><div className="k">Checks today</div><div className="v">19<small> / 50</small></div></div>
-      <div className="cell ink"><div className="k">Now blocking</div><div className="v">3<small> PRs gated</small></div></div>
+      <div className="cell">
+        <div className="k">Repos guarded</div>
+        {reposReady
+          ? <div className="v">{guarded}<small> / {list.length} installed</small></div>
+          : NA}
+      </div>
+      <div className="cell"><div className="k">Personas active</div>{NA}</div>
+      <div className="cell amber"><div className="k">Checks today</div>{NA}</div>
+      <div className="cell ink"><div className="k">Now blocking</div>{NA}</div>
     </div>
   );
 }
@@ -394,48 +410,23 @@ function AppearancePanel({ show, local, setLocal, fireToast }: { show: boolean; 
   );
 }
 
-function UsagePanel({ show, cap, setCap }: { show: boolean; cap: string; setCap: (c: string) => void }) {
+function UsagePanel({ show }: { show: boolean }) {
+  // "no lies": there is no usage-metering or billing backend yet, so this panel
+  // shows nothing invented — no fake "19/50 checks", no fake "$72/mo". An
+  // honest placeholder stands in until the usage counter + billing land.
   return (
     <section className={`panel${show ? " show" : ""}`}>
       <div className="panel-head">
         <h2>Usage &amp; <em>budget</em>.</h2>
-        <p className="note">// Grug cost money to run. Cap the daily checks so Grug not eat your whole AWS bill.</p>
+        <p className="note">// Grug cost money to run. One day you cap the daily checks so Grug not eat your whole AWS bill.</p>
       </div>
       <div className="card">
         <div className="card-head">Daily PR-check budget</div>
         <div className="card-body">
-          <div className="bignum">19 <small>of 50 checks used today</small></div>
-          <div className="budget"><i style={{ width: "38%" }}></i><span>38%</span></div>
-          <div className="field" style={{ borderTop: "2px dashed var(--ink)", marginTop: 8 }}>
-            <div className="lbl"><b>Hard cap per day</b><span>Grug stops posting once cap is hit. Pending PRs queue for tomorrow.</span></div>
-            <div className="seg">
-              {[["50", "50"], ["200", "200"], ["1000", "1000"], ["0", "∞"]].map(([v, lbl]) => (
-                <button key={v} className={cap === v ? "on" : ""} onClick={() => setCap(v)}>{lbl}</button>
-              ))}
-            </div>
-          </div>
-        </div>
-      </div>
-      <div className="card">
-        <div className="card-head">Current plan</div>
-        <div className="card-body" style={{ padding: 0 }}>
-          <div className="plan-grid">
-            <div>
-              <div className="nm">Pro</div>
-              <div className="pr">$12 / mo · per seat · 6 seats</div>
-              <ul className="feats" style={{ marginTop: 14 }}>
-                <li>Unlimited PR checks</li><li>All personas</li><li>Up to 10 repos</li><li>BYO model key</li>
-              </ul>
-            </div>
-            <div>
-              <div className="k mono" style={{ fontSize: 10, letterSpacing: "0.12em", textTransform: "uppercase", color: "var(--muted)" }}>This cycle</div>
-              <div className="bignum" style={{ margin: "8px 0 4px" }}>$72<small>/mo</small></div>
-              <div className="pr">Renews Jun 12 · 487 checks billed</div>
-              <div style={{ display: "flex", gap: 10, marginTop: 16, flexWrap: "wrap" }}>
-                <a className="btn sm" href="#">Manage billing</a>
-                <a className="btn sm ghost" href="/#pricing">Change plan</a>
-              </div>
-            </div>
+          <div className="mono" style={{ fontSize: 12, color: "var(--muted)", padding: "6px 0", lineHeight: 1.7 }}>
+            Grug not count checks yet.<br />
+            // Usage metering and per-day caps arrive with the billing backend.<br />
+            // No made-up numbers here — real counts show once Grug count for real.
           </div>
         </div>
       </div>
@@ -480,8 +471,8 @@ function AccountPanel({ show, me, pauseAll, setPause }: { show: boolean; me: { l
             <a className="btn sm ghost" href="https://github.com/apps/grug-tribe/installations/new">Manage on GitHub</a>
           </div>
           <div className="field">
-            <div className="lbl"><b>BYO model key</b><span>Grug uses your own LLM key for Elder review. Never leaves your VPC.</span></div>
-            <input className="text" type="password" defaultValue="sk-grug-••••••••••••" placeholder="sk-…" />
+            <div className="lbl"><b>BYO model key</b><span>Grug use your own LLM key for Elder review. Never leaves your VPC. <span className="mono" style={{ color: "var(--muted)" }}>// storage not wired yet</span></span></div>
+            <input className="text" type="password" placeholder="sk-… (not stored yet)" disabled />
           </div>
         </div>
       </div>
@@ -504,8 +495,10 @@ function AccountPanel({ show, me, pauseAll, setPause }: { show: boolean; me: { l
 
 function ActivityPanel({ show }: { show: boolean }) {
   const [filter, setFilter] = useState("all");
-  const sym = (v: string) => (v === "block" ? "×" : v === "warn" ? "!" : "✓");
-  const rows = ACTIVITY.filter((a) => filter === "all" || a.v === filter);
+  // "no lies": the Check-Run history feed has no real backend yet. Rather than
+  // ship the design's fabricated sample rows (fake CVEs, fake PRs), show an
+  // honest empty state until the real check-run source is wired. The filter
+  // chrome stays so the panel matches the design and is ready to light up.
   return (
     <section className={`panel${show ? " show" : ""}`}>
       <div className="panel-head">
@@ -522,15 +515,10 @@ function ActivityPanel({ show }: { show: boolean }) {
               ))}
             </div>
           </div>
-          {rows.map((a, i) => (
-            <div className="afeed-row" key={i}>
-              <div className={`vico ${a.v}`}>{sym(a.v)}</div>
-              <div className="who2"><b>{a.persona}</b> <span className="repo2">{a.repo} · {a.pr}</span><span className="msg">{a.msg}</span></div>
-              <span className={`verdict ${a.v}`}>{a.v.toUpperCase()}</span>
-              <span className="ago">{a.ago}</span>
-            </div>
-          ))}
-          {rows.length === 0 && <div className="mono" style={{ fontSize: 12, color: "var(--muted)", padding: 8 }}>Nothing here. Grug calm.</div>}
+          <div className="mono" style={{ fontSize: 12, color: "var(--muted)", padding: 8, lineHeight: 1.7 }}>
+            Grug calm. No runs yet.<br />
+            // The Check-Run feed lights up here once Grug start posting verdicts on your PRs.
+          </div>
         </div>
       </div>
     </section>
