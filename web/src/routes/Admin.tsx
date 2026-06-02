@@ -38,10 +38,10 @@ export function Admin() {
 
       <header className="nav">
         <div className="nav-inner">
-          <Link className="brand" to="/">
+          <a className="brand" href="/">
             <span className="brand-mark"><img src="/assets/grug-angry.png" alt="" /></span>
             <span>grug</span>
-          </Link>
+          </a>
           <nav className="links">
             <Link to="/dashboard">Dashboard</Link>
             <Link to="/admin" className="active">Admin</Link>
