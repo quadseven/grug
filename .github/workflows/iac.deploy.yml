@@ -1,23 +1,15 @@
 name: IaC · Pulumi deploy (grug)
-
 on:
   pull_request:
     branches: [main]
   workflow_dispatch:
-
 permissions:
   contents: read
-  id-token: write
-
 jobs:
   build:
-    uses: githumps/infrastructure/.github/workflows/_reusable.container-build.yml@06136d47ecaae1893471210dc17a5dec8e7de09b
+    uses: githumps/infrastructure/.github/workflows/_reusable.python-check.yml@0f8db3f5297b88ba041dc6d62d3c91c7f9f3f29c
     with:
-      runner: ubuntu-24.04-arm
-      image: grug-webhook
-      tag: testtag
-      context: services/webhook
-      dockerfile: services/webhook/Dockerfile.lambda
-      platform: linux/arm64
-      registry-type: none
-      push: false
+      runner: ubuntu-latest
+      install-cmd: "echo skip-install"
+      ruff: false
+      test-cmd: ""
