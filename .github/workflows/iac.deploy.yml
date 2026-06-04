@@ -1,27 +1,6 @@
 name: IaC · Pulumi deploy (grug)
 
-# Deploys grug SaaS infra to AWS via OIDC (no long-lived creds).
-#   - PR to main          → build-only validation (native arm64, no push/deploy)
-#   - push main / tag v*  → build + push images, then pulumi up + CF Workers + smoke
-# webhook+api arm64 images build via the #835 container-build reusable
-# (native arm64 on ubuntu-24.04-arm — NO QEMU). Two explicit build jobs
-# (not a matrix) to match the proven cross-repo reusable-call pattern.
-
 on:
-  push:
-    branches:
-      - main
-      - 'feat/22-*'
-      - 'feat/23-*'
-      - 'feat/24-*'
-      - 'feat/25-*'
-      - 'feat/26-*'
-      - 'feat/27-*'
-      - 'feat/28-*'
-      - 'feat/29-*'
-      - 'feat/30-*'
-      - 'feat/31-*'
-    tags: ['v*']
   pull_request:
     branches: [main]
   workflow_dispatch:
@@ -30,104 +9,15 @@ permissions:
   contents: read
   id-token: write
 
-concurrency:
-  group: iac-deploy-${{ github.ref }}
-  cancel-in-progress: false
-
 jobs:
-  meta:
-    runs-on: ubuntu-latest
-    outputs:
-      tag: ${{ steps.t.outputs.tag }}
-    steps:
-      - id: t
-        run: echo "tag=${GITHUB_SHA::8}" >> "$GITHUB_OUTPUT"
-
-  build-webhook:
-    needs: meta
-    uses: githumps/infrastructure/.github/workflows/_reusable.container-build.yml@06136d47ecaae1893471210dc17a5dec8e7de09b  # infra main; bump deliberately
+  build:
+    uses: githumps/infrastructure/.github/workflows/_reusable.container-build.yml@06136d47ecaae1893471210dc17a5dec8e7de09b
     with:
       runner: ubuntu-24.04-arm
       image: grug-webhook
-      tag: ${{ needs.meta.outputs.tag }}
+      tag: testtag
       context: services/webhook
       dockerfile: services/webhook/Dockerfile.lambda
       platform: linux/arm64
-      registry-type: ecr
-      push: ${{ github.event_name != 'pull_request' }}
-    secrets:
-      role_to_assume: arn:aws:iam::${{ secrets.AWS_ACCOUNT_ID }}:role/grug-gha-deploy
-      registry: ${{ secrets.AWS_ACCOUNT_ID }}.dkr.ecr.us-east-1.amazonaws.com
-
-  build-api:
-    needs: meta
-    uses: githumps/infrastructure/.github/workflows/_reusable.container-build.yml@06136d47ecaae1893471210dc17a5dec8e7de09b  # infra main; bump deliberately
-    with:
-      runner: ubuntu-24.04-arm
-      image: grug-api
-      tag: ${{ needs.meta.outputs.tag }}
-      context: services/api
-      dockerfile: services/api/Dockerfile.lambda
-      platform: linux/arm64
-      registry-type: ecr
-      push: ${{ github.event_name != 'pull_request' }}
-    secrets:
-      role_to_assume: arn:aws:iam::${{ secrets.AWS_ACCOUNT_ID }}:role/grug-gha-deploy
-      registry: ${{ secrets.AWS_ACCOUNT_ID }}.dkr.ecr.us-east-1.amazonaws.com
-
-  pulumi-up:
-    needs: [meta, build-webhook, build-api]
-    if: github.event_name != 'pull_request'
-    runs-on: ubuntu-latest
-    timeout-minutes: 20
-    steps:
-      - name: 01. Checkout
-        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
-      - name: 02. Configure AWS via OIDC
-        uses: aws-actions/configure-aws-credentials@ec61189d14ec14c8efccab744f656cffd0e33f37 # v6.1.0
-        with:
-          role-to-assume: arn:aws:iam::${{ secrets.AWS_ACCOUNT_ID }}:role/grug-gha-deploy
-          aws-region: us-east-1
-      - name: 03. Stack name
-        id: stack
-        run: echo "stack=prod" >> "$GITHUB_OUTPUT"
-      - name: 04. Pulumi login (S3 backend)
-        run: pulumi login s3://pulumi-state-mizu-cloud-castle
-      - name: 05a. Install uv
-        uses: astral-sh/setup-uv@d4b2f3b6ecc6e67c4457f6d3e41ec42d3d0fcb86 # v5
-      - name: 05b. Verify Python + uv
-        run: |
-          python3 --version
-          uv --version
-      - name: 10. Pulumi up
-        uses: pulumi/actions@8582a9e8cc630786854029b4e09281acd6794b58 # v6.6.1
-        with:
-          command: up
-          stack-name: ${{ steps.stack.outputs.stack }}
-          cloud-url: s3://pulumi-state-mizu-cloud-castle
-          work-dir: infra/pulumi
-          config-map: |
-            webhook_image_tag: { value: "${{ needs.meta.outputs.tag }}" }
-            api_image_tag:     { value: "${{ needs.meta.outputs.tag }}" }
-            full_commit_sha:   { value: "${{ github.sha }}" }
-      - name: 11. Deploy CF Workers
-        run: bash infra/cloudflare/deploy.sh
-        env:
-          PULUMI_CWD: infra/pulumi
-      - name: 12. Smoke test public endpoints
-        run: |
-          set -euo pipefail
-          DOMAIN_API="https://api.grug.lol"
-          DOMAIN_WH="https://webhook.grug.lol"
-          probe() {
-            local name="$1" url="$2" expected="$3"; shift 3
-            local actual
-            actual=$(curl -sS -o /dev/null -w "%{http_code}" \
-              --max-time 30 --retry 3 --retry-delay 5 --retry-all-errors "$@" "$url")
-            [ "$actual" = "$expected" ] || { echo "::error::$name expected $expected got $actual ($url)"; return 1; }
-            echo "✓ $name ($actual)"
-          }
-          probe "api /livez"     "$DOMAIN_API/livez" 200
-          probe "webhook /livez" "$DOMAIN_WH/livez"  200
-          probe "webhook unsigned POST" "$DOMAIN_WH/webhook/github" 401 \
-            -X POST -H "Content-Type: application/json" -H "X-GitHub-Event: ping" -d '{"zen":"smoke"}'
+      registry-type: none
+      push: false
