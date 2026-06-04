@@ -61,12 +61,8 @@ jobs:
       context: services/${{ matrix.service }}
       dockerfile: services/${{ matrix.service }}/Dockerfile.lambda
       platform: linux/arm64
-      registry-type: ecr
-      # Build-only on PRs (no ECR push/deploy); push on main/tag/dispatch.
-      push: ${{ github.event_name != 'pull_request' }}
-    secrets:
-      role_to_assume: arn:aws:iam::${{ secrets.AWS_ACCOUNT_ID }}:role/grug-gha-deploy
-      registry: ${{ secrets.AWS_ACCOUNT_ID }}.dkr.ecr.us-east-1.amazonaws.com
+      registry-type: none
+      push: false
 
   pulumi-up:
     needs: [meta, build]
