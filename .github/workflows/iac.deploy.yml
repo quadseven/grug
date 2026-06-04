@@ -1,14 +1,14 @@
 name: IaC · Pulumi deploy (grug)
 
-# Deploys grug SaaS infra to AWS via OIDC role (no long-lived creds).
-# Trigger:
-#   - merge to main → `pulumi up dev` stack
-#   - tag push v* → `pulumi up prod` stack (Slice 1: dev only)
+# Deploys grug SaaS infra to AWS via OIDC (no long-lived creds).
+#   - PR to main          → build-only validation (native arm64, no push/deploy)
+#   - push main / tag v*  → build + push images, then pulumi up + CF Workers + smoke
+# webhook+api arm64 images build via the #835 container-build reusable in
+# githumps/infra-public (PUBLIC — grug is public, so it can't call the private
+# infra repo's reusable). Native arm64 on ubuntu-24.04-arm — NO QEMU.
 
 on:
   push:
-    # `main` + active SaaS-conversion feature branches (epic-grug-saas).
-    # Tighten back to `main` only at Slice 13 (#34) cutover.
     branches:
       - main
       - 'feat/22-*'
@@ -22,134 +22,70 @@ on:
       - 'feat/30-*'
       - 'feat/31-*'
     tags: ['v*']
+  pull_request:
+    branches: [main]
   workflow_dispatch:
 
 permissions:
   contents: read
-  id-token: write   # Required for OIDC AWS auth
-
-# Force every JS-action to run on Node 24 instead of Node 20 (deprecated
-# 2026-09-16; default-on 2026-06-02). Bridges until each pinned action
-# ships a Node24-native release. Closes #71.
-env:
-  FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: "true"
+  id-token: write
 
 concurrency:
   group: iac-deploy-${{ github.ref }}
   cancel-in-progress: false
 
 jobs:
+  meta:
+    runs-on: ubuntu-latest
+    outputs:
+      tag: ${{ steps.t.outputs.tag }}
+    steps:
+      - id: t
+        run: echo "tag=${GITHUB_SHA::8}" >> "$GITHUB_OUTPUT"
+
+  build:
+    needs: meta
+    strategy:
+      matrix:
+        service: [webhook, api]
+    uses: githumps/infra-public/.github/workflows/_reusable.container-build.yml@d27416e63a9e14c626ae728f65ab0287eac6d78c  # infra-public main; bump deliberately
+    with:
+      runner: ubuntu-24.04-arm
+      image: grug-${{ matrix.service }}
+      tag: ${{ needs.meta.outputs.tag }}
+      context: services/${{ matrix.service }}
+      dockerfile: services/${{ matrix.service }}/Dockerfile.lambda
+      platform: linux/arm64
+      registry-type: ecr
+      push: ${{ github.event_name != 'pull_request' }}
+    secrets:
+      role_to_assume: arn:aws:iam::${{ secrets.AWS_ACCOUNT_ID }}:role/grug-gha-deploy
+      registry: ${{ secrets.AWS_ACCOUNT_ID }}.dkr.ecr.us-east-1.amazonaws.com
+
   pulumi-up:
-    # Public repo → GitHub-hosted ubuntu-latest is free + unmetered + no
-    # nightly auto-reboot interruption risk. Swapped from
-    # [self-hosted, srv-unraid-gha] 2026-05-24.
-    #
-    # Trade-off: the docker buildx `type=local,src=/tmp/buildx-cache-grug/`
-    # cache below survived across runs on the self-hosted runner but
-    # resets on every fresh ubuntu-latest VM. Each deploy will cold-build
-    # the 2 ECR images (~90s × 2 = ~3 min extra). Follow-up: swap
-    # `type=local` → `type=gha,mode=max` for GitHub's native cache.
+    needs: [meta, build]
+    if: github.event_name != 'pull_request'
     runs-on: ubuntu-latest
     timeout-minutes: 20
     steps:
       - name: 01. Checkout
         uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
-
       - name: 02. Configure AWS via OIDC
         uses: aws-actions/configure-aws-credentials@ec61189d14ec14c8efccab744f656cffd0e33f37 # v6.1.0
         with:
           role-to-assume: arn:aws:iam::${{ secrets.AWS_ACCOUNT_ID }}:role/grug-gha-deploy
           aws-region: us-east-1
-
-      - name: 03. Stack name (single env)
+      - name: 03. Stack name
         id: stack
-        run: echo "stack=prod" >> $GITHUB_OUTPUT
-
+        run: echo "stack=prod" >> "$GITHUB_OUTPUT"
       - name: 04. Pulumi login (S3 backend)
-        run: |
-          pulumi login s3://pulumi-state-mizu-cloud-castle
-
-      # ubuntu-latest ships system Python 3.12 but does NOT include uv.
-      # (The previous comment here claimed uv came from the runner-tooling
-      # bootstrap — that was true for srv-unraid-gha; ubuntu-latest needs
-      # it installed explicitly. PR #156's runner swap silently broke
-      # every iac.deploy from 2026-05-24 until this hotfix because uv was
-      # missing.) Use astral-sh/setup-uv for the cached, pinned install.
-      # Pinned to the same SHA used across infrastructure/.github/workflows/
-      # iac.pulumi.*.yml — keeps the uv version in lockstep with sibling
-      # Pulumi projects so a bump (or known-good rollback) is one greppable
-      # edit across all repos.
+        run: pulumi login s3://pulumi-state-mizu-cloud-castle
       - name: 05a. Install uv
         uses: astral-sh/setup-uv@d4b2f3b6ecc6e67c4457f6d3e41ec42d3d0fcb86 # v5
-
       - name: 05b. Verify Python + uv
         run: |
           python3 --version
           uv --version
-
-      - name: 06. Setup QEMU (arm64 cross-build emulation on x86)
-        uses: docker/setup-qemu-action@c7c53464625b32c7a7e944ae62b3e17d2b600130 # v3.7.0
-        with:
-          platforms: arm64
-
-      - name: 07. Setup Docker Buildx
-        uses: docker/setup-buildx-action@8d2750c68a42422c14e847fe6c8ac0403b4cbd6f # v3.12.0
-
-      - name: 08. Login to ECR
-        run: |
-          aws ecr get-login-password --region us-east-1 | \
-            docker login --username AWS --password-stdin \
-            ${{ secrets.AWS_ACCOUNT_ID }}.dkr.ecr.us-east-1.amazonaws.com
-
-      - name: 09. Build + push webhook + api images
-        id: build
-        run: |
-          IMAGE_TAG="${GITHUB_SHA::8}"
-          ECR="${{ secrets.AWS_ACCOUNT_ID }}.dkr.ecr.us-east-1.amazonaws.com"
-
-          # Lambda Image-mode rejects OCI media types + buildx provenance
-          # attestations. Force Docker manifest schema 2 + disable
-          # attestations so the manifest is a single arm64 image, not a
-          # provenance-wrapped manifest list.
-          #
-          # Closes #70: --cache-from + --cache-to type=local on the
-          # self-hosted runner's filesystem persists buildx layers
-          # between runs. Skips re-pulling python:3.13-arm64 base
-          # (~90s × 2 services) on warm-cache deploys.
-          # DD_GIT_* env vars now set on the Lambda Function (in
-          # __main__.py) instead of via --build-arg, so commit-SHA
-          # changes don't bust every layer.
-          set -euo pipefail
-          mkdir -p /tmp/buildx-cache-grug
-          for service in webhook api; do
-            REPO="$ECR/grug-$service"
-            CACHE_DIR="/tmp/buildx-cache-grug/$service"
-            mkdir -p "$CACHE_DIR"
-            # Atomic swap path: write new layers to -new, then promote
-            # ONLY if buildx exits 0 (set -e + && guard). A partial /
-            # corrupted dest never overwrites the working cache. Greptile
-            # P2 PR #81.
-            docker buildx build \
-              --platform linux/arm64 \
-              --provenance=false \
-              --sbom=false \
-              --file services/$service/Dockerfile.lambda \
-              --cache-from "type=local,src=$CACHE_DIR" \
-              --cache-to "type=local,dest=$CACHE_DIR-new,mode=max" \
-              --tag "$REPO:$IMAGE_TAG" \
-              --tag "$REPO:latest" \
-              --push \
-              "services/$service" \
-            && rm -rf "$CACHE_DIR" \
-            && mv "$CACHE_DIR-new" "$CACHE_DIR"
-          done
-          echo "tag=$IMAGE_TAG" >> $GITHUB_OUTPUT
-
-      # IAM eventual consistency now modeled in IaC via a
-      # `pulumiverse_time.Sleep` resource that gates KMS-using Lambda
-      # ops on the deploy-role policy having propagated. Local + CI
-      # share the same waiter. Closes #88. Previously this step had
-      # `continue-on-error: true` + a 45s sleep + retry (steps 10b/10c).
       - name: 10. Pulumi up
         uses: pulumi/actions@8582a9e8cc630786854029b4e09281acd6794b58 # v6.6.1
         with:
@@ -157,54 +93,23 @@ jobs:
           stack-name: ${{ steps.stack.outputs.stack }}
           cloud-url: s3://pulumi-state-mizu-cloud-castle
           work-dir: infra/pulumi
-          # full_commit_sha = 40-char SHA used for DD source-code linking
-          # (image_tag is 8-char short SHA; DD source UI requires full).
-          # Greptile P1 PR #81.
           config-map: |
-            webhook_image_tag: { value: "${{ steps.build.outputs.tag }}" }
-            api_image_tag:     { value: "${{ steps.build.outputs.tag }}" }
+            webhook_image_tag: { value: "${{ needs.meta.outputs.tag }}" }
+            api_image_tag:     { value: "${{ needs.meta.outputs.tag }}" }
             full_commit_sha:   { value: "${{ github.sha }}" }
-
-      - name: 11. Deploy CF Workers (host-rewrite proxies)
+      - name: 11. Deploy CF Workers
         run: bash infra/cloudflare/deploy.sh
         env:
           PULUMI_CWD: infra/pulumi
-
-      # 12. Post-deploy smoke test: catches Lambda boot failures, async-
-      # handler regressions, container handler import errors, CF Worker
-      # mis-routes BEFORE the next webhook lands. Failure here is more
-      # actionable than waiting for the first real request to time out
-      # (or worse, silently 422 like the bug closed in #124).
-      #
-      # Each subcommand is `set -e`-fatal; one failure stops the run.
-      # Retries built in: webhook + api may cold-start on first invoke
-      # so each curl gets up to 30s + 3 retries with backoff.
       - name: 12. Smoke test public endpoints
         run: |
           set -euo pipefail
-          DOMAIN_API="https://api.grug.lol"
-          DOMAIN_WH="https://webhook.grug.lol"
-
+          DOMAIN_API="https://api.grug.lol"; DOMAIN_WH="https://webhook.grug.lol"
           probe() {
-            local name="$1"
-            local url="$2"
-            local expected="$3"
-            shift 3
-            local actual
-            actual=$(curl -sS -o /dev/null -w "%{http_code}" \
-              --max-time 30 --retry 3 --retry-delay 5 --retry-all-errors \
-              "$@" "$url")
-            if [ "$actual" != "$expected" ]; then
-              echo "::error::$name expected $expected got $actual ($url)"
-              return 1
-            fi
-            echo "✓ $name ($actual)"
-          }
-
-          probe "api /livez"     "$DOMAIN_API/livez"     200
-          probe "webhook /livez" "$DOMAIN_WH/livez"      200
-          # Unsigned POST must 401 — proves HMAC verify gate runs (the
-          # #124 bug returned 422 here, blocking every real webhook).
-          probe "webhook unsigned POST" "$DOMAIN_WH/webhook/github" 401 \
-            -X POST -H "Content-Type: application/json" \
-            -H "X-GitHub-Event: ping" -d '{"zen":"smoke"}'
+            local name="$1" url="$2" expected="$3"; shift 3
+            local actual; actual=$(curl -sS -o /dev/null -w "%{http_code}" --max-time 30 --retry 3 --retry-delay 5 --retry-all-errors "$@" "$url")
+            [ "$actual" = "$expected" ] || { echo "::error::$name expected $expected got $actual ($url)"; return 1; }
+            echo "✓ $name ($actual)"; }
+          probe "api /livez" "$DOMAIN_API/livez" 200
+          probe "webhook /livez" "$DOMAIN_WH/livez" 200
+          probe "webhook unsigned POST" "$DOMAIN_WH/webhook/github" 401 -X POST -H "Content-Type: application/json" -H "X-GitHub-Event: ping" -d '{"zen":"smoke"}'
