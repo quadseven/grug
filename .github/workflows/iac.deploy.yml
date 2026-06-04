@@ -31,9 +31,6 @@ permissions:
   contents: read
   id-token: write   # OIDC AWS auth
 
-env:
-  FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: "true"
-
 concurrency:
   group: iac-deploy-${{ github.ref }}
   cancel-in-progress: false
@@ -49,23 +46,19 @@ jobs:
         run: echo "tag=${GITHUB_SHA::8}" >> "$GITHUB_OUTPUT"
 
   build:
-    needs: meta
-    strategy:
-      matrix:
-        service: [webhook, api]
     uses: githumps/infrastructure/.github/workflows/_reusable.container-build.yml@06136d47ecaae1893471210dc17a5dec8e7de09b  # infra main; bump deliberately
     with:
       runner: ubuntu-24.04-arm
-      image: grug-${{ matrix.service }}
-      tag: ${{ needs.meta.outputs.tag }}
-      context: services/${{ matrix.service }}
-      dockerfile: services/${{ matrix.service }}/Dockerfile.lambda
+      image: grug-webhook
+      tag: testtag
+      context: services/webhook
+      dockerfile: services/webhook/Dockerfile.lambda
       platform: linux/arm64
       registry-type: none
       push: false
 
   pulumi-up:
-    needs: [meta, build]
+    needs: [build]
     if: github.event_name != 'pull_request'
     runs-on: ubuntu-latest
     timeout-minutes: 20
