@@ -53,7 +53,7 @@ jobs:
     strategy:
       matrix:
         service: [webhook, api]
-    uses: githumps/infrastructure/.github/workflows/_reusable.container-build.yml@f4b5f43189c2460441f930e90c4e196f41b91e41  # infra main; bump deliberately
+    uses: githumps/infrastructure/.github/workflows/_reusable.container-build.yml@06136d47ecaae1893471210dc17a5dec8e7de09b  # infra main; bump deliberately
     with:
       runner: ubuntu-24.04-arm
       image: grug-${{ matrix.service }}
@@ -65,7 +65,7 @@ jobs:
       # Build-only on PRs (no ECR push/deploy); push on main/tag/dispatch.
       push: ${{ github.event_name != 'pull_request' }}
     secrets:
-      role-to-assume: arn:aws:iam::${{ secrets.AWS_ACCOUNT_ID }}:role/grug-gha-deploy
+      role_to_assume: arn:aws:iam::${{ secrets.AWS_ACCOUNT_ID }}:role/grug-gha-deploy
       registry: ${{ secrets.AWS_ACCOUNT_ID }}.dkr.ecr.us-east-1.amazonaws.com
 
   pulumi-up:
