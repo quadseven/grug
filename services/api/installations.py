@@ -1,8 +1,7 @@
 """User-facing installation + per-repo config endpoints (Slice 7 #28).
 
-3 endpoints, all session-cookie-authed (allowlist NOT required — users
-need to see their own installs even before admin allowlists them so
-they know to wait):
+All session-cookie-authed (allowlist NOT required — users need to see
+their own installs even before admin allowlists them so they know to wait):
 
   GET  /api/v1/installations
        → INST# rows installed by the current user
@@ -10,6 +9,10 @@ they know to wait):
   GET  /api/v1/installations/{install_id}/repos
        → repos visible to that install (calls GitHub via install token,
          then merges per-repo config from DDB)
+
+  GET  /api/v1/installations/{install_id}/activity
+       → recent Check verdicts (Activity feed, PRD #301), newest-first,
+         badge derived server-side; `?verdict=` filter, `limit` cap
 
   PUT  /api/v1/installations/{install_id}/repos/{repo_id}/config
        → upsert per-repo persona override (e.g. {"tpm_enabled": false})
@@ -30,12 +33,14 @@ from pydantic import BaseModel, ConfigDict, Field
 from adapters.install_store import (
     get_installation,
     get_repo_config,
+    list_check_verdicts,
     list_user_installations,
     set_repo_config,
 )
 from adapters.user_store import UserIdentity
 from auth.dependencies import require_authenticated
 from github_app_auth import get_install_token, with_install_token_retry
+from review_types import verdict as derive_verdict
 
 log = logging.getLogger("grug.api.installations")
 
@@ -203,6 +208,57 @@ def _toggle_enforcement(
                    "full_name": full_name, "enable": enable},
             exc_info=True,
         )
+
+
+@router.get("/installations/{install_id}/activity")
+def list_activity(
+    install_id: int,
+    verdict: str | None = None,
+    limit: int = 50,
+    user: UserIdentity = Depends(require_authenticated),
+) -> dict[str, Any]:
+    """Activity feed (PRD #301): the install's recent Check verdicts,
+    newest-first. The `verdict` badge is DERIVED server-side from each row's
+    raw facts via the single `review_types.verdict` mapper (ADR-0003) — the
+    frontend renders it verbatim, never re-derives, so a mapping change heals
+    history on read. Optional `?verdict=` filters to one badge; `limit` caps
+    the result (default 50, clamped 1..200)."""
+    install = get_installation(install_id)
+    if not install:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="install not found")
+    _ensure_can_access(install, user)
+    # Clamp the client-controlled limit in-function (not via Query(ge/le)) so
+    # the route stays directly callable in unit tests — the repo's endpoint
+    # tests invoke route fns directly, where a Query() default wouldn't resolve.
+    limit = max(1, min(limit, 200))
+    # Fetch the FULL (TTL-bounded) partition — the store materializes + sorts it
+    # all regardless — so the re-derive + `?verdict=` filter run across every
+    # row before we cap. Capping the fetch would let a sparse filter under-return
+    # (matches stranded past the cap). A time-ordered GSI is the noted scale
+    # upgrade if an install ever outgrows a single in-memory partition load.
+    fetched = list_check_verdicts(install_id, limit=None)
+    out: list[dict[str, Any]] = []
+    for r in fetched:
+        v = derive_verdict(
+            conclusion=r["conclusion"],
+            findings_count=r["findings_count"],
+            degraded_reason=r.get("degraded_reason"),
+        )
+        if verdict is not None and v != verdict:
+            continue
+        out.append({
+            "persona": r["persona"],
+            "repo": r["repo"],
+            "pr_number": r["pr_number"],
+            "head_sha": r["head_sha"],
+            "verdict": v,
+            "summary": r["summary"],
+            "findings_count": r["findings_count"],
+            "created_at": r["created_at"],
+        })
+        if len(out) >= limit:
+            break
+    return {"activity": out}
 
 
 @router.put("/installations/{install_id}/repos/{repo_id}/config")
