@@ -532,3 +532,13 @@ def test_list_check_verdicts_paginates_and_sorts_across_pages(_ddb_table, monkey
     rows = mod.list_check_verdicts(1)
     assert calls["n"] == 2  # both pages fetched
     assert [r["head_sha"] for r in rows] == ["new", "old"]  # page-2 newest sorts first
+
+
+def test_list_check_verdicts_limit_none_returns_all(_ddb_table):
+    """limit=None returns the full set (used by /activity, which filters across
+    all rows before applying its own cap); an int limit still slices."""
+    mod = _ddb_table
+    for i in range(5):
+        _put_cv(mod, head_sha=f"s{i}")
+    assert len(mod.list_check_verdicts(1, limit=None)) == 5
+    assert len(mod.list_check_verdicts(1, limit=2)) == 2

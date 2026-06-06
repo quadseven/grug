@@ -222,16 +222,21 @@ def list_activity(
     raw facts via the single `review_types.verdict` mapper (ADR-0003) — the
     frontend renders it verbatim, never re-derives, so a mapping change heals
     history on read. Optional `?verdict=` filters to one badge; `limit` caps
-    the result (default 50)."""
+    the result (default 50, clamped 1..200)."""
     install = get_installation(install_id)
     if not install:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="install not found")
     _ensure_can_access(install, user)
-    # Fetch a wider window when filtering so the cap applies to MATCHING rows,
-    # not pre-filter rows (else `?verdict=block` could return < limit even when
-    # more blocks exist deeper in the feed). 200 is the practical feed max under
-    # the 90-day TTL; revisit with a GSI if an install ever outgrows it.
-    fetched = list_check_verdicts(install_id, limit=(200 if verdict else limit))
+    # Clamp the client-controlled limit in-function (not via Query(ge/le)) so
+    # the route stays directly callable in unit tests — the repo's endpoint
+    # tests invoke route fns directly, where a Query() default wouldn't resolve.
+    limit = max(1, min(limit, 200))
+    # Fetch the FULL (TTL-bounded) partition — the store materializes + sorts it
+    # all regardless — so the re-derive + `?verdict=` filter run across every
+    # row before we cap. Capping the fetch would let a sparse filter under-return
+    # (matches stranded past the cap). A time-ordered GSI is the noted scale
+    # upgrade if an install ever outgrows a single in-memory partition load.
+    fetched = list_check_verdicts(install_id, limit=None)
     out: list[dict[str, Any]] = []
     for r in fetched:
         v = derive_verdict(

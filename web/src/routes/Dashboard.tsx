@@ -522,8 +522,8 @@ function ActivityPanel({ show, installId }: { show: boolean; installId?: number 
           </div>
           {activity.isLoading && <div className="mono" style={{ fontSize: 12, color: "var(--muted)", padding: 8 }}>loading…</div>}
           {activity.isError && <div className="mono" style={{ fontSize: 12, color: "var(--tomato)", padding: 8 }}>failed to load activity</div>}
-          {!activity.isLoading && rows.map((a, i) => (
-            <div className="afeed-row" key={`${a.head_sha}-${a.persona}-${i}`}>
+          {!activity.isLoading && rows.map((a) => (
+            <div className="afeed-row" key={`${a.head_sha}-${a.persona}`}>
               <div className={`vico ${a.verdict}`}>{_VERDICT_SYM[a.verdict] ?? "•"}</div>
               <div className="who2"><b>{_PERSONA_LABEL[a.persona] ?? a.persona}</b> <span className="repo2">{a.repo} · #{a.pr_number}</span><span className="msg">{a.summary}</span></div>
               <span className={`verdict ${a.verdict}`}>{a.verdict.toUpperCase()}</span>

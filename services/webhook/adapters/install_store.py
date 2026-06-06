@@ -529,9 +529,12 @@ def put_check_verdict(
 
 
 def list_check_verdicts(
-    install_id: int, limit: int = 50,
+    install_id: int, limit: int | None = 50,
 ) -> list[CheckVerdictRecord]:
-    """Return an install's Check verdicts, newest-first, capped at `limit`.
+    """Return an install's Check verdicts, newest-first. `limit` caps the
+    result; pass `limit=None` for the full set (used by the /activity endpoint,
+    which must re-derive + FILTER across all rows before applying its own cap —
+    a pre-slice here would let a sparse `?verdict=` under-return).
 
     Queries the `INST#` partition by `ACT#` SK prefix and sorts by `created_at`
     descending in-process: the SK encodes `head_sha` (for idempotency), not
@@ -567,7 +570,7 @@ def list_check_verdicts(
             break
         kwargs["ExclusiveStartKey"] = lek
     rows.sort(key=lambda r: r["created_at"], reverse=True)
-    return rows[:limit]
+    return rows if limit is None else rows[:limit]
 
 
 # Async-Elder idempotency claim (#272). Keyed on the GitHub

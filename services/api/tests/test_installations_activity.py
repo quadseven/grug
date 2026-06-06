@@ -84,3 +84,18 @@ def test_activity_limit_caps_output():
         with patch("installations.list_check_verdicts", return_value=rows):
             out = inst.list_activity(install_id=1, limit=2, user=_user(user_id="100"))
     assert len(out["activity"]) == 2
+
+
+def test_activity_filter_does_not_underreturn_when_matches_are_sparse():
+    """Regression (code-review S2): filtering must scan ALL rows, not a capped
+    window — a `block` stranded past the first `limit` rows must still surface.
+    Here only 3 of 60 are block (the last three); ?verdict=block must return 3."""
+    install = {"installed_by_user_id": "100"}
+    rows = [_row(head_sha=str(i), conclusion="success") for i in range(57)]  # pass
+    rows += [_row(head_sha=f"b{i}", conclusion="failure", blocking=True) for i in range(3)]  # block
+    with patch("installations.get_installation", return_value=install):
+        # The endpoint requests limit=None (all); the store returns everything.
+        with patch("installations.list_check_verdicts", return_value=rows):
+            out = inst.list_activity(install_id=1, verdict="block", limit=50, user=_user(user_id="100"))
+    assert len(out["activity"]) == 3
+    assert all(a["verdict"] == "block" for a in out["activity"])
