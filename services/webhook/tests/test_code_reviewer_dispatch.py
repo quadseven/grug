@@ -1172,3 +1172,16 @@ def test_activity_verdict_is_errored_when_check_run_publish_fails(monkeypatch):
     with patch("httpx.get", return_value=_diff_response()):
         cr_dispatch.dispatch_code_review(_payload(), blocking=False)
     assert recorded["degraded_reason"] == "check_publish_failed"
+
+
+def test_activity_verdict_errored_when_diff_fetch_fails(monkeypatch):
+    """No-lies: a diff fetch/parse failure ("Grug couldn't even look") records
+    an `errored` Activity row (degraded_reason set), never a fabricated pass."""
+    recorded: dict = {}
+    monkeypatch.setattr(cr_dispatch, "record_check_verdict", lambda **kw: recorded.update(kw))
+    monkeypatch.setattr(cr_dispatch, "post_check_run", lambda *a, **kw: {})
+    with patch("httpx.get", side_effect=httpx.ConnectError("gh down")):
+        cr_dispatch.dispatch_code_review(_payload(), blocking=False)
+    assert recorded["degraded_reason"] == "fetch_or_parse_failed"
+    assert recorded["conclusion"] == "neutral"
+    assert recorded["persona_key"] == "code_reviewer"

@@ -499,3 +499,36 @@ def test_check_verdict_degraded_reason_is_sparse(_ddb_table):
     rows = {r["head_sha"]: r for r in mod.list_check_verdicts(1)}
     assert "degraded_reason" not in rows["clean"]
     assert rows["bad"]["degraded_reason"] == "all_failed"
+
+
+def test_list_check_verdicts_paginates_and_sorts_across_pages(_ddb_table, monkeypatch):
+    """Must follow LastEvaluatedKey AND sort newest-first AFTER accumulating all
+    pages — a newer row stranded on page 2 must still surface (and sort first),
+    not be truncated at the 1MB page cap (moto only ever returns one page)."""
+    mod = _ddb_table
+
+    def _item(head, created_at):
+        return {
+            "PK": "INST#1", "SK": f"ACT#{head}#elder", "persona": "elder",
+            "repo": "o/r", "pr_number": 1, "head_sha": head, "conclusion": "neutral",
+            "summary": "t", "findings_count": 0, "blocking": False,
+            "verdict": "pass", "created_at": created_at,
+        }
+    pages = [
+        {"Items": [_item("old", "2026-06-01T00:00:00+00:00")],
+         "LastEvaluatedKey": {"PK": "INST#1", "SK": "ACT#old#elder"}},
+        {"Items": [_item("new", "2026-06-05T00:00:00+00:00")]},  # newer, on page 2
+    ]
+    calls = {"n": 0}
+
+    def fake_query(**kwargs):
+        i = calls["n"]
+        calls["n"] += 1
+        if i == 1:
+            assert kwargs.get("ExclusiveStartKey") == {"PK": "INST#1", "SK": "ACT#old#elder"}
+        return pages[i]
+
+    monkeypatch.setattr(mod._table, "query", fake_query)
+    rows = mod.list_check_verdicts(1)
+    assert calls["n"] == 2  # both pages fetched
+    assert [r["head_sha"] for r in rows] == ["new", "old"]  # page-2 newest sorts first

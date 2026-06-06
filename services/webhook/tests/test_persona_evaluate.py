@@ -308,3 +308,47 @@ def test_tpm_evaluation_results_is_tuple():
     assert isinstance(e.results, tuple)
     with pytest.raises(AttributeError):
         e.results.append(CheckResult("x", False, "y"))  # type: ignore[attr-defined]
+
+
+def test_publish_tpm_records_chief_verdict_excluding_advisory():
+    """Activity feed (PRD #301): Chief's `findings_count` is failed BLOCKING
+    checks only — the advisory `issue-link` failure must NOT count, else a PR
+    that only fails the advisory check would read warn/block instead of pass.
+    record_check_verdict is mocked so the assertion is real (otherwise the
+    no-DDB write would be swallowed by the best-effort guard)."""
+    evaluation = persona.TpmEvaluation(
+        passed=False,
+        results=(
+            CheckResult("why", False, "too short"),        # blocking fail
+            CheckResult("issue-link", False, "no link"),   # advisory fail (excluded)
+            CheckResult("acceptance", True, "ok"),
+        ),
+        conclusion="failure",
+    )
+    recorded: dict = {}
+    with patch.object(persona, "with_install_token_retry", side_effect=lambda i, fn: fn("t")):
+        with patch.object(persona, "post_check_run", side_effect=lambda **kw: {"id": 1}):
+            with patch.object(persona, "record_check_verdict", side_effect=lambda **kw: recorded.update(kw)):
+                persona.publish_tpm_evaluation(
+                    evaluation, installation_id=1, owner="o", repo="r",
+                    head_sha="x" * 40, pr_number=1,
+                )
+    assert recorded["persona_key"] == "tpm"
+    assert recorded["blocking"] is True
+    assert recorded["conclusion"] == "failure"
+    assert recorded["findings_count"] == 1   # only the blocking 'why'; issue-link advisory excluded
+
+
+def test_publish_tpm_records_chief_zero_findings_on_pass():
+    """All blocking checks pass -> findings_count == 0 (verdict will be pass)."""
+    evaluation = persona.evaluate_pull_request(_GOOD_BODY)
+    recorded: dict = {}
+    with patch.object(persona, "with_install_token_retry", side_effect=lambda i, fn: fn("t")):
+        with patch.object(persona, "post_check_run", side_effect=lambda **kw: {"id": 1}):
+            with patch.object(persona, "record_check_verdict", side_effect=lambda **kw: recorded.update(kw)):
+                persona.publish_tpm_evaluation(
+                    evaluation, installation_id=1, owner="o", repo="r",
+                    head_sha="y" * 40, pr_number=2,
+                )
+    assert recorded["findings_count"] == 0
+    assert recorded["conclusion"] == "success"
