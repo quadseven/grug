@@ -199,8 +199,30 @@ def test_request_uses_openai_chat_completions_shape() -> None:
     assert body.get("response_format") == {"type": "json_object"}
     # Authorization header carries the loaded key.
     assert captured[0]["headers"]["Authorization"].startswith("Bearer ")
-    # 30s timeout per the existing Poolside convention.
-    assert captured[0]["timeout"] == 30
+    # 60s timeout (raised from 30s — a large diff review can exceed 30s; 30s
+    # caused ReadTimeouts that silently dropped Elder reviews).
+    assert captured[0]["timeout"] == 60
+    # installation_id=1 is odd -> OpenRouter, which gets NO vendor extra_body.
+    assert "chat_template_kwargs" not in body
+
+
+def test_poolside_request_disables_thinking() -> None:
+    """Poolside's laguna-m.1 runs thinking ON by default — it blew past the
+    read timeout (72s measured) and leaked reasoning into `content` (broke JSON
+    parse), taking Elder dark. The Poolside backend MUST send the vLLM
+    `chat_template_kwargs.enable_thinking=false` switch; OpenRouter must NOT
+    (claude rejects the key)."""
+    captured: list = []
+
+    def capture(url, *, json, headers, timeout):
+        captured.append(json)
+        return httpx.Response(200, json=_openai_json_response('{"findings":[]}'))
+
+    # installation_id=2 is even -> Poolside.
+    with patch.object(httpx, "post", side_effect=capture):
+        review_diff([_hunk()], installation_id=2)
+
+    assert captured[0].get("chat_template_kwargs") == {"enable_thinking": False}
 
 
 def test_malformed_llm_json_returns_parse_failed_kind() -> None:

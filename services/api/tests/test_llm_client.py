@@ -198,8 +198,9 @@ def test_request_uses_openai_chat_completions_shape() -> None:
     assert body.get("response_format") == {"type": "json_object"}
     # Authorization header carries the loaded key.
     assert captured[0]["headers"]["Authorization"].startswith("Bearer ")
-    # 30s timeout per the existing Poolside convention.
-    assert captured[0]["timeout"] == 30
+    # 60s timeout (raised from 30s — a large diff review can exceed 30s; 30s
+    # caused ReadTimeouts that silently dropped Elder reviews).
+    assert captured[0]["timeout"] == 60
 
 
 def test_malformed_llm_json_returns_parse_failed_kind() -> None:
