@@ -8,6 +8,7 @@ import {
   useEnforcement,
   useFixEnforcement,
   useSetRepoConfig,
+  useActivity,
   type Repo,
 } from "../lib/installations";
 import "./dashboard-grug.css";
@@ -193,7 +194,7 @@ export function Dashboard() {
             <UsagePanel show={panel === "usage"} />
             <NotificationsPanel show={panel === "notifications"} notif={local.notif} toggle={(id) => setLocal({ notif: { ...local.notif, [id]: !local.notif[id] } })} />
             <AccountPanel show={panel === "account"} me={{ login: me.data.login ?? "you", role: me.data.role ?? "user" }} pauseAll={local.pauseAll} setPause={(v) => { setLocal({ pauseAll: v }); fireToast(v ? 'All personas <span class="am">PAUSED</span>. Grug nap.' : 'Grug <span class="am">AWAKE</span>. Back to work.'); }} />
-            <ActivityPanel show={panel === "activity"} />
+            <ActivityPanel show={panel === "activity"} installId={installId} />
           </main>
         </div>
       </div>
@@ -493,12 +494,16 @@ function AccountPanel({ show, me, pauseAll, setPause }: { show: boolean; me: { l
   );
 }
 
-function ActivityPanel({ show }: { show: boolean }) {
+const _PERSONA_LABEL: Record<string, string> = { chief: "Chief", elder: "Elder" };
+const _VERDICT_SYM: Record<string, string> = { block: "×", warn: "!", pass: "✓", errored: "‼" };
+
+function ActivityPanel({ show, installId }: { show: boolean; installId?: number }) {
   const [filter, setFilter] = useState("all");
-  // "no lies": the Check-Run history feed has no real backend yet. Rather than
-  // ship the design's fabricated sample rows (fake CVEs, fake PRs), show an
-  // honest empty state until the real check-run source is wired. The filter
-  // chrome stays so the panel matches the design and is ready to light up.
+  // Real Check-verdict feed (PRD #301 / S2). The `verdict` badge is derived
+  // server-side; we render it verbatim. "No lies": real rows or an honest
+  // empty state — never fabricated.
+  const activity = useActivity(installId, filter);
+  const rows = activity.data?.activity ?? [];
   return (
     <section className={`panel${show ? " show" : ""}`}>
       <div className="panel-head">
@@ -510,15 +515,27 @@ function ActivityPanel({ show }: { show: boolean }) {
         <div className="card-body">
           <div className="toolbar">
             <div className="seg">
-              {["all", "block", "warn", "pass"].map((f) => (
+              {["all", "block", "warn", "pass", "errored"].map((f) => (
                 <button key={f} className={filter === f ? "on" : ""} onClick={() => setFilter(f)}>{f.toUpperCase()}</button>
               ))}
             </div>
           </div>
-          <div className="mono" style={{ fontSize: 12, color: "var(--muted)", padding: 8, lineHeight: 1.7 }}>
-            Grug calm. No runs yet.<br />
-            // The Check-Run feed lights up here once Grug start posting verdicts on your PRs.
-          </div>
+          {activity.isLoading && <div className="mono" style={{ fontSize: 12, color: "var(--muted)", padding: 8 }}>loading…</div>}
+          {activity.isError && <div className="mono" style={{ fontSize: 12, color: "var(--tomato)", padding: 8 }}>failed to load activity</div>}
+          {!activity.isLoading && rows.map((a, i) => (
+            <div className="afeed-row" key={`${a.head_sha}-${a.persona}-${i}`}>
+              <div className={`vico ${a.verdict}`}>{_VERDICT_SYM[a.verdict] ?? "•"}</div>
+              <div className="who2"><b>{_PERSONA_LABEL[a.persona] ?? a.persona}</b> <span className="repo2">{a.repo} · #{a.pr_number}</span><span className="msg">{a.summary}</span></div>
+              <span className={`verdict ${a.verdict}`}>{a.verdict.toUpperCase()}</span>
+              <span className="ago mono">{a.head_sha.slice(0, 7)}</span>
+            </div>
+          ))}
+          {!activity.isLoading && !activity.isError && rows.length === 0 && (
+            <div className="mono" style={{ fontSize: 12, color: "var(--muted)", padding: 8, lineHeight: 1.7 }}>
+              Grug calm. No runs yet.<br />
+              // The Check-Run feed lights up here once Grug start posting verdicts on your PRs.
+            </div>
+          )}
         </div>
       </div>
     </section>

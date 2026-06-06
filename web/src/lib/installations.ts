@@ -115,6 +115,30 @@ export function useFixEnforcement(installId: number) {
   });
 }
 
+// Activity feed (PRD #301 / S2). The `verdict` badge is derived server-side;
+// the panel renders it verbatim (single source of truth — never re-derives).
+export type ActivityVerdict = "block" | "warn" | "pass" | "errored";
+
+export interface ActivityRow {
+  persona: string; // caveman key: "chief" | "elder"
+  repo: string;
+  pr_number: number;
+  head_sha: string;
+  verdict: ActivityVerdict;
+  summary: string;
+  findings_count: number;
+  created_at: string;
+}
+
+export function useActivity(installId: number | undefined, verdict?: string) {
+  const q = verdict && verdict !== "all" ? `?verdict=${encodeURIComponent(verdict)}` : "";
+  return useQuery<{ activity: ActivityRow[] }>({
+    queryKey: ["installations", installId, "activity", verdict ?? "all"],
+    queryFn: () => api(`/api/v1/installations/${installId}/activity${q}`),
+    enabled: installId != null,
+  });
+}
+
 export function useSetRepoConfig(installId: number) {
   const qc = useQueryClient();
   return useMutation({
