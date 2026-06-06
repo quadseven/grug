@@ -595,6 +595,11 @@ def review_diff(
     pr_tags = _llmobs_tags(pr_context)
 
     last_error = ""
+    # The FIRST 200-but-unparseable response, if any. Kept so that when BOTH
+    # backends fail we can still surface the specific `parse_failed` kind
+    # (caller posts an advisory check-run) attributed to the primary, rather
+    # than collapsing to `all_failed`.
+    first_parse_fail = None
     for backend in (primary, secondary):
         config = _BACKEND_CONFIGS[backend]
         # Open one LLM Obs span per backend attempt. Annotate on every
@@ -695,26 +700,37 @@ def review_diff(
                 review_span_context=span_context,
             )
         if resp.status_code == 200:
-            # 200 + parse failure — the LLM returned but we can't use
-            # the content. Don't fall back (the other backend would
-            # likely produce the same prose). Surface the parse failure
-            # directly so the caller can post an advisory check-run.
+            # 200 + parse failure — the LLM responded but the content wasn't
+            # usable JSON. FALL BACK to the other backend: the two backends run
+            # DIFFERENT models (OpenRouter=claude, Poolside=laguna), so a parse
+            # failure on one does NOT predict the other (the old "same prose"
+            # assumption is stale post the per-backend model split). Record the
+            # FIRST parse failure so a both-fail outcome still returns the
+            # specific `parse_failed` kind (caller posts an advisory check-run).
             log.warning(
                 "llm_response_parse_failed",
                 extra={"backend": backend.value, "model": model, "error": err},
             )
-            return LlmReviewResponse(
-                kind="parse_failed",
-                backend_used=backend,
-                model_name=model,
-                error=err,
-            )
+            if first_parse_fail is None:
+                first_parse_fail = (backend, model, err)
+            last_error = f"{backend.value}: parse_failed: {err}"
+            continue
         log.warning(
             "llm_backend_http_failed",
             extra={"backend": backend.value, "status": resp.status_code, "error": err},
         )
         last_error = f"{backend.value}: {err}"
 
+    # Every backend failed. Prefer the specific parse_failed kind (a backend
+    # DID respond, just unparseably) over the generic all_failed.
+    if first_parse_fail is not None:
+        pf_backend, pf_model, pf_err = first_parse_fail
+        return LlmReviewResponse(
+            kind="parse_failed",
+            backend_used=pf_backend,
+            model_name=pf_model,
+            error=pf_err,
+        )
     return LlmReviewResponse(
         kind="all_failed",
         error=last_error or "both backends failed",
