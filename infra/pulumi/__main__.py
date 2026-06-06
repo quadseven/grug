@@ -559,9 +559,32 @@ _dd_provider = _datadog.Provider(
     api_url="https://api.datadoghq.com/",
 )
 
-# Notification handle. SSM param `/grug/dd-notify-handle` MUST exist
-# before first pulumi up — pre-load it via HITL_PREREQUISITES.md §6.
-_dd_notify = aws.ssm.get_parameter(name="/grug/dd-notify-handle").value
+# Notification routing → Discord #monitoring-alerts (channel
+# 1501743643965394974 in guild 781626163591249930 — where the homelab's
+# migration-watcher already posts). The old `/grug/dd-notify-handle` was the
+# placeholder `@grug-stub`, which Datadog does not recognise as any target —
+# so EVERY monitor notified into the void (the Elder LLM outage ran ~5 days
+# with no page). Register a real DD webhook integration that POSTs to the
+# pre-existing Discord webhook secret, and route all monitors at it.
+# `@webhook-<name>` is how a DD monitor references a webhook integration entry.
+_discord_webhook_url = pulumi.Output.secret(
+    aws.ssm.get_parameter(
+        name="/infra/discord/781626163591249930/monitoring-alerts",
+        with_decryption=True,
+    ).value
+)
+_dd_discord = _datadog.Webhook(
+    "grug-discord-monitoring",
+    name="grug-discord-monitoring",
+    url=_discord_webhook_url,
+    encode_as="json",
+    # Discord's native webhook body. DD substitutes the $-variables at send
+    # time; keep it short — Discord rejects content > 2000 chars. `\n` in the
+    # source becomes a JSON newline escape Discord renders as a line break.
+    payload='{"content": "$EVENT_TITLE\\n$EVENT_MSG\\n$LINK"}',
+    opts=pulumi.ResourceOptions(provider=_dd_provider),
+)
+_dd_notify = "@webhook-grug-discord-monitoring"
 
 monitors = dd_monitors.create_all(
     env=env,
@@ -647,6 +670,8 @@ pulumi.export("monitor_api_5xx_id", monitors.api_5xx.id)
 pulumi.export("monitor_sig_verify_fail_id", monitors.sig_verify_fail.id)
 pulumi.export("monitor_cold_start_p99_id", monitors.cold_start_p99.id)
 pulumi.export("monitor_enforcement_gap_id", monitors.enforcement_gap.id)
+pulumi.export("monitor_elder_llm_degraded_id", monitors.elder_llm_degraded.id)
+pulumi.export("dd_discord_webhook_name", _dd_discord.name)
 pulumi.export("monitor_cf_secret_mismatch_id", monitors.cf_secret_mismatch.id)
 pulumi.export("synthetic_uptime_id", monitors.uptime.id)
 

@@ -30,6 +30,7 @@ class _MonitorBundle:
     api_5xx: datadog.Monitor
     sig_verify_fail: datadog.Monitor
     elder_offload_fail: datadog.Monitor
+    elder_llm_degraded: datadog.Monitor
     cold_start_p99: datadog.Monitor
     enforcement_gap: datadog.Monitor
     cf_secret_mismatch: datadog.Monitor
@@ -152,6 +153,39 @@ def create_all(
             f'logs("service:grug-webhook env:{env} '
             '(elder_enqueue_failed OR elder_job_unhandled)").index("*")'
             '.rollup("count").last("15m") > 0'
+        ),
+        tags=_common_tags(env, "grug-webhook"),
+        notify_no_data=False,
+        priority=2,
+        opts=opts,
+    )
+
+    # 3b) Elder LLM degraded — reviews silently dropped. The offload monitor
+    #     above watches the async PLUMBING (enqueue/worker crash); it cannot
+    #     see the failure that actually took Elder down for ~5 days — EVERY
+    #     LLM backend (OpenRouter 402 + Poolside ReadTimeout) failing, which
+    #     is logged at warn as `code_review_llm_degraded` and returns
+    #     gracefully (no crash, no offload failure). Same shape as the poller's
+    #     all-failed monitor: a handled systemic failure needs a LOG alert, not
+    #     a crash/metric one. `>= 2` in 1h ignores a lone transient blip but
+    #     trips on a sustained both-backends-down outage.
+    elder_llm_degraded = datadog.Monitor(
+        "grug-webhook-elder-llm-degraded",
+        type="log alert",
+        name="[grug-webhook] Elder LLM degraded — reviews dropped (1h)",
+        message=(
+            f"{notify_handle}\n"
+            "Grug Elder could not reach ANY LLM backend (all of OpenRouter + "
+            "Poolside failed) for >= 2 code reviews in the last hour — those "
+            "PRs got NO review, only a neutral 'skipping' check. Check provider "
+            "credits (OpenRouter `http_402` = out of credits) and timeouts "
+            "(Poolside `ReadTimeout`). Invisible to the offload monitor because "
+            "the async path succeeds; only the LLM call fails.\n"
+            "Runbook: docs/RUNBOOK.md#elder-async-offload"
+        ),
+        query=(
+            f'logs("service:grug-webhook env:{env} code_review_llm_degraded")'
+            '.index("*").rollup("count").last("1h") >= 2'
         ),
         tags=_common_tags(env, "grug-webhook"),
         notify_no_data=False,
@@ -289,6 +323,7 @@ def create_all(
         api_5xx=api_5xx,
         sig_verify_fail=sig_verify_fail,
         elder_offload_fail=elder_offload_fail,
+        elder_llm_degraded=elder_llm_degraded,
         cold_start_p99=cold_start_p99,
         enforcement_gap=enforcement_gap,
         cf_secret_mismatch=cf_secret_mismatch,
