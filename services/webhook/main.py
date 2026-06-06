@@ -89,14 +89,28 @@ async def receive_github_webhook(
 
     secret = get_webhook_secret()
     if not verify_signature(secret, body, x_hub_signature_256):
-        log.warning(
-            "webhook_signature_invalid",
-            extra={
-                "delivery_id": x_github_delivery,
-                "event": x_github_event,
-                "body_len": len(body),
-            },
-        )
+        # Split the alert signal from internet noise. A genuine GitHub delivery
+        # being REJECTED (webhook secret rotated / SSM drift — actionable)
+        # ALWAYS carries an X-Hub-Signature-256 header; an unsigned scanner
+        # poking the public Function URL sends none. Only the signed-but-invalid
+        # case is `webhook_signature_invalid` (the monitored alert), so a
+        # rotated-secret outage pages while background probes (which dominate a
+        # public endpoint) stay out of the alert path as a quieter
+        # `webhook_unsigned_probe`. Both still 401.
+        if x_hub_signature_256:
+            log.warning(
+                "webhook_signature_invalid",
+                extra={
+                    "delivery_id": x_github_delivery,
+                    "event": x_github_event,
+                    "body_len": len(body),
+                },
+            )
+        else:
+            log.info(
+                "webhook_unsigned_probe",
+                extra={"event": x_github_event, "body_len": len(body)},
+            )
         # 401 — GitHub stops retrying after 4xx (vs 5xx which retries).
         # Bad signature = caller is broken (or hostile); no point in retry.
         raise HTTPException(
