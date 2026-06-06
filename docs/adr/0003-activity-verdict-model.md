@@ -18,12 +18,13 @@ We also had to decide whether to persist the computed badge or the raw inputs, g
 **Store the raw facts; derive the badge with one shared pure function; make `errored` a first-class verdict.**
 
 - `CheckVerdictRecord` stores raw inputs: `conclusion`, `summary`, `findings_count`, `blocking`, `degraded_reason` — NOT a pre-collapsed badge.
-- A single pure function maps them to the badge — the **only** place the mapping lives:
-  - `failure → block`
-  - advisory/`neutral` **with** findings → `warn`
-  - clean (`success`, or `neutral` with nothing actionable) → `pass`
-  - `degraded_reason` set → **`errored`** (never `pass`)
-- The mapping is applied **server-side** in `GET /activity`; the frontend renders the result verbatim and never re-derives it.
+- A single pure function maps them to the badge — the **only** place the mapping lives. Precedence (order matters):
+  - `degraded_reason` set → **`errored`** (Grug could not evaluate; never `pass`)
+  - `conclusion == "failure"` → `block`
+  - conclusion **not in** {`success`, `neutral`} (`cancelled`/`timed_out`/`action_required`/`skipped`/`stale` — Grug never concluded) → **`errored`** (never a fabricated `pass`/`warn`)
+  - `findings_count != 0` (any non-zero, incl. a defensive negative) → `warn` (advisory issues, not gating)
+  - otherwise (clean `success`/`neutral`) → `pass`
+- The mapping is applied **server-side** (and at write time to denormalize); the frontend renders the result verbatim and never re-derives it.
 - A denormalized `verdict` may be stored on the row for cheap DDB filtering, but the **raw facts remain canonical** — a future mapping change can re-derive all of history truthfully.
 
 ## Consequences

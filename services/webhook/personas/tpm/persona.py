@@ -13,6 +13,7 @@ from __future__ import annotations
 import logging
 from dataclasses import dataclass
 
+from activity_log import record_check_verdict
 from github_app_auth import with_install_token_retry
 from github_checks_client import CheckConclusion, CheckRunResult, post_check_run
 from personas.tpm.dor_checks import CheckResult, run_all
@@ -128,4 +129,23 @@ def publish_tpm_evaluation(
             "passed": evaluation.passed,
             "failed_checks": [r.name for r in evaluation.results if not r.passed],
         },
+    )
+    # Activity feed (PRD #301): record what Chief did, best-effort. Chief's
+    # `findings_count` is the number of failed BLOCKING DoR checks (0 on pass) —
+    # advisory checks (issue-link) don't gate, so they don't count toward the
+    # block/pass verdict. TPM never degrades at the eval layer (conclusion is
+    # success|failure), so `degraded_reason` stays None.
+    record_check_verdict(
+        install_id=installation_id,
+        persona_key="tpm",
+        repo=f"{owner}/{repo}",
+        pr_number=pr_number,
+        head_sha=head_sha,
+        conclusion=evaluation.conclusion,
+        summary=title,
+        findings_count=sum(
+            1 for r in evaluation.results
+            if not r.passed and r.name not in _ADVISORY_CHECKS
+        ),
+        blocking=True,
     )
