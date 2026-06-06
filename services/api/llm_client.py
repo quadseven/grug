@@ -188,7 +188,12 @@ _POOLSIDE_MODEL = "poolside/laguna-m.1"
 _OPENROUTER_URL = "https://openrouter.ai/api/v1/chat/completions"
 _OPENROUTER_MODEL = "anthropic/claude-haiku-4.5"
 
-_TIMEOUT_SECONDS = 30
+# 60s (was 30s): a large diff review can legitimately take >30s even with
+# Poolside thinking disabled; 30s caused ReadTimeouts that silently dropped
+# Elder reviews. 60s gives ~4x margin over a measured 14s small-diff review
+# and still fits the retry x fallback budget under the 420s Lambda timeout
+# (3*60 primary + 3*60 fallback = 360s < 420s).
+_TIMEOUT_SECONDS = 60
 _RETRY_ATTEMPTS = 3
 # Exponential backoff applies on every attempt except the final one,
 # which either returns the response or raises.
@@ -250,6 +255,15 @@ class BackendConfig:
     url: str
     model: str
     key_loader: Callable[[], str]
+    # Vendor-specific chat-completions body params merged for THIS backend
+    # only. Poolside's laguna-m.1 runs thinking ON by default — ~87% of output
+    # was reasoning tokens, which (a) blew past the 30s read timeout (measured
+    # 72s for even a tiny diff → ReadTimeout → Elder posted nothing for days)
+    # and (b) leaked reasoning prose into `content`, breaking JSON parse. The
+    # vLLM `chat_template_kwargs.enable_thinking=false` switch disables it
+    # (verified live: 72s→<1s, reasoning_tokens 1106→0). claude/OpenRouter
+    # rejects this key, so it MUST be per-backend, never on the shared body.
+    extra_body: dict = field(default_factory=dict)
 
 
 @dataclass(frozen=True, slots=True)
@@ -314,6 +328,8 @@ _BACKEND_CONFIGS: dict[Backend, BackendConfig] = {
         # `lc._load_poolside_key`, which `_BACKEND_CONFIGS` no longer
         # consults.
         key_loader=lambda: _load_poolside_key(),
+        # Disable laguna-m.1's default thinking mode — see BackendConfig.extra_body.
+        extra_body={"chat_template_kwargs": {"enable_thinking": False}},
     ),
     Backend.OPENROUTER: BackendConfig(
         backend=Backend.OPENROUTER,
@@ -413,6 +429,7 @@ def _call_backend(
         "model": config.model,
         "messages": messages,
         "response_format": {"type": "json_object"},
+        **config.extra_body,
     }
     headers = {"Authorization": f"Bearer {key}"}
 
