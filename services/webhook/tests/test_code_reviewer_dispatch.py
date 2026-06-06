@@ -1150,3 +1150,25 @@ def test_dispatch_no_capture_when_review_resp_has_no_id(monkeypatch):
     with patch("httpx.get", return_value=_diff_response()):
         cr_dispatch.dispatch_code_review(_payload(), blocking=False)
     assert fetched == []
+
+
+def test_activity_verdict_is_errored_when_check_run_publish_fails(monkeypatch):
+    """No-lies: if the check-run never reaches GitHub, the Activity row must NOT
+    claim a pass/block — it records a `check_publish_failed` degraded_reason so
+    the verdict resolves to `errored` (re-runnable, honest)."""
+    llm = LlmReviewResponse(kind="reviewed", findings=(), backend_used=Backend.POOLSIDE)
+    monkeypatch.setattr(cr_dispatch, "review_diff", lambda *a, **kw: llm)
+    # check-run POST fails; dispatch logs publish_failed + continues.
+    monkeypatch.setattr(
+        cr_dispatch, "post_check_run",
+        lambda *a, **kw: (_ for _ in ()).throw(httpx.RequestError("publish boom")),
+    )
+    monkeypatch.setattr(cr_dispatch, "post_review", lambda *a, **kw: {})
+    recorded: dict = {}
+    monkeypatch.setattr(
+        cr_dispatch, "record_check_verdict",
+        lambda **kw: recorded.update(kw),
+    )
+    with patch("httpx.get", return_value=_diff_response()):
+        cr_dispatch.dispatch_code_review(_payload(), blocking=False)
+    assert recorded["degraded_reason"] == "check_publish_failed"

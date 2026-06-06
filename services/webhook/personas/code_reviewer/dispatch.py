@@ -632,9 +632,12 @@ def dispatch_code_review(
     # Activity feed (PRD #301): record what Elder did, best-effort. Use the
     # PUBLISHED `conclusion` (the actual PR outcome from _publish_shape), NOT
     # the raw eval severity — in advisory mode high/critical findings post
-    # `neutral` (no gate), so the honest badge is `warn`, not `block`.
-    # `evaluation.degraded_reason` (set on an LLM outage) makes verdict()
-    # resolve to `errored` regardless — never a fake pass.
+    # `neutral` (no gate), so the honest badge is `warn`, not `block`. The
+    # verdict resolves to `errored` (never a fake pass/block) when the LLM
+    # degraded (`evaluation.degraded_reason`) OR the check-run never reached
+    # GitHub (`check_publish_failed`) — the feed must not claim a verdict for a
+    # check that isn't on the PR (mirrors `_resolve_result`'s publish-failed
+    # precedence; "no lies").
     record_check_verdict(
         install_id=installation_id,
         persona_key="code_reviewer",
@@ -645,7 +648,10 @@ def dispatch_code_review(
         summary=title,
         findings_count=len(evaluation.findings),
         blocking=blocking,
-        degraded_reason=evaluation.degraded_reason,
+        degraded_reason=(
+            evaluation.degraded_reason
+            or ("check_publish_failed" if check_publish_failed else None)
+        ),
     )
     # LLM-as-a-judge (#190) runs AFTER the review + check-run are POSTed
     # to GitHub, so the developer sees the review immediately regardless
