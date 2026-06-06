@@ -859,7 +859,9 @@ def test_no_single_webhook_timeout_reaches_lambda_budget():
     bounds that. The only real fix is moving the LLM call off the ACK path
     (async offload, #272). Asserting a path-sum bound here would be false."""
     import llm_client
-    _WEBHOOK_LAMBDA_BUDGET = 60  # keep in sync w/ infra/pulumi/__main__ webhook
+    # 420s: the post-#272 async-offload webhook Lambda timeout (the function
+    # that runs the Elder dispatch). The old 60 here predated that bump.
+    _WEBHOOK_LAMBDA_BUDGET = 420  # keep in sync w/ infra/pulumi/__main__ webhook
     assert cr_dispatch._DIFF_FETCH_TIMEOUT < _WEBHOOK_LAMBDA_BUDGET
     assert cr_dispatch._COMMENT_FETCH_TIMEOUT < _WEBHOOK_LAMBDA_BUDGET
     assert llm_client._TIMEOUT_SECONDS < _WEBHOOK_LAMBDA_BUDGET
