@@ -424,3 +424,76 @@ def test_list_allowlisted_installs_paginates(_ddb_table, monkeypatch):
     monkeypatch.setattr(mod, "is_install_allowlisted", lambda iid: iid == 2)
     assert mod.list_allowlisted_installs() == [2]
     assert calls["n"] == 2   # both pages fetched
+
+
+# ── Check verdict store (PRD #301) ──────────────────────────────────────────
+
+def _put_cv(mod, **kw):
+    base = dict(
+        install_id=1, persona="elder", repo="o/r", pr_number=7,
+        head_sha="abc123", conclusion="neutral", summary="t",
+        findings_count=0, blocking=False, verdict="pass",
+        created_at="2026-06-06T00:00:00+00:00",
+    )
+    base.update(kw)
+    mod.put_check_verdict(**base)
+
+
+def test_check_verdict_put_then_list(_ddb_table):
+    mod = _ddb_table
+    _put_cv(mod, verdict="warn", findings_count=2)
+    rows = mod.list_check_verdicts(1)
+    assert len(rows) == 1
+    assert rows[0]["persona"] == "elder"
+    assert rows[0]["verdict"] == "warn"
+    assert rows[0]["findings_count"] == 2
+
+
+def test_check_verdict_idempotent_per_persona_headsha(_ddb_table):
+    """Re-reviewing the SAME (persona, commit) upserts (heals) — one row,
+    latest wins. A NEW commit appends."""
+    mod = _ddb_table
+    _put_cv(mod, head_sha="abc", verdict="errored", degraded_reason="all_failed")
+    _put_cv(mod, head_sha="abc", verdict="pass", conclusion="success")  # heal
+    rows = mod.list_check_verdicts(1)
+    assert len(rows) == 1
+    assert rows[0]["verdict"] == "pass"            # healed in place
+    _put_cv(mod, head_sha="def", verdict="warn")   # new commit appends
+    assert len(mod.list_check_verdicts(1)) == 2
+
+
+def test_check_verdict_distinct_personas_same_commit_are_two_rows(_ddb_table):
+    mod = _ddb_table
+    _put_cv(mod, persona="chief", head_sha="abc")
+    _put_cv(mod, persona="elder", head_sha="abc")
+    assert len(mod.list_check_verdicts(1)) == 2
+
+
+def test_check_verdict_newest_first_and_limit(_ddb_table):
+    mod = _ddb_table
+    _put_cv(mod, head_sha="s1", created_at="2026-06-01T00:00:00+00:00")
+    _put_cv(mod, head_sha="s2", created_at="2026-06-03T00:00:00+00:00")
+    _put_cv(mod, head_sha="s3", created_at="2026-06-02T00:00:00+00:00")
+    rows = mod.list_check_verdicts(1)
+    assert [r["head_sha"] for r in rows] == ["s2", "s3", "s1"]  # newest created_at first
+    assert len(mod.list_check_verdicts(1, limit=2)) == 2
+
+
+def test_check_verdict_ttl_set(_ddb_table):
+    mod = _ddb_table
+    _put_cv(mod, head_sha="ttlcheck")
+    item = boto3.resource("dynamodb", region_name="us-east-1").Table(
+        "grug-main-test"
+    ).get_item(Key={"PK": "INST#1", "SK": "ACT#ttlcheck#elder"})["Item"]
+    assert "ttl" in item and int(item["ttl"]) > 0
+
+
+def test_check_verdict_degraded_reason_is_sparse(_ddb_table):
+    """degraded_reason is omitted from the item when None (sparse), present
+    when set — matches CommentRecord.last_verdict opaque-optional discipline."""
+    mod = _ddb_table
+    _put_cv(mod, head_sha="clean")  # degraded_reason default None
+    _put_cv(mod, head_sha="bad", verdict="errored", degraded_reason="all_failed")
+    rows = {r["head_sha"]: r for r in mod.list_check_verdicts(1)}
+    assert "degraded_reason" not in rows["clean"]
+    assert rows["bad"]["degraded_reason"] == "all_failed"

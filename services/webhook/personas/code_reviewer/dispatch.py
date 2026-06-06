@@ -28,6 +28,7 @@ from typing import Any, Literal
 
 import httpx
 
+from activity_log import record_check_verdict
 from github_app_auth import with_install_token_retry
 from github_checks_client import CheckConclusion, CheckRunResult, post_check_run
 from github_reviews_client import (
@@ -415,10 +416,26 @@ def dispatch_code_review(
                 "kind": type(e).__name__,
             },
         )
-        return _publish_degraded(
+        degraded = _publish_degraded(
             installation_id, owner, repo_name, pull_number, head_sha,
             reason="fetch_or_parse_failed",
         )
+        # Errored Activity row (PRD #301): Grug couldn't even fetch/parse the
+        # diff — record it so it surfaces as `errored` (re-runnable in S3a),
+        # never a silent gap. Best-effort.
+        record_check_verdict(
+            install_id=installation_id,
+            persona_key="code_reviewer",
+            repo=f"{owner}/{repo_name}",
+            pr_number=pull_number,
+            head_sha=head_sha,
+            conclusion="neutral",
+            summary="Grug could not look — diff fetch/parse failed",
+            findings_count=0,
+            blocking=blocking,
+            degraded_reason="fetch_or_parse_failed",
+        )
+        return degraded
 
     # `pr_context` flows into DD LLM Obs span tags so traces are
     # filterable by repo / PR / installation in the LLM Obs UI.
@@ -611,6 +628,24 @@ def dispatch_code_review(
             "dedup_degraded": dedup_degraded,
             "result": result,
         },
+    )
+    # Activity feed (PRD #301): record what Elder did, best-effort. Use the
+    # PUBLISHED `conclusion` (the actual PR outcome from _publish_shape), NOT
+    # the raw eval severity — in advisory mode high/critical findings post
+    # `neutral` (no gate), so the honest badge is `warn`, not `block`.
+    # `evaluation.degraded_reason` (set on an LLM outage) makes verdict()
+    # resolve to `errored` regardless — never a fake pass.
+    record_check_verdict(
+        install_id=installation_id,
+        persona_key="code_reviewer",
+        repo=f"{owner}/{repo_name}",
+        pr_number=pull_number,
+        head_sha=head_sha,
+        conclusion=conclusion,
+        summary=title,
+        findings_count=len(evaluation.findings),
+        blocking=blocking,
+        degraded_reason=evaluation.degraded_reason,
     )
     # LLM-as-a-judge (#190) runs AFTER the review + check-run are POSTed
     # to GitHub, so the developer sees the review immediately regardless
