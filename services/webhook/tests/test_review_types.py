@@ -74,6 +74,25 @@ def test_verdict_clean_is_pass():
     ) == "pass"
 
 
+def test_verdict_non_success_conclusion_is_errored_never_pass():
+    """A non-success, non-failure GitHub conclusion (cancelled/timed_out/
+    action_required/skipped/stale) means Grug never concluded — it must read
+    `errored`, never `pass` or `warn` ("no lies"). Only success+neutral are
+    'clean' enough to be pass/warn."""
+    for c in ("cancelled", "timed_out", "action_required", "skipped", "stale"):
+        assert review_types.verdict(
+            conclusion=c, findings_count=0, degraded_reason=None
+        ) == "errored", c
+
+
+def test_verdict_negative_findings_count_is_not_pass():
+    """A defensive guard: a negative count (a caller subtraction bug) must
+    never silently read as pass — any non-zero count is a finding signal."""
+    assert review_types.verdict(
+        conclusion="neutral", findings_count=-1, degraded_reason=None
+    ) == "warn"
+
+
 def test_persona_names_round_trip():
     assert review_types.persona_for_key("tpm") == "chief"
     assert review_types.persona_for_key("code_reviewer") == "elder"

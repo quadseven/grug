@@ -429,10 +429,12 @@ def test_list_allowlisted_installs_paginates(_ddb_table, monkeypatch):
 # ── Check verdict store (PRD #301) ──────────────────────────────────────────
 
 def _put_cv(mod, **kw):
+    # No `verdict=` — put_check_verdict DERIVES the badge from the raw facts
+    # (conclusion/findings_count/degraded_reason) via review_types.verdict.
     base = dict(
         install_id=1, persona="elder", repo="o/r", pr_number=7,
         head_sha="abc123", conclusion="neutral", summary="t",
-        findings_count=0, blocking=False, verdict="pass",
+        findings_count=0, blocking=False,
         created_at="2026-06-06T00:00:00+00:00",
     )
     base.update(kw)
@@ -441,11 +443,11 @@ def _put_cv(mod, **kw):
 
 def test_check_verdict_put_then_list(_ddb_table):
     mod = _ddb_table
-    _put_cv(mod, verdict="warn", findings_count=2)
+    _put_cv(mod, conclusion="neutral", findings_count=2)  # derives -> warn
     rows = mod.list_check_verdicts(1)
     assert len(rows) == 1
     assert rows[0]["persona"] == "elder"
-    assert rows[0]["verdict"] == "warn"
+    assert rows[0]["verdict"] == "warn"        # derived from the raw facts
     assert rows[0]["findings_count"] == 2
 
 
@@ -453,12 +455,12 @@ def test_check_verdict_idempotent_per_persona_headsha(_ddb_table):
     """Re-reviewing the SAME (persona, commit) upserts (heals) — one row,
     latest wins. A NEW commit appends."""
     mod = _ddb_table
-    _put_cv(mod, head_sha="abc", verdict="errored", degraded_reason="all_failed")
-    _put_cv(mod, head_sha="abc", verdict="pass", conclusion="success")  # heal
+    _put_cv(mod, head_sha="abc", degraded_reason="all_failed")  # derives -> errored
+    _put_cv(mod, head_sha="abc", conclusion="success")          # heal -> pass
     rows = mod.list_check_verdicts(1)
     assert len(rows) == 1
     assert rows[0]["verdict"] == "pass"            # healed in place
-    _put_cv(mod, head_sha="def", verdict="warn")   # new commit appends
+    _put_cv(mod, head_sha="def", conclusion="failure")  # new commit appends
     assert len(mod.list_check_verdicts(1)) == 2
 
 
@@ -493,7 +495,7 @@ def test_check_verdict_degraded_reason_is_sparse(_ddb_table):
     when set — matches CommentRecord.last_verdict opaque-optional discipline."""
     mod = _ddb_table
     _put_cv(mod, head_sha="clean")  # degraded_reason default None
-    _put_cv(mod, head_sha="bad", verdict="errored", degraded_reason="all_failed")
+    _put_cv(mod, head_sha="bad", degraded_reason="all_failed")  # derives -> errored
     rows = {r["head_sha"]: r for r in mod.list_check_verdicts(1)}
     assert "degraded_reason" not in rows["clean"]
     assert rows["bad"]["degraded_reason"] == "all_failed"

@@ -2,9 +2,9 @@
 """Best-effort Activity-feed writer (PRD #301, Slice S1).
 
 The ONE place both persona dispatchers record a Check verdict: map the legacy
-persona code key to its caveman name (ADR-0002), derive the badge from raw
-facts via the single `review_types.verdict` mapper (ADR-0003), and upsert it
-through `install_store`.
+persona code key to its caveman name (ADR-0002) and upsert it through
+`install_store` (which derives the badge from the raw facts via the single
+`review_types.verdict` mapper, ADR-0003).
 
 **Best-effort / never-raise.** Recording activity must NEVER break a
 check-run — same discipline as the #272 async offload and the capture-on-publish
@@ -19,7 +19,7 @@ from datetime import datetime, timezone
 from typing import Optional
 
 from adapters.install_store import put_check_verdict
-from review_types import persona_for_key, verdict
+from review_types import persona_for_key
 
 log = logging.getLogger(f"{os.getenv('DD_SERVICE', 'grug')}.activity_log")
 
@@ -50,11 +50,6 @@ def record_check_verdict(
     """
     try:
         persona = persona_for_key(persona_key)
-        v = verdict(
-            conclusion=conclusion,
-            findings_count=findings_count,
-            degraded_reason=degraded_reason,
-        )
         put_check_verdict(
             install_id=install_id,
             persona=persona,
@@ -65,7 +60,6 @@ def record_check_verdict(
             summary=summary,
             findings_count=findings_count,
             blocking=blocking,
-            verdict=v,
             created_at=datetime.now(timezone.utc).isoformat(),
             degraded_reason=degraded_reason,
         )

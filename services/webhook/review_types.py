@@ -35,8 +35,11 @@ PERSONAS: frozenset[str] = frozenset(get_args(Persona))
 # dirs/config still carry the historical keys (`tpm`/`code_reviewer`); new
 # surfaces use `chief`/`elder`. Mapping at this single boundary is what keeps
 # the two from drifting into a forked copy in the frontend.
-_KEY_TO_PERSONA: dict[str, str] = {"tpm": "chief", "code_reviewer": "elder"}
-_PERSONA_TO_KEY: dict[str, str] = {v: k for k, v in _KEY_TO_PERSONA.items()}
+# Typed `dict[str, Persona]` (not `dict[str, str]`) so a typo'd value (e.g.
+# "cheif") is caught by the type checker against the Literal at definition
+# time — the guarantee is real, not laundered through a `# type: ignore`.
+_KEY_TO_PERSONA: dict[str, Persona] = {"tpm": "chief", "code_reviewer": "elder"}
+_PERSONA_TO_KEY: dict[Persona, str] = {v: k for k, v in _KEY_TO_PERSONA.items()}
 
 
 def persona_for_key(code_key: str) -> Persona:
@@ -44,7 +47,7 @@ def persona_for_key(code_key: str) -> Persona:
     caveman name (`chief`/`elder`). Raises on an unknown key rather than
     inventing a name."""
     try:
-        return _KEY_TO_PERSONA[code_key]  # type: ignore[return-value]
+        return _KEY_TO_PERSONA[code_key]
     except KeyError:
         raise ValueError(
             f"unknown persona code key {code_key!r}; expected one of "
@@ -74,20 +77,26 @@ def verdict(
     the SINGLE place this mapping lives.
 
     Precedence (order matters):
-      1. `degraded_reason` set     -> `errored` (Grug could not evaluate — LLM
-         outage / infra failure. NEVER `pass`, per the "no lies" rule.)
-      2. `conclusion == "failure"` -> `block`   (a blocking check failed → gated)
-      3. `findings_count > 0`      -> `warn`    (advisory issues raised, not gating)
-      4. otherwise                 -> `pass`    (clean)
+      1. `degraded_reason` set            -> `errored` (Grug could not evaluate —
+         LLM outage / infra failure. NEVER `pass`, per the "no lies" rule.)
+      2. `conclusion == "failure"`        -> `block`   (a blocking check failed → gated)
+      3. conclusion NOT in {success,neutral} -> `errored` (cancelled / timed_out /
+         action_required / skipped / stale: Grug never actually concluded — a
+         non-success outcome must NOT read as `pass` or `warn`. "no lies".)
+      4. `findings_count != 0`            -> `warn`    (advisory issues raised, not gating)
+      5. otherwise (success/neutral, clean) -> `pass`
 
     `findings_count` is whatever the caller counts as actionable: failed
     BLOCKING checks for Chief (0 on pass), surviving findings for Elder. A
     `failure` conclusion always wins over the finding count (a gated PR is
-    `block`, not `warn`)."""
+    `block`, not `warn`); a non-zero count (incl. a defensive negative) is
+    never `pass`."""
     if degraded_reason:
         return "errored"
     if conclusion == "failure":
         return "block"
-    if findings_count > 0:
+    if conclusion not in ("success", "neutral"):
+        return "errored"
+    if findings_count != 0:
         return "warn"
     return "pass"

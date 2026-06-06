@@ -28,18 +28,20 @@ def _capture(**overrides):
     return seen
 
 
-def test_record_maps_persona_and_derives_verdict():
+def test_record_maps_persona_and_forwards_facts():
+    """activity_log maps the persona key and forwards the RAW facts; the store
+    derives the verdict, so `verdict` is NOT passed by the writer."""
     seen = _capture(persona_key="code_reviewer", findings_count=3, conclusion="neutral")
     assert seen["persona"] == "elder"        # mapped from the legacy code key
-    assert seen["verdict"] == "warn"         # neutral + findings
+    assert seen["conclusion"] == "neutral"
     assert seen["findings_count"] == 3
     assert "created_at" in seen              # stamped by the writer
+    assert "verdict" not in seen            # derivation is the store's job
 
 
-def test_record_degraded_resolves_to_errored():
+def test_record_forwards_degraded_reason_and_maps_chief():
     seen = _capture(persona_key="tpm", degraded_reason="all_failed", findings_count=0)
     assert seen["persona"] == "chief"
-    assert seen["verdict"] == "errored"
     assert seen["degraded_reason"] == "all_failed"
 
 

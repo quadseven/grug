@@ -22,6 +22,8 @@ from typing import Any, NotRequired, Optional, TypedDict
 import boto3
 from botocore.exceptions import ClientError
 
+from review_types import verdict as _derive_verdict  # leaf import (no cycle)
+
 log = logging.getLogger("grug.webhook.install_store")
 
 _TABLE_NAME = os.environ.get("GRUG_DDB_TABLE", "grug-main")
@@ -485,15 +487,19 @@ def put_check_verdict(
     summary: str,
     findings_count: int,
     blocking: bool,
-    verdict: str,
     created_at: str,
     degraded_reason: Optional[str] = None,
 ) -> None:
     """Upsert a Check verdict. Idempotent per `(persona, head_sha)` via the SK
     — re-reviewing the same commit overwrites (heals the row), a new commit
     appends a fresh row. `ttl` (epoch seconds) auto-expires the row ~90 days
-    out. `degraded_reason` is omitted from the item when None (kept sparse, the
-    same opaque-optional discipline as `CommentRecord.last_verdict`)."""
+    out. `degraded_reason` is omitted from the item when falsy (kept sparse,
+    same opaque-optional discipline as `CommentRecord.last_verdict`).
+
+    The denormalized `verdict` badge is DERIVED here from the raw facts via the
+    single `review_types.verdict` mapper — never accepted as a parameter — so a
+    row can't be persisted with a badge that disagrees with its own facts (the
+    'raw facts are canonical' invariant is enforced by construction, ADR-0003)."""
     ttl = int(
         datetime.now(timezone.utc).timestamp()
         + _CHECK_VERDICT_TTL_DAYS * 86400
@@ -509,11 +515,15 @@ def put_check_verdict(
         "summary": summary,
         "findings_count": int(findings_count),
         "blocking": bool(blocking),
-        "verdict": verdict,
+        "verdict": _derive_verdict(
+            conclusion=conclusion,
+            findings_count=int(findings_count),
+            degraded_reason=degraded_reason,
+        ),
         "created_at": created_at,
         "ttl": ttl,
     }
-    if degraded_reason is not None:
+    if degraded_reason:
         item["degraded_reason"] = degraded_reason
     _table.put_item(Item=item)
 
