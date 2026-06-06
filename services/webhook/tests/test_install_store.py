@@ -424,3 +424,111 @@ def test_list_allowlisted_installs_paginates(_ddb_table, monkeypatch):
     monkeypatch.setattr(mod, "is_install_allowlisted", lambda iid: iid == 2)
     assert mod.list_allowlisted_installs() == [2]
     assert calls["n"] == 2   # both pages fetched
+
+
+# ── Check verdict store (PRD #301) ──────────────────────────────────────────
+
+def _put_cv(mod, **kw):
+    # No `verdict=` — put_check_verdict DERIVES the badge from the raw facts
+    # (conclusion/findings_count/degraded_reason) via review_types.verdict.
+    base = dict(
+        install_id=1, persona="elder", repo="o/r", pr_number=7,
+        head_sha="abc123", conclusion="neutral", summary="t",
+        findings_count=0, blocking=False,
+        created_at="2026-06-06T00:00:00+00:00",
+    )
+    base.update(kw)
+    mod.put_check_verdict(**base)
+
+
+def test_check_verdict_put_then_list(_ddb_table):
+    mod = _ddb_table
+    _put_cv(mod, conclusion="neutral", findings_count=2)  # derives -> warn
+    rows = mod.list_check_verdicts(1)
+    assert len(rows) == 1
+    assert rows[0]["persona"] == "elder"
+    assert rows[0]["verdict"] == "warn"        # derived from the raw facts
+    assert rows[0]["findings_count"] == 2
+
+
+def test_check_verdict_idempotent_per_persona_headsha(_ddb_table):
+    """Re-reviewing the SAME (persona, commit) upserts (heals) — one row,
+    latest wins. A NEW commit appends."""
+    mod = _ddb_table
+    _put_cv(mod, head_sha="abc", degraded_reason="all_failed")  # derives -> errored
+    _put_cv(mod, head_sha="abc", conclusion="success")          # heal -> pass
+    rows = mod.list_check_verdicts(1)
+    assert len(rows) == 1
+    assert rows[0]["verdict"] == "pass"            # healed in place
+    _put_cv(mod, head_sha="def", conclusion="failure")  # new commit appends
+    assert len(mod.list_check_verdicts(1)) == 2
+
+
+def test_check_verdict_distinct_personas_same_commit_are_two_rows(_ddb_table):
+    mod = _ddb_table
+    _put_cv(mod, persona="chief", head_sha="abc")
+    _put_cv(mod, persona="elder", head_sha="abc")
+    assert len(mod.list_check_verdicts(1)) == 2
+
+
+def test_check_verdict_newest_first_and_limit(_ddb_table):
+    mod = _ddb_table
+    _put_cv(mod, head_sha="s1", created_at="2026-06-01T00:00:00+00:00")
+    _put_cv(mod, head_sha="s2", created_at="2026-06-03T00:00:00+00:00")
+    _put_cv(mod, head_sha="s3", created_at="2026-06-02T00:00:00+00:00")
+    rows = mod.list_check_verdicts(1)
+    assert [r["head_sha"] for r in rows] == ["s2", "s3", "s1"]  # newest created_at first
+    assert len(mod.list_check_verdicts(1, limit=2)) == 2
+
+
+def test_check_verdict_ttl_set(_ddb_table):
+    mod = _ddb_table
+    _put_cv(mod, head_sha="ttlcheck")
+    item = boto3.resource("dynamodb", region_name="us-east-1").Table(
+        "grug-main-test"
+    ).get_item(Key={"PK": "INST#1", "SK": "ACT#ttlcheck#elder"})["Item"]
+    assert "ttl" in item and int(item["ttl"]) > 0
+
+
+def test_check_verdict_degraded_reason_is_sparse(_ddb_table):
+    """degraded_reason is omitted from the item when None (sparse), present
+    when set — matches CommentRecord.last_verdict opaque-optional discipline."""
+    mod = _ddb_table
+    _put_cv(mod, head_sha="clean")  # degraded_reason default None
+    _put_cv(mod, head_sha="bad", degraded_reason="all_failed")  # derives -> errored
+    rows = {r["head_sha"]: r for r in mod.list_check_verdicts(1)}
+    assert "degraded_reason" not in rows["clean"]
+    assert rows["bad"]["degraded_reason"] == "all_failed"
+
+
+def test_list_check_verdicts_paginates_and_sorts_across_pages(_ddb_table, monkeypatch):
+    """Must follow LastEvaluatedKey AND sort newest-first AFTER accumulating all
+    pages — a newer row stranded on page 2 must still surface (and sort first),
+    not be truncated at the 1MB page cap (moto only ever returns one page)."""
+    mod = _ddb_table
+
+    def _item(head, created_at):
+        return {
+            "PK": "INST#1", "SK": f"ACT#{head}#elder", "persona": "elder",
+            "repo": "o/r", "pr_number": 1, "head_sha": head, "conclusion": "neutral",
+            "summary": "t", "findings_count": 0, "blocking": False,
+            "verdict": "pass", "created_at": created_at,
+        }
+    pages = [
+        {"Items": [_item("old", "2026-06-01T00:00:00+00:00")],
+         "LastEvaluatedKey": {"PK": "INST#1", "SK": "ACT#old#elder"}},
+        {"Items": [_item("new", "2026-06-05T00:00:00+00:00")]},  # newer, on page 2
+    ]
+    calls = {"n": 0}
+
+    def fake_query(**kwargs):
+        i = calls["n"]
+        calls["n"] += 1
+        if i == 1:
+            assert kwargs.get("ExclusiveStartKey") == {"PK": "INST#1", "SK": "ACT#old#elder"}
+        return pages[i]
+
+    monkeypatch.setattr(mod._table, "query", fake_query)
+    rows = mod.list_check_verdicts(1)
+    assert calls["n"] == 2  # both pages fetched
+    assert [r["head_sha"] for r in rows] == ["new", "old"]  # page-2 newest sorts first

@@ -22,6 +22,8 @@ from typing import Any, NotRequired, Optional, TypedDict
 import boto3
 from botocore.exceptions import ClientError
 
+from review_types import verdict as _derive_verdict  # leaf import (no cycle)
+
 log = logging.getLogger("grug.webhook.install_store")
 
 _TABLE_NAME = os.environ.get("GRUG_DDB_TABLE", "grug-main")
@@ -440,6 +442,132 @@ def put_comment_record(
         "finding_tags": finding_tags,
         "ttl": ttl,
     })
+
+
+class CheckVerdictRecord(TypedDict):
+    """A persisted Check verdict — the atom of the Activity feed (PRD #301).
+
+    One row per `(persona, head_sha)`: re-reviewing the same commit upserts
+    (heals the row), a new commit appends. Stores the persona's RAW facts
+    (ADR-0003); the `verdict` badge is denormalized here for cheap filtering
+    but the canonical source is the raw facts (`review_types.verdict` re-derives
+    it, so a future mapping change can fix history). `persona` is the caveman
+    key (`chief`/`elder`, ADR-0002), never the legacy code key."""
+    persona: str
+    repo: str
+    pr_number: int
+    head_sha: str
+    conclusion: str
+    summary: str
+    findings_count: int
+    blocking: bool
+    verdict: str
+    created_at: str
+    degraded_reason: NotRequired[Optional[str]]
+
+
+# Activity rows auto-expire so the per-install ACT# partition stays bounded as
+# PRs close. 90 days — a history feed wants longer than the 30-day comment
+# window, but still finite. A GSI keyed by time is the noted scale upgrade.
+_CHECK_VERDICT_TTL_DAYS = 90
+
+
+def _check_verdict_sk(head_sha: str, persona: str) -> str:
+    return f"ACT#{head_sha}#{persona}"
+
+
+def put_check_verdict(
+    *,
+    install_id: int,
+    persona: str,
+    repo: str,
+    pr_number: int,
+    head_sha: str,
+    conclusion: str,
+    summary: str,
+    findings_count: int,
+    blocking: bool,
+    created_at: str,
+    degraded_reason: Optional[str] = None,
+) -> None:
+    """Upsert a Check verdict. Idempotent per `(persona, head_sha)` via the SK
+    — re-reviewing the same commit overwrites (heals the row), a new commit
+    appends a fresh row. `ttl` (epoch seconds) auto-expires the row ~90 days
+    out. `degraded_reason` is omitted from the item when falsy (kept sparse,
+    same opaque-optional discipline as `CommentRecord.last_verdict`).
+
+    The denormalized `verdict` badge is DERIVED here from the raw facts via the
+    single `review_types.verdict` mapper — never accepted as a parameter — so a
+    row can't be persisted with a badge that disagrees with its own facts (the
+    'raw facts are canonical' invariant is enforced by construction, ADR-0003)."""
+    ttl = int(
+        datetime.now(timezone.utc).timestamp()
+        + _CHECK_VERDICT_TTL_DAYS * 86400
+    )
+    item: dict[str, Any] = {
+        "PK": _inst_pk(install_id),
+        "SK": _check_verdict_sk(head_sha, persona),
+        "persona": persona,
+        "repo": repo,
+        "pr_number": int(pr_number),
+        "head_sha": head_sha,
+        "conclusion": conclusion,
+        "summary": summary,
+        "findings_count": int(findings_count),
+        "blocking": bool(blocking),
+        "verdict": _derive_verdict(
+            conclusion=conclusion,
+            findings_count=int(findings_count),
+            degraded_reason=degraded_reason,
+        ),
+        "created_at": created_at,
+        "ttl": ttl,
+    }
+    if degraded_reason:
+        item["degraded_reason"] = degraded_reason
+    _table.put_item(Item=item)
+
+
+def list_check_verdicts(
+    install_id: int, limit: int = 50,
+) -> list[CheckVerdictRecord]:
+    """Return an install's Check verdicts, newest-first, capped at `limit`.
+
+    Queries the `INST#` partition by `ACT#` SK prefix and sorts by `created_at`
+    descending in-process: the SK encodes `head_sha` (for idempotency), not
+    time, so DDB can't range-sort by time. Acceptable at current volume + the
+    90-day TTL bound; a time-ordered GSI is the noted scale upgrade. Paginates
+    via `LastEvaluatedKey` so a busy install isn't silently truncated at the
+    1MB page cap before the sort."""
+    rows: list[CheckVerdictRecord] = []
+    kwargs: dict[str, Any] = {
+        "KeyConditionExpression": "PK = :pk AND begins_with(SK, :sk)",
+        "ExpressionAttributeValues": {":pk": _inst_pk(install_id), ":sk": "ACT#"},
+    }
+    while True:
+        resp = _table.query(**kwargs)
+        for item in resp.get("Items", []):
+            rec: CheckVerdictRecord = {
+                "persona": str(item["persona"]),
+                "repo": str(item["repo"]),
+                "pr_number": int(item["pr_number"]),
+                "head_sha": str(item["head_sha"]),
+                "conclusion": str(item["conclusion"]),
+                "summary": str(item.get("summary", "")),
+                "findings_count": int(item.get("findings_count", 0)),
+                "blocking": bool(item.get("blocking", False)),
+                "verdict": str(item.get("verdict", "")),
+                "created_at": str(item["created_at"]),
+            }
+            if "degraded_reason" in item:
+                rec["degraded_reason"] = item["degraded_reason"]
+            rows.append(rec)
+        lek = resp.get("LastEvaluatedKey")
+        if not lek:
+            break
+        kwargs["ExclusiveStartKey"] = lek
+    rows.sort(key=lambda r: r["created_at"], reverse=True)
+    return rows[:limit]
 
 
 # Async-Elder idempotency claim (#272). Keyed on the GitHub
