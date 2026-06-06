@@ -361,9 +361,9 @@ def test_transport_failure_on_both_backends_returns_all_failed(monkeypatch) -> N
 def test_parse_failed_attributes_secondary_backend(monkeypatch) -> None:
     """If the primary backend transport-fails and the secondary returns
     200 + non-JSON content, parse_failed must report the secondary as
-    `backend_used`. Comment in review_diff explicitly says don't fall
-    back further; verify the attribution still points at whoever actually
-    responded."""
+    `backend_used`. (The secondary is the only backend that produced a 200,
+    so there's nothing further to fall back to.) Verify the attribution
+    points at whoever actually responded."""
     monkeypatch.setattr(lc, "_RETRY_SLEEP", lambda s: None)
     parse_fail_envelope = _openai_json_response("sorry, I cannot do that")
 
@@ -378,6 +378,45 @@ def test_parse_failed_attributes_secondary_backend(monkeypatch) -> None:
     assert out.kind == "parse_failed"
     assert out.backend_used == Backend.OPENROUTER
     assert "parse" in out.error.lower()
+
+
+def test_parse_failure_on_primary_falls_back_to_secondary(monkeypatch) -> None:
+    """A 200-but-unparseable response from the PRIMARY must fall back to the
+    secondary — the two backends run different models (claude vs laguna), so a
+    parse failure on one doesn't predict the other. Primary parse-fails,
+    secondary returns clean JSON → kind=reviewed, attributed to the secondary.
+    """
+    monkeypatch.setattr(lc, "_RETRY_SLEEP", lambda s: None)
+    good = _openai_json_response(
+        '{"findings":[{"path":"x.py","line":1,"rule":"ok",'
+        '"severity":"low","message":"m"}]}'
+    )
+    bad = _openai_json_response("sorry, no JSON here")
+
+    def staged(url, *args, **kwargs):
+        # installation_id=1 is odd -> OpenRouter primary, Poolside secondary.
+        if "openrouter" in url:
+            return httpx.Response(200, json=bad)
+        return httpx.Response(200, json=good)
+
+    with patch.object(httpx, "post", side_effect=staged):
+        out = review_diff([_hunk()], installation_id=1)
+
+    assert out.kind == "reviewed"
+    assert out.backend_used == Backend.POOLSIDE
+    assert len(out.findings) == 1
+
+
+def test_both_parse_fail_returns_parse_failed_attributed_to_primary(monkeypatch) -> None:
+    """When BOTH backends return 200-but-unparseable, fall back is exhausted;
+    surface the specific parse_failed kind (not all_failed), attributed to the
+    PRIMARY (the first parse failure)."""
+    monkeypatch.setattr(lc, "_RETRY_SLEEP", lambda s: None)
+    bad = httpx.Response(200, json=_openai_json_response("nope, prose only"))
+    with patch.object(httpx, "post", return_value=bad):
+        out = review_diff([_hunk()], installation_id=1)  # odd -> OpenRouter primary
+    assert out.kind == "parse_failed"
+    assert out.backend_used == Backend.OPENROUTER
 
 
 def test_non_dict_finding_entries_dropped() -> None:
