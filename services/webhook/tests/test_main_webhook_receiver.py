@@ -65,6 +65,41 @@ def test_bad_signature_returns_401(_client):
     assert r.status_code == 401
 
 
+def test_unsigned_probe_logs_distinct_event_not_signature_invalid(_client, caplog):
+    """An unsigned request (no X-Hub-Signature-256) is an internet probe of the
+    public URL, NOT a GitHub delivery being rejected — it must log
+    `webhook_unsigned_probe`, never `webhook_signature_invalid` (the monitored
+    alert). Keeps the sig-verify monitor precise to real rotated-secret events."""
+    import logging
+    caplog.set_level(logging.INFO)
+    _client.post(
+        "/webhook/github",
+        content=b'{"action":"opened"}',
+        headers={"X-GitHub-Event": "pull_request"},
+    )
+    msgs = [r.getMessage() for r in caplog.records]
+    assert "webhook_unsigned_probe" in msgs
+    assert "webhook_signature_invalid" not in msgs
+
+
+def test_signed_but_invalid_logs_signature_invalid(_client, caplog):
+    """A request that carried a signature but failed verification is a real
+    rejection (rotated secret / forged delivery) — it must log the monitored
+    `webhook_signature_invalid`, not the quiet probe event."""
+    import logging
+    caplog.set_level(logging.WARNING)
+    _client.post(
+        "/webhook/github",
+        content=b'{"action":"opened"}',
+        headers={
+            "X-GitHub-Event": "pull_request",
+            "X-Hub-Signature-256": "sha256=000000000000",
+        },
+    )
+    msgs = [r.getMessage() for r in caplog.records]
+    assert "webhook_signature_invalid" in msgs
+
+
 def test_signed_non_json_body_returns_400(_client):
     """silent-failure-hunter P1 #1: body that passes HMAC but fails
     JSON decode must 400 (not 200 'skip'), so DD alarms trigger."""
