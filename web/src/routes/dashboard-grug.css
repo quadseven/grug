@@ -216,6 +216,7 @@
 .grug-dash .afeed-row .vico.block{ background:var(--tomato); }
 .grug-dash .afeed-row .vico.warn{ background:var(--amber-deep); }
 .grug-dash .afeed-row .vico.pass{ background:var(--moss); }
+.grug-dash .afeed-row .vico.errored{ background:var(--muted); }
 .grug-dash .afeed-row .who2{ flex:1; min-width:0; }
 .grug-dash .afeed-row .who2 b{ font-weight:700; }
 .grug-dash .afeed-row .who2 .repo2{ color:var(--muted); }
@@ -224,6 +225,7 @@
 .grug-dash .afeed-row .verdict.block{ background:var(--tomato); color:#fff; }
 .grug-dash .afeed-row .verdict.warn{ background:var(--amber); color:var(--ink); }
 .grug-dash .afeed-row .verdict.pass{ background:var(--moss); color:#fff; }
+.grug-dash .afeed-row .verdict.errored{ background:var(--muted); color:#fff; }
 .grug-dash .afeed-row .ago{ color:var(--muted); font-size:10px; white-space:nowrap; }
 
 .grug-dash .toast{ position:fixed; left:50%; bottom:26px; transform:translateX(-50%) translateY(20px); background:var(--ink); color:var(--bg); border:2px solid var(--ink); box-shadow:var(--shadow); padding:10px 18px; font-family:'JetBrains Mono', monospace; font-size:12px; opacity:0; pointer-events:none; transition:opacity .2s, transform .2s; z-index:120; }
