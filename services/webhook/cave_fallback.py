@@ -1,0 +1,197 @@
+# WEBHOOK-ONLY (NOT mirrored): the Elder cave-fallback producer + (later)
+# result handler. Like async_dispatch.py / poller_handler.py, the api service
+# never runs Elder, so there is no api sibling.
+"""Elder cave-fallback (ADR-0005, spec 0018).
+
+When BOTH cloud LLM backends fail (`review_diff` → `all_failed`), enqueue a
+review job to "the Cave" — the operator's self-hosted LLM — over an SQS
+airlock (`grug-cave-jobs`). The connector (#316, separate repo) answers on
+`grug-cave-results`; the webhook consumes that and heals the verdict. Grug and
+the Cave never connect — the queues are the only contact surface.
+
+PART A scope (#310): the AWS-side producer + the cross-repo message contract,
+for small diffs (carried INLINE). The connector (#316) and S3 spillover for
+large diffs (#311) are separate slices. The result handler lands in a
+follow-up commit on this branch.
+"""
+from __future__ import annotations
+
+import json
+import logging
+import os
+from dataclasses import dataclass
+from typing import Any
+
+import boto3
+
+from llm_client import Hunk
+
+log = logging.getLogger(f"{os.getenv('DD_SERVICE', 'grug')}.cave_fallback")
+
+_sqs = boto3.client("sqs")
+
+# Queue URL injected by Pulumi as a Lambda env var. Empty in local/dev/tests →
+# enqueue is a no-op, so the producer can't crash a review just because the
+# queue isn't wired yet (best-effort, same discipline as the #272 offload).
+_JOBS_QUEUE_URL = os.getenv("GRUG_CAVE_JOBS_QUEUE_URL", "")
+
+# Bump when the wire shape changes so the connector (a separate repo) can
+# reject/handle an unknown version instead of silently mis-parsing.
+SCHEMA_VERSION = 1
+
+# The one persona that falls back today. Carried on the message so a future
+# multi-persona airlock routes without a schema change.
+_PERSONA = "elder"
+
+
+@dataclass(frozen=True, slots=True)
+class FallbackJob:
+    """A review job handed to the Cave connector over `grug-cave-jobs`.
+
+    Carries the PR coords + the diff INLINE (small-diff scope; #311 adds S3
+    spillover) and NO GitHub credential — the connector re-reads nothing from
+    GitHub. `hunks` is (path, body) pairs so the connector reconstructs the
+    same review units `review_diff` would have seen.
+    """
+
+    schema_version: int
+    install_id: int
+    repo: str  # "owner/name"
+    pr_number: int
+    head_sha: str
+    persona: str
+    hunks: tuple[tuple[str, str], ...]
+
+    def to_json(self) -> str:
+        return json.dumps(
+            {
+                "schema_version": self.schema_version,
+                "install_id": self.install_id,
+                "repo": self.repo,
+                "pr_number": self.pr_number,
+                "head_sha": self.head_sha,
+                "persona": self.persona,
+                "hunks": [{"path": p, "body": b} for p, b in self.hunks],
+            }
+        )
+
+
+@dataclass(frozen=True, slots=True)
+class FallbackResult:
+    """The connector's answer on `grug-cave-results`: findings (or a degraded
+    marker) for one (install, repo, pr, head). Consumed by the webhook to
+    publish the check-run + heal the verdict.
+
+    `findings` are kept as primitive dicts (the connector's wire shape) — the
+    result handler validates them into persona `Finding`s, mirroring how
+    `_coerce_finding` defends the live LLM path.
+    """
+
+    schema_version: int
+    install_id: int
+    repo: str
+    pr_number: int
+    head_sha: str
+    persona: str
+    findings: tuple[dict[str, Any], ...]
+    degraded: bool = False
+    degraded_reason: str = ""
+    model: str = ""
+
+    @classmethod
+    def from_json(cls, raw: str) -> "FallbackResult":
+        d = json.loads(raw)
+        if not isinstance(d, dict):
+            raise ValueError("FallbackResult body is not a JSON object")
+        findings = d.get("findings", [])
+        if not isinstance(findings, list):
+            findings = []
+        return cls(
+            schema_version=int(d["schema_version"]),
+            install_id=int(d["install_id"]),
+            repo=str(d["repo"]),
+            pr_number=int(d["pr_number"]),
+            head_sha=str(d["head_sha"]),
+            persona=str(d.get("persona", _PERSONA)),
+            findings=tuple(f for f in findings if isinstance(f, dict)),
+            degraded=bool(d.get("degraded", False)),
+            degraded_reason=str(d.get("degraded_reason", "")),
+            model=str(d.get("model", "")),
+        )
+
+
+def _dedup_id(install_id: int, repo: str, pr_number: int, head_sha: str) -> str:
+    """FIFO content-dedup key. Includes `head_sha` deliberately: a NEW push (new
+    head) is a DIFFERENT review that must enqueue, so it must not dedup against
+    the prior commit's job; but a double-fire on the SAME head within the 5-min
+    FIFO window is dropped for free (a redelivery / re-trigger guard)."""
+    return f"{install_id}:{repo}:{pr_number}:{_PERSONA}:{head_sha}"
+
+
+def enqueue_fallback(
+    hunks: list[Hunk],
+    *,
+    installation_id: int,
+    repo: str,
+    pr_number: int,
+    head_sha: str,
+) -> bool:
+    """Enqueue a `FallbackJob` to `grug-cave-jobs` — the Elder owned-LLM fallback.
+
+    Call ONLY when `review_diff` returned `all_failed`. No-op (returns `False`)
+    when the SSM flag is off, the queue URL is unset, or there are no hunks.
+    BEST-EFFORT: never raises — a SendMessage failure logs
+    `elder_fallback_enqueue_failed` and returns `False` so the already-published
+    `errored` verdict stands and the fallback re-triggers on the next push.
+
+    Returns `True` iff a job was actually enqueued.
+    """
+    # Lazy import keeps the SSM read off this module's import path (and lets
+    # tests patch `secrets_loader.get_fallback_enabled` at the lookup site).
+    from secrets_loader import get_fallback_enabled
+
+    if not get_fallback_enabled():
+        return False
+    if not _JOBS_QUEUE_URL:
+        log.warning(
+            "elder_fallback_no_queue_url",
+            extra={"repo": repo, "pr": pr_number},
+        )
+        return False
+    if not hunks:
+        return False
+
+    job = FallbackJob(
+        schema_version=SCHEMA_VERSION,
+        install_id=installation_id,
+        repo=repo,
+        pr_number=pr_number,
+        head_sha=head_sha,
+        persona=_PERSONA,
+        hunks=tuple((h.path, h.body) for h in hunks),
+    )
+    try:
+        _sqs.send_message(
+            QueueUrl=_JOBS_QUEUE_URL,
+            MessageBody=job.to_json(),
+            MessageGroupId=str(installation_id),
+            MessageDeduplicationId=_dedup_id(
+                installation_id, repo, pr_number, head_sha
+            ),
+        )
+    except Exception as e:  # noqa: BLE001 — best-effort: a lost fallback re-triggers next push
+        log.warning(
+            "elder_fallback_enqueue_failed",
+            extra={"repo": repo, "pr": pr_number, "kind": type(e).__name__},
+        )
+        return False
+    log.info(
+        "elder_fallback_enqueued",
+        extra={
+            "repo": repo,
+            "pr": pr_number,
+            "head_sha": head_sha[:8],
+            "hunks": len(hunks),
+        },
+    )
+    return True

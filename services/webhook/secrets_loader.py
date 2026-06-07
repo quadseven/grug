@@ -105,3 +105,28 @@ def get_prompt_experiment_mode() -> Mode:
         return "off"
     # Narrowed: `value` passed the `_EXPERIMENT_MODES` (== get_args(Mode)) gate.
     return cast("Mode", value)
+
+
+def get_fallback_enabled() -> bool:
+    """Whether the Elder cave-fallback (ADR-0005) is enabled, from the
+    `/grug/elder-fallback-enabled` SSM param (plain String, e.g. "true").
+
+    FALLBACK-SAFE in the strongest sense: returns `False` on a missing /
+    unreadable param, an SSM error, or any unrecognized value. The fallback
+    must never turn ITSELF on by accident (enqueuing to a queue whose connector
+    isn't live yet would just pile messages up), and a config blip must never
+    break a review. Read only on the rare `all_failed` path, so it is
+    intentionally NOT cached — toggling takes effect without a container
+    recycle."""
+    name = os.getenv("GRUG_FALLBACK_ENABLED_SSM", "")
+    if not name:
+        return False
+    try:
+        value = _ssm.get_parameter(Name=name)["Parameter"]["Value"].strip().lower()
+    except Exception as e:  # noqa: BLE001 — best-effort config; never break a review
+        log.warning(
+            "fallback_enabled_fetch_failed",
+            extra={"param": name, "kind": type(e).__name__},
+        )
+        return False
+    return value in ("true", "1", "yes", "on")
