@@ -11,7 +11,7 @@ External SaaS the stack depends on (flat dependencies, not topology):
 - **AWS us-east-1** account `317164914846` — Lambda, DDB, KMS, SSM, ECR, CloudWatch Logs
 - **Datadog US1** — APM + Logs + RUM + Monitors + Synthetics
 - **GitHub** — App registration `grug-tribe` (webhook source + OAuth identity provider) + Actions OIDC (deploys)
-- **Pulumi Cloud** — `pulumi_ehumps_me/grug/{dev,prod}` stacks (no passphrase)
+- **Pulumi Cloud** — `<pulumi-org>/grug/{dev,prod}` stacks (no passphrase)
 
 ---
 
@@ -175,7 +175,7 @@ sequenceDiagram
     end
 ```
 
-**Runner-swap gotcha** (memory: `feedback_runner_swap_check_preinstalled_tools`): when iac.deploy was swapped from `srv-unraid-gha` to `ubuntu-latest` (PR #156), the workflow assumed `uv` was preinstalled — true for the self-hosted runner, false for ubuntu-latest. Pulumi silently no-op'd for 24h until PR #166 added an explicit `astral-sh/setup-uv` step.
+**Runner-swap gotcha** (memory: `feedback_runner_swap_check_preinstalled_tools`): when iac.deploy was swapped from `the self-hosted CI runner` to `ubuntu-latest` (PR #156), the workflow assumed `uv` was preinstalled — true for the self-hosted runner, false for ubuntu-latest. Pulumi silently no-op'd for 24h until PR #166 added an explicit `astral-sh/setup-uv` step.
 
 ---
 
@@ -267,15 +267,14 @@ flowchart LR
 | 2026-05-17 | DD APP key leaked into `pulumi preview` output (unwrapped `aws.ssm.get_parameter().value`) | Every SSM read for a secret now `pulumi.Output.secret()`-wrapped before being passed to providers. Memory: `feedback_pulumi_preview_secret_leak_guard` |
 | 2026-05-24 | Design handoff regressions on grug.lol — `/apps/grug` 404 + mailto: CTAs + URL slug `/Grug` | PRs #157 + #160 fixed the symptoms; spec 0012 (Landing) + 3 attesters now block this class of regression in CI |
 | 2026-05-24 | DD APP key per-project SSM path — `/shared/datadog-app-key` cross-repo path was stale after rotation; every `pulumi up` 403'd | Split into `/shared/datadog-app-key/github-grug` so per-repo rotations don't clobber siblings (PR #155) |
-| 2026-05-24 | iac.deploy silently no-op'd for 24h after the `[self-hosted, srv-unraid-gha]` → `ubuntu-latest` runner swap (PR #156) — workflow comment claimed `uv` was preinstalled (true for old runner, false for new) | PR #166 added `astral-sh/setup-uv@v5` (same SHA the infrastructure repo uses). Memory: `feedback_runner_swap_check_preinstalled_tools` |
+| 2026-05-24 | iac.deploy silently no-op'd for 24h after the self-hosted → `ubuntu-latest` runner swap (PR #156) — workflow comment claimed `uv` was preinstalled (true for old runner, false for new) | PR #166 added `astral-sh/setup-uv@v5`. Memory: `feedback_runner_swap_check_preinstalled_tools` |
 | 2026-05-24 | RUM first-light cascade — 5 sequential 403s as each layer surfaced its next missing permission: `rum_apps_*` scopes → `product_analytics_apps_write` scope → `ssm:PutParameter` on `/grug/*` → IAM propagation race | DD UI scope additions (×2) + PR #171 (deploy role grant) + one-shot re-trigger (IAM propagation). RUM live in DD ~14:30 UTC after the cascade cleared |
 
 ---
 
 ## L. Cross-references
 
-- [`infrastructure/docs/network-topology.md`](https://github.com/githumps/infrastructure/blob/main/docs/network-topology.md) — k8s-ts cluster topology (sibling doc; this one is the SaaS-side equivalent)
-- [`infrastructure/docs/PULUMI-TOPOLOGY.md`](https://github.com/githumps/infrastructure/blob/main/docs/PULUMI-TOPOLOGY.md) — cross-repo Pulumi project graph (grug is one of 7 projects)
+- The operator's private infra repo holds the sibling cluster-topology + cross-repo Pulumi-project-graph docs (not linked from this public repo).
 - [`docs/HITL_PREREQUISITES.md`](HITL_PREREQUISITES.md) — every SSM parameter that must exist before first `pulumi up`
 - [`docs/RUNBOOK.md`](RUNBOOK.md) — operational procedures for live grug.lol
 - [`specs/0012-landing/`](../specs/0012-landing/) — Landing IOA spec + 3 grounding attesters (CTAs, install URL, slug)
