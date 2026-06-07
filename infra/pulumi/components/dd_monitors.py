@@ -159,27 +159,40 @@ def create_all(
         opts=opts,
     )
 
-    # 3b) Elder LLM degraded — reviews silently dropped. The offload monitor
+    # 3b) Elder LLM degraded — both CLOUD backends down. The offload monitor
     #     above watches the async PLUMBING (enqueue/worker crash); it cannot
-    #     see the failure that actually took Elder down for ~5 days — EVERY
-    #     LLM backend (OpenRouter 402 + Poolside ReadTimeout) failing, which
-    #     is logged at warn as `code_review_llm_degraded` and returns
-    #     gracefully (no crash, no offload failure). Same shape as the poller's
-    #     all-failed monitor: a handled systemic failure needs a LOG alert, not
-    #     a crash/metric one. `>= 2` in 1h ignores a lone transient blip but
-    #     trips on a sustained both-backends-down outage.
+    #     see EVERY LLM backend (OpenRouter + Poolside) failing, which is
+    #     logged at warn as `code_review_llm_degraded` and returns gracefully
+    #     (no crash, no offload failure). `>= 2` in 1h ignores a lone transient
+    #     blip but trips on a sustained both-backends-down outage.
+    #
+    #     RE-SCOPED (ADR-0005): the operator deliberately does NOT fund the
+    #     SaaS backends — topping up OpenRouter/Poolside is an explicit
+    #     non-strategy. The fix is Elder's OWNED fallback to the Cave (the
+    #     operator's self-hosted LLM; slices #310 -> #316 -> #313). So this monitor's
+    #     severity is now CONDITIONAL on whether that fallback is live:
+    #       - BEFORE the fallback ships: both clouds down → reviews dropped is
+    #         a KNOWN, ACCEPTED gap → informational (priority 4), do not page.
+    #       - AFTER the fallback ships: this firing means the Cave ALSO failed
+    #         (clouds down is normal; the fallback is what should have saved
+    #         it) → restore priority=2 and treat as a real outage.
+    #     When #310/#316/#313 land, bump priority back to 2 + update the
+    #     message's "until the fallback is live" framing.
     elder_llm_degraded = datadog.Monitor(
         "grug-webhook-elder-llm-degraded",
         type="log alert",
-        name="[grug-webhook] Elder LLM degraded — reviews dropped (1h)",
+        name="[grug-webhook] Elder cloud LLMs down — fallback gap (1h)",
         message=(
             f"{notify_handle}\n"
-            "Grug Elder could not reach ANY LLM backend (all of OpenRouter + "
-            "Poolside failed) for >= 2 code reviews in the last hour — those "
-            "PRs got NO review, only a neutral 'skipping' check. Check provider "
-            "credits (OpenRouter `http_402` = out of credits) and timeouts "
-            "(Poolside `ReadTimeout`). Invisible to the offload monitor because "
-            "the async path succeeds; only the LLM call fails.\n"
+            "Grug Elder could not reach any CLOUD LLM backend (OpenRouter + "
+            "Poolside both failed) for >= 2 reviews in the last hour. "
+            "**This is expected — the SaaS backends are unfunded by design; do "
+            "NOT top up OpenRouter/Poolside.** The fix is Elder's owned fallback "
+            "to the Cave — the operator's self-hosted LLM (ADR-0005, slices "
+            "#310 -> #316 -> #313). Until that fallback is live these reviews "
+            "are dropped (known gap, informational). ONCE it is live, this "
+            "firing means the Cave ALSO failed — investigate then and restore "
+            "this monitor to P2.\n"
             "Runbook: docs/RUNBOOK.md#elder-async-offload"
         ),
         query=(
@@ -188,7 +201,9 @@ def create_all(
         ),
         tags=_common_tags(env, "grug-webhook"),
         notify_no_data=False,
-        priority=2,
+        # Informational until the cave fallback lands — see comment above.
+        # Restore to 2 when #310/#316/#313 ship.
+        priority=4,
         opts=opts,
     )
 
