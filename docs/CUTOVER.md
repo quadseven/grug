@@ -88,9 +88,9 @@ If anything broke, re-add `.github/workflows/grug.pr-gate.yml` from
 git history and revert step 3's branch protection change. Cutover is
 fully reversible until step 4 lands on default branch.
 
-## Slice 11 — canary on `githumps/infrastructure`
+## Slice 11 — canary on a private repo you own
 
-Use this repo first. Smallest blast radius, you own it, can iterate.
+Use a private repo you own first. Smallest blast radius, you control it, can iterate.
 Steps 1-5 above. Confirm everything green for ~24h before bulk-cutover.
 
 ## Slice 12 — bulk-cutover remaining 9 repos
