@@ -565,19 +565,11 @@ _dd_provider = _datadog.Provider(
 # Elder LLM outage ran ~5 days with no page). Register a real DD webhook
 # integration that POSTs to the pre-existing Discord webhook secret, and route
 # all monitors at it. `@webhook-<name>` is how a DD monitor references a webhook
-# integration entry.
-#
-# The SSM path for that webhook is operator-specific (it embeds a private
-# Discord identifier), so it's read from Pulumi config rather than hardcoded:
-#   pulumi config set grug:discord_alerts_ssm_param /infra/discord/<id>/monitoring-alerts
-# The placeholder default keeps mocked synth green; a real deploy requires the
-# config (a missing SSM param fails fast at `pulumi up`).
-_discord_alerts_ssm_param = (
-    config.get("discord_alerts_ssm_param") or "/infra/discord/monitoring-alerts"
-)
+# integration entry. The webhook URL is an SSM SecureString (set out-of-band,
+# like the other `/infra/*` shared params) — one param, all stacks.
 _discord_webhook_url = pulumi.Output.secret(
     aws.ssm.get_parameter(
-        name=_discord_alerts_ssm_param,
+        name="/infra/discord/monitoring-alerts",
         with_decryption=True,
     ).value
 )
