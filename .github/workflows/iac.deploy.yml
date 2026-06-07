@@ -47,7 +47,7 @@ jobs:
     strategy:
       matrix:
         service: [webhook, api]
-    uses: githumps/infra-public/.github/workflows/_reusable.container-build.yml@41038951557478badb69ca2c34217f75825cfc2e  # infra-public main; bump deliberately
+    uses: githumps/infra-public/.github/workflows/build.container.yml@cd83e5727c0a7b904f780960664a51b3a3a0c685  # infra-public main; bump deliberately
     with:
       runner: ubuntu-24.04-arm
       image: grug-${{ matrix.service }}

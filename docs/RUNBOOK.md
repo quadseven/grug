@@ -120,7 +120,7 @@ Shared across all projects. Coordinate with somatic-scripts before rotating.
 | Webhook returns 403 with `{"Message":null}` (CF) | CF Worker proxied the request but origin Lambda Function URL rejected mismatched Host header | DNS proxied=False (loses CF) OR Worker upload broken — re-run `deploy.sh` |
 | Lambda invocation fails with `entrypoint requires the handler name to be the first argument` | Lambda image is bootstrap (bare AWS Python base) | CI didn't push image OR Pulumi rolled back to `:bootstrap` config. Trigger `gh workflow run iac.deploy.yml` |
 | Pulumi up fails: `script already exists` (CF) | CF Worker manually uploaded but not in Pulumi state | Drop `cloudflare:WorkerScript`/`WorkerRoute` from `__main__.py` (we now manage Worker via `infra/cloudflare/deploy.sh`) |
-| CI fails: `aws: command not found` on srv-unraid-gha | Runner missing tooling | Re-run `ansible-playbook production/playbooks/gha_runner_tooling.yml --limit srv-unraid-gha` from `githumps/infrastructure` |
+| CI fails: `aws: command not found` on the self-hosted CI runner | Runner missing tooling | Re-provision the self-hosted runner's tooling from your private infra repo |
 | CF Worker upload fails: `code 10021: No such module: worker.js` | Upload form-field name doesn't match metadata.main_module | Use `/tmp/worker.js` as path (basename `worker.js` matches main_module) — `deploy.sh` does this |
 
 ## Tear-down + rebuild
@@ -153,7 +153,7 @@ State that lives outside Pulumi (and persists across destroy):
 - **DD APM:** <https://app.datadoghq.com/apm/services?service=grug-webhook>
 - **DD Logs:** <https://app.datadoghq.com/logs?query=service%3Agrug-webhook>
 - **CloudWatch Logs:** `aws logs tail /aws/lambda/grug-webhook --region us-east-1 --since 5m`
-- **Pulumi state:** <https://app.pulumi.com/pulumi_ehumps_me/grug/dev>
+- **Pulumi state:** <https://app.pulumi.com/<pulumi-org>/grug/dev>
 - **CF dashboard:** <https://dash.cloudflare.com/<your-cf-account-id>/workers/services/view/grug-webhook-host-rewrite>
 
 ## Service tags
@@ -368,6 +368,19 @@ async worker (`async_dispatch.run_elder_job`) is idempotent on the
   original ran via `elder_job_done`.
 - AWS async retries are disabled (`maximum_retry_attempts=0`) — the worker
   owns idempotency + degrade, so AWS retries would only risk a storm.
+- **Monitor `[grug-webhook] Elder cloud LLMs down — fallback gap`** fires on
+  `code_review_llm_degraded` (BOTH cloud backends — OpenRouter + Poolside —
+  failed for ≥2 reviews in 1h). **The runbook is: do NOT top up credits.**
+  The SaaS backends are unfunded by deliberate choice; topping up
+  OpenRouter/Poolside is an explicit non-strategy. The fix is Elder's owned
+  fallback to the Cave (the operator's self-hosted LLM) (ADR-0005, slices #310 → #316 →
+  #313). Severity is conditional:
+  - **Before the fallback is live:** dropped reviews are a known, accepted
+    gap — the monitor is informational (P4). No action.
+  - **After the fallback is live:** this firing means the Cave ALSO failed
+    (clouds-down is the normal trigger; the fallback should have healed it)
+    — investigate the Cave / the `grug-cave-connector` / the SQS airlock,
+    and the monitor should be restored to P2.
 
 ### Elder prompt A/B experiment (#191)
 
