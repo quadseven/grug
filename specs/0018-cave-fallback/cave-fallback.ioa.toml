@@ -1,0 +1,184 @@
+# spec 0018 — Elder Cave Fallback (SQS airlock) I/O Automaton
+#
+# Models the AWS-side contract of the Elder owned-LLM fallback (ADR-0005):
+# when BOTH cloud LLM backends fail (`review_diff` → kind=all_failed) and the
+# SSM fallback flag is on, the webhook Lambda enqueues a FallbackJob onto
+# `grug-cave-jobs` (SQS FIFO) and keeps the `errored` verdict; the
+# `grug-cave-connector` (spec out of scope here — #316) answers on
+# `grug-cave-results`; the webhook consumes that result, publishes the
+# check-run, and HEALS the CheckVerdictRecord (errored → reviewed) via the
+# idempotent ADR-0003 upsert path.
+#
+# "The Cave" = the operator's self-hosted, OpenAI-compatible LLM, reachable
+# only over the operator's private network (never publicly exposed). The
+# deployment mechanics of that private connection live in the operator's
+# private infra repo, not here.
+#
+# The load-bearing invariants this attests:
+#   - enqueue ONLY on all_failed AND flag-on (never on a partial/healthy review);
+#   - the job carries the diff INLINE and NO GitHub credential (the creds
+#     boundary — the connector never calls GitHub; Part A scope is small diffs,
+#     S3 spillover is #311);
+#   - FIFO content dedup on (install,repo,pr,persona) + MessageGroupId=install_id;
+#   - enqueue + result handling are BEST-EFFORT (never raise back into the
+#     Lambda — a lost fallback re-triggers on the next push, mirroring #272);
+#   - the heal is idempotent per (persona, head_sha) — re-delivery heals in place;
+#   - the SQS queues are the AIRLOCK: the Cave receives ZERO inbound; Grug and
+#     the Cave only ever touch the queues.
+#
+# Source of truth: services/webhook/cave_fallback.py (enqueuer + result
+# handler) + services/webhook/lambda_handler.py (SQS routing) +
+# services/webhook/personas/code_reviewer/dispatch.py (the all_failed hook) +
+# infra/pulumi (queues, IAM, event-source mapping) + DESIGN.md
+# § "Elder cave fallback (SQS airlock)".
+#
+# SQS is greenfield in grug here; ADR-0004's rerun queue (#305) reuses this
+# scaffolding later (rule-of-three extraction deferred).
+#
+# Verified by `temper verify -s specs/0018-cave-fallback/`.
+
+[automaton]
+name = "CaveFallback"
+states = ["Drafted", "Enqueued", "Answered", "Healed", "Retired"]
+initial = "Drafted"
+
+# --- Enqueue contract bools (the producer side) ---
+
+[[state]]
+name = "enqueue_only_on_all_failed_and_flag_on_per_fallback"
+type = "bool"
+initial = "false"
+
+[[state]]
+name = "job_carries_inline_diff_and_no_github_credential_per_fallback"
+type = "bool"
+initial = "false"
+
+[[state]]
+name = "enqueue_uses_fifo_dedup_and_install_message_group_per_fallback"
+type = "bool"
+initial = "false"
+
+[[state]]
+name = "enqueue_is_best_effort_never_raises_into_dispatch_per_fallback"
+type = "bool"
+initial = "false"
+
+# --- Result/heal contract bools (the consumer side) ---
+
+[[state]]
+name = "result_consumed_via_sqs_event_source_mapping_per_fallback"
+type = "bool"
+initial = "false"
+
+[[state]]
+name = "result_publishes_check_run_then_heals_verdict_per_fallback"
+type = "bool"
+initial = "false"
+
+[[state]]
+name = "heal_is_idempotent_per_persona_head_sha_per_fallback"
+type = "bool"
+initial = "false"
+
+[[state]]
+name = "result_handler_never_raises_back_to_lambda_per_fallback"
+type = "bool"
+initial = "false"
+
+# --- The airlock invariant ---
+
+[[state]]
+name = "queues_are_airlock_cave_zero_inbound_per_fallback"
+type = "bool"
+initial = "false"
+
+[[action]]
+name = "AttestEnqueueContract"
+kind = "input"
+from = ["Drafted"]
+params = ["attestor"]
+guard = "is_false enqueue_is_best_effort_never_raises_into_dispatch_per_fallback"
+effect = [
+  { type = "set_bool", var = "enqueue_only_on_all_failed_and_flag_on_per_fallback", value = true },
+  { type = "set_bool", var = "job_carries_inline_diff_and_no_github_credential_per_fallback", value = true },
+  { type = "set_bool", var = "enqueue_uses_fifo_dedup_and_install_message_group_per_fallback", value = true },
+  { type = "set_bool", var = "enqueue_is_best_effort_never_raises_into_dispatch_per_fallback", value = true },
+]
+hint = "dispatch_code_review enqueues ONLY when llm_response.kind=='all_failed' AND get_fallback_enabled() is true; a healthy/partial review or flag-off is a no-op. The FallbackJob carries the diff hunks inline (small-diff scope; S3 spillover is #311) + install/repo/pr/head coords, and NEVER a GitHub token (the connector re-reads nothing from GitHub). SendMessage uses MessageDeduplicationId from (install,repo,pr,persona) + MessageGroupId=install_id. A SendMessage failure logs elder_fallback_enqueue_failed and is swallowed — the degraded `errored` verdict was already published; the fallback re-triggers on the next push."
+
+[[action]]
+name = "AttestResultContract"
+kind = "input"
+from = ["Drafted"]
+params = ["attestor"]
+guard = "is_false result_handler_never_raises_back_to_lambda_per_fallback"
+effect = [
+  { type = "set_bool", var = "result_consumed_via_sqs_event_source_mapping_per_fallback", value = true },
+  { type = "set_bool", var = "result_publishes_check_run_then_heals_verdict_per_fallback", value = true },
+  { type = "set_bool", var = "heal_is_idempotent_per_persona_head_sha_per_fallback", value = true },
+  { type = "set_bool", var = "result_handler_never_raises_back_to_lambda_per_fallback", value = true },
+  { type = "set_bool", var = "queues_are_airlock_cave_zero_inbound_per_fallback", value = true },
+]
+hint = "lambda_handler routes the aws:sqs event (grug-cave-results) to handle_fallback_result BEFORE Mangum. The handler parses a FallbackResult, post_check_run with the connector findings, then record_check_verdict — which upserts idempotently per (persona, head_sha), healing errored→reviewed for the current head (a moved-on PR appends a fresh row). The handler never raises back to the Lambda (a raise would retry-storm the ESM); a malformed/failed result degrades and is logged. Grug and the Cave never connect — the two FIFO queues are the only contact surface, so the Cave has zero inbound."
+
+[[action]]
+name = "Enqueue"
+kind = "input"
+from = ["Drafted"]
+to = "Enqueued"
+params = ["job_dedup_id"]
+guard = [
+  { type = "is_true", var = "enqueue_only_on_all_failed_and_flag_on_per_fallback" },
+  { type = "is_true", var = "job_carries_inline_diff_and_no_github_credential_per_fallback" },
+  { type = "is_true", var = "enqueue_uses_fifo_dedup_and_install_message_group_per_fallback" },
+  { type = "is_true", var = "enqueue_is_best_effort_never_raises_into_dispatch_per_fallback" },
+]
+hint = "Both clouds failed + flag on: SendMessage a FallbackJob to grug-cave-jobs."
+
+[[action]]
+name = "Answer"
+kind = "input"
+from = ["Enqueued"]
+to = "Answered"
+params = ["result_id"]
+hint = "grug-cave-connector (#316) reviewed via the Cave and wrote a FallbackResult to grug-cave-results. External to Part A."
+
+[[action]]
+name = "Heal"
+kind = "input"
+from = ["Answered"]
+to = "Healed"
+params = ["head_sha"]
+guard = [
+  { type = "is_true", var = "result_consumed_via_sqs_event_source_mapping_per_fallback" },
+  { type = "is_true", var = "result_publishes_check_run_then_heals_verdict_per_fallback" },
+  { type = "is_true", var = "heal_is_idempotent_per_persona_head_sha_per_fallback" },
+  { type = "is_true", var = "result_handler_never_raises_back_to_lambda_per_fallback" },
+]
+hint = "Webhook consumes the result, post_check_run + record_check_verdict upsert errored→reviewed."
+
+[[action]]
+name = "Retire"
+kind = "input"
+from = ["Healed"]
+to = "Retired"
+params = ["successor_pr_head_sha"]
+hint = "PR head moves; this fallback is now historical."
+
+[[invariant]]
+name = "MustEnqueueBeforeAnswer"
+assert = "ordering(Enqueued, Answered)"
+
+[[invariant]]
+name = "MustAnswerBeforeHeal"
+assert = "ordering(Answered, Healed)"
+
+[[invariant]]
+name = "MustHealBeforeRetire"
+assert = "ordering(Healed, Retired)"
+
+[[invariant]]
+name = "RetiredIsTerminal"
+when = ["Retired"]
+assert = "no_further_transitions"
