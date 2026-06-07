@@ -368,6 +368,19 @@ async worker (`async_dispatch.run_elder_job`) is idempotent on the
   original ran via `elder_job_done`.
 - AWS async retries are disabled (`maximum_retry_attempts=0`) — the worker
   owns idempotency + degrade, so AWS retries would only risk a storm.
+- **Monitor `[grug-webhook] Elder cloud LLMs down — fallback gap`** fires on
+  `code_review_llm_degraded` (BOTH cloud backends — OpenRouter + Poolside —
+  failed for ≥2 reviews in 1h). **The runbook is: do NOT top up credits.**
+  The SaaS backends are unfunded by deliberate choice; topping up
+  OpenRouter/Poolside is an explicit non-strategy. The fix is Elder's owned
+  fallback to the Cave (the operator's self-hosted LLM) (ADR-0005, slices #310 → #316 →
+  #313). Severity is conditional:
+  - **Before the fallback is live:** dropped reviews are a known, accepted
+    gap — the monitor is informational (P4). No action.
+  - **After the fallback is live:** this firing means the Cave ALSO failed
+    (clouds-down is the normal trigger; the fallback should have healed it)
+    — investigate the Cave / the `grug-cave-connector` / the SQS airlock,
+    and the monitor should be restored to P2.
 
 ### Elder prompt A/B experiment (#191)
 
