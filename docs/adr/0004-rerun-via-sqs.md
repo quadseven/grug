@@ -13,7 +13,7 @@ Re-run must run the persona's LLM review, which needs the webhook Lambda's 420s 
 Options considered for the hand-off/queue:
 
 - **Fire-and-forget `lambda.invoke(Event)`** (what the #272 offload does today) — no durability/visibility; drops on throttle (the `elder_enqueue_failed` monitor exists precisely because of this). Bad for batch backfill.
-- **Self-hosted k8s worker over Tailscale** — the homelab cluster. Splits the architecture across AWS↔tailnet, adds a network dependency + failure mode, and buys nothing: re-run work is **I/O-bound** (waiting on the LLM HTTP call), not compute-bound, so the cluster's power sits idle.
+- **Self-hosted worker over a private network** — the operator's own cluster. Splits the architecture across AWS↔private-network, adds a network dependency + failure mode, and buys nothing: re-run work is **I/O-bound** (waiting on the LLM HTTP call), not compute-bound, so the cluster's power sits idle.
 - **Kafka / MSK** — built for high-throughput streaming/replay. Massive overkill for dozens of human-triggered jobs/month, at real cost (MSK $$) or ops burden (self-host).
 - **SQS** — managed queue with native Lambda integration, DLQ, FIFO dedup, retry.
 

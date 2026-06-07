@@ -105,7 +105,7 @@ def create(
     # creation) + SSM read + CloudWatch + Cloudflare-via-API.
     #
     # SSM read explicitly includes `/shared/*` so CI can fetch the
-    # cross-repo Pulumi access token (per githumps/infrastructure#164
+    # cross-repo Pulumi access token (per the operator's private infra
     # SSM convention — `/shared/<token>` is the cross-cutting namespace).
     deploy_policy_doc = json.dumps(
             {

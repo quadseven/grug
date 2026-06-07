@@ -82,8 +82,8 @@ cf_provider = cloudflare.Provider(
 )
 
 # Datadog API key — the shared INFRA DD key (`/infra/datadog/api_key`), the
-# same pair the homelab infrastructure Pulumi uses. Consolidated here (#258
-# follow-up) so grug doesn't maintain its own DD credentials: the prior
+# same pair the operator's shared infrastructure Pulumi uses. Consolidated here
+# (#258 follow-up) so grug doesn't maintain its own DD credentials: the prior
 # `/shared/datadog-*` keys were revoked out-of-band and grug had no reason to
 # carry a separate key. Lambda extension reads DD_API_KEY to ship traces/logs.
 _dd_api_key = aws.ssm.get_parameter(
@@ -546,8 +546,8 @@ cloudflare_dns.create_proxied_cname(
 
 # Datadog monitors (Slice 9 #30). Provider reads DD creds from SSM — the
 # shared INFRA DD app key (`/infra/datadog/app_key`), paired with the infra
-# API key above. One DD key pair for the homelab rather than a grug-specific
-# one (the old per-project `/shared/datadog-app-key/github-grug` was revoked
+# API key above. One shared DD key pair rather than a grug-specific one (the
+# old per-project `/shared/datadog-app-key/github-grug` was revoked
 # out-of-band; consolidating removes a key grug had no reason to own).
 _dd_app_key = aws.ssm.get_parameter(
     name="/infra/datadog/app_key", with_decryption=True,
@@ -559,17 +559,25 @@ _dd_provider = _datadog.Provider(
     api_url="https://api.datadoghq.com/",
 )
 
-# Notification routing → Discord #monitoring-alerts (channel
-# 1501743643965394974 in guild 781626163591249930 — where the homelab's
-# migration-watcher already posts). The old `/grug/dd-notify-handle` was the
-# placeholder `@grug-stub`, which Datadog does not recognise as any target —
-# so EVERY monitor notified into the void (the Elder LLM outage ran ~5 days
-# with no page). Register a real DD webhook integration that POSTs to the
-# pre-existing Discord webhook secret, and route all monitors at it.
-# `@webhook-<name>` is how a DD monitor references a webhook integration entry.
+# Notification routing → a Discord webhook the operator already runs. The old
+# `/grug/dd-notify-handle` was the placeholder `@grug-stub`, which Datadog does
+# not recognise as any target — so EVERY monitor notified into the void (the
+# Elder LLM outage ran ~5 days with no page). Register a real DD webhook
+# integration that POSTs to the pre-existing Discord webhook secret, and route
+# all monitors at it. `@webhook-<name>` is how a DD monitor references a webhook
+# integration entry.
+#
+# The SSM path for that webhook is operator-specific (it embeds a private
+# Discord identifier), so it's read from Pulumi config rather than hardcoded:
+#   pulumi config set grug:discord_alerts_ssm_param /infra/discord/<id>/monitoring-alerts
+# The placeholder default keeps mocked synth green; a real deploy requires the
+# config (a missing SSM param fails fast at `pulumi up`).
+_discord_alerts_ssm_param = (
+    config.get("discord_alerts_ssm_param") or "/infra/discord/monitoring-alerts"
+)
 _discord_webhook_url = pulumi.Output.secret(
     aws.ssm.get_parameter(
-        name="/infra/discord/781626163591249930/monitoring-alerts",
+        name=_discord_alerts_ssm_param,
         with_decryption=True,
     ).value
 )

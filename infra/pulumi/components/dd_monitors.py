@@ -11,9 +11,8 @@ so it can never drift. Tag matrix is identical across all monitors:
     team:grug
 
 Notification handle = an SNS topic ARN OR a `@user@host`-style mention
-that DD knows how to route. v1 uses Discord webhook because that's the
-existing notify path in the homelab (see
-`infrastructure/production/scripts/llm-analysis-daemon`).
+that DD knows how to route. v1 uses a Discord webhook because that's the
+operator's existing notify path.
 """
 
 from __future__ import annotations
