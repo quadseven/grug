@@ -24,6 +24,9 @@ from typing import Any
 
 import boto3
 
+from activity_log import record_check_verdict
+from github_app_auth import with_install_token_retry
+from github_checks_client import CheckRunResult, post_check_run
 from llm_client import Hunk
 
 log = logging.getLogger(f"{os.getenv('DD_SERVICE', 'grug')}.cave_fallback")
@@ -195,3 +198,140 @@ def enqueue_fallback(
         },
     )
     return True
+
+
+# ---------------------------------------------------------------------------
+# Consumer (#310): heal the verdict from the connector's FallbackResult.
+# `lambda_handler.handler` routes the aws:sqs event (`grug-cave-results`) here.
+# The Elder check is advisory-by-default, so a healed fallback publishes a
+# NEUTRAL check-run carrying the Cave's findings (blocking-aware fallback is a
+# follow-up — Part A keeps it advisory). NEVER raises back to the Lambda: a
+# raise would retry-storm the event-source mapping; a bad record is logged and
+# dropped (the verdict stays `errored`, re-triggering on the next push).
+# ---------------------------------------------------------------------------
+
+# MUST match the persona's check name so the fallback heals the SAME check-run
+# (post_check_run is idempotent on (name, head_sha)) rather than posting a
+# duplicate. Kept in sync with personas/code_reviewer/dispatch.py:_CHECK_NAME.
+_CHECK_NAME = "Grug — Code Review"
+
+# Legacy persona code key; record_check_verdict maps it to the caveman name
+# "elder" (ADR-0002) at the write boundary.
+_PERSONA_KEY = "code_reviewer"
+
+
+def _summarize(findings: tuple[dict[str, Any], ...]) -> tuple[str, str]:
+    """(title, markdown summary) for the healed check-run. Caveman voice, same
+    register as the persona — computed here from primitive finding dicts so the
+    result handler stays decoupled from the persona module. Tolerant of either
+    the persona shape (`file`/`rule_name`) or the wire shape (`path`/`rule`)."""
+    if not findings:
+        return (
+            "✅ Grug see no bad omens (from the Cave)",
+            "Grug read your markings from his own Cave. No omens this time.",
+        )
+    n = len(findings)
+    high = sum(
+        1 for f in findings if str(f.get("severity")) in ("high", "critical")
+    )
+    lines = []
+    for f in findings:
+        sev = str(f.get("severity", "?"))
+        rule = str(f.get("rule_name") or f.get("rule") or "?")
+        loc = f"{f.get('file') or f.get('path') or '?'}:{f.get('line', '?')}"
+        msg = str(f.get("message", ""))
+        lines.append(f"- **[{sev}]** `{rule}` @ {loc} — {msg}")
+    title = f"🪨 Grug found {n} omen{'s' if n != 1 else ''} (from the Cave)"
+    body = (
+        "Grug read your markings from his own Cave (the cloud spirits slept).\n\n"
+        f"{high} loud omen(s) of {n}:\n\n" + "\n".join(lines)
+    )
+    return title, body
+
+
+def _heal_one(body: str) -> None:
+    """Publish + heal for ONE `FallbackResult`. Raises on a malformed body or a
+    publish error — `handle_fallback_result` catches per-record."""
+    res = FallbackResult.from_json(body)
+    if res.degraded:
+        # The Cave ALSO failed (or the connector couldn't review). Don't fake a
+        # review — leave the verdict `errored` and log so the double-outage is
+        # visible (this is what the re-scoped degraded monitor catches).
+        log.warning(
+            "elder_fallback_result_degraded",
+            extra={
+                "repo": res.repo,
+                "pr": res.pr_number,
+                "reason": res.degraded_reason,
+            },
+        )
+        return
+    owner, _, repo_name = res.repo.partition("/")
+    title, summary = _summarize(res.findings)
+    check = CheckRunResult(
+        name=_CHECK_NAME,
+        head_sha=res.head_sha,
+        status="completed",
+        # Elder is advisory-by-default; a healed fallback is advisory. Blocking-
+        # aware fallback (read RepoConfig, fail on high/critical) is a follow-up.
+        conclusion="neutral",
+        title=title,
+        summary=summary,
+    )
+    with_install_token_retry(
+        res.install_id,
+        lambda token: post_check_run(
+            token,
+            owner,
+            repo_name,
+            check,
+            external_id=f"grug-cr:{res.repo}#{res.pr_number}:{res.head_sha}",
+        ),
+    )
+    # Heal the Activity verdict: errored → reviewed (warn/pass). Idempotent per
+    # (persona, head_sha) at the store layer; never raises.
+    record_check_verdict(
+        install_id=res.install_id,
+        persona_key=_PERSONA_KEY,
+        repo=res.repo,
+        pr_number=res.pr_number,
+        head_sha=res.head_sha,
+        conclusion="neutral",
+        summary=title,
+        findings_count=len(res.findings),
+        blocking=False,
+        degraded_reason=None,
+    )
+    log.info(
+        "elder_fallback_healed",
+        extra={
+            "repo": res.repo,
+            "pr": res.pr_number,
+            "findings": len(res.findings),
+        },
+    )
+
+
+def handle_fallback_result(event: dict[str, Any]) -> dict[str, int]:
+    """Consume `grug-cave-results` SQS records (event-source mapping): publish
+    the Cave's review as a check-run and heal the `errored` verdict.
+
+    NEVER raises back to the Lambda — a raise would retry-storm the ESM. A
+    malformed record or a publish failure is logged and dropped (the verdict
+    stays `errored` and re-triggers on the next push). Returns a small summary
+    dict (also the structured-log payload)."""
+    records = event.get("Records", []) if isinstance(event, dict) else []
+    healed = 0
+    failed = 0
+    for rec in records:
+        body = rec.get("body", "") if isinstance(rec, dict) else ""
+        try:
+            _heal_one(body)
+            healed += 1
+        except Exception as e:  # noqa: BLE001 — never retry-storm the ESM
+            log.warning(
+                "elder_fallback_result_unhandled",
+                extra={"kind": type(e).__name__},
+            )
+            failed += 1
+    return {"records": len(records), "healed": healed, "failed": failed}

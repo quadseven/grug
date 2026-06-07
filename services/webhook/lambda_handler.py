@@ -31,4 +31,23 @@ def handler(event: Any, context: Any) -> Any:
         # HTTP (sync) cold-start path.
         from async_dispatch import run_elder_job
         return run_elder_job(event)
+    if _is_sqs_event(event):
+        # SQS event-source mapping delivers the Cave connector's results
+        # (grug-cave-results) as a raw `Records` event — Mangum can't parse
+        # it, so route to the fallback result handler FIRST (#310, ADR-0005).
+        from cave_fallback import handle_fallback_result
+        return handle_fallback_result(event)
     return _http_handler(event, context)
+
+
+def _is_sqs_event(event: Any) -> bool:
+    """True for an SQS event-source-mapping batch (`Records[*].eventSource ==
+    'aws:sqs'`). Defensive against non-dict events + empty/foreign Records so a
+    Function-URL HTTP event (which has no `Records`) never misroutes here."""
+    if not isinstance(event, dict):
+        return False
+    records = event.get("Records")
+    if not isinstance(records, list) or not records:
+        return False
+    first = records[0]
+    return isinstance(first, dict) and first.get("eventSource") == "aws:sqs"

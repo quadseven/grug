@@ -141,3 +141,90 @@ def test_enqueue_degrades_to_false_on_send_error(monkeypatch):
     with patch("secrets_loader.get_fallback_enabled", return_value=True), \
          patch.object(cf._sqs, "send_message", side_effect=RuntimeError("throttled")):
         assert _enqueue() is False  # never raises
+
+
+# --- consumer: handle_fallback_result (heal) ------------------------------
+
+def _result_body(**over) -> str:
+    d = {
+        "schema_version": 1,
+        "install_id": 42,
+        "repo": "acme/widget",
+        "pr_number": 7,
+        "head_sha": "deadbeef0000",
+        "persona": "elder",
+        "findings": [{"file": "a.py", "line": 4, "severity": "high",
+                      "rule_name": "null-deref", "message": "x may be None"}],
+    }
+    d.update(over)
+    return json.dumps(d)
+
+
+def _event(*bodies) -> dict:
+    return {"Records": [{"eventSource": "aws:sqs", "body": b} for b in bodies]}
+
+
+def test_handle_result_heals_publishes_check_and_records_verdict():
+    # with_install_token_retry(install_id, fn) → invoke fn with a fake token so
+    # the real post_check_run call path is exercised (not stubbed away).
+    with patch.object(cf, "with_install_token_retry", side_effect=lambda iid, fn: fn("tok")), \
+         patch.object(cf, "post_check_run") as post, \
+         patch.object(cf, "record_check_verdict") as rec:
+        out = cf.handle_fallback_result(_event(_result_body()))
+    assert out == {"records": 1, "healed": 1, "failed": 0}
+    # Published to the SAME check name + head, so it heals (not duplicates).
+    _, args, kwargs = post.mock_calls[0]
+    assert args[0] == "tok" and args[1] == "acme" and args[2] == "widget"
+    check = args[3]
+    assert check.name == "Grug — Code Review"
+    assert check.head_sha == "deadbeef0000"
+    assert check.conclusion == "neutral"
+    # Verdict healed: errored → reviewed, real findings_count, no degraded_reason.
+    rkw = rec.call_args.kwargs
+    assert rkw["persona_key"] == "code_reviewer"
+    assert rkw["findings_count"] == 1
+    assert rkw["degraded_reason"] is None
+    assert rkw["head_sha"] == "deadbeef0000"
+
+
+def test_handle_result_degraded_does_not_fake_a_review():
+    # Cave ALSO failed → leave the verdict errored (no publish, no heal).
+    with patch.object(cf, "with_install_token_retry") as tok, \
+         patch.object(cf, "post_check_run") as post, \
+         patch.object(cf, "record_check_verdict") as rec:
+        out = cf.handle_fallback_result(
+            _event(_result_body(degraded=True, degraded_reason="cave_unreachable", findings=[]))
+        )
+    assert out == {"records": 1, "healed": 1, "failed": 0}  # processed, not failed
+    post.assert_not_called()
+    rec.assert_not_called()
+    tok.assert_not_called()
+
+
+def test_handle_result_malformed_body_is_dropped_not_raised():
+    with patch.object(cf, "post_check_run") as post:
+        out = cf.handle_fallback_result(_event("this is not json"))
+    assert out == {"records": 1, "healed": 0, "failed": 1}
+    post.assert_not_called()
+
+
+def test_handle_result_publish_error_is_caught():
+    with patch.object(cf, "with_install_token_retry", side_effect=lambda iid, fn: fn("tok")), \
+         patch.object(cf, "post_check_run", side_effect=RuntimeError("GH 503")), \
+         patch.object(cf, "record_check_verdict") as rec:
+        out = cf.handle_fallback_result(_event(_result_body()))
+    assert out == {"records": 1, "healed": 0, "failed": 1}  # never raises out
+    rec.assert_not_called()  # publish failed before the heal
+
+
+def test_handle_result_empty_records():
+    assert cf.handle_fallback_result({"Records": []}) == {"records": 0, "healed": 0, "failed": 0}
+
+
+def test_handle_result_clean_review_titles_no_omens():
+    with patch.object(cf, "with_install_token_retry", side_effect=lambda iid, fn: fn("tok")), \
+         patch.object(cf, "post_check_run") as post, \
+         patch.object(cf, "record_check_verdict"):
+        cf.handle_fallback_result(_event(_result_body(findings=[])))
+    check = post.mock_calls[0].args[3]
+    assert "no bad omens" in check.title.lower()

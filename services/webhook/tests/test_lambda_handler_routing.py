@@ -39,3 +39,26 @@ def test_non_dict_event_routes_to_mangum():
     mock_http.assert_called_once()
     mock_run.assert_not_called()
     assert out == "ok"
+
+
+def test_sqs_event_routes_to_fallback_result_handler():
+    # #310 — the Cave connector's results arrive as an aws:sqs Records batch.
+    event = {"Records": [{"eventSource": "aws:sqs", "body": "{}"}]}
+    with patch("cave_fallback.handle_fallback_result", return_value={"healed": 1}) as mock_h, \
+         patch.object(lh, "_http_handler") as mock_http:
+        out = lh.handler(event, context=None)
+    mock_h.assert_called_once_with(event)
+    mock_http.assert_not_called()  # Mangum never sees the raw SQS event
+    assert out == {"healed": 1}
+
+
+def test_non_sqs_records_event_falls_through_to_mangum():
+    # A Records event from a non-SQS source must NOT misroute to the fallback
+    # handler (defensive — only eventSource==aws:sqs is ours).
+    event = {"Records": [{"eventSource": "aws:s3"}]}
+    with patch("cave_fallback.handle_fallback_result") as mock_h, \
+         patch.object(lh, "_http_handler", return_value="ok") as mock_http:
+        out = lh.handler(event, context=None)
+    mock_h.assert_not_called()
+    mock_http.assert_called_once()
+    assert out == "ok"
