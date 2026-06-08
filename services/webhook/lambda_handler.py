@@ -31,28 +31,41 @@ def handler(event: Any, context: Any) -> Any:
         # HTTP (sync) cold-start path.
         from async_dispatch import run_elder_job
         return run_elder_job(event)
-    if _is_sqs_event(event):
-        # SQS event-source mapping delivers the Cave connector's results
-        # (grug-cave-results) as a raw `Records` event — Mangum can't parse
-        # it, so route to the fallback result handler FIRST (#310, ADR-0005).
+    # Two SQS event-source mappings reach this Lambda, discriminated by which
+    # queue the batch came from (the `eventSourceARN`): the Cave connector's
+    # results (#310) and operator-triggered re-runs (#305). Mangum can't parse
+    # a raw `Records` event, so route SQS FIRST.
+    sqs_kind = _sqs_queue_kind(event)
+    if sqs_kind == "cave-results":
         from cave_fallback import handle_fallback_result
         return handle_fallback_result(event)
+    if sqs_kind == "rerun-jobs":
+        from rerun import handle_rerun_jobs
+        return handle_rerun_jobs(event)
     return _http_handler(event, context)
 
 
-def _is_sqs_event(event: Any) -> bool:
-    """True for an SQS event-source-mapping batch (`Records[*].eventSource ==
-    'aws:sqs'`). Defensive against non-dict events + empty/foreign Records so a
-    Function-URL HTTP event (which has no `Records`) never misroutes here."""
+def _sqs_queue_kind(event: Any) -> str | None:
+    """Classify an SQS event-source-mapping batch by its source queue:
+    `"cave-results"`, `"rerun-jobs"`, or `None` (not SQS / unknown queue → fall
+    through to Mangum). Requires EVERY record to be `aws:sqs` from the SAME
+    queue, so a Function-URL HTTP event (no `Records`) or a mixed/foreign batch
+    never misroutes."""
     if not isinstance(event, dict):
-        return False
+        return None
     records = event.get("Records")
     if not isinstance(records, list) or not records:
-        return False
-    # peer-review (OpenRouter + Poolside + Spark, CONFIRMED 3x): require EVERY
-    # record to be SQS, not just the first. batch_size=1 makes this moot today,
-    # but a future ESM reconfig (batch>1) or a mixed batch must not misroute a
-    # foreign record into handle_fallback_result.
-    return all(
+        return None
+    if not all(
         isinstance(r, dict) and r.get("eventSource") == "aws:sqs" for r in records
-    )
+    ):
+        return None
+    arns = {r.get("eventSourceARN", "") for r in records}
+    if len(arns) != 1:
+        return None  # a mixed batch (shouldn't happen) — don't guess
+    arn = arns.pop()
+    if arn.endswith(":grug-cave-results.fifo"):
+        return "cave-results"
+    if arn.endswith(":grug-rerun-jobs.fifo"):
+        return "rerun-jobs"
+    return None

@@ -299,6 +299,31 @@ aws.iam.UserPolicy(
     ),
 )
 
+# --- Re-run queue (#305, ADR-0004): operator backfill for `errored` rows -----
+# api → enqueue, webhook → consume (event-source mapping). FIFO content-dedup on
+# (install,repo,pr,persona) drops a double-click; MessageGroupId=install_id
+# rate-controls a batch backfill. DLQ + redrive (maxReceiveCount=3) so a stuck
+# re-run pages instead of vanishing.
+_rerun_dlq = aws.sqs.Queue(
+    "grug-rerun-jobs-dlq",
+    name="grug-rerun-jobs-dlq.fifo",
+    fifo_queue=True,
+    message_retention_seconds=1209600,  # 14d to inspect a stuck re-run
+    tags={"app": "grug", "service": "grug-rerun"},
+)
+_rerun_jobs_queue = aws.sqs.Queue(
+    "grug-rerun-jobs",
+    name="grug-rerun-jobs.fifo",
+    fifo_queue=True,
+    content_based_deduplication=False,  # api supplies MessageDeduplicationId
+    # >= the webhook Lambda timeout (the SQS→Lambda ESM rule, learned #310).
+    visibility_timeout_seconds=420,
+    redrive_policy=_rerun_dlq.arn.apply(
+        lambda arn: json.dumps({"deadLetterTargetArn": arn, "maxReceiveCount": 3})
+    ),
+    tags={"app": "grug", "service": "grug-rerun"},
+)
+
 webhook = lambda_service.create(
     name="grug-webhook",
     ecr_repo=webhook_ecr,
@@ -455,6 +480,35 @@ aws.lambda_.EventSourceMapping(
     batch_size=1,
 )
 
+# Webhook role: consume the re-run queue (#305). lambda_handler routes the
+# grug-rerun-jobs ESM (by queue ARN) to rerun.handle_rerun_jobs.
+aws.iam.RolePolicy(
+    "grug-webhook-rerun-sqs",
+    role=webhook.role.id,
+    policy=_rerun_jobs_queue.arn.apply(
+        lambda arn: json.dumps(
+            {
+                "Version": "2012-10-17",
+                "Statement": [
+                    {
+                        "Effect": "Allow",
+                        "Action": ["sqs:ReceiveMessage", "sqs:DeleteMessage", "sqs:GetQueueAttributes"],
+                        "Resource": arn,
+                    }
+                ],
+            }
+        )
+    ),
+)
+aws.lambda_.EventSourceMapping(
+    "grug-rerun-jobs-esm",
+    event_source_arn=_rerun_jobs_queue.arn,
+    function_name=webhook.function.name,
+    # batch_size=1: one job → one re-run. Unlike the cave handler, a failed
+    # rerun job RAISES so the ESM retries (visibility timeout) → DLQ.
+    batch_size=1,
+)
+
 # Webhook role gains kms:Decrypt on the grug-tokens CMK — required so
 # the Lambda runtime can unwrap encrypted env vars at cold start
 # BEFORE the DD extension or our handler boots. Scoped via
@@ -524,6 +578,9 @@ api_lambda = lambda_service.create(
         "GRUG_DOMAIN": domain,
         "GRUG_DDB_TABLE": grug_main_table.name,
         "GRUG_KMS_CMK_ARN": grug_tokens_cmk.arn,
+        # Re-run queue (#305): the api enqueues, the webhook consumes. Unset =>
+        # the rerun endpoint 503s (a real misconfig, not a silent drop).
+        "GRUG_RERUN_QUEUE_URL": _rerun_jobs_queue.url,
         "GRUG_CF_SHARED_SECRET_SSM": cf_secret.ssm_parameter.name,
         "GITHUB_APP_WEBHOOK_SECRET_SSM": secrets["github-app-webhook-secret"].name,
         # OAuth (Slice 3 #24 consumes)
@@ -586,6 +643,27 @@ kms_cmk.grant_use_to_role(
     cmk=grug_tokens_cmk,
     role=api_lambda.role,
     statement_id="grug-api-kms-policy",
+)
+
+# api role: send to the re-run queue (#305). The api enqueues; the webhook
+# consumes via the grug-rerun-jobs ESM above.
+aws.iam.RolePolicy(
+    "grug-api-rerun-sqs",
+    role=api_lambda.role.id,
+    policy=_rerun_jobs_queue.arn.apply(
+        lambda arn: json.dumps(
+            {
+                "Version": "2012-10-17",
+                "Statement": [
+                    {
+                        "Effect": "Allow",
+                        "Action": ["sqs:SendMessage", "sqs:GetQueueAttributes"],
+                        "Resource": arn,
+                    }
+                ],
+            }
+        )
+    ),
 )
 
 # DDB IAM for api Lambda (read+write for v1; tighten per access pattern
@@ -779,6 +857,30 @@ _cave_jobs_age_monitor = _datadog.Monitor(
     tags=[f"env:{env}", "service:grug-webhook", "team:grug"],
     notify_no_data=False,
     priority=4,
+    opts=pulumi.ResourceOptions(provider=_dd_provider),
+)
+
+# Re-run DLQ depth (#305): a job that failed maxReceiveCount times (GitHub fetch
+# failing, or a malformed job) lands here — the operator's re-run didn't
+# complete. Any message is worth a look.
+_rerun_dlq_monitor = _datadog.Monitor(
+    "grug-rerun-dlq-depth",
+    type="metric alert",
+    name="[grug] Re-run DLQ has messages",
+    message=(
+        f"{_dd_notify}\n"
+        "grug-rerun-jobs-dlq has messages — a re-run job exhausted its retries "
+        "(GitHub fetch failing, or a malformed job). The operator's re-run did "
+        "not complete; inspect the DLQ message.\n"
+        "Runbook: docs/RUNBOOK.md#elder-async-offload"
+    ),
+    query=(
+        "max(last_15m):max:aws.sqs.approximate_number_of_messages_visible"
+        "{queuename:grug-rerun-jobs-dlq.fifo} > 0"
+    ),
+    tags=[f"env:{env}", "service:grug-api", "team:grug"],
+    notify_no_data=False,
+    priority=3,
     opts=pulumi.ResourceOptions(provider=_dd_provider),
 )
 

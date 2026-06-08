@@ -9,6 +9,7 @@ import {
   useFixEnforcement,
   useSetRepoConfig,
   useActivity,
+  useRerun,
   type Repo,
 } from "../lib/installations";
 import "./dashboard-grug.css";
@@ -504,6 +505,16 @@ function ActivityPanel({ show, installId }: { show: boolean; installId?: number 
   // empty state — never fabricated.
   const activity = useActivity(installId, filter);
   const rows = activity.data?.activity ?? [];
+  // #305: re-run an errored row. Track which rows are mid-re-run so the ↻
+  // becomes RE-RUNNING until the feed refreshes with the healed verdict.
+  const rerun = useRerun(installId);
+  const [rerunning, setRerunning] = useState<Set<string>>(new Set());
+  const _rerunKey = (a: { repo: string; pr_number: number; persona: string }) =>
+    `${a.repo}#${a.pr_number}#${a.persona}`;
+  const doRerun = (a: { repo: string; pr_number: number; persona: string }) => {
+    setRerunning((s) => new Set(s).add(_rerunKey(a)));
+    rerun.mutate({ repo: a.repo, pr_number: a.pr_number, persona: a.persona });
+  };
   return (
     <section className={`panel${show ? " show" : ""}`}>
       <div className="panel-head">
@@ -528,6 +539,11 @@ function ActivityPanel({ show, installId }: { show: boolean; installId?: number 
               <div className="who2"><b>{_PERSONA_LABEL[a.persona] ?? a.persona}</b> <span className="repo2">{a.repo} · #{a.pr_number}</span><span className="msg">{a.summary}</span></div>
               <span className={`verdict ${a.verdict}`}>{a.verdict.toUpperCase()}</span>
               <span className="ago mono">{a.head_sha.slice(0, 7)}</span>
+              {a.verdict === "errored" && (
+                rerunning.has(_rerunKey(a))
+                  ? <span className="rerunning mono" title="Re-run queued">RE-RUNNING…</span>
+                  : <button className="rerun-btn" title="Re-run this check" aria-label="Re-run" onClick={() => doRerun(a)}>↻</button>
+              )}
             </div>
           ))}
           {!activity.isLoading && !activity.isError && rows.length === 0 && (
