@@ -229,6 +229,35 @@ _cave_results_queue = aws.sqs.Queue(
     visibility_timeout_seconds=420,
     tags={"app": "grug", "service": "grug-cave"},
 )
+# Spilled-diff bucket (#311): a diff over the SQS 256 KB cap is written here and
+# the job carries only an S3 pointer (DiffRef). Ephemeral — a 7-day lifecycle
+# reaps them (a fallback job is consumed in minutes). Auto-named (globally
+# unique) but `grug-`-prefixed so the deploy role's `grug-*` S3 scope matches.
+# Private: all public access blocked (the connector reads it via IAM creds).
+_cave_diff_bucket = aws.s3.BucketV2(
+    "grug-cave-diffs",
+    tags={"app": "grug", "service": "grug-cave"},
+)
+aws.s3.BucketPublicAccessBlock(
+    "grug-cave-diffs-pab",
+    bucket=_cave_diff_bucket.id,
+    block_public_acls=True,
+    block_public_policy=True,
+    ignore_public_acls=True,
+    restrict_public_buckets=True,
+)
+aws.s3.BucketLifecycleConfigurationV2(
+    "grug-cave-diffs-lifecycle",
+    bucket=_cave_diff_bucket.id,
+    rules=[
+        {
+            "id": "expire-spilled-diffs",
+            "status": "Enabled",
+            "filter": {"prefix": "diffs/"},
+            "expiration": {"days": 7},
+        }
+    ],
+)
 # Connector principal (grug-cave-connector, #316): consume jobs + send results,
 # nothing more. The access key is minted out-of-band by #316 — NOT in Pulumi
 # state — so this just establishes the permission boundary.
@@ -240,20 +269,29 @@ _cave_connector_user = aws.iam.User(
 aws.iam.UserPolicy(
     "grug-cave-connector-policy",
     user=_cave_connector_user.name,
-    policy=pulumi.Output.all(_cave_jobs_queue.arn, _cave_results_queue.arn).apply(
-        lambda arns: json.dumps(
+    policy=pulumi.Output.all(
+        _cave_jobs_queue.arn, _cave_results_queue.arn, _cave_diff_bucket.arn
+    ).apply(
+        lambda a: json.dumps(
             {
                 "Version": "2012-10-17",
                 "Statement": [
                     {
                         "Effect": "Allow",
                         "Action": ["sqs:ReceiveMessage", "sqs:DeleteMessage", "sqs:GetQueueAttributes"],
-                        "Resource": arns[0],
+                        "Resource": a[0],
                     },
                     {
                         "Effect": "Allow",
                         "Action": ["sqs:SendMessage", "sqs:GetQueueAttributes"],
-                        "Resource": arns[1],
+                        "Resource": a[1],
+                    },
+                    {
+                        # Read spilled diffs (#311) — GetObject only, scoped to
+                        # the diffs/ prefix. Never write, never list the bucket.
+                        "Effect": "Allow",
+                        "Action": ["s3:GetObject"],
+                        "Resource": f"{a[2]}/diffs/*",
                     },
                 ],
             }
@@ -301,6 +339,9 @@ webhook = lambda_service.create(
         # => enqueue is a no-op, so a half-wired deploy can't crash a review.
         "GRUG_FALLBACK_ENABLED_SSM": _fallback_enabled.name,
         "GRUG_CAVE_JOBS_QUEUE_URL": _cave_jobs_queue.url,
+        # Spilled-diff bucket (#311): empty => no spillover (a too-large diff
+        # just can't pack and the enqueue no-ops). Set => big diffs spill here.
+        "GRUG_CAVE_DIFF_BUCKET": _cave_diff_bucket.id,
         # CF→AWS auth boundary — middleware reads at cold start (#173).
         "GRUG_CF_SHARED_SECRET_SSM": cf_secret.ssm_parameter.name,
         # Datadog APM (datadog_lambda wrapper finds real handler via
@@ -376,20 +417,29 @@ webhook = lambda_service.create(
 aws.iam.RolePolicy(
     "grug-webhook-cave-sqs",
     role=webhook.role.id,
-    policy=pulumi.Output.all(_cave_jobs_queue.arn, _cave_results_queue.arn).apply(
-        lambda arns: json.dumps(
+    policy=pulumi.Output.all(
+        _cave_jobs_queue.arn, _cave_results_queue.arn, _cave_diff_bucket.arn
+    ).apply(
+        lambda a: json.dumps(
             {
                 "Version": "2012-10-17",
                 "Statement": [
                     {
                         "Effect": "Allow",
                         "Action": ["sqs:SendMessage", "sqs:GetQueueAttributes"],
-                        "Resource": arns[0],
+                        "Resource": a[0],
                     },
                     {
                         "Effect": "Allow",
                         "Action": ["sqs:ReceiveMessage", "sqs:DeleteMessage", "sqs:GetQueueAttributes"],
-                        "Resource": arns[1],
+                        "Resource": a[1],
+                    },
+                    {
+                        # Spill large diffs (#311) — PutObject only, scoped to
+                        # the diffs/ prefix. The webhook writes; never reads/lists.
+                        "Effect": "Allow",
+                        "Action": ["s3:PutObject"],
+                        "Resource": f"{a[2]}/diffs/*",
                     },
                 ],
             }
