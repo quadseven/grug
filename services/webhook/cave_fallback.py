@@ -20,7 +20,7 @@ import json
 import logging
 import os
 from dataclasses import dataclass
-from typing import Any
+from typing import Any, Optional
 
 import boto3
 
@@ -38,28 +38,37 @@ _sqs = boto3.client("sqs")
 # queue isn't wired yet (best-effort, same discipline as the #272 offload).
 _JOBS_QUEUE_URL = os.getenv("GRUG_CAVE_JOBS_QUEUE_URL", "")
 
-# Bump when the wire shape changes so the connector (a separate repo) can
-# reject/handle an unknown version instead of silently mis-parsing.
-SCHEMA_VERSION = 1
+# Wire-shape version. v2 (#311) carries a `diff_ref` (inline-or-S3) instead of
+# v1's raw inline `hunks` — bump so the connector (a separate repo) rejects an
+# unknown version instead of silently mis-parsing.
+SCHEMA_VERSION = 2
 
 # The one persona that falls back today. Carried on the message so a future
 # multi-persona airlock routes without a schema change.
 _PERSONA = "elder"
 
-# SQS hard-caps a message at 256 KB. Inline-diff jobs (#310) over this would
-# just fail the send; we skip them with a clear log instead (S3 spillover for
-# big diffs is #311). 250 KB leaves headroom for the JSON envelope.
-_MAX_INLINE_JOB_BYTES = 250 * 1024
+# SQS hard-caps a message at 256 KB. A diff serializing larger than this is
+# spilled to S3 and the message carries only a pointer (#311); under it, the
+# diff rides inline. 250 KB leaves headroom for the JSON envelope.
+_MAX_INLINE_DIFF_BYTES = 250 * 1024
+
+# S3 bucket for spilled (large) diffs, injected by Pulumi. Empty in
+# local/dev/tests → no spillover (a too-large diff just can't be packed and the
+# enqueue no-ops, same best-effort discipline as a missing queue URL).
+_DIFF_BUCKET = os.getenv("GRUG_CAVE_DIFF_BUCKET", "")
+
+_s3 = boto3.client("s3")
 
 
 @dataclass(frozen=True, slots=True)
 class FallbackJob:
     """A review job handed to the Cave connector over `grug-cave-jobs`.
 
-    Carries the PR coords + the diff INLINE (small-diff scope; #311 adds S3
-    spillover) and NO GitHub credential — the connector re-reads nothing from
-    GitHub. `hunks` is (path, body) pairs so the connector reconstructs the
-    same review units `review_diff` would have seen.
+    Carries the PR coords + a `diff_ref` (the DiffRef codec's output: the diff
+    inline for small PRs, or an S3 pointer for large ones — #311) and NO GitHub
+    credential. The connector calls `unpack_diff(diff_ref)` to reconstruct the
+    same review units `review_diff` would have seen — reading the diff from S3,
+    never from GitHub (the creds boundary).
     """
 
     schema_version: int
@@ -68,7 +77,7 @@ class FallbackJob:
     pr_number: int
     head_sha: str
     persona: str
-    hunks: tuple[tuple[str, str], ...]
+    diff_ref: dict[str, Any]  # DiffRef: {"kind": "inline"|"s3", ...}
 
     def to_json(self) -> str:
         return json.dumps(
@@ -79,7 +88,7 @@ class FallbackJob:
                 "pr_number": self.pr_number,
                 "head_sha": self.head_sha,
                 "persona": self.persona,
-                "hunks": [{"path": p, "body": b} for p, b in self.hunks],
+                "diff_ref": self.diff_ref,
             }
         )
 
@@ -128,6 +137,85 @@ class FallbackResult:
         )
 
 
+# ---------------------------------------------------------------------------
+# DiffRef codec (#311) — the deep module behind the airlock's diff delivery.
+# A DiffRef is a small JSON-able dict that is EITHER the diff inline (small PR)
+# OR an S3 pointer (large PR). `pack_diff` decides; `unpack_diff` reconstructs.
+# Both sides of the airlock use it: the webhook packs, the connector (#316)
+# unpacks — so a big diff is read from S3, never re-fetched from GitHub.
+# ---------------------------------------------------------------------------
+
+
+def _hunks_payload(hunks: list[Hunk]) -> list[dict[str, str]]:
+    return [{"path": h.path, "body": h.body} for h in hunks]
+
+
+def pack_diff(
+    hunks: list[Hunk], *, install_id: int, head_sha: str
+) -> Optional[dict[str, Any]]:
+    """Serialize `hunks` into a DiffRef: an INLINE ref when the diff fits under
+    `_MAX_INLINE_DIFF_BYTES`, else spill the diff to S3 and return an S3 pointer.
+
+    Returns `None` when a large diff can't be spilled (no bucket configured, or
+    the S3 put failed) — the caller treats that as "can't pack" and no-ops
+    (best-effort, same discipline as a missing queue URL)."""
+    payload = _hunks_payload(hunks)
+    inline = {"kind": "inline", "hunks": payload}
+    if len(json.dumps(inline).encode("utf-8")) <= _MAX_INLINE_DIFF_BYTES:
+        return inline
+    if not _DIFF_BUCKET:
+        log.warning(
+            "elder_fallback_diff_too_large_no_bucket",
+            extra={"install_id": install_id, "head_sha": head_sha[:8]},
+        )
+        return None
+    key = f"diffs/{install_id}/{head_sha}.json"
+    try:
+        _s3.put_object(
+            Bucket=_DIFF_BUCKET,
+            Key=key,
+            Body=json.dumps(payload).encode("utf-8"),
+            ContentType="application/json",
+        )
+    except Exception as e:  # noqa: BLE001 — best-effort: a failed spill drops the fallback
+        log.warning(
+            "elder_fallback_diff_spill_failed",
+            extra={
+                "install_id": install_id,
+                "head_sha": head_sha[:8],
+                "kind": type(e).__name__,
+            },
+        )
+        return None
+    return {"kind": "s3", "bucket": _DIFF_BUCKET, "key": key}
+
+
+def unpack_diff(diff_ref: dict[str, Any]) -> list[Hunk]:
+    """Reconstruct the hunks from a DiffRef — inline payload or an S3 fetch.
+
+    Raises `ValueError` on an unknown/malformed ref (the connector catches it
+    and degrades). Defined here, the codec's home, so the wire contract has ONE
+    owner; the connector (#316) consumes this same shape."""
+    kind = diff_ref.get("kind")
+    if kind == "inline":
+        payload = diff_ref.get("hunks", [])
+    elif kind == "s3":
+        bucket, key = diff_ref.get("bucket"), diff_ref.get("key")
+        if not bucket or not key:
+            raise ValueError("s3 DiffRef missing bucket/key")
+        raw = _s3.get_object(Bucket=bucket, Key=key)["Body"].read()
+        payload = json.loads(raw)
+    else:
+        raise ValueError(f"unknown DiffRef kind: {kind!r}")
+    if not isinstance(payload, list):
+        raise ValueError("DiffRef hunks payload is not a list")
+    return [
+        Hunk(path=str(h["path"]), body=str(h["body"]))
+        for h in payload
+        if isinstance(h, dict)
+    ]
+
+
 def _dedup_id(install_id: int, repo: str, pr_number: int, head_sha: str) -> str:
     """FIFO content-dedup key. Includes `head_sha` deliberately: a NEW push (new
     head) is a DIFFERENT review that must enqueue, so it must not dedup against
@@ -169,6 +257,13 @@ def enqueue_fallback(
     if not hunks:
         return False
 
+    # Pack the diff into a DiffRef (#311): inline for small PRs, spilled to S3
+    # for large ones. None ⇒ a large diff couldn't be spilled (no bucket / put
+    # failed); pack_diff already logged it, so no-op (best-effort).
+    diff_ref = pack_diff(hunks, install_id=installation_id, head_sha=head_sha)
+    if diff_ref is None:
+        return False
+
     job = FallbackJob(
         schema_version=SCHEMA_VERSION,
         install_id=installation_id,
@@ -176,24 +271,9 @@ def enqueue_fallback(
         pr_number=pr_number,
         head_sha=head_sha,
         persona=_PERSONA,
-        hunks=tuple((h.path, h.body) for h in hunks),
+        diff_ref=diff_ref,
     )
-    # peer-review (Poolside laguna-m.1 + Spark qwen3-coder-next + OpenRouter
-    # gpt-oss-120b, CONFIRMED 3x): an oversized inline job would just fail the
-    # SQS 256 KB send. Skip it with a CLEAR signal rather than a generic
-    # send-failure. Small-diff scope is #310 by design; S3 spillover is #311.
     body = job.to_json()
-    if len(body.encode("utf-8")) > _MAX_INLINE_JOB_BYTES:
-        log.warning(
-            "elder_fallback_diff_too_large",
-            extra={
-                "repo": repo,
-                "pr": pr_number,
-                "bytes": len(body.encode("utf-8")),
-                "note": "inline-only until S3 spillover (#311)",
-            },
-        )
-        return False
     try:
         _sqs.send_message(
             QueueUrl=_JOBS_QUEUE_URL,
@@ -216,6 +296,7 @@ def enqueue_fallback(
             "pr": pr_number,
             "head_sha": head_sha[:8],
             "hunks": len(hunks),
+            "diff_kind": diff_ref["kind"],  # inline | s3
         },
     )
     return True
