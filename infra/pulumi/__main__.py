@@ -190,6 +190,72 @@ _prompt_experiment = aws.ssm.Parameter(
     opts=pulumi.ResourceOptions(ignore_changes=["value"]),
 )
 
+# --- Elder cave fallback — SQS airlock to the self-hosted LLM (ADR-0005, #310) ---
+# Feature flag. Pulumi OWNS the param + "false" default (all-Pulumi rule);
+# `ignore_changes=["value"]` hands the toggle to the operator (no redeploy). The
+# webhook reads it fallback-safe (secrets_loader.get_fallback_enabled → False on
+# any error), so the fallback can never turn ITSELF on by accident.
+_fallback_enabled = aws.ssm.Parameter(
+    "grug-elder-fallback-enabled",
+    name="/grug/elder-fallback-enabled",
+    type="String",
+    value="false",
+    description="Enable Elder's owned cave fallback when both cloud LLMs fail (ADR-0005, #310).",
+    opts=pulumi.ResourceOptions(ignore_changes=["value"]),
+)
+# The airlock: two FIFO queues. Grug and the Cave never connect — they only ever
+# touch these. `jobs`: webhook → connector. `results`: connector → webhook (ESM).
+_cave_jobs_queue = aws.sqs.Queue(
+    "grug-cave-jobs",
+    name="grug-cave-jobs.fifo",
+    fifo_queue=True,
+    # Producer supplies MessageDeduplicationId (head-scoped) — NOT content-based.
+    content_based_deduplication=False,
+    message_retention_seconds=1209600,  # 14d: hold a backlog while the connector is down
+    visibility_timeout_seconds=420,     # ≥ the connector's per-job review budget
+    tags={"app": "grug", "service": "grug-cave"},
+)
+_cave_results_queue = aws.sqs.Queue(
+    "grug-cave-results",
+    name="grug-cave-results.fifo",
+    fifo_queue=True,
+    content_based_deduplication=True,   # results keyed by content; connector needn't mint an id
+    message_retention_seconds=1209600,
+    visibility_timeout_seconds=60,
+    tags={"app": "grug", "service": "grug-cave"},
+)
+# Connector principal (grug-cave-connector, #316): consume jobs + send results,
+# nothing more. The access key is minted out-of-band by #316 — NOT in Pulumi
+# state — so this just establishes the permission boundary.
+_cave_connector_user = aws.iam.User(
+    "grug-cave-connector",
+    name="grug-cave-connector",
+    tags={"app": "grug", "service": "grug-cave"},
+)
+aws.iam.UserPolicy(
+    "grug-cave-connector-policy",
+    user=_cave_connector_user.name,
+    policy=pulumi.Output.all(_cave_jobs_queue.arn, _cave_results_queue.arn).apply(
+        lambda arns: json.dumps(
+            {
+                "Version": "2012-10-17",
+                "Statement": [
+                    {
+                        "Effect": "Allow",
+                        "Action": ["sqs:ReceiveMessage", "sqs:DeleteMessage", "sqs:GetQueueAttributes"],
+                        "Resource": arns[0],
+                    },
+                    {
+                        "Effect": "Allow",
+                        "Action": ["sqs:SendMessage", "sqs:GetQueueAttributes"],
+                        "Resource": arns[1],
+                    },
+                ],
+            }
+        )
+    ),
+)
+
 webhook = lambda_service.create(
     name="grug-webhook",
     ecr_repo=webhook_ecr,
@@ -201,7 +267,7 @@ webhook = lambda_service.create(
     # Protocol (components/_types.py) — they expose `.arn`/`.name`, and the
     # consuming IAM policy wraps the arn list in `Output.all(...).apply()`,
     # so either arm resolves correctly (#235 named this contract).
-    extra_ssm_secrets=[_dd_api_key, cf_secret.ssm_parameter, _openrouter_api_key, _poolside_api_key, _prompt_experiment],
+    extra_ssm_secrets=[_dd_api_key, cf_secret.ssm_parameter, _openrouter_api_key, _poolside_api_key, _prompt_experiment, _fallback_enabled],
     # NOTE: DD extension is BAKED into the Lambda container image
     # (services/webhook/Dockerfile.lambda copies from
     # public.ecr.aws/datadog/lambda-extension-arm:<v>). Lambda Container
@@ -225,6 +291,11 @@ webhook = lambda_service.create(
         # Elder prompt A/B arm selector (#191). Carries the param NAME only;
         # the value (off|split|all_v2) is read fallback-safe at cold start.
         "GRUG_PROMPT_EXPERIMENT_SSM": _prompt_experiment.name,
+        # Elder cave fallback (#310, ADR-0005): the flag param NAME (read
+        # fallback-safe) + the jobs-queue URL the producer sends to. Empty URL
+        # => enqueue is a no-op, so a half-wired deploy can't crash a review.
+        "GRUG_FALLBACK_ENABLED_SSM": _fallback_enabled.name,
+        "GRUG_CAVE_JOBS_QUEUE_URL": _cave_jobs_queue.url,
         # CF→AWS auth boundary — middleware reads at cold start (#173).
         "GRUG_CF_SHARED_SECRET_SSM": cf_secret.ssm_parameter.name,
         # Datadog APM (datadog_lambda wrapper finds real handler via
@@ -290,6 +361,43 @@ webhook = lambda_service.create(
     # `kms:Encrypt` + `kms:GenerateDataKey` before this Function update
     # runs. Closes #88.
     iam_propagation_wait=_iam_propagation_wait,
+)
+
+# Webhook role: SQS perms for the cave airlock (#310). Send to jobs, consume
+# results. (ssm:GetParameter on the flag param is already granted via
+# extra_ssm_secrets above.) The result queue is wired to the webhook Lambda by
+# the event-source mapping below → lambda_handler routes it to
+# handle_fallback_result.
+aws.iam.RolePolicy(
+    "grug-webhook-cave-sqs",
+    role=webhook.role.id,
+    policy=pulumi.Output.all(_cave_jobs_queue.arn, _cave_results_queue.arn).apply(
+        lambda arns: json.dumps(
+            {
+                "Version": "2012-10-17",
+                "Statement": [
+                    {
+                        "Effect": "Allow",
+                        "Action": ["sqs:SendMessage", "sqs:GetQueueAttributes"],
+                        "Resource": arns[0],
+                    },
+                    {
+                        "Effect": "Allow",
+                        "Action": ["sqs:ReceiveMessage", "sqs:DeleteMessage", "sqs:GetQueueAttributes"],
+                        "Resource": arns[1],
+                    },
+                ],
+            }
+        )
+    ),
+)
+aws.lambda_.EventSourceMapping(
+    "grug-cave-results-esm",
+    event_source_arn=_cave_results_queue.arn,
+    function_name=webhook.function.name,
+    # batch_size=1: one result → one heal; the handler never raises (a raise
+    # would retry-storm the ESM), so whole-batch success semantics are fine.
+    batch_size=1,
 )
 
 # Webhook role gains kms:Decrypt on the grug-tokens CMK — required so
@@ -592,6 +700,31 @@ monitors = dd_monitors.create_all(
     webhook_public_url=f"https://webhook.{domain}/webhook/github",
     api_public_url=f"https://api.{domain}",
     provider=_dd_provider,
+)
+
+# Cave fallback (#310, ADR-0005): jobs queue backing up = the grug-cave-connector
+# isn't draining (down, or can't reach the Cave) → fallback reviews stay
+# `errored`. Informational (P4) until the fallback is live (#313); until then the
+# queue is empty and this never fires. (DLQ + age/depth hardening is #312.)
+_cave_jobs_age_monitor = _datadog.Monitor(
+    "grug-cave-jobs-age",
+    type="metric alert",
+    name="[grug-webhook] Cave fallback jobs queue backing up",
+    message=(
+        f"{_dd_notify}\n"
+        "grug-cave-jobs (Elder cave fallback) has messages older than 10min — the "
+        "grug-cave-connector isn't draining (down, or can't reach the Cave). "
+        "Fallback reviews stay `errored` until it recovers.\n"
+        "Runbook: docs/RUNBOOK.md#elder-async-offload"
+    ),
+    query=(
+        "max(last_15m):max:aws.sqs.approximate_age_of_oldest_message"
+        "{queuename:grug-cave-jobs.fifo} > 600"
+    ),
+    tags=[f"env:{env}", "service:grug-webhook", "team:grug"],
+    notify_no_data=False,
+    priority=4,
+    opts=pulumi.ResourceOptions(provider=_dd_provider),
 )
 
 # DD RUM Application for grug.lol (spec 0013 RumInstrumentation).
