@@ -151,3 +151,23 @@ export function useSetRepoConfig(installId: number) {
     onSuccess: () => qc.invalidateQueries({ queryKey: ["installations", installId, "repos"] }),
   });
 }
+
+// Re-run one persona's check on a PR (#305). The api 202s + enqueues; the new
+// verdict lands asynchronously (webhook consumer), so we refresh the Activity
+// feed shortly after to pick up the healed row.
+export function useRerun(installId: number | undefined) {
+  const qc = useQueryClient();
+  return useMutation({
+    mutationFn: (vars: { repo: string; pr_number: number; persona: string }) =>
+      api(`/api/v1/installations/${installId}/rerun`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify(vars),
+      }),
+    onSuccess: () =>
+      setTimeout(
+        () => qc.invalidateQueries({ queryKey: ["installations", installId, "activity"] }),
+        4000,
+      ),
+  });
+}

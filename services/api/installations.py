@@ -60,6 +60,16 @@ class RepoConfigPayload(BaseModel):
     tpm_enabled: bool = Field(default=True)
 
 
+class RerunRequest(BaseModel):
+    """SPA → api POST .../rerun payload (#305). Keyed by `repo` ("owner/name",
+    what the Activity row carries). `extra='forbid'` 422s typos; `repo` +
+    `persona` are pattern-constrained so junk can't reach the queue."""
+    model_config = ConfigDict(extra="forbid")
+    repo: str = Field(pattern=r"^[^/\s]+/[^/\s]+$")  # owner/name
+    pr_number: int
+    persona: str = Field(pattern=r"^(elder|code_reviewer|chief|tpm)$")
+
+
 def _ensure_can_access(install: dict[str, Any], user: UserIdentity) -> None:
     """Caller must own the install OR be admin. Raises 403 otherwise."""
     if user.role == "admin":
@@ -259,6 +269,43 @@ def list_activity(
         if len(out) >= limit:
             break
     return {"activity": out}
+
+
+@router.post(
+    "/installations/{install_id}/rerun",
+    status_code=status.HTTP_202_ACCEPTED,
+)
+def rerun_check(
+    install_id: int,
+    body: RerunRequest,
+    user: UserIdentity = Depends(require_authenticated),
+) -> dict[str, str]:
+    """Re-run one persona's check on a PR (#305, ADR-0004). Enqueues to
+    `grug-rerun-jobs` and returns 202; the webhook re-runs on the PR's CURRENT
+    head and upserts the verdict (heal-in-place / append). Caller must own the
+    install. The re-run acts with the INSTALL's GitHub token, so it can only
+    touch repos that install can reach (the bound on a user-supplied repo)."""
+    install = get_installation(install_id)
+    if not install:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="install not found")
+    _ensure_can_access(install, user)
+
+    from rerun import enqueue_rerun
+
+    try:
+        enqueue_rerun(
+            install_id=install_id,
+            repo=body.repo,
+            pr_number=body.pr_number,
+            persona=body.persona,
+        )
+    except RuntimeError as e:
+        log.error("rerun_enqueue_misconfigured", extra={"detail": str(e)})
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail="re-run queue not available",
+        ) from e
+    return {"status": "queued"}
 
 
 @router.put("/installations/{install_id}/repos/{repo_id}/config")

@@ -41,15 +41,47 @@ def test_non_dict_event_routes_to_mangum():
     assert out == "ok"
 
 
-def test_sqs_event_routes_to_fallback_result_handler():
-    # #310 — the Cave connector's results arrive as an aws:sqs Records batch.
-    event = {"Records": [{"eventSource": "aws:sqs", "body": "{}"}]}
+_CAVE_ARN = "arn:aws:sqs:us-east-1:1:grug-cave-results.fifo"
+_RERUN_ARN = "arn:aws:sqs:us-east-1:1:grug-rerun-jobs.fifo"
+
+
+def test_cave_results_sqs_event_routes_to_fallback_handler():
+    # #310 — the Cave connector's results (discriminated by queue ARN, #305).
+    event = {"Records": [{"eventSource": "aws:sqs", "eventSourceARN": _CAVE_ARN, "body": "{}"}]}
     with patch("cave_fallback.handle_fallback_result", return_value={"healed": 1}) as mock_h, \
+         patch("rerun.handle_rerun_jobs") as mock_r, \
          patch.object(lh, "_http_handler") as mock_http:
         out = lh.handler(event, context=None)
     mock_h.assert_called_once_with(event)
+    mock_r.assert_not_called()
     mock_http.assert_not_called()  # Mangum never sees the raw SQS event
     assert out == {"healed": 1}
+
+
+def test_rerun_jobs_sqs_event_routes_to_rerun_consumer():
+    # #305 — re-run jobs go to the rerun consumer, NOT the cave handler.
+    event = {"Records": [{"eventSource": "aws:sqs", "eventSourceARN": _RERUN_ARN, "body": "{}"}]}
+    with patch("rerun.handle_rerun_jobs", return_value={"records": 1}) as mock_r, \
+         patch("cave_fallback.handle_fallback_result") as mock_h, \
+         patch.object(lh, "_http_handler") as mock_http:
+        out = lh.handler(event, context=None)
+    mock_r.assert_called_once_with(event)
+    mock_h.assert_not_called()
+    mock_http.assert_not_called()
+    assert out == {"records": 1}
+
+
+def test_unknown_queue_sqs_event_falls_through_to_mangum():
+    # An SQS event from a queue we don't recognize must not guess a handler.
+    event = {"Records": [{"eventSource": "aws:sqs", "eventSourceARN": "arn:aws:sqs:us-east-1:1:some-other.fifo", "body": "{}"}]}
+    with patch("cave_fallback.handle_fallback_result") as mock_h, \
+         patch("rerun.handle_rerun_jobs") as mock_r, \
+         patch.object(lh, "_http_handler", return_value="ok") as mock_http:
+        out = lh.handler(event, context=None)
+    mock_h.assert_not_called()
+    mock_r.assert_not_called()
+    mock_http.assert_called_once()
+    assert out == "ok"
 
 
 def test_non_sqs_records_event_falls_through_to_mangum():
