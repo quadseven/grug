@@ -204,6 +204,19 @@ def create(
                             "arn:aws:dynamodb:*:*:table/grug-main/*",
                         ],
                     },
+                    {
+                        # SQS for the cave-fallback airlock (#310) + the future
+                        # rerun queue (#305). `pulumi preview` passes with admin
+                        # creds, but the SCOPED deploy role 403'd on
+                        # sqs:CreateQueue at apply time (deploy run 27137871238 —
+                        # an apply-time auth check preview can't see). Scoped to
+                        # grug-* queues, not "*". (lambda:* above already covers
+                        # the event-source mapping; iam:* covers the connector
+                        # user + policy.)
+                        "Effect": "Allow",
+                        "Action": "sqs:*",
+                        "Resource": "arn:aws:sqs:*:*:grug-*",
+                    },
                 ],
             },
         )
