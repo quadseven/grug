@@ -292,3 +292,15 @@
 }
 .afeed-row .rerun-btn:hover { color: var(--ink, #eee); border-color: var(--ink, #eee); }
 .afeed-row .rerunning { color: var(--amber, #e0a030); font-size: 11px; margin-left: 6px; letter-spacing: 0.5px; }
+.rerun-all-btn {
+  background: none;
+  border: 1px solid var(--line, #333);
+  color: var(--muted, #888);
+  border-radius: 4px;
+  cursor: pointer;
+  font-size: 11px;
+  letter-spacing: 0.5px;
+  padding: 4px 10px;
+}
+.rerun-all-btn:hover:not(:disabled) { color: var(--ink, #eee); border-color: var(--ink, #eee); }
+.rerun-all-btn:disabled { opacity: 0.5; cursor: default; }

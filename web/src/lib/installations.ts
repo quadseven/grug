@@ -171,3 +171,18 @@ export function useRerun(installId: number | undefined) {
       ),
   });
 }
+
+// Re-run ALL currently-errored rows (#306) — the outage-recovery batch. The api
+// fans every errored row into the queue; FIFO per-install ordering paces it.
+export function useRerunAll(installId: number | undefined) {
+  const qc = useQueryClient();
+  return useMutation({
+    mutationFn: () =>
+      api(`/api/v1/installations/${installId}/rerun-all`, { method: "POST" }) as Promise<{ queued: number }>,
+    onSuccess: () =>
+      setTimeout(
+        () => qc.invalidateQueries({ queryKey: ["installations", installId, "activity"] }),
+        4000,
+      ),
+  });
+}
