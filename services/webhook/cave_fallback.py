@@ -46,6 +46,11 @@ SCHEMA_VERSION = 1
 # multi-persona airlock routes without a schema change.
 _PERSONA = "elder"
 
+# SQS hard-caps a message at 256 KB. Inline-diff jobs (#310) over this would
+# just fail the send; we skip them with a clear log instead (S3 spillover for
+# big diffs is #311). 250 KB leaves headroom for the JSON envelope.
+_MAX_INLINE_JOB_BYTES = 250 * 1024
+
 
 @dataclass(frozen=True, slots=True)
 class FallbackJob:
@@ -173,10 +178,26 @@ def enqueue_fallback(
         persona=_PERSONA,
         hunks=tuple((h.path, h.body) for h in hunks),
     )
+    # peer-review (Poolside laguna-m.1 + Spark qwen3-coder-next + OpenRouter
+    # gpt-oss-120b, CONFIRMED 3x): an oversized inline job would just fail the
+    # SQS 256 KB send. Skip it with a CLEAR signal rather than a generic
+    # send-failure. Small-diff scope is #310 by design; S3 spillover is #311.
+    body = job.to_json()
+    if len(body.encode("utf-8")) > _MAX_INLINE_JOB_BYTES:
+        log.warning(
+            "elder_fallback_diff_too_large",
+            extra={
+                "repo": repo,
+                "pr": pr_number,
+                "bytes": len(body.encode("utf-8")),
+                "note": "inline-only until S3 spillover (#311)",
+            },
+        )
+        return False
     try:
         _sqs.send_message(
             QueueUrl=_JOBS_QUEUE_URL,
-            MessageBody=job.to_json(),
+            MessageBody=body,
             MessageGroupId=str(installation_id),
             MessageDeduplicationId=_dedup_id(
                 installation_id, repo, pr_number, head_sha
@@ -220,6 +241,20 @@ _CHECK_NAME = "Grug — Code Review"
 _PERSONA_KEY = "code_reviewer"
 
 
+def _md_safe(s: str) -> str:
+    """Neutralize markdown/control chars in connector-supplied finding text
+    before it lands in a check-run summary. Backticks/pipes/newlines are the
+    layout-breaking + injection-relevant ones; cap length to bound a hostile
+    payload. Cosmetic-grade (GitHub renders check-run summaries as markdown),
+    not a security boundary on its own."""
+    return (
+        s.replace("`", "'")
+        .replace("|", "\\|")
+        .replace("\r", " ")
+        .replace("\n", " ")
+    )[:300]
+
+
 def _summarize(findings: tuple[dict[str, Any], ...]) -> tuple[str, str]:
     """(title, markdown summary) for the healed check-run. Caveman voice, same
     register as the persona — computed here from primitive finding dicts so the
@@ -236,10 +271,14 @@ def _summarize(findings: tuple[dict[str, Any], ...]) -> tuple[str, str]:
     )
     lines = []
     for f in findings:
-        sev = str(f.get("severity", "?"))
-        rule = str(f.get("rule_name") or f.get("rule") or "?")
-        loc = f"{f.get('file') or f.get('path') or '?'}:{f.get('line', '?')}"
-        msg = str(f.get("message", ""))
+        # peer-review (OpenRouter + Poolside + Spark, CONFIRMED 3x): connector
+        # findings originate from an LLM reviewing a (semi-untrusted) PR diff,
+        # so neutralize markdown/control chars before interpolating into the
+        # check-run body — a crafted diff must not inject markup or break layout.
+        sev = _md_safe(str(f.get("severity", "?")))
+        rule = _md_safe(str(f.get("rule_name") or f.get("rule") or "?"))
+        loc = _md_safe(f"{f.get('file') or f.get('path') or '?'}:{f.get('line', '?')}")
+        msg = _md_safe(str(f.get("message", "")))
         lines.append(f"- **[{sev}]** `{rule}` @ {loc} — {msg}")
     title = f"🪨 Grug found {n} omen{'s' if n != 1 else ''} (from the Cave)"
     body = (

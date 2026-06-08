@@ -49,5 +49,10 @@ def _is_sqs_event(event: Any) -> bool:
     records = event.get("Records")
     if not isinstance(records, list) or not records:
         return False
-    first = records[0]
-    return isinstance(first, dict) and first.get("eventSource") == "aws:sqs"
+    # peer-review (OpenRouter + Poolside + Spark, CONFIRMED 3x): require EVERY
+    # record to be SQS, not just the first. batch_size=1 makes this moot today,
+    # but a future ESM reconfig (batch>1) or a mixed batch must not misroute a
+    # foreign record into handle_fallback_result.
+    return all(
+        isinstance(r, dict) and r.get("eventSource") == "aws:sqs" for r in records
+    )

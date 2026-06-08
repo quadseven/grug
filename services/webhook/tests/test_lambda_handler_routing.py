@@ -62,3 +62,15 @@ def test_non_sqs_records_event_falls_through_to_mangum():
     mock_h.assert_not_called()
     mock_http.assert_called_once()
     assert out == "ok"
+
+
+def test_mixed_batch_is_not_treated_as_sqs():
+    # #322 peer-review: a batch with any non-SQS record must NOT route to the
+    # fallback handler (all-records check, not first-only).
+    event = {"Records": [{"eventSource": "aws:sqs"}, {"eventSource": "aws:s3"}]}
+    with patch("cave_fallback.handle_fallback_result") as mock_h, \
+         patch.object(lh, "_http_handler", return_value="ok") as mock_http:
+        out = lh.handler(event, context=None)
+    mock_h.assert_not_called()
+    mock_http.assert_called_once()
+    assert out == "ok"

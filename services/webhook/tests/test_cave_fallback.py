@@ -228,3 +228,31 @@ def test_handle_result_clean_review_titles_no_omens():
         cf.handle_fallback_result(_event(_result_body(findings=[])))
     check = post.mock_calls[0].args[3]
     assert "no bad omens" in check.title.lower()
+
+
+# --- peer-review hardenings (#322): size guard + markdown safety -----------
+
+def test_enqueue_skips_oversized_diff(monkeypatch):
+    """A diff over the SQS 256KB inline cap is skipped with a clear signal
+    (S3 spillover is #311) — not sent, not a generic failure."""
+    big = [Hunk(path="big.py", body="x" * 260_000)]
+    monkeypatch.setattr(cf, "_JOBS_QUEUE_URL", "https://sqs/jobs.fifo")
+    with patch("secrets_loader.get_fallback_enabled", return_value=True), \
+         patch.object(cf._sqs, "send_message") as send:
+        out = cf.enqueue_fallback(big, installation_id=1, repo="a/b", pr_number=1, head_sha="h")
+    assert out is False
+    send.assert_not_called()  # never attempts a doomed >256KB send
+
+
+def test_summarize_neutralizes_markdown_from_connector_findings():
+    """Connector findings come from an LLM over a PR diff — backticks/pipes/
+    newlines must not break or inject into the check-run summary."""
+    title, body = cf._summarize((
+        {"severity": "high", "rule_name": "x`y|z",
+         "file": "a.py", "line": 1, "message": "line1\nline2 `code` |pipe|"},
+    ))
+    # No raw newlines or pipes survive into the per-finding line.
+    finding_line = [l for l in body.splitlines() if l.startswith("- ")][0]
+    assert "\n" not in finding_line
+    assert "line1 line2" in finding_line  # newline collapsed to space
+    assert "`code`" not in finding_line   # backticks neutralized
