@@ -10,6 +10,7 @@ import {
   useSetRepoConfig,
   useActivity,
   useRerun,
+  useRerunAll,
   type Repo,
 } from "../lib/installations";
 import "./dashboard-grug.css";
@@ -515,6 +516,17 @@ function ActivityPanel({ show, installId }: { show: boolean; installId?: number 
     setRerunning((s) => new Set(s).add(_rerunKey(a)));
     rerun.mutate({ repo: a.repo, pr_number: a.pr_number, persona: a.persona });
   };
+  // #306: re-run ALL errored rows in one click (outage recovery).
+  const rerunAll = useRerunAll(installId);
+  const erroredRows = rows.filter((a) => a.verdict === "errored");
+  const doRerunAll = () => {
+    setRerunning((s) => {
+      const n = new Set(s);
+      erroredRows.forEach((a) => n.add(_rerunKey(a)));
+      return n;
+    });
+    rerunAll.mutate();
+  };
   return (
     <section className={`panel${show ? " show" : ""}`}>
       <div className="panel-head">
@@ -530,6 +542,12 @@ function ActivityPanel({ show, installId }: { show: boolean; installId?: number 
                 <button key={f} className={filter === f ? "on" : ""} onClick={() => setFilter(f)}>{f.toUpperCase()}</button>
               ))}
             </div>
+            {erroredRows.length > 0 && (
+              <button className="rerun-all-btn" style={{ marginLeft: "auto" }} disabled={rerunAll.isPending}
+                onClick={doRerunAll} title="Re-run every errored check">
+                ↻ Re-run all errored ({erroredRows.length})
+              </button>
+            )}
           </div>
           {activity.isLoading && <div className="mono" style={{ fontSize: 12, color: "var(--muted)", padding: 8 }}>loading…</div>}
           {activity.isError && <div className="mono" style={{ fontSize: 12, color: "var(--tomato)", padding: 8 }}>failed to load activity</div>}

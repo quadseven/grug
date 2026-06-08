@@ -91,3 +91,62 @@ def test_rerun_request_rejects_junk_persona_and_repo():
         inst.RerunRequest(repo="myorg/myrepo", pr_number=1, persona="carrier-pigeon")
     with pytest.raises(Exception):
         inst.RerunRequest(repo="not-a-slug", pr_number=1, persona="elder")  # needs owner/name
+
+
+# --- batch: rerun_all_errored (#306) --------------------------------------
+
+def _row(repo, pr, persona, errored=True):
+    return {
+        "repo": repo, "pr_number": pr, "persona": persona, "head_sha": "h",
+        "conclusion": "neutral", "findings_count": 0,
+        "degraded_reason": "llm_outage" if errored else None,
+        "summary": "",
+    }
+
+
+def test_rerun_all_enqueues_distinct_errored_rows_only():
+    rows = [
+        _row("a/b", 1, "elder"),                 # errored
+        _row("a/b", 1, "elder"),                 # dup (repo,pr,persona) → 1 job
+        _row("a/b", 2, "elder"),                 # errored, distinct
+        _row("a/b", 3, "elder", errored=False),  # pass → skipped
+    ]
+    with patch("installations.get_installation", return_value=_install(owner_id="100")), \
+         patch("installations.list_check_verdicts", return_value=rows), \
+         patch("rerun.enqueue_rerun") as enq:
+        out = inst.rerun_all_errored(install_id=11, user=_user(user_id="100"))
+    assert out == {"queued": 2}  # 2 distinct errored, dup deduped, pass skipped
+    keys = {(c.kwargs["repo"], c.kwargs["pr_number"]) for c in enq.call_args_list}
+    assert keys == {("a/b", 1), ("a/b", 2)}
+
+
+def test_rerun_all_unknown_install_404():
+    with patch("installations.get_installation", return_value=None):
+        with pytest.raises(HTTPException) as exc:
+            inst.rerun_all_errored(install_id=999, user=_user())
+    assert exc.value.status_code == 404
+
+
+def test_rerun_all_not_owner_403():
+    with patch("installations.get_installation", return_value=_install(owner_id="999")):
+        with pytest.raises(HTTPException) as exc:
+            inst.rerun_all_errored(install_id=11, user=_user(user_id="100"))
+    assert exc.value.status_code == 403
+
+
+def test_rerun_all_503_when_queue_unconfigured():
+    with patch("installations.get_installation", return_value=_install(owner_id="100")), \
+         patch("installations.list_check_verdicts", return_value=[_row("a/b", 1, "elder")]), \
+         patch("rerun.enqueue_rerun", side_effect=RuntimeError("no queue")):
+        with pytest.raises(HTTPException) as exc:
+            inst.rerun_all_errored(install_id=11, user=_user(user_id="100"))
+    assert exc.value.status_code == 503
+
+
+def test_rerun_all_no_errored_returns_zero():
+    with patch("installations.get_installation", return_value=_install(owner_id="100")), \
+         patch("installations.list_check_verdicts", return_value=[_row("a/b", 1, "elder", errored=False)]), \
+         patch("rerun.enqueue_rerun") as enq:
+        out = inst.rerun_all_errored(install_id=11, user=_user(user_id="100"))
+    assert out == {"queued": 0}
+    enq.assert_not_called()
