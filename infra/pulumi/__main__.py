@@ -221,7 +221,12 @@ _cave_results_queue = aws.sqs.Queue(
     fifo_queue=True,
     content_based_deduplication=True,   # results keyed by content; connector needn't mint an id
     message_retention_seconds=1209600,
-    visibility_timeout_seconds=60,
+    # AWS requires an SQS→Lambda event-source-mapping queue's visibility timeout
+    # to be >= the consuming function's timeout. The webhook Lambda is 420s
+    # (shared with the Elder async path), so this MUST be >= 420 or
+    # CreateEventSourceMapping 400s (InvalidParameterValueException). The result
+    # handler itself is fast; this ceiling just satisfies the ESM constraint.
+    visibility_timeout_seconds=420,
     tags={"app": "grug", "service": "grug-cave"},
 )
 # Connector principal (grug-cave-connector, #316): consume jobs + send results,
