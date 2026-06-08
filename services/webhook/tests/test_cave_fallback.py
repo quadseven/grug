@@ -24,13 +24,15 @@ def test_fallback_job_to_json_round_trips():
         pr_number=7,
         head_sha="deadbeef",
         persona="elder",
-        hunks=(("a.py", "@@ -1 +1 @@\n-x\n+y"),),
+        diff_ref={"kind": "inline", "hunks": [{"path": "a.py", "body": "@@ x"}]},
     )
     d = json.loads(job.to_json())
     assert d["install_id"] == 42
     assert d["repo"] == "acme/widget"
     assert d["persona"] == "elder"
-    assert d["hunks"] == [{"path": "a.py", "body": "@@ -1 +1 @@\n-x\n+y"}]
+    assert d["schema_version"] == 2  # #311 bumped the wire shape
+    assert d["diff_ref"]["kind"] == "inline"
+    assert d["diff_ref"]["hunks"] == [{"path": "a.py", "body": "@@ x"}]
 
 
 def test_fallback_result_from_json_parses_findings():
@@ -121,7 +123,9 @@ def test_enqueue_sends_with_install_group_and_head_scoped_dedup(monkeypatch):
     assert kwargs["MessageDeduplicationId"] == "42:acme/widget:7:elder:deadbeef0000"
     body = json.loads(kwargs["MessageBody"])
     assert body["repo"] == "acme/widget" and body["head_sha"] == "deadbeef0000"
-    assert body["hunks"] == [{"path": "a.py", "body": "@@ -1 +1 @@\n-x\n+y"}]
+    # Small diff → inline DiffRef (no S3).
+    assert body["diff_ref"]["kind"] == "inline"
+    assert body["diff_ref"]["hunks"] == [{"path": "a.py", "body": "@@ -1 +1 @@\n-x\n+y"}]
     # The job must NOT carry any GitHub credential.
     assert "token" not in kwargs["MessageBody"].lower()
 
@@ -256,3 +260,87 @@ def test_summarize_neutralizes_markdown_from_connector_findings():
     assert "\n" not in finding_line
     assert "line1 line2" in finding_line  # newline collapsed to space
     assert "`code`" not in finding_line   # backticks neutralized
+
+
+# --- DiffRef codec (#311): pack/unpack, inline-vs-S3 boundary, round-trip ---
+
+import io  # noqa: E402
+
+_SMALL = [Hunk(path="a.py", body="@@ -1 +1 @@\n-x\n+y")]
+_BIG = [Hunk(path="big.py", body="x" * 260_000)]
+
+
+def test_pack_diff_inline_for_small_diff(monkeypatch):
+    monkeypatch.setattr(cf, "_DIFF_BUCKET", "")  # no bucket needed for inline
+    with patch.object(cf._s3, "put_object") as put:
+        ref = cf.pack_diff(_SMALL, install_id=1, head_sha="h")
+    assert ref == {"kind": "inline", "hunks": [{"path": "a.py", "body": "@@ -1 +1 @@\n-x\n+y"}]}
+    put.assert_not_called()  # small diff never touches S3
+
+
+def test_pack_diff_spills_large_diff_to_s3(monkeypatch):
+    monkeypatch.setattr(cf, "_DIFF_BUCKET", "grug-cave-diffs")
+    with patch.object(cf._s3, "put_object") as put:
+        ref = cf.pack_diff(_BIG, install_id=42, head_sha="cafef00d")
+    assert ref == {"kind": "s3", "bucket": "grug-cave-diffs", "key": "diffs/42/cafef00d.json"}
+    put.assert_called_once()
+    pk = put.call_args.kwargs
+    assert pk["Bucket"] == "grug-cave-diffs" and pk["Key"] == "diffs/42/cafef00d.json"
+
+
+def test_pack_diff_none_when_large_and_no_bucket(monkeypatch):
+    monkeypatch.setattr(cf, "_DIFF_BUCKET", "")
+    assert cf.pack_diff(_BIG, install_id=1, head_sha="h") is None  # can't spill → no-op
+
+
+def test_pack_diff_none_when_spill_fails(monkeypatch):
+    monkeypatch.setattr(cf, "_DIFF_BUCKET", "grug-cave-diffs")
+    with patch.object(cf._s3, "put_object", side_effect=RuntimeError("s3 down")):
+        assert cf.pack_diff(_BIG, install_id=1, head_sha="h") is None  # best-effort
+
+
+def test_unpack_diff_inline_round_trips():
+    ref = cf.pack_diff(_SMALL, install_id=1, head_sha="h")
+    hunks = cf.unpack_diff(ref)
+    assert [(h.path, h.body) for h in hunks] == [("a.py", "@@ -1 +1 @@\n-x\n+y")]
+
+
+def test_unpack_diff_s3_fetches_and_reconstructs(monkeypatch):
+    payload = json.dumps([{"path": "big.py", "body": "x" * 10}]).encode("utf-8")
+    with patch.object(cf._s3, "get_object", return_value={"Body": io.BytesIO(payload)}) as get:
+        hunks = cf.unpack_diff({"kind": "s3", "bucket": "b", "key": "k"})
+    get.assert_called_once_with(Bucket="b", Key="k")
+    assert [(h.path, h.body) for h in hunks] == [("big.py", "x" * 10)]
+
+
+def test_unpack_diff_round_trips_large_via_s3(monkeypatch):
+    # pack (spill) then unpack (fetch) reconstructs the SAME hunks.
+    monkeypatch.setattr(cf, "_DIFF_BUCKET", "grug-cave-diffs")
+    stored = {}
+    monkeypatch.setattr(cf._s3, "put_object",
+                        lambda **kw: stored.__setitem__("body", kw["Body"]))
+    ref = cf.pack_diff(_BIG, install_id=7, head_sha="hh")
+    monkeypatch.setattr(cf._s3, "get_object",
+                        lambda **kw: {"Body": io.BytesIO(stored["body"])})
+    hunks = cf.unpack_diff(ref)
+    assert [(h.path, h.body) for h in hunks] == [("big.py", "x" * 260_000)]
+
+
+def test_unpack_diff_rejects_unknown_kind():
+    import pytest
+    with pytest.raises(ValueError):
+        cf.unpack_diff({"kind": "carrier-pigeon"})
+
+
+def test_enqueue_spills_large_diff_and_sends_s3_ref(monkeypatch):
+    monkeypatch.setattr(cf, "_JOBS_QUEUE_URL", "https://sqs/jobs.fifo")
+    monkeypatch.setattr(cf, "_DIFF_BUCKET", "grug-cave-diffs")
+    with patch("secrets_loader.get_fallback_enabled", return_value=True), \
+         patch.object(cf._s3, "put_object") as put, \
+         patch.object(cf._sqs, "send_message") as send:
+        out = cf.enqueue_fallback(_BIG, installation_id=42, repo="a/b", pr_number=1, head_sha="deadbeef")
+    assert out is True
+    put.assert_called_once()  # spilled
+    body = json.loads(send.call_args.kwargs["MessageBody"])
+    assert body["diff_ref"]["kind"] == "s3"  # message carries only the pointer
+    assert "hunks" not in body["diff_ref"]   # the big diff is NOT inline

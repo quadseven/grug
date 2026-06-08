@@ -217,6 +217,19 @@ def create(
                         "Action": "sqs:*",
                         "Resource": "arn:aws:sqs:*:*:grug-*",
                     },
+                    {
+                        # S3 for the cave spilled-diff bucket (#311). Same
+                        # apply-time-auth lesson as the sqs grant above —
+                        # preview (admin creds) passes, the scoped CI role 403s
+                        # on create at apply. Scoped to grug-* buckets + their
+                        # objects, not "*".
+                        "Effect": "Allow",
+                        "Action": "s3:*",
+                        "Resource": [
+                            "arn:aws:s3:::grug-*",
+                            "arn:aws:s3:::grug-*/*",
+                        ],
+                    },
                 ],
             },
         )
