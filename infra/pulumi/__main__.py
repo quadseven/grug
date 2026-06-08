@@ -203,16 +203,40 @@ _fallback_enabled = aws.ssm.Parameter(
     description="Enable Elder's owned cave fallback when both cloud LLMs fail (ADR-0005, #310).",
     opts=pulumi.ResourceOptions(ignore_changes=["value"]),
 )
+# DLQs (#312): a poison message that fails maxReceiveCount times lands here
+# instead of vanishing or looping forever — the operator-visible "stuck" signal.
+# FIFO source → FIFO DLQ. The jobs DLQ is the meaningful one (a job the connector
+# can't process); the results DLQ is mostly inert (the webhook handler never
+# raises) but added for symmetry + hygiene.
+_cave_jobs_dlq = aws.sqs.Queue(
+    "grug-cave-jobs-dlq",
+    name="grug-cave-jobs-dlq.fifo",
+    fifo_queue=True,
+    message_retention_seconds=1209600,  # 14d to inspect a poison job
+    tags={"app": "grug", "service": "grug-cave"},
+)
+_cave_results_dlq = aws.sqs.Queue(
+    "grug-cave-results-dlq",
+    name="grug-cave-results-dlq.fifo",
+    fifo_queue=True,
+    message_retention_seconds=1209600,
+    tags={"app": "grug", "service": "grug-cave"},
+)
 # The airlock: two FIFO queues. Grug and the Cave never connect — they only ever
 # touch these. `jobs`: webhook → connector. `results`: connector → webhook (ESM).
 _cave_jobs_queue = aws.sqs.Queue(
     "grug-cave-jobs",
     name="grug-cave-jobs.fifo",
     fifo_queue=True,
-    # Producer supplies MessageDeduplicationId (head-scoped) — NOT content-based.
+    # Producer supplies MessageDeduplicationId (head-scoped: a new push is a
+    # DISTINCT fallback, unlike the rerun's head-less dedup) — NOT content-based.
     content_based_deduplication=False,
     message_retention_seconds=1209600,  # 14d: hold a backlog while the connector is down
     visibility_timeout_seconds=420,     # ≥ the connector's per-job review budget
+    receive_wait_time_seconds=20,       # long polling (#312 free-tier guard)
+    redrive_policy=_cave_jobs_dlq.arn.apply(
+        lambda arn: json.dumps({"deadLetterTargetArn": arn, "maxReceiveCount": 5})
+    ),
     tags={"app": "grug", "service": "grug-cave"},
 )
 _cave_results_queue = aws.sqs.Queue(
@@ -221,6 +245,10 @@ _cave_results_queue = aws.sqs.Queue(
     fifo_queue=True,
     content_based_deduplication=True,   # results keyed by content; connector needn't mint an id
     message_retention_seconds=1209600,
+    receive_wait_time_seconds=20,       # long polling (#312 free-tier guard)
+    redrive_policy=_cave_results_dlq.arn.apply(
+        lambda arn: json.dumps({"deadLetterTargetArn": arn, "maxReceiveCount": 3})
+    ),
     # AWS requires an SQS→Lambda event-source-mapping queue's visibility timeout
     # to be >= the consuming function's timeout. The webhook Lambda is 420s
     # (shared with the Elder async path), so this MUST be >= 420 or
@@ -881,6 +909,56 @@ _rerun_dlq_monitor = _datadog.Monitor(
     tags=[f"env:{env}", "service:grug-api", "team:grug"],
     notify_no_data=False,
     priority=3,
+    opts=pulumi.ResourceOptions(provider=_dd_provider),
+)
+
+# Cave DLQ depth (#312): a job/result that exhausted maxReceiveCount landed in a
+# cave DLQ — a poison message the connector (or webhook) couldn't process.
+# Covers both cave DLQs (the jobs one is the meaningful path; results is mostly
+# inert since the handler never raises).
+_cave_dlq_monitor = _datadog.Monitor(
+    "grug-cave-dlq-depth",
+    type="metric alert",
+    name="[grug] Cave airlock DLQ has messages",
+    message=(
+        f"{_dd_notify}\n"
+        "A cave airlock DLQ (grug-cave-jobs-dlq / grug-cave-results-dlq) has "
+        "messages — a poison job/result exhausted its retries. The fallback "
+        "review for that PR did not complete; inspect the DLQ message.\n"
+        "Runbook: docs/RUNBOOK.md#elder-async-offload"
+    ),
+    query=(
+        "max(last_15m):max:aws.sqs.approximate_number_of_messages_visible"
+        "{queuename:grug-cave-jobs-dlq.fifo OR queuename:grug-cave-results-dlq.fifo} > 0"
+    ),
+    tags=[f"env:{env}", "service:grug-webhook", "team:grug"],
+    notify_no_data=False,
+    priority=3,
+    opts=pulumi.ResourceOptions(provider=_dd_provider),
+)
+
+# Fallback-fired rate (#312): the operator's awareness signal that the owned
+# backstop actually activated (both cloud LLMs were down and a job was enqueued).
+# Informational (P4) — it won't fire until the fallback is enabled (#313). Built
+# from the producer's `elder_fallback_enqueued` log.
+_cave_fallback_fired_monitor = _datadog.Monitor(
+    "grug-cave-fallback-fired",
+    type="log alert",
+    name="[grug-webhook] Cave fallback fired (1h)",
+    message=(
+        f"{_dd_notify}\n"
+        "Elder's owned cave fallback was enqueued >= 1 time in the last hour — "
+        "both cloud LLM backends were down and the backstop kicked in. Expected "
+        "to be rare; sustained firing means the SaaS backends are persistently "
+        "out (which is by design, ADR-0005)."
+    ),
+    query=(
+        f'logs("service:grug-webhook env:{env} elder_fallback_enqueued")'
+        '.index("*").rollup("count").last("1h") >= 1'
+    ),
+    tags=[f"env:{env}", "service:grug-webhook", "team:grug"],
+    notify_no_data=False,
+    priority=4,
     opts=pulumi.ResourceOptions(provider=_dd_provider),
 )
 
