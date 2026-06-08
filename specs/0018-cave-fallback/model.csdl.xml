@@ -1,0 +1,103 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!-- Spec 0018 CaveFallback — CSDL companion. Filename must be `model.csdl.xml`. -->
+<edmx:Edmx Version="4.0" xmlns:edmx="http://docs.oasis-open.org/odata/ns/edmx">
+  <edmx:DataServices>
+
+    <Schema Namespace="Temper.Vocab" xmlns="http://docs.oasis-open.org/odata/ns/edm">
+      <Term Name="StateMachine.States" Type="Collection(Edm.String)" AppliesTo="EntityType"/>
+      <Term Name="StateMachine.InitialState" Type="Edm.String" AppliesTo="EntityType"/>
+      <Term Name="StateMachine.ValidFromStates" Type="Collection(Edm.String)" AppliesTo="Action"/>
+      <Term Name="StateMachine.TargetState" Type="Edm.String" AppliesTo="Action"/>
+      <Term Name="Agent.Hint" Type="Edm.String" AppliesTo="Action EntityType"/>
+      <Term Name="ShardKey" Type="Edm.String" AppliesTo="EntityType"/>
+      <Term Name="AuthZ.CedarPolicy" Type="Edm.String" AppliesTo="EntityType Action"/>
+    </Schema>
+
+    <Schema Namespace="Grug.CaveFallback" xmlns="http://docs.oasis-open.org/odata/ns/edm">
+
+      <EnumType Name="CaveFallbackStatus">
+        <Member Name="Drafted" Value="0"/>
+        <Member Name="Enqueued" Value="1"/>
+        <Member Name="Answered" Value="2"/>
+        <Member Name="Healed" Value="3"/>
+        <Member Name="Retired" Value="4"/>
+      </EnumType>
+
+      <EntityType Name="CaveFallback">
+        <Key><PropertyRef Name="CaveFallbackId"/></Key>
+        <Property Name="CaveFallbackId" Type="Edm.String" Nullable="false"/>
+        <Property Name="InstallationId" Type="Edm.String" Nullable="false"/>
+        <Property Name="Status" Type="Grug.CaveFallback.CaveFallbackStatus" Nullable="false"/>
+
+        <Property Name="enqueue_only_on_all_failed_and_flag_on_per_fallback" Type="Edm.Boolean" DefaultValue="false"/>
+        <Property Name="job_carries_inline_diff_and_no_github_credential_per_fallback" Type="Edm.Boolean" DefaultValue="false"/>
+        <Property Name="enqueue_uses_fifo_dedup_and_install_message_group_per_fallback" Type="Edm.Boolean" DefaultValue="false"/>
+        <Property Name="enqueue_is_best_effort_never_raises_into_dispatch_per_fallback" Type="Edm.Boolean" DefaultValue="false"/>
+        <Property Name="result_consumed_via_sqs_event_source_mapping_per_fallback" Type="Edm.Boolean" DefaultValue="false"/>
+        <Property Name="result_publishes_check_run_then_heals_verdict_per_fallback" Type="Edm.Boolean" DefaultValue="false"/>
+        <Property Name="heal_is_idempotent_per_persona_head_sha_per_fallback" Type="Edm.Boolean" DefaultValue="false"/>
+        <Property Name="result_handler_never_raises_back_to_lambda_per_fallback" Type="Edm.Boolean" DefaultValue="false"/>
+        <Property Name="queues_are_airlock_cave_zero_inbound_per_fallback" Type="Edm.Boolean" DefaultValue="false"/>
+
+        <Annotation Term="Temper.Vocab.StateMachine.States">
+          <Collection>
+            <String>Drafted</String><String>Enqueued</String><String>Answered</String><String>Healed</String><String>Retired</String>
+          </Collection>
+        </Annotation>
+        <Annotation Term="Temper.Vocab.StateMachine.InitialState" String="Drafted"/>
+        <Annotation Term="Temper.Vocab.ShardKey" String="InstallationId"/>
+        <Annotation Term="Temper.Vocab.AuthZ.CedarPolicy" String="policies/cave-fallback.cedar"/>
+      </EntityType>
+
+      <Action Name="AttestEnqueueContract" IsBound="true">
+        <Parameter Name="bindingParameter" Type="Grug.CaveFallback.CaveFallback"/>
+        <Parameter Name="attestor" Type="Edm.String" Nullable="false"/>
+        <ReturnType Type="Grug.CaveFallback.CaveFallback"/>
+        <Annotation Term="Temper.Vocab.StateMachine.ValidFromStates"><Collection><String>Drafted</String></Collection></Annotation>
+      </Action>
+
+      <Action Name="AttestResultContract" IsBound="true">
+        <Parameter Name="bindingParameter" Type="Grug.CaveFallback.CaveFallback"/>
+        <Parameter Name="attestor" Type="Edm.String" Nullable="false"/>
+        <ReturnType Type="Grug.CaveFallback.CaveFallback"/>
+        <Annotation Term="Temper.Vocab.StateMachine.ValidFromStates"><Collection><String>Drafted</String></Collection></Annotation>
+      </Action>
+
+      <Action Name="Enqueue" IsBound="true">
+        <Parameter Name="bindingParameter" Type="Grug.CaveFallback.CaveFallback"/>
+        <Parameter Name="job_dedup_id" Type="Edm.String" Nullable="false"/>
+        <ReturnType Type="Grug.CaveFallback.CaveFallback"/>
+        <Annotation Term="Temper.Vocab.StateMachine.ValidFromStates"><Collection><String>Drafted</String></Collection></Annotation>
+        <Annotation Term="Temper.Vocab.StateMachine.TargetState" String="Enqueued"/>
+      </Action>
+
+      <Action Name="Answer" IsBound="true">
+        <Parameter Name="bindingParameter" Type="Grug.CaveFallback.CaveFallback"/>
+        <Parameter Name="result_id" Type="Edm.String" Nullable="false"/>
+        <ReturnType Type="Grug.CaveFallback.CaveFallback"/>
+        <Annotation Term="Temper.Vocab.StateMachine.ValidFromStates"><Collection><String>Enqueued</String></Collection></Annotation>
+        <Annotation Term="Temper.Vocab.StateMachine.TargetState" String="Answered"/>
+      </Action>
+
+      <Action Name="Heal" IsBound="true">
+        <Parameter Name="bindingParameter" Type="Grug.CaveFallback.CaveFallback"/>
+        <Parameter Name="head_sha" Type="Edm.String" Nullable="false"/>
+        <ReturnType Type="Grug.CaveFallback.CaveFallback"/>
+        <Annotation Term="Temper.Vocab.StateMachine.ValidFromStates"><Collection><String>Answered</String></Collection></Annotation>
+        <Annotation Term="Temper.Vocab.StateMachine.TargetState" String="Healed"/>
+      </Action>
+
+      <Action Name="Retire" IsBound="true">
+        <Parameter Name="bindingParameter" Type="Grug.CaveFallback.CaveFallback"/>
+        <Parameter Name="successor_pr_head_sha" Type="Edm.String" Nullable="false"/>
+        <ReturnType Type="Grug.CaveFallback.CaveFallback"/>
+        <Annotation Term="Temper.Vocab.StateMachine.ValidFromStates"><Collection><String>Healed</String></Collection></Annotation>
+        <Annotation Term="Temper.Vocab.StateMachine.TargetState" String="Retired"/>
+      </Action>
+
+      <EntityContainer Name="CaveFallbackService">
+        <EntitySet Name="CaveFallbacks" EntityType="Grug.CaveFallback.CaveFallback"/>
+      </EntityContainer>
+    </Schema>
+  </edmx:DataServices>
+</edmx:Edmx>

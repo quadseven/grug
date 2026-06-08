@@ -1185,3 +1185,49 @@ def test_activity_verdict_errored_when_diff_fetch_fails(monkeypatch):
     assert recorded["degraded_reason"] == "fetch_or_parse_failed"
     assert recorded["conclusion"] == "neutral"
     assert recorded["persona_key"] == "code_reviewer"
+
+
+def test_dispatch_all_failed_enqueues_cave_fallback(monkeypatch):
+    """Both cloud LLM backends down (kind=all_failed) → the owned cave fallback
+    is enqueued (ADR-0005, #310) with the PR coords, AND the degraded path still
+    publishes (the errored verdict the connector later heals)."""
+    import cave_fallback
+
+    llm = LlmReviewResponse(kind="all_failed", error="both backends failed")
+    monkeypatch.setattr(cr_dispatch, "review_diff", lambda *a, **kw: llm)
+    monkeypatch.setattr(cr_dispatch, "post_check_run", lambda *a, **kw: {})
+    monkeypatch.setattr(cr_dispatch, "post_review", lambda *a, **kw: {})
+
+    calls = []
+    monkeypatch.setattr(
+        cave_fallback, "enqueue_fallback",
+        lambda hunks, **kw: (calls.append((hunks, kw)) or True),
+    )
+
+    with patch("httpx.get", return_value=_diff_response()):
+        cr_dispatch.dispatch_code_review(_payload(), blocking=False)
+
+    assert len(calls) == 1, "all_failed must enqueue exactly one fallback job"
+    hunks, kw = calls[0]
+    assert kw["repo"] == "myorg/myrepo"
+    assert kw["pr_number"] == 7
+    assert kw["head_sha"] == "abcd1234efgh"
+    assert len(hunks) >= 1  # the parsed diff hunks were forwarded inline
+
+
+def test_dispatch_reviewed_does_not_enqueue_fallback(monkeypatch):
+    """A healthy review (kind=reviewed) must NOT touch the fallback path."""
+    import cave_fallback
+
+    llm = LlmReviewResponse(kind="reviewed", findings=(), backend_used=Backend.POOLSIDE, model_name="m")
+    monkeypatch.setattr(cr_dispatch, "review_diff", lambda *a, **kw: llm)
+    monkeypatch.setattr(cr_dispatch, "post_check_run", lambda *a, **kw: {})
+    monkeypatch.setattr(cr_dispatch, "post_review", lambda *a, **kw: {})
+
+    calls = []
+    monkeypatch.setattr(cave_fallback, "enqueue_fallback", lambda *a, **kw: calls.append(1))
+
+    with patch("httpx.get", return_value=_diff_response()):
+        cr_dispatch.dispatch_code_review(_payload(), blocking=False)
+
+    assert calls == []  # no fallback on a healthy review

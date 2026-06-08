@@ -463,6 +463,20 @@ def dispatch_code_review(
                 "error": llm_response.error,
             },
         )
+        if llm_response.kind == "all_failed":
+            # Both cloud LLM backends failed — enqueue Elder's owned fallback to
+            # the Cave over the SQS airlock (ADR-0005). Best-effort + flag-gated:
+            # a no-op unless enabled, and never raises. The degraded `errored`
+            # verdict is still published below; the connector heals it later.
+            from cave_fallback import enqueue_fallback
+
+            enqueue_fallback(
+                _to_llm_hunks(hunks),
+                installation_id=installation_id,
+                repo=f"{owner}/{repo_name}",
+                pr_number=pull_number,
+                head_sha=head_sha,
+            )
 
     evaluation = evaluate_diff(hunks, llm_response)
 
