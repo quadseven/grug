@@ -308,6 +308,59 @@ def rerun_check(
     return {"status": "queued"}
 
 
+@router.post(
+    "/installations/{install_id}/rerun-all",
+    status_code=status.HTTP_202_ACCEPTED,
+)
+def rerun_all_errored(
+    install_id: int,
+    user: UserIdentity = Depends(require_authenticated),
+) -> dict[str, int]:
+    """Re-run EVERY currently-`errored` row for an install (#306) — the
+    outage-recovery move ("Elder failed on 12 PRs → one click"). Fans each
+    DISTINCT `(repo, pr, persona)` errored row into `grug-rerun-jobs`; the
+    per-install FIFO `MessageGroupId` paces the batch (no concurrent LLM burst)
+    and content-dedup drops any row already in-flight from a single re-run.
+    Returns the count queued. The verdict is re-derived server-side (ADR-0003),
+    so the set heals if the verdict mapping changes."""
+    install = get_installation(install_id)
+    if not install:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="install not found")
+    _ensure_can_access(install, user)
+
+    from rerun import enqueue_rerun
+
+    seen: set[tuple[str, int, str]] = set()
+    queued = 0
+    for r in list_check_verdicts(install_id, limit=None):
+        v = derive_verdict(
+            conclusion=r["conclusion"],
+            findings_count=r["findings_count"],
+            degraded_reason=r.get("degraded_reason"),
+        )
+        if v != "errored":
+            continue
+        key = (r["repo"], int(r["pr_number"]), r["persona"])
+        if key in seen:  # same (repo,pr,persona) across heads → one job (dedup)
+            continue
+        seen.add(key)
+        try:
+            enqueue_rerun(
+                install_id=install_id,
+                repo=r["repo"],
+                pr_number=int(r["pr_number"]),
+                persona=r["persona"],
+            )
+        except RuntimeError as e:
+            log.error("rerun_all_enqueue_misconfigured", extra={"detail": str(e)})
+            raise HTTPException(
+                status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+                detail="re-run queue not available",
+            ) from e
+        queued += 1
+    return {"queued": queued}
+
+
 @router.put("/installations/{install_id}/repos/{repo_id}/config")
 def update_repo_config(
     install_id: int,
