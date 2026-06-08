@@ -74,6 +74,17 @@ When **both** cloud LLM backends fail (`review_diff` → `kind=all_failed`), Eld
 | **`enqueue_fallback` (producer)** | `cave_fallback.enqueue_fallback` (webhook-only). Called from `dispatch_code_review` **only** when `llm_response.kind=="all_failed"` AND `secrets_loader.get_fallback_enabled()` is true (SSM `/grug/elder-fallback-enabled`, fallback-safe → `false`). `SendMessage` to `grug-cave-jobs` with `MessageDeduplicationId` from `(install,repo,pr,persona)` + `MessageGroupId=install_id`. **Best-effort / never raises** — a SendMessage failure logs `elder_fallback_enqueue_failed` and is swallowed (the degraded `errored` verdict was already published; the fallback re-triggers on the next push). The verdict stays `errored` until healed (the "no lies" rule). |
 | **`handle_fallback_result` (consumer)** | `cave_fallback.handle_fallback_result` (webhook-only). `lambda_handler.handler` routes the `aws:sqs` event (a `Records` list with `eventSource=="aws:sqs"`) to it **before** Mangum (which can't parse a non-HTTP event), alongside the existing `grug_async_job` sentinel. Parses a `FallbackResult`, `post_check_run` with the connector findings, then `record_check_verdict` — which upserts idempotently per `(persona, head_sha)`, **healing `errored` → `reviewed`** for the current head (a moved-on PR appends a fresh row). **Never raises back to the Lambda** (a raise would retry-storm the event-source mapping); a malformed/degraded result is logged and dropped. |
 
+## Re-run errored rows — SQS backfill (#305, ADR-0004)
+
+grug's backfill for a dropped/`errored` review (the 2026-06 Elder outage left reviews unre-runnable — webhook redelivery is a `claim_delivery` no-op). Reuses the cave SQS scaffolding + deploy-role grants.
+
+| Term | Definition |
+|---|---|
+| **`grug-rerun-jobs` (+ DLQ)** | SQS **FIFO** queue + DLQ (redrive `maxReceiveCount=3`, visibility 420s). api → enqueue (`rerun.enqueue_rerun`), webhook → consume (event-source mapping). Content-dedup on `(install, repo, pr, persona)` — a double-click drops; `MessageGroupId=install_id` rate-controls a batch backfill. DLQ-depth DD monitor. Keyed by **`repo`** ("owner/name", what the Activity row carries) — NOT a repo_id, which the verdict record doesn't store. |
+| **`POST /installations/{id}/rerun`** (api) | `{repo, pr_number, persona}` → **202** + enqueue. Auth via `_ensure_can_access` (owns install / admin). 503 if the queue isn't configured. The api Lambda is 15s, so it hands off to the durable queue; the webhook runs the review on its 420s budget. `RerunRequest` pattern-constrains `repo` + `persona` (422 junk). |
+| **`rerun.handle_rerun_jobs`** (webhook) | `lambda_handler` routes the `grug-rerun-jobs` ESM here (discriminated from `grug-cave-results` by queue ARN). Fetches the PR's CURRENT head (+ `base.repo.id` for RepoConfig) and re-runs the named persona via the unchanged `dispatch_code_review` — which upserts the verdict (heal-in-place on an unchanged head, append on a moved-on PR). Unlike the cave handler, a transient infra failure **RAISES** so the ESM retries (visibility) → DLQ; a repeat LLM outage degrades (published `errored`) and the job is "done". Code-reviewer persona only today; TPM rerun is a follow-up (the static check doesn't error from outages). |
+| **`↻` re-run button** (web) | On **`errored`** Activity rows only. Click → `RE-RUNNING…` + `useRerun` POST; the feed refreshes ~4s later to pick up the healed verdict. |
+
 ## Enforcement concepts
 
 | Term | Definition |
