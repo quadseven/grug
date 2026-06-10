@@ -368,19 +368,19 @@ async worker (`async_dispatch.run_elder_job`) is idempotent on the
   original ran via `elder_job_done`.
 - AWS async retries are disabled (`maximum_retry_attempts=0`) — the worker
   owns idempotency + degrade, so AWS retries would only risk a storm.
-- **Monitor `[grug-webhook] Elder cloud LLMs down — fallback gap`** fires on
-  `code_review_llm_degraded` (BOTH cloud backends — OpenRouter + Poolside —
-  failed for ≥2 reviews in 1h). **The runbook is: do NOT top up credits.**
-  The SaaS backends are unfunded by deliberate choice; topping up
-  OpenRouter/Poolside is an explicit non-strategy. The fix is Elder's owned
-  fallback to the Cave (the operator's self-hosted LLM) (ADR-0005, slices #310 → #316 →
-  #313). Severity is conditional:
-  - **Before the fallback is live:** dropped reviews are a known, accepted
-    gap — the monitor is informational (P4). No action.
-  - **After the fallback is live:** this firing means the Cave ALSO failed
-    (clouds-down is the normal trigger; the fallback should have healed it)
-    — investigate the Cave / the `grug-cave-connector` / the SQS airlock,
-    and the monitor should be restored to P2.
+- **Monitor `[grug-webhook] Elder fallback failed — review dropped for real`**
+  (P2). The cave fallback is **LIVE** (ADR-0005, #310/#316/#313, flag ON since
+  2026-06-10): clouds-down (`code_review_llm_degraded`) is now NORMAL — the
+  SaaS backends are unfunded by deliberate choice (**do NOT top up
+  OpenRouter/Poolside**) and the Cave heals each dropped review, so alerting
+  on clouds-down alone would page on every working review. This monitor fires
+  only when the BACKSTOP fails: the Cave answered degraded
+  (`elder_fallback_result_degraded`), the fallback enqueue failed, the queue
+  URL was missing, or a large diff couldn't spill to S3. Investigate: the
+  `grug-cave-connector` pod (LAN worker), the egress relay, the Cave host,
+  the cave DLQs. The errored Activity row re-runs from the dashboard once the
+  Cave recovers. Awareness-only signals: the P4 "Cave fallback fired" monitor
+  (the backstop activating is expected) + the DLQ-depth/queue-age monitors.
 
 ### Elder prompt A/B experiment (#191)
 
