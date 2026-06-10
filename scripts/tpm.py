@@ -45,6 +45,11 @@ POOLSIDE_BASE = "https://inference.poolside.ai/v1"
 POOLSIDE_MODEL = "poolside/laguna-m.1"
 POOLSIDE_TIMEOUT_S = 30
 
+# Wall-clock cap for any `gh` CLI invocation. A hung `gh` (network stall,
+# upstream GitHub degradation) must not block the persona run until the
+# Actions job timeout reaps it — fail fast with a clear error instead.
+GH_TIMEOUT_S = 60
+
 
 # ─── DoR static checks ───────────────────────────────────────────────────
 
@@ -59,10 +64,24 @@ class DoRCheck:
 def _gh(*args: str, json_out: bool = False) -> Any:
     """gh CLI wrapper."""
     cmd = ["gh", *args]
-    out = subprocess.run(cmd, capture_output=True, text=True, check=False)
+    try:
+        out = subprocess.run(
+            cmd, capture_output=True, text=True, check=False, timeout=GH_TIMEOUT_S
+        )
+    except subprocess.TimeoutExpired as exc:
+        raise RuntimeError(
+            f"gh {args} timed out after {GH_TIMEOUT_S}s"
+        ) from exc
     if out.returncode != 0:
         raise RuntimeError(f"gh {args} failed: {out.stderr.strip()}")
-    return json.loads(out.stdout) if json_out else out.stdout
+    if not json_out:
+        return out.stdout
+    try:
+        return json.loads(out.stdout)
+    except json.JSONDecodeError as exc:
+        raise RuntimeError(
+            f"gh {args} returned non-JSON output: {out.stdout!r}"
+        ) from exc
 
 
 def fetch_pr(repo: str, pr_number: int) -> dict[str, Any]:
@@ -550,6 +569,7 @@ def upsert_comment(repo: str, pr_number: int, body: str) -> None:
             ],
             check=True,
             capture_output=True,
+            timeout=GH_TIMEOUT_S,
         )
     else:
         subprocess.run(
@@ -564,6 +584,7 @@ def upsert_comment(repo: str, pr_number: int, body: str) -> None:
             ],
             check=True,
             capture_output=True,
+            timeout=GH_TIMEOUT_S,
         )
 
 
