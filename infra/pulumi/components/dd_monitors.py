@@ -159,51 +159,45 @@ def create_all(
         opts=opts,
     )
 
-    # 3b) Elder LLM degraded — both CLOUD backends down. The offload monitor
-    #     above watches the async PLUMBING (enqueue/worker crash); it cannot
-    #     see EVERY LLM backend (OpenRouter + Poolside) failing, which is
-    #     logged at warn as `code_review_llm_degraded` and returns gracefully
-    #     (no crash, no offload failure). `>= 2` in 1h ignores a lone transient
-    #     blip but trips on a sustained both-backends-down outage.
-    #
-    #     RE-SCOPED (ADR-0005): the operator deliberately does NOT fund the
-    #     SaaS backends — topping up OpenRouter/Poolside is an explicit
-    #     non-strategy. The fix is Elder's OWNED fallback to the Cave (the
-    #     operator's self-hosted LLM; slices #310 -> #316 -> #313). So this monitor's
-    #     severity is now CONDITIONAL on whether that fallback is live:
-    #       - BEFORE the fallback ships: both clouds down → reviews dropped is
-    #         a KNOWN, ACCEPTED gap → informational (priority 4), do not page.
-    #       - AFTER the fallback ships: this firing means the Cave ALSO failed
-    #         (clouds down is normal; the fallback is what should have saved
-    #         it) → restore priority=2 and treat as a real outage.
-    #     When #310/#316/#313 land, bump priority back to 2 + update the
-    #     message's "until the fallback is live" framing.
+    # 3b) Elder fallback FAILED — a review was dropped and the owned backstop
+    #     did not save it. Post-cutover semantics (2026-06-10, the cave
+    #     fallback is LIVE — #310/#316/#313, flag ON, E2E verified on
+    #     infra#1142): the SaaS backends are unfunded BY DESIGN, so
+    #     `code_review_llm_degraded` (clouds down) now fires on essentially
+    #     every review and then the Cave heals it — alerting on it would be a
+    #     permanent storm. The page-worthy signal is the fallback chain
+    #     breaking: the Cave answered DEGRADED (`elder_fallback_result_degraded`
+    #     — the webhook leaves the verdict errored, "no lies"), the enqueue
+    #     failed, the queue URL was missing, or a big diff couldn't spill.
+    #     Awareness that the backstop is firing at all = the P4
+    #     cave-fallback-fired monitor (#312); the DLQ-depth + queue-age
+    #     monitors cover the stuck-airlock cases.
     elder_llm_degraded = datadog.Monitor(
         "grug-webhook-elder-llm-degraded",
         type="log alert",
-        name="[grug-webhook] Elder cloud LLMs down — fallback gap (1h)",
+        name="[grug-webhook] Elder fallback failed — review dropped for real (30m)",
         message=(
             f"{notify_handle}\n"
-            "Grug Elder could not reach any CLOUD LLM backend (OpenRouter + "
-            "Poolside both failed) for >= 2 reviews in the last hour. "
-            "**This is expected — the SaaS backends are unfunded by design; do "
-            "NOT top up OpenRouter/Poolside.** The fix is Elder's owned fallback "
-            "to the Cave — the operator's self-hosted LLM (ADR-0005, slices "
-            "#310 -> #316 -> #313). Until that fallback is live these reviews "
-            "are dropped (known gap, informational). ONCE it is live, this "
-            "firing means the Cave ALSO failed — investigate then and restore "
-            "this monitor to P2.\n"
+            "A PR review was dropped AND Elder's owned cave fallback did not "
+            "heal it — the Cave answered degraded, the fallback enqueue failed, "
+            "or a large diff couldn't spill to S3. (Clouds-down alone is "
+            "expected — the SaaS backends are unfunded by design; do NOT top up "
+            "OpenRouter/Poolside.) Check the grug-cave-connector pod on the LAN "
+            "worker, proxy-egress-sparkles, the Cave itself, and the cave DLQs. "
+            "The errored Activity row can be re-run from the dashboard once "
+            "the Cave recovers.\n"
             "Runbook: docs/RUNBOOK.md#elder-async-offload"
         ),
         query=(
-            f'logs("service:grug-webhook env:{env} code_review_llm_degraded")'
-            '.index("*").rollup("count").last("1h") >= 2'
+            f'logs("service:grug-webhook env:{env} (elder_fallback_result_degraded '
+            "OR elder_fallback_enqueue_failed OR elder_fallback_no_queue_url "
+            'OR elder_fallback_diff_too_large_no_bucket OR elder_fallback_diff_spill_failed)")'
+            '.index("*").rollup("count").last("30m") > 0'
         ),
         tags=_common_tags(env, "grug-webhook"),
         notify_no_data=False,
-        # Informational until the cave fallback lands — see comment above.
-        # Restore to 2 when #310/#316/#313 ship.
-        priority=4,
+        # P2: the backstop itself failed — reviews are being lost for real.
+        priority=2,
         opts=opts,
     )
 
