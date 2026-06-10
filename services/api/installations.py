@@ -544,7 +544,13 @@ def fix_enforcement(
 def _resolve_repo(
     token: str, install_id: int, repo_id: int,
 ) -> tuple[str, str] | None:
-    """Find repo full_name + default_branch from the installation's repos."""
+    """Find repo full_name + default_branch from the installation's repos.
+
+    Capped at 10 pages (1000 repos) — same limit as `_fetch` — so a
+    large install can't exhaust the api Lambda's 15s budget on a repo
+    not found in its first N pages. Logs a warning when the cap is hit
+    so an over-large install is visible in DD.
+    """
     with httpx.Client(timeout=10) as client:
         page = 1
         while True:
@@ -564,3 +570,9 @@ def _resolve_repo(
             if len(body.get("repositories", [])) < 100:
                 return None
             page += 1
+            if page > 10:  # 1000 repos is plenty for v1; same cap as _fetch
+                log.warning(
+                    "resolve_repo_pagination_cap",
+                    extra={"install_id": install_id, "repo_id": repo_id},
+                )
+                return None
