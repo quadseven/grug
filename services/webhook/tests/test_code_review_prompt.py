@@ -181,3 +181,15 @@ def test_prompt_teaches_path_is_not_secret():
     p = crp.build_system_prompt()
     assert "KUBECONFIG=/tmp/x" in p
     assert "not the secret value" in p
+
+
+def test_new_high_value_rules_present(monkeypatch):
+    """#338: the Elder gained 5 high-value bug classes the audit flagged
+    as missing from the taxonomy."""
+    names = {r.name for r in crp.RULES}
+    for rule in ("missing-await", "query-in-loop", "missing-timeout",
+                 "unbounded-growth", "missing-pagination"):
+        assert rule in names, f"{rule} missing from RULES"
+    p = crp.build_system_prompt()
+    assert "missing-await" in p and "query-in-loop" in p
+    assert "performance" in crp._BUG_CLASSES  # query-in-loop's class
