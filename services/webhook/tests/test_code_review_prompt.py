@@ -193,3 +193,15 @@ def test_new_high_value_rules_present(monkeypatch):
     p = crp.build_system_prompt()
     assert "missing-await" in p and "query-in-loop" in p
     assert "performance" in crp._BUG_CLASSES  # query-in-loop's class
+
+
+def test_voice_has_mandatory_bookend_structure():
+    """#343: the voice instruction mandates the structural bookends that
+    keep the caveman cadence from slipping to plain English under technical
+    load (open in-voice + close 'So speaks Grug.')."""
+    p = crp.build_system_prompt()
+    assert "So speaks Grug." in p
+    assert "STRUCTURE every" in p
+    assert "STOP and re-cast" in p          # the anti-plain-English clause
+    assert "await fetch_user" in p          # the modern high-density example
+    assert "WRAPPER" in p                    # cadence-wraps, core-stays-exact
