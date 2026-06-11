@@ -25,6 +25,7 @@ from __future__ import annotations
 import logging
 import os
 from typing import Any, Literal
+from urllib.parse import quote
 
 import httpx
 
@@ -125,8 +126,12 @@ def _fetch_file_contents(
     contents: dict[str, str] = {}
     for path in paths[:_MAX_CONTEXT_FILES]:
         try:
+            # quote the path SEGMENT (safe="/" keeps the dir separators): a
+            # filename with a space, `#`, `?`, or unicode would otherwise
+            # truncate/reshape the URL → silent 404 → diff-only degrade that
+            # masks the encoding bug as a "fetch skip".
             resp = httpx.get(
-                f"https://api.github.com/repos/{owner}/{repo}/contents/{path}",
+                f"https://api.github.com/repos/{owner}/{repo}/contents/{quote(path, safe='/')}",
                 params={"ref": ref},
                 headers={
                     "Authorization": f"Bearer {install_token}",

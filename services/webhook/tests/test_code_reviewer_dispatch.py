@@ -1236,3 +1236,27 @@ def test_dispatch_reviewed_does_not_enqueue_fallback(monkeypatch):
         cr_dispatch.dispatch_code_review(_payload(), blocking=False)
 
     assert calls == []  # no fallback on a healthy review
+
+
+def test_fetch_file_contents_url_encodes_path(monkeypatch):
+    """#336 follow-up: a changed file with a space/special char must be
+    URL-encoded into the contents API path, not interpolated raw (which
+    truncates the URL → silent 404 → wrong diff-only degrade)."""
+    captured = []
+
+    def cap(url, *, headers, timeout, params=None):
+        captured.append(url)
+        r = MagicMock(spec=httpx.Response)
+        r.status_code = 200
+        r.raise_for_status = MagicMock()
+        r.text = "x"
+        return r
+
+    with patch("httpx.get", side_effect=cap):
+        out = cr_dispatch._fetch_file_contents(
+            "tok", "o", "r", ("dir/a b#c.py",), "deadbeef"
+        )
+    assert out == {"dir/a b#c.py": "x"}
+    got = captured[0]
+    assert "/contents/dir/a%20b%23c.py" in got  # space→%20, #→%23, / kept
+    assert " " not in got and "#" not in got.split("?")[0]
