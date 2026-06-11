@@ -123,7 +123,7 @@ def test_record_idempotent(_ddb_table):
 
 
 def test_record_preserves_installed_at_on_rewrite(_ddb_table):
-    """Greptile P2 on PR #41 — re-record must NOT overwrite installed_at.
+    """external-review P2 on PR #41 — re-record must NOT overwrite installed_at.
     Without this guard, a permissions-accept event months later would
     silently re-stamp the row with that day's date, losing the original
     install date forever."""

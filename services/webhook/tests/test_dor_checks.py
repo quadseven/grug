@@ -58,7 +58,7 @@ def test_acceptance_falls_back_to_test_plan():
     assert check_acceptance(body).passed
 
 
-# Greptile P2 on PR #40 — error msg must reference the section the user
+# external-review P2 on PR #40 — error msg must reference the section the user
 # actually used, not always say "Acceptance criteria".
 def test_acceptance_error_msg_says_test_plan_when_thats_what_user_used():
     body = "## Test plan\n- only one"
