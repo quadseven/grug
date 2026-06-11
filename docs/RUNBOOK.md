@@ -435,6 +435,23 @@ view faceted on `@variant_id`, comparing the judge `is_real_bug` rate and the
 default is a future code slice (bake the winner into `build_system_prompt`'s
 default), not a toggle flip.
 
+**Arm-up record (2026-06-10, #276).** The cell-balance check found the live
+population is **one install** (`129256114` → the `poolside × v2` cell; the
+other three cells empty). `split` would therefore be a misleading rename of
+all-v2 — there is no within-population A/B at n=1. Decision: the toggle is set
+to **`all_v2`** and the experiment is a **temporal comparison** — v2 spans
+(post-flip) vs the all-v1 history (pre-flip) on the same judge/reaction
+metrics. Analysis surface: the [DD notebook "Grug Elder — Prompt v1 vs v2"
+(#14750419)](https://app.datadoghq.com/notebook/14750419), which also records
+the confounds: (a) the SaaS backends are unfunded by design, so arm sample
+accrues only when a cloud (in practice intermittent Poolside) answers; (b)
+**cave-fallback reviews carry no `variant_id`** — the `grug-cave-connector`
+uses its own prompt; exclude healed reviews from arm comparisons. The DD
+Playground side-by-side of the two arm prompts is a manual console step: paste
+`build_system_prompt("v1")` / `("v2")` outputs from `code_review_prompt.py`.
+Re-run the cell-balance check before ever switching to `split` — it only
+becomes meaningful once installs spread across all four cells.
+
 ### Rollback
 
 If Elder produces too many false positives or operationally misbehaves,
