@@ -89,7 +89,7 @@ def check_why(body: str) -> CheckResult:
 
 def check_acceptance(body: str) -> CheckResult:
     # Track which heading name actually matched so the failure message
-    # references the section the author used. Greptile P2 on PR #40 —
+    # references the section the author used. external-review P2 on PR #40 —
     # earlier code always said "Acceptance criteria" even when only
     # "Test plan" was present, sending users hunting for a section that
     # doesn't exist.
