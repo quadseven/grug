@@ -26,7 +26,11 @@ APEX="grug.lol"
 PROD_BRANCH="main"
 
 api() {
-    curl -sS -H "Authorization: Bearer $CF_TOKEN" -H "Content-Type: application/json" "$@"
+    # --max-time/--connect-timeout give every CF Admin API call a per-call
+    # escape valve; on timeout curl exits 28 and `set -euo pipefail` aborts
+    # the bootstrap with a clear signal instead of hanging indefinitely (#340).
+    curl -sS --connect-timeout 10 --max-time 60 \
+        -H "Authorization: Bearer $CF_TOKEN" -H "Content-Type: application/json" "$@"
 }
 
 # Detect "missing Pages:Edit token perm" error 10000 + provide actionable
