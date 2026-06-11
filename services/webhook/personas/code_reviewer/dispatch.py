@@ -102,6 +102,53 @@ def _fetch_pr_diff(
     return resp.text
 
 
+# Full-file context (#336). Cap the number of changed files we fetch full
+# content for, so a sweeping PR can't fan out into dozens of API calls or blow
+# the LLM context budget. Files beyond the cap (and any that error) degrade to
+# diff-only — correctness is unchanged, only the extra context is skipped.
+_MAX_CONTEXT_FILES = 20
+
+
+def _fetch_file_contents(
+    install_token: str,
+    owner: str,
+    repo: str,
+    paths: tuple[str, ...],
+    ref: str,
+) -> dict[str, str]:
+    """Fetch the full content of each changed file at `ref` (head SHA) so the
+    Elder + judge can see mitigations outside the diff hunk (#336 — the #1149
+    false-positive class). Best-effort: a per-file fetch failure (deleted file,
+    binary, 404, timeout) is skipped, not raised — the review still runs
+    diff-only for that file. Returns path → content for the files that fetched.
+    """
+    contents: dict[str, str] = {}
+    for path in paths[:_MAX_CONTEXT_FILES]:
+        try:
+            resp = httpx.get(
+                f"https://api.github.com/repos/{owner}/{repo}/contents/{path}",
+                params={"ref": ref},
+                headers={
+                    "Authorization": f"Bearer {install_token}",
+                    # `.raw` returns the file body directly (no base64 JSON).
+                    "Accept": "application/vnd.github.raw",
+                    "X-GitHub-Api-Version": "2022-11-28",
+                },
+                timeout=_DIFF_FETCH_TIMEOUT,
+            )
+            resp.raise_for_status()
+            contents[path] = resp.text
+        except (httpx.HTTPStatusError, httpx.RequestError) as e:
+            # Deleted-in-PR / binary / rename-old-path / transient — diff-only
+            # is the correct, safe degrade. Log so a systemic fetch outage is
+            # visible (not silently reverting every review to hunk-blind).
+            log.info(
+                "code_review_file_fetch_skipped",
+                extra={"path": path, "ref": ref, "error": str(e)},
+            )
+    return contents
+
+
 def _fetch_pr_review_comments(
     install_token: str, owner: str, repo: str, pull_number: int,
 ) -> list[dict]:
@@ -437,11 +484,31 @@ def dispatch_code_review(
         )
         return degraded
 
+    # Full-file context (#336): fetch the whole current content of each changed
+    # file at head SHA so the Elder + judge can see mitigations OUTSIDE the diff
+    # hunk (the #1149 false-positive class). Best-effort + self-guarding — any
+    # failure degrades to the pre-#336 diff-only review, never blocks it.
+    changed_paths = tuple(dict.fromkeys(h.file_path for h in hunks))
+    try:
+        file_contents = with_install_token_retry(
+            installation_id,
+            lambda token: _fetch_file_contents(
+                token, owner, repo_name, changed_paths, head_sha
+            ),
+        )
+    except (httpx.HTTPStatusError, httpx.RequestError) as e:
+        log.info(
+            "code_review_file_contents_unavailable",
+            extra={"pr": f"{owner}/{repo_name}#{pull_number}", "error": str(e)},
+        )
+        file_contents = {}
+
     # `pr_context` flows into DD LLM Obs span tags so traces are
     # filterable by repo / PR / installation in the LLM Obs UI.
     llm_response: LlmReviewResponse = review_diff(
         _to_llm_hunks(hunks),
         installation_id=installation_id,
+        file_contents=file_contents,
         pr_context={
             "installation_id": installation_id,
             "repo": f"{owner}/{repo_name}",
@@ -682,6 +749,7 @@ def dispatch_code_review(
         run_judge(
             evaluation, hunks, installation_id=installation_id,
             review_span_context=llm_response.review_span_context,
+            file_contents=file_contents,
             pr_context={
                 "installation_id": installation_id,
                 "repo": f"{owner}/{repo_name}",
