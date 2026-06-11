@@ -37,7 +37,7 @@ _RULE_NAME_RE = re.compile(r"[A-Za-z0-9_-]+")
 _BUG_CLASSES: frozenset[str] = frozenset((
     "silent failure", "correctness", "async blocker", "concurrency",
     "test fidelity", "robustness", "security", "type design",
-    "maintainability", "test coverage",
+    "maintainability", "test coverage", "performance",  # #338
 ))
 
 
@@ -275,6 +275,59 @@ RULES: tuple[ReviewRule, ...] = (
         bad_example="asyncio.create_task(send())  # never awaited",
         good_example="task = asyncio.create_task(send()); await task",
         severity="medium",
+    ),
+    # ── #338: high-value bug classes a strong reviewer must catch ──
+    ReviewRule(
+        name="missing-await",
+        bug_class="async blocker",
+        description="An `async def` coroutine called WITHOUT `await` (and not "
+        "handed to gather/create_task) — the body never runs, the return is a "
+        "coroutine object, and the bug is silent. Distinct from "
+        "sync-io-in-async (this is the forgotten-await class).",
+        bad_example="result = fetch_user(id)  # fetch_user is async; never runs",
+        good_example="result = await fetch_user(id)",
+        severity="high",
+    ),
+    ReviewRule(
+        name="query-in-loop",
+        bug_class="performance",
+        description="A database or network call inside a loop/comprehension "
+        "over a collection — the classic N+1. Each iteration round-trips; the "
+        "fix is one batched/bulk call or a join.",
+        bad_example="for u in users: rows.append(db.get(u.id))  # N queries",
+        good_example="rows = db.get_many([u.id for u in users])  # 1 query",
+        severity="medium",
+    ),
+    ReviewRule(
+        name="missing-timeout",
+        bug_class="robustness",
+        description="A network call (requests/httpx/urllib/socket) with no "
+        "timeout — a hung peer blocks the caller forever, exhausting the "
+        "worker/Lambda budget. Every outbound call needs an explicit timeout.",
+        bad_example="requests.get(url)  # no timeout — hangs on a dead peer",
+        good_example="requests.get(url, timeout=10)",
+        severity="medium",
+    ),
+    ReviewRule(
+        name="unbounded-growth",
+        bug_class="robustness",
+        description="A cache/list/dict/accumulator that grows on each call or "
+        "iteration with no eviction or size cap — an OOM/leak that only fires "
+        "under sustained load. A long-lived collection needs a bound (maxsize, "
+        "LRU, TTL).",
+        bad_example="_CACHE[key] = val  # module-level dict, never evicted",
+        good_example="_CACHE = LRUCache(maxsize=1000)",
+        severity="medium",
+    ),
+    ReviewRule(
+        name="missing-pagination",
+        bug_class="correctness",
+        description="Consuming a paginated API/list endpoint as if page one is "
+        "the whole set — silently drops every item past the first page. Loop "
+        "until the response is short, or follow the `next` link/cursor.",
+        bad_example="items = api.list()  # only page 1; rest silently dropped",
+        good_example="items = []  # loop until a short page / no cursor",
+        severity="high",
     ),
 )
 
