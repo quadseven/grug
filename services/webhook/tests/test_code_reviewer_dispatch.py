@@ -75,7 +75,7 @@ def test_dispatch_advisory_mode_posts_neutral_check_and_comment_review(monkeypat
     posted_check = []
     posted_review = []
 
-    def _fake_review_diff(hunks, installation_id, pr_context=None):
+    def _fake_review_diff(hunks, installation_id, pr_context=None, file_contents=None):
         return llm
 
     def _fake_post_check_run(install_token, owner, repo, result, external_id=None):
@@ -798,7 +798,7 @@ def test_dispatch_passes_pr_context_to_review_diff(monkeypatch):
     this, all traces would look identical in the LLM Obs UI."""
     captured = []
 
-    def _fake_review_diff(hunks, installation_id, pr_context=None):
+    def _fake_review_diff(hunks, installation_id, pr_context=None, file_contents=None):
         captured.append(pr_context)
         return LlmReviewResponse(kind="no_diff")
 
@@ -830,18 +830,23 @@ def test_dispatch_fetches_diff_with_diff_accept_header(monkeypatch):
     monkeypatch.setattr(cr_dispatch, "post_check_run", lambda *a, **kw: {})
     monkeypatch.setattr(cr_dispatch, "post_review", lambda *a, **kw: {})
 
-    def capture_get(url, *, headers, timeout):
+    def capture_get(url, *, headers, timeout, params=None):
         captured.append({"url": url, "headers": headers, "timeout": timeout})
         return _diff_response()
 
     with patch("httpx.get", side_effect=capture_get):
         cr_dispatch.dispatch_code_review(_payload(), blocking=False)
 
-    assert len(captured) == 1
+    # First GET is the unified diff (diff Accept header).
     assert captured[0]["headers"]["Accept"] == "application/vnd.github.diff"
     assert "myorg/myrepo" in captured[0]["url"]
     assert "/pulls/7" in captured[0]["url"]
     assert captured[0]["timeout"] == cr_dispatch._DIFF_FETCH_TIMEOUT
+    # #336: subsequent GET(s) fetch full file content with the `.raw` Accept
+    # header so the Elder sees mitigations outside the diff hunk.
+    raw_gets = [c for c in captured if c["headers"].get("Accept") == "application/vnd.github.raw"]
+    assert raw_gets, "expected a full-file-content fetch with the raw Accept header"
+    assert "/contents/" in raw_gets[0]["url"]
 
 
 def test_no_single_webhook_timeout_reaches_lambda_budget():
@@ -1231,3 +1236,27 @@ def test_dispatch_reviewed_does_not_enqueue_fallback(monkeypatch):
         cr_dispatch.dispatch_code_review(_payload(), blocking=False)
 
     assert calls == []  # no fallback on a healthy review
+
+
+def test_fetch_file_contents_url_encodes_path(monkeypatch):
+    """#336 follow-up: a changed file with a space/special char must be
+    URL-encoded into the contents API path, not interpolated raw (which
+    truncates the URL → silent 404 → wrong diff-only degrade)."""
+    captured = []
+
+    def cap(url, *, headers, timeout, params=None):
+        captured.append(url)
+        r = MagicMock(spec=httpx.Response)
+        r.status_code = 200
+        r.raise_for_status = MagicMock()
+        r.text = "x"
+        return r
+
+    with patch("httpx.get", side_effect=cap):
+        out = cr_dispatch._fetch_file_contents(
+            "tok", "o", "r", ("dir/a b#c.py",), "deadbeef"
+        )
+    assert out == {"dir/a b#c.py": "x"}
+    got = captured[0]
+    assert "/contents/dir/a%20b%23c.py" in got  # space→%20, #→%23, / kept
+    assert " " not in got and "#" not in got.split("?")[0]
