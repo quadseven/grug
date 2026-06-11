@@ -136,3 +136,33 @@ def test_run_all_returns_5():
     assert {r.name for r in results} == {
         "why", "acceptance", "estimate", "scope-fence", "issue-link",
     }
+
+
+# --- Tolerant heading matching (qualifier suffix after the canonical name) ---
+
+def test_scope_fence_tolerates_parenthetical_suffix():
+    # `## Out of scope (→ #828 go-live)` should satisfy scope-fence — the
+    # brittle exact-match used to fail this otherwise-correct header.
+    assert check_scope_fence("## Out of scope (→ #828 go-live)\n\nDeferred.").passed
+
+
+def test_scope_fence_tolerates_dash_suffix():
+    assert check_scope_fence("## Out of scope — later\n\nNot now.").passed
+
+
+def test_why_tolerates_trailing_words():
+    body = "## Why this matters\n\nbecause the bill must trend toward zero over time"
+    assert check_why(body).passed
+
+
+def test_acceptance_tolerates_test_plan_qualifier():
+    body = "## Test plan (manual)\n\n- [ ] a\n- [ ] b\n- [ ] c\n"
+    assert check_acceptance(body).passed
+
+
+def test_heading_suffix_requires_word_boundary_no_false_match():
+    # `## Summarytext` must NOT match `Summary` (no boundary char after the
+    # name) — guards against the prefix match being too loose.
+    assert not check_why("## Summarytext\n\nplenty of words here to clear five").passed
+    # but a real `## Summary ...` still works
+    assert check_why("## Summary of the change\n\nfive or more words present here").passed

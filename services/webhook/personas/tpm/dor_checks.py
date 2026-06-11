@@ -59,15 +59,33 @@ _ISSUE_LINK_PAT = re.compile(
 )
 
 
+def _heading_matches(heading: str, name: str) -> bool:
+    """True if a `## ` heading IS the canonical `name`, tolerating a trailing
+    qualifier separated by a non-word boundary.
+
+    So `## Out of scope (→ #828)`, `## Test plan — manual`, and `## Why this
+    matters` all match their canonical names, while `## Summarytext` does NOT —
+    the char right after the name must be non-alphanumeric. This replaces the
+    brittle exact-equality match that failed otherwise-correct PRs whose authors
+    appended a parenthetical/qualifier to a required header.
+    """
+    h = heading.lower().strip()
+    n = name.lower().strip()
+    if h == n:
+        return True
+    return h.startswith(n) and len(h) > len(n) and not h[len(n)].isalnum()
+
+
 def _section_text(body: str, *names: str) -> str | None:
     """Return text under the first matching ## section, or None.
 
-    Matches case-insensitively; `names` provided in priority order.
+    Matches case-insensitively and tolerates a trailing qualifier on the heading
+    (see `_heading_matches`); `names` provided in priority order.
     """
     sections = list(_SECTION_PAT.finditer(body))
     for name in names:
         for i, m in enumerate(sections):
-            if m.group(1).lower().strip() == name.lower().strip():
+            if _heading_matches(m.group(1), name):
                 start = m.end()
                 end = sections[i + 1].start() if i + 1 < len(sections) else len(body)
                 return body[start:end].strip()
