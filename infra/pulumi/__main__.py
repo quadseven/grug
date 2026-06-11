@@ -149,11 +149,14 @@ grug_tokens_cmk = kms_cmk.create("grug-tokens")
 # avoids a second `pulumi up` to wire the env var after the secret lands.
 cf_secret = cf_shared_secret.create()
 
-# ECR repo for the webhook Lambda image. Lifecycle: untagged images expire
-# after 14 days (avoids ~$0.10/GB/mo image graveyard).
+# ECR repo for the webhook Lambda image. Lifecycle: untagged expire after 14d
+# AND keep only the last 20 images — CI SHA-tags every build, so without the
+# count rule tagged images accumulated to 215 (the bulk of the repo's billed
+# storage). 20 = current deploy + generous rollback headroom.
 webhook_ecr = ecr_repo.create(
     name="grug-webhook",
     untagged_expire_days=14,
+    keep_last_images=20,
     # dev needs force_delete=True for `make rebuild` (Slice 10 #31).
     # prod stays False so `pulumi destroy --stack prod` cannot wipe
     # production images. Greptile P2 PR #59.
@@ -589,6 +592,7 @@ cloudflare_dns.create_proxied_cname(
 api_ecr = ecr_repo.create(
     name="grug-api",
     untagged_expire_days=14,
+    keep_last_images=20,  # See webhook_ecr — caps the SHA-tagged build accumulation.
     force_delete=(env == "dev"),  # See webhook_ecr above.
 )
 
