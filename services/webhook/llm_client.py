@@ -386,13 +386,55 @@ def select_prompt_variant(installation_id: int) -> PromptVariant:
     return "v1"
 
 
-def _build_messages(hunks: list[Hunk], variant: PromptVariant) -> list[dict[str, str]]:
-    user = "\n\n".join(
-        f"### {h.path}\n```diff\n{h.body}\n```" for h in hunks
+# Full-file context budget (#336). A file longer than this gets diff-only
+# (the hunk still carries the change) so a generated file / lockfile can't
+# blow the context window or the per-call cost. ~800 lines ≈ a large-but-real
+# source file; the resource-leak/cleanup case that motivated this is always
+# well within it.
+_MAX_FILE_CONTEXT_LINES = 800
+
+
+def _render_file_block(path: str, content: str | None) -> str:
+    """1-based numbered full-file context for `path`, or "" when no content
+    is available (degrade to diff-only) or the file exceeds the line budget.
+
+    The Elder flags only diff additions, but reads this whole block to see
+    mitigations (a later `finally`, an `if: always()` cleanup) that live
+    outside the changed lines — the #1149 false-positive class.
+    """
+    if not content:
+        return ""
+    lines = content.splitlines()
+    if len(lines) > _MAX_FILE_CONTEXT_LINES:
+        return ""
+    numbered = "\n".join(f"{i}: {ln}" for i, ln in enumerate(lines, 1))
+    return (
+        "FULL FILE (current content; flag only diff additions, but read the "
+        f"whole file for context):\n```\n{numbered}\n```\n"
     )
+
+
+def _build_messages(
+    hunks: list[Hunk],
+    variant: PromptVariant,
+    file_contents: dict[str, str] | None = None,
+) -> list[dict[str, str]]:
+    # `file_contents` maps path → full file content at head SHA. Optional and
+    # backward-compatible: when empty (fetch disabled/failed), the per-hunk
+    # output is byte-identical to the pre-#336 diff-only shape. The full-file
+    # block is rendered ONCE per path (on its first hunk), not per hunk.
+    contents = file_contents or {}
+    shown: set[str] = set()
+    parts: list[str] = []
+    for h in hunks:
+        ctx = ""
+        if h.path not in shown:
+            ctx = _render_file_block(h.path, contents.get(h.path))
+            shown.add(h.path)
+        parts.append(f"### {h.path}\n{ctx}```diff\n{h.body}\n```")
     return [
         {"role": "system", "content": _SYSTEM_PROMPTS[variant]},
-        {"role": "user", "content": user},
+        {"role": "user", "content": "\n\n".join(parts)},
     ]
 
 
@@ -570,6 +612,7 @@ def review_diff(
     hunks: list[Hunk],
     installation_id: int,
     pr_context: Optional[PrContext] = None,
+    file_contents: dict[str, str] | None = None,
 ) -> LlmReviewResponse:
     """Send `hunks` to the round-robin-selected LLM and return findings.
 
@@ -591,7 +634,7 @@ def review_diff(
         Backend.OPENROUTER if primary == Backend.POOLSIDE else Backend.POOLSIDE
     )
     variant = select_prompt_variant(installation_id)  # #191 A/B arm
-    messages = _build_messages(hunks, variant)
+    messages = _build_messages(hunks, variant, file_contents)
     pr_tags = _llmobs_tags(pr_context)
 
     last_error = ""
@@ -799,14 +842,28 @@ class FindingJudgement:
 
 
 def _build_judge_messages(
-    findings_repr: list[JudgeFindingRepr], hunks: list[Hunk],
+    findings_repr: list[JudgeFindingRepr],
+    hunks: list[Hunk],
+    file_contents: dict[str, str] | None = None,
 ) -> list[dict[str, str]]:
-    """Compose the judge prompt: the diff hunks + a numbered finding list.
-    `findings_repr` is a primitive list-of-dicts (NOT persona `Finding`)
-    so this lower-layer module doesn't import the persona package."""
-    diff_block = "\n\n".join(
-        f"### {h.path}\n```diff\n{h.body}\n```" for h in hunks
-    )
+    """Compose the judge prompt: full-file context + diff hunks + a numbered
+    finding list. `findings_repr` is a primitive list-of-dicts (NOT persona
+    `Finding`) so this lower-layer module doesn't import the persona package.
+
+    The judge gets the SAME whole-file context as the reviewer (#336) — a
+    judge blind to the cleanup/guard outside the hunk rubber-stamps the same
+    false positives it exists to catch.
+    """
+    contents = file_contents or {}
+    shown: set[str] = set()
+    blocks: list[str] = []
+    for h in hunks:
+        ctx = ""
+        if h.path not in shown:
+            ctx = _render_file_block(h.path, contents.get(h.path))
+            shown.add(h.path)
+        blocks.append(f"### {h.path}\n{ctx}```diff\n{h.body}\n```")
+    diff_block = "\n\n".join(blocks)
     finding_lines = "\n".join(
         f"{i}. [{f.get('severity', '?')}] {f.get('rule_name', '?')} "
         f"@ {f.get('file', '?')}:{f.get('line', '?')} — {f.get('message', '')}"
@@ -873,6 +930,7 @@ def judge_findings(
     hunks: list[Hunk],
     installation_id: int,
     pr_context: Optional[PrContext] = None,
+    file_contents: dict[str, str] | None = None,
 ) -> tuple[FindingJudgement, ...]:
     """Second LLM call: grade each finding as real-bug vs false-positive.
 
@@ -903,7 +961,7 @@ def judge_findings(
     # overlap. Extract at the 3rd backend (rule-of-three), not now.
     backend = select_backend(installation_id)
     config = _BACKEND_CONFIGS[backend]
-    messages = _build_judge_messages(findings_repr, hunks)
+    messages = _build_judge_messages(findings_repr, hunks, file_contents)
     pr_tags = _llmobs_tags(pr_context)
     start_ns = time.monotonic_ns()
 

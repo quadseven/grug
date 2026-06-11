@@ -1232,3 +1232,59 @@ def test_submit_finding_evaluation_skips_when_no_span_context(monkeypatch) -> No
         review_span_context=None, tags={},
     )
     assert eval_calls == []
+
+
+# ── #336: full-file context (kills the #1149 "mitigation outside the hunk"
+#    false-positive class without breaking the diff-only backward path) ──
+
+def test_build_messages_diff_only_is_backward_compatible():
+    """No file_contents → byte-identical to the pre-#336 diff-only shape."""
+    hunks = [Hunk(path="src/x.py", body="@@ -1,2 +1,3 @@\n a\n+b")]
+    msgs = lc._build_messages(hunks, "v1")
+    assert msgs[1]["content"] == "### src/x.py\n```diff\n@@ -1,2 +1,3 @@\n a\n+b\n```"
+    # and explicitly identical whether file_contents is None or {}
+    assert lc._build_messages(hunks, "v1", {}) == msgs
+
+
+def test_build_messages_includes_full_file_when_provided():
+    """With file_contents, the numbered full file precedes the diff so the
+    Elder can see a cleanup/guard outside the changed lines."""
+    hunks = [Hunk(path="ci.yml", body="@@ -5,1 +5,2 @@\n a\n+b")]
+    file_contents = {"ci.yml": "line-one\nline-two\nrm -f /tmp/x  # cleanup"}
+    content = lc._build_messages(hunks, "v1", file_contents)[1]["content"]
+    assert "FULL FILE" in content
+    assert "1: line-one" in content                 # 1-based line numbers
+    assert "3: rm -f /tmp/x  # cleanup" in content   # the mitigation is visible
+    assert "```diff\n@@ -5,1 +5,2 @@" in content     # diff still present
+
+
+def test_render_file_block_skips_oversized_file():
+    """A file beyond the line budget degrades to diff-only (token guard)."""
+    big = "\n".join(f"x{i}" for i in range(lc._MAX_FILE_CONTEXT_LINES + 1))
+    assert lc._render_file_block("big.py", big) == ""
+    assert lc._render_file_block("none.py", None) == ""
+    assert lc._render_file_block("none.py", "") == ""
+
+
+def test_build_messages_renders_file_block_once_per_path():
+    """Two hunks in one file → the full-file block appears exactly once."""
+    hunks = [
+        Hunk(path="a.py", body="@@ -1 +1 @@\n+x"),
+        Hunk(path="a.py", body="@@ -9 +9 @@\n+y"),
+    ]
+    content = lc._build_messages(hunks, "v1", {"a.py": "one\ntwo"})[1]["content"]
+    assert content.count("FULL FILE") == 1
+
+
+def test_build_judge_messages_includes_full_file_when_provided():
+    """The judge gets the same whole-file context — a judge blind to the
+    cleanup rubber-stamps the FP it exists to catch."""
+    hunks = [Hunk(path="ci.yml", body="@@ -5 +5 @@\n+b")]
+    msgs = lc._build_judge_messages(
+        [{"severity": "medium", "rule_name": "resource-leak",
+          "file": "ci.yml", "line": "5", "message": "no cleanup"}],
+        hunks,
+        {"ci.yml": "open()\nrm -f /tmp/x"},
+    )
+    assert "FULL FILE" in msgs[1]["content"]
+    assert "2: rm -f /tmp/x" in msgs[1]["content"]

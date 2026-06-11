@@ -163,3 +163,21 @@ def test_covers_core_audit_bug_classes():
         "mock",        # mock-vs-real exception divergence
     ):
         assert needle in blob.lower(), f"missing audit bug class: {needle}"
+
+
+def test_prompt_teaches_whole_file_mitigation_scan():
+    """#336: the Elder is told to scan the WHOLE file for an existing
+    mitigation before flagging robustness/security defects (the #1149
+    resource-leak false positive)."""
+    p = crp.build_system_prompt()
+    assert "WHOLE TABLET" in p or "whole file" in p.lower()
+    assert "if: always()" in p          # names the exact infra-cleanup shape
+    assert "finally" in p
+
+
+def test_prompt_teaches_path_is_not_secret():
+    """#336: a file PATH is not a secret value — closes the #1149 CRITICAL
+    secret-in-log false positive."""
+    p = crp.build_system_prompt()
+    assert "KUBECONFIG=/tmp/x" in p
+    assert "not the secret value" in p

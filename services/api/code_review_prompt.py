@@ -182,8 +182,11 @@ RULES: tuple[ReviewRule, ...] = (
     ReviewRule(
         name="secret-in-log-or-trace",
         bug_class="security",
-        description="A token, key, password, or PII written to logs, an "
-        "exception message, or an observability span.",
+        description="The VALUE of a token, key, password, or PII written to "
+        "logs, an exception message, or an observability span. A variable "
+        "holding a file PATH, key-name, or reference is NOT the secret value "
+        "— writing `KUBECONFIG=/tmp/x` (a path) to an env or log is safe and "
+        "must NOT be flagged; only the secret value itself counts.",
         bad_example="log.info('auth', extra={'token': token})",
         good_example="log.info('auth', extra={'token_len': len(token)})",
         severity="critical",
@@ -191,8 +194,10 @@ RULES: tuple[ReviewRule, ...] = (
     ReviewRule(
         name="resource-leak",
         bug_class="robustness",
-        description="A file/socket/connection/lock acquired without a "
-        "context manager or finally — leaks on the exception path.",
+        description="A file/socket/connection/lock acquired with no cleanup "
+        "ANYWHERE in the file — leaks on the exception path. First scan the "
+        "whole file: if a later `finally`, `with`, `if: always()` teardown, "
+        "or explicit close/rm releases it, it is NOT a leak — do not flag.",
         bad_example="f = open(p); data = f.read()",
         good_example="with open(p) as f:\n    data = f.read()",
         severity="medium",
@@ -282,10 +287,34 @@ PromptVariant = Literal["v1", "v2"]
 
 _PREAMBLE_HEAD = (
     "You are Grug Elder, wisest of the cavemen and senior code reviewer for "
-    "the Grug bot. Review the supplied "
-    "diff hunks against the rules below. Flag ONLY concrete, actionable "
-    "instances you can point to a specific changed line for — not stylistic "
-    "preferences. If the diff is clean, return an empty findings list.\n"
+    "the Grug bot. For each changed file you are given the diff of what "
+    "changed and — when available — the file's FULL current content for "
+    "context. Review the changed lines against the rules below, using the "
+    "whole file to judge them. Flag ONLY concrete, actionable instances you "
+    "can point to a specific changed line for — not stylistic preferences. "
+    "If the diff is clean, return an empty findings list.\n"
+)
+# WHOLE-TABLET WISDOM (#336). Two false positives on infra PR #1149 came from
+# judging a hunk blind: (1) flagging "no cleanup" for a resource when an
+# `if: always()` rm lived ~50 lines below the hunk, and (2) flagging
+# "secret-in-log" when only a file PATH (not the secret value) was exported to
+# an env file. The Elder now receives the WHOLE file, so a mitigation outside
+# the changed lines is VISIBLE — this clause makes him READ it before he speaks,
+# and teaches the path-vs-value distinction. A defect the file already cures is
+# no defect.
+_MITIGATION_SCAN = (
+    "READ THE WHOLE TABLET — before emitting any robustness or security "
+    "finding (missing-error-handling, resource-leak, secret-in-log-or-trace, "
+    "broad-except-masks-bug, silent-exception-swallow), scan the ENTIRE file "
+    "for a mitigation that already handles the concern: a later "
+    "`finally`/`with`/cleanup, an `if: always()` teardown step, a `try` "
+    "enclosing the call, an `::add-mask::`, a guard above the line. If the "
+    "file already handles it, the line is NOT defective — OMIT it. "
+    "Know also the SECRET from the NAME of a secret: a variable assigned a "
+    "file PATH, filename, key-name, or reference is not the secret value. "
+    "Writing a PATH like `KUBECONFIG=/tmp/x` to an env or log is safe; flag "
+    "secret-in-log-or-trace ONLY when the secret VALUE itself flows into a "
+    "log, echo, trace, or env. "
 )
 # v1 — PRECISION-biased (default). A small model over-reports by pattern-
 # matching the vivid bad-examples; bias toward recall-loss over noise (an
@@ -379,6 +408,11 @@ def build_system_prompt(variant: PromptVariant = "v1") -> str:
             f"unknown prompt variant {variant!r}; "
             f"expected one of {sorted(_CONFIDENCE_CLAUSES)}"
         )
-    preamble = _PREAMBLE_HEAD + _CONFIDENCE_CLAUSES[variant] + _PREAMBLE_TAIL
+    preamble = (
+        _PREAMBLE_HEAD
+        + _CONFIDENCE_CLAUSES[variant]
+        + _MITIGATION_SCAN
+        + _PREAMBLE_TAIL
+    )
     rules_block = "\n".join(_render_rule(r) for r in RULES)
     return f"{preamble}\n\n{_VOICE}\n\nRULES:\n{rules_block}\n\n{_OUTPUT_CONTRACT}"
