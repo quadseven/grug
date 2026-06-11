@@ -51,7 +51,7 @@ def test_run_judge_submits_one_eval_per_finding(monkeypatch):
 
     monkeypatch.setattr(
         cr_judge, "judge_findings",
-        lambda fr, h, installation_id, pr_context=None: (
+        lambda fr, h, installation_id, pr_context=None, file_contents=None: (
             FindingJudgement(0, True, "real"),
             FindingJudgement(1, False, "nit"),
         ),
@@ -87,7 +87,7 @@ def test_run_judge_converts_diffhunks_to_wire_hunks(monkeypatch):
     captured: dict = {}
     monkeypatch.setattr(
         cr_judge, "judge_findings",
-        lambda fr, h, installation_id, pr_context=None: (
+        lambda fr, h, installation_id, pr_context=None, file_contents=None: (
             captured.update(hunks=list(h)) or (FindingJudgement(0, True, "real"),)
         ),
     )

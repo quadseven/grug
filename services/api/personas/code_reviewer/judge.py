@@ -71,6 +71,7 @@ def run_judge(
     *,
     review_span_context: Optional[dict],
     pr_context: Optional[PrContext] = None,
+    file_contents: Optional[dict[str, str]] = None,
 ) -> None:
     """Grade the evaluation's findings and submit DD LLM Obs evals.
 
@@ -102,6 +103,7 @@ def run_judge(
             [Hunk(path=h.file_path, body=h.body) for h in hunks],
             installation_id=installation_id,
             pr_context=pr_context,
+            file_contents=file_contents,
         )
         # Map verdict.finding_index → finding. A verdict whose index is
         # out of range (hallucinated) or absent is dropped — only
