@@ -84,7 +84,7 @@ def record_installation(
 
     Uses an atomic UpdateExpression with `if_not_exists(installed_at)`
     so concurrent duplicate webhook deliveries can't race-overwrite
-    the original install timestamp (Codex P2 follow-up to Greptile P2
+    the original install timestamp (Codex P2 follow-up to external-review P2
     on PR #41 — read-then-put had a race window between two concurrent
     Lambda invocations).
     """

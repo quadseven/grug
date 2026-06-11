@@ -2,7 +2,7 @@
 
 Mirrored from services/webhook/tests/test_section_h3_no_truncate.py.
 The api Lambda also imports `personas.tpm.dor_checks` for self-check
-endpoints, so the same regex fix needs the same coverage. Greptile P2
+endpoints, so the same regex fix needs the same coverage. external-review P2
 on PR #58.
 """
 
