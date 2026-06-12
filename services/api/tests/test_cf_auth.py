@@ -47,6 +47,10 @@ def _build_app(*, secret_loader=None):
     else:
         app.add_middleware(CfAuthMiddleware, secret_loader=secret_loader)
 
+    @app.get("/readyz")
+    def readyz():
+        return {"status": "ready"}
+
     @app.get("/livez")
     def livez():
         return {"status": "ok"}
@@ -63,6 +67,14 @@ def test_livez_always_bypasses_check_when_strict() -> None:
     app = _build_app(secret_loader=lambda: "real-secret")
     client = TestClient(app)
     r = client.get("/livez")
+    assert r.status_code == 200
+
+
+def test_readyz_always_bypasses_check_when_strict() -> None:
+    """DD synthetic uptime + smoke tests must reach /readyz without the header."""
+    app = _build_app(secret_loader=lambda: "real-secret")
+    client = TestClient(app)
+    r = client.get("/readyz")
     assert r.status_code == 200
 
 
