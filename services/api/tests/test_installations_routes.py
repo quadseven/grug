@@ -19,42 +19,11 @@ from fastapi import HTTPException
 
 
 @pytest.fixture
-def _mod(monkeypatch):
-    moto = pytest.importorskip("moto")
-    from moto import mock_aws  # type: ignore
+def _mod(pg_store):
+    """Post-#354 swap: delegates to the shared real-Postgres fixture."""
+    import installations as inst_routes
 
-    with mock_aws():
-        monkeypatch.setenv("AWS_DEFAULT_REGION", "us-east-1")
-        monkeypatch.setenv("GRUG_DDB_TABLE", "grug-main-test")
-        ddb = boto3.client("dynamodb", region_name="us-east-1")
-        ddb.create_table(
-            TableName="grug-main-test",
-            KeySchema=[
-                {"AttributeName": "PK", "KeyType": "HASH"},
-                {"AttributeName": "SK", "KeyType": "RANGE"},
-            ],
-            AttributeDefinitions=[
-                {"AttributeName": "PK", "AttributeType": "S"},
-                {"AttributeName": "SK", "AttributeType": "S"},
-                {"AttributeName": "GSI1PK", "AttributeType": "S"},
-                {"AttributeName": "GSI1SK", "AttributeType": "S"},
-            ],
-            BillingMode="PAY_PER_REQUEST",
-            GlobalSecondaryIndexes=[{
-                "IndexName": "GSI1",
-                "KeySchema": [
-                    {"AttributeName": "GSI1PK", "KeyType": "HASH"},
-                    {"AttributeName": "GSI1SK", "KeyType": "RANGE"},
-                ],
-                "Projection": {"ProjectionType": "ALL"},
-            }],
-        )
-        import importlib
-        import adapters.install_store as ins
-        importlib.reload(ins)
-        import installations as inst
-        importlib.reload(inst)
-        yield inst
+    yield inst_routes
 
 
 def _user(user_id="100", role="user"):
