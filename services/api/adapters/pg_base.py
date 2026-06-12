@@ -33,10 +33,12 @@ first pool acquisition; concurrent bootstrappers are safe (IF NOT EXISTS
 from __future__ import annotations
 
 import base64
+import binascii
 import logging
 import os
 import threading
 import time
+from decimal import Decimal
 from typing import Any
 
 import psycopg
@@ -96,18 +98,31 @@ def get_pool() -> ConnectionPool:
                     min_size=1,
                     max_size=int(os.environ.get("GRUG_PG_POOL_MAX", "5")),
                     open=True,
+                    # Validate connections at checkout: long-lived pools
+                    # accumulate dead sockets across idle timeouts (and
+                    # Lambda freeze/thaw in the interim deploy shape) -
+                    # without this the FIRST request per stale socket
+                    # 500s (audit M5).
+                    check=ConnectionPool.check_connection,
+                    max_idle=300,
                 )
-                with pool.connection() as conn:
-                    # Advisory lock so N replicas bootstrapping at once
-                    # don't race the CREATEs (IF NOT EXISTS is safe but
-                    # noisy under contention).
-                    conn.execute("SELECT pg_advisory_lock(%s)", (_BOOTSTRAP_LOCK_KEY,))
-                    try:
-                        conn.execute(_SCHEMA)
-                    finally:
+                try:
+                    with pool.connection() as conn:
+                        # TRANSACTION-scoped advisory lock (audit C1): the
+                        # session-scoped variant is NOT released by abort,
+                        # so a failed CREATE would leak the lock into the
+                        # orphaned pool and every retry fleet-wide would
+                        # block forever inside pg_advisory_lock. The xact
+                        # lock auto-releases on commit AND abort, and the
+                        # original error stays the visible one.
                         conn.execute(
-                            "SELECT pg_advisory_unlock(%s)", (_BOOTSTRAP_LOCK_KEY,)
+                            "SELECT pg_advisory_xact_lock(%s)",
+                            (_BOOTSTRAP_LOCK_KEY,),
                         )
+                        conn.execute(_SCHEMA)
+                except BaseException:
+                    pool.close()
+                    raise
                 _pool = pool
     return _pool
 
@@ -125,6 +140,11 @@ def reset_pool_for_tests() -> None:
 def _encode_value(v: Any) -> Any:
     if isinstance(v, bytes):
         return {"__b64__": base64.b64encode(v).decode("ascii")}
+    # boto3 resource-mode returns EVERY DDB number as Decimal; the cutover
+    # migration feeds those items straight in and json.dumps would raise
+    # on the first row otherwise (audit H3).
+    if isinstance(v, Decimal):
+        return int(v) if v == v.to_integral_value() else float(v)
     if isinstance(v, dict):
         return {k: _encode_value(x) for k, x in v.items()}
     if isinstance(v, list):
@@ -138,8 +158,15 @@ def _encode_value(v: Any) -> Any:
 
 def _decode_value(v: Any) -> Any:
     if isinstance(v, dict):
-        if set(v.keys()) == {"__b64__"}:
-            return base64.b64decode(v["__b64__"])
+        if set(v.keys()) == {"__b64__"} and isinstance(v["__b64__"], str):
+            # Guarded decode (audit M6): a colliding/corrupt sentinel in
+            # opaque persisted dicts must degrade to the raw dict, not
+            # throw binascii.Error inside a whole-batch read.
+            try:
+                return base64.b64decode(v["__b64__"], validate=True)
+            except (binascii.Error, ValueError):
+                log.warning("b64_sentinel_decode_failed_returning_raw")
+                return v
         return {k: _decode_value(x) for k, x in v.items()}
     if isinstance(v, list):
         return [_decode_value(x) for x in v]
@@ -158,17 +185,6 @@ def decode_item(pk: str, sk: str, data: dict[str, Any]) -> dict[str, Any]:
     item["SK"] = sk
     return item
 
-
-def split_special(attrs: dict[str, Any]) -> tuple[dict[str, Any], str | None, str | None, int | None]:
-    """Lift GSI1PK/GSI1SK/ttl out of an attr dict into their columns.
-
-    They STAY in `data` too (DDB keeps them as plain attributes); the
-    columns exist for indexing/filtering only.
-    """
-    gsi1pk = attrs.get("GSI1PK")
-    gsi1sk = attrs.get("GSI1SK")
-    ttl = attrs.get("ttl")
-    return attrs, gsi1pk, gsi1sk, int(ttl) if ttl is not None else None
 
 
 def maybe_purge_expired() -> None:

@@ -129,7 +129,17 @@ def is_install_allowlisted(install_id: int) -> bool:
             extra={"install_id": install_id},
         )
         return False
-    user = _get_item(_user_pk(user_id), "META")
+    # PROJECTED read (audit H2): the DDB original used
+    # ProjectionExpression="allowlisted" so the webhook NEVER holds the
+    # OAuth blobs that live on the same row; Postgres has no IAM
+    # projection, so this query is the enforcement now.
+    with get_pool().connection() as conn:
+        row = conn.execute(
+            f"SELECT data->'allowlisted' FROM grug_kv "
+            f"WHERE pk = %s AND sk = 'META' AND {TTL_LIVE}",
+            (_user_pk(user_id),),
+        ).fetchone()
+    user = {"allowlisted": row[0]} if row is not None else None
     if not user:
         log.info(
             "allowlist_miss_no_user",
@@ -154,7 +164,8 @@ def list_allowlisted_installs() -> list[int]:
     """
     with get_pool().connection() as conn:
         rows = conn.execute(
-            f"SELECT pk FROM grug_kv WHERE sk = 'META' AND pk LIKE 'INST#%%' AND {TTL_LIVE}"
+            f"SELECT pk FROM grug_kv WHERE sk = 'META' AND pk LIKE %s AND {TTL_LIVE}",
+            ("INST#%",),
         ).fetchall()
     install_ids: list[int] = []
     for (pk,) in rows:
@@ -232,7 +243,13 @@ def get_repo_config(install_id: int, repo_id: int) -> dict[str, Any]:
 
 def _merge_attrs(pk: str, sk: str, attrs: dict[str, Any]) -> None:
     """Sparse jsonb merge-upsert (DDB update_item SET parity: creates the
-    row when absent, merges fields when present)."""
+    row when absent, merges fields when present).
+
+    Known divergence (audit L8, deliberate): merging into a TTL-EXPIRED
+    row does not clear its ttl - the write lands on a row reads ignore
+    and the purge later removes. DDB would resurrect a sparse live row
+    (its own latent bug: such rows KeyError in the list readers). The
+    PG behavior is the safer of the two."""
     with get_pool().connection() as conn:
         conn.execute(
             """
@@ -462,7 +479,7 @@ def list_check_verdicts(
             f"""
             SELECT pk, sk, data FROM grug_kv
             WHERE pk = %s AND sk LIKE 'ACT#%%' AND {TTL_LIVE}
-            ORDER BY data->>'created_at' DESC
+            ORDER BY data->>'created_at' COLLATE "C" DESC
             """,
             (_inst_pk(install_id),),
         ).fetchall()

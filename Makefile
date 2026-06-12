@@ -45,6 +45,8 @@ api-test:
 # GRUG_TEST_DATABASE_URL (CI: workflow service container) - they skip
 # loudly otherwise; sqlite stand-ins are banned for these semantics.
 pg-test:
+	@if [ -n "$$CI" ] && [ -z "$$GRUG_TEST_DATABASE_URL" ]; then \
+		echo "FATAL: pg tests would SKIP in CI (GRUG_TEST_DATABASE_URL unset) - a skipped gate is a silent pass (audit H4)"; exit 1; fi
 	cd services/api && uv run --with pytest --with "psycopg[binary,pool]" --with boto3 --with cryptography pytest tests/test_pg_stores.py -q -rs
 
 pulumi-preview:
