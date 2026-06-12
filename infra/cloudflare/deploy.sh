@@ -199,7 +199,7 @@ except (json.JSONDecodeError, ValueError):
 }
 
 deploy_one "grug-webhook-host-rewrite" "webhook.grug.lol/*" "webhook_function_url" "/grug/webhook-upstream-host"
-deploy_one "grug-api-host-rewrite"     "api.grug.lol/*"     "api_function_url"
+deploy_one "grug-api-host-rewrite"     "api.grug.lol/*"     "api_function_url" "/grug/api-upstream-host"
 
 echo "Done. Smoke:"
 echo "  curl -i -X POST https://webhook.grug.lol/webhook/github -H 'X-Hub-Signature-256: sha256=invalid' -d '{}'  # → 401 (HMAC)"
