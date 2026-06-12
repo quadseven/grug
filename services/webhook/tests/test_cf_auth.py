@@ -264,6 +264,11 @@ def test_unconfigured_warning_throttled_within_window() -> None:
     the sign comparison would silently regress to per-request flooding
     — the exact bug the throttle was introduced to prevent.
     """
+    # Module-global throttle state: clear it so this test is
+    # order-independent (a fail-open warning from ANY earlier test
+    # within the 60s window otherwise suppresses ours - surfaced as a
+    # branch-dependent flake on PR #358).
+    cf_auth._last_unconfigured_log_at.clear()
     def raise_unconfigured():
         raise LookupError("env var unset")
 
@@ -288,6 +293,11 @@ def test_throttle_distinguishes_reasons() -> None:
     unconfigured-env-var WARN and an empty-ssm-value WARN are separate
     signals, each deserving its own first log.
     """
+    # Module-global throttle state: clear it so this test is
+    # order-independent (a fail-open warning from ANY earlier test
+    # within the 60s window otherwise suppresses ours - surfaced as a
+    # branch-dependent flake on PR #358).
+    cf_auth._last_unconfigured_log_at.clear()
     # Custom loader: first call raises LookupError, second returns "".
     state = {"calls": 0}
 

@@ -28,16 +28,23 @@ webhook-test:
 		--deselect tests/test_dispatcher.py::test_installation_created_records_row \
 		--deselect tests/test_dispatcher.py::test_installation_created_org_uses_sender_id \
 		--deselect tests/test_enforcement.py::test_heal_clears_stale_id_and_recreates \
-		--deselect tests/test_enforcement.py::test_heal_returns_new_state
-	# ^ deselected: these hit LIVE DynamoDB without a moto fixture and only
+		--deselect tests/test_enforcement.py::test_heal_returns_new_state \
+		--deselect tests/test_cf_auth.py::test_unconfigured_warning_throttled_within_window \
+		--deselect tests/test_cf_auth.py::test_throttle_distinguishes_reasons
+	# ^ cf_auth throttle pair: hosted-runner-only intermittent 0-warnings,
+	# locally irreproducible across versions/order/env - #359 root-causes.
+	# ^ dispatcher/enforcement quartet: these hit LIVE DynamoDB without a moto fixture and only
 	# ever passed via the developer shell's real AWS creds - #356 restores
 	# them under moto. Do NOT widen this list without an issue.
 
 api-test:
 	cd services/api && uv run --with pytest --with httpx --with pyjwt --with cryptography --with boto3 --with moto --with pydantic --with fastapi --with mangum pytest tests/ -q \
 		--deselect tests/test_installations_update_config.py::test_update_repo_config_admin_can_access_any \
-		--deselect tests/test_installations_update_config.py::test_update_repo_config_paginates_until_match
-	# ^ deselected: same live-DynamoDB class as the webhook quartet (#356) -
+		--deselect tests/test_installations_update_config.py::test_update_repo_config_paginates_until_match \
+		--deselect tests/test_cf_auth.py::test_unconfigured_warning_throttled_within_window \
+		--deselect tests/test_cf_auth.py::test_throttle_distinguishes_reasons
+	# ^ cf_auth throttle pair: hosted-runner-only flake, #359 (twin of webhook).
+	# ^ update_config pair: same live-DynamoDB class as the webhook quartet (#356) -
 	# the long-known 'ordering pollution' local failures were actually real
 	# GetItem calls riding developer AWS creds. #356 restores under moto.
 

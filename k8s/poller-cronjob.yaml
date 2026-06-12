@@ -1,0 +1,61 @@
+# Reaction poller (#354): the EventBridge-scheduled Lambda becomes a
+# CronJob invoking the SAME handler. Image placeholders rewritten at
+# deploy like the Deployments.
+apiVersion: batch/v1
+kind: CronJob
+metadata:
+  name: grug-poller
+  namespace: grug
+  labels: {app: grug-poller}
+spec:
+  schedule: "*/15 * * * *"
+  concurrencyPolicy: Forbid
+  successfulJobsHistoryLimit: 2
+  failedJobsHistoryLimit: 3
+  jobTemplate:
+    spec:
+      backoffLimit: 1
+      activeDeadlineSeconds: 600
+      template:
+        metadata:
+          labels:
+            app: grug-poller
+            tags.datadoghq.com/service: grug-poller
+            tags.datadoghq.com/env: prod
+        spec:
+          restartPolicy: Never
+          automountServiceAccountToken: false
+          nodeSelector:
+            kubernetes.io/arch: arm64
+          imagePullSecrets:
+            - name: registry-pull
+          securityContext:
+            runAsNonRoot: true
+            runAsUser: 10001
+            seccompProfile: {type: RuntimeDefault}
+          containers:
+            - name: poller
+              image: REGISTRY_PLACEHOLDER/grug-webhook:TAG_PLACEHOLDER
+              # ddtrace-run so poller spans are not silently dropped (review F4).
+              command: ["ddtrace-run", "python", "-c", "from poller_handler import handler; handler({}, None)"]
+              envFrom:
+                - secretRef: {name: grug-secrets}
+              env:
+                - {name: DD_SERVICE, value: grug-poller}
+                - {name: DD_ENV, value: prod}
+                - name: DD_VERSION
+                  value: TAG_PLACEHOLDER
+                - name: DD_AGENT_HOST
+                  valueFrom: {fieldRef: {fieldPath: status.hostIP}}
+              resources:
+                requests: {cpu: 50m, memory: 192Mi}
+                limits: {memory: 512Mi}
+              securityContext:
+                allowPrivilegeEscalation: false
+                readOnlyRootFilesystem: true
+                capabilities: {drop: ["ALL"]}
+              volumeMounts:
+                - {name: tmp, mountPath: /tmp}
+          volumes:
+            - name: tmp
+              emptyDir: {sizeLimit: 64Mi}

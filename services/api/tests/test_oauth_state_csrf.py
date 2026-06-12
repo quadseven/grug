@@ -64,7 +64,10 @@ def test_verify_rejects_tampered_timestamp(_oauth_mod):
 def test_verify_rejects_tampered_random(_oauth_mod):
     state = _oauth_mod._make_state()
     rand, ts, sig = state.split(".")
-    bad_rand = "X" + rand[1:]
+    # Guaranteed-different first char: "X" + rand[1:] was a NO-OP tamper
+    # whenever rand already started with X (~1.6% of runs for base64url) -
+    # a probabilistic flake the new CI gate finally caught.
+    bad_rand = ("X" if rand[0] != "X" else "Y") + rand[1:]
     assert _oauth_mod._verify_state(f"{bad_rand}.{ts}.{sig}") is False
 
 
