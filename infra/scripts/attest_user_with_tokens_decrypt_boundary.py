@@ -104,28 +104,35 @@ def main() -> int:
         print(f"FAIL: {USER_STORE} missing")
         return 1
 
-    tree = ast.parse(USER_STORE.read_text())
-    cls = _find_class(tree, "UserWithTokens")
-    if cls is None:
-        print(f"FAIL: {USER_STORE}: UserWithTokens class not found")
-        return 1
-
     failures: list[str] = []
 
-    if not _is_frozen_dataclass(cls):
-        failures.append("UserWithTokens is not @dataclass(frozen=True) — spec 0008 attests frozen.")
+    # Shape contract holds for the canonical file AND the staged Postgres
+    # successor (Codex F1 on PR #355: an allowed construction site that
+    # escapes shape validation could violate the very contract the
+    # allowance exists for).
+    for store_path in (USER_STORE, PG_USER_STORE):
+        if not store_path.exists():
+            continue  # PG successor is transitional; absence is fine
+        tree = ast.parse(store_path.read_text())
+        cls = _find_class(tree, "UserWithTokens")
+        if cls is None:
+            failures.append(f"{store_path.name}: UserWithTokens class not found")
+            continue
 
-    fields = _class_fields(cls)
-    extra = set(fields) - EXPECTED_FIELDS
-    missing = EXPECTED_FIELDS - set(fields)
-    if extra:
-        failures.append(f"UserWithTokens has unexpected fields: {sorted(extra)}.")
-    if missing:
-        failures.append(f"UserWithTokens missing expected fields: {sorted(missing)}.")
+        if not _is_frozen_dataclass(cls):
+            failures.append(f"{store_path.name}: UserWithTokens is not @dataclass(frozen=True) — spec 0008 attests frozen.")
 
-    refresh_ann = fields.get("oauth_refresh_token")
-    if refresh_ann is not None and not _refresh_is_optional(refresh_ann):
-        failures.append("UserWithTokens.oauth_refresh_token must be `str | None` (provider may not rotate). Got non-Optional annotation.")
+        fields = _class_fields(cls)
+        extra = set(fields) - EXPECTED_FIELDS
+        missing = EXPECTED_FIELDS - set(fields)
+        if extra:
+            failures.append(f"{store_path.name}: UserWithTokens has unexpected fields: {sorted(extra)}.")
+        if missing:
+            failures.append(f"{store_path.name}: UserWithTokens missing expected fields: {sorted(missing)}.")
+
+        refresh_ann = fields.get("oauth_refresh_token")
+        if refresh_ann is not None and not _refresh_is_optional(refresh_ann):
+            failures.append(f"{store_path.name}: UserWithTokens.oauth_refresh_token must be `str | None` (provider may not rotate). Got non-Optional annotation.")
 
     # Service-scope wall: webhook never references UserWithTokens.
     if WEBHOOK_DIR.exists():
@@ -148,7 +155,11 @@ def main() -> int:
                 continue  # canonical site + staged Postgres successor (#354)
             tree2 = ast.parse(path.read_text())
             for node in ast.walk(tree2):
-                if isinstance(node, ast.Call) and isinstance(node.func, ast.Name) and node.func.id == "UserWithTokens":
+                is_named = isinstance(node, ast.Call) and isinstance(node.func, ast.Name) and node.func.id == "UserWithTokens"
+                # Qualified form (module.UserWithTokens(...)) must not
+                # slip the wall (Codex F2 on PR #355).
+                is_attr = isinstance(node, ast.Call) and isinstance(node.func, ast.Attribute) and node.func.attr == "UserWithTokens"
+                if is_named or is_attr:
                     construction_sites.append(f"{path.relative_to(REPO_ROOT)}:{node.lineno}")
         if construction_sites:
             failures.append(
