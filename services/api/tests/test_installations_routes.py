@@ -5,7 +5,7 @@ Covers:
 - _ensure_can_access: install owner passes
 - _ensure_can_access: stranger raises 403
 - _ensure_can_access: int-vs-string user_id comparison robust
-- list_installations: returns user's installs from GSI1 query
+- list_installations: returns user's installs from the gsi1pk-indexed lookup
 - list_installations: empty for user with no installs
 - RepoConfigPayload: tpm_enabled defaults True
 - RepoConfigPayload: explicit false validates
@@ -57,7 +57,8 @@ def test_ensure_can_access_stranger_raises_403(_mod):
 
 def test_ensure_can_access_int_string_robust(_mod):
     """installed_by_user_id may be stored as int OR str depending on
-    DDB type-coercion path. Comparison must treat them as equivalent."""
+    which writer produced the row (jsonb preserves the caller's type;
+    rows migrated from DDB may differ). Treat them as equivalent."""
     install = {"installed_by_user_id": 100}  # int
     user = _user(user_id="100", role="user")  # str
     _mod._ensure_can_access(install, user)

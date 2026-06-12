@@ -1,11 +1,12 @@
 # MIRRORED — sibling at services/api/adapters/pg_install_store.py; keep in lockstep. See docs/adr/0001-mirror-with-rule-of-three-deferral.md.
-"""Postgres install store - exact-API port of install_store.py (DDB).
+"""Postgres install store - exact-API port of the DDB install_store.
 
-Same public surface, same single-table layout (see install_store.py's
-docstring for the PK/SK shapes); storage is the grug_kv table from
-pg_base.py. At cutover install_store.py's implementation is REPLACED by
-this module (no runtime dual-backend seam: DDB retires, the seam is
-git + the image tag - rule-of-three, ADR-0001).
+Same public surface, same single-table layout (see the "Single-table
+layout (grug_kv)" glossary row in CONTEXT.md / specs/DESIGN.md for the
+PK/SK shapes); storage is the grug_kv table from pg_base.py. Since the
+#354 swap install_store.py is a facade re-exporting this module (no
+runtime dual-backend seam: the rollback seam is git + the image tag -
+rule-of-three, ADR-0001).
 
 Semantics deliberately preserved from the DDB adapter:
 - record_installation: atomic upsert that PRESERVES the original

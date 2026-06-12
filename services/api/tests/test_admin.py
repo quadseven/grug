@@ -166,7 +166,7 @@ def test_patch_user_first_allowlist_writes_audit_trail(_adm):
 
 def test_scan_all_returns_every_row_for_prefix(_adm):
     """The DDB-era _scan_all capped pagination at 50 pages; its Postgres
-    replacement is an unbounded indexed SELECT. Seed past where a paging
+    replacement is a single unpaged SELECT. Seed past where a paging
     bug would bite and assert nothing is dropped + prefixes don't bleed."""
     for i in range(60):
         _seed_user(str(i), f"user{i}", "user")

@@ -9,14 +9,14 @@ Proves NECESSARY conditions for these bools:
   - `oauth_access_token_required_oauth_refresh_token_optional_per_identity_concepts`
 
 Asserts:
-  1. `services/api/adapters/user_store.py:UserWithTokens` is `@dataclass(frozen=True)`.
+  1. `services/api/adapters/pg_user_store.py:UserWithTokens` is `@dataclass(frozen=True)`.
   2. UserWithTokens carries exactly `identity`, `oauth_access_token`, `oauth_refresh_token` fields.
   3. oauth_refresh_token has type `str | None` (optional).
   4. The webhook side (`services/webhook/`) contains NO import / reference to
      `UserWithTokens` — service-scope wall per spec.
-  5. UserWithTokens construction happens ONLY in `services/api/adapters/user_store.py`
-     (search the whole repo for `UserWithTokens(...)` calls — there should be
-     exactly one site, in get_user_with_tokens).
+  5. UserWithTokens construction happens ONLY in `services/api/adapters/pg_user_store.py`
+     (search services/api/ non-test files for `UserWithTokens(...)` calls —
+     there should be exactly one site, in get_user_with_tokens).
 """
 from __future__ import annotations
 
@@ -29,7 +29,6 @@ REPO_ROOT = Path(__file__).resolve().parents[2]
 # a re-export facade with no class definitions. The shape + construction
 # walls apply to the canonical file only.
 USER_STORE = REPO_ROOT / "services/api/adapters/pg_user_store.py"
-PG_USER_STORE = USER_STORE
 WEBHOOK_DIR = REPO_ROOT / "services/webhook"
 API_DIR = REPO_ROOT / "services/api"
 
@@ -106,13 +105,11 @@ def main() -> int:
 
     failures: list[str] = []
 
-    # Shape contract holds for the canonical file AND the staged Postgres
-    # successor (Codex F1 on PR #355: an allowed construction site that
-    # escapes shape validation could violate the very contract the
-    # allowance exists for).
-    for store_path in (USER_STORE, PG_USER_STORE):
-        if not store_path.exists():
-            continue  # PG successor is transitional; absence is fine
+    # Shape contract holds for the canonical file (Codex F1 on PR #355:
+    # an allowed construction site that escapes shape validation could
+    # violate the very contract the allowance exists for). Post-swap the
+    # transitional dual-file allowance is gone.
+    for store_path in (USER_STORE,):
         tree = ast.parse(store_path.read_text())
         cls = _find_class(tree, "UserWithTokens")
         if cls is None:
@@ -151,8 +148,8 @@ def main() -> int:
         for path in API_DIR.rglob("*.py"):
             if "test" in path.name:
                 continue
-            if path in (USER_STORE, PG_USER_STORE):
-                continue  # canonical site + staged Postgres successor (#354)
+            if path == USER_STORE:
+                continue  # the sole canonical construction site
             tree2 = ast.parse(path.read_text())
             for node in ast.walk(tree2):
                 is_named = isinstance(node, ast.Call) and isinstance(node.func, ast.Name) and node.func.id == "UserWithTokens"
@@ -163,7 +160,7 @@ def main() -> int:
                     construction_sites.append(f"{path.relative_to(REPO_ROOT)}:{node.lineno}")
         if construction_sites:
             failures.append(
-                "UserWithTokens constructed outside user_store.py / pg_user_store.py (the #354-staged successor) — spec 0008 attests get_user_with_tokens is the sole construction site:\n"
+                "UserWithTokens constructed outside pg_user_store.py — spec 0008 attests get_user_with_tokens is the sole construction site:\n"
                 + "\n".join(f"    {s}" for s in construction_sites)
             )
 
