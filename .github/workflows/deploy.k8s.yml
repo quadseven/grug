@@ -157,7 +157,7 @@ jobs:
             echo "::error::unsubstituted placeholder in k8s/"; exit 1
           fi
           kubectl apply -k k8s/
-          for d in grug-webhook grug-api; do
+          for d in grug-webhook grug-api grug-consumer; do
             kubectl -n grug rollout status deploy/$d --timeout=180s
           done
           # CronJob smoke (F5): a broken image/command/secret must fail
