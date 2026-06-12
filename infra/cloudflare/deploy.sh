@@ -86,16 +86,33 @@ except (json.JSONDecodeError, ValueError):
 }
 
 deploy_one() {
-    local worker_name="$1" route_pattern="$2" pulumi_output="$3"
+    local worker_name="$1" route_pattern="$2" pulumi_output="$3" override_param="${4:-}"
 
-    local function_url
-    function_url=$(pulumi -C "$PULUMI_DIR" stack output "$pulumi_output" 2>/dev/null || true)
-    if [ -z "$function_url" ] || [ "$function_url" = "null" ]; then
-        echo "  ⚠ skip $worker_name — Pulumi output '$pulumi_output' missing (Lambda not yet deployed?)"
-        return 0
+    # k8s cutover (#354): an SSM per-worker upstream override beats the
+    # Lambda Function URL. When the override param exists, the Worker
+    # proxies to the in-cluster origin (a tunnel-served hostname; value
+    # lives in SSM, never committed - public repo). Rollback = delete
+    # the param and re-run this script: upstream reverts to the Lambda.
+    local upstream_host=""
+    if [ -n "$override_param" ]; then
+        local override
+        override=$(aws ssm get-parameter --region us-east-1 \
+            --name "$override_param" \
+            --query 'Parameter.Value' --output text 2>/dev/null || true)
+        if [ -n "$override" ] && [ "$override" != "None" ]; then
+            upstream_host="$override"
+            echo "  upstream override active ($override_param) — k8s cutover"
+        fi
     fi
-    local upstream_host
-    upstream_host=$(echo "$function_url" | sed -E 's|^https?://||; s|/$||')
+    if [ -z "$upstream_host" ]; then
+        local function_url
+        function_url=$(pulumi -C "$PULUMI_DIR" stack output "$pulumi_output" 2>/dev/null || true)
+        if [ -z "$function_url" ] || [ "$function_url" = "null" ]; then
+            echo "  ⚠ skip $worker_name — Pulumi output '$pulumi_output' missing (Lambda not yet deployed?)"
+            return 0
+        fi
+        upstream_host=$(echo "$function_url" | sed -E 's|^https?://||; s|/$||')
+    fi
 
     local worker_src="$SCRIPT_DIR/workers/$worker_name/worker.js"
     if [ ! -f "$worker_src" ]; then
@@ -181,7 +198,7 @@ except (json.JSONDecodeError, ValueError):
     fi
 }
 
-deploy_one "grug-webhook-host-rewrite" "webhook.grug.lol/*" "webhook_function_url"
+deploy_one "grug-webhook-host-rewrite" "webhook.grug.lol/*" "webhook_function_url" "/grug/webhook-upstream-host"
 deploy_one "grug-api-host-rewrite"     "api.grug.lol/*"     "api_function_url"
 
 echo "Done. Smoke:"
