@@ -139,6 +139,22 @@ def test_patch_user_role_change_persists(_adm):
     assert get_user_item("1")["role"] == "admin"
 
 
+def test_patch_user_update_race_maps_lookup_error_to_404(_adm, monkeypatch):
+    """Row vanished between the existence read and the UPDATE (raced a
+    deletion): the store's LookupError must surface as 404, not a 500."""
+    from admin import UserPatchPayload
+    from fastapi import HTTPException
+    _seed_user("1", "alice", "user")
+
+    def _vanished(user_id, fields):
+        raise LookupError("user row vanished during update")
+
+    monkeypatch.setattr(_adm, "update_user_fields", _vanished)
+    with pytest.raises(HTTPException) as e:
+        _adm.patch_user("1", UserPatchPayload(allowlisted=True), actor=_admin_user())
+    assert e.value.status_code == 404
+
+
 def test_patch_user_no_op_payload_returns_unchanged(_adm):
     from admin import UserPatchPayload
     _seed_user("1", "alice", "user")
