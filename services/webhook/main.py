@@ -14,6 +14,8 @@ from __future__ import annotations
 import logging
 import os
 
+from typing import Any
+
 from fastapi import FastAPI, Header, HTTPException, Request, status
 
 from cf_auth import CfAuthMiddleware
@@ -64,7 +66,13 @@ async def receive_github_webhook(
     x_github_event: str = Header(default=""),
     x_github_delivery: str = Header(default=""),
     x_hub_signature_256: str = Header(default=""),
-) -> dict[str, str]:
+) -> dict[str, Any]:
+    # dict[str, Any], NOT dict[str, str]: dispatch() returns an aggregated
+    # {status, personas: [...]} for pull_request events (list-shaped - see
+    # dispatcher.py's own contract comment). The narrower annotation made
+    # FastAPI's response validation 500 every dispatched PR delivery on the
+    # k8s image (caught by the #368 live proof; the Lambda image's older
+    # dependency set never enforced it).
     # Handler is async because reading raw body via Starlette's Request
     # requires `await request.body()`. Earlier sync version used
     # `body: bytes = Body(...)` but FastAPI 0.115 / Pydantic-v2
