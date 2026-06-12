@@ -12,7 +12,7 @@
 #   make rebuild            — destroy + up + image-rebuild + workers + reseed + smoke (~12-15min)
 #   make smoke              — quick prod-shape smoke test (read-only)
 
-.PHONY: test webhook-test api-test pulumi-preview pulumi-up \
+.PHONY: test webhook-test api-test pg-test pulumi-preview pulumi-up \
         tear-down rebuild bootstrap-images smoke docker-build-webhook
 
 # Admin seed defaults — the values that get re-installed after a tear-down
@@ -32,7 +32,7 @@ api-test:
 # Real-Postgres store tests (#354). REQUIRE a reachable Postgres via
 # GRUG_TEST_DATABASE_URL (CI: workflow service container) - they skip
 # loudly otherwise; sqlite stand-ins are banned for these semantics.
-test-pg:
+pg-test:
 	cd services/api && uv run --with pytest --with "psycopg[binary,pool]" --with boto3 --with cryptography pytest tests/test_pg_stores.py -q -rs
 
 pulumi-preview:
