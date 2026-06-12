@@ -24,7 +24,7 @@ GRUG_ADMIN_INSTALL_ID ?= 129256114
 test: webhook-test api-test
 
 webhook-test:
-	cd services/webhook && uv run --with pytest --with httpx --with pyjwt --with cryptography --with boto3 --with moto pytest tests/ -q
+	cd services/webhook && uv run --with pytest --with httpx --with pyjwt --with cryptography --with boto3 --with moto --with fastapi pytest tests/ -q
 
 api-test:
 	cd services/api && uv run --with pytest --with httpx --with pyjwt --with cryptography --with boto3 --with moto --with pydantic --with fastapi pytest tests/ -q
