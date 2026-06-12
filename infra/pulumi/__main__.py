@@ -346,34 +346,16 @@ _k8s_pod = k8s_pod_user.create(
 )
 
 
-# Cloudflare DNS — webhook.grug.lol stays a proxied CNAME so the
-# grug-webhook-host-rewrite Worker route intercepts (Workers require
-# the hostname proxied through CF). Post-cutover (#354) the target is
-# the in-cluster tunnel origin, read from SSM at deploy time — the
-# hostname is private infra and never committed here. The Worker
-# rewrites upstream anyway (same SSM param, via deploy.sh), so this
-# target only matters if the Worker route is ever removed: traffic
-# still lands on the tunnel origin (and 401s without the Worker's
-# auth header — cf_auth holds the boundary).
-# CONTENT IS HAND-OWNED until the #239 zone migration: the stack's CF
-# token verifies active but gets 10000 Authentication error on every
-# grug.lol DNS-records call (it kept Workers perms, lost zone DNS) -
-# the retirement up failed exactly here. The record's content was
-# PATCHed to the tunnel origin out-of-band with the infra-zone token;
-# ignore_changes below keeps this stack from ever calling the DNS API
-# it cannot use. The infra stack adopts both grug.lol records at the
-# zone migration (infra#239).
-_webhook_upstream_host = aws.ssm.get_parameter(name="/grug/webhook-upstream-host")
-cloudflare_dns.create_proxied_cname(
-    zone_id=_cf_zone_id.value,
-    name="webhook",
-    domain=domain,
-    target_url=pulumi.Output.from_input(_webhook_upstream_host.value),
-    provider=cf_provider,
-    # Proxied=True so the Worker route intercepts and rewrites Host.
-    proxied=True,
-    ignore_content=True,
-)
+# Cloudflare DNS — webhook.grug.lol is NO LONGER managed by this stack.
+# The stack's CF token verifies active but 10000s on every grug.lol
+# DNS-records call (kept Workers perms, lost zone DNS), which wedged the
+# retirement up twice (a failed update replays forever). The record
+# (id 04a6530d7067a563ffd2eb23962946ef) lives on in the zone - content
+# hand-PATCHed to the tunnel origin with the infra-zone token - and was
+# `pulumi state delete`d from this stack 2026-06-12. The infra stack
+# adopts BOTH grug.lol records (webhook + api) at the zone migration
+# (infra#239). The api record below stays managed only because its
+# content never changes until the api cutover.
 
 # API Lambda — separate ECR + Function URL from webhook (per Q10
 # topology decision; independent concurrency reservations so webhook
