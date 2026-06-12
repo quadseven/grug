@@ -24,7 +24,7 @@ GRUG_ADMIN_INSTALL_ID ?= 129256114
 test: webhook-test api-test
 
 webhook-test:
-	cd services/webhook && uv run --with pytest --with httpx --with pyjwt --with cryptography --with boto3 --with moto --with fastapi --with mangum --with 'ddtrace>=3.5,<4' --with 'datadog-lambda>=6.107,<7' pytest tests/ -q \
+	cd services/webhook && uv run --with pytest --with httpx --with pyjwt --with cryptography --with boto3 --with moto --with fastapi --with mangum --with 'psycopg[binary,pool]' --with 'ddtrace>=3.5,<4' --with 'datadog-lambda>=6.107,<7' pytest tests/ -q \
 		--deselect tests/test_dispatcher.py::test_installation_created_records_row \
 		--deselect tests/test_dispatcher.py::test_installation_created_org_uses_sender_id \
 		--deselect tests/test_enforcement.py::test_heal_clears_stale_id_and_recreates \
@@ -38,7 +38,7 @@ webhook-test:
 	# them under moto. Do NOT widen this list without an issue.
 
 api-test:
-	cd services/api && uv run --with pytest --with httpx --with pyjwt --with cryptography --with boto3 --with moto --with pydantic --with fastapi --with mangum pytest tests/ -q \
+	cd services/api && uv run --with pytest --with httpx --with pyjwt --with cryptography --with boto3 --with moto --with pydantic --with fastapi --with mangum --with 'psycopg[binary,pool]' pytest tests/ -q \
 		--deselect tests/test_installations_update_config.py::test_update_repo_config_admin_can_access_any \
 		--deselect tests/test_installations_update_config.py::test_update_repo_config_paginates_until_match \
 		--deselect tests/test_cf_auth.py::test_unconfigured_warning_throttled_within_window \

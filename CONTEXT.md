@@ -70,9 +70,9 @@ The vocabulary used in `services/`, `infra/`, and `web/`. Terms map to identifie
 
 | Term | Definition |
 |---|---|
-| **DynamoDB single-table layout** | Two key shapes co-existing in one DDB table: `PK=USER#<github_user_id> SK=META` (the `UserIdentity` row, optionally `UserWithTokens` + `allowlisted`) and `PK=INST#<install_id> SK=META` (the `Installation` row) plus `PK=INST#<install_id> SK=REPO#<repo_id>` (one `RepoConfig` per repo). Schema constants in [`services/{api,webhook}/adapters/install_store.py`](services/api/adapters/install_store.py). |
+| **Single-table layout (`grug_kv`)** | Two key shapes co-existing in one Postgres table (`grug_kv`, was DynamoDB `grug-main` pre-#354): `PK=USER#<github_user_id> SK=META` (the `UserIdentity` row, optionally `UserWithTokens` + `allowlisted`) and `PK=INST#<install_id> SK=META` (the `Installation` row) plus `PK=INST#<install_id> SK=REPO#<repo_id>` (one `RepoConfig` per repo). Key/attribute semantics preserved exactly across the port. Schema constants in [`services/{api,webhook}/adapters/pg_install_store.py`](services/api/adapters/pg_install_store.py); `install_store.py`/`user_store.py` are re-export facades. |
 | **KMS envelope** | Per-`UserIdentity` data-encryption-key generated via `kms:GenerateDataKey` and used (AES-GCM, 96-bit nonce) to encrypt OAuth refresh + access tokens. Wrapped DEK stored alongside the ciphertext. Only the api Lambda calls KMS at app-level; webhook never decrypts user tokens. Documented at [`infra/pulumi/components/kms_cmk.py`](infra/pulumi/components/kms_cmk.py). |
-| **CredentialBlobCorrupt** | Exception raised when an encrypted blob in DDB can't be decrypted (key-version drift, tampering, deliberate test fixture). Handler must idempotently clean up — see the "idempotency check after corruption-empty fallthrough" audit pattern. |
+| **CredentialBlobCorrupt** | Exception raised when an encrypted blob in the store can't be decrypted (key-version drift, tampering, deliberate test fixture). Handler must idempotently clean up — see the "idempotency check after corruption-empty fallthrough" audit pattern. |
 | **UserStateCorrupt** | Same shape as `CredentialBlobCorrupt`, but for non-secret user state fields that fail invariant checks at read time. |
 
 ## Auth-boundary concepts

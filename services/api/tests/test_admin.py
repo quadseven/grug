@@ -13,33 +13,10 @@ import pytest
 
 
 @pytest.fixture(autouse=True)
-def _ddb(monkeypatch):
-    moto = pytest.importorskip("moto")
-    from moto import mock_aws  # type: ignore
-
-    with mock_aws():
-        monkeypatch.setenv("AWS_DEFAULT_REGION", "us-east-1")
-        monkeypatch.setenv("GRUG_DDB_TABLE", "grug-main-test")
-        ddb = boto3.client("dynamodb", region_name="us-east-1")
-        ddb.create_table(
-            TableName="grug-main-test",
-            KeySchema=[
-                {"AttributeName": "PK", "KeyType": "HASH"},
-                {"AttributeName": "SK", "KeyType": "RANGE"},
-            ],
-            AttributeDefinitions=[
-                {"AttributeName": "PK", "AttributeType": "S"},
-                {"AttributeName": "SK", "AttributeType": "S"},
-            ],
-            BillingMode="PAY_PER_REQUEST",
-        )
-        # Reload modules so module-scope `_table` picks up env var.
-        import importlib
-        import adapters.user_store as us
-        importlib.reload(us)
-        import admin as adm
-        importlib.reload(adm)
-        yield adm
+def _ddb(pg_store):
+    """Post-#354 swap: delegates to the shared real-Postgres fixture
+    (conftest.pg_store) - moto-DDB setup lives in git history."""
+    yield pg_store
 
 
 def _seed_user(github_user_id, login="evan", role="admin", allowlisted=True):

@@ -23,7 +23,7 @@ from typing import Any
 from fastapi import APIRouter, Depends, HTTPException, status
 from pydantic import BaseModel
 
-from adapters.user_store import UserIdentity, _table  # type: ignore[reportPrivateUsage]
+from adapters.user_store import UserIdentity, get_user_item, scan_meta_items, update_user_fields
 from auth.dependencies import require_admin
 
 log = logging.getLogger("grug.api.admin")
@@ -62,36 +62,9 @@ def _inst_to_admin_view(item: dict[str, Any]) -> dict[str, Any]:
 
 
 def _scan_all(*, pk_prefix: str) -> list[dict[str, Any]]:
-    """Page through DDB Scan with PK-prefix + SK=META filter.
-
-    DDB Scan returns at most 1 MB per page; LastEvaluatedKey signals
-    more remain. Filter is applied AFTER the page read so 1 MB of
-    REPO# rows can yield zero matching USER# items in a single page —
-    must paginate. Capped at 50 pages defensively to bound admin
-    endpoint runtime.
-    """
-    items: list[dict[str, Any]] = []
-    last_key: dict[str, Any] | None = None
-    pages = 0
-    while True:
-        kwargs = {
-            "FilterExpression": "begins_with(PK, :prefix) AND SK = :sk",
-            "ExpressionAttributeValues": {":prefix": pk_prefix, ":sk": "META"},
-        }
-        if last_key is not None:
-            kwargs["ExclusiveStartKey"] = last_key
-        resp = _table.scan(**kwargs)
-        items.extend(resp.get("Items", []))
-        last_key = resp.get("LastEvaluatedKey")
-        pages += 1
-        if last_key is None or pages >= 50:
-            if last_key is not None:
-                log.warning(
-                    "admin_scan_truncated",
-                    extra={"pk_prefix": pk_prefix, "pages_read": pages},
-                )
-            break
-    return items
+    """Live META rows by PK prefix - a named store operation since the
+    #354 swap (the DDB Scan pagination this wrapped lives in history)."""
+    return scan_meta_items(pk_prefix=pk_prefix)
 
 
 @router.get("/users")
@@ -148,8 +121,7 @@ def patch_user(
             detail="cannot demote yourself; ask another admin",
         )
 
-    pk = f"USER#{user_id}"
-    existing = _table.get_item(Key={"PK": pk, "SK": "META"}).get("Item")
+    existing = get_user_item(str(user_id))
     if not existing:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="user not found")
 
@@ -159,46 +131,27 @@ def patch_user(
         "tier": existing.get("tier", "free"),
     }
     after = dict(before)
-    update_parts: list[str] = []
-    expr_vals: dict[str, Any] = {}
-    expr_names: dict[str, str] = {}
+    fields: dict[str, Any] = {}
     now = datetime.now(timezone.utc).isoformat()
 
     if payload.allowlisted is not None:
-        update_parts.append("allowlisted = :a")
-        expr_vals[":a"] = payload.allowlisted
+        fields["allowlisted"] = payload.allowlisted
         after["allowlisted"] = payload.allowlisted
         if payload.allowlisted and not before["allowlisted"]:
-            update_parts.append("allowlisted_at = :at, allowlisted_by = :by")
-            expr_vals[":at"] = now
+            fields["allowlisted_at"] = now
             # Record the immutable github_user_id, not the (mutable) login.
-            # GitHub usernames can be renamed; the audit trail must survive
-            # a username change.
-            expr_vals[":by"] = actor.github_user_id
+            fields["allowlisted_by"] = actor.github_user_id
     if payload.role is not None:
-        # `role` is a DDB reserved word — must alias.
-        update_parts.append("#r = :r")
-        expr_names["#r"] = "role"
-        expr_vals[":r"] = payload.role
+        fields["role"] = payload.role
         after["role"] = payload.role
     if payload.tier is not None:
-        update_parts.append("tier = :t")
-        expr_vals[":t"] = payload.tier
+        fields["tier"] = payload.tier
         after["tier"] = payload.tier
 
-    if not update_parts:
+    if not fields:
         return {"user_id": user_id, "before": before, "after": after, "changed": False}
 
-    kwargs: dict[str, Any] = {
-        "Key": {"PK": pk, "SK": "META"},
-        "UpdateExpression": "SET " + ", ".join(update_parts),
-        "ExpressionAttributeValues": expr_vals,
-        "ReturnValues": "ALL_NEW",
-    }
-    if expr_names:
-        kwargs["ExpressionAttributeNames"] = expr_names
-
-    new = _table.update_item(**kwargs).get("Attributes", {})
+    new = update_user_fields(str(user_id), fields)
 
     log.info(
         "admin_user_patched",

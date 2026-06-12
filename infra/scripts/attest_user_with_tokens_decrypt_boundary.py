@@ -25,11 +25,11 @@ import sys
 from pathlib import Path
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
-USER_STORE = REPO_ROOT / "services/api/adapters/user_store.py"
-# Staged Postgres successor (#354): same decrypt-boundary contract, same
-# sole-construction discipline. At cutover the implementation swap
-# collapses construction back to one file and this entry is removed.
-PG_USER_STORE = REPO_ROOT / "services/api/adapters/pg_user_store.py"
+# Post-swap (#354): pg_user_store.py IS the user store; user_store.py is
+# a re-export facade with no class definitions. The shape + construction
+# walls apply to the canonical file only.
+USER_STORE = REPO_ROOT / "services/api/adapters/pg_user_store.py"
+PG_USER_STORE = USER_STORE
 WEBHOOK_DIR = REPO_ROOT / "services/webhook"
 API_DIR = REPO_ROOT / "services/api"
 
