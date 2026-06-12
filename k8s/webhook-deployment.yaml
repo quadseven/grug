@@ -54,7 +54,6 @@ spec:
             # Off-Lambda Elder path (#368): run reviews on an in-process
             # background thread instead of the Lambda self-invoke.
             - {name: GRUG_K8S_RUNTIME, value: "1"}
-            - {name: GRUG_DDB_TABLE, value: grug-main}
             - {name: GITHUB_APP_ID_SSM, value: /grug/github-app-id}
             - {name: GITHUB_APP_PRIVATE_KEY_SSM, value: /grug/github-app-private-key}
             - {name: GITHUB_APP_WEBHOOK_SECRET_SSM, value: /grug/github-app-webhook-secret}
