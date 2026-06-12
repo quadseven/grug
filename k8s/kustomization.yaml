@@ -7,3 +7,4 @@ resources:
   - api-deployment.yaml
   - poller-cronjob.yaml
   - consumer-deployment.yaml
+# (k8s Elder live-proof scratch PR - close unmerged; grug#368 acceptance)
