@@ -11,6 +11,8 @@ from datetime import datetime, timezone
 
 import pytest
 
+from tests.conftest import seed_meta as _put_row
+
 
 @pytest.fixture(autouse=True)
 def _adm(pg_store):
@@ -18,19 +20,6 @@ def _adm(pg_store):
     import admin
 
     yield admin
-
-
-def _put_row(pk: str, attrs: dict) -> None:
-    """Seed a raw META row through the adapter's own codec — the same
-    write shape record_installation/upsert_oauth_user produce."""
-    from adapters import pg_base
-
-    with pg_base.get_pool().connection() as conn:
-        conn.execute(
-            "INSERT INTO grug_kv (pk, sk, data) VALUES (%s, 'META', %s) "
-            "ON CONFLICT (pk, sk) DO UPDATE SET data = EXCLUDED.data",
-            (pk, pg_base.encode_attrs(attrs)),
-        )
 
 
 def _seed_user(github_user_id, login="evan", role="admin", allowlisted=True):

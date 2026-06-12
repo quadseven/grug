@@ -15,6 +15,23 @@ import boto3
 import pytest
 
 
+def seed_meta(pk, attrs, *, gsi1pk=None, gsi1sk=None):
+    """Seed one raw META row through the adapter's own codec — the same
+    write shape record_installation/upsert_oauth_user produce. The single
+    place tests are allowed to hand-write the grug_kv row shape; seed
+    through this, not inline SQL, so schema drift has one home."""
+    from adapters import pg_base
+
+    with pg_base.get_pool().connection() as conn:
+        conn.execute(
+            "INSERT INTO grug_kv (pk, sk, data, gsi1pk, gsi1sk) "
+            "VALUES (%s, 'META', %s, %s, %s) "
+            "ON CONFLICT (pk, sk) DO UPDATE SET data = EXCLUDED.data, "
+            "gsi1pk = EXCLUDED.gsi1pk, gsi1sk = EXCLUDED.gsi1sk",
+            (pk, pg_base.encode_attrs(attrs), gsi1pk, gsi1sk),
+        )
+
+
 @pytest.fixture
 def pg_store(monkeypatch):
     test_db = os.environ.get("GRUG_TEST_DATABASE_URL", "")
@@ -44,6 +61,10 @@ def pg_store(monkeypatch):
         importlib.reload(kms_mod)
         from adapters import pg_base
 
+        # Setup-truncate is the isolation boundary: each pg_store test
+        # starts clean but leaves its rows behind for the NEXT setup to
+        # clear. Any store-touching test must use this fixture (or one
+        # depending on it) or it will see a sibling's leftovers.
         pg_base.reset_pool_for_tests()
         with pg_base.get_pool().connection() as conn:
             conn.execute("TRUNCATE grug_kv")

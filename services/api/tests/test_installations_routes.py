@@ -98,28 +98,20 @@ def test_repo_config_payload_explicit_false(_mod):
 def test_list_installations_skips_corrupt_pk_rows(_mod):
     """silent-failure-hunter P2 #6 regression: corrupt GSI1 row PK
     must skip + log, not crash entire endpoint."""
-    from adapters import pg_base
-
-    def _put(pk, attrs, gsi1pk, gsi1sk):
-        with pg_base.get_pool().connection() as conn:
-            conn.execute(
-                "INSERT INTO grug_kv (pk, sk, data, gsi1pk, gsi1sk) "
-                "VALUES (%s, 'META', %s, %s, %s)",
-                (pk, pg_base.encode_attrs(attrs), gsi1pk, gsi1sk),
-            )
+    from tests.conftest import seed_meta
 
     # Good row + corrupt-PK row both indexed under gsi1pk=100
-    _put(
+    seed_meta(
         "INST#1001",
         {"account_login": "good", "account_type": "User",
          "installed_at": "2026-01-01T00:00:00Z", "installed_by_user_id": "100"},
-        "100", "INST#1001",
+        gsi1pk="100", gsi1sk="INST#1001",
     )
-    _put(
+    seed_meta(
         "garbage-no-hash",
         {"account_login": "corrupt", "account_type": "User",
          "installed_by_user_id": "100"},
-        "100", "INST#bad",
+        gsi1pk="100", gsi1sk="INST#bad",
     )
     user = _user(user_id="100")
     out = _mod.list_installations(user)
