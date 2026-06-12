@@ -1,0 +1,138 @@
+# Kubernetes deploy for grug (#354 self-hosting migration).
+#
+# PUBLIC-REPO DISCIPLINE: no infrastructure identifiers are committed -
+# the registry host, cluster credentials, and join credentials all
+# arrive via the `k8s-prod` GitHub environment (vars/secrets), and the
+# manifests carry REGISTRY_PLACEHOLDER/TAG_PLACEHOLDER pins that this
+# workflow rewrites at deploy time.
+#
+# Required environment configuration (operator-seeded, never committed):
+#   vars.DEPLOY_REGISTRY_HOST     - private registry hostname
+#   secrets.TS_OAUTH_CLIENT_ID    - Tailscale OAuth client (ephemeral CI
+#   secrets.TS_OAUTH_SECRET         nodes, ACL tag-scoped)
+#   secrets.REGISTRY_USERNAME     - registry push credential
+#   secrets.REGISTRY_PASSWORD
+#   secrets.KUBECONFIG_B64        - cluster credential (base64)
+#   secrets.AWS_ACCOUNT_ID        - existing grug-gha-deploy OIDC role
+#                                   (reads the /grug/* parameter store
+#                                   namespace for the app secret seed)
+#
+# Native arm64 build (ubuntu-24.04-arm hosted runner, free for public
+# repos) - the target nodes are arm64 and emulation is banned org-wide.
+name: deploy.k8s
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - 'services/**'
+      - 'k8s/**'
+      - '.github/workflows/deploy.k8s.yml'
+  workflow_dispatch: {}
+
+permissions:
+  contents: read
+  id-token: write
+
+concurrency:
+  group: deploy-k8s
+  cancel-in-progress: false
+
+jobs:
+  deploy:
+    runs-on: ubuntu-24.04-arm
+    timeout-minutes: 30
+    environment: k8s-prod
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+
+      - name: Join tailnet (ephemeral)
+        uses: tailscale/github-action@306e68a486fd2350f2bfc3b19fcd143891a4a2d8 # v4
+        with:
+          oauth-client-id: ${{ secrets.TS_OAUTH_CLIENT_ID }}
+          oauth-secret: ${{ secrets.TS_OAUTH_SECRET }}
+          tags: tag:ci
+          use-cache: 'true'
+
+      - name: Configure AWS credentials (app-secret seed)
+        uses: aws-actions/configure-aws-credentials@cabfdba3510de1431bac9dba27511d97497fc100 # v5
+        with:
+          role-to-assume: arn:aws:iam::${{ secrets.AWS_ACCOUNT_ID }}:role/grug-gha-deploy
+          aws-region: us-east-1
+
+      - name: Registry login
+        env:
+          REGISTRY_HOST: ${{ vars.DEPLOY_REGISTRY_HOST }}
+          REGISTRY_USERNAME: ${{ secrets.REGISTRY_USERNAME }}
+          REGISTRY_PASSWORD: ${{ secrets.REGISTRY_PASSWORD }}
+        run: |
+          echo "$REGISTRY_PASSWORD" | docker login "$REGISTRY_HOST" \
+            --username "$REGISTRY_USERNAME" --password-stdin
+
+      - name: Build + push images (native arm64)
+        env:
+          REGISTRY_HOST: ${{ vars.DEPLOY_REGISTRY_HOST }}
+        run: |
+          set -euo pipefail
+          for svc in webhook api; do
+            docker build "services/$svc" \
+              -f "services/$svc/Dockerfile" \
+              -t "$REGISTRY_HOST/grug-$svc:${GITHUB_SHA}" \
+              --build-arg DD_GIT_REPOSITORY_URL="github.com/${GITHUB_REPOSITORY}" \
+              --build-arg DD_GIT_COMMIT_SHA="${GITHUB_SHA}"
+            docker push "$REGISTRY_HOST/grug-$svc:${GITHUB_SHA}"
+          done
+
+      - name: Write kubeconfig
+        env:
+          KUBECONFIG_B64: ${{ secrets.KUBECONFIG_B64 }}
+        run: |
+          install -m 700 -d "$HOME/.kube"
+          echo "$KUBECONFIG_B64" | base64 -d > "$HOME/.kube/config"
+          chmod 600 "$HOME/.kube/config"
+
+      - name: Seed app secrets from the parameter store
+        env:
+          REGISTRY_HOST: ${{ vars.DEPLOY_REGISTRY_HOST }}
+          REGISTRY_USERNAME: ${{ secrets.REGISTRY_USERNAME }}
+          REGISTRY_PASSWORD: ${{ secrets.REGISTRY_PASSWORD }}
+        run: |
+          set -euo pipefail
+          kubectl apply -f k8s/namespace.yaml
+          get() { aws ssm get-parameter --name "$1" --with-decryption \
+                    --query 'Parameter.Value' --output text; }
+          # Values pass through process substitution into kubectl only -
+          # never echoed; GH masks are not relied upon.
+          kubectl -n grug create secret generic grug-secrets \
+            --from-literal=GRUG_DATABASE_URL="$(get /grug/database-url)" \
+            --from-literal=GRUG_GITHUB_APP_ID="$(get /grug/github-app-id)" \
+            --from-literal=GRUG_GITHUB_APP_PRIVATE_KEY="$(get /grug/github-app-private-key)" \
+            --from-literal=GRUG_GITHUB_WEBHOOK_SECRET="$(get /grug/github-app-webhook-secret)" \
+            --from-literal=GRUG_GITHUB_APP_CLIENT_ID="$(get /grug/github-app-client-id)" \
+            --from-literal=GRUG_GITHUB_APP_CLIENT_SECRET="$(get /grug/github-app-client-secret)" \
+            --from-literal=CF_SHARED_SECRET="$(get /grug/cf-shared-secret)" \
+            --from-literal=DD_API_KEY="$(get /grug/dd-api-key)" \
+            --dry-run=client -o yaml | kubectl apply -f -
+          kubectl -n grug create secret docker-registry registry-pull \
+            --docker-server="$REGISTRY_HOST" \
+            --docker-username="$REGISTRY_USERNAME" \
+            --docker-password="$REGISTRY_PASSWORD" \
+            --dry-run=client -o yaml | kubectl apply -f -
+
+      - name: Pin image placeholders + apply
+        env:
+          REGISTRY_HOST: ${{ vars.DEPLOY_REGISTRY_HOST }}
+        run: |
+          set -euo pipefail
+          sed -i \
+            -e "s|REGISTRY_PLACEHOLDER|$REGISTRY_HOST|g" \
+            -e "s|TAG_PLACEHOLDER|${GITHUB_SHA}|g" \
+            k8s/*.yaml
+          kubectl apply -k k8s/
+          for d in grug-webhook grug-api; do
+            kubectl -n grug rollout status deploy/$d --timeout=180s
+          done
+
+      - name: Cleanup
+        if: always()
+        run: rm -f "$HOME/.kube/config"

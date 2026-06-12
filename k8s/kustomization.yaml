@@ -1,0 +1,8 @@
+# grug on Kubernetes (#354). Applied by the deploy workflow after image
+# placeholders are pinned. Secrets (grug-secrets, registry-pull) are
+# seeded by the workflow from the parameter store - never committed.
+resources:
+  - namespace.yaml
+  - webhook-deployment.yaml
+  - api-deployment.yaml
+  - poller-cronjob.yaml
