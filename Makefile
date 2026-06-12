@@ -24,7 +24,7 @@ GRUG_ADMIN_INSTALL_ID ?= 129256114
 test: webhook-test api-test
 
 webhook-test:
-	cd services/webhook && uv run --with pytest --with httpx --with pyjwt --with cryptography --with boto3 --with moto --with fastapi --with mangum --with datadog-lambda pytest tests/ -q \
+	cd services/webhook && uv run --with pytest --with httpx --with pyjwt --with cryptography --with boto3 --with moto --with fastapi --with mangum --with 'ddtrace>=3.5,<4' --with 'datadog-lambda>=6.107,<7' pytest tests/ -q \
 		--deselect tests/test_dispatcher.py::test_installation_created_records_row \
 		--deselect tests/test_dispatcher.py::test_installation_created_org_uses_sender_id \
 		--deselect tests/test_enforcement.py::test_heal_clears_stale_id_and_recreates \
