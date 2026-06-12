@@ -29,6 +29,12 @@ webhook-test:
 api-test:
 	cd services/api && uv run --with pytest --with httpx --with pyjwt --with cryptography --with boto3 --with moto --with pydantic --with fastapi pytest tests/ -q
 
+# Real-Postgres store tests (#354). REQUIRE a reachable Postgres via
+# GRUG_TEST_DATABASE_URL (CI: workflow service container) - they skip
+# loudly otherwise; sqlite stand-ins are banned for these semantics.
+test-pg:
+	cd services/api && uv run --with pytest --with "psycopg[binary,pool]" --with boto3 --with cryptography pytest tests/test_pg_stores.py -q -rs
+
 pulumi-preview:
 	cd infra/pulumi && uv sync && pulumi preview --stack dev
 

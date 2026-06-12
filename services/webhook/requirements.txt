@@ -11,3 +11,6 @@ cryptography>=43.0,<44.0
 # instrumentation + handler-wrapping in-process.
 ddtrace>=3.5,<4
 datadog-lambda>=6.107,<7
+# Postgres store (#306 epic store port) - pool included for the
+# long-lived k8s runtime (Lambda used per-invoke connections).
+psycopg[binary,pool]>=3.2,<4.0
