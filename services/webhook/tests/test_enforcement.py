@@ -148,9 +148,9 @@ def test_check_name():
 
 def test_heal_clears_stale_id_and_recreates():
     """Deleted Grug ruleset → clear old ID → ensure creates a new one."""
-    with patch("adapters.install_store.set_enforcement_id") as mock_set, \
-         patch("enforcement.detect_enforcement", return_value="none"), \
+    with patch("enforcement.detect_enforcement", return_value="none"), \
          patch("enforcement.create_ruleset", return_value={"id": 99}), \
+         patch("adapters.install_store.get_enforcement_id", return_value=99), \
          patch("adapters.install_store.set_enforcement_id") as mock_set:
         result = heal_enforcement("tok", "o", "r", "main", 1, 2, old_ruleset_id=42)
 
@@ -164,7 +164,8 @@ def test_heal_returns_new_state():
     """heal_enforcement returns the EnforcementState from ensure."""
     with patch("adapters.install_store.set_enforcement_id"), \
          patch("enforcement.detect_enforcement", return_value="none"), \
-         patch("enforcement.create_ruleset", return_value={"id": 50}):
+         patch("enforcement.create_ruleset", return_value={"id": 50}), \
+         patch("adapters.install_store.get_enforcement_id", return_value=50):
         result = heal_enforcement("tok", "o", "r", "main", 1, 2, old_ruleset_id=10)
 
     assert result == "grug_managed"
