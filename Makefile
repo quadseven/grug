@@ -12,7 +12,7 @@
 #   make rebuild            — destroy + up + image-rebuild + workers + reseed + smoke (~12-15min)
 #   make smoke              — quick prod-shape smoke test (read-only)
 
-.PHONY: test webhook-test api-test pulumi-preview pulumi-up \
+.PHONY: test webhook-test api-test pg-test pulumi-preview pulumi-up \
         tear-down rebuild bootstrap-images smoke docker-build-webhook
 
 # Admin seed defaults — the values that get re-installed after a tear-down
@@ -24,10 +24,30 @@ GRUG_ADMIN_INSTALL_ID ?= 129256114
 test: webhook-test api-test
 
 webhook-test:
-	cd services/webhook && uv run --with pytest --with httpx --with pyjwt --with cryptography --with boto3 --with moto pytest tests/ -q
+	cd services/webhook && uv run --with pytest --with httpx --with pyjwt --with cryptography --with boto3 --with moto --with fastapi --with mangum --with 'ddtrace>=3.5,<4' --with 'datadog-lambda>=6.107,<7' pytest tests/ -q \
+		--deselect tests/test_dispatcher.py::test_installation_created_records_row \
+		--deselect tests/test_dispatcher.py::test_installation_created_org_uses_sender_id \
+		--deselect tests/test_enforcement.py::test_heal_clears_stale_id_and_recreates \
+		--deselect tests/test_enforcement.py::test_heal_returns_new_state
+	# ^ deselected: these hit LIVE DynamoDB without a moto fixture and only
+	# ever passed via the developer shell's real AWS creds - #356 restores
+	# them under moto. Do NOT widen this list without an issue.
 
 api-test:
-	cd services/api && uv run --with pytest --with httpx --with pyjwt --with cryptography --with boto3 --with moto --with pydantic --with fastapi pytest tests/ -q
+	cd services/api && uv run --with pytest --with httpx --with pyjwt --with cryptography --with boto3 --with moto --with pydantic --with fastapi --with mangum pytest tests/ -q \
+		--deselect tests/test_installations_update_config.py::test_update_repo_config_admin_can_access_any \
+		--deselect tests/test_installations_update_config.py::test_update_repo_config_paginates_until_match
+	# ^ deselected: same live-DynamoDB class as the webhook quartet (#356) -
+	# the long-known 'ordering pollution' local failures were actually real
+	# GetItem calls riding developer AWS creds. #356 restores under moto.
+
+# Real-Postgres store tests (#354). REQUIRE a reachable Postgres via
+# GRUG_TEST_DATABASE_URL (CI: workflow service container) - they skip
+# loudly otherwise; sqlite stand-ins are banned for these semantics.
+pg-test:
+	@if [ -n "$$CI" ] && [ -z "$$GRUG_TEST_DATABASE_URL" ]; then \
+		echo "FATAL: pg tests would SKIP in CI (GRUG_TEST_DATABASE_URL unset) - a skipped gate is a silent pass (audit H4)"; exit 1; fi
+	cd services/api && uv run --with pytest --with "psycopg[binary,pool]" --with boto3 --with cryptography pytest tests/test_pg_stores.py -q -rs
 
 pulumi-preview:
 	cd infra/pulumi && uv sync && pulumi preview --stack dev
