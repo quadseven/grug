@@ -47,6 +47,21 @@ spec:
                   value: TAG_PLACEHOLDER
                 - name: DD_AGENT_HOST
                   valueFrom: {fieldRef: {fieldPath: status.hostIP}}
+                - {name: GRUG_ENV, value: prod}
+                - {name: GRUG_DDB_TABLE, value: grug-main}
+                - {name: GITHUB_APP_ID_SSM, value: /grug/github-app-id}
+                - {name: GITHUB_APP_PRIVATE_KEY_SSM, value: /grug/github-app-private-key}
+                - {name: GITHUB_APP_WEBHOOK_SECRET_SSM, value: /grug/github-app-webhook-secret}
+                - {name: GITHUB_APP_CLIENT_ID_SSM, value: /grug/github-app-client-id}
+                - {name: GITHUB_APP_CLIENT_SECRET_SSM, value: /grug/github-app-client-secret}
+                - {name: GRUG_CF_SHARED_SECRET_SSM, value: /grug/cf-shared-secret}
+                - {name: GRUG_OPENROUTER_API_KEY_SSM, value: /infra/llm/openrouter_api_key}
+                - {name: GRUG_POOLSIDE_API_KEY_SSM, value: /infra/llm/poolside_api_key}
+                - {name: GRUG_PROMPT_EXPERIMENT_SSM, value: /grug/elder-prompt-experiment}
+                - {name: GRUG_FALLBACK_ENABLED_SSM, value: /grug/elder-fallback-enabled}
+                - {name: DD_SITE, value: datadoghq.com}
+                - {name: DD_LLMOBS_ENABLED, value: "true"}
+                - {name: DD_LLMOBS_ML_APP, value: grug-elder}
               resources:
                 requests: {cpu: 50m, memory: 192Mi}
                 limits: {memory: 512Mi}

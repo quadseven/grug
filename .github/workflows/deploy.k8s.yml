@@ -111,21 +111,28 @@ jobs:
           # ephemeral runner; review F3). Multiline values (the App
           # private key) ride base64 in the env-file; the app reads the
           # _B64 form (decode at startup) for exactly this reason.
+          # The app self-loads its secrets from the parameter store at
+          # runtime (secrets_loader + the *_SSM path envs in the
+          # manifests) - the pod secret carries ONLY the AWS credential
+          # authorizing those reads, the database URL, and two
+          # deploy-resolved values that must not be committed as
+          # literals (the queue URL embeds the account id).
           ENVF="$RUNNER_TEMP/grug-secrets.env"
           install -m 600 /dev/null "$ENVF"
           {
+            echo "AWS_ACCESS_KEY_ID=$(get /grug/k8s-pod-aws-access-key-id)"
+            echo "AWS_SECRET_ACCESS_KEY=$(get /grug/k8s-pod-aws-secret-access-key)"
+            echo "AWS_DEFAULT_REGION=us-east-1"
             echo "GRUG_DATABASE_URL=$(get /grug/database-url)"
-            echo "GRUG_GITHUB_APP_ID=$(get /grug/github-app-id)"
-            echo "GRUG_GITHUB_APP_PRIVATE_KEY_B64=$(get /grug/github-app-private-key | base64 -w0)"
-            echo "GRUG_GITHUB_WEBHOOK_SECRET=$(get /grug/github-app-webhook-secret)"
-            echo "GRUG_GITHUB_APP_CLIENT_ID=$(get /grug/github-app-client-id)"
-            echo "GRUG_GITHUB_APP_CLIENT_SECRET=$(get /grug/github-app-client-secret)"
-            echo "CF_SHARED_SECRET=$(get /grug/cf-shared-secret)"
-            echo "DD_API_KEY=$(get /grug/dd-api-key)"
+            echo "GRUG_CAVE_JOBS_QUEUE_URL=$(aws sqs get-queue-url --queue-name grug-cave-jobs.fifo --query QueueUrl --output text)"
+            echo "GRUG_CAVE_DIFF_BUCKET=$(aws s3api list-buckets --query 'Buckets[?starts_with(Name, `grug-cave-diffs`)].Name | [0]' --output text)"
           } > "$ENVF"
+          # DELETE-then-create: kubectl apply MERGES secret data, so a
+          # shape change would leave stale keys behind (bit us on the
+          # first deploys - the interim seed's keys lingered).
+          kubectl -n grug delete secret grug-secrets --ignore-not-found
           kubectl -n grug create secret generic grug-secrets \
-            --from-env-file="$ENVF" \
-            --dry-run=client -o yaml | kubectl apply -f -
+            --from-env-file="$ENVF"
           rm -f "$ENVF"
           kubectl -n grug create secret docker-registry registry-pull \
             --docker-server="$REGISTRY_HOST" \
