@@ -95,8 +95,15 @@ jobs:
           cloud-url: ${{ secrets.PULUMI_BACKEND_URL }}
           work-dir: infra/pulumi
           config-map: |
-            webhook_image_tag: { value: "${{ needs.meta.outputs.tag }}" }
-            api_image_tag:     { value: "${{ needs.meta.outputs.tag }}" }
+            # FROZEN at the last pre-swap SHA (#354 store swap): the source
+            # tree is Postgres-only from the swap commit on, and the Lambdas
+            # have no database URL or network path to the cluster store -
+            # deploying a post-swap image here is an instant outage on live
+            # traffic. Builds still push per-SHA images; the Lambdas just
+            # never advance past this tag. Do NOT unfreeze: the Lambdas
+            # retire at cutover (retirement PR removes this whole pipeline).
+            webhook_image_tag: { value: "7c946045" }
+            api_image_tag:     { value: "7c946045" }
             full_commit_sha:   { value: "${{ github.sha }}" }
       - name: 11. Deploy CF Workers
         run: bash infra/cloudflare/deploy.sh
