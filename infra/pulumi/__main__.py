@@ -20,20 +20,16 @@ import json
 
 import pulumi
 import pulumi_aws as aws
-import pulumi_cloudflare as cloudflare
 import pulumi_datadog as _datadog
 
 from components import (
     cf_shared_secret,
     k8s_pod_user,
-    cloudflare_dns,
     dd_dashboard,
     dd_monitors,
     dd_rum,
     ddb_table,
-    ecr_repo,
     kms_cmk,
-    lambda_service,
     oidc_role,
     ssm_secrets,
 )
@@ -60,26 +56,11 @@ secrets = ssm_secrets.reference_existing(
     ],
 )
 
-# Cloudflare creds — also from SSM (single-source rule). The cloudflare
-# provider reads CLOUDFLARE_API_TOKEN from env when not configured
-# explicitly; we configure it explicitly via SSM lookup so a fresh
-# checkout doesn't need extra env-var setup.
-_cf_token = aws.ssm.get_parameter(
-    name="/grug/cloudflare-api-token",
-    with_decryption=True,
-)
-_cf_zone_id = aws.ssm.get_parameter(
-    name="/grug/cloudflare-zone-id",
-    with_decryption=False,
-)
-_cf_account_id = aws.ssm.get_parameter(
-    name="/grug/cloudflare-account-id",
-    with_decryption=False,
-)
-cf_provider = cloudflare.Provider(
-    "cloudflare-grug",
-    api_token=_cf_token.value,
-)
+# Cloudflare: this stack manages NOTHING in CF anymore. Both grug.lol
+# DNS records are hand-owned pending the infra zone migration
+# (infra#239) - the stack token kept Workers perms (deploy.sh) but
+# lost zone DNS. The Worker scripts themselves deploy via
+# infra/cloudflare/deploy.sh (CF API), not Pulumi.
 
 # Datadog API key — the shared INFRA DD key (`/infra/datadog/api_key`), the
 # same pair the operator's shared infrastructure Pulumi uses. Consolidated here
@@ -155,7 +136,6 @@ cf_secret = cf_shared_secret.create()
 # Full 40-char commit SHA — DD source-code linking requires the full
 # SHA (Greptile P1 PR #81). CI passes via config; falls back to the api
 # image tag (the webhook Lambda retired at the #354 k8s cutover).
-_full_commit_sha = config.get("full_commit_sha") or config.get("api_image_tag") or "bootstrap"
 # Elder prompt A/B experiment mode (#191). A plain String (NOT SecureString —
 # it's a non-secret operational toggle): one of "off" | "split" | "all_v2".
 # Pulumi OWNS the parameter's existence + the "off" default (all-Pulumi rule),
@@ -354,170 +334,8 @@ _k8s_pod = k8s_pod_user.create(
 # hand-PATCHed to the tunnel origin with the infra-zone token - and was
 # `pulumi state delete`d from this stack 2026-06-12. The infra stack
 # adopts BOTH grug.lol records (webhook + api) at the zone migration
-# (infra#239). The api record below stays managed only because its
-# content never changes until the api cutover.
-
-# API Lambda — separate ECR + Function URL from webhook (per Q10
-# topology decision; independent concurrency reservations so webhook
-# bursts can't starve user-interactive API).
-api_ecr = ecr_repo.create(
-    name="grug-api",
-    untagged_expire_days=14,
-    keep_last_images=20,  # Caps the SHA-tagged build accumulation (CI tags every build).
-    force_delete=(env == "dev"),  # prod stays False so `pulumi destroy` cannot wipe images.
-)
-
-api_image_tag = config.get("api_image_tag") or "bootstrap"
-api_lambda = lambda_service.create(
-    name="grug-api",
-    ecr_repo=api_ecr,
-    image_tag=api_image_tag,
-    secrets=secrets,
-    extra_ssm_secrets=[_dd_api_key, cf_secret.ssm_parameter],
-    env_vars={
-        "GRUG_ENV": env,
-        "GRUG_LOG_LEVEL": "INFO",
-        "GRUG_BUILD_SHA": api_image_tag,
-        "GRUG_DOMAIN": domain,
-        "GRUG_DDB_TABLE": grug_main_table.name,
-        "GRUG_KMS_CMK_ARN": grug_tokens_cmk.arn,
-        # Re-run queue (#305): the api enqueues, the webhook consumes. Unset =>
-        # the rerun endpoint 503s (a real misconfig, not a silent drop).
-        "GRUG_RERUN_QUEUE_URL": _rerun_jobs_queue.url,
-        "GRUG_CF_SHARED_SECRET_SSM": cf_secret.ssm_parameter.name,
-        "GITHUB_APP_WEBHOOK_SECRET_SSM": secrets["github-app-webhook-secret"].name,
-        # OAuth (Slice 3 #24 consumes)
-        "GITHUB_APP_CLIENT_ID_SSM": secrets["github-app-client-id"].name,
-        "GITHUB_APP_CLIENT_SECRET_SSM": secrets["github-app-client-secret"].name,
-        # GitHub App auth for personas dispatch (Slice 4 #25 consumes)
-        "GITHUB_APP_ID_SSM": secrets["github-app-id"].name,
-        "GITHUB_APP_PRIVATE_KEY_SSM": secrets["github-app-private-key"].name,
-        # DD APM
-        "DD_LAMBDA_HANDLER": "lambda_handler.handler",
-        "DD_SITE": "datadoghq.com",
-        "DD_API_KEY": _dd_api_key.value,
-        "DD_ENV": env,
-        "DD_SERVICE": "grug-api",
-        "DD_VERSION": api_image_tag,
-        # See webhook above — DD_GIT_* moved from build-arg to runtime
-        # env var so layer cache survives commit-SHA churn. Closes #70.
-        "DD_GIT_REPOSITORY_URL": "https://github.com/githumps/grug",
-        "DD_GIT_COMMIT_SHA": _full_commit_sha,
-        "DD_TRACE_ENABLED": "true",
-        "DD_LOGS_INJECTION": "true",
-        "DD_PATCH_MODULES": "asgi:false",
-        "DD_TRACE_ASGI_ENABLED": "false",
-        # Kill DD Lambda Extension's inferred-spans feature. Without
-        # this, the Extension synthesizes an `aws.lambda.url` root
-        # span per Function URL invocation tagged with the lambda-url
-        # FQDN as `service`, creating a phantom DD APM service entry
-        # like `<id>.lambda-url.us-east-1.on.aws` alongside the real
-        # `grug-webhook` / `grug-api` entries. Canonical kill-switch
-        # per https://docs.datadoghq.com/tracing/services/inferred_services/.
-        # Verified via DD spans 2026-05-07: 64 phantom spans/2h all
-        # carry `service:jikcel...lambda-url.us-east-1.on.aws` AND
-        # `base_service:grug-webhook` — same shape pasto-api faced
-        # before PR somatic-scripts#235 fixed it.
-        "DD_TRACE_MANAGED_SERVICES": "false",
-    },
-    timeout_seconds=15,
-    memory_mb=512,
-    # SPA at https://grug.lol calls api.grug.lol with credentials cookie.
-    # Browser rejects wildcard origin when credentials=True, so the
-    # apex must be enumerated. Methods enumerated to match every verb
-    # FastAPI routers expose (Slice 7 #28 added PUT for repo config).
-    cors_allow_origins=[f"https://{domain}"],
-    cors_allow_methods=["GET", "POST", "PUT", "DELETE"],
-    cors_allow_headers=["content-type", "authorization"],
-    cors_allow_credentials=True,
-    # Encrypt env vars at rest — api role already has kms:Decrypt on
-    # this CMK via kms_cmk.grant_use_to_role below (envelope-encrypted
-    # OAuth tokens), so the additional Lambda-runtime decrypt at cold
-    # start is covered by the existing grant. Closes #60.
-    env_vars_kms_key_arn=grug_tokens_cmk.arn,
-    # See webhook above. Closes #88.
-    iam_propagation_wait=_iam_propagation_wait,
-)
-
-# Per IAM split (Slice 2 acceptance criterion): api Lambda CAN decrypt
-# user OAuth tokens via KMS envelope. Webhook Lambda cannot — it never
-# reads user tokens (uses GitHub App JWT instead).
-kms_cmk.grant_use_to_role(
-    cmk=grug_tokens_cmk,
-    role=api_lambda.role,
-    statement_id="grug-api-kms-policy",
-)
-
-# api role: send to the re-run queue (#305). The api enqueues; the webhook
-# consumes via the grug-rerun-jobs ESM above.
-aws.iam.RolePolicy(
-    "grug-api-rerun-sqs",
-    role=api_lambda.role.id,
-    policy=_rerun_jobs_queue.arn.apply(
-        lambda arn: json.dumps(
-            {
-                "Version": "2012-10-17",
-                "Statement": [
-                    {
-                        "Effect": "Allow",
-                        "Action": ["sqs:SendMessage", "sqs:GetQueueAttributes"],
-                        "Resource": arn,
-                    }
-                ],
-            }
-        )
-    ),
-)
-
-# DDB IAM for api Lambda (read+write for v1; tighten per access pattern
-# in later slices if needed).
-import json as _json
-import pulumi_aws as _aws
-_aws.iam.RolePolicy(
-    "grug-api-ddb-policy",
-    role=api_lambda.role.id,
-    policy=grug_main_table.arn.apply(
-        lambda arn: _json.dumps(
-            {
-                "Version": "2012-10-17",
-                "Statement": [
-                    {
-                        "Effect": "Allow",
-                        "Action": [
-                            "dynamodb:GetItem",
-                            "dynamodb:PutItem",
-                            "dynamodb:UpdateItem",
-                            "dynamodb:DeleteItem",
-                            "dynamodb:Query",
-                            # Scan backs the admin endpoints (_scan_all over
-                            # USER#/INST# rows). Its absence 500'd
-                            # GET /admin/users + /admin/installations with
-                            # AccessDeniedException — admin never worked.
-                            "dynamodb:Scan",
-                            "dynamodb:BatchGetItem",
-                            "dynamodb:BatchWriteItem",
-                        ],
-                        "Resource": [arn, f"{arn}/index/*"],
-                    },
-                ],
-            },
-        ),
-    ),
-)
-
-
-
-# CF DNS — api.grug.lol → api Lambda Function URL (proxied; Worker
-# rewrites Host header just like webhook). Worker deployed via
-# infra/cloudflare/deploy.sh.
-cloudflare_dns.create_proxied_cname(
-    zone_id=_cf_zone_id.value,
-    name="api",
-    domain=domain,
-    target_url=api_lambda.function_url,
-    provider=cf_provider,
-    proxied=True,
-)
+# (infra#239). The api record was likewise hand-PATCHed to its tunnel
+# origin + state-deleted at the api cutover (#1172).
 
 # Datadog monitors (Slice 9 #30). Provider reads DD creds from SSM — the
 # shared INFRA DD app key (`/infra/datadog/app_key`), paired with the infra
@@ -686,10 +504,8 @@ elder_dashboard = dd_dashboard.create_elder_health(env=env, provider=_dd_provide
 
 
 pulumi.export("webhook_public_url", f"https://webhook.{domain}/webhook/github")
-pulumi.export("api_function_url", api_lambda.function_url)
 pulumi.export("api_public_url", f"https://api.{domain}")
 pulumi.export("gha_deploy_role_arn", gha_deploy_role.arn)
-pulumi.export("ecr_api_repo_url", api_ecr.repository_url)
 pulumi.export("ddb_table_name", grug_main_table.name)
 pulumi.export("ddb_table_arn", grug_main_table.arn)
 pulumi.export("kms_cmk_arn", grug_tokens_cmk.arn)

@@ -1,10 +1,9 @@
 name: IaC · Pulumi deploy (grug)
 
 # Deploys grug SaaS infra to AWS via OIDC (no long-lived creds).
-#   - PR to main          → build-only validation (native arm64, no push/deploy)
-#   - push main / tag v*  → build + push images, then pulumi up + CF Workers + smoke
-# webhook+api arm64 images build via the shared container-build reusable in
-# githumps/infra-public. Native arm64 on ubuntu-24.04-arm — NO QEMU.
+#   - push main / tag v*  → pulumi up + CF Workers + smoke (PRs: meta only)
+# The Lambda image build lanes retired with the #354 k8s cutover - app
+# images now build+deploy via deploy.k8s.yml (in-cluster registry).
 
 on:
   push:
@@ -42,27 +41,8 @@ jobs:
       - id: t
         run: echo "tag=${GITHUB_SHA::8}" >> "$GITHUB_OUTPUT"
 
-  build:
-    needs: meta
-    strategy:
-      matrix:
-        service: [api]  # webhook image retired at the #354 k8s cutover
-    uses: githumps/infra-public/.github/workflows/build.container.yml@cd83e5727c0a7b904f780960664a51b3a3a0c685  # infra-public main; bump deliberately
-    with:
-      runner: ubuntu-24.04-arm
-      image: grug-${{ matrix.service }}
-      tag: ${{ needs.meta.outputs.tag }}
-      context: services/${{ matrix.service }}
-      dockerfile: services/${{ matrix.service }}/Dockerfile.lambda
-      platform: linux/arm64
-      registry-type: ecr
-      push: ${{ github.event_name != 'pull_request' }}
-    secrets:
-      role_to_assume: arn:aws:iam::${{ secrets.AWS_ACCOUNT_ID }}:role/grug-gha-deploy
-      registry: ${{ secrets.AWS_ACCOUNT_ID }}.dkr.ecr.us-east-1.amazonaws.com
-
   pulumi-up:
-    needs: [meta, build]
+    needs: meta
     if: github.event_name != 'pull_request'
     runs-on: ubuntu-latest
     timeout-minutes: 20
@@ -102,8 +82,6 @@ jobs:
             # traffic. Builds still push per-SHA images; the Lambdas just
             # never advance past this tag. Do NOT unfreeze: the Lambdas
             # retire at cutover (retirement PR removes this whole pipeline).
-            api_image_tag:     { value: "7c946045" }
-            full_commit_sha:   { value: "${{ github.sha }}" }
       - name: 11. Deploy CF Workers
         run: bash infra/cloudflare/deploy.sh
         env:
