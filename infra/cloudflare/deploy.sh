@@ -114,7 +114,7 @@ deploy_one() {
       "$worker_src" > /tmp/worker.js
 
     local upload
-    upload=$(curl -sS -X PUT \
+    upload=$(curl -sS --connect-timeout 10 --max-time 60 -X PUT \
         -H "Authorization: Bearer $CF_TOKEN" \
         -F 'metadata={"main_module":"worker.js","compatibility_date":"2024-09-01"};type=application/json' \
         -F "worker.js=@/tmp/worker.js;type=application/javascript+module" \
@@ -134,7 +134,7 @@ deploy_one() {
     # header. The endpoint is upsert semantics so re-runs are safe.
     if [ -n "$CF_SHARED_SECRET" ]; then
         local secret_response
-        secret_response=$(curl -sS -X PUT \
+        secret_response=$(curl -sS --connect-timeout 10 --max-time 60 -X PUT \
             -H "Authorization: Bearer $CF_TOKEN" \
             -H "Content-Type: application/json" \
             -d "{\"name\":\"$BINDING_NAME\",\"type\":\"secret_text\",\"text\":\"$CF_SHARED_SECRET\"}" \
@@ -150,7 +150,7 @@ deploy_one() {
     fi
 
     local route_response
-    route_response=$(curl -sS -X POST \
+    route_response=$(curl -sS --connect-timeout 10 --max-time 60 -X POST \
         "https://api.cloudflare.com/client/v4/zones/$CF_ZONE/workers/routes" \
         -H "Authorization: Bearer $CF_TOKEN" -H "Content-Type: application/json" \
         -d "{\"pattern\":\"$route_pattern\",\"script\":\"$worker_name\"}")
