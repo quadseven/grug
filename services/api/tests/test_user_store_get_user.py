@@ -13,40 +13,14 @@ tests exercise the former.
 
 from __future__ import annotations
 
-import boto3
 import pytest
 
 
 @pytest.fixture
-def _us(monkeypatch):
-    moto = pytest.importorskip("moto")
-    from moto import mock_aws  # type: ignore
-
-    with mock_aws():
-        monkeypatch.setenv("AWS_DEFAULT_REGION", "us-east-1")
-        monkeypatch.setenv("GRUG_DDB_TABLE", "grug-main-test")
-        kms = boto3.client("kms", region_name="us-east-1")
-        cmk = kms.create_key(Description="test-grug-tokens")
-        monkeypatch.setenv("GRUG_KMS_CMK_ARN", cmk["KeyMetadata"]["Arn"])
-        ddb = boto3.client("dynamodb", region_name="us-east-1")
-        ddb.create_table(
-            TableName="grug-main-test",
-            KeySchema=[
-                {"AttributeName": "PK", "KeyType": "HASH"},
-                {"AttributeName": "SK", "KeyType": "RANGE"},
-            ],
-            AttributeDefinitions=[
-                {"AttributeName": "PK", "AttributeType": "S"},
-                {"AttributeName": "SK", "AttributeType": "S"},
-            ],
-            BillingMode="PAY_PER_REQUEST",
-        )
-        import importlib
-        import crypto.kms_envelope as kms_mod
-        importlib.reload(kms_mod)
-        import adapters.user_store as us
-        importlib.reload(us)
-        yield us
+def _us(pg_store):
+    """Post-#354 swap: delegates to the shared real-Postgres fixture
+    (conftest.pg_store) - moto-DDB setup lives in git history."""
+    yield pg_store["user_store"]
 
 
 def test_get_user_unknown_returns_none(_us):
@@ -107,12 +81,9 @@ def test_get_user_returns_admin_state_after_allowlist(_us):
         github_user_id="100", login="myname",
         oauth_access_token="x", oauth_refresh_token=None,
     )
-    # Bump to admin in DDB directly
-    _us._table.update_item(
-        Key={"PK": _us._user_pk("100"), "SK": "META"},
-        UpdateExpression="SET #r = :r, tier = :t, allowlisted = :a",
-        ExpressionAttributeNames={"#r": "role"},
-        ExpressionAttributeValues={":r": "admin", ":t": "lifetime", ":a": True},
+    # Bump to admin out-of-band via the store's own field-update helper.
+    _us.update_user_fields(
+        "100", {"role": "admin", "tier": "lifetime", "allowlisted": True}
     )
     u = _us.get_user("100")
     assert u.role == "admin"

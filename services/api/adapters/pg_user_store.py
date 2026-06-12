@@ -250,7 +250,7 @@ def scan_meta_items(*, pk_prefix: str) -> list[dict[str, Any]]:
     """All live META rows whose PK starts with `pk_prefix` (USER#/INST#).
 
     The DDB version paginated a 1MB-page Scan with a 50-page defensive
-    cap; a single indexed WHERE replaces it.
+    cap; a single WHERE replaces it.
     """
     with get_pool().connection() as conn:
         rows = conn.execute(
@@ -274,6 +274,11 @@ def update_user_fields(user_id: str, fields: dict[str, Any]) -> dict[str, Any]:
     Admin-only path; the caller has already 404'd on a missing row, but
     enforce it here too (the WHERE) so a race with row deletion cannot
     resurrect a sparse row.
+
+    No TTL_LIVE in the WHERE (unlike the read paths): USER# META rows
+    never carry a ttl - only install-store claim/comment rows do - so
+    the asymmetry is intentional, not a missed filter. Same applies to
+    delete_user_state.
     """
     with get_pool().connection() as conn:
         row = conn.execute(

@@ -1,21 +1,22 @@
 #!/usr/bin/env python3
-"""Grounding attester for the DDB-handle concurrency invariant.
+"""Grounding attester for the store-handle concurrency invariant.
 
-The peer-review pass surfaced an unguarded lazy-init race in the
-`_LazyTable` descriptor pattern shared by user_store + install_store:
-two warm-Lambda concurrent invocations could both see `_table_real is
-None` and both call `boto3.resource()`, leaking one of the two handles.
+The peer-review pass surfaced an unguarded lazy-init race in the DDB
+era's `_LazyTable` descriptor: two warm concurrent invocations could
+both see the handle as None and both construct it, leaking one. The
+#354 Postgres port carries the SAME invariant in `pg_base.get_pool()`
+(its docstring cites the same rationale): a connection pool built
+twice leaks connections and double-runs the schema bootstrap.
 
-Asserts that in every file using `_LazyTable`:
+Asserts that in every pg_base mirror:
   1. `import threading` is present
-  2. `_init_lock = threading.Lock()` (or similar) is at module scope
-  3. `_LazyTable.__getattr__` opens the lock BEFORE the inner re-check
-  4. The double-checked-locking re-check (`if _table_real is None:` AFTER
-     `with _init_lock:`) is present
+  2. `<name> = threading.Lock()` is at module scope
+  3. `get_pool` opens a `with <lock>:` block containing the inner
+     `if _pool is None:` re-check (double-checked locking, testing
+     the RIGHT variable - a spurious `if other is None:` must not pass)
 
-No spec dir for this invariant — the attester IS the contract. If we
-later promote it to a full spec, the bool name would be
-`ddb_handle_lazy_init_is_double_checked_locked_per_persistence_concepts`.
+No spec dir for this invariant - the attester IS the contract (the
+spec-0011 automaton models the state machine; this grounds it in code).
 """
 from __future__ import annotations
 
@@ -25,10 +26,9 @@ from pathlib import Path
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
 
-LAZY_TABLE_PATHS: tuple[Path, ...] = (
-    REPO_ROOT / "services/api/adapters/user_store.py",
-    REPO_ROOT / "services/api/adapters/install_store.py",
-    REPO_ROOT / "services/webhook/adapters/install_store.py",
+POOL_PATHS: tuple[Path, ...] = (
+    REPO_ROOT / "services/api/adapters/pg_base.py",
+    REPO_ROOT / "services/webhook/adapters/pg_base.py",
 )
 
 
@@ -60,50 +60,48 @@ def _has_module_lock(tree: ast.Module) -> bool:
     return False
 
 
-def _check_lazy_table_getattr(tree: ast.Module) -> str | None:
-    """Find class _LazyTable, find __getattr__, verify it uses `with <lock>:`
-    AND has the inner `if ... is None:` re-check inside the `with` block."""
+def _check_get_pool_double_checked(tree: ast.Module) -> str | None:
+    """Find get_pool, verify it uses `with <lock>:` AND has the inner
+    `if _pool is None:` re-check inside the `with` block."""
     for node in ast.walk(tree):
-        if not (isinstance(node, ast.ClassDef) and node.name == "_LazyTable"):
+        if not (isinstance(node, ast.FunctionDef) and node.name == "get_pool"):
             continue
-        for body_node in node.body:
-            if not (isinstance(body_node, ast.FunctionDef) and body_node.name == "__getattr__"):
-                continue
-            with_blocks = [n for n in ast.walk(body_node) if isinstance(n, ast.With)]
-            if not with_blocks:
-                return "__getattr__ has no `with <lock>:` block"
-            # Verify at least one `with` contains an inner `if ... is None:`
-            for w in with_blocks:
-                for sub in ast.walk(w):
-                    if isinstance(sub, ast.If) and isinstance(sub.test, ast.Compare):
-                        ops = sub.test.ops
-                        comps = sub.test.comparators
-                        # Peer-review MED (4x): only accept the re-check when the
-                        # name being tested is `_table_real` — a spurious
-                        # `if other_var is None:` would otherwise false-pass.
-                        if not (
-                            len(ops) == 1
-                            and isinstance(ops[0], ast.Is)
-                            and len(comps) == 1
-                            and isinstance(comps[0], ast.Constant)
-                            and comps[0].value is None
-                        ):
-                            continue
-                        if not (isinstance(sub.test.left, ast.Name) and sub.test.left.id == "_table_real"):
-                            continue
-                        return None
-            return "`with <lock>:` block has no inner `if _table_real is None:` re-check (double-checked locking incomplete or testing wrong variable)"
-        return "_LazyTable has no __getattr__"
-    return "no _LazyTable class found"
+        with_blocks = [n for n in ast.walk(node) if isinstance(n, ast.With)]
+        if not with_blocks:
+            return "get_pool has no `with <lock>:` block"
+        for w in with_blocks:
+            for sub in ast.walk(w):
+                if isinstance(sub, ast.If) and isinstance(sub.test, ast.Compare):
+                    ops = sub.test.ops
+                    comps = sub.test.comparators
+                    # Only accept the re-check when the name being tested
+                    # is `_pool` - a spurious `if other_var is None:`
+                    # would otherwise false-pass (peer-review MED, 4x).
+                    if not (
+                        len(ops) == 1
+                        and isinstance(ops[0], ast.Is)
+                        and len(comps) == 1
+                        and isinstance(comps[0], ast.Constant)
+                        and comps[0].value is None
+                    ):
+                        continue
+                    if not (isinstance(sub.test.left, ast.Name) and sub.test.left.id == "_pool"):
+                        continue
+                    return None
+        return (
+            "`with <lock>:` block has no inner `if _pool is None:` re-check "
+            "(double-checked locking incomplete or testing wrong variable)"
+        )
+    return "no get_pool function found"
 
 
 def main() -> int:
     # Vacuous-pass guard.
-    if not LAZY_TABLE_PATHS:
-        print("FAIL: LAZY_TABLE_PATHS is empty — refusing to pass vacuously")
+    if not POOL_PATHS:
+        print("FAIL: POOL_PATHS is empty — refusing to pass vacuously")
         return 1
     failures: list[str] = []
-    for path in LAZY_TABLE_PATHS:
+    for path in POOL_PATHS:
         if not path.exists():
             failures.append(f"FAIL: {path} missing")
             continue
@@ -113,17 +111,17 @@ def main() -> int:
             problems.append("no `import threading` at module level")
         if not _has_module_lock(tree):
             problems.append("no `threading.Lock()` assigned at module scope")
-        getattr_issue = _check_lazy_table_getattr(tree)
-        if getattr_issue:
-            problems.append(getattr_issue)
+        get_pool_issue = _check_get_pool_double_checked(tree)
+        if get_pool_issue:
+            problems.append(get_pool_issue)
         if problems:
             failures.append(f"FAIL: {path}\n" + "\n".join(f"  - {p}" for p in problems))
     if failures:
         print("\n".join(failures))
-        print("\n  Fix: add `_init_lock = threading.Lock()` and wrap the lazy-init in")
-        print("  `with _init_lock:` followed by an inner `if _table_real is None:` re-check.")
+        print("\n  Fix: add `_pool_lock = threading.Lock()` and wrap the lazy-init in")
+        print("  `with _pool_lock:` followed by an inner `if _pool is None:` re-check.")
         return 1
-    print(f"OK: _LazyTable double-checked-locking verified in {len(LAZY_TABLE_PATHS)} module(s)")
+    print(f"OK: get_pool double-checked-locking verified in {len(POOL_PATHS)} module(s)")
     return 0
 
 
