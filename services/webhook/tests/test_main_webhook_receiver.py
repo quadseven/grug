@@ -33,12 +33,18 @@ def _client(monkeypatch):
     monkeypatch.setenv("GRUG_DDB_TABLE", "grug-main-test")
     monkeypatch.setenv("AWS_DEFAULT_REGION", "us-east-1")
     import main as webhook_main
+
     monkeypatch.setattr(webhook_main, "get_webhook_secret", lambda: _WEBHOOK_SECRET)
     # Stub dispatcher so we don't need DDB/KMS for the webhook-receiver tests
     import dispatcher
+
     monkeypatch.setattr(
-        dispatcher, "dispatch",
-        lambda event, payload, *, delivery_id="": {"status": "no_op", "reason": "stubbed"},
+        dispatcher,
+        "dispatch",
+        lambda event, payload, *, delivery_id="": {
+            "status": "no_op",
+            "reason": "stubbed",
+        },
     )
     return TestClient(webhook_main.app)
 
@@ -71,6 +77,7 @@ def test_unsigned_probe_logs_distinct_event_not_signature_invalid(_client, caplo
     `webhook_unsigned_probe`, never `webhook_signature_invalid` (the monitored
     alert). Keeps the sig-verify monitor precise to real rotated-secret events."""
     import logging
+
     caplog.set_level(logging.INFO)
     _client.post(
         "/webhook/github",
@@ -87,6 +94,7 @@ def test_signed_but_invalid_logs_signature_invalid(_client, caplog):
     rejection (rotated secret / forged delivery) — it must log the monitored
     `webhook_signature_invalid`, not the quiet probe event."""
     import logging
+
     caplog.set_level(logging.WARNING)
     _client.post(
         "/webhook/github",
@@ -114,6 +122,41 @@ def test_signed_non_json_body_returns_400(_client):
     )
     assert r.status_code == 400
     assert r.json()["detail"] == "body_not_json"
+
+
+def test_dispatched_personas_list_response_returns_200(_client, monkeypatch):
+    """#368 live-proof regression: dispatch() returns {status, personas: [...]}
+    (LIST-shaped) for pull_request events. The route annotation must accept
+    it - a dict[str, str] annotation made FastAPI's response validation 500
+    every dispatched PR delivery on the k8s image (the Lambda image's older
+    dependency set never enforced it, which hid the bug)."""
+    import dispatcher
+
+    monkeypatch.setattr(
+        dispatcher,
+        "dispatch",
+        lambda event, payload, *, delivery_id="": {
+            "status": "dispatched",
+            "personas": [
+                {"persona": "tpm", "result": "pass"},
+                {"persona": "code_reviewer", "result": "queued"},
+            ],
+        },
+    )
+    body = b'{"action":"synchronize","number":373}'
+    r = _client.post(
+        "/webhook/github",
+        content=body,
+        headers={
+            "X-GitHub-Event": "pull_request",
+            "X-GitHub-Delivery": "k8sproof-regression",
+            "X-Hub-Signature-256": _sign(_WEBHOOK_SECRET, body),
+        },
+    )
+    assert r.status_code == 200
+    out = r.json()
+    assert out["status"] == "dispatched"
+    assert out["personas"][1] == {"persona": "code_reviewer", "result": "queued"}
 
 
 def test_signed_valid_json_dispatches(_client):
