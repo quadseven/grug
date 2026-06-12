@@ -1,0 +1,59 @@
+# Python test gate. Until this workflow, the pytest suites only ran via
+# local `make test-*` convention - nothing gated PRs. The postgres
+# service backs the real-Postgres store tests (test_pg_stores.py, #354):
+# their semantics (ON CONFLICT atomicity, jsonb merge, concurrent
+# claims) are exactly what fakes get wrong, so no sqlite stand-in.
+name: check.python
+
+on:
+  pull_request:
+    paths:
+      - 'services/**'
+      - 'Makefile'
+      - '.github/workflows/check.python.yml'
+  push:
+    branches: [main]
+    paths:
+      - 'services/**'
+
+permissions:
+  contents: read
+
+jobs:
+  tests:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    services:
+      postgres:
+        image: postgres:18-alpine
+        env:
+          POSTGRES_PASSWORD: test
+          POSTGRES_DB: grug_test
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U postgres"
+          --health-interval 5s
+          --health-timeout 3s
+          --health-retries 10
+    env:
+      # moto-backed suites construct boto3 clients at import; hosted
+      # runners have no ambient AWS config (developer shells do, which
+      # is why this never bit locally).
+      AWS_DEFAULT_REGION: us-east-1
+      AWS_ACCESS_KEY_ID: testing
+      AWS_SECRET_ACCESS_KEY: testing
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+      - uses: astral-sh/setup-uv@fac544c07dec837d0ccb6301d7b5580bf5edae39 # v8
+      - name: webhook tests
+        run: make webhook-test
+      - name: api tests
+        run: make api-test
+      - name: pg store tests (real Postgres)
+        # DB env is STEP-scoped on purpose: job-scoped would make the plain
+        # api suite (no psycopg dep) try to RUN the pg tests instead of
+        # skipping them.
+        env:
+          GRUG_TEST_DATABASE_URL: postgresql://postgres:test@localhost:5432/grug_test
+        run: make pg-test
