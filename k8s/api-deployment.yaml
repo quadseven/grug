@@ -23,6 +23,11 @@ spec:
         tags.datadoghq.com/env: prod
     spec:
       automountServiceAccountToken: false
+      # Images are built natively for arm64 only - without this pin a
+      # mixed-arch cluster schedules onto amd64 and exec-format-errors
+      # (review F2).
+      nodeSelector:
+        kubernetes.io/arch: arm64
       imagePullSecrets:
         - name: registry-pull
       securityContext:

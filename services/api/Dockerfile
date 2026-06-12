@@ -23,4 +23,7 @@ RUN useradd --uid 10001 --no-create-home grug
 USER 10001
 
 EXPOSE 8080
-CMD ["ddtrace-run", "uvicorn", "main:app", "--host", "0.0.0.0", "--port", "8080"]
+# Single worker is INTENTIONAL at replicas:1 (the in-process token
+# cache assumes one process; scale via replicas, not workers).
+CMD ["ddtrace-run", "uvicorn", "main:app", "--host", "0.0.0.0", "--port", "8080", \
+     "--workers", "1", "--timeout-keep-alive", "15", "--timeout-graceful-shutdown", "20"]

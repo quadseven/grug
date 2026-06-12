@@ -40,6 +40,11 @@ concurrency:
 
 jobs:
   deploy:
+    # workflow_dispatch carries no branch restriction by itself - without
+    # this guard a manual run from any ref reaches the environment
+    # secrets (review F1; also set the environment protection rule to
+    # main-only as defense in depth).
+    if: github.event_name != 'workflow_dispatch' || github.ref == 'refs/heads/main'
     runs-on: ubuntu-24.04-arm
     timeout-minutes: 30
     environment: k8s-prod
@@ -101,18 +106,27 @@ jobs:
           kubectl apply -f k8s/namespace.yaml
           get() { aws ssm get-parameter --name "$1" --with-decryption \
                     --query 'Parameter.Value' --output text; }
-          # Values pass through process substitution into kubectl only -
-          # never echoed; GH masks are not relied upon.
+          # Values land in a 0600 env-file consumed via --from-env-file -
+          # NOT in kubectl argv (visible in /proc/PID/cmdline even on an
+          # ephemeral runner; review F3). Multiline values (the App
+          # private key) ride base64 in the env-file; the app reads the
+          # _B64 form (decode at startup) for exactly this reason.
+          ENVF="$RUNNER_TEMP/grug-secrets.env"
+          install -m 600 /dev/null "$ENVF"
+          {
+            echo "GRUG_DATABASE_URL=$(get /grug/database-url)"
+            echo "GRUG_GITHUB_APP_ID=$(get /grug/github-app-id)"
+            echo "GRUG_GITHUB_APP_PRIVATE_KEY_B64=$(get /grug/github-app-private-key | base64 -w0)"
+            echo "GRUG_GITHUB_WEBHOOK_SECRET=$(get /grug/github-app-webhook-secret)"
+            echo "GRUG_GITHUB_APP_CLIENT_ID=$(get /grug/github-app-client-id)"
+            echo "GRUG_GITHUB_APP_CLIENT_SECRET=$(get /grug/github-app-client-secret)"
+            echo "CF_SHARED_SECRET=$(get /grug/cf-shared-secret)"
+            echo "DD_API_KEY=$(get /grug/dd-api-key)"
+          } > "$ENVF"
           kubectl -n grug create secret generic grug-secrets \
-            --from-literal=GRUG_DATABASE_URL="$(get /grug/database-url)" \
-            --from-literal=GRUG_GITHUB_APP_ID="$(get /grug/github-app-id)" \
-            --from-literal=GRUG_GITHUB_APP_PRIVATE_KEY="$(get /grug/github-app-private-key)" \
-            --from-literal=GRUG_GITHUB_WEBHOOK_SECRET="$(get /grug/github-app-webhook-secret)" \
-            --from-literal=GRUG_GITHUB_APP_CLIENT_ID="$(get /grug/github-app-client-id)" \
-            --from-literal=GRUG_GITHUB_APP_CLIENT_SECRET="$(get /grug/github-app-client-secret)" \
-            --from-literal=CF_SHARED_SECRET="$(get /grug/cf-shared-secret)" \
-            --from-literal=DD_API_KEY="$(get /grug/dd-api-key)" \
+            --from-env-file="$ENVF" \
             --dry-run=client -o yaml | kubectl apply -f -
+          rm -f "$ENVF"
           kubectl -n grug create secret docker-registry registry-pull \
             --docker-server="$REGISTRY_HOST" \
             --docker-username="$REGISTRY_USERNAME" \
@@ -128,10 +142,21 @@ jobs:
             -e "s|REGISTRY_PLACEHOLDER|$REGISTRY_HOST|g" \
             -e "s|TAG_PLACEHOLDER|${GITHUB_SHA}|g" \
             k8s/*.yaml
+          # Post-sed sentinel: a future manifest that escapes substitution
+          # must fail the deploy, not ship a literal placeholder (F7).
+          if grep -rn 'REGISTRY_PLACEHOLDER\|TAG_PLACEHOLDER' k8s/; then
+            echo "::error::unsubstituted placeholder in k8s/"; exit 1
+          fi
           kubectl apply -k k8s/
           for d in grug-webhook grug-api; do
             kubectl -n grug rollout status deploy/$d --timeout=180s
           done
+          # CronJob smoke (F5): a broken image/command/secret must fail
+          # THIS deploy, not the next scheduled tick.
+          kubectl -n grug delete job poller-smoke --ignore-not-found
+          kubectl -n grug create job poller-smoke --from=cronjob/grug-poller
+          kubectl -n grug wait --for=condition=complete job/poller-smoke --timeout=300s
+          kubectl -n grug delete job poller-smoke
 
       - name: Cleanup
         if: always()
