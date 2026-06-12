@@ -6,8 +6,9 @@ Usage:
         --github-user-id 59060157 --login githumps
 
 Idempotent: re-running on an existing row preserves OAuth blobs and
-created_at, only flips role + tier + allowlisted to admin/lifetime/true.
-Defaults match locked PRD: admin = Evan + GF; tier = lifetime.
+created_at; it (re)writes login, role, tier, allowlisted (always True)
+and backfills the allowlisted_at/by audit pair if absent. Defaults
+match locked PRD: admin = Evan + GF; tier = lifetime.
 
 Slice 5 #26 — required to unblock the webhook allowlist gate. Without
 this, the webhook will no_op every PR until at least one admin row

@@ -68,10 +68,11 @@ pulumi-preview:
 pulumi-up:
 	cd infra/pulumi && uv sync && pulumi up --stack dev
 
-# DESTRUCTIVE. Wipes Lambdas, DDB rows (incl. admin USER# + INST#),
+# DESTRUCTIVE. Wipes Lambdas, the legacy DDB table (pre-#354 data),
 # CMK (7-day deletion delay), CF DNS records, DD monitors. GitHub
 # App config + SSM secrets persist (registered at github.com / AWS
-# SSM, not in Pulumi state).
+# SSM, not in Pulumi state). The Postgres store (grug_kv) is NOT in
+# this Pulumi state and survives - hence the post-rebuild re-seed.
 tear-down:
 	@echo ">> tear-down: destroying dev stack (CTRL-C now to abort)"
 	@sleep 5

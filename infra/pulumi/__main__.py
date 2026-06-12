@@ -393,8 +393,8 @@ webhook = lambda_service.create(
         # future merged webhook+api Lambda has them available.
         "GITHUB_APP_CLIENT_ID_SSM": secrets["github-app-client-id"].name,
         "GITHUB_APP_CLIENT_SECRET_SSM": secrets["github-app-client-secret"].name,
-        # DDB allowlist gate (Slice 5 #26). Webhook reads INST# + USER#
-        # rows directly (no KMS — token blobs are api-Lambda-only).
+        # LEGACY (pre-#354): retained until the Lambdas retire at
+        # cutover; the swapped images read Postgres and ignore this.
         "GRUG_DDB_TABLE": grug_main_table.name,
         # Elder persona LLM client — webhook-only (api never calls LLMs).
         "GRUG_OPENROUTER_API_KEY_SSM": _openrouter_api_key.name,
@@ -779,8 +779,10 @@ _aws.iam.RolePolicy(
 # `poller_handler.handler` runs the cron entrypoint (#266) from the same
 # image with DD APM tracing. NO Function URL (EventBridge is the only
 # trigger). Needs the GitHub-App SecureStrings (install-token minting) +
-# DDB read/update; NOT the LLM keys (the reaction annotation is a DD-SDK
+# store read/update; NOT the LLM keys (the reaction annotation is a DD-SDK
 # call, no inference). DD_SERVICE=grug-poller for a distinct o11y surface.
+# LEGACY (pre-#354): this Lambda retires at cutover; the k8s CronJob
+# replaced it and the swapped images read Postgres, not GRUG_DDB_TABLE.
 poller = scheduled_lambda.create(
     "grug-poller",
     ecr_repo=webhook_ecr,

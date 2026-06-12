@@ -2,10 +2,9 @@
 #
 # Models the identity + decrypted-OAuth-tokens projection. Per CONTEXT.md
 # § "Identity & authorization concepts" + § "Persistence concepts":
-# TRANSITIONAL (#354): adapters/pg_user_store.py is the staged Postgres
-# successor and carries the SAME sole-construction + decrypt-boundary
-# contract; the attester allows both files until the cutover swap
-# collapses them back to one.
+# Post-swap (#354): adapters/pg_user_store.py is the canonical store;
+# user_store.py is a re-export facade with no class definitions. The
+# attester checks pg_user_store.py only.
 # UserWithTokens is constructed ONLY on the OAuth-refresh / on-behalf-of-
 # user paths in the api Lambda. The webhook Lambda has no KMS permissions
 # and MUST NEVER construct this type (enforced both at the IAM plane and

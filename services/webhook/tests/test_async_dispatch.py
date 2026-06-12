@@ -217,7 +217,7 @@ def test_slim_payload_satisfies_dispatch_code_review_consumer(monkeypatch):
 
 
 def test_run_elder_job_fails_open_when_claim_errors():
-    """A DDB hiccup on the claim must not drop the review — fail OPEN
+    """A store hiccup on the claim must not drop the review — fail OPEN
     (run it). A possible duplicate beats a silently-skipped review."""
     with patch("adapters.install_store.claim_delivery",
                side_effect=RuntimeError("ddb down")), \

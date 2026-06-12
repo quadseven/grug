@@ -1,16 +1,17 @@
 """Admin-only user + allowlist management (Slice 8 #29).
 
 Endpoints — all gated by `require_admin`:
-  GET  /api/v1/admin/users              → all USER# rows (paginated)
+  GET  /api/v1/admin/users              → all USER# rows
   PATCH /api/v1/admin/users/{user_id}   → flip allowlisted / role / tier
   GET  /api/v1/admin/installations      → all INST# rows (cross-user)
 
-DDB Scan instead of Query — admin endpoint, low traffic, < 100 rows in
-v1 (Evan + GF + handful of beta testers). At ~100 users we'd switch to
-a `BY=admin` GSI; for v1 that's premature optimization.
+Full prefix-fetch instead of a filtered/paged query — admin endpoint,
+low traffic, < 100 rows in v1 (Evan + GF + handful of beta testers).
+At real scale we'd add a dedicated index/predicate; for v1 that's
+premature optimization.
 
 Audit trail: every PATCH logs to DD with structured `admin_user_patched`
-event including actor + before/after diff. No DDB audit table per
+event including actor + before/after diff. No audit table in the store per
 locked PRD ("DD unlimited tier handles audit").
 """
 
@@ -32,7 +33,7 @@ router = APIRouter(prefix="/api/v1/admin")
 
 
 def _user_to_admin_view(item: dict[str, Any]) -> dict[str, Any]:
-    """Project a USER# DDB row into the admin response shape.
+    """Project a USER# store row into the admin response shape.
 
     Excludes oauth_*_blob ciphertext — admin doesn't need plaintext
     tokens AND including blobs in JSON responses would let an admin
