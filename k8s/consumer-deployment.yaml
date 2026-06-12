@@ -53,7 +53,6 @@ spec:
               valueFrom: {fieldRef: {fieldPath: status.hostIP}}
             - {name: DD_LOGS_INJECTION, value: "true"}
             - {name: GRUG_ENV, value: prod}
-            - {name: GRUG_DDB_TABLE, value: grug-main}
             - {name: GITHUB_APP_ID_SSM, value: /grug/github-app-id}
             - {name: GITHUB_APP_PRIVATE_KEY_SSM, value: /grug/github-app-private-key}
             - {name: GITHUB_APP_WEBHOOK_SECRET_SSM, value: /grug/github-app-webhook-secret}

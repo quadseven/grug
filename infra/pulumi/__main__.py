@@ -35,7 +35,6 @@ from components import (
     kms_cmk,
     lambda_service,
     oidc_role,
-    scheduled_lambda,
     ssm_secrets,
 )
 # NOTE: CF Worker (grug-webhook-host-rewrite) is managed OUT OF BAND
@@ -152,33 +151,11 @@ grug_tokens_cmk = kms_cmk.create("grug-tokens")
 # avoids a second `pulumi up` to wire the env var after the secret lands.
 cf_secret = cf_shared_secret.create()
 
-# ECR repo for the webhook Lambda image. Lifecycle: untagged expire after 14d
-# AND keep only the last 20 images — CI SHA-tags every build, so without the
-# count rule tagged images accumulated to 215 (the bulk of the repo's billed
-# storage). 20 = current deploy + generous rollback headroom.
-webhook_ecr = ecr_repo.create(
-    name="grug-webhook",
-    untagged_expire_days=14,
-    keep_last_images=20,
-    # dev needs force_delete=True for `make rebuild` (Slice 10 #31).
-    # prod stays False so `pulumi destroy --stack prod` cannot wipe
-    # production images. Greptile P2 PR #59.
-    force_delete=(env == "dev"),
-)
 
-# Webhook Lambda + Function URL. Image tag wired in via CI build step
-# (`pulumi up` consumes config value `webhook_image_tag`). Special tag
-# "bootstrap" means: use the public AWS Lambda Python 3.13 arm64 image
-# so the Lambda CREATES successfully even before our private ECR repo
-# has any pushed images. Lambda invocations will error (handler not
-# found in the base image) but the resource exists, the Function URL
-# is live, CF DNS resolves. CI's first build replaces the image tag
-# with the real SHA, second `pulumi up` swaps imageUri.
-webhook_image_tag = config.get("webhook_image_tag") or "bootstrap"
-# Full 40-char commit SHA — separate from image_tag (8-char short)
-# because DD source-code linking requires the full SHA. Greptile P1
-# PR #81. CI passes via config; bootstrap deploys fall back to short.
-_full_commit_sha = config.get("full_commit_sha") or webhook_image_tag
+# Full 40-char commit SHA — DD source-code linking requires the full
+# SHA (Greptile P1 PR #81). CI passes via config; falls back to the api
+# image tag (the webhook Lambda retired at the #354 k8s cutover).
+_full_commit_sha = config.get("full_commit_sha") or config.get("api_image_tag") or "bootstrap"
 # Elder prompt A/B experiment mode (#191). A plain String (NOT SecureString —
 # it's a non-secret operational toggle): one of "off" | "split" | "all_v2".
 # Pulumi OWNS the parameter's existence + the "off" default (all-Pulumi rule),
@@ -368,232 +345,22 @@ _k8s_pod = k8s_pod_user.create(
     cave_diff_bucket_arn=_cave_diff_bucket.arn,
 )
 
-webhook = lambda_service.create(
-    name="grug-webhook",
-    ecr_repo=webhook_ecr,
-    image_tag=webhook_image_tag,
-    secrets=secrets,
-    # Mixed refs: cf_secret.ssm_parameter is `aws.ssm.Parameter` (created
-    # resource, Output[str] arns) while the others are `GetParameterResult`
-    # (sync data lookup, plain-str arns). Both satisfy the `SsmSecretRef`
-    # Protocol (components/_types.py) — they expose `.arn`/`.name`, and the
-    # consuming IAM policy wraps the arn list in `Output.all(...).apply()`,
-    # so either arm resolves correctly (#235 named this contract).
-    extra_ssm_secrets=[_dd_api_key, cf_secret.ssm_parameter, _openrouter_api_key, _poolside_api_key, _prompt_experiment, _fallback_enabled],
-    # NOTE: DD extension is BAKED into the Lambda container image
-    # (services/webhook/Dockerfile.lambda copies from
-    # public.ecr.aws/datadog/lambda-extension-arm:<v>). Lambda Container
-    # package_type rejects `layers`, so layer-attachment is unavailable.
-    env_vars={
-        "GRUG_ENV": env,
-        "GRUG_LOG_LEVEL": "INFO",
-        "GITHUB_APP_ID_SSM": secrets["github-app-id"].name,
-        "GITHUB_APP_PRIVATE_KEY_SSM": secrets["github-app-private-key"].name,
-        "GITHUB_APP_WEBHOOK_SECRET_SSM": secrets["github-app-webhook-secret"].name,
-        # OAuth refs — webhook itself doesn't read them; included so a
-        # future merged webhook+api Lambda has them available.
-        "GITHUB_APP_CLIENT_ID_SSM": secrets["github-app-client-id"].name,
-        "GITHUB_APP_CLIENT_SECRET_SSM": secrets["github-app-client-secret"].name,
-        # LEGACY (pre-#354): retained until the Lambdas retire at
-        # cutover; the swapped images read Postgres and ignore this.
-        "GRUG_DDB_TABLE": grug_main_table.name,
-        # Elder persona LLM client — webhook-only (api never calls LLMs).
-        "GRUG_OPENROUTER_API_KEY_SSM": _openrouter_api_key.name,
-        "GRUG_POOLSIDE_API_KEY_SSM": _poolside_api_key.name,
-        # Elder prompt A/B arm selector (#191). Carries the param NAME only;
-        # the value (off|split|all_v2) is read fallback-safe at cold start.
-        "GRUG_PROMPT_EXPERIMENT_SSM": _prompt_experiment.name,
-        # Elder cave fallback (#310, ADR-0005): the flag param NAME (read
-        # fallback-safe) + the jobs-queue URL the producer sends to. Empty URL
-        # => enqueue is a no-op, so a half-wired deploy can't crash a review.
-        "GRUG_FALLBACK_ENABLED_SSM": _fallback_enabled.name,
-        "GRUG_CAVE_JOBS_QUEUE_URL": _cave_jobs_queue.url,
-        # Spilled-diff bucket (#311): empty => no spillover (a too-large diff
-        # just can't pack and the enqueue no-ops). Set => big diffs spill here.
-        "GRUG_CAVE_DIFF_BUCKET": _cave_diff_bucket.id,
-        # CF→AWS auth boundary — middleware reads at cold start (#173).
-        "GRUG_CF_SHARED_SECRET_SSM": cf_secret.ssm_parameter.name,
-        # Datadog APM (datadog_lambda wrapper finds real handler via
-        # DD_LAMBDA_HANDLER; layer adds the trace agent + log forwarder).
-        "DD_LAMBDA_HANDLER": "lambda_handler.handler",
-        "DD_SITE": "datadoghq.com",
-        "DD_API_KEY": _dd_api_key.value,
-        "DD_ENV": env,
-        "DD_SERVICE": "grug-webhook",
-        "DD_VERSION": webhook_image_tag,
-        # Closes #70 — set DD source-code link via runtime env vars
-        # instead of --build-arg so commit SHA churn doesn't bust
-        # buildx layer cache (which made every deploy a cold rebuild).
-        "DD_GIT_REPOSITORY_URL": "https://github.com/githumps/grug",
-        "DD_GIT_COMMIT_SHA": _full_commit_sha,
-        "DD_TRACE_ENABLED": "true",
-        "DD_LOGS_INJECTION": "true",
-        # DD LLM Observability for the Elder code-reviewer persona.
-        # Webhook-only: api Lambda never makes LLM calls so these env
-        # vars are omitted from the api section below.
-        "DD_LLMOBS_ENABLED": "true",
-        "DD_LLMOBS_ML_APP": "grug-elder",
-        # Disable noisy ASGI integration that collapses every FastAPI
-        # request into a single "ASGI request" trace span (per memory
-        # `reference_dd_apm_asgi_resource_grouping`).
-        "DD_PATCH_MODULES": "asgi:false",
-        "DD_TRACE_ASGI_ENABLED": "false",
-        # Kill DD Lambda Extension's inferred-spans feature. Without
-        # this, the Extension synthesizes an `aws.lambda.url` root
-        # span per Function URL invocation tagged with the lambda-url
-        # FQDN as `service`, creating a phantom DD APM service entry
-        # like `<id>.lambda-url.us-east-1.on.aws` alongside the real
-        # `grug-webhook` / `grug-api` entries. Canonical kill-switch
-        # per https://docs.datadoghq.com/tracing/services/inferred_services/.
-        # Verified via DD spans 2026-05-07: 64 phantom spans/2h all
-        # carry `service:jikcel...lambda-url.us-east-1.on.aws` AND
-        # `base_service:grug-webhook` — same shape pasto-api faced
-        # before PR somatic-scripts#235 fixed it.
-        "DD_TRACE_MANAGED_SERVICES": "false",
-    },
-    # 420s (#272 — was 60s in #252). The Elder LLM review is now OFFLOADED
-    # off the ACK path: the sync invocation does HMAC + TPM + a fire-and-
-    # forget self-invoke (returns in ~1–2s), and a SEPARATE async invocation
-    # of THIS function runs the Elder dispatch. This one timeout governs both
-    # shapes, so it must cover Elder's worst case: review_diff retries
-    # `_RETRY_ATTEMPTS`(3) per backend × 2 backends × `_TIMEOUT_SECONDS`(30) +
-    # backoff + the judge call ≈ 300s. 420s gives headroom. The sync ACK path
-    # is unaffected by the high ceiling — its httpx calls are each individually
-    # bounded (≤30s), so it provably can't run 420s; the ceiling only ever
-    # bites the async Elder invocation. Lambda bills actual duration, so the
-    # headroom is free except for the rare hung-call concurrency hold.
-    timeout_seconds=420,
-    memory_mb=512,
-    # Grant lambda:InvokeFunction on its own ARN so the sync handler can
-    # self-invoke the async Elder worker (#272).
-    allow_self_invoke=True,
-    # Encrypt env vars (DD_API_KEY in particular) at rest so a reader
-    # with `lambda:GetFunctionConfiguration` alone can't recover the
-    # plaintext API key. Closes #60. Webhook role granted kms:Decrypt
-    # via the additional inline policy below.
-    env_vars_kms_key_arn=grug_tokens_cmk.arn,
-    # Wait 45s after deploy-role policy update so AWS auth-checks see
-    # `kms:Encrypt` + `kms:GenerateDataKey` before this Function update
-    # runs. Closes #88.
-    iam_propagation_wait=_iam_propagation_wait,
-)
 
-# Webhook role: SQS perms for the cave airlock (#310). Send to jobs, consume
-# results. (ssm:GetParameter on the flag param is already granted via
-# extra_ssm_secrets above.) The result queue is wired to the webhook Lambda by
-# the event-source mapping below → lambda_handler routes it to
-# handle_fallback_result.
-aws.iam.RolePolicy(
-    "grug-webhook-cave-sqs",
-    role=webhook.role.id,
-    policy=pulumi.Output.all(
-        _cave_jobs_queue.arn, _cave_results_queue.arn, _cave_diff_bucket.arn
-    ).apply(
-        lambda a: json.dumps(
-            {
-                "Version": "2012-10-17",
-                "Statement": [
-                    {
-                        "Effect": "Allow",
-                        "Action": ["sqs:SendMessage", "sqs:GetQueueAttributes"],
-                        "Resource": a[0],
-                    },
-                    {
-                        "Effect": "Allow",
-                        "Action": ["sqs:ReceiveMessage", "sqs:DeleteMessage", "sqs:GetQueueAttributes"],
-                        "Resource": a[1],
-                    },
-                    {
-                        # Spill large diffs (#311) — PutObject only, scoped to
-                        # the diffs/ prefix. The webhook writes; never reads/lists.
-                        "Effect": "Allow",
-                        "Action": ["s3:PutObject"],
-                        "Resource": f"{a[2]}/diffs/*",
-                    },
-                ],
-            }
-        )
-    ),
-)
-aws.lambda_.EventSourceMapping(
-    "grug-cave-results-esm",
-    event_source_arn=_cave_results_queue.arn,
-    function_name=webhook.function.name,
-    # batch_size=1: one result → one heal; the handler never raises (a raise
-    # would retry-storm the ESM), so whole-batch success semantics are fine.
-    batch_size=1,
-)
-
-# Webhook role: consume the re-run queue (#305). lambda_handler routes the
-# grug-rerun-jobs ESM (by queue ARN) to rerun.handle_rerun_jobs.
-aws.iam.RolePolicy(
-    "grug-webhook-rerun-sqs",
-    role=webhook.role.id,
-    policy=_rerun_jobs_queue.arn.apply(
-        lambda arn: json.dumps(
-            {
-                "Version": "2012-10-17",
-                "Statement": [
-                    {
-                        "Effect": "Allow",
-                        "Action": ["sqs:ReceiveMessage", "sqs:DeleteMessage", "sqs:GetQueueAttributes"],
-                        "Resource": arn,
-                    }
-                ],
-            }
-        )
-    ),
-)
-aws.lambda_.EventSourceMapping(
-    "grug-rerun-jobs-esm",
-    event_source_arn=_rerun_jobs_queue.arn,
-    function_name=webhook.function.name,
-    # batch_size=1: one job → one re-run. Unlike the cave handler, a failed
-    # rerun job RAISES so the ESM retries (visibility timeout) → DLQ.
-    batch_size=1,
-)
-
-# Webhook role gains kms:Decrypt on the grug-tokens CMK — required so
-# the Lambda runtime can unwrap encrypted env vars at cold start
-# BEFORE the DD extension or our handler boots. Scoped via
-# `kms:ViaService = lambda` so this perm can't be reused for other
-# KMS-protected resources. Closes #60.
-# Region resolved from the active aws provider so a future multi-region
-# deploy doesn't silently break this condition. Greptile P2 PR #79.
-_aws_region = aws.get_region().name
-aws.iam.RolePolicy(
-    "grug-webhook-envvar-kms-policy",
-    role=webhook.role.id,
-    policy=pulumi.Output.all(grug_tokens_cmk.arn, _aws_region).apply(
-        lambda args: json.dumps({
-            "Version": "2012-10-17",
-            "Statement": [{
-                "Effect": "Allow",
-                "Action": "kms:Decrypt",
-                "Resource": args[0],
-                "Condition": {
-                    "StringEquals": {
-                        "kms:ViaService": f"lambda.{args[1]}.amazonaws.com",
-                    },
-                },
-            }],
-        }),
-    ),
-)
-
-# Cloudflare DNS — webhook.grug.lol → Lambda Function URL host
-# (proxied through CF for TLS termination + WAF). Per memory
-# `reference_lambda_function_url_host_volatile` the upstream URL changes
-# on every recreate — single-source via Pulumi output below.
-# Worker route + script managed via infra/cloudflare/deploy.sh (curl
-# against CF API). Pulumi just creates the proxied DNS record so the
-# Worker can intercept. Run the deploy.sh script after every Lambda
-# Function URL host change (memory: reference_lambda_function_url_host_volatile).
+# Cloudflare DNS — webhook.grug.lol stays a proxied CNAME so the
+# grug-webhook-host-rewrite Worker route intercepts (Workers require
+# the hostname proxied through CF). Post-cutover (#354) the target is
+# the in-cluster tunnel origin, read from SSM at deploy time — the
+# hostname is private infra and never committed here. The Worker
+# rewrites upstream anyway (same SSM param, via deploy.sh), so this
+# target only matters if the Worker route is ever removed: traffic
+# still lands on the tunnel origin (and 401s without the Worker's
+# auth header — cf_auth holds the boundary).
+_webhook_upstream_host = aws.ssm.get_parameter(name="/grug/webhook-upstream-host")
 cloudflare_dns.create_proxied_cname(
     zone_id=_cf_zone_id.value,
     name="webhook",
     domain=domain,
-    target_url=webhook.function_url,
+    target_url=pulumi.Output.from_input(_webhook_upstream_host.value),
     provider=cf_provider,
     # Proxied=True so the Worker route intercepts and rewrites Host.
     proxied=True,
@@ -605,8 +372,8 @@ cloudflare_dns.create_proxied_cname(
 api_ecr = ecr_repo.create(
     name="grug-api",
     untagged_expire_days=14,
-    keep_last_images=20,  # See webhook_ecr — caps the SHA-tagged build accumulation.
-    force_delete=(env == "dev"),  # See webhook_ecr above.
+    keep_last_images=20,  # Caps the SHA-tagged build accumulation (CI tags every build).
+    force_delete=(env == "dev"),  # prod stays False so `pulumi destroy` cannot wipe images.
 )
 
 api_image_tag = config.get("api_image_tag") or "bootstrap"
@@ -747,78 +514,7 @@ _aws.iam.RolePolicy(
     ),
 )
 
-# DDB IAM for webhook Lambda (Slice 5 #26 allowlist gate). Tighter
-# scope than api: GetItem + PutItem + DeleteItem only (no Query, no
-# UpdateItem — webhook only records install rows + reads INST/USER for
-# allowlist checks). Explicitly NO KMS perms — token blobs stay
-# api-Lambda-only per locked encryption decision.
-_aws.iam.RolePolicy(
-    "grug-webhook-ddb-policy",
-    role=webhook.role.id,
-    policy=grug_main_table.arn.apply(
-        lambda arn: _json.dumps(
-            {
-                "Version": "2012-10-17",
-                "Statement": [
-                    {
-                        "Effect": "Allow",
-                        "Action": [
-                            "dynamodb:GetItem",
-                            "dynamodb:PutItem",
-                            "dynamodb:DeleteItem",
-                        ],
-                        "Resource": [arn],
-                    },
-                ],
-            },
-        ),
-    ),
-)
 
-# Reaction-poll scheduled Lambda (#247b). Reuses the WEBHOOK image — the
-# datadog_lambda CMD dispatches to DD_LAMBDA_HANDLER, so pointing it at
-# `poller_handler.handler` runs the cron entrypoint (#266) from the same
-# image with DD APM tracing. NO Function URL (EventBridge is the only
-# trigger). Needs the GitHub-App SecureStrings (install-token minting) +
-# store read/update; NOT the LLM keys (the reaction annotation is a DD-SDK
-# call, no inference). DD_SERVICE=grug-poller for a distinct o11y surface.
-# LEGACY (pre-#354): this Lambda retires at cutover; the k8s CronJob
-# replaced it and the swapped images read Postgres, not GRUG_DDB_TABLE.
-poller = scheduled_lambda.create(
-    "grug-poller",
-    ecr_repo=webhook_ecr,
-    image_tag=webhook_image_tag,
-    schedule_expression="rate(15 minutes)",
-    env=env,
-    env_vars={
-        "GRUG_ENV": env,
-        "GRUG_LOG_LEVEL": "INFO",
-        "GRUG_DDB_TABLE": grug_main_table.name,
-        "GITHUB_APP_ID_SSM": secrets["github-app-id"].name,
-        "GITHUB_APP_PRIVATE_KEY_SSM": secrets["github-app-private-key"].name,
-        "DD_LAMBDA_HANDLER": "poller_handler.handler",
-        "DD_SITE": "datadoghq.com",
-        "DD_API_KEY": _dd_api_key.value,
-        "DD_ENV": env,
-        "DD_SERVICE": "grug-poller",
-        "DD_VERSION": _full_commit_sha,
-        # Parity with the webhook for trace/log correlation (the poller's
-        # structured logs carry trace_id; spans enabled).
-        "DD_TRACE_ENABLED": "true",
-        "DD_LOGS_INJECTION": "true",
-        # human_verdict evals attach to the Elder review spans, so the
-        # poller submits under the SAME ML app as the webhook.
-        "DD_LLMOBS_ENABLED": "true",
-        "DD_LLMOBS_ML_APP": "grug-elder",
-    },
-    table_arn=grug_main_table.arn,
-    extra_ssm_secrets=[
-        secrets["github-app-id"],
-        secrets["github-app-private-key"],
-    ],
-    env_vars_kms_key_arn=grug_tokens_cmk.arn,
-    iam_propagation_wait=_iam_propagation_wait,
-)
 
 # CF DNS — api.grug.lol → api Lambda Function URL (proxied; Worker
 # rewrites Host header just like webhook). Worker deployed via
@@ -997,55 +693,11 @@ rum = dd_rum.create(
 # explorer (evaluations aren't dashboard metrics — see component docstring).
 elder_dashboard = dd_dashboard.create_elder_health(env=env, provider=_dd_provider)
 
-# Poller error monitor (#247b, Phase 3.6 — a cron with no monitor isn't
-# "done"). poller_handler is best-effort (never raises), so any
-# aws.lambda.errors means a real crash (import error, OOM, timeout). Defined
-# here (not dd_monitors) to stay next to the poller + reuse _dd_provider /
-# _dd_notify which are created just above.
-monitor_poller_errors = _datadog.Monitor(
-    "grug-poller-errors",
-    type="metric alert",
-    name="[grug-poller] Lambda errors > 0 (15min)",
-    query=(
-        f"sum(last_15m):sum:aws.lambda.errors{{functionname:grug-poller,env:{env}}}"
-        ".as_count() > 0"
-    ),
-    message=(
-        "grug-poller (reaction-poll cron) is erroring — the handler is "
-        f"best-effort, so a Lambda error is a real crash. {_dd_notify}"
-    ),
-    tags=[f"env:{env}", "service:grug-poller", "team:grug"],
-    opts=pulumi.ResourceOptions(provider=_dd_provider),
-)
-# The handler SWALLOWS per-install failures (returns success → aws.lambda.errors
-# stays 0), so the metric monitor above can't see a SYSTEMIC outage. The
-# all-installs-failed path logs `reaction_poll_all_installs_failed` at error
-# (#266) precisely so a LOG monitor can catch it — this is that monitor.
-monitor_poller_all_failed = _datadog.Monitor(
-    "grug-poller-all-failed",
-    type="log alert",
-    name="[grug-poller] all installs failed (systemic)",
-    query=(
-        f'logs("service:grug-poller env:{env} reaction_poll_all_installs_failed")'
-        '.index("*").rollup("count").last("15m") > 0'
-    ),
-    message=(
-        "grug-poller: EVERY install failed to poll this cycle — systemic "
-        f"auth/config/GitHub failure, the human-verdict feed is dark. {_dd_notify}"
-    ),
-    tags=[f"env:{env}", "service:grug-poller", "team:grug"],
-    opts=pulumi.ResourceOptions(provider=_dd_provider),
-)
-pulumi.export("poller_function_name", poller.function.name)
-pulumi.export("monitor_poller_errors_id", monitor_poller_errors.id)
-pulumi.export("monitor_poller_all_failed_id", monitor_poller_all_failed.id)
 
-pulumi.export("webhook_function_url", webhook.function_url)
 pulumi.export("webhook_public_url", f"https://webhook.{domain}/webhook/github")
 pulumi.export("api_function_url", api_lambda.function_url)
 pulumi.export("api_public_url", f"https://api.{domain}")
 pulumi.export("gha_deploy_role_arn", gha_deploy_role.arn)
-pulumi.export("ecr_webhook_repo_url", webhook_ecr.repository_url)
 pulumi.export("ecr_api_repo_url", api_ecr.repository_url)
 pulumi.export("ddb_table_name", grug_main_table.name)
 pulumi.export("ddb_table_arn", grug_main_table.arn)

@@ -68,27 +68,6 @@ def create(
                         ],
                     },
                     {
-                        # TRANSITIONAL (#354): the services are
-                        # Postgres-only post-swap; this grant remains
-                        # ONLY so the one-shot DDB->PG prestage job can
-                        # re-run at cutover for data freshness. REMOVE
-                        # in the retirement PR with the table itself.
-                        "Sid": "TransitionalDdbAccess",
-                        "Effect": "Allow",
-                        "Action": [
-                            "dynamodb:GetItem",
-                            "dynamodb:PutItem",
-                            "dynamodb:UpdateItem",
-                            "dynamodb:DeleteItem",
-                            "dynamodb:Query",
-                            "dynamodb:Scan",
-                        ],
-                        "Resource": [
-                            "arn:aws:dynamodb:us-east-1:*:table/grug-main",
-                            "arn:aws:dynamodb:us-east-1:*:table/grug-main/index/*",
-                        ],
-                    },
-                    {
                         "Sid": "DecryptSsmSecureStrings",
                         "Effect": "Allow",
                         "Action": ["kms:Decrypt"],

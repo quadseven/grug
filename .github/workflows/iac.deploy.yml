@@ -46,7 +46,7 @@ jobs:
     needs: meta
     strategy:
       matrix:
-        service: [webhook, api]
+        service: [api]  # webhook image retired at the #354 k8s cutover
     uses: githumps/infra-public/.github/workflows/build.container.yml@cd83e5727c0a7b904f780960664a51b3a3a0c685  # infra-public main; bump deliberately
     with:
       runner: ubuntu-24.04-arm
@@ -102,7 +102,6 @@ jobs:
             # traffic. Builds still push per-SHA images; the Lambdas just
             # never advance past this tag. Do NOT unfreeze: the Lambdas
             # retire at cutover (retirement PR removes this whole pipeline).
-            webhook_image_tag: { value: "7c946045" }
             api_image_tag:     { value: "7c946045" }
             full_commit_sha:   { value: "${{ github.sha }}" }
       - name: 11. Deploy CF Workers
