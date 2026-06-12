@@ -237,6 +237,38 @@ def test_claim_delivery_concurrent_exactly_one_winner(pg):
     assert results.count(False) == 7
 
 
+def test_claim_delivery_concurrent_expired_takeover_exactly_one_winner(pg):
+    """The takeover WHERE clause's race: N claimants see the SAME expired
+    row; ON CONFLICT re-evaluation against the winner's committed tuple
+    must yield exactly one True (audit M7 - the arm the fresh-pk race
+    never exercises)."""
+    from adapters import pg_install_store as store
+
+    did = str(uuid.uuid4())
+    assert store.claim_delivery(did) is True
+    with store.get_pool().connection() as conn:
+        conn.execute(
+            "UPDATE grug_kv SET ttl = EXTRACT(EPOCH FROM now())::bigint - 10 "
+            "WHERE pk = %s",
+            (f"DELIVERY#{did}",),
+        )
+
+    results: list[bool] = []
+    barrier = threading.Barrier(8)
+
+    def claim():
+        barrier.wait()
+        results.append(store.claim_delivery(did))
+
+    threads = [threading.Thread(target=claim) for _ in range(8)]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join()
+    assert results.count(True) == 1
+    assert results.count(False) == 7
+
+
 def test_comment_records_roundtrip_and_ttl_filtering(pg):
     from adapters import pg_install_store as store
 
