@@ -31,6 +31,7 @@ def create(
     *,
     queue_arns: list[pulumi.Input[str]],
     kms_key_arn: pulumi.Input[str],
+    cave_diff_bucket_arn: pulumi.Input[str],
     name: str = "grug-k8s-pod",
 ) -> K8sPodUserBundle:
     """Provision the pod user + scoped policy + access key, landing the
@@ -42,7 +43,9 @@ def create(
     )
 
     policy_doc = pulumi.Output.all(
-        queues=pulumi.Output.all(*queue_arns), kms=kms_key_arn
+        queues=pulumi.Output.all(*queue_arns),
+        kms=kms_key_arn,
+        cave_bucket=cave_diff_bucket_arn,
     ).apply(
         lambda args: json.dumps(
             {
@@ -106,6 +109,16 @@ def create(
                             "sqs:GetQueueAttributes",
                         ],
                         "Resource": args["queues"],
+                    },
+                    {
+                        # Elder runs ON the pods post-#368: cave_fallback
+                        # spills oversized diffs to s3://<cave-diffs>/diffs/*
+                        # before enqueueing a FallbackJob. Write-only, prefix
+                        # -scoped - the connector (not the pods) reads them.
+                        "Sid": "SpillCaveDiffs",
+                        "Effect": "Allow",
+                        "Action": ["s3:PutObject"],
+                        "Resource": f"{args['cave_bucket']}/diffs/*",
                     },
                     {
                         "Sid": "EnvelopeCrypto",

@@ -9,9 +9,11 @@ ACK path:
   - `install_store.claim_delivery` — the win-once idempotency claim (only
     the error-propagation contract here; behavior is in the real-PG suite).
 """
+
 from __future__ import annotations
 
 import json
+import threading
 from unittest.mock import MagicMock, patch
 
 import httpx
@@ -21,6 +23,7 @@ import adapters.install_store as ins
 
 
 # --- enqueue_elder_review --------------------------------------------------
+
 
 def _full_gh_payload(body=""):
     """A GitHub pull_request payload with the bulky fields that must NOT be
@@ -75,7 +78,8 @@ def test_enqueue_drops_bulky_payload_fields(monkeypatch):
     with patch.object(ad._lambda, "invoke") as mock_invoke:
         ad.enqueue_elder_review(
             payload=_full_gh_payload(body=huge_body),
-            delivery_id="d-big", blocking=False,
+            delivery_id="d-big",
+            blocking=False,
         )
     raw = mock_invoke.call_args.kwargs["Payload"]
     assert len(raw) < 1000  # slim, bounded — not ~200 KB
@@ -91,6 +95,50 @@ def test_enqueue_returns_false_without_function_name(monkeypatch):
         ok = ad.enqueue_elder_review(payload={}, delivery_id="d-2", blocking=False)
     assert ok is False
     mock_invoke.assert_not_called()
+
+
+def test_enqueue_k8s_runtime_runs_in_process_thread(monkeypatch):
+    """#368: off-Lambda with GRUG_K8S_RUNTIME set, the job runs in-process
+    on a background thread - same slim-projection job shape, no boto3
+    invoke, returns True (the review is NOT dropped)."""
+    monkeypatch.delenv("AWS_LAMBDA_FUNCTION_NAME", raising=False)
+    monkeypatch.setenv("GRUG_K8S_RUNTIME", "1")
+    ran = threading.Event()
+    seen: dict = {}
+
+    def fake_job(event):
+        seen.update(event)
+        ran.set()
+        return {"persona": "code_reviewer", "result": "pass"}
+
+    with (
+        patch.object(ad, "run_elder_job", side_effect=fake_job),
+        patch.object(ad._lambda, "invoke") as mock_invoke,
+    ):
+        ok = ad.enqueue_elder_review(
+            payload=_full_gh_payload(body="m" * 5000),
+            delivery_id="d-k8s",
+            blocking=True,
+        )
+        assert ran.wait(5.0), "background thread never ran the job"
+    assert ok is True
+    mock_invoke.assert_not_called()
+    assert seen["delivery_id"] == "d-k8s"
+    assert seen["blocking"] is True
+    assert seen[ad.ASYNC_JOB_KEY] == ad.ELDER_REVIEW_JOB
+    # Slim projection applies on the k8s path too (keep-in-sync contract).
+    assert seen["payload"]["pull_request"] == {"number": 7, "head": {"sha": "abc123"}}
+    assert "sender" not in seen["payload"]
+
+
+def test_enqueue_k8s_spawn_failure_degrades_to_false(monkeypatch):
+    """#368: a thread-spawn failure must NOT raise into the ACK path -
+    same degrade-to-False contract as a Lambda invoke error."""
+    monkeypatch.delenv("AWS_LAMBDA_FUNCTION_NAME", raising=False)
+    monkeypatch.setenv("GRUG_K8S_RUNTIME", "1")
+    with patch.object(ad.threading, "Thread", side_effect=RuntimeError("no threads")):
+        ok = ad.enqueue_elder_review(payload={}, delivery_id="d-k8s2", blocking=False)
+    assert ok is False
 
 
 def test_enqueue_degrades_to_false_on_invoke_error(monkeypatch):
@@ -114,9 +162,13 @@ _JOB = {
 
 
 def test_run_elder_job_runs_dispatch_when_claim_won():
-    with patch("adapters.install_store.claim_delivery", return_value=True), \
-         patch("personas.code_reviewer.dispatch.dispatch_code_review",
-               return_value={"persona": "code_reviewer", "result": "pass"}) as mock_d:
+    with (
+        patch("adapters.install_store.claim_delivery", return_value=True),
+        patch(
+            "personas.code_reviewer.dispatch.dispatch_code_review",
+            return_value={"persona": "code_reviewer", "result": "pass"},
+        ) as mock_d,
+    ):
         out = ad.run_elder_job(_JOB)
     mock_d.assert_called_once()
     _, kwargs = mock_d.call_args
@@ -127,8 +179,10 @@ def test_run_elder_job_runs_dispatch_when_claim_won():
 def test_run_elder_job_skips_when_claim_lost():
     """Duplicate delivery (GitHub redelivery or AWS async retry) → claim
     lost → SKIP, dispatch_code_review NOT called (no double review)."""
-    with patch("adapters.install_store.claim_delivery", return_value=False), \
-         patch("personas.code_reviewer.dispatch.dispatch_code_review") as mock_d:
+    with (
+        patch("adapters.install_store.claim_delivery", return_value=False),
+        patch("personas.code_reviewer.dispatch.dispatch_code_review") as mock_d,
+    ):
         out = ad.run_elder_job(_JOB)
     mock_d.assert_not_called()
     assert out == {"status": "skipped", "reason": "duplicate_delivery"}
@@ -138,9 +192,13 @@ def test_run_elder_job_never_reraises_on_dispatch_error():
     """An unhandled error in the Elder dispatch must NOT propagate (that
     would make AWS retry-storm the async invocation) — degrade to a status
     dict."""
-    with patch("adapters.install_store.claim_delivery", return_value=True), \
-         patch("personas.code_reviewer.dispatch.dispatch_code_review",
-               side_effect=RuntimeError("boom")):
+    with (
+        patch("adapters.install_store.claim_delivery", return_value=True),
+        patch(
+            "personas.code_reviewer.dispatch.dispatch_code_review",
+            side_effect=RuntimeError("boom"),
+        ),
+    ):
         out = ad.run_elder_job(_JOB)
     assert out == {"persona": "code_reviewer", "result": "unhandled_error"}
 
@@ -149,9 +207,13 @@ def test_two_jobs_same_delivery_dispatch_once():
     """Integrated idempotency: two run_elder_job calls for the SAME delivery
     (first claim wins, second loses) → dispatch_code_review runs exactly
     once. The anti-double-review invariant, not just branch handling."""
-    with patch("adapters.install_store.claim_delivery", side_effect=[True, False]), \
-         patch("personas.code_reviewer.dispatch.dispatch_code_review",
-               return_value={"persona": "code_reviewer", "result": "pass"}) as mock_d:
+    with (
+        patch("adapters.install_store.claim_delivery", side_effect=[True, False]),
+        patch(
+            "personas.code_reviewer.dispatch.dispatch_code_review",
+            return_value={"persona": "code_reviewer", "result": "pass"},
+        ) as mock_d,
+    ):
         first = ad.run_elder_job(_JOB)
         second = ad.run_elder_job(_JOB)
     assert mock_d.call_count == 1
@@ -166,6 +228,7 @@ def test_two_jobs_same_delivery_dispatch_once():
 # wires the real projection into the real consumer so the contract is
 # load-bearing, not coincidental.
 
+
 def test_slim_payload_satisfies_dispatch_code_review_consumer(monkeypatch):
     from personas.code_reviewer import dispatch as cr_dispatch
     from llm_client import Backend, Finding as LlmFinding, LlmReviewResponse
@@ -176,7 +239,8 @@ def test_slim_payload_satisfies_dispatch_code_review_consumer(monkeypatch):
     # Stub dispatch_code_review's IO so it runs offline but exercises EVERY
     # payload field read (fetch→parse→review→PUBLISH) against the slim dict.
     monkeypatch.setattr(
-        cr_dispatch, "with_install_token_retry",
+        cr_dispatch,
+        "with_install_token_retry",
         lambda inst_id, fn: fn("fake-token"),
     )
     diff_resp = MagicMock(spec=httpx.Response)
@@ -188,19 +252,33 @@ def test_slim_payload_satisfies_dispatch_code_review_consumer(monkeypatch):
     # head_sha from the slim payload — is actually traversed, not skipped
     # by an empty-findings early return (codex WARN-3).
     monkeypatch.setattr(
-        cr_dispatch, "review_diff",
+        cr_dispatch,
+        "review_diff",
         lambda *a, **kw: LlmReviewResponse(
             kind="reviewed",
-            findings=(LlmFinding(
-                path="x.py", line=1, rule="silent-failure",
-                severity="medium", message="m",  # type: ignore[arg-type]
-            ),),
+            findings=(
+                LlmFinding(
+                    path="x.py",
+                    line=1,
+                    rule="silent-failure",
+                    severity="medium",
+                    message="m",  # type: ignore[arg-type]
+                ),
+            ),
             backend_used=Backend.POOLSIDE,
         ),
     )
     posted = []
-    monkeypatch.setattr(cr_dispatch, "post_check_run", lambda *a, **kw: posted.append("check") or {"id": 1})
-    monkeypatch.setattr(cr_dispatch, "post_review", lambda *a, **kw: posted.append("review") or {"id": 2})
+    monkeypatch.setattr(
+        cr_dispatch,
+        "post_check_run",
+        lambda *a, **kw: posted.append("check") or {"id": 1},
+    )
+    monkeypatch.setattr(
+        cr_dispatch,
+        "post_review",
+        lambda *a, **kw: posted.append("review") or {"id": 2},
+    )
     # Comment-capture (best-effort, post-publish) also reads the payload-
     # derived ids before short-circuiting on an empty comment list; stub its
     # GH fetch so it runs without network.
@@ -219,10 +297,16 @@ def test_slim_payload_satisfies_dispatch_code_review_consumer(monkeypatch):
 def test_run_elder_job_fails_open_when_claim_errors():
     """A store hiccup on the claim must not drop the review — fail OPEN
     (run it). A possible duplicate beats a silently-skipped review."""
-    with patch("adapters.install_store.claim_delivery",
-               side_effect=RuntimeError("ddb down")), \
-         patch("personas.code_reviewer.dispatch.dispatch_code_review",
-               return_value={"persona": "code_reviewer", "result": "pass"}) as mock_d:
+    with (
+        patch(
+            "adapters.install_store.claim_delivery",
+            side_effect=RuntimeError("ddb down"),
+        ),
+        patch(
+            "personas.code_reviewer.dispatch.dispatch_code_review",
+            return_value={"persona": "code_reviewer", "result": "pass"},
+        ) as mock_d,
+    ):
         out = ad.run_elder_job(_JOB)
     mock_d.assert_called_once()
     assert out["result"] == "pass"
