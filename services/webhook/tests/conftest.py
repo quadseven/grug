@@ -20,10 +20,49 @@ from collections.abc import Callable, Iterator
 from pathlib import Path
 from typing import Any
 
+import boto3
 import httpx
 import pytest
 
 sys.path.insert(0, str(Path(__file__).parent.parent))
+
+
+@pytest.fixture(autouse=True)
+def _ddb_table(monkeypatch):
+    """moto DDB for all webhook tests — prevents accidental prod DDB hits.
+    
+    install_store uses lazy DDB init (boto3.resource on first _table access),
+    so moto's mock_aws is picked up naturally — no module reload needed.
+    """
+    moto = pytest.importorskip("moto")
+    from moto import mock_aws  # type: ignore
+
+    with mock_aws():
+        monkeypatch.setenv("AWS_DEFAULT_REGION", "us-east-1")
+        ddb = boto3.client("dynamodb", region_name="us-east-1")
+        ddb.create_table(
+            TableName="grug-main",  # matches install_store's _TABLE_NAME default
+            KeySchema=[
+                {"AttributeName": "PK", "KeyType": "HASH"},
+                {"AttributeName": "SK", "KeyType": "RANGE"},
+            ],
+            AttributeDefinitions=[
+                {"AttributeName": "PK", "AttributeType": "S"},
+                {"AttributeName": "SK", "AttributeType": "S"},
+                {"AttributeName": "GSI1PK", "AttributeType": "S"},
+                {"AttributeName": "GSI1SK", "AttributeType": "S"},
+            ],
+            GlobalSecondaryIndexes=[{
+                "IndexName": "GSI1",
+                "KeySchema": [
+                    {"AttributeName": "GSI1PK", "KeyType": "HASH"},
+                    {"AttributeName": "GSI1SK", "KeyType": "RANGE"},
+                ],
+                "Projection": {"ProjectionType": "ALL"},
+            }],
+            BillingMode="PAY_PER_REQUEST",
+        )
+        yield
 
 
 def _build_handler(
