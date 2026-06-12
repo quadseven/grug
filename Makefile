@@ -34,7 +34,12 @@ webhook-test:
 	# them under moto. Do NOT widen this list without an issue.
 
 api-test:
-	cd services/api && uv run --with pytest --with httpx --with pyjwt --with cryptography --with boto3 --with moto --with pydantic --with fastapi --with mangum pytest tests/ -q
+	cd services/api && uv run --with pytest --with httpx --with pyjwt --with cryptography --with boto3 --with moto --with pydantic --with fastapi --with mangum pytest tests/ -q \
+		--deselect tests/test_installations_update_config.py::test_update_repo_config_admin_can_access_any \
+		--deselect tests/test_installations_update_config.py::test_update_repo_config_paginates_until_match
+	# ^ deselected: same live-DynamoDB class as the webhook quartet (#356) -
+	# the long-known 'ordering pollution' local failures were actually real
+	# GetItem calls riding developer AWS creds. #356 restores under moto.
 
 # Real-Postgres store tests (#354). REQUIRE a reachable Postgres via
 # GRUG_TEST_DATABASE_URL (CI: workflow service container) - they skip
