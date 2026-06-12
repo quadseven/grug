@@ -8,8 +8,7 @@
 #
 # Required environment configuration (operator-seeded, never committed):
 #   vars.DEPLOY_REGISTRY_HOST     - private registry hostname
-#   secrets.TS_OAUTH_CLIENT_ID    - Tailscale OAuth client (ephemeral CI
-#   secrets.TS_OAUTH_SECRET         nodes, ACL tag-scoped)
+#   secrets.TS_AUTHKEY            - tag-scoped ephemeral join key
 #   secrets.REGISTRY_USERNAME     - registry push credential
 #   secrets.REGISTRY_PASSWORD
 #   secrets.KUBECONFIG_B64        - cluster credential (base64)
@@ -54,8 +53,9 @@ jobs:
       - name: Join tailnet (ephemeral)
         uses: tailscale/github-action@306e68a486fd2350f2bfc3b19fcd143891a4a2d8 # v4
         with:
-          oauth-client-id: ${{ secrets.TS_OAUTH_CLIENT_ID }}
-          oauth-secret: ${{ secrets.TS_OAUTH_SECRET }}
+          # Pre-minted tag:ci authkey (ephemeral+reusable, 90-day expiry
+          # tracked in the parameter store) - no OAuth client needed.
+          authkey: ${{ secrets.TS_AUTHKEY }}
           tags: tag:ci
           use-cache: 'true'
 
