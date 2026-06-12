@@ -156,7 +156,9 @@ def patch_user(
     except LookupError:
         # Row existed at the read above but vanished mid-update (raced a
         # deletion). 404, not a 500 — the client retries and sees reality.
-        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="user not found")
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND, detail="user not found"
+        ) from None
 
     log.info(
         "admin_user_patched",
