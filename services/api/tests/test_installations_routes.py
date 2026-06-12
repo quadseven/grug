@@ -13,7 +13,6 @@ Covers:
 
 from __future__ import annotations
 
-import boto3
 import pytest
 from fastapi import HTTPException
 
@@ -99,22 +98,29 @@ def test_repo_config_payload_explicit_false(_mod):
 def test_list_installations_skips_corrupt_pk_rows(_mod):
     """silent-failure-hunter P2 #6 regression: corrupt GSI1 row PK
     must skip + log, not crash entire endpoint."""
-    table = boto3.resource("dynamodb", region_name="us-east-1").Table("grug-main-test")
-    # Good row + corrupt-PK row both indexed under GSI1PK=100
-    table.put_item(Item={
-        "PK": "INST#1001", "SK": "META",
-        "account_login": "good", "account_type": "User",
-        "installed_at": "2026-01-01T00:00:00Z",
-        "installed_by_user_id": "100",
-        "GSI1PK": "100", "GSI1SK": "INST#1001",
-    })
-    table.put_item(Item={
-        "PK": "garbage-no-hash",
-        "SK": "META",
-        "account_login": "corrupt", "account_type": "User",
-        "installed_by_user_id": "100",
-        "GSI1PK": "100", "GSI1SK": "INST#bad",
-    })
+    from adapters import pg_base
+
+    def _put(pk, attrs, gsi1pk, gsi1sk):
+        with pg_base.get_pool().connection() as conn:
+            conn.execute(
+                "INSERT INTO grug_kv (pk, sk, data, gsi1pk, gsi1sk) "
+                "VALUES (%s, 'META', %s, %s, %s)",
+                (pk, pg_base.encode_attrs(attrs), gsi1pk, gsi1sk),
+            )
+
+    # Good row + corrupt-PK row both indexed under gsi1pk=100
+    _put(
+        "INST#1001",
+        {"account_login": "good", "account_type": "User",
+         "installed_at": "2026-01-01T00:00:00Z", "installed_by_user_id": "100"},
+        "100", "INST#1001",
+    )
+    _put(
+        "garbage-no-hash",
+        {"account_login": "corrupt", "account_type": "User",
+         "installed_by_user_id": "100"},
+        "100", "INST#bad",
+    )
     user = _user(user_id="100")
     out = _mod.list_installations(user)
     install_ids = sorted(i["install_id"] for i in out["installations"])

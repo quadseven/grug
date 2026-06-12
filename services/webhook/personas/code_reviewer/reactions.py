@@ -169,7 +169,7 @@ def poll_and_annotate(
             )
         # Guard the DD-submit + baseline-write as a unit. Broad catch:
         # both the ddtrace seam (internal/intake errors, a stale
-        # malformed span dict) and the DDB update (botocore ClientError:
+        # malformed span dict) and the store update (psycopg.Error:
         # throttle, timeout) can raise, and a best-effort poller must
         # not let one bad record abort the rest of the batch. Submit
         # FIRST, advance the baseline only after — so on a partial

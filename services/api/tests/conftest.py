@@ -23,6 +23,13 @@ def pg_store(monkeypatch):
             "GRUG_TEST_DATABASE_URL unset - store-backed tests REQUIRE the "
             "real Postgres test database (CI provides it)"
         )
+    # This fixture TRUNCATEs grug_kv. Refuse anything that doesn't look
+    # like a test database so a mis-exported URL can't wipe live data.
+    if "test" not in test_db.rsplit("/", 1)[-1]:
+        pytest.fail(
+            "GRUG_TEST_DATABASE_URL database name must contain 'test' "
+            f"(got {test_db.rsplit('/', 1)[-1]!r}) - this fixture TRUNCATEs it"
+        )
     from moto import mock_aws
 
     with mock_aws():
