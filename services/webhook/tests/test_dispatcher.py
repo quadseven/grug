@@ -297,7 +297,8 @@ def test_installation_created_records_row():
         },
         "sender": {"id": 100, "login": "githumps"},
     }
-    with patch("dispatcher.record_installation") as mock_rec:
+    with patch("dispatcher.record_installation") as mock_rec, \
+         patch("dispatcher.is_install_allowlisted", return_value=False):
         out = dispatch("installation", payload)
     assert out["status"] == "recorded" and out["action"] == "created"
     mock_rec.assert_called_once_with(
@@ -316,7 +317,8 @@ def test_installation_created_org_uses_sender_id():
         },
         "sender": {"id": 100, "login": "evan"},
     }
-    with patch("dispatcher.record_installation") as mock_rec:
+    with patch("dispatcher.record_installation") as mock_rec, \
+         patch("dispatcher.is_install_allowlisted", return_value=False):
         dispatch("installation", payload)
     assert mock_rec.call_args.kwargs["installed_by_user_id"] == 100
 
