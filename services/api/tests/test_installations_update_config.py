@@ -77,7 +77,8 @@ def test_update_repo_config_admin_can_access_any():
             with patch("httpx.Client") as client_cls:
                 client = client_cls.return_value.__enter__.return_value
                 client.get.return_value = fake_pages[0]
-                with patch("installations.set_repo_config", return_value={"tpm_enabled": False}):
+                with patch("installations.get_repo_config", return_value={}), \
+                     patch("installations.set_repo_config", return_value={"tpm_enabled": False}):
                     out = inst.update_repo_config(
                         install_id=1, repo_id=42,
                         body=payload, user=_user(user_id="100", role="admin"),
@@ -170,7 +171,8 @@ def test_update_repo_config_paginates_until_match():
             with patch("httpx.Client") as client_cls:
                 client = client_cls.return_value.__enter__.return_value
                 client.get.side_effect = _client_get
-                with patch("installations.set_repo_config", return_value={"tpm_enabled": False}):
+                with patch("installations.get_repo_config", return_value={}), \
+                     patch("installations.set_repo_config", return_value={"tpm_enabled": False}):
                     out = inst.update_repo_config(
                         install_id=1, repo_id=200,
                         body=payload, user=_user(user_id="100"),

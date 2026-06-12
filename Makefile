@@ -27,32 +27,23 @@ webhook-test:
 	@if [ -n "$$CI" ] && [ -z "$$GRUG_TEST_DATABASE_URL" ]; then \
 		echo "FATAL: store-backed tests would SKIP in CI (GRUG_TEST_DATABASE_URL unset) - a skipped gate is a silent pass (audit H4)"; exit 1; fi
 	cd services/webhook && uv run --with pytest --with httpx --with pyjwt --with cryptography --with boto3 --with moto --with fastapi --with mangum --with 'psycopg[binary,pool]' --with 'ddtrace>=3.5,<4' --with 'datadog-lambda>=6.107,<7' pytest tests/ -q \
-		--deselect tests/test_dispatcher.py::test_installation_created_records_row \
-		--deselect tests/test_dispatcher.py::test_installation_created_org_uses_sender_id \
-		--deselect tests/test_enforcement.py::test_heal_clears_stale_id_and_recreates \
-		--deselect tests/test_enforcement.py::test_heal_returns_new_state \
 		--deselect tests/test_cf_auth.py::test_unconfigured_warning_throttled_within_window \
 		--deselect tests/test_cf_auth.py::test_throttle_distinguishes_reasons
 	# ^ cf_auth throttle pair: hosted-runner-only intermittent 0-warnings,
 	# locally irreproducible across versions/order/env - #359 root-causes.
-	# ^ dispatcher/enforcement quartet: written against live DDB (pre-swap,
-	# only ever passed via developer-shell AWS creds); post-#354 the right
-	# fix is converting them to the pg_store fixture - #356 tracks. Do NOT
-	# widen this list without an issue.
+	# (#356 dispatcher/enforcement quartet restored: the unmocked store
+	# boundary is now patched like every sibling test.) Do NOT widen this
+	# list without an issue.
 
 api-test:
 	@if [ -n "$$CI" ] && [ -z "$$GRUG_TEST_DATABASE_URL" ]; then \
 		echo "FATAL: store-backed tests would SKIP in CI (GRUG_TEST_DATABASE_URL unset) - a skipped gate is a silent pass (audit H4)"; exit 1; fi
 	cd services/api && uv run --with pytest --with httpx --with pyjwt --with cryptography --with boto3 --with moto --with pydantic --with fastapi --with mangum --with 'psycopg[binary,pool]' pytest tests/ -q \
-		--deselect tests/test_installations_update_config.py::test_update_repo_config_admin_can_access_any \
-		--deselect tests/test_installations_update_config.py::test_update_repo_config_paginates_until_match \
 		--deselect tests/test_cf_auth.py::test_unconfigured_warning_throttled_within_window \
 		--deselect tests/test_cf_auth.py::test_throttle_distinguishes_reasons
 	# ^ cf_auth throttle pair: hosted-runner-only flake, #359 (twin of webhook).
-	# ^ update_config pair: same live-store class as the webhook quartet -
-	# the long-known 'ordering pollution' local failures were actually real
-	# GetItem calls riding developer AWS creds (pre-swap). #356 converts
-	# them to the pg_store fixture.
+	# (#356 update_config pair restored: the unmocked previous_cfg store
+	# read is now patched.)
 
 # Real-Postgres store tests (#354). REQUIRE a reachable Postgres via
 # GRUG_TEST_DATABASE_URL (CI: workflow service container) - they skip
