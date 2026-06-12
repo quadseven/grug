@@ -25,6 +25,7 @@ import pulumi_datadog as _datadog
 
 from components import (
     cf_shared_secret,
+    k8s_pod_user,
     cloudflare_dns,
     dd_dashboard,
     dd_monitors,
@@ -353,6 +354,15 @@ _rerun_jobs_queue = aws.sqs.Queue(
         lambda arn: json.dumps({"deadLetterTargetArn": arn, "maxReceiveCount": 3})
     ),
     tags={"app": "grug", "service": "grug-rerun"},
+)
+
+# Scoped IAM user for the Kubernetes pods (#354): queue + envelope-KMS +
+# /grug/* parameter access, key pair landed in /grug/k8s-pod-aws-* for
+# the deploy workflow's secret seed. Retires with nothing - the same
+# user serves webhook/api/poller pods.
+_k8s_pod = k8s_pod_user.create(
+    queue_arns=[_cave_jobs_queue.arn, _cave_results_queue.arn, _rerun_jobs_queue.arn],
+    kms_key_arn=grug_tokens_cmk.arn,
 )
 
 webhook = lambda_service.create(
