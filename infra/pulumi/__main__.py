@@ -355,6 +355,14 @@ _k8s_pod = k8s_pod_user.create(
 # target only matters if the Worker route is ever removed: traffic
 # still lands on the tunnel origin (and 401s without the Worker's
 # auth header — cf_auth holds the boundary).
+# CONTENT IS HAND-OWNED until the #239 zone migration: the stack's CF
+# token verifies active but gets 10000 Authentication error on every
+# grug.lol DNS-records call (it kept Workers perms, lost zone DNS) -
+# the retirement up failed exactly here. The record's content was
+# PATCHed to the tunnel origin out-of-band with the infra-zone token;
+# ignore_changes below keeps this stack from ever calling the DNS API
+# it cannot use. The infra stack adopts both grug.lol records at the
+# zone migration (infra#239).
 _webhook_upstream_host = aws.ssm.get_parameter(name="/grug/webhook-upstream-host")
 cloudflare_dns.create_proxied_cname(
     zone_id=_cf_zone_id.value,
@@ -364,6 +372,7 @@ cloudflare_dns.create_proxied_cname(
     provider=cf_provider,
     # Proxied=True so the Worker route intercepts and rewrites Host.
     proxied=True,
+    ignore_content=True,
 )
 
 # API Lambda — separate ECR + Function URL from webhook (per Q10
