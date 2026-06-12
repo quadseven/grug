@@ -25,6 +25,8 @@ spec:
         spec:
           restartPolicy: Never
           automountServiceAccountToken: false
+          nodeSelector:
+            kubernetes.io/arch: arm64
           imagePullSecrets:
             - name: registry-pull
           securityContext:
@@ -34,7 +36,8 @@ spec:
           containers:
             - name: poller
               image: REGISTRY_PLACEHOLDER/grug-webhook:TAG_PLACEHOLDER
-              command: ["python", "-c", "from poller_handler import handler; handler({}, None)"]
+              # ddtrace-run so poller spans are not silently dropped (review F4).
+              command: ["ddtrace-run", "python", "-c", "from poller_handler import handler; handler({}, None)"]
               envFrom:
                 - secretRef: {name: grug-secrets}
               env:
