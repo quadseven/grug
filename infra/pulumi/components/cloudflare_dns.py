@@ -31,6 +31,7 @@ def create_proxied_cname(
     target_url: pulumi.Output[str],
     provider: cloudflare.Provider | None = None,
     proxied: bool = True,
+    ignore_content: bool = False,
 ) -> cloudflare.Record:
     """Create a CNAME `<name>.<domain>` → host of target_url.
 
@@ -51,5 +52,11 @@ def create_proxied_cname(
         proxied=proxied,
         ttl=1 if proxied else 300,  # 1 = "Auto" when proxied; 300 = 5min DNS-only
         comment=f"grug — managed by Pulumi (slice 1) — {name}.{domain}",
-        opts=pulumi.ResourceOptions(provider=provider) if provider else None,
+        # ignore_content: the record exists but its VALUE is owned
+        # out-of-band (e.g. the webhook record post-#354 - this stack's
+        # CF token lost zone-DNS access; see the call site + infra#239).
+        opts=pulumi.ResourceOptions(
+            provider=provider,
+            ignore_changes=["content"] if ignore_content else None,
+        ),
     )
