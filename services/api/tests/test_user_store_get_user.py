@@ -13,7 +13,6 @@ tests exercise the former.
 
 from __future__ import annotations
 
-import boto3
 import pytest
 
 
@@ -82,12 +81,9 @@ def test_get_user_returns_admin_state_after_allowlist(_us):
         github_user_id="100", login="myname",
         oauth_access_token="x", oauth_refresh_token=None,
     )
-    # Bump to admin in DDB directly
-    _us._table.update_item(
-        Key={"PK": _us._user_pk("100"), "SK": "META"},
-        UpdateExpression="SET #r = :r, tier = :t, allowlisted = :a",
-        ExpressionAttributeNames={"#r": "role"},
-        ExpressionAttributeValues={":r": "admin", ":t": "lifetime", ":a": True},
+    # Bump to admin out-of-band via the store's own field-update helper.
+    _us.update_user_fields(
+        "100", {"role": "admin", "tier": "lifetime", "allowlisted": True}
     )
     u = _us.get_user("100")
     assert u.role == "admin"

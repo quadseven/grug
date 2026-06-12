@@ -151,7 +151,12 @@ def patch_user(
     if not fields:
         return {"user_id": user_id, "before": before, "after": after, "changed": False}
 
-    new = update_user_fields(str(user_id), fields)
+    try:
+        new = update_user_fields(str(user_id), fields)
+    except LookupError:
+        # Row existed at the read above but vanished mid-update (raced a
+        # deletion). 404, not a 500 — the client retries and sees reality.
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="user not found")
 
     log.info(
         "admin_user_patched",
