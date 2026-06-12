@@ -24,10 +24,10 @@ GRUG_ADMIN_INSTALL_ID ?= 129256114
 test: webhook-test api-test
 
 webhook-test:
-	cd services/webhook && uv run --with pytest --with httpx --with pyjwt --with cryptography --with boto3 --with moto --with fastapi pytest tests/ -q
+	cd services/webhook && uv run --with pytest --with httpx --with pyjwt --with cryptography --with boto3 --with moto --with fastapi --with mangum pytest tests/ -q
 
 api-test:
-	cd services/api && uv run --with pytest --with httpx --with pyjwt --with cryptography --with boto3 --with moto --with pydantic --with fastapi pytest tests/ -q
+	cd services/api && uv run --with pytest --with httpx --with pyjwt --with cryptography --with boto3 --with moto --with pydantic --with fastapi --with mangum pytest tests/ -q
 
 # Real-Postgres store tests (#354). REQUIRE a reachable Postgres via
 # GRUG_TEST_DATABASE_URL (CI: workflow service container) - they skip
