@@ -36,14 +36,17 @@ jobs:
           --health-interval 5s
           --health-timeout 3s
           --health-retries 10
-    env:
-      GRUG_TEST_DATABASE_URL: postgresql://postgres:test@localhost:5432/grug_test
     steps:
       - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
       - uses: astral-sh/setup-uv@fac544c07dec837d0ccb6301d7b5580bf5edae39 # v8
       - name: webhook tests
-        run: make test-webhook
+        run: make webhook-test
       - name: api tests
-        run: make test-api
+        run: make api-test
       - name: pg store tests (real Postgres)
-        run: make test-pg
+        # DB env is STEP-scoped on purpose: job-scoped would make the plain
+        # api suite (no psycopg dep) try to RUN the pg tests instead of
+        # skipping them.
+        env:
+          GRUG_TEST_DATABASE_URL: postgresql://postgres:test@localhost:5432/grug_test
+        run: make pg-test

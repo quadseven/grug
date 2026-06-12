@@ -26,6 +26,10 @@ from pathlib import Path
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
 USER_STORE = REPO_ROOT / "services/api/adapters/user_store.py"
+# Staged Postgres successor (#354): same decrypt-boundary contract, same
+# sole-construction discipline. At cutover the implementation swap
+# collapses construction back to one file and this entry is removed.
+PG_USER_STORE = REPO_ROOT / "services/api/adapters/pg_user_store.py"
 WEBHOOK_DIR = REPO_ROOT / "services/webhook"
 API_DIR = REPO_ROOT / "services/api"
 
@@ -140,15 +144,15 @@ def main() -> int:
         for path in API_DIR.rglob("*.py"):
             if "test" in path.name:
                 continue
-            if path == USER_STORE:
-                continue  # the canonical definition + construction site
+            if path in (USER_STORE, PG_USER_STORE):
+                continue  # canonical site + staged Postgres successor (#354)
             tree2 = ast.parse(path.read_text())
             for node in ast.walk(tree2):
                 if isinstance(node, ast.Call) and isinstance(node.func, ast.Name) and node.func.id == "UserWithTokens":
                     construction_sites.append(f"{path.relative_to(REPO_ROOT)}:{node.lineno}")
         if construction_sites:
             failures.append(
-                "UserWithTokens constructed outside user_store.py — spec 0008 attests get_user_with_tokens is the sole construction site:\n"
+                "UserWithTokens constructed outside user_store.py / pg_user_store.py (the #354-staged successor) — spec 0008 attests get_user_with_tokens is the sole construction site:\n"
                 + "\n".join(f"    {s}" for s in construction_sites)
             )
 
