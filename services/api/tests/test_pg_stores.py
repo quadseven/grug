@@ -38,6 +38,14 @@ pytestmark = pytest.mark.skipif(
 @pytest.fixture()
 def pg(monkeypatch):
     """Fresh schema per test: point the pool at the test DB and truncate."""
+    # This fixture TRUNCATEs grug_kv. Refuse anything that doesn't look
+    # like a test database so a mis-exported URL can't wipe live data
+    # (same guard as conftest.pg_store).
+    if "test" not in _TEST_DB.rsplit("/", 1)[-1]:
+        pytest.fail(
+            "GRUG_TEST_DATABASE_URL database name must contain 'test' "
+            f"(got {_TEST_DB.rsplit('/', 1)[-1]!r}) - this fixture TRUNCATEs it"
+        )
     monkeypatch.setenv("GRUG_DATABASE_URL", _TEST_DB)
     from adapters import pg_base
 
@@ -425,3 +433,166 @@ def test_admin_scan_and_update(pg, fake_kms):
     new = users.update_user_fields("1", {"tier": "paid"})
     assert new["tier"] == "paid"
     assert users.get_user_item("1")["tier"] == "paid"
+
+
+# ---------------------------------------------------------------------------
+# stage-7 coverage round (PR #366): assertions the deleted DDB-fake suites
+# carried that nothing else asserted against the REAL store
+# ---------------------------------------------------------------------------
+
+
+def test_is_persona_enabled_matrix(pg):
+    """The webhook gate every event passes through - every dispatcher test
+    mocks it, so this is its ONLY non-mocked execution."""
+    from adapters import pg_install_store as store
+
+    # Row-less repo: every persona defaults enabled.
+    assert store.is_persona_enabled(1, 2, "tpm") is True
+    assert store.is_persona_enabled(1, 2, "code_reviewer") is True
+
+    store.set_repo_config(
+        install_id=1, repo_id=2, repo_full_name="o/r",
+        tpm_enabled=False, updated_by_user_id="9",
+    )
+    assert store.is_persona_enabled(1, 2, "tpm") is False
+    assert store.is_persona_enabled(1, 2, "code_reviewer") is True  # untouched
+    # Unknown persona (no <name>_enabled key) fails open to enabled.
+    assert store.is_persona_enabled(1, 2, "release-manager") is True
+
+
+def test_set_repo_config_code_reviewer_fields_round_trip(pg):
+    """The dashboard's Elder enable/blocking toggles - the route tests mock
+    set_repo_config entirely, so the kwarg branches run only here."""
+    from adapters import pg_install_store as store
+
+    store.set_repo_config(
+        install_id=1, repo_id=2, repo_full_name="o/r",
+        tpm_enabled=True, updated_by_user_id="9",
+        code_reviewer_enabled=False, code_reviewer_blocking=True,
+    )
+    cfg = store.get_repo_config(1, 2)
+    assert cfg["code_reviewer_enabled"] is False
+    assert cfg["code_reviewer_blocking"] is True
+    assert cfg["tpm_enabled"] is True
+    assert store.is_persona_enabled(1, 2, "code_reviewer") is False
+
+    # Re-enable without the blocking kwarg flips ONLY the enabled bit;
+    # blocking persists (sparse merge).
+    store.set_repo_config(
+        install_id=1, repo_id=2, repo_full_name="o/r",
+        tpm_enabled=True, updated_by_user_id="9", code_reviewer_enabled=True,
+    )
+    cfg = store.get_repo_config(1, 2)
+    assert cfg["code_reviewer_enabled"] is True
+    assert cfg["code_reviewer_blocking"] is True
+
+
+def test_re_auth_with_new_refresh_replaces(pg, fake_kms):
+    """The overshoot direction of refresh-preserve: rotation must REPLACE,
+    not keep the stale blob (the failure mode a 'preserve' fix invites)."""
+    from adapters import pg_user_store as users
+
+    users.upsert_oauth_user(
+        github_user_id="3", login="x",
+        oauth_access_token="a1", oauth_refresh_token="r1",
+    )
+    users.upsert_oauth_user(
+        github_user_id="3", login="x",
+        oauth_access_token="a2", oauth_refresh_token="r2",
+    )
+    got = users.get_user_with_tokens("3")
+    assert got.oauth_access_token == "a2"
+    assert got.oauth_refresh_token == "r2"
+
+
+def test_check_verdict_degraded_reason_round_trips_as_errored(pg):
+    """/activity's errored filter depends on the degraded write arm; the
+    sparse-when-absent arm alone leaves it unexecuted."""
+    from adapters import pg_install_store as store
+
+    store.put_check_verdict(
+        install_id=1, persona="elder", repo="o/r", pr_number=1,
+        head_sha="abc", conclusion="neutral", summary="s",
+        findings_count=0, blocking=False,
+        created_at="2026-06-12T00:00:00+00:00",
+        degraded_reason="all_backends_failed",
+    )
+    row = store.list_check_verdicts(1)[0]
+    assert row["degraded_reason"] == "all_backends_failed"
+    assert row["verdict"] == "errored"  # never 'pass' on a degraded run
+
+
+def test_put_paths_write_future_ttl(pg):
+    """The TTL_LIVE filter tests manually expire rows - which never proves
+    the put paths WRITE a ttl. A NULL-ttl regression would accumulate rows
+    forever while every filter test stays green."""
+    import time as _time
+
+    from adapters import pg_install_store as store
+
+    store.put_comment_record(
+        install_id=1, comment_id=100, repo="o/r", pr_number=5,
+        review_span_context={}, finding_tags={},
+    )
+    store.put_check_verdict(
+        install_id=1, persona="elder", repo="o/r", pr_number=1,
+        head_sha="abc", conclusion="neutral", summary="s",
+        findings_count=0, blocking=False,
+        created_at="2026-06-12T00:00:00+00:00",
+    )
+    assert store.claim_delivery("ttl-probe") is True
+
+    now = _time.time()
+    day = 86400
+    with store.get_pool().connection() as conn:
+        rows = dict(
+            conn.execute("SELECT sk, ttl FROM grug_kv WHERE ttl IS NOT NULL").fetchall()
+        )
+    assert now + 29 * day < rows["CRCOMMENT#100"] <= now + 31 * day
+    assert now + 89 * day < rows["ACT#abc#elder"] <= now + 91 * day
+    assert now + 23 * 3600 < rows["META"] <= now + 25 * 3600  # DELIVERY# claim
+
+
+def test_comment_record_span_and_tags_round_trip(pg):
+    """The reaction poller's span attribution rides these two dicts."""
+    from adapters import pg_install_store as store
+
+    store.put_comment_record(
+        install_id=1, comment_id=100, repo="o/r", pr_number=5,
+        review_span_context={"trace_id": "t1", "span_id": "s1"},
+        finding_tags={"rule": "no-bare-except", "file": "x.py"},
+    )
+    rec = store.list_comment_records(1)[0]
+    assert rec["review_span_context"] == {"trace_id": "t1", "span_id": "s1"}
+    assert rec["finding_tags"] == {"rule": "no-bare-except", "file": "x.py"}
+
+
+def test_allowlist_edges_missing_row_and_mixed_set(pg):
+    from adapters import pg_install_store as store
+    from adapters import pg_user_store as users
+
+    assert store.is_install_allowlisted(404) is False  # no INST row at all
+    assert store.list_allowlisted_installs() == []
+
+    for iid, uid, allowed in ((1, "11", True), (2, "22", False), (3, "33", True)):
+        store.record_installation(
+            install_id=iid, account_login=f"a{iid}", account_type="User",
+            installed_by_user_id=int(uid),
+        )
+        _seed_user(pg, uid, allowlisted=False)
+        if allowed:
+            users.update_user_fields(uid, {"allowlisted": True})
+    assert store.list_allowlisted_installs() == [1, 3]
+
+
+def test_scan_meta_items_excludes_ttl_expired(pg):
+    from adapters import pg_user_store as users
+
+    _seed_user(pg, "1", allowlisted=False)
+    _seed_user(pg, "2", allowlisted=False)
+    with users.get_pool().connection() as conn:
+        conn.execute(
+            "UPDATE grug_kv SET ttl = EXTRACT(EPOCH FROM now())::bigint - 10 "
+            "WHERE pk = 'USER#2'"
+        )
+    assert [i["PK"] for i in users.scan_meta_items(pk_prefix="USER#")] == ["USER#1"]

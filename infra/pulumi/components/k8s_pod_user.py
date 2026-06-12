@@ -65,11 +65,11 @@ def create(
                         ],
                     },
                     {
-                        # TRANSITIONAL (#354): until the store swap, all
-                        # three services still read/write the DynamoDB
-                        # table - the Postgres-only end-state policy made
-                        # the first deploy's poller die on Scan. REMOVE
-                        # this statement in the store-swap PR.
+                        # TRANSITIONAL (#354): the services are
+                        # Postgres-only post-swap; this grant remains
+                        # ONLY so the one-shot DDB->PG prestage job can
+                        # re-run at cutover for data freshness. REMOVE
+                        # in the retirement PR with the table itself.
                         "Sid": "TransitionalDdbAccess",
                         "Effect": "Allow",
                         "Action": [

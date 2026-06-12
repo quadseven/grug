@@ -125,6 +125,7 @@ jobs:
             echo "AWS_DEFAULT_REGION=us-east-1"
             echo "GRUG_DATABASE_URL=$(get /grug/database-url)"
             echo "GRUG_CAVE_JOBS_QUEUE_URL=$(aws sqs get-queue-url --queue-name grug-cave-jobs.fifo --query QueueUrl --output text)"
+            echo "GRUG_RERUN_QUEUE_URL=$(aws sqs get-queue-url --queue-name grug-rerun-jobs.fifo --query QueueUrl --output text)"
             echo "GRUG_CAVE_DIFF_BUCKET=$(aws s3api list-buckets --query 'Buckets[?starts_with(Name, `grug-cave-diffs`)].Name | [0]' --output text)"
           } > "$ENVF"
           # DELETE-then-create: kubectl apply MERGES secret data, so a

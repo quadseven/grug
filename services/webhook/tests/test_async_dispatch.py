@@ -6,7 +6,8 @@ ACK path:
     boto3 lambda.invoke; degrades to False, never raises).
   - `run_elder_job` — the async worker (idempotent on delivery_id; never
     re-raises so AWS doesn't retry-storm).
-  - `install_store.claim_delivery` — the conditional-put idempotency claim.
+  - `install_store.claim_delivery` — the win-once idempotency claim (only
+    the error-propagation contract here; behavior is in the real-PG suite).
 """
 from __future__ import annotations
 
@@ -216,7 +217,7 @@ def test_slim_payload_satisfies_dispatch_code_review_consumer(monkeypatch):
 
 
 def test_run_elder_job_fails_open_when_claim_errors():
-    """A DDB hiccup on the claim must not drop the review — fail OPEN
+    """A store hiccup on the claim must not drop the review — fail OPEN
     (run it). A possible duplicate beats a silently-skipped review."""
     with patch("adapters.install_store.claim_delivery",
                side_effect=RuntimeError("ddb down")), \
@@ -228,61 +229,29 @@ def test_run_elder_job_fails_open_when_claim_errors():
 
 
 # --- claim_delivery (idempotency) ------------------------------------------
-
-class _FakeTable:
-    def __init__(self, raise_conditional=False):
-        self.raise_conditional = raise_conditional
-        self.puts = []
-
-    def put_item(self, **kwargs):
-        from botocore.exceptions import ClientError
-        self.puts.append(kwargs)
-        if self.raise_conditional:
-            raise ClientError(
-                {"Error": {"Code": "ConditionalCheckFailedException"}}, "PutItem",
-            )
-        return {}
+# Behavioral coverage (win-once, redelivery skips, empty-id fails open,
+# expired-claim takeover, concurrent single-winner) lives in the real-PG
+# suite: services/api/tests/test_pg_stores.py. Only the error-propagation
+# contract is asserted here because it needs a broken pool, not a real one.
 
 
-def test_claim_delivery_first_caller_wins(monkeypatch):
-    fake = _FakeTable(raise_conditional=False)
-    monkeypatch.setattr(ins, "_table", fake)
-    assert ins.claim_delivery("uuid-1") is True
-    put = fake.puts[0]
-    assert put["Item"]["PK"] == "DELIVERY#uuid-1"
-    assert put["ConditionExpression"] == "attribute_not_exists(PK)"
-    assert "ttl" in put["Item"]  # auto-expire so the partition stays bounded
+def test_claim_delivery_db_error_propagates(monkeypatch):
+    """A real database error must NOT be swallowed into a false 'claimed'
+    that would drop the review — it propagates so run_elder_job's fail-open
+    catch runs it anyway."""
+    import psycopg
 
+    import adapters.pg_install_store as pg_ins
 
-def test_claim_delivery_second_caller_skips(monkeypatch):
-    """ConditionalCheckFailed → already claimed → False (caller skips)."""
-    monkeypatch.setattr(ins, "_table", _FakeTable(raise_conditional=True))
-    assert ins.claim_delivery("uuid-1") is False
+    class _BoomPool:
+        def connection(self):
+            raise psycopg.OperationalError("pg down")
 
-
-def test_claim_delivery_empty_id_fails_open(monkeypatch):
-    """No delivery id → can't dedup → fail OPEN (process). A double review
-    beats a silently-skipped one."""
-    fake = _FakeTable()
-    monkeypatch.setattr(ins, "_table", fake)
-    assert ins.claim_delivery("") is True
-    assert fake.puts == []  # no write attempted
-
-
-def test_claim_delivery_non_conditional_error_propagates(monkeypatch):
-    """A real DDB error (not ConditionalCheckFailed) must NOT be swallowed
-    into a false 'claimed' that would drop the review — it propagates so
-    run_elder_job's fail-open catch runs it anyway."""
-    from botocore.exceptions import ClientError
-
-    class _Boom:
-        def put_item(self, **kwargs):
-            raise ClientError({"Error": {"Code": "ProvisionedThroughputExceeded"}}, "PutItem")
-
-    monkeypatch.setattr(ins, "_table", _Boom())
+    monkeypatch.setattr(pg_ins.pg_base, "maybe_purge_expired", lambda: None)
+    monkeypatch.setattr(pg_ins, "get_pool", lambda: _BoomPool())
     try:
         ins.claim_delivery("uuid-x")
-    except ClientError:
+    except psycopg.Error:
         pass
     else:
-        raise AssertionError("expected ClientError to propagate")
+        raise AssertionError("expected psycopg.Error to propagate")

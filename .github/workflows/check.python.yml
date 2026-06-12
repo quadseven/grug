@@ -37,6 +37,11 @@ jobs:
           --health-timeout 3s
           --health-retries 10
     env:
+      # Post-#354 swap: the store IS Postgres, so the route/store tests
+      # in BOTH suites use the service container (job-level env; the
+      # suites carry psycopg now). The dedicated pg-test step keeps the
+      # skip-guard lane.
+      GRUG_TEST_DATABASE_URL: postgresql://postgres:test@localhost:5432/grug_test
       # moto-backed suites construct boto3 clients at import; hosted
       # runners have no ambient AWS config (developer shells do, which
       # is why this never bit locally).
@@ -51,9 +56,4 @@ jobs:
       - name: api tests
         run: make api-test
       - name: pg store tests (real Postgres)
-        # DB env is STEP-scoped on purpose: job-scoped would make the plain
-        # api suite (no psycopg dep) try to RUN the pg tests instead of
-        # skipping them.
-        env:
-          GRUG_TEST_DATABASE_URL: postgresql://postgres:test@localhost:5432/grug_test
         run: make pg-test

@@ -8,7 +8,7 @@ Proves NECESSARY conditions for these bools:
   - `defaults_enabled_explicit_optout_per_identity_concepts`
   - `is_persona_enabled_lookup_by_persona_underscore_enabled_key_per_identity_concepts`
 
-Asserts that both `services/{api,webhook}/adapters/install_store.py`:
+Asserts that both `services/{api,webhook}/adapters/pg_install_store.py`:
   1. Define a module-level `_DEFAULT_PERSONA_CONFIG` dict.
   2. The dict contains `tpm_enabled: True` (defaults-enabled invariant).
   3. Define `get_repo_config(install_id, repo_id)` returning the dict on missing row.
@@ -24,8 +24,10 @@ from pathlib import Path
 REPO_ROOT = Path(__file__).resolve().parents[2]
 
 INSTALL_STORE_PATHS: tuple[Path, ...] = (
-    REPO_ROOT / "services/api/adapters/install_store.py",
-    REPO_ROOT / "services/webhook/adapters/install_store.py",
+    # Post-swap (#354): install_store.py is a re-export facade; the
+    # default dict + gate logic live in the pg implementation.
+    REPO_ROOT / "services/api/adapters/pg_install_store.py",
+    REPO_ROOT / "services/webhook/adapters/pg_install_store.py",
 )
 
 
