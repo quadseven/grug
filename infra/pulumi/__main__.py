@@ -131,6 +131,8 @@ _deploy_role_bundle = oidc_role.create(
     # AND silently narrowed back whenever main re-deployed without the
     # wider list.
     branches=["main", "feat/*", "fix/*", "hotfix/*"],
+    # deploy.k8s runs inside the k8s-prod environment (#354).
+    environments=["k8s-prod"],
     tags_pattern="v*",
 )
 gha_deploy_role = _deploy_role_bundle.role
