@@ -365,6 +365,7 @@ _rerun_jobs_queue = aws.sqs.Queue(
 _k8s_pod = k8s_pod_user.create(
     queue_arns=[_cave_jobs_queue.arn, _cave_results_queue.arn, _rerun_jobs_queue.arn],
     kms_key_arn=grug_tokens_cmk.arn,
+    cave_diff_bucket_arn=_cave_diff_bucket.arn,
 )
 
 webhook = lambda_service.create(

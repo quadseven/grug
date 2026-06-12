@@ -6,3 +6,4 @@ resources:
   - webhook-deployment.yaml
   - api-deployment.yaml
   - poller-cronjob.yaml
+  - consumer-deployment.yaml
