@@ -8,6 +8,12 @@ metadata:
   namespace: grug
   labels: {app: grug-poller}
 spec:
+  # SUSPENDED until the cutover (#354): the Lambda poller still runs on
+  # its schedule - a second poller against the same stores double-submits
+  # reaction annotations. The deploy smoke still validates this CronJob
+  # via `create job --from` (suspend only stops SCHEDULING). The cutover
+  # PR flips this to false when the Lambdas retire.
+  suspend: true
   schedule: "*/15 * * * *"
   concurrencyPolicy: Forbid
   successfulJobsHistoryLimit: 2

@@ -59,6 +59,27 @@ def create(
                         "Resource": "arn:aws:ssm:us-east-1:*:parameter/grug/*",
                     },
                     {
+                        # TRANSITIONAL (#354): until the store swap, all
+                        # three services still read/write the DynamoDB
+                        # table - the Postgres-only end-state policy made
+                        # the first deploy's poller die on Scan. REMOVE
+                        # this statement in the store-swap PR.
+                        "Sid": "TransitionalDdbAccess",
+                        "Effect": "Allow",
+                        "Action": [
+                            "dynamodb:GetItem",
+                            "dynamodb:PutItem",
+                            "dynamodb:UpdateItem",
+                            "dynamodb:DeleteItem",
+                            "dynamodb:Query",
+                            "dynamodb:Scan",
+                        ],
+                        "Resource": [
+                            "arn:aws:dynamodb:us-east-1:*:table/grug-main",
+                            "arn:aws:dynamodb:us-east-1:*:table/grug-main/index/*",
+                        ],
+                    },
+                    {
                         "Sid": "DecryptSsmSecureStrings",
                         "Effect": "Allow",
                         "Action": ["kms:Decrypt"],
