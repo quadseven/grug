@@ -41,6 +41,11 @@ _ssm = boto3.client("ssm")
 
 SECRET_HEADER = "X-Grug-CF-Secret"
 LIVEZ_PATH = "/livez"
+# Readiness must be probeable by the ORCHESTRATOR (kubelet sends no CF
+# header); a 403 here reads as not-ready while the process is healthy -
+# exactly what blocked the first Kubernetes rollout (#354). Same
+# no-sensitive-data rationale as /livez.
+READYZ_PATH = "/readyz"
 
 # Narrow set of exceptions that put the middleware into fail-open mode.
 # Anything outside this set propagates as a 500 — a programmer bug or
@@ -123,7 +128,7 @@ class CfAuthMiddleware(BaseHTTPMiddleware):
         # + case so `/livez/` and `/LIVEZ` also bypass — FastAPI's
         # auto-redirect on trailing slash issues 307 from the route
         # layer, but the middleware sees the raw path first.
-        if request.url.path.rstrip("/").lower() == LIVEZ_PATH:
+        if request.url.path.rstrip("/").lower() in (LIVEZ_PATH, READYZ_PATH):
             return await call_next(request)
 
         try:
