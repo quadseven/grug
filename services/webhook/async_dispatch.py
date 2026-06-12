@@ -29,6 +29,7 @@ from __future__ import annotations
 import json
 import logging
 import os
+import threading
 from typing import Any
 
 import boto3
@@ -75,7 +76,10 @@ def _slim_payload(payload: dict[str, Any]) -> dict[str, Any]:
 
 
 def enqueue_elder_review(
-    *, payload: dict[str, Any], delivery_id: str, blocking: bool,
+    *,
+    payload: dict[str, Any],
+    delivery_id: str,
+    blocking: bool,
 ) -> bool:
     """Fire-and-forget self-invoke to run the Elder review async.
 
@@ -87,13 +91,19 @@ def enqueue_elder_review(
     the next push.
 
     The target function is the caller's OWN function, read from the
-    Lambda-runtime-provided ``AWS_LAMBDA_FUNCTION_NAME``; missing (local
-    / test) → we can't self-invoke, return False.
+    Lambda-runtime-provided ``AWS_LAMBDA_FUNCTION_NAME``. Off-Lambda
+    there are two cases (#368): the k8s runtime (``GRUG_K8S_RUNTIME``
+    set in the pod manifests) runs the job in-process on a background
+    thread — a pod has no Lambda-style invoke budget to escape, the ACK
+    handler returns immediately while the thread runs with the pod's
+    full lifetime. Local / test (neither env set) → return False.
+
+    k8s trade-off (vs a queue + worker Deployment, recorded in
+    specs/DESIGN.md): a pod restart mid-review drops the in-flight
+    review — the SAME best-effort contract as Lambda's async invoke
+    (a dropped review re-triggers on the next push). In exchange we
+    avoid a new queue + consumer + IAM surface for the hot path.
     """
-    function_name = os.getenv("AWS_LAMBDA_FUNCTION_NAME", "")
-    if not function_name:
-        log.warning("elder_enqueue_no_function_name", extra={"delivery_id": delivery_id})
-        return False
     job = {
         ASYNC_JOB_KEY: ELDER_REVIEW_JOB,
         "delivery_id": delivery_id,
@@ -102,6 +112,14 @@ def enqueue_elder_review(
         # _slim_payload.
         "payload": _slim_payload(payload),
     }
+    function_name = os.getenv("AWS_LAMBDA_FUNCTION_NAME", "")
+    if not function_name:
+        if os.getenv("GRUG_K8S_RUNTIME"):
+            return _spawn_local_elder(job)
+        log.warning(
+            "elder_enqueue_no_function_name", extra={"delivery_id": delivery_id}
+        )
+        return False
     try:
         _lambda.invoke(
             FunctionName=function_name,
@@ -113,6 +131,33 @@ def enqueue_elder_review(
         # Distinct token from the caller's `elder_enqueue_failed` so the
         # offload-failure monitor (which watches the caller's log) counts
         # one line per dropped review, not two. This line adds the cause.
+        log.error(
+            "elder_enqueue_invoke_error",
+            extra={"delivery_id": delivery_id, "kind": type(e).__name__},
+        )
+        return False
+
+
+def _spawn_local_elder(job: dict[str, Any]) -> bool:
+    """Run the Elder job on a daemon thread (k8s runtime, #368).
+
+    daemon=True is deliberate: on pod shutdown (deploy rollout, node
+    drain) an in-flight review dies WITHOUT blocking termination —
+    matching the documented best-effort contract. `run_elder_job` owns
+    idempotency + never-raise, so the thread body needs no wrapper.
+    """
+    delivery_id = str(job.get("delivery_id", ""))
+    try:
+        threading.Thread(
+            target=run_elder_job,
+            args=(job,),
+            name=f"elder-{delivery_id[:13]}",
+            daemon=True,
+        ).start()
+        return True
+    except Exception as e:  # noqa: BLE001 — best-effort enqueue; never break the ACK
+        # Same monitor contract as the Lambda branch: one error line per
+        # dropped review, with the cause kind.
         log.error(
             "elder_enqueue_invoke_error",
             extra={"delivery_id": delivery_id, "kind": type(e).__name__},
@@ -158,6 +203,7 @@ def run_elder_job(event: dict[str, Any]) -> dict[str, str]:
     blocking = bool(event.get("blocking", False))
     try:
         from personas.code_reviewer.dispatch import dispatch_code_review
+
         result = dispatch_code_review(payload, blocking=blocking)
         log.info(
             "elder_job_done",

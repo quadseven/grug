@@ -1,31 +1,34 @@
-# grug-webhook on Kubernetes (#354). Image registry + tag are PLACEHOLDERS
-# rewritten by the deploy workflow (sed from repository variables) - no
-# registry host is committed to this public repo by design.
+# grug-consumer on Kubernetes (#368): replaces the two SQS->Lambda
+# event-source mappings (grug-rerun-jobs.fifo + grug-cave-results.fifo)
+# with a long-polling consumer process (services/webhook/consumer.py).
+# Same image as the webhook - the rerun handler runs full Elder re-runs,
+# so it needs the identical dependency graph and SSM env surface.
+# Image registry + tag are PLACEHOLDERS rewritten by the deploy workflow.
 apiVersion: apps/v1
 kind: Deployment
 metadata:
-  name: grug-webhook
+  name: grug-consumer
   namespace: grug
   labels:
-    app: grug-webhook
-    tags.datadoghq.com/service: grug-webhook
+    app: grug-consumer
+    tags.datadoghq.com/service: grug-consumer
     tags.datadoghq.com/env: prod
 spec:
+  # ONE replica, deliberately: batch-size-1 consumption from FIFO queues -
+  # a second replica would interleave message groups and double Elder
+  # re-run load for zero benefit at grug's volume.
   replicas: 1
   strategy: {type: Recreate}
   selector:
-    matchLabels: {app: grug-webhook}
+    matchLabels: {app: grug-consumer}
   template:
     metadata:
       labels:
-        app: grug-webhook
-        tags.datadoghq.com/service: grug-webhook
+        app: grug-consumer
+        tags.datadoghq.com/service: grug-consumer
         tags.datadoghq.com/env: prod
     spec:
       automountServiceAccountToken: false
-      # Images are built natively for arm64 only - without this pin a
-      # mixed-arch cluster schedules onto amd64 and exec-format-errors
-      # (review F2).
       nodeSelector:
         kubernetes.io/arch: arm64
       imagePullSecrets:
@@ -35,15 +38,14 @@ spec:
         runAsUser: 10001
         seccompProfile: {type: RuntimeDefault}
       containers:
-        - name: webhook
+        - name: consumer
           image: REGISTRY_PLACEHOLDER/grug-webhook:TAG_PLACEHOLDER
           imagePullPolicy: Always
-          ports:
-            - {name: http, containerPort: 8080}
+          command: ["ddtrace-run", "python", "consumer.py"]
           envFrom:
             - secretRef: {name: grug-secrets}
           env:
-            - {name: DD_SERVICE, value: grug-webhook}
+            - {name: DD_SERVICE, value: grug-consumer}
             - {name: DD_ENV, value: prod}
             - name: DD_VERSION
               value: TAG_PLACEHOLDER
@@ -51,9 +53,6 @@ spec:
               valueFrom: {fieldRef: {fieldPath: status.hostIP}}
             - {name: DD_LOGS_INJECTION, value: "true"}
             - {name: GRUG_ENV, value: prod}
-            # Off-Lambda Elder path (#368): run reviews on an in-process
-            # background thread instead of the Lambda self-invoke.
-            - {name: GRUG_K8S_RUNTIME, value: "1"}
             - {name: GRUG_DDB_TABLE, value: grug-main}
             - {name: GITHUB_APP_ID_SSM, value: /grug/github-app-id}
             - {name: GITHUB_APP_PRIVATE_KEY_SSM, value: /grug/github-app-private-key}
@@ -68,13 +67,9 @@ spec:
             - {name: DD_SITE, value: datadoghq.com}
             - {name: DD_LLMOBS_ENABLED, value: "true"}
             - {name: DD_LLMOBS_ML_APP, value: grug-elder}
-          readinessProbe:
-            httpGet: {path: /readyz, port: http}
-            periodSeconds: 10
-          livenessProbe:
-            httpGet: {path: /livez, port: http}
-            initialDelaySeconds: 10
-            periodSeconds: 30
+          # No HTTP surface -> no http probes. Liveness = the python
+          # process itself; if a consumer thread dies the process exits
+          # (thread join in main) and the kubelet restarts the pod.
           resources:
             requests: {cpu: 50m, memory: 192Mi}
             limits: {memory: 512Mi}
@@ -87,14 +82,3 @@ spec:
       volumes:
         - name: tmp
           emptyDir: {sizeLimit: 64Mi}
----
-apiVersion: v1
-kind: Service
-metadata:
-  name: grug-webhook
-  namespace: grug
-  labels: {app: grug-webhook}
-spec:
-  selector: {app: grug-webhook}
-  ports:
-    - {name: http, port: 8080, targetPort: http}
