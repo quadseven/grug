@@ -1,0 +1,77 @@
+# grug-webhook on Kubernetes (#354). Image registry + tag are PLACEHOLDERS
+# rewritten by the deploy workflow (sed from repository variables) - no
+# registry host is committed to this public repo by design.
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: grug-webhook
+  namespace: grug
+  labels:
+    app: grug-webhook
+    tags.datadoghq.com/service: grug-webhook
+    tags.datadoghq.com/env: prod
+spec:
+  replicas: 1
+  strategy: {type: Recreate}
+  selector:
+    matchLabels: {app: grug-webhook}
+  template:
+    metadata:
+      labels:
+        app: grug-webhook
+        tags.datadoghq.com/service: grug-webhook
+        tags.datadoghq.com/env: prod
+    spec:
+      automountServiceAccountToken: false
+      imagePullSecrets:
+        - name: registry-pull
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 10001
+        seccompProfile: {type: RuntimeDefault}
+      containers:
+        - name: webhook
+          image: REGISTRY_PLACEHOLDER/grug-webhook:TAG_PLACEHOLDER
+          imagePullPolicy: Always
+          ports:
+            - {name: http, containerPort: 8080}
+          envFrom:
+            - secretRef: {name: grug-secrets}
+          env:
+            - {name: DD_SERVICE, value: grug-webhook}
+            - {name: DD_ENV, value: prod}
+            - name: DD_VERSION
+              value: TAG_PLACEHOLDER
+            - name: DD_AGENT_HOST
+              valueFrom: {fieldRef: {fieldPath: status.hostIP}}
+            - {name: DD_LOGS_INJECTION, value: "true"}
+          readinessProbe:
+            httpGet: {path: /readyz, port: http}
+            periodSeconds: 10
+          livenessProbe:
+            httpGet: {path: /livez, port: http}
+            initialDelaySeconds: 10
+            periodSeconds: 30
+          resources:
+            requests: {cpu: 50m, memory: 192Mi}
+            limits: {memory: 512Mi}
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities: {drop: ["ALL"]}
+          volumeMounts:
+            - {name: tmp, mountPath: /tmp}
+      volumes:
+        - name: tmp
+          emptyDir: {sizeLimit: 64Mi}
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: grug-webhook
+  namespace: grug
+  labels: {app: grug-webhook}
+spec:
+  selector: {app: grug-webhook}
+  ports:
+    - {name: http, port: 8080, targetPort: http}
