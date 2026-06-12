@@ -56,7 +56,13 @@ def create(
                             "ssm:GetParameters",
                             "ssm:GetParametersByPath",
                         ],
-                        "Resource": "arn:aws:ssm:us-east-1:*:parameter/grug/*",
+                        "Resource": [
+                            "arn:aws:ssm:us-east-1:*:parameter/grug/*",
+                            # Shared LLM keys the Elder backends read at
+                            # runtime (paths already public in this repo).
+                            "arn:aws:ssm:us-east-1:*:parameter/infra/llm/openrouter_api_key",
+                            "arn:aws:ssm:us-east-1:*:parameter/infra/llm/poolside_api_key",
+                        ],
                     },
                     {
                         "Sid": "DecryptSsmSecureStrings",
