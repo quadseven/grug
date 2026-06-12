@@ -60,12 +60,20 @@ def create(
     repo: str,
     branches: list[str],
     tags_pattern: str | None = None,
+    environments: list[str] | None = None,
 ) -> DeployRole:
     provider_arn = _ensure_oidc_provider()
 
     sub_patterns = [f"repo:{repo}:ref:refs/heads/{b}" for b in branches]
     if tags_pattern:
         sub_patterns.append(f"repo:{repo}:ref:refs/tags/{tags_pattern}")
+    # Jobs that declare a GitHub `environment:` present a DIFFERENT OIDC
+    # sub shape (`repo:<repo>:environment:<name>`), NOT the ref-based one.
+    # Without an explicit entry STS rejects with "Not authorized to
+    # perform sts:AssumeRoleWithWebIdentity" - hit live on the first
+    # deploy.k8s dispatch (#354), same trap the infra repo documented.
+    for env in environments or []:
+        sub_patterns.append(f"repo:{repo}:environment:{env}")
 
     assume = json.dumps(
         {
