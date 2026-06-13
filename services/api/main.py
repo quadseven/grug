@@ -17,6 +17,7 @@ import os
 from datetime import datetime, timezone
 
 from fastapi import FastAPI
+from fastapi.middleware.cors import CORSMiddleware
 
 from admin import router as admin_router
 from auth.github_oauth import router as github_oauth_router
@@ -43,6 +44,26 @@ app = FastAPI(
 # yet so deploy ordering across Pulumi + Workers + service can race
 # without breaking production traffic.
 app.add_middleware(CfAuthMiddleware)
+
+# CORS for the grug.lol SPA -> api.grug.lol cross-origin (different
+# subdomain = different origin). The SPA fetches /api/v1/me etc. with
+# `credentials: "include"`; without these headers the browser blocks the
+# credentialed response, the SPA reads it as logged-out, and the dashboard
+# loops back into OAuth (which trips GitHub's secondary rate limit).
+# The Lambda Function URL carried this CORS config (FunctionUrlCorsArgs);
+# the Lambda->k8s migration dropped it since FastAPI never added the
+# middleware. allow_origins MUST be explicit (not "*") when
+# allow_credentials=True — the browser rejects "*" with credentials.
+# Added last so CORS is the OUTERMOST layer: it answers the OPTIONS
+# preflight and stamps headers even on CfAuth short-circuits.
+_SPA_DOMAIN = os.environ.get("GRUG_DOMAIN", "grug.lol")
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=[f"https://{_SPA_DOMAIN}", f"https://www.{_SPA_DOMAIN}"],
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
 
 
 @app.get("/livez")
