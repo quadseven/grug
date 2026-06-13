@@ -124,6 +124,14 @@ jobs:
             echo "AWS_SECRET_ACCESS_KEY=$(get /grug/k8s-pod-aws-secret-access-key)"
             echo "AWS_DEFAULT_REGION=us-east-1"
             echo "GRUG_DATABASE_URL=$(get /grug/database-url)"
+            # GRUG_KMS_CMK_ARN: envelope-encryption CMK for OAuth/credential
+            # blobs (crypto/kms_envelope.encrypt_for_user hard-requires it at
+            # call time). The Lambda env had it; the k8s secret-seed missed
+            # it, so the dashboard OAuth callback 500'd on first sign-in.
+            # Sourced from SSM (the ARN carries the account id - keep it out
+            # of the repo). The grug k8s-pod IAM user already holds the KMS
+            # grant on this CMK (#354).
+            echo "GRUG_KMS_CMK_ARN=$(get /grug/kms-cmk-arn)"
             echo "GRUG_CAVE_JOBS_QUEUE_URL=$(aws sqs get-queue-url --queue-name grug-cave-jobs.fifo --query QueueUrl --output text)"
             echo "GRUG_RERUN_QUEUE_URL=$(aws sqs get-queue-url --queue-name grug-rerun-jobs.fifo --query QueueUrl --output text)"
             echo "GRUG_CAVE_RESULTS_QUEUE_URL=$(aws sqs get-queue-url --queue-name grug-cave-results.fifo --query QueueUrl --output text)"
