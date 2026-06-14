@@ -75,9 +75,12 @@ def _state_secret() -> str:
         try:
             return _get_ssm_secure_string(dedicated)
         except Exception:
+            # NB: do NOT log `dedicated` (the SSM param name) - the only
+            # such param is GRUG_SESSION_SIGNING_SECRET_SSM, so the message
+            # already identifies it, and logging a value sourced from a
+            # `*_SECRET_SSM` env var trips clear-text-secret scanners.
             log.warning(
-                "session_signing_secret_unavailable_falling_back_to_webhook_secret",
-                extra={"param": dedicated},
+                "session_signing_secret_unavailable_falling_back_to_webhook_secret"
             )
     else:
         log.warning("session_signing_secret_unconfigured_using_webhook_secret")
