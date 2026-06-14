@@ -165,14 +165,16 @@ jobs:
           REGISTRY_HOST: ${{ vars.DEPLOY_REGISTRY_HOST }}
         run: |
           set -euo pipefail
-          # Substitute each service's full image ref with the digest-pinned
-          # form captured at push time (audit #7). REGISTRY_PLACEHOLDER only
-          # ever appears inside image lines, so replacing the whole
-          # registry/name:tag token is sufficient — there's no longer a
-          # separate mutable tag substitution.
+          # Pin images by digest (audit #7): replace each FULL
+          # registry/name:tag image token with the @sha256 digest captured at
+          # push time. Order matters - do the image tokens FIRST, then the
+          # bare `TAG_PLACEHOLDER` substitution below only hits the remaining
+          # standalone uses (the DD_VERSION env value: TAG_PLACEHOLDER), which
+          # must still resolve to the git SHA for version tagging.
           sed -i \
             -e "s|REGISTRY_PLACEHOLDER/grug-api:TAG_PLACEHOLDER|${IMAGE_API}|g" \
             -e "s|REGISTRY_PLACEHOLDER/grug-webhook:TAG_PLACEHOLDER|${IMAGE_WEBHOOK}|g" \
+            -e "s|TAG_PLACEHOLDER|${GITHUB_SHA}|g" \
             k8s/*.yaml
           # Post-sed sentinel: a future manifest that escapes substitution
           # must fail the deploy, not ship a literal placeholder (F7).
