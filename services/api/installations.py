@@ -39,7 +39,7 @@ from adapters.install_store import (
 )
 from adapters.user_store import UserIdentity
 from auth.dependencies import require_authenticated
-from github_app_auth import get_install_token, with_install_token_retry
+from github_app_auth import with_install_token_retry
 from review_types import verdict as derive_verdict
 
 log = logging.getLogger("grug.api.installations")
@@ -538,6 +538,24 @@ def fix_enforcement(
         raise HTTPException(
             status_code=status.HTTP_502_BAD_GATEWAY,
             detail=f"GitHub rejected the ruleset ({gh_status}): {detail}",
+        ) from e
+    except httpx.RequestError as e:
+        # Transport-level failure (DNS, connect/read timeout, connection
+        # reset) reaching GitHub, even after with_install_token_retry's
+        # bounded retries. Unlike HTTPStatusError this carries NO response -
+        # GitHub is unreachable, not rejecting - so the old code let it
+        # propagate as an opaque 500 (#331). Return 503 (retryable) with a
+        # structured log so the dashboard "Fix" button shows an actionable
+        # "try again" and DD can alert. Mirrors get_enforcement's
+        # (HTTPStatusError, RequestError) handling on this same resource.
+        log.warning(
+            "fix_enforcement_transport_error",
+            extra={"install_id": install_id, "repo_id": repo_id,
+                   "kind": type(e).__name__, "err": str(e)},
+        )
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail="GitHub unreachable while applying enforcement; please retry.",
         ) from e
 
 

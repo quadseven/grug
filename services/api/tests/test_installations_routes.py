@@ -164,3 +164,40 @@ def test_get_enforcement_404_propagates_not_swallowed(_mod, monkeypatch):
     with pytest.raises(HTTPException) as exc:
         inst.get_enforcement(1, 2, user=_user(role="admin"))
     assert exc.value.status_code == 404
+
+
+# --- fix_enforcement transport-error handling (#331) ------------------------
+
+def _throw(err):
+    """Return a with_install_token_retry stub that raises `err`."""
+    def _stub(install_id, fn):
+        raise err
+    return _stub
+
+
+def test_fix_enforcement_transport_error_returns_503(monkeypatch):
+    """#331: a transport-level failure (httpx.RequestError) reaching GitHub
+    must return 503 (retryable upstream-unreachable), not an opaque 500."""
+    import httpx
+    import installations as inst
+    monkeypatch.setattr(inst, "get_installation", lambda iid: {"installed_by_user_id": "100"})
+    req = httpx.Request("POST", "https://api.github.com/repos/o/r/rulesets")
+    err = httpx.ConnectTimeout("dns/connect boom", request=req)
+    monkeypatch.setattr(inst, "with_install_token_retry", _throw(err))
+    with pytest.raises(HTTPException) as exc:
+        inst.fix_enforcement(1, 2, user=_user("100"))
+    assert exc.value.status_code == 503
+
+
+def test_fix_enforcement_github_4xx_still_returns_502(monkeypatch):
+    """Regression: a GitHub rejection (HTTPStatusError) keeps its 502 path
+    (the contributor's fix must not change existing 4xx behavior)."""
+    import httpx
+    import installations as inst
+    monkeypatch.setattr(inst, "get_installation", lambda iid: {"installed_by_user_id": "100"})
+    req = httpx.Request("POST", "https://api.github.com/repos/o/r/rulesets")
+    err = httpx.HTTPStatusError("422", request=req, response=httpx.Response(422, request=req, text="dup name"))
+    monkeypatch.setattr(inst, "with_install_token_retry", _throw(err))
+    with pytest.raises(HTTPException) as exc:
+        inst.fix_enforcement(1, 2, user=_user("100"))
+    assert exc.value.status_code == 502
