@@ -263,6 +263,20 @@ def create(
                             "arn:aws:s3:::grug-*/*",
                         ],
                     },
+                    {
+                        # The deploy.k8s secret-seed discovers the cave-diff
+                        # bucket's (random-suffixed) name via `aws s3api
+                        # list-buckets`. ListAllMyBuckets is ACCOUNT-level and
+                        # only accepts Resource "*" - the grug-* bucket scope
+                        # above can't grant it, so the seed silently got an
+                        # empty GRUG_CAVE_DIFF_BUCKET under the scoped role
+                        # (caught by the seed's empty-value guard). List bucket
+                        # NAMES only; no data access. (Cleaner future: export
+                        # the bucket name to SSM and drop this.)
+                        "Effect": "Allow",
+                        "Action": "s3:ListAllMyBuckets",
+                        "Resource": "*",
+                    },
                 ],
             },
         )
