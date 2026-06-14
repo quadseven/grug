@@ -49,6 +49,7 @@ MIRRORED_WITH_HEADER=(
   "personas/code_reviewer/reactions.py"
   "personas/tpm/dor_checks.py"
   "ports/token_cache.py"
+  "readiness.py"
   "secrets_loader.py"
 )
 

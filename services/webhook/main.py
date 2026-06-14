@@ -16,7 +16,7 @@ import os
 
 from typing import Any
 
-from fastapi import FastAPI, Header, HTTPException, Request, status
+from fastapi import FastAPI, Header, HTTPException, Request, Response, status
 
 from cf_auth import CfAuthMiddleware
 from hmac_verify import verify_signature
@@ -51,13 +51,22 @@ def livez() -> dict[str, str]:
 
 
 @app.get("/readyz")
-def readyz() -> dict[str, str]:
-    """Readiness probe — service can serve traffic. v1 has no downstream
-    deps so always returns ready. Slice 2+ adds DDB + KMS reachability
-    checks here (return 503 when DDB ping fails or KMS describe times
-    out — orchestrator routes traffic away but does NOT restart).
-    """
-    return {"status": "ready", "service": "grug-webhook"}
+def readyz(response: Response) -> dict[str, object]:
+    """Readiness probe — SSM/KMS + Postgres reachable (#404). Returns 503 when
+    a dependency is down so the orchestrator routes traffic away AND a rollout
+    of broken pods never completes (last-good pods keep serving); does NOT
+    restart (that's /livez). Health logic lives in `readiness` (TTL-cached,
+    fail-closed)."""
+    from readiness import check_readiness
+
+    rep = check_readiness()
+    if not rep.ready:
+        response.status_code = 503
+    return {
+        "status": "ready" if rep.ready else "not_ready",
+        "service": "grug-webhook",
+        "deps": rep.deps,
+    }
 
 
 @app.post("/webhook/github")
