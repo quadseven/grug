@@ -25,6 +25,8 @@ import time
 from dataclasses import dataclass
 
 import boto3
+import psycopg
+from botocore.config import Config
 
 log = logging.getLogger("grug.readiness")
 
@@ -32,6 +34,19 @@ _TTL_SECONDS = 5.0
 # Module-level single-slot cache. Mutated under Mangum/uvicorn's effectively
 # serial probe cadence; a benign duplicate check at a TTL boundary is fine.
 _cache: dict = {"at": -1.0e9, "report": None}
+
+# A readiness probe must fail FAST. A fast not-ready that recovers on the next
+# TTL is fine, but a SLOW probe that blows the kubelet timeoutSeconds drops the
+# replica and turns a blip / load-spike into an outage. So the probe's SSM
+# client uses tight timeouts + no retries (botocore defaults are ~60s + several
+# retries), and it is module-scoped for warm reuse (matches the cf_auth /
+# secrets_loader module-client pattern).
+_SSM_PROBE_CONFIG = Config(
+    connect_timeout=1, read_timeout=2, retries={"max_attempts": 1, "mode": "standard"}
+)
+_ssm = boto3.client("ssm", config=_SSM_PROBE_CONFIG)
+# Bound the Postgres reachability probe well under the kubelet probe timeout.
+_PG_CONNECT_TIMEOUT_S = 2
 
 
 @dataclass(frozen=True)
@@ -44,13 +59,16 @@ def _check_ssm_kms() -> None:
     """SecureString read: exercises AWS auth (catches a deleted/invalid key)
     AND KMS decrypt. Probes a param the pod already reads, so no extra IAM."""
     name = os.environ.get("GRUG_READYZ_SSM_PROBE") or os.environ["GITHUB_APP_ID_SSM"]
-    boto3.client("ssm").get_parameter(Name=name, WithDecryption=True)
+    _ssm.get_parameter(Name=name, WithDecryption=True)
 
 
 def _check_postgres() -> None:
-    from adapters.pg_base import get_pool  # lazy: no DB connect at import time
-
-    with get_pool().connection() as conn:
+    """Probe DB REACHABILITY with a SEPARATE short-lived connection, NOT the
+    request pool: a pod serving at max pool is busy, not unready, so readiness
+    must not be held hostage by an exhausted/contended pool. `connect_timeout`
+    bounds it under the kubelet probe timeout."""
+    url = os.environ["GRUG_DATABASE_URL"]
+    with psycopg.connect(url, connect_timeout=_PG_CONNECT_TIMEOUT_S) as conn:
         conn.execute("SELECT 1")
 
 
