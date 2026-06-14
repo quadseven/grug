@@ -21,7 +21,6 @@ import hashlib
 import json
 from dataclasses import dataclass
 
-import pulumi
 import pulumi_aws as aws
 import pulumiverse_time as ptime
 
@@ -108,66 +107,80 @@ def create(
         tags={"app": "grug", "purpose": "gha-deploy"},
     )
 
-    # Permissions: PowerUser-equivalent for the resources Pulumi creates,
-    # scoped down later. For Slice 1 — Lambda + ECR + IAM (for role
-    # creation) + SSM read + CloudWatch + Cloudflare-via-API.
-    #
-    # SSM read explicitly includes `/shared/*` so CI can fetch the
-    # cross-repo Pulumi access token (per the operator's private infra
-    # SSM convention — `/shared/<token>` is the cross-cutting namespace).
+    # Least-privilege deploy permissions, scoped to what the prod stack
+    # ACTUALLY manages (audit #2). Verified against the live stack
+    # (`pulumi stack export`): IAM principals are grug-gha-deploy (role) +
+    # grug-cave-connector / grug-k8s-pod (users) — all `grug-*` prefixed;
+    # and NO Lambda / ECR / EventBridge / CloudWatch-Logs resources are
+    # deployed (retired at the #354 k8s cutover; the container registry is
+    # self-hosted, not ECR). Those service grants were therefore dead and
+    # are removed. SSM reads include `/shared/*` so CI can fetch the
+    # cross-repo Pulumi access token (`/shared/<token>` is the operator's
+    # cross-cutting namespace); writes stay scoped to `/grug/*` below.
     deploy_policy_doc = json.dumps(
             {
                 "Version": "2012-10-17",
                 "Statement": [
                     {
+                        # IAM lifecycle for the stack's OWN principals only.
+                        # Replaces the former `iam:*` on `*`, which was
+                        # privilege-escalation-complete (CreateAccessKey /
+                        # AttachUserPolicy / CreateRole on ANY principal ->
+                        # self-grant admin). Scoped to role/grug-* + user/grug-*.
                         "Effect": "Allow",
                         "Action": [
-                            "lambda:*",
-                            "ecr:*",
-                            "iam:*",
-                            "logs:*",
-                            "ssm:GetParameter*",
-                            "ssm:DescribeParameters",
-                            "cloudwatch:*",
-                            # EventBridge (events:*) is a DISTINCT namespace
-                            # from cloudwatch:* (metrics/alarms). The reaction-
-                            # poll scheduled Lambda (#261) is the first
-                            # EventBridge resource; creating a TAGGED rule needs
-                            # events:TagResource + PutRule/PutTargets/etc. Broad
-                            # like the lambda:*/cloudwatch:* grants above
-                            # (Slice-1 "deploy works"; ARN-scoping is the
-                            # deferred follow-up).
-                            "events:*",
-                            "sts:GetCallerIdentity",
-                            "kms:Decrypt",
-                            # Lambda eagerly encrypts env vars on the
-                            # CALLING principal's behalf when kms_key_arn
-                            # is set on the function. Without kms:Encrypt
-                            # on the deployer role, UpdateFunctionConfig
-                            # 403s. Closes #60.
-                            #
-                            # kms:CreateGrant — required by AWS docs
-                            # for "configuring a customer managed key on
-                            # a Lambda function". Lambda needs the grant
-                            # to encrypt/decrypt during invocations.
-                            # Greptile P1 PR #79 (defensive: pulumi up
-                            # works without it, but AWS docs are
-                            # explicit it should be present).
-                            "kms:Encrypt",
-                            "kms:CreateGrant",
-                            "kms:DescribeKey",
-                            # Lambda's UpdateFunctionConfiguration on a
-                            # CMK-protected function performs an upfront
-                            # GenerateDataKey check using the calling
-                            # principal's perms. Verified mid-loop on
-                            # run 25310220972 (failed step 10, succeeded
-                            # step 10c after IAM-retry sleep). Adding
-                            # defensively so cold-account first deploys
-                            # don't repeat the chicken-egg.
-                            "kms:GenerateDataKey",
+                            "iam:CreateRole", "iam:GetRole", "iam:DeleteRole",
+                            "iam:UpdateRole", "iam:UpdateAssumeRolePolicy",
+                            "iam:TagRole", "iam:UntagRole",
+                            "iam:ListRolePolicies", "iam:ListAttachedRolePolicies",
+                            "iam:ListRoleTags",
+                            "iam:PutRolePolicy", "iam:GetRolePolicy",
+                            "iam:DeleteRolePolicy",
+                            "iam:CreateUser", "iam:GetUser", "iam:DeleteUser",
+                            "iam:TagUser", "iam:UntagUser",
+                            "iam:ListUserPolicies", "iam:ListAttachedUserPolicies",
+                            "iam:ListUserTags",
+                            "iam:PutUserPolicy", "iam:GetUserPolicy",
+                            "iam:DeleteUserPolicy",
+                            "iam:CreateAccessKey", "iam:DeleteAccessKey",
+                            "iam:ListAccessKeys", "iam:GetAccessKeyLastUsed",
                         ],
-                        # NOTE: tightening to specific resource ARNs is a
-                        # follow-up. Slice 1 prioritizes "deploy works".
+                        "Resource": [
+                            "arn:aws:iam::*:role/grug-*",
+                            "arn:aws:iam::*:user/grug-*",
+                        ],
+                    },
+                    {
+                        # SSM reads: the stack's own `/grug/*` params + the
+                        # cross-repo Pulumi token at `/shared/*`.
+                        "Effect": "Allow",
+                        "Action": ["ssm:GetParameter*"],
+                        "Resource": [
+                            "arn:aws:ssm:*:*:parameter/grug/*",
+                            "arn:aws:ssm:*:*:parameter/shared/*",
+                        ],
+                    },
+                    {
+                        # Account-global actions that have no resource-level
+                        # scoping.
+                        "Effect": "Allow",
+                        "Action": [
+                            "sts:GetCallerIdentity",
+                            "ssm:DescribeParameters",
+                        ],
+                        "Resource": "*",
+                    },
+                    {
+                        # KMS for the Pulumi awskms secrets provider (decrypts
+                        # the stack's encrypted config on every op) + drift
+                        # reads on the grug-tokens CMK. Real key access is
+                        # gated by each key's KEY POLICY, so `*` here is the
+                        # key-policy-gated minimum, not an escalation vector.
+                        # The former Encrypt / CreateGrant / GenerateDataKey
+                        # grants existed only for Lambda env-var encryption
+                        # (retired) and are removed.
+                        "Effect": "Allow",
+                        "Action": ["kms:Decrypt", "kms:DescribeKey"],
                         "Resource": "*",
                     },
                     {

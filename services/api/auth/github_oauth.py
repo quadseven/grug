@@ -19,11 +19,11 @@ from __future__ import annotations
 
 import hashlib
 import hmac
-import json
 import logging
 import os
 import secrets
 import time
+from functools import lru_cache
 from urllib.parse import urlencode
 
 import httpx
@@ -48,12 +48,43 @@ _DASHBOARD_URL = f"https://{_DOMAIN}/dashboard"
 _STATE_TTL_SECONDS = 600  # 10 min
 
 
+@lru_cache(maxsize=1)
 def _state_secret() -> str:
-    """Reuse the GitHub App webhook secret for CSRF state HMAC.
-    Same secret already in SSM; same secret-rotation cadence."""
+    """HMAC key for CSRF state + session-cookie signing.
+
+    Prefers a DEDICATED secret (GRUG_SESSION_SIGNING_SECRET_SSM) so that
+    session/CSRF signing does NOT share a key with GitHub webhook
+    verification (audit #5). Sharing was a latent account-takeover lever:
+    one leaked secret -> forge a session cookie for any gh_id (incl. admin),
+    and you could not rotate the webhook secret to respond without breaking
+    inbound webhook verification + logging every user out at once.
+
+    Falls back to the webhook secret when the dedicated param isn't
+    provisioned yet, so this is a ZERO-DOWNTIME migration: create the
+    SecureString `/grug/session-signing-secret` (HITL, see
+    docs/HITL_PREREQUISITES.md), wire GRUG_SESSION_SIGNING_SECRET_SSM in
+    k8s/api-deployment.yaml, and the next deploy switches over (live
+    sessions invalidate once — users simply re-login).
+
+    lru_cache(maxsize=1): resolve once per process (pods restart on deploy
+    / rotation), so the fallback warning logs once, not per request.
+    """
     from secrets_loader import _get_ssm_secure_string  # type: ignore
-    name = os.environ.get("GITHUB_APP_WEBHOOK_SECRET_SSM", "")
-    return _get_ssm_secure_string(name)
+    dedicated = os.environ.get("GRUG_SESSION_SIGNING_SECRET_SSM", "")
+    if dedicated:
+        try:
+            return _get_ssm_secure_string(dedicated)
+        except Exception:
+            # NB: do NOT log `dedicated` (the SSM param name) - the only
+            # such param is GRUG_SESSION_SIGNING_SECRET_SSM, so the message
+            # already identifies it, and logging a value sourced from a
+            # `*_SECRET_SSM` env var trips clear-text-secret scanners.
+            log.warning("session_signing_secret_unavailable_using_fallback")
+    else:
+        log.warning("session_signing_secret_unconfigured_using_fallback")
+    return _get_ssm_secure_string(
+        os.environ.get("GITHUB_APP_WEBHOOK_SECRET_SSM", "")
+    )
 
 
 def _make_state() -> str:

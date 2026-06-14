@@ -6,9 +6,10 @@ validates the `X-Grug-CF-Secret` header on every non-`/livez` request.
 
 Behaviors covered:
 - /livez always passes (DD synthetics + smoke tests need un-authenticated access)
-- Env var unset: fail-open (operator hasn't deployed Pulumi yet)
-- SSM returns empty: fail-open (impossible-by-accident config; logged + permissive)
-- SSM throws ParameterNotFound: fail-open (Worker/middleware deploy race)
+- Env var unset: fail-CLOSED 503 by default (audit #4); fail-open only
+  when GRUG_CF_AUTH_FAIL_OPEN is set (initial bring-up)
+- SSM returns empty: fail-CLOSED 503 (fail-open under the bring-up flag)
+- SSM throws ParameterNotFound: fail-CLOSED 503 (fail-open under the flag)
 - Strict mode + missing header: 401
 - Strict mode + mismatched header: 401
 - Strict mode + matching header (constant-time compare): pass-through
@@ -26,12 +27,17 @@ from cf_auth import CfAuthMiddleware
 
 
 @pytest.fixture(autouse=True)
-def _reset_throttle_state():
+def _reset_throttle_state(monkeypatch):
     """`_last_unconfigured_log_at` is module-scope and would persist
     across tests, masking the throttled-log signal. Clear before each
     test so the WARN-on-first-event semantics are honored.
+
+    Also force fail-CLOSED by default (delete the bring-up escape-hatch
+    flag) so a stray GRUG_CF_AUTH_FAIL_OPEN in the dev shell can't mask
+    the default-deny contract; the fail-open tests opt back in explicitly.
     """
     cf_auth._last_unconfigured_log_at.clear()
+    monkeypatch.delenv("GRUG_CF_AUTH_FAIL_OPEN", raising=False)
 
 
 def _build_app(*, secret_loader=None):
@@ -108,9 +114,23 @@ def test_strict_matching_header_passes_through() -> None:
     assert r.json() == {"status": "reached"}
 
 
-def test_unconfigured_env_var_fail_open() -> None:
-    """Operator hasn't deployed Pulumi yet — env var absent, middleware
-    must NOT block requests."""
+def test_unconfigured_env_var_fail_closed() -> None:
+    """Default (audit #4): env var absent -> deny 503 rather than silently
+    disable the origin-auth boundary."""
+    def raise_unconfigured():
+        raise LookupError("GRUG_CF_SHARED_SECRET_SSM env var unset")
+
+    app = _build_app(secret_loader=raise_unconfigured)
+    client = TestClient(app)
+    r = client.get("/protected", headers={"X-Grug-CF-Secret": "anything"})
+    assert r.status_code == 503
+
+
+def test_unconfigured_env_var_fail_open_when_flag_set(monkeypatch) -> None:
+    """Bring-up escape hatch: GRUG_CF_AUTH_FAIL_OPEN=1 restores fail-open
+    so the first Pulumi->Worker->service rollout isn't 503'd."""
+    monkeypatch.setenv("GRUG_CF_AUTH_FAIL_OPEN", "1")
+
     def raise_unconfigured():
         raise LookupError("GRUG_CF_SHARED_SECRET_SSM env var unset")
 
@@ -120,19 +140,25 @@ def test_unconfigured_env_var_fail_open() -> None:
     assert r.status_code == 200
 
 
-def test_empty_ssm_value_fail_open() -> None:
-    """SSM returned an empty string — impossible-by-accident, but if it
-    happens the rollout property still holds (fail-open + log error)."""
+def test_empty_ssm_value_fail_closed() -> None:
+    """SSM returned an empty string — deny 503 by default (audit #4)."""
+    app = _build_app(secret_loader=lambda: "")
+    client = TestClient(app)
+    r = client.get("/protected")
+    assert r.status_code == 503
+
+
+def test_empty_ssm_value_fail_open_when_flag_set(monkeypatch) -> None:
+    monkeypatch.setenv("GRUG_CF_AUTH_FAIL_OPEN", "true")
     app = _build_app(secret_loader=lambda: "")
     client = TestClient(app)
     r = client.get("/protected")
     assert r.status_code == 200
 
 
-def test_ssm_not_found_fail_open() -> None:
-    """Lambda env var points at a SSM param that doesn't exist (Pulumi
-    drift or rollout race). Fail-open — Workers' header injection still
-    works in the meantime. Uses botocore ClientError to mimic the real
+def test_ssm_not_found_fail_closed() -> None:
+    """SSM param doesn't exist (Pulumi drift / rollout race). Default
+    deny 503 (audit #4). Uses botocore ClientError to mimic the real
     boto3 ParameterNotFound shape."""
     from botocore.exceptions import ClientError
 
@@ -145,7 +171,7 @@ def test_ssm_not_found_fail_open() -> None:
     app = _build_app(secret_loader=raise_not_found)
     client = TestClient(app)
     r = client.get("/protected")
-    assert r.status_code == 200
+    assert r.status_code == 503
 
 
 def test_programmer_bug_propagates_as_500() -> None:
@@ -287,12 +313,12 @@ def test_unconfigured_warning_throttled_within_window() -> None:
     client = TestClient(app)
 
     with patch.object(cf_auth.log, "warning") as mock_warn:
-        # First request: should log.
+        # First request: should log. (Default fail-CLOSED -> 503.)
         r1 = client.get("/protected")
-        assert r1.status_code == 200
-        # Second request immediately after: throttle suppresses.
+        assert r1.status_code == 503
+        # Second request immediately after: throttle suppresses the log.
         r2 = client.get("/protected")
-        assert r2.status_code == 200
+        assert r2.status_code == 503
 
     assert mock_warn.call_count == 1, (
         f"throttle did not suppress duplicate log: {mock_warn.call_count} calls"
@@ -323,8 +349,9 @@ def test_throttle_distinguishes_reasons() -> None:
     with patch.object(cf_auth.log, "warning") as mock_warn:
         r1 = client.get("/protected")
         r2 = client.get("/protected")
-        assert r1.status_code == 200
-        assert r2.status_code == 200
+        # Default fail-CLOSED -> 503 for both reasons.
+        assert r1.status_code == 503
+        assert r2.status_code == 503
 
-    # Two distinct reasons → two distinct first-logs.
+    # Two distinct reasons -> two distinct first-logs.
     assert mock_warn.call_count == 2
