@@ -151,13 +151,25 @@ def create(
                         ],
                     },
                     {
-                        # SSM reads: the stack's own `/grug/*` params + the
-                        # cross-repo Pulumi token at `/shared/*`.
+                        # SSM reads. The stack's own `/grug/*`, the cross-repo
+                        # Pulumi token at `/shared/*`, AND the shared `/infra/*`
+                        # params the PROGRAM reads at invoke time: the Datadog
+                        # provider creds (/infra/datadog/api_key + app_key), the
+                        # LLM keys (/infra/llm/*), and the Discord alert handle
+                        # (/infra/discord/*). Missing /infra here 403s every
+                        # `pulumi up` at program-eval before any apply - the
+                        # first deploy that RUNS under the scoped role dies (the
+                        # initial scope-down deploy passed only because it ran
+                        # under the old broad policy and applied the narrow one
+                        # last). Tested via simulate-custom-policy incl. these.
                         "Effect": "Allow",
                         "Action": ["ssm:GetParameter*"],
                         "Resource": [
                             "arn:aws:ssm:*:*:parameter/grug/*",
                             "arn:aws:ssm:*:*:parameter/shared/*",
+                            "arn:aws:ssm:*:*:parameter/infra/datadog/*",
+                            "arn:aws:ssm:*:*:parameter/infra/llm/*",
+                            "arn:aws:ssm:*:*:parameter/infra/discord/*",
                         ],
                     },
                     {
