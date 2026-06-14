@@ -33,6 +33,7 @@ class _MonitorBundle:
     cold_start_p99: datadog.Monitor
     enforcement_gap: datadog.Monitor
     cf_secret_mismatch: datadog.Monitor
+    key_rotation_fail: datadog.Monitor
     uptime: datadog.SyntheticsTest
 
 
@@ -284,6 +285,34 @@ def create_all(
         opts=opts,
     )
 
+    # 6b) Key-rotator failure (#386 interim). The CronJob rotates the
+    #     grug-k8s-pod access key every 12h; a failure emits `key_rotation_failed`
+    #     and the Job exits non-zero. On failure the OLD key is kept valid (fail
+    #     safe-open), so pods keep working - but the rotation is stuck and the
+    #     exposure window stops shrinking until a human looks. Page on any
+    #     failure log in a 13h window (just over one cycle).
+    key_rotation_fail = datadog.Monitor(
+        "grug-key-rotator-fail",
+        type="log alert",
+        name="[grug] AWS key-rotation failed (interim rotator)",
+        message=(
+            f"{notify_handle}\n"
+            "The interim grug-k8s-pod key rotation failed. The old key is kept "
+            "valid so pods still work, but rotation is stuck - check the "
+            "grug-key-rotator Job logs (a dangling new key may need manual "
+            "cleanup; AWS caps the user at 2 keys).\n"
+            "Runbook: docs/RUNBOOK.md#key-rotation"
+        ),
+        query=(
+            f'logs("service:grug-key-rotator env:{env} key_rotation_failed")'
+            '.index("*").rollup("count").last("13h") > 0'
+        ),
+        tags=_common_tags(env, "grug-key-rotator"),
+        notify_no_data=False,
+        priority=2,
+        opts=opts,
+    )
+
     # 7) Synthetic uptime — hit GET /livez (no IO, returns 200). Earlier
     #    design POSTed a fake-sig body expecting 401, but that triggered
     #    webhook_signature_invalid every 5 min → false-positive infinite
@@ -335,5 +364,6 @@ def create_all(
         cold_start_p99=cold_start_p99,
         enforcement_gap=enforcement_gap,
         cf_secret_mismatch=cf_secret_mismatch,
+        key_rotation_fail=key_rotation_fail,
         uptime=uptime,
     )

@@ -25,6 +25,7 @@ import pulumi_datadog as _datadog
 from components import (
     cf_shared_secret,
     k8s_pod_user,
+    k8s_rotator,
     dd_dashboard,
     dd_monitors,
     dd_rum,
@@ -325,6 +326,11 @@ _k8s_pod = k8s_pod_user.create(
     kms_key_arn=grug_tokens_cmk.arn,
     cave_diff_bucket_arn=_cave_diff_bucket.arn,
 )
+
+# Interim AWS key-rotator user (#386) - scoped to access-key ops on the pod
+# user ONLY. Throwaway until Roles Anywhere (#388/#389). Its key lands in
+# /grug/k8s-rotator-aws-* for the deploy seed.
+_k8s_rotator = k8s_rotator.create(pod_user_arn=_k8s_pod.user.arn)
 
 
 # Cloudflare DNS — webhook.grug.lol is NO LONGER managed by this stack.
