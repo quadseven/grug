@@ -468,3 +468,37 @@ aws dynamodb update-item --region us-east-1 --table-name grug-main \
 Global kill switch (all repos) — set the SSM parameter
 `/grug/<env>/elder-disabled` to `true` and redeploy
 (future-roadmap; not implemented in this slice).
+
+## Key rotation
+
+Interim automated rotation of the `grug-k8s-pod` AWS access key (#386),
+throwaway until Roles Anywhere (#388/#389). The `grug-key-rotator` CronJob
+runs every 12h: mint a new key -> patch it into `grug-secrets` ->
+rollout-restart `grug-api`/`grug-webhook`/`grug-consumer` and wait -> delete
+the old key. Logic in `services/webhook/key_rotator.py`. It authenticates
+with `grug-rotator-secret` (IAM user `grug-k8s-rotator`, scoped to
+access-key ops on `grug-k8s-pod` only), NEVER `grug-secrets`.
+
+**On `[grug] AWS key-rotation failed`:** the rotation is stuck but pods keep
+working (fail safe-open keeps the old key valid). Check the Job logs:
+
+```bash
+kubectl -n grug get jobs -l app=grug-key-rotator
+kubectl -n grug logs job/<grug-key-rotator-...> | grep key_rotation
+```
+
+Common causes:
+- **Rollout did not complete** (`new_key_id` logged as `dangling_new_key_id`):
+  a new key WAS created and is in `grug-secrets`, but a Deployment didn't
+  roll. The new key is live + valid; the OLD key was NOT deleted. Investigate
+  the stuck rollout; the next 12h tick will retry (it treats the now-current
+  new key as current).
+- **Two keys, none current** (`refusing to guess`): `grug-k8s-pod` has 2 keys
+  and neither matches the one in `grug-secrets` (out-of-band change / stale
+  Secret). Reconcile by hand: confirm which key the pods actually use, delete
+  the other, then re-run the Job (`kubectl -n grug create job --from=cronjob/grug-key-rotator manual-rotate`).
+
+**Manual rotation:** `kubectl -n grug create job --from=cronjob/grug-key-rotator manual-rotate`,
+then `kubectl -n grug wait --for=condition=complete job/manual-rotate --timeout=300s`.
+
+**Disable rotation:** `kubectl -n grug patch cronjob grug-key-rotator -p '{"spec":{"suspend":true}}'`.

@@ -154,6 +154,21 @@ jobs:
           kubectl -n grug create secret generic grug-secrets \
             --from-env-file="$ENVF"
           rm -f "$ENVF"
+          # Rotator credential (#386): SEPARATE from grug-secrets, scoped to
+          # access-key ops on grug-k8s-pod only. The key-rotator CronJob uses
+          # THIS, never grug-secrets (which it rotates). Same 0600 env-file
+          # discipline as above.
+          ROTF="$RUNNER_TEMP/grug-rotator.env"
+          install -m 600 /dev/null "$ROTF"
+          {
+            echo "AWS_ACCESS_KEY_ID=$(get /grug/k8s-rotator-aws-access-key-id)"
+            echo "AWS_SECRET_ACCESS_KEY=$(get /grug/k8s-rotator-aws-secret-access-key)"
+            echo "AWS_DEFAULT_REGION=us-east-1"
+          } > "$ROTF"
+          kubectl -n grug delete secret grug-rotator-secret --ignore-not-found
+          kubectl -n grug create secret generic grug-rotator-secret \
+            --from-env-file="$ROTF"
+          rm -f "$ROTF"
           kubectl -n grug create secret docker-registry registry-pull \
             --docker-server="$REGISTRY_HOST" \
             --docker-username="$REGISTRY_USERNAME" \
