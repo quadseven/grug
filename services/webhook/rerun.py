@@ -25,6 +25,7 @@ import json
 import logging
 import os
 from typing import Any
+from urllib.parse import quote
 
 import httpx
 
@@ -84,7 +85,7 @@ def _run_one(body: str) -> str:
     pr = with_install_token_retry(
         install_id,
         lambda tok: _gh_get(
-            tok, f"{_GH_API}/repos/{owner}/{repo_name}/pulls/{pr_number}"
+            tok, f"{_GH_API}/repos/{quote(owner, safe='')}/{quote(repo_name, safe='')}/pulls/{pr_number}"
         ),
     )
     repo_id = int(pr["base"]["repo"]["id"])

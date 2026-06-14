@@ -8,7 +8,7 @@ External SaaS the stack depends on (flat dependencies, not topology):
 
 - **Cloudflare Pages** — `grug-web` project at apex `grug.lol` (static + SPA)
 - **Cloudflare DNS + Workers** — proxied A records for `api.grug.lol` + `webhook.grug.lol`; two Host-rewrite Workers
-- **AWS us-east-1** account `317164914846` — Lambda, DDB, KMS, SSM, ECR, CloudWatch Logs
+- **AWS us-east-1** account `<aws-account-id>` — Lambda, DDB, KMS, SSM, ECR, CloudWatch Logs
 - **Datadog US1** — APM + Logs + RUM + Monitors + Synthetics
 - **GitHub** — App registration `grug-tribe` (webhook source + OAuth identity provider) + Actions OIDC (deploys)
 - **Pulumi Cloud** — `<pulumi-org>/grug/{dev,prod}` stacks (no passphrase)
@@ -31,8 +31,8 @@ Stacks: `dev` (live), `prod` (locked, not yet cut over).
 
 | Component | Resource | Notes |
 |---|---|---|
-| `grug-api` Lambda | `arn:aws:lambda:us-east-1:317164914846:function:grug-api` | arm64, 512MB, 15s timeout, container image from ECR. FastAPI via Mangum. DD Extension 96-next baked in |
-| `grug-webhook` Lambda | `arn:aws:lambda:us-east-1:317164914846:function:grug-webhook` | Same shape; tighter DDB IAM scope (no token reads) |
+| `grug-api` Lambda | `arn:aws:lambda:us-east-1:<aws-account-id>:function:grug-api` | arm64, 512MB, 15s timeout, container image from ECR. FastAPI via Mangum. DD Extension 96-next baked in |
+| `grug-webhook` Lambda | `arn:aws:lambda:us-east-1:<aws-account-id>:function:grug-webhook` | Same shape; tighter DDB IAM scope (no token reads) |
 | Function URLs | `:url:grug-api`, `:url:grug-webhook` | AuthType=NONE; CF is the trust boundary. api Lambda has CORS allow `https://grug.lol` |
 | ECR repos | `grug-api`, `grug-webhook` | Private; 14d untagged GC |
 | DynamoDB | `grug-main` | Single-table, PAY_PER_REQUEST |

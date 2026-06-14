@@ -7,12 +7,14 @@ the same value sourced from SSM `/grug/cf-shared-secret`. Direct hits
 on the Lambda Function URL that bypass CF arrive without the header
 and get 401.
 
-Fail-open is the safe default during deploy churn — if the env var is
-unset OR the SSM lookup fails (ParameterNotFound, empty value), the
-middleware logs the misconfiguration and lets requests through. The
-Worker side mirrors this: when its `GRUG_CF_SECRET` binding is absent,
-no header is injected, so a strict-mode middleware would 401 every
-legitimate request. Pulumi-first rollout depends on this symmetry.
+Fail-CLOSED by default (audit #4): if the env var is unset OR the SSM
+lookup fails (ParameterNotFound, empty value), the middleware logs the
+misconfiguration and returns 503 rather than silently disabling the
+origin-auth boundary. During the very first Pulumi->Worker->service
+rollout the Worker's `GRUG_CF_SECRET` binding may not exist yet (no
+header injected), which a fail-closed boundary would 503; set
+`GRUG_CF_AUTH_FAIL_OPEN=1` for that bring-up window ONLY, then remove it
+once the secret is live so prod runs fail-closed.
 
 `/livez` is always exempt so DD synthetics and post-deploy smoke tests
 can reach the Lambda without a header.
@@ -89,6 +91,32 @@ def _ssm_cache_clear() -> None:
     _default_secret_loader.cache_clear()
 
 
+def _fail_open_enabled() -> bool:
+    """Fail-OPEN only when explicitly opted in for initial bring-up.
+
+    Default is fail-CLOSED (audit #4): a misconfigured / empty / unreachable
+    CF secret denies (503) rather than silently disabling the origin-auth
+    boundary. Set `GRUG_CF_AUTH_FAIL_OPEN=1` ONLY during the first
+    Pulumi->Worker->service rollout, when the Worker secret binding may not
+    exist yet; remove it once the secret is live.
+    """
+    return os.getenv("GRUG_CF_AUTH_FAIL_OPEN", "").strip().lower() in (
+        "1", "true", "yes",
+    )
+
+
+def _fail_response() -> Response:
+    """503 returned when the boundary can't verify and fail-open is off.
+
+    503 (not 401): the cause is a server-side misconfig, not a bad client
+    credential. /livez + /readyz are exempt earlier in dispatch, so the pod
+    stays schedulable even while app traffic is denied."""
+    return JSONResponse(
+        {"detail": "auth boundary unavailable"},
+        status_code=503,
+    )
+
+
 class CfAuthMiddleware(BaseHTTPMiddleware):
     """Starlette/FastAPI middleware that enforces the auth boundary.
 
@@ -106,14 +134,17 @@ class CfAuthMiddleware(BaseHTTPMiddleware):
         """
         Args:
           secret_loader: zero-arg callable returning the SSM secret value.
-            - returns a non-empty `str` → strict mode for this request
-            - returns `""` → fail-open + `cf_shared_secret_unconfigured`
-              log with `reason="empty_ssm_value"` (throttled per reason)
+            - returns a non-empty `str` -> strict mode for this request
+            - returns `""` -> log `cf_shared_secret_unconfigured`
+              (reason="empty_ssm_value") then deny 503, UNLESS
+              `GRUG_CF_AUTH_FAIL_OPEN=1` (bring-up only), in which case
+              fail-open
             - raises any exception in `_FAIL_OPEN_ERRORS` (LookupError,
-              ClientError, BotoCoreError) → fail-open + same log with
-              `reason=<type name>` (throttled per reason)
+              ClientError, BotoCoreError) -> same log with
+              `reason=<type name>` then deny 503 (or fail-open under the
+              bring-up flag)
             Anything else (`AttributeError`, `NameError`, `TypeError`,
-            …) propagates as 500. Programmer bugs MUST NOT silently
+            ...) propagates as 500. Programmer bugs MUST NOT silently
             disable the auth boundary — see `_FAIL_OPEN_ERRORS` for the
             whitelist rationale.
         """
@@ -140,18 +171,22 @@ class CfAuthMiddleware(BaseHTTPMiddleware):
             # or background-task coroutines that would otherwise stall.
             expected = await asyncio.to_thread(self._secret_loader)
         except _FAIL_OPEN_ERRORS as e:
-            # Known misconfig classes — fail-open with throttled log.
-            # Programmer bugs (AttributeError, NameError, TypeError, etc.)
-            # are NOT in _FAIL_OPEN_ERRORS and propagate as 500 so the
-            # boundary doesn't silently disable on unexpected failures.
+            # Known misconfig classes. Programmer bugs (AttributeError,
+            # NameError, TypeError, etc.) are NOT in _FAIL_OPEN_ERRORS and
+            # propagate as 500. Default: fail CLOSED (503). Only the
+            # explicit bring-up flag lets the request through.
             _log_unconfigured_throttled(type(e).__name__, request.url.path)
-            return await call_next(request)
+            if _fail_open_enabled():
+                return await call_next(request)
+            return _fail_response()
 
         if not expected:
-            # Same fail-open behavior for empty-string. Distinguishing
-            # from "unconfigured" only matters for the log signal.
+            # Empty-string secret — same handling. Distinguishing from
+            # "unconfigured" only matters for the log signal.
             _log_unconfigured_throttled("empty_ssm_value", request.url.path)
-            return await call_next(request)
+            if _fail_open_enabled():
+                return await call_next(request)
+            return _fail_response()
 
         # Strict mode from here on.
         received = request.headers.get(SECRET_HEADER, "")

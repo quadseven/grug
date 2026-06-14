@@ -3,6 +3,7 @@
 # seeded by the workflow from the parameter store - never committed.
 resources:
   - namespace.yaml
+  - networkpolicy.yaml
   - webhook-deployment.yaml
   - api-deployment.yaml
   - poller-cronjob.yaml

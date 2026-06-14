@@ -24,6 +24,7 @@ from __future__ import annotations
 import logging
 from dataclasses import asdict, dataclass
 from typing import Literal, get_args
+from urllib.parse import quote
 
 import httpx
 
@@ -138,7 +139,7 @@ def post_review(
     # stay in lockstep with field renames; this stays correct by
     # construction.
     resp = httpx.post(
-        f"{_GH_API}/repos/{owner}/{repo}/pulls/{pull_number}/reviews",
+        f"{_GH_API}/repos/{quote(owner, safe='')}/{quote(repo, safe='')}/pulls/{pull_number}/reviews",
         json=asdict(result),
         headers={
             "Authorization": f"Bearer {install_token}",
@@ -175,7 +176,7 @@ def get_review_comments(
     out: list[dict] = []
     for page in range(1, _MAX_REVIEW_COMMENT_PAGES + 1):
         resp = httpx.get(
-            f"{_GH_API}/repos/{owner}/{repo}/pulls/{pull_number}/reviews/{review_id}/comments",
+            f"{_GH_API}/repos/{quote(owner, safe='')}/{quote(repo, safe='')}/pulls/{pull_number}/reviews/{review_id}/comments",
             params={"per_page": 100, "page": page},
             headers={
                 "Authorization": f"Bearer {install_token}",

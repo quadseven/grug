@@ -3,12 +3,15 @@
 
 Usage:
     GRUG_DATABASE_URL=postgresql://... python3 infra/scripts/seed-admin.py \\
-        --github-user-id 59060157 --login githumps
+        --github-user-id <YOUR_GITHUB_USER_ID> --login <YOUR_LOGIN>
+
+Supply your OWN GitHub identity — there is no default, by design. A fork
+that seeded the upstream maintainer's id would hand that account lifetime
+admin of the fork's database.
 
 Idempotent: re-running on an existing row preserves OAuth blobs and
 created_at; it (re)writes login, role, tier, allowlisted (always True)
-and backfills the allowlisted_at/by audit pair if absent. Defaults
-match locked PRD: admin = Evan + GF; tier = lifetime.
+and backfills the allowlisted_at/by audit pair if absent.
 
 Slice 5 #26 — required to unblock the webhook allowlist gate. Without
 this, the webhook will no_op every PR until at least one admin row

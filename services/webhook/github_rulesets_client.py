@@ -190,7 +190,7 @@ def create_ruleset(
         ],
     }
     resp = httpx.post(
-        f"{_GH_API}/repos/{owner}/{repo}/rulesets",
+        f"{_GH_API}/repos/{quote(owner, safe='')}/{quote(repo, safe='')}/rulesets",
         json=body,
         headers=_auth_headers(install_token),
         timeout=10,
@@ -220,7 +220,7 @@ def delete_ruleset(
 ) -> None:
     """Delete a ruleset by ID."""
     resp = httpx.delete(
-        f"{_GH_API}/repos/{owner}/{repo}/rulesets/{ruleset_id}",
+        f"{_GH_API}/repos/{quote(owner, safe='')}/{quote(repo, safe='')}/rulesets/{ruleset_id}",
         headers=_auth_headers(install_token),
         timeout=10,
     )
@@ -235,7 +235,7 @@ def list_rulesets(
     """List all rulesets for a repository. Resilient to GitHub's secondary
     rate limit (the dashboard fan-out burst) via bounded jittered retries."""
     resp = _get_with_retry(
-        f"{_GH_API}/repos/{owner}/{repo}/rulesets",
+        f"{_GH_API}/repos/{quote(owner, safe='')}/{quote(repo, safe='')}/rulesets",
         install_token=install_token,
         op="list_rulesets",
     )

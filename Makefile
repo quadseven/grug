@@ -15,11 +15,15 @@
 .PHONY: test webhook-test api-test pg-test pulumi-preview pulumi-up \
         tear-down rebuild bootstrap-images smoke docker-build-webhook
 
-# Admin seed defaults — the values that get re-installed after a tear-down
-# so allowlist gate works on first PR after rebuild. Override via env.
-GRUG_ADMIN_USER_ID ?= 59060157
-GRUG_ADMIN_LOGIN   ?= githumps
-GRUG_ADMIN_INSTALL_ID ?= 129256114
+# Admin seed values — the row (re)installed after a tear-down so the
+# allowlist gate works on the first PR after rebuild. NO DEFAULTS on
+# purpose: a fork that ran this with the maintainer's hardcoded GitHub id
+# would seed the upstream owner as the lifetime admin of the fork's own
+# database (an accidental backdoor). You MUST supply your own via env:
+#   GRUG_ADMIN_USER_ID=12345 GRUG_ADMIN_LOGIN=you GRUG_ADMIN_INSTALL_ID=678 make rebuild
+GRUG_ADMIN_USER_ID ?=
+GRUG_ADMIN_LOGIN   ?=
+GRUG_ADMIN_INSTALL_ID ?=
 
 test: webhook-test api-test
 
@@ -102,6 +106,7 @@ rebuild: tear-down
 	  gh run watch $$RUN_ID --exit-status --repo githumps/grug
 	@echo ">> step 6/7: CF Workers re-deploy + admin re-seed"
 	bash infra/cloudflare/deploy.sh
+	@test -n "$(GRUG_ADMIN_USER_ID)" || { echo "FATAL: set GRUG_ADMIN_USER_ID (and GRUG_ADMIN_LOGIN/GRUG_ADMIN_INSTALL_ID) to YOUR own GitHub identity before seeding admin"; exit 1; }
 	uv run --with 'psycopg[binary]' python infra/scripts/seed-admin.py \
 	  --github-user-id $(GRUG_ADMIN_USER_ID) \
 	  --login $(GRUG_ADMIN_LOGIN) \

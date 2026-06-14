@@ -91,7 +91,7 @@ def _fetch_pr_diff(
     """GET the PR unified diff. `Accept: application/vnd.github.diff`
     returns the raw diff body rather than the JSON metadata."""
     resp = httpx.get(
-        f"https://api.github.com/repos/{owner}/{repo}/pulls/{pull_number}",
+        f"https://api.github.com/repos/{quote(owner, safe='')}/{quote(repo, safe='')}/pulls/{pull_number}",
         headers={
             "Authorization": f"Bearer {install_token}",
             "Accept": "application/vnd.github.diff",
@@ -163,7 +163,7 @@ def _fetch_pr_review_comments(
     out: list[dict] = []
     for page in range(1, _MAX_COMMENT_PAGES + 1):
         resp = httpx.get(
-            f"https://api.github.com/repos/{owner}/{repo}/pulls/{pull_number}/comments",
+            f"https://api.github.com/repos/{quote(owner, safe='')}/{quote(repo, safe='')}/pulls/{pull_number}/comments",
             params={"per_page": 100, "page": page},
             headers={
                 "Authorization": f"Bearer {install_token}",
