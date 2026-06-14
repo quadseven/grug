@@ -1,0 +1,16 @@
+name: Guard · issue-close completeness
+
+# Thin caller of the shared reusable in githumps/infra-public — reopens an issue
+# closed as completed while it still has unchecked acceptance/test boxes. Logic +
+# escape hatches live in the reusable. Public repo → ubuntu-latest (default).
+
+on:
+  issues:
+    types: [closed]
+
+permissions:
+  issues: write
+
+jobs:
+  guard:
+    uses: githumps/infra-public/.github/workflows/check.issue-close-completeness.yml@cd83e5727c0a7b904f780960664a51b3a3a0c685
