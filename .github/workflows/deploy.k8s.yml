@@ -86,6 +86,16 @@ jobs:
               --build-arg DD_GIT_REPOSITORY_URL="github.com/${GITHUB_REPOSITORY}" \
               --build-arg DD_GIT_COMMIT_SHA="${GITHUB_SHA}"
             docker push "$REGISTRY_HOST/grug-$svc:${GITHUB_SHA}"
+            # Capture the IMMUTABLE digest the registry assigned and deploy
+            # by @sha256, not the mutable tag (audit #7: a tag can be
+            # overwritten in the registry to serve a different image; a
+            # digest pins exactly what we just built + pushed).
+            digest="$(docker inspect --format='{{index .RepoDigests 0}}' \
+              "$REGISTRY_HOST/grug-$svc:${GITHUB_SHA}")"
+            if [ -z "$digest" ]; then
+              echo "::error::no RepoDigest for grug-$svc after push"; exit 1
+            fi
+            echo "IMAGE_${svc^^}=${digest}" >> "$GITHUB_ENV"
           done
 
       - name: Write kubeconfig
@@ -155,9 +165,14 @@ jobs:
           REGISTRY_HOST: ${{ vars.DEPLOY_REGISTRY_HOST }}
         run: |
           set -euo pipefail
+          # Substitute each service's full image ref with the digest-pinned
+          # form captured at push time (audit #7). REGISTRY_PLACEHOLDER only
+          # ever appears inside image lines, so replacing the whole
+          # registry/name:tag token is sufficient — there's no longer a
+          # separate mutable tag substitution.
           sed -i \
-            -e "s|REGISTRY_PLACEHOLDER|$REGISTRY_HOST|g" \
-            -e "s|TAG_PLACEHOLDER|${GITHUB_SHA}|g" \
+            -e "s|REGISTRY_PLACEHOLDER/grug-api:TAG_PLACEHOLDER|${IMAGE_API}|g" \
+            -e "s|REGISTRY_PLACEHOLDER/grug-webhook:TAG_PLACEHOLDER|${IMAGE_WEBHOOK}|g" \
             k8s/*.yaml
           # Post-sed sentinel: a future manifest that escapes substitution
           # must fail the deploy, not ship a literal placeholder (F7).

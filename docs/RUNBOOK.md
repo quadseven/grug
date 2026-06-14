@@ -176,7 +176,7 @@ Slice 10 (#31) acceptance proof. The "ready to tear down + build" requirement is
 | Webhook URL setting | github.com (matches DNS recreated by Pulumi) |
 | App webhook secret + private key | SSM SecureString `/grug/github-app-{webhook-secret,private-key}` |
 | OAuth client secret | SSM `/grug/github-app-client-secret` |
-| Existing installations | github.com (install_id 129256114 etc.) |
+| Existing installations | github.com (install_id <your-install-id> etc.) |
 | Branch protection on installed repos | github.com (referencing check-run name `Grug — Definition of Ready`) |
 | Datadog API + App keys | SSM `/shared/datadog-{api,app}-key` |
 | Cloudflare API token | SSM `/grug/cloudflare-api-token` |
@@ -232,9 +232,9 @@ Note: KMS CMK enters 7-day pending-deletion. Within that window, `pulumi up` aga
 
 | Var | Default | Use |
 |---|---|---|
-| `GRUG_ADMIN_USER_ID` | 59060157 | Numeric GitHub user ID for admin USER# row |
-| `GRUG_ADMIN_LOGIN` | githumps | login for the row |
-| `GRUG_ADMIN_INSTALL_ID` | 129256114 | INST# row to backfill (skip on org-account migrations where install_id changed) |
+| `GRUG_ADMIN_USER_ID` | _(none — set to YOUR id)_ | Numeric GitHub user ID for admin USER# row |
+| `GRUG_ADMIN_LOGIN` | _(none — set to YOUR login)_ | login for the row |
+| `GRUG_ADMIN_INSTALL_ID` | _(none — set to YOUR install)_ | INST# row to backfill (skip on org-account migrations where install_id changed) |
 
 Override per-recovery: `GRUG_ADMIN_USER_ID=123 make rebuild`
 
@@ -436,7 +436,7 @@ default is a future code slice (bake the winner into `build_system_prompt`'s
 default), not a toggle flip.
 
 **Arm-up record (2026-06-10, #276).** The cell-balance check found the live
-population is **one install** (`129256114` → the `poolside × v2` cell; the
+population is **one install** (the maintainer install -> the `poolside x v2` cell; the
 other three cells empty). `split` would therefore be a misleading rename of
 all-v2 — there is no within-population A/B at n=1. Decision: the toggle is set
 to **`all_v2`** and the experiment is a **temporal comparison** — v2 spans

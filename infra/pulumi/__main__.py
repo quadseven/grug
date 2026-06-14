@@ -103,14 +103,15 @@ _dd_extension_version = config.get("dd_extension_version") or "65"
 _deploy_role_bundle = oidc_role.create(
     name="grug-gha-deploy",
     repo="githumps/grug",
-    # `main` and SaaS-conversion feature branches (epic-grug-saas).
-    # Tighten back to `main` only once Slice 13 (#34) ships.
-    # Permissive `feat/*` + `fix/*` during the SaaS conversion (closes #64).
-    # Tighten back to `main` only at Slice 13 cutover (#34). Earlier
-    # per-slice patterns required local pulumi up after every new branch
-    # AND silently narrowed back whenever main re-deployed without the
-    # wider list.
-    branches=["main", "feat/*", "fix/*", "hotfix/*"],
+    # Trust ONLY `main` (+ `v*` tags below). The SaaS conversion is past
+    # cutover, so the permissive `feat/*` / `fix/*` / `hotfix/*` patterns
+    # (closes #64) are retired: they let anyone who could push such a
+    # branch to githumps/grug assume the deploy role and act in the AWS
+    # account. `pulumi up` only runs from `main` anyway (the deploy job is
+    # gated on it), so a feature branch never legitimately needs the role.
+    # (Audit #2.) Forks are already excluded — the trust is repo-scoped to
+    # githumps/grug, so this only ever governed first-party branches.
+    branches=["main"],
     # deploy.k8s runs inside the k8s-prod environment (#354).
     environments=["k8s-prod"],
     tags_pattern="v*",

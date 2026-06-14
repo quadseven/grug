@@ -1,0 +1,79 @@
+# Network segmentation for the grug namespace (audit #3).
+#
+# The OKE cluster is shared (CNPG, digital-ledger, pasto, tempo, ... all
+# live alongside grug). Without a NetworkPolicy the namespace is flat /
+# default-allow: any compromised pod anywhere on the cluster can reach the
+# grug pods on any port, and a compromised grug pod has unrestricted
+# egress. These policies close the lateral-movement path and add port-level
+# egress hygiene.
+#
+# ENFORCEMENT NOTE: NetworkPolicy is only enforced by a policy-capable CNI.
+# OKE's default VCN-native / flannel CNI does NOT enforce it unless Calico
+# (or an equivalent) is installed. This manifest is harmless when
+# unenforced and protective when enforced -- confirm the cluster CNI
+# enforces NetworkPolicy for it to actually bite.
+#
+# Egress is intentionally restricted to PORTS, not CIDRs: grug talks to
+# AWS (SSM/SQS/KMS/S3, 443), GitHub + the LLM backends (443), CNPG
+# Postgres (5432), and the node-local Datadog agent (DogStatsD 8125 / APM
+# 8126), plus DNS. Pinning destination CIDRs is the follow-up hardening;
+# port-scoping already blocks exfil over non-standard channels without
+# risking an outage from a wrong CIDR.
+---
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: default-deny-ingress
+  namespace: grug
+spec:
+  # Empty podSelector = every pod in the namespace.
+  podSelector: {}
+  policyTypes: [Ingress]
+  # No ingress rules => deny ALL inbound to every grug pod by default.
+  # The allow-rule below re-opens only what must be reachable.
+---
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: allow-http-ingress
+  namespace: grug
+spec:
+  # Only the two HTTP services accept inbound; consumer + poller stay
+  # fully sealed (they pull work from SQS / run on a cron, never serve).
+  podSelector:
+    matchExpressions:
+      - {key: app, operator: In, values: [grug-api, grug-webhook]}
+  policyTypes: [Ingress]
+  ingress:
+    # Port 8080 only. `from` is omitted so the Cloudflare tunnel
+    # (cloudflared) can reach it regardless of which namespace it runs in;
+    # the real request auth is the CF shared-secret + HMAC/session layers.
+    # Tightening `from` to the tunnel pod is a follow-up once its labels
+    # are pinned.
+    - ports:
+        - {protocol: TCP, port: 8080}
+---
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: allow-egress-scoped
+  namespace: grug
+spec:
+  podSelector: {}
+  policyTypes: [Egress]
+  egress:
+    # DNS resolution.
+    - ports:
+        - {protocol: UDP, port: 53}
+        - {protocol: TCP, port: 53}
+    # HTTPS: AWS APIs, GitHub, LLM backends.
+    - ports:
+        - {protocol: TCP, port: 443}
+    # CNPG Postgres.
+    - ports:
+        - {protocol: TCP, port: 5432}
+    # Node-local Datadog agent: DogStatsD (UDP 8125) + APM trace intake
+    # (TCP 8126). Restricting these would silently kill observability.
+    - ports:
+        - {protocol: UDP, port: 8125}
+        - {protocol: TCP, port: 8126}

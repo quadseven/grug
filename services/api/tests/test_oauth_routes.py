@@ -18,6 +18,11 @@ def _oauth_mod(monkeypatch):
     monkeypatch.setenv("GITHUB_APP_CLIENT_ID_SSM", "/grug/test-client-id")
     monkeypatch.setenv("GITHUB_APP_CLIENT_SECRET_SSM", "/grug/test-client-secret")
     monkeypatch.setenv("GRUG_DOMAIN", "grug.lol")
+    # CfAuthMiddleware now fail-CLOSES by default (audit #4). These tests
+    # exercise the OAuth router, not the CF boundary, so run them in
+    # bring-up mode (boundary effectively disabled) — the CF boundary has
+    # its own suite in test_cf_auth.py.
+    monkeypatch.setenv("GRUG_CF_AUTH_FAIL_OPEN", "1")
     import auth.github_oauth as mod
     # State CSRF + session cookie signing both use `_state_secret` —
     # no separate `_session_secret` function exists. The session HMAC

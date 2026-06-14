@@ -9,6 +9,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from typing import Literal
+from urllib.parse import quote
 
 import httpx
 
@@ -68,7 +69,7 @@ def post_check_run(
         body["external_id"] = external_id
 
     resp = httpx.post(
-        f"{_GH_API}/repos/{owner}/{repo}/check-runs",
+        f"{_GH_API}/repos/{quote(owner, safe='')}/{quote(repo, safe='')}/check-runs",
         json=body,
         headers={
             "Authorization": f"Bearer {install_token}",

@@ -61,8 +61,12 @@ app.add_middleware(
     CORSMiddleware,
     allow_origins=[f"https://{_SPA_DOMAIN}", f"https://www.{_SPA_DOMAIN}"],
     allow_credentials=True,
-    allow_methods=["*"],
-    allow_headers=["*"],
+    # Enumerate the methods/headers the SPA actually uses rather than "*".
+    # The origin allowlist above is the real gate, but with credentials
+    # enabled there's no reason to reflect a wildcard surface into the
+    # preflight response. (Audit #9.)
+    allow_methods=["GET", "POST", "PUT", "PATCH", "DELETE", "OPTIONS"],
+    allow_headers=["Content-Type"],
 )
 
 

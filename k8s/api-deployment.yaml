@@ -54,6 +54,11 @@ spec:
             - {name: GITHUB_APP_ID_SSM, value: /grug/github-app-id}
             - {name: GITHUB_APP_PRIVATE_KEY_SSM, value: /grug/github-app-private-key}
             - {name: GITHUB_APP_WEBHOOK_SECRET_SSM, value: /grug/github-app-webhook-secret}
+            # Dedicated key for session-cookie + CSRF-state HMAC, decoupled
+            # from the webhook secret (audit #5). github_oauth falls back to
+            # the webhook secret until this param exists, so it's safe to
+            # wire before the SecureString is created (HITL prereq).
+            - {name: GRUG_SESSION_SIGNING_SECRET_SSM, value: /grug/session-signing-secret}
             - {name: GITHUB_APP_CLIENT_ID_SSM, value: /grug/github-app-client-id}
             - {name: GITHUB_APP_CLIENT_SECRET_SSM, value: /grug/github-app-client-secret}
             - {name: GRUG_CF_SHARED_SECRET_SSM, value: /grug/cf-shared-secret}

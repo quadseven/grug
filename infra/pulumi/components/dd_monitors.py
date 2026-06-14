@@ -183,7 +183,7 @@ def create_all(
             "or a large diff couldn't spill to S3. (Clouds-down alone is "
             "expected — the SaaS backends are unfunded by design; do NOT top up "
             "OpenRouter/Poolside.) Check the grug-cave-connector pod on the LAN "
-            "worker, proxy-egress-sparkles, the Cave itself, and the cave DLQs. "
+            "worker, the cave egress proxy, the Cave itself, and the cave DLQs. "
             "The errored Activity row can be re-run from the dashboard once "
             "the Cave recovers.\n"
             "Runbook: docs/RUNBOOK.md#elder-async-offload"
