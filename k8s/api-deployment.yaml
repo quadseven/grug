@@ -12,7 +12,13 @@ metadata:
     tags.datadoghq.com/env: prod
 spec:
   replicas: 1
-  strategy: {type: Recreate}
+  # RollingUpdate with maxUnavailable:0 so the dependency-aware /readyz (#404)
+  # actually self-limits a bad deploy: the new pod must pass readiness before
+  # the serving pod is removed, so a dep-broken rollout stalls on the last-good
+  # pod instead of going to zero replicas (which Recreate would do).
+  strategy:
+    type: RollingUpdate
+    rollingUpdate: {maxUnavailable: 0, maxSurge: 1}
   selector:
     matchLabels: {app: grug-api}
   template:
@@ -72,6 +78,11 @@ spec:
           readinessProbe:
             httpGet: {path: /readyz, port: http}
             periodSeconds: 10
+            # /readyz now does a (TTL-cached) SSM/KMS + Postgres probe (#404);
+            # give the cache-miss request headroom over the 1s default and let
+            # a transient blip flap a few times before marking not-ready.
+            timeoutSeconds: 5
+            failureThreshold: 3
           livenessProbe:
             httpGet: {path: /livez, port: http}
             initialDelaySeconds: 10
