@@ -8,3 +8,4 @@ resources:
   - api-deployment.yaml
   - poller-cronjob.yaml
   - consumer-deployment.yaml
+  - key-rotator-cronjob.yaml
