@@ -70,6 +70,11 @@ spec:
           readinessProbe:
             httpGet: {path: /readyz, port: http}
             periodSeconds: 10
+            # /readyz now does a (TTL-cached) SSM/KMS + Postgres probe (#404);
+            # give the cache-miss request headroom over the 1s default and let
+            # a transient blip flap a few times before marking not-ready.
+            timeoutSeconds: 5
+            failureThreshold: 3
           livenessProbe:
             httpGet: {path: /livez, port: http}
             initialDelaySeconds: 10

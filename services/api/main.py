@@ -16,7 +16,7 @@ import logging
 import os
 from datetime import datetime, timezone
 
-from fastapi import FastAPI
+from fastapi import FastAPI, Response
 from fastapi.middleware.cors import CORSMiddleware
 
 from admin import router as admin_router
@@ -77,9 +77,22 @@ def livez() -> dict[str, str]:
 
 
 @app.get("/readyz")
-def readyz() -> dict[str, str]:
-    """Readiness — downstream deps reachable. v2 always ready (no deps)."""
-    return {"status": "ready", "service": "grug-api"}
+def readyz(response: Response) -> dict[str, object]:
+    """Readiness — SSM/KMS + Postgres reachable (#404). Returns 503 when a
+    dependency is down so k8s stops routing here AND a rollout of broken pods
+    never completes (the last-good pods keep serving). Health logic lives in
+    `readiness` (TTL-cached, fail-closed); /livez stays a cheap process-up
+    check so a transient dep blip restarts nothing."""
+    from readiness import check_readiness
+
+    rep = check_readiness()
+    if not rep.ready:
+        response.status_code = 503
+    return {
+        "status": "ready" if rep.ready else "not_ready",
+        "service": "grug-api",
+        "deps": rep.deps,
+    }
 
 
 app.include_router(github_oauth_router)

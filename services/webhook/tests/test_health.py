@@ -23,7 +23,15 @@ def test_livez_returns_200_with_status_ok() -> None:
     assert body["service"] == "grug-webhook"
 
 
-def test_readyz_returns_200_with_status_ready() -> None:
+def test_readyz_returns_200_with_status_ready(monkeypatch) -> None:
+    # /readyz is dependency-aware (#404): 200 only when SSM/KMS + Postgres are
+    # reachable. Mock the dep check to the reachable case here; the
+    # 503-on-dependency-down path is covered in test_readiness.py.
+    import readiness
+    monkeypatch.setattr(
+        readiness, "check_readiness",
+        lambda: readiness.ReadinessReport(ready=True, deps={"ssm_kms": True, "postgres": True}),
+    )
     r = client.get("/readyz")
     assert r.status_code == 200
     body = r.json()
