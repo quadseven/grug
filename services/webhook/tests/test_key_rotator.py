@@ -55,9 +55,12 @@ class FakeKube:
             }
         self._secret = data
         self.calls: list[tuple[str, str]] = []
-        # deployment_rolled returns False this many times before True
+        # status catches up to the restart generation after this many polls
+        # (models the stale-status window the H2 generation gate must survive)
         self._rolled_after = rolled_after
-        self._rolled_polls: dict[str, int] = {}
+        self._gen: dict[str, int] = {}
+        self._observed: dict[str, int] = {}
+        self._polls: dict[str, int] = {}
         self.restarted: list[str] = []
         self.patch_fails = False
 
@@ -71,13 +74,21 @@ class FakeKube:
         self.calls.append(("secret_update", data_b64[key_rotator._AK_ID_KEY]))
 
     def restart_deployment(self, name, *, stamp):
+        # merge-patch bumps generation; return the NEW generation.
+        self._gen[name] = self._gen.get(name, 1) + 1
         self.restarted.append(name)
         self.calls.append(("restart", name))
+        return self._gen[name]
 
-    def deployment_rolled(self, name):
-        n = self._rolled_polls.get(name, 0)
-        self._rolled_polls[name] = n + 1
-        return n >= self._rolled_after
+    def deployment_rolled(self, name, min_generation):
+        n = self._polls.get(name, 0)
+        self._polls[name] = n + 1
+        # Stale until `rolled_after` polls elapse, THEN observed catches up to
+        # the restart generation. Before that, replicas may look ready but the
+        # generation gate (observed < min_generation) keeps it "not rolled".
+        if n >= self._rolled_after:
+            self._observed[name] = self._gen.get(name, 0)
+        return self._observed.get(name, 0) >= min_generation
 
 
 _DEPLOYMENTS = ["grug-api", "grug-webhook", "grug-consumer"]
@@ -124,6 +135,21 @@ def test_invariant_old_key_deleted_only_after_secret_update_and_rollout():
     # k8s side updated the secret and restarted all three before the delete.
     assert ("secret_update", _b64("AKIA-NEW-1")) in k8s.calls
     assert k8s.restarted == _DEPLOYMENTS
+
+
+def test_stale_status_does_not_prematurely_delete_old_key():
+    """H2: just after the restart patch, a Deployment's status can still show
+    the PRIOR rollout as complete (replicas ready on OLD pods). The
+    generation gate must keep waiting - not delete the old key - until status
+    observes OUR restart generation."""
+    iam = FakeIam(["AKIA-OLD"])
+    k8s = FakeKube(current_key_id="AKIA-OLD", rolled_after=2)  # 2 stale polls
+    res = _rotate(iam, k8s)
+    assert res.deleted_key_id == "AKIA-OLD"
+    # Each deployment was polled PAST the stale window before being accepted.
+    assert all(p > 2 for p in k8s._polls.values())
+    # Old key deleted only after the secret update + restarts (still last).
+    assert iam.calls[-1] == ("delete", "AKIA-OLD")
 
 
 def test_two_key_cap_prunes_stale_noncurrent_key_first():

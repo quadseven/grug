@@ -106,8 +106,11 @@ class KubeApi:
         )
         r.raise_for_status()
 
-    def restart_deployment(self, name: str, *, stamp: str) -> None:
-        """Rollout-restart via the standard restartedAt annotation."""
+    def restart_deployment(self, name: str, *, stamp: str) -> int:
+        """Rollout-restart via the standard restartedAt annotation. Returns
+        the Deployment's NEW `.metadata.generation` (the merge-patch bumps it)
+        so the rollout wait can require status to catch up to THIS generation
+        rather than mistaking the prior rollout's completed status for ours."""
         r = self._client.patch(
             f"/apis/apps/v1/namespaces/{self._ns}/deployments/{name}",
             headers={"Content-Type": "application/merge-patch+json"},
@@ -124,11 +127,15 @@ class KubeApi:
             },
         )
         r.raise_for_status()
+        return r.json().get("metadata", {}).get("generation", 0)
 
-    def deployment_rolled(self, name: str) -> bool:
-        """True iff the Deployment's current generation is fully rolled out
-        (observedGeneration up to date AND updatedReplicas == desired AND no
-        unavailable replicas)."""
+    def deployment_rolled(self, name: str, min_generation: int) -> bool:
+        """True iff the Deployment has fully rolled out AT OR PAST
+        `min_generation` (the generation returned by restart_deployment).
+        Requiring `observedGeneration >= min_generation` closes the
+        stale-status race where, right after the restart patch, `.status`
+        still reflects the PRIOR completed rollout (all replicas ready on the
+        OLD pods) and would otherwise read as 'rolled'. (audit H2)"""
         r = self._client.get(
             f"/apis/apps/v1/namespaces/{self._ns}/deployments/{name}"
         )
@@ -138,7 +145,7 @@ class KubeApi:
         status = d.get("status", {})
         desired = spec.get("replicas", 1)
         return (
-            status.get("observedGeneration", 0) >= d.get("metadata", {}).get("generation", 0)
+            status.get("observedGeneration", 0) >= min_generation
             and status.get("updatedReplicas", 0) == desired
             and status.get("availableReplicas", 0) == desired
             and status.get("unavailableReplicas", 0) == 0
@@ -211,13 +218,14 @@ def rotate(
             secret_name,
             {_AK_ID_KEY: _b64(new_id), _AK_SECRET_KEY: _b64(new_secret)},
         )
-        # 3) Roll every consumer onto it and WAIT.
-        for dep in deployments:
-            k8s.restart_deployment(dep, stamp=stamp)
+        # 3) Roll every consumer onto it and WAIT. Capture each Deployment's
+        # post-restart generation so the wait requires status to catch up to
+        # OUR rollout, not the prior one (audit H2).
+        gens = {dep: k8s.restart_deployment(dep, stamp=stamp) for dep in deployments}
         deadline = now() + wait_timeout_s
         pending = set(deployments)
         while pending:
-            pending = {d for d in pending if not k8s.deployment_rolled(d)}
+            pending = {d for d in pending if not k8s.deployment_rolled(d, gens[d])}
             if not pending:
                 break
             if now() >= deadline:
@@ -249,6 +257,13 @@ def main() -> int:
     exits non-zero on failure so the Kubernetes Job is marked failed (the
     DD kube-job-failure monitor keys off that). Never deletes the old key on
     failure (RotationError is caught here, the old key stays valid)."""
+    # MUST configure structured logging first, or the success/failure events
+    # below never reach Datadog as JSON with the service/env tags the
+    # key_rotation_failed monitor queries (the default root logger drops INFO
+    # and emits a bare stderr string). Mirrors main.py. (audit C1)
+    from observability import configure_logging
+
+    configure_logging()
     import boto3  # local import: only the rotator pod needs it at call time
 
     pod_user = os.environ.get("GRUG_ROTATE_USER", "grug-k8s-pod")
@@ -262,9 +277,11 @@ def main() -> int:
     ]
     stamp = datetime.now(timezone.utc).isoformat()
 
-    iam = boto3.client("iam")
-    k8s = KubeApi()
     try:
+        # Construct inside the try so a KubeApi/boto3 init failure (misconfig)
+        # also surfaces as key_rotation_failed, not an un-logged crash (M1).
+        iam = boto3.client("iam")
+        k8s = KubeApi()
         res = rotate(
             iam, k8s, pod_user=pod_user, secret_name=secret_name,
             deployments=deployments, stamp=stamp,

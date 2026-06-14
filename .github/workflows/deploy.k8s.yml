@@ -147,6 +147,16 @@ jobs:
             echo "GRUG_CAVE_RESULTS_QUEUE_URL=$(aws sqs get-queue-url --queue-name grug-cave-results.fifo --query QueueUrl --output text)"
             echo "GRUG_CAVE_DIFF_BUCKET=$(aws s3api list-buckets --query 'Buckets[?starts_with(Name, `grug-cave-diffs`)].Name | [0]' --output text)"
           } > "$ENVF"
+          # Fail BEFORE the destructive delete if any value came back empty or
+          # "None": `set -e` does NOT trip on a command-substitution failure
+          # inside `echo "K=$(...)"`, so a failed SSM/SQS/S3 lookup would
+          # otherwise seed a broken secret and outage every pod. Print only
+          # KEY names (empty/None lines carry no secret value). (audit C2)
+          if grep -qE '=$|=None$' "$ENVF"; then
+            echo "::error::empty/None value(s) in grug-secrets seed:"
+            grep -nE '=$|=None$' "$ENVF" | cut -d= -f1
+            exit 1
+          fi
           # DELETE-then-create: kubectl apply MERGES secret data, so a
           # shape change would leave stale keys behind (bit us on the
           # first deploys - the interim seed's keys lingered).
@@ -165,6 +175,13 @@ jobs:
             echo "AWS_SECRET_ACCESS_KEY=$(get /grug/k8s-rotator-aws-secret-access-key)"
             echo "AWS_DEFAULT_REGION=us-east-1"
           } > "$ROTF"
+          # Same empty/None guard as grug-secrets (audit C2): a broken rotator
+          # credential would silently fail every future rotation.
+          if grep -qE '=$|=None$' "$ROTF"; then
+            echo "::error::empty/None value(s) in grug-rotator-secret seed:"
+            grep -nE '=$|=None$' "$ROTF" | cut -d= -f1
+            exit 1
+          fi
           kubectl -n grug delete secret grug-rotator-secret --ignore-not-found
           kubectl -n grug create secret generic grug-rotator-secret \
             --from-env-file="$ROTF"
