@@ -122,6 +122,43 @@ Shared across all projects. Coordinate with somatic-scripts before rotating.
 | Pulumi up fails: `script already exists` (CF) | CF Worker manually uploaded but not in Pulumi state | Drop `cloudflare:WorkerScript`/`WorkerRoute` from `__main__.py` (we now manage Worker via `infra/cloudflare/deploy.sh`) |
 | CI fails: `aws: command not found` on the self-hosted CI runner | Runner missing tooling | Re-provision the self-hosted runner's tooling from your private infra repo |
 | CF Worker upload fails: `code 10021: No such module: worker.js` | Upload form-field name doesn't match metadata.main_module | Use `/tmp/worker.js` as path (basename `worker.js` matches main_module) — `deploy.sh` does this |
+| A required PR check is stuck/missing after grug was briefly down | The inline DoR/TPM webhook delivery errored during the outage; GitHub gave up retrying (infra #1254) | Self-heals: the `grug-poller` CronJob replays errored deliveries every 15m (#407). To force it now, run the manual replay below |
+
+## Missed-delivery replay (#407)
+
+The DoR/TPM check runs inline on the webhook, so a GitHub delivery that arrives
+while grug is down is lost. Recovery:
+
+- **Automatic:** the `grug-poller` CronJob (every 15m) calls
+  `delivery_replay.replay_since()` each tick — it lists App webhook deliveries
+  via `GET /app/hook/deliveries`, and `POST .../attempts` re-sends every event
+  (`guid`) that never got a 200-399 delivery. Idempotent: a `guid` whose
+  redelivery succeeds is skipped next tick, and the redelivered webhook carries
+  that `guid` as `X-GitHub-Delivery`, so the consumer's `claim_delivery`
+  dedupes a second processing. (Note: `post_check_run` is NOT idempotent - it
+  POSTs the Checks create endpoint - so correctness rests on the guid-skip +
+  claim_delivery, never on re-posting being a no-op.)
+- **Manual fallback** (force a replay now, or widen the window) — runs the same
+  code inside a webhook pod (App SSM env already wired, no local creds needed):
+
+  ```bash
+  kubectl -n grug exec deploy/grug-webhook -- python replay_deliveries.py --hours 6
+  # or an explicit window start:
+  kubectl -n grug exec deploy/grug-webhook -- python replay_deliveries.py --since 2026-06-14T20:00:00Z
+  ```
+
+  Exit code is non-zero if any redeliver attempt errored. Default poller window
+  is `GRUG_REPLAY_WINDOW_HOURS` (6h).
+
+### Async SQS jobs need no replay (confirmed)
+
+The async layers — `grug-rerun-jobs` (Elder re-runs) and `grug-cave-results`
+(cave fallback) — are already outage-resilient and require **no** replay
+mechanism: SQS persists each message until acknowledged, with a visibility
+timeout + DLQ (redrive after maxReceiveCount). When the `grug-consumer` pod
+recovers it long-polls and auto-drains the backlog (#368), and its fail-fast
+startup self-check (#405) guarantees it only starts when AWS is reachable. So a
+consumer outage delays — never drops — re-run / cave-result jobs.
 
 ## Tear-down + rebuild
 
