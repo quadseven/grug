@@ -41,6 +41,24 @@ jobs:
       - id: t
         run: echo "tag=${GITHUB_SHA::8}" >> "$GITHUB_OUTPUT"
 
+  # Pure unit tests for the infra components (monitor query builders, the
+  # notify_no_data policy). Runs on PRs - the only pre-merge gate for
+  # infra/pulumi changes (pulumi-up is merge-only), so a regression that
+  # re-introduces a retired aws.lambda/aws.sqs query or flips a continuous-KSM
+  # monitor back to notify_no_data=False is caught before merge.
+  infra-test:
+    needs: meta
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - name: 01. Checkout
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+      - name: 02. Install uv
+        uses: astral-sh/setup-uv@d4b2f3b6ecc6e67c4457f6d3e41ec42d3d0fcb86 # v5
+      - name: 03. Infra unit tests
+        working-directory: infra/pulumi
+        run: uv run --with pytest pytest tests/ -q
+
   pulumi-up:
     needs: meta
     if: github.event_name != 'pull_request'

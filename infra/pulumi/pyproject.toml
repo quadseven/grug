@@ -17,3 +17,9 @@ dev = [
     "pytest>=8.0",
     "pulumi-policy>=1.0,<2.0",
 ]
+
+[tool.pytest.ini_options]
+# Make the `components` package importable from tests/ (the composition root
+# runs with cwd=infra/pulumi; mirror that for pytest).
+pythonpath = ["."]
+testpaths = ["tests"]
