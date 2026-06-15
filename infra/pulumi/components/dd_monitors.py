@@ -7,7 +7,9 @@ tag didn't match the actual log/trace `env` tag (one said `dev`, one
 so it can never drift. Tag matrix is identical across all monitors:
 
     env:<stack>          # dev | prod  (matches DD_ENV)
-    service:<grug-svc>   # grug-webhook | grug-api
+    service:<grug-svc>   # the service monitored: namespace-level `grug` for
+                         #   cross-workload monitors, or a specific workload
+                         #   (grug-webhook | grug-api | grug-poller | grug-key-rotator)
     team:grug
 
 Notification handle = an SNS topic ARN OR a `@user@host`-style mention
@@ -131,7 +133,7 @@ def create_all(
 
     opts = pulumi.ResourceOptions(provider=provider)
 
-    # 1) Workload availability (#406) — any grug Deployment with ZERO ready
+    # Workload availability (#406) — any grug Deployment with ZERO ready
     #    replicas for a full 10m. Replaces the retired aws.lambda 5xx monitors:
     #    on k8s, "the service is broken" = "no pod is serving". Multi-alert by
     #    deployment so webhook/api/consumer each page independently.
@@ -164,7 +166,7 @@ def create_all(
         opts=opts,
     )
 
-    # 2) CrashLoopBackOff (#406) — directly catches the failure mode the
+    # CrashLoopBackOff (#406) — directly catches the failure mode the
     #    2026-06-14 outage hit (grug-consumer crash-looping, unmonitored).
     #    Covers EVERY grug pod incl the no-HTTP consumer.
     crashloop = datadog.Monitor(
@@ -187,7 +189,7 @@ def create_all(
         opts=opts,
     )
 
-    # 3) Restart spike (#406) — flapping that recovers before settling into a
+    # Restart spike (#406) — flapping that recovers before settling into a
     #    CrashLoopBackOff state still signals trouble (OOMKill, transient dep).
     restart_spike = datadog.Monitor(
         "grug-restart-spike",
@@ -216,7 +218,7 @@ def create_all(
     #  crashloop + workload-not-ready monitors above; a true queue-age signal
     #  needs the SQS integration namespace enabled first — see PR notes.)
 
-    # 4) Poller CronJob health (#379 fold-in) — grug-poller (every 15m) has not
+    # Poller CronJob health (#379 fold-in) — grug-poller (every 15m) has not
     #    SUCCEEDED in >60m. The poller reconciles reactions / stuck PRs; if it
     #    stops, that backlog rots with no other signal.
     poller_cronjob = datadog.Monitor(
@@ -235,7 +237,7 @@ def create_all(
         # duration_since_last_successful is CONTINUOUS once the CronJob has run,
         # so No Data = the CronJob vanished or KSM stopped scraping it - a real
         # "poller is gone" signal worth paging (not benign). Conditional KSM
-        # monitors below (crashloop/restart-spike) correctly keep this False.
+        # monitors above (crashloop/restart-spike) correctly keep this False.
         notify_no_data=True,
         no_data_timeframe=30,
         priority=3,

@@ -166,22 +166,25 @@ def _consume(spec: QueueSpec) -> None:
 
 
 def _warm_trace_writer() -> None:
-    """Start the ddtrace trace writer on the MAIN thread (#406).
+    """Open a ddtrace span on the MAIN thread at startup (#406).
 
-    grug-consumer otherwise emits ZERO APM spans: its first auto-instrumented
-    span (a boto3 SQS receive_message) is created inside a spawned poll thread,
-    where ddtrace's lazy writer-service start fails ('failed to start writer
-    service') and every span is silently dropped. (grug-webhook is unaffected -
-    its first span is on the main thread; a peer service on the same node
-    traces fine, so this is thread-context, not a broken agent.) Opening one
-    span on the MAIN thread here initializes the writer in the main-thread
-    context, so the subsequent worker-thread spans flush.
+    Observed: grug-consumer emits ZERO APM spans while grug-webhook (same image,
+    same node-local agent) traces fine, and the pre-#405 consumer logged
+    'ddtrace ... failed to start writer service' from a botocore SQS call on a
+    poll thread. The spans that matter (per-message work) are created on those
+    worker poll threads, where ddtrace's lazy writer-service start can fail and
+    silently drop every span. Forcing one span on the MAIN thread before the
+    poll threads spawn initializes the writer in the main-thread context as a
+    mitigation. (This is belt-and-suspenders with #405's startup boto3 call,
+    which is also main-thread; efficacy is confirmed by checking that
+    grug-consumer spans actually appear in Datadog AFTER deploy - if they still
+    don't, the cause is elsewhere and tracked separately, not assumed fixed.)
 
     Fail-safe: telemetry must NEVER break consumer startup, so warmup errors
     are swallowed - but at the RIGHT level. ddtrace genuinely absent (tests) is
-    expected -> debug; ddtrace present but the writer raises is the exact
-    APM-misconfig this fix targets recurring -> warning (visible at default
-    level), so a regression to zero-spans is not itself silent."""
+    expected -> debug; ddtrace present but warmup raised (typically the
+    writer-service start failure) -> warning (visible at the default level), so
+    a regression to zero-spans is not itself silent."""
     try:
         import ddtrace
     except ImportError:
