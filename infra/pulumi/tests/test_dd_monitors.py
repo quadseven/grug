@@ -17,7 +17,6 @@ import pulumi
 
 from components.dd_monitors import (
     all_ksm_monitor_queries,
-    consumer_queue_age_query,
     crashloop_query,
     poller_cronjob_unhealthy_query,
     restart_spike_query,
@@ -68,13 +67,13 @@ def test_restart_spike_query_is_namespace_scoped() -> None:
     assert "by {pod_name}" in q
 
 
-def test_consumer_queue_age_covers_both_consumed_fifos() -> None:
-    """#379 fold-in: consumer that is 'ready' but silently not draining."""
-    q = consumer_queue_age_query()
-    assert "aws.sqs.approximate_age_of_oldest_message" in q
-    assert "grug-rerun-jobs.fifo" in q
-    assert "grug-cave-results.fifo" in q
-    assert "> 600" in q
+def test_no_replacement_query_uses_uncollected_aws_sqs() -> None:
+    """aws.sqs.* is NOT collected by the DD AWS integration in this org, so a
+    queue-age monitor would be permanent No Data — the trap this slice retires.
+    Guard that no replacement query reintroduces it (the consumer queue-age
+    monitor is deferred until the SQS integration namespace is enabled)."""
+    for q in all_ksm_monitor_queries():
+        assert "aws.sqs." not in q, f"uncollected aws.sqs metric in: {q}"
 
 
 def test_poller_cronjob_unhealthy_uses_duration_since_last_successful() -> None:

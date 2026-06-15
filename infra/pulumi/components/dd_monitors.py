@@ -28,7 +28,6 @@ class _MonitorBundle:
     workload_not_ready: datadog.Monitor
     crashloop: datadog.Monitor
     restart_spike: datadog.Monitor
-    consumer_queue_age: datadog.Monitor
     poller_cronjob: datadog.Monitor
     sig_verify_fail: datadog.Monitor
     elder_offload_fail: datadog.Monitor
@@ -92,16 +91,6 @@ def restart_spike_query() -> str:
     )
 
 
-def consumer_queue_age_query() -> str:
-    """#379: grug-consumer is 'ready' but silently not draining — the oldest
-    message in either consumed FIFO is older than 10m. No Data (empty queue)
-    is the healthy case, so the monitor sets notify_no_data=False."""
-    return (
-        "max(last_15m):max:aws.sqs.approximate_age_of_oldest_message"
-        "{queuename:grug-rerun-jobs.fifo OR queuename:grug-cave-results.fifo} > 600"
-    )
-
-
 def poller_cronjob_unhealthy_query() -> str:
     """#379: grug-poller CronJob (every 15m) has not SUCCEEDED in >60m (4
     missed cycles) — it stopped reconciling reactions/stuck PRs silently."""
@@ -112,13 +101,19 @@ def poller_cronjob_unhealthy_query() -> str:
 
 
 def all_ksm_monitor_queries() -> list[str]:
-    """Every NEW k8s-runtime monitor query (KSM-based + the SQS consumer-drain
-    one). The lambda-retirement guard test iterates this set."""
+    """Every NEW k8s-runtime monitor query (all KSM-based). The
+    lambda-retirement guard test iterates this set.
+
+    NB: a consumer queue-age monitor (#379) was intentionally NOT added here -
+    aws.sqs.* is not collected by the DD AWS integration in this org, so it
+    would be permanent No Data (the exact trap this slice retires). The
+    consumer's outage mode (crash/down) is covered by the crashloop +
+    workload-not-ready monitors; true queue-age needs the SQS integration
+    namespace enabled first."""
     return [
         workload_not_ready_query(),
         crashloop_query(),
         restart_spike_query(),
-        consumer_queue_age_query(),
         poller_cronjob_unhealthy_query(),
     ]
 
@@ -153,7 +148,10 @@ def create_all(
             "Runbook: docs/RUNBOOK.md#workload-not-ready"
         ),
         query=workload_not_ready_query(),
-        tags=_common_tags(env, "grug-webhook"),
+        # service:grug (namespace-level) NOT grug-webhook — this monitor covers
+        # all three workloads, so an operator filtering by service:grug-consumer
+        # must still find it.
+        tags=_common_tags(env, "grug"),
         # replicas_ready is a CONTINUOUS KSM gauge (always present for a live
         # Deployment), so No Data here is NOT benign - it means the agent/KSM
         # check stopped reporting, i.e. we've gone blind on every k8s signal
@@ -180,7 +178,7 @@ def create_all(
             "Runbook: docs/RUNBOOK.md#crashloop"
         ),
         query=crashloop_query(),
-        tags=_common_tags(env, "grug-webhook"),
+        tags=_common_tags(env, "grug"),  # all-workload (see workload-not-ready)
         # CONDITIONAL metric: the waiting-reason series only exists while a pod
         # is actually in CrashLoopBackOff, so No Data == healthy here. (Unlike
         # the continuous gauges above, which page on No Data.)
@@ -203,7 +201,7 @@ def create_all(
             "Runbook: docs/RUNBOOK.md#crashloop"
         ),
         query=restart_spike_query(),
-        tags=_common_tags(env, "grug-webhook"),
+        tags=_common_tags(env, "grug"),  # all-workload (see workload-not-ready)
         # CONDITIONAL: change() of the restart counter only registers when
         # restarts are climbing, so No Data == healthy here too.
         notify_no_data=False,
@@ -211,29 +209,14 @@ def create_all(
         opts=opts,
     )
 
-    # 4) Consumer queue-age (#379 fold-in) — grug-consumer is "ready" but
-    #    silently not draining either consumed FIFO. Complements the
-    #    crashloop/not-ready signals (a wedged-but-alive poll loop).
-    consumer_queue_age = datadog.Monitor(
-        "grug-consumer-queue-age",
-        type="metric alert",
-        name="[grug-consumer] Consumed queue backing up (>10min old)",
-        message=(
-            f"{notify_handle}\n"
-            "grug-consumer's rerun/cave-results FIFO has messages older than "
-            "10min — the consumer is alive but not draining (a wedged poll "
-            "thread, an IAM/queue-URL gap, or downstream Elder re-runs "
-            "failing). Re-run jobs / cave fallback results are stuck.\n"
-            "Runbook: docs/RUNBOOK.md#elder-async-offload"
-        ),
-        query=consumer_queue_age_query(),
-        tags=_common_tags(env, "grug-consumer"),
-        notify_no_data=False,
-        priority=2,
-        opts=opts,
-    )
+    # (A consumer queue-age monitor for #379 was intentionally NOT added: the
+    #  DD AWS integration in this org does not collect aws.sqs.* metrics, so it
+    #  would be permanent No Data — the exact silent-can't-fire trap this slice
+    #  retires. The consumer's crash/down outage mode is covered by the
+    #  crashloop + workload-not-ready monitors above; a true queue-age signal
+    #  needs the SQS integration namespace enabled first — see PR notes.)
 
-    # 5) Poller CronJob health (#379 fold-in) — grug-poller (every 15m) has not
+    # 4) Poller CronJob health (#379 fold-in) — grug-poller (every 15m) has not
     #    SUCCEEDED in >60m. The poller reconciles reactions / stuck PRs; if it
     #    stops, that backlog rots with no other signal.
     poller_cronjob = datadog.Monitor(
@@ -489,7 +472,6 @@ def create_all(
         workload_not_ready=workload_not_ready,
         crashloop=crashloop,
         restart_spike=restart_spike,
-        consumer_queue_age=consumer_queue_age,
         poller_cronjob=poller_cronjob,
         sig_verify_fail=sig_verify_fail,
         elder_offload_fail=elder_offload_fail,
