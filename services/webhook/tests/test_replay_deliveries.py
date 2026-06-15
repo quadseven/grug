@@ -29,6 +29,14 @@ def test_parse_args_requires_exactly_one_window():
         cli._parse_args(["--since", "x", "--hours", "6"])  # mutually exclusive
 
 
+def test_parse_args_rejects_non_positive_hours():
+    # a future window-start would silently scan nothing - must fail loudly
+    with pytest.raises(SystemExit):
+        cli._parse_args(["--hours", "-5"])
+    with pytest.raises(SystemExit):
+        cli._parse_args(["--hours", "0"])
+
+
 def test_main_exit_zero_when_no_errors(monkeypatch, capsys):
     import delivery_replay
 

@@ -133,8 +133,11 @@ while grug is down is lost. Recovery:
   `delivery_replay.replay_since()` each tick — it lists App webhook deliveries
   via `GET /app/hook/deliveries`, and `POST .../attempts` re-sends every event
   (`guid`) that never got a 200-399 delivery. Idempotent: a `guid` whose
-  redelivery succeeds is skipped next tick, and `post_check_run` is idempotent
-  on (name, head_sha), so a check that already passed is never duplicated.
+  redelivery succeeds is skipped next tick, and the redelivered webhook carries
+  that `guid` as `X-GitHub-Delivery`, so the consumer's `claim_delivery`
+  dedupes a second processing. (Note: `post_check_run` is NOT idempotent - it
+  POSTs the Checks create endpoint - so correctness rests on the guid-skip +
+  claim_delivery, never on re-posting being a no-op.)
 - **Manual fallback** (force a replay now, or widen the window) — runs the same
   code inside a webhook pod (App SSM env already wired, no local creds needed):
 

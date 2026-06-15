@@ -54,7 +54,8 @@ class Delivery:
     id: int
     guid: str
     status_code: int
-    delivered_at: str  # ISO-8601, lexicographically comparable (UTC 'Z')
+    delivered_at: str  # ISO-8601 'Z'; compare as an instant via _parse_dt
+    # (fractional seconds break a naive lexicographic compare - see M3 fix)
     event: str
     redelivery: bool
 
