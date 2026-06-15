@@ -20,8 +20,10 @@ from __future__ import annotations
 
 import logging
 import os
+from datetime import datetime, timedelta, timezone
 from typing import Any
 
+import delivery_replay
 from adapters.install_store import (  # type: ignore
     list_allowlisted_installs,
     list_comment_records,
@@ -31,8 +33,31 @@ from personas.code_reviewer.reactions import poll_and_annotate
 
 log = logging.getLogger(f"{os.getenv('DD_SERVICE', 'grug')}.poller")
 
+# How far back each cron tick scans App webhook deliveries for missed events
+# (#407). Generous by default - the guid dedup makes re-scanning a window
+# harmless (a delivery that later succeeds is skipped), and pagination is
+# window-bounded so this can't run away.
+_REPLAY_WINDOW_HOURS = int(os.getenv("GRUG_REPLAY_WINDOW_HOURS", "6"))
 
-def handler(event: dict[str, Any], context: Any) -> dict[str, int]:
+
+def _replay_missed_deliveries() -> dict[str, int | str]:
+    """Auto-recovery (#407): redeliver App webhook deliveries that errored in
+    the recent window, so a check dropped while grug was down re-posts without
+    a human re-triggering. Best-effort - a replay failure must never abort the
+    reaction-poll cron, so the caller wraps this and it also self-guards."""
+    since = (
+        datetime.now(timezone.utc) - timedelta(hours=_REPLAY_WINDOW_HOURS)
+    ).strftime("%Y-%m-%dT%H:%M:%SZ")
+    rep = delivery_replay.replay_since(since)
+    return {
+        "replay_scanned": rep.scanned,
+        "replay_failed_guids": rep.failed_guids,
+        "replay_redelivered": rep.redelivered,
+        "replay_errors": rep.errors,
+    }
+
+
+def handler(event: dict[str, Any], context: Any) -> dict[str, int | str]:
     """Poll reactions for every allowlisted install. Returns a summary
     dict (installs scanned, records polled, verdicts submitted) — also
     the structured-log payload an operator/DD reads to confirm the cron
@@ -75,11 +100,21 @@ def handler(event: dict[str, Any], context: Any) -> dict[str, int]:
             )
             failed_installs += 1
 
-    result = {
+    # Auto-replay missed webhook deliveries (#407), best-effort: a replay
+    # failure must never abort the cron, so it's wrapped here on TOP of
+    # replay_since's own per-attempt best-effort.
+    try:
+        replay = _replay_missed_deliveries()
+    except Exception as e:  # noqa: BLE001 - replay never aborts the poll cycle
+        log.warning("delivery_replay_failed", extra={"kind": type(e).__name__})
+        replay = {"replay_error": type(e).__name__}
+
+    result: dict[str, int | str] = {
         "installs": len(installs),
         "records": polled_records,
         "submitted": submitted,
         "failed_installs": failed_installs,
+        **replay,
     }
     # Total failure (auth/config drift, GitHub down) errors EVERY install and
     # would otherwise look identical to a healthy idle cycle (submitted:0) —
