@@ -16,6 +16,8 @@ from __future__ import annotations
 
 from unittest.mock import MagicMock, patch
 
+import pytest
+
 import consumer
 
 
@@ -133,7 +135,6 @@ def test_failed_delete_is_swallowed():
 # The consumer has no HTTP /readyz, so it must FAIL FAST at startup if its
 # critical deps (SSM/KMS + Postgres) are unreachable - a broken AWS key would
 # otherwise let the poll loop back off forever and leave the pod idle "Running".
-import pytest  # noqa: E402
 
 
 def test_startup_check_exits_nonzero_when_deps_unreachable(monkeypatch):
@@ -178,5 +179,62 @@ def test_main_exits_nonzero_when_a_poll_thread_dies(monkeypatch):
         with pytest.raises(SystemExit) as exc:
             consumer.main()
         assert exc.value.code == 1
+    finally:
+        consumer._stop.clear()
+
+
+def test_main_aborts_before_spawning_threads_when_startup_check_fails(monkeypatch):
+    """Ordering guarantee (#405): when the startup self-check fails, main()
+    exits non-zero and NEVER starts a poll thread. The check must GATE thread
+    spawn, not run beside it - a regression that moved it after t.start() would
+    reintroduce 'threads polling against a dead dependency'."""
+    consumer._stop.clear()
+
+    def _boom_startup():
+        raise SystemExit(1)
+
+    monkeypatch.setattr(consumer, "_startup_check", _boom_startup)
+    thread_ctor = MagicMock()
+    monkeypatch.setattr(consumer.threading, "Thread", thread_ctor)
+    try:
+        with pytest.raises(SystemExit) as exc:
+            consumer.main()
+        assert exc.value.code == 1
+        thread_ctor.assert_not_called()
+    finally:
+        consumer._stop.clear()
+
+
+def test_main_returns_zero_on_graceful_signal_shutdown(monkeypatch):
+    """A real SIGTERM (graceful scale-down) must return 0, NOT a non-zero exit
+    - otherwise every normal pod termination would read as a crash. Guards the
+    watchdog's signal-vs-death distinction from regressing to 'always died'."""
+    import threading as _threading
+    import time
+
+    consumer._stop.clear()
+    monkeypatch.setattr(consumer, "_startup_check", lambda: None)
+    monkeypatch.setattr(consumer, "_specs", lambda: [_spec(True, lambda e: None)])
+
+    def _quiet(_spec_arg):
+        # The real _consume contract: run until _stop is set, then return.
+        consumer._stop.wait()
+
+    monkeypatch.setattr(consumer, "_consume", _quiet)
+
+    # Capture the SIGTERM handler main() registers without touching real signal
+    # disposition, then invoke it from a helper thread = a graceful term.
+    handlers: dict = {}
+    monkeypatch.setattr(
+        consumer.signal, "signal", lambda sig, fn: handlers.__setitem__(sig, fn)
+    )
+
+    def _term_soon():
+        time.sleep(0.05)
+        handlers[consumer.signal.SIGTERM](consumer.signal.SIGTERM, None)
+
+    _threading.Thread(target=_term_soon, daemon=True).start()
+    try:
+        consumer.main()  # returns normally (exit 0); must NOT raise SystemExit
     finally:
         consumer._stop.clear()
