@@ -165,6 +165,38 @@ def _consume(spec: QueueSpec) -> None:
     log.info("consumer_stopped", extra={"queue": spec.kind})
 
 
+def _warm_trace_writer() -> None:
+    """Open a ddtrace span on the MAIN thread at startup (#406).
+
+    Observed: grug-consumer emits ZERO APM spans while grug-webhook (same image,
+    same node-local agent) traces fine, and the pre-#405 consumer logged
+    'ddtrace ... failed to start writer service' from a botocore SQS call on a
+    poll thread. The spans that matter (per-message work) are created on those
+    worker poll threads, where ddtrace's lazy writer-service start can fail and
+    silently drop every span. Forcing one span on the MAIN thread before the
+    poll threads spawn initializes the writer in the main-thread context as a
+    mitigation. (This is belt-and-suspenders with #405's startup boto3 call,
+    which is also main-thread; efficacy is confirmed by checking that
+    grug-consumer spans actually appear in Datadog AFTER deploy - if they still
+    don't, the cause is elsewhere and tracked separately, not assumed fixed.)
+
+    Fail-safe: telemetry must NEVER break consumer startup, so warmup errors
+    are swallowed - but at the RIGHT level. ddtrace genuinely absent (tests) is
+    expected -> debug; ddtrace present but warmup raised (typically the
+    writer-service start failure) -> warning (visible at the default level), so
+    a regression to zero-spans is not itself silent."""
+    try:
+        import ddtrace
+    except ImportError:
+        log.debug("trace_writer_warmup_skipped_no_ddtrace")
+        return
+    try:
+        with ddtrace.tracer.trace("grug.consumer.startup"):
+            pass
+    except Exception:  # noqa: BLE001 - telemetry is never worth crashing on
+        log.warning("trace_writer_warmup_failed", exc_info=True)
+
+
 def _startup_check() -> None:
     """Fail FAST (non-zero exit) if a critical dependency is unreachable at
     startup. The consumer has no HTTP /readyz for the kubelet to gate on, so
@@ -193,6 +225,11 @@ def _startup_check() -> None:
 
 def main() -> None:
     logging.basicConfig(level=os.getenv("GRUG_LOG_LEVEL", "INFO"))
+
+    # Initialize the ddtrace writer on the MAIN thread BEFORE any poll thread
+    # creates a (worker-thread) span (#406) - otherwise all consumer APM spans
+    # are silently dropped.
+    _warm_trace_writer()
 
     # Gate startup on critical deps BEFORE spawning poll threads (#405).
     _startup_check()
