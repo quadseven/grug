@@ -165,6 +165,29 @@ def _consume(spec: QueueSpec) -> None:
     log.info("consumer_stopped", extra={"queue": spec.kind})
 
 
+def _warm_trace_writer() -> None:
+    """Start the ddtrace trace writer on the MAIN thread (#406).
+
+    grug-consumer otherwise emits ZERO APM spans: its first auto-instrumented
+    span (a boto3 SQS receive_message) is created inside a spawned poll thread,
+    where ddtrace's lazy writer-service start fails ('failed to start writer
+    service') and every span is silently dropped. (grug-webhook is unaffected -
+    its first span is on the main thread; a peer service on the same node
+    traces fine, so this is thread-context, not a broken agent.) Opening one
+    span on the MAIN thread here initializes the writer in the main-thread
+    context, so the subsequent worker-thread spans flush.
+
+    Fail-safe: telemetry must NEVER break consumer startup, so any error
+    (ddtrace absent in tests, writer hiccup) is swallowed to debug."""
+    try:
+        import ddtrace
+
+        with ddtrace.tracer.trace("grug.consumer.startup"):
+            pass
+    except Exception:  # noqa: BLE001 - telemetry is never worth crashing on
+        log.debug("trace_writer_warmup_skipped", exc_info=True)
+
+
 def _startup_check() -> None:
     """Fail FAST (non-zero exit) if a critical dependency is unreachable at
     startup. The consumer has no HTTP /readyz for the kubelet to gate on, so
@@ -193,6 +216,11 @@ def _startup_check() -> None:
 
 def main() -> None:
     logging.basicConfig(level=os.getenv("GRUG_LOG_LEVEL", "INFO"))
+
+    # Initialize the ddtrace writer on the MAIN thread BEFORE any poll thread
+    # creates a (worker-thread) span (#406) - otherwise all consumer APM spans
+    # are silently dropped.
+    _warm_trace_writer()
 
     # Gate startup on critical deps BEFORE spawning poll threads (#405).
     _startup_check()

@@ -25,12 +25,14 @@ import pulumi_datadog as datadog
 
 @dataclass
 class _MonitorBundle:
-    webhook_5xx: datadog.Monitor
-    api_5xx: datadog.Monitor
+    workload_not_ready: datadog.Monitor
+    crashloop: datadog.Monitor
+    restart_spike: datadog.Monitor
+    consumer_queue_age: datadog.Monitor
+    poller_cronjob: datadog.Monitor
     sig_verify_fail: datadog.Monitor
     elder_offload_fail: datadog.Monitor
     elder_llm_degraded: datadog.Monitor
-    cold_start_p99: datadog.Monitor
     enforcement_gap: datadog.Monitor
     cf_secret_mismatch: datadog.Monitor
     key_rotation_fail: datadog.Monitor
@@ -39,6 +41,80 @@ class _MonitorBundle:
 
 def _common_tags(env: str, service: str) -> list[str]:
     return [f"env:{env}", f"service:{service}", "team:grug"]
+
+
+# --- k8s-native query builders (#406) ---------------------------------------
+# Post-Lambda, error-rate/availability and crash detection come from Kubernetes
+# State Metrics (KSM), which DO flow for the grug namespace. These are PURE
+# string builders so they're unit-testable without a Pulumi runtime.
+#
+# CRITICAL: scope by `kube_namespace:grug` ONLY — the stack `env` tag does NOT
+# propagate onto KSM series, so adding `env:<stack>` to a KSM query silently
+# matches nothing (permanent No Data) — the exact trap that hid the 2026-06-14
+# outage. (The monitor TAGS still carry env for routing/inventory; the QUERY
+# must not.)
+_NS = "kube_namespace:grug"
+
+
+def workload_not_ready_query() -> str:
+    """Any grug Deployment (api/webhook/consumer) with ZERO ready replicas for
+    a full 10m. `max(last_10m) < 1` tolerates brief deploy blips (a Recreate
+    consumer momentarily at 0 during rollout) and fires only on a sustained
+    outage — the availability equivalent of the retired Lambda 5xx alert."""
+    return (
+        "max(last_10m):max:kubernetes_state.deployment.replicas_ready"
+        "{" + _NS + "} by {kube_deployment} < 1"
+    )
+
+
+def crashloop_query() -> str:
+    """Any grug pod (incl grug-consumer) in CrashLoopBackOff. DD lowercases
+    tag values, so the waiting reason is `crashloopbackoff`."""
+    return (
+        "max(last_5m):max:kubernetes_state.container.status_report.count.waiting"
+        "{" + _NS + ",reason:crashloopbackoff} by {pod_name} > 0"
+    )
+
+
+def restart_spike_query() -> str:
+    """A pod that gains >3 restarts in 10m — catches flapping that recovers
+    before settling into a CrashLoopBackOff state. `change()` measures the
+    increase in the cumulative restart counter."""
+    return (
+        "change(max(last_10m),last_10m):max:kubernetes_state.container.restarts"
+        "{" + _NS + "} by {pod_name} > 3"
+    )
+
+
+def consumer_queue_age_query() -> str:
+    """#379: grug-consumer is 'ready' but silently not draining — the oldest
+    message in either consumed FIFO is older than 10m. No Data (empty queue)
+    is the healthy case, so the monitor sets notify_no_data=False."""
+    return (
+        "max(last_15m):max:aws.sqs.approximate_age_of_oldest_message"
+        "{queuename:grug-rerun-jobs.fifo OR queuename:grug-cave-results.fifo} > 600"
+    )
+
+
+def poller_cronjob_unhealthy_query() -> str:
+    """#379: grug-poller CronJob (every 15m) has not SUCCEEDED in >60m (4
+    missed cycles) — it stopped reconciling reactions/stuck PRs silently."""
+    return (
+        "max(last_15m):max:kubernetes_state.cronjob.duration_since_last_successful"
+        "{" + _NS + ",kube_cronjob:grug-poller} > 3600"
+    )
+
+
+def all_ksm_monitor_queries() -> list[str]:
+    """Every NEW k8s-runtime monitor query (KSM-based + the SQS consumer-drain
+    one). The lambda-retirement guard test iterates this set."""
+    return [
+        workload_not_ready_query(),
+        crashloop_query(),
+        restart_spike_query(),
+        consumer_queue_age_query(),
+        poller_cronjob_unhealthy_query(),
+    ]
 
 
 def create_all(
@@ -54,52 +130,107 @@ def create_all(
 
     opts = pulumi.ResourceOptions(provider=provider)
 
-    # 1) Webhook 5xx > 1% over 5min — pages. GitHub will silently retry
-    #    5xx but a sustained burn means EVERY install's PR check is broken.
-    webhook_5xx = datadog.Monitor(
-        "grug-webhook-5xx",
+    # 1) Workload availability (#406) — any grug Deployment with ZERO ready
+    #    replicas for a full 10m. Replaces the retired aws.lambda 5xx monitors:
+    #    on k8s, "the service is broken" = "no pod is serving". Multi-alert by
+    #    deployment so webhook/api/consumer each page independently.
+    workload_not_ready = datadog.Monitor(
+        "grug-workload-not-ready",
         type="metric alert",
-        name="[grug-webhook] 5xx error-rate > 1% (5min)",
+        name="[grug] Workload has zero ready replicas (10min)",
         message=(
             f"{notify_handle}\n"
-            "grug-webhook is returning 5xx > 1% of requests. PRs will "
-            "appear to silently miss their check-run.\n"
-            "Runbook: docs/RUNBOOK.md#webhook-5xx"
+            "A grug workload (grug-webhook / grug-api / grug-consumer) has had "
+            "ZERO ready replicas for 10 minutes — that service is down "
+            "(crashloop, image pull, scheduling, or a failing readiness probe). "
+            "PR check-runs / dashboard / queue draining are broken for it.\n"
+            "Runbook: docs/RUNBOOK.md#workload-not-ready"
         ),
-        query=(
-            "sum(last_5m):"
-            "( sum:aws.lambda.errors{functionname:grug-webhook,env:" + env
-            + "}.as_count() "
-            "/ sum:aws.lambda.invocations{functionname:grug-webhook,env:" + env
-            + "}.as_count() "
-            ") * 100 > 1"
-        ),
+        query=workload_not_ready_query(),
         tags=_common_tags(env, "grug-webhook"),
         notify_no_data=False,
         priority=2,
         opts=opts,
     )
 
-    # 2) API 5xx > 5% over 5min — degraded UX but not fully broken.
-    api_5xx = datadog.Monitor(
-        "grug-api-5xx",
+    # 2) CrashLoopBackOff (#406) — directly catches the failure mode the
+    #    2026-06-14 outage hit (grug-consumer crash-looping, unmonitored).
+    #    Covers EVERY grug pod incl the no-HTTP consumer.
+    crashloop = datadog.Monitor(
+        "grug-crashloop",
         type="metric alert",
-        name="[grug-api] 5xx error-rate > 5% (5min)",
+        name="[grug] Pod in CrashLoopBackOff (5min)",
         message=(
             f"{notify_handle}\n"
-            "grug-api is returning 5xx > 5% of requests. Dashboard + "
-            "OAuth flows are degraded.\n"
-            "Runbook: docs/RUNBOOK.md#api-5xx"
+            "A grug pod is in CrashLoopBackOff — it is repeatedly failing to "
+            "start. Check the pod's recent logs and `kubectl describe`.\n"
+            "Runbook: docs/RUNBOOK.md#crashloop"
         ),
-        query=(
-            "sum(last_5m):"
-            "( sum:aws.lambda.errors{functionname:grug-api,env:" + env
-            + "}.as_count() "
-            "/ sum:aws.lambda.invocations{functionname:grug-api,env:" + env
-            + "}.as_count() "
-            ") * 100 > 5"
+        query=crashloop_query(),
+        tags=_common_tags(env, "grug-webhook"),
+        notify_no_data=False,
+        priority=2,
+        opts=opts,
+    )
+
+    # 3) Restart spike (#406) — flapping that recovers before settling into a
+    #    CrashLoopBackOff state still signals trouble (OOMKill, transient dep).
+    restart_spike = datadog.Monitor(
+        "grug-restart-spike",
+        type="metric alert",
+        name="[grug] Pod restarting repeatedly (>3 in 10min)",
+        message=(
+            f"{notify_handle}\n"
+            "A grug pod gained more than 3 restarts in 10 minutes — it is "
+            "flapping (OOMKill, a crashing thread, or a transient dependency). "
+            "Check the pod's restart reason and recent logs.\n"
+            "Runbook: docs/RUNBOOK.md#crashloop"
         ),
-        tags=_common_tags(env, "grug-api"),
+        query=restart_spike_query(),
+        tags=_common_tags(env, "grug-webhook"),
+        notify_no_data=False,
+        priority=3,
+        opts=opts,
+    )
+
+    # 4) Consumer queue-age (#379 fold-in) — grug-consumer is "ready" but
+    #    silently not draining either consumed FIFO. Complements the
+    #    crashloop/not-ready signals (a wedged-but-alive poll loop).
+    consumer_queue_age = datadog.Monitor(
+        "grug-consumer-queue-age",
+        type="metric alert",
+        name="[grug-consumer] Consumed queue backing up (>10min old)",
+        message=(
+            f"{notify_handle}\n"
+            "grug-consumer's rerun/cave-results FIFO has messages older than "
+            "10min — the consumer is alive but not draining (a wedged poll "
+            "thread, an IAM/queue-URL gap, or downstream Elder re-runs "
+            "failing). Re-run jobs / cave fallback results are stuck.\n"
+            "Runbook: docs/RUNBOOK.md#elder-async-offload"
+        ),
+        query=consumer_queue_age_query(),
+        tags=_common_tags(env, "grug-consumer"),
+        notify_no_data=False,
+        priority=2,
+        opts=opts,
+    )
+
+    # 5) Poller CronJob health (#379 fold-in) — grug-poller (every 15m) has not
+    #    SUCCEEDED in >60m. The poller reconciles reactions / stuck PRs; if it
+    #    stops, that backlog rots with no other signal.
+    poller_cronjob = datadog.Monitor(
+        "grug-poller-cronjob-unhealthy",
+        type="metric alert",
+        name="[grug-poller] CronJob has not succeeded in 60min",
+        message=(
+            f"{notify_handle}\n"
+            "The grug-poller CronJob (runs every 15m) has not completed "
+            "successfully in over an hour — reaction/stuck-PR reconciliation "
+            "has stopped. Check the most recent grug-poller Job's logs.\n"
+            "Runbook: docs/RUNBOOK.md#poller-cronjob"
+        ),
+        query=poller_cronjob_unhealthy_query(),
+        tags=_common_tags(env, "grug-poller"),
         notify_no_data=False,
         priority=3,
         opts=opts,
@@ -202,34 +333,10 @@ def create_all(
         opts=opts,
     )
 
-    # 4) Cold-start p99 > 3s over 15min — informational. Container
-    #    Lambda cold-starts spike on image-uri swaps (every deploy).
-    #    Threshold tuned to ignore deploy-burst, catch sustained drift.
-    cold_start_p99 = datadog.Monitor(
-        "grug-cold-start-p99",
-        type="metric alert",
-        name="[grug] Lambda cold-start p99 > 3s (15min)",
-        message=(
-            f"{notify_handle}\n"
-            "Sustained cold-start p99 > 3s. PR check-runs feel slow. "
-            "Consider provisioned concurrency if growth demands.\n"
-            "Runbook: docs/RUNBOOK.md#cold-start"
-        ),
-        # Greptile P1 PR #48 — `aws.lambda.duration` measures total
-        # invocation time (warm + cold); cold-start spikes get drowned
-        # by warm calls. DD-extension-instrumented Lambdas emit init
-        # duration as `aws.lambda.enhanced.init_duration` (Codex P2
-        # follow-up; AWS-native `aws.lambda.init_duration` is empty on
-        # DD-extension Lambdas).
-        query=(
-            "avg(last_15m):p99:aws.lambda.enhanced.init_duration"
-            "{functionname:grug-webhook,env:" + env + "} > 3000"
-        ),
-        tags=_common_tags(env, "grug-webhook"),
-        notify_no_data=False,
-        priority=4,
-        opts=opts,
-    )
+    # (The Lambda cold-start p99 monitor — aws.lambda.enhanced.init_duration —
+    # was RETIRED with the k8s migration (#406): there is no Lambda cold start
+    # on k8s. Pod-start latency is covered by the workload-not-ready /
+    # CrashLoopBackOff monitors above; request latency by the /livez synthetic.)
 
     # 5) Enforcement gap detector — any repo with enforcement_type:none
     #    for >1h means a TPM-enabled repo has no merge gate. DogStatsD
@@ -356,12 +463,14 @@ def create_all(
     _ = api_public_url  # reserved for future api-uptime synthetic
 
     return _MonitorBundle(
-        webhook_5xx=webhook_5xx,
-        api_5xx=api_5xx,
+        workload_not_ready=workload_not_ready,
+        crashloop=crashloop,
+        restart_spike=restart_spike,
+        consumer_queue_age=consumer_queue_age,
+        poller_cronjob=poller_cronjob,
         sig_verify_fail=sig_verify_fail,
         elder_offload_fail=elder_offload_fail,
         elder_llm_degraded=elder_llm_degraded,
-        cold_start_p99=cold_start_p99,
         enforcement_gap=enforcement_gap,
         cf_secret_mismatch=cf_secret_mismatch,
         key_rotation_fail=key_rotation_fail,

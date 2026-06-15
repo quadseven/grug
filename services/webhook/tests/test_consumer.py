@@ -205,6 +205,37 @@ def test_main_aborts_before_spawning_threads_when_startup_check_fails(monkeypatc
         consumer._stop.clear()
 
 
+def test_warm_trace_writer_never_raises():
+    """#406: telemetry warmup must be fail-safe - it runs at consumer startup
+    and must never crash the process, with or without ddtrace installed."""
+    consumer._warm_trace_writer()  # must not raise
+
+
+def test_main_warms_trace_writer_before_spawning_threads(monkeypatch):
+    """#406: the ddtrace writer must be warmed on the MAIN thread BEFORE any
+    poll thread is created - otherwise the first span (in a worker thread)
+    fails to start the writer and all consumer spans are dropped."""
+    consumer._stop.clear()
+    order: list[str] = []
+    monkeypatch.setattr(consumer, "_warm_trace_writer", lambda: order.append("warm"))
+    # Abort right after warmup so no real threads spin up; the ordering is the
+    # point. _startup_check raising proves warmup already ran.
+    def _boom_startup():
+        order.append("startup")
+        raise SystemExit(1)
+
+    monkeypatch.setattr(consumer, "_startup_check", _boom_startup)
+    thread_ctor = MagicMock()
+    monkeypatch.setattr(consumer.threading, "Thread", thread_ctor)
+    try:
+        with pytest.raises(SystemExit):
+            consumer.main()
+        assert order == ["warm", "startup"], order
+        thread_ctor.assert_not_called()
+    finally:
+        consumer._stop.clear()
+
+
 def test_main_returns_zero_on_graceful_signal_shutdown(monkeypatch):
     """A real SIGTERM (graceful scale-down) must return 0, NOT a non-zero exit
     - otherwise every normal pod termination would read as a crash. Guards the
