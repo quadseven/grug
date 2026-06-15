@@ -42,7 +42,12 @@ def _parse_args(argv):
     g.add_argument(
         "--hours", type=float, help="replay deliveries from the last N hours"
     )
-    return p.parse_args(argv)
+    args = p.parse_args(argv)
+    # A negative/zero --hours yields a future window-start and silently scans
+    # nothing (a 3am typo that reads as "nothing was missed") - fail loudly.
+    if args.hours is not None and args.hours <= 0:
+        p.error("--hours must be positive")
+    return args
 
 
 def main(argv=None) -> int:
