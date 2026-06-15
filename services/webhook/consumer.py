@@ -165,8 +165,33 @@ def _consume(spec: QueueSpec) -> None:
     log.info("consumer_stopped", extra={"queue": spec.kind})
 
 
+def _startup_check() -> None:
+    """Fail FAST (non-zero exit) if a critical dependency is unreachable at
+    startup. The consumer has no HTTP /readyz for the kubelet to gate on, so
+    without this a pod with broken AWS credentials (the 2026-06-14 deleted-key
+    incident) would start its poll threads, hit the receive-error backoff
+    forever, and sit idle "Running" while its queues silently back up. A
+    non-zero exit surfaces as a visible CrashLoopBackOff instead.
+
+    Reuses the SAME dependency-health module the /readyz handlers use
+    (`readiness.check_readiness`) so there is one definition of "is AWS
+    reachable", not a second drifting copy. Imported lazily so the check picks
+    up test monkeypatches and the module's boto3 client is built only when the
+    consumer actually runs."""
+    from readiness import check_readiness
+
+    rep = check_readiness()
+    if not rep.ready:
+        log.error("consumer_startup_check_failed", extra={"deps": rep.deps})
+        raise SystemExit(1)
+    log.info("consumer_startup_check_passed", extra={"deps": rep.deps})
+
+
 def main() -> None:
     logging.basicConfig(level=os.getenv("GRUG_LOG_LEVEL", "INFO"))
+
+    # Gate startup on critical deps BEFORE spawning poll threads (#405).
+    _startup_check()
 
     def _terminate(signum: int, _frame: Any) -> None:
         log.info("consumer_terminating", extra={"signal": signum})

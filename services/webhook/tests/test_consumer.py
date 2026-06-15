@@ -127,3 +127,56 @@ def test_failed_delete_is_swallowed():
         patch.object(consumer._sqs, "delete_message", side_effect=RuntimeError("gone")),
     ):
         assert consumer._poll_once(_spec(False, handler), "https://q", "arn") == 1
+
+
+# --- startup dependency self-check (#405) -----------------------------------
+# The consumer has no HTTP /readyz, so it must FAIL FAST at startup if its
+# critical deps (SSM/KMS + Postgres) are unreachable - a broken AWS key would
+# otherwise let the poll loop back off forever and leave the pod idle "Running".
+import pytest  # noqa: E402
+
+
+def test_startup_check_exits_nonzero_when_deps_unreachable(monkeypatch):
+    import readiness
+    monkeypatch.setattr(
+        readiness, "check_readiness",
+        lambda: readiness.ReadinessReport(ready=False, deps={"ssm_kms": False, "postgres": True}),
+    )
+    with pytest.raises(SystemExit) as exc:
+        consumer._startup_check()
+    assert exc.value.code == 1
+
+
+def test_startup_check_passes_when_deps_reachable(monkeypatch):
+    import readiness
+    monkeypatch.setattr(
+        readiness, "check_readiness",
+        lambda: readiness.ReadinessReport(ready=True, deps={"ssm_kms": True, "postgres": True}),
+    )
+    consumer._startup_check()  # must not raise
+
+
+@pytest.mark.filterwarnings("ignore::pytest.PytestUnhandledThreadExceptionWarning")
+def test_main_exits_nonzero_when_a_poll_thread_dies(monkeypatch):
+    """Acceptance #1: a poll thread that dies mid-run takes the PROCESS down
+    (non-zero exit -> kubelet restart), never a silent idle 'Running' pod.
+    Exercises main()'s watchdog with a _consume that raises immediately."""
+    import time
+
+    consumer._stop.clear()
+    monkeypatch.setattr(consumer, "_startup_check", lambda: None)
+    monkeypatch.setattr(consumer, "_specs", lambda: [_spec(True, lambda e: None)])
+
+    def _boom(_spec_arg):
+        raise RuntimeError("poll thread died")
+
+    monkeypatch.setattr(consumer, "_consume", _boom)
+    # Don't burn the real 5s between watchdog checks; keep the loop tight.
+    monkeypatch.setattr(consumer._stop, "wait", lambda _t=None: time.sleep(0.02) or False)
+
+    try:
+        with pytest.raises(SystemExit) as exc:
+            consumer.main()
+        assert exc.value.code == 1
+    finally:
+        consumer._stop.clear()
