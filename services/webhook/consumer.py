@@ -177,15 +177,21 @@ def _warm_trace_writer() -> None:
     span on the MAIN thread here initializes the writer in the main-thread
     context, so the subsequent worker-thread spans flush.
 
-    Fail-safe: telemetry must NEVER break consumer startup, so any error
-    (ddtrace absent in tests, writer hiccup) is swallowed to debug."""
+    Fail-safe: telemetry must NEVER break consumer startup, so warmup errors
+    are swallowed - but at the RIGHT level. ddtrace genuinely absent (tests) is
+    expected -> debug; ddtrace present but the writer raises is the exact
+    APM-misconfig this fix targets recurring -> warning (visible at default
+    level), so a regression to zero-spans is not itself silent."""
     try:
         import ddtrace
-
+    except ImportError:
+        log.debug("trace_writer_warmup_skipped_no_ddtrace")
+        return
+    try:
         with ddtrace.tracer.trace("grug.consumer.startup"):
             pass
     except Exception:  # noqa: BLE001 - telemetry is never worth crashing on
-        log.debug("trace_writer_warmup_skipped", exc_info=True)
+        log.warning("trace_writer_warmup_failed", exc_info=True)
 
 
 def _startup_check() -> None:

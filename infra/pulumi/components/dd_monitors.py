@@ -77,9 +77,15 @@ def crashloop_query() -> str:
 
 
 def restart_spike_query() -> str:
-    """A pod that gains >3 restarts in 10m — catches flapping that recovers
-    before settling into a CrashLoopBackOff state. `change()` measures the
-    increase in the cumulative restart counter."""
+    """A container that gains >3 restarts in 10m — catches IN-PLACE flapping
+    (kubelet restarting the same container: OOMKill loops, a crashing thread)
+    that recovers before settling into a CrashLoopBackOff state. `change()`
+    measures the increase in the cumulative restart counter.
+
+    Scope/known limit: grouped `by {pod_name}` and the counter RESETS on pod
+    recreation, so controller-driven pod CHURN (each new pod_name starts at 0)
+    is under-counted here - the crashloop monitor is the backstop for that
+    case. Bias is toward under-firing, never false-firing."""
     return (
         "change(max(last_10m),last_10m):max:kubernetes_state.container.restarts"
         "{" + _NS + "} by {pod_name} > 3"
@@ -148,7 +154,14 @@ def create_all(
         ),
         query=workload_not_ready_query(),
         tags=_common_tags(env, "grug-webhook"),
-        notify_no_data=False,
+        # replicas_ready is a CONTINUOUS KSM gauge (always present for a live
+        # Deployment), so No Data here is NOT benign - it means the agent/KSM
+        # check stopped reporting, i.e. we've gone blind on every k8s signal
+        # (the same silent-can't-fire trap that hid the 2026-06-14 outage).
+        # Page on it, with a timeframe well above the 10m window so a brief
+        # agent restart doesn't false-page.
+        notify_no_data=True,
+        no_data_timeframe=30,
         priority=2,
         opts=opts,
     )
@@ -168,6 +181,9 @@ def create_all(
         ),
         query=crashloop_query(),
         tags=_common_tags(env, "grug-webhook"),
+        # CONDITIONAL metric: the waiting-reason series only exists while a pod
+        # is actually in CrashLoopBackOff, so No Data == healthy here. (Unlike
+        # the continuous gauges above, which page on No Data.)
         notify_no_data=False,
         priority=2,
         opts=opts,
@@ -188,6 +204,8 @@ def create_all(
         ),
         query=restart_spike_query(),
         tags=_common_tags(env, "grug-webhook"),
+        # CONDITIONAL: change() of the restart counter only registers when
+        # restarts are climbing, so No Data == healthy here too.
         notify_no_data=False,
         priority=3,
         opts=opts,
@@ -231,7 +249,12 @@ def create_all(
         ),
         query=poller_cronjob_unhealthy_query(),
         tags=_common_tags(env, "grug-poller"),
-        notify_no_data=False,
+        # duration_since_last_successful is CONTINUOUS once the CronJob has run,
+        # so No Data = the CronJob vanished or KSM stopped scraping it - a real
+        # "poller is gone" signal worth paging (not benign). Conditional KSM
+        # monitors below (crashloop/restart-spike) correctly keep this False.
+        notify_no_data=True,
+        no_data_timeframe=30,
         priority=3,
         opts=opts,
     )
