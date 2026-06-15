@@ -329,6 +329,23 @@ RULES: tuple[ReviewRule, ...] = (
         good_example="items = []  # loop until a short page / no cursor",
         severity="high",
     ),
+    # ── weekly harvest: runaway-process class (claude-stuff #356, #368) ──
+    ReviewRule(
+        name="subprocess-no-timeout",
+        bug_class="robustness",
+        description="A subprocess / child-process call that invokes an EXTERNAL "
+        "or potentially-blocking command (a network CLI, another model/agent, "
+        "ssh, a build/test runner) with NO timeout — `subprocess.run`/`call`/"
+        "`check_output`, `Popen(...).communicate()`, or a shell-spawned "
+        "`node`/`curl` without `timeout`/`--max-time`. A wedged provider then "
+        "hangs the whole chain forever with no diagnostic (the runaway-process "
+        "class). Distinct from missing-timeout, which is HTTP-client libs. A "
+        "fast local command (`git rev-parse`) does NOT need one — flag only "
+        "commands that can plausibly stall (network, another agent, remote).",
+        bad_example="subprocess.run(cmd, capture_output=True)  # external reviewer CLI; can hang",
+        good_example="subprocess.run(cmd, capture_output=True, timeout=600)",
+        severity="medium",
+    ),
 )
 
 

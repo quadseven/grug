@@ -195,6 +195,14 @@ def test_new_high_value_rules_present(monkeypatch):
     assert "performance" in crp._BUG_CLASSES  # query-in-loop's class
 
 
+def test_subprocess_no_timeout_rule_present():
+    """Weekly harvest: an external/blocking subprocess (or shell node/curl)
+    call without a timeout is the runaway-process class — one wedged
+    provider hangs the whole chain (claude-stuff #356, #368)."""
+    assert any(r.name == "subprocess-no-timeout" for r in crp.RULES)
+    assert "subprocess-no-timeout" in crp.build_system_prompt()
+
+
 def test_voice_has_mandatory_bookend_structure():
     """#343: the voice instruction mandates the structural bookends that
     keep the caveman cadence from slipping to plain English under technical
