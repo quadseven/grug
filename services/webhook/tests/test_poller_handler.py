@@ -11,6 +11,9 @@ def _wire(monkeypatch, *, installs, records_for, retry, poll):
     monkeypatch.setattr(poller_handler, "list_comment_records", records_for)
     monkeypatch.setattr(poller_handler, "with_install_token_retry", retry)
     monkeypatch.setattr(poller_handler, "poll_and_annotate", poll)
+    # #407: stub the auto-replay to a no-op so reaction-poll tests don't hit
+    # GitHub and their exact-result assertions stay about the reaction poll.
+    monkeypatch.setattr(poller_handler, "_replay_missed_deliveries", lambda: {})
 
 
 def test_poller_polls_each_allowlisted_install(monkeypatch):
@@ -98,6 +101,76 @@ def test_poller_skips_installs_with_no_records(monkeypatch):
     out = poller_handler.handler({}, None)
     assert touched == []
     assert out == {"installs": 1, "records": 0, "submitted": 0, "failed_installs": 0}
+
+
+# --- #407: auto-replay wiring -----------------------------------------------
+
+
+def test_replay_missed_deliveries_maps_report(monkeypatch):
+    """_replay_missed_deliveries calls delivery_replay.replay_since (with a
+    window-derived since) and maps the report into replay_* summary keys."""
+    import delivery_replay
+
+    captured = {}
+
+    def _fake(since):
+        captured["since"] = since
+        return delivery_replay.ReplayReport(
+            scanned=5, failed_guids=2, redelivered=2, errors=0
+        )
+
+    monkeypatch.setattr(poller_handler.delivery_replay, "replay_since", _fake)
+    out = poller_handler._replay_missed_deliveries()
+    assert out == {
+        "replay_scanned": 5,
+        "replay_failed_guids": 2,
+        "replay_redelivered": 2,
+        "replay_errors": 0,
+    }
+    assert captured["since"].endswith("Z")  # an ISO-8601 UTC instant was passed
+
+
+def test_handler_merges_replay_counts(monkeypatch):
+    """The cron summary carries the replay counts so an operator/DD sees that
+    auto-recovery ran each tick."""
+    _wire(
+        monkeypatch,
+        installs=[],
+        records_for=lambda iid: [],
+        retry=lambda iid, fn: 0,
+        poll=lambda *a, **k: 0,
+    )
+    monkeypatch.setattr(
+        poller_handler, "_replay_missed_deliveries",
+        lambda: {"replay_scanned": 9, "replay_redelivered": 3, "replay_errors": 0},
+    )
+    out = poller_handler.handler({}, None)
+    assert out["replay_redelivered"] == 3
+    assert out["replay_scanned"] == 9
+
+
+def test_handler_replay_failure_does_not_abort_cron(monkeypatch, caplog):
+    """A replay blow-up (GitHub down, JWT error) must NOT abort the reaction
+    poll - it's logged and surfaced as replay_error, results otherwise intact."""
+    import logging as _logging
+
+    _wire(
+        monkeypatch,
+        installs=[1],
+        records_for=lambda iid: [{"comment_id": iid}],
+        retry=lambda iid, fn: fn("tok"),
+        poll=lambda records, *, install_id, fetch_token: 1,
+    )
+
+    def _boom():
+        raise RuntimeError("github down")
+
+    monkeypatch.setattr(poller_handler, "_replay_missed_deliveries", _boom)
+    with caplog.at_level(_logging.WARNING):
+        out = poller_handler.handler({}, None)
+    assert out["submitted"] == 1  # reaction poll still completed
+    assert out["replay_error"] == "RuntimeError"
+    assert any(r.msg == "delivery_replay_failed" for r in caplog.records)
 
 
 def test_poller_all_installs_fail_logs_error(monkeypatch, caplog):
