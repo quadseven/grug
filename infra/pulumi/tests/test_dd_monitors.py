@@ -13,6 +13,8 @@ the 2026-06-14 outage unpaged:
 
 from __future__ import annotations
 
+import pulumi
+
 from components.dd_monitors import (
     all_ksm_monitor_queries,
     consumer_queue_age_query,
@@ -21,6 +23,17 @@ from components.dd_monitors import (
     restart_spike_query,
     workload_not_ready_query,
 )
+
+
+class _PulumiMocks(pulumi.runtime.Mocks):
+    def new_resource(self, args):  # type: ignore[override]
+        return [args.name + "_id", args.inputs]
+
+    def call(self, args):  # type: ignore[override]
+        return {}
+
+
+pulumi.runtime.set_mocks(_PulumiMocks())
 
 
 def test_no_ksm_or_workload_query_references_retired_aws_lambda() -> None:
@@ -78,3 +91,37 @@ def test_ksm_queries_do_not_scope_by_env_tag() -> None:
     for q in all_ksm_monitor_queries():
         if "kubernetes_state" in q:
             assert "env:" not in q, f"KSM query wrongly scoped by env tag: {q}"
+
+
+@pulumi.runtime.test
+def test_continuous_ksm_monitors_page_on_no_data():
+    """Regression guard (audit HIGH): a CONTINUOUS KSM metric (replicas_ready,
+    duration_since_last_successful) going No Data means the whole k8s-telemetry
+    pipeline broke — the same silent-can't-fire trap this slice exists to kill —
+    so those monitors MUST notify_no_data=True. CONDITIONAL metrics (crashloop
+    waiting-reason, restart change()) correctly stay False (No Data = healthy)."""
+    import pulumi_datadog as datadog
+    from components import dd_monitors
+
+    provider = datadog.Provider("test-dd", api_key="x", app_key="y")
+    bundle = dd_monitors.create_all(
+        env="prod",
+        notify_handle="@webhook-grug-discord-monitoring",
+        webhook_public_url="https://webhook.example/webhook/github",
+        api_public_url="https://api.example",
+        provider=provider,
+    )
+
+    def _check(vals):
+        workload_not_ready, poller, crashloop, restart = vals
+        assert workload_not_ready is True, "workload_not_ready must page on No Data"
+        assert poller is True, "poller_cronjob must page on No Data"
+        assert crashloop is False, "crashloop is conditional — No Data is healthy"
+        assert restart is False, "restart_spike is conditional — No Data is healthy"
+
+    return pulumi.Output.all(
+        bundle.workload_not_ready.notify_no_data,
+        bundle.poller_cronjob.notify_no_data,
+        bundle.crashloop.notify_no_data,
+        bundle.restart_spike.notify_no_data,
+    ).apply(_check)
