@@ -165,11 +165,49 @@ def _consume(spec: QueueSpec) -> None:
     log.info("consumer_stopped", extra={"queue": spec.kind})
 
 
+def _startup_check() -> None:
+    """Fail FAST (non-zero exit) if a critical dependency is unreachable at
+    startup. The consumer has no HTTP /readyz for the kubelet to gate on, so
+    without this a pod with broken AWS credentials (the 2026-06-14 deleted-key
+    incident) would start its poll threads, hit the receive-error backoff
+    forever, and sit idle "Running" while its queues silently back up. A
+    non-zero exit surfaces as a visible CrashLoopBackOff instead.
+
+    Reuses the SAME dependency-health module the /readyz handlers use
+    (`readiness.check_readiness`) so there is one definition of "is AWS
+    reachable", not a second drifting copy. Imported lazily so the check picks
+    up test monkeypatches and the module's boto3 client is built only when the
+    consumer actually runs."""
+    from readiness import check_readiness
+
+    rep = check_readiness()
+    # Independent fail-CLOSED guard, not just `rep.ready`: an empty/degenerate
+    # report reads as healthy under all([])==True, which is exactly the
+    # "false-healthy" the gate exists to refuse. Start ONLY on an explicit,
+    # non-empty, every-dep-up report.
+    if not rep.deps or not all(rep.deps.values()):
+        log.error("consumer_startup_check_failed", extra={"deps": rep.deps})
+        raise SystemExit(1)
+    log.info("consumer_startup_check_passed", extra={"deps": rep.deps})
+
+
 def main() -> None:
     logging.basicConfig(level=os.getenv("GRUG_LOG_LEVEL", "INFO"))
 
+    # Gate startup on critical deps BEFORE spawning poll threads (#405).
+    _startup_check()
+
+    # Records that _stop was set by a SIGNAL (graceful shutdown), to tell a
+    # deliberate stop apart from a thread death. _consume only ever returns
+    # once _stop is set, so any non-alive thread while _stop is clear is a
+    # death — but a SIGTERM landing in the same instant as a death would
+    # otherwise let the loop exit with died=False. The post-loop ground-truth
+    # check below uses this flag to refuse to mask a death.
+    terminated_by_signal = threading.Event()
+
     def _terminate(signum: int, _frame: Any) -> None:
         log.info("consumer_terminating", extra={"signal": signum})
+        terminated_by_signal.set()
         _stop.set()
 
     signal.signal(signal.SIGTERM, _terminate)
@@ -190,10 +228,19 @@ def main() -> None:
     while not _stop.is_set():
         if not all(t.is_alive() for t in threads):
             died = True
-            log.error("consumer_thread_died")
+            log.error(
+                "consumer_thread_died",
+                extra={"threads": [t.name for t in threads if not t.is_alive()]},
+            )
             _stop.set()
             break
         _stop.wait(5.0)
+    # Ground-truth re-check: if _stop was set by anything OTHER than a signal
+    # (i.e. not a graceful shutdown) and a thread is down, that's a death —
+    # even if a concurrent SIGTERM raced the loop condition and skipped the
+    # branch above. Never let a dead thread exit 0.
+    if not terminated_by_signal.is_set() and not all(t.is_alive() for t in threads):
+        died = True
     # Long-poll wait is 20s, so threads notice _stop well inside the pod's
     # default 30s terminationGracePeriod; in-flight handlers finish first.
     for t in threads:
