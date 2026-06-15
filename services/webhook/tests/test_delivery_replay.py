@@ -201,3 +201,74 @@ def test_replay_since_is_best_effort_on_redeliver_error(monkeypatch):
     assert len(attempts) == 2
     assert report.redelivered == 1
     assert report.errors == 1
+
+
+# --- audit hardening: systemic failure, fractional time, malformed rows ------
+
+
+def test_replay_since_escalates_when_all_redelivers_fail(monkeypatch, caplog):
+    """Audit H1: events to replay but EVERY redeliver fails (broken App-JWT) =
+    recovery is dead -> log.error (not a pile of warnings that read as one
+    blip), so a status:error monitor fires."""
+    import logging
+
+    monkeypatch.setattr(dr, "get_app_jwt", lambda: "jwt")
+    deliveries = [
+        {"id": 2, "guid": "a", "status_code": 500, "delivered_at": "2026-06-14T20:01:00Z", "event": "pull_request", "redelivery": False},
+    ]
+
+    def _get(url, headers=None, params=None, timeout=None):
+        return _Resp(deliveries)
+
+    def _post(url, headers=None, timeout=None):
+        raise RuntimeError("401")
+
+    http = SimpleNamespace(get=_get, post=_post)
+    with caplog.at_level(logging.INFO):
+        report = dr.replay_since("2026-06-14T20:00:00Z", http=http)
+    assert report.failed_guids == 1 and report.redelivered == 0
+    errs = [r for r in caplog.records if r.msg == "delivery_replay_all_redelivers_failed"]
+    assert errs and errs[0].levelno == logging.ERROR
+    assert not any(r.msg == "delivery_replay_done" for r in caplog.records)
+
+
+def test_list_window_boundary_uses_instants_not_string_compare():
+    """Audit M3: GitHub delivered_at has FRACTIONAL seconds; a delivery at
+    20:00:00.500Z is AFTER since=20:00:00Z and must be KEPT (lexicographic
+    compare wrongly excludes it because '.' < 'Z')."""
+    page = [
+        {"id": 5, "guid": "g5", "status_code": 500, "delivered_at": "2026-06-14T20:00:00.500Z", "event": "pull_request", "redelivery": False},
+    ]
+    http = SimpleNamespace(get=lambda *a, **k: _Resp(page))
+    out = dr.list_deliveries_since("2026-06-14T20:00:00Z", http=http, jwt_token="jwt")
+    assert [d.id for d in out] == [5]
+
+
+def test_list_skips_malformed_row_without_aborting_window():
+    """Audit M1: one row missing delivered_at must be skipped + logged, not
+    abort the whole window (best-effort contract)."""
+    page = [
+        {"id": 1, "guid": "g1", "status_code": 500, "event": "pull_request", "redelivery": False},  # no delivered_at
+        {"id": 2, "guid": "g2", "status_code": 500, "delivered_at": "2026-06-14T21:00:00Z", "event": "pull_request", "redelivery": False},
+    ]
+    http = SimpleNamespace(get=lambda *a, **k: _Resp(page))
+    out = dr.list_deliveries_since("2026-06-14T20:00:00Z", http=http, jwt_token="jwt")
+    assert [d.id for d in out] == [2]  # malformed row 1 skipped, row 2 kept
+
+
+def test_list_logs_truncation_when_page_budget_exhausted(monkeypatch, caplog):
+    """Audit M4: a window bigger than the page budget must log a truncation
+    warning, not silently under-recover."""
+    import logging
+
+    monkeypatch.setattr(dr, "_MAX_PAGES", 2)
+    full = [
+        {"id": 9, "guid": "g9", "status_code": 500, "delivered_at": "2026-06-14T21:00:00Z", "event": "pull_request", "redelivery": False},
+    ]
+    # every page returns a next cursor -> loop exhausts the (patched) 2-page budget
+    http = SimpleNamespace(
+        get=lambda *a, **k: _Resp(full, links={"next": {"url": "https://api.github.com/app/hook/deliveries?cursor=X"}})
+    )
+    with caplog.at_level(logging.WARNING):
+        dr.list_deliveries_since("2026-06-14T20:00:00Z", http=http, jwt_token="jwt")
+    assert any(r.msg == "delivery_replay_window_truncated" for r in caplog.records)
