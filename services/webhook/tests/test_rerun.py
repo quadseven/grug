@@ -83,3 +83,17 @@ def test_rerun_raises_on_github_fetch_failure_so_esm_retries():
 def test_rerun_raises_on_malformed_message():
     with pytest.raises(json.JSONDecodeError):
         rerun.handle_rerun_jobs(_event("not json"))  # → DLQ after retries
+
+
+def test_rerun_failure_raises_and_never_reenqueues():
+    """#418 loop guard: a failing re-run RAISES (so SQS redrives → DLQ) and
+    NEVER enqueues another re-run — the consumer calls dispatch directly, so
+    Elder self-recovery enqueues at most once per drop, never loops."""
+    with patch.object(rerun, "with_install_token_retry", side_effect=lambda iid, fn: fn("tok")), \
+         patch("httpx.get", return_value=_pr_response()), \
+         patch.object(rerun, "get_repo_config", return_value={}), \
+         patch.object(rerun, "dispatch_code_review", side_effect=RuntimeError("review boom")), \
+         patch.object(rerun, "enqueue_rerun") as enq:
+        with pytest.raises(RuntimeError):
+            rerun.handle_rerun_jobs(_event(_job()))
+    enq.assert_not_called()

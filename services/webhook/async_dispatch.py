@@ -216,4 +216,58 @@ def run_elder_job(event: dict[str, Any]) -> dict[str, str]:
             extra={"delivery_id": delivery_id, "kind": type(e).__name__},
             exc_info=True,
         )
+        # Self-recover (#418): a dropped review used to wait for a human to
+        # re-push. Enqueue ONE durable re-run to grug-rerun-jobs instead - the
+        # consumer re-runs it with the SQS redrive contract (visibility timeout
+        # -> DLQ after maxReceiveCount), so a transient failure heals on its own
+        # and a persistent one lands in the DLQ as a terminal, visible signal.
+        _self_recover_review(payload, delivery_id)
         return {"persona": "code_reviewer", "result": "unhandled_error"}
+
+
+def _pr_ids(payload: dict[str, Any]) -> tuple[int | None, str | None, int | None]:
+    """Extract (install_id, "owner/name", pr_number) from the slim payload for a
+    self-recovery re-run. Any missing -> None (caller skips)."""
+    inst = (payload.get("installation") or {}).get("id")
+    repo = payload.get("repository") or {}
+    owner = (repo.get("owner") or {}).get("login")
+    name = repo.get("name")
+    pr_number = (payload.get("pull_request") or {}).get("number")
+    full = f"{owner}/{name}" if owner and name else None
+    return (
+        int(inst) if inst is not None else None,
+        full,
+        int(pr_number) if pr_number is not None else None,
+    )
+
+
+def _self_recover_review(payload: dict[str, Any], delivery_id: str) -> None:
+    """Enqueue ONE durable re-run for a dropped Elder review (#418). Bounded:
+    enqueues at most once per drop - the rerun CONSUMER retries via SQS redrive,
+    never re-enqueues (it calls dispatch_code_review directly, not run_elder_job),
+    so there is no loop. Best-effort: a failure to enqueue is logged, never
+    raised (the caller is already in its degrade path)."""
+    try:
+        install_id, repo, pr_number = _pr_ids(payload)
+        if not (install_id and repo and pr_number):
+            log.warning(
+                "elder_self_recover_skipped_no_ids", extra={"delivery_id": delivery_id}
+            )
+            return
+        from rerun import enqueue_rerun
+
+        enqueue_rerun(
+            install_id=install_id, repo=repo, pr_number=pr_number, persona="elder"
+        )
+        log.info(
+            "elder_self_recover_enqueued",
+            extra={"delivery_id": delivery_id, "repo": repo, "pr": pr_number},
+        )
+    except Exception as e:  # noqa: BLE001 — recovery is best-effort, never raises
+        # exc_info for symmetry with elder_job_unhandled: if recovery is
+        # systematically broken (queue misconfig), the stack speeds triage.
+        log.error(
+            "elder_self_recover_failed",
+            extra={"delivery_id": delivery_id, "kind": type(e).__name__},
+            exc_info=True,
+        )
