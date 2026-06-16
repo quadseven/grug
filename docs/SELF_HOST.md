@@ -44,9 +44,10 @@ aws ssm put-parameter --name /grug/cloudflare-api-token --value "<your_cf_token>
 aws ssm put-parameter --name /grug/cloudflare-zone-id --value "<your_zone_id>" --type String
 aws ssm put-parameter --name /grug/cloudflare-account-id --value "<your_account_id>" --type String
 
-# Datadog (optional — skip if you removed dd_monitors)
-aws ssm put-parameter --name /shared/datadog-api-key --value "<dd_api_key>" --type SecureString
-aws ssm put-parameter --name /shared/datadog-app-key --value "<dd_app_key>" --type SecureString
+# Datadog (optional — skip if you removed dd_monitors). The Pulumi program
+# reads these shared-infra paths (NOT the retired /shared/datadog-* paths).
+aws ssm put-parameter --name /infra/datadog/api_key --value "<dd_api_key>" --type SecureString
+aws ssm put-parameter --name /infra/datadog/app_key --value "<dd_app_key>" --type SecureString
 
 # Pulumi access token
 aws ssm put-parameter --name /shared/pulumi-access-token --value "<pulumi_token>" --type SecureString
@@ -65,41 +66,58 @@ pulumi config set env dev
 pulumi config set domain <your-domain>   # e.g. grug.example.com
 ```
 
-### 4. Bootstrap the Lambda image
+### 4. Provision the Postgres store
 
-Lambda Image-mode rejects `public.ecr.aws/*` URIs, so we need a private
-ECR copy of the AWS Python base image:
+Grug stores everything in a single Postgres table `grug_kv` (the #354
+store swap retired DynamoDB). Create a database on any Postgres you run
+(the hosted instance uses CloudNativePG on Kubernetes), create the
+`grug_kv` table, and put the connection string in SSM:
 
 ```bash
-# Provision ECR first (this fails Lambda creation but creates the repo)
-pulumi up --stack dev --target 'urn:pulumi:dev::grug::aws:ecr/repository:Repository::grug-webhook'
-pulumi up --stack dev --target 'urn:pulumi:dev::grug::aws:ecr/repository:Repository::grug-api'
-
-# Then bootstrap the base image into both repos
-make bootstrap-images   # uses crane to copy public python:3.13-arm64 into your private ECR
+aws ssm put-parameter --name /grug/database-url \
+  --value "postgresql://user:pass@host:5432/grug" --type SecureString
 ```
 
-### 5. First full deploy
+Schema (`pk`, `sk`, `data jsonb`, `gsi1pk`, `gsi1sk`, `ttl`) and the lazy
+pool live in `services/{api,webhook}/adapters/pg_base.py`.
+
+### 5. Deploy the AWS infra (Pulumi)
 
 ```bash
 pulumi up --stack dev --yes
 ```
 
-Roughly 5-7 min cold deploy. Should create:
-- 2 Lambda Functions (grug-webhook, grug-api) on Function URLs
-- DynamoDB single-table `grug-main`
-- KMS CMK `alias/grug-tokens`
-- IAM OIDC role for GitHub Actions
-- Cloudflare DNS records pointing webhook/api subdomains at the
-  Function URL hosts (proxied through CF Workers for host-rewrite)
+Creates the AWS-side infra (no Lambda, no ECR — those retired at #354):
+- KMS CMK `alias/grug-tokens` (OAuth-token envelope encryption)
+- 3 SQS FIFO queues (`grug-rerun-jobs`, `grug-cave-jobs`, `grug-cave-results`) + DLQs
+- S3 cave-diff bucket (`grug-cave-diffs*`)
+- IAM OIDC role for GitHub Actions + the `grug-k8s-pod` and rotator IAM users
+- DD monitors + dashboard + RUM app
+- the legacy `grug-main` DynamoDB table (unused — kept in state pending a separate removal)
 
-### 6. Configure your GitHub App webhook URL
+### 6. Deploy the app to Kubernetes
+
+The services run as pods, not Lambdas. The reference deploy is
+`.github/workflows/deploy.k8s.yml`: it builds the arm64 images, pushes
+them to your registry, seeds the in-cluster Secrets from SSM/SQS/S3, and
+`kubectl apply -k k8s/`. You need:
+- a Kubernetes cluster (arm64 nodes) + an image registry
+- a Cloudflare tunnel routing `api`/`webhook.<your-domain>` to the
+  in-cluster Services on `:8080`, with the `*-host-rewrite` Workers
+  deployed via `infra/cloudflare/deploy.sh` (sets `X-Grug-CF-Secret` +
+  the `/grug/{api,webhook}-upstream-host` upstream)
+
+See [`docs/RUNBOOK.md`](RUNBOOK.md) and
+[`docs/NETWORK-TOPOLOGY.md`](NETWORK-TOPOLOGY.md) for the full deploy and
+topology details.
+
+### 7. Configure your GitHub App webhook URL
 
 Go back to your App settings on GitHub:
 - Webhook URL = `https://webhook.<your-domain>/webhook/github`
 - Webhook secret = the value you put into SSM above
 
-### 7. Bootstrap admin USER# row in DDB
+### 8. Bootstrap the admin USER# row in Postgres
 
 ```bash
 GRUG_ADMIN_USER_ID=<your_gh_user_id> \
@@ -110,33 +128,35 @@ make seed-admin
 
 ## Day-2 ops
 
-- **Tear-down + rebuild round-trip:** `make rebuild` (see RUNBOOK.md
-  "Tear-down + rebuild" section). Should reproduce in ~15 min from a
-  clean slate. This is the load-bearing acceptance criterion that
-  `pulumi destroy && pulumi up` reproduces from code alone — covered
-  by Slice 10 #31.
+- **Tear-down + rebuild round-trip:** `pulumi destroy && pulumi up`
+  reproduces the AWS infra from code alone; the app redeploys by
+  re-running `deploy.k8s.yml` (rebuilds the images + re-applies `k8s/`).
+  See RUNBOOK.md "Tear-down + rebuild". The Postgres `grug_kv` data is
+  the only state that must be backed up/restored separately.
 - **Allowlist new users:** sign in to your hosted dashboard
   (`https://<your-domain>/dashboard`) as admin, navigate to /admin,
   toggle the user.
 - **Per-repo persona toggles:** install on the target repo via the
   GitHub App's install URL, then toggle in the dashboard.
-- **Monitors + alerts:** Datadog dashboard wires automatically (5
-  monitors per stack via `infra/pulumi/components/dd_monitors.py`).
-  Notifications go to whatever handle you put in
-  `/grug/dd-notify-handle` SSM parameter.
+- **Monitors + alerts:** the Datadog monitors + dashboard wire
+  automatically via `infra/pulumi/components/dd_monitors.py`
+  (Kubernetes-State-Metrics-based since #406). Notifications route to a
+  Datadog Webhook the Pulumi program builds from SSM
+  `/infra/discord/monitoring-alerts` (the old `/grug/dd-notify-handle`
+  placeholder is retired).
 
 ## Differences from the hosted SaaS
 
 The hosted instance at grug.lol carries:
-- Pre-allowlisted admin (Evan + collaborators)
-- Pre-configured DD monitor handle (#grug Discord channel)
-- DD APM extension layer baked into Lambda images at the published tag
+- Pre-allowlisted admin (the operator + collaborators)
+- Pre-configured DD alert routing (a Discord webhook)
+- A node-local Datadog agent on the cluster for APM/logs (DD_AGENT_HOST
+  per pod); the app images are instrumented with `ddtrace`
 
 For self-hosters:
 - You set your own admin via the seed-admin make target
-- You control your own DD notify handle (or remove DD entirely)
-- DD extension version is configurable via Pulumi
-  (`pulumi config set dd_extension_version 65`)
+- You control your own DD alert routing (or remove DD entirely)
+- You run your own cluster's Datadog agent (or drop `DD_*` from the manifests)
 
 ## Compliance with AGPL-3.0
 
