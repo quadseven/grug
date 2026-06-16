@@ -203,6 +203,69 @@ def test_run_elder_job_never_reraises_on_dispatch_error():
     assert out == {"persona": "code_reviewer", "result": "unhandled_error"}
 
 
+# --- self-recovery (#418) --------------------------------------------------
+
+_FULL_JOB = {
+    ad.ASYNC_JOB_KEY: ad.ELDER_REVIEW_JOB,
+    "delivery_id": "d-42",
+    "blocking": False,
+    "payload": {
+        "installation": {"id": 99},
+        "repository": {"owner": {"login": "githumps"}, "name": "grug"},
+        "pull_request": {"number": 415, "head": {"sha": "abc"}},
+    },
+}
+
+
+def test_run_elder_job_self_recovers_on_dispatch_error():
+    """#418: an unhandled Elder failure enqueues exactly ONE durable re-run
+    (persona=elder) so the review recovers with no human re-push."""
+    with (
+        patch("adapters.install_store.claim_delivery", return_value=True),
+        patch(
+            "personas.code_reviewer.dispatch.dispatch_code_review",
+            side_effect=RuntimeError("boom"),
+        ),
+        patch("rerun.enqueue_rerun") as mock_enq,
+    ):
+        out = ad.run_elder_job(_FULL_JOB)
+    assert out == {"persona": "code_reviewer", "result": "unhandled_error"}
+    mock_enq.assert_called_once_with(
+        install_id=99, repo="githumps/grug", pr_number=415, persona="elder"
+    )
+
+
+def test_self_recover_skips_when_ids_missing():
+    """#418: a slim payload lacking install/repo/pr ids skips the re-run
+    (logged) instead of enqueuing a malformed job."""
+    with (
+        patch("adapters.install_store.claim_delivery", return_value=True),
+        patch(
+            "personas.code_reviewer.dispatch.dispatch_code_review",
+            side_effect=RuntimeError("boom"),
+        ),
+        patch("rerun.enqueue_rerun") as mock_enq,
+    ):
+        out = ad.run_elder_job(_JOB)  # payload has only pull_request.number
+    assert out["result"] == "unhandled_error"
+    mock_enq.assert_not_called()
+
+
+def test_self_recover_is_best_effort_on_enqueue_failure():
+    """#418: recovery never re-raises - a failure to enqueue the re-run is
+    swallowed (the worker already degraded), so the watchdog/thread is safe."""
+    with (
+        patch("adapters.install_store.claim_delivery", return_value=True),
+        patch(
+            "personas.code_reviewer.dispatch.dispatch_code_review",
+            side_effect=RuntimeError("boom"),
+        ),
+        patch("rerun.enqueue_rerun", side_effect=RuntimeError("queue down")),
+    ):
+        out = ad.run_elder_job(_FULL_JOB)  # must not raise
+    assert out == {"persona": "code_reviewer", "result": "unhandled_error"}
+
+
 def test_two_jobs_same_delivery_dispatch_once():
     """Integrated idempotency: two run_elder_job calls for the SAME delivery
     (first claim wins, second loses) → dispatch_code_review runs exactly
