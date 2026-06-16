@@ -27,6 +27,7 @@ import os
 from typing import Any
 from urllib.parse import quote
 
+import boto3
 import httpx
 
 from adapters.install_store import get_repo_config  # type: ignore
@@ -37,6 +38,42 @@ log = logging.getLogger(f"{os.getenv('DD_SERVICE', 'grug')}.rerun")
 
 _GH_API = "https://api.github.com"
 _FETCH_TIMEOUT = 15.0
+
+_sqs = boto3.client("sqs")
+# Queue URL injected by Pulumi (same env the consumer reads). Unset in
+# local/dev/tests -> enqueue raises, surfaced as best-effort by the caller.
+_RERUN_QUEUE_URL = os.getenv("GRUG_RERUN_QUEUE_URL", "")
+SCHEMA_VERSION = 1
+
+
+def enqueue_rerun(*, install_id: int, repo: str, pr_number: int, persona: str) -> None:
+    """Send a `RerunJob` to `grug-rerun-jobs` (the webhook-side producer used by
+    Elder self-recovery, #418). Same job shape + FIFO dedup as the api producer:
+    content-dedup on `(install, repo, pr, persona)` over the 5-min window, so a
+    self-recover enqueue that races an operator re-run (or a second drop) for the
+    same PR collapses to one job. `head_sha` is NOT in the key - a re-run always
+    targets the PR's CURRENT head. Raises `RuntimeError` when the queue isn't
+    configured (the caller treats enqueue as best-effort)."""
+    if not _RERUN_QUEUE_URL:
+        raise RuntimeError("GRUG_RERUN_QUEUE_URL not configured")
+    _sqs.send_message(
+        QueueUrl=_RERUN_QUEUE_URL,
+        MessageBody=json.dumps(
+            {
+                "schema_version": SCHEMA_VERSION,
+                "install_id": install_id,
+                "repo": repo,
+                "pr_number": pr_number,
+                "persona": persona,
+            }
+        ),
+        MessageGroupId=str(install_id),
+        MessageDeduplicationId=f"{install_id}:{repo}:{pr_number}:{persona}",
+    )
+    log.info(
+        "rerun_enqueued",
+        extra={"install_id": install_id, "repo": repo, "pr": pr_number, "persona": persona},
+    )
 
 # Personas the re-run can drive today. The motivating case (the 2026-06 Elder
 # outage) is the LLM-driven code reviewer; the static TPM check doesn't error
