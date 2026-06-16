@@ -522,6 +522,30 @@ def test_envelope_non_json_returns_parse_failed(monkeypatch) -> None:
     assert "envelope" in out.error.lower() or "json" in out.error.lower()
 
 
+def test_parse_response_handles_list_shaped_content() -> None:
+    """#416: a model returning a bare JSON ARRAY of findings (not the
+    documented {"findings": [...]} object) must be parsed as the findings
+    list, NOT crash with `'list' object has no attribute 'get'` (which dropped
+    a live Elder review, delivery 831476f0)."""
+    content = '[{"rule": "x", "path": "p", "line": 1, "severity": "low"}]'
+    findings, _model, err = lc._parse_response(
+        httpx.Response(200, json=_openai_json_response(content))
+    )
+    assert err == ""
+    assert len(findings) == 1
+
+
+def test_parse_response_scalar_content_is_graceful_not_crash() -> None:
+    """#416: content that is valid JSON but neither dict nor list (a bare
+    string/number) returns a graceful parse-failure error, never an unhandled
+    exception."""
+    findings, _model, err = lc._parse_response(
+        httpx.Response(200, json=_openai_json_response('"just a string"'))
+    )
+    assert findings == ()
+    assert err  # non-empty error string, no exception raised
+
+
 # ---------------------------------------------------------------------------
 # DD LLM Obs tracing — every successful LLM call emits a trace span with
 # prompt/response/latency/tokens; failures emit a span with error metadata.
