@@ -222,6 +222,7 @@ def test_run_elder_job_self_recovers_on_dispatch_error():
     (persona=elder) so the review recovers with no human re-push."""
     with (
         patch("adapters.install_store.claim_delivery", return_value=True),
+        patch("adapters.install_store.claim_review", return_value=True),
         patch(
             "personas.code_reviewer.dispatch.dispatch_code_review",
             side_effect=RuntimeError("boom"),
@@ -256,6 +257,7 @@ def test_self_recover_is_best_effort_on_enqueue_failure():
     swallowed (the worker already degraded), so the watchdog/thread is safe."""
     with (
         patch("adapters.install_store.claim_delivery", return_value=True),
+        patch("adapters.install_store.claim_review", return_value=True),
         patch(
             "personas.code_reviewer.dispatch.dispatch_code_review",
             side_effect=RuntimeError("boom"),
@@ -402,3 +404,157 @@ def test_claim_delivery_db_error_propagates(monkeypatch):
         pass
     else:
         raise AssertionError("expected psycopg.Error to propagate")
+
+
+# --- per-head-SHA idempotency (#397) ---------------------------------------
+# run_elder_job gates the review on claim_review (head SHA) IN ADDITION to
+# claim_delivery (per webhook delivery). claim_delivery catches an exact
+# redelivery; claim_review catches a same-SHA re-trigger across DIFFERENT
+# deliveries (a non-push `edited`/`ready_for_review` event), so unchanged
+# code is not re-reviewed while every NEW head SHA still reviews. The
+# claim_review win-once/expired-takeover behavior lives in the real-PG suite
+# (test_pg_stores.py); these assert the run_elder_job GATE wiring.
+
+_SHA_JOB = {
+    ad.ASYNC_JOB_KEY: ad.ELDER_REVIEW_JOB,
+    "delivery_id": "d-100",
+    "blocking": False,
+    "payload": {
+        "installation": {"id": 7},
+        "repository": {"owner": {"login": "githumps"}, "name": "grug"},
+        "pull_request": {"number": 12, "head": {"sha": "sha-aaa"}},
+    },
+}
+
+
+def test_run_elder_job_skips_when_head_sha_already_reviewed():
+    """#397 AC2: a same-head-SHA re-trigger where claim_delivery wins (new
+    delivery id) but claim_review LOSES → SKIP, dispatch NOT called (no
+    duplicate review of unchanged code on `edited`/`ready_for_review`)."""
+    with (
+        patch("adapters.install_store.claim_delivery", return_value=True),
+        patch("adapters.install_store.claim_review", return_value=False),
+        patch("personas.code_reviewer.dispatch.dispatch_code_review") as mock_d,
+    ):
+        out = ad.run_elder_job(_SHA_JOB)
+    mock_d.assert_not_called()
+    assert out == {"status": "skipped", "reason": "duplicate_head_sha"}
+
+
+def test_run_elder_job_reviews_when_head_sha_unclaimed():
+    """#397 AC1: a fresh head SHA (claim_review won) → dispatch runs, claimed
+    with the exact (install, repo, pr, persona, head_sha) tuple."""
+    with (
+        patch("adapters.install_store.claim_delivery", return_value=True),
+        patch("adapters.install_store.claim_review", return_value=True) as mock_c,
+        patch(
+            "personas.code_reviewer.dispatch.dispatch_code_review",
+            return_value={"persona": "code_reviewer", "result": "pass"},
+        ) as mock_d,
+    ):
+        out = ad.run_elder_job(_SHA_JOB)
+    mock_d.assert_called_once()
+    mock_c.assert_called_once_with(
+        install_id=7, repo="githumps/grug", pr_number=12,
+        persona="code_reviewer", head_sha="sha-aaa",
+    )
+    assert out == {"persona": "code_reviewer", "result": "pass"}
+
+
+def test_two_commits_distinct_sha_both_review():
+    """#397 AC1: two pushes with DIFFERENT head SHAs each produce a fresh
+    review (claim_review wins for each distinct SHA — no silent skip)."""
+    job_b = {
+        **_SHA_JOB, "delivery_id": "d-b",
+        "payload": {
+            **_SHA_JOB["payload"],
+            "pull_request": {"number": 12, "head": {"sha": "sha-bbb"}},
+        },
+    }
+    with (
+        patch("adapters.install_store.claim_delivery", return_value=True),
+        patch("adapters.install_store.claim_review", return_value=True),
+        patch(
+            "personas.code_reviewer.dispatch.dispatch_code_review",
+            return_value={"persona": "code_reviewer", "result": "pass"},
+        ) as mock_d,
+    ):
+        ad.run_elder_job(_SHA_JOB)
+        ad.run_elder_job(job_b)
+    assert mock_d.call_count == 2
+
+
+def test_same_sha_two_deliveries_dispatch_once():
+    """#397 AC2 integrated: the SAME head SHA across two DIFFERENT deliveries
+    (e.g. a push then an `edited`) — claim_delivery wins both (distinct ids)
+    but claim_review wins once → dispatch runs exactly once."""
+    with (
+        patch("adapters.install_store.claim_delivery", return_value=True),
+        patch("adapters.install_store.claim_review", side_effect=[True, False]),
+        patch(
+            "personas.code_reviewer.dispatch.dispatch_code_review",
+            return_value={"persona": "code_reviewer", "result": "pass"},
+        ) as mock_d,
+    ):
+        first = ad.run_elder_job(_SHA_JOB)
+        second = ad.run_elder_job({**_SHA_JOB, "delivery_id": "d-101"})
+    assert mock_d.call_count == 1
+    assert first == {"persona": "code_reviewer", "result": "pass"}
+    assert second == {"status": "skipped", "reason": "duplicate_head_sha"}
+
+
+def test_run_elder_job_fails_open_when_review_claim_errors():
+    """#397: a claim_review DB error must NOT drop the review — fail OPEN
+    (run it), the same best-effort contract as claim_delivery."""
+    with (
+        patch("adapters.install_store.claim_delivery", return_value=True),
+        patch(
+            "adapters.install_store.claim_review",
+            side_effect=RuntimeError("db down"),
+        ),
+        patch(
+            "personas.code_reviewer.dispatch.dispatch_code_review",
+            return_value={"persona": "code_reviewer", "result": "pass"},
+        ) as mock_d,
+    ):
+        out = ad.run_elder_job(_SHA_JOB)
+    mock_d.assert_called_once()
+    assert out == {"persona": "code_reviewer", "result": "pass"}
+
+
+def test_run_elder_job_engaged_gate_preserves_blocking():
+    """#397 AC3: with the head-SHA gate ENGAGED (claim_review won, real ids +
+    head SHA present), the `blocking` flag still flows through to
+    dispatch_code_review unchanged — the new gate must not regress the
+    advisory/blocking publish path."""
+    job = {**_SHA_JOB, "blocking": True}
+    with (
+        patch("adapters.install_store.claim_delivery", return_value=True),
+        patch("adapters.install_store.claim_review", return_value=True),
+        patch(
+            "personas.code_reviewer.dispatch.dispatch_code_review",
+            return_value={"persona": "code_reviewer", "result": "fail"},
+        ) as mock_d,
+    ):
+        ad.run_elder_job(job)
+    assert mock_d.call_args.kwargs["blocking"] is True
+
+
+def test_run_elder_job_no_head_sha_falls_through_to_review():
+    """#397: a payload missing head SHA does not engage the per-SHA gate
+    (fail open) — claim_review is never called and the review still runs."""
+    no_sha = {
+        ad.ASYNC_JOB_KEY: ad.ELDER_REVIEW_JOB, "delivery_id": "d-x",
+        "blocking": False, "payload": {"pull_request": {"number": 5}},
+    }
+    with (
+        patch("adapters.install_store.claim_delivery", return_value=True),
+        patch("adapters.install_store.claim_review") as mock_c,
+        patch(
+            "personas.code_reviewer.dispatch.dispatch_code_review",
+            return_value={"persona": "code_reviewer", "result": "pass"},
+        ) as mock_d,
+    ):
+        ad.run_elder_job(no_sha)
+    mock_c.assert_not_called()
+    mock_d.assert_called_once()

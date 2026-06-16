@@ -223,6 +223,37 @@ def test_claim_delivery_win_once_and_expired_takeover(pg):
     assert store.claim_delivery(did) is True
 
 
+def test_claim_review_per_head_sha_win_once_and_distinct_sha(pg):
+    """#397: claim_review wins once per (install, repo, pr, persona, head_sha).
+    The SAME head SHA loses on a re-trigger (idempotent — no duplicate review
+    on `edited`/`ready_for_review`); a DIFFERENT head SHA wins (every new
+    commit reviews); a missing head SHA fails OPEN; an expired claim is free."""
+    from adapters import pg_install_store as store
+
+    base = dict(
+        install_id=7, repo="githumps/grug", pr_number=12, persona="code_reviewer",
+    )
+    assert store.claim_review(**base, head_sha="sha-aaa") is True
+    assert store.claim_review(**base, head_sha="sha-aaa") is False  # same SHA loses
+    assert store.claim_review(**base, head_sha="sha-bbb") is True  # new SHA wins
+    assert store.claim_review(**base, head_sha="") is True  # fails OPEN
+    # Keyed on PR too: a different PR at the same SHA is a distinct claim.
+    assert store.claim_review(
+        install_id=7, repo="githumps/grug", pr_number=99,
+        persona="code_reviewer", head_sha="sha-aaa",
+    ) is True
+
+    # Expire the sha-aaa claim -> next claim of that SHA must WIN (expired
+    # reads as free, matching claim_delivery / DDB-TTL semantics).
+    with store.get_pool().connection() as conn:
+        conn.execute(
+            "UPDATE grug_kv SET ttl = EXTRACT(EPOCH FROM now())::bigint - 10 "
+            "WHERE pk = %s",
+            ("REVIEW#7:githumps/grug:12:code_reviewer:sha-aaa",),
+        )
+    assert store.claim_review(**base, head_sha="sha-aaa") is True
+
+
 def test_claim_delivery_concurrent_exactly_one_winner(pg):
     """The reason this suite needs REAL Postgres: N racing claimants,
     exactly one True."""
