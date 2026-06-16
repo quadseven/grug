@@ -43,7 +43,9 @@ Grug is AGPL-3.0. Deploy your own instance against your own AWS account + Cloudf
 ```
 # roughly
 aws ssm put-parameter ...   # pre-load App secrets
-pulumi up                   # deploy the cave
+pulumi up                   # provision AWS infra (SSM refs, SQS, KMS, DD monitors)
+# provision Postgres (grug_kv on CNPG) + stand up a Cloudflare tunnel
+# push to main → deploy.k8s.yml builds the images + applies k8s/ to your cluster
 # point GitHub App webhook → webhook.<your-domain>/webhook/github
 # done. Grug guard now.
 ```
@@ -84,22 +86,25 @@ Weekly issue-grooming sweep:
 ## Architecture
 
 ```
-┌─────────────────────────────────────────────────────┐
-│                    grug.lol                         │
-│  ┌──────────┐  ┌──────────┐  ┌──────────────────┐  │
-│  │  web/    │  │ webhook/ │  │     api/         │  │
-│  │ React+   │  │ FastAPI  │  │  FastAPI Lambda  │  │
-│  │ Vite SPA │  │ Lambda   │  │  (OAuth, /me,    │  │
-│  │ CF Pages │  │ (HMAC →  │  │  /installations) │  │
-│  │          │  │ persona  │  │                  │  │
-│  │          │  │ dispatch)│  │                  │  │
-│  └──────────┘  └──────────┘  └──────────────────┘  │
-│                                                     │
-│  ┌──────────────────────────────────────────────┐   │
-│  │ infra/pulumi/                                │   │
-│  │ AWS Lambda + DDB + KMS + CF DNS/Workers + DD │   │
-│  └──────────────────────────────────────────────┘   │
-└─────────────────────────────────────────────────────┘
+┌──────────────────────────────────────────────────────┐
+│                    grug.lol                            │
+│  ┌──────────┐  ┌──────────┐  ┌──────────────────┐      │
+│  │  web/    │  │ webhook/ │  │     api/         │      │
+│  │ React+   │  │ FastAPI  │  │  FastAPI         │      │
+│  │ Vite SPA │  │ pod      │  │  (OAuth, /me,    │      │
+│  │ CF Pages │  │ (HMAC →  │  │  /installations) │      │
+│  │          │  │ persona  │  │   pod            │      │
+│  │          │  │ dispatch)│  │                  │      │
+│  └──────────┘  └──────────┘  └──────────────────┘      │
+│       webhook + api on Kubernetes (OKE),               │
+│       behind a Cloudflare tunnel; + grug-consumer       │
+│       (SQS) and grug-poller / grug-key-rotator jobs    │
+│                                                        │
+│  ┌──────────────────────────────────────────────┐     │
+│  │ infra/pulumi/  +  k8s/                        │     │
+│  │ Postgres (CNPG) + SQS + KMS + SSM + CF + DD   │     │
+│  └──────────────────────────────────────────────┘     │
+└──────────────────────────────────────────────────────┘
 ```
 
 PRD #21 + slice issues #22-#34 track v1.
@@ -117,6 +122,7 @@ PR body must have `## Why`, `## Acceptance criteria`, `## Out of scope`, `Size:`
 | [`docs/RUNBOOK.md`](docs/RUNBOOK.md) | Operations (first deploy, secret rotation, tear-down + rebuild) |
 | [`docs/SELF_HOST.md`](docs/SELF_HOST.md) | Step-by-step self-host setup |
 | [`docs/HITL_PREREQUISITES.md`](docs/HITL_PREREQUISITES.md) | One-time GitHub App registration walkthrough |
+| [`docs/NETWORK-TOPOLOGY.md`](docs/NETWORK-TOPOLOGY.md) | k8s/tunnel/CNPG/SQS topology, request flows, trust boundaries |
 | [`CONTEXT.md`](CONTEXT.md) | Domain glossary (every term you'll see in the code) |
 | [`docs/adr/`](docs/adr/) | Architecture decision records |
 

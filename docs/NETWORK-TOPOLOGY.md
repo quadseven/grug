@@ -7,7 +7,7 @@ Mermaid's flowchart auto-layout produces overlapping edges on dense topologies �
 External SaaS the stack depends on (flat dependencies, not topology):
 
 - **Cloudflare Pages** — `grug-web` project at apex `grug.lol` (static landing + React SPA). Unchanged by the cutover.
-- **Cloudflare DNS + tunnel** — proxied records for `api.grug.lol` + `webhook.grug.lol` front a `cloudflared` tunnel that egresses to the in-cluster Services. (The legacy `*-host-rewrite` Workers + Lambda Function URLs are retired.)
+- **Cloudflare DNS + Worker + tunnel** — proxied records for `api.grug.lol` + `webhook.grug.lol` hit the per-service `*-host-rewrite` Worker (injects `X-Grug-CF-Secret`, rewrites `Host` to the in-cluster upstream read from SSM `/grug/{api,webhook}-upstream-host`), then a `cloudflared` tunnel transports to the in-cluster Services. The Lambda Function URLs the Workers used to target are retired; the Workers themselves remain the auth-injection point (rollback = delete the SSM override → Workers revert to the Function URL).
 - **AWS us-east-1** — SSM Parameter Store (secrets), SQS FIFO (async jobs), KMS CMK (OAuth-token envelope encryption), S3 (cave diff bucket). Lambda, Lambda Function URLs, and ECR are **gone**; the `grug-main` DynamoDB table still exists in Pulumi state but is **no longer the store** (the store is Postgres) — removing it is a separate destructive decision.
 - **Datadog US1** — APM + Logs + LLM Observability + RUM + Monitors.
 - **GitHub** — App registration (webhook source + OAuth identity provider) + Actions OIDC (deploys).
@@ -21,10 +21,10 @@ External SaaS the stack depends on (flat dependencies, not topology):
 | Surface | DNS | CF layer | Origin | Purpose |
 |---|---|---|---|---|
 | **Landing + SPA** | `grug.lol` | CF Pages (`grug-web` project, static assets + `_redirects`) | — | Marketing landing (static `index.html`) + React SPA at `/app.html` for `/signin`, `/dashboard`, `/admin` |
-| **User API** | `api.grug.lol` | CF DNS proxied → CF tunnel (`cloudflared`) | k8s Service `grug-api:8080` → `grug-api` pod | OAuth callback, dashboard reads/writes, repo config CRUD, admin endpoints |
-| **GitHub webhook** | `webhook.grug.lol` | CF DNS proxied → CF tunnel (`cloudflared`) | k8s Service `grug-webhook:8080` → `grug-webhook` pod | GitHub App webhook receiver — installations, PRs, check runs |
+| **User API** | `api.grug.lol` | CF DNS proxied → `grug-api-host-rewrite` Worker → CF tunnel (`cloudflared`) | k8s Service `grug-api:8080` → `grug-api` pod | OAuth callback, dashboard reads/writes, repo config CRUD, admin endpoints |
+| **GitHub webhook** | `webhook.grug.lol` | CF DNS proxied → `grug-webhook-host-rewrite` Worker → CF tunnel (`cloudflared`) | k8s Service `grug-webhook:8080` → `grug-webhook` pod | GitHub App webhook receiver — installations, PRs, check runs |
 
-The tunnel is the only inbound path; the NetworkPolicy (Section G) denies all other ingress to the pods. The CF shared-secret + HMAC/session layers (Section G) are the request-auth boundary regardless of the transport.
+The Worker + tunnel are the only inbound path; the NetworkPolicy (Section H) denies all other ingress to the pods. The CF shared-secret + HMAC/session layers (Section H) are the request-auth boundary regardless of the transport.
 
 ---
 
@@ -103,6 +103,7 @@ sequenceDiagram
     autonumber
     participant SPA as React SPA<br/>(in browser)
     participant CFDNS as CF DNS<br/>api.grug.lol (proxied)
+    participant Worker as grug-api-host-rewrite<br/>CF Worker
     participant Tunnel as CF tunnel<br/>cloudflared
     participant SVC as k8s Service<br/>grug-api:8080
     participant API as grug-api pod<br/>FastAPI / uvicorn
@@ -111,8 +112,9 @@ sequenceDiagram
     participant KMS
 
     SPA->>CFDNS: GET /api/v1/dashboard (cookie)
-    CFDNS->>Tunnel: route api.grug.lol/*
-    Tunnel->>SVC: forward (adds X-Grug-CF-Secret)
+    CFDNS->>Worker: route api.grug.lol/*
+    Worker->>Tunnel: rewrite Host to upstream + inject X-Grug-CF-Secret
+    Tunnel->>SVC: transport to in-cluster Service
     SVC->>API: proxy to a ready pod
     API->>API: cf_auth.py validates X-Grug-CF-Secret (else 401)
     API->>SSM: GetParameter /grug/* (cached after first read)
@@ -138,6 +140,7 @@ sequenceDiagram
     autonumber
     participant GH as GitHub<br/>App webhook emitter
     participant CFDNS as CF DNS<br/>webhook.grug.lol (proxied)
+    participant Worker as grug-webhook-host-rewrite<br/>CF Worker
     participant Tunnel as CF tunnel<br/>cloudflared
     participant SVC as k8s Service<br/>grug-webhook:8080
     participant WH as grug-webhook pod
@@ -146,8 +149,9 @@ sequenceDiagram
     participant SQS as SQS grug-rerun-jobs
 
     GH->>CFDNS: POST /webhook/github<br/>X-Hub-Signature-256: sha256=...
-    CFDNS->>Tunnel: route webhook.grug.lol/*
-    Tunnel->>SVC: forward (adds X-Grug-CF-Secret)
+    CFDNS->>Worker: route webhook.grug.lol/*
+    Worker->>Tunnel: rewrite Host to upstream + inject X-Grug-CF-Secret
+    Tunnel->>SVC: transport to in-cluster Service
     SVC->>WH: proxy to a ready pod
     WH->>WH: cf_auth + HMAC-SHA256 verify body
     alt signature valid
@@ -244,7 +248,7 @@ sequenceDiagram
 | Boundary | Outside | Inside | Mechanism |
 |---|---|---|---|
 | **Public → CF** | Internet | Cloudflare edge | TLS termination + WAF / bot mgmt at CF tier |
-| **CF → cluster** | CF tunnel | k8s Service `:8080` | `cloudflared` is the only inbound path (NetworkPolicy denies the rest). The tunnel injects `X-Grug-CF-Secret`; `services/{api,webhook}/cf_auth.py` validates it via `hmac.compare_digest` on every non-`/livez` request — a request that bypasses the tunnel has no valid header and gets 401. Secret in SSM `/grug/cf-shared-secret`; DD monitor on mismatch spikes |
+| **CF → cluster** | CF Worker + tunnel | k8s Service `:8080` | The `*-host-rewrite` Worker injects `X-Grug-CF-Secret` (from its `GRUG_CF_SECRET` binding) and rewrites `Host` to the in-cluster upstream; a `cloudflared` tunnel transports it to the Service (the only inbound path — NetworkPolicy denies the rest). `services/{api,webhook}/cf_auth.py` validates the header via `hmac.compare_digest` on every non-`/livez` request — a request that bypasses the Worker has no valid header and gets 401. Secret in SSM `/grug/cf-shared-secret`; DD monitor on mismatch spikes |
 | **Pod → AWS** | k8s Secret (plaintext to the process) | SSM / SQS / KMS / S3 | The `grug-k8s-pod` IAM credential in `grug-secrets`, rotated every 12h by the key-rotator CronJob. Pod reads app secrets from SSM at runtime (not baked into the image) |
 | **api pod → user OAuth tokens** | Postgres encrypted blob | plaintext access/refresh token | KMS envelope decrypt (`grug-tokens` CMK). Only the api path holds `kms:Decrypt`; the webhook uses the GitHub App JWT |
 | **Webhook payload** | GitHub | grug-webhook handler | HMAC-SHA256 verify against `/grug/github-app-webhook-secret`; 401 on mismatch |
@@ -299,7 +303,7 @@ flowchart LR
 
 | Component | Why load-bearing |
 |---|---|
-| CF tunnel (`cloudflared`) | The ONLY inbound path to `api`/`webhook`. Tunnel down = both public surfaces 5xx (the NetworkPolicy blocks every other ingress). Runs in private infra, not this repo |
+| CF `*-host-rewrite` Workers + tunnel (`cloudflared`) | The ONLY inbound path to `api`/`webhook`. The Workers are the auth-injection point (`X-Grug-CF-Secret`) + Host-rewrite; the tunnel is the transport. Either down = both public surfaces 5xx (the NetworkPolicy blocks every other ingress). Workers managed out-of-band via `infra/cloudflare/deploy.sh` (pulumi-cloudflare WorkerScript has idempotency bugs); the tunnel runs in private infra |
 | `grug-tokens` KMS CMK | Envelope-encrypts every user OAuth/credential blob; the api OAuth callback 500s without `kms:Decrypt` on it (`GRUG_KMS_CMK_ARN` must be in the pod secret — its omission is exactly what broke first-sign-in once) |
 | Postgres `grug_kv` (CNPG) | The store. Unreachable on 5432 = `/readyz` fails (#404), rollouts stall on the last-good pod, every dashboard/webhook read errors |
 | in-cluster registry + `registry-pull` Secret | Every pod pulls its image from here. A bad/expired pull credential = `ImagePullBackOff` cluster-wide for grug |
@@ -316,7 +320,7 @@ See `docs/SELF_HOST.md` + `docs/HITL_PREREQUISITES.md` for the full operator run
 1. **Manual SSM pre-load** — every `/grug/*` parameter the pods read at runtime (App id/key/secret, OAuth client id+secret, webhook secret, session-signing secret, CF shared secret, KMS CMK ARN, database URL, k8s-pod + rotator AWS keys) plus `/infra/llm/*` LLM keys and `/shared/datadog-*` keys.
 2. **`pulumi up`** (`iac.deploy.yml`) — creates the AWS-side infra: SSM references, KMS CMK, OIDC role, the `grug-k8s-pod` + rotator IAM users, SQS FIFO queues + DLQs, S3 cave bucket, DD monitors/dashboard/RUM app. (DynamoDB `grug-main` still exists here as legacy.)
 3. **Provision Postgres** — the `grug_kv` table on the shared CNPG cluster; put its DSN in `/grug/database-url`.
-4. **Stand up the CF tunnel** — `cloudflared` routing `api.grug.lol` + `webhook.grug.lol` to the in-cluster Services; set the matching `/grug/cf-shared-secret`.
+4. **Stand up the CF edge** — a `cloudflared` tunnel to the in-cluster Services; set `/grug/{api,webhook}-upstream-host` to the tunnel hostnames and `/grug/cf-shared-secret`; deploy the `*-host-rewrite` Workers via `infra/cloudflare/deploy.sh` (binds the routes, injects the secret, points upstream at the tunnel host).
 5. **First `deploy.k8s.yml` run** — builds + pushes the arm64 images, joins the tailnet, seeds the three Secrets, applies `k8s/` by digest, waits on rollout + the poller smoke job.
 6. **First `web.deploy.yml` run** — builds + `wrangler pages deploy` the `grug-web` CF Pages project (with RUM ids from SSM).
 7. **GitHub App registration** — create/point the App: webhook URL `https://webhook.<domain>/webhook/github`, setup URL `https://<domain>/dashboard`; copy the App id + private key into SSM (step 1).

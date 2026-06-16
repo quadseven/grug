@@ -18,7 +18,7 @@ npm run dev      # http://localhost:5173
 ```
 
 `VITE_API_BASE` defaults to `https://api.grug.lol`. To talk to a local
-api Lambda, set `VITE_API_BASE=http://localhost:8080` in `.env.local`.
+api service, set `VITE_API_BASE=http://localhost:8080` in `.env.local`.
 
 ## Build + deploy
 
