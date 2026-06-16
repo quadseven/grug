@@ -550,6 +550,66 @@ def claim_delivery(delivery_id: str) -> bool:
     return row is not None
 
 
+_REVIEW_CLAIM_TTL_DAYS = 30
+
+
+def _review_pk(
+    install_id: int, repo: str, pr_number: int, persona: str, head_sha: str
+) -> str:
+    return f"REVIEW#{install_id}:{repo}:{pr_number}:{persona}:{head_sha}"
+
+
+def claim_review(
+    *,
+    install_id: int,
+    repo: str,
+    pr_number: int,
+    persona: str,
+    head_sha: str,
+) -> bool:
+    """Win-once idempotency claim keyed on the EXACT head SHA (#397). True =
+    this caller won (run the review); False = a review of THIS head SHA was
+    already claimed -> SKIP. Distinct from claim_delivery (per webhook
+    delivery): head-SHA keying dedupes EVERY same-SHA re-trigger - a
+    redelivery AND a non-push event (`edited` on the PR body,
+    `ready_for_review`) that carries the same head SHA - so unchanged code is
+    not re-reviewed, while every NEW head SHA still wins a fresh review.
+
+    Atomic single statement with the SAME TTL-takeover semantics as
+    claim_delivery (an expired claim reads as free). Fails OPEN on a missing
+    head_sha (a possible double-review beats a silently-skipped one). The
+    claim is on ATTEMPT, not completion: an `errored` review heals via the
+    rerun queue (#305/#418) and an explicit `/rerun` (#87) both re-run
+    through `dispatch_code_review` DIRECTLY, bypassing this webhook-path gate,
+    so neither idempotency layer wedges a legitimate re-review. Any other
+    database error propagates - run_elder_job's fail-open catch runs the
+    review anyway, never swallowing into a false 'claimed'."""
+    if not head_sha:
+        return True
+    pg_base.maybe_purge_expired()
+    ttl = int(
+        datetime.now(timezone.utc).timestamp() + _REVIEW_CLAIM_TTL_DAYS * 86400
+    )
+    with get_pool().connection() as conn:
+        row = conn.execute(
+            """
+            INSERT INTO grug_kv (pk, sk, data, ttl)
+            VALUES (%(pk)s, 'META', %(data)s, %(ttl)s)
+            ON CONFLICT (pk, sk) DO UPDATE
+                SET data = %(data)s, ttl = %(ttl)s
+                WHERE grug_kv.ttl IS NOT NULL
+                  AND grug_kv.ttl <= EXTRACT(EPOCH FROM now())
+            RETURNING pk
+            """,
+            {
+                "pk": _review_pk(install_id, repo, pr_number, persona, head_sha),
+                "data": Jsonb({"ttl": ttl}),
+                "ttl": ttl,
+            },
+        ).fetchone()
+    return row is not None
+
+
 def list_comment_records(install_id: int) -> list[CommentRecord]:
     with get_pool().connection() as conn:
         rows = conn.execute(

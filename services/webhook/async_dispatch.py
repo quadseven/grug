@@ -168,9 +168,13 @@ def _spawn_local_elder(job: dict[str, Any]) -> bool:
 def run_elder_job(event: dict[str, Any]) -> dict[str, str]:
     """Worker entry for a self-invoked Elder review job.
 
-    Idempotent on ``delivery_id`` (`install_store.claim_delivery`): a
-    GitHub redelivery or an AWS async-invoke retry of the SAME delivery
-    claims-and-skips, so the review is never double-posted.
+    Two-layer idempotency so the review is never double-posted:
+    ``delivery_id`` (`install_store.claim_delivery`) skips a GitHub
+    redelivery / async-invoke retry of the SAME delivery, and the EXACT
+    head SHA (`install_store.claim_review`, #397) skips a same-SHA
+    re-trigger across DIFFERENT deliveries - a non-push event (`edited`
+    on the PR body, `ready_for_review`) that carries an already-reviewed
+    head SHA. Every NEW head SHA still wins a fresh review.
 
     NEVER re-raises: an unhandled error here would make AWS retry the
     async invocation (a retry storm), and we already have our own
@@ -200,6 +204,41 @@ def run_elder_job(event: dict[str, Any]) -> dict[str, str]:
         )
 
     payload = event.get("payload") or {}
+
+    # Per-head-SHA idempotency (#397): claim_delivery (above) only catches an
+    # exact-delivery retry; this catches a same-head-SHA re-trigger across
+    # DIFFERENT deliveries (a redelivery, or a non-push `edited` /
+    # `ready_for_review` event) so unchanged code is not re-reviewed - while
+    # every NEW head SHA still wins a fresh review. Best-effort: a missing id
+    # / head SHA, or a claim DB error, falls through to running the review
+    # (fail OPEN - a possible double-review beats a silent skip).
+    try:
+        from adapters.install_store import claim_review
+
+        install_id, repo, pr_number = _pr_ids(payload)
+        head_sha = ((payload.get("pull_request") or {}).get("head") or {}).get("sha")
+        if install_id and repo and pr_number and head_sha:
+            if not claim_review(
+                install_id=install_id,
+                repo=repo,
+                pr_number=pr_number,
+                persona="code_reviewer",
+                head_sha=head_sha,
+            ):
+                log.info(
+                    "elder_job_duplicate_sha_skipped",
+                    extra={
+                        "delivery_id": delivery_id, "repo": repo,
+                        "pr": pr_number, "head_sha": head_sha,
+                    },
+                )
+                return {"status": "skipped", "reason": "duplicate_head_sha"}
+    except Exception as e:  # noqa: BLE001 — claim is best-effort; degrade to running
+        log.warning(
+            "elder_job_review_claim_failed_running_anyway",
+            extra={"delivery_id": delivery_id, "kind": type(e).__name__},
+        )
+
     blocking = bool(event.get("blocking", False))
     try:
         from personas.code_reviewer.dispatch import dispatch_code_review
