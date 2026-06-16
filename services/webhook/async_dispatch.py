@@ -264,7 +264,10 @@ def _self_recover_review(payload: dict[str, Any], delivery_id: str) -> None:
             extra={"delivery_id": delivery_id, "repo": repo, "pr": pr_number},
         )
     except Exception as e:  # noqa: BLE001 — recovery is best-effort, never raises
+        # exc_info for symmetry with elder_job_unhandled: if recovery is
+        # systematically broken (queue misconfig), the stack speeds triage.
         log.error(
             "elder_self_recover_failed",
             extra={"delivery_id": delivery_id, "kind": type(e).__name__},
+            exc_info=True,
         )
