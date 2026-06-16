@@ -32,6 +32,7 @@ import logging
 import os
 import signal
 import threading
+import time
 from dataclasses import dataclass
 from typing import Any, Callable
 
@@ -197,6 +198,10 @@ def _warm_trace_writer() -> None:
         log.warning("trace_writer_warmup_failed", exc_info=True)
 
 
+_last_flush_warn = 0.0
+_FLUSH_WARN_INTERVAL_S = 60.0
+
+
 def _flush_traces() -> None:
     """Flush buffered APM spans from the MAIN thread (#412).
 
@@ -208,14 +213,31 @@ def _flush_traces() -> None:
     `tracer.flush()` on the MAIN thread (the path PROVEN to deliver - the
     startup span arrives) drains the shared span buffer each watchdog tick, so
     buffered worker-thread spans get delivered regardless of whatever stalls
-    the long-running periodic writer in the threaded consumer. Fail-safe:
-    telemetry must never break the consumer."""
+    the long-running periodic writer in the threaded consumer.
+
+    `tracer.flush()` is SYNCHRONOUS: when the trace agent is unreachable it
+    blocks for the ddtrace agent timeout (measured ~1.5s; pinned via
+    DD_TRACE_AGENT_TIMEOUT_SECONDS in the deploy), so it adds at most that to
+    the watchdog's ~5s dead-thread detection cadence - bounded and tolerable.
+
+    Fail-safe: telemetry must never break the consumer hot loop. ddtrace absent
+    (tests) is expected -> debug; a real recurring flush failure means we are
+    back in the zero-spans state #412 exists to kill, so surface it at WARNING -
+    but rate-limited (this runs every ~5s) so a sustained agent outage logs
+    ~once/min, not 12x/min and not never."""
+    global _last_flush_warn
     try:
         import ddtrace
-
+    except ImportError:
+        log.debug("trace_flush_skipped_no_ddtrace")
+        return
+    try:
         ddtrace.tracer.flush()
     except Exception:  # noqa: BLE001 - telemetry is never worth crashing on
-        log.debug("trace_flush_skipped", exc_info=True)
+        now = time.monotonic()
+        if now - _last_flush_warn > _FLUSH_WARN_INTERVAL_S:
+            log.warning("trace_flush_failed", exc_info=True)
+            _last_flush_warn = now
 
 
 def _startup_check() -> None:
