@@ -522,6 +522,24 @@ def test_run_elder_job_fails_open_when_review_claim_errors():
     assert out == {"persona": "code_reviewer", "result": "pass"}
 
 
+def test_run_elder_job_engaged_gate_preserves_blocking():
+    """#397 AC3: with the head-SHA gate ENGAGED (claim_review won, real ids +
+    head SHA present), the `blocking` flag still flows through to
+    dispatch_code_review unchanged — the new gate must not regress the
+    advisory/blocking publish path."""
+    job = {**_SHA_JOB, "blocking": True}
+    with (
+        patch("adapters.install_store.claim_delivery", return_value=True),
+        patch("adapters.install_store.claim_review", return_value=True),
+        patch(
+            "personas.code_reviewer.dispatch.dispatch_code_review",
+            return_value={"persona": "code_reviewer", "result": "fail"},
+        ) as mock_d,
+    ):
+        ad.run_elder_job(job)
+    assert mock_d.call_args.kwargs["blocking"] is True
+
+
 def test_run_elder_job_no_head_sha_falls_through_to_review():
     """#397: a payload missing head SHA does not engage the per-SHA gate
     (fail open) — claim_review is never called and the review still runs."""
