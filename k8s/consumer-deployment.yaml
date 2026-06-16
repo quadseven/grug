@@ -52,6 +52,11 @@ spec:
             - name: DD_AGENT_HOST
               valueFrom: {fieldRef: {fieldPath: status.hostIP}}
             - {name: DD_LOGS_INJECTION, value: "true"}
+            # Bound how long the main-thread tracer.flush() (#412) can block
+            # when the trace agent is unreachable, so it can't stall the
+            # dead-thread watchdog beyond ~2s (measured default ~1.5s; pin it
+            # so a ddtrace default change can't regress watchdog responsiveness).
+            - {name: DD_TRACE_AGENT_TIMEOUT_SECONDS, value: "2"}
             - {name: GRUG_ENV, value: prod}
             - {name: GITHUB_APP_ID_SSM, value: /grug/github-app-id}
             - {name: GITHUB_APP_PRIVATE_KEY_SSM, value: /grug/github-app-private-key}
