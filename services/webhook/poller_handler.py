@@ -1,15 +1,16 @@
-"""Scheduled reaction-poll Lambda entry point (#247b).
+"""Scheduled reaction-poll entry point (#247b).
 
-An EventBridge cron invokes this every ~15 min (NOT the webhook HTTP path —
-there's no FastAPI/Mangum, no signature check; the trigger is IAM-gated
-EventBridge). Per allowlisted install it polls 👍/👎 reactions on Grug review
-comments and submits `human_verdict` DD LLM Obs evals — the human ground-truth
-that calibrates the LLM judge.
+The `grug-poller` Kubernetes CronJob invokes this every ~15 min (NOT the
+webhook HTTP path — there's no FastAPI/Mangum, no signature check; it runs
+as a batch job). Per allowlisted install it polls 👍/👎 reactions on Grug
+review comments and submits `human_verdict` DD LLM Obs evals — the human
+ground-truth that calibrates the LLM judge.
 
 Reuses the webhook container image (same `reactions` / `install_store` /
-`llm_client` / `github_app_auth` code); the `scheduled_lambda` Pulumi
-component (#261) points `DD_LAMBDA_HANDLER` at `poller_handler.handler` (the
-image CMD stays the `datadog_lambda` wrapper, which dispatches to it).
+`llm_client` / `github_app_auth` code); the CronJob runs
+`ddtrace-run python -c "from poller_handler import handler; handler({}, None)"`
+(the `(event, context)` signature is a legacy of the EventBridge-scheduled
+Lambda this CronJob replaced at the #354 cutover).
 
 Best-effort by construction: one install's failure (GH 5xx, token error) logs
 and continues — a single bad install must never abort the whole poll cycle.
