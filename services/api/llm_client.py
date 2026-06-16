@@ -543,7 +543,17 @@ def _parse_response(
         parsed = json.loads(content)
     except json.JSONDecodeError:
         return (), model_name, "llm returned non-json — parse failed"
-    raw_findings = parsed.get("findings", [])
+    # Models sometimes return a bare JSON array of findings instead of the
+    # documented {"findings": [...]} object (#416 — Poolside did this and the
+    # old `parsed.get(...)` crashed with `'list' object has no attribute 'get'`,
+    # dropping a live review). Accept both shapes; anything else is a graceful
+    # parse failure, never an unhandled crash.
+    if isinstance(parsed, list):
+        raw_findings = parsed
+    elif isinstance(parsed, dict):
+        raw_findings = parsed.get("findings", [])
+    else:
+        return (), model_name, "llm content is neither object nor array"
     if not isinstance(raw_findings, list):
         return (), model_name, "findings field is not a list"
     coerced: list[Finding] = []
