@@ -23,10 +23,11 @@ import pulumi_random as random
 
 @dataclass(frozen=True, slots=True)
 class CfSharedSecretBundle:
-    """`ssm_parameter` duck-types as `GetParameterResult` for
-    lambda_service.extra_ssm_secrets (both expose `.arn` + `.name`).
-    `secret_value` is the raw random string, marked secret — surfaced so
-    sibling slice #232's deploy.sh can publish it as a CF Worker binding.
+    """`ssm_parameter` duck-types as `GetParameterResult` (exposes `.arn`
+    + `.name`), so it can be passed wherever an SSM secret reference is
+    expected. `secret_value` is the raw random string, marked secret —
+    surfaced so sibling slice #232's deploy.sh can publish it as a CF
+    Worker binding.
     """
     ssm_parameter: aws.ssm.Parameter
     secret_value: pulumi.Output[str]
