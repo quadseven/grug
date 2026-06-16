@@ -57,13 +57,13 @@ The vocabulary used in `services/`, `infra/`, and `web/`. Terms map to identifie
 | Term | Definition |
 |---|---|
 | **UserIdentity** | The GitHub user behind a session. Identifier: `github_user_id` (integer, stable across login renames). Definitions in `services/api/adapters/user_store.py`. |
-| **UserWithTokens** | `UserIdentity` plus an attached `oauth_*_blob` (KMS-envelope-encrypted access + refresh tokens). Used only by the api Lambda — webhook never needs it. |
+| **UserWithTokens** | `UserIdentity` plus an attached `oauth_*_blob` (KMS-envelope-encrypted access + refresh tokens). Used only by the api service — webhook never needs it. |
 | **Installation** | A `Grug` install on one GitHub account or organization. Identified by `install_id` (GitHub-issued integer). Carries metadata: `account_login`, `account_type` (User/Organization), `installed_at`, `installed_by_user_id`. |
 | **RepoConfig** | Per-repo settings stored under an `Installation`. Fields: `tpm_enabled: bool` (default `True`) and `enforcement_ruleset_id: int \| None` (GitHub ruleset ID managed by Grug, default `None`). Storage shape in [`services/{api,webhook}/adapters/install_store.py`](services/api/adapters/install_store.py). When more personas ship, the field set grows (e.g. `code_reviewer_enabled`); the `_DEFAULT_PERSONA_CONFIG` dict is the source of truth. |
 | **AllowlistGate** | Defense-in-depth check: webhook handler refuses to act on any `Installation` whose `installed_by_user_id` is not in the `allowlist` set on the user's store row. Independent of GitHub App's public/private listing. Bypass guard for the hosted SaaS while ramp is closed. |
 | **AppJWT** | RSA-signed JWT identifying Grug as a GitHub App (10-min TTL). Generated from the App private key (loaded from SSM SecureString `/grug/github-app-private-key`). Used to exchange for installation tokens. |
 | **InstallToken** | Short-lived (~1h TTL) token returned by `POST /app/installations/{id}/access_tokens`. Lets Grug act on behalf of the installation against the GitHub API. Cached per-`Installation` in `TokenCache`. |
-| **TokenCache** | Get/put/invalidate store for `AppJWT` and `InstallToken`s. Today: single in-process implementation (`InMemoryTokenCache`) — see ADR-0001 + planned `DdbTokenCache` per PRD #21 Q17. |
+| **TokenCache** | Get/put/invalidate store for `AppJWT` and `InstallToken`s. Today: single in-process implementation (`InMemoryTokenCache`) — see ADR-0001. A persistent cache is still planned (PRD #21 Q17); the original DynamoDB-backed sketch predates the #354 Postgres store swap, so it would now be Postgres-backed. |
 | **with_install_token_retry** | Helper that wraps a GitHub API call so that on 401 it invalidates the cached `InstallToken`, fetches a fresh one, and retries once. Lives alongside the AppJWT machinery; couples token rotation with call sites today (issue #142 may revisit). |
 
 ## Persistence concepts
@@ -71,7 +71,7 @@ The vocabulary used in `services/`, `infra/`, and `web/`. Terms map to identifie
 | Term | Definition |
 |---|---|
 | **Single-table layout (`grug_kv`)** | Two key shapes co-existing in one Postgres table (`grug_kv`, was DynamoDB `grug-main` pre-#354): `PK=USER#<github_user_id> SK=META` (the `UserIdentity` row, optionally `UserWithTokens` + `allowlisted`) and `PK=INST#<install_id> SK=META` (the `Installation` row) plus `PK=INST#<install_id> SK=REPO#<repo_id>` (one `RepoConfig` per repo). Key/attribute semantics preserved exactly across the port. Schema constants in [`services/{api,webhook}/adapters/pg_install_store.py`](services/api/adapters/pg_install_store.py); `install_store.py`/`user_store.py` are re-export facades. |
-| **KMS envelope** | Per-`UserIdentity` data-encryption-key generated via `kms:GenerateDataKey` and used (AES-GCM, 96-bit nonce) to encrypt OAuth refresh + access tokens. Wrapped DEK stored alongside the ciphertext. Only the api Lambda calls KMS at app-level; webhook never decrypts user tokens. Documented at [`infra/pulumi/components/kms_cmk.py`](infra/pulumi/components/kms_cmk.py). |
+| **KMS envelope** | Per-`UserIdentity` data-encryption-key generated via `kms:GenerateDataKey` and used (AES-GCM, 96-bit nonce) to encrypt OAuth refresh + access tokens. Wrapped DEK stored alongside the ciphertext. Only the api service calls KMS at app-level; webhook never decrypts user tokens. Documented at [`infra/pulumi/components/kms_cmk.py`](infra/pulumi/components/kms_cmk.py). |
 | **CredentialBlobCorrupt** | Exception raised when an encrypted blob in the store can't be decrypted (key-version drift, tampering, deliberate test fixture). Handler must idempotently clean up — see the "idempotency check after corruption-empty fallthrough" audit pattern. |
 | **UserStateCorrupt** | Same shape as `CredentialBlobCorrupt`, but for non-secret user state fields that fail invariant checks at read time. |
 
@@ -79,7 +79,7 @@ The vocabulary used in `services/`, `infra/`, and `web/`. Terms map to identifie
 
 | Term | Definition |
 |---|---|
-| **`X-Grug-CF-Secret`** | HTTP request header injected by the CF Workers (`infra/cloudflare/workers/grug-{api,webhook}-host-rewrite/worker.js`) on every upstream request to the Lambda Function URLs. Validated by `CfAuthMiddleware` on the Lambda side. The header name is templated into the worker.js by `deploy.sh` so deploy.sh is the single source of truth. |
+| **`X-Grug-CF-Secret`** | HTTP request header injected by the CF Workers (`infra/cloudflare/workers/grug-{api,webhook}-host-rewrite/worker.js`) on every upstream request. Since the #354 cutover the Worker rewrites `Host` to the in-cluster upstream (the tunnel-served hostname in SSM `/grug/{api,webhook}-upstream-host`) instead of the retired Lambda Function URL; the request transits the Cloudflare tunnel to the in-cluster Service. Validated by `CfAuthMiddleware` on the pod side. The header name is templated into the worker.js by `deploy.sh` so deploy.sh is the single source of truth. |
 | **`GRUG_CF_SECRET`** | CF Worker secret binding name. The Workers read `env.GRUG_CF_SECRET` and inject it as the `X-Grug-CF-Secret` header. `deploy.sh` PUTs the binding from SSM `/grug/cf-shared-secret` on every Worker script upload. |
 | **`/grug/cf-shared-secret`** | SSM SecureString holding the CF→AWS auth-boundary shared secret. Pulumi-managed via `infra/pulumi/components/cf_shared_secret.py` (`random.RandomPassword`, 64-char lowercase alphanumeric). Rotation: bump `keepers["version"]`, `pulumi up`, re-run `deploy.sh`. |
 | **`CfAuthMiddleware`** | Starlette/FastAPI middleware in mirrored module `cf_auth.py`. Reads the SSM secret at cold start via the `GRUG_CF_SHARED_SECRET_SSM` env var, validates `X-Grug-CF-Secret` on every non-`/livez` request using `hmac.compare_digest`. Fail-open on unconfigured env var or empty SSM value (rollout-safety property). |
@@ -105,10 +105,10 @@ The following nine modules exist as byte-identical copies under both `services/a
 
 | Term | Definition |
 |---|---|
-| **AWS Lambda image-mode** | Deploy shape: per-service Docker image pushed to ECR, Lambda function points at the digest. Both services use this. Container brings DD extension + `datadog_lambda` wrapper. |
-| **Lambda Function URL** | Public HTTPS endpoint AWS provisions for each Lambda. `AuthType=NONE` (we gate via app-layer HMAC + Cognito). Hosted at `api.grug.lol` / `webhook.grug.lol` via Cloudflare Worker proxy. |
-| **Cloudflare Worker proxy** | Per-service `<service>-host-rewrite` Worker that rewrites incoming `<service>.grug.lol` requests to the Lambda Function URL. Lets us use friendly domains + WAF in front of Lambda. |
-| **Pulumi stack** | One stack per environment. Today: `dev` only. Stack name and project structure under [`infra/pulumi/`](infra/pulumi/). |
+| **Kubernetes deploy (#354)** | Deploy shape since the cutover: each service is a Docker image (built natively for arm64) pushed to an in-cluster registry; the `grug` namespace runs Deployments `grug-api` / `grug-webhook` / `grug-consumer` + CronJobs `grug-poller` / `grug-key-rotator`, all from the one webhook image. `deploy.k8s.yml` builds, seeds Secrets from SSM, and `kubectl apply -k k8s/`. (Was AWS Lambda image-mode + ECR pre-#354.) |
+| **Cloudflare tunnel + Worker** | `api.grug.lol` / `webhook.grug.lol` resolve via CF DNS to the per-service `<service>-host-rewrite` Worker, which injects `X-Grug-CF-Secret` and rewrites `Host` to the in-cluster upstream; a `cloudflared` tunnel transports that to the k8s Service on `:8080`. App-layer gating is the CF shared secret + HMAC + signed session (no Cognito). (Was a CF Worker → Lambda Function URL proxy pre-#354.) |
+| **Postgres store (CNPG)** | The single-table store `grug_kv` on a shared CloudNativePG cluster (`GRUG_DATABASE_URL`, `psycopg`). Replaced the DynamoDB `grug-main` table at #354; key/attribute semantics preserved exactly. |
+| **Pulumi stack** | One stack per environment. Manages the AWS-side infra (SSM refs, SQS, KMS, OIDC, IAM users, DD monitors/dashboard/RUM); the k8s manifests are applied by `deploy.k8s.yml`, not Pulumi. Stack/project structure under [`infra/pulumi/`](infra/pulumi/). |
 | **Grugboard** | GitHub Projects (v2) board at https://github.com/users/githumps/projects/1. Target of the future `Pulse (roadmap)` persona's label sync + issue reprefixing. |
 
 ## Operational concepts
@@ -125,7 +125,7 @@ These terms exist in the codebase but are inconsistent or under-named. Resolving
 
 - **`with_install_token_retry`** — verbose helper name; better as a method on a future `TokenedGitHubClient` adapter (deferred in issue #142).
 - **`get_pool()` lazy init** — double-checked-lock pool bootstrap in `pg_base.py` deferring DB connection past import (same rationale as the DDB-era `_LazyTable` it replaced).
-- **No name for the SPA's session shape** — `web/src/` consumes the api Lambda's `/me` payload but the SPA's TS types don't have a corresponding `Session` or `Viewer` concept. Add when frontend changes touch session state.
+- **No name for the SPA's session shape** — `web/src/` consumes the api service's `/me` payload but the SPA's TS types don't have a corresponding `Session` or `Viewer` concept. Add when frontend changes touch session state.
 
 ---
 
