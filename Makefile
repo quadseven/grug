@@ -9,11 +9,12 @@
 #
 # Slice 10 (#31) — disaster-recovery proof:
 #   make tear-down          — destroy dev stack (DESTRUCTIVE; ~5min)
-#   make rebuild            — destroy + up + image-rebuild + workers + reseed + smoke (~12-15min)
+#   make rebuild            — destroy + pulumi up (AWS infra) + deploy.k8s.yml
+#                             (build+apply pods) + workers + reseed + smoke
 #   make smoke              — quick prod-shape smoke test (read-only)
 
 .PHONY: test webhook-test api-test pg-test pulumi-preview pulumi-up \
-        tear-down rebuild bootstrap-images smoke docker-build-webhook
+        tear-down rebuild smoke docker-build-webhook
 
 # Admin seed values — the row (re)installed after a tear-down so the
 # allowlist gate works on the first PR after rebuild. NO DEFAULTS on
@@ -63,48 +64,41 @@ pulumi-preview:
 pulumi-up:
 	cd infra/pulumi && uv sync && pulumi up --stack dev
 
-# DESTRUCTIVE. Wipes Lambdas, the legacy DDB table (pre-#354 data),
-# CMK (7-day deletion delay), CF DNS records, DD monitors. GitHub
-# App config + SSM secrets persist (registered at github.com / AWS
-# SSM, not in Pulumi state). The Postgres store (grug_kv) is NOT in
-# this Pulumi state and survives - hence the post-rebuild re-seed.
+# DESTRUCTIVE. Wipes the AWS-side infra in Pulumi state: KMS CMK (7-day
+# deletion delay), SQS queues + DLQs, S3 cave bucket, IAM users/role, DD
+# monitors/dashboard/RUM, and the legacy DDB table (pre-#354 data; unused).
+# It does NOT touch the Kubernetes workloads (applied by deploy.k8s.yml,
+# not Pulumi), the Postgres store (grug_kv lives outside this state and
+# survives - hence the post-rebuild re-seed), or the GitHub App config +
+# SSM secrets (registered at github.com / AWS SSM, not in Pulumi state).
 tear-down:
 	@echo ">> tear-down: destroying dev stack (CTRL-C now to abort)"
 	@sleep 5
 	cd infra/pulumi && pulumi destroy --stack dev --yes
 
-# Round-trip verifier per Slice 10 #31. Steps:
-#   1. tear-down (pulumi destroy --stack dev)
-#   2. pulumi up --target ECR repos only (Lambda image-mode needs the
-#      ECR repo URL to exist + a :bootstrap image present BEFORE its
-#      first create succeeds)
-#   3. bootstrap-images (crane copy public python:3.13 → private ECR)
-#   4. pulumi up — full stack (Lambdas now resolve image_uri)
-#   5. trigger CI to build + push real images, swap imageUri
-#   6. CF Workers re-deploy + admin USER# + INST# re-seed (Slice 5
-#      #26 allowlist gate requires at least one allowlisted user
-#      before any PR check) — also picks up Function URL host churn
-#      per reference_lambda_function_url_host_volatile
-#   7. smoke test all three public URLs
-#
-# Total wall-clock: ~12-15min. PR check-runs queue + retry post-rebuild.
+# Round-trip verifier per Slice 10 #31, post-#354 (k8s). Steps:
+#   1. tear-down (pulumi destroy --stack dev) — AWS infra only
+#   2. pulumi up — recreate the AWS infra (SSM refs, KMS, SQS, S3, IAM, DD).
+#      No ECR/bootstrap-image dance: the app no longer runs on Lambda.
+#   3. trigger deploy.k8s.yml to build + push the arm64 images, seed the
+#      in-cluster Secrets, and `kubectl apply -k k8s/`.
+#      NOTE: deploy.k8s.yml only runs on `main` (or workflow_dispatch from
+#      main) — run `make rebuild` from main for the app redeploy to fire.
+#   4. CF Workers re-deploy + admin USER# + INST# re-seed (Slice 5 #26
+#      allowlist gate requires at least one allowlisted user before any
+#      PR check).
+#   5. smoke test all three public URLs.
 rebuild: tear-down
-	@echo ">> step 2/7: pulumi up — ECR repos only (Lambda needs :bootstrap image to exist FIRST)"
-	cd infra/pulumi && pulumi up --stack dev --yes \
-	  --target 'urn:pulumi:dev::grug::aws:ecr/repository:Repository::grug-webhook' \
-	  --target 'urn:pulumi:dev::grug::aws:ecr/repository:Repository::grug-api'
-	@echo ">> step 3/7: bootstrap images (crane copy public python:3.13 base into private ECR)"
-	$(MAKE) bootstrap-images
-	@echo ">> step 4/7: pulumi up — full stack (Lambdas now have :bootstrap to point at)"
+	@echo ">> step 2/5: pulumi up — recreate AWS infra (SSM/KMS/SQS/S3/IAM/DD)"
 	cd infra/pulumi && pulumi up --stack dev --yes
-	@echo ">> step 5/7: triggering CI to build + push real images"
-	gh workflow run iac.deploy.yml --ref $$(git branch --show-current) --repo githumps/grug
+	@echo ">> step 3/5: trigger deploy.k8s.yml — build+push images, apply k8s/"
+	gh workflow run deploy.k8s.yml --ref $$(git branch --show-current) --repo githumps/grug
 	@echo ">>   waiting for run to start..."
 	@sleep 10
-	@RUN_ID=$$(gh run list --workflow=iac.deploy.yml --branch=$$(git branch --show-current) --repo githumps/grug --limit=1 --json databaseId --jq '.[0].databaseId'); \
+	@RUN_ID=$$(gh run list --workflow=deploy.k8s.yml --branch=$$(git branch --show-current) --repo githumps/grug --limit=1 --json databaseId --jq '.[0].databaseId'); \
 	  echo ">>   following run $$RUN_ID"; \
 	  gh run watch $$RUN_ID --exit-status --repo githumps/grug
-	@echo ">> step 6/7: CF Workers re-deploy + admin re-seed"
+	@echo ">> step 4/5: CF Workers re-deploy + admin re-seed"
 	bash infra/cloudflare/deploy.sh
 	@test -n "$(GRUG_ADMIN_USER_ID)" || { echo "FATAL: set GRUG_ADMIN_USER_ID (and GRUG_ADMIN_LOGIN/GRUG_ADMIN_INSTALL_ID) to YOUR own GitHub identity before seeding admin"; exit 1; }
 	uv run --with 'psycopg[binary]' python infra/scripts/seed-admin.py \
@@ -113,24 +107,9 @@ rebuild: tear-down
 	  --install-id $(GRUG_ADMIN_INSTALL_ID)
 	# ^ needs GRUG_DATABASE_URL in the shell (post-#354 the store is
 	# Postgres); the script exits 2 with a FATAL if it's unset.
-	@echo ">> step 7/7: smoke test"
+	@echo ">> step 5/5: smoke test"
 	$(MAKE) smoke
 	@echo ">> rebuild complete."
-
-# Bootstrap public Lambda Python base into our private ECR repos under
-# the `:bootstrap` tag. Lambda image-mode rejects public.ecr.aws/* URIs
-# directly, AND a freshly-created ECR repo is empty so pulumi up against
-# `<our-ecr>/<repo>:bootstrap` fails until something is pushed first.
-# This target uses `crane` (daemonless) to copy the public base image
-# into both grug-webhook + grug-api repos.
-bootstrap-images:
-	@command -v crane >/dev/null || { echo "crane not installed: brew install crane"; exit 1; }
-	@ACCT=$$(aws sts get-caller-identity --query Account --output text); \
-	  ECR="$$ACCT.dkr.ecr.us-east-1.amazonaws.com"; \
-	  aws ecr get-login-password --region us-east-1 \
-	    | crane auth login "$$ECR" --username AWS --password-stdin; \
-	  crane copy public.ecr.aws/lambda/python:3.13-arm64 "$$ECR/grug-webhook:bootstrap"; \
-	  crane copy public.ecr.aws/lambda/python:3.13-arm64 "$$ECR/grug-api:bootstrap"
 
 # Read-only smoke. Asserts public URLs respond as expected.
 smoke:
