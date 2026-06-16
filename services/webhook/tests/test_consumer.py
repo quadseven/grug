@@ -236,6 +236,42 @@ def test_main_warms_trace_writer_before_spawning_threads(monkeypatch):
         consumer._stop.clear()
 
 
+def test_flush_traces_never_raises():
+    """#412: span-flush is fail-safe - it runs in the consumer's hot watchdog
+    loop and must never crash it, with or without ddtrace installed."""
+    consumer._flush_traces()  # must not raise
+
+
+def test_watchdog_flushes_traces_each_tick(monkeypatch):
+    """#412: the main-thread watchdog flushes buffered worker-thread APM spans
+    via the main thread (the path proven to deliver) on each healthy tick."""
+    import threading as _threading
+    import time
+
+    consumer._stop.clear()
+    monkeypatch.setattr(consumer, "_warm_trace_writer", lambda: None)
+    monkeypatch.setattr(consumer, "_startup_check", lambda: None)
+    monkeypatch.setattr(consumer, "_specs", lambda: [_spec(True, lambda e: None)])
+    monkeypatch.setattr(consumer, "_consume", lambda _spec: consumer._stop.wait())
+    flushes: list[int] = []
+    monkeypatch.setattr(consumer, "_flush_traces", lambda: flushes.append(1))
+    handlers: dict = {}
+    monkeypatch.setattr(
+        consumer.signal, "signal", lambda sig, fn: handlers.__setitem__(sig, fn)
+    )
+
+    def _term_soon():
+        time.sleep(0.05)
+        handlers[consumer.signal.SIGTERM](consumer.signal.SIGTERM, None)
+
+    _threading.Thread(target=_term_soon, daemon=True).start()
+    try:
+        consumer.main()
+        assert len(flushes) >= 1  # flushed on at least the healthy tick(s)
+    finally:
+        consumer._stop.clear()
+
+
 def test_main_returns_zero_on_graceful_signal_shutdown(monkeypatch):
     """A real SIGTERM (graceful scale-down) must return 0, NOT a non-zero exit
     - otherwise every normal pod termination would read as a crash. Guards the

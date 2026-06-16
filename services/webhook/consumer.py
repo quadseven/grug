@@ -197,6 +197,27 @@ def _warm_trace_writer() -> None:
         log.warning("trace_writer_warmup_failed", exc_info=True)
 
 
+def _flush_traces() -> None:
+    """Flush buffered APM spans from the MAIN thread (#412).
+
+    The consumer's per-poll botocore SQS spans are created on the worker poll
+    threads. In prod those weren't reaching Datadog while the main-thread
+    startup span did - and a local repro under the same ddtrace (3.19.7) could
+    NOT reproduce a generic worker-thread bug (worker spans flush fine there),
+    so the prod cause is environmental, not a code bug in span creation.
+    `tracer.flush()` on the MAIN thread (the path PROVEN to deliver - the
+    startup span arrives) drains the shared span buffer each watchdog tick, so
+    buffered worker-thread spans get delivered regardless of whatever stalls
+    the long-running periodic writer in the threaded consumer. Fail-safe:
+    telemetry must never break the consumer."""
+    try:
+        import ddtrace
+
+        ddtrace.tracer.flush()
+    except Exception:  # noqa: BLE001 - telemetry is never worth crashing on
+        log.debug("trace_flush_skipped", exc_info=True)
+
+
 def _startup_check() -> None:
     """Fail FAST (non-zero exit) if a critical dependency is unreachable at
     startup. The consumer has no HTTP /readyz for the kubelet to gate on, so
@@ -271,6 +292,8 @@ def main() -> None:
             )
             _stop.set()
             break
+        # Deliver buffered worker-thread APM spans via the main thread (#412).
+        _flush_traces()
         _stop.wait(5.0)
     # Ground-truth re-check: if _stop was set by anything OTHER than a signal
     # (i.e. not a graceful shutdown) and a thread is down, that's a death —
