@@ -1,128 +1,103 @@
 # Grug — Operations Runbook
 
-Living doc for deploying, rotating secrets, debugging, and recovering grug. Updated as patterns lock in.
+Living doc for deploying, rotating secrets, debugging, and recovering grug.
+Updated as patterns lock in.
 
-## First-time deploy (chicken-egg paths)
+> **Runtime:** grug runs on **Kubernetes** (the #354 self-hosting migration
+> retired the AWS Lambdas). One container image (`services/webhook/Dockerfile`)
+> backs every workload: Deployments `grug-api`, `grug-webhook`, `grug-consumer`
+> and CronJobs `grug-poller`, `grug-key-rotator` (manifests in `k8s/`). The
+> app store is **Postgres** (table `grug_kv`); SQS FIFO queues carry async work;
+> SSM holds secrets. AWS Lambda / DynamoDB / ECR / Function URLs are gone.
 
-The PRD assumed a clean `pulumi up`. Reality has two bootstrap chicken-eggs:
+## Deploy
 
-1. **GHA OIDC role is created BY pulumi up** → CI cannot do the very first deploy. First `pulumi up` must run from a developer machine using personal AWS creds.
-2. **Lambda Container `package_type=Image` rejects `public.ecr.aws/*` images** → Cannot point Lambda at a public bootstrap image. Workaround: `crane copy` the public AWS Lambda Python base image into our private ECR with `:bootstrap` tag, point Lambda there, swap to real image after CI's first build.
+Two independent GitHub Actions pipelines, both on push to `main`:
 
-### Procedure
+- **App** — `.github/workflows/deploy.k8s.yml` (paths `services/**`, `k8s/**`).
+  Builds the arm64 image, pushes it to the private registry, **seeds the
+  `grug-secrets` / `grug-rotator-secret` / `registry-pull` k8s Secrets from
+  SSM** (`/grug/*`), then `kubectl apply -k k8s/` and rolls the workloads. The
+  image is deployed by **immutable digest**, not a mutable tag.
+- **Infra** — `.github/workflows/iac.deploy.yml` (paths `infra/pulumi/**`).
+  Runs `pulumi up` for the AWS supporting resources (KMS, SQS, S3, IAM/OIDC,
+  SSM references, Datadog monitors/RUM/dashboards). It does **not** deploy the
+  app and does not build images.
 
-```bash
-# 0. Prereqs (one-time per AWS account / Cloudflare zone / GitHub App)
-#    See docs/HITL_PREREQUISITES.md for the full list.
+Public-repo discipline: no infra identifiers are committed. The registry host,
+cluster credential, and tailnet join key arrive via the `k8s-prod` GitHub
+**environment** (vars/secrets); manifests carry `REGISTRY_PLACEHOLDER` /
+`TAG_PLACEHOLDER` that the workflow rewrites at deploy time. The cluster, the
+in-cluster registry, the Cloudflare tunnel, and the Postgres (CNPG) database
+are provisioned in the **private infrastructure repo**, not here.
 
-# 1. Initialize Pulumi stack
-cd infra/pulumi
-pulumi stack init <pulumi-org>/grug/dev
-pulumi config set aws:region us-east-1
-pulumi config set grug:env dev
-pulumi config set grug:domain grug.lol
-uv sync
-
-# 2. Push public Lambda base into our ECR as `:bootstrap`
-#    (crane is a daemon-less docker image copier — no Docker required)
-brew install crane
-mkdir -p /tmp/grug-docker-config
-PASS=$(aws ecr get-login-password --region us-east-1)
-AUTH=$(echo -n "AWS:$PASS" | base64)
-cat > /tmp/grug-docker-config/config.json <<EOF
-{"auths":{"<acct>.dkr.ecr.us-east-1.amazonaws.com":{"auth":"$AUTH"}}}
-EOF
-DOCKER_CONFIG=/tmp/grug-docker-config crane copy \
-  public.ecr.aws/lambda/python:3.13-arm64 \
-  <acct>.dkr.ecr.us-east-1.amazonaws.com/grug-webhook:bootstrap
-
-# 3. First pulumi up (creates ECR if missing, Lambda points at :bootstrap)
-pulumi up
-
-# 4. Add second Lambda Function URL policy statement
-#    (Pulumi can't express the `--invoked-via-function-url` condition)
-aws lambda add-permission --region us-east-1 \
-  --function-name grug-webhook \
-  --statement-id FunctionURLInvokeViaUrlOnly \
-  --action lambda:InvokeFunction \
-  --principal '*' \
-  --invoked-via-function-url
-
-# 5. Trigger CI to push the real Lambda image
-gh workflow run iac.deploy.yml --repo githumps/grug \
-  --ref feat/<branch> --field stack=dev
-
-# 6. Deploy CF Worker (Pulumi-cloudflare WorkerScript is unreliable;
-#    we manage out-of-band — see infra/cloudflare/deploy.sh)
-bash infra/cloudflare/deploy.sh
-```
+First-time bring-up: seed the SSM parameters (see `docs/HITL_PREREQUISITES.md`),
+seed the `k8s-prod` environment vars/secrets, run `iac.deploy.yml` (infra), then
+`deploy.k8s.yml` (app). The first `pulumi up` must run with credentials that can
+create the `grug-gha-deploy` OIDC role (chicken-egg: CI assumes that role).
 
 Smoke test:
 ```bash
 curl -i -X POST https://webhook.grug.lol/webhook/github \
   -H 'X-Hub-Signature-256: sha256=invalid' -d '{}'
 # Expect: HTTP 401 {"detail":"invalid signature"}
+curl -sf https://api.grug.lol/livez && curl -sf https://webhook.grug.lol/livez
 ```
 
-## CF Worker re-deploy
-
-Run after every `pulumi up` that recreates the Lambda (Function URL host changes per `reference_lambda_function_url_host_volatile` memory):
-
-```bash
-bash infra/cloudflare/deploy.sh
-```
-
-The script:
-- Reads CF token + account/zone IDs from SSM
-- Reads upstream Function URL from `pulumi stack output webhook_function_url`
-- Templates `__UPSTREAM_HOST__` in `worker.js` → uploads to CF
-- Creates route `webhook.grug.lol/*` (idempotent — swallows 409)
+Ingress: `<service>.grug.lol` resolves to the Cloudflare tunnel, which forwards
+to the in-cluster Service on port 8080. The `X-Grug-CF-Secret` shared-secret
+boundary (`cf_auth.py`) rejects requests that bypass Cloudflare.
 
 ## Secret rotation
 
-All secrets in SSM under `/grug/*` (per-project) and `/shared/*` (cross-cutting).
+All secrets in SSM under `/grug/*` (per-project) and `/infra/*` (cross-cutting,
+e.g. `/infra/llm/*`, `/infra/datadog/*`, `/infra/discord/*`). `grug-secrets` is
+re-seeded from SSM on every `deploy.k8s.yml` run, so the rotation pattern is:
+**put the new value in SSM, then re-seed + roll the pods.**
+
+```bash
+# Re-seed grug-secrets from SSM and roll, without a code change:
+gh workflow run deploy.k8s.yml --repo githumps/grug --ref main
+# (or, if grug-secrets already holds the new value, just force a re-read:)
+kubectl -n grug rollout restart deploy/grug-api deploy/grug-webhook deploy/grug-consumer
+```
 
 ### App private key (rotate quarterly OR on suspected compromise)
-
-1. GitHub App settings → Generate new private key → download `.pem`
+1. GitHub App settings -> Generate new private key -> download `.pem`.
 2. `aws ssm put-parameter --overwrite --name /grug/github-app-private-key --type SecureString --value "$(cat <new>.pem)"`
-3. `aws lambda update-function-configuration --function-name grug-webhook --environment ...` (forces cold-start cache refresh)
-4. Old key auto-revoked after ~1 hr (GitHub side)
+3. Re-seed + roll (above). 4. Old key auto-revokes after ~1h (GitHub side).
 
 ### Webhook secret (rotate annually)
+1. `NEW=$(openssl rand -hex 32)`. 2. Update the GH App webhook-secret field.
+3. `aws ssm put-parameter --overwrite --name /grug/github-app-webhook-secret --type SecureString --value "$NEW"`. 4. Re-seed + roll.
 
-1. `NEW=$(openssl rand -hex 32)`
-2. Update GH App webhook secret field
-3. `aws ssm put-parameter --overwrite --name /grug/github-app-webhook-secret --type SecureString --value "$NEW"`
-4. Lambda picks up on next cold start (or force one with `update-function-configuration`)
+### OAuth client secret (on suspected compromise)
+GH App -> Generate new client secret -> `aws ssm put-parameter --overwrite --name /grug/github-app-client-secret ...` -> re-seed + roll.
 
-### OAuth client secret (rotate on suspected compromise only)
+### LLM keys (`/infra/llm/{poolside,openrouter}_api_key`)
+Shared cross-project SecureStrings. Update in SSM -> re-seed + roll.
 
-1. GH App settings → Generate new client secret
-2. `aws ssm put-parameter --overwrite --name /grug/github-app-client-secret ...`
+### Datadog / Discord notify
+DD keys live at `/infra/datadog/{api,app}_key`; the monitor notify channel is a
+Datadog Webhook integration sourced from `/infra/discord/monitoring-alerts`
+(set in `infra/pulumi/__main__.py`). Rotating these is an `iac.deploy.yml`
+concern, not a pod re-seed.
 
-### CF API token (rotate quarterly)
-
-1. <https://dash.cloudflare.com/profile/api-tokens> → Roll
-2. `aws ssm put-parameter --overwrite --name /grug/cloudflare-api-token --type SecureString --value "<new>"`
-3. Re-run `bash infra/cloudflare/deploy.sh`
-
-### DD API key (`/shared/datadog-api-key`)
-
-Shared across all projects. Coordinate with somatic-scripts before rotating.
+### AWS pod access key
+Rotated automatically by the `grug-key-rotator` CronJob (#386) — see
+[Key rotation](#key-rotation). Do not rotate by hand unless that is wedged.
 
 ## Common failure modes
 
 | Symptom | Cause | Fix |
 |---|---|---|
-| Webhook returns 403 `AccessDeniedException` | Lambda Function URL missing dual-policy statement 2 | Re-run the `aws lambda add-permission --invoked-via-function-url` from first-time-deploy step 4 |
-| Webhook returns 502 | CF Worker errored (check upstream URL is current) | Re-run `bash infra/cloudflare/deploy.sh` |
-| Webhook returns 403 with `{"Message":null}` (CF) | CF Worker proxied the request but origin Lambda Function URL rejected mismatched Host header | DNS proxied=False (loses CF) OR Worker upload broken — re-run `deploy.sh` |
-| Lambda invocation fails with `entrypoint requires the handler name to be the first argument` | Lambda image is bootstrap (bare AWS Python base) | CI didn't push image OR Pulumi rolled back to `:bootstrap` config. Trigger `gh workflow run iac.deploy.yml` |
-| Pulumi up fails: `script already exists` (CF) | CF Worker manually uploaded but not in Pulumi state | Drop `cloudflare:WorkerScript`/`WorkerRoute` from `__main__.py` (we now manage Worker via `infra/cloudflare/deploy.sh`) |
-| CI fails: `aws: command not found` on the self-hosted CI runner | Runner missing tooling | Re-provision the self-hosted runner's tooling from your private infra repo |
-| CF Worker upload fails: `code 10021: No such module: worker.js` | Upload form-field name doesn't match metadata.main_module | Use `/tmp/worker.js` as path (basename `worker.js` matches main_module) — `deploy.sh` does this |
-| A required PR check is stuck/missing after grug was briefly down | The inline DoR/TPM webhook delivery errored during the outage; GitHub gave up retrying (infra #1254) | Self-heals: the `grug-poller` CronJob replays errored deliveries every 15m (#407). To force it now, run the manual replay below |
+| Pod in `CrashLoopBackOff` | bad image / missing dep / failing startup self-check (#405) | `kubectl -n grug describe pod <p>` + DD logs; the `[grug] Pod in CrashLoopBackOff` monitor pages (#406) |
+| Deployment stuck `0/1` ready, rollout not completing | new pod fails the dependency-aware `/readyz` (#404) — SSM/KMS or Postgres unreachable | last-good pods keep serving (RollingUpdate maxUnavailable:0); fix the dependency, the rollout self-limits |
+| `ImagePullBackOff` | `registry-pull` secret stale / wrong digest | re-run `deploy.k8s.yml` (re-seeds the pull secret + deploys a fresh digest) |
+| `/readyz` 503 but `/livez` 200 | a dependency (SSM/KMS/Postgres) is down — by design (#404) | check the dependency; `/readyz` recovers on the next TTL once it's back |
+| 5xx through Cloudflare | tunnel down or pods not ready | check the tunnel + `kubectl -n grug get pods`; the workload-not-ready monitor pages (#406) |
+| `cf_shared_secret_mismatch` burst | CF shared-secret drifted vs SSM, or a direct-to-origin probe | the CF auth-boundary monitor pages; reconcile the secret |
+| A required PR check stuck/missing after a brief outage | the inline DoR/TPM delivery errored during the outage; GitHub gave up (infra #1254) | self-heals: the `grug-poller` CronJob replays errored deliveries every 15m (#407); force it with the manual replay below |
 
 ## Missed-delivery replay (#407)
 
@@ -160,351 +135,171 @@ recovers it long-polls and auto-drains the backlog (#368), and its fail-fast
 startup self-check (#405) guarantees it only starts when AWS is reachable. So a
 consumer outage delays — never drops — re-run / cave-result jobs.
 
-## Tear-down + rebuild
+## Tear-down + rebuild / disaster recovery
 
-Verify-as-acceptance criterion per PRD (Slice 10 #31). Should reproduce in <15 min.
+The app is fully reconstructable from code + SSM. There is no Lambda/ECR
+bootstrap dance: rebuild = re-run the deploy pipelines.
 
-```bash
-# Destroy
-cd infra/pulumi && pulumi destroy --yes
+**What persists (lives outside grug's Pulumi state):**
+- App data — **Postgres `grug_kv`** (CNPG, managed in the private infra repo;
+  survives a grug `pulumi destroy` entirely, since grug's Pulumi never owned it).
+- All SSM params (`/grug/*`, `/infra/*`) — referenced, not created, by grug Pulumi.
+- GitHub App registration + installations + branch-protection (github.com).
+- The OKE cluster, in-cluster registry, and Cloudflare tunnel (private infra).
 
-# Rebuild from clean — 7-step round trip (Makefile `rebuild` target):
-#   1. tear-down
-#   2. pulumi up --target ECR repos only (Lambda image-mode prereq)
-#   3. bootstrap-images (crane copy public python:3.13 → private ECR)
-#   4. pulumi up — full stack (Lambdas resolve image_uri)
-#   5. trigger CI to build + push real images, swap imageUri
-#   6. CF Workers re-deploy + admin re-seed (Function URL host churn)
-#   7. smoke test
-make rebuild
-```
+**What grug's `pulumi up`/`destroy` owns (recreated from code):** KMS CMK
+(`alias/grug-tokens`, 7-day deletion delay), SQS queues + DLQs, the cave-diffs
+S3 bucket, IAM/OIDC roles, Cloudflare DNS records, Datadog monitors/RUM/
+dashboards. (A legacy DynamoDB table is still declared but is NOT the app store
+— removal tracked separately.)
 
-State that lives outside Pulumi (and persists across destroy):
-- All SSM params under `/grug/*` and `/shared/*`
-- ECR images (lifecycle expires untagged after 14d)
-- CF Worker + Route (managed via `deploy.sh`)
-- GitHub App registration (manual one-time)
+**Rebuild:** `iac.deploy.yml` (infra) then `deploy.k8s.yml` (app). Re-seed the
+admin row if the database was lost: `infra/scripts/seed-admin.py` writes to
+Postgres `grug_kv` (needs `GRUG_DATABASE_URL`); without it the allowlist gate
+no-ops every PR. PR check-runs queue + auto-retry (GitHub retries 5xx ~3x over
+~30 min), so they recover after the rollout.
+
+**KMS caveat:** OAuth tokens are envelope-encrypted under the CMK DEK; if the
+CMK is destroyed + recreated, old encrypted tokens become unrecoverable and
+users re-sign-in to re-encrypt. Zero impact for the admin-only user base.
 
 ## Observability
 
-- **DD APM:** <https://app.datadoghq.com/apm/services?service=grug-webhook>
+- **DD APM:** <https://app.datadoghq.com/apm/services?service=grug-webhook> (also `grug-api`, `grug-consumer`, `grug-poller`)
 - **DD Logs:** <https://app.datadoghq.com/logs?query=service%3Agrug-webhook>
-- **CloudWatch Logs:** `aws logs tail /aws/lambda/grug-webhook --region us-east-1 --since 5m`
-- **Pulumi state:** <https://app.pulumi.com/<pulumi-org>/grug/dev>
-- **CF dashboard:** <https://dash.cloudflare.com/<your-cf-account-id>/workers/services/view/grug-webhook-host-rewrite>
+- **Pod logs:** `kubectl -n grug logs deploy/grug-webhook --tail=200` (note: kubectl logs can be unreliable on the BYON nodes — prefer DD)
+- **Monitors:** k8s-native (CrashLoopBackOff / workload-not-ready / restart-spike / poller-cronjob), all routing to `@webhook-grug-discord-monitoring` (#406)
+- **Pulumi state + CF dashboard:** via the operator's Pulumi org + Cloudflare account.
 
 ## Service tags
 
-All grug DD entities tagged:
-- `service:grug-webhook` and `service:grug-api`
-- `env:dev` or `env:prod`
-- `version:<image-tag>` (typically commit SHA)
-- `app:grug` (resource tag on AWS resources)
-
-## Disaster recovery — full tear-down + cold rebuild
-
-Slice 10 (#31) acceptance proof. The "ready to tear down + build" requirement is load-bearing for AWS-org migration AND any-region failover. Verified via `make rebuild` round-trip against dev.
-
-### What survives `pulumi destroy`
-
-| Persists | Where |
-|---|---|
-| App registration (App ID, slug, OAuth client ID/secret) | github.com/settings/apps |
-| Webhook URL setting | github.com (matches DNS recreated by Pulumi) |
-| App webhook secret + private key | SSM SecureString `/grug/github-app-{webhook-secret,private-key}` |
-| OAuth client secret | SSM `/grug/github-app-client-secret` |
-| Existing installations | github.com (install_id <your-install-id> etc.) |
-| Branch protection on installed repos | github.com (referencing check-run name `Grug — Definition of Ready`) |
-| Datadog API + App keys | SSM `/shared/datadog-{api,app}-key` |
-| Cloudflare API token | SSM `/grug/cloudflare-api-token` |
-
-### What gets destroyed + recreated
-
-- Lambdas (`grug-webhook`, `grug-api`)
-- ECR repositories (untagged-14d lifecycle policy)
-- DDB table `grug-main` — incl. INST# rows + USER# rows (admin row + per-repo configs ALL LOST)
-- KMS CMK `alias/grug-tokens` (7-day deletion delay; new key takes same alias but different KeyID)
-- CF DNS records (`webhook.grug.lol`, `api.grug.lol`)
-- CF Workers (`grug-webhook-host-rewrite`, `grug-api-host-rewrite`)
-- DD monitors + synthetic uptime test
-- IAM roles + policies
-- CloudWatch log groups (14d retention)
-
-### Procedure
-
-```bash
-make rebuild
-```
-
-The target chains:
-
-1. `make tear-down` — `pulumi destroy --yes` (~5min)
-2. `pulumi up --yes` — recreates ECR + Lambdas with `:bootstrap` python:3.13 base
-3. `gh workflow run iac.deploy.yml` + `gh run watch` — CI builds + pushes real images, then re-runs `pulumi up` to swap imageUri (~5-7min)
-4. `bash infra/cloudflare/deploy.sh` — re-deploys Workers (Function URL host changes on recreate per `reference_lambda_function_url_host_volatile`)
-5. `python infra/scripts/seed-admin.py` — re-creates admin USER# + INST# rows (without these, allowlist gate no_ops every PR)
-6. `make smoke` — asserts `webhook.grug.lol/livez`, `api.grug.lol/livez`, `api.grug.lol/api/v1/health`, `grug.lol`, and `POST /webhook/github` (no-sig) all respond as expected
-
-Wall-clock: ~12-15 min. PR check-runs queue + retry post-rebuild (GitHub auto-retries 3× over ~30min on 5xx/connection-refused).
-
-### Tear-down only
-
-When you want to stop incurring AWS costs (e.g. before a long break) without rebuild:
-
-```bash
-make tear-down
-```
-
-Note: KMS CMK enters 7-day pending-deletion. Within that window, `pulumi up` against the same stack will recreate the alias on a new key (the old DEKs become unrecoverable, but no DDB data depends on them after destroy).
-
-### What `make rebuild` does NOT recover
-
-- **Encrypted OAuth tokens in old DDB rows** — if a user OAuth'd before tear-down, their tokens were encrypted with the OLD KMS DEK. Rows deleted; new sign-in re-encrypts with new DEK. Acceptable: zero impact for v1 admin-only user base.
-- **Per-repo persona overrides** — REPO# rows under INST# get nuked. Admins reconfigure via dashboard or via DDB CLI from a saved snapshot.
-- **In-flight CI runs** — workflows that triggered against the destroyed Lambda will 5xx. Re-trigger after rebuild.
-
-### Recovery override variables
-
-`make rebuild` reads these env vars (defaults match Evan's GitHub identity):
-
-| Var | Default | Use |
-|---|---|---|
-| `GRUG_ADMIN_USER_ID` | _(none — set to YOUR id)_ | Numeric GitHub user ID for admin USER# row |
-| `GRUG_ADMIN_LOGIN` | _(none — set to YOUR login)_ | login for the row |
-| `GRUG_ADMIN_INSTALL_ID` | _(none — set to YOUR install)_ | INST# row to backfill (skip on org-account migrations where install_id changed) |
-
-Override per-recovery: `GRUG_ADMIN_USER_ID=123 make rebuild`
+All grug DD entities tagged: `service:` one of `grug-api` / `grug-webhook` /
+`grug-consumer` / `grug-poller` / `grug-key-rotator` (cross-workload monitors
+use namespace-level `service:grug`); `env:prod`; `version:<image-sha>`;
+`team:grug`.
 
 ## Architecture decisions
 
 ### Sync-vs-async route handlers
 
-Webhook handler `receive_github_webhook` is **`async def`** (it `await
-request.body()` so HMAC verifies the raw wire bytes — a sync `def` with
-`Body(...)` lets Pydantic JSON-decode before bytes-validation and 422 before
-HMAC runs; see the comment in `main.py`). Its downstream calls — boto3
-DynamoDB, sync httpx GitHub posts, sync KMS, and the #272
-`lambda.invoke` self-invoke — are all **sync I/O running directly on the
-event loop** (an `async def` handler does NOT get Starlette's
-`run_in_threadpool` offload; only sync `def` handlers do).
+`receive_github_webhook` is **`async def`** (it `await request.body()` so HMAC
+verifies the raw wire bytes; a sync `def` with `Body(...)` lets Pydantic
+JSON-decode before bytes-validation and 422 before HMAC runs — see the comment
+in `main.py`). Its downstream sync I/O (boto3, sync httpx GitHub posts, KMS)
+runs directly on the event loop — an `async def` handler does NOT get
+Starlette's `run_in_threadpool` offload.
 
-**Why that's safe today**: AWS Lambda runs ONE invocation per warm
-container, so while the handler runs there are no peer request-coroutines to
-starve — the sync calls block a loop that has nothing else to do. This is an
-invariant of the execution model, NOT a threadpool guarantee.
-
-**Re-evaluate when**: anything introduces concurrent coroutines on that loop
-— `asyncio.gather` fan-out (e.g. parallel multi-repo GitHub calls), a
-streaming response, or a background task. At that point wrap the sync calls
-in `await asyncio.to_thread(...)` (the pattern `cf_auth.py`'s middleware
-already uses for its sync `ssm.get_parameter`), or migrate to
-`httpx.AsyncClient` + `aioboto3`. Closes #68.
+**On k8s this is a live concern, not a free invariant.** Under Lambda there was
+one invocation per warm container, so the loop had no peer coroutines to starve.
+A uvicorn pod serves **concurrent** requests on one loop, so a slow sync call in
+the async handler CAN delay peers. Keep the handler's per-call work bounded
+(each httpx call is individually timeout-bounded) and, if anything adds
+concurrent fan-out / streaming / background tasks, wrap sync calls in
+`await asyncio.to_thread(...)` (as `cf_auth.py` already does) or move to
+`httpx.AsyncClient` + `aioboto3`. (Originally #68; re-opened by the k8s move.)
 
 ### Mirrored files between services/api/ + services/webhook/
 
-Both Lambda services duplicate ~12 modules (adapters, ports, personas,
-github_app_auth, etc.) until the v1.5 shared-package extraction lands.
-
+Both services duplicate ~12 modules (adapters, ports, personas,
+github_app_auth, etc.) per ADR-0001 (rule-of-three extraction deferred).
 `.github/workflows/check.drift-lint.yml` runs `scripts/check-mirrored-files.sh`
-on every PR touching either service. The script byte-compares each file
-in `MIRRORED_FILES` and fails with a clear diff when they diverge.
-
-When you patch a mirrored file, ALWAYS apply the same change to both
-copies. The lint catches misses at PR time.
-
-Files that intentionally diverge (FastAPI app, Lambda handler entrypoint,
-logger name) are simply not in `MIRRORED_FILES` — the allowlist is
-opt-in by omission. Closes #66.
+on every PR touching either service and byte-compares the `MIRRORED_FILES`
+list. Patch a mirrored file in BOTH copies; the lint catches misses. Files that
+intentionally diverge (the FastAPI app, the consumer/poller entrypoints, logger
+names) are simply omitted from the list.
 
 ## Elder (code-reviewer) persona — end-to-end verification
 
-The Elder persona ships in advisory mode by default. After a deploy
-that includes a new dispatcher/dispatch.py/llm_client.py change, run
-this verification to confirm the full pipeline works on a real PR.
+Elder ships in advisory mode by default. After a deploy that changes
+`dispatcher.py` / `dispatch.py` / `llm_client.py`, verify on a real PR.
 
-### Prerequisites
+**Prerequisites:** SSM `/infra/llm/{poolside,openrouter}_api_key` loaded (the
+webhook pod mounts them via `grug-secrets`); `code_reviewer_enabled=True`,
+`code_reviewer_blocking=False` on the test repo's RepoConfig (defaults).
 
-1. SSM parameters loaded per `docs/HITL_PREREQUISITES.md` step 3:
-   - `/infra/llm/poolside_api_key` (SecureString, shared cross-project)
-   - `/infra/llm/openrouter_api_key` (SecureString, shared cross-project)
-2. `pulumi up` against the target stack — confirm the webhook Lambda
-   environment has both keys mounted.
-3. `code_reviewer_enabled=True` and `code_reviewer_blocking=False` on
-   the test repo's RepoConfig (defaults, no action needed for a new
-   install).
+**Steps:** open a small PR on a Grug-installed repo; wait ~30s; verify (1) the
+`Grug — Code Review` check-run (conclusion `neutral` in advisory mode), (2) at
+least one inline `(file, line)` review comment, (3) DD log
+`service:grug-webhook @event:code_reviewer_dispatched` carrying
+`installation_id`/`pr`/`head_sha`/`backend`/`model`/`findings_count`/`result`.
+Backends round-robin by `installation_id % 2` (poolside even / openrouter odd).
 
-### Steps
+**Failure-mode checks:** no check-run -> DD
+`@event:(code_review_fetch_or_parse_failed OR code_review_check_run_publish_failed OR code_review_degraded_publish_failed)`;
+neutral+"skipped" -> `@event:code_review_llm_degraded` (which backend kind);
+findings but no inline review -> `@event:code_review_review_publish_failed`
+(independent surface); webhook 500 -> DD `@event:(tpm_dispatch_unhandled OR code_review_dispatch_unhandled)` (last-resort guards, empty in steady state).
 
-1. Open a small test PR on a Grug-installed repo (e.g. githumps/grug
-   itself). Touch one file with a trivially-reviewable diff (e.g. add
-   a function that swallows a broad `except Exception: pass`).
-
-2. Wait ~30 seconds for the webhook → diff fetch → LLM round-trip.
-
-3. **Verify the check-run** — in the PR's "Checks" tab, look for:
-   - `Grug — Code Review` (separate from `Grug — Definition of Ready`)
-   - Conclusion: `neutral` (advisory mode)
-   - Summary: a Markdown table with at least one finding row OR
-     "Elder reviewed the diff and found nothing actionable."
-
-4. **Verify the inline review** — in the "Files changed" tab, look
-   for at least one `Grug` review comment pinned to a specific
-   `(file, line)`. Comment body should include severity, rule name,
-   and the LLM's message.
-
-5. **Verify the structured log** — in DD logs, query
-   `service:grug-webhook @event:code_reviewer_dispatched`. The most
-   recent entry should carry: `installation_id`, `pr`, `head_sha`,
-   `backend` (poolside or openrouter), `model`, `findings_count`,
-   `result` (pass/fail/skipped).
-
-6. **Verify both backends fire** (round-robin by `installation_id %
-   2`): open one PR from an even-`install_id` repo + one from an
-   odd-`install_id` repo. DD logs should show `backend:poolside` for
-   the even one and `backend:openrouter` for the odd one.
-
-### Failure-mode checks
-
-- **No check-run appears at all** → query DD for
-  `@event:code_review_fetch_or_parse_failed` or
-  `@event:code_review_check_run_publish_failed` or
-  `@event:code_review_degraded_publish_failed`. Each names the
-  specific surface that failed.
-- **Check-run appears with conclusion=neutral + "skipped" title** →
-  LLM degraded. Query DD for
-  `@event:code_review_llm_degraded` to see which backend kind
-  (`no_diff` / `all_failed` / `parse_failed`) triggered.
-- **Check-run shows findings but no inline review** → review-post
-  failed; see `@event:code_review_review_publish_failed`. Check-run
-  conclusion is unaffected by review-post failure — independent
-  surface by design.
-- **Webhook 500s entirely** → query Sentry for `tpm_dispatch_unhandled`
-  or `code_review_dispatch_unhandled`. Both are last-resort guards
-  that should be empty in steady-state.
-
-### Elder async offload
+### Elder async offload + self-recovery
 
 <a id="elder-async-offload"></a>
-Since #272 the Elder LLM review runs **off** the webhook ACK path: the
-sync handler ACKs GitHub (<10s) and self-invokes the `grug-webhook`
-Lambda asynchronously (`InvocationType="Event"`) to run the review. The
-async worker (`async_dispatch.run_elder_job`) is idempotent on the
-`X-GitHub-Delivery` id (a `DELIVERY#<id>` DDB row, 24h TTL).
+Off the webhook ACK path (#272, k8s mechanics #368): the sync handler ACKs
+GitHub (<10s) and runs the Elder review on an **in-process daemon thread**
+(`async_dispatch.run_elder_job`), idempotent on the `X-GitHub-Delivery` id (a
+`DELIVERY#<id>` claim row in Postgres `grug_kv`).
 
-- **Monitor `[grug-webhook] Elder async-offload failures`** fires on
-  `elder_enqueue_failed` (the self-invoke `lambda.invoke` threw — usually
-  a Lambda throttle) or `elder_job_unhandled` (the async worker crashed).
-  Both mean **that review was dropped** — by design we do NOT sync-fall-
-  back (it would re-block the ACK). Recovery: the review re-posts when the
-  PR is pushed again, or trigger it manually by closing+reopening the PR
-  (re-fires `pull_request`). Grab the `delivery_id` from the log line to
-  trace the specific delivery.
-- **Review never appears, no failure log** → check for
-  `elder_job_duplicate_skipped` (a GitHub redelivery / AWS retry was
-  correctly deduped — the FIRST delivery already ran it) and confirm the
-  original ran via `elder_job_done`.
-- AWS async retries are disabled (`maximum_retry_attempts=0`) — the worker
-  owns idempotency + degrade, so AWS retries would only risk a storm.
-- **Monitor `[grug-webhook] Elder fallback failed — review dropped for real`**
-  (P2). The cave fallback is **LIVE** (ADR-0005, #310/#316/#313, flag ON since
-  2026-06-10): clouds-down (`code_review_llm_degraded`) is now NORMAL — the
-  SaaS backends are unfunded by deliberate choice (**do NOT top up
-  OpenRouter/Poolside**) and the Cave heals each dropped review, so alerting
-  on clouds-down alone would page on every working review. This monitor fires
-  only when the BACKSTOP fails: the Cave answered degraded
-  (`elder_fallback_result_degraded`), the fallback enqueue failed, the queue
-  URL was missing, or a large diff couldn't spill to S3. Investigate: the
-  `grug-cave-connector` pod (LAN worker), the egress relay, the Cave host,
-  the cave DLQs. The errored Activity row re-runs from the dashboard once the
-  Cave recovers. Awareness-only signals: the P4 "Cave fallback fired" monitor
-  (the backstop activating is expected) + the DLQ-depth/queue-age monitors.
+- **`[grug-webhook] Elder async-offload failures`** fires on
+  `elder_enqueue_failed` (the offload couldn't start) or `elder_job_unhandled`
+  (the worker hit an unhandled error). **Self-recovery (#418):** an
+  `elder_job_unhandled` no longer waits for a human re-push — it enqueues ONE
+  durable re-run to `grug-rerun-jobs`, and the `grug-consumer` re-runs it with
+  the SQS redrive contract (visibility timeout -> DLQ after maxReceiveCount).
+  Grab the `delivery_id` from the log line (it carries `exc_info`). A
+  pod-restart-mid-review drop has no job to enqueue from and still re-triggers
+  on next push.
+- Review never appears, no failure log -> check `elder_job_duplicate_skipped`
+  (a redelivery correctly deduped — the first run already did it) + confirm via
+  `elder_job_done`.
+- **`[grug-webhook] Elder fallback failed`** (P2): the cave fallback is LIVE
+  (ADR-0005, #310/#316/#313, flag ON since 2026-06-10). Clouds-down
+  (`code_review_llm_degraded`) is NORMAL — the SaaS backends are unfunded by
+  deliberate choice (**do NOT top up OpenRouter/Poolside**) and the Cave heals
+  each dropped review. This monitor fires only when the BACKSTOP fails (Cave
+  answered degraded, fallback enqueue failed, queue URL missing, or a big diff
+  couldn't spill to S3). Investigate the `grug-cave-connector` pod, the egress
+  relay, the Cave host, the cave DLQs. Re-run the errored Activity row from the
+  dashboard once the Cave recovers.
 
 ### Elder prompt A/B experiment (#191)
 
 <a id="elder-prompt-experiment"></a>
-The Elder review prompt has two arms: **v1** (precision-biased, byte-identical
-to the shipped prompt — the control) and **v2** (recall-biased). The arm per
-install is chosen by `select_prompt_variant`, driven by the SSM String
-`/grug/elder-prompt-experiment` (one of `off` | `split` | `all_v2`). The chosen
-arm rides each review's DD LLM-Obs span as `variant_id`, so eval results
-(`is_real_bug` judge verdict, `human_verdict` reactions) slice by arm.
+Two arms: **v1** (precision, the control) and **v2** (recall), chosen per
+install by `select_prompt_variant` from SSM String `/grug/elder-prompt-experiment`
+(`off` | `split` | `all_v2`). The arm rides each review's DD LLM-Obs span as
+`variant_id`. The variant split `(id // 2) % 2` is orthogonal to the backend
+split `id % 2` (a 2x2 grid).
 
-**Before flipping — check cell balance.** The variant split `(id // 2) % 2` is
-orthogonal to the backend split `id % 2`, giving a 2×2 grid (v1/v2 × poolside/
-openrouter). It's balanced over each block of 4 consecutive install IDs, but a
-skewed live install-ID population can starve a cell. Verify the spread first:
+**Check cell balance before flipping** — bucket the allowlisted installs by
+`(backend, variant)`. The install IDs live in Postgres `grug_kv` now (NOT
+DynamoDB); query them with SQL against `grug_kv` (the `INST#...:META` rows) and
+bucket each `id` as `b=(id%2==0?poolside:openrouter)`, `v=((id//2)%2==1?v2:v1)`.
+Aim for all four cells populated before trusting a result.
 
-```bash
-# List allowlisted install IDs, then bucket each into its (backend, variant) cell.
-aws dynamodb scan --table-name grug-main --region us-east-1 \
-  --filter-expression 'begins_with(PK, :p) AND SK = :m' \
-  --expression-attribute-values '{":p":{"S":"INST#"},":m":{"S":"META"}}' \
-  --projection-expression 'PK' --query 'Items[].PK.S' --output text \
-| tr '\t' '\n' | sed 's/INST#//' \
-| awk '{b=($1%2==0)?"poolside":"openrouter"; v=(int($1/2)%2==1)?"v2":"v1"; print b" "v}' \
-| sort | uniq -c
-```
-
-Aim for all four cells populated and roughly even before trusting a result. If
-a cell is starved (few installs), the arm comparison for that backend is weak —
-note it when reading results.
-
-**Flip the arm** (no redeploy needed; `ignore_changes=["value"]` means Pulumi
-won't revert it):
-
+**Flip the arm** (no redeploy; `ignore_changes=["value"]` keeps Pulumi off it):
 ```bash
 aws ssm put-parameter --name /grug/elder-prompt-experiment --region us-east-1 \
   --type String --overwrite --value split   # or: all_v2 | off
 ```
+The mode is `lru_cache`d per pod, so a flip takes effect on the next pod
+recycle; force a fast cutover with
+`kubectl -n grug rollout restart deploy/grug-webhook`, or wait for the fleet to
+turn over before trusting the split. A garbage value logs
+`prompt_experiment_mode_unrecognized` and degrades to `off`.
 
-**Mixed-mode window.** The mode is `lru_cache`d per warm container, so a flip
-takes effect on the **next cold start** of each webhook container — warm
-containers keep the old arm until they recycle. Expect a mixed window of
-minutes-to-~1h depending on traffic. To force a fast cutover, publish a new
-image tag (any `pulumi up` that bumps `webhook_image_tag` cold-starts all
-containers), or simply **wait ≥1h before trusting the DD eval split** so the
-fleet has fully transitioned. A garbage value (typo) logs
-`prompt_experiment_mode_unrecognized` and degrades to `off` (control).
-
-**Reading results** is operator/DD-console work: build (or filter) an LLM-Obs
-view faceted on `@variant_id`, comparing the judge `is_real_bug` rate and the
-👍/👎 `human_verdict` rate between `v1` and `v2`. Promoting a winning arm to the
-default is a future code slice (bake the winner into `build_system_prompt`'s
-default), not a toggle flip.
-
-**Arm-up record (2026-06-10, #276).** The cell-balance check found the live
-population is **one install** (the maintainer install -> the `poolside x v2` cell; the
-other three cells empty). `split` would therefore be a misleading rename of
-all-v2 — there is no within-population A/B at n=1. Decision: the toggle is set
-to **`all_v2`** and the experiment is a **temporal comparison** — v2 spans
-(post-flip) vs the all-v1 history (pre-flip) on the same judge/reaction
-metrics. Analysis surface: the [DD notebook "Grug Elder — Prompt v1 vs v2"
-(#14750419)](https://app.datadoghq.com/notebook/14750419), which also records
-the confounds: (a) the SaaS backends are unfunded by design, so arm sample
-accrues only when a cloud (in practice intermittent Poolside) answers; (b)
-**cave-fallback reviews carry no `variant_id`** — the `grug-cave-connector`
-uses its own prompt; exclude healed reviews from arm comparisons. The DD
-Playground side-by-side of the two arm prompts is a manual console step: paste
-`build_system_prompt("v1")` / `("v2")` outputs from `code_review_prompt.py`.
-Re-run the cell-balance check before ever switching to `split` — it only
-becomes meaningful once installs spread across all four cells.
+**Arm-up record (2026-06-10, #276):** live population is one install (the
+maintainer -> `poolside x v2`; other cells empty), so the experiment is a
+**temporal** comparison (v2 post-flip vs v1 history) on the
+[DD notebook #14750419](https://app.datadoghq.com/notebook/14750419). Confounds:
+SaaS backends are unfunded (arm sample accrues only when a cloud answers); and
+cave-fallback reviews carry no `variant_id` (the connector uses its own prompt)
+— exclude healed reviews. Re-run the cell-balance check before switching to
+`split`.
 
 ### Rollback
 
-If Elder produces too many false positives or operationally misbehaves,
-disable per-repo via:
-
-```bash
-# Flip code_reviewer_enabled=False on a specific repo
-aws dynamodb update-item --region us-east-1 --table-name grug-main \
-  --key '{"PK":{"S":"INST#<install_id>"},"SK":{"S":"REPO#<repo_id>"}}' \
-  --update-expression 'SET code_reviewer_enabled = :f' \
-  --expression-attribute-values '{":f":{"BOOL":false}}'
-```
-
-Global kill switch (all repos) — set the SSM parameter
-`/grug/<env>/elder-disabled` to `true` and redeploy
-(future-roadmap; not implemented in this slice).
+Disable Elder per-repo by flipping `code_reviewer_enabled=False` on the repo's
+RepoConfig — update the row in Postgres `grug_kv` (SQL `UPDATE`) or via the
+admin dashboard. (A global SSM kill switch is future-roadmap, not implemented.)
 
 ## Key rotation
 
