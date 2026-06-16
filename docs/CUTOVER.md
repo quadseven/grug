@@ -4,12 +4,18 @@ Migrating each consumer repo off `_reusable.grug-pr-gate.yml` to the
 hosted Grug App. Tracks slices #32 (canary on infrastructure) and
 #33 (bulk on remaining 9).
 
+> **Note:** this playbook moves *consumer repos* onto the hosted App — it
+> is unrelated to the App's own runtime. The App now runs on Kubernetes
+> (Postgres store, SQS, Cloudflare tunnel; see [`RUNBOOK.md`](RUNBOOK.md)
+> + [`NETWORK-TOPOLOGY.md`](NETWORK-TOPOLOGY.md)). The `curl /livez`
+> checks below hit the k8s pods, not the retired Lambdas.
+
 ## Pre-flight (one-time)
 
 Verify on grug.lol dashboard:
 - `https://grug.lol/admin` shows your admin USER# row
-- Webhook lambda alive: `curl -sI https://webhook.grug.lol/livez | head -1` returns `HTTP/2 200`
-- API lambda alive: `curl -sI https://api.grug.lol/livez | head -1` returns `HTTP/2 200`
+- Webhook alive: `curl -sI https://webhook.grug.lol/livez | head -1` returns `HTTP/2 200`
+- API alive: `curl -sI https://api.grug.lol/livez | head -1` returns `HTTP/2 200`
 
 If any fail, see [`RUNBOOK.md`](RUNBOOK.md) "First-time deploy" / "Common
 failure modes" before continuing.
@@ -22,7 +28,8 @@ UI: https://github.com/apps/grug-boss/installations/new → pick the
 target repo → install.
 
 Webhook fires `installation` event → grug-webhook records the install
-in DDB. Verify on `/admin` that the new INST# row appears (refresh).
+in Postgres (`grug_kv`). Verify on `/admin` that the new INST# row
+appears (refresh).
 
 ### 2. Test the App posts a check-run
 

@@ -77,14 +77,16 @@ aws ssm put-parameter --region us-east-1 \
 # projects use them too), skip these — grug's Pulumi just reads them.
 #
 # OpenRouter API key — for Elder persona LLM calls (PRD #181). Mint at
-# https://openrouter.ai/settings/keys. Webhook Lambda only.
+# https://openrouter.ai/settings/keys. Read by the Elder-running workloads
+# (webhook + consumer + poller), loaded from SSM at startup.
 aws ssm put-parameter --region us-east-1 \
   --name /infra/llm/openrouter_api_key \
   --type SecureString \
   --value "sk-or-v1-..."
 
 # Poolside API key — second backend for Elder persona round-robin
-# (installation_id % 2). Mint at https://poolside.ai/. Webhook Lambda only.
+# (installation_id % 2). Mint at https://poolside.ai/. Read by the
+# Elder-running workloads (webhook + consumer + poller).
 aws ssm put-parameter --region us-east-1 \
   --name /infra/llm/poolside_api_key \
   --type SecureString \
@@ -142,39 +144,37 @@ to create the Pages project + apex domain binding (idempotent — safe
 to re-run if you forget). After that, the `web.deploy.yml` workflow
 handles every subsequent build/deploy via `wrangler pages deploy`.
 
-## 6. Datadog notify handle (Slice 9 #30)
+## 6. Datadog alert routing (Slice 9 #30)
 
-DD monitors fire on Lambda 5xx, sig-verify failures, etc. Notification
-target lives in SSM `/grug/dd-notify-handle`.
-
-Format: any string DD knows how to route — Discord webhook handle
-(`@webhook-grug`), email mention (`@evan@grug.lol`), PagerDuty
-integration name (`@pagerduty-grug-prod`), or `@slack-channel-grug`.
-
-```bash
-aws ssm put-parameter --region us-east-1 \
-  --name /grug/dd-notify-handle --type String \
-  --value "<handle>"
-```
-
-**Important — handle is baked into monitor messages at `pulumi up`
-time.** If you change the SSM value later, you MUST re-run `pulumi up`
-for the new handle to take effect on existing monitors. The Pulumi
-diff will show every monitor's `message` field changing. (For more
-flexible routing without re-deploys, set the SSM handle to a stable
-DD notification target — e.g. `@webhook-grug-router` — and change
-the routing inside DD's notification settings.)
-
-DD also needs the App key (in addition to the API key) for monitor
-creation:
+DD monitors fire on workload-not-ready, CrashLoopBackOff, sig-verify
+failures, etc. (Kubernetes-State-Metrics-based since #406). Routing is
+NOT a free-form handle anymore: the Pulumi program builds a Datadog
+Webhook integration (`grug-discord-monitoring`) from a Discord webhook
+URL in SSM, and every monitor references `@webhook-grug-discord-monitoring`.
+Pre-load the Discord webhook URL (the old `/grug/dd-notify-handle`
+placeholder is retired — it pointed at an undeliverable `@grug-stub`):
 
 ```bash
 aws ssm put-parameter --region us-east-1 \
-  --name /shared/datadog-app-key --type SecureString --value "<app key>"
+  --name /infra/discord/monitoring-alerts --type SecureString \
+  --value "https://discord.com/api/webhooks/<id>/<token>"
 ```
 
-(API key already loaded for the Lambda extension; App key is
-admin-scoped and only needed by the deploy role.)
+(To route somewhere other than Discord, swap the `Webhook`/notify-handle
+wiring in `infra/pulumi/__main__.py` for your target.)
+
+DD also needs an App key (in addition to the API key) for monitor
+creation. Both are the shared-infra keys (`/shared/datadog-*` were
+revoked):
+
+```bash
+aws ssm put-parameter --region us-east-1 \
+  --name /infra/datadog/app_key --type SecureString --value "<app key>"
+```
+
+(The API key `/infra/datadog/api_key` ships traces/logs via the
+cluster's node-local Datadog agent; the App key is admin-scoped and
+only needed by the deploy role for monitor/dashboard/RUM management.)
 
 ## When done
 
@@ -182,6 +182,6 @@ Tell me "HITL done" and I'll run `pulumi up` to provision the dev stack.
 
 ## Recovery / rotation
 
-- **App private key compromised:** generate a new one in GH UI, `aws ssm put-parameter --overwrite ...`, redeploy Lambda (env var read at cold start)
-- **Webhook secret compromised:** generate new `openssl rand -hex 32`, update both GH App + SSM (`--overwrite`), Lambda picks up on next cold start
-- **OAuth client secret compromised:** rotate in GH App UI, update SSM, redeploy
+- **App private key compromised:** generate a new one in GH UI, `aws ssm put-parameter --overwrite ...`, then `kubectl -n grug rollout restart deploy/grug-api deploy/grug-webhook deploy/grug-consumer` (pods read the SSM value at startup)
+- **Webhook secret compromised:** generate new `openssl rand -hex 32`, update both GH App + SSM (`--overwrite`), then rollout-restart the pods to pick it up
+- **OAuth client secret compromised:** rotate in GH App UI, update SSM, rollout-restart the pods
