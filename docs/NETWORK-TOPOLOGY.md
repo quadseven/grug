@@ -1,17 +1,18 @@
 # Grug network topology
 
-Mermaid's flowchart auto-layout produces overlapping edges on dense topologies — switching to **tables for static state** + **sequence diagrams for flows** (which render cleanly). Only the observability fan-out diagram (Section H) stays as a flowchart because the visual relationship is what's load-bearing.
+Mermaid's flowchart auto-layout produces overlapping edges on dense topologies — this doc uses **tables for static state** + **sequence diagrams for flows** (which render cleanly). Only the observability fan-out diagram (Section H) stays as a flowchart because the visual relationship is what's load-bearing.
 
-> **Last meaningful update:** 2026-05-24 — RUM went live via spec 0013 (PRs #164, #166, #171); the observability matrix is now ✅ across all four pillars (APM + Logs + Monitors + RUM).
+> **Last meaningful update:** 2026-06-16 — rewritten for the self-hosting cutover (#354/#368). The backend left AWS Lambda for Kubernetes: `api.grug.lol` + `webhook.grug.lol` now resolve through a **Cloudflare tunnel** to in-cluster Services (not CF Workers + Lambda Function URLs), the store is **Postgres `grug_kv` (CNPG)** (not DynamoDB), and async work runs on a **SQS-fed consumer** (not SQS→Lambda event-source mappings). The `grug.lol` landing + SPA + RUM frontend is unchanged (still Cloudflare Pages).
 
 External SaaS the stack depends on (flat dependencies, not topology):
 
-- **Cloudflare Pages** — `grug-web` project at apex `grug.lol` (static + SPA)
-- **Cloudflare DNS + Workers** — proxied A records for `api.grug.lol` + `webhook.grug.lol`; two Host-rewrite Workers
-- **AWS us-east-1** account `<aws-account-id>` — Lambda, DDB, KMS, SSM, ECR, CloudWatch Logs
-- **Datadog US1** — APM + Logs + RUM + Monitors + Synthetics
-- **GitHub** — App registration `grug-tribe` (webhook source + OAuth identity provider) + Actions OIDC (deploys)
-- **Pulumi Cloud** — `<pulumi-org>/grug/{dev,prod}` stacks (no passphrase)
+- **Cloudflare Pages** — `grug-web` project at apex `grug.lol` (static landing + React SPA). Unchanged by the cutover.
+- **Cloudflare DNS + tunnel** — proxied records for `api.grug.lol` + `webhook.grug.lol` front a `cloudflared` tunnel that egresses to the in-cluster Services. (The legacy `*-host-rewrite` Workers + Lambda Function URLs are retired.)
+- **AWS us-east-1** — SSM Parameter Store (secrets), SQS FIFO (async jobs), KMS CMK (OAuth-token envelope encryption), S3 (cave diff bucket). Lambda, Lambda Function URLs, and ECR are **gone**; the `grug-main` DynamoDB table still exists in Pulumi state but is **no longer the store** (the store is Postgres) — removing it is a separate destructive decision.
+- **Datadog US1** — APM + Logs + LLM Observability + RUM + Monitors.
+- **GitHub** — App registration (webhook source + OAuth identity provider) + Actions OIDC (deploys).
+- **Pulumi Cloud** — `grug/{dev,prod}` stacks (AWS-side infra only; the k8s manifests are applied by the deploy workflow, not Pulumi).
+- **OKE cluster + in-cluster registry** — private infra (the operator's homelab/cloud). Not addressable from this public repo; reached at deploy time over an ephemeral tailnet join.
 
 ---
 
@@ -20,31 +21,58 @@ External SaaS the stack depends on (flat dependencies, not topology):
 | Surface | DNS | CF layer | Origin | Purpose |
 |---|---|---|---|---|
 | **Landing + SPA** | `grug.lol` | CF Pages (`grug-web` project, static assets + `_redirects`) | — | Marketing landing (static `index.html`) + React SPA at `/app.html` for `/signin`, `/dashboard`, `/admin` |
-| **User API** | `api.grug.lol` | CF DNS proxied → CF Worker `grug-api-host-rewrite` | Lambda Function URL → `grug-api` | OAuth callback, dashboard reads/writes, repo config CRUD, admin endpoints |
-| **GitHub webhook** | `webhook.grug.lol` | CF DNS proxied → CF Worker `grug-webhook-host-rewrite` | Lambda Function URL → `grug-webhook` | GitHub App webhook receiver — installations, PRs, check runs |
+| **User API** | `api.grug.lol` | CF DNS proxied → CF tunnel (`cloudflared`) | k8s Service `grug-api:8080` → `grug-api` pod | OAuth callback, dashboard reads/writes, repo config CRUD, admin endpoints |
+| **GitHub webhook** | `webhook.grug.lol` | CF DNS proxied → CF tunnel (`cloudflared`) | k8s Service `grug-webhook:8080` → `grug-webhook` pod | GitHub App webhook receiver — installations, PRs, check runs |
 
-Stacks: `dev` (live), `prod` (locked, not yet cut over).
+The tunnel is the only inbound path; the NetworkPolicy (Section G) denies all other ingress to the pods. The CF shared-secret + HMAC/session layers (Section G) are the request-auth boundary regardless of the transport.
 
 ---
 
-## B. AWS placement — what lives where
+## B. Placement — what lives where
 
-| Component | Resource | Notes |
+Two planes now: a **Kubernetes namespace** (`grug`) holding every runtime workload, and a thin set of **AWS resources** the pods consume at runtime.
+
+### B.1 Kubernetes (`grug` namespace, OKE — private infra)
+
+| Workload | Kind | Shape | Purpose |
+|---|---|---|---|
+| `grug-api` | Deployment (1 replica) | arm64, 50m/192Mi req, 512Mi limit, RollingUpdate `maxUnavailable:0` | FastAPI HTTP service for the dashboard/OAuth/admin. Serves `:8080`, `/livez` + dependency-aware `/readyz` (#404) |
+| `grug-webhook` | Deployment (1 replica) | same shape; `GRUG_K8S_RUNTIME=1` | GitHub webhook receiver. ACKs in <10s and offloads the Elder review to an in-process background thread (#368) |
+| `grug-consumer` | Deployment (1 replica, Recreate) | no HTTP surface; `command: consumer.py` | Long-polls the SQS FIFO queues (`grug-rerun-jobs`, `grug-cave-results`) and runs Elder re-runs (#368). One replica by design — batch-size-1 FIFO, a second would interleave message groups |
+| `grug-poller` | CronJob (`*/15`) | `poller_handler.handler` | Reaction poller (was an EventBridge-scheduled Lambda) |
+| `grug-key-rotator` | CronJob (`0 */12`) | `key_rotator` module | Interim AWS key-rotator (#386): mints a new `grug-k8s-pod` access key, patches `grug-secrets`, rolls the three Deployments, deletes the old key. The **only** workload with k8s API access (RBAC-scoped to one Secret + three Deployments) |
+
+All workloads run the **same image** (the webhook image carries the full dependency graph); only `command`/env differ. Shared hardening: `runAsNonRoot` (uid 10001), `readOnlyRootFilesystem`, `drop: [ALL]`, `automountServiceAccountToken:false` (except the rotator), arm64 `nodeSelector`, `imagePullSecrets: registry-pull`.
+
+In-cluster Secrets (seeded by the deploy workflow from SSM/SQS/S3 — never committed):
+
+| Secret | Holds | Consumed by |
 |---|---|---|
-| `grug-api` Lambda | `arn:aws:lambda:us-east-1:<aws-account-id>:function:grug-api` | arm64, 512MB, 15s timeout, container image from ECR. FastAPI via Mangum. DD Extension 96-next baked in |
-| `grug-webhook` Lambda | `arn:aws:lambda:us-east-1:<aws-account-id>:function:grug-webhook` | Same shape; tighter DDB IAM scope (no token reads) |
-| Function URLs | `:url:grug-api`, `:url:grug-webhook` | AuthType=NONE; CF is the trust boundary. api Lambda has CORS allow `https://grug.lol` |
-| ECR repos | `grug-api`, `grug-webhook` | Private; 14d untagged GC |
-| DynamoDB | `grug-main` | Single-table, PAY_PER_REQUEST |
-| KMS CMK | `grug-tokens` | Envelope-encrypts OAuth tokens (api Lambda only) + Lambda env vars (both) |
-| SSM `/grug/*` | App ID, private key, webhook secret, OAuth client id+secret, CF creds, DD notify handle, **DD RUM app ID + client token** (managed by Pulumi) | SecureStrings |
-| SSM `/shared/*` | DD API key, DD APP key (`/shared/datadog-app-key/github-grug`), Pulumi access token | Cross-cutting; some managed by `infrastructure/pulumi/aws-cicd-bootstrap` |
-| CloudWatch Logs | per-Lambda log group | DD Extension streams via Lambda layer |
-| IAM | `grug-gha-deploy` role | OIDC trust for `githumps/grug` main + `feat/*` + `fix/*` + `hotfix/*` + `v*` tags |
+| `grug-secrets` | `grug-k8s-pod` AWS credential, `GRUG_DATABASE_URL`, `GRUG_KMS_CMK_ARN`, the three `*_QUEUE_URL`s, `GRUG_CAVE_DIFF_BUCKET` | api / webhook / consumer / poller (`envFrom`) |
+| `grug-rotator-secret` | `grug-k8s-rotator` AWS credential (scoped to access-key ops on `grug-k8s-pod`) | key-rotator only |
+| `registry-pull` | in-cluster registry pull credential | all pods (`imagePullSecrets`) |
+
+The pods do **not** carry app secrets (App key, OAuth secrets, LLM keys, CF shared secret): those are read from SSM **at runtime** via the `*_SSM` path env vars (`secrets_loader`), using the AWS credential in `grug-secrets`. The pod secret carries only the AWS credential authorizing those reads plus deploy-resolved values that must not be committed (the queue URLs and CMK ARN embed the account id).
+
+### B.2 AWS us-east-1 (runtime dependencies)
+
+| Resource | Name | Notes |
+|---|---|---|
+| SSM `/grug/*` | App ID, private key, webhook secret, OAuth client id+secret, session-signing secret, CF shared secret, KMS CMK ARN, database URL, k8s-pod + rotator AWS keys, DD RUM app id+token, prompt-experiment + fallback flags | SecureStrings; some Pulumi-managed (RUM ids), most hand-seeded (HITL prereqs) |
+| SSM `/infra/llm/*` | `openrouter_api_key`, `poolside_api_key` | Elder LLM backends (shared infra namespace) |
+| SQS FIFO | `grug-rerun-jobs.fifo`, `grug-cave-results.fifo`, `grug-cave-jobs.fifo` (+ DLQs) | Consumed by `grug-consumer`; redrive → DLQ at `maxReceiveCount` |
+| KMS CMK | `grug-tokens` | Envelope-encrypts user OAuth/credential blobs (`crypto/kms_envelope`). `grug-api` holds `kms:Decrypt`; webhook uses the GitHub App JWT instead |
+| S3 | `grug-cave-diffs*` | Cave (self-hosted LLM) diff hand-off bucket |
+| DynamoDB | `grug-main` | **Legacy — NOT the store.** Exists in Pulumi state; the store is Postgres `grug_kv`. Removal is a separate decision |
+| IAM | `grug-gha-deploy` (OIDC), `grug-k8s-pod`, `grug-k8s-rotator` users | Deploy role reads `/grug/*` for the secret seed; pod user is the runtime principal; rotator user rotates the pod key |
+
+### B.3 Postgres (CNPG — private infra)
+
+The single-table store `grug_kv(pk, sk, data jsonb, gsi1pk, gsi1sk, ttl)` lives on a **shared CloudNativePG cluster** in private infra (#354 store swap). Reached over the cluster network on `5432` via `GRUG_DATABASE_URL` (`psycopg`, lazy pool). DDB's lazy TTL became an explicit "skip expired rows on read" filter (Postgres has no TTL reaper).
 
 ---
 
-## C. Landing-page request flow (`grug.lol/`)
+## C. Landing-page request flow (`grug.lol/`) — unchanged
 
 ```mermaid
 sequenceDiagram
@@ -58,13 +86,13 @@ sequenceDiagram
     CF-->>Browser: 200 dist/index.html (no rewrite — implicit index)
     Browser->>Bundle: GET /assets/*.{css,js}
     Bundle-->>Browser: 200 with Cache-Control: max-age=31536000, immutable
-    Browser->>DD: DD_RUM.init() → session open + first view event
-    Note over DD: applicationId e075ed8c-1937-...<br/>service grug-web · env dev
+    Browser->>DD: DD_RUM.init() -> session open + first view event
+    Note over DD: service grug-web · env prod
     DD-->>Browser: 202 Accepted
-    Browser->>DD: (continuous) action / error / resource / long-task events<br/>+ session replay (100% sample)
+    Browser->>DD: (continuous) action / error / resource / long-task events<br/>+ session replay
 ```
 
-Routing rules live in `web/public/_redirects`. **Cardinal rule (learned PR #160):** destinations must NOT end in `.html` — CF Pretty URLs 308-canonicalizes the dest, converting the 200 rewrite into a 301 redirect.
+Routing rules live in `web/public/_redirects`. **Cardinal rule (learned PR #160):** destinations must NOT end in `.html` — CF Pretty URLs 308-canonicalizes the dest, converting the 200 rewrite into a 301 redirect. This frontend talks only to `api.grug.lol`; the backend migration did not touch it.
 
 ---
 
@@ -75,30 +103,31 @@ sequenceDiagram
     autonumber
     participant SPA as React SPA<br/>(in browser)
     participant CFDNS as CF DNS<br/>api.grug.lol (proxied)
-    participant Worker as CF Worker<br/>grug-api-host-rewrite
-    participant FURL as Lambda Function URL<br/>...lambda-url.us-east-1.on.aws
-    participant API as grug-api Lambda<br/>FastAPI / Mangum
+    participant Tunnel as CF tunnel<br/>cloudflared
+    participant SVC as k8s Service<br/>grug-api:8080
+    participant API as grug-api pod<br/>FastAPI / uvicorn
     participant SSM
+    participant PG as Postgres grug_kv<br/>(CNPG)
     participant KMS
-    participant DDB as DynamoDB grug-main
 
     SPA->>CFDNS: GET /api/v1/dashboard (cookie)
-    CFDNS->>Worker: route api.grug.lol/*
-    Worker->>FURL: rewrite Host: header to lambda-url FQDN
-    FURL->>API: invoke (cold or warm)
-    API->>SSM: GetParameter /grug/github-app-* (cached after cold start)
-    API->>DDB: Query PK=USER#<gh_id>
-    DDB-->>API: row w/ encrypted token blob
+    CFDNS->>Tunnel: route api.grug.lol/*
+    Tunnel->>SVC: forward (adds X-Grug-CF-Secret)
+    SVC->>API: proxy to a ready pod
+    API->>API: cf_auth.py validates X-Grug-CF-Secret (else 401)
+    API->>SSM: GetParameter /grug/* (cached after first read)
+    API->>PG: SELECT FROM grug_kv WHERE pk=USER#<gh_id>
+    PG-->>API: row w/ encrypted token blob
     API->>KMS: Decrypt(token_blob)
     KMS-->>API: plaintext access token
     API->>API: fetch repos via GH token
-    API-->>FURL: 200 JSON
-    FURL-->>Worker: 200
-    Worker-->>CFDNS: 200
+    API-->>SVC: 200 JSON
+    SVC-->>Tunnel: 200
+    Tunnel-->>CFDNS: 200
     CFDNS-->>SPA: 200 (URL stays api.grug.lol)
 ```
 
-CORS: api Lambda allows `https://grug.lol` only (exact-origin required for `credentials: true`). Methods: GET / POST / PUT / DELETE. Headers: content-type, authorization.
+CORS: the api service allows `https://grug.lol` only (exact-origin required for `credentials: true`). Methods GET/POST/PUT/DELETE; headers content-type, authorization. The pod is stateless and horizontally identical; `uvicorn` serves concurrent requests (no per-invocation isolation like the old Lambda).
 
 ---
 
@@ -109,185 +138,207 @@ sequenceDiagram
     autonumber
     participant GH as GitHub<br/>App webhook emitter
     participant CFDNS as CF DNS<br/>webhook.grug.lol (proxied)
-    participant Worker as CF Worker<br/>grug-webhook-host-rewrite
-    participant FURL as Lambda Function URL
-    participant WH as grug-webhook Lambda
-    participant SSM
-    participant DDB as DynamoDB grug-main
+    participant Tunnel as CF tunnel<br/>cloudflared
+    participant SVC as k8s Service<br/>grug-webhook:8080
+    participant WH as grug-webhook pod
+    participant PG as Postgres grug_kv
+    participant Thread as in-process Elder thread
+    participant SQS as SQS grug-rerun-jobs
 
     GH->>CFDNS: POST /webhook/github<br/>X-Hub-Signature-256: sha256=...
-    CFDNS->>Worker: route webhook.grug.lol/*
-    Worker->>FURL: rewrite Host:
-    FURL->>WH: invoke
-    WH->>SSM: GetParameter /grug/github-app-webhook-secret (cached)
-    WH->>WH: HMAC-SHA256 verify body
+    CFDNS->>Tunnel: route webhook.grug.lol/*
+    Tunnel->>SVC: forward (adds X-Grug-CF-Secret)
+    SVC->>WH: proxy to a ready pod
+    WH->>WH: cf_auth + HMAC-SHA256 verify body
     alt signature valid
-        WH->>DDB: GetItem PK=INST#<id> (allowlist check)
-        DDB-->>WH: allowlisted=true
-        WH->>WH: dispatch persona (TPM evaluate_pull_request)
-        WH-->>FURL: 200
+        WH->>PG: read INST#<id> (allowlist check)
+        PG-->>WH: allowlisted=true
+        WH->>Thread: enqueue_elder_review (background thread, #368)
+        WH-->>SVC: 200 (ACK < 10s)
+        Thread->>Thread: run Elder review (1-2 LLM calls)
+        Note over Thread,SQS: on unhandled failure -> _self_recover_review<br/>enqueues ONE re-run to grug-rerun-jobs (#418)
     else signature invalid
-        WH-->>FURL: 401
-        Note over WH,FURL: DD monitor<br/>[grug-webhook] sig-verify failures > 0.1/min<br/>fires on this path
+        WH-->>SVC: 401
+        Note over WH,SVC: DD monitor on sig-verify failures fires here
     end
-    FURL-->>CFDNS: response
+    SVC-->>Tunnel: response
+    Tunnel-->>CFDNS: response
     CFDNS-->>GH: response
 ```
 
-Webhook never decrypts user tokens — uses GitHub App JWT (signed via `/grug/github-app-private-key`).
+The webhook never decrypts user tokens — it authenticates as the GitHub App (JWT signed with `/grug/github-app-private-key`). The Elder review runs on a daemon thread so a pod restart drops it best-effort; #418 self-recovery enqueues a durable re-run to SQS so a dropped review heals without a human re-push (see `reference_grug_auto_recovery_rerun_queue`).
 
 ---
 
-## F. Deploy plane — GHA OIDC → AWS + CF + DD
+## F. Async consumer flow (SQS → `grug-consumer`)
+
+```mermaid
+sequenceDiagram
+    autonumber
+    participant Q1 as SQS grug-rerun-jobs.fifo
+    participant Q2 as SQS grug-cave-results.fifo
+    participant C as grug-consumer pod<br/>(long-poll, batch 1)
+    participant PG as Postgres grug_kv
+    participant GH as GitHub Checks API
+    participant DLQ as SQS DLQ
+
+    C->>Q1: ReceiveMessage (long poll)
+    Q1-->>C: rerun job (or empty)
+    C->>C: dispatch_code_review (full Elder re-run)
+    C->>PG: claim_delivery (idempotency)
+    C->>GH: post check-run / review
+    alt success
+        C->>Q1: DeleteMessage
+    else unhandled failure
+        Note over C,Q1: no delete -> visibility timeout -> redeliver
+        Q1->>DLQ: after maxReceiveCount (terminal, visible signal)
+    end
+    C->>Q2: ReceiveMessage (cave results, same loop)
+    Q2-->>C: cave result -> post to GitHub
+```
+
+The consumer is the recovery layer for dropped async reviews (the SQS redrive contract retries; a persistent failure lands in the DLQ). A watchdog (#405/#412) exits the process if a consumer thread dies so the kubelet restarts the pod; `tracer.flush()` is bounded by `DD_TRACE_AGENT_TIMEOUT_SECONDS=2` so a dead trace agent can't stall the watchdog.
+
+---
+
+## G. Deploy plane — two control planes
 
 ```mermaid
 sequenceDiagram
     autonumber
     participant Push as Push / Merge to main
-    participant IAC as iac.deploy.yml<br/>(ubuntu-latest)
-    participant Web as web.deploy.yml<br/>(ubuntu-latest)
-    participant OIDC as AWS STS<br/>via OIDC
-    participant Role as grug-gha-deploy<br/>role
-    participant SSM
-    participant ECR
-    participant Pulumi as Pulumi Cloud<br/>grug/dev stack
-    participant CFAPI as Cloudflare API
+    participant IAC as iac.deploy.yml<br/>(AWS infra, Pulumi)
+    participant K8S as deploy.k8s.yml<br/>(images + manifests)
+    participant Web as web.deploy.yml<br/>(CF Pages)
+    participant OIDC as AWS STS via OIDC
+    participant Pulumi as Pulumi Cloud<br/>grug stack
+    participant Reg as in-cluster registry
+    participant TS as tailnet (ephemeral)
+    participant K as OKE cluster
 
-    Push->>IAC: workflow_run
-    Push->>Web: workflow_run
+    Push->>IAC: push (paths: infra/**)
+    Push->>K8S: push (paths: services/** , k8s/**)
+    Push->>Web: push (web/**)
 
-    par IaC path
-        IAC->>OIDC: assume role via id-token
-        OIDC->>Role: federated trust check
-        Role-->>IAC: temp credentials (1h)
-        IAC->>SSM: GetParameter /shared/pulumi-access-token
-        IAC->>ECR: docker push grug-{api,webhook}:<sha>
-        IAC->>Pulumi: pulumi up dev (Lambda + DDB + KMS + DNS + RUM app + SSM puts)
-        IAC->>CFAPI: deploy Workers via curl
-    and Web path
-        Web->>OIDC: assume role via id-token
-        OIDC->>Role: federated trust check
-        Web->>SSM: GetParameter /grug/cloudflare-{api-token,account-id,zone-id}
-        Web->>SSM: GetParameter /grug/dd-rum-{application-id,client-token}
-        Web->>Web: npm run build (Vite inlines VITE_DD_RUM_* into bundle)
-        Web->>Web: sed inject DD_RUM_* into dist/{index,Privacy,Terms}.html
-        Web->>CFAPI: wrangler pages deploy dist (project grug-web)
+    par AWS infra (Pulumi)
+        IAC->>OIDC: assume grug-gha-deploy
+        IAC->>Pulumi: pulumi up (DD monitors+dashboard+RUM, KMS, SSM refs, OIDC, k8s IAM users, SQS, cf-shared-secret)
+    and k8s app (images + manifests)
+        K8S->>OIDC: assume grug-gha-deploy (read /grug/* for seed)
+        K8S->>Reg: docker build --arch arm64 + push grug-{api,webhook}, capture @sha256 digest
+        K8S->>TS: join tailnet (tag:ci ephemeral authkey)
+        K8S->>K: seed grug-secrets / grug-rotator-secret / registry-pull from SSM+SQS+S3
+        K8S->>K: sed-pin REGISTRY/TAG placeholders -> digest, kubectl apply -k, rollout status, poller smoke job
+    and frontend (CF Pages)
+        Web->>OIDC: assume grug-gha-deploy (read CF + RUM ids from SSM)
+        Web->>Web: npm run build (Vite inlines VITE_DD_RUM_*), wrangler pages deploy
     end
 ```
 
-**Runner-swap gotcha** (memory: `feedback_runner_swap_check_preinstalled_tools`): when iac.deploy was swapped from `the self-hosted CI runner` to `ubuntu-latest` (PR #156), the workflow assumed `uv` was preinstalled — true for the self-hosted runner, false for ubuntu-latest. Pulumi silently no-op'd for 24h until PR #166 added an explicit `astral-sh/setup-uv` step.
+**Public-repo discipline (load-bearing):** no infra identifiers are committed. The registry host arrives via `vars.DEPLOY_REGISTRY_HOST`, cluster + join creds via the `k8s-prod` environment secrets (`KUBECONFIG_B64`, `TS_AUTHKEY`, `REGISTRY_*`), and the manifests carry `REGISTRY_PLACEHOLDER`/`TAG_PLACEHOLDER` that the workflow rewrites at deploy time (a post-sed sentinel fails the deploy if any placeholder survives). Images deploy by **immutable `@sha256` digest**, not the mutable tag. `workflow_dispatch` is guarded to `main` so a manual run from any ref can't reach the environment secrets.
 
 ---
 
-## G. Trust boundaries
+## H. Trust boundaries
 
 | Boundary | Outside | Inside | Mechanism |
 |---|---|---|---|
 | **Public → CF** | Internet | Cloudflare edge | TLS termination + WAF / bot mgmt at CF tier |
-| **CF → AWS** | CF Workers | Lambda Function URL | Worker rewrites `Host:` header AND injects `X-Grug-CF-Secret` from a Worker secret binding sourced from SSM `/grug/cf-shared-secret`. Lambda middleware (`services/{api,webhook}/cf_auth.py`) validates the header on every non-`/livez` request via `hmac.compare_digest`; direct hits on the Function URL return 401. Spec 0014 (CfSharedSecret) encodes the contract. DD monitor `grug-cf-secret-mismatch` alerts on >1/min mismatches over 10min (catches rotation drift or direct probing) |
-| **AWS → Lambda env vars** | Lambda env (plaintext to the function) | KMS-encrypted at rest | `env_vars_kms_key_arn=grug-tokens-cmk`. `kms:Decrypt` scoped via `kms:ViaService = lambda.us-east-1.amazonaws.com` so the perm can't be reused for other KMS resources |
-| **api Lambda → user OAuth tokens** | DDB encrypted blob | Plaintext access/refresh token | KMS envelope decrypt. Only `grug-api` role has `kms:Decrypt` on `grug-tokens-cmk`. `grug-webhook` does NOT — webhook uses GitHub App JWT |
-| **Webhook payload** | GitHub | grug-webhook handler | HMAC-SHA256 verify against `/grug/github-app-webhook-secret`. 401 on mismatch. DD monitor on >0.1/min |
-| **User session** | Browser cookie | api.grug.lol handlers | Cookie issued by `/api/v1/auth/github/callback`. SameSite=Lax. CORS `allow_credentials=true` requires exact-origin (no `*`) — `https://grug.lol` enumerated |
+| **CF → cluster** | CF tunnel | k8s Service `:8080` | `cloudflared` is the only inbound path (NetworkPolicy denies the rest). The tunnel injects `X-Grug-CF-Secret`; `services/{api,webhook}/cf_auth.py` validates it via `hmac.compare_digest` on every non-`/livez` request — a request that bypasses the tunnel has no valid header and gets 401. Secret in SSM `/grug/cf-shared-secret`; DD monitor on mismatch spikes |
+| **Pod → AWS** | k8s Secret (plaintext to the process) | SSM / SQS / KMS / S3 | The `grug-k8s-pod` IAM credential in `grug-secrets`, rotated every 12h by the key-rotator CronJob. Pod reads app secrets from SSM at runtime (not baked into the image) |
+| **api pod → user OAuth tokens** | Postgres encrypted blob | plaintext access/refresh token | KMS envelope decrypt (`grug-tokens` CMK). Only the api path holds `kms:Decrypt`; the webhook uses the GitHub App JWT |
+| **Webhook payload** | GitHub | grug-webhook handler | HMAC-SHA256 verify against `/grug/github-app-webhook-secret`; 401 on mismatch |
+| **Namespace segmentation** | other tenants on the shared cluster | grug pods | NetworkPolicy: `default-deny-ingress` + `allow-http-ingress` (TCP 8080 to api/webhook only; consumer/poller/rotator stay sealed) + `allow-egress-scoped` (DNS 53, HTTPS 443, Postgres 5432, DD agent 8125/8126). **Only enforced if the cluster CNI is policy-capable** (e.g. Calico); harmless-but-inert otherwise |
+| **k8s API access** | every other grug pod (none) | key-rotator pod only | RBAC Role scoped to `get/patch` on the single `grug-secrets` Secret + the three named Deployments; `automountServiceAccountToken:true` on that one Job pod, false everywhere else |
+| **User session** | Browser cookie | api handlers | Cookie issued by `/api/v1/auth/github/callback`, HMAC-signed with `/grug/session-signing-secret` (decoupled from the webhook secret). SameSite=Lax. CORS `allow_credentials=true` requires exact-origin `https://grug.lol` |
 
 ---
 
-## H. Observability fan-out (the one diagram where the picture is the point)
+## I. Observability fan-out (the one diagram where the picture is the point)
 
 ```mermaid
 flowchart LR
-    L_API["grug-api Lambda"]
-    L_WH["grug-webhook Lambda"]
+    API["grug-api pod"]
+    WH["grug-webhook pod"]
+    CON["grug-consumer pod"]
+    POLL["grug-poller CronJob"]
     SPA["React SPA + static HTML<br/>(in browser)"]
 
-    APM["DD APM<br/>service:grug-api · grug-webhook"]
-    LOGS["DD Logs<br/>via Lambda Extension"]
-    RUM["DD RUM<br/>service:grug-web<br/>applicationId e075ed8c-..."]
-    MON["DD Monitors · 5x<br/>+ Synthetics"]
+    AGENT["node-local DD agent<br/>(DD_AGENT_HOST = status.hostIP)<br/>DogStatsD 8125 / APM 8126"]
+    APM["DD APM + LLM Obs<br/>service:grug-api · grug-webhook<br/>grug-consumer · grug-poller<br/>ml_app:grug-elder"]
+    LOGS["DD Logs<br/>(DD_LOGS_INJECTION, trace-correlated)"]
+    RUM["DD RUM<br/>service:grug-web"]
+    MON["DD Monitors (Pulumi)<br/>KSM workload-not-ready / crashloop /<br/>restart-spike / poller-unhealthy +<br/>SQS backlog + cave fallback"]
 
-    L_API -- "✅ traces" --> APM
-    L_WH -- "✅ traces" --> APM
-    L_API -- "✅ logs (trace-correlated)" --> LOGS
-    L_WH -- "✅ logs (trace-correlated)" --> LOGS
-    SPA -- "✅ view / action / error / long-task<br/>+ session replay (100%)" --> RUM
-    MON -- "synthetic GET /livez every 5min" --> L_API
-    MON -- "synthetic GET /livez every 5min" --> L_WH
+    API --> AGENT
+    WH --> AGENT
+    CON --> AGENT
+    POLL --> AGENT
+    AGENT -- traces --> APM
+    AGENT -- logs --> LOGS
+    SPA -- view / action / error + replay --> RUM
+    MON -. watches kubernetes_state.* + logs .-> API
 
     classDef green fill:#1b5e20,stroke:#4caf50,stroke-width:2px,color:#fff
     classDef yellow fill:#f57f17,stroke:#ffc107,stroke-width:2px,color:#fff
     class APM,LOGS,RUM green
-    class MON yellow
+    class MON,AGENT yellow
 ```
 
-| Pillar | Status | Live evidence (2026-05-24) |
+| Pillar | Status | Notes |
 |---|---|---|
-| **APM traces** | ✅ | `grug-api` 271 spans / 6h. `grug-webhook` 36 spans / 1h. FastAPI auto-instrumented. Source-code linking via `DD_GIT_*` env vars (full 40-char SHA — Greptile P1 PR #81). Inferred-spans pollution killed via `DD_TRACE_MANAGED_SERVICES=false` |
-| **Logs** | ✅ | DD Extension 96-next baked into image. 47 logs / 1h with `service`/`env`/`version`/`host` + `trace_id`+`span_id` for click-through |
-| **Monitors** | ✅ | 5: `[grug-webhook] 5xx > 1%`, `[grug-api] 5xx > 5%`, `[grug-webhook] sig-verify failures > 0.1/min`, `[grug] cold-start p99 > 3s`, synthetic uptime on both `/livez` every 5min |
-| **RUM** | ✅ | App ID `e075ed8c-1937-4c39-b1f0-548ebdaf48e6`. Service tag `grug-web`. 100% session-replay sampling. SDK loaded on all 4 HTML surfaces (`web/app.html` SPA via `@datadog/browser-rum`; `web/public/{index,Privacy,Terms}.html` via CDN snippet). First session opened 2026-05-24 ~14:30 UTC after PR #171 cleared the IAM gate |
+| **APM traces** | live | `ddtrace` on every workload (FastAPI auto-instrument for the HTTP pods; `ddtrace-run` for consumer/poller/rotator). Spans reach the **node-local** agent at `DD_AGENT_HOST=status.hostIP` (set per pod — a missing value silently drops APM). `DD_VERSION` = the build SHA. Verify via trace metrics, not raw span search (`feedback_verify_apm_via_trace_metrics`) |
+| **LLM Observability** | live | `DD_LLMOBS_ENABLED=true`, `DD_LLMOBS_ML_APP=grug-elder` on the LLM-calling workloads |
+| **Logs** | live | `DD_LOGS_INJECTION=true` correlates `trace_id`/`span_id`; service/env/version tags from the deploy |
+| **Monitors** | live | Pulumi-managed (`components/dd_monitors.py`), scoped `kube_namespace:grug`: KSM workload-not-ready / crashloop / restart-spike / poller-cronjob-unhealthy (#406) + SQS backlog + cave-fallback. Routed to the operator's Discord alert channel |
+| **RUM** | live | Frontend `service:grug-web` (unchanged). App id + client token in SSM, Pulumi-registered (`dd_rum`) |
 
 ---
 
-## I. Bridge components (load-bearing single points of failure)
+## J. Bridge components (load-bearing single points of failure)
 
 | Component | Why load-bearing |
 |---|---|
-| CF Worker `grug-{api,webhook}-host-rewrite` | Every public API + webhook request transits these. Without the Host-rewrite, Lambda Function URL rejects the request. Managed out-of-band via `infra/cloudflare/deploy.sh` — `pulumi-cloudflare` WorkerScript has known idempotency bugs |
-| `grug-tokens` KMS CMK | Single CMK for env-var encryption AND OAuth-token envelope encryption. Disable/wrong-region = every Lambda cold start fails to decrypt `DD_API_KEY` and dies. Inline policy uses `kms:ViaService = lambda.us-east-1.amazonaws.com` |
-| `/grug/cloudflare-api-token` SSM | Web deploys read this at workflow time (NOT a GitHub Actions secret — intentional). Rotate via SSM put; no code changes |
-| `/shared/datadog-app-key/github-grug` SSM | Per-project DD APP key. Needs `monitors_write` + `logs_read_data` + `rum_apps_read` + `rum_apps_write` + `product_analytics_apps_write` scopes — every scope earned a 403 during the RUM cascade until added |
-| `grug-gha-deploy` IAM role | OIDC-trust-scoped to `githumps/grug`. Policy must allow `ssm:PutParameter` on `/grug/*` (added PR #171 after RUM `dd_rum` component became the first Pulumi-managed SSM writer) |
-| `iam_propagation_wait` (`pulumiverse_time.Sleep`) | Gates resources whose create/update runs an upfront AWS auth check against a freshly-updated deploy-role policy, so the policy has ~45s to propagate. Threaded via an `iam_propagation_wait=` kwarg into the factories that create them (#172): **Lambda** Functions (`lambda_service` / `scheduled_lambda`, KMS encrypt check), **SSM Params** (`dd_rum`, `ssm:PutParameter` — the RUM cascade race), and **EventBridge rules** (`scheduled_lambda`, `events:TagResource` — the #261 poller race). Any new resource class that depends on a same-run role-policy grant should take the kwarg + add it to `opts.depends_on` (grep `iam_propagation_wait=`). |
-| `DD Lambda Extension 96-next` (baked into ECR image) | Cold-start path loads this binary. Version bump = full image rebuild |
+| CF tunnel (`cloudflared`) | The ONLY inbound path to `api`/`webhook`. Tunnel down = both public surfaces 5xx (the NetworkPolicy blocks every other ingress). Runs in private infra, not this repo |
+| `grug-tokens` KMS CMK | Envelope-encrypts every user OAuth/credential blob; the api OAuth callback 500s without `kms:Decrypt` on it (`GRUG_KMS_CMK_ARN` must be in the pod secret — its omission is exactly what broke first-sign-in once) |
+| Postgres `grug_kv` (CNPG) | The store. Unreachable on 5432 = `/readyz` fails (#404), rollouts stall on the last-good pod, every dashboard/webhook read errors |
+| in-cluster registry + `registry-pull` Secret | Every pod pulls its image from here. A bad/expired pull credential = `ImagePullBackOff` cluster-wide for grug |
+| `grug-secrets` seed (deploy workflow) | Carries the AWS credential that authorizes all runtime SSM reads + the DB URL + queue URLs. A broken seed outages every pod — the workflow fails the deploy on any empty/`None` value before the destructive secret re-create |
+| key-rotator CronJob | Rotates the `grug-k8s-pod` key every 12h and rolls the Deployments to pick it up. A broken rotation eventually expires the only runtime AWS credential |
+| `grug-gha-deploy` IAM role | OIDC-trust-scoped to the repo; reads `/grug/*` for the seed and runs `pulumi up`. Both deploy planes depend on it |
 
 ---
 
-## J. Bootstrap order (cold-start, if rebuilding from zero)
+## K. Bootstrap order (cold-start, if rebuilding from zero)
 
-1. **Manual SSM pre-load** — `docs/HITL_PREREQUISITES.md` lists every parameter that must exist before first `pulumi up`:
-   - `/grug/github-app-{id,client-id,client-secret,private-key,webhook-secret}`
-   - `/grug/cloudflare-{api-token,zone-id,account-id}`
-   - `/grug/dd-notify-handle`
-   - `/shared/datadog-api-key`, `/shared/datadog-app-key/github-grug` (with all 5 scopes: `monitors_write`, `logs_read_data`, `rum_apps_read`, `rum_apps_write`, `product_analytics_apps_write`)
-   - `/shared/pulumi-access-token`
-2. **Pulumi up** — creates: SSM references, ECR repos, OIDC role, KMS CMK, DDB table, both Lambdas (bootstrap image), Function URLs, CF DNS records, DD monitors, **DD RUM Application + `/grug/dd-rum-{application-id,client-token}` SSM**. Lambda invocations error until step 4 swaps the image.
-3. **GH Actions sync** — `infrastructure/scripts/sync-gh-secrets.sh` pushes `grug-gha-deploy` role ARN → `AWS_DEPLOY_ROLE_ARN` repo var.
-4. **First `iac.deploy.yml` run** — builds + pushes real ECR images, second `pulumi up` swaps `image_tag` from `"bootstrap"` to the commit SHA.
-5. **First `web.deploy.yml` run** — runs `infra/cloudflare/pages-bootstrap.sh` ONCE to create the `grug-web` CF Pages project + apex domain attachment, then `wrangler pages deploy dist` ships the build (with `VITE_DD_RUM_*` env + sed-substituted static HTML).
-6. **`infra/cloudflare/deploy.sh`** — deploys both `grug-{api,webhook}-host-rewrite` Workers + binds routes. Re-run after any Lambda Function URL host change (memory: `reference_lambda_function_url_host_volatile`).
-7. **Manual GitHub App reg** — `https://github.com/settings/apps/grug-tribe` already exists; on a fresh tenant create a new App, set webhook URL = `https://webhook.<domain>/webhook/github`, setup URL = `https://<domain>/dashboard`, copy the App ID + private key into SSM (step 1).
+See `docs/SELF_HOST.md` + `docs/HITL_PREREQUISITES.md` for the full operator runbook. In brief:
 
----
-
-## K. Outage / first-light history (lessons baked into IaC + specs)
-
-| Date | Incident | Fix |
-|---|---|---|
-| 2026-05-07 | DD Lambda Extension synthesized `aws.lambda.url` phantom spans tagged with the Function URL FQDN as `service`, polluting the APM catalog | `DD_TRACE_MANAGED_SERVICES=false` on both Lambda env. Memory: `reference_dd_apm_asgi_resource_grouping` |
-| 2026-05-17 | DD APP key leaked into `pulumi preview` output (unwrapped `aws.ssm.get_parameter().value`) | Every SSM read for a secret now `pulumi.Output.secret()`-wrapped before being passed to providers. Memory: `feedback_pulumi_preview_secret_leak_guard` |
-| 2026-05-24 | Design handoff regressions on grug.lol — `/apps/grug` 404 + mailto: CTAs + URL slug `/Grug` | PRs #157 + #160 fixed the symptoms; spec 0012 (Landing) + 3 attesters now block this class of regression in CI |
-| 2026-05-24 | DD APP key per-project SSM path — `/shared/datadog-app-key` cross-repo path was stale after rotation; every `pulumi up` 403'd | Split into `/shared/datadog-app-key/github-grug` so per-repo rotations don't clobber siblings (PR #155) |
-| 2026-05-24 | iac.deploy silently no-op'd for 24h after the self-hosted → `ubuntu-latest` runner swap (PR #156) — workflow comment claimed `uv` was preinstalled (true for old runner, false for new) | PR #166 added `astral-sh/setup-uv@v5`. Memory: `feedback_runner_swap_check_preinstalled_tools` |
-| 2026-05-24 | RUM first-light cascade — 5 sequential 403s as each layer surfaced its next missing permission: `rum_apps_*` scopes → `product_analytics_apps_write` scope → `ssm:PutParameter` on `/grug/*` → IAM propagation race | DD UI scope additions (×2) + PR #171 (deploy role grant) + one-shot re-trigger (IAM propagation). RUM live in DD ~14:30 UTC after the cascade cleared |
+1. **Manual SSM pre-load** — every `/grug/*` parameter the pods read at runtime (App id/key/secret, OAuth client id+secret, webhook secret, session-signing secret, CF shared secret, KMS CMK ARN, database URL, k8s-pod + rotator AWS keys) plus `/infra/llm/*` LLM keys and `/shared/datadog-*` keys.
+2. **`pulumi up`** (`iac.deploy.yml`) — creates the AWS-side infra: SSM references, KMS CMK, OIDC role, the `grug-k8s-pod` + rotator IAM users, SQS FIFO queues + DLQs, S3 cave bucket, DD monitors/dashboard/RUM app. (DynamoDB `grug-main` still exists here as legacy.)
+3. **Provision Postgres** — the `grug_kv` table on the shared CNPG cluster; put its DSN in `/grug/database-url`.
+4. **Stand up the CF tunnel** — `cloudflared` routing `api.grug.lol` + `webhook.grug.lol` to the in-cluster Services; set the matching `/grug/cf-shared-secret`.
+5. **First `deploy.k8s.yml` run** — builds + pushes the arm64 images, joins the tailnet, seeds the three Secrets, applies `k8s/` by digest, waits on rollout + the poller smoke job.
+6. **First `web.deploy.yml` run** — builds + `wrangler pages deploy` the `grug-web` CF Pages project (with RUM ids from SSM).
+7. **GitHub App registration** — create/point the App: webhook URL `https://webhook.<domain>/webhook/github`, setup URL `https://<domain>/dashboard`; copy the App id + private key into SSM (step 1).
 
 ---
 
 ## L. Cross-references
 
-- The operator's private infra repo holds the sibling cluster-topology + cross-repo Pulumi-project-graph docs (not linked from this public repo).
-- [`docs/HITL_PREREQUISITES.md`](HITL_PREREQUISITES.md) — every SSM parameter that must exist before first `pulumi up`
-- [`docs/RUNBOOK.md`](RUNBOOK.md) — operational procedures for live grug.lol
-- [`specs/0012-landing/`](../specs/0012-landing/) — Landing IOA spec + 3 grounding attesters (CTAs, install URL, slug)
-- [`specs/0013-rum-instrumentation/`](../specs/0013-rum-instrumentation/) — RUM Instrumentation IOA spec + 2 grounding attesters (Pulumi registration, SDK loaded)
+- [`docs/RUNBOOK.md`](RUNBOOK.md) — operational procedures (deploy, secret rotation, failure modes, DR) for the live k8s runtime
+- [`docs/SELF_HOST.md`](SELF_HOST.md) — end-to-end self-hosting setup
+- [`docs/HITL_PREREQUISITES.md`](HITL_PREREQUISITES.md) — every SSM parameter that must exist before first deploy
+- [`docs/CUTOVER.md`](CUTOVER.md) — the Lambda → k8s migration record
+- [`k8s/`](../k8s/) — the manifests this doc describes (`networkpolicy.yaml` is the authoritative segmentation)
+- The operator's private infra repo holds the cluster-topology + cross-tenant Pulumi-project graph (not linked from this public repo)
 
 ---
 
 ## Updating this doc
 
-When a new public surface, Lambda, or cross-tier edge lands:
-1. Add a row to the **A** (public surfaces) or **B** (AWS placement) table.
-2. If it changes a flow, update the relevant sequence diagram in **C / D / E / F**.
-3. If it adds a trust boundary, append to **G**.
-4. If it adds a bridge component (single point of failure for multiple surfaces), append to **I**.
-5. If observability changes (new service tag, new monitor, new RUM event type), update **H** — both the diagram AND the matrix.
-6. If something breaks, add a row to **K** with the fix's PR/memory reference.
+When a new public surface, workload, or cross-tier edge lands:
+1. Add a row to **A** (public surfaces), **B.1** (k8s workloads), or **B.2** (AWS resources).
+2. If it changes a flow, update the relevant sequence diagram in **C / D / E / F / G**.
+3. If it adds or moves a trust boundary, update **H** (and `k8s/networkpolicy.yaml` if it changes segmentation).
+4. If it adds a single point of failure for multiple surfaces, append to **J**.
+5. If observability changes (new service tag, new monitor, new RUM event type), update **I** — both the diagram AND the matrix.
