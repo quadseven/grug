@@ -48,6 +48,7 @@ from personas.code_reviewer.persona import (
     CodeReviewEvaluation, Finding, evaluate_diff, with_extra_findings,
 )
 from personas.code_reviewer.sast import judge_candidates, scan_candidates
+from personas.code_reviewer.sca import scan_dependencies
 from adapters.install_store import put_comment_record  # type: ignore
 
 log = logging.getLogger(f"{os.getenv('DD_SERVICE', 'grug')}.persona.code_reviewer")
@@ -553,16 +554,20 @@ def dispatch_code_review(
 
     evaluation = evaluate_diff(hunks, llm_response)
 
-    # SAST detection tracer (#400, ADR-0006): a deterministic scan over the
-    # diff produces candidate vuln sites (recall), the exploitability judge
-    # keeps only the real ones (precision — suppressing the #391 public-config
-    # log), and the kept findings merge into the SAME evaluation so they flow
-    # through the existing publish path (no parallel posting). Best-effort: any
-    # SAST failure must not break the core review (judge_candidates already
-    # fails-closed; guard the scan/merge too).
+    # Security detection (ADR-0006 SAST #400/#401 + ADR-0007 SCA #434): two
+    # candidate SOURCES — the SAST engine over the diff code, and the SCA engine
+    # over the diff's dependency changes — feed ONE exploitability-judge pass
+    # (recall from the engines, precision from the judge), and the kept findings
+    # merge into the SAME evaluation so they flow the existing publish path (no
+    # parallel posting). Best-effort: any failure must not break the core review
+    # (judge_candidates already fails-closed; guard the scan/merge too).
     try:
-        sast_findings = judge_candidates(
-            scan_candidates(hunks, file_contents=file_contents),
+        candidates = (
+            scan_candidates(hunks, file_contents=file_contents)
+            + scan_dependencies(hunks)
+        )
+        security_findings = judge_candidates(
+            candidates,
             hunks,
             installation_id,
             pr_context={
@@ -573,19 +578,19 @@ def dispatch_code_review(
             },
             file_contents=file_contents,
         )
-        if sast_findings:
-            evaluation = with_extra_findings(evaluation, sast_findings)
+        if security_findings:
+            evaluation = with_extra_findings(evaluation, security_findings)
             log.info(
-                "sast_findings_merged",
+                "security_findings_merged",
                 extra={
                     "installation_id": installation_id,
                     "pr": f"{owner}/{repo_name}#{pull_number}",
-                    "count": len(sast_findings),
+                    "count": len(security_findings),
                 },
             )
-    except Exception as e:  # noqa: BLE001 — SAST is additive; never break the review
+    except Exception as e:  # noqa: BLE001 — security scan is additive; never break the review
         log.warning(
-            "sast_detection_failed",
+            "security_detection_failed",
             extra={
                 "installation_id": installation_id,
                 "pr": f"{owner}/{repo_name}#{pull_number}",
