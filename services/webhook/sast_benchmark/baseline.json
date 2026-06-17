@@ -1,0 +1,4 @@
+{
+  "_comment": "Recorded by the benchmark.sast.yml workflow_dispatch job (joins tailnet for sparkles, uses the free OpenRouter/Poolside key secrets). Empty until the first --record run; `python -m sast_benchmark --check` skips any backend with no baseline entry. Do not hand-edit recall numbers (AC4: no fabricated verdicts).",
+  "backends": {}
+}
