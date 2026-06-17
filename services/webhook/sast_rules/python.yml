@@ -1,0 +1,137 @@
+# Curated offline Semgrep rules for Elder SAST detection (#401, ADR-0006).
+#
+# VENDORED + run with `--config <this dir>` so the review path needs NO network
+# (the pod's egress is restricted; the semgrep registry is a runtime dependency
+# we refuse). High-signal patterns for the PRD's canonical vuln classes; recall
+# is the engine's job, the LLM exploitability judge (#400) prunes false
+# positives. Each rule carries `metadata.vuln_class` — the runner maps that to
+# the Candidate.vuln_class (the benchmark + finding grouping key). Keep this the
+# single source of class spellings shared with sast.py / the #399 corpus.
+rules:
+  - id: grug-sql-injection-concat
+    languages: [python]
+    severity: ERROR
+    message: Possible SQL injection - untrusted value concatenated/interpolated into a query.
+    metadata: {vuln_class: sql-injection}
+    patterns:
+      - pattern-either:
+          - pattern: $C.execute("..." + ...)
+          - pattern: $C.execute(f"...")
+          - pattern: $C.execute("...".format(...))
+          - pattern: $C.execute("..." % ...)
+
+  - id: grug-command-injection
+    languages: [python]
+    severity: ERROR
+    message: Possible command injection - untrusted value in a shell command.
+    metadata: {vuln_class: command-injection}
+    patterns:
+      - pattern-either:
+          - pattern: os.system(...)
+          - pattern: os.popen(...)
+          - pattern: subprocess.$F(..., shell=True, ...)
+
+  - id: grug-template-injection
+    languages: [python]
+    severity: ERROR
+    message: Possible template injection - untrusted value built into a template string.
+    metadata: {vuln_class: template-injection}
+    patterns:
+      - pattern-either:
+          - pattern: jinja2.Template("..." + ...)
+          - pattern: Template("..." + ...)
+          - pattern: jinja2.Template(f"...")
+          - pattern: Template(f"...")
+
+  - id: grug-ssrf
+    languages: [python]
+    severity: WARNING
+    message: Possible SSRF - request to a URL derived from input without validation.
+    metadata: {vuln_class: ssrf}
+    # Flag a request call whose URL arg is NOT a string literal (a literal URL
+    # is not SSRF; a variable/derived URL is the suspect). The judge confirms.
+    patterns:
+      - pattern-either:
+          - pattern: requests.get(...)
+          - pattern: requests.post(...)
+          - pattern: requests.request(...)
+          - pattern: urllib.request.urlopen(...)
+          - pattern: httpx.get(...)
+      - pattern-not: requests.get("...", ...)
+      - pattern-not: requests.post("...", ...)
+      - pattern-not: requests.request(..., "...", ...)
+      - pattern-not: urllib.request.urlopen("...", ...)
+      - pattern-not: httpx.get("...", ...)
+
+  - id: grug-hardcoded-credential
+    languages: [python]
+    severity: ERROR
+    message: Hardcoded credential/key - a secret assigned a string literal in source.
+    metadata: {vuln_class: hardcoded-credential}
+    patterns:
+      - pattern: $NAME = "..."
+      - metavariable-regex:
+          metavariable: $NAME
+          regex: (?i)(password|passwd|secret|token|api_?key|access_?key|secret_?key|private_?key|credential|client_?secret)
+
+  - id: grug-path-traversal
+    languages: [python]
+    severity: ERROR
+    message: Possible path traversal - file path built from untrusted input.
+    metadata: {vuln_class: path-traversal}
+    patterns:
+      - pattern-either:
+          - pattern: open("..." + ..., ...)
+          - pattern: open(f"...", ...)
+          - pattern: open(os.path.join(..., $X), ...)
+
+  - id: grug-unsafe-deserialization
+    languages: [python]
+    severity: ERROR
+    message: Unsafe deserialization - pickle/yaml.load on untrusted data executes arbitrary code.
+    metadata: {vuln_class: unsafe-deserialization}
+    patterns:
+      - pattern-either:
+          - pattern: pickle.loads(...)
+          - pattern: pickle.load(...)
+          - pattern: yaml.load($X)
+          - pattern: cPickle.loads(...)
+
+  - id: grug-weak-crypto
+    languages: [python]
+    severity: WARNING
+    message: Weak/misused crypto - MD5/SHA1/DES are not safe for security use.
+    metadata: {vuln_class: weak-crypto}
+    patterns:
+      - pattern-either:
+          - pattern: hashlib.md5(...)
+          - pattern: hashlib.sha1(...)
+          - pattern: Crypto.Cipher.DES.new(...)
+
+  - id: grug-xxe
+    languages: [python]
+    severity: ERROR
+    message: Possible XXE - XML parsed without disabling external entities.
+    metadata: {vuln_class: xxe}
+    patterns:
+      - pattern-either:
+          - pattern: lxml.etree.parse(...)
+          - pattern: xml.etree.ElementTree.parse(...)
+          - pattern: xml.dom.minidom.parse(...)
+
+  - id: grug-cleartext-secret-log
+    languages: [python]
+    severity: ERROR
+    message: Possible clear-text logging of a secret.
+    metadata: {vuln_class: cleartext-secret-log}
+    patterns:
+      - pattern-either:
+          - pattern: $LOG.$LVL(..., $SECRET, ...)
+          - pattern: $LOG.$LVL(..., $SECRET)
+          - pattern: print(..., $SECRET, ...)
+      - metavariable-regex:
+          metavariable: $LVL
+          regex: ^(debug|info|warning|warn|error|exception|critical)$
+      - metavariable-regex:
+          metavariable: $SECRET
+          regex: (?i)(password|passwd|secret|token|api_?key|access_?key|private_?key|credential|client_?secret)

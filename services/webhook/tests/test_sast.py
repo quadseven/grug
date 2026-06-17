@@ -10,15 +10,20 @@ discriminates).
 
 from __future__ import annotations
 
+import shutil
 from unittest.mock import patch
+
+import pytest
 
 from llm_client import FindingJudgement
 from personas.code_reviewer.diff_parser import parse_diff
+from personas.code_reviewer import sast
 from personas.code_reviewer.sast import (
     CLEARTEXT_SECRET_LOG,
     Candidate,
     judge_candidates,
     scan_candidates,
+    scan_semgrep,
 )
 
 
@@ -102,6 +107,107 @@ def test_removed_line_not_flagged_and_line_numbers_correct():
     # context line 1 (import), then the added line is new-side line 2.
     assert cands[0].line == 2
     assert "token" in cands[0].snippet
+
+
+def test_scan_candidates_default_engine_is_builtin():
+    """No engine configured -> builtin detector (the #400 zero-dep path)."""
+    diff = (
+        "diff --git a/auth.py b/auth.py\n--- a/auth.py\n+++ b/auth.py\n"
+        "@@ -0,0 +1,1 @@\n"
+        '+    logging.info("password=%s", password)\n'
+    )
+    assert len(scan_candidates(_hunks(diff), engine="builtin")) == 1
+
+
+# --- Semgrep engine (#401): mocked subprocess (parse/map/diff-filter/budget) --
+
+from unittest.mock import MagicMock  # noqa: E402
+
+from personas.code_reviewer.diff_parser import DiffHunk  # noqa: E402
+
+
+def _semgrep_json(results):
+    r = MagicMock()
+    r.stdout = json.dumps({"results": results, "errors": []})
+    return r
+
+
+import json  # noqa: E402
+
+
+def _hunk(path, new_lines):
+    body = "@@ -0,0 +1,%d @@\n" % max(new_lines) + "".join("+x\n" for _ in new_lines)
+    return DiffHunk(file_path=path, new_start=min(new_lines), new_lines=frozenset(new_lines), body=body)
+
+
+def test_scan_semgrep_maps_class_and_filters_to_added_lines(monkeypatch):
+    """Maps metadata.vuln_class -> Candidate; keeps only findings on lines the
+    PR added (a hit on an untouched line is dropped)."""
+    results = [
+        {"path": "auth.py", "start": {"line": 2}, "extra": {"metadata": {"vuln_class": "sql-injection"}, "lines": "q = ... + uid"}},
+        {"path": "auth.py", "start": {"line": 99}, "extra": {"metadata": {"vuln_class": "ssrf"}, "lines": "pre-existing"}},
+    ]
+    monkeypatch.setattr(sast.subprocess, "run", lambda *a, **kw: _semgrep_json(results))
+    hunks = (_hunk("auth.py", {1, 2}),)
+    out = scan_semgrep(hunks, {"auth.py": "code\n"})
+    assert len(out) == 1
+    assert out[0].vuln_class == "sql-injection" and out[0].line == 2  # line 99 filtered (not added)
+
+
+def test_scan_semgrep_no_file_contents_returns_empty():
+    assert scan_semgrep((_hunk("a.py", {1}),), {}) == ()
+
+
+def test_scan_semgrep_missing_binary_fails_safe(monkeypatch):
+    def _missing(*a, **kw):
+        raise FileNotFoundError("semgrep not installed")
+    monkeypatch.setattr(sast.subprocess, "run", _missing)
+    assert scan_semgrep((_hunk("a.py", {1}),), {"a.py": "x"}) == ()
+
+
+def test_scan_semgrep_run_failure_fails_safe(monkeypatch):
+    monkeypatch.setattr(sast.subprocess, "run", lambda *a, **kw: (_ for _ in ()).throw(sast.subprocess.TimeoutExpired("semgrep", 60)))
+    assert scan_semgrep((_hunk("a.py", {1}),), {"a.py": "x"}) == ()
+
+
+def test_scan_semgrep_skips_files_over_byte_budget(monkeypatch):
+    """AC5: a file beyond the byte budget is not scanned (cost bound)."""
+    monkeypatch.setattr(sast, "_MAX_SCAN_BYTES", 50)
+    seen_files = {}
+    def _capture(cmd, **kw):
+        # Count files actually written into the temp scan dir.
+        tmp = cmd[-1]
+        seen_files["count"] = sum(len(fs) for _, _, fs in __import__("os").walk(tmp))
+        return _semgrep_json([])
+    monkeypatch.setattr(sast.subprocess, "run", _capture)
+    contents = {"small.py": "x" * 10, "huge.py": "y" * 1000}
+    scan_semgrep((_hunk("small.py", {1}),), contents)
+    assert seen_files["count"] == 1  # only small.py fit the budget
+
+
+@pytest.mark.skipif(shutil.which("semgrep") is None, reason="semgrep not installed")
+def test_scan_semgrep_real_engine_detects_multiple_classes():
+    """End-to-end with the REAL semgrep over the vendored rules: a multi-class
+    diff yields candidates of the right classes on the added lines."""
+    diff = (
+        "diff --git a/v.py b/v.py\n--- a/v.py\n+++ b/v.py\n"
+        "@@ -0,0 +1,4 @@\n"
+        "+def f(conn, uid, host):\n"
+        '+    conn.execute("SELECT * FROM t WHERE id=" + uid)\n'
+        '+    import os; os.system("ping " + host)\n'
+        "+    import pickle; pickle.loads(host)\n"
+    )
+    hunks = parse_diff(diff)
+    file_contents = {
+        "v.py": (
+            "def f(conn, uid, host):\n"
+            '    conn.execute("SELECT * FROM t WHERE id=" + uid)\n'
+            '    import os; os.system("ping " + host)\n'
+            "    import pickle; pickle.loads(host)\n"
+        )
+    }
+    classes = {c.vuln_class for c in scan_semgrep(hunks, file_contents)}
+    assert {"sql-injection", "command-injection", "unsafe-deserialization"} <= classes
 
 
 def test_multiple_candidates_across_hunks():

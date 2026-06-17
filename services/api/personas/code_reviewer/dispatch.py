@@ -562,7 +562,7 @@ def dispatch_code_review(
     # fails-closed; guard the scan/merge too).
     try:
         sast_findings = judge_candidates(
-            scan_candidates(hunks),
+            scan_candidates(hunks, file_contents=file_contents),
             hunks,
             installation_id,
             pr_context={
