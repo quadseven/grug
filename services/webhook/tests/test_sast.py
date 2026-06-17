@@ -185,6 +185,23 @@ def test_scan_semgrep_skips_files_over_byte_budget(monkeypatch):
     assert seen_files["count"] == 1  # only small.py fit the budget
 
 
+def test_scan_semgrep_rejects_path_traversal_in_file_path(monkeypatch):
+    """A PR-controlled path that escapes the temp dir (../../etc/...) is NOT
+    written (arbitrary-write guard); the safe file is still scanned."""
+    import os as _os
+    written = []
+    def _capture(cmd, **kw):
+        tmp = cmd[-1]
+        for root, _d, files in _os.walk(tmp):
+            for fn in files:
+                written.append(_os.path.relpath(_os.path.join(root, fn), tmp))
+        return _semgrep_json([])
+    monkeypatch.setattr(sast.subprocess, "run", _capture)
+    scan_semgrep((_hunk("ok.py", {1}),), {"ok.py": "x = 1\n", "../../etc/evil.py": "pwned"})
+    assert "ok.py" in written
+    assert all(".." not in w for w in written)  # the escaping path never landed
+
+
 @pytest.mark.skipif(shutil.which("semgrep") is None, reason="semgrep not installed")
 def test_scan_semgrep_real_engine_detects_multiple_classes():
     """End-to-end with the REAL semgrep over the vendored rules: a multi-class
