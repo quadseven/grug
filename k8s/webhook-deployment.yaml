@@ -70,6 +70,10 @@ spec:
             - {name: GRUG_POOLSIDE_API_KEY_SSM, value: /infra/llm/poolside_api_key}
             - {name: GRUG_PROMPT_EXPERIMENT_SSM, value: /grug/elder-prompt-experiment}
             - {name: GRUG_FALLBACK_ENABLED_SSM, value: /grug/elder-fallback-enabled}
+            # SAST detection engine (#401): Semgrep OSS over the vendored
+            # offline rules. Default off (builtin) elsewhere; on for the review
+            # workloads (webhook + consumer). The semgrep CLI ships in the image.
+            - {name: GRUG_SAST_ENGINE, value: semgrep}
             - {name: DD_SITE, value: datadoghq.com}
             - {name: DD_LLMOBS_ENABLED, value: "true"}
             - {name: DD_LLMOBS_ML_APP, value: grug-elder}

@@ -60,10 +60,15 @@ _SAMPLES: tuple[CorpusSample, ...] = (
         name="hardcoded_credential",
         vuln_class="hardcoded-credential",
         path="bench/hardcoded_credential.py",
+        # NOTE: a REALISTIC (non-allowlisted) dummy value. SAST engines + secret
+        # scanners allowlist the canonical AWS docs example key
+        # (wJalrXUtnFEMI/...EXAMPLEKEY) to avoid docs false-positives, so using
+        # it here would measure 0 recall for this class. The vuln is the
+        # hardcoded secret regardless of the literal.
         diff_body=(
             "@@ -0,0 +1,2 @@\n"
-            '+AWS_SECRET_ACCESS_KEY = "wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY"\n'
-            "+client = boto3.client('s3', aws_secret_access_key=AWS_SECRET_ACCESS_KEY)"
+            '+SERVICE_API_KEY = "k3y-live-7f8a9b2c4d6e1f3a5b7c9d0e2f4a6b8c"\n'
+            "+client = ServiceClient(api_key=SERVICE_API_KEY)"
         ),
         is_true_positive=True,
     ),
