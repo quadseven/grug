@@ -89,4 +89,4 @@ Until then: mirror with discipline.
 - `services/api/ports/token_cache.py` — comparable one-adapter Protocol; collapse decision (issue #141)
 - PRD #21 — v1.5+ roadmap (code-reviewer + release-manager + stuck-PR-pulse personas)
 - Sandi Metz, *Practical Object-Oriented Design* — "wrong abstraction" cost argument
-- somatic-scripts `services/pasto-api/` ↔ `services/tempo-api/` — sibling project applying the same mirror-with-discipline pattern at larger scale
+- A sibling private project applies the same mirror-with-discipline pattern at larger scale (two mirrored service packages kept in lockstep)
