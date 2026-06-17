@@ -247,6 +247,7 @@ def test_flush_failure_is_visible_but_rate_limited(monkeypatch, caplog):
     zero-spans-and-blind state this slice kills) - log WARNING - but rate-limit
     so a sustained agent outage logs ~once/min, not on every 5s tick."""
     import logging
+    import types
 
     import ddtrace
 
@@ -255,7 +256,13 @@ def test_flush_failure_is_visible_but_rate_limited(monkeypatch, caplog):
     def _boom():
         raise RuntimeError("agent unreachable")
 
-    monkeypatch.setattr(ddtrace.tracer, "flush", _boom)
+    # Replace the WHOLE tracer object, not just `.flush` — under ddtrace's
+    # proxy/lazy tracer, patching the `.flush` attribute is order/version
+    # dependent and silently no-ops on some hosted runners (the real flush
+    # then succeeds and nothing warns -> a deterministic CI failure that
+    # cannot reproduce locally). `_flush_traces` only calls `ddtrace.tracer
+    # .flush()`, so a SimpleNamespace stands in deterministically.
+    monkeypatch.setattr(ddtrace, "tracer", types.SimpleNamespace(flush=_boom))
     with caplog.at_level(logging.WARNING):
         consumer._flush_traces()  # first failure -> warns
         consumer._flush_traces()  # immediate retry -> rate-limited, no second warn
