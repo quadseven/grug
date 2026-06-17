@@ -177,7 +177,7 @@ def test_run_sample_counts_findings_on_sample_path(monkeypatch):
         lambda resp: ([_F("bench/a.py"), _F("bench/a.py"), _F("other.py")], "model", None),
     )
     backend = _bench_backend()
-    assert runner.run_sample(backend, sample) == 2
+    assert runner.run_sample(backend, sample) == (2, False)
 
 
 def test_run_sample_transport_error_returns_zero(monkeypatch):
@@ -190,7 +190,8 @@ def test_run_sample_transport_error_returns_zero(monkeypatch):
 
     monkeypatch.setattr(runner, "_build_messages", lambda hunks, ver: [{"role": "user", "content": "x"}])
     monkeypatch.setattr(runner, "_post", _boom)
-    assert runner.run_sample(_bench_backend(), _TP_A) == 0
+    count, errored = runner.run_sample(_bench_backend(), _TP_A)
+    assert count == 0 and errored is True
 
 
 def test_run_backend_maps_every_sample(monkeypatch):
@@ -199,9 +200,27 @@ def test_run_backend_maps_every_sample(monkeypatch):
     monkeypatch.setattr(runner, "_build_messages", lambda hunks, ver: [{"role": "user", "content": "x"}])
     monkeypatch.setattr(runner, "_post", lambda b, m: object())
     monkeypatch.setattr(runner, "_parse_response", lambda resp: ([], "m", None))
-    out = runner.run_backend(_bench_backend(), _SAMPLES)
-    assert set(out) == {s.name for s in _SAMPLES}
-    assert all(v == 0 for v in out.values())
+    run = runner.run_backend(_bench_backend(), _SAMPLES)
+    assert set(run.findings_by_sample) == {s.name for s in _SAMPLES}
+    assert all(v == 0 for v in run.findings_by_sample.values())
+    assert run.errors == 0 and run.all_errored is False
+
+
+def test_run_backend_all_errored_is_flagged(monkeypatch):
+    """Every sample erroring -> all_errored True, so the CLI can reject a bogus
+    zero-recall baseline (broken run != 'Elder found nothing')."""
+    from sast_benchmark import runner
+
+    def _boom(b, m):
+        raise RuntimeError("backend unreachable")
+
+    monkeypatch.setattr(runner, "_build_messages", lambda hunks, ver: [{"role": "user", "content": "x"}])
+    monkeypatch.setattr(runner, "_post", _boom)
+    run = runner.run_backend(_bench_backend(), _SAMPLES)
+    assert run.errors == len(_SAMPLES)
+    assert run.all_errored is True
+    # Counts are all zero, but all_errored tells the caller this is NOT a result.
+    assert all(v == 0 for v in run.findings_by_sample.values())
 
 
 def _bench_backend():

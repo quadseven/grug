@@ -15,6 +15,7 @@ and never runs in the per-PR CI suite. It runs only from the on-demand
 from __future__ import annotations
 
 import logging
+from dataclasses import dataclass
 
 import httpx
 
@@ -61,13 +62,17 @@ def _post(backend: BenchBackend, messages: list[dict[str, str]]) -> httpx.Respon
     raise last_exc
 
 
-def run_sample(backend: BenchBackend, sample: CorpusSample) -> int:
-    """Run ONE corpus sample through ONE backend; return the count of findings
-    Elder reported ON THIS SAMPLE'S PATH (the scoring "flagged" signal).
+def run_sample(backend: BenchBackend, sample: CorpusSample) -> tuple[int, bool]:
+    """Run ONE corpus sample through ONE backend. Returns `(finding_count,
+    errored)`: the count of findings Elder reported ON THIS SAMPLE'S PATH (the
+    scoring "flagged" signal), and whether the call ERRORED.
 
-    A transport/parse failure returns 0 (unflagged) + logs — it does NOT raise,
-    so one flaky sample can't abort the whole sweep, and it is NOT counted as a
-    detection (an errored backend reads as "found nothing", the honest floor).
+    A transport/parse failure returns `(0, True)` + logs — it does NOT raise,
+    so one flaky sample can't abort the sweep. The `errored` flag is
+    load-bearing: a count of 0 from a SUCCESSFUL call ("Elder found nothing")
+    must be distinguishable from 0 from a FAILED call ("the benchmark could not
+    run"), else an all-errored backend would record a bogus zero-recall
+    baseline that looks valid.
     """
     hunks = [Hunk(path=sample.path, body=sample.diff_body)]
     try:
@@ -79,7 +84,7 @@ def run_sample(backend: BenchBackend, sample: CorpusSample) -> int:
             "bench_sample_errored",
             extra={"backend": backend.name, "sample": sample.name, "kind": type(e).__name__},
         )
-        return 0
+        return (0, True)
     if err:
         log.info(
             "bench_sample_parse_degraded",
@@ -87,13 +92,43 @@ def run_sample(backend: BenchBackend, sample: CorpusSample) -> int:
         )
     # Count only findings on THIS sample's path (each corpus path is unique, so
     # cross-sample contamination is impossible, but match defensively).
-    return sum(1 for f in findings if f.path == sample.path)
+    return (sum(1 for f in findings if f.path == sample.path), False)
+
+
+@dataclass(frozen=True, slots=True)
+class BackendRun:
+    """One backend's sweep over the corpus. `findings_by_sample` feeds
+    `scoring.score`; `errors`/`total` let the caller reject a baseline from a
+    backend that could not actually run (e.g. all calls errored = bad key/URL),
+    rather than recording its bogus all-zero recall as valid."""
+
+    findings_by_sample: dict[str, int]
+    errors: int
+    total: int
+
+    @property
+    def all_errored(self) -> bool:
+        """True when EVERY sample errored — the run is broken, not a result."""
+        return self.total > 0 and self.errors == self.total
 
 
 def run_backend(
     backend: BenchBackend, corpus: tuple[CorpusSample, ...]
-) -> dict[str, int]:
-    """Run the whole corpus through one backend; return sample-name -> finding
-    count (the `findings_by_sample` input `scoring.score` expects)."""
+) -> BackendRun:
+    """Run the whole corpus through one backend. Returns a `BackendRun` whose
+    `findings_by_sample` is the input `scoring.score` expects, plus the error
+    tally so the caller can reject a fully-broken run."""
     log.info("bench_backend_start", extra={"backend": backend.name, "samples": len(corpus)})
-    return {s.name: run_sample(backend, s) for s in corpus}
+    counts: dict[str, int] = {}
+    errors = 0
+    for s in corpus:
+        count, errored = run_sample(backend, s)
+        counts[s.name] = count
+        if errored:
+            errors += 1
+    if errors:
+        log.warning(
+            "bench_backend_errors",
+            extra={"backend": backend.name, "errors": errors, "total": len(corpus)},
+        )
+    return BackendRun(findings_by_sample=counts, errors=errors, total=len(corpus))
