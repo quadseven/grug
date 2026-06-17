@@ -55,10 +55,26 @@ def main(argv: list[str] | None = None) -> int:
         return 2
 
     reports = {}
+    broken = []
     for backend in backends:
-        findings_by_sample = run_backend(backend, corpus)
-        reports[backend.name] = score(corpus, findings_by_sample)
+        run = run_backend(backend, corpus)
+        if run.all_errored:
+            # Every call failed (bad key/URL/unreachable Cave). Recording its
+            # all-zero recall as a baseline would be a fabricated "Elder detects
+            # nothing" — refuse it instead.
+            print(
+                f"\n!! backend {backend.name}: ALL {run.total} samples errored "
+                "- not a valid run (check key/URL/reachability); skipping.",
+                file=sys.stderr,
+            )
+            broken.append(backend.name)
+            continue
+        reports[backend.name] = score(corpus, run.findings_by_sample)
         _print_report(backend.name, reports[backend.name])
+
+    if not reports:
+        print("\nNo backend produced a valid run.", file=sys.stderr)
+        return 2
 
     if args.record:
         out = {name: to_baseline_dict(rep, backend=name) for name, rep in reports.items()}
