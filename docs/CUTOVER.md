@@ -100,19 +100,17 @@ fully reversible until step 4 lands on default branch.
 Use a private repo you own first. Smallest blast radius, you control it, can iterate.
 Steps 1-5 above. Confirm everything green for ~24h before bulk-cutover.
 
-## Slice 12 — bulk-cutover remaining 9 repos
+## Slice 12 — bulk-cutover the remaining repos
 
-Order (smallest → largest, or by criticality):
+Order them smallest -> largest (or by criticality): start with low-traffic
+repos to build confidence, leave the largest / most-active production
+service for last. A rough sequence:
 
-1. `aws-solutions-architect-study` (low-traffic study repo)
-2. `gemini-plugin-cc` (small)
-3. `meow-now`
-4. `holdfast`
-5. `vroom-vroom`
-6. `claude-stuff`
-7. `conducted`
-8. `grugthink` (production-traffic AWS service)
-9. `somatic-scripts` (largest, most active)
+1. low-traffic / study repos (smallest blast radius)
+2. small utility repos
+3. mid-size active repos
+4. the production-traffic service(s)
+5. the largest, most-active repo last
 
 For each: re-run steps 1-5. Total wall-clock ~45 min if you batch,
 plus a few PRs per repo to merge.

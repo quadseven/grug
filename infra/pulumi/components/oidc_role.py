@@ -30,8 +30,8 @@ def _ensure_oidc_provider() -> str:
 
     The token.actions.githubusercontent.com provider is account-wide
     (only one allowed per AWS account). ARN is deterministic from the
-    account ID — no SDK lookup needed. somatic-scripts pulumi created
-    this resource already; we only reference it here.
+    account ID — no SDK lookup needed. A prior Pulumi stack in this
+    account created this resource already; we only reference it here.
 
     If the provider doesn't exist (fresh account), the assume-role
     policy will be created but the trust will reject all OIDC calls
