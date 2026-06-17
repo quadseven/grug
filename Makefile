@@ -14,7 +14,7 @@
 #   make smoke              — quick prod-shape smoke test (read-only)
 
 .PHONY: test webhook-test api-test pg-test pulumi-preview pulumi-up \
-        tear-down rebuild smoke docker-build-webhook
+        tear-down rebuild smoke docker-build-webhook sast-benchmark
 
 # Admin seed values — the row (re)installed after a tear-down so the
 # allowlist gate works on the first PR after rebuild. NO DEFAULTS on
@@ -135,3 +135,16 @@ docker-build-webhook:
 	docker buildx build --platform linux/arm64 \
 		--tag grug-webhook:local \
 		services/webhook
+
+# SAST benchmark / eval harness (#399, ADR-0006). Measures Elder's vuln
+# recall+precision per backend over the committed corpus. Makes REAL backend
+# calls (free OpenRouter/Poolside keys; sparkles/Cave needs the tailnet) - set
+# GRUG_BENCH_{OPENROUTER,POOLSIDE}_KEY and/or GRUG_BENCH_CAVE_URL+MODEL.
+#   make sast-benchmark              # print report
+#   make sast-benchmark ARGS=--record  # write baseline.json
+#   make sast-benchmark ARGS=--check   # exit 1 on regression vs baseline
+# The pure scoring core is covered by `make webhook-test` (no LLM, no keys).
+sast-benchmark:
+	cd services/webhook && uv run --with httpx --with pyjwt --with cryptography \
+		--with boto3 --with 'psycopg[binary,pool]' --with 'ddtrace>=3.5,<4' \
+		--with 'datadog-lambda>=6.107,<7' python -m sast_benchmark $(ARGS)
