@@ -45,8 +45,9 @@ from personas.code_reviewer.diff_parser import (
 )
 from personas.code_reviewer.judge import eval_tags, run_judge
 from personas.code_reviewer.persona import (
-    CodeReviewEvaluation, Finding, evaluate_diff,
+    CodeReviewEvaluation, Finding, evaluate_diff, with_extra_findings,
 )
+from personas.code_reviewer.sast import judge_candidates, scan_candidates
 from adapters.install_store import put_comment_record  # type: ignore
 
 log = logging.getLogger(f"{os.getenv('DD_SERVICE', 'grug')}.persona.code_reviewer")
@@ -551,6 +552,46 @@ def dispatch_code_review(
             )
 
     evaluation = evaluate_diff(hunks, llm_response)
+
+    # SAST detection tracer (#400, ADR-0006): a deterministic scan over the
+    # diff produces candidate vuln sites (recall), the exploitability judge
+    # keeps only the real ones (precision — suppressing the #391 public-config
+    # log), and the kept findings merge into the SAME evaluation so they flow
+    # through the existing publish path (no parallel posting). Best-effort: any
+    # SAST failure must not break the core review (judge_candidates already
+    # fails-closed; guard the scan/merge too).
+    try:
+        sast_findings = judge_candidates(
+            scan_candidates(hunks),
+            hunks,
+            installation_id,
+            pr_context={
+                "installation_id": installation_id,
+                "repo": f"{owner}/{repo_name}",
+                "pr_number": pull_number,
+                "head_sha": head_sha,
+            },
+            file_contents=file_contents,
+        )
+        if sast_findings:
+            evaluation = with_extra_findings(evaluation, sast_findings)
+            log.info(
+                "sast_findings_merged",
+                extra={
+                    "installation_id": installation_id,
+                    "pr": f"{owner}/{repo_name}#{pull_number}",
+                    "count": len(sast_findings),
+                },
+            )
+    except Exception as e:  # noqa: BLE001 — SAST is additive; never break the review
+        log.warning(
+            "sast_detection_failed",
+            extra={
+                "installation_id": installation_id,
+                "pr": f"{owner}/{repo_name}#{pull_number}",
+                "kind": type(e).__name__,
+            },
+        )
 
     # Both clients are independent — a 5xx on review post must not
     # skip the check-run post.
