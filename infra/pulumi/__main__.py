@@ -37,7 +37,8 @@ from components import (
 # NOTE: CF Worker (grug-webhook-host-rewrite) is managed OUT OF BAND
 # via infra/cloudflare/deploy.sh because pulumi-cloudflare's
 # WorkerScript resource fails idempotency and main_module handling
-# (mirrors the macchina-router decision in somatic-scripts).
+# (mirrors the same out-of-band host-rewrite Worker decision the operator
+# made for other services).
 
 config = pulumi.Config()
 env = config.require("env")

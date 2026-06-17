@@ -39,7 +39,7 @@ Copy the output. You'll paste this into both:
 
 ## 3. Pre-load SSM SecureString parameters
 
-Run from your laptop with AWS CLI authenticated to the same account as somatic-scripts (`<your-aws-account-id>`, region `us-east-1`):
+Run from your laptop with AWS CLI authenticated to your grug AWS account (`<your-aws-account-id>`, region `us-east-1`):
 
 ```bash
 # App ID — from step 1
@@ -111,7 +111,7 @@ aws iam list-open-id-connect-providers --region us-east-1
 # Should include: arn:aws:iam::<your-aws-account-id>:oidc-provider/token.actions.githubusercontent.com
 ```
 
-If missing (somatic-scripts deploys should have created it), Pulumi will create it.
+If missing (a prior deploy in the account may have created it), Pulumi will create it.
 
 ## 5. Cloudflare API token for Pulumi
 

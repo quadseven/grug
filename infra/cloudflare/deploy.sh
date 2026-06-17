@@ -1,10 +1,10 @@
 #!/usr/bin/env bash
 # Deploy the grug-webhook-host-rewrite CF Worker + bind to webhook.grug.lol/*.
 #
-# Mirrors the macchina-router / chef-lambda-host-rewrite /
-# tempo-lambda-host-rewrite pattern from somatic-scripts. Pulumi can't
-# manage CF Workers reliably (script-exists, main_module, route binding
-# all fail in different ways across pulumi-cloudflare versions).
+# Mirrors a host-rewrite Worker pattern the operator uses across other
+# services. Pulumi can't manage CF Workers reliably (script-exists,
+# main_module, route binding all fail in different ways across
+# pulumi-cloudflare versions).
 #
 # Idempotent: PUT replaces the script content; route POST is one-shot
 # (existing routes return 409 which we swallow).
