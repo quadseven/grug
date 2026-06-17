@@ -14,3 +14,10 @@ datadog-lambda>=6.107,<7
 # Postgres store (#306 epic store port) - pool included for the
 # long-lived k8s runtime (Lambda used per-invoke connections).
 psycopg[binary,pool]>=3.2,<4.0
+# Semgrep OSS - the SAST detection engine (#401, ADR-0006). Invoked as a CLI
+# subprocess over the vendored offline rules (sast_rules/); NO registry network
+# at review time. Heavy dep, but a one-time image pull on the k8s pod (the
+# Lambda-cold-start objection is moot post-#354). Only the webhook image needs
+# it (the api never runs reviews); the mirrored sast.py shells out rather than
+# importing it, so the api copy is unaffected.
+semgrep>=1.166,<2.0

@@ -18,9 +18,12 @@ is the judge's job, not the detector's. A detector miss is unrecoverable
 
 from __future__ import annotations
 
+import json
 import logging
 import os
 import re
+import subprocess
+import tempfile
 from dataclasses import dataclass
 from typing import Optional
 
@@ -95,13 +98,14 @@ def _is_cleartext_secret_log(text: str) -> bool:
     return bool(_SINK_RE.search(text) and _SECRET_TOKEN_RE.search(text))
 
 
-def scan_candidates(hunks: tuple[DiffHunk, ...]) -> tuple[Candidate, ...]:
-    """Pure builtin detector for clear-text-secret-log over the diff hunks.
+def scan_builtin(hunks: tuple[DiffHunk, ...]) -> tuple[Candidate, ...]:
+    """Pure builtin detector for clear-text-secret-log over the diff hunks
+    (#400). The zero-dependency engine + the fallback when Semgrep is absent.
 
     Returns one Candidate per added line that looks like a secret reaching a
-    log sink. LIBERAL by design (see module docstring) — the judge does the
-    exploitability discrimination. Line numbers are real new-side numbers in
-    the hunk's `new_lines`, so a kept candidate survives `evaluate_diff`'s
+    log sink. LIBERAL by design — the judge does the exploitability
+    discrimination. Line numbers are real new-side numbers in the hunk's
+    `new_lines`, so a kept candidate survives `evaluate_diff`'s
     anti-hallucination filter. No IO, no logging — deterministic + unit-tested.
     """
     candidates: list[Candidate] = []
@@ -117,6 +121,135 @@ def scan_candidates(hunks: tuple[DiffHunk, ...]) -> tuple[Candidate, ...]:
                     )
                 )
     return tuple(candidates)
+
+
+# Engine selection (ADR-0006 vendor-neutral boundary). `semgrep` = the OSS
+# engine over the vendored offline rules (#401, full class coverage); `builtin`
+# = the #400 zero-dep detector. Config value, never an import — the vendor stays
+# swappable. Default `builtin` so a misconfig/absent-engine degrades to the
+# safe zero-dep path rather than failing the review.
+_ENGINE = os.getenv("GRUG_SAST_ENGINE", "builtin").strip().lower()
+_RULES_DIR = os.path.join(os.path.dirname(__file__), "..", "..", "sast_rules")
+# AC5 cost bound: cap the bytes Semgrep scans per review so a huge PR can't blow
+# review latency. Files beyond the budget are skipped + logged (never silently).
+_MAX_SCAN_BYTES = 1_000_000
+_SEMGREP_TIMEOUT_S = 60
+
+
+def _added_lines_by_file(hunks: tuple[DiffHunk, ...]) -> dict[str, set[int]]:
+    """file_path -> the new-side line numbers the PR added/changed (the hunks'
+    `new_lines`). Used to keep only Semgrep findings on lines THIS PR touched —
+    a PR review flags what the PR introduces, not pre-existing code (and GitHub
+    inline comments only attach to diff lines anyway)."""
+    out: dict[str, set[int]] = {}
+    for h in hunks:
+        out.setdefault(h.file_path, set()).update(h.new_lines)
+    return out
+
+
+def _budget_files(file_contents: dict[str, str]) -> tuple[dict[str, str], list[str]]:
+    """Select files within the byte budget (AC5). Returns (kept, skipped). Sorted
+    by size so a few huge files don't starve the rest. Skipped files are returned
+    so the caller logs them — a silent truncation reads as 'scanned everything'."""
+    kept: dict[str, str] = {}
+    skipped: list[str] = []
+    total = 0
+    for path, content in sorted(file_contents.items(), key=lambda kv: len(kv[1])):
+        size = len(content.encode("utf-8", "ignore"))
+        if total + size > _MAX_SCAN_BYTES:
+            skipped.append(path)
+            continue
+        kept[path] = content
+        total += size
+    return kept, skipped
+
+
+def scan_semgrep(
+    hunks: tuple[DiffHunk, ...], file_contents: dict[str, str]
+) -> tuple[Candidate, ...]:
+    """Semgrep OSS engine over the vendored offline rules (#401). Writes the
+    changed files to a temp dir, runs `semgrep scan --config <rules>` (NO
+    network — registry refs are refused), maps each result to a Candidate via
+    the rule's `metadata.vuln_class`, and keeps only findings on lines THIS PR
+    added (so we flag what the PR introduces, not pre-existing code).
+
+    Best-effort: a missing semgrep binary, a non-zero exit, a timeout, or
+    unparseable output returns () + logs — SAST is additive and must never
+    break the review (the dispatch caller also guards). file_contents is the
+    head-SHA content of changed files (#336); without it Semgrep has nothing
+    to scan -> ().
+    """
+    if not file_contents:
+        return ()
+    kept_files, skipped = _budget_files(file_contents)
+    if skipped:
+        log.info("sast_semgrep_files_skipped_over_budget", extra={"skipped": len(skipped)})
+    if not kept_files:
+        return ()
+    added = _added_lines_by_file(hunks)
+    try:
+        with tempfile.TemporaryDirectory(prefix="grug-sast-") as tmp:
+            tmp_real = os.path.realpath(tmp)
+            for path, content in kept_files.items():
+                dest = os.path.join(tmp, path)
+                # Containment guard: `path` is PR-controlled (from the diff's
+                # `+++ b/<path>`). A crafted `../../etc/foo` would escape the
+                # temp dir into an arbitrary write — refuse anything that does
+                # not resolve to UNDER tmp (defensive even though the pod is
+                # readOnlyRootFilesystem + non-root).
+                dest_real = os.path.realpath(dest)
+                if dest_real != tmp_real and not dest_real.startswith(tmp_real + os.sep):
+                    log.warning("sast_semgrep_path_escape_skipped", extra={"path": path})
+                    continue
+                os.makedirs(os.path.dirname(dest) or tmp, exist_ok=True)
+                with open(dest, "w", encoding="utf-8") as f:
+                    f.write(content)
+            proc = subprocess.run(
+                ["semgrep", "scan", "--config", _RULES_DIR, "--json", "--quiet",
+                 "--disable-version-check", "--no-rewrite-rule-ids", tmp],
+                capture_output=True, text=True, timeout=_SEMGREP_TIMEOUT_S,
+            )
+            data = json.loads(proc.stdout)
+            tmp_prefix = tmp.rstrip("/") + "/"
+    except FileNotFoundError:
+        log.warning("sast_semgrep_binary_missing")
+        return ()
+    except (subprocess.TimeoutExpired, json.JSONDecodeError, OSError) as e:
+        log.warning("sast_semgrep_run_failed", extra={"kind": type(e).__name__})
+        return ()
+
+    candidates: list[Candidate] = []
+    for r in data.get("results", []):
+        rel = r.get("path", "")
+        if rel.startswith(tmp_prefix):
+            rel = rel[len(tmp_prefix):]
+        line = (r.get("start") or {}).get("line")
+        vuln_class = (r.get("extra", {}).get("metadata") or {}).get("vuln_class")
+        if not (rel and line and vuln_class):
+            continue
+        # Only flag lines THIS PR added/changed.
+        if line not in added.get(rel, set()):
+            continue
+        snippet = (r.get("extra", {}).get("lines") or "").strip()
+        candidates.append(Candidate(vuln_class=vuln_class, file=rel, line=line, snippet=snippet))
+    return tuple(candidates)
+
+
+def scan_candidates(
+    hunks: tuple[DiffHunk, ...],
+    file_contents: dict[str, str] | None = None,
+    engine: str | None = None,
+) -> tuple[Candidate, ...]:
+    """The vendor-neutral detection boundary (ADR-0006). Dispatches to the
+    configured engine: Semgrep OSS over the vendored rules (`engine="semgrep"`,
+    the #401 full-class engine — needs `file_contents`) or the #400 zero-dep
+    builtin (default). `engine` defaults to `GRUG_SAST_ENGINE`. The judge +
+    merge + publish downstream are engine-agnostic, so swapping the engine here
+    is the only change #401 makes."""
+    eng = (engine or _ENGINE).strip().lower()
+    if eng == "semgrep" and file_contents:
+        return scan_semgrep(hunks, file_contents)
+    return scan_builtin(hunks)
 
 
 # Secret-leak severity. "high" lives in the blocking partition, so an operator
