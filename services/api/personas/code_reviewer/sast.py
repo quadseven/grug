@@ -257,6 +257,30 @@ def scan_candidates(
 _SAST_SEVERITY = "high"
 
 
+# Human-readable label per vuln class for the judge prompt + the published
+# finding message. Generic fallback so a new class (or a Semgrep rule whose
+# metadata.vuln_class we haven't enumerated) still reads sensibly instead of
+# being mislabeled. (Pre-#401/#434 these messages were hardcoded to
+# clear-text-secret-log, mislabeling every other class - fixed here.)
+_CLASS_LABELS: dict[str, str] = {
+    CLEARTEXT_SECRET_LOG: "Clear-text logging of a secret",
+    "sql-injection": "SQL injection",
+    "command-injection": "Command injection",
+    "template-injection": "Template injection",
+    "ssrf": "Server-side request forgery (SSRF)",
+    "path-traversal": "Path traversal",
+    "unsafe-deserialization": "Unsafe deserialization",
+    "weak-crypto": "Weak or misused cryptography",
+    "xxe": "XML external entity (XXE)",
+    "hardcoded-credential": "Hardcoded credential",
+    "vulnerable-dependency": "Vulnerable dependency",
+}
+
+
+def _label(vuln_class: str) -> str:
+    return _CLASS_LABELS.get(vuln_class, vuln_class.replace("-", " ").capitalize())
+
+
 def _candidate_to_repr(c: Candidate) -> JudgeFindingRepr:
     """Provisional finding handed to the exploitability judge. The message
     states the candidate hypothesis; the judge decides if the secret VALUE
@@ -266,7 +290,7 @@ def _candidate_to_repr(c: Candidate) -> JudgeFindingRepr:
         "file": c.file,
         "line": c.line,
         "severity": _SAST_SEVERITY,
-        "message": f"Possible clear-text logging of a secret: {c.snippet}",
+        "message": f"Possible {_label(c.vuln_class)}: {c.snippet}",
     }
 
 
@@ -333,7 +357,7 @@ def judge_candidates(
                 severity=_SAST_SEVERITY,
                 rule_name=c.vuln_class,
                 message=(
-                    f"Clear-text logging of a secret. {j.reasoning} "
+                    f"{_label(c.vuln_class)}. {j.reasoning} "
                     f"(line: `{c.snippet}`)"
                 ),
                 suggestion=None,

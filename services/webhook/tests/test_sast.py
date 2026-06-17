@@ -260,6 +260,17 @@ def test_judge_keeps_exploitable_and_carries_rationale():
     assert "real secret reaches the log sink" in out[0].message  # exploitability rationale
 
 
+def test_judge_message_labels_by_class_not_hardcoded():
+    """The published message reflects the candidate's CLASS, not a hardcoded
+    'clear-text logging' (regression guard for the #401/#434 multi-class fix)."""
+    sqli = Candidate("sql-injection", "db.py", 3, 'execute("..." + uid)')
+    judged = (FindingJudgement(finding_index=0, is_real_bug=True, reasoning="user input reaches the query"),)
+    with patch("personas.code_reviewer.sast.judge_findings", return_value=judged):
+        out = judge_candidates((sqli,), _HUNK, installation_id=1)
+    assert "SQL injection" in out[0].message
+    assert "clear-text logging" not in out[0].message.lower()
+
+
 def test_judge_suppresses_the_391_false_positive():
     """The #391 shape judged not-a-bug -> suppressed (no Finding posted)."""
     judged = (FindingJudgement(finding_index=0, is_real_bug=False, reasoning="logs a public SSM param name, not a secret value"),)
