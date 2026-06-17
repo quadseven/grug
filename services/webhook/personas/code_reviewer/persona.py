@@ -118,6 +118,33 @@ class CodeReviewEvaluation:
         return self.conclusion != "failure"
 
 
+def with_extra_findings(
+    evaluation: CodeReviewEvaluation, extra: tuple[Finding, ...]
+) -> CodeReviewEvaluation:
+    """Merge additional findings (e.g. SAST candidates the exploitability judge
+    KEPT, #400) into an evaluation and re-derive `conclusion` by the SAME rule
+    `evaluate_diff` uses: any high/critical -> failure; else preserve a degraded
+    `neutral`; else success. Pure — no IO. The `extra` are already diff-anchored
+    (built from real hunk line numbers), so they need no re-filtering. Returning
+    a new value (frozen dataclass) keeps the merge honest + testable; `passed`
+    re-derives from the new conclusion automatically."""
+    if not extra:
+        return evaluation
+    combined = evaluation.findings + extra
+    if any(f.severity in _BLOCKING_SEVERITIES for f in combined):
+        conclusion: CheckConclusion = "failure"
+    elif evaluation.degraded_reason is not None:
+        conclusion = "neutral"
+    else:
+        conclusion = "success"
+    return CodeReviewEvaluation(
+        findings=combined,
+        conclusion=conclusion,
+        dropped_hallucinations=evaluation.dropped_hallucinations,
+        degraded_reason=evaluation.degraded_reason,
+    )
+
+
 def _hunk_line_index(hunks: tuple[DiffHunk, ...]) -> dict[str, set[int]]:
     """Build {file_path: union(new_lines)} for O(1) hallucination check.
 
