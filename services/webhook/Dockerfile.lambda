@@ -9,8 +9,8 @@
 
 # Datadog Lambda Extension — Lambda Container images cannot attach
 # layers, so we COPY the extension binary directly into the runtime
-# image. Pinned by version, bump in lockstep with somatic-scripts
-# (currently :96 in infra/docker/macchina-base/Dockerfile).
+# image. Pinned by version, bump in lockstep with the operator's shared
+# base image (currently :96).
 FROM public.ecr.aws/datadog/lambda-extension:96 AS dd-ext
 
 FROM public.ecr.aws/lambda/python:3.13-arm64 AS runtime

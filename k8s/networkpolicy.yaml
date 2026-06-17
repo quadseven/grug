@@ -1,7 +1,7 @@
 # Network segmentation for the grug namespace (audit #3).
 #
-# The OKE cluster is shared (CNPG, digital-ledger, pasto, tempo, ... all
-# live alongside grug). Without a NetworkPolicy the namespace is flat /
+# The OKE cluster is shared (grug runs as one of several tenant
+# namespaces). Without a NetworkPolicy the namespace is flat /
 # default-allow: any compromised pod anywhere on the cluster can reach the
 # grug pods on any port, and a compromised grug pod has unrestricted
 # egress. These policies close the lateral-movement path and add port-level
