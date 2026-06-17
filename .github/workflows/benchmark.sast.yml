@@ -1,0 +1,94 @@
+# SAST benchmark / eval harness (#399, ADR-0006) — on-demand only.
+#
+# Records Elder's vuln recall+precision per backend over the committed corpus.
+# NOT a per-PR gate: it makes real LLM calls (free OpenRouter/Poolside keys +
+# the self-hosted Cave/sparkles over the tailnet), so it runs ONLY on manual
+# dispatch. The per-PR suite covers the pure scoring core (test_sast_benchmark)
+# with no keys. Backends with no configured secret are skipped (a partial run
+# still produces an honest partial baseline).
+#
+# PUBLIC-REPO DISCIPLINE: every endpoint/key arrives via secrets — the Cave
+# (sparkles) URL is a private tailnet address and is NEVER committed.
+#
+# Required (operator-seeded; absent ones are skipped):
+#   secrets.TS_AUTHKEY                  - tag-scoped ephemeral tailnet join (for sparkles)
+#   secrets.GRUG_BENCH_OPENROUTER_KEY   - free OpenRouter key
+#   secrets.GRUG_BENCH_POOLSIDE_KEY     - free Poolside key
+#   secrets.GRUG_BENCH_CAVE_URL         - sparkles/Cave OpenAI-compatible endpoint (tailnet)
+#   secrets.GRUG_BENCH_CAVE_MODEL       - sparkles model id (e.g. an Ollama coder model)
+#   secrets.GRUG_BENCH_CAVE_KEY         - optional (Ollama usually needs none)
+name: benchmark.sast
+
+on:
+  workflow_dispatch:
+    inputs:
+      mode:
+        description: "record (write baseline.json artifact) or report (print only)"
+        type: choice
+        options: [record, report]
+        default: record
+
+permissions:
+  contents: read
+
+concurrency:
+  group: benchmark-sast
+  cancel-in-progress: false
+
+jobs:
+  benchmark:
+    # workflow_dispatch from main only (defense in depth alongside the
+    # environment protection rule).
+    if: github.ref == 'refs/heads/main'
+    runs-on: ubuntu-24.04-arm
+    timeout-minutes: 20
+    # `secrets` isn't available in step `if:` — surface presence as a job env
+    # the steps can gate on.
+    env:
+      HAS_TS_AUTHKEY: ${{ secrets.TS_AUTHKEY != '' }}
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+
+      # Tailnet join so the Cave/sparkles endpoint is reachable. If TS_AUTHKEY
+      # is absent the step is skipped and sparkles is simply not benchmarked.
+      - name: Join tailnet (ephemeral)
+        if: env.HAS_TS_AUTHKEY == 'true'
+        uses: tailscale/github-action@306e68a486fd2350f2bfc3b19fcd143891a4a2d8 # v4
+        with:
+          authkey: ${{ secrets.TS_AUTHKEY }}
+          tags: tag:ci
+          use-cache: 'true'
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@d4b2f3b6ecc6e67c4457f6d3e41ec42d3d0fcb86 # v6
+
+      - name: Run SAST benchmark
+        working-directory: services/webhook
+        env:
+          GRUG_BENCH_OPENROUTER_KEY: ${{ secrets.GRUG_BENCH_OPENROUTER_KEY }}
+          GRUG_BENCH_POOLSIDE_KEY: ${{ secrets.GRUG_BENCH_POOLSIDE_KEY }}
+          GRUG_BENCH_CAVE_URL: ${{ secrets.GRUG_BENCH_CAVE_URL }}
+          GRUG_BENCH_CAVE_MODEL: ${{ secrets.GRUG_BENCH_CAVE_MODEL }}
+          GRUG_BENCH_CAVE_KEY: ${{ secrets.GRUG_BENCH_CAVE_KEY }}
+          BENCH_MODE: ${{ inputs.mode }}
+        run: |
+          set -euo pipefail
+          FLAG=""
+          if [ "$BENCH_MODE" = "record" ]; then FLAG="--record"; fi
+          uv run --with httpx --with pyjwt --with cryptography --with boto3 \
+            --with 'psycopg[binary,pool]' --with 'ddtrace>=3.5,<4' \
+            --with 'datadog-lambda>=6.107,<7' \
+            python -m sast_benchmark $FLAG | tee "$RUNNER_TEMP/bench-report.txt"
+
+      # The recorded baseline is uploaded as an artifact (not auto-committed) —
+      # download it and commit services/webhook/sast_benchmark/baseline.json to
+      # update the in-repo baseline + report through normal review.
+      - name: Upload baseline + report
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: sast-benchmark
+          path: |
+            services/webhook/sast_benchmark/baseline.json
+            ${{ runner.temp }}/bench-report.txt
+          if-no-files-found: warn
