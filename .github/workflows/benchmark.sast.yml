@@ -65,6 +65,13 @@ jobs:
       - name: Run SAST benchmark
         working-directory: services/webhook
         env:
+          # secrets_loader builds boto3.client("ssm") at import (via llm_client),
+          # which needs a region just to construct - even though the benchmark
+          # never CALLS SSM (it uses the GRUG_BENCH_* keys directly). Dummy creds
+          # + region match check.python.yml so the import succeeds offline.
+          AWS_DEFAULT_REGION: us-east-1
+          AWS_ACCESS_KEY_ID: testing
+          AWS_SECRET_ACCESS_KEY: testing
           GRUG_BENCH_OPENROUTER_KEY: ${{ secrets.GRUG_BENCH_OPENROUTER_KEY }}
           GRUG_BENCH_POOLSIDE_KEY: ${{ secrets.GRUG_BENCH_POOLSIDE_KEY }}
           GRUG_BENCH_CAVE_URL: ${{ secrets.GRUG_BENCH_CAVE_URL }}
