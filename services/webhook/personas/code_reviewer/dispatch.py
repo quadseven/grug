@@ -35,7 +35,7 @@ from github_checks_client import CheckConclusion, CheckRunResult, post_check_run
 from github_reviews_client import (
     InlineComment, ReviewEvent, ReviewResult, get_review_comments, post_review,
 )
-from llm_client import Hunk as LlmHunk, LlmReviewResponse, review_diff
+from llm_client import _JUDGE_MAX_FINDINGS, Hunk as LlmHunk, LlmReviewResponse, review_diff
 from personas.code_reviewer.dedup import (
     dedup_findings, finding_key, parse_rule, prior_keys_from_comments,
     rule_marker,
@@ -569,6 +569,21 @@ def dispatch_code_review(
             + scan_dependencies(hunks)
             + scan_secrets(hunks)
         )
+        # The shared judge fail-closes ABOVE its cap: past `_JUDGE_MAX_FINDINGS`
+        # it returns no verdicts and EVERY candidate is suppressed (a noisy PR
+        # could then bury a real leaked secret under benign candidates). Bound
+        # the combined set to the judge budget here so a flood degrades to
+        # "judge the first N" rather than "publish nothing". Logged, never silent.
+        if len(candidates) > _JUDGE_MAX_FINDINGS:
+            log.info(
+                "security_candidates_truncated_to_judge_budget",
+                extra={
+                    "installation_id": installation_id,
+                    "total": len(candidates),
+                    "max": _JUDGE_MAX_FINDINGS,
+                },
+            )
+            candidates = candidates[:_JUDGE_MAX_FINDINGS]
         security_findings = judge_candidates(
             candidates,
             hunks,
