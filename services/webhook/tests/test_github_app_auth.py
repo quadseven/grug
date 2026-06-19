@@ -179,3 +179,43 @@ def test_get_install_token_propagates_401(_stub_secrets):
         with pytest.raises(httpx.HTTPStatusError) as exc:
             gh.get_install_token(1)
     assert exc.value.response.status_code == 401
+
+
+def test_get_install_token_missing_token_key_raises_typed_error(_stub_secrets, caplog):
+    """A 200 whose body lacks `token` raises a clear typed error (not a bare
+    KeyError) and emits a structured warning DD can alert on (#341)."""
+    import logging
+
+    import github_app_auth as gh
+    fake = MagicMock()
+    fake.raise_for_status = MagicMock()
+    fake.json = MagicMock(return_value={"expires_at": "2026-01-01T00:00:00Z"})
+
+    with patch("httpx.post", return_value=fake):
+        with caplog.at_level(logging.WARNING):
+            with pytest.raises(RuntimeError) as exc:
+                gh.get_install_token(4242)
+
+    # Typed, descriptive, and does NOT leak a response body.
+    assert "4242" in str(exc.value)
+    assert not isinstance(exc.value, KeyError)
+    assert "install_token_exchange_malformed_response" in caplog.text
+
+
+def test_get_install_token_non_json_body_raises_typed_error(_stub_secrets, caplog):
+    """A 200 with an unparseable body (`resp.json()` raises) is handled the same
+    actionable way rather than surfacing as an opaque 500 (#341)."""
+    import logging
+
+    import github_app_auth as gh
+    fake = MagicMock()
+    fake.raise_for_status = MagicMock()
+    fake.json = MagicMock(side_effect=ValueError("Expecting value"))
+
+    with patch("httpx.post", return_value=fake):
+        with caplog.at_level(logging.WARNING):
+            with pytest.raises(RuntimeError) as exc:
+                gh.get_install_token(7)
+
+    assert "7" in str(exc.value)
+    assert "install_token_exchange_malformed_response" in caplog.text
