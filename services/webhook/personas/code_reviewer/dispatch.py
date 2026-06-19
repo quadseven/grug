@@ -564,10 +564,14 @@ def dispatch_code_review(
     # path (no parallel posting). Best-effort: any failure must not break the
     # core review (judge_candidates already fails-closed; guard the scan/merge too).
     try:
+        # Secret candidates FIRST: a committed live credential is the highest-
+        # exploitability class, so it must survive the judge-budget truncation
+        # below rather than being the first dropped (it would be, concatenated
+        # last) when a noisy PR fills the budget with other candidates.
         candidates = (
-            scan_candidates(hunks, file_contents=file_contents)
+            scan_secrets(hunks)
+            + scan_candidates(hunks, file_contents=file_contents)
             + scan_dependencies(hunks)
-            + scan_secrets(hunks)
         )
         # The shared judge fail-closes ABOVE its cap: past `_JUDGE_MAX_FINDINGS`
         # it returns no verdicts and EVERY candidate is suppressed (a noisy PR
