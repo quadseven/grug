@@ -128,6 +128,14 @@ def test_dedups_same_secret_across_lines():
     assert len(scan_secrets(_hunks(diff))) == 1
 
 
+def test_distinct_secrets_sharing_mask_not_collapsed():
+    # Two DIFFERENT credentials that mask to the same first4...last4 must both be
+    # reported - dedup is on the exact value, not the lossy mask.
+    a, b = "AKIABBBBBBBBBBBBWXYZ", "AKIACCCCCCCCCCCCWXYZ"  # both -> AKIA...WXYZ
+    cands = scan_secrets(_hunks(_diff(".env", f"K1={a}", f"K2={b}")))
+    assert len(cands) == 2
+
+
 def test_caps_at_max_secrets():
     # Distinct tokens (unique 36-char suffix) so content-dedup does not collapse
     # them; the cap is what bounds the count.

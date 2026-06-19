@@ -148,29 +148,34 @@ def _mask(value: str) -> str:
     return f"{value[:4]}...{value[-4:]}"
 
 
-def _detect(text: str) -> tuple[str, str] | None:
-    """Return `(kind, masked_value)` if an added line looks like it carries a
-    secret, else None. Provider patterns win over the generic rule."""
+def _detect(text: str) -> tuple[str, str, str] | None:
+    """Return `(kind, raw, masked)` if an added line looks like it carries a
+    secret, else None. `raw` is the exact matched credential, used ONLY for
+    in-memory dedup (never published/logged); `masked` is the safe snippet form.
+    Provider patterns win over the generic rule."""
     for pat in _PROVIDER_PATTERNS:
         m = pat.regex.search(text)
         if m:
-            return pat.kind, _mask(m.group(0))
+            return pat.kind, m.group(0), _mask(m.group(0))
     m = _GENERIC_RE.search(text)
     if m:
         value = m.group("value")
         if len(value) >= _MIN_GENERIC_LEN and _shannon_entropy(value) >= _MIN_ENTROPY:
-            return f"secret-like assignment to `{m.group('key')}`", _mask(value)
+            return f"secret-like assignment to `{m.group('key')}`", value, _mask(value)
     return None
 
 
 def scan_secrets(hunks: tuple[DiffHunk, ...]) -> tuple[Candidate, ...]:
     """Secret-scanning candidate source: a Candidate per committed credential a
-    PR introduces, across ANY file type. Diff-scoped, content-deduped by
-    `(file, kind, masked)` (the same credential repeated in a file is reported
-    once - bounds judge cost, mirrors SCA), capped at `_MAX_SECRETS`. Same
-    `Candidate` shape the SAST pipeline judges + publishes, so the judge decides
-    whether the value is a real secret (vs a docs example / placeholder). The
-    snippet is masked - the raw value is never echoed."""
+    PR introduces, across ANY file type. Diff-scoped, content-deduped by the
+    EXACT matched credential per `(file, kind)` (the same credential repeated in
+    a file is reported once - bounds judge cost, mirrors SCA; deduping on the
+    exact value, not the lossy mask, so two distinct secrets sharing a masked
+    prefix/suffix are both kept), capped at `_MAX_SECRETS`. Same `Candidate`
+    shape the SAST pipeline judges + publishes, so the judge decides whether the
+    value is a real secret (vs a docs example / placeholder). The raw value is
+    used only for in-memory dedup; the published snippet is masked - the raw
+    value is never echoed into a Candidate or a log."""
     secrets: list[_Secret] = []
     seen: set[tuple[str, str, str]] = set()
     scanned = 0
@@ -184,8 +189,8 @@ def scan_secrets(hunks: tuple[DiffHunk, ...]) -> tuple[Candidate, ...]:
             hit = _detect(text)
             if hit is None:
                 continue
-            kind, masked = hit
-            key = (hunk.file_path, kind, masked)
+            kind, raw, masked = hit
+            key = (hunk.file_path, kind, raw)
             if key in seen:
                 continue
             seen.add(key)
