@@ -42,6 +42,12 @@ EXPOSED_SECRET = "exposed-secret"
 # AC6 cost bound: cap how many secret candidates we emit per review.
 _MAX_SECRETS = 100
 
+# Skip absurdly long added lines (minified JS, lockfile blobs). The generic
+# regex is O(n^2) in line length, and this scanner runs over attacker-
+# influenceable PR content - bound the work so a pathological line cannot stall
+# the review. A real secret on a 4 KB+ single line is vanishingly rare.
+_MAX_LINE_LEN = 4096
+
 # Generic rule thresholds: a value must be at least this long AND clear this
 # Shannon entropy (bits/char) to count as secret-like. Tuned so dictionary
 # placeholders ("your-key-here", "passwordpassword") fall below the bar while
@@ -159,6 +165,8 @@ def scan_secrets(hunks: tuple[DiffHunk, ...]) -> tuple[Candidate, ...]:
     seen: set[tuple[str, str, str]] = set()
     for hunk in hunks:
         for lineno, text in _added_lines(hunk):
+            if len(text) > _MAX_LINE_LEN:
+                continue
             hit = _detect(text)
             if hit is None:
                 continue
