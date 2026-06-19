@@ -911,6 +911,41 @@ def test_llmobs_output_data_is_redacted_on_success(monkeypatch) -> None:
     assert "[REDACTED:aws-access-key]" in out_str
 
 
+def test_build_messages_redacts_secrets_in_diff(monkeypatch) -> None:
+    """#438: secrets in the diff are masked in the user message BEFORE it is sent
+    to the backend (a third-party SaaS endpoint), not just in the DD span."""
+    hunks = [lc.Hunk(path="bad.py", body="+AWS_KEY = 'AKIAIOSFODNN7EXAMPLE'")]
+    user = lc._build_messages(hunks, "v1")[1]["content"]
+    assert "AKIAIOSFODNN7EXAMPLE" not in user
+    assert "[REDACTED:aws-access-key]" in user
+
+
+def test_build_messages_redacts_secrets_in_file_context() -> None:
+    """#438: the full-file context block (#336) is also redacted - a secret on an
+    UNCHANGED line of a changed file must not reach the backend either."""
+    hunks = [lc.Hunk(path="bad.py", body="+x = 1")]
+    user = lc._build_messages(hunks, "v1", {"bad.py": "KEY = 'AKIAIOSFODNN7EXAMPLE'\nx = 1\n"})[1]["content"]
+    assert "AKIAIOSFODNN7EXAMPLE" not in user
+
+
+def test_backend_request_body_is_redacted(monkeypatch) -> None:
+    """#438 end-to-end: the body sent to _call_backend / httpx.post has secrets
+    redacted. This is THE acceptance criterion - the SaaS backend never receives
+    a raw secret from the main review."""
+    leaky_hunk = lc.Hunk(path="bad.py", body="+AWS_KEY = 'AKIAIOSFODNN7EXAMPLE'  # oops")
+    captured: dict = {}
+
+    def _capture_post(url, **kw):
+        captured["json"] = kw.get("json")
+        return httpx.Response(200, json=_openai_json_response('{"findings":[]}'))
+
+    monkeypatch.setattr(httpx, "post", _capture_post)
+    review_diff([leaky_hunk], installation_id=1)
+    body_str = json.dumps(captured["json"])
+    assert "AKIAIOSFODNN7EXAMPLE" not in body_str
+    assert "[REDACTED:aws-access-key]" in body_str
+
+
 def test_no_diff_short_circuit_does_not_emit_llmobs_span(monkeypatch) -> None:
     """Empty hunks short-circuit before any LLM call — no span should
     be emitted (no LLM call happened)."""
