@@ -247,6 +247,51 @@ def test_dispatch_suppresses_example_secret(monkeypatch):
     assert not leaked, "a judge-suppressed example secret must not be published"
 
 
+def test_judge_reasoning_cannot_leak_secret(monkeypatch):
+    """#436 no-echo (peer-review BLOCK fix): the judge sees full file content and
+    could quote the raw secret in its reasoning, which is published verbatim for
+    other classes. An exposed-secret finding must use a FIXED rationale, never
+    the judge's free text."""
+    posted_check, posted_review = [], []
+    _wire_common(monkeypatch, posted_check, posted_review)
+    monkeypatch.setattr(
+        "personas.code_reviewer.sast.judge_findings",
+        lambda *a, **kw: (FindingJudgement(finding_index=0, is_real_bug=True, reasoning=f"the key {_AWS_KEY} is live and reaches prod"),),
+    )
+    r = MagicMock(); r.status_code = 200; r.raise_for_status = MagicMock()
+    r.text = _diff(".env", f"AWS_SECRET_ACCESS_KEY={_AWS_KEY}")
+    with patch("httpx.get", return_value=r):
+        cr_dispatch.dispatch_code_review(_base_payload(), blocking=True)
+    assert posted_review and posted_review[0].comments
+    body = posted_review[0].comments[0].body
+    assert _AWS_KEY not in body, "judge reasoning must not echo the raw secret"
+    assert "rotate" in body.lower()  # the fixed rationale is used instead
+
+
+def test_dispatch_bounds_candidates_to_judge_budget(monkeypatch):
+    """#436 (peer-review BLOCK fix): a flood of candidates must NOT exceed the
+    judge cap (which fail-closes to zero findings); dispatch truncates first."""
+    from personas.code_reviewer.sast import Candidate
+
+    posted_check, posted_review = [], []
+    _wire_common(monkeypatch, posted_check, posted_review)
+    flood = tuple(Candidate(EXPOSED_SECRET, ".env", i + 1, f"masked-{i}") for i in range(40))
+    monkeypatch.setattr(cr_dispatch, "scan_secrets", lambda hunks: flood)
+    captured = {}
+
+    def _judge(reprs, *a, **kw):
+        captured["n"] = len(reprs)
+        return ()
+
+    monkeypatch.setattr("personas.code_reviewer.sast.judge_findings", _judge)
+    r = MagicMock(); r.status_code = 200; r.raise_for_status = MagicMock()
+    r.text = _diff("app.py", "x = 1")
+    with patch("httpx.get", return_value=r):
+        cr_dispatch.dispatch_code_review(_base_payload(), blocking=True)
+    from llm_client import _JUDGE_MAX_FINDINGS
+    assert captured.get("n", 0) <= _JUDGE_MAX_FINDINGS  # judge ran on a bounded set
+
+
 def test_dispatch_survives_secret_scan_failure(monkeypatch):
     """#436 AC4 (no regression): the wiring's core promise - a scan_secrets
     exception is swallowed by the dispatch security-block guard and the core

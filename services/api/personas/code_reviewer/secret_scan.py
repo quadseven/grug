@@ -35,9 +35,9 @@ import re
 from dataclasses import dataclass
 
 from .diff_parser import DiffHunk
-from .sast import Candidate
+from .sast import EXPOSED_SECRET, Candidate
 
-EXPOSED_SECRET = "exposed-secret"
+__all__ = ["EXPOSED_SECRET", "scan_secrets"]
 
 # AC6 cost bound: cap how many secret candidates we emit per review.
 _MAX_SECRETS = 100
