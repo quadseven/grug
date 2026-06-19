@@ -97,6 +97,12 @@ def test_ignores_removed_and_context_lines():
     assert scan_secrets(_hunks(diff)) == ()
 
 
+def test_skips_oversized_line():
+    # A real token buried in a 4 KB+ minified blob is skipped (ReDoS/cost bound).
+    giant = "x" * (secret_scan._MAX_LINE_LEN + 1) + _AWS_KEY
+    assert scan_secrets(_hunks(_diff("bundle.min.js", giant))) == ()
+
+
 def test_dedups_same_secret_across_lines():
     # Same credential repeated in a file -> reported once (content-dedup, like
     # SCA; bounds judge cost).
