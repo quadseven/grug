@@ -33,6 +33,7 @@ from llm_client import (
 )
 from personas.code_reviewer.diff_parser import DiffHunk
 from personas.code_reviewer.persona import CodeReviewEvaluation, Finding
+from personas.code_reviewer.sast import EXPOSED_SECRET
 
 log = logging.getLogger(f"{os.getenv('DD_SERVICE', 'grug')}.persona.code_reviewer.judge")
 
@@ -119,9 +120,18 @@ def run_judge(
                 continue
             seen_indices.add(v.finding_index)
             f = findings[v.finding_index]
+            # An exposed-secret finding's judge reasoning is generated from the
+            # full raw file content (#336) and can quote the credential; never
+            # ship that free text to DD. The is_real_bug label + tags (the
+            # ground-truth signal this dataset is for) are still recorded.
+            reasoning = (
+                "[redacted: exposed-secret]"
+                if f.rule_name == EXPOSED_SECRET
+                else v.reasoning
+            )
             submit_finding_evaluation(
                 is_real_bug=v.is_real_bug,
-                reasoning=v.reasoning,
+                reasoning=reasoning,
                 review_span_context=review_span_context,
                 tags=eval_tags(f),
             )

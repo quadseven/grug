@@ -292,6 +292,36 @@ def test_dispatch_bounds_candidates_to_judge_budget(monkeypatch):
     assert captured.get("n", 0) <= _JUDGE_MAX_FINDINGS  # judge ran on a bounded set
 
 
+def test_secret_candidates_survive_truncation(monkeypatch):
+    """#436 (peer-review BLOCK fix): under a candidate flood, secret candidates
+    (highest exploitability) are judged FIRST - they must not be the ones the
+    budget truncation drops."""
+    from personas.code_reviewer.sast import Candidate
+    from llm_client import _JUDGE_MAX_FINDINGS
+
+    posted_check, posted_review = [], []
+    _wire_common(monkeypatch, posted_check, posted_review)
+    sast_flood = tuple(Candidate("sql-injection", "a.py", i + 1, f"s{i}") for i in range(30))
+    secrets = (
+        Candidate(EXPOSED_SECRET, ".env", 1, "AWS access key id (value masked: AKIA...MPLE)"),
+        Candidate(EXPOSED_SECRET, ".env", 2, "GitHub token (value masked: ghp_...0009)"),
+    )
+    monkeypatch.setattr(cr_dispatch, "scan_candidates", lambda *a, **kw: sast_flood)
+    monkeypatch.setattr(cr_dispatch, "scan_secrets", lambda hunks: secrets)
+    captured = {}
+    monkeypatch.setattr(
+        "personas.code_reviewer.sast.judge_findings",
+        lambda reprs, *a, **kw: captured.update(reprs=list(reprs)) or (),
+    )
+    r = MagicMock(); r.status_code = 200; r.raise_for_status = MagicMock()
+    r.text = _diff("app.py", "x = 1")
+    with patch("httpx.get", return_value=r):
+        cr_dispatch.dispatch_code_review(_base_payload(), blocking=True)
+    classes = [rp["rule_name"] for rp in captured["reprs"]]
+    assert len(classes) <= _JUDGE_MAX_FINDINGS
+    assert classes.count(EXPOSED_SECRET) == 2, "both secrets survived truncation"
+
+
 def test_dispatch_survives_secret_scan_failure(monkeypatch):
     """#436 AC4 (no regression): the wiring's core promise - a scan_secrets
     exception is swallowed by the dispatch security-block guard and the core
