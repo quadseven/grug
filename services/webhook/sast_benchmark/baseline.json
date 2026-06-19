@@ -1,4 +1,38 @@
 {
-  "_comment": "Recorded by the benchmark.sast.yml workflow_dispatch job (joins tailnet for sparkles, uses the free OpenRouter/Poolside key secrets). Empty until the first --record run; `python -m sast_benchmark --check` skips any backend with no baseline entry. Do not hand-edit recall numbers (AC4: no fabricated verdicts).",
-  "backends": {}
+  "backends": {
+    "openrouter": {
+      "backend": "openrouter",
+      "fp_flagged": [],
+      "overall_recall": 0.0,
+      "per_class_recall": {
+        "cleartext-secret-log": 0.0,
+        "command-injection": 0.0,
+        "hardcoded-credential": 0.0,
+        "path-traversal": 0.0,
+        "sql-injection": 0.0,
+        "ssrf": 0.0,
+        "template-injection": 0.0,
+        "unsafe-deserialization": 0.0,
+        "weak-crypto": 0.0
+      },
+      "precision": 1.0
+    },
+    "poolside": {
+      "backend": "poolside",
+      "fp_flagged": [],
+      "overall_recall": 0.7777777777777778,
+      "per_class_recall": {
+        "cleartext-secret-log": 1.0,
+        "command-injection": 1.0,
+        "hardcoded-credential": 1.0,
+        "path-traversal": 0.0,
+        "sql-injection": 1.0,
+        "ssrf": 1.0,
+        "template-injection": 1.0,
+        "unsafe-deserialization": 1.0,
+        "weak-crypto": 0.0
+      },
+      "precision": 1.0
+    }
+  }
 }
