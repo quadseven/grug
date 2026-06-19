@@ -11,6 +11,7 @@ plug in via the same dispatcher).
 
 from __future__ import annotations
 
+import asyncio
 import logging
 import os
 
@@ -90,21 +91,22 @@ async def receive_github_webhook(
     # on the parsed dict not being bytes — so HMAC verify never runs.
     # Using `Request` keeps the wire bytes intact for HMAC verify.
     #
-    # This is `async def`, so the sync boto3 / httpx calls below (and the
-    # #272 `lambda.invoke` self-invoke in dispatch) run directly on the
-    # event loop — async handlers do NOT get Starlette's run_in_threadpool
-    # offload. That's safe ONLY because AWS Lambda runs one invocation per
-    # warm container: while this handler runs there are no peer request-
-    # coroutines to starve. It is an invariant of the execution model, not
-    # a guarantee — if anything ever adds concurrent coroutines to this loop
-    # (asyncio.gather fan-out, a streaming response, a background task), wrap
-    # the sync calls in `await asyncio.to_thread(...)` (as cf_auth.py's
-    # middleware already does for its sync ssm.get_parameter). See
-    # docs/RUNBOOK.md#sync-vs-async-route-handlers. Closes #68 (spirit) + the
-    # pre-Slice-11 422 regression.
+    # This is `async def` (it must be: reading the raw HMAC bytes needs
+    # `await request.body()` — see the 422 note above), so the sync boto3 /
+    # httpx calls below run on the event loop, and async handlers do NOT get
+    # Starlette's run_in_threadpool offload. On Lambda that was safe (one
+    # invocation per warm container, no peer coroutines to starve), but on the
+    # k8s runtime (#354) uvicorn serves CONCURRENT deliveries on one loop, so a
+    # sync call here would block every other in-flight delivery's ACK toward
+    # GitHub's ~10s timeout. So the blocking calls — the SSM secret fetch and
+    # `dispatch` (its remaining sync httpx/store work; the heavy Elder review is
+    # already off-loop via #368) — run in `await asyncio.to_thread(...)`, the
+    # same offload cf_auth.py's middleware uses for its sync ssm.get_parameter.
+    # See docs/RUNBOOK.md#sync-vs-async-route-handlers. Closes #371 + #68
+    # (spirit) + the pre-Slice-11 422 regression.
     body = await request.body()
 
-    secret = get_webhook_secret()
+    secret = await asyncio.to_thread(get_webhook_secret)
     if not verify_signature(secret, body, x_hub_signature_256):
         # Split the alert signal from internet noise. A genuine GitHub delivery
         # being REJECTED (webhook secret rotated / SSM drift — actionable)
@@ -163,7 +165,9 @@ async def receive_github_webhook(
         )
         raise HTTPException(status_code=400, detail="body_not_json")
 
-    outcome = dispatch(x_github_event, payload, delivery_id=x_github_delivery)
+    outcome = await asyncio.to_thread(
+        dispatch, x_github_event, payload, delivery_id=x_github_delivery
+    )
     log.info(
         "webhook_dispatched",
         extra={"delivery_id": x_github_delivery, **outcome},
