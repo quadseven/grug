@@ -31,6 +31,10 @@ log = logging.getLogger("grug.sast_benchmark")
 
 _TIMEOUT_SECONDS = 90.0
 _RETRY_ATTEMPTS = 2
+# Measure the SHIPPED prompt. `_build_messages` keys `_SYSTEM_PROMPTS` by
+# PromptVariant ("v1"/"v2", #191 A/B); "v1" is the production default. Passing
+# a non-member (the old "benchmark") raises KeyError -> every sample errors.
+_BENCH_PROMPT_VARIANT = "v1"
 
 
 def _post(backend: BenchBackend, messages: list[dict[str, str]]) -> httpx.Response:
@@ -76,7 +80,7 @@ def run_sample(backend: BenchBackend, sample: CorpusSample) -> tuple[int, bool]:
     """
     hunks = [Hunk(path=sample.path, body=sample.diff_body)]
     try:
-        messages = _build_messages(hunks, "benchmark")
+        messages = _build_messages(hunks, _BENCH_PROMPT_VARIANT)
         resp = _post(backend, messages)
         findings, _model, err = _parse_response(resp)
     except Exception as e:  # noqa: BLE001 — one sample must not abort the sweep
