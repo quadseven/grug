@@ -35,7 +35,7 @@ from github_checks_client import CheckConclusion, CheckRunResult, post_check_run
 from github_reviews_client import (
     InlineComment, ReviewEvent, ReviewResult, get_review_comments, post_review,
 )
-from llm_client import Hunk as LlmHunk, LlmReviewResponse, review_diff
+from llm_client import _JUDGE_MAX_FINDINGS, Hunk as LlmHunk, LlmReviewResponse, review_diff
 from personas.code_reviewer.dedup import (
     dedup_findings, finding_key, parse_rule, prior_keys_from_comments,
     rule_marker,
@@ -49,6 +49,7 @@ from personas.code_reviewer.persona import (
 )
 from personas.code_reviewer.sast import judge_candidates, scan_candidates
 from personas.code_reviewer.sca import scan_dependencies
+from personas.code_reviewer.secret_scan import scan_secrets
 from adapters.install_store import put_comment_record  # type: ignore
 
 log = logging.getLogger(f"{os.getenv('DD_SERVICE', 'grug')}.persona.code_reviewer")
@@ -554,18 +555,39 @@ def dispatch_code_review(
 
     evaluation = evaluate_diff(hunks, llm_response)
 
-    # Security detection (ADR-0006 SAST #400/#401 + ADR-0007 SCA #434): two
-    # candidate SOURCES — the SAST engine over the diff code, and the SCA engine
-    # over the diff's dependency changes — feed ONE exploitability-judge pass
-    # (recall from the engines, precision from the judge), and the kept findings
-    # merge into the SAME evaluation so they flow the existing publish path (no
-    # parallel posting). Best-effort: any failure must not break the core review
-    # (judge_candidates already fails-closed; guard the scan/merge too).
+    # Security detection (ADR-0006 SAST #400/#401 + ADR-0007 SCA #434 + secret
+    # scanning #436): three candidate SOURCES — the SAST engine over the diff
+    # code, the SCA engine over the diff's dependency changes, and the secret
+    # scanner over added lines of any file type — feed ONE exploitability-judge
+    # pass (recall from the engines, precision from the judge), and the kept
+    # findings merge into the SAME evaluation so they flow the existing publish
+    # path (no parallel posting). Best-effort: any failure must not break the
+    # core review (judge_candidates already fails-closed; guard the scan/merge too).
     try:
+        # Secret candidates FIRST: a committed live credential is the highest-
+        # exploitability class, so it must survive the judge-budget truncation
+        # below rather than being the first dropped (it would be, concatenated
+        # last) when a noisy PR fills the budget with other candidates.
         candidates = (
-            scan_candidates(hunks, file_contents=file_contents)
+            scan_secrets(hunks)
+            + scan_candidates(hunks, file_contents=file_contents)
             + scan_dependencies(hunks)
         )
+        # The shared judge fail-closes ABOVE its cap: past `_JUDGE_MAX_FINDINGS`
+        # it returns no verdicts and EVERY candidate is suppressed (a noisy PR
+        # could then bury a real leaked secret under benign candidates). Bound
+        # the combined set to the judge budget here so a flood degrades to
+        # "judge the first N" rather than "publish nothing". Logged, never silent.
+        if len(candidates) > _JUDGE_MAX_FINDINGS:
+            log.info(
+                "security_candidates_truncated_to_judge_budget",
+                extra={
+                    "installation_id": installation_id,
+                    "total": len(candidates),
+                    "max": _JUDGE_MAX_FINDINGS,
+                },
+            )
+            candidates = candidates[:_JUDGE_MAX_FINDINGS]
         security_findings = judge_candidates(
             candidates,
             hunks,
