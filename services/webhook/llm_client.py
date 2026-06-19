@@ -432,9 +432,15 @@ def _build_messages(
             ctx = _render_file_block(h.path, contents.get(h.path))
             shown.add(h.path)
         parts.append(f"### {h.path}\n{ctx}```diff\n{h.body}\n```")
+    # Redact secret-shaped values from the diff + file context BEFORE they reach
+    # the backend (#438). The backend is a third-party SaaS endpoint, and a PR
+    # diff can carry a committed credential; the Elder reviews code structure, not
+    # the literal secret value, so masking does not cost review quality. The
+    # system prompt is fixed and carries no secrets, so only the user content is
+    # scrubbed. (Until now `_redact_secrets` guarded only the DD span payload.)
     return [
         {"role": "system", "content": _SYSTEM_PROMPTS[variant]},
-        {"role": "user", "content": "\n\n".join(parts)},
+        {"role": "user", "content": _redact_secrets("\n\n".join(parts))},
     ]
 
 
