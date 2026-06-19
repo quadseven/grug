@@ -1,4 +1,4 @@
-# MIRRORED — sibling at services/webhook/personas/code_reviewer/sast.py; keep in lockstep. See docs/adr/0001-mirror-with-rule-of-three-deferral.md.
+# MIRRORED — sibling at services/api/personas/code_reviewer/sast.py; keep in lockstep. See docs/adr/0001-mirror-with-rule-of-three-deferral.md.
 """SAST detection tracer for Elder — clear-text-secret-log (#400, ADR-0006).
 
 The vendor-neutral RECALL layer: `scan_candidates` finds candidate vuln sites
