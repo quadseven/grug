@@ -198,7 +198,12 @@ def _warm_trace_writer() -> None:
         log.warning("trace_writer_warmup_failed", exc_info=True)
 
 
-_last_flush_warn = 0.0
+# -inf, NOT 0.0: the rate-limit compares against time.monotonic() (seconds
+# since boot, NOT epoch). On a freshly-booted pod monotonic() can be < the
+# interval, so a 0.0 sentinel makes `now - 0.0 > INTERVAL` False and SILENTLY
+# DROPS the first flush warning in the first 60s after start - exactly when
+# startup trouble matters. -inf means the first real failure always warns.
+_last_flush_warn = float("-inf")
 _FLUSH_WARN_INTERVAL_S = 60.0
 
 
@@ -227,17 +232,30 @@ def _flush_traces() -> None:
     ~once/min, not 12x/min and not never."""
     global _last_flush_warn
     try:
-        import ddtrace
-    except ImportError:
-        log.debug("trace_flush_skipped_no_ddtrace")
-        return
-    try:
-        ddtrace.tracer.flush()
+        _flush_tracer()
     except Exception:  # noqa: BLE001 - telemetry is never worth crashing on
         now = time.monotonic()
         if now - _last_flush_warn > _FLUSH_WARN_INTERVAL_S:
             log.warning("trace_flush_failed", exc_info=True)
             _last_flush_warn = now
+
+
+def _flush_tracer() -> None:
+    """Flush the global APM tracer once (the testable seam for #412).
+
+    ddtrace absent (tests run without it) is a no-op. Isolated from
+    `_flush_traces` so a test can force a flush FAILURE deterministically by
+    patching THIS function. Patching `ddtrace.tracer` (or its `.flush`)
+    directly is order/version dependent and silently no-ops on some hosted
+    runners - it passed locally and flaked red on CI, which is what this seam
+    retires. grug-local: this is a webhook-service test seam, NOT a reusable /
+    CI-workflow concern."""
+    try:
+        import ddtrace
+    except ImportError:
+        log.debug("trace_flush_skipped_no_ddtrace")
+        return
+    ddtrace.tracer.flush()
 
 
 def _startup_check() -> None:
