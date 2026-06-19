@@ -49,6 +49,7 @@ from personas.code_reviewer.persona import (
 )
 from personas.code_reviewer.sast import judge_candidates, scan_candidates
 from personas.code_reviewer.sca import scan_dependencies
+from personas.code_reviewer.secret_scan import scan_secrets
 from adapters.install_store import put_comment_record  # type: ignore
 
 log = logging.getLogger(f"{os.getenv('DD_SERVICE', 'grug')}.persona.code_reviewer")
@@ -554,17 +555,19 @@ def dispatch_code_review(
 
     evaluation = evaluate_diff(hunks, llm_response)
 
-    # Security detection (ADR-0006 SAST #400/#401 + ADR-0007 SCA #434): two
-    # candidate SOURCES — the SAST engine over the diff code, and the SCA engine
-    # over the diff's dependency changes — feed ONE exploitability-judge pass
-    # (recall from the engines, precision from the judge), and the kept findings
-    # merge into the SAME evaluation so they flow the existing publish path (no
-    # parallel posting). Best-effort: any failure must not break the core review
-    # (judge_candidates already fails-closed; guard the scan/merge too).
+    # Security detection (ADR-0006 SAST #400/#401 + ADR-0007 SCA #434 + secret
+    # scanning #436): three candidate SOURCES — the SAST engine over the diff
+    # code, the SCA engine over the diff's dependency changes, and the secret
+    # scanner over added lines of any file type — feed ONE exploitability-judge
+    # pass (recall from the engines, precision from the judge), and the kept
+    # findings merge into the SAME evaluation so they flow the existing publish
+    # path (no parallel posting). Best-effort: any failure must not break the
+    # core review (judge_candidates already fails-closed; guard the scan/merge too).
     try:
         candidates = (
             scan_candidates(hunks, file_contents=file_contents)
             + scan_dependencies(hunks)
+            + scan_secrets(hunks)
         )
         security_findings = judge_candidates(
             candidates,

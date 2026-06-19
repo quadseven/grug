@@ -274,6 +274,7 @@ _CLASS_LABELS: dict[str, str] = {
     "xxe": "XML external entity (XXE)",
     "hardcoded-credential": "Hardcoded credential",
     "vulnerable-dependency": "Vulnerable dependency",
+    "exposed-secret": "Exposed secret or credential",
 }
 
 
