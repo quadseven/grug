@@ -185,18 +185,20 @@ use namespace-level `service:grug`); `env:prod`; `version:<image-sha>`;
 `receive_github_webhook` is **`async def`** (it `await request.body()` so HMAC
 verifies the raw wire bytes; a sync `def` with `Body(...)` lets Pydantic
 JSON-decode before bytes-validation and 422 before HMAC runs — see the comment
-in `main.py`). Its downstream sync I/O (boto3, sync httpx GitHub posts, KMS)
-runs directly on the event loop — an `async def` handler does NOT get
-Starlette's `run_in_threadpool` offload.
+in `main.py`). Because it is `async def`, its sync I/O does NOT get Starlette's
+`run_in_threadpool` offload — it would run directly on the event loop.
 
 **On k8s this is a live concern, not a free invariant.** Under Lambda there was
 one invocation per warm container, so the loop had no peer coroutines to starve.
 A uvicorn pod serves **concurrent** requests on one loop, so a slow sync call in
-the async handler CAN delay peers. Keep the handler's per-call work bounded
-(each httpx call is individually timeout-bounded) and, if anything adds
-concurrent fan-out / streaming / background tasks, wrap sync calls in
-`await asyncio.to_thread(...)` (as `cf_auth.py` already does) or move to
-`httpx.AsyncClient` + `aioboto3`. (Originally #68; re-opened by the k8s move.)
+the async handler delays peers, stretching their ACK toward GitHub's ~10s
+timeout. So the ACK-path sync calls are offloaded with
+`await asyncio.to_thread(...)` (#371): the SSM secret fetch and `dispatch` (its
+remaining sync httpx/store work) run in a worker thread — the same offload
+`cf_auth.py`'s middleware uses. The heavy Elder review is already off-loop on a
+background thread (#368). Any NEW sync I/O added to this handler must be wrapped
+the same way (or moved to `httpx.AsyncClient` + `aioboto3`). (Originally #68;
+re-opened by the k8s move, fixed in #371.)
 
 ### Mirrored files between services/api/ + services/webhook/
 
