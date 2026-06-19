@@ -242,33 +242,40 @@ def test_flush_traces_never_raises():
     consumer._flush_traces()  # must not raise
 
 
-def test_flush_failure_is_visible_but_rate_limited(monkeypatch, caplog):
+def test_flush_failure_is_visible_but_rate_limited(monkeypatch):
     """#412 audit: a REAL flush failure must NOT be silent (that's the
     zero-spans-and-blind state this slice kills) - log WARNING - but rate-limit
-    so a sustained agent outage logs ~once/min, not on every 5s tick."""
-    import logging
-    import types
+    so a sustained agent outage logs ~once/min, not on every 5s tick.
 
-    import ddtrace
+    Forces the failure by patching the `_flush_tracer` SEAM and asserts on a
+    patched logger. Both deliberately avoid ddtrace internals AND caplog: the
+    old approach (swap `ddtrace.tracer`, read `caplog`) was order/version/
+    log-propagation dependent and flaked green-local / red-CI on hosted
+    runners. This path is deterministic everywhere."""
+    from unittest.mock import MagicMock
 
-    monkeypatch.setattr(consumer, "_last_flush_warn", 0.0)
+    # -inf = "never warned" (NOT 0.0: the rate-limit compares against
+    # time.monotonic() = since-boot, which on a fresh runner can be < the
+    # interval, suppressing the first warning -> the real green-local/red-CI
+    # flake this fixes).
+    monkeypatch.setattr(consumer, "_last_flush_warn", float("-inf"))
+    monkeypatch.setattr(
+        consumer,
+        "_flush_tracer",
+        MagicMock(side_effect=RuntimeError("agent unreachable")),
+    )
+    mock_log = MagicMock()
+    monkeypatch.setattr(consumer, "log", mock_log)
 
-    def _boom():
-        raise RuntimeError("agent unreachable")
+    consumer._flush_traces()  # first failure -> warns
+    consumer._flush_traces()  # immediate retry -> rate-limited, no second warn
 
-    # Replace the WHOLE tracer object, not just `.flush` — under ddtrace's
-    # proxy/lazy tracer, patching the `.flush` attribute is order/version
-    # dependent and silently no-ops on some hosted runners (the real flush
-    # then succeeds and nothing warns -> a deterministic CI failure that
-    # cannot reproduce locally). `_flush_traces` only calls `ddtrace.tracer
-    # .flush()`, so a SimpleNamespace stands in deterministically.
-    monkeypatch.setattr(ddtrace, "tracer", types.SimpleNamespace(flush=_boom))
-    with caplog.at_level(logging.WARNING):
-        consumer._flush_traces()  # first failure -> warns
-        consumer._flush_traces()  # immediate retry -> rate-limited, no second warn
-    warns = [r for r in caplog.records if r.msg == "trace_flush_failed"]
+    warns = [
+        c for c in mock_log.warning.call_args_list
+        if c.args and c.args[0] == "trace_flush_failed"
+    ]
     assert len(warns) == 1, "real flush failure must warn exactly once (rate-limited)"
-    assert warns[0].levelno == logging.WARNING
+    assert warns[0].kwargs.get("exc_info") is True
 
 
 def test_watchdog_flushes_traces_each_tick(monkeypatch):
