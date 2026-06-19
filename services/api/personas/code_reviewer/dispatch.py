@@ -48,6 +48,7 @@ from personas.code_reviewer.persona import (
     CodeReviewEvaluation, Finding, evaluate_diff, with_extra_findings,
 )
 from personas.code_reviewer.sast import judge_candidates, scan_candidates
+from personas.code_reviewer.iac_scan import scan_iac
 from personas.code_reviewer.sca import scan_dependencies
 from personas.code_reviewer.secret_scan import scan_secrets
 from adapters.install_store import put_comment_record  # type: ignore
@@ -572,6 +573,7 @@ def dispatch_code_review(
             scan_secrets(hunks)
             + scan_candidates(hunks, file_contents=file_contents)
             + scan_dependencies(hunks)
+            + scan_iac(hunks)
         )
         # The shared judge fail-closes ABOVE its cap: past `_JUDGE_MAX_FINDINGS`
         # it returns no verdicts and EVERY candidate is suppressed (a noisy PR

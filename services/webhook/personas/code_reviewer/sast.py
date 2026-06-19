@@ -43,6 +43,10 @@ CLEARTEXT_SECRET_LOG = "cleartext-secret-log"
 # (secret_scan imports Candidate from this module). secret_scan re-imports it.
 EXPOSED_SECRET = "exposed-secret"
 
+# IaC misconfiguration class (#447). Defined here (not in iac_scan) for the same
+# no-cycle reason as EXPOSED_SECRET; iac_scan re-imports it.
+IAC_MISCONFIG = "iac-misconfig"
+
 # A logging / print SINK on an added line. Covers the stdlib + common logger
 # idioms (`logging.info`, `log.warning`, `logger.debug`, `self.log.error`) and
 # bare `print(`. Deliberately broad — the judge filters non-exploitable hits.
@@ -280,6 +284,7 @@ _CLASS_LABELS: dict[str, str] = {
     "hardcoded-credential": "Hardcoded credential",
     "vulnerable-dependency": "Vulnerable dependency",
     "exposed-secret": "Exposed secret or credential",
+    "iac-misconfig": "Infrastructure-as-code misconfiguration",
 }
 
 
