@@ -27,7 +27,7 @@ import tempfile
 from dataclasses import dataclass
 from typing import Optional
 
-from llm_client import Hunk, JudgeFindingRepr, PrContext, judge_findings
+from llm_client import FindingJudgement, Hunk, JudgeFindingRepr, PrContext, judge_findings
 
 from .diff_parser import DiffHunk
 from .persona import Finding
@@ -37,6 +37,11 @@ log = logging.getLogger(f"{os.getenv('DD_SERVICE', 'grug')}.persona.code_reviewe
 # The one class this tracer covers. Kept as a constant so the judge + tests +
 # the (future) engine share one spelling.
 CLEARTEXT_SECRET_LOG = "cleartext-secret-log"
+
+# Committed-secret class (#436). Defined here (not in secret_scan) so the judge
+# can special-case it without importing secret_scan, which would cycle
+# (secret_scan imports Candidate from this module). secret_scan re-imports it.
+EXPOSED_SECRET = "exposed-secret"
 
 # A logging / print SINK on an added line. Covers the stdlib + common logger
 # idioms (`logging.info`, `log.warning`, `logger.debug`, `self.log.error`) and
@@ -274,6 +279,7 @@ _CLASS_LABELS: dict[str, str] = {
     "xxe": "XML external entity (XXE)",
     "hardcoded-credential": "Hardcoded credential",
     "vulnerable-dependency": "Vulnerable dependency",
+    "exposed-secret": "Exposed secret or credential",
 }
 
 
@@ -347,7 +353,7 @@ def judge_candidates(
         if not j.is_real_bug:
             log.info(
                 "sast_candidate_suppressed_not_exploitable",
-                extra={"file": c.file, "line": c.line, "reason": j.reasoning},
+                extra={"file": c.file, "line": c.line, "reason": _safe_reason(c, j)},
             )
             continue
         kept.append(
@@ -356,11 +362,32 @@ def judge_candidates(
                 line=c.line,
                 severity=_SAST_SEVERITY,
                 rule_name=c.vuln_class,
-                message=(
-                    f"{_label(c.vuln_class)}. {j.reasoning} "
-                    f"(line: `{c.snippet}`)"
-                ),
+                message=_finding_message(c, j),
                 suggestion=None,
             )
         )
     return tuple(kept)
+
+
+# The judge sees the full raw file content (#336), so its free-text `reasoning`
+# can quote the very secret an exposed-secret candidate is about. That reasoning
+# is published in the finding message and logged, which would defeat the
+# scanner's no-echo invariant. For exposed-secret findings we therefore NEVER
+# publish or log the judge's free text - the judge's keep/suppress DECISION is
+# still honored; only its prose is withheld and replaced with a fixed rationale.
+_SECRET_FINDING_RATIONALE = (
+    "A committed credential was detected on this line. Treat it as compromised: "
+    "rotate it, and remove it from the diff (and from history if already pushed)."
+)
+
+
+def _finding_message(c: Candidate, j: FindingJudgement) -> str:
+    if c.vuln_class == EXPOSED_SECRET:
+        return f"{_label(c.vuln_class)}. {_SECRET_FINDING_RATIONALE} (line: `{c.snippet}`)"
+    return f"{_label(c.vuln_class)}. {j.reasoning} (line: `{c.snippet}`)"
+
+
+def _safe_reason(c: Candidate, j: FindingJudgement) -> str:
+    """Judge reasoning is safe to log EXCEPT for exposed-secret, where it could
+    quote the raw value the judge read from full-file context."""
+    return "<redacted: exposed-secret>" if c.vuln_class == EXPOSED_SECRET else j.reasoning

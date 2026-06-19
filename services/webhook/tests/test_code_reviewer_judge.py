@@ -76,6 +76,39 @@ def test_run_judge_submits_one_eval_per_finding(monkeypatch):
     assert submitted[1]["tags"]["rule_name"] == "style"
 
 
+def test_run_judge_redacts_exposed_secret_reasoning(monkeypatch):
+    """#436: an exposed-secret finding's judge reasoning is generated from full
+    raw file context and can quote the credential; it must be redacted before
+    the DD eval submit. A normal finding's reasoning passes through unchanged."""
+    from personas.code_reviewer.sast import EXPOSED_SECRET
+
+    evaluation = CodeReviewEvaluation(
+        findings=(_finding(rule=EXPOSED_SECRET), _finding(rule="null-deref", line=3)),
+        conclusion="failure",
+    )
+    review = _reviewed(evaluation.findings)
+    monkeypatch.setattr(
+        cr_judge, "judge_findings",
+        lambda fr, h, installation_id, pr_context=None, file_contents=None: (
+            FindingJudgement(0, True, "the key AKIAIOSFODNN7EXAMPLE is live and reaches prod"),
+            FindingJudgement(1, True, "real null deref"),
+        ),
+    )
+    submitted: list[dict] = []
+    monkeypatch.setattr(cr_judge, "submit_finding_evaluation", lambda **kw: submitted.append(kw))
+
+    cr_judge.run_judge(
+        evaluation, parse_diff(_DIFF), installation_id=1,
+        review_span_context=review.review_span_context,
+        file_contents={"src/x.py": "AKIAIOSFODNN7EXAMPLE"},
+    )
+
+    assert submitted[0]["tags"]["rule_name"] == EXPOSED_SECRET
+    assert "AKIAIOSFODNN7EXAMPLE" not in submitted[0]["reasoning"]
+    assert submitted[0]["reasoning"] == "[redacted: exposed-secret]"
+    assert submitted[1]["reasoning"] == "real null deref"  # normal finding untouched
+
+
 def test_run_judge_converts_diffhunks_to_wire_hunks(monkeypatch):
     """Regression: run_judge must convert parser DiffHunks → wire `Hunk`s
     (field `path`) before judge_findings, which reads `.path`. Passing raw
