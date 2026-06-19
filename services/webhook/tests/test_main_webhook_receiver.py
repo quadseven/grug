@@ -202,3 +202,66 @@ def test_receiver_threads_delivery_id_into_dispatch(_client):
         )
     assert r.status_code == 200
     assert captured["delivery_id"] == "deliv-xyz"
+
+
+def test_concurrent_deliveries_do_not_serialize_on_ack_path(monkeypatch):
+    """#371: on k8s, uvicorn serves concurrent deliveries on ONE event loop.
+    The ACK-path sync calls (SSM secret fetch, dispatch) must be offloaded via
+    asyncio.to_thread so two simultaneous deliveries don't serialize - one
+    handler's sync call must not block the other's ACK. Proven with a
+    max-concurrency counter: if the slow sync call runs on the loop, the two
+    deliveries serialize and max concurrency is 1; offloaded to threads they
+    overlap and reach 2."""
+    import asyncio
+    import threading
+    import time
+
+    import httpx
+
+    monkeypatch.setenv("GITHUB_APP_WEBHOOK_SECRET_SSM", "/grug/test-webhook-secret")
+    monkeypatch.setenv("GRUG_DDB_TABLE", "grug-main-test")
+    monkeypatch.setenv("AWS_DEFAULT_REGION", "us-east-1")
+    import main as webhook_main
+    import dispatcher
+
+    state = {"current": 0, "max": 0}
+    lock = threading.Lock()
+
+    def slow_secret() -> str:
+        # Simulate the blocking SSM round-trip on the ACK path.
+        with lock:
+            state["current"] += 1
+            state["max"] = max(state["max"], state["current"])
+        time.sleep(0.2)
+        with lock:
+            state["current"] -= 1
+        return _WEBHOOK_SECRET
+
+    monkeypatch.setattr(webhook_main, "get_webhook_secret", slow_secret)
+    monkeypatch.setattr(
+        dispatcher,
+        "dispatch",
+        lambda event, payload, *, delivery_id="": {"status": "no_op"},
+    )
+
+    body = b'{"action":"opened"}'
+    headers = {
+        "X-GitHub-Event": "pull_request",
+        "X-Hub-Signature-256": _sign(_WEBHOOK_SECRET, body),
+    }
+
+    async def _drive() -> tuple[int, int]:
+        transport = httpx.ASGITransport(app=webhook_main.app)
+        async with httpx.AsyncClient(transport=transport, base_url="http://t") as c:
+            async def _one() -> int:
+                r = await c.post("/webhook/github", content=body, headers=headers)
+                return r.status_code
+
+            return await asyncio.gather(_one(), _one())
+
+    codes = asyncio.run(_drive())
+    assert codes == [200, 200]
+    assert state["max"] == 2, (
+        "ACK-path sync call serialized the two deliveries on the event loop "
+        "(expected concurrent offload via asyncio.to_thread)"
+    )
