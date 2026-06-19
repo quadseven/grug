@@ -66,6 +66,14 @@ def test_flags_generic_high_entropy_assignment():
     assert len(cands) == 1 and cands[0].vuln_class == EXPOSED_SECRET
 
 
+def test_flags_generic_yaml_colon_bare_value():
+    # The generic rule's `:` separator + bare (unquoted) value branch - distinct
+    # from the `=`/quoted path and from provider patterns (the value is not a
+    # provider format, so it exercises _GENERIC_RE, not a short-circuit).
+    cands = scan_secrets(_hunks(_diff("settings.yaml", f"app_token: {_HIGH_ENTROPY}")))
+    assert len(cands) == 1 and cands[0].vuln_class == EXPOSED_SECRET
+
+
 def test_ignores_low_entropy_placeholder():
     # len < 16 placeholder AND a 16-char low-entropy value: neither is flagged
     # (the judge never even sees them - the detector's entropy/len gate drops
@@ -119,6 +127,23 @@ def test_pathological_line_is_linear_time():
     start = time.monotonic()
     assert scan_secrets(_hunks(_diff("x.txt", line))) == ()
     assert time.monotonic() - start < 1.0
+
+
+def test_line_number_anchored_after_context_lines():
+    # A secret added after N context lines in a hunk that does NOT start at line
+    # 1 must anchor to its true new-side line number (the `lineno += 1` on the
+    # context-line branch). Every other test's hunk starts at line 1 with only
+    # added lines, so this is the only guard against mis-anchoring real hunks.
+    diff = (
+        "diff --git a/app.py b/app.py\n--- a/app.py\n+++ b/app.py\n"
+        "@@ -10,4 +10,5 @@\n"
+        " def f():\n"                                   # context -> new line 10
+        "     x = 1\n"                                   # context -> new line 11
+        f'+    api_key = "{_HIGH_ENTROPY}"\n'            # added   -> new line 12
+        "     return x\n"                                # context -> new line 13
+    )
+    cands = scan_secrets(_hunks(diff))
+    assert len(cands) == 1 and cands[0].line == 12
 
 
 def test_dedups_same_secret_across_lines():
@@ -214,7 +239,27 @@ def test_dispatch_suppresses_example_secret(monkeypatch):
     r = MagicMock(); r.status_code = 200; r.raise_for_status = MagicMock(); r.text = secret_diff
     with patch("httpx.get", return_value=r):
         cr_dispatch.dispatch_code_review(_base_payload(), blocking=True)
-    # judge suppressed the only candidate -> no inline secret finding published
-    if posted_review:
-        assert not any(".env" in c.path or "README" in c.path for c in posted_review[0].comments)
+    # judge suppressed the only candidate -> no inline secret finding published.
+    # Unconditional: if suppression broke and a README.md finding leaked, this
+    # fails regardless of what else was posted.
     assert posted_check and posted_check[0].conclusion != "failure"
+    leaked = [c for c in (posted_review[0].comments if posted_review else []) if c.path == "README.md"]
+    assert not leaked, "a judge-suppressed example secret must not be published"
+
+
+def test_dispatch_survives_secret_scan_failure(monkeypatch):
+    """#436 AC4 (no regression): the wiring's core promise - a scan_secrets
+    exception is swallowed by the dispatch security-block guard and the core
+    review still publishes."""
+    posted_check, posted_review = [], []
+    _wire_common(monkeypatch, posted_check, posted_review)
+
+    def _boom(hunks):
+        raise RuntimeError("secret scan exploded")
+
+    monkeypatch.setattr(cr_dispatch, "scan_secrets", _boom)
+    r = MagicMock(); r.status_code = 200; r.raise_for_status = MagicMock()
+    r.text = _diff("app.py", "x = 1")
+    with patch("httpx.get", return_value=r):
+        cr_dispatch.dispatch_code_review(_base_payload(), blocking=True)
+    assert posted_check, "core review still publishes despite a scan failure"
