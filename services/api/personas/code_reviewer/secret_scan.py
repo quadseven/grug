@@ -42,11 +42,16 @@ EXPOSED_SECRET = "exposed-secret"
 # AC6 cost bound: cap how many secret candidates we emit per review.
 _MAX_SECRETS = 100
 
-# Skip absurdly long added lines (minified JS, lockfile blobs). The generic
-# regex is O(n^2) in line length, and this scanner runs over attacker-
-# influenceable PR content - bound the work so a pathological line cannot stall
-# the review. A real secret on a 4 KB+ single line is vanishingly rare.
+# Skip absurdly long added lines (minified JS, lockfile blobs). A real secret on
+# a 4 KB+ single line is vanishingly rare.
 _MAX_LINE_LEN = 4096
+
+# Aggregate work budget across ALL added lines in a review (mirrors the SAST
+# source's per-review byte budget). The per-line cap alone does NOT bound total
+# work: a PR with thousands of just-under-cap lines is attacker-influenceable
+# content that could otherwise burn minutes of CPU. Once this many bytes of
+# added text have been scanned, stop (the diff is already pathological).
+_MAX_SCAN_BYTES = 1_048_576
 
 # Generic rule thresholds: a value must be at least this long AND clear this
 # Shannon entropy (bits/char) to count as secret-like. Tuned so dictionary
@@ -79,12 +84,17 @@ _PROVIDER_PATTERNS: tuple[_ProviderPattern, ...] = (
 
 # Generic rule: a secret-ish key name assigned (`=` or `:`) a value. The value
 # is captured (quoted or bare) and entropy-gated below. Case-insensitive.
+# The two `[A-Za-z0-9_.-]` windows around the keyword are BOUNDED (`{0,64}`),
+# not unbounded `*`: unbounded greedy classes flanking an alternation backtrack
+# super-linearly on a long word-char line with no `[:=]`, and this scanner runs
+# over attacker-influenceable PR content. A 64-char key affix covers any real
+# identifier while keeping the match linear in line length.
 _GENERIC_RE = re.compile(
-    r"(?i)(?P<key>[A-Za-z0-9_.-]*"
+    r"(?i)(?P<key>[A-Za-z0-9_.-]{0,64}"
     r"(?:secret|token|api[_-]?key|access[_-]?key|private[_-]?key|password|passwd|"
     r"client[_-]?secret|auth[_-]?token|apikey)"
-    r"[A-Za-z0-9_.-]*)"
-    r"\s*[:=]\s*"
+    r"[A-Za-z0-9_.-]{0,64})"
+    r"[ \t]*[:=][ \t]*"
     r"""['"]?(?P<value>[^'"\s]+)['"]?"""
 )
 
@@ -163,10 +173,14 @@ def scan_secrets(hunks: tuple[DiffHunk, ...]) -> tuple[Candidate, ...]:
     snippet is masked - the raw value is never echoed."""
     secrets: list[_Secret] = []
     seen: set[tuple[str, str, str]] = set()
+    scanned = 0
     for hunk in hunks:
         for lineno, text in _added_lines(hunk):
             if len(text) > _MAX_LINE_LEN:
                 continue
+            scanned += len(text)
+            if scanned > _MAX_SCAN_BYTES:
+                return _to_candidates(secrets)
             hit = _detect(text)
             if hit is None:
                 continue

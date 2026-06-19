@@ -103,6 +103,24 @@ def test_skips_oversized_line():
     assert scan_secrets(_hunks(_diff("bundle.min.js", giant))) == ()
 
 
+def test_aggregate_scan_budget_stops():
+    # Past _MAX_SCAN_BYTES of added text, scanning stops - a real token on a line
+    # beyond the budget is not found (aggregate work bound, mirrors SAST).
+    filler = [f"comment line {i} " + "x" * 200 for i in range(secret_scan._MAX_SCAN_BYTES // 200 + 50)]
+    added = [*filler, f"LEAK={_AWS_KEY}"]  # token is past the byte budget
+    assert scan_secrets(_hunks(_diff("big.txt", *added))) == ()
+
+
+def test_pathological_line_is_linear_time():
+    # A 4095-char near-miss of the generic key regex (no `=`) must NOT backtrack
+    # super-linearly. Bounded windows keep it linear; this returns fast.
+    import time
+    line = "apikey" + "a" * 4000  # matches the key class, never reaches `:=`
+    start = time.monotonic()
+    assert scan_secrets(_hunks(_diff("x.txt", line))) == ()
+    assert time.monotonic() - start < 1.0
+
+
 def test_dedups_same_secret_across_lines():
     # Same credential repeated in a file -> reported once (content-dedup, like
     # SCA; bounds judge cost).
