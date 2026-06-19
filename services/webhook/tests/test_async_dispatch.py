@@ -2,10 +2,10 @@
 
 Covers the three new seams that move the Elder LLM review off the webhook
 ACK path:
-  - `enqueue_elder_review` — the fire-and-forget self-invoke (shape of the
-    boto3 lambda.invoke; degrades to False, never raises).
+  - `enqueue_elder_review` — the fire-and-forget offload (on k8s, a
+    background thread; degrades to False, never raises).
   - `run_elder_job` — the async worker (idempotent on delivery_id; never
-    re-raises so AWS doesn't retry-storm).
+    re-raises so a retry doesn't storm).
   - `install_store.claim_delivery` — the win-once idempotency claim (only
     the error-propagation contract here; behavior is in the real-PG suite).
 """
@@ -27,7 +27,7 @@ import adapters.install_store as ins
 
 def _full_gh_payload(body=""):
     """A GitHub pull_request payload with the bulky fields that must NOT be
-    forwarded (the 256 KB Event cap)."""
+    forwarded to the worker (the worker re-fetches by id)."""
     return {
         "action": "opened",
         "pull_request": {
@@ -45,24 +45,11 @@ def _full_gh_payload(body=""):
     }
 
 
-def test_enqueue_invokes_self_async_with_slim_job_payload(monkeypatch):
-    monkeypatch.setenv("AWS_LAMBDA_FUNCTION_NAME", "grug-webhook")
-    with patch.object(ad._lambda, "invoke") as mock_invoke:
-        ok = ad.enqueue_elder_review(
-            payload=_full_gh_payload(body="m" * 5000),
-            delivery_id="d-1",
-            blocking=True,
-        )
-    assert ok is True
-    _, kwargs = mock_invoke.call_args
-    assert kwargs["FunctionName"] == "grug-webhook"
-    assert kwargs["InvocationType"] == "Event"  # async, doesn't wait
-    job = json.loads(kwargs["Payload"])
-    assert job[ad.ASYNC_JOB_KEY] == ad.ELDER_REVIEW_JOB
-    assert job["delivery_id"] == "d-1"
-    assert job["blocking"] is True
-    # Only the fields dispatch_code_review reads survive (256 KB Event cap).
-    assert job["payload"] == {
+def test_slim_payload_keeps_only_worker_fields():
+    """The slim projection forwards ONLY the fields dispatch_code_review
+    reads; the worker re-fetches the diff from GitHub by those ids."""
+    job_payload = ad._slim_payload(_full_gh_payload(body="m" * 5000))
+    assert job_payload == {
         "action": "opened",
         "pull_request": {"number": 7, "head": {"sha": "abc123"}},
         "repository": {"owner": {"login": "githumps"}, "name": "grug"},
@@ -70,38 +57,31 @@ def test_enqueue_invokes_self_async_with_slim_job_payload(monkeypatch):
     }
 
 
-def test_enqueue_drops_bulky_payload_fields(monkeypatch):
-    """The PR body, sender, and extra repo metadata (the parts that can
-    push a payload past the 256 KB async-invoke cap) must NOT be forwarded."""
-    monkeypatch.setenv("AWS_LAMBDA_FUNCTION_NAME", "grug-webhook")
-    huge_body = "z" * 200_000  # would blow the 256 KB cap if forwarded
-    with patch.object(ad._lambda, "invoke") as mock_invoke:
-        ad.enqueue_elder_review(
-            payload=_full_gh_payload(body=huge_body),
-            delivery_id="d-big",
-            blocking=False,
-        )
-    raw = mock_invoke.call_args.kwargs["Payload"]
+def test_slim_payload_drops_bulky_fields():
+    """The PR body, sender, and extra repo metadata must NOT be forwarded —
+    the job stays minimal and bounded regardless of PR size."""
+    huge_body = "z" * 200_000
+    slim = ad._slim_payload(_full_gh_payload(body=huge_body))
+    raw = json.dumps(slim)
     assert len(raw) < 1000  # slim, bounded — not ~200 KB
-    assert b"zzz" not in raw  # the huge body is gone
-    assert b"avatar_url" not in raw  # sender stripped
+    assert "zzz" not in raw  # the huge body is gone
+    assert "avatar_url" not in raw  # sender stripped
 
 
-def test_enqueue_returns_false_without_function_name(monkeypatch):
-    """Local/test (no AWS_LAMBDA_FUNCTION_NAME) → can't self-invoke → False,
-    no exception."""
-    monkeypatch.delenv("AWS_LAMBDA_FUNCTION_NAME", raising=False)
-    with patch.object(ad._lambda, "invoke") as mock_invoke:
+def test_enqueue_returns_false_without_runtime(monkeypatch):
+    """Local/test (no GRUG_K8S_RUNTIME) → no offload path → False, no
+    exception, and no thread spawned."""
+    monkeypatch.delenv("GRUG_K8S_RUNTIME", raising=False)
+    with patch.object(ad.threading, "Thread") as mock_thread:
         ok = ad.enqueue_elder_review(payload={}, delivery_id="d-2", blocking=False)
     assert ok is False
-    mock_invoke.assert_not_called()
+    mock_thread.assert_not_called()
 
 
 def test_enqueue_k8s_runtime_runs_in_process_thread(monkeypatch):
-    """#368: off-Lambda with GRUG_K8S_RUNTIME set, the job runs in-process
-    on a background thread - same slim-projection job shape, no boto3
-    invoke, returns True (the review is NOT dropped)."""
-    monkeypatch.delenv("AWS_LAMBDA_FUNCTION_NAME", raising=False)
+    """#368: with GRUG_K8S_RUNTIME set, the job runs in-process on a
+    background thread - slim-projection job shape, returns True (the review
+    is NOT dropped)."""
     monkeypatch.setenv("GRUG_K8S_RUNTIME", "1")
     ran = threading.Event()
     seen: dict = {}
@@ -111,10 +91,7 @@ def test_enqueue_k8s_runtime_runs_in_process_thread(monkeypatch):
         ran.set()
         return {"persona": "code_reviewer", "result": "pass"}
 
-    with (
-        patch.object(ad, "run_elder_job", side_effect=fake_job),
-        patch.object(ad._lambda, "invoke") as mock_invoke,
-    ):
+    with patch.object(ad, "run_elder_job", side_effect=fake_job):
         ok = ad.enqueue_elder_review(
             payload=_full_gh_payload(body="m" * 5000),
             delivery_id="d-k8s",
@@ -122,32 +99,20 @@ def test_enqueue_k8s_runtime_runs_in_process_thread(monkeypatch):
         )
         assert ran.wait(5.0), "background thread never ran the job"
     assert ok is True
-    mock_invoke.assert_not_called()
     assert seen["delivery_id"] == "d-k8s"
     assert seen["blocking"] is True
     assert seen[ad.ASYNC_JOB_KEY] == ad.ELDER_REVIEW_JOB
-    # Slim projection applies on the k8s path too (keep-in-sync contract).
+    # Slim projection applies on the thread path (keep-in-sync contract).
     assert seen["payload"]["pull_request"] == {"number": 7, "head": {"sha": "abc123"}}
     assert "sender" not in seen["payload"]
 
 
 def test_enqueue_k8s_spawn_failure_degrades_to_false(monkeypatch):
     """#368: a thread-spawn failure must NOT raise into the ACK path -
-    same degrade-to-False contract as a Lambda invoke error."""
-    monkeypatch.delenv("AWS_LAMBDA_FUNCTION_NAME", raising=False)
+    it degrades to False so the caller logs enqueue_failed and still ACKs."""
     monkeypatch.setenv("GRUG_K8S_RUNTIME", "1")
     with patch.object(ad.threading, "Thread", side_effect=RuntimeError("no threads")):
         ok = ad.enqueue_elder_review(payload={}, delivery_id="d-k8s2", blocking=False)
-    assert ok is False
-
-
-def test_enqueue_degrades_to_false_on_invoke_error(monkeypatch):
-    """A throttle/transport error on the invoke must NOT raise (the caller
-    must still ACK GitHub) — it returns False so the caller logs
-    enqueue_failed."""
-    monkeypatch.setenv("AWS_LAMBDA_FUNCTION_NAME", "grug-webhook")
-    with patch.object(ad._lambda, "invoke", side_effect=RuntimeError("throttled")):
-        ok = ad.enqueue_elder_review(payload={}, delivery_id="d-3", blocking=False)
     assert ok is False
 
 

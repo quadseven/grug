@@ -308,13 +308,14 @@ def _handle_pull_request(
         #
         # Elder makes 1–2 LLM calls (worst case ~300s) — far over
         # GitHub's ~10s delivery timeout — so it is OFFLOADED off the
-        # ACK path (#272): self-invoke the Lambda async and return
-        # `queued` immediately. TPM (fast, no LLM) already ran inline
-        # above. Idempotency keys on `delivery_id` inside the worker.
-        # Enqueue failure does NOT fall back to a sync run — that would
-        # re-block the ACK; a dropped review re-triggers on next push.
+        # ACK path (#272): enqueue the review (on k8s, a background
+        # thread — #368) and return `queued` immediately. TPM (fast, no
+        # LLM) already ran inline above. Idempotency keys on `delivery_id`
+        # inside the worker. Enqueue failure does NOT fall back to a sync
+        # run — that would re-block the ACK; a dropped review re-triggers
+        # on next push.
         cfg = get_repo_config(int(installation_id), int(repo_id))
-        from async_dispatch import enqueue_elder_review  # lazy: keeps boto3 lambda client off non-PR cold starts
+        from async_dispatch import enqueue_elder_review  # lazy import keeps cold-start cheap
         enqueued = enqueue_elder_review(
             payload=payload,
             delivery_id=delivery_id,

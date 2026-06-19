@@ -1,48 +1,43 @@
-# WEBHOOK-ONLY (NOT mirrored): self-invoke of the grug-webhook Lambda + its
-# async-job routing. The api service has no webhook ACK path, so there is no
-# api sibling — like dispatcher.py / main.py / lambda_handler.py. Per ADR-0001,
-# only modules BOTH services run are mirrored.
+# WEBHOOK-ONLY (NOT mirrored): Elder async-offload + its async-job routing.
+# The api service has no webhook ACK path, so there is no api sibling — like
+# dispatcher.py / main.py / lambda_handler.py. Per ADR-0001, only modules BOTH
+# services run are mirrored.
 """Async offload of the Elder LLM review off the webhook ACK path (#272).
 
 `receive_github_webhook` must ACK GitHub in <10s, but the Elder persona
 makes 1–2 LLM calls (worst case ~300s with retries) — far over GitHub's
-~10s delivery timeout. So the webhook **self-invokes** the same Lambda
-asynchronously (`InvocationType="Event"`) and returns immediately; the
-async invocation runs the Elder dispatch with the full Lambda budget.
+~10s delivery timeout. So the review is run OFF the ACK path: the handler
+enqueues it and returns immediately.
 
-Why self-invoke the SAME function rather than a dedicated worker Lambda
-or SQS: the webhook image already carries every dependency the Elder
-path needs (GitHub-App auth, LLM keys, DDB, LLM-Obs, KMS) — a separate
-worker would duplicate ~15 env vars + secret grants + a role + the
-mirror surface (the drift ADR-0001 exists to prevent). A same-function
-async invocation IS the async worker. See `specs/DESIGN.md` →
-"Async Elder offload (#272)".
+On the k8s runtime (#354/#368) the offload is an in-process background
+thread (`_spawn_local_elder`): the webhook pod already carries every
+dependency the Elder path needs (GitHub-App auth, LLM keys, Postgres,
+LLM-Obs, KMS), so a separate worker would duplicate ~15 env vars + secret
+grants + a role + the mirror surface ADR-0001 exists to prevent. The
+thread runs with the pod's full lifetime; a pod restart mid-review drops
+the in-flight review, the same best-effort contract Lambda's async invoke
+had (a dropped review re-triggers on the next push). See `specs/DESIGN.md`
+→ "Async Elder offload (#272)".
 
-Routing: the async invocation arrives at `lambda_handler.handler` as a
-RAW event (not a Function-URL HTTP event), so the handler sniffs the
-`grug_async_job` sentinel and calls `run_elder_job` BEFORE handing the
-event to Mangum (which would choke on a non-HTTP shape).
+Routing: a self-invoked async job is still tagged with the `grug_async_job`
+sentinel so `lambda_handler.handler` (reused as the SQS event router by
+consumer.py) can dispatch raw async events to `run_elder_job`.
 """
 
 from __future__ import annotations
 
-import json
 import logging
 import os
 import threading
 from typing import Any
 
-import boto3
-
 log = logging.getLogger(f"{os.getenv('DD_SERVICE', 'grug')}.async_dispatch")
 
-# Sentinel marking a self-invoked async job. `lambda_handler.handler`
-# routes on `event.get("grug_async_job")` truthiness; the value names the
-# job kind so a future second async job type can fan out from one router.
+# Sentinel marking an async job. `lambda_handler.handler` routes on
+# `event.get("grug_async_job")` truthiness; the value names the job kind so a
+# future second async job type can fan out from one router.
 ASYNC_JOB_KEY = "grug_async_job"
 ELDER_REVIEW_JOB = "elder_review"
-
-_lambda = boto3.client("lambda")
 
 
 def _slim_payload(payload: dict[str, Any]) -> dict[str, Any]:
@@ -50,14 +45,10 @@ def _slim_payload(payload: dict[str, Any]) -> dict[str, Any]:
     (`dispatch_code_review`) reads: `action`, the PR number + head sha,
     the repo owner/name, and the installation id. The worker re-fetches
     the diff from GitHub by those IDs, so forwarding the full payload is
-    not just unnecessary — it's DANGEROUS: an async (`InvocationType=
-    "Event"`) invoke caps the request payload at 256 KB, and a large PR
-    (long body + two full repo objects + sender/org) can blow past that
-    → `InvalidRequestContentException` → the review is dropped, and since
-    every re-push re-sends the same oversized payload it NEVER recovers.
-    The slim projection keeps the event tiny and bounded regardless of PR
-    size. Mirrors `dispatch_code_review`'s reads — keep in sync if that
-    function starts consuming new payload fields.
+    unnecessary: the slim projection keeps the job minimal and bounded
+    regardless of PR size (a long body + two full repo objects + sender/org
+    are all dropped). Mirrors `dispatch_code_review`'s reads — keep in sync
+    if that function starts consuming new payload fields.
     """
     pr = payload.get("pull_request") or {}
     repo = payload.get("repository") or {}
@@ -81,61 +72,38 @@ def enqueue_elder_review(
     delivery_id: str,
     blocking: bool,
 ) -> bool:
-    """Fire-and-forget self-invoke to run the Elder review async.
+    """Fire-and-forget offload to run the Elder review async.
 
-    Returns ``True`` if the async invocation was accepted, ``False`` on
+    Returns ``True`` if the async job was accepted, ``False`` on
     any failure (logged). Best-effort by design: the caller logs the
     failure and returns ``result="enqueue_failed"`` — it does NOT fall
     back to a synchronous Elder run, because that would re-block the ACK
     path and break the <10s guarantee. A dropped review re-triggers on
     the next push.
 
-    The target function is the caller's OWN function, read from the
-    Lambda-runtime-provided ``AWS_LAMBDA_FUNCTION_NAME``. Off-Lambda
-    there are two cases (#368): the k8s runtime (``GRUG_K8S_RUNTIME``
-    set in the pod manifests) runs the job in-process on a background
-    thread — a pod has no Lambda-style invoke budget to escape, the ACK
-    handler returns immediately while the thread runs with the pod's
-    full lifetime. Local / test (neither env set) → return False.
+    The k8s runtime (``GRUG_K8S_RUNTIME`` set in the pod manifests, #368)
+    runs the job in-process on a background thread: the ACK handler returns
+    immediately while the thread runs with the pod's full lifetime. This is
+    the only async path post-Lambda (#354); local / test (the flag unset)
+    has no offload and returns False.
 
     k8s trade-off (vs a queue + worker Deployment, recorded in
     specs/DESIGN.md): a pod restart mid-review drops the in-flight
-    review — the SAME best-effort contract as Lambda's async invoke
-    (a dropped review re-triggers on the next push). In exchange we
-    avoid a new queue + consumer + IAM surface for the hot path.
+    review — a best-effort contract (a dropped review re-triggers on the
+    next push). In exchange we avoid a new queue + consumer + IAM surface
+    for the hot path.
     """
     job = {
         ASYNC_JOB_KEY: ELDER_REVIEW_JOB,
         "delivery_id": delivery_id,
         "blocking": blocking,
-        # Slim projection — NOT the full payload (256 KB Event cap). See
-        # _slim_payload.
+        # Slim projection — NOT the full payload. See _slim_payload.
         "payload": _slim_payload(payload),
     }
-    function_name = os.getenv("AWS_LAMBDA_FUNCTION_NAME", "")
-    if not function_name:
-        if os.getenv("GRUG_K8S_RUNTIME"):
-            return _spawn_local_elder(job)
-        log.warning(
-            "elder_enqueue_no_function_name", extra={"delivery_id": delivery_id}
-        )
-        return False
-    try:
-        _lambda.invoke(
-            FunctionName=function_name,
-            InvocationType="Event",  # async; returns 202, does not wait
-            Payload=json.dumps(job).encode("utf-8"),
-        )
-        return True
-    except Exception as e:  # noqa: BLE001 — best-effort enqueue; never break the ACK
-        # Distinct token from the caller's `elder_enqueue_failed` so the
-        # offload-failure monitor (which watches the caller's log) counts
-        # one line per dropped review, not two. This line adds the cause.
-        log.error(
-            "elder_enqueue_invoke_error",
-            extra={"delivery_id": delivery_id, "kind": type(e).__name__},
-        )
-        return False
+    if os.getenv("GRUG_K8S_RUNTIME"):
+        return _spawn_local_elder(job)
+    log.warning("elder_enqueue_no_runtime", extra={"delivery_id": delivery_id})
+    return False
 
 
 def _spawn_local_elder(job: dict[str, Any]) -> bool:
@@ -166,7 +134,7 @@ def _spawn_local_elder(job: dict[str, Any]) -> bool:
 
 
 def run_elder_job(event: dict[str, Any]) -> dict[str, str]:
-    """Worker entry for a self-invoked Elder review job.
+    """Worker entry for an async Elder review job.
 
     Two-layer idempotency so the review is never double-posted:
     ``delivery_id`` (`install_store.claim_delivery`) skips a GitHub
