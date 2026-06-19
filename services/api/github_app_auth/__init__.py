@@ -5,6 +5,7 @@ Per PRD #21 Q17: warm-container module-scope cache. Cold start re-signs.
 
 from __future__ import annotations
 
+import logging
 import os
 import time
 from datetime import datetime, timedelta, timezone
@@ -13,6 +14,8 @@ import httpx
 import jwt
 
 from ports.token_cache import InMemoryTokenCache
+
+log = logging.getLogger(f"{os.getenv('DD_SERVICE', 'grug')}.github_app_auth")
 
 _cache = InMemoryTokenCache()
 _GH_API = "https://api.github.com"
@@ -70,8 +73,26 @@ def get_install_token(installation_id: int, *, force_refresh: bool = False) -> s
         timeout=10,
     )
     resp.raise_for_status()
-    payload = resp.json()
-    token = payload["token"]
+    # raise_for_status() validates only the HTTP status, not the body schema.
+    # A 200 can still carry a truncated body, a gateway interstitial that
+    # parses as JSON-without-`token`, or an unexpected schema. Guard the parse
+    # + key access so this hot path fails with an actionable typed error and a
+    # structured log line instead of a bare KeyError/ValueError opaque 500
+    # (which, on the webhook side, makes GitHub retry the delivery). Mirrors
+    # the defensive parsing in llm_client._parse_envelope. The response body is
+    # NOT logged (it may contain a token-shaped value).
+    try:
+        payload = resp.json()
+        token = payload["token"]
+    except (ValueError, KeyError, TypeError) as e:
+        log.warning(
+            "install_token_exchange_malformed_response",
+            extra={"installation_id": installation_id, "error": type(e).__name__},
+        )
+        raise RuntimeError(
+            "GitHub returned a 200 without a usable installation token "
+            f"(installation {installation_id}): {type(e).__name__}"
+        ) from e
     # GitHub returns expires_at ISO; default 1hr from creation.
     _cache.put(key, token, ttl_seconds=55 * 60)
     return token
