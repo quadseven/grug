@@ -31,24 +31,12 @@ test: webhook-test api-test
 webhook-test:
 	@if [ -n "$$CI" ] && [ -z "$$GRUG_TEST_DATABASE_URL" ]; then \
 		echo "FATAL: store-backed tests would SKIP in CI (GRUG_TEST_DATABASE_URL unset) - a skipped gate is a silent pass (audit H4)"; exit 1; fi
-	cd services/webhook && uv run --with pytest --with httpx --with pyjwt --with cryptography --with boto3 --with moto --with fastapi --with mangum --with 'psycopg[binary,pool]' --with 'ddtrace>=3.5,<4' --with 'datadog-lambda>=6.107,<7' pytest tests/ -q \
-		--deselect tests/test_cf_auth.py::test_unconfigured_warning_throttled_within_window \
-		--deselect tests/test_cf_auth.py::test_throttle_distinguishes_reasons
-	# ^ cf_auth throttle pair: hosted-runner-only intermittent 0-warnings,
-	# locally irreproducible across versions/order/env - #359 root-causes.
-	# (#356 dispatcher/enforcement quartet restored: the unmocked store
-	# boundary is now patched like every sibling test.) Do NOT widen this
-	# list without an issue.
+	cd services/webhook && uv run --with pytest --with httpx --with pyjwt --with cryptography --with boto3 --with moto --with fastapi --with mangum --with 'psycopg[binary,pool]' --with 'ddtrace>=3.5,<4' --with 'datadog-lambda>=6.107,<7' pytest tests/ -q
 
 api-test:
 	@if [ -n "$$CI" ] && [ -z "$$GRUG_TEST_DATABASE_URL" ]; then \
 		echo "FATAL: store-backed tests would SKIP in CI (GRUG_TEST_DATABASE_URL unset) - a skipped gate is a silent pass (audit H4)"; exit 1; fi
-	cd services/api && uv run --with pytest --with httpx --with pyjwt --with cryptography --with boto3 --with moto --with pydantic --with fastapi --with mangum --with 'psycopg[binary,pool]' pytest tests/ -q \
-		--deselect tests/test_cf_auth.py::test_unconfigured_warning_throttled_within_window \
-		--deselect tests/test_cf_auth.py::test_throttle_distinguishes_reasons
-	# ^ cf_auth throttle pair: hosted-runner-only flake, #359 (twin of webhook).
-	# (#356 update_config pair restored: the unmocked previous_cfg store
-	# read is now patched.)
+	cd services/api && uv run --with pytest --with httpx --with pyjwt --with cryptography --with boto3 --with moto --with pydantic --with fastapi --with mangum --with 'psycopg[binary,pool]' pytest tests/ -q
 
 # Real-Postgres store tests (#354). REQUIRE a reachable Postgres via
 # GRUG_TEST_DATABASE_URL (CI: workflow service container) - they skip
