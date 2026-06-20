@@ -218,7 +218,14 @@ def _log_unconfigured_throttled(reason: str, path: str) -> None:
     independently).
     """
     now = time.monotonic()
-    last = _last_unconfigured_log_at.get(reason, 0.0)
+    # -inf, NOT 0.0: the comparison is against time.monotonic() (seconds since
+    # BOOT, not epoch). On a freshly-booted pod/runner monotonic() can be < the
+    # throttle window, so a 0.0 default makes `now - 0.0 < WINDOW` True and
+    # SILENTLY DROPS the FIRST warning per reason - exactly the
+    # `cf_shared_secret_unconfigured` misconfig signal you want during a rollout.
+    # -inf means the first occurrence of each reason always logs. (#359: this was
+    # the green-local / red-CI flake, NOT a ddtrace logger-rebinding race.)
+    last = _last_unconfigured_log_at.get(reason, float("-inf"))
     if now - last < _LOG_THROTTLE_SECONDS:
         return
     _last_unconfigured_log_at[reason] = now

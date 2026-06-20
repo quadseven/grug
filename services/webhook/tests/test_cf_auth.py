@@ -313,7 +313,11 @@ def test_unconfigured_warning_throttled_within_window() -> None:
     app = _build_app(secret_loader=raise_unconfigured)
     client = TestClient(app)
 
-    with patch.object(cf_auth.log, "warning") as mock_warn:
+    # Patch the WHOLE module logger, not `.warning` on it: under ddtrace
+    # log-injection the logger's bound methods can be rebound, so patching the
+    # attribute can race on slower runners (the #359 suspect). Swapping the
+    # whole `cf_auth.log` object is immune to that.
+    with patch.object(cf_auth, "log") as mock_log:
         # First request: should log. (Default fail-CLOSED -> 503.)
         r1 = client.get("/protected")
         assert r1.status_code == 503
@@ -321,8 +325,8 @@ def test_unconfigured_warning_throttled_within_window() -> None:
         r2 = client.get("/protected")
         assert r2.status_code == 503
 
-    assert mock_warn.call_count == 1, (
-        f"throttle did not suppress duplicate log: {mock_warn.call_count} calls"
+    assert mock_log.warning.call_count == 1, (
+        f"throttle did not suppress duplicate log: {mock_log.warning.call_count} calls"
     )
 
 
@@ -348,7 +352,11 @@ def test_throttle_distinguishes_reasons() -> None:
     app = _build_app(secret_loader=loader_two_reasons)
     client = TestClient(app)
 
-    with patch.object(cf_auth.log, "warning") as mock_warn:
+    # Patch the WHOLE module logger, not `.warning` on it: under ddtrace
+    # log-injection the logger's bound methods can be rebound, so patching the
+    # attribute can race on slower runners (the #359 suspect). Swapping the
+    # whole `cf_auth.log` object is immune to that.
+    with patch.object(cf_auth, "log") as mock_log:
         r1 = client.get("/protected")
         r2 = client.get("/protected")
         # Default fail-CLOSED -> 503 for both reasons.
@@ -356,4 +364,4 @@ def test_throttle_distinguishes_reasons() -> None:
         assert r2.status_code == 503
 
     # Two distinct reasons -> two distinct first-logs.
-    assert mock_warn.call_count == 2
+    assert mock_log.warning.call_count == 2
