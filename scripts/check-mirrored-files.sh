@@ -47,6 +47,7 @@ MIRRORED_WITH_HEADER=(
   "personas/code_reviewer/judge.py"
   "personas/code_reviewer/persona.py"
   "personas/code_reviewer/reactions.py"
+  "personas/code_reviewer/iac_scan.py"
   "personas/code_reviewer/sast.py"
   "personas/code_reviewer/sca.py"
   "personas/tpm/dor_checks.py"
