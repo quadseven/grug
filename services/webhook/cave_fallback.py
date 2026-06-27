@@ -19,7 +19,6 @@ from __future__ import annotations
 import json
 import logging
 import os
-from dataclasses import dataclass
 from typing import Any, Optional
 
 import boto3
@@ -28,6 +27,16 @@ from activity_log import record_check_verdict
 from github_app_auth import with_install_token_retry
 from github_checks_client import CheckRunResult, post_check_run
 from llm_client import Hunk
+
+# Shared Spark-Cave airlock library (#1610). Vendored from githumps/infra-public
+# (see spark_cave/VENDOR.md), so grug (public) and the macchina lane (private)
+# share ONE persona-generic wire envelope read by one connector. grug's rich
+# review fields (install_id/repo/pr/head_sha/diff_ref) ride INSIDE the generic
+# `payload`; the DiffRef codec below still spills a large diff to S3 BEFORE the
+# envelope, so the packed payload is always small (inline). The connector replies
+# with a generic FallbackResult whose `result` carries grug's findings + model.
+from spark_cave.enqueue import enqueue as _sc_enqueue
+from spark_cave.schema import FallbackResult as _SharedResult
 
 log = logging.getLogger(f"{os.getenv('DD_SERVICE', 'grug')}.cave_fallback")
 
@@ -38,10 +47,11 @@ _sqs = boto3.client("sqs")
 # queue isn't wired yet (best-effort, same discipline as the #272 offload).
 _JOBS_QUEUE_URL = os.getenv("GRUG_CAVE_JOBS_QUEUE_URL", "")
 
-# Wire-shape version. v2 (#311) carries a `diff_ref` (inline-or-S3) instead of
-# v1's raw inline `hunks` — bump so the connector (a separate repo) rejects an
-# unknown version instead of silently mis-parsing.
-SCHEMA_VERSION = 2
+# PAYLOAD-shape version, carried INSIDE the generic envelope's `payload` (the
+# envelope itself is versioned by the shared spark_cave schema). v2 (#311)
+# carries a `diff_ref` (inline-or-S3) instead of v1's raw inline `hunks` — the
+# connector rejects an unknown payload_version instead of mis-parsing.
+PAYLOAD_VERSION = 2
 
 # The one persona that falls back today. Carried on the message so a future
 # multi-persona airlock routes without a schema change.
@@ -60,81 +70,23 @@ _DIFF_BUCKET = os.getenv("GRUG_CAVE_DIFF_BUCKET", "")
 _s3 = boto3.client("s3")
 
 
-@dataclass(frozen=True, slots=True)
-class FallbackJob:
-    """A review job handed to the Cave connector over `grug-cave-jobs`.
-
-    Carries the PR coords + a `diff_ref` (the DiffRef codec's output: the diff
-    inline for small PRs, or an S3 pointer for large ones — #311) and NO GitHub
-    credential. The connector calls `unpack_diff(diff_ref)` to reconstruct the
-    same review units `review_diff` would have seen — reading the diff from S3,
-    never from GitHub (the creds boundary).
-    """
-
-    schema_version: int
-    install_id: int
-    repo: str  # "owner/name"
-    pr_number: int
-    head_sha: str
-    persona: str
-    diff_ref: dict[str, Any]  # DiffRef: {"kind": "inline"|"s3", ...}
-
-    def to_json(self) -> str:
-        return json.dumps(
-            {
-                "schema_version": self.schema_version,
-                "install_id": self.install_id,
-                "repo": self.repo,
-                "pr_number": self.pr_number,
-                "head_sha": self.head_sha,
-                "persona": self.persona,
-                "diff_ref": self.diff_ref,
-            }
-        )
+# grug's review job/result now ride the shared generic envelope (FallbackJob /
+# FallbackResult in spark_cave.schema). The job's `payload` carries grug's rich
+# fields below; the result's `result` carries the connector's findings + model.
+# Helpers to map between grug's coords and the generic envelope's
+# principal_id/request_id (the only two routing handles the shared schema has):
+#   principal_id = str(install_id)            -> FIFO group "elder:<install>"
+#   request_id   = "<repo>:<pr>:<head_sha>"   -> dedup is head-scoped (a new push
+#                                                is a new request_id => enqueues)
+def _request_id(repo: str, pr_number: int, head_sha: str) -> str:
+    return f"{repo}:{pr_number}:{head_sha}"
 
 
-@dataclass(frozen=True, slots=True)
-class FallbackResult:
-    """The connector's answer on `grug-cave-results`: findings (or a degraded
-    marker) for one (install, repo, pr, head). Consumed by the webhook to
-    publish the check-run + heal the verdict.
-
-    `findings` are kept as primitive dicts (the connector's wire shape) — the
-    result handler validates them into persona `Finding`s, mirroring how
-    `_coerce_finding` defends the live LLM path.
-    """
-
-    schema_version: int
-    install_id: int
-    repo: str
-    pr_number: int
-    head_sha: str
-    persona: str
-    findings: tuple[dict[str, Any], ...]
-    degraded: bool = False
-    degraded_reason: str = ""
-    model: str = ""
-
-    @classmethod
-    def from_json(cls, raw: str) -> "FallbackResult":
-        d = json.loads(raw)
-        if not isinstance(d, dict):
-            raise ValueError("FallbackResult body is not a JSON object")
-        findings = d.get("findings", [])
-        if not isinstance(findings, list):
-            findings = []
-        return cls(
-            schema_version=int(d["schema_version"]),
-            install_id=int(d["install_id"]),
-            repo=str(d["repo"]),
-            pr_number=int(d["pr_number"]),
-            head_sha=str(d["head_sha"]),
-            persona=str(d.get("persona", _PERSONA)),
-            findings=tuple(f for f in findings if isinstance(f, dict)),
-            degraded=bool(d.get("degraded", False)),
-            degraded_reason=str(d.get("degraded_reason", "")),
-            model=str(d.get("model", "")),
-        )
+def _parse_request_id(request_id: str) -> tuple[str, int, str]:
+    """Inverse of `_request_id`. repo ("owner/name") and head_sha never contain
+    ':', so an rsplit on the last two ':' recovers (repo, pr_number, head_sha)."""
+    repo, pr_raw, head_sha = request_id.rsplit(":", 2)
+    return repo, int(pr_raw), head_sha
 
 
 # ---------------------------------------------------------------------------
@@ -216,14 +168,6 @@ def unpack_diff(diff_ref: dict[str, Any]) -> list[Hunk]:
     ]
 
 
-def _dedup_id(install_id: int, repo: str, pr_number: int, head_sha: str) -> str:
-    """FIFO content-dedup key. Includes `head_sha` deliberately: a NEW push (new
-    head) is a DIFFERENT review that must enqueue, so it must not dedup against
-    the prior commit's job; but a double-fire on the SAME head within the 5-min
-    FIFO window is dropped for free (a redelivery / re-trigger guard)."""
-    return f"{install_id}:{repo}:{pr_number}:{_PERSONA}:{head_sha}"
-
-
 def enqueue_fallback(
     hunks: list[Hunk],
     *,
@@ -264,24 +208,25 @@ def enqueue_fallback(
     if diff_ref is None:
         return False
 
-    job = FallbackJob(
-        schema_version=SCHEMA_VERSION,
-        install_id=installation_id,
-        repo=repo,
-        pr_number=pr_number,
-        head_sha=head_sha,
-        persona=_PERSONA,
-        diff_ref=diff_ref,
-    )
-    body = job.to_json()
+    # grug's rich review fields ride INSIDE the generic envelope's payload. The
+    # diff was already spilled to S3 by pack_diff if large, so this payload is
+    # always small -> the shared packer keeps it inline (put_s3 unused).
+    payload = {
+        "payload_version": PAYLOAD_VERSION,
+        "install_id": installation_id,
+        "repo": repo,
+        "pr_number": pr_number,
+        "head_sha": head_sha,
+        "diff_ref": diff_ref,
+    }
     try:
-        _sqs.send_message(
-            QueueUrl=_JOBS_QUEUE_URL,
-            MessageBody=body,
-            MessageGroupId=str(installation_id),
-            MessageDeduplicationId=_dedup_id(
-                installation_id, repo, pr_number, head_sha
-            ),
+        _sc_enqueue(
+            sqs=_sqs,
+            queue_url=_JOBS_QUEUE_URL,
+            persona=_PERSONA,
+            principal_id=str(installation_id),
+            request_id=_request_id(repo, pr_number, head_sha),
+            payload=payload,
         )
     except Exception as e:  # noqa: BLE001 — best-effort: a lost fallback re-triggers next push
         log.warning(
@@ -370,27 +315,34 @@ def _summarize(findings: tuple[dict[str, Any], ...]) -> tuple[str, str]:
 
 
 def _heal_one(body: str) -> None:
-    """Publish + heal for ONE `FallbackResult`. Raises on a malformed body or a
-    publish error — `handle_fallback_result` catches per-record."""
-    res = FallbackResult.from_json(body)
-    if res.degraded:
+    """Publish + heal for ONE generic `FallbackResult`. Raises on a malformed
+    body or a publish error — `handle_fallback_result` catches per-record.
+
+    Maps the generic envelope back to grug's coords: `principal_id` is the
+    install id, `request_id` decodes to (repo, pr, head_sha), and the connector's
+    findings + model ride in `result`. `ok=False` is the degraded marker (the
+    Cave itself failed)."""
+    res = _SharedResult.from_json(body)
+    install_id = int(res.principal_id)
+    repo, pr_number, head_sha = _parse_request_id(res.request_id)
+    if not res.ok:
         # The Cave ALSO failed (or the connector couldn't review). Don't fake a
         # review — leave the verdict `errored` and log so the double-outage is
         # visible (this is what the re-scoped degraded monitor catches).
         log.warning(
             "elder_fallback_result_degraded",
-            extra={
-                "repo": res.repo,
-                "pr": res.pr_number,
-                "reason": res.degraded_reason,
-            },
+            extra={"repo": repo, "pr": pr_number, "reason": res.error},
         )
         return
-    owner, _, repo_name = res.repo.partition("/")
-    title, summary = _summarize(res.findings)
+    result = res.result or {}
+    raw_findings = result.get("findings", [])
+    # Same tolerance the old wire shape had: keep only dict findings.
+    findings = tuple(f for f in raw_findings if isinstance(f, dict)) if isinstance(raw_findings, list) else ()
+    owner, _, repo_name = repo.partition("/")
+    title, summary = _summarize(findings)
     check = CheckRunResult(
         name=_CHECK_NAME,
-        head_sha=res.head_sha,
+        head_sha=head_sha,
         status="completed",
         # Elder is advisory-by-default; a healed fallback is advisory. Blocking-
         # aware fallback (read RepoConfig, fail on high/critical) is a follow-up.
@@ -399,36 +351,32 @@ def _heal_one(body: str) -> None:
         summary=summary,
     )
     with_install_token_retry(
-        res.install_id,
+        install_id,
         lambda token: post_check_run(
             token,
             owner,
             repo_name,
             check,
-            external_id=f"grug-cr:{res.repo}#{res.pr_number}:{res.head_sha}",
+            external_id=f"grug-cr:{repo}#{pr_number}:{head_sha}",
         ),
     )
     # Heal the Activity verdict: errored → reviewed (warn/pass). Idempotent per
     # (persona, head_sha) at the store layer; never raises.
     record_check_verdict(
-        install_id=res.install_id,
+        install_id=install_id,
         persona_key=_PERSONA_KEY,
-        repo=res.repo,
-        pr_number=res.pr_number,
-        head_sha=res.head_sha,
+        repo=repo,
+        pr_number=pr_number,
+        head_sha=head_sha,
         conclusion="neutral",
         summary=title,
-        findings_count=len(res.findings),
+        findings_count=len(findings),
         blocking=False,
         degraded_reason=None,
     )
     log.info(
         "elder_fallback_healed",
-        extra={
-            "repo": res.repo,
-            "pr": res.pr_number,
-            "findings": len(res.findings),
-        },
+        extra={"repo": repo, "pr": pr_number, "findings": len(findings)},
     )
 
 
