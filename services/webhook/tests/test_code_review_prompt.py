@@ -203,6 +203,14 @@ def test_subprocess_no_timeout_rule_present():
     assert "subprocess-no-timeout" in crp.build_system_prompt()
 
 
+def test_tls_verification_disabled_rule_present():
+    """Weekly harvest: disabling TLS/cert verification (CERT_NONE / verify=False
+    / rejectUnauthorized:false / InsecureSkipVerify) sends credentials over a
+    MITM-able link — pin the CA instead (infrastructure #1390/#1391)."""
+    assert any(r.name == "tls-verification-disabled" for r in crp.RULES)
+    assert "tls-verification-disabled" in crp.build_system_prompt()
+
+
 def test_voice_has_mandatory_bookend_structure():
     """#343: the voice instruction mandates the structural bookends that
     keep the caveman cadence from slipping to plain English under technical
