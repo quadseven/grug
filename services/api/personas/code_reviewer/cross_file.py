@@ -31,6 +31,7 @@ from __future__ import annotations
 import logging
 import os
 import re
+import time
 from urllib.parse import quote
 
 import httpx
@@ -46,6 +47,13 @@ _MAX_SYMBOLS = 5
 _MAX_FILES = 5
 _MAX_FILE_BYTES = 60_000
 _SEARCH_TIMEOUT = 10  # seconds, per call
+# GLOBAL wall-clock budget for the WHOLE cross-file phase (codex
+# peer-review HIGH, PR #480): per-call timeouts alone allow up to
+# (_MAX_SYMBOLS + _MAX_FILES) x _SEARCH_TIMEOUT ~= 100s of slow-but-not-
+# failing responses before the review even starts. The #468 acceptance
+# bound is <10s p95 added latency; stop BOTH search and content fetching
+# the moment the deadline passes and degrade to whatever was collected.
+_TOTAL_BUDGET_SECONDS = 8.0
 
 # Added-line function definition: `+def foo(` / `+    def foo(`.
 _PY_DEF = re.compile(r"^\+\s*def\s+([A-Za-z_]\w*)\s*\(", re.MULTILINE)
@@ -116,8 +124,19 @@ def fetch_cross_file_context(
     if not symbols:
         return {}
 
+    # Elapsed-time deadline (a comparison of monotonic DELTAS, not a
+    # zero-sentinel): the whole phase - searches AND content fetches -
+    # must finish inside _TOTAL_BUDGET_SECONDS.
+    deadline = time.monotonic() + _TOTAL_BUDGET_SECONDS
+
     paths: list[str] = []
     for sym in symbols[:_MAX_SYMBOLS]:
+        if time.monotonic() >= deadline:
+            log.info(
+                "cross_file_context_degraded",
+                extra={"stage": "budget", "phase": "search"},
+            )
+            break
         try:
             resp = httpx.get(
                 "https://api.github.com/search/code",
@@ -152,6 +171,12 @@ def fetch_cross_file_context(
 
     contents: dict[str, str] = {}
     for path in paths[:_MAX_FILES]:
+        if time.monotonic() >= deadline:
+            log.info(
+                "cross_file_context_degraded",
+                extra={"stage": "budget", "phase": "content", "collected": len(contents)},
+            )
+            break
         try:
             resp = httpx.get(
                 f"https://api.github.com/repos/{owner}/{repo}/contents/{quote(path, safe='/')}",

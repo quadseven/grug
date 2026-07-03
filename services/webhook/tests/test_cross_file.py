@@ -303,3 +303,35 @@ def test_dispatch_cross_file_failure_degrades_to_diff_only(monkeypatch):
     out = cr_dispatch.dispatch_code_review(payload, blocking=False)
     assert out["result"] == "pass"          # review still ran
     assert captured["xf"] == {}             # degraded to diff-only
+
+
+def test_fetch_stops_at_global_wall_clock_budget(monkeypatch):
+    """Codex peer-review HIGH (PR #480): per-call timeouts alone allow
+    ~100s of slow-but-not-failing responses. Simulate a clock advancing
+    5s per HTTP call: the 8s global budget must stop the phase after ~2
+    calls and degrade to what was collected - never run all 10."""
+    clock = {"t": 100.0}
+
+    def fake_monotonic():
+        return clock["t"]
+
+    http_calls = {"n": 0}
+
+    def fake_get(url, **kw):
+        http_calls["n"] += 1
+        clock["t"] += 5.0  # each call is slow but under the per-call timeout
+        if "/search/code" in url:
+            return _search_response([f"src/hit_{http_calls['n']}_{i}.py" for i in range(5)])
+        return _raw_response("content")
+
+    monkeypatch.setattr(cross_file.time, "monotonic", fake_monotonic)
+    with patch.object(cross_file.httpx, "get", side_effect=fake_get):
+        out = cross_file.fetch_cross_file_context(
+            "tok", "o", "r", tuple(f"sym{i}" for i in range(5)),
+            head_sha="abc", exclude_paths=frozenset(),
+        )
+    # Budget 8s / 5s per call -> at most 2 calls started before the
+    # deadline tripped, and the function returned (partial or empty)
+    # instead of burning the full 10-call worst case.
+    assert http_calls["n"] <= 2
+    assert isinstance(out, dict)
