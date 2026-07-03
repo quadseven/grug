@@ -191,6 +191,29 @@ def test_toy_persona_missing_repo_policy_disabled_skips(monkeypatch):
     mock_enq.assert_not_called()
 
 
+def test_dispatch_leaves_payload_unmutated():
+    """Audit #477 H2: PullRequestContext.payload is the SAME dict object
+    for every persona - the documented contract is read-only. Lock that
+    the shipped personas honor it (a mutation would corrupt what later
+    personas and Elder's async worker receive, ordering-dependently)."""
+    import copy
+
+    payload = _full_pr_payload()
+    baseline = copy.deepcopy(payload)
+
+    with patch("dispatcher.is_install_allowlisted", return_value=True), \
+         patch("dispatcher.is_persona_enabled", return_value=True), \
+         patch("dispatcher.get_repo_config", return_value={"code_reviewer_blocking": False}), \
+         patch("personas.tpm.persona.evaluate_pull_request") as mock_eval, \
+         patch("personas.tpm.persona.publish_tpm_evaluation"), \
+         patch("async_dispatch.enqueue_elder_review", return_value=True):
+        mock_eval.return_value = type("R", (), {"passed": True})()
+        out = dispatch("pull_request", payload)
+
+    assert out["status"] == "dispatched"
+    assert payload == baseline
+
+
 def test_pull_request_review_falls_through_to_generic_no_op():
     """The v1.5 placeholder branch is retired (#465): the event now hits
     the generic no-handler fallthrough instead of a bespoke reason."""
