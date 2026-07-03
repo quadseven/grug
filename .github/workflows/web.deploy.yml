@@ -182,7 +182,7 @@ jobs:
           ZONE_ID=$(aws ssm get-parameter \
             --name /grug/cloudflare-zone-id \
             --query 'Parameter.Value' --output text)
-          response=$(curl --silent --show-error --max-time 15 \
+          response=$(curl --silent --show-error --connect-timeout 10 --max-time 15 \
             -w "\n%{http_code}" \
             -X POST "https://api.cloudflare.com/client/v4/zones/${ZONE_ID}/purge_cache" \
             -H "Authorization: Bearer ${CF_API_TOKEN}" \
