@@ -19,7 +19,12 @@
 
 ## What Grug do
 
-Grug is a modular GitHub bot. Different **personas** across the SDLC — TPM today, with code-reviewer, release-manager, and stuck-PR-pulse personas planned.
+Grug is a modular GitHub bot. Different **personas** across the SDLC. Two ship today:
+
+- **Chief** (`Grug — Definition of Ready`) — the process gate: static DoR checks on every PR body, plus branch-ruleset self-heal and a `/grug recheck` slash command.
+- **Elder** (`Grug — Code Review`) — the code gate: LLM diff review (whole-file context, 25+ named rules, caveman voice) PLUS a deterministic security suite on every PR: SAST (Semgrep + builtin), dependency-CVE scanning (OSV), committed-secret detection, and IaC misconfiguration scanning — all filtered through an LLM exploitability judge so you see real findings, not noise. Advisory by default; blocking is per-repo opt-in.
+
+Roadmap personas (epic #464): **Guard** (the security suite gets its own check-run), **Smasher** (cross-file bug hunting + mutation testing), **Omen** (findings backed by live Datadog runtime signal), **Warder** (release gate), **Pulse** (stuck-PR sweep).
 
 Grug live in GitHub. Grug post Check Runs. Grug never spam comments. **You ship. Grug guard.**
 
@@ -50,7 +55,7 @@ pulumi up                   # provision AWS infra (SSM refs, SQS, KMS, DD monito
 # done. Grug guard now.
 ```
 
-## What Grug checks (Definition of Ready)
+## What Chief checks (Definition of Ready)
 
 Static checks on PR body — **4 blocking, 1 advisory:**
 
@@ -62,26 +67,38 @@ Static checks on PR body — **4 blocking, 1 advisory:**
 | ✅ | `scope-fence` | Has `## Out of scope` section | **yes** |
 | ⚠️ | `issue-link` | Body links an issue via `closes #N` | advisory |
 
-LLM scope review (advisory) — Poolside `laguna-m.1`:
-- Title ↔ body match
-- AC testability
-- Scope creep flag
-- XL inflation check
+## What Elder checks (Code Review)
 
-## What Grug NOT check
+Every PR diff, on every pushed head SHA (idempotent per SHA):
 
-Grug is the **process gate**, not the code review gate.
+- **LLM review** — whole-file context, 25+ named rules (correctness, error
+  handling, concurrency, security shapes like TLS-verify-off and
+  monotonic-clock sentinels), inline comments in the caveman voice, one
+  check-run rollup. Backends: Poolside / OpenRouter, with a self-hosted
+  fallback over an SQS airlock when both clouds fail (ADR-0005).
+- **SAST** — Semgrep OSS over vendored offline rules + a zero-dep builtin
+  detector (sql/command/template injection, path traversal, SSRF, unsafe
+  deserialization, weak crypto, cleartext secret logging).
+- **SCA** — dependency-CVE scan of manifest/lockfile changes via the OSV API.
+- **Secret scanning** — provider-token patterns + entropy-gated generic rule
+  on added lines of ANY file type; values are masked, never echoed.
+- **IaC scanning** — Terraform / Kubernetes YAML / Dockerfile misconfigs
+  (open 0.0.0.0/0, privileged pods, public ACLs, root containers).
+- **Exploitability judge** — an LLM precision layer that grades every
+  security candidate real-vs-noise before it reaches your PR; recall +
+  precision are tracked against a committed benchmark corpus.
 
-- Code correctness — Sentry / Seer / DD PR Gates own that
-- Test coverage — pytest gate owns that
-- Security findings — DD/Sentry security scanners own that
+Advisory-first: findings post as `neutral` until you flip
+`code_reviewer_blocking` per repo.
 
-## Pulse (scheduled)
+## Roadmap (epic #464)
 
-Weekly issue-grooming sweep:
-- Re-prefixes Grugboard items with `[<repo>]`
-- Labels stale issues (>90d, idempotent, capped at 30/run)
-- Posts iteration-metrics summary to a configured Discord/Slack channel
+- **Guard** — the security suite above graduates to its own persona + check-run
+- **Smasher** — 1-hop cross-file context, then diff-scoped mutation testing
+- **Omen** — findings fused with live Datadog error signal ("this function threw 47x today")
+- **Warder** — changelog draft + semver hint + deploy gating
+- **Pulse** — stuck-PR nudges on the scheduled poller
+- **LLM scope review for Chief** — title/body match, AC testability, scope-creep flag
 
 ## Architecture
 

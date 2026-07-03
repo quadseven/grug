@@ -1,13 +1,11 @@
-# WEBHOOK-ONLY (NOT mirrored): k8s replacement for the two SQS→Lambda
-# event-source mappings. The api service produces to these queues but
-# never consumes — like lambda_handler.py, per ADR-0001 only modules
+# WEBHOOK-ONLY (NOT mirrored): the k8s SQS consumer. The api service
+# produces to these queues but never consumes — per ADR-0001 only modules
 # BOTH services run are mirrored.
 """SQS consumers for the k8s runtime (#368).
 
-On Lambda, AWS event-source mappings deliver `grug-cave-results.fifo`
-and `grug-rerun-jobs.fifo` batches into `lambda_handler.handler`. A pod
-has no ESM, so this entrypoint long-polls both queues (one thread each)
-and feeds each message to the SAME handler the ESM used, wrapped in the
+This entrypoint long-polls `grug-cave-results.fifo` and
+`grug-rerun-jobs.fifo` (one thread each) and feeds each message to its
+per-queue handler, wrapped in the
 SAME `Records` event shape — the handlers and their tests are untouched.
 
 Delivery semantics preserved per queue (mirrors the ESM config):

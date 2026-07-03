@@ -232,6 +232,18 @@ neutral+"skipped" -> `@event:code_review_llm_degraded` (which backend kind);
 findings but no inline review -> `@event:code_review_review_publish_failed`
 (independent surface); webhook 500 -> DD `@event:(tpm_dispatch_unhandled OR code_review_dispatch_unhandled)` (last-resort guards, empty in steady state).
 
+**Security-suite checks (SAST/SCA/secret/IaC):** the four candidate sources
+are best-effort - a detector failure returns `()` and never breaks the core
+review, which also means a silently-broken detector looks like "no findings."
+Verify after deploys that touch them: open a test PR adding a known-bad line
+(e.g. a fake `AKIA...` key, or `privileged: true` in a YAML) and confirm the
+finding posts. Semgrep engine issues surface as
+`@event:(sast_semgrep_binary_missing OR sast_semgrep_failed)`; the judge
+failing CLOSED (all candidates suppressed) shows findings_count drop to zero
+with `@event:judge_verdicts_unparseable`. Recall/precision baseline lives at
+`services/webhook/sast_benchmark/baseline.json` (re-record via the
+`benchmark.sast` workflow, record mode).
+
 ### Elder async offload + self-recovery
 
 <a id="elder-async-offload"></a>
