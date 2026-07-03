@@ -221,25 +221,16 @@ def get_repo_config(install_id: int, repo_id: int) -> dict[str, Any]:
             "force_disable_enforcement": False,
         }
     rid = item.get("enforcement_ruleset_id")
-    return {
-        "tpm_enabled": bool(
-            item.get("tpm_enabled", _DEFAULT_PERSONA_CONFIG["tpm_enabled"])
-        ),
-        "code_reviewer_enabled": bool(
-            item.get(
-                "code_reviewer_enabled",
-                _DEFAULT_PERSONA_CONFIG["code_reviewer_enabled"],
-            )
-        ),
-        "code_reviewer_blocking": bool(
-            item.get(
-                "code_reviewer_blocking",
-                _DEFAULT_PERSONA_CONFIG["code_reviewer_blocking"],
-            )
-        ),
-        "enforcement_ruleset_id": int(rid) if rid is not None else None,
-        "force_disable_enforcement": bool(item.get("force_disable_enforcement", False)),
+    # Persona flags derived from _DEFAULT_PERSONA_CONFIG's keys (#465,
+    # ADR-0010): adding a persona's flags to the default dict makes them
+    # flow through this read path with no further edit here.
+    cfg: dict[str, Any] = {
+        flag: bool(item.get(flag, default))
+        for flag, default in _DEFAULT_PERSONA_CONFIG.items()
     }
+    cfg["enforcement_ruleset_id"] = int(rid) if rid is not None else None
+    cfg["force_disable_enforcement"] = bool(item.get("force_disable_enforcement", False))
+    return cfg
 
 
 def _merge_attrs(pk: str, sk: str, attrs: dict[str, Any]) -> None:
@@ -266,32 +257,38 @@ def set_repo_config(
     install_id: int,
     repo_id: int,
     repo_full_name: str,
-    tpm_enabled: bool,
     updated_by_user_id: str,
-    code_reviewer_enabled: bool | None = None,
-    code_reviewer_blocking: bool | None = None,
+    **persona_flags: bool | None,
 ) -> dict[str, Any]:
     """Upsert per-repo override; returns the FIELDS THAT WERE UPDATED
     (same contract as the DDB adapter). Sparse merge preserves fields
-    managed by other writers (enforcement_ruleset_id)."""
+    managed by other writers (enforcement_ruleset_id).
+
+    Persona flags arrive as keyword arguments validated against
+    _DEFAULT_PERSONA_CONFIG's keys (#465, ADR-0010): any key in the
+    default dict is writable, so a new persona's flags work here with
+    no edit; an unknown key raises TypeError, preserving the explicit-
+    signature era's unexpected-keyword behavior (typo protection).
+    None = leave the stored value alone (sparse merge)."""
+    unknown = set(persona_flags) - set(_DEFAULT_PERSONA_CONFIG)
+    if unknown:
+        raise TypeError(
+            f"set_repo_config() got unknown persona flag(s) {sorted(unknown)}; "
+            f"known flags: {sorted(_DEFAULT_PERSONA_CONFIG)}"
+        )
     now = datetime.now(timezone.utc).isoformat()
+    updated_fields: dict[str, Any] = {
+        flag: bool(value)
+        for flag, value in persona_flags.items()
+        if value is not None
+    }
     attrs: dict[str, Any] = {
         "repo_full_name": repo_full_name,
-        "tpm_enabled": bool(tpm_enabled),
         "updated_at": now,
         "updated_by_user_id": str(updated_by_user_id),
+        **updated_fields,
     }
-    if code_reviewer_enabled is not None:
-        attrs["code_reviewer_enabled"] = bool(code_reviewer_enabled)
-    if code_reviewer_blocking is not None:
-        attrs["code_reviewer_blocking"] = bool(code_reviewer_blocking)
     _merge_attrs(_inst_pk(install_id), _repo_sk(repo_id), attrs)
-
-    updated_fields: dict[str, Any] = {"tpm_enabled": bool(tpm_enabled)}
-    if code_reviewer_enabled is not None:
-        updated_fields["code_reviewer_enabled"] = bool(code_reviewer_enabled)
-    if code_reviewer_blocking is not None:
-        updated_fields["code_reviewer_blocking"] = bool(code_reviewer_blocking)
     return updated_fields
 
 

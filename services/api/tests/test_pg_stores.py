@@ -518,6 +518,49 @@ def test_set_repo_config_code_reviewer_fields_round_trip(pg):
     assert cfg["code_reviewer_blocking"] is True
 
 
+def test_repo_config_new_default_key_flows_end_to_end(pg, monkeypatch):
+    """#465 acceptance: config flags are DERIVED from
+    _DEFAULT_PERSONA_CONFIG - adding a key must make the flag work
+    end-to-end (defaults on missing row, set_repo_config write path,
+    get_repo_config read path, is_persona_enabled gate) with no other
+    store edit."""
+    from adapters import pg_install_store as store
+
+    monkeypatch.setattr(
+        store, "_DEFAULT_PERSONA_CONFIG",
+        {**store._DEFAULT_PERSONA_CONFIG, "toy_enabled": True},
+    )
+
+    # Missing row: the new key appears with its default.
+    cfg = store.get_repo_config(1, 33)
+    assert cfg["toy_enabled"] is True
+    assert store.is_persona_enabled(1, 33, "toy") is True
+
+    # Update path accepts the new key with zero set_repo_config edits.
+    store.set_repo_config(
+        install_id=1, repo_id=33, repo_full_name="o/r",
+        updated_by_user_id="9", toy_enabled=False,
+    )
+    cfg = store.get_repo_config(1, 33)
+    assert cfg["toy_enabled"] is False
+    assert store.is_persona_enabled(1, 33, "toy") is False
+    # Untouched personas keep their defaults on the same row.
+    assert cfg["tpm_enabled"] is True
+
+
+def test_set_repo_config_rejects_unknown_flag(pg):
+    """Typo protection parity: an unknown persona flag must raise
+    TypeError (the old explicit-kwargs signature raised TypeError for
+    unexpected keywords; the generic form keeps that contract)."""
+    from adapters import pg_install_store as store
+
+    with pytest.raises(TypeError):
+        store.set_repo_config(
+            install_id=1, repo_id=34, repo_full_name="o/r",
+            updated_by_user_id="9", tmp_enabled=True,  # typo'd flag
+        )
+
+
 def test_re_auth_with_new_refresh_replaces(pg, fake_kms):
     """The overshoot direction of refresh-preserve: rotation must REPLACE,
     not keep the stale blob (the failure mode a 'preserve' fix invites)."""
