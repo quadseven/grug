@@ -249,7 +249,7 @@ def enqueue_fallback(
 
 # ---------------------------------------------------------------------------
 # Consumer (#310): heal the verdict from the connector's FallbackResult.
-# `lambda_handler.handler` routes the aws:sqs event (`grug-cave-results`) here.
+# `consumer.py` long-polls `grug-cave-results.fifo` and routes batches here.
 # The Elder check is advisory-by-default, so a healed fallback publishes a
 # NEUTRAL check-run carrying the Cave's findings (blocking-aware fallback is a
 # follow-up — Part A keeps it advisory). NEVER raises back to the Lambda: a
