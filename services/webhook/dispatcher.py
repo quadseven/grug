@@ -15,6 +15,7 @@ public but webhook never acts on PRs from non-allowlisted users.
 
 from __future__ import annotations
 
+import copy
 import importlib
 import logging
 from typing import Any
@@ -315,6 +316,13 @@ def _handle_pull_request(
             cfg = get_repo_config(int(installation_id), int(repo_id))
             blocking = bool(cfg.get(spec.blocking_flag, spec.blocking_default))
 
+        # Each persona gets its OWN deep copy of the payload (audit #477
+        # H2 / codex peer-review): the isolation guarantee is structural,
+        # not by-convention, so a future persona that mutates ctx.payload
+        # (normalize/redact/pop) cannot corrupt what later personas - or
+        # Elder's async enqueue - receive. N deep copies of one webhook
+        # payload on the ACK path is negligible vs the LLM enqueue it
+        # already does; correctness over the micro-cost.
         ctx = persona_registry.PullRequestContext(
             installation_id=int(installation_id),
             owner=owner,
@@ -322,7 +330,7 @@ def _handle_pull_request(
             head_sha=head_sha,
             pr_number=int(pr_number),
             pr_body=pr_body,
-            payload=payload,
+            payload=copy.deepcopy(payload),
             delivery_id=delivery_id,
             blocking=blocking,
         )

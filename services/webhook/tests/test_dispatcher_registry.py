@@ -196,6 +196,54 @@ def test_dispatch_leaves_payload_unmutated():
     assert payload == baseline
 
 
+def test_mutating_persona_cannot_corrupt_later_personas(monkeypatch):
+    """Audit #477 H2 / codex peer-review: isolation is STRUCTURAL, not
+    by-convention. Inject a persona that mutates its ctx.payload BEFORE
+    Elder in the loop; Elder's enqueue must still receive the original
+    payload, and the caller's dict must be untouched."""
+    import copy
+    import dataclasses
+
+    mutator_seen: list = []
+    mod = types.ModuleType("toy_webhook_dispatch")
+
+    def dispatch_pull_request(ctx):
+        # A hostile/careless persona: pop a key + add scratch state.
+        ctx.payload.pop("pull_request", None)
+        ctx.payload["_mutator_scratch"] = True
+        mutator_seen.append(ctx.payload)
+        return {"persona": "toy", "result": "pass"}
+
+    mod.dispatch_pull_request = dispatch_pull_request
+    monkeypatch.setitem(sys.modules, "toy_webhook_dispatch", mod)
+    # Register the mutator FIRST so it runs before the real personas.
+    mutator = dataclasses.replace(_toy_spec(), dispatch_module="toy_webhook_dispatch")
+    extended = (mutator,) + persona_registry.REGISTRY
+
+    payload = _full_pr_payload()
+    baseline = copy.deepcopy(payload)
+
+    with patch.object(persona_registry, "REGISTRY", extended), \
+         patch("dispatcher.is_install_allowlisted", return_value=True), \
+         patch("dispatcher.is_persona_enabled", return_value=True), \
+         patch("dispatcher.get_repo_config", return_value={"code_reviewer_blocking": False}), \
+         patch("personas.tpm.persona.evaluate_pull_request") as mock_eval, \
+         patch("personas.tpm.persona.publish_tpm_evaluation"), \
+         patch("async_dispatch.enqueue_elder_review", return_value=True) as mock_enq:
+        mock_eval.return_value = type("R", (), {"passed": True})()
+        out = dispatch("pull_request", payload)
+
+    assert out["status"] == "dispatched"
+    # The mutator corrupted only its OWN copy.
+    assert mutator_seen[0].get("_mutator_scratch") is True
+    # The caller's payload is pristine.
+    assert payload == baseline
+    # Elder's enqueue received an un-corrupted payload (its own copy).
+    elder_payload = mock_enq.call_args.kwargs["payload"]
+    assert "pull_request" in elder_payload
+    assert "_mutator_scratch" not in elder_payload
+
+
 def test_pull_request_review_falls_through_to_generic_no_op():
     """The v1.5 placeholder branch is retired (#465): the event now hits
     the generic no-handler fallthrough instead of a bespoke reason."""
