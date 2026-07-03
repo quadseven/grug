@@ -276,9 +276,20 @@ def set_repo_config(
             f"set_repo_config() got unknown persona flag(s) {sorted(unknown)}; "
             f"known flags: {sorted(_DEFAULT_PERSONA_CONFIG)}"
         )
+    # Values get the same rigor as keys (audit #477 M3): bool(value)
+    # would silently store True for a truthy non-bool like "false" if a
+    # caller ever passed a query-string value through.
+    non_bool = {
+        flag: value for flag, value in persona_flags.items()
+        if value is not None and not isinstance(value, bool)
+    }
+    if non_bool:
+        raise TypeError(
+            f"set_repo_config() persona flags must be bool or None; got {non_bool!r}"
+        )
     now = datetime.now(timezone.utc).isoformat()
     updated_fields: dict[str, Any] = {
-        flag: bool(value)
+        flag: value
         for flag, value in persona_flags.items()
         if value is not None
     }

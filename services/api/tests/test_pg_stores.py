@@ -561,6 +561,19 @@ def test_set_repo_config_rejects_unknown_flag(pg):
         )
 
 
+def test_set_repo_config_rejects_non_bool_flag_value(pg):
+    """Audit #477 M3: values get the same rigor as keys - bool("false")
+    is True, so a stringly-typed caller would silently ENABLE what it
+    meant to disable."""
+    from adapters import pg_install_store as store
+
+    with pytest.raises(TypeError, match="bool or None"):
+        store.set_repo_config(
+            install_id=1, repo_id=35, repo_full_name="o/r",
+            updated_by_user_id="9", tpm_enabled="false",
+        )
+
+
 def test_re_auth_with_new_refresh_replaces(pg, fake_kms):
     """The overshoot direction of refresh-preserve: rotation must REPLACE,
     not keep the stale blob (the failure mode a 'preserve' fix invites)."""

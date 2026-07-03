@@ -56,6 +56,32 @@ def test_every_spec_declares_pull_request_event():
         assert "pull_request" in p.events
 
 
+def test_spec_rejects_nonconvention_enabled_flag():
+    """Audit #477 H1: the store derives the enablement key as
+    f"{persona}_enabled" (AST-attested shape), so a non-convention
+    enabled_flag would silently fail OPEN to enabled forever. The spec
+    must refuse to construct."""
+    import dataclasses
+
+    import pytest
+
+    chief = registry.by_key("tpm")
+    with pytest.raises(ValueError, match="enabled_flag"):
+        dataclasses.replace(chief, enabled_flag="tpm_review_enabled")
+
+
+def test_spec_rejects_blocking_default_without_flag():
+    """Audit #477 M1: blocking_default=True with no blocking_flag would
+    mean always-blocking with no repo-level off switch."""
+    import dataclasses
+
+    import pytest
+
+    chief = registry.by_key("tpm")
+    with pytest.raises(ValueError, match="blocking_flag"):
+        dataclasses.replace(chief, blocking_flag=None, blocking_default=True)
+
+
 def test_every_dispatch_module_imports_and_exposes_entrypoint():
     """dispatch_module is a string resolved at dispatch time - a typo
     would otherwise surface only on the first live delivery. Import each

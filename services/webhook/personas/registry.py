@@ -57,6 +57,26 @@ class PersonaSpec:
     events: tuple[str, ...]
     dispatch_module: str
 
+    def __post_init__(self) -> None:
+        # The store's is_persona_enabled derives its lookup key as
+        # f"{persona}_enabled" (an AST-attested shape, temper spec 0009),
+        # so a non-convention enabled_flag would silently fail OPEN to
+        # enabled with no repo-level off switch (audit #477 H1). Make the
+        # naming convention structural instead of folklore.
+        if self.enabled_flag != f"{self.key}_enabled":
+            raise ValueError(
+                f"PersonaSpec({self.key!r}): enabled_flag must be "
+                f"'{self.key}_enabled', got {self.enabled_flag!r}"
+            )
+        # blocking_default is only ever read when blocking_flag exists;
+        # a flagless True would mean always-blocking with no off switch
+        # (audit #477 M1) - forbid the illegal state at construction.
+        if self.blocking_flag is None and self.blocking_default:
+            raise ValueError(
+                f"PersonaSpec({self.key!r}): blocking_default=True "
+                "requires a blocking_flag"
+            )
+
 
 @dataclass(frozen=True, slots=True)
 class PullRequestContext:
@@ -65,7 +85,13 @@ class PullRequestContext:
     personas get the full event coordinates without a signature change.
     `payload` is the full webhook payload (Elder's enqueue ships it to the
     async worker); `blocking` is the persona's own blocking flag resolved
-    from RepoConfig (always False for personas with no `blocking_flag`)."""
+    from RepoConfig (always False for personas with no `blocking_flag`).
+
+    CONTRACT: `payload` is the SAME dict object for every persona in the
+    dispatch loop - personas MUST treat it as read-only. A persona that
+    mutates it corrupts what later personas (and Elder's async worker)
+    receive, ordering-dependently (audit #477 H2). Locked by
+    test_dispatch_leaves_payload_unmutated."""
 
     installation_id: int
     owner: str
@@ -113,6 +139,13 @@ REGISTRY: tuple[PersonaSpec, ...] = (
 
 _BY_KEY = {p.key: p for p in REGISTRY}
 _BY_CANONICAL = {p.canonical: p for p in REGISTRY}
+
+# A duplicate key/canonical would silently last-win in the lookup maps
+# while the dispatch loop still runs BOTH entries (double check-runs,
+# double enqueues) - make uniqueness structural (audit #477 M2). Same
+# import-time-assert idiom as llm_client's backend-count gate.
+assert len(_BY_KEY) == len(REGISTRY), "duplicate persona key in REGISTRY"
+assert len(_BY_CANONICAL) == len(REGISTRY), "duplicate canonical name in REGISTRY"
 
 
 def by_key(key: str) -> PersonaSpec | None:
