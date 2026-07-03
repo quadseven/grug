@@ -277,6 +277,13 @@ def _handle_pull_request(
     # isolated in its own try/except so a bug or import failure in one
     # doesn't 500 the webhook or starve the others (#185).
     results: list[dict[str, str]] = []
+    # An UNEXPECTED exception escaping an ASYNC persona's dispatch is a
+    # HANDOFF failure (the review was never durably enqueued) - unlike an
+    # inline persona's publish, swallowing it into a 200 drops the review
+    # with no GitHub redelivery (codex peer-review HIGH, PR #477). We run
+    # every persona for isolation, then re-raise the first async-handoff
+    # error AFTER the loop so the delivery is non-2xx and GitHub retries.
+    async_handoff_error: Exception | None = None
     for spec in persona_registry.REGISTRY:
         if "pull_request" not in spec.events:
             continue
@@ -338,11 +345,11 @@ def _handle_pull_request(
             module = importlib.import_module(spec.dispatch_module)
             results.append(module.dispatch_pull_request(ctx))
         except Exception as e:  # noqa: BLE001 - per-persona isolation guard
-            # NOTE: this guard makes persona failures uniform 200s - the
-            # delivery reads SUCCESSFUL in GitHub and the replay sweep
-            # skips it (ADR-0010 "replay invisibility" trade). This log
-            # line is therefore the ONLY failure signal; delivery_id +
-            # kind keep it correlatable to the GitHub delivery GUID.
+            # Isolate so one persona's failure never starves the others
+            # (#185). delivery_id + kind keep the log correlatable to the
+            # GitHub delivery GUID. For an INLINE persona this 200s (a
+            # retry would duplicate its already-done publish); for an
+            # ASYNC persona it is a dropped handoff and we re-raise below.
             log.error(
                 "persona_dispatch_unhandled",
                 extra={
@@ -352,10 +359,24 @@ def _handle_pull_request(
                     "delivery_id": delivery_id,
                     "head_sha": head_sha[:8],
                     "kind": type(e).__name__,
+                    "dispatch_style": spec.dispatch_style,
                 },
                 exc_info=True,
             )
             results.append({"persona": spec.key, "result": "unhandled_error"})
+            if spec.dispatch_style == "async" and async_handoff_error is None:
+                async_handoff_error = e
+
+    if async_handoff_error is not None:
+        # Re-raise so the webhook returns non-2xx and GitHub redelivers
+        # the event - the durable retry the async handoff needs. Inline
+        # personas already ran; their publishes are idempotent per
+        # head_sha on redelivery (parity with the pre-registry behavior,
+        # where an Elder enqueue exception 500ed after TPM published).
+        # NOTE: the EXPECTED enqueue-returns-False path does NOT raise -
+        # it returns `enqueue_failed` and 200s, preserving the deliberate
+        # #272 "drop + re-trigger on next push" contract.
+        raise async_handoff_error
 
     if not results:
         return {"status": "no_op", "reason": "all personas disabled"}

@@ -121,21 +121,32 @@ no store edits.
 
 ### Negative / accepted
 
-- **Replay invisibility (audit #477 stage-2 H1).** The per-persona guard
-  is strictly broader than the guards it replaced: an Elder enqueue-path
-  escape (e.g. an `async_dispatch` import failure on a bad deploy)
-  previously propagated and 500ed the delivery, which kept it eligible
-  for GitHub redelivery and the `delivery_replay` sweep. It now returns
-  a 200 with `result=unhandled_error`, so the delivery reads SUCCESSFUL
-  everywhere except the `persona_dispatch_unhandled` log line (which
-  carries `delivery_id`, `kind`, `head_sha`, persona + repo coords for
-  exactly this reason). Accepted for uniform persona isolation - the old
-  semantics were inconsistent per persona (a TPM import failure already
-  degraded to a 200) - but it means log monitoring on
-  `persona_dispatch_unhandled` is the ONLY alerting channel for this
-  failure class. Store-read failures (`is_persona_enabled`,
-  `get_repo_config`) deliberately remain OUTSIDE the guard and still
-  500, preserving replay eligibility for store outages.
+- **Inline vs async failure handling (audit #477 stage-2 + codex
+  peer-review).** The per-persona guard isolates every persona so one
+  failure never starves the others (#185), but the guard's OUTCOME
+  depends on `dispatch_style`:
+  - **inline** (Chief): an unexpected dispatch exception 200s with
+    `result=unhandled_error`. A retry would duplicate the check-run
+    publish it already attempted, so swallowing is correct. The
+    `persona_dispatch_unhandled` log (carrying `delivery_id`, `kind`,
+    `head_sha`, `dispatch_style`, persona + repo coords) is the alerting
+    channel, wired to the `grug-webhook-persona-dispatch-unhandled`
+    monitor.
+  - **async** (Elder): an unexpected dispatch exception is a HANDOFF
+    failure - the review was never durably enqueued. Swallowing it into
+    a 200 would drop the review with no GitHub redelivery, strictly worse
+    than the pre-registry code where the enqueue exception propagated and
+    500ed. So the loop re-raises the first async-handoff error AFTER
+    running every persona: the delivery is non-2xx, GitHub redelivers,
+    and the inline personas that already ran re-publish idempotently per
+    head_sha (parity with the old behavior).
+  The deliberate #272 EXPECTED-failure path is unchanged: when
+  `enqueue_elder_review` returns False (throttle/backpressure), Elder's
+  dispatch returns `result=enqueue_failed` and 200s - a drop that
+  re-triggers on the next push, monitored by the elder-offload alert, NOT
+  re-raised. Store-read failures (`is_persona_enabled`, `get_repo_config`)
+  remain OUTSIDE the guard and still 500, preserving replay eligibility
+  for store outages.
 - The moved TPM/Elder dispatch logs (`tpm_publish_failed`,
   `tpm_dispatch_unhandled`, `elder_enqueue_failed`) keep their event
   names and extras but move logger namespace from
