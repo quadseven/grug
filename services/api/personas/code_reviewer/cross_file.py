@@ -81,21 +81,44 @@ _STOP_NAMES = frozenset({
 })
 
 
-def extract_symbols(hunks: tuple[DiffHunk, ...]) -> tuple[str, ...]:
+_PY_LINE_DEF = re.compile(r"^\s*def\s+([A-Za-z_]\w*)\s*\(")
+
+
+def _enclosing_def_from_content(content: str, first_added_line: int) -> str | None:
+    """Nearest `def` at or above `first_added_line` (1-based) in the full
+    file content - the enclosing function of a body-only change whose def
+    line sits OUTSIDE the diff context window (codex round 4, PR #480).
+    Pure; None when no def precedes the line (module-level change)."""
+    lines = content.splitlines()
+    for i in range(min(first_added_line, len(lines)) - 1, -1, -1):
+        m = _PY_LINE_DEF.match(lines[i])
+        if m:
+            return m.group(1)
+    return None
+
+
+def extract_symbols(
+    hunks: tuple[DiffHunk, ...],
+    file_contents: dict[str, str] | None = None,
+) -> tuple[str, ...]:
     """Pull the diff's cross-file-interesting symbols:
 
     1. Function defs the diff adds/changes on a `+` line (their CALLERS
        elsewhere may break on the new signature) - listed first, they
        are the highest-value lookups.
-    2. ENCLOSING functions of body-only changes (context-line / hunk
-       section-header defs): a new raise or changed return inside an
-       untouched `def` line still changes the contract its callers rely
-       on (codex round 3, PR #480).
+    2. ENCLOSING functions of body-only changes: a new raise or changed
+       return inside an untouched `def` line still changes the contract
+       its callers rely on. Found via context-line / hunk section-header
+       defs (codex round 3) and - when `file_contents` (the #336
+       full-file fetch) is available - by walking UP from the first
+       added line to the nearest preceding def, covering defs entirely
+       outside the diff context window (codex round 4).
     3. Called names the diff adds that are NOT defined in-diff (their
        DEFINITION elsewhere tells the reviewer what the call does).
 
     Pure; capped at `_MAX_SYMBOLS`; dedup preserves first-seen order.
     """
+    contents = file_contents or {}
     defs: list[str] = []
     calls: list[str] = []
     defined_here: set[str] = set()
@@ -104,7 +127,14 @@ def extract_symbols(hunks: tuple[DiffHunk, ...]) -> tuple[str, ...]:
             defined_here.add(name)
             if name not in defs:
                 defs.append(name)
-        for name in _PY_CONTEXT_DEF.findall(h.body) + _PY_SECTION_DEF.findall(h.body):
+        enclosing = list(_PY_CONTEXT_DEF.findall(h.body))
+        enclosing += _PY_SECTION_DEF.findall(h.body)
+        content = contents.get(h.file_path)
+        if content and h.new_lines:
+            name = _enclosing_def_from_content(content, min(h.new_lines))
+            if name:
+                enclosing.append(name)
+        for name in enclosing:
             # The enclosing def IS defined in this file - queue it for a
             # caller search, never as a call target.
             defined_here.add(name)

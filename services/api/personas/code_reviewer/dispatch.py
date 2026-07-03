@@ -538,7 +538,10 @@ def dispatch_code_review(
     # any failure degrades to {} = today's diff-only review, never blocks.
     cross_file_contents: dict[str, str] = {}
     try:
-        symbols = extract_symbols(hunks)
+        # file_contents (the #336 full-file fetch) lets the extractor find
+        # the ENCLOSING def of a body-only change even when the def line is
+        # outside the diff context window (codex round 4).
+        symbols = extract_symbols(hunks, file_contents)
         if symbols:
             cross_file_contents = with_install_token_retry(
                 installation_id,
