@@ -121,6 +121,21 @@ no store edits.
 
 ### Negative / accepted
 
+- **Replay invisibility (audit #477 stage-2 H1).** The per-persona guard
+  is strictly broader than the guards it replaced: an Elder enqueue-path
+  escape (e.g. an `async_dispatch` import failure on a bad deploy)
+  previously propagated and 500ed the delivery, which kept it eligible
+  for GitHub redelivery and the `delivery_replay` sweep. It now returns
+  a 200 with `result=unhandled_error`, so the delivery reads SUCCESSFUL
+  everywhere except the `persona_dispatch_unhandled` log line (which
+  carries `delivery_id`, `kind`, `head_sha`, persona + repo coords for
+  exactly this reason). Accepted for uniform persona isolation - the old
+  semantics were inconsistent per persona (a TPM import failure already
+  degraded to a 200) - but it means log monitoring on
+  `persona_dispatch_unhandled` is the ONLY alerting channel for this
+  failure class. Store-read failures (`is_persona_enabled`,
+  `get_repo_config`) deliberately remain OUTSIDE the guard and still
+  500, preserving replay eligibility for store outages.
 - The moved TPM/Elder dispatch logs (`tpm_publish_failed`,
   `tpm_dispatch_unhandled`, `elder_enqueue_failed`) keep their event
   names and extras but move logger namespace from

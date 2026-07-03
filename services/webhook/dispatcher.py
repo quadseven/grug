@@ -303,6 +303,10 @@ def _handle_pull_request(
             )
             continue
 
+        # Future-persona edge (unreachable with today's registry): a
+        # persona with missing_repo_policy="enabled" AND a blocking_flag
+        # dispatches with blocking_default on a missing repo_id - the
+        # cfg read below needs the id. Deliberate, not an oversight.
         blocking = spec.blocking_default
         if spec.blocking_flag is not None and repo_id is not None:
             # One config read, only for personas with a blocking mode —
@@ -325,13 +329,21 @@ def _handle_pull_request(
         try:
             module = importlib.import_module(spec.dispatch_module)
             results.append(module.dispatch_pull_request(ctx))
-        except Exception:  # noqa: BLE001 - per-persona isolation guard
+        except Exception as e:  # noqa: BLE001 - per-persona isolation guard
+            # NOTE: this guard makes persona failures uniform 200s - the
+            # delivery reads SUCCESSFUL in GitHub and the replay sweep
+            # skips it (ADR-0010 "replay invisibility" trade). This log
+            # line is therefore the ONLY failure signal; delivery_id +
+            # kind keep it correlatable to the GitHub delivery GUID.
             log.error(
                 "persona_dispatch_unhandled",
                 extra={
                     "installation_id": installation_id,
                     "owner": owner, "repo": repo_name, "pr_number": pr_number,
                     "persona": spec.key,
+                    "delivery_id": delivery_id,
+                    "head_sha": head_sha[:8],
+                    "kind": type(e).__name__,
                 },
                 exc_info=True,
             )
