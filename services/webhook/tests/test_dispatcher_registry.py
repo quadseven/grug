@@ -145,6 +145,40 @@ def test_toy_persona_missing_module_is_isolated(monkeypatch):
     assert out["personas"][0]["result"] == "pass"
 
 
+def test_async_persona_handoff_failure_raises_not_swallowed(monkeypatch):
+    """Codex peer-review HIGH: an unexpected exception escaping an ASYNC
+    persona's dispatch is a dropped handoff - it must NOT ACK 200 (which
+    loses GitHub redelivery). It re-raises so the webhook returns non-2xx
+    and GitHub retries. Contrast test_toy_persona_missing_module_is_isolated
+    (inline persona -> swallowed 200)."""
+    import dataclasses
+
+    import pytest
+
+    # Async toy persona whose module import fails.
+    spec = dataclasses.replace(
+        _toy_spec(),
+        dispatch_style="async",
+        dispatch_module="async_module_that_does_not_exist_465",
+    )
+    extended = persona_registry.REGISTRY + (spec,)
+
+    with patch.object(persona_registry, "REGISTRY", extended), \
+         patch("dispatcher.is_install_allowlisted", return_value=True), \
+         patch("dispatcher.is_persona_enabled", return_value=True), \
+         patch("dispatcher.get_repo_config", return_value={"code_reviewer_blocking": False}), \
+         patch("personas.tpm.persona.evaluate_pull_request") as mock_eval, \
+         patch("personas.tpm.persona.publish_tpm_evaluation") as mock_pub, \
+         patch("async_dispatch.enqueue_elder_review", return_value=True):
+        mock_eval.return_value = type("R", (), {"passed": True})()
+        with pytest.raises(ModuleNotFoundError):
+            dispatch("pull_request", _full_pr_payload())
+
+    # The inline personas still RAN before the re-raise - their publishes
+    # are idempotent on GitHub's redelivery.
+    mock_pub.assert_called_once()
+
+
 def test_toy_persona_missing_repo_policy_disabled_skips(monkeypatch):
     """missing_repo_policy is registry data, not dispatcher folklore: a
     `disabled` toy persona must be skipped when the payload lacks

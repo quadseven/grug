@@ -301,12 +301,13 @@ def create_all(
     )
 
     # 3c) Registry dispatch loop unhandled persona failure (#465, ADR-0010).
-    #     The per-persona isolation guard converts persona failures into
-    #     200s, so the delivery reads SUCCESSFUL in GitHub and the replay
-    #     sweep skips it ("replay invisibility" trade, audit #477 stage-2
-    #     H1). This log-line is therefore the ONLY signal for a broken
-    #     persona module (bad deploy, import failure, escaped exception)
-    #     - alert on any occurrence.
+    #     The per-persona isolation guard 200s an INLINE persona's failure
+    #     (Chief - a retry would duplicate its publish), so this log-line
+    #     is the primary signal for a broken inline persona module (bad
+    #     deploy, import failure, escaped exception). An ASYNC persona's
+    #     handoff failure (Elder) is re-raised instead and 500s (covered by
+    #     the workload / uptime monitors), but it ALSO logs this event, so
+    #     alerting on any occurrence catches both classes.
     persona_dispatch_unhandled = datadog.Monitor(
         "grug-webhook-persona-dispatch-unhandled",
         type="log alert",
