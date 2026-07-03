@@ -383,6 +383,23 @@ RULES: tuple[ReviewRule, ...] = (
         good_example="ctx = ssl.create_default_context(cafile=pinned_ca)  # CERT_REQUIRED",
         severity="high",
     ),
+    ReviewRule(
+        name="caller-not-updated",
+        bug_class="correctness",
+        description="A changed function signature, return shape, or raised "
+        "exception whose CALLER (shown in the UNCHANGED cross-file context "
+        "blocks, when present) was not updated to match: a call site passing "
+        "the old arguments, ignoring a new required parameter, or not "
+        "handling a newly raised exception. Only flag when a cross-file "
+        "context block actually shows the stale caller. ANCHOR the finding "
+        "on the CHANGED line in the diff (the new signature/raise) - never "
+        "on the unchanged context file - and name the caller's path and "
+        "line in the message (e.g. 'caller src/jobs.py:42 still passes the "
+        "old 2-arg form').",
+        bad_example="-def fetch(id):\n+def fetch(id, *, tenant):  # caller src/jobs.py:42 still calls fetch(1)",
+        good_example="+def fetch(id, *, tenant=None):  # optional keeps old call sites valid",
+        severity="high",
+    ),
 )
 
 
