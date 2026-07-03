@@ -56,14 +56,14 @@ _SEARCH_TIMEOUT = 10  # seconds, per call
 _TOTAL_BUDGET_SECONDS = 8.0
 
 # Added-line function definition: `+def foo(` / `+    def foo(`.
-_PY_DEF = re.compile(r"^\+\s*def\s+([A-Za-z_]\w*)\s*\(", re.MULTILINE)
+_PY_DEF = re.compile(r"^\+\s*(?:async\s+)?def\s+([A-Za-z_]\w*)\s*\(", re.MULTILINE)
 # ENCLOSING function of a body-only change (codex round 3, PR #480): a
 # function that gains a new raise/return inside its body without touching
 # its `def` line still changes its CONTRACT - its callers matter. The
 # enclosing def shows up as a CONTEXT line (` def foo(`) near the hunk
 # start and/or in the hunk section header (`@@ -a,b +c,d @@ def foo(...)`).
-_PY_CONTEXT_DEF = re.compile(r"^[ -]\s*def\s+([A-Za-z_]\w*)\s*\(", re.MULTILINE)
-_PY_SECTION_DEF = re.compile(r"^@@[^@]*@@\s.*?\bdef\s+([A-Za-z_]\w*)\s*\(", re.MULTILINE)
+_PY_CONTEXT_DEF = re.compile(r"^[ -]\s*(?:async\s+)?def\s+([A-Za-z_]\w*)\s*\(", re.MULTILINE)
+_PY_SECTION_DEF = re.compile(r"^@@[^@]*@@\s.*?\b(?:async\s+)?def\s+([A-Za-z_]\w*)\s*\(", re.MULTILINE)
 # A call on an added line: `name(` not preceded by `.` (method calls on
 # unknown receivers are noise for a 1-hop tracer) or `def `.
 _PY_CALL = re.compile(r"^\+.*?(?<![\w.])([A-Za-z_]\w*)\s*\(", re.MULTILINE)
@@ -78,10 +78,11 @@ _STOP_NAMES = frozenset({
     "super", "repr", "hash", "id", "iter", "next", "vars", "format",
     "def", "if", "elif", "while", "for", "return", "yield", "raise",
     "assert", "with", "lambda", "not", "and", "or", "in", "is",
+    "async", "await",
 })
 
 
-_PY_LINE_DEF = re.compile(r"^\s*def\s+([A-Za-z_]\w*)\s*\(")
+_PY_LINE_DEF = re.compile(r"^\s*(?:async\s+)?def\s+([A-Za-z_]\w*)\s*\(")
 
 
 def _enclosing_def_from_content(content: str, first_added_line: int) -> str | None:

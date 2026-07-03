@@ -466,3 +466,53 @@ def test_prompt_hardening_covers_file_context_blocks():
         "v1", None, {"src/caller.py": "y = 2"},
     )
     assert "untrusted repository DATA" in msgs[1]["content"]
+
+
+def test_extract_symbols_handles_async_defs():
+    """Codex round 6 (PR #480): async def must be recognized in ALL four
+    shapes - added def, context-line def, section-header def, and the
+    full-file enclosing walk."""
+    added = """diff --git a/src/a.py b/src/a.py
+--- a/src/a.py
++++ b/src/a.py
+@@ -1,1 +1,2 @@
+ import x
++async def handler(req, *, tenant):
+"""
+    assert "handler" in cross_file.extract_symbols(parse_diff(added))
+
+    context = """diff --git a/src/b.py b/src/b.py
+--- a/src/b.py
++++ b/src/b.py
+@@ -1,3 +1,4 @@
+ async def charge(card, amount):
++    raise InvalidAmountError(amount)
+     return await gateway.charge(card, amount)
+"""
+    assert "charge" in cross_file.extract_symbols(parse_diff(context))
+
+    section = """diff --git a/src/c.py b/src/c.py
+--- a/src/c.py
++++ b/src/c.py
+@@ -10,2 +10,3 @@ async def refund(order_id):
+     amount = order.total
++    await audit(order_id)
+"""
+    assert "refund" in cross_file.extract_symbols(parse_diff(section))
+
+    body_only = """diff --git a/src/d.py b/src/d.py
+--- a/src/d.py
++++ b/src/d.py
+@@ -20,2 +20,3 @@
+     total = sum(items)
++    audit(total)
+"""
+    full = "\n".join(
+        [f"# filler {i}" for i in range(15)]
+        + ["async def process(items):"]
+        + [f"    # body {i}" for i in range(6)]
+        + ["    total = sum(items)", "    audit(total)"]
+    )
+    assert "process" in cross_file.extract_symbols(
+        parse_diff(body_only), {"src/d.py": full},
+    )
