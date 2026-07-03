@@ -218,3 +218,95 @@ def test_run_judge_never_raises_on_submit_failure(monkeypatch):
         evaluation, parse_diff(_DIFF), installation_id=1,
         review_span_context={"span_id": "s"},
     )
+# ── #467 judge-gated publication ──────────────────────────────────────
+
+
+def test_partition_suppresses_confident_medium_false_positive():
+    """A finding the judge marks not-real at/above the confidence floor
+    with severity<=medium is suppressed; a real one is kept."""
+    findings = (
+        _finding(rule="real-bug", severity="medium"),
+        _finding(rule="style-nit", severity="medium", line=3),
+    )
+    verdicts = (
+        FindingJudgement(0, True, "real", 0.9),
+        FindingJudgement(1, False, "nit", 0.9),
+    )
+    kept, suppressed = cr_judge.partition_findings(
+        findings, verdicts, confidence_floor=0.7,
+    )
+    assert [f.rule_name for f in kept] == ["real-bug"]
+    assert [f.rule_name for f in suppressed] == ["style-nit"]
+
+
+def test_partition_never_suppresses_high_or_critical():
+    """HIGH/CRITICAL always publish even when the judge is confident it's
+    a false positive (a judge FP on a critical must never hide it)."""
+    findings = (
+        _finding(rule="hi", severity="high"),
+        _finding(rule="crit", severity="critical", line=3),
+    )
+    verdicts = (
+        FindingJudgement(0, False, "fp", 0.99),
+        FindingJudgement(1, False, "fp", 0.99),
+    )
+    kept, suppressed = cr_judge.partition_findings(
+        findings, verdicts, confidence_floor=0.7,
+    )
+    assert len(kept) == 2 and suppressed == ()
+
+
+def test_partition_keeps_low_confidence_false_positive():
+    """A not-real verdict BELOW the confidence floor does not suppress
+    (fail toward publishing when the judge is unsure)."""
+    findings = (_finding(rule="maybe", severity="medium"),)
+    verdicts = (FindingJudgement(0, False, "unsure", 0.5),)
+    kept, suppressed = cr_judge.partition_findings(
+        findings, verdicts, confidence_floor=0.7,
+    )
+    assert len(kept) == 1 and suppressed == ()
+
+
+def test_partition_keeps_ungraded_findings_fail_open():
+    """A finding with no verdict (judge outage / hallucinated index /
+    over budget) is kept — fail-open."""
+    findings = (_finding(rule="a"), _finding(rule="b", line=3))
+    verdicts = (FindingJudgement(0, False, "fp", 0.9),)  # only finding 0 graded
+    kept, suppressed = cr_judge.partition_findings(
+        findings, verdicts, confidence_floor=0.7,
+    )
+    assert [f.rule_name for f in kept] == ["b"]
+    assert [f.rule_name for f in suppressed] == ["a"]
+
+
+def test_partition_empty_verdicts_keeps_everything():
+    """Judge returned nothing (outage) -> zero suppression."""
+    findings = (_finding(rule="a", severity="medium"),)
+    kept, suppressed = cr_judge.partition_findings(
+        findings, (), confidence_floor=0.7,
+    )
+    assert len(kept) == 1 and suppressed == ()
+
+
+def test_grade_findings_fail_open_on_llm_error(monkeypatch):
+    """grade_findings returns () when the judge LLM raises — the caller
+    then suppresses nothing."""
+    evaluation = CodeReviewEvaluation(
+        findings=(_finding(),), conclusion="success",
+    )
+
+    def _boom(*a, **kw):
+        raise RuntimeError("judge LLM down")
+
+    monkeypatch.setattr(cr_judge, "judge_findings", _boom)
+    verdicts = cr_judge.grade_findings(
+        evaluation, parse_diff(_DIFF), installation_id=1,
+    )
+    assert verdicts == ()
+
+
+def test_grade_findings_empty_when_no_findings():
+    evaluation = CodeReviewEvaluation(findings=(), conclusion="success")
+    assert cr_judge.grade_findings(
+        evaluation, parse_diff(_DIFF), installation_id=1,
+    ) == ()

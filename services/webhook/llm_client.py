@@ -821,8 +821,12 @@ _JUDGE_SYSTEM_PROMPT = (
     "style nit / hallucination (false). Judge each finding ON THE EVIDENCE "
     "in the diff — do not assume either way. Calibrated accuracy matters "
     "more than caution: a wrong label in either direction corrupts the "
-    "dataset. Return JSON of shape "
-    '{"verdicts": [{"index": int, "is_real_bug": bool, "reasoning": str}]}. '
+    "dataset. Also report `confidence` in [0.0, 1.0] - how sure you are of "
+    "the label (findings marked not-real with high confidence may be "
+    "suppressed, so only be confident when the evidence is clear). Return "
+    "JSON of shape "
+    '{"verdicts": [{"index": int, "is_real_bug": bool, "confidence": float, '
+    '"reasoning": str}]}. '
     "One verdict per finding, matching its index. No prose outside the JSON."
 )
 
@@ -850,11 +854,16 @@ class FindingJudgement:
     """One adjudicated finding. `finding_index` ties back to the caller's
     finding list position; `is_real_bug` is the categorical verdict;
     `reasoning` is the judge's one-line justification (surfaced in the DD
-    annotation-queue UI for human review)."""
+    annotation-queue UI for human review); `confidence` (0.0-1.0) is how sure
+    the judge is of that verdict, used by `judge.partition_findings` to gate
+    publication (#467). Defaults to 0.0 so a verdict from an older judge
+    shape - or a garbled `confidence` - is treated as MINIMALLY confident and
+    can never cause suppression (fail-safe toward publishing)."""
 
     finding_index: int
     is_real_bug: bool
     reasoning: str
+    confidence: float = 0.0
 
 
 def _build_judge_messages(
@@ -928,10 +937,18 @@ def _parse_judge_verdicts(content: str) -> tuple[FindingJudgement, ...]:
         except (KeyError, TypeError, ValueError):
             dropped += 1
             continue
+        # A missing / non-numeric confidence defaults to 0.0 (below any
+        # floor -> never suppresses, #467 fail-safe). Clamp to [0, 1] so a
+        # hallucinated 5.0 can't skew the gate.
+        try:
+            confidence = min(1.0, max(0.0, float(entry.get("confidence", 0.0))))
+        except (TypeError, ValueError):
+            confidence = 0.0
         out.append(FindingJudgement(
             finding_index=idx,
             is_real_bug=is_real,
             reasoning=str(entry.get("reasoning", "")),
+            confidence=confidence,
         ))
     if dropped:
         log.warning(

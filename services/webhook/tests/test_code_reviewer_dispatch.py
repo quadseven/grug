@@ -10,7 +10,7 @@ from unittest.mock import MagicMock, patch
 import httpx
 import pytest
 
-from llm_client import Backend, Finding as LlmFinding, LlmReviewResponse
+from llm_client import Backend, Finding as LlmFinding, FindingJudgement, LlmReviewResponse
 from personas.code_reviewer import dispatch as cr_dispatch
 
 
@@ -739,10 +739,10 @@ def test_dispatch_structured_log_carries_degraded_reason(monkeypatch, caplog):
     assert rec.__dict__.get("result") == "skipped"
 
 
-def test_dispatch_runs_judge_after_publish_with_review_span(monkeypatch):
-    """When the review carries a span context, the LLM-as-a-judge is
-    invoked AFTER publishing — with the evaluation, hunks, install id,
-    and the review's span context for eval attribution."""
+def test_dispatch_submits_judge_evals_after_publish_with_review_span(monkeypatch):
+    """The review's findings are graded pre-publish (grade_findings) and
+    the verdicts submitted to DD AFTER publishing (submit_evals) — with the
+    full graded set + the review's span context for eval attribution (#467)."""
     llm = LlmReviewResponse(
         kind="reviewed",
         findings=(LlmFinding(
@@ -754,24 +754,71 @@ def test_dispatch_runs_judge_after_publish_with_review_span(monkeypatch):
     monkeypatch.setattr(cr_dispatch, "review_diff", lambda *a, **kw: llm)
     monkeypatch.setattr(cr_dispatch, "post_check_run", lambda *a, **kw: {})
     monkeypatch.setattr(cr_dispatch, "post_review", lambda *a, **kw: {})
-
-    judge_calls: list[dict] = []
+    # A "real" verdict so nothing is suppressed - the finding still publishes.
     monkeypatch.setattr(
-        cr_dispatch, "run_judge",
-        lambda evaluation, hunks, **kw: judge_calls.append(kw),
+        cr_dispatch, "grade_findings",
+        lambda *a, **kw: (FindingJudgement(0, True, "real", 0.9),),
+    )
+
+    submit_calls: list[dict] = []
+    monkeypatch.setattr(
+        cr_dispatch, "submit_evals",
+        lambda findings, verdicts, **kw: submit_calls.append(
+            {"findings": findings, "verdicts": verdicts, **kw}
+        ),
     )
 
     with patch("httpx.get", return_value=_diff_response()):
         cr_dispatch.dispatch_code_review(_payload(), blocking=False)
 
-    assert len(judge_calls) == 1
-    assert judge_calls[0]["review_span_context"] == {"span_id": "rs1"}
-    assert judge_calls[0]["pr_context"]["repo"] == "myorg/myrepo"
+    assert len(submit_calls) == 1
+    assert submit_calls[0]["review_span_context"] == {"span_id": "rs1"}
+    assert len(submit_calls[0]["findings"]) == 1  # the full graded set
+
+
+def test_dispatch_suppresses_confident_medium_false_positive(monkeypatch):
+    """A medium finding the judge confidently calls not-real is NOT
+    published as an inline comment, but IS still recorded to DD evals
+    (#467)."""
+    llm = LlmReviewResponse(
+        kind="reviewed",
+        findings=(LlmFinding(
+            path="src/x.py", line=2, rule="nit", severity="medium", message="m",  # type: ignore[arg-type]
+        ),),
+        backend_used=Backend.POOLSIDE,
+        review_span_context={"span_id": "rs1"},
+    )
+    monkeypatch.setattr(cr_dispatch, "review_diff", lambda *a, **kw: llm)
+    monkeypatch.setattr(cr_dispatch, "post_check_run", lambda *a, **kw: {})
+    monkeypatch.setattr(
+        cr_dispatch, "grade_findings",
+        lambda *a, **kw: (FindingJudgement(0, False, "false positive", 0.95),),
+    )
+    posted_reviews: list = []
+    monkeypatch.setattr(
+        cr_dispatch, "post_review",
+        lambda *a, **kw: posted_reviews.append(kw) or {},
+    )
+    submitted: list = []
+    monkeypatch.setattr(
+        cr_dispatch, "submit_evals",
+        lambda findings, verdicts, **kw: submitted.append(findings),
+    )
+
+    with patch("httpx.get", return_value=_diff_response()):
+        out = cr_dispatch.dispatch_code_review(_payload(), blocking=False)
+
+    # The suppressed finding produced no inline review (nothing to post).
+    assert posted_reviews == []
+    # But it was still submitted to DD evals (denominator preserved).
+    assert len(submitted[0]) == 1
+    # Suppressed-all -> clean pass verdict.
+    assert out["result"] == "pass"
 
 
 def test_dispatch_judge_failure_does_not_change_result(monkeypatch):
-    """The judge is pure observability — even if run_judge raises (past
-    its own internal guard), the dispatch result must stand."""
+    """The judge is pure observability past the gate — even if submit_evals
+    raises (past its own internal guard), the dispatch result must stand."""
     llm = LlmReviewResponse(
         kind="reviewed", findings=(), backend_used=Backend.POOLSIDE,
         review_span_context={"span_id": "rs1"},
@@ -783,7 +830,7 @@ def test_dispatch_judge_failure_does_not_change_result(monkeypatch):
     def _boom(*a, **kw):
         raise RuntimeError("judge exploded past its guard")
 
-    monkeypatch.setattr(cr_dispatch, "run_judge", _boom)
+    monkeypatch.setattr(cr_dispatch, "submit_evals", _boom)
 
     with patch("httpx.get", return_value=_diff_response()):
         out = cr_dispatch.dispatch_code_review(_payload(), blocking=False)

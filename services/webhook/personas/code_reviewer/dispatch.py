@@ -43,9 +43,12 @@ from personas.code_reviewer.dedup import (
 from personas.code_reviewer.diff_parser import (
     DiffHunk, DiffParseError, parse_diff,
 )
-from personas.code_reviewer.judge import eval_tags, run_judge
+from personas.code_reviewer.judge import (
+    eval_tags, grade_findings, partition_findings, submit_evals,
+)
 from personas.code_reviewer.persona import (
     CodeReviewEvaluation, Finding, evaluate_diff, with_extra_findings,
+    with_findings,
 )
 from personas.code_reviewer.sast import judge_candidates, scan_candidates
 from personas.code_reviewer.iac_scan import scan_iac
@@ -239,25 +242,39 @@ def _to_llm_hunks(hunks: tuple[DiffHunk, ...]) -> list[LlmHunk]:
     return [LlmHunk(path=h.file_path, body=h.body) for h in hunks]
 
 
-def _summary_markdown(evaluation: CodeReviewEvaluation) -> tuple[str, str]:
+def _summary_markdown(
+    evaluation: CodeReviewEvaluation, *, suppressed_count: int = 0,
+) -> tuple[str, str]:
     """Render a (title, summary) pair for the check-run output.
 
     Title is a one-liner status; summary is a Markdown table of findings
     by severity. Operators read this when triaging in GH's Checks tab.
+    `suppressed_count` (#467) is how many weak findings the judge held back
+    from publication - surfaced as a transparency line so a suppressed
+    finding is never a silent gap.
     """
+    held = (
+        f"\n\nGrug held back {suppressed_count} weak finding(s) his judge doubted."
+        if suppressed_count
+        else ""
+    )
     if evaluation.degraded_reason:
         title = f"⚠️ Grug eyes clouded ({evaluation.degraded_reason})"
         return title, (
             "Grug Elder could not see the diff this pass. The mist: "
             f"`{evaluation.degraded_reason}`. Grug stay his club — this "
             "only counsel, merge not blocked."
-        )
+        ) + held
     if not evaluation.findings:
-        title = "✅ Grug find nothing — code good"
+        title = (
+            "✅ Grug find nothing — code good"
+            if not suppressed_count
+            else "✅ Grug find nothing worth the club"
+        )
         return title, (
             "Grug Elder look long upon the diff and find nothing to fear. "
             "Code walk steady. Grug nod."
-        )
+        ) + held
 
     severity_icon = {
         "critical": "🛑", "high": "❌", "medium": "⚠️", "low": "ℹ️",
@@ -622,10 +639,41 @@ def dispatch_code_review(
             },
         )
 
+    # Judge-gated publication (#467, ADR-0011): grade the findings with the
+    # exploitability judge BEFORE publishing, then suppress the ones it
+    # confidently calls false positives at low/medium severity. HIGH/CRITICAL
+    # always publish; a judge outage grades nothing and publishes everything
+    # (fail-open). ONE judge call - its verdicts drive both the gate here and
+    # the DD evals below. `graded_findings` keeps the FULL set so the eval
+    # denominator counts suppressed rows too.
+    graded_findings = evaluation.findings
+    judge_verdicts = grade_findings(
+        evaluation, hunks, installation_id,
+        pr_context={
+            "installation_id": installation_id,
+            "repo": f"{owner}/{repo_name}",
+            "pr_number": pull_number,
+            "head_sha": head_sha,
+        },
+        file_contents=file_contents,
+    )
+    kept, suppressed = partition_findings(evaluation.findings, judge_verdicts)
+    if suppressed:
+        evaluation = with_findings(evaluation, kept)
+        log.info(
+            "judge_suppressed_findings",
+            extra={
+                "installation_id": installation_id,
+                "pr": f"{owner}/{repo_name}#{pull_number}",
+                "suppressed": len(suppressed),
+                "published": len(kept),
+            },
+        )
+
     # Both clients are independent — a 5xx on review post must not
     # skip the check-run post.
     conclusion, event = _publish_shape(evaluation, mode=mode)
-    title, summary = _summary_markdown(evaluation)
+    title, summary = _summary_markdown(evaluation, suppressed_count=len(suppressed))
     check_result = CheckRunResult(
         name=_CHECK_NAME,
         head_sha=head_sha,
@@ -809,30 +857,20 @@ def dispatch_code_review(
             or ("check_publish_failed" if check_publish_failed else None)
         ),
     )
-    # LLM-as-a-judge (#190) runs AFTER the review + check-run are POSTed
-    # to GitHub, so the developer sees the review immediately regardless
-    # of the judge. NOTE the webhook HANDLER, however, still blocks on
-    # the judge's LLM round-trip before returning to GitHub — this is a
-    # deliberate tradeoff for v1: true async (Lambda self-invoke / SQS)
-    # is deferred to #245's scheduled-poller infra. The judge inherits
-    # the 30s `_TIMEOUT_SECONDS` and the `_JUDGE_MAX_FINDINGS` cost guard
-    # bounds the worst case; revisit if webhook-delivery timeouts appear
-    # in DD. `run_judge` is fully self-guarding (never raises), but wrap
-    # it anyway — the judge is pure observability and must never affect
+    # LLM-as-a-judge DD evals (#190) submit AFTER the review + check-run are
+    # POSTed, so recording can't delay the developer seeing the review. The
+    # judge LLM CALL already ran pre-publish (grade_findings, #467) to gate
+    # publication; here we only submit its verdicts to DD LLM Obs - for the
+    # FULL `graded_findings` set (published AND suppressed) so the precision
+    # denominator and the learning corpus keep every judged row. `submit_evals`
+    # is self-guarding (never raises); wrap anyway - evals must never affect
     # the dispatch result the developer already has.
     try:
-        run_judge(
-            evaluation, hunks, installation_id=installation_id,
+        submit_evals(
+            graded_findings, judge_verdicts,
             review_span_context=llm_response.review_span_context,
-            file_contents=file_contents,
-            pr_context={
-                "installation_id": installation_id,
-                "repo": f"{owner}/{repo_name}",
-                "pr_number": pull_number,
-                "head_sha": head_sha,
-            },
         )
-    except Exception as e:  # noqa: BLE001 — defense-in-depth over run_judge's own guard
+    except Exception as e:  # noqa: BLE001 — defense-in-depth over submit_evals's own guard
         log.error(
             "code_review_judge_dispatch_failed",
             extra={

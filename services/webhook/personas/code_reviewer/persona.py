@@ -145,6 +145,29 @@ def with_extra_findings(
     )
 
 
+def with_findings(
+    evaluation: CodeReviewEvaluation, findings: tuple[Finding, ...]
+) -> CodeReviewEvaluation:
+    """Replace an evaluation's findings and re-derive `conclusion` by the
+    SAME rule as `with_extra_findings` / `evaluate_diff`. Used by the
+    judge-gated publish path (#467) to publish only the KEPT findings.
+    Suppression only ever removes advisory-severity findings, so the
+    conclusion is provably unchanged - but re-deriving keeps the invariant
+    honest rather than relying on it. Pure - no IO."""
+    if any(f.severity in _BLOCKING_SEVERITIES for f in findings):
+        conclusion: CheckConclusion = "failure"
+    elif evaluation.degraded_reason is not None:
+        conclusion = "neutral"
+    else:
+        conclusion = "success"
+    return CodeReviewEvaluation(
+        findings=findings,
+        conclusion=conclusion,
+        dropped_hallucinations=evaluation.dropped_hallucinations,
+        degraded_reason=evaluation.degraded_reason,
+    )
+
+
 def _hunk_line_index(hunks: tuple[DiffHunk, ...]) -> dict[str, set[int]]:
     """Build {file_path: union(new_lines)} for O(1) hallucination check.
 
