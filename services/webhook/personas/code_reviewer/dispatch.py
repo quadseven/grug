@@ -43,6 +43,9 @@ from personas.code_reviewer.dedup import (
 from personas.code_reviewer.diff_parser import (
     DiffHunk, DiffParseError, parse_diff,
 )
+from personas.code_reviewer.cross_file import (
+    extract_symbols, fetch_cross_file_context,
+)
 from personas.code_reviewer.judge import (
     eval_tags, grade_findings, partition_findings, submit_evals,
 )
@@ -529,12 +532,39 @@ def dispatch_code_review(
         )
         file_contents = {}
 
+    # Cross-file context (#468): resolve the diff's changed defs + external
+    # calls to the UNCHANGED files that define/call them, so the Elder can
+    # catch stale callers (caller-not-updated rule). FAIL-SAFE + additive:
+    # any failure degrades to {} = today's diff-only review, never blocks.
+    cross_file_contents: dict[str, str] = {}
+    try:
+        symbols = extract_symbols(hunks)
+        if symbols:
+            cross_file_contents = with_install_token_retry(
+                installation_id,
+                lambda token: fetch_cross_file_context(
+                    token, owner, repo_name, symbols,
+                    head_sha=head_sha,
+                    exclude_paths=frozenset(changed_paths),
+                ),
+            )
+    except Exception as e:  # noqa: BLE001 — cross-file context is additive; never break the review
+        log.info(
+            "cross_file_context_degraded",
+            extra={
+                "stage": "dispatch",
+                "pr": f"{owner}/{repo_name}#{pull_number}",
+                "kind": type(e).__name__,
+            },
+        )
+
     # `pr_context` flows into DD LLM Obs span tags so traces are
     # filterable by repo / PR / installation in the LLM Obs UI.
     llm_response: LlmReviewResponse = review_diff(
         _to_llm_hunks(hunks),
         installation_id=installation_id,
         file_contents=file_contents,
+        cross_file_contents=cross_file_contents,
         pr_context={
             "installation_id": installation_id,
             "repo": f"{owner}/{repo_name}",

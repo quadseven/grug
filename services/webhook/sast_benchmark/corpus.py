@@ -38,6 +38,11 @@ class CorpusSample:
     path: str
     diff_body: str
     is_true_positive: bool
+    # Cross-file context (#468): {path: content} of UNCHANGED pseudo-files
+    # rendered into the prompt exactly as production does (the runner passes
+    # it through _build_messages). None for single-file samples - their
+    # prompt stays byte-identical to the pre-#468 shape.
+    cross_file_contents: dict[str, str] | None = None
 
 
 # One TRUE-POSITIVE sample per canonical class (ADR-0006 / PRD #392), then the
@@ -170,6 +175,58 @@ _SAMPLES: tuple[CorpusSample, ...] = (
             "+    return ssm.get_parameter(Name=ssm_param_name, WithDecryption=True)"
         ),
         is_true_positive=False,
+    ),
+    # ── Cross-file samples (#468) — the caller-not-updated class. The diff
+    # changes a contract; the STALE CALLER lives in an unchanged pseudo-file
+    # supplied as cross-file context. A recall hit = a finding anchored on
+    # the sample's DIFF path (per the rule's anchoring instruction).
+    CorpusSample(
+        name="xfile_signature_change_stale_caller",
+        vuln_class="caller-not-updated",
+        path="bench/xfile_api.py",
+        diff_body=(
+            "@@ -1,3 +1,4 @@\n"
+            " import db\n"
+            "-def fetch_user(user_id):\n"
+            "+def fetch_user(user_id, *, tenant):\n"
+            "+    _check_tenant(tenant)\n"
+            "     return db.get(user_id)"
+        ),
+        is_true_positive=True,
+        cross_file_contents={
+            "bench/xfile_jobs.py": (
+                "from xfile_api import fetch_user\n"
+                "\n"
+                "def nightly_sync():\n"
+                "    for uid in pending_ids():\n"
+                "        user = fetch_user(uid)  # old 1-arg call - no tenant\n"
+                "        push(user)\n"
+            ),
+        },
+    ),
+    CorpusSample(
+        name="xfile_new_exception_unhandled_caller",
+        vuln_class="caller-not-updated",
+        path="bench/xfile_pay.py",
+        diff_body=(
+            "@@ -1,3 +1,6 @@\n"
+            " import gateway\n"
+            " def charge(card, amount):\n"
+            "+    if amount <= 0:\n"
+            "+        raise InvalidAmountError(amount)\n"
+            "     return gateway.charge(card, amount)"
+        ),
+        is_true_positive=True,
+        cross_file_contents={
+            "bench/xfile_checkout.py": (
+                "from xfile_pay import charge\n"
+                "\n"
+                "def checkout(cart, card):\n"
+                "    # no try/except - InvalidAmountError now escapes to the 500 handler\n"
+                "    receipt = charge(card, cart.total)\n"
+                "    return receipt\n"
+            ),
+        },
     ),
 )
 
