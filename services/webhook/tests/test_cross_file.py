@@ -362,3 +362,40 @@ def test_per_call_timeout_clamped_to_remaining_budget(monkeypatch):
     # ~2s, never the full 10s default.
     assert seen_timeouts[0] <= cross_file._TOTAL_BUDGET_SECONDS
     assert all(t < cross_file._SEARCH_TIMEOUT for t in seen_timeouts[1:])
+
+
+def test_extract_symbols_finds_enclosing_def_of_body_only_change():
+    """Codex round 3 (PR #480): a new raise inside an UNTOUCHED def line
+    changes the function's contract - the enclosing function must be
+    queued so its callers get fetched (this is exactly the
+    xfile_new_exception_unhandled_caller corpus shape)."""
+    diff = """diff --git a/src/pay.py b/src/pay.py
+--- a/src/pay.py
++++ b/src/pay.py
+@@ -1,3 +1,6 @@
+ import gateway
+ def charge(card, amount):
++    if amount <= 0:
++        raise InvalidAmountError(amount)
+     return gateway.charge(card, amount)
+"""
+    symbols = cross_file.extract_symbols(parse_diff(diff))
+    assert "charge" in symbols
+    # And charge is treated as defined-here: it is queued as a DEF
+    # (caller search), not duplicated as a call target.
+    assert symbols.count("charge") == 1
+
+
+def test_extract_symbols_finds_def_in_hunk_section_header():
+    """Git puts the enclosing function in the hunk section header when
+    the def line itself is outside the context window."""
+    diff = """diff --git a/src/pay.py b/src/pay.py
+--- a/src/pay.py
++++ b/src/pay.py
+@@ -10,3 +10,4 @@ def refund(order_id):
+     amount = order.total
++    audit_log(order_id)
+     return gateway.refund(order_id, amount)
+"""
+    symbols = cross_file.extract_symbols(parse_diff(diff))
+    assert "refund" in symbols

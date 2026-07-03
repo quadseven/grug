@@ -57,6 +57,13 @@ _TOTAL_BUDGET_SECONDS = 8.0
 
 # Added-line function definition: `+def foo(` / `+    def foo(`.
 _PY_DEF = re.compile(r"^\+\s*def\s+([A-Za-z_]\w*)\s*\(", re.MULTILINE)
+# ENCLOSING function of a body-only change (codex round 3, PR #480): a
+# function that gains a new raise/return inside its body without touching
+# its `def` line still changes its CONTRACT - its callers matter. The
+# enclosing def shows up as a CONTEXT line (` def foo(`) near the hunk
+# start and/or in the hunk section header (`@@ -a,b +c,d @@ def foo(...)`).
+_PY_CONTEXT_DEF = re.compile(r"^[ -]\s*def\s+([A-Za-z_]\w*)\s*\(", re.MULTILINE)
+_PY_SECTION_DEF = re.compile(r"^@@[^@]*@@\s.*?\bdef\s+([A-Za-z_]\w*)\s*\(", re.MULTILINE)
 # A call on an added line: `name(` not preceded by `.` (method calls on
 # unknown receivers are noise for a 1-hop tracer) or `def `.
 _PY_CALL = re.compile(r"^\+.*?(?<![\w.])([A-Za-z_]\w*)\s*\(", re.MULTILINE)
@@ -75,12 +82,16 @@ _STOP_NAMES = frozenset({
 
 
 def extract_symbols(hunks: tuple[DiffHunk, ...]) -> tuple[str, ...]:
-    """Pull the diff's cross-file-interesting symbols from ADDED lines:
+    """Pull the diff's cross-file-interesting symbols:
 
-    1. Function defs the diff adds/changes (their CALLERS elsewhere may
-       break on the new signature) - listed first, they are the
-       highest-value lookups.
-    2. Called names the diff adds that are NOT defined in-diff (their
+    1. Function defs the diff adds/changes on a `+` line (their CALLERS
+       elsewhere may break on the new signature) - listed first, they
+       are the highest-value lookups.
+    2. ENCLOSING functions of body-only changes (context-line / hunk
+       section-header defs): a new raise or changed return inside an
+       untouched `def` line still changes the contract its callers rely
+       on (codex round 3, PR #480).
+    3. Called names the diff adds that are NOT defined in-diff (their
        DEFINITION elsewhere tells the reviewer what the call does).
 
     Pure; capped at `_MAX_SYMBOLS`; dedup preserves first-seen order.
@@ -90,6 +101,12 @@ def extract_symbols(hunks: tuple[DiffHunk, ...]) -> tuple[str, ...]:
     defined_here: set[str] = set()
     for h in hunks:
         for name in _PY_DEF.findall(h.body):
+            defined_here.add(name)
+            if name not in defs:
+                defs.append(name)
+        for name in _PY_CONTEXT_DEF.findall(h.body) + _PY_SECTION_DEF.findall(h.body):
+            # The enclosing def IS defined in this file - queue it for a
+            # caller search, never as a call target.
             defined_here.add(name)
             if name not in defs:
                 defs.append(name)
