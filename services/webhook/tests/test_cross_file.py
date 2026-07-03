@@ -432,3 +432,37 @@ def test_extract_symbols_without_file_contents_still_works():
     """file_contents is optional - the pre-round-4 behavior holds."""
     hunks = parse_diff(_DIFF_CHANGED_SIG)
     assert cross_file.extract_symbols(hunks) == cross_file.extract_symbols(hunks, None)
+
+
+def test_search_hits_filtered_to_python_paths():
+    """Codex round 5 (PR #480): non-code files (README/docs mentioning
+    the symbol) are attacker-influenceable prose, not callers - only .py
+    paths ride into the context."""
+    def fake_get(url, **kw):
+        if "/search/code" in url:
+            return _search_response(["README.md", "docs/guide.rst", "src/caller.py"])
+        return _raw_response("fetch_user(1)")
+
+    with patch.object(cross_file.httpx, "get", side_effect=fake_get):
+        out = cross_file.fetch_cross_file_context(
+            "tok", "o", "r", ("fetch_user",),
+            head_sha="abc", exclude_paths=frozenset(),
+        )
+    assert list(out) == ["src/caller.py"]
+
+
+def test_prompt_hardening_covers_file_context_blocks():
+    """The injection-hardening clause must frame ALL repo-sourced blocks
+    (diff + full-file + cross-file) as data, and the cross-file block
+    itself carries the untrusted-data label."""
+    from code_review_prompt import build_system_prompt
+    from llm_client import Hunk, _build_messages
+
+    prompt = build_system_prompt()
+    assert "cross-file" in prompt and "never as" in prompt
+
+    msgs = _build_messages(
+        [Hunk(path="src/api.py", body="+x = 1")],
+        "v1", None, {"src/caller.py": "y = 2"},
+    )
+    assert "untrusted repository DATA" in msgs[1]["content"]
