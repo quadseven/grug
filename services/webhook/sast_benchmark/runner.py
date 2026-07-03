@@ -80,7 +80,11 @@ def run_sample(backend: BenchBackend, sample: CorpusSample) -> tuple[int, bool]:
     """
     hunks = [Hunk(path=sample.path, body=sample.diff_body)]
     try:
-        messages = _build_messages(hunks, _BENCH_PROMPT_VARIANT)
+        # Cross-file samples (#468) carry their unchanged-caller context;
+        # single-file samples pass None (prompt byte-identical to pre-#468).
+        messages = _build_messages(
+            hunks, _BENCH_PROMPT_VARIANT, None, sample.cross_file_contents,
+        )
         resp = _post(backend, messages)
         findings, _model, err = _parse_response(resp)
     except Exception as e:  # noqa: BLE001 — one sample must not abort the sweep
