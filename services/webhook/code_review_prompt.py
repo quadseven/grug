@@ -346,6 +346,26 @@ RULES: tuple[ReviewRule, ...] = (
         good_example="subprocess.run(cmd, capture_output=True, timeout=600)",
         severity="medium",
     ),
+    # ── weekly harvest: monotonic-clock throttle sentinel (grug #450, #444) ──
+    ReviewRule(
+        name="monotonic-zero-sentinel",
+        bug_class="correctness",
+        description="A rate-limit / throttle / debounce whose 'last fired' "
+        "timestamp is initialized to 0 / 0.0 and then compared against "
+        "time.monotonic() / time.perf_counter() — both are SECONDS-SINCE-BOOT, "
+        "not epoch. On a freshly-booted pod/runner monotonic() can be SMALLER "
+        "than the interval, so `now - 0.0 < WINDOW` (or `now - 0.0 > INTERVAL` "
+        "being False) holds and the FIRST event in the first window after boot "
+        "is silently suppressed — exactly the startup / rollout misconfig signal "
+        "you most want to see. Initialize the sentinel to float('-inf') so the "
+        "first occurrence per key always fires. (A 0.0 sentinel is correct only "
+        "when compared against time.time()/epoch.)",
+        bad_example="_last = 0.0  # vs time.monotonic(): drops first event after boot\n"
+        "if time.monotonic() - _last < WINDOW: return",
+        good_example="_last = float('-inf')\n"
+        "if time.monotonic() - _last < WINDOW: return",
+        severity="medium",
+    ),
     # ── weekly harvest: disabled-TLS-verification class (infrastructure #1390/#1391) ──
     ReviewRule(
         name="tls-verification-disabled",

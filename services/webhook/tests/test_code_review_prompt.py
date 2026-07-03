@@ -203,6 +203,15 @@ def test_subprocess_no_timeout_rule_present():
     assert "subprocess-no-timeout" in crp.build_system_prompt()
 
 
+def test_monotonic_zero_sentinel_rule_present():
+    """Weekly harvest: a throttle/rate-limit sentinel initialized to 0.0 but
+    compared against time.monotonic() (since-boot, not epoch) silently drops
+    the FIRST event in the first window after boot — fix is float('-inf')
+    (grug #450 cf_auth, #444 trace-flush)."""
+    assert any(r.name == "monotonic-zero-sentinel" for r in crp.RULES)
+    assert "monotonic-zero-sentinel" in crp.build_system_prompt()
+
+
 def test_tls_verification_disabled_rule_present():
     """Weekly harvest: disabling TLS/cert verification (CERT_NONE / verify=False
     / rejectUnauthorized:false / InsecureSkipVerify) sends credentials over a
