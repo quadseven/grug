@@ -215,7 +215,15 @@ def fetch_cross_file_context(
             break
         for item in items:
             p = item.get("path")
-            if p and p not in exclude_paths and p not in paths:
+            # Tracer scope: Python callers only. Also cuts injection/noise
+            # surface — a README or docs file mentioning the symbol is
+            # attacker-influenceable prose, not a caller (codex round 5).
+            if (
+                p
+                and p.endswith(".py")
+                and p not in exclude_paths
+                and p not in paths
+            ):
                 paths.append(p)
         if len(paths) >= _MAX_FILES:
             break
