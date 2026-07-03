@@ -84,6 +84,45 @@ _STOP_NAMES = frozenset({
 
 _PY_LINE_DEF = re.compile(r"^\s*(?:async\s+)?def\s+([A-Za-z_]\w*)\s*\(")
 
+# Snippet bounds (codex round 7, PR #480): ship only windows AROUND the
+# symbol matches, never the whole unchanged file - less data leaves the
+# boundary and the prompt stays cheap. Line numbers are ORIGINAL (the
+# caller-not-updated rule cites caller path:line).
+_SNIPPET_RADIUS = 10
+_MAX_SNIPPET_WINDOWS = 3
+_MAX_SNIPPET_LINES = 80
+
+
+def _symbol_snippet(content: str, symbols: tuple[str, ...]) -> str | None:
+    """Bounded, original-line-numbered windows of `content` around lines
+    mentioning any of `symbols`. None when no symbol appears (a search
+    false-hit - drop the file rather than ship unrelated code). Pure."""
+    lines = content.splitlines()
+    hits = [i for i, ln in enumerate(lines) if any(s in ln for s in symbols)]
+    if not hits:
+        return None
+    windows: list[tuple[int, int]] = []
+    for i in hits:
+        lo = max(0, i - _SNIPPET_RADIUS)
+        hi = min(len(lines), i + _SNIPPET_RADIUS + 1)
+        if windows and lo <= windows[-1][1]:
+            windows[-1] = (windows[-1][0], max(hi, windows[-1][1]))
+        elif len(windows) < _MAX_SNIPPET_WINDOWS:
+            windows.append((lo, hi))
+        else:
+            break
+    out: list[str] = []
+    total = 0
+    for lo, hi in windows:
+        if out:
+            out.append("...")
+        for j in range(lo, hi):
+            if total >= _MAX_SNIPPET_LINES:
+                break
+            out.append(f"{j + 1}: {lines[j]}")
+            total += 1
+    return "\n".join(out)
+
 
 def _enclosing_def_from_content(content: str, first_added_line: int) -> str | None:
     """Nearest `def` at or above `first_added_line` (1-based) in the full
@@ -258,7 +297,20 @@ def fetch_cross_file_context(
                     extra={"stage": "size", "path": path, "bytes": len(resp.content)},
                 )
                 continue
-            contents[path] = resp.text
+            # Ship SNIPPETS around the symbol matches, not the whole file
+            # (codex round 7): bounds what leaves the boundary + the
+            # prompt cost. Original line numbers preserved so the
+            # caller-not-updated rule can cite caller path:line. A file
+            # where no symbol actually appears (search false-hit) is
+            # dropped entirely.
+            snippet = _symbol_snippet(resp.text, symbols)
+            if snippet is None:
+                log.info(
+                    "cross_file_context_degraded",
+                    extra={"stage": "no_symbol_match", "path": path},
+                )
+                continue
+            contents[path] = snippet
         except (httpx.HTTPStatusError, httpx.RequestError) as e:
             # Same per-file degrade contract as #336's _fetch_file_contents:
             # skip this file, keep the rest.

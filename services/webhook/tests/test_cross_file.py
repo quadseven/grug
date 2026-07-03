@@ -124,7 +124,7 @@ def test_fetch_cross_file_context_partial_on_content_error():
         calls["n"] += 1
         if calls["n"] == 1:
             raise httpx.ConnectTimeout("blip", request=None)
-        return _raw_response("content-b")
+        return _raw_response("value = sym(1)  # mentions the symbol")
 
     with patch.object(cross_file.httpx, "get", side_effect=fake_get):
         out = cross_file.fetch_cross_file_context(
@@ -172,12 +172,13 @@ def test_build_messages_renders_cross_file_block():
         [Hunk(path="src/api.py", body="+def f(x, *, t):")],
         "v1",
         None,
-        {"src/caller.py": "def g():\n    f(1)\n"},
+        {"src/caller.py": "1: def g():\n2:     f(1)"},
     )
     user = msgs[1]["content"]
     assert "src/caller.py (UNCHANGED — cross-file context)" in user
     assert "do not flag lines in it" in user
     assert "1: def g():" in user
+    assert "SNIPPETS (original line numbers)" in user
 
 
 def test_build_messages_byte_identical_when_no_cross_file():
@@ -516,3 +517,35 @@ def test_extract_symbols_handles_async_defs():
     assert "process" in cross_file.extract_symbols(
         parse_diff(body_only), {"src/d.py": full},
     )
+
+
+def test_fetched_context_is_snippets_not_whole_files():
+    """Codex round 7 (PR #480): only bounded windows around symbol
+    matches leave the boundary - never the whole unchanged file - with
+    ORIGINAL line numbers preserved; a search false-hit (file without the
+    symbol) is dropped entirely."""
+    big = "\n".join(
+        [f"filler_{i} = {i}" for i in range(200)]
+        + ["def caller():", "    fetch_user(1)"]
+        + [f"tail_{i} = {i}" for i in range(200)]
+    )
+
+    def fake_get(url, **kw):
+        if "/search/code" in url:
+            return _search_response(["src/caller.py", "src/false_hit.py"])
+        if "false_hit" in url:
+            return _raw_response("no relevant symbol here\n" * 50)
+        return _raw_response(big)
+
+    with patch.object(cross_file.httpx, "get", side_effect=fake_get):
+        out = cross_file.fetch_cross_file_context(
+            "tok", "o", "r", ("fetch_user",),
+            head_sha="abc", exclude_paths=frozenset(),
+        )
+    assert list(out) == ["src/caller.py"]  # false-hit dropped
+    snippet = out["src/caller.py"]
+    # Original line number of the match (202) survives; the 400+ filler
+    # lines do not.
+    assert "202: " in snippet
+    assert len(snippet.splitlines()) <= cross_file._MAX_SNIPPET_LINES + cross_file._MAX_SNIPPET_WINDOWS
+    assert "filler_0 = 0" not in snippet
