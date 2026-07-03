@@ -171,3 +171,11 @@ def test_subprocess_no_timeout_rule_present():
     provider hangs the whole chain (claude-stuff #356, #368)."""
     assert any(r.name == "subprocess-no-timeout" for r in crp.RULES)
     assert "subprocess-no-timeout" in crp.build_system_prompt()
+
+
+def test_tls_verification_disabled_rule_present():
+    """Weekly harvest: disabling TLS/cert verification (CERT_NONE / verify=False
+    / rejectUnauthorized:false / InsecureSkipVerify) sends credentials over a
+    MITM-able link — pin the CA instead (infrastructure #1390/#1391)."""
+    assert any(r.name == "tls-verification-disabled" for r in crp.RULES)
+    assert "tls-verification-disabled" in crp.build_system_prompt()
