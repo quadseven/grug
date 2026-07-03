@@ -124,18 +124,10 @@ def test_toy_persona_missing_module_is_isolated(monkeypatch):
     """dispatch_module is a string resolved at dispatch time - a typo'd
     or missing module must degrade to unhandled_error for that persona
     only (the import failure happens inside the per-persona guard)."""
-    spec = persona_registry.PersonaSpec(
-        key="toy",
-        canonical="toy",
-        check_run_name="Grug - Toy",
-        enabled_flag="toy_enabled",
-        enabled_default=True,
-        blocking_flag=None,
-        blocking_default=False,
-        dispatch_style="inline",
-        missing_repo_policy="enabled",
-        events=("pull_request",),
-        dispatch_module="module_that_does_not_exist_465",
+    import dataclasses
+
+    spec = dataclasses.replace(
+        _toy_spec(), dispatch_module="module_that_does_not_exist_465",
     )
     extended = persona_registry.REGISTRY + (spec,)
 
@@ -157,21 +149,11 @@ def test_toy_persona_missing_repo_policy_disabled_skips(monkeypatch):
     """missing_repo_policy is registry data, not dispatcher folklore: a
     `disabled` toy persona must be skipped when the payload lacks
     repository.id, without is_persona_enabled ever being called for it."""
+    import dataclasses
+
     seen: list = []
     monkeypatch.setitem(sys.modules, "toy_webhook_dispatch", _toy_module(seen))
-    spec = persona_registry.PersonaSpec(
-        key="toy",
-        canonical="toy",
-        check_run_name="Grug - Toy",
-        enabled_flag="toy_enabled",
-        enabled_default=True,
-        blocking_flag=None,
-        blocking_default=False,
-        dispatch_style="inline",
-        missing_repo_policy="disabled",
-        events=("pull_request",),
-        dispatch_module="toy_webhook_dispatch",
-    )
+    spec = dataclasses.replace(_toy_spec(), missing_repo_policy="disabled")
     payload = _full_pr_payload()
     payload["repository"].pop("id", None)
     extended = persona_registry.REGISTRY + (spec,)

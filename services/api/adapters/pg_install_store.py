@@ -213,17 +213,13 @@ def list_user_installations(github_user_id: str) -> list[dict[str, Any]]:
 
 
 def get_repo_config(install_id: int, repo_id: int) -> dict[str, Any]:
-    item = _get_item(_inst_pk(install_id), _repo_sk(repo_id))
-    if not item:
-        return {
-            **_DEFAULT_PERSONA_CONFIG,
-            "enforcement_ruleset_id": None,
-            "force_disable_enforcement": False,
-        }
+    # A missing row and an empty row are the same shape: every field
+    # falls through to its default below (no separate early-return to
+    # keep in sync). Persona flags derive from _DEFAULT_PERSONA_CONFIG's
+    # keys (#465, ADR-0010): adding a persona's flags to the default
+    # dict makes them flow through this read path with no edit here.
+    item = _get_item(_inst_pk(install_id), _repo_sk(repo_id)) or {}
     rid = item.get("enforcement_ruleset_id")
-    # Persona flags derived from _DEFAULT_PERSONA_CONFIG's keys (#465,
-    # ADR-0010): adding a persona's flags to the default dict makes them
-    # flow through this read path with no further edit here.
     cfg: dict[str, Any] = {
         flag: bool(item.get(flag, default))
         for flag, default in _DEFAULT_PERSONA_CONFIG.items()
