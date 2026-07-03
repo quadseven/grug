@@ -33,6 +33,7 @@ class _MonitorBundle:
     poller_cronjob: datadog.Monitor
     sig_verify_fail: datadog.Monitor
     elder_offload_fail: datadog.Monitor
+    persona_dispatch_unhandled: datadog.Monitor
     elder_llm_degraded: datadog.Monitor
     enforcement_gap: datadog.Monitor
     cf_secret_mismatch: datadog.Monitor
@@ -299,6 +300,40 @@ def create_all(
         opts=opts,
     )
 
+    # 3c) Registry dispatch loop unhandled persona failure (#465, ADR-0010).
+    #     The per-persona isolation guard 200s an INLINE persona's failure
+    #     (Chief - a retry would duplicate its publish), so this log-line
+    #     is the primary signal for a broken inline persona module (bad
+    #     deploy, import failure, escaped exception). An ASYNC persona's
+    #     handoff failure (Elder) is re-raised instead and 500s (covered by
+    #     the workload / uptime monitors), but it ALSO logs this event, so
+    #     alerting on any occurrence catches both classes.
+    persona_dispatch_unhandled = datadog.Monitor(
+        "grug-webhook-persona-dispatch-unhandled",
+        type="log alert",
+        name="[grug-webhook] Persona dispatch unhandled failure > 0 (15min)",
+        message=(
+            f"{notify_handle}\n"
+            "A persona blew through its webhook dispatch entry - the "
+            "delivery was ACKed 200 with result=unhandled_error, so GitHub "
+            "and the replay sweep both consider it delivered (ADR-0010 "
+            "replay-invisibility trade). The log carries persona, "
+            "delivery_id, head_sha and kind. If it is Elder, the review "
+            "was dropped and re-triggers on the next push; if it is Chief, "
+            "the DoR check-run never posted and the PR may sit ungated.\n"
+            "Runbook: docs/RUNBOOK.md#elder-async-offload"
+        ),
+        query=(
+            f'logs("service:grug-webhook env:{env} '
+            'persona_dispatch_unhandled").index("*")'
+            '.rollup("count").last("15m") > 0'
+        ),
+        tags=_common_tags(env, "grug-webhook"),
+        notify_no_data=False,
+        priority=2,
+        opts=opts,
+    )
+
     # 3b) Elder fallback FAILED — a review was dropped and the owned backstop
     #     did not save it. Post-cutover semantics (2026-06-10, the cave
     #     fallback is LIVE — #310/#316/#313, flag ON, E2E verified on
@@ -477,6 +512,7 @@ def create_all(
         poller_cronjob=poller_cronjob,
         sig_verify_fail=sig_verify_fail,
         elder_offload_fail=elder_offload_fail,
+        persona_dispatch_unhandled=persona_dispatch_unhandled,
         elder_llm_degraded=elder_llm_degraded,
         enforcement_gap=enforcement_gap,
         cf_secret_mismatch=cf_secret_mismatch,

@@ -1,9 +1,12 @@
 """Webhook → persona dispatch.
 
-Routes GitHub events to active personas. v1 handles:
+Routes GitHub events to active personas. Handles:
   - installation / installation_repositories: record + delete INST# rows
-  - pull_request: TPM persona (gated on installer allowlist)
-  - pull_request_review: placeholder for v1.5 code-reviewer persona
+  - pull_request: iterates the persona registry (ADR-0010) — every
+    registered persona whose `events` include pull_request dispatches
+    through the uniform `dispatch_pull_request(ctx)` seam
+  - issue_comment: the `/grug recheck` slash command
+  - repository_ruleset: enforcement self-healing
 
 Allowlist gate (Slice 5 #26): non-allowlisted installs no_op silently
 BEFORE persona work runs. Defense-in-depth — App registration is
@@ -12,6 +15,8 @@ public but webhook never acts on PRs from non-allowlisted users.
 
 from __future__ import annotations
 
+import copy
+import importlib
 import logging
 from typing import Any
 
@@ -23,6 +28,7 @@ from adapters.install_store import (
     is_persona_enabled,
     record_installation,
 )
+from personas import registry as persona_registry
 
 log = logging.getLogger("grug.webhook.dispatcher")
 
@@ -45,8 +51,6 @@ def dispatch(
         return {"status": "no_op", "reason": "installation_repositories acknowledged"}
     if event_name == "pull_request":
         return _handle_pull_request(payload, delivery_id=delivery_id)
-    if event_name == "pull_request_review":
-        return {"status": "no_op", "reason": "no persona for pull_request_review yet"}
     if event_name == "issue_comment":
         return _handle_issue_comment(payload)
     if event_name == "repository_ruleset":
@@ -262,169 +266,130 @@ def _handle_pull_request(
         return {"status": "no_op", "reason": "installer not allowlisted"}
 
     # `get_repo_config` is already imported at module scope (top of file);
-    # the former function-local re-import here shadowed it, silently
-    # defeating `patch("dispatcher.get_repo_config")` in tests — removed
-    # (#272). `httpx` is no longer used in this handler now that the Elder
-    # branch enqueues instead of running inline (TPM imports its own).
+    # a function-local re-import would shadow it and silently defeat
+    # `patch("dispatcher.get_repo_config")` in tests (#272).
     repo_id = repo.get("id")
 
-    # Both TPM and Elder dispatch from this handler on the same event,
-    # producing INDEPENDENT verdicts. Each persona's exceptions are
-    # caught locally so a transient GH 5xx on one doesn't 500 the
-    # webhook or starve the other.
+    # Registry dispatch loop (ADR-0010): every registered persona whose
+    # events include pull_request dispatches from this handler on the
+    # same event, producing INDEPENDENT verdicts. Registry order is
+    # dispatch order (TPM first, Elder second). Each persona call is
+    # isolated in its own try/except so a bug or import failure in one
+    # doesn't 500 the webhook or starve the others (#185).
     results: list[dict[str, str]] = []
+    # An UNEXPECTED exception escaping an ASYNC persona's dispatch is a
+    # HANDOFF failure (the review was never durably enqueued) - unlike an
+    # inline persona's publish, swallowing it into a 200 drops the review
+    # with no GitHub redelivery (codex peer-review HIGH, PR #477). We run
+    # every persona for isolation, then re-raise the first async-handoff
+    # error AFTER the loop so the delivery is non-2xx and GitHub retries.
+    async_handoff_error: Exception | None = None
+    for spec in persona_registry.REGISTRY:
+        if "pull_request" not in spec.events:
+            continue
 
-    tpm_enabled = (
-        repo_id is None
-        or is_persona_enabled(int(installation_id), int(repo_id), "tpm")
-    )
-    if tpm_enabled:
-        results.append(_dispatch_tpm(
-            installation_id=int(installation_id),
-            owner=owner, repo_name=repo_name,
-            head_sha=head_sha, pr_number=int(pr_number),
-            pr_body=pr_body,
-        ))
-    else:
-        log.info(
-            "persona_disabled_skip",
-            extra={
-                "installation_id": installation_id,
-                "owner": owner, "repo": repo_name, "pr_number": pr_number,
-                "persona": "tpm",
-            },
-        )
-
-    code_reviewer_enabled = (
-        repo_id is not None
-        and is_persona_enabled(
-            int(installation_id), int(repo_id), "code_reviewer",
-        )
-    )
-    if code_reviewer_enabled:
-        # `code_reviewer_blocking` defaults False; operator flips via
-        # dashboard once LLM-finding trust is established. Advisory-
-        # first prevents false-positives from blocking velocity.
-        #
-        # Elder makes 1–2 LLM calls (worst case ~300s) — far over
-        # GitHub's ~10s delivery timeout — so it is OFFLOADED off the
-        # ACK path (#272): enqueue the review (on k8s, a background
-        # thread — #368) and return `queued` immediately. TPM (fast, no
-        # LLM) already ran inline above. Idempotency keys on `delivery_id`
-        # inside the worker. Enqueue failure does NOT fall back to a sync
-        # run — that would re-block the ACK; a dropped review re-triggers
-        # on next push.
-        cfg = get_repo_config(int(installation_id), int(repo_id))
-        from async_dispatch import enqueue_elder_review  # lazy import keeps cold-start cheap
-        enqueued = enqueue_elder_review(
-            payload=payload,
-            delivery_id=delivery_id,
-            blocking=bool(cfg.get("code_reviewer_blocking", False)),
-        )
-        if not enqueued:
-            log.error(
-                "elder_enqueue_failed",
+        if repo_id is None:
+            # Rare payload-shape glitch: no repository.id. What that
+            # means is the persona's own declared policy (Chief: run
+            # anyway — a missing id must not skip DoR; Elder: skip —
+            # never run an LLM review blind).
+            enabled = spec.missing_repo_policy == "enabled"
+        else:
+            enabled = is_persona_enabled(
+                int(installation_id), int(repo_id), spec.key,
+            )
+        if not enabled:
+            # Distinguishable from "persona ran and found nothing."
+            log.info(
+                "persona_disabled_skip",
                 extra={
                     "installation_id": installation_id,
                     "owner": owner, "repo": repo_name, "pr_number": pr_number,
-                    "delivery_id": delivery_id,
+                    "persona": spec.key,
+                    "reason": "no_repo_id" if repo_id is None else "toggle_off",
                 },
             )
-        results.append({
-            "persona": "code_reviewer",
-            "result": "queued" if enqueued else "enqueue_failed",
-        })
-    else:
-        # Either explicitly disabled per-repo OR `repo_id is None`
-        # (rare payload-shape glitch). Both produce a `disabled_skip`
-        # log so the operator can tell the difference from "Elder ran
-        # and found nothing." TPM treats missing repo_id as enabled by
-        # legacy — the asymmetry is deliberate: Elder requires repo_id
-        # to call is_persona_enabled, so a missing one is treated as
-        # opt-out rather than blanket-enabled.
-        log.info(
-            "persona_disabled_skip",
-            extra={
-                "installation_id": installation_id,
-                "owner": owner, "repo": repo_name, "pr_number": pr_number,
-                "persona": "code_reviewer",
-                "reason": "no_repo_id" if repo_id is None else "toggle_off",
-            },
+            continue
+
+        # Future-persona edge (unreachable with today's registry): a
+        # persona with missing_repo_policy="enabled" AND a blocking_flag
+        # dispatches with blocking_default on a missing repo_id - the
+        # cfg read below needs the id. Deliberate, not an oversight.
+        blocking = spec.blocking_default
+        if spec.blocking_flag is not None and repo_id is not None:
+            # One config read, only for personas with a blocking mode —
+            # same store call pattern as the hand-wired era (zero reads
+            # for TPM, one for an enabled Elder).
+            cfg = get_repo_config(int(installation_id), int(repo_id))
+            blocking = bool(cfg.get(spec.blocking_flag, spec.blocking_default))
+
+        # Each persona gets its OWN deep copy of the payload (audit #477
+        # H2 / codex peer-review): the isolation guarantee is structural,
+        # not by-convention, so a future persona that mutates ctx.payload
+        # (normalize/redact/pop) cannot corrupt what later personas - or
+        # Elder's async enqueue - receive. N deep copies of one webhook
+        # payload on the ACK path is negligible vs the LLM enqueue it
+        # already does; correctness over the micro-cost.
+        ctx = persona_registry.PullRequestContext(
+            installation_id=int(installation_id),
+            owner=owner,
+            repo_name=repo_name,
+            head_sha=head_sha,
+            pr_number=int(pr_number),
+            pr_body=pr_body,
+            payload=copy.deepcopy(payload),
+            delivery_id=delivery_id,
+            blocking=blocking,
         )
+        try:
+            module = importlib.import_module(spec.dispatch_module)
+            results.append(module.dispatch_pull_request(ctx))
+        except Exception as e:  # noqa: BLE001 - per-persona isolation guard
+            # Isolate so one persona's failure never starves the others
+            # (#185). delivery_id + kind keep the log correlatable to the
+            # GitHub delivery GUID. For an INLINE persona this 200s (a
+            # retry would duplicate its already-done publish); for an
+            # ASYNC persona it is a dropped handoff and we re-raise below.
+            log.error(
+                "persona_dispatch_unhandled",
+                extra={
+                    "installation_id": installation_id,
+                    "owner": owner, "repo": repo_name, "pr_number": pr_number,
+                    "persona": spec.key,
+                    "delivery_id": delivery_id,
+                    "head_sha": head_sha[:8],
+                    "kind": type(e).__name__,
+                    "dispatch_style": spec.dispatch_style,
+                },
+                exc_info=True,
+            )
+            results.append({"persona": spec.key, "result": "unhandled_error"})
+            if spec.dispatch_style == "async" and async_handoff_error is None:
+                async_handoff_error = e
+
+    if async_handoff_error is not None:
+        # Re-raise so the webhook returns non-2xx and GitHub redelivers
+        # the event - the durable retry the async handoff needs. Inline
+        # personas already ran; their publishes are idempotent per
+        # head_sha on redelivery (parity with the pre-registry behavior,
+        # where an Elder enqueue exception 500ed after TPM published).
+        # NOTE: the EXPECTED enqueue-returns-False path does NOT raise -
+        # it returns `enqueue_failed` and 200s, preserving the deliberate
+        # #272 "drop + re-trigger on next push" contract.
+        raise async_handoff_error
 
     if not results:
         return {"status": "no_op", "reason": "all personas disabled"}
     return {"status": "dispatched", "personas": results}
 
 
-def _dispatch_tpm(
-    *, installation_id: int, owner: str, repo_name: str, head_sha: str,
-    pr_number: int, pr_body: str,
-) -> dict[str, str]:
-    """TPM persona dispatch — pure evaluate + publish. Catches BOTH
-    evaluate-time and publish-time exceptions locally so the Elder
-    dispatch (which runs after this) can still execute. Without the
-    broad final-guard, a future bug in `evaluate_pull_request` or an
-    import-time failure of personas.tpm would propagate, skipping
-    Elder entirely and violating the independence acceptance criterion.
-    """
-    import httpx  # type: ignore
-    try:
-        from personas.tpm.persona import (  # type: ignore
-            evaluate_pull_request, publish_tpm_evaluation,
-        )
-        evaluation = evaluate_pull_request(pr_body)
-        publish_tpm_evaluation(
-            evaluation,
-            installation_id=installation_id,
-            owner=owner,
-            repo=repo_name,
-            head_sha=head_sha,
-            pr_number=pr_number,
-        )
-        return {
-            "persona": "tpm",
-            "result": "pass" if evaluation.passed else "fail",
-        }
-    except (httpx.HTTPStatusError, httpx.RequestError) as e:
-        log.error(
-            "tpm_publish_failed",
-            extra={
-                "installation_id": installation_id,
-                "owner": owner,
-                "repo": repo_name,
-                "pr_number": pr_number,
-                "head_sha": head_sha[:8],
-                "kind": type(e).__name__,
-                "status": getattr(getattr(e, "response", None), "status_code", None),
-            },
-        )
-        return {"persona": "tpm", "result": "publish_failed"}
-    except Exception as e:  # noqa: BLE001 — final guard
-        # Broad catch mirrors the async Elder worker's final-guard
-        # pattern (async_dispatch.run_elder_job). Without it, an
-        # unexpected exception in
-        # evaluate_pull_request (or its import) would propagate up and
-        # skip Elder entirely, violating the independence criterion.
-        # exc_info=True carries the traceback to DD/Sentry.
-        log.error(
-            "tpm_dispatch_unhandled",
-            extra={
-                "installation_id": installation_id,
-                "owner": owner, "repo": repo_name, "pr_number": pr_number,
-                "kind": type(e).__name__,
-            },
-            exc_info=True,
-        )
-        return {"persona": "tpm", "result": "unhandled_error"}
-
-
-# NOTE (#272): the former `_dispatch_code_reviewer` wrapper was removed —
-# Elder no longer runs synchronously in this handler. The Elder review is
-# enqueued via `async_dispatch.enqueue_elder_review` (see the
-# `code_reviewer_enabled` branch above) and executed off the ACK path by
-# `async_dispatch.run_elder_job`, which calls `dispatch_code_review`
-# directly with its own broad final-guard.
+# NOTE (#465, ADR-0010): the former `_dispatch_tpm` body lives in
+# `personas/tpm/webhook_dispatch.py`, and the former Elder enqueue block
+# in `personas/code_reviewer/webhook_dispatch.py` — the registry loop
+# above resolves each persona's module from its PersonaSpec. The Elder
+# review itself still executes off the ACK path via
+# `async_dispatch.run_elder_job` (#272), which calls
+# `dispatch_code_review` directly with its own broad final-guard.
 
 
 # Closes #2 — `/grug recheck` slash command. PR comments containing
