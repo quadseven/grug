@@ -49,11 +49,13 @@ def test_only_elder_has_a_blocking_flag():
     assert registry.by_key("code_reviewer").blocking_flag == "code_reviewer_blocking"
 
 
-def test_every_spec_declares_pull_request_event():
-    # Both live personas dispatch from the pull_request handler; the
-    # events field is what the dispatcher loop filters on (ADR-0010).
-    for p in registry.REGISTRY:
-        assert "pull_request" in p.events
+def test_live_personas_declare_pull_request_event():
+    # Pin the two live personas' events per-key (NOT a for-all-specs
+    # assertion - a future issue_comment-only persona like Pulse #472
+    # must be registrable without failing this lock). The events field
+    # is what the dispatcher loop filters on (ADR-0010).
+    assert registry.by_key("tpm").events == ("pull_request",)
+    assert registry.by_key("code_reviewer").events == ("pull_request",)
 
 
 def test_spec_rejects_nonconvention_enabled_flag():
