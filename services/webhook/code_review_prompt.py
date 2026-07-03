@@ -366,6 +366,23 @@ RULES: tuple[ReviewRule, ...] = (
         "if time.monotonic() - _last < WINDOW: return",
         severity="medium",
     ),
+    # ── weekly harvest: disabled-TLS-verification class (infrastructure #1390/#1391) ──
+    ReviewRule(
+        name="tls-verification-disabled",
+        bug_class="security",
+        description="TLS/certificate verification turned OFF on an outbound "
+        "connection: `verify=False` (requests/httpx), `ssl.CERT_NONE` "
+        "(ssl/urllib), `rejectUnauthorized: false` (Node), or "
+        "`InsecureSkipVerify: true` (Go). Any API key / token / data then "
+        "rides a link a MITM can read or forge. A self-signed peer is NOT an "
+        "excuse — pin its CA instead. Do NOT flag `check_hostname=False` while "
+        "`verify_mode` stays `CERT_REQUIRED` against a pinned CA — that is the "
+        "legitimate connect-by-IP-with-pinned-cert pattern, not disabled "
+        "verification.",
+        bad_example="ctx.verify_mode = ssl.CERT_NONE  # sends X-API-KEY to any peer",
+        good_example="ctx = ssl.create_default_context(cafile=pinned_ca)  # CERT_REQUIRED",
+        severity="high",
+    ),
 )
 
 
