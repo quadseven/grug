@@ -5,8 +5,7 @@
 """Re-run consumer (#305, ADR-0004) — grug's backfill for a dropped/`errored`
 review.
 
-`lambda_handler.handler` routes the `grug-rerun-jobs` SQS event-source mapping
-here (discriminated from `grug-cave-results` by queue ARN). For each job the
+`consumer.py` long-polls `grug-rerun-jobs.fifo` and routes each batch here. For each job the
 consumer fetches the PR's **current** head + diff and re-runs the named persona
 via the unchanged `dispatch_code_review`, which posts the check-run and upserts
 the `CheckVerdictRecord` — healing the `errored` row in place if the head is

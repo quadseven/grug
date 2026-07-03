@@ -1,6 +1,6 @@
 # WEBHOOK-ONLY (NOT mirrored): Elder async-offload + its async-job routing.
 # The api service has no webhook ACK path, so there is no api sibling — like
-# dispatcher.py / main.py / lambda_handler.py. Per ADR-0001, only modules BOTH
+# dispatcher.py / main.py / consumer.py. Per ADR-0001, only modules BOTH
 # services run are mirrored.
 """Async offload of the Elder LLM review off the webhook ACK path (#272).
 
@@ -19,9 +19,8 @@ the in-flight review, the same best-effort contract Lambda's async invoke
 had (a dropped review re-triggers on the next push). See `specs/DESIGN.md`
 → "Async Elder offload (#272)".
 
-Routing: a self-invoked async job is still tagged with the `grug_async_job`
-sentinel so `lambda_handler.handler` (reused as the SQS event router by
-consumer.py) can dispatch raw async events to `run_elder_job`.
+Routing: an async job is tagged with the `grug_async_job` sentinel so a
+router can dispatch raw async events to `run_elder_job`.
 """
 
 from __future__ import annotations
@@ -33,9 +32,9 @@ from typing import Any
 
 log = logging.getLogger(f"{os.getenv('DD_SERVICE', 'grug')}.async_dispatch")
 
-# Sentinel marking an async job. `lambda_handler.handler` routes on
-# `event.get("grug_async_job")` truthiness; the value names the job kind so a
-# future second async job type can fan out from one router.
+# Sentinel marking an async job. Routing keys on `event.get("grug_async_job")`
+# truthiness; the value names the job kind so a future second async job type
+# can fan out from one router.
 ASYNC_JOB_KEY = "grug_async_job"
 ELDER_REVIEW_JOB = "elder_review"
 

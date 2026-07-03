@@ -10,7 +10,7 @@ doc covers running it yourself.
   once for Pulumi bootstrap; Pulumi-provisioned OIDC role takes over after)
 - Cloudflare account (for proxied DNS + Workers + Pages)
 - Pulumi Cloud account (free tier OK; alternative is self-managed S3
-  backend — see `infra/pulumi/README.md` for the migration recipe)
+  backend — see `infra/pulumi/__main__.py` + `docs/NETWORK-TOPOLOGY.md` for the layout)
 - Datadog account (free tier OK; or skip the dd_monitors component
   entirely by removing it from `infra/pulumi/__main__.py`)
 - A registered GitHub App (you create this once via UI)

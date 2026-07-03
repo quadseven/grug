@@ -1,7 +1,7 @@
 """Scheduled reaction-poll entry point (#247b).
 
 The `grug-poller` Kubernetes CronJob invokes this every ~15 min (NOT the
-webhook HTTP path — there's no FastAPI/Mangum, no signature check; it runs
+webhook HTTP path — there's no FastAPI, no signature check; it runs
 as a batch job). Per allowlisted install it polls 👍/👎 reactions on Grug
 review comments and submits `human_verdict` DD LLM Obs evals — the human
 ground-truth that calibrates the LLM judge.
