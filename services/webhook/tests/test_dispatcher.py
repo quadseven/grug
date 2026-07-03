@@ -194,7 +194,8 @@ def test_pull_request_tpm_failure_does_not_skip_elder_enqueue():
 def test_pull_request_tpm_evaluator_exception_does_not_skip_elder_enqueue():
     """An unhandled exception in `evaluate_pull_request` (TPM evaluator
     bug) must not propagate up `_handle_pull_request` and skip the Elder
-    enqueue. The broad final guard in _dispatch_tpm catches it."""
+    enqueue. The broad final guard in personas/tpm/webhook_dispatch.py
+    catches it (moved from the old dispatcher._dispatch_tpm, #465)."""
     with patch("dispatcher.is_install_allowlisted", return_value=True), \
          patch("dispatcher.is_persona_enabled", return_value=True), \
          patch("dispatcher.get_repo_config", return_value={"code_reviewer_blocking": False}), \
