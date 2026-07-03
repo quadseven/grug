@@ -87,11 +87,13 @@ class PullRequestContext:
     async worker); `blocking` is the persona's own blocking flag resolved
     from RepoConfig (always False for personas with no `blocking_flag`).
 
-    CONTRACT: `payload` is the SAME dict object for every persona in the
-    dispatch loop - personas MUST treat it as read-only. A persona that
-    mutates it corrupts what later personas (and Elder's async worker)
-    receive, ordering-dependently (audit #477 H2). Locked by
-    test_dispatch_leaves_payload_unmutated."""
+    ISOLATION: the dispatch loop hands each persona its OWN deep copy of
+    `payload` (audit #477 H2 / codex peer-review), so a persona that
+    mutates `ctx.payload` cannot corrupt what later personas - or Elder's
+    async enqueue - receive. The guarantee is structural, not by
+    convention; still, personas SHOULD treat it as read-only. Locked by
+    test_dispatch_leaves_payload_unmutated +
+    test_mutating_persona_cannot_corrupt_later_personas."""
 
     installation_id: int
     owner: str
