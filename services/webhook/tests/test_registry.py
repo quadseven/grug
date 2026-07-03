@@ -47,3 +47,24 @@ def test_dispatch_styles():
 def test_only_elder_has_a_blocking_flag():
     assert registry.by_key("tpm").blocking_flag is None
     assert registry.by_key("code_reviewer").blocking_flag == "code_reviewer_blocking"
+
+
+def test_every_spec_declares_pull_request_event():
+    # Both live personas dispatch from the pull_request handler; the
+    # events field is what the dispatcher loop filters on (ADR-0010).
+    for p in registry.REGISTRY:
+        assert "pull_request" in p.events
+
+
+def test_every_dispatch_module_imports_and_exposes_entrypoint():
+    """dispatch_module is a string resolved at dispatch time - a typo
+    would otherwise surface only on the first live delivery. Import each
+    registered module and check the `dispatch_pull_request(ctx)`
+    convention here instead (ADR-0010 'accepted negative')."""
+    import importlib
+
+    for p in registry.REGISTRY:
+        mod = importlib.import_module(p.dispatch_module)
+        assert callable(getattr(mod, "dispatch_pull_request", None)), (
+            f"{p.dispatch_module} must expose dispatch_pull_request(ctx)"
+        )
