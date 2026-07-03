@@ -37,8 +37,14 @@ concurrency:
 
 jobs:
   benchmark:
-    # workflow_dispatch from main only (defense in depth alongside the
-    # environment protection rule).
+    # Two gates (#453): the ref check below, AND the `benchmark` GitHub
+    # Environment this job binds to. Binding is what makes the Environment's
+    # protection rules (required reviewers / branch restriction) actually
+    # apply - without `environment:` they are never in force. Protection
+    # rules for the environment are repo config (managed via the
+    # infrastructure repo's Pulumi, not by hand); until rules are attached
+    # the binding is a no-op hook, not a gate.
+    environment: benchmark
     if: github.ref == 'refs/heads/main'
     runs-on: ubuntu-24.04-arm
     timeout-minutes: 20
