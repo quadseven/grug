@@ -399,3 +399,36 @@ def test_extract_symbols_finds_def_in_hunk_section_header():
 """
     symbols = cross_file.extract_symbols(parse_diff(diff))
     assert "refund" in symbols
+
+
+def test_extract_symbols_finds_enclosing_def_via_file_contents():
+    """Codex round 4 (PR #480): the enclosing def can sit entirely
+    OUTSIDE the diff context window (no context line, no section
+    header). With the #336 full-file content available, the extractor
+    walks up from the first added line to the nearest preceding def."""
+    # A hunk deep inside process_order: no def anywhere in the hunk body
+    # and no section header annotation.
+    diff = """diff --git a/src/orders.py b/src/orders.py
+--- a/src/orders.py
++++ b/src/orders.py
+@@ -20,3 +20,4 @@
+     total = sum(items)
++    audit(total)
+     return total
+"""
+    full_file = "\n".join(
+        ["import x"]
+        + [f"# filler {i}" for i in range(10)]
+        + ["def process_order(items):"]
+        + [f"    # body {i}" for i in range(8)]
+        + ["    total = sum(items)", "    audit(total)", "    return total"]
+    )
+    hunks = parse_diff(diff)
+    symbols = cross_file.extract_symbols(hunks, {"src/orders.py": full_file})
+    assert "process_order" in symbols
+
+
+def test_extract_symbols_without_file_contents_still_works():
+    """file_contents is optional - the pre-round-4 behavior holds."""
+    hunks = parse_diff(_DIFF_CHANGED_SIG)
+    assert cross_file.extract_symbols(hunks) == cross_file.extract_symbols(hunks, None)
