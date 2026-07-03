@@ -31,7 +31,7 @@ from botocore.config import Config
 log = logging.getLogger("grug.readiness")
 
 _TTL_SECONDS = 5.0
-# Module-level single-slot cache. Mutated under Mangum/uvicorn's effectively
+# Module-level single-slot cache. Mutated under uvicorn's effectively
 # serial probe cadence; a benign duplicate check at a TTL boundary is fine.
 _cache: dict = {"at": -1.0e9, "report": None}
 
