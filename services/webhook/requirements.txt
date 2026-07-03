@@ -6,11 +6,11 @@ boto3>=1.34,<2.0
 # image is ready when handlers expand.
 pyjwt[crypto]>=2.9,<3.0
 cryptography>=43.0,<44.0
-# Datadog APM tracer + Lambda wrapper. The DD-Extension-ARM Lambda layer
-# ships the trace agent + log forwarder; ddtrace + datadog-lambda do the
-# instrumentation + handler-wrapping in-process.
+# Datadog APM tracer (in-process instrumentation; the node-local DD agent
+# receives traces + DogStatsD). datadog-lambda removed with the k8s
+# migration - the Lambda Extension it wrapped no longer exists, and the
+# enforcement gauge now ships as a plain DogStatsD datagram.
 ddtrace>=3.5,<4
-datadog-lambda>=6.107,<7
 # Postgres store (#306 epic store port) - pool included for the
 # long-lived k8s runtime (Lambda used per-invoke connections).
 psycopg[binary,pool]>=3.2,<4.0
