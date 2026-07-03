@@ -169,7 +169,7 @@ def test_run_sample_counts_findings_on_sample_path(monkeypatch):
     from sast_benchmark import runner
 
     sample = _TP_A  # path bench/a.py
-    monkeypatch.setattr(runner, "_build_messages", lambda hunks, ver: [{"role": "user", "content": "x"}])
+    monkeypatch.setattr(runner, "_build_messages", lambda hunks, ver, *a: [{"role": "user", "content": "x"}])
     monkeypatch.setattr(runner, "_post", lambda b, m: object())
     # Two findings on this path + one on another path -> count 2.
     monkeypatch.setattr(
@@ -188,7 +188,7 @@ def test_run_sample_transport_error_returns_zero(monkeypatch):
     def _boom(b, m):
         raise RuntimeError("backend down")
 
-    monkeypatch.setattr(runner, "_build_messages", lambda hunks, ver: [{"role": "user", "content": "x"}])
+    monkeypatch.setattr(runner, "_build_messages", lambda hunks, ver, *a: [{"role": "user", "content": "x"}])
     monkeypatch.setattr(runner, "_post", _boom)
     count, errored = runner.run_sample(_bench_backend(), _TP_A)
     assert count == 0 and errored is True
@@ -197,7 +197,7 @@ def test_run_sample_transport_error_returns_zero(monkeypatch):
 def test_run_backend_maps_every_sample(monkeypatch):
     from sast_benchmark import runner
 
-    monkeypatch.setattr(runner, "_build_messages", lambda hunks, ver: [{"role": "user", "content": "x"}])
+    monkeypatch.setattr(runner, "_build_messages", lambda hunks, ver, *a: [{"role": "user", "content": "x"}])
     monkeypatch.setattr(runner, "_post", lambda b, m: object())
     monkeypatch.setattr(runner, "_parse_response", lambda resp: ([], "m", None))
     run = runner.run_backend(_bench_backend(), _SAMPLES)
@@ -214,7 +214,7 @@ def test_run_backend_all_errored_is_flagged(monkeypatch):
     def _boom(b, m):
         raise RuntimeError("backend unreachable")
 
-    monkeypatch.setattr(runner, "_build_messages", lambda hunks, ver: [{"role": "user", "content": "x"}])
+    monkeypatch.setattr(runner, "_build_messages", lambda hunks, ver, *a: [{"role": "user", "content": "x"}])
     monkeypatch.setattr(runner, "_post", _boom)
     run = runner.run_backend(_bench_backend(), _SAMPLES)
     assert run.errors == len(_SAMPLES)
