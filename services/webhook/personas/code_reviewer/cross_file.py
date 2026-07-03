@@ -131,7 +131,11 @@ def fetch_cross_file_context(
 
     paths: list[str] = []
     for sym in symbols[:_MAX_SYMBOLS]:
-        if time.monotonic() >= deadline:
+        # Clamp the per-call timeout to the REMAINING budget (codex round
+        # 2): a call started at deadline-epsilon must not block the full
+        # _SEARCH_TIMEOUT past the global cap.
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
             log.info(
                 "cross_file_context_degraded",
                 extra={"stage": "budget", "phase": "search"},
@@ -149,7 +153,7 @@ def fetch_cross_file_context(
                     "Accept": "application/vnd.github+json",
                     "X-GitHub-Api-Version": "2022-11-28",
                 },
-                timeout=_SEARCH_TIMEOUT,
+                timeout=min(_SEARCH_TIMEOUT, remaining),
             )
             resp.raise_for_status()
             items = (resp.json() or {}).get("items", [])
@@ -171,7 +175,8 @@ def fetch_cross_file_context(
 
     contents: dict[str, str] = {}
     for path in paths[:_MAX_FILES]:
-        if time.monotonic() >= deadline:
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
             log.info(
                 "cross_file_context_degraded",
                 extra={"stage": "budget", "phase": "content", "collected": len(contents)},
@@ -186,7 +191,7 @@ def fetch_cross_file_context(
                     "Accept": "application/vnd.github.raw",
                     "X-GitHub-Api-Version": "2022-11-28",
                 },
-                timeout=_SEARCH_TIMEOUT,
+                timeout=min(_SEARCH_TIMEOUT, remaining),
             )
             resp.raise_for_status()
             if len(resp.content) > _MAX_FILE_BYTES:

@@ -335,3 +335,30 @@ def test_fetch_stops_at_global_wall_clock_budget(monkeypatch):
     # instead of burning the full 10-call worst case.
     assert http_calls["n"] <= 2
     assert isinstance(out, dict)
+
+
+def test_per_call_timeout_clamped_to_remaining_budget(monkeypatch):
+    """Codex round 2 (PR #480): a request started near the deadline must
+    receive only the REMAINING budget as its timeout, never the full
+    per-call default."""
+    clock = {"t": 100.0}
+    monkeypatch.setattr(cross_file.time, "monotonic", lambda: clock["t"])
+
+    seen_timeouts: list[float] = []
+
+    def fake_get(url, **kw):
+        seen_timeouts.append(kw["timeout"])
+        clock["t"] += 6.0  # slow call: 6s of the 8s budget gone
+        if "/search/code" in url:
+            return _search_response(["src/a.py"])
+        return _raw_response("content")
+
+    with patch.object(cross_file.httpx, "get", side_effect=fake_get):
+        cross_file.fetch_cross_file_context(
+            "tok", "o", "r", ("s1", "s2"),
+            head_sha="abc", exclude_paths=frozenset(),
+        )
+    # First call gets min(10, 8) = 8; every later call gets the remaining
+    # ~2s, never the full 10s default.
+    assert seen_timeouts[0] <= cross_file._TOTAL_BUDGET_SECONDS
+    assert all(t < cross_file._SEARCH_TIMEOUT for t in seen_timeouts[1:])
