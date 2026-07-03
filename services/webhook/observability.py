@@ -16,6 +16,7 @@ import json
 import logging
 import os
 import secrets
+import socket
 import sys
 
 # Per-process random key for fingerprint(). Stable for the lifetime of a
@@ -86,18 +87,38 @@ def emit_enforcement_metric(
     *,
     persona: str = "tpm",
 ) -> None:
-    """Emit grug.enforcement.state gauge via DD Lambda Extension DogStatsD.
+    """Emit the grug.enforcement.state gauge via DogStatsD over UDP.
 
-    Tags: repo, persona, enforcement_type (grug_managed|external|none).
+    k8s emission path (grug#460): a plain DogStatsD datagram to
+    DD_AGENT_HOST:8125 - the node-local Datadog agent's hostPort, which the
+    NetworkPolicy already allows. The previous implementation called
+    datadog_lambda's lambda_metric, which only works inside the DD Lambda
+    Extension; after the Lambda-to-k8s migration every emit was silently
+    swallowed and the metric went dark.
+
+    Tags: repo, persona, enforcement_type (grug_managed|external|none), env.
     Value: 1.0 for grug_managed, 0.5 for external, 0.0 for none.
+    Never raises into the enforcement path; failures log a WARNING (not
+    debug - a silent emit path is how this metric died the first time).
     """
     value_map = {"grug_managed": 1.0, "external": 0.5, "none": 0.0}
     value = value_map.get(enforcement_type, 0.0)
-    tags = [f"repo:{repo}", f"persona:{persona}", f"enforcement_type:{enforcement_type}"]
+    env = os.getenv("DD_ENV") or os.getenv("GRUG_ENV", "prod")
+    host = os.getenv("DD_AGENT_HOST", "")
+    if not host:
+        logging.getLogger("grug.observability").warning(
+            "enforcement_metric_skipped_no_agent_host", extra={"repo": repo},
+        )
+        return
+    tags = f"repo:{repo},persona:{persona},enforcement_type:{enforcement_type},env:{env}"
+    payload = f"grug.enforcement.state:{value}|g|#{tags}".encode()
     try:
-        from datadog_lambda.metric import lambda_metric
-        lambda_metric("grug.enforcement.state", value, tags=tags)
+        sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        try:
+            sock.sendto(payload, (host, 8125))
+        finally:
+            sock.close()
     except Exception:
-        logging.getLogger("grug.observability").debug(
+        logging.getLogger("grug.observability").warning(
             "enforcement_metric_emit_failed", extra={"repo": repo},
         )

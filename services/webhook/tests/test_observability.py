@@ -101,29 +101,57 @@ def test_configure_logging_replaces_existing_handlers():
 
 # ── emit_enforcement_metric ─────────────────────────────────────────
 
-def test_emit_enforcement_metric_calls_lambda_metric():
-    from unittest.mock import patch, MagicMock
-    mock_metric = MagicMock()
-    with patch.dict("sys.modules", {"datadog_lambda": MagicMock(), "datadog_lambda.metric": MagicMock(lambda_metric=mock_metric)}):
-        with patch("observability.lambda_metric", mock_metric, create=True):
-            emit_enforcement_metric("githumps/infra", "grug_managed")
+def _sent_datagrams(monkeypatch):
+    """Route the emit's UDP socket to a capture list; returns the list."""
+    from unittest.mock import MagicMock
+    sent = []
+    sock = MagicMock()
+    sock.sendto.side_effect = lambda payload, addr: sent.append((payload, addr))
+    monkeypatch.setattr("observability.socket.socket", lambda *a, **k: sock)
+    return sent
 
 
-def test_emit_enforcement_metric_value_mapping():
-    from unittest.mock import patch, MagicMock, call
-    mock_metric = MagicMock()
-    with patch("datadog_lambda.metric.lambda_metric", mock_metric):
+def test_emit_enforcement_metric_sends_dogstatsd_datagram(monkeypatch):
+    monkeypatch.setenv("DD_AGENT_HOST", "10.0.0.99")
+    monkeypatch.setenv("GRUG_ENV", "prod")
+    monkeypatch.delenv("DD_ENV", raising=False)
+    sent = _sent_datagrams(monkeypatch)
+    emit_enforcement_metric("githumps/infra", "grug_managed")
+    assert sent == [(
+        b"grug.enforcement.state:1.0|g|#repo:githumps/infra,persona:tpm,"
+        b"enforcement_type:grug_managed,env:prod",
+        ("10.0.0.99", 8125),
+    )]
+
+
+def test_emit_enforcement_metric_value_mapping(monkeypatch):
+    monkeypatch.setenv("DD_AGENT_HOST", "10.0.0.99")
+    monkeypatch.setenv("GRUG_ENV", "prod")
+    monkeypatch.delenv("DD_ENV", raising=False)
+    sent = _sent_datagrams(monkeypatch)
+    emit_enforcement_metric("o/r", "grug_managed")
+    emit_enforcement_metric("o/r", "external")
+    emit_enforcement_metric("o/r", "none")
+    values = [p.split(b":")[1].split(b"|")[0] for p, _ in sent]
+    assert values == [b"1.0", b"0.5", b"0.0"]
+
+
+def test_emit_enforcement_metric_skips_without_agent_host(monkeypatch, caplog):
+    monkeypatch.delenv("DD_AGENT_HOST", raising=False)
+    sent = _sent_datagrams(monkeypatch)
+    with caplog.at_level("WARNING", logger="grug.observability"):
         emit_enforcement_metric("o/r", "grug_managed")
-        emit_enforcement_metric("o/r", "external")
-        emit_enforcement_metric("o/r", "none")
-
-    calls = mock_metric.call_args_list
-    assert calls[0] == call("grug.enforcement.state", 1.0, tags=["repo:o/r", "persona:tpm", "enforcement_type:grug_managed"])
-    assert calls[1] == call("grug.enforcement.state", 0.5, tags=["repo:o/r", "persona:tpm", "enforcement_type:external"])
-    assert calls[2] == call("grug.enforcement.state", 0.0, tags=["repo:o/r", "persona:tpm", "enforcement_type:none"])
+    assert sent == []
+    assert "enforcement_metric_skipped_no_agent_host" in caplog.text
 
 
-def test_emit_enforcement_metric_does_not_raise_on_import_failure():
-    from unittest.mock import patch
-    with patch("builtins.__import__", side_effect=ImportError("no datadog_lambda")):
+def test_emit_enforcement_metric_does_not_raise_on_socket_failure(monkeypatch, caplog):
+    monkeypatch.setenv("DD_AGENT_HOST", "10.0.0.99")
+
+    def _boom(*a, **k):
+        raise OSError("network unreachable")
+
+    monkeypatch.setattr("observability.socket.socket", _boom)
+    with caplog.at_level("WARNING", logger="grug.observability"):
         emit_enforcement_metric("o/r", "grug_managed")
+    assert "enforcement_metric_emit_failed" in caplog.text
