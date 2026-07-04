@@ -8,7 +8,7 @@ both see the handle as None and both construct it, leaking one. The
 (its docstring cites the same rationale): a connection pool built
 twice leaks connections and double-runs the schema bootstrap.
 
-Asserts that in every pg_base mirror:
+Asserts that in the shared pg_base module (services/_shared/, ADR-0014):
   1. `import threading` is present
   2. `<name> = threading.Lock()` is at module scope
   3. `get_pool` opens a `with <lock>:` block containing the inner
@@ -27,8 +27,7 @@ from pathlib import Path
 REPO_ROOT = Path(__file__).resolve().parents[2]
 
 POOL_PATHS: tuple[Path, ...] = (
-    REPO_ROOT / "services/api/adapters/pg_base.py",
-    REPO_ROOT / "services/webhook/adapters/pg_base.py",
+    REPO_ROOT / "services/_shared/adapters/pg_base.py",
 )
 
 

@@ -27,8 +27,6 @@ on:
       - 'services/**/crypto/**'
       - 'services/**/github_app_auth/**'
       - 'services/**/dispatcher.py'
-      - 'scripts/check-mirrored-files.sh'
-      - '.github/workflows/check.drift-lint.yml'
       - 'web/public/**'
       - 'web/index.html'
       - 'web/app.html'
@@ -232,7 +230,7 @@ jobs:
       - name: Attester · DoR-checks five canonical rules (spec 0006)
         run: python3 infra/scripts/attest_dor_checks_five_rules.py
 
-      - name: Attester · DoR-checks mirror byte-identity modulo line 1 (spec 0006)
+      - name: Attester · DoR-checks single-copy invariant (spec 0006)
         run: python3 infra/scripts/attest_dor_checks_mirror.py
 
       - name: Attester · UserIdentity frozen + no token fields (spec 0007)
@@ -244,7 +242,7 @@ jobs:
       - name: Attester · RepoConfig _DEFAULT_PERSONA_CONFIG + is_persona_enabled (spec 0009)
         run: python3 infra/scripts/attest_repo_config_default_dict.py
 
-      - name: Attester · MirrorDiscipline policy + drift-lint wiring (spec 0010)
+      - name: Attester · MirrorDiscipline Extracted-state consistency (spec 0010)
         run: python3 infra/scripts/attest_mirror_policy_consistency.py
 
       - name: Attester · DDB-handle double-checked locking (infra invariant)

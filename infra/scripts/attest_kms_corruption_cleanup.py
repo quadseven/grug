@@ -6,7 +6,7 @@ Proves the bool:
   - `credential_blob_corrupt_triggers_idempotent_cleanup_per_persistence_concepts`
   - `idempotency_check_after_corruption_empty_fallthrough_per_persistence_concepts`
 
-Asserts that `services/api/adapters/pg_user_store.py:get_user_with_tokens`
+Asserts that `services/_shared/adapters/pg_user_store.py:get_user_with_tokens`
 has the documented audit pattern: a `try/except CredentialBlobCorrupt`
 that (a) logs the failure, (b) calls `delete_user_state(...)` (the
 idempotent purge), and (c) returns `None` so callers re-route to /signin.
@@ -20,7 +20,7 @@ import sys
 from pathlib import Path
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
-USER_STORE = REPO_ROOT / "services/api/adapters/pg_user_store.py"
+USER_STORE = REPO_ROOT / "services/_shared/adapters/pg_user_store.py"
 
 
 def _find_function(tree: ast.Module, name: str) -> ast.FunctionDef | None:

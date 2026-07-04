@@ -122,7 +122,7 @@ smoke:
 docker-build-webhook:
 	docker buildx build --platform linux/arm64 \
 		--tag grug-webhook:local \
-		services/webhook
+		-f services/webhook/Dockerfile services
 
 # SAST benchmark / eval harness (#399, ADR-0006). Measures Elder's vuln
 # recall+precision per backend over the committed corpus. Makes REAL backend
@@ -133,6 +133,6 @@ docker-build-webhook:
 #   make sast-benchmark ARGS=--check   # exit 1 on regression vs baseline
 # The pure scoring core is covered by `make webhook-test` (no LLM, no keys).
 sast-benchmark:
-	cd services/webhook && uv run --with httpx --with pyjwt --with cryptography \
+	cd services/webhook && PYTHONPATH=../_shared uv run --with httpx --with pyjwt --with cryptography \
 		--with boto3 --with 'psycopg[binary,pool]' --with 'ddtrace>=3.5,<4' \
 		--with 'datadog-lambda>=6.107,<7' python -m sast_benchmark $(ARGS)

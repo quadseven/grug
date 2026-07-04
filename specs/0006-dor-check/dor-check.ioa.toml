@@ -103,7 +103,7 @@ guard = "is_false dor_checks_byte_identical_modulo_first_line_per_cross_service_
 effect = [
   { type = "set_bool", var = "dor_checks_byte_identical_modulo_first_line_per_cross_service_primitives", value = true },
 ]
-hint = "Per ADR-0001: dor_checks.py is byte-identical between services/api/ and services/webhook/ MODULO the line-1 `# MIRRORED — sibling at <path>` header (commit 641eba5), which by construction names the other sibling. Body-level drift = bug. Verified by infra/scripts/attest_dor_checks_mirror.py."
+hint = "Post-#77 (ADR-0014, supersedes the ADR-0001 mirror): dor_checks.py exists EXACTLY ONCE, at services/_shared/personas/tpm/dor_checks.py - byte-identity across services holds by construction (single copy). A stray per-service copy would SHADOW the shared one on sys.path. Verified by infra/scripts/attest_dor_checks_mirror.py (single-copy invariant)."
 
 [[action]]
 name = "Evaluate"

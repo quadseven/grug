@@ -60,12 +60,19 @@ WHITELIST_RELATIVE = (
 
 
 def _candidate_files() -> list[Path]:
+    # Post-extraction (#77/ADR-0014) the shared modules live in
+    # services/_shared/ — scanning SERVICE_DIR alone would silently
+    # shrink coverage to the service-local files only, so the shared
+    # tree is scanned too (both suites scan it; overlap is harmless).
+    shared_root = SERVICE_DIR.parent / "_shared"
     out: list[Path] = []
-    for path in SERVICE_DIR.rglob("*.py"):
-        rel = path.relative_to(SERVICE_DIR).as_posix()
-        if any(skip in rel for skip in WHITELIST_RELATIVE):
-            continue
-        out.append(path)
+    for root in (SERVICE_DIR, shared_root):
+        for path in root.rglob("*.py"):
+            rel = path.relative_to(root).as_posix()
+            if any(skip in rel for skip in WHITELIST_RELATIVE):
+                continue
+            out.append(path)
+    assert any(shared_root in p.parents for p in out), "shared root contributed no files"
     return out
 
 

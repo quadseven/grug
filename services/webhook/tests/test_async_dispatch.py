@@ -598,3 +598,97 @@ def test_run_guard_job_self_recovers_on_dispatch_error():
     assert out == {"persona": "guard", "result": "unhandled_error"}
     mock_rr.assert_called_once()
     assert mock_rr.call_args.kwargs["persona"] == "guard"
+
+
+# ── Smasher async job (#469) + generic wrapper binding (#77) ──────────
+
+
+def test_run_smasher_job_claims_namespaced_delivery_and_binds_smasher_row():
+    """The generic _run_job serves three personas off one spec table (#77);
+    this pins the SMASHER wrapper's row binding - a copy-paste of another
+    persona's row would claim the wrong namespace and run the wrong
+    dispatch while every other test stays green (audit stage 7)."""
+    claimed: list = []
+    with (
+        patch(
+            "adapters.install_store.claim_delivery",
+            side_effect=lambda d: claimed.append(d) or True,
+        ),
+        patch(
+            "personas.smasher.dispatch.dispatch_smasher_review",
+            return_value={"persona": "smasher", "result": "pass"},
+        ) as mock_d,
+    ):
+        out = ad.run_smasher_job(_JOB)
+    assert claimed == [f"{_JOB['delivery_id']}:smasher"]
+    mock_d.assert_called_once()
+    assert out == {"persona": "smasher", "result": "pass"}
+
+
+def test_run_smasher_job_self_recovers_with_smasher_persona():
+    with (
+        patch("adapters.install_store.claim_delivery", return_value=True),
+        patch("adapters.install_store.claim_review", return_value=True),
+        patch(
+            "personas.smasher.dispatch.dispatch_smasher_review",
+            side_effect=RuntimeError("boom"),
+        ),
+        patch("rerun.enqueue_rerun") as mock_rr,
+    ):
+        out = ad.run_smasher_job({**_FULL_JOB, ad.ASYNC_JOB_KEY: ad.SMASHER_REVIEW_JOB})
+    assert out == {"persona": "smasher", "result": "unhandled_error"}
+    mock_rr.assert_called_once()
+    assert mock_rr.call_args.kwargs["persona"] == "smasher"
+
+
+import pytest  # noqa: E402
+
+
+@pytest.mark.parametrize(
+    "enqueue_name, runner_name, job_kind",
+    [
+        ("enqueue_elder_review", "run_elder_job", "elder_review"),
+        ("enqueue_guard_review", "run_guard_job", "guard_review"),
+        ("enqueue_smasher_review", "run_smasher_job", "smasher_review"),
+    ],
+)
+def test_enqueue_wrappers_bind_their_own_runner_and_job_kind(
+    monkeypatch, enqueue_name, runner_name, job_kind
+):
+    """Wrapper-to-spec-row binding for ALL three personas: each enqueue
+    must spawn ITS runner with ITS job kind (#77 audit stage 7)."""
+    monkeypatch.setenv("GRUG_K8S_RUNTIME", "1")
+    ran = threading.Event()
+    seen: dict = {}
+
+    def fake_job(event):
+        seen.update(event)
+        ran.set()
+        return {"result": "pass"}
+
+    with patch.object(ad, runner_name, side_effect=fake_job):
+        ok = getattr(ad, enqueue_name)(
+            payload=_full_gh_payload(), delivery_id="d-bind", blocking=False,
+        )
+        assert ran.wait(5.0), f"{runner_name} never ran"
+    assert ok is True
+    assert seen[ad.ASYNC_JOB_KEY] == job_kind
+
+
+def test_self_recover_log_extras_carry_persona(caplog):
+    """Recovery log lines keep their legacy elder_ NAMES for monitor
+    continuity; the persona extra is the only thing making a Guard or
+    Smasher recovery attributable in DD - pin it (#77 audit stage 7)."""
+    import logging
+
+    with (
+        patch("rerun.enqueue_rerun") as mock_rr,
+        caplog.at_level(logging.INFO, logger=ad.log.name),
+    ):
+        ad.self_recover_review(
+            _FULL_JOB["payload"], "d-attr", persona="guard",
+        )
+    mock_rr.assert_called_once()
+    enq = [r for r in caplog.records if r.msg == "elder_self_recover_enqueued"]
+    assert len(enq) == 1
+    assert enq[0].persona == "guard"

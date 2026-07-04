@@ -78,6 +78,11 @@ jobs:
           AWS_DEFAULT_REGION: us-east-1
           AWS_ACCESS_KEY_ID: testing
           AWS_SECRET_ACCESS_KEY: testing
+          # Post-#77 (ADR-0014) llm_client + friends live in services/_shared/;
+          # this lane runs OUTSIDE the conftest/PYTHONPATH bootstrap, so the
+          # shared root must be added explicitly or `python -m sast_benchmark`
+          # dies at import (no per-PR CI exercises this on-demand lane).
+          PYTHONPATH: ${{ github.workspace }}/services/_shared
           GRUG_BENCH_OPENROUTER_KEY: ${{ secrets.GRUG_BENCH_OPENROUTER_KEY }}
           GRUG_BENCH_POOLSIDE_KEY: ${{ secrets.GRUG_BENCH_POOLSIDE_KEY }}
           GRUG_BENCH_CAVE_URL: ${{ secrets.GRUG_BENCH_CAVE_URL }}

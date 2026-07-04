@@ -2,7 +2,7 @@
 """Grounding attester for spec 0017.CodeReviewerDispatch.
 
 Proves NECESSARY (static, AST-based) conditions for the dispatch
-orchestration bools against the real mirrored `dispatch.py`.
+orchestration bools against the real shared `dispatch.py` (services/_shared/).
 
 Design note — value-flow, not token-presence. An earlier draft checked
 that string literals / call names merely *appeared* in the function; a
@@ -43,7 +43,7 @@ Static half only — runtime sufficiency (the gate actually returning neutral
 in advisory mode, the review post still firing after a check-run 5xx) is
 exercised by `services/webhook/tests/test_code_reviewer_dispatch.py`. That
 runtime suite lives on the webhook side only; this attester covers BOTH
-mirrored source modules statically.
+shared source modules statically.
 """
 from __future__ import annotations
 
@@ -54,8 +54,7 @@ from pathlib import Path
 REPO_ROOT = Path(__file__).resolve().parents[2]
 
 DISPATCH_PATHS: tuple[Path, ...] = (
-    REPO_ROOT / "services/api/personas/code_reviewer/dispatch.py",
-    REPO_ROOT / "services/webhook/personas/code_reviewer/dispatch.py",
+    REPO_ROOT / "services/_shared/personas/code_reviewer/dispatch.py",
 )
 
 # Exception types that legitimately wrap a wire/IO call so dispatch can
@@ -495,7 +494,7 @@ def main() -> int:
         return 1
     print(
         f"OK: _publish_shape gate (reachable branches + mode flow) + dual-publish "
-        f"independence verified in {len(DISPATCH_PATHS)} mirrored dispatch module(s)"
+        f"independence verified in {len(DISPATCH_PATHS)} shared dispatch module(s)"
     )
     return 0
 

@@ -1,7 +1,9 @@
 # Kubernetes runtime image for grug-webhook (#354 self-hosting migration).
-# Sibling: Dockerfile.lambda (retires at cutover). FastAPI app served by
-# uvicorn under ddtrace-run (APM via the node's Datadog agent -
-# DD_AGENT_HOST is injected by the Deployment).
+# Built with CONTEXT=services/ (ADR-0014: the image carries services/_shared/
+# - the single copy of the cross-service modules - alongside the service
+# tree):  docker build services -f services/webhook/Dockerfile
+# FastAPI app served by uvicorn under ddtrace-run (APM via the node's
+# Datadog agent - DD_AGENT_HOST is injected by the Deployment).
 FROM python:3.13-slim AS runtime
 
 ARG DD_GIT_REPOSITORY_URL=""
@@ -9,15 +11,19 @@ ARG DD_GIT_COMMIT_SHA=""
 ENV DD_GIT_REPOSITORY_URL=${DD_GIT_REPOSITORY_URL}
 ENV DD_GIT_COMMIT_SHA=${DD_GIT_COMMIT_SHA}
 ENV PYTHONUNBUFFERED=1
+# The service dir (/app, via WORKDIR/cwd) resolves first; _shared/ supplies
+# the shared modules under their unchanged top-level import names (ADR-0014).
+ENV PYTHONPATH=/app/_shared
 
 WORKDIR /app
 
-COPY requirements.txt .
-# uvicorn is the k8s-only server (the Lambda image uses Mangum) - kept out
-# of requirements.txt so the Lambda image doesn't grow during the overlap.
+COPY webhook/requirements.txt .
+# uvicorn is the k8s server - kept out of requirements.txt (it is not a
+# library dependency of the app code, only of this runtime image).
 RUN pip install --no-cache-dir -r requirements.txt "uvicorn>=0.34,<1"
 
-COPY . .
+COPY _shared/ ./_shared/
+COPY webhook/ ./
 
 RUN useradd --uid 10001 --no-create-home grug
 USER 10001

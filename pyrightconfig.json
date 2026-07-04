@@ -1,0 +1,4 @@
+{
+  "extraPaths": ["services/_shared", "services/api", "services/webhook"],
+  "exclude": ["**/__pycache__", "**/node_modules", "web", "graphify-out"]
+}
