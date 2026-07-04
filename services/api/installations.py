@@ -66,6 +66,7 @@ class RepoConfigPayload(BaseModel):
     guard_blocking: bool | None = Field(default=None)
     warder_enabled: bool | None = Field(default=None)
     pulse_enabled: bool | None = Field(default=None)
+    dep_watch_enabled: bool | None = Field(default=None)
 
 
 class RerunRequest(BaseModel):
@@ -439,6 +440,7 @@ def update_repo_config(
         guard_blocking=body.guard_blocking,
         warder_enabled=body.warder_enabled,
         pulse_enabled=body.pulse_enabled,
+        dep_watch_enabled=body.dep_watch_enabled,
     )
     log.info(
         "repo_config_updated",
