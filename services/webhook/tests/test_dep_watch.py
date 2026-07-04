@@ -32,7 +32,7 @@ def _wire(monkeypatch, *, enabled=True, vulns=None, existing_report=None):
     monkeypatch.setattr(dw, "_discover_manifests", lambda t, o, r: ["requirements.txt"])
     monkeypatch.setattr(dw, "_fetch_manifest",
                         lambda t, o, r, p: "requests==2.19.0\n" if p == "requirements.txt" else None)
-    monkeypatch.setattr(dw, "_audit", lambda deps: vulns if vulns is not None else {})
+    monkeypatch.setattr(dw, "_audit", lambda deps, *, strict=False: vulns if vulns is not None else {})
     monkeypatch.setattr(dw, "claim_dep_watch_report", lambda i, r: True)
     monkeypatch.setattr(dw, "_existing_report", lambda t, o, r: existing_report)
     writes = []
@@ -51,8 +51,8 @@ def _wire(monkeypatch, *, enabled=True, vulns=None, existing_report=None):
 
 def test_vulnerable_pin_files_quarantine_issue(monkeypatch):
     writes = _wire(monkeypatch, vulns={("requests", "2.19.0"): ["GHSA-x", "CVE-y"]})
-    n = dw.run_dep_watch_for_install("tok", 1, [{"id": 9, "full_name": "o/r"}])
-    assert n == 1
+    n, failed = dw.run_dep_watch_for_install("tok", 1, [{"id": 9, "full_name": "o/r"}])
+    assert n == 1 and failed == 0
     verb, url, body = writes[0]
     assert verb == "post" and url.endswith("/issues")
     assert "quarantine report" in body["title"]
@@ -62,15 +62,15 @@ def test_vulnerable_pin_files_quarantine_issue(monkeypatch):
 
 def test_existing_report_is_refreshed_not_duplicated(monkeypatch):
     writes = _wire(monkeypatch, vulns={("requests", "2.19.0"): ["GHSA-x"]}, existing_report=7)
-    n = dw.run_dep_watch_for_install("tok", 1, [{"id": 9, "full_name": "o/r"}])
-    assert n == 1
+    n, failed = dw.run_dep_watch_for_install("tok", 1, [{"id": 9, "full_name": "o/r"}])
+    assert n == 1 and failed == 0
     verb, url, _ = writes[0]
     assert verb == "patch" and url.endswith("/issues/7")
 
 
 def test_clean_pins_file_nothing(monkeypatch):
     writes = _wire(monkeypatch, vulns={})
-    assert dw.run_dep_watch_for_install("tok", 1, [{"id": 9, "full_name": "o/r"}]) == 0
+    assert dw.run_dep_watch_for_install("tok", 1, [{"id": 9, "full_name": "o/r"}])[0] == 0
     assert writes == []
 
 
@@ -80,7 +80,7 @@ def test_disabled_repo_costs_no_calls(monkeypatch):
         dw, "_fetch_manifest",
         lambda t, o, r, p: (_ for _ in ()).throw(AssertionError("no fetch expected")),
     )
-    assert dw.run_dep_watch_for_install("tok", 1, [{"id": 9, "full_name": "o/r"}]) == 0
+    assert dw.run_dep_watch_for_install("tok", 1, [{"id": 9, "full_name": "o/r"}])[0] == 0
 
 
 def test_lost_claim_writes_nothing(monkeypatch):
@@ -89,7 +89,7 @@ def test_lost_claim_writes_nothing(monkeypatch):
     import personas.guard.dep_watch as mod
     mod_claim = lambda i, r: False
     with patch.object(dw, "claim_dep_watch_report", mod_claim):
-        assert dw.run_dep_watch_for_install("tok", 1, [{"id": 9, "full_name": "o/r"}]) == 0
+        assert dw.run_dep_watch_for_install("tok", 1, [{"id": 9, "full_name": "o/r"}])[0] == 0
     assert writes == []
 
 
@@ -100,7 +100,7 @@ def test_definite_write_failure_releases_claim(monkeypatch):
     monkeypatch.setattr(dw, "_discover_manifests", lambda t, o, r: ["requirements.txt"])
     monkeypatch.setattr(dw, "_fetch_manifest",
                         lambda t, o, r, p: "requests==2.19.0\n" if p == "requirements.txt" else None)
-    monkeypatch.setattr(dw, "_audit", lambda deps: {("requests", "2.19.0"): ["GHSA-x"]})
+    monkeypatch.setattr(dw, "_audit", lambda deps, *, strict=False: {("requests", "2.19.0"): ["GHSA-x"]})
     monkeypatch.setattr(dw, "_existing_report", lambda t, o, r: None)
     monkeypatch.setattr(dw, "claim_dep_watch_report", lambda i, r: True)
     released = []
@@ -112,7 +112,7 @@ def test_definite_write_failure_releases_claim(monkeypatch):
         lambda url, **kw: (_ for _ in ()).throw(
             httpx.HTTPStatusError("422", request=resp.request, response=resp)),
     )
-    assert dw.run_dep_watch_for_install("tok", 1, [{"id": 9, "full_name": "o/r"}]) == 0
+    assert dw.run_dep_watch_for_install("tok", 1, [{"id": 9, "full_name": "o/r"}])[0] == 0
     assert released == ["o/r"]
 
 
@@ -123,7 +123,7 @@ def test_lookup_failure_does_not_burn_claim(monkeypatch):
     monkeypatch.setattr(dw, "_discover_manifests", lambda t, o, r: ["requirements.txt"])
     monkeypatch.setattr(dw, "_fetch_manifest",
                         lambda t, o, r, p: "requests==2.19.0\n" if p == "requirements.txt" else None)
-    monkeypatch.setattr(dw, "_audit", lambda deps: {("requests", "2.19.0"): ["GHSA-x"]})
+    monkeypatch.setattr(dw, "_audit", lambda deps, *, strict=False: {("requests", "2.19.0"): ["GHSA-x"]})
     monkeypatch.setattr(
         dw, "_existing_report",
         lambda t, o, r: (_ for _ in ()).throw(httpx.ConnectTimeout("gh down", request=None)),
@@ -131,7 +131,7 @@ def test_lookup_failure_does_not_burn_claim(monkeypatch):
     claims = []
     monkeypatch.setattr(dw, "claim_dep_watch_report",
                         lambda i, r: claims.append(r) or True)
-    assert dw.run_dep_watch_for_install("tok", 1, [{"id": 9, "full_name": "o/r"}]) == 0
+    assert dw.run_dep_watch_for_install("tok", 1, [{"id": 9, "full_name": "o/r"}])[0] == 0
     assert claims == []  # never claimed - next tick retries freely
 
 
@@ -174,3 +174,35 @@ def test_existing_report_is_marker_based_not_title(monkeypatch):
         lambda url, **kw: httpx.Response(200, json=issues, request=httpx.Request("GET", url)),
     )
     assert dw._existing_report("tok", "o", "r") == 5
+
+
+def test_osv_outage_counts_failed_not_clean(monkeypatch):
+    """Codex PR #492 r3: an advisory-feed outage must never masquerade
+    as a clean scan - the repo counts FAILED and no report claim burns."""
+    monkeypatch.setattr(dw, "get_repo_config", lambda i, r: {"dep_watch_enabled": True})
+    monkeypatch.setattr(dw, "_discover_manifests", lambda t, o, r: ["requirements.txt"])
+    monkeypatch.setattr(dw, "_fetch_manifest", lambda t, o, r, p: "requests==2.19.0\n")
+    def _osv_down(deps, *, strict=False):
+        raise httpx.ConnectTimeout("osv down", request=None)
+    monkeypatch.setattr(dw, "_audit", _osv_down)
+    claims = []
+    monkeypatch.setattr(dw, "claim_dep_watch_report", lambda i, r: claims.append(r) or True)
+    filed, failed = dw.run_dep_watch_for_install("tok", 1, [{"id": 9, "full_name": "o/r"}])
+    assert filed == 0 and failed == 1
+    assert claims == []
+
+
+def test_sca_audit_strict_reraises(monkeypatch):
+    """The shared OSV helper keeps fail-open for the diff path and
+    re-raises for strict callers."""
+    from personas.code_reviewer import sca
+
+    monkeypatch.setattr(
+        sca.httpx, "post",
+        lambda *a, **kw: (_ for _ in ()).throw(httpx.ConnectTimeout("osv down", request=None)),
+    )
+    dep = sca.ChangedDep(file="requirements.txt", line=1, name="requests", version="2.19.0")
+    assert sca._audit((dep,)) == {}  # diff path: fail-open
+    import pytest
+    with pytest.raises(httpx.ConnectTimeout):
+        sca._audit((dep,), strict=True)

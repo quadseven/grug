@@ -165,11 +165,13 @@ def _existing_report(token: str, owner: str, repo: str) -> int | None:
 
 def run_dep_watch_for_install(
     token: str, install_id: int, repos: list[dict[str, Any]],
-) -> int:
+) -> tuple[int, int]:
     """One dep-watch pass for one install's ENABLED repos (store-driven
-    list, the Pulse pattern). Returns reports filed/refreshed. Never
-    raises past a repo."""
+    list, the Pulse pattern). Returns (reports_filed, repos_failed) so
+    the poller summary can distinguish a total outage from a clean pass
+    (codex r3). Never raises past a repo."""
     filed = 0
+    failed = 0
     for repo in repos:
         repo_id = repo.get("id")
         full = repo.get("full_name", "")
@@ -186,7 +188,9 @@ def run_dep_watch_for_install(
                     pins.extend(parse_manifest_pins(manifest, text))
             if not pins:
                 continue
-            vulns = _audit(tuple(pins))
+            # strict: an OSV outage RAISES (counted as a failed repo)
+            # instead of masquerading as a clean scan (codex r3).
+            vulns = _audit(tuple(pins), strict=True)
             if not vulns:
                 log.info("dep_watch_clean", extra={"repo": full, "pins": len(pins)})
                 continue
@@ -241,9 +245,10 @@ def run_dep_watch_for_install(
                 extra={"install_id": install_id, "repo": full,
                        "vulnerable": len(rows), "refreshed": bool(existing)},
             )
-        except (httpx.HTTPStatusError, httpx.RequestError) as e:
+        except (httpx.HTTPStatusError, httpx.RequestError, ValueError) as e:
+            failed += 1
             log.warning(
                 "dep_watch_repo_failed",
                 extra={"install_id": install_id, "repo": full, "kind": type(e).__name__},
             )
-    return filed
+    return filed, failed
