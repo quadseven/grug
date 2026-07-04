@@ -37,6 +37,17 @@ def test_egress_default_deny_with_prep_only_opening_443():
     assert "grug-trial-phase: prep" in text
 
 
+def test_janitor_uses_an_sa_defined_in_its_own_namespace():
+    # SAs are namespace-scoped: the janitor CronJob (in grug-trial) must NOT
+    # reference the launcher SA (which lives in `grug`), or it won't start
+    # (codex peer-review PR #494). It must use grug-trial-janitor, defined here.
+    text = _text()
+    assert "serviceAccountName: grug-trial-janitor" in text
+    assert "kind: ServiceAccount\nmetadata:\n  name: grug-trial-janitor\n  namespace: grug-trial" in text
+    # The CronJob must NOT reference the grug-namespace launcher SA.
+    assert "serviceAccountName: grug-smasher-launcher" not in text
+
+
 def test_launcher_role_lives_in_grug_trial():
     # The launcher's Role + RoleBinding must be in grug-trial (secret-free); the
     # only reference to the `grug` namespace is the RoleBinding SUBJECT (the SA

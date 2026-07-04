@@ -144,6 +144,7 @@ def launch_trial(
         return _degraded("prep_create_failed")
 
     message: str | None = None
+    degrade_reason: str | None = None
     try:
         # Phase 1: prep (fetch + wheel-install into the PVC). The token Secret is
         # only needed until fetch is done; drop it before the test pod runs so
@@ -152,21 +153,35 @@ def launch_trial(
         _swallow(lambda: cluster.delete_secret(secret_name))
         if prep_phase != "Succeeded":
             log.warning("smasher_prep_failed", extra={"phase": prep_phase})
-            return _degraded("prep_failed")
-
-        # Phase 2: test (mutation worker, network-denied). Author code runs here.
-        cluster.create_job(build_test_job(
-            job_name=test_job, image=image, pvc_name=pvc_name, targets=targets,
-            total_budget_seconds=budget, per_mutant_timeout_seconds=per_mutant_timeout_seconds,
-            mutant_cap=mutant_cap,
-        ))
-        cluster.wait_for_completion(test_job, budget + _WAIT_SLACK_SECONDS)
-        message = cluster.read_termination_message(test_job)
+            degrade_reason = "prep_failed"
+        else:
+            # Phase 2: test (mutation worker, network-denied). Author code runs here.
+            cluster.create_job(build_test_job(
+                job_name=test_job, image=image, pvc_name=pvc_name, targets=targets,
+                total_budget_seconds=budget,
+                per_mutant_timeout_seconds=per_mutant_timeout_seconds, mutant_cap=mutant_cap,
+            ))
+            test_phase = cluster.wait_for_completion(test_job, budget + _WAIT_SLACK_SECONDS)
+            # CRITICAL (codex peer-review PR #494): the termination message is
+            # only TRUSTWORTHY if the worker exited cleanly (Job Succeeded). A
+            # malicious test can pre-write a forged clean message and then kill
+            # PID 1 before the worker's reap+authoritative-write - the kubelet
+            # then records the FORGED message and marks the Job FAILED. So we
+            # read + trust the message ONLY on Succeeded; any other phase
+            # degrades WITHOUT parsing it.
+            if test_phase == "Succeeded":
+                message = cluster.read_termination_message(test_job)
+            else:
+                log.warning("smasher_test_job_not_succeeded", extra={"phase": test_phase})
+                degrade_reason = "test_job_failed"
     except Exception as e:  # noqa: BLE001 — read/wait failure degrades
         log.warning("smasher_job_wait_or_read_failed", extra={"kind": type(e).__name__})
+        degrade_reason = degrade_reason or "trial_error"
     finally:
         _cleanup()
 
+    if degrade_reason:
+        return _degraded(degrade_reason)
     return parse_trial_result(message)
 
 
