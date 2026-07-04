@@ -72,6 +72,9 @@ spec:
     # CNPG Postgres.
     - ports:
         - {protocol: TCP, port: 5432}
+    # In-cluster spark-gateway (exposed-secret judge, #439 / ADR-0009).
+    - ports:
+        - {protocol: TCP, port: 8080}
     # Node-local Datadog agent: DogStatsD (UDP 8125) + APM trace intake
     # (TCP 8126). Restricting these would silently kill observability.
     - ports:

@@ -213,6 +213,10 @@ class Backend(str, Enum):
 
     POOLSIDE = "poolside"
     OPENROUTER = "openrouter"
+    # In-cluster spark-gateway (ADR-0009). NOT a review backend yet - only
+    # the exposed-secret judge routes here (#439); select_backend's
+    # round-robin stays pinned to the two SaaS backends below.
+    CAVE = "cave"
 
 
 # `Severity` + `SEVERITIES` now live in the shared leaf `review_types` (#250)
@@ -340,6 +344,29 @@ _BACKEND_CONFIGS: dict[Backend, BackendConfig] = {
 }
 
 
+_CAVE_JUDGE_DEFAULT_MODEL = "qwen3-coder-next:latest"
+
+
+def _cave_judge_config() -> "BackendConfig | None":
+    """BackendConfig for the in-cluster spark-gateway judge (#439,
+    ADR-0009), or None when unconfigured (fail-open: callers fall back to
+    today's SaaS judge). The base URL arrives via env - on the shared OKE
+    cluster the manifests set the non-secret in-cluster Service DNS
+    (`spark-gateway.spark-gateway.svc`, named in ADR-0009); a tailnet URL
+    would come via SSM instead, never a repo literal. The gateway is an
+    OpenAI-compatible Ollama front; it takes no API key in-cluster, so the
+    key_loader returns a placeholder (_call_backend requires non-empty)."""
+    base = os.getenv("GRUG_CAVE_GATEWAY_URL", "").strip().rstrip("/")
+    if not base:
+        return None
+    return BackendConfig(
+        backend=Backend.CAVE,
+        url=f"{base}/v1/chat/completions",
+        model=os.getenv("GRUG_CAVE_JUDGE_MODEL", _CAVE_JUDGE_DEFAULT_MODEL),
+        key_loader=lambda: "in-cluster",  # gateway is unauthenticated in-cluster
+    )
+
+
 def select_backend(installation_id: int) -> Backend:
     """Stable per-install backend pick via `installation_id % 2`.
 
@@ -351,9 +378,14 @@ def select_backend(installation_id: int) -> Backend:
     would silently keep returning Poolside/OpenRouter and the new
     backend would never be picked.
     """
-    assert len(Backend) == 2, (
-        "select_backend assumes a 2-backend enum; add a real selector "
-        "before extending Backend."
+    # Pin the REVIEW pair explicitly (was `len(Backend) == 2`): Backend
+    # gained CAVE for the judge-only flow (#439, ADR-0009), but the review
+    # round-robin stays SaaS-only until the Cave-primary slice lands with
+    # its own latency budget. This assert is what fails loudly if someone
+    # adds a review backend without replacing the modulo selector.
+    assert {Backend.POOLSIDE, Backend.OPENROUTER}.issubset(set(Backend)), (
+        "select_backend assumes the Poolside/OpenRouter review pair; add a "
+        "real selector before changing the review backends."
     )
     return Backend.POOLSIDE if installation_id % 2 == 0 else Backend.OPENROUTER
 
@@ -894,6 +926,8 @@ def _build_judge_messages(
     findings_repr: list[JudgeFindingRepr],
     hunks: list[Hunk],
     file_contents: dict[str, str] | None = None,
+    *,
+    redact: bool = False,
 ) -> list[dict[str, str]]:
     """Compose the judge prompt: full-file context + diff hunks + a numbered
     finding list. `findings_repr` is a primitive list-of-dicts (NOT persona
@@ -919,6 +953,14 @@ def _build_judge_messages(
         for i, f in enumerate(findings_repr)
     )
     user = f"Diff under review:\n{diff_block}\n\nFindings to grade:\n{finding_lines}"
+    if redact:
+        # #439 (2d): SaaS-judged classes (SAST/SCA/IaC) no longer need raw
+        # secret values - the exposed-secret class routes to the in-cluster
+        # Cave. Mask secret-shaped values before the content leaves the
+        # boundary, same policy as the main review (#438). The Cave call
+        # passes redact=False (it NEEDS the raw value to tell a live key
+        # from a docs example, and it never leaves the cluster).
+        user = _redact_secrets(user)
     return [
         {"role": "system", "content": _JUDGE_SYSTEM_PROMPT},
         {"role": "user", "content": user},
@@ -988,6 +1030,9 @@ def judge_findings(
     installation_id: int,
     pr_context: Optional[PrContext] = None,
     file_contents: dict[str, str] | None = None,
+    *,
+    config: "BackendConfig | None" = None,
+    redact: bool = False,
 ) -> tuple[FindingJudgement, ...]:
     """Second LLM call: grade each finding as real-bug vs false-positive.
 
@@ -1016,9 +1061,14 @@ def judge_findings(
     # shared helper would need callbacks for the divergent annotate
     # metadata + fallback control flow — more complex than the ~25-line
     # overlap. Extract at the 3rd backend (rule-of-three), not now.
-    backend = select_backend(installation_id)
-    config = _BACKEND_CONFIGS[backend]
-    messages = _build_judge_messages(findings_repr, hunks, file_contents)
+    # `config` override routes this judge call to a specific backend - the
+    # exposed-secret class goes to the in-cluster Cave (#439, ADR-0009);
+    # default None keeps today's per-install SaaS pick. `redact` masks
+    # secret-shaped values in the prompt for SaaS-bound calls (2d).
+    if config is None:
+        backend = select_backend(installation_id)
+        config = _BACKEND_CONFIGS[backend]
+    messages = _build_judge_messages(findings_repr, hunks, file_contents, redact=redact)
     pr_tags = _llmobs_tags(pr_context)
     start_ns = time.monotonic_ns()
 
