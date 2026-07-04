@@ -1068,6 +1068,12 @@ def judge_findings(
     if config is None:
         backend = select_backend(installation_id)
         config = _BACKEND_CONFIGS[backend]
+    else:
+        # Codex PR #486 CRITICAL: without this, `backend` is unbound on the
+        # override path - the span setup's backend.value raised
+        # UnboundLocalError BEFORE _call_backend, the caller read it as a
+        # Cave outage, and the raw secret batch fell back to SaaS.
+        backend = config.backend
     messages = _build_judge_messages(findings_repr, hunks, file_contents, redact=redact)
     pr_tags = _llmobs_tags(pr_context)
     start_ns = time.monotonic_ns()
