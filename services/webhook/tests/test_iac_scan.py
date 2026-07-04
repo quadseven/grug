@@ -138,7 +138,7 @@ def test_empty_input():
 def test_scan_iac_is_in_dispatch_concatenation():
     import inspect
 
-    from personas.code_reviewer import dispatch
+    from personas.guard import dispatch
 
     src = inspect.getsource(dispatch)
     assert "scan_iac(hunks)" in src, "scan_iac must be concatenated into the candidate sources"

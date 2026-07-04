@@ -13,7 +13,7 @@ from unittest.mock import MagicMock, patch
 import pytest
 
 from llm_client import Backend, FindingJudgement, LlmReviewResponse
-from personas.code_reviewer import dispatch as cr_dispatch
+from personas.guard import dispatch as guard_dispatch  # security dispatch moved to Guard (#466)
 from personas.code_reviewer import sca
 from personas.code_reviewer.diff_parser import parse_diff
 from personas.code_reviewer.sca import (
@@ -135,15 +135,11 @@ def test_scan_osv_bad_output_fails_safe(monkeypatch):
 def test_dispatch_publishes_vulnerable_dep_finding(monkeypatch):
     """#434 AC: a vulnerable dep the judge KEEPS publishes via the existing
     check-run + inline-review path."""
-    monkeypatch.setattr(cr_dispatch, "with_install_token_retry", lambda iid, fn: fn("tok"))
-    monkeypatch.setattr(
-        cr_dispatch, "review_diff",
-        lambda *a, **kw: LlmReviewResponse(kind="reviewed", findings=(), backend_used=Backend.POOLSIDE, model_name="laguna"),
-    )
+    monkeypatch.setattr(guard_dispatch, "with_install_token_retry", lambda iid, fn: fn("tok"))
     # No SAST candidates; one SCA candidate.
-    monkeypatch.setattr(cr_dispatch, "scan_candidates", lambda *a, **kw: ())
+    monkeypatch.setattr(guard_dispatch, "scan_candidates", lambda *a, **kw: ())
     monkeypatch.setattr(
-        cr_dispatch, "scan_dependencies",
+        guard_dispatch, "scan_dependencies",
         lambda hunks: (sca.Candidate(VULNERABLE_DEPENDENCY, "requirements.txt", 1, "jinja2==2.4.1 (known advisories: GHSA-x)"),),
     )
     monkeypatch.setattr(
@@ -151,8 +147,8 @@ def test_dispatch_publishes_vulnerable_dep_finding(monkeypatch):
         lambda *a, **kw: (FindingJudgement(finding_index=0, is_real_bug=True, reasoning="reachable in a server-side template path"),),
     )
     posted_check, posted_review = [], []
-    monkeypatch.setattr(cr_dispatch, "post_check_run", lambda t, o, r, result, external_id=None: posted_check.append(result) or {"id": 1})
-    monkeypatch.setattr(cr_dispatch, "post_review", lambda t, o, r, *, pull_number, result: posted_review.append(result) or {"id": 2})
+    monkeypatch.setattr(guard_dispatch, "post_check_run", lambda t, o, r, result, external_id=None: posted_check.append(result) or {"id": 1})
+    monkeypatch.setattr(guard_dispatch, "post_review", lambda t, o, r, *, pull_number, result: posted_review.append(result) or {"id": 2})
 
     r = MagicMock(); r.status_code = 200; r.raise_for_status = MagicMock()
     r.text = _VULN_DIFF
@@ -162,7 +158,7 @@ def test_dispatch_publishes_vulnerable_dep_finding(monkeypatch):
         "pull_request": {"number": 7, "head": {"sha": "abcd1234"}},
     }
     with patch("httpx.get", return_value=r):
-        cr_dispatch.dispatch_code_review(payload, blocking=True)
+        guard_dispatch.dispatch_guard_review(payload, blocking=True)
 
     assert posted_review, "a review should be posted"
     inline = posted_review[0].comments

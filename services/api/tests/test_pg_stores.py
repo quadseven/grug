@@ -683,3 +683,22 @@ def test_scan_meta_items_excludes_ttl_expired(pg):
             "WHERE pk = 'USER#2'"
         )
     assert [i["PK"] for i in users.scan_meta_items(pk_prefix="USER#")] == ["USER#1"]
+
+
+def test_guard_flags_round_trip(pg):
+    """#466: guard_enabled/guard_blocking flow through the generic
+    plumbing (defaults, write, read, gate) with no store edits beyond
+    the _DEFAULT_PERSONA_CONFIG keys."""
+    from adapters import pg_install_store as store
+
+    cfg = store.get_repo_config(1, 44)
+    assert cfg["guard_enabled"] is True and cfg["guard_blocking"] is False
+    assert store.is_persona_enabled(1, 44, "guard") is True
+
+    store.set_repo_config(
+        install_id=1, repo_id=44, repo_full_name="o/r",
+        updated_by_user_id="9", guard_enabled=False, guard_blocking=True,
+    )
+    cfg = store.get_repo_config(1, 44)
+    assert cfg["guard_enabled"] is False and cfg["guard_blocking"] is True
+    assert store.is_persona_enabled(1, 44, "guard") is False
