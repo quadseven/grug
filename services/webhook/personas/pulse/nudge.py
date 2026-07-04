@@ -52,24 +52,45 @@ def _headers(token: str) -> dict[str, str]:
     }
 
 
+_MAX_PR_PAGES = 5
+
+
 def _stale_prs(token: str, owner: str, repo: str) -> list[dict[str, Any]]:
-    """Open PRs untouched for _STALE_DAYS, oldest-updated first."""
-    resp = httpx.get(
-        f"https://api.github.com/repos/{quote(owner, safe='')}/{quote(repo, safe='')}/pulls",
-        params={"state": "open", "sort": "updated", "direction": "asc",
-                "per_page": _MAX_PRS_PER_REPO},
-        headers=_headers(token), timeout=_FETCH_TIMEOUT,
-    )
-    resp.raise_for_status()
+    """ALL open PRs untouched for _STALE_DAYS, oldest-updated first.
+
+    Paginates (codex PR #489 r4: a fixed first-page slice could starve
+    eligible PRs behind 30 ineligible stale ones). With `sort=updated
+    asc`, staleness is a PREFIX property - the first non-stale PR ends
+    the scan, so pagination is naturally bounded by the stale backlog,
+    with a hard page cap as the backstop (logged, never silent)."""
     cutoff = datetime.now(timezone.utc) - timedelta(days=_STALE_DAYS)
-    out = []
-    for pr in resp.json() or []:
-        updated = pr.get("updated_at", "")
-        try:
-            if datetime.fromisoformat(updated.replace("Z", "+00:00")) < cutoff:
-                out.append(pr)
-        except ValueError:
-            continue
+    out: list[dict[str, Any]] = []
+    for page in range(1, _MAX_PR_PAGES + 1):
+        resp = httpx.get(
+            f"https://api.github.com/repos/{quote(owner, safe='')}/{quote(repo, safe='')}/pulls",
+            params={"state": "open", "sort": "updated", "direction": "asc",
+                    "per_page": _MAX_PRS_PER_REPO, "page": page},
+            headers=_headers(token), timeout=_FETCH_TIMEOUT,
+        )
+        resp.raise_for_status()
+        batch = resp.json() or []
+        for pr in batch:
+            updated = pr.get("updated_at", "")
+            try:
+                if datetime.fromisoformat(updated.replace("Z", "+00:00")) < cutoff:
+                    out.append(pr)
+                else:
+                    # Ascending by updated: everything after is fresher.
+                    return out
+            except ValueError:
+                continue
+        if len(batch) < _MAX_PRS_PER_REPO:
+            return out
+    log.info(
+        "pulse_stale_scan_page_cap",
+        extra={"repo": f"{owner}/{repo}", "pages": _MAX_PR_PAGES,
+               "stale_found": len(out)},
+    )
     return out
 
 
