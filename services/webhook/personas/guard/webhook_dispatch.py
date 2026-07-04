@@ -34,6 +34,17 @@ def dispatch_pull_request(ctx: PullRequestContext) -> dict[str, str]:
         blocking=ctx.blocking,
     )
     if not enqueued:
+        # #478 resolution: an enqueue failure (missing runtime flag /
+        # thread-spawn error) now ALSO enqueues one durable re-run on the
+        # SQS rerun lane - consumed by the separate grug-consumer
+        # deployment, which survives exactly the pod-local breakage that
+        # made this enqueue fail. Chosen over a 503 (GitHub redelivery
+        # storms + webhook auto-disable on persistent misconfig) and over
+        # the old silent drop-and-monitor. The error log below stays -
+        # it drives the offload monitor.
+        from async_dispatch import self_recover_review  # lazy: webhook-only
+
+        self_recover_review(ctx.payload, ctx.delivery_id, persona="guard")
         log.error(
             "guard_enqueue_failed",
             extra={
