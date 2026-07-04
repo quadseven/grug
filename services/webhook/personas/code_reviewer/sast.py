@@ -27,7 +27,7 @@ import tempfile
 from dataclasses import dataclass
 from typing import Optional
 
-from llm_client import FindingJudgement, Hunk, JudgeFindingRepr, PrContext, judge_findings
+from llm_client import _cave_judge_config, FindingJudgement, Hunk, JudgeFindingRepr, PrContext, judge_findings
 
 from .diff_parser import DiffHunk
 from .persona import Finding
@@ -328,12 +328,81 @@ def judge_candidates(
     """
     if not candidates:
         return ()
+
+    # #439 (ADR-0009): route the exposed-secret class to the in-cluster
+    # Cave judge (raw value never leaves the boundary) and the remaining
+    # classes to the SaaS judge with REDACTED input (2d). When the Cave is
+    # unconfigured/unreachable, secrets fall back to today's SaaS path
+    # (unredacted - the class needs the raw value; detection beats privacy
+    # regression until the gateway route is live), logged either way.
+    cave = _cave_judge_config()
+    secrets = tuple(c for c in candidates if c.vuln_class == EXPOSED_SECRET)
+    others = tuple(c for c in candidates if c.vuln_class != EXPOSED_SECRET)
+
+    if cave is None or not secrets:
+        # Single-call path. Redact iff no secret candidate rides along
+        # (a secret candidate on SaaS still needs its raw value).
+        return _judge_batch(
+            candidates, hunks, installation_id,
+            pr_context=pr_context, file_contents=file_contents,
+            config=None, redact=not secrets,
+        )
+
+    kept = _judge_batch(
+        secrets, hunks, installation_id,
+        pr_context=pr_context, file_contents=file_contents,
+        config=cave, redact=False,
+    )
+    if not kept and secrets:
+        # () from a non-empty batch is the judge ERROR shape (a legit
+        # all-not-real result returns verdicts, filtered inside). Retry
+        # the secret batch on SaaS (today's behavior) so a Cave outage
+        # cannot silently kill secret detection. May double-judge a batch
+        # the Cave legitimately suppressed entirely - acceptable: the
+        # SaaS judge then re-suppresses, at one extra call.
+        log.warning(
+            "cave_judge_empty_fell_back_to_saas",
+            extra={"installation_id": installation_id, "secrets": len(secrets)},
+        )
+        kept = _judge_batch(
+            secrets, hunks, installation_id,
+            pr_context=pr_context, file_contents=file_contents,
+            config=None, redact=False,
+        )
+    else:
+        log.info(
+            "cave_judge_used",
+            extra={"installation_id": installation_id, "secrets": len(secrets),
+                   "kept": len(kept)},
+        )
+    return kept + _judge_batch(
+        others, hunks, installation_id,
+        pr_context=pr_context, file_contents=file_contents,
+        config=None, redact=True,
+    )
+
+
+def _judge_batch(
+    candidates: tuple[Candidate, ...],
+    hunks: tuple[DiffHunk, ...],
+    installation_id: int,
+    *,
+    pr_context: Optional[PrContext],
+    file_contents: dict[str, str] | None,
+    config,
+    redact: bool,
+) -> tuple[Finding, ...]:
+    """One judge call over one candidate batch - the pre-#439 body of
+    judge_candidates, parameterized by backend config + redaction."""
+    if not candidates:
+        return ()
     reprs = [_candidate_to_repr(c) for c in candidates]
     llm_hunks = [Hunk(path=h.file_path, body=h.body) for h in hunks]
     try:
         judgements = judge_findings(
             reprs, llm_hunks, installation_id,
             pr_context=pr_context, file_contents=file_contents,
+            config=config, redact=redact,
         )
     except Exception as e:  # noqa: BLE001 — judge failure must not crash the review
         log.warning(
