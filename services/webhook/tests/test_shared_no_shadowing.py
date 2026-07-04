@@ -50,6 +50,24 @@ def test_no_service_tree_shadows_a_shared_module():
     )
 
 
+def test_conftest_shim_exposes_every_shared_fixture():
+    # The per-service conftest shims import shared fixtures BY NAME. A
+    # non-autouse fixture forgotten in a shim fails loud ("fixture not
+    # found"), but a forgotten AUTOUSE fixture is silently inert for that
+    # service's whole suite - this guard makes it red instead.
+    import conftest
+    import grug_shared_conftest
+
+    missing = [
+        name
+        for name, obj in vars(grug_shared_conftest).items()
+        if hasattr(obj, "_pytestfixturefunction") and name not in vars(conftest)
+    ]
+    assert not missing, (
+        f"shared fixtures not imported by the conftest shim: {missing}"
+    )
+
+
 def test_no_mirrored_headers_remain():
     # The ADR-0001 `# MIRRORED — sibling at ...` line-1 convention died with
     # the extraction; a new one appearing means someone resurrected the
