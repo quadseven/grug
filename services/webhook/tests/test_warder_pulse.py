@@ -237,3 +237,28 @@ def test_warder_only_wakes_on_closed_action():
     assert registry.by_key("pulse").actions == ()
     assert registry.by_key("pulse").events == ()
     assert registry.by_key("tpm").actions == registry.PR_UPDATE_ACTIONS
+
+
+def test_pulse_post_failure_releases_claim_for_retry(monkeypatch):
+    """Codex PR #489: a claim must represent a COMPLETED nudge. If the
+    comment POST fails after the claim, the claim is released so the
+    next cron tick retries - a transient GitHub blip must not burn the
+    weekly slot."""
+    monkeypatch.setattr(pulse, "get_repo_config", lambda i, r: {"pulse_enabled": True})
+    monkeypatch.setattr(pulse, "_stale_prs", lambda t, o, r: [_pr(1, "2020-01-01T00:00:00Z")])
+    monkeypatch.setattr(pulse, "_dor_green", lambda t, o, r, s: True)
+    monkeypatch.setattr(pulse, "claim_pulse_nudge", lambda i, repo, pr: True)
+    released = []
+    monkeypatch.setattr(
+        pulse, "release_pulse_nudge",
+        lambda i, repo, pr: released.append((repo, pr)),
+    )
+    monkeypatch.setattr(
+        pulse.httpx, "post",
+        lambda url, **kw: (_ for _ in ()).throw(
+            httpx.ConnectTimeout("gh down", request=None)
+        ),
+    )
+    n = pulse.run_pulse_for_install("tok", 1, [{"id": 9, "full_name": "o/r"}])
+    assert n == 0
+    assert released == [("o/r", 1)]

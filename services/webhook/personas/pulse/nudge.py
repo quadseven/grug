@@ -24,7 +24,7 @@ from urllib.parse import quote
 import httpx
 
 from activity_log import record_check_verdict
-from adapters.install_store import claim_pulse_nudge, get_repo_config
+from adapters.install_store import claim_pulse_nudge, get_repo_config, release_pulse_nudge
 
 log = logging.getLogger(f"{os.getenv('DD_SERVICE', 'grug')}.persona.pulse")
 
@@ -117,12 +117,19 @@ def run_pulse_for_install(
                 # happened (or a concurrent poller run won it).
                 if not claim_pulse_nudge(install_id, full, pr_number):
                     continue
-                resp = httpx.post(
-                    f"https://api.github.com/repos/{quote(owner, safe='')}/{quote(name, safe='')}/issues/{pr_number}/comments",
-                    json={"body": _NUDGE_BODY.format(days=_STALE_DAYS)},
-                    headers=_headers(token), timeout=_FETCH_TIMEOUT,
-                )
-                resp.raise_for_status()
+                try:
+                    resp = httpx.post(
+                        f"https://api.github.com/repos/{quote(owner, safe='')}/{quote(name, safe='')}/issues/{pr_number}/comments",
+                        json={"body": _NUDGE_BODY.format(days=_STALE_DAYS)},
+                        headers=_headers(token), timeout=_FETCH_TIMEOUT,
+                    )
+                    resp.raise_for_status()
+                except (httpx.HTTPStatusError, httpx.RequestError):
+                    # The claim must represent a COMPLETED nudge (codex
+                    # PR #489): release it so the next cron tick retries
+                    # instead of silently burning the weekly slot.
+                    release_pulse_nudge(install_id, full, pr_number)
+                    raise
                 nudged += 1
                 log.info(
                     "pulse_nudged",
