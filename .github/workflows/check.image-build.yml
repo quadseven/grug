@@ -21,6 +21,7 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 15
     strategy:
+      fail-fast: false  # one service's failure must not hide the other's result
       matrix:
         svc: [webhook, api]
     steps:
