@@ -412,7 +412,7 @@ def test_refresh_blob_preserved_when_not_rotated(pg, fake_kms):
         oauth_access_token="a1",
         oauth_refresh_token="r1",
     )
-    # Re-auth WITHOUT a refresh token must keep the old one (Sentry HIGH #39).
+    # Re-auth WITHOUT a refresh token must keep the old one (Seer HIGH #39).
     users.upsert_oauth_user(github_user_id="3", login="x", oauth_access_token="a2")
     got = users.get_user_with_tokens("3")
     assert got.oauth_access_token == "a2"

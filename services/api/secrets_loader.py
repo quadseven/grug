@@ -107,6 +107,39 @@ def get_prompt_experiment_mode() -> Mode:
     return cast("Mode", value)
 
 
+def get_dd_api_key() -> str:
+    """DD API key for Omen's read queries (#470). Empty env = feature off."""
+    name = os.getenv("GRUG_DD_API_KEY_SSM", "")
+    return _get_ssm_secure_string(name) if name else ""
+
+
+def get_dd_app_key() -> str:
+    """DD APPLICATION key for Omen (#470) - scope it logs_read_data only."""
+    name = os.getenv("GRUG_DD_APP_KEY_SSM", "")
+    return _get_ssm_secure_string(name) if name else ""
+
+
+def get_omen_service_map() -> dict:
+    """Operator-managed repo->DD-service mapping for Omen (#470):
+    a JSON object {"owner/repo": "service"} in a plain String param.
+    Explicit allow - {} (feature off) on ANY error or malformation,
+    logged so a fat-fingered map is distinguishable from an absent one."""
+    name = os.getenv("GRUG_OMEN_SERVICE_MAP_SSM", "")
+    if not name:
+        return {}
+    try:
+        raw = _ssm.get_parameter(Name=name)["Parameter"]["Value"]
+    except Exception as e:  # noqa: BLE001 — absent param = feature off
+        log.info("omen_service_map_unavailable", extra={"kind": type(e).__name__})
+        return {}
+    from personas.code_reviewer.omen import _service_map_from_json
+
+    parsed = _service_map_from_json(raw)
+    if raw.strip() and not parsed:
+        log.warning("omen_service_map_malformed", extra={"param": name})
+    return parsed
+
+
 def get_fallback_enabled() -> bool:
     """Whether the Elder cave-fallback (ADR-0005) is enabled, from the
     `/grug/elder-fallback-enabled` SSM param (plain String, e.g. "true").
