@@ -578,3 +578,23 @@ def test_enqueue_guard_review_no_runtime_returns_false(monkeypatch):
         payload={"pull_request": {}, "repository": {}, "installation": {}},
         delivery_id="d1", blocking=False,
     ) is False
+
+
+def test_run_guard_job_self_recovers_on_dispatch_error():
+    """Codex PR #482: run_guard_job takes the head-SHA claim BEFORE
+    dispatching, so an unhandled dispatch error must enqueue a durable
+    guard rerun - otherwise that SHA's security check is suppressed
+    until a new push."""
+    with (
+        patch("adapters.install_store.claim_delivery", return_value=True),
+        patch("adapters.install_store.claim_review", return_value=True),
+        patch(
+            "personas.guard.dispatch.dispatch_guard_review",
+            side_effect=RuntimeError("guard exploded"),
+        ),
+        patch("rerun.enqueue_rerun") as mock_rr,
+    ):
+        out = ad.run_guard_job({**_FULL_JOB, ad.ASYNC_JOB_KEY: ad.GUARD_REVIEW_JOB})
+    assert out == {"persona": "guard", "result": "unhandled_error"}
+    mock_rr.assert_called_once()
+    assert mock_rr.call_args.kwargs["persona"] == "guard"

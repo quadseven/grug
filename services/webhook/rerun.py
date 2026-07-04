@@ -32,6 +32,7 @@ import httpx
 from adapters.install_store import get_repo_config  # type: ignore
 from github_app_auth import with_install_token_retry
 from personas.code_reviewer.dispatch import dispatch_code_review
+from personas.guard.dispatch import dispatch_guard_review
 
 log = logging.getLogger(f"{os.getenv('DD_SERVICE', 'grug')}.rerun")
 
@@ -78,6 +79,8 @@ def enqueue_rerun(*, install_id: int, repo: str, pr_number: int, persona: str) -
 # outage) is the LLM-driven code reviewer; the static TPM check doesn't error
 # from outages, so its re-run is a deliberate follow-up (logged + skipped here).
 _CODE_REVIEWER = frozenset({"elder", "code_reviewer"})
+_GUARD = frozenset({"guard"})
+_RERUNNABLE = _CODE_REVIEWER | _GUARD
 
 
 def _gh_get(token: str, url: str) -> dict[str, Any]:
@@ -106,7 +109,7 @@ def _run_one(body: str) -> str:
     pr_number = int(job["pr_number"])
     persona = str(job.get("persona", "elder"))
 
-    if persona not in _CODE_REVIEWER:
+    if persona not in _RERUNNABLE:
         # Not an infra failure — don't retry/DLQ a persona we don't drive yet.
         log.info(
             "rerun_unsupported_persona",
@@ -132,12 +135,19 @@ def _run_one(body: str) -> str:
         "repository": {"id": repo_id, "name": repo_name, "owner": {"login": owner}},
         "pull_request": {"number": pr_number, "head": {"sha": pr["head"]["sha"]}},
     }
-    blocking = bool(get_repo_config(install_id, repo_id).get("code_reviewer_blocking", False))
-    # dispatch_code_review never raises a wire exception: it fetches the diff,
-    # re-runs Elder, dual-publishes, and upserts the verdict (heal-in-place on an
-    # unchanged head, append on a moved-on PR). A repeat LLM outage degrades to a
+    cfg = get_repo_config(install_id, repo_id)
+    # Neither dispatch raises a wire exception: each fetches the diff, re-runs
+    # its persona, publishes, and upserts the verdict (heal-in-place on an
+    # unchanged head, append on a moved-on PR). A repeat outage degrades to a
     # published `errored` row — the job still completed.
-    dispatch_code_review(payload, blocking=blocking)
+    if persona in _GUARD:
+        dispatch_guard_review(
+            payload, blocking=bool(cfg.get("guard_blocking", False)),
+        )
+    else:
+        dispatch_code_review(
+            payload, blocking=bool(cfg.get("code_reviewer_blocking", False)),
+        )
     log.info(
         "rerun_dispatched",
         extra={"repo": f"{owner}/{repo_name}", "pr": pr_number, "persona": persona},

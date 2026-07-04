@@ -73,7 +73,7 @@ class RerunRequest(BaseModel):
     model_config = ConfigDict(extra="forbid")
     repo: str = Field(pattern=r"^[^/\s]+/[^/\s]+$")  # owner/name
     pr_number: int
-    persona: str = Field(pattern=r"^(elder|code_reviewer|chief|tpm)$")
+    persona: str = Field(pattern=r"^(elder|code_reviewer|chief|tpm|guard)$")
 
 
 def _ensure_can_access(install: dict[str, Any], user: UserIdentity) -> None:
