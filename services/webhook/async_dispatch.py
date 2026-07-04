@@ -183,9 +183,10 @@ def run_guard_job(event: dict[str, Any]) -> dict[str, str]:
       `claim_delivery` is keyed on the raw GUID - an unnamespaced claim
       would let whichever persona ran first mark the delivery consumed
       and silently skip the other.
-    - No #418 self-recover: the rerun lane's persona surface doesn't
-      carry guard yet; a dropped scan re-triggers on the next push
-      (tracer contract, ADR-0012).
+    - Self-recover (#418) enqueues with persona="guard" so the rerun
+      consumer re-drives dispatch_guard_review (codex PR #482: without
+      it, the already-consumed head-SHA claim would suppress the Guard
+      check for that SHA until a new push).
     """
     delivery_id = str(event.get("delivery_id", ""))
     try:
@@ -244,6 +245,12 @@ def run_guard_job(event: dict[str, Any]) -> dict[str, str]:
             extra={"delivery_id": delivery_id, "kind": type(e).__name__},
             exc_info=True,
         )
+        # Self-recover (#418, codex PR #482): the head-SHA claim above is
+        # already consumed, so without a durable re-run this SHA's Guard
+        # check would be suppressed until the next push. Same contract as
+        # Elder's recovery: at most one enqueue per drop, SQS redrive owns
+        # retries.
+        _self_recover_review(payload, delivery_id, persona="guard")
         return {"persona": "guard", "result": "unhandled_error"}
 
 
@@ -362,7 +369,9 @@ def _pr_ids(payload: dict[str, Any]) -> tuple[int | None, str | None, int | None
     )
 
 
-def _self_recover_review(payload: dict[str, Any], delivery_id: str) -> None:
+def _self_recover_review(
+    payload: dict[str, Any], delivery_id: str, *, persona: str = "elder",
+) -> None:
     """Enqueue ONE durable re-run for a dropped Elder review (#418). Bounded:
     enqueues at most once per drop - the rerun CONSUMER retries via SQS redrive,
     never re-enqueues (it calls dispatch_code_review directly, not run_elder_job),
@@ -378,7 +387,7 @@ def _self_recover_review(payload: dict[str, Any], delivery_id: str) -> None:
         from rerun import enqueue_rerun
 
         enqueue_rerun(
-            install_id=install_id, repo=repo, pr_number=pr_number, persona="elder"
+            install_id=install_id, repo=repo, pr_number=pr_number, persona=persona
         )
         log.info(
             "elder_self_recover_enqueued",

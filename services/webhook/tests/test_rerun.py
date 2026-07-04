@@ -97,3 +97,35 @@ def test_rerun_failure_raises_and_never_reenqueues():
         with pytest.raises(RuntimeError):
             rerun.handle_rerun_jobs(_event(_job()))
     enq.assert_not_called()
+
+
+def test_run_one_dispatches_guard(monkeypatch):
+    """#466 (codex PR #482): a guard rerun job drives dispatch_guard_review
+    with the repo's guard_blocking flag - previously it was skipped as an
+    unsupported persona while the API happily queued it."""
+    import json as _json
+
+    import rerun as rr
+
+    monkeypatch.setattr(
+        rr, "with_install_token_retry",
+        lambda iid, fn: {"head": {"sha": "abc"}, "base": {"repo": {"id": 7}}},
+    )
+    monkeypatch.setattr(
+        rr, "get_repo_config",
+        lambda iid, rid: {"guard_blocking": True, "code_reviewer_blocking": False},
+    )
+    called = {}
+    monkeypatch.setattr(
+        rr, "dispatch_guard_review",
+        lambda payload, *, blocking: called.update(blocking=blocking) or {},
+    )
+    monkeypatch.setattr(
+        rr, "dispatch_code_review",
+        lambda *a, **kw: (_ for _ in ()).throw(AssertionError("elder must not run")),
+    )
+    status = rr._run_one(_json.dumps({
+        "install_id": 1, "repo": "o/r", "pr_number": 5, "persona": "guard",
+    }))
+    assert status == "dispatched"
+    assert called["blocking"] is True

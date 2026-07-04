@@ -64,10 +64,15 @@ review comments through Elder's shared dedup path (`grug-rule` markers are
 rule-scoped, so no cross-persona collision). Degraded runs publish neutral
 and record errored Activity rows ("no lies", ADR-0003).
 
-**5. No #418 self-recover for Guard yet.** The rerun lane's persona
-surface (api RerunRequest pattern, rerun consumer) does not carry guard; a
-dropped Guard scan re-triggers on the next push and is visible via the
-offload monitor. Wiring guard into the rerun lane is follow-up scope.
+**5. Guard rides the rerun lane end-to-end (codex PR #482).** The api
+`RerunRequest` accepts `persona=guard`, the rerun consumer dispatches
+`dispatch_guard_review` with `guard_blocking`, and `run_guard_job`
+self-recovers (#418) by enqueueing a guard rerun on an unhandled dispatch
+error. Without this, two real gaps existed: an errored Guard Activity row
+showed a rerun button that silently no-op'd (validation rejected guard and
+the consumer skipped it), and - worse - the head-SHA claim taken before
+dispatch meant a transient Guard failure suppressed that SHA's security
+check until a new push, with no recovery path.
 
 **6. Elder loses the security concat.** `dispatch_code_review` is the LLM
 diff review only; its judge-gated publication (#467) now grades only LLM
