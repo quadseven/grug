@@ -27,7 +27,7 @@ import tempfile
 from dataclasses import dataclass
 from typing import Optional
 
-from llm_client import FindingJudgement, Hunk, JudgeFindingRepr, PrContext, judge_findings
+from llm_client import _cave_judge_config, FindingJudgement, Hunk, JudgeFindingRepr, PrContext, judge_findings
 
 from .diff_parser import DiffHunk
 from .persona import Finding
@@ -328,12 +328,90 @@ def judge_candidates(
     """
     if not candidates:
         return ()
+
+    # #439 (ADR-0009): route the exposed-secret class to the in-cluster
+    # Cave judge (raw value never leaves the boundary) and the remaining
+    # classes to the SaaS judge with REDACTED input (2d). When the Cave is
+    # unconfigured/unreachable, secrets fall back to today's SaaS path
+    # (unredacted - the class needs the raw value; detection beats privacy
+    # regression until the gateway route is live), logged either way.
+    cave = _cave_judge_config()
+    secrets = tuple(c for c in candidates if c.vuln_class == EXPOSED_SECRET)
+    others = tuple(c for c in candidates if c.vuln_class != EXPOSED_SECRET)
+
+    if cave is None or not secrets:
+        # Single-call path. Redact iff no secret candidate rides along
+        # (a secret candidate on SaaS still needs its raw value).
+        kept, _ok = _judge_batch(
+            candidates, hunks, installation_id,
+            pr_context=pr_context, file_contents=file_contents,
+            config=None, redact=not secrets,
+        )
+        return kept
+
+    kept, cave_ok = _judge_batch(
+        secrets, hunks, installation_id,
+        pr_context=pr_context, file_contents=file_contents,
+        config=cave, redact=False,
+    )
+    if not cave_ok:
+        # The Cave judge FAILED (transport/config/parse - NOT an
+        # all-suppressed verdict, which returns judged_ok=True with an
+        # empty kept). FAIL-CLOSED (codex PR #486 round 2): once the
+        # in-cluster boundary is CONFIGURED, a raw secret batch never
+        # falls back to SaaS - the outage moment is exactly when the
+        # privacy control matters most. The secret candidates are
+        # suppressed for THIS pass (same fail-closed shape as any judge
+        # outage), re-triggered on the next push/rerun; the monitored
+        # log line below is the alerting channel.
+        log.warning(
+            "cave_judge_failed_secrets_suppressed",
+            extra={"installation_id": installation_id, "secrets": len(secrets)},
+        )
+        kept = ()
+    else:
+        log.info(
+            "cave_judge_used",
+            extra={"installation_id": installation_id, "secrets": len(secrets),
+                   "kept": len(kept)},
+        )
+    others_kept, _ok = _judge_batch(
+        others, hunks, installation_id,
+        pr_context=pr_context, file_contents=file_contents,
+        config=None, redact=True,
+    )
+    return kept + others_kept
+
+
+def _judge_batch(
+    candidates: tuple[Candidate, ...],
+    hunks: tuple[DiffHunk, ...],
+    installation_id: int,
+    *,
+    pr_context: Optional[PrContext],
+    file_contents: dict[str, str] | None,
+    config,
+    redact: bool,
+) -> tuple[tuple[Finding, ...], bool]:
+    """One judge call over one candidate batch - the pre-#439 body of
+    judge_candidates, parameterized by backend config + redaction.
+
+    Returns (kept_findings, judged_ok). `judged_ok` distinguishes "the
+    judge RAN and returned verdicts" (kept may legitimately be empty -
+    every candidate suppressed) from "the judge FAILED" (error or the
+    ()-on-failure shape) - codex PR #486 HIGH: conflating the two made a
+    legitimately all-suppressed Cave batch retry on SaaS unredacted,
+    leaking exactly the benign/example credentials the in-cluster judge
+    had correctly suppressed."""
+    if not candidates:
+        return (), True
     reprs = [_candidate_to_repr(c) for c in candidates]
     llm_hunks = [Hunk(path=h.file_path, body=h.body) for h in hunks]
     try:
         judgements = judge_findings(
             reprs, llm_hunks, installation_id,
             pr_context=pr_context, file_contents=file_contents,
+            config=config, redact=redact,
         )
     except Exception as e:  # noqa: BLE001 — judge failure must not crash the review
         log.warning(
@@ -341,7 +419,10 @@ def judge_candidates(
             extra={"installation_id": installation_id, "candidates": len(candidates),
                    "kind": type(e).__name__},
         )
-        return ()
+        return (), False
+    if not judgements:
+        # judge_findings' ()-on-failure shape for a non-empty batch.
+        return (), False
 
     by_index = {j.finding_index: j for j in judgements}
     kept: list[Finding] = []
@@ -371,7 +452,7 @@ def judge_candidates(
                 suggestion=None,
             )
         )
-    return tuple(kept)
+    return tuple(kept), True
 
 
 # The judge sees the full raw file content (#336), so its free-text `reasoning`
