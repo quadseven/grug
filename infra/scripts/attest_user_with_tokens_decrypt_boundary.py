@@ -136,7 +136,12 @@ def main() -> int:
             failures.append(f"{store_path.name}: UserWithTokens.oauth_refresh_token must be `str | None` (provider may not rotate). Got non-Optional annotation.")
 
     # Service-scope wall: webhook never references UserWithTokens.
-    if WEBHOOK_DIR.exists():
+    # A missing tree is a FAIL, not a skip - an `if exists()` gate here
+    # would let a rename/move silently evaporate the wall (the vacuous-pass
+    # class attest_mirror_policy_consistency.py is hardened against).
+    if not WEBHOOK_DIR.exists():
+        failures.append(f"{WEBHOOK_DIR.relative_to(REPO_ROOT)} missing — wall scan cannot run")
+    else:
         webhook_hits = _files_referencing("UserWithTokens", WEBHOOK_DIR)
         if webhook_hits:
             failures.append(
@@ -147,7 +152,11 @@ def main() -> int:
     # Construction-site uniqueness: only get_user_with_tokens should call UserWithTokens(...).
     # We allow references in tests + the dataclass def itself; flag any non-test, non-user_store
     # construction site.
-    if API_DIR.exists():
+    if not API_DIR.exists():
+        failures.append(f"{API_DIR.relative_to(REPO_ROOT)} missing — construction-wall scan cannot run")
+    elif not SHARED_DIR.exists():
+        failures.append(f"{SHARED_DIR.relative_to(REPO_ROOT)} missing — construction-wall scan cannot run")
+    else:
         construction_sites: list[str] = []
         for path in [*API_DIR.rglob("*.py"), *SHARED_DIR.rglob("*.py")]:
             if "test" in path.name:

@@ -201,6 +201,14 @@ def scan_semgrep(
         log.info("sast_semgrep_files_skipped_over_budget", extra={"skipped": len(skipped)})
     if not kept_files:
         return ()
+    # The rules dir is resolved from the service cwd post-#77 (ADR-0014) -
+    # a wrong working directory is a REAL misconfiguration class now, and
+    # semgrep without rules = the security scanner silently finding
+    # nothing. Fail loudly-and-degrade with a dedicated, monitorable line
+    # (the missing-BINARY sibling below already has one).
+    if not os.path.isdir(_RULES_DIR):
+        log.error("sast_semgrep_rules_dir_missing", extra={"rules_dir": _RULES_DIR})
+        return ()
     added = _added_lines_by_file(hunks)
     try:
         with tempfile.TemporaryDirectory(prefix="grug-sast-") as tmp:
@@ -224,6 +232,20 @@ def scan_semgrep(
                  "--disable-version-check", "--no-rewrite-rule-ids", tmp],
                 capture_output=True, text=True, timeout=_SEMGREP_TIMEOUT_S,
             )
+            if proc.returncode != 0:
+                # Version-dependent, semgrep can exit non-zero AND emit
+                # parseable-but-empty JSON - without this check that
+                # degrades to a silent zero-findings scan.
+                log.warning(
+                    "sast_semgrep_run_failed",
+                    extra={
+                        "kind": "NonZeroExit",
+                        "returncode": proc.returncode,
+                        "rules_dir": _RULES_DIR,
+                        "stderr": (proc.stderr or "")[:200],
+                    },
+                )
+                return ()
             data = json.loads(proc.stdout)
             tmp_prefix = tmp.rstrip("/") + "/"
     except FileNotFoundError:

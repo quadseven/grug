@@ -32,7 +32,11 @@ jobs:
         run: |
           set -euo pipefail
           if [ "${{ matrix.svc }}" = "webhook" ]; then
-            mods="dispatcher, consumer, async_dispatch, hmac_verify, adapters.install_store, personas.registry, personas.smasher.sandbox, observability, readiness, main"
+            # Includes the LAZY dispatch_path targets (personas.*.dispatch) +
+            # rerun: they are deliberately off dispatcher/main's eager import
+            # graph, so a broken _shared layout could pass an eager-only smoke
+            # and then fail inside every async job at runtime.
+            mods="dispatcher, consumer, async_dispatch, hmac_verify, rerun, adapters.install_store, personas.registry, personas.code_reviewer.dispatch, personas.guard.dispatch, personas.smasher.dispatch, personas.smasher.sandbox, observability, readiness, main"
           else
             mods="admin, installations, auth.github_oauth, crypto.kms_envelope, adapters.user_store, adapters.install_store, personas.registry, observability, readiness, main"
           fi

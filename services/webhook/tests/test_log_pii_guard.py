@@ -53,13 +53,18 @@ def _candidate_files() -> list[Path]:
     # services/_shared/ — scanning SERVICE_DIR alone would silently
     # shrink coverage to the service-local files only, so the shared
     # tree is scanned too (both suites scan it; overlap is harmless).
+    shared_root = SERVICE_DIR.parent / "_shared"
+    # Guard the guard: a wrong/renamed shared root would yield [] silently
+    # and shrink the scan back to service-local files with a green test.
+    assert shared_root.is_dir(), f"shared scan root missing: {shared_root}"
     out: list[Path] = []
-    for root in (SERVICE_DIR, SERVICE_DIR.parent / "_shared"):
+    for root in (SERVICE_DIR, shared_root):
         for path in root.rglob("*.py"):
             rel = path.relative_to(root).as_posix()
             if any(skip in rel for skip in WHITELIST_RELATIVE):
                 continue
             out.append(path)
+    assert any(shared_root in p.parents for p in out), "shared root contributed no files"
     return out
 
 
