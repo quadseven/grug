@@ -74,3 +74,40 @@ def test_thread_names_stay_length_bounded():
         guid_chars = ad._THREAD_NAME_LEN - len(spec.log_prefix) - 1
         name = f"{spec.log_prefix}-{'d' * 64:.{guid_chars}s}"
         assert len(name) == ad._THREAD_NAME_LEN
+
+
+def test_post_init_rejects_illegal_contract_values():
+    """The __post_init__ guards exist to catch future table typos at
+    import time - prove each branch actually fires (audit stage 7)."""
+    import dataclasses
+
+    import pytest
+
+    valid = ad._ASYNC_PERSONAS["guard"]
+    for illegal in (
+        {"claim_namespace": ""},
+        {"dispatch_path": "no.colon.here"},
+        {"runner_name": "handle_guard"},
+        {"log_prefix": ""},
+        {"log_prefix": "x" * ad._THREAD_NAME_LEN},
+    ):
+        with pytest.raises(ValueError):
+            dataclasses.replace(valid, **illegal)
+
+
+def test_image_smoke_covers_every_lazy_dispatch_module():
+    """check.image-build.yml's webhook mods list is hand-maintained; a
+    future async persona missing from it would pass the gate and fail
+    inside every async job in-image - the exact hole the gate closes
+    (audit stage 7)."""
+    from pathlib import Path
+
+    wf = (
+        Path(__file__).resolve().parents[3]
+        / ".github/workflows/check.image-build.yml"
+    ).read_text()
+    for spec in ad._ASYNC_PERSONAS.values():
+        module = spec.dispatch_path.split(":", 1)[0]
+        assert module in wf, (
+            f"{module} missing from the check.image-build.yml import smoke"
+        )
