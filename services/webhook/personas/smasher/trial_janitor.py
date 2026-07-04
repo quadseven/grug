@@ -26,6 +26,11 @@ log = logging.getLogger("grug.smasher.trial_janitor")
 # old is definitively orphaned (no legitimate Trial runs that long).
 _DEFAULT_MAX_AGE_SECONDS = 1800
 
+# Allowlist that maps the (taint-carrying) resource kind to a LITERAL for logs -
+# sanitizes the secret-listing-sourced value so CodeQL's clear-text-secret query
+# doesn't flag it (the value logged is a constant from this dict, not the input).
+_KINDS = {"pvc": "pvc", "secret": "secret", "job": "job"}
+
 
 class JanitorCluster(Protocol):
     def list_orphans(self) -> list[tuple[str, str, str]]:
@@ -58,16 +63,16 @@ def reap_orphans(
         try:
             cluster.delete(kind, name)
             reaped[kind] = reaped.get(kind, 0) + 1
-            # Log the KIND + count only, never the resource name: a Secret's
-            # name flows here, and CodeQL (rightly conservative) taints any
-            # secret-sourced value reaching a log as clear-text-sensitive. The
-            # name is opaque (not the secret value), but kind+count is the
-            # triage signal anyway; drop the name to keep the log clean.
-            log.info("trial_janitor_reaped", extra={"kind": kind})
+            # Never log the resource NAME (a Secret's name flows here; CodeQL
+            # rightly taints any secret-listing-sourced value reaching a log as
+            # clear-text-sensitive) and log a SANITIZED kind: `_KINDS.get(kind)`
+            # returns a literal from the allowlist, which breaks the taint while
+            # keeping the triage label. kind+count is the signal anyway.
+            log.info("trial_janitor_reaped", extra={"kind": _KINDS.get(kind, "other")})
         except Exception as e:  # noqa: BLE001 — one bad delete doesn't stop the sweep
             log.warning(
                 "trial_janitor_delete_failed",
-                extra={"kind": kind, "error": type(e).__name__},
+                extra={"kind": _KINDS.get(kind, "other"), "error": type(e).__name__},
             )
     return reaped
 
