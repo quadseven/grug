@@ -54,6 +54,7 @@ MIRRORED_WITH_HEADER=(
   "personas/code_reviewer/sast.py"
   "personas/code_reviewer/sca.py"
   "personas/code_reviewer/webhook_dispatch.py"
+  "personas/guard/dep_watch.py"
   "personas/guard/dispatch.py"
   "personas/guard/webhook_dispatch.py"
   "personas/pulse/nudge.py"

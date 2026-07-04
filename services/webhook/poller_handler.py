@@ -131,6 +131,31 @@ def handler(event: dict[str, Any], context: Any) -> dict[str, int | str]:
             )
             pulse_failed += 1
 
+    # Guard dependency watch (#491): the owned dependabot-class pass -
+    # same store-driven, best-effort shape as Pulse.
+    dep_reports = 0
+    dep_watch_failed = 0
+    for install_id in installs:
+        try:
+            from adapters.install_store import list_dep_watch_repos
+            from personas.guard.dep_watch import run_dep_watch_for_install
+
+            repos = list_dep_watch_repos(install_id)
+            if not repos:
+                continue
+            filed_failed = with_install_token_retry(
+                install_id,
+                lambda token, iid=install_id, r=repos: run_dep_watch_for_install(token, iid, r),
+            ) or (0, 0)
+            dep_reports += filed_failed[0]
+            dep_watch_failed += filed_failed[1]
+        except Exception as e:  # noqa: BLE001 — one install must not abort the cron
+            log.warning(
+                "dep_watch_install_failed",
+                extra={"install_id": install_id, "kind": type(e).__name__},
+            )
+            dep_watch_failed += 1
+
     # Auto-replay missed webhook deliveries (#407), best-effort: a replay
     # failure must never abort the cron, so it's wrapped here on TOP of
     # replay_since's own per-attempt best-effort.
@@ -147,6 +172,8 @@ def handler(event: dict[str, Any], context: Any) -> dict[str, int | str]:
         "failed_installs": failed_installs,
         "pulse_nudges": nudges,
         "pulse_failed_installs": pulse_failed,
+        "dep_watch_reports": dep_reports,
+        "dep_watch_failed_installs": dep_watch_failed,
         **replay,
     }
     # Total failure (auth/config drift, GitHub down) errors EVERY install and
