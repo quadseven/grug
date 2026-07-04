@@ -742,3 +742,18 @@ def test_warder_pulse_flags_flow_through_config(pg):
     assert cfg["warder_enabled"] is True and cfg["pulse_enabled"] is True
     assert store.is_persona_enabled(1, 55, "warder") is True
     assert store.is_persona_enabled(1, 55, "pulse") is True
+
+
+def test_list_pulse_enabled_repos_targets_only_enabled(pg):
+    """Codex PR #489 r2: Pulse targets CONFIGURED repos from the store -
+    no discovery paging, no starvation."""
+    from adapters import pg_install_store as store
+
+    store.set_repo_config(install_id=3, repo_id=101, repo_full_name="o/on",
+                          updated_by_user_id="9", pulse_enabled=True)
+    store.set_repo_config(install_id=3, repo_id=102, repo_full_name="o/off",
+                          updated_by_user_id="9", pulse_enabled=False)
+    store.set_repo_config(install_id=3, repo_id=103, repo_full_name="o/unset",
+                          updated_by_user_id="9")
+    rows = store.list_pulse_enabled_repos(3)
+    assert rows == [{"id": 101, "full_name": "o/on"}]
