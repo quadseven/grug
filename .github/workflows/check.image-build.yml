@@ -43,8 +43,12 @@ jobs:
           # boto3 clients constructed at import (crypto/kms_envelope.py) need
           # a region; hosted runners/containers have no ambient AWS config -
           # same benign-placeholder pattern check.python.yml uses for the moto suites.
+          # The trailing provenance assert (peer review, PR #495) proves the
+          # shared modules resolve from /app/_shared INSIDE the image - not a
+          # stray in-image copy under /app - so a future Dockerfile COPY
+          # mistake cannot silently serve a duplicate.
           docker run --rm \
             -e AWS_DEFAULT_REGION=us-east-1 \
             -e AWS_ACCESS_KEY_ID=smoke -e AWS_SECRET_ACCESS_KEY=smoke \
             "grug-${{ matrix.svc }}:pr-smoke" \
-            python -c "import ${mods}; print('IMPORTS OK')"
+            python -c "import ${mods}; import observability, adapters.install_store as _s; assert '_shared' in observability.__file__ and '_shared' in _s.__file__, (observability.__file__, _s.__file__); print('IMPORTS OK')"
