@@ -144,3 +144,63 @@ def test_cave_outage_falls_back_to_saas_for_secrets(monkeypatch):
     )
     assert len(kept) == 1          # detection preserved
     assert calls == ["cave", "saas"]  # cave tried first, SaaS rescued
+
+
+def test_real_judge_findings_uses_cave_backend(monkeypatch):
+    """Codex PR #486 CRITICAL regression: call the REAL judge_findings
+    with a Cave config, mocking only _call_backend - the override path
+    must reach the Cave URL (no UnboundLocalError, no silent SaaS
+    fallback)."""
+    import httpx as _httpx
+
+    monkeypatch.setenv("GRUG_CAVE_GATEWAY_URL", "http://gw.example.svc:8080")
+    cfg = _cave_judge_config()
+    seen = {}
+
+    def fake_call_backend(config, messages):
+        seen["url"] = config.url
+        seen["backend"] = config.backend.value
+        return _httpx.Response(
+            200,
+            json={"choices": [{"message": {"content":
+                '{"verdicts": [{"index": 0, "is_real_bug": true, '
+                '"confidence": 0.9, "reasoning": "live key"}]}'}}]},
+            request=_httpx.Request("POST", config.url),
+        )
+
+    monkeypatch.setattr(llm_client, "_call_backend", fake_call_backend)
+    reprs = [{"rule_name": EXPOSED_SECRET, "file": ".env", "line": 1,
+              "severity": "high", "message": "masked"}]
+    verdicts = llm_client.judge_findings(
+        reprs, [Hunk(path=".env", body="+k=v")], 1, config=cfg,
+    )
+    assert seen["backend"] == "cave"
+    assert seen["url"].startswith("http://gw.example.svc:8080")
+    assert len(verdicts) == 1 and verdicts[0].is_real_bug is True
+
+
+def test_cave_all_suppressed_does_not_retry_on_saas(monkeypatch):
+    """Codex PR #486 HIGH regression: a Cave batch whose verdicts mark
+    EVERY secret candidate not-real is a SUCCESSFUL judgement (kept=()),
+    not an outage - the raw batch must NOT retry on SaaS."""
+    monkeypatch.setenv("GRUG_CAVE_GATEWAY_URL", "http://gw.example.svc:8080")
+    backends_called = []
+
+    def fake_judge(reprs, hunks, installation_id, pr_context=None,
+                   file_contents=None, *, config=None, redact=False):
+        backend = getattr(getattr(config, "backend", None), "value", "saas")
+        backends_called.append(backend)
+        if backend == "cave":
+            # Complete verdicts: every candidate judged NOT real.
+            return tuple(
+                FindingJudgement(i, False, "docs example", 0.95)
+                for i in range(len(reprs))
+            )
+        return tuple(FindingJudgement(i, True, "r", 0.9) for i in range(len(reprs)))
+
+    monkeypatch.setattr(sast, "judge_findings", fake_judge)
+    kept = judge_candidates(
+        (Candidate(EXPOSED_SECRET, ".env", 1, "AWS key (masked)"),), _hunks(), 1,
+    )
+    assert kept == ()                    # suppression honored
+    assert backends_called == ["cave"]   # NO SaaS retry with the raw value

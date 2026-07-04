@@ -342,29 +342,28 @@ def judge_candidates(
     if cave is None or not secrets:
         # Single-call path. Redact iff no secret candidate rides along
         # (a secret candidate on SaaS still needs its raw value).
-        return _judge_batch(
+        kept, _ok = _judge_batch(
             candidates, hunks, installation_id,
             pr_context=pr_context, file_contents=file_contents,
             config=None, redact=not secrets,
         )
+        return kept
 
-    kept = _judge_batch(
+    kept, cave_ok = _judge_batch(
         secrets, hunks, installation_id,
         pr_context=pr_context, file_contents=file_contents,
         config=cave, redact=False,
     )
-    if not kept and secrets:
-        # () from a non-empty batch is the judge ERROR shape (a legit
-        # all-not-real result returns verdicts, filtered inside). Retry
-        # the secret batch on SaaS (today's behavior) so a Cave outage
-        # cannot silently kill secret detection. May double-judge a batch
-        # the Cave legitimately suppressed entirely - acceptable: the
-        # SaaS judge then re-suppresses, at one extra call.
+    if not cave_ok:
+        # The Cave judge FAILED (transport/config/parse - NOT an
+        # all-suppressed verdict, which returns judged_ok=True with an
+        # empty kept). Retry the secret batch on SaaS (today's path) so
+        # a Cave outage cannot silently kill secret detection.
         log.warning(
-            "cave_judge_empty_fell_back_to_saas",
+            "cave_judge_failed_fell_back_to_saas",
             extra={"installation_id": installation_id, "secrets": len(secrets)},
         )
-        kept = _judge_batch(
+        kept, _ok = _judge_batch(
             secrets, hunks, installation_id,
             pr_context=pr_context, file_contents=file_contents,
             config=None, redact=False,
@@ -375,11 +374,12 @@ def judge_candidates(
             extra={"installation_id": installation_id, "secrets": len(secrets),
                    "kept": len(kept)},
         )
-    return kept + _judge_batch(
+    others_kept, _ok = _judge_batch(
         others, hunks, installation_id,
         pr_context=pr_context, file_contents=file_contents,
         config=None, redact=True,
     )
+    return kept + others_kept
 
 
 def _judge_batch(
@@ -391,11 +391,19 @@ def _judge_batch(
     file_contents: dict[str, str] | None,
     config,
     redact: bool,
-) -> tuple[Finding, ...]:
+) -> tuple[tuple[Finding, ...], bool]:
     """One judge call over one candidate batch - the pre-#439 body of
-    judge_candidates, parameterized by backend config + redaction."""
+    judge_candidates, parameterized by backend config + redaction.
+
+    Returns (kept_findings, judged_ok). `judged_ok` distinguishes "the
+    judge RAN and returned verdicts" (kept may legitimately be empty -
+    every candidate suppressed) from "the judge FAILED" (error or the
+    ()-on-failure shape) - codex PR #486 HIGH: conflating the two made a
+    legitimately all-suppressed Cave batch retry on SaaS unredacted,
+    leaking exactly the benign/example credentials the in-cluster judge
+    had correctly suppressed."""
     if not candidates:
-        return ()
+        return (), True
     reprs = [_candidate_to_repr(c) for c in candidates]
     llm_hunks = [Hunk(path=h.file_path, body=h.body) for h in hunks]
     try:
@@ -410,7 +418,10 @@ def _judge_batch(
             extra={"installation_id": installation_id, "candidates": len(candidates),
                    "kind": type(e).__name__},
         )
-        return ()
+        return (), False
+    if not judgements:
+        # judge_findings' ()-on-failure shape for a non-empty batch.
+        return (), False
 
     by_index = {j.finding_index: j for j in judgements}
     kept: list[Finding] = []
@@ -440,7 +451,7 @@ def _judge_batch(
                 suggestion=None,
             )
         )
-    return tuple(kept)
+    return tuple(kept), True
 
 
 # The judge sees the full raw file content (#336), so its free-text `reasoning`
