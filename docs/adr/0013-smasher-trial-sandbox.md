@@ -42,11 +42,16 @@ it):
     extraction runs no author build backends, so NO author code runs in prep).
 - **test pod** (`grug-trial-phase: test`, DENY-ALL egress):
   - `test` — NO token, NO secrets, DENY-ALL egress (deps are vendored on the
-    PVC, so it needs no network), `readOnlyRootFilesystem` (+ writable `/tmp` +
-    the PVC), `runAsNonRoot`, all caps dropped, `seccompProfile: RuntimeDefault`,
-    CPU/memory limits. Runs the mutation worker; this is the ONLY phase author
-    code executes, now fully network-jailed (on a policy CNI) and holding
-    nothing to steal.
+    PVC, so it needs no network), `runAsNonRoot`, all caps dropped,
+    `seccompProfile: RuntimeDefault`, CPU/memory limits. Runs the mutation
+    worker; this is the ONLY phase author code executes, now fully
+    network-jailed (on a policy CNI) and holding nothing to steal.
+  - The PVC (pristine checkout + vendored deps) is mounted READ-ONLY here, so
+    author pytest — same UID, same volume — is KERNEL-BLOCKED from writing back
+    to `/workspace/repo` to poison the source of the per-mutant copies
+    (peer-review PR #494; enforced, not by-convention). Each baseline/mutant is
+    copied into a separate WRITABLE `scratch` emptyDir and run there; the copy is
+    discarded after, so no run can pollute another.
 - The **shared PVC** (node-local `local-path`, `WaitForFirstConsumer`) carries
   the checkout+deps between the pods; the binding pins the test pod to the prep
   pod's node. The launcher creates the PVC + Secret, runs prep, DROPS the Secret
