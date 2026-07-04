@@ -1,6 +1,6 @@
 # MIRRORED — sibling at services/webhook/personas/code_reviewer/cross_file.py; keep in lockstep. See docs/adr/0001-mirror-with-rule-of-three-deferral.md.
 """Cross-file review context - 1-hop symbol resolution (#468, epic #464
-slice 4 = PRD #346 P1.1, the Greptile-class capability tracer).
+slice 4 = PRD #346 P1.1, the repo-graph review capability tracer).
 
 The Elder sees changed files (whole-file since #336) but nothing else in
 the repo. The highest-value review questions are cross-file: "does the

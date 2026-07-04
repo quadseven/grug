@@ -731,7 +731,7 @@ def review_diff(
         # so DD captures latency tails and per-backend error rates. A
         # surprise exception escaping `_call_backend` would propagate
         # without annotation — that's intentional (it's a bug worth
-        # seeing in Sentry, not a routine signal).
+        # seeing in Seer, not a routine signal).
         start_ns = time.monotonic_ns()
         with _llmobs_llm(
             model_name=config.model,

@@ -183,7 +183,7 @@ def upsert_oauth_user(
     no read-then-write window in which an admin-side change could be
     silently reverted (lost-update anomaly, peer-review CRITICAL 4x on
     the DDB original). An existing refresh blob is preserved when GitHub
-    re-auth returns access without rotating refresh (Sentry HIGH #39).
+    re-auth returns access without rotating refresh (Seer HIGH #39).
     """
     from crypto.kms_envelope import encrypt_for_user  # lazy import
 

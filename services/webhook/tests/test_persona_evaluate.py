@@ -17,7 +17,7 @@ from personas.tpm.dor_checks import CheckResult
 
 
 _GOOD_BODY = """## Why
-We need this for the launch tomorrow morning, fixes a Sentry HIGH.
+We need this for the launch tomorrow morning, fixes a Seer HIGH.
 
 ## Acceptance criteria
 - [x] one
@@ -33,7 +33,7 @@ closes #1
 """
 
 _BODY_MISSING_ISSUE_LINK = """## Why
-We need this for the launch tomorrow morning, fixes a Sentry HIGH.
+We need this for the launch tomorrow morning, fixes a Seer HIGH.
 
 ## Acceptance criteria
 - [x] one
@@ -47,7 +47,7 @@ nothing
 """
 
 _BODY_MISSING_SCOPE_FENCE = """## Why
-We need this for the launch tomorrow morning, fixes a Sentry HIGH.
+We need this for the launch tomorrow morning, fixes a Seer HIGH.
 
 ## Acceptance criteria
 - [x] one
@@ -60,7 +60,7 @@ closes #1
 """
 
 _BODY_MISSING_SCOPE_AND_LINK = """## Why
-We need this for the launch tomorrow morning, fixes a Sentry HIGH.
+We need this for the launch tomorrow morning, fixes a Seer HIGH.
 
 ## Acceptance criteria
 - [x] one

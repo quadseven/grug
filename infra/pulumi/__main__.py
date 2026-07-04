@@ -137,7 +137,7 @@ cf_secret = cf_shared_secret.create()
 
 
 # Full 40-char commit SHA — DD source-code linking requires the full
-# SHA (Greptile P1 PR #81). CI passes via config; falls back to the api
+# SHA (review-bot P1 PR #81). CI passes via config; falls back to the api
 # image tag (the webhook Lambda retired at the #354 k8s cutover).
 # Elder prompt A/B experiment mode (#191). A plain String (NOT SecureString —
 # it's a non-secret operational toggle): one of "off" | "split" | "all_v2".

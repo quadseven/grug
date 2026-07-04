@@ -15,7 +15,7 @@ rule. New PRs that introduce a `log.X("...", oauth_access_token=...)`
 Pattern history: peer-review on PR #151 surfaced the audit category
 "PII / secrets emitted into logs / spans / breadcrumbs" (audit.md Stage
 8). This guard catches the simple textual form; structured-attribute
-leaks via Sentry breadcrumbs need a separate runtime check.
+leaks via error-tracker breadcrumbs need a separate runtime check.
 """
 
 from __future__ import annotations
