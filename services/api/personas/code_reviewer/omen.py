@@ -111,9 +111,14 @@ def build_runtime_context(
     # traceback paths while disambiguating; top-level files keep their
     # basename. Changed paths whose tokens still collide are SKIPPED
     # (ambiguous attribution is worse than no signal), logged.
+    # The FULL path is rendered into the prompt block, so it must pass
+    # the same allowlist as the query token (codex PR #490 r3: an unsafe
+    # earlier segment with a safe suffix would otherwise ride into the
+    # LLM prompt as an injection channel).
     token_by_path: dict[str, str] = {
         h.file_path: "/".join(h.file_path.split("/")[-2:])
-        for h in hunks if h.file_path
+        for h in hunks
+        if h.file_path and _SAFE_TOKEN_RE.match(h.file_path)
     }
     token_owners: dict[str, list[str]] = {}
     for path, tok in token_by_path.items():
