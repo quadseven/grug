@@ -23,8 +23,10 @@ import json
 import logging
 import os
 import shutil
+import signal
 import subprocess
 import sys
+import time
 from contextlib import contextmanager
 from pathlib import Path
 from typing import Any, Callable
@@ -228,40 +230,66 @@ def main() -> int:
         per_mutant_timeout=timeout,
         run_tests=_default_run_tests,
     )
-    # AI-REVIEW 2026-07-04 [codex (peer-review, PR #494)] HIGH: an author test
+    # AI-REVIEW 2026-07-04 [codex (peer-review, PR #494)] HIGH+MED: an author test
     # could daemonize a process (double-fork/setsid) that survives pytest and
     # OVERWRITES /dev/termination-log AFTER the worker writes the authoritative
     # result, forging a clean pass. Kill every other process in this PID
-    # namespace before the authoritative write so no author-spawned survivor can
-    # race it. Gated on PID 1 (we own the namespace only inside the sandbox pod)
-    # so a local run never reaps the developer's processes.
-    _reap_other_processes()
+    # namespace before the authoritative write. SIGKILL is async, so we CONFIRM
+    # the namespace is empty (bounded retry); if any process survives, we cannot
+    # trust the result channel - write a DEGRADED result rather than a possibly-
+    # forged `completed` one. PID-1 gated so a local run never reaps developer
+    # processes (and is trivially "clean").
+    if not _reap_other_processes():
+        log.error("trial_reap_incomplete")
+        summary = _summary("degraded", reason="reap_incomplete")
     _write_termination(summary)
     # Exit 0 regardless of survivors: the Job SUCCEEDED at measuring; survivors
     # are a finding, not a Job failure (which would trip backoff semantics).
     return 0
 
 
-def _reap_other_processes() -> None:
+def _reap_other_processes() -> bool:
     """Kill every OTHER process in this PID namespace so an author-spawned
     daemon cannot overwrite the termination message after the worker's
-    authoritative write (codex peer-review, PR #494). Best-effort + only acts
-    when this worker is PID 1 (i.e. inside the sandbox pod it owns) - a local
-    run is a no-op, never touching the developer's processes."""
+    authoritative write (codex peer-review, PR #494). Returns True when the
+    namespace is CONFIRMED clean (only the worker remains). Only acts when this
+    worker is PID 1 (inside the sandbox pod it owns) - a local run is a no-op.
+
+    SIGKILL is asynchronous, so we don't trust a single pass: sweep + reap
+    zombies + re-check in a bounded loop, and report whether the namespace is
+    actually empty. The caller degrades the result if it is NOT confirmed clean
+    (rather than writing a possibly-forgeable `completed`)."""
     if os.getpid() != 1:
-        return
-    import signal
-    try:
-        pids = [int(p) for p in os.listdir("/proc") if p.isdigit()]
-    except OSError:
-        return
-    for pid in pids:
-        if pid == 1:  # never the worker itself
-            continue
+        return True
+    for _ in range(_REAP_MAX_PASSES):
+        others = _other_pids()
+        if not others:
+            return True
+        for pid in others:
+            try:
+                os.kill(pid, signal.SIGKILL)
+            except (ProcessLookupError, PermissionError, OSError):
+                continue
+        # Reap any children/reparented zombies so they leave /proc.
         try:
-            os.kill(pid, signal.SIGKILL)
-        except (ProcessLookupError, PermissionError, OSError):
-            continue
+            while os.waitpid(-1, os.WNOHANG)[0]:
+                pass
+        except (ChildProcessError, OSError):
+            pass
+        time.sleep(_REAP_PASS_SLEEP_SECONDS)
+    return not _other_pids()
+
+
+_REAP_MAX_PASSES = 20
+_REAP_PASS_SLEEP_SECONDS = 0.1
+
+
+def _other_pids() -> list[int]:
+    """PIDs in this namespace other than the worker itself (PID 1)."""
+    try:
+        return [int(p) for p in os.listdir("/proc") if p.isdigit() and p != "1"]
+    except OSError:
+        return []
 
 
 def _int_env(name: str, default: int) -> int:

@@ -183,6 +183,12 @@ def _swallow(fn) -> None:
         log.debug("smasher_cleanup_noop", extra={"kind": type(e).__name__})
 
 
+def build_janitor_cluster() -> "_HttpxCluster | None":
+    """The orphan janitor (trial_janitor.py) uses the same launcher client -
+    it needs list + delete on the grug-trial PVC/Secret/Job objects."""
+    return _default_cluster()
+
+
 def _default_cluster() -> "_HttpxCluster | None":
     """Build the real in-cluster client from the mounted SA creds, or None when
     not running in a pod with the launcher token (local/test/misconfigured)."""
@@ -283,3 +289,21 @@ class _HttpxCluster:
         )
         if resp.status_code not in (200, 202, 404):
             resp.raise_for_status()
+
+    # --- orphan janitor surface (trial_janitor.py) ---
+
+    def list_orphans(self) -> list[tuple[str, str, str]]:
+        """(kind, name, creationTimestamp) for every app=grug-trial PVC/Secret/Job."""
+        out: list[tuple[str, str, str]] = []
+        for kind, url in (("pvc", self._pvcs), ("secret", self._secrets), ("job", self._jobs)):
+            resp = self._client.get(url, params={"labelSelector": "app=grug-trial"}, timeout=15)
+            resp.raise_for_status()
+            for item in resp.json().get("items", []):
+                meta = item.get("metadata", {})
+                name, created = meta.get("name"), meta.get("creationTimestamp")
+                if name and created:
+                    out.append((kind, name, created))
+        return out
+
+    def delete(self, kind: str, name: str) -> None:
+        {"pvc": self.delete_pvc, "secret": self.delete_secret, "job": self.delete_job}[kind](name)

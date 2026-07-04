@@ -7,9 +7,15 @@
 # namespace. If Trial Jobs were created in the `grug` namespace, a compromised
 # webhook pod could create a Job borrowing `grug-key-rotator` (which can patch
 # the `grug-secrets` AWS credential). Running Trials in THIS namespace - which
-# holds NO secrets and NO privileged ServiceAccounts (only the permissionless
-# `default` SA) - removes anything worth borrowing, so the primitive is inert.
-# This is CNI-independent (unlike the egress NetworkPolicy).
+# holds NO privileged ServiceAccount (only the permissionless `default` SA) and
+# NO secret that grants access to grug-secrets (only the EPHEMERAL per-Trial
+# contents:read token, reaped after prep, plus the read-only `registry-pull`
+# image credential) - removes anything worth borrowing, so the primitive is
+# inert. This is CNI-independent (unlike the egress NetworkPolicy).
+#
+# DEPLOY NOTE: seed the `registry-pull` image-pull Secret in this namespace too
+# (the Trial + janitor pods pull the private grug image); if it is missing the
+# pull just fails and the Trial degrades to advisory-neutral.
 apiVersion: v1
 kind: Namespace
 metadata:
@@ -57,14 +63,16 @@ rules:
   - apiGroups: [""]
     resources: ["pods"]
     verbs: ["get", "list"]
+  # `list` (not just get/delete) so the orphan janitor can find leaked
+  # Secrets/PVCs by label after a launcher crash.
   - apiGroups: [""]
     resources: ["secrets"]
-    verbs: ["create", "get", "delete"]
+    verbs: ["create", "get", "list", "delete"]
   # The per-Trial shared workspace PVC (carries the checkout+deps from the prep
   # pod to the network-jailed test pod).
   - apiGroups: [""]
     resources: ["persistentvolumeclaims"]
-    verbs: ["create", "get", "delete"]
+    verbs: ["create", "get", "list", "delete"]
 ---
 # Bind the grug-namespace launcher SA (mounted on the webhook + consumer pods)
 # to the grug-trial Role. Cross-namespace subject is explicit + intentional.
@@ -133,3 +141,74 @@ metadata:
 spec:
   podSelector: {}
   policyTypes: [Egress]
+---
+# The orphan janitor (not a Trial phase) needs the k8s API (DNS + 443) to list +
+# delete leaked resources. It runs NO author code.
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: allow-egress-janitor
+  namespace: grug-trial
+spec:
+  podSelector:
+    matchLabels: {grug-trial-role: janitor}
+  policyTypes: [Egress]
+  egress:
+    - ports:
+        - {protocol: UDP, port: 53}
+        - {protocol: TCP, port: 53}
+    - ports:
+        - {protocol: TCP, port: 443}
+---
+# Reap app=grug-trial PVCs/Secrets/Jobs left behind by a launcher-pod crash
+# mid-run (the in-process finally cleanup is skipped on a crash; Jobs TTL-clean
+# but PVCs/Secrets don't). Runs as the launcher SA (list+delete in grug-trial
+# only). Labelled `app: grug-trial-janitor` (NOT `grug-trial`) so it never reaps
+# its own Jobs. Restricted-PSS-compliant (the namespace enforces it).
+apiVersion: batch/v1
+kind: CronJob
+metadata:
+  name: grug-trial-janitor
+  namespace: grug-trial
+  labels: {app: grug-trial-janitor}
+spec:
+  schedule: "*/15 * * * *"
+  concurrencyPolicy: Forbid
+  successfulJobsHistoryLimit: 1
+  failedJobsHistoryLimit: 2
+  jobTemplate:
+    metadata:
+      labels: {app: grug-trial-janitor}
+    spec:
+      activeDeadlineSeconds: 120
+      backoffLimit: 1
+      ttlSecondsAfterFinished: 300
+      template:
+        metadata:
+          labels: {app: grug-trial-janitor, grug-trial-role: janitor}
+        spec:
+          serviceAccountName: grug-smasher-launcher
+          automountServiceAccountToken: true
+          restartPolicy: Never
+          nodeSelector: {kubernetes.io/arch: arm64}
+          imagePullSecrets:
+            - name: registry-pull
+          containers:
+            - name: janitor
+              image: REGISTRY_PLACEHOLDER/grug-webhook:TAG_PLACEHOLDER
+              command: ["python", "-m", "personas.smasher.trial_janitor"]
+              securityContext:
+                runAsNonRoot: true
+                runAsUser: 10001
+                allowPrivilegeEscalation: false
+                readOnlyRootFilesystem: true
+                capabilities: {drop: ["ALL"]}
+                seccompProfile: {type: RuntimeDefault}
+              resources:
+                requests: {cpu: 50m, memory: 64Mi}
+                limits: {cpu: 250m, memory: 128Mi}
+              volumeMounts:
+                - {name: tmp, mountPath: /tmp}
+          volumes:
+            - name: tmp
+              emptyDir: {sizeLimit: 16Mi}

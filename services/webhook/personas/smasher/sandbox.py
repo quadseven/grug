@@ -272,6 +272,7 @@ def build_prep_job(
         "automountServiceAccountToken": False,
         "restartPolicy": "Never",
         "nodeSelector": {"kubernetes.io/arch": "arm64"},
+        "imagePullSecrets": [{"name": "registry-pull"}],
         "initContainers": [fetch_init],
         "containers": [deps_main],
         "volumes": _pvc_volumes(pvc_name),
@@ -322,6 +323,7 @@ def build_test_job(
         "automountServiceAccountToken": False,
         "restartPolicy": "Never",
         "nodeSelector": {"kubernetes.io/arch": "arm64"},
+        "imagePullSecrets": [{"name": "registry-pull"}],
         "containers": [test_container],
         "volumes": _pvc_volumes(pvc_name) + [{"name": "scratch", "emptyDir": {"sizeLimit": "1Gi"}}],
     }
