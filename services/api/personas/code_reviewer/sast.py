@@ -357,17 +357,18 @@ def judge_candidates(
     if not cave_ok:
         # The Cave judge FAILED (transport/config/parse - NOT an
         # all-suppressed verdict, which returns judged_ok=True with an
-        # empty kept). Retry the secret batch on SaaS (today's path) so
-        # a Cave outage cannot silently kill secret detection.
+        # empty kept). FAIL-CLOSED (codex PR #486 round 2): once the
+        # in-cluster boundary is CONFIGURED, a raw secret batch never
+        # falls back to SaaS - the outage moment is exactly when the
+        # privacy control matters most. The secret candidates are
+        # suppressed for THIS pass (same fail-closed shape as any judge
+        # outage), re-triggered on the next push/rerun; the monitored
+        # log line below is the alerting channel.
         log.warning(
-            "cave_judge_failed_fell_back_to_saas",
+            "cave_judge_failed_secrets_suppressed",
             extra={"installation_id": installation_id, "secrets": len(secrets)},
         )
-        kept, _ok = _judge_batch(
-            secrets, hunks, installation_id,
-            pr_context=pr_context, file_contents=file_contents,
-            config=None, redact=False,
-        )
+        kept = ()
     else:
         log.info(
             "cave_judge_used",

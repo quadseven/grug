@@ -73,7 +73,12 @@ spec:
     - ports:
         - {protocol: TCP, port: 5432}
     # In-cluster spark-gateway (exposed-secret judge, #439 / ADR-0009).
-    - ports:
+    # Namespace-scoped (unlike the port-only rules above - this dest is
+    # a single known namespace, so the CIDR-pinning follow-up is free).
+    - to:
+        - namespaceSelector:
+            matchLabels: {kubernetes.io/metadata.name: spark-gateway}
+      ports:
         - {protocol: TCP, port: 8080}
     # Node-local Datadog agent: DogStatsD (UDP 8125) + APM trace intake
     # (TCP 8126). Restricting these would silently kill observability.

@@ -124,9 +124,12 @@ def test_no_secrets_saas_call_is_redacted(monkeypatch):
     assert calls[0]["redact"] is True  # 2d applies even pre-Cave
 
 
-def test_cave_outage_falls_back_to_saas_for_secrets(monkeypatch):
-    """A Cave error (judge returns () for a non-empty batch) must not
-    kill secret detection - the batch retries on SaaS."""
+def test_cave_outage_fails_closed_no_saas_leak(monkeypatch):
+    """Codex PR #486 round 2: once the in-cluster boundary is CONFIGURED,
+    a Cave outage suppresses the secret batch for this pass - it must
+    NEVER retry on SaaS with the raw value (the outage moment is exactly
+    when the privacy control matters). Next push/rerun heals; the
+    monitored log line alerts."""
     monkeypatch.setenv("GRUG_CAVE_GATEWAY_URL", "http://gw.example.svc:8080")
     calls = []
 
@@ -142,8 +145,8 @@ def test_cave_outage_falls_back_to_saas_for_secrets(monkeypatch):
     kept = judge_candidates(
         (Candidate(EXPOSED_SECRET, ".env", 1, "AWS key (masked)"),), _hunks(), 1,
     )
-    assert len(kept) == 1          # detection preserved
-    assert calls == ["cave", "saas"]  # cave tried first, SaaS rescued
+    assert kept == ()          # fail-closed for this pass
+    assert calls == ["cave"]   # the raw batch never reached SaaS
 
 
 def test_real_judge_findings_uses_cave_backend(monkeypatch):
