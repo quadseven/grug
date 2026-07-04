@@ -178,7 +178,7 @@ def test_real_judge_findings_uses_cave_backend(monkeypatch):
         reprs, [Hunk(path=".env", body="+k=v")], 1, config=cfg,
     )
     assert seen["backend"] == "cave"
-    assert seen["url"].startswith("http://gw.example.svc:8080")
+    assert seen["url"] == "http://gw.example.svc:8080/v1/chat/completions"
     assert len(verdicts) == 1 and verdicts[0].is_real_bug is True
 
 
