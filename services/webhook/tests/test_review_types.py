@@ -104,6 +104,6 @@ def test_persona_names_round_trip():
 
 def test_persona_mappers_reject_unknown():
     with pytest.raises(ValueError):
-        review_types.persona_for_key("smasher")
+        review_types.persona_for_key("bogus_persona")
     with pytest.raises(ValueError):
         review_types.key_for_persona("omen")

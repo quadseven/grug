@@ -200,6 +200,7 @@ _DEFAULT_PERSONA_CONFIG = {
     "guard_blocking": False,
     "warder_enabled": False,
     "pulse_enabled": False,
+    "smasher_enabled": False,  # execution tracer (#469): opt-in per repo
 }
 
 

@@ -158,6 +158,37 @@ For self-hosters:
 - You control your own DD alert routing (or remove DD entirely)
 - You run your own cluster's Datadog agent (or drop `DD_*` from the manifests)
 
+## Smasher Trial (mutation testing) — enablement + preconditions (#469)
+
+The Smasher persona runs diff-scoped MUTATION TESTING: it launches a
+locked-down Kubernetes Job that checks out the PR at its head SHA, mutates the
+added lines, and runs the repo's own test suite per mutant. A mutant the tests
+still pass on ("survived") is an executable proof of a coverage gap.
+
+Because the Job executes PR-author-controlled code (the repo's tests + the code
+under test), Smasher is OFF by default and gated behind a TWO-KEY enable, and it
+has a hard cluster precondition:
+
+1. **Policy-enforcing CNI is REQUIRED.** The Trial pod's network isolation
+   (`allow-egress-trial` NetworkPolicy) is only enforced by a policy-capable CNI
+   (Calico, Cilium, ...). On a non-policy CNI (e.g. flannel) the policy is inert
+   and the test phase could reach the cluster network. The load-bearing
+   isolation is credential-denial (the test phase gets NO ServiceAccount token
+   and NO secrets), but the network jail needs the policy CNI. DO NOT enable
+   Smasher on a flannel-only cluster.
+2. **Global master switch** — set the SSM String `/grug/smasher-enabled` to
+   `true`. Absent/false keeps Smasher globally off regardless of per-repo config.
+3. **Per-repo opt-in** — enable `smasher_enabled` on the repo (config API).
+   Default OFF.
+4. **Trust framing** — only enable Smasher on repos whose PR authors you trust
+   at the level of "may run code in the sandbox." The sandbox bounds credential
+   theft and resource use, not intent.
+
+RBAC: applying `k8s/smasher-rbac.yaml` creates the minimal `grug-smasher-launcher`
+ServiceAccount (Jobs + Pods verbs only). The webhook + consumer deployments run
+as this SA so they can launch Trial Jobs; the SA cannot read Secrets or escalate.
+See `docs/adr/0013-smasher-trial-sandbox.md` for the full boundary design.
+
 ## Compliance with AGPL-3.0
 
 If you modify Grug and offer the modified version as a network

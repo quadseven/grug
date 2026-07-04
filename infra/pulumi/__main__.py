@@ -169,6 +169,21 @@ _fallback_enabled = aws.ssm.Parameter(
     description="Enable Elder's owned cave fallback when both cloud LLMs fail (ADR-0005, #310).",
     opts=pulumi.ResourceOptions(ignore_changes=["value"]),
 )
+
+# --- Smasher Trial global master switch (ADR-0013, #469) ---
+# Pulumi OWNS the param + "false" default (all-Pulumi rule); `ignore_changes`
+# hands the toggle to the operator (no redeploy). The webhook + consumer read it
+# fallback-safe (secrets_loader.get_smasher_enabled → False on any error), so
+# Smasher can never turn ITSELF on. Enabling also requires per-repo opt-in AND a
+# policy-enforcing CNI (see docs/SELF_HOST.md § Smasher).
+_smasher_enabled = aws.ssm.Parameter(
+    "grug-smasher-enabled",
+    name="/grug/smasher-enabled",
+    type="String",
+    value="false",
+    description="Global master switch for the Smasher Trial mutation testing (ADR-0013, #469).",
+    opts=pulumi.ResourceOptions(ignore_changes=["value"]),
+)
 # DLQs (#312): a poison message that fails maxReceiveCount times lands here
 # instead of vanishing or looping forever — the operator-visible "stuck" signal.
 # FIFO source → FIFO DLQ. The jobs DLQ is the meaningful one (a job the connector
