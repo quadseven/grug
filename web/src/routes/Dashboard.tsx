@@ -285,6 +285,7 @@ function ReposPanel({ show, installId, reposLoading, fireToast }: { show: boolea
           {!repos.isLoading && filtered.map((r) => (
             <RepoRow key={r.repo_id} repo={r} installId={installId!}
               onToggle={(enabled) => { setConfig.mutate({ repo_id: r.repo_id, tpm_enabled: enabled }); const nm = esc(r.full_name.split("/")[1] ?? ""); fireToast(enabled ? `Grug now guard <span class="am">${nm}</span>.` : `Grug sleep on <span class="am">${nm}</span>.`); }}
+              onGuardToggle={(enabled) => { setConfig.mutate({ repo_id: r.repo_id, tpm_enabled: r.config.tpm_enabled, guard_enabled: enabled }); const nm = esc(r.full_name.split("/")[1] ?? ""); fireToast(enabled ? `Guard watch <span class="am">${nm}</span>. Evil shall not pass.` : `Guard sleep on <span class="am">${nm}</span>.`); }}
               onFix={() => fixEnforcement.mutate(r.repo_id)}
               fixPending={fixEnforcement.isPending && fixEnforcement.variables === r.repo_id}
               fixError={fixEnforcement.isError && fixEnforcement.variables === r.repo_id ? ((fixEnforcement.error as Error)?.message ?? "fix failed") : undefined}
@@ -299,11 +300,14 @@ function ReposPanel({ show, installId, reposLoading, fireToast }: { show: boolea
   );
 }
 
-function RepoRow({ repo, installId, onToggle, onFix, fixPending, fixError }: {
-  repo: Repo; installId: number; onToggle: (e: boolean) => void; onFix: () => void; fixPending: boolean; fixError?: string;
+function RepoRow({ repo, installId, onToggle, onGuardToggle, onFix, fixPending, fixError }: {
+  repo: Repo; installId: number; onToggle: (e: boolean) => void; onGuardToggle: (e: boolean) => void; onFix: () => void; fixPending: boolean; fixError?: string;
 }) {
   const [owner, name] = repo.full_name.split("/");
   const on = repo.config.tpm_enabled;
+  // Real backend flag (#483) - the roster tile stays cosmetic; THIS is
+  // the per-repo truth ("no lies").
+  const guardOn = repo.config.guard_enabled !== false;
   const enforcement = useEnforcement(on ? installId : undefined, on ? repo.repo_id : undefined);
   const state = enforcement.data?.enforcement_state;
   const degraded = enforcement.data?.degraded === true;
@@ -325,6 +329,8 @@ function RepoRow({ repo, installId, onToggle, onFix, fixPending, fixError }: {
       {on && state === "none" && !fixPending && <button className="fixbtn" onClick={onFix} title="Create a branch ruleset that REQUIRES Grug's check to pass before a PR can merge.">fix</button>}
       {fixPending && <span className="state paused">fixing…</span>}
       {fixError && !fixPending && <span className="fixerr" title={fixError}>⚠ fix failed</span>}
+      <span className={`state ${guardOn ? "live" : "paused"}`} title={guardOn ? "GUARD ON: the security suite (secrets, SAST, dependency CVEs, IaC) posts its own 'Grug — Guard' check-run on every PR here." : "GUARD OFF: no security check-run on this repo's PRs."}>{guardOn ? "GUARD" : "GUARD OFF"}</span>
+      <div className={`sw${guardOn ? " on" : ""}`} onClick={() => onGuardToggle(!guardOn)} role="switch" aria-checked={guardOn} title="Toggle the Guard (security) persona for this repo"></div>
       <span className={`state ${on ? "live" : "paused"}`} title={on ? "GUARDED: Grug watches this repo and posts a Check Run on every PR. Toggle off to silence Grug here." : "PAUSED: Grug is asleep on this repo. Toggle on to guard it."}>{on ? "GUARDED" : "PAUSED"}</span>
       <div className={`sw${on ? " on" : ""}`} onClick={() => onToggle(!on)} role="switch" aria-checked={on}></div>
     </div>
