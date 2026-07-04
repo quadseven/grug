@@ -79,12 +79,20 @@ spec:
 #
 # ENFORCEMENT CAVEAT (ADR-0013): NetworkPolicy is only enforced by a policy CNI;
 # this cluster runs flannel (does NOT enforce), so this policy is INERT here
-# today. The C1 escalation fix does NOT depend on it - that rests on the
-# namespace holding no credential to steal. The network jail is the additional
-# protection a policy CNI (the documented precondition for enabling Smasher)
-# provides. Pod-level NetworkPolicy cannot grant egress to the init phase while
-# denying it to the test phase (shared netns); the test phase makes no calls by
-# construction.
+# today. The escalation fix does NOT depend on it - that rests on the namespace
+# holding no credential to steal.
+#
+# ACCEPTED RESIDUAL (codex/poolside/spark peer-review, PR #494): pod-level
+# NetworkPolicy cannot grant egress to the init phases (fetch+deps NEED DNS+443)
+# while denying it to the test phase - they share one pod netns. The test phase
+# runs arbitrary PR-author code (pytest), so it CAN make DNS+443 calls even on a
+# policy CNI; "makes no calls" is not enforceable. This is accepted because the
+# test phase holds NO credential (nothing to exfiltrate but the repo the author
+# already controls) and Smasher is default-OFF, opt-in only for repos whose
+# authors are trusted to "run code in the sandbox", deadline+resource bounded.
+# TRUE test-phase network denial needs a two-pod split (prep pod fetches to a
+# shared volume; test pod runs with default-deny egress) - a documented
+# follow-up, out of scope for this tracer. See ADR-0013.
 apiVersion: networking.k8s.io/v1
 kind: NetworkPolicy
 metadata:

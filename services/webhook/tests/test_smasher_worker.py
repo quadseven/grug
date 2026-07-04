@@ -11,7 +11,28 @@ from __future__ import annotations
 
 from pathlib import Path
 
+import personas.smasher.trial_worker as tw
 from personas.smasher.trial_worker import run_trial
+
+
+def test_reap_noop_when_not_pid1(monkeypatch):
+    # A local run (worker is not PID 1) must NEVER kill anything.
+    monkeypatch.setattr(tw.os, "getpid", lambda: 4242)
+    killed = []
+    monkeypatch.setattr(tw.os, "kill", lambda pid, sig: killed.append(pid))
+    tw._reap_other_processes()
+    assert killed == []
+
+
+def test_reap_kills_others_but_never_pid1_when_worker_is_pid1(monkeypatch):
+    # Inside the sandbox pod the worker is PID 1 and reaps every OTHER process
+    # (an author-spawned daemon) before writing the authoritative result.
+    monkeypatch.setattr(tw.os, "getpid", lambda: 1)
+    monkeypatch.setattr(tw.os, "listdir", lambda p: ["1", "37", "88", "notapid"])
+    killed = []
+    monkeypatch.setattr(tw.os, "kill", lambda pid, sig: killed.append(pid))
+    tw._reap_other_processes()
+    assert killed == [37, 88]  # PID 1 (self) never signalled
 
 
 def _write(ws: Path, rel: str, body: str) -> None:

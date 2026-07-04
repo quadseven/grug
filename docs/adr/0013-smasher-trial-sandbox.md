@@ -123,6 +123,40 @@ re-confirming the rule-of-three trigger for the async-machinery extraction
 enqueue+run functions) rather than doing that risky refactor inside a
 security-critical change — the extraction is its own slice.
 
+### Accepted residuals (peer-review PR #494)
+
+Cross-model peer review (codex, poolside, spark) surfaced three residuals that
+are INHERENT to the pre-agreed single-Job mutation-testing design, not
+defects. They are accepted under Smasher's trust model (default OFF, per-repo
+opt-in only where PR authors may "run code in the sandbox", advisory-only,
+policy-CNI precondition, no credential in the test phase):
+
+- **Test-phase egress.** The test phase runs arbitrary PR-author code, so on a
+  policy CNI it can still make DNS+443 calls (pod-level NetworkPolicy can't deny
+  only the test phase — see the manifest). No credential rides there; the
+  residual is SSRF/exfil-of-already-owned-repo/compute within the deadline. TRUE
+  test-phase network denial requires a two-pod split (a prep pod fetches into a
+  shared volume; a separate test pod runs with default-deny egress) — a
+  documented FOLLOW-UP, out of scope for this tracer.
+- **Oracle trust.** Mutation testing measures the repo's OWN test suite as the
+  oracle, so the test suite's exit code IS author-controlled by definition — an
+  author could add a source-hash-guard test to make every mutant "killed". This
+  is intrinsic to mutation testing, not a Smasher bug; it is bounded by
+  advisory-only + trusted-authors, and gaming it is self-defeating (the author
+  is the party who wanted the coverage signal).
+- **Persistent launcher token.** The launcher SA token is mounted on
+  webhook/consumer whenever they run, not only when Smasher is enabled. Its
+  permissions are confined to the secret-free `grug-trial` namespace, so the
+  added surface over an already-compromised webhook is marginal (create
+  locked-down Jobs in a namespace with nothing to steal). The launch PATH is
+  still flag-gated (`dispatch_smasher_review` checks the global master switch
+  before minting a token or creating a Job).
+
+The one NON-inherent integrity hole peer review found — an author test
+daemonizing a process to OVERWRITE the termination message after the worker's
+authoritative write — IS fixed: the worker reaps every other process in its PID
+namespace before the authoritative write (`trial_worker._reap_other_processes`).
+
 ### Kill switches (all fail-open to no-Trial)
 
 `smasher_enabled` per-repo (default OFF), a global SSM flag
