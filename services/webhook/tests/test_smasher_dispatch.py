@@ -110,12 +110,42 @@ def test_no_python_changes_is_clean_pass(monkeypatch):
     assert captured["checks"]
 
 
-def test_degraded_trial_publishes_neutral(monkeypatch):
-    trial = TrialResult(status="degraded", total=0, killed=0, survived=())
+def test_degraded_trial_surfaces_specific_reason(monkeypatch):
+    trial = TrialResult(status="degraded", total=0, killed=0, survived=(),
+                        reason="baseline_failed")
     captured = _wire(monkeypatch, trial=trial)
     out = sm_dispatch.dispatch_smasher_review(_payload(), blocking=False)
     assert out["result"] == "degraded"
-    assert captured["verdicts"][0]["degraded_reason"] == "trial_degraded"
+    # The specific cause is surfaced on the check, not a generic "degraded".
+    assert captured["verdicts"][0]["degraded_reason"] == "baseline_failed"
+
+
+def test_completed_but_zero_mutants_degrades_not_passes(monkeypatch):
+    # dispatch guaranteed non-empty targets, so a completed Trial with total=0
+    # means the checkout/targets broke inside the Job -> degrade, never a green
+    # "tests strong" pass (ADR-0003 "no lies").
+    trial = TrialResult(status="completed", total=0, killed=0, survived=())
+    captured = _wire(monkeypatch, trial=trial)
+    out = sm_dispatch.dispatch_smasher_review(_payload(), blocking=False)
+    assert out["result"] == "degraded"
+    assert captured["verdicts"][0]["findings_count"] == 0
+
+
+def test_scoped_token_minted_contents_read_single_repo(monkeypatch):
+    # ADR-0013 security property: the sandbox token is down-scoped to
+    # contents:read on the ONE repo — assert the mint args, not just that it's
+    # called (a full-scope token would pass a lambda that ignores args).
+    trial = TrialResult(status="completed", total=2, killed=2, survived=())
+    _wire(monkeypatch, trial=trial)
+    seen = {}
+    monkeypatch.setattr(
+        sm_dispatch, "get_scoped_install_token",
+        lambda iid, *, repositories, permissions: seen.update(
+            repos=repositories, perms=permissions) or "scoped",
+    )
+    sm_dispatch.dispatch_smasher_review(_payload(), blocking=False)
+    assert seen["repos"] == ["widget"]
+    assert seen["perms"] == {"contents": "read"}
 
 
 def test_diff_fetch_failure_degrades(monkeypatch):

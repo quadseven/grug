@@ -29,9 +29,9 @@ spec:
         tags.datadoghq.com/env: prod
     spec:
       # The consumer runs the rerun lane, which re-drives Smasher (#469) and so
-      # can LAUNCH a Trial Job - it needs the same minimal launcher SA as the
-      # webhook (jobs + pods verbs only; k8s/smasher-rbac.yaml + ADR-0013).
-      # Inert until Smasher is enabled account-wide (default OFF).
+      # can LAUNCH a Trial Job - it mounts the same launcher SA as the webhook,
+      # whose permissions are confined to the secret-free `grug-trial` namespace
+      # (k8s/smasher-trial-namespace.yaml + ADR-0013) with none in `grug`.
       serviceAccountName: grug-smasher-launcher
       automountServiceAccountToken: true
       nodeSelector:

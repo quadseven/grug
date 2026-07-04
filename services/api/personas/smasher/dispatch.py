@@ -244,9 +244,26 @@ def dispatch_smasher_review(
         )
 
     if result.status != "completed":
+        # Surface the specific cause (no_termination_message, baseline_failed,
+        # no_job_image_configured, ...) so the check text is actionable, not a
+        # generic "degraded".
         return _publish_degraded(
             installation_id, owner, repo_name, pull_number, head_sha,
-            reason="trial_degraded",
+            reason=result.reason or "trial_degraded",
+        )
+
+    if result.total == 0:
+        # dispatch guaranteed non-empty targets before launching, so a completed
+        # Trial that mutated NOTHING means the checkout/targets broke inside the
+        # Job (absent files, unparseable targets) - that is a degrade, never the
+        # green "tests strong" pass (ADR-0003 "no lies").
+        log.warning(
+            "smasher_trial_zero_mutants",
+            extra={"pr": f"{owner}/{repo_name}#{pull_number}"},
+        )
+        return _publish_degraded(
+            installation_id, owner, repo_name, pull_number, head_sha,
+            reason=result.reason or "no_mutants_generated",
         )
 
     findings = tuple(_finding_for(m) for m in result.survived)

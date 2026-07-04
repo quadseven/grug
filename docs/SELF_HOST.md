@@ -184,10 +184,13 @@ has a hard cluster precondition:
    at the level of "may run code in the sandbox." The sandbox bounds credential
    theft and resource use, not intent.
 
-RBAC: applying `k8s/smasher-rbac.yaml` creates the minimal `grug-smasher-launcher`
-ServiceAccount (Jobs + Pods verbs only). The webhook + consumer deployments run
-as this SA so they can launch Trial Jobs; the SA cannot read Secrets or escalate.
-See `docs/adr/0013-smasher-trial-sandbox.md` for the full boundary design.
+RBAC: applying `k8s/smasher-rbac.yaml` + `k8s/smasher-trial-namespace.yaml`
+creates the `grug-smasher-launcher` ServiceAccount and its permissions, which
+live ENTIRELY in a dedicated, secret-free `grug-trial` namespace (Jobs + Pods +
+the per-Job token Secret) with none in `grug`. Trial Jobs run in `grug-trial`,
+so the launcher's `create jobs` grant cannot be used to borrow a privileged
+ServiceAccount and reach `grug-secrets`. See
+`docs/adr/0013-smasher-trial-sandbox.md` for the full boundary design.
 
 ## Compliance with AGPL-3.0
 

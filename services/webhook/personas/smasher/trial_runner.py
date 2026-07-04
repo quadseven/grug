@@ -6,23 +6,30 @@ from the pod termination message, and deletes the Job. Never raises: any
 cluster / credential / timeout failure returns a degraded `TrialResult` so the
 persona degrades to an advisory-neutral check.
 
+Runs the Job in the DEDICATED `grug-trial` namespace (ADR-0013) — isolated from
+the credential-bearing `grug` namespace, so the launcher's `create jobs` grant
+there cannot borrow a privileged ServiceAccount. The scoped GitHub token is
+handed to the Job via a per-Job Secret (created here, deleted with the Job),
+never inlined into the Job spec.
+
 Talks to `kubernetes.default.svc` over httpx with the launcher SA's mounted
 token + CA bundle (no heavyweight `kubernetes` client dependency, consistent
-with the repo's hand-rolled-over-deps ethos). The launcher SA
-(`grug-smasher-launcher`) is scoped to `jobs` + `pods` verbs only - it cannot
-read secrets or escalate (ADR-0013).
+with the repo's hand-rolled-over-deps ethos).
 """
 
 from __future__ import annotations
 
+import hashlib
 import logging
 import os
+import ssl
 import time
 from typing import Any, Protocol
 
 import httpx
 
 from personas.smasher.sandbox import (
+    TRIAL_NAMESPACE,
     TrialResult,
     build_trial_job,
     parse_trial_result,
@@ -30,7 +37,6 @@ from personas.smasher.sandbox import (
 
 log = logging.getLogger("grug.smasher.trial_runner")
 
-_NAMESPACE = "grug"
 _API = "https://kubernetes.default.svc"
 _SA_DIR = "/var/run/secrets/kubernetes.io/serviceaccount"
 _TOKEN_PATH = f"{_SA_DIR}/token"
@@ -46,10 +52,22 @@ class Cluster(Protocol):
     """The k8s operations the runner needs — injectable so the launch flow is
     testable without an API server."""
 
+    def create_secret(self, name: str, token: str) -> None: ...
+    def delete_secret(self, name: str) -> None: ...
     def create_job(self, manifest: dict[str, Any]) -> None: ...
     def wait_for_completion(self, job_name: str, timeout: int) -> str: ...
     def read_termination_message(self, job_name: str) -> str | None: ...
     def delete_job(self, job_name: str) -> None: ...
+
+
+def _job_name(owner: str, repo: str, head_sha: str) -> str:
+    """Repo-qualified, collision-free Job name. Two PRs sharing a head SHA (a
+    fork PR + base PR of the same commit) must NOT collide onto one Job name —
+    the pre-create delete would otherwise kill a concurrently-running Trial for
+    the other PR. Hash `owner/repo` into the name. Stays within the 63-char
+    k8s name limit and the lowercase-alphanumeric-plus-dash charset."""
+    repo_hash = hashlib.sha1(f"{owner}/{repo}".encode()).hexdigest()[:8]
+    return f"grug-trial-{repo_hash}-{head_sha[:12].lower()}"
 
 
 def launch_trial(
@@ -72,23 +90,24 @@ def launch_trial(
     if cluster is None:
         built = _default_cluster()
         if built is None:
-            log.warning("smasher_no_launcher_credentials")
-            return _degraded()
+            log.error("smasher_no_launcher_credentials")  # permanent operator fault
+            return _degraded("no_launcher_credentials")
         cluster = built
 
     image = image or os.getenv(_IMAGE_ENV, "")
     if not image:
-        log.warning("smasher_no_job_image_configured")
-        return _degraded()
+        log.error("smasher_no_job_image_configured")  # permanent operator fault
+        return _degraded("no_job_image_configured")
 
-    job_name = f"grug-trial-{head_sha[:12]}"
+    job_name = _job_name(owner, repo, head_sha)
+    secret_name = f"{job_name}-token"
     manifest = build_trial_job(
         job_name=job_name,
         image=image,
         owner=owner,
         repo=repo,
         head_sha=head_sha,
-        token=token,
+        token_secret_name=secret_name,
         targets=targets,
         total_budget_seconds=total_budget_seconds,
         per_mutant_timeout_seconds=per_mutant_timeout_seconds,
@@ -96,16 +115,16 @@ def launch_trial(
     )
 
     try:
-        # A prior run at the same head SHA may have left a Job (name collision);
-        # delete first so create doesn't 409. Best-effort.
-        try:
-            cluster.delete_job(job_name)
-        except Exception:  # noqa: BLE001 — no prior Job is the common case
-            pass
+        # A prior run at the same head SHA may have left a Job/Secret (re-run at
+        # the same head); delete first so create doesn't 409. Best-effort.
+        _swallow(lambda: cluster.delete_job(job_name))
+        _swallow(lambda: cluster.delete_secret(secret_name))
+        cluster.create_secret(secret_name, token)
         cluster.create_job(manifest)
     except Exception as e:  # noqa: BLE001 — submit failure degrades, never raises
         log.warning("smasher_job_create_failed", extra={"kind": type(e).__name__})
-        return _degraded()
+        _swallow(lambda: cluster.delete_secret(secret_name))
+        return _degraded("job_create_failed")
 
     message: str | None = None
     try:
@@ -114,17 +133,25 @@ def launch_trial(
     except Exception as e:  # noqa: BLE001 — read/wait failure degrades
         log.warning("smasher_job_wait_or_read_failed", extra={"kind": type(e).__name__})
     finally:
-        # Delete is best-effort; ttlSecondsAfterFinished is the backstop.
-        try:
-            cluster.delete_job(job_name)
-        except Exception as e:  # noqa: BLE001
-            log.info("smasher_job_delete_failed", extra={"kind": type(e).__name__})
+        # Delete the Job + its token Secret; ttlSecondsAfterFinished is the
+        # backstop for the Job (the Secret has no TTL, so this cleanup matters).
+        _swallow(lambda: cluster.delete_job(job_name))
+        _swallow(lambda: cluster.delete_secret(secret_name))
 
     return parse_trial_result(message)
 
 
-def _degraded() -> TrialResult:
-    return TrialResult(status="degraded", total=0, killed=0, survived=())
+def _degraded(reason: str) -> TrialResult:
+    return TrialResult(status="degraded", total=0, killed=0, survived=(), reason=reason)
+
+
+def _swallow(fn) -> None:
+    """Run a best-effort cleanup/pre-delete; a failure (e.g. 404 no prior
+    object) is logged at debug and never propagates."""
+    try:
+        fn()
+    except Exception as e:  # noqa: BLE001
+        log.debug("smasher_cleanup_noop", extra={"kind": type(e).__name__})
 
 
 def _default_cluster() -> "_HttpxCluster | None":
@@ -144,27 +171,48 @@ class _HttpxCluster:
     """Real Kubernetes API client over httpx (the launcher SA token + CA)."""
 
     def __init__(self, *, token: str, ca_path: str) -> None:
-        self._headers = {"Authorization": f"Bearer {token}"}
-        self._verify = ca_path
-        self._jobs = f"{_API}/apis/batch/v1/namespaces/{_NAMESPACE}/jobs"
-        self._pods = f"{_API}/api/v1/namespaces/{_NAMESPACE}/pods"
+        # ssl context (not verify=<path>, deprecated in httpx 0.28+); one reused
+        # client instead of a fresh TLS handshake per poll.
+        ctx = ssl.create_default_context(cafile=ca_path)
+        self._client = httpx.Client(
+            verify=ctx,
+            headers={"Authorization": f"Bearer {token}"},
+            timeout=15,
+        )
+        self._jobs = f"{_API}/apis/batch/v1/namespaces/{TRIAL_NAMESPACE}/jobs"
+        self._pods = f"{_API}/api/v1/namespaces/{TRIAL_NAMESPACE}/pods"
+        self._secrets = f"{_API}/api/v1/namespaces/{TRIAL_NAMESPACE}/secrets"
+
+    def create_secret(self, name: str, token: str) -> None:
+        manifest = {
+            "apiVersion": "v1",
+            "kind": "Secret",
+            "metadata": {
+                "name": name,
+                "namespace": TRIAL_NAMESPACE,
+                "labels": {"app": "grug-trial"},
+            },
+            "type": "Opaque",
+            # stringData: k8s base64-encodes it; the raw token never appears in
+            # our code path as base64 and is deleted with the Job.
+            "stringData": {"token": token},
+        }
+        self._client.post(self._secrets, json=manifest).raise_for_status()
+
+    def delete_secret(self, name: str) -> None:
+        resp = self._client.request("DELETE", f"{self._secrets}/{name}")
+        if resp.status_code not in (200, 202, 404):
+            resp.raise_for_status()
 
     def create_job(self, manifest: dict[str, Any]) -> None:
-        resp = httpx.post(
-            self._jobs, headers=self._headers, verify=self._verify,
-            json=manifest, timeout=15,
-        )
-        resp.raise_for_status()
+        self._client.post(self._jobs, json=manifest).raise_for_status()
 
     def wait_for_completion(self, job_name: str, timeout: int) -> str:
         """Poll the Job until it Completes or Fails, or the timeout elapses.
         Returns the terminal phase ("Succeeded"/"Failed"/"Unknown")."""
         deadline = time.monotonic() + timeout
         while time.monotonic() < deadline:
-            resp = httpx.get(
-                f"{self._jobs}/{job_name}", headers=self._headers,
-                verify=self._verify, timeout=10,
-            )
+            resp = self._client.get(f"{self._jobs}/{job_name}", timeout=10)
             resp.raise_for_status()
             status = resp.json().get("status", {})
             if status.get("succeeded"):
@@ -176,9 +224,8 @@ class _HttpxCluster:
 
     def read_termination_message(self, job_name: str) -> str | None:
         """Read the test container's termination message from the Job's pod."""
-        resp = httpx.get(
-            self._pods, headers=self._headers, verify=self._verify,
-            params={"labelSelector": f"job-name={job_name}"}, timeout=10,
+        resp = self._client.get(
+            self._pods, params={"labelSelector": f"job-name={job_name}"}, timeout=10,
         )
         resp.raise_for_status()
         for pod in resp.json().get("items", []):
@@ -192,10 +239,9 @@ class _HttpxCluster:
         return None
 
     def delete_job(self, job_name: str) -> None:
-        resp = httpx.request(
-            "DELETE", f"{self._jobs}/{job_name}", headers=self._headers,
-            verify=self._verify, params={"propagationPolicy": "Background"},
-            timeout=10,
+        resp = self._client.request(
+            "DELETE", f"{self._jobs}/{job_name}",
+            params={"propagationPolicy": "Background"}, timeout=10,
         )
         if resp.status_code not in (200, 202, 404):
             resp.raise_for_status()

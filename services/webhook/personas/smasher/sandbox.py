@@ -3,40 +3,67 @@
 
 Two pure surfaces, both fully unit-lockable (no cluster, no IO):
 
-  - `build_trial_job(...)` renders the locked-down k8s Job manifest that runs
+  - `build_trial_job(...)` renders the locked-down Trial Job manifest that runs
     PR-author code. The security boundary lives ENTIRELY in this manifest's
     shape (see ADR-0013); the tests assert every boundary property.
   - `parse_trial_result(termination_message)` decodes the worker's JSON summary
-    read back from the pod termination message. Malformed/absent -> degraded.
+    read back from the pod termination message. It is a TRUST BOUNDARY: the
+    message is written by author-controlled code (same container), so every
+    field is validated + bounded here. Malformed/absent -> degraded.
 
 Plus `extract_target_lines(hunks)` — the diff's added Python lines, the mutation
 targets. Non-Python files are skipped (the tracer is Python-only, #346 P3.1).
 
-The Job's containers run from the SAME grug-webhook image (so `personas.smasher`
-is importable inside the Job):
-  - initContainer `fetch` — the ONLY token holder. Downloads the repo tarball
-    at the head SHA (GitHub API, no git binary, no on-disk token) into the
-    workspace. Token is an env var on THIS container only.
+The Job runs in the DEDICATED `grug-trial` namespace (ADR-0013), which holds no
+secrets and no privileged ServiceAccounts, so even the launcher's `create jobs`
+grant there cannot be used to borrow a privileged identity (the escalation a
+shared namespace would allow). The Job's containers run from the grug-webhook
+image (so `personas.smasher` is importable inside the Job):
+  - initContainer `fetch` — the ONLY token holder. The scoped `contents:read`
+    token is injected via a per-Job Secret (`secretKeyRef`), never inlined into
+    the pod spec / etcd. Downloads the repo tarball at the head SHA into the
+    workspace.
   - initContainer `deps` — NO token. Installs test deps (network) into the
-    workspace. Author build code may run here, but there is no credential to
-    steal.
-  - container `test` — NO token, NO secrets, read-only rootfs, non-root, caps
-    dropped, resource-limited. Runs the mutation worker offline-by-construction
-    and writes the result to /dev/termination-log.
+    workspace. Author build code may run here, but there is no credential.
+  - container `test` — NO token, NO secrets, read-only rootfs (with a writable
+    `/tmp` + `/workspace`), non-root, caps dropped, resource-limited. Runs the
+    mutation worker and writes the result to /dev/termination-log.
 """
 
 from __future__ import annotations
 
 import json
 from dataclasses import dataclass
-from typing import Any
+from typing import Any, Literal
 
 from personas.code_reviewer.diff_parser import DiffHunk
+
+# The namespace Trial Jobs run in — isolated from the credential-bearing `grug`
+# namespace (ADR-0013). No secrets, no privileged SAs live here.
+TRIAL_NAMESPACE = "grug-trial"
+
+# The mutation operators the engine can emit (mutate.py). Used to VALIDATE the
+# operator field of a survived-mutant row read back from the untrusted
+# termination message — an unknown value means a forged/corrupt message.
+TrialStatus = Literal["completed", "degraded"]
+VALID_OPERATORS: frozenset[str] = frozenset(
+    {"comparison-flip", "boundary", "boolean", "return-value"}
+)
+
+# Bound on the free-text fields of a survived-mutant row (they flow into a
+# Grug-authored check-run markdown table; the message is author-controllable so
+# the length is capped to prevent table/markdown flooding). The whole message is
+# already kubelet-capped at 4 KiB, so these are belt-and-braces.
+_MAX_FIELD_LEN = 200
 
 
 @dataclass(frozen=True, slots=True)
 class SurvivedMutant:
-    """One mutant the repo's tests did NOT catch — an executable coverage gap."""
+    """One mutant the repo's tests did NOT catch — an executable coverage gap.
+
+    Fields originate from the (untrusted) termination message, so construction
+    is validated: `operator` must be a known operator, string fields are length-
+    bounded, `line >= 1`. `parse_trial_result` drops rows that fail these."""
 
     file: str
     line: int
@@ -44,28 +71,43 @@ class SurvivedMutant:
     original: str
     mutated: str
 
+    def __post_init__(self) -> None:
+        if self.operator not in VALID_OPERATORS:
+            raise ValueError(f"unknown mutation operator {self.operator!r}")
+        if self.line < 1:
+            raise ValueError(f"line must be >= 1, got {self.line}")
+        for name in ("file", "original", "mutated"):
+            if len(getattr(self, name)) > _MAX_FIELD_LEN:
+                raise ValueError(f"{name} exceeds {_MAX_FIELD_LEN} chars")
+
 
 @dataclass(frozen=True, slots=True)
 class TrialResult:
     """Decoded Trial outcome. `status` is `completed` (the worker ran to a
     verdict) or `degraded` (the Job produced no usable result — a fetch/parse
-    failure, timeout, or crash; degraded is NEVER a pass, ADR-0003)."""
+    failure, timeout, or crash; degraded is NEVER a pass, ADR-0003). `reason`
+    names the degrade cause (surfaced to the operator/PR author); `truncated`
+    flags that survivor rows were dropped to fit the 4 KiB channel. Counts are
+    non-negative (clamped at parse)."""
 
-    status: str
+    status: TrialStatus
     total: int
     killed: int
     survived: tuple[SurvivedMutant, ...]
     timed_out: int = 0
     errored: int = 0
+    reason: str | None = None
+    truncated: bool = False
 
 
 def extract_target_lines(hunks: tuple[DiffHunk, ...]) -> dict[str, list[int]]:
     """Map each changed `*.py` file to the sorted new-side line numbers the diff
     ADDED. Only added lines are mutation targets — a PR review measures the
-    coverage of what the PR introduces. Non-Python files are omitted."""
+    coverage of what the PR introduces. Non-Python files, and any path that
+    isn't a safe relative path (absolute or containing `..`), are omitted."""
     by_file: dict[str, set[int]] = {}
     for hunk in hunks:
-        if not hunk.file_path.endswith(".py"):
+        if not hunk.file_path.endswith(".py") or not _is_safe_relpath(hunk.file_path):
             continue
         added = _added_line_numbers(hunk)
         if added:
@@ -73,22 +115,38 @@ def extract_target_lines(hunks: tuple[DiffHunk, ...]) -> dict[str, list[int]]:
     return {path: sorted(lines) for path, lines in by_file.items()}
 
 
+def _is_safe_relpath(path: str) -> bool:
+    """True for a workspace-relative path with no traversal — rejects absolute
+    paths and any `..` segment (the path originates from an attacker-controlled
+    diff and is used to open files inside the sandbox workspace)."""
+    if not path or path.startswith("/") or path.startswith("\\"):
+        return False
+    parts = path.replace("\\", "/").split("/")
+    return ".." not in parts
+
+
 def _added_line_numbers(hunk: DiffHunk) -> list[int]:
     """New-side line numbers of the ADDED (`+`) lines in one hunk. Advances the
     counter on added/context lines, not removed lines (unified-diff semantics).
-    The first body line is the `@@` header (skipped)."""
+    The first body line is the `@@` header (skipped). Only a SINGLE leading
+    `+`/`-` marks add/remove — an added line whose content starts with `++`
+    (e.g. `+  x = ++y`) must still count, so we branch on the first char."""
     out: list[int] = []
     lineno = hunk.new_start
     for raw in hunk.body.splitlines():
-        if raw.startswith("@@") or raw.startswith("+++") or raw.startswith("---"):
+        if not raw:
+            lineno += 1
             continue
-        if raw.startswith("+"):
+        if raw.startswith("@@"):
+            continue
+        marker = raw[0]
+        if marker == "+":
             out.append(lineno)
             lineno += 1
-        elif raw.startswith("-"):
-            continue
+        elif marker == "-":
+            continue  # removed line: no new-side advance
         else:
-            lineno += 1
+            lineno += 1  # context line
     return out
 
 
@@ -104,23 +162,26 @@ def build_trial_job(
     owner: str,
     repo: str,
     head_sha: str,
-    token: str,
+    token_secret_name: str,
     targets: dict[str, list[int]],
     total_budget_seconds: int,
     per_mutant_timeout_seconds: int,
     mutant_cap: int,
-    service_account_name: str = "grug-smasher-launcher",
 ) -> dict[str, Any]:
     """Render the locked-down Trial Job manifest (ADR-0013). PURE.
 
     Boundary invariants asserted by test_smasher_sandbox.py: no pod SA token;
-    the GitHub token reaches ONLY the `fetch` init container; the `test`
-    container has no secrets, read-only rootfs, non-root, caps dropped, resource
-    limits; `activeDeadlineSeconds`/`restartPolicy=Never`/`backoffLimit=0` bound
-    runaways; result via the termination message; pod labelled for the
-    egress-deny NetworkPolicy."""
+    the GitHub token is a `secretKeyRef` on the `fetch` init container ONLY (not
+    inlined in the spec/etcd); ALL containers are hardened (non-root, read-only
+    rootfs, caps dropped) with a writable `/tmp` + `/workspace`; the `test`
+    container has no secrets; `activeDeadlineSeconds`/`restartPolicy=Never`/
+    `backoffLimit=0` bound runaways; result via the termination message; pod
+    labelled for the egress-deny NetworkPolicy; runs in the isolated
+    `grug-trial` namespace."""
     targets_json = json.dumps(targets, sort_keys=True)
     workspace = {"name": "workspace", "mountPath": "/workspace"}
+    tmp = {"name": "tmp", "mountPath": "/tmp"}
+    mounts = [workspace, tmp]
     hardened_sc = {
         "runAsNonRoot": True,
         "runAsUser": 10001,
@@ -136,17 +197,20 @@ def build_trial_job(
         "image": image,
         "command": ["python", "-m", "personas.smasher.trial_fetch"],
         "env": [
-            # The token lives ONLY here. Used for the one authenticated tarball
-            # request; never written to disk (no git remote to persist it).
-            {"name": "GRUG_TRIAL_TOKEN", "value": token},
-            {"name": "GRUG_TRIAL_REPO", "value": f"{owner}/{repo}"},
-            {"name": "GRUG_TRIAL_REF", "value": head_sha},
+            # The token lives ONLY here, sourced from a per-Job Secret via
+            # secretKeyRef (never inlined into the pod spec / etcd). Used for
+            # the one authenticated tarball request; never written to disk.
+            {
+                "name": "GRUG_TRIAL_TOKEN",
+                "valueFrom": {"secretKeyRef": {"name": token_secret_name, "key": "token"}},
+            },
+            {"name": "GRUG_TRIAL_WORKSPACE", "value": "/workspace"},
             {"name": "GRUG_TRIAL_TARBALL_PATH",
              "value": _TARBALL_PATH.format(owner=owner, repo=repo, ref=head_sha)},
         ],
         "securityContext": hardened_sc,
         "resources": {"limits": limits, "requests": {"cpu": "100m", "memory": "128Mi"}},
-        "volumeMounts": [workspace],
+        "volumeMounts": mounts,
     }
     deps_init = {
         "name": "deps",
@@ -156,7 +220,7 @@ def build_trial_job(
         "env": [{"name": "GRUG_TRIAL_WORKSPACE", "value": "/workspace"}],
         "securityContext": hardened_sc,
         "resources": {"limits": limits, "requests": {"cpu": "100m", "memory": "256Mi"}},
-        "volumeMounts": [workspace],
+        "volumeMounts": mounts,
     }
     test_container = {
         "name": "test",
@@ -168,10 +232,13 @@ def build_trial_job(
             {"name": "GRUG_TRIAL_TARGETS", "value": targets_json},
             {"name": "GRUG_TRIAL_MUTANT_CAP", "value": str(mutant_cap)},
             {"name": "GRUG_TRIAL_PER_MUTANT_TIMEOUT", "value": str(per_mutant_timeout_seconds)},
+            # Same-source rewrites within one pytest-second could otherwise serve
+            # stale .pyc (timestamp invalidation granularity); disable bytecode.
+            {"name": "PYTHONDONTWRITEBYTECODE", "value": "1"},
         ],
         "securityContext": hardened_sc,
         "resources": {"limits": limits, "requests": {"cpu": "250m", "memory": "256Mi"}},
-        "volumeMounts": [workspace],
+        "volumeMounts": mounts,
         "terminationMessagePath": "/dev/termination-log",
         "terminationMessagePolicy": "File",
     }
@@ -181,7 +248,7 @@ def build_trial_job(
         "kind": "Job",
         "metadata": {
             "name": job_name,
-            "namespace": "grug",
+            "namespace": TRIAL_NAMESPACE,
             "labels": {"app": "grug-trial", "grug-trial": "true"},
         },
         "spec": {
@@ -196,15 +263,16 @@ def build_trial_job(
                 },
                 "spec": {
                     # The load-bearing credential-denial: the code under test
-                    # gets NO Kubernetes token.
+                    # gets NO Kubernetes token. Runs as the grug-trial default
+                    # SA (no permissions).
                     "automountServiceAccountToken": False,
-                    "serviceAccountName": service_account_name,
                     "restartPolicy": "Never",
                     "nodeSelector": {"kubernetes.io/arch": "arm64"},
                     "initContainers": [fetch_init, deps_init],
                     "containers": [test_container],
                     "volumes": [
                         {"name": "workspace", "emptyDir": {"sizeLimit": "512Mi"}},
+                        {"name": "tmp", "emptyDir": {"sizeLimit": "256Mi"}},
                     ],
                 },
             },
@@ -215,20 +283,32 @@ def build_trial_job(
 def parse_trial_result(termination_message: str | None) -> TrialResult:
     """Decode the worker's JSON summary from the pod termination message.
 
-    Never raises: an absent / non-JSON / wrong-shape message degrades to a
-    `TrialResult(status="degraded")` (ADR-0003 "no lies" — a Trial that
-    produced no usable verdict is advisory-neutral, never a false pass)."""
+    TRUST BOUNDARY: the message is written by author-controlled code, so every
+    field is validated + bounded. Never raises: an absent / non-JSON / wrong-
+    shape / forged message degrades to `TrialResult(status="degraded")` (ADR-0003
+    "no lies" — a Trial that produced no usable verdict is advisory-neutral,
+    never a false pass)."""
     if not termination_message:
-        return _degraded()
+        return _degraded("no_termination_message")
     try:
         data = json.loads(termination_message)
     except (json.JSONDecodeError, TypeError):
-        return _degraded()
+        return _degraded("unparseable_termination_message")
     if not isinstance(data, dict):
-        return _degraded()
+        return _degraded("malformed_termination_message")
+
+    raw_survived = data.get("survived")
+    if raw_survived is None:
+        raw_survived = []
+    if not isinstance(raw_survived, list):
+        # A non-list `survived` (forged `{"survived": 5}`) would crash a naive
+        # iteration — degrade instead.
+        return _degraded("malformed_termination_message")
 
     survived: list[SurvivedMutant] = []
-    for row in data.get("survived", []) or []:
+    for row in raw_survived:
+        if not isinstance(row, dict):
+            continue
         try:
             survived.append(
                 SurvivedMutant(
@@ -240,8 +320,8 @@ def parse_trial_result(termination_message: str | None) -> TrialResult:
                 )
             )
         except (KeyError, TypeError, ValueError):
-            # Drop a malformed survivor row — never let one bad row sink the
-            # whole result (the survivors are advisory findings).
+            # Drop a malformed/forged survivor row — never let one bad row sink
+            # the whole result (the survivors are advisory findings).
             continue
 
     status = data.get("status")
@@ -249,20 +329,23 @@ def parse_trial_result(termination_message: str | None) -> TrialResult:
         status = "degraded"
     return TrialResult(
         status=status,
-        total=_as_int(data.get("total")),
-        killed=_as_int(data.get("killed")),
+        total=_as_nonneg_int(data.get("total")),
+        killed=_as_nonneg_int(data.get("killed")),
         survived=tuple(survived),
-        timed_out=_as_int(data.get("timed_out")),
-        errored=_as_int(data.get("errored")),
+        timed_out=_as_nonneg_int(data.get("timed_out")),
+        errored=_as_nonneg_int(data.get("errored")),
+        reason=(str(data["reason"])[:_MAX_FIELD_LEN] if data.get("reason") else None),
+        truncated=bool(data.get("truncated", False)),
     )
 
 
-def _degraded() -> TrialResult:
-    return TrialResult(status="degraded", total=0, killed=0, survived=())
+def _degraded(reason: str) -> TrialResult:
+    return TrialResult(status="degraded", total=0, killed=0, survived=(), reason=reason)
 
 
-def _as_int(value: Any) -> int:
+def _as_nonneg_int(value: Any) -> int:
+    """Coerce to a non-negative int (a forged negative count is clamped to 0)."""
     try:
-        return int(value)
+        return max(0, int(value))
     except (TypeError, ValueError):
         return 0

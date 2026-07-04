@@ -31,12 +31,14 @@ Job is the vessel; its pod spec is the security boundary:
 - `automountServiceAccountToken: false` on the Job pod — the code under test
   gets NO Kubernetes credential.
 - Two containers sharing a `workspace` emptyDir, run as separate phases:
-  - **init `clone`** — the ONLY holder of a short-lived credential. Receives a
+  - **init `fetch`** — the ONLY holder of a short-lived credential. Receives a
     GitHub installation access token scoped `contents:read` on the SINGLE repo
-    (the token-create API accepts a `repositories` + `permissions` subset),
-    clones at the PR head SHA, installs test dependencies (this phase has
-    egress). Writes the checkout + the non-secret target map to `workspace`.
-    The token is an env var on THIS CONTAINER ONLY.
+    (the token-create API accepts a `repositories` + `permissions` subset) via a
+    per-Job Kubernetes Secret (`secretKeyRef`), NOT inlined into the Job spec
+    (an inlined credential would persist in etcd and be readable by anything
+    with `get jobs`). Downloads the repo tarball at the head SHA. A separate
+    `deps` init phase (NO token) installs test dependencies. The Secret is
+    created and deleted alongside the Job by the launcher.
   - **main `test`** — NO token, NO secrets, `readOnlyRootFilesystem: true`
     except the workspace, `runAsNonRoot`, all caps dropped,
     `seccompProfile: RuntimeDefault`, CPU/memory limits. Runs the mutation
@@ -54,16 +56,31 @@ survived-mutant summary as JSON to `/dev/termination-log`; the launcher reads
 it back via `pod.status.containerStatuses[].state.terminated.message` (the
 Kubernetes API, no kubelet access, 4 KiB cap — survived-mutant summaries fit).
 
-### Launcher RBAC (minimal)
+### Launcher RBAC + namespace isolation (the escalation fix)
 
-The webhook pod gets a dedicated ServiceAccount `grug-smasher-launcher` bound
-to a namespace-scoped Role granting exactly: `jobs` create/get/delete/list and
-`pods` get/list (to read the termination message). NO secret read, NO exec, NO
-deployment access — it cannot escalate. The launcher talks to the in-cluster
-API over HTTPS (`kubernetes.default.svc`, port 443, already permitted by the
-egress NetworkPolicy) using the mounted SA token + CA bundle via `httpx` — no
-new heavyweight `kubernetes` client dependency, consistent with the repo's
-hand-rolled-over-deps ethos (`diff_parser`, OSV-over-httpx).
+The webhook + consumer pods mount a dedicated ServiceAccount
+`grug-smasher-launcher`. Its permissions live ENTIRELY in a SEPARATE, dedicated
+`grug-trial` namespace — NOT in `grug` — granting exactly `jobs`
+create/get/list/delete, `pods` get/list (to read the termination message), and
+`secrets` create/get/delete (for the per-Job token Secret). It has ZERO
+permissions in the `grug` namespace.
+
+Why the separate namespace matters (this is load-bearing): `create jobs`
+combined with the ability to set an arbitrary `serviceAccountName` on the
+created pod is a known Kubernetes escalation primitive — the creator can launch
+a Job whose pod mounts ANY ServiceAccount token in that namespace. In `grug`
+that would include `grug-key-rotator` (which can patch the `grug-secrets` AWS
+credential). By running Trial Jobs in `grug-trial` — which holds NO secrets and
+NO privileged ServiceAccounts (only the permissionless `default` SA) — there is
+nothing worth borrowing, so the primitive is inert. This isolation is
+CNI-independent and does not rely on any admission controller. Trial pods run as
+the `grug-trial` `default` SA with `automountServiceAccountToken:false`.
+
+The launcher talks to the in-cluster API over HTTPS (`kubernetes.default.svc`,
+port 443, already permitted by the `grug` egress NetworkPolicy) using the
+mounted SA token + CA bundle via `httpx` — no new heavyweight `kubernetes`
+client dependency, consistent with the repo's hand-rolled-over-deps ethos
+(`diff_parser`, OSV-over-httpx).
 
 ### Network isolation and the flannel constraint (load-bearing)
 
@@ -116,10 +133,15 @@ that cannot run never blocks a PR.
 
 ## Consequences
 
-- The webhook pod now mounts a ServiceAccount token (for the launcher SA). The
-  blast radius is bounded to `jobs`/`pods` verbs in the one namespace with no
-  secret read — a compromised webhook could create locked-down Jobs, not
-  escalate. This is the accepted cost of in-cluster Job launching.
+- The webhook + consumer pods now mount a ServiceAccount token (the launcher).
+  The blast radius is bounded by the `grug-trial` namespace isolation: the token
+  grants `jobs`/`pods`/`secrets` verbs ONLY in a secret-free, privileged-SA-free
+  namespace and nothing in `grug`, so a compromised webhook cannot use it to
+  reach `grug-secrets` or any real credential. This is the accepted cost of
+  in-cluster Job launching. (An earlier draft granted the launcher `create jobs`
+  in the `grug` namespace, which WAS a privilege-escalation path via
+  serviceAccountName borrowing — caught in review and fixed by the dedicated
+  namespace.)
 - Smasher cannot be safely enabled on a flannel-only cluster; a policy CNI is a
   hard precondition. Until then Smasher stays OFF (its default) and the built
   code is inert.

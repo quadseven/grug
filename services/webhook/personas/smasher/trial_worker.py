@@ -61,16 +61,25 @@ def run_trial(
         return _summary("degraded", reason="baseline_error")
 
     survived: list[dict[str, Any]] = []
-    total = killed = timed_out = errored = 0
+    total = killed = timed_out = errored = skipped_files = 0
 
     for rel_path in sorted(targets):
         if total >= mutant_cap:
             break
+        if not _is_safe_relpath(rel_path):
+            # An absolute or `..`-bearing path (attacker-controlled diff) would
+            # escape the workspace. Skip it — never open it.
+            log.warning("trial_unsafe_target_path", extra={"path": rel_path})
+            skipped_files += 1
+            continue
         file_abs = ws / rel_path
         try:
             original = file_abs.read_text()
         except OSError:
-            # A target file that isn't in the checkout — skip, don't crash.
+            # A target file that isn't in the checkout — visible skip (a silent
+            # one would let a broken tarball layout render as a clean pass).
+            log.warning("trial_target_file_absent", extra={"path": rel_path})
+            skipped_files += 1
             continue
 
         remaining = mutant_cap - total
@@ -82,6 +91,7 @@ def run_trial(
         )
         for mutant in mutants:
             total += 1
+            restored = True
             try:
                 file_abs.write_text(mutant.source)
                 try:
@@ -107,12 +117,32 @@ def run_trial(
                 try:
                     file_abs.write_text(original)
                 except OSError:
-                    log.error("trial_restore_failed", extra={"file": rel_path})
+                    restored = False
+                    log.error("trial_restore_failed", extra={"path": rel_path})
+            if not restored:
+                # A left-mutated file would poison every SUBSEQUENT file's tests
+                # (their runs execute against a corrupt tree), so the counts are
+                # no longer trustworthy — degrade rather than report them as
+                # complete (ADR-0003 "no lies").
+                return _summary("degraded", reason="restore_failed")
+
+    if skipped_files and total == 0:
+        # Targets were provided but no target file was readable/mutable — the
+        # checkout or targets broke; that is a degrade, never a clean pass.
+        return _summary("degraded", reason="targets_absent_from_checkout")
 
     return _summary(
         "completed", total=total, killed=killed,
         survived=survived, timed_out=timed_out, errored=errored,
     )
+
+
+def _is_safe_relpath(path: str) -> bool:
+    """Reject absolute paths and `..` traversal in an attacker-controlled target
+    path before it is joined onto the workspace root."""
+    if not path or path.startswith("/") or path.startswith("\\"):
+        return False
+    return ".." not in path.replace("\\", "/").split("/")
 
 
 def _summary(
@@ -159,12 +189,19 @@ def main() -> int:
     logging.basicConfig(level=logging.INFO)
     workspace = os.getenv("GRUG_TRIAL_WORKSPACE", "/workspace")
     repo_dir = str(Path(workspace) / "repo")
+    cap = _int_env("GRUG_TRIAL_MUTANT_CAP", 10)
+    timeout = _int_env("GRUG_TRIAL_PER_MUTANT_TIMEOUT", 30)
+
     try:
         targets = json.loads(os.getenv("GRUG_TRIAL_TARGETS", "{}"))
     except json.JSONDecodeError:
-        targets = {}
-    cap = _int_env("GRUG_TRIAL_MUTANT_CAP", 10)
-    timeout = _int_env("GRUG_TRIAL_PER_MUTANT_TIMEOUT", 30)
+        targets = None
+    if not isinstance(targets, dict):
+        # A corrupt/truncated targets env must degrade, NOT silently become an
+        # empty run that renders as a clean pass (ADR-0003 "no lies").
+        log.error("trial_targets_unparseable")
+        _write_termination(_summary("degraded", reason="targets_unparseable"))
+        return 0
 
     summary = run_trial(
         workspace=repo_dir,
@@ -197,8 +234,11 @@ def _write_termination(summary: dict[str, Any]) -> None:
         payload = json.dumps(summary)
     try:
         Path(_TERMINATION_LOG).write_text(payload)
-    except OSError:
-        # Not in a pod (local run) — fall back to stdout so nothing is lost.
+    except OSError as e:
+        # Either a local run (no /dev/termination-log) OR an in-pod write
+        # failure of the ONLY channel the launcher can read. Log so the latter
+        # is distinguishable from a benign local run, then fall back to stdout.
+        log.warning("trial_termination_write_failed", extra={"kind": type(e).__name__})
         sys.stdout.write(payload + "\n")
 
 
