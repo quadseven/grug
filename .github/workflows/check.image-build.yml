@@ -35,5 +35,11 @@ jobs:
           else
             mods="admin, installations, auth.github_oauth, crypto.kms_envelope, adapters.user_store, adapters.install_store, personas.registry, observability, readiness, main"
           fi
-          docker run --rm "grug-${{ matrix.svc }}:pr-smoke" \
+          # boto3 clients constructed at import (crypto/kms_envelope.py) need
+          # a region; hosted runners/containers have no ambient AWS config -
+          # same benign values check.python.yml uses for the moto suites.
+          docker run --rm \
+            -e AWS_DEFAULT_REGION=us-east-1 \
+            -e AWS_ACCESS_KEY_ID=smoke -e AWS_SECRET_ACCESS_KEY=smoke \
+            "grug-${{ matrix.svc }}:pr-smoke" \
             python -c "import ${mods}; print('IMPORTS OK')"
