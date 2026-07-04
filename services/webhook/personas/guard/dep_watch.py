@@ -27,12 +27,12 @@ import httpx
 from adapters.install_store import (
     claim_dep_watch_report, get_repo_config, release_dep_watch_report,
 )
-from personas.code_reviewer.sca import ChangedDep, _audit, _PINNED_DEP_RE
+from personas.code_reviewer.sca import ChangedDep, _audit, _MANIFEST_RE, _PINNED_DEP_RE
 
 log = logging.getLogger(f"{os.getenv('DD_SERVICE', 'grug')}.persona.guard.dep_watch")
 
-_MANIFESTS = ("requirements.txt", "pyproject.toml")
 _FETCH_TIMEOUT = 10
+_MAX_MANIFESTS = 10
 _MAX_PINS = 100
 _MAX_REPORT_ROWS = 30
 _REPORT_MARKER = "<!-- grug-guard-dep-watch -->"
@@ -69,6 +69,39 @@ def _headers(token: str) -> dict[str, str]:
         "Accept": "application/vnd.github.raw",
         "X-GitHub-Api-Version": "2022-11-28",
     }
+
+
+def _discover_manifests(token: str, owner: str, repo: str) -> list[str]:
+    """Manifest paths across the WHOLE default-branch tree (codex PR
+    #492: root-only fetching silently skipped requirements-dev.txt,
+    constraints.txt, setup.cfg, and nested manifests that the diff-time
+    SCA already covers). Matches sca's own _MANIFEST_RE so the two
+    scanners can never disagree about what counts as a manifest. Capped
+    + truncation logged (no silent caps)."""
+    resp = httpx.get(
+        f"https://api.github.com/repos/{quote(owner, safe='')}/{quote(repo, safe='')}/git/trees/HEAD",
+        params={"recursive": "1"},
+        headers={
+            "Authorization": f"Bearer {token}",
+            "Accept": "application/vnd.github+json",
+            "X-GitHub-Api-Version": "2022-11-28",
+        },
+        timeout=_FETCH_TIMEOUT,
+    )
+    resp.raise_for_status()
+    payload = resp.json() or {}
+    if payload.get("truncated"):
+        log.info("dep_watch_tree_truncated", extra={"repo": f"{owner}/{repo}"})
+    paths = [
+        t.get("path", "") for t in payload.get("tree", [])
+        if t.get("type") == "blob" and _MANIFEST_RE.search(t.get("path", ""))
+    ]
+    if len(paths) > _MAX_MANIFESTS:
+        log.info(
+            "dep_watch_manifest_cap",
+            extra={"repo": f"{owner}/{repo}", "found": len(paths), "cap": _MAX_MANIFESTS},
+        )
+    return paths[:_MAX_MANIFESTS]
 
 
 def _fetch_manifest(token: str, owner: str, repo: str, path: str) -> str | None:
@@ -110,8 +143,11 @@ def _report_body(rows: list[dict[str, Any]]) -> str:
 
 
 def _existing_report(token: str, owner: str, repo: str) -> int | None:
-    """Open quarantine-report issue number, or None. Marker-based - the
-    same write-verification discipline as Pulse."""
+    """Open quarantine-report issue number, or None. Identified by the
+    BODY MARKER (codex PR #492: a title-substring match could overwrite
+    an unrelated user issue, and a bot report with an edited title would
+    duplicate). Title is not consulted at all - the marker is the
+    identity."""
     resp = httpx.get(
         f"https://api.github.com/repos/{quote(owner, safe='')}/{quote(repo, safe='')}/issues",
         params={"state": "open", "per_page": 50},
@@ -122,7 +158,7 @@ def _existing_report(token: str, owner: str, repo: str) -> int | None:
     for issue in resp.json() or []:
         if issue.get("pull_request"):
             continue
-        if _REPORT_TITLE in (issue.get("title") or ""):
+        if _REPORT_MARKER in (issue.get("body") or ""):
             return int(issue["number"])
     return None
 
@@ -144,7 +180,7 @@ def run_dep_watch_for_install(
             if not get_repo_config(install_id, int(repo_id)).get("dep_watch_enabled", False):
                 continue
             pins: list[ChangedDep] = []
-            for manifest in _MANIFESTS:
+            for manifest in _discover_manifests(token, owner, name):
                 text = _fetch_manifest(token, owner, name, manifest)
                 if text:
                     pins.extend(parse_manifest_pins(manifest, text))
