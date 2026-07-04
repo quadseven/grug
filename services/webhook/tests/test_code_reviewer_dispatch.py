@@ -1307,3 +1307,39 @@ def test_fetch_file_contents_url_encodes_path(monkeypatch):
     got = captured[0]
     assert "/contents/dir/a%20b%23c.py" in got  # space→%20, #→%23, / kept
     assert " " not in got and "#" not in got.split("?")[0]
+
+
+def test_elder_no_longer_carries_security_findings(monkeypatch):
+    """#466 acceptance: a diff carrying a committed secret produces NO
+    security finding on ELDER's surfaces (the security suite moved to
+    Guard's own check-run). With the LLM returning zero findings, Elder
+    posts a clean check-run and no inline review - even though the diff
+    contains a real AWS key shape."""
+    llm = LlmReviewResponse(
+        kind="reviewed", findings=(), backend_used=Backend.POOLSIDE,
+        review_span_context=None,
+    )
+    monkeypatch.setattr(cr_dispatch, "review_diff", lambda *a, **kw: llm)
+    monkeypatch.setattr(cr_dispatch, "grade_findings", lambda *a, **kw: ())
+    posted_check, posted_review = [], []
+    monkeypatch.setattr(
+        cr_dispatch, "post_check_run",
+        lambda t, o, r, result, external_id=None: posted_check.append(result) or {},
+    )
+    monkeypatch.setattr(
+        cr_dispatch, "post_review",
+        lambda *a, **kw: posted_review.append(kw) or {},
+    )
+
+    secret_diff = (
+        "diff --git a/.env b/.env\n--- a/.env\n+++ b/.env\n"
+        "@@ -0,0 +1,1 @@\n"
+        "+AWS_SECRET_ACCESS_KEY=AKIAIOSFODNN7EXAMPLE\n"
+    )
+    r = MagicMock(); r.status_code = 200; r.raise_for_status = MagicMock(); r.text = secret_diff
+    with patch("httpx.get", return_value=r):
+        out = cr_dispatch.dispatch_code_review(_payload(), blocking=True)
+
+    assert out["result"] == "pass"
+    assert posted_check[0].conclusion == "success"  # blocking mode, no findings
+    assert posted_review == []  # no inline security comments from Elder

@@ -106,4 +106,4 @@ def test_persona_mappers_reject_unknown():
     with pytest.raises(ValueError):
         review_types.persona_for_key("smasher")
     with pytest.raises(ValueError):
-        review_types.key_for_persona("guard")
+        review_types.key_for_persona("warder")

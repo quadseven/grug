@@ -53,6 +53,8 @@ MIRRORED_WITH_HEADER=(
   "personas/code_reviewer/sast.py"
   "personas/code_reviewer/sca.py"
   "personas/code_reviewer/webhook_dispatch.py"
+  "personas/guard/dispatch.py"
+  "personas/guard/webhook_dispatch.py"
   "personas/tpm/dor_checks.py"
   "personas/tpm/webhook_dispatch.py"
   "ports/token_cache.py"
@@ -66,6 +68,7 @@ MIRRORED_BYTE_IDENTICAL=(
   "github_app_auth/__init__.py"
   "personas/__init__.py"
   "personas/code_reviewer/__init__.py"
+  "personas/guard/__init__.py"
   "personas/tpm/__init__.py"
   "ports/__init__.py"
 )

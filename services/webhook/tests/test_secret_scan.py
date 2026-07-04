@@ -12,7 +12,7 @@ from __future__ import annotations
 from unittest.mock import MagicMock, patch
 
 from llm_client import Backend, FindingJudgement, LlmReviewResponse
-from personas.code_reviewer import dispatch as cr_dispatch
+from personas.guard import dispatch as guard_dispatch  # security dispatch moved to Guard (#466)
 from personas.code_reviewer import secret_scan
 from personas.code_reviewer.diff_parser import parse_diff
 from personas.code_reviewer.secret_scan import EXPOSED_SECRET, scan_secrets
@@ -196,15 +196,11 @@ def _base_payload():
 
 
 def _wire_common(monkeypatch, posted_check, posted_review):
-    monkeypatch.setattr(cr_dispatch, "with_install_token_retry", lambda iid, fn: fn("tok"))
-    monkeypatch.setattr(
-        cr_dispatch, "review_diff",
-        lambda *a, **kw: LlmReviewResponse(kind="reviewed", findings=(), backend_used=Backend.POOLSIDE, model_name="laguna"),
-    )
-    monkeypatch.setattr(cr_dispatch, "scan_candidates", lambda *a, **kw: ())
-    monkeypatch.setattr(cr_dispatch, "scan_dependencies", lambda hunks: ())
-    monkeypatch.setattr(cr_dispatch, "post_check_run", lambda t, o, r, result, external_id=None: posted_check.append(result) or {"id": 1})
-    monkeypatch.setattr(cr_dispatch, "post_review", lambda t, o, r, *, pull_number, result: posted_review.append(result) or {"id": 2})
+    monkeypatch.setattr(guard_dispatch, "with_install_token_retry", lambda iid, fn: fn("tok"))
+    monkeypatch.setattr(guard_dispatch, "scan_candidates", lambda *a, **kw: ())
+    monkeypatch.setattr(guard_dispatch, "scan_dependencies", lambda hunks: ())
+    monkeypatch.setattr(guard_dispatch, "post_check_run", lambda t, o, r, result, external_id=None: posted_check.append(result) or {"id": 1})
+    monkeypatch.setattr(guard_dispatch, "post_review", lambda t, o, r, *, pull_number, result: posted_review.append(result) or {"id": 2})
 
 
 def test_dispatch_publishes_exposed_secret_finding(monkeypatch):
@@ -219,7 +215,7 @@ def test_dispatch_publishes_exposed_secret_finding(monkeypatch):
     secret_diff = _diff(".env", f"AWS_SECRET_ACCESS_KEY={_AWS_KEY}")
     r = MagicMock(); r.status_code = 200; r.raise_for_status = MagicMock(); r.text = secret_diff
     with patch("httpx.get", return_value=r):
-        cr_dispatch.dispatch_code_review(_base_payload(), blocking=True)
+        guard_dispatch.dispatch_guard_review(_base_payload(), blocking=True)
     assert posted_review, "a review should be posted"
     inline = posted_review[0].comments
     assert any(c.path == ".env" and c.line == 1 for c in inline)
@@ -238,7 +234,7 @@ def test_dispatch_suppresses_example_secret(monkeypatch):
     secret_diff = _diff("README.md", f"export AWS_ACCESS_KEY_ID={_AWS_KEY}  # docs example")
     r = MagicMock(); r.status_code = 200; r.raise_for_status = MagicMock(); r.text = secret_diff
     with patch("httpx.get", return_value=r):
-        cr_dispatch.dispatch_code_review(_base_payload(), blocking=True)
+        guard_dispatch.dispatch_guard_review(_base_payload(), blocking=True)
     # judge suppressed the only candidate -> no inline secret finding published.
     # Unconditional: if suppression broke and a README.md finding leaked, this
     # fails regardless of what else was posted.
@@ -261,7 +257,7 @@ def test_judge_reasoning_cannot_leak_secret(monkeypatch):
     r = MagicMock(); r.status_code = 200; r.raise_for_status = MagicMock()
     r.text = _diff(".env", f"AWS_SECRET_ACCESS_KEY={_AWS_KEY}")
     with patch("httpx.get", return_value=r):
-        cr_dispatch.dispatch_code_review(_base_payload(), blocking=True)
+        guard_dispatch.dispatch_guard_review(_base_payload(), blocking=True)
     assert posted_review and posted_review[0].comments
     body = posted_review[0].comments[0].body
     assert _AWS_KEY not in body, "judge reasoning must not echo the raw secret"
@@ -276,7 +272,7 @@ def test_dispatch_bounds_candidates_to_judge_budget(monkeypatch):
     posted_check, posted_review = [], []
     _wire_common(monkeypatch, posted_check, posted_review)
     flood = tuple(Candidate(EXPOSED_SECRET, ".env", i + 1, f"masked-{i}") for i in range(40))
-    monkeypatch.setattr(cr_dispatch, "scan_secrets", lambda hunks: flood)
+    monkeypatch.setattr(guard_dispatch, "scan_secrets", lambda hunks: flood)
     captured = {}
 
     def _judge(reprs, *a, **kw):
@@ -287,7 +283,7 @@ def test_dispatch_bounds_candidates_to_judge_budget(monkeypatch):
     r = MagicMock(); r.status_code = 200; r.raise_for_status = MagicMock()
     r.text = _diff("app.py", "x = 1")
     with patch("httpx.get", return_value=r):
-        cr_dispatch.dispatch_code_review(_base_payload(), blocking=True)
+        guard_dispatch.dispatch_guard_review(_base_payload(), blocking=True)
     from llm_client import _JUDGE_MAX_FINDINGS
     assert captured.get("n", 0) <= _JUDGE_MAX_FINDINGS  # judge ran on a bounded set
 
@@ -306,8 +302,8 @@ def test_secret_candidates_survive_truncation(monkeypatch):
         Candidate(EXPOSED_SECRET, ".env", 1, "AWS access key id (value masked: AKIA...MPLE)"),
         Candidate(EXPOSED_SECRET, ".env", 2, "GitHub token (value masked: ghp_...0009)"),
     )
-    monkeypatch.setattr(cr_dispatch, "scan_candidates", lambda *a, **kw: sast_flood)
-    monkeypatch.setattr(cr_dispatch, "scan_secrets", lambda hunks: secrets)
+    monkeypatch.setattr(guard_dispatch, "scan_candidates", lambda *a, **kw: sast_flood)
+    monkeypatch.setattr(guard_dispatch, "scan_secrets", lambda hunks: secrets)
     captured = {}
     monkeypatch.setattr(
         "personas.code_reviewer.sast.judge_findings",
@@ -316,7 +312,7 @@ def test_secret_candidates_survive_truncation(monkeypatch):
     r = MagicMock(); r.status_code = 200; r.raise_for_status = MagicMock()
     r.text = _diff("app.py", "x = 1")
     with patch("httpx.get", return_value=r):
-        cr_dispatch.dispatch_code_review(_base_payload(), blocking=True)
+        guard_dispatch.dispatch_guard_review(_base_payload(), blocking=True)
     classes = [rp["rule_name"] for rp in captured["reprs"]]
     assert len(classes) <= _JUDGE_MAX_FINDINGS
     assert classes.count(EXPOSED_SECRET) == 2, "both secrets survived truncation"
@@ -332,9 +328,9 @@ def test_dispatch_survives_secret_scan_failure(monkeypatch):
     def _boom(hunks):
         raise RuntimeError("secret scan exploded")
 
-    monkeypatch.setattr(cr_dispatch, "scan_secrets", _boom)
+    monkeypatch.setattr(guard_dispatch, "scan_secrets", _boom)
     r = MagicMock(); r.status_code = 200; r.raise_for_status = MagicMock()
     r.text = _diff("app.py", "x = 1")
     with patch("httpx.get", return_value=r):
-        cr_dispatch.dispatch_code_review(_base_payload(), blocking=True)
+        guard_dispatch.dispatch_guard_review(_base_payload(), blocking=True)
     assert posted_check, "core review still publishes despite a scan failure"

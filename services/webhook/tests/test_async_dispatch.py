@@ -523,3 +523,58 @@ def test_run_elder_job_no_head_sha_falls_through_to_review():
         ad.run_elder_job(no_sha)
     mock_c.assert_not_called()
     mock_d.assert_called_once()
+
+
+# ── Guard async job (#466) ────────────────────────────────────────────
+
+
+def test_run_guard_job_claims_namespaced_delivery():
+    """Elder and Guard both dispatch from the SAME webhook delivery;
+    claim_delivery is keyed on the raw GUID, so Guard MUST claim a
+    namespaced key or whichever persona ran first would silently skip
+    the other (#466)."""
+    claimed: list = []
+    with (
+        patch(
+            "adapters.install_store.claim_delivery",
+            side_effect=lambda d: claimed.append(d) or True,
+        ),
+        patch(
+            "personas.guard.dispatch.dispatch_guard_review",
+            return_value={"persona": "guard", "result": "pass"},
+        ) as mock_d,
+    ):
+        out = ad.run_guard_job(_JOB)
+    assert claimed == [f"{_JOB['delivery_id']}:guard"]
+    mock_d.assert_called_once()
+    assert out == {"persona": "guard", "result": "pass"}
+
+
+def test_run_guard_job_skips_when_claim_lost():
+    with (
+        patch("adapters.install_store.claim_delivery", return_value=False),
+        patch("personas.guard.dispatch.dispatch_guard_review") as mock_d,
+    ):
+        out = ad.run_guard_job(_JOB)
+    mock_d.assert_not_called()
+    assert out == {"status": "skipped", "reason": "duplicate_delivery"}
+
+
+def test_run_guard_job_never_reraises_on_dispatch_error():
+    with (
+        patch("adapters.install_store.claim_delivery", return_value=True),
+        patch(
+            "personas.guard.dispatch.dispatch_guard_review",
+            side_effect=RuntimeError("guard exploded"),
+        ),
+    ):
+        out = ad.run_guard_job(_JOB)
+    assert out == {"persona": "guard", "result": "unhandled_error"}
+
+
+def test_enqueue_guard_review_no_runtime_returns_false(monkeypatch):
+    monkeypatch.delenv("GRUG_K8S_RUNTIME", raising=False)
+    assert ad.enqueue_guard_review(
+        payload={"pull_request": {}, "repository": {}, "installation": {}},
+        delivery_id="d1", blocking=False,
+    ) is False
