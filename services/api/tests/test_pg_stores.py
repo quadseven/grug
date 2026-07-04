@@ -757,3 +757,21 @@ def test_list_pulse_enabled_repos_targets_only_enabled(pg):
                           updated_by_user_id="9")
     rows = store.list_pulse_enabled_repos(3)
     assert rows == [{"id": 101, "full_name": "o/on"}]
+
+
+def test_dep_watch_flag_and_targeting(pg):
+    """#491: dep_watch_enabled flows through config (an EXTRA repo flag,
+    not a persona pair) and the store-driven targeting lists only
+    enabled repos; the weekly report claim is win-once."""
+    from adapters import pg_install_store as store
+
+    cfg = store.get_repo_config(4, 201)
+    assert cfg["dep_watch_enabled"] is False
+    store.set_repo_config(install_id=4, repo_id=201, repo_full_name="o/dep",
+                          updated_by_user_id="9", dep_watch_enabled=True)
+    store.set_repo_config(install_id=4, repo_id=202, repo_full_name="o/no",
+                          updated_by_user_id="9")
+    assert store.get_repo_config(4, 201)["dep_watch_enabled"] is True
+    assert store.list_dep_watch_repos(4) == [{"id": 201, "full_name": "o/dep"}]
+    assert store.claim_dep_watch_report(4, "o/dep") is True
+    assert store.claim_dep_watch_report(4, "o/dep") is False
