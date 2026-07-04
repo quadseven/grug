@@ -341,7 +341,7 @@ def _run_job(spec: _AsyncPersonaSpec, event: dict[str, Any]) -> dict[str, str]:
             extra={"delivery_id": delivery_id, "kind": type(e).__name__},
             exc_info=True,
         )
-        _self_recover_review(payload, delivery_id, persona=spec.rerun_persona)
+        self_recover_review(payload, delivery_id, persona=spec.rerun_persona)
         return {"persona": spec.review_persona, "result": "unhandled_error"}
 
 
@@ -415,28 +415,27 @@ def _pr_ids(payload: dict[str, Any]) -> tuple[int | None, str | None, int | None
 def self_recover_review(
     payload: dict[str, Any], delivery_id: str, *, persona: str,
 ) -> None:
-    """Public seam for the webhook-dispatch modules (#478): enqueue ONE
-    durable re-run when the in-process enqueue itself fails (missing
-    GRUG_K8S_RUNTIME / thread-spawn error). The rerun lane is SQS-backed
-    and consumed by the separate grug-consumer deployment, so it survives
-    exactly the class of pod-local breakage that made the enqueue fail.
-    Best-effort: never raises."""
-    _self_recover_review(payload, delivery_id, persona=persona)
+    """Enqueue ONE durable re-run for a dropped review (#418/#478) - the
+    lazy-import seam for the webhook-dispatch modules AND the runner's
+    unhandled-error recovery. Bounded: enqueues at most once per drop -
+    the rerun CONSUMER retries via SQS redrive, never re-enqueues (it
+    calls the dispatch function directly, not the runner), so there is no
+    loop. The rerun lane is SQS-backed and consumed by the separate
+    grug-consumer deployment, so it survives exactly the class of
+    pod-local breakage that made an in-process enqueue fail. Best-effort:
+    a failure to enqueue is logged, never raised (the caller is already
+    in its degrade path).
 
-
-def _self_recover_review(
-    payload: dict[str, Any], delivery_id: str, *, persona: str = "elder",
-) -> None:
-    """Enqueue ONE durable re-run for a dropped review (#418). Bounded:
-    enqueues at most once per drop - the rerun CONSUMER retries via SQS redrive,
-    never re-enqueues (it calls the dispatch function directly, not the runner),
-    so there is no loop. Best-effort: a failure to enqueue is logged, never
-    raised (the caller is already in its degrade path)."""
+    Log-line names keep their legacy elder_ prefix for monitor
+    continuity; the persona rides in `extra` so a Guard/Smasher recovery
+    is attributable.
+    """
     try:
         install_id, repo, pr_number = _pr_ids(payload)
         if not (install_id and repo and pr_number):
             log.warning(
-                "elder_self_recover_skipped_no_ids", extra={"delivery_id": delivery_id}
+                "elder_self_recover_skipped_no_ids",
+                extra={"delivery_id": delivery_id, "persona": persona},
             )
             return
         from rerun import enqueue_rerun
@@ -446,13 +445,20 @@ def _self_recover_review(
         )
         log.info(
             "elder_self_recover_enqueued",
-            extra={"delivery_id": delivery_id, "repo": repo, "pr": pr_number},
+            extra={
+                "delivery_id": delivery_id, "repo": repo,
+                "pr": pr_number, "persona": persona,
+            },
         )
     except Exception as e:  # noqa: BLE001 — recovery is best-effort, never raises
         # exc_info for symmetry with the *_job_unhandled lines: if recovery is
         # systematically broken (queue misconfig), the stack speeds triage.
         log.error(
             "elder_self_recover_failed",
-            extra={"delivery_id": delivery_id, "kind": type(e).__name__},
+            extra={
+                "delivery_id": delivery_id,
+                "kind": type(e).__name__,
+                "persona": persona,
+            },
             exc_info=True,
         )
