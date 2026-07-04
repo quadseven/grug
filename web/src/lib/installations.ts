@@ -42,6 +42,10 @@ export interface Installation {
 
 export interface RepoConfig {
   tpm_enabled: boolean;
+  // Guard persona flags (#466/#483) - served by the same get_repo_config
+  // passthrough as tpm_enabled since the generic store plumbing (#465).
+  guard_enabled: boolean;
+  guard_blocking: boolean;
   enforcement_ruleset_id: number | null;
 }
 
@@ -142,11 +146,16 @@ export function useActivity(installId: number | undefined, verdict?: string) {
 export function useSetRepoConfig(installId: number) {
   const qc = useQueryClient();
   return useMutation({
-    mutationFn: (vars: { repo_id: number; tpm_enabled: boolean }) =>
+    mutationFn: (vars: { repo_id: number; tpm_enabled: boolean; guard_enabled?: boolean }) =>
       api(`/api/v1/installations/${installId}/repos/${vars.repo_id}/config`, {
         method: "PUT",
         headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ tpm_enabled: vars.tpm_enabled }),
+        // tpm_enabled is required by the payload model; guard_enabled is
+        // optional (omitted = leave the stored value alone, sparse merge).
+        body: JSON.stringify({
+          tpm_enabled: vars.tpm_enabled,
+          ...(vars.guard_enabled !== undefined ? { guard_enabled: vars.guard_enabled } : {}),
+        }),
       }),
     onSuccess: () => qc.invalidateQueries({ queryKey: ["installations", installId, "repos"] }),
   });
