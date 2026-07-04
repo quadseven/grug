@@ -25,8 +25,7 @@ from pathlib import Path
 REPO_ROOT = Path(__file__).resolve().parents[2]
 
 PERSONA_PATHS: tuple[Path, ...] = (
-    REPO_ROOT / "services/api/personas/tpm/persona.py",
-    REPO_ROOT / "services/webhook/personas/tpm/persona.py",
+    REPO_ROOT / "services/_shared/personas/tpm/persona.py",
 )
 
 # Allowlist of permitted call-target roots inside `evaluate_pull_request`.

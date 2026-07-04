@@ -1,108 +1,110 @@
 #!/usr/bin/env python3
-"""Grounding attester for spec 0010.MirrorDiscipline.
+"""Grounding attester for spec 0010.MirrorDiscipline - EXTRACTED state.
 
-Proves NECESSARY conditions for these bools:
+The MirrorDiscipline automaton reached its terminal `Extracted` state at
+#77 / ADR-0014: the rule-of-three fired (Smasher was the third async
+persona, ADR-0013) and the mirrored modules graduated to services/_shared/.
 
-  - `mirror_with_header_files_carry_line1_mirrored_at_per_cross_service_primitives`
-  - `scripts_check_mirrored_files_sh_is_authoritative_list_per_cross_service_primitives`
-  - `drift_lint_runs_on_every_pr_per_cross_service_primitives`
+Pre-extraction this script proved the Copied/Synced-state contracts
+(headers, byte-identity, drift-lint wiring). Post-extraction it proves the
+NECESSARY conditions of the Extracted state:
 
-Asserts:
-  1. `scripts/check-mirrored-files.sh` exists.
-  2. It defines BOTH `MIRRORED_WITH_HEADER` and `MIRRORED_BYTE_IDENTICAL` arrays.
-  3. `.github/workflows/check.drift-lint.yml` exists and invokes the script.
-  4. Every file listed in `MIRRORED_WITH_HEADER` exists at both
-     `services/api/<relpath>` AND `services/webhook/<relpath>`.
-  5. Each of those files starts with the line-1 MIRRORED header pattern
-     pointing at the OTHER sibling.
+  1. `services/_shared/` exists and contains the shared import roots.
+  2. NO SHADOWING: no relative path under `services/api/` or
+     `services/webhook/` duplicates a path in `services/_shared/`. The
+     service dir precedes _shared/ on sys.path, so a stray copy would
+     silently shadow the shared module for that one service - the
+     post-extraction drift class (the pytest twin lives in
+     services/webhook/tests/test_shared_no_shadowing.py).
+  3. The retired enforcement is GONE: scripts/check-mirrored-files.sh and
+     .github/workflows/check.drift-lint.yml must not exist.
+  4. No line-1 ADR-0001 `# MIRRORED — sibling at` headers remain under
+     services/.
 """
 from __future__ import annotations
 
-import re
 import sys
 from pathlib import Path
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
-SCRIPT = REPO_ROOT / "scripts/check-mirrored-files.sh"
-DRIFT_LINT_WORKFLOW = REPO_ROOT / ".github/workflows/check.drift-lint.yml"
-
-_ARRAY_RE = re.compile(
-    r"(?P<name>MIRRORED_WITH_HEADER|MIRRORED_BYTE_IDENTICAL)=\(\s*(?P<body>[^)]*)\)",
-    re.DOTALL,
+SHARED = REPO_ROOT / "services/_shared"
+SERVICE_TREES = (REPO_ROOT / "services/api", REPO_ROOT / "services/webhook")
+RETIRED = (
+    REPO_ROOT / "scripts/check-mirrored-files.sh",
+    REPO_ROOT / ".github/workflows/check.drift-lint.yml",
 )
-_QUOTED_PATH_RE = re.compile(r'"([^"]+)"')
-_HEADER_LINE_RE = re.compile(r"^# MIRRORED — sibling at services/(?:api|webhook)/.+; keep in lockstep\.")
+# Anchor modules that must exist in _shared/ - guards against the attester
+# passing vacuously if the tree were emptied or relocated.
+EXPECTED_SHARED = (
+    "observability.py",
+    "secrets_loader.py",
+    "adapters/install_store.py",
+    "personas/registry.py",
+    "personas/tpm/dor_checks.py",
+    "ports/token_cache.py",
+    "github_app_auth/__init__.py",
+)
 
 
-def _parse_arrays(script_text: str) -> dict[str, list[str]]:
-    out: dict[str, list[str]] = {}
-    for m in _ARRAY_RE.finditer(script_text):
-        out[m.group("name")] = _QUOTED_PATH_RE.findall(m.group("body"))
-    return out
+def _py_relpaths(root: Path) -> list[str]:
+    return [
+        p.relative_to(root).as_posix()
+        for p in root.rglob("*.py")
+        if "__pycache__" not in p.parts
+    ]
 
 
 def main() -> int:
-    if not SCRIPT.exists():
-        print(f"FAIL: {SCRIPT} missing")
-        return 1
-    if not DRIFT_LINT_WORKFLOW.exists():
-        print(f"FAIL: {DRIFT_LINT_WORKFLOW} missing — drift-lint not wired")
-        return 1
-
-    script_text = SCRIPT.read_text()
-    workflow_text = DRIFT_LINT_WORKFLOW.read_text()
-
     failures: list[str] = []
 
-    if "check-mirrored-files.sh" not in workflow_text:
-        failures.append(f"FAIL: {DRIFT_LINT_WORKFLOW.name} doesn't invoke check-mirrored-files.sh")
+    if not SHARED.is_dir():
+        print(f"FAIL: {SHARED.relative_to(REPO_ROOT)} missing - not Extracted")
+        return 1
 
-    arrays = _parse_arrays(script_text)
-    if "MIRRORED_WITH_HEADER" not in arrays:
-        failures.append("FAIL: check-mirrored-files.sh missing MIRRORED_WITH_HEADER array")
-    if "MIRRORED_BYTE_IDENTICAL" not in arrays:
-        failures.append("FAIL: check-mirrored-files.sh missing MIRRORED_BYTE_IDENTICAL array")
+    for rel in EXPECTED_SHARED:
+        if not (SHARED / rel).is_file():
+            failures.append(f"FAIL: expected shared module missing: services/_shared/{rel}")
 
-    # Verify each MIRRORED_WITH_HEADER file exists at both sides + has the header.
-    for relpath in arrays.get("MIRRORED_WITH_HEADER", []):
-        api = REPO_ROOT / f"services/api/{relpath}"
-        webhook = REPO_ROOT / f"services/webhook/{relpath}"
-        if not api.exists():
-            failures.append(f"FAIL: MIRRORED_WITH_HEADER entry `{relpath}` missing at services/api/")
-            continue
-        if not webhook.exists():
-            failures.append(f"FAIL: MIRRORED_WITH_HEADER entry `{relpath}` missing at services/webhook/")
-            continue
-        for side in (api, webhook):
-            first_line = side.read_text().splitlines()[0] if side.read_text() else ""
-            if not _HEADER_LINE_RE.match(first_line):
+    shared_rels = set(_py_relpaths(SHARED))
+    if len(shared_rels) < 40:
+        failures.append(
+            f"FAIL: services/_shared/ holds only {len(shared_rels)} modules - "
+            "expected the full extracted set (>=40)"
+        )
+
+    for tree in SERVICE_TREES:
+        for rel in _py_relpaths(tree):
+            if rel in shared_rels:
                 failures.append(
-                    f"FAIL: {side.relative_to(REPO_ROOT)} doesn't have the line-1 MIRRORED header "
-                    f"(found: {first_line[:80]!r})"
+                    f"FAIL: {tree.relative_to(REPO_ROOT)}/{rel} SHADOWS "
+                    f"services/_shared/{rel} - edit the shared copy instead (ADR-0014)"
                 )
 
-    # Verify each MIRRORED_BYTE_IDENTICAL file exists at both sides + is byte-identical.
-    for relpath in arrays.get("MIRRORED_BYTE_IDENTICAL", []):
-        api = REPO_ROOT / f"services/api/{relpath}"
-        webhook = REPO_ROOT / f"services/webhook/{relpath}"
-        if not api.exists():
-            failures.append(f"FAIL: MIRRORED_BYTE_IDENTICAL entry `{relpath}` missing at services/api/")
-            continue
-        if not webhook.exists():
-            failures.append(f"FAIL: MIRRORED_BYTE_IDENTICAL entry `{relpath}` missing at services/webhook/")
-            continue
-        if api.read_bytes() != webhook.read_bytes():
+    for retired in RETIRED:
+        if retired.exists():
             failures.append(
-                f"FAIL: MIRRORED_BYTE_IDENTICAL entry `{relpath}` is NOT byte-identical between sides"
+                f"FAIL: {retired.relative_to(REPO_ROOT)} still exists - "
+                "the mirror enforcement was retired at #77"
             )
+
+    for tree in (*SERVICE_TREES, SHARED):
+        for p in tree.rglob("*.py"):
+            if "__pycache__" in p.parts:
+                continue
+            text = p.read_text()
+            first = text.splitlines()[0] if text else ""
+            if first.startswith("# MIRRORED — sibling at"):
+                failures.append(
+                    f"FAIL: {p.relative_to(REPO_ROOT)} carries an ADR-0001 MIRRORED "
+                    "header - the convention died with the extraction (ADR-0014)"
+                )
 
     if failures:
         print("\n".join(failures))
         return 1
     print(
-        f"OK: mirror policy consistent ("
-        f"{len(arrays.get('MIRRORED_WITH_HEADER', []))} with-header + "
-        f"{len(arrays.get('MIRRORED_BYTE_IDENTICAL', []))} byte-identical pairs verified)"
+        f"OK: Extracted state consistent ({len(shared_rels)} shared modules, "
+        "zero shadowing, mirror enforcement retired)"
     )
     return 0
 

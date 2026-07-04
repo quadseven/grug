@@ -1,12 +1,14 @@
 # spec 0010 — MirrorDiscipline I/O Automaton
 #
-# Models the ADR-0001 rule-of-three-deferral policy for files duplicated
-# between services/api/ and services/webhook/. Per CONTEXT.md
-# § "Cross-service primitives (mirrored)": six modules are intentionally
-# byte-identical (modulo line-1 MIRRORED-from header per PR #138). When
-# the rule of three triggers (3rd copy needed) the module graduates to
-# services/_shared/. Until then, scripts/check-mirrored-files.sh
-# enforces no-drift on every PR.
+# Models the ADR-0001 rule-of-three-deferral policy for files that WERE
+# duplicated between services/api/ and services/webhook/. The lifecycle
+# completed at #77/ADR-0014: the rule of three fired (Smasher was the 3rd
+# async persona, ADR-0013) and the mirrored modules graduated to
+# services/_shared/ - the automaton's terminal `Extracted` state. The
+# Copied/Synced states and their contract bools are the historical record;
+# the grounding attester (attest_mirror_policy_consistency.py) now proves
+# the Extracted-state facts: shared tree present, zero shadowing, the
+# drift-lint enforcement retired.
 #
 # Verified by `temper verify -s specs/0010-mirror-discipline/`.
 

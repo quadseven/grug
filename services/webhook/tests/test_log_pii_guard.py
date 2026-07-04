@@ -8,10 +8,11 @@ logged across grug today, with DD as the authorized observability sink
 `observability.fingerprint()` is a deliberate future call (see
 specs/SLICE_PLAN_TEMPLATE.md §11), not a CI blocker today.
 
-Webhook-side mirror of services/api/tests/test_log_pii_guard.py. Not
-in MIRRORED_FILES (tests are allowed to differ per-service); kept
+Webhook-side twin of services/api/tests/test_log_pii_guard.py (tests
+stay per-service and are allowed to differ - ADR-0014); kept
 substantially identical for clarity. Diverge only when the webhook's
-threat model genuinely requires different scanning rules.
+threat model genuinely requires different scanning rules. Both twins
+also scan services/_shared/ (overlap is deliberate).
 """
 
 from __future__ import annotations
@@ -48,12 +49,17 @@ WHITELIST_RELATIVE = (
 
 
 def _candidate_files() -> list[Path]:
+    # Post-extraction (#77/ADR-0014) the shared modules live in
+    # services/_shared/ — scanning SERVICE_DIR alone would silently
+    # shrink coverage to the service-local files only, so the shared
+    # tree is scanned too (both suites scan it; overlap is harmless).
     out: list[Path] = []
-    for path in SERVICE_DIR.rglob("*.py"):
-        rel = path.relative_to(SERVICE_DIR).as_posix()
-        if any(skip in rel for skip in WHITELIST_RELATIVE):
-            continue
-        out.append(path)
+    for root in (SERVICE_DIR, SERVICE_DIR.parent / "_shared"):
+        for path in root.rglob("*.py"):
+            rel = path.relative_to(root).as_posix()
+            if any(skip in rel for skip in WHITELIST_RELATIVE):
+                continue
+            out.append(path)
     return out
 
 

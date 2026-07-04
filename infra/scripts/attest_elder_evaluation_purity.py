@@ -23,12 +23,10 @@ from pathlib import Path
 REPO_ROOT = Path(__file__).resolve().parents[2]
 
 PARSE_DIFF_PATHS: tuple[Path, ...] = (
-    REPO_ROOT / "services/api/personas/code_reviewer/diff_parser.py",
-    REPO_ROOT / "services/webhook/personas/code_reviewer/diff_parser.py",
+    REPO_ROOT / "services/_shared/personas/code_reviewer/diff_parser.py",
 )
 EVALUATE_DIFF_PATHS: tuple[Path, ...] = (
-    REPO_ROOT / "services/api/personas/code_reviewer/persona.py",
-    REPO_ROOT / "services/webhook/personas/code_reviewer/persona.py",
+    REPO_ROOT / "services/_shared/personas/code_reviewer/persona.py",
 )
 
 # Allowlist of permitted call-target roots inside `parse_diff`.
@@ -242,7 +240,7 @@ def main() -> int:
         return 1
     print(
         f"OK: parse_diff + evaluate_diff are pure in both "
-        f"{len(PARSE_DIFF_PATHS)} mirrored persona module(s)"
+        f"{len(PARSE_DIFF_PATHS)} shared persona module(s)"
     )
     return 0
 

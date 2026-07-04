@@ -27,7 +27,7 @@ import sys
 from pathlib import Path
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
-USER_STORE = REPO_ROOT / "services/api/adapters/pg_user_store.py"
+USER_STORE = REPO_ROOT / "services/_shared/adapters/pg_user_store.py"
 
 EXPECTED_FIELDS: frozenset[str] = frozenset({
     "github_user_id", "login", "role", "tier",

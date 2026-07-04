@@ -1,0 +1,15 @@
+# Context root is services/ (ADR-0014) - patterns are re-rooted from the
+# retired per-service .dockerignore files.
+**/__pycache__
+**/*.pyc
+**/*.pyo
+**/.pytest_cache
+**/.ruff_cache
+**/.venv
+**/venv
+**/.git
+*/tests
+**/*.md
+**/.dockerignore
+*/Dockerfile*
+**/.env*
