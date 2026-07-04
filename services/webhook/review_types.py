@@ -28,7 +28,7 @@ Verdict = Literal["block", "warn", "pass", "errored"]
 VERDICTS: frozenset[str] = frozenset(get_args(Verdict))
 
 # Canonical caveman persona keys used in new code + the Activity feed (ADR-0002).
-Persona = Literal["chief", "elder", "guard"]
+Persona = Literal["chief", "elder", "guard", "warder", "pulse"]
 PERSONAS: frozenset[str] = frozenset(get_args(Persona))
 
 # The ONE place the caveman name <-> legacy code key map lives. The persona
@@ -38,7 +38,10 @@ PERSONAS: frozenset[str] = frozenset(get_args(Persona))
 # Typed `dict[str, Persona]` (not `dict[str, str]`) so a typo'd value (e.g.
 # "cheif") is caught by the type checker against the Literal at definition
 # time — the guarantee is real, not laundered through a `# type: ignore`.
-_KEY_TO_PERSONA: dict[str, Persona] = {"tpm": "chief", "code_reviewer": "elder", "guard": "guard"}
+_KEY_TO_PERSONA: dict[str, Persona] = {
+    "tpm": "chief", "code_reviewer": "elder", "guard": "guard",
+    "warder": "warder", "pulse": "pulse",
+}
 _PERSONA_TO_KEY: dict[Persona, str] = {v: k for k, v in _KEY_TO_PERSONA.items()}
 
 

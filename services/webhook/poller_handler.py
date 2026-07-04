@@ -101,6 +101,36 @@ def handler(event: dict[str, Any], context: Any) -> dict[str, int | str]:
             )
             failed_installs += 1
 
+    # Pulse pass (#472): the first SCHEDULED persona rides the same
+    # cadence as its OWN loop (the reactions loop `continue`s installs
+    # with no comment records - Pulse must still run there). Best-effort
+    # per install; everything inside run_pulse_for_install is capped +
+    # per-repo best-effort + store-claim idempotent.
+    nudges = 0
+    pulse_failed = 0
+    for install_id in installs:
+        try:
+            from adapters.install_store import list_pulse_enabled_repos
+            from personas.pulse.nudge import run_pulse_for_install
+
+            # Store-driven targeting (codex PR #489): only repos the
+            # operator ENABLED - no /installation/repositories paging, so
+            # a large install can never starve an enabled repo behind a
+            # discovery-page prefix, and idle ticks cost zero GH calls.
+            repos = list_pulse_enabled_repos(install_id)
+            if not repos:
+                continue
+            nudges += with_install_token_retry(
+                install_id,
+                lambda token, iid=install_id, r=repos: run_pulse_for_install(token, iid, r),
+            ) or 0
+        except Exception as e:  # noqa: BLE001 — one install must not abort the cron
+            log.warning(
+                "pulse_install_failed",
+                extra={"install_id": install_id, "kind": type(e).__name__},
+            )
+            pulse_failed += 1
+
     # Auto-replay missed webhook deliveries (#407), best-effort: a replay
     # failure must never abort the cron, so it's wrapped here on TOP of
     # replay_since's own per-attempt best-effort.
@@ -115,6 +145,8 @@ def handler(event: dict[str, Any], context: Any) -> dict[str, int | str]:
         "records": polled_records,
         "submitted": submitted,
         "failed_installs": failed_installs,
+        "pulse_nudges": nudges,
+        "pulse_failed_installs": pulse_failed,
         **replay,
     }
     # Total failure (auth/config drift, GitHub down) errors EVERY install and
