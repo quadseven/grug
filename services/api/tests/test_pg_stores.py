@@ -744,6 +744,25 @@ def test_warder_pulse_flags_flow_through_config(pg):
     assert store.is_persona_enabled(1, 55, "pulse") is True
 
 
+def test_smasher_flag_flows_through_config(pg):
+    """codex peer-review PR #494: smasher_enabled reachable end-to-end via the
+    config API path, so the documented per-repo opt-in actually enables the
+    registry dispatch gate (was unreachable - RepoConfigPayload didn't declare
+    it)."""
+    from adapters import pg_install_store as store
+
+    cfg = store.get_repo_config(1, 57)
+    assert cfg["smasher_enabled"] is False  # opt-in default
+    assert store.is_persona_enabled(1, 57, "smasher") is False
+    store.set_repo_config(
+        install_id=1, repo_id=57, repo_full_name="o/r",
+        updated_by_user_id="9", smasher_enabled=True,
+    )
+    cfg = store.get_repo_config(1, 57)
+    assert cfg["smasher_enabled"] is True
+    assert store.is_persona_enabled(1, 57, "smasher") is True
+
+
 def test_list_pulse_enabled_repos_targets_only_enabled(pg):
     """Codex PR #489 r2: Pulse targets CONFIGURED repos from the store -
     no discovery paging, no starvation."""
