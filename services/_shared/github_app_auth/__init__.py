@@ -141,7 +141,7 @@ def with_install_token_retry(installation_id: int, fn):
 
     Use this for any API call that depends on a cached install token —
     GitHub revokes tokens out-of-band on App reinstall, perm change, or
-    secret rotation, and the warm Lambda would otherwise reuse the bad
+    secret rotation, and the long-lived process would otherwise reuse the bad
     cached token until the 55-min TTL elapsed (Codex post-review #50).
     """
     token = get_install_token(installation_id)

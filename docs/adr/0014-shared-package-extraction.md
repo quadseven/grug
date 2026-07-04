@@ -57,7 +57,8 @@ packages are forbidden. Consequences:
 
 - `adapters/user_store.py` + `adapters/pg_user_store.py` (api-only) and
   `personas/smasher/trial_*.py` (webhook-only) move INTO `_shared/` with
-  their packages, keep their `# API-ONLY` / `# WEBHOOK-ONLY` line-1 markers,
+  their packages, keep their API-ONLY / WEBHOOK-ONLY markers in the opening
+  docstring lines,
   and stay lazy-imported (the other service never executes them - the same
   convention that already keeps `async_dispatch` imports webhook-side).
 - Genuinely per-service top-level modules stay put: `main.py`, `rerun.py`
@@ -119,6 +120,6 @@ Guards:
   context upload; layer contents unchanged, plus `PYTHONPATH`).
 - Spec 0010 reaches its terminal `Extracted` state; its attesters now
   ground the extracted reality instead of the mirror contracts.
-- The `# MIRRORED` header convention is dead; `# API-ONLY` /
-  `# WEBHOOK-ONLY` markers remain for single-service modules inside
-  `_shared/` packages.
+- The `# MIRRORED` header convention is dead; API-ONLY / WEBHOOK-ONLY
+  markers (in the opening docstring lines) remain for single-service
+  modules inside `_shared/` packages.

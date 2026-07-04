@@ -7,7 +7,7 @@ Proves NECESSARY conditions for these bools:
   - `identity_only_projection_has_no_token_fields_per_identity_concepts`
   - `defaults_role_user_tier_free_allowlisted_false_per_identity_concepts`
 
-Asserts that `services/api/adapters/pg_user_store.py:UserIdentity`:
+Asserts that `services/_shared/adapters/pg_user_store.py:UserIdentity`:
   1. Is decorated with `@dataclass(frozen=True)` — no post-construction mutation.
   2. Has NO field whose name contains `oauth_`, `token`, `password`, `secret`,
      or `blob` — token material lives ONLY on UserWithTokens (spec 0008).

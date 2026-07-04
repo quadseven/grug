@@ -34,7 +34,7 @@ _HEADERS_TEMPLATE = {
 # rate limit (429, sometimes 403 + Retry-After). A bare raise_for_status made
 # the whole enforcement check fail → the UI showed a false "not enforced".
 #
-# Budget note: these GETs run inside the grug-api Lambda (15s timeout), so the
+# Budget note: these GETs run inside a user-facing grug-api request, so the
 # retry budget is deliberately SMALL — a few jittered, short backoffs to ride
 # out a transient burst. A SUSTAINED rate limit is NOT waited out here; it
 # exhausts fast and the caller (get_enforcement) falls back to the last-known
@@ -75,7 +75,7 @@ def _retry_delay(attempt: int, resp: httpx.Response | None) -> float:
     Equal jitter (`base/2 + rand(0, base/2)`) de-syncs the dashboard's
     parallel retries so they don't re-collide into a fresh burst, while
     still guaranteeing a meaningful minimum wait. Retry-After (seconds) is
-    respected but capped at _GET_RETRY_MAX_DELAY to stay inside the Lambda
+    respected but capped at _GET_RETRY_MAX_DELAY to stay inside the request
     budget — a longer limit is handled by the caller's fallback, not a wait.
     """
     base = min(_GET_RETRY_BASE_DELAY * (2 ** attempt), _GET_RETRY_MAX_DELAY)
