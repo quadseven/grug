@@ -102,11 +102,19 @@ def extract_changed_deps(hunks: tuple[DiffHunk, ...]) -> tuple[ChangedDep, ...]:
     return tuple(out[:_MAX_DEPS])
 
 
-def _audit(deps: tuple[ChangedDep, ...]) -> dict[tuple[str, str], list[str]]:
+def _audit(
+    deps: tuple[ChangedDep, ...], *, strict: bool = False,
+) -> dict[tuple[str, str], list[str]]:
     """Query the OSV batch API for the changed deps; return {(name_lower,
     version): [advisory-id, ...]} for those with known vulns. ONE HTTPS call;
-    OSV returns results in query order, so we zip back to deps. Best-effort: an
-    OSV-unreachable / unparseable response -> {} + log (additive)."""
+    OSV returns results in query order, so we zip back to deps.
+
+    Failure semantics are the caller's choice (codex PR #492 r3):
+    - strict=False (the diff-time review path): OSV-unreachable /
+      unparseable -> {} + log. Fail-open is right there - SCA is additive
+      to a review that ships regardless.
+    - strict=True (the scheduled dep watch): RE-RAISE - a weekly security
+      scan must never report an advisory-feed outage as a clean repo."""
     if not deps:
         return {}
     queries = [
@@ -119,6 +127,8 @@ def _audit(deps: tuple[ChangedDep, ...]) -> dict[tuple[str, str], list[str]]:
         results = resp.json().get("results", [])
     except (httpx.HTTPError, json.JSONDecodeError, ValueError) as e:
         log.warning("sca_osv_query_failed", extra={"kind": type(e).__name__})
+        if strict:
+            raise
         return {}
 
     vulns_by_dep: dict[tuple[str, str], list[str]] = {}

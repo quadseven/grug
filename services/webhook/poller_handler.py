@@ -143,10 +143,12 @@ def handler(event: dict[str, Any], context: Any) -> dict[str, int | str]:
             repos = list_dep_watch_repos(install_id)
             if not repos:
                 continue
-            dep_reports += with_install_token_retry(
+            filed_failed = with_install_token_retry(
                 install_id,
                 lambda token, iid=install_id, r=repos: run_dep_watch_for_install(token, iid, r),
-            ) or 0
+            ) or (0, 0)
+            dep_reports += filed_failed[0]
+            dep_watch_failed += filed_failed[1]
         except Exception as e:  # noqa: BLE001 — one install must not abort the cron
             log.warning(
                 "dep_watch_install_failed",
