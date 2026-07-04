@@ -62,6 +62,10 @@ MIRRORED_WITH_HEADER=(
   "personas/tpm/webhook_dispatch.py"
   "personas/warder/dispatch.py"
   "personas/warder/webhook_dispatch.py"
+  "personas/smasher/mutate.py"
+  "personas/smasher/sandbox.py"
+  "personas/smasher/dispatch.py"
+  "personas/smasher/webhook_dispatch.py"
   "ports/token_cache.py"
   "readiness.py"
   "secrets_loader.py"
@@ -77,6 +81,7 @@ MIRRORED_BYTE_IDENTICAL=(
   "personas/pulse/__init__.py"
   "personas/warder/__init__.py"
   "personas/tpm/__init__.py"
+  "personas/smasher/__init__.py"
   "ports/__init__.py"
 )
 

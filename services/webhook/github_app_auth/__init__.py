@@ -98,6 +98,44 @@ def get_install_token(installation_id: int, *, force_refresh: bool = False) -> s
     return token
 
 
+def get_scoped_install_token(
+    installation_id: int,
+    *,
+    repositories: list[str],
+    permissions: dict[str, str],
+) -> str:
+    """Mint a fresh installation token DOWN-SCOPED to specific repositories +
+    permissions (#469). GitHub's token-create API narrows a token when the body
+    carries `repositories` / `permissions` subsets - the resulting token can do
+    strictly LESS than the installation's full grant. Used to hand the Smasher
+    Trial sandbox a `contents:read`-only, single-repo token (ADR-0013).
+
+    NOT cached: a scoped token is minted per Trial for a one-shot clone and must
+    never be reused as if it were the full-scope cached token. The response body
+    is never logged (it carries a token-shaped value)."""
+    resp = httpx.post(
+        f"{_GH_API}/app/installations/{installation_id}/access_tokens",
+        headers={
+            "Authorization": f"Bearer {get_app_jwt()}",
+            "Accept": "application/vnd.github+json",
+        },
+        json={"repositories": repositories, "permissions": permissions},
+        timeout=10,
+    )
+    resp.raise_for_status()
+    try:
+        return resp.json()["token"]
+    except (ValueError, KeyError, TypeError) as e:
+        log.warning(
+            "scoped_install_token_malformed_response",
+            extra={"installation_id": installation_id, "error": type(e).__name__},
+        )
+        raise RuntimeError(
+            "GitHub returned a 200 without a usable scoped installation token "
+            f"(installation {installation_id}): {type(e).__name__}"
+        ) from e
+
+
 def with_install_token_retry(installation_id: int, fn):
     """Run `fn(token)` once. On httpx 401, invalidate cache + retry once.
 

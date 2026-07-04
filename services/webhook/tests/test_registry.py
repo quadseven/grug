@@ -10,7 +10,19 @@ from personas import registry
 
 def test_registered_personas():
     keys = {p.key for p in registry.REGISTRY}
-    assert keys == {"tpm", "code_reviewer", "guard", "warder", "pulse"}
+    assert keys == {"tpm", "code_reviewer", "guard", "warder", "pulse", "smasher"}
+
+
+def test_smasher_is_advisory_async_optin():
+    # Smasher (#469) runs author code in a Job (async) and is opt-in per repo
+    # (default OFF); mutation findings are advisory so it has no blocking mode.
+    smasher = registry.by_key("smasher")
+    assert smasher.canonical == "smasher"
+    assert smasher.dispatch_style == "async"
+    assert smasher.enabled_default is False
+    assert smasher.blocking_flag is None
+    assert smasher.missing_repo_policy == "disabled"
+    assert smasher.check_run_name == "Grug — Smasher"
 
 
 def test_canonical_names_match_adr_0002():

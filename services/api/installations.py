@@ -66,6 +66,7 @@ class RepoConfigPayload(BaseModel):
     guard_blocking: bool | None = Field(default=None)
     warder_enabled: bool | None = Field(default=None)
     pulse_enabled: bool | None = Field(default=None)
+    smasher_enabled: bool | None = Field(default=None)
     dep_watch_enabled: bool | None = Field(default=None)
 
 
@@ -76,7 +77,7 @@ class RerunRequest(BaseModel):
     model_config = ConfigDict(extra="forbid")
     repo: str = Field(pattern=r"^[^/\s]+/[^/\s]+$")  # owner/name
     pr_number: int
-    persona: str = Field(pattern=r"^(elder|code_reviewer|chief|tpm|guard)$")
+    persona: str = Field(pattern=r"^(elder|code_reviewer|chief|tpm|guard|smasher)$")
 
 
 def _ensure_can_access(install: dict[str, Any], user: UserIdentity) -> None:
@@ -440,6 +441,7 @@ def update_repo_config(
         guard_blocking=body.guard_blocking,
         warder_enabled=body.warder_enabled,
         pulse_enabled=body.pulse_enabled,
+        smasher_enabled=body.smasher_enabled,
         dep_watch_enabled=body.dep_watch_enabled,
     )
     log.info(

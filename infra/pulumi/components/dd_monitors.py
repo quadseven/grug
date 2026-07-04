@@ -269,10 +269,10 @@ def create_all(
         opts=opts,
     )
 
-    # 3b) Async persona offload failures (#272 Elder, #466 Guard). The
-    #     async personas run off the ACK path; if an enqueue throttles
-    #     (`elder_enqueue_failed`/`guard_enqueue_failed`) or an async worker
-    #     crashes (`elder_job_unhandled`/`guard_job_unhandled`), that run is
+    # 3b) Async persona offload failures (#272 Elder, #466 Guard, #469 Smasher).
+    #     The async personas run off the ACK path; if an enqueue throttles
+    #     (`*_enqueue_failed`) or an async worker crashes (`*_job_unhandled`),
+    #     that run is
     #     DROPPED — by design we don't sync-fall-back (it would re-block the
     #     <10s ACK) and rely on the next push re-triggering. That "drop +
     #     re-trigger" is only safe if the drop is VISIBLE, so alert on any
@@ -295,7 +295,8 @@ def create_all(
         query=(
             f'logs("service:grug-webhook env:{env} '
             '(elder_enqueue_failed OR elder_job_unhandled OR guard_enqueue_failed '
-            'OR guard_job_unhandled OR cave_judge_failed_secrets_suppressed)").index("*")'
+            'OR guard_job_unhandled OR smasher_enqueue_failed OR smasher_job_unhandled '
+            'OR cave_judge_failed_secrets_suppressed)").index("*")'
             '.rollup("count").last("15m") > 0'
         ),
         tags=_common_tags(env, "grug-webhook"),

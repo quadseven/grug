@@ -4,10 +4,12 @@
 # to AWS with the SEPARATE grug-rotator-secret (scoped to access-key ops on
 # the pod user only) - NEVER grug-secrets, which it is mutating.
 #
-# This is the ONLY workload in the namespace with Kubernetes API access
-# (automountServiceAccountToken: true) - a deliberate, documented exception,
+# This workload has Kubernetes API access (automountServiceAccountToken: true),
 # narrowly scoped by the Role below to exactly the one Secret and the three
-# Deployments it must touch.
+# Deployments it must touch. (Since #469 the webhook + consumer also mount an
+# SA token - the Smasher launcher - but that SA's permissions live entirely in
+# the separate `grug-trial` namespace, NOT here, so it cannot touch grug-secrets;
+# see k8s/smasher-trial-namespace.yaml.)
 ---
 apiVersion: v1
 kind: ServiceAccount

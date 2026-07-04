@@ -4,6 +4,8 @@
 resources:
   - namespace.yaml
   - networkpolicy.yaml
+  - smasher-rbac.yaml
+  - smasher-trial-namespace.yaml
   - webhook-deployment.yaml
   - api-deployment.yaml
   - poller-cronjob.yaml
