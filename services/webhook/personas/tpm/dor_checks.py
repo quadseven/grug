@@ -38,7 +38,7 @@ _BULLET_PAT = re.compile(
 # criteria` truncated the section to empty and the bullet check failed
 # on legitimate PR bodies. Closes #45.
 _SECTION_PAT = re.compile(r"^##(?!#)\s+(.+?)\s*$", re.MULTILINE)
-# Sentry MED on PR #40 — earlier `(?:Size:?\s*)?` made the prefix
+# Seer MED on PR #40 — earlier `(?:Size:?\s*)?` made the prefix
 # OPTIONAL, so a body like "use the M&Ms" would match `M` and falsely
 # satisfy the estimate check. Require an explicit `Size` token followed
 # by punctuation/whitespace/markdown-emphasis (`:` `**` `_` etc.) and

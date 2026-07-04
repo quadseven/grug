@@ -72,6 +72,11 @@ spec:
             # feature off, SaaS judge as before (fail-open).
             - {name: GRUG_CAVE_GATEWAY_URL, value: http://spark-gateway.spark-gateway.svc:8080}
             - {name: GRUG_CAVE_JUDGE_MODEL, value: qwen3-coder-next:latest}
+            # Omen production-signal fusion (#470). All three fail-open:
+            # absent params/mapping = zero DD calls = today's review.
+            - {name: GRUG_DD_API_KEY_SSM, value: /grug/dd-api-key}
+            - {name: GRUG_DD_APP_KEY_SSM, value: /grug/dd-app-key}
+            - {name: GRUG_OMEN_SERVICE_MAP_SSM, value: /grug/omen-service-map}
             - {name: GRUG_FALLBACK_ENABLED_SSM, value: /grug/elder-fallback-enabled}
             # SAST detection engine (#401): Semgrep OSS over the vendored
             # offline rules - the consumer runs full Elder re-runs, so it needs

@@ -4,7 +4,7 @@ The PUT /installations/{id}/repos/{id}/config endpoint enforces:
 1. Install must exist (404 otherwise)
 2. Caller must own install OR be admin (403 otherwise — see test_installations_routes)
 3. Repo must belong to install (verified via GH /installation/repositories,
-   not /repositories/{id} — Sentry CRITICAL on PR #43 closed that gap)
+   not /repositories/{id} — Seer CRITICAL on PR #43 closed that gap)
 4. set_repo_config persists toggle
 
 Tests mock get_installation + with_install_token_retry + httpx + set_repo_config
@@ -90,7 +90,7 @@ def test_update_repo_config_admin_can_access_any():
 
 
 def test_update_repo_config_repo_not_in_install_404():
-    """Sentry CRITICAL fix: repo not visible to install must 404 even if
+    """Seer CRITICAL fix: repo not visible to install must 404 even if
     repo exists publicly elsewhere on GH."""
     payload = inst.RepoConfigPayload(tpm_enabled=True)
     install = {"installed_by_user_id": "100"}
