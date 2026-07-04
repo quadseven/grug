@@ -64,6 +64,14 @@ class Cluster(Protocol):
     def delete_job(self, job_name: str) -> None: ...
 
 
+def _attempt_id() -> str:
+    """Short unique suffix so concurrent Trial attempts for the same head SHA
+    (e.g. a webhook run + an operator rerun) get DISTINCT resource names and
+    never destructively collide. `os.urandom` (not a clock) so it works in the
+    resume-safe runtime."""
+    return os.urandom(4).hex()
+
+
 def _job_name(owner: str, repo: str, head_sha: str) -> str:
     """Repo-qualified, collision-free Job name. Two PRs sharing a head SHA (a
     fork PR + base PR of the same commit) must NOT collide onto one Job name —
@@ -103,7 +111,15 @@ def launch_trial(
         log.error("smasher_no_job_image_configured")  # permanent operator fault
         return _degraded("no_job_image_configured")
 
-    base = _job_name(owner, repo, head_sha)
+    # Per-ATTEMPT unique names (codex peer-review PR #494): deterministic
+    # head-SHA names + a delete-before-create would let a same-head rerun
+    # (the rerun lane bypasses the head-SHA claim) destroy an in-flight Trial's
+    # Jobs/PVC/Secret. A unique attempt suffix means concurrent attempts never
+    # collide; each cleans up ONLY its own resources in the finally below. (A
+    # webhook-pod crash mid-run leaks this attempt's PVC/Secret - bounded + all
+    # carry the `app: grug-trial` label for a future age-based janitor; the Jobs
+    # self-clean via ttlSecondsAfterFinished.)
+    base = f"{_job_name(owner, repo, head_sha)}-{_attempt_id()}"
     prep_job, test_job = f"{base}-prep", f"{base}-test"
     secret_name, pvc_name = f"{base}-token", f"{base}-ws"
     budget = total_budget_seconds
@@ -115,7 +131,6 @@ def launch_trial(
         _swallow(lambda: cluster.delete_pvc(pvc_name))
         _swallow(lambda: cluster.delete_secret(secret_name))
 
-    _cleanup()  # clear any leftovers from a prior same-head run (best-effort)
     try:
         cluster.create_secret(secret_name, token)
         cluster.create_pvc(build_trial_pvc(pvc_name))

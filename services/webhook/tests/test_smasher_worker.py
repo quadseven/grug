@@ -91,15 +91,39 @@ def test_killed_mutant_not_reported(tmp_path):
     assert summary["survived"] == []
 
 
-def test_file_restored_after_each_mutant(tmp_path):
+def test_pristine_checkout_never_mutated(tmp_path):
+    # Every run happens in a COPY; the pristine checkout is never touched.
     original = "def f(x):\n    return x > 0\n"
     _write(tmp_path, "m.py", original)
     run_trial(
         workspace=str(tmp_path), targets={"m.py": [2]},
         mutant_cap=10, per_mutant_timeout=5, run_tests=lambda ws, t: 0,
     )
-    # The workspace file is left pristine (each mutant is reverted).
     assert (tmp_path / "m.py").read_text() == original
+
+
+def test_stateful_test_cannot_poison_later_mutants(tmp_path):
+    # A test that writes to a SIBLING file must not affect later mutants - each
+    # runs in a fresh copy of the pristine tree (codex peer-review isolation).
+    _write(tmp_path, "m.py", "def f(a, b):\n    return a == 1 or b == 2\n")
+
+    def run_tests(ws, timeout):
+        poison = Path(ws) / "poison.py"
+        # If a prior run's pollution leaked into this copy, fail (mislabel).
+        if poison.exists():
+            return 1
+        poison.write_text("x = 1\n")  # try to pollute for the next run
+        return 0
+
+    summary = run_trial(
+        workspace=str(tmp_path), targets={"m.py": [2]},
+        mutant_cap=10, per_mutant_timeout=5, run_tests=run_tests,
+    )
+    # Every mutant saw a pristine tree (no poison) -> all survive; none mislabeled.
+    assert summary["status"] == "completed"
+    assert summary["killed"] == 0 and summary["total"] >= 2
+    # The pollution never reached the pristine checkout either.
+    assert not (tmp_path / "poison.py").exists()
 
 
 def test_timeout_is_not_a_survivor(tmp_path):
@@ -225,22 +249,3 @@ def test_all_targets_absent_degrades(tmp_path):
     assert summary["reason"] == "targets_absent_from_checkout"
 
 
-def test_restore_failure_degrades(tmp_path, monkeypatch):
-    original = "def f(x):\n    return x > 0\n"
-    _write(tmp_path, "m.py", original)
-    calls = {"n": 0}
-    real_write = Path.write_text
-
-    def flaky_write(self, data, *a, **k):
-        # Let the mutant write succeed, fail the restore write.
-        if data == original:
-            calls["n"] += 1
-            raise OSError("disk full")
-        return real_write(self, data, *a, **k)
-
-    monkeypatch.setattr(Path, "write_text", flaky_write)
-    summary = run_trial(
-        workspace=str(tmp_path), targets={"m.py": [2]},
-        mutant_cap=10, per_mutant_timeout=5, run_tests=lambda ws, t: 0,
-    )
-    assert summary["status"] == "degraded" and summary["reason"] == "restore_failed"

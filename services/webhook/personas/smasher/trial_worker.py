@@ -22,8 +22,10 @@ from __future__ import annotations
 import json
 import logging
 import os
+import shutil
 import subprocess
 import sys
+from contextlib import contextmanager
 from pathlib import Path
 from typing import Any, Callable
 
@@ -46,19 +48,30 @@ def run_trial(
     run_tests: RunTests,
 ) -> dict[str, Any]:
     """Mutate the target lines, run the suite per mutant, classify. Returns the
-    summary dict written to the termination message. Never raises."""
+    summary dict written to the termination message. Never raises.
+
+    ISOLATION (codex peer-review PR #494): the pristine `workspace` checkout is
+    NEVER executed against or mutated - every baseline/mutant run happens in a
+    FRESH COPY of it, discarded afterward. So a stateful or malicious test suite
+    that writes to sibling files, tests, or config cannot poison later mutants'
+    verdicts - each starts from a pristine tree. The vendored deps live OUTSIDE
+    the checkout (a sibling dir) and are shared read-only via PYTHONPATH, so they
+    are not copied per mutant."""
     ws = Path(workspace)
 
-    # Baseline: the pristine checkout must pass, else no mutant verdict is
-    # trustworthy. A timeout or nonzero baseline degrades the whole run.
+    # Baseline in an isolated copy: the pristine checkout must pass, else no
+    # mutant verdict is trustworthy. A copy so a stateful baseline can't taint
+    # the tree the mutant copies are made from.
     try:
-        if run_tests(workspace, per_mutant_timeout) != 0:
-            return _summary("degraded", reason="baseline_failed")
+        with _isolated_copy(ws, "baseline") as base_dir:
+            code = run_tests(str(base_dir), per_mutant_timeout)
     except TimeoutError:
         return _summary("degraded", reason="baseline_timeout")
     except Exception as e:  # noqa: BLE001 — a broken runner degrades, never raises
         log.warning("trial_baseline_error", extra={"kind": type(e).__name__})
         return _summary("degraded", reason="baseline_error")
+    if code != 0:
+        return _summary("degraded", reason="baseline_failed")
 
     survived: list[dict[str, Any]] = []
     total = killed = timed_out = errored = skipped_files = 0
@@ -72,9 +85,8 @@ def run_trial(
             log.warning("trial_unsafe_target_path", extra={"path": rel_path})
             skipped_files += 1
             continue
-        file_abs = ws / rel_path
         try:
-            original = file_abs.read_text()
+            original = (ws / rel_path).read_text()
         except OSError:
             # A target file that isn't in the checkout — visible skip (a silent
             # one would let a broken tarball layout render as a clean pass).
@@ -82,49 +94,33 @@ def run_trial(
             skipped_files += 1
             continue
 
-        remaining = mutant_cap - total
         mutants = generate_mutants(
-            original,
-            file=rel_path,
-            target_lines=frozenset(targets[rel_path]),
-            cap=remaining,
+            original, file=rel_path,
+            target_lines=frozenset(targets[rel_path]), cap=mutant_cap - total,
         )
         for mutant in mutants:
             total += 1
-            restored = True
             try:
-                file_abs.write_text(mutant.source)
-                try:
-                    code = run_tests(workspace, per_mutant_timeout)
-                except TimeoutError:
-                    timed_out += 1  # a hang is a kill, never a survivor
-                    continue
-                if code == 0:
-                    survived.append({
-                        "file": mutant.file,
-                        "line": mutant.line,
-                        "operator": mutant.operator,
-                        "original": mutant.original,
-                        "mutated": mutant.mutated,
-                    })
-                else:
-                    killed += 1
+                with _isolated_copy(ws, f"m{total}") as mutant_dir:
+                    # Apply the mutant into the FRESH copy; the pristine tree is
+                    # never touched.
+                    (mutant_dir / rel_path).write_text(mutant.source)
+                    try:
+                        code = run_tests(str(mutant_dir), per_mutant_timeout)
+                    except TimeoutError:
+                        timed_out += 1  # a hang is a kill, never a survivor
+                        continue
+                    if code == 0:
+                        survived.append({
+                            "file": mutant.file, "line": mutant.line,
+                            "operator": mutant.operator,
+                            "original": mutant.original, "mutated": mutant.mutated,
+                        })
+                    else:
+                        killed += 1
             except Exception as e:  # noqa: BLE001 — one bad mutant doesn't sink the run
                 errored += 1
                 log.warning("trial_mutant_error", extra={"kind": type(e).__name__})
-            finally:
-                # ALWAYS restore the pristine file before the next mutant.
-                try:
-                    file_abs.write_text(original)
-                except OSError:
-                    restored = False
-                    log.error("trial_restore_failed", extra={"path": rel_path})
-            if not restored:
-                # A left-mutated file would poison every SUBSEQUENT file's tests
-                # (their runs execute against a corrupt tree), so the counts are
-                # no longer trustworthy — degrade rather than report them as
-                # complete (ADR-0003 "no lies").
-                return _summary("degraded", reason="restore_failed")
 
     if skipped_files and total == 0:
         # Targets were provided but no target file was readable/mutable — the
@@ -135,6 +131,21 @@ def run_trial(
         "completed", total=total, killed=killed,
         survived=survived, timed_out=timed_out, errored=errored,
     )
+
+
+@contextmanager
+def _isolated_copy(pristine: Path, tag: str):
+    """Yield a FRESH copy of the pristine checkout for one test run, removed on
+    exit. Each baseline/mutant runs in its own copy so a stateful test can't
+    pollute later runs (peer-review PR #494). The copy is a sibling of the
+    checkout so the vendored deps dir (also a sibling) is NOT copied."""
+    dest = pristine.parent / f"{pristine.name}-{tag}"
+    shutil.rmtree(dest, ignore_errors=True)
+    shutil.copytree(pristine, dest)
+    try:
+        yield dest
+    finally:
+        shutil.rmtree(dest, ignore_errors=True)
 
 
 def _is_safe_relpath(path: str) -> bool:
@@ -164,12 +175,14 @@ def _summary(
 
 
 def _default_run_tests(workspace: str, timeout: int) -> int:
-    """Run the repo's pytest suite once. `-x` stops at the first failure so a
-    kill is detected fast; `-q` keeps output small. Deps vendored by the `deps`
-    init container are on PYTHONPATH. Raises TimeoutError on the per-mutant
-    budget."""
+    """Run the repo's pytest suite once in `workspace` (a fresh per-run copy of
+    the checkout). `-x` stops at the first failure so a kill is detected fast;
+    `-q` keeps output small. The deps vendored by the `deps` init phase live in
+    a SIBLING dir of the checkout (`<parent>/.grug-deps`), shared read-only via
+    PYTHONPATH - NOT inside the copied tree. Raises TimeoutError on the budget."""
     env = dict(os.environ)
-    deps = str(Path(workspace) / ".grug-deps")
+    # The checkout copy is `<parent>/repo-<tag>`; the deps sit at `<parent>/.grug-deps`.
+    deps = str(Path(workspace).parent / ".grug-deps")
     env["PYTHONPATH"] = deps + (os.pathsep + env["PYTHONPATH"] if env.get("PYTHONPATH") else "")
     try:
         proc = subprocess.run(
