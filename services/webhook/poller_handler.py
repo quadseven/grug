@@ -107,6 +107,7 @@ def handler(event: dict[str, Any], context: Any) -> dict[str, int | str]:
     # per install; everything inside run_pulse_for_install is capped +
     # per-repo best-effort + store-claim idempotent.
     nudges = 0
+    pulse_failed = 0
     for install_id in installs:
         try:
             from adapters.install_store import list_pulse_enabled_repos
@@ -128,6 +129,7 @@ def handler(event: dict[str, Any], context: Any) -> dict[str, int | str]:
                 "pulse_install_failed",
                 extra={"install_id": install_id, "kind": type(e).__name__},
             )
+            pulse_failed += 1
 
     # Auto-replay missed webhook deliveries (#407), best-effort: a replay
     # failure must never abort the cron, so it's wrapped here on TOP of
@@ -144,6 +146,7 @@ def handler(event: dict[str, Any], context: Any) -> dict[str, int | str]:
         "submitted": submitted,
         "failed_installs": failed_installs,
         "pulse_nudges": nudges,
+        "pulse_failed_installs": pulse_failed,
         **replay,
     }
     # Total failure (auth/config drift, GitHub down) errors EVERY install and
