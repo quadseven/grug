@@ -131,12 +131,16 @@ def run_pulse_for_install(
                 # Win-once per (install, repo, pr) per TTL window - a
                 # lost claim means a nudge inside the window already
                 # happened (or a concurrent poller run won it).
-                if not claim_pulse_nudge(install_id, full, pr_number):
-                    continue
-                # Write-verification BEFORE posting (codex PR #489): a
-                # marker comment inside the window means a prior tick's
-                # ambiguous failure actually landed - never double-post.
+                # Write-verification BEFORE the claim (codex PR #489 r3:
+                # a verification-READ failure must not burn the weekly
+                # slot - before the claim exists there is nothing to
+                # release). A marker comment inside the window means a
+                # prior tick's ambiguous failure actually landed - never
+                # double-post. Racing runs then serialize on the claim's
+                # win-once semantics below.
                 if _recent_nudge_exists(token, owner, name, pr_number):
+                    continue
+                if not claim_pulse_nudge(install_id, full, pr_number):
                     continue
                 try:
                     resp = httpx.post(
