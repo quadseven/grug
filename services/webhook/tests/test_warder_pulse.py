@@ -296,3 +296,22 @@ def test_pulse_marker_precheck_skips_existing_nudge(monkeypatch):
         lambda url, **kw: (_ for _ in ()).throw(AssertionError("no POST expected")),
     )
     assert pulse.run_pulse_for_install("tok", 1, [{"id": 9, "full_name": "o/r"}]) == 0
+
+
+def test_stale_prs_paginates_past_ineligible_prefix(monkeypatch):
+    """Codex PR #489 r4: a full first page of stale PRs must not end the
+    scan - page 2's stale PRs are still collected; the first NON-stale
+    PR ends it (updated-asc makes staleness a prefix property)."""
+    pages = {
+        1: [_pr(i, "2020-01-01T00:00:00Z") for i in range(30)],
+        2: [_pr(30, "2020-06-01T00:00:00Z"), _pr(31, "2099-01-01T00:00:00Z")],
+    }
+
+    def fake_get(url, params=None, **kw):
+        body = pages.get((params or {}).get("page", 1), [])
+        return httpx.Response(200, json=body, request=httpx.Request("GET", url))
+
+    monkeypatch.setattr(pulse.httpx, "get", fake_get)
+    out = pulse._stale_prs("tok", "o", "r")
+    assert len(out) == 31           # 30 from page 1 + 1 stale from page 2
+    assert all(p_["number"] != 31 for p_ in out)  # fresh PR excluded, scan ended
