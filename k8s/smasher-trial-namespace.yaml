@@ -1,0 +1,101 @@
+# Dedicated namespace for Smasher Trial Jobs (#469, ADR-0013).
+#
+# WHY A SEPARATE NAMESPACE (the C1 escalation fix): the launcher needs
+# `create jobs`, and in Kubernetes `create jobs` + an arbitrary
+# `serviceAccountName` on the created pod is an escalation primitive - the
+# creator can launch a Job whose pod mounts ANY ServiceAccount token in that
+# namespace. If Trial Jobs were created in the `grug` namespace, a compromised
+# webhook pod could create a Job borrowing `grug-key-rotator` (which can patch
+# the `grug-secrets` AWS credential). Running Trials in THIS namespace - which
+# holds NO secrets and NO privileged ServiceAccounts (only the permissionless
+# `default` SA) - removes anything worth borrowing, so the primitive is inert.
+# This is CNI-independent (unlike the egress NetworkPolicy).
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: grug-trial
+  labels:
+    app.kubernetes.io/part-of: grug
+    grug-trial-namespace: "true"
+---
+# The Trial pods run as this namespace's `default` SA with
+# automountServiceAccountToken:false (set on the pod), so no token is mounted -
+# but we also pin the default SA itself to not auto-mount, defence in depth.
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: default
+  namespace: grug-trial
+automountServiceAccountToken: false
+---
+# The launcher's grant lives HERE (not in `grug`): create/observe/clean up Trial
+# Jobs, read their pods for the termination-message result, and manage the
+# per-Job token Secret. Scoped to this secret-free namespace, so even this
+# `secrets` verb cannot reach a real credential.
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: grug-smasher-launcher
+  namespace: grug-trial
+rules:
+  - apiGroups: ["batch"]
+    resources: ["jobs"]
+    verbs: ["create", "get", "list", "delete"]
+  - apiGroups: [""]
+    resources: ["pods"]
+    verbs: ["get", "list"]
+  - apiGroups: [""]
+    resources: ["secrets"]
+    verbs: ["create", "get", "delete"]
+---
+# Bind the grug-namespace launcher SA (mounted on the webhook + consumer pods)
+# to the grug-trial Role. Cross-namespace subject is explicit + intentional.
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: grug-smasher-launcher
+  namespace: grug-trial
+subjects:
+  - kind: ServiceAccount
+    name: grug-smasher-launcher
+    namespace: grug
+roleRef:
+  kind: Role
+  name: grug-smasher-launcher
+  apiGroup: rbac.authorization.k8s.io
+---
+# No pod in grug-trial serves anything - deny all ingress.
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: default-deny-ingress
+  namespace: grug-trial
+spec:
+  podSelector: {}
+  policyTypes: [Ingress]
+---
+# Trial pods get the MINIMUM egress the fetch + dependency-install init phases
+# need - DNS + 443 (GitHub tarball + PyPI wheels) - and nothing else.
+#
+# ENFORCEMENT CAVEAT (ADR-0013): NetworkPolicy is only enforced by a policy CNI;
+# this cluster runs flannel (does NOT enforce), so this policy is INERT here
+# today. The C1 escalation fix does NOT depend on it - that rests on the
+# namespace holding no credential to steal. The network jail is the additional
+# protection a policy CNI (the documented precondition for enabling Smasher)
+# provides. Pod-level NetworkPolicy cannot grant egress to the init phase while
+# denying it to the test phase (shared netns); the test phase makes no calls by
+# construction.
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: allow-egress-trial
+  namespace: grug-trial
+spec:
+  podSelector: {}
+  policyTypes: [Egress]
+  egress:
+    - ports:
+        - {protocol: UDP, port: 53}
+        - {protocol: TCP, port: 53}
+    - ports:
+        - {protocol: TCP, port: 443}

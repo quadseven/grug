@@ -169,13 +169,13 @@ def generate_mutants(
 
     mutants: list[Mutant] = []
     for site in sites:
-        tree_copy = copy.deepcopy(tree)
-        target = list(ast.walk(tree_copy))[site.node_index]
-        site.apply(target)
-        ast.fix_missing_locations(tree_copy)
         try:
+            tree_copy = copy.deepcopy(tree)
+            target = list(ast.walk(tree_copy))[site.node_index]
+            site.apply(target)
+            ast.fix_missing_locations(tree_copy)
             mutated_source = ast.unparse(tree_copy)
-        except Exception:  # noqa: BLE001 — a non-unparseable mutation is dropped, never raised
+        except Exception:  # noqa: BLE001 — a bad mutation is dropped, never raised (the "never raises" contract)
             continue
         mutants.append(
             Mutant(

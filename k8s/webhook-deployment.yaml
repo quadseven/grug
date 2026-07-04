@@ -29,10 +29,14 @@ spec:
         tags.datadoghq.com/env: prod
     spec:
       # The webhook runs the async Smasher Trial (#469), which LAUNCHES a
-      # locked-down Job via the in-cluster k8s API - so it needs the minimal
-      # launcher SA token (jobs + pods verbs only; NO secret read, cannot
-      # escalate - see k8s/smasher-rbac.yaml + ADR-0013). The token is INERT
-      # until Smasher is enabled account-wide (global master flag default OFF).
+      # locked-down Job via the in-cluster k8s API - so it mounts the launcher
+      # SA token. That token's PERMISSIONS are confined to the dedicated,
+      # secret-free `grug-trial` namespace (jobs + pods + per-Job token secret;
+      # k8s/smasher-trial-namespace.yaml + ADR-0013) and it has ZERO permissions
+      # in this `grug` namespace - so a webhook compromise cannot use it to
+      # reach grug-secrets. The token is mounted on every deploy (not gated by
+      # the default-OFF feature flag), which is why its blast radius is bounded
+      # by the grug-trial namespace isolation rather than by the flag.
       serviceAccountName: grug-smasher-launcher
       automountServiceAccountToken: true
       # Images are built natively for arm64 only - without this pin a

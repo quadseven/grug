@@ -137,3 +137,89 @@ def test_survivor_rows_carry_reproducer(tmp_path):
     row = summary["survived"][0]
     assert row["file"] == "m.py" and row["line"] == 2
     assert row["operator"] and row["original"] and row["mutated"]
+
+
+def test_errored_mutant_classified_not_survived(tmp_path):
+    original = "def f(x):\n    return x > 0\n"
+    _write(tmp_path, "m.py", original)
+
+    def run_tests(ws, timeout):
+        if (Path(ws) / "m.py").read_text() != original:
+            raise ValueError("runner blew up on the mutant")
+        return 0  # baseline passes
+
+    summary = run_trial(
+        workspace=str(tmp_path), targets={"m.py": [2]},
+        mutant_cap=10, per_mutant_timeout=5, run_tests=run_tests,
+    )
+    assert summary["errored"] >= 1
+    assert summary["survived"] == []
+
+
+def test_baseline_timeout_degrades_with_reason(tmp_path):
+    _write(tmp_path, "m.py", "def f(x):\n    return x > 0\n")
+
+    def run_tests(ws, timeout):
+        raise TimeoutError
+
+    summary = run_trial(
+        workspace=str(tmp_path), targets={"m.py": [2]},
+        mutant_cap=10, per_mutant_timeout=5, run_tests=run_tests,
+    )
+    assert summary["status"] == "degraded" and summary["reason"] == "baseline_timeout"
+
+
+def test_baseline_error_degrades_with_reason(tmp_path):
+    _write(tmp_path, "m.py", "def f(x):\n    return x > 0\n")
+
+    def run_tests(ws, timeout):
+        raise RuntimeError("runner broke at baseline")
+
+    summary = run_trial(
+        workspace=str(tmp_path), targets={"m.py": [2]},
+        mutant_cap=10, per_mutant_timeout=5, run_tests=run_tests,
+    )
+    assert summary["status"] == "degraded" and summary["reason"] == "baseline_error"
+
+
+def test_unsafe_target_path_skipped(tmp_path):
+    _write(tmp_path, "ok.py", "def f(x):\n    return x > 0\n")
+    summary = run_trial(
+        workspace=str(tmp_path),
+        targets={"ok.py": [2], "../escape.py": [1], "/etc/passwd": [1]},
+        mutant_cap=10, per_mutant_timeout=5, run_tests=lambda ws, t: 0,
+    )
+    # The traversal/absolute paths are never opened; ok.py still mutated.
+    assert summary["status"] == "completed"
+    assert all(row["file"] == "ok.py" for row in summary["survived"])
+
+
+def test_all_targets_absent_degrades(tmp_path):
+    # Targets provided but no file present -> degrade, NEVER a clean pass.
+    summary = run_trial(
+        workspace=str(tmp_path), targets={"gone.py": [1], "also_gone.py": [2]},
+        mutant_cap=10, per_mutant_timeout=5, run_tests=lambda ws, t: 0,
+    )
+    assert summary["status"] == "degraded"
+    assert summary["reason"] == "targets_absent_from_checkout"
+
+
+def test_restore_failure_degrades(tmp_path, monkeypatch):
+    original = "def f(x):\n    return x > 0\n"
+    _write(tmp_path, "m.py", original)
+    calls = {"n": 0}
+    real_write = Path.write_text
+
+    def flaky_write(self, data, *a, **k):
+        # Let the mutant write succeed, fail the restore write.
+        if data == original:
+            calls["n"] += 1
+            raise OSError("disk full")
+        return real_write(self, data, *a, **k)
+
+    monkeypatch.setattr(Path, "write_text", flaky_write)
+    summary = run_trial(
+        workspace=str(tmp_path), targets={"m.py": [2]},
+        mutant_cap=10, per_mutant_timeout=5, run_tests=lambda ws, t: 0,
+    )
+    assert summary["status"] == "degraded" and summary["reason"] == "restore_failed"

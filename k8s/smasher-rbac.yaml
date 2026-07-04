@@ -1,50 +1,20 @@
-# Launcher RBAC for the Smasher Trial (#469, ADR-0013).
+# Launcher ServiceAccount for the Smasher Trial (#469, ADR-0013).
 #
 # The webhook + consumer pods launch a locked-down Job per Trial run (they
 # process untrusted PR payloads but never execute author code themselves; the
-# author code runs only inside the Job). To create that Job they need a
-# ServiceAccount with a MINIMAL namespace-scoped Role: Jobs + Pods verbs only.
+# author code runs only inside the Job). This SA is mounted on those pods and
+# is the identity that creates Trial Jobs.
 #
-# Deliberately NO secret/exec/deployment access - a compromised launcher could
-# create locked-down Jobs, NOT read a Secret or escalate. This bounded blast
-# radius is the accepted cost of in-cluster Job launching (ADR-0013 Consequences).
+# Its PERMISSIONS live in the SEPARATE `grug-trial` namespace (see
+# k8s/smasher-trial-namespace.yaml): jobs + pods + the per-Job token Secret,
+# scoped to that secret-free, privileged-SA-free namespace. It has NO
+# permissions in the `grug` namespace. This split is the escalation fix: even
+# though `create jobs` lets the holder set an arbitrary serviceAccountName on
+# the created pod, the grug-trial namespace has no privileged SA to borrow, so
+# the primitive cannot reach `grug-secrets`.
 apiVersion: v1
 kind: ServiceAccount
 metadata:
   name: grug-smasher-launcher
   namespace: grug
-# The Job pods themselves run as this SA too (serviceAccountName in the manifest)
-# but with automountServiceAccountToken:false, so the code under test gets NO
-# token - the SA is an identity for the pod, not a credential handed to author
-# code.
 automountServiceAccountToken: false
----
-apiVersion: rbac.authorization.k8s.io/v1
-kind: Role
-metadata:
-  name: grug-smasher-launcher
-  namespace: grug
-rules:
-  # Create + observe + clean up Trial Jobs.
-  - apiGroups: ["batch"]
-    resources: ["jobs"]
-    verbs: ["create", "get", "list", "delete"]
-  # Read the Job's pod to pull back the termination-message result (the only
-  # result channel - BYON kubelet logs are unreachable, ADR-0013).
-  - apiGroups: [""]
-    resources: ["pods"]
-    verbs: ["get", "list"]
----
-apiVersion: rbac.authorization.k8s.io/v1
-kind: RoleBinding
-metadata:
-  name: grug-smasher-launcher
-  namespace: grug
-subjects:
-  - kind: ServiceAccount
-    name: grug-smasher-launcher
-    namespace: grug
-roleRef:
-  kind: Role
-  name: grug-smasher-launcher
-  apiGroup: rbac.authorization.k8s.io
