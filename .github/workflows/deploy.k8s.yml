@@ -191,6 +191,20 @@ jobs:
             --docker-username="$REGISTRY_USERNAME" \
             --docker-password="$REGISTRY_PASSWORD" \
             --dry-run=client -o yaml | kubectl apply -f -
+          # grug-trial (Smasher sandbox, ADR-0013) is a SEPARATE namespace whose
+          # janitor + Trial pods pull the same private grug image, so it needs its
+          # OWN registry-pull secret. Without it every janitor run (*/15) hits
+          # ImagePullBackOff ("no basic auth credentials") and pages the
+          # cluster ImagePullBackOff monitor. The namespace is (re)applied by the
+          # `kubectl apply -k k8s/` step below; create it here idempotently so the
+          # seed lands even on a first deploy. (Was a manual DEPLOY NOTE in
+          # k8s/smasher-trial-namespace.yaml that got missed -> now codified.)
+          kubectl create namespace grug-trial --dry-run=client -o yaml | kubectl apply -f -
+          kubectl -n grug-trial create secret docker-registry registry-pull \
+            --docker-server="$REGISTRY_HOST" \
+            --docker-username="$REGISTRY_USERNAME" \
+            --docker-password="$REGISTRY_PASSWORD" \
+            --dry-run=client -o yaml | kubectl apply -f -
 
       - name: Pin image placeholders + apply
         env:
