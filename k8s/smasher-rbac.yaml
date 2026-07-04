@@ -1,0 +1,20 @@
+# Launcher ServiceAccount for the Smasher Trial (#469, ADR-0013).
+#
+# The webhook + consumer pods launch a locked-down Job per Trial run (they
+# process untrusted PR payloads but never execute author code themselves; the
+# author code runs only inside the Job). This SA is mounted on those pods and
+# is the identity that creates Trial Jobs.
+#
+# Its PERMISSIONS live in the SEPARATE `grug-trial` namespace (see
+# k8s/smasher-trial-namespace.yaml): jobs + pods + the per-Job token Secret,
+# scoped to that secret-free, privileged-SA-free namespace. It has NO
+# permissions in the `grug` namespace. This split is the escalation fix: even
+# though `create jobs` lets the holder set an arbitrary serviceAccountName on
+# the created pod, the grug-trial namespace has no privileged SA to borrow, so
+# the primitive cannot reach `grug-secrets`.
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: grug-smasher-launcher
+  namespace: grug
+automountServiceAccountToken: false

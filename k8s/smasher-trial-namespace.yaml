@@ -1,0 +1,249 @@
+# Dedicated namespace for Smasher Trial Jobs (#469, ADR-0013).
+#
+# WHY A SEPARATE NAMESPACE (the C1 escalation fix): the launcher needs
+# `create jobs`, and in Kubernetes `create jobs` + an arbitrary
+# `serviceAccountName` on the created pod is an escalation primitive - the
+# creator can launch a Job whose pod mounts ANY ServiceAccount token in that
+# namespace. If Trial Jobs were created in the `grug` namespace, a compromised
+# webhook pod could create a Job borrowing `grug-key-rotator` (which can patch
+# the `grug-secrets` AWS credential). Running Trials in THIS namespace - which
+# holds NO privileged ServiceAccount (only the permissionless `default` SA) and
+# NO secret that grants access to grug-secrets (only the EPHEMERAL per-Trial
+# contents:read token, reaped after prep, plus the read-only `registry-pull`
+# image credential) - removes anything worth borrowing, so the primitive is
+# inert. This is CNI-independent (unlike the egress NetworkPolicy).
+#
+# DEPLOY NOTE: seed the `registry-pull` image-pull Secret in this namespace too
+# (the Trial + janitor pods pull the private grug image); if it is missing the
+# pull just fails and the Trial degrades to advisory-neutral.
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: grug-trial
+  labels:
+    app.kubernetes.io/part-of: grug
+    grug-trial-namespace: "true"
+    # Pod Security Admission (built-in, apiserver-enforced, CNI-INDEPENDENT):
+    # RBAC lets the launcher `create jobs` but does NOT constrain the holder to
+    # the hardened manifests this code generates - a compromised webhook could
+    # otherwise submit a Job with hostPath / hostNetwork / privileged and escape
+    # to the NODE (codex peer-review, PR #494). Enforcing the `restricted`
+    # standard makes the apiserver REJECT any such pod. The Trial pods this code
+    # builds already comply (non-root, caps dropped, seccomp RuntimeDefault, no
+    # host namespaces, emptyDir+PVC volumes only), so this blocks the escalation
+    # without breaking legitimate Trials.
+    pod-security.kubernetes.io/enforce: restricted
+    pod-security.kubernetes.io/enforce-version: latest
+    pod-security.kubernetes.io/audit: restricted
+    pod-security.kubernetes.io/warn: restricted
+---
+# The Trial pods run as this namespace's `default` SA with
+# automountServiceAccountToken:false (set on the pod), so no token is mounted -
+# but we also pin the default SA itself to not auto-mount, defence in depth.
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: default
+  namespace: grug-trial
+automountServiceAccountToken: false
+---
+# The launcher's grant lives HERE (not in `grug`): create/observe/clean up Trial
+# Jobs, read their pods for the termination-message result, and manage the
+# per-Job token Secret. Scoped to this secret-free namespace, so even this
+# `secrets` verb cannot reach a real credential.
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: grug-smasher-launcher
+  namespace: grug-trial
+rules:
+  - apiGroups: ["batch"]
+    resources: ["jobs"]
+    verbs: ["create", "get", "delete"]
+  - apiGroups: [""]
+    resources: ["pods"]
+    verbs: ["get", "list"]  # list: read the Job's pod for the termination message
+  - apiGroups: [""]
+    resources: ["secrets"]
+    verbs: ["create", "get", "delete"]
+  # The per-Trial shared workspace PVC (carries the checkout+deps from the prep
+  # pod to the network-jailed test pod).
+  - apiGroups: [""]
+    resources: ["persistentvolumeclaims"]
+    verbs: ["create", "get", "delete"]
+---
+# The orphan janitor runs as its OWN in-namespace ServiceAccount (a SA is
+# namespace-scoped, so the CronJob in grug-trial cannot use the launcher SA that
+# lives in `grug`; codex peer-review PR #494). Minimal: list + delete only.
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: grug-trial-janitor
+  namespace: grug-trial
+automountServiceAccountToken: false
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: grug-trial-janitor
+  namespace: grug-trial
+rules:
+  - apiGroups: ["batch"]
+    resources: ["jobs"]
+    verbs: ["list", "delete"]
+  - apiGroups: [""]
+    resources: ["secrets", "persistentvolumeclaims"]
+    verbs: ["list", "delete"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: grug-trial-janitor
+  namespace: grug-trial
+subjects:
+  - kind: ServiceAccount
+    name: grug-trial-janitor
+    namespace: grug-trial
+roleRef:
+  kind: Role
+  name: grug-trial-janitor
+  apiGroup: rbac.authorization.k8s.io
+---
+# Bind the grug-namespace launcher SA (mounted on the webhook + consumer pods)
+# to the grug-trial Role. Cross-namespace subject is explicit + intentional.
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: grug-smasher-launcher
+  namespace: grug-trial
+subjects:
+  - kind: ServiceAccount
+    name: grug-smasher-launcher
+    namespace: grug
+roleRef:
+  kind: Role
+  name: grug-smasher-launcher
+  apiGroup: rbac.authorization.k8s.io
+---
+# No pod in grug-trial serves anything - deny all ingress.
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: default-deny-ingress
+  namespace: grug-trial
+spec:
+  podSelector: {}
+  policyTypes: [Ingress]
+---
+# TWO-POD SPLIT (peer-review PR #494) gives the two phases DIFFERENT egress:
+#
+#  - the PREP pod (label grug-trial-phase=prep) fetches the tarball + wheels, so
+#    it gets DNS + 443 - and it runs NO author test code (wheel-only install).
+#  - the TEST pod (label grug-trial-phase=test) runs the author's pytest suite
+#    with DENY-ALL egress: it needs no network (deps are already vendored on the
+#    shared PVC) and holds no token. This is the phase that runs untrusted code,
+#    now fully network-jailed rather than sharing the fetch phase's egress.
+#
+# ENFORCEMENT CAVEAT (ADR-0013): NetworkPolicy is only enforced by a policy CNI;
+# this cluster runs flannel (does NOT enforce), so these are INERT here today.
+# The escalation fix + credential-denial do NOT depend on them. A policy CNI is
+# the documented precondition for enabling Smasher, at which point the test pod
+# is genuinely offline.
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: allow-egress-prep
+  namespace: grug-trial
+spec:
+  podSelector:
+    matchLabels: {grug-trial-phase: prep}
+  policyTypes: [Egress]
+  egress:
+    - ports:
+        - {protocol: UDP, port: 53}
+        - {protocol: TCP, port: 53}
+    - ports:
+        - {protocol: TCP, port: 443}
+---
+# Deny ALL egress by default (every pod). Only the prep phase re-opens DNS+443
+# above; the TEST pod (author code) matches nothing that opens egress, so it is
+# fully denied - the whole point of the two-pod split.
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: default-deny-egress
+  namespace: grug-trial
+spec:
+  podSelector: {}
+  policyTypes: [Egress]
+---
+# The orphan janitor (not a Trial phase) needs the k8s API (DNS + 443) to list +
+# delete leaked resources. It runs NO author code.
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: allow-egress-janitor
+  namespace: grug-trial
+spec:
+  podSelector:
+    matchLabels: {grug-trial-role: janitor}
+  policyTypes: [Egress]
+  egress:
+    - ports:
+        - {protocol: UDP, port: 53}
+        - {protocol: TCP, port: 53}
+    - ports:
+        - {protocol: TCP, port: 443}
+---
+# Reap app=grug-trial PVCs/Secrets/Jobs left behind by a launcher-pod crash
+# mid-run (the in-process finally cleanup is skipped on a crash; Jobs TTL-clean
+# but PVCs/Secrets don't). Runs as the launcher SA (list+delete in grug-trial
+# only). Labelled `app: grug-trial-janitor` (NOT `grug-trial`) so it never reaps
+# its own Jobs. Restricted-PSS-compliant (the namespace enforces it).
+apiVersion: batch/v1
+kind: CronJob
+metadata:
+  name: grug-trial-janitor
+  namespace: grug-trial
+  labels: {app: grug-trial-janitor}
+spec:
+  schedule: "*/15 * * * *"
+  concurrencyPolicy: Forbid
+  successfulJobsHistoryLimit: 1
+  failedJobsHistoryLimit: 2
+  jobTemplate:
+    metadata:
+      labels: {app: grug-trial-janitor}
+    spec:
+      activeDeadlineSeconds: 120
+      backoffLimit: 1
+      ttlSecondsAfterFinished: 300
+      template:
+        metadata:
+          labels: {app: grug-trial-janitor, grug-trial-role: janitor}
+        spec:
+          serviceAccountName: grug-trial-janitor
+          automountServiceAccountToken: true
+          restartPolicy: Never
+          nodeSelector: {kubernetes.io/arch: arm64}
+          imagePullSecrets:
+            - name: registry-pull
+          containers:
+            - name: janitor
+              image: REGISTRY_PLACEHOLDER/grug-webhook:TAG_PLACEHOLDER
+              command: ["python", "-m", "personas.smasher.trial_janitor"]
+              securityContext:
+                runAsNonRoot: true
+                runAsUser: 10001
+                allowPrivilegeEscalation: false
+                readOnlyRootFilesystem: true
+                capabilities: {drop: ["ALL"]}
+                seccompProfile: {type: RuntimeDefault}
+              resources:
+                requests: {cpu: 50m, memory: 64Mi}
+                limits: {cpu: 250m, memory: 128Mi}
+              volumeMounts:
+                - {name: tmp, mountPath: /tmp}
+          volumes:
+            - name: tmp
+              emptyDir: {sizeLimit: 16Mi}

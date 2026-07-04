@@ -169,6 +169,34 @@ _fallback_enabled = aws.ssm.Parameter(
     description="Enable Elder's owned cave fallback when both cloud LLMs fail (ADR-0005, #310).",
     opts=pulumi.ResourceOptions(ignore_changes=["value"]),
 )
+
+# --- Smasher Trial global master switch (ADR-0013, #469) ---
+# Pulumi OWNS the param + "false" default (all-Pulumi rule); `ignore_changes`
+# hands the toggle to the operator (no redeploy). The webhook + consumer read it
+# fallback-safe (secrets_loader.get_smasher_enabled → False on any error), so
+# Smasher can never turn ITSELF on. Enabling also requires per-repo opt-in AND a
+# policy-enforcing CNI (see docs/SELF_HOST.md § Smasher).
+_smasher_enabled = aws.ssm.Parameter(
+    "grug-smasher-enabled",
+    name="/grug/smasher-enabled",
+    type="String",
+    value="false",
+    description="Global master switch for the Smasher Trial mutation testing (ADR-0013, #469).",
+    opts=pulumi.ResourceOptions(ignore_changes=["value"]),
+)
+
+# Fail-closed egress precondition (codex peer-review PR #494): Smasher refuses to
+# run author pytest unless the operator affirms a policy-enforcing CNI here.
+# Default false so a config mistake can't run author code with unrestricted
+# egress on flannel. Operator flips it once a policy CNI (Calico/Cilium) is live.
+_smasher_netpol_enforced = aws.ssm.Parameter(
+    "grug-smasher-network-policy-enforced",
+    name="/grug/smasher-network-policy-enforced",
+    type="String",
+    value="false",
+    description="Operator affirmation that a policy-enforcing CNI is present (Smasher egress gate, #469).",
+    opts=pulumi.ResourceOptions(ignore_changes=["value"]),
+)
 # DLQs (#312): a poison message that fails maxReceiveCount times lands here
 # instead of vanishing or looping forever — the operator-visible "stuck" signal.
 # FIFO source → FIFO DLQ. The jobs DLQ is the meaningful one (a job the connector

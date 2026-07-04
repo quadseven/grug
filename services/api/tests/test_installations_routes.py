@@ -96,6 +96,16 @@ def test_repo_config_payload_explicit_false(_mod):
     assert p.tpm_enabled is False
 
 
+def test_repo_config_payload_accepts_smasher_enabled(_mod):
+    # codex peer-review PR #494: the opt-in flag must be accepted by the payload
+    # (extra="forbid" would 422 an undeclared field), else the per-repo enable
+    # path is unreachable.
+    p = _mod.RepoConfigPayload(smasher_enabled=True)
+    assert p.smasher_enabled is True
+    # unchanged default when omitted (sparse merge)
+    assert _mod.RepoConfigPayload().smasher_enabled is None
+
+
 def test_list_installations_skips_corrupt_pk_rows(_mod):
     """silent-failure-hunter P2 #6 regression: corrupt GSI1 row PK
     must skip + log, not crash entire endpoint."""

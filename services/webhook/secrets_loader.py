@@ -140,6 +140,57 @@ def get_omen_service_map() -> dict:
     return parsed
 
 
+def get_smasher_enabled() -> bool:
+    """Global master kill switch for the Smasher Trial (#469), from the
+    `/grug/smasher-enabled` SSM param (plain String, e.g. "true").
+
+    FALLBACK-SAFE: returns `False` on a missing/unreadable param, an SSM error,
+    or any unrecognized value. Smasher runs PR-author code in a sandbox Job, so
+    it stays globally OFF until the operator explicitly flips this master flag
+    AND opts a repo in (`smasher_enabled`) - two-key defense in depth
+    (ADR-0013). Read on the async Trial path only, so intentionally NOT cached -
+    toggling takes effect without a container recycle."""
+    name = os.getenv("GRUG_SMASHER_ENABLED_SSM", "")
+    if not name:
+        return False
+    try:
+        value = _ssm.get_parameter(Name=name)["Parameter"]["Value"].strip().lower()
+    except Exception as e:  # noqa: BLE001 — best-effort config; never break a review
+        log.warning(
+            "smasher_enabled_fetch_failed",
+            extra={"param": name, "kind": type(e).__name__},
+        )
+        return False
+    return value in ("true", "1", "yes", "on")
+
+
+def get_smasher_network_policy_enforced() -> bool:
+    """Whether the operator has AFFIRMED that a policy-enforcing CNI is present,
+    from `/grug/smasher-network-policy-enforced` (#469, codex peer-review PR
+    #494). FALLBACK-SAFE -> False.
+
+    Smasher's test-pod egress isolation is a NetworkPolicy, which only bites on a
+    policy CNI (Calico/Cilium); on flannel it is inert. So enabling Smasher must
+    NOT rest on documentation alone (a single config mistake would run author
+    pytest with unrestricted egress). This is a DEDICATED fail-closed gate,
+    separate from the feature-enable flag: `dispatch_smasher_review` refuses to
+    launch author code unless this is explicitly true. The operator sets it once
+    they have installed a policy CNI - a deliberate action tied specifically to
+    the egress precondition, not folded into the enable switch."""
+    name = os.getenv("GRUG_SMASHER_NETPOL_ENFORCED_SSM", "")
+    if not name:
+        return False
+    try:
+        value = _ssm.get_parameter(Name=name)["Parameter"]["Value"].strip().lower()
+    except Exception as e:  # noqa: BLE001 — best-effort config; never break a review
+        log.warning(
+            "smasher_netpol_enforced_fetch_failed",
+            extra={"param": name, "kind": type(e).__name__},
+        )
+        return False
+    return value in ("true", "1", "yes", "on")
+
+
 def get_fallback_enabled() -> bool:
     """Whether the Elder cave-fallback (ADR-0005) is enabled, from the
     `/grug/elder-fallback-enabled` SSM param (plain String, e.g. "true").

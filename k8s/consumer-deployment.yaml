@@ -28,7 +28,12 @@ spec:
         tags.datadoghq.com/service: grug-consumer
         tags.datadoghq.com/env: prod
     spec:
-      automountServiceAccountToken: false
+      # The consumer runs the rerun lane, which re-drives Smasher (#469) and so
+      # can LAUNCH a Trial Job - it mounts the same launcher SA as the webhook,
+      # whose permissions are confined to the secret-free `grug-trial` namespace
+      # (k8s/smasher-trial-namespace.yaml + ADR-0013) with none in `grug`.
+      serviceAccountName: grug-smasher-launcher
+      automountServiceAccountToken: true
       nodeSelector:
         kubernetes.io/arch: arm64
       imagePullSecrets:
@@ -82,6 +87,11 @@ spec:
             # offline rules - the consumer runs full Elder re-runs, so it needs
             # the same engine as the webhook. The semgrep CLI ships in the image.
             - {name: GRUG_SAST_ENGINE, value: semgrep}
+            # Smasher Trial (#469): the consumer re-drives Smasher on the rerun
+            # lane, so it needs the same master flag + Job image as the webhook.
+            - {name: GRUG_SMASHER_ENABLED_SSM, value: /grug/smasher-enabled}
+            - {name: GRUG_SMASHER_NETPOL_ENFORCED_SSM, value: /grug/smasher-network-policy-enforced}
+            - {name: GRUG_SMASHER_JOB_IMAGE, value: REGISTRY_PLACEHOLDER/grug-webhook:TAG_PLACEHOLDER}
             - {name: DD_SITE, value: datadoghq.com}
             - {name: DD_LLMOBS_ENABLED, value: "true"}
             - {name: DD_LLMOBS_ML_APP, value: grug-elder}

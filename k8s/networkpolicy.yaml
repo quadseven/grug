@@ -87,3 +87,6 @@ spec:
     - ports:
         - {protocol: UDP, port: 8125}
         - {protocol: TCP, port: 8126}
+# NOTE: Smasher Trial pods (#469) do NOT run in this namespace - they run in the
+# dedicated `grug-trial` namespace with their own egress policy (see
+# k8s/smasher-trial-namespace.yaml).

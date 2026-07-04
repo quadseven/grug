@@ -158,6 +158,50 @@ For self-hosters:
 - You control your own DD alert routing (or remove DD entirely)
 - You run your own cluster's Datadog agent (or drop `DD_*` from the manifests)
 
+## Smasher Trial (mutation testing) — enablement + preconditions (#469)
+
+The Smasher persona runs diff-scoped MUTATION TESTING: it launches a
+locked-down Kubernetes Job that checks out the PR at its head SHA, mutates the
+added lines, and runs the repo's own test suite per mutant. A mutant the tests
+still pass on ("survived") is an executable proof of a coverage gap.
+
+Because the Job executes PR-author-controlled code (the repo's tests + the code
+under test), Smasher is OFF by default and gated behind a TWO-KEY enable, and it
+has a hard cluster precondition:
+
+1. **Policy-enforcing CNI is REQUIRED.** The Trial runs as TWO pods: a prep pod
+   (fetch + wheel-install, egress DNS+443) and a network-jailed test pod
+   (author code, `default-deny-egress`). That egress split is only ENFORCED by a
+   policy-capable CNI (Calico, Cilium, ...). On a non-policy CNI (e.g. flannel)
+   the policies are inert and the test pod could reach the cluster network. The
+   CNI-independent isolation is credential-denial (the test pod has NO token / NO
+   secrets) plus the fact that the test pod needs no network (deps are vendored
+   on the shared volume), but the hard network jail needs the policy CNI. DO NOT
+   enable Smasher on a flannel-only cluster.
+2. **Affirm the CNI (fail-closed egress gate)** — after installing a policy CNI,
+   set the SSM String `/grug/smasher-network-policy-enforced` to `true`. This is
+   a SEPARATE machine-checked gate from the enable switch: Smasher refuses to run
+   author code while it is false, so a config mistake can't run pytest with
+   unrestricted egress on flannel. (The `grug-trial` namespace also enforces the
+   `restricted` Pod Security Standard at the apiserver, CNI-independently, so a
+   compromised launcher token still cannot create a privileged/hostPath Job.)
+3. **Global master switch** — set the SSM String `/grug/smasher-enabled` to
+   `true`. Absent/false keeps Smasher globally off regardless of per-repo config.
+4. **Per-repo opt-in** — enable `smasher_enabled` on the repo (config API).
+   Default OFF.
+5. **Trust framing** — only enable Smasher on repos whose PR authors you trust
+   at the level of "may run code in the sandbox." The sandbox bounds credential
+   theft and resource use, not intent.
+
+RBAC: applying `k8s/smasher-rbac.yaml` + `k8s/smasher-trial-namespace.yaml`
+creates the `grug-smasher-launcher` ServiceAccount and its permissions, which
+live ENTIRELY in a dedicated, secret-free `grug-trial` namespace (Jobs + Pods +
+the per-Job token Secret + the shared workspace PVC) with none in `grug`. Trial
+Jobs run in `grug-trial`,
+so the launcher's `create jobs` grant cannot be used to borrow a privileged
+ServiceAccount and reach `grug-secrets`. See
+`docs/adr/0013-smasher-trial-sandbox.md` for the full boundary design.
+
 ## Compliance with AGPL-3.0
 
 If you modify Grug and offer the modified version as a network
