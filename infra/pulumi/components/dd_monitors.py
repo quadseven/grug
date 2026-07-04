@@ -284,7 +284,9 @@ def create_all(
         name="[grug-webhook] Async persona offload failures > 0 (15min)",
         message=(
             f"{notify_handle}\n"
-            "An async persona run (Elder review or Guard scan) was DROPPED off "
+            "An async persona run was DROPPED (Elder/Guard enqueue or worker) OR "
+            "the in-cluster Cave secret judge failed closed (#439 - secret "
+            "candidates suppressed this pass, never sent to SaaS) - "
             "the async path — either the enqueue failed or the async worker "
             "hit an unhandled error. It will not post until the PR is pushed "
             "again. Check grug-webhook logs for the delivery_id.\n"
@@ -293,7 +295,7 @@ def create_all(
         query=(
             f'logs("service:grug-webhook env:{env} '
             '(elder_enqueue_failed OR elder_job_unhandled OR guard_enqueue_failed '
-            'OR guard_job_unhandled)").index("*")'
+            'OR guard_job_unhandled OR cave_judge_failed_secrets_suppressed)").index("*")'
             '.rollup("count").last("15m") > 0'
         ),
         tags=_common_tags(env, "grug-webhook"),

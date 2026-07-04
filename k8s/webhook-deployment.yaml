@@ -69,6 +69,11 @@ spec:
             - {name: GRUG_OPENROUTER_API_KEY_SSM, value: /infra/llm/openrouter_api_key}
             - {name: GRUG_POOLSIDE_API_KEY_SSM, value: /infra/llm/poolside_api_key}
             - {name: GRUG_PROMPT_EXPERIMENT_SSM, value: /grug/elder-prompt-experiment}
+            # In-cluster spark-gateway for the exposed-secret judge (#439,
+            # ADR-0009). Non-secret Service DNS (named in the ADR); unset =
+            # feature off, SaaS judge as before (fail-open).
+            - {name: GRUG_CAVE_GATEWAY_URL, value: http://spark-gateway.spark-gateway.svc:8080}
+            - {name: GRUG_CAVE_JUDGE_MODEL, value: qwen3-coder-next:latest}
             - {name: GRUG_FALLBACK_ENABLED_SSM, value: /grug/elder-fallback-enabled}
             # SAST detection engine (#401): Semgrep OSS over the vendored
             # offline rules. Default off (builtin) elsewhere; on for the review
