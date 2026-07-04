@@ -43,6 +43,7 @@ MIRRORED_WITH_HEADER=(
   "personas/registry.py"
   "personas/code_reviewer/cross_file.py"
   "personas/code_reviewer/dedup.py"
+  "personas/code_reviewer/omen.py"
   "personas/code_reviewer/diff_parser.py"
   "review_types.py"
   "personas/code_reviewer/dispatch.py"
