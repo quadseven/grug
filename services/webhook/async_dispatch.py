@@ -369,6 +369,18 @@ def _pr_ids(payload: dict[str, Any]) -> tuple[int | None, str | None, int | None
     )
 
 
+def self_recover_review(
+    payload: dict[str, Any], delivery_id: str, *, persona: str,
+) -> None:
+    """Public seam for the webhook-dispatch modules (#478): enqueue ONE
+    durable re-run when the in-process enqueue itself fails (missing
+    GRUG_K8S_RUNTIME / thread-spawn error). The rerun lane is SQS-backed
+    and consumed by the separate grug-consumer deployment, so it survives
+    exactly the class of pod-local breakage that made the enqueue fail.
+    Best-effort: never raises."""
+    _self_recover_review(payload, delivery_id, persona=persona)
+
+
 def _self_recover_review(
     payload: dict[str, Any], delivery_id: str, *, persona: str = "elder",
 ) -> None:
