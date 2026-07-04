@@ -34,7 +34,7 @@ MAIN_PATHS = (
 )
 
 # Cross-source structural-drift guard: the header literal must match
-# across the Lambda middleware, the CF Worker code, the deploy script
+# across the shared middleware, the CF Worker code, the deploy script
 # that templates the Workers, and the DD monitor that alerts on
 # mismatches. If any side renames the header without the others, the
 # auth boundary silently fails and the monitor stops alerting.

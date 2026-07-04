@@ -9,14 +9,17 @@ Proves NECESSARY conditions for these bools:
   - `oauth_access_token_required_oauth_refresh_token_optional_per_identity_concepts`
 
 Asserts:
-  1. `services/api/adapters/pg_user_store.py:UserWithTokens` is `@dataclass(frozen=True)`.
+  1. `services/_shared/adapters/pg_user_store.py:UserWithTokens` is `@dataclass(frozen=True)`.
   2. UserWithTokens carries exactly `identity`, `oauth_access_token`, `oauth_refresh_token` fields.
   3. oauth_refresh_token has type `str | None` (optional).
   4. The webhook side (`services/webhook/`) contains NO import / reference to
      `UserWithTokens` — service-scope wall per spec.
-  5. UserWithTokens construction happens ONLY in `services/api/adapters/pg_user_store.py`
-     (search services/api/ non-test files for `UserWithTokens(...)` calls —
+  5. UserWithTokens construction happens ONLY in
+     `services/_shared/adapters/pg_user_store.py` (search services/api/ AND
+     services/_shared/ non-test files for `UserWithTokens(...)` calls —
      there should be exactly one site, in get_user_with_tokens).
+  6. Missing api/webhook/_shared trees are FAILURES, not skips (a rename
+     must not silently evaporate a wall).
 """
 from __future__ import annotations
 

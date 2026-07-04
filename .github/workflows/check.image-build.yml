@@ -42,7 +42,7 @@ jobs:
           fi
           # boto3 clients constructed at import (crypto/kms_envelope.py) need
           # a region; hosted runners/containers have no ambient AWS config -
-          # same benign values check.python.yml uses for the moto suites.
+          # same benign-placeholder pattern check.python.yml uses for the moto suites.
           docker run --rm \
             -e AWS_DEFAULT_REGION=us-east-1 \
             -e AWS_ACCESS_KEY_ID=smoke -e AWS_SECRET_ACCESS_KEY=smoke \

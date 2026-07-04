@@ -10,7 +10,7 @@
   `rule_of_three_triggers_extraction_to_services_underscore_shared_*` bool
   stays grounded - its meaning flips from "policy exists" to "policy fired":
   the 3rd async persona (Smasher, ADR-0013) is the trigger evidence, recorded
-  in `async_dispatch.py`'s own `enqueue_smasher_review` docstring and
+  in `async_dispatch.py`'s module docstring (generalization section) and
   ADR-0013's deferral note.
 - **Bools left deferred (with reason):** none - the four mirror-era contract
   bools (header, body-identity, enforcement x2) describe the Copied/Synced
@@ -97,7 +97,7 @@ This slice RETIRES the discipline - terminal `Extracted` state:
   `f"{os.getenv('DD_SERVICE', 'grug')}.persona.tpm"` convention.
 - Package-integrity rule: a Python package is wholly owned by ONE root.
   Service-specific modules inside shared-owned packages move WITH the
-  package, marked `# API-ONLY` / `# WEBHOOK-ONLY` line-1 headers and only
+  package, marked API-ONLY / WEBHOOK-ONLY in their opening docstring lines and only
   lazy-imported (existing convention): `adapters/{user_store,pg_user_store}.py`
   (api-only), `personas/smasher/trial_*.py` (webhook-only).
 - Diverged-by-design top-level modules stay per-service: `main.py`,

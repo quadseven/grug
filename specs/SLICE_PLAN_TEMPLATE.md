@@ -138,8 +138,9 @@ module for that one service (the post-extraction drift class; guarded by
 
 If a shared module needs service-specific behavior, parameterize it
 (env read / argument), or - for whole modules only one service executes -
-keep the module in `_shared/` with an `# API-ONLY` / `# WEBHOOK-ONLY`
-line-1 marker and lazy imports (the user-store / trial_* pattern).
+keep the module in `_shared/` with an API-ONLY / WEBHOOK-ONLY marker
+in its opening docstring lines and lazy imports (the user-store /
+trial_* pattern).
 
 If no shared modules touched: `N/A — no shared surface`.
 
@@ -228,7 +229,7 @@ This template is NOT CI-gated (plans are advisory documents). The rules
 it codifies ARE enforced by:
 
 - `temper verify` — IOA state-machine reachability + invariants
-- The 12 grounding attesters under `infra/scripts/attest_*.py` — claim-
+- The grounding attesters under `infra/scripts/attest_*.py` — claim-
   proving against real source/runtime
 - `services/webhook/tests/test_shared_no_shadowing.py` + the spec-0010
   attester — shared-package shadowing guard (ADR-0014)

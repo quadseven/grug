@@ -230,7 +230,7 @@ jobs:
       - name: Attester · DoR-checks five canonical rules (spec 0006)
         run: python3 infra/scripts/attest_dor_checks_five_rules.py
 
-      - name: Attester · DoR-checks mirror byte-identity modulo line 1 (spec 0006)
+      - name: Attester · DoR-checks single-copy invariant (spec 0006)
         run: python3 infra/scripts/attest_dor_checks_mirror.py
 
       - name: Attester · UserIdentity frozen + no token fields (spec 0007)

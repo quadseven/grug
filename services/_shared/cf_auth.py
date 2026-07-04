@@ -3,7 +3,7 @@
 CF Workers inject `X-Grug-CF-Secret` from a Worker secret binding on
 every upstream request. This middleware validates the header against
 the same value sourced from SSM `/grug/cf-shared-secret`. Direct hits
-on the Lambda Function URL that bypass CF arrive without the header
+that bypass CF (e.g. straight to the in-cluster Service) arrive without the header
 and get 401.
 
 Fail-CLOSED by default (audit #4): if the env var is unset OR the SSM
@@ -16,7 +16,7 @@ header injected), which a fail-closed boundary would 503; set
 once the secret is live so prod runs fail-closed.
 
 `/livez` is always exempt so DD synthetics and post-deploy smoke tests
-can reach the Lambda without a header.
+can reach the service without a header.
 """
 from __future__ import annotations
 
