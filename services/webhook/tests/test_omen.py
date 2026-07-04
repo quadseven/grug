@@ -174,3 +174,23 @@ def test_distinct_dirs_same_basename_query_distinct_tokens(monkeypatch):
     assert any("api/config.py" in q for q in seen_queries)
     assert any("webhook/config.py" in q for q in seen_queries)
     assert "api/config.py" in ctx and "webhook/config.py" in ctx
+
+
+def test_query_injection_shaped_path_is_skipped(monkeypatch):
+    """Codex PR #490 r2: a PR-author-controlled path carrying DD query
+    syntax (quotes/operators) must never reach the query builder."""
+    diff = (
+        'diff --git "a/evil\\" OR service:other/x.py" "b/evil\\" OR service:other/x.py"\n'
+        '--- "a/evil\\" OR service:other/x.py"\n'
+        '+++ "b/evil\\" OR service:other/x.py"\n'
+        "@@ -0,0 +1,1 @@\n+x=1\n"
+    )
+    from personas.code_reviewer.diff_parser import DiffHunk
+
+    hunks = (DiffHunk(
+        file_path='evil" OR service:other/x.py', new_start=1,
+        new_lines=frozenset({1}), body="@@ -0,0 +1,1 @@\n+x=1",
+    ),)
+    calls = _wire(monkeypatch, mapping={"o/r": "svc"}, count=100)
+    assert omen.build_runtime_context("o", "r", hunks) is None
+    assert calls == []  # unsafe token never queried
