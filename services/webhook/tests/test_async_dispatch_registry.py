@@ -31,6 +31,16 @@ def test_runner_names_resolve_to_module_globals():
         assert callable(runner), f"{key}: runner {spec.runner_name} not found"
 
 
+def test_dispatch_paths_resolve_to_callables():
+    # Same drift class one layer deeper: a typo'd dispatch_path would only
+    # surface inside _run_job's final try as *_job_unhandled + a
+    # self-recover enqueue per job. Resolve every path statically instead
+    # (audit stage 1 finding).
+    for key, spec in ad._ASYNC_PERSONAS.items():
+        dispatch = ad._resolve_dispatch(spec.dispatch_path)
+        assert callable(dispatch), f"{key}: dispatch {spec.dispatch_path} not callable"
+
+
 def test_job_kinds_and_log_prefixes_are_unique_and_pinned():
     kinds = [s.job_kind for s in ad._ASYNC_PERSONAS.values()]
     prefixes = [s.log_prefix for s in ad._ASYNC_PERSONAS.values()]
@@ -45,14 +55,16 @@ def test_elder_legacy_claim_and_persona_values_are_pinned():
     raw-GUID delivery claim (#272 rows exist in the store), claim_review
     persona `code_reviewer` (historical key), rerun persona `elder`.
     Guard/Smasher claim namespaced because all three personas dispatch
-    from the SAME delivery GUID."""
+    from the SAME delivery GUID. Pinned at the BEHAVIOR level
+    (claim_key output), not just the field, so a derivation change
+    cannot slip past a field-only assertion."""
     elder = ad._ASYNC_PERSONAS["code_reviewer"]
-    assert elder.claim_namespace is None
+    assert elder.claim_key("guid-123") == "guid-123"
     assert elder.review_persona == "code_reviewer"
     assert elder.rerun_persona == "elder"
     for key in ("guard", "smasher"):
         spec = ad._ASYNC_PERSONAS[key]
-        assert spec.claim_namespace == key
+        assert spec.claim_key("guid-123") == f"guid-123:{key}"
         assert spec.review_persona == key
         assert spec.rerun_persona == key
 

@@ -79,7 +79,10 @@ class _AsyncPersonaSpec:
     test_async_dispatch_registry.py fails until the row exists.
     """
 
-    job_kind: str  # ASYNC_JOB_KEY value routed to the runner
+    # ASYNC_JOB_KEY value carried on the job dict. Nothing routes on it
+    # in the in-process path (_spawn_local targets the runner directly);
+    # it tags jobs for a future/external router and for log forensics.
+    job_kind: str
     log_prefix: str  # monitored log-line prefix (elder/guard/smasher)
     # None = claim the RAW delivery GUID (Elder legacy); otherwise the
     # namespace suffix producing `{delivery_id}:<namespace>`.
@@ -88,6 +91,28 @@ class _AsyncPersonaSpec:
     rerun_persona: str  # self-recover (#418) rerun-lane persona
     dispatch_path: str  # "module.path:callable" — imported LAZILY per run
     runner_name: str  # module-global run_*_job name (late-bound for patching)
+
+    def __post_init__(self) -> None:
+        # Contract values only - reject illegal states at import time, not
+        # inside a daemon thread mid-review.
+        if self.claim_namespace is not None and not self.claim_namespace:
+            raise ValueError(f"{self.log_prefix}: empty claim_namespace (use None for the raw-GUID claim)")
+        if ":" not in self.dispatch_path:
+            raise ValueError(f"{self.log_prefix}: dispatch_path must be 'module.path:callable'")
+        if not self.runner_name.startswith("run_"):
+            raise ValueError(f"{self.log_prefix}: runner_name must be a run_*_job module global")
+        if not self.log_prefix or len(self.log_prefix) >= _THREAD_NAME_LEN - 1:
+            raise ValueError("log_prefix must be non-empty and leave room for a GUID slice")
+
+    def claim_key(self, delivery_id: str) -> str:
+        """The delivery-claim key: RAW GUID for Elder (legacy #272 - the
+        claim rows already in the store are keyed that way), namespaced
+        `{delivery_id}:<persona>` for everyone else (all async personas
+        dispatch from the SAME delivery; a raw claim would let whichever
+        ran first consume it and silently skip the others)."""
+        if self.claim_namespace is None:
+            return delivery_id
+        return f"{delivery_id}:{self.claim_namespace}"
 
 
 _ASYNC_PERSONAS: dict[str, _AsyncPersonaSpec] = {
@@ -255,17 +280,12 @@ def _run_job(spec: _AsyncPersonaSpec, event: dict[str, Any]) -> dict[str, str]:
     silently-skipped review).
     """
     delivery_id = str(event.get("delivery_id", ""))
-    claim_key = (
-        delivery_id
-        if spec.claim_namespace is None
-        else f"{delivery_id}:{spec.claim_namespace}"
-    )
     try:
         # Lazy import INSIDE the guard (#272): a failed import degrades to
         # running, same as a store hiccup on the claim.
         from adapters.install_store import claim_delivery
 
-        if not claim_delivery(claim_key):
+        if not claim_delivery(spec.claim_key(delivery_id)):
             log.info(
                 f"{spec.log_prefix}_job_duplicate_skipped",
                 extra={"delivery_id": delivery_id},
