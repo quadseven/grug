@@ -1,55 +1,135 @@
-# WEBHOOK-ONLY (NOT mirrored): Elder async-offload + its async-job routing.
+# WEBHOOK-ONLY (NOT mirrored): async-persona offload + its async-job routing.
 # The api service has no webhook ACK path, so there is no api sibling — like
-# dispatcher.py / main.py / consumer.py. Per ADR-0001, only modules BOTH
-# services run are mirrored.
-"""Async offload of the Elder LLM review off the webhook ACK path (#272).
+# dispatcher.py / main.py / consumer.py. Per ADR-0014, only modules BOTH
+# services run live in services/_shared/; this machinery's only consumer is
+# the webhook, so it stays here.
+"""Async offload of persona reviews off the webhook ACK path (#272/#466/#469).
 
-`receive_github_webhook` must ACK GitHub in <10s, but the Elder persona
-makes 1–2 LLM calls (worst case ~300s with retries) — far over GitHub's
-~10s delivery timeout. So the review is run OFF the ACK path: the handler
-enqueues it and returns immediately.
+`receive_github_webhook` must ACK GitHub in <10s, but the async personas
+(Elder's 1-2 LLM calls, Guard's scan+judge, Smasher's Trial Job round-trip)
+run far over GitHub's ~10s delivery timeout. So each review runs OFF the
+ACK path: the handler enqueues it and returns immediately.
 
 On the k8s runtime (#354/#368) the offload is an in-process background
-thread (`_spawn_local_elder`): the webhook pod already carries every
-dependency the Elder path needs (GitHub-App auth, LLM keys, Postgres,
-LLM-Obs, KMS), so a separate worker would duplicate ~15 env vars + secret
-grants + a role + the mirror surface ADR-0001 exists to prevent. The
-thread runs with the pod's full lifetime; a pod restart mid-review drops
-the in-flight review, the same best-effort contract Lambda's async invoke
-had (a dropped review re-triggers on the next push). See `specs/DESIGN.md`
+thread: the webhook pod already carries every dependency the persona paths
+need (GitHub-App auth, LLM keys, Postgres, LLM-Obs, KMS), so a separate
+worker would duplicate ~15 env vars + secret grants + a role. The thread
+runs with the pod's full lifetime; a pod restart mid-review drops the
+in-flight review, the same best-effort contract Lambda's async invoke had
+(a dropped review re-triggers on the next push). See `specs/DESIGN.md`
 → "Async Elder offload (#272)".
 
 Routing: an async job is tagged with the `grug_async_job` sentinel so a
-router can dispatch raw async events to `run_elder_job`.
+router can dispatch raw async events to the persona's `run_*_job`.
+
+GENERALIZATION (#77, ADR-0014): Elder, Guard, and Smasher each used to
+carry a near-identical copy of the enqueue+run machinery here (the third
+copy fired the rule-of-three; ADR-0012/ADR-0013 both deferred to #77).
+One generic `_enqueue_review` + `_run_job` now implements the contract,
+parameterized by `_AsyncPersonaSpec`. The per-persona wrappers below are
+LOAD-BEARING seams, not sugar: they are live patch targets in the test
+suites and the lazy-import targets of the `webhook_dispatch` modules, and
+they pin the persona-specific contract values (monitored log-line names,
+claim-key shapes, personas) that must never drift:
+
+- Log names stay byte-identical per persona
+  (`elder_job_done`, `guard_enqueue_invoke_error`, ...) — DD monitors key
+  on them.
+- Elder claims the RAW delivery GUID (legacy #272 behavior — the claim
+  rows already in the store are keyed that way); Guard/Smasher claim
+  NAMESPACED `{delivery_id}:<persona>` because all three personas dispatch
+  from the SAME webhook delivery — a raw-GUID claim would let whichever
+  ran first mark the delivery consumed and silently skip the others.
+- Elder's `claim_review`/result persona is the legacy key
+  `code_reviewer`, while its self-recover rerun persona is `elder` —
+  both pre-date this refactor and are preserved exactly.
 """
 
 from __future__ import annotations
 
+import importlib
 import logging
 import os
 import threading
+from dataclasses import dataclass
 from typing import Any
 
 log = logging.getLogger(f"{os.getenv('DD_SERVICE', 'grug')}.async_dispatch")
 
 # Sentinel marking an async job. Routing keys on `event.get("grug_async_job")`
 # truthiness; the value names the job kind so job types can fan out from one
-# router. Guard (#466) is the second async job type the sentinel anticipated.
+# router.
 ASYNC_JOB_KEY = "grug_async_job"
 ELDER_REVIEW_JOB = "elder_review"
 GUARD_REVIEW_JOB = "guard_review"
 SMASHER_REVIEW_JOB = "smasher_review"
 
+# Thread names are bounded so `ps`/py-spy views stay aligned:
+# prefix + delivery-GUID slice, 19 chars total (elder-/guard- keep 13 GUID
+# chars, smasher- keeps 11 — the pre-generalization values, preserved).
+_THREAD_NAME_LEN = 19
+
+
+@dataclass(frozen=True)
+class _AsyncPersonaSpec:
+    """Contract values for one async persona (keyed by REGISTRY key).
+
+    A new async persona = one REGISTRY entry with dispatch_style="async" +
+    one row in _ASYNC_PERSONAS + its thin wrappers; the coverage test in
+    test_async_dispatch_registry.py fails until the row exists.
+    """
+
+    job_kind: str  # ASYNC_JOB_KEY value routed to the runner
+    log_prefix: str  # monitored log-line prefix (elder/guard/smasher)
+    # None = claim the RAW delivery GUID (Elder legacy); otherwise the
+    # namespace suffix producing `{delivery_id}:<namespace>`.
+    claim_namespace: str | None
+    review_persona: str  # claim_review + result-dict persona key
+    rerun_persona: str  # self-recover (#418) rerun-lane persona
+    dispatch_path: str  # "module.path:callable" — imported LAZILY per run
+    runner_name: str  # module-global run_*_job name (late-bound for patching)
+
+
+_ASYNC_PERSONAS: dict[str, _AsyncPersonaSpec] = {
+    "code_reviewer": _AsyncPersonaSpec(
+        job_kind=ELDER_REVIEW_JOB,
+        log_prefix="elder",
+        claim_namespace=None,  # RAW GUID — legacy #272 claim shape
+        review_persona="code_reviewer",
+        rerun_persona="elder",
+        dispatch_path="personas.code_reviewer.dispatch:dispatch_code_review",
+        runner_name="run_elder_job",
+    ),
+    "guard": _AsyncPersonaSpec(
+        job_kind=GUARD_REVIEW_JOB,
+        log_prefix="guard",
+        claim_namespace="guard",
+        review_persona="guard",
+        rerun_persona="guard",
+        dispatch_path="personas.guard.dispatch:dispatch_guard_review",
+        runner_name="run_guard_job",
+    ),
+    "smasher": _AsyncPersonaSpec(
+        job_kind=SMASHER_REVIEW_JOB,
+        log_prefix="smasher",
+        claim_namespace="smasher",
+        review_persona="smasher",
+        rerun_persona="smasher",
+        dispatch_path="personas.smasher.dispatch:dispatch_smasher_review",
+        runner_name="run_smasher_job",
+    ),
+}
+
 
 def _slim_payload(payload: dict[str, Any]) -> dict[str, Any]:
-    """Project the GitHub PR payload to ONLY the fields the Elder worker
-    (`dispatch_code_review`) reads: `action`, the PR number + head sha,
-    the repo owner/name, and the installation id. The worker re-fetches
-    the diff from GitHub by those IDs, so forwarding the full payload is
-    unnecessary: the slim projection keeps the job minimal and bounded
-    regardless of PR size (a long body + two full repo objects + sender/org
-    are all dropped). Mirrors `dispatch_code_review`'s reads — keep in sync
-    if that function starts consuming new payload fields.
+    """Project the GitHub PR payload to ONLY the fields the persona workers
+    (`dispatch_code_review` and siblings) read: `action`, the PR number +
+    head sha, the repo owner/name, and the installation id. The worker
+    re-fetches the diff from GitHub by those IDs, so forwarding the full
+    payload is unnecessary: the slim projection keeps the job minimal and
+    bounded regardless of PR size (a long body + two full repo objects +
+    sender/org are all dropped). Mirrors the dispatch functions' reads —
+    keep in sync if one starts consuming new payload fields.
     """
     pr = payload.get("pull_request") or {}
     repo = payload.get("repository") or {}
@@ -67,142 +147,138 @@ def _slim_payload(payload: dict[str, Any]) -> dict[str, Any]:
     }
 
 
-def enqueue_elder_review(
+def _enqueue_review(
+    spec: _AsyncPersonaSpec,
     *,
     payload: dict[str, Any],
     delivery_id: str,
     blocking: bool,
 ) -> bool:
-    """Fire-and-forget offload to run the Elder review async.
+    """Fire-and-forget offload to run one persona's review async.
 
-    Returns ``True`` if the async job was accepted, ``False`` on
-    any failure (logged). Best-effort by design: the caller logs the
-    failure and returns ``result="enqueue_failed"`` — it does NOT fall
-    back to a synchronous Elder run, because that would re-block the ACK
-    path and break the <10s guarantee. A dropped review re-triggers on
-    the next push.
+    Returns ``True`` if the async job was accepted, ``False`` on any
+    failure (logged). Best-effort by design: the caller logs the failure
+    and returns ``result="enqueue_failed"`` — it does NOT fall back to a
+    synchronous run, because that would re-block the ACK path and break
+    the <10s guarantee. A dropped review re-triggers on the next push.
 
     The k8s runtime (``GRUG_K8S_RUNTIME`` set in the pod manifests, #368)
-    runs the job in-process on a background thread: the ACK handler returns
-    immediately while the thread runs with the pod's full lifetime. This is
-    the only async path post-Lambda (#354); local / test (the flag unset)
-    has no offload and returns False.
+    runs the job in-process on a background thread: the ACK handler
+    returns immediately while the thread runs with the pod's full
+    lifetime. This is the only async path post-Lambda (#354); local /
+    test (the flag unset) has no offload and returns False.
 
     k8s trade-off (vs a queue + worker Deployment, recorded in
     specs/DESIGN.md): a pod restart mid-review drops the in-flight
-    review — a best-effort contract (a dropped review re-triggers on the
-    next push). In exchange we avoid a new queue + consumer + IAM surface
-    for the hot path.
+    review — a best-effort contract. In exchange we avoid a new queue +
+    consumer + IAM surface for the hot path.
     """
     job = {
-        ASYNC_JOB_KEY: ELDER_REVIEW_JOB,
+        ASYNC_JOB_KEY: spec.job_kind,
         "delivery_id": delivery_id,
         "blocking": blocking,
         # Slim projection — NOT the full payload. See _slim_payload.
         "payload": _slim_payload(payload),
     }
     if os.getenv("GRUG_K8S_RUNTIME"):
-        return _spawn_local_elder(job)
-    log.warning("elder_enqueue_no_runtime", extra={"delivery_id": delivery_id})
+        return _spawn_local(spec, job)
+    log.warning(
+        f"{spec.log_prefix}_enqueue_no_runtime", extra={"delivery_id": delivery_id}
+    )
     return False
 
 
-def _spawn_local_elder(job: dict[str, Any]) -> bool:
-    """Run the Elder job on a daemon thread (k8s runtime, #368).
+def _spawn_local(spec: _AsyncPersonaSpec, job: dict[str, Any]) -> bool:
+    """Run the persona job on a daemon thread (k8s runtime, #368).
 
     daemon=True is deliberate: on pod shutdown (deploy rollout, node
     drain) an in-flight review dies WITHOUT blocking termination —
-    matching the documented best-effort contract. `run_elder_job` owns
+    matching the documented best-effort contract. The runner owns
     idempotency + never-raise, so the thread body needs no wrapper.
+
+    The runner is resolved through the MODULE GLOBAL (`globals()[...]`)
+    at spawn time, not captured in the spec table, so
+    `patch.object(async_dispatch, "run_elder_job", ...)` keeps working.
     """
     delivery_id = str(job.get("delivery_id", ""))
+    guid_chars = _THREAD_NAME_LEN - len(spec.log_prefix) - 1
     try:
         threading.Thread(
-            target=run_elder_job,
+            target=globals()[spec.runner_name],
             args=(job,),
-            name=f"elder-{delivery_id[:13]}",
+            name=f"{spec.log_prefix}-{delivery_id[:guid_chars]}",
             daemon=True,
         ).start()
         return True
     except Exception as e:  # noqa: BLE001 — best-effort enqueue; never break the ACK
-        # Same monitor contract as the Lambda branch: one error line per
-        # dropped review, with the cause kind.
+        # Same monitor contract as always: one error line per dropped
+        # review, with the cause kind.
         log.error(
-            "elder_enqueue_invoke_error",
+            f"{spec.log_prefix}_enqueue_invoke_error",
             extra={"delivery_id": delivery_id, "kind": type(e).__name__},
         )
         return False
 
 
-def enqueue_guard_review(
-    *,
-    payload: dict[str, Any],
-    delivery_id: str,
-    blocking: bool,
-) -> bool:
-    """Fire-and-forget offload for the Guard security review (#466) -
-    same contract, runtime, and trade-offs as `enqueue_elder_review`
-    (see its docstring): background daemon thread under GRUG_K8S_RUNTIME,
-    False on any failure, NO sync fallback, a dropped scan re-triggers on
-    the next push. Kept as its own function (not a persona-generic one)
-    deliberately: Elder's enqueue is a live patch target and its monitored
-    log names must stay byte-identical; a THIRD async persona triggers the
-    rule-of-three generalization (ADR-0012)."""
-    job = {
-        ASYNC_JOB_KEY: GUARD_REVIEW_JOB,
-        "delivery_id": delivery_id,
-        "blocking": blocking,
-        "payload": _slim_payload(payload),
-    }
-    if os.getenv("GRUG_K8S_RUNTIME"):
-        delivery = str(job.get("delivery_id", ""))
-        try:
-            threading.Thread(
-                target=run_guard_job,
-                args=(job,),
-                name=f"guard-{delivery[:13]}",
-                daemon=True,
-            ).start()
-            return True
-        except Exception as e:  # noqa: BLE001 — best-effort enqueue; never break the ACK
-            log.error(
-                "guard_enqueue_invoke_error",
-                extra={"delivery_id": delivery, "kind": type(e).__name__},
-            )
-            return False
-    log.warning("guard_enqueue_no_runtime", extra={"delivery_id": delivery_id})
-    return False
+def _resolve_dispatch(dispatch_path: str):
+    """Import `module.path:callable` LAZILY (#272): keeps the ACK path
+    cold-start cheap (the persona dep graph only loads in the async job),
+    AND — load-bearing — an import failure inside the runner's try must
+    degrade, never escape. getattr on the imported module also respects
+    test patches of the dispatch function."""
+    module_path, func_name = dispatch_path.split(":", 1)
+    module = importlib.import_module(module_path)
+    return getattr(module, func_name)
 
 
-def run_guard_job(event: dict[str, Any]) -> dict[str, str]:
-    """Worker entry for an async Guard security review (#466). Same
-    two-layer idempotency + never-raise contract as `run_elder_job` (see
-    its docstring), with two deliberate differences:
+def _run_job(spec: _AsyncPersonaSpec, event: dict[str, Any]) -> dict[str, str]:
+    """Worker entry for one async persona review job.
 
-    - The delivery claim key is NAMESPACED (`{delivery_id}:guard`):
-      Elder and Guard both dispatch from the SAME webhook delivery, and
-      `claim_delivery` is keyed on the raw GUID - an unnamespaced claim
-      would let whichever persona ran first mark the delivery consumed
-      and silently skip the other.
-    - Self-recover (#418) enqueues with persona="guard" so the rerun
-      consumer re-drives dispatch_guard_review (codex PR #482: without
-      it, the already-consumed head-SHA claim would suppress the Guard
-      check for that SHA until a new push).
+    Two-layer idempotency so the review is never double-posted:
+    the delivery claim (`install_store.claim_delivery`, raw or namespaced
+    per spec — see the module docstring) skips a GitHub redelivery /
+    retry of the SAME delivery, and the EXACT head SHA
+    (`install_store.claim_review`, #397) skips a same-SHA re-trigger
+    across DIFFERENT deliveries — a non-push event (`edited` on the PR
+    body, `ready_for_review`) that carries an already-reviewed head SHA.
+    Every NEW head SHA still wins a fresh review.
+
+    NEVER re-raises: we own idempotency + the advisory-degrade contract
+    inside the dispatch functions, so all failures are logged and
+    returned as a status dict instead (no retry storms). On an unhandled
+    dispatch error the head-SHA claim is already consumed, so #418
+    self-recovery enqueues ONE durable re-run — without it, that SHA's
+    check would be suppressed until a new push (codex PR #482).
+
+    Claims are best-effort: a store hiccup on either claim degrades to
+    RUNNING the review (fail OPEN — a possible duplicate beats a
+    silently-skipped review).
     """
     delivery_id = str(event.get("delivery_id", ""))
+    claim_key = (
+        delivery_id
+        if spec.claim_namespace is None
+        else f"{delivery_id}:{spec.claim_namespace}"
+    )
     try:
+        # Lazy import INSIDE the guard (#272): a failed import degrades to
+        # running, same as a store hiccup on the claim.
         from adapters.install_store import claim_delivery
 
-        if not claim_delivery(f"{delivery_id}:guard"):
-            log.info("guard_job_duplicate_skipped", extra={"delivery_id": delivery_id})
+        if not claim_delivery(claim_key):
+            log.info(
+                f"{spec.log_prefix}_job_duplicate_skipped",
+                extra={"delivery_id": delivery_id},
+            )
             return {"status": "skipped", "reason": "duplicate_delivery"}
     except Exception as e:  # noqa: BLE001 — claim is best-effort; degrade to running
         log.warning(
-            "guard_job_claim_failed_running_anyway",
+            f"{spec.log_prefix}_job_claim_failed_running_anyway",
             extra={"delivery_id": delivery_id, "kind": type(e).__name__},
         )
 
     payload = event.get("payload") or {}
+
     try:
         from adapters.install_store import claim_review
 
@@ -213,11 +289,11 @@ def run_guard_job(event: dict[str, Any]) -> dict[str, str]:
                 install_id=install_id,
                 repo=repo,
                 pr_number=pr_number,
-                persona="guard",
+                persona=spec.review_persona,
                 head_sha=head_sha,
             ):
                 log.info(
-                    "guard_job_duplicate_sha_skipped",
+                    f"{spec.log_prefix}_job_duplicate_sha_skipped",
                     extra={
                         "delivery_id": delivery_id, "repo": repo,
                         "pr": pr_number, "head_sha": head_sha,
@@ -226,237 +302,78 @@ def run_guard_job(event: dict[str, Any]) -> dict[str, str]:
                 return {"status": "skipped", "reason": "duplicate_head_sha"}
     except Exception as e:  # noqa: BLE001 — claim is best-effort; degrade to running
         log.warning(
-            "guard_job_review_claim_failed_running_anyway",
+            f"{spec.log_prefix}_job_review_claim_failed_running_anyway",
             extra={"delivery_id": delivery_id, "kind": type(e).__name__},
         )
 
     blocking = bool(event.get("blocking", False))
     try:
-        from personas.guard.dispatch import dispatch_guard_review
-
-        result = dispatch_guard_review(payload, blocking=blocking)
+        dispatch = _resolve_dispatch(spec.dispatch_path)
+        result = dispatch(payload, blocking=blocking)
         log.info(
-            "guard_job_done",
+            f"{spec.log_prefix}_job_done",
             extra={"delivery_id": delivery_id, **result},
         )
         return result
     except Exception as e:  # noqa: BLE001 — never retry-storm; degrade contract owns this
         log.error(
-            "guard_job_unhandled",
+            f"{spec.log_prefix}_job_unhandled",
             extra={"delivery_id": delivery_id, "kind": type(e).__name__},
             exc_info=True,
         )
-        # Self-recover (#418, codex PR #482): the head-SHA claim above is
-        # already consumed, so without a durable re-run this SHA's Guard
-        # check would be suppressed until the next push. Same contract as
-        # Elder's recovery: at most one enqueue per drop, SQS redrive owns
-        # retries.
-        _self_recover_review(payload, delivery_id, persona="guard")
-        return {"persona": "guard", "result": "unhandled_error"}
+        _self_recover_review(payload, delivery_id, persona=spec.rerun_persona)
+        return {"persona": spec.review_persona, "result": "unhandled_error"}
 
 
-def enqueue_smasher_review(
-    *,
-    payload: dict[str, Any],
-    delivery_id: str,
-    blocking: bool,
+# --- Per-persona wrappers -------------------------------------------------
+# Thin by design; see the module docstring for why they exist and what
+# contract values they pin. Signatures are keyword-only, matching the
+# pre-generalization functions exactly.
+
+
+def enqueue_elder_review(
+    *, payload: dict[str, Any], delivery_id: str, blocking: bool,
 ) -> bool:
-    """Fire-and-forget offload for the Smasher Trial (#469) - same contract,
-    runtime, and trade-offs as `enqueue_elder_review`/`enqueue_guard_review`:
-    background daemon thread under GRUG_K8S_RUNTIME, False on any failure, NO
-    sync fallback, a dropped Trial re-triggers on the next push. This is the
-    THIRD copy of this per-persona enqueue machinery - re-confirming the
-    rule-of-three trigger for the async-generalization extraction (#77); kept
-    separate here so the security-critical #469 slice does not also do that
-    risky refactor (ADR-0013)."""
-    job = {
-        ASYNC_JOB_KEY: SMASHER_REVIEW_JOB,
-        "delivery_id": delivery_id,
-        "blocking": blocking,
-        "payload": _slim_payload(payload),
-    }
-    if os.getenv("GRUG_K8S_RUNTIME"):
-        delivery = str(job.get("delivery_id", ""))
-        try:
-            threading.Thread(
-                target=run_smasher_job,
-                args=(job,),
-                name=f"smasher-{delivery[:11]}",
-                daemon=True,
-            ).start()
-            return True
-        except Exception as e:  # noqa: BLE001 — best-effort enqueue; never break the ACK
-            log.error(
-                "smasher_enqueue_invoke_error",
-                extra={"delivery_id": delivery, "kind": type(e).__name__},
-            )
-            return False
-    log.warning("smasher_enqueue_no_runtime", extra={"delivery_id": delivery_id})
-    return False
-
-
-def run_smasher_job(event: dict[str, Any]) -> dict[str, str]:
-    """Worker entry for an async Smasher Trial (#469). Same two-layer
-    idempotency + never-raise contract as `run_guard_job`, with the delivery
-    claim NAMESPACED `{delivery_id}:smasher` (Elder + Guard + Smasher all
-    dispatch from the SAME webhook delivery; an unnamespaced claim would let
-    whichever ran first mark the delivery consumed and skip the others) and the
-    head-SHA claim + self-recover carrying persona="smasher"."""
-    delivery_id = str(event.get("delivery_id", ""))
-    try:
-        from adapters.install_store import claim_delivery
-
-        if not claim_delivery(f"{delivery_id}:smasher"):
-            log.info("smasher_job_duplicate_skipped", extra={"delivery_id": delivery_id})
-            return {"status": "skipped", "reason": "duplicate_delivery"}
-    except Exception as e:  # noqa: BLE001 — claim is best-effort; degrade to running
-        log.warning(
-            "smasher_job_claim_failed_running_anyway",
-            extra={"delivery_id": delivery_id, "kind": type(e).__name__},
-        )
-
-    payload = event.get("payload") or {}
-    try:
-        from adapters.install_store import claim_review
-
-        install_id, repo, pr_number = _pr_ids(payload)
-        head_sha = ((payload.get("pull_request") or {}).get("head") or {}).get("sha")
-        if install_id and repo and pr_number and head_sha:
-            if not claim_review(
-                install_id=install_id,
-                repo=repo,
-                pr_number=pr_number,
-                persona="smasher",
-                head_sha=head_sha,
-            ):
-                log.info(
-                    "smasher_job_duplicate_sha_skipped",
-                    extra={
-                        "delivery_id": delivery_id, "repo": repo,
-                        "pr": pr_number, "head_sha": head_sha,
-                    },
-                )
-                return {"status": "skipped", "reason": "duplicate_head_sha"}
-    except Exception as e:  # noqa: BLE001 — claim is best-effort; degrade to running
-        log.warning(
-            "smasher_job_review_claim_failed_running_anyway",
-            extra={"delivery_id": delivery_id, "kind": type(e).__name__},
-        )
-
-    blocking = bool(event.get("blocking", False))
-    try:
-        from personas.smasher.dispatch import dispatch_smasher_review
-
-        result = dispatch_smasher_review(payload, blocking=blocking)
-        log.info("smasher_job_done", extra={"delivery_id": delivery_id, **result})
-        return result
-    except Exception as e:  # noqa: BLE001 — never retry-storm; degrade contract owns this
-        log.error(
-            "smasher_job_unhandled",
-            extra={"delivery_id": delivery_id, "kind": type(e).__name__},
-            exc_info=True,
-        )
-        _self_recover_review(payload, delivery_id, persona="smasher")
-        return {"persona": "smasher", "result": "unhandled_error"}
+    """Offload the Elder LLM review (#272). Contract: `_enqueue_review`."""
+    return _enqueue_review(
+        _ASYNC_PERSONAS["code_reviewer"],
+        payload=payload, delivery_id=delivery_id, blocking=blocking,
+    )
 
 
 def run_elder_job(event: dict[str, Any]) -> dict[str, str]:
-    """Worker entry for an async Elder review job.
+    """Worker entry for an async Elder review job. Contract: `_run_job`."""
+    return _run_job(_ASYNC_PERSONAS["code_reviewer"], event)
 
-    Two-layer idempotency so the review is never double-posted:
-    ``delivery_id`` (`install_store.claim_delivery`) skips a GitHub
-    redelivery / async-invoke retry of the SAME delivery, and the EXACT
-    head SHA (`install_store.claim_review`, #397) skips a same-SHA
-    re-trigger across DIFFERENT deliveries - a non-push event (`edited`
-    on the PR body, `ready_for_review`) that carries an already-reviewed
-    head SHA. Every NEW head SHA still wins a fresh review.
 
-    NEVER re-raises: an unhandled error here would make AWS retry the
-    async invocation (a retry storm), and we already have our own
-    idempotency + the advisory-degrade contract inside
-    `dispatch_code_review`. All failures are logged and returned as a
-    status dict instead.
-    """
-    delivery_id = str(event.get("delivery_id", ""))
-    try:
-        # Lazy import INSIDE the guard (#272): keeps the SYNC (HTTP) cold-start
-        # cheap (the Elder dep graph only loads in the async invocation), AND
-        # — load-bearing — an import failure here must NOT escape and trigger
-        # AWS's 2 default async retries (the retry-storm this function exists
-        # to prevent). A failed import degrades to running, same as a DDB
-        # hiccup on the claim.
-        from adapters.install_store import claim_delivery
+def enqueue_guard_review(
+    *, payload: dict[str, Any], delivery_id: str, blocking: bool,
+) -> bool:
+    """Offload the Guard security review (#466). Contract: `_enqueue_review`."""
+    return _enqueue_review(
+        _ASYNC_PERSONAS["guard"],
+        payload=payload, delivery_id=delivery_id, blocking=blocking,
+    )
 
-        if not claim_delivery(delivery_id):
-            log.info("elder_job_duplicate_skipped", extra={"delivery_id": delivery_id})
-            return {"status": "skipped", "reason": "duplicate_delivery"}
-    except Exception as e:  # noqa: BLE001 — claim is best-effort; degrade to running
-        # A DDB hiccup on the claim must not drop the review. Fail OPEN
-        # (run it): a possible duplicate beats a silently-skipped review.
-        log.warning(
-            "elder_job_claim_failed_running_anyway",
-            extra={"delivery_id": delivery_id, "kind": type(e).__name__},
-        )
 
-    payload = event.get("payload") or {}
+def run_guard_job(event: dict[str, Any]) -> dict[str, str]:
+    """Worker entry for an async Guard review (#466). Contract: `_run_job`."""
+    return _run_job(_ASYNC_PERSONAS["guard"], event)
 
-    # Per-head-SHA idempotency (#397): claim_delivery (above) only catches an
-    # exact-delivery retry; this catches a same-head-SHA re-trigger across
-    # DIFFERENT deliveries (a redelivery, or a non-push `edited` /
-    # `ready_for_review` event) so unchanged code is not re-reviewed - while
-    # every NEW head SHA still wins a fresh review. Best-effort: a missing id
-    # / head SHA, or a claim DB error, falls through to running the review
-    # (fail OPEN - a possible double-review beats a silent skip).
-    try:
-        from adapters.install_store import claim_review
 
-        install_id, repo, pr_number = _pr_ids(payload)
-        head_sha = ((payload.get("pull_request") or {}).get("head") or {}).get("sha")
-        if install_id and repo and pr_number and head_sha:
-            if not claim_review(
-                install_id=install_id,
-                repo=repo,
-                pr_number=pr_number,
-                persona="code_reviewer",
-                head_sha=head_sha,
-            ):
-                log.info(
-                    "elder_job_duplicate_sha_skipped",
-                    extra={
-                        "delivery_id": delivery_id, "repo": repo,
-                        "pr": pr_number, "head_sha": head_sha,
-                    },
-                )
-                return {"status": "skipped", "reason": "duplicate_head_sha"}
-    except Exception as e:  # noqa: BLE001 — claim is best-effort; degrade to running
-        log.warning(
-            "elder_job_review_claim_failed_running_anyway",
-            extra={"delivery_id": delivery_id, "kind": type(e).__name__},
-        )
+def enqueue_smasher_review(
+    *, payload: dict[str, Any], delivery_id: str, blocking: bool,
+) -> bool:
+    """Offload the Smasher Trial (#469). Contract: `_enqueue_review`."""
+    return _enqueue_review(
+        _ASYNC_PERSONAS["smasher"],
+        payload=payload, delivery_id=delivery_id, blocking=blocking,
+    )
 
-    blocking = bool(event.get("blocking", False))
-    try:
-        from personas.code_reviewer.dispatch import dispatch_code_review
 
-        result = dispatch_code_review(payload, blocking=blocking)
-        log.info(
-            "elder_job_done",
-            extra={"delivery_id": delivery_id, **result},
-        )
-        return result
-    except Exception as e:  # noqa: BLE001 — never retry-storm; degrade contract owns this
-        log.error(
-            "elder_job_unhandled",
-            extra={"delivery_id": delivery_id, "kind": type(e).__name__},
-            exc_info=True,
-        )
-        # Self-recover (#418): a dropped review used to wait for a human to
-        # re-push. Enqueue ONE durable re-run to grug-rerun-jobs instead - the
-        # consumer re-runs it with the SQS redrive contract (visibility timeout
-        # -> DLQ after maxReceiveCount), so a transient failure heals on its own
-        # and a persistent one lands in the DLQ as a terminal, visible signal.
-        _self_recover_review(payload, delivery_id)
-        return {"persona": "code_reviewer", "result": "unhandled_error"}
+def run_smasher_job(event: dict[str, Any]) -> dict[str, str]:
+    """Worker entry for an async Smasher Trial (#469). Contract: `_run_job`."""
+    return _run_job(_ASYNC_PERSONAS["smasher"], event)
 
 
 def _pr_ids(payload: dict[str, Any]) -> tuple[int | None, str | None, int | None]:
@@ -490,9 +407,9 @@ def self_recover_review(
 def _self_recover_review(
     payload: dict[str, Any], delivery_id: str, *, persona: str = "elder",
 ) -> None:
-    """Enqueue ONE durable re-run for a dropped Elder review (#418). Bounded:
+    """Enqueue ONE durable re-run for a dropped review (#418). Bounded:
     enqueues at most once per drop - the rerun CONSUMER retries via SQS redrive,
-    never re-enqueues (it calls dispatch_code_review directly, not run_elder_job),
+    never re-enqueues (it calls the dispatch function directly, not the runner),
     so there is no loop. Best-effort: a failure to enqueue is logged, never
     raised (the caller is already in its degrade path)."""
     try:
@@ -512,7 +429,7 @@ def _self_recover_review(
             extra={"delivery_id": delivery_id, "repo": repo, "pr": pr_number},
         )
     except Exception as e:  # noqa: BLE001 — recovery is best-effort, never raises
-        # exc_info for symmetry with elder_job_unhandled: if recovery is
+        # exc_info for symmetry with the *_job_unhandled lines: if recovery is
         # systematically broken (queue misconfig), the stack speeds triage.
         log.error(
             "elder_self_recover_failed",
