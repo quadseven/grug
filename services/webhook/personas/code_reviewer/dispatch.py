@@ -46,6 +46,7 @@ from personas.code_reviewer.diff_parser import (
 from personas.code_reviewer.cross_file import (
     extract_symbols, fetch_cross_file_context,
 )
+from personas.code_reviewer.omen import build_runtime_context
 from personas.code_reviewer.judge import (
     eval_tags, grade_findings, partition_findings, submit_evals,
 )
@@ -556,6 +557,22 @@ def dispatch_code_review(
             },
         )
 
+    # Production signal (#470 Omen): DD error counts for the diff's
+    # files, injected as review context. FAIL-SAFE + explicit-allow: no
+    # service mapping (or any failure) = None = today's review.
+    runtime_context: str | None = None
+    try:
+        runtime_context = build_runtime_context(owner, repo_name, hunks)
+    except Exception as e:  # noqa: BLE001 — omen is additive; never break the review
+        log.info(
+            "omen_degraded",
+            extra={
+                "stage": "dispatch",
+                "pr": f"{owner}/{repo_name}#{pull_number}",
+                "kind": type(e).__name__,
+            },
+        )
+
     # `pr_context` flows into DD LLM Obs span tags so traces are
     # filterable by repo / PR / installation in the LLM Obs UI.
     llm_response: LlmReviewResponse = review_diff(
@@ -563,6 +580,7 @@ def dispatch_code_review(
         installation_id=installation_id,
         file_contents=file_contents,
         cross_file_contents=cross_file_contents,
+        runtime_context=runtime_context,
         pr_context={
             "installation_id": installation_id,
             "repo": f"{owner}/{repo_name}",
