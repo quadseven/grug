@@ -284,3 +284,27 @@ def test_pull_request_review_falls_through_to_generic_no_op():
     out = dispatch("pull_request_review", {})
     assert out["status"] == "no_op"
     assert "no handler" in out["reason"]
+
+
+def test_enqueue_failure_self_recovers_via_rerun_lane():
+    """#478 resolution: an Elder/Guard enqueue failure (missing runtime
+    flag / thread-spawn error) enqueues ONE durable rerun instead of
+    silently dropping (old) or 503ing (redelivery-storm risk). The
+    enqueue_failed result + error log stay (monitor unchanged)."""
+    recovered: list = []
+
+    with patch("dispatcher.is_install_allowlisted", return_value=True), \
+         patch("dispatcher.is_persona_enabled", return_value=True), \
+         patch("dispatcher.get_repo_config", return_value={"code_reviewer_blocking": False}), \
+         patch("personas.tpm.persona.evaluate_pull_request") as mock_eval, \
+         patch("personas.tpm.persona.publish_tpm_evaluation"), \
+         patch("async_dispatch.enqueue_elder_review", return_value=False), \
+         patch("async_dispatch.enqueue_guard_review", return_value=False), \
+         patch("async_dispatch.self_recover_review",
+               side_effect=lambda payload, delivery_id, *, persona: recovered.append(persona)):
+        mock_eval.return_value = type("R", (), {"passed": True})()
+        out = dispatch("pull_request", _full_pr_payload(), delivery_id="d-478")
+
+    assert out["personas"][1]["result"] == "enqueue_failed"
+    assert out["personas"][2]["result"] == "enqueue_failed"
+    assert recovered == ["elder", "guard"]
