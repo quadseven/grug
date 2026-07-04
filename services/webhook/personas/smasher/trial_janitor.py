@@ -58,11 +58,16 @@ def reap_orphans(
         try:
             cluster.delete(kind, name)
             reaped[kind] = reaped.get(kind, 0) + 1
-            log.info("trial_janitor_reaped", extra={"kind": kind, "resource": name})
+            # Log the KIND + count only, never the resource name: a Secret's
+            # name flows here, and CodeQL (rightly conservative) taints any
+            # secret-sourced value reaching a log as clear-text-sensitive. The
+            # name is opaque (not the secret value), but kind+count is the
+            # triage signal anyway; drop the name to keep the log clean.
+            log.info("trial_janitor_reaped", extra={"kind": kind})
         except Exception as e:  # noqa: BLE001 — one bad delete doesn't stop the sweep
             log.warning(
                 "trial_janitor_delete_failed",
-                extra={"kind": kind, "resource": name, "error": type(e).__name__},
+                extra={"kind": kind, "error": type(e).__name__},
             )
     return reaped
 
