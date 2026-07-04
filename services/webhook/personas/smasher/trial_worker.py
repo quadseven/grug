@@ -42,6 +42,7 @@ _TERMINATION_LOG = "/dev/termination-log"
 def run_trial(
     *,
     workspace: str,
+    scratch: str,
     targets: dict[str, list[int]],
     mutant_cap: int,
     per_mutant_timeout: int,
@@ -52,18 +53,17 @@ def run_trial(
 
     ISOLATION (codex peer-review PR #494): the pristine `workspace` checkout is
     NEVER executed against or mutated - every baseline/mutant run happens in a
-    FRESH COPY of it, discarded afterward. So a stateful or malicious test suite
-    that writes to sibling files, tests, or config cannot poison later mutants'
-    verdicts - each starts from a pristine tree. The vendored deps live OUTSIDE
-    the checkout (a sibling dir) and are shared read-only via PYTHONPATH, so they
-    are not copied per mutant."""
+    FRESH COPY under the writable `scratch` dir, discarded afterward. In the pod
+    the pristine checkout + vendored deps are mounted READ-ONLY, so author pytest
+    (same UID) is kernel-blocked from writing to them - a stateful or malicious
+    test cannot poison the source of later mutants' copies. The vendored deps
+    live OUTSIDE the checkout and are shared read-only via PYTHONPATH."""
     ws = Path(workspace)
 
     # Baseline in an isolated copy: the pristine checkout must pass, else no
-    # mutant verdict is trustworthy. A copy so a stateful baseline can't taint
-    # the tree the mutant copies are made from.
+    # mutant verdict is trustworthy.
     try:
-        with _isolated_copy(ws, "baseline") as base_dir:
+        with _isolated_copy(ws, scratch, "baseline") as base_dir:
             code = run_tests(str(base_dir), per_mutant_timeout)
     except TimeoutError:
         return _summary("degraded", reason="baseline_timeout")
@@ -101,7 +101,7 @@ def run_trial(
         for mutant in mutants:
             total += 1
             try:
-                with _isolated_copy(ws, f"m{total}") as mutant_dir:
+                with _isolated_copy(ws, scratch, f"m{total}") as mutant_dir:
                     # Apply the mutant into the FRESH copy; the pristine tree is
                     # never touched.
                     (mutant_dir / rel_path).write_text(mutant.source)
@@ -134,12 +134,13 @@ def run_trial(
 
 
 @contextmanager
-def _isolated_copy(pristine: Path, tag: str):
-    """Yield a FRESH copy of the pristine checkout for one test run, removed on
-    exit. Each baseline/mutant runs in its own copy so a stateful test can't
-    pollute later runs (peer-review PR #494). The copy is a sibling of the
-    checkout so the vendored deps dir (also a sibling) is NOT copied."""
-    dest = pristine.parent / f"{pristine.name}-{tag}"
+def _isolated_copy(pristine: Path, scratch: str, tag: str):
+    """Yield a FRESH copy of the pristine (read-only) checkout under the writable
+    `scratch` dir for one test run, removed on exit. Each baseline/mutant runs in
+    its own copy so a stateful test can't pollute later runs; the pristine tree
+    is read-only-mounted so a test cannot write back to the copy source either
+    (peer-review PR #494)."""
+    dest = Path(scratch) / f"repo-{tag}"
     shutil.rmtree(dest, ignore_errors=True)
     shutil.copytree(pristine, dest)
     try:
@@ -181,8 +182,10 @@ def _default_run_tests(workspace: str, timeout: int) -> int:
     a SIBLING dir of the checkout (`<parent>/.grug-deps`), shared read-only via
     PYTHONPATH - NOT inside the copied tree. Raises TimeoutError on the budget."""
     env = dict(os.environ)
-    # The checkout copy is `<parent>/repo-<tag>`; the deps sit at `<parent>/.grug-deps`.
-    deps = str(Path(workspace).parent / ".grug-deps")
+    # `workspace` here is a scratch copy of the checkout; the vendored deps live
+    # on the READ-ONLY workspace mount at `<GRUG_TRIAL_WORKSPACE>/.grug-deps`,
+    # shared read-only via PYTHONPATH (importing from a RO dir is fine).
+    deps = str(Path(os.getenv("GRUG_TRIAL_WORKSPACE", "/workspace")) / ".grug-deps")
     env["PYTHONPATH"] = deps + (os.pathsep + env["PYTHONPATH"] if env.get("PYTHONPATH") else "")
     try:
         proc = subprocess.run(
@@ -202,6 +205,7 @@ def main() -> int:
     logging.basicConfig(level=logging.INFO)
     workspace = os.getenv("GRUG_TRIAL_WORKSPACE", "/workspace")
     repo_dir = str(Path(workspace) / "repo")
+    scratch = os.getenv("GRUG_TRIAL_SCRATCH", "/scratch")
     cap = _int_env("GRUG_TRIAL_MUTANT_CAP", 10)
     timeout = _int_env("GRUG_TRIAL_PER_MUTANT_TIMEOUT", 30)
 
@@ -218,6 +222,7 @@ def main() -> int:
 
     summary = run_trial(
         workspace=repo_dir,
+        scratch=scratch,
         targets=targets,
         mutant_cap=cap,
         per_mutant_timeout=timeout,

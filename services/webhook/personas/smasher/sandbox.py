@@ -197,8 +197,11 @@ def _pod_meta(labels: dict[str, str]) -> dict[str, Any]:
     return {"labels": {"app": "grug-trial", **labels}}
 
 
-def _workspace_mounts() -> list[dict[str, str]]:
-    return [{"name": "workspace", "mountPath": "/workspace"}, {"name": "tmp", "mountPath": "/tmp"}]
+def _workspace_mounts(*, workspace_readonly: bool = False) -> list[dict[str, Any]]:
+    ws: dict[str, Any] = {"name": "workspace", "mountPath": "/workspace"}
+    if workspace_readonly:
+        ws["readOnly"] = True
+    return [ws, {"name": "tmp", "mountPath": "/tmp"}]
 
 
 def _job_shell(job_name: str, *, phase_label: str, budget: int, pod_spec: dict[str, Any]) -> dict[str, Any]:
@@ -291,12 +294,19 @@ def build_test_job(
     this is the phase that runs author code, and it is fully network-jailed (on
     a policy CNI) with NO token/secrets. Result via the termination message."""
     targets_json = json.dumps(targets, sort_keys=True)
+    # The pristine checkout + vendored deps are mounted READ-ONLY, so author
+    # pytest (same UID, same PVC) CANNOT write to `/workspace/repo` or the deps
+    # to poison the source of the per-mutant copies (codex peer-review PR #494 -
+    # kernel-enforced, not by-convention). Copies + the mutant edits go to a
+    # WRITABLE `scratch` emptyDir instead.
+    mounts = _workspace_mounts(workspace_readonly=True) + [{"name": "scratch", "mountPath": "/scratch"}]
     test_container = {
         "name": "test",
         "image": image,
         "command": ["python", "-m", "personas.smasher.trial_worker"],
         "env": [
             {"name": "GRUG_TRIAL_WORKSPACE", "value": "/workspace"},
+            {"name": "GRUG_TRIAL_SCRATCH", "value": "/scratch"},
             {"name": "GRUG_TRIAL_TARGETS", "value": targets_json},
             {"name": "GRUG_TRIAL_MUTANT_CAP", "value": str(mutant_cap)},
             {"name": "GRUG_TRIAL_PER_MUTANT_TIMEOUT", "value": str(per_mutant_timeout_seconds)},
@@ -304,7 +314,7 @@ def build_test_job(
         ],
         "securityContext": _HARDENED_SC,
         "resources": {"limits": _LIMITS, "requests": {"cpu": "250m", "memory": "256Mi"}},
-        "volumeMounts": _workspace_mounts(),
+        "volumeMounts": mounts,
         "terminationMessagePath": "/dev/termination-log",
         "terminationMessagePolicy": "File",
     }
@@ -313,7 +323,7 @@ def build_test_job(
         "restartPolicy": "Never",
         "nodeSelector": {"kubernetes.io/arch": "arm64"},
         "containers": [test_container],
-        "volumes": _pvc_volumes(pvc_name),
+        "volumes": _pvc_volumes(pvc_name) + [{"name": "scratch", "emptyDir": {"sizeLimit": "1Gi"}}],
     }
     return _job_shell(job_name, phase_label="test", budget=total_budget_seconds, pod_spec=pod_spec)
 

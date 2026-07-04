@@ -125,6 +125,25 @@ def test_both_pods_share_the_workspace_pvc_plus_writable_tmp():
             assert {"/workspace", "/tmp"} <= mounts, c["name"]
 
 
+def test_test_pod_mounts_pristine_readonly_with_writable_scratch():
+    # Kernel-enforced isolation: the test pod mounts the pristine checkout+deps
+    # READ-ONLY (author pytest can't write back to poison later copies) and gets
+    # a separate WRITABLE scratch emptyDir for the per-mutant copies.
+    test = _test()
+    spec = test["spec"]["template"]["spec"]
+    tc = next(c for c in spec["containers"] if c["name"] == "test")
+    ws_mount = next(m for m in tc["volumeMounts"] if m["name"] == "workspace")
+    assert ws_mount.get("readOnly") is True
+    scratch_mount = next(m for m in tc["volumeMounts"] if m["name"] == "scratch")
+    assert scratch_mount["mountPath"] == "/scratch"
+    assert any(v["name"] == "scratch" and "emptyDir" in v for v in spec["volumes"])
+    # The PREP pod, by contrast, mounts the workspace WRITABLE (it populates it).
+    prep = _prep()
+    prep_tc = prep["spec"]["template"]["spec"]["initContainers"][0]
+    prep_ws = next(m for m in prep_tc["volumeMounts"] if m["name"] == "workspace")
+    assert prep_ws.get("readOnly") is not True
+
+
 def test_pvc_is_node_local_rwo():
     pvc = build_trial_pvc("grug-trial-abc123-ws")
     assert pvc["kind"] == "PersistentVolumeClaim"
