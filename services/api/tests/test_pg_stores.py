@@ -702,3 +702,15 @@ def test_guard_flags_round_trip(pg):
     cfg = store.get_repo_config(1, 44)
     assert cfg["guard_enabled"] is False and cfg["guard_blocking"] is True
     assert store.is_persona_enabled(1, 44, "guard") is False
+
+
+def test_claim_pulse_nudge_win_once(pg):
+    """#472: the Pulse nudge claim is win-once per (install, repo, pr)
+    inside the TTL window - the idempotency that makes 'exactly one
+    nudge' true across poller runs."""
+    from adapters import pg_install_store as store
+
+    assert store.claim_pulse_nudge(1, "o/r", 5) is True
+    assert store.claim_pulse_nudge(1, "o/r", 5) is False   # window held
+    assert store.claim_pulse_nudge(1, "o/r", 6) is True    # different PR
+    assert store.claim_pulse_nudge(2, "o/r", 5) is True    # different install

@@ -101,6 +101,39 @@ def handler(event: dict[str, Any], context: Any) -> dict[str, int | str]:
             )
             failed_installs += 1
 
+    # Pulse pass (#472): the first SCHEDULED persona rides the same
+    # cadence as its OWN loop (the reactions loop `continue`s installs
+    # with no comment records - Pulse must still run there). Best-effort
+    # per install; everything inside run_pulse_for_install is capped +
+    # per-repo best-effort + store-claim idempotent.
+    nudges = 0
+    for install_id in installs:
+        try:
+            from personas.pulse.nudge import run_pulse_for_install
+
+            def _pulse(token: str, iid: int = install_id) -> int:
+                import httpx as _httpx
+
+                resp = _httpx.get(
+                    "https://api.github.com/installation/repositories",
+                    params={"per_page": 100},
+                    headers={
+                        "Authorization": f"Bearer {token}",
+                        "Accept": "application/vnd.github+json",
+                    },
+                    timeout=10,
+                )
+                resp.raise_for_status()
+                repos = (resp.json() or {}).get("repositories", [])
+                return run_pulse_for_install(token, iid, repos)
+
+            nudges += with_install_token_retry(install_id, _pulse) or 0
+        except Exception as e:  # noqa: BLE001 — one install must not abort the cron
+            log.warning(
+                "pulse_install_failed",
+                extra={"install_id": install_id, "kind": type(e).__name__},
+            )
+
     # Auto-replay missed webhook deliveries (#407), best-effort: a replay
     # failure must never abort the cron, so it's wrapped here on TOP of
     # replay_since's own per-attempt best-effort.
@@ -115,6 +148,7 @@ def handler(event: dict[str, Any], context: Any) -> dict[str, int | str]:
         "records": polled_records,
         "submitted": submitted,
         "failed_installs": failed_installs,
+        "pulse_nudges": nudges,
         **replay,
     }
     # Total failure (auth/config drift, GitHub down) errors EVERY install and
