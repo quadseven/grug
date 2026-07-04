@@ -88,7 +88,7 @@ def test_estimate_missing():
     assert not check_estimate("no size here").passed
 
 
-# Sentry MED on PR #40 — _SIZE_PAT must require Size: prefix, NOT match
+# Seer MED on PR #40 — _SIZE_PAT must require Size: prefix, NOT match
 # bare letters in random prose.
 def test_estimate_rejects_bare_letter_in_prose():
     """`M&Ms` / `the M key` / `XL t-shirts` must NOT satisfy estimate."""

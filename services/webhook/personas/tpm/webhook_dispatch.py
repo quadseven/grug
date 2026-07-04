@@ -65,7 +65,7 @@ def dispatch_pull_request(ctx: PullRequestContext) -> dict[str, str]:
         # (async_dispatch.run_elder_job). Without it, an unexpected
         # exception in evaluate_pull_request (or its import) would
         # propagate up and skip the personas dispatched after this one.
-        # exc_info=True carries the traceback to DD/Sentry.
+        # exc_info=True carries the traceback to DD/error tracking.
         log.error(
             "tpm_dispatch_unhandled",
             extra={

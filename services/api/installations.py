@@ -385,7 +385,7 @@ def update_repo_config(
     # Verify repo really belongs to the install — stops a caller from
     # setting overrides for repos they can't reach.
     #
-    # Sentry CRITICAL on PR #43: earlier check used `GET /repositories/{id}`
+    # Seer CRITICAL on PR #43: earlier check used `GET /repositories/{id}`
     # which returns 200 for ANY public repo regardless of install access.
     # Now enumerate via `GET /installation/repositories` (the dedicated
     # endpoint that lists ONLY this install's repos) and verify
@@ -423,7 +423,7 @@ def update_repo_config(
                 page += 1
                 # No page cap — single-repo membership lookup must scan
                 # all pages on large org installs (>1000 repos). Codex
-                # P2 follow-up to the Sentry CRITICAL fix. Worst case
+                # P2 follow-up to the Seer CRITICAL fix. Worst case
                 # ~Npages*100ms; acceptable for an admin write path.
 
     found, full_name, default_branch = with_install_token_retry(install_id, _lookup)
