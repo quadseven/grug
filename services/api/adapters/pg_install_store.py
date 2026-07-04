@@ -187,6 +187,11 @@ def list_allowlisted_installs() -> list[int]:
 # Per-repo persona toggles
 # ---------------------------------------------------------------------------
 
+# Repo-level flags that are NOT persona enable/blocking pairs (those live
+# in _DEFAULT_PERSONA_CONFIG, locked to the registry). Writable through
+# set_repo_config; read with an explicit default in get_repo_config.
+_EXTRA_REPO_FLAGS = frozenset({"dep_watch_enabled"})
+
 _DEFAULT_PERSONA_CONFIG = {
     "tpm_enabled": True,
     "code_reviewer_enabled": True,
@@ -230,6 +235,7 @@ def get_repo_config(install_id: int, repo_id: int) -> dict[str, Any]:
     }
     cfg["enforcement_ruleset_id"] = int(rid) if rid is not None else None
     cfg["force_disable_enforcement"] = bool(item.get("force_disable_enforcement", False))
+    cfg["dep_watch_enabled"] = bool(item.get("dep_watch_enabled", False))
     return cfg
 
 
@@ -270,7 +276,7 @@ def set_repo_config(
     no edit; an unknown key raises TypeError, preserving the explicit-
     signature era's unexpected-keyword behavior (typo protection).
     None = leave the stored value alone (sparse merge)."""
-    unknown = set(persona_flags) - set(_DEFAULT_PERSONA_CONFIG)
+    unknown = set(persona_flags) - set(_DEFAULT_PERSONA_CONFIG) - _EXTRA_REPO_FLAGS
     if unknown:
         raise TypeError(
             f"set_repo_config() got unknown persona flag(s) {sorted(unknown)}; "
@@ -559,6 +565,73 @@ def claim_delivery(delivery_id: str) -> bool:
 
 
 _PULSE_NUDGE_TTL_DAYS = 7
+
+
+_DEP_WATCH_TTL_DAYS = 7
+
+
+def claim_dep_watch_report(install_id: int, repo: str) -> bool:
+    """Win-once weekly claim for a Guard dependency quarantine report
+    (#491) - same shape as claim_pulse_nudge."""
+    pg_base.maybe_purge_expired()
+    ttl = int(
+        datetime.now(timezone.utc).timestamp() + _DEP_WATCH_TTL_DAYS * 86400
+    )
+    with get_pool().connection() as conn:
+        row = conn.execute(
+            """
+            INSERT INTO grug_kv (pk, sk, data, ttl)
+            VALUES (%(pk)s, %(sk)s, %(data)s, %(ttl)s)
+            ON CONFLICT (pk, sk) DO UPDATE
+                SET data = %(data)s, ttl = %(ttl)s
+                WHERE grug_kv.ttl IS NOT NULL
+                  AND grug_kv.ttl <= EXTRACT(EPOCH FROM now())
+            RETURNING pk
+            """,
+            {
+                "pk": _inst_pk(install_id),
+                "sk": f"DEPWATCH#{repo}",
+                "data": Jsonb({"ttl": ttl}),
+                "ttl": ttl,
+            },
+        ).fetchone()
+    return row is not None
+
+
+def release_dep_watch_report(install_id: int, repo: str) -> None:
+    """Release a dep-watch claim whose report WRITE definitively failed
+    (codex PR #492) - the claim must represent a FILED report, not an
+    attempt. Best-effort."""
+    with get_pool().connection() as conn:
+        conn.execute(
+            "DELETE FROM grug_kv WHERE pk = %s AND sk = %s",
+            (_inst_pk(install_id), f"DEPWATCH#{repo}"),
+        )
+
+
+def list_dep_watch_repos(install_id: int) -> list[dict[str, Any]]:
+    """Repo rows with dep_watch_enabled=true (#491) - the Pulse
+    store-driven targeting pattern."""
+    with get_pool().connection() as conn:
+        rows = conn.execute(
+            f"""
+            SELECT sk, data FROM grug_kv
+            WHERE pk = %s AND sk LIKE 'REPO#%%'
+              AND data->>'dep_watch_enabled' = 'true' AND {TTL_LIVE}
+            """,
+            (_inst_pk(install_id),),
+        ).fetchall()
+    out: list[dict[str, Any]] = []
+    for sk, data in rows:
+        _, sep, id_str = sk.partition("#")
+        try:
+            rid = int(id_str)
+        except (TypeError, ValueError):
+            continue
+        full = (data or {}).get("repo_full_name", "")
+        if sep and full:
+            out.append({"id": rid, "full_name": full})
+    return out
 
 
 def claim_pulse_nudge(install_id: int, repo: str, pr_number: int) -> bool:
