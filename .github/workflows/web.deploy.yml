@@ -218,7 +218,7 @@ jobs:
     if: github.ref == 'refs/heads/main' || startsWith(github.ref, 'refs/tags/v')
     permissions:
       contents: read
-    uses: githumps/infra-public/.github/workflows/_reusable.smoke-test.yml@91c46ceed4656a992e9143fbe29cc52744c9f524
+    uses: githumps/infra-public/.github/workflows/_reusable.smoke-test.yml@7a66418334f4c40c43e3555db5e7d86f81b51486
     with:
       retries: 3
       retry-delay: 5

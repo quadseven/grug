@@ -108,14 +108,16 @@ jobs:
 
   # Public-endpoint smoke test, migrated to the shared reusable so the
   # curl-retry + status-assert pattern lives in one place (githumps/infra-public
-  # #24, githumps/infrastructure#840). SHA-pinned to the reusable PR branch tip;
-  # repins to the merge commit once that PR lands.
+  # #24, githumps/infrastructure#840). SHA-pinned to PR #24's MERGE commit -
+  # NEVER a PR-branch tip: the branch gets deleted after merge, the SHA goes
+  # dangling, and Actions cross-repo resolution then fails the whole caller
+  # with a zero-job 'workflow file issue' (broke every main deploy 2026-07-03).
   smoke:
     needs: pulumi-up
     if: github.event_name != 'pull_request'
     permissions:
       contents: read
-    uses: githumps/infra-public/.github/workflows/_reusable.smoke-test.yml@91c46ceed4656a992e9143fbe29cc52744c9f524
+    uses: githumps/infra-public/.github/workflows/_reusable.smoke-test.yml@7a66418334f4c40c43e3555db5e7d86f81b51486
     with:
       retries: 3
       retry-delay: 5
