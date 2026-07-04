@@ -147,3 +147,41 @@ healthy + a real webhook delivery dispatching (DD logs).
   _shared path (the new drift class).
 - **iac.deploy.yml is pulumi-only post-#354** - no image-build edits there;
   the only build surface is deploy.k8s.yml step "Build + push images".
+
+## Outcome
+
+Shipped: PR #495, merge 4c0c140, 2026-07-04. Deploy green; api.grug.lol/livez
+and grug.lol both 200 post-rollout. Issue #77 closed with deviation notes
+(Lambda-era boxes mapped to k8s equivalents).
+
+v1 -> shipped deltas (what review changed):
+- ci-gate (first run of the new check.image-build.yml) caught boto3
+  import-time client construction needing AWS env in the bare container.
+- Stage 1 moved claim_key() onto _AsyncPersonaSpec + added __post_init__
+  validation + static dispatch_path resolution.
+- Stage 2 hardened the semgrep path (rules-dir + returncode guards - the
+  plan's "degrades like a missing binary" claim was NOT initially true),
+  widened the image smoke to the lazy dispatch modules, unnested attester
+  silent-skip gates, anchored the PII _shared scan.
+- Stage 4 found the Makefile docker-build target this very PR broke.
+- Stage 6 found CONTEXT.md documenting the CF-auth boundary as fail-open
+  (code fail-closes) - a pre-existing doc error surfaced by the sweep.
+- Stage 7 added smasher wrapper-binding tests (the one persona with zero
+  direct behavior tests - and the one that is DEFAULT OFF).
+- Stage 8 found the on-demand sast_benchmark lane broken by the move (no
+  per-PR CI exercises it) + the trial sandbox inheriting /app/_shared on
+  PYTHONPATH (replaced, not appended, for author pytest).
+- Peer review (codex approve; gemma/poolside/spark NEEDS-ATTENTION):
+  their 3x-confirmed "shadow guard asymmetric" HIGH was a FALSE POSITIVE
+  (the guard scans both trees); their provenance-assert suggestion was
+  adopted into the image smoke. Gemini skipped (companion parse failure
+  on both models). Full ledger: PR #495 comment + logs/review-ledger.jsonl.
+
+Reviewer-finding pre-emption matrix (plan section 11 vs reality): patch-target
+preservation HELD (zero pre-existing test edits); monitored log names HELD
+(byte-verified twice); PII-scan shrinkage pre-empted as planned; the shadow
+guard pre-empted the peer chain's only HIGH. Not pre-empted by the plan:
+the sast rules-dir cwd fragility (stage 2) and the out-of-bootstrap benchmark
+lane (stage 8) - both are entrypoint-not-on-the-path bugs; future extraction
+plans should enumerate EVERY entrypoint (cron, Job, workflow_dispatch, make
+target), not just services + tests.
