@@ -210,10 +210,40 @@ def main() -> int:
         per_mutant_timeout=timeout,
         run_tests=_default_run_tests,
     )
+    # AI-REVIEW 2026-07-04 [codex (peer-review, PR #494)] HIGH: an author test
+    # could daemonize a process (double-fork/setsid) that survives pytest and
+    # OVERWRITES /dev/termination-log AFTER the worker writes the authoritative
+    # result, forging a clean pass. Kill every other process in this PID
+    # namespace before the authoritative write so no author-spawned survivor can
+    # race it. Gated on PID 1 (we own the namespace only inside the sandbox pod)
+    # so a local run never reaps the developer's processes.
+    _reap_other_processes()
     _write_termination(summary)
     # Exit 0 regardless of survivors: the Job SUCCEEDED at measuring; survivors
     # are a finding, not a Job failure (which would trip backoff semantics).
     return 0
+
+
+def _reap_other_processes() -> None:
+    """Kill every OTHER process in this PID namespace so an author-spawned
+    daemon cannot overwrite the termination message after the worker's
+    authoritative write (codex peer-review, PR #494). Best-effort + only acts
+    when this worker is PID 1 (i.e. inside the sandbox pod it owns) - a local
+    run is a no-op, never touching the developer's processes."""
+    if os.getpid() != 1:
+        return
+    import signal
+    try:
+        pids = [int(p) for p in os.listdir("/proc") if p.isdigit()]
+    except OSError:
+        return
+    for pid in pids:
+        if pid == 1:  # never the worker itself
+            continue
+        try:
+            os.kill(pid, signal.SIGKILL)
+        except (ProcessLookupError, PermissionError, OSError):
+            continue
 
 
 def _int_env(name: str, default: int) -> int:
