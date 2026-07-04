@@ -598,6 +598,17 @@ def claim_dep_watch_report(install_id: int, repo: str) -> bool:
     return row is not None
 
 
+def release_dep_watch_report(install_id: int, repo: str) -> None:
+    """Release a dep-watch claim whose report WRITE definitively failed
+    (codex PR #492) - the claim must represent a FILED report, not an
+    attempt. Best-effort."""
+    with get_pool().connection() as conn:
+        conn.execute(
+            "DELETE FROM grug_kv WHERE pk = %s AND sk = %s",
+            (_inst_pk(install_id), f"DEPWATCH#{repo}"),
+        )
+
+
 def list_dep_watch_repos(install_id: int) -> list[dict[str, Any]]:
     """Repo rows with dep_watch_enabled=true (#491) - the Pulse
     store-driven targeting pattern."""

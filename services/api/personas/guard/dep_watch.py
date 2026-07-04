@@ -24,7 +24,9 @@ from urllib.parse import quote
 
 import httpx
 
-from adapters.install_store import claim_dep_watch_report, get_repo_config
+from adapters.install_store import (
+    claim_dep_watch_report, get_repo_config, release_dep_watch_report,
+)
 from personas.code_reviewer.sca import ChangedDep, _audit, _PINNED_DEP_RE
 
 log = logging.getLogger(f"{os.getenv('DD_SERVICE', 'grug')}.persona.guard.dep_watch")
@@ -157,32 +159,46 @@ def run_dep_watch_for_install(
                  "version": d.version, "ids": vulns[(d.name.lower(), d.version)]}
                 for d in pins if (d.name.lower(), d.version) in vulns
             ]
-            # Weekly cadence claim BEFORE any write (the Pulse ordering:
-            # a lost claim = this window already reported).
+            # Read-only lookup BEFORE the claim (codex PR #492, the
+            # Pulse r3 lesson: a read failure must not burn the weekly
+            # window - before the claim exists there is nothing to
+            # release).
+            existing = _existing_report(token, owner, name)
             if not claim_dep_watch_report(install_id, full):
                 continue
-            existing = _existing_report(token, owner, name)
             api_headers = {
                 "Authorization": f"Bearer {token}",
                 "Accept": "application/vnd.github+json",
                 "X-GitHub-Api-Version": "2022-11-28",
             }
-            if existing:
-                resp = httpx.patch(
-                    f"https://api.github.com/repos/{quote(owner, safe='')}/{quote(name, safe='')}/issues/{existing}",
-                    json={"body": _report_body(rows)},
-                    headers=api_headers, timeout=_FETCH_TIMEOUT,
-                )
-            else:
-                resp = httpx.post(
-                    f"https://api.github.com/repos/{quote(owner, safe='')}/{quote(name, safe='')}/issues",
-                    json={
-                        "title": f"{_REPORT_TITLE} ({len(rows)} dependency(ies))",
-                        "body": _report_body(rows),
-                    },
-                    headers=api_headers, timeout=_FETCH_TIMEOUT,
-                )
-            resp.raise_for_status()
+            try:
+                if existing:
+                    resp = httpx.patch(
+                        f"https://api.github.com/repos/{quote(owner, safe='')}/{quote(name, safe='')}/issues/{existing}",
+                        json={"body": _report_body(rows)},
+                        headers=api_headers, timeout=_FETCH_TIMEOUT,
+                    )
+                else:
+                    resp = httpx.post(
+                        f"https://api.github.com/repos/{quote(owner, safe='')}/{quote(name, safe='')}/issues",
+                        json={
+                            "title": f"{_REPORT_TITLE} ({len(rows)} dependency(ies))",
+                            "body": _report_body(rows),
+                        },
+                        headers=api_headers, timeout=_FETCH_TIMEOUT,
+                    )
+                resp.raise_for_status()
+            except httpx.HTTPStatusError as e:
+                if 400 <= e.response.status_code < 500:
+                    # Definite no-write: release so the next tick retries.
+                    release_dep_watch_report(install_id, full)
+                # 5xx = ambiguous (write may have landed): keep the claim;
+                # the marker-based refresh makes a future pass safe.
+                raise
+            except httpx.RequestError:
+                # Ambiguous transport outcome: keep the claim - a missed
+                # weekly report beats duplicate issues.
+                raise
             filed += 1
             log.info(
                 "dep_watch_reported",
