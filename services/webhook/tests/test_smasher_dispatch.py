@@ -43,6 +43,7 @@ def _wire(monkeypatch, *, diff=_DIFF, trial=None, enabled=True):
     captured: dict = {"checks": [], "reviews": [], "verdicts": []}
 
     monkeypatch.setattr(secrets_loader, "get_smasher_enabled", lambda: enabled)
+    monkeypatch.setattr(secrets_loader, "get_smasher_network_policy_enforced", lambda: True)
     monkeypatch.setattr(
         sm_dispatch, "with_install_token_retry",
         lambda _iid, fn: fn("tok"),
@@ -72,6 +73,16 @@ def test_globally_disabled_short_circuits(monkeypatch):
     assert out["result"] == "disabled_global"
     # No check-run posted when the master switch is off.
     assert captured["checks"] == []
+
+
+def test_refuses_to_run_when_netpol_not_affirmed(monkeypatch):
+    # Fail-closed egress gate: even with the master switch ON, Smasher must NOT
+    # run author code unless the operator affirmed a policy-enforcing CNI.
+    captured = _wire(monkeypatch, enabled=True)
+    monkeypatch.setattr(secrets_loader, "get_smasher_network_policy_enforced", lambda: False)
+    out = sm_dispatch.dispatch_smasher_review(_payload(), blocking=False)
+    assert out["result"] == "disabled_no_netpol_enforcement"
+    assert captured["checks"] == []  # no Job launched, no check posted
 
 
 def test_survived_mutant_becomes_advisory_finding(monkeypatch):

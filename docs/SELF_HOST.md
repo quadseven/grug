@@ -178,11 +178,18 @@ has a hard cluster precondition:
    secrets) plus the fact that the test pod needs no network (deps are vendored
    on the shared volume), but the hard network jail needs the policy CNI. DO NOT
    enable Smasher on a flannel-only cluster.
-2. **Global master switch** — set the SSM String `/grug/smasher-enabled` to
+2. **Affirm the CNI (fail-closed egress gate)** — after installing a policy CNI,
+   set the SSM String `/grug/smasher-network-policy-enforced` to `true`. This is
+   a SEPARATE machine-checked gate from the enable switch: Smasher refuses to run
+   author code while it is false, so a config mistake can't run pytest with
+   unrestricted egress on flannel. (The `grug-trial` namespace also enforces the
+   `restricted` Pod Security Standard at the apiserver, CNI-independently, so a
+   compromised launcher token still cannot create a privileged/hostPath Job.)
+3. **Global master switch** — set the SSM String `/grug/smasher-enabled` to
    `true`. Absent/false keeps Smasher globally off regardless of per-repo config.
-3. **Per-repo opt-in** — enable `smasher_enabled` on the repo (config API).
+4. **Per-repo opt-in** — enable `smasher_enabled` on the repo (config API).
    Default OFF.
-4. **Trust framing** — only enable Smasher on repos whose PR authors you trust
+5. **Trust framing** — only enable Smasher on repos whose PR authors you trust
    at the level of "may run code in the sandbox." The sandbox bounds credential
    theft and resource use, not intent.
 

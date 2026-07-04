@@ -90,6 +90,7 @@ spec:
             # Smasher Trial (#469): the consumer re-drives Smasher on the rerun
             # lane, so it needs the same master flag + Job image as the webhook.
             - {name: GRUG_SMASHER_ENABLED_SSM, value: /grug/smasher-enabled}
+            - {name: GRUG_SMASHER_NETPOL_ENFORCED_SSM, value: /grug/smasher-network-policy-enforced}
             - {name: GRUG_SMASHER_JOB_IMAGE, value: REGISTRY_PLACEHOLDER/grug-webhook:TAG_PLACEHOLDER}
             - {name: DD_SITE, value: datadoghq.com}
             - {name: DD_LLMOBS_ENABLED, value: "true"}

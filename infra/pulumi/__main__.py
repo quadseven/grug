@@ -184,6 +184,19 @@ _smasher_enabled = aws.ssm.Parameter(
     description="Global master switch for the Smasher Trial mutation testing (ADR-0013, #469).",
     opts=pulumi.ResourceOptions(ignore_changes=["value"]),
 )
+
+# Fail-closed egress precondition (codex peer-review PR #494): Smasher refuses to
+# run author pytest unless the operator affirms a policy-enforcing CNI here.
+# Default false so a config mistake can't run author code with unrestricted
+# egress on flannel. Operator flips it once a policy CNI (Calico/Cilium) is live.
+_smasher_netpol_enforced = aws.ssm.Parameter(
+    "grug-smasher-network-policy-enforced",
+    name="/grug/smasher-network-policy-enforced",
+    type="String",
+    value="false",
+    description="Operator affirmation that a policy-enforcing CNI is present (Smasher egress gate, #469).",
+    opts=pulumi.ResourceOptions(ignore_changes=["value"]),
+)
 # DLQs (#312): a poison message that fails maxReceiveCount times lands here
 # instead of vanishing or looping forever — the operator-visible "stuck" signal.
 # FIFO source → FIFO DLQ. The jobs DLQ is the meaningful one (a job the connector

@@ -17,6 +17,19 @@ metadata:
   labels:
     app.kubernetes.io/part-of: grug
     grug-trial-namespace: "true"
+    # Pod Security Admission (built-in, apiserver-enforced, CNI-INDEPENDENT):
+    # RBAC lets the launcher `create jobs` but does NOT constrain the holder to
+    # the hardened manifests this code generates - a compromised webhook could
+    # otherwise submit a Job with hostPath / hostNetwork / privileged and escape
+    # to the NODE (codex peer-review, PR #494). Enforcing the `restricted`
+    # standard makes the apiserver REJECT any such pod. The Trial pods this code
+    # builds already comply (non-root, caps dropped, seccomp RuntimeDefault, no
+    # host namespaces, emptyDir+PVC volumes only), so this blocks the escalation
+    # without breaking legitimate Trials.
+    pod-security.kubernetes.io/enforce: restricted
+    pod-security.kubernetes.io/enforce-version: latest
+    pod-security.kubernetes.io/audit: restricted
+    pod-security.kubernetes.io/warn: restricted
 ---
 # The Trial pods run as this namespace's `default` SA with
 # automountServiceAccountToken:false (set on the pod), so no token is mounted -
