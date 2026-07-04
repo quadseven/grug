@@ -59,20 +59,55 @@ metadata:
 rules:
   - apiGroups: ["batch"]
     resources: ["jobs"]
-    verbs: ["create", "get", "list", "delete"]
+    verbs: ["create", "get", "delete"]
   - apiGroups: [""]
     resources: ["pods"]
-    verbs: ["get", "list"]
-  # `list` (not just get/delete) so the orphan janitor can find leaked
-  # Secrets/PVCs by label after a launcher crash.
+    verbs: ["get", "list"]  # list: read the Job's pod for the termination message
   - apiGroups: [""]
     resources: ["secrets"]
-    verbs: ["create", "get", "list", "delete"]
+    verbs: ["create", "get", "delete"]
   # The per-Trial shared workspace PVC (carries the checkout+deps from the prep
   # pod to the network-jailed test pod).
   - apiGroups: [""]
     resources: ["persistentvolumeclaims"]
-    verbs: ["create", "get", "list", "delete"]
+    verbs: ["create", "get", "delete"]
+---
+# The orphan janitor runs as its OWN in-namespace ServiceAccount (a SA is
+# namespace-scoped, so the CronJob in grug-trial cannot use the launcher SA that
+# lives in `grug`; codex peer-review PR #494). Minimal: list + delete only.
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: grug-trial-janitor
+  namespace: grug-trial
+automountServiceAccountToken: false
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: grug-trial-janitor
+  namespace: grug-trial
+rules:
+  - apiGroups: ["batch"]
+    resources: ["jobs"]
+    verbs: ["list", "delete"]
+  - apiGroups: [""]
+    resources: ["secrets", "persistentvolumeclaims"]
+    verbs: ["list", "delete"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: grug-trial-janitor
+  namespace: grug-trial
+subjects:
+  - kind: ServiceAccount
+    name: grug-trial-janitor
+    namespace: grug-trial
+roleRef:
+  kind: Role
+  name: grug-trial-janitor
+  apiGroup: rbac.authorization.k8s.io
 ---
 # Bind the grug-namespace launcher SA (mounted on the webhook + consumer pods)
 # to the grug-trial Role. Cross-namespace subject is explicit + intentional.
@@ -187,7 +222,7 @@ spec:
         metadata:
           labels: {app: grug-trial-janitor, grug-trial-role: janitor}
         spec:
-          serviceAccountName: grug-smasher-launcher
+          serviceAccountName: grug-trial-janitor
           automountServiceAccountToken: true
           restartPolicy: Never
           nodeSelector: {kubernetes.io/arch: arm64}

@@ -114,6 +114,17 @@ def test_prep_failure_degrades_and_skips_test_pod():
     assert not any(k == "job+" and n.endswith("-test") for k, n in cluster.events)
 
 
+def test_failed_test_job_with_forged_clean_message_degrades():
+    # CRITICAL: a malicious test can pre-write a forged clean termination
+    # message and kill the worker (-> Job FAILED). The runner must NOT trust the
+    # message from a non-Succeeded Job - it degrades WITHOUT parsing it.
+    forged = json.dumps({"status": "completed", "total": 1, "killed": 1, "survived": []})
+    cluster = _FakeCluster(forged, test_phase="Failed")
+    res = _launch(cluster)
+    assert res.status == "degraded" and res.reason == "test_job_failed"
+    assert res.survived == ()  # the forged clean result never surfaced
+
+
 def test_token_goes_into_a_secret_never_inlined():
     cluster = _FakeCluster(json.dumps({"status": "completed", "total": 1, "killed": 1}))
     _launch(cluster, token="ghs_secret")  # noqa: S106
