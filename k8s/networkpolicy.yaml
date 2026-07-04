@@ -78,6 +78,8 @@ spec:
     - to:
         - namespaceSelector:
             matchLabels: {kubernetes.io/metadata.name: spark-gateway}
+          podSelector:
+            matchLabels: {app: spark-gateway}  # the Service's own selector
       ports:
         - {protocol: TCP, port: 8080}
     # Node-local Datadog agent: DogStatsD (UDP 8125) + APM trace intake
