@@ -169,13 +169,15 @@ Because the Job executes PR-author-controlled code (the repo's tests + the code
 under test), Smasher is OFF by default and gated behind a TWO-KEY enable, and it
 has a hard cluster precondition:
 
-1. **Policy-enforcing CNI is REQUIRED.** The Trial pod's network isolation
-   (`allow-egress-trial` NetworkPolicy) is only enforced by a policy-capable CNI
-   (Calico, Cilium, ...). On a non-policy CNI (e.g. flannel) the policy is inert
-   and the test phase could reach the cluster network. The load-bearing
-   isolation is credential-denial (the test phase gets NO ServiceAccount token
-   and NO secrets), but the network jail needs the policy CNI. DO NOT enable
-   Smasher on a flannel-only cluster.
+1. **Policy-enforcing CNI is REQUIRED.** The Trial runs as TWO pods: a prep pod
+   (fetch + wheel-install, egress DNS+443) and a network-jailed test pod
+   (author code, `default-deny-egress`). That egress split is only ENFORCED by a
+   policy-capable CNI (Calico, Cilium, ...). On a non-policy CNI (e.g. flannel)
+   the policies are inert and the test pod could reach the cluster network. The
+   CNI-independent isolation is credential-denial (the test pod has NO token / NO
+   secrets) plus the fact that the test pod needs no network (deps are vendored
+   on the shared volume), but the hard network jail needs the policy CNI. DO NOT
+   enable Smasher on a flannel-only cluster.
 2. **Global master switch** — set the SSM String `/grug/smasher-enabled` to
    `true`. Absent/false keeps Smasher globally off regardless of per-repo config.
 3. **Per-repo opt-in** — enable `smasher_enabled` on the repo (config API).
@@ -187,7 +189,8 @@ has a hard cluster precondition:
 RBAC: applying `k8s/smasher-rbac.yaml` + `k8s/smasher-trial-namespace.yaml`
 creates the `grug-smasher-launcher` ServiceAccount and its permissions, which
 live ENTIRELY in a dedicated, secret-free `grug-trial` namespace (Jobs + Pods +
-the per-Job token Secret) with none in `grug`. Trial Jobs run in `grug-trial`,
+the per-Job token Secret + the shared workspace PVC) with none in `grug`. Trial
+Jobs run in `grug-trial`,
 so the launcher's `create jobs` grant cannot be used to borrow a privileged
 ServiceAccount and reach `grug-secrets`. See
 `docs/adr/0013-smasher-trial-sandbox.md` for the full boundary design.

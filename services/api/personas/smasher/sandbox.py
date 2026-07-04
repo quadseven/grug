@@ -14,20 +14,28 @@ Two pure surfaces, both fully unit-lockable (no cluster, no IO):
 Plus `extract_target_lines(hunks)` — the diff's added Python lines, the mutation
 targets. Non-Python files are skipped (the tracer is Python-only, #346 P3.1).
 
-The Job runs in the DEDICATED `grug-trial` namespace (ADR-0013), which holds no
-secrets and no privileged ServiceAccounts, so even the launcher's `create jobs`
-grant there cannot be used to borrow a privileged identity (the escalation a
-shared namespace would allow). The Job's containers run from the grug-webhook
-image (so `personas.smasher` is importable inside the Job):
-  - initContainer `fetch` — the ONLY token holder. The scoped `contents:read`
-    token is injected via a per-Job Secret (`secretKeyRef`), never inlined into
-    the pod spec / etcd. Downloads the repo tarball at the head SHA into the
-    workspace.
-  - initContainer `deps` — NO token. Installs test deps (network) into the
-    workspace. Author build code may run here, but there is no credential.
-  - container `test` — NO token, NO secrets, read-only rootfs (with a writable
-    `/tmp` + `/workspace`), non-root, caps dropped, resource-limited. Runs the
-    mutation worker and writes the result to /dev/termination-log.
+Everything runs in the DEDICATED `grug-trial` namespace (ADR-0013), which holds
+no secrets and no privileged ServiceAccounts, so even the launcher's `create
+jobs` grant there cannot be used to borrow a privileged identity.
+
+TWO-POD SPLIT (peer-review PR #494) so the network-having phase and the
+author-code phase are DIFFERENT pods with DIFFERENT egress policies (pod-level
+NetworkPolicy can't distinguish containers in one pod):
+  - **prep pod** (label `grug-trial-phase: prep`, egress DNS+443): initContainer
+    `fetch` is the ONLY token holder (scoped `contents:read` token via a per-Job
+    Secret `secretKeyRef`, never inlined) and tarball-fetches the repo at the
+    head SHA into a shared PVC; main container `deps` (NO token) wheel-installs
+    test deps into the PVC. No author test code runs here (wheel-only install).
+  - **test pod** (label `grug-trial-phase: test`, DENY-ALL egress): the `test`
+    container runs the mutation worker over the SAME PVC with NO token, NO
+    secrets, and NO network at all - the deps are already vendored, so it needs
+    none. This is the phase that runs author code; it is fully network-jailed
+    (on a policy CNI) and holds nothing to steal.
+All containers: read-only rootfs (+ writable `/tmp` + the PVC), non-root, caps
+dropped, resource limits. The PVC (node-local `local-path`) is what carries the
+checkout+deps between the two pods; `WaitForFirstConsumer` pins the test pod to
+the prep pod's node. Result: the `test` pod writes the survived-mutant summary
+to /dev/termination-log.
 """
 
 from __future__ import annotations
@@ -154,8 +162,71 @@ def _added_line_numbers(hunk: DiffHunk) -> list[int]:
 # the runner) so the manifest and the fetcher can't drift on the path shape.
 _TARBALL_PATH = "/repos/{owner}/{repo}/tarball/{ref}"
 
+# The storage class carrying the checkout+deps between the prep and test pods.
+# Node-local + WaitForFirstConsumer, so the PV is pinned to the prep pod's node
+# and the test pod (mounting the same PVC) is forced onto that same node.
+_TRIAL_STORAGE_CLASS = "local-path"
 
-def build_trial_job(
+_HARDENED_SC = {
+    "runAsNonRoot": True,
+    "runAsUser": 10001,
+    "allowPrivilegeEscalation": False,
+    "readOnlyRootFilesystem": True,
+    "capabilities": {"drop": ["ALL"]},
+    "seccompProfile": {"type": "RuntimeDefault"},
+}
+_LIMITS = {"cpu": "1", "memory": "1Gi"}
+
+
+def build_trial_pvc(name: str) -> dict[str, Any]:
+    """The per-Trial shared workspace PVC (PURE). Carries the checkout + vendored
+    deps from the prep pod to the network-jailed test pod."""
+    return {
+        "apiVersion": "v1",
+        "kind": "PersistentVolumeClaim",
+        "metadata": {"name": name, "namespace": TRIAL_NAMESPACE, "labels": {"app": "grug-trial"}},
+        "spec": {
+            "accessModes": ["ReadWriteOnce"],
+            "storageClassName": _TRIAL_STORAGE_CLASS,
+            "resources": {"requests": {"storage": "1Gi"}},
+        },
+    }
+
+
+def _pod_meta(labels: dict[str, str]) -> dict[str, Any]:
+    return {"labels": {"app": "grug-trial", **labels}}
+
+
+def _workspace_mounts() -> list[dict[str, str]]:
+    return [{"name": "workspace", "mountPath": "/workspace"}, {"name": "tmp", "mountPath": "/tmp"}]
+
+
+def _job_shell(job_name: str, *, phase_label: str, budget: int, pod_spec: dict[str, Any]) -> dict[str, Any]:
+    return {
+        "apiVersion": "batch/v1",
+        "kind": "Job",
+        "metadata": {
+            "name": job_name,
+            "namespace": TRIAL_NAMESPACE,
+            "labels": {"app": "grug-trial", "grug-trial-phase": phase_label},
+        },
+        "spec": {
+            "activeDeadlineSeconds": budget,   # kubelet-enforced kill switch
+            "backoffLimit": 0,                 # never re-run on failure
+            "ttlSecondsAfterFinished": 300,
+            "template": {"metadata": _pod_meta({"grug-trial-phase": phase_label}), "spec": pod_spec},
+        },
+    }
+
+
+def _pvc_volumes(pvc_name: str) -> list[dict[str, Any]]:
+    return [
+        {"name": "workspace", "persistentVolumeClaim": {"claimName": pvc_name}},
+        {"name": "tmp", "emptyDir": {"sizeLimit": "256Mi"}},
+    ]
+
+
+def build_prep_job(
     *,
     job_name: str,
     image: str,
@@ -163,121 +234,88 @@ def build_trial_job(
     repo: str,
     head_sha: str,
     token_secret_name: str,
-    targets: dict[str, list[int]],
+    pvc_name: str,
     total_budget_seconds: int,
-    per_mutant_timeout_seconds: int,
-    mutant_cap: int,
 ) -> dict[str, Any]:
-    """Render the locked-down Trial Job manifest (ADR-0013). PURE.
-
-    Boundary invariants asserted by test_smasher_sandbox.py: no pod SA token;
-    the GitHub token is a `secretKeyRef` on the `fetch` init container ONLY (not
-    inlined in the spec/etcd); ALL containers are hardened (non-root, read-only
-    rootfs, caps dropped) with a writable `/tmp` + `/workspace`; the `test`
-    container has no secrets; `activeDeadlineSeconds`/`restartPolicy=Never`/
-    `backoffLimit=0` bound runaways; result via the termination message; pod
-    labelled for the egress-deny NetworkPolicy; runs in the isolated
-    `grug-trial` namespace."""
-    targets_json = json.dumps(targets, sort_keys=True)
-    workspace = {"name": "workspace", "mountPath": "/workspace"}
-    tmp = {"name": "tmp", "mountPath": "/tmp"}
-    mounts = [workspace, tmp]
-    hardened_sc = {
-        "runAsNonRoot": True,
-        "runAsUser": 10001,
-        "allowPrivilegeEscalation": False,
-        "readOnlyRootFilesystem": True,
-        "capabilities": {"drop": ["ALL"]},
-        "seccompProfile": {"type": "RuntimeDefault"},
-    }
-    limits = {"cpu": "1", "memory": "1Gi"}
-
+    """Prep pod (PURE): fetch the repo tarball (init `fetch`, the ONLY token
+    holder) + wheel-install deps (`deps`, no token) into the shared PVC. Labelled
+    `grug-trial-phase: prep` so the egress-DNS+443 NetworkPolicy selects it. NO
+    author test code runs here (wheel-only install runs no build backends)."""
     fetch_init = {
         "name": "fetch",
         "image": image,
         "command": ["python", "-m", "personas.smasher.trial_fetch"],
         "env": [
-            # The token lives ONLY here, sourced from a per-Job Secret via
-            # secretKeyRef (never inlined into the pod spec / etcd). Used for
-            # the one authenticated tarball request; never written to disk.
-            {
-                "name": "GRUG_TRIAL_TOKEN",
-                "valueFrom": {"secretKeyRef": {"name": token_secret_name, "key": "token"}},
-            },
+            {"name": "GRUG_TRIAL_TOKEN",
+             "valueFrom": {"secretKeyRef": {"name": token_secret_name, "key": "token"}}},
             {"name": "GRUG_TRIAL_WORKSPACE", "value": "/workspace"},
             {"name": "GRUG_TRIAL_TARBALL_PATH",
              "value": _TARBALL_PATH.format(owner=owner, repo=repo, ref=head_sha)},
         ],
-        "securityContext": hardened_sc,
-        "resources": {"limits": limits, "requests": {"cpu": "100m", "memory": "128Mi"}},
-        "volumeMounts": mounts,
+        "securityContext": _HARDENED_SC,
+        "resources": {"limits": _LIMITS, "requests": {"cpu": "100m", "memory": "128Mi"}},
+        "volumeMounts": _workspace_mounts(),
     }
-    deps_init = {
+    deps_main = {
         "name": "deps",
         "image": image,
-        # NO token. Author build backends may run here; there is nothing to steal.
         "command": ["python", "-m", "personas.smasher.trial_deps"],
         "env": [{"name": "GRUG_TRIAL_WORKSPACE", "value": "/workspace"}],
-        "securityContext": hardened_sc,
-        "resources": {"limits": limits, "requests": {"cpu": "100m", "memory": "256Mi"}},
-        "volumeMounts": mounts,
+        "securityContext": _HARDENED_SC,
+        "resources": {"limits": _LIMITS, "requests": {"cpu": "100m", "memory": "256Mi"}},
+        "volumeMounts": _workspace_mounts(),
     }
+    pod_spec = {
+        "automountServiceAccountToken": False,
+        "restartPolicy": "Never",
+        "nodeSelector": {"kubernetes.io/arch": "arm64"},
+        "initContainers": [fetch_init],
+        "containers": [deps_main],
+        "volumes": _pvc_volumes(pvc_name),
+    }
+    return _job_shell(job_name, phase_label="prep", budget=total_budget_seconds, pod_spec=pod_spec)
+
+
+def build_test_job(
+    *,
+    job_name: str,
+    image: str,
+    pvc_name: str,
+    targets: dict[str, list[int]],
+    total_budget_seconds: int,
+    per_mutant_timeout_seconds: int,
+    mutant_cap: int,
+) -> dict[str, Any]:
+    """Test pod (PURE): run the mutation worker over the prepped PVC. Labelled
+    `grug-trial-phase: test` so the DENY-ALL-egress NetworkPolicy selects it -
+    this is the phase that runs author code, and it is fully network-jailed (on
+    a policy CNI) with NO token/secrets. Result via the termination message."""
+    targets_json = json.dumps(targets, sort_keys=True)
     test_container = {
         "name": "test",
         "image": image,
-        # NO token, NO envFrom secret. This is the phase that runs author code.
         "command": ["python", "-m", "personas.smasher.trial_worker"],
         "env": [
             {"name": "GRUG_TRIAL_WORKSPACE", "value": "/workspace"},
             {"name": "GRUG_TRIAL_TARGETS", "value": targets_json},
             {"name": "GRUG_TRIAL_MUTANT_CAP", "value": str(mutant_cap)},
             {"name": "GRUG_TRIAL_PER_MUTANT_TIMEOUT", "value": str(per_mutant_timeout_seconds)},
-            # Same-source rewrites within one pytest-second could otherwise serve
-            # stale .pyc (timestamp invalidation granularity); disable bytecode.
             {"name": "PYTHONDONTWRITEBYTECODE", "value": "1"},
         ],
-        "securityContext": hardened_sc,
-        "resources": {"limits": limits, "requests": {"cpu": "250m", "memory": "256Mi"}},
-        "volumeMounts": mounts,
+        "securityContext": _HARDENED_SC,
+        "resources": {"limits": _LIMITS, "requests": {"cpu": "250m", "memory": "256Mi"}},
+        "volumeMounts": _workspace_mounts(),
         "terminationMessagePath": "/dev/termination-log",
         "terminationMessagePolicy": "File",
     }
-
-    return {
-        "apiVersion": "batch/v1",
-        "kind": "Job",
-        "metadata": {
-            "name": job_name,
-            "namespace": TRIAL_NAMESPACE,
-            "labels": {"app": "grug-trial", "grug-trial": "true"},
-        },
-        "spec": {
-            # The kubelet-enforced kill switch: no matter what author code does,
-            # the whole Job dies at the budget.
-            "activeDeadlineSeconds": total_budget_seconds,
-            "backoffLimit": 0,        # never re-run author code on failure
-            "ttlSecondsAfterFinished": 300,  # self-clean finished Jobs
-            "template": {
-                "metadata": {
-                    "labels": {"app": "grug-trial", "grug-trial": "true"},
-                },
-                "spec": {
-                    # The load-bearing credential-denial: the code under test
-                    # gets NO Kubernetes token. Runs as the grug-trial default
-                    # SA (no permissions).
-                    "automountServiceAccountToken": False,
-                    "restartPolicy": "Never",
-                    "nodeSelector": {"kubernetes.io/arch": "arm64"},
-                    "initContainers": [fetch_init, deps_init],
-                    "containers": [test_container],
-                    "volumes": [
-                        {"name": "workspace", "emptyDir": {"sizeLimit": "512Mi"}},
-                        {"name": "tmp", "emptyDir": {"sizeLimit": "256Mi"}},
-                    ],
-                },
-            },
-        },
+    pod_spec = {
+        "automountServiceAccountToken": False,
+        "restartPolicy": "Never",
+        "nodeSelector": {"kubernetes.io/arch": "arm64"},
+        "containers": [test_container],
+        "volumes": _pvc_volumes(pvc_name),
     }
+    return _job_shell(job_name, phase_label="test", budget=total_budget_seconds, pod_spec=pod_spec)
 
 
 def parse_trial_result(termination_message: str | None) -> TrialResult:
