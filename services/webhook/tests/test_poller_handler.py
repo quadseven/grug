@@ -14,6 +14,11 @@ def _wire(monkeypatch, *, installs, records_for, retry, poll):
     # #407: stub the auto-replay to a no-op so reaction-poll tests don't hit
     # GitHub and their exact-result assertions stay about the reaction poll.
     monkeypatch.setattr(poller_handler, "_replay_missed_deliveries", lambda: {})
+    # #472: default the Pulse pass to idle (no enabled repos) so the
+    # reaction-poll assertions stay about the reaction poll.
+    monkeypatch.setattr(
+        "adapters.install_store.list_pulse_enabled_repos", lambda iid: [],
+    )
 
 
 def test_poller_polls_each_allowlisted_install(monkeypatch):
