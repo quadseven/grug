@@ -32,6 +32,13 @@ DispatchStyle = Literal["inline", "async"]
 #   "disabled" — treat as off (Elder's choice: never run an LLM review blind).
 MissingRepoPolicy = Literal["enabled", "disabled"]
 
+# The PR-update actions Chief/Elder/Guard dispatch on - the historical
+# hand-wired set (moved here from the dispatcher gate with #471, which
+# added the first non-update action, "closed").
+PR_UPDATE_ACTIONS: tuple[str, ...] = (
+    "opened", "edited", "synchronize", "ready_for_review", "reopened",
+)
+
 
 @dataclass(frozen=True, slots=True)
 class PersonaSpec:
@@ -56,6 +63,12 @@ class PersonaSpec:
     missing_repo_policy: MissingRepoPolicy
     events: tuple[str, ...]
     dispatch_module: str
+    # Which pull_request ACTIONS the persona dispatches on. Defaults to the
+    # PR-update set the original three personas share; Warder (#471) is the
+    # first off it (merged-PR = action "closed" + merged flag, checked in
+    # its own dispatch). Filtered BEFORE enablement in the loop, so a
+    # non-matching action costs no store read.
+    actions: tuple[str, ...] = PR_UPDATE_ACTIONS
 
     def __post_init__(self) -> None:
         # The store's is_persona_enabled derives its lookup key as
@@ -150,6 +163,37 @@ REGISTRY: tuple[PersonaSpec, ...] = (
         missing_repo_policy="disabled",
         events=("pull_request",),
         dispatch_module="personas.guard.webhook_dispatch",
+    ),
+    PersonaSpec(
+        key="warder",
+        canonical="warder",
+        check_run_name="Grug — Warder",
+        enabled_flag="warder_enabled",
+        enabled_default=False,  # tracer: opt-in per repo (#471)
+        blocking_flag=None,
+        blocking_default=False,
+        dispatch_style="inline",
+        missing_repo_policy="disabled",
+        events=("pull_request",),
+        dispatch_module="personas.warder.webhook_dispatch",
+        actions=("closed",),  # merged-PR seam; merged flag checked in-module
+    ),
+    PersonaSpec(
+        key="pulse",
+        canonical="pulse",
+        check_run_name="Grug — Pulse",
+        enabled_flag="pulse_enabled",
+        enabled_default=False,  # tracer: opt-in per repo (#472)
+        blocking_flag=None,
+        blocking_default=False,
+        dispatch_style="inline",
+        missing_repo_policy="disabled",
+        # SCHEDULED persona: no webhook events - runs on the poller
+        # cadence (personas/pulse/nudge.py). The registry entry gives it
+        # the store flags + roster identity; the dispatch loop skips it.
+        events=(),
+        dispatch_module="personas.pulse.nudge",
+        actions=(),
     ),
 )
 

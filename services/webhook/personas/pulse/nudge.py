@@ -1,0 +1,151 @@
+# MIRRORED — sibling at services/api/personas/pulse/nudge.py; keep in lockstep. See docs/adr/0001-mirror-with-rule-of-three-deferral.md.
+"""Pulse persona (#472, epic #464 slice 8) - the stuck-PR nudge TRACER,
+the first SCHEDULED (non-webhook) persona.
+
+Runs inside the existing grug-poller CronJob cadence (its own pass,
+gated independently): for each pulse-enabled repo of an allowlisted
+install, find open PRs with no update for `_STALE_DAYS` whose Grug DoR
+check is green, and post ONE caveman-voiced nudge comment per PR per
+`_NUDGE_TTL_DAYS` (idempotent via a store claim). Hard-capped per
+install per run so a backlog can't blow the CronJob budget.
+
+Default OFF per repo (`pulse_enabled`). Best-effort everywhere: one
+repo's failure logs and continues.
+"""
+
+from __future__ import annotations
+
+import logging
+import os
+from datetime import datetime, timedelta, timezone
+from typing import Any
+from urllib.parse import quote
+
+import httpx
+
+from activity_log import record_check_verdict
+from adapters.install_store import claim_pulse_nudge, get_repo_config
+
+log = logging.getLogger(f"{os.getenv('DD_SERVICE', 'grug')}.persona.pulse")
+
+_STALE_DAYS = 7
+_NUDGE_TTL_DAYS = 7  # at most one nudge per PR per week (store-claimed)
+_MAX_NUDGES_PER_INSTALL_RUN = 3
+_MAX_REPOS_PER_INSTALL = 30
+_MAX_PRS_PER_REPO = 30
+_FETCH_TIMEOUT = 10
+_DOR_CHECK_NAME = "Grug — Definition of Ready"
+
+_NUDGE_BODY = (
+    "Grug Pulse see this PR sleep {days} sunrises. Plan is ready (Chief "
+    "nod long ago) but no grug touch it. Tribe forget? If hunt is dead, "
+    "close it - open trails confuse the tribe.\n\n"
+    "<!-- grug-pulse-nudge -->"
+)
+
+
+def _headers(token: str) -> dict[str, str]:
+    return {
+        "Authorization": f"Bearer {token}",
+        "Accept": "application/vnd.github+json",
+        "X-GitHub-Api-Version": "2022-11-28",
+    }
+
+
+def _stale_prs(token: str, owner: str, repo: str) -> list[dict[str, Any]]:
+    """Open PRs untouched for _STALE_DAYS, oldest-updated first."""
+    resp = httpx.get(
+        f"https://api.github.com/repos/{quote(owner, safe='')}/{quote(repo, safe='')}/pulls",
+        params={"state": "open", "sort": "updated", "direction": "asc",
+                "per_page": _MAX_PRS_PER_REPO},
+        headers=_headers(token), timeout=_FETCH_TIMEOUT,
+    )
+    resp.raise_for_status()
+    cutoff = datetime.now(timezone.utc) - timedelta(days=_STALE_DAYS)
+    out = []
+    for pr in resp.json() or []:
+        updated = pr.get("updated_at", "")
+        try:
+            if datetime.fromisoformat(updated.replace("Z", "+00:00")) < cutoff:
+                out.append(pr)
+        except ValueError:
+            continue
+    return out
+
+
+def _dor_green(token: str, owner: str, repo: str, head_sha: str) -> bool:
+    """Only nudge PRs whose plan is READY (Chief's check green) - a
+    failing-DoR PR has a different problem than staleness."""
+    resp = httpx.get(
+        f"https://api.github.com/repos/{quote(owner, safe='')}/{quote(repo, safe='')}/commits/{head_sha}/check-runs",
+        params={"per_page": 50}, headers=_headers(token), timeout=_FETCH_TIMEOUT,
+    )
+    resp.raise_for_status()
+    for run in (resp.json() or {}).get("check_runs", []):
+        if run.get("name") == _DOR_CHECK_NAME:
+            return run.get("conclusion") == "success"
+    return False
+
+
+def run_pulse_for_install(
+    token: str, install_id: int, repos: list[dict[str, Any]],
+) -> int:
+    """One Pulse pass for one install. `repos` = the install's repo list
+    (id + full_name), fetched by the caller (the poller already holds a
+    token). Returns nudges posted. Never raises past a repo."""
+    nudged = 0
+    for repo in repos[:_MAX_REPOS_PER_INSTALL]:
+        if nudged >= _MAX_NUDGES_PER_INSTALL_RUN:
+            break
+        repo_id = repo.get("id")
+        full = repo.get("full_name", "")
+        owner, _, name = full.partition("/")
+        if not (repo_id and owner and name):
+            continue
+        try:
+            if not get_repo_config(install_id, int(repo_id)).get("pulse_enabled", False):
+                continue
+            for pr in _stale_prs(token, owner, name):
+                if nudged >= _MAX_NUDGES_PER_INSTALL_RUN:
+                    break
+                pr_number = int(pr["number"])
+                head_sha = ((pr.get("head") or {}).get("sha")) or ""
+                if not head_sha or not _dor_green(token, owner, name, head_sha):
+                    continue
+                # Win-once per (install, repo, pr) per TTL window - a
+                # lost claim means a nudge inside the window already
+                # happened (or a concurrent poller run won it).
+                if not claim_pulse_nudge(install_id, full, pr_number):
+                    continue
+                resp = httpx.post(
+                    f"https://api.github.com/repos/{quote(owner, safe='')}/{quote(name, safe='')}/issues/{pr_number}/comments",
+                    json={"body": _NUDGE_BODY.format(days=_STALE_DAYS)},
+                    headers=_headers(token), timeout=_FETCH_TIMEOUT,
+                )
+                resp.raise_for_status()
+                nudged += 1
+                log.info(
+                    "pulse_nudged",
+                    extra={"install_id": install_id, "repo": full, "pr": pr_number},
+                )
+                # Honest Activity row (ADR-0003): a nudge is a completed
+                # advisory action, not a review - neutral, zero findings.
+                record_check_verdict(
+                    install_id=install_id,
+                    persona_key="pulse",
+                    repo=full,
+                    pr_number=pr_number,
+                    head_sha=head_sha,
+                    conclusion="neutral",
+                    summary=f"Pulse nudge - PR quiet {_STALE_DAYS}+ days",
+                    findings_count=0,
+                    blocking=False,
+                    degraded_reason=None,
+                )
+        except (httpx.HTTPStatusError, httpx.RequestError) as e:
+            # One repo's API failure must not stop the pass.
+            log.warning(
+                "pulse_repo_failed",
+                extra={"install_id": install_id, "repo": full, "kind": type(e).__name__},
+            )
+    return nudged

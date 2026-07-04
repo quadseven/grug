@@ -193,6 +193,8 @@ _DEFAULT_PERSONA_CONFIG = {
     "code_reviewer_blocking": False,
     "guard_enabled": True,
     "guard_blocking": False,
+    "warder_enabled": False,
+    "pulse_enabled": False,
 }
 
 
@@ -549,6 +551,39 @@ def claim_delivery(delivery_id: str) -> bool:
             """,
             {
                 "pk": _delivery_pk(delivery_id),
+                "data": Jsonb({"ttl": ttl}),
+                "ttl": ttl,
+            },
+        ).fetchone()
+    return row is not None
+
+
+_PULSE_NUDGE_TTL_DAYS = 7
+
+
+def claim_pulse_nudge(install_id: int, repo: str, pr_number: int) -> bool:
+    """Win-once claim for a Pulse stuck-PR nudge (#472): True = nudge now;
+    False = a nudge inside the TTL window already happened (or a
+    concurrent poller run won). Same atomic upsert-if-expired shape as
+    claim_delivery. Best-effort caller: any DB error propagates."""
+    pg_base.maybe_purge_expired()
+    ttl = int(
+        datetime.now(timezone.utc).timestamp() + _PULSE_NUDGE_TTL_DAYS * 86400
+    )
+    with get_pool().connection() as conn:
+        row = conn.execute(
+            """
+            INSERT INTO grug_kv (pk, sk, data, ttl)
+            VALUES (%(pk)s, %(sk)s, %(data)s, %(ttl)s)
+            ON CONFLICT (pk, sk) DO UPDATE
+                SET data = %(data)s, ttl = %(ttl)s
+                WHERE grug_kv.ttl IS NOT NULL
+                  AND grug_kv.ttl <= EXTRACT(EPOCH FROM now())
+            RETURNING pk
+            """,
+            {
+                "pk": _inst_pk(install_id),
+                "sk": f"PULSE#{repo}#{pr_number}",
                 "data": Jsonb({"ttl": ttl}),
                 "ttl": ttl,
             },

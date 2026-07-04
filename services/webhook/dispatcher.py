@@ -225,7 +225,10 @@ def _handle_pull_request(
     optional list-shaped `.get("personas")`. Honest `dict[str, Any]`
     over the prior `dict[str, str]` + `# type: ignore`."""
     action = payload.get("action", "")
-    if action not in {"opened", "edited", "synchronize", "ready_for_review", "reopened"}:
+    # The union of every registered persona's actions ("closed" joined via
+    # Warder, #471). Per-persona filtering happens in the loop; anything
+    # outside the union no_ops early exactly as before.
+    if not any(action in spec.actions for spec in persona_registry.REGISTRY):
         return {"status": "no_op", "reason": f"pull_request action={action} not gated"}
 
     pr = payload.get("pull_request") or {}
@@ -286,6 +289,10 @@ def _handle_pull_request(
     async_handoff_error: Exception | None = None
     for spec in persona_registry.REGISTRY:
         if "pull_request" not in spec.events:
+            continue
+        if action not in spec.actions:
+            # e.g. Warder only wakes on "closed"; the update personas
+            # don't. Silent skip - costs no store read, not a disable.
             continue
 
         if repo_id is None:

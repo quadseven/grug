@@ -10,7 +10,7 @@ from personas import registry
 
 def test_registered_personas():
     keys = {p.key for p in registry.REGISTRY}
-    assert keys == {"tpm", "code_reviewer", "guard"}
+    assert keys == {"tpm", "code_reviewer", "guard", "warder", "pulse"}
 
 
 def test_canonical_names_match_adr_0002():
@@ -101,6 +101,9 @@ def test_every_dispatch_module_imports_and_exposes_entrypoint():
 
     for p in registry.REGISTRY:
         mod = importlib.import_module(p.dispatch_module)
-        assert callable(getattr(mod, "dispatch_pull_request", None)), (
-            f"{p.dispatch_module} must expose dispatch_pull_request(ctx)"
-        )
+        if "pull_request" in p.events:
+            assert callable(getattr(mod, "dispatch_pull_request", None)), (
+                f"{p.dispatch_module} must expose dispatch_pull_request(ctx)"
+            )
+        # Scheduled personas (Pulse) still must IMPORT - a typo'd module
+        # path fails here, not on the first cron tick.
