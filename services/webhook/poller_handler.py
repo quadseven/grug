@@ -109,25 +109,20 @@ def handler(event: dict[str, Any], context: Any) -> dict[str, int | str]:
     nudges = 0
     for install_id in installs:
         try:
+            from adapters.install_store import list_pulse_enabled_repos
             from personas.pulse.nudge import run_pulse_for_install
 
-            def _pulse(token: str, iid: int = install_id) -> int:
-                import httpx as _httpx
-
-                resp = _httpx.get(
-                    "https://api.github.com/installation/repositories",
-                    params={"per_page": 100},
-                    headers={
-                        "Authorization": f"Bearer {token}",
-                        "Accept": "application/vnd.github+json",
-                    },
-                    timeout=10,
-                )
-                resp.raise_for_status()
-                repos = (resp.json() or {}).get("repositories", [])
-                return run_pulse_for_install(token, iid, repos)
-
-            nudges += with_install_token_retry(install_id, _pulse) or 0
+            # Store-driven targeting (codex PR #489): only repos the
+            # operator ENABLED - no /installation/repositories paging, so
+            # a large install can never starve an enabled repo behind a
+            # discovery-page prefix, and idle ticks cost zero GH calls.
+            repos = list_pulse_enabled_repos(install_id)
+            if not repos:
+                continue
+            nudges += with_install_token_retry(
+                install_id,
+                lambda token, iid=install_id, r=repos: run_pulse_for_install(token, iid, r),
+            ) or 0
         except Exception as e:  # noqa: BLE001 — one install must not abort the cron
             log.warning(
                 "pulse_install_failed",

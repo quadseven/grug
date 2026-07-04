@@ -73,6 +73,22 @@ def _stale_prs(token: str, owner: str, repo: str) -> list[dict[str, Any]]:
     return out
 
 
+def _recent_nudge_exists(token: str, owner: str, repo: str, pr_number: int) -> bool:
+    """A pulse-nudge marker comment inside the TTL window already exists
+    (codex PR #489): the write-verification that makes retries safe after
+    an AMBIGUOUS failure (timeout after GitHub accepted the write)."""
+    since = (datetime.now(timezone.utc) - timedelta(days=_NUDGE_TTL_DAYS)).strftime(
+        "%Y-%m-%dT%H:%M:%SZ"
+    )
+    resp = httpx.get(
+        f"https://api.github.com/repos/{quote(owner, safe='')}/{quote(repo, safe='')}/issues/{pr_number}/comments",
+        params={"since": since, "per_page": 100},
+        headers=_headers(token), timeout=_FETCH_TIMEOUT,
+    )
+    resp.raise_for_status()
+    return any("grug-pulse-nudge" in (c.get("body") or "") for c in resp.json() or [])
+
+
 def _dor_green(token: str, owner: str, repo: str, head_sha: str) -> bool:
     """Only nudge PRs whose plan is READY (Chief's check green) - a
     failing-DoR PR has a different problem than staleness."""
@@ -117,6 +133,11 @@ def run_pulse_for_install(
                 # happened (or a concurrent poller run won it).
                 if not claim_pulse_nudge(install_id, full, pr_number):
                     continue
+                # Write-verification BEFORE posting (codex PR #489): a
+                # marker comment inside the window means a prior tick's
+                # ambiguous failure actually landed - never double-post.
+                if _recent_nudge_exists(token, owner, name, pr_number):
+                    continue
                 try:
                     resp = httpx.post(
                         f"https://api.github.com/repos/{quote(owner, safe='')}/{quote(name, safe='')}/issues/{pr_number}/comments",
@@ -124,11 +145,21 @@ def run_pulse_for_install(
                         headers=_headers(token), timeout=_FETCH_TIMEOUT,
                     )
                     resp.raise_for_status()
-                except (httpx.HTTPStatusError, httpx.RequestError):
-                    # The claim must represent a COMPLETED nudge (codex
-                    # PR #489): release it so the next cron tick retries
-                    # instead of silently burning the weekly slot.
-                    release_pulse_nudge(install_id, full, pr_number)
+                except httpx.HTTPStatusError as e:
+                    if 400 <= e.response.status_code < 500:
+                        # DEFINITE no-write (4xx): release so the next
+                        # tick retries - the claim represents a
+                        # COMPLETED nudge, never a failed attempt.
+                        release_pulse_nudge(install_id, full, pr_number)
+                    # 5xx = ambiguous (the write may have landed): keep
+                    # the claim; the marker pre-check above makes a
+                    # future retry safe either way.
+                    raise
+                except httpx.RequestError:
+                    # Ambiguous transport outcome (timeout after accept
+                    # is possible): keep the claim - a missed nudge
+                    # beats duplicate spam; the marker pre-check governs
+                    # any later retry.
                     raise
                 nudged += 1
                 log.info(

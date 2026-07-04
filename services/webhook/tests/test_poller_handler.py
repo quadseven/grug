@@ -89,11 +89,14 @@ def test_poller_records_listing_failure_is_best_effort(monkeypatch):
 
 
 def test_poller_skips_installs_with_no_records(monkeypatch):
-    """An install with no CommentRecords skips the REACTIONS poll (no
-    records fetched, nothing submitted). The Pulse pass (#472) still
-    acquires a token for the install - it deliberately runs its OWN loop
-    so record-less installs get their stale-PR sweep."""
+    """An install with no CommentRecords skips the REACTIONS poll, and
+    with no pulse-enabled repos (store-driven targeting, #472/PR #489)
+    the Pulse pass costs no token either - a fully idle install makes
+    zero GitHub calls."""
     touched = []
+    monkeypatch.setattr(
+        "adapters.install_store.list_pulse_enabled_repos", lambda iid: [],
+    )
     _wire(
         monkeypatch,
         installs=[7],
@@ -102,7 +105,7 @@ def test_poller_skips_installs_with_no_records(monkeypatch):
         poll=lambda *a, **k: 0,
     )
     out = poller_handler.handler({}, None)
-    assert touched == [7]  # the Pulse pass, not the reactions poll
+    assert touched == []
     assert out == {"installs": 1, "records": 0, "submitted": 0, "failed_installs": 0, "pulse_nudges": 0}
 
 

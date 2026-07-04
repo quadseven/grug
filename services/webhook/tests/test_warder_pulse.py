@@ -149,6 +149,7 @@ def _pr(number, updated_at, sha="s"):
 
 def test_pulse_nudges_stale_green_pr_once(monkeypatch):
     stale = _pr(1, "2020-01-01T00:00:00Z")
+    monkeypatch.setattr(pulse, "_recent_nudge_exists", lambda t, o, r, p: False)
     monkeypatch.setattr(pulse, "get_repo_config", lambda i, r: {"pulse_enabled": True})
     monkeypatch.setattr(pulse, "_stale_prs", lambda t, o, r: [stale])
     monkeypatch.setattr(pulse, "_dor_green", lambda t, o, r, s: True)
@@ -195,6 +196,7 @@ def test_pulse_disabled_repo_costs_no_github_calls(monkeypatch):
 
 
 def test_pulse_respects_per_install_cap(monkeypatch):
+    monkeypatch.setattr(pulse, "_recent_nudge_exists", lambda t, o, r, p: False)
     monkeypatch.setattr(pulse, "get_repo_config", lambda i, r: {"pulse_enabled": True})
     many = [_pr(i, "2020-01-01T00:00:00Z") for i in range(10)]
     monkeypatch.setattr(pulse, "_stale_prs", lambda t, o, r: many)
@@ -239,26 +241,58 @@ def test_warder_only_wakes_on_closed_action():
     assert registry.by_key("tpm").actions == registry.PR_UPDATE_ACTIONS
 
 
-def test_pulse_post_failure_releases_claim_for_retry(monkeypatch):
-    """Codex PR #489: a claim must represent a COMPLETED nudge. If the
-    comment POST fails after the claim, the claim is released so the
-    next cron tick retries - a transient GitHub blip must not burn the
-    weekly slot."""
+def _wire_pulse_happy(monkeypatch, released):
     monkeypatch.setattr(pulse, "get_repo_config", lambda i, r: {"pulse_enabled": True})
     monkeypatch.setattr(pulse, "_stale_prs", lambda t, o, r: [_pr(1, "2020-01-01T00:00:00Z")])
     monkeypatch.setattr(pulse, "_dor_green", lambda t, o, r, s: True)
+    monkeypatch.setattr(pulse, "_recent_nudge_exists", lambda t, o, r, p: False)
     monkeypatch.setattr(pulse, "claim_pulse_nudge", lambda i, repo, pr: True)
-    released = []
     monkeypatch.setattr(
         pulse, "release_pulse_nudge",
         lambda i, repo, pr: released.append((repo, pr)),
     )
+
+
+def test_pulse_definite_post_failure_releases_claim(monkeypatch):
+    """Codex PR #489 r2: a DEFINITE no-write (4xx) releases the claim so
+    the next cron tick retries."""
+    released: list = []
+    _wire_pulse_happy(monkeypatch, released)
+    resp404 = httpx.Response(404, request=httpx.Request("POST", "https://x"))
+    monkeypatch.setattr(
+        pulse.httpx, "post",
+        lambda url, **kw: (_ for _ in ()).throw(
+            httpx.HTTPStatusError("404", request=resp404.request, response=resp404)
+        ),
+    )
+    assert pulse.run_pulse_for_install("tok", 1, [{"id": 9, "full_name": "o/r"}]) == 0
+    assert released == [("o/r", 1)]
+
+
+def test_pulse_ambiguous_failure_keeps_claim_no_spam(monkeypatch):
+    """Codex PR #489 r2: a transport failure is AMBIGUOUS (the write may
+    have landed) - keep the claim; a missed nudge beats duplicate spam."""
+    released: list = []
+    _wire_pulse_happy(monkeypatch, released)
     monkeypatch.setattr(
         pulse.httpx, "post",
         lambda url, **kw: (_ for _ in ()).throw(
             httpx.ConnectTimeout("gh down", request=None)
         ),
     )
-    n = pulse.run_pulse_for_install("tok", 1, [{"id": 9, "full_name": "o/r"}])
-    assert n == 0
-    assert released == [("o/r", 1)]
+    assert pulse.run_pulse_for_install("tok", 1, [{"id": 9, "full_name": "o/r"}]) == 0
+    assert released == []
+
+
+def test_pulse_marker_precheck_skips_existing_nudge(monkeypatch):
+    """Codex PR #489 r2: write-verification - a marker comment already
+    inside the window (a prior ambiguous failure that actually landed)
+    means SKIP, never double-post."""
+    released: list = []
+    _wire_pulse_happy(monkeypatch, released)
+    monkeypatch.setattr(pulse, "_recent_nudge_exists", lambda t, o, r, p: True)
+    monkeypatch.setattr(
+        pulse.httpx, "post",
+        lambda url, **kw: (_ for _ in ()).throw(AssertionError("no POST expected")),
+    )
+    assert pulse.run_pulse_for_install("tok", 1, [{"id": 9, "full_name": "o/r"}]) == 0
