@@ -362,7 +362,7 @@ import httpx  # noqa: E402
 from unittest.mock import MagicMock  # noqa: E402
 
 from llm_client import Backend, LlmReviewResponse  # noqa: E402
-from personas.code_reviewer import dispatch as cr_dispatch  # noqa: E402
+from personas.guard import dispatch as guard_dispatch  # noqa: E402  — security dispatch moved to Guard (#466)
 
 _SECRET_DIFF = (
     "diff --git a/auth.py b/auth.py\n--- a/auth.py\n+++ b/auth.py\n"
@@ -385,19 +385,15 @@ def test_dispatch_publishes_kept_sast_finding_and_drives_verdict(monkeypatch):
     existing check-run + inline-review path; in blocking mode the high-severity
     SAST finding drives the verdict to failure. The Elder LLM review is clean
     (no findings) so the published finding is purely the SAST tracer's."""
-    monkeypatch.setattr(cr_dispatch, "with_install_token_retry", lambda iid, fn: fn("tok"))
-    monkeypatch.setattr(
-        cr_dispatch, "review_diff",
-        lambda *a, **kw: LlmReviewResponse(kind="reviewed", findings=(), backend_used=Backend.POOLSIDE, model_name="laguna"),
-    )
+    monkeypatch.setattr(guard_dispatch, "with_install_token_retry", lambda iid, fn: fn("tok"))
     # The exploitability judge KEEPS the candidate.
     monkeypatch.setattr(
         "personas.code_reviewer.sast.judge_findings",
         lambda *a, **kw: (FindingJudgement(finding_index=0, is_real_bug=True, reasoning="real secret reaches the log sink"),),
     )
     posted_check, posted_review = [], []
-    monkeypatch.setattr(cr_dispatch, "post_check_run", lambda t, o, r, result, external_id=None: posted_check.append(result) or {"id": 1})
-    monkeypatch.setattr(cr_dispatch, "post_review", lambda t, o, r, *, pull_number, result: posted_review.append(result) or {"id": 2})
+    monkeypatch.setattr(guard_dispatch, "post_check_run", lambda t, o, r, result, external_id=None: posted_check.append(result) or {"id": 1})
+    monkeypatch.setattr(guard_dispatch, "post_review", lambda t, o, r, *, pull_number, result: posted_review.append(result) or {"id": 2})
 
     payload = {
         "action": "opened", "installation": {"id": 11},
@@ -405,9 +401,9 @@ def test_dispatch_publishes_kept_sast_finding_and_drives_verdict(monkeypatch):
         "pull_request": {"number": 7, "head": {"sha": "abcd1234"}},
     }
     with patch("httpx.get", return_value=_diff_resp()):
-        out = cr_dispatch.dispatch_code_review(payload, blocking=True)
+        out = guard_dispatch.dispatch_guard_review(payload, blocking=True)
 
-    assert out["persona"] == "code_reviewer"
+    assert out["persona"] == "guard"
     # The SAST finding reached the inline review on the real line.
     assert len(posted_review) == 1
     inline = posted_review[0].comments
@@ -419,18 +415,14 @@ def test_dispatch_publishes_kept_sast_finding_and_drives_verdict(monkeypatch):
 def test_dispatch_suppressed_sast_finding_not_published(monkeypatch):
     """#400 AC2: the #391-shape candidate the judge SUPPRESSES is NOT published
     (no inline comment, verdict stays clean)."""
-    monkeypatch.setattr(cr_dispatch, "with_install_token_retry", lambda iid, fn: fn("tok"))
-    monkeypatch.setattr(
-        cr_dispatch, "review_diff",
-        lambda *a, **kw: LlmReviewResponse(kind="reviewed", findings=(), backend_used=Backend.POOLSIDE, model_name="laguna"),
-    )
+    monkeypatch.setattr(guard_dispatch, "with_install_token_retry", lambda iid, fn: fn("tok"))
     monkeypatch.setattr(
         "personas.code_reviewer.sast.judge_findings",
         lambda *a, **kw: (FindingJudgement(finding_index=0, is_real_bug=False, reasoning="public param name, not a secret value"),),
     )
     posted_check, posted_review = [], []
-    monkeypatch.setattr(cr_dispatch, "post_check_run", lambda t, o, r, result, external_id=None: posted_check.append(result) or {"id": 1})
-    monkeypatch.setattr(cr_dispatch, "post_review", lambda t, o, r, *, pull_number, result: posted_review.append(result) or {"id": 2})
+    monkeypatch.setattr(guard_dispatch, "post_check_run", lambda t, o, r, result, external_id=None: posted_check.append(result) or {"id": 1})
+    monkeypatch.setattr(guard_dispatch, "post_review", lambda t, o, r, *, pull_number, result: posted_review.append(result) or {"id": 2})
 
     payload = {
         "action": "opened", "installation": {"id": 11},
@@ -438,7 +430,7 @@ def test_dispatch_suppressed_sast_finding_not_published(monkeypatch):
         "pull_request": {"number": 7, "head": {"sha": "abcd1234"}},
     }
     with patch("httpx.get", return_value=_diff_resp()):
-        cr_dispatch.dispatch_code_review(payload, blocking=True)
+        guard_dispatch.dispatch_guard_review(payload, blocking=True)
 
     # No SAST inline comment, verdict not driven to failure by SAST.
     if posted_review:

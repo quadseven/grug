@@ -55,9 +55,15 @@ class RepoConfigPayload(BaseModel):
     `extra='forbid'` catches SPA typos (e.g. `tmp_enabled=true`) at
     request-validation time so they 422 rather than silently dropping
     the toggle. type-design-analyzer P3.
+
+    Guard flags (#466) are OPTIONAL (None = leave stored value alone -
+    the store's sparse-merge semantics), so the existing SPA payload
+    that sends only `tpm_enabled` keeps working unchanged.
     """
     model_config = ConfigDict(extra="forbid")
     tpm_enabled: bool = Field(default=True)
+    guard_enabled: bool | None = Field(default=None)
+    guard_blocking: bool | None = Field(default=None)
 
 
 class RerunRequest(BaseModel):
@@ -67,7 +73,7 @@ class RerunRequest(BaseModel):
     model_config = ConfigDict(extra="forbid")
     repo: str = Field(pattern=r"^[^/\s]+/[^/\s]+$")  # owner/name
     pr_number: int
-    persona: str = Field(pattern=r"^(elder|code_reviewer|chief|tpm)$")
+    persona: str = Field(pattern=r"^(elder|code_reviewer|chief|tpm|guard)$")
 
 
 def _ensure_can_access(install: dict[str, Any], user: UserIdentity) -> None:
@@ -427,6 +433,8 @@ def update_repo_config(
         install_id=install_id, repo_id=repo_id,
         repo_full_name=full_name, tpm_enabled=body.tpm_enabled,
         updated_by_user_id=user.github_user_id,
+        guard_enabled=body.guard_enabled,
+        guard_blocking=body.guard_blocking,
     )
     log.info(
         "repo_config_updated",

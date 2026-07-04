@@ -33,10 +33,11 @@ from typing import Any
 log = logging.getLogger(f"{os.getenv('DD_SERVICE', 'grug')}.async_dispatch")
 
 # Sentinel marking an async job. Routing keys on `event.get("grug_async_job")`
-# truthiness; the value names the job kind so a future second async job type
-# can fan out from one router.
+# truthiness; the value names the job kind so job types can fan out from one
+# router. Guard (#466) is the second async job type the sentinel anticipated.
 ASYNC_JOB_KEY = "grug_async_job"
 ELDER_REVIEW_JOB = "elder_review"
+GUARD_REVIEW_JOB = "guard_review"
 
 
 def _slim_payload(payload: dict[str, Any]) -> dict[str, Any]:
@@ -130,6 +131,127 @@ def _spawn_local_elder(job: dict[str, Any]) -> bool:
             extra={"delivery_id": delivery_id, "kind": type(e).__name__},
         )
         return False
+
+
+def enqueue_guard_review(
+    *,
+    payload: dict[str, Any],
+    delivery_id: str,
+    blocking: bool,
+) -> bool:
+    """Fire-and-forget offload for the Guard security review (#466) -
+    same contract, runtime, and trade-offs as `enqueue_elder_review`
+    (see its docstring): background daemon thread under GRUG_K8S_RUNTIME,
+    False on any failure, NO sync fallback, a dropped scan re-triggers on
+    the next push. Kept as its own function (not a persona-generic one)
+    deliberately: Elder's enqueue is a live patch target and its monitored
+    log names must stay byte-identical; a THIRD async persona triggers the
+    rule-of-three generalization (ADR-0012)."""
+    job = {
+        ASYNC_JOB_KEY: GUARD_REVIEW_JOB,
+        "delivery_id": delivery_id,
+        "blocking": blocking,
+        "payload": _slim_payload(payload),
+    }
+    if os.getenv("GRUG_K8S_RUNTIME"):
+        delivery = str(job.get("delivery_id", ""))
+        try:
+            threading.Thread(
+                target=run_guard_job,
+                args=(job,),
+                name=f"guard-{delivery[:13]}",
+                daemon=True,
+            ).start()
+            return True
+        except Exception as e:  # noqa: BLE001 — best-effort enqueue; never break the ACK
+            log.error(
+                "guard_enqueue_invoke_error",
+                extra={"delivery_id": delivery, "kind": type(e).__name__},
+            )
+            return False
+    log.warning("guard_enqueue_no_runtime", extra={"delivery_id": delivery_id})
+    return False
+
+
+def run_guard_job(event: dict[str, Any]) -> dict[str, str]:
+    """Worker entry for an async Guard security review (#466). Same
+    two-layer idempotency + never-raise contract as `run_elder_job` (see
+    its docstring), with two deliberate differences:
+
+    - The delivery claim key is NAMESPACED (`{delivery_id}:guard`):
+      Elder and Guard both dispatch from the SAME webhook delivery, and
+      `claim_delivery` is keyed on the raw GUID - an unnamespaced claim
+      would let whichever persona ran first mark the delivery consumed
+      and silently skip the other.
+    - Self-recover (#418) enqueues with persona="guard" so the rerun
+      consumer re-drives dispatch_guard_review (codex PR #482: without
+      it, the already-consumed head-SHA claim would suppress the Guard
+      check for that SHA until a new push).
+    """
+    delivery_id = str(event.get("delivery_id", ""))
+    try:
+        from adapters.install_store import claim_delivery
+
+        if not claim_delivery(f"{delivery_id}:guard"):
+            log.info("guard_job_duplicate_skipped", extra={"delivery_id": delivery_id})
+            return {"status": "skipped", "reason": "duplicate_delivery"}
+    except Exception as e:  # noqa: BLE001 — claim is best-effort; degrade to running
+        log.warning(
+            "guard_job_claim_failed_running_anyway",
+            extra={"delivery_id": delivery_id, "kind": type(e).__name__},
+        )
+
+    payload = event.get("payload") or {}
+    try:
+        from adapters.install_store import claim_review
+
+        install_id, repo, pr_number = _pr_ids(payload)
+        head_sha = ((payload.get("pull_request") or {}).get("head") or {}).get("sha")
+        if install_id and repo and pr_number and head_sha:
+            if not claim_review(
+                install_id=install_id,
+                repo=repo,
+                pr_number=pr_number,
+                persona="guard",
+                head_sha=head_sha,
+            ):
+                log.info(
+                    "guard_job_duplicate_sha_skipped",
+                    extra={
+                        "delivery_id": delivery_id, "repo": repo,
+                        "pr": pr_number, "head_sha": head_sha,
+                    },
+                )
+                return {"status": "skipped", "reason": "duplicate_head_sha"}
+    except Exception as e:  # noqa: BLE001 — claim is best-effort; degrade to running
+        log.warning(
+            "guard_job_review_claim_failed_running_anyway",
+            extra={"delivery_id": delivery_id, "kind": type(e).__name__},
+        )
+
+    blocking = bool(event.get("blocking", False))
+    try:
+        from personas.guard.dispatch import dispatch_guard_review
+
+        result = dispatch_guard_review(payload, blocking=blocking)
+        log.info(
+            "guard_job_done",
+            extra={"delivery_id": delivery_id, **result},
+        )
+        return result
+    except Exception as e:  # noqa: BLE001 — never retry-storm; degrade contract owns this
+        log.error(
+            "guard_job_unhandled",
+            extra={"delivery_id": delivery_id, "kind": type(e).__name__},
+            exc_info=True,
+        )
+        # Self-recover (#418, codex PR #482): the head-SHA claim above is
+        # already consumed, so without a durable re-run this SHA's Guard
+        # check would be suppressed until the next push. Same contract as
+        # Elder's recovery: at most one enqueue per drop, SQS redrive owns
+        # retries.
+        _self_recover_review(payload, delivery_id, persona="guard")
+        return {"persona": "guard", "result": "unhandled_error"}
 
 
 def run_elder_job(event: dict[str, Any]) -> dict[str, str]:
@@ -247,7 +369,9 @@ def _pr_ids(payload: dict[str, Any]) -> tuple[int | None, str | None, int | None
     )
 
 
-def _self_recover_review(payload: dict[str, Any], delivery_id: str) -> None:
+def _self_recover_review(
+    payload: dict[str, Any], delivery_id: str, *, persona: str = "elder",
+) -> None:
     """Enqueue ONE durable re-run for a dropped Elder review (#418). Bounded:
     enqueues at most once per drop - the rerun CONSUMER retries via SQS redrive,
     never re-enqueues (it calls dispatch_code_review directly, not run_elder_job),
@@ -263,7 +387,7 @@ def _self_recover_review(payload: dict[str, Any], delivery_id: str) -> None:
         from rerun import enqueue_rerun
 
         enqueue_rerun(
-            install_id=install_id, repo=repo, pr_number=pr_number, persona="elder"
+            install_id=install_id, repo=repo, pr_number=pr_number, persona=persona
         )
         log.info(
             "elder_self_recover_enqueued",
