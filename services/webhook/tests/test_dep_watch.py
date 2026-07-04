@@ -90,3 +90,43 @@ def test_lost_claim_writes_nothing(monkeypatch):
     with patch.object(dw, "claim_dep_watch_report", mod_claim):
         assert dw.run_dep_watch_for_install("tok", 1, [{"id": 9, "full_name": "o/r"}]) == 0
     assert writes == []
+
+
+def test_definite_write_failure_releases_claim(monkeypatch):
+    """Codex PR #492: a 4xx on the report write releases the weekly
+    claim so the next tick retries (claim = FILED report, not attempt)."""
+    monkeypatch.setattr(dw, "get_repo_config", lambda i, r: {"dep_watch_enabled": True})
+    monkeypatch.setattr(dw, "_fetch_manifest",
+                        lambda t, o, r, p: "requests==2.19.0\n" if p == "requirements.txt" else None)
+    monkeypatch.setattr(dw, "_audit", lambda deps: {("requests", "2.19.0"): ["GHSA-x"]})
+    monkeypatch.setattr(dw, "_existing_report", lambda t, o, r: None)
+    monkeypatch.setattr(dw, "claim_dep_watch_report", lambda i, r: True)
+    released = []
+    monkeypatch.setattr(dw, "release_dep_watch_report",
+                        lambda i, r: released.append(r))
+    resp = httpx.Response(422, request=httpx.Request("POST", "https://x"))
+    monkeypatch.setattr(
+        dw.httpx, "post",
+        lambda url, **kw: (_ for _ in ()).throw(
+            httpx.HTTPStatusError("422", request=resp.request, response=resp)),
+    )
+    assert dw.run_dep_watch_for_install("tok", 1, [{"id": 9, "full_name": "o/r"}]) == 0
+    assert released == ["o/r"]
+
+
+def test_lookup_failure_does_not_burn_claim(monkeypatch):
+    """Codex PR #492 (Pulse r3 lesson): the read-only existing-report
+    lookup runs BEFORE the claim - its failure leaves no claim behind."""
+    monkeypatch.setattr(dw, "get_repo_config", lambda i, r: {"dep_watch_enabled": True})
+    monkeypatch.setattr(dw, "_fetch_manifest",
+                        lambda t, o, r, p: "requests==2.19.0\n" if p == "requirements.txt" else None)
+    monkeypatch.setattr(dw, "_audit", lambda deps: {("requests", "2.19.0"): ["GHSA-x"]})
+    monkeypatch.setattr(
+        dw, "_existing_report",
+        lambda t, o, r: (_ for _ in ()).throw(httpx.ConnectTimeout("gh down", request=None)),
+    )
+    claims = []
+    monkeypatch.setattr(dw, "claim_dep_watch_report",
+                        lambda i, r: claims.append(r) or True)
+    assert dw.run_dep_watch_for_install("tok", 1, [{"id": 9, "full_name": "o/r"}]) == 0
+    assert claims == []  # never claimed - next tick retries freely
