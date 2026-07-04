@@ -14,6 +14,11 @@ def _wire(monkeypatch, *, installs, records_for, retry, poll):
     # #407: stub the auto-replay to a no-op so reaction-poll tests don't hit
     # GitHub and their exact-result assertions stay about the reaction poll.
     monkeypatch.setattr(poller_handler, "_replay_missed_deliveries", lambda: {})
+    # #472: default the Pulse pass to idle (no enabled repos) so the
+    # reaction-poll assertions stay about the reaction poll.
+    monkeypatch.setattr(
+        "adapters.install_store.list_pulse_enabled_repos", lambda iid: [],
+    )
 
 
 def test_poller_polls_each_allowlisted_install(monkeypatch):
@@ -34,7 +39,7 @@ def test_poller_polls_each_allowlisted_install(monkeypatch):
     )
     out = poller_handler.handler({}, None)
     assert polled == [11, 22]
-    assert out == {"installs": 2, "records": 2, "submitted": 4, "failed_installs": 0}
+    assert out == {"installs": 2, "records": 2, "submitted": 4, "failed_installs": 0, "pulse_nudges": 0, "pulse_failed_installs": 0}
 
 
 def test_poller_one_install_failure_does_not_abort_cycle(monkeypatch, caplog):
@@ -89,8 +94,14 @@ def test_poller_records_listing_failure_is_best_effort(monkeypatch):
 
 
 def test_poller_skips_installs_with_no_records(monkeypatch):
-    """An install with no CommentRecords is skipped — no token fetch, no poll."""
+    """An install with no CommentRecords skips the REACTIONS poll, and
+    with no pulse-enabled repos (store-driven targeting, #472/PR #489)
+    the Pulse pass costs no token either - a fully idle install makes
+    zero GitHub calls."""
     touched = []
+    monkeypatch.setattr(
+        "adapters.install_store.list_pulse_enabled_repos", lambda iid: [],
+    )
     _wire(
         monkeypatch,
         installs=[7],
@@ -100,7 +111,7 @@ def test_poller_skips_installs_with_no_records(monkeypatch):
     )
     out = poller_handler.handler({}, None)
     assert touched == []
-    assert out == {"installs": 1, "records": 0, "submitted": 0, "failed_installs": 0}
+    assert out == {"installs": 1, "records": 0, "submitted": 0, "failed_installs": 0, "pulse_nudges": 0, "pulse_failed_installs": 0}
 
 
 # --- #407: auto-replay wiring -----------------------------------------------
@@ -190,7 +201,7 @@ def test_poller_all_installs_fail_logs_error(monkeypatch, caplog):
     )
     with caplog.at_level(_logging.WARNING):
         out = poller_handler.handler({}, None)
-    assert out == {"installs": 2, "records": 2, "submitted": 0, "failed_installs": 2}
+    assert out == {"installs": 2, "records": 2, "submitted": 0, "failed_installs": 2, "pulse_nudges": 0, "pulse_failed_installs": 0}
     errs = [r for r in caplog.records if r.msg == "reaction_poll_all_installs_failed"]
     assert errs and errs[0].levelno == _logging.ERROR
     # a partial failure (not ALL) must NOT escalate to error
@@ -207,4 +218,4 @@ def test_poller_no_installs_is_a_clean_noop(monkeypatch):
         poll=lambda *a, **k: 1,
     )
     out = poller_handler.handler({}, None)
-    assert out == {"installs": 0, "records": 0, "submitted": 0, "failed_installs": 0}
+    assert out == {"installs": 0, "records": 0, "submitted": 0, "failed_installs": 0, "pulse_nudges": 0, "pulse_failed_installs": 0}

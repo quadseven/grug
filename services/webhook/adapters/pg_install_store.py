@@ -193,6 +193,8 @@ _DEFAULT_PERSONA_CONFIG = {
     "code_reviewer_blocking": False,
     "guard_enabled": True,
     "guard_blocking": False,
+    "warder_enabled": False,
+    "pulse_enabled": False,
 }
 
 
@@ -554,6 +556,79 @@ def claim_delivery(delivery_id: str) -> bool:
             },
         ).fetchone()
     return row is not None
+
+
+_PULSE_NUDGE_TTL_DAYS = 7
+
+
+def claim_pulse_nudge(install_id: int, repo: str, pr_number: int) -> bool:
+    """Win-once claim for a Pulse stuck-PR nudge (#472): True = nudge now;
+    False = a nudge inside the TTL window already happened (or a
+    concurrent poller run won). Same atomic upsert-if-expired shape as
+    claim_delivery. Best-effort caller: any DB error propagates."""
+    pg_base.maybe_purge_expired()
+    ttl = int(
+        datetime.now(timezone.utc).timestamp() + _PULSE_NUDGE_TTL_DAYS * 86400
+    )
+    with get_pool().connection() as conn:
+        row = conn.execute(
+            """
+            INSERT INTO grug_kv (pk, sk, data, ttl)
+            VALUES (%(pk)s, %(sk)s, %(data)s, %(ttl)s)
+            ON CONFLICT (pk, sk) DO UPDATE
+                SET data = %(data)s, ttl = %(ttl)s
+                WHERE grug_kv.ttl IS NOT NULL
+                  AND grug_kv.ttl <= EXTRACT(EPOCH FROM now())
+            RETURNING pk
+            """,
+            {
+                "pk": _inst_pk(install_id),
+                "sk": f"PULSE#{repo}#{pr_number}",
+                "data": Jsonb({"ttl": ttl}),
+                "ttl": ttl,
+            },
+        ).fetchone()
+    return row is not None
+
+
+def list_pulse_enabled_repos(install_id: int) -> list[dict[str, Any]]:
+    """Repo rows with pulse_enabled=true for an install (codex PR #489):
+    Pulse targets CONFIGURED repos from the store instead of paginating
+    /installation/repositories - an enabled repo can never be starved by
+    a discovery-page prefix, and idle ticks cost zero GitHub calls.
+    Returns [{"id": repo_id, "full_name": ...}] (the run_pulse shape)."""
+    with get_pool().connection() as conn:
+        rows = conn.execute(
+            f"""
+            SELECT sk, data FROM grug_kv
+            WHERE pk = %s AND sk LIKE 'REPO#%%'
+              AND data->>'pulse_enabled' = 'true' AND {TTL_LIVE}
+            """,
+            (_inst_pk(install_id),),
+        ).fetchall()
+    out: list[dict[str, Any]] = []
+    for sk, data in rows:
+        _, sep, id_str = sk.partition("#")
+        try:
+            rid = int(id_str)
+        except (TypeError, ValueError):
+            continue
+        full = (data or {}).get("repo_full_name", "")
+        if sep and full:
+            out.append({"id": rid, "full_name": full})
+    return out
+
+
+def release_pulse_nudge(install_id: int, repo: str, pr_number: int) -> None:
+    """Release a pulse-nudge claim whose COMMENT POST failed (codex PR
+    #489): the claim must represent a COMPLETED nudge, not an attempt -
+    otherwise a transient GitHub failure silently burns the weekly slot
+    for exactly the stale PR Pulse exists to recover. Best-effort."""
+    with get_pool().connection() as conn:
+        conn.execute(
+            "DELETE FROM grug_kv WHERE pk = %s AND sk = %s",
+            (_inst_pk(install_id), f"PULSE#{repo}#{pr_number}"),
+        )
 
 
 _REVIEW_CLAIM_TTL_DAYS = 30
