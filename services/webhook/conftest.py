@@ -1,8 +1,10 @@
-"""pytest config for services/{api,webhook}/ tests.
+"""pytest bootstrap for this service's tests (ADR-0014).
 
-Adds the parent directory to sys.path so tests can `from hmac_verify
-import ...` without a package install (handler files live alongside the
-tests folder, not under a package).
+Adds the service dir + services/_shared/ to sys.path so tests can
+`from hmac_verify import ...` / `from adapters.install_store import ...`
+without a package install, then loads the SHARED fixture module (fixture
+logic lives once, in services/_shared/grug_shared_conftest.py — conftest
+discovery is directory-bound, so this shim is per-service by necessity).
 """
 
 from __future__ import annotations
@@ -10,21 +12,8 @@ from __future__ import annotations
 import sys
 from pathlib import Path
 
-import pytest
+_HERE = Path(__file__).parent
+sys.path.insert(0, str(_HERE))
+sys.path.insert(1, str(_HERE.parent / "_shared"))
 
-sys.path.insert(0, str(Path(__file__).parent))
-
-
-@pytest.fixture(autouse=True)
-def _cf_auth_bringup_mode(monkeypatch):
-    """Default app-level tests to CF-auth bring-up mode (fail-open).
-
-    CfAuthMiddleware now fail-CLOSES by default (audit #4) when the CF
-    shared secret is unconfigured, so any test that drives the full app via
-    TestClient without configuring the secret would 503 at the boundary even
-    though it is not testing the boundary. This conftest autouse fixture
-    runs BEFORE module-level autouse fixtures, so the cf_auth suites - which
-    delete this flag in their own autouse fixture - still exercise the real
-    fail-closed default.
-    """
-    monkeypatch.setenv("GRUG_CF_AUTH_FAIL_OPEN", "1")
+from grug_shared_conftest import _cf_auth_bringup_mode  # noqa: E402,F401

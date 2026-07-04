@@ -9,14 +9,17 @@ Proves NECESSARY conditions for these bools:
   - `oauth_access_token_required_oauth_refresh_token_optional_per_identity_concepts`
 
 Asserts:
-  1. `services/api/adapters/pg_user_store.py:UserWithTokens` is `@dataclass(frozen=True)`.
+  1. `services/_shared/adapters/pg_user_store.py:UserWithTokens` is `@dataclass(frozen=True)`.
   2. UserWithTokens carries exactly `identity`, `oauth_access_token`, `oauth_refresh_token` fields.
   3. oauth_refresh_token has type `str | None` (optional).
   4. The webhook side (`services/webhook/`) contains NO import / reference to
      `UserWithTokens` — service-scope wall per spec.
-  5. UserWithTokens construction happens ONLY in `services/api/adapters/pg_user_store.py`
-     (search services/api/ non-test files for `UserWithTokens(...)` calls —
+  5. UserWithTokens construction happens ONLY in
+     `services/_shared/adapters/pg_user_store.py` (search services/api/ AND
+     services/_shared/ non-test files for `UserWithTokens(...)` calls —
      there should be exactly one site, in get_user_with_tokens).
+  6. Missing api/webhook/_shared trees are FAILURES, not skips (a rename
+     must not silently evaporate a wall).
 """
 from __future__ import annotations
 
@@ -28,9 +31,13 @@ REPO_ROOT = Path(__file__).resolve().parents[2]
 # Post-swap (#354): pg_user_store.py IS the user store; user_store.py is
 # a re-export facade with no class definitions. The shape + construction
 # walls apply to the canonical file only.
-USER_STORE = REPO_ROOT / "services/api/adapters/pg_user_store.py"
+USER_STORE = REPO_ROOT / "services/_shared/adapters/pg_user_store.py"
 WEBHOOK_DIR = REPO_ROOT / "services/webhook"
 API_DIR = REPO_ROOT / "services/api"
+# Post-#77 the user store lives in services/_shared/ (package-integrity,
+# ADR-0014) - the construction wall must scan the shared tree too, or a
+# rogue construction site in another shared module would escape it.
+SHARED_DIR = REPO_ROOT / "services/_shared"
 
 EXPECTED_FIELDS: frozenset[str] = frozenset({
     "identity", "oauth_access_token", "oauth_refresh_token",
@@ -132,7 +139,12 @@ def main() -> int:
             failures.append(f"{store_path.name}: UserWithTokens.oauth_refresh_token must be `str | None` (provider may not rotate). Got non-Optional annotation.")
 
     # Service-scope wall: webhook never references UserWithTokens.
-    if WEBHOOK_DIR.exists():
+    # A missing tree is a FAIL, not a skip - an `if exists()` gate here
+    # would let a rename/move silently evaporate the wall (the vacuous-pass
+    # class attest_mirror_policy_consistency.py is hardened against).
+    if not WEBHOOK_DIR.exists():
+        failures.append(f"{WEBHOOK_DIR.relative_to(REPO_ROOT)} missing — wall scan cannot run")
+    else:
         webhook_hits = _files_referencing("UserWithTokens", WEBHOOK_DIR)
         if webhook_hits:
             failures.append(
@@ -143,9 +155,13 @@ def main() -> int:
     # Construction-site uniqueness: only get_user_with_tokens should call UserWithTokens(...).
     # We allow references in tests + the dataclass def itself; flag any non-test, non-user_store
     # construction site.
-    if API_DIR.exists():
+    if not API_DIR.exists():
+        failures.append(f"{API_DIR.relative_to(REPO_ROOT)} missing — construction-wall scan cannot run")
+    elif not SHARED_DIR.exists():
+        failures.append(f"{SHARED_DIR.relative_to(REPO_ROOT)} missing — construction-wall scan cannot run")
+    else:
         construction_sites: list[str] = []
-        for path in API_DIR.rglob("*.py"):
+        for path in [*API_DIR.rglob("*.py"), *SHARED_DIR.rglob("*.py")]:
             if "test" in path.name:
                 continue
             if path == USER_STORE:

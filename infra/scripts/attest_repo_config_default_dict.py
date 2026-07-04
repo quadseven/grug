@@ -26,8 +26,7 @@ REPO_ROOT = Path(__file__).resolve().parents[2]
 INSTALL_STORE_PATHS: tuple[Path, ...] = (
     # Post-swap (#354): install_store.py is a re-export facade; the
     # default dict + gate logic live in the pg implementation.
-    REPO_ROOT / "services/api/adapters/pg_install_store.py",
-    REPO_ROOT / "services/webhook/adapters/pg_install_store.py",
+    REPO_ROOT / "services/_shared/adapters/pg_install_store.py",
 )
 
 

@@ -200,15 +200,18 @@ background thread (#368). Any NEW sync I/O added to this handler must be wrapped
 the same way (or moved to `httpx.AsyncClient` + `aioboto3`). (Originally #68;
 re-opened by the k8s move, fixed in #371.)
 
-### Mirrored files between services/api/ + services/webhook/
+### Shared modules (services/_shared/)
 
-Both services duplicate ~12 modules (adapters, ports, personas,
-github_app_auth, etc.) per ADR-0001 (rule-of-three extraction deferred).
-`.github/workflows/check.drift-lint.yml` runs `scripts/check-mirrored-files.sh`
-on every PR touching either service and byte-compares the `MIRRORED_FILES`
-list. Patch a mirrored file in BOTH copies; the lint catches misses. Files that
-intentionally diverge (the FastAPI app, the consumer/poller entrypoints, logger
-names) are simply omitted from the list.
+The cross-service modules (adapters, ports, personas, github_app_auth,
+observability, clients, ...) live ONCE in `services/_shared/`, a PYTHONPATH
+root both images and both test suites add after the service dir (#77,
+ADR-0014 - supersedes the ADR-0001 mirror discipline and its drift-lint).
+Import paths are unchanged (`from adapters.install_store import ...`). Edit
+the shared copy; NEVER create a same-relpath file under `services/api/` or
+`services/webhook/` - it would silently shadow the shared module for that
+service (guarded by `tests/test_shared_no_shadowing.py` + the spec-0010
+attester). Per-service files (main.py, rerun.py, dispatcher/consumer, auth/,
+crypto/, sast_benchmark/, spark_cave/) stay in their service tree.
 
 ## Elder (code-reviewer) persona — end-to-end verification
 

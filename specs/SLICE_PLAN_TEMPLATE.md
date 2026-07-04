@@ -127,22 +127,22 @@ If nothing deferred: `N/A — full surface translated`.
 
 ---
 
-## 7. Mirror discipline (services/api/ vs services/webhook/)
+## 7. Shared-package discipline (services/_shared/, ADR-0014)
 
-If the slice touches a file listed in `scripts/check-mirrored-files.sh`'s
-`MIRRORED_WITH_HEADER` or `MIRRORED_BYTE_IDENTICAL` arrays, the change
-MUST land in BOTH sides byte-identically (modulo the line-1 header).
+If the slice touches a cross-service module, edit the single copy in
+`services/_shared/`. NEVER create a same-relpath file under
+`services/api/` or `services/webhook/` - it silently shadows the shared
+module for that one service (the post-extraction drift class; guarded by
+`services/webhook/tests/test_shared_no_shadowing.py` and
+`infra/scripts/attest_mirror_policy_consistency.py`).
 
-Verify locally before push: `bash scripts/check-mirrored-files.sh`.
+If a shared module needs service-specific behavior, parameterize it
+(env read / argument), or - for whole modules only one service executes -
+keep the module in `_shared/` with an API-ONLY / WEBHOOK-ONLY marker
+in its opening docstring lines and lazy imports (the user-store /
+trial_* pattern).
 
-If the mirrored module needs to diverge in a load-bearing way, the
-intentional divergence pattern is:
-1. Remove the file from the array.
-2. Document the divergence rationale in the file's docstring.
-3. Annotate the divergence in `CONTEXT.md`'s mirrored-primitives table
-   (with the same strikethrough + note pattern that `persona.py` uses).
-
-If no mirrored files touched: `N/A — no mirror surface`.
+If no shared modules touched: `N/A — no shared surface`.
 
 ---
 
@@ -229,9 +229,10 @@ This template is NOT CI-gated (plans are advisory documents). The rules
 it codifies ARE enforced by:
 
 - `temper verify` — IOA state-machine reachability + invariants
-- The 12 grounding attesters under `infra/scripts/attest_*.py` — claim-
+- The grounding attesters under `infra/scripts/attest_*.py` — claim-
   proving against real source/runtime
-- `scripts/check-mirrored-files.sh` (drift-lint workflow) — mirror discipline
+- `services/webhook/tests/test_shared_no_shadowing.py` + the spec-0010
+  attester — shared-package shadowing guard (ADR-0014)
 - `services/{api,webhook}/tests/test_log_pii_guard.py` — PII surface
 - The full pytest suite for each service
 

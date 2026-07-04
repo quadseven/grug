@@ -128,6 +128,7 @@ from personas.code_reviewer.diff_parser import DiffHunk  # noqa: E402
 
 def _semgrep_json(results):
     r = MagicMock()
+    r.returncode = 0  # semgrep success shape - non-zero is the run-failed degrade path
     r.stdout = json.dumps({"results": results, "errors": []})
     return r
 
@@ -163,6 +164,30 @@ def test_scan_semgrep_missing_binary_fails_safe(monkeypatch):
         raise FileNotFoundError("semgrep not installed")
     monkeypatch.setattr(sast.subprocess, "run", _missing)
     assert scan_semgrep((_hunk("a.py", {1}),), {"a.py": "x"}) == ()
+
+
+def test_scan_semgrep_nonzero_exit_fails_safe(monkeypatch):
+    """Version-dependent, semgrep can exit non-zero AND emit parseable
+    JSON - that must degrade to () + log, never a silent zero-findings
+    scan (#77 audit stage 2)."""
+    r = MagicMock()
+    r.returncode = 2
+    r.stdout = json.dumps({"results": [], "errors": [{"message": "invalid rules"}]})
+    r.stderr = "invalid configuration"
+    monkeypatch.setattr(sast.subprocess, "run", lambda *a, **kw: r)
+    out = scan_semgrep((_hunk("a.py", {1}),), {"a.py": "code\n"})
+    assert out == ()
+
+
+def test_scan_semgrep_missing_rules_dir_fails_safe(monkeypatch):
+    """Post-#77 the rules dir resolves from the service cwd - a wrong
+    working directory must degrade loudly to (), not scan without rules."""
+    monkeypatch.setattr(sast, "_RULES_DIR", "/nonexistent/sast_rules")
+    called = []
+    monkeypatch.setattr(sast.subprocess, "run", lambda *a, **kw: called.append(a) or _semgrep_json([]))
+    out = scan_semgrep((_hunk("a.py", {1}),), {"a.py": "code\n"})
+    assert out == ()
+    assert not called, "semgrep must not run without its rules dir"
 
 
 def test_scan_semgrep_run_failure_fails_safe(monkeypatch):

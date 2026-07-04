@@ -26,8 +26,7 @@ from pathlib import Path
 REPO_ROOT = Path(__file__).resolve().parents[2]
 
 CF_AUTH_PATHS = (
-    REPO_ROOT / "services/api/cf_auth.py",
-    REPO_ROOT / "services/webhook/cf_auth.py",
+    REPO_ROOT / "services/_shared/cf_auth.py",
 )
 MAIN_PATHS = (
     REPO_ROOT / "services/api/main.py",
@@ -35,14 +34,13 @@ MAIN_PATHS = (
 )
 
 # Cross-source structural-drift guard: the header literal must match
-# across the Lambda middleware, the CF Worker code, the deploy script
+# across the shared middleware, the CF Worker code, the deploy script
 # that templates the Workers, and the DD monitor that alerts on
 # mismatches. If any side renames the header without the others, the
 # auth boundary silently fails and the monitor stops alerting.
 HEADER_LITERAL = "X-Grug-CF-Secret"
 HEADER_LITERAL_SOURCES = (
-    REPO_ROOT / "services/api/cf_auth.py",
-    REPO_ROOT / "services/webhook/cf_auth.py",
+    REPO_ROOT / "services/_shared/cf_auth.py",
     REPO_ROOT / "infra/cloudflare/deploy.sh",
     REPO_ROOT / "infra/pulumi/components/dd_monitors.py",
 )
@@ -141,7 +139,7 @@ def main() -> int:
             failures.append(
                 f"FAIL: {path} — missing header literal '{HEADER_LITERAL}'. "
                 "Renaming the header requires updating ALL of: "
-                "cf_auth.py (both copies), deploy.sh, dd_monitors.py."
+                "cf_auth.py (services/_shared/), deploy.sh, dd_monitors.py."
             )
 
     # 2 + 3. cf_auth.py-side bools

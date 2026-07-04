@@ -1,0 +1,54 @@
+name: Check · image build · services/ Docker context
+
+# Pre-merge proof that BOTH service images build from the ADR-0014 context
+# (services/ with _shared/ alongside each service tree) and that their
+# import graphs resolve INSIDE the image (PYTHONPATH=/app/_shared).
+# deploy.k8s.yml builds only on merge to main - without this gate a broken
+# COPY/PYTHONPATH layout would take down BOTH services at the next deploy
+# (#77: the extraction's main deploy risk, flagged when the issue was filed).
+
+permissions:
+  contents: read
+
+on:
+  pull_request:
+    paths:
+      - 'services/**'
+      - '.github/workflows/check.image-build.yml'
+
+jobs:
+  image-build:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    strategy:
+      fail-fast: false  # one service's failure must not hide the other's result
+      matrix:
+        svc: [webhook, api]
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+      - name: Build image (services/ context)
+        run: docker build services -f "services/${{ matrix.svc }}/Dockerfile" -t "grug-${{ matrix.svc }}:pr-smoke"
+      - name: Import smoke (inside the image)
+        run: |
+          set -euo pipefail
+          if [ "${{ matrix.svc }}" = "webhook" ]; then
+            # Includes the LAZY dispatch_path targets (personas.*.dispatch) +
+            # rerun: they are deliberately off dispatcher/main's eager import
+            # graph, so a broken _shared layout could pass an eager-only smoke
+            # and then fail inside every async job at runtime.
+            mods="dispatcher, consumer, async_dispatch, hmac_verify, rerun, key_rotator, poller_handler, cave_fallback, adapters.install_store, personas.registry, personas.code_reviewer.dispatch, personas.guard.dispatch, personas.smasher.dispatch, personas.smasher.sandbox, personas.smasher.trial_janitor, personas.smasher.trial_fetch, personas.smasher.trial_deps, personas.smasher.trial_worker, observability, readiness, main"
+          else
+            mods="admin, installations, auth.github_oauth, crypto.kms_envelope, adapters.user_store, adapters.install_store, personas.registry, observability, readiness, main"
+          fi
+          # boto3 clients constructed at import (crypto/kms_envelope.py) need
+          # a region; hosted runners/containers have no ambient AWS config -
+          # same benign-placeholder pattern check.python.yml uses for the moto suites.
+          # The trailing provenance assert (peer review, PR #495) proves the
+          # shared modules resolve from /app/_shared INSIDE the image - not a
+          # stray in-image copy under /app - so a future Dockerfile COPY
+          # mistake cannot silently serve a duplicate.
+          docker run --rm \
+            -e AWS_DEFAULT_REGION=us-east-1 \
+            -e AWS_ACCESS_KEY_ID=smoke -e AWS_SECRET_ACCESS_KEY=smoke \
+            "grug-${{ matrix.svc }}:pr-smoke" \
+            python -c "import ${mods}; import observability, adapters.install_store as _s; assert '_shared' in observability.__file__ and '_shared' in _s.__file__, (observability.__file__, _s.__file__); print('IMPORTS OK')"
