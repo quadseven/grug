@@ -100,6 +100,9 @@ spec:
             # is importable inside the Job). The registry placeholder is pinned
             # by the deploy workflow, same as the container image above.
             - {name: GRUG_SMASHER_ENABLED_SSM, value: /grug/smasher-enabled}
+            # Fail-closed egress gate: Smasher refuses to run author code unless
+            # the operator affirms a policy-enforcing CNI here (default off).
+            - {name: GRUG_SMASHER_NETPOL_ENFORCED_SSM, value: /grug/smasher-network-policy-enforced}
             - {name: GRUG_SMASHER_JOB_IMAGE, value: REGISTRY_PLACEHOLDER/grug-webhook:TAG_PLACEHOLDER}
             - {name: DD_SITE, value: datadoghq.com}
             - {name: DD_LLMOBS_ENABLED, value: "true"}

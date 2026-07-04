@@ -157,7 +157,10 @@ def dispatch_smasher_review(
 
     # Global master kill switch (ADR-0013): OFF unless the operator explicitly
     # enabled Smasher account-wide. Per-repo opt-in was already checked upstream.
-    from secrets_loader import get_smasher_enabled  # lazy: rare path, uncached
+    from secrets_loader import (  # lazy: rare path, uncached
+        get_smasher_enabled,
+        get_smasher_network_policy_enforced,
+    )
 
     if not get_smasher_enabled():
         log.info(
@@ -165,6 +168,16 @@ def dispatch_smasher_review(
             extra={"pr": f"{owner}/{repo_name}#{pull_number}"},
         )
         return {"persona": "smasher", "result": "disabled_global"}
+
+    # Fail-closed egress precondition (codex peer-review PR #494): never run
+    # author pytest unless the operator has AFFIRMED a policy-enforcing CNI, so a
+    # config mistake can't run it with unrestricted egress on flannel.
+    if not get_smasher_network_policy_enforced():
+        log.warning(
+            "smasher_network_policy_not_affirmed",
+            extra={"pr": f"{owner}/{repo_name}#{pull_number}"},
+        )
+        return {"persona": "smasher", "result": "disabled_no_netpol_enforcement"}
 
     # Fetch + parse the diff.
     try:
