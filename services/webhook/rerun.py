@@ -33,6 +33,7 @@ from adapters.install_store import get_repo_config  # type: ignore
 from github_app_auth import with_install_token_retry
 from personas.code_reviewer.dispatch import dispatch_code_review
 from personas.guard.dispatch import dispatch_guard_review
+from personas.smasher.dispatch import dispatch_smasher_review
 
 log = logging.getLogger(f"{os.getenv('DD_SERVICE', 'grug')}.rerun")
 
@@ -80,7 +81,8 @@ def enqueue_rerun(*, install_id: int, repo: str, pr_number: int, persona: str) -
 # from outages, so its re-run is a deliberate follow-up (logged + skipped here).
 _CODE_REVIEWER = frozenset({"elder", "code_reviewer"})
 _GUARD = frozenset({"guard"})
-_RERUNNABLE = _CODE_REVIEWER | _GUARD
+_SMASHER = frozenset({"smasher"})
+_RERUNNABLE = _CODE_REVIEWER | _GUARD | _SMASHER
 
 
 def _gh_get(token: str, url: str) -> dict[str, Any]:
@@ -144,6 +146,10 @@ def _run_one(body: str) -> str:
         dispatch_guard_review(
             payload, blocking=bool(cfg.get("guard_blocking", False)),
         )
+    elif persona in _SMASHER:
+        # Smasher is advisory-only (no blocking flag); the global master switch
+        # is re-checked inside dispatch_smasher_review.
+        dispatch_smasher_review(payload, blocking=False)
     else:
         dispatch_code_review(
             payload, blocking=bool(cfg.get("code_reviewer_blocking", False)),

@@ -59,7 +59,14 @@ metadata:
   name: allow-egress-scoped
   namespace: grug
 spec:
-  podSelector: {}
+  # Every grug pod EXCEPT the Smasher Trial pods (#469): those run
+  # PR-author code and get a TIGHTER egress policy (allow-egress-trial
+  # below) that omits Postgres / spark-gateway / the DD agent. Excluding
+  # them here is what makes that tighter policy actually bite - NetworkPolicy
+  # rules are additive, so a pod selected by BOTH would get the union.
+  podSelector:
+    matchExpressions:
+      - {key: grug-trial, operator: NotIn, values: ["true"]}
   policyTypes: [Egress]
   egress:
     # DNS resolution.
@@ -87,3 +94,37 @@ spec:
     - ports:
         - {protocol: UDP, port: 8125}
         - {protocol: TCP, port: 8126}
+---
+# Smasher Trial pods (#469, ADR-0013) run PR-author code. Their egress is the
+# MINIMUM the fetch + dependency-install init phases need - DNS + 443 (GitHub
+# tarball + PyPI wheels) - and NOTHING else: no Postgres (5432), no
+# spark-gateway, no cluster-internal reach. The `test` phase makes no network
+# calls by construction and holds no credential.
+#
+# ENFORCEMENT CAVEAT (load-bearing, ADR-0013): NetworkPolicy is only enforced by
+# a policy-capable CNI. This cluster runs flannel (does NOT enforce), so this
+# policy is INERT here today and the real isolation is credential-denial (the
+# test phase has no token / no secrets). A policy CNI (Calico/Cilium) is the
+# documented operator PRECONDITION for enabling Smasher on a cluster.
+#
+# NOTE: pod-level NetworkPolicy cannot grant egress to the init phase while
+# denying it to the test phase (they share the pod's network namespace). The
+# test phase's network-denial is therefore by-construction (it makes no calls)
+# + this scoping, NOT per-container enforcement.
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: allow-egress-trial
+  namespace: grug
+spec:
+  podSelector:
+    matchLabels: {grug-trial: "true"}
+  policyTypes: [Egress]
+  egress:
+    # DNS resolution.
+    - ports:
+        - {protocol: UDP, port: 53}
+        - {protocol: TCP, port: 53}
+    # HTTPS ONLY: the GitHub tarball (init `fetch`) + PyPI wheels (init `deps`).
+    - ports:
+        - {protocol: TCP, port: 443}

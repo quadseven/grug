@@ -179,6 +179,21 @@ REGISTRY: tuple[PersonaSpec, ...] = (
         actions=("closed",),  # merged-PR seam; merged flag checked in-module
     ),
     PersonaSpec(
+        key="smasher",
+        canonical="smasher",
+        # Matches the existing check-run family ("Grug — Guard" etc.) so the
+        # checks group consistently in the GitHub UI.
+        check_run_name="Grug — Smasher",
+        enabled_flag="smasher_enabled",
+        enabled_default=False,  # execution tracer: opt-in per repo (#469)
+        blocking_flag=None,     # mutation findings are inherently advisory
+        blocking_default=False,
+        dispatch_style="async",  # the Job round-trip is far over the ACK budget
+        missing_repo_policy="disabled",  # never run author code blind
+        events=("pull_request",),
+        dispatch_module="personas.smasher.webhook_dispatch",
+    ),
+    PersonaSpec(
         key="pulse",
         canonical="pulse",
         check_run_name="Grug — Pulse",

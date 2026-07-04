@@ -28,7 +28,13 @@ spec:
         tags.datadoghq.com/service: grug-webhook
         tags.datadoghq.com/env: prod
     spec:
-      automountServiceAccountToken: false
+      # The webhook runs the async Smasher Trial (#469), which LAUNCHES a
+      # locked-down Job via the in-cluster k8s API - so it needs the minimal
+      # launcher SA token (jobs + pods verbs only; NO secret read, cannot
+      # escalate - see k8s/smasher-rbac.yaml + ADR-0013). The token is INERT
+      # until Smasher is enabled account-wide (global master flag default OFF).
+      serviceAccountName: grug-smasher-launcher
+      automountServiceAccountToken: true
       # Images are built natively for arm64 only - without this pin a
       # mixed-arch cluster schedules onto amd64 and exec-format-errors
       # (review F2).
@@ -84,6 +90,13 @@ spec:
             # offline rules. Default off (builtin) elsewhere; on for the review
             # workloads (webhook + consumer). The semgrep CLI ships in the image.
             - {name: GRUG_SAST_ENGINE, value: semgrep}
+            # Smasher Trial (#469): global master kill switch (default OFF - the
+            # SSM param is absent/false until the operator opts in) + the image
+            # the sandbox Job runs (the SAME webhook image, so personas.smasher
+            # is importable inside the Job). The registry placeholder is pinned
+            # by the deploy workflow, same as the container image above.
+            - {name: GRUG_SMASHER_ENABLED_SSM, value: /grug/smasher-enabled}
+            - {name: GRUG_SMASHER_JOB_IMAGE, value: REGISTRY_PLACEHOLDER/grug-webhook:TAG_PLACEHOLDER}
             - {name: DD_SITE, value: datadoghq.com}
             - {name: DD_LLMOBS_ENABLED, value: "true"}
             - {name: DD_LLMOBS_ML_APP, value: grug-elder}

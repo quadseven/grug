@@ -38,6 +38,7 @@ log = logging.getLogger(f"{os.getenv('DD_SERVICE', 'grug')}.async_dispatch")
 ASYNC_JOB_KEY = "grug_async_job"
 ELDER_REVIEW_JOB = "elder_review"
 GUARD_REVIEW_JOB = "guard_review"
+SMASHER_REVIEW_JOB = "smasher_review"
 
 
 def _slim_payload(payload: dict[str, Any]) -> dict[str, Any]:
@@ -252,6 +253,111 @@ def run_guard_job(event: dict[str, Any]) -> dict[str, str]:
         # retries.
         _self_recover_review(payload, delivery_id, persona="guard")
         return {"persona": "guard", "result": "unhandled_error"}
+
+
+def enqueue_smasher_review(
+    *,
+    payload: dict[str, Any],
+    delivery_id: str,
+    blocking: bool,
+) -> bool:
+    """Fire-and-forget offload for the Smasher Trial (#469) - same contract,
+    runtime, and trade-offs as `enqueue_elder_review`/`enqueue_guard_review`:
+    background daemon thread under GRUG_K8S_RUNTIME, False on any failure, NO
+    sync fallback, a dropped Trial re-triggers on the next push. This is the
+    THIRD copy of this per-persona enqueue machinery - re-confirming the
+    rule-of-three trigger for the async-generalization extraction (#77); kept
+    separate here so the security-critical #469 slice does not also do that
+    risky refactor (ADR-0013)."""
+    job = {
+        ASYNC_JOB_KEY: SMASHER_REVIEW_JOB,
+        "delivery_id": delivery_id,
+        "blocking": blocking,
+        "payload": _slim_payload(payload),
+    }
+    if os.getenv("GRUG_K8S_RUNTIME"):
+        delivery = str(job.get("delivery_id", ""))
+        try:
+            threading.Thread(
+                target=run_smasher_job,
+                args=(job,),
+                name=f"smasher-{delivery[:11]}",
+                daemon=True,
+            ).start()
+            return True
+        except Exception as e:  # noqa: BLE001 — best-effort enqueue; never break the ACK
+            log.error(
+                "smasher_enqueue_invoke_error",
+                extra={"delivery_id": delivery, "kind": type(e).__name__},
+            )
+            return False
+    log.warning("smasher_enqueue_no_runtime", extra={"delivery_id": delivery_id})
+    return False
+
+
+def run_smasher_job(event: dict[str, Any]) -> dict[str, str]:
+    """Worker entry for an async Smasher Trial (#469). Same two-layer
+    idempotency + never-raise contract as `run_guard_job`, with the delivery
+    claim NAMESPACED `{delivery_id}:smasher` (Elder + Guard + Smasher all
+    dispatch from the SAME webhook delivery; an unnamespaced claim would let
+    whichever ran first mark the delivery consumed and skip the others) and the
+    head-SHA claim + self-recover carrying persona="smasher"."""
+    delivery_id = str(event.get("delivery_id", ""))
+    try:
+        from adapters.install_store import claim_delivery
+
+        if not claim_delivery(f"{delivery_id}:smasher"):
+            log.info("smasher_job_duplicate_skipped", extra={"delivery_id": delivery_id})
+            return {"status": "skipped", "reason": "duplicate_delivery"}
+    except Exception as e:  # noqa: BLE001 — claim is best-effort; degrade to running
+        log.warning(
+            "smasher_job_claim_failed_running_anyway",
+            extra={"delivery_id": delivery_id, "kind": type(e).__name__},
+        )
+
+    payload = event.get("payload") or {}
+    try:
+        from adapters.install_store import claim_review
+
+        install_id, repo, pr_number = _pr_ids(payload)
+        head_sha = ((payload.get("pull_request") or {}).get("head") or {}).get("sha")
+        if install_id and repo and pr_number and head_sha:
+            if not claim_review(
+                install_id=install_id,
+                repo=repo,
+                pr_number=pr_number,
+                persona="smasher",
+                head_sha=head_sha,
+            ):
+                log.info(
+                    "smasher_job_duplicate_sha_skipped",
+                    extra={
+                        "delivery_id": delivery_id, "repo": repo,
+                        "pr": pr_number, "head_sha": head_sha,
+                    },
+                )
+                return {"status": "skipped", "reason": "duplicate_head_sha"}
+    except Exception as e:  # noqa: BLE001 — claim is best-effort; degrade to running
+        log.warning(
+            "smasher_job_review_claim_failed_running_anyway",
+            extra={"delivery_id": delivery_id, "kind": type(e).__name__},
+        )
+
+    blocking = bool(event.get("blocking", False))
+    try:
+        from personas.smasher.dispatch import dispatch_smasher_review
+
+        result = dispatch_smasher_review(payload, blocking=blocking)
+        log.info("smasher_job_done", extra={"delivery_id": delivery_id, **result})
+        return result
+    except Exception as e:  # noqa: BLE001 — never retry-storm; degrade contract owns this
+        log.error(
+            "smasher_job_unhandled",
+            extra={"delivery_id": delivery_id, "kind": type(e).__name__},
+            exc_info=True,
+        )
+        _self_recover_review(payload, delivery_id, persona="smasher")
+        return {"persona": "smasher", "result": "unhandled_error"}
 
 
 def run_elder_job(event: dict[str, Any]) -> dict[str, str]:

@@ -140,6 +140,30 @@ def get_omen_service_map() -> dict:
     return parsed
 
 
+def get_smasher_enabled() -> bool:
+    """Global master kill switch for the Smasher Trial (#469), from the
+    `/grug/smasher-enabled` SSM param (plain String, e.g. "true").
+
+    FALLBACK-SAFE: returns `False` on a missing/unreadable param, an SSM error,
+    or any unrecognized value. Smasher runs PR-author code in a sandbox Job, so
+    it stays globally OFF until the operator explicitly flips this master flag
+    AND opts a repo in (`smasher_enabled`) - two-key defense in depth
+    (ADR-0013). Read on the async Trial path only, so intentionally NOT cached -
+    toggling takes effect without a container recycle."""
+    name = os.getenv("GRUG_SMASHER_ENABLED_SSM", "")
+    if not name:
+        return False
+    try:
+        value = _ssm.get_parameter(Name=name)["Parameter"]["Value"].strip().lower()
+    except Exception as e:  # noqa: BLE001 — best-effort config; never break a review
+        log.warning(
+            "smasher_enabled_fetch_failed",
+            extra={"param": name, "kind": type(e).__name__},
+        )
+        return False
+    return value in ("true", "1", "yes", "on")
+
+
 def get_fallback_enabled() -> bool:
     """Whether the Elder cave-fallback (ADR-0005) is enabled, from the
     `/grug/elder-fallback-enabled` SSM param (plain String, e.g. "true").
