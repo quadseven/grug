@@ -16,23 +16,37 @@ from personas.smasher.trial_worker import run_trial
 
 
 def test_reap_noop_when_not_pid1(monkeypatch):
-    # A local run (worker is not PID 1) must NEVER kill anything.
+    # A local run (worker is not PID 1) must NEVER kill anything, and reports clean.
     monkeypatch.setattr(tw.os, "getpid", lambda: 4242)
     killed = []
     monkeypatch.setattr(tw.os, "kill", lambda pid, sig: killed.append(pid))
-    tw._reap_other_processes()
+    assert tw._reap_other_processes() is True
     assert killed == []
 
 
-def test_reap_kills_others_but_never_pid1_when_worker_is_pid1(monkeypatch):
-    # Inside the sandbox pod the worker is PID 1 and reaps every OTHER process
-    # (an author-spawned daemon) before writing the authoritative result.
+def test_reap_kills_others_then_confirms_clean(monkeypatch):
+    # Inside the sandbox pod the worker is PID 1: it kills every OTHER process,
+    # then confirms the namespace is empty and reports clean.
     monkeypatch.setattr(tw.os, "getpid", lambda: 1)
-    monkeypatch.setattr(tw.os, "listdir", lambda p: ["1", "37", "88", "notapid"])
+    proc = iter([["1", "37", "88"], ["1"]])  # after the kill sweep, only self remains
+    monkeypatch.setattr(tw.os, "listdir", lambda p: next(proc))
     killed = []
     monkeypatch.setattr(tw.os, "kill", lambda pid, sig: killed.append(pid))
-    tw._reap_other_processes()
+    monkeypatch.setattr(tw.os, "waitpid", lambda *a: (_ for _ in ()).throw(ChildProcessError()))
+    monkeypatch.setattr(tw.time, "sleep", lambda s: None)
+    assert tw._reap_other_processes() is True
     assert killed == [37, 88]  # PID 1 (self) never signalled
+
+
+def test_reap_returns_false_if_process_survives(monkeypatch):
+    # A process that will not die (always present) -> reap can't confirm clean
+    # -> the caller must degrade rather than trust the result channel.
+    monkeypatch.setattr(tw.os, "getpid", lambda: 1)
+    monkeypatch.setattr(tw.os, "listdir", lambda p: ["1", "99"])  # 99 never leaves
+    monkeypatch.setattr(tw.os, "kill", lambda pid, sig: None)
+    monkeypatch.setattr(tw.os, "waitpid", lambda *a: (_ for _ in ()).throw(ChildProcessError()))
+    monkeypatch.setattr(tw.time, "sleep", lambda s: None)
+    assert tw._reap_other_processes() is False
 
 
 def _write(ws: Path, rel: str, body: str) -> None:
