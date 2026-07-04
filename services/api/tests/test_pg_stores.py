@@ -714,3 +714,31 @@ def test_claim_pulse_nudge_win_once(pg):
     assert store.claim_pulse_nudge(1, "o/r", 5) is False   # window held
     assert store.claim_pulse_nudge(1, "o/r", 6) is True    # different PR
     assert store.claim_pulse_nudge(2, "o/r", 5) is True    # different install
+
+
+def test_release_pulse_nudge_allows_retry(pg):
+    """Codex PR #489: releasing a claim after a failed comment POST lets
+    the next poller tick retry."""
+    from adapters import pg_install_store as store
+
+    assert store.claim_pulse_nudge(1, "o/r", 7) is True
+    assert store.claim_pulse_nudge(1, "o/r", 7) is False
+    store.release_pulse_nudge(1, "o/r", 7)
+    assert store.claim_pulse_nudge(1, "o/r", 7) is True  # slot free again
+
+
+def test_warder_pulse_flags_flow_through_config(pg):
+    """Codex PR #489: warder_enabled/pulse_enabled reachable end-to-end
+    through the generic store plumbing."""
+    from adapters import pg_install_store as store
+
+    cfg = store.get_repo_config(1, 55)
+    assert cfg["warder_enabled"] is False and cfg["pulse_enabled"] is False
+    store.set_repo_config(
+        install_id=1, repo_id=55, repo_full_name="o/r",
+        updated_by_user_id="9", warder_enabled=True, pulse_enabled=True,
+    )
+    cfg = store.get_repo_config(1, 55)
+    assert cfg["warder_enabled"] is True and cfg["pulse_enabled"] is True
+    assert store.is_persona_enabled(1, 55, "warder") is True
+    assert store.is_persona_enabled(1, 55, "pulse") is True

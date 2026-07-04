@@ -591,6 +591,18 @@ def claim_pulse_nudge(install_id: int, repo: str, pr_number: int) -> bool:
     return row is not None
 
 
+def release_pulse_nudge(install_id: int, repo: str, pr_number: int) -> None:
+    """Release a pulse-nudge claim whose COMMENT POST failed (codex PR
+    #489): the claim must represent a COMPLETED nudge, not an attempt -
+    otherwise a transient GitHub failure silently burns the weekly slot
+    for exactly the stale PR Pulse exists to recover. Best-effort."""
+    with get_pool().connection() as conn:
+        conn.execute(
+            "DELETE FROM grug_kv WHERE pk = %s AND sk = %s",
+            (_inst_pk(install_id), f"PULSE#{repo}#{pr_number}"),
+        )
+
+
 _REVIEW_CLAIM_TTL_DAYS = 30
 
 

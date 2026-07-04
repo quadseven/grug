@@ -64,6 +64,8 @@ class RepoConfigPayload(BaseModel):
     tpm_enabled: bool = Field(default=True)
     guard_enabled: bool | None = Field(default=None)
     guard_blocking: bool | None = Field(default=None)
+    warder_enabled: bool | None = Field(default=None)
+    pulse_enabled: bool | None = Field(default=None)
 
 
 class RerunRequest(BaseModel):
@@ -435,6 +437,8 @@ def update_repo_config(
         updated_by_user_id=user.github_user_id,
         guard_enabled=body.guard_enabled,
         guard_blocking=body.guard_blocking,
+        warder_enabled=body.warder_enabled,
+        pulse_enabled=body.pulse_enabled,
     )
     log.info(
         "repo_config_updated",
