@@ -188,7 +188,12 @@ def _default_run_tests(workspace: str, timeout: int) -> int:
     # on the READ-ONLY workspace mount at `<GRUG_TRIAL_WORKSPACE>/.grug-deps`,
     # shared read-only via PYTHONPATH (importing from a RO dir is fine).
     deps = str(Path(os.getenv("GRUG_TRIAL_WORKSPACE", "/workspace")) / ".grug-deps")
-    env["PYTHONPATH"] = deps + (os.pathsep + env["PYTHONPATH"] if env.get("PYTHONPATH") else "")
+    # REPLACE, never append: post-#77 the image env carries
+    # PYTHONPATH=/app/_shared, and inheriting it would let author test code
+    # import grug's shared modules inside the sandbox (a stray import that
+    # should ImportError would succeed and could flip a mutant verdict).
+    # Author code gets the vendored deps and NOTHING else.
+    env["PYTHONPATH"] = deps
     try:
         proc = subprocess.run(
             [sys.executable, "-m", "pytest", "-x", "-q", "-p", "no:cacheprovider"],
