@@ -2,7 +2,9 @@
 
 ## Status
 
-Accepted (2026-05-17)
+Superseded by [ADR-0014](0014-shared-package-extraction.md) (2026-07-04) - the rule-of-three trigger this ADR defined FIRED (Smasher was the third async persona, ADR-0013) and the mirrored modules were extracted to `services/_shared/` at #77.
+
+Originally Accepted (2026-05-17).
 
 ## Context
 

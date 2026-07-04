@@ -1,0 +1,39 @@
+name: Check · image build · services/ Docker context
+
+# Pre-merge proof that BOTH service images build from the ADR-0014 context
+# (services/ with _shared/ alongside each service tree) and that their
+# import graphs resolve INSIDE the image (PYTHONPATH=/app/_shared).
+# deploy.k8s.yml builds only on merge to main - without this gate a broken
+# COPY/PYTHONPATH layout would take down BOTH services at the next deploy
+# (#77: the extraction's main deploy risk, flagged when the issue was filed).
+
+permissions:
+  contents: read
+
+on:
+  pull_request:
+    paths:
+      - 'services/**'
+      - '.github/workflows/check.image-build.yml'
+
+jobs:
+  image-build:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    strategy:
+      matrix:
+        svc: [webhook, api]
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+      - name: Build image (services/ context)
+        run: docker build services -f "services/${{ matrix.svc }}/Dockerfile" -t "grug-${{ matrix.svc }}:pr-smoke"
+      - name: Import smoke (inside the image)
+        run: |
+          set -euo pipefail
+          if [ "${{ matrix.svc }}" = "webhook" ]; then
+            mods="dispatcher, consumer, async_dispatch, hmac_verify, adapters.install_store, personas.registry, personas.smasher.sandbox, observability, readiness, main"
+          else
+            mods="admin, installations, auth.github_oauth, crypto.kms_envelope, adapters.user_store, adapters.install_store, personas.registry, observability, readiness, main"
+          fi
+          docker run --rm "grug-${{ matrix.svc }}:pr-smoke" \
+            python -c "import ${mods}; print('IMPORTS OK')"

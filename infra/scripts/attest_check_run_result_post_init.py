@@ -27,8 +27,7 @@ from pathlib import Path
 REPO_ROOT = Path(__file__).resolve().parents[2]
 
 CLIENT_PATHS: tuple[Path, ...] = (
-    REPO_ROOT / "services/api/github_checks_client.py",
-    REPO_ROOT / "services/webhook/github_checks_client.py",
+    REPO_ROOT / "services/_shared/github_checks_client.py",
 )
 
 

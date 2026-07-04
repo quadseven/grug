@@ -30,8 +30,7 @@ CANONICAL_RULES: frozenset[str] = frozenset(
 )
 
 DOR_CHECK_PATHS: tuple[Path, ...] = (
-    Path(__file__).resolve().parents[2] / "services/api/personas/tpm/dor_checks.py",
-    Path(__file__).resolve().parents[2] / "services/webhook/personas/tpm/dor_checks.py",
+    Path(__file__).resolve().parents[2] / "services/_shared/personas/tpm/dor_checks.py",
 )
 
 _DEF_PATTERN = re.compile(r"^(?:async\s+)?def\s+(check_\w+)\s*\(", re.MULTILINE)
@@ -74,7 +73,7 @@ def main() -> int:
     failures: list[str] = []
     for path in DOR_CHECK_PATHS:
         if not path.exists():
-            failures.append(f"FAIL: {path} does not exist (mirror discipline broken)")
+            failures.append(f"FAIL: {path} does not exist (shared module missing, ADR-0014)")
             continue
         found = _module_check_functions(path)
         if found != CANONICAL_RULES:

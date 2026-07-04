@@ -28,9 +28,13 @@ REPO_ROOT = Path(__file__).resolve().parents[2]
 # Post-swap (#354): pg_user_store.py IS the user store; user_store.py is
 # a re-export facade with no class definitions. The shape + construction
 # walls apply to the canonical file only.
-USER_STORE = REPO_ROOT / "services/api/adapters/pg_user_store.py"
+USER_STORE = REPO_ROOT / "services/_shared/adapters/pg_user_store.py"
 WEBHOOK_DIR = REPO_ROOT / "services/webhook"
 API_DIR = REPO_ROOT / "services/api"
+# Post-#77 the user store lives in services/_shared/ (package-integrity,
+# ADR-0014) - the construction wall must scan the shared tree too, or a
+# rogue construction site in another shared module would escape it.
+SHARED_DIR = REPO_ROOT / "services/_shared"
 
 EXPECTED_FIELDS: frozenset[str] = frozenset({
     "identity", "oauth_access_token", "oauth_refresh_token",
@@ -145,7 +149,7 @@ def main() -> int:
     # construction site.
     if API_DIR.exists():
         construction_sites: list[str] = []
-        for path in API_DIR.rglob("*.py"):
+        for path in [*API_DIR.rglob("*.py"), *SHARED_DIR.rglob("*.py")]:
             if "test" in path.name:
                 continue
             if path == USER_STORE:

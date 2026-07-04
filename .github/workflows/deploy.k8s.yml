@@ -80,7 +80,9 @@ jobs:
         run: |
           set -euo pipefail
           for svc in webhook api; do
-            docker build "services/$svc" \
+            # Context is services/ (ADR-0014): the image COPYs both the
+            # service tree and services/_shared/.
+            docker build services \
               -f "services/$svc/Dockerfile" \
               -t "$REGISTRY_HOST/grug-$svc:${GITHUB_SHA}" \
               --build-arg DD_GIT_REPOSITORY_URL="github.com/${GITHUB_REPOSITORY}" \

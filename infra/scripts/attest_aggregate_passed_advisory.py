@@ -19,8 +19,7 @@ from pathlib import Path
 REPO_ROOT = Path(__file__).resolve().parents[2]
 
 PERSONA_PATHS = (
-    REPO_ROOT / "services/api/personas/tpm/persona.py",
-    REPO_ROOT / "services/webhook/personas/tpm/persona.py",
+    REPO_ROOT / "services/_shared/personas/tpm/persona.py",
 )
 
 CANONICAL_NAMES = frozenset({"why", "acceptance", "estimate", "scope-fence", "issue-link"})

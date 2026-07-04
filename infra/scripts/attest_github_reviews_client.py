@@ -27,8 +27,7 @@ from pathlib import Path
 REPO_ROOT = Path(__file__).resolve().parents[2]
 
 CLIENT_PATHS: tuple[Path, ...] = (
-    REPO_ROOT / "services/api/github_reviews_client.py",
-    REPO_ROOT / "services/webhook/github_reviews_client.py",
+    REPO_ROOT / "services/_shared/github_reviews_client.py",
 )
 
 EXPECTED_EVENTS: frozenset[str] = frozenset(("COMMENT", "REQUEST_CHANGES"))
@@ -328,7 +327,7 @@ def main() -> int:
         return 1
     print(
         f"OK: github_reviews_client contracts verified in both "
-        f"{len(CLIENT_PATHS)} mirrored sides (spec 0016)"
+        f"{len(CLIENT_PATHS)} shared client module(s) (spec 0016)"
     )
     return 0
 
