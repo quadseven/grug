@@ -106,7 +106,8 @@ class PullRequestContext:
     blocking: bool
 
 
-# The two personas that ship today, declared exactly as the previously
+# The personas that ship today (Guard extracted from Elder, #466), declared
+# exactly as the previously
 # hand-wired code behaved (locked in by test_registry.py + the dispatcher
 # suite). New personas (Guard #466, Warder #471, Pulse #472) append here
 # as they land.
@@ -136,6 +137,19 @@ REGISTRY: tuple[PersonaSpec, ...] = (
         missing_repo_policy="disabled",
         events=("pull_request",),
         dispatch_module="personas.code_reviewer.webhook_dispatch",
+    ),
+    PersonaSpec(
+        key="guard",
+        canonical="guard",
+        check_run_name="Grug — Guard",
+        enabled_flag="guard_enabled",
+        enabled_default=True,
+        blocking_flag="guard_blocking",
+        blocking_default=False,
+        dispatch_style="async",
+        missing_repo_policy="disabled",
+        events=("pull_request",),
+        dispatch_module="personas.guard.webhook_dispatch",
     ),
 )
 

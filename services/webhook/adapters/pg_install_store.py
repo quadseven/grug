@@ -191,6 +191,8 @@ _DEFAULT_PERSONA_CONFIG = {
     "tpm_enabled": True,
     "code_reviewer_enabled": True,
     "code_reviewer_blocking": False,
+    "guard_enabled": True,
+    "guard_blocking": False,
 }
 
 

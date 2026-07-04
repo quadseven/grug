@@ -76,8 +76,8 @@ def test_toy_persona_dispatches_via_registry_only(monkeypatch):
         out = dispatch("pull_request", _full_pr_payload(), delivery_id="deliv-toy")
 
     assert out["status"] == "dispatched"
-    assert [r["persona"] for r in out["personas"]] == ["tpm", "code_reviewer", "toy"]
-    assert out["personas"][2] == {"persona": "toy", "result": "pass"}
+    assert [r["persona"] for r in out["personas"]] == ["tpm", "code_reviewer", "guard", "toy"]
+    assert out["personas"][3] == {"persona": "toy", "result": "pass"}
 
     # The uniform context contract: the toy module received the full
     # event coordinates without any toy-specific dispatcher plumbing.
@@ -117,7 +117,7 @@ def test_toy_persona_exception_is_isolated(monkeypatch):
 
     assert out["personas"][0]["result"] == "pass"
     assert out["personas"][1] == {"persona": "code_reviewer", "result": "queued"}
-    assert out["personas"][2] == {"persona": "toy", "result": "unhandled_error"}
+    assert out["personas"][-1] == {"persona": "toy", "result": "unhandled_error"}
 
 
 def test_toy_persona_missing_module_is_isolated(monkeypatch):
@@ -141,7 +141,7 @@ def test_toy_persona_missing_module_is_isolated(monkeypatch):
         mock_eval.return_value = type("R", (), {"passed": True})()
         out = dispatch("pull_request", _full_pr_payload())
 
-    assert out["personas"][2] == {"persona": "toy", "result": "unhandled_error"}
+    assert out["personas"][-1] == {"persona": "toy", "result": "unhandled_error"}
     assert out["personas"][0]["result"] == "pass"
 
 

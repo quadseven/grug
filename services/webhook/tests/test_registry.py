@@ -8,21 +8,25 @@ from __future__ import annotations
 from personas import registry
 
 
-def test_two_personas_registered():
+def test_registered_personas():
     keys = {p.key for p in registry.REGISTRY}
-    assert keys == {"tpm", "code_reviewer"}
+    assert keys == {"tpm", "code_reviewer", "guard"}
 
 
 def test_canonical_names_match_adr_0002():
     assert registry.by_key("tpm").canonical == "chief"
     assert registry.by_key("code_reviewer").canonical == "elder"
     assert registry.by_canonical("elder").key == "code_reviewer"
+    assert registry.by_key("guard").canonical == "guard"
 
 
 def test_check_run_names_match_the_persona_modules():
-    # Elder's check-run name is the authoritative constant in dispatch.py.
+    # Each persona's check-run name is the authoritative constant in its
+    # dispatch module.
     from personas.code_reviewer.dispatch import _CHECK_NAME as elder_check
+    from personas.guard.dispatch import _CHECK_NAME as guard_check
     assert registry.by_key("code_reviewer").check_run_name == elder_check
+    assert registry.by_key("guard").check_run_name == guard_check
 
 
 def test_default_config_matches_store_ssot():
@@ -37,16 +41,19 @@ def test_missing_repo_policy_is_explicit_and_opposite():
     # registry records the choice instead of leaving it as dispatcher folklore.
     assert registry.by_key("tpm").missing_repo_policy == "enabled"
     assert registry.by_key("code_reviewer").missing_repo_policy == "disabled"
+    assert registry.by_key("guard").missing_repo_policy == "disabled"
 
 
 def test_dispatch_styles():
     assert registry.by_key("tpm").dispatch_style == "inline"
     assert registry.by_key("code_reviewer").dispatch_style == "async"
+    assert registry.by_key("guard").dispatch_style == "async"
 
 
-def test_only_elder_has_a_blocking_flag():
+def test_blocking_flags():
     assert registry.by_key("tpm").blocking_flag is None
     assert registry.by_key("code_reviewer").blocking_flag == "code_reviewer_blocking"
+    assert registry.by_key("guard").blocking_flag == "guard_blocking"
 
 
 def test_live_personas_declare_pull_request_event():
@@ -56,6 +63,7 @@ def test_live_personas_declare_pull_request_event():
     # is what the dispatcher loop filters on (ADR-0010).
     assert registry.by_key("tpm").events == ("pull_request",)
     assert registry.by_key("code_reviewer").events == ("pull_request",)
+    assert registry.by_key("guard").events == ("pull_request",)
 
 
 def test_spec_rejects_nonconvention_enabled_flag():

@@ -35,7 +35,7 @@ from github_checks_client import CheckConclusion, CheckRunResult, post_check_run
 from github_reviews_client import (
     InlineComment, ReviewEvent, ReviewResult, get_review_comments, post_review,
 )
-from llm_client import _JUDGE_MAX_FINDINGS, Hunk as LlmHunk, LlmReviewResponse, review_diff
+from llm_client import Hunk as LlmHunk, LlmReviewResponse, review_diff
 from personas.code_reviewer.dedup import (
     dedup_findings, finding_key, parse_rule, prior_keys_from_comments,
     rule_marker,
@@ -50,13 +50,8 @@ from personas.code_reviewer.judge import (
     eval_tags, grade_findings, partition_findings, submit_evals,
 )
 from personas.code_reviewer.persona import (
-    CodeReviewEvaluation, Finding, evaluate_diff, with_extra_findings,
-    with_findings,
+    CodeReviewEvaluation, Finding, evaluate_diff, with_findings,
 )
-from personas.code_reviewer.sast import judge_candidates, scan_candidates
-from personas.code_reviewer.iac_scan import scan_iac
-from personas.code_reviewer.sca import scan_dependencies
-from personas.code_reviewer.secret_scan import scan_secrets
 from adapters.install_store import put_comment_record  # type: ignore
 
 log = logging.getLogger(f"{os.getenv('DD_SERVICE', 'grug')}.persona.code_reviewer")
@@ -606,71 +601,11 @@ def dispatch_code_review(
 
     evaluation = evaluate_diff(hunks, llm_response)
 
-    # Security detection (ADR-0006 SAST #400/#401 + ADR-0007 SCA #434 + secret
-    # scanning #436): three candidate SOURCES — the SAST engine over the diff
-    # code, the SCA engine over the diff's dependency changes, and the secret
-    # scanner over added lines of any file type — feed ONE exploitability-judge
-    # pass (recall from the engines, precision from the judge), and the kept
-    # findings merge into the SAME evaluation so they flow the existing publish
-    # path (no parallel posting). Best-effort: any failure must not break the
-    # core review (judge_candidates already fails-closed; guard the scan/merge too).
-    try:
-        # Secret candidates FIRST: a committed live credential is the highest-
-        # exploitability class, so it must survive the judge-budget truncation
-        # below rather than being the first dropped (it would be, concatenated
-        # last) when a noisy PR fills the budget with other candidates.
-        candidates = (
-            scan_secrets(hunks)
-            + scan_candidates(hunks, file_contents=file_contents)
-            + scan_dependencies(hunks)
-            + scan_iac(hunks)
-        )
-        # The shared judge fail-closes ABOVE its cap: past `_JUDGE_MAX_FINDINGS`
-        # it returns no verdicts and EVERY candidate is suppressed (a noisy PR
-        # could then bury a real leaked secret under benign candidates). Bound
-        # the combined set to the judge budget here so a flood degrades to
-        # "judge the first N" rather than "publish nothing". Logged, never silent.
-        if len(candidates) > _JUDGE_MAX_FINDINGS:
-            log.info(
-                "security_candidates_truncated_to_judge_budget",
-                extra={
-                    "installation_id": installation_id,
-                    "total": len(candidates),
-                    "max": _JUDGE_MAX_FINDINGS,
-                },
-            )
-            candidates = candidates[:_JUDGE_MAX_FINDINGS]
-        security_findings = judge_candidates(
-            candidates,
-            hunks,
-            installation_id,
-            pr_context={
-                "installation_id": installation_id,
-                "repo": f"{owner}/{repo_name}",
-                "pr_number": pull_number,
-                "head_sha": head_sha,
-            },
-            file_contents=file_contents,
-        )
-        if security_findings:
-            evaluation = with_extra_findings(evaluation, security_findings)
-            log.info(
-                "security_findings_merged",
-                extra={
-                    "installation_id": installation_id,
-                    "pr": f"{owner}/{repo_name}#{pull_number}",
-                    "count": len(security_findings),
-                },
-            )
-    except Exception as e:  # noqa: BLE001 — security scan is additive; never break the review
-        log.warning(
-            "security_detection_failed",
-            extra={
-                "installation_id": installation_id,
-                "pr": f"{owner}/{repo_name}#{pull_number}",
-                "kind": type(e).__name__,
-            },
-        )
+    # NOTE (#466, ADR-0012): the deterministic security suite (SAST + SCA +
+    # secret + IaC scans -> exploitability judge) that used to merge into
+    # THIS evaluation now runs as the GUARD persona with its own check-run
+    # ("Grug — Guard") - see personas/guard/dispatch.py. Elder is the LLM
+    # diff review only.
 
     # Judge-gated publication (#467, ADR-0011): grade the findings with the
     # exploitability judge BEFORE publishing, then suppress the ones it
