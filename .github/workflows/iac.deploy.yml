@@ -117,7 +117,7 @@ jobs:
     if: github.event_name != 'pull_request'
     permissions:
       contents: read
-    uses: githumps/infra-public/.github/workflows/_reusable.smoke-test.yml@7a66418334f4c40c43e3555db5e7d86f81b51486
+    uses: githumps/infra-public/.github/workflows/_reusable.smoke-test.yml@25bd74d115a964fdbe0b9bc035750c2cac3c2690
     with:
       retries: 3
       retry-delay: 5
