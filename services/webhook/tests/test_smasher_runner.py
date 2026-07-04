@@ -1,43 +1,52 @@
-"""Trial runner tests (#469) — the launcher that submits the Job + reads back
-the result. The k8s I/O is behind an injectable `cluster` seam so these run with
-a fake cluster (no real API server)."""
+"""Trial runner tests (#469) — the launcher that orchestrates the two-pod flow
+(PVC -> prep pod -> test pod) and reads back the result. The k8s I/O is behind
+an injectable `cluster` seam so these run with a fake cluster (no API server)."""
 
 from __future__ import annotations
 
 import json
 
-from personas.smasher.sandbox import TRIAL_NAMESPACE, TrialResult
+from personas.smasher.sandbox import TRIAL_NAMESPACE
 from personas.smasher.trial_runner import _job_name, launch_trial
 
 
 class _FakeCluster:
-    """Records the submitted manifest + secret and returns a canned message."""
+    """Records the full lifecycle and returns a canned test-pod message."""
 
-    def __init__(self, termination_message, *, phase="Succeeded"):
+    def __init__(self, termination_message, *, prep_phase="Succeeded", test_phase="Succeeded"):
         self.termination_message = termination_message
-        self.phase = phase
-        self.created = None
+        self.prep_phase = prep_phase
+        self.test_phase = test_phase
+        self.events: list = []
+        self.jobs: dict = {}
         self.secret = None
-        self.deleted_job = False
-        self.deleted_secret = False
+        self.pvc = None
 
     def create_secret(self, name, token):
-        self.secret = (name, token)
+        self.secret = (name, token); self.events.append(("secret+", name))
 
     def delete_secret(self, name):
-        self.deleted_secret = True
+        self.events.append(("secret-", name))
+
+    def create_pvc(self, manifest):
+        self.pvc = manifest; self.events.append(("pvc+", manifest["metadata"]["name"]))
+
+    def delete_pvc(self, name):
+        self.events.append(("pvc-", name))
 
     def create_job(self, manifest):
-        self.created = manifest
+        n = manifest["metadata"]["name"]; self.jobs[n] = manifest
+        self.events.append(("job+", n))
 
     def wait_for_completion(self, job_name, timeout):
-        return self.phase
+        return self.prep_phase if job_name.endswith("-prep") else self.test_phase
 
     def read_termination_message(self, job_name):
+        assert job_name.endswith("-test"), "result read from the TEST pod only"
         return self.termination_message
 
     def delete_job(self, job_name):
-        self.deleted_job = True
+        self.events.append(("job-", job_name))
 
 
 _TARGETS = {"pkg/mod.py": [2]}
@@ -48,14 +57,13 @@ def _launch(cluster, **over):
         owner="acme", repo="widget", head_sha="deadbeefcafe",
         token="ghs_x", targets=_TARGETS,  # noqa: S106
         mutant_cap=10, per_mutant_timeout_seconds=30, total_budget_seconds=300,
-        image="registry.example/grug-webhook:sha",
-        cluster=cluster,
+        image="registry.example/grug-webhook:sha", cluster=cluster,
     )
     kw.update(over)
     return launch_trial(**kw)
 
 
-def test_happy_path_returns_survivors_and_cleans_up():
+def test_happy_path_two_pod_flow_and_cleanup():
     msg = json.dumps({
         "status": "completed", "total": 3, "killed": 2,
         "survived": [{"file": "pkg/mod.py", "line": 2, "operator": "boundary",
@@ -63,81 +71,78 @@ def test_happy_path_returns_survivors_and_cleans_up():
     })
     cluster = _FakeCluster(msg)
     res = _launch(cluster)
-    assert isinstance(res, TrialResult)
-    assert res.status == "completed"
-    assert len(res.survived) == 1
-    assert cluster.created["kind"] == "Job"
-    assert cluster.created["metadata"]["namespace"] == TRIAL_NAMESPACE
-    # Job + Secret both cleaned up.
-    assert cluster.deleted_job is True and cluster.deleted_secret is True
+    assert res.status == "completed" and len(res.survived) == 1
+    created_jobs = [n for kind, n in cluster.events if kind == "job+"]
+    # prep pod created BEFORE the test pod.
+    assert created_jobs == [n for n in created_jobs if n.endswith(("-prep", "-test"))]
+    assert any(n.endswith("-prep") for n in created_jobs)
+    assert any(n.endswith("-test") for n in created_jobs)
+    prep_i = next(i for i, (k, n) in enumerate(cluster.events) if k == "job+" and n.endswith("-prep"))
+    test_i = next(i for i, (k, n) in enumerate(cluster.events) if k == "job+" and n.endswith("-test"))
+    assert prep_i < test_i
+    # PVC + Secret + both Jobs cleaned up.
+    assert cluster.pvc is not None
+    assert ("pvc-", cluster.pvc["metadata"]["name"]) in cluster.events
+    assert any(k == "secret-" for k, _ in cluster.events)
+    deleted = {n for k, n in cluster.events if k == "job-"}
+    assert all(n in deleted for n in created_jobs)
 
 
-def test_token_goes_into_a_secret_referenced_by_the_job():
+def test_test_pod_runs_in_grug_trial_namespace():
+    cluster = _FakeCluster(json.dumps({"status": "completed", "total": 1, "killed": 1}))
+    _launch(cluster)
+    for m in cluster.jobs.values():
+        assert m["metadata"]["namespace"] == TRIAL_NAMESPACE
+
+
+def test_token_secret_dropped_before_test_pod_runs():
+    # The token Secret must be deleted after prep succeeds, BEFORE the test pod
+    # (author code) runs - so the author phase can't even reach the Secret.
+    cluster = _FakeCluster(json.dumps({"status": "completed", "total": 1, "killed": 1}))
+    _launch(cluster)
+    test_create_i = next(i for i, (k, n) in enumerate(cluster.events) if k == "job+" and n.endswith("-test"))
+    # A secret delete happens before the test job is created.
+    secret_deletes = [i for i, (k, _) in enumerate(cluster.events) if k == "secret-"]
+    assert any(i < test_create_i for i in secret_deletes)
+
+
+def test_prep_failure_degrades_and_skips_test_pod():
+    cluster = _FakeCluster(None, prep_phase="Failed")
+    res = _launch(cluster)
+    assert res.status == "degraded" and res.reason == "prep_failed"
+    # The test pod (author code) is NEVER created if prep failed.
+    assert not any(k == "job+" and n.endswith("-test") for k, n in cluster.events)
+
+
+def test_token_goes_into_a_secret_never_inlined():
     cluster = _FakeCluster(json.dumps({"status": "completed", "total": 1, "killed": 1}))
     _launch(cluster, token="ghs_secret")  # noqa: S106
-    # The token is created as a Secret, never inlined into the manifest.
-    assert cluster.secret is not None
-    secret_name, tok = cluster.secret
-    assert tok == "ghs_secret"
-    manifest_json = json.dumps(cluster.created)
-    assert "ghs_secret" not in manifest_json
-    # The fetch container references that Secret by name.
-    fetch = cluster.created["spec"]["template"]["spec"]["initContainers"][0]
-    ref = next(e["valueFrom"]["secretKeyRef"] for e in fetch["env"] if e["name"] == "GRUG_TRIAL_TOKEN")
-    assert ref["name"] == secret_name
+    assert cluster.secret[1] == "ghs_secret"
+    for m in cluster.jobs.values():
+        assert "ghs_secret" not in json.dumps(m)
 
 
-def test_job_name_is_repo_qualified_no_collision_on_shared_sha():
-    # Two different repos at the SAME head SHA must not collide onto one Job.
+def test_job_name_repo_qualified_no_collision_on_shared_sha():
     a = _job_name("acme", "widget", "deadbeefcafe")
     b = _job_name("other", "widget", "deadbeefcafe")
-    assert a != b
-    assert a.startswith("grug-trial-") and len(a) <= 63
+    assert a != b and a.startswith("grug-trial-") and len(a) <= 55  # +suffix stays <=63
 
 
 def test_no_image_degrades_with_reason():
     cluster = _FakeCluster(None)
     res = _launch(cluster, image="")
     assert res.status == "degraded" and res.reason == "no_job_image_configured"
-    # No Job/Secret created when we bail early.
-    assert cluster.created is None and cluster.secret is None
+    assert cluster.pvc is None and cluster.secret is None
 
 
 def test_no_termination_message_degrades():
-    res = _launch(_FakeCluster(None))
-    assert res.status == "degraded"
+    assert _launch(_FakeCluster(None)).status == "degraded"
 
 
-def test_cluster_error_degrades_not_raises_and_cleans_secret():
-    class _Boom:
-        def create_secret(self, name, token):
+def test_cluster_error_degrades_not_raises():
+    class _Boom(_FakeCluster):
+        def create_pvc(self, manifest):
             raise RuntimeError("api down")
 
-        def delete_secret(self, name):
-            pass
-
-        def create_job(self, manifest):
-            raise RuntimeError("api down")
-
-        def wait_for_completion(self, *a):
-            raise RuntimeError("api down")
-
-        def read_termination_message(self, *a):
-            raise RuntimeError("api down")
-
-        def delete_job(self, *a):
-            pass
-
-    res = _launch(_Boom())
-    assert res.status == "degraded" and res.reason == "job_create_failed"
-
-
-def test_delete_best_effort_even_on_read_failure():
-    class _ReadBoom(_FakeCluster):
-        def read_termination_message(self, job_name):
-            raise RuntimeError("cannot read")
-
-    cluster = _ReadBoom(None)
-    res = _launch(cluster)
-    assert res.status == "degraded"
-    assert cluster.deleted_job is True and cluster.deleted_secret is True
+    res = _launch(_Boom(None))
+    assert res.status == "degraded" and res.reason == "prep_create_failed"

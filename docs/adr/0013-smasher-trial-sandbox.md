@@ -22,30 +22,39 @@ whole slice is a sandbox-boundary problem.
 
 ## Decision
 
-### Execution vessel: one locked-down Kubernetes Job per Trial run
+### Execution vessel: a TWO-POD split per Trial run
 
 The webhook (which already processes the untrusted webhook payload but holds no
-code-execution surface) LAUNCHES a Job and never runs author code itself. The
-Job is the vessel; its pod spec is the security boundary:
+code-execution surface) LAUNCHES the pods and never runs author code itself. The
+work is split across TWO Jobs sharing one PVC so the network-having phase and
+the author-code phase are DIFFERENT pods with DIFFERENT egress policies (a
+pod-level NetworkPolicy cannot distinguish containers within one pod — the
+original single-Job design could not deny the test phase network without also
+denying the fetch phase; peer review PR #494 flagged this, and the split closes
+it):
 
-- `automountServiceAccountToken: false` on the Job pod — the code under test
-  gets NO Kubernetes credential.
-- Two containers sharing a `workspace` emptyDir, run as separate phases:
-  - **init `fetch`** — the ONLY holder of a short-lived credential. Receives a
-    GitHub installation access token scoped `contents:read` on the SINGLE repo
-    (the token-create API accepts a `repositories` + `permissions` subset) via a
-    per-Job Kubernetes Secret (`secretKeyRef`), NOT inlined into the Job spec
-    (an inlined credential would persist in etcd and be readable by anything
-    with `get jobs`). Downloads the repo tarball at the head SHA. A separate
-    `deps` init phase (NO token) installs test dependencies. The Secret is
-    created and deleted alongside the Job by the launcher.
-  - **main `test`** — NO token, NO secrets, `readOnlyRootFilesystem: true`
-    except the workspace, `runAsNonRoot`, all caps dropped,
-    `seccompProfile: RuntimeDefault`, CPU/memory limits. Runs the mutation
-    worker over the checkout. This is where author code executes; it holds
-    nothing worth stealing and (see below) is the network-jailed phase.
-- `activeDeadlineSeconds` = the total wall-clock budget: the kubelet kills a
-  runaway Job regardless of what the code under test does.
+- **prep pod** (`grug-trial-phase: prep`, egress DNS+443):
+  - init `fetch` — the ONLY holder of a short-lived credential (a
+    `contents:read`-scoped, single-repo GitHub token via a per-Job Secret
+    `secretKeyRef`, NOT inlined into the spec/etcd). Downloads the repo tarball
+    at the head SHA into the shared PVC.
+  - main `deps` — NO token. Wheel-only installs test deps into the PVC (wheel
+    extraction runs no author build backends, so NO author code runs in prep).
+- **test pod** (`grug-trial-phase: test`, DENY-ALL egress):
+  - `test` — NO token, NO secrets, DENY-ALL egress (deps are vendored on the
+    PVC, so it needs no network), `readOnlyRootFilesystem` (+ writable `/tmp` +
+    the PVC), `runAsNonRoot`, all caps dropped, `seccompProfile: RuntimeDefault`,
+    CPU/memory limits. Runs the mutation worker; this is the ONLY phase author
+    code executes, now fully network-jailed (on a policy CNI) and holding
+    nothing to steal.
+- The **shared PVC** (node-local `local-path`, `WaitForFirstConsumer`) carries
+  the checkout+deps between the pods; the binding pins the test pod to the prep
+  pod's node. The launcher creates the PVC + Secret, runs prep, DROPS the Secret
+  once prep succeeds (before the author-code pod starts), runs test, reads the
+  result, and reaps the PVC/Secret/Jobs.
+- `automountServiceAccountToken: false` on BOTH pods — no Kubernetes credential.
+- `activeDeadlineSeconds` per Job = the wall-clock budget: the kubelet kills a
+  runaway regardless of what the code under test does.
 
 ### Result channel: the pod termination message, NOT logs
 
@@ -61,8 +70,9 @@ Kubernetes API, no kubelet access, 4 KiB cap — survived-mutant summaries fit).
 The webhook + consumer pods mount a dedicated ServiceAccount
 `grug-smasher-launcher`. Its permissions live ENTIRELY in a SEPARATE, dedicated
 `grug-trial` namespace — NOT in `grug` — granting exactly `jobs`
-create/get/list/delete, `pods` get/list (to read the termination message), and
-`secrets` create/get/delete (for the per-Job token Secret). It has ZERO
+create/get/list/delete, `pods` get/list (to read the termination message),
+`secrets` create/get/delete (for the per-Job token Secret), and
+`persistentvolumeclaims` create/get/delete (the shared workspace). It has ZERO
 permissions in the `grug` namespace.
 
 Why the separate namespace matters (this is load-bearing): `create jobs`
@@ -131,13 +141,11 @@ defects. They are accepted under Smasher's trust model (default OFF, per-repo
 opt-in only where PR authors may "run code in the sandbox", advisory-only,
 policy-CNI precondition, no credential in the test phase):
 
-- **Test-phase egress.** The test phase runs arbitrary PR-author code, so on a
-  policy CNI it can still make DNS+443 calls (pod-level NetworkPolicy can't deny
-  only the test phase — see the manifest). No credential rides there; the
-  residual is SSRF/exfil-of-already-owned-repo/compute within the deadline. TRUE
-  test-phase network denial requires a two-pod split (a prep pod fetches into a
-  shared volume; a separate test pod runs with default-deny egress) — a
-  documented FOLLOW-UP, out of scope for this tracer.
+- **Test-phase egress — FIXED (was a residual).** The two-pod split (above) puts
+  the author-code phase in its own pod with a DENY-ALL egress NetworkPolicy;
+  deps are already vendored on the PVC so it needs no network. On a policy CNI
+  the test phase is genuinely offline. (On flannel the policy is inert like all
+  the others, but credential-denial + no-network-need still hold.)
 - **Oracle trust.** Mutation testing measures the repo's OWN test suite as the
   oracle, so the test suite's exit code IS author-controlled by definition — an
   author could add a source-hash-guard test to make every mutant "killed". This

@@ -47,6 +47,11 @@ rules:
   - apiGroups: [""]
     resources: ["secrets"]
     verbs: ["create", "get", "delete"]
+  # The per-Trial shared workspace PVC (carries the checkout+deps from the prep
+  # pod to the network-jailed test pod).
+  - apiGroups: [""]
+    resources: ["persistentvolumeclaims"]
+    verbs: ["create", "get", "delete"]
 ---
 # Bind the grug-namespace launcher SA (mounted on the webhook + consumer pods)
 # to the grug-trial Role. Cross-namespace subject is explicit + intentional.
@@ -74,32 +79,28 @@ spec:
   podSelector: {}
   policyTypes: [Ingress]
 ---
-# Trial pods get the MINIMUM egress the fetch + dependency-install init phases
-# need - DNS + 443 (GitHub tarball + PyPI wheels) - and nothing else.
+# TWO-POD SPLIT (peer-review PR #494) gives the two phases DIFFERENT egress:
+#
+#  - the PREP pod (label grug-trial-phase=prep) fetches the tarball + wheels, so
+#    it gets DNS + 443 - and it runs NO author test code (wheel-only install).
+#  - the TEST pod (label grug-trial-phase=test) runs the author's pytest suite
+#    with DENY-ALL egress: it needs no network (deps are already vendored on the
+#    shared PVC) and holds no token. This is the phase that runs untrusted code,
+#    now fully network-jailed rather than sharing the fetch phase's egress.
 #
 # ENFORCEMENT CAVEAT (ADR-0013): NetworkPolicy is only enforced by a policy CNI;
-# this cluster runs flannel (does NOT enforce), so this policy is INERT here
-# today. The escalation fix does NOT depend on it - that rests on the namespace
-# holding no credential to steal.
-#
-# ACCEPTED RESIDUAL (codex/poolside/spark peer-review, PR #494): pod-level
-# NetworkPolicy cannot grant egress to the init phases (fetch+deps NEED DNS+443)
-# while denying it to the test phase - they share one pod netns. The test phase
-# runs arbitrary PR-author code (pytest), so it CAN make DNS+443 calls even on a
-# policy CNI; "makes no calls" is not enforceable. This is accepted because the
-# test phase holds NO credential (nothing to exfiltrate but the repo the author
-# already controls) and Smasher is default-OFF, opt-in only for repos whose
-# authors are trusted to "run code in the sandbox", deadline+resource bounded.
-# TRUE test-phase network denial needs a two-pod split (prep pod fetches to a
-# shared volume; test pod runs with default-deny egress) - a documented
-# follow-up, out of scope for this tracer. See ADR-0013.
+# this cluster runs flannel (does NOT enforce), so these are INERT here today.
+# The escalation fix + credential-denial do NOT depend on them. A policy CNI is
+# the documented precondition for enabling Smasher, at which point the test pod
+# is genuinely offline.
 apiVersion: networking.k8s.io/v1
 kind: NetworkPolicy
 metadata:
-  name: allow-egress-trial
+  name: allow-egress-prep
   namespace: grug-trial
 spec:
-  podSelector: {}
+  podSelector:
+    matchLabels: {grug-trial-phase: prep}
   policyTypes: [Egress]
   egress:
     - ports:
@@ -107,3 +108,15 @@ spec:
         - {protocol: TCP, port: 53}
     - ports:
         - {protocol: TCP, port: 443}
+---
+# Deny ALL egress by default (every pod). Only the prep phase re-opens DNS+443
+# above; the TEST pod (author code) matches nothing that opens egress, so it is
+# fully denied - the whole point of the two-pod split.
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: default-deny-egress
+  namespace: grug-trial
+spec:
+  podSelector: {}
+  policyTypes: [Egress]

@@ -16,18 +16,28 @@ from personas.smasher.sandbox import (
     TRIAL_NAMESPACE,
     SurvivedMutant,
     TrialResult,
-    build_trial_job,
+    build_prep_job,
+    build_test_job,
+    build_trial_pvc,
     extract_target_lines,
     parse_trial_result,
 )
 
-_KW = dict(
-    job_name="grug-trial-abc123",
+_PREP_KW = dict(
+    job_name="grug-trial-abc123-prep",
     image="registry.example/grug-webhook:sha",
     owner="acme",
     repo="widget",
     head_sha="deadbeef",
     token_secret_name="grug-trial-abc123-token",
+    pvc_name="grug-trial-abc123-ws",
+    total_budget_seconds=300,
+)
+
+_TEST_KW = dict(
+    job_name="grug-trial-abc123-test",
+    image="registry.example/grug-webhook:sha",
+    pvc_name="grug-trial-abc123-ws",
     targets={"pkg/mod.py": [2, 3]},
     total_budget_seconds=300,
     per_mutant_timeout_seconds=30,
@@ -35,38 +45,47 @@ _KW = dict(
 )
 
 
-def _job(**over):
-    kw = {**_KW, **over}
-    return build_trial_job(**kw)
+def _prep(**over):
+    return build_prep_job(**{**_PREP_KW, **over})
 
 
-def _containers(job):
+def _test(**over):
+    return build_test_job(**{**_TEST_KW, **over})
+
+
+def _all_containers(job):
     spec = job["spec"]["template"]["spec"]
-    return spec.get("initContainers", []), spec["containers"]
+    return spec.get("initContainers", []) + spec.get("containers", [])
 
 
-def test_job_runs_in_isolated_trial_namespace():
-    # The escalation fix: Trial Jobs live in the dedicated, secret-free
+def test_both_jobs_run_in_isolated_trial_namespace():
+    # The escalation fix: everything lives in the dedicated, secret-free
     # grug-trial namespace, NOT in grug.
-    assert _job()["metadata"]["namespace"] == TRIAL_NAMESPACE == "grug-trial"
+    assert _prep()["metadata"]["namespace"] == TRIAL_NAMESPACE == "grug-trial"
+    assert _test()["metadata"]["namespace"] == "grug-trial"
+    assert build_trial_pvc("ws")["metadata"]["namespace"] == "grug-trial"
 
 
-def test_pod_gets_no_service_account_token():
-    job = _job()
-    assert job["spec"]["template"]["spec"]["automountServiceAccountToken"] is False
+def test_pods_get_no_service_account_token():
+    for job in (_prep(), _test()):
+        assert job["spec"]["template"]["spec"]["automountServiceAccountToken"] is False
 
 
-def test_token_only_reaches_fetch_via_secretref_never_inlined():
-    job = _job(token_secret_name="the-secret")
-    inits, mains = _containers(job)
+def test_phase_labels_drive_the_egress_split():
+    # prep pod gets the DNS+443 policy; test pod is denied all egress - the
+    # two-pod isolation hinges on these labels.
+    assert _prep()["spec"]["template"]["metadata"]["labels"]["grug-trial-phase"] == "prep"
+    assert _test()["spec"]["template"]["metadata"]["labels"]["grug-trial-phase"] == "test"
+
+
+def test_token_only_in_prep_fetch_via_secretref_never_inlined():
+    prep = _prep(token_secret_name="the-secret")
     # The token is NEVER a plaintext env value anywhere (would persist in etcd).
-    for c in inits + mains:
+    for c in _all_containers(prep):
         for e in c.get("env", []):
             assert "value" not in e or "token" not in e.get("value", "").lower()
-    # Exactly the `fetch` init container carries a GRUG_TRIAL_TOKEN sourced from
-    # the per-Job Secret via secretKeyRef.
     holders = []
-    for c in inits + mains:
+    for c in _all_containers(prep):
         for e in c.get("env", []):
             if e["name"] == "GRUG_TRIAL_TOKEN":
                 assert e["valueFrom"]["secretKeyRef"] == {"name": "the-secret", "key": "token"}
@@ -74,71 +93,62 @@ def test_token_only_reaches_fetch_via_secretref_never_inlined():
     assert holders == ["fetch"]
 
 
-def test_test_container_has_no_secrets_and_no_token():
-    job = _job()
-    _inits, mains = _containers(job)
-    test = next(c for c in mains if c["name"] == "test")
-    assert "envFrom" not in test
-    for e in test.get("env", []):
-        assert "TOKEN" not in e["name"]
-        assert "valueFrom" not in e  # no secretKeyRef sneaking in
+def test_test_pod_has_no_token_no_secret_anywhere():
+    # The author-code pod carries NO credential of any kind.
+    test = _test()
+    for c in _all_containers(test):
+        assert "envFrom" not in c
+        for e in c.get("env", []):
+            assert "TOKEN" not in e["name"]
+            assert "valueFrom" not in e
 
 
-def test_all_containers_are_hardened():
-    # The security context must be locked on EVERY container that touches
-    # author-controlled input — fetch (tarball), deps (requirements), test.
-    job = _job()
-    inits, mains = _containers(job)
-    for c in inits + mains:
-        sc = c["securityContext"]
-        assert sc["readOnlyRootFilesystem"] is True, c["name"]
-        assert sc["allowPrivilegeEscalation"] is False, c["name"]
-        assert sc["runAsNonRoot"] is True, c["name"]
-        assert sc["capabilities"]["drop"] == ["ALL"], c["name"]
-        assert c["resources"]["limits"]["memory"] and c["resources"]["limits"]["cpu"]
+def test_all_containers_hardened_in_both_pods():
+    for job in (_prep(), _test()):
+        for c in _all_containers(job):
+            sc = c["securityContext"]
+            assert sc["readOnlyRootFilesystem"] is True, c["name"]
+            assert sc["allowPrivilegeEscalation"] is False, c["name"]
+            assert sc["runAsNonRoot"] is True, c["name"]
+            assert sc["capabilities"]["drop"] == ["ALL"], c["name"]
+            assert c["resources"]["limits"]["memory"] and c["resources"]["limits"]["cpu"]
 
 
-def test_every_container_has_writable_tmp():
-    # readOnlyRootFilesystem would break pip + pytest tmp_path without a
-    # writable /tmp emptyDir mounted on each container.
-    job = _job()
-    spec = job["spec"]["template"]["spec"]
-    vol_names = {v["name"] for v in spec["volumes"]}
-    assert "tmp" in vol_names
-    inits, mains = _containers(job)
-    for c in inits + mains:
-        mounts = {m["mountPath"] for m in c["volumeMounts"]}
-        assert "/tmp" in mounts, c["name"]
-        assert "/workspace" in mounts, c["name"]
+def test_both_pods_share_the_workspace_pvc_plus_writable_tmp():
+    for job in (_prep(), _test()):
+        vols = {v["name"]: v for v in job["spec"]["template"]["spec"]["volumes"]}
+        # The shared PVC carries the checkout+deps between the pods.
+        assert vols["workspace"]["persistentVolumeClaim"]["claimName"] == "grug-trial-abc123-ws"
+        assert "tmp" in vols  # writable /tmp for pip/pytest
+        for c in _all_containers(job):
+            mounts = {m["mountPath"] for m in c["volumeMounts"]}
+            assert {"/workspace", "/tmp"} <= mounts, c["name"]
+
+
+def test_pvc_is_node_local_rwo():
+    pvc = build_trial_pvc("grug-trial-abc123-ws")
+    assert pvc["kind"] == "PersistentVolumeClaim"
+    assert pvc["spec"]["accessModes"] == ["ReadWriteOnce"]
+    assert pvc["spec"]["storageClassName"] == "local-path"
 
 
 def test_deadline_and_restart_policy_bound_runaways():
-    job = _job()
-    spec = job["spec"]["template"]["spec"]
-    assert job["spec"]["activeDeadlineSeconds"] == _KW["total_budget_seconds"]
-    assert spec["restartPolicy"] == "Never"
-    assert job["spec"]["backoffLimit"] == 0
+    for job in (_prep(), _test()):
+        assert job["spec"]["activeDeadlineSeconds"] == 300
+        assert job["spec"]["template"]["spec"]["restartPolicy"] == "Never"
+        assert job["spec"]["backoffLimit"] == 0
 
 
 def test_result_channel_is_termination_message():
-    job = _job()
-    _inits, mains = _containers(job)
-    test = next(c for c in mains if c["name"] == "test")
-    assert test["terminationMessagePath"] == "/dev/termination-log"
-    assert test["terminationMessagePolicy"] == "File"
-
-
-def test_pod_labelled_for_networkpolicy_selection():
-    job = _job()
-    labels = job["spec"]["template"]["metadata"]["labels"]
-    assert labels.get("grug-trial") == "true"
+    test = _test()
+    tc = next(c for c in test["spec"]["template"]["spec"]["containers"] if c["name"] == "test")
+    assert tc["terminationMessagePath"] == "/dev/termination-log"
+    assert tc["terminationMessagePolicy"] == "File"
 
 
 def test_budget_env_passed_to_worker_not_as_secret():
-    job = _job()
-    _inits, mains = _containers(job)
-    test = next(c for c in mains if c["name"] == "test")
-    env = {e["name"]: e["value"] for e in test.get("env", []) if "value" in e}
+    tc = next(c for c in _test()["spec"]["template"]["spec"]["containers"] if c["name"] == "test")
+    env = {e["name"]: e["value"] for e in tc.get("env", []) if "value" in e}
     assert env["GRUG_TRIAL_MUTANT_CAP"] == "10"
     assert env["GRUG_TRIAL_PER_MUTANT_TIMEOUT"] == "30"
     assert env["PYTHONDONTWRITEBYTECODE"] == "1"

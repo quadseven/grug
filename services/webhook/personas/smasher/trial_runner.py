@@ -31,7 +31,9 @@ import httpx
 from personas.smasher.sandbox import (
     TRIAL_NAMESPACE,
     TrialResult,
-    build_trial_job,
+    build_prep_job,
+    build_test_job,
+    build_trial_pvc,
     parse_trial_result,
 )
 
@@ -54,6 +56,8 @@ class Cluster(Protocol):
 
     def create_secret(self, name: str, token: str) -> None: ...
     def delete_secret(self, name: str) -> None: ...
+    def create_pvc(self, manifest: dict[str, Any]) -> None: ...
+    def delete_pvc(self, name: str) -> None: ...
     def create_job(self, manifest: dict[str, Any]) -> None: ...
     def wait_for_completion(self, job_name: str, timeout: int) -> str: ...
     def read_termination_message(self, job_name: str) -> str | None: ...
@@ -99,44 +103,54 @@ def launch_trial(
         log.error("smasher_no_job_image_configured")  # permanent operator fault
         return _degraded("no_job_image_configured")
 
-    job_name = _job_name(owner, repo, head_sha)
-    secret_name = f"{job_name}-token"
-    manifest = build_trial_job(
-        job_name=job_name,
-        image=image,
-        owner=owner,
-        repo=repo,
-        head_sha=head_sha,
-        token_secret_name=secret_name,
-        targets=targets,
-        total_budget_seconds=total_budget_seconds,
-        per_mutant_timeout_seconds=per_mutant_timeout_seconds,
-        mutant_cap=mutant_cap,
-    )
+    base = _job_name(owner, repo, head_sha)
+    prep_job, test_job = f"{base}-prep", f"{base}-test"
+    secret_name, pvc_name = f"{base}-token", f"{base}-ws"
+    budget = total_budget_seconds
 
+    def _cleanup() -> None:
+        # Order: Jobs (release the PVC mount) before the PVC, then the Secret.
+        _swallow(lambda: cluster.delete_job(test_job))
+        _swallow(lambda: cluster.delete_job(prep_job))
+        _swallow(lambda: cluster.delete_pvc(pvc_name))
+        _swallow(lambda: cluster.delete_secret(secret_name))
+
+    _cleanup()  # clear any leftovers from a prior same-head run (best-effort)
     try:
-        # A prior run at the same head SHA may have left a Job/Secret (re-run at
-        # the same head); delete first so create doesn't 409. Best-effort.
-        _swallow(lambda: cluster.delete_job(job_name))
-        _swallow(lambda: cluster.delete_secret(secret_name))
         cluster.create_secret(secret_name, token)
-        cluster.create_job(manifest)
+        cluster.create_pvc(build_trial_pvc(pvc_name))
+        cluster.create_job(build_prep_job(
+            job_name=prep_job, image=image, owner=owner, repo=repo, head_sha=head_sha,
+            token_secret_name=secret_name, pvc_name=pvc_name, total_budget_seconds=budget,
+        ))
     except Exception as e:  # noqa: BLE001 — submit failure degrades, never raises
-        log.warning("smasher_job_create_failed", extra={"kind": type(e).__name__})
-        _swallow(lambda: cluster.delete_secret(secret_name))
-        return _degraded("job_create_failed")
+        log.warning("smasher_prep_create_failed", extra={"kind": type(e).__name__})
+        _cleanup()
+        return _degraded("prep_create_failed")
 
     message: str | None = None
     try:
-        cluster.wait_for_completion(job_name, total_budget_seconds + _WAIT_SLACK_SECONDS)
-        message = cluster.read_termination_message(job_name)
+        # Phase 1: prep (fetch + wheel-install into the PVC). The token Secret is
+        # only needed until fetch is done; drop it before the test pod runs so
+        # the author-code phase can't even reach the Secret object.
+        prep_phase = cluster.wait_for_completion(prep_job, budget + _WAIT_SLACK_SECONDS)
+        _swallow(lambda: cluster.delete_secret(secret_name))
+        if prep_phase != "Succeeded":
+            log.warning("smasher_prep_failed", extra={"phase": prep_phase})
+            return _degraded("prep_failed")
+
+        # Phase 2: test (mutation worker, network-denied). Author code runs here.
+        cluster.create_job(build_test_job(
+            job_name=test_job, image=image, pvc_name=pvc_name, targets=targets,
+            total_budget_seconds=budget, per_mutant_timeout_seconds=per_mutant_timeout_seconds,
+            mutant_cap=mutant_cap,
+        ))
+        cluster.wait_for_completion(test_job, budget + _WAIT_SLACK_SECONDS)
+        message = cluster.read_termination_message(test_job)
     except Exception as e:  # noqa: BLE001 — read/wait failure degrades
         log.warning("smasher_job_wait_or_read_failed", extra={"kind": type(e).__name__})
     finally:
-        # Delete the Job + its token Secret; ttlSecondsAfterFinished is the
-        # backstop for the Job (the Secret has no TTL, so this cleanup matters).
-        _swallow(lambda: cluster.delete_job(job_name))
-        _swallow(lambda: cluster.delete_secret(secret_name))
+        _cleanup()
 
     return parse_trial_result(message)
 
@@ -182,6 +196,7 @@ class _HttpxCluster:
         self._jobs = f"{_API}/apis/batch/v1/namespaces/{TRIAL_NAMESPACE}/jobs"
         self._pods = f"{_API}/api/v1/namespaces/{TRIAL_NAMESPACE}/pods"
         self._secrets = f"{_API}/api/v1/namespaces/{TRIAL_NAMESPACE}/secrets"
+        self._pvcs = f"{_API}/api/v1/namespaces/{TRIAL_NAMESPACE}/persistentvolumeclaims"
 
     def create_secret(self, name: str, token: str) -> None:
         manifest = {
@@ -201,6 +216,14 @@ class _HttpxCluster:
 
     def delete_secret(self, name: str) -> None:
         resp = self._client.request("DELETE", f"{self._secrets}/{name}")
+        if resp.status_code not in (200, 202, 404):
+            resp.raise_for_status()
+
+    def create_pvc(self, manifest: dict[str, Any]) -> None:
+        self._client.post(self._pvcs, json=manifest).raise_for_status()
+
+    def delete_pvc(self, name: str) -> None:
+        resp = self._client.request("DELETE", f"{self._pvcs}/{name}")
         if resp.status_code not in (200, 202, 404):
             resp.raise_for_status()
 
