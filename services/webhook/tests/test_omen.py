@@ -133,3 +133,44 @@ def test_prompt_has_hot_path_rule():
     from code_review_prompt import RULES
 
     assert "hot-path-unguarded" in {r.name for r in RULES}
+
+
+def test_same_tail_collision_is_skipped_not_misattributed(monkeypatch):
+    """Codex PR #490: two changed paths sharing the same two-segment
+    tail are AMBIGUOUS - query neither rather than attribute one
+    path's errors to the other."""
+    diff = "\n".join([
+        "diff --git a/svc_a/m/x.py b/svc_a/m/x.py", "--- a/svc_a/m/x.py",
+        "+++ b/svc_a/m/x.py", "@@ -0,0 +1,1 @@", "+a=1",
+        "diff --git a/svc_b/m/x.py b/svc_b/m/x.py", "--- a/svc_b/m/x.py",
+        "+++ b/svc_b/m/x.py", "@@ -0,0 +1,1 @@", "+b=1",
+    ]) + "\n"
+    calls = _wire(monkeypatch, mapping={"o/r": "svc"}, count=100)
+    assert omen.build_runtime_context("o", "r", parse_diff(diff)) is None
+    assert calls == []  # ambiguous token: zero queries
+
+
+def test_distinct_dirs_same_basename_query_distinct_tokens(monkeypatch):
+    """Two config.py files in different dirs get DISTINCT two-segment
+    tokens - no basename collision (the codex misattribution class)."""
+    diff = "\n".join([
+        "diff --git a/api/config.py b/api/config.py", "--- a/api/config.py",
+        "+++ b/api/config.py", "@@ -0,0 +1,1 @@", "+a=1",
+        "diff --git a/webhook/config.py b/webhook/config.py", "--- a/webhook/config.py",
+        "+++ b/webhook/config.py", "@@ -0,0 +1,1 @@", "+b=1",
+    ]) + "\n"
+    seen_queries = []
+    monkeypatch.setattr(omen, "get_omen_service_map", lambda: {"o/r": "svc"})
+    monkeypatch.setattr(omen, "get_dd_api_key", lambda: "api")
+    monkeypatch.setattr(omen, "get_dd_app_key", lambda: "app")
+
+    def fake_post(url, **kw):
+        seen_queries.append(kw["json"]["filter"]["query"])
+        return _dd_response(50)
+
+    monkeypatch.setattr(omen.httpx, "post", fake_post)
+    ctx = omen.build_runtime_context("o", "r", parse_diff(diff))
+    assert ctx is not None
+    assert any("api/config.py" in q for q in seen_queries)
+    assert any("webhook/config.py" in q for q in seen_queries)
+    assert "api/config.py" in ctx and "webhook/config.py" in ctx

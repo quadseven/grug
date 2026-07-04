@@ -386,12 +386,14 @@ RULES: tuple[ReviewRule, ...] = (
     ReviewRule(
         name="hot-path-unguarded",
         bug_class="robustness",
-        description="A change on a code path that is ERRORING IN PRODUCTION "
-        "right now (see the PRODUCTION SIGNAL block, when present) that does "
+        description="A change on a code path CORRELATED with production "
+        "errors (see the PRODUCTION SIGNAL block, when present) that does "
         "not guard or fix the failing behavior - or worsens it. Only flag "
-        "when the signal block names the file; anchor on the changed diff "
-        "line and cite the production evidence (count + window) from the "
-        "signal block in the message.",
+        "when the signal block lists the exact changed path AND the "
+        "correlation plausibly involves the changed lines (the match is a "
+        "path-suffix correlation, not proven attribution - say so). Anchor "
+        "on the changed diff line and cite the evidence (count + window) "
+        "from the signal block in the message.",
         bad_example="+    data = payload[key]  # dispatcher.py: 47 errors/7d, still no KeyError guard",
         good_example="+    data = payload.get(key)\n+    if data is None:\n+        log.warning('missing_key', extra={'key': key}); return",
         severity="high",

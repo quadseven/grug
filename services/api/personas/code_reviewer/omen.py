@@ -98,39 +98,59 @@ def build_runtime_context(
         return None
 
     deadline = time.monotonic() + _TOTAL_BUDGET_SECONDS
-    basenames: list[str] = []
-    for h in hunks:
-        base = h.file_path.rsplit("/", 1)[-1]
-        if base and base not in basenames:
-            basenames.append(base)
+    # Query token = the LAST TWO path segments (codex PR #490: a bare
+    # basename collides across a service's many config.py/__init__.py
+    # files and misattributes unrelated errors). Two segments match
+    # traceback paths while disambiguating; top-level files keep their
+    # basename. Changed paths whose tokens still collide are SKIPPED
+    # (ambiguous attribution is worse than no signal), logged.
+    token_by_path: dict[str, str] = {
+        h.file_path: "/".join(h.file_path.split("/")[-2:])
+        for h in hunks if h.file_path
+    }
+    token_owners: dict[str, list[str]] = {}
+    for path, tok in token_by_path.items():
+        token_owners.setdefault(tok, []).append(path)
 
     lines: list[str] = []
-    for base in basenames[:_MAX_FILES]:
+    queried = 0
+    for tok, owners in token_owners.items():
+        if queried >= _MAX_FILES:
+            break
+        if len(owners) > 1:
+            log.info(
+                "omen_degraded",
+                extra={"stage": "ambiguous_token", "token": tok, "paths": len(owners)},
+            )
+            continue
+        queried += 1
         try:
-            count = _error_count(api_key, app_key, service, base, deadline)
+            count = _error_count(api_key, app_key, service, tok, deadline)
         except (httpx.HTTPStatusError, httpx.RequestError, ValueError) as e:
             log.info(
                 "omen_degraded",
-                extra={"stage": "query", "file": base, "kind": type(e).__name__},
+                extra={"stage": "query", "file": tok, "kind": type(e).__name__},
             )
             continue
         if count is None:
-            log.info("omen_degraded", extra={"stage": "budget", "file": base})
+            log.info("omen_degraded", extra={"stage": "budget", "file": tok})
             break
         if count < _MIN_ERROR_COUNT:
             continue
-        link_query = quote(f'service:{service} status:error "{base}"', safe="")
+        link_query = quote(f'service:{service} status:error "{tok}"', safe="")
         lines.append(
-            f"- `{base}`: {count} error log(s) in the last 7 days "
-            f"([evidence](https://app.{_dd_site()}/logs?query={link_query}&from_ts=now-7d&to_ts=now))"
+            f"- `{owners[0]}`: {count} error log(s) MATCHING `{tok}` in the "
+            f"last 7 days ([evidence](https://app.{_dd_site()}/logs?query={link_query}&from_ts=now-7d&to_ts=now))"
         )
     if not lines:
         return None
     return (
         f"PRODUCTION SIGNAL (Datadog service `{service}`, last 7 days) — "
-        "files in this diff that are ERRORING IN PRODUCTION right now. "
-        "Weigh findings on these paths heavier and check the diff guards "
-        "the failing path (see hot-path-unguarded rule):\n" + "\n".join(lines)
+        "error-log CORRELATION for paths this diff touches (matched on the "
+        "path suffix shown, not proven attribution). Before flagging, "
+        "confirm the evidence actually names the changed file; then weigh "
+        "findings on that path heavier and check the diff guards the "
+        "failing path (see hot-path-unguarded rule):\n" + "\n".join(lines)
     )
 
 
