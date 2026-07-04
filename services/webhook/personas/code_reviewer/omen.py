@@ -26,6 +26,7 @@ from __future__ import annotations
 import json
 import logging
 import os
+import re
 import time
 from urllib.parse import quote
 
@@ -42,6 +43,12 @@ _CALL_TIMEOUT = 10
 _TOTAL_BUDGET_SECONDS = 8.0
 # Below this count the signal is noise, not an omen.
 _MIN_ERROR_COUNT = 5
+# Query tokens must be plain source-path shaped (codex PR #490 r2: a PR
+# author controls filenames - a quote in a path would break out of the
+# DD query literal and turn Omen into a log-query oracle). Conservative
+# allowlist beats escaping: DD quoting rules are finicky; a path that
+# fails this is simply skipped (logged).
+_SAFE_TOKEN_RE = re.compile(r"^[A-Za-z0-9._/@-]+$")
 
 
 def _dd_site() -> str:
@@ -121,6 +128,12 @@ def build_runtime_context(
             log.info(
                 "omen_degraded",
                 extra={"stage": "ambiguous_token", "token": tok, "paths": len(owners)},
+            )
+            continue
+        if not _SAFE_TOKEN_RE.match(tok):
+            log.info(
+                "omen_degraded",
+                extra={"stage": "unsafe_token", "paths": 1},
             )
             continue
         queried += 1
