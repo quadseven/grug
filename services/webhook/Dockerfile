@@ -10,7 +10,7 @@
 # rolesanywhere-credential-helper tag. Used by the POLLER's SDK
 # credential_process today (see k8s/grug-aws-config.yaml; every pod after
 # the #389 rollout); the api image does not carry it until #389.
-FROM golang:1.23-bookworm AS signing-helper
+FROM golang:1.26-bookworm AS signing-helper
 ARG SIGNING_HELPER_VERSION=v1.8.4
 RUN git clone --depth 1 --branch ${SIGNING_HELPER_VERSION} \
       https://github.com/aws/rolesanywhere-credential-helper /src \
