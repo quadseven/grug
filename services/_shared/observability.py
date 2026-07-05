@@ -80,6 +80,44 @@ def configure_logging() -> None:
     root.setLevel(level)
 
 
+def _send_dogstatsd(payload: bytes, host: str) -> None:
+    """Fire one DogStatsD UDP datagram at the node-local agent hostPort.
+    Raises on socket errors - callers own their never-raise contract and
+    their log tokens (monitors grep for the specific token, so each emit
+    path keeps its own)."""
+    sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+    try:
+        sock.sendto(payload, (host, 8125))
+    finally:
+        sock.close()
+
+
+def emit_gauge(
+    metric: str,
+    value: float,
+    tags: dict[str, str] | None = None,
+) -> None:
+    """Generic DogStatsD gauge over UDP (#379 owned queue telemetry).
+
+    Same k8s emission path as emit_enforcement_metric (#460): datagram to
+    DD_AGENT_HOST:8125. The env tag is appended automatically so every
+    owned gauge is env-scoped without each caller re-deriving it. Never
+    raises; failures log a WARNING with the metric name.
+    """
+    env = os.getenv("DD_ENV") or os.getenv("GRUG_ENV", "prod")
+    host = os.getenv("DD_AGENT_HOST", "")
+    lg = logging.getLogger("grug.observability")
+    if not host:
+        lg.warning("gauge_skipped_no_agent_host", extra={"metric": metric})
+        return
+    parts = [f"{k}:{v}" for k, v in (tags or {}).items()] + [f"env:{env}"]
+    payload = f"{metric}:{value}|g|#{','.join(parts)}".encode()
+    try:
+        _send_dogstatsd(payload, host)
+    except Exception:
+        lg.warning("gauge_emit_failed", extra={"metric": metric})
+
+
 def emit_enforcement_metric(
     repo: str,
     enforcement_type: str,
@@ -112,11 +150,7 @@ def emit_enforcement_metric(
     tags = f"repo:{repo},persona:{persona},enforcement_type:{enforcement_type},env:{env}"
     payload = f"grug.enforcement.state:{value}|g|#{tags}".encode()
     try:
-        sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-        try:
-            sock.sendto(payload, (host, 8125))
-        finally:
-            sock.close()
+        _send_dogstatsd(payload, host)
     except Exception:
         logging.getLogger("grug.observability").warning(
             "enforcement_metric_emit_failed", extra={"repo": repo},

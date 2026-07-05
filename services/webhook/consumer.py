@@ -105,6 +105,99 @@ def _esm_event(arn: str, message: dict[str, Any]) -> dict[str, Any]:
     }
 
 
+# ── owned queue-depth telemetry (#379) ───────────────────────────────
+# The DD AWS integration does not collect aws.sqs.* in this org, which left
+# the queue/DLQ monitors permanently blind. The consumer owns the queues'
+# health signal instead: every _TELEMETRY_INTERVAL_S it reads the depth of
+# ALL grug queues (both consumed FIFOs, the connector-consumed cave-jobs,
+# and the three DLQs) via GetQueueAttributes and emits owned gauges the
+# monitors query. Age-of-oldest is CloudWatch-only, so the monitors use
+# SUSTAINED-depth semantics (visible > 0 across the window) - the same
+# operator signal ("not draining") from an attribute SQS actually serves.
+
+_TELEMETRY_INTERVAL_S = float(os.getenv("GRUG_QUEUE_TELEMETRY_INTERVAL_S", "60"))
+
+_TELEMETRY_QUEUE_NAMES = (
+    "grug-rerun-jobs.fifo",
+    "grug-rerun-jobs-dlq.fifo",
+    "grug-cave-jobs.fifo",
+    "grug-cave-jobs-dlq.fifo",
+    "grug-cave-results.fifo",
+    "grug-cave-results-dlq.fifo",
+)
+
+
+def _telemetry_base_url() -> str | None:
+    """Derive the account-scoped SQS URL prefix from a queue URL the pod
+    already carries - queue NAMES are fixed (explicit `name=` in Pulumi),
+    so the other five URLs are prefix + name, no extra env plumbing."""
+    for env_name in ("GRUG_RERUN_QUEUE_URL", "GRUG_CAVE_RESULTS_QUEUE_URL"):
+        url = os.getenv(env_name, "")
+        if url:
+            return url.rsplit("/", 1)[0]
+    return None
+
+
+def _emit_queue_depth_once() -> int:
+    """One depth sweep. Returns queues successfully emitted. Per-queue
+    best-effort: an AccessDenied on one queue (e.g. the DLQ grant landing
+    after this code) must not cost the others their gauge."""
+    from observability import emit_gauge  # late: patchable, and webhook-image only
+
+    base = _telemetry_base_url()
+    if base is None:
+        log.warning("queue_telemetry_no_base_url")
+        return 0
+    emitted = 0
+    for name in _TELEMETRY_QUEUE_NAMES:
+        try:
+            attrs = _sqs.get_queue_attributes(
+                QueueUrl=f"{base}/{name}",
+                AttributeNames=[
+                    "ApproximateNumberOfMessages",
+                    "ApproximateNumberOfMessagesNotVisible",
+                ],
+            )["Attributes"]
+            emit_gauge(
+                "grug.sqs.messages_visible",
+                float(attrs.get("ApproximateNumberOfMessages", 0)),
+                {"queue": name},
+            )
+            emit_gauge(
+                "grug.sqs.messages_not_visible",
+                float(attrs.get("ApproximateNumberOfMessagesNotVisible", 0)),
+                {"queue": name},
+            )
+            emitted += 1
+        except Exception as e:  # noqa: BLE001 - per-queue best-effort
+            log.warning(
+                "queue_depth_probe_failed",
+                extra={"queue": name, "kind": type(e).__name__},
+            )
+    return emitted
+
+
+def _telemetry_loop() -> None:
+    """Thread body: depth sweep every interval until shutdown. Hard-wrapped
+    never-raise; if this loop somehow dies anyway, the consumer-backlog
+    monitor's notify_no_data pages on the metric going silent - the pod is
+    NOT restarted for a telemetry failure (the watchdog excludes this
+    thread on purpose; review data flow > metric flow)."""
+    log.info(
+        "queue_telemetry_started",
+        extra={"interval_s": _TELEMETRY_INTERVAL_S,
+               "queues": len(_TELEMETRY_QUEUE_NAMES)},
+    )
+    while not _stop.is_set():
+        try:
+            _emit_queue_depth_once()
+        except Exception as e:  # noqa: BLE001 - belt-and-suspenders
+            log.warning(
+                "queue_telemetry_cycle_failed", extra={"kind": type(e).__name__},
+            )
+        _stop.wait(_TELEMETRY_INTERVAL_S)
+
+
 def _poll_once(spec: QueueSpec, queue_url: str, arn: str) -> int:
     """One receive → dispatch → delete cycle. Returns the number of
     messages handled (0 or 1). Never raises: receive errors back off,
@@ -321,6 +414,14 @@ def main() -> None:
     ]
     for t in threads:
         t.start()
+
+    # Owned queue-depth telemetry (#379). Daemon + OUTSIDE the watchdog
+    # list: a telemetry failure surfaces as the consumer-backlog monitor's
+    # No Data page, never as a pod restart that would interrupt review
+    # message flow.
+    threading.Thread(
+        target=_telemetry_loop, name="queue-telemetry", daemon=True,
+    ).start()
     # Watchdog: there is no HTTP probe on this pod, so a consumer thread
     # that dies (missing env, ARN resolve failure, anything escaping
     # _consume) must take the PROCESS down — a half-dead consumer would

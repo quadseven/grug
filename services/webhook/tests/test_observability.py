@@ -155,3 +155,44 @@ def test_emit_enforcement_metric_does_not_raise_on_socket_failure(monkeypatch, c
     with caplog.at_level("WARNING", logger="grug.observability"):
         emit_enforcement_metric("o/r", "grug_managed")
     assert "enforcement_metric_emit_failed" in caplog.text
+
+
+# ── emit_gauge (#379 owned queue telemetry) ──────────────────────────
+
+def test_emit_gauge_sends_datagram_with_env_tag(monkeypatch):
+    from observability import emit_gauge
+
+    monkeypatch.setenv("DD_AGENT_HOST", "10.0.0.99")
+    monkeypatch.setenv("GRUG_ENV", "prod")
+    monkeypatch.delenv("DD_ENV", raising=False)
+    sent = _sent_datagrams(monkeypatch)
+    emit_gauge("grug.sqs.messages_visible", 3.0, {"queue": "grug-rerun-jobs.fifo"})
+    assert sent == [(
+        b"grug.sqs.messages_visible:3.0|g|#queue:grug-rerun-jobs.fifo,env:prod",
+        ("10.0.0.99", 8125),
+    )]
+
+
+def test_emit_gauge_skips_without_agent_host(monkeypatch, caplog):
+    from observability import emit_gauge
+
+    monkeypatch.delenv("DD_AGENT_HOST", raising=False)
+    sent = _sent_datagrams(monkeypatch)
+    with caplog.at_level("WARNING", logger="grug.observability"):
+        emit_gauge("grug.sqs.messages_visible", 1.0, {"queue": "q.fifo"})
+    assert sent == []
+    assert "gauge_skipped_no_agent_host" in caplog.text
+
+
+def test_emit_gauge_never_raises_on_socket_failure(monkeypatch, caplog):
+    from observability import emit_gauge
+
+    monkeypatch.setenv("DD_AGENT_HOST", "10.0.0.99")
+
+    def _boom(*a, **k):
+        raise OSError("network unreachable")
+
+    monkeypatch.setattr("observability.socket.socket", _boom)
+    with caplog.at_level("WARNING", logger="grug.observability"):
+        emit_gauge("grug.sqs.messages_visible", 1.0, {"queue": "q.fifo"})
+    assert "gauge_emit_failed" in caplog.text
