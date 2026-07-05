@@ -229,13 +229,30 @@ Secret stays live and rotator-maintained as the ROLLBACK RESERVE; the
 retirement PR deletes it + the #386 rotator + the static AccessKey.
 
 - **Rollback** (any workload misbehaving on the cert path, valid until
-  the retirement PR deletes the reserve): add
-  `- secretRef: {name: grug-aws-static-key}` to that workload's envFrom
-  AND remove its `AWS_CONFIG_FILE` env (BOTH steps: the boot proof
-  refuses to run with env creds + RA config together). Env creds then
-  out-rank credential_process and the pod is instantly back on the
-  static key. Drill evidence (#389 AC): see the PR for the exercised
-  consumer rollback + re-cutover.
+  the retirement PR deletes the reserve). IN ORDER:
+  1. SUSPEND THE ROTATOR FIRST: `kubectl -n grug patch cronjob
+     grug-key-rotator -p '{"spec":{"suspend":true}}'` - with
+     GRUG_ROTATE_DEPLOYMENTS empty (#389) a rotation tick would delete
+     the very key your rolled-back pod snapshotted, and that failure
+     (InvalidClientTokenId) pages via the credential monitor only after
+     the pod is already broken.
+  2. VERIFY THE RESERVE IS LIVE: if a deploy ran since the last rotation
+     tick, the Secret was re-seeded from SSM, which the rotator never
+     writes back (#502) - i.e. possibly a DELETED key. Compare
+     `aws iam list-access-keys --user-name grug-k8s-pod` with the
+     Secret; if stale, run the manual-rotate job first.
+  3. Add `- secretRef: {name: grug-aws-static-key}` to that workload's
+     envFrom AND remove its `AWS_CONFIG_FILE` env (BOTH steps: the boot
+     proof refuses env creds + RA config together). Env creds then
+     out-rank credential_process - instantly back on the static key.
+  4. Un-suspend the rotator when done.
+  Drill evidence (#389 AC): see PR #504 for the exercised consumer
+  rollback + re-cutover.
+- **Cutover blast radius**: api/webhook roll maxUnavailable:0 - a
+  fleet-broken cert path BLOCKS the deploy while old pods keep serving.
+  The consumer is strategy Recreate: its old pod stops BEFORE the new
+  one proves creds, so a bad rollout PAUSES consumption (SQS buffers,
+  no loss) until fixed or rolled back.
 - **"Untrusted certificate. Insufficient certificate"** from Roles
   Anywhere = the leaf lost the `digital signature` usage (the
   infrastructure#1318 gotcha). Check `kubectl -n grug get certificate
