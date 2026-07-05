@@ -14,12 +14,17 @@ and the escape hatch should be seconds, not minutes.
 
 ## Decision
 
-1. **Rollback anchor = last SYNTHETIC-VERIFIED release.** The deploy
-   snapshots the currently-running digest pair (webhook+api) into the
-   `grug-last-good` ConfigMap BEFORE applying (only when every workload
-   is currently Available, so a broken state is never anchored) and
-   ADVANCES it to the new digests after the synthetic passes - so a
-   manual rollback dispatch between deploys is a genuine no-op drill. The anchor's digest
+1. **Rollback anchor = the release running BEFORE the latest deploy.**
+   The deploy snapshots the currently-running digest pair (webhook+api)
+   into the `grug-last-good` ConfigMap BEFORE any mutation (only when
+   every workload is currently Available, so a broken state is never
+   anchored). The anchor deliberately does NOT advance to the new
+   release on success: manual rollback's one job is "get me OFF the
+   current release" - including a bad release that fooled the synthetic
+   (codex r11; the earlier no-op-drill framing from r5 inverted that
+   priority and was removed). A drill therefore genuinely reverts one
+   release; roll forward afterwards by re-running deploy.k8s via
+   workflow_dispatch. The anchor's digest
    manifests are protected from registry retention by the live-cluster
    reference rule (and by their merge-sha tags).
 2. **Synthetic self-test after apply**: /livez + /readyz on both
