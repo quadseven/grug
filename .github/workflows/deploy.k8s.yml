@@ -294,6 +294,13 @@ jobs:
           # retired). The AWS_* leak guard below stays load-bearing: env
           # creds would out-rank credential_process in the SDK chain and
           # silently bypass the Roles Anywhere path every pod boot-proves.
+          # Snapshot the CURRENT grug-secrets before the destructive
+          # delete+create (codex r3): auto-rollback restores it alongside
+          # the images, so a bad-but-non-empty SSM value cannot survive a
+          # rollback. Metadata stripped so kubectl apply accepts it.
+          kubectl -n grug get secret grug-secrets -o json --ignore-not-found \
+            | python3 -c "import json,sys; d=sys.stdin.read(); d=json.loads(d) if d.strip() else None; [d['metadata'].pop(k, None) for k in ('resourceVersion','uid','creationTimestamp','managedFields') ] if d else None; print(json.dumps(d)) if d else None" \
+            > "$RUNNER_TEMP/grug-secrets.pre.json" || true
           ENVF="$RUNNER_TEMP/grug-secrets.env"
           install -m 600 /dev/null "$ENVF"
           {
@@ -517,6 +524,15 @@ jobs:
             echo "::error::synthetic FAILED and no last-good anchor exists - manual intervention required"
             exit 1
           fi
+          # Restore the pre-seed grug-secrets snapshot FIRST (codex r3):
+          # rollback covers images + the one durable object this run
+          # mutates; the pods restarted below mount the restored values.
+          if [ -s "$RUNNER_TEMP/grug-secrets.pre.json" ]; then
+            kubectl -n grug apply -f "$RUNNER_TEMP/grug-secrets.pre.json"
+            echo "restored pre-deploy grug-secrets snapshot" >> "$GITHUB_STEP_SUMMARY"
+          else
+            echo "::warning::no grug-secrets snapshot from this run - secret left as seeded"
+          fi
           # Container names per the live manifests: webhook/webhook,
           # api/webhook (historical), consumer/consumer, poller/poller.
           kubectl -n grug set image deploy/grug-webhook webhook="$W"
@@ -524,6 +540,12 @@ jobs:
           kubectl -n grug set image deploy/grug-consumer consumer="$W"
           kubectl -n grug set image cronjob/grug-poller poller="$W"
           kubectl -n grug-trial set image cronjob/grug-trial-janitor janitor="$W"
+          # set image is a no-op when digests match (a config-only bad
+          # deploy) - force pod restarts so the restored secret is
+          # actually mounted.
+          for d in grug-webhook grug-api grug-consumer; do
+            kubectl -n grug rollout restart "deploy/$d"
+          done
           for d in grug-webhook grug-api grug-consumer; do
             kubectl -n grug rollout status "deploy/$d" --timeout=180s
           done
@@ -557,4 +579,4 @@ jobs:
 
       - name: Cleanup
         if: always()
-        run: rm -f "$HOME/.kube/config"
+        run: rm -f "$HOME/.kube/config" "$RUNNER_TEMP/grug-secrets.pre.json"
