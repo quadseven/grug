@@ -263,6 +263,24 @@ def _check_name_in_legacy(legacy_data: dict, check_name: str) -> bool:
     return False
 
 
+def get_repo_default_branch(install_token: str, owner: str, repo: str) -> str:
+    """Fetch the repo's default branch (``GET /repos/{owner}/{repo}``).
+
+    detect_enforcement's legacy branch-protection fallback needs the real
+    default branch; callers outside a webhook payload (the poller's #460
+    re-emission pass) have no payload to read it from. Falls back to
+    ``main`` if GitHub omits the field (brand-new empty repo) - the legacy
+    check 404s harmlessly on a wrong branch.
+    """
+    resp = _get_with_retry(
+        f"{_GH_API}/repos/{quote(owner, safe='')}/{quote(repo, safe='')}",
+        install_token=install_token,
+        op="repo_default_branch",
+    )
+    resp.raise_for_status()
+    return (resp.json() or {}).get("default_branch") or "main"
+
+
 def detect_enforcement(
     install_token: str,
     owner: str,

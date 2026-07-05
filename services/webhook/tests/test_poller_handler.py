@@ -34,6 +34,11 @@ def _wire(monkeypatch, *, installs, records_for, retry, poll):
     monkeypatch.setattr(
         "adapters.install_store.list_dep_watch_repos", lambda iid: [],
     )
+    # #460: default the enforcement re-emission pass to idle (no tpm
+    # repos) so the reaction-poll assertions stay about the reaction poll.
+    monkeypatch.setattr(
+        "adapters.install_store.list_tpm_enabled_repos", lambda iid: [],
+    )
 
 
 def test_poller_polls_each_allowlisted_install(monkeypatch):
@@ -54,7 +59,7 @@ def test_poller_polls_each_allowlisted_install(monkeypatch):
     )
     out = poller_handler.handler({}, None)
     assert polled == [11, 22]
-    assert out == {"installs": 2, "records": 2, "submitted": 4, "failed_installs": 0, "pulse_nudges": 0, "pulse_failed_installs": 0, "dep_watch_reports": 0, "dep_watch_failed_installs": 0}
+    assert out == {"installs": 2, "records": 2, "submitted": 4, "failed_installs": 0, "pulse_nudges": 0, "pulse_failed_installs": 0, "dep_watch_reports": 0, "dep_watch_failed_installs": 0, "enforcement_emitted": 0, "enforcement_failed_installs": 0}
 
 
 def test_poller_one_install_failure_does_not_abort_cycle(monkeypatch, caplog):
@@ -129,7 +134,7 @@ def test_poller_skips_installs_with_no_records(monkeypatch):
     )
     out = poller_handler.handler({}, None)
     assert touched == []
-    assert out == {"installs": 1, "records": 0, "submitted": 0, "failed_installs": 0, "pulse_nudges": 0, "pulse_failed_installs": 0, "dep_watch_reports": 0, "dep_watch_failed_installs": 0}
+    assert out == {"installs": 1, "records": 0, "submitted": 0, "failed_installs": 0, "pulse_nudges": 0, "pulse_failed_installs": 0, "dep_watch_reports": 0, "dep_watch_failed_installs": 0, "enforcement_emitted": 0, "enforcement_failed_installs": 0}
 
 
 # --- #407: auto-replay wiring -----------------------------------------------
@@ -219,7 +224,7 @@ def test_poller_all_installs_fail_logs_error(monkeypatch, caplog):
     )
     with caplog.at_level(_logging.WARNING):
         out = poller_handler.handler({}, None)
-    assert out == {"installs": 2, "records": 2, "submitted": 0, "failed_installs": 2, "pulse_nudges": 0, "pulse_failed_installs": 0, "dep_watch_reports": 0, "dep_watch_failed_installs": 0}
+    assert out == {"installs": 2, "records": 2, "submitted": 0, "failed_installs": 2, "pulse_nudges": 0, "pulse_failed_installs": 0, "dep_watch_reports": 0, "dep_watch_failed_installs": 0, "enforcement_emitted": 0, "enforcement_failed_installs": 0}
     errs = [r for r in caplog.records if r.msg == "reaction_poll_all_installs_failed"]
     assert errs and errs[0].levelno == _logging.ERROR
     # a partial failure (not ALL) must NOT escalate to error
@@ -236,7 +241,146 @@ def test_poller_no_installs_is_a_clean_noop(monkeypatch):
         poll=lambda *a, **k: 1,
     )
     out = poller_handler.handler({}, None)
-    assert out == {"installs": 0, "records": 0, "submitted": 0, "failed_installs": 0, "pulse_nudges": 0, "pulse_failed_installs": 0, "dep_watch_reports": 0, "dep_watch_failed_installs": 0}
+    assert out == {"installs": 0, "records": 0, "submitted": 0, "failed_installs": 0, "pulse_nudges": 0, "pulse_failed_installs": 0, "dep_watch_reports": 0, "dep_watch_failed_installs": 0, "enforcement_emitted": 0, "enforcement_failed_installs": 0}
+
+
+# --- #460: enforcement-gauge re-emission pass --------------------------------
+
+
+def _wire_enforcement(monkeypatch, *, installs, tpm_repos, detect, branch=None):
+    """Wire an idle reactions/pulse/dep-watch cycle with a live enforcement
+    pass. `tpm_repos` maps install_id -> repo rows; `detect` is the
+    detect_enforcement stand-in."""
+    _wire(
+        monkeypatch,
+        installs=installs,
+        records_for=lambda iid: [],
+        retry=lambda iid, fn: fn("tok"),
+        poll=lambda *a, **k: 0,
+    )
+    monkeypatch.setattr(
+        "adapters.install_store.list_tpm_enabled_repos",
+        lambda iid: tpm_repos.get(iid, []),
+    )
+    monkeypatch.setattr(
+        "github_rulesets_client.get_repo_default_branch",
+        branch or (lambda token, owner, repo: "main"),
+    )
+    monkeypatch.setattr("github_rulesets_client.detect_enforcement", detect)
+
+
+def test_enforcement_pass_emits_live_state_per_tpm_repo(monkeypatch):
+    """#460: every tpm-enabled repo of every install gets a LIVE-detected
+    gauge emission each cycle - the continuous signal the enforcement-gap
+    monitor needs (the old event-only emission left it in permanent No
+    Data)."""
+    emitted = []
+    detected = []
+
+    def _detect(token, owner, repo, branch, check_name):
+        detected.append((owner, repo, branch, check_name))
+        return "grug_managed" if repo == "a" else "none"
+
+    _wire_enforcement(
+        monkeypatch,
+        installs=[1],
+        tpm_repos={1: [{"id": 10, "full_name": "o/a"}, {"id": 11, "full_name": "o/b"}]},
+        detect=_detect,
+    )
+    monkeypatch.setattr(
+        "observability.emit_enforcement_metric",
+        lambda full, state, **kw: emitted.append((full, state)),
+    )
+    out = poller_handler.handler({}, None)
+    assert emitted == [("o/a", "grug_managed"), ("o/b", "none")]
+    from enforcement import GRUG_DOR_CHECK_NAME
+    assert detected == [
+        ("o", "a", "main", GRUG_DOR_CHECK_NAME),
+        ("o", "b", "main", GRUG_DOR_CHECK_NAME),
+    ]
+    assert out["enforcement_emitted"] == 2
+    assert out["enforcement_failed_installs"] == 0
+
+
+def test_enforcement_pass_one_repo_failure_does_not_starve_the_rest(monkeypatch, caplog):
+    """Per-REPO best-effort: one repo's GitHub error is logged and the
+    install's remaining repos still get their gauge (no install-level
+    failure count either - the token was fine)."""
+    import logging as _logging
+
+    emitted = []
+
+    def _detect(token, owner, repo, branch, check_name):
+        if repo == "bad":
+            raise RuntimeError("GH 500")
+        return "external"
+
+    _wire_enforcement(
+        monkeypatch,
+        installs=[1],
+        tpm_repos={1: [{"id": 1, "full_name": "o/bad"}, {"id": 2, "full_name": "o/good"}]},
+        detect=_detect,
+    )
+    monkeypatch.setattr(
+        "observability.emit_enforcement_metric",
+        lambda full, state, **kw: emitted.append((full, state)),
+    )
+    with caplog.at_level(_logging.WARNING):
+        out = poller_handler.handler({}, None)
+    assert emitted == [("o/good", "external")]
+    assert out["enforcement_emitted"] == 1
+    assert out["enforcement_failed_installs"] == 0
+    assert any(r.msg == "enforcement_emit_repo_failed" for r in caplog.records)
+
+
+def test_enforcement_pass_one_install_failure_does_not_abort_cycle(monkeypatch, caplog):
+    """Per-INSTALL best-effort: a store/token failure for one install is
+    counted and the next install still emits."""
+    import logging as _logging
+
+    emitted = []
+
+    def _list(iid):
+        if iid == 1:
+            raise RuntimeError("store down")
+        return [{"id": 5, "full_name": "o/ok"}]
+
+    _wire_enforcement(
+        monkeypatch,
+        installs=[1, 2],
+        tpm_repos={},
+        detect=lambda *a, **k: "grug_managed",
+    )
+    monkeypatch.setattr("adapters.install_store.list_tpm_enabled_repos", _list)
+    monkeypatch.setattr(
+        "observability.emit_enforcement_metric",
+        lambda full, state, **kw: emitted.append((full, state)),
+    )
+    with caplog.at_level(_logging.WARNING):
+        out = poller_handler.handler({}, None)
+    assert emitted == [("o/ok", "grug_managed")]
+    assert out["enforcement_emitted"] == 1
+    assert out["enforcement_failed_installs"] == 1
+    assert any(r.msg == "enforcement_emit_install_failed" for r in caplog.records)
+
+
+def test_enforcement_pass_skips_malformed_full_name(monkeypatch):
+    """A row without an owner/name full_name is skipped, not crashed on
+    (the store guards this, but defense in depth for hand-edited rows)."""
+    emitted = []
+    _wire_enforcement(
+        monkeypatch,
+        installs=[1],
+        tpm_repos={1: [{"id": 1, "full_name": "no-slash"}, {"id": 2, "full_name": "o/r"}]},
+        detect=lambda *a, **k: "none",
+    )
+    monkeypatch.setattr(
+        "observability.emit_enforcement_metric",
+        lambda full, state, **kw: emitted.append((full, state)),
+    )
+    out = poller_handler.handler({}, None)
+    assert emitted == [("o/r", "none")]
+    assert out["enforcement_emitted"] == 1
 
 
 # ── Roles Anywhere identity proof (#388, audit stage-2 CRITICAL) ──────

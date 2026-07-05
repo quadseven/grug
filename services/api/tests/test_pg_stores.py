@@ -794,3 +794,20 @@ def test_dep_watch_flag_and_targeting(pg):
     assert store.list_dep_watch_repos(4) == [{"id": 201, "full_name": "o/dep"}]
     assert store.claim_dep_watch_report(4, "o/dep") is True
     assert store.claim_dep_watch_report(4, "o/dep") is False
+
+
+def test_list_tpm_enabled_repos_default_is_enabled(pg):
+    """#460: tpm_enabled defaults TRUE, so the enforcement re-emission
+    denominator includes rows that never wrote the key - only an explicit
+    false opts a repo out (inverse of the pulse/dep-watch opt-IN shape)."""
+    from adapters import pg_install_store as store
+
+    store.set_repo_config(install_id=6, repo_id=301, repo_full_name="o/explicit-on",
+                          updated_by_user_id="9", tpm_enabled=True)
+    store.set_repo_config(install_id=6, repo_id=302, repo_full_name="o/explicit-off",
+                          updated_by_user_id="9", tpm_enabled=False)
+    store.set_repo_config(install_id=6, repo_id=303, repo_full_name="o/unset",
+                          updated_by_user_id="9")
+    rows = store.list_tpm_enabled_repos(6)
+    assert sorted(r["id"] for r in rows) == [301, 303]
+    assert {r["full_name"] for r in rows} == {"o/explicit-on", "o/unset"}
