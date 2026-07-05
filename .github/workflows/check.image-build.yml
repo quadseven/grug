@@ -161,6 +161,7 @@ jobs:
           CI_REGISTRY_USERNAME: ${{ secrets.CI_REGISTRY_USERNAME }}
           CI_REGISTRY_PASSWORD: ${{ secrets.CI_REGISTRY_PASSWORD }}
           PR_NUMBER: ${{ github.event.pull_request.number }}
+          HEAD_SHA: ${{ github.event.pull_request.head.sha }}
         run: |
           set -euo pipefail
           echo "$CI_REGISTRY_PASSWORD" | docker login "$REGISTRY_HOST" \
@@ -170,4 +171,4 @@ jobs:
           docker push "$REGISTRY_HOST/grug-${{ matrix.svc }}:pr-${PR_NUMBER}"
           digest="$(docker inspect --format='{{index .RepoDigests 0}}' \
             "$REGISTRY_HOST/grug-${{ matrix.svc }}:pr-${PR_NUMBER}")"
-          echo "pushed ${digest}" >> "$GITHUB_STEP_SUMMARY"
+          echo "pushed ${digest} (built from head ${HEAD_SHA})" >> "$GITHUB_STEP_SUMMARY"
