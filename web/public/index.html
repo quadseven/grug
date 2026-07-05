@@ -833,6 +833,13 @@
     .proster-list{ list-style:none; padding:0; margin:0; display:grid; gap:4px; font-family:'JetBrains Mono', monospace; font-size:11.5px; color:var(--ink-2); }
     .proster-list li{ padding-left:14px; position:relative; }
     .proster-list li::before{ content:"+"; position:absolute; left:0; color:var(--amber-deep); font-weight:700; }
+    /* Honest capability status (#493): every roster line carries its real
+       state - the marketing page follows the dashboard's "no lies" rule. */
+    .proster-list li{ display:flex; justify-content:space-between; align-items:baseline; gap:8px; }
+    .cap{ font-size:9px; letter-spacing:0.08em; font-weight:700; padding:1px 6px; border-radius:3px; flex:none; }
+    .cap.live{ background:#1f7a3f; color:#fff; }
+    .cap.preview{ background:#b5820a; color:#fff; }
+    .cap.soon{ background:var(--bg-2); color:var(--muted); outline:1px solid var(--muted); }
     .proster-add{ background:var(--bg-2); }
     @media (max-width: 980px){
       .persona-roster{ grid-template-columns: 1fr 1fr; }
@@ -1107,11 +1114,11 @@
           <div class="proster-body">
             <div class="proster-tag">F-01 · SMASHER</div>
             <h3>Smasher</h3>
-            <p>Static analysis, symbolic exec, LLM diff review. Catches null-derefs, races, off-by-ones, sloppy error handling.</p>
+            <p>Diff-scoped mutation testing today (mutate the changed lines, run your suite, surface surviving mutants). LLM diff review rides the Elder; broader static analysis is on the roadmap.</p>
             <ul class="proster-list">
-              <li>Languages: Go, TS, Py, Rust, Java, Ruby</li>
-              <li>Posts inline suggestions you can accept</li>
-              <li>Blocks merge on critical findings</li>
+              <li><span>Languages: Go, TS, Py, Rust, Java, Ruby</span><span class="cap soon">SOON</span></li>
+              <li><span>Posts inline suggestions you can accept</span><span class="cap soon">SOON</span></li>
+              <li><span>Blocks merge on critical findings</span><span class="cap soon">SOON</span></li>
             </ul>
           </div>
         </article>
@@ -1126,9 +1133,9 @@
             <h3>Guard</h3>
             <p>SCA, secret scanning, SAST on the diff, hourly CVE feed. Quarantines evil dependencies before they reach main.</p>
             <ul class="proster-list">
-              <li>NIST + OSV + GHSA feeds merged</li>
-              <li>Inline secret revoke + rotate hint</li>
-              <li>License compliance gate (GPL/AGPL/MIT/...)</li>
+              <li><span>NIST + OSV + GHSA feeds merged</span><span class="cap soon">SOON</span></li>
+              <li><span>Inline secret revoke + rotate hint</span><span class="cap preview">PREVIEW</span></li>
+              <li><span>License compliance gate (GPL/AGPL/MIT/...)</span><span class="cap soon">SOON</span></li>
             </ul>
           </div>
         </article>
@@ -1143,9 +1150,9 @@
             <h3>Elder</h3>
             <p>Style, naming, complexity, test coverage, dead code. "Strong code only" is the motto. Grumpy but fair.</p>
             <ul class="proster-list">
-              <li>Cyclomatic + cognitive complexity caps</li>
-              <li>Per-file test coverage thresholds</li>
-              <li>Style profiles or BYO ruleset</li>
+              <li><span>Cyclomatic + cognitive complexity caps</span><span class="cap soon">SOON</span></li>
+              <li><span>Per-file test coverage thresholds</span><span class="cap soon">SOON</span></li>
+              <li><span>Style profiles or BYO ruleset</span><span class="cap soon">SOON</span></li>
             </ul>
           </div>
         </article>
@@ -1160,9 +1167,9 @@
             <h3>Chief</h3>
             <p>Definition of Ready, sprint burndown, stale-PR pulse, milestone roll-ups. Project management without leaving the repo.</p>
             <ul class="proster-list">
-              <li>5-check DoR · strict / lenient modes</li>
-              <li>Burndown chart on every release branch</li>
-              <li>Auto-pings reviewers blocked &gt; 48h</li>
+              <li><span>5-check DoR (strict / lenient modes)</span><span class="cap preview">PREVIEW</span></li>
+              <li><span>Burndown chart on every release branch</span><span class="cap soon">SOON</span></li>
+              <li><span>Nudges stale PRs (author pings live; reviewer pings soon)</span><span class="cap soon">SOON</span></li>
             </ul>
           </div>
         </article>
@@ -1177,9 +1184,9 @@
             <h3>Warder</h3>
             <p>Stand at cave mouth. Drafts the changelog from merged PRs, picks semver, gates the deploy on staging health, posts release notes to Slack. Bad release not get past warder. Virus not infect tribe.</p>
             <ul class="proster-list">
-              <li>Conventional Commits or freeform</li>
-              <li>Semver hint: <span class="mono">major / minor / patch</span></li>
-              <li>Deploy gate on Datadog SLO breach</li>
+              <li><span>Conventional Commits or freeform</span><span class="cap live">LIVE</span></li>
+              <li><span>Semver hint: <span class="mono">major / minor / patch</span></span><span class="cap live">LIVE</span></li>
+              <li><span>Deploy gate on Datadog SLO breach</span><span class="cap soon">SOON</span></li>
             </ul>
           </div>
         </article>
@@ -1194,9 +1201,9 @@
             <h3>Bring your own Grug.</h3>
             <p>Define a persona in YAML or TS. Hook into the same Check Run pipeline. Grug ecosystem, your rules.</p>
             <ul class="proster-list">
-              <li><span class="mono">grug.config.ts</span> in repo root</li>
-              <li>Reuse Grug's diff parser + GitHub plumbing</li>
-              <li>Publish to the marketplace if you want</li>
+              <li><span><span class="mono">grug.config.ts</span> in repo root</span><span class="cap soon">SOON</span></li>
+              <li><span>Reuse Grug's diff parser + GitHub plumbing</span><span class="cap soon">SOON</span></li>
+              <li><span>Publish to the marketplace if you want</span><span class="cap soon">SOON</span></li>
             </ul>
           </div>
         </article>
