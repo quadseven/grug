@@ -253,6 +253,12 @@ jobs:
           chmod 600 "$HOME/.kube/config"
 
       - name: Seed app secrets from the parameter store
+        id: seed
+        # continue-on-error AFTER the snapshots exist (codex r6): a
+        # mid-seed failure has already deleted/replaced live Secrets, so
+        # it must reach the same restore path as apply/synthetic
+        # failures instead of stranding the cluster half-mutated.
+        continue-on-error: true
         env:
           REGISTRY_HOST: ${{ vars.DEPLOY_REGISTRY_HOST }}
           REGISTRY_USERNAME: ${{ secrets.REGISTRY_USERNAME }}
@@ -361,6 +367,7 @@ jobs:
             --dry-run=client -o yaml | kubectl apply -f -
 
       - name: Record last-good digests (rollback anchor, #499)
+        if: steps.seed.outcome == 'success'
         run: |
           set -euo pipefail
           # Snapshot the CURRENTLY-RUNNING digest pair before we touch
@@ -388,6 +395,7 @@ jobs:
 
       - name: Pin image placeholders + apply
         id: apply
+        if: steps.seed.outcome == 'success'
         # continue-on-error so a FAILED apply/rollout/smoke still reaches
         # the rollback step below (codex peer review: a bad image or
         # manifest aborting here is exactly when recovery matters most);
@@ -540,7 +548,7 @@ jobs:
         # anchor restores the previous digests under the CURRENT applied
         # config - a manifest/secret regression needs revert + redeploy;
         # the step warns when this merge touched k8s/.
-        if: steps.apply.outcome == 'failure' || steps.synthetic.outcome == 'failure'
+        if: steps.seed.outcome == 'failure' || steps.apply.outcome == 'failure' || steps.synthetic.outcome == 'failure'
         run: |
           set -euo pipefail
           W=$(kubectl -n grug get configmap grug-last-good -o jsonpath='{.data.webhook}' 2>/dev/null || echo "")
