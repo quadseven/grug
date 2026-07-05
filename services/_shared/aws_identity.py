@@ -36,6 +36,10 @@ def prove_roles_anywhere_identity() -> None:
        observationally - peer review on #388, confirmed 3x).
     """
     if not os.getenv("AWS_CONFIG_FILE"):
+        # Tests/image-smoke land here by design. In PROD this means the
+        # manifest lost its RA env - greppable, though the real page
+        # comes from the credential monitor when calls start failing.
+        log.info("roles_anywhere_identity_skipped")
         return
     try:
         if os.getenv("AWS_ACCESS_KEY_ID"):

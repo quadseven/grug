@@ -105,7 +105,8 @@ def credential_acquisition_failure_query(env: str) -> str:
     # reserve custodian's cred failing is page-worthy too).
     return (
         f'logs("service:grug-* env:{env} '
-        '(roles_anywhere_identity_failed OR CredentialRetrievalError)")'
+        '(roles_anywhere_identity_failed OR CredentialRetrievalError '
+        'OR NoCredentialsError OR InvalidClientTokenId)")'
         '.index("*").rollup("count").last("15m") > 0'
     )
 
@@ -492,10 +493,11 @@ def create_all(
         name="[grug] AWS key-rotation failed (interim rotator)",
         message=(
             f"{notify_handle}\n"
-            "The interim grug-k8s-pod key rotation failed. The old key is kept "
-            "valid so pods still work, but rotation is stuck - check the "
-            "grug-key-rotator Job logs (a dangling new key may need manual "
-            "cleanup; AWS caps the user at 2 keys).\n"
+            "The grug-k8s-pod key rotation failed. Since #389 NO workload "
+            "consumes this key - it is the ROLLBACK RESERVE, and a stuck "
+            "rotation degrades the rollback path; fix it before you need "
+            "it. Check the grug-key-rotator Job logs (a dangling new key "
+            "may need manual cleanup; AWS caps the user at 2 keys).\n"
             "Runbook: docs/RUNBOOK.md#key-rotation"
         ),
         query=(
