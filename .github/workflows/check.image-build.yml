@@ -10,11 +10,13 @@ name: Check · image build · services/ Docker context
 # native arm64 (same hosted runner class as deploy.k8s.yml - the cluster is
 # arm64, so an x86 smoke image would prove nothing about what ships), and
 # for SAME-REPO PRs the smoked images are pushed to the private registry
-# tagged pr-<n>; the merge deploy PROMOTES that digest instead of
-# rebuilding. Fork PRs get no secrets by GitHub's rules and skip the push
-# steps (the smokes still gate) - the deploy then falls back to a rebuild.
+# tagged pr-<n>; the merge deploy PROMOTES that digest when the ADR-0016
+# checks pass (single merged PR, tree-identical, manifests present, baked
+# sha verified) - anything else rebuilds, including fork PRs (no secrets
+# by GitHub's rules; the smokes still gate) and unseeded credentials.
 # Credentials are repo-level CI_* secrets (push-scoped registry credential
-# + ephemeral tag:ci tailnet key), NOT the main-only k8s-prod environment;
+# + an ephemeral tag:ci tailnet key that MUST be reusable - the matrix
+# joins twice concurrently), NOT the main-only k8s-prod environment;
 # trust boundary documented in ADR-0016.
 
 permissions:
@@ -26,6 +28,13 @@ on:
       - 'services/**'
       - '.github/workflows/check.image-build.yml'
 
+# A superseded run finishing LATE must never overwrite pr-<n> with an
+# older commit's image (audit stage-5): cancel it. A cancelled mid-push
+# leaves the manifest absent and the merge deploy falls back to rebuild.
+concurrency:
+  group: image-build-${{ github.ref }}
+  cancel-in-progress: true
+
 jobs:
   image-build:
     runs-on: ubuntu-24.04-arm
@@ -36,6 +45,12 @@ jobs:
         svc: [webhook, api]
     steps:
       - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          # Build the PR HEAD bytes, not the default merge ref: promotion
+          # verifies the baked DD_GIT_COMMIT_SHA against head.sha, and
+          # ADR-0016 rule 2 (head tree == merge tree) is only sound when
+          # the artifact IS the head (audit stage-6).
+          ref: ${{ github.event.pull_request.head.sha }}
       - name: Build image (services/ context)
         # DD_GIT_COMMIT_SHA = the PR HEAD sha: if this digest is promoted,
         # ADR-0016 rule 3b guarantees the merge tree is identical, so the
@@ -103,19 +118,44 @@ jobs:
           docker run --rm "grug-${{ matrix.svc }}:pr-smoke" aws_signing_helper version
 
       # --- #498 (ADR-0016): publish the smoked artifact for promotion ---
-      # Everything below is same-repo-PR only: fork runs have no secrets and
-      # skip cleanly; the merge deploy falls back to a rebuild when no pr-<n>
-      # image exists. Push happens ONLY after every smoke above passed.
-      - name: Join tailnet (ephemeral)
+      # Push happens ONLY after every smoke above passed, and only when the
+      # promotion credentials are actually usable: fork PRs (no secrets by
+      # GitHub's rules) and unseeded CI_* secrets both skip EVERY promotion
+      # step - including the tailnet join, which would otherwise hard-fail
+      # the whole gate on an empty authkey (audit stage-2).
+      - name: Check promotion seeding
+        id: seeding
         if: github.event.pull_request.head.repo.full_name == github.repository
+        env:
+          REGISTRY_HOST: ${{ vars.DEPLOY_REGISTRY_HOST }}
+          CI_REGISTRY_USERNAME: ${{ secrets.CI_REGISTRY_USERNAME }}
+          CI_REGISTRY_PASSWORD: ${{ secrets.CI_REGISTRY_PASSWORD }}
+          CI_TS_AUTHKEY: ${{ secrets.CI_TS_AUTHKEY }}
+        run: |
+          if [ -n "$REGISTRY_HOST" ] && [ -n "$CI_REGISTRY_USERNAME" ] \
+             && [ -n "$CI_REGISTRY_PASSWORD" ] && [ -n "$CI_TS_AUTHKEY" ]; then
+            echo "seeded=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "seeded=false" >> "$GITHUB_OUTPUT"
+            echo "::warning::promotion push skipped - CI_* secrets/vars not fully seeded; merge will rebuild"
+            echo "promotion artifact NOT published (CI_* seeding incomplete) - merge will rebuild" >> "$GITHUB_STEP_SUMMARY"
+          fi
+
+      - name: Fork-PR notice
+        if: github.event.pull_request.head.repo.full_name != github.repository
+        run: echo "fork PR - promotion artifacts not published by design; merge will rebuild" >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Join tailnet (ephemeral)
+        if: steps.seeding.outputs.seeded == 'true'
         uses: tailscale/github-action@306e68a486fd2350f2bfc3b19fcd143891a4a2d8 # v4
         with:
+          # Reusable key on purpose: both matrix legs join concurrently.
           authkey: ${{ secrets.CI_TS_AUTHKEY }}
           tags: tag:ci
           use-cache: 'true'
 
       - name: Push pr-tagged image
-        if: github.event.pull_request.head.repo.full_name == github.repository
+        if: steps.seeding.outputs.seeded == 'true'
         env:
           REGISTRY_HOST: ${{ vars.DEPLOY_REGISTRY_HOST }}
           CI_REGISTRY_USERNAME: ${{ secrets.CI_REGISTRY_USERNAME }}
@@ -123,10 +163,6 @@ jobs:
           PR_NUMBER: ${{ github.event.pull_request.number }}
         run: |
           set -euo pipefail
-          if [ -z "$REGISTRY_HOST" ] || [ -z "$CI_REGISTRY_USERNAME" ]; then
-            echo "::warning::registry push skipped - CI_* secrets/vars not seeded; merge will rebuild"
-            exit 0
-          fi
           echo "$CI_REGISTRY_PASSWORD" | docker login "$REGISTRY_HOST" \
             --username "$CI_REGISTRY_USERNAME" --password-stdin
           docker tag "grug-${{ matrix.svc }}:pr-smoke" \

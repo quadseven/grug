@@ -7,7 +7,9 @@
 # workflow rewrites at deploy time.
 #
 # Required environment configuration (operator-seeded, never committed):
-#   vars.DEPLOY_REGISTRY_HOST     - private registry hostname
+#   vars.DEPLOY_REGISTRY_HOST     - private registry hostname (since #498
+#                                   ALSO seeded at repo level for the PR
+#                                   gate's promotion push)
 #   secrets.TS_AUTHKEY            - tag-scoped ephemeral join key
 #   secrets.REGISTRY_USERNAME     - registry push credential
 #   secrets.REGISTRY_PASSWORD
@@ -77,58 +79,111 @@ jobs:
 
       - name: Resolve promotion (ADR-0016)
         id: promo
+        # continue-on-error: plumbing failures here must degrade to the
+        # rebuild path (promotion is an optimization, never a requirement);
+        # the rebuild step keys on promote != 'true', which a failed/empty
+        # step satisfies.
+        continue-on-error: true
         env:
           GH_TOKEN: ${{ github.token }}
           REGISTRY_HOST: ${{ vars.DEPLOY_REGISTRY_HOST }}
         run: |
           set -euo pipefail
           # Gather the facts; scripts/promotion.py (pure, unit-tested)
-          # decides. ANY gather failure lands as an empty fact = rebuild.
-          pr_num=""; head_tree=""; merge_tree=""
-          present_webhook=false; present_api=false
+          # decides. Every gh/docker probe failure lands as an empty fact
+          # or a false manifest bit = rebuild - with its stderr surfaced as
+          # a ::warning so a 403/auth/network failure is not misread as a
+          # clean absence (audit stage-2).
+          gh_fact() {  # gh_fact <out-default> <args...>
+            local out
+            if out=$(gh api "$@" 2> "$RUNNER_TEMP/gh-err.txt"); then
+              printf '%s' "$out"
+            else
+              echo "::warning::gh api $1 failed: $(head -c 200 "$RUNNER_TEMP/gh-err.txt")"
+              printf ''
+            fi
+          }
+          prs_json="[]"; head_sha=""; head_tree=""; merge_tree=""
+          manifest_flags=()
           if [ "${{ github.event_name }}" = "push" ]; then
-            pr_num=$(gh api "repos/${GITHUB_REPOSITORY}/commits/${GITHUB_SHA}/pulls" \
-              --jq '[.[] | select(.merged_at != null) | .number] | if length == 1 then .[0] else "" end' \
-              2>/dev/null || echo "")
+            prs_json=$(gh_fact "repos/${GITHUB_REPOSITORY}/commits/${GITHUB_SHA}/pulls" \
+              --jq '[.[] | select(.merged_at != null) | .number]')
+            prs_json=${prs_json:-[]}
           fi
-          merge_tree=$(gh api "repos/${GITHUB_REPOSITORY}/commits/${GITHUB_SHA}" \
-            --jq .commit.tree.sha 2>/dev/null || echo "")
+          pr_num=$(printf '%s' "$prs_json" | python3 -c "import json,sys; v=json.load(sys.stdin); print(v[0] if len(v)==1 else '')" 2>/dev/null || echo "")
           if [ -n "$pr_num" ]; then
-            head_sha=$(gh api "repos/${GITHUB_REPOSITORY}/pulls/${pr_num}" \
-              --jq .head.sha 2>/dev/null || echo "")
+            merge_tree=$(gh_fact "repos/${GITHUB_REPOSITORY}/commits/${GITHUB_SHA}" --jq .commit.tree.sha)
+            head_sha=$(gh_fact "repos/${GITHUB_REPOSITORY}/pulls/${pr_num}" --jq .head.sha)
             if [ -n "$head_sha" ]; then
-              head_tree=$(gh api "repos/${GITHUB_REPOSITORY}/commits/${head_sha}" \
-                --jq .commit.tree.sha 2>/dev/null || echo "")
+              head_tree=$(gh_fact "repos/${GITHUB_REPOSITORY}/commits/${head_sha}" --jq .commit.tree.sha)
             fi
             for svc in webhook api; do
-              if docker manifest inspect "$REGISTRY_HOST/grug-$svc:pr-${pr_num}" > /dev/null 2>&1; then
-                eval "present_$svc=true"
+              present=false
+              if err=$(docker manifest inspect "$REGISTRY_HOST/grug-$svc:pr-${pr_num}" 2>&1 >/dev/null); then
+                present=true
+              elif ! printf '%s' "$err" | grep -qiE 'manifest unknown|not found|no such manifest'; then
+                echo "::warning::manifest probe grug-$svc:pr-${pr_num} failed (non-absence): $(printf '%s' "$err" | head -c 160)"
               fi
+              manifest_flags+=("--manifest" "$svc=$present")
             done
+          else
+            manifest_flags+=("--manifest" "webhook=false" "--manifest" "api=false")
           fi
-          python3 -c "import json,sys; a=sys.argv; print(json.dumps({
-            'pr_numbers': [int(a[1])] if a[1] else [],
-            'pr_head_tree': a[2] or None, 'merge_tree': a[3] or None,
-            'manifests_present': {'webhook': a[4]=='true', 'api': a[5]=='true'}}))" \
-            "$pr_num" "$head_tree" "$merge_tree" "$present_webhook" "$present_api" \
-            | python3 scripts/promotion.py | tee -a "$GITHUB_OUTPUT"
-          echo "pr_num=$pr_num" >> "$GITHUB_OUTPUT"
+          python3 scripts/promotion.py \
+            --pr-numbers-json "$prs_json" \
+            --head-tree "$head_tree" --merge-tree "$merge_tree" \
+            --expected-services webhook,api \
+            "${manifest_flags[@]}" | tee -a "$GITHUB_OUTPUT"
+          echo "head_sha=$head_sha" >> "$GITHUB_OUTPUT"
+
+      - name: Rebuild-cause triage
+        if: steps.promo.outputs.promote != 'true'
+        env:
+          CATEGORY: ${{ steps.promo.outputs.category }}
+          REASON: ${{ steps.promo.outputs.reason }}
+        run: |
+          # env-var indirection, never ${{ }} inside the script body - the
+          # reason string is data, not code (audit stage-8 injection sink).
+          echo "rebuild (${CATEGORY:-unknown}): ${REASON:-resolve step failed}" >> "$GITHUB_STEP_SUMMARY"
+          if [ "${CATEGORY}" = "artifact-missing" ]; then
+            echo "::warning::promotion EXPECTED but pr artifact absent - check the gate's push / CI_* seeding (silent promotion death otherwise)"
+          fi
 
       - name: Promote PR-tested digests (server-side retag)
+        id: promote
         if: steps.promo.outputs.promote == 'true'
+        # A retag failure must fall back to rebuild, not kill the deploy;
+        # a HALF-promoted registry heals because the rebuild path pushes
+        # the same merge-sha tags right over the orphans.
+        continue-on-error: true
         env:
           REGISTRY_HOST: ${{ vars.DEPLOY_REGISTRY_HOST }}
           PR_NUM: ${{ steps.promo.outputs.pr_num }}
+          HEAD_SHA: ${{ steps.promo.outputs.head_sha }}
         run: |
           set -euo pipefail
           for svc in webhook api; do
+            # Verify the ARTIFACT, not just the git graph: the baked
+            # DD_GIT_COMMIT_SHA must equal the PR head sha. Closes the
+            # stale-tag vectors tree identity cannot see (superseded gate
+            # run finishing late, path-filter dropout, merge-ref build) -
+            # audit stages 5, 6 and 8.
+            env_json=$(docker buildx imagetools inspect \
+              "$REGISTRY_HOST/grug-$svc:pr-${PR_NUM}" \
+              --format '{{json .Image.Config.Env}}')
+            verdict=$(python3 scripts/promotion.py --verify-baked-sha "$env_json" "$HEAD_SHA")
+            printf '%s\n' "$verdict"
+            if ! printf '%s' "$verdict" | grep -q '^verified=true'; then
+              echo "::warning::grug-$svc:pr-${PR_NUM} failed baked-sha verification - falling back to rebuild"
+              exit 1
+            fi
             digest=$(docker buildx imagetools inspect \
               "$REGISTRY_HOST/grug-$svc:pr-${PR_NUM}" --format '{{.Manifest.Digest}}')
-            [ -n "$digest" ] || { echo "::error::no digest for grug-$svc:pr-${PR_NUM}"; exit 1; }
             # Server-side retag: the merge sha tag points at the EXACT
-            # PR-tested manifest - no rebuild, no layer transfer. The sha
-            # tag keeps the registry retention window + rollback ergonomics
-            # identical to the rebuild path.
+            # PR-tested manifest - no rebuild, no layer transfer. NOTE the
+            # merge-sha tag then SHARES a manifest with pr-<n>; safe
+            # because the retention CronJob deletes by TAG (dist-spec v3),
+            # never by digest - see ADR-0016.
             docker buildx imagetools create \
               -t "$REGISTRY_HOST/grug-$svc:${GITHUB_SHA}" \
               "$REGISTRY_HOST/grug-$svc@${digest}"
@@ -138,13 +193,12 @@ jobs:
           echo "promoted pr-${PR_NUM} digests (no rebuild)" >> "$GITHUB_STEP_SUMMARY"
 
       - name: Build + push images (native arm64)
-        if: steps.promo.outputs.promote != 'true'
+        if: steps.promo.outputs.promote != 'true' || steps.promote.outcome != 'success'
         env:
           REGISTRY_HOST: ${{ vars.DEPLOY_REGISTRY_HOST }}
         run: |
           set -euo pipefail
           echo "IMAGE_SOURCE=rebuilt" >> "$GITHUB_ENV"
-          echo "rebuild: ${{ steps.promo.outputs.reason }}" >> "$GITHUB_STEP_SUMMARY"
           for svc in webhook api; do
             # Context is services/ (ADR-0014): the image COPYs both the
             # service tree and services/_shared/.
@@ -338,7 +392,7 @@ jobs:
           kubectl -n grug annotate --overwrite \
             deploy/grug-webhook deploy/grug-api deploy/grug-consumer \
             cronjob/grug-poller \
-            "grug.dev/image-source=${IMAGE_SOURCE:-rebuilt}" \
+            "grug.dev/image-source=${IMAGE_SOURCE:?neither image step set IMAGE_SOURCE}" \
             "grug.dev/merge-sha=${GITHUB_SHA}"
 
       - name: Cleanup
