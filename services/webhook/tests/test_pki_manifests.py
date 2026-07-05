@@ -11,7 +11,8 @@ pins the contract values a well-meaning cleanup would break:
   out-rank credential_process in the SDK chain, silently bypassing the
   exact path this tracer proves.
 - The credential_process line must pass --intermediates (the trust anchor
-  is the offline ROOT; ca.crt is the signing intermediate).
+  is the offline ROOT; ca.crt from the CA-backed ClusterIssuer carries the
+  signing intermediate - see grug-aws-config.yaml for the tls.crt nuance).
 """
 
 from __future__ import annotations

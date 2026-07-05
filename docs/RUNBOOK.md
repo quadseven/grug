@@ -225,7 +225,8 @@ of grug-secrets at #388; the #386 rotator now rotates THAT Secret) until
 the #389 rollout.
 
 - **Rollback** (poller misbehaving on the cert path): add
-  `- secretRef: {name: grug-aws-static-key}` back to the poller's envFrom
+  `- secretRef: {name: grug-aws-static-key}` to the poller's envFrom
+  (restoring the pre-#388 static-cred behavior)
   and drop the `AWS_CONFIG_FILE` env - env creds out-rank
   credential_process, so this instantly reverts to the static key. Both
   paths coexist until #389.
@@ -239,7 +240,7 @@ the #389 rollout.
   CRASHES the Job - the KSM `duration_since_last_successful` monitor
   pages within the hour. No news from this log line = the cert path is
   dead, not idle.
-- **Rotator/SSM gap (pre-existing, #388 follow-up filed)**: the #386
+- **Rotator/SSM gap (#502, filed from the #388 audit)**: the #386
   rotator rotates the LIVE IAM key but never writes it back to
   /grug/k8s-pod-aws-*, so a deploy right after a rotation seeds
   grug-aws-static-key with a DELETED key until the next rotator tick.
