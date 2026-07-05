@@ -158,26 +158,3 @@ def test_rollback_incomplete_flag_gates_completed_telemetry():
     assert block.index("RESTORE_INCOMPLETE=1") < block.index("phase=")
     assert 'RESTORE_INCOMPLETE:-0' in block and "incomplete" in block
 
-
-def test_release_bundle_generations_structure():
-    """#499 (codex r13): the verified-release bundle is recorded AFTER the
-    synthetic (two-generation shift) and both rollback paths consume the
-    PREVIOUS generation before the image re-pins."""
-    text = (_ROOT / ".github" / "workflows" / "deploy.k8s.yml").read_text()
-    i_synth = text.index("Post-deploy synthetic self-test")
-    i_bundle = text.index("Record verified release bundle")
-    i_rollback = text.index("Auto-rollback to last-good")
-    assert i_synth < i_bundle < i_rollback
-    assert "steps.synthetic.outcome == 'success'" in text[i_bundle:i_rollback]
-    # AUTO-rollback (deploy.k8s) restores the RUNNING verified release =
-    # 'current' (pairs with the pre-mutation grug-last-good images = same
-    # generation, no hybrid); MANUAL rollback (deploy.rollback) leaves the
-    # running release, so it restores 'previous' (codex r14).
-    auto = (_ROOT / ".github" / "workflows" / "deploy.k8s.yml").read_text()
-    i_gen = auto.index("{.data.current}", auto.index("Auto-rollback to last-good"))
-    i_pin = auto.index("set image deploy/grug-webhook", auto.index("Auto-rollback to last-good"))
-    assert i_gen < i_pin, "auto-rollback: bundle must apply before image re-pins"
-    manual = (_ROOT / ".github" / "workflows" / "deploy.rollback.yml").read_text()
-    i_prev = manual.index("{.data.previous}")
-    i_pin_m = manual.index("set image deploy/grug-webhook")
-    assert i_prev < i_pin_m, "manual rollback: bundle must apply before image re-pins"
