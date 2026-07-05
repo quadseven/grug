@@ -31,6 +31,7 @@ jobs:
     environment: k8s-prod
     steps:
       - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+      - uses: astral-sh/setup-uv@d0d8abe699bfb85fec6de9f7adb5ae17292296ff # v6
       - name: Join tailnet (ephemeral)
         uses: tailscale/github-action@306e68a486fd2350f2bfc3b19fcd143891a4a2d8 # v4
         with:
@@ -67,18 +68,20 @@ jobs:
           # int); guard anyway before it reaches a namespace/schema name.
           case "$PR" in ''|*[!0-9]*) echo "::error::PR number not numeric"; exit 1;; esac
           NS="grug-pr-${PR}"; SCHEMA="grug_pr_${PR}"
-          # Require the #498 pr-tagged images; a preview cannot exist
-          # without them (fork / unseeded gate -> clear failure).
-          for svc in webhook api; do
-            docker manifest inspect "$REGISTRY_HOST/grug-$svc:pr-${PR}" > /dev/null 2>&1 \
-              || { echo "::error::no pr-${PR} image for grug-$svc - the #498 gate must push it first"; exit 1; }
-          done
+          # Require the #498 pr-tagged images and PIN BY DIGEST (tags are
+          # mutable - Qodo review; deploy the exact tested manifest like
+          # #498 does on merge).
+          DIG_W=$(docker buildx imagetools inspect "$REGISTRY_HOST/grug-webhook:pr-${PR}" --format '{{.Manifest.Digest}}' 2>/dev/null || echo "")
+          DIG_A=$(docker buildx imagetools inspect "$REGISTRY_HOST/grug-api:pr-${PR}" --format '{{.Manifest.Digest}}' 2>/dev/null || echo "")
+          if [ -z "$DIG_W" ] || [ -z "$DIG_A" ]; then
+            echo "::error::no pr-${PR} image digest for a service - the #498 gate must push it first"; exit 1
+          fi
           # Throwaway Postgres SCHEMA in the shared CNPG DB (drop+create =
           # clean slate each refresh). The app bootstraps grug_kv into it
           # via search_path. Secret piped to python via stdin (never argv
           # or a shell var) - the same discipline the deploy uses.
           BASE_URL=$(aws ssm get-parameter --name /grug/database-url --with-decryption --query Parameter.Value --output text)
-          printf '%s' "$BASE_URL" | SCHEMA="$SCHEMA" python3 -c '
+          printf '%s' "$BASE_URL" | SCHEMA="$SCHEMA" uv run --with 'psycopg[binary]' python3 -c '
           import os, sys, psycopg
           url = sys.stdin.read().strip(); schema = os.environ["SCHEMA"]
           with psycopg.connect(url, autocommit=True) as c:
@@ -98,8 +101,8 @@ jobs:
             --docker-server="$REGISTRY_HOST" --docker-username="$REGISTRY_USERNAME" \
             --docker-password="$REGISTRY_PASSWORD" --dry-run=client -o yaml | kubectl apply -f -
           sed -e "s|PREVIEW_NS|${NS}|g" -e "s|PREVIEW_PR|${PR}|g" \
-              -e "s|PREVIEW_IMAGE_WEBHOOK|${REGISTRY_HOST}/grug-webhook:pr-${PR}|g" \
-              -e "s|PREVIEW_IMAGE_API|${REGISTRY_HOST}/grug-api:pr-${PR}|g" \
+              -e "s|PREVIEW_IMAGE_WEBHOOK|${REGISTRY_HOST}/grug-webhook@${DIG_W}|g" \
+              -e "s|PREVIEW_IMAGE_API|${REGISTRY_HOST}/grug-api@${DIG_A}|g" \
               k8s/preview/namespace.yaml k8s/preview/deployments.yaml | kubectl apply -f -
           kubectl -n "$NS" rollout status deploy/grug-webhook --timeout=180s
           kubectl -n "$NS" rollout status deploy/grug-api --timeout=180s
@@ -118,6 +121,7 @@ jobs:
     environment: k8s-prod
     steps:
       - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+      - uses: astral-sh/setup-uv@d0d8abe699bfb85fec6de9f7adb5ae17292296ff # v6
       - name: Join tailnet (ephemeral)
         uses: tailscale/github-action@306e68a486fd2350f2bfc3b19fcd143891a4a2d8 # v4
         with:
@@ -147,7 +151,7 @@ jobs:
           NS="grug-pr-${PR}"; SCHEMA="grug_pr_${PR}"
           kubectl delete namespace "$NS" --ignore-not-found --wait=false
           BASE_URL=$(aws ssm get-parameter --name /grug/database-url --with-decryption --query Parameter.Value --output text)
-          printf '%s' "$BASE_URL" | SCHEMA="$SCHEMA" python3 -c '
+          printf '%s' "$BASE_URL" | SCHEMA="$SCHEMA" uv run --with 'psycopg[binary]' python3 -c '
           import os, sys, psycopg
           url = sys.stdin.read().strip()
           with psycopg.connect(url, autocommit=True) as c:
