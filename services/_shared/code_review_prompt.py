@@ -564,13 +564,15 @@ def _render_rule(r: ReviewRule) -> str:
     )
 
 
-def build_system_prompt(variant: PromptVariant = "v1") -> str:
+def build_system_prompt(variant: PromptVariant = "v1", extra_rules: str = "") -> str:
     """Compose the full Elder review system prompt from the rule set.
 
     `variant` selects the confidence-bias arm (#191 A/B): `v1`
     precision-biased (default, the pre-#191 prompt), `v2` recall-biased.
     Deterministic per variant (rules render in declaration order) so the
-    prompt-cache key + DD experiment arm stay stable."""
+    prompt-cache key + DD experiment arm stay stable. `extra_rules` (the
+    per-repo #527 practices block) appends after the static RULES; it is
+    NOT part of the static per-variant cache (it is repo-specific)."""
     if variant not in _CONFIDENCE_CLAUSES:
         raise ValueError(
             f"unknown prompt variant {variant!r}; "
@@ -583,4 +585,8 @@ def build_system_prompt(variant: PromptVariant = "v1") -> str:
         + _PREAMBLE_TAIL
     )
     rules_block = "\n".join(_render_rule(r) for r in RULES)
-    return f"{preamble}\n\n{_VOICE}\n\nRULES:\n{rules_block}\n\n{_OUTPUT_CONTRACT}"
+    # Per-repo team-learned practices (#527) append AFTER the static rules -
+    # a bounded, already-rendered block from best_practices.practices_block.
+    # Empty for repos with no accepted-finding history yet.
+    learned = f"\n\n{extra_rules}" if extra_rules else ""
+    return f"{preamble}\n\n{_VOICE}\n\nRULES:\n{rules_block}{learned}\n\n{_OUTPUT_CONTRACT}"
