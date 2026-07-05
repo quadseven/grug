@@ -4,6 +4,18 @@ network. Webhook-only (the poller ships in the webhook image)."""
 from __future__ import annotations
 
 import poller_handler
+import pytest
+
+
+@pytest.fixture(autouse=True)
+def _no_ambient_ra_config(monkeypatch):
+    """Hermeticity (audit #388 stage-7, VERIFIED failing): a developer
+    shell with AWS_CONFIG_FILE + ambient AWS_* creds sent every handler()
+    test into the identity proof's tripwire. CI never caught it (hosted
+    runners lack the env). The proof tests setenv explicitly, so they are
+    unaffected by this delenv."""
+    monkeypatch.delenv("AWS_CONFIG_FILE", raising=False)
+
 
 
 def _wire(monkeypatch, *, installs, records_for, retry, poll):
@@ -290,3 +302,23 @@ def test_identity_proof_logs_the_assumed_arn(monkeypatch, caplog):
         ph._prove_roles_anywhere_identity()
     (rec,) = [r for r in caplog.records if r.msg == "roles_anywhere_identity_proven"]
     assert "ra-grug" in rec.assumed_arn
+
+
+def test_handler_runs_identity_proof_before_any_install_work(monkeypatch):
+    """The proof's two production duties (fail-loud cred channel, expiry
+    canary) hang on ONE call site at the top of handler(); the four unit
+    tests all call the proof directly and would stay green if it were
+    deleted (audit stage-7 CRITICAL). Ordering matters: the proof must
+    fire BEFORE any per-install best-effort swallow can absorb it."""
+
+    def _boom():
+        raise RuntimeError("proof ran")
+
+    monkeypatch.setattr(poller_handler, "_prove_roles_anywhere_identity", _boom)
+    monkeypatch.setattr(
+        poller_handler,
+        "list_allowlisted_installs",
+        lambda: pytest.fail("install work reached before the proof"),
+    )
+    with pytest.raises(RuntimeError, match="proof ran"):
+        poller_handler.handler({}, None)
