@@ -451,6 +451,7 @@ def _build_messages(
     file_contents: dict[str, str] | None = None,
     cross_file_contents: dict[str, str] | None = None,
     runtime_context: str | None = None,
+    team_practices: str = "",
 ) -> list[dict[str, str]]:
     # `file_contents` maps path → full file content at head SHA. Optional and
     # backward-compatible: when empty (fetch disabled/failed), the per-hunk
@@ -500,8 +501,13 @@ def _build_messages(
     # the literal secret value, so masking does not cost review quality. The
     # system prompt is fixed and carries no secrets, so only the user content is
     # scrubbed. (Until now `_redact_secrets` guarded only the DD span payload.)
+    # Per-repo team-learned practices (#527) append to the system prompt at
+    # CALL time (repo-specific, so not part of the static per-variant cache).
+    system = _SYSTEM_PROMPTS[variant]
+    if team_practices:
+        system = f"{system}\n\n{team_practices}"
     return [
-        {"role": "system", "content": _SYSTEM_PROMPTS[variant]},
+        {"role": "system", "content": system},
         {"role": "user", "content": _redact_secrets("\n\n".join(parts))},
     ]
 
@@ -686,6 +692,29 @@ def _extract_usage_metrics(body: Any) -> dict[str, Optional[int]]:
     }
 
 
+def _team_practices_block(pr_context: Optional[PrContext]) -> str:
+    """Fetch + render the repo's cached best-practices for the prompt (#527).
+    Best-effort: any failure (no repo, store down, none derived) returns ""
+    so the review runs on the static rules alone."""
+    if not pr_context or "repo" not in pr_context:
+        return ""
+    try:
+        from adapters.pg_install_store import get_repo_practices  # type: ignore
+        from best_practices import practices_block, practices_from_dicts  # type: ignore
+        rows = get_repo_practices(str(pr_context["repo"]))
+        if not rows:
+            return ""
+        block = practices_block(practices_from_dicts(rows))
+        # Redact secret-shaped values (#541 Qodo): the block is ledger-derived
+        # and now rides the SYSTEM prompt to a third-party backend - a finding
+        # could quote a committed credential. Same guard the user content uses.
+        return _redact_secrets(block) if block else ""
+    except Exception as e:  # noqa: BLE001 - practices never break a review, but log
+        log.warning("team_practices_fetch_failed", extra={
+            "repo": str(pr_context.get("repo", "")), "kind": type(e).__name__})
+        return ""
+
+
 def review_diff(
     hunks: list[Hunk],
     installation_id: int,
@@ -714,7 +743,10 @@ def review_diff(
         Backend.OPENROUTER if primary == Backend.POOLSIDE else Backend.POOLSIDE
     )
     variant = select_prompt_variant(installation_id)  # #191 A/B arm
-    messages = _build_messages(hunks, variant, file_contents, cross_file_contents, runtime_context)
+    messages = _build_messages(
+        hunks, variant, file_contents, cross_file_contents, runtime_context,
+        team_practices=_team_practices_block(pr_context),
+    )
     pr_tags = _llmobs_tags(pr_context)
 
     last_error = ""
