@@ -540,23 +540,6 @@ jobs:
           probe_health grug-api
           echo "synthetic PASS: health x2, signed ping 200, 60s soak clean" >> "$GITHUB_STEP_SUMMARY"
 
-      - name: Advance rollback anchor (synthetic passed)
-        if: steps.synthetic.outcome == 'success'
-        run: |
-          set -euo pipefail
-          # The anchor now means 'last SYNTHETIC-VERIFIED release': advance
-          # it to the just-verified digests so a manual deploy.rollback
-          # dispatch between deploys is a true no-op drill (codex r5 - the
-          # pre-apply anchor alone made a post-success drill revert a
-          # healthy release).
-          W=$(kubectl -n grug get deploy grug-webhook -o jsonpath='{.spec.template.spec.containers[0].image}')
-          A=$(kubectl -n grug get deploy grug-api -o jsonpath='{.spec.template.spec.containers[0].image}')
-          kubectl -n grug create configmap grug-last-good \
-            --from-literal=webhook="$W" --from-literal=api="$A" \
-            --from-literal=recorded_from_sha="${GITHUB_SHA}" \
-            --dry-run=client -o yaml | kubectl apply -f -
-          echo "anchor advanced to this verified release" >> "$GITHUB_STEP_SUMMARY"
-
       - name: Auto-rollback to last-good (#499)
         # Fires on ANY post-anchor deploy failure: a failed apply/rollout/
         # smoke OR a failed synthetic. IMAGE-ONLY contract (ADR-0017): the

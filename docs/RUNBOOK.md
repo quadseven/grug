@@ -325,8 +325,11 @@ digest pair that was running before the last deploy) - no rebuild:
   touched k8s/) - revert + redeploy for those. The manual path is
   image-only (no snapshot exists in a later run).
 - **Manual one-click**: Actions -> deploy.rollback -> Run workflow (main).
-  Same re-apply; safe to drill after a good deploy (anchor == running
-  images = no-op rollout).
+  Re-applies the release that was running BEFORE the latest deploy - use
+  it when the current release is bad, INCLUDING a bad release that
+  passed the synthetic. NOTE a "drill" genuinely reverts one release
+  (not a no-op): roll forward afterwards with Actions -> deploy.k8s ->
+  Run workflow.
 
 Verify state after either path: `kubectl -n grug get deploy -o
 jsonpath='{range .items[*]}{.metadata.name}: {.metadata.annotations.grug\.dev/image-source}{"\n"}{end}'`
