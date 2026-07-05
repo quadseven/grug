@@ -85,6 +85,27 @@ _SMASHER = frozenset({"smasher"})
 _RERUNNABLE = _CODE_REVIEWER | _GUARD | _SMASHER
 
 
+def enqueue_ask(*, install_id: int, repo: str, pr_number: int, comment_id: int, question: str) -> None:
+    """Enqueue a `/grug ask` job (#528) so the heavy LLM Q&A runs in the
+    consumer, NOT inline in the webhook ACK path. Dedup keys on comment_id
+    (each question is distinct - unlike a persona rerun), so a re-delivered
+    comment collapses but two different questions do not."""
+    if not _RERUN_QUEUE_URL:
+        raise RuntimeError("GRUG_RERUN_QUEUE_URL not configured")
+    _sqs.send_message(
+        QueueUrl=_RERUN_QUEUE_URL,
+        MessageBody=json.dumps({
+            "schema_version": SCHEMA_VERSION, "kind": "ask",
+            "install_id": install_id, "repo": repo, "pr_number": pr_number,
+            "comment_id": comment_id, "question": question,
+        }),
+        MessageGroupId=str(install_id),
+        MessageDeduplicationId=f"{install_id}:{repo}:{pr_number}:ask:{comment_id}",
+    )
+    log.info("ask_enqueued", extra={"install_id": install_id, "repo": repo,
+                                    "pr": pr_number, "comment_id": comment_id})
+
+
 def _gh_get(token: str, url: str) -> dict[str, Any]:
     resp = httpx.get(
         url,
@@ -98,6 +119,60 @@ def _gh_get(token: str, url: str) -> dict[str, Any]:
     return resp.json()
 
 
+def _gh_get_text(token: str, url: str, *, accept: str) -> str:
+    resp = httpx.get(
+        url, headers={"Authorization": f"Bearer {token}", "Accept": accept},
+        timeout=_FETCH_TIMEOUT,
+    )
+    resp.raise_for_status()
+    return resp.text
+
+
+def _gh_post(token: str, url: str, json_body: dict[str, Any]) -> None:
+    resp = httpx.post(
+        url, json=json_body,
+        headers={"Authorization": f"Bearer {token}", "Accept": "application/vnd.github+json"},
+        timeout=_FETCH_TIMEOUT,
+    )
+    resp.raise_for_status()
+
+
+def _run_ask(install_id: int, repo_full: str, pr_number: int, question: str) -> str:
+    """Answer a /grug ask question in the consumer (async, #528). Fetches the
+    diff, runs the JSON-constrained Q&A over the REDACTED question + diff, and
+    posts the answer as a reply. Records an activity row. Never raises past
+    the job (a bad answer degrades to a fallback reply)."""
+    from urllib.parse import quote as _q
+    from llm_client import _redact_secrets, answer_pr_question  # type: ignore
+    from observability import emit_gauge  # type: ignore
+    owner, _, repo_name = repo_full.partition("/")
+    q = _redact_secrets(question)
+
+    def _do(token: str) -> str:
+        diff = _gh_get_text(
+            token,
+            f"{_GH_API}/repos/{_q(owner, safe='')}/{_q(repo_name, safe='')}/pulls/{pr_number}",
+            accept="application/vnd.github.v3.diff",
+        )
+        answer = answer_pr_question(q, diff, install_id)
+        body = (f"{answer}\n\n*(Grug answered from the PR diff - may be wrong; verify.)*"
+                if answer else
+                "Grug could not answer that right now (the thinking-rock is tired). Try again.")
+        _gh_post(
+            token,
+            f"{_GH_API}/repos/{_q(owner, safe='')}/{_q(repo_name, safe='')}/issues/{pr_number}/comments",
+            {"body": body},
+        )
+        return "answered" if answer else "ask_no_answer"
+    result = with_install_token_retry(install_id, _do)
+    try:
+        emit_gauge("grug.interactive.ask", 1)
+    except Exception:  # noqa: BLE001
+        pass
+    log.info("ask_answered", extra={"repo": repo_full, "pr": pr_number, "result": result})
+    return result
+
+
 def _run_one(body: str) -> str:
     """Re-run ONE job. Raises on a malformed message or an infra fetch failure
     (→ ESM retry → DLQ). Returns a short status for the batch summary log.
@@ -109,6 +184,8 @@ def _run_one(body: str) -> str:
     install_id = int(job["install_id"])
     repo_full = str(job["repo"])  # "owner/name"
     pr_number = int(job["pr_number"])
+    if job.get("kind") == "ask":
+        return _run_ask(install_id, repo_full, pr_number, str(job.get("question", "")))
     persona = str(job.get("persona", "elder"))
 
     if persona not in _RERUNNABLE:

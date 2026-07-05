@@ -71,7 +71,7 @@ def test_no_trigger_text_no_ops(_no_install_lookups):
     payload = _comment_payload(body="lgtm")
     out = d.dispatch("issue_comment", payload)
     assert out["status"] == "no_op"
-    assert "no /grug recheck trigger" in out["reason"]
+    assert "no /grug command trigger" in out["reason"]
 
 
 def test_non_pr_issue_comment_no_ops(_no_install_lookups):
