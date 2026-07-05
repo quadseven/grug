@@ -646,6 +646,10 @@ jobs:
           # consumer - set image never touches env.
           kubectl -n grug set env deploy/grug-webhook GRUG_SMASHER_JOB_IMAGE="$W"
           kubectl -n grug set env deploy/grug-consumer GRUG_SMASHER_JOB_IMAGE="$W"
+          # The preview janitor rides the webhook image too (#500) - roll
+          # it back so a bad webhook digest doesn't linger on the hourly
+          # cleanup CronJob.
+          kubectl -n grug set image cronjob/grug-preview-janitor janitor="$W"
           # set image is a no-op when digests match (a config-only bad
           # deploy) - force pod restarts so the restored secret is
           # actually mounted.

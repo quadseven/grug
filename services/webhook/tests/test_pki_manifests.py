@@ -74,6 +74,7 @@ def test_aws_config_credential_process_shape():
 # ride the Roles Anywhere path.
 EXCLUDED_FROM_RA_FLEET = {
     "smasher-trial-namespace.yaml": "trial sandbox: token-free by design, no AWS",
+    "preview-janitor.yaml": "preview TTL janitor: in-cluster k8s API ONLY, no AWS/RA/grug-secrets (#500)",
 }
 
 
