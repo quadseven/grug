@@ -316,7 +316,7 @@ flowchart LR
 See `docs/SELF_HOST.md` + `docs/HITL_PREREQUISITES.md` for the full operator runbook. In brief:
 
 1. **Manual SSM pre-load** — every `/grug/*` parameter the pods read at runtime (App id/key/secret, OAuth client id+secret, webhook secret, session-signing secret, CF shared secret, KMS CMK ARN, database URL) plus `/infra/llm/*` LLM keys and `/infra/datadog/*` keys.
-2. **`pulumi up`** (`iac.deploy.yml`) — creates the AWS-side infra: SSM references, KMS CMK, OIDC role, the `grug-k8s-pod` + rotator IAM users, SQS FIFO queues + DLQs, S3 cave bucket, DD monitors/dashboard/RUM app. (DynamoDB `grug-main` still exists here as legacy.)
+2. **`pulumi up`** (`iac.deploy.yml`) — creates the AWS-side infra: SSM references, KMS CMK, OIDC role, SQS FIFO queues + DLQs, S3 cave bucket, DD monitors/dashboard/RUM app. (DynamoDB `grug-main` still exists here as legacy.)
 3. **Provision Postgres** — the `grug_kv` table on the shared CNPG cluster; put its DSN in `/grug/database-url`.
 4. **Stand up the CF edge** — a `cloudflared` tunnel to the in-cluster Services; set `/grug/{api,webhook}-upstream-host` to the tunnel hostnames and `/grug/cf-shared-secret`; deploy the `*-host-rewrite` Workers via `infra/cloudflare/deploy.sh` (binds the routes, injects the secret, points upstream at the tunnel host).
 5. **First `deploy.k8s.yml` run** — builds + pushes the arm64 images, joins the tailnet, seeds the three Secrets, applies `k8s/` by digest, waits on rollout + the poller smoke job.
