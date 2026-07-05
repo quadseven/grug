@@ -43,11 +43,10 @@ spec:
               image: REGISTRY_PLACEHOLDER/grug-webhook:TAG_PLACEHOLDER
               # ddtrace-run so poller spans are not silently dropped (review F4).
               command: ["ddtrace-run", "python", "-c", "from poller_handler import handler; handler({}, None)"]
-              # envFrom is APP CONFIG ONLY (#388): the static AWS key pair
-              # lives in the separate grug-aws-static-key Secret, which the
-              # poller deliberately does NOT receive - env credentials would
-              # out-rank credential_process in the SDK chain and silently
-              # bypass the Roles Anywhere path this tracer exists to prove.
+              # envFrom is APP CONFIG ONLY: env credentials would out-rank
+              # credential_process in the SDK chain and silently bypass the
+              # Roles Anywhere path the boot proof asserts (#388/#389; the
+              # static-key world is fully retired).
               envFrom:
                 - secretRef: {name: grug-secrets}
               env:

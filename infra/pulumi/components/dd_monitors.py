@@ -9,7 +9,7 @@ so it can never drift. Tag matrix is identical across all monitors:
     env:<stack>          # dev | prod  (matches DD_ENV)
     service:<grug-svc>   # the service monitored: namespace-level `grug` for
                          #   cross-workload monitors, or a specific workload
-                         #   (grug-webhook | grug-api | grug-poller | grug-key-rotator)
+                         #   (grug-webhook | grug-api | grug-poller | grug-consumer)
     team:grug
 
 Notification handle = an SNS topic ARN OR a `@user@host`-style mention
@@ -37,7 +37,6 @@ class _MonitorBundle:
     elder_llm_degraded: datadog.Monitor
     enforcement_gap: datadog.Monitor
     cf_secret_mismatch: datadog.Monitor
-    key_rotation_fail: datadog.Monitor
     uptime: datadog.SyntheticsTest
     credential_acquisition_fail: datadog.Monitor
 
@@ -101,9 +100,8 @@ def credential_acquisition_failure_query(env: str) -> str:
     botocore's CredentialRetrievalError string so BOTH the boot-proof
     path and a mid-run SDK acquisition failure alert. All four grug
     services emit it; one monitor covers the fleet."""
-    # service:grug-* on purpose (audit #389-1): auto-covers a future 5th
-    # service AND the key-rotator's own CredentialRetrievalError (the
-    # reserve custodian's cred failing is page-worthy too).
+    # service:grug-* on purpose (audit #389-1): auto-covers any future
+    # grug service without editing the monitor.
     return (
         f'logs("service:grug-* env:{env} '
         '(roles_anywhere_identity_failed OR CredentialRetrievalError '
@@ -482,35 +480,6 @@ def create_all(
         opts=opts,
     )
 
-    # 6b) Key-rotator failure (#386 interim). The CronJob rotates the
-    #     grug-k8s-pod access key every 12h; a failure emits `key_rotation_failed`
-    #     and the Job exits non-zero. On failure the OLD key is kept valid (fail
-    #     safe-open), so pods keep working - but the rotation is stuck and the
-    #     exposure window stops shrinking until a human looks. Page on any
-    #     failure log in a 13h window (just over one cycle).
-    key_rotation_fail = datadog.Monitor(
-        "grug-key-rotator-fail",
-        type="log alert",
-        name="[grug] AWS key-rotation failed (interim rotator)",
-        message=(
-            f"{notify_handle}\n"
-            "The grug-k8s-pod key rotation failed. Since #389 NO workload "
-            "consumes this key - it is the ROLLBACK RESERVE, and a stuck "
-            "rotation degrades the rollback path; fix it before you need "
-            "it. Check the grug-key-rotator Job logs (a dangling new key "
-            "may need manual cleanup; AWS caps the user at 2 keys).\n"
-            "Runbook: docs/RUNBOOK.md#key-rotation"
-        ),
-        query=(
-            f'logs("service:grug-key-rotator env:{env} key_rotation_failed")'
-            '.index("*").rollup("count").last("13h") > 0'
-        ),
-        tags=_common_tags(env, "grug-key-rotator"),
-        notify_no_data=False,
-        priority=2,
-        opts=opts,
-    )
-
     # 7) Synthetic uptime — hit GET /livez (no IO, returns 200). Earlier
     #    design POSTed a fake-sig body expecting 401, but that triggered
     #    webhook_signature_invalid every 5 min → false-positive infinite
@@ -564,7 +533,6 @@ def create_all(
         elder_llm_degraded=elder_llm_degraded,
         enforcement_gap=enforcement_gap,
         cf_secret_mismatch=cf_secret_mismatch,
-        key_rotation_fail=key_rotation_fail,
         uptime=uptime,
         credential_acquisition_fail=credential_acquisition_fail,
     )

@@ -252,7 +252,7 @@ def test_identity_proof_skips_without_ra_config(monkeypatch):
 
 def test_identity_proof_refuses_static_env_creds(monkeypatch, caplog):
     """Env creds out-rank credential_process - their presence means the
-    tracer would silently run on the static key. Refuse loudly. EITHER
+    pod would silently bypass the cert path. Refuse loudly. EITHER
     half of the pair triggers (peer review #504: secret-only partial env
     is still config drift worth refusing)."""
     monkeypatch.setenv("AWS_CONFIG_FILE", "/etc/grug-aws/config")

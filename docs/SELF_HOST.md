@@ -91,7 +91,9 @@ Creates the AWS-side infra (no Lambda, no ECR — those retired at #354):
 - KMS CMK `alias/grug-tokens` (OAuth-token envelope encryption)
 - 3 SQS FIFO queues (`grug-rerun-jobs`, `grug-cave-jobs`, `grug-cave-results`) + DLQs
 - S3 cave-diff bucket (`grug-cave-diffs*`)
-- IAM OIDC role for GitHub Actions + the `grug-k8s-pod` and rotator IAM users
+- IAM OIDC role for GitHub Actions (pods hold NO IAM users since #389 -
+  they authenticate via the Roles Anywhere tenant role; see the
+  infrastructure-side pki stack)
 - DD monitors + dashboard + RUM app
 - the legacy `grug-main` DynamoDB table (unused — kept in state pending a separate removal)
 

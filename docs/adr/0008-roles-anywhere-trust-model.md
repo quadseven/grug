@@ -2,7 +2,7 @@
 
 ## Status
 
-Accepted (2026-07-03, ratified via PR #441; the shared PKI it depends on shipped in infrastructure#1318). Resolves audit #6. Supersedes the long-lived static
+Accepted (2026-07-03, ratified via PR #441; the shared PKI it depends on shipped in infrastructure#1318). FULLY IMPLEMENTED 2026-07-05: #388 tracer (PRs #501/#503), #389 fleet rollout (PR #504) + static-key/rotator retirement (PR #506) - every workload authenticates via Roles Anywhere only. Resolves audit #6. Supersedes the long-lived static
 key + interim rotator (#386, shipped as a throwaway). Parent PRD: #385.
 Implemented by #388 (end-to-end tracer) then #389 (rollout + static-key
 retirement).
