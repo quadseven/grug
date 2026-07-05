@@ -12,10 +12,15 @@
 # the #389 rollout); the api image does not carry it until #389.
 FROM golang:1.26-bookworm AS signing-helper
 ARG SIGNING_HELPER_VERSION=v1.8.4
+# CGO stays ON: the helper's pkcs11 support (miekg/pkcs11) is cgo-only
+# and CGO_ENABLED=0 fails compilation. The binary therefore links the
+# builder's glibc - keep BOTH stages on the same Debian release
+# (bookworm) or the runtime exec dies; the image gate execs the binary
+# inside the runtime image to pin that.
 RUN git clone --depth 1 --branch ${SIGNING_HELPER_VERSION} \
       https://github.com/aws/rolesanywhere-credential-helper /src \
  && cd /src \
- && CGO_ENABLED=0 go build -trimpath -ldflags "-s -w" \
+ && go build -trimpath -ldflags "-s -w" \
       -o /aws_signing_helper . \
  && /aws_signing_helper version
 
