@@ -34,10 +34,12 @@ def _wire(monkeypatch, *, installs, records_for, retry, poll):
     monkeypatch.setattr(
         "adapters.install_store.list_dep_watch_repos", lambda iid: [],
     )
-    # #460: default the enforcement re-emission pass to idle (no tpm
-    # repos) so the reaction-poll assertions stay about the reaction poll.
+    # #460: default the enforcement re-emission pass to idle (GitHub
+    # reports no repos) so the reaction-poll assertions stay about the
+    # reaction poll. NOTE the pass still acquires one token per install
+    # (the repo listing itself is a GitHub call).
     monkeypatch.setattr(
-        "adapters.install_store.list_tpm_enabled_repos", lambda iid: [],
+        "github_rulesets_client.list_installation_repos", lambda token: [],
     )
 
 
@@ -116,8 +118,9 @@ def test_poller_records_listing_failure_is_best_effort(monkeypatch):
 def test_poller_skips_installs_with_no_records(monkeypatch):
     """An install with no CommentRecords skips the REACTIONS poll, and
     with no pulse-enabled repos (store-driven targeting, #472/PR #489)
-    the Pulse pass costs no token either - a fully idle install makes
-    zero GitHub calls."""
+    the Pulse pass costs no token either. The #460 enforcement pass DOES
+    acquire one token per install by design - its GitHub repo listing is
+    the denominator - so exactly one retry call remains."""
     touched = []
     monkeypatch.setattr(
         "adapters.install_store.list_pulse_enabled_repos", lambda iid: [],
@@ -133,7 +136,7 @@ def test_poller_skips_installs_with_no_records(monkeypatch):
         poll=lambda *a, **k: 0,
     )
     out = poller_handler.handler({}, None)
-    assert touched == []
+    assert touched == [7]   # the enforcement pass's single token acquisition
     assert out == {"installs": 1, "records": 0, "submitted": 0, "failed_installs": 0, "pulse_nudges": 0, "pulse_failed_installs": 0, "dep_watch_reports": 0, "dep_watch_failed_installs": 0, "enforcement_emitted": 0, "enforcement_failed_installs": 0}
 
 
@@ -224,7 +227,7 @@ def test_poller_all_installs_fail_logs_error(monkeypatch, caplog):
     )
     with caplog.at_level(_logging.WARNING):
         out = poller_handler.handler({}, None)
-    assert out == {"installs": 2, "records": 2, "submitted": 0, "failed_installs": 2, "pulse_nudges": 0, "pulse_failed_installs": 0, "dep_watch_reports": 0, "dep_watch_failed_installs": 0, "enforcement_emitted": 0, "enforcement_failed_installs": 0}
+    assert out == {"installs": 2, "records": 2, "submitted": 0, "failed_installs": 2, "pulse_nudges": 0, "pulse_failed_installs": 0, "dep_watch_reports": 0, "dep_watch_failed_installs": 0, "enforcement_emitted": 0, "enforcement_failed_installs": 2}
     errs = [r for r in caplog.records if r.msg == "reaction_poll_all_installs_failed"]
     assert errs and errs[0].levelno == _logging.ERROR
     # a partial failure (not ALL) must NOT escalate to error
@@ -247,10 +250,11 @@ def test_poller_no_installs_is_a_clean_noop(monkeypatch):
 # --- #460: enforcement-gauge re-emission pass --------------------------------
 
 
-def _wire_enforcement(monkeypatch, *, installs, tpm_repos, detect, branch=None):
+def _wire_enforcement(monkeypatch, *, installs, gh_repos, detect, config=None):
     """Wire an idle reactions/pulse/dep-watch cycle with a live enforcement
-    pass. `tpm_repos` maps install_id -> repo rows; `detect` is the
-    detect_enforcement stand-in."""
+    pass. `gh_repos` is what GitHub's /installation/repositories returns;
+    `config` maps (install_id, repo_id) -> repo-config dict (default {} =
+    all defaults, i.e. tpm enabled)."""
     _wire(
         monkeypatch,
         installs=installs,
@@ -259,21 +263,19 @@ def _wire_enforcement(monkeypatch, *, installs, tpm_repos, detect, branch=None):
         poll=lambda *a, **k: 0,
     )
     monkeypatch.setattr(
-        "adapters.install_store.list_tpm_enabled_repos",
-        lambda iid: tpm_repos.get(iid, []),
+        "github_rulesets_client.list_installation_repos", lambda token: gh_repos,
     )
     monkeypatch.setattr(
-        "github_rulesets_client.get_repo_default_branch",
-        branch or (lambda token, owner, repo: "main"),
+        "adapters.install_store.get_repo_config",
+        lambda iid, rid: (config or {}).get((iid, rid), {}),
     )
     monkeypatch.setattr("github_rulesets_client.detect_enforcement", detect)
 
 
-def test_enforcement_pass_emits_live_state_per_tpm_repo(monkeypatch):
-    """#460: every tpm-enabled repo of every install gets a LIVE-detected
-    gauge emission each cycle - the continuous signal the enforcement-gap
-    monitor needs (the old event-only emission left it in permanent No
-    Data)."""
+def test_enforcement_pass_emits_live_state_per_github_repo(monkeypatch):
+    """#460 v2: the denominator is GitHub's /installation/repositories (a
+    defaults-only install has ZERO store rows - verified live), each repo
+    emits a LIVE-detected gauge using the listing's default_branch."""
     emitted = []
     detected = []
 
@@ -284,7 +286,10 @@ def test_enforcement_pass_emits_live_state_per_tpm_repo(monkeypatch):
     _wire_enforcement(
         monkeypatch,
         installs=[1],
-        tpm_repos={1: [{"id": 10, "full_name": "o/a"}, {"id": 11, "full_name": "o/b"}]},
+        gh_repos=[
+            {"id": 10, "full_name": "o/a", "default_branch": "trunk"},
+            {"id": 11, "full_name": "o/b", "default_branch": "main"},
+        ],
         detect=_detect,
     )
     monkeypatch.setattr(
@@ -295,11 +300,41 @@ def test_enforcement_pass_emits_live_state_per_tpm_repo(monkeypatch):
     assert emitted == [("o/a", "grug_managed"), ("o/b", "none")]
     from enforcement import GRUG_DOR_CHECK_NAME
     assert detected == [
-        ("o", "a", "main", GRUG_DOR_CHECK_NAME),
+        ("o", "a", "trunk", GRUG_DOR_CHECK_NAME),
         ("o", "b", "main", GRUG_DOR_CHECK_NAME),
     ]
     assert out["enforcement_emitted"] == 2
     assert out["enforcement_failed_installs"] == 0
+
+
+def test_enforcement_pass_honors_store_opt_out(monkeypatch):
+    """A stored tpm_enabled=false is the per-repo opt-OUT overlay: the repo
+    is skipped (not emitted, not detected); missing rows default enabled."""
+    emitted = []
+    detected = []
+
+    def _detect(token, owner, repo, branch, check_name):
+        detected.append(repo)
+        return "grug_managed"
+
+    _wire_enforcement(
+        monkeypatch,
+        installs=[1],
+        gh_repos=[
+            {"id": 10, "full_name": "o/on", "default_branch": "main"},
+            {"id": 11, "full_name": "o/off", "default_branch": "main"},
+        ],
+        detect=_detect,
+        config={(1, 11): {"tpm_enabled": False}},
+    )
+    monkeypatch.setattr(
+        "observability.emit_enforcement_metric",
+        lambda full, state, **kw: emitted.append((full, state)),
+    )
+    out = poller_handler.handler({}, None)
+    assert emitted == [("o/on", "grug_managed")]
+    assert detected == ["on"]
+    assert out["enforcement_emitted"] == 1
 
 
 def test_enforcement_pass_one_repo_failure_does_not_starve_the_rest(monkeypatch, caplog):
@@ -318,7 +353,10 @@ def test_enforcement_pass_one_repo_failure_does_not_starve_the_rest(monkeypatch,
     _wire_enforcement(
         monkeypatch,
         installs=[1],
-        tpm_repos={1: [{"id": 1, "full_name": "o/bad"}, {"id": 2, "full_name": "o/good"}]},
+        gh_repos=[
+            {"id": 1, "full_name": "o/bad", "default_branch": "main"},
+            {"id": 2, "full_name": "o/good", "default_branch": "main"},
+        ],
         detect=_detect,
     )
     monkeypatch.setattr(
@@ -334,24 +372,28 @@ def test_enforcement_pass_one_repo_failure_does_not_starve_the_rest(monkeypatch,
 
 
 def test_enforcement_pass_one_install_failure_does_not_abort_cycle(monkeypatch, caplog):
-    """Per-INSTALL best-effort: a store/token failure for one install is
+    """Per-INSTALL best-effort: a listing/token failure for one install is
     counted and the next install still emits."""
     import logging as _logging
 
     emitted = []
 
-    def _list(iid):
-        if iid == 1:
-            raise RuntimeError("store down")
-        return [{"id": 5, "full_name": "o/ok"}]
+    def _list(token):
+        # First install's listing blows up; the second's succeeds. The
+        # closure distinguishes installs via the wired config below.
+        if _list.calls == 0:
+            _list.calls += 1
+            raise RuntimeError("GitHub listing down")
+        return [{"id": 5, "full_name": "o/ok", "default_branch": "main"}]
+    _list.calls = 0
 
     _wire_enforcement(
         monkeypatch,
         installs=[1, 2],
-        tpm_repos={},
+        gh_repos=[],
         detect=lambda *a, **k: "grug_managed",
     )
-    monkeypatch.setattr("adapters.install_store.list_tpm_enabled_repos", _list)
+    monkeypatch.setattr("github_rulesets_client.list_installation_repos", _list)
     monkeypatch.setattr(
         "observability.emit_enforcement_metric",
         lambda full, state, **kw: emitted.append((full, state)),
@@ -365,13 +407,16 @@ def test_enforcement_pass_one_install_failure_does_not_abort_cycle(monkeypatch, 
 
 
 def test_enforcement_pass_skips_malformed_full_name(monkeypatch):
-    """A row without an owner/name full_name is skipped, not crashed on
-    (the store guards this, but defense in depth for hand-edited rows)."""
+    """A listing entry without an owner/name full_name is skipped, not
+    crashed on."""
     emitted = []
     _wire_enforcement(
         monkeypatch,
         installs=[1],
-        tpm_repos={1: [{"id": 1, "full_name": "no-slash"}, {"id": 2, "full_name": "o/r"}]},
+        gh_repos=[
+            {"id": 1, "full_name": "no-slash", "default_branch": "main"},
+            {"id": 2, "full_name": "o/r", "default_branch": "main"},
+        ],
         detect=lambda *a, **k: "none",
     )
     monkeypatch.setattr(

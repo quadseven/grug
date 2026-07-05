@@ -30,7 +30,16 @@ from adapters.install_store import (  # type: ignore
     list_comment_records,
 )
 from github_app_auth import with_install_token_retry
+from observability import configure_logging
 from personas.code_reviewer.reactions import poll_and_annotate
+
+# The CronJob entry is a bare `python -c "... handler({}, None)"` - unlike
+# webhook/api there is no main.py to configure logging, so without this the
+# root logger has NO handler and every INFO line (including the
+# reaction_poll_cycle_complete summary this module's docstring promises the
+# operator) is silently dropped; only WARNING+ leaked out via logging's
+# lastResort stderr handler. Found at the #460 post-deploy verification.
+configure_logging()
 
 log = logging.getLogger(f"{os.getenv('DD_SERVICE', 'grug')}.poller")
 
@@ -168,37 +177,41 @@ def handler(event: dict[str, Any], context: Any) -> dict[str, int | str]:
     # emitted on enforcement CONFIG events (dashboard toggle, repo-added
     # heal), so in steady state the enforcement-gap monitor sat in permanent
     # No Data - blind to exactly the out-of-band ruleset deletion it exists
-    # to catch. Re-emit a LIVE-detected state per tpm-enabled repo every
-    # cycle so the monitor has a continuous per-repo signal. Same
-    # best-effort shape as the passes above, plus per-REPO best-effort so
-    # one repo's GitHub error can't starve the rest of their gauge.
+    # to catch. The denominator comes from GITHUB (/installation/
+    # repositories), NOT the store: REPO# rows are written only on explicit
+    # config changes, so a defaults-only install has ZERO rows (verified
+    # live at the #513 post-deploy check - the store-driven v1 of this pass
+    # emitted nothing). The store overlays per-repo opt-OUTs
+    # (tpm_enabled=false skips). Same best-effort shape as the passes
+    # above, plus per-REPO best-effort so one repo's GitHub error can't
+    # starve the rest of their gauge.
     enforcement_emitted = 0
     enforcement_failed = 0
     for install_id in installs:
         try:
-            from adapters.install_store import list_tpm_enabled_repos
+            from adapters.install_store import get_repo_config
             from enforcement import GRUG_DOR_CHECK_NAME
             from github_rulesets_client import (
                 detect_enforcement,
-                get_repo_default_branch,
+                list_installation_repos,
             )
             from observability import emit_enforcement_metric
 
-            repos = list_tpm_enabled_repos(install_id)
-            if not repos:
-                continue
-
-            def _emit_for_install(token: str, iid=install_id, rs=repos) -> int:
+            def _emit_for_install(token: str, iid=install_id) -> int:
                 n = 0
-                for r in rs:
+                for r in list_installation_repos(token):
                     full = r.get("full_name", "")
                     owner, sep, name = full.partition("/")
                     if not sep or not name:
                         continue
                     try:
-                        branch = get_repo_default_branch(token, owner, name)
+                        cfg = get_repo_config(iid, r["id"])
+                        if cfg.get("tpm_enabled", True) is False:
+                            continue
                         state = detect_enforcement(
-                            token, owner, name, branch, GRUG_DOR_CHECK_NAME,
+                            token, owner, name,
+                            r.get("default_branch") or "main",
+                            GRUG_DOR_CHECK_NAME,
                         )
                         emit_enforcement_metric(full, state)
                         n += 1
