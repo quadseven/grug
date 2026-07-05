@@ -343,7 +343,7 @@ jobs:
           # absent; NEITHER = snapshot failed -> restore leaves that secret
           # untouched and demands manual review.
           snap() {  # snap <ns> <secret> <file-stem>
-            local out rc err
+            local out err
             err="$RUNNER_TEMP/$3.snap-err"
             if out=$(kubectl -n "$1" get secret "$2" -o json 2> "$err"); then
               printf '%s' "$out" | python3 -c "import json,sys; d=json.load(sys.stdin); [d['metadata'].pop(k, None) for k in ('resourceVersion','uid','creationTimestamp','managedFields')]; print(json.dumps(d))" \
@@ -529,6 +529,20 @@ jobs:
             --data "$BODY" "http://127.0.0.1:18080/webhook/github")
           kill "$pf" 2>/dev/null; wait "$pf" 2>/dev/null || true
           [ "$code" = "200" ] || fail "signed ping got HTTP $code: $(head -c 120 "$RUNNER_TEMP/ping.out")"
+          # Public-edge probe (codex r13): port-forward proves pod-local
+          # health only - GitHub reaches the webhook via DNS + the CF
+          # worker + the tunnel, so probe the real ingress too. grug.lol
+          # is the public product domain (already public in this repo).
+          # Retries absorb edge-cache/tunnel wobble.
+          edge_ok=false
+          for attempt in 1 2 3; do
+            if curl -fsS -m 15 "https://webhook.grug.lol/livez" > /dev/null; then
+              edge_ok=true; break
+            fi
+            echo "edge probe attempt ${attempt} failed; retrying"
+            sleep 10
+          done
+          [ "$edge_ok" = "true" ] || fail "public edge https://webhook.grug.lol/livez unreachable"
           # 60s soak: no container restarts and both services still ready
           # (the owned stand-in for a DD error-rate window - the deploy
           # role has no DD keys by design; see ADR-0017).
@@ -539,6 +553,31 @@ jobs:
           probe_health grug-webhook
           probe_health grug-api
           echo "synthetic PASS: health x2, signed ping 200, 60s soak clean" >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Record verified release bundle (two generations, #499)
+        if: steps.synthetic.outcome == 'success'
+        run: |
+          set -euo pipefail
+          # k8s/ here is the SED-PINNED rendered state this run applied
+          # (digests + RA ARNs baked). Store it as generation 'current'
+          # and shift the old current to 'previous' - rollback (auto
+          # during the NEXT deploy, or manual between deploys) applies
+          # 'previous', which is always the verified release BEFORE the
+          # one running (codex r11 semantics + r13 manifest coverage).
+          NEW=$(tar czf - -C k8s . | base64 | tr -d '\n')
+          OLD=$(kubectl -n grug get configmap grug-release-manifests -o jsonpath='{.data.current}' 2>/dev/null || echo "")
+          {
+            echo "apiVersion: v1"
+            echo "kind: ConfigMap"
+            echo "metadata:"
+            echo "  name: grug-release-manifests"
+            echo "  namespace: grug"
+            echo "data:"
+            echo "  current: $NEW"
+            [ -n "$OLD" ] && echo "  previous: $OLD"
+            echo "  current_sha: ${GITHUB_SHA}"
+          } | kubectl apply -f -
+          echo "verified release bundle recorded (current + previous generations)" >> "$GITHUB_STEP_SUMMARY"
 
       - name: Auto-rollback to last-good (#499)
         # Fires on ANY post-anchor deploy failure: a failed apply/rollout/
@@ -596,6 +635,20 @@ jobs:
             echo "restored pre-deploy secret state (exact, delete-then-create)" >> "$GITHUB_STEP_SUMMARY"
           else
             echo "ROLLBACK INCOMPLETE: one or more secrets could not be verified/restored - review manually" >> "$GITHUB_STEP_SUMMARY"
+          fi
+          # Restore the PREVIOUS release's rendered manifests when a
+          # bundle exists (codex r13): covers Deployment/Service/ConfigMap
+          # spec regressions, with the digests + RA config of the previous
+          # verified release baked in. Bootstrap fallback (no bundle yet):
+          # the image/env re-pins below still restore the containers.
+          BUNDLE=$(kubectl -n grug get configmap grug-release-manifests -o jsonpath='{.data.previous}' 2>/dev/null || echo "")
+          if [ -n "$BUNDLE" ]; then
+            mkdir -p "$RUNNER_TEMP/rollback-manifests"
+            printf '%s' "$BUNDLE" | base64 -d | tar xzf - -C "$RUNNER_TEMP/rollback-manifests"
+            kubectl apply -k "$RUNNER_TEMP/rollback-manifests"
+            echo "applied previous release's rendered manifests" >> "$GITHUB_STEP_SUMMARY"
+          else
+            echo "::warning::no previous release bundle recorded yet - image/env-only rollback (manifest regressions in this merge are NOT undone)"
           fi
           # Container names per the live manifests: webhook/webhook,
           # api/webhook (historical), consumer/consumer, poller/poller.

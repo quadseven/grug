@@ -57,6 +57,18 @@ jobs:
             echo "::error::no last-good anchor recorded (configmap grug-last-good) - nothing to roll back to"
             exit 1
           fi
+          # Apply the previous release's rendered manifest bundle when
+          # recorded (covers spec regressions; digests baked). Bootstrap
+          # fallback: image/env re-pins only.
+          BUNDLE=$(kubectl -n grug get configmap grug-release-manifests -o jsonpath='{.data.previous}' 2>/dev/null || echo "")
+          if [ -n "$BUNDLE" ]; then
+            mkdir -p "$RUNNER_TEMP/rollback-manifests"
+            printf '%s' "$BUNDLE" | base64 -d | tar xzf - -C "$RUNNER_TEMP/rollback-manifests"
+            kubectl apply -k "$RUNNER_TEMP/rollback-manifests"
+            echo "applied previous release's rendered manifests" >> "$GITHUB_STEP_SUMMARY"
+          else
+            echo "::warning::no previous release bundle recorded - image/env-only rollback"
+          fi
           # Container names per the live manifests: webhook/webhook,
           # api/webhook (historical), consumer/consumer, poller/poller.
           kubectl -n grug set image deploy/grug-webhook webhook="$W"
