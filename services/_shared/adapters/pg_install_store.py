@@ -519,6 +519,59 @@ def list_check_verdicts(
     return out if limit is None else out[:limit]
 
 
+# --- Review-findings ledger (#361 slice 1) ------------------------------
+# Ledger rows are REPO-scoped (not install-scoped like the activity feed),
+# so they live under their own pk=`LEDGER#<repo>` partition. The access
+# pattern is the SAME grug_kv prefix-scan the activity feed uses; the sk
+# encodes (class, pr, reviewer, seq) so a class prefix query is natural.
+
+def _ledger_pk(repo: str) -> str:
+    return f"LEDGER#{repo}"
+
+
+def _ledger_sk(finding_class: str, pr: int, reviewer: str, seq: int) -> str:
+    # zero-pad pr + seq so lexicographic == numeric ordering within a class.
+    return f"{finding_class}#{pr:07d}#{reviewer}#{seq:05d}"
+
+
+def put_ledger_row(row: dict[str, Any], seq: int) -> None:
+    """Upsert one ledger finding as a first-class grug_kv row. `row` is the
+    raw JSONL dict ({repo, pr, reviewer, severity, class, finding, verdict,
+    evidence, ts, commit}); `seq` disambiguates rows sharing (class, pr,
+    reviewer). Idempotent per key so re-ingesting the corpus heals rows."""
+    repo = str(row["repo"])
+    with get_pool().connection() as conn:
+        conn.execute(
+            """
+            INSERT INTO grug_kv (pk, sk, data)
+            VALUES (%(pk)s, %(sk)s, %(data)s)
+            ON CONFLICT (pk, sk) DO UPDATE SET data = %(data)s
+            """,
+            {
+                "pk": _ledger_pk(repo),
+                "sk": _ledger_sk(str(row["class"]), int(row["pr"]),
+                                 str(row["reviewer"]), int(seq)),
+                "data": encode_attrs(dict(row)),
+            },
+        )
+
+
+def list_ledger_rows(repo: str, limit: int | None = None) -> list[dict[str, Any]]:
+    """Every ledger finding for a repo (the corpus #527 / few-shot read),
+    class-ordered. Same prefix-scan shape as list_check_verdicts."""
+    with get_pool().connection() as conn:
+        rows = conn.execute(
+            f"""
+            SELECT pk, sk, data FROM grug_kv
+            WHERE pk = %s AND {TTL_LIVE}
+            ORDER BY sk COLLATE "C" ASC
+            """,
+            (_ledger_pk(repo),),
+        ).fetchall()
+    out = [decode_item(pk, sk, data) for pk, sk, data in rows]
+    return out if limit is None else out[:limit]
+
+
 _DELIVERY_CLAIM_TTL_HOURS = 24
 
 
