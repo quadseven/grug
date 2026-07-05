@@ -16,9 +16,10 @@ Updated as patterns lock in.
 Two independent GitHub Actions pipelines, both on push to `main`:
 
 - **App** — `.github/workflows/deploy.k8s.yml` (paths `services/**`, `k8s/**`).
-  Builds the arm64 image, pushes it to the private registry, **seeds the
-  `grug-secrets` / `registry-pull` k8s Secrets from
-  SSM** (`/grug/*`), then `kubectl apply -k k8s/` and rolls the workloads. The
+  Builds the arm64 images, pushes them to the private registry, **seeds
+  `grug-secrets` from SSM** (`/grug/*`) and `registry-pull` from the
+  environment's registry credentials, then `kubectl apply -k k8s/` and
+  rolls the workloads. The
   image is deployed by **immutable digest**, not a mutable tag.
 - **Infra** — `.github/workflows/iac.deploy.yml` (paths `infra/pulumi/**`).
   Runs `pulumi up` for the AWS supporting resources (KMS, SQS, S3, IAM/OIDC,
@@ -215,7 +216,9 @@ service (guarded by `tests/test_shared_no_shadowing.py` + the spec-0010
 attester). Per-service files (main.py, rerun.py, dispatcher/consumer, auth/,
 crypto/, sast_benchmark/, spark_cave/) stay in their service tree.
 
-## Roles Anywhere credential path (grug-poller tracer, #388)
+<a id="roles-anywhere-credential-path-grug-poller-tracer-388"></a>
+
+## Roles Anywhere credential path (fleet-wide, #388/#389)
 
 EVERY grug workload (api, webhook, consumer, poller) runs on cert-derived
 short-lived AWS creds (ADR-0008; #388 tracer -> #389 rollout): the
@@ -225,8 +228,8 @@ cert-manager Certificate `grug-pki` (CN=grug, 6h/renew-4h, Secret
 from SSM `/infra/roles-anywhere/...` at deploy). Each service proves the
 identity at BOOT (`aws_identity.prove_roles_anywhere_identity` - asserts
 the ra-grug session, fails the pod loud) and the poller re-proves every
-15m tick. Failures page via the "[grug] Roles Anywhere credential acquisition failing (15min)"
-monitor ("[grug] Roles Anywhere credential acquisition failing").
+15m tick. Failures page via the
+"[grug] Roles Anywhere credential acquisition failing (15min)" monitor.
 The #389 retirement REMOVED the static key, the reserve Secret, and the
 #386 rotator - this is the ONLY credential path.
 
