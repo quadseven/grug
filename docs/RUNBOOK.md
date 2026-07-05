@@ -4,9 +4,10 @@ Living doc for deploying, rotating secrets, debugging, and recovering grug.
 Updated as patterns lock in.
 
 > **Runtime:** grug runs on **Kubernetes** (the #354 self-hosting migration
-> retired the AWS Lambdas). One container image (`services/webhook/Dockerfile`)
-> backs every workload: Deployments `grug-api`, `grug-webhook`, `grug-consumer`
-> and CronJobs `grug-poller`, `grug-key-rotator` (manifests in `k8s/`). The
+> retired the AWS Lambdas). One Dockerfile (`services/Dockerfile`, ARG
+> SERVICE) builds the two images backing Deployments `grug-api`,
+> `grug-webhook`, `grug-consumer` and CronJob `grug-poller` (manifests in
+> `k8s/`; api runs its own image, the rest share the webhook image). The
 > app store is **Postgres** (table `grug_kv`); SQS FIFO queues carry async work;
 > SSM holds secrets. AWS Lambda / DynamoDB / ECR / Function URLs are gone.
 
@@ -15,9 +16,10 @@ Updated as patterns lock in.
 Two independent GitHub Actions pipelines, both on push to `main`:
 
 - **App** — `.github/workflows/deploy.k8s.yml` (paths `services/**`, `k8s/**`).
-  Builds the arm64 image, pushes it to the private registry, **seeds the
-  `grug-secrets` / `grug-rotator-secret` / `registry-pull` k8s Secrets from
-  SSM** (`/grug/*`), then `kubectl apply -k k8s/` and rolls the workloads. The
+  Builds the arm64 images, pushes them to the private registry, **seeds
+  `grug-secrets` from SSM** (`/grug/*`) and `registry-pull` from the
+  environment's registry credentials, then `kubectl apply -k k8s/` and
+  rolls the workloads. The
   image is deployed by **immutable digest**, not a mutable tag.
 - **Infra** — `.github/workflows/iac.deploy.yml` (paths `infra/pulumi/**`).
   Runs `pulumi up` for the AWS supporting resources (KMS, SQS, S3, IAM/OIDC,
@@ -83,9 +85,10 @@ Datadog Webhook integration sourced from `/infra/discord/monitoring-alerts`
 (set in `infra/pulumi/__main__.py`). Rotating these is an `iac.deploy.yml`
 concern, not a pod re-seed.
 
-### AWS pod access key
-Rotated automatically by the `grug-key-rotator` CronJob (#386) — see
-[Key rotation](#key-rotation). Do not rotate by hand unless that is wedged.
+### AWS pod credentials
+RETIRED as a stored secret (#389): no static AWS key exists anywhere.
+Every workload derives short-lived creds from its Roles Anywhere
+certificate - see the Roles Anywhere section below.
 
 ## Common failure modes
 
@@ -174,7 +177,7 @@ users re-sign-in to re-encrypt. Zero impact for the admin-only user base.
 ## Service tags
 
 All grug DD entities tagged: `service:` one of `grug-api` / `grug-webhook` /
-`grug-consumer` / `grug-poller` / `grug-key-rotator` (cross-workload monitors
+`grug-consumer` / `grug-poller` (cross-workload monitors
 use namespace-level `service:grug`); `env:prod`; `version:<image-sha>`;
 `team:grug`.
 
@@ -213,7 +216,9 @@ service (guarded by `tests/test_shared_no_shadowing.py` + the spec-0010
 attester). Per-service files (main.py, rerun.py, dispatcher/consumer, auth/,
 crypto/, sast_benchmark/, spark_cave/) stay in their service tree.
 
-## Roles Anywhere credential path (grug-poller tracer, #388)
+<a id="roles-anywhere-credential-path-grug-poller-tracer-388"></a>
+
+## Roles Anywhere credential path (fleet-wide, #388/#389)
 
 EVERY grug workload (api, webhook, consumer, poller) runs on cert-derived
 short-lived AWS creds (ADR-0008; #388 tracer -> #389 rollout): the
@@ -223,31 +228,23 @@ cert-manager Certificate `grug-pki` (CN=grug, 6h/renew-4h, Secret
 from SSM `/infra/roles-anywhere/...` at deploy). Each service proves the
 identity at BOOT (`aws_identity.prove_roles_anywhere_identity` - asserts
 the ra-grug session, fails the pod loud) and the poller re-proves every
-15m tick. Failures page via the "[grug] Roles Anywhere credential acquisition failing (15min)"
-log monitor. During the #389 rollout window the `grug-aws-static-key`
-Secret stays live and rotator-maintained as the ROLLBACK RESERVE; the
-retirement PR deletes it + the #386 rotator + the static AccessKey.
+15m tick. Failures page via the
+"[grug] Roles Anywhere credential acquisition failing (15min)" monitor.
+The #389 retirement REMOVED the static key, the reserve Secret, and the
+#386 rotator - this is the ONLY credential path.
 
-- **Rollback** (any workload misbehaving on the cert path, valid until
-  the retirement PR deletes the reserve). IN ORDER:
-  1. SUSPEND THE ROTATOR FIRST: `kubectl -n grug patch cronjob
-     grug-key-rotator -p '{"spec":{"suspend":true}}'` - with
-     GRUG_ROTATE_DEPLOYMENTS empty (#389) a rotation tick would delete
-     the very key your rolled-back pod snapshotted, and that failure
-     (InvalidClientTokenId) pages via the credential monitor only after
-     the pod is already broken.
-  2. VERIFY THE RESERVE IS LIVE: if a deploy ran since the last rotation
-     tick, the Secret was re-seeded from SSM, which the rotator never
-     writes back (#502) - i.e. possibly a DELETED key. Compare
-     `aws iam list-access-keys --user-name grug-k8s-pod` with the
-     Secret; if stale, run the manual-rotate job first.
-  3. Add `- secretRef: {name: grug-aws-static-key}` to that workload's
-     envFrom AND remove its `AWS_CONFIG_FILE` env (BOTH steps: the boot
-     proof refuses env creds + RA config together). Env creds then
-     out-rank credential_process - instantly back on the static key.
-  4. Un-suspend the rotator when done.
-  Drill evidence (#389 AC) lands on PR #504 post-merge, before the
-  retirement PR deletes the reserve.
+- **Rollback / recovery (post-retirement)**: the static key, its
+  reserve Secret, and the #386 rotator NO LONGER EXIST - Roles Anywhere
+  is the only credential path. If the cert path breaks fleet-wide:
+  1. Fastest: fix the cert path (Certificate Ready? ClusterIssuer? the
+     intermediate in the tls.crt bundle? RA outage?). Old pods keep
+     serving (maxUnavailable:0) except the consumer (Recreate - pauses,
+     SQS buffers).
+  2. Full fallback: revert the retirement PR (restores the Pulumi
+     user/AccessKey/SSM params + deploy seed), run the pulumi-up, then
+     redeploy and flip the affected workload (envFrom the reseeded
+     Secret + drop AWS_CONFIG_FILE). The PR #504 drill proved the flip
+     mechanics both ways while the reserve existed.
 - **Cutover blast radius**: api/webhook roll maxUnavailable:0 - a
   fleet-broken cert path BLOCKS the deploy while old pods keep serving.
   The consumer is strategy Recreate: its old pod stops BEFORE the new
@@ -268,10 +265,6 @@ retirement PR deletes it + the #386 rotator + the static AccessKey.
   CRASHES the Job - the KSM `duration_since_last_successful` monitor
   pages within the hour. No news from this log line = the cert path is
   dead, not idle.
-- **Rotator/SSM gap (#502, filed from the #388 audit)**: the #386
-  rotator rotates the LIVE IAM key but never writes it back to
-  /grug/k8s-pod-aws-*, so a deploy right after a rotation seeds
-  grug-aws-static-key with a DELETED key until the next rotator tick.
 - **Cert not issuing**: `kubectl get clusterissuer pki-intermediate` must
   be READY (shared PKI, infrastructure repo); then describe the
   Certificate for cert-manager events.
@@ -381,39 +374,3 @@ Disable Elder per-repo by flipping `code_reviewer_enabled=False` on the repo's
 RepoConfig — update the row in Postgres `grug_kv` (SQL `UPDATE`) or via the
 admin dashboard. (A global SSM kill switch is future-roadmap, not implemented.)
 
-## Key rotation
-
-Since #389 the `grug-k8s-pod` key is the ROLLBACK RESERVE: no workload
-consumes it (the fleet rides Roles Anywhere), and the `grug-key-rotator`
-CronJob (#386) survives only as the reserve's CUSTODIAN until the
-retirement PR deletes both. Every 12h it mints a new key -> patches it
-into `grug-aws-static-key` -> deletes the old key. It restarts NOTHING
-(`GRUG_ROTATE_DEPLOYMENTS` is empty - nothing consumes the key, so a
-rotation must not bounce the fleet). Logic in
-`services/webhook/key_rotator.py`. It authenticates with
-`grug-rotator-secret` (IAM user `grug-k8s-rotator`, scoped to access-key
-ops on `grug-k8s-pod` only), never the secret it rotates.
-
-**On `[grug] AWS key-rotation failed`:** no pod is affected, but your
-ROLLBACK PATH is degrading - fix before you need it. Check the Job logs:
-
-```bash
-kubectl -n grug get jobs -l app=grug-key-rotator
-kubectl -n grug logs job/<grug-key-rotator-...> | grep key_rotation
-```
-
-Common causes:
-- **Rollout did not complete** (`new_key_id` logged as `dangling_new_key_id`):
-  a new key WAS created and is in `grug-secrets`, but a Deployment didn't
-  roll. The new key is live + valid; the OLD key was NOT deleted. Investigate
-  the stuck rollout; the next 12h tick will retry (it treats the now-current
-  new key as current).
-- **Two keys, none current** (`refusing to guess`): `grug-k8s-pod` has 2 keys
-  and neither matches the one in `grug-secrets` (out-of-band change / stale
-  Secret). Reconcile by hand: confirm which key the pods actually use, delete
-  the other, then re-run the Job (`kubectl -n grug create job --from=cronjob/grug-key-rotator manual-rotate`).
-
-**Manual rotation:** `kubectl -n grug create job --from=cronjob/grug-key-rotator manual-rotate`,
-then `kubectl -n grug wait --for=condition=complete job/manual-rotate --timeout=300s`.
-
-**Disable rotation:** `kubectl -n grug patch cronjob grug-key-rotator -p '{"spec":{"suspend":true}}'`.
