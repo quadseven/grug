@@ -14,10 +14,12 @@ and the escape hatch should be seconds, not minutes.
 
 ## Decision
 
-1. **Rollback anchor before apply.** The deploy snapshots the
-   currently-running digest pair (webhook+api) into the `grug-last-good`
-   ConfigMap BEFORE applying - but only when every workload is currently
-   Available, so a broken state is never anchored. The anchor's digest
+1. **Rollback anchor = last SYNTHETIC-VERIFIED release.** The deploy
+   snapshots the currently-running digest pair (webhook+api) into the
+   `grug-last-good` ConfigMap BEFORE applying (only when every workload
+   is currently Available, so a broken state is never anchored) and
+   ADVANCES it to the new digests after the synthetic passes - so a
+   manual rollback dispatch between deploys is a genuine no-op drill. The anchor's digest
    manifests are protected from registry retention by the live-cluster
    reference rule (and by their merge-sha tags).
 2. **Synthetic self-test after apply**: /livez + /readyz on both
@@ -52,10 +54,11 @@ and the escape hatch should be seconds, not minutes.
 
 ### What rollback does NOT cover (image-only contract)
 
-The anchor records DIGESTS plus one durable object: the auto-rollback
-also restores the pre-seed grug-secrets snapshot (the one Secret this
-run destructively mutates from SSM) and force-restarts the pods so it
-mounts. Everything else applied from k8s/ (manifests, the RA ConfigMap)
+The anchor records DIGESTS plus the mutated durable objects: the
+auto-rollback restores the pre-seed snapshots of grug-secrets AND both
+registry-pull secrets (a rotated-wrong pull credential would strand
+rollback pods under imagePullPolicy Always) and force-restarts the pods
+so they mount and pull with the restored values. Everything else applied from k8s/ (manifests, the RA ConfigMap)
 is NOT undone - the rollback step warns when the failing merge touched
 k8s/, and the recovery for manifest-shaped failures is revert +
 redeploy. The MANUAL deploy.rollback.yml path is image-only (a later
