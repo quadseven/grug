@@ -252,8 +252,19 @@ def test_identity_proof_skips_without_ra_config(monkeypatch):
 
 def test_identity_proof_refuses_static_env_creds(monkeypatch, caplog):
     """Env creds out-rank credential_process - their presence means the
-    tracer would silently run on the static key. Refuse loudly."""
+    tracer would silently run on the static key. Refuse loudly. EITHER
+    half of the pair triggers (peer review #504: secret-only partial env
+    is still config drift worth refusing)."""
     monkeypatch.setenv("AWS_CONFIG_FILE", "/etc/grug-aws/config")
+    monkeypatch.delenv("AWS_ACCESS_KEY_ID", raising=False)
+    monkeypatch.setenv("AWS_SECRET_ACCESS_KEY", "static-half")
+    import pytest as _pytest
+
+    import poller_handler as ph
+
+    with _pytest.raises(RuntimeError, match="Roles Anywhere"):
+        ph._prove_roles_anywhere_identity()
+    monkeypatch.delenv("AWS_SECRET_ACCESS_KEY", raising=False)
     monkeypatch.setenv("AWS_ACCESS_KEY_ID", "static")
     import pytest
 
@@ -340,6 +351,23 @@ def test_handler_runs_identity_proof_before_any_install_work(monkeypatch):
     )
     with pytest.raises(RuntimeError, match="proof ran"):
         poller_handler.handler({}, None)
+
+
+def test_identity_proof_rejects_malformed_expected_arn(monkeypatch):
+    """An unsubstituted placeholder or mangled ARN must be an actionable
+    ValueError (still logged + raised), not a cryptic IndexError."""
+    monkeypatch.setenv("AWS_CONFIG_FILE", "/etc/grug-aws/config")
+    monkeypatch.setenv("GRUG_RA_ROLE_ARN", "RA_ROLE_ARN_PLACEHOLDER")
+    monkeypatch.delenv("AWS_ACCESS_KEY_ID", raising=False)
+    import boto3
+
+    monkeypatch.setattr(boto3, "client", lambda s: type("S", (), {"get_caller_identity": lambda self: {"Arn": "x"}})())
+    import pytest as _pytest
+
+    import poller_handler as ph
+
+    with _pytest.raises(ValueError, match="not an IAM role ARN"):
+        ph._prove_roles_anywhere_identity()
 
 
 def test_identity_proof_asserts_the_expected_role(monkeypatch):
