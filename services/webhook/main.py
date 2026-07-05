@@ -21,11 +21,15 @@ from fastapi import FastAPI, Header, HTTPException, Request, Response, status
 
 from cf_auth import CfAuthMiddleware
 from hmac_verify import verify_signature
+from aws_identity import prove_roles_anywhere_identity
 from observability import configure_logging
 from secrets_loader import get_webhook_secret
 
 configure_logging()
 log = logging.getLogger("grug.webhook")
+
+# Roles Anywhere boot proof (#389) - see services/api/main.py note.
+prove_roles_anywhere_identity()
 
 app = FastAPI(
     title="grug-webhook",

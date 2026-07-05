@@ -52,10 +52,10 @@ jobs:
             -e AWS_ACCESS_KEY_ID=smoke -e AWS_SECRET_ACCESS_KEY=smoke \
             "grug-${{ matrix.svc }}:pr-smoke" \
             python -c "import ${mods}; import observability, adapters.install_store as _s; assert '_shared' in observability.__file__ and '_shared' in _s.__file__, (observability.__file__, _s.__file__); print('IMPORTS OK')"
-      - name: Signing-helper exec smoke (webhook runtime ABI)
-        if: matrix.svc == 'webhook'
+      - name: Signing-helper exec smoke (runtime ABI)
         run: |
           # The helper is cgo-linked against the BUILDER's glibc; exec it in
           # the RUNTIME image so a base-image (Debian release) drift between
-          # the two stages fails here, not in the poller pod (#388).
-          docker run --rm "grug-webhook:pr-smoke" aws_signing_helper version
+          # the two stages fails here, not in a pod (#388; both images since
+          # the #389 rollout).
+          docker run --rm "grug-${{ matrix.svc }}:pr-smoke" aws_signing_helper version

@@ -124,3 +124,17 @@ def test_continuous_ksm_monitors_page_on_no_data():
         bundle.crashloop.notify_no_data,
         bundle.restart_spike.notify_no_data,
     ).apply(_check)
+
+
+def test_credential_acquisition_query_covers_fleet_and_both_signals() -> None:
+    """#389: the one monitor must see every workload AND both failure
+    shapes (boot-proof event + botocore's mid-run error class)."""
+    from components.dd_monitors import credential_acquisition_failure_query
+
+    q = credential_acquisition_failure_query("prod")
+    for svc in ("grug-api", "grug-webhook", "grug-consumer", "grug-poller"):
+        assert svc in q
+    assert "roles_anywhere_identity_failed" in q
+    assert "CredentialRetrievalError" in q
+    assert 'rollup("count")' in q and "> 0" in q
+    assert "env:prod" in q
