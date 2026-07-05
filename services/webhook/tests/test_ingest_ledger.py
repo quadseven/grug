@@ -23,17 +23,18 @@ def test_ingest_persists_valid_and_counts_skips():
         json.dumps({"repo": "r"}),  # missing fields -> skipped
         _line(pr=2),
     ])
-    res = ingest_text(text, put=lambda row, seq: puts.append((row["pr"], seq)))
+    res = ingest_text(text, put=lambda row: puts.append(row["pr"]))
     assert res == {"ingested": 2, "skipped": 2}
-    assert puts == [(1, 0), (2, 0)]
+    assert puts == [1, 2]
 
 
-def test_seq_disambiguates_same_key():
+def test_all_valid_rows_are_put():
     puts = []
-    # two findings sharing (repo, class, pr, reviewer) -> seq 0,1
+    # two findings sharing (repo, class, pr, reviewer) but different content
+    # -> both persisted (content-derived key disambiguates, no seq needed)
     text = "\n".join([_line(pr=5, finding="a"), _line(pr=5, finding="b")])
-    ingest_text(text, put=lambda row, seq: puts.append(seq))
-    assert puts == [0, 1]
+    ingest_text(text, put=lambda row: puts.append(row["finding"]))
+    assert puts == ["a", "b"]
 
 
 def test_ingest_is_reusable_across_classes():
@@ -42,6 +43,5 @@ def test_ingest_is_reusable_across_classes():
         _line(pr=5, finding_class="silent-failure"),
         _line(pr=5, finding_class="correctness"),
     ])
-    ingest_text(text, put=lambda row, seq: puts.append((row["class"], seq)))
-    # different class -> independent seq counters, both 0
-    assert puts == [("silent-failure", 0), ("correctness", 0)]
+    ingest_text(text, put=lambda row: puts.append(row["class"]))
+    assert puts == ["silent-failure", "correctness"]
