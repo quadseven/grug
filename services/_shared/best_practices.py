@@ -21,6 +21,17 @@ from ledger import LedgerRow
 DEFAULT_TOP_N = 8
 DEFAULT_DECAY_PRS = 200
 _MAX_EXAMPLE_PRS = 3
+_MAX_RULE_CHARS = 220
+
+
+def _sanitize(text: str) -> str:
+    """Neutralize a ledger finding for SYSTEM-prompt injection (#541 Qodo):
+    flatten newlines (no fake message boundaries), drop control chars, and
+    cap length. Ledger text is operator-authored but still DATA, not
+    instructions."""
+    flat = " ".join(str(text).split())
+    flat = "".join(c for c in flat if c.isprintable())
+    return flat[:_MAX_RULE_CHARS]
 
 
 @dataclass(frozen=True)
@@ -97,7 +108,7 @@ def practices_block(
     lines = [header]
     for p in practices[:top_n]:
         refs = ", ".join(f"#{n}" for n in p.example_prs)
-        line = f"- [{p.finding_class} x{p.hits}] {p.rule} (e.g. {refs})"
+        line = f"- [{_sanitize(p.finding_class)} x{p.hits}] {_sanitize(p.rule)} (e.g. {refs})"
         if sum(len(x) + 1 for x in lines) + len(line) > max_chars:
             break
         lines.append(line)
