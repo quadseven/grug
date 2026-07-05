@@ -89,9 +89,25 @@ def _prove_roles_anywhere_identity() -> None:
     import boto3
 
     ident = boto3.client("sts").get_caller_identity()
+    arn = ident.get("Arn", "")
+    # Assert the INTENDED identity, not merely a working one (peer review,
+    # confirmed 3x): a wrong-but-valid SSM ARN, a swapped profile, or any
+    # ambient credential source that wins the chain must FAIL here, not
+    # pass observationally. GRUG_RA_ROLE_ARN is sed-pinned at deploy from
+    # the same SSM value the ConfigMap uses.
+    expected_role_arn = os.getenv("GRUG_RA_ROLE_ARN", "")
+    if expected_role_arn:
+        account = expected_role_arn.split(":")[4]
+        role_name = expected_role_arn.rsplit("/", 1)[-1]
+        expected_prefix = f"arn:aws:sts::{account}:assumed-role/{role_name}/"
+        if not arn.startswith(expected_prefix):
+            raise RuntimeError(
+                f"wrong AWS identity on the Roles Anywhere path: got {arn!r}, "
+                f"expected an assumed-role session of {role_name!r} (#388)"
+            )
     log.info(
         "roles_anywhere_identity_proven",
-        extra={"assumed_arn": ident.get("Arn", ""), "account_present": bool(ident.get("Account"))},
+        extra={"assumed_arn": arn, "identity_asserted": bool(expected_role_arn)},
     )
 
 

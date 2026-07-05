@@ -322,3 +322,28 @@ def test_handler_runs_identity_proof_before_any_install_work(monkeypatch):
     )
     with pytest.raises(RuntimeError, match="proof ran"):
         poller_handler.handler({}, None)
+
+
+def test_identity_proof_asserts_the_expected_role(monkeypatch):
+    """Peer review (confirmed 3x): a wrong-but-VALID identity - swapped
+    SSM ARN, ambient instance profile - must FAIL the proof, not pass
+    observationally."""
+    monkeypatch.setenv("AWS_CONFIG_FILE", "/etc/grug-aws/config")
+    monkeypatch.setenv("GRUG_RA_ROLE_ARN", "arn:aws:iam::111122223333:role/ra-grug")
+    monkeypatch.delenv("AWS_ACCESS_KEY_ID", raising=False)
+    import boto3
+
+    class _WrongSts:
+        def get_caller_identity(self):
+            return {"Arn": "arn:aws:sts::999988887777:assumed-role/other-role/x", "Account": "999988887777"}
+
+    monkeypatch.setattr(boto3, "client", lambda service: _WrongSts())
+    with pytest.raises(RuntimeError, match="wrong AWS identity"):
+        poller_handler._prove_roles_anywhere_identity()
+
+    class _RightSts:
+        def get_caller_identity(self):
+            return {"Arn": "arn:aws:sts::111122223333:assumed-role/ra-grug/session1", "Account": "111122223333"}
+
+    monkeypatch.setattr(boto3, "client", lambda service: _RightSts())
+    poller_handler._prove_roles_anywhere_identity()  # must not raise

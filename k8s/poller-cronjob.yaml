@@ -52,6 +52,10 @@ spec:
                 - secretRef: {name: grug-secrets}
               env:
                 - {name: AWS_CONFIG_FILE, value: /etc/grug-aws/config}
+                # Expected Roles Anywhere role (sed-pinned from SSM): the
+                # identity proof ASSERTS the assumed identity matches this,
+                # not merely that SOME credential worked (peer review 3x).
+                - {name: GRUG_RA_ROLE_ARN, value: RA_ROLE_ARN_PLACEHOLDER}
                 - {name: DD_SERVICE, value: grug-poller}
                 - {name: DD_ENV, value: prod}
                 - name: DD_VERSION
