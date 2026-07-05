@@ -180,53 +180,58 @@ def test_no_owned_queue_query_references_uncollected_aws_sqs() -> None:
     monitors). Every queue monitor must ride an owned grug.sqs.* gauge."""
     from components.dd_monitors import all_owned_queue_queries
 
-    for q in all_owned_queue_queries():
+    for q in all_owned_queue_queries("prod"):
         assert "aws.sqs." not in q, f"uncollected aws.sqs metric in: {q}"
         assert "grug.sqs." in q
 
 
+def test_owned_queue_queries_are_env_scoped() -> None:
+    """Every owned query filters env explicitly (gemini peer review): the
+    owned gauges carry a reliable env tag, and an unscoped query would let
+    a healthy dev emitter mask a dead prod one."""
+    from components.dd_monitors import all_owned_queue_queries
+
+    for q in all_owned_queue_queries("prod"):
+        assert "env:prod" in q, f"env-unscoped query: {q}"
+    for q in all_owned_queue_queries("dev"):
+        assert "env:dev" in q
+
+
 def test_owned_queue_queries_tag_exact_queue_names() -> None:
     """Queue tags must match the consumer's emission exactly - the fixed
-    Pulumi `name=` values with the .fifo suffix."""
-    from components.dd_monitors import (
-        cave_dlq_depth_query,
-        cave_jobs_backlog_query,
-        consumer_queue_backlog_query,
-        rerun_dlq_depth_query,
-    )
+    Pulumi `name=` values with the .fifo suffix. One monitor per queue,
+    simple filters (no OR/AND boolean filter syntax - an apply-time
+    validation risk preview cannot catch)."""
+    from components import dd_monitors as m
 
-    assert "queue:grug-cave-jobs.fifo" in cave_jobs_backlog_query()
-    assert "queue:grug-rerun-jobs-dlq.fifo" in rerun_dlq_depth_query()
-    q = cave_dlq_depth_query()
-    assert "queue:grug-cave-jobs-dlq.fifo" in q
-    assert "queue:grug-cave-results-dlq.fifo" in q
-    q = consumer_queue_backlog_query()
-    assert "queue:grug-rerun-jobs.fifo" in q
-    assert "queue:grug-cave-results.fifo" in q
+    assert "queue:grug-cave-jobs.fifo" in m.cave_jobs_backlog_query("prod")
+    assert "queue:grug-rerun-jobs.fifo" in m.rerun_backlog_query("prod")
+    assert "queue:grug-cave-results.fifo" in m.cave_results_backlog_query("prod")
+    assert "queue:grug-rerun-jobs-dlq.fifo" in m.rerun_dlq_depth_query("prod")
+    assert "queue:grug-cave-jobs-dlq.fifo" in m.cave_jobs_dlq_depth_query("prod")
+    assert "queue:grug-cave-results-dlq.fifo" in m.cave_results_dlq_depth_query("prod")
+    for q in m.all_owned_queue_queries("prod"):
+        assert " OR " not in q and " AND " not in q
 
 
-def test_backlog_queries_use_sustained_per_queue_semantics() -> None:
-    """'Backing up' monitors require depth to hold across the FULL window
-    (min > 0 = never drained once), not a momentary spike (max > 0); DLQ
-    monitors are any-message (max > 0) on purpose. Multi-queue queries
-    carry `by {queue}` so the union of two alternating-busy queues cannot
-    fake a sustained backlog and the alert names the offending queue."""
-    from components.dd_monitors import (
-        cave_dlq_depth_query,
-        cave_jobs_backlog_query,
-        consumer_queue_backlog_query,
-        rerun_dlq_depth_query,
-        telemetry_health_query,
-    )
+def test_backlog_queries_use_sustained_semantics_and_health_is_intermittent_proof() -> None:
+    """Backlog monitors require depth across the FULL window (min > 0);
+    DLQ monitors are any-message (max > 0). The health query is avg-of-avg
+    per queue < 0.5 so an INTERMITTENT partial failure cannot hide behind
+    one good sweep (codex peer review) and a single blip does not flap."""
+    from components import dd_monitors as m
 
-    assert cave_jobs_backlog_query().startswith("min(last_15m):")
-    assert consumer_queue_backlog_query().startswith("min(last_15m):")
-    assert rerun_dlq_depth_query().startswith("max(last_15m):")
-    assert cave_dlq_depth_query().startswith("max(last_15m):")
-    assert " by {queue}" in consumer_queue_backlog_query()
-    assert " by {queue}" in cave_dlq_depth_query()
-    assert telemetry_health_query().startswith("max(last_15m):")
-    assert "< 6" in telemetry_health_query()
+    assert m.cave_jobs_backlog_query("prod").startswith("min(last_15m):")
+    assert m.rerun_backlog_query("prod").startswith("min(last_15m):")
+    assert m.cave_results_backlog_query("prod").startswith("min(last_15m):")
+    assert m.rerun_dlq_depth_query("prod").startswith("max(last_15m):")
+    assert m.cave_jobs_dlq_depth_query("prod").startswith("max(last_15m):")
+    assert m.cave_results_dlq_depth_query("prod").startswith("max(last_15m):")
+    hq = m.telemetry_health_query("prod")
+    assert hq.startswith("avg(last_15m):avg:")
+    assert "grug.sqs.telemetry_queue_ok" in hq
+    assert " by {queue}" in hq
+    assert "< 0.5" in hq
 
 
 def _consumer_module_ast():
@@ -265,25 +270,27 @@ def test_monitor_queue_tags_subset_of_consumer_emission() -> None:
 
     emitted = set(_consumer_telemetry_queue_names())
     queried = set()
-    for q in all_owned_queue_queries():
+    for q in all_owned_queue_queries("prod"):
         queried.update(re.findall(r"queue:([a-z0-9.-]+)", q))
     assert queried, "no queue tags found in owned queries"
     missing = queried - emitted
     assert not missing, f"monitors query queues the consumer never emits: {missing}"
 
 
-def test_telemetry_health_expected_count_matches_consumer() -> None:
-    """The health query's `< N` threshold must equal the number of queues
-    the consumer sweeps - a queue added to the emitter without bumping the
-    threshold makes partial death undetectable (and vice versa)."""
-    from components.dd_monitors import (
-        _TELEMETRY_EXPECTED_QUEUES,
-        telemetry_health_query,
-    )
+def test_every_consumer_queue_has_a_depth_monitor() -> None:
+    """The inverse guard: every queue the consumer sweeps is watched by at
+    least one depth monitor - an emitted-but-unmonitored queue is quiet
+    coverage rot."""
+    import re
 
-    n = len(_consumer_telemetry_queue_names())
-    assert _TELEMETRY_EXPECTED_QUEUES == n
-    assert f"< {n}" in telemetry_health_query()
+    from components.dd_monitors import all_owned_queue_queries
+
+    emitted = set(_consumer_telemetry_queue_names())
+    queried = set()
+    for q in all_owned_queue_queries("prod"):
+        queried.update(re.findall(r"queue:([a-z0-9.-]+)", q))
+    unmonitored = emitted - queried
+    assert not unmonitored, f"consumer sweeps unmonitored queues: {unmonitored}"
 
 
 @pulumi.runtime.test
@@ -304,11 +311,13 @@ def test_owned_queue_monitors_no_data_pager_placement():
     )
 
     expected = {
-        "cave_jobs_backlog": (dd_monitors.cave_jobs_backlog_query(), False),
-        "rerun_dlq": (dd_monitors.rerun_dlq_depth_query(), False),
-        "cave_dlq": (dd_monitors.cave_dlq_depth_query(), False),
-        "consumer_backlog": (dd_monitors.consumer_queue_backlog_query(), False),
-        "telemetry_health": (dd_monitors.telemetry_health_query(), True),
+        "cave_jobs_backlog": (dd_monitors.cave_jobs_backlog_query("prod"), False),
+        "rerun_backlog": (dd_monitors.rerun_backlog_query("prod"), False),
+        "cave_results_backlog": (dd_monitors.cave_results_backlog_query("prod"), False),
+        "rerun_dlq": (dd_monitors.rerun_dlq_depth_query("prod"), False),
+        "cave_jobs_dlq": (dd_monitors.cave_jobs_dlq_depth_query("prod"), False),
+        "cave_results_dlq": (dd_monitors.cave_results_dlq_depth_query("prod"), False),
+        "telemetry_health": (dd_monitors.telemetry_health_query("prod"), True),
     }
 
     checks = []

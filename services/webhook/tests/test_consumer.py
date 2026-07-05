@@ -433,7 +433,7 @@ def test_emit_queue_depth_emits_both_gauges_per_queue(telemetry_env, captured_ga
     attributes (real SQS returns only what is requested - a dropped
     AttributeName would silently emit fake zeros forever)."""
     with patch.object(
-        consumer._sqs,
+        consumer._sqs_telemetry,
         "get_queue_attributes",
         return_value={"Attributes": {
             "ApproximateNumberOfMessages": "2",
@@ -457,20 +457,20 @@ def test_emit_queue_depth_emits_both_gauges_per_queue(telemetry_env, captured_ga
                if m == "grug.sqs.messages_not_visible")
 
 
-def test_emit_queue_depth_emits_telemetry_health_gauge(telemetry_env, captured_gauges):
-    """The sweep count is emitted as the health gauge - the family's
-    heartbeat monitor input (audit stage-2 HIGH: partial telemetry death
-    must page, not silently re-blind the depth monitors)."""
+def test_emit_queue_depth_emits_per_queue_ok_boolean(telemetry_env, captured_gauges):
+    """Every queue emits a 1/0 telemetry_queue_ok boolean per sweep - the
+    per-queue heartbeat monitor input (audit stage-2 HIGH + codex peer
+    review: partial telemetry death, sustained OR intermittent, must page
+    by queue name, not silently re-blind the depth monitors)."""
     with patch.object(
-        consumer._sqs, "get_queue_attributes",
+        consumer._sqs_telemetry, "get_queue_attributes",
         return_value={"Attributes": {"ApproximateNumberOfMessages": "0",
                                      "ApproximateNumberOfMessagesNotVisible": "0"}},
     ):
         consumer._emit_queue_depth_once()
-    health = [(m, v) for m, v, t in captured_gauges
-              if m == "grug.sqs.telemetry_queues_ok"]
-    assert health == [("grug.sqs.telemetry_queues_ok",
-                       float(len(consumer._TELEMETRY_QUEUE_NAMES)))]
+    ok = [((t or {}).get("queue"), v) for m, v, t in captured_gauges
+          if m == "grug.sqs.telemetry_queue_ok"]
+    assert ok == [(name, 1.0) for name in consumer._TELEMETRY_QUEUE_NAMES]
 
 
 def test_emit_queue_depth_per_queue_best_effort(telemetry_env, captured_gauges, caplog):
@@ -491,7 +491,7 @@ def test_emit_queue_depth_per_queue_best_effort(telemetry_env, captured_gauges, 
         return {"Attributes": {"ApproximateNumberOfMessages": "0",
                                "ApproximateNumberOfMessagesNotVisible": "0"}}
 
-    with patch.object(consumer._sqs, "get_queue_attributes", side_effect=_attrs):
+    with patch.object(consumer._sqs_telemetry, "get_queue_attributes", side_effect=_attrs):
         with caplog.at_level(_logging.WARNING):
             n = consumer._emit_queue_depth_once()
     assert n == 3  # the three non-DLQ queues probed
@@ -501,8 +501,11 @@ def test_emit_queue_depth_per_queue_best_effort(telemetry_env, captured_gauges, 
     fails = [r for r in caplog.records if r.msg == "queue_depth_probe_failed"]
     assert len(fails) == 3
     assert all(r.code == "AccessDenied" for r in fails)
-    health = [v for m, v, t in captured_gauges if m == "grug.sqs.telemetry_queues_ok"]
-    assert health == [3.0]
+    ok = {(t or {}).get("queue"): v for m, v, t in captured_gauges
+          if m == "grug.sqs.telemetry_queue_ok"}
+    assert len(ok) == len(consumer._TELEMETRY_QUEUE_NAMES)
+    assert all(v == 0.0 for q, v in ok.items() if "dlq" in q)
+    assert all(v == 1.0 for q, v in ok.items() if "dlq" not in q)
 
 
 def test_emit_queue_depth_non_clienterror_logs_kind_without_code(
@@ -511,7 +514,7 @@ def test_emit_queue_depth_non_clienterror_logs_kind_without_code(
     import logging as _logging
 
     with patch.object(
-        consumer._sqs, "get_queue_attributes", side_effect=RuntimeError("boom"),
+        consumer._sqs_telemetry, "get_queue_attributes", side_effect=RuntimeError("boom"),
     ):
         with caplog.at_level(_logging.WARNING):
             n = consumer._emit_queue_depth_once()
@@ -527,7 +530,7 @@ def test_emit_queue_depth_missing_attributes_key_is_probe_failure(
     silently emit fake zeros) - pins the ["Attributes"] KeyError path."""
     import logging as _logging
 
-    with patch.object(consumer._sqs, "get_queue_attributes", return_value={}):
+    with patch.object(consumer._sqs_telemetry, "get_queue_attributes", return_value={}):
         with caplog.at_level(_logging.WARNING):
             n = consumer._emit_queue_depth_once()
     assert n == 0
@@ -542,7 +545,7 @@ def test_emit_queue_depth_skips_sweep_without_agent_host(monkeypatch, caplog):
 
     monkeypatch.setenv("GRUG_RERUN_QUEUE_URL", _RERUN_URL)
     monkeypatch.delenv("DD_AGENT_HOST", raising=False)
-    with patch.object(consumer._sqs, "get_queue_attributes") as mock_attrs:
+    with patch.object(consumer._sqs_telemetry, "get_queue_attributes") as mock_attrs:
         with caplog.at_level(_logging.WARNING):
             assert consumer._emit_queue_depth_once() == 0
     assert mock_attrs.call_count == 0
