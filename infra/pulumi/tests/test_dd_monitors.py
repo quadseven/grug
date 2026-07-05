@@ -172,17 +172,17 @@ def test_credential_monitor_is_log_alert_and_not_no_data():
 
 
 
-# ── #379: owned SQS depth gauges ─────────────────────────────────────
+# --- #379: owned SQS depth gauges -------------------------------------
 
 def test_no_owned_queue_query_references_uncollected_aws_sqs() -> None:
     """The DD AWS integration does not collect aws.sqs.* in this org - a
     monitor on it is permanently blind (the trap that shipped three blind
-    monitors). Every queue monitor must ride the owned gauge."""
+    monitors). Every queue monitor must ride an owned grug.sqs.* gauge."""
     from components.dd_monitors import all_owned_queue_queries
 
     for q in all_owned_queue_queries():
         assert "aws.sqs." not in q, f"uncollected aws.sqs metric in: {q}"
-        assert "grug.sqs.messages_visible" in q
+        assert "grug.sqs." in q
 
 
 def test_owned_queue_queries_tag_exact_queue_names() -> None:
@@ -205,18 +205,125 @@ def test_owned_queue_queries_tag_exact_queue_names() -> None:
     assert "queue:grug-cave-results.fifo" in q
 
 
-def test_backlog_queries_use_sustained_depth_semantics() -> None:
+def test_backlog_queries_use_sustained_per_queue_semantics() -> None:
     """'Backing up' monitors require depth to hold across the FULL window
-    (min > 0 = never drained once), not a momentary spike (max > 0);
-    DLQ monitors are any-message (max > 0) on purpose."""
+    (min > 0 = never drained once), not a momentary spike (max > 0); DLQ
+    monitors are any-message (max > 0) on purpose. Multi-queue queries
+    carry `by {queue}` so the union of two alternating-busy queues cannot
+    fake a sustained backlog and the alert names the offending queue."""
     from components.dd_monitors import (
         cave_dlq_depth_query,
         cave_jobs_backlog_query,
         consumer_queue_backlog_query,
         rerun_dlq_depth_query,
+        telemetry_health_query,
     )
 
     assert cave_jobs_backlog_query().startswith("min(last_15m):")
     assert consumer_queue_backlog_query().startswith("min(last_15m):")
     assert rerun_dlq_depth_query().startswith("max(last_15m):")
     assert cave_dlq_depth_query().startswith("max(last_15m):")
+    assert " by {queue}" in consumer_queue_backlog_query()
+    assert " by {queue}" in cave_dlq_depth_query()
+    assert telemetry_health_query().startswith("max(last_15m):")
+    assert "< 6" in telemetry_health_query()
+
+
+def _consumer_module_ast():
+    """Parse the consumer module WITHOUT importing it (it builds a boto3
+    client at import; this test env has no AWS runtime)."""
+    import ast
+    from pathlib import Path
+
+    src = (
+        Path(__file__).resolve().parents[3]
+        / "services" / "webhook" / "consumer.py"
+    ).read_text()
+    return ast.parse(src)
+
+
+def _consumer_telemetry_queue_names() -> list[str]:
+    import ast
+
+    for node in ast.walk(_consumer_module_ast()):
+        if isinstance(node, ast.Assign):
+            for target in node.targets:
+                if getattr(target, "id", "") == "_TELEMETRY_QUEUE_NAMES":
+                    return [el.value for el in node.value.elts]
+    raise AssertionError("_TELEMETRY_QUEUE_NAMES not found in consumer.py")
+
+
+def test_monitor_queue_tags_subset_of_consumer_emission() -> None:
+    """Cross-package name-drift guard (audit stage-8): a queue name in a
+    monitor query that the consumer does not emit = that monitor is
+    permanently blind (No Data, notify_no_data=false) - the exact trap
+    this family exists to retire. The emitter tuple is the source of
+    truth; monitors may watch a subset."""
+    import re
+
+    from components.dd_monitors import all_owned_queue_queries
+
+    emitted = set(_consumer_telemetry_queue_names())
+    queried = set()
+    for q in all_owned_queue_queries():
+        queried.update(re.findall(r"queue:([a-z0-9.-]+)", q))
+    assert queried, "no queue tags found in owned queries"
+    missing = queried - emitted
+    assert not missing, f"monitors query queues the consumer never emits: {missing}"
+
+
+def test_telemetry_health_expected_count_matches_consumer() -> None:
+    """The health query's `< N` threshold must equal the number of queues
+    the consumer sweeps - a queue added to the emitter without bumping the
+    threshold makes partial death undetectable (and vice versa)."""
+    from components.dd_monitors import (
+        _TELEMETRY_EXPECTED_QUEUES,
+        telemetry_health_query,
+    )
+
+    n = len(_consumer_telemetry_queue_names())
+    assert _TELEMETRY_EXPECTED_QUEUES == n
+    assert f"< {n}" in telemetry_health_query()
+
+
+@pulumi.runtime.test
+def test_owned_queue_monitors_no_data_pager_placement():
+    """Pin each monitor's (query, notify_no_data) pair (audit stage-7):
+    the telemetry-health monitor is the family's ONLY no-data pager - a
+    silent flip (or a copy-paste swapping builder queries between
+    monitors) re-creates the blind-monitor trap with green tests."""
+    import pulumi_datadog as datadog
+
+    from components import dd_monitors
+
+    provider = datadog.Provider("test-dd-queues", api_key="x", app_key="y")
+    bundle = dd_monitors.create_owned_queue_monitors(
+        env="prod",
+        notify_handle="@webhook-grug-discord-monitoring",
+        provider=provider,
+    )
+
+    expected = {
+        "cave_jobs_backlog": (dd_monitors.cave_jobs_backlog_query(), False),
+        "rerun_dlq": (dd_monitors.rerun_dlq_depth_query(), False),
+        "cave_dlq": (dd_monitors.cave_dlq_depth_query(), False),
+        "consumer_backlog": (dd_monitors.consumer_queue_backlog_query(), False),
+        "telemetry_health": (dd_monitors.telemetry_health_query(), True),
+    }
+
+    checks = []
+    for field, (want_query, want_no_data) in expected.items():
+        monitor = getattr(bundle, field)
+
+        def check(args, wq=want_query, wnd=want_no_data, f=field):
+            query, no_data, full_window = args
+            assert query == wq, f"{f}: query mismatch: {query}"
+            assert bool(no_data) is wnd, f"{f}: notify_no_data={no_data}, want {wnd}"
+            assert full_window is False, f"{f}: require_full_window must be False"
+
+        checks.append(
+            pulumi.Output.all(
+                monitor.query, monitor.notify_no_data, monitor.require_full_window,
+            ).apply(check)
+        )
+    return pulumi.Output.all(*checks)

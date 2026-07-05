@@ -196,3 +196,54 @@ def test_emit_gauge_never_raises_on_socket_failure(monkeypatch, caplog):
     with caplog.at_level("WARNING", logger="grug.observability"):
         emit_gauge("grug.sqs.messages_visible", 1.0, {"queue": "q.fifo"})
     assert "gauge_emit_failed" in caplog.text
+
+
+def test_emit_gauge_empty_or_none_tags_emit_env_only(monkeypatch):
+    """No leading comma / malformed tag list when only the auto env tag
+    remains - DogStatsD drops malformed datagrams silently."""
+    from observability import emit_gauge
+
+    monkeypatch.setenv("DD_AGENT_HOST", "10.0.0.99")
+    monkeypatch.setenv("GRUG_ENV", "prod")
+    monkeypatch.delenv("DD_ENV", raising=False)
+    sent = _sent_datagrams(monkeypatch)
+    emit_gauge("m", 1.0)
+    emit_gauge("m", 1.0, {})
+    assert [p for p, _ in sent] == [b"m:1.0|g|#env:prod", b"m:1.0|g|#env:prod"]
+
+
+def test_emit_gauge_prefers_dd_env_over_grug_env(monkeypatch):
+    from observability import emit_gauge
+
+    monkeypatch.setenv("DD_AGENT_HOST", "10.0.0.99")
+    monkeypatch.setenv("DD_ENV", "staging")
+    monkeypatch.setenv("GRUG_ENV", "prod")
+    sent = _sent_datagrams(monkeypatch)
+    emit_gauge("m", 1.0)
+    assert sent[0][0].endswith(b"#env:staging")
+
+
+def test_emit_gauge_sanitizes_tags_and_reserves_env_key(monkeypatch):
+    """Datagram-grammar characters in tags are neutralized and a caller
+    env key cannot shadow the auto env tag."""
+    from observability import emit_gauge
+
+    monkeypatch.setenv("DD_AGENT_HOST", "10.0.0.99")
+    monkeypatch.setenv("GRUG_ENV", "prod")
+    monkeypatch.delenv("DD_ENV", raising=False)
+    sent = _sent_datagrams(monkeypatch)
+    emit_gauge("m", 1.0, {"queue": "a|b,c#d", "env": "evil"})
+    assert sent == [(b"m:1.0|g|#queue:a_b_c_d,env:prod", ("10.0.0.99", 8125))]
+
+
+def test_emit_gauge_skips_non_finite_values(monkeypatch, caplog):
+    from observability import emit_gauge
+
+    monkeypatch.setenv("DD_AGENT_HOST", "10.0.0.99")
+    sent = _sent_datagrams(monkeypatch)
+    with caplog.at_level("WARNING", logger="grug.observability"):
+        emit_gauge("m", float("nan"))
+        emit_gauge("m", float("inf"))
+    assert sent == []
+    assert sum(1 for r in caplog.records
+               if r.msg == "gauge_skipped_non_finite") == 2

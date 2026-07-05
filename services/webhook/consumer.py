@@ -105,17 +105,35 @@ def _esm_event(arn: str, message: dict[str, Any]) -> dict[str, Any]:
     }
 
 
-# ── owned queue-depth telemetry (#379) ───────────────────────────────
+# --- owned queue-depth telemetry (#379) ------------------------------
 # The DD AWS integration does not collect aws.sqs.* in this org, which left
-# the queue/DLQ monitors permanently blind. The consumer owns the queues'
-# health signal instead: every _TELEMETRY_INTERVAL_S it reads the depth of
-# ALL grug queues (both consumed FIFOs, the connector-consumed cave-jobs,
-# and the three DLQs) via GetQueueAttributes and emits owned gauges the
-# monitors query. Age-of-oldest is CloudWatch-only, so the monitors use
-# SUSTAINED-depth semantics (visible > 0 across the window) - the same
-# operator signal ("not draining") from an attribute SQS actually serves.
+# the queue/DLQ monitors permanently blind; the consumer owns the queues'
+# depth signal instead. Full rationale + monitor semantics:
+# specs/DESIGN.md "Owned queue-depth telemetry".
 
-_TELEMETRY_INTERVAL_S = float(os.getenv("GRUG_QUEUE_TELEMETRY_INTERVAL_S", "60"))
+
+def _telemetry_interval_s() -> float:
+    """Interval knob, clamped to [10, 300]s: a malformed value must not
+    crash the consumer at import for a telemetry knob, near-zero must not
+    hot-loop GetQueueAttributes, and an interval above the monitors' 15m
+    window would starve every query into permanent No Data (the trap this
+    telemetry retires)."""
+    raw = os.getenv("GRUG_QUEUE_TELEMETRY_INTERVAL_S", "60")
+    try:
+        val = float(raw)
+    except ValueError:
+        log.warning("queue_telemetry_bad_interval", extra={"raw": raw})
+        return 60.0
+    clamped = min(300.0, max(10.0, val))
+    if clamped != val:
+        log.warning(
+            "queue_telemetry_interval_clamped",
+            extra={"raw": raw, "clamped": clamped},
+        )
+    return clamped
+
+
+_TELEMETRY_INTERVAL_S = _telemetry_interval_s()
 
 _TELEMETRY_QUEUE_NAMES = (
     "grug-rerun-jobs.fifo",
@@ -130,25 +148,42 @@ _TELEMETRY_QUEUE_NAMES = (
 def _telemetry_base_url() -> str | None:
     """Derive the account-scoped SQS URL prefix from a queue URL the pod
     already carries - queue NAMES are fixed (explicit `name=` in Pulumi),
-    so the other five URLs are prefix + name, no extra env plumbing."""
+    so all six URLs are just prefix + fixed name, no extra env plumbing.
+    Returns None (and the caller warns) if no env URL is present or the
+    value has no path segment to strip."""
     for env_name in ("GRUG_RERUN_QUEUE_URL", "GRUG_CAVE_RESULTS_QUEUE_URL"):
         url = os.getenv(env_name, "")
-        if url:
-            return url.rsplit("/", 1)[0]
+        if not url:
+            continue
+        base, sep, tail = url.rpartition("/")
+        if sep and tail:
+            return base
     return None
 
 
 def _emit_queue_depth_once() -> int:
-    """One depth sweep. Returns queues successfully emitted. Per-queue
-    best-effort: an AccessDenied on one queue (e.g. the DLQ grant landing
-    after this code) must not cost the others their gauge."""
+    """One depth sweep. Returns queues successfully PROBED (emit_gauge is
+    fire-and-forget UDP - delivery is the monitors' No Data problem, not
+    ours). Per-queue best-effort: an AccessDenied on one queue must not
+    cost the others their gauge. The sweep count itself is emitted as the
+    telemetry-health gauge: fewer-than-all-queues for a sustained window
+    pages via the '[grug-consumer] Queue telemetry degraded' monitor -
+    without it, a partial failure would silently re-blind the per-queue
+    depth monitors (audit stage-2 HIGH on PR #516)."""
     from observability import emit_gauge  # late: patchable, and webhook-image only
 
+    if not os.getenv("DD_AGENT_HOST", ""):
+        # Sweep-level guard: without an agent host every emit would
+        # skip-warn individually (12 lines/min forever); one line per
+        # sweep says the same thing. Total metric silence still reaches
+        # the health monitor's notify_no_data pager.
+        log.warning("queue_telemetry_no_agent_host")
+        return 0
     base = _telemetry_base_url()
     if base is None:
         log.warning("queue_telemetry_no_base_url")
         return 0
-    emitted = 0
+    probed = 0
     for name in _TELEMETRY_QUEUE_NAMES:
         try:
             attrs = _sqs.get_queue_attributes(
@@ -168,18 +203,23 @@ def _emit_queue_depth_once() -> int:
                 float(attrs.get("ApproximateNumberOfMessagesNotVisible", 0)),
                 {"queue": name},
             )
-            emitted += 1
+            probed += 1
         except Exception as e:  # noqa: BLE001 - per-queue best-effort
+            # botocore folds most service errors (AccessDenied, throttle)
+            # into ClientError; the wire Code is the diagnosable bit.
+            code = getattr(e, "response", None)
+            code = (code or {}).get("Error", {}).get("Code") if isinstance(code, dict) else None
             log.warning(
                 "queue_depth_probe_failed",
-                extra={"queue": name, "kind": type(e).__name__},
+                extra={"queue": name, "kind": type(e).__name__, "code": code},
             )
-    return emitted
+    emit_gauge("grug.sqs.telemetry_queues_ok", float(probed))
+    return probed
 
 
 def _telemetry_loop() -> None:
     """Thread body: depth sweep every interval until shutdown. Hard-wrapped
-    never-raise; if this loop somehow dies anyway, the consumer-backlog
+    never-raise; if this loop somehow dies anyway, the telemetry-health
     monitor's notify_no_data pages on the metric going silent - the pod is
     NOT restarted for a telemetry failure (the watchdog excludes this
     thread on purpose; review data flow > metric flow)."""
@@ -416,7 +456,7 @@ def main() -> None:
         t.start()
 
     # Owned queue-depth telemetry (#379). Daemon + OUTSIDE the watchdog
-    # list: a telemetry failure surfaces as the consumer-backlog monitor's
+    # list: a telemetry failure surfaces as the telemetry-health monitor's
     # No Data page, never as a pod restart that would interrupt review
     # message flow.
     threading.Thread(

@@ -13,6 +13,7 @@ from __future__ import annotations
 import hashlib
 import json
 import logging
+import math
 import os
 import secrets
 import socket
@@ -83,13 +84,21 @@ def configure_logging() -> None:
 def _send_dogstatsd(payload: bytes, host: str) -> None:
     """Fire one DogStatsD UDP datagram at the node-local agent hostPort.
     Raises on socket errors - callers own their never-raise contract and
-    their log tokens (monitors grep for the specific token, so each emit
-    path keeps its own)."""
+    their log tokens (tokens are operator-grep landmarks and candidates
+    for log monitors, so each emit path keeps its own, distinct and
+    stable)."""
     sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
     try:
         sock.sendto(payload, (host, 8125))
     finally:
         sock.close()
+
+
+def _clean_tag(text: str) -> str:
+    """Strip the characters that corrupt DogStatsD datagram grammar (field
+    separators and the tag-list delimiter). Colons are legal in tag VALUES
+    (only the first splits key from value), so they stay."""
+    return text.replace("|", "_").replace(",", "_").replace("#", "_").replace("\n", "_")
 
 
 def emit_gauge(
@@ -100,22 +109,37 @@ def emit_gauge(
     """Generic DogStatsD gauge over UDP (#379 owned queue telemetry).
 
     Same k8s emission path as emit_enforcement_metric (#460): datagram to
-    DD_AGENT_HOST:8125. The env tag is appended automatically so every
-    owned gauge is env-scoped without each caller re-deriving it. Never
-    raises; failures log a WARNING with the metric name.
+    DD_AGENT_HOST:8125. The env tag is appended automatically (a caller
+    `env` key is reserved and dropped) so every owned gauge is env-scoped
+    without each caller re-deriving it. Tag keys/values are sanitized
+    against datagram-grammar corruption. Never raises: everything past
+    the host check runs inside the try; failures log a WARNING carrying
+    the metric name and exception class.
     """
-    env = os.getenv("DD_ENV") or os.getenv("GRUG_ENV", "prod")
     host = os.getenv("DD_AGENT_HOST", "")
     lg = logging.getLogger("grug.observability")
     if not host:
         lg.warning("gauge_skipped_no_agent_host", extra={"metric": metric})
         return
-    parts = [f"{k}:{v}" for k, v in (tags or {}).items()] + [f"env:{env}"]
-    payload = f"{metric}:{value}|g|#{','.join(parts)}".encode()
     try:
+        if not math.isfinite(value):
+            lg.warning(
+                "gauge_skipped_non_finite", extra={"metric": metric},
+            )
+            return
+        env = os.getenv("DD_ENV") or os.getenv("GRUG_ENV", "prod")
+        parts = [
+            f"{_clean_tag(str(k))}:{_clean_tag(str(v))}"
+            for k, v in (tags or {}).items()
+            if str(k) != "env"
+        ] + [f"env:{env}"]
+        payload = f"{metric}:{value}|g|#{','.join(parts)}".encode()
         _send_dogstatsd(payload, host)
-    except Exception:
-        lg.warning("gauge_emit_failed", extra={"metric": metric})
+    except Exception as e:  # noqa: BLE001 - the never-raise contract is load-bearing
+        lg.warning(
+            "gauge_emit_failed",
+            extra={"metric": metric, "kind": type(e).__name__},
+        )
 
 
 def emit_enforcement_metric(
