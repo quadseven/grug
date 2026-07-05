@@ -372,6 +372,12 @@ jobs:
           fi
 
       - name: Pin image placeholders + apply
+        id: apply
+        # continue-on-error so a FAILED apply/rollout/smoke still reaches
+        # the rollback step below (codex peer review: a bad image or
+        # manifest aborting here is exactly when recovery matters most);
+        # the rollback + the run's final state stay loud.
+        continue-on-error: true
         env:
           REGISTRY_HOST: ${{ vars.DEPLOY_REGISTRY_HOST }}
         run: |
@@ -447,6 +453,7 @@ jobs:
 
       - name: Post-deploy synthetic self-test (#499)
         id: synthetic
+        if: steps.apply.outcome == 'success'
         continue-on-error: true
         run: |
           set -euo pipefail
@@ -495,8 +502,13 @@ jobs:
           probe_health grug-api
           echo "synthetic PASS: health x2, signed ping 200, 60s soak clean" >> "$GITHUB_STEP_SUMMARY"
 
-      - name: Auto-rollback to last-good (synthetic failed, #499)
-        if: steps.synthetic.outcome == 'failure'
+      - name: Auto-rollback to last-good (#499)
+        # Fires on ANY post-anchor deploy failure: a failed apply/rollout/
+        # smoke OR a failed synthetic. IMAGE-ONLY contract (ADR-0017): the
+        # anchor restores the previous digests under the CURRENT applied
+        # config - a manifest/secret regression needs revert + redeploy;
+        # the step warns when this merge touched k8s/.
+        if: steps.apply.outcome == 'failure' || steps.synthetic.outcome == 'failure'
         run: |
           set -euo pipefail
           W=$(kubectl -n grug get configmap grug-last-good -o jsonpath='{.data.webhook}' 2>/dev/null || echo "")
@@ -523,7 +535,10 @@ jobs:
             printf 'grug.deploy.rollback:1|c|#env:prod,trigger:synthetic' \
               | timeout 5 bash -c "cat > /dev/udp/${NODE_IP}/8125" || true
           fi
-          echo "::error::synthetic FAILED - rolled back to last-good. The bad merge is STILL ON MAIN: revert or fix forward."
+          if git diff-tree --no-commit-id --name-only -r "${GITHUB_SHA}" | grep -q '^k8s/'; then
+            echo "::warning::this merge also changed k8s/ manifests - rollback restored IMAGES ONLY; the applied config may still be bad (ADR-0017 image-only contract). Revert + redeploy if the failure was config-shaped."
+          fi
+          echo "::error::deploy FAILED (apply or synthetic) - rolled back to last-good images. The bad merge is STILL ON MAIN: revert or fix forward."
           echo "ROLLED BACK to last-good (from $(kubectl -n grug get configmap grug-last-good -o jsonpath='{.data.recorded_from_sha}'))" >> "$GITHUB_STEP_SUMMARY"
           exit 1
 

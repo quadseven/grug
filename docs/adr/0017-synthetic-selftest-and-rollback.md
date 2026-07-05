@@ -30,7 +30,9 @@ and the escape hatch should be seconds, not minutes.
    The soak is the OWNED stand-in for the "DD error-rate window" idea:
    the deploy role deliberately has no DD keys (least privilege), and
    restarts+readiness catch the same crash classes.
-3. **Auto-rollback on synthetic failure**: re-apply the anchored digests
+3. **Auto-rollback on ANY post-anchor failure** (a failed apply/rollout/
+   smoke - captured via continue-on-error - or a failed synthetic):
+   re-apply the anchored digests
    (set image, no rebuild, ~30s), annotate
    `grug.dev/image-source=rollback-last-good`, emit the owned
    `grug.deploy.rollback` count via a node's DogStatsD hostPort, and
@@ -47,6 +49,17 @@ and the escape hatch should be seconds, not minutes.
    promotion decision now takes a `gate_ran` fact (from the head's
    check-runs) so workflow-only merges classify as expected-rebuild
    instead of firing the artifact-missing warning.
+
+### What rollback does NOT cover (image-only contract)
+
+The anchor records DIGESTS, not release state: rollback restores the
+previous images under the CURRENT applied manifests/config/secrets. A
+regression in k8s/ manifests or the secret seed is NOT undone - the
+rollback step warns when the failing merge touched k8s/, and the
+recovery for config-shaped failures is revert + redeploy. Full
+release-state rollback (rendered-manifest snapshots) is deliberately
+rejected at this scale - it is the Argo/GitOps threshold the issue
+excluded.
 
 ## Consequences
 
