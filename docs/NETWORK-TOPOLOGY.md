@@ -47,10 +47,10 @@ In-cluster Secrets (seeded by the deploy workflow from SSM/SQS/S3 — never comm
 
 | Secret | Holds | Consumed by |
 |---|---|---|
-| `grug-secrets` | `grug-k8s-pod` AWS credential, `GRUG_DATABASE_URL`, `GRUG_KMS_CMK_ARN`, the three `*_QUEUE_URL`s, `GRUG_CAVE_DIFF_BUCKET` | api / webhook / consumer / poller (`envFrom`) |
+| `grug-secrets` | APP CONFIG ONLY (#389): `GRUG_DATABASE_URL`, `GRUG_KMS_CMK_ARN`, the three `*_QUEUE_URL`s, `GRUG_CAVE_DIFF_BUCKET` - NEVER AWS credentials (the deploy seed + every pod's boot proof both refuse them) | api / webhook / consumer / poller (`envFrom`) |
 | `registry-pull` | in-cluster registry pull credential | all pods (`imagePullSecrets`) |
 
-The pods do **not** carry app secrets (App key, OAuth secrets, LLM keys, CF shared secret): those are read from SSM **at runtime** via the `*_SSM` path env vars (`secrets_loader`), using the AWS credential in `grug-secrets`. The pod secret carries only the AWS credential authorizing those reads plus deploy-resolved values that must not be committed (the queue URLs and CMK ARN embed the account id).
+The pods do **not** carry app secrets (App key, OAuth secrets, LLM keys, CF shared secret): those are read from SSM **at runtime** via the `*_SSM` path env vars (`secrets_loader`), authorized by the pod's Roles Anywhere session (X.509 leaf -> aws_signing_helper -> STS; #389). `grug-secrets` carries only deploy-resolved app values that must not be committed (the queue URLs and CMK ARN embed the account id) - no credential of any kind.
 
 ### B.2 AWS us-east-1 (runtime dependencies)
 
