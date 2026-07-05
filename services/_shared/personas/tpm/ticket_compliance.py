@@ -21,8 +21,11 @@ import re
 # `closes/fixes/resolves` CLAIM closure; `refs/part of/blocked by` do not,
 # so only the closing verbs trigger the compliance check.
 _CLOSES_RE = re.compile(r"\b(?:closes|closed|close|fixes|fixed|fix|resolves|resolved|resolve)\s+#(\d+)\b", re.I)
-# Acceptance-criteria checkbox lines: `- [ ] text` / `- [x] text`.
-_BOX_RE = re.compile(r"^\s*[-*]\s*\[[ xX]\]\s+(.+?)\s*$")
+# UNCHECKED acceptance-criteria lines only: `- [ ] text`. A CHECKED box
+# (`- [x]`) is the author asserting that criterion is already done -
+# flagging it would contradict them and manufacture false positives
+# (Qodo review #535), so only open boxes are cross-checked.
+_BOX_RE = re.compile(r"^\s*[-*]\s*\[ \]\s+(.+?)\s*$")
 # Words too generic to be distinctive signal.
 _STOP = frozenset("""
 a an the and or of to in on for with without via per is are be that this it
@@ -42,9 +45,9 @@ def closes_refs(pr_body: str) -> list[int]:
 
 
 def acceptance_criteria(issue_body: str) -> list[str]:
-    """The checkbox lines under an Acceptance/Test-plan section - the
-    criteria the PR is claiming to satisfy. Returns the raw text of each
-    box (checked or not; a PR should address them regardless)."""
+    """The UNCHECKED acceptance-criteria lines - the still-open criteria a
+    PR claiming to close the issue should address. Checked boxes are
+    excluded (the author asserts those are done)."""
     out = []
     for line in (issue_body or "").splitlines():
         m = _BOX_RE.match(line)
