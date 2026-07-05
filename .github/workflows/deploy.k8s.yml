@@ -28,6 +28,7 @@ on:
     paths:
       - 'services/**'
       - 'k8s/**'
+      - 'scripts/promotion.py'
       - '.github/workflows/deploy.k8s.yml'
   workflow_dispatch: {}
 
