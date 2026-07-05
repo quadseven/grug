@@ -145,3 +145,15 @@ def test_deploy_failure_lattice_structure():
                     "steps.apply.outcome == 'failure'",
                     "steps.synthetic.outcome == 'failure'"):
         assert outcome in rb, f"rollback missing trigger: {outcome}"
+
+
+def test_rollback_incomplete_flag_gates_completed_telemetry():
+    """#499 (codex r12): a failed-snapshot restore must poison the
+    completed signal - the flag is set in the failed branch and consumed
+    before the phase metric."""
+    text = (_ROOT / ".github" / "workflows" / "deploy.k8s.yml").read_text()
+    start = text.index("Auto-rollback to last-good")
+    block = text[start:text.find("\n      - name:", start)]
+    assert "RESTORE_INCOMPLETE=1" in block
+    assert block.index("RESTORE_INCOMPLETE=1") < block.index("phase=")
+    assert 'RESTORE_INCOMPLETE:-0' in block and "incomplete" in block

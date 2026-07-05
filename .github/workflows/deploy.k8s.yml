@@ -572,6 +572,7 @@ jobs:
           # hazard the seed's own delete-then-create exists to prevent.
           # Empty snapshot = the object did not exist pre-deploy: restore
           # ABSENCE by deleting whatever the failed run seeded.
+          RESTORE_INCOMPLETE=0
           restore() {  # restore <ns> <secret> <file-stem>
             if [ -s "$RUNNER_TEMP/$3.pre.json" ]; then
               kubectl -n "$1" delete secret "$2" --ignore-not-found
@@ -581,13 +582,21 @@ jobs:
               kubectl -n "$1" delete secret "$2" --ignore-not-found
               echo "::warning::$2@$1 did not exist pre-deploy - deleted the seeded object"
             else
+              # snapshot FAILED pre-deploy: this rollback is INCOMPLETE
+              # (codex r12) - still restore everything else, but the
+              # completed signal below must not fire.
               echo "::error::$2@$1 snapshot FAILED pre-deploy - secret left AS-IS, review manually"
+              RESTORE_INCOMPLETE=1
             fi
           }
           restore grug grug-secrets grug-secrets
           restore grug registry-pull registry-pull-grug
           restore grug-trial registry-pull registry-pull-trial
-          echo "restored pre-deploy secret state (exact, delete-then-create)" >> "$GITHUB_STEP_SUMMARY"
+          if [ "$RESTORE_INCOMPLETE" = "0" ]; then
+            echo "restored pre-deploy secret state (exact, delete-then-create)" >> "$GITHUB_STEP_SUMMARY"
+          else
+            echo "ROLLBACK INCOMPLETE: one or more secrets could not be verified/restored - review manually" >> "$GITHUB_STEP_SUMMARY"
+          fi
           # Container names per the live manifests: webhook/webhook,
           # api/webhook (historical), consumer/consumer, poller/poller.
           kubectl -n grug set image deploy/grug-webhook webhook="$W"
@@ -614,7 +623,8 @@ jobs:
             "grug.dev/image-source=rollback-last-good" \
             "grug.dev/rolled-back-from=${GITHUB_SHA}"
           if [ -n "$NODE_IP" ]; then
-            printf 'grug.deploy.rollback:1|c|#env:prod,trigger:auto,phase:completed' \
+            phase=$([ "${RESTORE_INCOMPLETE:-0}" = "0" ] && echo completed || echo incomplete)
+            printf 'grug.deploy.rollback:1|c|#env:prod,trigger:auto,phase:%s' "$phase" \
               | timeout 5 bash -c "cat > /dev/udp/${NODE_IP}/8125" || true
           fi
           if git diff-tree --no-commit-id --name-only -r "${GITHUB_SHA}" | grep -q '^k8s/'; then
