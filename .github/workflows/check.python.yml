@@ -9,12 +9,14 @@ on:
   pull_request:
     paths:
       - 'services/**'
+      - 'scripts/**'
       - 'Makefile'
       - '.github/workflows/check.python.yml'
   push:
     branches: [main]
     paths:
       - 'services/**'
+      - 'scripts/**'
 
 permissions:
   contents: read
@@ -53,6 +55,8 @@ jobs:
       - uses: astral-sh/setup-uv@fac544c07dec837d0ccb6301d7b5580bf5edae39 # v8
       - name: webhook tests
         run: make webhook-test
+      - name: scripts tests (promotion decision + migration)
+        run: make scripts-test
       - name: api tests
         run: make api-test
       - name: pg store tests (real Postgres)

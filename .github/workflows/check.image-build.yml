@@ -3,9 +3,21 @@ name: Check · image build · services/ Docker context
 # Pre-merge proof that BOTH service images build from the ADR-0014 context
 # (services/ with _shared/ alongside each service tree) and that their
 # import graphs resolve INSIDE the image (PYTHONPATH=/app/_shared).
-# deploy.k8s.yml builds only on merge to main - without this gate a broken
-# COPY/PYTHONPATH layout would take down BOTH services at the next deploy
-# (#77: the extraction's main deploy risk, flagged when the issue was filed).
+# Without this gate a broken COPY/PYTHONPATH layout would take down BOTH
+# services at the next deploy (#77).
+#
+# Since #498 (ADR-0016) this gate also BUILDS THE SHIPPABLE ARTIFACT:
+# native arm64 (same hosted runner class as deploy.k8s.yml - the cluster is
+# arm64, so an x86 smoke image would prove nothing about what ships), and
+# for SAME-REPO PRs the smoked images are pushed to the private registry
+# tagged pr-<n>; the merge deploy PROMOTES that digest when the ADR-0016
+# checks pass (single merged PR, tree-identical, manifests present, baked
+# sha verified) - anything else rebuilds, including fork PRs (no secrets
+# by GitHub's rules; the smokes still gate) and unseeded credentials.
+# Credentials are repo-level CI_* secrets (push-scoped registry credential
+# + an ephemeral tag:ci tailnet key that MUST be reusable - the matrix
+# joins twice concurrently), NOT the main-only k8s-prod environment;
+# trust boundary documented in ADR-0016.
 
 permissions:
   contents: read
@@ -16,18 +28,39 @@ on:
       - 'services/**'
       - '.github/workflows/check.image-build.yml'
 
+# A superseded run finishing LATE must never overwrite pr-<n> with an
+# older commit's image (audit stage-5): cancel it. A cancelled mid-push
+# leaves the manifest absent and the merge deploy falls back to rebuild.
+concurrency:
+  group: image-build-${{ github.ref }}
+  cancel-in-progress: true
+
 jobs:
   image-build:
-    runs-on: ubuntu-latest
-    timeout-minutes: 15
+    runs-on: ubuntu-24.04-arm
+    timeout-minutes: 20
     strategy:
       fail-fast: false  # one service's failure must not hide the other's result
       matrix:
         svc: [webhook, api]
     steps:
       - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          # Build the PR HEAD bytes, not the default merge ref: promotion
+          # verifies the baked DD_GIT_COMMIT_SHA against head.sha, and
+          # ADR-0016 rule 2 (head tree == merge tree) is only sound when
+          # the artifact IS the head (audit stage-6).
+          ref: ${{ github.event.pull_request.head.sha }}
       - name: Build image (services/ context)
-        run: docker build services -f services/Dockerfile --build-arg SERVICE="${{ matrix.svc }}" -t "grug-${{ matrix.svc }}:pr-smoke"
+        # DD_GIT_COMMIT_SHA = the PR HEAD sha: if this digest is promoted,
+        # ADR-0016 rule 3b guarantees the merge tree is identical, so the
+        # baked source link stays truthful.
+        run: |
+          docker build services -f services/Dockerfile \
+            --build-arg SERVICE="${{ matrix.svc }}" \
+            --build-arg DD_GIT_REPOSITORY_URL="github.com/${{ github.repository }}" \
+            --build-arg DD_GIT_COMMIT_SHA="${{ github.event.pull_request.head.sha }}" \
+            -t "grug-${{ matrix.svc }}:pr-smoke"
       - name: Import smoke (inside the image)
         run: |
           set -euo pipefail
@@ -83,3 +116,59 @@ jobs:
           # the two stages fails here, not in a pod (#388; both images since
           # the #389 rollout).
           docker run --rm "grug-${{ matrix.svc }}:pr-smoke" aws_signing_helper version
+
+      # --- #498 (ADR-0016): publish the smoked artifact for promotion ---
+      # Push happens ONLY after every smoke above passed, and only when the
+      # promotion credentials are actually usable: fork PRs (no secrets by
+      # GitHub's rules) and unseeded CI_* secrets both skip EVERY promotion
+      # step - including the tailnet join, which would otherwise hard-fail
+      # the whole gate on an empty authkey (audit stage-2).
+      - name: Check promotion seeding
+        id: seeding
+        if: github.event.pull_request.head.repo.full_name == github.repository
+        env:
+          REGISTRY_HOST: ${{ vars.DEPLOY_REGISTRY_HOST }}
+          CI_REGISTRY_USERNAME: ${{ secrets.CI_REGISTRY_USERNAME }}
+          CI_REGISTRY_PASSWORD: ${{ secrets.CI_REGISTRY_PASSWORD }}
+          CI_TS_AUTHKEY: ${{ secrets.CI_TS_AUTHKEY }}
+        run: |
+          if [ -n "$REGISTRY_HOST" ] && [ -n "$CI_REGISTRY_USERNAME" ] \
+             && [ -n "$CI_REGISTRY_PASSWORD" ] && [ -n "$CI_TS_AUTHKEY" ]; then
+            echo "seeded=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "seeded=false" >> "$GITHUB_OUTPUT"
+            echo "::warning::promotion push skipped - CI_* secrets/vars not fully seeded; merge will rebuild"
+            echo "promotion artifact NOT published (CI_* seeding incomplete) - merge will rebuild" >> "$GITHUB_STEP_SUMMARY"
+          fi
+
+      - name: Fork-PR notice
+        if: github.event.pull_request.head.repo.full_name != github.repository
+        run: echo "fork PR - promotion artifacts not published by design; merge will rebuild" >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Join tailnet (ephemeral)
+        if: steps.seeding.outputs.seeded == 'true'
+        uses: tailscale/github-action@306e68a486fd2350f2bfc3b19fcd143891a4a2d8 # v4
+        with:
+          # Reusable key on purpose: both matrix legs join concurrently.
+          authkey: ${{ secrets.CI_TS_AUTHKEY }}
+          tags: tag:ci
+          use-cache: 'true'
+
+      - name: Push pr-tagged image
+        if: steps.seeding.outputs.seeded == 'true'
+        env:
+          REGISTRY_HOST: ${{ vars.DEPLOY_REGISTRY_HOST }}
+          CI_REGISTRY_USERNAME: ${{ secrets.CI_REGISTRY_USERNAME }}
+          CI_REGISTRY_PASSWORD: ${{ secrets.CI_REGISTRY_PASSWORD }}
+          PR_NUMBER: ${{ github.event.pull_request.number }}
+          HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+        run: |
+          set -euo pipefail
+          echo "$CI_REGISTRY_PASSWORD" | docker login "$REGISTRY_HOST" \
+            --username "$CI_REGISTRY_USERNAME" --password-stdin
+          docker tag "grug-${{ matrix.svc }}:pr-smoke" \
+            "$REGISTRY_HOST/grug-${{ matrix.svc }}:pr-${PR_NUMBER}"
+          docker push "$REGISTRY_HOST/grug-${{ matrix.svc }}:pr-${PR_NUMBER}"
+          digest="$(docker inspect --format='{{index .RepoDigests 0}}' \
+            "$REGISTRY_HOST/grug-${{ matrix.svc }}:pr-${PR_NUMBER}")"
+          echo "pushed ${digest} (built from head ${HEAD_SHA})" >> "$GITHUB_STEP_SUMMARY"
