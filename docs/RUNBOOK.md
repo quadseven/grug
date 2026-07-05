@@ -223,7 +223,7 @@ cert-manager Certificate `grug-pki` (CN=grug, 6h/renew-4h, Secret
 from SSM `/infra/roles-anywhere/...` at deploy). Each service proves the
 identity at BOOT (`aws_identity.prove_roles_anywhere_identity` - asserts
 the ra-grug session, fails the pod loud) and the poller re-proves every
-15m tick. Failures page via the `grug-roles-anywhere-credential-fail`
+15m tick. Failures page via the "[grug] Roles Anywhere credential acquisition failing (15min)"
 log monitor. During the #389 rollout window the `grug-aws-static-key`
 Secret stays live and rotator-maintained as the ROLLBACK RESERVE; the
 retirement PR deletes it + the #386 rotator + the static AccessKey.
@@ -246,8 +246,8 @@ retirement PR deletes it + the #386 rotator + the static AccessKey.
      proof refuses env creds + RA config together). Env creds then
      out-rank credential_process - instantly back on the static key.
   4. Un-suspend the rotator when done.
-  Drill evidence (#389 AC): see PR #504 for the exercised consumer
-  rollback + re-cutover.
+  Drill evidence (#389 AC) lands on PR #504 post-merge, before the
+  retirement PR deletes the reserve.
 - **Cutover blast radius**: api/webhook roll maxUnavailable:0 - a
   fleet-broken cert path BLOCKS the deploy while old pods keep serving.
   The consumer is strategy Recreate: its old pod stops BEFORE the new
@@ -383,16 +383,19 @@ admin dashboard. (A global SSM kill switch is future-roadmap, not implemented.)
 
 ## Key rotation
 
-Interim automated rotation of the `grug-k8s-pod` AWS access key (#386),
-throwaway until Roles Anywhere (#388/#389). The `grug-key-rotator` CronJob
-runs every 12h: mint a new key -> patch it into `grug-secrets` ->
-rollout-restart `grug-api`/`grug-webhook`/`grug-consumer` and wait -> delete
-the old key. Logic in `services/webhook/key_rotator.py`. It authenticates
-with `grug-rotator-secret` (IAM user `grug-k8s-rotator`, scoped to
-access-key ops on `grug-k8s-pod` only), NEVER `grug-secrets`.
+Since #389 the `grug-k8s-pod` key is the ROLLBACK RESERVE: no workload
+consumes it (the fleet rides Roles Anywhere), and the `grug-key-rotator`
+CronJob (#386) survives only as the reserve's CUSTODIAN until the
+retirement PR deletes both. Every 12h it mints a new key -> patches it
+into `grug-aws-static-key` -> deletes the old key. It restarts NOTHING
+(`GRUG_ROTATE_DEPLOYMENTS` is empty - nothing consumes the key, so a
+rotation must not bounce the fleet). Logic in
+`services/webhook/key_rotator.py`. It authenticates with
+`grug-rotator-secret` (IAM user `grug-k8s-rotator`, scoped to access-key
+ops on `grug-k8s-pod` only), never the secret it rotates.
 
-**On `[grug] AWS key-rotation failed`:** the rotation is stuck but pods keep
-working (fail safe-open keeps the old key valid). Check the Job logs:
+**On `[grug] AWS key-rotation failed`:** no pod is affected, but your
+ROLLBACK PATH is degrading - fix before you need it. Check the Job logs:
 
 ```bash
 kubectl -n grug get jobs -l app=grug-key-rotator

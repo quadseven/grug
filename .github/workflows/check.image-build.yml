@@ -52,6 +52,27 @@ jobs:
             -e AWS_ACCESS_KEY_ID=smoke -e AWS_SECRET_ACCESS_KEY=smoke \
             "grug-${{ matrix.svc }}:pr-smoke" \
             python -c "import ${mods}; import observability, adapters.install_store as _s; assert '_shared' in observability.__file__ and '_shared' in _s.__file__, (observability.__file__, _s.__file__); print('IMPORTS OK')"
+      - name: Boot-proof crash smoke (call site + monitored event)
+        run: |
+          # Deterministic tripwire branch, zero network (#389 audit): with RA
+          # config AND static env creds, main's import-time proof must refuse
+          # to boot AND emit the monitored event. Pins the call site the unit
+          # suite structurally cannot (import happens at collection) and the
+          # event name half the DD monitor keys on.
+          set +e
+          out=$(docker run --rm \
+            -e AWS_CONFIG_FILE=/etc/grug-aws/config \
+            -e AWS_ACCESS_KEY_ID=x -e AWS_SECRET_ACCESS_KEY=x \
+            -e AWS_DEFAULT_REGION=us-east-1 \
+            "grug-${{ matrix.svc }}:pr-smoke" python -c "import main" 2>&1)
+          rc=$?
+          set -e
+          if [ "$rc" -eq 0 ]; then
+            echo "::error::boot proof did NOT refuse static creds + RA config"; exit 1
+          fi
+          echo "$out" | grep -q "roles_anywhere_identity_failed" || {
+            echo "::error::monitored event missing from boot failure output"; echo "$out" | tail -5; exit 1
+          }
       - name: Signing-helper exec smoke (runtime ABI)
         run: |
           # The helper is cgo-linked against the BUILDER's glibc; exec it in

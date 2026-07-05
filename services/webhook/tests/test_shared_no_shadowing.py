@@ -86,3 +86,18 @@ def test_no_mirrored_headers_remain():
             if first.startswith("# MIRRORED — sibling at"):
                 offenders.append(str(p.relative_to(SERVICES.parent)))
     assert not offenders, f"MIRRORED headers should not exist post-#77: {offenders}"
+
+
+def test_shared_conftest_scrubs_aws_config_file(monkeypatch):
+    """The import-time hermeticity guard is itself unpinned otherwise: a
+    hygiene cleanup removing the pop would resurface only as dev-shell
+    flakes at pytest collection (#389 audit stage-7)."""
+    import importlib
+    import os
+
+    import grug_shared_conftest
+
+    monkeypatch.setenv("AWS_CONFIG_FILE", "/dev/null")
+    importlib.reload(grug_shared_conftest)
+    assert "AWS_CONFIG_FILE" not in os.environ
+

@@ -82,6 +82,13 @@ EXCLUDED_FROM_RA_FLEET = {
 }
 
 
+def test_excluded_entries_reference_real_manifests():
+    # A stale exclusion could later mask a NEW file reusing the name
+    # (#389 audit stage-7).
+    names = {f.name for f in K8S.glob("*.yaml")}
+    assert set(EXCLUDED_FROM_RA_FLEET) <= names
+
+
 def _fleet_manifests() -> list[str]:
     out = []
     for f in sorted(K8S.glob("*.yaml")):
@@ -144,7 +151,8 @@ def test_rotator_stays_off_the_ra_path_and_rotates_no_deployments():
 
 
 def test_rotator_maintains_the_rollback_reserve_until_retirement():
-    """PR-A window (#389): no workload CONSUMES grug-aws-static-key, but
+    """#389 rollout window (PR A of 2; the retirement PR deletes the
+    reserve): no workload CONSUMES grug-aws-static-key, but
     the #386 rotator keeps it VALID as the documented rollback reserve.
     The retirement PR deletes the rotator + this test together - flipping
     either side alone is the drift this pin catches."""

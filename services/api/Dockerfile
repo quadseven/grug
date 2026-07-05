@@ -12,10 +12,11 @@
 FROM golang:1.26-bookworm AS signing-helper
 ARG SIGNING_HELPER_VERSION=v1.8.4
 # CGO stays ON: the helper's pkcs11 support (miekg/pkcs11) is cgo-only
-# and CGO_ENABLED=0 fails compilation. The binary therefore links the
-# builder's glibc - keep BOTH stages on the same Debian release
-# (bookworm) or the runtime exec dies; the image gate execs the binary
-# inside the runtime image to pin that.
+# and CGO_ENABLED=0 fails compilation. The binary links the BUILDER's
+# glibc, so the invariant is DIRECTIONAL: runtime glibc >= builder glibc
+# (python:*-slim tracks newer Debian than the pinned golang builder -
+# forward-compatible). The image gate execs the binary inside the
+# runtime image, so a violation dies pre-merge, not in a pod.
 RUN git clone --depth 1 --branch ${SIGNING_HELPER_VERSION} \
       https://github.com/aws/rolesanywhere-credential-helper /src \
  && cd /src \

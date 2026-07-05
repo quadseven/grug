@@ -250,7 +250,7 @@ def test_identity_proof_skips_without_ra_config(monkeypatch):
     ph._prove_roles_anywhere_identity()  # must not raise, must not call AWS
 
 
-def test_identity_proof_refuses_static_env_creds(monkeypatch):
+def test_identity_proof_refuses_static_env_creds(monkeypatch, caplog):
     """Env creds out-rank credential_process - their presence means the
     tracer would silently run on the static key. Refuse loudly."""
     monkeypatch.setenv("AWS_CONFIG_FILE", "/etc/grug-aws/config")
@@ -259,11 +259,17 @@ def test_identity_proof_refuses_static_env_creds(monkeypatch):
 
     import poller_handler as ph
 
-    with pytest.raises(RuntimeError, match="Roles Anywhere"):
-        ph._prove_roles_anywhere_identity()
+    import logging
+
+    import aws_identity
+
+    with caplog.at_level(logging.ERROR, logger=aws_identity.log.name):
+        with pytest.raises(RuntimeError, match="Roles Anywhere"):
+            ph._prove_roles_anywhere_identity()
+    assert any(r.msg == "roles_anywhere_identity_failed" for r in caplog.records)
 
 
-def test_identity_proof_calls_sts_and_propagates_failure(monkeypatch):
+def test_identity_proof_calls_sts_and_propagates_failure(monkeypatch, caplog):
     """The proof is deliberately UNGUARDED: a credential failure must crash
     the Job (KSM monitor pages) instead of dissolving into the per-install
     best-effort swallow."""
@@ -280,8 +286,16 @@ def test_identity_proof_calls_sts_and_propagates_failure(monkeypatch):
             raise RuntimeError("CredentialRetrievalError: helper exploded")
 
     monkeypatch.setattr(boto3, "client", lambda service: _Sts())
-    with pytest.raises(RuntimeError, match="helper exploded"):
-        ph._prove_roles_anywhere_identity()
+    import logging
+
+    import aws_identity
+
+    with caplog.at_level(logging.ERROR, logger=aws_identity.log.name):
+        with pytest.raises(RuntimeError, match="helper exploded"):
+            ph._prove_roles_anywhere_identity()
+    # The monitorable event is HALF the credential monitor's trigger -
+    # a rename would disarm it while every test stayed green (stage 7).
+    assert any(r.msg == "roles_anywhere_identity_failed" for r in caplog.records)
 
 
 def test_identity_proof_logs_the_assumed_arn(monkeypatch, caplog):
