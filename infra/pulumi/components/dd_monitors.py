@@ -94,6 +94,19 @@ def restart_spike_query() -> str:
     )
 
 
+def credential_acquisition_failure_query(env: str) -> str:
+    """#389: any workload failing to acquire (or prove) Roles Anywhere
+    credentials. Keys on the shared aws_identity event name plus
+    botocore's CredentialRetrievalError string so BOTH the boot-proof
+    path and a mid-run SDK acquisition failure alert. All four grug
+    services emit it; one monitor covers the fleet."""
+    return (
+        f'logs("service:(grug-api OR grug-webhook OR grug-consumer OR grug-poller) '
+        f'env:{env} (roles_anywhere_identity_failed OR CredentialRetrievalError)")'
+        '.index("*").rollup("count").last("15m") > 0'
+    )
+
+
 def poller_cronjob_unhealthy_query() -> str:
     """#379: grug-poller CronJob (every 15m) has not SUCCEEDED in >60m (4
     missed cycles) — it stopped reconciling reactions/stuck PRs silently."""
@@ -266,6 +279,30 @@ def create_all(
         tags=_common_tags(env, "grug-webhook"),
         notify_no_data=False,
         priority=3,
+        opts=opts,
+    )
+
+    # 3c) Roles Anywhere credential-acquisition failures (#389 AC): the
+    #     cert path is fleet-wide now; a broken chain/cert/trust surfaces
+    #     as roles_anywhere_identity_failed (boot proof) or botocore
+    #     CredentialRetrievalError (mid-run). Zero tolerance - one event
+    #     pages (single-operator scale, realistic pager).
+    credential_acquisition_fail = datadog.Monitor(
+        "grug-roles-anywhere-credential-fail",
+        type="log alert",
+        name="[grug] Roles Anywhere credential acquisition failing (15min)",
+        message=(
+            f"{notify_handle}\n"
+            "A grug workload cannot acquire (or prove) Roles Anywhere "
+            "credentials - broken cert chain, stuck renewal, wrong "
+            "identity, or Roles Anywhere outage. Pods fail loud at boot; "
+            "the poller fails per tick.\n"
+            "Runbook: docs/RUNBOOK.md#roles-anywhere-credential-path-grug-poller-tracer-388"
+        ),
+        query=credential_acquisition_failure_query(env),
+        tags=_common_tags(env, "grug"),
+        notify_no_data=False,
+        priority=2,
         opts=opts,
     )
 

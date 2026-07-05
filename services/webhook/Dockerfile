@@ -8,8 +8,7 @@
 # tag (#388, ADR-0008): the public binary distribution URLs are not
 # reliably fetchable, and a source build pins provenance to the aws/
 # rolesanywhere-credential-helper tag. Used by the POLLER's SDK
-# credential_process today (see k8s/grug-aws-config.yaml; every pod after
-# the #389 rollout); the api image does not carry it until #389.
+# credential_process on every workload since the #389 rollout.
 FROM golang:1.26-bookworm AS signing-helper
 ARG SIGNING_HELPER_VERSION=v1.8.4
 # CGO stays ON: the helper's pkcs11 support (miekg/pkcs11) is cgo-only

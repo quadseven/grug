@@ -215,21 +215,27 @@ crypto/, sast_benchmark/, spark_cave/) stay in their service tree.
 
 ## Roles Anywhere credential path (grug-poller tracer, #388)
 
-grug-poller runs on cert-derived short-lived AWS creds (ADR-0008): the
+EVERY grug workload (api, webhook, consumer, poller) runs on cert-derived
+short-lived AWS creds (ADR-0008; #388 tracer -> #389 rollout): the
 cert-manager Certificate `grug-pki` (CN=grug, 6h/renew-4h, Secret
-`grug-pki-tls`) + `aws_signing_helper` (baked into the webhook image) via
-SDK `credential_process` (`AWS_CONFIG_FILE=/etc/grug-aws/config`, ARNs
-seeded from SSM `/infra/roles-anywhere/...` at deploy). api/webhook/
-consumer stay on the static key (`grug-aws-static-key` Secret, split out
-of grug-secrets at #388; the #386 rotator now rotates THAT Secret) until
-the #389 rollout.
+`grug-pki-tls`) + `aws_signing_helper` (baked into BOTH images) via SDK
+`credential_process` (`AWS_CONFIG_FILE=/etc/grug-aws/config`, ARNs seeded
+from SSM `/infra/roles-anywhere/...` at deploy). Each service proves the
+identity at BOOT (`aws_identity.prove_roles_anywhere_identity` - asserts
+the ra-grug session, fails the pod loud) and the poller re-proves every
+15m tick. Failures page via the `grug-roles-anywhere-credential-fail`
+log monitor. During the #389 rollout window the `grug-aws-static-key`
+Secret stays live and rotator-maintained as the ROLLBACK RESERVE; the
+retirement PR deletes it + the #386 rotator + the static AccessKey.
 
-- **Rollback** (poller misbehaving on the cert path): add
-  `- secretRef: {name: grug-aws-static-key}` to the poller's envFrom
-  (restoring the pre-#388 static-cred behavior)
-  and drop the `AWS_CONFIG_FILE` env - env creds out-rank
-  credential_process, so this instantly reverts to the static key. Both
-  paths coexist until #389.
+- **Rollback** (any workload misbehaving on the cert path, valid until
+  the retirement PR deletes the reserve): add
+  `- secretRef: {name: grug-aws-static-key}` to that workload's envFrom
+  AND remove its `AWS_CONFIG_FILE` env (BOTH steps: the boot proof
+  refuses to run with env creds + RA config together). Env creds then
+  out-rank credential_process and the pod is instantly back on the
+  static key. Drill evidence (#389 AC): see the PR for the exercised
+  consumer rollback + re-cutover.
 - **"Untrusted certificate. Insufficient certificate"** from Roles
   Anywhere = the leaf lost the `digital signature` usage (the
   infrastructure#1318 gotcha). Check `kubectl -n grug get certificate

@@ -58,57 +58,11 @@ def _replay_missed_deliveries() -> dict[str, int | str]:
     }
 
 
-def _prove_roles_anywhere_identity() -> None:
-    """Fail-LOUD credential proof for the #388 tracer (audit stage-2
-    CRITICAL). Gated on AWS_CONFIG_FILE - the marker the poller manifest
-    sets for the Roles Anywhere credential_process path; local/test runs
-    without it skip entirely.
-
-    Two checks, both deliberately UNGUARDED (a failure crashes the Job,
-    which the existing KSM duration_since_last_successful monitor pages
-    on within the hour - the per-install best-effort contract does NOT
-    apply to process-global credentials):
-
-    1. Static env creds present alongside the RA config = the SDK chain
-       is silently bypassing the cert path (env creds out-rank
-       credential_process): a rotator patching the wrong Secret, a
-       manifest revert, or a seed regression. Refuse to run.
-    2. sts get-caller-identity - the positive proof. The logged ARN is a
-       Roles Anywhere session ARN on the cert path; this line runs every
-       15m tick, which also makes the poller the de facto expiry canary
-       for a silently-stuck Certificate renewal (a stale leaf dies here,
-       loudly, instead of inside the per-install swallow).
-    """
-    if not os.getenv("AWS_CONFIG_FILE"):
-        return
-    if os.getenv("AWS_ACCESS_KEY_ID"):
-        raise RuntimeError(
-            "static AWS creds present in the poller env - the Roles Anywhere "
-            "path is being bypassed (#388); see RUNBOOK 'Roles Anywhere'"
-        )
-    import boto3
-
-    ident = boto3.client("sts").get_caller_identity()
-    arn = ident.get("Arn", "")
-    # Assert the INTENDED identity, not merely a working one (peer review,
-    # confirmed 3x): a wrong-but-valid SSM ARN, a swapped profile, or any
-    # ambient credential source that wins the chain must FAIL here, not
-    # pass observationally. GRUG_RA_ROLE_ARN is sed-pinned at deploy from
-    # the same SSM value the ConfigMap uses.
-    expected_role_arn = os.getenv("GRUG_RA_ROLE_ARN", "")
-    if expected_role_arn:
-        account = expected_role_arn.split(":")[4]
-        role_name = expected_role_arn.rsplit("/", 1)[-1]
-        expected_prefix = f"arn:aws:sts::{account}:assumed-role/{role_name}/"
-        if not arn.startswith(expected_prefix):
-            raise RuntimeError(
-                f"wrong AWS identity on the Roles Anywhere path: got {arn!r}, "
-                f"expected an assumed-role session of {role_name!r} (#388)"
-            )
-    log.info(
-        "roles_anywhere_identity_proven",
-        extra={"assumed_arn": arn, "identity_asserted": bool(expected_role_arn)},
-    )
+# Moved to services/_shared/aws_identity.py at #389 (fleet-wide rollout).
+# Re-exported under the historical name: it is a live patch target in the
+# test suite, and handler() resolves it through THIS module's namespace so
+# monkeypatch.setattr(poller_handler, ...) keeps working.
+from aws_identity import prove_roles_anywhere_identity as _prove_roles_anywhere_identity  # noqa: E402
 
 
 def handler(event: dict[str, Any], context: Any) -> dict[str, int | str]:
