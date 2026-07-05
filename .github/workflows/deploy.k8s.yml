@@ -143,8 +143,13 @@ jobs:
           CATEGORY: ${{ steps.promo.outputs.category }}
           REASON: ${{ steps.promo.outputs.reason }}
         run: |
-          # env-var indirection, never ${{ }} inside the script body - the
-          # reason string is data, not code (audit stage-8 injection sink).
+          # env-var indirection - the reason string is data, not code
+          # (audit stage-8 injection sink), so it must never reach this
+          # script via expression interpolation. (And a dollar-brace
+          # expression literal must never appear in a run block AT ALL,
+          # even in a comment - GitHub evaluates it anywhere in the
+          # string; the first version of this very comment parse-failed
+          # the whole workflow.)
           echo "rebuild (${CATEGORY:-unknown}): ${REASON:-resolve step failed}" >> "$GITHUB_STEP_SUMMARY"
           if [ "${CATEGORY}" = "artifact-missing" ]; then
             echo "::warning::promotion EXPECTED but pr artifact absent - check the gate's push / CI_* seeding (silent promotion death otherwise)"
