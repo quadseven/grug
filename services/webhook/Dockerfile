@@ -37,10 +37,9 @@ COPY webhook/requirements.txt .
 # library dependency of the app code, only of this runtime image).
 RUN pip install --no-cache-dir -r requirements.txt "uvicorn>=0.34,<1"
 
+COPY --from=signing-helper /aws_signing_helper /usr/local/bin/aws_signing_helper
 COPY _shared/ ./_shared/
 COPY webhook/ ./
-
-COPY --from=signing-helper /aws_signing_helper /usr/local/bin/aws_signing_helper
 
 RUN useradd --uid 10001 --no-create-home grug
 USER 10001

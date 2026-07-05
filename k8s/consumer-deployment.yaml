@@ -49,9 +49,8 @@ spec:
           command: ["ddtrace-run", "python", "consumer.py"]
           envFrom:
             - secretRef: {name: grug-secrets}
-            # Static AWS key pair, split out of grug-secrets at #388 so the
-            # poller (Roles Anywhere tracer) can omit it. This workload keeps
-            # it until the #389 rollout retires the static key entirely.
+            # Static AWS key pair (#388 split; #389 retires) - rationale in
+            # poller-cronjob.yaml + deploy.k8s.yml.
             - secretRef: {name: grug-aws-static-key}
           env:
             - {name: DD_SERVICE, value: grug-consumer}

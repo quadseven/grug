@@ -32,6 +32,10 @@ def _pod_spec(doc: dict) -> dict:
     return tpl["spec"]
 
 
+def _secret_env_from(container: dict) -> list[str]:
+    return [e["secretRef"]["name"] for e in container.get("envFrom", []) if "secretRef" in e]
+
+
 def test_certificate_pins_the_verified_usages_and_issuer():
     (cert,) = _load("pki-certificate.yaml")
     spec = cert["spec"]
@@ -52,11 +56,10 @@ def test_aws_config_credential_process_shape():
     (cm,) = _load("grug-aws-config.yaml")
     config = cm["data"]["config"]
     line = next(l for l in config.splitlines() if l.startswith("credential_process"))
+    # Path flags are pinned by the cross-derived test; this one uniquely
+    # pins the helper invocation + the ARN flag/placeholder pairings.
     for required in (
         "aws_signing_helper credential-process",
-        "--certificate /var/run/grug-pki/tls.crt",
-        "--private-key /var/run/grug-pki/tls.key",
-        "--intermediates /var/run/grug-pki/ca.crt",
         "--trust-anchor-arn RA_TRUST_ANCHOR_ARN_PLACEHOLDER",
         "--profile-arn RA_PROFILE_ARN_PLACEHOLDER",
         "--role-arn RA_ROLE_ARN_PLACEHOLDER",
@@ -69,22 +72,19 @@ def test_poller_rides_roles_anywhere_not_the_static_key():
     pod = _pod_spec(cron)
     (container,) = pod["containers"]
 
-    env_from = [e["secretRef"]["name"] for e in container.get("envFrom", []) if "secretRef" in e]
+    env_from = _secret_env_from(container)
     assert "grug-secrets" in env_from
     assert "grug-aws-static-key" not in env_from, (
         "poller must NOT get the static key - env creds out-rank credential_process"
     )
     env = {e["name"]: e.get("value") for e in container.get("env", [])}
+    # The single ABSOLUTE path anchor; every other path is derived from it
+    # (or from a manifest counterpart) in the cross-derivation test.
     assert env.get("AWS_CONFIG_FILE") == "/etc/grug-aws/config"
     assert "AWS_ACCESS_KEY_ID" not in env and "AWS_SECRET_ACCESS_KEY" not in env
 
     mounts = {m["name"]: m for m in container["volumeMounts"]}
-    assert mounts["grug-pki"]["mountPath"] == "/var/run/grug-pki"
     assert mounts["grug-pki"].get("readOnly") is True
-    assert mounts["aws-config"]["mountPath"] == "/etc/grug-aws"
-    vols = {v["name"]: v for v in pod["volumes"]}
-    assert vols["grug-pki"]["secret"]["secretName"] == "grug-pki-tls"
-    assert vols["aws-config"]["configMap"]["name"] == "grug-aws-config"
 
 
 def test_static_key_consumers_are_exactly_the_non_tracer_workloads():
@@ -94,8 +94,9 @@ def test_static_key_consumers_are_exactly_the_non_tracer_workloads():
     for manifest in ("api-deployment.yaml", "consumer-deployment.yaml", "webhook-deployment.yaml"):
         (dep,) = [d for d in _load(manifest) if d["kind"] == "Deployment"]
         (container,) = _pod_spec(dep)["containers"]
-        env_from = [e["secretRef"]["name"] for e in container.get("envFrom", []) if "secretRef" in e]
-        assert "grug-aws-static-key" in env_from, f"{manifest} lost the static key pre-#389"
+        assert "grug-aws-static-key" in _secret_env_from(container), (
+            f"{manifest} lost the static key pre-#389"
+        )
 
     (rotator,) = [d for d in _load("key-rotator-cronjob.yaml") if d["kind"] == "CronJob"]
     (rc,) = _pod_spec(rotator)["containers"]
@@ -177,8 +178,7 @@ def test_rotator_covers_exactly_the_static_key_consumers():
             if doc["kind"] not in ("Deployment", "CronJob"):
                 continue
             (c,) = _pod_spec(doc)["containers"]
-            names = [e["secretRef"]["name"] for e in c.get("envFrom", []) if "secretRef" in e]
-            if "grug-aws-static-key" in names:
+            if "grug-aws-static-key" in _secret_env_from(c):
                 carriers.add(doc["metadata"]["name"])
     (rotator,) = [d for d in _load("key-rotator-cronjob.yaml") if d["kind"] == "CronJob"]
     (rc,) = _pod_spec(rotator)["containers"]

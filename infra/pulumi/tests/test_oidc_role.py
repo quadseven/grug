@@ -80,7 +80,7 @@ def test_deploy_role_ssm_scope_is_exactly_the_pinned_set():
         # ONE statement by design: a split-statement refactor must be a
         # conscious test edit, not a silent second allowlist.
         assert len(ssm_statements) == 1, f"expected 1 ssm statement, got {len(ssm_statements)}"
-        scoped = set().union(*ssm_statements)
+        (scoped,) = ssm_statements
         assert "*" not in scoped, "wildcard SSM resource defeats the allowlist"
         assert scoped == EXPECTED_SSM_READ_PATHS, (
             f"deploy-role SSM scope drifted.\n  extra: {scoped - EXPECTED_SSM_READ_PATHS}"
