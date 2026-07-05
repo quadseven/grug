@@ -41,6 +41,26 @@ def dispatch_pull_request(ctx: PullRequestContext) -> dict[str, str]:
             head_sha=ctx.head_sha,
             pr_number=ctx.pr_number,
         )
+        # Ticket-compliance advisory (#529): best-effort, AFTER the DoR
+        # verdict is published, in its own token+error boundary so a
+        # compliance hiccup never affects the DoR result or the personas
+        # dispatched after Chief. Advisory only - posts a comment, no gate.
+        try:
+            from github_app_auth import with_install_token_retry  # type: ignore
+            from personas.tpm.ticket_compliance_run import run_ticket_compliance  # type: ignore
+            result = with_install_token_retry(
+                ctx.installation_id,
+                lambda token: run_ticket_compliance(
+                    token, owner=ctx.owner, repo=ctx.repo_name,
+                    pr_number=ctx.pr_number, pr_body=ctx.pr_body,
+                ),
+            )
+            log.info("tpm_ticket_compliance", extra={"pr_number": ctx.pr_number, "result": result})
+        except Exception as e:  # noqa: BLE001 - advisory must never break the verdict
+            log.warning(
+                "tpm_ticket_compliance_failed",
+                extra={"pr_number": ctx.pr_number, "kind": type(e).__name__},
+            )
         return {
             "persona": "tpm",
             "result": "pass" if evaluation.passed else "fail",
