@@ -636,12 +636,14 @@ jobs:
           else
             echo "ROLLBACK INCOMPLETE: one or more secrets could not be verified/restored - review manually" >> "$GITHUB_STEP_SUMMARY"
           fi
-          # Restore the PREVIOUS release's rendered manifests when a
-          # bundle exists (codex r13): covers Deployment/Service/ConfigMap
-          # spec regressions, with the digests + RA config of the previous
-          # verified release baked in. Bootstrap fallback (no bundle yet):
-          # the image/env re-pins below still restore the containers.
-          BUNDLE=$(kubectl -n grug get configmap grug-release-manifests -o jsonpath='{.data.previous}' 2>/dev/null || echo "")
+          # AUTO-rollback restores the release that was RUNNING when this
+          # failed deploy started = generation 'current' (codex r14). It
+          # pairs with grug-last-good, also captured pre-mutation from the
+          # same running release, so manifests + image pins are the SAME
+          # verified generation - never a hybrid. (Manual rollback reads
+          # 'previous' instead: its job is to leave the running release.)
+          # Bootstrap fallback (no bundle yet): image/env re-pins only.
+          BUNDLE=$(kubectl -n grug get configmap grug-release-manifests -o jsonpath='{.data.current}' 2>/dev/null || echo "")
           if [ -n "$BUNDLE" ]; then
             mkdir -p "$RUNNER_TEMP/rollback-manifests"
             printf '%s' "$BUNDLE" | base64 -d | tar xzf - -C "$RUNNER_TEMP/rollback-manifests"

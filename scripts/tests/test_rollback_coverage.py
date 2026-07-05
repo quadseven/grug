@@ -169,8 +169,15 @@ def test_release_bundle_generations_structure():
     i_rollback = text.index("Auto-rollback to last-good")
     assert i_synth < i_bundle < i_rollback
     assert "steps.synthetic.outcome == 'success'" in text[i_bundle:i_rollback]
-    for wf in ("deploy.k8s.yml", "deploy.rollback.yml"):
-        t = (_ROOT / ".github" / "workflows" / wf).read_text()
-        i_prev = t.index("{.data.previous}")
-        i_pin = t.index("set image deploy/grug-webhook")
-        assert i_prev < i_pin, f"{wf}: bundle must apply before image re-pins"
+    # AUTO-rollback (deploy.k8s) restores the RUNNING verified release =
+    # 'current' (pairs with the pre-mutation grug-last-good images = same
+    # generation, no hybrid); MANUAL rollback (deploy.rollback) leaves the
+    # running release, so it restores 'previous' (codex r14).
+    auto = (_ROOT / ".github" / "workflows" / "deploy.k8s.yml").read_text()
+    i_gen = auto.index("{.data.current}", auto.index("Auto-rollback to last-good"))
+    i_pin = auto.index("set image deploy/grug-webhook", auto.index("Auto-rollback to last-good"))
+    assert i_gen < i_pin, "auto-rollback: bundle must apply before image re-pins"
+    manual = (_ROOT / ".github" / "workflows" / "deploy.rollback.yml").read_text()
+    i_prev = manual.index("{.data.previous}")
+    i_pin_m = manual.index("set image deploy/grug-webhook")
+    assert i_prev < i_pin_m, "manual rollback: bundle must apply before image re-pins"
