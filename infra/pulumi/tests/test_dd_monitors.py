@@ -16,6 +16,7 @@ from __future__ import annotations
 import pulumi
 
 from components.dd_monitors import (
+    credential_acquisition_failure_query,
     all_ksm_monitor_queries,
     crashloop_query,
     poller_cronjob_unhealthy_query,
@@ -129,8 +130,6 @@ def test_continuous_ksm_monitors_page_on_no_data():
 def test_credential_acquisition_query_covers_fleet_and_both_signals() -> None:
     """#389: the one monitor must see every workload AND both failure
     shapes (boot-proof event + botocore's mid-run error class)."""
-    from components.dd_monitors import credential_acquisition_failure_query
-
     q = credential_acquisition_failure_query("prod")
     # Wildcard on purpose: a 5th grug service (or the rotator's own cred
     # failure) must be covered without editing the monitor.

@@ -7,7 +7,7 @@
 # Build the AWS Roles Anywhere credential helper from source at a PINNED
 # tag (#388, ADR-0008): the public binary distribution URLs are not
 # reliably fetchable, and a source build pins provenance to the aws/
-# rolesanywhere-credential-helper tag. Used by the POLLER's SDK
+# rolesanywhere-credential-helper tag. Used by the SDK
 # credential_process on every workload since the #389 rollout.
 FROM golang:1.26-bookworm AS signing-helper
 ARG SIGNING_HELPER_VERSION=v1.8.4
@@ -41,10 +41,9 @@ COPY api/requirements.txt .
 # library dependency of the app code, only of this runtime image).
 RUN pip install --no-cache-dir -r requirements.txt "uvicorn>=0.34,<1"
 
+COPY --from=signing-helper /aws_signing_helper /usr/local/bin/aws_signing_helper
 COPY _shared/ ./_shared/
 COPY api/ ./
-
-COPY --from=signing-helper /aws_signing_helper /usr/local/bin/aws_signing_helper
 
 RUN useradd --uid 10001 --no-create-home grug
 USER 10001

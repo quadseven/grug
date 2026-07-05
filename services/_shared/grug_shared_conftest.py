@@ -6,7 +6,17 @@
 
 from __future__ import annotations
 
+import os
+
 import pytest
+
+# Import-time hermeticity (#389 audit): each service's main.py runs the
+# Roles Anywhere boot proof AT IMPORT, i.e. at pytest collection - before
+# any fixture executes. Only conftest-import-time code can protect that
+# call site from a dev shell exporting AWS_CONFIG_FILE. Lives here (not
+# in the per-service shims) so a future service gets it for free; the
+# proof tests setenv explicitly and are unaffected.
+os.environ.pop("AWS_CONFIG_FILE", None)
 
 
 @pytest.fixture(autouse=True)

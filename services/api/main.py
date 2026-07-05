@@ -32,10 +32,8 @@ log = logging.getLogger("grug.api")
 _BUILD_SHA = os.getenv("GRUG_BUILD_SHA", "unknown")
 _STARTED_AT = datetime.now(timezone.utc)
 
-# Roles Anywhere boot proof (#389): gated on AWS_CONFIG_FILE (unset in
-# tests/image smoke), UNGUARDED on purpose - a broken credential path
-# must fail the pod BEFORE it serves, so the deploy rollout gate (and,
-# steady-state, CrashLoopBackOff -> KSM monitors) catch it loudly.
+# Roles Anywhere boot proof (#389): import-time + UNGUARDED on purpose -
+# rationale in the aws_identity module docstring.
 prove_roles_anywhere_identity()
 
 app = FastAPI(

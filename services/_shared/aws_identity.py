@@ -36,9 +36,7 @@ def prove_roles_anywhere_identity() -> None:
        observationally - peer review on #388, confirmed 3x).
     """
     if not os.getenv("AWS_CONFIG_FILE"):
-        # Tests/image-smoke land here by design. In PROD this means the
-        # manifest lost its RA env - greppable, though the real page
-        # comes from the credential monitor when calls start failing.
+        # Greppable absence marker (module docstring has the gating story).
         log.info("roles_anywhere_identity_skipped")
         return
     try:
@@ -62,8 +60,7 @@ def prove_roles_anywhere_identity() -> None:
                     f"expected an assumed-role session of {role_name!r} (#388)"
                 )
     except Exception as e:
-        # The monitorable event FIRST (the #389 credential-acquisition
-        # monitor keys on this name), then fail loud.
+        # Monitorable event FIRST, then fail loud (see module docstring).
         log.error(
             "roles_anywhere_identity_failed",
             extra={"kind": type(e).__name__},
