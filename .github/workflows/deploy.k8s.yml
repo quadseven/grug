@@ -146,12 +146,10 @@ jobs:
           # authorizing those reads, the database URL, and two
           # deploy-resolved values that must not be committed as
           # literals (the queue URL embeds the account id).
-          # #388 SPLIT: the static AWS key pair lives in its OWN Secret
-          # (grug-aws-static-key) so the poller - the Roles Anywhere tracer
-          # workload - can receive grug-secrets WITHOUT env credentials
-          # (env creds out-rank credential_process in the SDK chain and
-          # would silently bypass the cert path). api/webhook/consumer
-          # keep envFrom BOTH until the #389 rollout retires the key.
+          # grug-secrets is APP CONFIG ONLY (#389: the static-key world is
+          # retired). The AWS_* leak guard below stays load-bearing: env
+          # creds would out-rank credential_process in the SDK chain and
+          # silently bypass the Roles Anywhere path every pod boot-proves.
           ENVF="$RUNNER_TEMP/grug-secrets.env"
           install -m 600 /dev/null "$ENVF"
           {
@@ -162,8 +160,8 @@ jobs:
             # call time). The Lambda env had it; the k8s secret-seed missed
             # it, so the dashboard OAuth callback 500'd on first sign-in.
             # Sourced from SSM (the ARN carries the account id - keep it out
-            # of the repo). The grug k8s-pod IAM user already holds the KMS
-            # grant on this CMK (#354).
+            # of the repo). The KMS grant lives on the ra-grug tenant role's
+            # inline policy (infrastructure repo) since #389.
             echo "GRUG_KMS_CMK_ARN=$(get /grug/kms-cmk-arn)"
             echo "GRUG_CAVE_JOBS_QUEUE_URL=$(aws sqs get-queue-url --queue-name grug-cave-jobs.fifo --query QueueUrl --output text)"
             echo "GRUG_RERUN_QUEUE_URL=$(aws sqs get-queue-url --queue-name grug-rerun-jobs.fifo --query QueueUrl --output text)"

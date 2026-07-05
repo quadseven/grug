@@ -226,15 +226,33 @@ def test_static_key_apparatus_is_fully_retired():
     """#389 retirement: no manifest, workflow, or component may reference
     the static-key world again. A single surviving reference is either a
     resurrection (drift) or a missed retirement site."""
-    forbidden = ("grug-aws-static-key", "grug-rotator-secret", "key-rotator", "k8s-pod-aws")
+    forbidden = (
+        "grug-aws-static-key", "grug-rotator-secret",
+        "key-rotator", "key_rotator",  # BOTH forms - the underscore one slipped this guard once
+        "k8s-pod-aws",
+    )
     offenders = []
-    roots = [K8S, K8S.parent.parent / ".github" / "workflows"]
+    workflows = K8S.parent / ".github" / "workflows"
+    # Guard the guard: a wrong path here silently yields zero files and
+    # the workflow leg of the scan goes dead (it DID - audit #506-A).
+    assert workflows.is_dir(), workflows
+    roots = [K8S, workflows]
     for root in roots:
         for f in sorted(root.glob("*.y*ml")):
             text = f.read_text()
             for needle in forbidden:
                 if needle in text:
                     offenders.append(f"{f.name}: {needle}")
-    # The deploy's one-time CLEANUP deletes are the sanctioned exception.
-    offenders = [o for o in offenders if not o.startswith("deploy.k8s.yml")]
+    # ONLY the sanctioned one-time cleanup deletes are exempt - a whole-
+    # file exemption would let a re-added seed block sail through.
+    deploy_text = (workflows / "deploy.k8s.yml").read_text()
+    sanctioned = {
+        line.strip() for line in deploy_text.splitlines() if "--ignore-not-found" in line
+    }
+    def _sanctioned(offender: str) -> bool:
+        if not offender.startswith("deploy.k8s.yml"):
+            return False
+        needle = offender.split(": ", 1)[1]
+        return any(needle in line for line in sanctioned)
+    offenders = [o for o in offenders if not _sanctioned(o)]
     assert not offenders, f"static-key world referenced post-retirement: {offenders}"

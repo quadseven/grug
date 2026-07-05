@@ -40,6 +40,11 @@ ENV PYTHONPATH=/app/_shared
 WORKDIR /app
 
 ARG SERVICE
+# Fail LOUD on a missing build-arg: an unset SERVICE degrades COPY to
+# context-root paths - today that errors by accident; the day a root
+# requirements.txt exists it becomes a silent whole-context image that
+# CrashLoops at uvicorn (audit #506-A).
+RUN test -n "$SERVICE" || { echo "SERVICE build-arg required (api|webhook)" >&2; exit 1; }
 COPY ${SERVICE}/requirements.txt .
 # uvicorn is the k8s server - kept out of requirements.txt (it is not a
 # library dependency of the app code, only of this runtime image).
