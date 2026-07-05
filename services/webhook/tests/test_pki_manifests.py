@@ -236,23 +236,17 @@ def test_static_key_apparatus_is_fully_retired():
     # Guard the guard: a wrong path here silently yields zero files and
     # the workflow leg of the scan goes dead (it DID - audit #506-A).
     assert workflows.is_dir(), workflows
-    roots = [K8S, workflows]
-    for root in roots:
+    # LINE-based scan with LINE-based exemption (audit #506-B: a needle-
+    # level exemption masked every same-needle line in the file - a
+    # re-added seed block would have sailed through). Only the sanctioned
+    # one-time --ignore-not-found cleanup lines are exempt (#507 removes
+    # them + this exemption together).
+    for root in (K8S, workflows):
         for f in sorted(root.glob("*.y*ml")):
-            text = f.read_text()
-            for needle in forbidden:
-                if needle in text:
-                    offenders.append(f"{f.name}: {needle}")
-    # ONLY the sanctioned one-time cleanup deletes are exempt - a whole-
-    # file exemption would let a re-added seed block sail through.
-    deploy_text = (workflows / "deploy.k8s.yml").read_text()
-    sanctioned = {
-        line.strip() for line in deploy_text.splitlines() if "--ignore-not-found" in line
-    }
-    def _sanctioned(offender: str) -> bool:
-        if not offender.startswith("deploy.k8s.yml"):
-            return False
-        needle = offender.split(": ", 1)[1]
-        return any(needle in line for line in sanctioned)
-    offenders = [o for o in offenders if not _sanctioned(o)]
+            for lineno, line in enumerate(f.read_text().splitlines(), 1):
+                if f.name == "deploy.k8s.yml" and "--ignore-not-found" in line:
+                    continue
+                for needle in forbidden:
+                    if needle in line:
+                        offenders.append(f"{f.name}:{lineno}: {needle}")
     assert not offenders, f"static-key world referenced post-retirement: {offenders}"

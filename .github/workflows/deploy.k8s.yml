@@ -169,20 +169,20 @@ jobs:
             echo "GRUG_CAVE_DIFF_BUCKET=$(aws s3api list-buckets --query 'Buckets[?starts_with(Name, `grug-cave-diffs`)].Name | [0]' --output text)"
           } > "$ENVF"
           # #388 split guard (grug-secrets ONLY, so not in seed()): the
-          # static key pair must NEVER re-enter this Secret - the poller
+          # static creds must NEVER enter this Secret - every workload
           # envFroms it, and env creds silently out-rank credential_process,
-          # un-proving the Roles Anywhere tracer while everything stays
-          # green (audit stage-1 HIGH; runtime twin lives in
-          # services/_shared/aws_identity.prove_roles_anywhere_identity).
+          # bypassing the Roles Anywhere path each pod boot-proves (runtime
+          # twin: services/_shared/aws_identity.prove_roles_anywhere_identity).
           if grep -qE '^AWS_(ACCESS_KEY_ID|SECRET_ACCESS_KEY)=' "$ENVF"; then
-            echo "::error::static key pair leaked back into grug-secrets (belongs in grug-aws-static-key, #388)"
+            echo "::error::static AWS creds must never enter grug-secrets - the fleet is Roles Anywhere-only (#389)"
             exit 1
           fi
           seed grug-secrets "$ENVF"
           # #389 RETIREMENT: the static key, its reserve Secret, the #386
           # rotator (CronJob + Secret + IAM user), and the SSM key params
           # are GONE - the fleet authenticates via Roles Anywhere only.
-          # One-time live cleanup (idempotent; removable once observed):
+          # One-time live cleanup (idempotent; #507 removes these lines +
+          # the completeness-test exemption after the first observed run):
           kubectl -n grug delete secret grug-aws-static-key grug-rotator-secret --ignore-not-found
           kubectl -n grug delete cronjob grug-key-rotator --ignore-not-found
           kubectl -n grug create secret docker-registry registry-pull \

@@ -5,8 +5,9 @@
 # `serviceAccountName` on the created pod is an escalation primitive - the
 # creator can launch a Job whose pod mounts ANY ServiceAccount token in that
 # namespace. If Trial Jobs were created in the `grug` namespace, a compromised
-# webhook pod could create a Job borrowing `a privileged grug-namespace SA (e.g. the retired rotator's)` (which can patch
-# the `grug-secrets` AWS credential). Running Trials in THIS namespace - which
+# webhook pod could create a Job borrowing any privileged grug-namespace
+# ServiceAccount (the retired #386 rotator's SA, which could patch the pod
+# credential Secret, was the concrete instance). Running Trials in THIS namespace - which
 # holds NO privileged ServiceAccount (only the permissionless `default` SA) and
 # NO secret that grants access to grug-secrets (only the EPHEMERAL per-Trial
 # contents:read token, reaped after prep, plus the read-only `registry-pull`

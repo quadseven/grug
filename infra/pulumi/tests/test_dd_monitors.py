@@ -131,13 +131,13 @@ def test_credential_acquisition_query_covers_fleet_and_both_signals() -> None:
     """#389: the one monitor must see every workload AND both failure
     shapes (boot-proof event + botocore's mid-run error class)."""
     q = credential_acquisition_failure_query("prod")
-    # Wildcard on purpose: a 5th grug service (or the rotator's own cred
-    # failure) must be covered without editing the monitor.
+    # Wildcard on purpose: any future grug service must be covered
+    # without editing the monitor.
     assert "service:grug-*" in q
     assert "roles_anywhere_identity_failed" in q
     assert "CredentialRetrievalError" in q
-    # Mid-run non-retrieval classes (rolled-back pod on a deleted key,
-    # mangled profile) must page too - audit #389 stage 2.
+    # Mid-run non-retrieval classes (a pod flipped to env creds during
+    # revert-recovery, mangled profile) must page too - audit #389 stage 2.
     assert "NoCredentialsError" in q and "InvalidClientTokenId" in q
     assert 'rollup("count")' in q and "> 0" in q
     assert "env:prod" in q

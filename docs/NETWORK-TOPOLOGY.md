@@ -40,16 +40,14 @@ Two planes now: a **Kubernetes namespace** (`grug`) holding every runtime worklo
 | `grug-webhook` | Deployment (1 replica) | same shape; `GRUG_K8S_RUNTIME=1` | GitHub webhook receiver. ACKs in <10s and offloads the Elder review to an in-process background thread (#368) |
 | `grug-consumer` | Deployment (1 replica, Recreate) | no HTTP surface; `command: consumer.py` | Long-polls the SQS FIFO queues (`grug-rerun-jobs`, `grug-cave-results`) and runs Elder re-runs (#368). One replica by design — batch-size-1 FIFO, a second would interleave message groups |
 | `grug-poller` | CronJob (`*/15`) | `poller_handler.handler` | Reaction poller (was an EventBridge-scheduled Lambda) |
-| `grug-key-rotator` | CronJob (`0 */12`) | `key_rotator` module | Interim AWS key-rotator (#386): mints a new `grug-k8s-pod` access key, patches `grug-secrets`, rolls the three Deployments, deletes the old key. The **only** workload with k8s API access (RBAC-scoped to one Secret + three Deployments) |
 
-All workloads run the **same image** (the webhook image carries the full dependency graph); only `command`/env differ. Shared hardening: `runAsNonRoot` (uid 10001), `readOnlyRootFilesystem`, `drop: [ALL]`, `automountServiceAccountToken:false` (except the rotator), arm64 `nodeSelector`, `imagePullSecrets: registry-pull`.
+One Dockerfile (`services/Dockerfile`, ARG SERVICE) builds two images: api runs its own, the rest share the webhook image (full dependency graph); only `command`/env differ. Shared hardening: `runAsNonRoot` (uid 10001), `readOnlyRootFilesystem`, `drop: [ALL]`, `automountServiceAccountToken:false` (the Smasher launcher SA is the exception, #469), arm64 `nodeSelector`, `imagePullSecrets: registry-pull`. Since #389 every workload derives AWS creds from its Roles Anywhere certificate (cert-manager leaf + aws_signing_helper credential_process).
 
 In-cluster Secrets (seeded by the deploy workflow from SSM/SQS/S3 — never committed):
 
 | Secret | Holds | Consumed by |
 |---|---|---|
 | `grug-secrets` | `grug-k8s-pod` AWS credential, `GRUG_DATABASE_URL`, `GRUG_KMS_CMK_ARN`, the three `*_QUEUE_URL`s, `GRUG_CAVE_DIFF_BUCKET` | api / webhook / consumer / poller (`envFrom`) |
-| `grug-rotator-secret` | `grug-k8s-rotator` AWS credential (scoped to access-key ops on `grug-k8s-pod`) | key-rotator only |
 | `registry-pull` | in-cluster registry pull credential | all pods (`imagePullSecrets`) |
 
 The pods do **not** carry app secrets (App key, OAuth secrets, LLM keys, CF shared secret): those are read from SSM **at runtime** via the `*_SSM` path env vars (`secrets_loader`), using the AWS credential in `grug-secrets`. The pod secret carries only the AWS credential authorizing those reads plus deploy-resolved values that must not be committed (the queue URLs and CMK ARN embed the account id).
@@ -58,13 +56,13 @@ The pods do **not** carry app secrets (App key, OAuth secrets, LLM keys, CF shar
 
 | Resource | Name | Notes |
 |---|---|---|
-| SSM `/grug/*` | App ID, private key, webhook secret, OAuth client id+secret, session-signing secret, CF shared secret, KMS CMK ARN, database URL, k8s-pod + rotator AWS keys, DD RUM app id+token, prompt-experiment + fallback flags | SecureStrings; some Pulumi-managed (RUM ids), most hand-seeded (HITL prereqs) |
+| SSM `/grug/*` | App ID, private key, webhook secret, OAuth client id+secret, session-signing secret, CF shared secret, KMS CMK ARN, database URL, DD RUM app id+token, prompt-experiment + fallback flags | SecureStrings; some Pulumi-managed (RUM ids), most hand-seeded (HITL prereqs) |
 | SSM `/infra/llm/*` | `openrouter_api_key`, `poolside_api_key` | Elder LLM backends (shared infra namespace) |
 | SQS FIFO | `grug-rerun-jobs.fifo`, `grug-cave-results.fifo`, `grug-cave-jobs.fifo` (+ DLQs) | Consumed by `grug-consumer`; redrive → DLQ at `maxReceiveCount` |
 | KMS CMK | `grug-tokens` | Envelope-encrypts user OAuth/credential blobs (`crypto/kms_envelope`). `grug-api` holds `kms:Decrypt`; webhook uses the GitHub App JWT instead |
 | S3 | `grug-cave-diffs*` | Cave (self-hosted LLM) diff hand-off bucket |
 | DynamoDB | `grug-main` | **Legacy — NOT the store.** Exists in Pulumi state; the store is Postgres `grug_kv`. Removal is a separate decision |
-| IAM | `grug-gha-deploy` (OIDC), `grug-k8s-pod`, `grug-k8s-rotator` users | Deploy role reads `/grug/*` for the secret seed; pod user is the runtime principal; rotator user rotates the pod key |
+| IAM | `grug-gha-deploy` (OIDC role) + the `ra-grug` Roles Anywhere tenant role (infrastructure repo) | Deploy role reads `/grug/*` + the RA ARNs for the seed; pods assume `ra-grug` via X.509 (#389 - no IAM users remain) |
 
 ### B.3 Postgres (CNPG — private infra)
 
@@ -231,7 +229,7 @@ sequenceDiagram
         K8S->>OIDC: assume grug-gha-deploy (read /grug/* for seed)
         K8S->>Reg: docker build --arch arm64 + push grug-{api,webhook}, capture @sha256 digest
         K8S->>TS: join tailnet (tag:ci ephemeral authkey)
-        K8S->>K: seed grug-secrets / grug-rotator-secret / registry-pull from SSM+SQS+S3
+        K8S->>K: seed grug-secrets / registry-pull (SSM+SQS+S3 lookups + registry creds)
         K8S->>K: sed-pin REGISTRY/TAG placeholders -> digest, kubectl apply -k, rollout status, poller smoke job
     and frontend (CF Pages)
         Web->>OIDC: assume grug-gha-deploy (read CF + RUM ids from SSM)
@@ -249,11 +247,11 @@ sequenceDiagram
 |---|---|---|---|
 | **Public → CF** | Internet | Cloudflare edge | TLS termination + WAF / bot mgmt at CF tier |
 | **CF → cluster** | CF Worker + tunnel | k8s Service `:8080` | The `*-host-rewrite` Worker injects `X-Grug-CF-Secret` (from its `GRUG_CF_SECRET` binding) and rewrites `Host` to the in-cluster upstream; a `cloudflared` tunnel transports it to the Service (the only inbound path — NetworkPolicy denies the rest). `services/{api,webhook}/cf_auth.py` validates the header via `hmac.compare_digest` on every non-`/livez` request — a request that bypasses the Worker has no valid header and gets 401. Secret in SSM `/grug/cf-shared-secret`; DD monitor on mismatch spikes |
-| **Pod → AWS** | k8s Secret (plaintext to the process) | SSM / SQS / KMS / S3 | The `grug-k8s-pod` IAM credential in `grug-secrets`, rotated every 12h by the key-rotator CronJob. Pod reads app secrets from SSM at runtime (not baked into the image) |
+| **Pod → AWS** | X.509 leaf (cert-manager Secret `grug-pki-tls`) | SSM / SQS / KMS / S3 | Roles Anywhere: 6h cert -> aws_signing_helper -> ~1h STS session as `ra-grug` (#389; no long-lived credential exists). Pod reads app secrets from SSM at runtime (not baked into the image) |
 | **api pod → user OAuth tokens** | Postgres encrypted blob | plaintext access/refresh token | KMS envelope decrypt (`grug-tokens` CMK). Only the api path holds `kms:Decrypt`; the webhook uses the GitHub App JWT |
 | **Webhook payload** | GitHub | grug-webhook handler | HMAC-SHA256 verify against `/grug/github-app-webhook-secret`; 401 on mismatch |
-| **Namespace segmentation** | other tenants on the shared cluster | grug pods | NetworkPolicy: `default-deny-ingress` + `allow-http-ingress` (TCP 8080 to api/webhook only; consumer/poller/rotator stay sealed) + `allow-egress-scoped` (DNS 53, HTTPS 443, Postgres 5432, DD agent 8125/8126). **Only enforced if the cluster CNI is policy-capable** (e.g. Calico); harmless-but-inert otherwise |
-| **k8s API access** | every other grug pod (none) | key-rotator pod only | RBAC Role scoped to `get/patch` on the single `grug-secrets` Secret + the three named Deployments; `automountServiceAccountToken:true` on that one Job pod, false everywhere else |
+| **Namespace segmentation** | other tenants on the shared cluster | grug pods | NetworkPolicy: `default-deny-ingress` + `allow-http-ingress` (TCP 8080 to api/webhook only; consumer/poller stay sealed) + `allow-egress-scoped` (DNS 53, HTTPS 443, Postgres 5432, DD agent 8125/8126). **Only enforced if the cluster CNI is policy-capable** (e.g. Calico); harmless-but-inert otherwise |
+| **k8s API access** | every other grug pod (none) | webhook/consumer via the Smasher launcher SA only (#469; perms live in the grug-trial namespace) | `automountServiceAccountToken:false` everywhere else |
 | **User session** | Browser cookie | api handlers | Cookie issued by `/api/v1/auth/github/callback`, HMAC-signed with `/grug/session-signing-secret` (decoupled from the webhook secret). SameSite=Lax. CORS `allow_credentials=true` requires exact-origin `https://grug.lol` |
 
 ---
@@ -291,7 +289,7 @@ flowchart LR
 
 | Pillar | Status | Notes |
 |---|---|---|
-| **APM traces** | live | `ddtrace` on every workload (FastAPI auto-instrument for the HTTP pods; `ddtrace-run` for consumer/poller/rotator). Spans reach the **node-local** agent at `DD_AGENT_HOST=status.hostIP` (set per pod — a missing value silently drops APM). `DD_VERSION` = the build SHA. Verify via trace metrics, not raw span search (`feedback_verify_apm_via_trace_metrics`) |
+| **APM traces** | live | `ddtrace` on every workload (FastAPI auto-instrument for the HTTP pods; `ddtrace-run` for consumer/poller). Spans reach the **node-local** agent at `DD_AGENT_HOST=status.hostIP` (set per pod — a missing value silently drops APM). `DD_VERSION` = the build SHA. Verify via trace metrics, not raw span search (`feedback_verify_apm_via_trace_metrics`) |
 | **LLM Observability** | live | `DD_LLMOBS_ENABLED=true`, `DD_LLMOBS_ML_APP=grug-elder` on the LLM-calling workloads |
 | **Logs** | live | `DD_LOGS_INJECTION=true` correlates `trace_id`/`span_id`; service/env/version tags from the deploy |
 | **Monitors** | live | Pulumi-managed (`components/dd_monitors.py`), scoped `kube_namespace:grug`: KSM workload-not-ready / crashloop / restart-spike / poller-cronjob-unhealthy (#406) + SQS backlog + cave-fallback. Routed to the operator's Discord alert channel |
@@ -308,7 +306,7 @@ flowchart LR
 | Postgres `grug_kv` (CNPG) | The store. Unreachable on 5432 = `/readyz` fails (#404), rollouts stall on the last-good pod, every dashboard/webhook read errors |
 | in-cluster registry + `registry-pull` Secret | Every pod pulls its image from here. A bad/expired pull credential = `ImagePullBackOff` cluster-wide for grug |
 | `grug-secrets` seed (deploy workflow) | Carries the AWS credential that authorizes all runtime SSM reads + the DB URL + queue URLs. A broken seed outages every pod — the workflow fails the deploy on any empty/`None` value before the destructive secret re-create |
-| key-rotator CronJob | Rotates the `grug-k8s-pod` key every 12h and rolls the Deployments to pick it up. A broken rotation eventually expires the only runtime AWS credential |
+| cert-manager / pki-intermediate | Issues + renews the 6h `grug-pki` leaf every workload's AWS access rides on (#389). A stuck renewal crashes pods loud (boot proofs) and pages via the credential monitor |
 | `grug-gha-deploy` IAM role | OIDC-trust-scoped to the repo; reads `/grug/*` for the seed and runs `pulumi up`. Both deploy planes depend on it |
 
 ---
@@ -317,7 +315,7 @@ flowchart LR
 
 See `docs/SELF_HOST.md` + `docs/HITL_PREREQUISITES.md` for the full operator runbook. In brief:
 
-1. **Manual SSM pre-load** — every `/grug/*` parameter the pods read at runtime (App id/key/secret, OAuth client id+secret, webhook secret, session-signing secret, CF shared secret, KMS CMK ARN, database URL, k8s-pod + rotator AWS keys) plus `/infra/llm/*` LLM keys and `/infra/datadog/*` keys.
+1. **Manual SSM pre-load** — every `/grug/*` parameter the pods read at runtime (App id/key/secret, OAuth client id+secret, webhook secret, session-signing secret, CF shared secret, KMS CMK ARN, database URL) plus `/infra/llm/*` LLM keys and `/infra/datadog/*` keys.
 2. **`pulumi up`** (`iac.deploy.yml`) — creates the AWS-side infra: SSM references, KMS CMK, OIDC role, the `grug-k8s-pod` + rotator IAM users, SQS FIFO queues + DLQs, S3 cave bucket, DD monitors/dashboard/RUM app. (DynamoDB `grug-main` still exists here as legacy.)
 3. **Provision Postgres** — the `grug_kv` table on the shared CNPG cluster; put its DSN in `/grug/database-url`.
 4. **Stand up the CF edge** — a `cloudflared` tunnel to the in-cluster Services; set `/grug/{api,webhook}-upstream-host` to the tunnel hostnames and `/grug/cf-shared-secret`; deploy the `*-host-rewrite` Workers via `infra/cloudflare/deploy.sh` (binds the routes, injects the secret, points upstream at the tunnel host).

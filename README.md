@@ -115,7 +115,7 @@ Advisory-first: findings post as `neutral` until you flip
 │  └──────────┘  └──────────┘  └──────────────────┘      │
 │       webhook + api on Kubernetes (OKE),               │
 │       behind a Cloudflare tunnel; + grug-consumer       │
-│       (SQS) and grug-poller / grug-key-rotator jobs    │
+│       (SQS) and grug-poller job    │
 │                                                        │
 │  ┌──────────────────────────────────────────────┐     │
 │  │ infra/pulumi/  +  k8s/                        │     │
