@@ -51,8 +51,9 @@ spec:
             # #389: static key DROPPED from this workload - it now rides the
             # Roles Anywhere cert path. The grug-aws-static-key Secret stays
             # live (rotator-maintained) as the ROLLBACK RESERVE until the
-            # retirement PR deletes it; re-adding this envFrom + removing
-            # AWS_CONFIG_FILE (env below) is the documented rollback.
+            # retirement PR deletes it. Re-adding this envFrom + removing
+            # AWS_CONFIG_FILE is STEP 3 of the RUNBOOK 'Roles Anywhere'
+            # rollback - suspend the rotator and verify the reserve FIRST.
           env:
             - {name: AWS_CONFIG_FILE, value: /etc/grug-aws/config}
             - {name: GRUG_RA_ROLE_ARN, value: RA_ROLE_ARN_PLACEHOLDER}

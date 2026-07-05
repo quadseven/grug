@@ -341,3 +341,27 @@ def test_main_returns_zero_on_graceful_signal_shutdown(monkeypatch):
         consumer.main()  # returns normally (exit 0); must NOT raise SystemExit
     finally:
         consumer._stop.clear()
+
+
+def test_startup_check_runs_identity_proof_before_readiness(monkeypatch):
+    """#389 audit stage-7 (mirror of the #388 poller pin): the consumer's
+    proof call site is the FIRST thing _startup_check does - deleting it
+    (or demoting it below the readiness probe) must be a red test, not a
+    silent un-proving with Recreate-strategy blast radius."""
+    import aws_identity
+    import pytest
+    import readiness
+
+    import consumer
+
+    def _boom():
+        raise RuntimeError("proof ran")
+
+    monkeypatch.setattr(aws_identity, "prove_roles_anywhere_identity", _boom)
+    monkeypatch.setattr(
+        readiness, "check_readiness",
+        lambda: pytest.fail("readiness probed before the proof"),
+    )
+    with pytest.raises(RuntimeError, match="proof ran"):
+        consumer._startup_check()
+
