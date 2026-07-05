@@ -252,6 +252,35 @@ jobs:
           echo "$KUBECONFIG_B64" | base64 -d > "$HOME/.kube/config"
           chmod 600 "$HOME/.kube/config"
 
+      - name: Record last-good digests (rollback anchor, #499)
+        # Runs BEFORE the destructive secret seed (codex r10): a failure
+        # here aborts the deploy while NOTHING has been mutated yet -
+        # fail-fast is safe and correct at this point.
+        run: |
+          set -euo pipefail
+          # Snapshot the CURRENTLY-RUNNING digest pair before we touch
+          # anything - it survived its own deploy's synthetic, so it is
+          # the rollback target. Skip (keep the previous anchor) unless
+          # every workload is currently Available: never anchor a broken
+          # state.
+          ok=true
+          for d in grug-webhook grug-api grug-consumer; do
+            avail=$(kubectl -n grug get deploy "$d" -o jsonpath='{.status.conditions[?(@.type=="Available")].status}' 2>/dev/null || echo "")
+            [ "$avail" = "True" ] || ok=false
+          done
+          if [ "$ok" = "true" ]; then
+            W=$(kubectl -n grug get deploy grug-webhook -o jsonpath='{.spec.template.spec.containers[0].image}')
+            A=$(kubectl -n grug get deploy grug-api -o jsonpath='{.spec.template.spec.containers[0].image}')
+            FROM=$(kubectl -n grug get deploy grug-webhook -o jsonpath='{.metadata.annotations.grug\.dev/merge-sha}' 2>/dev/null || echo unknown)
+            kubectl -n grug create configmap grug-last-good \
+              --from-literal=webhook="$W" --from-literal=api="$A" \
+              --from-literal=recorded_from_sha="$FROM" \
+              --dry-run=client -o yaml | kubectl apply -f -
+            echo "last-good anchor recorded (from ${FROM})" >> "$GITHUB_STEP_SUMMARY"
+          else
+            echo "::warning::workloads not all Available pre-apply - keeping the previous last-good anchor"
+          fi
+
       - name: Seed app secrets from the parameter store
         id: seed
         # continue-on-error AFTER the snapshots exist (codex r6): a
@@ -378,33 +407,6 @@ jobs:
             --docker-username="$REGISTRY_USERNAME" \
             --docker-password="$REGISTRY_PASSWORD" \
             --dry-run=client -o yaml | kubectl apply -f -
-
-      - name: Record last-good digests (rollback anchor, #499)
-        if: steps.seed.outcome == 'success'
-        run: |
-          set -euo pipefail
-          # Snapshot the CURRENTLY-RUNNING digest pair before we touch
-          # anything - it survived its own deploy's synthetic, so it is
-          # the rollback target. Skip (keep the previous anchor) unless
-          # every workload is currently Available: never anchor a broken
-          # state.
-          ok=true
-          for d in grug-webhook grug-api grug-consumer; do
-            avail=$(kubectl -n grug get deploy "$d" -o jsonpath='{.status.conditions[?(@.type=="Available")].status}' 2>/dev/null || echo "")
-            [ "$avail" = "True" ] || ok=false
-          done
-          if [ "$ok" = "true" ]; then
-            W=$(kubectl -n grug get deploy grug-webhook -o jsonpath='{.spec.template.spec.containers[0].image}')
-            A=$(kubectl -n grug get deploy grug-api -o jsonpath='{.spec.template.spec.containers[0].image}')
-            FROM=$(kubectl -n grug get deploy grug-webhook -o jsonpath='{.metadata.annotations.grug\.dev/merge-sha}' 2>/dev/null || echo unknown)
-            kubectl -n grug create configmap grug-last-good \
-              --from-literal=webhook="$W" --from-literal=api="$A" \
-              --from-literal=recorded_from_sha="$FROM" \
-              --dry-run=client -o yaml | kubectl apply -f -
-            echo "last-good anchor recorded (from ${FROM})" >> "$GITHUB_STEP_SUMMARY"
-          else
-            echo "::warning::workloads not all Available pre-apply - keeping the previous last-good anchor"
-          fi
 
       - name: Pin image placeholders + apply
         id: apply

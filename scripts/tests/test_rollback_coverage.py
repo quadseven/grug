@@ -117,3 +117,31 @@ def test_every_placeholder_consumer_is_rolled_back():
         assert not missing, (
             f"{wf} rollback misses image-bearing workloads: {sorted(missing)}"
         )
+
+
+def test_deploy_failure_lattice_structure():
+    """#499 (codex r6+r10): the deploy's mutation steps must form the
+    capture lattice - anchor BEFORE the destructive seed (a pre-mutation
+    failure is a safe abort), seed+apply continue-on-error, and the
+    rollback condition referencing all three outcomes. Ordering/structure
+    pin on the workflow data, so a refactor cannot silently strand
+    mutated secrets outside the restore path again."""
+    text = (_ROOT / ".github" / "workflows" / "deploy.k8s.yml").read_text()
+    i_anchor = text.index("Record last-good digests")
+    i_seed = text.index("Seed app secrets")
+    i_apply = text.index("Pin image placeholders + apply")
+    i_rollback = text.index("Auto-rollback to last-good")
+    assert i_anchor < i_seed < i_apply < i_rollback
+
+    def step_block(marker: str) -> str:
+        start = text.index(marker)
+        nxt = text.find("\n      - name:", start)
+        return text[start:nxt]
+
+    assert "continue-on-error: true" in step_block("Seed app secrets")
+    assert "continue-on-error: true" in step_block("Pin image placeholders + apply")
+    rb = step_block("Auto-rollback to last-good")
+    for outcome in ("steps.seed.outcome == 'failure'",
+                    "steps.apply.outcome == 'failure'",
+                    "steps.synthetic.outcome == 'failure'"):
+        assert outcome in rb, f"rollback missing trigger: {outcome}"
