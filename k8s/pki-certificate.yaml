@@ -1,0 +1,38 @@
+# Roles Anywhere workload certificate for the grug tenant (#388, ADR-0008).
+# Issued by the SHARED cluster PKI (infrastructure ADR 0015): the
+# pki-intermediate ClusterIssuer signs a short-lived leaf whose subject CN
+# is the tenant name - the infra-side trust policy pins x509Subject/CN=grug
+# AND x509Issuer/CN (the shared intermediate) AND the account trust anchor,
+# so this exact issuance path is the ONLY one that can assume the grug role.
+#
+# GOTCHA (verified live in infrastructure#1318 Phase 4): `digital signature`
+# is MANDATORY in usages - `client auth` alone sets EKU but no keyUsage and
+# Roles Anywhere rejects the leaf with "Untrusted certificate. Insufficient
+# certificate". Do not "simplify" the usages list.
+#
+# TTL 6h / renewBefore 4h per the proven tenant recipe (pulumi/pki/README
+# in infrastructure): a leaked cert is useless within hours; STS sessions
+# from aws_signing_helper are ~1h.
+apiVersion: cert-manager.io/v1
+kind: Certificate
+metadata:
+  name: grug-pki
+  namespace: grug
+spec:
+  secretName: grug-pki-tls
+  commonName: grug
+  duration: 6h
+  renewBefore: 4h
+  privateKey:
+    algorithm: ECDSA
+    size: 256
+    # Fresh keypair on every 6h renewal (default Never would reuse it
+    # forever) - key-rotation parity with cert rotation.
+    rotationPolicy: Always
+  usages:
+    - digital signature  # keyUsage Roles Anywhere REQUIRES (see header)
+    - client auth
+  issuerRef:
+    name: pki-intermediate
+    kind: ClusterIssuer
+    group: cert-manager.io

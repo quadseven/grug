@@ -58,6 +58,9 @@ spec:
             - {name: http, containerPort: 8080}
           envFrom:
             - secretRef: {name: grug-secrets}
+            # Static AWS key pair (#388 split; #389 retires) - rationale in
+            # poller-cronjob.yaml + deploy.k8s.yml.
+            - secretRef: {name: grug-aws-static-key}
           env:
             - {name: DD_SERVICE, value: grug-webhook}
             - {name: DD_ENV, value: prod}

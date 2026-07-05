@@ -170,6 +170,11 @@ def create(
                             "arn:aws:ssm:*:*:parameter/infra/datadog/*",
                             "arn:aws:ssm:*:*:parameter/infra/llm/*",
                             "arn:aws:ssm:*:*:parameter/infra/discord/*",
+                            # Roles Anywhere tenant ARNs (#388): deploy.k8s.yml
+                            # seeds the trust-anchor/profile/role ARNs into the
+                            # grug-aws-config ConfigMap from these paths.
+                            # Read-only; the values are ARNs, not secrets.
+                            "arn:aws:ssm:*:*:parameter/infra/roles-anywhere/*",
                         ],
                     },
                     {

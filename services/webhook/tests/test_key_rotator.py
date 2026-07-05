@@ -202,3 +202,13 @@ def test_first_run_no_current_key_creates_and_does_not_delete():
     assert res.new_key_id == "AKIA-NEW-1"
     assert res.deleted_key_id is None
     assert all(c[0] != "delete" for c in iam.calls)
+
+
+def test_main_requires_rotate_secret_loudly(monkeypatch):
+    """#388 split: the silent grug-secrets default WOULD have patched the
+    wrong secret class, so the env is required - and the read sits BEFORE
+    main()'s broad except, so an unset var is an uncaught KeyError (loud),
+    not a logged return-1. Freeze both properties (audit stage-7)."""
+    monkeypatch.delenv("GRUG_ROTATE_SECRET", raising=False)
+    with pytest.raises(KeyError, match="GRUG_ROTATE_SECRET"):
+        key_rotator.main()

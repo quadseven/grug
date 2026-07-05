@@ -213,6 +213,46 @@ service (guarded by `tests/test_shared_no_shadowing.py` + the spec-0010
 attester). Per-service files (main.py, rerun.py, dispatcher/consumer, auth/,
 crypto/, sast_benchmark/, spark_cave/) stay in their service tree.
 
+## Roles Anywhere credential path (grug-poller tracer, #388)
+
+grug-poller runs on cert-derived short-lived AWS creds (ADR-0008): the
+cert-manager Certificate `grug-pki` (CN=grug, 6h/renew-4h, Secret
+`grug-pki-tls`) + `aws_signing_helper` (baked into the webhook image) via
+SDK `credential_process` (`AWS_CONFIG_FILE=/etc/grug-aws/config`, ARNs
+seeded from SSM `/infra/roles-anywhere/...` at deploy). api/webhook/
+consumer stay on the static key (`grug-aws-static-key` Secret, split out
+of grug-secrets at #388; the #386 rotator now rotates THAT Secret) until
+the #389 rollout.
+
+- **Rollback** (poller misbehaving on the cert path): add
+  `- secretRef: {name: grug-aws-static-key}` to the poller's envFrom
+  (restoring the pre-#388 static-cred behavior)
+  and drop the `AWS_CONFIG_FILE` env - env creds out-rank
+  credential_process, so this instantly reverts to the static key. Both
+  paths coexist until #389.
+- **"Untrusted certificate. Insufficient certificate"** from Roles
+  Anywhere = the leaf lost the `digital signature` usage (the
+  infrastructure#1318 gotcha). Check `kubectl -n grug get certificate
+  grug-pki -o yaml` usages; `test_pki_manifests.py` pins them in CI.
+- **Deploy failed AFTER the seed step** (ARN lookup/sed/apply): the
+  cluster is in the split-secret half-state - grug-secrets is keyless,
+  manifests still old. Running pods keep their baked env; do NOT
+  restart api/webhook/consumer pods, just fix and re-run deploy.k8s
+  (the seed is delete-then-create idempotent).
+- **The 15m canary**: every poller tick starts with an UNGUARDED
+  `sts get-caller-identity` (`roles_anywhere_identity_proven` in DD, with
+  the assumed-role ARN). A broken/expired cert or a bypassed chain
+  CRASHES the Job - the KSM `duration_since_last_successful` monitor
+  pages within the hour. No news from this log line = the cert path is
+  dead, not idle.
+- **Rotator/SSM gap (#502, filed from the #388 audit)**: the #386
+  rotator rotates the LIVE IAM key but never writes it back to
+  /grug/k8s-pod-aws-*, so a deploy right after a rotation seeds
+  grug-aws-static-key with a DELETED key until the next rotator tick.
+- **Cert not issuing**: `kubectl get clusterissuer pki-intermediate` must
+  be READY (shared PKI, infrastructure repo); then describe the
+  Certificate for cert-manager events.
+
 ## Elder (code-reviewer) persona — end-to-end verification
 
 Elder ships in advisory mode by default. After a deploy that changes
