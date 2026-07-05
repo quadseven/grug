@@ -38,11 +38,14 @@ and the escape hatch should be seconds, not minutes.
    healthy deploys before this was corrected): a 60s SOAK asserting zero
    container restarts (a pod that went Ready then crash-loops) + a
    post-soak Available recheck on all workloads, plus a HARD
-   public-edge endpoint validation - /livez + /readyz on BOTH services
-   through the real ingress (DNS + CF worker + tunnel + TLS + the app),
-   a strictly stronger signal than an in-cluster ClusterIP probe and the
-   BYON-safe way to satisfy the issue's endpoint-validation requirement
-   (Qodo review on #525). The soak is the OWNED stand-in for the 'DD
+   public-edge validation - /livez + /readyz (explicit 200) on BOTH
+   services AND a SIGNED ping POSTed to the public webhook URL through
+   the real ingress (DNS + CF worker injecting the shared secret + tunnel
+   + HMAC verify + the app; a ping dispatches nothing = side-effect-free,
+   the #368 proof mechanics automated over the exact GitHub path). This
+   is BYON-safe (runs from the runner, no kubelet) and a strictly
+   stronger signal than the removed in-cluster ClusterIP/port-forward
+   probes (Qodo reviews on #525/#526). The soak is the OWNED stand-in for the 'DD
    error-rate window' - the deploy role has no DD keys by design.
 3. **Auto-rollback on ANY post-anchor failure** (a failed apply/rollout/
    smoke - captured via continue-on-error - or a failed synthetic):
