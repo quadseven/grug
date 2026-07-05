@@ -836,6 +836,9 @@
     /* Honest capability status (#493): every roster line carries its real
        state - the marketing page follows the dashboard's "no lies" rule. */
     .proster-list li{ display:flex; justify-content:space-between; align-items:baseline; gap:8px; }
+    /* Let the label shrink + wrap so a long token can't overflow the chip
+       on the single-column mobile roster (Qodo review #534). */
+    .proster-list li > span:first-child{ flex:1 1 auto; min-width:0; overflow-wrap:anywhere; }
     .cap{ font-size:9px; letter-spacing:0.08em; font-weight:700; padding:1px 6px; border-radius:3px; flex:none; }
     .cap.live{ background:#1f7a3f; color:#fff; }
     .cap.preview{ background:#b5820a; color:#fff; }
