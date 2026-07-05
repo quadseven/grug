@@ -69,7 +69,7 @@ jobs:
             # rerun: they are deliberately off dispatcher/main's eager import
             # graph, so a broken _shared layout could pass an eager-only smoke
             # and then fail inside every async job at runtime.
-            mods="dispatcher, consumer, async_dispatch, hmac_verify, rerun, poller_handler, cave_fallback, adapters.install_store, personas.registry, personas.code_reviewer.dispatch, personas.guard.dispatch, personas.smasher.dispatch, personas.smasher.sandbox, personas.smasher.trial_janitor, personas.smasher.trial_fetch, personas.smasher.trial_deps, personas.smasher.trial_worker, observability, readiness, preview_mode, preview_names, reap_previews, main"
+            mods="dispatcher, consumer, async_dispatch, hmac_verify, rerun, poller_handler, cave_fallback, adapters.install_store, personas.registry, personas.code_reviewer.dispatch, personas.guard.dispatch, personas.smasher.dispatch, personas.smasher.sandbox, personas.smasher.trial_janitor, personas.smasher.trial_fetch, personas.smasher.trial_deps, personas.smasher.trial_worker, observability, readiness, preview_mode, preview_names, reap_previews, main, personas.tpm.ticket_compliance, personas.tpm.ticket_compliance_run"
           else
             mods="admin, installations, auth.github_oauth, crypto.kms_envelope, adapters.user_store, adapters.install_store, personas.registry, observability, readiness, preview_mode, preview_names, main"
           fi
