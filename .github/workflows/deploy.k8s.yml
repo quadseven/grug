@@ -496,10 +496,22 @@ jobs:
         run: |
           set -euo pipefail
           fail() { echo "::error::synthetic: $1"; exit 1; }
+          # Wait for the backgrounded port-forward to actually BIND before
+          # probing - a fixed sleep raced the bind and false-failed a
+          # healthy deploy (the first live run), which then auto-rolled
+          # back. Poll /livez until it answers or a deadline; only a
+          # genuinely-down pod exhausts the budget.
+          wait_pf() {  # wait_pf <svc-for-message>
+            for _ in $(seq 1 20); do
+              curl -fsS -m 5 "http://127.0.0.1:18080/livez" > /dev/null 2>&1 && return 0
+              sleep 1
+            done
+            return 1
+          }
           probe_health() {  # probe_health <svc>
             timeout 60 kubectl -n grug port-forward "svc/$1" 18080:8080 >/dev/null 2>&1 &
             pf=$!
-            sleep 3
+            wait_pf "$1" || { kill "$pf" 2>/dev/null; fail "$1 /livez not ready in 20s"; }
             for ep in livez readyz; do
               curl -fsS -m 10 "http://127.0.0.1:18080/$ep" > /dev/null \
                 || { kill "$pf" 2>/dev/null; fail "$1 /$ep unhealthy"; }
@@ -517,7 +529,7 @@ jobs:
           CF_SECRET=$(aws ssm get-parameter --name /grug/cf-shared-secret --with-decryption --query 'Parameter.Value' --output text)
           timeout 60 kubectl -n grug port-forward svc/grug-webhook 18080:8080 >/dev/null 2>&1 &
           pf=$!
-          sleep 3
+          wait_pf grug-webhook || { kill "$pf" 2>/dev/null; fail "grug-webhook port-forward not ready for the signed ping"; }
           BODY='{"zen":"synthetic deploy self-test","hook_id":0}'
           SIG=$(printf '%s' "$BODY" | openssl dgst -sha256 -hmac "$WH_SECRET" | awk '{print $NF}')
           code=$(curl -s -o "$RUNNER_TEMP/ping.out" -w '%{http_code}' -m 15 \
