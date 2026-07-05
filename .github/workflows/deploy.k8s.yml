@@ -554,31 +554,6 @@ jobs:
           probe_health grug-api
           echo "synthetic PASS: health x2, signed ping 200, 60s soak clean" >> "$GITHUB_STEP_SUMMARY"
 
-      - name: Record verified release bundle (two generations, #499)
-        if: steps.synthetic.outcome == 'success'
-        run: |
-          set -euo pipefail
-          # k8s/ here is the SED-PINNED rendered state this run applied
-          # (digests + RA ARNs baked). Store it as generation 'current'
-          # and shift the old current to 'previous' - rollback (auto
-          # during the NEXT deploy, or manual between deploys) applies
-          # 'previous', which is always the verified release BEFORE the
-          # one running (codex r11 semantics + r13 manifest coverage).
-          NEW=$(tar czf - -C k8s . | base64 | tr -d '\n')
-          OLD=$(kubectl -n grug get configmap grug-release-manifests -o jsonpath='{.data.current}' 2>/dev/null || echo "")
-          {
-            echo "apiVersion: v1"
-            echo "kind: ConfigMap"
-            echo "metadata:"
-            echo "  name: grug-release-manifests"
-            echo "  namespace: grug"
-            echo "data:"
-            echo "  current: $NEW"
-            [ -n "$OLD" ] && echo "  previous: $OLD"
-            echo "  current_sha: ${GITHUB_SHA}"
-          } | kubectl apply -f -
-          echo "verified release bundle recorded (current + previous generations)" >> "$GITHUB_STEP_SUMMARY"
-
       - name: Auto-rollback to last-good (#499)
         # Fires on ANY post-anchor deploy failure: a failed apply/rollout/
         # smoke OR a failed synthetic. IMAGE-ONLY contract (ADR-0017): the
@@ -636,22 +611,11 @@ jobs:
           else
             echo "ROLLBACK INCOMPLETE: one or more secrets could not be verified/restored - review manually" >> "$GITHUB_STEP_SUMMARY"
           fi
-          # AUTO-rollback restores the release that was RUNNING when this
-          # failed deploy started = generation 'current' (codex r14). It
-          # pairs with grug-last-good, also captured pre-mutation from the
-          # same running release, so manifests + image pins are the SAME
-          # verified generation - never a hybrid. (Manual rollback reads
-          # 'previous' instead: its job is to leave the running release.)
-          # Bootstrap fallback (no bundle yet): image/env re-pins only.
-          BUNDLE=$(kubectl -n grug get configmap grug-release-manifests -o jsonpath='{.data.current}' 2>/dev/null || echo "")
-          if [ -n "$BUNDLE" ]; then
-            mkdir -p "$RUNNER_TEMP/rollback-manifests"
-            printf '%s' "$BUNDLE" | base64 -d | tar xzf - -C "$RUNNER_TEMP/rollback-manifests"
-            kubectl apply -k "$RUNNER_TEMP/rollback-manifests"
-            echo "applied previous release's rendered manifests" >> "$GITHUB_STEP_SUMMARY"
-          else
-            echo "::warning::no previous release bundle recorded yet - image/env-only rollback (manifest regressions in this merge are NOT undone)"
-          fi
+          # IMAGE + ENV + SECRET rollback (the issue's digest-pair scope;
+          # Argo/release-state rollback was explicitly out of scope). A
+          # k8s/ manifest regression is NOT undone here - the warning
+          # below fires when this merge touched k8s/, and the recovery is
+          # revert + redeploy.
           # Container names per the live manifests: webhook/webhook,
           # api/webhook (historical), consumer/consumer, poller/poller.
           kubectl -n grug set image deploy/grug-webhook webhook="$W"
