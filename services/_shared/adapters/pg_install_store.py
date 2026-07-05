@@ -586,6 +586,31 @@ def list_ledger_rows(repo: str, limit: int | None = None) -> list[dict[str, Any]
     return out if limit is None else out[:limit]
 
 
+def put_repo_practices(repo: str, practices: list[dict[str, Any]]) -> None:
+    """Cache the derived best-practices for a repo (#527) - one row under
+    the same LEDGER#<repo> partition, sk='PRACTICES'. Refreshed by the
+    ingest/poller pass; read at review time to steer Elder's prompt."""
+    with get_pool().connection() as conn:
+        conn.execute(
+            """
+            INSERT INTO grug_kv (pk, sk, data)
+            VALUES (%(pk)s, %(sk)s, %(data)s)
+            ON CONFLICT (pk, sk) DO UPDATE SET data = %(data)s
+            """,
+            {
+                "pk": _ledger_pk(repo),
+                "sk": "PRACTICES",
+                "data": encode_attrs({"practices": practices}),
+            },
+        )
+
+
+def get_repo_practices(repo: str) -> list[dict[str, Any]]:
+    """The cached best-practices for a repo, or [] if none derived yet."""
+    item = _get_item(_ledger_pk(repo), "PRACTICES")
+    return list(item.get("practices", [])) if item else []
+
+
 _DELIVERY_CLAIM_TTL_HOURS = 24
 
 

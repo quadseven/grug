@@ -19,13 +19,14 @@ from ledger import parse_row
 _DEFAULT_PATH = "logs/review-ledger.jsonl"
 
 
-def ingest_text(text: str, put=None) -> dict[str, int]:
+def ingest_text(text: str, put=None, put_practices=None) -> dict[str, object]:
     """Parse + persist every valid ledger line. `put` defaults to the store
     adapter but is injectable for tests. Returns {ingested, skipped}."""
     if put is None:
         from adapters.pg_install_store import put_ledger_row  # type: ignore
         put = put_ledger_row
     ingested = skipped = 0
+    parsed_by_repo: dict[str, list] = {}
     for line in text.splitlines():
         line = line.strip()
         if not line:
@@ -35,12 +36,35 @@ def ingest_text(text: str, put=None) -> dict[str, int]:
         except json.JSONDecodeError:
             skipped += 1
             continue
-        if parse_row(row) is None:  # reuse the same validity gate
+        lr = parse_row(row)
+        if lr is None:  # reuse the same validity gate
             skipped += 1
             continue
         put(row)  # key is content-derived in the store; ingest order irrelevant
+        parsed_by_repo.setdefault(lr.repo, []).append(lr)
         ingested += 1
-    return {"ingested": ingested, "skipped": skipped}
+    refreshed = _refresh_practices(parsed_by_repo, put_practices)
+    return {"ingested": ingested, "skipped": skipped, "repos_refreshed": refreshed}
+
+
+def _refresh_practices(parsed_by_repo: dict, put_practices=None) -> int:
+    """After ingest, recompute + cache each repo's best-practices (#527) so
+    the derived block tracks the freshest corpus. Best-effort per repo."""
+    from best_practices import derive_practices, practices_to_dicts
+    if put_practices is None:
+        try:
+            from adapters.pg_install_store import put_repo_practices  # type: ignore
+            put_practices = put_repo_practices
+        except Exception:  # noqa: BLE001
+            return 0
+    n = 0
+    for repo, rows in parsed_by_repo.items():
+        try:
+            put_practices(repo, practices_to_dicts(derive_practices(rows)))
+            n += 1
+        except Exception:  # noqa: BLE001 - a practices refresh must not abort ingest
+            continue
+    return n
 
 
 def main(argv: list[str]) -> int:

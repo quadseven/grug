@@ -23,8 +23,8 @@ def test_ingest_persists_valid_and_counts_skips():
         json.dumps({"repo": "r"}),  # missing fields -> skipped
         _line(pr=2),
     ])
-    res = ingest_text(text, put=lambda row: puts.append(row["pr"]))
-    assert res == {"ingested": 2, "skipped": 2}
+    res = ingest_text(text, put=lambda row: puts.append(row["pr"]), put_practices=lambda repo, ps: None)
+    assert res["ingested"] == 2 and res["skipped"] == 2
     assert puts == [1, 2]
 
 
@@ -33,7 +33,7 @@ def test_all_valid_rows_are_put():
     # two findings sharing (repo, class, pr, reviewer) but different content
     # -> both persisted (content-derived key disambiguates, no seq needed)
     text = "\n".join([_line(pr=5, finding="a"), _line(pr=5, finding="b")])
-    ingest_text(text, put=lambda row: puts.append(row["finding"]))
+    ingest_text(text, put=lambda row: puts.append(row["finding"]), put_practices=lambda repo, ps: None)
     assert puts == ["a", "b"]
 
 
@@ -43,5 +43,5 @@ def test_ingest_is_reusable_across_classes():
         _line(pr=5, finding_class="silent-failure"),
         _line(pr=5, finding_class="correctness"),
     ])
-    ingest_text(text, put=lambda row: puts.append(row["class"]))
+    ingest_text(text, put=lambda row: puts.append(row["class"]), put_practices=lambda repo, ps: None)
     assert puts == ["silent-failure", "correctness"]
