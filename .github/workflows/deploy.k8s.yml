@@ -163,6 +163,14 @@ jobs:
             grep -nE '=$|=None$' "$ENVF" | cut -d= -f1
             exit 1
           fi
+          # #388 split guard: the static key pair must NEVER re-enter
+          # grug-secrets - the poller envFroms it, and env creds silently
+          # out-rank credential_process, un-proving the Roles Anywhere
+          # tracer while everything stays green (audit stage-1 HIGH).
+          if grep -qE '^AWS_(ACCESS_KEY_ID|SECRET_ACCESS_KEY)=' "$ENVF"; then
+            echo "::error::static key pair leaked back into grug-secrets (belongs in grug-aws-static-key, #388)"
+            exit 1
+          fi
           # DELETE-then-create: kubectl apply MERGES secret data, so a
           # shape change would leave stale keys behind (bit us on the
           # first deploys - the interim seed's keys lingered).
