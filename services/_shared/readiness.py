@@ -79,7 +79,15 @@ def check_readiness(*, now=time.monotonic) -> ReadinessReport:
     if cached is not None and t - _cache["at"] < _TTL_SECONDS:
         return cached
     # Built per call so tests can monkeypatch the module-level check fns.
-    checks = {"ssm_kms": _check_ssm_kms, "postgres": _check_postgres}
+    # A preview pod (#500) has no SSM/KMS access by design - its /readyz
+    # gates on its own Postgres schema only. The namespace-gated
+    # preview_mode() cannot engage in the prod namespace, so this never
+    # weakens prod readiness.
+    from preview_mode import preview_mode  # local import: _shared is on PYTHONPATH
+    if preview_mode():
+        checks = {"postgres": _check_postgres}
+    else:
+        checks = {"ssm_kms": _check_ssm_kms, "postgres": _check_postgres}
     deps: dict[str, bool] = {}
     for name, fn in checks.items():
         try:

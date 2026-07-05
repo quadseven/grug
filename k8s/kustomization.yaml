@@ -14,3 +14,4 @@ resources:
   - consumer-deployment.yaml
   - pki-certificate.yaml
   - grug-aws-config.yaml
+  - preview-janitor.yaml
