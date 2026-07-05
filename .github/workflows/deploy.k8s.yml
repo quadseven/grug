@@ -496,57 +496,14 @@ jobs:
         run: |
           set -euo pipefail
           fail() { echo "::error::synthetic: $1"; exit 1; }
-          # In-cluster probe Job (BYON: kubectl port-forward/exec/logs stream
-          # through the kubelet:10250 path the apiserver cannot reach on our
-          # BYON nodes - only Job COMPLETION status returns via the API,
-          # which is why the deploy's poller-smoke uses a Job too). This Job
-          # curls both services' auth-exempt /livez + /readyz (the kubelet's
-          # own probe endpoints) from inside the cluster; we gate on its
-          # completion. RA identity + SSM secret access were already proven
-          # by the poller-smoke Job above. Manifest written by python (not an
-          # inline heredoc) so run-block indentation cannot corrupt the YAML.
-          python3 - "$IMAGE_WEBHOOK" > "$RUNNER_TEMP/synthetic-probe.yaml" <<'PYEOF_JOB'
-          import sys
-          image = sys.argv[1]
-          probe = (
-              "import sys, urllib.request\n"
-              "base = 'http://{}.grug.svc.cluster.local:8080/{}'\n"
-              "for svc in ('grug-webhook', 'grug-api'):\n"
-              "    for ep in ('livez', 'readyz'):\n"
-              "        u = base.format(svc, ep)\n"
-              "        try:\n"
-              "            r = urllib.request.urlopen(u, timeout=10)\n"
-              "            assert r.status == 200, (u, r.status)\n"
-              "        except Exception as e:\n"
-              "            print('PROBE FAIL', u, e); sys.exit(1)\n"
-              "print('PROBE OK')\n"
-          )
-          import json
-          print(json.dumps({
-              "apiVersion": "batch/v1", "kind": "Job",
-              "metadata": {"name": "synthetic-probe", "namespace": "grug"},
-              "spec": {
-                  "backoffLimit": 0, "ttlSecondsAfterFinished": 300,
-                  "template": {"spec": {
-                      "restartPolicy": "Never",
-                      "imagePullSecrets": [{"name": "registry-pull"}],
-                      "containers": [{
-                          "name": "probe", "image": image,
-                          "command": ["python", "-c", probe],
-                      }],
-                  }},
-              },
-          }))
-          PYEOF_JOB
-          kubectl -n grug delete job synthetic-probe --ignore-not-found
-          kubectl -n grug apply -f "$RUNNER_TEMP/synthetic-probe.yaml"
-          if ! kubectl -n grug wait --for=condition=complete job/synthetic-probe --timeout=120s 2>/dev/null; then
-            echo "::group::synthetic-probe diagnosis"; kubectl -n grug describe job synthetic-probe | tail -20 || true; echo "::endgroup::"
-            kubectl -n grug delete job synthetic-probe --ignore-not-found
-            fail "in-cluster health probe (livez/readyz on both services) did not pass"
-          fi
-          kubectl -n grug delete job synthetic-probe --ignore-not-found
-          echo "in-cluster health probe passed (livez + readyz, both services)" >> "$GITHUB_STEP_SUMMARY"
+          # Health is ALREADY proven by this deploy before the synthetic:
+          # `kubectl rollout status` gates on the readinessProbe (/readyz)
+          # and livenessProbe (/livez), and poller-smoke proves the image
+          # boots + RA identity + SSM secret access. The synthetic adds the
+          # signal those DON'T give, all via the API (BYON-safe - kubelet
+          # port-forward/exec/logs are unreachable on our BYON nodes):
+          # a SOAK (a pod that went Ready then crashes) + a best-effort
+          # public-edge check.
           # Public-edge probe (best-effort, warn-only): proves DNS + CF +
           # tunnel + TLS on the real ingress but must NOT roll back a
           # cluster-healthy release on edge flakiness; the DD uptime
@@ -576,7 +533,7 @@ jobs:
             avail=$(kubectl -n grug get deploy "$d" -o jsonpath='{.status.conditions[?(@.type=="Available")].status}' 2>/dev/null || echo "")
             [ "$avail" = "True" ] || fail "$d not Available after soak"
           done
-          echo "synthetic PASS: in-cluster health probe + 60s zero-restart soak + post-soak readiness" >> "$GITHUB_STEP_SUMMARY"
+          echo "synthetic PASS: 60s zero-restart soak + post-soak readiness (health already gated by rollout status + poller-smoke)" >> "$GITHUB_STEP_SUMMARY"
 
       - name: Auto-rollback to last-good (#499)
         # Fires on ANY post-anchor deploy failure: a failed apply/rollout/
