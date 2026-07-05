@@ -263,22 +263,43 @@ def _check_name_in_legacy(legacy_data: dict, check_name: str) -> bool:
     return False
 
 
-def get_repo_default_branch(install_token: str, owner: str, repo: str) -> str:
-    """Fetch the repo's default branch (``GET /repos/{owner}/{repo}``).
+_INSTALL_REPOS_MAX_PAGES = 10  # 1000 repos - same v1 cap as the api's list_repos
 
-    detect_enforcement's legacy branch-protection fallback needs the real
-    default branch; callers outside a webhook payload (the poller's #460
-    re-emission pass) have no payload to read it from. Falls back to
-    ``main`` if GitHub omits the field (brand-new empty repo) - the legacy
-    check 404s harmlessly on a wrong branch.
+
+def list_installation_repos(install_token: str) -> list[dict]:
+    """Enumerate the repos this installation grants access to
+    (``GET /installation/repositories``, paginated).
+
+    Returns ``[{"id", "full_name", "default_branch"}]``. This is the
+    GROUND-TRUTH denominator for "repos grug is expected to act on" - the
+    #460 re-emission pass discovered live that the store's REPO# rows are
+    written only on explicit config changes, so a defaults-only install
+    has ZERO rows and any store-driven enumeration is empty. GitHub owns
+    the install-repo relationship; the store overlays per-repo opt-outs.
+    Page cap mirrors the api's list_repos (log + truncate, never spin).
     """
-    resp = _get_with_retry(
-        f"{_GH_API}/repos/{quote(owner, safe='')}/{quote(repo, safe='')}",
-        install_token=install_token,
-        op="repo_default_branch",
-    )
-    resp.raise_for_status()
-    return (resp.json() or {}).get("default_branch") or "main"
+    out: list[dict] = []
+    for page in range(1, _INSTALL_REPOS_MAX_PAGES + 1):
+        resp = _get_with_retry(
+            f"{_GH_API}/installation/repositories?per_page=100&page={page}",
+            install_token=install_token,
+            op="installation_repositories",
+        )
+        resp.raise_for_status()
+        repos = (resp.json() or {}).get("repositories", [])
+        if not repos:
+            break
+        for r in repos:
+            out.append({
+                "id": r.get("id"),
+                "full_name": r.get("full_name", ""),
+                "default_branch": r.get("default_branch") or "main",
+            })
+        if len(repos) < 100:
+            break
+    else:
+        log.warning("installation_repos_pagination_cap", extra={"count": len(out)})
+    return out
 
 
 def detect_enforcement(
