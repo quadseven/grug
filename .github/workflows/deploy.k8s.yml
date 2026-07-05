@@ -538,9 +538,18 @@ jobs:
           # end-to-end - a strictly better proof than the removed
           # in-cluster port-forward ping. The secret never leaves the
           # runner (openssl HMAC; not echoed).
-          WH_SECRET=$(aws ssm get-parameter --name /grug/github-app-webhook-secret --with-decryption --query 'Parameter.Value' --output text)
+          # Compute the HMAC in python with the secret read from the
+          # ENVIRONMENT, never as a shell argument (grug Elder CRITICAL on
+          # #526: `openssl -hmac "$WH_SECRET"` puts the raw secret in the
+          # process arg table and would be captured by any `set -x`; the
+          # SSM-fetched value is not a registered GHA secret so it is NOT
+          # auto-masked). WH_SECRET is exported ONLY for the python child
+          # and unset immediately after; it never touches argv or tracing.
           PING_BODY='{"zen":"synthetic deploy self-test","hook_id":0}'
-          PING_SIG=$(printf '%s' "$PING_BODY" | openssl dgst -sha256 -hmac "$WH_SECRET" | awk '{print $NF}')
+          export WH_SECRET
+          WH_SECRET=$(aws ssm get-parameter --name /grug/github-app-webhook-secret --with-decryption --query 'Parameter.Value' --output text)
+          PING_SIG=$(PING_BODY="$PING_BODY" python3 -c 'import hashlib, hmac, os; print(hmac.new(os.environ["WH_SECRET"].encode(), os.environ["PING_BODY"].encode(), hashlib.sha256).hexdigest())')
+          unset WH_SECRET
           ping_code=$(curl -s -o "$RUNNER_TEMP/ping.out" -w '%{http_code}' -m 20 -X POST \
             -H "X-GitHub-Event: ping" \
             -H "X-GitHub-Delivery: synthetic-${GITHUB_SHA}" \
