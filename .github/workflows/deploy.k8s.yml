@@ -243,15 +243,21 @@ jobs:
           RA_ANCHOR="$(aws ssm get-parameter --with-decryption --name /infra/roles-anywhere/trust_anchor_arn --query Parameter.Value --output text)"
           RA_PROFILE="$(aws ssm get-parameter --with-decryption --name /infra/roles-anywhere/grug/profile_arn --query Parameter.Value --output text)"
           RA_ROLE="$(aws ssm get-parameter --with-decryption --name /infra/roles-anywhere/grug/role_arn --query Parameter.Value --output text)"
-          for v in RA_ANCHOR RA_PROFILE RA_ROLE; do
-            case "${!v}" in
-              arn:aws:*) ;;
+          # Per-SERVICE shapes (peer review): a syntactically-valid but
+          # wrong-service ARN (iam where rolesanywhere belongs, etc) must
+          # die here, not at the first poller tick.
+          check_arn() {
+            case "$2" in
+              $3) ;;
               *)
-                echo "::error::Roles Anywhere lookup $v is not an ARN (empty/None/ciphertext?) - is the grug tenant applied in infrastructure (infra-pki)?"
+                echo "::error::Roles Anywhere lookup $1 has the wrong shape (got: unlogged; expected $3) - is the grug tenant applied in infrastructure (infra-pki)?"
                 exit 1
                 ;;
             esac
-          done
+          }
+          check_arn RA_ANCHOR "$RA_ANCHOR" 'arn:aws:rolesanywhere:*:*:trust-anchor/*'
+          check_arn RA_PROFILE "$RA_PROFILE" 'arn:aws:rolesanywhere:*:*:profile/*'
+          check_arn RA_ROLE "$RA_ROLE" 'arn:aws:iam::*:role/*'
           sed -i \
             -e "s|REGISTRY_PLACEHOLDER/grug-api:TAG_PLACEHOLDER|${IMAGE_API}|g" \
             -e "s|REGISTRY_PLACEHOLDER/grug-webhook:TAG_PLACEHOLDER|${IMAGE_WEBHOOK}|g" \

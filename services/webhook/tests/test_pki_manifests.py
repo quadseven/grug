@@ -83,6 +83,9 @@ def test_poller_rides_roles_anywhere_not_the_static_key():
     # The single ABSOLUTE path anchor; every other path is derived from it
     # (or from a manifest counterpart) in the cross-derivation test.
     assert env.get("AWS_CONFIG_FILE") == "/etc/grug-aws/config"
+    # The identity ASSERTION input (peer review 3x): sed-pinned to the
+    # same SSM role ARN the ConfigMap's credential_process uses.
+    assert env.get("GRUG_RA_ROLE_ARN") == "RA_ROLE_ARN_PLACEHOLDER"
     assert "AWS_ACCESS_KEY_ID" not in env and "AWS_SECRET_ACCESS_KEY" not in env
 
     mounts = {m["name"]: m for m in container["volumeMounts"]}

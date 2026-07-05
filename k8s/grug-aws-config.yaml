@@ -14,9 +14,10 @@
 # INTERMEDIATE. We pass ca.crt (a CA-backed ClusterIssuer populates it
 # with the issuing CA cert = the intermediate); ADR 0015's recipe words
 # this as "the intermediate from the tls.crt bundle" - equivalent chain,
-# different file. NOT yet live-proven on this exact wiring: the
-# roles_anywhere_identity_proven log line on first deploy is the proof;
-# if the chain is rejected, switch --intermediates to tls.crt.
+# different file. LIVE-PROVEN at the Secret level (2026-07-05: the
+# issued grug-pki-tls carries ca.crt = 1 intermediate cert, tls.crt =
+# leaf+intermediate bundle); the full STS chain proof is the
+# roles_anywhere_identity_proven log line on first deploy.
 apiVersion: v1
 kind: ConfigMap
 metadata:
