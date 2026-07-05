@@ -314,6 +314,7 @@ def test_identity_proof_logs_the_assumed_arn(monkeypatch, caplog):
 
     monkeypatch.setenv("AWS_CONFIG_FILE", "/etc/grug-aws/config")
     monkeypatch.delenv("AWS_ACCESS_KEY_ID", raising=False)
+    monkeypatch.delenv("AWS_SECRET_ACCESS_KEY", raising=False)
     import boto3
 
     import poller_handler as ph
@@ -359,6 +360,7 @@ def test_identity_proof_rejects_malformed_expected_arn(monkeypatch):
     monkeypatch.setenv("AWS_CONFIG_FILE", "/etc/grug-aws/config")
     monkeypatch.setenv("GRUG_RA_ROLE_ARN", "RA_ROLE_ARN_PLACEHOLDER")
     monkeypatch.delenv("AWS_ACCESS_KEY_ID", raising=False)
+    monkeypatch.delenv("AWS_SECRET_ACCESS_KEY", raising=False)
     import boto3
 
     monkeypatch.setattr(boto3, "client", lambda s: type("S", (), {"get_caller_identity": lambda self: {"Arn": "x"}})())
@@ -377,6 +379,7 @@ def test_identity_proof_asserts_the_expected_role(monkeypatch):
     monkeypatch.setenv("AWS_CONFIG_FILE", "/etc/grug-aws/config")
     monkeypatch.setenv("GRUG_RA_ROLE_ARN", "arn:aws:iam::111122223333:role/ra-grug")
     monkeypatch.delenv("AWS_ACCESS_KEY_ID", raising=False)
+    monkeypatch.delenv("AWS_SECRET_ACCESS_KEY", raising=False)
     import boto3
 
     class _WrongSts:
