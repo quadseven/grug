@@ -298,7 +298,11 @@ def test_identity_proof_logs_the_assumed_arn(monkeypatch, caplog):
             return {"Arn": "arn:aws:sts::1:assumed-role/ra-grug/x", "Account": "1"}
 
     monkeypatch.setattr(boto3, "client", lambda service: _Sts())
-    with caplog.at_level(logging.INFO, logger=ph.log.name):
+    # The proof MOVED to aws_identity (#389) - capture ITS logger, not the
+    # poller's (the stale target made this test ordering-dependent: audit).
+    import aws_identity
+
+    with caplog.at_level(logging.INFO, logger=aws_identity.log.name):
         ph._prove_roles_anywhere_identity()
     (rec,) = [r for r in caplog.records if r.msg == "roles_anywhere_identity_proven"]
     assert "ra-grug" in rec.assumed_arn

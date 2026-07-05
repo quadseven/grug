@@ -132,8 +132,9 @@ def test_credential_acquisition_query_covers_fleet_and_both_signals() -> None:
     from components.dd_monitors import credential_acquisition_failure_query
 
     q = credential_acquisition_failure_query("prod")
-    for svc in ("grug-api", "grug-webhook", "grug-consumer", "grug-poller"):
-        assert svc in q
+    # Wildcard on purpose: a 5th grug service (or the rotator's own cred
+    # failure) must be covered without editing the monitor.
+    assert "service:grug-*" in q
     assert "roles_anywhere_identity_failed" in q
     assert "CredentialRetrievalError" in q
     assert 'rollup("count")' in q and "> 0" in q

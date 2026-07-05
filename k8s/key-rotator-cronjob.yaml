@@ -107,7 +107,10 @@ spec:
                 - {name: GRUG_ENV, value: prod}
                 - {name: GRUG_ROTATE_USER, value: grug-k8s-pod}
                 - {name: GRUG_ROTATE_SECRET, value: grug-aws-static-key}
-                - {name: GRUG_ROTATE_DEPLOYMENTS, value: "grug-api,grug-webhook,grug-consumer"}
+                # EMPTY since #389: no workload consumes the reserve Secret, so a
+                # rotation must not bounce the serving fleet (it restarted all
+                # three deployments twice a day for a Secret nobody read).
+                - {name: GRUG_ROTATE_DEPLOYMENTS, value: ""}
               securityContext:
                 allowPrivilegeEscalation: false
                 readOnlyRootFilesystem: true
