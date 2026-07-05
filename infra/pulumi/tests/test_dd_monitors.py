@@ -16,6 +16,7 @@ from __future__ import annotations
 import pulumi
 
 from components.dd_monitors import (
+    credential_acquisition_failure_query,
     all_ksm_monitor_queries,
     crashloop_query,
     poller_cronjob_unhealthy_query,
@@ -124,3 +125,48 @@ def test_continuous_ksm_monitors_page_on_no_data():
         bundle.crashloop.notify_no_data,
         bundle.restart_spike.notify_no_data,
     ).apply(_check)
+
+
+def test_credential_acquisition_query_covers_fleet_and_both_signals() -> None:
+    """#389: the one monitor must see every workload AND both failure
+    shapes (boot-proof event + botocore's mid-run error class)."""
+    q = credential_acquisition_failure_query("prod")
+    # Wildcard on purpose: a 5th grug service (or the rotator's own cred
+    # failure) must be covered without editing the monitor.
+    assert "service:grug-*" in q
+    assert "roles_anywhere_identity_failed" in q
+    assert "CredentialRetrievalError" in q
+    # Mid-run non-retrieval classes (rolled-back pod on a deleted key,
+    # mangled profile) must page too - audit #389 stage 2.
+    assert "NoCredentialsError" in q and "InvalidClientTokenId" in q
+    assert 'rollup("count")' in q and "> 0" in q
+    assert "env:prod" in q
+
+
+@pulumi.runtime.test
+def test_credential_monitor_is_log_alert_and_not_no_data():
+    """#389 audit stage-7: a make-everything-page-on-no-data sweep would
+    turn this log monitor into a nightly flapper; pin its shape."""
+    import pulumi_datadog as datadog
+
+    from components import dd_monitors
+
+    provider = datadog.Provider("test-dd-cred", api_key="x", app_key="y")
+    bundle = dd_monitors.create_all(
+        env="prod",
+        notify_handle="@webhook-grug-discord-monitoring",
+        webhook_public_url="https://webhook.example/webhook/github",
+        api_public_url="https://api.example",
+        provider=provider,
+    )
+
+    def check(args):
+        mtype, no_data = args
+        assert mtype == "log alert"
+        assert no_data is False
+
+    return pulumi.Output.all(
+        bundle.credential_acquisition_fail.type,
+        bundle.credential_acquisition_fail.notify_no_data,
+    ).apply(check)
+

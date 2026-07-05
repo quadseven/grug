@@ -4,6 +4,26 @@
 # tree):  docker build services -f services/api/Dockerfile
 # FastAPI app served by uvicorn under ddtrace-run (APM via the node's
 # Datadog agent - DD_AGENT_HOST is injected by the Deployment).
+# Build the AWS Roles Anywhere credential helper from source at a PINNED
+# tag (#388, ADR-0008): the public binary distribution URLs are not
+# reliably fetchable, and a source build pins provenance to the aws/
+# rolesanywhere-credential-helper tag. Used by the SDK
+# credential_process on every workload since the #389 rollout.
+FROM golang:1.26-bookworm AS signing-helper
+ARG SIGNING_HELPER_VERSION=v1.8.4
+# CGO stays ON: the helper's pkcs11 support (miekg/pkcs11) is cgo-only
+# and CGO_ENABLED=0 fails compilation. The binary links the BUILDER's
+# glibc, so the invariant is DIRECTIONAL: runtime glibc >= builder glibc
+# (python:*-slim tracks newer Debian than the pinned golang builder -
+# forward-compatible). The image gate execs the binary inside the
+# runtime image, so a violation dies pre-merge, not in a pod.
+RUN git clone --depth 1 --branch ${SIGNING_HELPER_VERSION} \
+      https://github.com/aws/rolesanywhere-credential-helper /src \
+ && cd /src \
+ && go build -trimpath -ldflags "-s -w" \
+      -o /aws_signing_helper . \
+ && /aws_signing_helper version
+
 FROM python:3.13-slim AS runtime
 
 ARG DD_GIT_REPOSITORY_URL=""
@@ -22,6 +42,7 @@ COPY api/requirements.txt .
 # library dependency of the app code, only of this runtime image).
 RUN pip install --no-cache-dir -r requirements.txt "uvicorn>=0.34,<1"
 
+COPY --from=signing-helper /aws_signing_helper /usr/local/bin/aws_signing_helper
 COPY _shared/ ./_shared/
 COPY api/ ./
 

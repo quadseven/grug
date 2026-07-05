@@ -39,6 +39,7 @@ class _MonitorBundle:
     cf_secret_mismatch: datadog.Monitor
     key_rotation_fail: datadog.Monitor
     uptime: datadog.SyntheticsTest
+    credential_acquisition_fail: datadog.Monitor
 
 
 def _common_tags(env: str, service: str) -> list[str]:
@@ -91,6 +92,23 @@ def restart_spike_query() -> str:
     return (
         "change(max(last_10m),last_10m):max:kubernetes_state.container.restarts"
         "{" + _NS + "} by {pod_name} > 3"
+    )
+
+
+def credential_acquisition_failure_query(env: str) -> str:
+    """#389: any workload failing to acquire (or prove) Roles Anywhere
+    credentials. Keys on the shared aws_identity event name plus
+    botocore's CredentialRetrievalError string so BOTH the boot-proof
+    path and a mid-run SDK acquisition failure alert. All four grug
+    services emit it; one monitor covers the fleet."""
+    # service:grug-* on purpose (audit #389-1): auto-covers a future 5th
+    # service AND the key-rotator's own CredentialRetrievalError (the
+    # reserve custodian's cred failing is page-worthy too).
+    return (
+        f'logs("service:grug-* env:{env} '
+        '(roles_anywhere_identity_failed OR CredentialRetrievalError '
+        'OR NoCredentialsError OR InvalidClientTokenId)")'
+        '.index("*").rollup("count").last("15m") > 0'
     )
 
 
@@ -266,6 +284,30 @@ def create_all(
         tags=_common_tags(env, "grug-webhook"),
         notify_no_data=False,
         priority=3,
+        opts=opts,
+    )
+
+    # 3c) Roles Anywhere credential-acquisition failures (#389 AC): the
+    #     cert path is fleet-wide now; a broken chain/cert/trust surfaces
+    #     as roles_anywhere_identity_failed (boot proof) or botocore
+    #     CredentialRetrievalError (mid-run). Zero tolerance - one event
+    #     pages (single-operator scale, realistic pager).
+    credential_acquisition_fail = datadog.Monitor(
+        "grug-roles-anywhere-credential-fail",
+        type="log alert",
+        name="[grug] Roles Anywhere credential acquisition failing (15min)",
+        message=(
+            f"{notify_handle}\n"
+            "A grug workload cannot acquire (or prove) Roles Anywhere "
+            "credentials - broken cert chain, stuck renewal, wrong "
+            "identity, or Roles Anywhere outage. Pods fail loud at boot; "
+            "the poller fails per tick.\n"
+            "Runbook: docs/RUNBOOK.md#roles-anywhere-credential-path-grug-poller-tracer-388"
+        ),
+        query=credential_acquisition_failure_query(env),
+        tags=_common_tags(env, "grug"),
+        notify_no_data=False,
+        priority=2,
         opts=opts,
     )
 
@@ -452,10 +494,11 @@ def create_all(
         name="[grug] AWS key-rotation failed (interim rotator)",
         message=(
             f"{notify_handle}\n"
-            "The interim grug-k8s-pod key rotation failed. The old key is kept "
-            "valid so pods still work, but rotation is stuck - check the "
-            "grug-key-rotator Job logs (a dangling new key may need manual "
-            "cleanup; AWS caps the user at 2 keys).\n"
+            "The grug-k8s-pod key rotation failed. Since #389 NO workload "
+            "consumes this key - it is the ROLLBACK RESERVE, and a stuck "
+            "rotation degrades the rollback path; fix it before you need "
+            "it. Check the grug-key-rotator Job logs (a dangling new key "
+            "may need manual cleanup; AWS caps the user at 2 keys).\n"
             "Runbook: docs/RUNBOOK.md#key-rotation"
         ),
         query=(
@@ -523,4 +566,5 @@ def create_all(
         cf_secret_mismatch=cf_secret_mismatch,
         key_rotation_fail=key_rotation_fail,
         uptime=uptime,
+        credential_acquisition_fail=credential_acquisition_fail,
     )

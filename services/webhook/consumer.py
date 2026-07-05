@@ -269,6 +269,12 @@ def _startup_check() -> None:
     reachable", not a second drifting copy. Imported lazily so the check picks
     up test monkeypatches and the module's boto3 client is built only when the
     consumer actually runs."""
+    # Roles Anywhere boot proof (#389): credentials are the DEEPEST dep -
+    # prove the cert path (or crash loud) before probing anything else.
+    from aws_identity import prove_roles_anywhere_identity
+
+    prove_roles_anywhere_identity()
+
     from readiness import check_readiness
 
     rep = check_readiness()

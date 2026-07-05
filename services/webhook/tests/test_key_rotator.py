@@ -212,3 +212,21 @@ def test_main_requires_rotate_secret_loudly(monkeypatch):
     monkeypatch.delenv("GRUG_ROTATE_SECRET", raising=False)
     with pytest.raises(KeyError, match="GRUG_ROTATE_SECRET"):
         key_rotator.main()
+
+
+def test_rotate_with_no_deployments_restarts_nothing():
+    """#389: GRUG_ROTATE_DEPLOYMENTS is empty in prod (nothing consumes
+    the reserve) - rotation must complete WITHOUT bouncing any workload.
+    The manifest comment's whole claim rests on this branch."""
+    iam = FakeIam(["AKIA-OLD"])
+    k8s = FakeKube(current_key_id="AKIA-OLD")
+    res = rotate(
+        iam, k8s, pod_user="grug-k8s-pod", secret_name="grug-aws-static-key",
+        deployments=[], stamp="2026-01-01T00:00:00Z",
+        sleep=lambda _s: None, now=_fake_clock(),
+    )
+    assert res.rotated is True
+    assert not [c for c in k8s.calls if c[0] == "restart"]
+    # Old key still deleted - the reserve stays single-keyed.
+    assert ("delete", "AKIA-OLD") in iam.calls
+
