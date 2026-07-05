@@ -50,3 +50,18 @@ def test_webhook_secret_from_env_in_preview(monkeypatch):
     monkeypatch.setenv("GRUG_PREVIEW_WEBHOOK_SECRET", "fake-preview-secret")
     import secrets_loader
     assert secrets_loader.get_webhook_secret() == "fake-preview-secret"
+
+
+def test_webhook_secret_fallback_is_random_not_predictable(monkeypatch):
+    """#531 Qodo: an unconfigured preview must REJECT unknown HMACs, not
+    accept a predictable 'preview-not-configured'. The fallback is a
+    per-process random token (stable within the process, unguessable)."""
+    monkeypatch.setenv("GRUG_PREVIEW", "1")
+    monkeypatch.setenv("POD_NAMESPACE", "grug-pr-7")
+    monkeypatch.delenv("GRUG_PREVIEW_WEBHOOK_SECRET", raising=False)
+    import secrets_loader
+    secrets_loader._PREVIEW_FALLBACK_SECRET = None
+    v1 = secrets_loader.get_webhook_secret()
+    v2 = secrets_loader.get_webhook_secret()
+    assert v1 == v2  # stable within the process
+    assert v1 != "preview-not-configured" and len(v1) >= 32  # random, not predictable

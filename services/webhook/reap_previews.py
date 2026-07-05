@@ -53,7 +53,13 @@ def _preview_namespaces() -> list[dict]:
         if pr_of_namespace(name) is None:
             continue
         ts = item["metadata"].get("creationTimestamp")
-        created = datetime.strptime(ts, "%Y-%m-%dT%H:%M:%SZ").replace(tzinfo=timezone.utc)
+        try:
+            created = datetime.strptime(ts, "%Y-%m-%dT%H:%M:%SZ").replace(tzinfo=timezone.utc)
+        except (TypeError, ValueError):
+            # One unparseable timestamp must not abort the whole sweep
+            # (Qodo review on #531); skip it - next run retries.
+            print(f"::warning:: unparseable creationTimestamp on {name}: {ts!r}", file=sys.stderr)
+            continue
         out.append({"namespace": name, "age_hours": (now - created).total_seconds() / 3600})
     return out
 

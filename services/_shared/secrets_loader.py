@@ -20,6 +20,7 @@ import boto3
 
 log = logging.getLogger(f"{os.getenv('DD_SERVICE', 'grug')}.secrets")
 _ssm = boto3.client("ssm")
+_PREVIEW_FALLBACK_SECRET: str | None = None
 
 # The recognized Elder prompt-experiment arms (#191). A value outside this set
 # (operator typo / stray whitespace) is treated as "off" — same safe default as
@@ -46,7 +47,18 @@ def get_webhook_secret() -> str:
     # engage in prod, so prod always takes the SSM path.
     from preview_mode import preview_mode
     if preview_mode():
-        return os.environ.get("GRUG_PREVIEW_WEBHOOK_SECRET", "preview-not-configured")
+        # The preview workflow always injects a fresh random secret; if it
+        # is somehow absent, fall back to a per-PROCESS random value (Qodo
+        # review on #531) - an unconfigured preview then REJECTS every HMAC
+        # rather than accepting a predictable "preview-not-configured".
+        env_secret = os.environ.get("GRUG_PREVIEW_WEBHOOK_SECRET")
+        if env_secret:
+            return env_secret
+        global _PREVIEW_FALLBACK_SECRET
+        if _PREVIEW_FALLBACK_SECRET is None:
+            import secrets as _secrets
+            _PREVIEW_FALLBACK_SECRET = _secrets.token_hex(32)
+        return _PREVIEW_FALLBACK_SECRET
     name = os.getenv("GITHUB_APP_WEBHOOK_SECRET_SSM", "")
     return _get_ssm_secure_string(name)
 
