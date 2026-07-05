@@ -307,14 +307,27 @@ jobs:
           # rotated-wrong registry credential can survive a rollback (with
           # imagePullPolicy Always, a bad pull secret would strand the
           # rollback pods). Metadata stripped so kubectl apply accepts it.
-          snap() {  # snap <ns> <secret> <file>
-            kubectl -n "$1" get secret "$2" -o json --ignore-not-found \
-              | python3 -c "import json,sys; d=sys.stdin.read(); d=json.loads(d) if d.strip() else None; [d['metadata'].pop(k, None) for k in ('resourceVersion','uid','creationTimestamp','managedFields') ] if d else None; print(json.dumps(d)) if d else None" \
-              > "$RUNNER_TEMP/$3" || true
+          # Three-state snapshot protocol (codex r8): a snapshot READ
+          # failure must never masquerade as absence - restore may only
+          # DELETE a secret on a confirmed NotFound. States: <file>.pre.json
+          # non-empty = confirmed present; <file>.absent marker = confirmed
+          # absent; NEITHER = snapshot failed -> restore leaves that secret
+          # untouched and demands manual review.
+          snap() {  # snap <ns> <secret> <file-stem>
+            local out rc err
+            err="$RUNNER_TEMP/$3.snap-err"
+            if out=$(kubectl -n "$1" get secret "$2" -o json 2> "$err"); then
+              printf '%s' "$out" | python3 -c "import json,sys; d=json.load(sys.stdin); [d['metadata'].pop(k, None) for k in ('resourceVersion','uid','creationTimestamp','managedFields')]; print(json.dumps(d))" \
+                > "$RUNNER_TEMP/$3.pre.json"
+            elif grep -qi "NotFound" "$err"; then
+              : > "$RUNNER_TEMP/$3.absent"
+            else
+              echo "::warning::snapshot of $2@$1 FAILED (not NotFound) - rollback will not touch this secret: $(head -c 120 "$err")"
+            fi
           }
-          snap grug grug-secrets grug-secrets.pre.json
-          snap grug registry-pull registry-pull-grug.pre.json
-          snap grug-trial registry-pull registry-pull-trial.pre.json
+          snap grug grug-secrets grug-secrets
+          snap grug registry-pull registry-pull-grug
+          snap grug-trial registry-pull registry-pull-trial
           ENVF="$RUNNER_TEMP/grug-secrets.env"
           install -m 600 /dev/null "$ENVF"
           {
@@ -566,17 +579,21 @@ jobs:
           # hazard the seed's own delete-then-create exists to prevent.
           # Empty snapshot = the object did not exist pre-deploy: restore
           # ABSENCE by deleting whatever the failed run seeded.
-          restore() {  # restore <ns> <secret> <file>
-            kubectl -n "$1" delete secret "$2" --ignore-not-found
-            if [ -s "$RUNNER_TEMP/$3" ]; then
-              kubectl -n "$1" apply -f "$RUNNER_TEMP/$3"
+          restore() {  # restore <ns> <secret> <file-stem>
+            if [ -s "$RUNNER_TEMP/$3.pre.json" ]; then
+              kubectl -n "$1" delete secret "$2" --ignore-not-found
+              kubectl -n "$1" apply -f "$RUNNER_TEMP/$3.pre.json"
+            elif [ -e "$RUNNER_TEMP/$3.absent" ]; then
+              # confirmed absent pre-deploy: restore ABSENCE
+              kubectl -n "$1" delete secret "$2" --ignore-not-found
+              echo "::warning::$2@$1 did not exist pre-deploy - deleted the seeded object"
             else
-              echo "::warning::$2@$1 had no pre-deploy snapshot - restored its ABSENCE"
+              echo "::error::$2@$1 snapshot FAILED pre-deploy - secret left AS-IS, review manually"
             fi
           }
-          restore grug grug-secrets grug-secrets.pre.json
-          restore grug registry-pull registry-pull-grug.pre.json
-          restore grug-trial registry-pull registry-pull-trial.pre.json
+          restore grug grug-secrets grug-secrets
+          restore grug registry-pull registry-pull-grug
+          restore grug-trial registry-pull registry-pull-trial
           echo "restored pre-deploy secret state (exact, delete-then-create)" >> "$GITHUB_STEP_SUMMARY"
           # Container names per the live manifests: webhook/webhook,
           # api/webhook (historical), consumer/consumer, poller/poller.
@@ -629,4 +646,4 @@ jobs:
 
       - name: Cleanup
         if: always()
-        run: rm -f "$HOME/.kube/config" "$RUNNER_TEMP"/grug-secrets.pre.json "$RUNNER_TEMP"/registry-pull-*.pre.json
+        run: rm -f "$HOME/.kube/config" "$RUNNER_TEMP"/*.pre.json "$RUNNER_TEMP"/*.absent "$RUNNER_TEMP"/*.snap-err
