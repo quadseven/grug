@@ -62,7 +62,10 @@ consumed per project.
    workload. A project's blast radius is its own role; the shared CA does not
    widen it.
 3. **Pod certs are short-lived and auto-renewed.** A cert-manager `Certificate`
-   issues the pod cert+key into a Secret with **duration 6h, renewBefore 2h**.
+   issues the pod cert+key into a Secret with **duration 6h, renewBefore 4h**
+   (aligned at #388 with the infrastructure tenant recipe proven in the #1318
+   acceptance; this ADR originally said 2h - 4h renews earlier, never letting
+   a pod hold a cert within 4h of expiry).
    STS sessions from `aws_signing_helper` are ~1h. A leaked cert is useless
    within hours; a leaked STS session within ~1h.
 4. **grug creds delivery: `aws_signing_helper` baked into the image + SDK

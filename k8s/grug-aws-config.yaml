@@ -1,0 +1,23 @@
+# AWS SDK config for the Roles Anywhere credential path (#388, ADR-0008).
+# Mounted by grug-poller (the tracer workload); the ARNs are seeded by
+# deploy.k8s.yml from SSM (/infra/roles-anywhere/trust_anchor_arn +
+# /infra/roles-anywhere/grug/{profile_arn,role_arn}) - they carry the
+# account id, so they reach this PUBLIC repo only as placeholders, never
+# literals (same pattern as REGISTRY_PLACEHOLDER).
+#
+# The SDK runs aws_signing_helper (baked into the webhook image) per
+# credential refresh: X.509 leaf (cert-manager Secret grug-pki-tls) ->
+# Roles Anywhere -> ~1h STS session. --intermediates is REQUIRED: the
+# trust anchor is the offline ROOT, and ca.crt in the cert-manager Secret
+# is the signing INTERMEDIATE the chain must present (infrastructure
+# ADR 0015 recipe).
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: grug-aws-config
+  namespace: grug
+data:
+  config: |
+    [default]
+    region = us-east-1
+    credential_process = aws_signing_helper credential-process --certificate /var/run/grug-pki/tls.crt --private-key /var/run/grug-pki/tls.key --intermediates /var/run/grug-pki/ca.crt --trust-anchor-arn RA_TRUST_ANCHOR_ARN_PLACEHOLDER --profile-arn RA_PROFILE_ARN_PLACEHOLDER --role-arn RA_ROLE_ARN_PLACEHOLDER

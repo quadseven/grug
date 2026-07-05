@@ -129,11 +129,15 @@ jobs:
           # authorizing those reads, the database URL, and two
           # deploy-resolved values that must not be committed as
           # literals (the queue URL embeds the account id).
+          # #388 SPLIT: the static AWS key pair lives in its OWN Secret
+          # (grug-aws-static-key) so the poller - the Roles Anywhere tracer
+          # workload - can receive grug-secrets WITHOUT env credentials
+          # (env creds out-rank credential_process in the SDK chain and
+          # would silently bypass the cert path). api/webhook/consumer
+          # keep envFrom BOTH until the #389 rollout retires the key.
           ENVF="$RUNNER_TEMP/grug-secrets.env"
           install -m 600 /dev/null "$ENVF"
           {
-            echo "AWS_ACCESS_KEY_ID=$(get /grug/k8s-pod-aws-access-key-id)"
-            echo "AWS_SECRET_ACCESS_KEY=$(get /grug/k8s-pod-aws-secret-access-key)"
             echo "AWS_DEFAULT_REGION=us-east-1"
             echo "GRUG_DATABASE_URL=$(get /grug/database-url)"
             # GRUG_KMS_CMK_ARN: envelope-encryption CMK for OAuth/credential
@@ -166,6 +170,22 @@ jobs:
           kubectl -n grug create secret generic grug-secrets \
             --from-env-file="$ENVF"
           rm -f "$ENVF"
+          # Static AWS key pair (#388 split; #389 deletes this block).
+          KEYF="$RUNNER_TEMP/grug-aws-static-key.env"
+          install -m 600 /dev/null "$KEYF"
+          {
+            echo "AWS_ACCESS_KEY_ID=$(get /grug/k8s-pod-aws-access-key-id)"
+            echo "AWS_SECRET_ACCESS_KEY=$(get /grug/k8s-pod-aws-secret-access-key)"
+          } > "$KEYF"
+          if grep -qE '=$|=None$' "$KEYF"; then
+            echo "::error::empty/None value(s) in grug-aws-static-key seed:"
+            grep -nE '=$|=None$' "$KEYF" | cut -d= -f1
+            exit 1
+          fi
+          kubectl -n grug delete secret grug-aws-static-key --ignore-not-found
+          kubectl -n grug create secret generic grug-aws-static-key \
+            --from-env-file="$KEYF"
+          rm -f "$KEYF"
           # Rotator credential (#386): SEPARATE from grug-secrets, scoped to
           # access-key ops on grug-k8s-pod only. The key-rotator CronJob uses
           # THIS, never grug-secrets (which it rotates). Same 0600 env-file
@@ -219,14 +239,30 @@ jobs:
           # bare `TAG_PLACEHOLDER` substitution below only hits the remaining
           # standalone uses (the DD_VERSION env value: TAG_PLACEHOLDER), which
           # must still resolve to the git SHA for version tagging.
+          # Roles Anywhere tenant ARNs (#388): seeded from SSM into the
+          # grug-aws-config ConfigMap - the ARNs carry the account id, so
+          # the PUBLIC repo holds only placeholders. Fail LOUD on an empty
+          # lookup (the tenant must be applied in infrastructure first).
+          RA_ANCHOR="$(aws ssm get-parameter --name /infra/roles-anywhere/trust_anchor_arn --query Parameter.Value --output text)"
+          RA_PROFILE="$(aws ssm get-parameter --name /infra/roles-anywhere/grug/profile_arn --query Parameter.Value --output text)"
+          RA_ROLE="$(aws ssm get-parameter --name /infra/roles-anywhere/grug/role_arn --query Parameter.Value --output text)"
+          for v in RA_ANCHOR RA_PROFILE RA_ROLE; do
+            if [ -z "${!v}" ] || [ "${!v}" = "None" ]; then
+              echo "::error::Roles Anywhere ARN lookup $v came back empty - is the grug tenant applied in infrastructure (infra-pki)?"
+              exit 1
+            fi
+          done
           sed -i \
             -e "s|REGISTRY_PLACEHOLDER/grug-api:TAG_PLACEHOLDER|${IMAGE_API}|g" \
             -e "s|REGISTRY_PLACEHOLDER/grug-webhook:TAG_PLACEHOLDER|${IMAGE_WEBHOOK}|g" \
             -e "s|TAG_PLACEHOLDER|${GITHUB_SHA}|g" \
+            -e "s|RA_TRUST_ANCHOR_ARN_PLACEHOLDER|${RA_ANCHOR}|g" \
+            -e "s|RA_PROFILE_ARN_PLACEHOLDER|${RA_PROFILE}|g" \
+            -e "s|RA_ROLE_ARN_PLACEHOLDER|${RA_ROLE}|g" \
             k8s/*.yaml
           # Post-sed sentinel: a future manifest that escapes substitution
           # must fail the deploy, not ship a literal placeholder (F7).
-          if grep -rn 'REGISTRY_PLACEHOLDER\|TAG_PLACEHOLDER' k8s/; then
+          if grep -rn 'REGISTRY_PLACEHOLDER\|TAG_PLACEHOLDER\|RA_.*_ARN_PLACEHOLDER' k8s/; then
             echo "::error::unsubstituted placeholder in k8s/"; exit 1
           fi
           kubectl apply -k k8s/
