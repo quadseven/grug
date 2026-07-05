@@ -170,3 +170,169 @@ def test_credential_monitor_is_log_alert_and_not_no_data():
         bundle.credential_acquisition_fail.notify_no_data,
     ).apply(check)
 
+
+
+# --- #379: owned SQS depth gauges -------------------------------------
+
+def test_no_owned_queue_query_references_uncollected_aws_sqs() -> None:
+    """The DD AWS integration does not collect aws.sqs.* in this org - a
+    monitor on it is permanently blind (the trap that shipped three blind
+    monitors). Every queue monitor must ride an owned grug.sqs.* gauge."""
+    from components.dd_monitors import all_owned_queue_queries
+
+    for q in all_owned_queue_queries("prod"):
+        assert "aws.sqs." not in q, f"uncollected aws.sqs metric in: {q}"
+        assert "grug.sqs." in q
+
+
+def test_owned_queue_queries_are_env_scoped() -> None:
+    """Every owned query filters env explicitly (gemini peer review): the
+    owned gauges carry a reliable env tag, and an unscoped query would let
+    a healthy dev emitter mask a dead prod one."""
+    from components.dd_monitors import all_owned_queue_queries
+
+    for q in all_owned_queue_queries("prod"):
+        assert "env:prod" in q, f"env-unscoped query: {q}"
+    for q in all_owned_queue_queries("dev"):
+        assert "env:dev" in q
+
+
+def test_owned_queue_queries_tag_exact_queue_names() -> None:
+    """Queue tags must match the consumer's emission exactly - the fixed
+    Pulumi `name=` values with the .fifo suffix. One monitor per queue,
+    simple filters (no OR/AND boolean filter syntax - an apply-time
+    validation risk preview cannot catch)."""
+    from components import dd_monitors as m
+
+    assert "queue:grug-cave-jobs.fifo" in m.cave_jobs_backlog_query("prod")
+    assert "queue:grug-rerun-jobs.fifo" in m.rerun_backlog_query("prod")
+    assert "queue:grug-cave-results.fifo" in m.cave_results_backlog_query("prod")
+    assert "queue:grug-rerun-jobs-dlq.fifo" in m.rerun_dlq_depth_query("prod")
+    assert "queue:grug-cave-jobs-dlq.fifo" in m.cave_jobs_dlq_depth_query("prod")
+    assert "queue:grug-cave-results-dlq.fifo" in m.cave_results_dlq_depth_query("prod")
+    for q in m.all_owned_queue_queries("prod"):
+        assert " OR " not in q and " AND " not in q
+
+
+def test_backlog_queries_use_sustained_semantics_and_health_is_intermittent_proof() -> None:
+    """Backlog monitors require depth across the FULL window (min > 0);
+    DLQ monitors are any-message (max > 0). The health query is avg-of-avg
+    per queue < 0.5 so an INTERMITTENT partial failure cannot hide behind
+    one good sweep (codex peer review) and a single blip does not flap."""
+    from components import dd_monitors as m
+
+    assert m.cave_jobs_backlog_query("prod").startswith("min(last_15m):")
+    assert m.rerun_backlog_query("prod").startswith("min(last_15m):")
+    assert m.cave_results_backlog_query("prod").startswith("min(last_15m):")
+    assert m.rerun_dlq_depth_query("prod").startswith("max(last_15m):")
+    assert m.cave_jobs_dlq_depth_query("prod").startswith("max(last_15m):")
+    assert m.cave_results_dlq_depth_query("prod").startswith("max(last_15m):")
+    hq = m.telemetry_health_query("prod")
+    assert hq.startswith("avg(last_15m):avg:")
+    assert "grug.sqs.telemetry_queue_ok" in hq
+    assert " by {queue}" in hq
+    assert "< 0.5" in hq
+
+
+def _consumer_module_ast():
+    """Parse the consumer module WITHOUT importing it (it builds a boto3
+    client at import; this test env has no AWS runtime)."""
+    import ast
+    from pathlib import Path
+
+    src = (
+        Path(__file__).resolve().parents[3]
+        / "services" / "webhook" / "consumer.py"
+    ).read_text()
+    return ast.parse(src)
+
+
+def _consumer_telemetry_queue_names() -> list[str]:
+    import ast
+
+    for node in ast.walk(_consumer_module_ast()):
+        if isinstance(node, ast.Assign):
+            for target in node.targets:
+                if getattr(target, "id", "") == "_TELEMETRY_QUEUE_NAMES":
+                    return [el.value for el in node.value.elts]
+    raise AssertionError("_TELEMETRY_QUEUE_NAMES not found in consumer.py")
+
+
+def test_monitor_queue_tags_subset_of_consumer_emission() -> None:
+    """Cross-package name-drift guard (audit stage-8): a queue name in a
+    monitor query that the consumer does not emit = that monitor is
+    permanently blind (No Data, notify_no_data=false) - the exact trap
+    this family exists to retire. The emitter tuple is the source of
+    truth; monitors may watch a subset."""
+    import re
+
+    from components.dd_monitors import all_owned_queue_queries
+
+    emitted = set(_consumer_telemetry_queue_names())
+    queried = set()
+    for q in all_owned_queue_queries("prod"):
+        queried.update(re.findall(r"queue:([a-z0-9.-]+)", q))
+    assert queried, "no queue tags found in owned queries"
+    missing = queried - emitted
+    assert not missing, f"monitors query queues the consumer never emits: {missing}"
+
+
+def test_every_consumer_queue_has_a_depth_monitor() -> None:
+    """The inverse guard: every queue the consumer sweeps is watched by at
+    least one depth monitor - an emitted-but-unmonitored queue is quiet
+    coverage rot."""
+    import re
+
+    from components.dd_monitors import all_owned_queue_queries
+
+    emitted = set(_consumer_telemetry_queue_names())
+    queried = set()
+    for q in all_owned_queue_queries("prod"):
+        queried.update(re.findall(r"queue:([a-z0-9.-]+)", q))
+    unmonitored = emitted - queried
+    assert not unmonitored, f"consumer sweeps unmonitored queues: {unmonitored}"
+
+
+@pulumi.runtime.test
+def test_owned_queue_monitors_no_data_pager_placement():
+    """Pin each monitor's (query, notify_no_data) pair (audit stage-7):
+    the telemetry-health monitor is the family's ONLY no-data pager - a
+    silent flip (or a copy-paste swapping builder queries between
+    monitors) re-creates the blind-monitor trap with green tests."""
+    import pulumi_datadog as datadog
+
+    from components import dd_monitors
+
+    provider = datadog.Provider("test-dd-queues", api_key="x", app_key="y")
+    bundle = dd_monitors.create_owned_queue_monitors(
+        env="prod",
+        notify_handle="@webhook-grug-discord-monitoring",
+        provider=provider,
+    )
+
+    expected = {
+        "cave_jobs_backlog": (dd_monitors.cave_jobs_backlog_query("prod"), False),
+        "rerun_backlog": (dd_monitors.rerun_backlog_query("prod"), False),
+        "cave_results_backlog": (dd_monitors.cave_results_backlog_query("prod"), False),
+        "rerun_dlq": (dd_monitors.rerun_dlq_depth_query("prod"), False),
+        "cave_jobs_dlq": (dd_monitors.cave_jobs_dlq_depth_query("prod"), False),
+        "cave_results_dlq": (dd_monitors.cave_results_dlq_depth_query("prod"), False),
+        "telemetry_health": (dd_monitors.telemetry_health_query("prod"), True),
+    }
+
+    checks = []
+    for field, (want_query, want_no_data) in expected.items():
+        monitor = getattr(bundle, field)
+
+        def check(args, wq=want_query, wnd=want_no_data, f=field):
+            query, no_data, full_window = args
+            assert query == wq, f"{f}: query mismatch: {query}"
+            assert bool(no_data) is wnd, f"{f}: notify_no_data={no_data}, want {wnd}"
+            assert full_window is False, f"{f}: require_full_window must be False"
+
+        checks.append(
+            pulumi.Output.all(
+                monitor.query, monitor.notify_no_data, monitor.require_full_window,
+            ).apply(check)
+        )
+    return pulumi.Output.all(*checks)
