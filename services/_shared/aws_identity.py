@@ -40,7 +40,7 @@ def prove_roles_anywhere_identity() -> None:
         log.info("roles_anywhere_identity_skipped")
         return
     try:
-        if os.getenv("AWS_ACCESS_KEY_ID"):
+        if os.getenv("AWS_ACCESS_KEY_ID") or os.getenv("AWS_SECRET_ACCESS_KEY"):
             raise RuntimeError(
                 "static AWS creds present in the pod env - the Roles Anywhere "
                 "path is being bypassed (#388/#389); see RUNBOOK 'Roles Anywhere'"
@@ -51,6 +51,13 @@ def prove_roles_anywhere_identity() -> None:
         arn = ident.get("Arn", "")
         expected_role_arn = os.getenv("GRUG_RA_ROLE_ARN", "")
         if expected_role_arn:
+            # Pre-validate so a mangled/unsubstituted value raises an
+            # actionable error, not a cryptic IndexError (peer review).
+            if not expected_role_arn.startswith("arn:aws:iam::") or "/" not in expected_role_arn:
+                raise ValueError(
+                    f"GRUG_RA_ROLE_ARN is not an IAM role ARN: {expected_role_arn!r} "
+                    "(unsubstituted placeholder or manifest drift?)"
+                )
             account = expected_role_arn.split(":")[4]
             role_name = expected_role_arn.rsplit("/", 1)[-1]
             expected_prefix = f"arn:aws:sts::{account}:assumed-role/{role_name}/"

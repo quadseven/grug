@@ -70,6 +70,9 @@ jobs:
           if [ "$rc" -eq 0 ]; then
             echo "::error::boot proof did NOT refuse static creds + RA config"; exit 1
           fi
+          echo "$out" | grep -q "static AWS creds present" || {
+            echo "::error::wrong failure mode (expected the static-creds refusal)"; echo "$out" | tail -5; exit 1
+          }
           echo "$out" | grep -q "roles_anywhere_identity_failed" || {
             echo "::error::monitored event missing from boot failure output"; echo "$out" | tail -5; exit 1
           }
