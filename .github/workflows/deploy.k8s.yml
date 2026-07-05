@@ -561,15 +561,23 @@ jobs:
           # rollback covers images + every durable object this run
           # mutates; the pods restarted below mount the restored values
           # and pull with the restored credential.
-          for pair in "grug:grug-secrets.pre.json" "grug:registry-pull-grug.pre.json" "grug-trial:registry-pull-trial.pre.json"; do
-            ns="${pair%%:*}"; f="${pair#*:}"
-            if [ -s "$RUNNER_TEMP/$f" ]; then
-              kubectl -n "$ns" apply -f "$RUNNER_TEMP/$f"
+          # EXACT restore, not an apply overlay (codex r7): apply merges
+          # and would keep stale keys the failed seed added - the same
+          # hazard the seed's own delete-then-create exists to prevent.
+          # Empty snapshot = the object did not exist pre-deploy: restore
+          # ABSENCE by deleting whatever the failed run seeded.
+          restore() {  # restore <ns> <secret> <file>
+            kubectl -n "$1" delete secret "$2" --ignore-not-found
+            if [ -s "$RUNNER_TEMP/$3" ]; then
+              kubectl -n "$1" apply -f "$RUNNER_TEMP/$3"
             else
-              echo "::warning::no $f snapshot from this run - left as seeded"
+              echo "::warning::$2@$1 had no pre-deploy snapshot - restored its ABSENCE"
             fi
-          done
-          echo "restored pre-deploy secret snapshots" >> "$GITHUB_STEP_SUMMARY"
+          }
+          restore grug grug-secrets grug-secrets.pre.json
+          restore grug registry-pull registry-pull-grug.pre.json
+          restore grug-trial registry-pull registry-pull-trial.pre.json
+          echo "restored pre-deploy secret state (exact, delete-then-create)" >> "$GITHUB_STEP_SUMMARY"
           # Container names per the live manifests: webhook/webhook,
           # api/webhook (historical), consumer/consumer, poller/poller.
           kubectl -n grug set image deploy/grug-webhook webhook="$W"
