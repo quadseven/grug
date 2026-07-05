@@ -11,13 +11,14 @@
 # credential refresh: X.509 leaf (cert-manager Secret grug-pki-tls) ->
 # Roles Anywhere -> ~1h STS session. --intermediates is REQUIRED: the
 # trust anchor is the offline ROOT, so the chain must present the signing
-# INTERMEDIATE. We pass ca.crt (a CA-backed ClusterIssuer populates it
-# with the issuing CA cert = the intermediate); ADR 0015's recipe words
-# this as "the intermediate from the tls.crt bundle" - equivalent chain,
-# different file. LIVE-PROVEN at the Secret level (2026-07-05: the
-# issued grug-pki-tls carries ca.crt = 1 intermediate cert, tls.crt =
-# leaf+intermediate bundle); the full STS chain proof is the
-# roles_anywhere_identity_proven log line on first deploy.
+# INTERMEDIATE - and it MUST come from the tls.crt bundle (cert #2),
+# exactly as the ADR 0015 recipe words it. LIVE-DEBUGGED 2026-07-05: in
+# THIS issuer topology ca.crt is the ROOT (cert-manager copies the
+# issuer Secret's own ca.crt), so passing it as --intermediates presents
+# leaf+root with no intermediate and Roles Anywhere 403s with
+# "Untrusted signing certificate" (first deploy failed on it; offline
+# openssl verify pinned the mechanism). The helper reads what it needs
+# from the bundle; do not "clean this up" to ca.crt.
 apiVersion: v1
 kind: ConfigMap
 metadata:
@@ -27,4 +28,4 @@ data:
   config: |
     [default]
     region = us-east-1
-    credential_process = aws_signing_helper credential-process --certificate /var/run/grug-pki/tls.crt --private-key /var/run/grug-pki/tls.key --intermediates /var/run/grug-pki/ca.crt --trust-anchor-arn RA_TRUST_ANCHOR_ARN_PLACEHOLDER --profile-arn RA_PROFILE_ARN_PLACEHOLDER --role-arn RA_ROLE_ARN_PLACEHOLDER
+    credential_process = aws_signing_helper credential-process --certificate /var/run/grug-pki/tls.crt --private-key /var/run/grug-pki/tls.key --intermediates /var/run/grug-pki/tls.crt --trust-anchor-arn RA_TRUST_ANCHOR_ARN_PLACEHOLDER --profile-arn RA_PROFILE_ARN_PLACEHOLDER --role-arn RA_ROLE_ARN_PLACEHOLDER
