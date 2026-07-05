@@ -411,78 +411,14 @@ monitors = dd_monitors.create_all(
     provider=_dd_provider,
 )
 
-# Cave fallback (#310, ADR-0005): jobs queue backing up = the grug-cave-connector
-# isn't draining (down, or can't reach the Cave) → fallback reviews stay
-# `errored`. Informational (P4) until the fallback is live (#313); until then the
-# queue is empty and this never fires. (DLQ + age/depth hardening is #312.)
-_cave_jobs_age_monitor = _datadog.Monitor(
-    "grug-cave-jobs-age",
-    type="metric alert",
-    name="[grug-webhook] Cave fallback jobs queue backing up",
-    message=(
-        f"{_dd_notify}\n"
-        "grug-cave-jobs (Elder cave fallback) has messages older than 10min — the "
-        "grug-cave-connector isn't draining (down, or can't reach the Cave). "
-        "Fallback reviews stay `errored` until it recovers.\n"
-        "Runbook: docs/RUNBOOK.md#elder-async-offload"
-    ),
-    query=(
-        "max(last_15m):max:aws.sqs.approximate_age_of_oldest_message"
-        "{queuename:grug-cave-jobs.fifo} > 600"
-    ),
-    tags=[f"env:{env}", "service:grug-webhook", "team:grug"],
-    notify_no_data=False,
-    priority=4,
-    opts=pulumi.ResourceOptions(provider=_dd_provider),
-)
-
-# Re-run DLQ depth (#305): a job that failed maxReceiveCount times (GitHub fetch
-# failing, or a malformed job) lands here — the operator's re-run didn't
-# complete. Any message is worth a look.
-_rerun_dlq_monitor = _datadog.Monitor(
-    "grug-rerun-dlq-depth",
-    type="metric alert",
-    name="[grug] Re-run DLQ has messages",
-    message=(
-        f"{_dd_notify}\n"
-        "grug-rerun-jobs-dlq has messages — a re-run job exhausted its retries "
-        "(GitHub fetch failing, or a malformed job). The operator's re-run did "
-        "not complete; inspect the DLQ message.\n"
-        "Runbook: docs/RUNBOOK.md#elder-async-offload"
-    ),
-    query=(
-        "max(last_15m):max:aws.sqs.approximate_number_of_messages_visible"
-        "{queuename:grug-rerun-jobs-dlq.fifo} > 0"
-    ),
-    tags=[f"env:{env}", "service:grug-api", "team:grug"],
-    notify_no_data=False,
-    priority=3,
-    opts=pulumi.ResourceOptions(provider=_dd_provider),
-)
-
-# Cave DLQ depth (#312): a job/result that exhausted maxReceiveCount landed in a
-# cave DLQ — a poison message the connector (or webhook) couldn't process.
-# Covers both cave DLQs (the jobs one is the meaningful path; results is mostly
-# inert since the handler never raises).
-_cave_dlq_monitor = _datadog.Monitor(
-    "grug-cave-dlq-depth",
-    type="metric alert",
-    name="[grug] Cave airlock DLQ has messages",
-    message=(
-        f"{_dd_notify}\n"
-        "A cave airlock DLQ (grug-cave-jobs-dlq / grug-cave-results-dlq) has "
-        "messages — a poison job/result exhausted its retries. The fallback "
-        "review for that PR did not complete; inspect the DLQ message.\n"
-        "Runbook: docs/RUNBOOK.md#elder-async-offload"
-    ),
-    query=(
-        "max(last_15m):max:aws.sqs.approximate_number_of_messages_visible"
-        "{queuename:grug-cave-jobs-dlq.fifo OR queuename:grug-cave-results-dlq.fifo} > 0"
-    ),
-    tags=[f"env:{env}", "service:grug-webhook", "team:grug"],
-    notify_no_data=False,
-    priority=3,
-    opts=pulumi.ResourceOptions(provider=_dd_provider),
+# Owned-gauge queue monitors (#379): five monitors (cave-jobs backlog,
+# rerun DLQ, cave DLQs, consumer backlog, telemetry health) built in the
+# component so the synth test pins each (query, notify_no_data) pair. The
+# telemetry-health monitor is the family's ONLY no-data pager.
+_queue_monitors = dd_monitors.create_owned_queue_monitors(
+    env=env,
+    notify_handle=_dd_notify,
+    provider=_dd_provider,
 )
 
 # Fallback-fired rate (#312): the operator's awareness signal that the owned

@@ -35,10 +35,24 @@ from dataclasses import dataclass
 from typing import Any, Callable
 
 import boto3
+from botocore.config import Config as _BotoConfig
 
 log = logging.getLogger(f"{os.getenv('DD_SERVICE', 'grug')}.consumer")
 
 _sqs = boto3.client("sqs")
+
+# Telemetry gets its OWN client with tight timeouts (poolside peer review,
+# PR #516): the default ~60s connect/read timeouts could wedge the
+# telemetry thread for minutes on an SQS brownout (6 sequential probes),
+# skewing the sweep cadence. Depth probes are disposable - fail fast, log,
+# and let the next sweep retry. The consume paths keep the default client:
+# a long-poll receive SHOULD wait.
+_sqs_telemetry = boto3.client(
+    "sqs",
+    config=_BotoConfig(
+        connect_timeout=5, read_timeout=10, retries={"max_attempts": 2},
+    ),
+)
 
 # Receive errors back off so a misconfigured queue URL or an IAM gap
 # logs at a readable rate instead of hot-looping the pod CPU.
@@ -103,6 +117,142 @@ def _esm_event(arn: str, message: dict[str, Any]) -> dict[str, Any]:
             }
         ]
     }
+
+
+# --- owned queue-depth telemetry (#379) ------------------------------
+# The DD AWS integration does not collect aws.sqs.* in this org, which left
+# the queue/DLQ monitors permanently blind; the consumer owns the queues'
+# depth signal instead. Full rationale + monitor semantics:
+# specs/DESIGN.md "Owned queue-depth telemetry".
+
+
+def _telemetry_interval_s() -> float:
+    """Interval knob, clamped to [10, 300]s: a malformed value must not
+    crash the consumer at import for a telemetry knob, near-zero must not
+    hot-loop GetQueueAttributes, and an interval above the monitors' 15m
+    window would starve every query into permanent No Data (the trap this
+    telemetry retires)."""
+    raw = os.getenv("GRUG_QUEUE_TELEMETRY_INTERVAL_S", "60")
+    try:
+        val = float(raw)
+    except ValueError:
+        log.warning("queue_telemetry_bad_interval", extra={"raw": raw})
+        return 60.0
+    clamped = min(300.0, max(10.0, val))
+    if clamped != val:
+        log.warning(
+            "queue_telemetry_interval_clamped",
+            extra={"raw": raw, "clamped": clamped},
+        )
+    return clamped
+
+
+_TELEMETRY_INTERVAL_S = _telemetry_interval_s()
+
+_TELEMETRY_QUEUE_NAMES = (
+    "grug-rerun-jobs.fifo",
+    "grug-rerun-jobs-dlq.fifo",
+    "grug-cave-jobs.fifo",
+    "grug-cave-jobs-dlq.fifo",
+    "grug-cave-results.fifo",
+    "grug-cave-results-dlq.fifo",
+)
+
+
+def _telemetry_base_url() -> str | None:
+    """Derive the account-scoped SQS URL prefix from a queue URL the pod
+    already carries - queue NAMES are fixed (explicit `name=` in Pulumi),
+    so all six URLs are just prefix + fixed name, no extra env plumbing.
+    Returns None (and the caller warns) if no env URL is present or the
+    value has no path segment to strip."""
+    for env_name in ("GRUG_RERUN_QUEUE_URL", "GRUG_CAVE_RESULTS_QUEUE_URL"):
+        url = os.getenv(env_name, "")
+        if not url:
+            continue
+        base, sep, tail = url.rpartition("/")
+        if sep and tail:
+            return base
+    return None
+
+
+def _emit_queue_depth_once() -> int:
+    """One depth sweep. Returns queues successfully PROBED (emit_gauge is
+    fire-and-forget UDP - delivery is the monitors' No Data problem, not
+    ours). Per-queue best-effort: an AccessDenied on one queue must not
+    cost the others their gauge. Each queue also emits a 1/0
+    telemetry_queue_ok boolean per sweep: a queue whose success rate sinks
+    below half over the monitor window pages BY NAME via the
+    '[grug-consumer] Queue telemetry degraded' monitor - so neither a
+    sustained nor an INTERMITTENT partial failure can silently re-blind
+    that queue's depth monitor (audit stage-2 HIGH + codex peer review,
+    PR #516)."""
+    from observability import emit_gauge  # late: patchable, and webhook-image only
+
+    if not os.getenv("DD_AGENT_HOST", ""):
+        # Sweep-level guard: without an agent host every emit would
+        # skip-warn individually (12 lines/min forever); one line per
+        # sweep says the same thing. Total metric silence still reaches
+        # the health monitor's notify_no_data pager.
+        log.warning("queue_telemetry_no_agent_host")
+        return 0
+    base = _telemetry_base_url()
+    if base is None:
+        log.warning("queue_telemetry_no_base_url")
+        return 0
+    probed = 0
+    for name in _TELEMETRY_QUEUE_NAMES:
+        try:
+            attrs = _sqs_telemetry.get_queue_attributes(
+                QueueUrl=f"{base}/{name}",
+                AttributeNames=[
+                    "ApproximateNumberOfMessages",
+                    "ApproximateNumberOfMessagesNotVisible",
+                ],
+            )["Attributes"]
+            emit_gauge(
+                "grug.sqs.messages_visible",
+                float(attrs.get("ApproximateNumberOfMessages", 0)),
+                {"queue": name},
+            )
+            emit_gauge(
+                "grug.sqs.messages_not_visible",
+                float(attrs.get("ApproximateNumberOfMessagesNotVisible", 0)),
+                {"queue": name},
+            )
+            probed += 1
+            emit_gauge("grug.sqs.telemetry_queue_ok", 1.0, {"queue": name})
+        except Exception as e:  # noqa: BLE001 - per-queue best-effort
+            # botocore folds most service errors (AccessDenied, throttle)
+            # into ClientError; the wire Code is the diagnosable bit.
+            code = getattr(e, "response", None)
+            code = (code or {}).get("Error", {}).get("Code") if isinstance(code, dict) else None
+            log.warning(
+                "queue_depth_probe_failed",
+                extra={"queue": name, "kind": type(e).__name__, "code": code},
+            )
+            emit_gauge("grug.sqs.telemetry_queue_ok", 0.0, {"queue": name})
+    return probed
+
+
+def _telemetry_loop() -> None:
+    """Thread body: depth sweep every interval until shutdown. Hard-wrapped
+    never-raise; if this loop somehow dies anyway, the telemetry-health
+    monitor's notify_no_data pages on the metric going silent - the pod is
+    NOT restarted for a telemetry failure (the watchdog excludes this
+    thread on purpose; review data flow > metric flow)."""
+    log.info(
+        "queue_telemetry_started",
+        extra={"interval_s": _TELEMETRY_INTERVAL_S,
+               "queues": len(_TELEMETRY_QUEUE_NAMES)},
+    )
+    while not _stop.is_set():
+        try:
+            _emit_queue_depth_once()
+        except Exception as e:  # noqa: BLE001 - belt-and-suspenders
+            log.warning(
+                "queue_telemetry_cycle_failed", extra={"kind": type(e).__name__},
+            )
+        _stop.wait(_TELEMETRY_INTERVAL_S)
 
 
 def _poll_once(spec: QueueSpec, queue_url: str, arn: str) -> int:
@@ -321,6 +471,14 @@ def main() -> None:
     ]
     for t in threads:
         t.start()
+
+    # Owned queue-depth telemetry (#379). Daemon + OUTSIDE the watchdog
+    # list: a telemetry failure surfaces as the telemetry-health monitor's
+    # No Data page, never as a pod restart that would interrupt review
+    # message flow.
+    threading.Thread(
+        target=_telemetry_loop, name="queue-telemetry", daemon=True,
+    ).start()
     # Watchdog: there is no HTTP probe on this pod, so a consumer thread
     # that dies (missing env, ARN resolve failure, anything escaping
     # _consume) must take the PROCESS down — a half-dead consumer would

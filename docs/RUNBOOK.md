@@ -171,7 +171,7 @@ users re-sign-in to re-encrypt. Zero impact for the admin-only user base.
 - **DD APM:** <https://app.datadoghq.com/apm/services?service=grug-webhook> (also `grug-api`, `grug-consumer`, `grug-poller`)
 - **DD Logs:** <https://app.datadoghq.com/logs?query=service%3Agrug-webhook>
 - **Pod logs:** `kubectl -n grug logs deploy/grug-webhook --tail=200` (note: kubectl logs can be unreliable on the BYON nodes — prefer DD)
-- **Monitors:** k8s-native (CrashLoopBackOff / workload-not-ready / restart-spike / poller-cronjob), all routing to `@webhook-grug-discord-monitoring` (#406)
+- **Monitors:** k8s-native (CrashLoopBackOff / workload-not-ready / restart-spike / poller-cronjob, #406) + owned queue-depth family (cave-jobs backlog / re-run DLQ / cave DLQs / consumer backlog / telemetry health, on `grug.sqs.*` gauges the consumer emits - #379), all routing to `@webhook-grug-discord-monitoring`
 - **Pulumi state + CF dashboard:** via the operator's Pulumi org + Cloudflare account.
 
 ## Service tags
@@ -306,6 +306,22 @@ with `@event:judge_verdicts_unparseable`. Recall/precision baseline lives at
 ### Elder async offload + self-recovery
 
 <a id="elder-async-offload"></a>
+
+**Queue-depth telemetry + monitors (#379):** the consumer emits
+`grug.sqs.messages_visible` / `grug.sqs.messages_not_visible` and a 1/0
+`grug.sqs.telemetry_queue_ok` boolean (all tagged `queue:<name>`) every
+~60s for all six grug queues; aws.sqs.* is NOT collected in this org, so
+these owned gauges are the only queue signal. Alert meanings: backlog
+monitors = that queue never drained across 15min; DLQ monitors = a poison
+message landed (inspect it via the AWS console or `aws sqs
+receive-message` on the DLQ); `Queue telemetry degraded` firing on VALUES
+= that queue's probe success rate fell below half (check
+`queue_depth_probe_failed` warnings for the botocore error `code` -
+AccessDenied means the ra-grug IAM grant regressed); `Queue telemetry
+degraded` in NO DATA = the queue vanished from emission (rename) or the
+consumer/telemetry thread is down entirely - treat as consumer-down and
+check the workload monitors + pod state.
+
 Off the webhook ACK path (#272, k8s mechanics #368): the sync handler ACKs
 GitHub (<10s) and runs the Elder review on an **in-process daemon thread**
 (`async_dispatch.run_elder_job`), idempotent on the `X-GitHub-Delivery` id (a
