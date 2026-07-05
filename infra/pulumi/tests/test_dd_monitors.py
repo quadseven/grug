@@ -336,3 +336,35 @@ def test_owned_queue_monitors_no_data_pager_placement():
             ).apply(check)
         )
     return pulumi.Output.all(*checks)
+
+
+def test_deploy_rollback_query_shape() -> None:
+    """#499: any rollback occurrence pages; env-scoped; count semantics
+    per the DD monitor-syntax gotchas (.as_count on a dogstatsd count)."""
+    from components.dd_monitors import deploy_rollback_query
+
+    q = deploy_rollback_query("prod")
+    assert "grug.deploy.rollback" in q and "env:prod" in q
+    assert q.endswith("> 0") and ".as_count()" in q
+
+
+@pulumi.runtime.test
+def test_deploy_monitor_pin():
+    import pulumi_datadog as datadog
+
+    from components import dd_monitors
+
+    provider = datadog.Provider("test-dd-deploy", api_key="x", app_key="y")
+    bundle = dd_monitors.create_deploy_monitors(
+        env="prod", notify_handle="@webhook-grug-discord-monitoring",
+        provider=provider,
+    )
+
+    def check(args):
+        query, no_data = args
+        assert query == dd_monitors.deploy_rollback_query("prod")
+        assert bool(no_data) is False
+
+    return pulumi.Output.all(
+        bundle.rollback_fired.query, bundle.rollback_fired.notify_no_data,
+    ).apply(check)

@@ -305,6 +305,27 @@ with `@event:judge_verdicts_unparseable`. Recall/precision baseline lives at
 
 ### Elder async offload + self-recovery
 
+<a id="deploy-rollback"></a>
+## Deploy rollback (#499, ADR-0017)
+
+Two paths, both re-applying the `grug-last-good` ConfigMap anchor (the
+digest pair that was running before the last deploy) - no rebuild:
+
+- **Automatic**: every deploy runs a post-apply synthetic (health probes,
+  a signed ping through the full auth stack, 60s zero-restart soak). On
+  failure the deploy rolls itself back, annotates
+  `grug.dev/image-source=rollback-last-good`, emits `grug.deploy.rollback`
+  (pages Discord via the '[grug] Deploy auto-rollback fired' monitor),
+  and fails the run. The bad merge is STILL ON MAIN - revert or fix
+  forward, then let the next deploy re-prove itself.
+- **Manual one-click**: Actions -> deploy.rollback -> Run workflow (main).
+  Same re-apply; safe to drill after a good deploy (anchor == running
+  images = no-op rollout).
+
+Verify state after either path: `kubectl -n grug get deploy -o
+jsonpath='{range .items[*]}{.metadata.name}: {.metadata.annotations.grug\.dev/image-source}{"\n"}{end}'`
+and check the anchor with `kubectl -n grug get configmap grug-last-good -o yaml`.
+
 <a id="elder-async-offload"></a>
 
 **Queue-depth telemetry + monitors (#379):** the consumer emits
