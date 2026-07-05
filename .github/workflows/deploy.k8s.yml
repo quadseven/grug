@@ -273,7 +273,11 @@ jobs:
           # THIS deploy, not the next scheduled tick.
           kubectl -n grug delete job poller-smoke --ignore-not-found
           kubectl -n grug create job poller-smoke --from=cronjob/grug-poller
-          kubectl -n grug wait --for=condition=complete job/poller-smoke --timeout=300s
+          kubectl -n grug wait --for=condition=complete job/poller-smoke --timeout=300s || {
+            echo "::error::poller-smoke failed - dumping job logs (identity proof / cert chain?)"
+            kubectl -n grug logs job/poller-smoke --tail=50 || true
+            exit 1
+          }
           kubectl -n grug delete job poller-smoke
 
       - name: Cleanup

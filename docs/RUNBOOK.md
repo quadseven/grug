@@ -234,6 +234,11 @@ the #389 rollout.
   Anywhere = the leaf lost the `digital signature` usage (the
   infrastructure#1318 gotcha). Check `kubectl -n grug get certificate
   grug-pki -o yaml` usages; `test_pki_manifests.py` pins them in CI.
+- **Deploy failed AFTER the seed step** (ARN lookup/sed/apply): the
+  cluster is in the split-secret half-state - grug-secrets is keyless,
+  manifests still old. Running pods keep their baked env; do NOT
+  restart api/webhook/consumer pods, just fix and re-run deploy.k8s
+  (the seed is delete-then-create idempotent).
 - **The 15m canary**: every poller tick starts with an UNGUARDED
   `sts get-caller-identity` (`roles_anywhere_identity_proven` in DD, with
   the assumed-role ARN). A broken/expired cert or a bypassed chain

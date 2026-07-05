@@ -3,7 +3,9 @@
 # deploy.k8s.yml from SSM (/infra/roles-anywhere/trust_anchor_arn +
 # /infra/roles-anywhere/grug/{profile_arn,role_arn}) - they carry the
 # account id, so they reach this PUBLIC repo only as placeholders, never
-# literals (same pattern as REGISTRY_PLACEHOLDER).
+# literals (same discipline as the registry/tag image pins - and do NOT
+# name those tokens literally here: the post-sed sentinel greps ALL of
+# k8s/ and a comment mention would fail every deploy; audit #388-8).
 #
 # The SDK runs aws_signing_helper (baked into the webhook image) per
 # credential refresh: X.509 leaf (cert-manager Secret grug-pki-tls) ->
