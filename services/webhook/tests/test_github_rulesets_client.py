@@ -472,33 +472,53 @@ def test_retry_delay_bounded_and_caps_retry_after():
     assert grc._retry_delay(0, big) <= grc._GET_RETRY_MAX_DELAY
 
 
-# --- #460: get_repo_default_branch -------------------------------------------
+# --- #460: list_installation_repos -------------------------------------------
 
 
-def test_get_repo_default_branch_url_auth_and_value():
-    from github_rulesets_client import get_repo_default_branch
+def test_list_installation_repos_single_page_shape_and_auth():
+    from github_rulesets_client import list_installation_repos
 
-    with patch(
-        "httpx.get", return_value=_ok_response({"default_branch": "trunk"})
-    ) as mock_get:
-        assert get_repo_default_branch("tok", "o", "r x") == "trunk"
+    body = {"total_count": 2, "repositories": [
+        {"id": 10, "full_name": "o/a", "default_branch": "trunk"},
+        {"id": 11, "full_name": "o/b", "default_branch": None},
+    ]}
+    with patch("httpx.get", return_value=_ok_response(body)) as mock_get:
+        out = list_installation_repos("tok")
+    assert out == [
+        {"id": 10, "full_name": "o/a", "default_branch": "trunk"},
+        {"id": 11, "full_name": "o/b", "default_branch": "main"},  # None -> main
+    ]
+    assert mock_get.call_count == 1  # <100 repos on page 1 stops pagination
     url = mock_get.call_args[0][0]
-    assert url == "https://api.github.com/repos/o/r%20x"  # safe='' encoding
+    assert url == "https://api.github.com/installation/repositories?per_page=100&page=1"
     headers = mock_get.call_args[1]["headers"]
     assert headers["Authorization"] == "Bearer tok"
 
 
-def test_get_repo_default_branch_falls_back_to_main():
-    from github_rulesets_client import get_repo_default_branch
+def test_list_installation_repos_paginates_until_short_page():
+    from github_rulesets_client import list_installation_repos
 
-    with patch("httpx.get", return_value=_ok_response({})):
-        assert get_repo_default_branch("tok", "o", "r") == "main"
+    full_page = {"repositories": [
+        {"id": i, "full_name": f"o/r{i}", "default_branch": "main"}
+        for i in range(100)
+    ]}
+    short_page = {"repositories": [
+        {"id": 200, "full_name": "o/last", "default_branch": "main"},
+    ]}
+    with patch(
+        "httpx.get",
+        side_effect=[_ok_response(full_page), _ok_response(short_page)],
+    ) as mock_get:
+        out = list_installation_repos("tok")
+    assert len(out) == 101
+    assert mock_get.call_count == 2
+    assert "page=2" in mock_get.call_args[0][0]
 
 
-def test_get_repo_default_branch_error_propagates(mock_transport_client):
-    from github_rulesets_client import get_repo_default_branch
+def test_list_installation_repos_error_propagates(mock_transport_client):
+    from github_rulesets_client import list_installation_repos
 
-    client = mock_transport_client(status_codes=[404])
+    client = mock_transport_client(status_codes=[401])
     with patch("httpx.get", side_effect=lambda *a, **kw: client.get(*a, **kw)):
         with pytest.raises(httpx.HTTPStatusError):
-            get_repo_default_branch("tok", "o", "gone")
+            list_installation_repos("bad-tok")
