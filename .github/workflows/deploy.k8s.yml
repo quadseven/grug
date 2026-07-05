@@ -564,10 +564,18 @@ jobs:
         if: steps.seed.outcome == 'failure' || steps.apply.outcome == 'failure' || steps.synthetic.outcome == 'failure'
         run: |
           set -euo pipefail
+          # Page FIRST (codex r9): the metric must fire even when the
+          # rollback itself then fails (unpullable restored image, bad
+          # restored secret) - a failed recovery is the loudest case.
+          NODE_IP=$(kubectl get nodes -o jsonpath='{.items[0].status.addresses[?(@.type=="InternalIP")].address}' 2>/dev/null || echo "")
+          if [ -n "$NODE_IP" ]; then
+            printf 'grug.deploy.rollback:1|c|#env:prod,trigger:auto,phase:attempted' \
+              | timeout 5 bash -c "cat > /dev/udp/${NODE_IP}/8125" || true
+          fi
           W=$(kubectl -n grug get configmap grug-last-good -o jsonpath='{.data.webhook}' 2>/dev/null || echo "")
           A=$(kubectl -n grug get configmap grug-last-good -o jsonpath='{.data.api}' 2>/dev/null || echo "")
           if [ -z "$W" ] || [ -z "$A" ]; then
-            echo "::error::synthetic FAILED and no last-good anchor exists - manual intervention required"
+            echo "::error::deploy FAILED and no last-good anchor exists - manual intervention required"
             exit 1
           fi
           # Restore the pre-seed secret snapshots FIRST (codex r3+r5):
@@ -620,9 +628,8 @@ jobs:
             deploy/grug-webhook deploy/grug-api deploy/grug-consumer cronjob/grug-poller \
             "grug.dev/image-source=rollback-last-good" \
             "grug.dev/rolled-back-from=${GITHUB_SHA}"
-          NODE_IP=$(kubectl get nodes -o jsonpath='{.items[0].status.addresses[?(@.type=="InternalIP")].address}')
           if [ -n "$NODE_IP" ]; then
-            printf 'grug.deploy.rollback:1|c|#env:prod,trigger:synthetic' \
+            printf 'grug.deploy.rollback:1|c|#env:prod,trigger:auto,phase:completed' \
               | timeout 5 bash -c "cat > /dev/udp/${NODE_IP}/8125" || true
           fi
           if git diff-tree --no-commit-id --name-only -r "${GITHUB_SHA}" | grep -q '^k8s/'; then
