@@ -67,7 +67,7 @@ The vocabulary used in `services/`, `infra/`, and `web/`. Terms map to identifie
 | **AppJWT** | RSA-signed JWT identifying Grug as a GitHub App (10-min TTL). Generated from the App private key (loaded from SSM SecureString `/grug/github-app-private-key`). Used to exchange for installation tokens. |
 | **InstallToken** | Short-lived (~1h TTL) token returned by `POST /app/installations/{id}/access_tokens`. Lets Grug act on behalf of the installation against the GitHub API. Cached per-`Installation` in `TokenCache`. |
 | **TokenCache** | Get/put/invalidate store for `AppJWT` and `InstallToken`s. Today: single in-process implementation (`InMemoryTokenCache`) — see ADR-0001. A persistent cache is still planned (PRD #21 Q17); the original DynamoDB-backed sketch predates the #354 Postgres store swap, so it would now be Postgres-backed. |
-| **with_install_token_retry** | Helper that wraps a GitHub API call so that on 401 it invalidates the cached `InstallToken`, fetches a fresh one, and retries once. Lives alongside the AppJWT machinery; couples token rotation with call sites today (issue #142 may revisit). |
+| **with_install_token_retry** | Helper that wraps a GitHub API call so that on 401 it invalidates the cached `InstallToken`, fetches a fresh one, and retries once. Lives alongside the AppJWT machinery; couples token rotation with call sites today (adapter extraction tracked in #510, per the #142 walk / ADR-0015). |
 
 ## Persistence concepts
 
@@ -126,7 +126,7 @@ The single copy of every cross-service module lives in `services/_shared/` - a P
 
 These terms exist in the codebase but are inconsistent or under-named. Resolving them is out of scope for the initial CONTEXT.md authoring; track in dedicated issues.
 
-- **`with_install_token_retry`** — verbose helper name; better as a method on a future `TokenedGitHubClient` adapter (deferred in issue #142).
+- **`with_install_token_retry`** — verbose helper name; better as a method on a `TokenedGitHubClient` adapter (no longer deferred: extracted to #510 by the #142 walk, ADR-0015).
 - **`get_pool()` lazy init** — double-checked-lock pool bootstrap in `pg_base.py` deferring DB connection past import (same rationale as the DDB-era `_LazyTable` it replaced).
 - **No name for the SPA's session shape** — `web/src/` consumes the api service's `/me` payload but the SPA's TS types don't have a corresponding `Session` or `Viewer` concept. Add when frontend changes touch session state.
 
