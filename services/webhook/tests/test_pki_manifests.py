@@ -50,6 +50,7 @@ def test_certificate_pins_the_verified_usages_and_issuer():
     # 6h/renew-4h per the proven infra tenant recipe.
     assert spec["duration"] == "6h"
     assert spec["renewBefore"] == "4h"
+    assert spec["privateKey"]["rotationPolicy"] == "Always"
 
 
 def test_aws_config_credential_process_shape():

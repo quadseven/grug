@@ -26,6 +26,9 @@ spec:
   privateKey:
     algorithm: ECDSA
     size: 256
+    # Fresh keypair on every 6h renewal (default Never would reuse it
+    # forever) - key-rotation parity with cert rotation.
+    rotationPolicy: Always
   usages:
     - digital signature  # keyUsage Roles Anywhere REQUIRES (see header)
     - client auth
