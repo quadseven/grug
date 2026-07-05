@@ -26,7 +26,12 @@ GRUG_ADMIN_USER_ID ?=
 GRUG_ADMIN_LOGIN   ?=
 GRUG_ADMIN_INSTALL_ID ?=
 
-test: webhook-test api-test
+test: webhook-test api-test scripts-test
+
+# scripts/ tests (promotion decision #498 + enforcement migration). Was
+# NEVER wired into CI before #498 - a test that never runs is fiction.
+scripts-test:
+	uv run --with pytest --with boto3 --with moto --with httpx --with pyjwt --with cryptography pytest scripts/tests/ -q
 
 webhook-test:
 	@if [ -n "$$CI" ] && [ -z "$$GRUG_TEST_DATABASE_URL" ]; then \
