@@ -100,9 +100,12 @@ def credential_acquisition_failure_query(env: str) -> str:
     botocore's CredentialRetrievalError string so BOTH the boot-proof
     path and a mid-run SDK acquisition failure alert. All four grug
     services emit it; one monitor covers the fleet."""
+    # service:grug-* on purpose (audit #389-1): auto-covers a future 5th
+    # service AND the key-rotator's own CredentialRetrievalError (the
+    # reserve custodian's cred failing is page-worthy too).
     return (
-        f'logs("service:(grug-api OR grug-webhook OR grug-consumer OR grug-poller) '
-        f'env:{env} (roles_anywhere_identity_failed OR CredentialRetrievalError)")'
+        f'logs("service:grug-* env:{env} '
+        '(roles_anywhere_identity_failed OR CredentialRetrievalError)")'
         '.index("*").rollup("count").last("15m") > 0'
     )
 

@@ -92,10 +92,28 @@ def test_poller_rides_roles_anywhere_not_the_static_key():
     assert mounts["grug-pki"].get("readOnly") is True
 
 
-ALL_WORKLOAD_MANIFESTS = (
-    "api-deployment.yaml", "consumer-deployment.yaml",
-    "webhook-deployment.yaml", "poller-cronjob.yaml",
-)
+# DERIVED from k8s/ (audit #389-1): a 5th AWS-talking workload manifest
+# joins the fleet test automatically instead of silently escaping a
+# hand-list. The exclusions are the point: each names WHY it must never
+# ride the Roles Anywhere path.
+EXCLUDED_FROM_RA_FLEET = {
+    "key-rotator-cronjob.yaml": (
+        "reserve custodian: rotates the rollback key with its OWN static "
+        "cred - putting it on RA would make the reserve's freshness depend "
+        "on the path it exists to back up"
+    ),
+    "smasher-trial-namespace.yaml": "trial sandbox: token-free by design, no AWS",
+}
+
+
+def _fleet_manifests() -> list[str]:
+    out = []
+    for f in sorted(K8S.glob("*.yaml")):
+        if f.name in EXCLUDED_FROM_RA_FLEET:
+            continue
+        if any(d.get("kind") in ("Deployment", "CronJob") for d in _load(f.name)):
+            out.append(f.name)
+    return out
 
 
 def test_no_workload_carries_the_static_key_and_all_ride_roles_anywhere():
@@ -103,7 +121,7 @@ def test_no_workload_carries_the_static_key_and_all_ride_roles_anywhere():
     AWS_CONFIG_FILE + GRUG_RA_ROLE_ARN) and NONE receives the static key
     Secret - env creds would out-rank credential_process and silently
     bypass the path the boot proofs assert."""
-    for manifest in ALL_WORKLOAD_MANIFESTS:
+    for manifest in _fleet_manifests():
         for doc in _load(manifest):
             if doc["kind"] not in ("Deployment", "CronJob"):
                 continue
@@ -121,6 +139,23 @@ def test_no_workload_carries_the_static_key_and_all_ride_roles_anywhere():
             vols = {v["name"]: v for v in pod["volumes"]}
             assert vols["grug-pki"]["secret"]["secretName"] == "grug-pki-tls", name
             assert vols["aws-config"]["configMap"]["name"] == "grug-aws-config", name
+
+
+def test_rotator_stays_off_the_ra_path_and_rotates_no_deployments():
+    """The rotator is the reserve CUSTODIAN (audit #389-1): it must keep
+    its own static cred (grug-rotator-secret), never the cert path - and
+    since no workload consumes the reserve, a rotation must not bounce
+    the serving fleet (GRUG_ROTATE_DEPLOYMENTS empty; it restarted all
+    three deployments twice a day before this pin)."""
+    (rotator,) = [d for d in _load("key-rotator-cronjob.yaml") if d["kind"] == "CronJob"]
+    pod = _pod_spec(rotator)
+    (rc,) = pod["containers"]
+    renv = {e["name"]: e.get("value") for e in rc.get("env", [])}
+    assert "AWS_CONFIG_FILE" not in renv
+    assert renv.get("GRUG_ROTATE_DEPLOYMENTS") == ""
+    assert "grug-rotator-secret" in _secret_env_from(rc)
+    mounts = {m["name"] for m in rc.get("volumeMounts", [])}
+    assert "grug-pki" not in mounts and "aws-config" not in mounts
 
 
 def test_rotator_maintains_the_rollback_reserve_until_retirement():
