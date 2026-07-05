@@ -7,9 +7,9 @@ pins the contract values a well-meaning cleanup would break:
   usages: `client auth` alone sets EKU but no keyUsage and Roles Anywhere
   rejects the leaf with "Insufficient certificate" (verified live,
   infrastructure#1318 Phase 4 - the gotcha that cost a failed attempt).
-- The poller must NOT receive the static AWS key pair: env credentials
-  out-rank credential_process in the SDK chain, silently bypassing the
-  exact path this tracer proves.
+- NO workload receives the static AWS key pair (#389 fleet rollout):
+  env credentials out-rank credential_process in the SDK chain, silently
+  bypassing the path the boot proofs assert.
 - The credential_process line must pass --intermediates FROM THE tls.crt
   BUNDLE (the trust anchor is the offline ROOT; ca.crt here is the ROOT,
   not the intermediate - live-debugged, see grug-aws-config.yaml).
@@ -68,41 +68,94 @@ def test_aws_config_credential_process_shape():
     ):
         assert required in line, f"missing from credential_process: {required}"
 
-
-def test_poller_rides_roles_anywhere_not_the_static_key():
-    (cron,) = [d for d in _load("poller-cronjob.yaml") if d["kind"] == "CronJob"]
-    pod = _pod_spec(cron)
-    (container,) = pod["containers"]
-
-    env_from = _secret_env_from(container)
-    assert "grug-secrets" in env_from
-    assert "grug-aws-static-key" not in env_from, (
-        "poller must NOT get the static key - env creds out-rank credential_process"
-    )
-    env = {e["name"]: e.get("value") for e in container.get("env", [])}
-    # The single ABSOLUTE path anchor; every other path is derived from it
-    # (or from a manifest counterpart) in the cross-derivation test.
-    assert env.get("AWS_CONFIG_FILE") == "/etc/grug-aws/config"
-    # The identity ASSERTION input (peer review 3x): sed-pinned to the
-    # same SSM role ARN the ConfigMap's credential_process uses.
-    assert env.get("GRUG_RA_ROLE_ARN") == "RA_ROLE_ARN_PLACEHOLDER"
-    assert "AWS_ACCESS_KEY_ID" not in env and "AWS_SECRET_ACCESS_KEY" not in env
-
-    mounts = {m["name"]: m for m in container["volumeMounts"]}
-    assert mounts["grug-pki"].get("readOnly") is True
+# DERIVED from k8s/ (audit #389-1): a 5th AWS-talking workload manifest
+# joins the fleet test automatically instead of silently escaping a
+# hand-list. The exclusions are the point: each names WHY it must never
+# ride the Roles Anywhere path.
+EXCLUDED_FROM_RA_FLEET = {
+    "key-rotator-cronjob.yaml": (
+        "reserve custodian: rotates the rollback key with its OWN static "
+        "cred - putting it on RA would make the reserve's freshness depend "
+        "on the path it exists to back up"
+    ),
+    "smasher-trial-namespace.yaml": "trial sandbox: token-free by design, no AWS",
+}
 
 
-def test_static_key_consumers_are_exactly_the_non_tracer_workloads():
-    """api/webhook/consumer keep the split-out key Secret until #389; the
-    rotator rotates it by name. A drift here either breaks a workload's
-    AWS access or silently re-exposes the poller to the static key."""
-    for manifest in ("api-deployment.yaml", "consumer-deployment.yaml", "webhook-deployment.yaml"):
-        (dep,) = [d for d in _load(manifest) if d["kind"] == "Deployment"]
-        (container,) = _pod_spec(dep)["containers"]
-        assert "grug-aws-static-key" in _secret_env_from(container), (
-            f"{manifest} lost the static key pre-#389"
-        )
+def test_excluded_entries_reference_real_manifests():
+    # A stale exclusion could later mask a NEW file reusing the name
+    # (#389 audit stage-7).
+    names = {f.name for f in K8S.glob("*.yaml")}
+    assert set(EXCLUDED_FROM_RA_FLEET) <= names
 
+
+def _fleet_manifests() -> list[str]:
+    out = []
+    for f in sorted(K8S.glob("*.yaml")):
+        if f.name in EXCLUDED_FROM_RA_FLEET:
+            continue
+        if any(d.get("kind") in ("Deployment", "CronJob") for d in _load(f.name)):
+            out.append(f.name)
+    return out
+
+
+def test_no_workload_carries_the_static_key_and_all_ride_roles_anywhere():
+    """#389 rollout state: EVERY workload is on the cert path (mounts +
+    AWS_CONFIG_FILE + GRUG_RA_ROLE_ARN) and NONE receives the static key
+    Secret - env creds would out-rank credential_process and silently
+    bypass the path the boot proofs assert."""
+    for manifest in _fleet_manifests():
+        for doc in _load(manifest):
+            if doc["kind"] not in ("Deployment", "CronJob"):
+                continue
+            pod = _pod_spec(doc)
+            (c,) = pod["containers"]
+            name = doc["metadata"]["name"]
+            env_from = _secret_env_from(c)
+            assert "grug-aws-static-key" not in env_from, name
+            assert "grug-secrets" in env_from, name  # app config rides along
+            env = {e["name"]: e.get("value") for e in c.get("env", [])}
+            # The single ABSOLUTE path anchor; the cross-derivation test
+            # derives every other path from manifest counterparts.
+            assert env.get("AWS_CONFIG_FILE") == "/etc/grug-aws/config", name
+            # Sed-pinned from the same SSM role ARN the ConfigMap uses -
+            # the exact-identity assertion input.
+            assert env.get("GRUG_RA_ROLE_ARN") == "RA_ROLE_ARN_PLACEHOLDER", name
+            assert "AWS_ACCESS_KEY_ID" not in env, name
+            assert "AWS_SECRET_ACCESS_KEY" not in env, name
+            mounts = {m["name"]: m for m in c["volumeMounts"]}
+            assert mounts["grug-pki"]["mountPath"] == "/var/run/grug-pki", name
+            assert mounts["grug-pki"].get("readOnly") is True, name
+            assert mounts["aws-config"]["mountPath"] == "/etc/grug-aws", name
+            assert mounts["aws-config"].get("readOnly") is True, name
+            vols = {v["name"]: v for v in pod["volumes"]}
+            assert vols["grug-pki"]["secret"]["secretName"] == "grug-pki-tls", name
+            assert vols["aws-config"]["configMap"]["name"] == "grug-aws-config", name
+
+
+def test_rotator_stays_off_the_ra_path_and_rotates_no_deployments():
+    """The rotator is the reserve CUSTODIAN (audit #389-1): it must keep
+    its own static cred (grug-rotator-secret), never the cert path - and
+    since no workload consumes the reserve, a rotation must not bounce
+    the serving fleet (GRUG_ROTATE_DEPLOYMENTS empty; it restarted all
+    three deployments twice a day before this pin)."""
+    (rotator,) = [d for d in _load("key-rotator-cronjob.yaml") if d["kind"] == "CronJob"]
+    pod = _pod_spec(rotator)
+    (rc,) = pod["containers"]
+    renv = {e["name"]: e.get("value") for e in rc.get("env", [])}
+    assert "AWS_CONFIG_FILE" not in renv
+    assert renv.get("GRUG_ROTATE_DEPLOYMENTS") == ""
+    assert "grug-rotator-secret" in _secret_env_from(rc)
+    mounts = {m["name"] for m in rc.get("volumeMounts", [])}
+    assert "grug-pki" not in mounts and "aws-config" not in mounts
+
+
+def test_rotator_maintains_the_rollback_reserve_until_retirement():
+    """#389 rollout window (PR A of 2; the retirement PR deletes the
+    reserve): no workload CONSUMES grug-aws-static-key, but
+    the #386 rotator keeps it VALID as the documented rollback reserve.
+    The retirement PR deletes the rotator + this test together - flipping
+    either side alone is the drift this pin catches."""
     (rotator,) = [d for d in _load("key-rotator-cronjob.yaml") if d["kind"] == "CronJob"]
     (rc,) = _pod_spec(rotator)["containers"]
     renv = {e["name"]: e.get("value") for e in rc.get("env", [])}
@@ -173,26 +226,6 @@ def test_configmap_placeholders_match_the_deploy_sed_and_sentinel():
         assert re.fullmatch(r"RA_.*_ARN_PLACEHOLDER", tok), (
             f"{tok} escapes the post-sed sentinel shape RA_.*_ARN_PLACEHOLDER"
         )
-
-
-def test_rotator_covers_exactly_the_static_key_consumers():
-    """Audit stage-1 LOW: the rotate list and the set of workloads carrying
-    the static key must be the SAME set - a workload gaining the key
-    without joining the rotation runs on a key deleted at the next cycle."""
-    carriers = set()
-    for manifest in ("api-deployment.yaml", "consumer-deployment.yaml", "webhook-deployment.yaml", "poller-cronjob.yaml"):
-        for doc in _load(manifest):
-            if doc["kind"] not in ("Deployment", "CronJob"):
-                continue
-            (c,) = _pod_spec(doc)["containers"]
-            if "grug-aws-static-key" in _secret_env_from(c):
-                carriers.add(doc["metadata"]["name"])
-    (rotator,) = [d for d in _load("key-rotator-cronjob.yaml") if d["kind"] == "CronJob"]
-    (rc,) = _pod_spec(rotator)["containers"]
-    renv = {e["name"]: e.get("value") for e in rc.get("env", [])}
-    rotated = set(renv["GRUG_ROTATE_DEPLOYMENTS"].split(","))
-    assert carriers == rotated, f"carriers {carriers} != rotated {rotated}"
-
 
 def test_deploy_sed_simulation_leaves_no_sentinel_matches():
     """Audit stage-8 CRITICAL (caught live): a COMMENT in a manifest

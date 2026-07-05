@@ -58,10 +58,15 @@ spec:
             - {name: http, containerPort: 8080}
           envFrom:
             - secretRef: {name: grug-secrets}
-            # Static AWS key pair (#388 split; #389 retires) - rationale in
-            # poller-cronjob.yaml + deploy.k8s.yml.
-            - secretRef: {name: grug-aws-static-key}
+            # #389: static key DROPPED from this workload - it now rides the
+            # Roles Anywhere cert path. The grug-aws-static-key Secret stays
+            # live (rotator-maintained) as the ROLLBACK RESERVE until the
+            # retirement PR deletes it. Re-adding this envFrom + removing
+            # AWS_CONFIG_FILE is STEP 3 of the RUNBOOK 'Roles Anywhere'
+            # rollback - suspend the rotator and verify the reserve FIRST.
           env:
+            - {name: AWS_CONFIG_FILE, value: /etc/grug-aws/config}
+            - {name: GRUG_RA_ROLE_ARN, value: RA_ROLE_ARN_PLACEHOLDER}
             - {name: DD_SERVICE, value: grug-webhook}
             - {name: DD_ENV, value: prod}
             - name: DD_VERSION
@@ -130,8 +135,17 @@ spec:
             readOnlyRootFilesystem: true
             capabilities: {drop: ["ALL"]}
           volumeMounts:
+            # Roles Anywhere credential path (#389 - the #388 tracer wiring).
+            - {name: grug-pki, mountPath: /var/run/grug-pki, readOnly: true}
+            - {name: aws-config, mountPath: /etc/grug-aws, readOnly: true}
             - {name: tmp, mountPath: /tmp}
       volumes:
+        - name: grug-pki
+          secret:
+            secretName: grug-pki-tls
+        - name: aws-config
+          configMap:
+            name: grug-aws-config
         - name: tmp
           emptyDir: {sizeLimit: 64Mi}
 ---

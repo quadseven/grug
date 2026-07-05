@@ -23,6 +23,7 @@ from admin import router as admin_router
 from auth.github_oauth import router as github_oauth_router
 from cf_auth import CfAuthMiddleware
 from installations import router as installations_router
+from aws_identity import prove_roles_anywhere_identity
 from observability import configure_logging
 
 configure_logging()
@@ -30,6 +31,10 @@ log = logging.getLogger("grug.api")
 
 _BUILD_SHA = os.getenv("GRUG_BUILD_SHA", "unknown")
 _STARTED_AT = datetime.now(timezone.utc)
+
+# Roles Anywhere boot proof (#389): import-time + UNGUARDED on purpose -
+# rationale in the aws_identity module docstring.
+prove_roles_anywhere_identity()
 
 app = FastAPI(
     title="grug-api",
