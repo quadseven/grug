@@ -540,6 +540,11 @@ jobs:
           kubectl -n grug set image deploy/grug-consumer consumer="$W"
           kubectl -n grug set image cronjob/grug-poller poller="$W"
           kubectl -n grug-trial set image cronjob/grug-trial-janitor janitor="$W"
+          # Image-bearing ENV vars are pins too (codex r4): the Smasher
+          # sandbox job image rides GRUG_SMASHER_JOB_IMAGE on webhook +
+          # consumer - set image never touches env.
+          kubectl -n grug set env deploy/grug-webhook GRUG_SMASHER_JOB_IMAGE="$W"
+          kubectl -n grug set env deploy/grug-consumer GRUG_SMASHER_JOB_IMAGE="$W"
           # set image is a no-op when digests match (a config-only bad
           # deploy) - force pod restarts so the restored secret is
           # actually mounted.
