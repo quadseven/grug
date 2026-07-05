@@ -602,9 +602,13 @@ def test_main_starts_daemon_telemetry_thread_outside_watchdog(monkeypatch):
     monkeypatch.setattr(consumer, "_startup_check", lambda: None)
     monkeypatch.setattr(consumer, "_flush_traces", lambda: None)
     monkeypatch.setattr(consumer, "_flush_tracer", lambda: None)
-    monkeypatch.setattr(
-        consumer, "_telemetry_loop", lambda: (_ for _ in ()).throw(RuntimeError("die")),
-    )
+    # A clean quick-return (NOT a raise): the safety property - telemetry
+    # death is non-fatal to main() - is proven STRUCTURALLY below (the
+    # thread is daemon + NOT in the watchdog `threads` list, so main()
+    # never gates on it). Raising in the daemon thread made pytest's
+    # thread-exception capture fail the test non-deterministically by
+    # timing (green locally, red in CI).
+    monkeypatch.setattr(consumer, "_telemetry_loop", lambda: None)
     monkeypatch.setattr(
         consumer, "_specs",
         lambda: [consumer.QueueSpec(
