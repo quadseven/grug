@@ -225,3 +225,68 @@ def test_poller_no_installs_is_a_clean_noop(monkeypatch):
     )
     out = poller_handler.handler({}, None)
     assert out == {"installs": 0, "records": 0, "submitted": 0, "failed_installs": 0, "pulse_nudges": 0, "pulse_failed_installs": 0, "dep_watch_reports": 0, "dep_watch_failed_installs": 0}
+
+
+# ── Roles Anywhere identity proof (#388, audit stage-2 CRITICAL) ──────
+
+
+def test_identity_proof_skips_without_ra_config(monkeypatch):
+    monkeypatch.delenv("AWS_CONFIG_FILE", raising=False)
+    monkeypatch.setenv("AWS_ACCESS_KEY_ID", "static")  # irrelevant without the marker
+    import poller_handler as ph
+
+    ph._prove_roles_anywhere_identity()  # must not raise, must not call AWS
+
+
+def test_identity_proof_refuses_static_env_creds(monkeypatch):
+    """Env creds out-rank credential_process - their presence means the
+    tracer would silently run on the static key. Refuse loudly."""
+    monkeypatch.setenv("AWS_CONFIG_FILE", "/etc/grug-aws/config")
+    monkeypatch.setenv("AWS_ACCESS_KEY_ID", "static")
+    import pytest
+
+    import poller_handler as ph
+
+    with pytest.raises(RuntimeError, match="Roles Anywhere"):
+        ph._prove_roles_anywhere_identity()
+
+
+def test_identity_proof_calls_sts_and_propagates_failure(monkeypatch):
+    """The proof is deliberately UNGUARDED: a credential failure must crash
+    the Job (KSM monitor pages) instead of dissolving into the per-install
+    best-effort swallow."""
+    monkeypatch.setenv("AWS_CONFIG_FILE", "/etc/grug-aws/config")
+    monkeypatch.delenv("AWS_ACCESS_KEY_ID", raising=False)
+    monkeypatch.delenv("AWS_SECRET_ACCESS_KEY", raising=False)
+    import boto3
+    import pytest
+
+    import poller_handler as ph
+
+    class _Sts:
+        def get_caller_identity(self):
+            raise RuntimeError("CredentialRetrievalError: helper exploded")
+
+    monkeypatch.setattr(boto3, "client", lambda service: _Sts())
+    with pytest.raises(RuntimeError, match="helper exploded"):
+        ph._prove_roles_anywhere_identity()
+
+
+def test_identity_proof_logs_the_assumed_arn(monkeypatch, caplog):
+    import logging
+
+    monkeypatch.setenv("AWS_CONFIG_FILE", "/etc/grug-aws/config")
+    monkeypatch.delenv("AWS_ACCESS_KEY_ID", raising=False)
+    import boto3
+
+    import poller_handler as ph
+
+    class _Sts:
+        def get_caller_identity(self):
+            return {"Arn": "arn:aws:sts::1:assumed-role/ra-grug/x", "Account": "1"}
+
+    monkeypatch.setattr(boto3, "client", lambda service: _Sts())
+    with caplog.at_level(logging.INFO, logger=ph.log.name):
+        ph._prove_roles_anywhere_identity()
+    (rec,) = [r for r in caplog.records if r.msg == "roles_anywhere_identity_proven"]
+    assert "ra-grug" in rec.assumed_arn

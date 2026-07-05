@@ -267,7 +267,7 @@ def main() -> int:
     import boto3  # local import: only the rotator pod needs it at call time
 
     pod_user = os.environ.get("GRUG_ROTATE_USER", "grug-k8s-pod")
-    secret_name = os.environ.get("GRUG_ROTATE_SECRET", "grug-secrets")
+    secret_name = os.environ["GRUG_ROTATE_SECRET"]  # required; #388 split - a silent default patched the WRONG secret class
     deployments = [
         d.strip()
         for d in os.environ.get(

@@ -251,14 +251,22 @@ jobs:
           # grug-aws-config ConfigMap - the ARNs carry the account id, so
           # the PUBLIC repo holds only placeholders. Fail LOUD on an empty
           # lookup (the tenant must be applied in infrastructure first).
-          RA_ANCHOR="$(aws ssm get-parameter --name /infra/roles-anywhere/trust_anchor_arn --query Parameter.Value --output text)"
-          RA_PROFILE="$(aws ssm get-parameter --name /infra/roles-anywhere/grug/profile_arn --query Parameter.Value --output text)"
-          RA_ROLE="$(aws ssm get-parameter --name /infra/roles-anywhere/grug/role_arn --query Parameter.Value --output text)"
+          # --with-decryption is harmless on String params and REQUIRED if
+          # one is ever (re)created SecureString: without it the value is
+          # KMS ciphertext - non-empty, not None, placeholder-free - and
+          # sails past every guard into the ConfigMap (audit #388-4). The
+          # arn: shape check catches that and any other garbage.
+          RA_ANCHOR="$(aws ssm get-parameter --with-decryption --name /infra/roles-anywhere/trust_anchor_arn --query Parameter.Value --output text)"
+          RA_PROFILE="$(aws ssm get-parameter --with-decryption --name /infra/roles-anywhere/grug/profile_arn --query Parameter.Value --output text)"
+          RA_ROLE="$(aws ssm get-parameter --with-decryption --name /infra/roles-anywhere/grug/role_arn --query Parameter.Value --output text)"
           for v in RA_ANCHOR RA_PROFILE RA_ROLE; do
-            if [ -z "${!v}" ] || [ "${!v}" = "None" ]; then
-              echo "::error::Roles Anywhere ARN lookup $v came back empty - is the grug tenant applied in infrastructure (infra-pki)?"
-              exit 1
-            fi
+            case "${!v}" in
+              arn:aws:*) ;;
+              *)
+                echo "::error::Roles Anywhere lookup $v is not an ARN (empty/None/ciphertext?) - is the grug tenant applied in infrastructure (infra-pki)?"
+                exit 1
+                ;;
+            esac
           done
           sed -i \
             -e "s|REGISTRY_PLACEHOLDER/grug-api:TAG_PLACEHOLDER|${IMAGE_API}|g" \
