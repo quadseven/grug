@@ -164,6 +164,63 @@ def handler(event: dict[str, Any], context: Any) -> dict[str, int | str]:
             )
             dep_watch_failed += 1
 
+    # Enforcement-gauge re-emission (#460): grug.enforcement.state was only
+    # emitted on enforcement CONFIG events (dashboard toggle, repo-added
+    # heal), so in steady state the enforcement-gap monitor sat in permanent
+    # No Data - blind to exactly the out-of-band ruleset deletion it exists
+    # to catch. Re-emit a LIVE-detected state per tpm-enabled repo every
+    # cycle so the monitor has a continuous per-repo signal. Same
+    # best-effort shape as the passes above, plus per-REPO best-effort so
+    # one repo's GitHub error can't starve the rest of their gauge.
+    enforcement_emitted = 0
+    enforcement_failed = 0
+    for install_id in installs:
+        try:
+            from adapters.install_store import list_tpm_enabled_repos
+            from enforcement import GRUG_DOR_CHECK_NAME
+            from github_rulesets_client import (
+                detect_enforcement,
+                get_repo_default_branch,
+            )
+            from observability import emit_enforcement_metric
+
+            repos = list_tpm_enabled_repos(install_id)
+            if not repos:
+                continue
+
+            def _emit_for_install(token: str, iid=install_id, rs=repos) -> int:
+                n = 0
+                for r in rs:
+                    full = r.get("full_name", "")
+                    owner, sep, name = full.partition("/")
+                    if not sep or not name:
+                        continue
+                    try:
+                        branch = get_repo_default_branch(token, owner, name)
+                        state = detect_enforcement(
+                            token, owner, name, branch, GRUG_DOR_CHECK_NAME,
+                        )
+                        emit_enforcement_metric(full, state)
+                        n += 1
+                    except Exception as e:  # noqa: BLE001 - one repo must not
+                        # starve the install's remaining repos of their gauge
+                        log.warning(
+                            "enforcement_emit_repo_failed",
+                            extra={"install_id": iid, "repo": full,
+                                   "kind": type(e).__name__},
+                        )
+                return n
+
+            enforcement_emitted += (
+                with_install_token_retry(install_id, _emit_for_install) or 0
+            )
+        except Exception as e:  # noqa: BLE001 - one install must not abort the cron
+            log.warning(
+                "enforcement_emit_install_failed",
+                extra={"install_id": install_id, "kind": type(e).__name__},
+            )
+            enforcement_failed += 1
+
     # Auto-replay missed webhook deliveries (#407), best-effort: a replay
     # failure must never abort the cron, so it's wrapped here on TOP of
     # replay_since's own per-attempt best-effort.
@@ -182,6 +239,8 @@ def handler(event: dict[str, Any], context: Any) -> dict[str, int | str]:
         "pulse_failed_installs": pulse_failed,
         "dep_watch_reports": dep_reports,
         "dep_watch_failed_installs": dep_watch_failed,
+        "enforcement_emitted": enforcement_emitted,
+        "enforcement_failed_installs": enforcement_failed,
         **replay,
     }
     # Total failure (auth/config drift, GitHub down) errors EVERY install and
