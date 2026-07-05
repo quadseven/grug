@@ -118,6 +118,23 @@ jobs:
           kubectl apply -f k8s/namespace.yaml
           get() { aws ssm get-parameter --name "$1" --with-decryption \
                     --query 'Parameter.Value' --output text; }
+          # seed <secret-name> <0600-env-file>: shared discipline for every
+          # Secret seed (audit #388-4 rule-of-three) - fail BEFORE the
+          # destructive delete on any empty/"None" value (`set -e` does NOT
+          # trip on command-substitution failures inside `echo "K=$(...)"`,
+          # audit C2; print only KEY names), then DELETE-then-create
+          # (kubectl apply MERGES secret data - stale keys lingered on the
+          # first deploys), then shred the env-file.
+          seed() {
+            if grep -qE '=$|=None$' "$2"; then
+              echo "::error::empty/None value(s) in $1 seed:"
+              grep -nE '=$|=None$' "$2" | cut -d= -f1
+              exit 1
+            fi
+            kubectl -n grug delete secret "$1" --ignore-not-found
+            kubectl -n grug create secret generic "$1" --from-env-file="$2"
+            rm -f "$2"
+          }
           # Values land in a 0600 env-file consumed via --from-env-file -
           # NOT in kubectl argv (visible in /proc/PID/cmdline even on an
           # ephemeral runner; review F3). Multiline values (the App
@@ -153,31 +170,17 @@ jobs:
             echo "GRUG_CAVE_RESULTS_QUEUE_URL=$(aws sqs get-queue-url --queue-name grug-cave-results.fifo --query QueueUrl --output text)"
             echo "GRUG_CAVE_DIFF_BUCKET=$(aws s3api list-buckets --query 'Buckets[?starts_with(Name, `grug-cave-diffs`)].Name | [0]' --output text)"
           } > "$ENVF"
-          # Fail BEFORE the destructive delete if any value came back empty or
-          # "None": `set -e` does NOT trip on a command-substitution failure
-          # inside `echo "K=$(...)"`, so a failed SSM/SQS/S3 lookup would
-          # otherwise seed a broken secret and outage every pod. Print only
-          # KEY names (empty/None lines carry no secret value). (audit C2)
-          if grep -qE '=$|=None$' "$ENVF"; then
-            echo "::error::empty/None value(s) in grug-secrets seed:"
-            grep -nE '=$|=None$' "$ENVF" | cut -d= -f1
-            exit 1
-          fi
-          # #388 split guard: the static key pair must NEVER re-enter
-          # grug-secrets - the poller envFroms it, and env creds silently
-          # out-rank credential_process, un-proving the Roles Anywhere
-          # tracer while everything stays green (audit stage-1 HIGH).
+          # #388 split guard (grug-secrets ONLY, so not in seed()): the
+          # static key pair must NEVER re-enter this Secret - the poller
+          # envFroms it, and env creds silently out-rank credential_process,
+          # un-proving the Roles Anywhere tracer while everything stays
+          # green (audit stage-1 HIGH; runtime twin lives in
+          # poller_handler._prove_roles_anywhere_identity).
           if grep -qE '^AWS_(ACCESS_KEY_ID|SECRET_ACCESS_KEY)=' "$ENVF"; then
             echo "::error::static key pair leaked back into grug-secrets (belongs in grug-aws-static-key, #388)"
             exit 1
           fi
-          # DELETE-then-create: kubectl apply MERGES secret data, so a
-          # shape change would leave stale keys behind (bit us on the
-          # first deploys - the interim seed's keys lingered).
-          kubectl -n grug delete secret grug-secrets --ignore-not-found
-          kubectl -n grug create secret generic grug-secrets \
-            --from-env-file="$ENVF"
-          rm -f "$ENVF"
+          seed grug-secrets "$ENVF"
           # Static AWS key pair (#388 split; #389 deletes this block).
           KEYF="$RUNNER_TEMP/grug-aws-static-key.env"
           install -m 600 /dev/null "$KEYF"
@@ -185,19 +188,10 @@ jobs:
             echo "AWS_ACCESS_KEY_ID=$(get /grug/k8s-pod-aws-access-key-id)"
             echo "AWS_SECRET_ACCESS_KEY=$(get /grug/k8s-pod-aws-secret-access-key)"
           } > "$KEYF"
-          if grep -qE '=$|=None$' "$KEYF"; then
-            echo "::error::empty/None value(s) in grug-aws-static-key seed:"
-            grep -nE '=$|=None$' "$KEYF" | cut -d= -f1
-            exit 1
-          fi
-          kubectl -n grug delete secret grug-aws-static-key --ignore-not-found
-          kubectl -n grug create secret generic grug-aws-static-key \
-            --from-env-file="$KEYF"
-          rm -f "$KEYF"
-          # Rotator credential (#386): SEPARATE from grug-secrets, scoped to
-          # access-key ops on grug-k8s-pod only. The key-rotator CronJob uses
-          # THIS, never grug-secrets (which it rotates). Same 0600 env-file
-          # discipline as above.
+          seed grug-aws-static-key "$KEYF"
+          # Rotator credential (#386): SEPARATE from the pod secrets, scoped
+          # to access-key ops on grug-k8s-pod only. The key-rotator CronJob
+          # uses THIS, never the secret it rotates.
           ROTF="$RUNNER_TEMP/grug-rotator.env"
           install -m 600 /dev/null "$ROTF"
           {
@@ -205,17 +199,7 @@ jobs:
             echo "AWS_SECRET_ACCESS_KEY=$(get /grug/k8s-rotator-aws-secret-access-key)"
             echo "AWS_DEFAULT_REGION=us-east-1"
           } > "$ROTF"
-          # Same empty/None guard as grug-secrets (audit C2): a broken rotator
-          # credential would silently fail every future rotation.
-          if grep -qE '=$|=None$' "$ROTF"; then
-            echo "::error::empty/None value(s) in grug-rotator-secret seed:"
-            grep -nE '=$|=None$' "$ROTF" | cut -d= -f1
-            exit 1
-          fi
-          kubectl -n grug delete secret grug-rotator-secret --ignore-not-found
-          kubectl -n grug create secret generic grug-rotator-secret \
-            --from-env-file="$ROTF"
-          rm -f "$ROTF"
+          seed grug-rotator-secret "$ROTF"
           kubectl -n grug create secret docker-registry registry-pull \
             --docker-server="$REGISTRY_HOST" \
             --docker-username="$REGISTRY_USERNAME" \
