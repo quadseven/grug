@@ -1,0 +1,67 @@
+# Preview webhook + api on the PR digest (#500). No smasher SA, no Roles
+# Anywhere, no prod grug-secrets - preview mode (namespace-gated) skips
+# the RA proof + SSM/KMS and reads a throwaway webhook secret + a
+# schema-scoped DB URL from the preview secret.
+apiVersion: apps/v1
+kind: Deployment
+metadata: {name: grug-webhook, namespace: PREVIEW_NS, labels: {app: grug-webhook}}
+spec:
+  replicas: 1
+  selector: {matchLabels: {app: grug-webhook}}
+  template:
+    metadata: {labels: {app: grug-webhook}}
+    spec:
+      automountServiceAccountToken: false
+      nodeSelector: {kubernetes.io/arch: arm64}
+      imagePullSecrets: [{name: registry-pull}]
+      securityContext: {runAsNonRoot: true, runAsUser: 10001, seccompProfile: {type: RuntimeDefault}}
+      containers:
+        - name: webhook
+          image: PREVIEW_IMAGE_WEBHOOK
+          imagePullPolicy: Always
+          ports: [{name: http, containerPort: 8080}]
+          envFrom: [{secretRef: {name: grug-preview-secret}}]
+          env:
+            - {name: GRUG_PREVIEW, value: "1"}
+            - {name: POD_NAMESPACE, valueFrom: {fieldRef: {fieldPath: metadata.namespace}}}
+            - {name: DD_SERVICE, value: grug-webhook-preview}
+            - {name: DD_ENV, value: preview}
+          readinessProbe: {httpGet: {path: /readyz, port: http}, periodSeconds: 10, timeoutSeconds: 5, initialDelaySeconds: 5}
+          livenessProbe: {httpGet: {path: /livez, port: http}, initialDelaySeconds: 10, periodSeconds: 30}
+---
+apiVersion: v1
+kind: Service
+metadata: {name: grug-webhook, namespace: PREVIEW_NS}
+spec: {selector: {app: grug-webhook}, ports: [{port: 8080, targetPort: http}]}
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata: {name: grug-api, namespace: PREVIEW_NS, labels: {app: grug-api}}
+spec:
+  replicas: 1
+  selector: {matchLabels: {app: grug-api}}
+  template:
+    metadata: {labels: {app: grug-api}}
+    spec:
+      automountServiceAccountToken: false
+      nodeSelector: {kubernetes.io/arch: arm64}
+      imagePullSecrets: [{name: registry-pull}]
+      securityContext: {runAsNonRoot: true, runAsUser: 10001, seccompProfile: {type: RuntimeDefault}}
+      containers:
+        - name: webhook
+          image: PREVIEW_IMAGE_API
+          imagePullPolicy: Always
+          ports: [{name: http, containerPort: 8080}]
+          envFrom: [{secretRef: {name: grug-preview-secret}}]
+          env:
+            - {name: GRUG_PREVIEW, value: "1"}
+            - {name: POD_NAMESPACE, valueFrom: {fieldRef: {fieldPath: metadata.namespace}}}
+            - {name: DD_SERVICE, value: grug-api-preview}
+            - {name: DD_ENV, value: preview}
+          readinessProbe: {httpGet: {path: /readyz, port: http}, periodSeconds: 10, timeoutSeconds: 5, initialDelaySeconds: 5}
+          livenessProbe: {httpGet: {path: /livez, port: http}, initialDelaySeconds: 10, periodSeconds: 30}
+---
+apiVersion: v1
+kind: Service
+metadata: {name: grug-api, namespace: PREVIEW_NS}
+spec: {selector: {app: grug-api}, ports: [{port: 8080, targetPort: http}]}

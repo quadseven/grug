@@ -1,0 +1,70 @@
+# Preview TTL janitor (#500, ADR-0018). The preview workflow reaps on PR
+# close/unlabel; this CronJob is the BACKSTOP for the 48h TTL and any
+# missed teardown (a workflow that failed, a label removed while CI was
+# down). Hourly, it deletes grug-pr-<n> namespaces older than the TTL.
+#
+# Scope: a dedicated SA that can list/delete ONLY namespaces (cluster
+# scope is unavoidable for namespace ops, but reap_previews.py refuses to
+# touch anything not matching ^grug-pr-\d+$ via preview_names.pr_of_namespace).
+# Uses ONLY the in-cluster k8s API (no AWS/RA/grug-secrets). The Postgres
+# schema is dropped by the workflow teardown on PR close (idempotent
+# DROP SCHEMA IF EXISTS) - a TTL-reaped-but-still-open preview redeploys
+# with a fresh schema.
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: grug-preview-janitor
+  namespace: grug
+  # automountServiceAccountToken stays default (needed - it calls the k8s API).
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: grug-preview-janitor
+rules:
+  # Namespace lifecycle is cluster-scoped; the reap script confines the
+  # blast radius to ^grug-pr-\d+$ by name.
+  - apiGroups: [""]
+    resources: [namespaces]
+    verbs: [list, get, delete]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  name: grug-preview-janitor
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: ClusterRole
+  name: grug-preview-janitor
+subjects:
+  - kind: ServiceAccount
+    name: grug-preview-janitor
+    namespace: grug
+---
+apiVersion: batch/v1
+kind: CronJob
+metadata:
+  name: grug-preview-janitor
+  namespace: grug
+spec:
+  schedule: "17 * * * *"  # hourly, off the top of the hour
+  concurrencyPolicy: Forbid
+  successfulJobsHistoryLimit: 1
+  failedJobsHistoryLimit: 3
+  jobTemplate:
+    spec:
+      backoffLimit: 1
+      activeDeadlineSeconds: 300
+      template:
+        spec:
+          serviceAccountName: grug-preview-janitor
+          restartPolicy: Never
+          nodeSelector: {kubernetes.io/arch: arm64}
+          imagePullSecrets: [{name: registry-pull}]
+          securityContext: {runAsNonRoot: true, runAsUser: 10001, seccompProfile: {type: RuntimeDefault}}
+          containers:
+            - name: janitor
+              image: REGISTRY_PLACEHOLDER/grug-webhook:TAG_PLACEHOLDER
+              command: ["python", "reap_previews.py"]
+              env:
+                - {name: GRUG_PREVIEW_TTL_HOURS, value: "48"}
