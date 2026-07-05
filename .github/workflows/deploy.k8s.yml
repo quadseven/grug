@@ -538,9 +538,17 @@ jobs:
           # end-to-end - a strictly better proof than the removed
           # in-cluster port-forward ping. The secret never leaves the
           # runner (openssl HMAC; not echoed).
-          WH_SECRET=$(aws ssm get-parameter --name /grug/github-app-webhook-secret --with-decryption --query 'Parameter.Value' --output text)
+          # Compute the HMAC in python with the secret PIPED via STDIN -
+          # never a shell argument, an env var, or a shell variable (grug
+          # Elder CRITICAL x2 on #526/#530: argv is in the process table;
+          # even an exported var is in /proc/<pid>/environ and would be
+          # traced by any future `set -x`; the SSM-fetched value is not a
+          # registered GHA secret so GitHub masking does not cover it). The
+          # secret flows aws-ssm-stdout -> pipe -> python-stdin only; it
+          # never lands in the shell's variable space, argv, or environ.
           PING_BODY='{"zen":"synthetic deploy self-test","hook_id":0}'
-          PING_SIG=$(printf '%s' "$PING_BODY" | openssl dgst -sha256 -hmac "$WH_SECRET" | awk '{print $NF}')
+          PING_SIG=$(aws ssm get-parameter --name /grug/github-app-webhook-secret --with-decryption --query 'Parameter.Value' --output text \
+            | PING_BODY="$PING_BODY" python3 -c 'import hashlib, hmac, os, sys; secret = sys.stdin.read().rstrip("\n").encode(); print(hmac.new(secret, os.environ["PING_BODY"].encode(), hashlib.sha256).hexdigest())')
           ping_code=$(curl -s -o "$RUNNER_TEMP/ping.out" -w '%{http_code}' -m 20 -X POST \
             -H "X-GitHub-Event: ping" \
             -H "X-GitHub-Delivery: synthetic-${GITHUB_SHA}" \
