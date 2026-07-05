@@ -35,10 +35,24 @@ from dataclasses import dataclass
 from typing import Any, Callable
 
 import boto3
+from botocore.config import Config as _BotoConfig
 
 log = logging.getLogger(f"{os.getenv('DD_SERVICE', 'grug')}.consumer")
 
 _sqs = boto3.client("sqs")
+
+# Telemetry gets its OWN client with tight timeouts (poolside peer review,
+# PR #516): the default ~60s connect/read timeouts could wedge the
+# telemetry thread for minutes on an SQS brownout (6 sequential probes),
+# skewing the sweep cadence. Depth probes are disposable - fail fast, log,
+# and let the next sweep retry. The consume paths keep the default client:
+# a long-poll receive SHOULD wait.
+_sqs_telemetry = boto3.client(
+    "sqs",
+    config=_BotoConfig(
+        connect_timeout=5, read_timeout=10, retries={"max_attempts": 2},
+    ),
+)
 
 # Receive errors back off so a misconfigured queue URL or an IAM gap
 # logs at a readable rate instead of hot-looping the pod CPU.
@@ -165,11 +179,13 @@ def _emit_queue_depth_once() -> int:
     """One depth sweep. Returns queues successfully PROBED (emit_gauge is
     fire-and-forget UDP - delivery is the monitors' No Data problem, not
     ours). Per-queue best-effort: an AccessDenied on one queue must not
-    cost the others their gauge. The sweep count itself is emitted as the
-    telemetry-health gauge: fewer-than-all-queues for a sustained window
-    pages via the '[grug-consumer] Queue telemetry degraded' monitor -
-    without it, a partial failure would silently re-blind the per-queue
-    depth monitors (audit stage-2 HIGH on PR #516)."""
+    cost the others their gauge. Each queue also emits a 1/0
+    telemetry_queue_ok boolean per sweep: a queue whose success rate sinks
+    below half over the monitor window pages BY NAME via the
+    '[grug-consumer] Queue telemetry degraded' monitor - so neither a
+    sustained nor an INTERMITTENT partial failure can silently re-blind
+    that queue's depth monitor (audit stage-2 HIGH + codex peer review,
+    PR #516)."""
     from observability import emit_gauge  # late: patchable, and webhook-image only
 
     if not os.getenv("DD_AGENT_HOST", ""):
@@ -186,7 +202,7 @@ def _emit_queue_depth_once() -> int:
     probed = 0
     for name in _TELEMETRY_QUEUE_NAMES:
         try:
-            attrs = _sqs.get_queue_attributes(
+            attrs = _sqs_telemetry.get_queue_attributes(
                 QueueUrl=f"{base}/{name}",
                 AttributeNames=[
                     "ApproximateNumberOfMessages",
@@ -204,6 +220,7 @@ def _emit_queue_depth_once() -> int:
                 {"queue": name},
             )
             probed += 1
+            emit_gauge("grug.sqs.telemetry_queue_ok", 1.0, {"queue": name})
         except Exception as e:  # noqa: BLE001 - per-queue best-effort
             # botocore folds most service errors (AccessDenied, throttle)
             # into ClientError; the wire Code is the diagnosable bit.
@@ -213,7 +230,7 @@ def _emit_queue_depth_once() -> int:
                 "queue_depth_probe_failed",
                 extra={"queue": name, "kind": type(e).__name__, "code": code},
             )
-    emit_gauge("grug.sqs.telemetry_queues_ok", float(probed))
+            emit_gauge("grug.sqs.telemetry_queue_ok", 0.0, {"queue": name})
     return probed
 
 

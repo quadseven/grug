@@ -143,80 +143,97 @@ def all_ksm_monitor_queries() -> list[str]:
 # redrive, not here).
 
 _QUEUE_GAUGE = "grug.sqs.messages_visible"
-_TELEMETRY_HEALTH_GAUGE = "grug.sqs.telemetry_queues_ok"
+_TELEMETRY_OK_GAUGE = "grug.sqs.telemetry_queue_ok"
 
-# Must equal len(consumer._TELEMETRY_QUEUE_NAMES); the cross-package guard
-# test (test_dd_monitors.py) imports the consumer module by path and pins
-# this number AND the queue tags against the emitter's tuple.
-_TELEMETRY_EXPECTED_QUEUES = 6
+# Every query filters env explicitly (gemini peer review, PR #516): the
+# owned gauges carry a reliable env tag (emit_gauge appends it), and an
+# unscoped query would let a healthy dev emitter mask a dead prod one.
+# One monitor per queue with a simple {env,queue} filter - no OR/AND
+# boolean filter syntax, which is an apply-time validation risk the
+# preview cannot catch.
 
 
-def cave_jobs_backlog_query() -> str:
+def _backlog_query(env: str, queue: str) -> str:
+    """SUSTAINED depth: the queue held messages across the FULL window
+    (min > 0 = never drained once). Per-queue simple filter."""
+    return f"min(last_15m):max:{_QUEUE_GAUGE}{{env:{env},queue:{queue}}} > 0"
+
+
+def _dlq_query(env: str, queue: str) -> str:
+    """Any-message DLQ depth: a single poison message is worth a look."""
+    return f"max(last_15m):max:{_QUEUE_GAUGE}{{env:{env},queue:{queue}}} > 0"
+
+
+def cave_jobs_backlog_query(env: str) -> str:
     """Cave fallback jobs queue not draining for 15m - the connector is
     down or can't reach the Cave. (Was: age-of-oldest > 10m on aws.sqs.*.)"""
-    return f"min(last_15m):max:{_QUEUE_GAUGE}{{queue:grug-cave-jobs.fifo}} > 0"
+    return _backlog_query(env, "grug-cave-jobs.fifo")
 
 
-def rerun_dlq_depth_query() -> str:
+def rerun_backlog_query(env: str) -> str:
+    """The consumer's rerun queue not draining for 15m - a stuck/poisoned
+    consumer loop the pod watchdog can't see (#379's original ask)."""
+    return _backlog_query(env, "grug-rerun-jobs.fifo")
+
+
+def cave_results_backlog_query(env: str) -> str:
+    """The consumer's cave-results queue not draining for 15m."""
+    return _backlog_query(env, "grug-cave-results.fifo")
+
+
+def rerun_dlq_depth_query(env: str) -> str:
     """Any message in the re-run DLQ - an operator's re-run burned its
     retries and did not complete."""
-    return f"max(last_15m):max:{_QUEUE_GAUGE}{{queue:grug-rerun-jobs-dlq.fifo}} > 0"
+    return _dlq_query(env, "grug-rerun-jobs-dlq.fifo")
 
 
-def cave_dlq_depth_query() -> str:
-    """Any message in either cave airlock DLQ - a poison job/result.
-    `by {queue}` so the alert names the poisoned DLQ."""
+def cave_jobs_dlq_depth_query(env: str) -> str:
+    """Any message in the cave-jobs DLQ - a poison fallback job."""
+    return _dlq_query(env, "grug-cave-jobs-dlq.fifo")
+
+
+def cave_results_dlq_depth_query(env: str) -> str:
+    """Any message in the cave-results DLQ - a poison fallback result."""
+    return _dlq_query(env, "grug-cave-results-dlq.fifo")
+
+
+def telemetry_health_query(env: str) -> str:
+    """The telemetry family's ONE heartbeat, per queue: the consumer emits
+    a 1/0 success boolean per queue per sweep; a queue whose success rate
+    drops below half over the window pages AND names itself. avg-of-avg
+    (not max) so an INTERMITTENT partial failure cannot hide behind one
+    good sweep (codex peer review, PR #516); a single throttle blip in an
+    otherwise-healthy window does not flap. The paired monitor is the
+    family's only notify_no_data=TRUE: a queue vanishing from emission
+    (rename) no-datas its group, and total silence == consumer down."""
     return (
-        f"max(last_15m):max:{_QUEUE_GAUGE}"
-        "{queue:grug-cave-jobs-dlq.fifo OR queue:grug-cave-results-dlq.fifo}"
-        " by {queue} > 0"
+        f"avg(last_15m):avg:{_TELEMETRY_OK_GAUGE}{{env:{env}}}"
+        " by {queue} < 0.5"
     )
 
 
-def consumer_queue_backlog_query() -> str:
-    """A consumer-consumed queue not draining for 15m - a stuck/poisoned
-    consumer loop that the pod watchdog can't see (#379's original ask).
-    `by {queue}` gives true PER-QUEUE sustained semantics (without it the
-    OR-union could alert when each queue individually drained fine) and
-    the alert names the stuck queue."""
-    return (
-        f"min(last_15m):max:{_QUEUE_GAUGE}"
-        "{queue:grug-rerun-jobs.fifo OR queue:grug-cave-results.fifo}"
-        " by {queue} > 0"
-    )
-
-
-def telemetry_health_query() -> str:
-    """The telemetry family's ONE heartbeat: the consumer reports how many
-    queues each sweep probed successfully; below the full set for a whole
-    window = partial telemetry death (per-queue AccessDenied, renamed
-    queue) that would otherwise silently re-blind the depth monitors. The
-    paired monitor is the family's only notify_no_data=TRUE: total metric
-    silence == consumer (or its telemetry thread) down."""
-    return (
-        f"max(last_15m):max:{_TELEMETRY_HEALTH_GAUGE}{{*}}"
-        f" < {_TELEMETRY_EXPECTED_QUEUES}"
-    )
-
-
-def all_owned_queue_queries() -> list[str]:
+def all_owned_queue_queries(env: str = "prod") -> list[str]:
     """Every owned-gauge queue monitor query - the aws.sqs retirement
     guard test iterates this set."""
     return [
-        cave_jobs_backlog_query(),
-        rerun_dlq_depth_query(),
-        cave_dlq_depth_query(),
-        consumer_queue_backlog_query(),
-        telemetry_health_query(),
+        cave_jobs_backlog_query(env),
+        rerun_backlog_query(env),
+        cave_results_backlog_query(env),
+        rerun_dlq_depth_query(env),
+        cave_jobs_dlq_depth_query(env),
+        cave_results_dlq_depth_query(env),
+        telemetry_health_query(env),
     ]
 
 
 @dataclass(frozen=True)
 class _QueueMonitorBundle:
     cave_jobs_backlog: datadog.Monitor
+    rerun_backlog: datadog.Monitor
+    cave_results_backlog: datadog.Monitor
     rerun_dlq: datadog.Monitor
-    cave_dlq: datadog.Monitor
-    consumer_backlog: datadog.Monitor
+    cave_jobs_dlq: datadog.Monitor
+    cave_results_dlq: datadog.Monitor
     telemetry_health: datadog.Monitor
 
 
@@ -226,12 +243,12 @@ def create_owned_queue_monitors(
     notify_handle: str,
     provider: datadog.Provider,
 ) -> _QueueMonitorBundle:
-    """The five owned-gauge queue monitors (#379). Lives in the component
-    (not the composition root) so the synth test can pin each monitor's
-    (query, notify_no_data) pair - the no-data pager placement is the
-    load-bearing bit of the family design and a silent flip re-creates
-    the blind-monitor trap. Resource names preserved from the original
-    inline definitions (URN stability - in-place update, not recreate).
+    """The owned-gauge queue monitor family (#379): one monitor per queue
+    with a simple {env,queue} filter, plus the per-queue telemetry-health
+    heartbeat. Lives in the component (not the composition root) so the
+    synth test can pin each monitor's (query, notify_no_data) pair - the
+    no-data pager placement is the load-bearing bit of the family design
+    and a silent flip re-creates the blind-monitor trap.
 
     require_full_window=False everywhere: a 60s-cadence DogStatsD gauge
     is exactly the sparse metric DD warns about; the provider default
@@ -239,113 +256,115 @@ def create_owned_queue_monitors(
     cross-version provider default.
     """
     opts = pulumi.ResourceOptions(provider=provider)
+    runbook = "Runbook: docs/RUNBOOK.md#elder-async-offload"
 
-    cave_jobs_backlog = datadog.Monitor(
-        "grug-cave-jobs-age",
-        type="metric alert",
-        name="[grug-webhook] Cave fallback jobs queue backing up",
-        message=(
-            f"{notify_handle}\n"
-            "grug-cave-jobs (Elder cave fallback) has not drained for 15min - "
-            "the grug-cave-connector isn't draining (down, or can't reach the "
-            "Cave). Fallback reviews stay `errored` until it recovers.\n"
-            "Runbook: docs/RUNBOOK.md#elder-async-offload"
-        ),
-        query=cave_jobs_backlog_query(),
-        tags=[f"env:{env}", "service:grug-webhook", "team:grug"],
-        notify_no_data=False,
-        require_full_window=False,
+    def _monitor(
+        resource_name: str,
+        display_name: str,
+        body: str,
+        query: str,
+        service: str,
+        *,
+        priority: int = 3,
+        notify_no_data: bool = False,
+        no_data_timeframe: int | None = None,
+    ) -> datadog.Monitor:
+        return datadog.Monitor(
+            resource_name,
+            type="metric alert",
+            name=display_name,
+            message=f"{notify_handle}\n{body}\n{runbook}",
+            query=query,
+            tags=[f"env:{env}", f"service:{service}", "team:grug"],
+            notify_no_data=notify_no_data,
+            no_data_timeframe=no_data_timeframe,
+            require_full_window=False,
+            priority=priority,
+            opts=opts,
+        )
+
+    cave_jobs_backlog = _monitor(
+        "grug-cave-jobs-age",  # historical URN, kept for in-place update
+        "[grug-webhook] Cave fallback jobs queue backing up",
+        "grug-cave-jobs (Elder cave fallback) has not drained for 15min - "
+        "the grug-cave-connector isn't draining (down, or can't reach the "
+        "Cave). Fallback reviews stay `errored` until it recovers.",
+        cave_jobs_backlog_query(env),
+        "grug-webhook",
         priority=4,
-        opts=opts,
     )
 
-    rerun_dlq = datadog.Monitor(
+    rerun_backlog = _monitor(
+        "grug-rerun-backlog",
+        "[grug-consumer] rerun queue not draining (15min)",
+        "grug-rerun-jobs has had messages sitting for a full 15min window "
+        "- the consumer is stuck (poisoned loop, IAM regression) even if "
+        "its pod reads healthy.",
+        rerun_backlog_query(env),
+        "grug-consumer",
+    )
+
+    cave_results_backlog = _monitor(
+        "grug-cave-results-backlog",
+        "[grug-consumer] cave-results queue not draining (15min)",
+        "grug-cave-results has had messages sitting for a full 15min "
+        "window - the consumer is stuck (poisoned loop, IAM regression) "
+        "even if its pod reads healthy.",
+        cave_results_backlog_query(env),
+        "grug-consumer",
+    )
+
+    rerun_dlq = _monitor(
         "grug-rerun-dlq-depth",
-        type="metric alert",
-        name="[grug] Re-run DLQ has messages",
-        message=(
-            f"{notify_handle}\n"
-            "grug-rerun-jobs-dlq has messages - a re-run job exhausted its "
-            "retries (GitHub fetch failing, or a malformed job). The "
-            "operator's re-run did not complete; inspect the DLQ message.\n"
-            "Runbook: docs/RUNBOOK.md#elder-async-offload"
-        ),
-        query=rerun_dlq_depth_query(),
-        tags=[f"env:{env}", "service:grug-api", "team:grug"],
-        notify_no_data=False,
-        require_full_window=False,
-        priority=3,
-        opts=opts,
+        "[grug] Re-run DLQ has messages",
+        "grug-rerun-jobs-dlq has messages - a re-run job exhausted its "
+        "retries (GitHub fetch failing, or a malformed job). The "
+        "operator's re-run did not complete; inspect the DLQ message.",
+        rerun_dlq_depth_query(env),
+        "grug-api",
     )
 
-    cave_dlq = datadog.Monitor(
-        "grug-cave-dlq-depth",
-        type="metric alert",
-        name="[grug] Cave airlock DLQ has messages",
-        message=(
-            f"{notify_handle}\n"
-            "A cave airlock DLQ ({{queue.name}}) has messages - a poison "
-            "job/result exhausted its retries. The fallback review for that "
-            "PR did not complete; inspect the DLQ message.\n"
-            "Runbook: docs/RUNBOOK.md#elder-async-offload"
-        ),
-        query=cave_dlq_depth_query(),
-        tags=[f"env:{env}", "service:grug-webhook", "team:grug"],
-        notify_no_data=False,
-        require_full_window=False,
-        priority=3,
-        opts=opts,
+    cave_jobs_dlq = _monitor(
+        "grug-cave-jobs-dlq-depth",
+        "[grug] Cave jobs DLQ has messages",
+        "grug-cave-jobs-dlq has messages - a poison fallback job exhausted "
+        "its retries. The fallback review for that PR did not complete; "
+        "inspect the DLQ message.",
+        cave_jobs_dlq_depth_query(env),
+        "grug-webhook",
     )
 
-    consumer_backlog = datadog.Monitor(
-        "grug-consumer-queue-backlog",
-        type="metric alert",
-        name="[grug-consumer] Consumed queue not draining (15min)",
-        message=(
-            f"{notify_handle}\n"
-            "{{queue.name}} has had messages sitting for a full 15min window "
-            "- the consumer is stuck (poisoned loop, IAM regression) even if "
-            "its pod reads healthy.\n"
-            "Runbook: docs/RUNBOOK.md#elder-async-offload"
-        ),
-        query=consumer_queue_backlog_query(),
-        tags=[f"env:{env}", "service:grug-consumer", "team:grug"],
-        # The telemetry-health monitor is the family's no-data pager; this
-        # one is a pure depth signal (audit stage-2: a per-queue emission
-        # failure must page via health, not hide behind a depth monitor).
-        notify_no_data=False,
-        require_full_window=False,
-        priority=3,
-        opts=opts,
+    cave_results_dlq = _monitor(
+        "grug-cave-results-dlq-depth",
+        "[grug] Cave results DLQ has messages",
+        "grug-cave-results-dlq has messages - a poison fallback result "
+        "exhausted its retries; inspect the DLQ message.",
+        cave_results_dlq_depth_query(env),
+        "grug-webhook",
     )
 
-    telemetry_health = datadog.Monitor(
+    telemetry_health = _monitor(
         "grug-queue-telemetry-health",
-        type="metric alert",
-        name="[grug-consumer] Queue telemetry degraded (15min)",
-        message=(
-            f"{notify_handle}\n"
-            "The consumer's queue-depth telemetry probed fewer than all six "
-            "queues for a full 15min window (per-queue AccessDenied, renamed "
-            "queue, SQS throttling) - the depth monitors above are partially "
-            "BLIND until this recovers. NO DATA on this monitor means the "
-            "telemetry stopped entirely - treat as consumer down.\n"
-            "Runbook: docs/RUNBOOK.md#elder-async-offload"
-        ),
-        query=telemetry_health_query(),
-        tags=[f"env:{env}", "service:grug-consumer", "team:grug"],
+        "[grug-consumer] Queue telemetry degraded (15min)",
+        "A queue's depth-telemetry success rate fell below 50% over 15min "
+        "({{queue.name}}) - its depth monitor is partially BLIND. Check "
+        "queue_depth_probe_failed warnings for the botocore error code "
+        "(AccessDenied = the ra-grug IAM grant regressed). NO DATA here "
+        "means the queue vanished from emission (rename) or the consumer/"
+        "telemetry thread is down entirely - treat as consumer down.",
+        telemetry_health_query(env),
+        "grug-consumer",
         notify_no_data=True,
         no_data_timeframe=30,
-        require_full_window=False,
-        priority=3,
-        opts=opts,
     )
 
     return _QueueMonitorBundle(
         cave_jobs_backlog=cave_jobs_backlog,
+        rerun_backlog=rerun_backlog,
+        cave_results_backlog=cave_results_backlog,
         rerun_dlq=rerun_dlq,
-        cave_dlq=cave_dlq,
-        consumer_backlog=consumer_backlog,
+        cave_jobs_dlq=cave_jobs_dlq,
+        cave_results_dlq=cave_results_dlq,
         telemetry_health=telemetry_health,
     )
 
