@@ -73,18 +73,26 @@ def test_deploy_role_ssm_scope_is_exactly_the_pinned_set():
                 actions = [actions] if isinstance(actions, str) else actions
                 if any(a.startswith("ssm:GetParameter") for a in actions):
                     res = stmt.get("Resource")
-                    if isinstance(res, list):
-                        ssm_statements.append(set(res))
-        assert ssm_statements, "no resource-scoped ssm:GetParameter* statement found"
-        scoped = ssm_statements[0]
+                    # Normalize: a string Resource (e.g. "*") must be SEEN
+                    # by the allowlist, not skipped past it.
+                    ssm_statements.append(set(res if isinstance(res, list) else [res]))
+        assert ssm_statements, "no ssm:GetParameter* statement found"
+        # ONE statement by design: a split-statement refactor must be a
+        # conscious test edit, not a silent second allowlist.
+        assert len(ssm_statements) == 1, f"expected 1 ssm statement, got {len(ssm_statements)}"
+        scoped = set().union(*ssm_statements)
+        assert "*" not in scoped, "wildcard SSM resource defeats the allowlist"
         assert scoped == EXPECTED_SSM_READ_PATHS, (
             f"deploy-role SSM scope drifted.\n  extra: {scoped - EXPECTED_SSM_READ_PATHS}"
             f"\n  missing: {EXPECTED_SSM_READ_PATHS - scoped}"
         )
 
-    # Chain on the LAST resource create() registers (the propagation
-    # Sleep) so the mocked RolePolicy registration has landed in _CAPTURED
-    # before the assertions run - a bare Output.all() fires too early.
+    # The ordering guarantee is the Sleep's DATAFLOW dependency on the
+    # RolePolicy (triggers={"role_policy_id": deploy_policy.id} in
+    # oidc_role.py) - awaiting its urn means the policy registration has
+    # landed in _CAPTURED. That trigger is load-bearing for this test; if
+    # it is ever dropped, the `assert policies` anchor fails loud (never
+    # vacuous), and this chain must find a new late output.
     return pulumi.Output.all(
         bundle.role.urn, bundle.iam_propagation_wait.urn
     ).apply(check)

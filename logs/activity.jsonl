@@ -1,0 +1,12 @@
+{"timestamp":"2026-06-14T18:45:00Z","action":"ship_slice","detail":{"issue":386,"phase":"merged+live-verified","status":"complete","note":"interim AWS key rotator; rotation verified live (key AKIA...B3EOQEFZ -> HYPGOVSH, old deleted, pods healthy); fixed two #2b deploy-role regressions (/infra read, s3 ListAllMyBuckets)"}}
+{"timestamp":"2026-06-14T21:30:00Z","action":"ship_slice","detail":{"issue":404,"phase":"merged+live-verified","status":"complete","note":"dependency-aware /readyz keystone; RollingUpdate self-limit live-verified; audit fixed 2 HIGH false-negative risks"}}
+{"timestamp":"2026-06-14","action":"ship_slice","detail":{"issue":405,"pr":410,"phase":"merged","status":"complete","note":"grug-consumer fail-fast startup self-check + watchdog hardening; 5 audit findings fixed"}}
+{"timestamp":"2026-06-14","action":"ship_slice","detail":{"issue":406,"pr":411,"phase":"merged+live-verified","status":"complete","note":"k8s-native monitors (retired 3 aws.lambda); crashloop monitor fired on induced crashloop; APM partial (worker spans->#412); #379 reconciled"}}
+{"timestamp":"2026-06-15","action":"ship_slice","detail":{"issue":407,"pr":414,"phase":"merged+live-verified","status":"complete","note":"webhook delivery replay via App redeliver API; guid-sharing verified live; 9 audit findings fixed; poller auto-replay + manual CLI"}}
+{"timestamp":"2026-06-16","action":"ship_slice","detail":{"issue":418,"pr":419,"phase":"merged+deployed","status":"complete","note":"Elder reviews self-recover: run_elder_job failure enqueues one durable rerun (SQS redrive->DLQ); loop structurally impossible (audit CLEAN); live"}}
+{"timestamp": "2026-07-03T18:28:01Z", "action": "ship_slice", "detail": {"issue": 465, "phase": "spec", "status": "complete"}}
+{"timestamp": "2026-07-03T18:28:01Z", "action": "ship_slice", "detail": {"issue": 465, "phase": "tdd", "status": "complete"}}
+{"timestamp": "2026-07-03T18:28:01Z", "action": "ship_slice", "detail": {"issue": 465, "phase": "pr", "status": "complete"}}
+{"timestamp": "2026-07-04T00:20:45Z", "action": "ship_slice", "detail": {"issues": [467, 468, 466], "phase": "guard-shipped", "status": "complete"}}
+{"timestamp": "2026-07-04T18:45:00-04:00", "action": "ship_slice", "detail": {"issue": 77, "phase": "pr_created", "pr": 495, "status": "complete"}}
+{"timestamp": "2026-07-04T20:55:00-04:00", "action": "ship_slice", "detail": {"issue": 77, "phase": "merged_deployed_verified", "pr": 495, "merge": "4c0c140", "postscript_pr": 497, "status": "complete"}}

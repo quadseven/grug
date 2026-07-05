@@ -117,3 +117,71 @@ def test_webhook_image_bakes_the_signing_helper():
     assert "rolesanywhere-credential-helper" in dockerfile
     assert "SIGNING_HELPER_VERSION=v" in dockerfile  # pinned tag, not a branch
     assert "COPY --from=signing-helper /aws_signing_helper /usr/local/bin/aws_signing_helper" in dockerfile
+
+
+def test_paths_and_secret_names_are_cross_derived_not_coincidental():
+    """Audit stage-1 MEDIUM: the mount paths, config path, and secret name
+    each appeared in two artifacts as twice-hardcoded literals - a rename
+    in one place + a matching test edit would leave the OTHER artifact
+    stale and green. Derive each from its counterpart instead."""
+    (cert,) = _load("pki-certificate.yaml")
+    (cm,) = _load("grug-aws-config.yaml")
+    (cron,) = [d for d in _load("poller-cronjob.yaml") if d["kind"] == "CronJob"]
+    pod = _pod_spec(cron)
+    (container,) = pod["containers"]
+    mounts = {m["name"]: m for m in container["volumeMounts"]}
+    vols = {v["name"]: v for v in pod["volumes"]}
+    env = {e["name"]: e.get("value") for e in container.get("env", [])}
+
+    # Certificate secret <-> poller volume: same Secret, by derivation.
+    assert vols["grug-pki"]["secret"]["secretName"] == cert["spec"]["secretName"]
+    # ConfigMap name <-> poller volume.
+    assert vols["aws-config"]["configMap"]["name"] == cm["metadata"]["name"]
+    # AWS_CONFIG_FILE = <config mount>/<the ConfigMap's single data key>.
+    (data_key,) = cm["data"].keys()
+    assert env["AWS_CONFIG_FILE"] == f"{mounts['aws-config']['mountPath']}/{data_key}"
+    # credential_process paths = <pki mount>/<tls files>.
+    line = next(l for l in cm["data"][data_key].splitlines() if l.startswith("credential_process"))
+    pki_mount = mounts["grug-pki"]["mountPath"]
+    for flag, fname in (("--certificate", "tls.crt"), ("--private-key", "tls.key"), ("--intermediates", "ca.crt")):
+        assert f"{flag} {pki_mount}/{fname}" in line
+
+
+def test_configmap_placeholders_match_the_deploy_sed_and_sentinel():
+    """Audit stage-1 MEDIUM: the placeholder contract spans the ConfigMap,
+    the deploy sed, and the post-sed sentinel. This test is the single
+    arbiter: every *_PLACEHOLDER token in the ConfigMap must be sed-
+    substituted by deploy.k8s.yml AND match the sentinel shape that
+    fails the deploy if substitution is ever skipped."""
+    import re
+
+    (cm,) = _load("grug-aws-config.yaml")
+    (data_key,) = cm["data"].keys()
+    workflow = (K8S.parent / ".github/workflows/deploy.k8s.yml").read_text()
+    tokens = set(re.findall(r"\b\w+_PLACEHOLDER\b", cm["data"][data_key]))
+    assert tokens, "expected ARN placeholders in the ConfigMap"
+    for tok in tokens:
+        assert f"s|{tok}|" in workflow, f"{tok} has no sed substitution in deploy.k8s.yml"
+        assert re.fullmatch(r"RA_.*_ARN_PLACEHOLDER", tok), (
+            f"{tok} escapes the post-sed sentinel shape RA_.*_ARN_PLACEHOLDER"
+        )
+
+
+def test_rotator_covers_exactly_the_static_key_consumers():
+    """Audit stage-1 LOW: the rotate list and the set of workloads carrying
+    the static key must be the SAME set - a workload gaining the key
+    without joining the rotation runs on a key deleted at the next cycle."""
+    carriers = set()
+    for manifest in ("api-deployment.yaml", "consumer-deployment.yaml", "webhook-deployment.yaml", "poller-cronjob.yaml"):
+        for doc in _load(manifest):
+            if doc["kind"] not in ("Deployment", "CronJob"):
+                continue
+            (c,) = _pod_spec(doc)["containers"]
+            names = [e["secretRef"]["name"] for e in c.get("envFrom", []) if "secretRef" in e]
+            if "grug-aws-static-key" in names:
+                carriers.add(doc["metadata"]["name"])
+    (rotator,) = [d for d in _load("key-rotator-cronjob.yaml") if d["kind"] == "CronJob"]
+    (rc,) = _pod_spec(rotator)["containers"]
+    renv = {e["name"]: e.get("value") for e in rc.get("env", [])}
+    rotated = set(renv["GRUG_ROTATE_DEPLOYMENTS"].split(","))
+    assert carriers == rotated, f"carriers {carriers} != rotated {rotated}"
