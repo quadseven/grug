@@ -311,13 +311,18 @@ with `@event:judge_verdicts_unparseable`. Recall/precision baseline lives at
 Two paths, both re-applying the `grug-last-good` ConfigMap anchor (the
 digest pair that was running before the last deploy) - no rebuild:
 
-- **Automatic**: every deploy runs a post-apply synthetic (health probes,
-  a signed ping through the full auth stack, 60s zero-restart soak). On
-  failure the deploy rolls itself back, annotates
+- **Automatic**: every deploy anchors, applies, then runs a synthetic
+  (health probes, a signed ping through the full auth stack, 60s
+  zero-restart soak). If the APPLY or the SYNTHETIC fails, the deploy
+  rolls itself back, annotates
   `grug.dev/image-source=rollback-last-good`, emits `grug.deploy.rollback`
   (pages Discord via the '[grug] Deploy auto-rollback fired' monitor),
   and fails the run. The bad merge is STILL ON MAIN - revert or fix
   forward, then let the next deploy re-prove itself.
+- **IMAGE-ONLY contract**: rollback restores the previous digests under
+  the CURRENT applied config - a k8s/ manifest or secret regression needs
+  revert + redeploy instead (the rollback step warns when the merge
+  touched k8s/).
 - **Manual one-click**: Actions -> deploy.rollback -> Run workflow (main).
   Same re-apply; safe to drill after a good deploy (anchor == running
   images = no-op rollout).
