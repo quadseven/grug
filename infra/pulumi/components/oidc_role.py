@@ -144,6 +144,11 @@ def create(
                             "iam:DeleteUserPolicy",
                             "iam:CreateAccessKey", "iam:DeleteAccessKey",
                             "iam:ListAccessKeys", "iam:GetAccessKeyLastUsed",
+                            # #389 teardown: the AWS provider lists (and
+                            # would remove) group memberships before
+                            # DeleteUser - the retirement up died here,
+                            # the audit-6 serial-denial class.
+                            "iam:ListGroupsForUser", "iam:RemoveUserFromGroup",
                         ],
                         "Resource": [
                             "arn:aws:iam::*:role/grug-*",
