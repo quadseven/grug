@@ -121,19 +121,67 @@ def poller_cronjob_unhealthy_query() -> str:
 
 def all_ksm_monitor_queries() -> list[str]:
     """Every NEW k8s-runtime monitor query (all KSM-based). The
-    lambda-retirement guard test iterates this set.
-
-    NB: a consumer queue-age monitor (#379) was intentionally NOT added here -
-    aws.sqs.* is not collected by the DD AWS integration in this org, so it
-    would be permanent No Data (the exact trap this slice retires). The
-    consumer's outage mode (crash/down) is covered by the crashloop +
-    workload-not-ready monitors; true queue-age needs the SQS integration
-    namespace enabled first."""
+    lambda-retirement guard test iterates this set."""
     return [
         workload_not_ready_query(),
         crashloop_query(),
         restart_spike_query(),
         poller_cronjob_unhealthy_query(),
+    ]
+
+
+# ── owned SQS depth gauges (#379) ─────────────────────────────────────
+# aws.sqs.* is not collected by the DD AWS integration in this org, so any
+# monitor on it is permanent No Data with notify_no_data=false - silently
+# blind (three shipped that way). The consumer now emits owned gauges
+# (grug.sqs.messages_visible / .messages_not_visible, tag queue:<name>)
+# every ~60s via GetQueueAttributes + DogStatsD. Age-of-oldest is a
+# CloudWatch-only metric, so "backing up" monitors use SUSTAINED depth
+# (min over the window > 0 == never drained once) - the same operator
+# signal from an attribute SQS actually serves.
+
+_QUEUE_GAUGE = "grug.sqs.messages_visible"
+
+
+def cave_jobs_backlog_query() -> str:
+    """Cave fallback jobs queue not draining for 15m - the connector is
+    down or can't reach the Cave. (Was: age-of-oldest > 10m on aws.sqs.*.)"""
+    return f"min(last_15m):max:{_QUEUE_GAUGE}{{queue:grug-cave-jobs.fifo}} > 0"
+
+
+def rerun_dlq_depth_query() -> str:
+    """Any message in the re-run DLQ - an operator's re-run burned its
+    retries and did not complete."""
+    return f"max(last_15m):max:{_QUEUE_GAUGE}{{queue:grug-rerun-jobs-dlq.fifo}} > 0"
+
+
+def cave_dlq_depth_query() -> str:
+    """Any message in either cave airlock DLQ - a poison job/result."""
+    return (
+        f"max(last_15m):max:{_QUEUE_GAUGE}"
+        "{queue:grug-cave-jobs-dlq.fifo OR queue:grug-cave-results-dlq.fifo} > 0"
+    )
+
+
+def consumer_queue_backlog_query() -> str:
+    """The consumer's own queues not draining for 15m - a stuck/poisoned
+    consumer loop that the pod watchdog can't see (#379's original ask).
+    The paired monitor sets notify_no_data=TRUE: the consumer is also the
+    EMITTER, so metric silence == consumer (or its telemetry) down."""
+    return (
+        f"min(last_15m):max:{_QUEUE_GAUGE}"
+        "{queue:grug-rerun-jobs.fifo OR queue:grug-cave-results.fifo} > 0"
+    )
+
+
+def all_owned_queue_queries() -> list[str]:
+    """Every owned-gauge queue monitor query - the aws.sqs retirement
+    guard test iterates this set."""
+    return [
+        cave_jobs_backlog_query(),
+        rerun_dlq_depth_query(),
+        cave_dlq_depth_query(),
+        consumer_queue_backlog_query(),
     ]
 
 

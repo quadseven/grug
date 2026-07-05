@@ -170,3 +170,53 @@ def test_credential_monitor_is_log_alert_and_not_no_data():
         bundle.credential_acquisition_fail.notify_no_data,
     ).apply(check)
 
+
+
+# ── #379: owned SQS depth gauges ─────────────────────────────────────
+
+def test_no_owned_queue_query_references_uncollected_aws_sqs() -> None:
+    """The DD AWS integration does not collect aws.sqs.* in this org - a
+    monitor on it is permanently blind (the trap that shipped three blind
+    monitors). Every queue monitor must ride the owned gauge."""
+    from components.dd_monitors import all_owned_queue_queries
+
+    for q in all_owned_queue_queries():
+        assert "aws.sqs." not in q, f"uncollected aws.sqs metric in: {q}"
+        assert "grug.sqs.messages_visible" in q
+
+
+def test_owned_queue_queries_tag_exact_queue_names() -> None:
+    """Queue tags must match the consumer's emission exactly - the fixed
+    Pulumi `name=` values with the .fifo suffix."""
+    from components.dd_monitors import (
+        cave_dlq_depth_query,
+        cave_jobs_backlog_query,
+        consumer_queue_backlog_query,
+        rerun_dlq_depth_query,
+    )
+
+    assert "queue:grug-cave-jobs.fifo" in cave_jobs_backlog_query()
+    assert "queue:grug-rerun-jobs-dlq.fifo" in rerun_dlq_depth_query()
+    q = cave_dlq_depth_query()
+    assert "queue:grug-cave-jobs-dlq.fifo" in q
+    assert "queue:grug-cave-results-dlq.fifo" in q
+    q = consumer_queue_backlog_query()
+    assert "queue:grug-rerun-jobs.fifo" in q
+    assert "queue:grug-cave-results.fifo" in q
+
+
+def test_backlog_queries_use_sustained_depth_semantics() -> None:
+    """'Backing up' monitors require depth to hold across the FULL window
+    (min > 0 = never drained once), not a momentary spike (max > 0);
+    DLQ monitors are any-message (max > 0) on purpose."""
+    from components.dd_monitors import (
+        cave_dlq_depth_query,
+        cave_jobs_backlog_query,
+        consumer_queue_backlog_query,
+        rerun_dlq_depth_query,
+    )
+
+    assert cave_jobs_backlog_query().startswith("min(last_15m):")
+    assert consumer_queue_backlog_query().startswith("min(last_15m):")
+    assert rerun_dlq_depth_query().startswith("max(last_15m):")
+    assert cave_dlq_depth_query().startswith("max(last_15m):")

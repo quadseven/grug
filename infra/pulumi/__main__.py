@@ -421,15 +421,15 @@ _cave_jobs_age_monitor = _datadog.Monitor(
     name="[grug-webhook] Cave fallback jobs queue backing up",
     message=(
         f"{_dd_notify}\n"
-        "grug-cave-jobs (Elder cave fallback) has messages older than 10min — the "
+        "grug-cave-jobs (Elder cave fallback) has not drained for 15min — the "
         "grug-cave-connector isn't draining (down, or can't reach the Cave). "
         "Fallback reviews stay `errored` until it recovers.\n"
         "Runbook: docs/RUNBOOK.md#elder-async-offload"
     ),
-    query=(
-        "max(last_15m):max:aws.sqs.approximate_age_of_oldest_message"
-        "{queuename:grug-cave-jobs.fifo} > 600"
-    ),
+    # #379: owned gauge (aws.sqs.* is not collected in this DD org - the
+    # original query sat in permanent No Data). Sustained depth == same
+    # "not draining" signal the age threshold approximated.
+    query=dd_monitors.cave_jobs_backlog_query(),
     tags=[f"env:{env}", "service:grug-webhook", "team:grug"],
     notify_no_data=False,
     priority=4,
@@ -450,10 +450,7 @@ _rerun_dlq_monitor = _datadog.Monitor(
         "not complete; inspect the DLQ message.\n"
         "Runbook: docs/RUNBOOK.md#elder-async-offload"
     ),
-    query=(
-        "max(last_15m):max:aws.sqs.approximate_number_of_messages_visible"
-        "{queuename:grug-rerun-jobs-dlq.fifo} > 0"
-    ),
+    query=dd_monitors.rerun_dlq_depth_query(),  # #379: owned gauge
     tags=[f"env:{env}", "service:grug-api", "team:grug"],
     notify_no_data=False,
     priority=3,
@@ -475,12 +472,36 @@ _cave_dlq_monitor = _datadog.Monitor(
         "review for that PR did not complete; inspect the DLQ message.\n"
         "Runbook: docs/RUNBOOK.md#elder-async-offload"
     ),
-    query=(
-        "max(last_15m):max:aws.sqs.approximate_number_of_messages_visible"
-        "{queuename:grug-cave-jobs-dlq.fifo OR queuename:grug-cave-results-dlq.fifo} > 0"
-    ),
+    query=dd_monitors.cave_dlq_depth_query(),  # #379: owned gauge
     tags=[f"env:{env}", "service:grug-webhook", "team:grug"],
     notify_no_data=False,
+    priority=3,
+    opts=pulumi.ResourceOptions(provider=_dd_provider),
+)
+
+# Consumer backlog (#379): the consumer's own queues never drained across a
+# 15m window - a stuck/poisoned consumer loop or IAM regression that the pod
+# watchdog cannot see (the pod is alive; the loop is useless). The consumer
+# is ALSO the gauge's emitter, so notify_no_data=True doubles as the
+# consumer-telemetry heartbeat: metric silence = consumer (or its telemetry
+# thread) down = page. The three depth monitors above stay
+# notify_no_data=False - this one carries the no-data pager for the family.
+_consumer_backlog_monitor = _datadog.Monitor(
+    "grug-consumer-queue-backlog",
+    type="metric alert",
+    name="[grug-consumer] Consumed queues not draining (15min)",
+    message=(
+        f"{_dd_notify}\n"
+        "grug-rerun-jobs / grug-cave-results has had messages sitting for a "
+        "full 15min window — the consumer is stuck (poisoned loop, IAM "
+        "regression) even if its pod reads healthy. NO DATA means the "
+        "consumer's own telemetry stopped — treat as consumer down.\n"
+        "Runbook: docs/RUNBOOK.md#elder-async-offload"
+    ),
+    query=dd_monitors.consumer_queue_backlog_query(),
+    tags=[f"env:{env}", "service:grug-webhook", "team:grug"],
+    notify_no_data=True,
+    no_data_timeframe=30,
     priority=3,
     opts=pulumi.ResourceOptions(provider=_dd_provider),
 )
