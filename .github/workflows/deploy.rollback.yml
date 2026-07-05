@@ -44,6 +44,12 @@ jobs:
       - name: Re-apply last-good digests
         run: |
           set -euo pipefail
+          # Page FIRST: the metric fires even if the re-apply then fails.
+          NODE_IP=$(kubectl get nodes -o jsonpath='{.items[0].status.addresses[?(@.type=="InternalIP")].address}' 2>/dev/null || echo "")
+          if [ -n "$NODE_IP" ]; then
+            printf 'grug.deploy.rollback:1|c|#env:prod,trigger:dispatch,phase:attempted' \
+              | timeout 5 bash -c "cat > /dev/udp/${NODE_IP}/8125" || true
+          fi
           W=$(kubectl -n grug get configmap grug-last-good -o jsonpath='{.data.webhook}' 2>/dev/null || echo "")
           A=$(kubectl -n grug get configmap grug-last-good -o jsonpath='{.data.api}' 2>/dev/null || echo "")
           FROM=$(kubectl -n grug get configmap grug-last-good -o jsonpath='{.data.recorded_from_sha}' 2>/dev/null || echo unknown)
@@ -70,9 +76,8 @@ jobs:
             deploy/grug-webhook deploy/grug-api deploy/grug-consumer cronjob/grug-poller \
             "grug.dev/image-source=rollback-last-good" \
             "grug.dev/rolled-back-via=workflow-dispatch"
-          NODE_IP=$(kubectl get nodes -o jsonpath='{.items[0].status.addresses[?(@.type=="InternalIP")].address}' 2>/dev/null || echo "")
           if [ -n "$NODE_IP" ]; then
-            printf 'grug.deploy.rollback:1|c|#env:prod,trigger:dispatch' \
+            printf 'grug.deploy.rollback:1|c|#env:prod,trigger:dispatch,phase:completed' \
               | timeout 5 bash -c "cat > /dev/udp/${NODE_IP}/8125" || true
           fi
           echo "rolled back to last-good (recorded from ${FROM})" >> "$GITHUB_STEP_SUMMARY"
