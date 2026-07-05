@@ -187,3 +187,35 @@ def test_rotator_covers_exactly_the_static_key_consumers():
     renv = {e["name"]: e.get("value") for e in rc.get("env", [])}
     rotated = set(renv["GRUG_ROTATE_DEPLOYMENTS"].split(","))
     assert carriers == rotated, f"carriers {carriers} != rotated {rotated}"
+
+
+def test_deploy_sed_simulation_leaves_no_sentinel_matches():
+    """Audit stage-8 CRITICAL (caught live): a COMMENT in a manifest
+    mentioning a placeholder token literally would survive the deploy's
+    sed (which only rewrites the real pin sites) and then trip the
+    post-sed sentinel grep over ALL of k8s/ - failing every deploy
+    BEFORE kubectl apply, with the secret seed already run. Simulate the
+    deploy's exact substitutions over every manifest and assert the
+    sentinel would pass."""
+    import re
+
+    sub = {
+        "REGISTRY_PLACEHOLDER/grug-api:TAG_PLACEHOLDER": "reg.example/grug-api@sha256:aaaa",
+        "REGISTRY_PLACEHOLDER/grug-webhook:TAG_PLACEHOLDER": "reg.example/grug-webhook@sha256:bbbb",
+        "TAG_PLACEHOLDER": "deadbeef",
+        "RA_TRUST_ANCHOR_ARN_PLACEHOLDER": "arn:aws:rolesanywhere:x:1:trust-anchor/t",
+        "RA_PROFILE_ARN_PLACEHOLDER": "arn:aws:rolesanywhere:x:1:profile/p",
+        "RA_ROLE_ARN_PLACEHOLDER": "arn:aws:iam::1:role/r",
+    }
+    sentinel = re.compile(r"REGISTRY_PLACEHOLDER|TAG_PLACEHOLDER|RA_.*_ARN_PLACEHOLDER")
+    offenders = []
+    for manifest in sorted(K8S.glob("*.yaml")):
+        text = manifest.read_text()
+        for old, new in sub.items():  # dict order mirrors the sed -e order
+            text = text.replace(old, new)
+        for i, line in enumerate(text.splitlines(), 1):
+            if sentinel.search(line):
+                offenders.append(f"{manifest.name}:{i}: {line.strip()[:80]}")
+    assert not offenders, (
+        "post-sed sentinel would fail the deploy on: " + "; ".join(offenders)
+    )
