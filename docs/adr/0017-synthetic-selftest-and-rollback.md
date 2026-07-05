@@ -37,10 +37,13 @@ and the escape hatch should be seconds, not minutes.
    here; the first cut used port-forward and false-rolled-back two
    healthy deploys before this was corrected): a 60s SOAK asserting zero
    container restarts (a pod that went Ready then crash-loops) + a
-   post-soak Available recheck on all workloads, plus a best-effort
-   public-edge curl (warn-only; the DD uptime synthetic is the
-   authoritative external alarm). The soak is the OWNED stand-in for the
-   'DD error-rate window' - the deploy role has no DD keys by design.
+   post-soak Available recheck on all workloads, plus a HARD
+   public-edge endpoint validation - /livez + /readyz on BOTH services
+   through the real ingress (DNS + CF worker + tunnel + TLS + the app),
+   a strictly stronger signal than an in-cluster ClusterIP probe and the
+   BYON-safe way to satisfy the issue's endpoint-validation requirement
+   (Qodo review on #525). The soak is the OWNED stand-in for the 'DD
+   error-rate window' - the deploy role has no DD keys by design.
 3. **Auto-rollback on ANY post-anchor failure** (a failed apply/rollout/
    smoke - captured via continue-on-error - or a failed synthetic):
    re-apply the anchored digests
