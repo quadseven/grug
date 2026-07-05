@@ -24,8 +24,6 @@ import pulumi_datadog as _datadog
 
 from components import (
     cf_shared_secret,
-    k8s_pod_user,
-    k8s_rotator,
     dd_dashboard,
     dd_monitors,
     dd_rum,
@@ -346,20 +344,10 @@ _rerun_jobs_queue = aws.sqs.Queue(
     tags={"app": "grug", "service": "grug-rerun"},
 )
 
-# Scoped IAM user for the Kubernetes pods (#354): queue + envelope-KMS +
-# /grug/* parameter access, key pair landed in /grug/k8s-pod-aws-* for
-# the deploy workflow's secret seed. Retires with nothing - the same
-# user serves webhook/api/poller pods.
-_k8s_pod = k8s_pod_user.create(
-    queue_arns=[_cave_jobs_queue.arn, _cave_results_queue.arn, _rerun_jobs_queue.arn],
-    kms_key_arn=grug_tokens_cmk.arn,
-    cave_diff_bucket_arn=_cave_diff_bucket.arn,
-)
-
-# Interim AWS key-rotator user (#386) - scoped to access-key ops on the pod
-# user ONLY. Throwaway until Roles Anywhere (#388/#389). Its key lands in
-# /grug/k8s-rotator-aws-* for the deploy seed.
-_k8s_rotator = k8s_rotator.create(pod_user_arn=_k8s_pod.user.arn)
+# RETIRED at #389: the static grug-k8s-pod IAM user + AccessKey + the
+# #386 rotator user. Every workload authenticates via Roles Anywhere
+# (ADR-0008; role ra-grug in the infrastructure repo's infra-pki stack -
+# the pod policy lives THERE now, as the tenant's inline role policy).
 
 
 # Cloudflare DNS — webhook.grug.lol is NO LONGER managed by this stack.

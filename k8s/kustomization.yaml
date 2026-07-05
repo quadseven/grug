@@ -1,6 +1,6 @@
 # grug on Kubernetes (#354). Applied by the deploy workflow after image
-# placeholders are pinned. Secrets (grug-secrets, grug-aws-static-key,
-# registry-pull) are seeded by the workflow from the parameter store -
+# placeholders are pinned. Secrets (grug-secrets, registry-pull) are
+# seeded by the workflow from the parameter store -
 # never committed; the Roles Anywhere ARNs in grug-aws-config are seeded
 # the same way (#388).
 resources:
@@ -12,6 +12,5 @@ resources:
   - api-deployment.yaml
   - poller-cronjob.yaml
   - consumer-deployment.yaml
-  - key-rotator-cronjob.yaml
   - pki-certificate.yaml
   - grug-aws-config.yaml

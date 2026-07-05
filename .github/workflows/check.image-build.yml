@@ -27,7 +27,7 @@ jobs:
     steps:
       - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
       - name: Build image (services/ context)
-        run: docker build services -f "services/${{ matrix.svc }}/Dockerfile" -t "grug-${{ matrix.svc }}:pr-smoke"
+        run: docker build services -f services/Dockerfile --build-arg SERVICE="${{ matrix.svc }}" -t "grug-${{ matrix.svc }}:pr-smoke"
       - name: Import smoke (inside the image)
         run: |
           set -euo pipefail

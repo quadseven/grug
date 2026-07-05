@@ -83,7 +83,7 @@ jobs:
             # Context is services/ (ADR-0014): the image COPYs both the
             # service tree and services/_shared/.
             docker build services \
-              -f "services/$svc/Dockerfile" \
+              -f "services/Dockerfile" --build-arg SERVICE="$svc" \
               -t "$REGISTRY_HOST/grug-$svc:${GITHUB_SHA}" \
               --build-arg DD_GIT_REPOSITORY_URL="github.com/${GITHUB_REPOSITORY}" \
               --build-arg DD_GIT_COMMIT_SHA="${GITHUB_SHA}"
@@ -181,41 +181,12 @@ jobs:
             exit 1
           fi
           seed grug-secrets "$ENVF"
-          # Static AWS key pair (#388 split): the ROLLBACK RESERVE while the
-          # fleet rides Roles Anywhere (#389); the retirement PR deletes it.
-          # ROTATOR-OWNED after bootstrap (peer review #504, confirmed 4x):
-          # the rotator rotates the live Secret but never writes back to SSM
-          # (#502), so re-seeding here would overwrite a VALID rotated key
-          # with a DELETED one on every post-rotation deploy - exactly when
-          # the reserve becomes load-bearing. Seed ONLY if absent (first
-          # deploy), then verify the held key is LIVE in IAM either way.
-          if ! kubectl -n grug get secret grug-aws-static-key >/dev/null 2>&1; then
-            KEYF="$RUNNER_TEMP/grug-aws-static-key.env"
-            install -m 600 /dev/null "$KEYF"
-            {
-              echo "AWS_ACCESS_KEY_ID=$(get /grug/k8s-pod-aws-access-key-id)"
-              echo "AWS_SECRET_ACCESS_KEY=$(get /grug/k8s-pod-aws-secret-access-key)"
-            } > "$KEYF"
-            seed grug-aws-static-key "$KEYF"
-          fi
-          RESERVE_KEY_ID="$(kubectl -n grug get secret grug-aws-static-key \
-            -o jsonpath='{.data.AWS_ACCESS_KEY_ID}' | base64 -d)"
-          if ! aws iam list-access-keys --user-name grug-k8s-pod \
-              --query 'AccessKeyMetadata[].AccessKeyId' --output text | grep -qw "$RESERVE_KEY_ID"; then
-            echo "::error::rollback reserve holds a key NOT live in IAM - run the manual-rotate job (RUNBOOK 'Key rotation') before relying on rollback"
-            exit 1
-          fi
-          # Rotator credential (#386): SEPARATE from the pod secrets, scoped
-          # to access-key ops on grug-k8s-pod only. The key-rotator CronJob
-          # uses THIS, never the secret it rotates.
-          ROTF="$RUNNER_TEMP/grug-rotator.env"
-          install -m 600 /dev/null "$ROTF"
-          {
-            echo "AWS_ACCESS_KEY_ID=$(get /grug/k8s-rotator-aws-access-key-id)"
-            echo "AWS_SECRET_ACCESS_KEY=$(get /grug/k8s-rotator-aws-secret-access-key)"
-            echo "AWS_DEFAULT_REGION=us-east-1"
-          } > "$ROTF"
-          seed grug-rotator-secret "$ROTF"
+          # #389 RETIREMENT: the static key, its reserve Secret, the #386
+          # rotator (CronJob + Secret + IAM user), and the SSM key params
+          # are GONE - the fleet authenticates via Roles Anywhere only.
+          # One-time live cleanup (idempotent; removable once observed):
+          kubectl -n grug delete secret grug-aws-static-key grug-rotator-secret --ignore-not-found
+          kubectl -n grug delete cronjob grug-key-rotator --ignore-not-found
           kubectl -n grug create secret docker-registry registry-pull \
             --docker-server="$REGISTRY_HOST" \
             --docker-username="$REGISTRY_USERNAME" \

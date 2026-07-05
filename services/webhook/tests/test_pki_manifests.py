@@ -73,11 +73,6 @@ def test_aws_config_credential_process_shape():
 # hand-list. The exclusions are the point: each names WHY it must never
 # ride the Roles Anywhere path.
 EXCLUDED_FROM_RA_FLEET = {
-    "key-rotator-cronjob.yaml": (
-        "reserve custodian: rotates the rollback key with its OWN static "
-        "cred - putting it on RA would make the reserve's freshness depend "
-        "on the path it exists to back up"
-    ),
     "smasher-trial-namespace.yaml": "trial sandbox: token-free by design, no AWS",
 }
 
@@ -132,39 +127,6 @@ def test_no_workload_carries_the_static_key_and_all_ride_roles_anywhere():
             assert vols["grug-pki"]["secret"]["secretName"] == "grug-pki-tls", name
             assert vols["aws-config"]["configMap"]["name"] == "grug-aws-config", name
 
-
-def test_rotator_stays_off_the_ra_path_and_rotates_no_deployments():
-    """The rotator is the reserve CUSTODIAN (audit #389-1): it must keep
-    its own static cred (grug-rotator-secret), never the cert path - and
-    since no workload consumes the reserve, a rotation must not bounce
-    the serving fleet (GRUG_ROTATE_DEPLOYMENTS empty; it restarted all
-    three deployments twice a day before this pin)."""
-    (rotator,) = [d for d in _load("key-rotator-cronjob.yaml") if d["kind"] == "CronJob"]
-    pod = _pod_spec(rotator)
-    (rc,) = pod["containers"]
-    renv = {e["name"]: e.get("value") for e in rc.get("env", [])}
-    assert "AWS_CONFIG_FILE" not in renv
-    assert renv.get("GRUG_ROTATE_DEPLOYMENTS") == ""
-    assert "grug-rotator-secret" in _secret_env_from(rc)
-    mounts = {m["name"] for m in rc.get("volumeMounts", [])}
-    assert "grug-pki" not in mounts and "aws-config" not in mounts
-
-
-def test_rotator_maintains_the_rollback_reserve_until_retirement():
-    """#389 rollout window (PR A of 2; the retirement PR deletes the
-    reserve): no workload CONSUMES grug-aws-static-key, but
-    the #386 rotator keeps it VALID as the documented rollback reserve.
-    The retirement PR deletes the rotator + this test together - flipping
-    either side alone is the drift this pin catches."""
-    (rotator,) = [d for d in _load("key-rotator-cronjob.yaml") if d["kind"] == "CronJob"]
-    (rc,) = _pod_spec(rotator)["containers"]
-    renv = {e["name"]: e.get("value") for e in rc.get("env", [])}
-    assert renv.get("GRUG_ROTATE_SECRET") == "grug-aws-static-key"
-    (role,) = [d for d in _load("key-rotator-cronjob.yaml") if d["kind"] == "Role"]
-    (rule,) = [r for r in role["rules"] if "secrets" in r.get("resources", [])]
-    assert rule["resourceNames"] == ["grug-aws-static-key"]
-
-
 def test_kustomization_ships_the_new_manifests():
     (kust,) = _load("kustomization.yaml")
     for res in ("pki-certificate.yaml", "grug-aws-config.yaml"):
@@ -172,7 +134,8 @@ def test_kustomization_ships_the_new_manifests():
 
 
 def test_webhook_image_bakes_the_signing_helper():
-    dockerfile = (K8S.parent / "services/webhook/Dockerfile").read_text()
+    # Unified single Dockerfile since #389 (ARG SERVICE selects the tree).
+    dockerfile = (K8S.parent / "services/Dockerfile").read_text()
     assert "rolesanywhere-credential-helper" in dockerfile
     assert "SIGNING_HELPER_VERSION=v" in dockerfile  # pinned tag, not a branch
     assert "COPY --from=signing-helper /aws_signing_helper /usr/local/bin/aws_signing_helper" in dockerfile
@@ -257,3 +220,21 @@ def test_deploy_sed_simulation_leaves_no_sentinel_matches():
     assert not offenders, (
         "post-sed sentinel would fail the deploy on: " + "; ".join(offenders)
     )
+
+
+def test_static_key_apparatus_is_fully_retired():
+    """#389 retirement: no manifest, workflow, or component may reference
+    the static-key world again. A single surviving reference is either a
+    resurrection (drift) or a missed retirement site."""
+    forbidden = ("grug-aws-static-key", "grug-rotator-secret", "key-rotator", "k8s-pod-aws")
+    offenders = []
+    roots = [K8S, K8S.parent.parent / ".github" / "workflows"]
+    for root in roots:
+        for f in sorted(root.glob("*.y*ml")):
+            text = f.read_text()
+            for needle in forbidden:
+                if needle in text:
+                    offenders.append(f"{f.name}: {needle}")
+    # The deploy's one-time CLEANUP deletes are the sanctioned exception.
+    offenders = [o for o in offenders if not o.startswith("deploy.k8s.yml")]
+    assert not offenders, f"static-key world referenced post-retirement: {offenders}"
