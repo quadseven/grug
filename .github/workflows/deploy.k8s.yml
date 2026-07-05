@@ -118,6 +118,19 @@ jobs:
             if [ -n "$head_sha" ]; then
               head_tree=$(gh_fact "repos/${GITHUB_REPOSITORY}/commits/${head_sha}" --jq .commit.tree.sha)
             fi
+            # Did the image-build gate RUN for this head at all? A
+            # workflow-only merge never triggers it - the absent artifact
+            # is then an EXPECTED rebuild, not the alertable
+            # artifact-missing case (#499 reclassification).
+            gate_ran="unknown"
+            if [ -n "$head_sha" ]; then
+              cr=$(gh_fact "repos/${GITHUB_REPOSITORY}/commits/${head_sha}/check-runs?check_name=image-build%20(webhook)" --jq '.total_count')
+              case "$cr" in
+                0) gate_ran="false" ;;
+                ''|*[!0-9]*) gate_ran="unknown" ;;
+                *) gate_ran="true" ;;
+              esac
+            fi
             for svc in webhook api; do
               present=false
               if err=$(docker manifest inspect "$REGISTRY_HOST/grug-$svc:pr-${pr_num}" 2>&1 >/dev/null); then
@@ -134,6 +147,7 @@ jobs:
             --pr-numbers-json "$prs_json" \
             --head-tree "$head_tree" --merge-tree "$merge_tree" \
             --expected-services webhook,api \
+            --gate-ran "${gate_ran:-unknown}" \
             "${manifest_flags[@]}" | tee -a "$GITHUB_OUTPUT"
           echo "head_sha=$head_sha" >> "$GITHUB_OUTPUT"
 
@@ -331,6 +345,32 @@ jobs:
             --docker-password="$REGISTRY_PASSWORD" \
             --dry-run=client -o yaml | kubectl apply -f -
 
+      - name: Record last-good digests (rollback anchor, #499)
+        run: |
+          set -euo pipefail
+          # Snapshot the CURRENTLY-RUNNING digest pair before we touch
+          # anything - it survived its own deploy's synthetic, so it is
+          # the rollback target. Skip (keep the previous anchor) unless
+          # every workload is currently Available: never anchor a broken
+          # state.
+          ok=true
+          for d in grug-webhook grug-api grug-consumer; do
+            avail=$(kubectl -n grug get deploy "$d" -o jsonpath='{.status.conditions[?(@.type=="Available")].status}' 2>/dev/null || echo "")
+            [ "$avail" = "True" ] || ok=false
+          done
+          if [ "$ok" = "true" ]; then
+            W=$(kubectl -n grug get deploy grug-webhook -o jsonpath='{.spec.template.spec.containers[0].image}')
+            A=$(kubectl -n grug get deploy grug-api -o jsonpath='{.spec.template.spec.containers[0].image}')
+            FROM=$(kubectl -n grug get deploy grug-webhook -o jsonpath='{.metadata.annotations.grug\.dev/merge-sha}' 2>/dev/null || echo unknown)
+            kubectl -n grug create configmap grug-last-good \
+              --from-literal=webhook="$W" --from-literal=api="$A" \
+              --from-literal=recorded_from_sha="$FROM" \
+              --dry-run=client -o yaml | kubectl apply -f -
+            echo "last-good anchor recorded (from ${FROM})" >> "$GITHUB_STEP_SUMMARY"
+          else
+            echo "::warning::workloads not all Available pre-apply - keeping the previous last-good anchor"
+          fi
+
       - name: Pin image placeholders + apply
         env:
           REGISTRY_HOST: ${{ vars.DEPLOY_REGISTRY_HOST }}
@@ -404,6 +444,100 @@ jobs:
             cronjob/grug-poller \
             "grug.dev/image-source=${IMAGE_SOURCE:?neither image step set IMAGE_SOURCE}" \
             "grug.dev/merge-sha=${GITHUB_SHA}"
+
+      - name: Post-deploy synthetic self-test (#499)
+        id: synthetic
+        continue-on-error: true
+        run: |
+          set -euo pipefail
+          fail() { echo "::error::synthetic: $1"; exit 1; }
+          probe_health() {  # probe_health <svc>
+            kubectl -n grug port-forward "svc/$1" 18080:8080 >/dev/null 2>&1 &
+            pf=$!
+            sleep 3
+            for ep in livez readyz; do
+              curl -fsS -m 10 "http://127.0.0.1:18080/$ep" > /dev/null \
+                || { kill "$pf" 2>/dev/null; fail "$1 /$ep unhealthy"; }
+            done
+            kill "$pf" 2>/dev/null; wait "$pf" 2>/dev/null || true
+          }
+          probe_health grug-webhook
+          probe_health grug-api
+          # Signed ping through the FULL auth stack: proves the pod serves,
+          # its Roles Anywhere creds fetch the webhook secret from SSM,
+          # HMAC verify runs, and the CF-boundary middleware accepts the
+          # shared secret - the #368 proof mechanics, automated and
+          # side-effect-free (ping dispatches nothing).
+          WH_SECRET=$(aws ssm get-parameter --name /grug/github-app-webhook-secret --with-decryption --query 'Parameter.Value' --output text)
+          CF_SECRET=$(aws ssm get-parameter --name /grug/cf-shared-secret --with-decryption --query 'Parameter.Value' --output text)
+          kubectl -n grug port-forward svc/grug-webhook 18080:8080 >/dev/null 2>&1 &
+          pf=$!
+          sleep 3
+          BODY='{"zen":"synthetic deploy self-test","hook_id":0}'
+          SIG=$(printf '%s' "$BODY" | openssl dgst -sha256 -hmac "$WH_SECRET" | awk '{print $NF}')
+          code=$(curl -s -o "$RUNNER_TEMP/ping.out" -w '%{http_code}' -m 15 \
+            -H "X-GitHub-Event: ping" \
+            -H "X-GitHub-Delivery: synthetic-${GITHUB_SHA}" \
+            -H "X-Hub-Signature-256: sha256=${SIG}" \
+            -H "X-Grug-CF-Secret: ${CF_SECRET}" \
+            -H "Content-Type: application/json" \
+            --data "$BODY" "http://127.0.0.1:18080/webhook/github")
+          kill "$pf" 2>/dev/null; wait "$pf" 2>/dev/null || true
+          [ "$code" = "200" ] || fail "signed ping got HTTP $code: $(head -c 120 "$RUNNER_TEMP/ping.out")"
+          # 60s soak: no container restarts and both services still ready
+          # (the owned stand-in for a DD error-rate window - the deploy
+          # role has no DD keys by design; see ADR-0017).
+          base=$(kubectl -n grug get pods -o jsonpath='{range .items[*]}{range .status.containerStatuses[*]}{.restartCount}{"\n"}{end}{end}' | awk '{s+=$1} END {print s+0}')
+          sleep 60
+          after=$(kubectl -n grug get pods -o jsonpath='{range .items[*]}{range .status.containerStatuses[*]}{.restartCount}{"\n"}{end}{end}' | awk '{s+=$1} END {print s+0}')
+          [ "$after" -le "$base" ] || fail "container restarts during soak (${base} -> ${after})"
+          probe_health grug-webhook
+          probe_health grug-api
+          echo "synthetic PASS: health x2, signed ping 200, 60s soak clean" >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Auto-rollback to last-good (synthetic failed, #499)
+        if: steps.synthetic.outcome == 'failure'
+        run: |
+          set -euo pipefail
+          W=$(kubectl -n grug get configmap grug-last-good -o jsonpath='{.data.webhook}' 2>/dev/null || echo "")
+          A=$(kubectl -n grug get configmap grug-last-good -o jsonpath='{.data.api}' 2>/dev/null || echo "")
+          if [ -z "$W" ] || [ -z "$A" ]; then
+            echo "::error::synthetic FAILED and no last-good anchor exists - manual intervention required"
+            exit 1
+          fi
+          # Container names per the live manifests: webhook/webhook,
+          # api/webhook (historical), consumer/consumer, poller/poller.
+          kubectl -n grug set image deploy/grug-webhook webhook="$W"
+          kubectl -n grug set image deploy/grug-api webhook="$A"
+          kubectl -n grug set image deploy/grug-consumer consumer="$W"
+          kubectl -n grug set image cronjob/grug-poller poller="$W"
+          for d in grug-webhook grug-api grug-consumer; do
+            kubectl -n grug rollout status "deploy/$d" --timeout=180s
+          done
+          kubectl -n grug annotate --overwrite \
+            deploy/grug-webhook deploy/grug-api deploy/grug-consumer cronjob/grug-poller \
+            "grug.dev/image-source=rollback-last-good" \
+            "grug.dev/rolled-back-from=${GITHUB_SHA}"
+          NODE_IP=$(kubectl get nodes -o jsonpath='{.items[0].status.addresses[?(@.type=="InternalIP")].address}')
+          if [ -n "$NODE_IP" ]; then
+            printf 'grug.deploy.rollback:1|c|#env:prod,trigger:synthetic' \
+              | timeout 5 bash -c "cat > /dev/udp/${NODE_IP}/8125" || true
+          fi
+          echo "::error::synthetic FAILED - rolled back to last-good. The bad merge is STILL ON MAIN: revert or fix forward."
+          echo "ROLLED BACK to last-good (from $(kubectl -n grug get configmap grug-last-good -o jsonpath='{.data.recorded_from_sha}'))" >> "$GITHUB_STEP_SUMMARY"
+          exit 1
+
+      - name: Emit deploy telemetry
+        if: always() && steps.synthetic.outcome == 'success'
+        run: |
+          # promoted-vs-rebuilt rate (#498 handoff): owned DogStatsD count
+          # via a node's agent hostPort; best-effort.
+          NODE_IP=$(kubectl get nodes -o jsonpath='{.items[0].status.addresses[?(@.type=="InternalIP")].address}' 2>/dev/null || echo "")
+          if [ -n "$NODE_IP" ] && [ -n "${IMAGE_SOURCE:-}" ]; then
+            src=$(printf '%s' "$IMAGE_SOURCE" | tr -cd 'a-z0-9-' | head -c 40)
+            printf 'grug.deploy.completed:1|c|#env:prod,source:%s' "$src" \
+              | timeout 5 bash -c "cat > /dev/udp/${NODE_IP}/8125" || true
+          fi
 
       - name: Cleanup
         if: always()

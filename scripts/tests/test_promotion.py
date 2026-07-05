@@ -154,3 +154,24 @@ def test_cli_verify_baked_sha_subcommand():
     assert "verified=true" in ok.stdout
     bad = _run_cli("--verify-baked-sha", "not-json", _SHA)
     assert bad.returncode == 0 and "verified=" in bad.stdout or "promote=false" in bad.stdout
+
+
+def test_missing_artifact_reclassified_when_gate_did_not_run():
+    """#499: a workflow-only merge never triggers the gate - the absent
+    artifact is EXPECTED, not the alertable silent-promotion-death case."""
+    d = _decide(manifests_present={"webhook": False, "api": False}, gate_ran=False)
+    assert d.promote is False
+    assert d.category == CATEGORY_EXPECTED_REBUILD
+    assert "did not run" in d.reason
+    # gate ran (or unknown) stays alertable
+    ran = _decide(manifests_present={"webhook": False, "api": False}, gate_ran=True)
+    unk = _decide(manifests_present={"webhook": False, "api": False})
+    assert ran.category == CATEGORY_ARTIFACT_MISSING
+    assert unk.category == CATEGORY_ARTIFACT_MISSING
+
+
+def test_cli_gate_ran_flag():
+    r = _run_cli("--pr-numbers-json", "[7]", "--head-tree", _TREE,
+                 "--merge-tree", _TREE, "--manifest", "webhook=false",
+                 "--manifest", "api=false", "--gate-ran", "false")
+    assert "category=expected-rebuild" in r.stdout
