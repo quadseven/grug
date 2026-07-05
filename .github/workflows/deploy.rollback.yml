@@ -57,6 +57,7 @@ jobs:
           kubectl -n grug set image deploy/grug-api webhook="$A"
           kubectl -n grug set image deploy/grug-consumer consumer="$W"
           kubectl -n grug set image cronjob/grug-poller poller="$W"
+          kubectl -n grug-trial set image cronjob/grug-trial-janitor janitor="$W"
           for d in grug-webhook grug-api grug-consumer; do
             kubectl -n grug rollout status "deploy/$d" --timeout=180s
           done
