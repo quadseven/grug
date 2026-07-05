@@ -123,3 +123,11 @@ def test_files_fetch_failure_is_graceful(monkeypatch):
     _install(monkeypatch, routes)
     res = run.run_ticket_compliance("t", owner="o", repo="r", pr_number=1, pr_body="closes #5")
     assert res["checked"] == 0 and "failed" in res["reason"]
+
+
+def test_global_kill_switch(monkeypatch):
+    monkeypatch.setenv("GRUG_TICKET_COMPLIANCE_DISABLED", "1")
+    fake = _install(monkeypatch, {})
+    res = run.run_ticket_compliance("t", owner="o", repo="r", pr_number=1, pr_body="closes #5")
+    assert res["reason"] == "disabled"
+    assert fake.calls == []

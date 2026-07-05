@@ -29,8 +29,10 @@ words
 - not a box
 * [ ] star-bullet box too
 """
+    # only UNCHECKED boxes are candidates; the checked "wire the poller
+    # pass" is excluded (author asserts it done).
     assert acceptance_criteria(body) == [
-        "add the emit_gauge helper", "wire the poller pass", "star-bullet box too",
+        "add the emit_gauge helper", "star-bullet box too",
     ]
 
 
@@ -80,3 +82,10 @@ def test_multi_criteria_mixed():
         ["services/webhook/consumer.py"], "emit grug.sqs.messages_visible per queue via dogstatsd",
     )
     assert unaddressed_criteria(criteria, signals) == ["add a nist ghsa merged feed"]
+
+
+def test_checked_box_not_flagged():
+    """#535 Qodo: a CHECKED box is the author asserting done - never a
+    candidate for 'unaddressed', so it can't false-positive."""
+    body = "## Acceptance criteria\n- [x] add the nist ghsa merged feed\n- [ ] emit dogstatsd gauge\n"
+    assert acceptance_criteria(body) == ["emit dogstatsd gauge"]

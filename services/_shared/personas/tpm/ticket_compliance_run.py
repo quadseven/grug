@@ -78,18 +78,26 @@ def _changed_files(token: str, owner: str, repo: str, pr_number: int) -> list[st
         if len(batch) < 100:
             break
         page += 1
-    return files
+    return files[:_MAX_FILES]  # hard cap (Qodo review #535: a page could overshoot)
 
 
 def _find_marker_comment(token: str, owner: str, repo: str, pr_number: int) -> int | None:
-    resp = httpx.get(
-        f"{_API}/repos/{_repo_path(owner, repo)}/issues/{pr_number}/comments",
-        params={"per_page": 100}, headers=_headers(token), timeout=_TIMEOUT,
-    )
-    resp.raise_for_status()
-    for c in resp.json():
-        if _MARKER in (c.get("body") or ""):
-            return int(c["id"])
+    # Paginate: on a busy PR the marker may sit past page 1, and missing it
+    # would POST a duplicate instead of PATCHing (Qodo review #535).
+    page = 1
+    while page <= 20:  # bound the scan (>2000 comments = give up, post fresh)
+        resp = httpx.get(
+            f"{_API}/repos/{_repo_path(owner, repo)}/issues/{pr_number}/comments",
+            params={"per_page": 100, "page": page}, headers=_headers(token), timeout=_TIMEOUT,
+        )
+        resp.raise_for_status()
+        batch = resp.json()
+        for c in batch:
+            if _MARKER in (c.get("body") or ""):
+                return int(c["id"])
+        if len(batch) < 100:
+            return None
+        page += 1
     return None
 
 
@@ -118,6 +126,17 @@ def _cleared_body(issue_numbers: list[int]) -> str:
     )
 
 
+def _emit_metric(flagged: int) -> None:
+    """Best-effort observability signal (Qodo review #535): ticket-compliance
+    posts an advisory COMMENT (not a check-run), so a check-verdict row would
+    misrepresent it - emit an owned gauge instead."""
+    try:
+        from observability import emit_gauge  # type: ignore
+        emit_gauge("grug.chief.ticket_compliance.flagged", flagged)
+    except Exception:  # noqa: BLE001 - telemetry never breaks the advisory
+        pass
+
+
 def run_ticket_compliance(
     token: str, *, owner: str, repo: str, pr_number: int, pr_body: str,
 ) -> dict[str, object]:
@@ -125,6 +144,11 @@ def run_ticket_compliance(
     it claims to close; upsert one advisory comment. Returns a small result
     dict for logging. Best-effort: raises only on a programming error, not
     on GitHub hiccups (the dispatch also guards)."""
+    # Toggle: per-repo it inherits Chief's tpm_enabled (this runs only inside
+    # the Chief dispatch, which the registry gates per repo). A global
+    # operator kill-switch lets it be turned off fleet-wide (Qodo review #535).
+    if os.getenv("GRUG_TICKET_COMPLIANCE_DISABLED", "").lower() in ("1", "true", "yes"):
+        return {"checked": 0, "reason": "disabled"}
     refs = closes_refs(pr_body)[:_MAX_ISSUES]
     if not refs:
         return {"checked": 0, "reason": "no closing refs"}
@@ -153,6 +177,8 @@ def run_ticket_compliance(
     # cleared note when a prior advisory is now satisfied.
     sections = [advisory_markdown(n, gaps) for n, gaps in all_unaddressed.items()]
     sections = [s for s in sections if s]
+    total_flagged = sum(len(g) for g in all_unaddressed.values())
+    _emit_metric(total_flagged)
     if sections:
         # Strip the duplicate marker/preamble from all but the first block.
         body = sections[0]
