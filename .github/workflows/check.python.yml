@@ -9,12 +9,14 @@ on:
   pull_request:
     paths:
       - 'services/**'
+      - 'scripts/**'
       - 'Makefile'
       - '.github/workflows/check.python.yml'
   push:
     branches: [main]
     paths:
       - 'services/**'
+      - 'scripts/**'
 
 permissions:
   contents: read
