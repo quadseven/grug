@@ -83,6 +83,7 @@ def decide(
     merge_tree: str | None,
     manifests_present: dict[str, bool],
     expected_services: list[str],
+    gate_ran: bool | None = None,
 ) -> Decision:
     """Decide PROMOTE vs REBUILD from gathered facts.
 
@@ -90,6 +91,10 @@ def decide(
     workflow passes the full list; the exactly-one rule lives HERE).
     manifests_present must enumerate EXACTLY expected_services - a
     gatherer/matrix drift (missing or unexpected service) rebuilds.
+    gate_ran: whether the image-build gate actually ran for the PR head
+    (#499): a missing artifact when the gate NEVER RAN (workflow-only
+    merge, path filters) is an EXPECTED rebuild, not the alertable
+    artifact-missing case; None = unknown, stays alertable (fail-noisy).
     """
     if len(pr_numbers) != 1:
         return Decision.rebuild(
@@ -115,9 +120,14 @@ def decide(
         )
     missing = sorted(svc for svc, ok in manifests_present.items() if not ok)
     if missing:
+        if gate_ran is False:
+            return Decision.rebuild(
+                f"gate did not run for this merge (path filters) - no "
+                f"pr-{pr} artifact expected",
+            )
         return Decision.rebuild(
             f"registry missing pr-{pr} manifest for: {', '.join(missing)} "
-            "(gate did not push: fork PR, unseeded CI secrets, push "
+            "(gate ran or unknown: fork PR, unseeded CI secrets, push "
             "failure, or expired tag)",
             category=CATEGORY_ARTIFACT_MISSING,
         )
@@ -162,6 +172,8 @@ def _main() -> int:
     parser.add_argument("--manifest", action="append", default=[],
                         help="svc=true|false, repeatable")
     parser.add_argument("--expected-services", default="webhook,api")
+    parser.add_argument("--gate-ran", default="unknown",
+                        choices=["true", "false", "unknown"])
     parser.add_argument("--verify-baked-sha", nargs=2, metavar=("ENV_JSON", "SHA"))
     try:
         args = parser.parse_args()
@@ -182,6 +194,7 @@ def _main() -> int:
             merge_tree=args.merge_tree or None,
             manifests_present=manifests,
             expected_services=[s for s in args.expected_services.split(",") if s],
+            gate_ran={"true": True, "false": False}.get(args.gate_ran),
         )
     except SystemExit:
         # argparse's own exit (bad flags) - even that must not fail the deploy

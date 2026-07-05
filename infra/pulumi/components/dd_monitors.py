@@ -212,6 +212,17 @@ def telemetry_health_query(env: str) -> str:
     )
 
 
+def deploy_rollback_query(env: str) -> str:
+    """#499: the deploy's post-apply synthetic failed and last-good
+    digests were re-applied (or a manual rollback dispatch ran). The
+    runner emits grug.deploy.rollback as a COUNT via DogStatsD to a
+    node's agent hostPort; any occurrence pages - a rollback is always
+    operator-relevant. notify_no_data=false (fires rarely by design)."""
+    return (
+        f"sum(last_30m):sum:grug.deploy.rollback{{env:{env}}}.as_count() > 0"
+    )
+
+
 def all_owned_queue_queries(env: str = "prod") -> list[str]:
     """Every owned-gauge queue monitor query - the aws.sqs retirement
     guard test iterates this set."""
@@ -224,6 +235,42 @@ def all_owned_queue_queries(env: str = "prod") -> list[str]:
         cave_results_dlq_depth_query(env),
         telemetry_health_query(env),
     ]
+
+
+@dataclass(frozen=True)
+class _DeployMonitorBundle:
+    rollback_fired: datadog.Monitor
+
+
+def create_deploy_monitors(
+    *,
+    env: str,
+    notify_handle: str,
+    provider: datadog.Provider,
+) -> _DeployMonitorBundle:
+    """#499 release-chain monitors. In the component so the synth test
+    pins (query, notify_no_data) like the queue family."""
+    rollback_fired = datadog.Monitor(
+        "grug-deploy-rollback-fired",
+        type="metric alert",
+        name="[grug] Deploy auto-rollback fired",
+        message=(
+            f"{notify_handle}\n"
+            "A grug deploy's post-apply synthetic FAILED and the last-good "
+            "digests were re-applied (or a manual rollback dispatch ran). "
+            "Prod is on the PREVIOUS images - the bad merge is still on "
+            "main. Read the failed deploy run's summary, revert or fix "
+            "forward, and re-deploy.\n"
+            "Runbook: docs/RUNBOOK.md#deploy-rollback"
+        ),
+        query=deploy_rollback_query(env),
+        tags=[f"env:{env}", "service:grug-webhook", "team:grug"],
+        notify_no_data=False,
+        require_full_window=False,
+        priority=2,
+        opts=pulumi.ResourceOptions(provider=provider),
+    )
+    return _DeployMonitorBundle(rollback_fired=rollback_fired)
 
 
 @dataclass(frozen=True)

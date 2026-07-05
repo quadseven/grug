@@ -1,0 +1,87 @@
+# One-click rollback to the last-good digest pair (#499, ADR-0017).
+#
+# Re-applies the digests recorded by deploy.k8s.yml's rollback anchor -
+# NO rebuild, ~30s to healthy. Use when a bad merge slipped past the
+# synthetic (or you just want out): this restores the previous images
+# while the bad code is still on main - follow with a revert or fix.
+#
+# PUBLIC-REPO DISCIPLINE: cluster credentials arrive via the k8s-prod
+# environment; nothing infrastructure-specific is committed.
+name: deploy.rollback
+
+on:
+  workflow_dispatch: {}
+
+permissions:
+  contents: read
+
+concurrency:
+  group: deploy-k8s
+  cancel-in-progress: false
+
+jobs:
+  rollback:
+    if: github.ref == 'refs/heads/main'
+    runs-on: ubuntu-24.04-arm
+    timeout-minutes: 15
+    environment: k8s-prod
+    steps:
+      - name: Join tailnet (ephemeral)
+        uses: tailscale/github-action@306e68a486fd2350f2bfc3b19fcd143891a4a2d8 # v4
+        with:
+          authkey: ${{ secrets.TS_AUTHKEY }}
+          tags: tag:ci
+          use-cache: 'true'
+
+      - name: Write kubeconfig
+        env:
+          KUBECONFIG_B64: ${{ secrets.KUBECONFIG_B64 }}
+        run: |
+          install -m 700 -d "$HOME/.kube"
+          echo "$KUBECONFIG_B64" | base64 -d > "$HOME/.kube/config"
+          chmod 600 "$HOME/.kube/config"
+
+      - name: Re-apply last-good digests
+        run: |
+          set -euo pipefail
+          # Page FIRST: the metric fires even if the re-apply then fails.
+          NODE_IP=$(kubectl get nodes -o jsonpath='{.items[0].status.addresses[?(@.type=="InternalIP")].address}' 2>/dev/null || echo "")
+          if [ -n "$NODE_IP" ]; then
+            printf 'grug.deploy.rollback:1|c|#env:prod,trigger:dispatch,phase:attempted' \
+              | timeout 5 bash -c "cat > /dev/udp/${NODE_IP}/8125" || true
+          fi
+          W=$(kubectl -n grug get configmap grug-last-good -o jsonpath='{.data.webhook}' 2>/dev/null || echo "")
+          A=$(kubectl -n grug get configmap grug-last-good -o jsonpath='{.data.api}' 2>/dev/null || echo "")
+          FROM=$(kubectl -n grug get configmap grug-last-good -o jsonpath='{.data.recorded_from_sha}' 2>/dev/null || echo unknown)
+          if [ -z "$W" ] || [ -z "$A" ]; then
+            echo "::error::no last-good anchor recorded (configmap grug-last-good) - nothing to roll back to"
+            exit 1
+          fi
+          # Container names per the live manifests: webhook/webhook,
+          # api/webhook (historical), consumer/consumer, poller/poller.
+          kubectl -n grug set image deploy/grug-webhook webhook="$W"
+          kubectl -n grug set image deploy/grug-api webhook="$A"
+          kubectl -n grug set image deploy/grug-consumer consumer="$W"
+          kubectl -n grug set image cronjob/grug-poller poller="$W"
+          kubectl -n grug-trial set image cronjob/grug-trial-janitor janitor="$W"
+          # Image-bearing ENV vars are pins too (codex r4): the Smasher
+          # sandbox job image rides GRUG_SMASHER_JOB_IMAGE on webhook +
+          # consumer - set image never touches env.
+          kubectl -n grug set env deploy/grug-webhook GRUG_SMASHER_JOB_IMAGE="$W"
+          kubectl -n grug set env deploy/grug-consumer GRUG_SMASHER_JOB_IMAGE="$W"
+          for d in grug-webhook grug-api grug-consumer; do
+            kubectl -n grug rollout status "deploy/$d" --timeout=180s
+          done
+          kubectl -n grug annotate --overwrite \
+            deploy/grug-webhook deploy/grug-api deploy/grug-consumer cronjob/grug-poller \
+            "grug.dev/image-source=rollback-last-good" \
+            "grug.dev/rolled-back-via=workflow-dispatch"
+          if [ -n "$NODE_IP" ]; then
+            printf 'grug.deploy.rollback:1|c|#env:prod,trigger:dispatch,phase:completed' \
+              | timeout 5 bash -c "cat > /dev/udp/${NODE_IP}/8125" || true
+          fi
+          echo "rolled back to last-good (recorded from ${FROM})" >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Cleanup
+        if: always()
+        run: rm -f "$HOME/.kube/config"
