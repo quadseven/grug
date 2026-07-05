@@ -13,7 +13,6 @@ from __future__ import annotations
 
 import json
 import sys
-from collections import Counter
 
 from ledger import parse_row
 
@@ -26,7 +25,6 @@ def ingest_text(text: str, put=None) -> dict[str, int]:
     if put is None:
         from adapters.pg_install_store import put_ledger_row  # type: ignore
         put = put_ledger_row
-    seq: Counter = Counter()
     ingested = skipped = 0
     for line in text.splitlines():
         line = line.strip()
@@ -40,9 +38,7 @@ def ingest_text(text: str, put=None) -> dict[str, int]:
         if parse_row(row) is None:  # reuse the same validity gate
             skipped += 1
             continue
-        key = (row["repo"], row["class"], row["pr"], row["reviewer"])
-        put(row, seq[key])
-        seq[key] += 1
+        put(row)  # key is content-derived in the store; ingest order irrelevant
         ingested += 1
     return {"ingested": ingested, "skipped": skipped}
 

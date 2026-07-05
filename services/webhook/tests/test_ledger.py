@@ -109,3 +109,17 @@ def test_parses_the_real_committed_ledger():
     assert len(rows) >= 100  # 150-row corpus at time of writing
     # every parsed row has the load-bearing fields
     assert all(r.repo and r.reviewer and r.finding_class and r.verdict for r in rows)
+
+
+def test_ledger_digest_is_content_stable():
+    """#536 Qodo: the store sk digest must depend on finding CONTENT, not
+    ingest order - so re-ingesting a reordered corpus heals in place."""
+    from adapters.pg_install_store import _ledger_digest, _ledger_sk
+    a = {"finding": "swallowed exception", "ts": "2026-07-05T00:00:00Z", "evidence": "e1"}
+    b = {"finding": "different finding", "ts": "2026-07-05T00:00:00Z", "evidence": "e1"}
+    assert _ledger_digest(a) == _ledger_digest(a)      # deterministic
+    assert _ledger_digest(a) != _ledger_digest(b)      # content-sensitive
+    # same finding -> same sk regardless of when it's ingested
+    sk1 = _ledger_sk("silent-failure", 5, "codex", _ledger_digest(a))
+    sk2 = _ledger_sk("silent-failure", 5, "codex", _ledger_digest(a))
+    assert sk1 == sk2

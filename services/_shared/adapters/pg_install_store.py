@@ -529,16 +529,30 @@ def _ledger_pk(repo: str) -> str:
     return f"LEDGER#{repo}"
 
 
-def _ledger_sk(finding_class: str, pr: int, reviewer: str, seq: int) -> str:
-    # zero-pad pr + seq so lexicographic == numeric ordering within a class.
-    return f"{finding_class}#{pr:07d}#{reviewer}#{seq:05d}"
+def _ledger_sk(finding_class: str, pr: int, reviewer: str, digest: str) -> str:
+    # zero-pad pr so lexicographic == numeric ordering within a class; the
+    # trailing digest is CONTENT-derived (not ingest order) so the same
+    # finding always maps to the same key - true idempotency across a
+    # reordered corpus (Qodo review #536).
+    return f"{finding_class}#{pr:07d}#{reviewer}#{digest}"
 
 
-def put_ledger_row(row: dict[str, Any], seq: int) -> None:
+def _ledger_digest(row: dict[str, Any]) -> str:
+    """Stable 12-hex identity of a finding from its content (finding text +
+    timestamp + evidence) - independent of ingest order."""
+    import hashlib
+    material = "\x1f".join((
+        str(row.get("finding", "")), str(row.get("ts", "")),
+        str(row.get("evidence", "")),
+    ))
+    return hashlib.sha256(material.encode("utf-8")).hexdigest()[:12]
+
+
+def put_ledger_row(row: dict[str, Any]) -> None:
     """Upsert one ledger finding as a first-class grug_kv row. `row` is the
     raw JSONL dict ({repo, pr, reviewer, severity, class, finding, verdict,
-    evidence, ts, commit}); `seq` disambiguates rows sharing (class, pr,
-    reviewer). Idempotent per key so re-ingesting the corpus heals rows."""
+    evidence, ts, commit}). The key is CONTENT-derived, so re-ingesting the
+    corpus (even reordered) heals rows in place instead of duplicating."""
     repo = str(row["repo"])
     with get_pool().connection() as conn:
         conn.execute(
@@ -550,7 +564,7 @@ def put_ledger_row(row: dict[str, Any], seq: int) -> None:
             {
                 "pk": _ledger_pk(repo),
                 "sk": _ledger_sk(str(row["class"]), int(row["pr"]),
-                                 str(row["reviewer"]), int(seq)),
+                                 str(row["reviewer"]), _ledger_digest(row)),
                 "data": encode_attrs(dict(row)),
             },
         )
