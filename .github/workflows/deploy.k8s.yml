@@ -118,6 +118,23 @@ jobs:
           kubectl apply -f k8s/namespace.yaml
           get() { aws ssm get-parameter --name "$1" --with-decryption \
                     --query 'Parameter.Value' --output text; }
+          # seed <secret-name> <0600-env-file>: shared discipline for every
+          # Secret seed (audit #388-4 rule-of-three) - fail BEFORE the
+          # destructive delete on any empty/"None" value (`set -e` does NOT
+          # trip on command-substitution failures inside `echo "K=$(...)"`,
+          # audit C2; print only KEY names), then DELETE-then-create
+          # (kubectl apply MERGES secret data - stale keys lingered on the
+          # first deploys), then delete the env-file.
+          seed() {
+            if grep -qE '=$|=None$' "$2"; then
+              echo "::error::empty/None value(s) in $1 seed:"
+              grep -nE '=$|=None$' "$2" | cut -d= -f1
+              exit 1
+            fi
+            kubectl -n grug delete secret "$1" --ignore-not-found
+            kubectl -n grug create secret generic "$1" --from-env-file="$2"
+            rm -f "$2"
+          }
           # Values land in a 0600 env-file consumed via --from-env-file -
           # NOT in kubectl argv (visible in /proc/PID/cmdline even on an
           # ephemeral runner; review F3). Multiline values (the App
@@ -129,11 +146,15 @@ jobs:
           # authorizing those reads, the database URL, and two
           # deploy-resolved values that must not be committed as
           # literals (the queue URL embeds the account id).
+          # #388 SPLIT: the static AWS key pair lives in its OWN Secret
+          # (grug-aws-static-key) so the poller - the Roles Anywhere tracer
+          # workload - can receive grug-secrets WITHOUT env credentials
+          # (env creds out-rank credential_process in the SDK chain and
+          # would silently bypass the cert path). api/webhook/consumer
+          # keep envFrom BOTH until the #389 rollout retires the key.
           ENVF="$RUNNER_TEMP/grug-secrets.env"
           install -m 600 /dev/null "$ENVF"
           {
-            echo "AWS_ACCESS_KEY_ID=$(get /grug/k8s-pod-aws-access-key-id)"
-            echo "AWS_SECRET_ACCESS_KEY=$(get /grug/k8s-pod-aws-secret-access-key)"
             echo "AWS_DEFAULT_REGION=us-east-1"
             echo "GRUG_DATABASE_URL=$(get /grug/database-url)"
             # GRUG_KMS_CMK_ARN: envelope-encryption CMK for OAuth/credential
@@ -149,27 +170,28 @@ jobs:
             echo "GRUG_CAVE_RESULTS_QUEUE_URL=$(aws sqs get-queue-url --queue-name grug-cave-results.fifo --query QueueUrl --output text)"
             echo "GRUG_CAVE_DIFF_BUCKET=$(aws s3api list-buckets --query 'Buckets[?starts_with(Name, `grug-cave-diffs`)].Name | [0]' --output text)"
           } > "$ENVF"
-          # Fail BEFORE the destructive delete if any value came back empty or
-          # "None": `set -e` does NOT trip on a command-substitution failure
-          # inside `echo "K=$(...)"`, so a failed SSM/SQS/S3 lookup would
-          # otherwise seed a broken secret and outage every pod. Print only
-          # KEY names (empty/None lines carry no secret value). (audit C2)
-          if grep -qE '=$|=None$' "$ENVF"; then
-            echo "::error::empty/None value(s) in grug-secrets seed:"
-            grep -nE '=$|=None$' "$ENVF" | cut -d= -f1
+          # #388 split guard (grug-secrets ONLY, so not in seed()): the
+          # static key pair must NEVER re-enter this Secret - the poller
+          # envFroms it, and env creds silently out-rank credential_process,
+          # un-proving the Roles Anywhere tracer while everything stays
+          # green (audit stage-1 HIGH; runtime twin lives in
+          # poller_handler._prove_roles_anywhere_identity).
+          if grep -qE '^AWS_(ACCESS_KEY_ID|SECRET_ACCESS_KEY)=' "$ENVF"; then
+            echo "::error::static key pair leaked back into grug-secrets (belongs in grug-aws-static-key, #388)"
             exit 1
           fi
-          # DELETE-then-create: kubectl apply MERGES secret data, so a
-          # shape change would leave stale keys behind (bit us on the
-          # first deploys - the interim seed's keys lingered).
-          kubectl -n grug delete secret grug-secrets --ignore-not-found
-          kubectl -n grug create secret generic grug-secrets \
-            --from-env-file="$ENVF"
-          rm -f "$ENVF"
-          # Rotator credential (#386): SEPARATE from grug-secrets, scoped to
-          # access-key ops on grug-k8s-pod only. The key-rotator CronJob uses
-          # THIS, never grug-secrets (which it rotates). Same 0600 env-file
-          # discipline as above.
+          seed grug-secrets "$ENVF"
+          # Static AWS key pair (#388 split; #389 deletes this block).
+          KEYF="$RUNNER_TEMP/grug-aws-static-key.env"
+          install -m 600 /dev/null "$KEYF"
+          {
+            echo "AWS_ACCESS_KEY_ID=$(get /grug/k8s-pod-aws-access-key-id)"
+            echo "AWS_SECRET_ACCESS_KEY=$(get /grug/k8s-pod-aws-secret-access-key)"
+          } > "$KEYF"
+          seed grug-aws-static-key "$KEYF"
+          # Rotator credential (#386): SEPARATE from the pod secrets, scoped
+          # to access-key ops on grug-k8s-pod only. The key-rotator CronJob
+          # uses THIS, never the secret it rotates.
           ROTF="$RUNNER_TEMP/grug-rotator.env"
           install -m 600 /dev/null "$ROTF"
           {
@@ -177,17 +199,7 @@ jobs:
             echo "AWS_SECRET_ACCESS_KEY=$(get /grug/k8s-rotator-aws-secret-access-key)"
             echo "AWS_DEFAULT_REGION=us-east-1"
           } > "$ROTF"
-          # Same empty/None guard as grug-secrets (audit C2): a broken rotator
-          # credential would silently fail every future rotation.
-          if grep -qE '=$|=None$' "$ROTF"; then
-            echo "::error::empty/None value(s) in grug-rotator-secret seed:"
-            grep -nE '=$|=None$' "$ROTF" | cut -d= -f1
-            exit 1
-          fi
-          kubectl -n grug delete secret grug-rotator-secret --ignore-not-found
-          kubectl -n grug create secret generic grug-rotator-secret \
-            --from-env-file="$ROTF"
-          rm -f "$ROTF"
+          seed grug-rotator-secret "$ROTF"
           kubectl -n grug create secret docker-registry registry-pull \
             --docker-server="$REGISTRY_HOST" \
             --docker-username="$REGISTRY_USERNAME" \
@@ -219,14 +231,44 @@ jobs:
           # bare `TAG_PLACEHOLDER` substitution below only hits the remaining
           # standalone uses (the DD_VERSION env value: TAG_PLACEHOLDER), which
           # must still resolve to the git SHA for version tagging.
+          # Roles Anywhere tenant ARNs (#388): seeded from SSM into the
+          # grug-aws-config ConfigMap - the ARNs carry the account id, so
+          # the PUBLIC repo holds only placeholders. Fail LOUD on an empty
+          # lookup (the tenant must be applied in infrastructure first).
+          # --with-decryption is harmless on String params and REQUIRED if
+          # one is ever (re)created SecureString: without it the value is
+          # KMS ciphertext - non-empty, not None, placeholder-free - and
+          # sails past every guard into the ConfigMap (audit #388-4). The
+          # arn: shape check catches that and any other garbage.
+          RA_ANCHOR="$(aws ssm get-parameter --with-decryption --name /infra/roles-anywhere/trust_anchor_arn --query Parameter.Value --output text)"
+          RA_PROFILE="$(aws ssm get-parameter --with-decryption --name /infra/roles-anywhere/grug/profile_arn --query Parameter.Value --output text)"
+          RA_ROLE="$(aws ssm get-parameter --with-decryption --name /infra/roles-anywhere/grug/role_arn --query Parameter.Value --output text)"
+          # Per-SERVICE shapes (peer review): a syntactically-valid but
+          # wrong-service ARN (iam where rolesanywhere belongs, etc) must
+          # die here, not at the first poller tick.
+          check_arn() {
+            case "$2" in
+              $3) ;;
+              *)
+                echo "::error::Roles Anywhere lookup $1 has the wrong shape (got: unlogged; expected $3) - is the grug tenant applied in infrastructure (infra-pki)?"
+                exit 1
+                ;;
+            esac
+          }
+          check_arn RA_ANCHOR "$RA_ANCHOR" 'arn:aws:rolesanywhere:*:*:trust-anchor/*'
+          check_arn RA_PROFILE "$RA_PROFILE" 'arn:aws:rolesanywhere:*:*:profile/*'
+          check_arn RA_ROLE "$RA_ROLE" 'arn:aws:iam::*:role/*'
           sed -i \
             -e "s|REGISTRY_PLACEHOLDER/grug-api:TAG_PLACEHOLDER|${IMAGE_API}|g" \
             -e "s|REGISTRY_PLACEHOLDER/grug-webhook:TAG_PLACEHOLDER|${IMAGE_WEBHOOK}|g" \
             -e "s|TAG_PLACEHOLDER|${GITHUB_SHA}|g" \
+            -e "s|RA_TRUST_ANCHOR_ARN_PLACEHOLDER|${RA_ANCHOR}|g" \
+            -e "s|RA_PROFILE_ARN_PLACEHOLDER|${RA_PROFILE}|g" \
+            -e "s|RA_ROLE_ARN_PLACEHOLDER|${RA_ROLE}|g" \
             k8s/*.yaml
           # Post-sed sentinel: a future manifest that escapes substitution
           # must fail the deploy, not ship a literal placeholder (F7).
-          if grep -rn 'REGISTRY_PLACEHOLDER\|TAG_PLACEHOLDER' k8s/; then
+          if grep -rn 'REGISTRY_PLACEHOLDER\|TAG_PLACEHOLDER\|RA_.*_ARN_PLACEHOLDER' k8s/; then
             echo "::error::unsubstituted placeholder in k8s/"; exit 1
           fi
           kubectl apply -k k8s/
@@ -237,7 +279,11 @@ jobs:
           # THIS deploy, not the next scheduled tick.
           kubectl -n grug delete job poller-smoke --ignore-not-found
           kubectl -n grug create job poller-smoke --from=cronjob/grug-poller
-          kubectl -n grug wait --for=condition=complete job/poller-smoke --timeout=300s
+          kubectl -n grug wait --for=condition=complete job/poller-smoke --timeout=300s || {
+            echo "::error::poller-smoke failed - dumping job logs (identity proof / cert chain?)"
+            kubectl -n grug logs job/poller-smoke --tail=50 || true
+            exit 1
+          }
           kubectl -n grug delete job poller-smoke
 
       - name: Cleanup

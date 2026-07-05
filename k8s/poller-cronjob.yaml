@@ -43,9 +43,19 @@ spec:
               image: REGISTRY_PLACEHOLDER/grug-webhook:TAG_PLACEHOLDER
               # ddtrace-run so poller spans are not silently dropped (review F4).
               command: ["ddtrace-run", "python", "-c", "from poller_handler import handler; handler({}, None)"]
+              # envFrom is APP CONFIG ONLY (#388): the static AWS key pair
+              # lives in the separate grug-aws-static-key Secret, which the
+              # poller deliberately does NOT receive - env credentials would
+              # out-rank credential_process in the SDK chain and silently
+              # bypass the Roles Anywhere path this tracer exists to prove.
               envFrom:
                 - secretRef: {name: grug-secrets}
               env:
+                - {name: AWS_CONFIG_FILE, value: /etc/grug-aws/config}
+                # Expected Roles Anywhere role (sed-pinned from SSM): the
+                # identity proof ASSERTS the assumed identity matches this,
+                # not merely that SOME credential worked (peer review 3x).
+                - {name: GRUG_RA_ROLE_ARN, value: RA_ROLE_ARN_PLACEHOLDER}
                 - {name: DD_SERVICE, value: grug-poller}
                 - {name: DD_ENV, value: prod}
                 - name: DD_VERSION
@@ -75,6 +85,18 @@ spec:
                 capabilities: {drop: ["ALL"]}
               volumeMounts:
                 - {name: tmp, mountPath: /tmp}
+                # Roles Anywhere tracer (#388, ADR-0008): the poller is the
+                # FIRST workload on cert-derived short-lived creds. The SDK
+                # reads AWS_CONFIG_FILE -> credential_process ->
+                # aws_signing_helper (in the image) with the mounted leaf.
+                - {name: grug-pki, mountPath: /var/run/grug-pki, readOnly: true}
+                - {name: aws-config, mountPath: /etc/grug-aws, readOnly: true}
           volumes:
             - name: tmp
               emptyDir: {sizeLimit: 64Mi}
+            - name: grug-pki
+              secret:
+                secretName: grug-pki-tls
+            - name: aws-config
+              configMap:
+                name: grug-aws-config
