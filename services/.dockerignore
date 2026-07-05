@@ -12,4 +12,5 @@
 **/*.md
 **/.dockerignore
 */Dockerfile*
+Dockerfile*
 **/.env*

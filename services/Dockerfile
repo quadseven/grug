@@ -1,7 +1,9 @@
-# Kubernetes runtime image for grug-webhook (#354 self-hosting migration).
-# Built with CONTEXT=services/ (ADR-0014: the image carries services/_shared/
-# - the single copy of the cross-service modules - alongside the service
-# tree):  docker build services -f services/webhook/Dockerfile
+# Kubernetes runtime image for BOTH grug services (#354; unified at #389 -
+# the #495-era two-file deferral rationale died when the signing-helper
+# stage landed in both and the diff shrank to three path lines).
+# Build:  docker build services -f services/Dockerfile --build-arg SERVICE=<api|webhook>
+# CONTEXT=services/ (ADR-0014: the image carries services/_shared/ - the
+# single copy of the cross-service modules - alongside the service tree)
 # FastAPI app served by uvicorn under ddtrace-run (APM via the node's
 # Datadog agent - DD_AGENT_HOST is injected by the Deployment).
 # Build the AWS Roles Anywhere credential helper from source at a PINNED
@@ -37,14 +39,15 @@ ENV PYTHONPATH=/app/_shared
 
 WORKDIR /app
 
-COPY webhook/requirements.txt .
+ARG SERVICE
+COPY ${SERVICE}/requirements.txt .
 # uvicorn is the k8s server - kept out of requirements.txt (it is not a
 # library dependency of the app code, only of this runtime image).
 RUN pip install --no-cache-dir -r requirements.txt "uvicorn>=0.34,<1"
 
 COPY --from=signing-helper /aws_signing_helper /usr/local/bin/aws_signing_helper
 COPY _shared/ ./_shared/
-COPY webhook/ ./
+COPY ${SERVICE}/ ./
 
 RUN useradd --uid 10001 --no-create-home grug
 USER 10001

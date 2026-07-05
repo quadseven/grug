@@ -58,12 +58,10 @@ spec:
             - {name: http, containerPort: 8080}
           envFrom:
             - secretRef: {name: grug-secrets}
-            # #389: static key DROPPED from this workload - it now rides the
-            # Roles Anywhere cert path. The grug-aws-static-key Secret stays
-            # live (rotator-maintained) as the ROLLBACK RESERVE until the
-            # retirement PR deletes it. Re-adding this envFrom + removing
-            # AWS_CONFIG_FILE is STEP 3 of the RUNBOOK 'Roles Anywhere'
-            # rollback - suspend the rotator and verify the reserve FIRST.
+            # Roles Anywhere ONLY (#389 retirement): the static key and its
+            # reserve Secret no longer exist. Recovery from a broken cert
+            # path = revert the retirement PR (restores the Pulumi user/key
+            # + seed), redeploy, then the PR-A rollback - see RUNBOOK.
           env:
             - {name: AWS_CONFIG_FILE, value: /etc/grug-aws/config}
             - {name: GRUG_RA_ROLE_ARN, value: RA_ROLE_ARN_PLACEHOLDER}
