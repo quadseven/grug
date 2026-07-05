@@ -609,6 +609,36 @@ def release_dep_watch_report(install_id: int, repo: str) -> None:
         )
 
 
+def list_tpm_enabled_repos(install_id: int) -> list[dict[str, Any]]:
+    """Repo rows where Chief/DoR is enabled (#460). tpm_enabled defaults
+    to TRUE, so a missing key means enabled - only an explicit false opts
+    out (the inverse of the pulse/dep-watch opt-IN listings). These are
+    the repos where DoR enforcement is EXPECTED, i.e. the enforcement-gap
+    monitor's denominator; the poller re-emits the enforcement gauge for
+    exactly this set."""
+    with get_pool().connection() as conn:
+        rows = conn.execute(
+            f"""
+            SELECT sk, data FROM grug_kv
+            WHERE pk = %s AND sk LIKE 'REPO#%%'
+              AND COALESCE(data->>'tpm_enabled', 'true') <> 'false'
+              AND {TTL_LIVE}
+            """,
+            (_inst_pk(install_id),),
+        ).fetchall()
+    out: list[dict[str, Any]] = []
+    for sk, data in rows:
+        _, sep, id_str = sk.partition("#")
+        try:
+            rid = int(id_str)
+        except (TypeError, ValueError):
+            continue
+        full = (data or {}).get("repo_full_name", "")
+        if sep and full:
+            out.append({"id": rid, "full_name": full})
+    return out
+
+
 def list_dep_watch_repos(install_id: int) -> list[dict[str, Any]]:
     """Repo rows with dep_watch_enabled=true (#491) - the Pulse
     store-driven targeting pattern."""

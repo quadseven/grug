@@ -470,3 +470,35 @@ def test_retry_delay_bounded_and_caps_retry_after():
     # A huge Retry-After is capped — never block a user request that long.
     big = _resp(429, headers={"retry-after": "600"})
     assert grc._retry_delay(0, big) <= grc._GET_RETRY_MAX_DELAY
+
+
+# --- #460: get_repo_default_branch -------------------------------------------
+
+
+def test_get_repo_default_branch_url_auth_and_value():
+    from github_rulesets_client import get_repo_default_branch
+
+    with patch(
+        "httpx.get", return_value=_ok_response({"default_branch": "trunk"})
+    ) as mock_get:
+        assert get_repo_default_branch("tok", "o", "r x") == "trunk"
+    url = mock_get.call_args[0][0]
+    assert url == "https://api.github.com/repos/o/r%20x"  # safe='' encoding
+    headers = mock_get.call_args[1]["headers"]
+    assert headers["Authorization"] == "Bearer tok"
+
+
+def test_get_repo_default_branch_falls_back_to_main():
+    from github_rulesets_client import get_repo_default_branch
+
+    with patch("httpx.get", return_value=_ok_response({})):
+        assert get_repo_default_branch("tok", "o", "r") == "main"
+
+
+def test_get_repo_default_branch_error_propagates(mock_transport_client):
+    from github_rulesets_client import get_repo_default_branch
+
+    client = mock_transport_client(status_codes=[404])
+    with patch("httpx.get", side_effect=lambda *a, **kw: client.get(*a, **kw)):
+        with pytest.raises(httpx.HTTPStatusError):
+            get_repo_default_branch("tok", "o", "gone")
