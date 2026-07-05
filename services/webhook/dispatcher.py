@@ -424,8 +424,11 @@ def _handle_issue_comment(payload: dict[str, Any]) -> dict[str, str]:
 
     comment = payload.get("comment") or {}
     body = comment.get("body") or ""
-    if not _RECHECK_PAT.search(body):
-        return {"status": "no_op", "reason": "no /grug recheck trigger"}
+    comment_id = comment.get("id")
+    from grug_commands import parse_command  # type: ignore
+    cmd = parse_command(body)
+    if cmd is None:
+        return {"status": "no_op", "reason": "no /grug command trigger"}
 
     repo = payload.get("repository") or {}
     installation = payload.get("installation") or {}
@@ -552,6 +555,18 @@ def _handle_issue_comment(payload: dict[str, Any]) -> dict[str, str]:
     pr_body = pr.get("body") or ""
     if not head_sha:
         return {"status": "skip", "reason": "pr_has_no_head_sha"}
+
+    # Interactive commands (#528) reuse the SAME gating above (allowlist +
+    # tpm + author-or-write-collaborator), then branch to their own actions.
+    # recheck keeps the original DoR-re-evaluate path below.
+    if cmd.verb != "recheck":
+        from interactive import run_command  # type: ignore
+        return run_command(
+            cmd.verb, cmd.arg, install_id=int(installation_id), owner=owner,
+            repo=repo_name, pr_number=int(pr_number),
+            comment_id=int(comment_id) if comment_id is not None else 0,
+            token_fn=lambda fn: with_install_token_retry(int(installation_id), fn),
+        )
 
     evaluation = evaluate_pull_request(pr_body)
     # Same wrap pattern as the pull_request handler — peer-review CRITICAL.
