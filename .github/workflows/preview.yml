@@ -1,0 +1,159 @@
+# PR preview environments (#500, ADR-0018): namespace-per-PR from the
+# pr-<n> digest #498 already pushes. OPT-IN via the `preview` label.
+# Isolated: own namespace + own Postgres SCHEMA + throwaway secret + a
+# FAKE webhook secret (never prod GitHub App creds). Reaped on
+# unlabel/close (here) and by the TTL janitor CronJob (k8s/preview-janitor).
+name: preview
+
+on:
+  pull_request:
+    types: [labeled, unlabeled, synchronize, closed]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: preview-${{ github.event.pull_request.number }}
+  cancel-in-progress: false
+
+jobs:
+  deploy:
+    # Deploy/refresh while the `preview` label is present and the PR is
+    # open. Same-repo only: a fork PR has no access to the environment
+    # secrets by GitHub's rules, and a preview must not run fork code with
+    # cluster credentials.
+    if: >-
+      github.event.pull_request.state == 'open' &&
+      contains(github.event.pull_request.labels.*.name, 'preview') &&
+      github.event.pull_request.head.repo.full_name == github.repository
+    runs-on: ubuntu-24.04-arm
+    timeout-minutes: 20
+    environment: k8s-prod
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+      - name: Join tailnet (ephemeral)
+        uses: tailscale/github-action@306e68a486fd2350f2bfc3b19fcd143891a4a2d8 # v4
+        with:
+          authkey: ${{ secrets.TS_AUTHKEY }}
+          tags: tag:ci
+          use-cache: 'true'
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@cabfdba3510de1431bac9dba27511d97497fc100 # v5
+        with:
+          role-to-assume: arn:aws:iam::${{ secrets.AWS_ACCOUNT_ID }}:role/grug-gha-deploy
+          aws-region: us-east-1
+      - name: Write kubeconfig
+        env:
+          KUBECONFIG_B64: ${{ secrets.KUBECONFIG_B64 }}
+        run: |
+          install -m 700 -d "$HOME/.kube"
+          echo "$KUBECONFIG_B64" | base64 -d > "$HOME/.kube/config"
+          chmod 600 "$HOME/.kube/config"
+      - name: Registry login
+        env:
+          REGISTRY_HOST: ${{ vars.DEPLOY_REGISTRY_HOST }}
+          REGISTRY_USERNAME: ${{ secrets.REGISTRY_USERNAME }}
+          REGISTRY_PASSWORD: ${{ secrets.REGISTRY_PASSWORD }}
+        run: echo "$REGISTRY_PASSWORD" | docker login "$REGISTRY_HOST" --username "$REGISTRY_USERNAME" --password-stdin
+      - name: Deploy preview
+        env:
+          REGISTRY_HOST: ${{ vars.DEPLOY_REGISTRY_HOST }}
+          REGISTRY_USERNAME: ${{ secrets.REGISTRY_USERNAME }}
+          REGISTRY_PASSWORD: ${{ secrets.REGISTRY_PASSWORD }}
+          PR: ${{ github.event.pull_request.number }}
+        run: |
+          set -euo pipefail
+          # $PR is github.event.pull_request.number (a trusted positive
+          # int); guard anyway before it reaches a namespace/schema name.
+          case "$PR" in ''|*[!0-9]*) echo "::error::PR number not numeric"; exit 1;; esac
+          NS="grug-pr-${PR}"; SCHEMA="grug_pr_${PR}"
+          # Require the #498 pr-tagged images; a preview cannot exist
+          # without them (fork / unseeded gate -> clear failure).
+          for svc in webhook api; do
+            docker manifest inspect "$REGISTRY_HOST/grug-$svc:pr-${PR}" > /dev/null 2>&1 \
+              || { echo "::error::no pr-${PR} image for grug-$svc - the #498 gate must push it first"; exit 1; }
+          done
+          # Throwaway Postgres SCHEMA in the shared CNPG DB (drop+create =
+          # clean slate each refresh). The app bootstraps grug_kv into it
+          # via search_path. Secret piped to python via stdin (never argv
+          # or a shell var) - the same discipline the deploy uses.
+          BASE_URL=$(aws ssm get-parameter --name /grug/database-url --with-decryption --query Parameter.Value --output text)
+          printf '%s' "$BASE_URL" | SCHEMA="$SCHEMA" python3 -c '
+          import os, sys, psycopg
+          url = sys.stdin.read().strip(); schema = os.environ["SCHEMA"]
+          with psycopg.connect(url, autocommit=True) as c:
+              c.execute(f"DROP SCHEMA IF EXISTS \"{schema}\" CASCADE")
+              c.execute(f"CREATE SCHEMA \"{schema}\"")
+          print("schema reset:", schema)'
+          PREVIEW_DB_URL="${BASE_URL}?options=-csearch_path%3D${SCHEMA}"
+          FAKE_WH=$(head -c 32 /dev/urandom | base64 | tr -d '/+=')
+          kubectl create namespace "$NS" --dry-run=client -o yaml | kubectl apply -f -
+          # Preview secret: schema-scoped DB URL + a FAKE webhook secret.
+          # No prod GitHub App creds ever enter a preview.
+          kubectl -n "$NS" delete secret grug-preview-secret --ignore-not-found
+          printf 'GRUG_DATABASE_URL=%s\nGRUG_PREVIEW_WEBHOOK_SECRET=%s\n' "$PREVIEW_DB_URL" "$FAKE_WH" > "$RUNNER_TEMP/preview.env"
+          kubectl -n "$NS" create secret generic grug-preview-secret --from-env-file="$RUNNER_TEMP/preview.env"
+          rm -f "$RUNNER_TEMP/preview.env"
+          kubectl -n "$NS" create secret docker-registry registry-pull \
+            --docker-server="$REGISTRY_HOST" --docker-username="$REGISTRY_USERNAME" \
+            --docker-password="$REGISTRY_PASSWORD" --dry-run=client -o yaml | kubectl apply -f -
+          sed -e "s|PREVIEW_NS|${NS}|g" -e "s|PREVIEW_PR|${PR}|g" \
+              -e "s|PREVIEW_IMAGE_WEBHOOK|${REGISTRY_HOST}/grug-webhook:pr-${PR}|g" \
+              -e "s|PREVIEW_IMAGE_API|${REGISTRY_HOST}/grug-api:pr-${PR}|g" \
+              k8s/preview/namespace.yaml k8s/preview/deployments.yaml | kubectl apply -f -
+          kubectl -n "$NS" rollout status deploy/grug-webhook --timeout=180s
+          kubectl -n "$NS" rollout status deploy/grug-api --timeout=180s
+          echo "Preview **${NS}** up: both services on pr-${PR}, schema ${SCHEMA}, NO prod secrets, resource-capped. Reaped on close/unlabel or after 48h." >> "$GITHUB_STEP_SUMMARY"
+      - name: Cleanup kubeconfig
+        if: always()
+        run: rm -f "$HOME/.kube/config"
+
+  teardown:
+    # Reap when the PR closes/merges, or the `preview` label is removed.
+    if: >-
+      github.event.action == 'closed' ||
+      (github.event.action == 'unlabeled' && github.event.label.name == 'preview')
+    runs-on: ubuntu-24.04-arm
+    timeout-minutes: 10
+    environment: k8s-prod
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+      - name: Join tailnet (ephemeral)
+        uses: tailscale/github-action@306e68a486fd2350f2bfc3b19fcd143891a4a2d8 # v4
+        with:
+          authkey: ${{ secrets.TS_AUTHKEY }}
+          tags: tag:ci
+          use-cache: 'true'
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@cabfdba3510de1431bac9dba27511d97497fc100 # v5
+        with:
+          role-to-assume: arn:aws:iam::${{ secrets.AWS_ACCOUNT_ID }}:role/grug-gha-deploy
+          aws-region: us-east-1
+      - name: Write kubeconfig
+        env:
+          KUBECONFIG_B64: ${{ secrets.KUBECONFIG_B64 }}
+        run: |
+          install -m 700 -d "$HOME/.kube"
+          echo "$KUBECONFIG_B64" | base64 -d > "$HOME/.kube/config"
+          chmod 600 "$HOME/.kube/config"
+      - name: Reap preview namespace + schema
+        env:
+          PR: ${{ github.event.pull_request.number }}
+        run: |
+          set -euo pipefail
+          # $PR is github.event.pull_request.number (a trusted positive
+          # int); guard anyway before it reaches a namespace/schema name.
+          case "$PR" in ''|*[!0-9]*) echo "::error::PR number not numeric"; exit 1;; esac
+          NS="grug-pr-${PR}"; SCHEMA="grug_pr_${PR}"
+          kubectl delete namespace "$NS" --ignore-not-found --wait=false
+          BASE_URL=$(aws ssm get-parameter --name /grug/database-url --with-decryption --query Parameter.Value --output text)
+          printf '%s' "$BASE_URL" | SCHEMA="$SCHEMA" python3 -c '
+          import os, sys, psycopg
+          url = sys.stdin.read().strip()
+          with psycopg.connect(url, autocommit=True) as c:
+              c.execute(f"DROP SCHEMA IF EXISTS \"{os.environ[\"SCHEMA\"]}\" CASCADE")
+          print("dropped schema", os.environ["SCHEMA"])'
+          echo "reaped preview for PR ${PR}" >> "$GITHUB_STEP_SUMMARY"
+      - name: Cleanup kubeconfig
+        if: always()
+        run: rm -f "$HOME/.kube/config"

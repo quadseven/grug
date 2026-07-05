@@ -41,6 +41,12 @@ def _get_ssm_secure_string(name: str) -> str:
 
 
 def get_webhook_secret() -> str:
+    # Preview (#500): no SSM access; read the throwaway secret injected
+    # into the preview pod's env. Namespace-gated preview_mode() cannot
+    # engage in prod, so prod always takes the SSM path.
+    from preview_mode import preview_mode
+    if preview_mode():
+        return os.environ.get("GRUG_PREVIEW_WEBHOOK_SECRET", "preview-not-configured")
     name = os.getenv("GITHUB_APP_WEBHOOK_SECRET_SSM", "")
     return _get_ssm_secure_string(name)
 
