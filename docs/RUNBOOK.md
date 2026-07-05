@@ -233,6 +233,16 @@ the #389 rollout.
   Anywhere = the leaf lost the `digital signature` usage (the
   infrastructure#1318 gotcha). Check `kubectl -n grug get certificate
   grug-pki -o yaml` usages; `test_pki_manifests.py` pins them in CI.
+- **The 15m canary**: every poller tick starts with an UNGUARDED
+  `sts get-caller-identity` (`roles_anywhere_identity_proven` in DD, with
+  the assumed-role ARN). A broken/expired cert or a bypassed chain
+  CRASHES the Job - the KSM `duration_since_last_successful` monitor
+  pages within the hour. No news from this log line = the cert path is
+  dead, not idle.
+- **Rotator/SSM gap (pre-existing, #388 follow-up filed)**: the #386
+  rotator rotates the LIVE IAM key but never writes it back to
+  /grug/k8s-pod-aws-*, so a deploy right after a rotation seeds
+  grug-aws-static-key with a DELETED key until the next rotator tick.
 - **Cert not issuing**: `kubectl get clusterissuer pki-intermediate` must
   be READY (shared PKI, infrastructure repo); then describe the
   Certificate for cert-manager events.
