@@ -3,9 +3,19 @@ name: Check · image build · services/ Docker context
 # Pre-merge proof that BOTH service images build from the ADR-0014 context
 # (services/ with _shared/ alongside each service tree) and that their
 # import graphs resolve INSIDE the image (PYTHONPATH=/app/_shared).
-# deploy.k8s.yml builds only on merge to main - without this gate a broken
-# COPY/PYTHONPATH layout would take down BOTH services at the next deploy
-# (#77: the extraction's main deploy risk, flagged when the issue was filed).
+# Without this gate a broken COPY/PYTHONPATH layout would take down BOTH
+# services at the next deploy (#77).
+#
+# Since #498 (ADR-0016) this gate also BUILDS THE SHIPPABLE ARTIFACT:
+# native arm64 (same hosted runner class as deploy.k8s.yml - the cluster is
+# arm64, so an x86 smoke image would prove nothing about what ships), and
+# for SAME-REPO PRs the smoked images are pushed to the private registry
+# tagged pr-<n>; the merge deploy PROMOTES that digest instead of
+# rebuilding. Fork PRs get no secrets by GitHub's rules and skip the push
+# steps (the smokes still gate) - the deploy then falls back to a rebuild.
+# Credentials are repo-level CI_* secrets (push-scoped registry credential
+# + ephemeral tag:ci tailnet key), NOT the main-only k8s-prod environment;
+# trust boundary documented in ADR-0016.
 
 permissions:
   contents: read
@@ -18,8 +28,8 @@ on:
 
 jobs:
   image-build:
-    runs-on: ubuntu-latest
-    timeout-minutes: 15
+    runs-on: ubuntu-24.04-arm
+    timeout-minutes: 20
     strategy:
       fail-fast: false  # one service's failure must not hide the other's result
       matrix:
@@ -27,7 +37,15 @@ jobs:
     steps:
       - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
       - name: Build image (services/ context)
-        run: docker build services -f services/Dockerfile --build-arg SERVICE="${{ matrix.svc }}" -t "grug-${{ matrix.svc }}:pr-smoke"
+        # DD_GIT_COMMIT_SHA = the PR HEAD sha: if this digest is promoted,
+        # ADR-0016 rule 3b guarantees the merge tree is identical, so the
+        # baked source link stays truthful.
+        run: |
+          docker build services -f services/Dockerfile \
+            --build-arg SERVICE="${{ matrix.svc }}" \
+            --build-arg DD_GIT_REPOSITORY_URL="github.com/${{ github.repository }}" \
+            --build-arg DD_GIT_COMMIT_SHA="${{ github.event.pull_request.head.sha }}" \
+            -t "grug-${{ matrix.svc }}:pr-smoke"
       - name: Import smoke (inside the image)
         run: |
           set -euo pipefail
@@ -83,3 +101,37 @@ jobs:
           # the two stages fails here, not in a pod (#388; both images since
           # the #389 rollout).
           docker run --rm "grug-${{ matrix.svc }}:pr-smoke" aws_signing_helper version
+
+      # --- #498 (ADR-0016): publish the smoked artifact for promotion ---
+      # Everything below is same-repo-PR only: fork runs have no secrets and
+      # skip cleanly; the merge deploy falls back to a rebuild when no pr-<n>
+      # image exists. Push happens ONLY after every smoke above passed.
+      - name: Join tailnet (ephemeral)
+        if: github.event.pull_request.head.repo.full_name == github.repository
+        uses: tailscale/github-action@306e68a486fd2350f2bfc3b19fcd143891a4a2d8 # v4
+        with:
+          authkey: ${{ secrets.CI_TS_AUTHKEY }}
+          tags: tag:ci
+          use-cache: 'true'
+
+      - name: Push pr-tagged image
+        if: github.event.pull_request.head.repo.full_name == github.repository
+        env:
+          REGISTRY_HOST: ${{ vars.DEPLOY_REGISTRY_HOST }}
+          CI_REGISTRY_USERNAME: ${{ secrets.CI_REGISTRY_USERNAME }}
+          CI_REGISTRY_PASSWORD: ${{ secrets.CI_REGISTRY_PASSWORD }}
+          PR_NUMBER: ${{ github.event.pull_request.number }}
+        run: |
+          set -euo pipefail
+          if [ -z "$REGISTRY_HOST" ] || [ -z "$CI_REGISTRY_USERNAME" ]; then
+            echo "::warning::registry push skipped - CI_* secrets/vars not seeded; merge will rebuild"
+            exit 0
+          fi
+          echo "$CI_REGISTRY_PASSWORD" | docker login "$REGISTRY_HOST" \
+            --username "$CI_REGISTRY_USERNAME" --password-stdin
+          docker tag "grug-${{ matrix.svc }}:pr-smoke" \
+            "$REGISTRY_HOST/grug-${{ matrix.svc }}:pr-${PR_NUMBER}"
+          docker push "$REGISTRY_HOST/grug-${{ matrix.svc }}:pr-${PR_NUMBER}"
+          digest="$(docker inspect --format='{{index .RepoDigests 0}}' \
+            "$REGISTRY_HOST/grug-${{ matrix.svc }}:pr-${PR_NUMBER}")"
+          echo "pushed ${digest}" >> "$GITHUB_STEP_SUMMARY"

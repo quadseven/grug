@@ -32,6 +32,7 @@ on:
 permissions:
   contents: read
   id-token: write
+  pull-requests: read  # ADR-0016: resolve the merged PR for digest promotion
 
 concurrency:
   group: deploy-k8s
@@ -74,11 +75,76 @@ jobs:
           echo "$REGISTRY_PASSWORD" | docker login "$REGISTRY_HOST" \
             --username "$REGISTRY_USERNAME" --password-stdin
 
+      - name: Resolve promotion (ADR-0016)
+        id: promo
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REGISTRY_HOST: ${{ vars.DEPLOY_REGISTRY_HOST }}
+        run: |
+          set -euo pipefail
+          # Gather the facts; scripts/promotion.py (pure, unit-tested)
+          # decides. ANY gather failure lands as an empty fact = rebuild.
+          pr_num=""; head_tree=""; merge_tree=""
+          present_webhook=false; present_api=false
+          if [ "${{ github.event_name }}" = "push" ]; then
+            pr_num=$(gh api "repos/${GITHUB_REPOSITORY}/commits/${GITHUB_SHA}/pulls" \
+              --jq '[.[] | select(.merged_at != null) | .number] | if length == 1 then .[0] else "" end' \
+              2>/dev/null || echo "")
+          fi
+          merge_tree=$(gh api "repos/${GITHUB_REPOSITORY}/commits/${GITHUB_SHA}" \
+            --jq .commit.tree.sha 2>/dev/null || echo "")
+          if [ -n "$pr_num" ]; then
+            head_sha=$(gh api "repos/${GITHUB_REPOSITORY}/pulls/${pr_num}" \
+              --jq .head.sha 2>/dev/null || echo "")
+            if [ -n "$head_sha" ]; then
+              head_tree=$(gh api "repos/${GITHUB_REPOSITORY}/commits/${head_sha}" \
+                --jq .commit.tree.sha 2>/dev/null || echo "")
+            fi
+            for svc in webhook api; do
+              if docker manifest inspect "$REGISTRY_HOST/grug-$svc:pr-${pr_num}" > /dev/null 2>&1; then
+                eval "present_$svc=true"
+              fi
+            done
+          fi
+          python3 -c "import json,sys; a=sys.argv; print(json.dumps({
+            'pr_numbers': [int(a[1])] if a[1] else [],
+            'pr_head_tree': a[2] or None, 'merge_tree': a[3] or None,
+            'manifests_present': {'webhook': a[4]=='true', 'api': a[5]=='true'}}))" \
+            "$pr_num" "$head_tree" "$merge_tree" "$present_webhook" "$present_api" \
+            | python3 scripts/promotion.py | tee -a "$GITHUB_OUTPUT"
+          echo "pr_num=$pr_num" >> "$GITHUB_OUTPUT"
+
+      - name: Promote PR-tested digests (server-side retag)
+        if: steps.promo.outputs.promote == 'true'
+        env:
+          REGISTRY_HOST: ${{ vars.DEPLOY_REGISTRY_HOST }}
+          PR_NUM: ${{ steps.promo.outputs.pr_num }}
+        run: |
+          set -euo pipefail
+          for svc in webhook api; do
+            digest=$(docker buildx imagetools inspect \
+              "$REGISTRY_HOST/grug-$svc:pr-${PR_NUM}" --format '{{.Manifest.Digest}}')
+            [ -n "$digest" ] || { echo "::error::no digest for grug-$svc:pr-${PR_NUM}"; exit 1; }
+            # Server-side retag: the merge sha tag points at the EXACT
+            # PR-tested manifest - no rebuild, no layer transfer. The sha
+            # tag keeps the registry retention window + rollback ergonomics
+            # identical to the rebuild path.
+            docker buildx imagetools create \
+              -t "$REGISTRY_HOST/grug-$svc:${GITHUB_SHA}" \
+              "$REGISTRY_HOST/grug-$svc@${digest}"
+            echo "IMAGE_${svc^^}=$REGISTRY_HOST/grug-$svc@${digest}" >> "$GITHUB_ENV"
+          done
+          echo "IMAGE_SOURCE=promoted-pr-${PR_NUM}" >> "$GITHUB_ENV"
+          echo "promoted pr-${PR_NUM} digests (no rebuild)" >> "$GITHUB_STEP_SUMMARY"
+
       - name: Build + push images (native arm64)
+        if: steps.promo.outputs.promote != 'true'
         env:
           REGISTRY_HOST: ${{ vars.DEPLOY_REGISTRY_HOST }}
         run: |
           set -euo pipefail
+          echo "IMAGE_SOURCE=rebuilt" >> "$GITHUB_ENV"
+          echo "rebuild: ${{ steps.promo.outputs.reason }}" >> "$GITHUB_STEP_SUMMARY"
           for svc in webhook api; do
             # Context is services/ (ADR-0014): the image COPYs both the
             # service tree and services/_shared/.
@@ -266,6 +332,14 @@ jobs:
             exit 1
           }
           kubectl -n grug delete job poller-smoke
+          # Provenance (ADR-0016): record on the workloads how these images
+          # reached prod - the promoted-vs-rebuilt trail #499's rollback
+          # machinery will read.
+          kubectl -n grug annotate --overwrite \
+            deploy/grug-webhook deploy/grug-api deploy/grug-consumer \
+            cronjob/grug-poller \
+            "grug.dev/image-source=${IMAGE_SOURCE:-rebuilt}" \
+            "grug.dev/merge-sha=${GITHUB_SHA}"
 
       - name: Cleanup
         if: always()
