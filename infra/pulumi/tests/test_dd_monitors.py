@@ -137,5 +137,8 @@ def test_credential_acquisition_query_covers_fleet_and_both_signals() -> None:
     assert "service:grug-*" in q
     assert "roles_anywhere_identity_failed" in q
     assert "CredentialRetrievalError" in q
+    # Mid-run non-retrieval classes (rolled-back pod on a deleted key,
+    # mangled profile) must page too - audit #389 stage 2.
+    assert "NoCredentialsError" in q and "InvalidClientTokenId" in q
     assert 'rollup("count")' in q and "> 0" in q
     assert "env:prod" in q
