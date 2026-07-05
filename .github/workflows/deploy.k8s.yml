@@ -504,22 +504,26 @@ jobs:
           # port-forward/exec/logs are unreachable on our BYON nodes):
           # a SOAK (a pod that went Ready then crashes) + a best-effort
           # public-edge check.
-          # Public-edge probe (best-effort, warn-only): proves DNS + CF +
-          # tunnel + TLS on the real ingress but must NOT roll back a
-          # cluster-healthy release on edge flakiness; the DD uptime
-          # synthetic is the authoritative public alarm.
-          edge_ok=false
-          for _ in 1 2 3; do
-            if curl -fsS -m 15 "https://webhook.grug.lol/livez" > /dev/null 2>&1; then
-              edge_ok=true; break
-            fi
-            sleep 10
-          done
-          if [ "$edge_ok" = "true" ]; then
-            echo "public edge https://webhook.grug.lol/livez OK" >> "$GITHUB_STEP_SUMMARY"
-          else
-            echo "::warning::public edge https://webhook.grug.lol/livez unreachable from the runner (best-effort; DD uptime synthetic is authoritative)"
-          fi
+          # Public-edge endpoint validation (Qodo review on #525): the
+          # required post-deploy endpoint check, done through the REAL
+          # ingress (DNS + CF worker + tunnel + TLS + the app) rather than
+          # a BYON-incompatible in-cluster probe - a strictly stronger
+          # signal than port-forwarding to a ClusterIP. HARD gate: a
+          # sustained-unreachable public health endpoint rolls back. Short
+          # retries absorb tunnel/cache wobble; a genuinely-down edge
+          # exhausts them.
+          edge() {  # edge <url>
+            for _ in 1 2 3 4 5; do
+              curl -fsS -m 12 "$1" > /dev/null 2>&1 && return 0
+              sleep 6
+            done
+            return 1
+          }
+          edge "https://webhook.grug.lol/livez"  || fail "public edge webhook /livez unreachable (DNS/CF/tunnel/TLS/app)"
+          edge "https://webhook.grug.lol/readyz" || fail "public edge webhook /readyz unhealthy"
+          edge "https://api.grug.lol/livez"      || fail "public edge api /livez unreachable"
+          edge "https://api.grug.lol/readyz"     || fail "public edge api /readyz unhealthy"
+          echo "public-edge endpoints OK (both services /livez + /readyz)" >> "$GITHUB_STEP_SUMMARY"
           # 60s soak: no container restarts and both services still ready
           # (the owned stand-in for a DD error-rate window - the deploy
           # role has no DD keys by design; see ADR-0017).
@@ -533,7 +537,7 @@ jobs:
             avail=$(kubectl -n grug get deploy "$d" -o jsonpath='{.status.conditions[?(@.type=="Available")].status}' 2>/dev/null || echo "")
             [ "$avail" = "True" ] || fail "$d not Available after soak"
           done
-          echo "synthetic PASS: 60s zero-restart soak + post-soak readiness (health already gated by rollout status + poller-smoke)" >> "$GITHUB_STEP_SUMMARY"
+          echo "synthetic PASS: public-edge endpoint validation + 60s zero-restart soak + post-soak readiness" >> "$GITHUB_STEP_SUMMARY"
 
       - name: Auto-rollback to last-good (#499)
         # Fires on ANY post-anchor deploy failure: a failed apply/rollout/
