@@ -411,99 +411,14 @@ monitors = dd_monitors.create_all(
     provider=_dd_provider,
 )
 
-# Cave fallback (#310, ADR-0005): jobs queue backing up = the grug-cave-connector
-# isn't draining (down, or can't reach the Cave) → fallback reviews stay
-# `errored`. Informational (P4) until the fallback is live (#313); until then the
-# queue is empty and this never fires. (DLQ + age/depth hardening is #312.)
-_cave_jobs_age_monitor = _datadog.Monitor(
-    "grug-cave-jobs-age",
-    type="metric alert",
-    name="[grug-webhook] Cave fallback jobs queue backing up",
-    message=(
-        f"{_dd_notify}\n"
-        "grug-cave-jobs (Elder cave fallback) has not drained for 15min — the "
-        "grug-cave-connector isn't draining (down, or can't reach the Cave). "
-        "Fallback reviews stay `errored` until it recovers.\n"
-        "Runbook: docs/RUNBOOK.md#elder-async-offload"
-    ),
-    # #379: owned gauge (aws.sqs.* is not collected in this DD org - the
-    # original query sat in permanent No Data). Sustained depth == same
-    # "not draining" signal the age threshold approximated.
-    query=dd_monitors.cave_jobs_backlog_query(),
-    tags=[f"env:{env}", "service:grug-webhook", "team:grug"],
-    notify_no_data=False,
-    priority=4,
-    opts=pulumi.ResourceOptions(provider=_dd_provider),
-)
-
-# Re-run DLQ depth (#305): a job that failed maxReceiveCount times (GitHub fetch
-# failing, or a malformed job) lands here — the operator's re-run didn't
-# complete. Any message is worth a look.
-_rerun_dlq_monitor = _datadog.Monitor(
-    "grug-rerun-dlq-depth",
-    type="metric alert",
-    name="[grug] Re-run DLQ has messages",
-    message=(
-        f"{_dd_notify}\n"
-        "grug-rerun-jobs-dlq has messages — a re-run job exhausted its retries "
-        "(GitHub fetch failing, or a malformed job). The operator's re-run did "
-        "not complete; inspect the DLQ message.\n"
-        "Runbook: docs/RUNBOOK.md#elder-async-offload"
-    ),
-    query=dd_monitors.rerun_dlq_depth_query(),  # #379: owned gauge
-    tags=[f"env:{env}", "service:grug-api", "team:grug"],
-    notify_no_data=False,
-    priority=3,
-    opts=pulumi.ResourceOptions(provider=_dd_provider),
-)
-
-# Cave DLQ depth (#312): a job/result that exhausted maxReceiveCount landed in a
-# cave DLQ — a poison message the connector (or webhook) couldn't process.
-# Covers both cave DLQs (the jobs one is the meaningful path; results is mostly
-# inert since the handler never raises).
-_cave_dlq_monitor = _datadog.Monitor(
-    "grug-cave-dlq-depth",
-    type="metric alert",
-    name="[grug] Cave airlock DLQ has messages",
-    message=(
-        f"{_dd_notify}\n"
-        "A cave airlock DLQ (grug-cave-jobs-dlq / grug-cave-results-dlq) has "
-        "messages — a poison job/result exhausted its retries. The fallback "
-        "review for that PR did not complete; inspect the DLQ message.\n"
-        "Runbook: docs/RUNBOOK.md#elder-async-offload"
-    ),
-    query=dd_monitors.cave_dlq_depth_query(),  # #379: owned gauge
-    tags=[f"env:{env}", "service:grug-webhook", "team:grug"],
-    notify_no_data=False,
-    priority=3,
-    opts=pulumi.ResourceOptions(provider=_dd_provider),
-)
-
-# Consumer backlog (#379): the consumer's own queues never drained across a
-# 15m window - a stuck/poisoned consumer loop or IAM regression that the pod
-# watchdog cannot see (the pod is alive; the loop is useless). The consumer
-# is ALSO the gauge's emitter, so notify_no_data=True doubles as the
-# consumer-telemetry heartbeat: metric silence = consumer (or its telemetry
-# thread) down = page. The three depth monitors above stay
-# notify_no_data=False - this one carries the no-data pager for the family.
-_consumer_backlog_monitor = _datadog.Monitor(
-    "grug-consumer-queue-backlog",
-    type="metric alert",
-    name="[grug-consumer] Consumed queues not draining (15min)",
-    message=(
-        f"{_dd_notify}\n"
-        "grug-rerun-jobs / grug-cave-results has had messages sitting for a "
-        "full 15min window — the consumer is stuck (poisoned loop, IAM "
-        "regression) even if its pod reads healthy. NO DATA means the "
-        "consumer's own telemetry stopped — treat as consumer down.\n"
-        "Runbook: docs/RUNBOOK.md#elder-async-offload"
-    ),
-    query=dd_monitors.consumer_queue_backlog_query(),
-    tags=[f"env:{env}", "service:grug-webhook", "team:grug"],
-    notify_no_data=True,
-    no_data_timeframe=30,
-    priority=3,
-    opts=pulumi.ResourceOptions(provider=_dd_provider),
+# Owned-gauge queue monitors (#379): five monitors (cave-jobs backlog,
+# rerun DLQ, cave DLQs, consumer backlog, telemetry health) built in the
+# component so the synth test pins each (query, notify_no_data) pair. The
+# telemetry-health monitor is the family's ONLY no-data pager.
+_queue_monitors = dd_monitors.create_owned_queue_monitors(
+    env=env,
+    notify_handle=_dd_notify,
+    provider=_dd_provider,
 )
 
 # Fallback-fired rate (#312): the operator's awareness signal that the owned

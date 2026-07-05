@@ -367,48 +367,71 @@ def test_startup_check_runs_identity_proof_before_readiness(monkeypatch):
 
 
 
-# ── #379: owned queue-depth telemetry ────────────────────────────────
+# --- #379: owned queue-depth telemetry -------------------------------
 
 
-def test_telemetry_base_url_derived_from_known_queue_env(monkeypatch):
-    monkeypatch.setenv(
-        "GRUG_RERUN_QUEUE_URL",
-        "https://sqs.us-east-1.amazonaws.com/123456789012/grug-rerun-jobs.fifo",
-    )
-    assert consumer._telemetry_base_url() == (
-        "https://sqs.us-east-1.amazonaws.com/123456789012"
-    )
+_RERUN_URL = "https://sqs.us-east-1.amazonaws.com/123456789012/grug-rerun-jobs.fifo"
+_BASE = "https://sqs.us-east-1.amazonaws.com/123456789012"
+_BOTH_ATTRS = {"ApproximateNumberOfMessages", "ApproximateNumberOfMessagesNotVisible"}
 
 
-def test_telemetry_base_url_falls_back_to_cave_results(monkeypatch):
-    monkeypatch.delenv("GRUG_RERUN_QUEUE_URL", raising=False)
-    monkeypatch.setenv(
-        "GRUG_CAVE_RESULTS_QUEUE_URL",
-        "https://sqs.us-east-1.amazonaws.com/123456789012/grug-cave-results.fifo",
-    )
-    assert consumer._telemetry_base_url() == (
-        "https://sqs.us-east-1.amazonaws.com/123456789012"
-    )
+@pytest.fixture
+def telemetry_env(monkeypatch):
+    """Baseline env for a sweep: known queue URL + agent host present."""
+    monkeypatch.setenv("GRUG_RERUN_QUEUE_URL", _RERUN_URL)
+    monkeypatch.setenv("DD_AGENT_HOST", "10.0.0.99")
+    return _BASE
 
 
-def test_telemetry_base_url_none_without_env(monkeypatch):
-    monkeypatch.delenv("GRUG_RERUN_QUEUE_URL", raising=False)
-    monkeypatch.delenv("GRUG_CAVE_RESULTS_QUEUE_URL", raising=False)
-    assert consumer._telemetry_base_url() is None
-
-
-def test_emit_queue_depth_emits_both_gauges_per_queue(monkeypatch):
-    """Every telemetry queue gets messages_visible + messages_not_visible
-    gauges tagged with its exact name - the monitor queries' contract."""
-    monkeypatch.setenv(
-        "GRUG_RERUN_QUEUE_URL",
-        "https://sqs.us-east-1.amazonaws.com/123456789012/grug-rerun-jobs.fifo",
-    )
+@pytest.fixture
+def captured_gauges(monkeypatch):
+    """Capture observability.emit_gauge calls as (metric, value, tags)."""
     emitted = []
     monkeypatch.setattr(
         "observability.emit_gauge",
         lambda metric, value, tags=None: emitted.append((metric, value, tags)),
     )
+    return emitted
+
+
+def test_telemetry_base_url_derived_from_known_queue_env(monkeypatch):
+    monkeypatch.setenv("GRUG_RERUN_QUEUE_URL", _RERUN_URL)
+    assert consumer._telemetry_base_url() == _BASE
+
+
+def test_telemetry_base_url_falls_back_to_cave_results(monkeypatch):
+    monkeypatch.delenv("GRUG_RERUN_QUEUE_URL", raising=False)
+    monkeypatch.setenv(
+        "GRUG_CAVE_RESULTS_QUEUE_URL", f"{_BASE}/grug-cave-results.fifo",
+    )
+    assert consumer._telemetry_base_url() == _BASE
+
+
+def test_telemetry_base_url_none_without_env_or_on_malformed(monkeypatch):
+    monkeypatch.delenv("GRUG_RERUN_QUEUE_URL", raising=False)
+    monkeypatch.delenv("GRUG_CAVE_RESULTS_QUEUE_URL", raising=False)
+    assert consumer._telemetry_base_url() is None
+    # No path segment to strip -> refuse rather than derive garbage.
+    monkeypatch.setenv("GRUG_RERUN_QUEUE_URL", "no-slashes-here")
+    assert consumer._telemetry_base_url() is None
+
+
+def test_telemetry_interval_clamped_and_never_raises(monkeypatch):
+    monkeypatch.setenv("GRUG_QUEUE_TELEMETRY_INTERVAL_S", "not-a-number")
+    assert consumer._telemetry_interval_s() == 60.0
+    monkeypatch.setenv("GRUG_QUEUE_TELEMETRY_INTERVAL_S", "0")
+    assert consumer._telemetry_interval_s() == 10.0   # floor: no hot loop
+    monkeypatch.setenv("GRUG_QUEUE_TELEMETRY_INTERVAL_S", "1800")
+    assert consumer._telemetry_interval_s() == 300.0  # cap: < the 15m window
+    monkeypatch.setenv("GRUG_QUEUE_TELEMETRY_INTERVAL_S", "45")
+    assert consumer._telemetry_interval_s() == 45.0
+
+
+def test_emit_queue_depth_emits_both_gauges_per_queue(telemetry_env, captured_gauges):
+    """Every telemetry queue gets messages_visible + messages_not_visible
+    gauges tagged with its exact name, requesting exactly the two
+    attributes (real SQS returns only what is requested - a dropped
+    AttributeName would silently emit fake zeros forever)."""
     with patch.object(
         consumer._sqs,
         "get_queue_attributes",
@@ -419,56 +442,118 @@ def test_emit_queue_depth_emits_both_gauges_per_queue(monkeypatch):
     ) as mock_attrs:
         n = consumer._emit_queue_depth_once()
     assert n == len(consumer._TELEMETRY_QUEUE_NAMES)
-    assert mock_attrs.call_count == len(consumer._TELEMETRY_QUEUE_NAMES)
     urls = [c.kwargs["QueueUrl"] for c in mock_attrs.call_args_list]
-    assert urls == [
-        f"https://sqs.us-east-1.amazonaws.com/123456789012/{name}"
-        for name in consumer._TELEMETRY_QUEUE_NAMES
-    ]
-    visible = [(t or {}).get("queue") for m, v, t in emitted
+    assert urls == [f"{_BASE}/{name}" for name in consumer._TELEMETRY_QUEUE_NAMES]
+    assert all(
+        set(c.kwargs["AttributeNames"]) == _BOTH_ATTRS
+        for c in mock_attrs.call_args_list
+    )
+    visible = [(t or {}).get("queue") for m, v, t in captured_gauges
                if m == "grug.sqs.messages_visible"]
     assert visible == list(consumer._TELEMETRY_QUEUE_NAMES)
-    assert all(v == 2.0 for m, v, t in emitted if m == "grug.sqs.messages_visible")
-    assert all(v == 1.0 for m, v, t in emitted if m == "grug.sqs.messages_not_visible")
+    assert all(v == 2.0 for m, v, t in captured_gauges
+               if m == "grug.sqs.messages_visible")
+    assert all(v == 1.0 for m, v, t in captured_gauges
+               if m == "grug.sqs.messages_not_visible")
 
 
-def test_emit_queue_depth_per_queue_best_effort(monkeypatch, caplog):
-    """One queue's GetQueueAttributes failure (e.g. AccessDenied before the
-    infra IAM grant lands) is logged and the OTHER queues still emit."""
+def test_emit_queue_depth_emits_telemetry_health_gauge(telemetry_env, captured_gauges):
+    """The sweep count is emitted as the health gauge - the family's
+    heartbeat monitor input (audit stage-2 HIGH: partial telemetry death
+    must page, not silently re-blind the depth monitors)."""
+    with patch.object(
+        consumer._sqs, "get_queue_attributes",
+        return_value={"Attributes": {"ApproximateNumberOfMessages": "0",
+                                     "ApproximateNumberOfMessagesNotVisible": "0"}},
+    ):
+        consumer._emit_queue_depth_once()
+    health = [(m, v) for m, v, t in captured_gauges
+              if m == "grug.sqs.telemetry_queues_ok"]
+    assert health == [("grug.sqs.telemetry_queues_ok",
+                       float(len(consumer._TELEMETRY_QUEUE_NAMES)))]
+
+
+def test_emit_queue_depth_per_queue_best_effort(telemetry_env, captured_gauges, caplog):
+    """One queue's failure (real botocore ClientError shape, e.g.
+    AccessDenied before the infra IAM grant lands) logs the WIRE error
+    code and the OTHER queues still emit; the health gauge reports the
+    reduced count."""
     import logging as _logging
 
-    monkeypatch.setenv(
-        "GRUG_RERUN_QUEUE_URL",
-        "https://sqs.us-east-1.amazonaws.com/123456789012/grug-rerun-jobs.fifo",
-    )
-    emitted = []
-    monkeypatch.setattr(
-        "observability.emit_gauge",
-        lambda metric, value, tags=None: emitted.append(tags["queue"]),
-    )
+    from botocore.exceptions import ClientError
 
-    def _attrs(QueueUrl):
+    def _attrs(QueueUrl, AttributeNames):
         if "dlq" in QueueUrl:
-            raise RuntimeError("AccessDenied")
+            raise ClientError(
+                {"Error": {"Code": "AccessDenied", "Message": "denied"}},
+                "GetQueueAttributes",
+            )
         return {"Attributes": {"ApproximateNumberOfMessages": "0",
                                "ApproximateNumberOfMessagesNotVisible": "0"}}
 
+    with patch.object(consumer._sqs, "get_queue_attributes", side_effect=_attrs):
+        with caplog.at_level(_logging.WARNING):
+            n = consumer._emit_queue_depth_once()
+    assert n == 3  # the three non-DLQ queues probed
+    queues = [(t or {}).get("queue") for m, v, t in captured_gauges
+              if m == "grug.sqs.messages_visible"]
+    assert queues and not any("dlq" in q for q in queues)
+    fails = [r for r in caplog.records if r.msg == "queue_depth_probe_failed"]
+    assert len(fails) == 3
+    assert all(r.code == "AccessDenied" for r in fails)
+    health = [v for m, v, t in captured_gauges if m == "grug.sqs.telemetry_queues_ok"]
+    assert health == [3.0]
+
+
+def test_emit_queue_depth_non_clienterror_logs_kind_without_code(
+    telemetry_env, captured_gauges, caplog,
+):
+    import logging as _logging
+
     with patch.object(
-        consumer._sqs, "get_queue_attributes",
-        side_effect=lambda QueueUrl, AttributeNames: _attrs(QueueUrl),
+        consumer._sqs, "get_queue_attributes", side_effect=RuntimeError("boom"),
     ):
         with caplog.at_level(_logging.WARNING):
             n = consumer._emit_queue_depth_once()
-    assert n == 3  # the three non-DLQ queues emitted
-    assert "grug-rerun-jobs.fifo" in emitted
-    assert not any("dlq" in q for q in emitted)
+    assert n == 0
+    fails = [r for r in caplog.records if r.msg == "queue_depth_probe_failed"]
+    assert fails and all(r.kind == "RuntimeError" and r.code is None for r in fails)
+
+
+def test_emit_queue_depth_missing_attributes_key_is_probe_failure(
+    telemetry_env, captured_gauges, caplog,
+):
+    """A response without Attributes must count as a FAILED probe (never
+    silently emit fake zeros) - pins the ["Attributes"] KeyError path."""
+    import logging as _logging
+
+    with patch.object(consumer._sqs, "get_queue_attributes", return_value={}):
+        with caplog.at_level(_logging.WARNING):
+            n = consumer._emit_queue_depth_once()
+    assert n == 0
+    assert not any(m == "grug.sqs.messages_visible" for m, v, t in captured_gauges)
+    assert sum(1 for r in caplog.records if r.msg == "queue_depth_probe_failed") == 6
+
+
+def test_emit_queue_depth_skips_sweep_without_agent_host(monkeypatch, caplog):
+    """Sweep-level guard: no DD_AGENT_HOST -> one warning per sweep (not
+    12 per-emit lines) and zero pointless SQS calls."""
+    import logging as _logging
+
+    monkeypatch.setenv("GRUG_RERUN_QUEUE_URL", _RERUN_URL)
+    monkeypatch.delenv("DD_AGENT_HOST", raising=False)
+    with patch.object(consumer._sqs, "get_queue_attributes") as mock_attrs:
+        with caplog.at_level(_logging.WARNING):
+            assert consumer._emit_queue_depth_once() == 0
+    assert mock_attrs.call_count == 0
     assert sum(1 for r in caplog.records
-               if r.msg == "queue_depth_probe_failed") == 3
+               if r.msg == "queue_telemetry_no_agent_host") == 1
 
 
 def test_emit_queue_depth_warns_without_base_url(monkeypatch, caplog):
     import logging as _logging
 
+    monkeypatch.setenv("DD_AGENT_HOST", "10.0.0.99")
     monkeypatch.delenv("GRUG_RERUN_QUEUE_URL", raising=False)
     monkeypatch.delenv("GRUG_CAVE_RESULTS_QUEUE_URL", raising=False)
     with caplog.at_level(_logging.WARNING):
@@ -494,3 +579,64 @@ def test_telemetry_loop_exits_on_stop_and_survives_cycle_failure(monkeypatch):
     finally:
         consumer._stop.clear()
     assert calls["n"] == 2
+
+
+def test_main_starts_daemon_telemetry_thread_outside_watchdog(monkeypatch):
+    """The design's safety wiring, pinned (audit stage-7): the telemetry
+    thread IS started, IS daemon, and is NOT watchdog-tracked - its death
+    must surface as monitor No Data, never as a pod restart. main() must
+    exit 0 on graceful shutdown even though the telemetry thread died."""
+    built = []
+    real_thread = consumer.threading.Thread
+
+    class _RecordingThread(real_thread):
+        def __init__(self, *a, **k):
+            built.append(k)
+            super().__init__(*a, **k)
+
+    monkeypatch.setattr(consumer.threading, "Thread", _RecordingThread)
+    monkeypatch.setattr(consumer, "_warm_trace_writer", lambda: None)
+    monkeypatch.setattr(consumer, "_startup_check", lambda: None)
+    monkeypatch.setattr(consumer, "_flush_traces", lambda: None)
+    monkeypatch.setattr(consumer, "_flush_tracer", lambda: None)
+    monkeypatch.setattr(
+        consumer, "_telemetry_loop", lambda: (_ for _ in ()).throw(RuntimeError("die")),
+    )
+    monkeypatch.setattr(
+        consumer, "_specs",
+        lambda: [consumer.QueueSpec(
+            kind="t", url_env="TEST_QUEUE_URL",
+            handler=lambda e: None, delete_on_error=True,
+        )],
+    )
+    monkeypatch.setenv("TEST_QUEUE_URL", f"{_BASE}/t.fifo")
+    monkeypatch.setattr(consumer, "_queue_arn", lambda url: "arn:aws:sqs:t")
+    monkeypatch.setattr(consumer, "_poll_once", lambda *a: consumer._stop.wait(0.01))
+
+    captured_sig = {}
+
+    def _fake_signal(signum, handler):
+        captured_sig[signum] = handler
+
+    monkeypatch.setattr(consumer.signal, "signal", _fake_signal)
+    consumer._stop.clear()
+
+    import threading as _threading
+
+    def _send_sigterm():
+        import time as _time
+        _time.sleep(0.1)
+        captured_sig[consumer.signal.SIGTERM](consumer.signal.SIGTERM, None)
+
+    killer = _threading.Thread(target=_send_sigterm)
+    killer.start()
+    try:
+        consumer.main()   # must NOT raise SystemExit: telemetry death is non-fatal
+    finally:
+        killer.join()
+        consumer._stop.clear()
+
+    telemetry = [k for k in built if k.get("target") is not None
+                 and getattr(k.get("target"), "__name__", "") == "<lambda>"
+                 and k.get("name") == "queue-telemetry"]
+    assert telemetry and telemetry[0].get("daemon") is True
