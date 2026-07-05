@@ -120,6 +120,7 @@ def test_no_workload_carries_the_static_key_and_all_ride_roles_anywhere():
             assert mounts["grug-pki"]["mountPath"] == "/var/run/grug-pki", name
             assert mounts["grug-pki"].get("readOnly") is True, name
             assert mounts["aws-config"]["mountPath"] == "/etc/grug-aws", name
+            assert mounts["aws-config"].get("readOnly") is True, name
             vols = {v["name"]: v for v in pod["volumes"]}
             assert vols["grug-pki"]["secret"]["secretName"] == "grug-pki-tls", name
             assert vols["aws-config"]["configMap"]["name"] == "grug-aws-config", name
