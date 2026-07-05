@@ -68,30 +68,6 @@ def test_aws_config_credential_process_shape():
     ):
         assert required in line, f"missing from credential_process: {required}"
 
-
-def test_poller_rides_roles_anywhere_not_the_static_key():
-    (cron,) = [d for d in _load("poller-cronjob.yaml") if d["kind"] == "CronJob"]
-    pod = _pod_spec(cron)
-    (container,) = pod["containers"]
-
-    env_from = _secret_env_from(container)
-    assert "grug-secrets" in env_from
-    assert "grug-aws-static-key" not in env_from, (
-        "poller must NOT get the static key - env creds out-rank credential_process"
-    )
-    env = {e["name"]: e.get("value") for e in container.get("env", [])}
-    # The single ABSOLUTE path anchor; every other path is derived from it
-    # (or from a manifest counterpart) in the cross-derivation test.
-    assert env.get("AWS_CONFIG_FILE") == "/etc/grug-aws/config"
-    # The identity ASSERTION input (peer review 3x): sed-pinned to the
-    # same SSM role ARN the ConfigMap's credential_process uses.
-    assert env.get("GRUG_RA_ROLE_ARN") == "RA_ROLE_ARN_PLACEHOLDER"
-    assert "AWS_ACCESS_KEY_ID" not in env and "AWS_SECRET_ACCESS_KEY" not in env
-
-    mounts = {m["name"]: m for m in container["volumeMounts"]}
-    assert mounts["grug-pki"].get("readOnly") is True
-
-
 # DERIVED from k8s/ (audit #389-1): a 5th AWS-talking workload manifest
 # joins the fleet test automatically instead of silently escaping a
 # hand-list. The exclusions are the point: each names WHY it must never
@@ -128,13 +104,21 @@ def test_no_workload_carries_the_static_key_and_all_ride_roles_anywhere():
             pod = _pod_spec(doc)
             (c,) = pod["containers"]
             name = doc["metadata"]["name"]
-            assert "grug-aws-static-key" not in _secret_env_from(c), name
+            env_from = _secret_env_from(c)
+            assert "grug-aws-static-key" not in env_from, name
+            assert "grug-secrets" in env_from, name  # app config rides along
             env = {e["name"]: e.get("value") for e in c.get("env", [])}
+            # The single ABSOLUTE path anchor; the cross-derivation test
+            # derives every other path from manifest counterparts.
             assert env.get("AWS_CONFIG_FILE") == "/etc/grug-aws/config", name
+            # Sed-pinned from the same SSM role ARN the ConfigMap uses -
+            # the exact-identity assertion input.
             assert env.get("GRUG_RA_ROLE_ARN") == "RA_ROLE_ARN_PLACEHOLDER", name
             assert "AWS_ACCESS_KEY_ID" not in env, name
+            assert "AWS_SECRET_ACCESS_KEY" not in env, name
             mounts = {m["name"]: m for m in c["volumeMounts"]}
             assert mounts["grug-pki"]["mountPath"] == "/var/run/grug-pki", name
+            assert mounts["grug-pki"].get("readOnly") is True, name
             assert mounts["aws-config"]["mountPath"] == "/etc/grug-aws", name
             vols = {v["name"]: v for v in pod["volumes"]}
             assert vols["grug-pki"]["secret"]["secretName"] == "grug-pki-tls", name

@@ -39,6 +39,7 @@ class _MonitorBundle:
     cf_secret_mismatch: datadog.Monitor
     key_rotation_fail: datadog.Monitor
     uptime: datadog.SyntheticsTest
+    credential_acquisition_fail: datadog.Monitor
 
 
 def _common_tags(env: str, service: str) -> list[str]:
@@ -565,4 +566,5 @@ def create_all(
         cf_secret_mismatch=cf_secret_mismatch,
         key_rotation_fail=key_rotation_fail,
         uptime=uptime,
+        credential_acquisition_fail=credential_acquisition_fail,
     )

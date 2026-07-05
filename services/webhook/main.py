@@ -28,7 +28,7 @@ from secrets_loader import get_webhook_secret
 configure_logging()
 log = logging.getLogger("grug.webhook")
 
-# Roles Anywhere boot proof (#389) - see services/api/main.py note.
+# Roles Anywhere boot proof (#389) - rationale in aws_identity's docstring.
 prove_roles_anywhere_identity()
 
 app = FastAPI(
