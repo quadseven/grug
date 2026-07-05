@@ -497,7 +497,7 @@ jobs:
           set -euo pipefail
           fail() { echo "::error::synthetic: $1"; exit 1; }
           probe_health() {  # probe_health <svc>
-            kubectl -n grug port-forward "svc/$1" 18080:8080 >/dev/null 2>&1 &
+            timeout 60 kubectl -n grug port-forward "svc/$1" 18080:8080 >/dev/null 2>&1 &
             pf=$!
             sleep 3
             for ep in livez readyz; do
@@ -515,7 +515,7 @@ jobs:
           # side-effect-free (ping dispatches nothing).
           WH_SECRET=$(aws ssm get-parameter --name /grug/github-app-webhook-secret --with-decryption --query 'Parameter.Value' --output text)
           CF_SECRET=$(aws ssm get-parameter --name /grug/cf-shared-secret --with-decryption --query 'Parameter.Value' --output text)
-          kubectl -n grug port-forward svc/grug-webhook 18080:8080 >/dev/null 2>&1 &
+          timeout 60 kubectl -n grug port-forward svc/grug-webhook 18080:8080 >/dev/null 2>&1 &
           pf=$!
           sleep 3
           BODY='{"zen":"synthetic deploy self-test","hook_id":0}'
