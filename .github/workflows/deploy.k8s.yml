@@ -164,13 +164,19 @@ jobs:
         run: |
           set -euo pipefail
           for svc in webhook api; do
+            # Resolve the tag to a DIGEST once, then read AND retag via
+            # @digest only: content-addressed reads make the verify+retag
+            # single-read consistent - a tag swap between steps cannot
+            # switch the artifact under us (spark peer review TOCTOU).
+            digest=$(docker buildx imagetools inspect \
+              "$REGISTRY_HOST/grug-$svc:pr-${PR_NUM}" --format '{{.Manifest.Digest}}')
             # Verify the ARTIFACT, not just the git graph: the baked
             # DD_GIT_COMMIT_SHA must equal the PR head sha. Closes the
             # stale-tag vectors tree identity cannot see (superseded gate
             # run finishing late, path-filter dropout, merge-ref build) -
             # audit stages 5, 6 and 8.
             env_json=$(docker buildx imagetools inspect \
-              "$REGISTRY_HOST/grug-$svc:pr-${PR_NUM}" \
+              "$REGISTRY_HOST/grug-$svc@${digest}" \
               --format '{{json .Image.Config.Env}}')
             verdict=$(python3 scripts/promotion.py --verify-baked-sha "$env_json" "$HEAD_SHA")
             printf '%s\n' "$verdict"
@@ -178,8 +184,6 @@ jobs:
               echo "::warning::grug-$svc:pr-${PR_NUM} failed baked-sha verification - falling back to rebuild"
               exit 1
             fi
-            digest=$(docker buildx imagetools inspect \
-              "$REGISTRY_HOST/grug-$svc:pr-${PR_NUM}" --format '{{.Manifest.Digest}}')
             # Server-side retag: the merge sha tag points at the EXACT
             # PR-tested manifest - no rebuild, no layer transfer. NOTE the
             # merge-sha tag then SHARES a manifest with pr-<n>; safe
