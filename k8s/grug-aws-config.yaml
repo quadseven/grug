@@ -8,9 +8,13 @@
 # The SDK runs aws_signing_helper (baked into the webhook image) per
 # credential refresh: X.509 leaf (cert-manager Secret grug-pki-tls) ->
 # Roles Anywhere -> ~1h STS session. --intermediates is REQUIRED: the
-# trust anchor is the offline ROOT, and ca.crt in the cert-manager Secret
-# is the signing INTERMEDIATE the chain must present (infrastructure
-# ADR 0015 recipe).
+# trust anchor is the offline ROOT, so the chain must present the signing
+# INTERMEDIATE. We pass ca.crt (a CA-backed ClusterIssuer populates it
+# with the issuing CA cert = the intermediate); ADR 0015's recipe words
+# this as "the intermediate from the tls.crt bundle" - equivalent chain,
+# different file. NOT yet live-proven on this exact wiring: the
+# roles_anywhere_identity_proven log line on first deploy is the proof;
+# if the chain is rejected, switch --intermediates to tls.crt.
 apiVersion: v1
 kind: ConfigMap
 metadata:

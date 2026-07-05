@@ -124,7 +124,7 @@ jobs:
           # trip on command-substitution failures inside `echo "K=$(...)"`,
           # audit C2; print only KEY names), then DELETE-then-create
           # (kubectl apply MERGES secret data - stale keys lingered on the
-          # first deploys), then shred the env-file.
+          # first deploys), then delete the env-file.
           seed() {
             if grep -qE '=$|=None$' "$2"; then
               echo "::error::empty/None value(s) in $1 seed:"
