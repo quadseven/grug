@@ -305,6 +305,36 @@ with `@event:judge_verdicts_unparseable`. Recall/precision baseline lives at
 
 ### Elder async offload + self-recovery
 
+<a id="deploy-rollback"></a>
+## Deploy rollback (#499, ADR-0017)
+
+Two paths, both re-applying the `grug-last-good` ConfigMap anchor (the
+digest pair that was running before the last deploy) - no rebuild:
+
+- **Automatic**: every deploy anchors, applies, then runs a synthetic
+  (health probes, a signed ping through the full auth stack, 60s
+  zero-restart soak). If the APPLY or the SYNTHETIC fails, the deploy
+  rolls itself back, annotates
+  `grug.dev/image-source=rollback-last-good`, emits `grug.deploy.rollback`
+  (pages Discord via the '[grug] Deploy auto-rollback fired' monitor),
+  and fails the run. The bad merge is STILL ON MAIN - revert or fix
+  forward, then let the next deploy re-prove itself.
+- **Contract**: auto-rollback restores the previous digests AND the
+  pre-seed grug-secrets snapshot (with forced pod restarts); k8s/
+  manifest regressions are NOT undone (the step warns when the merge
+  touched k8s/) - revert + redeploy for those. The manual path is
+  image-only (no snapshot exists in a later run).
+- **Manual one-click**: Actions -> deploy.rollback -> Run workflow (main).
+  Re-applies the release that was running BEFORE the latest deploy - use
+  it when the current release is bad, INCLUDING a bad release that
+  passed the synthetic. NOTE a "drill" genuinely reverts one release
+  (not a no-op): roll forward afterwards with Actions -> deploy.k8s ->
+  Run workflow.
+
+Verify state after either path: `kubectl -n grug get deploy -o
+jsonpath='{range .items[*]}{.metadata.name}: {.metadata.annotations.grug\.dev/image-source}{"\n"}{end}'`
+and check the anchor with `kubectl -n grug get configmap grug-last-good -o yaml`.
+
 <a id="elder-async-offload"></a>
 
 **Queue-depth telemetry + monitors (#379):** the consumer emits

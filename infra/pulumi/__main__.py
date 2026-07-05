@@ -421,6 +421,13 @@ _queue_monitors = dd_monitors.create_owned_queue_monitors(
     provider=_dd_provider,
 )
 
+# Release-chain monitors (#499): rollback-fired pager.
+_deploy_monitors = dd_monitors.create_deploy_monitors(
+    env=env,
+    notify_handle=_dd_notify,
+    provider=_dd_provider,
+)
+
 # Fallback-fired rate (#312): the operator's awareness signal that the owned
 # backstop actually activated (both cloud LLMs were down and a job was enqueued).
 # Informational (P4) — it won't fire until the fallback is enabled (#313). Built

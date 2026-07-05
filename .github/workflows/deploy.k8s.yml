@@ -118,6 +118,19 @@ jobs:
             if [ -n "$head_sha" ]; then
               head_tree=$(gh_fact "repos/${GITHUB_REPOSITORY}/commits/${head_sha}" --jq .commit.tree.sha)
             fi
+            # Did the image-build gate RUN for this head at all? A
+            # workflow-only merge never triggers it - the absent artifact
+            # is then an EXPECTED rebuild, not the alertable
+            # artifact-missing case (#499 reclassification).
+            gate_ran="unknown"
+            if [ -n "$head_sha" ]; then
+              cr=$(gh_fact "repos/${GITHUB_REPOSITORY}/commits/${head_sha}/check-runs?check_name=image-build%20(webhook)" --jq '.total_count')
+              case "$cr" in
+                0) gate_ran="false" ;;
+                ''|*[!0-9]*) gate_ran="unknown" ;;
+                *) gate_ran="true" ;;
+              esac
+            fi
             for svc in webhook api; do
               present=false
               if err=$(docker manifest inspect "$REGISTRY_HOST/grug-$svc:pr-${pr_num}" 2>&1 >/dev/null); then
@@ -134,6 +147,7 @@ jobs:
             --pr-numbers-json "$prs_json" \
             --head-tree "$head_tree" --merge-tree "$merge_tree" \
             --expected-services webhook,api \
+            --gate-ran "${gate_ran:-unknown}" \
             "${manifest_flags[@]}" | tee -a "$GITHUB_OUTPUT"
           echo "head_sha=$head_sha" >> "$GITHUB_OUTPUT"
 
@@ -238,7 +252,42 @@ jobs:
           echo "$KUBECONFIG_B64" | base64 -d > "$HOME/.kube/config"
           chmod 600 "$HOME/.kube/config"
 
+      - name: Record last-good digests (rollback anchor, #499)
+        # Runs BEFORE the destructive secret seed (codex r10): a failure
+        # here aborts the deploy while NOTHING has been mutated yet -
+        # fail-fast is safe and correct at this point.
+        run: |
+          set -euo pipefail
+          # Snapshot the CURRENTLY-RUNNING digest pair before we touch
+          # anything - it survived its own deploy's synthetic, so it is
+          # the rollback target. Skip (keep the previous anchor) unless
+          # every workload is currently Available: never anchor a broken
+          # state.
+          ok=true
+          for d in grug-webhook grug-api grug-consumer; do
+            avail=$(kubectl -n grug get deploy "$d" -o jsonpath='{.status.conditions[?(@.type=="Available")].status}' 2>/dev/null || echo "")
+            [ "$avail" = "True" ] || ok=false
+          done
+          if [ "$ok" = "true" ]; then
+            W=$(kubectl -n grug get deploy grug-webhook -o jsonpath='{.spec.template.spec.containers[0].image}')
+            A=$(kubectl -n grug get deploy grug-api -o jsonpath='{.spec.template.spec.containers[0].image}')
+            FROM=$(kubectl -n grug get deploy grug-webhook -o jsonpath='{.metadata.annotations.grug\.dev/merge-sha}' 2>/dev/null || echo unknown)
+            kubectl -n grug create configmap grug-last-good \
+              --from-literal=webhook="$W" --from-literal=api="$A" \
+              --from-literal=recorded_from_sha="$FROM" \
+              --dry-run=client -o yaml | kubectl apply -f -
+            echo "last-good anchor recorded (from ${FROM})" >> "$GITHUB_STEP_SUMMARY"
+          else
+            echo "::warning::workloads not all Available pre-apply - keeping the previous last-good anchor"
+          fi
+
       - name: Seed app secrets from the parameter store
+        id: seed
+        # continue-on-error AFTER the snapshots exist (codex r6): a
+        # mid-seed failure has already deleted/replaced live Secrets, so
+        # it must reach the same restore path as apply/synthetic
+        # failures instead of stranding the cluster half-mutated.
+        continue-on-error: true
         env:
           REGISTRY_HOST: ${{ vars.DEPLOY_REGISTRY_HOST }}
           REGISTRY_USERNAME: ${{ secrets.REGISTRY_USERNAME }}
@@ -280,6 +329,34 @@ jobs:
           # retired). The AWS_* leak guard below stays load-bearing: env
           # creds would out-rank credential_process in the SDK chain and
           # silently bypass the Roles Anywhere path every pod boot-proves.
+          # Snapshot EVERY secret this run destructively mutates (codex
+          # r3+r5): grug-secrets (SSM-derived) AND both registry-pull
+          # secrets (env-credential-derived) - auto-rollback restores all
+          # three before restarting pods, so neither a bad SSM value nor a
+          # rotated-wrong registry credential can survive a rollback (with
+          # imagePullPolicy Always, a bad pull secret would strand the
+          # rollback pods). Metadata stripped so kubectl apply accepts it.
+          # Three-state snapshot protocol (codex r8): a snapshot READ
+          # failure must never masquerade as absence - restore may only
+          # DELETE a secret on a confirmed NotFound. States: <file>.pre.json
+          # non-empty = confirmed present; <file>.absent marker = confirmed
+          # absent; NEITHER = snapshot failed -> restore leaves that secret
+          # untouched and demands manual review.
+          snap() {  # snap <ns> <secret> <file-stem>
+            local out err
+            err="$RUNNER_TEMP/$3.snap-err"
+            if out=$(kubectl -n "$1" get secret "$2" -o json 2> "$err"); then
+              printf '%s' "$out" | python3 -c "import json,sys; d=json.load(sys.stdin); [d['metadata'].pop(k, None) for k in ('resourceVersion','uid','creationTimestamp','managedFields')]; print(json.dumps(d))" \
+                > "$RUNNER_TEMP/$3.pre.json"
+            elif grep -qi "NotFound" "$err"; then
+              : > "$RUNNER_TEMP/$3.absent"
+            else
+              echo "::warning::snapshot of $2@$1 FAILED (not NotFound) - rollback will not touch this secret: $(head -c 120 "$err")"
+            fi
+          }
+          snap grug grug-secrets grug-secrets
+          snap grug registry-pull registry-pull-grug
+          snap grug-trial registry-pull registry-pull-trial
           ENVF="$RUNNER_TEMP/grug-secrets.env"
           install -m 600 /dev/null "$ENVF"
           {
@@ -332,6 +409,13 @@ jobs:
             --dry-run=client -o yaml | kubectl apply -f -
 
       - name: Pin image placeholders + apply
+        id: apply
+        if: steps.seed.outcome == 'success'
+        # continue-on-error so a FAILED apply/rollout/smoke still reaches
+        # the rollback step below (codex peer review: a bad image or
+        # manifest aborting here is exactly when recovery matters most);
+        # the rollback + the run's final state stay loud.
+        continue-on-error: true
         env:
           REGISTRY_HOST: ${{ vars.DEPLOY_REGISTRY_HOST }}
         run: |
@@ -405,6 +489,182 @@ jobs:
             "grug.dev/image-source=${IMAGE_SOURCE:?neither image step set IMAGE_SOURCE}" \
             "grug.dev/merge-sha=${GITHUB_SHA}"
 
+      - name: Post-deploy synthetic self-test (#499)
+        id: synthetic
+        if: steps.apply.outcome == 'success'
+        continue-on-error: true
+        run: |
+          set -euo pipefail
+          fail() { echo "::error::synthetic: $1"; exit 1; }
+          probe_health() {  # probe_health <svc>
+            timeout 60 kubectl -n grug port-forward "svc/$1" 18080:8080 >/dev/null 2>&1 &
+            pf=$!
+            sleep 3
+            for ep in livez readyz; do
+              curl -fsS -m 10 "http://127.0.0.1:18080/$ep" > /dev/null \
+                || { kill "$pf" 2>/dev/null; fail "$1 /$ep unhealthy"; }
+            done
+            kill "$pf" 2>/dev/null; wait "$pf" 2>/dev/null || true
+          }
+          probe_health grug-webhook
+          probe_health grug-api
+          # Signed ping through the FULL auth stack: proves the pod serves,
+          # its Roles Anywhere creds fetch the webhook secret from SSM,
+          # HMAC verify runs, and the CF-boundary middleware accepts the
+          # shared secret - the #368 proof mechanics, automated and
+          # side-effect-free (ping dispatches nothing).
+          WH_SECRET=$(aws ssm get-parameter --name /grug/github-app-webhook-secret --with-decryption --query 'Parameter.Value' --output text)
+          CF_SECRET=$(aws ssm get-parameter --name /grug/cf-shared-secret --with-decryption --query 'Parameter.Value' --output text)
+          timeout 60 kubectl -n grug port-forward svc/grug-webhook 18080:8080 >/dev/null 2>&1 &
+          pf=$!
+          sleep 3
+          BODY='{"zen":"synthetic deploy self-test","hook_id":0}'
+          SIG=$(printf '%s' "$BODY" | openssl dgst -sha256 -hmac "$WH_SECRET" | awk '{print $NF}')
+          code=$(curl -s -o "$RUNNER_TEMP/ping.out" -w '%{http_code}' -m 15 \
+            -H "X-GitHub-Event: ping" \
+            -H "X-GitHub-Delivery: synthetic-${GITHUB_SHA}" \
+            -H "X-Hub-Signature-256: sha256=${SIG}" \
+            -H "X-Grug-CF-Secret: ${CF_SECRET}" \
+            -H "Content-Type: application/json" \
+            --data "$BODY" "http://127.0.0.1:18080/webhook/github")
+          kill "$pf" 2>/dev/null; wait "$pf" 2>/dev/null || true
+          [ "$code" = "200" ] || fail "signed ping got HTTP $code: $(head -c 120 "$RUNNER_TEMP/ping.out")"
+          # Public-edge probe (codex r13): port-forward proves pod-local
+          # health only - GitHub reaches the webhook via DNS + the CF
+          # worker + the tunnel, so probe the real ingress too. grug.lol
+          # is the public product domain (already public in this repo).
+          # Retries absorb edge-cache/tunnel wobble.
+          edge_ok=false
+          for attempt in 1 2 3; do
+            if curl -fsS -m 15 "https://webhook.grug.lol/livez" > /dev/null; then
+              edge_ok=true; break
+            fi
+            echo "edge probe attempt ${attempt} failed; retrying"
+            sleep 10
+          done
+          [ "$edge_ok" = "true" ] || fail "public edge https://webhook.grug.lol/livez unreachable"
+          # 60s soak: no container restarts and both services still ready
+          # (the owned stand-in for a DD error-rate window - the deploy
+          # role has no DD keys by design; see ADR-0017).
+          base=$(kubectl -n grug get pods -o jsonpath='{range .items[*]}{range .status.containerStatuses[*]}{.restartCount}{"\n"}{end}{end}' | awk '{s+=$1} END {print s+0}')
+          sleep 60
+          after=$(kubectl -n grug get pods -o jsonpath='{range .items[*]}{range .status.containerStatuses[*]}{.restartCount}{"\n"}{end}{end}' | awk '{s+=$1} END {print s+0}')
+          [ "$after" -le "$base" ] || fail "container restarts during soak (${base} -> ${after})"
+          probe_health grug-webhook
+          probe_health grug-api
+          echo "synthetic PASS: health x2, signed ping 200, 60s soak clean" >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Auto-rollback to last-good (#499)
+        # Fires on ANY post-anchor deploy failure: a failed apply/rollout/
+        # smoke OR a failed synthetic. IMAGE-ONLY contract (ADR-0017): the
+        # anchor restores the previous digests under the CURRENT applied
+        # config - a manifest/secret regression needs revert + redeploy;
+        # the step warns when this merge touched k8s/.
+        if: steps.seed.outcome == 'failure' || steps.apply.outcome == 'failure' || steps.synthetic.outcome == 'failure'
+        run: |
+          set -euo pipefail
+          # Page FIRST (codex r9): the metric must fire even when the
+          # rollback itself then fails (unpullable restored image, bad
+          # restored secret) - a failed recovery is the loudest case.
+          NODE_IP=$(kubectl get nodes -o jsonpath='{.items[0].status.addresses[?(@.type=="InternalIP")].address}' 2>/dev/null || echo "")
+          if [ -n "$NODE_IP" ]; then
+            printf 'grug.deploy.rollback:1|c|#env:prod,trigger:auto,phase:attempted' \
+              | timeout 5 bash -c "cat > /dev/udp/${NODE_IP}/8125" || true
+          fi
+          W=$(kubectl -n grug get configmap grug-last-good -o jsonpath='{.data.webhook}' 2>/dev/null || echo "")
+          A=$(kubectl -n grug get configmap grug-last-good -o jsonpath='{.data.api}' 2>/dev/null || echo "")
+          if [ -z "$W" ] || [ -z "$A" ]; then
+            echo "::error::deploy FAILED and no last-good anchor exists - manual intervention required"
+            exit 1
+          fi
+          # Restore the pre-seed secret snapshots FIRST (codex r3+r5):
+          # rollback covers images + every durable object this run
+          # mutates; the pods restarted below mount the restored values
+          # and pull with the restored credential.
+          # EXACT restore, not an apply overlay (codex r7): apply merges
+          # and would keep stale keys the failed seed added - the same
+          # hazard the seed's own delete-then-create exists to prevent.
+          # Empty snapshot = the object did not exist pre-deploy: restore
+          # ABSENCE by deleting whatever the failed run seeded.
+          RESTORE_INCOMPLETE=0
+          restore() {  # restore <ns> <secret> <file-stem>
+            if [ -s "$RUNNER_TEMP/$3.pre.json" ]; then
+              kubectl -n "$1" delete secret "$2" --ignore-not-found
+              kubectl -n "$1" apply -f "$RUNNER_TEMP/$3.pre.json"
+            elif [ -e "$RUNNER_TEMP/$3.absent" ]; then
+              # confirmed absent pre-deploy: restore ABSENCE
+              kubectl -n "$1" delete secret "$2" --ignore-not-found
+              echo "::warning::$2@$1 did not exist pre-deploy - deleted the seeded object"
+            else
+              # snapshot FAILED pre-deploy: this rollback is INCOMPLETE
+              # (codex r12) - still restore everything else, but the
+              # completed signal below must not fire.
+              echo "::error::$2@$1 snapshot FAILED pre-deploy - secret left AS-IS, review manually"
+              RESTORE_INCOMPLETE=1
+            fi
+          }
+          restore grug grug-secrets grug-secrets
+          restore grug registry-pull registry-pull-grug
+          restore grug-trial registry-pull registry-pull-trial
+          if [ "$RESTORE_INCOMPLETE" = "0" ]; then
+            echo "restored pre-deploy secret state (exact, delete-then-create)" >> "$GITHUB_STEP_SUMMARY"
+          else
+            echo "ROLLBACK INCOMPLETE: one or more secrets could not be verified/restored - review manually" >> "$GITHUB_STEP_SUMMARY"
+          fi
+          # IMAGE + ENV + SECRET rollback (the issue's digest-pair scope;
+          # Argo/release-state rollback was explicitly out of scope). A
+          # k8s/ manifest regression is NOT undone here - the warning
+          # below fires when this merge touched k8s/, and the recovery is
+          # revert + redeploy.
+          # Container names per the live manifests: webhook/webhook,
+          # api/webhook (historical), consumer/consumer, poller/poller.
+          kubectl -n grug set image deploy/grug-webhook webhook="$W"
+          kubectl -n grug set image deploy/grug-api webhook="$A"
+          kubectl -n grug set image deploy/grug-consumer consumer="$W"
+          kubectl -n grug set image cronjob/grug-poller poller="$W"
+          kubectl -n grug-trial set image cronjob/grug-trial-janitor janitor="$W"
+          # Image-bearing ENV vars are pins too (codex r4): the Smasher
+          # sandbox job image rides GRUG_SMASHER_JOB_IMAGE on webhook +
+          # consumer - set image never touches env.
+          kubectl -n grug set env deploy/grug-webhook GRUG_SMASHER_JOB_IMAGE="$W"
+          kubectl -n grug set env deploy/grug-consumer GRUG_SMASHER_JOB_IMAGE="$W"
+          # set image is a no-op when digests match (a config-only bad
+          # deploy) - force pod restarts so the restored secret is
+          # actually mounted.
+          for d in grug-webhook grug-api grug-consumer; do
+            kubectl -n grug rollout restart "deploy/$d"
+          done
+          for d in grug-webhook grug-api grug-consumer; do
+            kubectl -n grug rollout status "deploy/$d" --timeout=180s
+          done
+          kubectl -n grug annotate --overwrite \
+            deploy/grug-webhook deploy/grug-api deploy/grug-consumer cronjob/grug-poller \
+            "grug.dev/image-source=rollback-last-good" \
+            "grug.dev/rolled-back-from=${GITHUB_SHA}"
+          if [ -n "$NODE_IP" ]; then
+            phase=$([ "${RESTORE_INCOMPLETE:-0}" = "0" ] && echo completed || echo incomplete)
+            printf 'grug.deploy.rollback:1|c|#env:prod,trigger:auto,phase:%s' "$phase" \
+              | timeout 5 bash -c "cat > /dev/udp/${NODE_IP}/8125" || true
+          fi
+          if git diff-tree --no-commit-id --name-only -r "${GITHUB_SHA}" | grep -q '^k8s/'; then
+            echo "::warning::this merge also changed k8s/ manifests - rollback restored IMAGES ONLY; the applied config may still be bad (ADR-0017 image-only contract). Revert + redeploy if the failure was config-shaped."
+          fi
+          echo "::error::deploy FAILED (apply or synthetic) - rolled back to last-good images. The bad merge is STILL ON MAIN: revert or fix forward."
+          echo "ROLLED BACK to last-good (from $(kubectl -n grug get configmap grug-last-good -o jsonpath='{.data.recorded_from_sha}'))" >> "$GITHUB_STEP_SUMMARY"
+          exit 1
+
+      - name: Emit deploy telemetry
+        if: always() && steps.synthetic.outcome == 'success'
+        run: |
+          # promoted-vs-rebuilt rate (#498 handoff): owned DogStatsD count
+          # via a node's agent hostPort; best-effort.
+          NODE_IP=$(kubectl get nodes -o jsonpath='{.items[0].status.addresses[?(@.type=="InternalIP")].address}' 2>/dev/null || echo "")
+          if [ -n "$NODE_IP" ] && [ -n "${IMAGE_SOURCE:-}" ]; then
+            src=$(printf '%s' "$IMAGE_SOURCE" | tr -cd 'a-z0-9-' | head -c 40)
+            printf 'grug.deploy.completed:1|c|#env:prod,source:%s' "$src" \
+              | timeout 5 bash -c "cat > /dev/udp/${NODE_IP}/8125" || true
+          fi
+
       - name: Cleanup
         if: always()
-        run: rm -f "$HOME/.kube/config"
+        run: rm -f "$HOME/.kube/config" "$RUNNER_TEMP"/*.pre.json "$RUNNER_TEMP"/*.absent "$RUNNER_TEMP"/*.snap-err
