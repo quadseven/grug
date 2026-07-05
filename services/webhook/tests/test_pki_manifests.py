@@ -10,9 +10,9 @@ pins the contract values a well-meaning cleanup would break:
 - The poller must NOT receive the static AWS key pair: env credentials
   out-rank credential_process in the SDK chain, silently bypassing the
   exact path this tracer proves.
-- The credential_process line must pass --intermediates (the trust anchor
-  is the offline ROOT; ca.crt from the CA-backed ClusterIssuer carries the
-  signing intermediate - see grug-aws-config.yaml for the tls.crt nuance).
+- The credential_process line must pass --intermediates FROM THE tls.crt
+  BUNDLE (the trust anchor is the offline ROOT; ca.crt here is the ROOT,
+  not the intermediate - live-debugged, see grug-aws-config.yaml).
 """
 
 from __future__ import annotations
@@ -149,7 +149,9 @@ def test_paths_and_secret_names_are_cross_derived_not_coincidental():
     # credential_process paths = <pki mount>/<tls files>.
     line = next(l for l in cm["data"][data_key].splitlines() if l.startswith("credential_process"))
     pki_mount = mounts["grug-pki"]["mountPath"]
-    for flag, fname in (("--certificate", "tls.crt"), ("--private-key", "tls.key"), ("--intermediates", "ca.crt")):
+    # --intermediates = the tls.crt BUNDLE, never ca.crt: in this issuer
+    # topology ca.crt is the ROOT and the chain 403s (live-debugged #388).
+    for flag, fname in (("--certificate", "tls.crt"), ("--private-key", "tls.key"), ("--intermediates", "tls.crt")):
         assert f"{flag} {pki_mount}/{fname}" in line
 
 
