@@ -577,7 +577,7 @@ def list_ledger_rows(repo: str, limit: int | None = None) -> list[dict[str, Any]
         rows = conn.execute(
             f"""
             SELECT pk, sk, data FROM grug_kv
-            WHERE pk = %s AND {TTL_LIVE}
+            WHERE pk = %s AND sk <> 'PRACTICES' AND {TTL_LIVE}
             ORDER BY sk COLLATE "C" ASC
             """,
             (_ledger_pk(repo),),

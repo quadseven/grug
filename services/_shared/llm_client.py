@@ -702,8 +702,16 @@ def _team_practices_block(pr_context: Optional[PrContext]) -> str:
         from adapters.pg_install_store import get_repo_practices  # type: ignore
         from best_practices import practices_block, practices_from_dicts  # type: ignore
         rows = get_repo_practices(str(pr_context["repo"]))
-        return practices_block(practices_from_dicts(rows)) if rows else ""
-    except Exception:  # noqa: BLE001 - practices never break a review
+        if not rows:
+            return ""
+        block = practices_block(practices_from_dicts(rows))
+        # Redact secret-shaped values (#541 Qodo): the block is ledger-derived
+        # and now rides the SYSTEM prompt to a third-party backend - a finding
+        # could quote a committed credential. Same guard the user content uses.
+        return _redact_secrets(block) if block else ""
+    except Exception as e:  # noqa: BLE001 - practices never break a review, but log
+        log.warning("team_practices_fetch_failed", extra={
+            "repo": str(pr_context.get("repo", "")), "kind": type(e).__name__})
         return ""
 
 
