@@ -27,16 +27,20 @@ and the escape hatch should be seconds, not minutes.
    workflow_dispatch. The anchor's digest
    manifests are protected from registry retention by the live-cluster
    reference rule (and by their merge-sha tags).
-2. **Synthetic self-test after apply**: /livez + /readyz on both
-   services (port-forward from the runner - no public round-trip
-   dependency), a SIGNED ping delivery through the full auth stack (CF
-   shared-secret middleware + HMAC verify + the SSM secret fetch that
-   proves Roles Anywhere creds work in the new pods; ping dispatches
-   nothing = side-effect-free, the #368 proof mechanics automated), then
-   a 60s soak asserting zero container restarts and re-probed health.
-   The soak is the OWNED stand-in for the "DD error-rate window" idea:
-   the deploy role deliberately has no DD keys (least privilege), and
-   restarts+readiness catch the same crash classes.
+2. **Synthetic self-test after apply.** What the deploy ALREADY proves
+   before the synthetic: `kubectl rollout status` gates on the
+   readinessProbe (/readyz) + livenessProbe (/livez) of the new pods, and
+   the poller-smoke Job proves the image boots + Roles Anywhere identity
+   + SSM secret access. The synthetic adds the signal those don't, and it
+   is deliberately API-ONLY (kubelet port-forward/exec/logs are
+   unreachable on our BYON nodes - the same reason `kubectl logs` is dead
+   here; the first cut used port-forward and false-rolled-back two
+   healthy deploys before this was corrected): a 60s SOAK asserting zero
+   container restarts (a pod that went Ready then crash-loops) + a
+   post-soak Available recheck on all workloads, plus a best-effort
+   public-edge curl (warn-only; the DD uptime synthetic is the
+   authoritative external alarm). The soak is the OWNED stand-in for the
+   'DD error-rate window' - the deploy role has no DD keys by design.
 3. **Auto-rollback on ANY post-anchor failure** (a failed apply/rollout/
    smoke - captured via continue-on-error - or a failed synthetic):
    re-apply the anchored digests
