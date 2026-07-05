@@ -178,13 +178,9 @@ jobs:
             exit 1
           fi
           seed grug-secrets "$ENVF"
-          # #389 RETIREMENT: the static key, its reserve Secret, the #386
-          # rotator (CronJob + Secret + IAM user), and the SSM key params
-          # are GONE - the fleet authenticates via Roles Anywhere only.
-          # One-time live cleanup (idempotent; #507 removes these lines +
-          # the completeness-test exemption after the first observed run):
-          kubectl -n grug delete secret grug-aws-static-key grug-rotator-secret --ignore-not-found
-          kubectl -n grug delete cronjob grug-key-rotator --ignore-not-found
+          # #389 RETIREMENT: the fleet authenticates via Roles Anywhere
+          # only; the static-key world (Secrets, rotator, IAM users, SSM
+          # params) was deleted and verified gone (#507).
           kubectl -n grug create secret docker-registry registry-pull \
             --docker-server="$REGISTRY_HOST" \
             --docker-username="$REGISTRY_USERNAME" \

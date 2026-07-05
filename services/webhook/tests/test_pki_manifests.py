@@ -236,16 +236,11 @@ def test_static_key_apparatus_is_fully_retired():
     # Guard the guard: a wrong path here silently yields zero files and
     # the workflow leg of the scan goes dead (it DID - audit #506-A).
     assert workflows.is_dir(), workflows
-    # LINE-based scan with LINE-based exemption (audit #506-B: a needle-
-    # level exemption masked every same-needle line in the file - a
-    # re-added seed block would have sailed through). Only the sanctioned
-    # one-time --ignore-not-found cleanup lines are exempt (#507 removes
-    # them + this exemption together).
+    # LINE-based scan, ZERO exemptions (#507: the one-time cleanup lines
+    # are gone after the observed post-retirement deploy).
     for root in (K8S, workflows):
         for f in sorted(root.glob("*.y*ml")):
             for lineno, line in enumerate(f.read_text().splitlines(), 1):
-                if f.name == "deploy.k8s.yml" and "--ignore-not-found" in line:
-                    continue
                 for needle in forbidden:
                     if needle in line:
                         offenders.append(f"{f.name}:{lineno}: {needle}")
