@@ -319,10 +319,11 @@ digest pair that was running before the last deploy) - no rebuild:
   (pages Discord via the '[grug] Deploy auto-rollback fired' monitor),
   and fails the run. The bad merge is STILL ON MAIN - revert or fix
   forward, then let the next deploy re-prove itself.
-- **IMAGE-ONLY contract**: rollback restores the previous digests under
-  the CURRENT applied config - a k8s/ manifest or secret regression needs
-  revert + redeploy instead (the rollback step warns when the merge
-  touched k8s/).
+- **Contract**: auto-rollback restores the previous digests AND the
+  pre-seed grug-secrets snapshot (with forced pod restarts); k8s/
+  manifest regressions are NOT undone (the step warns when the merge
+  touched k8s/) - revert + redeploy for those. The manual path is
+  image-only (no snapshot exists in a later run).
 - **Manual one-click**: Actions -> deploy.rollback -> Run workflow (main).
   Same re-apply; safe to drill after a good deploy (anchor == running
   images = no-op rollout).

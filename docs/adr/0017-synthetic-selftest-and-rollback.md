@@ -52,11 +52,14 @@ and the escape hatch should be seconds, not minutes.
 
 ### What rollback does NOT cover (image-only contract)
 
-The anchor records DIGESTS, not release state: rollback restores the
-previous images under the CURRENT applied manifests/config/secrets. A
-regression in k8s/ manifests or the secret seed is NOT undone - the
-rollback step warns when the failing merge touched k8s/, and the
-recovery for config-shaped failures is revert + redeploy. Full
+The anchor records DIGESTS plus one durable object: the auto-rollback
+also restores the pre-seed grug-secrets snapshot (the one Secret this
+run destructively mutates from SSM) and force-restarts the pods so it
+mounts. Everything else applied from k8s/ (manifests, the RA ConfigMap)
+is NOT undone - the rollback step warns when the failing merge touched
+k8s/, and the recovery for manifest-shaped failures is revert +
+redeploy. The MANUAL deploy.rollback.yml path is image-only (a later
+run has no snapshot). Full
 release-state rollback (rendered-manifest snapshots) is deliberately
 rejected at this scale - it is the Argo/GitOps threshold the issue
 excluded.
