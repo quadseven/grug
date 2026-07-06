@@ -33,7 +33,12 @@ from pathlib import Path
 from ledger import parse_jsonl
 
 from .corpus import build_cases, rows_from_store
-from .gate import BASELINE_PATH, compute_prompt_sha, load_baseline
+from .gate import (
+    BASELINE_PATH,
+    compute_prompt_sha,
+    load_baseline,
+    merge_baseline,
+)
 from .runner import run_eval
 from .scoring import EvalReport, compare_to_baseline, score, to_baseline_dict
 
@@ -156,27 +161,13 @@ def main(argv: list[str] | None = None) -> int:
             report, prompt_sha=compute_prompt_sha(), backend=backend.name
         )
         if BASELINE_PATH.exists():
-            existing = load_baseline()
-            if existing.get("prompt_sha") == fresh["prompt_sha"]:
-                # Same prompt: keep other backends' recorded scores and
-                # refresh this backend's.
-                fresh["backends"] = {
-                    **existing.get("backends", {}),
-                    **fresh["backends"],
-                }
-            else:
-                # The prompt CHANGED: other backends' scores describe the
-                # old prompt - carrying them forward under the new
-                # prompt_sha would re-bless stale data as fresh.
-                dropped = sorted(
-                    set(existing.get("backends", {})) - set(fresh["backends"])
+            fresh, dropped = merge_baseline(load_baseline(), fresh)
+            if dropped:
+                print(
+                    "prompt changed since the last record - dropping "
+                    f"stale backend baseline(s): {', '.join(dropped)} "
+                    "(re-record them against the new prompt)"
                 )
-                if dropped:
-                    print(
-                        "prompt changed since the last record - dropping "
-                        f"stale backend baseline(s): {', '.join(dropped)} "
-                        "(re-record them against the new prompt)"
-                    )
         BASELINE_PATH.write_text(json.dumps(fresh, indent=2, sort_keys=True) + "\n")
         print(f"baseline recorded -> {BASELINE_PATH}")
         return 0

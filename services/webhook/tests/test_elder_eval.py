@@ -21,6 +21,7 @@ from elder_eval.gate import (
     BASELINE_PATH,
     compute_prompt_sha,
     load_baseline,
+    merge_baseline,
 )
 from elder_eval.runner import classes_for_findings, diff_to_hunks
 from elder_eval.scoring import (
@@ -196,13 +197,14 @@ def test_score_noise_counts_fp_only_emissions():
     replays = {
         "githumps/grug#7": CaseReplay(
             case_id="githumps/grug#7",
-            # 1 noise emission (known-FP cell) + 3 other findings.
-            emitted={"silent-failure": 1, "correctness": 2, "performance": 1},
+            # 3 noise emissions (known-FP cell, counted PER FINDING not
+            # per class) + 3 other findings.
+            emitted={"silent-failure": 3, "correctness": 2, "performance": 1},
             errored=False,
         ),
     }
     report = score(cases, replays)
-    assert abs(report.noise_rate - 1 / 4) < 1e-9
+    assert abs(report.noise_rate - 3 / 6) < 1e-9
 
 
 def test_score_noise_vacuous_zero_when_nothing_emitted():
@@ -348,6 +350,89 @@ def test_compare_to_baseline_tolerates_within_tolerance():
         compare_to_baseline(report, baseline["backends"]["cave"], catch_tolerance=0.5)
         == []
     )
+
+
+def test_score_raises_on_orphan_replay():
+    """A replay whose case_id matches no case would silently vanish from
+    every metric - the join-key-drift tripwire must raise instead."""
+    import pytest
+
+    cases = build_cases([_row(1, "correctness")])
+    orphan = {
+        "githumps/grug#999": CaseReplay(
+            case_id="githumps/grug#999", emitted={}, errored=False
+        ),
+    }
+    with pytest.raises(ValueError, match="unknown cases"):
+        score(cases, orphan)
+
+
+def test_score_case_with_no_replay_is_errored():
+    """A case the replays dict never mentions did not run - it must land
+    in errored_cases, not silently shrink the corpus."""
+    cases = build_cases([_row(1, "correctness")])
+    report = score(cases, {})
+    assert report.errored_cases == ("githumps/grug#1",)
+    assert report.all_errored
+
+
+def test_merge_baseline_same_prompt_keeps_other_backends():
+    existing = {
+        "prompt_sha": "abc",
+        "backends": {"openrouter": {"overall_catch": 0.5}, "sparkles": {"overall_catch": 0.1}},
+    }
+    fresh = {
+        "prompt_sha": "abc",
+        "backends": {"sparkles": {"overall_catch": 0.2}},
+    }
+    merged, dropped = merge_baseline(existing, fresh)
+    assert dropped == []
+    assert merged["backends"]["openrouter"] == {"overall_catch": 0.5}
+    assert merged["backends"]["sparkles"] == {"overall_catch": 0.2}
+
+
+def test_merge_baseline_changed_prompt_drops_stale_backends():
+    """Other backends' scores describe the OLD prompt - carrying them
+    under the new prompt_sha would re-bless stale data as fresh."""
+    existing = {
+        "prompt_sha": "old",
+        "backends": {"openrouter": {"overall_catch": 0.5}, "sparkles": {"overall_catch": 0.1}},
+    }
+    fresh = {
+        "prompt_sha": "new",
+        "backends": {"sparkles": {"overall_catch": 0.2}},
+    }
+    merged, dropped = merge_baseline(existing, fresh)
+    assert dropped == ["openrouter"]
+    assert set(merged["backends"]) == {"sparkles"}
+    assert merged["prompt_sha"] == "new"
+
+
+def test_run_case_parse_failure_is_errored(monkeypatch):
+    """A broken/unparseable LLM response must be errored=True, never a
+    fabricated 'Elder found nothing' - a fake zero recorded into the
+    baseline would bless a broken parser as real behavior forever."""
+    import httpx
+
+    from elder_eval import runner
+    from sast_benchmark.backends import BenchBackend
+
+    (case,) = build_cases([_row(1, "correctness")])
+    backend = BenchBackend(name="fake", url="http://invalid", model="m", api_key="")
+    monkeypatch.setattr(
+        runner, "_post",
+        lambda b, m: httpx.Response(
+            200, content=b"not json at all",
+            request=httpx.Request("POST", "http://invalid"),
+        ),
+    )
+    diff = (
+        "diff --git a/x.py b/x.py\n--- a/x.py\n+++ b/x.py\n"
+        "@@ -1 +1,2 @@\n a = 1\n+b = 2\n"
+    )
+    replay = runner.run_case(backend, case, diff)
+    assert replay.errored
+    assert replay.emitted == {}
 
 
 # --- the CI gate: prompt changes require a re-recorded baseline --------------
