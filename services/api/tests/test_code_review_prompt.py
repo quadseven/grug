@@ -188,3 +188,19 @@ def test_tls_verification_disabled_rule_present():
     MITM-able link — pin the CA instead (infrastructure #1390/#1391)."""
     assert any(r.name == "tls-verification-disabled" for r in crp.RULES)
     assert "tls-verification-disabled" in crp.build_system_prompt()
+
+
+def test_positional_parse_drops_holes_rule_present():
+    """Weekly harvest: a parser that keeps only matching tokens (dropping
+    NA/empty holes) then pairs the list positionally with a parallel list
+    shifts every slot after the hole onto the wrong element — silent data
+    corruption. Keep placeholders and pair by position (somatic-scripts
+    #1782)."""
+    assert any(
+        r.name == "positional-parse-drops-holes-shifts-alignment"
+        for r in crp.RULES
+    )
+    assert (
+        "positional-parse-drops-holes-shifts-alignment"
+        in crp.build_system_prompt()
+    )
