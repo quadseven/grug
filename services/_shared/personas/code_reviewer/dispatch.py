@@ -291,7 +291,7 @@ def _summary_markdown(
         icon = severity_icon.get(f.severity, "•")
         rows.append(
             f"| {icon} {f.severity} | `{f.file}` | {f.line} | "
-            f"`{f.rule_name}` | {f.message} |"
+            f"`{f.rule_name}` | {_defused(f.message)} |"
         )
     table = "\n".join(rows)
     return title, f"{table}{held}\n\n{_consolidated_agent_prompt(evaluation)}"
@@ -355,6 +355,15 @@ def _details_block(summary: str, content: str) -> str:
     )
 
 
+def _defused(prose: str) -> str:
+    """Neutralize fence-capable backtick runs in PROSE surfaces (comment
+    head, table cells): an unterminated ``` in a model message would open
+    a fence that swallows the rest of the body - including the dedup
+    marker and the suggestion block. Inline code spans (1-2 backticks)
+    render untouched."""
+    return re.sub(r"`{3,}", "``", prose)
+
+
 def _fenced(text: str) -> str:
     """Wrap text in a code fence GUARANTEED to contain it: the fence is one
     backtick longer than the longest backtick run inside (CommonMark).
@@ -393,7 +402,7 @@ def _inline_comment_body(f: Finding) -> str:
     chip = f"**{f.severity.upper()} · `{f.rule_name}`**"
     if f.effort in _EFFORT_LABELS:
         chip += f" · {_EFFORT_LABELS[f.effort]}"
-    head = f"{chip}\n\n{f.message}"
+    head = f"{chip}\n\n{_defused(f.message)}"
     if (
         f.suggestion
         and "```" not in f.suggestion
