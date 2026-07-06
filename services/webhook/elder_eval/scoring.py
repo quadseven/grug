@@ -1,0 +1,153 @@
+"""Pure scoring for the Elder replay eval (#361 slice 2, #537).
+
+NO LLM, NO I/O, fully deterministic - the CI-safe core, unit-tested with
+synthetic ledger rows + replays. The live runner produces `CaseReplay`s;
+this module turns them into per-class catch-rate + noise-rate and
+compares against the committed baseline.
+
+Metrics:
+- CATCH (per ledger class, over non-errored cases that expect it): the
+  replay emitted >= 1 finding in any of the class's bridged Elder classes.
+- OVERALL CATCH (micro): caught (case, class) cells / expected cells.
+- NOISE: replay findings landing on (case, class) cells the corpus knows
+  ONLY as false positives / all replay findings. 0.0 when nothing was
+  emitted (vacuously noise-free, mirroring the SAST precision convention).
+- HONEST-ZERO RULE: an errored case is EXCLUDED from every denominator
+  and listed in `errored_cases` - a non-run is not a miss, and an
+  all-errored sweep must never record as a valid (zero) baseline.
+"""
+
+from __future__ import annotations
+
+from dataclasses import dataclass
+from typing import Mapping, Sequence
+
+from .corpus import EvalCase
+
+
+@dataclass(frozen=True)
+class CaseReplay:
+    """One case's replay outcome: ELDER-normalized class -> finding count.
+    `errored` = the replay could not run (fetch/transport/parse failure) -
+    distinguishable from "Elder found nothing" ({} with errored=False)."""
+
+    case_id: str
+    emitted: Mapping[str, int]
+    errored: bool
+
+
+@dataclass(frozen=True)
+class EvalReport:
+    """Scored outcome over the corpus. `per_class_catch` keys are LEDGER
+    classes (the ground-truth vocabulary). Empty when every case errored."""
+
+    per_class_catch: dict[str, float]
+    overall_catch: float
+    noise_rate: float
+    errored_cases: tuple[str, ...]
+    out_of_taxonomy: dict[str, int]
+    cases_scored: int
+
+    @property
+    def all_errored(self) -> bool:
+        """True when NOTHING scored - the run is broken, not a result."""
+        return self.cases_scored == 0 and bool(self.errored_cases)
+
+
+def score(
+    cases: Sequence[EvalCase], replays: Mapping[str, CaseReplay]
+) -> EvalReport:
+    """Join cases with their replays and compute the report. A case with no
+    replay entry counts as errored (it did not run)."""
+    expected_cells: dict[str, int] = {}
+    caught_cells: dict[str, int] = {}
+    noise = 0
+    total_emitted = 0
+    errored: list[str] = []
+    out_of_taxonomy: dict[str, int] = {}
+    scored = 0
+
+    for case in cases:
+        for cls, n in case.out_of_taxonomy.items():
+            out_of_taxonomy[cls] = out_of_taxonomy.get(cls, 0) + n
+        replay = replays.get(case.case_id)
+        if replay is None or replay.errored:
+            errored.append(case.case_id)
+            continue
+        scored += 1
+        emitted_classes = {c for c, n in replay.emitted.items() if n > 0}
+        for ledger_cls, elder_set in case.expected_classes.items():
+            expected_cells[ledger_cls] = expected_cells.get(ledger_cls, 0) + 1
+            if emitted_classes & elder_set:
+                caught_cells[ledger_cls] = caught_cells.get(ledger_cls, 0) + 1
+        for elder_cls, n in replay.emitted.items():
+            total_emitted += n
+            if elder_cls in case.fp_only_classes:
+                noise += n
+
+    per_class = {
+        cls: caught_cells.get(cls, 0) / expected_cells[cls]
+        for cls in expected_cells
+    }
+    total_expected = sum(expected_cells.values())
+    return EvalReport(
+        per_class_catch=per_class,
+        overall_catch=(
+            sum(caught_cells.values()) / total_expected if total_expected else 0.0
+        ),
+        noise_rate=noise / total_emitted if total_emitted else 0.0,
+        errored_cases=tuple(errored),
+        out_of_taxonomy=out_of_taxonomy,
+        cases_scored=scored,
+    )
+
+
+def to_baseline_dict(report: EvalReport, *, prompt_sha: str, backend: str) -> dict:
+    """Serialize one backend's report as the committed-baseline shape. The
+    top level carries `prompt_sha` - the #537 CI gate key."""
+    return {
+        "prompt_sha": prompt_sha,
+        "backends": {
+            backend: {
+                "overall_catch": report.overall_catch,
+                "per_class_catch": dict(sorted(report.per_class_catch.items())),
+                "noise_rate": report.noise_rate,
+                "cases_scored": report.cases_scored,
+                "errored_cases": sorted(report.errored_cases),
+            }
+        },
+    }
+
+
+def compare_to_baseline(
+    report: EvalReport,
+    backend_baseline: dict,
+    *,
+    catch_tolerance: float = 0.05,
+    noise_tolerance: float = 0.05,
+) -> list[str]:
+    """Regressions of `report` vs one backend's recorded scores. Empty list
+    = no regression. Only classes PRESENT in the baseline are compared (a
+    corpus can grow new classes without failing the check); a baseline
+    class missing from the new report IS a regression (coverage lost)."""
+    regressions: list[str] = []
+    base_overall = float(backend_baseline.get("overall_catch", 0.0))
+    if report.overall_catch < base_overall - catch_tolerance:
+        regressions.append(
+            f"overall_catch regressed {base_overall:.2f} -> "
+            f"{report.overall_catch:.2f}"
+        )
+    base_noise = float(backend_baseline.get("noise_rate", 0.0))
+    if report.noise_rate > base_noise + noise_tolerance:
+        regressions.append(
+            f"noise_rate regressed {base_noise:.2f} -> {report.noise_rate:.2f}"
+        )
+    for cls, base_catch in backend_baseline.get("per_class_catch", {}).items():
+        new = report.per_class_catch.get(cls)
+        if new is None:
+            regressions.append(f"class {cls} vanished from the report")
+        elif new < float(base_catch) - catch_tolerance:
+            regressions.append(
+                f"class {cls} catch regressed {float(base_catch):.2f} -> {new:.2f}"
+            )
+    return regressions

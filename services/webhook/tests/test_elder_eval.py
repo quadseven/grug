@@ -1,0 +1,385 @@
+"""Pure tests for the Elder replay eval harness (#361 slice 2, #537).
+
+NO LLM, NO network - these run in the normal CI test suite. They feed
+SYNTHETIC ledger rows + replay results into the pure corpus/scoring core
+and assert per-class catch-rate, noise-rate, the out-of-taxonomy
+exclusion, baseline-regression detection, and the prompt-sha CI gate.
+The live replay (real backends over real PR diffs) is the on-demand
+`benchmark.elder-eval.yml` job, not these tests.
+"""
+
+from __future__ import annotations
+
+import hashlib
+
+from elder_eval.corpus import (
+    build_cases,
+    expected_elder_classes,
+    normalize_class,
+)
+from elder_eval.gate import (
+    BASELINE_PATH,
+    compute_prompt_sha,
+    load_baseline,
+)
+from elder_eval.runner import classes_for_findings, diff_to_hunks
+from elder_eval.scoring import (
+    CaseReplay,
+    compare_to_baseline,
+    score,
+    to_baseline_dict,
+)
+from ledger import LedgerRow
+from llm_client import Finding
+
+
+def _row(
+    pr: int,
+    finding_class: str,
+    verdict: str = "fixed",
+    reviewer: str = "codex",
+    severity: str = "HIGH",
+    repo: str = "githumps/grug",
+) -> LedgerRow:
+    return LedgerRow(
+        repo=repo,
+        pr=pr,
+        reviewer=reviewer,
+        severity=severity,
+        finding_class=finding_class,
+        finding=f"synthetic {finding_class} finding",
+        verdict=verdict,
+    )
+
+
+# --- class normalization + taxonomy bridge ---------------------------------
+
+
+def test_normalize_class_kebabs_labels():
+    assert normalize_class("silent failure") == "silent-failure"
+    assert normalize_class("Test Coverage") == "test-coverage"
+    assert normalize_class("silent-failure") == "silent-failure"
+
+
+def test_expected_elder_classes_identity_and_aliases():
+    # Identity: ledger class that IS an Elder class (modulo kebab).
+    assert expected_elder_classes("silent-failure") == frozenset({"silent-failure"})
+    assert expected_elder_classes("correctness") == frozenset({"correctness"})
+    # Aliases: ledger vocabulary -> Elder vocabulary.
+    assert expected_elder_classes("test-gap") == frozenset(
+        {"test-coverage", "test-fidelity"}
+    )
+    assert expected_elder_classes("security-scope") == frozenset({"security"})
+
+
+def test_expected_elder_classes_out_of_taxonomy_is_empty():
+    # Elder has no way to express these - they must be EXCLUDED from the
+    # denominator, never scored as misses.
+    assert expected_elder_classes("doc-truth") == frozenset()
+    assert expected_elder_classes("iac-hygiene") == frozenset()
+
+
+# --- corpus construction ----------------------------------------------------
+
+
+def test_build_cases_groups_by_repo_pr_and_splits_verdicts():
+    rows = [
+        _row(100, "silent-failure", verdict="fixed"),
+        _row(100, "correctness", verdict="declined"),
+        _row(100, "correctness", verdict="false-positive", reviewer="lore-bot"),
+        _row(200, "test-gap", verdict="fixed"),
+    ]
+    cases = build_cases(rows)
+    assert [c.pr for c in cases] == [100, 200]
+    c100 = cases[0]
+    # Accepted classes (fixed + declined) land in expected_classes.
+    assert set(c100.expected_classes) == {"silent-failure", "correctness"}
+    # correctness has an accepted row on this case, so the FP row does NOT
+    # make it fp-only.
+    assert "correctness" not in c100.fp_only_classes
+
+
+def test_build_cases_fp_only_class_feeds_noise():
+    rows = [
+        _row(300, "silent-failure", verdict="false-positive"),
+        _row(300, "correctness", verdict="fixed"),
+    ]
+    (case,) = build_cases(rows)
+    # silent-failure on PR 300 is known ONLY as a false positive - a replay
+    # emission there is noise. Stored in ELDER-normalized form.
+    assert "silent-failure" in case.fp_only_classes
+    assert set(case.expected_classes) == {"correctness"}
+
+
+def test_build_cases_counts_out_of_taxonomy():
+    rows = [
+        _row(400, "doc-truth", verdict="fixed"),
+        _row(400, "doc-truth", verdict="fixed"),
+        _row(400, "correctness", verdict="fixed"),
+    ]
+    (case,) = build_cases(rows)
+    assert case.out_of_taxonomy == {"doc-truth": 2}
+    assert set(case.expected_classes) == {"correctness"}
+
+
+# --- scoring: catch-rate ----------------------------------------------------
+
+
+def test_score_catch_rate_per_class():
+    rows = [
+        _row(1, "silent-failure"),
+        _row(2, "silent-failure"),
+        _row(2, "correctness"),
+    ]
+    cases = build_cases(rows)
+    replays = {
+        "githumps/grug#1": CaseReplay(
+            case_id="githumps/grug#1",
+            emitted={"silent-failure": 1},
+            errored=False,
+        ),
+        "githumps/grug#2": CaseReplay(
+            case_id="githumps/grug#2",
+            emitted={"correctness": 2},
+            errored=False,
+        ),
+    }
+    report = score(cases, replays)
+    # silent-failure expected on 2 cases, caught on 1.
+    assert report.per_class_catch["silent-failure"] == 0.5
+    # correctness expected on 1 case, caught on it.
+    assert report.per_class_catch["correctness"] == 1.0
+    # Micro overall: 2 caught cells / 3 expected cells.
+    assert abs(report.overall_catch - 2 / 3) < 1e-9
+
+
+def test_score_catch_via_alias():
+    # Ledger says test-gap; Elder can only say test-coverage/test-fidelity.
+    rows = [_row(5, "test-gap")]
+    cases = build_cases(rows)
+    replays = {
+        "githumps/grug#5": CaseReplay(
+            case_id="githumps/grug#5",
+            emitted={"test-coverage": 1},
+            errored=False,
+        ),
+    }
+    report = score(cases, replays)
+    assert report.per_class_catch["test-gap"] == 1.0
+
+
+# --- scoring: noise ---------------------------------------------------------
+
+
+def test_score_noise_counts_fp_only_emissions():
+    rows = [
+        _row(7, "silent-failure", verdict="false-positive"),
+        _row(7, "correctness", verdict="fixed"),
+    ]
+    cases = build_cases(rows)
+    replays = {
+        "githumps/grug#7": CaseReplay(
+            case_id="githumps/grug#7",
+            # 1 noise emission (known-FP cell) + 3 other findings.
+            emitted={"silent-failure": 1, "correctness": 2, "performance": 1},
+            errored=False,
+        ),
+    }
+    report = score(cases, replays)
+    assert abs(report.noise_rate - 1 / 4) < 1e-9
+
+
+def test_score_noise_vacuous_zero_when_nothing_emitted():
+    rows = [_row(8, "correctness")]
+    cases = build_cases(rows)
+    replays = {
+        "githumps/grug#8": CaseReplay(
+            case_id="githumps/grug#8", emitted={}, errored=False
+        ),
+    }
+    report = score(cases, replays)
+    assert report.noise_rate == 0.0
+    assert report.per_class_catch["correctness"] == 0.0
+
+
+# --- scoring: errored cases (honest-zero rule) ------------------------------
+
+
+def test_score_errored_case_excluded_from_denominators():
+    rows = [
+        _row(10, "correctness"),
+        _row(11, "correctness"),
+    ]
+    cases = build_cases(rows)
+    replays = {
+        "githumps/grug#10": CaseReplay(
+            case_id="githumps/grug#10", emitted={"correctness": 1}, errored=False
+        ),
+        "githumps/grug#11": CaseReplay(
+            case_id="githumps/grug#11", emitted={}, errored=True
+        ),
+    }
+    report = score(cases, replays)
+    # The errored case must NOT drag catch to 0.5 - it is not a miss, it is
+    # a non-run. It is reported, not scored.
+    assert report.per_class_catch["correctness"] == 1.0
+    assert report.errored_cases == ("githumps/grug#11",)
+
+
+def test_score_all_errored_guard():
+    rows = [_row(20, "correctness")]
+    cases = build_cases(rows)
+    replays = {
+        "githumps/grug#20": CaseReplay(
+            case_id="githumps/grug#20", emitted={}, errored=True
+        ),
+    }
+    report = score(cases, replays)
+    assert report.all_errored
+    # An all-errored run must never look like a valid baseline.
+    assert report.per_class_catch == {}
+
+
+# --- baseline round-trip + regression gate ----------------------------------
+
+
+def _report(rows, replays):
+    return score(build_cases(rows), replays)
+
+
+def test_baseline_roundtrip_and_no_regression_on_identical():
+    rows = [_row(1, "correctness")]
+    replays = {
+        "githumps/grug#1": CaseReplay(
+            case_id="githumps/grug#1", emitted={"correctness": 1}, errored=False
+        ),
+    }
+    report = _report(rows, replays)
+    baseline = to_baseline_dict(report, prompt_sha="abc", backend="cave")
+    assert baseline["prompt_sha"] == "abc"
+    assert compare_to_baseline(report, baseline["backends"]["cave"]) == []
+
+
+def test_compare_to_baseline_flags_catch_drop_and_noise_rise():
+    rows = [
+        _row(1, "correctness"),
+        _row(1, "silent-failure", verdict="false-positive"),
+    ]
+    good = {
+        "githumps/grug#1": CaseReplay(
+            case_id="githumps/grug#1", emitted={"correctness": 1}, errored=False
+        ),
+    }
+    bad = {
+        "githumps/grug#1": CaseReplay(
+            case_id="githumps/grug#1",
+            emitted={"silent-failure": 5},  # misses correctness, emits known FP
+            errored=False,
+        ),
+    }
+    baseline = to_baseline_dict(_report(rows, good), prompt_sha="abc", backend="cave")
+    regressions = compare_to_baseline(
+        _report(rows, bad), baseline["backends"]["cave"]
+    )
+    joined = " ".join(regressions)
+    assert "overall_catch" in joined
+    assert "noise_rate" in joined
+
+
+def test_compare_to_baseline_tolerates_within_tolerance():
+    rows = [_row(1, "correctness"), _row(2, "correctness")]
+    full = {
+        "githumps/grug#1": CaseReplay(
+            case_id="githumps/grug#1", emitted={"correctness": 1}, errored=False
+        ),
+        "githumps/grug#2": CaseReplay(
+            case_id="githumps/grug#2", emitted={"correctness": 1}, errored=False
+        ),
+    }
+    report = _report(rows, full)
+    baseline = to_baseline_dict(report, prompt_sha="abc", backend="cave")
+    # A drop smaller than the tolerance passes.
+    assert (
+        compare_to_baseline(report, baseline["backends"]["cave"], catch_tolerance=0.5)
+        == []
+    )
+
+
+# --- the CI gate: prompt changes require a re-recorded baseline --------------
+
+
+def test_prompt_sha_is_sha256_of_prompt_source():
+    import code_review_prompt
+
+    src = code_review_prompt.__file__
+    assert src is not None
+    expected = hashlib.sha256(open(src, "rb").read()).hexdigest()
+    assert compute_prompt_sha() == expected
+
+
+def test_baseline_exists_and_prompt_sha_matches():
+    """THE CI gate (#537): if this fails, code_review_prompt.py changed
+    without re-running the eval. Run:
+
+        python -m elder_eval --record   (with a bench backend configured)
+
+    and commit the refreshed elder_eval/baseline.json IN THE SAME PR as
+    the prompt change."""
+    assert BASELINE_PATH.exists(), (
+        "elder_eval/baseline.json missing - record it with "
+        "`python -m elder_eval --record`"
+    )
+    baseline = load_baseline()
+    assert baseline["prompt_sha"] == compute_prompt_sha(), (
+        "code_review_prompt.py changed but elder_eval/baseline.json was not "
+        "re-recorded - run `python -m elder_eval --record` and commit the "
+        "refreshed baseline in this PR"
+    )
+
+
+# --- runner pure bits (no network) -------------------------------------------
+
+
+def test_classes_for_findings_maps_rule_to_bug_class():
+    findings = (
+        Finding(
+            path="a.py", line=1, rule="sync-io-in-async",
+            severity="high", message="m",
+        ),
+        Finding(
+            path="a.py", line=2, rule="null-deref",
+            severity="high", message="m",
+        ),
+        Finding(
+            path="a.py", line=3, rule="off-by-one-or-bounds",
+            severity="low", message="m",
+        ),
+    )
+    classes = classes_for_findings(findings)
+    assert classes == {"async-blocker": 1, "correctness": 2}
+
+
+def test_classes_for_findings_unknown_rule_falls_back_to_rule_name():
+    findings = (
+        Finding(
+            path="a.py", line=1, rule="Some Novel Rule",
+            severity="low", message="m",
+        ),
+    )
+    assert classes_for_findings(findings) == {"some-novel-rule": 1}
+
+
+def test_diff_to_hunks_converts_unified_diff():
+    diff = (
+        "diff --git a/x.py b/x.py\n"
+        "--- a/x.py\n"
+        "+++ b/x.py\n"
+        "@@ -1,2 +1,3 @@\n"
+        " a = 1\n"
+        "+b = 2\n"
+        " c = 3\n"
+    )
+    hunks = diff_to_hunks(diff)
+    assert len(hunks) == 1
+    assert hunks[0].path == "x.py"
+    assert hunks[0].body.startswith("@@")
