@@ -169,10 +169,12 @@ def main(argv: list[str] | None = None) -> int:
         )
 
     if args.ab_few_shot:
-        from few_shot import exemplars_block
+        from few_shot import exemplars_block, exemplars_from_rows
         from ledger import accepted_findings_by_class
 
-        examples = exemplars_block(accepted_findings_by_class(list(rows)))
+        examples = exemplars_block(
+            exemplars_from_rows(accepted_findings_by_class(list(rows)))
+        )
         with_examples = score(
             all_cases, run_eval(backend, cases, token=token, few_shot=examples)
         )
