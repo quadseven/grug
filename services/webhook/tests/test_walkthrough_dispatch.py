@@ -8,9 +8,20 @@ from __future__ import annotations
 from unittest.mock import MagicMock, patch
 
 import httpx
+import pytest
 
 from personas.walkthrough import dispatch as wt_dispatch
 from personas.walkthrough.render import MARKER
+
+_OWN_APP_ID = "1"  # matches performed_via_github_app.id in the fixtures below
+
+
+@pytest.fixture(autouse=True)
+def _stub_own_app_id(monkeypatch):
+    """Every test exercises _find_marker_comment's own-app-identity check
+    (#554 peer review round 3) - stub it once rather than per-test, since
+    the real get_app_id() reads GITHUB_APP_ID_SSM (unset in this env)."""
+    monkeypatch.setattr(wt_dispatch, "get_app_id", lambda: _OWN_APP_ID)
 
 
 def _payload(pull_number: int = 7, head_sha: str = "a" * 40) -> dict:
@@ -570,3 +581,26 @@ def test_dispatch_ignores_decoy_marker_and_posts_fresh_comment(monkeypatch):
     assert out == {"persona": "walkthrough", "result": "degraded"}
     mock_patch.assert_not_called()
     assert MARKER in posted["body"]
+
+
+def test_find_marker_comment_ignores_different_app_decoy(monkeypatch):
+    """#554 peer review round 3 (codex): a bare non-null performed_via_
+    github_app check only proves SOME GitHub App posted the comment, not
+    that WE did - a decoy from a DIFFERENT installed app (own numeric ID
+    mismatched) must still be ignored, not just a human-authored one."""
+    def fake_get(url, **kwargs):
+        return _files_response([
+            {
+                "id": 111, "body": MARKER,
+                "performed_via_github_app": {"id": 999, "slug": "some-other-app"},
+            },
+            {
+                "id": 222, "body": MARKER,
+                "performed_via_github_app": {"id": int(_OWN_APP_ID), "slug": "grug"},
+            },
+        ])
+
+    with patch("httpx.get", side_effect=fake_get):
+        result = wt_dispatch._find_marker_comment("tok", "o", "r", 1)
+
+    assert result == 222

@@ -27,6 +27,15 @@ def _app_id() -> str:
     return _get_ssm_secure_string(os.environ["GITHUB_APP_ID_SSM"])
 
 
+def get_app_id() -> str:
+    """Public accessor for our OWN app's numeric GitHub App ID - needed
+    beyond JWT signing to verify a webhook comment's `performed_via_
+    github_app.id` is genuinely OURS, not merely "some GitHub App"
+    (#554 peer review round 3, codex: a decoy comment from a DIFFERENT
+    installed app would otherwise pass a bare non-null check)."""
+    return _app_id()
+
+
 def _app_private_key() -> str:
     from secrets_loader import _get_ssm_secure_string  # type: ignore
     return _get_ssm_secure_string(os.environ["GITHUB_APP_PRIVATE_KEY_SSM"])
