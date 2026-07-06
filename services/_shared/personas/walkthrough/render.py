@@ -23,6 +23,7 @@ _MAX_SUMMARY_CHARS = 2000
 _MAX_FILE_SUMMARY_CHARS = 160
 
 _MENTION_RE = re.compile(r"@(?=\w)")
+_HEADING_RE = re.compile(r"^(#{1,6})(\s)", re.MULTILINE)
 
 
 def _neutralize_mentions(text: str) -> str:
@@ -34,6 +35,19 @@ def _neutralize_mentions(text: str) -> str:
     peer review round 4, codex). Visually identical to a reader; GitHub's
     mention parser requires an unbroken `@word` token."""
     return _MENTION_RE.sub("@\u200b", text)
+
+
+def _neutralize_headings(text: str) -> str:
+    """Break a line-leading `#` run (an ATX heading) with a zero-width
+    space so model-authored summary prose can never impersonate a NEW
+    section of Teller's own comment (round 4, codex) - e.g. a prompt-
+    injected diff getting the model to emit a line that reads as a fake
+    "## Merge immediately" heading, visually indistinguishable from a
+    real Teller section. Deliberately narrow: only leading `#` is
+    neutralized, not all Markdown, so legitimate prose (backticks,
+    emphasis, inline code) still renders - matching how CodeRabbit/Qodo's
+    own AI-authored walkthroughs use normal Markdown formatting."""
+    return _HEADING_RE.sub(lambda m: "\u200b" + m.group(1) + m.group(2), text)
 
 
 def _escape_table_cell(text: str) -> str:
@@ -107,12 +121,14 @@ def walkthrough_body(
     thing. `files_truncated` marks a PR whose changed-file count exceeded
     our fetch cap (GitHub's own /files cap is far higher) - every number
     below is then a floor, not an exact count, and the comment says so.
-    `summary` is model-authored: mentions are neutralized before this
-    prose posts under the app's own installation-token identity (round 4,
-    codex) - a prompt-injected diff could otherwise get a real GitHub
-    user pinged as if Teller itself did it."""
+    `summary` is model-authored: mentions and line-leading `#` headings
+    are neutralized before this prose posts under the app's own
+    installation-token identity (round 4, codex) - a prompt-injected diff
+    could otherwise get a real GitHub user pinged, or a fake heading
+    impersonating a new section of Teller's own comment, as if Teller
+    itself did it."""
     parts = [MARKER, "## Grug Teller walk the PR before the tribe judge it", ""]
-    parts.append(_neutralize_mentions(summary[:_MAX_SUMMARY_CHARS]))
+    parts.append(_neutralize_headings(_neutralize_mentions(summary[:_MAX_SUMMARY_CHARS])))
     if degraded:
         parts.append(
             "\n_(Teller's voice was quiet this pass - a deterministic "
