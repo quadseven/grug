@@ -117,34 +117,13 @@ _LLMOBS_PAYLOAD_TRUNC_BYTES = 16 * 1024
 # format-specific first (AWS, GitHub, Slack), then the generic
 # "key=value" sweeps. False positives are acceptable; missing a real
 # secret is not.
-_SECRET_PATTERNS: tuple[tuple[re.Pattern[str], str], ...] = (
-    (re.compile(r"AKIA[0-9A-Z]{16}"), "[REDACTED:aws-access-key]"),
-    (re.compile(r"ghp_[A-Za-z0-9]{36,}"), "[REDACTED:github-pat]"),
-    (re.compile(r"ghs_[A-Za-z0-9]{36,}"), "[REDACTED:github-app-token]"),
-    (re.compile(r"github_pat_[A-Za-z0-9_]{82,}"), "[REDACTED:github-fine-grained-pat]"),
-    (re.compile(r"xox[baprs]-[A-Za-z0-9-]{10,}"), "[REDACTED:slack-token]"),
-    (re.compile(r"sk-[A-Za-z0-9]{32,}"), "[REDACTED:openai-style-key]"),
-    (re.compile(r"sk-or-v1-[A-Za-z0-9]{32,}"), "[REDACTED:openrouter-key]"),
-    (re.compile(r"-----BEGIN [A-Z ]*PRIVATE KEY-----[\s\S]*?-----END [A-Z ]*PRIVATE KEY-----"), "[REDACTED:pem-private-key]"),
-    # Generic `KEY=VALUE` env-var leak inside an added diff line.
-    # Min-length 8 catches `secret=hunter22` but not `key=42`; longer
-    # is too strict (real secrets like `secret12345` would slip).
-    (re.compile(
-        r'((?:password|passwd|secret|api[-_]?key|token|access[-_]?key)\s*[:=]\s*)["\']?[A-Za-z0-9_\-+/=]{8,}["\']?',
-        re.IGNORECASE,
-    ), r"\1[REDACTED:env-secret]"),
-)
-
-
-def _redact_secrets(text: str) -> str:
-    """Apply best-effort secret-pattern redaction. False positives are
-    acceptable (an `AKIA...`-shaped string in code that isn't an AWS
-    key still gets masked); missing a real secret is not. Patterns
-    target shapes most likely to appear in a PR diff: AWS/GH tokens,
-    Slack bot tokens, PEM private keys, `KEY=VALUE` env lines."""
-    for pattern, repl in _SECRET_PATTERNS:
-        text = pattern.sub(repl, text)
-    return text
+# The pattern set + redactor now live in the leaf module `redact` (#546:
+# the derived-block renderers must redact BEFORE their sanitizers
+# truncate, and importing llm_client from a pure module would be a
+# cycle/heavy-dep trap). Re-exported under the historical names so this
+# module's many call sites and tests are unchanged.
+from redact import SECRET_PATTERNS as _SECRET_PATTERNS  # noqa: F401
+from redact import redact_secrets as _redact_secrets
 
 
 def _redact_payload(payload: Any) -> Any:
