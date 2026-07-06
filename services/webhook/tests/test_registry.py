@@ -10,7 +10,10 @@ from personas import registry
 
 def test_registered_personas():
     keys = {p.key for p in registry.REGISTRY}
-    assert keys == {"tpm", "code_reviewer", "guard", "warder", "pulse", "smasher"}
+    assert keys == {
+        "tpm", "code_reviewer", "guard", "warder", "pulse", "smasher",
+        "walkthrough",
+    }
 
 
 def test_smasher_is_advisory_async_optin():

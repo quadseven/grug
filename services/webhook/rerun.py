@@ -34,6 +34,7 @@ from github_app_auth import with_install_token_retry
 from personas.code_reviewer.dispatch import dispatch_code_review
 from personas.guard.dispatch import dispatch_guard_review
 from personas.smasher.dispatch import dispatch_smasher_review
+from personas.walkthrough.dispatch import dispatch_walkthrough_review
 
 log = logging.getLogger(f"{os.getenv('DD_SERVICE', 'grug')}.rerun")
 
@@ -82,7 +83,8 @@ def enqueue_rerun(*, install_id: int, repo: str, pr_number: int, persona: str) -
 _CODE_REVIEWER = frozenset({"elder", "code_reviewer"})
 _GUARD = frozenset({"guard"})
 _SMASHER = frozenset({"smasher"})
-_RERUNNABLE = _CODE_REVIEWER | _GUARD | _SMASHER
+_TELLER = frozenset({"teller", "walkthrough"})
+_RERUNNABLE = _CODE_REVIEWER | _GUARD | _SMASHER | _TELLER
 
 
 def enqueue_ask(*, install_id: int, repo: str, pr_number: int, comment_id: int, question: str) -> None:
@@ -227,6 +229,9 @@ def _run_one(body: str) -> str:
         # Smasher is advisory-only (no blocking flag); the global master switch
         # is re-checked inside dispatch_smasher_review.
         dispatch_smasher_review(payload, blocking=False)
+    elif persona in _TELLER:
+        # Teller has no blocking mode (comment-only, no blocking_flag).
+        dispatch_walkthrough_review(payload, blocking=False)
     else:
         dispatch_code_review(
             payload, blocking=bool(cfg.get("code_reviewer_blocking", False)),

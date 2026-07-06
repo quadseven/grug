@@ -219,3 +219,12 @@ def test_get_install_token_non_json_body_raises_typed_error(_stub_secrets, caplo
 
     assert "7" in str(exc.value)
     assert "install_token_exchange_malformed_response" in caplog.text
+
+
+def test_get_app_id_exposes_the_private_accessor(_stub_secrets):
+    """#554 peer review round 3: Teller's marker-authorship check needs
+    OUR OWN app ID outside this module - get_app_id() is the public
+    call-through to the existing private _app_id()."""
+    import github_app_auth as gh
+
+    assert gh.get_app_id() == "12345"

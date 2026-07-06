@@ -625,6 +625,65 @@ def test_run_smasher_job_claims_namespaced_delivery_and_binds_smasher_row():
     assert out == {"persona": "smasher", "result": "pass"}
 
 
+def test_run_walkthrough_job_claims_namespaced_delivery_and_binds_walkthrough_row():
+    """The generic _run_job serves four personas off one spec table (#77);
+    this pins the TELLER wrapper's row binding - a copy-paste of another
+    persona's row would claim the wrong namespace and run the wrong
+    dispatch while every other test stays green (audit stage 7, #554)."""
+    claimed: list = []
+    with (
+        patch(
+            "adapters.install_store.claim_delivery",
+            side_effect=lambda d: claimed.append(d) or True,
+        ),
+        patch(
+            "personas.walkthrough.dispatch.dispatch_walkthrough_review",
+            return_value={"persona": "walkthrough", "result": "pass"},
+        ) as mock_d,
+    ):
+        out = ad.run_walkthrough_job(_JOB)
+    assert claimed == [f"{_JOB['delivery_id']}:walkthrough"]
+    mock_d.assert_called_once()
+    assert out == {"persona": "walkthrough", "result": "pass"}
+
+
+def test_run_walkthrough_job_skips_when_head_sha_already_reviewed():
+    """#554: the same head-sha idempotency Elder/Guard/Smasher get for
+    free from the generic machinery - a same-head-SHA re-trigger where
+    claim_delivery wins (new delivery id) but claim_review LOSES must
+    SKIP, never re-post/re-PATCH the walkthrough comment."""
+    job = {**_SHA_JOB, ad.ASYNC_JOB_KEY: ad.WALKTHROUGH_REVIEW_JOB}
+    with (
+        patch("adapters.install_store.claim_delivery", return_value=True),
+        patch("adapters.install_store.claim_review", return_value=False),
+        patch("personas.walkthrough.dispatch.dispatch_walkthrough_review") as mock_d,
+    ):
+        out = ad.run_walkthrough_job(job)
+    mock_d.assert_not_called()
+    assert out == {"status": "skipped", "reason": "duplicate_head_sha"}
+
+
+def test_run_walkthrough_job_reviews_when_head_sha_unclaimed():
+    """A fresh head SHA (claim_review won) -> dispatch runs, claimed with
+    the exact (install, repo, pr, persona, head_sha) tuple."""
+    job = {**_SHA_JOB, ad.ASYNC_JOB_KEY: ad.WALKTHROUGH_REVIEW_JOB}
+    with (
+        patch("adapters.install_store.claim_delivery", return_value=True),
+        patch("adapters.install_store.claim_review", return_value=True) as mock_c,
+        patch(
+            "personas.walkthrough.dispatch.dispatch_walkthrough_review",
+            return_value={"persona": "walkthrough", "result": "pass"},
+        ) as mock_d,
+    ):
+        out = ad.run_walkthrough_job(job)
+    mock_d.assert_called_once()
+    mock_c.assert_called_once_with(
+        install_id=7, repo="githumps/grug", pr_number=12,
+        persona="walkthrough", head_sha="sha-aaa",
+    )
+    assert out == {"persona": "walkthrough", "result": "pass"}
+
+
 def test_run_smasher_job_self_recovers_with_smasher_persona():
     with (
         patch("adapters.install_store.claim_delivery", return_value=True),

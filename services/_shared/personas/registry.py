@@ -193,6 +193,21 @@ REGISTRY: tuple[PersonaSpec, ...] = (
         dispatch_module="personas.smasher.webhook_dispatch",
     ),
     PersonaSpec(
+        key="walkthrough",
+        canonical="teller",
+        # No real check-run posts (comment-only, like Pulse); this name is
+        # the roster/Activity-feed identity record_check_verdict carries.
+        check_run_name="Grug — Teller",
+        enabled_flag="walkthrough_enabled",
+        enabled_default=True,  # trial-harvest gap 1: default ON (#554, #522)
+        blocking_flag=None,
+        blocking_default=False,
+        dispatch_style="async",  # summary LLM call + comment upsert I/O
+        missing_repo_policy="disabled",  # never run an LLM summary blind
+        events=("pull_request",),
+        dispatch_module="personas.walkthrough.webhook_dispatch",
+    ),
+    PersonaSpec(
         key="pulse",
         canonical="pulse",
         check_run_name="Grug — Pulse",
