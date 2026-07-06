@@ -45,6 +45,17 @@ _CLASS_ALIASES: dict[str, frozenset[str]] = {
     "upstream-semantics": frozenset({"correctness", "robustness"}),
 }
 
+# A rename/removal in _BUG_CLASSES must fail HERE at import, not silently
+# turn an aliased ledger class uncatchable (same import-time-guard style as
+# ReviewRule.__post_init__).
+for _ledger_cls, _elder_set in _CLASS_ALIASES.items():
+    _unknown = _elder_set - ELDER_CLASSES
+    if _unknown:
+        raise ValueError(
+            f"_CLASS_ALIASES[{_ledger_cls!r}] maps to classes outside "
+            f"Elder's taxonomy: {sorted(_unknown)}"
+        )
+
 
 def expected_elder_classes(ledger_class: str) -> frozenset[str]:
     """The Elder classes that would count as CATCHING a ledger finding of
