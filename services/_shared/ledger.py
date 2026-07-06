@@ -31,6 +31,11 @@ from dataclasses import dataclass
 _ACCEPTED = frozenset({"fixed", "declined"})
 _REJECTED = frozenset({"false-positive"})
 
+# CRITICAL first; unknown labels sort last. The ONE severity-ranking
+# convention - few_shot (and any future consumer) imports this instead of
+# keeping a drift-prone copy.
+SEVERITY_ORDER = {"CRITICAL": 0, "HIGH": 1, "MEDIUM": 2, "MED": 2, "LOW": 3}
+
 
 @dataclass(frozen=True)
 class LedgerRow:
@@ -102,7 +107,7 @@ def accepted_findings_by_class(
     exemplars. False positives are excluded (we don't want Elder to learn
     a reviewer's mistakes). Severity order CRITICAL>HIGH>MEDIUM>LOW>other;
     within a severity, insertion order (recency of the corpus) breaks ties."""
-    order = {"CRITICAL": 0, "HIGH": 1, "MEDIUM": 2, "MED": 2, "LOW": 3}
+    order = SEVERITY_ORDER
     by_class: dict[str, list[LedgerRow]] = {}
     for r in rows:
         if r.accepted:

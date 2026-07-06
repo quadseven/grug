@@ -70,6 +70,25 @@ def _print_report(name: str, report: EvalReport) -> None:
         print(f"  !! unknown verdicts (excluded - fix the corpus labels): {uv}")
 
 
+
+def _run_ab_arm(
+    backend, all_cases, cases, token, baseline_report, *, label, block, kwarg
+) -> None:
+    """One ON-arm replay + delta print vs the baseline report. `kwarg` is
+    the run_eval keyword carrying the block (team_practices / few_shot)."""
+    on = score(
+        all_cases, run_eval(backend, cases, token=token, **{kwarg: block})
+    )
+    _print_report(f"{backend.name} + {label}", on)
+    print(
+        f"\n{label} delta: catch "
+        f"{baseline_report.overall_catch:.2f} -> {on.overall_catch:.2f} "
+        f"({on.overall_catch - baseline_report.overall_catch:+.2f}), noise "
+        f"{baseline_report.noise_rate:.2f} -> {on.noise_rate:.2f} "
+        f"({on.noise_rate - baseline_report.noise_rate:+.2f})"
+    )
+
+
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(prog="elder_eval")
     src = parser.add_mutually_exclusive_group()
@@ -166,16 +185,9 @@ def main(argv: list[str] | None = None) -> int:
             "skipping ON arm (delta would be A/A noise)"
         )
     if block:
-        with_practices = score(
-            all_cases, run_eval(backend, cases, token=token, team_practices=block)
-        )
-        _print_report(f"{backend.name} + practices (#527)", with_practices)
-        print(
-            f"\n#527 practices delta: catch "
-            f"{report.overall_catch:.2f} -> {with_practices.overall_catch:.2f} "
-            f"({with_practices.overall_catch - report.overall_catch:+.2f}), noise "
-            f"{report.noise_rate:.2f} -> {with_practices.noise_rate:.2f} "
-            f"({with_practices.noise_rate - report.noise_rate:+.2f})"
+        _run_ab_arm(
+            backend, all_cases, cases, token, report,
+            label="practices (#527)", block=block, kwarg="team_practices",
         )
 
     if args.ab_few_shot:
@@ -194,16 +206,9 @@ def main(argv: list[str] | None = None) -> int:
             "A/A noise)"
         )
     if examples:
-        with_examples = score(
-            all_cases, run_eval(backend, cases, token=token, few_shot=examples)
-        )
-        _print_report(f"{backend.name} + few-shot (#538)", with_examples)
-        print(
-            f"\n#538 few-shot delta: catch "
-            f"{report.overall_catch:.2f} -> {with_examples.overall_catch:.2f} "
-            f"({with_examples.overall_catch - report.overall_catch:+.2f}), noise "
-            f"{report.noise_rate:.2f} -> {with_examples.noise_rate:.2f} "
-            f"({with_examples.noise_rate - report.noise_rate:+.2f})"
+        _run_ab_arm(
+            backend, all_cases, cases, token, report,
+            label="few-shot (#538)", block=examples, kwarg="few_shot",
         )
 
     if args.record:
