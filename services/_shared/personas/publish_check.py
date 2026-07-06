@@ -17,13 +17,17 @@ from __future__ import annotations
 import logging
 import os
 
-import httpx
-
 from activity_log import record_check_verdict
 from github_app_auth import with_install_token_retry
 from github_checks_client import CheckConclusion, CheckRunResult, post_check_run
 
 log = logging.getLogger(f"{os.getenv('DD_SERVICE', 'grug')}.persona.publish_check")
+
+# Reserved: this is the seam's own internal failure sentinel (returned +
+# recorded when the check-run publish itself fails). A caller's own
+# `success_result` must never collide with it, or a clean publish becomes
+# indistinguishable from a real publish failure in the Activity row.
+_PUBLISH_FAILED_SENTINEL = "publish_failed"
 
 
 def publish_persona_check(
@@ -59,9 +63,29 @@ def publish_persona_check(
     and failure paths.
 
     Returns `{"persona": persona_key, "result": ...}` — the caller's own
-    `success_result` on a clean publish, `"publish_failed"` when the
-    check-run POST failed.
+    `success_result` on a clean publish, `"publish_failed"` when publishing
+    failed for ANY reason (a bad HTTP response to the check-run POST, or a
+    raise anywhere earlier in the token-retry/auth chain — token exchange,
+    JWT signing, the SSM secret fetch, or a malformed response body).
+
+    Raises:
+        ValueError: if `success_result == "publish_failed"` — that string
+            is the seam's own internal failure sentinel and cannot be
+            reused as a caller's success signal. Also propagates uncaught
+            from `CheckRunResult`'s own cross-field invariant (status vs.
+            conclusion) — a caller-contract violation, checked before any
+            network call, that should fail loud rather than be folded into
+            a "publish_failed" result.
     """
+    if success_result == _PUBLISH_FAILED_SENTINEL:
+        raise ValueError(
+            f"success_result cannot be {_PUBLISH_FAILED_SENTINEL!r} — that "
+            "string is this seam's own internal failure sentinel",
+        )
+
+    full_repo = f"{owner}/{repo}"
+    pr_ref = f"{full_repo}#{pr_number}"
+
     check_result = CheckRunResult(
         name=check_name,
         head_sha=head_sha,
@@ -70,7 +94,7 @@ def publish_persona_check(
         title=title,
         summary=summary,
     )
-    external_id = f"grug-{persona_prefix}:{owner}/{repo}#{pr_number}:{head_sha}"
+    external_id = f"grug-{persona_prefix}:{full_repo}#{pr_number}:{head_sha}"
 
     publish_failed = False
     try:
@@ -80,17 +104,22 @@ def publish_persona_check(
                 token, owner, repo, check_result, external_id=external_id,
             ),
         )
-    except (httpx.HTTPStatusError, httpx.RequestError) as e:
+    except Exception as e:  # noqa: BLE001 — this IS the total publish boundary
+        # every persona hand-rolled the same way (guard/warder/smasher/
+        # code_reviewer all use httpx-only excepts here today); a narrower
+        # catch would let a token-exchange RuntimeError, a botocore SSM
+        # error, JWT signing failure, or a malformed-JSON response escape
+        # uncaught and skip record_check_verdict entirely — exactly the
+        # silent Activity-row gap this seam exists to close (confirmed live
+        # via runtime-trace audit on PR #562: each of those failure modes
+        # left `record_check_verdict` never called before this fix).
         log.error(
             publish_failed_log_name,
             extra={
                 "installation_id": installation_id,
-                "pr": f"{owner}/{repo}#{pr_number}",
+                "pr": pr_ref,
                 "kind": type(e).__name__,
-                "status_code": (
-                    e.response.status_code
-                    if isinstance(e, httpx.HTTPStatusError) else None
-                ),
+                "status_code": getattr(getattr(e, "response", None), "status_code", None),
                 "error": str(e)[:500],
             },
         )
@@ -101,12 +130,17 @@ def publish_persona_check(
     # seam's own docstring promises this call can't crash the tail after
     # a successful publish — don't let that promise depend transitively on
     # a callee's internals never regressing (same discipline as
-    # code_reviewer/dispatch.py's submit_evals wrap).
+    # code_reviewer/dispatch.py's submit_evals wrap). Logged under a name
+    # distinct from activity_log.py's own "check_verdict_record_failed" —
+    # reusing that name would make it impossible to tell "the store write
+    # itself failed" (activity_log's own, expected, WARNING-level case)
+    # from "something escaped record_check_verdict's never-raise contract
+    # entirely" (this one — always unexpected).
     try:
         record_check_verdict(
             install_id=installation_id,
             persona_key=persona_key,
-            repo=f"{owner}/{repo}",
+            repo=full_repo,
             pr_number=pr_number,
             head_sha=head_sha,
             conclusion=conclusion,
@@ -117,16 +151,19 @@ def publish_persona_check(
                 degraded_reason or ("check_publish_failed" if publish_failed else None)
             ),
         )
-    except Exception:  # noqa: BLE001 — best-effort per this module's own contract
-        log.exception(
-            "check_verdict_record_failed",
+    except Exception as e:  # noqa: BLE001 — best-effort per this module's own contract
+        log.error(
+            "check_verdict_record_failed_unexpected",
             extra={
                 "persona": persona_key,
-                "pr": f"{owner}/{repo}#{pr_number}",
+                "pr": pr_ref,
+                "kind": type(e).__name__,
+                "error": str(e)[:500],
             },
+            exc_info=True,
         )
 
     return {
         "persona": persona_key,
-        "result": "publish_failed" if publish_failed else success_result,
+        "result": _PUBLISH_FAILED_SENTINEL if publish_failed else success_result,
     }
