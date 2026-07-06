@@ -31,9 +31,9 @@ from dataclasses import dataclass
 _ACCEPTED = frozenset({"fixed", "declined"})
 _REJECTED = frozenset({"false-positive"})
 
-# CRITICAL first; unknown labels sort last. The ONE severity-ranking
-# convention - few_shot (and any future consumer) imports this instead of
-# keeping a drift-prone copy.
+# CRITICAL first; unknown labels sort last (consumers use .get(sev, 4)).
+# The ONE severity-ranking convention - few_shot (and any future consumer)
+# imports this instead of keeping a drift-prone copy.
 SEVERITY_ORDER = {"CRITICAL": 0, "HIGH": 1, "MEDIUM": 2, "MED": 2, "LOW": 3}
 
 

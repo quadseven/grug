@@ -1,8 +1,9 @@
 """#538 (#361 slice 3): few-shot exemplar injection into Elder's prompt.
 
 Pure tests: rendering bounds, cache round-trip shape, prompt append order
-(EXAMPLES after RULES), best-effort fetch isolation, and the ingest
-refresh. No LLM, no network, no store.
+(EXAMPLES after RULES), best-effort fetch isolation, the ingest refresh,
+sanitizer parity with best_practices, and strength-ranked class capping.
+No LLM, no network, no store.
 """
 
 from __future__ import annotations

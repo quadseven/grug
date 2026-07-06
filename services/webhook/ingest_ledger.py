@@ -25,8 +25,10 @@ _DEFAULT_PATH = "logs/review-ledger.jsonl"
 def ingest_text(
     text: str, put=None, put_practices=None, put_exemplars=None
 ) -> dict[str, object]:
-    """Parse + persist every valid ledger line. `put` defaults to the store
-    adapter but is injectable for tests. Returns {ingested, skipped}."""
+    """Parse + persist every valid ledger line. `put`/`put_practices`/
+    `put_exemplars` default to the store adapter but are injectable for
+    tests. Returns {ingested, skipped, repos_refreshed,
+    exemplars_refreshed}."""
     if put is None:
         from adapters.pg_install_store import put_ledger_row  # type: ignore
         put = put_ledger_row
