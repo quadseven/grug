@@ -58,16 +58,25 @@ def walkthrough_body(
     effort: ReviewEffort,
     head_sha: str,
     degraded: bool,
+    files_truncated: bool = False,
 ) -> str:
     """Assemble the full comment body. `degraded` marks a summary that
-    fell back to the deterministic form (LLM call failed/timed out) - the
-    comment says so rather than presenting a fallback as the real thing."""
+    fell back to the deterministic form (LLM call failed/timed out) -
+    the comment says so rather than presenting a fallback as the real
+    thing. `files_truncated` marks a PR whose changed-file count exceeded
+    our fetch cap (GitHub's own /files cap is far higher) - every number
+    below is then a floor, not an exact count, and the comment says so."""
     parts = [MARKER, "## Grug Teller walk the PR before the tribe judge it", ""]
     parts.append(summary[:_MAX_SUMMARY_CHARS])
     if degraded:
         parts.append(
             "\n_(Teller's voice was quiet this pass - a deterministic "
             "summary stands in; the table and diagram below are unaffected.)_"
+        )
+    if files_truncated:
+        parts.append(
+            f"\n_(This hunt sprawl wide - Teller counted only the first "
+            f"{len(files)} file(s); the true count runs higher.)_"
         )
     parts.append(f"\n**Effort to review:** {effort_label(effort)}")
     table = changed_files_table(files)

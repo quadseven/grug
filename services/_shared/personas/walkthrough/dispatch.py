@@ -53,10 +53,16 @@ def _fetch_pr_diff(token: str, owner: str, repo: str, pull_number: int) -> str:
 
 def _fetch_pr_files(
     token: str, owner: str, repo: str, pull_number: int,
-) -> list[FileStat]:
-    """Paginated `/files` fetch -> FileStat (no summary yet - filled in
-    from the LLM response, if any, after)."""
+) -> tuple[list[FileStat], bool]:
+    """Paginated `/files` fetch -> (FileStat list, truncated). GitHub's own
+    endpoint caps at 3000 files - well above our _MAX_FILE_PAGES bound - so
+    a monorepo migration or generated-file dump can legitimately exceed our
+    cap. `truncated=True` when the cap was hit with a still-full last page,
+    so the caller can say so honestly instead of presenting a truncated
+    count as exact (no summary yet - filled in from the LLM response, if
+    any, after)."""
     out: list[FileStat] = []
+    truncated = False
     for page in range(1, _MAX_FILE_PAGES + 1):
         resp = httpx.get(
             f"{_API}/repos/{_repo_path(owner, repo)}/pulls/{pull_number}/files",
@@ -73,7 +79,9 @@ def _fetch_pr_files(
             ))
         if len(batch) < 100:
             break
-    return out
+        if page == _MAX_FILE_PAGES:
+            truncated = True
+    return out, truncated
 
 
 def _find_marker_comment(
@@ -181,7 +189,7 @@ def dispatch_walkthrough_review(
         return {"persona": "walkthrough", "result": "fetch_failed"}
 
     try:
-        files = with_install_token_retry(
+        files, files_truncated = with_install_token_retry(
             installation_id,
             lambda token: _fetch_pr_files(token, owner, repo_name, pull_number),
         )
@@ -193,6 +201,16 @@ def dispatch_walkthrough_review(
         _log_fetch_failed(e, phase="files", installation_id=installation_id,
                            owner=owner, repo_name=repo_name, pull_number=pull_number)
         return {"persona": "walkthrough", "result": "fetch_failed"}
+    if files_truncated:
+        # GitHub's own /files cap is 3000 - well above our _MAX_FILE_PAGES
+        # bound - so a monorepo migration or generated-file dump can
+        # legitimately exceed it. Every downstream number (line count,
+        # effort estimate, comment text) is computed off the truncated
+        # list; say so, never present it as exact.
+        log.warning(
+            "walkthrough_file_fetch_capped",
+            extra={"pr": f"{owner}/{repo_name}#{pull_number}", "files_seen": len(files)},
+        )
 
     lines_changed = sum(f.additions + f.deletions for f in files)
     degraded = False
@@ -218,10 +236,12 @@ def dispatch_walkthrough_review(
         ]
     else:
         degraded = True
+        count_hedge = "at least " if files_truncated else ""
         summary = (
-            f"{len(files)} file(s) changed (+{sum(f.additions for f in files)}/"
-            f"-{sum(f.deletions for f in files)}). Grug's teller-voice was "
-            "quiet this pass; this is the honest deterministic summary."
+            f"{count_hedge}{len(files)} file(s) changed "
+            f"(+{sum(f.additions for f in files)}/-{sum(f.deletions for f in files)}). "
+            "Grug's teller-voice was quiet this pass; this is the honest "
+            "deterministic summary."
         )
         model_effort = None
 
@@ -234,7 +254,7 @@ def dispatch_walkthrough_review(
 
     body = walkthrough_body(
         summary=summary, files=files, diagram=diagram, effort=effort,
-        head_sha=head_sha, degraded=degraded,
+        head_sha=head_sha, degraded=degraded, files_truncated=files_truncated,
     )
 
     try:

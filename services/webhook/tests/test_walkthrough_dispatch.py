@@ -347,3 +347,70 @@ def test_upsert_marker_lookup_failure_during_publish_degrades_to_publish_failed(
     mock_post.assert_not_called()
     mock_patch.assert_not_called()
     mock_rcv.assert_not_called()
+
+
+def test_fetch_pr_files_signals_truncation_at_the_page_cap():
+    """#554 audit stage 8: GitHub's own /files cap (3000) is far above our
+    _MAX_FILE_PAGES bound (500) - a monorepo migration or generated-file
+    dump can legitimately exceed it. The fetch must SIGNAL truncation, not
+    silently return a partial list that looks complete."""
+    def full_page(url, **kwargs):
+        return _files_response([
+            {"filename": f"f{i}.py", "additions": 1, "deletions": 0}
+            for i in range(100)
+        ])
+
+    with patch("httpx.get", side_effect=full_page):
+        files, truncated = wt_dispatch._fetch_pr_files("tok", "o", "r", 1)
+
+    assert len(files) == 500  # _MAX_FILE_PAGES x 100
+    assert truncated is True
+
+
+def test_fetch_pr_files_not_truncated_under_the_cap():
+    def small_page(url, **kwargs):
+        return _files_response([{"filename": "x.py", "additions": 1, "deletions": 0}])
+
+    with patch("httpx.get", side_effect=small_page):
+        files, truncated = wt_dispatch._fetch_pr_files("tok", "o", "r", 1)
+
+    assert len(files) == 1
+    assert truncated is False
+
+
+def test_dispatch_truncated_files_logs_warning_and_hedges_the_comment(monkeypatch, caplog):
+    """The truncation signal must reach BOTH the log (operator visibility)
+    and the posted comment (author visibility) - never silently present a
+    partial count as exact in either surface."""
+    monkeypatch.setattr(
+        wt_dispatch, "with_install_token_retry",
+        lambda inst_id, fn: fn("tok"),
+    )
+    posted = {}
+
+    def fake_get(url, **kwargs):
+        if url.endswith("/files"):
+            return _files_response([
+                {"filename": f"f{i}.py", "additions": 1, "deletions": 0}
+                for i in range(100)
+            ])
+        if "/comments" in url:
+            return _empty_comments_response()
+        return _diff_response()
+
+    def fake_post(url, **kwargs):
+        posted["body"] = kwargs["json"]["body"]
+        r = MagicMock(spec=httpx.Response)
+        r.raise_for_status = MagicMock()
+        return r
+
+    with patch("httpx.get", side_effect=fake_get), \
+         patch("httpx.post", side_effect=fake_post), \
+         patch("personas.walkthrough.dispatch.record_check_verdict"), \
+         patch("llm_client.summarize_pr", return_value=None), \
+         caplog.at_level("WARNING", logger="grug.persona.walkthrough"):
+        wt_dispatch.dispatch_walkthrough_review(_payload(), blocking=False)
+
+    assert "walkthrough_file_fetch_capped" in caplog.text
+    assert "at least 500" in posted["body"]
+    assert "sprawl wide" in posted["body"]
