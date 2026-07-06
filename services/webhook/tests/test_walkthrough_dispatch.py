@@ -196,3 +196,100 @@ def test_dispatch_publish_failure_does_not_record_activity(monkeypatch):
 
     assert out == {"persona": "walkthrough", "result": "publish_failed"}
     mock_rcv.assert_not_called()
+
+
+def test_find_marker_comment_logs_when_scan_cap_exhausted(caplog):
+    """#554 audit stage 2: giving up at the 20-page cap without finding
+    the marker must be distinguishable from the ordinary 'no marker'
+    exit - silent here means an unbounded duplicate-comment bug on an
+    extreme PR (>2000 comments) would go unnoticed forever."""
+
+    def full_comments_page(url, **kwargs):
+        r = MagicMock(spec=httpx.Response)
+        r.status_code = 200
+        r.raise_for_status = MagicMock()
+        r.json = MagicMock(return_value=[{"id": i, "body": "unrelated"} for i in range(100)])
+        return r
+
+    with patch("httpx.get", side_effect=full_comments_page), \
+         caplog.at_level("WARNING", logger="grug.persona.walkthrough"):
+        result = wt_dispatch._find_marker_comment("tok", "o", "r", 1)
+
+    assert result is None
+    assert "walkthrough_marker_scan_capped" in caplog.text
+
+
+def test_dispatch_diff_fetch_failure_is_phase_tagged(monkeypatch, caplog):
+    """#554 audit stage 2: a diff-fetch failure and a files-fetch failure
+    must be distinguishable in logs (not both a bare 'HTTPStatusError')."""
+    monkeypatch.setattr(
+        wt_dispatch, "with_install_token_retry",
+        lambda inst_id, fn: fn("tok"),
+    )
+
+    def fake_get(url, **kwargs):
+        raise httpx.ConnectError("dns down")
+
+    with patch("httpx.get", side_effect=fake_get), \
+         patch("httpx.post") as mock_post, \
+         caplog.at_level("WARNING", logger="grug.persona.walkthrough"):
+        wt_dispatch.dispatch_walkthrough_review(_payload(), blocking=False)
+
+    mock_post.assert_not_called()
+    assert any(
+        getattr(r, "phase", None) == "diff" for r in caplog.records
+    ), "expected a phase='diff' fetch-failure log line"
+
+
+def test_dispatch_files_fetch_failure_is_phase_tagged(monkeypatch, caplog):
+    """The diff fetch succeeds, then the files fetch fails - must log
+    phase='files', not the same undifferentiated message as a diff outage."""
+    monkeypatch.setattr(
+        wt_dispatch, "with_install_token_retry",
+        lambda inst_id, fn: fn("tok"),
+    )
+
+    def fake_get(url, **kwargs):
+        if url.endswith("/files"):
+            raise httpx.ConnectError("dns down")
+        return _diff_response()
+
+    with patch("httpx.get", side_effect=fake_get), \
+         patch("httpx.post") as mock_post, \
+         caplog.at_level("WARNING", logger="grug.persona.walkthrough"):
+        out = wt_dispatch.dispatch_walkthrough_review(_payload(), blocking=False)
+
+    assert out == {"persona": "walkthrough", "result": "fetch_failed"}
+    mock_post.assert_not_called()
+    assert any(
+        getattr(r, "phase", None) == "files" for r in caplog.records
+    ), "expected a phase='files' fetch-failure log line"
+
+
+def test_dispatch_degraded_summary_notes_it_and_emits_gauge(monkeypatch):
+    """#554 audit stage 2: the Activity-feed summary text must disclose a
+    degraded LLM call (conclusion stays 'success' - the comment DID post -
+    but the summary + a best-effort gauge carry the honest signal)."""
+    monkeypatch.setattr(
+        wt_dispatch, "with_install_token_retry",
+        lambda inst_id, fn: fn("tok"),
+    )
+
+    def fake_get(url, **kwargs):
+        if url.endswith("/files"):
+            return _files_response([{"filename": "x.py", "additions": 1, "deletions": 0}])
+        if "/comments" in url:
+            return _empty_comments_response()
+        return _diff_response()
+
+    gauges = []
+    with patch("httpx.get", side_effect=fake_get), \
+         patch("httpx.post", return_value=MagicMock(raise_for_status=MagicMock())), \
+         patch("personas.walkthrough.dispatch.record_check_verdict") as mock_rcv, \
+         patch("llm_client.summarize_pr", return_value=None), \
+         patch("observability.emit_gauge", side_effect=lambda name, val: gauges.append((name, val)), create=True):
+        wt_dispatch.dispatch_walkthrough_review(_payload(), blocking=False)
+
+    summary = mock_rcv.call_args.kwargs["summary"]
+    assert "degraded to fallback" in summary
+    assert mock_rcv.call_args.kwargs["conclusion"] == "success"

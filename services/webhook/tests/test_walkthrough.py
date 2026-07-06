@@ -167,3 +167,14 @@ def test_walkthrough_body_degraded_says_so_honestly():
         head_sha="c" * 40, degraded=True,
     )
     assert "quiet this pass" in body
+
+
+def test_estimate_effort_logs_rejected_off_vocabulary_value(caplog):
+    """#554 audit stage 2: a truthy-but-rejected model_effort must be
+    distinguishable from 'model omitted an estimate' - both looked
+    identical before this fix."""
+    with caplog.at_level("DEBUG", logger="grug.persona.walkthrough"):
+        result = estimate_effort(file_count=1, lines_changed=5, model_effort="Quick")
+    assert result == "quick"  # heuristic fallback (wrong case, off-vocabulary)
+    assert "walkthrough_model_effort_rejected" in caplog.text
+    assert caplog.records[0].value == "Quick"  # extra= payload, not just the message

@@ -11,7 +11,11 @@ so an off-vocabulary or hallucinated label can never reach the chip.
 
 from __future__ import annotations
 
+import logging
+import os
 from typing import Literal, get_args
+
+log = logging.getLogger(f"{os.getenv('DD_SERVICE', 'grug')}.persona.walkthrough")
 
 ReviewEffort = Literal["quick", "moderate", "involved", "extensive"]
 REVIEW_EFFORTS: frozenset[str] = frozenset(get_args(ReviewEffort))
@@ -31,6 +35,13 @@ def estimate_effort(
     itself a member of the closed set (never an off-vocabulary passthrough)."""
     if model_effort in REVIEW_EFFORTS:
         return model_effort  # type: ignore[return-value]
+    if model_effort:
+        # A truthy-but-rejected value (wrong case, hallucinated label) must
+        # not look identical to "the model omitted an estimate" - a
+        # systemic prompt-casing regression would otherwise be invisible.
+        log.debug(
+            "walkthrough_model_effort_rejected", extra={"value": model_effort}
+        )
     if file_count > 15 or lines_changed > 500:
         return "extensive"
     if file_count > 6 or lines_changed > 150:
