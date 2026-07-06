@@ -156,6 +156,15 @@ def main(argv: list[str] | None = None) -> int:
         from best_practices import derive_practices, practices_block
 
         block = practices_block(derive_practices(list(rows)))
+        if not block:
+            # An empty block makes the ON arm byte-identical to baseline -
+            # the "delta" would be pure sampling noise dressed as a result.
+            print(
+                "#527 practices: no practices derivable from this corpus - "
+                "skipping ON arm (delta would be A/A noise)"
+            )
+            args.ab_practices = False
+    if args.ab_practices:
         with_practices = score(
             all_cases, run_eval(backend, cases, token=token, team_practices=block)
         )
@@ -175,6 +184,14 @@ def main(argv: list[str] | None = None) -> int:
         examples = exemplars_block(
             exemplars_from_rows(accepted_findings_by_class(list(rows)))
         )
+        if not examples:
+            print(
+                "#538 few-shot: no exemplars derivable from this corpus "
+                "(0 accepted findings) - skipping ON arm (delta would be "
+                "A/A noise)"
+            )
+            args.ab_few_shot = False
+    if args.ab_few_shot:
         with_examples = score(
             all_cases, run_eval(backend, cases, token=token, few_shot=examples)
         )

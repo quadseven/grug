@@ -18,6 +18,7 @@ review time.
 
 from __future__ import annotations
 
+import logging
 from dataclasses import dataclass
 
 # Deliberate private import: the sibling's sanitizer strips control chars
@@ -25,6 +26,8 @@ from dataclasses import dataclass
 # prompt to a third-party backend). One sanitizer, not two drifting copies.
 from best_practices import _sanitize
 from ledger import LedgerRow
+
+log = logging.getLogger("grug.few_shot")
 
 DEFAULT_MAX_CLASSES = 6
 DEFAULT_PER_CLASS = 2
@@ -80,10 +83,15 @@ def exemplars_to_dicts(exemplars: list[Exemplar]) -> list[dict]:
 
 def exemplars_from_dicts(data: list[dict]) -> list[Exemplar]:
     """Cached dicts back to Exemplars. Malformed entries are skipped (a
-    stale cache row must not break a review)."""
+    stale cache row must not break a review) but COUNTED: a
+    present-but-rotten cache decoding to [] must not be indistinguishable
+    from 'no exemplars derived' - that failure would be permanent and
+    invisible."""
     out: list[Exemplar] = []
+    skipped = 0
     for d in data:
         if not isinstance(d, dict):
+            skipped += 1
             continue
         try:
             out.append(
@@ -95,7 +103,11 @@ def exemplars_from_dicts(data: list[dict]) -> list[Exemplar]:
                 )
             )
         except (KeyError, ValueError, TypeError):
-            continue
+            skipped += 1
+    if skipped:
+        log.warning(
+            "exemplar_cache_rows_skipped skipped=%d total=%d", skipped, len(data)
+        )
     return out
 
 
