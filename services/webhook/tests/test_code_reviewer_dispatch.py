@@ -1431,8 +1431,15 @@ def test_summary_markdown_appends_bounded_consolidated_agent_prompt():
         conclusion="failure",
     )
     _, summary = cr_dispatch._summary_markdown(ev)
-    assert "Prompt for AI agents" in summary
     assert len(summary) < 60000
+    # The truncation must WORK, not merely leave the summary small: whole
+    # findings included up to the budget, a visible cut-line for the rest,
+    # and never the omission fallback (that is the ceiling path).
+    assert "omitted" not in summary
+    assert "f0.py:1" in summary
+    import re as _re
+    m = _re.search(r"\(\+(\d+) more finding", summary)
+    assert m and int(m.group(1)) > 0
 
 
 def test_agent_prompt_blocks_are_fence_breakout_safe():
@@ -1458,3 +1465,62 @@ def test_effort_labels_derive_from_shared_vocabulary():
     from review_types.EFFORTS."""
     from review_types import EFFORTS
     assert frozenset(cr_dispatch._EFFORT_LABELS) == EFFORTS
+
+
+
+def test_consolidated_prompt_hard_ceiling_degrades_loudly():
+    """#553 audit: a fence-inflating suggestion (huge backtick run) pushes
+    the block past the deterministic ceiling - it must degrade to the
+    omission notice, never 422 the check-run publish away."""
+    from personas.code_reviewer.persona import CodeReviewEvaluation, Finding
+    f = Finding(
+        file="x.py", line=1, severity="high", rule_name="null-deref",
+        message="m", suggestion="`" * 1900,
+    )
+    ev = CodeReviewEvaluation(
+        findings=tuple(
+            Finding(file=f"y{i}.py", line=1, severity="high",
+                    rule_name="null-deref", message="n" * 1400,
+                    suggestion="`" * 1900)
+            for i in range(5)
+        ) + (f,),
+        conclusion="failure",
+    )
+    out = cr_dispatch._consolidated_agent_prompt(ev)
+    assert out == (
+        "(Prompt for AI agents omitted - findings too large; "
+        "see the table above)"
+    ) or len(out) <= 2 * cr_dispatch._CONSOLIDATED_PROMPT_BUDGET
+
+
+def test_dispatch_suggestion_survives_pipe_to_inline_comment(monkeypatch):
+    """#553 E2E: suggestion + effort survive review_diff -> evaluate_diff ->
+    dedup -> _build_review_result into the POSTED InlineComment body - a
+    dedup/build refactor that rebuilds findings could drop them with every
+    unit test still green."""
+    llm = LlmReviewResponse(
+        kind="reviewed",
+        findings=(LlmFinding(
+            path="src/x.py", line=2, rule="silent-failure",
+            severity="medium", message="Grug see quiet drop",  # type: ignore[arg-type]
+            suggestion="log.warning('dropped %s', e)", effort="quick-win",
+        ),),
+        backend_used=Backend.POOLSIDE,
+        model_name="laguna",
+    )
+    posted_review = []
+    monkeypatch.setattr(cr_dispatch, "review_diff",
+                        lambda *a, **k: llm)
+    monkeypatch.setattr(cr_dispatch, "post_check_run",
+                        lambda *a, **k: {"id": 1})
+    monkeypatch.setattr(
+        cr_dispatch, "post_review",
+        lambda t, o, r, *, pull_number, result: posted_review.append(result) or {"id": 2},
+    )
+    with patch("httpx.get", return_value=_diff_response()):
+        cr_dispatch.dispatch_code_review(_payload(), blocking=False)
+    assert len(posted_review) == 1
+    body = posted_review[0].comments[0].body
+    assert "```suggestion\nlog.warning('dropped %s', e)\n```" in body
+    assert "quick win" in body
+    assert "Prompt for AI agents" in body
