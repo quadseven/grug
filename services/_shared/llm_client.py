@@ -228,7 +228,8 @@ class Finding:
     # #553: optional one-click remediation fields. `suggestion` is the exact
     # replacement text for the flagged line(s) - emitted only when the model
     # is confident and line-exact; anything non-str/empty coerces to None.
-    # `effort` is a closed enum (quick-win / heavy-lift) or "".
+    # `effort` is a closed enum (quick-win / heavy-lift) or None
+    # (mirrors suggestion's None-for-absent).
     suggestion: str | None = None
     effort: Effort | None = None
 
