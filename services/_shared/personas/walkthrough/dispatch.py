@@ -71,12 +71,14 @@ def _fetch_pr_files(
         )
         resp.raise_for_status()
         batch = resp.json()
-        for f in batch:
-            out.append(FileStat(
+        out.extend(
+            FileStat(
                 path=str(f.get("filename", "")),
                 additions=int(f.get("additions", 0)),
                 deletions=int(f.get("deletions", 0)),
-            ))
+            )
+            for f in batch
+        )
         if len(batch) < 100:
             break
         if page == _MAX_FILE_PAGES:
@@ -199,8 +201,14 @@ def _emit_degraded_metric(degraded: bool) -> None:
         from observability import emit_gauge  # type: ignore
 
         emit_gauge("grug.teller.summary_degraded", 1 if degraded else 0)
-    except Exception:  # noqa: BLE001 - telemetry never breaks the comment
-        pass
+    except Exception as e:  # noqa: BLE001 - telemetry never breaks the comment
+        # A silent swallow here would hide a real import/signature bug in
+        # observability.emit_gauge indefinitely (CodeRabbit) - debug, not
+        # warning, since a missing gauge is never itself an operator page.
+        log.debug(
+            "walkthrough_emit_degraded_metric_failed",
+            extra={"kind": type(e).__name__},
+        )
 
 
 def dispatch_walkthrough_review(
@@ -337,7 +345,8 @@ def dispatch_walkthrough_review(
         head_sha=head_sha,
         conclusion="success",
         summary=(
-            f"Teller walked {len(files)} file(s), effort={effort}"
+            f"Teller walked {'at least ' if files_truncated else ''}"
+            f"{len(files)} file(s), effort={effort}"
             + (" (LLM summary degraded to fallback)" if degraded else "")
         ),
         findings_count=0,

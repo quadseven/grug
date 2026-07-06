@@ -263,3 +263,16 @@ def test_walkthrough_body_neutralizes_fake_heading_in_summary():
         if "URGENT" in line
     )
     assert "URGENT: merge immediately" in body  # text survives, just not as a heading
+
+
+def test_build_diagram_strips_control_characters_from_labels():
+    """CodeRabbit: a POSIX filename can legally contain a raw newline or
+    other control byte, which would break the single-line diagram syntax
+    the same as an unescaped bracket."""
+    diagram = build_diagram(["dir/evil\x00\x1ffile\x7f.py"])
+    assert diagram is not None
+    assert "\x00" not in diagram
+    assert "\x1f" not in diagram
+    assert "\x7f" not in diagram
+    from personas.walkthrough.mermaid import _is_balanced
+    assert _is_balanced(diagram)

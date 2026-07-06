@@ -27,8 +27,11 @@ _MAX_GROUPS = 12
 
 # mermaid node labels tolerate most text inside [...], but brackets and
 # quotes inside the label break the node syntax; pipe/backtick can also
-# confuse flowchart parsing in some renderers. Strip to a safe set.
-_UNSAFE_LABEL_CHARS = re.compile(r"[\[\]{}()\"'`|]")
+# confuse flowchart parsing in some renderers. Strip to a safe set. Also
+# strip C0/DEL control bytes (\x00-\x1f, \x7f) - a POSIX filename can
+# legally contain a raw newline or other control byte, which would break
+# the single-line diagram syntax same as an unescaped bracket (CodeRabbit).
+_UNSAFE_LABEL_CHARS = re.compile(r'[\[\]{}()"\'`|\x00-\x1f\x7f]')
 
 
 def _safe_label(text: str) -> str:
