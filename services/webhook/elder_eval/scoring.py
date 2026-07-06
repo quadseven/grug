@@ -67,6 +67,12 @@ def score(
     out_of_taxonomy: dict[str, int] = {}
     scored = 0
 
+    # An orphan replay (no matching case) would silently vanish from every
+    # metric - surface it loudly, it means the join key drifted.
+    orphans = set(replays) - {c.case_id for c in cases}
+    if orphans:
+        raise ValueError(f"replays reference unknown cases: {sorted(orphans)}")
+
     for case in cases:
         for cls, n in case.out_of_taxonomy.items():
             out_of_taxonomy[cls] = out_of_taxonomy.get(cls, 0) + n

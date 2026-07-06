@@ -44,6 +44,9 @@ _MAX_DIFF_BYTES = 200_000
 _RULE_TO_CLASS: dict[str, str] = {
     r.name: normalize_class(r.bug_class) for r in RULES
 }
+# A duplicate rule name would silently keep the last entry - fail at import.
+if len(_RULE_TO_CLASS) != len(RULES):
+    raise ValueError("duplicate ReviewRule.name in RULES")
 
 
 def classes_for_findings(findings: Iterable[Finding]) -> dict[str, int]:
