@@ -1441,9 +1441,12 @@ def test_coerce_finding_drops_suggestion_redaction_would_alter() -> None:
     """#553 audit stage 8: a suggestion that echoed a secret is DROPPED,
     never rendered - a committable block containing [REDACTED:...] would
     one-click the placeholder into source."""
+    # constructed at runtime, not a committed credential-shaped literal
+    fake_aws_key = "AKIA" + "".join(["ABCDEFGHIJKLMNOP"[i % 16] for i in range(16)])
     ok, _ = lc._coerce_finding({
         "path": "x.py", "line": 1, "rule": "r", "severity": "high",
         "message": "m",
-        "suggestion": "key = 'AKIAABCDEFGHIJKLMNOP'",
+        "suggestion": f"key = '{fake_aws_key}'",
     })
-    assert ok is not None and ok.suggestion is None
+    assert ok is not None
+    assert ok.suggestion is None

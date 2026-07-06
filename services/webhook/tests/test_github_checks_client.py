@@ -176,7 +176,7 @@ def test_post_check_run_connect_error_propagates(mock_transport_client):
             post_check_run("tok", "o", "r", result)
 
 
-def test_post_check_run_truncates_oversize_summary(monkeypatch):
+def test_post_check_run_truncates_oversize_summary():
     """#553 audit stage 8: a >65535-char summary 422s and vanishes the
     whole check-run - the client truncates visibly at the choke point."""
     import httpx
@@ -186,7 +186,7 @@ def test_post_check_run_truncates_oversize_summary(monkeypatch):
 
     captured = {}
 
-    def fake_post(url, **kwargs):
+    def fake_post(url: str, **kwargs: object) -> httpx.Response:
         captured["body"] = kwargs["json"]
         r = MagicMock(spec=httpx.Response)
         r.status_code = 201
@@ -194,9 +194,11 @@ def test_post_check_run_truncates_oversize_summary(monkeypatch):
         r.json = MagicMock(return_value={"id": 1})
         return r
 
+    # multi-byte content: a byte-length truncation bug (vs char-length)
+    # would only surface with non-ASCII input.
     result = CheckRunResult(
         name="Grug — Code Review", head_sha="a" * 40, status="completed",
-        conclusion="neutral", title="t", summary="x" * 70000,
+        conclusion="neutral", title="t", summary="日" * 70000,
     )
     with patch("httpx.post", side_effect=fake_post):
         post_check_run("tok", "o", "r", result)
