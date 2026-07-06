@@ -1,5 +1,7 @@
-"""Teller dispatch tests (#554): fetch, LLM-summary fallback, upsert-by-marker
-(PATCH-else-POST), and the honest degrade-comment path. Network mocked."""
+"""Teller dispatch tests (#554): fetch (incl. phase-tagged failure logging),
+LLM-summary fallback, upsert-by-marker (PATCH-else-POST, incl. scan-cap-
+exhaustion warning), and the honest degrade-comment path (incl. the
+summary_degraded gauge). Network mocked."""
 
 from __future__ import annotations
 
@@ -293,3 +295,22 @@ def test_dispatch_degraded_summary_notes_it_and_emits_gauge(monkeypatch):
     summary = mock_rcv.call_args.kwargs["summary"]
     assert "degraded to fallback" in summary
     assert mock_rcv.call_args.kwargs["conclusion"] == "success"
+
+
+def test_dispatch_token_exchange_runtime_error_degrades_not_raises(monkeypatch):
+    """#554 audit stage 6: get_install_token can raise a bare RuntimeError
+    on a malformed token-exchange response (github_app_auth), which the
+    original except (HTTPStatusError, RequestError) tuple did NOT catch -
+    Smasher's sibling dispatch already guards this exact case. Must
+    degrade to fetch_failed, never escape as a wire-level exception."""
+    def raising_retry(inst_id, fn):
+        raise RuntimeError("GitHub token exchange returned no token")
+
+    monkeypatch.setattr(wt_dispatch, "with_install_token_retry", raising_retry)
+    with patch("httpx.post") as mock_post, \
+         patch("personas.walkthrough.dispatch.record_check_verdict") as mock_rcv:
+        out = wt_dispatch.dispatch_walkthrough_review(_payload(), blocking=False)
+
+    assert out == {"persona": "walkthrough", "result": "fetch_failed"}
+    mock_post.assert_not_called()
+    mock_rcv.assert_not_called()
