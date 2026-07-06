@@ -414,3 +414,92 @@ def test_dispatch_truncated_files_logs_warning_and_hedges_the_comment(monkeypatc
     assert "walkthrough_file_fetch_capped" in caplog.text
     assert "at least 500" in posted["body"]
     assert "sprawl wide" in posted["body"]
+
+
+def test_dispatch_diff_fetch_failure_enqueues_self_recovery(monkeypatch):
+    """#554 peer review (codex/poolside/spark, CONFIRMED 3x): _run_job
+    claims the head-SHA idempotency key BEFORE calling dispatch. Teller
+    never publishes anything on fetch_failed, so without a durable retry
+    the SHA would be permanently suppressed - one silent skip forever.
+    Must enqueue exactly one rerun via the SAME lane Elder/Guard/Smasher
+    use for an unhandled dispatch error."""
+    monkeypatch.setattr(
+        wt_dispatch, "with_install_token_retry",
+        lambda inst_id, fn: fn("tok"),
+    )
+    with patch("httpx.get", side_effect=httpx.ConnectError("dns down")), \
+         patch("rerun.enqueue_rerun") as mock_rerun:
+        out = wt_dispatch.dispatch_walkthrough_review(_payload(), blocking=False)
+
+    assert out == {"persona": "walkthrough", "result": "fetch_failed"}
+    mock_rerun.assert_called_once_with(
+        install_id=1, repo="o/r", pr_number=7, persona="walkthrough",
+    )
+
+
+def test_dispatch_files_fetch_failure_enqueues_self_recovery(monkeypatch):
+    monkeypatch.setattr(
+        wt_dispatch, "with_install_token_retry",
+        lambda inst_id, fn: fn("tok"),
+    )
+
+    def fake_get(url, **kwargs):
+        if url.endswith("/files"):
+            raise httpx.ConnectError("dns down")
+        return _diff_response()
+
+    with patch("httpx.get", side_effect=fake_get), \
+         patch("rerun.enqueue_rerun") as mock_rerun:
+        out = wt_dispatch.dispatch_walkthrough_review(_payload(), blocking=False)
+
+    assert out == {"persona": "walkthrough", "result": "fetch_failed"}
+    mock_rerun.assert_called_once_with(
+        install_id=1, repo="o/r", pr_number=7, persona="walkthrough",
+    )
+
+
+def test_dispatch_publish_failure_enqueues_self_recovery(monkeypatch):
+    monkeypatch.setattr(
+        wt_dispatch, "with_install_token_retry",
+        lambda inst_id, fn: fn("tok"),
+    )
+
+    def fake_get(url, **kwargs):
+        if url.endswith("/files"):
+            return _files_response([])
+        if "/comments" in url:
+            return _empty_comments_response()
+        return _diff_response()
+
+    with patch("httpx.get", side_effect=fake_get), \
+         patch("httpx.post", side_effect=httpx.ConnectError("dns down")), \
+         patch("personas.walkthrough.dispatch.record_check_verdict"), \
+         patch("llm_client.summarize_pr", return_value=None), \
+         patch("rerun.enqueue_rerun") as mock_rerun:
+        out = wt_dispatch.dispatch_walkthrough_review(_payload(), blocking=False)
+
+    assert out == {"persona": "walkthrough", "result": "publish_failed"}
+    mock_rerun.assert_called_once_with(
+        install_id=1, repo="o/r", pr_number=7, persona="walkthrough",
+    )
+
+
+def test_self_recover_failure_is_swallowed_never_escalates(monkeypatch, caplog):
+    """The self-recovery enqueue is itself best-effort - if the rerun
+    queue isn't configured (RuntimeError) or the import fails, that must
+    log and never turn a degrade path into an unhandled exception."""
+    monkeypatch.setattr(
+        wt_dispatch, "with_install_token_retry",
+        lambda inst_id, fn: fn("tok"),
+    )
+
+    def raising_rerun(**kwargs):
+        raise RuntimeError("GRUG_RERUN_QUEUE_URL not configured")
+
+    with patch("httpx.get", side_effect=httpx.ConnectError("dns down")), \
+         patch("rerun.enqueue_rerun", side_effect=raising_rerun), \
+         caplog.at_level("WARNING", logger="grug.persona.walkthrough"):
+        out = wt_dispatch.dispatch_walkthrough_review(_payload(), blocking=False)
+
+    assert out == {"persona": "walkthrough", "result": "fetch_failed"}
+    assert "walkthrough_self_recover_failed" in caplog.text
