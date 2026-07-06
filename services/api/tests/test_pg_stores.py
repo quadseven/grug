@@ -795,3 +795,32 @@ def test_dep_watch_flag_and_targeting(pg):
     assert store.claim_dep_watch_report(4, "o/dep") is True
     assert store.claim_dep_watch_report(4, "o/dep") is False
 
+
+
+def test_ledger_exemplars_cache_and_corpus_scan_exclusion(pg):
+    """#538: exemplars cache round-trips under sk=EXEMPLARS, and BOTH
+    derived rows (PRACTICES + EXEMPLARS) are excluded from the corpus
+    scan - a cached derivation leaking into list_ledger_rows would feed
+    Elder its own output as ground truth. SQL-level guarantee, so it
+    needs the real store (the injectable-mock tests cannot catch a
+    NOT IN typo)."""
+    from adapters import pg_install_store as store
+
+    repo = "o/ledger"
+    store.put_ledger_row({
+        "repo": repo, "pr": 1, "reviewer": "codex", "severity": "HIGH",
+        "class": "correctness", "finding": "real row", "verdict": "fixed",
+    })
+    store.put_repo_practices(repo, [{"finding_class": "correctness",
+                                     "rule": "r", "hits": 1,
+                                     "example_prs": [1], "last_pr": 1}])
+    store.put_repo_exemplars(repo, [{"class": "correctness",
+                                     "severity": "HIGH",
+                                     "finding": "real row", "pr": 1}])
+    corpus = store.list_ledger_rows(repo)
+    assert len(corpus) == 1
+    assert corpus[0]["finding"] == "real row"
+    exemplars = store.get_repo_exemplars(repo)
+    assert exemplars == [{"class": "correctness", "severity": "HIGH",
+                          "finding": "real row", "pr": 1}]
+    assert store.get_repo_exemplars("o/none") == []

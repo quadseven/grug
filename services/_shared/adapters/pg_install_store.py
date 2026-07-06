@@ -577,7 +577,10 @@ def list_ledger_rows(repo: str, limit: int | None = None) -> list[dict[str, Any]
         rows = conn.execute(
             f"""
             SELECT pk, sk, data FROM grug_kv
-            WHERE pk = %s AND sk <> 'PRACTICES' AND {TTL_LIVE}
+            WHERE pk = %s AND sk NOT IN ('PRACTICES', 'EXEMPLARS') AND {TTL_LIVE}
+            -- keep the NOT IN list in lockstep with every derived-cache sk
+            -- (PRACTICES #527, EXEMPLARS #538): a cached derivation leaking
+            -- into the corpus scan feeds Elder its own output as ground truth
             ORDER BY sk COLLATE "C" ASC
             """,
             (_ledger_pk(repo),),
@@ -609,6 +612,31 @@ def get_repo_practices(repo: str) -> list[dict[str, Any]]:
     """The cached best-practices for a repo, or [] if none derived yet."""
     item = _get_item(_ledger_pk(repo), "PRACTICES")
     return list(item.get("practices", [])) if item else []
+
+
+def put_repo_exemplars(repo: str, exemplars: list[dict[str, Any]]) -> None:
+    """Cache the few-shot exemplars for a repo (#538) - one row under the
+    same LEDGER#<repo> partition, sk='EXEMPLARS'. Refreshed by the ingest
+    pass; read at review time for Elder's EXAMPLES section."""
+    with get_pool().connection() as conn:
+        conn.execute(
+            """
+            INSERT INTO grug_kv (pk, sk, data)
+            VALUES (%(pk)s, %(sk)s, %(data)s)
+            ON CONFLICT (pk, sk) DO UPDATE SET data = %(data)s
+            """,
+            {
+                "pk": _ledger_pk(repo),
+                "sk": "EXEMPLARS",
+                "data": encode_attrs({"exemplars": exemplars}),
+            },
+        )
+
+
+def get_repo_exemplars(repo: str) -> list[dict[str, Any]]:
+    """The cached few-shot exemplars for a repo, or [] if none derived."""
+    item = _get_item(_ledger_pk(repo), "EXEMPLARS")
+    return list(item.get("exemplars", [])) if item else []
 
 
 _DELIVERY_CLAIM_TTL_HOURS = 24

@@ -117,34 +117,13 @@ _LLMOBS_PAYLOAD_TRUNC_BYTES = 16 * 1024
 # format-specific first (AWS, GitHub, Slack), then the generic
 # "key=value" sweeps. False positives are acceptable; missing a real
 # secret is not.
-_SECRET_PATTERNS: tuple[tuple[re.Pattern[str], str], ...] = (
-    (re.compile(r"AKIA[0-9A-Z]{16}"), "[REDACTED:aws-access-key]"),
-    (re.compile(r"ghp_[A-Za-z0-9]{36,}"), "[REDACTED:github-pat]"),
-    (re.compile(r"ghs_[A-Za-z0-9]{36,}"), "[REDACTED:github-app-token]"),
-    (re.compile(r"github_pat_[A-Za-z0-9_]{82,}"), "[REDACTED:github-fine-grained-pat]"),
-    (re.compile(r"xox[baprs]-[A-Za-z0-9-]{10,}"), "[REDACTED:slack-token]"),
-    (re.compile(r"sk-[A-Za-z0-9]{32,}"), "[REDACTED:openai-style-key]"),
-    (re.compile(r"sk-or-v1-[A-Za-z0-9]{32,}"), "[REDACTED:openrouter-key]"),
-    (re.compile(r"-----BEGIN [A-Z ]*PRIVATE KEY-----[\s\S]*?-----END [A-Z ]*PRIVATE KEY-----"), "[REDACTED:pem-private-key]"),
-    # Generic `KEY=VALUE` env-var leak inside an added diff line.
-    # Min-length 8 catches `secret=hunter22` but not `key=42`; longer
-    # is too strict (real secrets like `secret12345` would slip).
-    (re.compile(
-        r'((?:password|passwd|secret|api[-_]?key|token|access[-_]?key)\s*[:=]\s*)["\']?[A-Za-z0-9_\-+/=]{8,}["\']?',
-        re.IGNORECASE,
-    ), r"\1[REDACTED:env-secret]"),
-)
-
-
-def _redact_secrets(text: str) -> str:
-    """Apply best-effort secret-pattern redaction. False positives are
-    acceptable (an `AKIA...`-shaped string in code that isn't an AWS
-    key still gets masked); missing a real secret is not. Patterns
-    target shapes most likely to appear in a PR diff: AWS/GH tokens,
-    Slack bot tokens, PEM private keys, `KEY=VALUE` env lines."""
-    for pattern, repl in _SECRET_PATTERNS:
-        text = pattern.sub(repl, text)
-    return text
+# The pattern set + redactor now live in the leaf module `redact` (#546:
+# the derived-block renderers must redact BEFORE their sanitizers
+# truncate, and importing llm_client from a pure module would be a
+# cycle/heavy-dep trap). Re-exported under the historical names so this
+# module's many call sites and tests are unchanged.
+from redact import SECRET_PATTERNS as _SECRET_PATTERNS  # noqa: F401
+from redact import redact_secrets as _redact_secrets
 
 
 def _redact_payload(payload: Any) -> Any:
@@ -452,6 +431,7 @@ def _build_messages(
     cross_file_contents: dict[str, str] | None = None,
     runtime_context: str | None = None,
     team_practices: str = "",
+    few_shot_examples: str = "",
 ) -> list[dict[str, str]]:
     # `file_contents` maps path → full file content at head SHA. Optional and
     # backward-compatible: when empty (fetch disabled/failed), the per-hunk
@@ -506,6 +486,11 @@ def _build_messages(
     system = _SYSTEM_PROMPTS[variant]
     if team_practices:
         system = f"{system}\n\n{team_practices}"
+    # Few-shot exemplars (#538, #361 slice 3) append AFTER the practices:
+    # RULES state the norms, EXAMPLES teach the shape. Same call-time,
+    # repo-specific rationale as team_practices.
+    if few_shot_examples:
+        system = f"{system}\n\n{few_shot_examples}"
     return [
         {"role": "system", "content": system},
         {"role": "user", "content": _redact_secrets("\n\n".join(parts))},
@@ -748,6 +733,28 @@ def _team_practices_block(pr_context: Optional[PrContext]) -> str:
         return ""
 
 
+def _few_shot_block(pr_context: Optional[PrContext]) -> str:
+    """Fetch + render the repo's cached few-shot exemplars for the prompt
+    (#538). Best-effort: any failure (no repo, store down, none derived)
+    returns "" so the review runs without EXAMPLES. Redacted for the same
+    reason as the practices block - exemplar text is ledger-derived and
+    rides the SYSTEM prompt to a third-party backend."""
+    if not pr_context or "repo" not in pr_context:
+        return ""
+    try:
+        from adapters.pg_install_store import get_repo_exemplars  # type: ignore
+        from few_shot import exemplars_block, exemplars_from_dicts  # type: ignore
+        rows = get_repo_exemplars(str(pr_context["repo"]))
+        if not rows:
+            return ""
+        block = exemplars_block(exemplars_from_dicts(rows))
+        return _redact_secrets(block) if block else ""
+    except Exception as e:  # noqa: BLE001 - exemplars never break a review, but log
+        log.warning("few_shot_fetch_failed", extra={
+            "repo": str(pr_context.get("repo", "")), "kind": type(e).__name__})
+        return ""
+
+
 def review_diff(
     hunks: list[Hunk],
     installation_id: int,
@@ -779,6 +786,7 @@ def review_diff(
     messages = _build_messages(
         hunks, variant, file_contents, cross_file_contents, runtime_context,
         team_practices=_team_practices_block(pr_context),
+        few_shot_examples=_few_shot_block(pr_context),
     )
     pr_tags = _llmobs_tags(pr_context)
 

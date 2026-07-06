@@ -6,6 +6,7 @@
                                              # entries; changed prompt: drops them)
     python -m elder_eval --check             # ... and exit 1 on regression vs baseline
     python -m elder_eval --ab-practices      # also measure the #527 practices delta
+    python -m elder_eval --ab-few-shot       # also measure the #538 few-shot delta
 
 Corpus source: `--repo <owner/name>` reads the INGESTED store rows (needs
 the DB env; the in-cluster path), else `--jsonl <path>` parses the
@@ -17,8 +18,11 @@ All modes make REAL backend calls (`sast_benchmark.backends`
 GRUG_BENCH_* env) and REAL GitHub diff fetches - never run in the per-PR
 CI suite. The per-PR suite exercises only the pure core + the prompt-sha
 gate (test_elder_eval.py). The baseline records the STATIC prompt run
-(no practices block) so it is stable across repos; `--ab-practices`
-prints the ON-vs-OFF delta separately - the #527 measurement.
+(no derived blocks - neither practices nor few-shot) so it is stable
+across repos; `--ab-practices` and
+`--ab-few-shot` print their ON-vs-OFF deltas separately - the #527 and
+#538 measurements. An empty derived block skips its ON arm loudly (an
+A/A replay printed as a delta would be a fabricated result).
 """
 
 from __future__ import annotations
@@ -70,6 +74,25 @@ def _print_report(name: str, report: EvalReport) -> None:
         print(f"  !! unknown verdicts (excluded - fix the corpus labels): {uv}")
 
 
+
+def _run_ab_arm(
+    backend, all_cases, cases, token, baseline_report, *, label, block, kwarg
+) -> None:
+    """One ON-arm replay + delta print vs the baseline report. `kwarg` is
+    the run_eval keyword carrying the block (team_practices / few_shot)."""
+    on = score(
+        all_cases, run_eval(backend, cases, token=token, **{kwarg: block})
+    )
+    _print_report(f"{backend.name} + {label}", on)
+    print(
+        f"\n{label} delta: catch "
+        f"{baseline_report.overall_catch:.2f} -> {on.overall_catch:.2f} "
+        f"({on.overall_catch - baseline_report.overall_catch:+.2f}), noise "
+        f"{baseline_report.noise_rate:.2f} -> {on.noise_rate:.2f} "
+        f"({on.noise_rate - baseline_report.noise_rate:+.2f})"
+    )
+
+
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(prog="elder_eval")
     src = parser.add_mutually_exclusive_group()
@@ -89,6 +112,11 @@ def main(argv: list[str] | None = None) -> int:
         "--ab-practices",
         action="store_true",
         help="also replay WITH the #527 practices block and print the delta",
+    )
+    parser.add_argument(
+        "--ab-few-shot",
+        action="store_true",
+        help="also replay WITH the #538 few-shot EXAMPLES and print the delta",
     )
     args = parser.parse_args(argv)
 
@@ -151,16 +179,40 @@ def main(argv: list[str] | None = None) -> int:
         from best_practices import derive_practices, practices_block
 
         block = practices_block(derive_practices(list(rows)))
-        with_practices = score(
-            cases, run_eval(backend, cases, token=token, team_practices=block)
-        )
-        _print_report(f"{backend.name} + practices (#527)", with_practices)
+    else:
+        block = ""
+    if args.ab_practices and not block:
+        # An empty block makes the ON arm byte-identical to baseline -
+        # the "delta" would be pure sampling noise dressed as a result.
         print(
-            f"\n#527 practices delta: catch "
-            f"{report.overall_catch:.2f} -> {with_practices.overall_catch:.2f} "
-            f"({with_practices.overall_catch - report.overall_catch:+.2f}), noise "
-            f"{report.noise_rate:.2f} -> {with_practices.noise_rate:.2f} "
-            f"({with_practices.noise_rate - report.noise_rate:+.2f})"
+            "#527 practices: no practices derivable from this corpus - "
+            "skipping ON arm (delta would be A/A noise)"
+        )
+    if block:
+        _run_ab_arm(
+            backend, all_cases, cases, token, report,
+            label="practices (#527)", block=block, kwarg="team_practices",
+        )
+
+    if args.ab_few_shot:
+        from few_shot import exemplars_block, exemplars_from_rows
+        from ledger import accepted_findings_by_class
+
+        examples = exemplars_block(
+            exemplars_from_rows(accepted_findings_by_class(list(rows)))
+        )
+    else:
+        examples = ""
+    if args.ab_few_shot and not examples:
+        print(
+            "#538 few-shot: no exemplars derivable from this corpus "
+            "(0 accepted findings) - skipping ON arm (delta would be "
+            "A/A noise)"
+        )
+    if examples:
+        _run_ab_arm(
+            backend, all_cases, cases, token, report,
+            label="few-shot (#538)", block=examples, kwarg="few_shot",
         )
 
     if args.record:
