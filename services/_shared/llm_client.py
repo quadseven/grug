@@ -739,6 +739,9 @@ class WalkthroughSummary:
 
     summary: str
     file_summaries: dict[str, str]
+    # UNVALIDATED model output - not yet checked against the closed
+    # ReviewEffort set. Must pass through effort.estimate_effort's
+    # REVIEW_EFFORTS gate before use; never render this raw.
     effort: str | None
 
 

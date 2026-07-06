@@ -168,7 +168,7 @@ def dispatch_walkthrough_review(
         model_effort = llm_summary.effort
         files = [
             FileStat(path=f.path, additions=f.additions, deletions=f.deletions,
-                     summary=blurbs.get(f.path, ""))
+                     summary=blurbs.get(f.path))
             for f in files
         ]
     else:
