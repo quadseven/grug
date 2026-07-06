@@ -35,7 +35,7 @@ from typing import Any, Callable, Literal, Optional, TypedDict, get_args
 import httpx
 
 from code_review_prompt import PromptVariant, build_system_prompt
-from review_types import SEVERITIES, Severity
+from review_types import EFFORTS, SEVERITIES, Effort, Severity
 from secrets_loader import (
     get_openrouter_api_key,
     get_poolside_api_key,
@@ -230,12 +230,7 @@ class Finding:
     # is confident and line-exact; anything non-str/empty coerces to None.
     # `effort` is a closed enum (quick-win / heavy-lift) or "".
     suggestion: str | None = None
-    effort: str = ""
-
-
-# The one effort vocabulary (#553) - validated at coercion so a typo'd
-# label degrades to "" instead of leaking into render surfaces.
-EFFORTS: frozenset[str] = frozenset({"quick-win", "heavy-lift"})
+    effort: Effort | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -593,7 +588,7 @@ def _coerce_finding(raw: Any) -> tuple[Optional[Finding], str]:
         else None
     )
     raw_effort = raw.get("effort")
-    effort = raw_effort if raw_effort in EFFORTS else ""
+    effort = raw_effort if raw_effort in EFFORTS else None
     return Finding(
         path=path, line=line, rule=rule, severity=severity, message=message,  # type: ignore[arg-type]
         suggestion=suggestion, effort=effort,

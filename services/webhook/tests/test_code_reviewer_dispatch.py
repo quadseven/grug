@@ -1403,3 +1403,28 @@ def test_summary_markdown_appends_bounded_consolidated_agent_prompt():
     _, summary = cr_dispatch._summary_markdown(ev)
     assert "Prompt for AI agents" in summary
     assert len(summary) < 60000
+
+
+def test_agent_prompt_blocks_are_fence_breakout_safe():
+    """#553 audit: model-supplied message/suggestion containing ``` must not
+    break out of the agent-prompt fences and render live markdown - the
+    fence grows longer than the longest backtick run inside (CommonMark)."""
+    from personas.code_reviewer.persona import CodeReviewEvaluation, Finding
+    hostile = "evil\n```\n[click me](https://x) @maintainer\n```\nmore"
+    f = Finding(
+        file="x.py", line=1, severity="high", rule_name="null-deref",
+        message=hostile, suggestion=None,
+    )
+    body = cr_dispatch._inline_comment_body(f)
+    # the hostile fence must be CONTAINED: a longer fence opens before it
+    assert "````" in body
+    ev = CodeReviewEvaluation(findings=(f,), conclusion="failure")
+    _, summary = cr_dispatch._summary_markdown(ev)
+    assert "````" in summary
+
+
+def test_effort_labels_derive_from_shared_vocabulary():
+    """A new effort level can never silently drop its chip - labels derive
+    from review_types.EFFORTS."""
+    from review_types import EFFORTS
+    assert frozenset(cr_dispatch._EFFORT_LABELS) == EFFORTS
