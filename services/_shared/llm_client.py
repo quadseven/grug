@@ -563,6 +563,7 @@ def _call_backend(
 # every message and GitHub 422s past 65536 chars - an uncapped verbose
 # model could vanish the whole check-run. Visible truncation, never silent.
 _MAX_FINDING_MESSAGE_CHARS = 1500
+_MAX_SUGGESTION_CHARS = 2000
 
 
 def _coerce_finding(raw: Any) -> tuple[Optional[Finding], str]:
@@ -611,6 +612,11 @@ def _coerce_finding(raw: Any) -> tuple[Optional[Finding], str]:
     message = _redact_secrets(message)
     if len(message) > _MAX_FINDING_MESSAGE_CHARS:
         message = message[:_MAX_FINDING_MESSAGE_CHARS] + " [truncated]"
+    if suggestion is not None and len(suggestion) > _MAX_SUGGESTION_CHARS:
+        # A "replacement for the flagged line" this size is not a
+        # suggestion - and uncapped it can blow the comment-body or
+        # summary limits. Drop it (the finding still lands).
+        suggestion = None
     if suggestion is not None:
         suggestion = _redact_secrets(suggestion)
     return Finding(
