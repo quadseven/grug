@@ -4,15 +4,15 @@
       "cases_scored": 12,
       "errored_cases": [],
       "noise_rate": 0.0,
-      "overall_catch": 0.025,
+      "overall_catch": 0.125,
       "per_class_catch": {
-        "correctness": 0.125,
-        "security-scope": 0.0,
-        "silent-failure": 0.0,
+        "correctness": 0.0,
+        "security-scope": 0.14285714285714285,
+        "silent-failure": 0.2,
         "simplification": 0.0,
-        "test-gap": 0.0,
+        "test-gap": 0.14285714285714285,
         "type-design": 0.0,
-        "upstream-semantics": 0.0
+        "upstream-semantics": 0.2
       },
       "truncated_cases": [
         "githumps/grug#366",
