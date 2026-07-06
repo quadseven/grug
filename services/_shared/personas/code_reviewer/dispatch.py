@@ -23,6 +23,7 @@ from __future__ import annotations
 
 import logging
 import os
+import re
 from typing import Any, Literal
 from urllib.parse import quote
 
@@ -35,6 +36,7 @@ from github_reviews_client import (
     InlineComment, ReviewEvent, ReviewResult, get_review_comments, post_review,
 )
 from llm_client import Hunk as LlmHunk, LlmReviewResponse, review_diff
+from review_types import EFFORTS
 from personas.code_reviewer.dedup import (
     dedup_findings, finding_key, parse_rule, prior_keys_from_comments,
     rule_marker,
@@ -289,20 +291,151 @@ def _summary_markdown(
         icon = severity_icon.get(f.severity, "•")
         rows.append(
             f"| {icon} {f.severity} | `{f.file}` | {f.line} | "
-            f"`{f.rule_name}` | {f.message} |"
+            f"`{f.rule_name}` | {_defused(f.message)} |"
         )
-    return title, "\n".join(rows)
+    table = "\n".join(rows)
+    return title, f"{table}{held}\n\n{_consolidated_agent_prompt(evaluation)}"
+
+
+# GitHub caps check-run summaries at 65536 chars; the findings table is
+# unbounded (message-length x count), so the consolidated prompt gets a
+# fixed budget well under the cap and truncates by WHOLE findings.
+_CONSOLIDATED_PROMPT_BUDGET = 8000
+
+
+def _consolidated_agent_prompt(evaluation: CodeReviewEvaluation) -> str:
+    """One copy-paste prompt covering the findings (#553), deterministic
+    and bounded. Truncates by whole findings and SAYS how many were cut -
+    a silently-partial prompt would read as the complete work list."""
+    header = [
+        "Address each finding below. Keep every fix minimal and scoped to "
+        "the named line; do not refactor beyond the findings.",
+    ]
+
+    body: list[str] = []
+    used = sum(len(x) + 1 for x in header)
+    included = 0
+    for f in evaluation.findings:
+        entry = f"- {f.file}:{f.line} [{f.severity}/{f.rule_name}] {f.message}"
+        if f.suggestion:
+            entry += f"\n  Suggested fix: {f.suggestion}"
+        if used + len(entry) + 1 > _CONSOLIDATED_PROMPT_BUDGET:
+            break
+        body.append(entry)
+        used += len(entry) + 1
+        included += 1
+    cut = len(evaluation.findings) - included
+    if cut:
+        body.append(
+            f"(+{cut} more finding(s) - see the findings table above)"
+        )
+    block = _details_block(
+        "Prompt for AI agents (all findings)", "\n".join(header + body)
+    )
+    # Hard deterministic ceiling: fence growth (backtick-run + 1, twice)
+    # and the wrapper are not in the per-entry budget, so cap the WHOLE
+    # block - an oversized prompt must degrade loudly, never 422 the
+    # check-run publish.
+    if len(block) > 2 * _CONSOLIDATED_PROMPT_BUDGET:
+        return "(Prompt for AI agents omitted - findings too large; see the table above)"
+    return block
+
+
+# Derived from the shared vocabulary so a new effort level can never
+# silently drop its chip (the Severity-partition-assert drift class).
+_EFFORT_LABELS = {e: e.replace("-", " ") for e in EFFORTS}
+
+
+def _details_block(summary: str, content: str) -> str:
+    """The one <details> scaffold for agent prompts - the blank lines
+    around the fence are load-bearing for GitHub rendering, so both
+    surfaces share this instead of hand-building drift-prone copies."""
+    return "\n".join(
+        ["<details>", f"<summary>{summary}</summary>", "", _fenced(content), "", "</details>"]
+    )
+
+
+def _defused(prose: str) -> str:
+    """Neutralize fence-capable backtick runs in PROSE surfaces (comment
+    head, table cells): an unterminated ``` in a model message would open
+    a fence that swallows the rest of the body - including the dedup
+    marker and the suggestion block. Inline code spans (1-2 backticks)
+    render untouched."""
+    return re.sub(r"`{3,}", "``", prose)
+
+
+def _fenced(text: str) -> str:
+    """Wrap text in a code fence GUARANTEED to contain it: the fence is one
+    backtick longer than the longest backtick run inside (CommonMark).
+    Model-supplied text with ``` must never break out of the block and
+    render live markdown (links, @-mentions that ping) inside an agent
+    prompt or the check-run summary."""
+    longest = max((len(m) for m in re.findall(r"`+", text)), default=0)
+    fence = "`" * max(3, longest + 1)
+    return f"{fence}\n{text}\n{fence}"
+
+
+def _agent_prompt_block(f: Finding) -> str:
+    """The copy-paste remediation prompt (#553), assembled DETERMINISTICALLY
+    from finding fields - no extra LLM call, so it can never hallucinate
+    beyond what the finding already claims."""
+    content = [
+        f"In {f.file}:{f.line} address this {f.severity} finding "
+        f"({f.rule_name}):",
+        f.message,
+        "Fix focus: change only what the finding names; keep the fix "
+        "minimal and line-exact; do not refactor beyond it.",
+    ]
+    if f.suggestion:
+        content += ["Suggested fix:", f.suggestion]
+    return _details_block("Prompt for AI agents", "\n".join(content))
 
 
 def _inline_comment_body(f: Finding) -> str:
-    """Format one finding as an inline-comment Markdown body.
+    """Format one finding as an inline-comment Markdown body (#553:
+    committable suggestion block + effort chip + agent prompt).
 
     Appends a hidden `grug-rule` marker (rendered invisibly by GitHub)
     so a later `synchronize` push can recognise this comment as a Grug
-    finding for dedup (#189) — see dedup.parse_rule."""
-    head = f"**{f.severity.upper()} · `{f.rule_name}`**\n\n{f.message}"
-    body = f"{head}\n\n**Suggested fix:**\n{f.suggestion}" if f.suggestion else head
-    return f"{body}\n\n{rule_marker(f.rule_name)}"
+    finding for dedup (#189) — see dedup.parse_rule. The marker stays
+    LAST (dedup.parse_rule reads the last marker in the body)."""
+    chip = f"**{f.severity.upper()} · `{f.rule_name}`**"
+    if f.effort in _EFFORT_LABELS:
+        chip += f" · {_EFFORT_LABELS[f.effort]}"
+    head = f"{chip}\n\n{_defused(f.message)}"
+    # strip wrapping NEWLINES only (not spaces): GitHub commits the block
+    # verbatim as the full replacement line, so leading indentation must
+    # survive, but a bare "\n\n\n" suggestion must not slip through as a
+    # blank-line commit (FLINT finding on #558).
+    stripped_suggestion = f.suggestion.strip("\n\r") if f.suggestion else ""
+    if (
+        f.suggestion
+        and "```" not in f.suggestion
+        and "\n" not in f.suggestion.strip()
+        and stripped_suggestion
+    ):
+        # GitHub-native committable block - one click REPLACES the single
+        # anchored line. Committable ONLY when the suggestion is itself
+        # single-line and fence-safe: the comment anchors one line, so a
+        # multi-line suggestion applied there duplicates the following
+        # original lines - confident-looking one-click corruption.
+        body = (
+            f"{head}\n\n**Suggested fix:**\n"
+            f"```suggestion\n{stripped_suggestion}\n```"
+        )
+    elif f.suggestion:
+        # Multi-line or fence-bearing: fenced prose with an explicit scope
+        # label. _fenced() contains ANY payload (a suggestion containing
+        # ```suggestion would otherwise render as a live committable block
+        # - the sanitizer must not route the payload around itself).
+        body = (
+            f"{head}\n\n**Suggested fix** "
+            f"(anchored at line {f.line} - verify scope before applying):\n"
+            f"{_fenced(f.suggestion)}"
+        )
+    else:
+        body = head
+    return f"{body}\n\n{_agent_prompt_block(f)}\n\n{rule_marker(f.rule_name)}"
 
 
 def _resolve_result(

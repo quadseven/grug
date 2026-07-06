@@ -28,7 +28,7 @@ from typing import get_args
 from github_checks_client import CheckConclusion
 from llm_client import LlmReviewResponse
 from personas.code_reviewer.diff_parser import DiffHunk
-from review_types import Severity  # single source (#250)
+from review_types import Effort, Severity  # single source (#250)
 
 # A finding at one of these severities flips the aggregate verdict.
 # Medium + low remain advisory: reported in the check-run summary but
@@ -68,6 +68,10 @@ class Finding:
     rule_name: str
     message: str
     suggestion: str | None
+    # #553: closed-enum fix-effort hint, typed against the shared Literal
+    # (review_types.Effort) so an off-vocabulary value is a type error at
+    # the constructor, not a silently dropped chip. None = no estimate.
+    effort: Effort | None = None
 
     def __post_init__(self) -> None:
         assert self.line >= 1, (
@@ -216,9 +220,11 @@ def evaluate_diff(
                 severity=raw.severity,
                 rule_name=raw.rule,
                 message=raw.message,
-                # `None` (not "") so consumers don't conflate "LLM
-                # supplied no hint" with "LLM supplied an empty hint."
-                suggestion=None,
+                # #553: wire fields carry through; the anti-hallucination
+                # line gate above already guarantees a suggestion only
+                # anchors on a line the LLM actually saw.
+                suggestion=raw.suggestion,
+                effort=raw.effort,
             )
         )
 

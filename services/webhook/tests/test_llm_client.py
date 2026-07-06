@@ -1380,3 +1380,73 @@ def test_review_diff_injects_cached_exemplars(monkeypatch) -> None:
     system = captured["messages"][0]["content"]
     assert "EXAMPLES OF ACCEPTED FINDINGS" in system
     assert "cached exemplar finding" in system
+
+
+def test_coerce_finding_parses_suggestion_and_effort() -> None:
+    """#553 wire format: optional suggestion (non-empty str else None) and
+    effort (closed enum else "")."""
+    ok, reason = lc._coerce_finding({
+        "path": "x.py", "line": 1, "rule": "null-deref", "severity": "high",
+        "message": "m", "suggestion": "fixed line", "effort": "quick-win",
+    })
+    assert reason == "" and ok is not None
+    assert ok.suggestion == "fixed line" and ok.effort == "quick-win"
+
+    # hostile/malformed values degrade, never reject the finding
+    ok2, _ = lc._coerce_finding({
+        "path": "x.py", "line": 1, "rule": "r", "severity": "low",
+        "message": "m", "suggestion": {"not": "a str"}, "effort": "yolo",
+    })
+    assert ok2 is not None
+    assert ok2.suggestion is None and ok2.effort is None
+
+    # unhashable effort must degrade, not TypeError the whole parse
+    ok4, _ = lc._coerce_finding({
+        "path": "x.py", "line": 1, "rule": "r", "severity": "low",
+        "message": "m", "effort": [], "suggestion": ["also", "bad"],
+    })
+    assert ok4 is not None and ok4.effort is None and ok4.suggestion is None
+
+    # absent fields keep prior behavior
+    ok3, _ = lc._coerce_finding({
+        "path": "x.py", "line": 1, "rule": "r", "severity": "low", "message": "m",
+    })
+    assert ok3 is not None and ok3.suggestion is None and ok3.effort is None
+
+
+def test_coerce_finding_redacts_and_caps_message_and_suggestion() -> None:
+    """#553 audit: the model can ECHO a diff secret into message/suggestion,
+    and a posted comment outlives a force-push - redact at the coercion
+    choke point; cap message length with a VISIBLE marker."""
+    pem = (
+        "-----BEGIN RSA PRIVATE KEY-----\n" + "MIIEfake\n" * 5
+        + "-----END RSA PRIVATE KEY-----"
+    )
+    ok, _ = lc._coerce_finding({
+        "path": "x.py", "line": 1, "rule": "r", "severity": "high",
+        "message": "leak: " + pem + " end " + "x" * 3000,
+        "suggestion": "key = " + pem,
+    })
+    assert ok is not None
+    assert "MIIEfake" not in ok.message
+    # stage-8 policy: a redaction-ALTERED suggestion is dropped entirely
+    # (a committable [REDACTED:...] placeholder would corrupt source).
+    assert ok.suggestion is None
+    assert "[REDACTED:pem-private-key]" in ok.message
+    assert ok.message.endswith("[truncated]")
+    assert len(ok.message) <= 1520
+
+
+def test_coerce_finding_drops_suggestion_redaction_would_alter() -> None:
+    """#553 audit stage 8: a suggestion that echoed a secret is DROPPED,
+    never rendered - a committable block containing [REDACTED:...] would
+    one-click the placeholder into source."""
+    # constructed at runtime, not a committed credential-shaped literal
+    fake_aws_key = "AKIA" + "".join(["ABCDEFGHIJKLMNOP"[i % 16] for i in range(16)])
+    ok, _ = lc._coerce_finding({
+        "path": "x.py", "line": 1, "rule": "r", "severity": "high",
+        "message": "m",
+        "suggestion": f"key = '{fake_aws_key}'",
+    })
+    assert ok is not None
+    assert ok.suggestion is None

@@ -35,7 +35,7 @@ from typing import Any, Callable, Literal, Optional, TypedDict, get_args
 import httpx
 
 from code_review_prompt import PromptVariant, build_system_prompt
-from review_types import SEVERITIES, Severity
+from review_types import EFFORTS, SEVERITIES, Effort, Severity
 from secrets_loader import (
     get_openrouter_api_key,
     get_poolside_api_key,
@@ -225,6 +225,13 @@ class Finding:
     rule: str
     severity: Severity
     message: str
+    # #553: optional one-click remediation fields. `suggestion` is the exact
+    # replacement text for the flagged line(s) - emitted only when the model
+    # is confident and line-exact; anything non-str/empty coerces to None.
+    # `effort` is a closed enum (quick-win / heavy-lift) or None
+    # (mirrors suggestion's None-for-absent).
+    suggestion: str | None = None
+    effort: Effort | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -552,6 +559,13 @@ def _call_backend(
     raise AssertionError("retry loop exited without producing a response")
 
 
+# Message length cap (#553 audit): the check-run findings table repeats
+# every message and GitHub 422s past 65536 chars - an uncapped verbose
+# model could vanish the whole check-run. Visible truncation, never silent.
+_MAX_FINDING_MESSAGE_CHARS = 1500
+_MAX_SUGGESTION_CHARS = 2000
+
+
 def _coerce_finding(raw: Any) -> tuple[Optional[Finding], str]:
     """Validate one raw dict from the LLM into a `Finding`. Returns
     `(finding, "")` on success or `(None, reason)` on rejection so
@@ -572,8 +586,46 @@ def _coerce_finding(raw: Any) -> tuple[Optional[Finding], str]:
         return None, f"bad_type:{type(e).__name__}"
     if severity not in SEVERITIES:
         return None, f"invalid_severity:{severity[:32]}"
+    # #553 optional fields: malformed values DEGRADE (finding still lands),
+    # never reject - a hostile model must not be able to drop a real
+    # finding by attaching a bad suggestion.
+    raw_suggestion = raw.get("suggestion")
+    suggestion = (
+        raw_suggestion
+        if isinstance(raw_suggestion, str) and raw_suggestion.strip()
+        else None
+    )
+    # isinstance BEFORE the frozenset membership: an unhashable value
+    # ([] / {}) would TypeError out of the whole parse and drop every
+    # finding - the exact hostile-model outcome this coercion exists to
+    # prevent.
+    raw_effort = raw.get("effort")
+    effort = (
+        raw_effort
+        if isinstance(raw_effort, str) and raw_effort in EFFORTS
+        else None
+    )
+    # Output-side redaction at the ONE choke point: the model can ECHO a
+    # secret from the diff into message/suggestion, and a posted comment
+    # OUTLIVES a force-push that scrubs the diff. Every downstream surface
+    # (inline comment, agent prompts, summary table) inherits this.
+    message = _redact_secrets(message)
+    if len(message) > _MAX_FINDING_MESSAGE_CHARS:
+        message = message[:_MAX_FINDING_MESSAGE_CHARS] + " [truncated]"
+    if suggestion is not None:
+        redacted = _redact_secrets(suggestion)
+        if redacted != suggestion:
+            # A suggestion that echoed a secret is dropped entirely: a
+            # committable block containing [REDACTED:...] would one-click
+            # the placeholder into source.
+            suggestion = None
+        elif len(suggestion) > _MAX_SUGGESTION_CHARS:
+            # Not a line replacement at this size - and uncapped it can
+            # blow the comment-body or summary limits. Drop, keep finding.
+            suggestion = None
     return Finding(
         path=path, line=line, rule=rule, severity=severity, message=message,  # type: ignore[arg-type]
+        suggestion=suggestion, effort=effort,
     ), ""
 
 

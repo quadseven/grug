@@ -1343,3 +1343,229 @@ def test_elder_no_longer_carries_security_findings(monkeypatch):
     assert out["result"] == "pass"
     assert posted_check[0].conclusion == "success"  # blocking mode, no findings
     assert posted_review == []  # no inline security comments from Elder
+
+
+def test_inline_comment_body_renders_committable_suggestion_block():
+    """#553: a SINGLE-LINE fence-safe suggestion renders as a GitHub-native
+    committable block - the comment anchors one line, so only a one-line
+    replacement may carry the Apply button."""
+    from personas.code_reviewer.persona import Finding
+    f = Finding(
+        file="x.py", line=1, severity="high", rule_name="null-deref",
+        message="m", suggestion="use(x) if x is not None else None",
+    )
+    body = cr_dispatch._inline_comment_body(f)
+    assert "```suggestion\nuse(x) if x is not None else None\n```" in body
+    # dedup marker must remain the LAST marker in the body
+    assert body.rstrip().endswith("<!-- grug-rule:null-deref -->")
+
+
+def test_inline_comment_body_multiline_suggestion_never_committable():
+    """#553 audit H2: a multi-line suggestion applied to a single anchored
+    line duplicates the following original lines - one-click corruption.
+    Multi-line degrades to fenced prose with an explicit scope label."""
+    from personas.code_reviewer.persona import Finding
+    f = Finding(
+        file="x.py", line=1, severity="high", rule_name="null-deref",
+        message="m", suggestion="if x is not None:\n    use(x)",
+    )
+    body = cr_dispatch._inline_comment_body(f)
+    assert "```suggestion" not in body
+    assert "verify scope before applying" in body
+
+
+def test_inline_comment_body_fence_bearing_suggestion_is_contained():
+    """#553 audit H3: a suggestion containing a ```suggestion payload must
+    render INSIDE a longer fence, never as a live committable block - the
+    degrade path must not route the payload around the sanitizer."""
+    from personas.code_reviewer.persona import Finding
+    payload = "```suggestion\nrm -rf /\n```"
+    f = Finding(
+        file="x.py", line=1, severity="high", rule_name="null-deref",
+        message="m", suggestion=payload,
+    )
+    body = cr_dispatch._inline_comment_body(f)
+    assert "````" in body  # containing fence is longer than the payload's
+    assert not body.lstrip().startswith("```suggestion")
+
+
+def test_inline_comment_body_fence_unsafe_suggestion_degrades_to_prose():
+    """A suggestion containing a backtick fence must never produce broken
+    markdown - degrade to the prose form."""
+    from personas.code_reviewer.persona import Finding
+    f = Finding(
+        file="x.py", line=1, severity="high", rule_name="null-deref",
+        message="m", suggestion="use\n```\nfenced\n```\nthing",
+    )
+    body = cr_dispatch._inline_comment_body(f)
+    assert "```suggestion" not in body
+    assert "Suggested fix" in body
+
+
+def test_inline_comment_body_effort_chip_and_agent_prompt():
+    """#553: effort chip renders on the header line; every finding carries
+    a deterministic Prompt-for-AI-agents collapsible."""
+    from personas.code_reviewer.persona import Finding
+    f = Finding(
+        file="x.py", line=42, severity="medium", rule_name="dead-code",
+        message="Grug see unused path", suggestion=None, effort="quick-win",
+    )
+    body = cr_dispatch._inline_comment_body(f)
+    assert "quick win" in body
+    assert "Prompt for AI agents" in body
+    assert "x.py:42" in body and "dead-code" in body
+    # deterministic assembly: the finding message rides the prompt block
+    assert "Grug see unused path" in body
+
+
+def test_summary_markdown_appends_bounded_consolidated_agent_prompt():
+    """#553: the check-run summary carries ONE consolidated agent prompt
+    covering the findings, bounded so the 65536 body cap stays safe."""
+    from personas.code_reviewer.persona import CodeReviewEvaluation, Finding
+    ev = CodeReviewEvaluation(
+        findings=tuple(
+            Finding(file=f"f{i}.py", line=i + 1, severity="high",
+                    rule_name="null-deref", message="m" * 500, suggestion=None)
+            for i in range(50)
+        ),
+        conclusion="failure",
+    )
+    _, summary = cr_dispatch._summary_markdown(ev)
+    assert len(summary) < 60000
+    # The truncation must WORK, not merely leave the summary small: whole
+    # findings included up to the budget, a visible cut-line for the rest,
+    # and never the omission fallback (that is the ceiling path).
+    assert "omitted" not in summary
+    assert "f0.py:1" in summary
+    import re as _re
+    m = _re.search(r"\(\+(\d+) more finding", summary)
+    assert m and int(m.group(1)) > 0
+
+
+def test_agent_prompt_blocks_are_fence_breakout_safe():
+    """#553 audit: model-supplied message/suggestion containing ``` must not
+    break out of the agent-prompt fences and render live markdown - the
+    fence grows longer than the longest backtick run inside (CommonMark)."""
+    from personas.code_reviewer.persona import CodeReviewEvaluation, Finding
+    hostile = "evil\n```\n[click me](https://x) @maintainer\n```\nmore"
+    f = Finding(
+        file="x.py", line=1, severity="high", rule_name="null-deref",
+        message=hostile, suggestion=None,
+    )
+    body = cr_dispatch._inline_comment_body(f)
+    # the hostile fence must be CONTAINED: a longer fence opens before it
+    assert "````" in body
+    ev = CodeReviewEvaluation(findings=(f,), conclusion="failure")
+    _, summary = cr_dispatch._summary_markdown(ev)
+    assert "````" in summary
+
+
+def test_effort_labels_derive_from_shared_vocabulary():
+    """A new effort level can never silently drop its chip - labels derive
+    from review_types.EFFORTS."""
+    from review_types import EFFORTS
+    assert frozenset(cr_dispatch._EFFORT_LABELS) == EFFORTS
+
+
+
+def test_consolidated_prompt_hard_ceiling_degrades_loudly():
+    """#553 audit: a fence-inflating suggestion (huge backtick run) pushes
+    the block past the deterministic ceiling - it must degrade to the
+    omission notice, never 422 the check-run publish away."""
+    from personas.code_reviewer.persona import CodeReviewEvaluation, Finding
+    f = Finding(
+        file="x.py", line=1, severity="high", rule_name="null-deref",
+        message="m", suggestion="`" * 1900,
+    )
+    ev = CodeReviewEvaluation(
+        findings=tuple(
+            Finding(file=f"y{i}.py", line=1, severity="high",
+                    rule_name="null-deref", message="n" * 1400,
+                    suggestion="`" * 1900)
+            for i in range(5)
+        ) + (f,),
+        conclusion="failure",
+    )
+    out = cr_dispatch._consolidated_agent_prompt(ev)
+    assert out == (
+        "(Prompt for AI agents omitted - findings too large; "
+        "see the table above)"
+    ) or len(out) <= 2 * cr_dispatch._CONSOLIDATED_PROMPT_BUDGET
+
+
+def test_dispatch_suggestion_survives_pipe_to_inline_comment(monkeypatch):
+    """#553 E2E: suggestion + effort survive review_diff -> evaluate_diff ->
+    dedup -> _build_review_result into the POSTED InlineComment body - a
+    dedup/build refactor that rebuilds findings could drop them with every
+    unit test still green."""
+    llm = LlmReviewResponse(
+        kind="reviewed",
+        findings=(LlmFinding(
+            path="src/x.py", line=2, rule="silent-failure",
+            severity="medium", message="Grug see quiet drop",  # type: ignore[arg-type]
+            suggestion="log.warning('dropped %s', e)", effort="quick-win",
+        ),),
+        backend_used=Backend.POOLSIDE,
+        model_name="laguna",
+    )
+    posted_review = []
+    monkeypatch.setattr(cr_dispatch, "review_diff",
+                        lambda *a, **k: llm)
+    monkeypatch.setattr(cr_dispatch, "post_check_run",
+                        lambda *a, **k: {"id": 1})
+    monkeypatch.setattr(
+        cr_dispatch, "post_review",
+        lambda t, o, r, *, pull_number, result: posted_review.append(result) or {"id": 2},
+    )
+    with patch("httpx.get", return_value=_diff_response()):
+        cr_dispatch.dispatch_code_review(_payload(), blocking=False)
+    assert len(posted_review) == 1
+    body = posted_review[0].comments[0].body
+    assert "```suggestion\nlog.warning('dropped %s', e)\n```" in body
+    assert "quick win" in body
+    assert "Prompt for AI agents" in body
+
+
+def test_committable_suggestion_preserves_leading_indentation():
+    """#553 audit stage 8: GitHub commits the block verbatim as the full
+    replacement line - stripping leading whitespace one-clicks an
+    IndentationError into the file."""
+    from personas.code_reviewer.persona import Finding
+    f = Finding(
+        file="x.py", line=1, severity="high", rule_name="null-deref",
+        message="m", suggestion="    return use(x)",
+    )
+    body = cr_dispatch._inline_comment_body(f)
+    assert "```suggestion\n    return use(x)\n```" in body
+
+
+def test_unterminated_fence_in_message_cannot_swallow_the_body():
+    """FLINT on #558: an UNBALANCED ``` in the message head (prose, unfenced
+    by design) must not open a fence that eats the suggestion block and the
+    dedup marker."""
+    from personas.code_reviewer.persona import Finding
+    f = Finding(
+        file="x.py", line=1, severity="high", rule_name="null-deref",
+        message="evil ``` unterminated", suggestion="use(x)",
+    )
+    body = cr_dispatch._inline_comment_body(f)
+    assert "```suggestion\nuse(x)\n```" in body
+    assert body.rstrip().endswith("<!-- grug-rule:null-deref -->")
+    # the head's backtick run was defused below fence-capability
+    head = body.split("**Suggested fix", 1)[0]
+    assert "```" not in head
+
+
+def test_all_newline_suggestion_never_produces_empty_committable_block():
+    """FLINT on #558: a suggestion of only newlines passes the single-line
+    check (no literal \\n after an initial .strip()) but strips to empty -
+    committing it would replace the line with a BLANK line. Must degrade,
+    never emit an empty ```suggestion``` block."""
+    from personas.code_reviewer.persona import Finding
+    f = Finding(
+        file="x.py", line=1, severity="high", rule_name="null-deref",
+        message="m", suggestion="\n\n\n",
+    )
+    body = cr_dispatch._inline_comment_body(f)
+    assert "```suggestion\n\n```" not in body
+    assert "```suggestion" not in body

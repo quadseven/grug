@@ -364,3 +364,30 @@ def test_diff_hunk_rejects_missing_at_at_in_body() -> None:
     from personas.code_reviewer.diff_parser import DiffHunk as _DH
     with _pytest.raises(AssertionError, match="@@ hunk header"):
         _DH(file_path="x.py", new_start=1, new_lines=frozenset({1}), body="no header here")
+
+
+def test_evaluate_diff_carries_suggestion_and_effort():
+    """#553: the wire-format suggestion/effort survive translation into the
+    persona Finding (they were hardwired None/absent before)."""
+    from llm_client import Finding as WireFinding
+    from llm_client import LlmReviewResponse
+    from personas.code_reviewer.diff_parser import parse_diff
+    from personas.code_reviewer.persona import evaluate_diff
+
+    hunks = parse_diff(
+        "diff --git a/x.py b/x.py\n--- a/x.py\n+++ b/x.py\n"
+        "@@ -1 +1,2 @@\n a = 1\n+b = use(x)\n"
+    )
+    resp = LlmReviewResponse(
+        kind="reviewed",
+        findings=(
+            WireFinding(
+                path="x.py", line=2, rule="null-deref", severity="high",
+                message="m", suggestion="b = use(x) if x else None",
+                effort="quick-win",
+            ),
+        ),
+    )
+    ev = evaluate_diff(hunks, resp)
+    assert ev.findings[0].suggestion == "b = use(x) if x else None"
+    assert ev.findings[0].effort == "quick-win"

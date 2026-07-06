@@ -495,11 +495,18 @@ _PREAMBLE_TAIL = (
 _OUTPUT_CONTRACT = (
     'Return ONLY a JSON object of shape '
     '{"findings": [{"path": str, "line": int, "rule": str, '
-    '"severity": "low"|"medium"|"high"|"critical", "message": str}]}. '
+    '"severity": "low"|"medium"|"high"|"critical", "message": str, '
+    '"suggestion": str (OPTIONAL), "effort": "quick-win"|"heavy-lift" '
+    '(OPTIONAL)}]}. '
     "`rule` MUST be one of the rule names above. `line` is the new-side "
     "line number from the diff. `severity` reflects THIS instance "
-    "(the per-rule severity is only a default hint). No prose, no "
-    "markdown, no text outside the JSON object."
+    "(the per-rule severity is only a default hint). `suggestion` is the "
+    "EXACT replacement text for ONLY the flagged line - plain code, no "
+    "diff syntax, no backticks; include it ONLY when you are confident "
+    "the replacement is complete and line-exact, else omit it. `effort` "
+    "estimates the fix: quick-win (small, local) or heavy-lift "
+    "(structural); omit when unsure. No prose, no markdown, no text "
+    "outside the JSON object."
 )
 
 # VOICE — Grug is branded a caveman on every surface (the README's "one
