@@ -19,7 +19,9 @@ from ledger import parse_row
 _DEFAULT_PATH = "logs/review-ledger.jsonl"
 
 
-def ingest_text(text: str, put=None, put_practices=None) -> dict[str, object]:
+def ingest_text(
+    text: str, put=None, put_practices=None, put_exemplars=None
+) -> dict[str, object]:
     """Parse + persist every valid ledger line. `put` defaults to the store
     adapter but is injectable for tests. Returns {ingested, skipped}."""
     if put is None:
@@ -44,7 +46,29 @@ def ingest_text(text: str, put=None, put_practices=None) -> dict[str, object]:
         parsed_by_repo.setdefault(lr.repo, []).append(lr)
         ingested += 1
     refreshed = _refresh_practices(parsed_by_repo, put_practices)
+    _refresh_exemplars(parsed_by_repo, put_exemplars)
     return {"ingested": ingested, "skipped": skipped, "repos_refreshed": refreshed}
+
+
+def _refresh_exemplars(parsed_by_repo: dict, put_exemplars=None) -> int:
+    """After ingest, recompute + cache each repo's few-shot exemplars
+    (#538) beside the practices refresh. Best-effort per repo."""
+    from few_shot import exemplars_to_dicts
+    from ledger import accepted_findings_by_class
+    if put_exemplars is None:
+        try:
+            from adapters.pg_install_store import put_repo_exemplars  # type: ignore
+            put_exemplars = put_repo_exemplars
+        except Exception:  # noqa: BLE001
+            return 0
+    n = 0
+    for repo, rows in parsed_by_repo.items():
+        try:
+            put_exemplars(repo, exemplars_to_dicts(accepted_findings_by_class(rows)))
+            n += 1
+        except Exception:  # noqa: BLE001 - an exemplar refresh must not abort ingest
+            continue
+    return n
 
 
 def _refresh_practices(parsed_by_repo: dict, put_practices=None) -> int:

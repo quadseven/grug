@@ -452,6 +452,7 @@ def _build_messages(
     cross_file_contents: dict[str, str] | None = None,
     runtime_context: str | None = None,
     team_practices: str = "",
+    few_shot_examples: str = "",
 ) -> list[dict[str, str]]:
     # `file_contents` maps path → full file content at head SHA. Optional and
     # backward-compatible: when empty (fetch disabled/failed), the per-hunk
@@ -506,6 +507,11 @@ def _build_messages(
     system = _SYSTEM_PROMPTS[variant]
     if team_practices:
         system = f"{system}\n\n{team_practices}"
+    # Few-shot exemplars (#538, #361 slice 3) append AFTER the practices:
+    # RULES state the norms, EXAMPLES teach the shape. Same call-time,
+    # repo-specific rationale as team_practices.
+    if few_shot_examples:
+        system = f"{system}\n\n{few_shot_examples}"
     return [
         {"role": "system", "content": system},
         {"role": "user", "content": _redact_secrets("\n\n".join(parts))},
@@ -748,6 +754,28 @@ def _team_practices_block(pr_context: Optional[PrContext]) -> str:
         return ""
 
 
+def _few_shot_block(pr_context: Optional[PrContext]) -> str:
+    """Fetch + render the repo's cached few-shot exemplars for the prompt
+    (#538). Best-effort: any failure (no repo, store down, none derived)
+    returns "" so the review runs without EXAMPLES. Redacted for the same
+    reason as the practices block - exemplar text is ledger-derived and
+    rides the SYSTEM prompt to a third-party backend."""
+    if not pr_context or "repo" not in pr_context:
+        return ""
+    try:
+        from adapters.pg_install_store import get_repo_exemplars  # type: ignore
+        from few_shot import exemplars_block, exemplars_from_dicts  # type: ignore
+        rows = get_repo_exemplars(str(pr_context["repo"]))
+        if not rows:
+            return ""
+        block = exemplars_block(exemplars_from_dicts(rows))
+        return _redact_secrets(block) if block else ""
+    except Exception as e:  # noqa: BLE001 - exemplars never break a review, but log
+        log.warning("few_shot_fetch_failed", extra={
+            "repo": str(pr_context.get("repo", "")), "kind": type(e).__name__})
+        return ""
+
+
 def review_diff(
     hunks: list[Hunk],
     installation_id: int,
@@ -779,6 +807,7 @@ def review_diff(
     messages = _build_messages(
         hunks, variant, file_contents, cross_file_contents, runtime_context,
         team_practices=_team_practices_block(pr_context),
+        few_shot_examples=_few_shot_block(pr_context),
     )
     pr_tags = _llmobs_tags(pr_context)
 

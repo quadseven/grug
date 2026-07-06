@@ -90,6 +90,11 @@ def main(argv: list[str] | None = None) -> int:
         action="store_true",
         help="also replay WITH the #527 practices block and print the delta",
     )
+    parser.add_argument(
+        "--ab-few-shot",
+        action="store_true",
+        help="also replay WITH the #538 few-shot EXAMPLES and print the delta",
+    )
     args = parser.parse_args(argv)
 
     logging.basicConfig(level=logging.INFO, format="%(message)s")
@@ -152,7 +157,7 @@ def main(argv: list[str] | None = None) -> int:
 
         block = practices_block(derive_practices(list(rows)))
         with_practices = score(
-            cases, run_eval(backend, cases, token=token, team_practices=block)
+            all_cases, run_eval(backend, cases, token=token, team_practices=block)
         )
         _print_report(f"{backend.name} + practices (#527)", with_practices)
         print(
@@ -161,6 +166,23 @@ def main(argv: list[str] | None = None) -> int:
             f"({with_practices.overall_catch - report.overall_catch:+.2f}), noise "
             f"{report.noise_rate:.2f} -> {with_practices.noise_rate:.2f} "
             f"({with_practices.noise_rate - report.noise_rate:+.2f})"
+        )
+
+    if args.ab_few_shot:
+        from few_shot import exemplars_block
+        from ledger import accepted_findings_by_class
+
+        examples = exemplars_block(accepted_findings_by_class(list(rows)))
+        with_examples = score(
+            all_cases, run_eval(backend, cases, token=token, few_shot=examples)
+        )
+        _print_report(f"{backend.name} + few-shot (#538)", with_examples)
+        print(
+            f"\n#538 few-shot delta: catch "
+            f"{report.overall_catch:.2f} -> {with_examples.overall_catch:.2f} "
+            f"({with_examples.overall_catch - report.overall_catch:+.2f}), noise "
+            f"{report.noise_rate:.2f} -> {with_examples.noise_rate:.2f} "
+            f"({with_examples.noise_rate - report.noise_rate:+.2f})"
         )
 
     if args.record:
