@@ -197,3 +197,53 @@ def test_walkthrough_body_not_truncated_by_default():
         head_sha="e" * 40, degraded=False,
     )
     assert "sprawl wide" not in body
+
+
+# --- output sanitization: mentions + table-breaking chars (round 4, codex) -
+
+
+def test_changed_files_table_escapes_pipe_in_plain_summary_cell():
+    files = [FileStat(path="a.py", additions=1, deletions=0,
+                       summary="fixes | breaks the table")]
+    table = changed_files_table(files)
+    assert "fixes \\| breaks the table" in table
+    # Exactly 3 data rows (header + separator + 1) - an unescaped pipe
+    # would fake an extra column/row.
+    assert table.count("\n") == 2
+
+
+def test_changed_files_table_collapses_newline_in_summary_cell():
+    files = [FileStat(path="a.py", additions=1, deletions=0,
+                       summary="line one\nFAKE ROW | injected | here")]
+    table = changed_files_table(files)
+    assert "\nFAKE ROW" not in table
+    assert table.count("\n") == 2
+
+
+def test_changed_files_table_strips_backtick_from_path_cell():
+    """A path is rendered inside a single-backtick code span - a raw
+    backtick in the path would close the span early and let anything
+    after it render as live markdown."""
+    files = [FileStat(path="evil`](x)[owned", additions=1, deletions=0)]
+    table = changed_files_table(files)
+    assert "evil`](x)[owned" not in table  # the raw, unstripped path is gone
+    assert "evil'](x)[owned" in table  # backtick swapped for an apostrophe
+    assert table.count("\n") == 2  # still exactly header + separator + 1 row
+
+
+def test_changed_files_table_neutralizes_mention_in_summary_and_path():
+    files = [FileStat(path="@evan/notes.py", additions=1, deletions=0,
+                       summary="ping @cait about this")]
+    table = changed_files_table(files)
+    assert "@cait" not in table  # the live mention form must not survive
+    assert "@​cait" in table
+    assert "@​evan" in table
+
+
+def test_walkthrough_body_neutralizes_mention_in_top_level_summary():
+    body = walkthrough_body(
+        summary="hey @evan check this out", files=[], diagram=None,
+        effort="quick", head_sha="f" * 40, degraded=False,
+    )
+    assert "@evan" not in body
+    assert "@​evan" in body
