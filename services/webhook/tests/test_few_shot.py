@@ -105,14 +105,18 @@ def test_exemplar_dict_roundtrip():
     assert exemplars_block(restored) == exemplars_block(exemplars)
 
 
-def test_exemplars_from_dicts_skips_malformed():
+def test_exemplars_from_dicts_skips_malformed_and_warns(caplog):
     dicts = [
         {"class": "correctness", "severity": "HIGH", "finding": "ok", "pr": 1},
         {"severity": "HIGH"},  # missing load-bearing fields -> skipped
         "not-a-dict",
     ]
-    restored = exemplars_from_dicts(dicts)  # type: ignore[arg-type]
+    with caplog.at_level("WARNING", logger="grug.few_shot"):
+        restored = exemplars_from_dicts(dicts)  # type: ignore[arg-type]
     assert [e.finding_class for e in restored] == ["correctness"]
+    # The WARNING is the point (stage-2 fix): rot must be visible, not
+    # just skipped - deleting the log line must fail this test.
+    assert "skipped=2 total=3" in caplog.text
 
 
 # --- prompt injection order ---------------------------------------------------
