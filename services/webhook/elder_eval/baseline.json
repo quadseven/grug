@@ -4,16 +4,20 @@
       "cases_scored": 12,
       "errored_cases": [],
       "noise_rate": 0.0,
-      "overall_catch": 0.125,
+      "overall_catch": 0.025,
       "per_class_catch": {
-        "correctness": 0.0,
-        "security-scope": 0.14285714285714285,
-        "silent-failure": 0.1,
+        "correctness": 0.125,
+        "security-scope": 0.0,
+        "silent-failure": 0.0,
         "simplification": 0.0,
-        "test-gap": 0.2857142857142857,
+        "test-gap": 0.0,
         "type-design": 0.0,
-        "upstream-semantics": 0.2
-      }
+        "upstream-semantics": 0.0
+      },
+      "truncated_cases": [
+        "githumps/grug#366",
+        "githumps/grug#494"
+      ]
     }
   },
   "prompt_sha": "f6a526a5ffd43189c52db6e345b73a31934611fe272f0dcb65c610032bbbff40"
