@@ -17,6 +17,11 @@ Severity = Literal["low", "medium", "high", "critical"]
 # updates every consumer's validation at once — no drift possible.
 SEVERITIES: frozenset[str] = frozenset(get_args(Severity))
 
+# #553: fix-effort vocabulary, same one-source pattern as Severity.
+# None = the model offered no estimate (mirrors suggestion's None-for-absent).
+Effort = Literal["quick-win", "heavy-lift"]
+EFFORTS: frozenset[str] = frozenset(get_args(Effort))
+
 
 # ── Activity-feed verdict + persona mapping (PRD #301; ADR-0002, ADR-0003) ────
 # Kept in this shared leaf so BOTH the write path (the persona dispatchers) and

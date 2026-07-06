@@ -64,6 +64,10 @@ class InlineComment:
     path: str
     line: int
     body: str
+    # Explicit RIGHT: `line` is always the NEW side here, and the docs do
+    # not promise a default - an implicit LEFT would anchor committable
+    # suggestion blocks (#553) on the wrong side of the diff.
+    side: Literal["LEFT", "RIGHT"] = "RIGHT"
 
     def __post_init__(self) -> None:
         if self.line < 1:
