@@ -1347,3 +1347,36 @@ def test_build_judge_messages_includes_full_file_when_provided():
     )
     assert "FULL FILE" in msgs[1]["content"]
     assert "2: rm -f /tmp/x" in msgs[1]["content"]
+
+
+def test_review_diff_injects_cached_exemplars(monkeypatch) -> None:
+    """#538 end-to-end wiring: cached EXEMPLARS reach the SYSTEM prompt via
+    review_diff. Fails on a lazy-import typo in _few_shot_block, a store-fn
+    rename, or a dropped few_shot_examples kwarg at the call site - each of
+    which would silently ship the feature permanently disabled ("" is a
+    no-op append and the fetch is best-effort)."""
+    import adapters.pg_install_store as store
+
+    monkeypatch.setattr(
+        store,
+        "get_repo_exemplars",
+        lambda repo: [
+            {"class": "correctness", "severity": "HIGH",
+             "finding": "cached exemplar finding", "pr": 9}
+        ],
+    )
+    captured: dict = {}
+
+    def fake_post(url, **kwargs):
+        captured["messages"] = kwargs["json"]["messages"]
+        return httpx.Response(200, json=_openai_json_response('{"findings": []}'))
+
+    with patch.object(httpx, "post", side_effect=fake_post):
+        out = review_diff(
+            [_hunk()], installation_id=2,
+            pr_context={"repo": "o/r", "pr_number": 1},
+        )
+    assert out.kind == "reviewed"
+    system = captured["messages"][0]["content"]
+    assert "EXAMPLES OF ACCEPTED FINDINGS" in system
+    assert "cached exemplar finding" in system
