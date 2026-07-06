@@ -151,7 +151,8 @@ def test_pull_request_dispatches_all_personas_independently():
     """Acceptance criterion (#185): the personas run on the same event,
     producing independent verdicts. All must appear in the results
     list. Order: TPM first, Elder second, Guard third (#466), Smasher
-    fourth (#469)."""
+    fourth (#469), Teller fifth (#554) - Warder/Pulse are filtered by
+    `actions`/`events`, not by this test's universal enable patch."""
     with patch("dispatcher.is_install_allowlisted", return_value=True), \
          patch("dispatcher.is_persona_enabled", return_value=True), \
          patch("dispatcher.get_repo_config", return_value={"code_reviewer_blocking": False}), \
@@ -159,19 +160,22 @@ def test_pull_request_dispatches_all_personas_independently():
          patch("personas.tpm.persona.publish_tpm_evaluation"), \
          patch("async_dispatch.enqueue_elder_review", return_value=True) as mock_enq, \
          patch("async_dispatch.enqueue_guard_review", return_value=True) as mock_guard_enq, \
-         patch("async_dispatch.enqueue_smasher_review", return_value=True) as mock_smasher_enq:
+         patch("async_dispatch.enqueue_smasher_review", return_value=True) as mock_smasher_enq, \
+         patch("async_dispatch.enqueue_walkthrough_review", return_value=True) as mock_teller_enq:
         mock_eval.return_value = type("R", (), {"passed": True})()
         out = dispatch("pull_request", _full_pr_payload())
 
     assert out["status"] == "dispatched"
-    assert len(out["personas"]) == 4
+    assert len(out["personas"]) == 5
     assert out["personas"][0]["persona"] == "tpm"
-    # Elder + Guard + Smasher are OFFLOADED (#272/#466/#469): the sync path enqueues.
+    # Elder + Guard + Smasher + Teller are OFFLOADED (#272/#466/#469/#554): the sync path enqueues.
     assert out["personas"][1] == {"persona": "code_reviewer", "result": "queued"}
     assert out["personas"][2] == {"persona": "guard", "result": "queued"}
     assert out["personas"][3] == {"persona": "smasher", "result": "queued"}
+    assert out["personas"][4] == {"persona": "walkthrough", "result": "queued"}
     mock_enq.assert_called_once()
     mock_guard_enq.assert_called_once()
+    mock_teller_enq.assert_called_once()
     mock_smasher_enq.assert_called_once()
 
 

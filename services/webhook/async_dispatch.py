@@ -63,6 +63,7 @@ ASYNC_JOB_KEY = "grug_async_job"
 ELDER_REVIEW_JOB = "elder_review"
 GUARD_REVIEW_JOB = "guard_review"
 SMASHER_REVIEW_JOB = "smasher_review"
+WALKTHROUGH_REVIEW_JOB = "walkthrough_review"
 
 # Thread names are bounded so `ps`/py-spy views stay aligned:
 # prefix + delivery-GUID slice, 19 chars total (elder-/guard- keep 13 GUID
@@ -142,6 +143,15 @@ _ASYNC_PERSONAS: dict[str, _AsyncPersonaSpec] = {
         rerun_persona="smasher",
         dispatch_path="personas.smasher.dispatch:dispatch_smasher_review",
         runner_name="run_smasher_job",
+    ),
+    "walkthrough": _AsyncPersonaSpec(
+        job_kind=WALKTHROUGH_REVIEW_JOB,
+        log_prefix="walkthrough",
+        claim_namespace="walkthrough",
+        review_persona="walkthrough",
+        rerun_persona="walkthrough",
+        dispatch_path="personas.walkthrough.dispatch:dispatch_walkthrough_review",
+        runner_name="run_walkthrough_job",
     ),
 }
 
@@ -394,6 +404,21 @@ def enqueue_smasher_review(
 def run_smasher_job(event: dict[str, Any]) -> dict[str, str]:
     """Worker entry for an async Smasher Trial (#469). Contract: `_run_job`."""
     return _run_job(_ASYNC_PERSONAS["smasher"], event)
+
+
+def enqueue_walkthrough_review(
+    *, payload: dict[str, Any], delivery_id: str, blocking: bool,
+) -> bool:
+    """Offload the Teller PR walkthrough (#554). Contract: `_enqueue_review`."""
+    return _enqueue_review(
+        _ASYNC_PERSONAS["walkthrough"],
+        payload=payload, delivery_id=delivery_id, blocking=blocking,
+    )
+
+
+def run_walkthrough_job(event: dict[str, Any]) -> dict[str, str]:
+    """Worker entry for an async Teller walkthrough (#554). Contract: `_run_job`."""
+    return _run_job(_ASYNC_PERSONAS["walkthrough"], event)
 
 
 def _pr_ids(payload: dict[str, Any]) -> tuple[int | None, str | None, int | None]:

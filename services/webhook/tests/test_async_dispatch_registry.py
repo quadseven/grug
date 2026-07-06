@@ -47,7 +47,7 @@ def test_job_kinds_and_log_prefixes_are_unique_and_pinned():
     assert len(set(kinds)) == len(kinds)
     # Monitored DD log-line names derive from these prefixes
     # (f"{prefix}_job_done" etc.) — changing one silently blinds a monitor.
-    assert set(prefixes) == {"elder", "guard", "smasher"}
+    assert set(prefixes) == {"elder", "guard", "smasher", "walkthrough"}
 
 
 def test_elder_legacy_claim_and_persona_values_are_pinned():
