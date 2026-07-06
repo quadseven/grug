@@ -1400,8 +1400,35 @@ def test_coerce_finding_parses_suggestion_and_effort() -> None:
     assert ok2 is not None
     assert ok2.suggestion is None and ok2.effort is None
 
+    # unhashable effort must degrade, not TypeError the whole parse
+    ok4, _ = lc._coerce_finding({
+        "path": "x.py", "line": 1, "rule": "r", "severity": "low",
+        "message": "m", "effort": [], "suggestion": ["also", "bad"],
+    })
+    assert ok4 is not None and ok4.effort is None and ok4.suggestion is None
+
     # absent fields keep prior behavior
     ok3, _ = lc._coerce_finding({
         "path": "x.py", "line": 1, "rule": "r", "severity": "low", "message": "m",
     })
     assert ok3 is not None and ok3.suggestion is None and ok3.effort is None
+
+
+def test_coerce_finding_redacts_and_caps_message_and_suggestion() -> None:
+    """#553 audit: the model can ECHO a diff secret into message/suggestion,
+    and a posted comment outlives a force-push - redact at the coercion
+    choke point; cap message length with a VISIBLE marker."""
+    pem = (
+        "-----BEGIN RSA PRIVATE KEY-----\n" + "MIIEfake\n" * 5
+        + "-----END RSA PRIVATE KEY-----"
+    )
+    ok, _ = lc._coerce_finding({
+        "path": "x.py", "line": 1, "rule": "r", "severity": "high",
+        "message": "leak: " + pem + " end " + "x" * 3000,
+        "suggestion": "key = " + pem,
+    })
+    assert ok is not None
+    assert "MIIEfake" not in ok.message and "MIIEfake" not in (ok.suggestion or "")
+    assert "[REDACTED:pem-private-key]" in (ok.suggestion or "")
+    assert ok.message.endswith("[truncated]")
+    assert len(ok.message) <= 1520

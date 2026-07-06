@@ -1346,17 +1346,47 @@ def test_elder_no_longer_carries_security_findings(monkeypatch):
 
 
 def test_inline_comment_body_renders_committable_suggestion_block():
-    """#553: a fence-safe suggestion renders as a GitHub-native committable
-    suggestion block, not just prose."""
+    """#553: a SINGLE-LINE fence-safe suggestion renders as a GitHub-native
+    committable block - the comment anchors one line, so only a one-line
+    replacement may carry the Apply button."""
+    from personas.code_reviewer.persona import Finding
+    f = Finding(
+        file="x.py", line=1, severity="high", rule_name="null-deref",
+        message="m", suggestion="use(x) if x is not None else None",
+    )
+    body = cr_dispatch._inline_comment_body(f)
+    assert "```suggestion\nuse(x) if x is not None else None\n```" in body
+    # dedup marker must remain the LAST marker in the body
+    assert body.rstrip().endswith("<!-- grug-rule:null-deref -->")
+
+
+def test_inline_comment_body_multiline_suggestion_never_committable():
+    """#553 audit H2: a multi-line suggestion applied to a single anchored
+    line duplicates the following original lines - one-click corruption.
+    Multi-line degrades to fenced prose with an explicit scope label."""
     from personas.code_reviewer.persona import Finding
     f = Finding(
         file="x.py", line=1, severity="high", rule_name="null-deref",
         message="m", suggestion="if x is not None:\n    use(x)",
     )
     body = cr_dispatch._inline_comment_body(f)
-    assert "```suggestion\nif x is not None:\n    use(x)\n```" in body
-    # dedup marker must remain the LAST marker in the body
-    assert body.rstrip().endswith("<!-- grug-rule:null-deref -->")
+    assert "```suggestion" not in body
+    assert "verify scope before applying" in body
+
+
+def test_inline_comment_body_fence_bearing_suggestion_is_contained():
+    """#553 audit H3: a suggestion containing a ```suggestion payload must
+    render INSIDE a longer fence, never as a live committable block - the
+    degrade path must not route the payload around the sanitizer."""
+    from personas.code_reviewer.persona import Finding
+    payload = "```suggestion\nrm -rf /\n```"
+    f = Finding(
+        file="x.py", line=1, severity="high", rule_name="null-deref",
+        message="m", suggestion=payload,
+    )
+    body = cr_dispatch._inline_comment_body(f)
+    assert "````" in body  # containing fence is longer than the payload's
+    assert not body.lstrip().startswith("```suggestion")
 
 
 def test_inline_comment_body_fence_unsafe_suggestion_degrades_to_prose():

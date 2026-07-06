@@ -329,7 +329,7 @@ def _consolidated_agent_prompt(evaluation: CodeReviewEvaluation) -> str:
         body.append(
             f"(+{cut} more finding(s) - see the findings table above)"
         )
-    return "\n".join([
+    block = "\n".join([
         "<details>",
         "<summary>Prompt for AI agents (all findings)</summary>",
         "",
@@ -337,6 +337,13 @@ def _consolidated_agent_prompt(evaluation: CodeReviewEvaluation) -> str:
         "",
         "</details>",
     ])
+    # Hard deterministic ceiling: fence growth (backtick-run + 1, twice)
+    # and the wrapper are not in the per-entry budget, so cap the WHOLE
+    # block - an oversized prompt must degrade loudly, never 422 the
+    # check-run publish.
+    if len(block) > 2 * _CONSOLIDATED_PROMPT_BUDGET:
+        return "(Prompt for AI agents omitted - findings too large; see the table above)"
+    return block
 
 
 # Derived from the shared vocabulary so a new effort level can never
@@ -390,16 +397,30 @@ def _inline_comment_body(f: Finding) -> str:
     if f.effort in _EFFORT_LABELS:
         chip += f" · {_EFFORT_LABELS[f.effort]}"
     head = f"{chip}\n\n{f.message}"
-    if f.suggestion and "```" not in f.suggestion:
-        # GitHub-native committable block - one click applies it to the
-        # anchored line. Only when fence-safe: a backtick fence inside
-        # would break out of the block (degrade to prose below).
+    if (
+        f.suggestion
+        and "```" not in f.suggestion
+        and "\n" not in f.suggestion.strip()
+    ):
+        # GitHub-native committable block - one click REPLACES the single
+        # anchored line. Committable ONLY when the suggestion is itself
+        # single-line and fence-safe: the comment anchors one line, so a
+        # multi-line suggestion applied there duplicates the following
+        # original lines - confident-looking one-click corruption.
         body = (
             f"{head}\n\n**Suggested fix:**\n"
-            f"```suggestion\n{f.suggestion.rstrip()}\n```"
+            f"```suggestion\n{f.suggestion.strip()}\n```"
         )
     elif f.suggestion:
-        body = f"{head}\n\n**Suggested fix:**\n{f.suggestion}"
+        # Multi-line or fence-bearing: fenced prose with an explicit scope
+        # label. _fenced() contains ANY payload (a suggestion containing
+        # ```suggestion would otherwise render as a live committable block
+        # - the sanitizer must not route the payload around itself).
+        body = (
+            f"{head}\n\n**Suggested fix** "
+            f"(anchored at line {f.line} - verify scope before applying):\n"
+            f"{_fenced(f.suggestion)}"
+        )
     else:
         body = head
     return f"{body}\n\n{_agent_prompt_block(f)}\n\n{rule_marker(f.rule_name)}"
