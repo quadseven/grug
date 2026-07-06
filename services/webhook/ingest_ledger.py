@@ -12,16 +12,23 @@ adds any new ones. The `seq` disambiguates findings that share
 from __future__ import annotations
 
 import json
+import logging
 import sys
 
 from ledger import parse_row
 
+log = logging.getLogger("grug.ingest_ledger")
+
 _DEFAULT_PATH = "logs/review-ledger.jsonl"
 
 
-def ingest_text(text: str, put=None, put_practices=None) -> dict[str, object]:
-    """Parse + persist every valid ledger line. `put` defaults to the store
-    adapter but is injectable for tests. Returns {ingested, skipped}."""
+def ingest_text(
+    text: str, put=None, put_practices=None, put_exemplars=None
+) -> dict[str, object]:
+    """Parse + persist every valid ledger line. `put`/`put_practices`/
+    `put_exemplars` default to the store adapter but are injectable for
+    tests. Returns {ingested, skipped, repos_refreshed,
+    exemplars_refreshed}."""
     if put is None:
         from adapters.pg_install_store import put_ledger_row  # type: ignore
         put = put_ledger_row
@@ -44,7 +51,42 @@ def ingest_text(text: str, put=None, put_practices=None) -> dict[str, object]:
         parsed_by_repo.setdefault(lr.repo, []).append(lr)
         ingested += 1
     refreshed = _refresh_practices(parsed_by_repo, put_practices)
-    return {"ingested": ingested, "skipped": skipped, "repos_refreshed": refreshed}
+    exemplars_refreshed = _refresh_exemplars(parsed_by_repo, put_exemplars)
+    return {
+        "ingested": ingested,
+        "skipped": skipped,
+        "repos_refreshed": refreshed,
+        "exemplars_refreshed": exemplars_refreshed,
+    }
+
+
+def _refresh_exemplars(parsed_by_repo: dict, put_exemplars=None) -> int:
+    """After ingest, recompute + cache each repo's few-shot exemplars
+    (#538) beside the practices refresh. Best-effort per repo."""
+    from few_shot import exemplars_from_rows, exemplars_to_dicts
+    from ledger import accepted_findings_by_class
+    if put_exemplars is None:
+        try:
+            from adapters.pg_install_store import put_repo_exemplars  # type: ignore
+            put_exemplars = put_repo_exemplars
+        except Exception:  # noqa: BLE001
+            return 0
+    n = 0
+    for repo, rows in parsed_by_repo.items():
+        try:
+            put_exemplars(
+                repo,
+                exemplars_to_dicts(
+                    exemplars_from_rows(accepted_findings_by_class(rows))
+                ),
+            )
+            n += 1
+        except Exception as e:  # noqa: BLE001 - must not abort ingest, but SAY so
+            log.warning(
+                "exemplar_refresh_failed repo=%s kind=%s", repo, type(e).__name__
+            )
+            continue
+    return n
 
 
 def _refresh_practices(parsed_by_repo: dict, put_practices=None) -> int:
@@ -62,7 +104,10 @@ def _refresh_practices(parsed_by_repo: dict, put_practices=None) -> int:
         try:
             put_practices(repo, practices_to_dicts(derive_practices(rows)))
             n += 1
-        except Exception:  # noqa: BLE001 - a practices refresh must not abort ingest
+        except Exception as e:  # noqa: BLE001 - must not abort ingest, but SAY so
+            log.warning(
+                "practices_refresh_failed repo=%s kind=%s", repo, type(e).__name__
+            )
             continue
     return n
 
@@ -71,7 +116,12 @@ def main(argv: list[str]) -> int:
     path = argv[1] if len(argv) > 1 else _DEFAULT_PATH
     with open(path, encoding="utf-8") as f:
         result = ingest_text(f.read())
-    print(f"ledger ingest: {result['ingested']} ingested, {result['skipped']} skipped")
+    print(
+        f"ledger ingest: {result['ingested']} ingested, "
+        f"{result['skipped']} skipped, "
+        f"{result['repos_refreshed']} practices + "
+        f"{result['exemplars_refreshed']} exemplar repo-caches refreshed"
+    )
     return 0
 
 

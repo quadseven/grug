@@ -112,6 +112,7 @@ def run_case(
     diff_text: str,
     *,
     team_practices: str = "",
+    few_shot: str = "",
 ) -> CaseReplay:
     """Replay ONE case. Any failure (empty/unparseable diff, transport,
     parse) returns errored=True + logs - it must never abort the sweep, and
@@ -132,6 +133,7 @@ def run_case(
         messages = _build_messages(
             hunks, _PROMPT_VARIANT, None, None, None,
             team_practices=team_practices,
+            few_shot_examples=few_shot,
         )
         resp = _post(backend, messages)
         findings, _model, err = _parse_response(resp)
@@ -160,6 +162,7 @@ def run_eval(
     fetch: Callable[[str, int, str], str] = fetch_pr_diff,
     token: str = "",
     team_practices: str = "",
+    few_shot: str = "",
 ) -> dict[str, CaseReplay]:
     """Replay the whole corpus through one backend. `fetch` is injectable
     for tests. Returns case_id -> CaseReplay for `scoring.score`."""
@@ -203,7 +206,8 @@ def run_eval(
             )
             continue
         replays[case.case_id] = run_case(
-            backend, case, diff, team_practices=team_practices
+            backend, case, diff, team_practices=team_practices,
+            few_shot=few_shot,
         )
     errored = sum(1 for r in replays.values() if r.errored)
     if errored:
