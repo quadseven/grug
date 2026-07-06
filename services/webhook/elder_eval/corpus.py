@@ -14,6 +14,7 @@ committed JSONL - never a third parser.
 
 from __future__ import annotations
 
+import logging
 import re
 from dataclasses import dataclass
 from typing import Iterable
@@ -23,6 +24,8 @@ from typing import Iterable
 # importing _build_messages - measuring Elder means using Elder's own parts).
 from code_review_prompt import _BUG_CLASSES
 from ledger import LedgerRow, parse_row
+
+log = logging.getLogger("grug.elder_eval")
 
 _NORM_RE = re.compile(r"[^a-z0-9]+")
 
@@ -76,8 +79,12 @@ class EvalCase:
     count as a catch. Only accepted (fixed/declined) in-taxonomy rows.
     `fp_only_classes`: ELDER-normalized classes known on this PR ONLY as
     false positives - a replay emission there is measured noise.
-    `out_of_taxonomy`: accepted ledger classes Elder cannot express, with
-    row counts - reported, never scored.
+    `out_of_taxonomy`: ledger classes Elder cannot express (accepted OR
+    false-positive rows), with row counts - reported, never scored.
+    `unknown_verdicts`: rows whose verdict is neither accepted nor
+    false-positive (a typo or a new verdict value) - excluded from
+    scoring, but COUNTED so a mislabeled corpus cannot silently yield an
+    empty eval.
     """
 
     repo: str
@@ -85,6 +92,7 @@ class EvalCase:
     expected_classes: dict[str, frozenset[str]]
     fp_only_classes: frozenset[str]
     out_of_taxonomy: dict[str, int]
+    unknown_verdicts: dict[str, int]
 
     @property
     def case_id(self) -> str:
@@ -106,6 +114,7 @@ def build_cases(rows: Iterable[LedgerRow]) -> tuple[EvalCase, ...]:
     for repo, pr in sorted(grouped):
         expected: dict[str, frozenset[str]] = {}
         out_of_taxonomy: dict[str, int] = {}
+        unknown_verdicts: dict[str, int] = {}
         fp_elder: set[str] = set()
         accepted_elder: set[str] = set()
         for r in grouped[(repo, pr)]:
@@ -118,7 +127,15 @@ def build_cases(rows: Iterable[LedgerRow]) -> tuple[EvalCase, ...]:
                 expected[norm] = elder
                 accepted_elder |= elder
             elif r.false_positive:
+                if not elder:
+                    out_of_taxonomy[norm] = out_of_taxonomy.get(norm, 0) + 1
+                    continue
                 fp_elder |= elder
+            else:
+                # Neither accepted nor FP: a typo'd or novel verdict. It
+                # must not vanish - a mislabeled corpus that yields zero
+                # expected cells needs to say WHY.
+                unknown_verdicts[r.verdict] = unknown_verdicts.get(r.verdict, 0) + 1
         cases.append(
             EvalCase(
                 repo=repo,
@@ -128,6 +145,7 @@ def build_cases(rows: Iterable[LedgerRow]) -> tuple[EvalCase, ...]:
                 # fp-only - emitting it there is a legitimate catch.
                 fp_only_classes=frozenset(fp_elder - accepted_elder),
                 out_of_taxonomy=out_of_taxonomy,
+                unknown_verdicts=unknown_verdicts,
             )
         )
     return tuple(cases)
@@ -140,8 +158,16 @@ def rows_from_store(repo: str) -> list[LedgerRow]:
     from adapters.pg_install_store import list_ledger_rows  # type: ignore
 
     out: list[LedgerRow] = []
+    malformed = 0
     for d in list_ledger_rows(repo):
         row = parse_row(d)
-        if row is not None:
-            out.append(row)
+        if row is None:
+            malformed += 1
+            continue
+        out.append(row)
+    if malformed:
+        # A corrupted ingest must not silently shrink the corpus.
+        log.warning(
+            "eval_store_rows_malformed repo=%s skipped=%d", repo, malformed
+        )
     return out

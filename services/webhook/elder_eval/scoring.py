@@ -46,6 +46,7 @@ class EvalReport:
     noise_rate: float
     errored_cases: tuple[str, ...]
     out_of_taxonomy: dict[str, int]
+    unknown_verdicts: dict[str, int]
     cases_scored: int
 
     @property
@@ -73,9 +74,12 @@ def score(
     if orphans:
         raise ValueError(f"replays reference unknown cases: {sorted(orphans)}")
 
+    unknown_verdicts: dict[str, int] = {}
     for case in cases:
         for cls, n in case.out_of_taxonomy.items():
             out_of_taxonomy[cls] = out_of_taxonomy.get(cls, 0) + n
+        for verdict, n in case.unknown_verdicts.items():
+            unknown_verdicts[verdict] = unknown_verdicts.get(verdict, 0) + n
         replay = replays.get(case.case_id)
         if replay is None or replay.errored:
             errored.append(case.case_id)
@@ -104,6 +108,7 @@ def score(
         noise_rate=noise / total_emitted if total_emitted else 0.0,
         errored_cases=tuple(errored),
         out_of_taxonomy=out_of_taxonomy,
+        unknown_verdicts=unknown_verdicts,
         cases_scored=scored,
     )
 
@@ -135,8 +140,23 @@ def compare_to_baseline(
     """Regressions of `report` vs one backend's recorded scores. Empty list
     = no regression. Only classes PRESENT in the baseline are compared (a
     corpus can grow new classes without failing the check); a baseline
-    class missing from the new report IS a regression (coverage lost)."""
+    class missing from the new report IS a regression (coverage lost).
+
+    COVERAGE LOSS IS A REGRESSION: a run that errored cases or scored
+    fewer cases than the baseline compares rates over a smaller corpus -
+    a partial result must never read as a complete pass."""
     regressions: list[str] = []
+    if report.errored_cases:
+        regressions.append(
+            f"{len(report.errored_cases)} case(s) errored (not scored): "
+            f"{', '.join(report.errored_cases)}"
+        )
+    base_cases = int(backend_baseline.get("cases_scored", 0))
+    if report.cases_scored < base_cases:
+        regressions.append(
+            f"cases_scored shrank {base_cases} -> {report.cases_scored} "
+            "(coverage loss - rates are not comparable)"
+        )
     base_overall = float(backend_baseline.get("overall_catch", 0.0))
     if report.overall_catch < base_overall - catch_tolerance:
         regressions.append(

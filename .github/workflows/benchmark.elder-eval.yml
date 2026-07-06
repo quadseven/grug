@@ -97,15 +97,24 @@ jobs:
             --with 'datadog-lambda>=6.107,<7' \
             python -m elder_eval $FLAG $AB | tee "$RUNNER_TEMP/eval-report.txt"
 
-      # The recorded baseline is uploaded as an artifact (not auto-committed) -
-      # download it and commit services/webhook/elder_eval/baseline.json to
-      # update the in-repo baseline + gate through normal review.
-      - name: Upload baseline + report
+      # The report uploads even on failure (it is the diagnostic); the
+      # baseline uploads ONLY on success - a failed record run would
+      # otherwise upload the stale checked-out baseline.json dressed as
+      # freshly recorded. Download + commit
+      # services/webhook/elder_eval/baseline.json to update the in-repo
+      # baseline + gate through normal review.
+      - name: Upload report
         if: always()
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         with:
-          name: elder-eval
-          path: |
-            services/webhook/elder_eval/baseline.json
-            ${{ runner.temp }}/eval-report.txt
+          name: elder-eval-report
+          path: ${{ runner.temp }}/eval-report.txt
           if-no-files-found: warn
+
+      - name: Upload recorded baseline
+        if: success() && inputs.mode == 'record'
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: elder-eval-baseline
+          path: services/webhook/elder_eval/baseline.json
+          if-no-files-found: error
