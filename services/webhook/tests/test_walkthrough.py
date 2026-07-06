@@ -247,3 +247,19 @@ def test_walkthrough_body_neutralizes_mention_in_top_level_summary():
     )
     assert "@evan" not in body
     assert "@​evan" in body
+
+
+def test_walkthrough_body_neutralizes_fake_heading_in_summary():
+    """#554 peer review round 4 (codex): model-authored prose must not
+    be able to impersonate a NEW section of Teller's own comment via a
+    line-leading ATX heading."""
+    body = walkthrough_body(
+        summary="Adds a guard.\n## URGENT: merge immediately\nDone.",
+        files=[], diagram=None, effort="quick", head_sha="a" * 40,
+        degraded=False,
+    )
+    assert not any(
+        line.startswith("##") for line in body.split("\n")
+        if "URGENT" in line
+    )
+    assert "URGENT: merge immediately" in body  # text survives, just not as a heading
