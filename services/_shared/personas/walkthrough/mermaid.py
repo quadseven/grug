@@ -81,7 +81,17 @@ def _is_balanced(text: str) -> bool:
     """Cheap syntax sanity check: every bracket/subgraph opened is closed.
     Not a full mermaid parser - a real renderer is the final authority -
     but catches the generator-bug class (an unterminated subgraph, a
-    stray quote) before it ever reaches GitHub."""
+    stray quote) before it ever reaches GitHub.
+
+    Bracket/quote counting is safe against label pollution: `_safe_label`
+    already strips `[](){}` and `"` from every label, so those exact
+    characters can never appear inside label text. But "subgraph"/"end"
+    are ordinary words, NOT stripped - a directory literally named
+    `subgraph` produces a label `"subgraph"`, and a substring count of
+    the whole diagram text would then count that label's text as an
+    extra structural token, causing a false-negative (Qodo #559: a
+    perfectly fine diagram gets needlessly dropped). Count matching
+    LINES instead, keyed on line-start position, not substring presence."""
     pairs = {"[": "]", "{": "}", "(": ")"}
     stack: list[str] = []
     for ch in text:
@@ -94,4 +104,7 @@ def _is_balanced(text: str) -> bool:
         return False
     if text.count('"') % 2 != 0:
         return False
-    return text.count("subgraph") == text.count("  end") + text.count("\tend")
+    lines = text.split("\n")
+    subgraphs = sum(1 for ln in lines if ln.lstrip().startswith("subgraph "))
+    ends = sum(1 for ln in lines if ln.strip() == "end")
+    return subgraphs == ends

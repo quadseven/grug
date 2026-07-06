@@ -145,5 +145,16 @@ def walkthrough_body(
         parts.append(f"\n### Changed files\n\n{table}")
     if diagram:
         parts.append(f"\n### Shape of the change\n\n```mermaid\n{diagram}\n```")
+    elif files:
+        # A stated degradation reason, not a silent omission (Qodo #559:
+        # "Compliance ID 6 requires... a diagram, or if absent, a stated
+        # degradation reason"). build_diagram() can return None for three
+        # bounded cases (no files, too many top-level directories, or its
+        # own balance-check failing) - all collapse honestly to "too big
+        # or complex to draw," without over-claiming which one occurred.
+        parts.append(
+            "\n_(No diagram this pass - the change was too large or "
+            "complex to visualize cleanly.)_"
+        )
     parts.append(f"\n_Last walked at commit `{head_sha[:12]}`._")
     return "\n".join(parts)
