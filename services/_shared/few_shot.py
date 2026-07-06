@@ -25,6 +25,7 @@ from dataclasses import dataclass
 # prompt to a third-party backend). One sanitizer, not two drifting copies.
 from best_practices import _sanitize
 from ledger import SEVERITY_ORDER, LedgerRow
+from redact import redact_secrets
 
 log = logging.getLogger("grug.few_shot")
 
@@ -138,9 +139,13 @@ def exemplars_block(
     lines = [_HEADER]
     for cls in ranked_classes[:max_classes]:
         for e in by_class[cls][:per_class]:
+            # REDACT BEFORE SANITIZE: the sanitizer truncates at 220
+            # chars, and a PEM key cut mid-body no longer matches its
+            # BEGIN...END redaction pattern - redaction on the truncated
+            # text would leak partial key material (#546 peer review).
             line = (
                 f"- [{_sanitize(cls)}/{_sanitize(e.severity)}] "
-                f"{_sanitize(e.finding)} (PR #{e.pr})"
+                f"{_sanitize(redact_secrets(e.finding))} (PR #{e.pr})"
             )
             if sum(len(x) + 1 for x in lines) + len(line) > max_chars:
                 return "\n".join(lines) if len(lines) > 1 else ""

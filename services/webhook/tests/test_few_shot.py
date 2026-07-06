@@ -216,3 +216,38 @@ def test_block_ranks_classes_by_strength_not_insertion_order():
     )
     assert "strong-class" in block
     assert "weak-class" not in block
+
+
+def test_block_redacts_long_pem_before_truncation():
+    """#546 peer review (codex, CONFIRMED by spark): redaction must run
+    BEFORE the sanitizer's 220-char cap - a PEM key cut mid-body no longer
+    matches its BEGIN...END pattern and partial key material would ride
+    the SYSTEM prompt to a third-party backend."""
+    pem = (
+        "reviewer quoted the committed key: "
+        "-----BEGIN RSA PRIVATE KEY-----\n"
+        + "MIIEfakefakefakefake\n" * 30
+        + "-----END RSA PRIVATE KEY-----"
+    )
+    by_class = accepted_findings_by_class(
+        [_row(1, "security-scope", finding=pem)]
+    )
+    block = exemplars_block(exemplars_from_rows(by_class))
+    assert "[REDACTED:pem-private-key]" in block
+    assert "MIIEfake" not in block
+    assert "BEGIN RSA" not in block
+
+
+def test_practices_block_redacts_long_pem_before_truncation():
+    """Same ordering rule for the #527 sibling renderer - it shipped with
+    the identical latent flaw."""
+    from best_practices import Practice, practices_block
+
+    pem = (
+        "always rotate: -----BEGIN PRIVATE KEY-----\n"
+        + "MIIEfakefakefakefake\n" * 30
+        + "-----END PRIVATE KEY-----"
+    )
+    block = practices_block([Practice("security-scope", pem, 2, [5], 5)])
+    assert "[REDACTED:pem-private-key]" in block
+    assert "MIIEfake" not in block

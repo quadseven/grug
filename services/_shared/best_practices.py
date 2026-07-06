@@ -16,6 +16,7 @@ from collections import defaultdict
 from dataclasses import asdict, dataclass
 
 from ledger import LedgerRow
+from redact import redact_secrets
 
 # Keep the injected block bounded - it rides on every review prompt.
 DEFAULT_TOP_N = 8
@@ -108,7 +109,13 @@ def practices_block(
     lines = [header]
     for p in practices[:top_n]:
         refs = ", ".join(f"#{n}" for n in p.example_prs)
-        line = f"- [{_sanitize(p.finding_class)} x{p.hits}] {_sanitize(p.rule)} (e.g. {refs})"
+        # REDACT BEFORE SANITIZE (#546 peer review): the sanitizer caps at
+        # 220 chars; a mid-body truncation defeats the PEM BEGIN...END
+        # redaction pattern and would leak partial key material.
+        line = (
+            f"- [{_sanitize(p.finding_class)} x{p.hits}] "
+            f"{_sanitize(redact_secrets(p.rule))} (e.g. {refs})"
+        )
         if sum(len(x) + 1 for x in lines) + len(line) > max_chars:
             break
         lines.append(line)
