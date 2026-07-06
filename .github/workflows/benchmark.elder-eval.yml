@@ -10,7 +10,8 @@
 # PUBLIC-REPO DISCIPLINE: every endpoint/key arrives via secrets - the Cave
 # (sparkles) URL is a private tailnet address and is NEVER committed.
 #
-# Required (operator-seeded; absent ones are skipped):
+# Secrets (operator-seeded; backends whose secrets are absent are simply
+# not configured):
 #   secrets.TS_AUTHKEY                  - tag-scoped ephemeral tailnet join (for sparkles)
 #   secrets.GRUG_BENCH_OPENROUTER_KEY   - free OpenRouter key
 #   secrets.GRUG_BENCH_POOLSIDE_KEY    - free Poolside key

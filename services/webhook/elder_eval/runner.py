@@ -6,9 +6,11 @@ production variant) and `_parse_response` (Elder's exact parser) - via the
 SAST benchmark's backend transport, so the catch/noise numbers are Elder's
 real behavior, never a reimplementation's.
 
-This module makes network calls - it is NOT imported by the pure-scoring
-tests and never runs in the per-PR CI suite. It runs only from the
-on-demand `benchmark.elder-eval.yml` job or a manual `python -m elder_eval`.
+This module makes network calls at runtime - `fetch_pr_diff` and live
+`run_case` never run in the per-PR CI suite. Its pure pieces
+(`classes_for_findings`, `diff_to_hunks`, `run_eval` with an injected
+fetch) ARE unit-tested there. Live runs happen only from the on-demand
+`benchmark.elder-eval.yml` job or a manual `python -m elder_eval`.
 """
 
 from __future__ import annotations

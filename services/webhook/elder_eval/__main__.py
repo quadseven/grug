@@ -1,7 +1,9 @@
 """Elder replay eval CLI (#361 slice 2, #537).
 
     python -m elder_eval                     # replay + print report
-    python -m elder_eval --record            # ... and (over)write baseline.json
+    python -m elder_eval --record            # ... and update baseline.json
+                                             # (same prompt: merges other backends'
+                                             # entries; changed prompt: drops them)
     python -m elder_eval --check             # ... and exit 1 on regression vs baseline
     python -m elder_eval --ab-practices      # also measure the #527 practices delta
 
@@ -90,8 +92,8 @@ def main(argv: list[str] | None = None) -> int:
     cases = tuple(c for c in all_cases if c.scorable)
     skipped = len(all_cases) - len(cases)
     if skipped:
-        # No silent caps: unscorable (fully out-of-taxonomy) cases are
-        # skipped LLM calls, and we say so.
+        # Unscorable cases (nothing accepted or FP'd inside Elder's
+        # taxonomy) are skipped LLM calls - skip loudly, never silently.
         print(
             f"skipping {skipped} unscorable case(s) "
             "(no accepted/false-positive rows in Elder's taxonomy)"
