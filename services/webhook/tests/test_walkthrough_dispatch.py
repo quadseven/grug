@@ -309,6 +309,45 @@ def test_dispatch_degraded_summary_notes_it_and_emits_gauge(monkeypatch):
     summary = mock_rcv.call_args.kwargs["summary"]
     assert "degraded to fallback" in summary
     assert mock_rcv.call_args.kwargs["conclusion"] == "success"
+    assert gauges == [("grug.teller.summary_degraded", 1)]
+
+
+def test_emit_degraded_metric_failure_is_logged_not_swallowed_silently(caplog):
+    """CodeRabbit: a bare except-pass on the gauge emit would hide a real
+    import/signature bug in observability.emit_gauge indefinitely."""
+    with patch("observability.emit_gauge", side_effect=RuntimeError("boom"), create=True), \
+         caplog.at_level("DEBUG", logger="grug.persona.walkthrough"):
+        wt_dispatch._emit_degraded_metric(True)
+
+    assert "walkthrough_emit_degraded_metric_failed" in caplog.text
+
+
+def test_dispatch_truncated_and_degraded_hedges_the_check_run_summary(monkeypatch):
+    """CodeRabbit: record_check_verdict's summary must hedge 'at least N'
+    the same way the posted comment does - the Checks tab shouldn't show
+    a capped count as exact when the comment body already says otherwise."""
+    monkeypatch.setattr(
+        wt_dispatch, "with_install_token_retry",
+        lambda inst_id, fn: fn("tok"),
+    )
+
+    def fake_get(url, **kwargs):
+        if url.endswith("/files"):
+            return _files_response([
+                {"filename": f"f{i}.py", "additions": 1, "deletions": 0}
+                for i in range(100)
+            ])
+        if "/comments" in url:
+            return _empty_comments_response()
+        return _diff_response()
+
+    with patch("httpx.get", side_effect=fake_get), \
+         patch("httpx.post", return_value=MagicMock(raise_for_status=MagicMock())), \
+         patch("personas.walkthrough.dispatch.record_check_verdict") as mock_rcv, \
+         patch("llm_client.summarize_pr", return_value=None):
+        wt_dispatch.dispatch_walkthrough_review(_payload(), blocking=False)
+
+    assert "at least 500" in mock_rcv.call_args.kwargs["summary"]
 
 
 def test_dispatch_token_exchange_runtime_error_degrades_not_raises(monkeypatch):
