@@ -200,6 +200,7 @@ _DEFAULT_PERSONA_CONFIG = {
     "warder_enabled": False,
     "pulse_enabled": False,
     "smasher_enabled": False,  # execution tracer (#469): opt-in per repo
+    "walkthrough_enabled": True,  # Teller PR-walkthrough comment (#554)
 }
 
 

@@ -1450,3 +1450,61 @@ def test_coerce_finding_drops_suggestion_redaction_would_alter() -> None:
     })
     assert ok is not None
     assert ok.suggestion is None
+
+
+def test_summarize_pr_returns_structured_summary() -> None:
+    payload = json.dumps({
+        "summary": "Adds retry logic to the fetcher.",
+        "file_summaries": {"x.py": "added retry loop"},
+        "effort": "moderate",
+    })
+    response = httpx.Response(200, json=_openai_json_response(payload))
+    with patch.object(httpx, "post", return_value=response):
+        out = lc.summarize_pr("diff --git a/x.py b/x.py\n", ["x.py"], installation_id=2)
+    assert out is not None
+    assert out.summary == "Adds retry logic to the fetcher."
+    assert out.file_summaries == {"x.py": "added retry loop"}
+    assert out.effort == "moderate"
+
+
+def test_summarize_pr_tolerates_missing_optional_fields() -> None:
+    payload = json.dumps({"summary": "A small fix."})
+    response = httpx.Response(200, json=_openai_json_response(payload))
+    with patch.object(httpx, "post", return_value=response):
+        out = lc.summarize_pr("diff", ["x.py"], installation_id=2)
+    assert out is not None
+    assert out.summary == "A small fix."
+    assert out.file_summaries == {}
+    assert out.effort is None
+
+
+def test_summarize_pr_empty_summary_is_treated_as_failure() -> None:
+    payload = json.dumps({"summary": "   "})
+    response = httpx.Response(200, json=_openai_json_response(payload))
+    with patch.object(httpx, "post", return_value=response):
+        out = lc.summarize_pr("diff", ["x.py"], installation_id=2)
+    assert out is None
+
+
+def test_summarize_pr_malformed_json_returns_none_never_raises() -> None:
+    response = httpx.Response(200, json=_openai_json_response("not json at all"))
+    with patch.object(httpx, "post", return_value=response):
+        out = lc.summarize_pr("diff", ["x.py"], installation_id=2)
+    assert out is None
+
+
+def test_summarize_pr_backend_failure_falls_back_to_none() -> None:
+    with patch.object(httpx, "post", side_effect=httpx.ConnectError("down")):
+        out = lc.summarize_pr("diff", ["x.py"], installation_id=2)
+    assert out is None
+
+
+def test_summarize_pr_ignores_non_dict_file_summaries() -> None:
+    """A malformed file_summaries shape must degrade to {} - not crash the
+    whole summary (the summary text itself is still useful)."""
+    payload = json.dumps({"summary": "ok", "file_summaries": ["not", "a", "dict"]})
+    response = httpx.Response(200, json=_openai_json_response(payload))
+    with patch.object(httpx, "post", return_value=response):
+        out = lc.summarize_pr("diff", ["x.py"], installation_id=2)
+    assert out is not None
+    assert out.file_summaries == {}
