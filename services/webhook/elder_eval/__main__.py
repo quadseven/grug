@@ -134,8 +134,10 @@ def main(argv: list[str] | None = None) -> int:
         )
     token = os.getenv("GITHUB_TOKEN", "")
 
+    # Score over ALL cases: unscorable ones contribute their excluded-row
+    # tallies to the report without being replayed or read as errored.
     replays = run_eval(backend, cases, token=token)
-    report = score(cases, replays)
+    report = score(all_cases, replays)
     _print_report(backend.name, report)
 
     if report.all_errored:

@@ -53,6 +53,10 @@ jobs:
       HAS_TS_AUTHKEY: ${{ secrets.TS_AUTHKEY != '' }}
     steps:
       - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          # This job joins a tailnet + calls LLM backends; the GITHUB_TOKEN
+          # must not persist in git config for the rest of the job.
+          persist-credentials: false
 
       # Tailnet join so the Cave/sparkles endpoint is reachable. If TS_AUTHKEY
       # is absent the step is skipped and sparkles is simply not available.

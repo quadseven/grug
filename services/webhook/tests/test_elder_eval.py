@@ -383,6 +383,26 @@ def test_score_raises_on_orphan_replay():
         score(cases, orphan)
 
 
+def test_score_unscorable_case_counts_rows_without_erroring():
+    """A fully out-of-taxonomy case is never replayed - its excluded-row
+    tallies must still reach the report, and it must NOT read as errored
+    (which would trip the --record refusal and all_errored guard)."""
+    rows = [
+        _row(1, "correctness"),
+        _row(2, "doc-truth"),  # entire case out of taxonomy -> unscorable
+    ]
+    cases = build_cases(rows)
+    replays = {
+        "githumps/grug#1": CaseReplay(
+            case_id="githumps/grug#1", emitted={"correctness": 1}, errored=False
+        ),
+    }
+    report = score(cases, replays)
+    assert report.out_of_taxonomy == {"doc-truth": 1}
+    assert report.errored_cases == ()
+    assert report.cases_scored == 1
+
+
 def test_score_case_with_no_replay_is_errored():
     """A case the replays dict never mentions did not run - it must land
     in errored_cases, not silently shrink the corpus."""
