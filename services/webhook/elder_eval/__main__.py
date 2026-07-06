@@ -18,7 +18,8 @@ All modes make REAL backend calls (`sast_benchmark.backends`
 GRUG_BENCH_* env) and REAL GitHub diff fetches - never run in the per-PR
 CI suite. The per-PR suite exercises only the pure core + the prompt-sha
 gate (test_elder_eval.py). The baseline records the STATIC prompt run
-(no practices block) so it is stable across repos; `--ab-practices` and
+(no derived blocks - neither practices nor few-shot) so it is stable
+across repos; `--ab-practices` and
 `--ab-few-shot` print their ON-vs-OFF deltas separately - the #527 and
 #538 measurements. An empty derived block skips its ON arm loudly (an
 A/A replay printed as a delta would be a fabricated result).

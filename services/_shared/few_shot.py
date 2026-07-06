@@ -8,9 +8,8 @@ the slice-1 ledger corpus and both are refreshed by `ingest_ledger`.
 
 Pure module: selection comes from `ledger.accepted_findings_by_class`
 (FPs excluded, severity-ranked - slice 1's exemplar function); this module
-converts to its own dedicated `Exemplar` carrier (never a placeholder
-LedgerRow - a fabricated verdict/repo would lie to any future consumer),
-serializes for the cache, and renders the bounded block. The store
+converts to its dedicated `Exemplar` carrier, serializes for the cache,
+and renders the bounded block. The store
 adapter persists under sk='EXEMPLARS' (`put_repo_exemplars` /
 `get_repo_exemplars`); `llm_client._few_shot_block` fetches best-effort at
 review time.
