@@ -314,3 +314,36 @@ def test_dispatch_token_exchange_runtime_error_degrades_not_raises(monkeypatch):
     assert out == {"persona": "walkthrough", "result": "fetch_failed"}
     mock_post.assert_not_called()
     mock_rcv.assert_not_called()
+
+
+def test_upsert_marker_lookup_failure_during_publish_degrades_to_publish_failed(monkeypatch):
+    """#554 audit stage 7: diff+files succeed; the comments-list GET INSIDE
+    _find_marker_comment fails during the upsert phase (distinct from the
+    initial diff/files fetch phase already tested). Currently caught
+    correctly by the outer try around with_install_token_retry(upsert) -
+    this pins that so a future refactor that adds local handling inside
+    _find_marker_comment (treating a transient error as 'no marker') can't
+    silently start double-posting duplicate advisory comments."""
+    monkeypatch.setattr(
+        wt_dispatch, "with_install_token_retry",
+        lambda inst_id, fn: fn("tok"),
+    )
+
+    def fake_get(url, **kwargs):
+        if "/comments" in url:
+            raise httpx.ConnectError("dns down")
+        if url.endswith("/files"):
+            return _files_response([{"filename": "x.py", "additions": 1, "deletions": 0}])
+        return _diff_response()
+
+    with patch("httpx.get", side_effect=fake_get), \
+         patch("httpx.post") as mock_post, \
+         patch("httpx.patch") as mock_patch, \
+         patch("personas.walkthrough.dispatch.record_check_verdict") as mock_rcv, \
+         patch("llm_client.summarize_pr", return_value=None):
+        out = wt_dispatch.dispatch_walkthrough_review(_payload(), blocking=False)
+
+    assert out == {"persona": "walkthrough", "result": "publish_failed"}
+    mock_post.assert_not_called()
+    mock_patch.assert_not_called()
+    mock_rcv.assert_not_called()
