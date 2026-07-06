@@ -126,6 +126,22 @@ def test_build_cases_counts_out_of_taxonomy():
     assert set(case.expected_classes) == {"correctness"}
 
 
+def test_parse_row_normalizes_annotated_verdicts():
+    """Historical ledger rows embed the reason in the verdict -
+    'declined(bounded: ...)' - the leading token is the label. Without
+    normalization those rows silently matched NO verdict class."""
+    from ledger import parse_row
+
+    row = parse_row({
+        "repo": "githumps/grug", "pr": 1, "reviewer": "codex",
+        "class": "correctness", "finding": "f",
+        "verdict": "declined(bounded: advisory only)",
+    })
+    assert row is not None
+    assert row.verdict == "declined"
+    assert row.accepted
+
+
 def test_build_cases_counts_unknown_verdicts():
     rows = [
         _row(450, "correctness", verdict="fixed"),

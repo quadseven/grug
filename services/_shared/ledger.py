@@ -65,7 +65,11 @@ def parse_row(d: dict) -> LedgerRow | None:
             severity=str(d.get("severity", "")).upper(),
             finding_class=str(d["class"]),
             finding=str(d["finding"]),
-            verdict=str(d["verdict"]).lower(),
+            # Some historical rows carry the reason inline -
+            # "declined(bounded: ...)" - the label is the leading token;
+            # without the split those rows silently match NO verdict class
+            # (surfaced by the #537 eval's unknown-verdict counter).
+            verdict=str(d["verdict"]).lower().split("(", 1)[0].strip(),
             evidence=str(d.get("evidence", "")),
             ts=str(d.get("ts", "")),
             commit=d.get("commit"),

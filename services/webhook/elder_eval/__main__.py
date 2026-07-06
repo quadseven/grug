@@ -162,6 +162,19 @@ def main(argv: list[str] | None = None) -> int:
         )
 
     if args.record:
+        if report.errored_cases:
+            # A partial run must never become the committed ruler: an
+            # errored case would permanently shrink cases_scored and the
+            # missing slice of the corpus would silently stop gating
+            # Elder (codex+poolside peer review, PR #543).
+            print(
+                "refusing --record: "
+                f"{len(report.errored_cases)} case(s) errored "
+                f"({', '.join(report.errored_cases)}) - a baseline must "
+                "come from a complete run; fix or prune the cases and re-run",
+                file=sys.stderr,
+            )
+            return 3
         fresh = to_baseline_dict(
             report, prompt_sha=compute_prompt_sha(), backend=backend.name
         )

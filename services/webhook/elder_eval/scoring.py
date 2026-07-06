@@ -146,7 +146,10 @@ def compare_to_baseline(
     report: EvalReport,
     backend_baseline: dict,
     *,
-    catch_tolerance: float = 0.05,
+    # Measured run-to-run sampling swing on the 12-case corpus (sparkles,
+    # 2026-07-05) was ~0.09 overall catch; a tolerance below the noise
+    # floor would page on dice rolls, not regressions.
+    catch_tolerance: float = 0.10,
     noise_tolerance: float = 0.05,
 ) -> list[str]:
     """Regressions of `report` vs one backend's recorded scores. Empty list
