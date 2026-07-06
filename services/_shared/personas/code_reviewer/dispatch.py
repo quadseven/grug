@@ -311,9 +311,9 @@ def _consolidated_agent_prompt(evaluation: CodeReviewEvaluation) -> str:
         "Address each finding below. Keep every fix minimal and scoped to "
         "the named line; do not refactor beyond the findings.",
     ]
-    footer: list[str] = []
+
     body: list[str] = []
-    used = sum(len(x) + 1 for x in header + footer)
+    used = sum(len(x) + 1 for x in header)
     included = 0
     for f in evaluation.findings:
         entry = f"- {f.file}:{f.line} [{f.severity}/{f.rule_name}] {f.message}"
@@ -329,14 +329,9 @@ def _consolidated_agent_prompt(evaluation: CodeReviewEvaluation) -> str:
         body.append(
             f"(+{cut} more finding(s) - see the findings table above)"
         )
-    block = "\n".join([
-        "<details>",
-        "<summary>Prompt for AI agents (all findings)</summary>",
-        "",
-        _fenced("\n".join(header + body + footer)),
-        "",
-        "</details>",
-    ])
+    block = _details_block(
+        "Prompt for AI agents (all findings)", "\n".join(header + body)
+    )
     # Hard deterministic ceiling: fence growth (backtick-run + 1, twice)
     # and the wrapper are not in the per-entry budget, so cap the WHOLE
     # block - an oversized prompt must degrade loudly, never 422 the
@@ -349,6 +344,15 @@ def _consolidated_agent_prompt(evaluation: CodeReviewEvaluation) -> str:
 # Derived from the shared vocabulary so a new effort level can never
 # silently drop its chip (the Severity-partition-assert drift class).
 _EFFORT_LABELS = {e: e.replace("-", " ") for e in EFFORTS}
+
+
+def _details_block(summary: str, content: str) -> str:
+    """The one <details> scaffold for agent prompts - the blank lines
+    around the fence are load-bearing for GitHub rendering, so both
+    surfaces share this instead of hand-building drift-prone copies."""
+    return "\n".join(
+        ["<details>", f"<summary>{summary}</summary>", "", _fenced(content), "", "</details>"]
+    )
 
 
 def _fenced(text: str) -> str:
@@ -375,14 +379,7 @@ def _agent_prompt_block(f: Finding) -> str:
     ]
     if f.suggestion:
         content += ["Suggested fix:", f.suggestion]
-    return "\n".join([
-        "<details>",
-        "<summary>Prompt for AI agents</summary>",
-        "",
-        _fenced("\n".join(content)),
-        "",
-        "</details>",
-    ])
+    return _details_block("Prompt for AI agents", "\n".join(content))
 
 
 def _inline_comment_body(f: Finding) -> str:
