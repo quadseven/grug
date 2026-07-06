@@ -114,7 +114,7 @@ def test_effort_label_renders_every_closed_value():
 def test_changed_files_table_renders_rows():
     files = [
         FileStat(path="a.py", additions=3, deletions=1, summary="added a guard"),
-        FileStat(path="b.py", additions=0, deletions=5, summary=""),
+        FileStat(path="b.py", additions=0, deletions=5, summary=None),
     ]
     table = changed_files_table(files)
     assert "a.py" in table and "added a guard" in table and "+3/-1" in table

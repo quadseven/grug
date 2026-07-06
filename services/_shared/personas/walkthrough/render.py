@@ -22,14 +22,16 @@ _MAX_SUMMARY_CHARS = 2000
 _MAX_FILE_SUMMARY_CHARS = 160
 
 
-@dataclass(frozen=True)
+@dataclass(frozen=True, slots=True)
 class FileStat:
-    """One changed file's diff-stat + (optional, model-supplied) blurb."""
+    """One changed file's diff-stat + (optional, model-supplied) blurb.
+    `summary=None` (not "") for absence - the one convention this whole
+    PR uses everywhere else (WalkthroughSummary.effort, build_diagram)."""
 
     path: str
     additions: int
     deletions: int
-    summary: str = ""
+    summary: str | None = None
 
 
 def changed_files_table(files: list[FileStat]) -> str:
@@ -39,7 +41,7 @@ def changed_files_table(files: list[FileStat]) -> str:
         return ""
     rows = ["| File | Summary | Changes |", "|---|---|---|"]
     for f in files[:_MAX_TABLE_ROWS]:
-        summary = f.summary[:_MAX_FILE_SUMMARY_CHARS] or "-"
+        summary = (f.summary or "")[:_MAX_FILE_SUMMARY_CHARS] or "-"
         rows.append(f"| `{f.path}` | {summary} | +{f.additions}/-{f.deletions} |")
     table = "\n".join(rows)
     cut = len(files) - _MAX_TABLE_ROWS
