@@ -6,7 +6,10 @@ CodeRabbit's "~60 minutes" chip. A deterministic file/line-count
 heuristic is the reliable baseline; the model's own judgment (returned
 alongside its summary) overrides it ONLY when the value is itself in the
 closed set - the same coercion-degrades-to-fallback discipline as #553,
-so an off-vocabulary or hallucinated label can never reach the chip.
+so an off-vocabulary or hallucinated label can never reach the chip. A
+rejected-but-truthy value is debug-logged
+("walkthrough_model_effort_rejected") so a systemic prompt-casing
+regression is not invisible.
 """
 
 from __future__ import annotations

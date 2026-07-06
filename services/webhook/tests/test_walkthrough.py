@@ -1,8 +1,8 @@
 """Teller persona: pure module tests (#554, epic #522).
 
 Mermaid diagram determinism + injection safety, effort heuristic +
-model-override coercion, changed-files table, and the full comment
-assembly. No LLM, no network.
+model-override coercion (incl. rejected-value debug logging), changed-
+files table, and the full comment assembly. No LLM, no network.
 """
 
 from __future__ import annotations

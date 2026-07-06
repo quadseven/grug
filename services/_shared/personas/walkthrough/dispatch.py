@@ -80,7 +80,7 @@ def _find_marker_comment(
     token: str, owner: str, repo: str, pr_number: int,
 ) -> int | None:
     page = 1
-    while page <= 20:  # bound the scan (>2000 comments = give up, post fresh)
+    while page <= 20:  # bound the scan (>2000 comments = give up, post fresh, warn below)
         resp = httpx.get(
             f"{_API}/repos/{_repo_path(owner, repo)}/issues/{pr_number}/comments",
             params={"per_page": 100, "page": page}, headers=_headers(token), timeout=_TIMEOUT,
@@ -155,9 +155,11 @@ def dispatch_walkthrough_review(
 ) -> dict[str, str]:
     """Entry point - one Teller walkthrough pass. `blocking` is unused
     (Teller has no blocking mode - registry requires the parameter for
-    the shared async-job contract). Never raises: every failure degrades
-    to a deterministic comment or a logged skip, never a wire-level
-    exception."""
+    the shared async-job contract). Never raises on the guarded surfaces:
+    every HTTPStatusError/RequestError/RuntimeError from the diff/files
+    fetch or the comment publish degrades to a logged, structured result
+    (fetch_failed/publish_failed), matching Smasher's dispatch guard for
+    the token-exchange RuntimeError case."""
     del blocking  # advisory-only persona; kept for the shared call contract
     pr = payload["pull_request"]
     repo = payload["repository"]
@@ -173,7 +175,7 @@ def dispatch_walkthrough_review(
             installation_id,
             lambda token: _fetch_pr_diff(token, owner, repo_name, pull_number),
         )
-    except (httpx.HTTPStatusError, httpx.RequestError) as e:
+    except (httpx.HTTPStatusError, httpx.RequestError, RuntimeError) as e:
         _log_fetch_failed(e, phase="diff", installation_id=installation_id,
                            owner=owner, repo_name=repo_name, pull_number=pull_number)
         return {"persona": "walkthrough", "result": "fetch_failed"}
@@ -183,7 +185,7 @@ def dispatch_walkthrough_review(
             installation_id,
             lambda token: _fetch_pr_files(token, owner, repo_name, pull_number),
         )
-    except (httpx.HTTPStatusError, httpx.RequestError) as e:
+    except (httpx.HTTPStatusError, httpx.RequestError, RuntimeError) as e:
         # The diff fetch above already succeeded and is discarded here -
         # acceptable (the whole walkthrough needs both), but the log must
         # say WHICH call failed so a diff-outage and a files-outage don't
@@ -240,7 +242,7 @@ def dispatch_walkthrough_review(
             installation_id,
             lambda token: _upsert_comment(token, owner, repo_name, pull_number, body),
         )
-    except (httpx.HTTPStatusError, httpx.RequestError) as e:
+    except (httpx.HTTPStatusError, httpx.RequestError, RuntimeError) as e:
         log.warning(
             "walkthrough_publish_failed",
             extra={
