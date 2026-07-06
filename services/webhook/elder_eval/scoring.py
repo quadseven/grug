@@ -87,6 +87,11 @@ def score(
     for case in cases:
         out_of_taxonomy.update(case.out_of_taxonomy)
         unknown_verdicts.update(case.unknown_verdicts)
+        if not case.scorable:
+            # Nothing replayable, but its excluded-row counts (above) must
+            # still reach the report - a fully out-of-taxonomy case is not
+            # an errored case, and not invisible either.
+            continue
         replay = replays.get(case.case_id)
         if replay is None or replay.errored:
             errored.append(case.case_id)
