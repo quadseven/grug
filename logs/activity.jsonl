@@ -10,3 +10,7 @@
 {"timestamp": "2026-07-04T00:20:45Z", "action": "ship_slice", "detail": {"issues": [467, 468, 466], "phase": "guard-shipped", "status": "complete"}}
 {"timestamp": "2026-07-04T18:45:00-04:00", "action": "ship_slice", "detail": {"issue": 77, "phase": "pr_created", "pr": 495, "status": "complete"}}
 {"timestamp": "2026-07-04T20:55:00-04:00", "action": "ship_slice", "detail": {"issue": 77, "phase": "merged_deployed_verified", "pr": 495, "merge": "4c0c140", "postscript_pr": 497, "status": "complete"}}
+{"timestamp": "2026-07-05T22:40:00-04:00", "action": "ship_slice", "detail": {"issue": 388, "phase": "merged_deployed_live_proven", "prs": [501, 503], "infra_prs": [1617, 1618], "status": "complete"}}
+{"timestamp": "2026-07-05T01:05:00-04:00", "action": "ship_slice", "detail": {"issue": 389, "phase": "rollout_merged_fleet_proven_drill_exercised", "prs": [504, 505], "status": "pr_a_complete"}}
+{"timestamp": "2026-07-05T02:05:00-04:00", "action": "ship_slice", "detail": {"issue": 389, "phase": "retired_verified_closed", "prs": [504, 505, 506], "status": "complete"}}
+{"timestamp": "2026-07-05T02:30:00-04:00", "action": "ship_slice", "detail": {"issue": 507, "phase": "merged", "status": "complete"}}

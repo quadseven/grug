@@ -1,0 +1,125 @@
+# Elder replay eval harness (#361 slice 2, #537) - on-demand only.
+#
+# Replays Elder over the PRs in the committed review-findings ledger corpus
+# and scores catch-rate vs noise per class. NOT a per-PR gate: it makes real
+# LLM calls + real GitHub diff fetches, so it runs ONLY on manual dispatch.
+# The per-PR suite covers the pure corpus/scoring core AND the prompt-sha
+# gate (test_elder_eval.py): a change to code_review_prompt.py fails CI until
+# this job (or a local run) re-records baseline.json in the same PR.
+#
+# PUBLIC-REPO DISCIPLINE: every endpoint/key arrives via secrets - the Cave
+# (sparkles) URL is a private tailnet address and is NEVER committed.
+#
+# Secrets (operator-seeded; backends whose secrets are absent are simply
+# not configured):
+#   secrets.TS_AUTHKEY                  - tag-scoped ephemeral tailnet join (for sparkles)
+#   secrets.GRUG_BENCH_OPENROUTER_KEY   - free OpenRouter key
+#   secrets.GRUG_BENCH_POOLSIDE_KEY    - free Poolside key
+#   secrets.GRUG_BENCH_CAVE_URL         - sparkles/Cave OpenAI-compatible endpoint (tailnet)
+#   secrets.GRUG_BENCH_CAVE_MODEL       - sparkles model id
+#   secrets.GRUG_BENCH_CAVE_KEY         - optional (Ollama usually needs none)
+name: benchmark.elder-eval
+
+on:
+  workflow_dispatch:
+    inputs:
+      mode:
+        description: "record (write baseline.json artifact), check (exit 1 on regression), or report (print only)"
+        type: choice
+        options: [record, check, report]
+        default: record
+      ab_practices:
+        description: "also measure the #527 practices ON-vs-OFF delta"
+        type: boolean
+        default: false
+
+permissions:
+  contents: read
+
+concurrency:
+  group: benchmark-elder-eval
+  cancel-in-progress: false
+
+jobs:
+  eval:
+    # Same two gates as benchmark.sast (#453): the ref check AND the
+    # `benchmark` Environment's protection rules (managed via the
+    # infrastructure repo's Pulumi, not by hand).
+    environment: benchmark
+    if: github.ref == 'refs/heads/main'
+    runs-on: ubuntu-24.04-arm
+    timeout-minutes: 30
+    env:
+      HAS_TS_AUTHKEY: ${{ secrets.TS_AUTHKEY != '' }}
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          # This job joins a tailnet + calls LLM backends; the GITHUB_TOKEN
+          # must not persist in git config for the rest of the job.
+          persist-credentials: false
+
+      # Tailnet join so the Cave/sparkles endpoint is reachable. If TS_AUTHKEY
+      # is absent the step is skipped and sparkles is simply not available.
+      - name: Join tailnet (ephemeral)
+        if: env.HAS_TS_AUTHKEY == 'true'
+        uses: tailscale/github-action@306e68a486fd2350f2bfc3b19fcd143891a4a2d8 # v4
+        with:
+          authkey: ${{ secrets.TS_AUTHKEY }}
+          tags: tag:ci
+          use-cache: 'true'
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@d4b2f3b6ecc6e67c4457f6d3e41ec42d3d0fcb86 # v6
+
+      - name: Run Elder eval
+        working-directory: services/webhook
+        env:
+          # Same offline-import shims as benchmark.sast: secrets_loader builds
+          # boto3.client("ssm") at import via llm_client, needing only a region.
+          AWS_DEFAULT_REGION: us-east-1
+          AWS_ACCESS_KEY_ID: testing
+          AWS_SECRET_ACCESS_KEY: testing
+          PYTHONPATH: ${{ github.workspace }}/services/_shared
+          GRUG_BENCH_OPENROUTER_KEY: ${{ secrets.GRUG_BENCH_OPENROUTER_KEY }}
+          GRUG_BENCH_POOLSIDE_KEY: ${{ secrets.GRUG_BENCH_POOLSIDE_KEY }}
+          GRUG_BENCH_CAVE_URL: ${{ secrets.GRUG_BENCH_CAVE_URL }}
+          GRUG_BENCH_CAVE_MODEL: ${{ secrets.GRUG_BENCH_CAVE_MODEL }}
+          GRUG_BENCH_CAVE_KEY: ${{ secrets.GRUG_BENCH_CAVE_KEY }}
+          # Tokenless diff fetches rate-limit fast; the workflow token reads
+          # public PR diffs fine.
+          GITHUB_TOKEN: ${{ github.token }}
+          EVAL_MODE: ${{ inputs.mode }}
+          EVAL_AB: ${{ inputs.ab_practices }}
+        run: |
+          set -euo pipefail
+          FLAG=""
+          if [ "$EVAL_MODE" = "record" ]; then FLAG="--record"; fi
+          if [ "$EVAL_MODE" = "check" ]; then FLAG="--check"; fi
+          AB=""
+          if [ "$EVAL_AB" = "true" ]; then AB="--ab-practices"; fi
+          uv run --with httpx --with pyjwt --with cryptography --with boto3 \
+            --with 'psycopg[binary,pool]' --with 'ddtrace>=3.5,<4' \
+            --with 'datadog-lambda>=6.107,<7' \
+            python -m elder_eval $FLAG $AB | tee "$RUNNER_TEMP/eval-report.txt"
+
+      # The report uploads even on failure (it is the diagnostic); the
+      # baseline uploads ONLY on success - a failed record run would
+      # otherwise upload the stale checked-out baseline.json dressed as
+      # freshly recorded. Download + commit
+      # services/webhook/elder_eval/baseline.json to update the in-repo
+      # baseline + gate through normal review.
+      - name: Upload report
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: elder-eval-report
+          path: ${{ runner.temp }}/eval-report.txt
+          if-no-files-found: warn
+
+      - name: Upload recorded baseline
+        if: success() && inputs.mode == 'record'
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: elder-eval-baseline
+          path: services/webhook/elder_eval/baseline.json
+          if-no-files-found: error
