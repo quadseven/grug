@@ -96,6 +96,16 @@ def _find_marker_comment(
         resp.raise_for_status()
         batch = resp.json()
         for c in batch:
+            # `performed_via_github_app` is populated server-side ONLY for
+            # comments created via a GitHub App installation token - a
+            # human contributor cannot set it. Without this check, any PR
+            # commenter could post the literal marker string ahead of
+            # Teller's first run; the PATCH would then target a comment
+            # this app cannot edit (GitHub 403/404), turning every
+            # dispatch into a permanent publish_failed until the decoy is
+            # manually removed (#554 peer review - codex).
+            if c.get("performed_via_github_app") is None:
+                continue
             if MARKER in (c.get("body") or ""):
                 return int(c["id"])
         if len(batch) < 100:
