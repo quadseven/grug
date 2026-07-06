@@ -10,6 +10,7 @@ from __future__ import annotations
 from few_shot import (
     exemplars_block,
     exemplars_from_dicts,
+    exemplars_from_rows,
     exemplars_to_dicts,
 )
 from ledger import LedgerRow, accepted_findings_by_class
@@ -37,14 +38,14 @@ def _row(
 
 
 def test_block_empty_when_no_exemplars():
-    assert exemplars_block({}) == ""
+    assert exemplars_block([]) == ""
 
 
 def test_block_renders_class_severity_finding_and_pr():
     by_class = accepted_findings_by_class(
         [_row(7, "silent-failure", severity="CRITICAL", finding="swallowed drop")]
     )
-    block = exemplars_block(by_class)
+    block = exemplars_block(exemplars_from_rows(by_class))
     assert "EXAMPLES" in block
     assert "silent-failure" in block
     assert "CRITICAL" in block
@@ -59,7 +60,7 @@ def test_block_excludes_false_positives_via_corpus_layer():
             _row(2, "correctness", verdict="false-positive", finding="fp noise"),
         ]
     )
-    block = exemplars_block(by_class)
+    block = exemplars_block(exemplars_from_rows(by_class))
     assert "real bug" in block
     assert "fp noise" not in block
 
@@ -69,7 +70,9 @@ def test_block_bounded_by_max_chars_and_per_class():
         _row(i, f"class-{i % 4}", finding=f"finding {i} " + "x" * 80)
         for i in range(40)
     ]
-    block = exemplars_block(accepted_findings_by_class(rows), max_chars=500)
+    block = exemplars_block(
+        exemplars_from_rows(accepted_findings_by_class(rows)), max_chars=500
+    )
     assert len(block) <= 500
 
 
@@ -77,7 +80,7 @@ def test_block_sanitizes_newlines_in_findings():
     by_class = accepted_findings_by_class(
         [_row(1, "correctness", finding="line one\nline two\r\nline three")]
     )
-    block = exemplars_block(by_class)
+    block = exemplars_block(exemplars_from_rows(by_class))
     # One exemplar = one line; embedded newlines must not fork the block.
     exemplar_lines = [ln for ln in block.splitlines() if ln.startswith("- ")]
     assert len(exemplar_lines) == 1
@@ -93,10 +96,12 @@ def test_exemplar_dict_roundtrip():
             _row(2, "silent-failure", severity="CRITICAL", finding="b"),
         ]
     )
-    dicts = exemplars_to_dicts(by_class)
+    exemplars = exemplars_from_rows(by_class)
+    dicts = exemplars_to_dicts(exemplars)
     assert all(isinstance(d, dict) for d in dicts)
     restored = exemplars_from_dicts(dicts)
-    assert exemplars_block(restored) == exemplars_block(by_class)
+    assert restored == exemplars
+    assert exemplars_block(restored) == exemplars_block(exemplars)
 
 
 def test_exemplars_from_dicts_skips_malformed():
@@ -106,7 +111,7 @@ def test_exemplars_from_dicts_skips_malformed():
         "not-a-dict",
     ]
     restored = exemplars_from_dicts(dicts)  # type: ignore[arg-type]
-    assert list(restored) == ["correctness"]
+    assert [e.finding_class for e in restored] == ["correctness"]
 
 
 # --- prompt injection order ---------------------------------------------------
@@ -176,3 +181,33 @@ def test_ingest_refreshes_exemplars_beside_practices():
     assert practice_calls and practice_calls[0][0] == "githumps/grug"
     assert exemplar_calls and exemplar_calls[0][0] == "githumps/grug"
     assert any(d.get("finding") == "exemplar seed" for d in exemplar_calls[0][1])
+
+
+def test_block_strips_control_chars_and_caps_item_length():
+    """Sanitizer parity with the #527 sibling (#541 lesson): control chars
+    never reach the SYSTEM prompt, and one oversized finding is capped -
+    never allowed to blank the whole block."""
+    by_class = accepted_findings_by_class(
+        [
+            _row(1, "correctness", finding="evil \x1b[31m ansi"),
+            _row(2, "silent-failure", finding="y" * 5000),
+        ]
+    )
+    block = exemplars_block(exemplars_from_rows(by_class))
+    assert "\x1b" not in block
+    assert "silent-failure" in block  # capped, not dropped
+    assert "correctness" in block
+
+
+def test_block_ranks_classes_by_strength_not_insertion_order():
+    """Which classes survive max_classes must be strongest-first, never
+    corpus-insertion order."""
+    rows = [
+        _row(1, "weak-class", severity="LOW"),
+        _row(2, "strong-class", severity="CRITICAL"),
+    ]
+    block = exemplars_block(
+        exemplars_from_rows(accepted_findings_by_class(rows)), max_classes=1
+    )
+    assert "strong-class" in block
+    assert "weak-class" not in block

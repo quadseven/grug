@@ -578,6 +578,9 @@ def list_ledger_rows(repo: str, limit: int | None = None) -> list[dict[str, Any]
             f"""
             SELECT pk, sk, data FROM grug_kv
             WHERE pk = %s AND sk NOT IN ('PRACTICES', 'EXEMPLARS') AND {TTL_LIVE}
+            -- keep the NOT IN list in lockstep with every derived-cache sk
+            -- (PRACTICES #527, EXEMPLARS #538): a cached derivation leaking
+            -- into the corpus scan feeds Elder its own output as ground truth
             ORDER BY sk COLLATE "C" ASC
             """,
             (_ledger_pk(repo),),

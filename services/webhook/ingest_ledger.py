@@ -53,7 +53,7 @@ def ingest_text(
 def _refresh_exemplars(parsed_by_repo: dict, put_exemplars=None) -> int:
     """After ingest, recompute + cache each repo's few-shot exemplars
     (#538) beside the practices refresh. Best-effort per repo."""
-    from few_shot import exemplars_to_dicts
+    from few_shot import exemplars_from_rows, exemplars_to_dicts
     from ledger import accepted_findings_by_class
     if put_exemplars is None:
         try:
@@ -64,7 +64,12 @@ def _refresh_exemplars(parsed_by_repo: dict, put_exemplars=None) -> int:
     n = 0
     for repo, rows in parsed_by_repo.items():
         try:
-            put_exemplars(repo, exemplars_to_dicts(accepted_findings_by_class(rows)))
+            put_exemplars(
+                repo,
+                exemplars_to_dicts(
+                    exemplars_from_rows(accepted_findings_by_class(rows))
+                ),
+            )
             n += 1
         except Exception:  # noqa: BLE001 - an exemplar refresh must not abort ingest
             continue
