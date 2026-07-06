@@ -1343,3 +1343,63 @@ def test_elder_no_longer_carries_security_findings(monkeypatch):
     assert out["result"] == "pass"
     assert posted_check[0].conclusion == "success"  # blocking mode, no findings
     assert posted_review == []  # no inline security comments from Elder
+
+
+def test_inline_comment_body_renders_committable_suggestion_block():
+    """#553: a fence-safe suggestion renders as a GitHub-native committable
+    suggestion block, not just prose."""
+    from personas.code_reviewer.persona import Finding
+    f = Finding(
+        file="x.py", line=1, severity="high", rule_name="null-deref",
+        message="m", suggestion="if x is not None:\n    use(x)",
+    )
+    body = cr_dispatch._inline_comment_body(f)
+    assert "```suggestion\nif x is not None:\n    use(x)\n```" in body
+    # dedup marker must remain the LAST marker in the body
+    assert body.rstrip().endswith("<!-- grug-rule:null-deref -->")
+
+
+def test_inline_comment_body_fence_unsafe_suggestion_degrades_to_prose():
+    """A suggestion containing a backtick fence must never produce broken
+    markdown - degrade to the prose form."""
+    from personas.code_reviewer.persona import Finding
+    f = Finding(
+        file="x.py", line=1, severity="high", rule_name="null-deref",
+        message="m", suggestion="use\n```\nfenced\n```\nthing",
+    )
+    body = cr_dispatch._inline_comment_body(f)
+    assert "```suggestion" not in body
+    assert "Suggested fix" in body
+
+
+def test_inline_comment_body_effort_chip_and_agent_prompt():
+    """#553: effort chip renders on the header line; every finding carries
+    a deterministic Prompt-for-AI-agents collapsible."""
+    from personas.code_reviewer.persona import Finding
+    f = Finding(
+        file="x.py", line=42, severity="medium", rule_name="dead-code",
+        message="Grug see unused path", suggestion=None, effort="quick-win",
+    )
+    body = cr_dispatch._inline_comment_body(f)
+    assert "quick win" in body
+    assert "Prompt for AI agents" in body
+    assert "x.py:42" in body and "dead-code" in body
+    # deterministic assembly: the finding message rides the prompt block
+    assert "Grug see unused path" in body
+
+
+def test_summary_markdown_appends_bounded_consolidated_agent_prompt():
+    """#553: the check-run summary carries ONE consolidated agent prompt
+    covering the findings, bounded so the 65536 body cap stays safe."""
+    from personas.code_reviewer.persona import CodeReviewEvaluation, Finding
+    ev = CodeReviewEvaluation(
+        findings=tuple(
+            Finding(file=f"f{i}.py", line=i + 1, severity="high",
+                    rule_name="null-deref", message="m" * 500, suggestion=None)
+            for i in range(50)
+        ),
+        conclusion="failure",
+    )
+    _, summary = cr_dispatch._summary_markdown(ev)
+    assert "Prompt for AI agents" in summary
+    assert len(summary) < 60000

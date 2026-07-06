@@ -1380,3 +1380,28 @@ def test_review_diff_injects_cached_exemplars(monkeypatch) -> None:
     system = captured["messages"][0]["content"]
     assert "EXAMPLES OF ACCEPTED FINDINGS" in system
     assert "cached exemplar finding" in system
+
+
+def test_coerce_finding_parses_suggestion_and_effort() -> None:
+    """#553 wire format: optional suggestion (non-empty str else None) and
+    effort (closed enum else "")."""
+    ok, reason = lc._coerce_finding({
+        "path": "x.py", "line": 1, "rule": "null-deref", "severity": "high",
+        "message": "m", "suggestion": "fixed line", "effort": "quick-win",
+    })
+    assert reason == "" and ok is not None
+    assert ok.suggestion == "fixed line" and ok.effort == "quick-win"
+
+    # hostile/malformed values degrade, never reject the finding
+    ok2, _ = lc._coerce_finding({
+        "path": "x.py", "line": 1, "rule": "r", "severity": "low",
+        "message": "m", "suggestion": {"not": "a str"}, "effort": "yolo",
+    })
+    assert ok2 is not None
+    assert ok2.suggestion is None and ok2.effort == ""
+
+    # absent fields keep prior behavior
+    ok3, _ = lc._coerce_finding({
+        "path": "x.py", "line": 1, "rule": "r", "severity": "low", "message": "m",
+    })
+    assert ok3 is not None and ok3.suggestion is None and ok3.effort == ""

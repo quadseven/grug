@@ -225,6 +225,17 @@ class Finding:
     rule: str
     severity: Severity
     message: str
+    # #553: optional one-click remediation fields. `suggestion` is the exact
+    # replacement text for the flagged line(s) - emitted only when the model
+    # is confident and line-exact; anything non-str/empty coerces to None.
+    # `effort` is a closed enum (quick-win / heavy-lift) or "".
+    suggestion: str | None = None
+    effort: str = ""
+
+
+# The one effort vocabulary (#553) - validated at coercion so a typo'd
+# label degrades to "" instead of leaking into render surfaces.
+EFFORTS: frozenset[str] = frozenset({"quick-win", "heavy-lift"})
 
 
 @dataclass(frozen=True, slots=True)
@@ -572,8 +583,20 @@ def _coerce_finding(raw: Any) -> tuple[Optional[Finding], str]:
         return None, f"bad_type:{type(e).__name__}"
     if severity not in SEVERITIES:
         return None, f"invalid_severity:{severity[:32]}"
+    # #553 optional fields: malformed values DEGRADE (finding still lands),
+    # never reject - a hostile model must not be able to drop a real
+    # finding by attaching a bad suggestion.
+    raw_suggestion = raw.get("suggestion")
+    suggestion = (
+        raw_suggestion
+        if isinstance(raw_suggestion, str) and raw_suggestion.strip()
+        else None
+    )
+    raw_effort = raw.get("effort")
+    effort = raw_effort if raw_effort in EFFORTS else ""
     return Finding(
         path=path, line=line, rule=rule, severity=severity, message=message,  # type: ignore[arg-type]
+        suggestion=suggestion, effort=effort,
     ), ""
 
 

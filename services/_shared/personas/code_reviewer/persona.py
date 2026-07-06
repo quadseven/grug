@@ -68,6 +68,9 @@ class Finding:
     rule_name: str
     message: str
     suggestion: str | None
+    # #553: closed-enum fix-effort hint ("quick-win" / "heavy-lift" / "").
+    # Validated at the wire boundary (llm_client.EFFORTS); render-only here.
+    effort: str = ""
 
     def __post_init__(self) -> None:
         assert self.line >= 1, (
@@ -216,9 +219,11 @@ def evaluate_diff(
                 severity=raw.severity,
                 rule_name=raw.rule,
                 message=raw.message,
-                # `None` (not "") so consumers don't conflate "LLM
-                # supplied no hint" with "LLM supplied an empty hint."
-                suggestion=None,
+                # #553: wire fields carry through; the anti-hallucination
+                # line gate above already guarantees a suggestion only
+                # anchors on a line the LLM actually saw.
+                suggestion=raw.suggestion,
+                effort=raw.effort,
             )
         )
 
