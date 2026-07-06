@@ -15,6 +15,9 @@ Metrics:
 - HONEST-ZERO RULE: an errored case is EXCLUDED from every denominator
   and listed in `errored_cases` - a non-run is not a miss, and an
   all-errored sweep must never record as a valid (zero) baseline.
+  Excluded from RATES, but not from the GATE: `compare_to_baseline`
+  flags errored cases and `cases_scored` shrinkage as regressions (a
+  partial run must not pass as complete).
 """
 
 from __future__ import annotations

@@ -1,7 +1,7 @@
 """Pure tests for the Elder replay eval harness (#361 slice 2, #537).
 
 NO LLM, NO network - these run in the normal CI test suite. They feed
-SYNTHETIC ledger rows + replay results into the pure corpus/scoring core
+SYNTHETIC ledger rows + replay results into the pure corpus/scoring/runner core
 and assert per-class catch-rate, noise-rate, the out-of-taxonomy
 exclusion, baseline-regression detection, and the prompt-sha CI gate.
 The live replay (real backends over real PR diffs) is the on-demand
