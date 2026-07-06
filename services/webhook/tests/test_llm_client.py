@@ -1398,10 +1398,10 @@ def test_coerce_finding_parses_suggestion_and_effort() -> None:
         "message": "m", "suggestion": {"not": "a str"}, "effort": "yolo",
     })
     assert ok2 is not None
-    assert ok2.suggestion is None and ok2.effort == ""
+    assert ok2.suggestion is None and ok2.effort is None
 
     # absent fields keep prior behavior
     ok3, _ = lc._coerce_finding({
         "path": "x.py", "line": 1, "rule": "r", "severity": "low", "message": "m",
     })
-    assert ok3 is not None and ok3.suggestion is None and ok3.effort == ""
+    assert ok3 is not None and ok3.suggestion is None and ok3.effort is None

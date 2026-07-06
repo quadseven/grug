@@ -23,6 +23,7 @@ from __future__ import annotations
 
 import logging
 import os
+import re
 from typing import Any, Literal
 from urllib.parse import quote
 
@@ -35,6 +36,7 @@ from github_reviews_client import (
     InlineComment, ReviewEvent, ReviewResult, get_review_comments, post_review,
 )
 from llm_client import Hunk as LlmHunk, LlmReviewResponse, review_diff
+from review_types import EFFORTS
 from personas.code_reviewer.dedup import (
     dedup_findings, finding_key, parse_rule, prior_keys_from_comments,
     rule_marker,
@@ -306,14 +308,10 @@ def _consolidated_agent_prompt(evaluation: CodeReviewEvaluation) -> str:
     and bounded. Truncates by whole findings and SAYS how many were cut -
     a silently-partial prompt would read as the complete work list."""
     header = [
-        "<details>",
-        "<summary>Prompt for AI agents (all findings)</summary>",
-        "",
-        "```",
         "Address each finding below. Keep every fix minimal and scoped to "
         "the named line; do not refactor beyond the findings.",
     ]
-    footer = ["```", "", "</details>"]
+    footer: list[str] = []
     body: list[str] = []
     used = sum(len(x) + 1 for x in header + footer)
     included = 0
@@ -331,21 +329,37 @@ def _consolidated_agent_prompt(evaluation: CodeReviewEvaluation) -> str:
         body.append(
             f"(+{cut} more finding(s) - see the findings table above)"
         )
-    return "\n".join(header + body + footer)
+    return "\n".join([
+        "<details>",
+        "<summary>Prompt for AI agents (all findings)</summary>",
+        "",
+        _fenced("\n".join(header + body + footer)),
+        "",
+        "</details>",
+    ])
 
 
-_EFFORT_LABELS = {"quick-win": "quick win", "heavy-lift": "heavy lift"}
+# Derived from the shared vocabulary so a new effort level can never
+# silently drop its chip (the Severity-partition-assert drift class).
+_EFFORT_LABELS = {e: e.replace("-", " ") for e in EFFORTS}
+
+
+def _fenced(text: str) -> str:
+    """Wrap text in a code fence GUARANTEED to contain it: the fence is one
+    backtick longer than the longest backtick run inside (CommonMark).
+    Model-supplied text with ``` must never break out of the block and
+    render live markdown (links, @-mentions that ping) inside an agent
+    prompt or the check-run summary."""
+    longest = max((len(m) for m in re.findall(r"`+", text)), default=0)
+    fence = "`" * max(3, longest + 1)
+    return f"{fence}\n{text}\n{fence}"
 
 
 def _agent_prompt_block(f: Finding) -> str:
     """The copy-paste remediation prompt (#553), assembled DETERMINISTICALLY
     from finding fields - no extra LLM call, so it can never hallucinate
     beyond what the finding already claims."""
-    lines = [
-        "<details>",
-        "<summary>Prompt for AI agents</summary>",
-        "",
-        "```",
+    content = [
         f"In {f.file}:{f.line} address this {f.severity} finding "
         f"({f.rule_name}):",
         f.message,
@@ -353,9 +367,15 @@ def _agent_prompt_block(f: Finding) -> str:
         "minimal and line-exact; do not refactor beyond it.",
     ]
     if f.suggestion:
-        lines += ["Suggested fix:", f.suggestion]
-    lines += ["```", "", "</details>"]
-    return "\n".join(lines)
+        content += ["Suggested fix:", f.suggestion]
+    return "\n".join([
+        "<details>",
+        "<summary>Prompt for AI agents</summary>",
+        "",
+        _fenced("\n".join(content)),
+        "",
+        "</details>",
+    ])
 
 
 def _inline_comment_body(f: Finding) -> str:
