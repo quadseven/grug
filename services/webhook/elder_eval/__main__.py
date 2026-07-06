@@ -6,6 +6,7 @@
                                              # entries; changed prompt: drops them)
     python -m elder_eval --check             # ... and exit 1 on regression vs baseline
     python -m elder_eval --ab-practices      # also measure the #527 practices delta
+    python -m elder_eval --ab-few-shot       # also measure the #538 few-shot delta
 
 Corpus source: `--repo <owner/name>` reads the INGESTED store rows (needs
 the DB env; the in-cluster path), else `--jsonl <path>` parses the
@@ -17,8 +18,10 @@ All modes make REAL backend calls (`sast_benchmark.backends`
 GRUG_BENCH_* env) and REAL GitHub diff fetches - never run in the per-PR
 CI suite. The per-PR suite exercises only the pure core + the prompt-sha
 gate (test_elder_eval.py). The baseline records the STATIC prompt run
-(no practices block) so it is stable across repos; `--ab-practices`
-prints the ON-vs-OFF delta separately - the #527 measurement.
+(no practices block) so it is stable across repos; `--ab-practices` and
+`--ab-few-shot` print their ON-vs-OFF deltas separately - the #527 and
+#538 measurements. An empty derived block skips its ON arm loudly (an
+A/A replay printed as a delta would be a fabricated result).
 """
 
 from __future__ import annotations
