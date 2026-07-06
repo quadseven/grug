@@ -67,10 +67,16 @@ def test_publish_success_records_honest_verdict_and_matching_external_id(monkeyp
     assert posted["external_id"] == "grug-guard:o/r#7:abc123"
     assert posted["result"].name == "Grug — Guard"
     assert posted["result"].conclusion == "neutral"
+    assert posted["result"].title == "t"
+    assert posted["result"].summary == "s"
+    assert posted["result"].head_sha == "abc123"
+    assert posted["result"].status == "completed"
     assert recorded["persona_key"] == "guard"
     assert recorded["repo"] == "o/r"
     assert recorded["pr_number"] == 7
     assert recorded["head_sha"] == "abc123"
+    assert recorded["conclusion"] == "neutral"
+    assert recorded["summary"] == "t"  # title, not summary - matches all 6 existing sites
     assert recorded["findings_count"] == 2
     assert recorded["blocking"] is False
     assert recorded["degraded_reason"] is None
@@ -294,5 +300,150 @@ def test_record_check_verdict_raising_does_not_crash_publish(monkeypatch, caplog
     # blew up.
     assert out == {"persona": "guard", "result": "pass"}
     assert any(
-        r.getMessage() == "check_verdict_record_failed" for r in caplog.records
+        r.getMessage() == "check_verdict_record_failed_unexpected"
+        for r in caplog.records
     )
+
+
+def test_success_result_cannot_collide_with_publish_failed_sentinel():
+    """Type-design finding on PR #562: a future caller passing
+    success_result="publish_failed" by mistake would make a CLEAN publish
+    indistinguishable from a real one in the returned dict + Activity row."""
+    import pytest
+
+    from personas.publish_check import publish_persona_check as ppc
+
+    with pytest.raises(ValueError, match="publish_failed"):
+        ppc(
+            persona_key="guard",
+            persona_prefix="guard",
+            check_name="Grug — Guard",
+            installation_id=1,
+            owner="o",
+            repo="r",
+            pr_number=2,
+            head_sha="sha",
+            conclusion="neutral",
+            title="t",
+            summary="s",
+            findings_count=0,
+            blocking=False,
+            degraded_reason=None,
+            success_result="publish_failed",
+            publish_failed_log_name="guard_check_run_publish_failed",
+        )
+
+
+def test_inconsistent_conclusion_raises_before_any_network_call(monkeypatch):
+    """CheckRunResult's own invariant (status='completed' requires a
+    non-None conclusion) is a caller-contract violation - it must fail
+    loud and uncaught, not get folded into a swallowed "publish_failed"."""
+    import pytest
+
+    from personas import publish_check
+
+    called = []
+    monkeypatch.setattr(
+        publish_check, "with_install_token_retry",
+        lambda *a, **kw: called.append(1),
+    )
+
+    with pytest.raises(ValueError):
+        publish_check.publish_persona_check(
+            persona_key="guard",
+            persona_prefix="guard",
+            check_name="Grug — Guard",
+            installation_id=1,
+            owner="o",
+            repo="r",
+            pr_number=2,
+            head_sha="sha",
+            conclusion=None,
+            title="t",
+            summary="s",
+            findings_count=0,
+            blocking=False,
+            degraded_reason=None,
+            success_result="pass",
+            publish_failed_log_name="guard_check_run_publish_failed",
+        )
+    assert called == []  # never reached the network call
+
+
+def test_non_httpx_exception_from_auth_chain_still_records_honest_verdict(monkeypatch):
+    """Runtime-trace finding on PR #562: a token-exchange RuntimeError, an
+    SSM botocore error, or a malformed-JSON response are all real, reachable
+    failures from the publish boundary that are NOT httpx.HTTPStatusError/
+    RequestError - the except must be total, not HTTP-shaped, or these
+    silently skip record_check_verdict entirely."""
+    from personas import publish_check
+
+    recorded = {}
+    monkeypatch.setattr(
+        publish_check, "with_install_token_retry",
+        lambda *a, **kw: (_ for _ in ()).throw(RuntimeError("malformed token response")),
+    )
+    monkeypatch.setattr(
+        publish_check, "record_check_verdict", lambda **kw: recorded.update(kw),
+    )
+
+    out = publish_check.publish_persona_check(
+        persona_key="tpm",
+        persona_prefix="tpm",
+        check_name="Grug — Definition of Ready",
+        installation_id=1,
+        owner="o",
+        repo="r",
+        pr_number=2,
+        head_sha="sha",
+        conclusion="success",
+        title="t",
+        summary="s",
+        findings_count=0,
+        blocking=True,
+        degraded_reason=None,
+        success_result="pass",
+        publish_failed_log_name="tpm_publish_failed",
+    )
+
+    assert out == {"persona": "tpm", "result": "publish_failed"}
+    assert recorded["degraded_reason"] == "check_publish_failed"
+
+
+def test_request_error_with_no_response_attribute_does_not_crash(monkeypatch, caplog):
+    """httpx.RequestError subclasses (ConnectError, ConnectTimeout, ...) have
+    NO `.response` attribute at all - a naive `e.response.status_code` would
+    raise AttributeError from inside the except block itself."""
+    from personas import publish_check
+
+    monkeypatch.setattr(
+        publish_check, "with_install_token_retry",
+        lambda *a, **kw: (_ for _ in ()).throw(httpx.ConnectError("connection refused")),
+    )
+    monkeypatch.setattr(publish_check, "record_check_verdict", lambda **kw: None)
+
+    with caplog.at_level(logging.ERROR):
+        out = publish_check.publish_persona_check(
+            persona_key="guard",
+            persona_prefix="guard",
+            check_name="Grug — Guard",
+            installation_id=1,
+            owner="o",
+            repo="r",
+            pr_number=2,
+            head_sha="sha",
+            conclusion="neutral",
+            title="t",
+            summary="s",
+            findings_count=0,
+            blocking=False,
+            degraded_reason=None,
+            success_result="pass",
+            publish_failed_log_name="guard_check_run_publish_failed",
+        )
+
+    assert out == {"persona": "guard", "result": "publish_failed"}
+    record = next(
+        r for r in caplog.records if r.getMessage() == "guard_check_run_publish_failed"
+    )
+    assert record.status_code is None
