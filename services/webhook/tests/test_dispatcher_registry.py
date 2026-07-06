@@ -77,7 +77,7 @@ def test_toy_persona_dispatches_via_registry_only(monkeypatch):
 
     assert out["status"] == "dispatched"
     assert [r["persona"] for r in out["personas"]] == [
-        "tpm", "code_reviewer", "guard", "smasher", "toy",
+        "tpm", "code_reviewer", "guard", "smasher", "walkthrough", "toy",
     ]
     assert out["personas"][-1] == {"persona": "toy", "result": "pass"}
 
@@ -303,6 +303,7 @@ def test_enqueue_failure_self_recovers_via_rerun_lane():
          patch("async_dispatch.enqueue_elder_review", return_value=False), \
          patch("async_dispatch.enqueue_guard_review", return_value=False), \
          patch("async_dispatch.enqueue_smasher_review", return_value=False), \
+         patch("async_dispatch.enqueue_walkthrough_review", return_value=False), \
          patch("async_dispatch.self_recover_review",
                side_effect=lambda payload, delivery_id, *, persona: recovered.append(persona)):
         mock_eval.return_value = type("R", (), {"passed": True})()
@@ -311,4 +312,5 @@ def test_enqueue_failure_self_recovers_via_rerun_lane():
     assert out["personas"][1]["result"] == "enqueue_failed"
     assert out["personas"][2]["result"] == "enqueue_failed"
     assert out["personas"][3]["result"] == "enqueue_failed"
-    assert recovered == ["elder", "guard", "smasher"]
+    assert out["personas"][4]["result"] == "enqueue_failed"
+    assert recovered == ["elder", "guard", "smasher", "walkthrough"]
