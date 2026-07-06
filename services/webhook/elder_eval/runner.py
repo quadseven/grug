@@ -68,6 +68,28 @@ def diff_to_hunks(diff_text: str) -> list[Hunk]:
     return [Hunk(path=h.file_path, body=h.body) for h in parse_diff(diff_text)]
 
 
+def bounded_hunks(
+    diff_text: str, budget: int = _MAX_DIFF_BYTES
+) -> tuple[list[Hunk], bool]:
+    """Bound the replay context at WHOLE-HUNK boundaries. A flat character
+    slice corrupts the final hunk (Elder reviews garbage) and, worse,
+    silently amputates expected findings - the two heaviest corpus PRs
+    exceed the budget TODAY, so truncation is steady-state, not an edge.
+    Returns (kept_hunks, truncated); the caller must surface `truncated`
+    all the way into the report, never just a log line. A single hunk
+    larger than the whole budget is kept alone (an empty replay would be
+    a worse lie than an oversized prompt)."""
+    hunks = diff_to_hunks(diff_text)
+    kept: list[Hunk] = []
+    used = 0
+    for h in hunks:
+        if kept and used + len(h.body) > budget:
+            return kept, True
+        kept.append(h)
+        used += len(h.body)
+    return kept, False
+
+
 def fetch_pr_diff(repo: str, pr: int, token: str = "") -> str:
     """One PR's current unified diff from the GitHub API. Public repos work
     tokenless; `token` lifts the rate limit."""
@@ -95,14 +117,15 @@ def run_case(
     parse) returns errored=True + logs - it must never abort the sweep, and
     a non-run must never read as "Elder found nothing" (honest-zero rule)."""
     try:
-        if len(diff_text) > _MAX_DIFF_BYTES:
-            # Truncation changes what is measured - findings in the amputated
-            # tail become misses. Say so, loudly, with sizes.
+        hunks, truncated = bounded_hunks(diff_text)
+        if truncated:
+            # Truncation changes what is measured - findings in the dropped
+            # hunks become misses. It rides the CaseReplay into the report
+            # and baseline, not just this log line.
             log.warning(
-                "eval_diff_truncated case=%s original=%d kept=%d",
+                "eval_diff_truncated case=%s original=%d budget=%d",
                 case.case_id, len(diff_text), _MAX_DIFF_BYTES,
             )
-        hunks = diff_to_hunks(diff_text[:_MAX_DIFF_BYTES])
         if not hunks:
             log.warning("eval_case_empty_diff case=%s", case.case_id)
             return CaseReplay(case_id=case.case_id, emitted={}, errored=True)
@@ -126,6 +149,7 @@ def run_case(
         case_id=case.case_id,
         emitted=classes_for_findings(findings),
         errored=False,
+        truncated=truncated,
     )
 
 
@@ -151,11 +175,15 @@ def run_eval(
             # differently, or corpus rot silently shrinks denominators
             # run after run.
             status = e.response.status_code
-            if status == 404:
+            if status in (404, 406):
+                # 404: deleted/inaccessible PR. 406: GitHub refuses the
+                # diff media type over 20k lines / 300 files. Both are
+                # PERMANENT corpus rot, not transient failures.
                 log.warning(
-                    "eval_corpus_pr_missing case=%s status=404 - the ledger "
-                    "references a deleted/inaccessible PR; prune or annotate it",
-                    case.case_id,
+                    "eval_corpus_pr_unfetchable case=%s status=%d - the ledger "
+                    "references a PR whose diff cannot be fetched; prune or "
+                    "annotate it",
+                    case.case_id, status,
                 )
             else:
                 log.warning(

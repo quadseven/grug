@@ -57,6 +57,11 @@ def _print_report(name: str, report: EvalReport) -> None:
         print(f"    {cls:28s} catch={report.per_class_catch[cls]:.2f}")
     if report.errored_cases:
         print(f"  !! errored (not scored): {', '.join(report.errored_cases)}")
+    if report.truncated_cases:
+        print(
+            "  !! diff hunk-bounded (misses may be amputation, not Elder): "
+            f"{', '.join(report.truncated_cases)}"
+        )
     if report.out_of_taxonomy:
         oot = ", ".join(f"{c}x{n}" for c, n in sorted(report.out_of_taxonomy.items()))
         print(f"  out-of-taxonomy (excluded, not misses): {oot}")

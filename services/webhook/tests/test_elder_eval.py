@@ -408,6 +408,52 @@ def test_merge_baseline_changed_prompt_drops_stale_backends():
     assert merged["prompt_sha"] == "new"
 
 
+def test_bounded_hunks_truncates_at_whole_hunk_boundary():
+    from elder_eval.runner import bounded_hunks
+
+    hunk = (
+        "diff --git a/{f} b/{f}\n--- a/{f}\n+++ b/{f}\n"
+        "@@ -1 +1,2 @@\n a = 1\n+b = 2\n"
+    )
+    diff = "".join(hunk.format(f=f"f{i}.py") for i in range(3))
+    all_hunks, truncated = bounded_hunks(diff, budget=10_000)
+    assert len(all_hunks) == 3 and not truncated
+    # A tight budget keeps only WHOLE leading hunks and reports truncation.
+    body_len = len(all_hunks[0].body)
+    kept, truncated = bounded_hunks(diff, budget=body_len + 1)
+    assert len(kept) == 1 and truncated
+    assert kept[0].body.startswith("@@")
+
+
+def test_bounded_hunks_keeps_single_oversized_hunk():
+    from elder_eval.runner import bounded_hunks
+
+    diff = (
+        "diff --git a/x.py b/x.py\n--- a/x.py\n+++ b/x.py\n"
+        "@@ -1 +1,2 @@\n a = 1\n+b = 2\n"
+    )
+    # An empty replay would be a worse lie than an oversized prompt.
+    kept, truncated = bounded_hunks(diff, budget=1)
+    assert len(kept) == 1 and not truncated
+
+
+def test_score_threads_truncated_cases_into_report():
+    rows = [_row(1, "correctness")]
+    cases = build_cases(rows)
+    replays = {
+        "githumps/grug#1": CaseReplay(
+            case_id="githumps/grug#1",
+            emitted={"correctness": 1},
+            errored=False,
+            truncated=True,
+        ),
+    }
+    report = score(cases, replays)
+    assert report.truncated_cases == ("githumps/grug#1",)
+    baseline = to_baseline_dict(report, prompt_sha="abc", backend="cave")
+    assert baseline["backends"]["cave"]["truncated_cases"] == ["githumps/grug#1"]
+
+
 def test_run_case_parse_failure_is_errored(monkeypatch):
     """A broken/unparseable LLM response must be errored=True, never a
     fabricated 'Elder found nothing' - a fake zero recorded into the
