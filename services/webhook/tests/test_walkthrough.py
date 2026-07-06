@@ -178,3 +178,22 @@ def test_estimate_effort_logs_rejected_off_vocabulary_value(caplog):
     assert result == "quick"  # heuristic fallback (wrong case, off-vocabulary)
     assert "walkthrough_model_effort_rejected" in caplog.text
     assert caplog.records[0].value == "Quick"  # extra= payload, not just the message
+
+
+def test_walkthrough_body_files_truncated_hedges_the_count():
+    """#554 audit stage 8: a truncated file fetch must hedge the comment,
+    never present a partial count as an exact one."""
+    body = walkthrough_body(
+        summary="at least 2 files changed", files=[], diagram=None,
+        effort="extensive", head_sha="d" * 40, degraded=True,
+        files_truncated=True,
+    )
+    assert "sprawl wide" in body
+
+
+def test_walkthrough_body_not_truncated_by_default():
+    body = walkthrough_body(
+        summary="s", files=[], diagram=None, effort="quick",
+        head_sha="e" * 40, degraded=False,
+    )
+    assert "sprawl wide" not in body
