@@ -44,6 +44,10 @@ class CheckRunResult:
             )
 
 
+# GitHub documented limit is 65535; leave headroom for the marker.
+_MAX_SUMMARY_CHARS = 65000
+
+
 def post_check_run(
     install_token: str,
     owner: str,
@@ -52,13 +56,21 @@ def post_check_run(
     external_id: str | None = None,
 ) -> dict:
     """POST a check-run. Idempotent on (name, head_sha) per GitHub spec."""
+    # GitHub 422s output.summary over 65535 chars, and a 422 here vanishes
+    # the ENTIRE check-run from the PR (#553 audit). The findings table is
+    # message-count-bounded but not finding-count-bounded, so enforce the
+    # cap at this ONE choke point, visibly - a truncated summary beats an
+    # absent check-run.
+    summary = result.summary
+    if len(summary) > _MAX_SUMMARY_CHARS:
+        summary = summary[:_MAX_SUMMARY_CHARS] + "\n\n(summary truncated)"
     body = {
         "name": result.name,
         "head_sha": result.head_sha,
         "status": result.status,
         "output": {
             "title": result.title,
-            "summary": result.summary,
+            "summary": summary,
             **({"text": result.text} if result.text else {}),
         },
     }

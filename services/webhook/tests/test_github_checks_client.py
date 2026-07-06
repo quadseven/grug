@@ -174,3 +174,32 @@ def test_post_check_run_connect_error_propagates(mock_transport_client):
     with patch("httpx.post", side_effect=lambda *a, **kw: client.post(*a, **kw)):
         with pytest.raises(httpx.ConnectError):
             post_check_run("tok", "o", "r", result)
+
+
+def test_post_check_run_truncates_oversize_summary(monkeypatch):
+    """#553 audit stage 8: a >65535-char summary 422s and vanishes the
+    whole check-run - the client truncates visibly at the choke point."""
+    import httpx
+    from unittest.mock import MagicMock, patch
+
+    from github_checks_client import CheckRunResult, post_check_run
+
+    captured = {}
+
+    def fake_post(url, **kwargs):
+        captured["body"] = kwargs["json"]
+        r = MagicMock(spec=httpx.Response)
+        r.status_code = 201
+        r.raise_for_status = MagicMock()
+        r.json = MagicMock(return_value={"id": 1})
+        return r
+
+    result = CheckRunResult(
+        name="Grug — Code Review", head_sha="a" * 40, status="completed",
+        conclusion="neutral", title="t", summary="x" * 70000,
+    )
+    with patch("httpx.post", side_effect=fake_post):
+        post_check_run("tok", "o", "r", result)
+    sent = captured["body"]["output"]["summary"]
+    assert len(sent) <= 65100
+    assert sent.endswith("(summary truncated)")

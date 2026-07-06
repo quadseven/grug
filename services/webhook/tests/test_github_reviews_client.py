@@ -89,9 +89,11 @@ def test_post_review_body_request_changes_with_inline_comments():
     assert len(body["comments"]) == 2
     assert body["comments"][0] == {
         "path": "src/x.py", "line": 10, "body": "Critical: silent-exception",
+        "side": "RIGHT",
     }
     assert body["comments"][1] == {
         "path": "src/y.py", "line": 42, "body": "Critical: secret-in-log",
+        "side": "RIGHT",
     }
 
 

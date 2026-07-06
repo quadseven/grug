@@ -612,13 +612,17 @@ def _coerce_finding(raw: Any) -> tuple[Optional[Finding], str]:
     message = _redact_secrets(message)
     if len(message) > _MAX_FINDING_MESSAGE_CHARS:
         message = message[:_MAX_FINDING_MESSAGE_CHARS] + " [truncated]"
-    if suggestion is not None and len(suggestion) > _MAX_SUGGESTION_CHARS:
-        # A "replacement for the flagged line" this size is not a
-        # suggestion - and uncapped it can blow the comment-body or
-        # summary limits. Drop it (the finding still lands).
-        suggestion = None
     if suggestion is not None:
-        suggestion = _redact_secrets(suggestion)
+        redacted = _redact_secrets(suggestion)
+        if redacted != suggestion:
+            # A suggestion that echoed a secret is dropped entirely: a
+            # committable block containing [REDACTED:...] would one-click
+            # the placeholder into source.
+            suggestion = None
+        elif len(suggestion) > _MAX_SUGGESTION_CHARS:
+            # Not a line replacement at this size - and uncapped it can
+            # blow the comment-body or summary limits. Drop, keep finding.
+            suggestion = None
     return Finding(
         path=path, line=line, rule=rule, severity=severity, message=message,  # type: ignore[arg-type]
         suggestion=suggestion, effort=effort,
