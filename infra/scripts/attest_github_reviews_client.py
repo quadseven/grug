@@ -182,8 +182,10 @@ def _post_review_url_matches(tree: ast.Module) -> bool:
 EXPECTED_REVIEW_FIELDS: frozenset[str] = frozenset(
     ("commit_id", "event", "body", "comments")
 )
+# side: explicit RIGHT (#553) - `line` is always new-side and the GH docs
+# do not promise a default; asdict() marshals it as a valid comments[] key.
 EXPECTED_INLINE_COMMENT_FIELDS: frozenset[str] = frozenset(
-    ("path", "line", "body")
+    ("path", "line", "body", "side")
 )
 
 
