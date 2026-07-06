@@ -92,7 +92,10 @@ def main(argv: list[str] | None = None) -> int:
     if skipped:
         # No silent caps: unscorable (fully out-of-taxonomy) cases are
         # skipped LLM calls, and we say so.
-        print(f"skipping {skipped} unscorable case(s) (all rows out of taxonomy)")
+        print(
+            f"skipping {skipped} unscorable case(s) "
+            "(no accepted/false-positive rows in Elder's taxonomy)"
+        )
     if not cases:
         print("corpus has no scorable cases - nothing to eval", file=sys.stderr)
         return 2

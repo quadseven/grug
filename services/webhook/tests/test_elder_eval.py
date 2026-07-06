@@ -414,6 +414,34 @@ def test_classes_for_findings_unknown_rule_falls_back_to_rule_name():
     assert classes_for_findings(findings) == {"some-novel-rule": 1}
 
 
+def test_run_eval_fetch_failure_is_errored_case():
+    """run_eval's injectable fetch: a diff-fetch failure (404'd corpus PR,
+    rate limit, network) must become an errored CaseReplay, never a crash
+    and never a fake 'Elder found nothing'."""
+    import httpx
+
+    from elder_eval.runner import run_eval
+    from sast_benchmark.backends import BenchBackend
+
+    rows = [_row(1, "correctness"), _row(2, "correctness")]
+    cases = build_cases(rows)
+    backend = BenchBackend(name="fake", url="http://invalid", model="m", api_key="")
+
+    def failing_fetch(repo: str, pr: int, token: str) -> str:
+        if pr == 1:
+            raise httpx.HTTPStatusError(
+                "gone",
+                request=httpx.Request("GET", "http://x"),
+                response=httpx.Response(404, request=httpx.Request("GET", "http://x")),
+            )
+        raise ValueError("boom")
+
+    replays = run_eval(backend, cases, fetch=failing_fetch)
+    assert all(r.errored for r in replays.values())
+    report = score(cases, replays)
+    assert report.all_errored
+
+
 def test_diff_to_hunks_converts_unified_diff():
     diff = (
         "diff --git a/x.py b/x.py\n"

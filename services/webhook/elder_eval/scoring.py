@@ -19,6 +19,7 @@ Metrics:
 
 from __future__ import annotations
 
+from collections import Counter
 from dataclasses import dataclass
 from typing import Mapping, Sequence
 
@@ -60,12 +61,13 @@ def score(
 ) -> EvalReport:
     """Join cases with their replays and compute the report. A case with no
     replay entry counts as errored (it did not run)."""
-    expected_cells: dict[str, int] = {}
-    caught_cells: dict[str, int] = {}
+    expected_cells: Counter[str] = Counter()
+    caught_cells: Counter[str] = Counter()
     noise = 0
     total_emitted = 0
     errored: list[str] = []
-    out_of_taxonomy: dict[str, int] = {}
+    out_of_taxonomy: Counter[str] = Counter()
+    unknown_verdicts: Counter[str] = Counter()
     scored = 0
 
     # An orphan replay (no matching case) would silently vanish from every
@@ -74,12 +76,9 @@ def score(
     if orphans:
         raise ValueError(f"replays reference unknown cases: {sorted(orphans)}")
 
-    unknown_verdicts: dict[str, int] = {}
     for case in cases:
-        for cls, n in case.out_of_taxonomy.items():
-            out_of_taxonomy[cls] = out_of_taxonomy.get(cls, 0) + n
-        for verdict, n in case.unknown_verdicts.items():
-            unknown_verdicts[verdict] = unknown_verdicts.get(verdict, 0) + n
+        out_of_taxonomy.update(case.out_of_taxonomy)
+        unknown_verdicts.update(case.unknown_verdicts)
         replay = replays.get(case.case_id)
         if replay is None or replay.errored:
             errored.append(case.case_id)
@@ -87,17 +86,16 @@ def score(
         scored += 1
         emitted_classes = {c for c, n in replay.emitted.items() if n > 0}
         for ledger_cls, elder_set in case.expected_classes.items():
-            expected_cells[ledger_cls] = expected_cells.get(ledger_cls, 0) + 1
+            expected_cells[ledger_cls] += 1
             if emitted_classes & elder_set:
-                caught_cells[ledger_cls] = caught_cells.get(ledger_cls, 0) + 1
+                caught_cells[ledger_cls] += 1
         for elder_cls, n in replay.emitted.items():
             total_emitted += n
             if elder_cls in case.fp_only_classes:
                 noise += n
 
     per_class = {
-        cls: caught_cells.get(cls, 0) / expected_cells[cls]
-        for cls in expected_cells
+        cls: caught_cells[cls] / expected_cells[cls] for cls in expected_cells
     }
     total_expected = sum(expected_cells.values())
     return EvalReport(
@@ -107,8 +105,8 @@ def score(
         ),
         noise_rate=noise / total_emitted if total_emitted else 0.0,
         errored_cases=tuple(errored),
-        out_of_taxonomy=out_of_taxonomy,
-        unknown_verdicts=unknown_verdicts,
+        out_of_taxonomy=dict(out_of_taxonomy),
+        unknown_verdicts=dict(unknown_verdicts),
         cases_scored=scored,
     )
 
