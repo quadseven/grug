@@ -153,12 +153,29 @@ def test_walkthrough_body_carries_marker_summary_table_diagram_effort():
     assert "quiet this pass" not in body  # not degraded
 
 
-def test_walkthrough_body_no_diagram_omits_the_section():
+def test_walkthrough_body_no_diagram_and_no_files_omits_the_section_silently():
+    """With zero changed files there is nothing to explain - the whole
+    comment is otherwise near-empty, so no degradation note is added."""
     body = walkthrough_body(
         summary="s", files=[], diagram=None, effort="quick",
         head_sha="b" * 40, degraded=False,
     )
     assert "```mermaid" not in body
+    assert "too large or complex" not in body
+
+
+def test_walkthrough_body_no_diagram_with_files_states_a_degradation_reason():
+    """Qodo #559 (Compliance ID 6): a missing diagram with real changed
+    files present must state a reason, not silently vanish - build_diagram
+    can return None for a bounded, honest set of reasons (no files, too
+    many top-level directories, or its own balance-check failing)."""
+    files = [FileStat(path="a.py", additions=1, deletions=0)]
+    body = walkthrough_body(
+        summary="s", files=files, diagram=None, effort="quick",
+        head_sha="b" * 40, degraded=False,
+    )
+    assert "```mermaid" not in body
+    assert "too large or complex" in body
 
 
 def test_walkthrough_body_degraded_says_so_honestly():
@@ -274,5 +291,16 @@ def test_build_diagram_strips_control_characters_from_labels():
     assert "\x00" not in diagram
     assert "\x1f" not in diagram
     assert "\x7f" not in diagram
+    from personas.walkthrough.mermaid import _is_balanced
+    assert _is_balanced(diagram)
+
+
+def test_build_diagram_not_confused_by_directory_named_subgraph():
+    """Qodo #559: a directory literally named 'subgraph' produces a label
+    string containing that word, which would inflate a substring-based
+    balance count and cause a false-negative (a perfectly fine diagram
+    needlessly dropped). Must still render."""
+    diagram = build_diagram(["subgraph/foo.py", "other/bar.py"])
+    assert diagram is not None
     from personas.walkthrough.mermaid import _is_balanced
     assert _is_balanced(diagram)
