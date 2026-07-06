@@ -18,7 +18,7 @@ from urllib.parse import quote
 import httpx
 
 from activity_log import record_check_verdict
-from github_app_auth import with_install_token_retry
+from github_app_auth import get_app_id, with_install_token_retry
 from personas.walkthrough.effort import estimate_effort
 from personas.walkthrough.render import MARKER, FileStat, walkthrough_body
 
@@ -87,6 +87,15 @@ def _fetch_pr_files(
 def _find_marker_comment(
     token: str, owner: str, repo: str, pr_number: int,
 ) -> int | None:
+    # `performed_via_github_app` is populated server-side ONLY for comments
+    # created via a GitHub App installation token - a human contributor
+    # cannot set it. But a bare non-null check only proves "some GitHub
+    # App posted this," not "WE did" - a decoy from a DIFFERENT installed
+    # app would still pass. Compare the app's own numeric ID (#554 peer
+    # review round 3, codex). `get_app_id()` is guaranteed to already have
+    # succeeded once by this point - it backs the very token exchange
+    # that produced `token` - so no fallback-on-failure path exists here.
+    own_app_id = get_app_id()
     page = 1
     while page <= 20:  # bound the scan (>2000 comments = give up, post fresh, warn below)
         resp = httpx.get(
@@ -96,15 +105,8 @@ def _find_marker_comment(
         resp.raise_for_status()
         batch = resp.json()
         for c in batch:
-            # `performed_via_github_app` is populated server-side ONLY for
-            # comments created via a GitHub App installation token - a
-            # human contributor cannot set it. Without this check, any PR
-            # commenter could post the literal marker string ahead of
-            # Teller's first run; the PATCH would then target a comment
-            # this app cannot edit (GitHub 403/404), turning every
-            # dispatch into a permanent publish_failed until the decoy is
-            # manually removed (#554 peer review - codex).
-            if c.get("performed_via_github_app") is None:
+            app = c.get("performed_via_github_app")
+            if not app or str(app.get("id")) != own_app_id:
                 continue
             if MARKER in (c.get("body") or ""):
                 return int(c["id"])
