@@ -25,7 +25,7 @@ from dataclasses import dataclass
 # and caps item length (the #541 lesson - this text rides the SYSTEM
 # prompt to a third-party backend). One sanitizer, not two drifting copies.
 from best_practices import _sanitize
-from ledger import LedgerRow
+from ledger import SEVERITY_ORDER, LedgerRow
 
 log = logging.getLogger("grug.few_shot")
 
@@ -38,9 +38,7 @@ _HEADER = (
     "re-report these exact items:"
 )
 
-# CRITICAL first; unknown labels sort last (same convention as the
-# corpus layer's ranking).
-_SEVERITY_ORDER = {"CRITICAL": 0, "HIGH": 1, "MEDIUM": 2, "MED": 2, "LOW": 3}
+
 
 
 @dataclass(frozen=True)
@@ -115,7 +113,7 @@ def _class_rank(exemplars: list[Exemplar]) -> tuple[int, int]:
     """Strongest-first class ordering: best severity, then depth. Which
     classes survive the max_classes cut must be deterministic strength,
     never corpus-insertion order."""
-    best = min(_SEVERITY_ORDER.get(e.severity, 4) for e in exemplars)
+    best = min(SEVERITY_ORDER.get(e.severity, 4) for e in exemplars)
     return (best, -len(exemplars))
 
 
