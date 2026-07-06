@@ -93,6 +93,13 @@ def _find_marker_comment(
         if len(batch) < 100:
             return None
         page += 1
+    # Gave up at the cap without finding the marker - distinguish this from
+    # the ordinary "no marker" exit above, or a duplicate-comment-growth
+    # bug on an extreme PR (>2000 comments) would go unnoticed forever.
+    log.warning(
+        "walkthrough_marker_scan_capped",
+        extra={"repo": f"{owner}/{repo}", "pr": pr_number},
+    )
     return None
 
 
@@ -110,6 +117,37 @@ def _upsert_comment(
             f"{_API}/repos/{_repo_path(owner, repo)}/issues/{pr_number}/comments",
             json={"body": body}, headers=_headers(token), timeout=_TIMEOUT,
         ).raise_for_status()
+
+
+def _log_fetch_failed(
+    e: Exception, *, phase: str, installation_id: int,
+    owner: str, repo_name: str, pull_number: int,
+) -> None:
+    """Log a fetch failure with the PHASE it happened in + the real status
+    code on an HTTPStatusError - "HTTPStatusError" alone can't distinguish
+    a full auth outage from a page-3 rate limit, and both look identical
+    without this."""
+    extra: dict[str, Any] = {
+        "installation_id": installation_id,
+        "pr": f"{owner}/{repo_name}#{pull_number}",
+        "phase": phase,
+        "kind": type(e).__name__,
+    }
+    if isinstance(e, httpx.HTTPStatusError):
+        extra["status_code"] = e.response.status_code
+    log.warning("walkthrough_fetch_failed", extra=extra)
+
+
+def _emit_degraded_metric(degraded: bool) -> None:
+    """Best-effort observability signal: repeated LLM-summary degradation
+    is invisible on the Activity feed (conclusion stays "success" - see
+    the call site), so a DD monitor needs its own gauge to catch it."""
+    try:
+        from observability import emit_gauge  # type: ignore
+
+        emit_gauge("grug.teller.summary_degraded", 1 if degraded else 0)
+    except Exception:  # noqa: BLE001 - telemetry never breaks the comment
+        pass
 
 
 def dispatch_walkthrough_review(
@@ -131,22 +169,27 @@ def dispatch_walkthrough_review(
     installation_id = int(installation["id"])
 
     try:
-        diff_text, files = with_install_token_retry(
+        diff_text = with_install_token_retry(
             installation_id,
-            lambda token: (
-                _fetch_pr_diff(token, owner, repo_name, pull_number),
-                _fetch_pr_files(token, owner, repo_name, pull_number),
-            ),
+            lambda token: _fetch_pr_diff(token, owner, repo_name, pull_number),
         )
     except (httpx.HTTPStatusError, httpx.RequestError) as e:
-        log.warning(
-            "walkthrough_fetch_failed",
-            extra={
-                "installation_id": installation_id,
-                "pr": f"{owner}/{repo_name}#{pull_number}",
-                "kind": type(e).__name__,
-            },
+        _log_fetch_failed(e, phase="diff", installation_id=installation_id,
+                           owner=owner, repo_name=repo_name, pull_number=pull_number)
+        return {"persona": "walkthrough", "result": "fetch_failed"}
+
+    try:
+        files = with_install_token_retry(
+            installation_id,
+            lambda token: _fetch_pr_files(token, owner, repo_name, pull_number),
         )
+    except (httpx.HTTPStatusError, httpx.RequestError) as e:
+        # The diff fetch above already succeeded and is discarded here -
+        # acceptable (the whole walkthrough needs both), but the log must
+        # say WHICH call failed so a diff-outage and a files-outage don't
+        # look identical.
+        _log_fetch_failed(e, phase="files", installation_id=installation_id,
+                           owner=owner, repo_name=repo_name, pull_number=pull_number)
         return {"persona": "walkthrough", "result": "fetch_failed"}
 
     lines_changed = sum(f.additions + f.deletions for f in files)
@@ -208,6 +251,14 @@ def dispatch_walkthrough_review(
         )
         return {"persona": "walkthrough", "result": "publish_failed"}
 
+    # conclusion stays "success" - the comment WAS published; degraded_reason
+    # is reserved for "Grug could not evaluate at all" (Elder/Guard's LLM
+    # outage), which overstates this case (the deterministic fallback still
+    # delivers real value). The summary text + a best-effort gauge (same
+    # shape as ticket-compliance's _emit_metric) are the honest signal for
+    # "the AI-authored prose fell back" without lying the OTHER way on the
+    # Activity badge.
+    _emit_degraded_metric(degraded)
     record_check_verdict(
         install_id=installation_id,
         persona_key="walkthrough",
@@ -215,7 +266,10 @@ def dispatch_walkthrough_review(
         pr_number=pull_number,
         head_sha=head_sha,
         conclusion="success",
-        summary=f"Teller walked {len(files)} file(s), effort={effort}",
+        summary=(
+            f"Teller walked {len(files)} file(s), effort={effort}"
+            + (" (LLM summary degraded to fallback)" if degraded else "")
+        ),
         findings_count=0,
         blocking=False,
     )
