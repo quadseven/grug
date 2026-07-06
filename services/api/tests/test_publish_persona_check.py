@@ -27,6 +27,15 @@ def _fake_retry_raises(installation_id, fn):
     )
 
 
+def _raising(exc: BaseException):
+    """Factory for a with_install_token_retry stand-in that raises `exc`
+    instead of calling `fn` - shared by the non-httpx and RequestError
+    exception-surface tests (CodeRabbit finding on PR #562)."""
+    def _retry(installation_id, fn):
+        raise exc
+    return _retry
+
+
 def test_publish_success_records_honest_verdict_and_matching_external_id(monkeypatch):
     from personas import publish_check
 
@@ -381,7 +390,7 @@ def test_non_httpx_exception_from_auth_chain_still_records_honest_verdict(monkey
     recorded = {}
     monkeypatch.setattr(
         publish_check, "with_install_token_retry",
-        lambda *a, **kw: (_ for _ in ()).throw(RuntimeError("malformed token response")),
+        _raising(RuntimeError("malformed token response")),
     )
     monkeypatch.setattr(
         publish_check, "record_check_verdict", lambda **kw: recorded.update(kw),
@@ -418,7 +427,7 @@ def test_request_error_with_no_response_attribute_does_not_crash(monkeypatch, ca
 
     monkeypatch.setattr(
         publish_check, "with_install_token_retry",
-        lambda *a, **kw: (_ for _ in ()).throw(httpx.ConnectError("connection refused")),
+        _raising(httpx.ConnectError("connection refused")),
     )
     monkeypatch.setattr(publish_check, "record_check_verdict", lambda **kw: None)
 

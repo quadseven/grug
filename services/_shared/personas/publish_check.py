@@ -152,7 +152,7 @@ def publish_persona_check(
             ),
         )
     except Exception as e:  # noqa: BLE001 — best-effort per this module's own contract
-        log.error(
+        log.exception(
             "check_verdict_record_failed_unexpected",
             extra={
                 "persona": persona_key,
@@ -160,7 +160,6 @@ def publish_persona_check(
                 "kind": type(e).__name__,
                 "error": str(e)[:500],
             },
-            exc_info=True,
         )
 
     return {
