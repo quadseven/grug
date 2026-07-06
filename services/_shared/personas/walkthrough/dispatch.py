@@ -146,6 +146,39 @@ def _log_fetch_failed(
     log.warning("walkthrough_fetch_failed", extra=extra)
 
 
+def _self_recover(
+    installation_id: int, owner: str, repo_name: str, pull_number: int,
+) -> None:
+    """Enqueue ONE durable rerun on the SAME rerun lane Elder/Guard/Smasher
+    use for an unhandled dispatch error (#554 peer review, CONFIRMED 3x -
+    codex/poolside/spark independently). Teller's dispatch never raises
+    (matching the sibling contract - see this function's docstring), so
+    `_run_job`'s claim-then-dispatch ordering would otherwise consume the
+    head-SHA claim on a transient fetch/publish failure with NOTHING
+    published and no retry ever firing - permanently suppressing the
+    walkthrough for that SHA. `rerun` is webhook-only (this shared module
+    is also importable by the api service, where the rerun consumer never
+    runs), so the import stays inside the function - same pattern as
+    webhook_dispatch.py's async_dispatch import. Best-effort: an enqueue
+    failure here must not turn a degrade path into a raise."""
+    try:
+        from rerun import enqueue_rerun  # lazy: webhook-only
+
+        enqueue_rerun(
+            install_id=installation_id, repo=f"{owner}/{repo_name}",
+            pr_number=pull_number, persona="walkthrough",
+        )
+    except Exception as e:  # noqa: BLE001 - best-effort, never escalate a degrade
+        log.warning(
+            "walkthrough_self_recover_failed",
+            extra={
+                "installation_id": installation_id,
+                "pr": f"{owner}/{repo_name}#{pull_number}",
+                "kind": type(e).__name__,
+            },
+        )
+
+
 def _emit_degraded_metric(degraded: bool) -> None:
     """Best-effort observability signal: repeated LLM-summary degradation
     is invisible on the Activity feed (conclusion stays "success" - see
@@ -186,6 +219,7 @@ def dispatch_walkthrough_review(
     except (httpx.HTTPStatusError, httpx.RequestError, RuntimeError) as e:
         _log_fetch_failed(e, phase="diff", installation_id=installation_id,
                            owner=owner, repo_name=repo_name, pull_number=pull_number)
+        _self_recover(installation_id, owner, repo_name, pull_number)
         return {"persona": "walkthrough", "result": "fetch_failed"}
 
     try:
@@ -200,6 +234,7 @@ def dispatch_walkthrough_review(
         # look identical.
         _log_fetch_failed(e, phase="files", installation_id=installation_id,
                            owner=owner, repo_name=repo_name, pull_number=pull_number)
+        _self_recover(installation_id, owner, repo_name, pull_number)
         return {"persona": "walkthrough", "result": "fetch_failed"}
     if files_truncated:
         # GitHub's own /files cap is 3000 - well above our _MAX_FILE_PAGES
@@ -271,6 +306,7 @@ def dispatch_walkthrough_review(
                 "kind": type(e).__name__,
             },
         )
+        _self_recover(installation_id, owner, repo_name, pull_number)
         return {"persona": "walkthrough", "result": "publish_failed"}
 
     # conclusion stays "success" - the comment WAS published; degraded_reason
