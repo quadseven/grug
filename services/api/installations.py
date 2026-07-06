@@ -67,6 +67,7 @@ class RepoConfigPayload(BaseModel):
     warder_enabled: bool | None = Field(default=None)
     pulse_enabled: bool | None = Field(default=None)
     smasher_enabled: bool | None = Field(default=None)
+    walkthrough_enabled: bool | None = Field(default=None)
     dep_watch_enabled: bool | None = Field(default=None)
 
 
@@ -442,6 +443,7 @@ def update_repo_config(
         warder_enabled=body.warder_enabled,
         pulse_enabled=body.pulse_enabled,
         smasher_enabled=body.smasher_enabled,
+        walkthrough_enabled=body.walkthrough_enabled,
         dep_watch_enabled=body.dep_watch_enabled,
     )
     log.info(

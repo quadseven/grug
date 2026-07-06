@@ -180,3 +180,40 @@ def test_update_repo_config_paginates_until_match():
 
     assert out["full_name"] == "myorg/target"
     assert call_idx[0] == 2  # paginated past page 1
+
+
+def test_update_repo_config_walkthrough_enabled_reaches_set_repo_config():
+    """#554 peer review (codex): the new default-on Teller persona had no
+    reachable per-repo opt-out - RepoConfigPayload didn't carry the field
+    at all, so no admin action (dashboard or raw API call) could disable
+    it. Pins that walkthrough_enabled now flows payload -> set_repo_config
+    exactly like every other optional persona flag."""
+    payload = inst.RepoConfigPayload(tpm_enabled=True, walkthrough_enabled=False)
+    install = {"installed_by_user_id": "100"}
+
+    def _retry(install_id, fn):
+        return fn("tok")
+
+    fake_resp = _ok_resp({"repositories": [{"id": 42, "full_name": "myorg/myrepo"}]})
+
+    with patch("installations.get_installation", return_value=install):
+        with patch("installations.with_install_token_retry", side_effect=_retry):
+            with patch("httpx.Client") as client_cls:
+                client = client_cls.return_value.__enter__.return_value
+                client.get.return_value = fake_resp
+                with patch("installations.get_repo_config", return_value={}), \
+                     patch("installations.set_repo_config") as mock_set:
+                    mock_set.return_value = {"walkthrough_enabled": False}
+                    inst.update_repo_config(
+                        install_id=1, repo_id=42,
+                        body=payload, user=_user(user_id="100"),
+                    )
+
+    assert mock_set.call_args.kwargs["walkthrough_enabled"] is False
+
+
+def test_repo_config_payload_rejects_unknown_field():
+    """extra='forbid' still 422s a typo - walkthrough_enabled's addition
+    must not have loosened this."""
+    with pytest.raises(Exception):
+        inst.RepoConfigPayload(tmp_enabled=True)  # typo: tmp not tpm

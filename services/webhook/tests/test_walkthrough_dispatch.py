@@ -50,7 +50,10 @@ def _marker_comment_response(comment_id: int) -> httpx.Response:
     r = MagicMock(spec=httpx.Response)
     r.status_code = 200
     r.raise_for_status = MagicMock()
-    r.json = MagicMock(return_value=[{"id": comment_id, "body": MARKER}])
+    r.json = MagicMock(return_value=[{
+        "id": comment_id, "body": MARKER,
+        "performed_via_github_app": {"id": 1, "slug": "grug"},
+    }])
     return r
 
 
@@ -503,3 +506,67 @@ def test_self_recover_failure_is_swallowed_never_escalates(monkeypatch, caplog):
 
     assert out == {"persona": "walkthrough", "result": "fetch_failed"}
     assert "walkthrough_self_recover_failed" in caplog.text
+
+
+def test_find_marker_comment_ignores_user_authored_decoy(monkeypatch):
+    """#554 peer review (codex): a PR commenter who posts the literal
+    marker string BEFORE Teller's first run must not be mistaken for
+    Teller's own comment - only `performed_via_github_app` (set
+    server-side, unforgeable by a human commenter) counts."""
+    def fake_get(url, **kwargs):
+        return _files_response([
+            {
+                "id": 111, "body": MARKER,
+                "performed_via_github_app": None,  # human-authored decoy
+            },
+            {
+                "id": 222, "body": MARKER,
+                "performed_via_github_app": {"id": 1, "slug": "grug"},
+            },
+        ])
+
+    with patch("httpx.get", side_effect=fake_get):
+        result = wt_dispatch._find_marker_comment("tok", "o", "r", 1)
+
+    assert result == 222
+
+
+def test_dispatch_ignores_decoy_marker_and_posts_fresh_comment(monkeypatch):
+    """End-to-end: a human-authored decoy marker comment exists, but no
+    genuine app-authored one - Teller must POST a fresh comment, not
+    attempt (and fail) a PATCH against the decoy it cannot edit."""
+    monkeypatch.setattr(
+        wt_dispatch, "with_install_token_retry",
+        lambda inst_id, fn: fn("tok"),
+    )
+    posted = {}
+
+    def fake_get(url, **kwargs):
+        if url.endswith("/files"):
+            return _files_response([{"filename": "x.py", "additions": 1, "deletions": 0}])
+        if "/comments" in url:
+            r = MagicMock(spec=httpx.Response)
+            r.status_code = 200
+            r.raise_for_status = MagicMock()
+            r.json = MagicMock(return_value=[{
+                "id": 111, "body": MARKER, "performed_via_github_app": None,
+            }])
+            return r
+        return _diff_response()
+
+    def fake_post(url, **kwargs):
+        posted["body"] = kwargs["json"]["body"]
+        r = MagicMock(spec=httpx.Response)
+        r.raise_for_status = MagicMock()
+        return r
+
+    with patch("httpx.get", side_effect=fake_get), \
+         patch("httpx.post", side_effect=fake_post), \
+         patch("httpx.patch") as mock_patch, \
+         patch("personas.walkthrough.dispatch.record_check_verdict"), \
+         patch("llm_client.summarize_pr", return_value=None):
+        out = wt_dispatch.dispatch_walkthrough_review(_payload(), blocking=False)
+
+    assert out == {"persona": "walkthrough", "result": "degraded"}
+    mock_patch.assert_not_called()
+    assert MARKER in posted["body"]
