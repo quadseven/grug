@@ -16,6 +16,7 @@ from __future__ import annotations
 
 import logging
 import re
+from collections import Counter
 from dataclasses import dataclass
 from typing import Iterable
 
@@ -113,8 +114,8 @@ def build_cases(rows: Iterable[LedgerRow]) -> tuple[EvalCase, ...]:
     cases: list[EvalCase] = []
     for repo, pr in sorted(grouped):
         expected: dict[str, frozenset[str]] = {}
-        out_of_taxonomy: dict[str, int] = {}
-        unknown_verdicts: dict[str, int] = {}
+        out_of_taxonomy: Counter[str] = Counter()
+        unknown_verdicts: Counter[str] = Counter()
         fp_elder: set[str] = set()
         accepted_elder: set[str] = set()
         for r in grouped[(repo, pr)]:
@@ -122,20 +123,20 @@ def build_cases(rows: Iterable[LedgerRow]) -> tuple[EvalCase, ...]:
             elder = expected_elder_classes(norm)
             if r.accepted:
                 if not elder:
-                    out_of_taxonomy[norm] = out_of_taxonomy.get(norm, 0) + 1
+                    out_of_taxonomy[norm] += 1
                     continue
                 expected[norm] = elder
                 accepted_elder |= elder
             elif r.false_positive:
                 if not elder:
-                    out_of_taxonomy[norm] = out_of_taxonomy.get(norm, 0) + 1
+                    out_of_taxonomy[norm] += 1
                     continue
                 fp_elder |= elder
             else:
                 # Neither accepted nor FP: a typo'd or novel verdict. It
                 # must not vanish - a mislabeled corpus that yields zero
                 # expected cells needs to say WHY.
-                unknown_verdicts[r.verdict] = unknown_verdicts.get(r.verdict, 0) + 1
+                unknown_verdicts[r.verdict] += 1
         cases.append(
             EvalCase(
                 repo=repo,
@@ -144,8 +145,8 @@ def build_cases(rows: Iterable[LedgerRow]) -> tuple[EvalCase, ...]:
                 # A class both accepted AND FP'd on the same PR is not
                 # fp-only - emitting it there is a legitimate catch.
                 fp_only_classes=frozenset(fp_elder - accepted_elder),
-                out_of_taxonomy=out_of_taxonomy,
-                unknown_verdicts=unknown_verdicts,
+                out_of_taxonomy=dict(out_of_taxonomy),
+                unknown_verdicts=dict(unknown_verdicts),
             )
         )
     return tuple(cases)
