@@ -87,24 +87,44 @@ def publish_persona_check(
                 "installation_id": installation_id,
                 "pr": f"{owner}/{repo}#{pr_number}",
                 "kind": type(e).__name__,
+                "status_code": (
+                    e.response.status_code
+                    if isinstance(e, httpx.HTTPStatusError) else None
+                ),
+                "error": str(e)[:500],
             },
         )
         publish_failed = True
 
-    record_check_verdict(
-        install_id=installation_id,
-        persona_key=persona_key,
-        repo=f"{owner}/{repo}",
-        pr_number=pr_number,
-        head_sha=head_sha,
-        conclusion=conclusion,
-        summary=title,
-        findings_count=findings_count,
-        blocking=blocking,
-        degraded_reason=(
-            degraded_reason or ("check_publish_failed" if publish_failed else None)
-        ),
-    )
+    # Defense-in-depth: record_check_verdict is already documented as
+    # never-raise (activity_log.py swallows + logs internally), but the
+    # seam's own docstring promises this call can't crash the tail after
+    # a successful publish — don't let that promise depend transitively on
+    # a callee's internals never regressing (same discipline as
+    # code_reviewer/dispatch.py's submit_evals wrap).
+    try:
+        record_check_verdict(
+            install_id=installation_id,
+            persona_key=persona_key,
+            repo=f"{owner}/{repo}",
+            pr_number=pr_number,
+            head_sha=head_sha,
+            conclusion=conclusion,
+            summary=title,
+            findings_count=findings_count,
+            blocking=blocking,
+            degraded_reason=(
+                degraded_reason or ("check_publish_failed" if publish_failed else None)
+            ),
+        )
+    except Exception:  # noqa: BLE001 — best-effort per this module's own contract
+        log.exception(
+            "check_verdict_record_failed",
+            extra={
+                "persona": persona_key,
+                "pr": f"{owner}/{repo}#{pr_number}",
+            },
+        )
 
     return {
         "persona": persona_key,

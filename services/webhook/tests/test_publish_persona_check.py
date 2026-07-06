@@ -216,3 +216,83 @@ def test_publish_failure_emits_persona_named_log_line_verbatim(monkeypatch, capl
     assert any(
         r.getMessage() == "guard_check_run_publish_failed" for r in caplog.records
     )
+
+
+def test_publish_failure_log_carries_status_code_and_error_detail(monkeypatch, caplog):
+    """Qodo finding on PR #562: the publish-failure log must carry enough
+    detail (status code + error string) to diagnose a real incident, not
+    just the exception class name - while the event NAME stays byte-identical
+    for the monitor contract."""
+    from personas import publish_check
+
+    monkeypatch.setattr(publish_check, "with_install_token_retry", _fake_retry_raises)
+    monkeypatch.setattr(publish_check, "record_check_verdict", lambda **kw: None)
+
+    with caplog.at_level(logging.ERROR):
+        publish_persona_check(
+            persona_key="guard",
+            persona_prefix="guard",
+            check_name="Grug — Guard",
+            installation_id=1,
+            owner="o",
+            repo="r",
+            pr_number=2,
+            head_sha="sha",
+            conclusion="neutral",
+            title="t",
+            summary="s",
+            findings_count=0,
+            blocking=False,
+            degraded_reason=None,
+            success_result="pass",
+            publish_failed_log_name="guard_check_run_publish_failed",
+        )
+
+    record = next(
+        r for r in caplog.records if r.getMessage() == "guard_check_run_publish_failed"
+    )
+    assert record.status_code == 500
+    assert "500" in record.error or "Server Error" in record.error
+
+
+def test_record_check_verdict_raising_does_not_crash_publish(monkeypatch, caplog):
+    """CodeRabbit finding on PR #562: the docstring promises record_check_verdict
+    can't crash the tail even after a successful publish - defense-in-depth over
+    activity_log's own never-raise contract."""
+    from personas import publish_check
+
+    monkeypatch.setattr(publish_check, "with_install_token_retry", _fake_retry_ok)
+    monkeypatch.setattr(publish_check, "post_check_run", lambda *a, **kw: {})
+
+    def _boom(**kw):
+        raise RuntimeError("store unavailable")
+
+    monkeypatch.setattr(publish_check, "record_check_verdict", _boom)
+
+    with caplog.at_level(logging.ERROR):
+        out = publish_persona_check(
+            persona_key="guard",
+            persona_prefix="guard",
+            check_name="Grug — Guard",
+            installation_id=1,
+            owner="o",
+            repo="r",
+            pr_number=2,
+            head_sha="sha",
+            conclusion="neutral",
+            title="t",
+            summary="s",
+            findings_count=0,
+            blocking=False,
+            degraded_reason=None,
+            success_result="pass",
+            publish_failed_log_name="guard_check_run_publish_failed",
+        )
+
+    # The publish itself succeeded, so the result reflects that - it must
+    # never crash or silently invert to publish_failed because recording
+    # blew up.
+    assert out == {"persona": "guard", "result": "pass"}
+    assert any(
+        r.getMessage() == "check_verdict_record_failed" for r in caplog.records
+    )
