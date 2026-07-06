@@ -404,9 +404,12 @@ def _inline_comment_body(f: Finding) -> str:
         # single-line and fence-safe: the comment anchors one line, so a
         # multi-line suggestion applied there duplicates the following
         # original lines - confident-looking one-click corruption.
+        # strip NEWLINES only: GitHub commits the block verbatim as the
+        # full replacement line, leading indentation included - .strip()
+        # would one-click an IndentationError into the file.
         body = (
             f"{head}\n\n**Suggested fix:**\n"
-            f"```suggestion\n{f.suggestion.strip()}\n```"
+            f"```suggestion\n{f.suggestion.strip(chr(10) + chr(13))}\n```"
         )
     elif f.suggestion:
         # Multi-line or fence-bearing: fenced prose with an explicit scope

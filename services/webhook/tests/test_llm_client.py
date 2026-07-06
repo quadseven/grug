@@ -1428,7 +1428,22 @@ def test_coerce_finding_redacts_and_caps_message_and_suggestion() -> None:
         "suggestion": "key = " + pem,
     })
     assert ok is not None
-    assert "MIIEfake" not in ok.message and "MIIEfake" not in (ok.suggestion or "")
-    assert "[REDACTED:pem-private-key]" in (ok.suggestion or "")
+    assert "MIIEfake" not in ok.message
+    # stage-8 policy: a redaction-ALTERED suggestion is dropped entirely
+    # (a committable [REDACTED:...] placeholder would corrupt source).
+    assert ok.suggestion is None
+    assert "[REDACTED:pem-private-key]" in ok.message
     assert ok.message.endswith("[truncated]")
     assert len(ok.message) <= 1520
+
+
+def test_coerce_finding_drops_suggestion_redaction_would_alter() -> None:
+    """#553 audit stage 8: a suggestion that echoed a secret is DROPPED,
+    never rendered - a committable block containing [REDACTED:...] would
+    one-click the placeholder into source."""
+    ok, _ = lc._coerce_finding({
+        "path": "x.py", "line": 1, "rule": "r", "severity": "high",
+        "message": "m",
+        "suggestion": "key = 'AKIAABCDEFGHIJKLMNOP'",
+    })
+    assert ok is not None and ok.suggestion is None

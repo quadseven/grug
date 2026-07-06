@@ -1524,3 +1524,16 @@ def test_dispatch_suggestion_survives_pipe_to_inline_comment(monkeypatch):
     assert "```suggestion\nlog.warning('dropped %s', e)\n```" in body
     assert "quick win" in body
     assert "Prompt for AI agents" in body
+
+
+def test_committable_suggestion_preserves_leading_indentation():
+    """#553 audit stage 8: GitHub commits the block verbatim as the full
+    replacement line - stripping leading whitespace one-clicks an
+    IndentationError into the file."""
+    from personas.code_reviewer.persona import Finding
+    f = Finding(
+        file="x.py", line=1, severity="high", rule_name="null-deref",
+        message="m", suggestion="    return use(x)",
+    )
+    body = cr_dispatch._inline_comment_body(f)
+    assert "```suggestion\n    return use(x)\n```" in body
