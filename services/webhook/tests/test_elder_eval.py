@@ -116,9 +116,25 @@ def test_build_cases_counts_out_of_taxonomy():
         _row(400, "doc-truth", verdict="fixed"),
         _row(400, "doc-truth", verdict="fixed"),
         _row(400, "correctness", verdict="fixed"),
+        # An out-of-taxonomy FALSE-POSITIVE row must also be counted, not
+        # silently union the empty set and vanish.
+        _row(400, "iac-hygiene", verdict="false-positive"),
     ]
     (case,) = build_cases(rows)
-    assert case.out_of_taxonomy == {"doc-truth": 2}
+    assert case.out_of_taxonomy == {"doc-truth": 2, "iac-hygiene": 1}
+    assert set(case.expected_classes) == {"correctness"}
+
+
+def test_build_cases_counts_unknown_verdicts():
+    rows = [
+        _row(450, "correctness", verdict="fixed"),
+        _row(450, "correctness", verdict="pending"),
+        _row(450, "silent-failure", verdict="wontfix"),
+    ]
+    (case,) = build_cases(rows)
+    # Unknown verdicts are excluded from scoring but COUNTED - a
+    # mislabeled corpus must say why it yielded nothing.
+    assert case.unknown_verdicts == {"pending": 1, "wontfix": 1}
     assert set(case.expected_classes) == {"correctness"}
 
 
@@ -284,6 +300,35 @@ def test_compare_to_baseline_flags_catch_drop_and_noise_rise():
     joined = " ".join(regressions)
     assert "overall_catch" in joined
     assert "noise_rate" in joined
+
+
+def test_compare_to_baseline_flags_coverage_loss():
+    rows = [_row(1, "correctness"), _row(2, "correctness")]
+    full = {
+        "githumps/grug#1": CaseReplay(
+            case_id="githumps/grug#1", emitted={"correctness": 1}, errored=False
+        ),
+        "githumps/grug#2": CaseReplay(
+            case_id="githumps/grug#2", emitted={"correctness": 1}, errored=False
+        ),
+    }
+    partial = {
+        "githumps/grug#1": CaseReplay(
+            case_id="githumps/grug#1", emitted={"correctness": 1}, errored=False
+        ),
+        "githumps/grug#2": CaseReplay(
+            case_id="githumps/grug#2", emitted={}, errored=True
+        ),
+    }
+    baseline = to_baseline_dict(_report(rows, full), prompt_sha="abc", backend="cave")
+    # Rates are identical (1.0) over the surviving case - but the errored
+    # case + shrunken coverage must fail the check anyway.
+    regressions = compare_to_baseline(
+        _report(rows, partial), baseline["backends"]["cave"]
+    )
+    joined = " ".join(regressions)
+    assert "errored" in joined
+    assert "cases_scored shrank" in joined
 
 
 def test_compare_to_baseline_tolerates_within_tolerance():

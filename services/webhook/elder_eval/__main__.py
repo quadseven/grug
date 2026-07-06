@@ -53,6 +53,9 @@ def _print_report(name: str, report: EvalReport) -> None:
     if report.out_of_taxonomy:
         oot = ", ".join(f"{c}x{n}" for c, n in sorted(report.out_of_taxonomy.items()))
         print(f"  out-of-taxonomy (excluded, not misses): {oot}")
+    if report.unknown_verdicts:
+        uv = ", ".join(f"{v}x{n}" for v, n in sorted(report.unknown_verdicts.items()))
+        print(f"  !! unknown verdicts (excluded - fix the corpus labels): {uv}")
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -108,6 +111,12 @@ def main(argv: list[str] | None = None) -> int:
         )
         return 2
     backend = backends[0]
+    skipped_backends = [b.name for b in backends[1:]]
+    if skipped_backends:
+        print(
+            f"running backend {backend.name!r}; skipping configured "
+            f"{', '.join(skipped_backends)} (use --backend to select)"
+        )
     token = os.getenv("GITHUB_TOKEN", "")
 
     replays = run_eval(backend, cases, token=token)
@@ -142,14 +151,27 @@ def main(argv: list[str] | None = None) -> int:
             report, prompt_sha=compute_prompt_sha(), backend=backend.name
         )
         if BASELINE_PATH.exists():
-            # Merge: keep other backends' recorded scores, refresh this
-            # backend's + the prompt_sha (a record run re-blesses the prompt).
             existing = load_baseline()
-            merged_backends = {
-                **existing.get("backends", {}),
-                **fresh["backends"],
-            }
-            fresh["backends"] = merged_backends
+            if existing.get("prompt_sha") == fresh["prompt_sha"]:
+                # Same prompt: keep other backends' recorded scores and
+                # refresh this backend's.
+                fresh["backends"] = {
+                    **existing.get("backends", {}),
+                    **fresh["backends"],
+                }
+            else:
+                # The prompt CHANGED: other backends' scores describe the
+                # old prompt - carrying them forward under the new
+                # prompt_sha would re-bless stale data as fresh.
+                dropped = sorted(
+                    set(existing.get("backends", {})) - set(fresh["backends"])
+                )
+                if dropped:
+                    print(
+                        "prompt changed since the last record - dropping "
+                        f"stale backend baseline(s): {', '.join(dropped)} "
+                        "(re-record them against the new prompt)"
+                    )
         BASELINE_PATH.write_text(json.dumps(fresh, indent=2, sort_keys=True) + "\n")
         print(f"baseline recorded -> {BASELINE_PATH}")
         return 0

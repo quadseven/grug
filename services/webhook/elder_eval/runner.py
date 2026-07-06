@@ -93,12 +93,16 @@ def run_case(
     parse) returns errored=True + logs - it must never abort the sweep, and
     a non-run must never read as "Elder found nothing" (honest-zero rule)."""
     try:
+        if len(diff_text) > _MAX_DIFF_BYTES:
+            # Truncation changes what is measured - findings in the amputated
+            # tail become misses. Say so, loudly, with sizes.
+            log.warning(
+                "eval_diff_truncated case=%s original=%d kept=%d",
+                case.case_id, len(diff_text), _MAX_DIFF_BYTES,
+            )
         hunks = diff_to_hunks(diff_text[:_MAX_DIFF_BYTES])
         if not hunks:
-            log.warning(
-                "eval_case_empty_diff",
-                extra={"case": case.case_id},
-            )
+            log.warning("eval_case_empty_diff case=%s", case.case_id)
             return CaseReplay(case_id=case.case_id, emitted={}, errored=True)
         messages = _build_messages(
             hunks, _PROMPT_VARIANT, None, None, None,
@@ -108,14 +112,12 @@ def run_case(
         findings, _model, err = _parse_response(resp)
     except Exception as e:  # noqa: BLE001 - one case must not abort the sweep
         log.warning(
-            "eval_case_errored",
-            extra={"case": case.case_id, "kind": type(e).__name__},
+            "eval_case_errored case=%s kind=%s", case.case_id, type(e).__name__
         )
         return CaseReplay(case_id=case.case_id, emitted={}, errored=True)
     if err and not findings:
         log.warning(
-            "eval_case_parse_failed",
-            extra={"case": case.case_id, "err": err},
+            "eval_case_parse_failed case=%s err=%s", case.case_id, err
         )
         return CaseReplay(case_id=case.case_id, emitted={}, errored=True)
     return CaseReplay(
@@ -135,18 +137,36 @@ def run_eval(
 ) -> dict[str, CaseReplay]:
     """Replay the whole corpus through one backend. `fetch` is injectable
     for tests. Returns case_id -> CaseReplay for `scoring.score`."""
-    log.info(
-        "eval_start",
-        extra={"backend": backend.name, "cases": len(cases)},
-    )
+    log.info("eval_start backend=%s cases=%d", backend.name, len(cases))
     replays: dict[str, CaseReplay] = {}
     for case in cases:
         try:
             diff = fetch(case.repo, case.pr, token)
+        except httpx.HTTPStatusError as e:
+            # Transient (401/403/429: auth or rate limit - the rest of the
+            # sweep is probably doomed too) vs PERMANENT (404: the corpus
+            # references a deleted PR and should be pruned) must read
+            # differently, or corpus rot silently shrinks denominators
+            # run after run.
+            status = e.response.status_code
+            if status == 404:
+                log.warning(
+                    "eval_corpus_pr_missing case=%s status=404 - the ledger "
+                    "references a deleted/inaccessible PR; prune or annotate it",
+                    case.case_id,
+                )
+            else:
+                log.warning(
+                    "eval_diff_fetch_failed case=%s status=%d", case.case_id, status
+                )
+            replays[case.case_id] = CaseReplay(
+                case_id=case.case_id, emitted={}, errored=True
+            )
+            continue
         except Exception as e:  # noqa: BLE001 - fetch failure = errored case
             log.warning(
-                "eval_diff_fetch_failed",
-                extra={"case": case.case_id, "kind": type(e).__name__},
+                "eval_diff_fetch_failed case=%s kind=%s",
+                case.case_id, type(e).__name__,
             )
             replays[case.case_id] = CaseReplay(
                 case_id=case.case_id, emitted={}, errored=True
@@ -158,7 +178,7 @@ def run_eval(
     errored = sum(1 for r in replays.values() if r.errored)
     if errored:
         log.warning(
-            "eval_errors",
-            extra={"backend": backend.name, "errors": errored, "total": len(cases)},
+            "eval_errors backend=%s errors=%d total=%d",
+            backend.name, errored, len(cases),
         )
     return replays
