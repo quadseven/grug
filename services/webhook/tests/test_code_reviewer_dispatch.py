@@ -1554,3 +1554,18 @@ def test_unterminated_fence_in_message_cannot_swallow_the_body():
     # the head's backtick run was defused below fence-capability
     head = body.split("**Suggested fix", 1)[0]
     assert "```" not in head
+
+
+def test_all_newline_suggestion_never_produces_empty_committable_block():
+    """FLINT on #558: a suggestion of only newlines passes the single-line
+    check (no literal \\n after an initial .strip()) but strips to empty -
+    committing it would replace the line with a BLANK line. Must degrade,
+    never emit an empty ```suggestion``` block."""
+    from personas.code_reviewer.persona import Finding
+    f = Finding(
+        file="x.py", line=1, severity="high", rule_name="null-deref",
+        message="m", suggestion="\n\n\n",
+    )
+    body = cr_dispatch._inline_comment_body(f)
+    assert "```suggestion\n\n```" not in body
+    assert "```suggestion" not in body
