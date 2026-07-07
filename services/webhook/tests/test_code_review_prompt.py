@@ -220,6 +220,22 @@ def test_tls_verification_disabled_rule_present():
     assert "tls-verification-disabled" in crp.build_system_prompt()
 
 
+def test_positional_parse_drops_holes_rule_present():
+    """Weekly harvest: a parser that keeps only matching tokens (dropping
+    NA/empty holes) then pairs the list positionally with a parallel list
+    shifts every slot after the hole onto the wrong element — silent data
+    corruption. Keep placeholders and pair by position (somatic-scripts
+    #1782)."""
+    assert any(
+        r.name == "positional-parse-drops-holes-shifts-alignment"
+        for r in crp.RULES
+    )
+    assert (
+        "positional-parse-drops-holes-shifts-alignment"
+        in crp.build_system_prompt()
+    )
+
+
 def test_voice_has_mandatory_bookend_structure():
     """#343: the voice instruction mandates the structural bookends that
     keep the caveman cadence from slipping to plain English under technical
