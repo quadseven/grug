@@ -421,18 +421,21 @@ RULES: tuple[ReviewRule, ...] = (
         "match a 'good' pattern (a comprehension or `re.findall` that "
         "silently skips empty/unparseable/NA holes), then pairs it BY "
         "POSITION (index `[i]` or `zip`) with another list drawn from the "
-        "same source — so one dropped hole shifts every later element onto "
+        "same source - so one dropped hole shifts every later element onto "
         "the wrong slot: silent data corruption, no error raised. Flag ONLY "
         "when BOTH the hole-dropping extraction AND the positional pairing of "
         "the parallel lists are visible in the diff/file; keeping placeholders "
-        "for the holes (so lengths stay in lockstep) is the fix.",
+        "for the holes (so lengths stay in lockstep) is the fix - `zip` alone "
+        "does not enforce this, since it silently truncates to the shorter "
+        "list instead of raising on a length mismatch.",
         bad_example="names = re.findall(r'\"([^\"]+)\"', row)  # unquoted NA "
         "holes vanish\nreturn [{'name': n, 'qty': qtys[i]} for i, n in "
         "enumerate(names)]  # every qty after a hole is now misaligned",
         good_example="cells = [m.group(1) for m in CELL_RE.finditer(row)]  # "
         "CELL_RE matches NA too, emitting a None placeholder\nreturn "
-        "[{'name': n, 'qty': q} for n, q in zip(cells, qtys)]  # slots stay "
-        "aligned; drop an element from BOTH lists or neither",
+        "[{'name': n, 'qty': q} for n, q in zip(cells, qtys, strict=True)]  # "
+        "placeholders keep the lists equal length; strict=True makes any "
+        "future mismatch a loud ValueError instead of a silent truncation",
         severity="high",
     ),
 )
