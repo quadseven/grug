@@ -74,7 +74,7 @@ def test_ensure_stores_ruleset_id_from_create_response():
 def test_ensure_passes_stored_id_to_detect():
     """A previously-stored ruleset_id is threaded through to detect_enforcement.
 
-    This is the ID-based detection path (grug#<TODO-fill-issue-number>):
+    This is the ID-based detection path (grug#565):
     detect_enforcement matches by ID first, falling back to the
     Grug-prefix name heuristic only when nothing is on file yet.
     """

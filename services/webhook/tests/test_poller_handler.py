@@ -255,7 +255,12 @@ def _wire_enforcement(monkeypatch, *, installs, gh_repos, detect, config=None, s
     pass. `gh_repos` is what GitHub's /installation/repositories returns;
     `config` maps (install_id, repo_id) -> repo-config dict (default {} =
     all defaults, i.e. tpm enabled); `stored_ids` maps (install_id, repo_id)
-    -> the stored enforcement_ruleset_id (default None = never enrolled)."""
+    -> the stored enforcement_ruleset_id (default None = never enrolled).
+    get_repo_config's real return already carries enforcement_ruleset_id
+    (pg_install_store.get_repo_config) - the poller reuses that single
+    fetch rather than a second get_enforcement_id lookup for the same
+    row, so stored_ids is merged into the config dict here rather than
+    mocked as a separate store call."""
     _wire(
         monkeypatch,
         installs=installs,
@@ -266,14 +271,13 @@ def _wire_enforcement(monkeypatch, *, installs, gh_repos, detect, config=None, s
     monkeypatch.setattr(
         "github_rulesets_client.list_installation_repos", lambda token: gh_repos,
     )
-    monkeypatch.setattr(
-        "adapters.install_store.get_repo_config",
-        lambda iid, rid: (config or {}).get((iid, rid), {}),
-    )
-    monkeypatch.setattr(
-        "adapters.install_store.get_enforcement_id",
-        lambda iid, rid: (stored_ids or {}).get((iid, rid)),
-    )
+
+    def _get_repo_config(iid, rid):
+        cfg = dict((config or {}).get((iid, rid), {}))
+        cfg.setdefault("enforcement_ruleset_id", (stored_ids or {}).get((iid, rid)))
+        return cfg
+
+    monkeypatch.setattr("adapters.install_store.get_repo_config", _get_repo_config)
     monkeypatch.setattr("github_rulesets_client.detect_enforcement", detect)
 
 
@@ -310,6 +314,33 @@ def test_enforcement_pass_emits_live_state_per_github_repo(monkeypatch):
     ]
     assert out["enforcement_emitted"] == 2
     assert out["enforcement_failed_installs"] == 0
+
+
+def test_enforcement_pass_threads_stored_ruleset_id_per_repo(monkeypatch):
+    """grug#565 regression: the poller's re-emission pass must pass each
+    repo's OWN stored enforcement_ruleset_id through to detect_enforcement
+    - not None, and not another repo's ID - so a ruleset whose live name
+    has drifted from the Grug prefix (the exact bug: "Grug TPM gate" vs
+    "Grug — ...") still gets found by ID."""
+    detected_ids = []
+
+    def _detect(token, owner, repo, branch, check_name, stored_ruleset_id=None):
+        detected_ids.append((repo, stored_ruleset_id))
+        return "grug_managed"
+
+    _wire_enforcement(
+        monkeypatch,
+        installs=[1],
+        gh_repos=[
+            {"id": 10, "full_name": "o/a", "default_branch": "main"},
+            {"id": 11, "full_name": "o/b", "default_branch": "main"},
+        ],
+        detect=_detect,
+        stored_ids={(1, 10): 555, (1, 11): None},
+    )
+    monkeypatch.setattr("observability.emit_enforcement_metric", lambda *a, **k: None)
+    poller_handler.handler({}, None)
+    assert detected_ids == [("a", 555), ("b", None)]
 
 
 def test_enforcement_pass_honors_store_opt_out(monkeypatch):
