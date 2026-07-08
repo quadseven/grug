@@ -122,9 +122,14 @@ jobs:
 
   teardown:
     # Reap when the PR closes/merges, or the `preview` label is removed.
+    # Same-repo guard for consistency/defense-in-depth with deploy (CodeRabbit
+    # PR #571) - low risk either way since GitHub already withholds repo
+    # secrets from fork-triggered pull_request runs by default, but this
+    # removes any doubt.
     if: >-
-      github.event.action == 'closed' ||
-      (github.event.action == 'unlabeled' && github.event.label.name == 'preview')
+      (github.event.action == 'closed' ||
+       (github.event.action == 'unlabeled' && github.event.label.name == 'preview')) &&
+      github.event.pull_request.head.repo.full_name == github.repository
     runs-on: ubuntu-24.04-arm
     timeout-minutes: 10
     # NOT k8s-prod - see the deploy job's comment above; a pull_request-
