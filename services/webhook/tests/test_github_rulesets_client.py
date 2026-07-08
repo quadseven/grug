@@ -194,6 +194,69 @@ def test_detect_external_via_rulesets():
     assert result == "external"
 
 
+def test_detect_grug_managed_via_stored_id_despite_mismatched_name():
+    """A ruleset enforcing the check, matching stored_ruleset_id but NOT the
+    Grug — name prefix (e.g. an operator or migration renamed it), is still
+    grug_managed. Regression for a live repo-rename incident: a ruleset
+    named "Grug TPM gate" (no em-dash, doesn't match GRUG_RULESET_PREFIX)
+    was misclassified as external/none purely on the name heuristic even
+    though Grug created and tracks it (infra#943 rename investigation).
+    """
+    rulesets = [
+        {
+            "id": 999,
+            "name": "Grug TPM gate",
+            "rules": [
+                {
+                    "type": "required_status_checks",
+                    "parameters": {
+                        "required_status_checks": [
+                            {"context": "Grug — Definition of Ready"},
+                        ],
+                    },
+                },
+            ],
+        },
+    ]
+    rulesets_resp = _ok_response(rulesets)
+    with patch("httpx.get", return_value=rulesets_resp):
+        result = detect_enforcement(
+            "tok", "o", "r", "main", "Grug — Definition of Ready",
+            stored_ruleset_id=999,
+        )
+
+    assert result == "grug_managed"
+
+
+def test_detect_external_when_stored_id_does_not_match_any_ruleset():
+    """stored_ruleset_id set, but no live ruleset has that ID → falls back
+    to the name-prefix heuristic (here: non-Grug name → external)."""
+    rulesets = [
+        {
+            "id": 20,
+            "name": "CI Required Checks",
+            "rules": [
+                {
+                    "type": "required_status_checks",
+                    "parameters": {
+                        "required_status_checks": [
+                            {"context": "Grug — Definition of Ready"},
+                        ],
+                    },
+                },
+            ],
+        },
+    ]
+    rulesets_resp = _ok_response(rulesets)
+    with patch("httpx.get", return_value=rulesets_resp):
+        result = detect_enforcement(
+            "tok", "o", "r", "main", "Grug — Definition of Ready",
+            stored_ruleset_id=12345,
+        )
+
+    assert result == "external"
+
+
 def test_detect_external_via_legacy_branch_protection():
     """No rulesets match, but legacy branch protection enforces the check → external."""
     rulesets_resp = _ok_response([])

@@ -250,11 +250,12 @@ def test_poller_no_installs_is_a_clean_noop(monkeypatch):
 # --- #460: enforcement-gauge re-emission pass --------------------------------
 
 
-def _wire_enforcement(monkeypatch, *, installs, gh_repos, detect, config=None):
+def _wire_enforcement(monkeypatch, *, installs, gh_repos, detect, config=None, stored_ids=None):
     """Wire an idle reactions/pulse/dep-watch cycle with a live enforcement
     pass. `gh_repos` is what GitHub's /installation/repositories returns;
     `config` maps (install_id, repo_id) -> repo-config dict (default {} =
-    all defaults, i.e. tpm enabled)."""
+    all defaults, i.e. tpm enabled); `stored_ids` maps (install_id, repo_id)
+    -> the stored enforcement_ruleset_id (default None = never enrolled)."""
     _wire(
         monkeypatch,
         installs=installs,
@@ -269,6 +270,10 @@ def _wire_enforcement(monkeypatch, *, installs, gh_repos, detect, config=None):
         "adapters.install_store.get_repo_config",
         lambda iid, rid: (config or {}).get((iid, rid), {}),
     )
+    monkeypatch.setattr(
+        "adapters.install_store.get_enforcement_id",
+        lambda iid, rid: (stored_ids or {}).get((iid, rid)),
+    )
     monkeypatch.setattr("github_rulesets_client.detect_enforcement", detect)
 
 
@@ -279,7 +284,7 @@ def test_enforcement_pass_emits_live_state_per_github_repo(monkeypatch):
     emitted = []
     detected = []
 
-    def _detect(token, owner, repo, branch, check_name):
+    def _detect(token, owner, repo, branch, check_name, stored_ruleset_id=None):
         detected.append((owner, repo, branch, check_name))
         return "grug_managed" if repo == "a" else "none"
 
@@ -313,7 +318,7 @@ def test_enforcement_pass_honors_store_opt_out(monkeypatch):
     emitted = []
     detected = []
 
-    def _detect(token, owner, repo, branch, check_name):
+    def _detect(token, owner, repo, branch, check_name, stored_ruleset_id=None):
         detected.append(repo)
         return "grug_managed"
 
@@ -345,7 +350,7 @@ def test_enforcement_pass_one_repo_failure_does_not_starve_the_rest(monkeypatch,
 
     emitted = []
 
-    def _detect(token, owner, repo, branch, check_name):
+    def _detect(token, owner, repo, branch, check_name, stored_ruleset_id=None):
         if repo == "bad":
             raise RuntimeError("GH 500")
         return "external"

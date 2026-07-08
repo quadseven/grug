@@ -308,13 +308,24 @@ def detect_enforcement(
     repo: str,
     branch: str,
     check_name: str,
+    stored_ruleset_id: int | None = None,
 ) -> EnforcementState:
     """Determine whether check_name is enforced and by whom.
 
     Checks the Rulesets API first, then falls back to legacy branch
-    protection. Returns ``"grug_managed"`` if a ``Grug —``-prefixed
-    ruleset enforces the check, ``"external"`` if enforced by a
-    non-Grug mechanism, or ``"none"`` if not enforced at all.
+    protection. Returns ``"grug_managed"`` if a ruleset enforces the
+    check AND either matches ``stored_ruleset_id`` (the ID Grug itself
+    created, tracked in the install store) or - when no ID is on file,
+    e.g. a repo Grug hasn't enrolled yet - falls back to the ``Grug —``
+    name-prefix heuristic. ``"external"`` if enforced by a non-Grug
+    mechanism, or ``"none"`` if not enforced at all.
+
+    The ID check is load-bearing, not cosmetic: a rename, a manual
+    rename of the ruleset itself, or any other drift between the
+    ruleset's live name and GRUG_RULESET_PREFIX would otherwise
+    misclassify an actually-enforcing Grug ruleset as external/none
+    (grug#565 - found via a live repo rename,
+    ruleset id 15934208 named "Grug TPM gate" doesn't match the prefix).
     """
     rulesets = list_rulesets(install_token, owner, repo)
 
@@ -323,7 +334,9 @@ def detect_enforcement(
     for rs in rulesets:
         if not _check_name_in_ruleset(rs, check_name):
             continue
-        if rs.get("name", "").startswith(GRUG_RULESET_PREFIX):
+        if stored_ruleset_id is not None and rs.get("id") == stored_ruleset_id:
+            grug_match = True
+        elif rs.get("name", "").startswith(GRUG_RULESET_PREFIX):
             grug_match = True
         else:
             external_match = True

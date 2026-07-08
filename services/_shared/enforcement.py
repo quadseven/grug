@@ -37,8 +37,10 @@ def ensure_enforcement(
 
     Returns the resulting enforcement state after the operation.
     """
+    from adapters.install_store import get_enforcement_id  # type: ignore
     state = detect_enforcement(
         install_token, owner, repo, default_branch, GRUG_DOR_CHECK_NAME,
+        stored_ruleset_id=get_enforcement_id(install_id, repo_id),
     )
     if state != "none":
         log.info(

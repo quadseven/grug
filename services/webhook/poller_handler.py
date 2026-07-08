@@ -189,7 +189,7 @@ def handler(event: dict[str, Any], context: Any) -> dict[str, int | str]:
     enforcement_failed = 0
     for install_id in installs:
         try:
-            from adapters.install_store import get_repo_config
+            from adapters.install_store import get_enforcement_id, get_repo_config
             from enforcement import GRUG_DOR_CHECK_NAME
             from github_rulesets_client import (
                 detect_enforcement,
@@ -212,6 +212,7 @@ def handler(event: dict[str, Any], context: Any) -> dict[str, int | str]:
                             token, owner, name,
                             r.get("default_branch") or "main",
                             GRUG_DOR_CHECK_NAME,
+                            stored_ruleset_id=get_enforcement_id(iid, r["id"]),
                         )
                         emit_enforcement_metric(full, state)
                         n += 1
