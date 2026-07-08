@@ -28,7 +28,16 @@ jobs:
       github.event.pull_request.head.repo.full_name == github.repository
     runs-on: ubuntu-24.04-arm
     timeout-minutes: 20
-    environment: k8s-prod
+    # NOT k8s-prod (#943-adjacent fix): GitHub evaluates an Environment's
+    # deployment-branch-policy against refs/pull/N/merge for a
+    # pull_request-triggered job, which can NEVER match a branch-name
+    # policy like k8s-prod's "main only" - this job was structurally
+    # incapable of ever succeeding. k8s-preview is a dedicated environment
+    # with NO branch policy, holding its own copy of the same 5 secrets
+    # (a fresh, minimally-scoped ServiceAccount for KUBECONFIG_B64, not a
+    # copy of the cluster-admin-bound prod credential) plus a matching
+    # OIDC trust-policy entry (infra/pulumi/__main__.py, environments=).
+    environment: k8s-preview
     steps:
       - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
       - uses: astral-sh/setup-uv@d0d8abe699bfb85fec6de9f7adb5ae17292296ff # v6
@@ -118,7 +127,9 @@ jobs:
       (github.event.action == 'unlabeled' && github.event.label.name == 'preview')
     runs-on: ubuntu-24.04-arm
     timeout-minutes: 10
-    environment: k8s-prod
+    # NOT k8s-prod - see the deploy job's comment above; a pull_request-
+    # triggered job can never satisfy a branch-name deployment policy.
+    environment: k8s-preview
     steps:
       - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
       - uses: astral-sh/setup-uv@d0d8abe699bfb85fec6de9f7adb5ae17292296ff # v6
