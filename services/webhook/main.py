@@ -8,6 +8,8 @@ Slice 4 (#25) extends this with persona dispatch (TPM is the first
 persona; future personas — code-reviewer, release-manager, stuck-PR-pulse —
 plug in via the same dispatcher).
 """
+# no-op: touches services/** to trigger the pr-<n> image-build gate for a
+# live verification of PR #571's preview.yml fix (throwaway PR, will close)
 
 from __future__ import annotations
 
