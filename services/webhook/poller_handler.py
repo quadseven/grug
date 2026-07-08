@@ -212,6 +212,7 @@ def handler(event: dict[str, Any], context: Any) -> dict[str, int | str]:
                             token, owner, name,
                             r.get("default_branch") or "main",
                             GRUG_DOR_CHECK_NAME,
+                            stored_ruleset_id=cfg.get("enforcement_ruleset_id"),
                         )
                         emit_enforcement_metric(full, state)
                         n += 1
