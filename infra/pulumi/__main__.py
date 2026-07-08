@@ -112,8 +112,13 @@ _deploy_role_bundle = oidc_role.create(
     # (Audit #2.) Forks are already excluded — the trust is repo-scoped to
     # githumps/grug, so this only ever governed first-party branches.
     branches=["main"],
-    # deploy.k8s runs inside the k8s-prod environment (#354).
-    environments=["k8s-prod"],
+    # deploy.k8s runs inside the k8s-prod environment (#354). preview.yml's
+    # deploy/teardown jobs run inside k8s-preview (a separate, no-branch-
+    # policy environment - a branch-restricted environment can never be
+    # satisfied by a pull_request-triggered job, since GitHub evaluates its
+    # policy against refs/pull/N/merge, never a literal branch name; see
+    # docs/runbooks or the preview.yml fix commit for the full story).
+    environments=["k8s-prod", "k8s-preview"],
     tags_pattern="v*",
 )
 gha_deploy_role = _deploy_role_bundle.role
