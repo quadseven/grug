@@ -11,6 +11,15 @@ on:
 
 permissions:
   contents: read
+  # Both deploy and teardown assume grug-gha-deploy via GitHub OIDC
+  # (aws-actions/configure-aws-credentials) - without this, the action
+  # fails "Credentials could not be loaded, please check your action
+  # inputs: Could not load credentials from any providers" because no
+  # OIDC token can be minted at all. This was a second, independent bug
+  # from the environment/branch-policy one (infra#943-adjacent fix) -
+  # always present, just invisible because the environment rejection
+  # always failed first. Matches deploy.k8s.yml's existing permissions.
+  id-token: write
 
 concurrency:
   group: preview-${{ github.event.pull_request.number }}
