@@ -232,11 +232,36 @@ def list_rulesets(
     repo: str,
 ) -> list[dict]:
     """List all rulesets for a repository. Resilient to GitHub's secondary
-    rate limit (the dashboard fan-out burst) via bounded jittered retries."""
+    rate limit (the dashboard fan-out burst) via bounded jittered retries.
+
+    GitHub's LIST endpoint returns SUMMARIES ONLY - id, name, target,
+    enforcement, source, timestamps - it does NOT include ``rules``
+    (verified live, grug#567). Callers that need to inspect a ruleset's
+    actual rules (e.g. required_status_checks) must fetch full detail
+    per candidate via ``get_ruleset()``.
+    """
     resp = _get_with_retry(
         f"{_GH_API}/repos/{quote(owner, safe='')}/{quote(repo, safe='')}/rulesets",
         install_token=install_token,
         op="list_rulesets",
+    )
+    resp.raise_for_status()
+    return resp.json()
+
+
+def get_ruleset(
+    install_token: str,
+    owner: str,
+    repo: str,
+    ruleset_id: int,
+) -> dict:
+    """Fetch a single ruleset's FULL detail, including ``rules`` (the
+    LIST endpoint omits this - grug#567). Resilient to GitHub's secondary
+    rate limit via the same bounded jittered retries as list_rulesets."""
+    resp = _get_with_retry(
+        f"{_GH_API}/repos/{quote(owner, safe='')}/{quote(repo, safe='')}/rulesets/{ruleset_id}",
+        install_token=install_token,
+        op="get_ruleset",
     )
     resp.raise_for_status()
     return resp.json()
@@ -326,18 +351,32 @@ def detect_enforcement(
     misclassify an actually-enforcing Grug ruleset as external/none
     (grug#565 - found via a live repo rename,
     ruleset id 15934208 named "Grug TPM gate" doesn't match the prefix).
+
+    list_rulesets() only returns SUMMARIES (grug#567 - verified live,
+    no ``rules`` key at all in the LIST response), so each candidate's
+    full detail is fetched individually via get_ruleset() before its
+    rules are inspected. Bounded to active, branch-target rulesets
+    (the only kind that can enforce a branch status check) to keep the
+    extra per-ruleset GETs to the handful that could plausibly match -
+    most repos have 1-3 rulesets total. Short-circuits on the first
+    grug_match, since that already wins the final classification below.
     """
     rulesets = list_rulesets(install_token, owner, repo)
 
     grug_match = False
     external_match = False
     for rs in rulesets:
-        if not _check_name_in_ruleset(rs, check_name):
+        if rs.get("enforcement") != "active" or rs.get("target") != "branch":
+            continue
+        full = get_ruleset(install_token, owner, repo, rs["id"])
+        if not _check_name_in_ruleset(full, check_name):
             continue
         if stored_ruleset_id is not None and rs.get("id") == stored_ruleset_id:
             grug_match = True
+            break
         elif rs.get("name", "").startswith(GRUG_RULESET_PREFIX):
             grug_match = True
+            break
         else:
             external_match = True
 

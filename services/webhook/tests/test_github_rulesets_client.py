@@ -17,6 +17,7 @@ from github_rulesets_client import (
     create_ruleset,
     delete_ruleset,
     list_rulesets,
+    get_ruleset,
     detect_enforcement,
     GRUG_RULESET_PREFIX,
 )
@@ -142,53 +143,75 @@ def test_list_rulesets_401_propagates(mock_transport_client):
     assert exc.value.response.status_code == 401
 
 
+# ── get_ruleset (grug#567: the LIST endpoint doesn't carry rules[]) ───
+
+def test_get_ruleset_url_and_auth():
+    detail = {"id": 42, "name": "Grug — DoR", "rules": [{"type": "required_status_checks"}]}
+    with patch("httpx.get", return_value=_ok_response(detail)) as mock_get:
+        out = get_ruleset("tok-4", "myorg", "myrepo", 42)
+
+    mock_get.assert_called_once()
+    args, kwargs = mock_get.call_args
+    assert args[0] == "https://api.github.com/repos/myorg/myrepo/rulesets/42"
+    assert kwargs["headers"]["Authorization"] == "Bearer tok-4"
+    assert out == detail
+
+
+def test_get_ruleset_401_propagates(mock_transport_client):
+    client = mock_transport_client(status_codes=[401])
+    with patch("httpx.get", side_effect=lambda *a, **kw: client.get(*a, **kw)):
+        with pytest.raises(httpx.HTTPStatusError) as exc:
+            get_ruleset("stale", "o", "r", 1)
+    assert exc.value.response.status_code == 401
+
+
 # ── detect_enforcement ───────────────────────────────────────────────
 
+def _summary(ruleset_id, name, *, target="branch", enforcement="active"):
+    """A LIST-endpoint ruleset summary - no 'rules' key (grug#567: GitHub's
+    real LIST response never carries one)."""
+    return {"id": ruleset_id, "name": name, "target": target, "enforcement": enforcement}
+
+
+def _detail(ruleset_id, name, *, required_checks=None, rule_type="required_status_checks"):
+    """A single-ruleset GET response - the only shape that carries 'rules'."""
+    rules = []
+    if rule_type == "required_status_checks":
+        rules.append({
+            "type": "required_status_checks",
+            "parameters": {
+                "required_status_checks": [
+                    {"context": c} for c in (required_checks or [])
+                ],
+            },
+        })
+    elif rule_type is not None:
+        rules.append({"type": rule_type, "parameters": {}})
+    return {"id": ruleset_id, "name": name, "rules": rules}
+
+
 def test_detect_grug_managed_via_rulesets():
-    """Grug-prefixed ruleset with matching check → grug_managed."""
-    rulesets = [
-        {
-            "id": 10,
-            "name": "Grug — DoR Enforcement",
-            "rules": [
-                {
-                    "type": "required_status_checks",
-                    "parameters": {
-                        "required_status_checks": [
-                            {"context": "Grug — Definition of Ready"},
-                        ],
-                    },
-                },
-            ],
-        },
-    ]
-    rulesets_resp = _ok_response(rulesets)
-    with patch("httpx.get", return_value=rulesets_resp):
+    """Grug-prefixed ruleset with matching check → grug_managed.
+
+    Two-call shape (grug#567): list_rulesets() returns a summary only
+    (no rules[]); detect_enforcement() must fetch the ruleset's full
+    detail via get_ruleset() before it can see the required check.
+    """
+    summaries = [_summary(10, "Grug — DoR Enforcement")]
+    detail = _detail(10, "Grug — DoR Enforcement", required_checks=["Grug — Definition of Ready"])
+    with patch("httpx.get", side_effect=[_ok_response(summaries), _ok_response(detail)]) as mock_get:
         result = detect_enforcement("tok", "o", "r", "main", "Grug — Definition of Ready")
 
     assert result == "grug_managed"
+    assert mock_get.call_count == 2
+    assert mock_get.call_args_list[1][0][0] == "https://api.github.com/repos/o/r/rulesets/10"
 
 
 def test_detect_external_via_rulesets():
     """Non-Grug ruleset enforcing the check → external."""
-    rulesets = [
-        {
-            "id": 20,
-            "name": "CI Required Checks",
-            "rules": [
-                {
-                    "type": "required_status_checks",
-                    "parameters": {
-                        "required_status_checks": [
-                            {"context": "Grug — Definition of Ready"},
-                        ],
-                    },
-                },
-            ],
-        },
-    ]
-    rulesets_resp = _ok_response(rulesets)
-    with patch("httpx.get", return_value=rulesets_resp):
+    summaries = [_summary(20, "CI Required Checks")]
+    detail = _detail(20, "CI Required Checks", required_checks=["Grug — Definition of Ready"])
+    with patch("httpx.get", side_effect=[_ok_response(summaries), _ok_response(detail)]):
         result = detect_enforcement("tok", "o", "r", "main", "Grug — Definition of Ready")
 
     assert result == "external"
@@ -202,24 +225,9 @@ def test_detect_grug_managed_via_stored_id_despite_mismatched_name():
     was misclassified as external/none purely on the name heuristic even
     though Grug created and tracks it (infra#943 rename investigation).
     """
-    rulesets = [
-        {
-            "id": 999,
-            "name": "Grug TPM gate",
-            "rules": [
-                {
-                    "type": "required_status_checks",
-                    "parameters": {
-                        "required_status_checks": [
-                            {"context": "Grug — Definition of Ready"},
-                        ],
-                    },
-                },
-            ],
-        },
-    ]
-    rulesets_resp = _ok_response(rulesets)
-    with patch("httpx.get", return_value=rulesets_resp):
+    summaries = [_summary(999, "Grug TPM gate")]
+    detail = _detail(999, "Grug TPM gate", required_checks=["Grug — Definition of Ready"])
+    with patch("httpx.get", side_effect=[_ok_response(summaries), _ok_response(detail)]):
         result = detect_enforcement(
             "tok", "o", "r", "main", "Grug — Definition of Ready",
             stored_ruleset_id=999,
@@ -231,30 +239,32 @@ def test_detect_grug_managed_via_stored_id_despite_mismatched_name():
 def test_detect_external_when_stored_id_does_not_match_any_ruleset():
     """stored_ruleset_id set, but no live ruleset has that ID → falls back
     to the name-prefix heuristic (here: non-Grug name → external)."""
-    rulesets = [
-        {
-            "id": 20,
-            "name": "CI Required Checks",
-            "rules": [
-                {
-                    "type": "required_status_checks",
-                    "parameters": {
-                        "required_status_checks": [
-                            {"context": "Grug — Definition of Ready"},
-                        ],
-                    },
-                },
-            ],
-        },
-    ]
-    rulesets_resp = _ok_response(rulesets)
-    with patch("httpx.get", return_value=rulesets_resp):
+    summaries = [_summary(20, "CI Required Checks")]
+    detail = _detail(20, "CI Required Checks", required_checks=["Grug — Definition of Ready"])
+    with patch("httpx.get", side_effect=[_ok_response(summaries), _ok_response(detail)]):
         result = detect_enforcement(
             "tok", "o", "r", "main", "Grug — Definition of Ready",
             stored_ruleset_id=12345,
         )
 
     assert result == "external"
+
+
+def test_detect_skips_get_ruleset_for_disabled_or_non_branch_rulesets():
+    """A ruleset that is disabled, or doesn't target a branch, can't enforce
+    a branch status check - skipped WITHOUT the extra get_ruleset() GET
+    (grug#567: bounding the per-candidate detail fetch to plausible
+    matches only, not every ruleset on the repo)."""
+    summaries = [
+        _summary(1, "Grug — Disabled", enforcement="disabled"),
+        _summary(2, "Grug — Tag Rule", target="tag"),
+    ]
+    legacy_resp = _ok_response({"contexts": []})
+    with patch("httpx.get", side_effect=[_ok_response(summaries), legacy_resp]) as mock_get:
+        result = detect_enforcement("tok", "o", "r", "main", "Grug — Definition of Ready")
+
+    assert result == "none"
+    assert mock_get.call_count == 2  # list + legacy fallback only, no get_ruleset calls
 
 
 def test_detect_external_via_legacy_branch_protection():
@@ -298,37 +308,26 @@ def test_detect_none_when_legacy_404s():
 
 
 def test_detect_grug_managed_takes_priority_over_external():
-    """If both a Grug-managed AND external ruleset match, grug_managed wins."""
-    rulesets = [
-        {
-            "id": 10,
-            "name": "Grug — DoR",
-            "rules": [{"type": "required_status_checks", "parameters": {"required_status_checks": [{"context": "Grug — Definition of Ready"}]}}],
-        },
-        {
-            "id": 20,
-            "name": "CI Gate",
-            "rules": [{"type": "required_status_checks", "parameters": {"required_status_checks": [{"context": "Grug — Definition of Ready"}]}}],
-        },
-    ]
-    with patch("httpx.get", return_value=_ok_response(rulesets)):
+    """If both a Grug-managed AND external ruleset match, grug_managed wins.
+    Grug's own ruleset is listed FIRST, so detect_enforcement() short-
+    circuits there - the second ruleset's detail is never even fetched."""
+    summaries = [_summary(10, "Grug — DoR"), _summary(20, "CI Gate")]
+    detail_10 = _detail(10, "Grug — DoR", required_checks=["Grug — Definition of Ready"])
+    with patch("httpx.get", side_effect=[_ok_response(summaries), _ok_response(detail_10)]) as mock_get:
         result = detect_enforcement("tok", "o", "r", "main", "Grug — Definition of Ready")
     assert result == "grug_managed"
+    assert mock_get.call_count == 2  # list + ruleset 10's detail only - short-circuited before 20
 
 
 def test_detect_skips_rulesets_without_status_check_rules():
-    """Rulesets with no required_status_checks rules are ignored."""
-    rulesets = [
-        {
-            "id": 30,
-            "name": "Grug — Approvals",
-            "rules": [{"type": "pull_request", "parameters": {"required_approving_review_count": 1}}],
-        },
-    ]
-    rulesets_resp = _ok_response(rulesets)
+    """A ruleset with no required_status_checks rules (here: a pull_request
+    approval-count rule) doesn't satisfy the check-name match, so detection
+    falls through to the legacy check."""
+    summaries = [_summary(30, "Grug — Approvals")]
+    detail = _detail(30, "Grug — Approvals", rule_type="pull_request")
     legacy_resp = _ok_response({"contexts": []})
 
-    with patch("httpx.get", side_effect=[rulesets_resp, legacy_resp]):
+    with patch("httpx.get", side_effect=[_ok_response(summaries), _ok_response(detail), legacy_resp]):
         result = detect_enforcement("tok", "o", "r", "main", "Grug — Definition of Ready")
     assert result == "none"
 
