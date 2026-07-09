@@ -66,6 +66,7 @@ def test_pull_request_dispatches_when_allowlisted():
          patch("personas.tpm.persona.evaluate_pull_request") as mock_eval, \
          patch("personas.tpm.persona.publish_tpm_evaluation") as _mock_pub:
         mock_eval.return_value = type("R", (), {"passed": True})()
+        _mock_pub.return_value = {"persona": "tpm", "result": "pass"}
         out = dispatch("pull_request", _full_pr_payload())
     assert out["status"] == "dispatched"
     assert len(out["personas"]) == 1
@@ -93,6 +94,7 @@ def test_pull_request_fail_propagates():
          patch("personas.tpm.persona.evaluate_pull_request") as mock_eval, \
          patch("personas.tpm.persona.publish_tpm_evaluation") as _mock_pub:
         mock_eval.return_value = type("R", (), {"passed": False})()
+        _mock_pub.return_value = {"persona": "tpm", "result": "fail"}
         out = dispatch("pull_request", _full_pr_payload())
     assert out["personas"][0]["result"] == "fail"
 
@@ -108,21 +110,17 @@ def test_pull_request_blocked_when_not_allowlisted():
     mock_eval.assert_not_called()
 
 
-def test_pull_request_publish_failure_returns_skip_with_log_context():
-    """Peer-review CRITICAL (4x): publish_tpm_evaluation exceptions must
-    NOT propagate uncaught into main.py (which would 500 the webhook
-    with no install/repo/PR coords in the error log). The dispatcher
-    must catch HTTPStatusError + RequestError, log structured fields,
-    and return a `{"status": "skip", "reason": "publish_failed"}` dict."""
-    import httpx
-
-    fake_response = httpx.Response(status_code=502, request=httpx.Request("POST", "https://api.github.com/repos/githumps/infra/check-runs"))
-    publish_error = httpx.HTTPStatusError("502 Bad Gateway", request=fake_response.request, response=fake_response)
-
+def test_pull_request_publish_failure_surfaces_sentinel():
+    """Since #550, publish_tpm_evaluation never raises on a failed
+    publish — the shared seam classifies the failure (any exception in
+    the token/POST chain, not just httpx shapes), records the honest
+    errored Activity row, and returns the "publish_failed" sentinel.
+    The dispatch must surface it per-persona without short-circuiting."""
     with patch("dispatcher.is_install_allowlisted", return_value=True), \
          patch("dispatcher.is_persona_enabled", side_effect=lambda *a: _only_tpm(a[2])), \
          patch("personas.tpm.persona.evaluate_pull_request") as mock_eval, \
-         patch("personas.tpm.persona.publish_tpm_evaluation", side_effect=publish_error):
+         patch("personas.tpm.persona.publish_tpm_evaluation",
+               return_value={"persona": "tpm", "result": "publish_failed"}):
         mock_eval.return_value = type("R", (), {"passed": True})()
         out = dispatch("pull_request", _full_pr_payload())
 
@@ -132,19 +130,39 @@ def test_pull_request_publish_failure_returns_skip_with_log_context():
     assert out["personas"][0] == {"persona": "tpm", "result": "publish_failed"}
 
 
-def test_pull_request_publish_transport_error_returns_skip():
-    """Same shape as above for transport-level errors (timeout, DNS, connection-reset)."""
-    import httpx
-
+def test_pull_request_publish_failure_skips_ticket_compliance():
+    """Pre-#550 a failed publish raised past the ticket-compliance
+    advisory block, so the advisory never ran on that path. The seam
+    migration must preserve that flow: publish_failed -> return
+    immediately, run_ticket_compliance never called."""
     with patch("dispatcher.is_install_allowlisted", return_value=True), \
          patch("dispatcher.is_persona_enabled", side_effect=lambda *a: _only_tpm(a[2])), \
          patch("personas.tpm.persona.evaluate_pull_request") as mock_eval, \
          patch("personas.tpm.persona.publish_tpm_evaluation",
-               side_effect=httpx.ConnectTimeout("timed out", request=None)):
+               return_value={"persona": "tpm", "result": "publish_failed"}), \
+         patch("personas.tpm.ticket_compliance_run.run_ticket_compliance") as mock_compliance:
         mock_eval.return_value = type("R", (), {"passed": True})()
         out = dispatch("pull_request", _full_pr_payload())
 
-    assert out["personas"][0]["result"] == "publish_failed"
+    assert out["personas"][0] == {"persona": "tpm", "result": "publish_failed"}
+    mock_compliance.assert_not_called()
+
+
+def test_pull_request_publish_unexpected_raise_hits_final_guard():
+    """The httpx-shaped catch around publish is gone (#550) — an
+    UNEXPECTED raise from publish_tpm_evaluation (a bug, not a publish
+    failure: those are classified inside the seam) must still be
+    contained by the final guard, not propagate into main.py."""
+    with patch("dispatcher.is_install_allowlisted", return_value=True), \
+         patch("dispatcher.is_persona_enabled", side_effect=lambda *a: _only_tpm(a[2])), \
+         patch("personas.tpm.persona.evaluate_pull_request") as mock_eval, \
+         patch("personas.tpm.persona.publish_tpm_evaluation",
+               side_effect=RuntimeError("seam contract bug")):
+        mock_eval.return_value = type("R", (), {"passed": True})()
+        out = dispatch("pull_request", _full_pr_payload())
+
+    assert out["status"] == "dispatched"
+    assert out["personas"][0] == {"persona": "tpm", "result": "unhandled_error"}
 
 
 def test_pull_request_dispatches_all_personas_independently():
@@ -157,7 +175,8 @@ def test_pull_request_dispatches_all_personas_independently():
          patch("dispatcher.is_persona_enabled", return_value=True), \
          patch("dispatcher.get_repo_config", return_value={"code_reviewer_blocking": False}), \
          patch("personas.tpm.persona.evaluate_pull_request") as mock_eval, \
-         patch("personas.tpm.persona.publish_tpm_evaluation"), \
+         patch("personas.tpm.persona.publish_tpm_evaluation",
+               return_value={"persona": "tpm", "result": "pass"}), \
          patch("async_dispatch.enqueue_elder_review", return_value=True) as mock_enq, \
          patch("async_dispatch.enqueue_guard_review", return_value=True) as mock_guard_enq, \
          patch("async_dispatch.enqueue_smasher_review", return_value=True) as mock_smasher_enq, \
@@ -183,14 +202,12 @@ def test_pull_request_tpm_failure_does_not_skip_elder_enqueue():
     """One persona failing must not skip the other — independence is
     the load-bearing property. With #272, "Elder runs" means "Elder is
     enqueued": a TPM publish failure must not stop the self-invoke."""
-    import httpx
-
     with patch("dispatcher.is_install_allowlisted", return_value=True), \
          patch("dispatcher.is_persona_enabled", return_value=True), \
          patch("dispatcher.get_repo_config", return_value={"code_reviewer_blocking": False}), \
          patch("personas.tpm.persona.evaluate_pull_request") as mock_eval, \
          patch("personas.tpm.persona.publish_tpm_evaluation",
-               side_effect=httpx.ConnectError("dns down")), \
+               return_value={"persona": "tpm", "result": "publish_failed"}), \
          patch("async_dispatch.enqueue_elder_review", return_value=True) as mock_enq:
         mock_eval.return_value = type("R", (), {"passed": True})()
         out = dispatch("pull_request", _full_pr_payload())
@@ -230,7 +247,8 @@ def test_pull_request_elder_enqueue_failure_does_not_skip_tpm_status():
          patch("dispatcher.is_persona_enabled", return_value=True), \
          patch("dispatcher.get_repo_config", return_value={"code_reviewer_blocking": False}), \
          patch("personas.tpm.persona.evaluate_pull_request") as mock_eval, \
-         patch("personas.tpm.persona.publish_tpm_evaluation"), \
+         patch("personas.tpm.persona.publish_tpm_evaluation",
+               return_value={"persona": "tpm", "result": "pass"}), \
          patch("async_dispatch.enqueue_elder_review", return_value=False):
         mock_eval.return_value = type("R", (), {"passed": True})()
         out = dispatch("pull_request", _full_pr_payload())
@@ -248,7 +266,8 @@ def test_pull_request_threads_delivery_id_to_enqueue():
          patch("dispatcher.is_persona_enabled", return_value=True), \
          patch("dispatcher.get_repo_config", return_value={"code_reviewer_blocking": True}), \
          patch("personas.tpm.persona.evaluate_pull_request") as mock_eval, \
-         patch("personas.tpm.persona.publish_tpm_evaluation"), \
+         patch("personas.tpm.persona.publish_tpm_evaluation",
+               return_value={"persona": "tpm", "result": "pass"}), \
          patch("async_dispatch.enqueue_elder_review", return_value=True) as mock_enq:
         mock_eval.return_value = type("R", (), {"passed": True})()
         dispatch("pull_request", _full_pr_payload(), delivery_id="deliv-abc")
@@ -271,7 +290,8 @@ def test_pull_request_missing_repo_id_skips_elder_but_runs_tpm():
     with patch("dispatcher.is_install_allowlisted", return_value=True), \
          patch("dispatcher.is_persona_enabled", return_value=True), \
          patch("personas.tpm.persona.evaluate_pull_request") as mock_eval, \
-         patch("personas.tpm.persona.publish_tpm_evaluation"), \
+         patch("personas.tpm.persona.publish_tpm_evaluation",
+               return_value={"persona": "tpm", "result": "pass"}), \
          patch("async_dispatch.enqueue_elder_review") as mock_enq:
         mock_eval.return_value = type("R", (), {"passed": True})()
         out = dispatch("pull_request", payload)
@@ -290,7 +310,8 @@ def test_pull_request_code_reviewer_disabled_skips_only_elder():
     with patch("dispatcher.is_install_allowlisted", return_value=True), \
          patch("dispatcher.is_persona_enabled", side_effect=_only_tpm_enabled), \
          patch("personas.tpm.persona.evaluate_pull_request") as mock_eval, \
-         patch("personas.tpm.persona.publish_tpm_evaluation"), \
+         patch("personas.tpm.persona.publish_tpm_evaluation",
+               return_value={"persona": "tpm", "result": "pass"}), \
          patch("async_dispatch.enqueue_elder_review") as mock_enq:
         mock_eval.return_value = type("R", (), {"passed": True})()
         out = dispatch("pull_request", _full_pr_payload())
@@ -475,3 +496,24 @@ def test_repository_ruleset_skips_when_force_disable():
          }):
         out = dispatch("repository_ruleset", payload)
     assert out["status"] == "no_op" and "force_disable" in out["reason"]
+
+
+def test_pull_request_publish_success_runs_ticket_compliance():
+    """Positive twin of the skip test above: the #550 early return made
+    the #529 advisory invocation CONDITIONAL, and the advisory block
+    swallows its own errors - an inverted sentinel comparison would
+    silently kill compliance comments forever with no error anywhere.
+    Pin that a clean publish still invokes run_ticket_compliance."""
+    with patch("dispatcher.is_install_allowlisted", return_value=True), \
+         patch("dispatcher.is_persona_enabled", side_effect=lambda *a: _only_tpm(a[2])), \
+         patch("personas.tpm.persona.evaluate_pull_request") as mock_eval, \
+         patch("personas.tpm.persona.publish_tpm_evaluation",
+               return_value={"persona": "tpm", "result": "pass"}), \
+         patch("github_app_auth.with_install_token_retry", side_effect=lambda _i, fn: fn("tok")), \
+         patch("personas.tpm.ticket_compliance_run.run_ticket_compliance",
+               return_value={"status": "ok"}) as mock_compliance:
+        mock_eval.return_value = type("R", (), {"passed": True})()
+        out = dispatch("pull_request", _full_pr_payload())
+
+    assert out["personas"][0] == {"persona": "tpm", "result": "pass"}
+    mock_compliance.assert_called_once()

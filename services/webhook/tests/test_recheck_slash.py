@@ -224,3 +224,66 @@ def test_pr_fetch_transport_error_returns_skip(_no_install_lookups, mock_transpo
 
     assert out["status"] == "skip"
     assert "transport" in out["reason"]
+
+
+def test_recheck_unexpected_raise_contained_not_500(_no_install_lookups):
+    """CodeRabbit on #575: main.py forwards dispatch() exceptions into a
+    webhook 500 and GitHub does NOT auto-redeliver on 5xx — an
+    unexpected raise from evaluate/publish must be contained by the
+    recheck final guard (mirror of
+    test_pull_request_publish_unexpected_raise_hits_final_guard)."""
+    payload = _comment_payload(body="/grug recheck", sender_login="evan", pr_author="evan")
+    fake_pr = {"head": {"sha": "abc123"}, "body": "irrelevant"}
+
+    with patch("github_app_auth.with_install_token_retry", side_effect=lambda _i, fn: fn("tok")):
+        with patch("httpx.get") as get_mock, \
+             patch("personas.tpm.persona.evaluate_pull_request",
+                   side_effect=RuntimeError("evaluator regression")):
+            get_mock.return_value.raise_for_status = lambda: None
+            get_mock.return_value.json.return_value = fake_pr
+            out = d.dispatch("issue_comment", payload)
+
+    assert out == {"status": "skip", "trigger": "recheck", "reason": "unhandled_error"}
+
+
+def test_recheck_publish_failed_sentinel_returns_skip(_no_install_lookups):
+    """#550: publish no longer raises on a failed publish — the seam
+    returns the sentinel. The recheck path must map it to the same
+    skip/publish_failed shape it returned pre-migration (and the seam
+    already recorded the honest errored Activity row)."""
+    payload = _comment_payload(body="/grug recheck", sender_login="evan", pr_author="evan")
+    fake_pr = {"head": {"sha": "abc123"}, "body": "irrelevant"}
+
+    with patch("github_app_auth.with_install_token_retry", side_effect=lambda _i, fn: fn("tok")):
+        with patch("httpx.get") as get_mock, \
+             patch("personas.tpm.persona.evaluate_pull_request") as eval_mock, \
+             patch("personas.tpm.persona.publish_tpm_evaluation",
+                   return_value={"persona": "tpm", "result": "publish_failed"}):
+            eval_mock.return_value = type("R", (), {"passed": True})()
+            get_mock.return_value.raise_for_status = lambda: None
+            get_mock.return_value.json.return_value = fake_pr
+            out = d.dispatch("issue_comment", payload)
+
+    assert out == {"status": "skip", "trigger": "recheck", "reason": "publish_failed"}
+
+
+def test_recheck_resultless_map_lands_in_guard_not_500(_no_install_lookups):
+    """The result_map subscript sits INSIDE the recheck final guard on
+    purpose: a seam regression returning a map without "result" must
+    yield skip/unhandled_error, not a webhook 500 (GitHub does not
+    redeliver on 5xx). A refactor hoisting the subscript above the try
+    fails this test."""
+    payload = _comment_payload(body="/grug recheck", sender_login="evan", pr_author="evan")
+    fake_pr = {"head": {"sha": "abc123"}, "body": "irrelevant"}
+
+    with patch("github_app_auth.with_install_token_retry", side_effect=lambda _i, fn: fn("tok")):
+        with patch("httpx.get") as get_mock, \
+             patch("personas.tpm.persona.evaluate_pull_request") as eval_mock, \
+             patch("personas.tpm.persona.publish_tpm_evaluation",
+                   return_value={"persona": "tpm"}):
+            eval_mock.return_value = type("R", (), {"passed": True})()
+            get_mock.return_value.raise_for_status = lambda: None
+            get_mock.return_value.json.return_value = fake_pr
+            out = d.dispatch("issue_comment", payload)
+
+    assert out == {"status": "skip", "trigger": "recheck", "reason": "unhandled_error"}
