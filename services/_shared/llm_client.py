@@ -41,7 +41,7 @@ from secrets_loader import (
     get_poolside_api_key,
     get_prompt_experiment_mode,
 )
-from code_review_prompt import PromptVariant, VoiceSelection, build_system_prompt
+# Duplicate import of VoiceSelection added earlier in file
 
 log = logging.getLogger(f"{os.getenv('DD_SERVICE', 'grug')}.llm_client")
 
