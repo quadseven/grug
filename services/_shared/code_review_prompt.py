@@ -654,4 +654,4 @@ def build_system_prompt(
     # Voice selection — free tier gets caveman; paid sage has inversion
     voice_clause = _VOICE_YODA if voice == "sage" else _VOICE
     
-    return f"{preamble}\n\n{voice_clause}\n\nRULES:{learned}\n\n{_OUTPUT_CONTRACT}"
+    return f"{preamble}\n\n{voice_clause}\n\nRULES:\n{rules_block}{learned}\n\n{_OUTPUT_CONTRACT}"

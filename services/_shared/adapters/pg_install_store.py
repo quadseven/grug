@@ -301,17 +301,14 @@ def set_repo_config(
         raise TypeError(
             f"set_repo_config() persona flags must be bool or None; got {non_bool!r}"
         )
-    # Voice entitlement gate (#288 paid voice pack): sage is only for paid installs is only for paid installs
+    # Voice entitlement gate (#288 paid voice pack): sage is only for entitled installs
     if "elder_voice" in persona_flags and persona_flags["elder_voice"] == "sage":
-        from adapters.install_store import get_installation
-        install = get_installation(install_id)
-        if not install:
-            raise ValueError(f"Installation {install_id} not found")
-        # Check if the install is on a paid plan - for now, we treat all installs as
-        # eligible for the demo/beta sage voice. In production with Stripe billing,
-        # this would check `install.get("plan") == "paid"` or similar.
-        # For now, allow it but log that it's a free-tier usage of premium feature.
-        pass
+        from adapters.pg_install_store import is_install_allowlisted
+        if not is_install_allowlisted(install_id):
+            raise ValueError(
+                f"Elder sage voice requires an allowlisted (paid) installation. "
+                f"Install {install_id} is not entitled."
+            )
     
     now = datetime.now(timezone.utc).isoformat()
     updated_fields: dict[str, Any] = {
