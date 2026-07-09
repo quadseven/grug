@@ -17,6 +17,7 @@ from __future__ import annotations
 
 import logging
 import os
+from collections.abc import Sequence
 from dataclasses import dataclass
 
 from github_checks_client import CheckConclusion
@@ -61,7 +62,7 @@ _CHECK_NAME = "Grug — Definition of Ready"
 _ADVISORY_CHECKS: frozenset[str] = frozenset({"issue-link"})
 
 
-def _blocking_failures(results: list[CheckResult] | tuple[CheckResult, ...]) -> list[CheckResult]:
+def _blocking_failures(results: Sequence[CheckResult]) -> list[CheckResult]:
     """Failed BLOCKING checks — the one predicate behind title, rollup,
     and `findings_count`. Advisory checks (issue-link) don't gate, so
     they never count; keeping the predicate in one place stops the
