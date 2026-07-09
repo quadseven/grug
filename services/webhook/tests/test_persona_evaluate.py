@@ -458,3 +458,22 @@ def test_publish_tpm_records_chief_zero_findings_on_pass():
                 )
     assert recorded["findings_count"] == 0
     assert recorded["conclusion"] == "success"
+
+
+def test_tpm_evaluation_rejects_incoherent_passed_conclusion():
+    """The __post_init__ coherence invariant: passed and conclusion are
+    two encodings of the same rollup and feed the publish seam as
+    independent params - an incoherent instance would publish a red
+    check while returning "pass". Deleting __post_init__ fails this."""
+    with pytest.raises(ValueError, match="incoherent"):
+        persona.TpmEvaluation(
+            passed=True,
+            results=(CheckResult("why", False, "bad"),),
+            conclusion="failure",
+        )
+    with pytest.raises(ValueError, match="incoherent"):
+        persona.TpmEvaluation(
+            passed=False,
+            results=(CheckResult("why", True, "ok"),),
+            conclusion="success",
+        )

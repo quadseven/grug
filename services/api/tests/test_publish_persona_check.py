@@ -268,6 +268,13 @@ def test_publish_failure_log_carries_status_code_and_error_detail(monkeypatch, c
     )
     assert record.status_code == 500
     assert "500" in record.error or "Server Error" in record.error
+    # #550 stage-2 contract: the seam's total boundary absorbs exceptions
+    # that used to escape to per-persona final guards (which logged the
+    # traceback) - the failure line itself must carry the stack frame for
+    # DD error tracking, and head_sha so it stays self-sufficient even if
+    # INFO lines are sampled away.
+    assert record.exc_info is not None
+    assert record.head_sha == "sha"
 
 
 def test_record_check_verdict_raising_does_not_crash_publish(monkeypatch, caplog):
