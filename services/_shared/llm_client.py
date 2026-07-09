@@ -41,6 +41,7 @@ from secrets_loader import (
     get_poolside_api_key,
     get_prompt_experiment_mode,
 )
+from code_review_prompt import PromptVariant, VoiceSelection, build_system_prompt
 
 log = logging.getLogger(f"{os.getenv('DD_SERVICE', 'grug')}.llm_client")
 
@@ -379,12 +380,8 @@ def select_backend(installation_id: int) -> Backend:
 # placeholder one-paragraph prompt is gone — the rule set + good/bad
 # examples live in code_review_prompt.py (a sibling module, so no
 # import cycle) for A/B testing without touching the dispatch path.
-# Built once per variant at import (#191 A/B). v1 is the precision-biased
-# default; v2 the recall-biased experiment arm. Per-variant caching keeps the
-# prompt-cache key + DD experiment arm stable.
-_SYSTEM_PROMPTS: dict[PromptVariant, str] = {
-    v: build_system_prompt(v) for v in get_args(PromptVariant)
-}
+# Voice selection is now dynamic per review request (#288 paid voice pack).
+# prompt-cache key + DD experiment arm stable via variant only.
 
 
 def select_prompt_variant(installation_id: int) -> PromptVariant:
@@ -434,6 +431,7 @@ def _render_file_block(path: str, content: str | None) -> str:
 def _build_messages(
     hunks: list[Hunk],
     variant: PromptVariant,
+    voice: VoiceSelection,
     file_contents: dict[str, str] | None = None,
     cross_file_contents: dict[str, str] | None = None,
     runtime_context: str | None = None,
@@ -490,7 +488,8 @@ def _build_messages(
     # scrubbed. (Until now `_redact_secrets` guarded only the DD span payload.)
     # Per-repo team-learned practices (#527) append to the system prompt at
     # CALL time (repo-specific, so not part of the static per-variant cache).
-    system = _SYSTEM_PROMPTS[variant]
+    # Build system prompt with both variant and voice; cache per-variant+voice combo
+    system = build_system_prompt(variant=variant, voice=voice)
     if team_practices:
         system = f"{system}\n\n{team_practices}"
     # Few-shot exemplars (#538, #361 slice 3) append AFTER the practices:
@@ -885,6 +884,7 @@ def review_diff(
     file_contents: dict[str, str] | None = None,
     cross_file_contents: dict[str, str] | None = None,
     runtime_context: str | None = None,
+    voice: VoiceSelection = "caveman",
 ) -> LlmReviewResponse:
     """Send `hunks` to the round-robin-selected LLM and return findings.
 
@@ -897,6 +897,9 @@ def review_diff(
     `pr_context` (Optional dict) carries the PR coords for DD LLM Obs
     tags. Keys consumed: installation_id, repo, pr_number, head_sha.
     Omitted ⇒ traces still emit but without filterable PR tags.
+    
+    `voice` selects persona cadence: "caveman" (free tier default) or
+    "yoda" (paid voice pack). Technical tokens remain verbatim in both.
     """
     if not hunks:
         return LlmReviewResponse(kind="no_diff")
@@ -907,7 +910,7 @@ def review_diff(
     )
     variant = select_prompt_variant(installation_id)  # #191 A/B arm
     messages = _build_messages(
-        hunks, variant, file_contents, cross_file_contents, runtime_context,
+        hunks, variant, voice, file_contents, cross_file_contents, runtime_context,
         team_practices=_team_practices_block(pr_context),
         few_shot_examples=_few_shot_block(pr_context),
     )

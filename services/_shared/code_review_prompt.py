@@ -585,6 +585,28 @@ _VOICE = (
     "Grug.'"
 )
 
+# YODA VOICE — paid voice pack. Inverted cadence (object-subject-verb),
+# \"Hmm\"/\"yes\" particles, wise but distinct from caveman.
+_VOICE_YODA = (
+    "VOICE — write every `message` in the Yoda cadence: inverted word order "
+    "(object-subject-verb), subtle 'Hmm' or 'yes' particles, ancient wisdom. "
+    "Example: 'Masked, the real bug is, hmm — catch only OSError, you must.'"
+    # MANDATORY STRUCTURE
+    "STRUCTURE every `message` so the voice cannot slip: (1) OPEN with Yoda's "
+    "greeting — `Hmm...` or `Yes...`/`I sense...`; (2) the insight — object first, "
+    "then subject, then verb; (3) the remedy — exact fix; (4) CLOSE with "
+    "`Hmm.` or `yes`. Every message ends thus and NO plain prose begins. "
+    # Technical tokens unchanged
+    "The technical core is verbatim: identifiers, exception/class/function names, "
+    "file paths, and rule name spoken EXACTLY. Only the wrapper cadence shifts."
+)
+
+# Voice selection — free tier (default) vs paid yoda pack.
+# The default remains wise-caveman; yoda is the premium option.
+VoiceSelection = Literal["caveman", "yoda"]
+
+_DEFAULT_VOICE: VoiceSelection = "caveman"
+
 
 def _render_rule(r: ReviewRule) -> str:
     return (
@@ -595,7 +617,9 @@ def _render_rule(r: ReviewRule) -> str:
     )
 
 
-def build_system_prompt(variant: PromptVariant = "v1", extra_rules: str = "") -> str:
+def build_system_prompt(
+    variant: PromptVariant = "v1", extra_rules: str = "", voice: VoiceSelection = _DEFAULT_VOICE
+) -> str:
     """Compose the full Elder review system prompt from the rule set.
 
     `variant` selects the confidence-bias arm (#191 A/B): `v1`
@@ -603,11 +627,18 @@ def build_system_prompt(variant: PromptVariant = "v1", extra_rules: str = "") ->
     Deterministic per variant (rules render in declaration order) so the
     prompt-cache key + DD experiment arm stay stable. `extra_rules` (the
     per-repo #527 practices block) appends after the static RULES; it is
-    NOT part of the static per-variant cache (it is repo-specific)."""
+    NOT part of the static per-variant cache (it is repo-specific).
+    
+    `voice` selects the persona cadence: "caveman" (free, default) or 
+    "yoda" (paid voice pack). The technical tokens remain verbatim in both."""
     if variant not in _CONFIDENCE_CLAUSES:
         raise ValueError(
             f"unknown prompt variant {variant!r}; "
             f"expected one of {sorted(_CONFIDENCE_CLAUSES)}"
+        )
+    if voice not in get_args(VoiceSelection):
+        raise ValueError(
+            f"unknown voice {voice!r}; expected one of {get_args(VoiceSelection)}"
         )
     preamble = (
         _PREAMBLE_HEAD
@@ -620,4 +651,7 @@ def build_system_prompt(variant: PromptVariant = "v1", extra_rules: str = "") ->
     # a bounded, already-rendered block from best_practices.practices_block.
     # Empty for repos with no accepted-finding history yet.
     learned = f"\n\n{extra_rules}" if extra_rules else ""
-    return f"{preamble}\n\n{_VOICE}\n\nRULES:\n{rules_block}{learned}\n\n{_OUTPUT_CONTRACT}"
+    # Voice selection — free tier gets caveman; paid yoda has inversion
+    voice_clause = _VOICE_YODA if voice == "yoda" else _VOICE
+    
+    return f"{preamble}\n\n{voice_clause}\n\nRULES:{learned}\n\n{_OUTPUT_CONTRACT}"
