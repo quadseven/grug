@@ -37,6 +37,10 @@ ALLOWED_CALL_NAMES: frozenset[str] = frozenset({
     "check_why", "check_acceptance", "check_estimate", "check_scope_fence", "check_issue_link",
     # Pure dataclass constructor
     "TpmEvaluation",
+    # Pure list-comprehension predicate over CheckResults (#550 stage-1
+    # audit deduplicated it out of evaluate/_summary/publish into one
+    # helper; no IO, defined in this same module)
+    "_blocking_failures",
     # Stdlib pure builtins commonly used in rollup logic
     "tuple", "list", "len", "all", "any", "isinstance", "sorted", "filter", "map",
 })

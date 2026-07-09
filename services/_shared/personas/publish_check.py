@@ -118,15 +118,23 @@ def publish_persona_check(
         # silent Activity-row gap this seam exists to close (confirmed live
         # via runtime-trace audit on PR #562: each of those failure modes
         # left `record_check_verdict` never called before this fix).
+        # exc_info: pre-migration, non-httpx failures escaped to each
+        # persona's final guard which logged the full traceback; the
+        # seam's total boundary absorbs them first, so it must carry the
+        # traceback itself or DD error tracking loses the stack frame
+        # (#550 stage-2 audit). head_sha likewise: the failure line must
+        # be self-sufficient even if INFO logs are sampled away.
         log.error(
             publish_failed_log_name,
             extra={
                 "installation_id": installation_id,
                 "pr": pr_ref,
+                "head_sha": head_sha[:8],
                 "kind": type(e).__name__,
                 "status_code": getattr(getattr(e, "response", None), "status_code", None),
                 "error": str(e)[:500],
             },
+            exc_info=True,
         )
         publish_failed = True
 
