@@ -1,6 +1,5 @@
-"""Tests for the yoda voice pack feature (#288)."""
+"""Tests for the sage voice pack feature (#288)."""
 import pytest
-
 
 class TestSummaryMarkdownVoice:
     """Test that voice selection is respected in check-run output."""
@@ -21,7 +20,7 @@ class TestSummaryMarkdownVoice:
         # Caveman uses "Grug Elder" as subject
         assert "Grug Elder" in title or "Grug Elder" in summary
 
-    def test_summary_markdown_yoda_degraded(self) -> None:
+    def test_summary_markdown_sage_degraded(self) -> None:
         from personas.code_reviewer.dispatch import _summary_markdown
         from personas.code_reviewer.persona import CodeReviewEvaluation
         
@@ -32,9 +31,9 @@ class TestSummaryMarkdownVoice:
             conclusion="neutral",
         )
         
-        title, summary = _summary_markdown(evaluation, voice="yoda")
+        title, summary = _summary_markdown(evaluation, voice="sage")
         
-        # Yoda has distinct inverted cadence with Hmm/Yes
+        # Sage has distinct inverted cadence with Hmm/Yes
         assert "Hmm" in summary or "yes" in summary.lower() or "Yes" in summary
 
     def test_summary_markdown_caveman_no_findings(self) -> None:
@@ -52,7 +51,7 @@ class TestSummaryMarkdownVoice:
         
         assert "Grug" in title or "Grug" in summary
 
-    def test_summary_markdown_yoda_no_findings(self) -> None:
+    def test_summary_markdown_sage_no_findings(self) -> None:
         from personas.code_reviewer.dispatch import _summary_markdown
         from personas.code_reviewer.persona import CodeReviewEvaluation
         
@@ -63,7 +62,7 @@ class TestSummaryMarkdownVoice:
             conclusion="success",
         )
         
-        title, summary = _summary_markdown(evaluation, voice="yoda")
+        title, summary = _summary_markdown(evaluation, voice="sage")
         
-        # Yoda cadence
+        # Sage cadence
         assert "Nothing" in title or "nothing" in title.lower()

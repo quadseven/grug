@@ -255,7 +255,7 @@ def _summary_markdown(
     finding is never a silent gap.
     
     `voice` selects persona cadence: "caveman" (free tier default) or
-    "yoda" (paid voice pack). Static lines like degraded/no-findings
+    "sage" (paid voice pack). Static lines like degraded/no-findings
     messages also shift to match the selected voice."""
     held = (
         f"\n\nGrug held back {suppressed_count} weak finding(s) his judge doubted."
@@ -265,8 +265,8 @@ def _summary_markdown(
     
     if evaluation.degraded_reason:
         title = f"⚠️ Grug eyes clouded ({evaluation.degraded_reason})"
-        if voice == "yoda":
-            # Yoda cadence: object-subject-verb inversion
+        if voice == "sage":
+            # Sage cadence: object-subject-verb inversion
             summary = (
                 "Mist the real bug is, hmm — `"
                 f"{evaluation.degraded_reason}`. Clouded, Grug Elder eyes are. "
@@ -281,8 +281,8 @@ def _summary_markdown(
         return title, summary + held
     
     if not evaluation.findings:
-        if voice == "yoda":
-            # Yoda cadence
+        if voice == "sage":
+            # Sage cadence
             title = (
                 "✅ Nothing, code good"
                 if not suppressed_count
@@ -313,7 +313,7 @@ def _summary_markdown(
     )
     
     # Build voice-appropriate title
-    if voice == "yoda":
+    if voice == "sage":
         title = (
             f"❌ Trouble, Grug see — {blocking} blocking · "
             f"{len(evaluation.findings)} finding(s) in all"
@@ -344,8 +344,8 @@ def _consolidated_agent_prompt(evaluation: CodeReviewEvaluation) -> str:
     """One copy-paste prompt covering the findings (#553), deterministic
     and bounded. Truncates by whole findings and SAYS how many were cut -
     a silently-partial prompt would read as the complete work list."""
-    if voice == "yoda":
-        # Yoda cadence for static header
+    if voice == "sage":
+        # Sage cadence for static header
         header = [
             "Below each finding, address you must. Minimal keep every fix, "
             "scoped to the named line; beyond findings refactor not you shall."
@@ -358,8 +358,8 @@ def _consolidated_agent_prompt(evaluation: CodeReviewEvaluation) -> str:
 
     body: list[str] = []
     # Build voice-appropriate header text first
-    if voice == "yoda":
-        # Yoda cadence: object-subject-verb inversion
+    if voice == "sage":
+        # Sage cadence: object-subject-verb inversion
         header_text = (
             "Below each finding, address you must. Minimal keep every fix,"
             " scoped to the named line; beyond findings refactor not you shall."

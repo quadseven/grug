@@ -24,7 +24,7 @@ INST#installed_by_user_id). Admins bypass the ownership check.
 from __future__ import annotations
 
 import logging
-from typing import Any
+from typing import Any, Literal
 
 import httpx
 from fastapi import APIRouter, Depends, HTTPException, status
@@ -69,7 +69,7 @@ class RepoConfigPayload(BaseModel):
     smasher_enabled: bool | None = Field(default=None)
     walkthrough_enabled: bool | None = Field(default=None)
     dep_watch_enabled: bool | None = Field(default=None)
-    elder_voice: Literal[\"caveman\", \"yoda\"] | None = Field(default=None)
+    elder_voice: Literal["caveman", "sage"] | None = Field(default=None)
 
 
 class RerunRequest(BaseModel):

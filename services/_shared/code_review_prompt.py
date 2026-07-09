@@ -601,9 +601,9 @@ _VOICE_YODA = (
     "file paths, and rule name spoken EXACTLY. Only the wrapper cadence shifts."
 )
 
-# Voice selection — free tier (default) vs paid yoda pack.
-# The default remains wise-caveman; yoda is the premium option.
-VoiceSelection = Literal["caveman", "yoda"]
+# Voice selection — free tier (default) vs paid sage pack.
+# The default remains wise-caveman; sage is the premium option.
+VoiceSelection = Literal["caveman", "sage"]
 
 _DEFAULT_VOICE: VoiceSelection = "caveman"
 
@@ -630,7 +630,7 @@ def build_system_prompt(
     NOT part of the static per-variant cache (it is repo-specific).
     
     `voice` selects the persona cadence: "caveman" (free, default) or 
-    "yoda" (paid voice pack). The technical tokens remain verbatim in both."""
+    "sage" (paid voice pack). The technical tokens remain verbatim in both."""
     if variant not in _CONFIDENCE_CLAUSES:
         raise ValueError(
             f"unknown prompt variant {variant!r}; "
@@ -651,7 +651,7 @@ def build_system_prompt(
     # a bounded, already-rendered block from best_practices.practices_block.
     # Empty for repos with no accepted-finding history yet.
     learned = f"\n\n{extra_rules}" if extra_rules else ""
-    # Voice selection — free tier gets caveman; paid yoda has inversion
-    voice_clause = _VOICE_YODA if voice == "yoda" else _VOICE
+    # Voice selection — free tier gets caveman; paid sage has inversion
+    voice_clause = _VOICE_YODA if voice == "sage" else _VOICE
     
     return f"{preamble}\n\n{voice_clause}\n\nRULES:{learned}\n\n{_OUTPUT_CONTRACT}"

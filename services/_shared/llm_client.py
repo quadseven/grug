@@ -899,7 +899,7 @@ def review_diff(
     Omitted ⇒ traces still emit but without filterable PR tags.
     
     `voice` selects persona cadence: "caveman" (free tier default) or
-    "yoda" (paid voice pack). Technical tokens remain verbatim in both.
+    "sage" (paid voice pack). Technical tokens remain verbatim in both.
     """
     if not hunks:
         return LlmReviewResponse(kind="no_diff")
