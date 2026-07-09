@@ -591,6 +591,10 @@ def _handle_issue_comment(payload: dict[str, Any]) -> dict[str, str]:
             head_sha=head_sha,
             pr_number=int(pr_number),
         )
+        # Subscript INSIDE the guard: a seam regression returning a map
+        # without "result" must land here (skip + coords), not 500 the
+        # webhook past the guard (#550 stage-2 audit).
+        publish_result = result_map["result"]
     except Exception as e:  # noqa: BLE001 - final guard, same as webhook_dispatch
         log.error(
             "recheck_unhandled",
@@ -605,7 +609,7 @@ def _handle_issue_comment(payload: dict[str, Any]) -> dict[str, str]:
             exc_info=True,
         )
         return {"status": "skip", "trigger": "recheck", "reason": "unhandled_error"}
-    if result_map["result"] == PUBLISH_FAILED:
+    if publish_result == PUBLISH_FAILED:
         log.error(
             "recheck_publish_failed",
             extra={
