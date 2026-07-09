@@ -10,8 +10,14 @@ Imports stay inside the function: the ACK path pays import cost only for
 personas that actually dispatch, and the historical patch targets
 (`personas.tpm.persona.evaluate_pull_request` / `publish_tpm_evaluation`)
 keep intercepting.
-"""
 
+Since #550, `publish_tpm_evaluation` publishes via the shared
+`publish_persona_check` seam and returns the seam's result map instead of
+raising on a failed publish — so the httpx-shaped catch that used to live
+here is gone (the seam classifies every publish failure into the returned
+`"publish_failed"` sentinel and logs `tpm_publish_failed` itself), and the
+persona result is read straight off the returned map.
+"""
 from __future__ import annotations
 
 import logging
@@ -27,13 +33,13 @@ def dispatch_pull_request(ctx: PullRequestContext) -> dict[str, str]:
     exceptions so a future bug in `evaluate_pull_request` or an import-time
     failure of personas.tpm cannot propagate and starve the other personas.
     """
-    import httpx  # type: ignore
     try:
+        from personas.publish_check import PUBLISH_FAILED  # type: ignore
         from personas.tpm.persona import (  # type: ignore
             evaluate_pull_request, publish_tpm_evaluation,
         )
         evaluation = evaluate_pull_request(ctx.pr_body)
-        publish_tpm_evaluation(
+        result_map = publish_tpm_evaluation(
             evaluation,
             installation_id=ctx.installation_id,
             owner=ctx.owner,
@@ -41,6 +47,12 @@ def dispatch_pull_request(ctx: PullRequestContext) -> dict[str, str]:
             head_sha=ctx.head_sha,
             pr_number=ctx.pr_number,
         )
+        if result_map["result"] == PUBLISH_FAILED:
+            # Pre-#550 a failed publish raised past the compliance block,
+            # so the advisory never ran on this path — preserve that
+            # flow. The seam already logged `tpm_publish_failed` and
+            # recorded the errored Activity row.
+            return result_map
         # Ticket-compliance advisory (#529): best-effort, AFTER the DoR
         # verdict is published, in its own token+error boundary so a
         # compliance hiccup never affects the DoR result or the personas
@@ -61,24 +73,7 @@ def dispatch_pull_request(ctx: PullRequestContext) -> dict[str, str]:
                 "tpm_ticket_compliance_failed",
                 extra={"pr_number": ctx.pr_number, "kind": type(e).__name__},
             )
-        return {
-            "persona": "tpm",
-            "result": "pass" if evaluation.passed else "fail",
-        }
-    except (httpx.HTTPStatusError, httpx.RequestError) as e:
-        log.error(
-            "tpm_publish_failed",
-            extra={
-                "installation_id": ctx.installation_id,
-                "owner": ctx.owner,
-                "repo": ctx.repo_name,
-                "pr_number": ctx.pr_number,
-                "head_sha": ctx.head_sha[:8],
-                "kind": type(e).__name__,
-                "status": getattr(getattr(e, "response", None), "status_code", None),
-            },
-        )
-        return {"persona": "tpm", "result": "publish_failed"}
+        return result_map
     except Exception as e:  # noqa: BLE001 - final guard
         # Broad catch mirrors the async Elder worker's final-guard pattern
         # (async_dispatch.run_elder_job). Without it, an unexpected

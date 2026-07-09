@@ -464,6 +464,7 @@ def _handle_issue_comment(payload: dict[str, Any]) -> dict[str, str]:
     # commenters can't spam re-evaluations. Lazy imports keep cold-start
     # cheap when only PR events fire.
     from github_app_auth import with_install_token_retry  # type: ignore
+    from personas.publish_check import PUBLISH_FAILED  # type: ignore
     from personas.tpm.persona import evaluate_pull_request, publish_tpm_evaluation  # type: ignore
     import httpx  # type: ignore
 
@@ -568,10 +569,19 @@ def _handle_issue_comment(payload: dict[str, Any]) -> dict[str, str]:
             token_fn=lambda fn: with_install_token_retry(int(installation_id), fn),
         )
 
-    evaluation = evaluate_pull_request(pr_body)
-    # Same wrap pattern as the pull_request handler — peer-review CRITICAL.
+    # Final guard (CodeRabbit on #575): main.py forwards dispatch()
+    # exceptions straight into a webhook 500, and GitHub does NOT
+    # auto-redeliver on 5xx — an unexpected raise here would make
+    # /grug recheck silently do nothing. Mirror the pull_request
+    # handler's containment: log with coords, return a skip.
     try:
-        publish_tpm_evaluation(
+        evaluation = evaluate_pull_request(pr_body)
+        # publish_tpm_evaluation never raises on a failed publish since
+        # #550 — the seam classifies ANY publish failure into the
+        # returned "publish_failed" sentinel, logs it under
+        # `tpm_publish_failed` (kind/status_code/error fields live on
+        # that seam log), and records the honest errored Activity row.
+        result_map = publish_tpm_evaluation(
             evaluation,
             installation_id=int(installation_id),
             owner=owner,
@@ -579,7 +589,25 @@ def _handle_issue_comment(payload: dict[str, Any]) -> dict[str, str]:
             head_sha=head_sha,
             pr_number=int(pr_number),
         )
-    except (httpx.HTTPStatusError, httpx.RequestError) as e:
+        # Subscript INSIDE the guard: a seam regression returning a map
+        # without "result" must land here (skip + coords), not 500 the
+        # webhook past the guard (#550 stage-2 audit).
+        publish_result = result_map["result"]
+    except Exception as e:  # noqa: BLE001 - final guard, same as webhook_dispatch
+        log.error(
+            "recheck_unhandled",
+            extra={
+                "installation_id": int(installation_id),
+                "owner": owner,
+                "repo": repo_name,
+                "pr_number": int(pr_number),
+                "head_sha": head_sha[:8],
+                "kind": type(e).__name__,
+            },
+            exc_info=True,
+        )
+        return {"status": "skip", "trigger": "recheck", "reason": "unhandled_error"}
+    if publish_result == PUBLISH_FAILED:
         log.error(
             "recheck_publish_failed",
             extra={
@@ -588,8 +616,6 @@ def _handle_issue_comment(payload: dict[str, Any]) -> dict[str, str]:
                 "repo": repo_name,
                 "pr_number": int(pr_number),
                 "head_sha": head_sha[:8],
-                "kind": type(e).__name__,
-                "status": getattr(getattr(e, "response", None), "status_code", None),
             },
         )
         return {"status": "skip", "trigger": "recheck", "reason": "publish_failed"}
