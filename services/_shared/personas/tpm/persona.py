@@ -20,7 +20,7 @@ import os
 from dataclasses import dataclass
 
 from github_checks_client import CheckConclusion
-from personas.publish_check import publish_persona_check
+from personas.publish_check import PUBLISH_FAILED, publish_persona_check
 from personas.tpm.dor_checks import CheckResult, run_all
 
 
@@ -38,6 +38,20 @@ class TpmEvaluation:
     results: tuple[CheckResult, ...]
     conclusion: CheckConclusion
 
+    def __post_init__(self) -> None:
+        # passed and conclusion are two encodings of the same rollup —
+        # since #550 they feed the publish seam as INDEPENDENT params
+        # (`conclusion` -> the check-run + Activity row, `passed` ->
+        # `success_result`), so an incoherent hand-built instance would
+        # publish a red check while returning "pass" to the dispatcher.
+        # Same construction-boundary discipline as CheckRunResult's
+        # status/conclusion invariant.
+        if self.passed != (self.conclusion == "success"):
+            raise ValueError(
+                f"TpmEvaluation incoherent: passed={self.passed} but "
+                f"conclusion={self.conclusion!r}",
+            )
+
 # DD_SERVICE-derived namespace (grug-api / grug-webhook) — the same
 # convention every other shared module uses. Pre-extraction this was the
 # one hardcoded per-service divergence in the mirror set (ADR-0014).
@@ -47,9 +61,17 @@ _CHECK_NAME = "Grug — Definition of Ready"
 _ADVISORY_CHECKS: frozenset[str] = frozenset({"issue-link"})
 
 
+def _blocking_failures(results: list[CheckResult] | tuple[CheckResult, ...]) -> list[CheckResult]:
+    """Failed BLOCKING checks — the one predicate behind title, rollup,
+    and `findings_count`. Advisory checks (issue-link) don't gate, so
+    they never count; keeping the predicate in one place stops the
+    three call sites from drifting (#550 stage-1 audit)."""
+    return [r for r in results if not r.passed and r.name not in _ADVISORY_CHECKS]
+
+
 def _summary(results: list[CheckResult]) -> tuple[str, str]:
     """Build (title, summary) markdown for the check-run output."""
-    blocking = [r for r in results if not r.passed and r.name not in _ADVISORY_CHECKS]
+    blocking = _blocking_failures(results)
     title = (
         f"✅ DoR pass — all {len(results)} checks"
         if not blocking
@@ -74,7 +96,7 @@ def evaluate_pull_request(pr_body: str) -> TpmEvaluation:
     the result in `publish_tpm_evaluation(...)` to POST the check-run.
     """
     results = run_all(pr_body)
-    blocking = [r for r in results if not r.passed and r.name not in _ADVISORY_CHECKS]
+    blocking = _blocking_failures(results)
     conclusion: CheckConclusion = "success" if not blocking else "failure"
     return TpmEvaluation(
         passed=not blocking,
@@ -132,16 +154,13 @@ def publish_tpm_evaluation(
         conclusion=evaluation.conclusion,
         title=title,
         summary=summary,
-        findings_count=sum(
-            1 for r in evaluation.results
-            if not r.passed and r.name not in _ADVISORY_CHECKS
-        ),
+        findings_count=len(_blocking_failures(evaluation.results)),
         blocking=True,
         degraded_reason=None,
         success_result="pass" if evaluation.passed else "fail",
         publish_failed_log_name="tpm_publish_failed",
     )
-    if result_map["result"] != "publish_failed":
+    if result_map["result"] != PUBLISH_FAILED:
         # Static event name — DD monitors key on it. The failure-path
         # outcome log is the seam's `tpm_publish_failed` (same event name
         # the dispatcher emitted pre-migration), so `tpm_published` fires
