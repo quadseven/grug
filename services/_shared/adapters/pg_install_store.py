@@ -201,6 +201,10 @@ _DEFAULT_PERSONA_CONFIG = {
     "pulse_enabled": False,
     "smasher_enabled": False,  # execution tracer (#469): opt-in per repo
     "walkthrough_enabled": True,  # Teller PR-walkthrough comment (#554)
+}
+
+# Non-persona fields that need defaults (not in registry, not boolean flags).
+_DEFAULT_REPO_CONFIG = {
     "elder_voice": "caveman",  # voice pack: "caveman" (free) or "sage" (paid)
 }
 
@@ -231,11 +235,20 @@ def get_repo_config(install_id: int, repo_id: int) -> dict[str, Any]:
     # dict makes them flow through this read path with no edit here.
     item = _get_item(_inst_pk(install_id), _repo_sk(repo_id)) or {}
     rid = item.get("enforcement_ruleset_id")
+
+    # Start with persona flags from registry (boolean enable/blocking flags)
     cfg: dict[str, Any] = {
         flag: item.get(flag, default)
         for flag, default in _DEFAULT_PERSONA_CONFIG.items()
     }
-    # Voice should be "caveman" or "sage"; fall back to "caveman"
+
+    # Merge non-persona fields (like elder_voice) - fall back to defaults
+    for key, default in _DEFAULT_REPO_CONFIG.items():
+        val = item.get(key)
+        if val is not None:
+            cfg[key] = val
+
+    # Validate voice value and fallback to caveman
     if cfg.get("elder_voice") not in ("caveman", "sage"):
         cfg["elder_voice"] = "caveman"
     cfg["enforcement_ruleset_id"] = int(rid) if rid is not None else None

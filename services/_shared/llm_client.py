@@ -34,14 +34,13 @@ from typing import Any, Callable, Literal, Optional, TypedDict, get_args
 
 import httpx
 
-from code_review_prompt import PromptVariant, build_system_prompt
+from code_review_prompt import PromptVariant, VoiceSelection, build_system_prompt
 from review_types import EFFORTS, SEVERITIES, Effort, Severity
 from secrets_loader import (
     get_openrouter_api_key,
     get_poolside_api_key,
     get_prompt_experiment_mode,
 )
-# Duplicate import of VoiceSelection added earlier in file
 
 log = logging.getLogger(f"{os.getenv('DD_SERVICE', 'grug')}.llm_client")
 

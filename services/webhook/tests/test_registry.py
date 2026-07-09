@@ -46,7 +46,8 @@ def test_check_run_names_match_the_persona_modules():
 
 def test_default_config_matches_store_ssot():
     # The registry-derived defaults MUST equal the store's current
-    # _DEFAULT_PERSONA_CONFIG, so making the store generic later is drift-free.
+    # _DEFAULT_PERSONA_CONFIG (boolean persona enable/blocking flags only).
+    # Non-persona config fields like elder_voice live in a separate dict.
     from adapters.pg_install_store import _DEFAULT_PERSONA_CONFIG
     assert registry.default_persona_config() == _DEFAULT_PERSONA_CONFIG
 

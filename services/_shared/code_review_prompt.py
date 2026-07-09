@@ -585,10 +585,10 @@ _VOICE = (
     "Grug.'"
 )
 
-# YODA VOICE — paid voice pack. Inverted cadence (object-subject-verb),
-# \"Hmm\"/\"yes\" particles, wise but distinct from caveman.
-_VOICE_YODA = (
-    "VOICE — write every `message` in the Yoda cadence: inverted word order "
+# SAGE VOICE — paid voice pack. Inverted cadence (object-subject-verb),
+# "Hmm"/"yes" particles, ancient wisdom.
+_VOICE_SAGE = (
+    "VOICE — write every `message` in the sage cadence: inverted word order "
     "(object-subject-verb), subtle 'Hmm' or 'yes' particles, ancient wisdom. "
     "Example: 'Masked, the real bug is, hmm — catch only OSError, you must.'"
     # MANDATORY STRUCTURE
@@ -597,8 +597,8 @@ _VOICE_YODA = (
     "then subject, then verb; (3) the remedy — exact fix; (4) CLOSE with "
     "`Hmm.` or `yes`. Every message ends thus and NO plain prose begins. "
     # Technical tokens unchanged
-    "The technical core is verbatim: identifiers, exception/class/function names, "
-    "file paths, and rule name spoken EXACTLY. Only the wrapper cadence shifts."
+    "Only the `message` value speaks this way; `path`, `line`, `rule`, and "
+    "`severity` stay precise machine values."
 )
 
 # Voice selection — free tier (default) vs paid sage pack.
@@ -652,6 +652,6 @@ def build_system_prompt(
     # Empty for repos with no accepted-finding history yet.
     learned = f"\n\n{extra_rules}" if extra_rules else ""
     # Voice selection — free tier gets caveman; paid sage has inversion
-    voice_clause = _VOICE_YODA if voice == "sage" else _VOICE
+    voice_clause = _VOICE_SAGE if voice == "sage" else _VOICE
     
     return f"{preamble}\n\n{voice_clause}\n\nRULES:\n{rules_block}{learned}\n\n{_OUTPUT_CONTRACT}"
