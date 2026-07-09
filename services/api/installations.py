@@ -435,19 +435,22 @@ def update_repo_config(
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="repo not visible to install")
 
     previous_cfg = get_repo_config(install_id, repo_id)
-    cfg = set_repo_config(
-        install_id=install_id, repo_id=repo_id,
-        repo_full_name=full_name, tpm_enabled=body.tpm_enabled,
-        updated_by_user_id=user.github_user_id,
-        guard_enabled=body.guard_enabled,
-        guard_blocking=body.guard_blocking,
-        warder_enabled=body.warder_enabled,
-        pulse_enabled=body.pulse_enabled,
-        smasher_enabled=body.smasher_enabled,
-        walkthrough_enabled=body.walkthrough_enabled,
-        dep_watch_enabled=body.dep_watch_enabled,
-        elder_voice=body.elder_voice,
-    )
+    try:
+        cfg = set_repo_config(
+            install_id=install_id, repo_id=repo_id,
+            repo_full_name=full_name, tpm_enabled=body.tpm_enabled,
+            updated_by_user_id=user.github_user_id,
+            guard_enabled=body.guard_enabled,
+            guard_blocking=body.guard_blocking,
+            warder_enabled=body.warder_enabled,
+            pulse_enabled=body.pulse_enabled,
+            smasher_enabled=body.smasher_enabled,
+            walkthrough_enabled=body.walkthrough_enabled,
+            dep_watch_enabled=body.dep_watch_enabled,
+            elder_voice=body.elder_voice,
+        )
+    except ValueError as e:
+        raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail=str(e))
     log.info(
         "repo_config_updated",
         extra={

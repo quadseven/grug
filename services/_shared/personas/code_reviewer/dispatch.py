@@ -339,24 +339,13 @@ def _summary_markdown(
 
 
 # GitHub caps check-run summaries at 65536 chars...
+_CONSOLIDATED_PROMPT_BUDGET = 8000
 
-def _consolidated_agent_prompt(evaluation: CodeReviewEvaluation) -> str:
+def _consolidated_agent_prompt(evaluation: CodeReviewEvaluation, voice: str = "caveman") -> str:
     """One copy-paste prompt covering the findings (#553), deterministic
     and bounded. Truncates by whole findings and SAYS how many were cut -
     a silently-partial prompt would read as the complete work list."""
-    if voice == "sage":
-        # Sage cadence for static header
-        header = [
-            "Below each finding, address you must. Minimal keep every fix, "
-            "scoped to the named line; beyond findings refactor not you shall."
-        ]
-    else:  # caveman default
-        header = [
-            "Address each finding below. Keep every fix minimal and scoped to "
-            "the named line; do not refactor beyond the findings.",
-        ]
-
-    body: list[str] = []
+    
     # Build voice-appropriate header text first
     if voice == "sage":
         # Sage cadence: object-subject-verb inversion
@@ -369,7 +358,8 @@ def _consolidated_agent_prompt(evaluation: CodeReviewEvaluation) -> str:
             "Address each finding below. Keep every fix minimal and scoped to "
             "the named line; do not refactor beyond the findings."
         )
-    
+
+    body: list[str] = []
     used = len(header_text) + 1
     included = 0
     for f in evaluation.findings:
