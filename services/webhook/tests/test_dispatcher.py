@@ -496,3 +496,24 @@ def test_repository_ruleset_skips_when_force_disable():
          }):
         out = dispatch("repository_ruleset", payload)
     assert out["status"] == "no_op" and "force_disable" in out["reason"]
+
+
+def test_pull_request_publish_success_runs_ticket_compliance():
+    """Positive twin of the skip test above: the #550 early return made
+    the #529 advisory invocation CONDITIONAL, and the advisory block
+    swallows its own errors - an inverted sentinel comparison would
+    silently kill compliance comments forever with no error anywhere.
+    Pin that a clean publish still invokes run_ticket_compliance."""
+    with patch("dispatcher.is_install_allowlisted", return_value=True), \
+         patch("dispatcher.is_persona_enabled", side_effect=lambda *a: _only_tpm(a[2])), \
+         patch("personas.tpm.persona.evaluate_pull_request") as mock_eval, \
+         patch("personas.tpm.persona.publish_tpm_evaluation",
+               return_value={"persona": "tpm", "result": "pass"}), \
+         patch("github_app_auth.with_install_token_retry", side_effect=lambda _i, fn: fn("tok")), \
+         patch("personas.tpm.ticket_compliance_run.run_ticket_compliance",
+               return_value={"status": "ok"}) as mock_compliance:
+        mock_eval.return_value = type("R", (), {"passed": True})()
+        out = dispatch("pull_request", _full_pr_payload())
+
+    assert out["personas"][0] == {"persona": "tpm", "result": "pass"}
+    mock_compliance.assert_called_once()
