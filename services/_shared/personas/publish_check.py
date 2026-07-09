@@ -9,8 +9,8 @@ degraded/failed publish still leaves an honest, recomputable Activity row,
 never a silent gap — lives in ONE tested place instead of being re-derived
 per persona.
 
-This slice only ADDS the seam; no persona is migrated onto it yet (#550,
-#551, #552 do that). See DESIGN.md "Shared publish-and-record seam".
+Migration status per persona: see DESIGN.md "Shared publish-and-record
+seam" (kept there, not here, so this docstring cannot rot per-slice).
 """
 from __future__ import annotations
 
@@ -23,11 +23,15 @@ from github_checks_client import CheckConclusion, CheckRunResult, post_check_run
 
 log = logging.getLogger(f"{os.getenv('DD_SERVICE', 'grug')}.persona.publish_check")
 
-# Reserved: this is the seam's own internal failure sentinel (returned +
-# recorded when the check-run publish itself fails). A caller's own
-# `success_result` must never collide with it, or a clean publish becomes
-# indistinguishable from a real publish failure in the Activity row.
-_PUBLISH_FAILED_SENTINEL = "publish_failed"
+# Reserved: the seam's failure sentinel (returned + recorded when the
+# check-run publish itself fails). A caller's own `success_result` must
+# never collide with it, or a clean publish becomes indistinguishable
+# from a real publish failure in the Activity row. PUBLIC on purpose
+# (#550 stage-1 audit): every migrated persona compares the returned
+# `result` against this value — importing the constant instead of
+# re-typing the literal means a rename/typo cannot silently route
+# publish failures onto the success path.
+PUBLISH_FAILED = "publish_failed"
 
 
 def publish_persona_check(
@@ -70,17 +74,19 @@ def publish_persona_check(
 
     Raises:
         ValueError: if `success_result == "publish_failed"` — that string
-            is the seam's own internal failure sentinel and cannot be
-            reused as a caller's success signal. Also propagates uncaught
+            is the seam's reserved failure sentinel (exported as
+            `PUBLISH_FAILED`) and cannot be reused as a caller's success
+            signal. Also propagates uncaught
             from `CheckRunResult`'s own cross-field invariant (status vs.
             conclusion) — a caller-contract violation, checked before any
             network call, that should fail loud rather than be folded into
             a "publish_failed" result.
     """
-    if success_result == _PUBLISH_FAILED_SENTINEL:
+    if success_result == PUBLISH_FAILED:
         raise ValueError(
-            f"success_result cannot be {_PUBLISH_FAILED_SENTINEL!r} — that "
-            "string is this seam's own internal failure sentinel",
+            f"success_result cannot be {PUBLISH_FAILED!r} — that "
+            "string is this seam's reserved failure sentinel "
+            "(exported as PUBLISH_FAILED)",
         )
 
     full_repo = f"{owner}/{repo}"
@@ -113,15 +119,23 @@ def publish_persona_check(
         # silent Activity-row gap this seam exists to close (confirmed live
         # via runtime-trace audit on PR #562: each of those failure modes
         # left `record_check_verdict` never called before this fix).
+        # exc_info: pre-migration, non-httpx failures escaped to each
+        # persona's final guard which logged the full traceback; the
+        # seam's total boundary absorbs them first, so it must carry the
+        # traceback itself or DD error tracking loses the stack frame
+        # (#550 stage-2 audit). head_sha likewise: the failure line must
+        # be self-sufficient even if INFO logs are sampled away.
         log.error(
             publish_failed_log_name,
             extra={
                 "installation_id": installation_id,
                 "pr": pr_ref,
+                "head_sha": head_sha[:8],
                 "kind": type(e).__name__,
                 "status_code": getattr(getattr(e, "response", None), "status_code", None),
                 "error": str(e)[:500],
             },
+            exc_info=True,
         )
         publish_failed = True
 
@@ -164,5 +178,5 @@ def publish_persona_check(
 
     return {
         "persona": persona_key,
-        "result": _PUBLISH_FAILED_SENTINEL if publish_failed else success_result,
+        "result": PUBLISH_FAILED if publish_failed else success_result,
     }
