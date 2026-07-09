@@ -191,8 +191,9 @@ def test_evaluate_pull_request_is_pure_no_external_calls():
 # The seam (`personas.publish_check.publish_persona_check`) owns the
 # transport, so the patch targets are publish_check's imports. Its
 # post_check_run call is positional: (token, owner, repo, result,
-# external_id=...) — fakes must match or every test silently exercises
-# nothing.
+# external_id=...) — fakes must match, or the TypeError is swallowed by
+# the seam's total publish boundary and every publish surfaces as
+# publish_failed.
 
 def _seam_retry(install_id, fn):
     return fn("fake-token")

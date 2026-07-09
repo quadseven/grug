@@ -49,10 +49,9 @@ def dispatch_pull_request(ctx: PullRequestContext) -> dict[str, str]:
         )
         if result_map["result"] == PUBLISH_FAILED:
             # Pre-#550 a failed publish raised past the compliance block,
-            # so the advisory never ran on this path — preserve that flow
-            # (a broken Checks API makes the compliance comment-post
-            # pointless anyway). The seam already logged
-            # `tpm_publish_failed` and recorded the errored Activity row.
+            # so the advisory never ran on this path — preserve that
+            # flow. The seam already logged `tpm_publish_failed` and
+            # recorded the errored Activity row.
             return result_map
         # Ticket-compliance advisory (#529): best-effort, AFTER the DoR
         # verdict is published, in its own token+error boundary so a

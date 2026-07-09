@@ -9,9 +9,8 @@ degraded/failed publish still leaves an honest, recomputable Activity row,
 never a silent gap — lives in ONE tested place instead of being re-derived
 per persona.
 
-Migrated so far: Chief/tpm (#550 — both the pull_request dispatch and the
-/grug recheck path). Remaining: #551 (Warder + Elder cave-fallback), #552
-(the async-3). See DESIGN.md "Shared publish-and-record seam".
+Migration status per persona: see DESIGN.md "Shared publish-and-record
+seam" (kept there, not here, so this docstring cannot rot per-slice).
 """
 from __future__ import annotations
 
@@ -75,8 +74,9 @@ def publish_persona_check(
 
     Raises:
         ValueError: if `success_result == "publish_failed"` — that string
-            is the seam's own internal failure sentinel and cannot be
-            reused as a caller's success signal. Also propagates uncaught
+            is the seam's reserved failure sentinel (exported as
+            `PUBLISH_FAILED`) and cannot be reused as a caller's success
+            signal. Also propagates uncaught
             from `CheckRunResult`'s own cross-field invariant (status vs.
             conclusion) — a caller-contract violation, checked before any
             network call, that should fail loud rather than be folded into
@@ -85,7 +85,8 @@ def publish_persona_check(
     if success_result == PUBLISH_FAILED:
         raise ValueError(
             f"success_result cannot be {PUBLISH_FAILED!r} — that "
-            "string is this seam's own internal failure sentinel",
+            "string is this seam's reserved failure sentinel "
+            "(exported as PUBLISH_FAILED)",
         )
 
     full_repo = f"{owner}/{repo}"
