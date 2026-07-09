@@ -569,17 +569,21 @@ def _handle_issue_comment(payload: dict[str, Any]) -> dict[str, str]:
         )
 
     evaluation = evaluate_pull_request(pr_body)
-    # Same wrap pattern as the pull_request handler — peer-review CRITICAL.
-    try:
-        publish_tpm_evaluation(
-            evaluation,
-            installation_id=int(installation_id),
-            owner=owner,
-            repo=repo_name,
-            head_sha=head_sha,
-            pr_number=int(pr_number),
-        )
-    except (httpx.HTTPStatusError, httpx.RequestError) as e:
+    # Since #550 publish goes through the shared publish_persona_check
+    # seam: it no longer raises on a failed publish (the httpx catch that
+    # lived here is dead code now) — it classifies ANY publish failure
+    # into the returned "publish_failed" sentinel, logs it under
+    # `tpm_publish_failed` (kind/status_code/error fields live on that
+    # seam log now), and records the honest errored Activity row.
+    result_map = publish_tpm_evaluation(
+        evaluation,
+        installation_id=int(installation_id),
+        owner=owner,
+        repo=repo_name,
+        head_sha=head_sha,
+        pr_number=int(pr_number),
+    )
+    if result_map["result"] == "publish_failed":
         log.error(
             "recheck_publish_failed",
             extra={
@@ -588,8 +592,6 @@ def _handle_issue_comment(payload: dict[str, Any]) -> dict[str, str]:
                 "repo": repo_name,
                 "pr_number": int(pr_number),
                 "head_sha": head_sha[:8],
-                "kind": type(e).__name__,
-                "status": getattr(getattr(e, "response", None), "status_code", None),
             },
         )
         return {"status": "skip", "trigger": "recheck", "reason": "publish_failed"}

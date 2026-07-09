@@ -70,7 +70,8 @@ def test_toy_persona_dispatches_via_registry_only(monkeypatch):
          patch("dispatcher.is_persona_enabled", return_value=True), \
          patch("dispatcher.get_repo_config", return_value={"code_reviewer_blocking": False}), \
          patch("personas.tpm.persona.evaluate_pull_request") as mock_eval, \
-         patch("personas.tpm.persona.publish_tpm_evaluation"), \
+         patch("personas.tpm.persona.publish_tpm_evaluation",
+               return_value={"persona": "tpm", "result": "pass"}), \
          patch("async_dispatch.enqueue_elder_review", return_value=True):
         mock_eval.return_value = type("R", (), {"passed": True})()
         out = dispatch("pull_request", _full_pr_payload(), delivery_id="deliv-toy")
@@ -112,7 +113,8 @@ def test_toy_persona_exception_is_isolated(monkeypatch):
          patch("dispatcher.is_persona_enabled", return_value=True), \
          patch("dispatcher.get_repo_config", return_value={"code_reviewer_blocking": False}), \
          patch("personas.tpm.persona.evaluate_pull_request") as mock_eval, \
-         patch("personas.tpm.persona.publish_tpm_evaluation"), \
+         patch("personas.tpm.persona.publish_tpm_evaluation",
+               return_value={"persona": "tpm", "result": "pass"}), \
          patch("async_dispatch.enqueue_elder_review", return_value=True):
         mock_eval.return_value = type("R", (), {"passed": True})()
         out = dispatch("pull_request", _full_pr_payload())
@@ -138,7 +140,8 @@ def test_toy_persona_missing_module_is_isolated(monkeypatch):
          patch("dispatcher.is_persona_enabled", return_value=True), \
          patch("dispatcher.get_repo_config", return_value={"code_reviewer_blocking": False}), \
          patch("personas.tpm.persona.evaluate_pull_request") as mock_eval, \
-         patch("personas.tpm.persona.publish_tpm_evaluation"), \
+         patch("personas.tpm.persona.publish_tpm_evaluation",
+               return_value={"persona": "tpm", "result": "pass"}), \
          patch("async_dispatch.enqueue_elder_review", return_value=True):
         mock_eval.return_value = type("R", (), {"passed": True})()
         out = dispatch("pull_request", _full_pr_payload())
@@ -198,7 +201,8 @@ def test_toy_persona_missing_repo_policy_disabled_skips(monkeypatch):
          patch("dispatcher.is_install_allowlisted", return_value=True), \
          patch("dispatcher.is_persona_enabled", return_value=True), \
          patch("personas.tpm.persona.evaluate_pull_request") as mock_eval, \
-         patch("personas.tpm.persona.publish_tpm_evaluation"), \
+         patch("personas.tpm.persona.publish_tpm_evaluation",
+               return_value={"persona": "tpm", "result": "pass"}), \
          patch("async_dispatch.enqueue_elder_review") as mock_enq:
         mock_eval.return_value = type("R", (), {"passed": True})()
         out = dispatch("pull_request", payload)
@@ -223,7 +227,8 @@ def test_dispatch_leaves_payload_unmutated():
          patch("dispatcher.is_persona_enabled", return_value=True), \
          patch("dispatcher.get_repo_config", return_value={"code_reviewer_blocking": False}), \
          patch("personas.tpm.persona.evaluate_pull_request") as mock_eval, \
-         patch("personas.tpm.persona.publish_tpm_evaluation"), \
+         patch("personas.tpm.persona.publish_tpm_evaluation",
+               return_value={"persona": "tpm", "result": "pass"}), \
          patch("async_dispatch.enqueue_elder_review", return_value=True):
         mock_eval.return_value = type("R", (), {"passed": True})()
         out = dispatch("pull_request", payload)
@@ -264,7 +269,8 @@ def test_mutating_persona_cannot_corrupt_later_personas(monkeypatch):
          patch("dispatcher.is_persona_enabled", return_value=True), \
          patch("dispatcher.get_repo_config", return_value={"code_reviewer_blocking": False}), \
          patch("personas.tpm.persona.evaluate_pull_request") as mock_eval, \
-         patch("personas.tpm.persona.publish_tpm_evaluation"), \
+         patch("personas.tpm.persona.publish_tpm_evaluation",
+               return_value={"persona": "tpm", "result": "pass"}), \
          patch("async_dispatch.enqueue_elder_review", return_value=True) as mock_enq:
         mock_eval.return_value = type("R", (), {"passed": True})()
         out = dispatch("pull_request", payload)
@@ -299,7 +305,8 @@ def test_enqueue_failure_self_recovers_via_rerun_lane():
          patch("dispatcher.is_persona_enabled", return_value=True), \
          patch("dispatcher.get_repo_config", return_value={"code_reviewer_blocking": False}), \
          patch("personas.tpm.persona.evaluate_pull_request") as mock_eval, \
-         patch("personas.tpm.persona.publish_tpm_evaluation"), \
+         patch("personas.tpm.persona.publish_tpm_evaluation",
+               return_value={"persona": "tpm", "result": "pass"}), \
          patch("async_dispatch.enqueue_elder_review", return_value=False), \
          patch("async_dispatch.enqueue_guard_review", return_value=False), \
          patch("async_dispatch.enqueue_smasher_review", return_value=False), \
