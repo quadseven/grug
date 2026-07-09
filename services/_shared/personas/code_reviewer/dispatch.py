@@ -37,6 +37,7 @@ from github_reviews_client import (
 )
 from llm_client import Hunk as LlmHunk, LlmReviewResponse, review_diff
 from review_types import EFFORTS
+from adapters.install_store import get_repo_config
 from personas.code_reviewer.dedup import (
     dedup_findings, finding_key, parse_rule, prior_keys_from_comments,
     rule_marker,
@@ -243,7 +244,7 @@ def _to_llm_hunks(hunks: tuple[DiffHunk, ...]) -> list[LlmHunk]:
 
 
 def _summary_markdown(
-    evaluation: CodeReviewEvaluation, *, suppressed_count: int = 0,
+    evaluation: CodeReviewEvaluation, *, suppressed_count: int = 0, voice: str = "caveman"
 ) -> tuple[str, str]:
     """Render a (title, summary) pair for the check-run output.
 
@@ -252,29 +253,57 @@ def _summary_markdown(
     `suppressed_count` (#467) is how many weak findings the judge held back
     from publication - surfaced as a transparency line so a suppressed
     finding is never a silent gap.
-    """
+    
+    `voice` selects persona cadence: "caveman" (free tier default) or
+    "yoda" (paid voice pack). Static lines like degraded/no-findings
+    messages also shift to match the selected voice."""
     held = (
         f"\n\nGrug held back {suppressed_count} weak finding(s) his judge doubted."
         if suppressed_count
         else ""
     )
+    
     if evaluation.degraded_reason:
         title = f"⚠️ Grug eyes clouded ({evaluation.degraded_reason})"
-        return title, (
-            "Grug Elder could not see the diff this pass. The mist: "
-            f"`{evaluation.degraded_reason}`. Grug stay his club — this "
-            "only counsel, merge not blocked."
-        ) + held
+        if voice == "yoda":
+            # Yoda cadence: object-subject-verb inversion
+            summary = (
+                "Mist the real bug is, hmm — `"
+                f"{evaluation.degraded_reason}`. Clouded, Grug Elder eyes are. "
+                "Stay his club, Grug will — this only counsel, merge not blocked."
+            )
+        else:  # caveman default
+            summary = (
+                "Grug Elder could not see the diff this pass. The mist: "
+                f"`{evaluation.degraded_reason}`. Grug stay his club — this "
+                "only counsel, merge not blocked."
+            )
+        return title, summary + held
+    
     if not evaluation.findings:
-        title = (
-            "✅ Grug find nothing — code good"
-            if not suppressed_count
-            else "✅ Grug find nothing worth the club"
-        )
-        return title, (
-            "Grug Elder look long upon the diff and find nothing to fear. "
-            "Code walk steady. Grug nod."
-        ) + held
+        if voice == "yoda":
+            # Yoda cadence
+            title = (
+                "✅ Nothing, code good"
+                if not suppressed_count
+                else "✅ Worth the club, find nothing Grug did"
+            )
+            summary = (
+                "Long upon the diff, lookGrug Elder has. "
+                "Nothing to fear, find Grug. "
+                "Steady walk the code. Nod Grug."
+            )
+        else:  # caveman default
+            title = (
+                "✅ Grug find nothing — code good"
+                if not suppressed_count
+                else "✅ Grug find nothing worth the club"
+            )
+            summary = (
+                "Grug Elder look long upon the diff and find nothing to fear. "
+                "Code walk steady. Grug nod."
+            )
+        return title, summary + held
 
     severity_icon = {
         "critical": "🛑", "high": "❌", "medium": "⚠️", "low": "ℹ️",
@@ -282,10 +311,19 @@ def _summary_markdown(
     blocking = sum(
         1 for f in evaluation.findings if f.severity in ("high", "critical")
     )
-    title = (
-        f"❌ Grug see trouble — {blocking} blocking · "
-        f"{len(evaluation.findings)} finding(s) in all"
-    )
+    
+    # Build voice-appropriate title
+    if voice == "yoda":
+        title = (
+            f"❌ Trouble, Grug see — {blocking} blocking · "
+            f"{len(evaluation.findings)} finding(s) in all"
+        )
+    else:
+        title = (
+            f"❌ Grug see trouble — {blocking} blocking · "
+            f"{len(evaluation.findings)} finding(s) in all"
+        )
+    
     rows = ["| Severity | File | Line | Rule | Message |", "|---|---|---|---|---|"]
     for f in evaluation.findings:
         icon = severity_icon.get(f.severity, "•")
@@ -294,26 +332,45 @@ def _summary_markdown(
             f"`{f.rule_name}` | {_defused(f.message)} |"
         )
     table = "\n".join(rows)
-    return title, f"{table}{held}\n\n{_consolidated_agent_prompt(evaluation)}"
+    
+    # Build the consolidated prompt with voice support
+    final_block = _consolidated_agent_prompt(evaluation, voice=voice)
+    return title, f"{table}{held}\n\n{final_block}"
 
 
-# GitHub caps check-run summaries at 65536 chars; the findings table is
-# unbounded (message-length x count), so the consolidated prompt gets a
-# fixed budget well under the cap and truncates by WHOLE findings.
-_CONSOLIDATED_PROMPT_BUDGET = 8000
-
+# GitHub caps check-run summaries at 65536 chars...
 
 def _consolidated_agent_prompt(evaluation: CodeReviewEvaluation) -> str:
     """One copy-paste prompt covering the findings (#553), deterministic
     and bounded. Truncates by whole findings and SAYS how many were cut -
     a silently-partial prompt would read as the complete work list."""
-    header = [
-        "Address each finding below. Keep every fix minimal and scoped to "
-        "the named line; do not refactor beyond the findings.",
-    ]
+    if voice == "yoda":
+        # Yoda cadence for static header
+        header = [
+            "Below each finding, address you must. Minimal keep every fix, "
+            "scoped to the named line; beyond findings refactor not you shall."
+        ]
+    else:  # caveman default
+        header = [
+            "Address each finding below. Keep every fix minimal and scoped to "
+            "the named line; do not refactor beyond the findings.",
+        ]
 
     body: list[str] = []
-    used = sum(len(x) + 1 for x in header)
+    # Build voice-appropriate header text first
+    if voice == "yoda":
+        # Yoda cadence: object-subject-verb inversion
+        header_text = (
+            "Below each finding, address you must. Minimal keep every fix,"
+            " scoped to the named line; beyond findings refactor not you shall."
+        )
+    else:
+        header_text = (
+            "Address each finding below. Keep every fix minimal and scoped to "
+            "the named line; do not refactor beyond the findings."
+        )
+    
+    used = len(header_text) + 1
     included = 0
     for f in evaluation.findings:
         entry = f"- {f.file}:{f.line} [{f.severity}/{f.rule_name}] {f.message}"
@@ -330,7 +387,8 @@ def _consolidated_agent_prompt(evaluation: CodeReviewEvaluation) -> str:
             f"(+{cut} more finding(s) - see the findings table above)"
         )
     block = _details_block(
-        "Prompt for AI agents (all findings)", "\n".join(header + body)
+        f"Prompt for AI agents ({voice} voice)",
+        header_text + "\n\n" + "\n".join(body) if body else header_text
     )
     # Hard deterministic ceiling: fence growth (backtick-run + 1, twice)
     # and the wrapper are not in the per-entry budget, so cap the WHOLE
@@ -602,6 +660,10 @@ def dispatch_code_review(
     pull_number = int(pr["number"])
     head_sha = pr["head"]["sha"]
     installation_id = int(installation["id"])
+    
+    # Fetch repo config to get voice selection (#288 paid voice pack)
+    repo_config = get_repo_config(installation_id, int(repo.get("id", 0)))
+    voice = repo_config.get("elder_voice", "caveman")
 
     # DiffParseError → advisory neutral so a fetcher bug or GitHub
     # format drift cannot 500 the webhook.
@@ -713,6 +775,7 @@ def dispatch_code_review(
         file_contents=file_contents,
         cross_file_contents=cross_file_contents,
         runtime_context=runtime_context,
+        voice=voice,
         pr_context={
             "installation_id": installation_id,
             "repo": f"{owner}/{repo_name}",
@@ -791,7 +854,7 @@ def dispatch_code_review(
     # Both clients are independent — a 5xx on review post must not
     # skip the check-run post.
     conclusion, event = _publish_shape(evaluation, mode=mode)
-    title, summary = _summary_markdown(evaluation, suppressed_count=len(suppressed))
+    title, summary = _summary_markdown(evaluation, suppressed_count=len(suppressed), voice=voice)
     check_result = CheckRunResult(
         name=_CHECK_NAME,
         head_sha=head_sha,

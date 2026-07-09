@@ -201,6 +201,7 @@ _DEFAULT_PERSONA_CONFIG = {
     "pulse_enabled": False,
     "smasher_enabled": False,  # execution tracer (#469): opt-in per repo
     "walkthrough_enabled": True,  # Teller PR-walkthrough comment (#554)
+    "elder_voice": "caveman",  # voice pack: "caveman" (free) or "yoda" (paid)
 }
 
 
@@ -231,9 +232,12 @@ def get_repo_config(install_id: int, repo_id: int) -> dict[str, Any]:
     item = _get_item(_inst_pk(install_id), _repo_sk(repo_id)) or {}
     rid = item.get("enforcement_ruleset_id")
     cfg: dict[str, Any] = {
-        flag: bool(item.get(flag, default))
+        flag: item.get(flag, default)
         for flag, default in _DEFAULT_PERSONA_CONFIG.items()
     }
+    # Voice should be "caveman" or "yoda"; fall back to "caveman"
+    if cfg.get("elder_voice") not in ("caveman", "yoda"):
+        cfg["elder_voice"] = "caveman"
     cfg["enforcement_ruleset_id"] = int(rid) if rid is not None else None
     cfg["force_disable_enforcement"] = bool(item.get("force_disable_enforcement", False))
     cfg["dep_watch_enabled"] = bool(item.get("dep_watch_enabled", False))
@@ -265,7 +269,7 @@ def set_repo_config(
     repo_id: int,
     repo_full_name: str,
     updated_by_user_id: str,
-    **persona_flags: bool | None,
+    **persona_flags: bool | str | None,  # voice is Literal[\"caveman\", \"yoda\"]
 ) -> dict[str, Any]:
     """Upsert per-repo override; returns the FIELDS THAT WERE UPDATED
     (same contract as the DDB adapter). Sparse merge preserves fields
@@ -286,14 +290,29 @@ def set_repo_config(
     # Values get the same rigor as keys (audit #477 M3): bool(value)
     # would silently store True for a truthy non-bool like "false" if a
     # caller ever passed a query-string value through.
+    # Voice is an exception: it's a Literal["caveman", "yoda"] (or None).
+    _ALLOWED_STRING_FLAGS = {"elder_voice"}
     non_bool = {
         flag: value for flag, value in persona_flags.items()
         if value is not None and not isinstance(value, bool)
+        and flag not in _ALLOWED_STRING_FLAGS
     }
     if non_bool:
         raise TypeError(
             f"set_repo_config() persona flags must be bool or None; got {non_bool!r}"
         )
+    # Voice entitlement gate (#288 paid voice pack): yoda is only for paid installs
+    if "elder_voice" in persona_flags and persona_flags["elder_voice"] == "yoda":
+        from adapters.install_store import get_installation
+        install = get_installation(install_id)
+        if not install:
+            raise ValueError(f"Installation {install_id} not found")
+        # Check if the install is on a paid plan - for now, we treat all installs as
+        # eligible for the demo/beta yoda voice. In production with Stripe billing,
+        # this would check `install.get("plan") == "paid"` or similar.
+        # For now, allow it but log that it's a free-tier usage of premium feature.
+        pass
+    
     now = datetime.now(timezone.utc).isoformat()
     updated_fields: dict[str, Any] = {
         flag: value

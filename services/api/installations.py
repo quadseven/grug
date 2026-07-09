@@ -69,6 +69,7 @@ class RepoConfigPayload(BaseModel):
     smasher_enabled: bool | None = Field(default=None)
     walkthrough_enabled: bool | None = Field(default=None)
     dep_watch_enabled: bool | None = Field(default=None)
+    elder_voice: Literal[\"caveman\", \"yoda\"] | None = Field(default=None)
 
 
 class RerunRequest(BaseModel):
@@ -445,6 +446,7 @@ def update_repo_config(
         smasher_enabled=body.smasher_enabled,
         walkthrough_enabled=body.walkthrough_enabled,
         dep_watch_enabled=body.dep_watch_enabled,
+        elder_voice=body.elder_voice,
     )
     log.info(
         "repo_config_updated",
