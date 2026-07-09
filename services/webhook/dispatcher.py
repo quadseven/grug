@@ -576,13 +576,11 @@ def _handle_issue_comment(payload: dict[str, Any]) -> dict[str, str]:
     # handler's containment: log with coords, return a skip.
     try:
         evaluation = evaluate_pull_request(pr_body)
-        # Since #550 publish goes through the shared publish_persona_check
-        # seam: it no longer raises on a failed publish (the httpx catch
-        # that lived here is dead code now) — it classifies ANY publish
-        # failure into the returned "publish_failed" sentinel, logs it
-        # under `tpm_publish_failed` (kind/status_code/error fields live
-        # on that seam log now), and records the honest errored Activity
-        # row.
+        # publish_tpm_evaluation never raises on a failed publish since
+        # #550 — the seam classifies ANY publish failure into the
+        # returned "publish_failed" sentinel, logs it under
+        # `tpm_publish_failed` (kind/status_code/error fields live on
+        # that seam log), and records the honest errored Activity row.
         result_map = publish_tpm_evaluation(
             evaluation,
             installation_id=int(installation_id),
