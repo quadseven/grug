@@ -464,6 +464,7 @@ def _handle_issue_comment(payload: dict[str, Any]) -> dict[str, str]:
     # commenters can't spam re-evaluations. Lazy imports keep cold-start
     # cheap when only PR events fire.
     from github_app_auth import with_install_token_retry  # type: ignore
+    from personas.publish_check import PUBLISH_FAILED  # type: ignore
     from personas.tpm.persona import evaluate_pull_request, publish_tpm_evaluation  # type: ignore
     import httpx  # type: ignore
 
@@ -583,7 +584,7 @@ def _handle_issue_comment(payload: dict[str, Any]) -> dict[str, str]:
         head_sha=head_sha,
         pr_number=int(pr_number),
     )
-    if result_map["result"] == "publish_failed":
+    if result_map["result"] == PUBLISH_FAILED:
         log.error(
             "recheck_publish_failed",
             extra={
