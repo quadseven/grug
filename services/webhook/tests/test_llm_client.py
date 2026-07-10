@@ -229,12 +229,15 @@ def test_deep_review_uses_stronger_duplicate_explanation(monkeypatch) -> None:
     )
 
 
-def test_deep_review_one_backend_failure_is_partial_and_retryable(monkeypatch) -> None:
+def test_deep_review_one_backend_reply_is_a_complete_review(monkeypatch) -> None:
+    # The two deep backends are best-effort free tier: ONE reply is a complete
+    # review (never provisional/retryable), so an OpenRouter 402/5xx cannot
+    # block a review that Poolside answered.
     monkeypatch.setenv("GRUG_REVIEW_DEPTH", "deep")
 
     def respond(url, **kwargs):
         if "openrouter" in url:
-            return httpx.Response(500, json={"error": "down"})
+            return httpx.Response(402, json={"error": "Payment Required"})
         return httpx.Response(
             200,
             json=_openai_json_response(
@@ -246,8 +249,8 @@ def test_deep_review_one_backend_failure_is_partial_and_retryable(monkeypatch) -
     with patch.object(httpx, "post", side_effect=respond):
         out = review_diff([_hunk()], installation_id=1)
 
-    assert out.kind == "partial"
-    assert out.error
+    assert out.kind == "reviewed"
+    assert not out.error  # one backend answering is not an error
     assert out.backends_used == (Backend.POOLSIDE,)
     assert [finding.rule for finding in out.findings] == ["lost-error"]
 
