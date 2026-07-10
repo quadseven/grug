@@ -1,0 +1,20 @@
+# Lightweight dependencies for CI testing
+discord.py
+python-dotenv
+requests
+numpy<2
+google-generativeai
+google-api-python-client
+setuptools>=78.1.1
+
+# Multi-bot container dependencies (lightweight)
+fastapi>=0.104.0
+uvicorn[standard]>=0.24.0
+pydantic>=2.4.0
+watchdog>=3.0.0
+pyyaml>=6.0.1
+itsdangerous>=2.1.2
+
+# Skip heavy dependencies in CI - they're mocked in conftest.py
+# faiss-cpu==1.7.4
+# sentence-transformers>=2.2.2

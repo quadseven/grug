@@ -1,0 +1,4 @@
+pytest
+ruff
+pytest-asyncio
+pytest-xdist
