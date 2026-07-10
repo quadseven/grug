@@ -216,9 +216,7 @@ def test_claim_delivery_win_once_and_expired_takeover(pg):
     # have deleted the row; PG must treat expired as free).
     with store.get_pool().connection() as conn:
         conn.execute(
-            "UPDATE grug_kv SET data = jsonb_set("
-            "data, '{lease_expires_at}', "
-            "to_jsonb(EXTRACT(EPOCH FROM now())::bigint - 10)) "
+            "UPDATE grug_kv SET ttl = EXTRACT(EPOCH FROM now())::bigint - 10 "
             "WHERE pk = %s",
             (f"DELIVERY#{did}",),
         )

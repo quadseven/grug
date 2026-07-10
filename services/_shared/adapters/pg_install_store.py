@@ -1100,7 +1100,8 @@ def release_review_claim(
             """
             DELETE FROM grug_kv
             WHERE pk = %(pk)s AND sk = 'META'
-              AND (%(owner)s IS NULL OR data->>'review_claim_owner' = %(owner)s)
+              AND (CAST(%(owner)s AS text) IS NULL
+                   OR data->>'review_claim_owner' = %(owner)s)
             RETURNING pk
             """,
             {
