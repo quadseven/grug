@@ -96,6 +96,24 @@ def test_rerun_request_rejects_junk_persona_and_repo():
         inst.RerunRequest(repo="not-a-slug", pr_number=1, persona="elder")  # needs owner/name
 
 
+def test_rerun_request_accepts_teller_and_walkthrough():
+    # #581: the consumer re-runs Teller/walkthrough, so the request model must
+    # accept them - previously they 422'd, making the capability dead.
+    for persona in ("teller", "walkthrough"):
+        inst.RerunRequest(repo="o/r", pr_number=1, persona=persona)
+
+
+def test_every_rerunnable_persona_is_requestable():
+    # The #581 drift guard: no persona the consumer RE-RUNS may be rejected by
+    # the request model (that is the dead-capability class). Derived from the
+    # single shared source so the two can't diverge again.
+    from rerun_personas import RERUNNABLE, REQUESTABLE
+
+    assert RERUNNABLE <= REQUESTABLE
+    for persona in RERUNNABLE:
+        inst.RerunRequest(repo="o/r", pr_number=1, persona=persona)  # no 422
+
+
 # --- batch: rerun_all_errored (#306) --------------------------------------
 
 def _row(repo, pr, persona, errored=True):
