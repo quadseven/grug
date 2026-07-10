@@ -191,7 +191,7 @@ async def restart_bot(
         raise HTTPException(status_code=500, detail=str(e))
 
 
-@router.get("/{bot_id}/chat-settings")
+@router.get("/{bot_id}/chat-settings", dependencies=[Depends(admin_required)])
 async def get_bot_chat_settings(
     bot_id: str, server_id: str = "admin", bot_manager: BotManager = Depends(get_bot_manager)
 ):
@@ -240,7 +240,7 @@ async def get_bot_chat_settings(
     }
 
 
-@router.post("/{bot_id}/chat-frequency")
+@router.post("/{bot_id}/chat-frequency", dependencies=[Depends(admin_required)])
 async def set_bot_chat_frequency(
     bot_id: str, request: Dict[str, Union[str, int]], bot_manager: BotManager = Depends(get_bot_manager)
 ):
@@ -288,7 +288,7 @@ async def set_bot_chat_frequency(
     }
 
 
-@router.post("/{bot_id}/reset-activity")
+@router.post("/{bot_id}/reset-activity", dependencies=[Depends(admin_required)])
 async def reset_bot_activity(bot_id: str, bot_manager: BotManager = Depends(get_bot_manager)):
     """Reset activity tracking data for a bot."""
     bot = bot_manager.bots.get(bot_id)
@@ -315,7 +315,7 @@ async def reset_bot_activity(bot_id: str, bot_manager: BotManager = Depends(get_
     return {"message": "Bot activity data reset successfully", "bot_id": bot_id}
 
 
-@router.get("/{bot_id}/logs")
+@router.get("/{bot_id}/logs", dependencies=[Depends(admin_required)])
 async def get_bot_logs(bot_id: str):
     """Get logs for a specific bot."""
     try:

@@ -2,6 +2,7 @@
 
 import asyncio
 import os
+import secrets
 import signal
 from pathlib import Path
 
@@ -49,12 +50,13 @@ def create_app(bot_manager: BotManager, config_manager: ConfigManager) -> FastAP
     dependencies.set_bot_manager(bot_manager)
     dependencies.set_config_manager(config_manager)
 
-    # Get session secret from config manager or environment
-    session_secret = "grug-secret"  # default
+    # Session secret: NEVER ship a hardcoded default (a public repo would leak a
+    # forgeable signing key). Read it from config/env only.
+    session_secret = None
     if config_manager:
-        session_secret = config_manager.get_env_var("SESSION_SECRET_KEY", session_secret)
-    else:
-        session_secret = os.getenv("SESSION_SECRET", session_secret)
+        session_secret = config_manager.get_env_var("SESSION_SECRET_KEY", "") or None
+    if not session_secret:
+        session_secret = os.getenv("SESSION_SECRET") or None
 
     # Only add SessionMiddleware if OAuth is enabled
     disable_oauth = False
@@ -63,16 +65,31 @@ def create_app(bot_manager: BotManager, config_manager: ConfigManager) -> FastAP
     else:
         disable_oauth = os.getenv("DISABLE_OAUTH", "false").lower() == "true"
 
+    if not session_secret:
+        if disable_oauth:
+            # No login flow -> an ephemeral secret is fine (sessions reset on restart).
+            session_secret = secrets.token_urlsafe(32)
+        else:
+            # Fail closed: a login flow with an unset/guessable secret is unsafe.
+            raise RuntimeError(
+                "SESSION_SECRET (or SESSION_SECRET_KEY) must be set when OAuth is enabled"
+            )
+
     if not disable_oauth:
         app.add_middleware(SessionMiddleware, secret_key=session_secret)
 
-    # Add CORS middleware with optimizations
+    # CORS: restrict to a configured allowlist - never "*" with credentials.
+    allowed_origins = "http://localhost:8080"
+    if config_manager:
+        allowed_origins = config_manager.get_env_var("ALLOWED_ORIGINS", allowed_origins)
+    else:
+        allowed_origins = os.getenv("ALLOWED_ORIGINS", allowed_origins)
     app.add_middleware(
         CORSMiddleware,
-        allow_origins=["*"],  # Configure appropriately for production
+        allow_origins=[o.strip() for o in allowed_origins.split(",") if o.strip()],
         allow_credentials=True,
-        allow_methods=["GET", "POST", "PUT", "DELETE"],  # Specific methods only
-        allow_headers=["*"],
+        allow_methods=["GET", "POST", "PUT", "DELETE"],
+        allow_headers=["Content-Type", "Authorization"],
     )
 
     # Add gzip compression middleware
@@ -134,7 +151,7 @@ def create_app(bot_manager: BotManager, config_manager: ConfigManager) -> FastAP
         return FileResponse("web/admin.html")
 
     @app.get("/login")
-    async def login():
+    async def login(request: Request):
         # Check if OAuth is disabled
         disable_oauth = config_manager.get_env_var("DISABLE_OAUTH", "false").lower() == "true"
 
@@ -155,11 +172,16 @@ def create_app(bot_manager: BotManager, config_manager: ConfigManager) -> FastAP
         if not client_id or not redirect_uri:
             return {"error": "Discord OAuth not configured"}
 
+        # CSRF protection: a random `state` stored in the session and verified in
+        # the callback prevents a forged/replayed OAuth response.
+        state = secrets.token_urlsafe(32)
+        request.session["oauth_state"] = state
         params = {
             "client_id": client_id,
             "response_type": "code",
             "scope": "identify",
             "redirect_uri": redirect_uri,
+            "state": state,
         }
         url = "https://discord.com/api/oauth2/authorize?" + requests.compat.urlencode(params)
         return RedirectResponse(url)
@@ -169,6 +191,12 @@ def create_app(bot_manager: BotManager, config_manager: ConfigManager) -> FastAP
         code = request.query_params.get("code")
         if not code:
             return {"error": "Missing code"}
+
+        # CSRF: the `state` must match the one we stored at /login.
+        expected_state = request.session.pop("oauth_state", None)
+        received_state = request.query_params.get("state")
+        if not expected_state or received_state != expected_state:
+            return {"error": "Invalid OAuth state"}
 
         # Get Discord OAuth settings from config manager
         client_id = config_manager.get_env_var("DISCORD_CLIENT_ID")

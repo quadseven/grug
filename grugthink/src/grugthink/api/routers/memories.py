@@ -110,7 +110,7 @@ async def get_bot_memories(
         raise HTTPException(status_code=500, detail=f"Failed to get memories: {str(e)}")
 
 
-@router.post("/{bot_id}/memories")
+@router.post("/{bot_id}/memories", dependencies=[Depends(memory_manager_required)])
 async def add_bot_memory(bot_id: str, memory: Dict[str, str], bot_manager: BotManager = Depends(get_bot_manager)):
     """Add a new memory to a bot."""
     content = memory.get("content", "").strip()
@@ -153,7 +153,7 @@ async def add_bot_memory(bot_id: str, memory: Dict[str, str], bot_manager: BotMa
         raise HTTPException(status_code=500, detail=f"Failed to add memory: {str(e)}")
 
 
-@router.delete("/{bot_id}/memories")
+@router.delete("/{bot_id}/memories", dependencies=[Depends(memory_manager_required)])
 async def delete_bot_memory(bot_id: str, memory: Dict[str, str], bot_manager: BotManager = Depends(get_bot_manager)):
     """Delete a memory from a bot."""
     content = memory.get("content", "").strip()

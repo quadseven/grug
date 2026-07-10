@@ -115,7 +115,7 @@ async def get_api_keys(service: str, config_manager: ConfigManager = Depends(get
     return {key: "***REDACTED***" if value else None for key, value in keys.items()}
 
 
-@router.get("/settings")
+@router.get("/settings", dependencies=[Depends(admin_required)])
 async def get_settings(config_manager: ConfigManager = Depends(get_config_manager)):
     """Get current system settings for the Settings page."""
     try:
@@ -146,7 +146,7 @@ async def get_settings(config_manager: ConfigManager = Depends(get_config_manage
         raise HTTPException(status_code=500, detail=str(e))
 
 
-@router.put("/settings", response_model=Dict[str, str])
+@router.put("/settings", response_model=Dict[str, str], dependencies=[Depends(admin_required)])
 async def update_settings(request: Dict, config_manager: ConfigManager = Depends(get_config_manager)):
     """Update system settings from the Settings page."""
     try:
@@ -197,17 +197,30 @@ async def update_settings(request: Dict, config_manager: ConfigManager = Depends
         raise HTTPException(status_code=500, detail=str(e))
 
 
-@router.get("/ollama/models")
+@router.get("/ollama/models", dependencies=[Depends(admin_required)])
 async def get_ollama_models(url: str):
-    """Query Ollama server for available models (proxy to avoid CORS)."""
+    """Query an Ollama server for available models (proxy to avoid CORS).
+
+    SSRF hardening: this is admin-only (the primary control - only a trusted
+    dashboard admin can reach it), and the target must be a plain http(s) URL.
+    We deliberately do NOT block private/loopback addresses: Ollama legitimately
+    runs on localhost or an in-cluster host, so blocking those would break the
+    real use case. The error is generic so we don't leak the target or internals
+    back to the caller.
+    """
+    from urllib.parse import urlparse
+
+    parsed = urlparse(url)
+    if parsed.scheme not in ("http", "https") or not parsed.netloc:
+        raise HTTPException(status_code=400, detail="url must be a http(s) URL")
     try:
         import httpx
 
         async with httpx.AsyncClient() as client:
-            response = await client.get(f"{url}/api/tags", timeout=5.0)
+            response = await client.get(f"{url.rstrip('/')}/api/tags", timeout=5.0)
             response.raise_for_status()
             data = response.json()
             return {"models": [m["name"] for m in data.get("models", [])]}
     except Exception as e:
         log.error("Failed to query Ollama models", extra={"error": str(e), "url": url})
-        raise HTTPException(status_code=500, detail=f"Failed to query Ollama: {str(e)}")
+        raise HTTPException(status_code=502, detail="Failed to query the Ollama server")
