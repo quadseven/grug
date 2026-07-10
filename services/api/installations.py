@@ -40,6 +40,7 @@ from adapters.install_store import (
 from adapters.user_store import UserIdentity
 from auth.dependencies import require_authenticated
 from github_app_auth import with_install_token_retry
+from rerun_personas import requestable_pattern
 from review_types import verdict as derive_verdict
 
 log = logging.getLogger("grug.api.installations")
@@ -78,7 +79,10 @@ class RerunRequest(BaseModel):
     model_config = ConfigDict(extra="forbid")
     repo: str = Field(pattern=r"^[^/\s]+/[^/\s]+$")  # owner/name
     pr_number: int
-    persona: str = Field(pattern=r"^(elder|code_reviewer|chief|tpm|guard|smasher)$")
+    # Pattern derived from the shared REQUESTABLE set (rerun_personas) so it
+    # can't drift from the consumer's rerunnable set - this is what omitted
+    # teller/walkthrough and made Teller rerun a dead capability (#581).
+    persona: str = Field(pattern=requestable_pattern())
 
 
 def _ensure_can_access(install: dict[str, Any], user: UserIdentity) -> None:

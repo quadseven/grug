@@ -44,6 +44,12 @@ from personas.code_reviewer.snapshot import (
 from personas.guard.dispatch import dispatch_guard_review
 from personas.smasher.dispatch import dispatch_smasher_review
 from personas.walkthrough.dispatch import dispatch_walkthrough_review
+from rerun_personas import (
+    GUARD as _GUARD,
+    RERUNNABLE as _RERUNNABLE,
+    SMASHER as _SMASHER,
+    TELLER as _TELLER,
+)
 from rerun_queue import (
     ask_group_id as _ask_group_id,
     rerun_group_id as _rerun_group_id,
@@ -176,14 +182,11 @@ def enqueue_review(
         },
     )
 
-# Personas the re-run can drive today. The motivating case (the 2026-06 Elder
-# outage) is the LLM-driven code reviewer; the static TPM check doesn't error
-# from outages, so its re-run is a deliberate follow-up (logged + skipped here).
-_CODE_REVIEWER = frozenset({"elder", "code_reviewer"})
-_GUARD = frozenset({"guard"})
-_SMASHER = frozenset({"smasher"})
-_TELLER = frozenset({"teller", "walkthrough"})
-_RERUNNABLE = _CODE_REVIEWER | _GUARD | _SMASHER | _TELLER
+# Persona rerun sets + dispatch-routing groups come from the shared
+# rerun_personas module (imported at the top) so the API request validator and
+# this consumer cannot drift (#581): a rerunnable persona the request rejects
+# would be a dead capability - exactly the Teller bug that motivated the split.
+# The static TPM check is requestable but logged + skipped below (deliberate).
 
 
 def enqueue_ask(*, install_id: int, repo: str, pr_number: int, comment_id: int, question: str) -> None:
