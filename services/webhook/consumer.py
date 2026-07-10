@@ -4,7 +4,8 @@
 """SQS consumers for the k8s runtime (#368).
 
 This entrypoint long-polls `grug-cave-results.fifo` and
-`grug-rerun-jobs.fifo` (one thread each) and feeds each message to its
+`grug-rerun-jobs.fifo` (one cave thread plus a bounded rerun worker pool) and
+feeds each message to its
 per-queue handler, wrapped in the
 SAME `Records` event shape — the handlers and their tests are untouched.
 
@@ -12,7 +13,7 @@ Delivery semantics preserved per queue (mirrors the ESM config):
 
 - **rerun-jobs** (`rerun.handle_rerun_jobs`): the handler RAISES on a
   failed re-run. We then do NOT delete — the message reappears after the
-  queue's 420s visibility timeout and redrives to the DLQ after
+  queue's 900s fallback visibility timeout and redrives to the DLQ after
   maxReceiveCount=3, exactly like the ESM retry path.
 - **cave-results** (`cave_fallback.handle_fallback_result`): the handler
   never raises (logs + skips bad records), so every received message is
@@ -26,6 +27,7 @@ message and FIFO group ordering is preserved within each queue.
 
 from __future__ import annotations
 
+import json
 import logging
 import os
 import signal
@@ -58,6 +60,15 @@ _sqs_telemetry = boto3.client(
 # logs at a readable rate instead of hot-looping the pod CPU.
 _RECEIVE_ERROR_BACKOFF_S = 30.0
 
+# A deep Elder pass can outlive the queue's base visibility timeout. Review
+# messages therefore receive a renewable, per-message lease. The queue-level
+# timeout remains a fallback for a deploy race where IAM has not gained
+# ChangeMessageVisibility yet; normal rerun/ask messages keep that base lease.
+_REVIEW_VISIBILITY_TIMEOUT_S = 600
+_REVIEW_VISIBILITY_HEARTBEAT_S = 120.0
+_DEFAULT_RERUN_WORKERS = 4
+_MAX_RERUN_WORKERS = 16
+
 _stop = threading.Event()
 
 
@@ -71,6 +82,29 @@ class QueueSpec:
     url_env: str
     handler: Callable[[dict[str, Any]], Any]
     delete_on_error: bool
+    workers: int = 1
+
+
+@dataclass(frozen=True, slots=True)
+class _VisibilityHeartbeat:
+    stop: threading.Event
+    thread: threading.Thread
+
+
+def _rerun_workers() -> int:
+    """Bounded worker count so long reviews do not globally block the FIFO.
+
+    SQS still serializes each MessageGroupId. Review producers use a per-PR
+    group while operator asks/reruns retain their own groups, so unrelated work
+    can proceed without sacrificing ordering for one PR.
+    """
+    raw = os.getenv("GRUG_RERUN_WORKERS", str(_DEFAULT_RERUN_WORKERS))
+    try:
+        value = int(raw)
+    except ValueError:
+        log.warning("consumer_rerun_workers_invalid", extra={"value": raw})
+        return _DEFAULT_RERUN_WORKERS
+    return min(_MAX_RERUN_WORKERS, max(1, value))
 
 
 def _specs() -> list[QueueSpec]:
@@ -78,7 +112,7 @@ def _specs() -> list[QueueSpec]:
     only loads each handler's dependency graph once, and tests can patch
     the handler modules before the table is built."""
     from cave_fallback import handle_fallback_result
-    from rerun import handle_rerun_jobs
+    from rerun import handle_rerun_jobs  # type: ignore[attr-defined]
 
     return [
         QueueSpec(
@@ -86,6 +120,7 @@ def _specs() -> list[QueueSpec]:
             url_env="GRUG_RERUN_QUEUE_URL",
             handler=handle_rerun_jobs,
             delete_on_error=False,
+            workers=_rerun_workers(),
         ),
         QueueSpec(
             kind="cave-results",
@@ -117,6 +152,71 @@ def _esm_event(arn: str, message: dict[str, Any]) -> dict[str, Any]:
             }
         ]
     }
+
+
+def _is_durable_review(spec: QueueSpec, message: dict[str, Any]) -> bool:
+    """Return whether this message owns a potentially long Elder pass."""
+    if spec.kind != "rerun-jobs":
+        return False
+    try:
+        body = json.loads(str(message.get("Body", "")))
+    except json.JSONDecodeError:
+        return False
+    return isinstance(body, dict) and body.get("kind") == "review"
+
+
+def _extend_review_visibility(
+    queue_url: str, receipt: str, message_id: str,
+) -> bool:
+    try:
+        _sqs.change_message_visibility(
+            QueueUrl=queue_url,
+            ReceiptHandle=receipt,
+            VisibilityTimeout=_REVIEW_VISIBILITY_TIMEOUT_S,
+        )
+        return True
+    except Exception as e:  # noqa: BLE001 - queue base visibility remains fallback
+        log.warning(
+            "consumer_review_visibility_heartbeat_failed",
+            extra={"message_id": message_id, "kind": type(e).__name__},
+        )
+        return False
+
+
+def _review_visibility_loop(
+    queue_url: str,
+    receipt: str,
+    message_id: str,
+    stop: threading.Event,
+) -> None:
+    while not stop.wait(_REVIEW_VISIBILITY_HEARTBEAT_S):
+        _extend_review_visibility(queue_url, receipt, message_id)
+
+
+def _start_review_visibility_heartbeat(
+    queue_url: str, receipt: str, message_id: str,
+) -> _VisibilityHeartbeat | None:
+    """Start a renewable visibility lease, or use queue fallback on failure."""
+    if not _extend_review_visibility(queue_url, receipt, message_id):
+        return None
+    stop = threading.Event()
+    thread = threading.Thread(
+        target=_review_visibility_loop,
+        args=(queue_url, receipt, message_id, stop),
+        name="review-visibility-heartbeat",
+        daemon=True,
+    )
+    thread.start()
+    return _VisibilityHeartbeat(stop=stop, thread=thread)
+
+
+def _stop_review_visibility_heartbeat(
+    heartbeat: _VisibilityHeartbeat | None,
+) -> None:
+    if heartbeat is None:
+        return
+    heartbeat.stop.set()
+    heartbeat.thread.join(timeout=1.0)
 
 
 # --- owned queue-depth telemetry (#379) ------------------------------
@@ -279,6 +379,11 @@ def _poll_once(spec: QueueSpec, queue_url: str, arn: str) -> int:
         return 0
     message = messages[0]
     receipt = message.get("ReceiptHandle", "")
+    heartbeat = None
+    if receipt and _is_durable_review(spec, message):
+        heartbeat = _start_review_visibility_heartbeat(
+            queue_url, receipt, str(message.get("MessageId", "")),
+        )
     delete = True
     try:
         spec.handler(_esm_event(arn, message))
@@ -293,6 +398,8 @@ def _poll_once(spec: QueueSpec, queue_url: str, arn: str) -> int:
                 "redrive": not delete,
             },
         )
+    finally:
+        _stop_review_visibility_heartbeat(heartbeat)
     if delete and receipt:
         try:
             _sqs.delete_message(QueueUrl=queue_url, ReceiptHandle=receipt)
@@ -312,6 +419,22 @@ def _consume(spec: QueueSpec) -> None:
     while not _stop.is_set():
         _poll_once(spec, queue_url, arn)
     log.info("consumer_stopped", extra={"queue": spec.kind})
+
+
+def _consumer_threads(specs: list[QueueSpec]) -> list[threading.Thread]:
+    """Build one poll thread per configured queue worker."""
+    threads: list[threading.Thread] = []
+    for spec in specs:
+        for worker in range(spec.workers):
+            suffix = f"-{worker + 1}" if spec.workers > 1 else ""
+            threads.append(
+                threading.Thread(
+                    target=_consume,
+                    args=(spec,),
+                    name=f"consume-{spec.kind}{suffix}",
+                )
+            )
+    return threads
 
 
 def _warm_trace_writer() -> None:
@@ -340,7 +463,7 @@ def _warm_trace_writer() -> None:
         log.debug("trace_writer_warmup_skipped_no_ddtrace")
         return
     try:
-        with ddtrace.tracer.trace("grug.consumer.startup"):
+        with ddtrace.tracer.trace("grug.consumer.startup"):  # type: ignore
             pass
     except Exception:  # noqa: BLE001 - telemetry is never worth crashing on
         log.warning("trace_writer_warmup_failed", exc_info=True)
@@ -403,7 +526,7 @@ def _flush_tracer() -> None:
     except ImportError:
         log.debug("trace_flush_skipped_no_ddtrace")
         return
-    ddtrace.tracer.flush()
+    ddtrace.tracer.flush()  # type: ignore
 
 
 def _startup_check() -> None:
@@ -465,10 +588,7 @@ def main() -> None:
     signal.signal(signal.SIGTERM, _terminate)
     signal.signal(signal.SIGINT, _terminate)
 
-    threads = [
-        threading.Thread(target=_consume, args=(spec,), name=f"consume-{spec.kind}")
-        for spec in _specs()
-    ]
+    threads = _consumer_threads(_specs())
     for t in threads:
         t.start()
 

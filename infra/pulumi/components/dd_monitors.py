@@ -588,24 +588,23 @@ def create_all(
     # 3b) Async persona offload failures (#272 Elder, #466 Guard, #469 Smasher).
     #     The async personas run off the ACK path; if an enqueue throttles
     #     (`*_enqueue_failed`) or an async worker crashes (`*_job_unhandled`),
-    #     that run is
-    #     DROPPED — by design we don't sync-fall-back (it would re-block the
-    #     <10s ACK) and rely on the next push re-triggering. That "drop +
-    #     re-trigger" is only safe if the drop is VISIBLE, so alert on any
-    #     occurrence. (The duplicate-skip + claim-fail-open paths are NOT
-    #     errors and are excluded.)
+    #     local async run is dropped. Durable Elder enqueue failures make the
+    #     webhook delivery fail so the 15-minute replay poller can recover it;
+    #     the alert still needs the historical elder_enqueue_failed event name.
+    #     Other local async personas rely on their self-recovery/next event.
     elder_offload_fail = datadog.Monitor(
         "grug-webhook-elder-offload-fail",
         type="log alert",
         name="[grug-webhook] Async persona offload failures > 0 (15min)",
         message=(
             f"{notify_handle}\n"
-            "An async persona run was DROPPED (Elder/Guard enqueue or worker) OR "
+            "An async persona handoff failed (Elder/Guard enqueue or worker) OR "
             "the in-cluster Cave secret judge failed closed (#439 - secret "
-            "candidates suppressed this pass, never sent to SaaS) - "
-            "the async path — either the enqueue failed or the async worker "
-            "hit an unhandled error. It will not post until the PR is pushed "
-            "again. Check grug-webhook logs for the delivery_id.\n"
+            "candidates suppressed this pass, never sent to SaaS). "
+            "Durable Elder enqueue failures are replayed "
+            "by the 15-minute delivery poller; local async failures use their "
+            "self-recovery path or the next PR event. Check grug-webhook logs "
+            "for the delivery_id.\n"
             "Runbook: docs/RUNBOOK.md#elder-async-offload"
         ),
         query=(

@@ -7,7 +7,8 @@ skipped (not retried); an infra failure RAISES so the ESM retries → DLQ.
 from __future__ import annotations
 
 import json
-from unittest.mock import MagicMock, patch
+import threading
+from unittest.mock import ANY, MagicMock, patch
 
 import httpx
 import pytest
@@ -25,15 +26,538 @@ def _event(*bodies) -> dict:
     return {"Records": [{"eventSource": "aws:sqs", "body": b} for b in bodies]}
 
 
+def _pr_data(
+    head_sha="abc123",
+    repo_id=222,
+    *,
+    base_sha="base-sha",
+    title="Improve review depth",
+    body="Closes #6. Preserve old fallback behavior.",
+    state="open",
+    draft=False,
+):
+    return {
+        "number": 7,
+        "title": title,
+        "body": body,
+        "state": state,
+        "draft": draft,
+        "user": {"login": "evan"},
+        "head": {"sha": head_sha},
+        "base": {"sha": base_sha, "repo": {"id": repo_id}},
+    }
+
+
 def _pr_response(head_sha="abc123", repo_id=222):
     pr = MagicMock(spec=httpx.Response)
     pr.raise_for_status = MagicMock()
-    pr.json = MagicMock(return_value={
-        "number": 7,
-        "head": {"sha": head_sha},
-        "base": {"repo": {"id": repo_id}},
-    })
+    pr.json = MagicMock(return_value=_pr_data(head_sha=head_sha, repo_id=repo_id))
     return pr
+
+
+def _patch_hot_claims(
+    monkeypatch,
+    *,
+    status="acquired",
+    release_result=True,
+    complete_result=True,
+):
+    acquire = MagicMock(return_value=status)
+    complete = MagicMock(return_value=complete_result)
+    release = MagicMock(return_value=release_result)
+    monkeypatch.setattr("adapters.install_store.acquire_review_claim", acquire)
+    monkeypatch.setattr("adapters.install_store.complete_review_claim", complete)
+    monkeypatch.setattr("adapters.install_store.release_review_claim", release)
+    return acquire, complete, release
+
+
+def test_review_claim_heartbeat_renews_until_stopped(monkeypatch):
+    renewed = threading.Event()
+
+    def renew(**kwargs):
+        renewed.set()
+        return True
+
+    monkeypatch.setattr("adapters.install_store.renew_review_claim", renew)
+    monkeypatch.setattr(rerun, "_REVIEW_CLAIM_HEARTBEAT_SECONDS", 0.001)
+    heartbeat = rerun._start_review_claim_heartbeat({
+        "install_id": 11,
+        "repo": "myorg/myrepo",
+        "pr_number": 7,
+        "persona": "code_reviewer",
+        "head_sha": "snapshot",
+        "owner_token": "worker",
+    })
+
+    assert renewed.wait(1.0)
+    assert rerun._stop_review_claim_heartbeat(heartbeat) is True
+
+
+def test_review_claim_heartbeat_surfaces_lost_ownership(monkeypatch):
+    attempted = threading.Event()
+
+    def renew(**kwargs):
+        attempted.set()
+        return False
+
+    monkeypatch.setattr("adapters.install_store.renew_review_claim", renew)
+    monkeypatch.setattr(rerun, "_REVIEW_CLAIM_HEARTBEAT_SECONDS", 0.001)
+    heartbeat = rerun._start_review_claim_heartbeat({
+        "install_id": 11,
+        "repo": "myorg/myrepo",
+        "pr_number": 7,
+        "persona": "code_reviewer",
+        "head_sha": "snapshot",
+        "owner_token": "worker",
+    })
+
+    assert attempted.wait(1.0)
+    heartbeat.thread.join(timeout=1.0)
+    assert rerun._stop_review_claim_heartbeat(heartbeat) is False
+
+
+def test_enqueue_review_is_snapshot_scoped_and_carries_quiet_window(monkeypatch):
+    sent = {}
+    monkeypatch.setattr(rerun, "_RERUN_QUEUE_URL", "https://sqs.example/review.fifo")
+    monkeypatch.setattr(
+        rerun._sqs, "send_message", lambda **kwargs: sent.update(kwargs),
+    )
+
+    rerun.enqueue_review(
+        install_id=11,
+        repo="myorg/myrepo",
+        pr_number=7,
+        requested_base_sha="base-123",
+        requested_head_sha="head-123",
+        requested_title="Review intent",
+        requested_body="Preserve compatibility.",
+        settle_seconds=90,
+    )
+
+    body = json.loads(sent["MessageBody"])
+    assert body["kind"] == "review"
+    assert body["requested_head_sha"] == "head-123"
+    expected_snapshot_id = rerun.review_snapshot_id(
+        base_sha="base-123",
+        head_sha="head-123",
+        title="Review intent",
+        body="Preserve compatibility.",
+    )
+    assert body["requested_snapshot_id"] == expected_snapshot_id
+    assert body["settle_seconds"] == 90
+    assert sent["MessageDeduplicationId"] == rerun._review_dedup_id(
+        11, "myorg/myrepo", 7, expected_snapshot_id,
+    )
+    assert sent["MessageGroupId"] == rerun._review_group_id(
+        11, "myorg/myrepo", 7,
+    )
+    assert len(sent["MessageDeduplicationId"]) <= 128
+    assert len(sent["MessageGroupId"]) <= 128
+
+
+def test_review_dedup_id_is_bounded_and_snapshot_scoped_for_long_repo_names():
+    repo = f"{'o' * 39}/{'r' * 100}"
+    first = rerun._review_dedup_id(11, repo, 7, "head-1")
+    second = rerun._review_dedup_id(11, repo, 7, "head-2")
+
+    assert len(first) <= 128
+    assert first != second
+
+
+def test_review_group_is_bounded_per_pr_not_global_per_installation():
+    repo = f"{'o' * 39}/{'r' * 100}"
+    first = rerun._review_group_id(11, repo, 7)
+    other_pr = rerun._review_group_id(11, repo, 8)
+
+    assert len(first) <= 128
+    assert first != other_pr
+
+
+def test_rerun_and_ask_use_separate_bounded_workload_groups(monkeypatch):
+    sent = []
+    monkeypatch.setattr(rerun, "_RERUN_QUEUE_URL", "https://sqs.example/jobs.fifo")
+    monkeypatch.setattr(
+        rerun._sqs, "send_message", lambda **kwargs: sent.append(kwargs),
+    )
+
+    rerun.enqueue_rerun(
+        install_id=11, repo="myorg/myrepo", pr_number=7, persona="elder",
+    )
+    rerun.enqueue_ask(
+        install_id=11,
+        repo="myorg/myrepo",
+        pr_number=7,
+        comment_id=99,
+        question="What changed?",
+    )
+
+    rerun_group = sent[0]["MessageGroupId"]
+    ask_group = sent[1]["MessageGroupId"]
+    assert rerun_group == rerun._rerun_group_id(11, "myorg/myrepo", 7, "elder")
+    assert ask_group == rerun._ask_group_id(11, "myorg/myrepo", 7)
+    assert rerun_group != ask_group
+    assert len(rerun_group) <= 128
+    assert len(ask_group) <= 128
+
+
+def test_review_snapshot_identity_changes_for_same_head_intent_or_base_edit():
+    common = {
+        "head_sha": "same-head",
+        "base_sha": "base-1",
+        "title": "Initial title",
+        "body": "Initial body",
+    }
+    original = rerun.review_snapshot_id(**common)
+
+    for changed in (
+        {**common, "base_sha": "base-2"},
+        {**common, "title": "Updated title"},
+        {**common, "body": "Updated body"},
+    ):
+        assert rerun.review_snapshot_id(**changed) != original
+
+
+def test_hot_review_settles_then_dispatches_same_current_snapshot(monkeypatch):
+    pulls = iter((_pr_data(head_sha="latest"), _pr_data(head_sha="latest")))
+    monkeypatch.setattr(
+        rerun, "with_install_token_retry", lambda iid, fn: next(pulls),
+    )
+    monkeypatch.setattr(rerun, "get_repo_config", lambda iid, rid: {
+        "code_reviewer_blocking": True,
+    })
+    acquire, complete, release = _patch_hot_claims(monkeypatch)
+    sleep = MagicMock()
+    monkeypatch.setattr(rerun.time, "sleep", sleep)
+    dispatch = MagicMock(return_value={"persona": "code_reviewer", "result": "pass"})
+    monkeypatch.setattr(rerun, "dispatch_code_review", dispatch)
+
+    status = rerun._run_one(_job(
+        kind="review", requested_head_sha="event-head", settle_seconds=90,
+    ))
+
+    assert status == "dispatched"
+    sleep.assert_called_once_with(90)
+    acquire.assert_called_once_with(
+        install_id=11,
+        repo="myorg/myrepo",
+        pr_number=7,
+        persona="code_reviewer",
+        head_sha=rerun.review_snapshot_id_from_pr(_pr_data(head_sha="latest")),
+        owner_token=ANY,
+        lease_seconds=rerun._REVIEW_CLAIM_LEASE_SECONDS,
+    )
+    owner_token = acquire.call_args.kwargs["owner_token"]
+    assert owner_token
+    complete.assert_called_once_with(
+        install_id=11,
+        repo="myorg/myrepo",
+        pr_number=7,
+        persona="code_reviewer",
+        head_sha=rerun.review_snapshot_id_from_pr(_pr_data(head_sha="latest")),
+        owner_token=owner_token,
+    )
+    payload = dispatch.call_args.args[0]
+    assert payload["pull_request"]["title"] == "Improve review depth"
+    assert payload["pull_request"]["body"].startswith("Closes #6")
+    assert payload["pull_request"]["base"]["sha"] == "base-sha"
+    assert dispatch.call_args.kwargs["blocking"] is True
+    release.assert_not_called()
+
+
+def test_hot_review_cancels_when_snapshot_moves_during_quiet_window(monkeypatch):
+    pulls = iter((
+        _pr_data(head_sha="same-head", title="Before"),
+        _pr_data(head_sha="same-head", title="After"),
+    ))
+    monkeypatch.setattr(
+        rerun, "with_install_token_retry", lambda iid, fn: next(pulls),
+    )
+    acquire, complete, release = _patch_hot_claims(monkeypatch)
+    monkeypatch.setattr(rerun.time, "sleep", lambda seconds: None)
+    requeue = MagicMock()
+    monkeypatch.setattr(rerun, "_enqueue_current_review", requeue)
+    dispatch = MagicMock()
+    monkeypatch.setattr(rerun, "dispatch_code_review", dispatch)
+
+    status = rerun._run_one(_job(
+        kind="review", requested_head_sha="same-head", settle_seconds=90,
+    ))
+
+    assert status == "stale_snapshot"
+    release.assert_called_once_with(
+        install_id=11,
+        repo="myorg/myrepo",
+        pr_number=7,
+        persona="code_reviewer",
+        head_sha=rerun.review_snapshot_id_from_pr(
+            _pr_data(head_sha="same-head", title="Before"),
+        ),
+        owner_token=acquire.call_args.kwargs["owner_token"],
+    )
+    complete.assert_not_called()
+    dispatch.assert_not_called()
+    requeue.assert_called_once_with(
+        install_id=11,
+        repo_full="myorg/myrepo",
+        pr_number=7,
+        pr=_pr_data(head_sha="same-head", title="After"),
+        settle_seconds=90,
+    )
+
+
+def test_hot_review_stops_when_pr_becomes_draft_during_settle(monkeypatch):
+    pulls = iter((
+        _pr_data(head_sha="same-head"),
+        _pr_data(head_sha="same-head", draft=True),
+    ))
+    monkeypatch.setattr(
+        rerun, "with_install_token_retry", lambda iid, fn: next(pulls),
+    )
+    acquire, complete, release = _patch_hot_claims(monkeypatch)
+    monkeypatch.setattr(rerun.time, "sleep", lambda seconds: None)
+    requeue = MagicMock()
+    monkeypatch.setattr(rerun, "_enqueue_current_review", requeue)
+    dispatch = MagicMock()
+    monkeypatch.setattr(rerun, "dispatch_code_review", dispatch)
+
+    status = rerun._run_one(_job(kind="review", settle_seconds=90))
+
+    assert status == "pr_ineligible"
+    release.assert_called_once()
+    assert release.call_args.kwargs["owner_token"] == acquire.call_args.kwargs["owner_token"]
+    complete.assert_not_called()
+    requeue.assert_not_called()
+    dispatch.assert_not_called()
+
+
+def test_hot_review_requeues_latest_when_dispatch_detects_stale(monkeypatch):
+    original = _pr_data(head_sha="same-head", title="Before")
+    latest = _pr_data(head_sha="same-head", title="After")
+    pulls = iter((original, original, latest))
+    monkeypatch.setattr(
+        rerun, "with_install_token_retry", lambda iid, fn: next(pulls),
+    )
+    monkeypatch.setattr(rerun, "get_repo_config", lambda iid, rid: {})
+    acquire, complete, release = _patch_hot_claims(monkeypatch)
+    requeue = MagicMock()
+    monkeypatch.setattr(rerun, "_enqueue_current_review", requeue)
+    monkeypatch.setattr(
+        rerun,
+        "dispatch_code_review",
+        MagicMock(return_value={
+            "persona": "code_reviewer",
+            "result": "skipped",
+            "degraded_reason": "stale_snapshot",
+        }),
+    )
+
+    status = rerun._run_one(_job(kind="review", settle_seconds=0))
+
+    assert status == "stale_snapshot"
+    requeue.assert_called_once_with(
+        install_id=11,
+        repo_full="myorg/myrepo",
+        pr_number=7,
+        pr=latest,
+        settle_seconds=0,
+    )
+    release.assert_called_once()
+    assert release.call_args.kwargs["owner_token"] == acquire.call_args.kwargs["owner_token"]
+    complete.assert_not_called()
+
+
+def test_hot_review_duplicate_current_snapshot_skips_without_wait(monkeypatch):
+    monkeypatch.setattr(
+        rerun, "with_install_token_retry", lambda iid, fn: _pr_data(head_sha="same"),
+    )
+    acquire, complete, release = _patch_hot_claims(
+        monkeypatch, status="completed",
+    )
+    sleep = MagicMock()
+    monkeypatch.setattr(rerun.time, "sleep", sleep)
+    dispatch = MagicMock()
+    monkeypatch.setattr(rerun, "dispatch_code_review", dispatch)
+
+    status = rerun._run_one(_job(
+        kind="review", requested_head_sha="same", settle_seconds=90,
+    ))
+
+    assert status == "duplicate_snapshot"
+    acquire.assert_called_once()
+    complete.assert_not_called()
+    release.assert_not_called()
+    sleep.assert_not_called()
+    dispatch.assert_not_called()
+
+
+def test_hot_review_draft_skips_before_claim_so_ready_event_can_reuse_head(monkeypatch):
+    monkeypatch.setattr(
+        rerun,
+        "with_install_token_retry",
+        lambda iid, fn: _pr_data(head_sha="draft-head", draft=True),
+    )
+    acquire = MagicMock()
+    monkeypatch.setattr("adapters.install_store.acquire_review_claim", acquire)
+    sleep = MagicMock()
+    monkeypatch.setattr(rerun.time, "sleep", sleep)
+    dispatch = MagicMock()
+    monkeypatch.setattr(rerun, "dispatch_code_review", dispatch)
+
+    out = rerun.handle_rerun_jobs(
+        _event(_job(kind="review", requested_head_sha="draft-head")),
+    )
+
+    assert out == {"records": 1, "dispatched": 0, "skipped": 1}
+    acquire.assert_not_called()
+    sleep.assert_not_called()
+    dispatch.assert_not_called()
+
+
+def test_hot_review_dispatch_error_releases_claim_and_raises_for_redrive(monkeypatch):
+    monkeypatch.setattr(
+        rerun,
+        "with_install_token_retry",
+        lambda iid, fn: _pr_data(head_sha="retry-head"),
+    )
+    monkeypatch.setattr(rerun, "get_repo_config", lambda iid, rid: {})
+    acquire, complete, release = _patch_hot_claims(monkeypatch)
+    monkeypatch.setattr(
+        rerun,
+        "dispatch_code_review",
+        MagicMock(side_effect=RuntimeError("review crashed")),
+    )
+
+    with pytest.raises(RuntimeError, match="review crashed"):
+        rerun._run_one(_job(kind="review", settle_seconds=0))
+
+    release.assert_called_once_with(
+        install_id=11,
+        repo="myorg/myrepo",
+        pr_number=7,
+        persona="code_reviewer",
+        head_sha=rerun.review_snapshot_id_from_pr(_pr_data(head_sha="retry-head")),
+        owner_token=acquire.call_args.kwargs["owner_token"],
+    )
+    complete.assert_not_called()
+
+
+def test_hot_review_publish_failure_releases_claim_and_raises_for_redrive(monkeypatch):
+    monkeypatch.setattr(
+        rerun,
+        "with_install_token_retry",
+        lambda iid, fn: _pr_data(head_sha="publish-head"),
+    )
+    monkeypatch.setattr(rerun, "get_repo_config", lambda iid, rid: {})
+    acquire, complete, release = _patch_hot_claims(monkeypatch)
+    monkeypatch.setattr(
+        rerun,
+        "dispatch_code_review",
+        MagicMock(return_value={
+            "persona": "code_reviewer",
+            "result": "publish_failed",
+        }),
+    )
+
+    with pytest.raises(RuntimeError, match="publication failed"):
+        rerun._run_one(_job(kind="review", settle_seconds=0))
+
+    release.assert_called_once_with(
+        install_id=11,
+        repo="myorg/myrepo",
+        pr_number=7,
+        persona="code_reviewer",
+        head_sha=rerun.review_snapshot_id_from_pr(_pr_data(head_sha="publish-head")),
+        owner_token=acquire.call_args.kwargs["owner_token"],
+    )
+    complete.assert_not_called()
+
+
+def test_hot_review_unexpected_result_releases_claim_and_redrives(monkeypatch):
+    monkeypatch.setattr(
+        rerun,
+        "with_install_token_retry",
+        lambda iid, fn: _pr_data(head_sha="unexpected-head"),
+    )
+    monkeypatch.setattr(rerun, "get_repo_config", lambda iid, rid: {})
+    acquire, complete, release = _patch_hot_claims(monkeypatch)
+    monkeypatch.setattr(
+        rerun,
+        "dispatch_code_review",
+        MagicMock(return_value={
+            "persona": "code_reviewer",
+            "result": "unhandled_error",
+        }),
+    )
+
+    with pytest.raises(RuntimeError, match="unexpected result"):
+        rerun._run_one(_job(kind="review", settle_seconds=0))
+
+    release.assert_called_once()
+    assert release.call_args.kwargs["owner_token"] == (
+        acquire.call_args.kwargs["owner_token"]
+    )
+    complete.assert_not_called()
+
+
+def test_hot_review_model_outage_releases_claim_and_raises_for_redrive(monkeypatch):
+    monkeypatch.setattr(
+        rerun,
+        "with_install_token_retry",
+        lambda iid, fn: _pr_data(head_sha="outage-head"),
+    )
+    monkeypatch.setattr(rerun, "get_repo_config", lambda iid, rid: {})
+    acquire, complete, release = _patch_hot_claims(monkeypatch)
+    monkeypatch.setattr(
+        rerun,
+        "dispatch_code_review",
+        MagicMock(return_value={
+            "persona": "code_reviewer",
+            "result": "skipped",
+            "degraded_reason": "all_failed",
+        }),
+    )
+
+    with pytest.raises(RuntimeError, match="all_failed"):
+        rerun._run_one(_job(kind="review", settle_seconds=0))
+
+    release.assert_called_once_with(
+        install_id=11,
+        repo="myorg/myrepo",
+        pr_number=7,
+        persona="code_reviewer",
+        head_sha=rerun.review_snapshot_id_from_pr(_pr_data(head_sha="outage-head")),
+        owner_token=acquire.call_args.kwargs["owner_token"],
+    )
+    complete.assert_not_called()
+
+
+def test_hot_review_release_failure_redrives_until_lease_is_reclaimable(monkeypatch):
+    """A failed claim release must not turn redelivery into a dropped job."""
+    monkeypatch.setattr(
+        rerun,
+        "with_install_token_retry",
+        lambda iid, fn: _pr_data(head_sha="recover-head"),
+    )
+    monkeypatch.setattr(rerun, "get_repo_config", lambda iid, rid: {})
+    acquire, complete, release = _patch_hot_claims(monkeypatch)
+    acquire.side_effect = ["acquired", "busy", "acquired"]
+    release.side_effect = RuntimeError("database unavailable during release")
+    dispatch = MagicMock(side_effect=[
+        RuntimeError("review crashed"),
+        {"persona": "code_reviewer", "result": "pass"},
+    ])
+    monkeypatch.setattr(rerun, "dispatch_code_review", dispatch)
+
+    with pytest.raises(RuntimeError, match="review crashed"):
+        rerun._run_one(_job(kind="review", settle_seconds=0))
+    with pytest.raises(RuntimeError, match="claim is still in progress"):
+        rerun._run_one(_job(kind="review", settle_seconds=0))
+
+    assert rerun._run_one(_job(kind="review", settle_seconds=0)) == "dispatched"
+    assert acquire.call_count == 3
+    assert dispatch.call_count == 2
+    assert release.call_count == 1
+    complete.assert_called_once()
 
 
 def test_rerun_dispatches_persona_on_current_head():
@@ -46,6 +570,9 @@ def test_rerun_dispatches_persona_on_current_head():
     payload, kwargs = disp.call_args.args[0], disp.call_args.kwargs
     # Re-run targets the PR's CURRENT head (fetched), not the errored row's.
     assert payload["pull_request"]["head"]["sha"] == "deadbeef"
+    assert payload["pull_request"]["base"]["sha"] == "base-sha"
+    assert payload["pull_request"]["title"] == "Improve review depth"
+    assert payload["pull_request"]["user"]["login"] == "evan"
     assert payload["repository"]["owner"]["login"] == "myorg"  # from the repo string
     assert payload["repository"]["name"] == "myrepo"
     assert payload["repository"]["id"] == 222  # from pr.base.repo.id

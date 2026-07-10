@@ -13,7 +13,7 @@ The vocabulary used in `services/`, `infra/`, and `web/`. Terms map to identifie
 | **Persona** | A bounded behavior surface Grug applies per PR — a single grug of the tribe, each with one job. Five run today: **Chief** (DoR gate), **Elder** (code reviewer), **Guard** (security, #466), **Warder** (release tracer, #471), **Pulse** (scheduled nudge, #472). FIVE run today: Chief, Elder, **Guard** (security, #466), **Warder** (release-manager tracer, #471, default off), and **Pulse** (the scheduled stuck-PR nudge, #472, default off). Roadmap: **Smasher** (bug-hunt) - being built as capabilities (Trial #469 mutation-testing, Omen #470 DD-fusion). Personas are per-repo togglable. Each has a **caveman name** (Chief, Elder, …) — the canonical outward identity used in the Activity feed, dashboard, and new code — and a **historical code key** (`tpm`, `code_reviewer`, …) still carried by the legacy persona dirs + config fields (`tpm_enabled`). New code uses the caveman name; the key→name map is resolved in ONE place at the write boundary. _Avoid_: calling the personas by their code keys in user-facing surfaces or new feed code. |
 | **Persona registry** | The declarative table of personas - `REGISTRY: tuple[PersonaSpec, ...]` in `personas/registry.py` (shared). One `PersonaSpec` row per persona: key, canonical caveman name, check-run name, config flags + defaults, dispatch style (inline/async), missing-repo policy, handled events, and the `dispatch_module` whose `dispatch_pull_request(ctx: PullRequestContext)` the webhook dispatcher calls. `dispatcher._handle_pull_request` iterates this table; adding a persona = one spec entry + one `personas/<key>/webhook_dispatch.py` module + its `_DEFAULT_PERSONA_CONFIG` keys, with no dispatcher or store edits (ADR-0010, spec section "Persona dispatch - the registry" in `specs/DESIGN.md`). |
 | **Chief** (the **TPM** persona) | The grug who leads the tribe. Before the tribe leave the cave to hunt, Chief ask: the hunt have a name? enough meat counted? the path home known? If the plan not whole, tribe not go. Chief not read the code — Chief check the **plan** is ready. = the static **Definition-of-Ready (DoR) check** (`Grug — Definition of Ready`), which blocks merge on a malformed PR body. Code dir `personas/tpm/` (key `tpm`); canonical name **`chief`**. The companion **Scope review** half is wired but NOT shipped — see "Roadmap" rows. See [`services/_shared/personas/tpm/`](services/_shared/personas/tpm/). |
-| **Elder** (the **code-reviewer** persona) | The oldest grug, many winters of bad code behind him — Elder seen many a grug fall in the same pit. Elder read your markings one line at a time and name the bad omen before it bite: the null in the dark, the race by the river, the error swallowed in silence. = the LLM **code review** pass (`Grug — Code Review`), advisory by default. (The deterministic security suite that used to ride inside Elder is now **Guard**, #466/ADR-0012.) Code dir `personas/code_reviewer/` (key `code_reviewer`); canonical name **`elder`** (already `_PERSONA = "Elder"` in dispatch). Speaks in the wise-caveman voice (the `_VOICE` clause in `code_review_prompt.py`). |
+| **Elder** (the **code-reviewer** persona) | The oldest grug, many winters of bad code behind him — Elder seen many a grug fall in the same pit. Elder read your markings one line at a time and name the bad omen before it bite: the null in the dark, the race by the river, the error swallowed in silence. = the LLM **code review** pass (`Grug — Code Review`), advisory by default. Production review jobs enter the durable rerun FIFO, wait for a 90-second quiet snapshot, and cancel/re-enqueue when base, head, title, or body changes before publication. The default `deep` pass gives the recall prompt and untrusted PR title/body intent to BOTH Poolside and OpenRouter (review-only Opus 4.7 with high-effort reasoning), then merges deduplicated findings with backend/model provenance. Both deep passes must succeed before the snapshot is marked complete; a one-backend result is provisional and retried. Judge and write-authorized maintainer reaction labels fan out only to the producer spans that actually exist. Confirmed reactions refresh positive practices/examples; false positives become bounded AVOID guidance. `GRUG_REVIEW_DEPTH=fast` restores the one-primary-plus-fallback path without changing the lighter OpenRouter model used by the judge, Teller, or `/grug ask`. (The deterministic security suite that used to ride inside Elder is now **Guard**, #466/ADR-0012.) Code dir `personas/code_reviewer/` (key `code_reviewer`); canonical name **`elder`** (already `_PERSONA = "Elder"` in dispatch). Speaks in the wise-caveman voice (the `_VOICE` clause in `code_review_prompt.py`). |
 | **Guard** (the security persona) | The grug who watch the cave mouth at night. Guard sniff every bundle the tribe carry in: leaked secret smell, sick dependency, weak markings, open door in the camp wall. Evil shall not pass. = the deterministic **security suite** (`Grug — Guard`, #466/ADR-0012): SAST (`sast.py`), dependency-CVE (`sca.py`), committed secrets (`secret_scan.py`), IaC misconfig (`iac_scan.py`) -> the LLM **exploitability judge** (`judge_candidates`) -> Guard's own check-run + inline review, advisory by default (`guard_blocking`). Detector files stay under `personas/code_reviewer/` (ownership by import); recall/precision tracked by the SAST benchmark. Code dir `personas/guard/` (key `guard`); canonical name **`guard`**. |
 | **Warder** (the release persona) | The grug who keep the gate ledger. When a hunt merge to the main trail, Warder draft the scroll: what changed since the last carved mark (changelog grouped from Conventional-Commit subjects) and how big the next mark should be (semver hint). = the "Grug — Warder" check-run on merged PRs (#471 tracer; advisory, `warder_enabled` default off). Code dir `personas/warder/` (key `warder`). Deploy gating + Release creation = later slices. |
 | **Pulse** (the scheduled persona) | The grug who walk the camp at night and poke sleeping hunts. Every poller tick (15 min cadence), Pulse find open PRs quiet 7+ sunrises whose plan Chief already blessed, and leave ONE gentle nudge per week ("Grug see PR sleep seven sunrises. Tribe forget?"). = `personas/pulse/nudge.py` on the grug-poller CronJob (#472 tracer; `pulse_enabled` default off, hard-capped per run, store-claim idempotent). The first non-webhook persona. |
@@ -130,6 +130,57 @@ These terms exist in the codebase but are inconsistent or under-named. Resolving
 - **`with_install_token_retry`** — verbose helper name; better as a method on a `TokenedGitHubClient` adapter (no longer deferred: extracted to #510 by the #142 walk, ADR-0015).
 - **`get_pool()` lazy init** — double-checked-lock pool bootstrap in `pg_base.py` deferring DB connection past import (same rationale as the DDB-era `_LazyTable` it replaced).
 - **No name for the SPA's session shape** — `web/src/` consumes the api service's `/me` payload but the SPA's TS types don't have a corresponding `Session` or `Viewer` concept. Add when frontend changes touch session state.
+
+---
+
+## Datadog LLM Observability (DD LLMObs) reference
+
+Grug uses **Datadog LLM Observability** to track Elder model calls and collect trusted human feedback from reactions on inline comments.
+
+### Key terminology
+
+| Term | Definition |
+|---|---|
+| **ML app name** | Datadog organizes traces by ML app. Grug uses `grug-elder` (set on the webhook and consumer workloads). |
+| **Review span name** | Each Elder producer call creates an `elder_code_review` LLMObs span in `services/_shared/llm_client.py`. A deep review can create both Poolside and OpenRouter spans for one snapshot. |
+| **DD_SERVICE tag** | The workload identity is `grug-webhook` for webhook handling and `grug-consumer` for durable review execution. This is APM service identity, not the LLMObs ML app. |
+| **Reaction polling** | The `grug-poller` CronJob polls reactions on Grug review comments every 15 minutes. Only reactions from users with repository write/admin permission can steer repository learning. |
+| **Producer provenance** | A merged finding retains every backend/model origin. Judge and reaction evaluations attach only to exported spans that actually produced that finding. |
+| **Annotation queue** | Human review workflow in Datadog UI. The `human_verdict` categorical label uses `false_positive` and `confirmed` values to validate judge accuracy over time. |
+
+### How to inspect Grug traces with pup
+
+```bash
+# List all projects (Grug project has id e24e1215...)
+pup llm-obs projects list -o json
+
+# Create annotation queue for human review
+pup llm-obs annotation-queues create --name="Grug human_verdict Reviews" \
+  --project-id=<PROJECT_ID> \
+  --label="verdict|categorical|false_positive,confirmed" \
+  --has-assessment=true \
+  --has-reasoning=true
+
+# Search for Elder spans (filter by ML app)
+pup llm-obs spans search --ml-app grug-elder --from 1h
+
+# List annotation queues
+pup llm-obs annotation-queues list --project-id <PROJECT_ID>
+```
+
+### How reactions become evaluations and learning
+
+1. A maintainer reacts to a Grug inline comment.
+2. `grug-poller` polls the GitHub reactions API.
+3. `poll_and_annotate()` filters reactors by repository permission and classifies the trusted reaction.
+4. `submit_reaction_annotation()` sends a `human_verdict` evaluation to each available producer span for that finding.
+5. The stable comment evidence row refreshes repository practices: confirmed findings become positive guidance/examples; false positives become AVOID guidance.
+
+### Running issues
+
+- **No traces showing?** Check `DD_LLMOBS_ENABLED=true` on both Elder workloads and verify `elder_code_review` spans under `@ml_app:grug-elder`.
+- **Reactions not appearing?** Confirm `grug-poller` is running and the reactor has repository write/admin permission. New reactions take up to 15 minutes to appear.
+- **Annotations queue empty?** Search for producer spans first. A finding whose producer span failed to export remains learnable but is intentionally not attributed to a different model span.
 
 ---
 

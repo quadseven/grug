@@ -7,9 +7,7 @@ Best-effort — a judge failure never affects the (already-published)
 review."""
 from __future__ import annotations
 
-from unittest.mock import patch
-
-from llm_client import Backend, FindingJudgement, LlmReviewResponse
+from llm_client import Backend, FindingJudgement, FindingOrigin, LlmReviewResponse
 from personas.code_reviewer import judge as cr_judge
 from personas.code_reviewer.diff_parser import parse_diff
 from personas.code_reviewer.persona import CodeReviewEvaluation, Finding
@@ -26,10 +24,10 @@ _DIFF = """diff --git a/src/x.py b/src/x.py
 """
 
 
-def _finding(rule="r", line=2, severity="medium") -> Finding:
+def _finding(rule="r", line=2, severity="medium", origins=()) -> Finding:
     return Finding(
         file="src/x.py", line=line, severity=severity, rule_name=rule,
-        message="m", suggestion=None,
+        message="m", suggestion=None, origins=origins,
     )
 
 
@@ -51,7 +49,7 @@ def test_run_judge_submits_one_eval_per_finding(monkeypatch):
 
     monkeypatch.setattr(
         cr_judge, "judge_findings",
-        lambda fr, h, installation_id, pr_context=None, file_contents=None: (
+        lambda fr, h, installation_id, **kwargs: (
             FindingJudgement(0, True, "real"),
             FindingJudgement(1, False, "nit"),
         ),
@@ -76,6 +74,101 @@ def test_run_judge_submits_one_eval_per_finding(monkeypatch):
     assert submitted[1]["tags"]["rule_name"] == "style"
 
 
+def test_run_judge_fans_out_eval_to_every_finding_origin(monkeypatch):
+    """One deduplicated finding can be produced by both ensemble models.
+    The judge verdict must train both review spans with source attribution."""
+    origins = (
+        FindingOrigin(
+            backend=Backend.POOLSIDE,
+            model="poolside/laguna-m.1",
+            review_span_context={"span_id": "poolside-span"},
+        ),
+        FindingOrigin(
+            backend=Backend.OPENROUTER,
+            model="anthropic/claude-opus-4.7",
+            review_span_context={"span_id": "openrouter-span"},
+        ),
+    )
+    evaluation = CodeReviewEvaluation(
+        findings=(_finding(rule="null-deref", origins=origins),),
+        conclusion="success",
+    )
+    monkeypatch.setattr(
+        cr_judge,
+        "judge_findings",
+        lambda *a, **kw: (FindingJudgement(0, True, "real"),),
+    )
+    submitted: list[dict] = []
+    monkeypatch.setattr(
+        cr_judge,
+        "submit_finding_evaluation",
+        lambda **kw: submitted.append(kw),
+    )
+
+    cr_judge.run_judge(
+        evaluation,
+        parse_diff(_DIFF),
+        installation_id=1,
+        review_span_context=None,
+    )
+
+    assert [s["review_span_context"] for s in submitted] == [
+        {"span_id": "poolside-span"},
+        {"span_id": "openrouter-span"},
+    ]
+    assert [s["tags"]["source_backend"] for s in submitted] == [
+        "poolside",
+        "openrouter",
+    ]
+    assert [s["tags"]["source_model"] for s in submitted] == [
+        "poolside/laguna-m.1",
+        "anthropic/claude-opus-4.7",
+    ]
+
+
+def test_submit_evals_does_not_misattribute_failed_origin_export(monkeypatch):
+    """A Poolside finding whose trace export failed must not be attached to
+    the response-level OpenRouter span."""
+    finding = _finding(origins=(FindingOrigin(
+        backend=Backend.POOLSIDE,
+        model="poolside/laguna-m.1",
+        review_span_context=None,
+    ),))
+    submitted: list[dict] = []
+    monkeypatch.setattr(
+        cr_judge,
+        "submit_finding_evaluation",
+        lambda **kw: submitted.append(kw),
+    )
+
+    cr_judge.submit_evals(
+        (finding,),
+        (FindingJudgement(0, True, "real"),),
+        review_span_context={"span_id": "legacy-span"},
+    )
+
+    assert submitted == []
+
+
+def test_submit_evals_uses_response_span_for_legacy_finding(monkeypatch):
+    finding = _finding(origins=())
+    submitted: list[dict] = []
+    monkeypatch.setattr(
+        cr_judge,
+        "submit_finding_evaluation",
+        lambda **kw: submitted.append(kw),
+    )
+
+    cr_judge.submit_evals(
+        (finding,),
+        (FindingJudgement(0, True, "real"),),
+        review_span_context={"span_id": "legacy-span"},
+    )
+
+    assert submitted[0]["review_span_context"] == {"span_id": "legacy-span"}
+    assert "source_backend" not in submitted[0]["tags"]
+
+
 def test_run_judge_redacts_exposed_secret_reasoning(monkeypatch):
     """#436: an exposed-secret finding's judge reasoning is generated from full
     raw file context and can quote the credential; it must be redacted before
@@ -89,7 +182,7 @@ def test_run_judge_redacts_exposed_secret_reasoning(monkeypatch):
     review = _reviewed(evaluation.findings)
     monkeypatch.setattr(
         cr_judge, "judge_findings",
-        lambda fr, h, installation_id, pr_context=None, file_contents=None: (
+        lambda fr, h, installation_id, **kwargs: (
             FindingJudgement(0, True, "the key AKIAIOSFODNN7EXAMPLE is live and reaches prod"),
             FindingJudgement(1, True, "real null deref"),
         ),
@@ -120,7 +213,7 @@ def test_run_judge_converts_diffhunks_to_wire_hunks(monkeypatch):
     captured: dict = {}
     monkeypatch.setattr(
         cr_judge, "judge_findings",
-        lambda fr, h, installation_id, pr_context=None, file_contents=None: (
+        lambda fr, h, installation_id, **kwargs: (
             captured.update(hunks=list(h)) or (FindingJudgement(0, True, "real"),)
         ),
     )
@@ -375,3 +468,92 @@ def test_grade_findings_empty_when_no_findings():
     assert cr_judge.grade_findings(
         evaluation, parse_diff(_DIFF), installation_id=1,
     ) == ()
+
+
+def test_grade_findings_batches_large_ensemble_output(monkeypatch):
+    """A high-recall ensemble must not make the judge skip every candidate."""
+    total = cr_judge.JUDGE_BATCH_SIZE + 2
+    evaluation = CodeReviewEvaluation(
+        findings=tuple(_finding(rule=f"rule-{i}") for i in range(total)),
+        conclusion="success",
+    )
+    batch_sizes: list[int] = []
+
+    def judge_batch(reprs, *args, **kwargs):
+        batch_sizes.append(len(reprs))
+        return tuple(
+            FindingJudgement(i, True, "real") for i in range(len(reprs))
+        )
+
+    monkeypatch.setattr(cr_judge, "judge_findings", judge_batch)
+
+    verdicts = cr_judge.grade_findings(
+        evaluation, parse_diff(_DIFF), installation_id=1,
+    )
+
+    assert batch_sizes == [cr_judge.JUDGE_BATCH_SIZE, 2]
+    assert [verdict.finding_index for verdict in verdicts] == list(range(total))
+
+
+def test_grade_findings_caps_total_batches_and_leaves_remainder_ungraded(
+    monkeypatch, caplog,
+):
+    total = cr_judge.JUDGE_MAX_FINDINGS + 2
+    evaluation = CodeReviewEvaluation(
+        findings=tuple(_finding(rule=f"rule-{i}") for i in range(total)),
+        conclusion="success",
+    )
+    batch_sizes: list[int] = []
+
+    def judge_batch(reprs, *args, **kwargs):
+        batch_sizes.append(len(reprs))
+        return tuple(
+            FindingJudgement(i, False, "noise", confidence=1.0)
+            for i in range(len(reprs))
+        )
+
+    monkeypatch.setattr(cr_judge, "judge_findings", judge_batch)
+
+    verdicts = cr_judge.grade_findings(
+        evaluation, parse_diff(_DIFF), installation_id=1,
+    )
+    kept, suppressed = cr_judge.partition_findings(
+        evaluation.findings, verdicts,
+    )
+
+    assert batch_sizes == [cr_judge.JUDGE_BATCH_SIZE] * 3
+    assert len(verdicts) == cr_judge.JUDGE_MAX_FINDINGS
+    assert len(suppressed) == cr_judge.JUDGE_MAX_FINDINGS
+    assert [finding.rule_name for finding in kept] == [
+        f"rule-{cr_judge.JUDGE_MAX_FINDINGS}",
+        f"rule-{cr_judge.JUDGE_MAX_FINDINGS + 1}",
+    ]
+    assert any(record.message == "judge_total_cap_reached" for record in caplog.records)
+
+
+def test_grade_findings_forwards_full_review_context_and_redacts(monkeypatch):
+    evaluation = CodeReviewEvaluation(
+        findings=(_finding(rule="caller-not-updated"),), conclusion="success",
+    )
+    captured: dict = {}
+
+    def judge_batch(reprs, *args, **kwargs):
+        captured.update(kwargs)
+        return (FindingJudgement(0, True, "real"),)
+
+    monkeypatch.setattr(cr_judge, "judge_findings", judge_batch)
+
+    verdicts = cr_judge.grade_findings(
+        evaluation,
+        parse_diff(_DIFF),
+        installation_id=1,
+        pr_context={"title": "contract"},
+        file_contents={"src/x.py": "changed"},
+        cross_file_contents={"src/caller.py": "old_call()"},
+        runtime_context="10 errors",
+    )
+
+    assert len(verdicts) == 1
+    assert captured["cross_file_contents"] == {"src/caller.py": "old_call()"}
+    assert captured["runtime_context"] == "10 errors"
+    assert captured["redact"] is True

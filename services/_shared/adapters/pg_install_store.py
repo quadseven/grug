@@ -22,7 +22,7 @@ from __future__ import annotations
 
 import logging
 from datetime import datetime, timezone
-from typing import Any, NotRequired, Optional, TypedDict
+from typing import Any, Literal, NotRequired, Optional, TypedDict
 
 from psycopg.types.json import Jsonb
 
@@ -368,12 +368,23 @@ def is_persona_enabled(install_id: int, repo_id: int, persona: str) -> bool:
 # ---------------------------------------------------------------------------
 
 
+class CommentFindingOrigin(TypedDict):
+    backend: str
+    model: str
+    review_span_context: Optional[dict]
+
+
 class CommentRecord(TypedDict):
     comment_id: int
     repo: str
     pr_number: int
     review_span_context: Optional[dict]
     finding_tags: dict[str, str]
+    finding_origins: NotRequired[list[CommentFindingOrigin]]
+    finding_text: NotRequired[str]
+    head_sha: NotRequired[str]
+    author_login: NotRequired[str]
+    trust_reactors: NotRequired[bool]
     last_verdict: NotRequired[Optional[str]]
 
 
@@ -390,8 +401,13 @@ def put_comment_record(
     comment_id: int,
     repo: str,
     pr_number: int,
-    review_span_context: dict,
-    finding_tags: dict,
+    review_span_context: Optional[dict],
+    finding_tags: dict[str, str],
+    finding_origins: Optional[list[CommentFindingOrigin]] = None,
+    finding_text: str = "",
+    head_sha: str = "",
+    author_login: str = "",
+    trust_reactors: bool = True,
 ) -> None:
     ttl = int(
         datetime.now(timezone.utc).timestamp() + _COMMENT_RECORD_TTL_DAYS * 86400
@@ -404,6 +420,16 @@ def put_comment_record(
         "finding_tags": finding_tags,
         "ttl": ttl,
     }
+    if finding_origins:
+        attrs["finding_origins"] = finding_origins
+    if finding_text:
+        attrs["finding_text"] = finding_text
+    if head_sha:
+        attrs["head_sha"] = head_sha
+    if author_login:
+        attrs["author_login"] = author_login
+    if trust_reactors:
+        attrs["trust_reactors"] = True
     with get_pool().connection() as conn:
         conn.execute(
             """
@@ -842,6 +868,7 @@ def release_pulse_nudge(install_id: int, repo: str, pr_number: int) -> None:
 
 
 _REVIEW_CLAIM_TTL_DAYS = 30
+ReviewClaimStatus = Literal["acquired", "completed", "busy"]
 
 
 def _review_pk(
@@ -858,17 +885,16 @@ def claim_review(
     persona: str,
     head_sha: str,
 ) -> bool:
-    """Win-once idempotency claim keyed on the EXACT head SHA (#397). True =
-    this caller won (run the review); False = a review of THIS head SHA was
-    already claimed -> SKIP. Distinct from claim_delivery (per webhook
-    delivery): head-SHA keying dedupes EVERY same-SHA re-trigger - a
-    redelivery AND a non-push event (`edited` on the PR body,
-    `ready_for_review`) that carries the same head SHA - so unchanged code is
-    not re-reviewed, while every NEW head SHA still wins a fresh review.
+    """Win-once idempotency claim keyed on one exact review input (#397).
+
+    ``head_sha`` is the historical API name; callers pass the canonical
+    snapshot identity covering base, head, title, and body. True means this
+    caller won and should review; False means that exact snapshot was already
+    claimed. This remains distinct from the per-webhook ``claim_delivery``.
 
     Atomic single statement with the SAME TTL-takeover semantics as
     claim_delivery (an expired claim reads as free). Fails OPEN on a missing
-    head_sha (a possible double-review beats a silently-skipped one). The
+    identity (a possible double-review beats a silently-skipped one). The
     claim is on ATTEMPT, not completion: an `errored` review heals via the
     rerun queue (#305/#418) and an explicit `/rerun` (#87) both re-run
     through `dispatch_code_review` DIRECTLY, bypassing this webhook-path gate,
@@ -901,6 +927,209 @@ def claim_review(
     return row is not None
 
 
+def acquire_review_claim(
+    *,
+    install_id: int,
+    repo: str,
+    pr_number: int,
+    persona: str,
+    head_sha: str,
+    owner_token: str,
+    lease_seconds: int,
+) -> ReviewClaimStatus:
+    """Acquire a recoverable lease for one durable review attempt.
+
+    Unlike ``claim_review``, this separates an in-flight attempt from a
+    completed review. If a worker dies before it can release its claim, a later
+    SQS delivery can atomically take over after the lease expires. Existing
+    rows created by ``claim_review`` have no state marker and are treated as
+    completed, preserving same-snapshot deduplication across deployments.
+    """
+    if not head_sha:
+        return "acquired"
+    if not owner_token:
+        raise ValueError("owner_token must be non-empty")
+    lease_seconds = max(1, int(lease_seconds))
+    pg_base.maybe_purge_expired()
+    now = int(datetime.now(timezone.utc).timestamp())
+    lease_expires_at = now + lease_seconds
+    row_ttl = now + _REVIEW_CLAIM_TTL_DAYS * 86400
+    pk = _review_pk(install_id, repo, pr_number, persona, head_sha)
+    in_progress = {
+        "review_claim_state": "in_progress",
+        "review_claim_owner": owner_token,
+        "lease_expires_at": lease_expires_at,
+        # Storage retention is deliberately longer than the ownership lease.
+        # Otherwise the generic TTL purge can delete a live claim between
+        # heartbeats. Takeover keys on lease_expires_at below.
+        "ttl": row_ttl,
+    }
+    with get_pool().connection() as conn:
+        row = conn.execute(
+            """
+            INSERT INTO grug_kv (pk, sk, data, ttl)
+            VALUES (%(pk)s, 'META', %(data)s, %(ttl)s)
+            ON CONFLICT (pk, sk) DO UPDATE
+                SET data = %(data)s, ttl = %(ttl)s
+                WHERE (
+                    grug_kv.data->>'review_claim_state' = 'in_progress'
+                    AND COALESCE(
+                        NULLIF(grug_kv.data->>'lease_expires_at', '')::bigint, 0
+                    ) <= EXTRACT(EPOCH FROM now())
+                ) OR (
+                    grug_kv.ttl IS NOT NULL
+                    AND grug_kv.ttl <= EXTRACT(EPOCH FROM now())
+                )
+            RETURNING pk
+            """,
+            {
+                "pk": pk,
+                "data": Jsonb(in_progress),
+                "ttl": row_ttl,
+            },
+        ).fetchone()
+        if row is not None:
+            return "acquired"
+        existing = conn.execute(
+            "SELECT data->>'review_claim_state' FROM grug_kv "
+            "WHERE pk = %s AND sk = 'META'",
+            (pk,),
+        ).fetchone()
+    # A legacy claim or an explicit completed marker both mean that this
+    # snapshot already finished. A concurrently released row returns busy so
+    # the queue retries instead of incorrectly acknowledging the message.
+    if existing is not None and existing[0] in {None, "completed"}:
+        return "completed"
+    return "busy"
+
+
+def complete_review_claim(
+    *,
+    install_id: int,
+    repo: str,
+    pr_number: int,
+    persona: str,
+    head_sha: str,
+    owner_token: str,
+) -> bool:
+    """Convert an owned in-flight lease into a 30-day completed claim."""
+    if not head_sha:
+        return True
+    if not owner_token:
+        raise ValueError("owner_token must be non-empty")
+    ttl = int(
+        datetime.now(timezone.utc).timestamp() + _REVIEW_CLAIM_TTL_DAYS * 86400
+    )
+    with get_pool().connection() as conn:
+        row = conn.execute(
+            """
+            UPDATE grug_kv
+            SET data = %(data)s, ttl = %(ttl)s
+            WHERE pk = %(pk)s AND sk = 'META'
+              AND data->>'review_claim_state' = 'in_progress'
+              AND data->>'review_claim_owner' = %(owner)s
+            RETURNING pk
+            """,
+            {
+                "pk": _review_pk(
+                    install_id, repo, pr_number, persona, head_sha,
+                ),
+                "owner": owner_token,
+                "data": Jsonb({
+                    "review_claim_state": "completed",
+                    "ttl": ttl,
+                }),
+                "ttl": ttl,
+            },
+        ).fetchone()
+    return row is not None
+
+
+def renew_review_claim(
+    *,
+    install_id: int,
+    repo: str,
+    pr_number: int,
+    persona: str,
+    head_sha: str,
+    owner_token: str,
+    lease_seconds: int,
+) -> bool:
+    """Extend one owned in-flight lease without changing its identity."""
+    if not head_sha:
+        return True
+    if not owner_token:
+        raise ValueError("owner_token must be non-empty")
+    lease_seconds = max(1, int(lease_seconds))
+    now = int(datetime.now(timezone.utc).timestamp())
+    lease_expires_at = now + lease_seconds
+    row_ttl = now + _REVIEW_CLAIM_TTL_DAYS * 86400
+    lease_data = {
+        "lease_expires_at": lease_expires_at,
+        "ttl": row_ttl,
+    }
+    with get_pool().connection() as conn:
+        row = conn.execute(
+            """
+            UPDATE grug_kv
+            SET data = data || %(lease_data)s, ttl = %(ttl)s
+            WHERE pk = %(pk)s AND sk = 'META'
+              AND data->>'review_claim_state' = 'in_progress'
+              AND data->>'review_claim_owner' = %(owner)s
+            RETURNING pk
+            """,
+            {
+                "pk": _review_pk(
+                    install_id, repo, pr_number, persona, head_sha,
+                ),
+                "owner": owner_token,
+                "lease_data": Jsonb(lease_data),
+                "ttl": row_ttl,
+            },
+        ).fetchone()
+    return row is not None
+
+
+def release_review_claim(
+    *,
+    install_id: int,
+    repo: str,
+    pr_number: int,
+    persona: str,
+    head_sha: str,
+    owner_token: str | None = None,
+) -> bool:
+    """Release one exact review-input claim.
+
+    Durable review workers call this only when the claimed attempt did not
+    complete: the snapshot became stale, dispatch raised, or publication
+    failed. A later SQS delivery can then claim the same snapshot and finish
+    the review. Successful reviews retain the claim and continue to deduplicate
+    same-snapshot webhook events for the normal 30-day TTL. When
+    ``owner_token`` is provided, deletion is conditional on ownership so a
+    slow worker cannot delete a lease that a newer worker took over.
+    """
+    if not head_sha:
+        return True
+    with get_pool().connection() as conn:
+        row = conn.execute(
+            """
+            DELETE FROM grug_kv
+            WHERE pk = %(pk)s AND sk = 'META'
+              AND (CAST(%(owner)s AS text) IS NULL
+                   OR data->>'review_claim_owner' = %(owner)s)
+            RETURNING pk
+            """,
+            {
+                "pk": _review_pk(
+                    install_id, repo, pr_number, persona, head_sha,
+                ),
+                "owner": owner_token,
+            },
+        ).fetchone()
+    return row is not None
+
+
 def list_comment_records(install_id: int) -> list[CommentRecord]:
     with get_pool().connection() as conn:
         rows = conn.execute(
@@ -913,16 +1142,25 @@ def list_comment_records(install_id: int) -> list[CommentRecord]:
     out: list[CommentRecord] = []
     for pk, sk, data in rows:
         item = decode_item(pk, sk, data)
-        out.append(
-            {
-                "comment_id": int(item["comment_id"]),
-                "repo": item["repo"],
-                "pr_number": int(item["pr_number"]),
-                "review_span_context": item.get("review_span_context"),
-                "finding_tags": item.get("finding_tags", {}),
-                "last_verdict": item.get("last_verdict"),
-            }
-        )
+        record: CommentRecord = {
+            "comment_id": int(item["comment_id"]),
+            "repo": item["repo"],
+            "pr_number": int(item["pr_number"]),
+            "review_span_context": item.get("review_span_context"),
+            "finding_tags": item.get("finding_tags", {}),
+            "last_verdict": item.get("last_verdict"),
+        }
+        if item.get("finding_origins"):
+            record["finding_origins"] = item["finding_origins"]
+        if item.get("finding_text"):
+            record["finding_text"] = str(item["finding_text"])
+        if item.get("head_sha"):
+            record["head_sha"] = str(item["head_sha"])
+        if item.get("author_login"):
+            record["author_login"] = str(item["author_login"])
+        if item.get("trust_reactors"):
+            record["trust_reactors"] = True
+        out.append(record)
     return out
 
 

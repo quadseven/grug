@@ -39,8 +39,13 @@ class BenchBackend:
 # models Elder uses; overridable by env for an apples-to-apples re-run on a new
 # model. NO endpoint URL is defaulted for the Cave (it is private/tailnet) — it
 # only runs when GRUG_BENCH_CAVE_URL is supplied.
-_OPENROUTER_DEFAULT_MODEL = "anthropic/claude-haiku-4.5"
+_OPENROUTER_DEFAULT_MODEL = "anthropic/claude-opus-4.7"
 _POOLSIDE_DEFAULT_MODEL = "poolside/laguna-m.1"
+
+_OPENROUTER_EXTRA_BODY = {
+    "max_tokens": 32_768,
+    "reasoning": {"effort": "high", "exclude": True},
+}
 
 # Poolside's laguna-m.1 runs thinking ON by default (blew the read timeout +
 # broke JSON parse — see llm_client). Disable it for the benchmark too.
@@ -65,6 +70,7 @@ def configured_backends() -> list[BenchBackend]:
                 ),
                 model=os.getenv("GRUG_BENCH_OPENROUTER_MODEL", _OPENROUTER_DEFAULT_MODEL),
                 api_key=openrouter_key,
+                extra_body=dict(_OPENROUTER_EXTRA_BODY),
             )
         )
 

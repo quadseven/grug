@@ -19,12 +19,20 @@
 
 ## What Grug do
 
-Grug is a modular GitHub bot. Different **personas** across the SDLC. Two ship today:
+Grug is a modular GitHub bot with focused **personas** across the SDLC. Four
+are enabled by default:
 
-- **Chief** (`Grug — Definition of Ready`) — the process gate: static DoR checks on every PR body, plus branch-ruleset self-heal and a `/grug recheck` slash command.
-- **Elder** (`Grug — Code Review`) — the code gate: LLM diff review (whole-file context, 25+ named rules, caveman voice) PLUS a deterministic security suite on every PR: SAST (Semgrep + builtin), dependency-CVE scanning (OSV), committed-secret detection, and IaC misconfiguration scanning — all filtered through an LLM exploitability judge so you see real findings, not noise. Advisory by default; blocking is per-repo opt-in.
+- **Chief** (`Grug - Definition of Ready`) - static PR-readiness checks and
+  branch-ruleset self-heal.
+- **Elder** (`Grug - Code Review`) - durable, deep LLM diff review with
+  whole-file, cross-file, PR-intent, and runtime context.
+- **Guard** (`Grug - Guard`) - Semgrep, dependency-CVE, secret, and IaC
+  detection filtered through an exploitability judge.
+- **Teller** (`Grug - Teller`) - an updatable PR walkthrough with file and
+  effort summaries.
 
-Roadmap personas (epic #464): **Guard** (the security suite gets its own check-run), **Smasher** (cross-file bug hunting + mutation testing), **Omen** (findings backed by live Datadog runtime signal), **Warder** (release gate), **Pulse** (stuck-PR sweep).
+**Smasher**, **Warder**, and **Pulse** are wired as opt-in tracers. Omen runtime
+signal already augments Elder where a repository-to-service mapping exists.
 
 Grug live in GitHub. Grug post Check Runs. Grug never spam comments. **You ship. Grug guard.**
 
@@ -67,15 +75,30 @@ Static checks on PR body — **4 blocking, 1 advisory:**
 | ✅ | `scope-fence` | Has `## Out of scope` section | **yes** |
 | ⚠️ | `issue-link` | Body links an issue via `closes #N` | advisory |
 
-## What Elder checks (Code Review)
+## What Elder and Guard check
 
-Every PR diff, on every pushed head SHA (idempotent per SHA):
+### Elder: deep code review
 
-- **LLM review** — whole-file context, 25+ named rules (correctness, error
-  handling, concurrency, security shapes like TLS-verify-off and
-  monotonic-clock sentinels), inline comments in the caveman voice, one
-  check-run rollup. Backends: Poolside / OpenRouter, with a self-hosted
-  fallback over an SQS airlock when both clouds fail (ADR-0005).
+Every PR snapshot, after its base, head, title, and body remain stable for the
+quiet window:
+
+- **LLM review** - after a durable 90-second quiet-snapshot window, the default
+  deep pass sends whole-file context plus untrusted PR intent to both Poolside
+  and OpenRouter (review-only Opus 4.7 with high-effort reasoning), merges
+  deduplicated findings, and preserves backend/model provenance. It covers 25+
+  named correctness, error-handling, concurrency, and security-shape rules;
+  `GRUG_REVIEW_DEPTH=fast` is the one-primary-plus-fallback rollback. A
+  self-hosted fallback remains behind an SQS airlock when both clouds fail
+  (ADR-0005). If only one deep backend succeeds, its findings are published as
+  provisional advice and the durable job retries instead of recording a clean
+  completed review.
+- **Feedback learning** - judge labels and write-authorized maintainer reactions
+  retain per-model provenance. Confirmed findings refresh positive practices and
+  few-shot examples; false positives become bounded AVOID guidance for later
+  reviews. Reactions from users without write access cannot steer the prompt.
+
+### Guard: deterministic security review
+
 - **SAST** — Semgrep OSS over vendored offline rules + a zero-dep builtin
   detector (sql/command/template injection, path traversal, SSRF, unsafe
   deserialization, weak crypto, cleartext secret logging).
@@ -88,17 +111,15 @@ Every PR diff, on every pushed head SHA (idempotent per SHA):
   security candidate real-vs-noise before it reaches your PR; recall +
   precision are tracked against a committed benchmark corpus.
 
-Advisory-first: findings post as `neutral` until you flip
-`code_reviewer_blocking` per repo.
+Advisory-first: Elder and Guard findings post as `neutral` until their separate
+per-repo blocking flags are enabled.
 
 ## Roadmap (epic #464)
 
-- **Guard** — the security suite above graduates to its own persona + check-run
-- **Smasher** — 1-hop cross-file context, then diff-scoped mutation testing
-- **Omen** — findings fused with live Datadog error signal ("this function threw 47x today")
-- **Warder** — changelog draft + semver hint + deploy gating
-- **Pulse** — stuck-PR nudges on the scheduled poller
-- **LLM scope review for Chief** — title/body match, AC testability, scope-creep flag
+- expand Smasher beyond its mutation-testing tracer
+- add deploy gating to Warder's changelog and semver analysis
+- deepen Pulse's scheduled project-health sweep
+- add title/body scope review to Chief
 
 ## Architecture
 

@@ -28,10 +28,13 @@ def test_derive_ranks_by_hits_then_recency():
     assert ps[1].finding_class == "correctness"
 
 
-def test_derive_excludes_false_positives():
+def test_derive_turns_false_positives_into_negative_guidance():
     rows = [_r(1, "x", "real"), _r(2, "x", "wrong", verdict="false-positive")]
     ps = derive_practices(rows)
-    assert ps[0].hits == 1 and ps[0].rule == "real"
+    assert {(p.disposition, p.rule) for p in ps} == {
+        ("report", "real"),
+        ("avoid", "wrong"),
+    }
 
 
 def test_representative_rule_is_most_recent():
@@ -46,9 +49,14 @@ def test_decay_drops_stale_classes():
     assert classes == {"fresh"}
 
 
-def test_empty_and_all_fp_yield_no_practices():
+def test_empty_yields_no_practices_and_all_fp_yields_avoidance():
     assert derive_practices([]) == []
-    assert derive_practices([_r(1, "x", "w", verdict="false-positive")]) == []
+    practices = derive_practices([
+        _r(1, "x", "w", verdict="false-positive"),
+    ])
+    assert len(practices) == 1
+    assert practices[0].disposition == "avoid"
+    assert "AVOID FALSE POSITIVE" in practices_block(practices)
 
 
 def test_block_is_bounded_and_labeled():
