@@ -291,11 +291,13 @@ class LlmReviewResponse:
 
     `kind` is the load-bearing discriminator the caller switches on:
       - `"no_diff"`: empty hunks, no LLM ran. Don't post anything.
-      - `"reviewed"`: every backend required by the selected review depth
-        returned a parseable payload. `findings` may be empty (clean review).
-        Always carries backend + model attribution.
-      - `"partial"`: deep mode received a usable response from only one
-        backend. Findings are provisional and the durable worker must retry.
+      - `"reviewed"`: at least one deep backend (the free-tier pair is
+        best-effort) returned a parseable payload; findings merge whatever
+        answered. `findings` may be empty (clean review). Always carries
+        backend + model attribution.
+      - `"partial"`: NO LONGER produced by `review_diff` - a single-backend
+        reply is now a complete `reviewed` result. The member is retained
+        only for the not-yet-removed downstream retry machinery.
       - `"parse_failed"`: LLM responded with non-JSON or prose. Caller
         posts an advisory check-run with the error.
       - `"all_failed"`: every backend errored. Caller posts a
@@ -1090,12 +1092,12 @@ def review_diff(
 
     Returns one of five discriminated states (`response.kind`):
       - `no_diff`: empty hunks short-circuit, no LLM call made.
-      - `reviewed`: every backend required by the selected depth returned a
-        parseable payload.
-      - `partial`: one deep-review backend succeeded and one failed; callers
-        may surface provisional findings but must not treat the pass complete.
+      - `reviewed`: at least one deep backend answered. The two backends are
+        best-effort free tier, so ONE reply is a complete review (findings
+        merge whatever came back); the Cave/Spark judge grades them downstream.
       - `parse_failed`: LLM responded but the content wasn't usable JSON.
-      - `all_failed`: every backend errored or timed out.
+      - `all_failed`: every backend errored or timed out (the Cave fallback
+        then reviews).
 
     `pr_context` carries span tags plus bounded PR intent. Title and body are
     explicitly framed as untrusted repository data and redacted before either
