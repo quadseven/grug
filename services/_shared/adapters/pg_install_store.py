@@ -294,6 +294,22 @@ def set_repo_config(
         raise TypeError(
             f"set_repo_config() persona flags must be bool or None; got {non_bool!r}"
         )
+    # Validate elder_voice values explicitly (must be "caveman" or "sage")
+    if "elder_voice" in persona_flags and persona_flags["elder_voice"] is not None:
+        valid_voices = ("caveman", "sage")
+        val = persona_flags["elder_voice"]
+        if val not in valid_voices:
+            raise ValueError(
+                f"elder_voice must be one of {valid_voices}, got {val!r}"
+            )
+        # Entitlement gate: sage requires allowlisted install
+        if val == "sage":
+            from adapters.pg_install_store import is_install_allowlisted
+            if not is_install_allowlisted(install_id):
+                raise ValueError(
+                    f"elder_voice='sage' requires an allowlisted (paid) installation. "
+                    f"Install {install_id} is not entitled."
+                )
     now = datetime.now(timezone.utc).isoformat()
     updated_fields: dict[str, Any] = {
         flag: value
