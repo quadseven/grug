@@ -366,6 +366,23 @@ def _run_job(spec: _AsyncPersonaSpec, event: dict[str, Any]) -> dict[str, str]:
             f"{spec.log_prefix}_job_done",
             extra={"delivery_id": delivery_id, **result},
         )
+        # A deep review that got only ONE backend is PROVISIONAL, not final
+        # (llm_client kind='partial' -> degraded_reason='partial', mapped to
+        # result='skipped'). The durable lane re-drives these; the legacy
+        # in-process lane returns normally, so without this a partial deep
+        # review would stay unresolved whenever GRUG_ELDER_DURABLE_QUEUE is
+        # off. self_recover enqueues ONE durable re-run (bounded: the rerun
+        # consumer redrives via SQS and never re-enqueues, so no loop). Other
+        # degrade reasons (no_diff / parse_failed / all_failed) are terminal
+        # here and must NOT retry. (Qodo #585: partial review never retried.)
+        if result.get("degraded_reason") == "partial":
+            log.info(
+                f"{spec.log_prefix}_job_partial_recover",
+                extra={"delivery_id": delivery_id},
+            )
+            self_recover_review(
+                payload, delivery_id, persona=spec.rerun_persona
+            )
         return result
     except Exception as e:  # noqa: BLE001 — never retry-storm; degrade contract owns this
         log.error(

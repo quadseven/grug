@@ -138,6 +138,7 @@ These terms exist in the codebase but are inconsistent or under-named. Resolving
 Grug uses **Datadog LLM Observability** to track Elder model calls and collect trusted human feedback from reactions on inline comments.
 
 ### Key terminology
+
 | Term | Definition |
 |---|---|
 | **ML app name** | Datadog organizes traces by ML app. Grug uses `grug-elder` (set on the webhook and consumer workloads). |
@@ -148,6 +149,7 @@ Grug uses **Datadog LLM Observability** to track Elder model calls and collect t
 | **Annotation queue** | Human review workflow in Datadog UI. The `human_verdict` categorical label uses `false_positive` and `confirmed` values to validate judge accuracy over time. |
 
 ### How to inspect Grug traces with pup
+
 ```bash
 # List all projects (Grug project has id e24e1215...)
 pup llm-obs projects list -o json
@@ -167,6 +169,7 @@ pup llm-obs annotation-queues list --project-id <PROJECT_ID>
 ```
 
 ### How reactions become evaluations and learning
+
 1. A maintainer reacts to a Grug inline comment.
 2. `grug-poller` polls the GitHub reactions API.
 3. `poll_and_annotate()` filters reactors by repository permission and classifies the trusted reaction.
@@ -174,6 +177,7 @@ pup llm-obs annotation-queues list --project-id <PROJECT_ID>
 5. The stable comment evidence row refreshes repository practices: confirmed findings become positive guidance/examples; false positives become AVOID guidance.
 
 ### Running issues
+
 - **No traces showing?** Check `DD_LLMOBS_ENABLED=true` on both Elder workloads and verify `elder_code_review` spans under `@ml_app:grug-elder`.
 - **Reactions not appearing?** Confirm `grug-poller` is running and the reactor has repository write/admin permission. New reactions take up to 15 minutes to appear.
 - **Annotations queue empty?** Search for producer spans first. A finding whose producer span failed to export remains learnable but is intentionally not attributed to a different model span.
