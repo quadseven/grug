@@ -647,6 +647,17 @@ def _call_backend(
         raise _BackendConfigError(
             f"{config.backend.value} transport_retry_attempts must be positive"
         )
+    if transport_attempts > config.retry_attempts:
+        # The dispatch loop is bounded by retry_attempts, so a larger transport
+        # budget can never be spent - and worse, a transport error on the final
+        # attempt takes the `continue` branch (attempt < transport_attempts - 1
+        # still holds), exhausts the loop, and raises the spurious
+        # AssertionError below instead of re-raising the real transport error.
+        raise _BackendConfigError(
+            f"{config.backend.value} transport_retry_attempts "
+            f"({transport_attempts}) must not exceed retry_attempts "
+            f"({config.retry_attempts})"
+        )
     for attempt in range(config.retry_attempts):
         try:
             resp = httpx.post(

@@ -226,6 +226,13 @@ def _enqueue_review(
     review — a best-effort contract. In exchange we avoid a new queue +
     consumer + IAM surface for the hot path.
     """
+    # Hash the snapshot identity from the FULL PR body HERE, before
+    # _slim_payload truncates body to _MAX_PR_BODY_CHARS. Otherwise _run_job's
+    # claim_review idempotency key would hash a truncated body and diverge from
+    # the durable lane's full-body hash - a body edit past the cap would be
+    # invisible to dedup (Qodo #585). In-flight jobs enqueued before this field
+    # fall back to hashing the slim pr in _run_job.
+    pr = payload.get("pull_request") or {}
     job = {
         ASYNC_JOB_KEY: spec.job_kind,
         "delivery_id": delivery_id,
@@ -233,6 +240,8 @@ def _enqueue_review(
         # Slim projection — NOT the full payload. See _slim_payload.
         "payload": _slim_payload(payload),
     }
+    if pr:
+        job["review_snapshot_id"] = review_snapshot_id_from_pr(pr)
     if os.getenv("GRUG_K8S_RUNTIME"):
         return _spawn_local(spec, job)
     log.warning(
@@ -333,7 +342,12 @@ def _run_job(spec: _AsyncPersonaSpec, event: dict[str, Any]) -> dict[str, str]:
         pr = payload.get("pull_request") or {}
         head_sha = (pr.get("head") or {}).get("sha")
         if install_id and repo and pr_number and head_sha:
-            snapshot_id = review_snapshot_id_from_pr(pr)
+            # Prefer the full-body hash computed at enqueue; fall back to
+            # hashing the (slim) pr for in-flight jobs enqueued before the
+            # review_snapshot_id field existed (Qodo #585).
+            snapshot_id = event.get("review_snapshot_id") or (
+                review_snapshot_id_from_pr(pr)
+            )
             if not claim_review(
                 install_id=install_id,
                 repo=repo,
