@@ -1286,7 +1286,9 @@ def review_diff(
                 extra={
                     "successful_backends": [r.backend.value for r in successes],
                     "unavailable": last_error,
-                    "installation_id": ctx.get("installation_id"),
+                    # installation_id is a required review_diff param (always
+                    # present); the rest are best-effort from optional pr_context.
+                    "installation_id": installation_id,
                     "repo": ctx.get("repo"),
                     "pr_number": ctx.get("pr_number"),
                     "head_sha": str(ctx.get("head_sha") or "")[:8],
