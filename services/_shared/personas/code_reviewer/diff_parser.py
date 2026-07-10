@@ -177,9 +177,10 @@ def parse_diff(unified_diff: str) -> tuple[DiffHunk, ...]:
                 # for truncate-to-empty commits). Consume the hunk body and
                 # move on, exactly like the deletion case.
                 i += 1
-                while i < len(lines) and not lines[i].startswith(
-                    _HUNK_BOUNDARY_PREFIXES
-                ):
+                while i < len(lines):
+                    hline = lines[i]
+                    if hline.startswith(_HUNK_BOUNDARY_PREFIXES):
+                        break
                     i += 1
                 continue
             # Walk the hunk body collecting added + context-with-removed
