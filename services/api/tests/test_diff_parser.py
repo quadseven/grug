@@ -271,3 +271,75 @@ def test_malformed_diff_git_header_raises_diff_parse_error() -> None:
 """
     with pytest.raises(DiffParseError, match="malformed `diff --git`"):
         parse_diff(diff)
+
+
+def test_emptied_file_hunk_yields_zero_hunks_and_does_not_raise() -> None:
+    """A file EMPTIED to zero bytes (truncate-to-empty commit) keeps its
+    `+++ b/<path>` line - deletion_skip never arms - and still emits a
+    `@@ -1,N +0,0 @@` hunk. new_start=0 crashed parse_diff with an
+    AssertionError that escaped the dispatch degrade contract and
+    crash-looped the consumer into the rerun DLQ (grug PR #577 force-push,
+    2026-07-10). The zero-new-side guard must skip the hunk instead."""
+    diff = """diff --git a/emptied.py b/emptied.py
+index 325e1ec8..e69de29b 100644
+--- a/emptied.py
++++ b/emptied.py
+@@ -1,3 +0,0 @@
+-line_one
+-line_two
+-line_three
+"""
+    assert parse_diff(diff) == ()
+
+
+def test_emptied_file_does_not_swallow_the_next_files_hunks() -> None:
+    """The zero-new-side skip consumes ONLY the emptied file's hunk body;
+    a following file in the same diff must still produce its hunks."""
+    diff = """diff --git a/emptied.py b/emptied.py
+index 325e1ec8..e69de29b 100644
+--- a/emptied.py
++++ b/emptied.py
+@@ -1,2 +0,0 @@
+-gone_one
+-gone_two
+diff --git a/kept.py b/kept.py
+index abc..def 100644
+--- a/kept.py
++++ b/kept.py
+@@ -1,2 +1,3 @@
+ context
+-old
++new
+"""
+    hunks = parse_diff(diff)
+    assert [h.file_path for h in hunks] == ["kept.py"]
+    assert hunks[0].new_start == 1
+
+
+def test_diff_hunk_invariant_violation_raises_diff_parse_error() -> None:
+    """Boundary invariants must raise DiffParseError - the only parser
+    exception the persona dispatch degrade contract catches - never a
+    bare AssertionError (which poisons the consumer's rerun loop, and
+    which `python -O` would silently strip)."""
+    with pytest.raises(DiffParseError, match="new_start must be >= 1"):
+        DiffHunk(
+            file_path="x.py",
+            new_start=0,
+            new_lines=frozenset(),
+            body="@@ -1,1 +0,0 @@",
+        )
+
+
+def test_zero_start_with_nonzero_count_raises() -> None:
+    """`+0,N` (zero start, nonzero count) is malformed unified diff - the
+    zero-new-side skip must only accept the legal `+0,0` shape, never
+    silently swallow a corrupt header (CodeRabbit PR #580)."""
+    diff = """diff --git a/x.py b/x.py
+index abc..def 100644
+--- a/x.py
++++ b/x.py
+@@ -1,3 +0,2 @@
+-gone
+"""
+    with pytest.raises(DiffParseError, match="malformed zero-start"):
+        parse_diff(diff)

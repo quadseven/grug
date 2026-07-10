@@ -6,9 +6,14 @@
 """Async offload of persona reviews off the webhook ACK path (#272/#466/#469).
 
 `receive_github_webhook` must ACK GitHub in <10s, but the async personas
-(Elder's 1-2 LLM calls, Guard's scan+judge, Smasher's Trial Job round-trip)
+(Elder's multi-model review, Guard's scan+judge, Smasher's Trial Job round-trip)
 run far over GitHub's ~10s delivery timeout. So each review runs OFF the
 ACK path: the handler enqueues it and returns immediately.
+
+Elder uses the durable `grug-rerun-jobs` consumer when
+`GRUG_ELDER_DURABLE_QUEUE=1`. That lane owns the quiet window, latest-head
+claim, and stale-head cancellation. The in-process runner remains as the
+local/backward-compatible fallback and still serves the other personas.
 
 On the k8s runtime (#354/#368) the offload is an in-process background
 thread: the webhook pod already carries every dependency the persona paths
@@ -54,6 +59,8 @@ import threading
 from dataclasses import dataclass
 from typing import Any
 
+from personas.code_reviewer.snapshot import review_snapshot_id_from_pr
+
 log = logging.getLogger(f"{os.getenv('DD_SERVICE', 'grug')}.async_dispatch")
 
 # Sentinel marking an async job. Routing keys on `event.get("grug_async_job")`
@@ -69,6 +76,12 @@ WALKTHROUGH_REVIEW_JOB = "walkthrough_review"
 # prefix + delivery-GUID slice, 19 chars total (elder-/guard- keep 13 GUID
 # chars, smasher- keeps 11 — the pre-generalization values, preserved).
 _THREAD_NAME_LEN = 19
+
+# Intent is useful review evidence, but a PR body can approach GitHub's own
+# large payload limits. Keep the async projection bounded.
+_MAX_PR_BODY_CHARS = 12_000
+_DEFAULT_ELDER_SETTLE_SECONDS = 90
+_MAX_ELDER_SETTLE_SECONDS = 300
 
 
 @dataclass(frozen=True)
@@ -157,22 +170,27 @@ _ASYNC_PERSONAS: dict[str, _AsyncPersonaSpec] = {
 
 
 def _slim_payload(payload: dict[str, Any]) -> dict[str, Any]:
-    """Project the GitHub PR payload to ONLY the fields the persona workers
-    (`dispatch_code_review` and siblings) read: `action`, the PR number +
-    head sha, the repo owner/name, and the installation id. The worker
-    re-fetches the diff from GitHub by those IDs, so forwarding the full
-    payload is unnecessary: the slim projection keeps the job minimal and
-    bounded regardless of PR size (a long body + two full repo objects +
-    sender/org are all dropped). Mirrors the dispatch functions' reads —
-    keep in sync if one starts consuming new payload fields.
+    """Project the GitHub PR payload to the bounded fields persona workers use.
+
+    PR title/body and base SHA are review evidence, not event bulk: title/body
+    state the intended contract and base/head form the immutable diff snapshot.
+    The body is capped; sender/org and full repository objects are dropped.
     """
     pr = payload.get("pull_request") or {}
     repo = payload.get("repository") or {}
+    body = str(pr.get("body") or "")[:_MAX_PR_BODY_CHARS]
     return {
         "action": payload.get("action", ""),
         "pull_request": {
             "number": pr.get("number"),
             "head": {"sha": (pr.get("head") or {}).get("sha")},
+            "base": {"sha": (pr.get("base") or {}).get("sha")},
+            "title": str(pr.get("title") or ""),
+            "body": body,
+            "draft": bool(pr.get("draft", False)),
+            "user": {
+                "login": str((pr.get("user") or {}).get("login") or ""),
+            },
         },
         "repository": {
             "owner": {"login": (repo.get("owner") or {}).get("login")},
@@ -208,6 +226,13 @@ def _enqueue_review(
     review — a best-effort contract. In exchange we avoid a new queue +
     consumer + IAM surface for the hot path.
     """
+    # Hash the snapshot identity from the FULL PR body HERE, before
+    # _slim_payload truncates body to _MAX_PR_BODY_CHARS. Otherwise _run_job's
+    # claim_review idempotency key would hash a truncated body and diverge from
+    # the durable lane's full-body hash - a body edit past the cap would be
+    # invisible to dedup (Qodo #585). In-flight jobs enqueued before this field
+    # fall back to hashing the slim pr in _run_job.
+    pr = payload.get("pull_request") or {}
     job = {
         ASYNC_JOB_KEY: spec.job_kind,
         "delivery_id": delivery_id,
@@ -215,6 +240,8 @@ def _enqueue_review(
         # Slim projection — NOT the full payload. See _slim_payload.
         "payload": _slim_payload(payload),
     }
+    if pr:
+        job["review_snapshot_id"] = review_snapshot_id_from_pr(pr)
     if os.getenv("GRUG_K8S_RUNTIME"):
         return _spawn_local(spec, job)
     log.warning(
@@ -271,12 +298,11 @@ def _run_job(spec: _AsyncPersonaSpec, event: dict[str, Any]) -> dict[str, str]:
 
     Two-layer idempotency so the review is never double-posted:
     the delivery claim (`install_store.claim_delivery`, raw or namespaced
-    per spec — see the module docstring) skips a GitHub redelivery /
-    retry of the SAME delivery, and the EXACT head SHA
-    (`install_store.claim_review`, #397) skips a same-SHA re-trigger
-    across DIFFERENT deliveries — a non-push event (`edited` on the PR
-    body, `ready_for_review`) that carries an already-reviewed head SHA.
-    Every NEW head SHA still wins a fresh review.
+    per spec - see the module docstring) skips a replay/manual redelivery of
+    the SAME delivery, and the canonical review snapshot
+    (`install_store.claim_review`, #397) skips only an exact base/head/title/
+    body re-trigger across DIFFERENT deliveries. Same-head intent/base edits
+    and every new head still win a fresh review.
 
     NEVER re-raises: we own idempotency + the advisory-degrade contract
     inside the dispatch functions, so all failures are logged and
@@ -313,23 +339,33 @@ def _run_job(spec: _AsyncPersonaSpec, event: dict[str, Any]) -> dict[str, str]:
         from adapters.install_store import claim_review
 
         install_id, repo, pr_number = _pr_ids(payload)
-        head_sha = ((payload.get("pull_request") or {}).get("head") or {}).get("sha")
+        pr = payload.get("pull_request") or {}
+        head_sha = (pr.get("head") or {}).get("sha")
         if install_id and repo and pr_number and head_sha:
+            # Prefer the full-body hash computed at enqueue; fall back to
+            # hashing the (slim) pr for in-flight jobs enqueued before the
+            # review_snapshot_id field existed (Qodo #585).
+            snapshot_id = event.get("review_snapshot_id") or (
+                review_snapshot_id_from_pr(pr)
+            )
             if not claim_review(
                 install_id=install_id,
                 repo=repo,
                 pr_number=pr_number,
                 persona=spec.review_persona,
-                head_sha=head_sha,
+                # Legacy store parameter name; this is the canonical input
+                # identity, not the actual commit SHA.
+                head_sha=snapshot_id,
             ):
                 log.info(
-                    f"{spec.log_prefix}_job_duplicate_sha_skipped",
+                    f"{spec.log_prefix}_job_duplicate_snapshot_skipped",
                     extra={
                         "delivery_id": delivery_id, "repo": repo,
                         "pr": pr_number, "head_sha": head_sha,
+                        "snapshot_id": snapshot_id[:11],
                     },
                 )
-                return {"status": "skipped", "reason": "duplicate_head_sha"}
+                return {"status": "skipped", "reason": "duplicate_snapshot"}
     except Exception as e:  # noqa: BLE001 — claim is best-effort; degrade to running
         log.warning(
             f"{spec.log_prefix}_job_review_claim_failed_running_anyway",
@@ -344,6 +380,23 @@ def _run_job(spec: _AsyncPersonaSpec, event: dict[str, Any]) -> dict[str, str]:
             f"{spec.log_prefix}_job_done",
             extra={"delivery_id": delivery_id, **result},
         )
+        # A deep review that got only ONE backend is PROVISIONAL, not final
+        # (llm_client kind='partial' -> degraded_reason='partial', mapped to
+        # result='skipped'). The durable lane re-drives these; the legacy
+        # in-process lane returns normally, so without this a partial deep
+        # review would stay unresolved whenever GRUG_ELDER_DURABLE_QUEUE is
+        # off. self_recover enqueues ONE durable re-run (bounded: the rerun
+        # consumer redrives via SQS and never re-enqueues, so no loop). Other
+        # degrade reasons (no_diff / parse_failed / all_failed) are terminal
+        # here and must NOT retry. (Qodo #585: partial review never retried.)
+        if result.get("degraded_reason") == "partial":
+            log.info(
+                f"{spec.log_prefix}_job_partial_recover",
+                extra={"delivery_id": delivery_id},
+            )
+            self_recover_review(
+                payload, delivery_id, persona=spec.rerun_persona
+            )
         return result
     except Exception as e:  # noqa: BLE001 — never retry-storm; degrade contract owns this
         log.error(
@@ -364,7 +417,88 @@ def _run_job(spec: _AsyncPersonaSpec, event: dict[str, Any]) -> dict[str, str]:
 def enqueue_elder_review(
     *, payload: dict[str, Any], delivery_id: str, blocking: bool,
 ) -> bool:
-    """Offload the Elder LLM review (#272). Contract: `_enqueue_review`."""
+    """Offload Elder to the durable quiet-window lane when enabled.
+
+    The consumer re-reads blocking config after settling. A durable enqueue
+    failure raises after logging so the webhook records a failed delivery; the
+    15-minute replay poller can then redeliver it. GitHub does not retry failed
+    webhooks automatically, and acknowledging would hide the failure from that
+    recovery path. The local thread fallback retains its historical boolean/
+    best-effort contract.
+    """
+    if os.getenv("GRUG_ELDER_DURABLE_QUEUE", "").lower() in {"1", "true", "yes"}:
+        try:
+            pr = payload.get("pull_request") or {}
+            if bool(pr.get("draft", False)) and payload.get("action") != "ready_for_review":
+                # Do not consume SQS's five-minute snapshot dedup key for a
+                # draft. A later ready_for_review event can carry the exact
+                # same input and must still enqueue the first real review.
+                log.info(
+                    "elder_enqueue_draft_skipped",
+                    extra={"delivery_id": delivery_id},
+                )
+                return True
+            install_id, repo, pr_number = _pr_ids(payload)
+            head_sha = str(
+                (pr.get("head") or {}).get("sha")
+                or ""
+            )
+            if not (install_id and repo and pr_number and head_sha):
+                log.warning(
+                    "elder_enqueue_durable_missing_ids",
+                    extra={"delivery_id": delivery_id},
+                )
+                raise ValueError("durable Elder enqueue requires complete PR identity")
+            raw_settle = os.getenv(
+                "GRUG_ELDER_SETTLE_SECONDS",
+                str(_DEFAULT_ELDER_SETTLE_SECONDS),
+            )
+            try:
+                settle_seconds = int(raw_settle)
+            except ValueError:
+                log.warning(
+                    "elder_settle_seconds_invalid",
+                    extra={"value": raw_settle},
+                )
+                settle_seconds = _DEFAULT_ELDER_SETTLE_SECONDS
+            settle_seconds = min(
+                _MAX_ELDER_SETTLE_SECONDS, max(0, settle_seconds),
+            )
+
+            from rerun import enqueue_review  # type: ignore[attr-defined]
+
+            enqueue_review(
+                install_id=install_id,
+                repo=repo,
+                pr_number=pr_number,
+                requested_base_sha=str((pr.get("base") or {}).get("sha") or ""),
+                requested_head_sha=head_sha,
+                requested_title=str(pr.get("title") or ""),
+                requested_body=str(pr.get("body") or ""),
+                settle_seconds=settle_seconds,
+            )
+            log.info(
+                "elder_enqueue_durable",
+                extra={
+                    "delivery_id": delivery_id,
+                    "repo": repo,
+                    "pr": pr_number,
+                    "head_sha": head_sha[:8],
+                    "settle_seconds": settle_seconds,
+                },
+            )
+            return True
+        except Exception as e:  # noqa: BLE001 - normalize the retryable handoff error
+            log.error(
+                "elder_enqueue_failed",
+                extra={
+                    "delivery_id": delivery_id,
+                    "kind": type(e).__name__,
+                    "handoff": "durable_sqs",
+                },
+                exc_info=True,
+            )
+            raise RuntimeError("durable Elder review enqueue failed") from e
     return _enqueue_review(
         _ASYNC_PERSONAS["code_reviewer"],
         payload=payload, delivery_id=delivery_id, blocking=blocking,

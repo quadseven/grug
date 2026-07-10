@@ -38,7 +38,10 @@ def test_enqueue_rerun_sends_fifo_with_content_dedup(monkeypatch):
         rerun.enqueue_rerun(install_id=11, repo="myorg/myrepo", pr_number=7, persona="elder")
     kw = send.call_args.kwargs
     assert kw["QueueUrl"] == "https://sqs/grug-rerun-jobs.fifo"
-    assert kw["MessageGroupId"] == "11"  # per-install serialization
+    assert kw["MessageGroupId"] == rerun.rerun_group_id(
+        11, "myorg/myrepo", 7, "elder",
+    )
+    assert len(kw["MessageGroupId"]) <= 128
     # Dedup on (install,repo,pr,persona) — NO head_sha (re-run targets current head).
     assert kw["MessageDeduplicationId"] == "11:myorg/myrepo:7:elder"
     body = json.loads(kw["MessageBody"])

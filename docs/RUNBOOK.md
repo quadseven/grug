@@ -100,12 +100,12 @@ certificate - see the Roles Anywhere section below.
 | `/readyz` 503 but `/livez` 200 | a dependency (SSM/KMS/Postgres) is down — by design (#404) | check the dependency; `/readyz` recovers on the next TTL once it's back |
 | 5xx through Cloudflare | tunnel down or pods not ready | check the tunnel + `kubectl -n grug get pods`; the workload-not-ready monitor pages (#406) |
 | `cf_shared_secret_mismatch` burst | CF shared-secret drifted vs SSM, or a direct-to-origin probe | the CF auth-boundary monitor pages; reconcile the secret |
-| A required PR check stuck/missing after a brief outage | the inline DoR/TPM delivery errored during the outage; GitHub gave up (infra #1254) | self-heals: the `grug-poller` CronJob replays errored deliveries every 15m (#407); force it with the manual replay below |
+| A required PR check stuck/missing after a brief outage | the inline DoR/TPM delivery errored and GitHub does not auto-redeliver (infra #1254) | self-heals: the `grug-poller` CronJob replays errored deliveries every 15m (#407); force it with the manual replay below |
 
 ## Missed-delivery replay (#407)
 
-The DoR/TPM check runs inline on the webhook, so a GitHub delivery that arrives
-while grug is down is lost. Recovery:
+The DoR/TPM check runs inline on the webhook. GitHub does not automatically
+redeliver a failed webhook, so recovery is owned here:
 
 - **Automatic:** the `grug-poller` CronJob (every 15m) calls
   `delivery_replay.replay_since()` each tick — it lists App webhook deliveries
@@ -159,8 +159,9 @@ dashboards. (A legacy DynamoDB table is still declared but is NOT the app store
 **Rebuild:** `iac.deploy.yml` (infra) then `deploy.k8s.yml` (app). Re-seed the
 admin row if the database was lost: `infra/scripts/seed-admin.py` writes to
 Postgres `grug_kv` (needs `GRUG_DATABASE_URL`); without it the allowlist gate
-no-ops every PR. PR check-runs queue + auto-retry (GitHub retries 5xx ~3x over
-~30 min), so they recover after the rollout.
+no-ops every PR. GitHub does not automatically retry failed webhooks. The
+`grug-poller` replays failed App deliveries every 15 minutes, so recovery after
+the rollout depends on that CronJob being healthy.
 
 **KMS caveat:** OAuth tokens are envelope-encrypted under the CMK DEK; if the
 CMK is destroyed + recreated, old encrypted tokens become unrecoverable and
@@ -274,16 +275,24 @@ The #389 retirement REMOVED the static key, the reserve Secret, and the
 Elder ships in advisory mode by default. After a deploy that changes
 `dispatcher.py` / `dispatch.py` / `llm_client.py`, verify on a real PR.
 
-**Prerequisites:** SSM `/infra/llm/{poolside,openrouter}_api_key` loaded (the
-webhook pod mounts them via `grug-secrets`); `code_reviewer_enabled=True`,
+**Prerequisites:** SSM `/infra/llm/{poolside,openrouter}_api_key` loaded and
+readable by the Elder workloads; `code_reviewer_enabled=True` and
 `code_reviewer_blocking=False` on the test repo's RepoConfig (defaults).
+Production manifests must show `GRUG_ELDER_DURABLE_QUEUE=1` and
+`GRUG_ELDER_SETTLE_SECONDS=90` on `grug-webhook`, plus
+`GRUG_REVIEW_DEPTH=deep` and
+`GRUG_OPENROUTER_REVIEW_MODEL=anthropic/claude-opus-4.7` on both webhook and
+consumer.
 
-**Steps:** open a small PR on a Grug-installed repo; wait ~30s; verify (1) the
-`Grug — Code Review` check-run (conclusion `neutral` in advisory mode), (2) at
-least one inline `(file, line)` review comment, (3) DD log
-`service:grug-webhook @event:code_reviewer_dispatched` carrying
-`installation_id`/`pr`/`head_sha`/`backend`/`model`/`findings_count`/`result`.
-Backends round-robin by `installation_id % 2` (poolside even / openrouter odd).
+**Steps:** open a small PR on a Grug-installed repo and leave its head unchanged
+for at least 90 seconds. Verify (1) webhook log `elder_review_enqueued`, (2)
+consumer log `elder_review_settling`, (3) two `elder_code_review` LLM-Obs spans,
+one for Poolside/Laguna and one for OpenRouter/Opus 4.7, and (4) the Elder
+check-run (`neutral` in advisory mode) plus any inline `(file, line)` findings.
+The consumer's `code_reviewer_dispatched` / `elder_review_durable_done` logs
+must carry the stable head and final result. Deep inference starts only after
+the quiet window, so a normal end-to-end check takes materially longer than
+the old single-pass ~30-second path.
 
 **Failure-mode checks:** no check-run -> DD
 `@event:(code_review_fetch_or_parse_failed OR code_review_check_run_publish_failed OR code_review_degraded_publish_failed)`;
@@ -353,27 +362,44 @@ consumer/telemetry thread is down entirely - treat as consumer-down and
 check the workload monitors + pod state.
 
 Off the webhook ACK path (#272, k8s mechanics #368): the sync handler ACKs
-GitHub (<10s) and runs the Elder review on an **in-process daemon thread**
-(`async_dispatch.run_elder_job`), idempotent on the `X-GitHub-Delivery` id (a
-`DELIVERY#<id>` claim row in Postgres `grug_kv`).
+GitHub in under 10 seconds after writing a snapshot-scoped `kind=review`
+message to `grug-rerun-jobs.fifo`. Snapshot identity covers base SHA, head SHA,
+title, and body; FIFO ordering is per PR. The webhook stamps a 90-second settle
+duration. The consumer fetches the current PR and leases that snapshot, waits,
+then fetches it again. If code, base, or intent changed, the consumer enqueues
+the freshly fetched eligible snapshot, releases the stale lease, and publishes
+nothing from stale input. A stable snapshot continues through deep inference
+against the immutable base/head compare. The dispatcher checks the full
+snapshot and open/non-draft eligibility before inference and again before
+publication. Review messages renew both their SQS visibility and ownership-token
+database leases every 120 seconds. A dead worker's expired lease is reclaimable;
+a completed snapshot leaves a 30-day tombstone. Model, freshness-check, or
+publication failures release the owned lease and raise so SQS redrives the
+message. Four bounded workers consume separate per-PR FIFO groups, so one deep
+review cannot globally block unrelated reviews or `/grug ask`. Repeated failures
+reach the rerun DLQ.
 
 - **`[grug-webhook] Elder async-offload failures`** fires on
-  `elder_enqueue_failed` (the offload couldn't start) or `elder_job_unhandled`
-  (the worker hit an unhandled error). **Self-recovery (#418):** an
-  `elder_job_unhandled` no longer waits for a human re-push — it enqueues ONE
-  durable re-run to `grug-rerun-jobs`, and the `grug-consumer` re-runs it with
-  the SQS redrive contract (visibility timeout -> DLQ after maxReceiveCount).
-  Grab the `delivery_id` from the log line (it carries `exc_info`). A
-  pod-restart-mid-review drop has no job to enqueue from and still re-triggers
-  on next push.
-- Review never appears, no failure log -> check `elder_job_duplicate_skipped`
-  (a redelivery correctly deduped — the first run already did it) + confirm via
-  `elder_job_done`.
+  `elder_enqueue_failed`: the durable message was not accepted, so inspect the
+  webhook's `GRUG_RERUN_QUEUE_URL`, Roles Anywhere session, and SQS grant. There
+  is no synchronous fallback because preserving the GitHub ACK budget is the
+  stronger contract. The request returns 5xx so GitHub records a failed
+  delivery; GitHub does not retry it automatically. Confirm the 15-minute
+  delivery replay poller is healthy. `elder_job_unhandled` now indicates only
+  the local-thread compatibility path (`GRUG_ELDER_DURABLE_QUEUE` absent/false).
+- Review never appears, no enqueue failure -> follow the snapshot through
+  `elder_review_enqueued`, `elder_review_settling`, then one of
+  `elder_review_durable_done`, `elder_review_stale_snapshot_cancelled`, or
+  `elder_review_duplicate_snapshot_skipped`. A consumer exception leaves the
+  message for visibility redrive; persistent failures land in the rerun DLQ and
+  page through the owned queue monitors.
 - **`[grug-webhook] Elder fallback failed`** (P2): the cave fallback is LIVE
-  (ADR-0005, #310/#316/#313, flag ON since 2026-06-10). Clouds-down
-  (`code_review_llm_degraded`) is NORMAL — the SaaS backends are unfunded by
-  deliberate choice (**do NOT top up OpenRouter/Poolside**) and the Cave heals
-  each dropped review. This monitor fires only when the BACKSTOP fails (Cave
+  (ADR-0005, #310/#316/#313). A one-cloud failure is visible as a provisional
+  partial review and is retried rather than marked complete.
+  `code_review_llm_degraded` with `kind=all_failed` means no cloud pass produced
+  a usable response and the Cave path is needed. Check API credit/key/timeout
+  health before treating repeated cloud failure as normal.
+  This monitor fires when the backstop also fails (Cave
   answered degraded, fallback enqueue failed, queue URL missing, or a big diff
   couldn't spill to S3). Investigate the `grug-cave-connector` pod, the egress
   relay, the Cave host, the cave DLQs. Re-run the errored Activity row from the
@@ -382,17 +408,19 @@ GitHub (<10s) and runs the Elder review on an **in-process daemon thread**
 ### Elder prompt A/B experiment (#191)
 
 <a id="elder-prompt-experiment"></a>
-Two arms: **v1** (precision, the control) and **v2** (recall), chosen per
-install by `select_prompt_variant` from SSM String `/grug/elder-prompt-experiment`
-(`off` | `split` | `all_v2`). The arm rides each review's DD LLM-Obs span as
-`variant_id`. The variant split `(id // 2) % 2` is orthogonal to the backend
-split `id % 2` (a 2x2 grid).
+Two arms remain: **v1** (precision) and **v2** (recall). Production
+`GRUG_REVIEW_DEPTH=deep` deliberately pins v2 for both backends, so the SSM
+experiment does not split normal production reviews. In `fast` mode,
+`select_prompt_variant` reads `/grug/elder-prompt-experiment`
+(`off` | `split` | `all_v2`) and the selected arm rides the review's DD LLM-Obs
+span as `variant_id`.
 
-**Check cell balance before flipping** — bucket the allowlisted installs by
-`(backend, variant)`. The install IDs live in Postgres `grug_kv` now (NOT
-DynamoDB); query them with SQL against `grug_kv` (the `INST#...:META` rows) and
-bucket each `id` as `b=(id%2==0?poolside:openrouter)`, `v=((id//2)%2==1?v2:v1)`.
-Aim for all four cells populated before trusting a result.
+**Check cell balance before a fast-mode experiment** - bucket the allowlisted
+installs by `(primary backend, variant)`. The install IDs live in Postgres
+`grug_kv` (not DynamoDB); query the `INST#...:META` rows and bucket each id as
+`b=(id%2==0?poolside:openrouter)`, `v=((id//2)%2==1?v2:v1)`. Aim for all four
+cells before trusting a fast-mode result. Deep-mode samples are dual-backend v2
+and must not be mixed into that comparison.
 
 **Flip the arm** (no redeploy; `ignore_changes=["value"]` keeps Pulumi off it):
 ```bash
@@ -400,23 +428,61 @@ aws ssm put-parameter --name /grug/elder-prompt-experiment --region us-east-1 \
   --type String --overwrite --value split   # or: all_v2 | off
 ```
 The mode is `lru_cache`d per pod, so a flip takes effect on the next pod
-recycle; force a fast cutover with
-`kubectl -n grug rollout restart deploy/grug-webhook`, or wait for the fleet to
-turn over before trusting the split. A garbage value logs
+recycle. In a deliberate fast-mode experiment, restart both review-capable
+deployments (`kubectl -n grug rollout restart deploy/grug-webhook
+deploy/grug-consumer`) before trusting the split. A garbage value logs
 `prompt_experiment_mode_unrecognized` and degrades to `off`.
 
-**Arm-up record (2026-06-10, #276):** live population is one install (the
-maintainer -> `poolside x v2`; other cells empty), so the experiment is a
-**temporal** comparison (v2 post-flip vs v1 history) on the
-[DD notebook #14750419](https://app.datadoghq.com/notebook/14750419). Confounds:
-SaaS backends are unfunded (arm sample accrues only when a cloud answers); and
-cave-fallback reviews carry no `variant_id` (the connector uses its own prompt)
-— exclude healed reviews. Re-run the cell-balance check before switching to
-`split`.
+**Historical arm-up record (2026-06-10, #276):** the population was one install
+(`poolside x v2`; other cells empty), so the notebook comparison was temporal:
+[DD notebook #14750419](https://app.datadoghq.com/notebook/14750419). That record
+predates the deep dual-backend default and is not evidence about the current
+ensemble. Cave-fallback reviews still carry no `variant_id`; exclude them from
+any prompt-arm analysis.
+
+### Elder feedback learning
+
+Each posted Elder inline comment stores the redacted finding, reviewed SHA, PR
+author, and all model-origin span IDs for 30 days. On new records the poller
+checks each reactor through GitHub's collaborator-permission endpoint and
+trusts only users with `write` or `admin` access. A changed verdict:
+
+1. submits `human_verdict` to every model span that produced the finding;
+2. upserts a stable `grug-elder` row in the repository ledger; and
+3. recomputes the bounded practice and few-shot caches used by later reviews.
+
+A thumbs-up becomes positive practice/few-shot evidence. A thumbs-down records a
+false positive, removes it from positive examples, and creates bounded `AVOID
+FALSE POSITIVE` guidance requiring materially new evidence before Elder repeats
+the pattern. Reactions by users without write access do not annotate or train.
+Legacy records without capture metadata remain observable under the old DD-only
+behavior and never auto-train.
+
+Inspect `reaction_poll_cycle`, `reaction_submit_or_persist_failed`, and the
+repo's `LEDGER#<owner/repo>` rows when feedback is not appearing. The ledger
+write and cache refresh happen before `last_verdict` advances, so a transient
+store failure retries the idempotent learning update on the next poll.
 
 ### Rollback
 
-Disable Elder per-repo by flipping `code_reviewer_enabled=False` on the repo's
-RepoConfig — update the row in Postgres `grug_kv` (SQL `UPDATE`) or via the
-admin dashboard. (A global SSM kill switch is future-roadmap, not implemented.)
+For an immediate latency/cost rollback without disabling Elder, set
+`GRUG_REVIEW_DEPTH=fast` on **both** review-capable deployments:
 
+```bash
+kubectl -n grug set env deploy/grug-webhook deploy/grug-consumer \
+  GRUG_REVIEW_DEPTH=fast
+kubectl -n grug rollout status deploy/grug-webhook
+kubectl -n grug rollout status deploy/grug-consumer
+```
+
+This restores one primary review backend with the other used only on failure;
+it does not change the judge, Teller, or `/grug ask` model. The manifest remains
+`deep`, so this live override is temporary and the next deploy restores deep
+mode unless the manifest is changed in a reviewed rollback.
+
+If the durable queue path itself is the fault, remove
+`GRUG_ELDER_DURABLE_QUEUE` from the webhook deployment to use the compatibility
+thread path while repairing SQS; this gives up pod-restart durability and the
+quiet/stale-head gate. Disable Elder entirely per repo by flipping
+`code_reviewer_enabled=False` in Postgres `grug_kv` or through the admin
+dashboard. A global SSM kill switch is not implemented.

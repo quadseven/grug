@@ -341,8 +341,11 @@ _rerun_jobs_queue = aws.sqs.Queue(
     name="grug-rerun-jobs.fifo",
     fifo_queue=True,
     content_based_deduplication=False,  # api supplies MessageDeduplicationId
-    # >= the webhook Lambda timeout (the SQS→Lambda ESM rule, learned #310).
-    visibility_timeout_seconds=420,
+    # Fallback budget for deep Elder reviews if the consumer's review-only
+    # ChangeMessageVisibility heartbeat is temporarily unavailable during a
+    # deploy. Healthy consumers renew a 600s per-message lease every 120s, so
+    # a pod death normally redrives much sooner than this shared 15m ceiling.
+    visibility_timeout_seconds=900,
     redrive_policy=_rerun_dlq.arn.apply(
         lambda arn: json.dumps({"deadLetterTargetArn": arn, "maxReceiveCount": 3})
     ),

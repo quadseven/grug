@@ -36,7 +36,7 @@ from .scoring import CaseReplay
 log = logging.getLogger("grug.elder_eval")
 
 # Measure the SHIPPED prompt (see sast_benchmark.runner._BENCH_PROMPT_VARIANT).
-_PROMPT_VARIANT = "v1"
+_PROMPT_VARIANT = "v2"
 _GITHUB_API = "https://api.github.com"
 _DIFF_TIMEOUT_SECONDS = 30.0
 # Bound the replay context like the live review path bounds its own input.

@@ -37,8 +37,8 @@ Two planes now: a **Kubernetes namespace** (`grug`) holding every runtime worklo
 | Workload | Kind | Shape | Purpose |
 |---|---|---|---|
 | `grug-api` | Deployment (1 replica) | arm64, 50m/192Mi req, 512Mi limit, RollingUpdate `maxUnavailable:0` | FastAPI HTTP service for the dashboard/OAuth/admin. Serves `:8080`, `/livez` + dependency-aware `/readyz` (#404) |
-| `grug-webhook` | Deployment (1 replica) | same shape; `GRUG_K8S_RUNTIME=1` | GitHub webhook receiver. ACKs in <10s and offloads the Elder review to an in-process background thread (#368) |
-| `grug-consumer` | Deployment (1 replica, Recreate) | no HTTP surface; `command: consumer.py` | Long-polls the SQS FIFO queues (`grug-rerun-jobs`, `grug-cave-results`) and runs Elder re-runs (#368). One replica by design — batch-size-1 FIFO, a second would interleave message groups |
+| `grug-webhook` | Deployment (1 replica) | same shape; `GRUG_K8S_RUNTIME=1`, `GRUG_ELDER_DURABLE_QUEUE=1` | GitHub webhook receiver. ACKs in under 10s after persisting a snapshot-scoped Elder job with a 90-second settle duration to SQS |
+| `grug-consumer` | Deployment (1 replica, Recreate) | no HTTP surface; `command: consumer.py`; deep Elder config; four rerun workers | Long-polls the SQS FIFO queues, runs quiet-window Elder reviews and explicit reruns, and answers `/grug ask`. Per-PR workload groups preserve local ordering while unrelated work runs concurrently |
 | `grug-poller` | CronJob (`*/15`) | `poller_handler.handler` | Reaction poller (was an EventBridge-scheduled Lambda) |
 
 One Dockerfile (`services/Dockerfile`, ARG SERVICE) builds two images: api runs its own, the rest share the webhook image (full dependency graph); only `command`/env differ. Shared hardening: `runAsNonRoot` (uid 10001), `readOnlyRootFilesystem`, `drop: [ALL]`, `automountServiceAccountToken:false` (the Smasher launcher SA is the exception, #469), arm64 `nodeSelector`, `imagePullSecrets: registry-pull`. Since #389 every workload derives AWS creds from its Roles Anywhere certificate (cert-manager leaf + aws_signing_helper credential_process).
@@ -58,7 +58,7 @@ The pods do **not** carry app secrets (App key, OAuth secrets, LLM keys, CF shar
 |---|---|---|
 | SSM `/grug/*` | App ID, private key, webhook secret, OAuth client id+secret, session-signing secret, CF shared secret, KMS CMK ARN, database URL, DD RUM app id+token, prompt-experiment + fallback flags | SecureStrings; some Pulumi-managed (RUM ids), most hand-seeded (HITL prereqs) |
 | SSM `/infra/llm/*` | `openrouter_api_key`, `poolside_api_key` | Elder LLM backends (shared infra namespace) |
-| SQS FIFO | `grug-rerun-jobs.fifo`, `grug-cave-results.fifo`, `grug-cave-jobs.fifo` (+ DLQs) | Consumed by `grug-consumer`; redrive → DLQ at `maxReceiveCount` |
+| SQS FIFO | `grug-rerun-jobs.fifo`, `grug-cave-results.fifo`, `grug-cave-jobs.fifo` (+ DLQs) | `grug-rerun-jobs` carries snapshot-scoped Elder reviews, explicit reruns, and questions in separate bounded workload groups; failures redrive to a DLQ at `maxReceiveCount` |
 | KMS CMK | `grug-tokens` | Envelope-encrypts user OAuth/credential blobs (`crypto/kms_envelope`). `grug-api` holds `kms:Decrypt`; webhook uses the GitHub App JWT instead |
 | S3 | `grug-cave-diffs*` | Cave (self-hosted LLM) diff hand-off bucket |
 | DynamoDB | `grug-main` | **Legacy — NOT the store.** Exists in Pulumi state; the store is Postgres `grug_kv`. Removal is a separate decision |
@@ -143,8 +143,10 @@ sequenceDiagram
     participant SVC as k8s Service<br/>grug-webhook:8080
     participant WH as grug-webhook pod
     participant PG as Postgres grug_kv
-    participant Thread as in-process Elder thread
     participant SQS as SQS grug-rerun-jobs
+    participant C as grug-consumer pod
+    participant Pool as Poolside Laguna
+    participant OR as OpenRouter Opus 4.7
 
     GH->>CFDNS: POST /webhook/github<br/>X-Hub-Signature-256: sha256=...
     CFDNS->>Worker: route webhook.grug.lol/*
@@ -155,10 +157,30 @@ sequenceDiagram
     alt signature valid
         WH->>PG: read INST#<id> (allowlist check)
         PG-->>WH: allowlisted=true
-        WH->>Thread: enqueue_elder_review (background thread, #368)
+        WH->>SQS: enqueue snapshot-scoped review<br/>settle_seconds=90
         WH-->>SVC: 200 (ACK < 10s)
-        Thread->>Thread: run Elder review (1-2 LLM calls)
-        Note over Thread,SQS: on unhandled failure -> _self_recover_review<br/>enqueues ONE re-run to grug-rerun-jobs (#418)
+        SQS-->>C: long-poll returns review job
+        C->>GH: fetch current PR snapshot
+        C->>PG: lease current base/head/title/body snapshot
+        C->>C: wait 90s quiet window
+        C->>GH: refetch current PR snapshot
+        alt snapshot eligible and unchanged
+            C->>GH: fetch immutable base...head diff
+            C->>Pool: deep review pass
+            C->>OR: deep review pass<br/>high-effort reasoning
+            C->>C: merge + deduplicate findings
+            C->>C: judge findings in bounded batches
+            C->>GH: recheck full snapshot + eligibility
+            alt snapshot still eligible and unchanged
+                C->>GH: publish check-run + inline review
+            else snapshot changed or PR ineligible
+                C->>C: cancel before publication<br/>enqueue fresh eligible snapshot
+            end
+        else snapshot changed or PR ineligible
+            C->>C: cancel stale job; publish nothing
+            C->>SQS: enqueue freshly fetched eligible snapshot
+        end
+        C->>SQS: delete completed/stale message
     else signature invalid
         WH-->>SVC: 401
         Note over WH,SVC: DD monitor on sig-verify failures fires here
@@ -168,7 +190,7 @@ sequenceDiagram
     CFDNS-->>GH: response
 ```
 
-The webhook never decrypts user tokens — it authenticates as the GitHub App (JWT signed with `/grug/github-app-private-key`). The Elder review runs on a daemon thread so a pod restart drops it best-effort; #418 self-recovery enqueues a durable re-run to SQS so a dropped review heals without a human re-push (see `reference_grug_auto_recovery_rerun_queue`).
+The webhook never decrypts user tokens - it authenticates as the GitHub App (JWT signed with `/grug/github-app-private-key`). Elder's normal hot path is durable before the ACK, so either pod may restart without losing queued work. SQS visibility and ownership-token database leases renew during long reviews. The consumer supplies bounded, redacted intent and code/runtime context to both reviewers and the publication judge. `GRUG_REVIEW_DEPTH=deep` requires both review passes before completion; a one-backend result is provisional and retried. Write-authorized reactions train only real producer spans: confirmed findings become positive examples and false positives become AVOID guidance. The legacy in-process Elder worker is compatibility-only when `GRUG_ELDER_DURABLE_QUEUE` is absent or false.
 
 ---
 
@@ -179,27 +201,39 @@ sequenceDiagram
     autonumber
     participant Q1 as SQS grug-rerun-jobs.fifo
     participant Q2 as SQS grug-cave-results.fifo
-    participant C as grug-consumer pod<br/>(long-poll, batch 1)
+    participant C as grug-consumer pod<br/>(four rerun workers)
     participant PG as Postgres grug_kv
     participant GH as GitHub Checks API
     participant DLQ as SQS DLQ
 
     C->>Q1: ReceiveMessage (long poll)
-    Q1-->>C: rerun job (or empty)
-    C->>C: dispatch_code_review (full Elder re-run)
-    C->>PG: claim_delivery (idempotency)
-    C->>GH: post check-run / review
+    Q1-->>C: normal review or explicit rerun job (or empty)
+    alt normal snapshot-scoped review
+        C->>GH: fetch current PR
+        C->>PG: acquire + renew snapshot lease
+        C->>C: wait 90s; refetch
+        C->>C: stable -> deep review; moved -> enqueue fresh + cancel
+    else explicit operator/recovery rerun
+        C->>C: dispatch persona on current head immediately
+    end
+    C->>GH: post check-run / review when dispatched
     alt success
         C->>Q1: DeleteMessage
     else unhandled failure
         Note over C,Q1: no delete -> visibility timeout -> redeliver
         Q1->>DLQ: after maxReceiveCount (terminal, visible signal)
     end
-    C->>Q2: ReceiveMessage (cave results, same loop)
+    C->>Q2: ReceiveMessage (dedicated cave-results worker)
     Q2-->>C: cave result -> post to GitHub
 ```
 
-The consumer is the recovery layer for dropped async reviews (the SQS redrive contract retries; a persistent failure lands in the DLQ). A watchdog (#405/#412) exits the process if a consumer thread dies so the kubelet restarts the pod; `tracer.flush()` is bounded by `DD_TRACE_AGENT_TIMEOUT_SECONDS=2` so a dead trace agent can't stall the watchdog.
+The consumer is both Elder's normal durable execution plane and the recovery
+layer for explicit reruns. The SQS redrive contract retries a raised handler;
+a persistent failure lands in the DLQ. Completed stale-head cancellations are
+deleted normally because a newer webhook message owns the replacement work. A
+watchdog (#405/#412) exits the process if a consumer thread dies so the kubelet
+restarts the pod; `tracer.flush()` is bounded by
+`DD_TRACE_AGENT_TIMEOUT_SECONDS=2` so a dead trace agent cannot stall it.
 
 ---
 

@@ -134,17 +134,18 @@ no store edits.
     monitor.
   - **async** (Elder): an unexpected dispatch exception is a HANDOFF
     failure - the review was never durably enqueued. Swallowing it into
-    a 200 would drop the review with no GitHub redelivery, strictly worse
+    a 200 would hide the failed handoff from delivery recovery, strictly worse
     than the pre-registry code where the enqueue exception propagated and
     500ed. So the loop re-raises the first async-handoff error AFTER
-    running every persona: the delivery is non-2xx, GitHub redelivers,
-    and the inline personas that already ran re-publish idempotently per
-    head_sha (parity with the old behavior).
-  The deliberate #272 EXPECTED-failure path is unchanged: when
-  `enqueue_elder_review` returns False (throttle/backpressure), Elder's
-  dispatch returns `result=enqueue_failed` and 200s - a drop that
-  re-triggers on the next push, monitored by the elder-offload alert, NOT
-  re-raised. Store-read failures (`is_persona_enabled`, `get_repo_config`)
+    running every persona: the delivery is recorded non-2xx and the owned
+    15-minute replay poller can redeliver it. GitHub does not retry failed
+    webhooks automatically. Inline personas that already ran may republish on
+    replay; preserving the missing durable Elder handoff takes precedence, and
+    the check-run surface tolerates that rare duplicate.
+  The `enqueue_elder_review` returns-False path now applies only to the local
+  compatibility runner. Production durable enqueue failures raise, retain the
+  historical `elder_enqueue_failed` alert event, and become replay-eligible.
+  Store-read failures (`is_persona_enabled`, `get_repo_config`)
   remain OUTSIDE the guard and still 500, preserving replay eligibility
   for store outages.
 - The moved TPM/Elder dispatch logs (`tpm_publish_failed`,

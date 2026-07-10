@@ -21,8 +21,9 @@ added lines). The lazy tree-sitter repo index is #346 P1.2, deferred.
 
 FAIL-SAFE contract: every error path degrades to `{}` - today's
 diff-only review - and logs `cross_file_context_degraded`. No cache:
-`claim_review` already guarantees one review per head SHA, so a
-per-head_sha cache would never hit.
+The durable snapshot claim already guarantees one completed review per exact
+base/head/intent input, so a per-head cache would rarely hit and could return
+context for the wrong base or intent.
 """
 
 from __future__ import annotations

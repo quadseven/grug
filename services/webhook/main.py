@@ -134,8 +134,9 @@ async def receive_github_webhook(
                 "webhook_unsigned_probe",
                 extra={"event": x_github_event, "body_len": len(body)},
             )
-        # 401 — GitHub stops retrying after 4xx (vs 5xx which retries).
-        # Bad signature = caller is broken (or hostile); no point in retry.
+        # GitHub does not automatically redeliver failed webhooks. A 401 makes
+        # the rejection explicit; the delivery replay poller is the recovery
+        # path for a genuine signed delivery after secret drift is repaired.
         raise HTTPException(
             status_code=status.HTTP_401_UNAUTHORIZED,
             detail="invalid signature",
@@ -160,9 +161,8 @@ async def receive_github_webhook(
     except _json.JSONDecodeError:
         # Body already passed HMAC verify — non-JSON here is GitHub
         # bug, our own header-stripping middleware, or attack payload
-        # that got past sig verify (shouldn't happen). 400 stops GH
-        # retries while bumping severity above the 200 'skip' bucket
-        # so DD alerts fire. silent-failure-hunter P1 #1.
+        # that got past sig verify (shouldn't happen). A 400 records an honest
+        # failed delivery for alerts/replay instead of a false 200 skip.
         log.error(
             "webhook_body_not_json_after_hmac_pass",
             extra={"delivery_id": x_github_delivery, "body_len": len(body)},

@@ -26,14 +26,17 @@ import adapters.install_store as ins
 
 
 def _full_gh_payload(body=""):
-    """A GitHub pull_request payload with the bulky fields that must NOT be
-    forwarded to the worker (the worker re-fetches by id)."""
+    """A GitHub pull_request payload with review context plus bulky fields."""
     return {
         "action": "opened",
         "pull_request": {
             "number": 7,
             "head": {"sha": "abc123"},
-            "body": body,  # can be ~65 KB of markdown — must be dropped
+            "base": {"sha": "base123"},
+            "title": "Improve the reviewer",
+            "body": body,
+            "draft": False,
+            "user": {"login": "evan"},
         },
         "repository": {
             "owner": {"login": "githumps", "id": 999, "url": "https://x"},
@@ -45,33 +48,41 @@ def _full_gh_payload(body=""):
     }
 
 
-def test_slim_payload_keeps_only_worker_fields():
-    """The slim projection forwards ONLY the fields dispatch_code_review
-    reads; the worker re-fetches the diff from GitHub by those ids."""
+def test_slim_payload_keeps_bounded_review_context():
+    """The async worker needs intent and immutable diff coordinates, not just
+    IDs. Preserve those fields while still dropping unrelated event bulk."""
     job_payload = ad._slim_payload(_full_gh_payload(body="m" * 5000))
     assert job_payload == {
         "action": "opened",
-        "pull_request": {"number": 7, "head": {"sha": "abc123"}},
+        "pull_request": {
+            "number": 7,
+            "head": {"sha": "abc123"},
+            "base": {"sha": "base123"},
+            "title": "Improve the reviewer",
+            "body": "m" * 5000,
+            "draft": False,
+            "user": {"login": "evan"},
+        },
         "repository": {"owner": {"login": "githumps"}, "name": "grug"},
         "installation": {"id": 555},
     }
 
 
-def test_slim_payload_drops_bulky_fields():
-    """The PR body, sender, and extra repo metadata must NOT be forwarded —
-    the job stays minimal and bounded regardless of PR size."""
+def test_slim_payload_bounds_body_and_drops_unrelated_fields():
+    """Intent survives, but a huge PR body cannot make the job unbounded."""
     huge_body = "z" * 200_000
     slim = ad._slim_payload(_full_gh_payload(body=huge_body))
     raw = json.dumps(slim)
-    assert len(raw) < 1000  # slim, bounded — not ~200 KB
-    assert "zzz" not in raw  # the huge body is gone
-    assert "avatar_url" not in raw  # sender stripped
+    assert len(raw) < 20_000
+    assert len(slim["pull_request"]["body"]) == ad._MAX_PR_BODY_CHARS
+    assert "avatar_url" not in raw
 
 
 def test_enqueue_returns_false_without_runtime(monkeypatch):
     """Local/test (no GRUG_K8S_RUNTIME) → no offload path → False, no
     exception, and no thread spawned."""
     monkeypatch.delenv("GRUG_K8S_RUNTIME", raising=False)
+    monkeypatch.delenv("GRUG_ELDER_DURABLE_QUEUE", raising=False)
     with patch.object(ad.threading, "Thread") as mock_thread:
         ok = ad.enqueue_elder_review(payload={}, delivery_id="d-2", blocking=False)
     assert ok is False
@@ -83,6 +94,7 @@ def test_enqueue_k8s_runtime_runs_in_process_thread(monkeypatch):
     background thread - slim-projection job shape, returns True (the review
     is NOT dropped)."""
     monkeypatch.setenv("GRUG_K8S_RUNTIME", "1")
+    monkeypatch.delenv("GRUG_ELDER_DURABLE_QUEUE", raising=False)
     ran = threading.Event()
     seen: dict = {}
 
@@ -103,14 +115,104 @@ def test_enqueue_k8s_runtime_runs_in_process_thread(monkeypatch):
     assert seen["blocking"] is True
     assert seen[ad.ASYNC_JOB_KEY] == ad.ELDER_REVIEW_JOB
     # Slim projection applies on the thread path (keep-in-sync contract).
-    assert seen["payload"]["pull_request"] == {"number": 7, "head": {"sha": "abc123"}}
+    assert seen["payload"]["pull_request"] == {
+        "number": 7,
+        "head": {"sha": "abc123"},
+        "base": {"sha": "base123"},
+        "title": "Improve the reviewer",
+        "body": "m" * 5000,
+        "draft": False,
+        "user": {"login": "evan"},
+    }
     assert "sender" not in seen["payload"]
+
+
+def test_enqueue_elder_uses_durable_quiet_window_queue(monkeypatch):
+    """Production Elder jobs use the existing durable consumer lane. The
+    requested head scopes FIFO dedup; the consumer owns settling and stale-head
+    cancellation before review work starts."""
+    monkeypatch.setenv("GRUG_ELDER_DURABLE_QUEUE", "1")
+    monkeypatch.setenv("GRUG_ELDER_SETTLE_SECONDS", "120")
+
+    with patch("rerun.enqueue_review") as enqueue, \
+         patch.object(ad.threading, "Thread") as thread:
+        ok = ad.enqueue_elder_review(
+            payload=_full_gh_payload(), delivery_id="delivery-1", blocking=True,
+        )
+
+    assert ok is True
+    enqueue.assert_called_once_with(
+        install_id=555,
+        repo="githumps/grug",
+        pr_number=7,
+        requested_base_sha="base123",
+        requested_head_sha="abc123",
+        requested_title="Improve the reviewer",
+        requested_body="",
+        settle_seconds=120,
+    )
+    thread.assert_not_called()
+
+
+def test_durable_elder_draft_does_not_consume_ready_event_dedup_key(monkeypatch):
+    monkeypatch.setenv("GRUG_ELDER_DURABLE_QUEUE", "1")
+    payload = _full_gh_payload()
+    payload["pull_request"]["draft"] = True
+
+    with patch("rerun.enqueue_review") as enqueue:
+        ok = ad.enqueue_elder_review(
+            payload=payload, delivery_id="draft-delivery", blocking=False,
+        )
+
+    assert ok is True
+    enqueue.assert_not_called()
+
+
+def test_durable_elder_enqueue_failure_is_recorded_for_replay(monkeypatch):
+    monkeypatch.setenv("GRUG_ELDER_DURABLE_QUEUE", "1")
+    with patch("rerun.enqueue_review", side_effect=RuntimeError("queue down")), \
+         pytest.raises(RuntimeError, match="durable Elder review enqueue failed"):
+        ad.enqueue_elder_review(
+            payload=_full_gh_payload(),
+            delivery_id="delivery-2",
+            blocking=False,
+        )
+
+
+def test_enqueue_hashes_snapshot_from_full_body_not_slimmed(monkeypatch):
+    """Qodo #585: the claim_review snapshot must hash the FULL PR body, not the
+    _slim_payload-truncated one - else a body edit past _MAX_PR_BODY_CHARS is
+    invisible to idempotency. The enqueued job must carry the full-body hash."""
+    from personas.code_reviewer.snapshot import review_snapshot_id_from_pr
+
+    long_body = "x" * (ad._MAX_PR_BODY_CHARS + 500)
+    payload = _full_gh_payload(body=long_body)
+
+    captured: dict = {}
+    monkeypatch.delenv("GRUG_ELDER_DURABLE_QUEUE", raising=False)
+    monkeypatch.setenv("GRUG_K8S_RUNTIME", "1")
+    with patch.object(
+        ad, "_spawn_local", lambda spec, job: captured.update(job) or True
+    ):
+        ad.enqueue_elder_review(
+            payload=payload, delivery_id="d-full", blocking=False,
+        )
+
+    full_hash = review_snapshot_id_from_pr(payload["pull_request"])
+    slim_pr = dict(payload["pull_request"])
+    slim_pr["body"] = long_body[: ad._MAX_PR_BODY_CHARS]
+    slim_hash = review_snapshot_id_from_pr(slim_pr)
+
+    assert captured["review_snapshot_id"] == full_hash
+    # Truncation genuinely changes identity, so the slim hash is the wrong one.
+    assert full_hash != slim_hash
 
 
 def test_enqueue_k8s_spawn_failure_degrades_to_false(monkeypatch):
     """#368: a thread-spawn failure must NOT raise into the ACK path -
     it degrades to False so the caller logs enqueue_failed and still ACKs."""
     monkeypatch.setenv("GRUG_K8S_RUNTIME", "1")
+    monkeypatch.delenv("GRUG_ELDER_DURABLE_QUEUE", raising=False)
     with patch.object(ad.threading, "Thread", side_effect=RuntimeError("no threads")):
         ok = ad.enqueue_elder_review(payload={}, delivery_id="d-k8s2", blocking=False)
     assert ok is False
@@ -231,6 +333,57 @@ def test_self_recover_is_best_effort_on_enqueue_failure():
     ):
         out = ad.run_elder_job(_FULL_JOB)  # must not raise
     assert out == {"persona": "code_reviewer", "result": "unhandled_error"}
+
+
+def test_run_elder_job_retries_partial_deep_review():
+    """Qodo #585: a PARTIAL deep review (one backend, provisional) returns
+    normally rather than raising, so the legacy in-process lane must itself
+    enqueue ONE durable re-run - otherwise a partial stays unresolved when
+    GRUG_ELDER_DURABLE_QUEUE is off. Mirrors the durable lane, which redrives
+    partials via SQS."""
+    partial = {
+        "persona": "code_reviewer",
+        "result": "skipped",
+        "degraded_reason": "partial",
+    }
+    with (
+        patch("adapters.install_store.claim_delivery", return_value=True),
+        patch("adapters.install_store.claim_review", return_value=True),
+        patch(
+            "personas.code_reviewer.dispatch.dispatch_code_review",
+            return_value=partial,
+        ),
+        patch("rerun.enqueue_rerun") as mock_enq,
+    ):
+        out = ad.run_elder_job(_FULL_JOB)
+    assert out == partial  # provisional result still surfaced to the caller
+    mock_enq.assert_called_once_with(
+        install_id=99, repo="githumps/grug", pr_number=415, persona="elder"
+    )
+
+
+def test_run_elder_job_does_not_retry_terminal_degrade():
+    """Terminal degrade reasons (no_diff / parse_failed / all_failed) are
+    final in this lane and must NOT enqueue a re-run - only `partial` is
+    provisional."""
+    for reason in ("no_diff", "parse_failed", "all_failed"):
+        terminal = {
+            "persona": "code_reviewer",
+            "result": "skipped",
+            "degraded_reason": reason,
+        }
+        with (
+            patch("adapters.install_store.claim_delivery", return_value=True),
+            patch("adapters.install_store.claim_review", return_value=True),
+            patch(
+                "personas.code_reviewer.dispatch.dispatch_code_review",
+                return_value=terminal,
+            ),
+            patch("rerun.enqueue_rerun") as mock_enq,
+        ):
+            out = ad.run_elder_job(_FULL_JOB)
+        assert out == terminal
+        mock_enq.assert_not_called()
 
 
 def test_two_jobs_same_delivery_dispatch_once():
@@ -371,12 +524,12 @@ def test_claim_delivery_db_error_propagates(monkeypatch):
         raise AssertionError("expected psycopg.Error to propagate")
 
 
-# --- per-head-SHA idempotency (#397) ---------------------------------------
-# run_elder_job gates the review on claim_review (head SHA) IN ADDITION to
+# --- per-snapshot idempotency (#397) ---------------------------------------
+# run_elder_job gates the review on claim_review (snapshot ID) IN ADDITION to
 # claim_delivery (per webhook delivery). claim_delivery catches an exact
-# redelivery; claim_review catches a same-SHA re-trigger across DIFFERENT
-# deliveries (a non-push `edited`/`ready_for_review` event), so unchanged
-# code is not re-reviewed while every NEW head SHA still reviews. The
+# redelivery; claim_review catches an exact base/head/title/body re-trigger
+# across DIFFERENT deliveries, while intent/base edits and every new head
+# still review. The
 # claim_review win-once/expired-takeover behavior lives in the real-PG suite
 # (test_pg_stores.py); these assert the run_elder_job GATE wiring.
 
@@ -392,8 +545,8 @@ _SHA_JOB = {
 }
 
 
-def test_run_elder_job_skips_when_head_sha_already_reviewed():
-    """#397 AC2: a same-head-SHA re-trigger where claim_delivery wins (new
+def test_run_elder_job_skips_when_snapshot_already_reviewed():
+    """#397 AC2: an exact-snapshot re-trigger where claim_delivery wins (new
     delivery id) but claim_review LOSES → SKIP, dispatch NOT called (no
     duplicate review of unchanged code on `edited`/`ready_for_review`)."""
     with (
@@ -403,12 +556,11 @@ def test_run_elder_job_skips_when_head_sha_already_reviewed():
     ):
         out = ad.run_elder_job(_SHA_JOB)
     mock_d.assert_not_called()
-    assert out == {"status": "skipped", "reason": "duplicate_head_sha"}
+    assert out == {"status": "skipped", "reason": "duplicate_snapshot"}
 
 
-def test_run_elder_job_reviews_when_head_sha_unclaimed():
-    """#397 AC1: a fresh head SHA (claim_review won) → dispatch runs, claimed
-    with the exact (install, repo, pr, persona, head_sha) tuple."""
+def test_run_elder_job_reviews_when_snapshot_unclaimed():
+    """#397 AC1: a fresh snapshot dispatches and uses its digest as claim key."""
     with (
         patch("adapters.install_store.claim_delivery", return_value=True),
         patch("adapters.install_store.claim_review", return_value=True) as mock_c,
@@ -421,7 +573,10 @@ def test_run_elder_job_reviews_when_head_sha_unclaimed():
     mock_d.assert_called_once()
     mock_c.assert_called_once_with(
         install_id=7, repo="githumps/grug", pr_number=12,
-        persona="code_reviewer", head_sha="sha-aaa",
+        persona="code_reviewer",
+        head_sha=ad.review_snapshot_id_from_pr(
+            _SHA_JOB["payload"]["pull_request"],
+        ),
     )
     assert out == {"persona": "code_reviewer", "result": "pass"}
 
@@ -465,7 +620,38 @@ def test_same_sha_two_deliveries_dispatch_once():
         second = ad.run_elder_job({**_SHA_JOB, "delivery_id": "d-101"})
     assert mock_d.call_count == 1
     assert first == {"persona": "code_reviewer", "result": "pass"}
-    assert second == {"status": "skipped", "reason": "duplicate_head_sha"}
+    assert second == {"status": "skipped", "reason": "duplicate_snapshot"}
+
+
+def test_same_head_with_changed_intent_claims_distinct_snapshots():
+    claims: list[str] = []
+    edited = {
+        **_SHA_JOB,
+        "delivery_id": "d-edited",
+        "payload": {
+            **_SHA_JOB["payload"],
+            "pull_request": {
+                **_SHA_JOB["payload"]["pull_request"],
+                "body": "New review intent",
+            },
+        },
+    }
+    with (
+        patch("adapters.install_store.claim_delivery", return_value=True),
+        patch(
+            "adapters.install_store.claim_review",
+            side_effect=lambda **kw: claims.append(kw["head_sha"]) or True,
+        ),
+        patch(
+            "personas.code_reviewer.dispatch.dispatch_code_review",
+            return_value={"persona": "code_reviewer", "result": "pass"},
+        ) as dispatch,
+    ):
+        ad.run_elder_job(_SHA_JOB)
+        ad.run_elder_job(edited)
+
+    assert len(set(claims)) == 2
+    assert dispatch.call_count == 2
 
 
 def test_run_elder_job_fails_open_when_review_claim_errors():
@@ -647,7 +833,7 @@ def test_run_walkthrough_job_claims_namespaced_delivery_and_binds_walkthrough_ro
     assert out == {"persona": "walkthrough", "result": "pass"}
 
 
-def test_run_walkthrough_job_skips_when_head_sha_already_reviewed():
+def test_run_walkthrough_job_skips_when_snapshot_already_reviewed():
     """#554: the same head-sha idempotency Elder/Guard/Smasher get for
     free from the generic machinery - a same-head-SHA re-trigger where
     claim_delivery wins (new delivery id) but claim_review LOSES must
@@ -660,12 +846,11 @@ def test_run_walkthrough_job_skips_when_head_sha_already_reviewed():
     ):
         out = ad.run_walkthrough_job(job)
     mock_d.assert_not_called()
-    assert out == {"status": "skipped", "reason": "duplicate_head_sha"}
+    assert out == {"status": "skipped", "reason": "duplicate_snapshot"}
 
 
-def test_run_walkthrough_job_reviews_when_head_sha_unclaimed():
-    """A fresh head SHA (claim_review won) -> dispatch runs, claimed with
-    the exact (install, repo, pr, persona, head_sha) tuple."""
+def test_run_walkthrough_job_reviews_when_snapshot_unclaimed():
+    """A fresh snapshot dispatches and uses its digest as claim key."""
     job = {**_SHA_JOB, ad.ASYNC_JOB_KEY: ad.WALKTHROUGH_REVIEW_JOB}
     with (
         patch("adapters.install_store.claim_delivery", return_value=True),
@@ -679,7 +864,10 @@ def test_run_walkthrough_job_reviews_when_head_sha_unclaimed():
     mock_d.assert_called_once()
     mock_c.assert_called_once_with(
         install_id=7, repo="githumps/grug", pr_number=12,
-        persona="walkthrough", head_sha="sha-aaa",
+        persona="walkthrough",
+        head_sha=ad.review_snapshot_id_from_pr(
+            _SHA_JOB["payload"]["pull_request"],
+        ),
     )
     assert out == {"persona": "walkthrough", "result": "pass"}
 

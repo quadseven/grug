@@ -1,8 +1,13 @@
 """Tests for personas/code_reviewer/persona.py."""
 from __future__ import annotations
 
-from llm_client import Backend, Finding as LlmFinding, LlmReviewResponse
-from personas.code_reviewer.diff_parser import DiffHunk, parse_diff
+from llm_client import (
+    Backend,
+    Finding as LlmFinding,
+    FindingOrigin,
+    LlmReviewResponse,
+)
+from personas.code_reviewer.diff_parser import parse_diff
 from personas.code_reviewer.persona import (
     CodeReviewEvaluation,
     Finding,
@@ -158,6 +163,22 @@ def test_parse_failed_response_yields_neutral_passed_true() -> None:
     assert out.conclusion == "neutral"
 
 
+def test_partial_response_keeps_provisional_findings_but_never_blocks() -> None:
+    hunks = parse_diff(_DIFF)
+    llm = LlmReviewResponse(
+        kind="partial",
+        findings=(_llm_finding(rule="silent-exception", line=2),),
+        backend_used=Backend.POOLSIDE,
+        error="openrouter: timeout",
+    )
+
+    out = evaluate_diff(hunks, llm)
+
+    assert out.conclusion == "neutral"
+    assert out.degraded_reason == "partial"
+    assert [finding.rule_name for finding in out.findings] == ["silent-exception"]
+
+
 def test_finding_carries_persona_level_field_names() -> None:
     """Issue #182 spec: persona-level Finding has `file`, `line`,
     `severity`, `rule_name`, `message`, `suggestion`. The llm_client's
@@ -174,6 +195,38 @@ def test_finding_carries_persona_level_field_names() -> None:
     assert f.file == "src/x.py"  # not `path`
     assert f.rule_name == "silent-exception"  # not `rule`
     assert hasattr(f, "suggestion")  # new field at persona level
+
+
+def test_evaluate_diff_preserves_every_wire_finding_origin() -> None:
+    """A merged ensemble finding keeps all producer spans after the
+    wire-to-persona translation so judge and reaction evals can fan out."""
+    origins = (
+        FindingOrigin(
+            backend=Backend.POOLSIDE,
+            model="poolside/laguna-m.1",
+            review_span_context={"span_id": "poolside-span"},
+        ),
+        FindingOrigin(
+            backend=Backend.OPENROUTER,
+            model="anthropic/claude-opus-4.7",
+            review_span_context={"span_id": "openrouter-span"},
+        ),
+    )
+    llm = LlmReviewResponse(
+        kind="reviewed",
+        findings=(LlmFinding(
+            path="src/x.py",
+            line=2,
+            rule="null-deref",
+            severity="high",
+            message="m",
+            origins=origins,
+        ),),
+    )
+
+    out = evaluate_diff(parse_diff(_DIFF), llm)
+
+    assert out.findings[0].origins == origins
 
 
 def test_evaluate_diff_is_pure_no_logging_or_io(monkeypatch) -> None:
@@ -359,10 +412,12 @@ def test_reviewed_response_has_no_degraded_reason() -> None:
 
 def test_diff_hunk_rejects_missing_at_at_in_body() -> None:
     """Boundary check — catches a parser regression that loses the @@
-    header before the body string is captured."""
+    header before the body string is captured. Raises DiffParseError
+    (the exception the dispatch degrade contract catches), never a bare
+    AssertionError that would escape it and poison the consumer."""
     import pytest as _pytest
-    from personas.code_reviewer.diff_parser import DiffHunk as _DH
-    with _pytest.raises(AssertionError, match="@@ hunk header"):
+    from personas.code_reviewer.diff_parser import DiffHunk as _DH, DiffParseError as _DPE
+    with _pytest.raises(_DPE, match="@@ hunk header"):
         _DH(file_path="x.py", new_start=1, new_lines=frozenset({1}), body="no header here")
 
 

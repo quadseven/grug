@@ -282,10 +282,11 @@ def _handle_pull_request(
     results: list[dict[str, str]] = []
     # An UNEXPECTED exception escaping an ASYNC persona's dispatch is a
     # HANDOFF failure (the review was never durably enqueued) - unlike an
-    # inline persona's publish, swallowing it into a 200 drops the review
-    # with no GitHub redelivery (codex peer-review HIGH, PR #477). We run
-    # every persona for isolation, then re-raise the first async-handoff
-    # error AFTER the loop so the delivery is non-2xx and GitHub retries.
+    # inline persona's publish, swallowing it into a 200 marks the delivery
+    # successful and hides it from the 15-minute replay poller. We run every
+    # persona for isolation, then re-raise the first async-handoff error AFTER
+    # the loop so GitHub records a failed delivery for that poller. GitHub does
+    # not automatically retry webhook failures.
     async_handoff_error: Exception | None = None
     for spec in persona_registry.REGISTRY:
         if "pull_request" not in spec.events:
@@ -354,9 +355,9 @@ def _handle_pull_request(
         except Exception as e:  # noqa: BLE001 - per-persona isolation guard
             # Isolate so one persona's failure never starves the others
             # (#185). delivery_id + kind keep the log correlatable to the
-            # GitHub delivery GUID. For an INLINE persona this 200s (a
-            # retry would duplicate its already-done publish); for an
-            # ASYNC persona it is a dropped handoff and we re-raise below.
+            # GitHub delivery GUID. For an INLINE persona this 200s (a replay
+            # could duplicate its already-done publish); for an ASYNC persona
+            # it is a dropped handoff and we re-raise below.
             log.error(
                 "persona_dispatch_unhandled",
                 extra={
@@ -375,14 +376,12 @@ def _handle_pull_request(
                 async_handoff_error = e
 
     if async_handoff_error is not None:
-        # Re-raise so the webhook returns non-2xx and GitHub redelivers
-        # the event - the durable retry the async handoff needs. Inline
-        # personas already ran; their publishes are idempotent per
-        # head_sha on redelivery (parity with the pre-registry behavior,
-        # where an Elder enqueue exception 500ed after TPM published).
-        # NOTE: the EXPECTED enqueue-returns-False path does NOT raise -
-        # it returns `enqueue_failed` and 200s, preserving the deliberate
-        # #272 "drop + re-trigger on next push" contract.
+        # Re-raise so GitHub records the delivery as failed. The poller replays
+        # failed deliveries every 15 minutes; GitHub itself does not retry.
+        # Inline personas already ran and may republish on replay; that rare
+        # duplicate is preferable to losing Elder's durable handoff. The
+        # enqueue-returns-False path is only the local-thread compatibility
+        # path; durable enqueue errors raise before that boolean result.
         raise async_handoff_error
 
     if not results:
@@ -492,8 +491,8 @@ def _handle_issue_comment(payload: dict[str, Any]) -> dict[str, str]:
 
         # Catch BOTH HTTPStatusError (4xx/5xx from GH) AND RequestError
         # (transport: timeout, DNS, connection-reset). Earlier code only
-        # caught HTTPStatusError; transport blips surfaced as webhook
-        # 500 → GitHub retries the delivery → duplicate work.
+        # caught HTTPStatusError; transport blips surfaced as webhook 500s,
+        # which the replay poller could later redeliver as duplicate work.
         # async-blocker-hunter F-01.
         try:
             perm = with_install_token_retry(int(installation_id), _check_perm)
