@@ -79,8 +79,10 @@ def derive_practices(
         last_pr = max(r.pr for r in items)
         if last_pr < cutoff:
             continue  # decayed: not reinforced recently enough
-        # Representative rule = the most-recent accepted finding in the
-        # class (freshest phrasing of the recurring requirement).
+        # Representative rule = the most-recent finding in this
+        # (class, disposition) group (freshest phrasing of the recurring
+        # pattern). For a "report" group that is an accepted finding; for an
+        # "avoid" group it is a FALSE-POSITIVE finding driving AVOID guidance.
         rep = max(items, key=lambda r: r.pr)
         example_prs = sorted({r.pr for r in items}, reverse=True)[:_MAX_EXAMPLE_PRS]
         practices.append(Practice(

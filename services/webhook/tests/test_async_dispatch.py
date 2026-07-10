@@ -179,6 +179,35 @@ def test_durable_elder_enqueue_failure_is_recorded_for_replay(monkeypatch):
         )
 
 
+def test_enqueue_hashes_snapshot_from_full_body_not_slimmed(monkeypatch):
+    """Qodo #585: the claim_review snapshot must hash the FULL PR body, not the
+    _slim_payload-truncated one - else a body edit past _MAX_PR_BODY_CHARS is
+    invisible to idempotency. The enqueued job must carry the full-body hash."""
+    from personas.code_reviewer.snapshot import review_snapshot_id_from_pr
+
+    long_body = "x" * (ad._MAX_PR_BODY_CHARS + 500)
+    payload = _full_gh_payload(body=long_body)
+
+    captured: dict = {}
+    monkeypatch.delenv("GRUG_ELDER_DURABLE_QUEUE", raising=False)
+    monkeypatch.setenv("GRUG_K8S_RUNTIME", "1")
+    with patch.object(
+        ad, "_spawn_local", lambda spec, job: captured.update(job) or True
+    ):
+        ad.enqueue_elder_review(
+            payload=payload, delivery_id="d-full", blocking=False,
+        )
+
+    full_hash = review_snapshot_id_from_pr(payload["pull_request"])
+    slim_pr = dict(payload["pull_request"])
+    slim_pr["body"] = long_body[: ad._MAX_PR_BODY_CHARS]
+    slim_hash = review_snapshot_id_from_pr(slim_pr)
+
+    assert captured["review_snapshot_id"] == full_hash
+    # Truncation genuinely changes identity, so the slim hash is the wrong one.
+    assert full_hash != slim_hash
+
+
 def test_enqueue_k8s_spawn_failure_degrades_to_false(monkeypatch):
     """#368: a thread-spawn failure must NOT raise into the ACK path -
     it degrades to False so the caller logs enqueue_failed and still ACKs."""
