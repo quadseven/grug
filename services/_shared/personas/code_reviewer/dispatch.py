@@ -303,7 +303,7 @@ def _summary_markdown(
 _CONSOLIDATED_PROMPT_BUDGET = 8000
 
 
-def _consolidated_agent_prompt(evaluation: CodeReviewEvaluation) -> str:
+def _consolidated_agent_prompt(evaluation: CodeReviewEvaluation, voice: str = "caveman") -> str:
     """One copy-paste prompt covering the findings (#553), deterministic
     and bounded. Truncates by whole findings and SAYS how many were cut -
     a silently-partial prompt would read as the complete work list."""
