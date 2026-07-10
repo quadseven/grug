@@ -32,12 +32,15 @@ RERUNNABLE: frozenset[str] = CODE_REVIEWER | GUARD | SMASHER | TELLER
 REQUESTABLE: frozenset[str] = RERUNNABLE | frozenset({"chief", "tpm"})
 
 # Dead-capability guard, enforced at import: a persona the consumer re-runs that
-# the request model rejects is unreachable (the #581 class). Fails loudly here
-# rather than silently 422-ing real rerun traffic.
-assert RERUNNABLE <= REQUESTABLE, (
-    "rerun drift: consumer re-runs personas the request model rejects: "
-    f"{sorted(RERUNNABLE - REQUESTABLE)}"
-)
+# the request model rejects is unreachable (the #581 class). An explicit raise
+# (not assert - stripped under -O/PYTHONOPTIMIZE) so the guard fires in every
+# deployment rather than silently 422-ing real rerun traffic.
+_unreachable = RERUNNABLE - REQUESTABLE
+if _unreachable:
+    raise RuntimeError(
+        "rerun drift: consumer re-runs personas the request model rejects: "
+        f"{sorted(_unreachable)}"
+    )
 
 
 def requestable_pattern() -> str:
