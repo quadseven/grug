@@ -170,6 +170,14 @@ def parse_diff(unified_diff: str) -> tuple[DiffHunk, ...]:
                 )
             new_start = int(m.group(1))
             if new_start == 0:
+                # A zero START is only legal with a zero COUNT: `+0,0`.
+                # `+0,N` / a bare `+0` (implied count 1) are malformed -
+                # fall through to fail loudly rather than silently
+                # swallowing hunks (CodeRabbit PR #580).
+                if m.group(2) != "0":
+                    raise DiffParseError(
+                        f"malformed zero-start hunk header at line {i + 1}: {line!r}"
+                    )
                 # `+0,0` — the change leaves NOTHING on the new side to
                 # review. `+++ /dev/null` deletions are skipped above, but
                 # a file EMPTIED to zero bytes keeps its `+++ b/<path>`
