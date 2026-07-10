@@ -191,6 +191,11 @@ def list_allowlisted_installs() -> list[int]:
 # set_repo_config; read with an explicit default in get_repo_config.
 _EXTRA_REPO_FLAGS = frozenset({"dep_watch_enabled"})
 
+# Repo-level flags whose value is a STRING, not a bool (the persona flags and
+# _EXTRA_REPO_FLAGS are all bool). elder_voice (#288/#578) is "caveman" | "sage".
+# These are exempt from the bool-only value check and validated per-flag below.
+_STR_REPO_FLAGS = frozenset({"elder_voice"})
+
 _DEFAULT_PERSONA_CONFIG = {
     "tpm_enabled": True,
     "code_reviewer_enabled": True,
@@ -237,6 +242,9 @@ def get_repo_config(install_id: int, repo_id: int) -> dict[str, Any]:
     cfg["enforcement_ruleset_id"] = int(rid) if rid is not None else None
     cfg["force_disable_enforcement"] = bool(item.get("force_disable_enforcement", False))
     cfg["dep_watch_enabled"] = bool(item.get("dep_watch_enabled", False))
+    # Elder voice pack (#288/#578): stored only for entitled installs that
+    # opted in; every other repo reads the caveman free default.
+    cfg["elder_voice"] = str(item.get("elder_voice") or "caveman")
     return cfg
 
 
@@ -265,7 +273,7 @@ def set_repo_config(
     repo_id: int,
     repo_full_name: str,
     updated_by_user_id: str,
-    **persona_flags: bool | None,
+    **persona_flags: bool | str | None,
 ) -> dict[str, Any]:
     """Upsert per-repo override; returns the FIELDS THAT WERE UPDATED
     (same contract as the DDB adapter). Sparse merge preserves fields
@@ -277,7 +285,12 @@ def set_repo_config(
     no edit; an unknown key raises TypeError, preserving the explicit-
     signature era's unexpected-keyword behavior (typo protection).
     None = leave the stored value alone (sparse merge)."""
-    unknown = set(persona_flags) - set(_DEFAULT_PERSONA_CONFIG) - _EXTRA_REPO_FLAGS
+    unknown = (
+        set(persona_flags)
+        - set(_DEFAULT_PERSONA_CONFIG)
+        - _EXTRA_REPO_FLAGS
+        - _STR_REPO_FLAGS
+    )
     if unknown:
         raise TypeError(
             f"set_repo_config() got unknown persona flag(s) {sorted(unknown)}; "
@@ -285,31 +298,32 @@ def set_repo_config(
         )
     # Values get the same rigor as keys (audit #477 M3): bool(value)
     # would silently store True for a truthy non-bool like "false" if a
-    # caller ever passed a query-string value through.
+    # caller ever passed a query-string value through. String-valued flags
+    # (_STR_REPO_FLAGS, e.g. elder_voice) are exempt here and validated by
+    # their own per-flag guard below.
     non_bool = {
         flag: value for flag, value in persona_flags.items()
-        if value is not None and not isinstance(value, bool)
+        if flag not in _STR_REPO_FLAGS
+        and value is not None and not isinstance(value, bool)
     }
     if non_bool:
         raise TypeError(
             f"set_repo_config() persona flags must be bool or None; got {non_bool!r}"
         )
-    # Validate elder_voice values explicitly (must be "caveman" or "sage")
-    if "elder_voice" in persona_flags and persona_flags["elder_voice"] is not None:
-        valid_voices = ("caveman", "sage")
-        val = persona_flags["elder_voice"]
-        if val not in valid_voices:
+    # elder_voice (#288/#578): must be "caveman" or "sage", and "sage" is a
+    # paid pack gated on the install allowlist. This runs AFTER the flag is
+    # accepted (it is in _STR_REPO_FLAGS) so the gate is actually reachable.
+    voice = persona_flags.get("elder_voice")
+    if voice is not None:
+        if voice not in ("caveman", "sage"):
             raise ValueError(
-                f"elder_voice must be one of {valid_voices}, got {val!r}"
+                f"elder_voice must be one of ('caveman', 'sage'), got {voice!r}"
             )
-        # Entitlement gate: sage requires allowlisted install
-        if val == "sage":
-            from adapters.pg_install_store import is_install_allowlisted
-            if not is_install_allowlisted(install_id):
-                raise ValueError(
-                    f"elder_voice='sage' requires an allowlisted (paid) installation. "
-                    f"Install {install_id} is not entitled."
-                )
+        if voice == "sage" and not is_install_allowlisted(install_id):
+            raise ValueError(
+                f"elder_voice='sage' requires an allowlisted (paid) "
+                f"installation; install {install_id} is not entitled"
+            )
     now = datetime.now(timezone.utc).isoformat()
     updated_fields: dict[str, Any] = {
         flag: value

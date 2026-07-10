@@ -23,7 +23,7 @@ import re
 from dataclasses import dataclass
 from typing import Literal, get_args
 
-from review_types import SEVERITIES, Severity, Effort  # shared leaf — no cycle (#250)
+from review_types import SEVERITIES, Severity  # shared leaf — no cycle (#250)
 
 # Rule-name charset — must equal the dedup marker's capture class
 # (dedup._MARKER_RE) so a name round-trips through the comment marker
