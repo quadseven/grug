@@ -170,13 +170,13 @@ def test_durable_elder_draft_does_not_consume_ready_event_dedup_key(monkeypatch)
 
 def test_durable_elder_enqueue_failure_is_recorded_for_replay(monkeypatch):
     monkeypatch.setenv("GRUG_ELDER_DURABLE_QUEUE", "1")
-    with patch("rerun.enqueue_review", side_effect=RuntimeError("queue down")):
-        with pytest.raises(RuntimeError, match="durable Elder review enqueue failed"):
-            ad.enqueue_elder_review(
-                payload=_full_gh_payload(),
-                delivery_id="delivery-2",
-                blocking=False,
-            )
+    with patch("rerun.enqueue_review", side_effect=RuntimeError("queue down")), \
+         pytest.raises(RuntimeError, match="durable Elder review enqueue failed"):
+        ad.enqueue_elder_review(
+            payload=_full_gh_payload(),
+            delivery_id="delivery-2",
+            blocking=False,
+        )
 
 
 def test_enqueue_k8s_spawn_failure_degrades_to_false(monkeypatch):
@@ -304,6 +304,57 @@ def test_self_recover_is_best_effort_on_enqueue_failure():
     ):
         out = ad.run_elder_job(_FULL_JOB)  # must not raise
     assert out == {"persona": "code_reviewer", "result": "unhandled_error"}
+
+
+def test_run_elder_job_retries_partial_deep_review():
+    """Qodo #585: a PARTIAL deep review (one backend, provisional) returns
+    normally rather than raising, so the legacy in-process lane must itself
+    enqueue ONE durable re-run - otherwise a partial stays unresolved when
+    GRUG_ELDER_DURABLE_QUEUE is off. Mirrors the durable lane, which redrives
+    partials via SQS."""
+    partial = {
+        "persona": "code_reviewer",
+        "result": "skipped",
+        "degraded_reason": "partial",
+    }
+    with (
+        patch("adapters.install_store.claim_delivery", return_value=True),
+        patch("adapters.install_store.claim_review", return_value=True),
+        patch(
+            "personas.code_reviewer.dispatch.dispatch_code_review",
+            return_value=partial,
+        ),
+        patch("rerun.enqueue_rerun") as mock_enq,
+    ):
+        out = ad.run_elder_job(_FULL_JOB)
+    assert out == partial  # provisional result still surfaced to the caller
+    mock_enq.assert_called_once_with(
+        install_id=99, repo="githumps/grug", pr_number=415, persona="elder"
+    )
+
+
+def test_run_elder_job_does_not_retry_terminal_degrade():
+    """Terminal degrade reasons (no_diff / parse_failed / all_failed) are
+    final in this lane and must NOT enqueue a re-run - only `partial` is
+    provisional."""
+    for reason in ("no_diff", "parse_failed", "all_failed"):
+        terminal = {
+            "persona": "code_reviewer",
+            "result": "skipped",
+            "degraded_reason": reason,
+        }
+        with (
+            patch("adapters.install_store.claim_delivery", return_value=True),
+            patch("adapters.install_store.claim_review", return_value=True),
+            patch(
+                "personas.code_reviewer.dispatch.dispatch_code_review",
+                return_value=terminal,
+            ),
+            patch("rerun.enqueue_rerun") as mock_enq,
+        ):
+            out = ad.run_elder_job(_FULL_JOB)
+        assert out == terminal
+        mock_enq.assert_not_called()
 
 
 def test_two_jobs_same_delivery_dispatch_once():
