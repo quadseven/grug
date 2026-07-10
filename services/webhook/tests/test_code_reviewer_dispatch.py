@@ -459,12 +459,12 @@ def test_dispatch_llm_outage_does_not_block_pr(monkeypatch):
     }
 
 
-def test_dispatch_partial_deep_review_publishes_provisional_findings(monkeypatch):
-    """One usable deep backend is useful but not a completed clean review.
-    Publish its findings as neutral/provisional and return a retryable degraded
-    result to the durable worker."""
+def test_dispatch_single_backend_review_publishes_as_a_complete_review(monkeypatch):
+    """Since #586 a single deep-backend reply is a complete `reviewed` result
+    (not provisional): its findings publish as a normal review, not a neutral
+    'incomplete' one."""
     llm = LlmReviewResponse(
-        kind="partial",
+        kind="reviewed",
         findings=(LlmFinding(
             path="src/x.py",
             line=2,
@@ -473,7 +473,6 @@ def test_dispatch_partial_deep_review_publishes_provisional_findings(monkeypatch
             message="error is discarded",
         ),),
         backend_used=Backend.POOLSIDE,
-        error="openrouter: timeout",
         backends_used=(Backend.POOLSIDE,),
         models_used=("poolside/laguna-m.1",),
     )
@@ -494,14 +493,9 @@ def test_dispatch_partial_deep_review_publishes_provisional_findings(monkeypatch
     with patch("httpx.get", return_value=_diff_response()):
         out = cr_dispatch.dispatch_code_review(_payload(), blocking=True)
 
-    assert out == {
-        "persona": "code_reviewer",
-        "result": "skipped",
-        "degraded_reason": "partial",
-    }
-    assert posted_check[0].conclusion == "neutral"
-    assert "incomplete" in posted_check[0].title
-    assert posted_review[0].event == "COMMENT"
+    assert out == {"persona": "code_reviewer", "result": "fail"}  # blocking + high
+    assert "incomplete" not in posted_check[0].title
+    assert posted_review[0].event == "REQUEST_CHANGES"
     assert len(posted_review[0].comments) == 1
 
 
