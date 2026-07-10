@@ -1269,20 +1269,26 @@ def review_diff(
 
     if successes:
         first = successes[0]
+        # Deep review fans out to two FREE-TIER backends (Poolside + OpenRouter)
+        # that may each be paywalled / rate-limited at any moment. ONE reply is
+        # a complete review, not a provisional one: requiring both would let
+        # either free backend's outage (e.g. an OpenRouter 402) block EVERY
+        # review. We merge whatever came back (1 or 2 backends) and the
+        # Cave/Spark judge does the final grading downstream regardless. Log
+        # which backend(s) answered for observability, but never degrade/retry.
         if len(successes) < 2:
-            log.warning(
-                "llm_deep_review_partial",
+            log.info(
+                "llm_deep_review_single_backend",
                 extra={
                     "successful_backends": [r.backend.value for r in successes],
-                    "error": last_error,
+                    "unavailable": last_error,
                 },
             )
         return LlmReviewResponse(
-            kind="partial" if len(successes) < 2 else "reviewed",
+            kind="reviewed",
             findings=_merge_review_findings(successes),
             backend_used=first.backend,
             model_name=first.model,
-            error=last_error if len(successes) < 2 else "",
             review_span_context=first.review_span_context,
             backends_used=tuple(review.backend for review in successes),
             models_used=tuple(review.model for review in successes),
