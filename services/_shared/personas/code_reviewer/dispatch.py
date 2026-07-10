@@ -399,33 +399,6 @@ def _summary_markdown(
         if suppressed_count
         else ""
     )
-    if evaluation.degraded_reason == "partial":
-        title = (
-            "Grug deep review incomplete - "
-            f"{len(evaluation.findings)} provisional finding(s)"
-        )
-        if not evaluation.findings:
-            return title, (
-                "Only one deep-review backend returned a usable response. "
-                "This pass is advisory and will be retried; no clean result "
-                "has been recorded."
-            ) + held
-        rows = [
-            "| Severity | File | Line | Rule | Message |",
-            "|---|---|---|---|---|",
-        ]
-        for finding in evaluation.findings:
-            rows.append(
-                f"| {finding.severity} | `{finding.file}` | {finding.line} | "
-                f"`{finding.rule_name}` | {_defused(finding.message)} |"
-            )
-        return title, (
-            "Only one deep-review backend returned a usable response. These "
-            "findings are provisional and the durable review will retry.\n\n"
-            + "\n".join(rows)
-            + held
-            + f"\n\n{_consolidated_agent_prompt(evaluation)}"
-        )
     if evaluation.degraded_reason:
         title = f"⚠️ Grug eyes clouded ({evaluation.degraded_reason})"
         return title, (
@@ -657,16 +630,14 @@ def _build_review_result(
 ) -> ReviewResult | None:
     """Build the ReviewResult, or None if nothing NEW to post.
 
-    Skips entirely on degraded responses except a partial deep pass, whose
-    useful findings remain advisory while the durable worker retries.
-    `prior_keys` (non-empty only
+    Skips entirely on degraded responses. `prior_keys` (non-empty only
     on a synchronize/reopened push) dedups findings already commented
     on unchanged lines (#189) — so a re-review doesn't flood the PR with
     duplicate inline comments. If every finding was already posted,
     returns None (nothing new). NOTE: dedup affects only the inline
     REVIEW; the check-run summary/conclusion still reflect ALL current
     findings (the bugs are still there)."""
-    if evaluation.degraded_reason and evaluation.degraded_reason != "partial":
+    if evaluation.degraded_reason:
         return None
     new_findings = dedup_findings(evaluation.findings, prior_keys)
     if not new_findings:

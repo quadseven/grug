@@ -335,39 +335,13 @@ def test_self_recover_is_best_effort_on_enqueue_failure():
     assert out == {"persona": "code_reviewer", "result": "unhandled_error"}
 
 
-def test_run_elder_job_retries_partial_deep_review():
-    """Qodo #585: a PARTIAL deep review (one backend, provisional) returns
-    normally rather than raising, so the legacy in-process lane must itself
-    enqueue ONE durable re-run - otherwise a partial stays unresolved when
-    GRUG_ELDER_DURABLE_QUEUE is off. Mirrors the durable lane, which redrives
-    partials via SQS."""
-    partial = {
-        "persona": "code_reviewer",
-        "result": "skipped",
-        "degraded_reason": "partial",
-    }
-    with (
-        patch("adapters.install_store.claim_delivery", return_value=True),
-        patch("adapters.install_store.claim_review", return_value=True),
-        patch(
-            "personas.code_reviewer.dispatch.dispatch_code_review",
-            return_value=partial,
-        ),
-        patch("rerun.enqueue_rerun") as mock_enq,
-    ):
-        out = ad.run_elder_job(_FULL_JOB)
-    assert out == partial  # provisional result still surfaced to the caller
-    mock_enq.assert_called_once_with(
-        install_id=99, repo="githumps/grug", pr_number=415, persona="elder"
-    )
-
-
-def test_run_elder_job_does_not_retry_terminal_degrade():
-    """Terminal degrade reasons (no_diff / parse_failed / all_failed) are
-    final in this lane and must NOT enqueue a re-run - only `partial` is
-    provisional."""
+def test_run_elder_job_does_not_retry_a_degraded_result():
+    """A degraded dispatch result (any reason) is returned as-is and never
+    enqueues a re-run from this lane - only an UNHANDLED exception triggers
+    self-recovery (#418). Since #586 a single-backend deep review is a
+    complete `reviewed` result, so there is no provisional/partial retry."""
     for reason in ("no_diff", "parse_failed", "all_failed"):
-        terminal = {
+        degraded = {
             "persona": "code_reviewer",
             "result": "skipped",
             "degraded_reason": reason,
@@ -377,12 +351,12 @@ def test_run_elder_job_does_not_retry_terminal_degrade():
             patch("adapters.install_store.claim_review", return_value=True),
             patch(
                 "personas.code_reviewer.dispatch.dispatch_code_review",
-                return_value=terminal,
+                return_value=degraded,
             ),
             patch("rerun.enqueue_rerun") as mock_enq,
         ):
             out = ad.run_elder_job(_FULL_JOB)
-        assert out == terminal
+        assert out == degraded
         mock_enq.assert_not_called()
 
 

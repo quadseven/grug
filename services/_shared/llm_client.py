@@ -295,20 +295,17 @@ class LlmReviewResponse:
         best-effort) returned a parseable payload; findings merge whatever
         answered. `findings` may be empty (clean review). Always carries
         backend + model attribution.
-      - `"partial"`: NO LONGER produced by `review_diff` - a single-backend
-        reply is now a complete `reviewed` result. The member is retained
-        only for the not-yet-removed downstream retry machinery.
       - `"parse_failed"`: LLM responded with non-JSON or prose. Caller
         posts an advisory check-run with the error.
       - `"all_failed"`: every backend errored. Caller posts a
         "skipped" advisory check-run.
 
-    Keeping all five states in one dataclass instead of a true union
+    Keeping all four states in one dataclass instead of a true union
     keeps the call sites cheap (one isinstance check vs many) at the
     cost of mildly redundant `Optional[...]` fields. Acceptable v1.
     """
 
-    kind: Literal["no_diff", "reviewed", "partial", "parse_failed", "all_failed"]
+    kind: Literal["no_diff", "reviewed", "parse_failed", "all_failed"]
     findings: tuple[Finding, ...] = field(default_factory=tuple)
     backend_used: Optional[Backend] = None
     model_name: Optional[str] = None
@@ -1279,11 +1276,20 @@ def review_diff(
         # Cave/Spark judge does the final grading downstream regardless. Log
         # which backend(s) answered for observability, but never degrade/retry.
         if len(successes) < 2:
+            # Carry PR/install identifiers so operators can find WHICH PRs were
+            # reviewed on a single backend during a free-tier outage - the
+            # dispatch-layer degraded log (installation_id + PR) no longer fires
+            # for this now-`reviewed` path, so this is the only per-PR signal.
+            ctx = pr_context or {}
             log.info(
                 "llm_deep_review_single_backend",
                 extra={
                     "successful_backends": [r.backend.value for r in successes],
                     "unavailable": last_error,
+                    "installation_id": ctx.get("installation_id"),
+                    "repo": ctx.get("repo"),
+                    "pr_number": ctx.get("pr_number"),
+                    "head_sha": str(ctx.get("head_sha") or "")[:8],
                 },
             )
         return LlmReviewResponse(
