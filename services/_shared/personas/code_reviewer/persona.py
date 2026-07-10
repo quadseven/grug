@@ -10,7 +10,7 @@ Two load-bearing safety properties:
      any hunk's `new_lines` set are dropped. An LLM-invented line is
      worse than no finding because it teaches developers to ignore
      Elder.
-  2. **Advisory degradation**: `kind in {no_diff, partial, all_failed, parse_failed}`
+  2. **Advisory degradation**: `kind in {no_diff, all_failed, parse_failed}`
      never blocks. Elder is advisory-first; LLM outages must not 500
      the gate. `conclusion=neutral` so the future blocking flip
      doesn't accidentally fail PRs on infrastructure flakiness.
@@ -112,8 +112,7 @@ class CodeReviewEvaluation:
     — both yield `findings=()` but only one is a real clean PR.
 
     `degraded_reason` carries the `LlmReviewResponse.kind` value when
-    not `"reviewed"` (`no_diff`, `partial`, `all_failed`, `parse_failed`).
-    A partial response retains its provisional findings; the other states
+    not `"reviewed"` (`no_diff`, `all_failed`, `parse_failed`) - these
     contain no usable findings. All degraded states
     map to `conclusion="neutral"` but the cause is preserved so caller
     metrics can distinguish empty PR vs LLM provider outage.
@@ -201,7 +200,7 @@ def evaluate_diff(
     """
     # Preserve `kind` as the degraded_reason so the caller can tell
     # "empty PR" from "every backend failed" (both yield findings=()).
-    if llm_response.kind not in {"reviewed", "partial"}:
+    if llm_response.kind != "reviewed":
         return CodeReviewEvaluation(
             findings=(),
             conclusion="neutral",
@@ -241,7 +240,7 @@ def evaluate_diff(
     conclusion: CheckConclusion = "failure" if has_blocking else "success"
     return CodeReviewEvaluation(
         findings=tuple(kept),
-        conclusion="neutral" if llm_response.kind == "partial" else conclusion,
+        conclusion=conclusion,
         dropped_hallucinations=dropped,
-        degraded_reason="partial" if llm_response.kind == "partial" else None,
+        degraded_reason=None,
     )

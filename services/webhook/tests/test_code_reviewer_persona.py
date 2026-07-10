@@ -163,22 +163,6 @@ def test_parse_failed_response_yields_neutral_passed_true() -> None:
     assert out.conclusion == "neutral"
 
 
-def test_partial_response_keeps_provisional_findings_but_never_blocks() -> None:
-    hunks = parse_diff(_DIFF)
-    llm = LlmReviewResponse(
-        kind="partial",
-        findings=(_llm_finding(rule="silent-exception", line=2),),
-        backend_used=Backend.POOLSIDE,
-        error="openrouter: timeout",
-    )
-
-    out = evaluate_diff(hunks, llm)
-
-    assert out.conclusion == "neutral"
-    assert out.degraded_reason == "partial"
-    assert [finding.rule_name for finding in out.findings] == ["silent-exception"]
-
-
 def test_finding_carries_persona_level_field_names() -> None:
     """Issue #182 spec: persona-level Finding has `file`, `line`,
     `severity`, `rule_name`, `message`, `suggestion`. The llm_client's
