@@ -447,9 +447,27 @@ _SYSTEM_PROMPTS: dict[PromptVariant, str] = {
 # block swapped for the sage cadence. Precomputed alongside the caveman set so
 # the paid path keeps the same prompt-cache stability; selected per-review by
 # the repo's `elder_voice` config. Caveman stays the default (free) voice.
-_SYSTEM_PROMPTS_SAGE: dict[PromptVariant, str] = {
-    v: apply_voice(prompt, "sage") for v, prompt in _SYSTEM_PROMPTS.items()
-}
+def _build_sage_prompts() -> dict[PromptVariant, str]:
+    """Precompute the sage-voiced prompts. A voice-swap failure (the caveman
+    VOICE block drifting so `apply_voice` can't find it) must NOT crash this
+    module's import - that would take down EVERY review, not just the paid
+    voice. Degrade the affected variant to its caveman prompt and log loudly;
+    `test_voice_pack` asserts the swap actually differs, so real drift fails in
+    CI rather than shipping."""
+    prompts: dict[PromptVariant, str] = {}
+    for variant, prompt in _SYSTEM_PROMPTS.items():
+        try:
+            prompts[variant] = apply_voice(prompt, "sage")
+        except ValueError:
+            log.error(
+                "sage_prompt_build_failed_degrading_to_caveman",
+                extra={"variant": variant},
+            )
+            prompts[variant] = prompt
+    return prompts
+
+
+_SYSTEM_PROMPTS_SAGE: dict[PromptVariant, str] = _build_sage_prompts()
 
 
 def select_prompt_variant(installation_id: int) -> PromptVariant:
