@@ -36,6 +36,7 @@ from github_reviews_client import (
     InlineComment, ReviewEvent, ReviewResult, get_review_comments, post_review,
 )
 from llm_client import Hunk as LlmHunk, LlmReviewResponse, PrContext, review_diff
+from voice_pack import VoiceSelection, entitled_voice
 from review_types import EFFORTS
 from personas.code_reviewer.dedup import (
     dedup_findings, finding_key, parse_rule, prior_keys_from_comments,
@@ -815,6 +816,30 @@ def dispatch_code_review(
         "body": str(pr.get("body") or ""),
     }
 
+    # Elder voice pack (#288/#578): sage for entitled installs that opted in
+    # via repo config, caveman (the free default) otherwise. Entitlement is
+    # re-checked HERE at use-time (not just at config write) so an install that
+    # lost allowlist status stops getting the paid voice on its next review;
+    # the allowlist lookup only fires for a repo whose config asks for sage.
+    # Best-effort: a config-store hiccup must not fail a review, so any error
+    # falls back to the caveman default.
+    voice: VoiceSelection = "caveman"
+    try:
+        from adapters.install_store import get_repo_config, is_install_allowlisted
+
+        voice = entitled_voice(
+            get_repo_config(installation_id, int(repo["id"])),
+            check_entitlement=lambda: is_install_allowlisted(installation_id),
+        )
+    except Exception as e:  # noqa: BLE001 - voice is cosmetic; never fail a review
+        log.warning(
+            "elder_voice_resolve_failed",
+            extra={
+                "pr": f"{owner}/{repo_name}#{pull_number}",
+                "kind": type(e).__name__,
+            },
+        )
+
     # A queued message can already be stale when the consumer starts it. Check
     # the complete review input before spending model tokens: unchanged head
     # does not imply unchanged diff or intent when base/title/body moved.
@@ -961,6 +986,7 @@ def dispatch_code_review(
         cross_file_contents=cross_file_contents,
         runtime_context=runtime_context,
         pr_context=pr_context,
+        voice=voice,
     )
     needs_cave_fallback = llm_response.kind == "all_failed"
     if llm_response.kind != "reviewed":
