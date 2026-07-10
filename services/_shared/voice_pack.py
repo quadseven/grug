@@ -15,7 +15,7 @@ baseline is untouched. The default (caveman) path is a pure no-op.
 """
 from __future__ import annotations
 
-from typing import Literal
+from typing import Callable, Literal
 
 # The caveman VOICE block, imported (not re-declared) so the swap targets the
 # EXACT string build_system_prompt injects. Keeping code_review_prompt.py the
@@ -87,10 +87,26 @@ def apply_voice(system_prompt: str, voice: VoiceSelection) -> str:
 
 
 def resolve_voice(repo_config: dict) -> VoiceSelection:
-    """The Elder voice for a repo, from its stored `elder_voice` config.
+    """Decode the stored `elder_voice` config into a voice (pure, no entitlement
+    check - see `entitled_voice` for the use-time gate).
 
-    Fail-safe to caveman for a missing or unrecognized value: the paid voice is
-    opt-in and write-gated (set_repo_config enforces entitlement), so an
-    unexpected stored value must never crash a review - it speaks the free
-    default instead."""
+    Fail-safe to caveman for a missing or unrecognized value: an unexpected
+    stored value must never crash a review - it speaks the free default."""
     return "sage" if repo_config.get("elder_voice") == "sage" else "caveman"
+
+
+def entitled_voice(
+    repo_config: dict, *, check_entitlement: Callable[[], bool]
+) -> VoiceSelection:
+    """The Elder voice with a USE-TIME entitlement gate.
+
+    The write-time gate (set_repo_config) alone can't revoke: an install that
+    opted into sage and later lost allowlist status would keep the paid voice
+    forever from stored config. So sage is granted only if the config asks for
+    it AND `check_entitlement()` (the paid allowlist) is currently True.
+
+    `check_entitlement` is a thunk so a free install never pays the extra
+    lookup - it is called only when the stored voice is sage."""
+    if resolve_voice(repo_config) == "sage" and check_entitlement():
+        return "sage"
+    return "caveman"

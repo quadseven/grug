@@ -36,7 +36,7 @@ from github_reviews_client import (
     InlineComment, ReviewEvent, ReviewResult, get_review_comments, post_review,
 )
 from llm_client import Hunk as LlmHunk, LlmReviewResponse, PrContext, review_diff
-from voice_pack import VoiceSelection, resolve_voice
+from voice_pack import VoiceSelection, entitled_voice
 from review_types import EFFORTS
 from personas.code_reviewer.dedup import (
     dedup_findings, finding_key, parse_rule, prior_keys_from_comments,
@@ -817,14 +817,20 @@ def dispatch_code_review(
     }
 
     # Elder voice pack (#288/#578): sage for entitled installs that opted in
-    # via repo config, caveman (the free default) otherwise. Resolved once here
-    # and threaded into review_diff. Best-effort: a config-store hiccup must not
-    # fail a review, so any error falls back to the caveman default.
+    # via repo config, caveman (the free default) otherwise. Entitlement is
+    # re-checked HERE at use-time (not just at config write) so an install that
+    # lost allowlist status stops getting the paid voice on its next review;
+    # the allowlist lookup only fires for a repo whose config asks for sage.
+    # Best-effort: a config-store hiccup must not fail a review, so any error
+    # falls back to the caveman default.
     voice: VoiceSelection = "caveman"
     try:
-        from adapters.install_store import get_repo_config
+        from adapters.install_store import get_repo_config, is_install_allowlisted
 
-        voice = resolve_voice(get_repo_config(installation_id, int(repo["id"])))
+        voice = entitled_voice(
+            get_repo_config(installation_id, int(repo["id"])),
+            check_entitlement=lambda: is_install_allowlisted(installation_id),
+        )
     except Exception as e:  # noqa: BLE001 - voice is cosmetic; never fail a review
         log.warning(
             "elder_voice_resolve_failed",

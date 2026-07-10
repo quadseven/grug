@@ -72,6 +72,35 @@ def test_resolve_voice(cfg, expected):
     assert vp.resolve_voice(cfg) == expected
 
 
+# --- voice_pack.entitled_voice (use-time entitlement gate) ------------------
+
+def test_entitled_voice_sage_granted_when_currently_entitled():
+    assert vp.entitled_voice(
+        {"elder_voice": "sage"}, check_entitlement=lambda: True
+    ) == "sage"
+
+
+def test_entitled_voice_sage_revoked_when_no_longer_entitled():
+    # The write-time gate can't revoke; use-time re-check must (Qodo #1).
+    assert vp.entitled_voice(
+        {"elder_voice": "sage"}, check_entitlement=lambda: False
+    ) == "caveman"
+
+
+def test_entitled_voice_free_install_never_pays_the_lookup():
+    # A caveman/free repo must not trigger the allowlist check (thunk unused).
+    called = {"n": 0}
+
+    def _boom():
+        called["n"] += 1
+        return True
+
+    assert vp.entitled_voice(
+        {"elder_voice": "caveman"}, check_entitlement=_boom
+    ) == "caveman"
+    assert called["n"] == 0
+
+
 # --- llm_client prompt selection --------------------------------------------
 
 def test_sage_prompt_cache_built_for_every_variant():
@@ -93,6 +122,17 @@ def test_build_messages_defaults_to_caveman():
     hunks = [Hunk(path="a.py", body="+x = 1")]
     default_sys = lc._build_messages(hunks, "v1")[0]["content"]
     assert CAVEMAN_VOICE in default_sys
+
+
+def test_sage_prompt_build_degrades_instead_of_crashing_import(monkeypatch):
+    # A voice-swap failure must NOT crash llm_client import (Qodo #2): it would
+    # take down every review, not just the paid voice. Degrade to caveman.
+    def _boom(prompt, voice):
+        raise ValueError("caveman VOICE block not found")
+
+    monkeypatch.setattr(lc, "apply_voice", _boom)
+    degraded = lc._build_sage_prompts()
+    assert degraded == lc._SYSTEM_PROMPTS  # every variant fell back to caveman
 
 
 # --- pg_install_store: storage + entitlement gate ---------------------------
