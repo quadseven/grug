@@ -5,16 +5,18 @@ on a Grug inline review comment is the HUMAN ground-truth label that
 calibrates the LLM judge's `is_real_bug` guess. GitHub does not webhook
 comment reactions, so a scheduled poller (#245b) reads them via the
 reactions REST API and pipes the signal into DD LLM Obs as a
-`human_verdict` annotation attached to the review span.
+`human_verdict` annotation attached to every producer span. New records
+trust only reactors with repository write permission; confirmed/false-positive labels also
+update the repository ledger and refresh its bounded practices/examples.
 
 This module is the engine: classify reactions → verdict, poll a
 comment's reactions, and `poll_and_annotate` a batch with dedup. The
 scheduled trigger (Lambda + EventBridge) + the persist-on-publish
-wiring live in #245b — this layer is pure logic + GH/DD I/O, fully
+wiring live in #245b - this layer owns GH, DD, and ledger I/O and is fully
 unit-testable.
 
 Dedup: each comment record carries `last_verdict` (the verdict last
-submitted to DD). We only submit when the current classification
+submitted and learned). We only act when the current classification
 differs — so a 👎 that's been sitting for days doesn't re-submit every
 poll cycle, but a developer flipping 👎→👍 (changed their mind) does.
 Dedup is at-least-once, NOT exactly-once: if the DD submit succeeds but
@@ -24,7 +26,7 @@ generation timestamp), so a re-submit APPENDS a second `human_verdict`
 event on the span — it does NOT overwrite. We accept that: a rare
 duplicate (only on a submit-ok / baseline-write-fail partial failure,
 which needs a DDB fault) is strictly better than advancing the baseline
-before a confirmed submit and losing a human 👍/👎 forever. The
+before a confirmed submit and losing a human signal forever. The
 calibration consumer MUST dedup by (span, label) taking the latest
 timestamp — do not assume one eval per comment.
 """
@@ -32,7 +34,8 @@ from __future__ import annotations
 
 import logging
 import os
-from typing import Any, Callable, Optional
+from typing import Callable, Optional
+from urllib.parse import quote
 
 import httpx
 
@@ -45,6 +48,38 @@ _GH_API = "https://api.github.com"
 _REACTIONS_TIMEOUT = 10
 
 
+def _annotation_targets(
+    record: CommentRecord,
+) -> list[tuple[dict, dict[str, str]]]:
+    """Build per-producer annotation targets with legacy fallback."""
+    base_tags = record.get("finding_tags", {})
+    targets: list[tuple[dict, dict[str, str]]] = []
+    origins = record.get("finding_origins", [])
+    for origin in origins:
+        span_context = origin.get("review_span_context")
+        if not isinstance(span_context, dict):
+            continue
+        tags = dict(base_tags)
+        backend = origin.get("backend")
+        model = origin.get("model")
+        if isinstance(backend, str):
+            tags["source_backend"] = backend
+        if isinstance(model, str):
+            tags["source_model"] = model
+        targets.append((span_context, tags))
+    if targets:
+        return targets
+    if origins:
+        # The finding has producer provenance, but none of those producers has
+        # an exported span. Do not attach feedback to the response-level span,
+        # which may belong to a different backend.
+        return []
+    span_context = record.get("review_span_context")
+    if isinstance(span_context, dict):
+        return [(span_context, dict(base_tags))]
+    return []
+
+
 def _classify_reactions(reactions: list[dict]) -> Optional[ReactionVerdict]:
     """Map a comment's reactions to a single verdict, or None.
 
@@ -54,13 +89,8 @@ def _classify_reactions(reactions: list[dict]) -> Optional[ReactionVerdict]:
     is what prompt-optimization needs most). Non-thumbs reactions
     (heart/rocket/eyes) carry no verdict signal → None.
 
-    This classifies WHATEVER reactions it's handed — it does NOT filter
-    by who reacted. A passerby's 👎 currently counts the same as the PR
-    author's. Filtering to author/collaborator reactions needs the PR
-    author identity (captured at persist time) and is tracked in the
-    dispatch-wiring slice (#247). Until then the asymmetric 👎-wins rule
-    is bias-prone: the mixed-signal log (below) marks contested rows so
-    the calibration set can DOWN-WEIGHT them, not merely filter.
+    Caller filters new records to write-authorized collaborators; old records
+    without the capture marker retain their historical DD-only behavior.
     """
     contents = {r.get("content") for r in reactions}
     if "-1" in contents:
@@ -68,6 +98,131 @@ def _classify_reactions(reactions: list[dict]) -> Optional[ReactionVerdict]:
     if "+1" in contents:
         return "confirmed"
     return None
+
+
+def _has_write_permission(
+    install_token: str, owner: str, repo: str, login: str,
+) -> bool:
+    """Check whether a reactor can maintain repository code."""
+    resp = httpx.get(
+        f"{_GH_API}/repos/{quote(owner, safe='')}/{quote(repo, safe='')}/"
+        f"collaborators/{quote(login, safe='')}/permission",
+        headers={
+            "Authorization": f"Bearer {install_token}",
+            "Accept": "application/vnd.github+json",
+            "X-GitHub-Api-Version": "2022-11-28",
+        },
+        timeout=_REACTIONS_TIMEOUT,
+    )
+    if resp.status_code == 404:
+        return False
+    resp.raise_for_status()
+    body = resp.json()
+    return isinstance(body, dict) and body.get("permission") in {"admin", "write"}
+
+
+def _trusted_reactions(
+    record: CommentRecord,
+    reactions: list[dict],
+    *,
+    install_token: str,
+    owner: str,
+    repo: str,
+    permission_cache: dict[tuple[str, str], bool],
+) -> list[dict]:
+    """Use only write-authorized reactors for newly captured records."""
+    if not record.get("trust_reactors", False):
+        # Old records can still annotate DD but lack the fields required for
+        # automatic prompt learning.
+        return reactions
+    trusted: list[dict] = []
+    for reaction in reactions:
+        login = str((reaction.get("user") or {}).get("login") or "")
+        if not login:
+            continue
+        cache_key = (f"{owner}/{repo}".casefold(), login.casefold())
+        if cache_key not in permission_cache:
+            try:
+                permission_cache[cache_key] = _has_write_permission(
+                    install_token, owner, repo, login,
+                )
+            except (httpx.HTTPStatusError, httpx.RequestError) as e:
+                log.warning(
+                    "reaction_permission_check_failed",
+                    extra={
+                        "repo": f"{owner}/{repo}",
+                        "login": login,
+                        "kind": type(e).__name__,
+                    },
+                )
+                permission_cache[cache_key] = False
+        if permission_cache[cache_key]:
+            trusted.append(reaction)
+    return trusted
+
+
+def _record_reaction_learning(
+    record: CommentRecord, verdict: ReactionVerdict,
+) -> bool:
+    """Persist trusted feedback and refresh the repo's bounded prompt cache."""
+    if not record.get("trust_reactors", False):
+        return False
+    finding_text = record.get("finding_text", "")
+    tags = record.get("finding_tags", {})
+    rule_name = tags.get("rule_name", "")
+    severity = tags.get("severity", "")
+    if not all((finding_text, rule_name, severity)):
+        return False
+
+    from adapters.install_store import (  # type: ignore
+        list_ledger_rows,
+        put_ledger_row,
+        put_repo_exemplars,
+        put_repo_practices,
+    )
+    from best_practices import derive_practices, practices_to_dicts
+    from few_shot import exemplars_from_rows, exemplars_to_dicts
+    from ledger import accepted_findings_by_class, parse_row
+
+    row = {
+        "repo": record["repo"],
+        "pr": record["pr_number"],
+        "reviewer": "grug-elder",
+        "severity": severity,
+        "class": rule_name,
+        "finding": finding_text,
+        "verdict": "declined" if verdict == "confirmed" else "false-positive",
+        # Stable evidence makes a reaction flip overwrite the same ledger row.
+        "evidence": f"github-review-comment:{record['comment_id']}",
+        "ts": "",
+        "commit": record.get("head_sha") or None,
+    }
+    put_ledger_row(row)
+    parsed_rows = [
+        parsed
+        for raw in list_ledger_rows(record["repo"])
+        if (parsed := parse_row(raw)) is not None
+    ]
+    put_repo_practices(
+        record["repo"], practices_to_dicts(derive_practices(parsed_rows)),
+    )
+    put_repo_exemplars(
+        record["repo"],
+        exemplars_to_dicts(
+            exemplars_from_rows(accepted_findings_by_class(parsed_rows))
+        ),
+    )
+    return True
+
+
+def _can_learn(record: CommentRecord) -> bool:
+    tags = record.get("finding_tags", {})
+    return bool(
+        record.get("finding_text")
+        and record.get("trust_reactors")
+        and tags.get("rule_name")
+        and tags.get("severity")
+    )
 
 
 def poll_comment_reactions(
@@ -85,7 +240,8 @@ def poll_comment_reactions(
     impossible for a single review comment (full Link-header pagination
     would be over-engineering at that ceiling)."""
     resp = httpx.get(
-        f"{_GH_API}/repos/{owner}/{repo}/pulls/comments/{comment_id}/reactions",
+        f"{_GH_API}/repos/{quote(owner, safe='')}/{quote(repo, safe='')}/"
+        f"pulls/comments/{comment_id}/reactions",
         params={"per_page": 100},
         headers={
             "Authorization": f"Bearer {install_token}",
@@ -115,13 +271,13 @@ def poll_and_annotate(
     what the thunk caches).
     """
     submitted = 0
+    permission_cache: dict[tuple[str, str], bool] = {}
     for rec in records:
         comment_id = rec["comment_id"]
-        span_context = rec.get("review_span_context")
-        if span_context is None:
-            # `CommentRecord` types this `Optional[dict]`: None means the
-            # review span never exported (degraded review at publish), so
-            # there's nothing to attach the annotation to. Skip.
+        annotation_targets = _annotation_targets(rec)
+        if not annotation_targets and not _can_learn(rec):
+            # Old record with neither a producer span nor trusted-learning
+            # fields has no usable feedback destination.
             continue
         # `partition` (not `split` + splat): a malformed persisted repo
         # without a "/" would make `*split("/",1)` a 1-element splat →
@@ -136,8 +292,9 @@ def poll_and_annotate(
             )
             continue
         try:
+            install_token = fetch_token()
             reactions = poll_comment_reactions(
-                fetch_token(), owner, name, comment_id,
+                install_token, owner, name, comment_id,
             )
         except (httpx.HTTPStatusError, httpx.RequestError) as e:
             log.warning(
@@ -148,6 +305,14 @@ def poll_and_annotate(
                 },
             )
             continue
+        reactions = _trusted_reactions(
+            rec,
+            reactions,
+            install_token=install_token,
+            owner=owner,
+            repo=name,
+            permission_cache=permission_cache,
+        )
         verdict = _classify_reactions(reactions)
         if verdict is None:
             continue
@@ -166,22 +331,35 @@ def poll_and_annotate(
                 extra={"install_id": install_id, "comment_id": comment_id,
                        "verdict": verdict},
             )
-        # Guard the DD-submit + baseline-write as a unit. Broad catch:
-        # both the ddtrace seam (internal/intake errors, a stale
-        # malformed span dict) and the store update (psycopg.Error:
-        # throttle, timeout) can raise, and a best-effort poller must
-        # not let one bad record abort the rest of the batch. Submit
-        # FIRST, advance the baseline only after — so on a partial
-        # failure we re-submit next cycle rather than lose the human
-        # signal forever. A re-submit APPENDS a duplicate eval (DD evals
-        # are time-series, not upserts) — accepted; the calibration
-        # consumer dedups by (span, label). See module docstring.
+        # Attempt every producer even if one DD submit fails. Advance the
+        # per-comment baseline only when every annotation and the store update
+        # succeed; otherwise the next poll retries the whole fan-out. A retry
+        # can append a duplicate eval for a producer that succeeded before a
+        # sibling failed, which the calibration consumer already deduplicates
+        # by (span, label).
+        annotation_failed = False
+        for span_context, tags in annotation_targets:
+            try:
+                submit_reaction_annotation(
+                    verdict=verdict,
+                    review_span_context=span_context,
+                    tags=tags,
+                )
+            except Exception as e:  # noqa: BLE001 - best-effort per producer span
+                annotation_failed = True
+                log.warning(
+                    "reaction_submit_or_persist_failed",
+                    extra={
+                        "install_id": install_id,
+                        "comment_id": comment_id,
+                        "kind": type(e).__name__,
+                        "source_backend": tags.get("source_backend"),
+                    },
+                )
+        if annotation_failed:
+            continue
         try:
-            submit_reaction_annotation(
-                verdict=verdict,
-                review_span_context=span_context,
-                tags=rec.get("finding_tags", {}),
-            )
+            _record_reaction_learning(rec, verdict)
             update_comment_record_reaction(
                 install_id=install_id, comment_id=comment_id, verdict=verdict,
             )

@@ -7,8 +7,6 @@ Best-effort — a judge failure never affects the (already-published)
 review."""
 from __future__ import annotations
 
-from unittest.mock import patch
-
 from llm_client import Backend, FindingJudgement, LlmReviewResponse
 from personas.code_reviewer import judge as cr_judge
 from personas.code_reviewer.diff_parser import parse_diff
@@ -51,7 +49,7 @@ def test_run_judge_submits_one_eval_per_finding(monkeypatch):
 
     monkeypatch.setattr(
         cr_judge, "judge_findings",
-        lambda fr, h, installation_id, pr_context=None, file_contents=None: (
+        lambda fr, h, installation_id, **kwargs: (
             FindingJudgement(0, True, "real"),
             FindingJudgement(1, False, "nit"),
         ),

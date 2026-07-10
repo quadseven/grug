@@ -29,12 +29,12 @@ from .corpus import CorpusSample
 
 log = logging.getLogger("grug.sast_benchmark")
 
-_TIMEOUT_SECONDS = 90.0
+_TIMEOUT_SECONDS = 150.0
 _RETRY_ATTEMPTS = 2
 # Measure the SHIPPED prompt. `_build_messages` keys `_SYSTEM_PROMPTS` by
-# PromptVariant ("v1"/"v2", #191 A/B); "v1" is the production default. Passing
+# PromptVariant ("v1"/"v2", #191 A/B); deep production uses v2. Passing
 # a non-member (the old "benchmark") raises KeyError -> every sample errors.
-_BENCH_PROMPT_VARIANT = "v1"
+_BENCH_PROMPT_VARIANT = "v2"
 
 
 def _post(backend: BenchBackend, messages: list[dict[str, str]]) -> httpx.Response:

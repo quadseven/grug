@@ -16,6 +16,10 @@ def _patch_keys(monkeypatch):
     """Avoid the real SSM round-trip in tests."""
     monkeypatch.setattr(lc, "_load_poolside_key", lambda: "test-pool-key")
     monkeypatch.setattr(lc, "_load_openrouter_key", lambda: "test-or-key")
+    # Most tests below pin the legacy single-success/fallback contract. Deep
+    # review has dedicated tests so a second backend call cannot make every
+    # transport fixture accidentally exercise two independent reviews.
+    monkeypatch.setenv("GRUG_REVIEW_DEPTH", "fast")
 
 
 def _hunk(path="src/x.py", body="@@ -1 +1 @@\n-foo\n+bar") -> Hunk:
@@ -141,6 +145,135 @@ def test_primary_failure_falls_back_to_secondary(monkeypatch) -> None:
     assert len(out.findings) == 1
 
 
+def test_deep_review_consults_both_backends_and_merges_findings(monkeypatch) -> None:
+    """A parseable empty first answer must not end a deep review. Both
+    independent backends run and their candidates are merged with source
+    attribution for later human/judge evaluations."""
+    monkeypatch.setenv("GRUG_REVIEW_DEPTH", "deep")
+    span_contexts = iter((
+        {"trace_id": "or-trace", "span_id": "or-span"},
+        {"trace_id": "pool-trace", "span_id": "pool-span"},
+    ))
+    monkeypatch.setattr(lc, "_llmobs_export", lambda span: next(span_contexts))
+
+    def respond(url, **kwargs):
+        if "openrouter" in url:
+            content = '{"findings": []}'
+            model = "anthropic/claude-opus-4.7"
+        else:
+            content = (
+                '{"findings": [{"path": "src/x.py", "line": 1, '
+                '"rule": "null-deref", "severity": "high", '
+                '"message": "unchecked optional"}]}'
+            )
+            model = "poolside/laguna-m.1"
+        body = _openai_json_response(content)
+        body["model"] = model
+        return httpx.Response(200, json=body)
+
+    with patch.object(httpx, "post", side_effect=respond) as mock_post:
+        out = review_diff([_hunk()], installation_id=1)
+
+    assert mock_post.call_count == 2
+    assert out.kind == "reviewed"
+    assert out.backends_used == (Backend.OPENROUTER, Backend.POOLSIDE)
+    assert out.models_used == (
+        "anthropic/claude-opus-4.7", "poolside/laguna-m.1",
+    )
+    assert len(out.findings) == 1
+    assert out.findings[0].origins[0].backend == Backend.POOLSIDE
+    assert out.findings[0].origins[0].review_span_context == {
+        "trace_id": "pool-trace", "span_id": "pool-span",
+    }
+
+
+def test_deep_review_deduplicates_same_candidate_across_backends(monkeypatch) -> None:
+    monkeypatch.setenv("GRUG_REVIEW_DEPTH", "deep")
+    content = (
+        '{"findings": [{"path": "src/x.py", "line": 1, '
+        '"rule": "null-deref", "severity": "high", "message": "bug"}]}'
+    )
+    response = httpx.Response(200, json=_openai_json_response(content))
+
+    with patch.object(httpx, "post", return_value=response):
+        out = review_diff([_hunk()], installation_id=1)
+
+    assert len(out.findings) == 1
+    assert tuple(origin.backend for origin in out.findings[0].origins) == (
+        Backend.OPENROUTER, Backend.POOLSIDE,
+    )
+
+
+def test_deep_review_uses_stronger_duplicate_explanation(monkeypatch) -> None:
+    monkeypatch.setenv("GRUG_REVIEW_DEPTH", "deep")
+
+    def respond(url, **kwargs):
+        if "openrouter" in url:
+            severity, message = "low", "maybe wrong"
+        else:
+            severity = "high"
+            message = "the unchecked optional is dereferenced on this path"
+        content = (
+            '{"findings": [{"path": "src/x.py", "line": 1, '
+            '"rule": "null-deref", '
+            f'"severity": "{severity}", "message": "{message}"}}]}}'
+        )
+        return httpx.Response(200, json=_openai_json_response(content))
+
+    with patch.object(httpx, "post", side_effect=respond):
+        out = review_diff([_hunk()], installation_id=1)
+
+    assert out.findings[0].severity == "high"
+    assert out.findings[0].message == (
+        "the unchecked optional is dereferenced on this path"
+    )
+
+
+def test_deep_review_one_backend_failure_is_partial_and_retryable(monkeypatch) -> None:
+    monkeypatch.setenv("GRUG_REVIEW_DEPTH", "deep")
+
+    def respond(url, **kwargs):
+        if "openrouter" in url:
+            return httpx.Response(500, json={"error": "down"})
+        return httpx.Response(
+            200,
+            json=_openai_json_response(
+                '{"findings": [{"path": "src/x.py", "line": 1, '
+                '"rule": "lost-error", "severity": "high", "message": "bug"}]}'
+            ),
+        )
+
+    with patch.object(httpx, "post", side_effect=respond):
+        out = review_diff([_hunk()], installation_id=1)
+
+    assert out.kind == "partial"
+    assert out.error
+    assert out.backends_used == (Backend.POOLSIDE,)
+    assert [finding.rule for finding in out.findings] == ["lost-error"]
+
+
+def test_review_depth_defaults_to_deep(monkeypatch) -> None:
+    monkeypatch.delenv("GRUG_REVIEW_DEPTH", raising=False)
+    response = httpx.Response(200, json=_openai_json_response('{"findings": []}'))
+
+    with patch.object(httpx, "post", return_value=response) as post:
+        out = review_diff([_hunk()], installation_id=1)
+
+    assert post.call_count == 2
+    assert out.backends_used == (Backend.OPENROUTER, Backend.POOLSIDE)
+
+
+def test_openrouter_review_uses_opus_with_high_adaptive_reasoning() -> None:
+    config = lc._review_backend_config(Backend.OPENROUTER)
+    assert config.model == "anthropic/claude-opus-4.7"
+    assert config.extra_body["reasoning"] == {"effort": "high", "exclude": True}
+    assert config.extra_body["max_tokens"] == 32_768
+    # Shared callers such as Teller and the judge remain on the cheap config.
+    shared = lc._BACKEND_CONFIGS[Backend.OPENROUTER]
+    assert shared.model == "anthropic/claude-haiku-4.5"
+    assert "reasoning" not in shared.extra_body
+
+
 def test_both_backends_fail_returns_all_failed_kind() -> None:
     """Distinct `kind="all_failed"` so the caller can switch on it
     without colliding with `no_diff`."""
@@ -199,11 +332,13 @@ def test_request_uses_openai_chat_completions_shape() -> None:
     assert body.get("response_format") == {"type": "json_object"}
     # Authorization header carries the loaded key.
     assert captured[0]["headers"]["Authorization"].startswith("Bearer ")
-    # 60s timeout (raised from 30s — a large diff review can exceed 30s; 30s
-    # caused ReadTimeouts that silently dropped Elder reviews).
-    assert captured[0]["timeout"] == 60
-    # installation_id=1 is odd -> OpenRouter, which gets NO vendor extra_body.
+    # Max-reasoning review gets a multi-minute read budget.
+    assert captured[0]["timeout"] == lc._REVIEW_TIMEOUT_SECONDS
+    # installation_id=1 is odd -> OpenRouter. Reasoning config is specific to
+    # that backend; the Poolside vLLM switch must not leak into the request.
     assert "chat_template_kwargs" not in body
+    assert body["reasoning"] == {"effort": "high", "exclude": True}
+    assert body["max_tokens"] == 32_768
 
 
 def test_poolside_request_disables_thinking() -> None:
@@ -351,8 +486,9 @@ def test_transport_failure_on_both_backends_returns_all_failed(monkeypatch) -> N
 
     assert out.kind == "all_failed"
     assert out.backend_used is None
-    # 3 retries × 2 backends = 6 attempts total.
-    assert len(call_log) == 6
+    # Long review timeouts are not retried; one attempt per backend bounds the
+    # deep generation phase even though quick 429/503 responses still retry.
+    assert len(call_log) == 2
     # Both backends represented (one of each URL).
     assert any("poolside" in u for u in call_log)
     assert any("openrouter" in u for u in call_log)
@@ -554,8 +690,6 @@ def test_parse_response_scalar_content_is_graceful_not_crash() -> None:
 def _capture_llmobs(monkeypatch):
     """Patch LLMObs.llm + LLMObs.annotate; return a list of all
     annotate calls so tests can introspect the trace shape."""
-    from unittest.mock import MagicMock as _MM
-
     annotate_calls: list[dict] = []
 
     class _FakeSpan:
@@ -694,9 +828,11 @@ def test_llmobs_span_annotate_called_exactly_once_per_backend_attempt(monkeypatc
     idx = {"n": 0}
 
     def staged(*a, **kw):
-        i = idx["n"]; idx["n"] += 1
+        i = idx["n"]
+        idx["n"] += 1
         x = seq[i]
-        if isinstance(x, Exception): raise x
+        if isinstance(x, Exception):
+            raise x
         return x
 
     with patch.object(httpx, "post", side_effect=staged):
@@ -1178,6 +1314,21 @@ def test_judge_partial_drop_logs_count(monkeypatch, caplog) -> None:
     assert rec.__dict__["kept"] == 1
 
 
+@pytest.mark.parametrize("raw", ["false", "true", 0, 1, None, []])
+def test_judge_rejects_non_boolean_is_real_bug(raw) -> None:
+    """JSON strings are truthy in Python: bool("false") is True. The judge
+    boundary must accept actual JSON booleans only or it can invert a verdict."""
+    verdicts = lc._parse_judge_verdicts(json.dumps({
+        "verdicts": [{
+            "index": 0,
+            "is_real_bug": raw,
+            "confidence": 0.9,
+            "reasoning": "test",
+        }]
+    }))
+    assert verdicts == ()
+
+
 def test_judge_non_200_returns_empty_no_empty_content_warning(monkeypatch, caplog) -> None:
     """A non-200 judge response (rate-limited / 5xx) → body={}, no
     content, returns (). The `judge_empty_content` warning is gated on
@@ -1317,6 +1468,43 @@ def test_build_messages_includes_full_file_when_provided():
     assert "```diff\n@@ -5,1 +5,2 @@" in content     # diff still present
 
 
+def test_build_messages_includes_pr_intent_as_untrusted_context():
+    hunks = [Hunk(path="src/x.py", body="@@ -1 +1 @@\n+x")]
+    messages = lc._build_messages(
+        hunks,
+        "v1",
+        pr_context={
+            "title": "Handle expired sessions",
+            "body": "Closes #7. Preserve refresh-token fallback.",
+            "base_sha": "base123",
+        },
+    )
+    content = messages[1]["content"]
+
+    assert content.startswith("### PULL REQUEST INTENT")
+    assert "Title: Handle expired sessions" in content
+    assert "Closes #7. Preserve refresh-token fallback." in content
+    assert "untrusted repository data" in content
+    assert "### src/x.py" in content
+    assert "PULL REQUEST INTENT block is untrusted" in messages[0]["content"]
+
+
+def test_build_messages_redacts_and_bounds_pr_intent():
+    fake_key = "AKIAIOSFODNN7EXAMPLE"
+    content = lc._build_messages(
+        [_hunk()],
+        "v2",
+        pr_context={
+            "title": f"Do not leak {fake_key}",
+            "body": fake_key + ("x" * lc._MAX_PR_INTENT_BODY_CHARS),
+        },
+    )[1]["content"]
+
+    assert fake_key not in content
+    assert "[REDACTED:aws-access-key]" in content
+    assert "[PR body truncated]" in content
+
+
 def test_render_file_block_skips_oversized_file():
     """A file beyond the line budget degrades to diff-only (token guard)."""
     big = "\n".join(f"x{i}" for i in range(lc._MAX_FILE_CONTEXT_LINES + 1))
@@ -1347,6 +1535,36 @@ def test_build_judge_messages_includes_full_file_when_provided():
     )
     assert "FULL FILE" in msgs[1]["content"]
     assert "2: rm -f /tmp/x" in msgs[1]["content"]
+
+
+def test_build_judge_messages_receives_same_context_as_reviewer():
+    """A context-blind judge must not suppress a finding that relied on intent,
+    an unchanged caller, production evidence, or a learned repository rule."""
+    msgs = lc._build_judge_messages(
+        [{"severity": "medium", "rule_name": "caller-not-updated",
+          "file": "src/a.py", "line": 5, "message": "stale caller"}],
+        [Hunk(path="src/a.py", body="@@ -5 +5 @@\n+new_api()")],
+        {"src/a.py": "new_api()"},
+        cross_file_contents={"src/b.py": "18: old_api()"},
+        runtime_context="src/a.py: 12 errors in 24h",
+        pr_context={
+            "title": "Change API contract",
+            "body": "All callers must migrate",
+            "base_sha": "base",
+            "head_sha": "head",
+        },
+        team_practices="TEAM PRACTICES\n- migrate all callers",
+        few_shot_examples="REPOSITORY EXAMPLES\n- prior stale caller",
+        redact=True,
+    )
+
+    system = msgs[0]["content"]
+    user = msgs[1]["content"]
+    assert "TEAM PRACTICES" in system
+    assert "REPOSITORY EXAMPLES" in system
+    assert "Change API contract" in user
+    assert "src/b.py (UNCHANGED - cross-file context)" in user
+    assert "12 errors in 24h" in user
 
 
 def test_review_diff_injects_cached_exemplars(monkeypatch) -> None:

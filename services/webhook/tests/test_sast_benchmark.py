@@ -141,8 +141,14 @@ def test_configured_backends_honors_env(monkeypatch):
     monkeypatch.setenv("GRUG_BENCH_OPENROUTER_KEY", "k")
     monkeypatch.setenv("GRUG_BENCH_CAVE_URL", "http://cave.example/v1/chat/completions")
     monkeypatch.setenv("GRUG_BENCH_CAVE_MODEL", "qwen-coder")
-    names = {b.name for b in backends.configured_backends()}
+    configured = backends.configured_backends()
+    names = {b.name for b in configured}
     assert names == {"openrouter", "sparkles"}  # poolside absent (no key)
+    openrouter = next(b for b in configured if b.name == "openrouter")
+    assert openrouter.model == "anthropic/claude-opus-4.7"
+    assert openrouter.extra_body["reasoning"] == {
+        "effort": "high", "exclude": True,
+    }
 
 
 def test_cave_needs_both_url_and_model(monkeypatch):

@@ -8,7 +8,7 @@ Accepted (2026-06-06)
 
 The 2026-06 Elder outage (both LLM backends failing) left Elder posting nothing for ~5 days across many PRs — and there was **no way to re-run** those reviews. Re-delivering the original webhook event is a no-op: the #272 async offload is idempotent on the delivery id (`claim_delivery`). The Activity feed (PRD #301) adds a **Re-run** action on `errored` rows (single + a "Re-run all errored" batch) to provide that missing backfill path.
 
-Re-run must run the persona's LLM review, which needs the webhook Lambda's 420s budget — the api Lambda (where the dashboard button lives) has a 15s timeout, so it cannot run the review itself. It must hand off to async, durable, rate-limited execution.
+Re-run must run the persona's LLM review, which exceeds the API request budget. The dashboard endpoint therefore hands work to async, durable, rate-limited execution owned by the Kubernetes consumer.
 
 Options considered for the hand-off/queue:
 
@@ -19,12 +19,12 @@ Options considered for the hand-off/queue:
 
 ## Decision
 
-**Re-run jobs go through an SQS FIFO queue (`grug-rerun-jobs`) + a DLQ, consumed by the webhook Lambda.**
+**Re-run jobs go through an SQS FIFO queue (`grug-rerun-jobs`) + a DLQ, consumed by the Kubernetes consumer.**
 
 - API endpoint `POST /installations/{id}/repos/{repo_id}/rerun` returns **202** and enqueues; a batch variant enqueues every current `errored` row.
 - **FIFO + content-based dedup** on `(install, repo, pr, persona)` → a double-click within the 5-min window is dropped (free double-click guard).
-- **`MessageGroupId = install_id`** → per-install serialization, so a batch backfill drains at a controlled rate instead of firing N concurrent LLM calls (protects rate limits + cost).
-- **Consumer** = SQS event-source mapping → the webhook Lambda (reuses dispatch + GitHub + LLM clients and the 420s budget), batch size 1. Fetches the PR's **current** head, runs the single named persona, upserts the `CheckVerdictRecord` (heals the row).
+- **Bounded workload groups** - normal reviews serialize per PR, explicit reruns per PR/persona, and questions per PR. Four consumer workers let unrelated groups progress concurrently without removing FIFO ordering inside one workload.
+- **Consumer** = the `grug-consumer` deployment. It reuses dispatch + GitHub + LLM clients, renews long-review visibility/claim leases, fetches the PR's current snapshot, runs the named persona, and upserts the `CheckVerdictRecord`.
 - **DLQ** with redrive (`maxReceiveCount ~3`) + a Datadog monitor on DLQ depth, so a stuck re-run pages instead of vanishing.
 - All Pulumi-managed (queue, DLQ, IAM: api → enqueue, webhook → consume).
 
@@ -34,19 +34,19 @@ Options considered for the hand-off/queue:
 
 - The backfill path the outage proved was missing: one click recovers a failed review; "Re-run all errored" recovers a batch.
 - Durable + retried + DLQ-backed — strictly better than the fire-and-forget offload.
-- Free double-click guard and built-in rate control (FIFO group ordering).
+- Free double-click guard, bounded concurrency, and FIFO ordering per workload.
 - ~$0: SQS free tier is 1M requests/month (always-free); volume is dozens/month. Zero ops; stays in the all-AWS-serverless architecture.
 
 ### Negative
 
 - Introduces SQS to grug (first queue) — new infra + IAM + a DLQ monitor to own.
-- FIFO per-install serialization makes a large batch drain slowly (acceptable — it's the rate control we want).
+- The fixed worker pool bounds concurrency; a large batch still drains in waves.
 - A new api → webhook coupling (api enqueues work the webhook runs).
 
 ### Reconsideration triggers
 
-- Re-run volume grows enough that per-install FIFO serialization is too slow (move to a standard queue + explicit concurrency cap).
-- The #272 Elder *offload* is migrated onto the same queue (kills the drop-on-throttle failure mode) — a noted future consolidation.
+- Re-run volume outgrows the four-worker pool (add autoscaling or a dedicated review queue).
+- One workload class needs an independent cost/rate budget (split the shared FIFO).
 
 ## References
 

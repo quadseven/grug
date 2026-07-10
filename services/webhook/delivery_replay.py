@@ -5,7 +5,7 @@
 """Replay GitHub App webhook deliveries missed during an outage (#407).
 
 The DoR/TPM check runs inline on the webhook, so a delivery that arrives while
-grug is down is lost: GitHub retries a few times then gives up, leaving a
+grug is down is lost: GitHub does not automatically redeliver it, leaving a
 required check stuck until a human re-triggers (infra #1254). This recovers
 those deliveries via the GitHub App webhook-deliveries API (App-JWT auth):
 
