@@ -1,12 +1,13 @@
 """Elder (code-reviewer) persona - webhook pull_request dispatch (ADR-0010, #465).
 
-Elder makes 1-2 LLM calls (worst case ~300s) - far over GitHub's ~10s
-delivery timeout - so this entry ENQUEUES the review off the ACK path
-(#272) and returns `queued` immediately; `async_dispatch.run_elder_job`
-executes it with its own final guard. Enqueue failure does NOT fall back
-to a synchronous run - that would re-block the ACK; a dropped review
-re-triggers on the next push. Idempotency keys on `ctx.delivery_id`
-inside the worker.
+Elder's quiet window and two independent review calls run far beyond GitHub's
+delivery timeout, so this entry enqueues the review off the ACK path and
+returns `queued` immediately. Production uses the durable rerun FIFO; the
+consumer owns settling, snapshot-scoped idempotency, stale cancellation, and
+redrive. A durable queue failure escapes this async handoff so the webhook
+delivery is recorded failed and the replay poller can redeliver it; GitHub does
+not retry automatically. The local thread fallback never runs synchronously
+and retains the existing best-effort self-recovery path.
 
 `async_dispatch` is a webhook-only module, so the import stays inside the
 function: this shared module (services/_shared/, ADR-0014) is also
@@ -38,14 +39,9 @@ def dispatch_pull_request(ctx: PullRequestContext) -> dict[str, str]:
         blocking=ctx.blocking,
     )
     if not enqueued:
-        # #478 resolution: an enqueue failure (missing runtime flag /
-        # thread-spawn error) now ALSO enqueues one durable re-run on the
-        # SQS rerun lane - consumed by the separate grug-consumer
-        # deployment, which survives exactly the pod-local breakage that
-        # made this enqueue fail. Chosen over a 503 (GitHub redelivery
-        # storms + webhook auto-disable on persistent misconfig) and over
-        # the old silent drop-and-monitor. The error log below stays -
-        # it drives the offload monitor.
+        # Local/backward-compatible thread handoff only. Production durable
+        # queue errors raise above and are recorded as failed webhook
+        # deliveries for the replay poller by the registry boundary.
         from async_dispatch import self_recover_review  # lazy: webhook-only
 
         self_recover_review(ctx.payload, ctx.delivery_id, persona="elder")

@@ -84,9 +84,10 @@ aws ssm put-parameter --region us-east-1 \
   --type SecureString \
   --value "sk-or-v1-..."
 
-# Poolside API key — second backend for Elder persona round-robin
-# (installation_id % 2). Mint at https://poolside.ai/. Read by the
-# Elder-running workloads (webhook + consumer + poller).
+# Poolside API key - the second independent Elder review pass in deep mode.
+# In fast mode installation_id % 2 still selects the primary. Mint at
+# https://poolside.ai/. Read by the Elder-running workloads (webhook +
+# consumer + poller).
 aws ssm put-parameter --region us-east-1 \
   --name /infra/llm/poolside_api_key \
   --type SecureString \

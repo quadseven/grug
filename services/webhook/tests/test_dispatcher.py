@@ -10,6 +10,7 @@ from __future__ import annotations
 from unittest.mock import patch
 
 import personas.tpm.persona  # noqa: F401 — register submodule for patch path
+import pytest
 from dispatcher import dispatch
 
 
@@ -257,6 +258,28 @@ def test_pull_request_elder_enqueue_failure_does_not_skip_tpm_status():
     assert out["personas"][1] == {
         "persona": "code_reviewer", "result": "enqueue_failed",
     }
+
+
+def test_pull_request_durable_enqueue_error_propagates_for_retry():
+    """A failed durable handoff must become a non-2xx webhook response."""
+    with patch("dispatcher.is_install_allowlisted", return_value=True), \
+         patch("dispatcher.is_persona_enabled", return_value=True), \
+         patch("dispatcher.get_repo_config", return_value={"code_reviewer_blocking": False}), \
+         patch("personas.tpm.persona.evaluate_pull_request") as mock_eval, \
+         patch("personas.tpm.persona.publish_tpm_evaluation") as mock_pub, \
+         patch("async_dispatch.enqueue_elder_review",
+               side_effect=RuntimeError("durable queue unavailable")), \
+         patch("async_dispatch.enqueue_guard_review", return_value=True), \
+         patch("async_dispatch.enqueue_smasher_review", return_value=True), \
+         patch("async_dispatch.enqueue_walkthrough_review", return_value=True):
+        mock_eval.return_value = type("R", (), {"passed": True})()
+        mock_pub.return_value = {"persona": "tpm", "result": "pass"}
+        with pytest.raises(RuntimeError, match="durable queue unavailable"):
+            dispatch("pull_request", _full_pr_payload(), delivery_id="retry-me")
+
+    # Isolation is preserved: inline TPM still completed before the handoff
+    # error was re-raised to the HTTP boundary.
+    mock_pub.assert_called_once()
 
 
 def test_pull_request_threads_delivery_id_to_enqueue():

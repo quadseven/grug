@@ -7,7 +7,7 @@
 `POST /installations/{id}/repos/{repo_id}/rerun` validates + calls
 `enqueue_rerun`, which sends a `RerunJob` to `grug-rerun-jobs` (SQS FIFO). The
 api Lambda is 15s and can't run the review itself, so it hands off to the
-durable queue; the webhook consumes + re-runs the persona on the 420s budget.
+    durable queue; the webhook consumer runs the persona with renewable leases.
 """
 from __future__ import annotations
 
@@ -16,6 +16,7 @@ import logging
 import os
 
 import boto3
+from rerun_queue import rerun_group_id
 
 log = logging.getLogger("grug.api.rerun")
 
@@ -38,8 +39,8 @@ def enqueue_rerun(
     content-dedup on `(install, repo, pr, persona)` — a double-click within the
     5-min window is dropped for free (ADR-0004). `head_sha` is deliberately NOT
     in the key: a re-run always targets the PR's CURRENT head, so two clicks on
-    the same errored row ARE the same job. `MessageGroupId = install_id`
-    serializes a batch backfill at a controlled rate (protects rate limits)."""
+    the same errored row ARE the same job. FIFO ordering is scoped to the same
+    PR/persona so one long review cannot block unrelated PRs or questions."""
     if not _RERUN_QUEUE_URL:
         raise RuntimeError("GRUG_RERUN_QUEUE_URL not configured")
     _sqs.send_message(
@@ -53,7 +54,9 @@ def enqueue_rerun(
                 "persona": persona,
             }
         ),
-        MessageGroupId=str(install_id),
+        MessageGroupId=rerun_group_id(
+            install_id, repo, pr_number, persona,
+        ),
         MessageDeduplicationId=f"{install_id}:{repo}:{pr_number}:{persona}",
     )
     log.info(

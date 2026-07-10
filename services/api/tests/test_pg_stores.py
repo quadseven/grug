@@ -216,7 +216,9 @@ def test_claim_delivery_win_once_and_expired_takeover(pg):
     # have deleted the row; PG must treat expired as free).
     with store.get_pool().connection() as conn:
         conn.execute(
-            "UPDATE grug_kv SET ttl = EXTRACT(EPOCH FROM now())::bigint - 10 "
+            "UPDATE grug_kv SET data = jsonb_set("
+            "data, '{lease_expires_at}', "
+            "to_jsonb(EXTRACT(EPOCH FROM now())::bigint - 10)) "
             "WHERE pk = %s",
             (f"DELIVERY#{did}",),
         )
@@ -224,10 +226,11 @@ def test_claim_delivery_win_once_and_expired_takeover(pg):
 
 
 def test_claim_review_per_head_sha_win_once_and_distinct_sha(pg):
-    """#397: claim_review wins once per (install, repo, pr, persona, head_sha).
-    The SAME head SHA loses on a re-trigger (idempotent — no duplicate review
-    on `edited`/`ready_for_review`); a DIFFERENT head SHA wins (every new
-    commit reviews); a missing head SHA fails OPEN; an expired claim is free."""
+    """The historical head_sha argument is an opaque review-input identity.
+
+    The same identity loses on a re-trigger, a different identity wins, a
+    missing identity fails open, and an expired claim is free.
+    """
     from adapters import pg_install_store as store
 
     base = dict(
@@ -252,6 +255,97 @@ def test_claim_review_per_head_sha_win_once_and_distinct_sha(pg):
             ("REVIEW#7:githumps/grug:12:code_reviewer:sha-aaa",),
         )
     assert store.claim_review(**base, head_sha="sha-aaa") is True
+
+
+def test_release_review_claim_makes_failed_head_retryable(pg):
+    """A durable attempt that did not publish must not burn the head claim."""
+    from adapters import pg_install_store as store
+
+    claim = dict(
+        install_id=7,
+        repo="githumps/grug",
+        pr_number=12,
+        persona="code_reviewer",
+        head_sha="sha-retry",
+    )
+    assert store.claim_review(**claim) is True
+    store.release_review_claim(**claim)
+    assert store.claim_review(**claim) is True
+
+
+def test_durable_review_claim_lease_lifecycle(pg):
+    """In-flight attempts are busy; completed and legacy claims deduplicate."""
+    from adapters import pg_install_store as store
+
+    claim = dict(
+        install_id=7,
+        repo="githumps/grug",
+        pr_number=12,
+        persona="code_reviewer",
+        head_sha="snapshot-lease",
+    )
+    assert store.acquire_review_claim(
+        **claim, owner_token="worker-a", lease_seconds=900,
+    ) == "acquired"
+    with store.get_pool().connection() as conn:
+        ttl, lease_expires_at = conn.execute(
+            "SELECT ttl, (data->>'lease_expires_at')::bigint FROM grug_kv "
+            "WHERE pk = %s",
+            ("REVIEW#7:githumps/grug:12:code_reviewer:snapshot-lease",),
+        ).fetchone()
+    assert ttl - lease_expires_at > 29 * 86400
+    assert store.acquire_review_claim(
+        **claim, owner_token="worker-b", lease_seconds=900,
+    ) == "busy"
+    assert store.renew_review_claim(
+        **claim, owner_token="worker-b", lease_seconds=900,
+    ) is False
+    assert store.renew_review_claim(
+        **claim, owner_token="worker-a", lease_seconds=900,
+    ) is True
+    assert store.release_review_claim(**claim, owner_token="worker-b") is False
+    assert store.complete_review_claim(**claim, owner_token="worker-b") is False
+    assert store.complete_review_claim(**claim, owner_token="worker-a") is True
+    assert store.renew_review_claim(
+        **claim, owner_token="worker-a", lease_seconds=900,
+    ) is False
+    assert store.acquire_review_claim(
+        **claim, owner_token="worker-c", lease_seconds=900,
+    ) == "completed"
+
+    legacy = {**claim, "head_sha": "legacy-claim"}
+    assert store.claim_review(**legacy) is True
+    assert store.acquire_review_claim(
+        **legacy, owner_token="worker-c", lease_seconds=900,
+    ) == "completed"
+
+
+def test_durable_review_claim_expiry_allows_safe_takeover(pg):
+    """An abandoned lease is reclaimable and its old owner cannot delete it."""
+    from adapters import pg_install_store as store
+
+    claim = dict(
+        install_id=7,
+        repo="githumps/grug",
+        pr_number=12,
+        persona="code_reviewer",
+        head_sha="snapshot-takeover",
+    )
+    assert store.acquire_review_claim(
+        **claim, owner_token="worker-old", lease_seconds=900,
+    ) == "acquired"
+    with store.get_pool().connection() as conn:
+        conn.execute(
+            "UPDATE grug_kv SET ttl = EXTRACT(EPOCH FROM now())::bigint - 10 "
+            "WHERE pk = %s",
+            ("REVIEW#7:githumps/grug:12:code_reviewer:snapshot-takeover",),
+        )
+
+    assert store.acquire_review_claim(
+        **claim, owner_token="worker-new", lease_seconds=900,
+    ) == "acquired"
+    assert store.release_review_claim(**claim, owner_token="worker-old") is False
+    assert store.complete_review_claim(**claim, owner_token="worker-new") is True
 
 
 def test_claim_delivery_concurrent_exactly_one_winner(pg):
@@ -641,17 +735,39 @@ def test_put_paths_write_future_ttl(pg):
 
 
 def test_comment_record_span_and_tags_round_trip(pg):
-    """The reaction poller's span attribution rides these two dicts."""
+    """Reaction attribution survives the Postgres JSON round trip for
+    both legacy scalar spans and the full ensemble producer list."""
     from adapters import pg_install_store as store
 
+    origins = [
+        {
+            "backend": "poolside",
+            "model": "poolside/laguna-m.1",
+            "review_span_context": {"trace_id": "t1", "span_id": "s1"},
+        },
+        {
+            "backend": "openrouter",
+            "model": "anthropic/claude-opus-4.7",
+            "review_span_context": {"trace_id": "t2", "span_id": "s2"},
+        },
+    ]
     store.put_comment_record(
         install_id=1, comment_id=100, repo="o/r", pr_number=5,
         review_span_context={"trace_id": "t1", "span_id": "s1"},
         finding_tags={"rule": "no-bare-except", "file": "x.py"},
+        finding_origins=origins,
+        finding_text="Exception is silently discarded.",
+        head_sha="abc123",
+        author_login="evan",
     )
     rec = store.list_comment_records(1)[0]
     assert rec["review_span_context"] == {"trace_id": "t1", "span_id": "s1"}
     assert rec["finding_tags"] == {"rule": "no-bare-except", "file": "x.py"}
+    assert rec["finding_origins"] == origins
+    assert rec["finding_text"] == "Exception is silently discarded."
+    assert rec["head_sha"] == "abc123"
+    assert rec["author_login"] == "evan"
+    assert rec["trust_reactors"] is True
 
 
 def test_allowlist_edges_missing_row_and_mixed_set(pg):
