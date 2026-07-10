@@ -1,6 +1,6 @@
-# Heavy ML dependencies (for Docker base image only)
+# Vector-index dependencies for the base image. v2 (spark-gateway native):
+# embeddings now come from the owned gateway, so sentence-transformers + torch
+# are gone - only the lightweight local index (faiss + numpy) remains.
 numpy==1.26.4
 faiss-cpu==1.7.4
-sentence-transformers>=2.3.0
-torch
 

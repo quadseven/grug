@@ -7,8 +7,8 @@ pyyaml>=6.0.1
 # Discord and Bot dependencies
 discord.py>=2.3.0
 
-# Google API dependencies
-google-generativeai>=0.3.0
+# Google Custom Search for fact-checking (lightweight). v2 drops Gemini
+# (google-generativeai) - chat + embeddings run on the owned spark-gateway.
 google-api-python-client>=2.0.0
 
 # Web framework dependencies

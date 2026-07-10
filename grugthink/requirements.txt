@@ -8,12 +8,12 @@ pyyaml>=6.0.1
 # Discord and Bot dependencies
 discord.py>=2.3.0
 
-# AI/ML dependencies (larger, grouped together)
+# Vector index (local). v2: embeddings come from the spark-gateway, so
+# sentence-transformers + torch are dropped.
 faiss-cpu==1.7.4
-sentence-transformers>=2.3.0
 
-# Google API dependencies
-google-generativeai>=0.3.0
+# Google Custom Search for fact-checking (lightweight). Gemini
+# (google-generativeai) is dropped - chat/embeddings run on the spark-gateway.
 google-api-python-client>=2.0.0
 
 # Web framework dependencies

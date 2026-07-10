@@ -33,6 +33,21 @@ Secrets (Discord tokens, LLM/API keys, Sentry DSN) are supplied at runtime via
 config/env or the dashboard - never hardcode them in source. If you fork a
 personality, keep it in `personalities/`.
 
+## LLM engine (v2: spark-gateway native)
+
+Chat and embeddings run against the owned, in-cluster **spark-gateway**
+(OpenAI-compatible) via `src/grugthink/llm.py` - no SaaS keys, no `torch`/
+`sentence-transformers`. Configure with:
+
+- `SPARK_GATEWAY_URL` (or `OLLAMA_URLS`) - the gateway base URL, e.g.
+  `http://spark-gateway.spark-gateway.svc:8080`.
+- `GRUGTHINK_LLM_MODEL` - chat model (default `qwen3-coder-next:latest`).
+- `GRUGTHINK_EMBED_MODEL` - embedding model (default `nomic-embed-text`).
+
+Leaving Gemini unset (`GEMINI_API_KEY` empty) keeps the bot fully on the
+gateway. If the gateway is unreachable a chat degrades to a canned in-character
+line and memory falls back to keyword search - it never crashes the bot.
+
 ## Status
 
 Imported into the monorepo as a curated, public-safe snapshot (deployment/infra

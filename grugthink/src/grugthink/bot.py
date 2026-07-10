@@ -36,6 +36,7 @@ else:
 # Lazy import of commands module to avoid loading Discord command decorators at module import time
 # cross_bot can be imported normally as it doesn't have decorator issues
 # from .bot import commands as bot_commands  # Imported lazily in __init__
+from . import llm  # noqa: E402  (v2 spark-gateway LLM engine)
 from .bot import cross_bot  # noqa: E402
 from .bot.prompts import (  # noqa: E402
     get_personality_engine,
@@ -1050,20 +1051,34 @@ IMPORTANT: Respond conversationally, NOT with TRUE/FALSE statements. Just chat n
 
 Response:"""
 
-            # Get response from the AI using existing query infrastructure
-
-            # Use direct API call for conversational responses (bypass TRUE/FALSE validation)
-            loop = asyncio.get_running_loop()
-            if config.USE_GEMINI:
-                raw_response = await loop.run_in_executor(
-                    None, self.query_conversational_gemini, prompt, self.get_bot_id()
+            # v2 engine: generate via the owned spark-gateway (llm.chat), not
+            # Gemini. Degrade to a canned in-character line if the gateway is
+            # unavailable, so a chat never crashes the bot.
+            try:
+                raw_response = await llm.chat(
+                    [
+                        {
+                            "role": "system",
+                            "content": (
+                                f"You are {personality.name}. Stay fully in "
+                                "character, casual, 1-2 sentences. Chat naturally "
+                                "- never emit TRUE/FALSE."
+                            ),
+                        },
+                        {"role": "user", "content": prompt},
+                    ],
+                    temperature=0.7,
+                    max_tokens=120,
                 )
-            else:
-                # Fallback to simple response for now
+            except llm.LLMError as gateway_error:
+                self.log.warning(
+                    "spark-gateway chat unavailable; canned reply",
+                    extra={"bot_id": self.get_bot_id(), "error": str(gateway_error)},
+                )
                 raw_response = (
                     "Grug think about cave things..."
                     if "grug" in personality.name.lower()
-                    else "Interesting conversation, mate."
+                    else "Hmm, Grug brain quiet right now."
                 )
 
             if raw_response and len(raw_response.strip()) > 0:
@@ -1103,47 +1118,6 @@ Response:"""
                     "error": str(e),
                 },
             )
-
-    def query_conversational_gemini(self, prompt: str, bot_id: str) -> str:
-        """Query Gemini API for conversational responses (not TRUE/FALSE validation)."""
-        try:
-            self.log.info(
-                "Starting conversational Gemini query", extra={"bot_id": bot_id, "prompt_length": len(prompt)}
-            )
-
-            if not config.GEMINI_API_KEY:
-                self.log.error("Gemini API key not configured for conversational query", extra={"bot_id": bot_id})
-                return "Sorry, I can't chat right now."
-
-            import google.generativeai as genai
-
-            genai.configure(api_key=config.GEMINI_API_KEY)
-            model = genai.GenerativeModel(model_name=config.GEMINI_MODEL)
-
-            resp = model.generate_content(
-                prompt, stream=False, generation_config={"temperature": 0.7, "top_p": 0.8, "max_output_tokens": 100}
-            )
-
-            if resp.text:
-                response = resp.text.strip()
-                self.log.info(
-                    "Conversational Gemini response received",
-                    extra={"bot_id": bot_id, "response_length": len(response), "response_preview": response[:50]},
-                )
-                return response
-            else:
-                self.log.warning("Empty response from Gemini API", extra={"bot_id": bot_id})
-                return "Hmm, not sure what to say about that."
-
-        except ImportError as e:
-            self.log.error("Gemini library not available for conversation", extra={"bot_id": bot_id, "error": str(e)})
-            return "Can't chat without proper setup."
-        except Exception as e:
-            self.log.error(
-                "Conversational Gemini API call failed",
-                extra={"bot_id": bot_id, "error": str(e), "error_type": type(e).__name__},
-            )
-            return "Sorry, having trouble thinking right now."
 
     async def handle_intelligent_bot_conversation(
         self, message, server_id, personality, bot_name, channel_id, current_time
