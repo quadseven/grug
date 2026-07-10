@@ -1,8 +1,9 @@
 # grug-consumer on Kubernetes (#368): replaces the two SQS->Lambda
 # event-source mappings (grug-rerun-jobs.fifo + grug-cave-results.fifo)
 # with a long-polling consumer process (services/webhook/consumer.py).
-# Same image as the webhook - the rerun handler runs full Elder re-runs,
-# so it needs the identical dependency graph and SSM env surface.
+# Same image as the webhook - the consumer runs normal durable Elder reviews
+# as well as explicit reruns, so it needs the identical dependency graph and
+# SSM env surface.
 # Image registry + tag are PLACEHOLDERS rewritten by the deploy workflow.
 apiVersion: apps/v1
 kind: Deployment
@@ -14,9 +15,9 @@ metadata:
     tags.datadoghq.com/service: grug-consumer
     tags.datadoghq.com/env: prod
 spec:
-  # ONE replica, deliberately: batch-size-1 consumption from FIFO queues -
-  # a second replica would interleave message groups and double Elder
-  # re-run load for zero benefit at grug's volume.
+  # One pod with a bounded in-process rerun worker pool. FIFO message groups
+  # preserve per-PR ordering while unrelated reviews and /grug ask jobs run in
+  # parallel; the watchdog restarts the pod if any worker dies.
   replicas: 1
   strategy: {type: Recreate}
   selector:
@@ -79,6 +80,16 @@ spec:
             - {name: GRUG_OPENROUTER_API_KEY_SSM, value: /infra/llm/openrouter_api_key}
             - {name: GRUG_POOLSIDE_API_KEY_SSM, value: /infra/llm/poolside_api_key}
             - {name: GRUG_PROMPT_EXPERIMENT_SSM, value: /grug/elder-prompt-experiment}
+            # Production Elder runs both review backends and merges their
+            # findings. Opus is scoped to the OpenRouter REVIEW pass only.
+            # Set GRUG_REVIEW_DEPTH=fast on both deployments for the immediate
+            # one-primary-plus-fallback latency/cost rollback.
+            - {name: GRUG_REVIEW_DEPTH, value: deep}
+            - {name: GRUG_OPENROUTER_REVIEW_MODEL, value: anthropic/claude-opus-4.7}
+            - {name: GRUG_RERUN_WORKERS, value: "4"}
+            # Four handlers plus their short claim-renewal heartbeats may touch
+            # Postgres concurrently; keep pool headroom above the worker count.
+            - {name: GRUG_PG_POOL_MAX, value: "10"}
             # In-cluster spark-gateway for the exposed-secret judge (#439,
             # ADR-0009). Non-secret Service DNS (named in the ADR); unset =
             # feature off, SaaS judge as before (fail-open).
@@ -106,8 +117,11 @@ spec:
           # process itself; if a consumer thread dies the process exits
           # (thread join in main) and the kubelet restarts the pod.
           resources:
-            requests: {cpu: 50m, memory: 192Mi}
-            limits: {memory: 512Mi}
+            # Four network-heavy review workers share this process. Leave room
+            # for concurrent prompts and occasional Semgrep reruns without an
+            # OOM restart halfway through a leased review.
+            requests: {cpu: 100m, memory: 256Mi}
+            limits: {memory: 1Gi}
           securityContext:
             allowPrivilegeEscalation: false
             readOnlyRootFilesystem: true

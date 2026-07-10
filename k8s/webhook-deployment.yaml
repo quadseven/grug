@@ -74,9 +74,22 @@ spec:
               valueFrom: {fieldRef: {fieldPath: status.hostIP}}
             - {name: DD_LOGS_INJECTION, value: "true"}
             - {name: GRUG_ENV, value: prod}
-            # Off-Lambda Elder path (#368): run reviews on an in-process
-            # background thread instead of the Lambda self-invoke.
+            # Off-Lambda async path (#368). Elder's production hot path is
+            # durable SQS below; this flag still enables the local worker used
+            # by the other async personas and by Elder only if that lane is
+            # deliberately disabled.
             - {name: GRUG_K8S_RUNTIME, value: "1"}
+            # Durable Elder hot path: stamp each webhook head onto the existing
+            # rerun FIFO, then let the consumer require 90s of head stability
+            # before spending the deep-review budget. A moved head is stale and
+            # cancelled; its newer webhook event owns the next message.
+            - {name: GRUG_ELDER_DURABLE_QUEUE, value: "1"}
+            - {name: GRUG_ELDER_SETTLE_SECONDS, value: "90"}
+            # Keep review configuration on both Elder-capable workloads. The
+            # Opus override is review-only; judge, Teller, and /grug ask retain
+            # their existing lower-cost OpenRouter model configuration.
+            - {name: GRUG_REVIEW_DEPTH, value: deep}
+            - {name: GRUG_OPENROUTER_REVIEW_MODEL, value: anthropic/claude-opus-4.7}
             - {name: GITHUB_APP_ID_SSM, value: /grug/github-app-id}
             - {name: GITHUB_APP_PRIVATE_KEY_SSM, value: /grug/github-app-private-key}
             - {name: GITHUB_APP_WEBHOOK_SECRET_SSM, value: /grug/github-app-webhook-secret}

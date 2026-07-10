@@ -2,9 +2,10 @@
 
 Runs AFTER a review is published: grades each surviving finding via a
 second LLM call (`llm_client.judge_findings`) and submits a per-finding
-`is_real_bug` evaluation to DD LLM Obs, attached to the original review
-span. Together with the reaction-poll pipeline (#190b) this builds a
-ground-truth dataset for prompt optimization.
+`is_real_bug` evaluation to DD LLM Obs. Ensemble findings fan the verdict
+out to every producer span; legacy and deterministic findings fall back
+to the response-level review span. Together with the reaction-poll
+pipeline (#190b) this builds a ground-truth dataset for prompt optimization.
 
 Best-effort contract: the developer already saw the review before this
 runs. A judge failure — LLM down, parse error, DD submit error — must
@@ -12,19 +13,23 @@ never raise, never alter the review outcome. Every exit path swallows.
 
 The judge is gated on two preconditions, both meaning "nothing useful
 to record":
-  - no findings (clean review — nothing to grade)
-  - no review_span_context (review degraded or span export failed —
-    nowhere to attach the eval)
+  - no findings (clean review - nothing to grade)
+  - no finding-level or response-level span context (nowhere to attach
+    the eval)
 """
 from __future__ import annotations
 
 import logging
 import os
+from dataclasses import replace
 from typing import Optional
 
 from llm_client import (
     FindingJudgement,
+    FindingOrigin,
     Hunk,
+    JUDGE_BATCH_SIZE,
+    JUDGE_MAX_FINDINGS,
     JudgeFindingRepr,
     PrContext,
     judge_findings,
@@ -62,16 +67,47 @@ def _finding_to_repr(f: Finding) -> JudgeFindingRepr:
     }
 
 
-def eval_tags(f: Finding) -> dict[str, str]:
+def eval_tags(
+    f: Finding, *, origin: Optional[FindingOrigin] = None,
+) -> dict[str, str]:
     """DD evaluation tags — finding identity for the annotation-queue
     UI to group + filter. `line` is stringified so all tag values are
     str (DD infers facet type from the first value seen)."""
-    return {
+    tags = {
         "rule_name": f.rule_name,
         "file": f.file,
         "line": str(f.line),
         "severity": f.severity,
     }
+    if origin is not None:
+        tags["source_backend"] = origin.backend.value
+        tags["source_model"] = origin.model
+    return tags
+
+
+def _eval_targets(
+    finding: Finding,
+    fallback_span_context: Optional[dict],
+) -> tuple[tuple[dict, Optional[FindingOrigin]], ...]:
+    """Return every exported producer span, or the legacy global span.
+
+    The fallback keeps SAST findings and records created before ensemble
+    provenance trainable. An ensemble finding with origins but no exported
+    origin span stays unattributed; attaching it to the response-level first
+    success would train the wrong backend.
+    """
+    origin_targets = tuple(
+        (origin.review_span_context, origin)
+        for origin in finding.origins
+        if origin.review_span_context is not None
+    )
+    if origin_targets:
+        return origin_targets
+    if finding.origins:
+        return ()
+    if fallback_span_context is not None:
+        return ((fallback_span_context, None),)
+    return ()
 
 
 def grade_findings(
@@ -81,43 +117,82 @@ def grade_findings(
     *,
     pr_context: Optional[PrContext] = None,
     file_contents: Optional[dict[str, str]] = None,
+    cross_file_contents: Optional[dict[str, str]] = None,
+    runtime_context: str | None = None,
 ) -> tuple[FindingJudgement, ...]:
     """Run the judge LLM over the evaluation's findings and return its
-    verdicts (#467). Fail-OPEN: an empty finding set, an over-budget PR, or
-    any LLM/parse error returns `()` so the caller suppresses nothing. This
+    verdicts (#467). Fail-OPEN: an empty finding set or an LLM/parse error
+    returns no verdict for the affected findings, so the caller suppresses
+    nothing. This
     is the ONLY function that makes the judge LLM call; both the
     publication gate (`partition_findings`) and the DD evals (`submit_evals`)
-    consume its result, so a review makes exactly one judge call. The
-    `_JUDGE_MAX_FINDINGS` cost guard lives inside `judge_findings` (it returns
-    `()` above the cap), so a firehose PR fail-opens there - no duplicate
-    check here."""
+    consume its result. Large ensemble outputs are split into bounded batches;
+    one failed batch does not discard verdicts for the others."""
     if not evaluation.findings:
         return ()
-    try:
-        # Convert parser DiffHunks → wire `Hunk`s (path/body) the SAME way the
-        # review path does (dispatch._to_llm_hunks). judge_findings is typed
-        # `list[Hunk]` and reads `.path`; passing raw DiffHunks (field is
-        # `file_path`) crashed the judge with AttributeError on EVERY review
-        # with findings, silently killing all `is_real_bug` LLM-Obs evals.
-        verdicts = judge_findings(
-            [_finding_to_repr(f) for f in evaluation.findings],
-            [Hunk(path=h.file_path, body=h.body) for h in hunks],
-            installation_id=installation_id,
-            pr_context=pr_context,
-            file_contents=file_contents,
-        )
-        log.info(
-            "judge_completed",
+    # Convert parser DiffHunks -> wire `Hunk`s (path/body) the same way the
+    # review path does. Passing raw DiffHunks once crashed every judge call.
+    wire_hunks = [Hunk(path=h.file_path, body=h.body) for h in hunks]
+    finding_reprs = [_finding_to_repr(f) for f in evaluation.findings]
+    verdicts: list[FindingJudgement] = []
+    failed_batches = 0
+    graded_reprs = finding_reprs[:JUDGE_MAX_FINDINGS]
+    ungraded_due_to_cap = len(finding_reprs) - len(graded_reprs)
+    if ungraded_due_to_cap:
+        log.warning(
+            "judge_total_cap_reached",
             extra={
-                "findings": len(evaluation.findings),
-                "verdicts": len(verdicts),
-                "real_bugs": sum(1 for v in verdicts if v.is_real_bug),
+                "findings": len(finding_reprs),
+                "max": JUDGE_MAX_FINDINGS,
+                "ungraded": ungraded_due_to_cap,
             },
         )
-        return verdicts
-    except Exception as e:  # noqa: BLE001 — fail-open: grade nothing, publish all
-        log.error("judge_grade_failed", extra={"kind": type(e).__name__}, exc_info=True)
-        return ()
+    for start in range(0, len(graded_reprs), JUDGE_BATCH_SIZE):
+        batch = graded_reprs[start:start + JUDGE_BATCH_SIZE]
+        try:
+            batch_verdicts = judge_findings(
+                batch,
+                wire_hunks,
+                installation_id=installation_id,
+                pr_context=pr_context,
+                file_contents=file_contents,
+                cross_file_contents=cross_file_contents,
+                runtime_context=runtime_context,
+                # Elder's cloud judge must receive the same secret-masked
+                # evidence as the cloud review pass. Cave-only callers opt out
+                # explicitly at the lower-level judge_findings boundary.
+                redact=True,
+            )
+        except Exception as e:  # noqa: BLE001 - fail-open per bounded batch
+            failed_batches += 1
+            log.error(
+                "judge_grade_batch_failed",
+                extra={
+                    "kind": type(e).__name__,
+                    "batch_start": start,
+                    "batch_size": len(batch),
+                },
+                exc_info=True,
+            )
+            continue
+        verdicts.extend(
+            replace(verdict, finding_index=verdict.finding_index + start)
+            for verdict in batch_verdicts
+        )
+    result = tuple(verdicts)
+    log.info(
+        "judge_completed",
+        extra={
+            "findings": len(evaluation.findings),
+            "batches": (len(graded_reprs) + JUDGE_BATCH_SIZE - 1)
+            // JUDGE_BATCH_SIZE,
+            "failed_batches": failed_batches,
+            "ungraded_due_to_cap": ungraded_due_to_cap,
+            "verdicts": len(result),
+            "real_bugs": sum(1 for v in result if v.is_real_bug),
+        },
+    )
+    return result
 
 
 def partition_findings(
@@ -162,43 +237,62 @@ def submit_evals(
     *,
     review_span_context: Optional[dict],
 ) -> None:
-    """Submit one DD LLM-Obs `is_real_bug` eval per graded finding (#190),
-    attached to the review span. Called for ALL findings - kept AND
-    suppressed (#467) - so the precision-metric denominator and the
-    learning corpus keep every judged row. Best-effort: never raises."""
-    if not findings or review_span_context is None:
-        # No span -> nowhere to attach; DD would reject the eval. Skip.
-        if findings and review_span_context is None:
-            log.info("judge_evals_skipped_no_review_span", extra={"findings": len(findings)})
+    """Submit one DD LLM-Obs `is_real_bug` eval per finding origin (#190).
+
+    Called for ALL findings - kept AND suppressed (#467) - so the
+    precision-metric denominator and learning corpus keep every judged row.
+    Legacy/global span attribution is the fallback. Best-effort: never raises.
+    """
+    if not findings:
         return
-    try:
-        # Dedupe on index (first verdict wins) - a double verdict for one
-        # finding would otherwise submit two evals, skewing the dataset.
-        seen_indices: set[int] = set()
-        for v in verdicts:
-            if not (0 <= v.finding_index < len(findings)):
-                continue
-            if v.finding_index in seen_indices:
-                continue
-            seen_indices.add(v.finding_index)
-            f = findings[v.finding_index]
-            # An exposed-secret finding's judge reasoning is generated from the
-            # full raw file content (#336) and can quote the credential; never
-            # ship that free text to DD. The is_real_bug label + tags (the
-            # ground-truth signal this dataset is for) are still recorded.
-            reasoning = (
-                "[redacted: exposed-secret]"
-                if f.rule_name == EXPOSED_SECRET
-                else v.reasoning
-            )
-            submit_finding_evaluation(
-                is_real_bug=v.is_real_bug,
-                reasoning=reasoning,
-                review_span_context=review_span_context,
-                tags=eval_tags(f),
-            )
-    except Exception as e:  # noqa: BLE001 — best-effort, never disturb the review
-        log.error("judge_submit_failed", extra={"kind": type(e).__name__}, exc_info=True)
+    skipped_no_span = 0
+    # Dedupe on index (first verdict wins) - a double verdict for one
+    # finding would otherwise submit two evals, skewing the dataset.
+    seen_indices: set[int] = set()
+    for v in verdicts:
+        if not (0 <= v.finding_index < len(findings)):
+            continue
+        if v.finding_index in seen_indices:
+            continue
+        seen_indices.add(v.finding_index)
+        f = findings[v.finding_index]
+        targets = _eval_targets(f, review_span_context)
+        if not targets:
+            skipped_no_span += 1
+            continue
+        # An exposed-secret finding's judge reasoning is generated from the
+        # full raw file content (#336) and can quote the credential; never
+        # ship that free text to DD. The is_real_bug label + tags (the
+        # ground-truth signal this dataset is for) are still recorded.
+        reasoning = (
+            "[redacted: exposed-secret]"
+            if f.rule_name == EXPOSED_SECRET
+            else v.reasoning
+        )
+        for span_context, origin in targets:
+            try:
+                submit_finding_evaluation(
+                    is_real_bug=v.is_real_bug,
+                    reasoning=reasoning,
+                    review_span_context=span_context,
+                    tags=eval_tags(f, origin=origin),
+                )
+            except Exception as e:  # noqa: BLE001 - best-effort per producer span
+                log.error(
+                    "judge_submit_failed",
+                    extra={
+                        "kind": type(e).__name__,
+                        "source_backend": (
+                            origin.backend.value if origin is not None else None
+                        ),
+                    },
+                    exc_info=True,
+                )
+    if skipped_no_span:
+        log.info(
+            "judge_evals_skipped_no_review_span",
+            extra={"findings": skipped_no_span},
+        )
 
 
 def run_judge(
@@ -209,13 +303,18 @@ def run_judge(
     review_span_context: Optional[dict],
     pr_context: Optional[PrContext] = None,
     file_contents: Optional[dict[str, str]] = None,
+    cross_file_contents: Optional[dict[str, str]] = None,
+    runtime_context: str | None = None,
 ) -> None:
     """Grade the evaluation's findings and submit DD LLM Obs evals - the
     eval-only compose (`grade_findings` + `submit_evals`), NO publication
     filtering. Retained for callers/tests that only want to record evals;
     the judge-gated publish path (dispatch, #467) calls the primitives
     directly so it can filter between them. Best-effort - never raises."""
-    if review_span_context is None:
+    if not any(
+        _eval_targets(finding, review_span_context)
+        for finding in evaluation.findings
+    ):
         if evaluation.findings:
             log.info(
                 "judge_skipped_no_review_span",
@@ -224,7 +323,10 @@ def run_judge(
         return
     verdicts = grade_findings(
         evaluation, hunks, installation_id,
-        pr_context=pr_context, file_contents=file_contents,
+        pr_context=pr_context,
+        file_contents=file_contents,
+        cross_file_contents=cross_file_contents,
+        runtime_context=runtime_context,
     )
     submit_evals(
         evaluation.findings, verdicts, review_span_context=review_span_context,

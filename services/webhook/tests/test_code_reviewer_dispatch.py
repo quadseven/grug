@@ -10,7 +10,13 @@ from unittest.mock import MagicMock, patch
 import httpx
 import pytest
 
-from llm_client import Backend, Finding as LlmFinding, FindingJudgement, LlmReviewResponse
+from llm_client import (
+    Backend,
+    Finding as LlmFinding,
+    FindingJudgement,
+    FindingOrigin,
+    LlmReviewResponse,
+)
 from personas.code_reviewer import dispatch as cr_dispatch
 
 
@@ -37,6 +43,10 @@ def _payload(action: str = "opened") -> dict:
         "pull_request": {
             "number": 7,
             "head": {"sha": "abcd1234efgh"},
+            "base": {"sha": "base5678ijkl"},
+            "title": "Preserve PR intent",
+            "body": "Reviewer should understand the requested behavior.",
+            "user": {"login": "evan"},
         },
     }
 
@@ -442,7 +452,57 @@ def test_dispatch_llm_outage_does_not_block_pr(monkeypatch):
     # advisory-first contract.
     assert posted_check[0].conclusion == "neutral"
     assert posted_review == []
-    assert out == {"persona": "code_reviewer", "result": "skipped"}
+    assert out == {
+        "persona": "code_reviewer",
+        "result": "skipped",
+        "degraded_reason": "all_failed",
+    }
+
+
+def test_dispatch_partial_deep_review_publishes_provisional_findings(monkeypatch):
+    """One usable deep backend is useful but not a completed clean review.
+    Publish its findings as neutral/provisional and return a retryable degraded
+    result to the durable worker."""
+    llm = LlmReviewResponse(
+        kind="partial",
+        findings=(LlmFinding(
+            path="src/x.py",
+            line=2,
+            rule="silent-failure",
+            severity="high",
+            message="error is discarded",
+        ),),
+        backend_used=Backend.POOLSIDE,
+        error="openrouter: timeout",
+        backends_used=(Backend.POOLSIDE,),
+        models_used=("poolside/laguna-m.1",),
+    )
+    posted_check, posted_review = [], []
+    monkeypatch.setattr(cr_dispatch, "review_diff", lambda *a, **kw: llm)
+    monkeypatch.setattr(cr_dispatch, "grade_findings", lambda *a, **kw: ())
+    monkeypatch.setattr(
+        cr_dispatch,
+        "post_check_run",
+        lambda *a, **kw: posted_check.append(kw.get("result") or a[3]) or {},
+    )
+    monkeypatch.setattr(
+        cr_dispatch,
+        "post_review",
+        lambda *a, **kw: posted_review.append(kw["result"]) or {},
+    )
+
+    with patch("httpx.get", return_value=_diff_response()):
+        out = cr_dispatch.dispatch_code_review(_payload(), blocking=True)
+
+    assert out == {
+        "persona": "code_reviewer",
+        "result": "skipped",
+        "degraded_reason": "partial",
+    }
+    assert posted_check[0].conclusion == "neutral"
+    assert "incomplete" in posted_check[0].title
+    assert posted_review[0].event == "COMMENT"
+    assert len(posted_review[0].comments) == 1
 
 
 def test_dispatch_unparseable_diff_yields_neutral(monkeypatch):
@@ -611,6 +671,8 @@ def test_dispatch_emits_structured_log_on_success(monkeypatch, caplog):
         ),),
         backend_used=Backend.POOLSIDE,
         model_name="poolside/laguna-m.1",
+        backends_used=(Backend.POOLSIDE, Backend.OPENROUTER),
+        models_used=("poolside/laguna-m.1", "anthropic/claude-opus-4.7"),
     )
     monkeypatch.setattr(cr_dispatch, "review_diff", lambda *a, **kw: llm)
     monkeypatch.setattr(cr_dispatch, "post_check_run", lambda *a, **kw: {})
@@ -631,6 +693,10 @@ def test_dispatch_emits_structured_log_on_success(monkeypatch, caplog):
     # Backend + model attribution for DD LLM Obs / per-backend dashboards.
     assert extra.get("backend") == "poolside"
     assert extra.get("model") == "poolside/laguna-m.1"
+    assert extra.get("backends") == ["poolside", "openrouter"]
+    assert extra.get("models") == [
+        "poolside/laguna-m.1", "anthropic/claude-opus-4.7",
+    ]
     # Finding count + result for at-a-glance triage.
     assert extra.get("findings_count") == 1
     assert extra.get("result") == "pass"
@@ -839,10 +905,8 @@ def test_dispatch_judge_failure_does_not_change_result(monkeypatch):
     assert out["result"] == "pass"
 
 
-def test_dispatch_passes_pr_context_to_review_diff(monkeypatch):
-    """The PR coords flow into review_diff(pr_context=...) so DD LLM
-    Obs spans carry tags that filter by repo / PR / install. Without
-    this, all traces would look identical in the LLM Obs UI."""
+def test_dispatch_passes_identity_and_intent_to_review_diff(monkeypatch):
+    """The review receives both trace coordinates and author intent."""
     captured = []
 
     def _fake_review_diff(hunks, installation_id, pr_context=None, file_contents=None, cross_file_contents=None, runtime_context=None):
@@ -863,12 +927,14 @@ def test_dispatch_passes_pr_context_to_review_diff(monkeypatch):
         "repo": "myorg/myrepo",
         "pr_number": 7,
         "head_sha": "abcd1234efgh",
+        "base_sha": "base5678ijkl",
+        "title": "Preserve PR intent",
+        "body": "Reviewer should understand the requested behavior.",
     }
 
 
-def test_dispatch_fetches_diff_with_diff_accept_header(monkeypatch):
-    """Confirms the GH API call uses `Accept: application/vnd.github.diff`
-    so we get the unified-diff body rather than the JSON metadata."""
+def test_dispatch_fetches_immutable_base_head_diff(monkeypatch):
+    """Diff, full files, and publication all target the event snapshot."""
     captured = []
     monkeypatch.setattr(
         cr_dispatch, "review_diff",
@@ -887,13 +953,123 @@ def test_dispatch_fetches_diff_with_diff_accept_header(monkeypatch):
     # First GET is the unified diff (diff Accept header).
     assert captured[0]["headers"]["Accept"] == "application/vnd.github.diff"
     assert "myorg/myrepo" in captured[0]["url"]
-    assert "/pulls/7" in captured[0]["url"]
+    assert "/compare/base5678ijkl...abcd1234efgh" in captured[0]["url"]
     assert captured[0]["timeout"] == cr_dispatch._DIFF_FETCH_TIMEOUT
     # #336: subsequent GET(s) fetch full file content with the `.raw` Accept
     # header so the Elder sees mitigations outside the diff hunk.
     raw_gets = [c for c in captured if c["headers"].get("Accept") == "application/vnd.github.raw"]
     assert raw_gets, "expected a full-file-content fetch with the raw Accept header"
     assert "/contents/" in raw_gets[0]["url"]
+
+
+@pytest.mark.parametrize("compare_status", [404, 422])
+def test_fetch_pr_diff_falls_back_when_immutable_compare_is_unavailable(
+    compare_status,
+):
+    unavailable = _diff_response()
+    unavailable.status_code = compare_status
+    fallback = _diff_response("fallback diff")
+
+    with patch("httpx.get", side_effect=[unavailable, fallback]) as get:
+        diff = cr_dispatch._fetch_pr_diff(
+            "token", "myorg", "myrepo", 7,
+            base_sha="base", head_sha="head",
+        )
+
+    assert diff == "fallback diff"
+    assert "/compare/base...head" in get.call_args_list[0].args[0]
+    assert get.call_args_list[1].args[0].endswith("/pulls/7")
+    assert get.call_args_list[0].kwargs["headers"] == (
+        get.call_args_list[1].kwargs["headers"]
+    )
+
+
+def test_durable_dispatch_cancels_if_intent_moves_during_inference(monkeypatch):
+    payload = _payload(action="review")
+    initial_id = cr_dispatch.review_snapshot_id_from_pr(payload["pull_request"])
+    changed_pr = {**payload["pull_request"], "body": "Changed intent"}
+    changed_id = cr_dispatch.review_snapshot_id_from_pr(changed_pr)
+    monkeypatch.setattr(
+        cr_dispatch,
+        "review_diff",
+        lambda *a, **kw: LlmReviewResponse(kind="reviewed"),
+    )
+    monkeypatch.setattr(
+        cr_dispatch,
+        "_fetch_current_review_snapshot",
+        MagicMock(side_effect=[
+            (initial_id, "abcd1234efgh", "open", False),
+            (changed_id, "abcd1234efgh", "open", False),
+        ]),
+    )
+    post_check = MagicMock()
+    post_review = MagicMock()
+    monkeypatch.setattr(cr_dispatch, "post_check_run", post_check)
+    monkeypatch.setattr(cr_dispatch, "post_review", post_review)
+
+    with patch("httpx.get", return_value=_diff_response()):
+        out = cr_dispatch.dispatch_code_review(payload, blocking=False)
+
+    assert out == {
+        "persona": "code_reviewer",
+        "result": "skipped",
+        "degraded_reason": "stale_snapshot",
+    }
+    post_check.assert_not_called()
+    post_review.assert_not_called()
+
+
+def test_durable_dispatch_rejects_stale_input_before_inference(monkeypatch):
+    payload = _payload(action="review")
+    current_pr = {**payload["pull_request"], "base": {"sha": "new-base"}}
+    current_id = cr_dispatch.review_snapshot_id_from_pr(current_pr)
+    monkeypatch.setattr(
+        cr_dispatch,
+        "_fetch_current_review_snapshot",
+        lambda *a: (current_id, "abcd1234efgh", "open", False),
+    )
+    review = MagicMock()
+    monkeypatch.setattr(cr_dispatch, "review_diff", review)
+    post_check = MagicMock()
+    post_review = MagicMock()
+    monkeypatch.setattr(cr_dispatch, "post_check_run", post_check)
+    monkeypatch.setattr(cr_dispatch, "post_review", post_review)
+
+    out = cr_dispatch.dispatch_code_review(payload, blocking=False)
+
+    assert out["degraded_reason"] == "stale_snapshot"
+    review.assert_not_called()
+    post_check.assert_not_called()
+    post_review.assert_not_called()
+
+
+@pytest.mark.parametrize(
+    ("state", "draft"),
+    (("closed", False), ("open", True)),
+)
+def test_durable_dispatch_rejects_ineligible_pr_before_inference(
+    monkeypatch, state, draft,
+):
+    payload = _payload(action="review")
+    snapshot_id = cr_dispatch.review_snapshot_id_from_pr(payload["pull_request"])
+    monkeypatch.setattr(
+        cr_dispatch,
+        "_fetch_current_review_snapshot",
+        lambda *a: (snapshot_id, "abcd1234efgh", state, draft),
+    )
+    review = MagicMock()
+    monkeypatch.setattr(cr_dispatch, "review_diff", review)
+    post_check = MagicMock()
+    post_review = MagicMock()
+    monkeypatch.setattr(cr_dispatch, "post_check_run", post_check)
+    monkeypatch.setattr(cr_dispatch, "post_review", post_review)
+
+    out = cr_dispatch.dispatch_code_review(payload, blocking=False)
+
+    assert out["degraded_reason"] == "pr_ineligible"
+    review.assert_not_called()
+    post_check.assert_not_called()
+    post_review.assert_not_called()
 
 
 def test_no_single_webhook_timeout_reaches_lambda_budget():
@@ -966,6 +1142,76 @@ def test_dispatch_captures_comment_records_on_publish(monkeypatch):
     assert rec["finding_tags"]["rule_name"] == "silent-failure"
     assert rec["finding_tags"]["file"] == "src/x.py"
     assert rec["finding_tags"]["line"] == "2"
+    assert rec["finding_text"] == "m"
+    assert rec["head_sha"] == "abcd1234efgh"
+    assert rec["author_login"] == "evan"
+    assert rec["trust_reactors"] is True
+
+
+def test_dispatch_captures_all_origin_spans_without_global_span(monkeypatch):
+    """Ensemble findings remain reaction-trainable even when the legacy
+    response-level span is absent: persist every finding origin on the
+    posted comment record."""
+    origins = (
+        FindingOrigin(
+            backend=Backend.POOLSIDE,
+            model="poolside/laguna-m.1",
+            review_span_context={"span_id": "poolside-span"},
+        ),
+        FindingOrigin(
+            backend=Backend.OPENROUTER,
+            model="anthropic/claude-opus-4.7",
+            review_span_context={"span_id": "openrouter-span"},
+        ),
+    )
+    llm = LlmReviewResponse(
+        kind="reviewed",
+        findings=(LlmFinding(
+            path="src/x.py",
+            line=2,
+            rule="silent-failure",
+            severity="medium",
+            message="m",
+            origins=origins,
+        ),),
+        review_span_context=None,
+    )
+    captured: list[dict] = []
+    monkeypatch.setattr(cr_dispatch, "review_diff", lambda *a, **kw: llm)
+    monkeypatch.setattr(cr_dispatch, "post_check_run", lambda *a, **kw: {"id": 1})
+    monkeypatch.setattr(cr_dispatch, "post_review", lambda *a, **kw: {"id": 77})
+    monkeypatch.setattr(
+        cr_dispatch,
+        "get_review_comments",
+        lambda *a, **kw: [{
+            "id": 555,
+            "path": "src/x.py",
+            "line": 2,
+            "body": "m\n<!-- grug-rule:silent-failure -->",
+        }],
+    )
+    monkeypatch.setattr(
+        cr_dispatch,
+        "put_comment_record",
+        lambda **kw: captured.append(kw),
+    )
+
+    with patch("httpx.get", return_value=_diff_response()):
+        cr_dispatch.dispatch_code_review(_payload(), blocking=False)
+
+    assert captured[0]["review_span_context"] == {"span_id": "poolside-span"}
+    assert captured[0]["finding_origins"] == [
+        {
+            "backend": "poolside",
+            "model": "poolside/laguna-m.1",
+            "review_span_context": {"span_id": "poolside-span"},
+        },
+        {
+            "backend": "openrouter",
+            "model": "anthropic/claude-opus-4.7",
+            "review_span_context": {"span_id": "openrouter-span"},
+        },
+    ]
 
 
 def test_dispatch_capture_failure_does_not_affect_review(monkeypatch):
@@ -1085,10 +1331,8 @@ def test_dispatch_capture_two_rules_same_line_keep_distinct_tags(monkeypatch):
     assert by_id == {1: "null-deref", 2: "race-condition"}  # NOT collapsed
 
 
-def test_dispatch_no_capture_when_review_span_absent(monkeypatch):
-    """When the review span never exported (degraded review), skip capture
-    entirely — the poller would skip a null-span record anyway, so persisting
-    it just wastes the poll batch. get_review_comments must NOT be called."""
+def test_dispatch_captures_learning_record_when_review_span_absent(monkeypatch):
+    """A tracing outage must not discard later trusted human feedback."""
     llm = LlmReviewResponse(
         kind="reviewed",
         findings=(LlmFinding(
@@ -1098,19 +1342,28 @@ def test_dispatch_no_capture_when_review_span_absent(monkeypatch):
         backend_used=Backend.POOLSIDE,
         review_span_context=None,  # span never exported
     )
-    fetched = []
+    captured = []
     monkeypatch.setattr(cr_dispatch, "review_diff", lambda *a, **kw: llm)
     monkeypatch.setattr(cr_dispatch, "post_check_run", lambda *a, **kw: {"id": 1})
     monkeypatch.setattr(cr_dispatch, "post_review", lambda *a, **kw: {"id": 77})
     monkeypatch.setattr(
         cr_dispatch, "get_review_comments",
-        lambda *a, **kw: fetched.append(1) or [],
+        lambda *a, **kw: [{
+            "id": 9,
+            "path": "src/x.py",
+            "line": 2,
+            "body": "m\n<!-- grug-rule:silent-failure -->",
+        }],
     )
-    monkeypatch.setattr(cr_dispatch, "put_comment_record", lambda **kw: None)
+    monkeypatch.setattr(
+        cr_dispatch, "put_comment_record", lambda **kw: captured.append(kw),
+    )
     with patch("httpx.get", return_value=_diff_response()):
         out = cr_dispatch.dispatch_code_review(_payload(), blocking=False)
     assert out["result"] == "pass"
-    assert fetched == []  # capture skipped
+    assert captured[0]["review_span_context"] is None
+    assert captured[0]["finding_text"] == "m"
+    assert captured[0]["author_login"] == "evan"
 
 
 def test_dispatch_capture_skips_unmarked_human_comment(monkeypatch):
@@ -1336,7 +1589,10 @@ def test_elder_no_longer_carries_security_findings(monkeypatch):
         "@@ -0,0 +1,1 @@\n"
         "+AWS_SECRET_ACCESS_KEY=AKIAIOSFODNN7EXAMPLE\n"
     )
-    r = MagicMock(); r.status_code = 200; r.raise_for_status = MagicMock(); r.text = secret_diff
+    r = MagicMock()
+    r.status_code = 200
+    r.raise_for_status = MagicMock()
+    r.text = secret_diff
     with patch("httpx.get", return_value=r):
         out = cr_dispatch.dispatch_code_review(_payload(), blocking=True)
 

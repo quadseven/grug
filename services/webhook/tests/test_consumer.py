@@ -14,6 +14,8 @@ in test_rerun.py / test_cave_fallback.py):
 
 from __future__ import annotations
 
+import json
+import threading
 from unittest.mock import MagicMock, patch
 
 import pytest
@@ -21,9 +23,11 @@ import pytest
 import consumer
 
 
-def _spec(delete_on_error: bool, handler) -> consumer.QueueSpec:
+def _spec(
+    delete_on_error: bool, handler, *, kind: str = "test-queue",
+) -> consumer.QueueSpec:
     return consumer.QueueSpec(
-        kind="test-queue",
+        kind=kind,
         url_env="TEST_QUEUE_URL",
         handler=handler,
         delete_on_error=delete_on_error,
@@ -35,6 +39,11 @@ _MSG = {
     "ReceiptHandle": "r-1",
     "Body": '{"k": "v"}',
     "Attributes": {"ApproximateReceiveCount": "1"},
+}
+
+_REVIEW_MSG = {
+    **_MSG,
+    "Body": json.dumps({"kind": "review", "install_id": 11}),
 }
 
 
@@ -72,6 +81,69 @@ def test_poll_handler_raise_leaves_message_for_redrive():
         n = consumer._poll_once(_spec(False, handler), "https://q", "arn")
     assert n == 1  # handled (not crashed), just not deleted
     mock_delete.assert_not_called()
+
+
+def test_poll_hot_review_renews_visibility_until_handler_finishes(monkeypatch):
+    """Long Elder work owns a renewable SQS lease; other job kinds do not."""
+    renewed = threading.Event()
+    calls = 0
+
+    def change_visibility(**kwargs):
+        nonlocal calls
+        calls += 1
+        if calls >= 2:
+            renewed.set()
+
+    def handler(_event):
+        assert renewed.wait(1.0)
+
+    monkeypatch.setattr(consumer, "_REVIEW_VISIBILITY_HEARTBEAT_S", 0.01)
+    with (
+        patch.object(
+            consumer._sqs, "receive_message", return_value={"Messages": [_REVIEW_MSG]},
+        ),
+        patch.object(
+            consumer._sqs,
+            "change_message_visibility",
+            side_effect=change_visibility,
+        ) as mock_change,
+        patch.object(consumer._sqs, "delete_message") as mock_delete,
+    ):
+        n = consumer._poll_once(
+            _spec(False, handler, kind="rerun-jobs"), "https://q", "arn",
+        )
+
+    assert n == 1
+    assert mock_change.call_count >= 2
+    assert mock_change.call_args_list[0].kwargs == {
+        "QueueUrl": "https://q",
+        "ReceiptHandle": "r-1",
+        "VisibilityTimeout": consumer._REVIEW_VISIBILITY_TIMEOUT_S,
+    }
+    mock_delete.assert_called_once()
+
+
+def test_poll_review_heartbeat_failure_uses_base_visibility_and_still_runs():
+    """A transient IAM/SQS failure must not discard the queued review."""
+    handler = MagicMock()
+    with (
+        patch.object(
+            consumer._sqs, "receive_message", return_value={"Messages": [_REVIEW_MSG]},
+        ),
+        patch.object(
+            consumer._sqs,
+            "change_message_visibility",
+            side_effect=RuntimeError("SQS unavailable"),
+        ),
+        patch.object(consumer._sqs, "delete_message") as mock_delete,
+    ):
+        n = consumer._poll_once(
+            _spec(False, handler, kind="rerun-jobs"), "https://q", "arn",
+        )
+
+    assert n == 1
+    handler.assert_called_once()
+    mock_delete.assert_called_once()
 
 
 def test_poll_handler_raise_still_deletes_when_policy_says_so():
@@ -113,9 +185,43 @@ def test_specs_wire_queues_to_handlers_and_policies():
     assert specs["rerun-jobs"].url_env == "GRUG_RERUN_QUEUE_URL"
     assert specs["rerun-jobs"].handler is rerun.handle_rerun_jobs
     assert specs["rerun-jobs"].delete_on_error is False
+    assert specs["rerun-jobs"].workers == consumer._DEFAULT_RERUN_WORKERS
     assert specs["cave-results"].url_env == "GRUG_CAVE_RESULTS_QUEUE_URL"
     assert specs["cave-results"].handler is cave_fallback.handle_fallback_result
     assert specs["cave-results"].delete_on_error is True
+    assert specs["cave-results"].workers == 1
+
+
+def test_rerun_worker_count_is_configurable_and_bounded(monkeypatch):
+    monkeypatch.setenv("GRUG_RERUN_WORKERS", "7")
+    assert consumer._rerun_workers() == 7
+    monkeypatch.setenv("GRUG_RERUN_WORKERS", "999")
+    assert consumer._rerun_workers() == consumer._MAX_RERUN_WORKERS
+    monkeypatch.setenv("GRUG_RERUN_WORKERS", "0")
+    assert consumer._rerun_workers() == 1
+    monkeypatch.setenv("GRUG_RERUN_WORKERS", "invalid")
+    assert consumer._rerun_workers() == consumer._DEFAULT_RERUN_WORKERS
+
+
+def test_consumer_threads_expand_only_configured_queue_workers():
+    rerun = _spec(False, lambda event: None, kind="rerun-jobs")
+    rerun = consumer.QueueSpec(
+        kind=rerun.kind,
+        url_env=rerun.url_env,
+        handler=rerun.handler,
+        delete_on_error=rerun.delete_on_error,
+        workers=3,
+    )
+    cave = _spec(True, lambda event: None, kind="cave-results")
+
+    threads = consumer._consumer_threads([rerun, cave])
+
+    assert [thread.name for thread in threads] == [
+        "consume-rerun-jobs-1",
+        "consume-rerun-jobs-2",
+        "consume-rerun-jobs-3",
+        "consume-cave-results",
+    ]
 
 
 def test_failed_delete_is_swallowed():

@@ -153,8 +153,9 @@ def test_toy_persona_missing_module_is_isolated(monkeypatch):
 def test_async_persona_handoff_failure_raises_not_swallowed(monkeypatch):
     """Codex peer-review HIGH: an unexpected exception escaping an ASYNC
     persona's dispatch is a dropped handoff - it must NOT ACK 200 (which
-    loses GitHub redelivery). It re-raises so the webhook returns non-2xx
-    and GitHub retries. Contrast test_toy_persona_missing_module_is_isolated
+    hides the failure from replay). It re-raises so the webhook returns non-2xx
+    and the replay poller can recover it. GitHub does not retry automatically.
+    Contrast test_toy_persona_missing_module_is_isolated
     (inline persona -> swallowed 200)."""
     import dataclasses
 
