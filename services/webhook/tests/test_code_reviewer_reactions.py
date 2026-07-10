@@ -26,12 +26,52 @@ def _record(comment_id=1, last_verdict=None, span={"trace_id": "t", "span_id": "
     }
 
 
+def _ensemble_record(comment_id=1, last_verdict=None):
+    record = _record(comment_id=comment_id, last_verdict=last_verdict, span=None)
+    record["finding_origins"] = [
+        {
+            "backend": "poolside",
+            "model": "poolside/laguna-m.1",
+            "review_span_context": {"span_id": "poolside-span"},
+        },
+        {
+            "backend": "openrouter",
+            "model": "anthropic/claude-opus-4.7",
+            "review_span_context": {"span_id": "openrouter-span"},
+        },
+    ]
+    return record
+
+
+def _learning_record(comment_id=1):
+    record = _record(comment_id=comment_id)
+    record.update({
+        "finding_text": "Optional value is dereferenced without a guard.",
+        "head_sha": "abc123",
+        "author_login": "evan",
+        "trust_reactors": True,
+    })
+    record["finding_tags"]["severity"] = "high"
+    return record
+
+
 def _reactions_response(contents):
     r = MagicMock(spec=httpx.Response)
     r.status_code = 200
     r.raise_for_status = MagicMock()
     r.json = MagicMock(return_value=[{"content": c} for c in contents])
     return r
+
+
+def test_annotation_targets_do_not_misattribute_untraced_origin():
+    record = _record(span={"span_id": "different-first-backend"})
+    record["finding_origins"] = [{
+        "backend": "poolside",
+        "model": "poolside/laguna-m.1",
+        "review_span_context": None,
+    }]
+
+    assert cr_reactions._annotation_targets(record) == []
 
 
 # --- classification ---
@@ -93,6 +133,161 @@ def test_poll_and_annotate_submits_on_new_thumbs_down(monkeypatch, _patch_store)
     assert submitted[0]["tags"]["rule_name"] == "null-deref"
     # dedup baseline updated.
     assert _patch_store[0] == {"install_id": 1, "comment_id": 5, "verdict": "false_positive"}
+
+
+def test_poll_uses_write_collaborator_reaction_and_ignores_outsider(
+    monkeypatch, _patch_store,
+):
+    submitted = _patch_annotate(monkeypatch)
+    learned = MagicMock(return_value=True)
+    monkeypatch.setattr(cr_reactions, "_record_reaction_learning", learned)
+    monkeypatch.setattr(
+        cr_reactions,
+        "_has_write_permission",
+        lambda token, owner, repo, login: login == "evan",
+    )
+    response = MagicMock(spec=httpx.Response)
+    response.raise_for_status = MagicMock()
+    response.json = MagicMock(return_value=[
+        {"content": "-1", "user": {"login": "outsider"}},
+        {"content": "+1", "user": {"login": "evan"}},
+    ])
+
+    with patch("httpx.get", return_value=response):
+        n = cr_reactions.poll_and_annotate(
+            [_learning_record(comment_id=5)],
+            install_id=1,
+            fetch_token=lambda: "tok",
+        )
+
+    assert n == 1
+    assert submitted[0]["verdict"] == "confirmed"
+    learned.assert_called_once_with(_learning_record(comment_id=5), "confirmed")
+
+
+def test_trusted_reaction_refreshes_ledger_practices_and_examples(monkeypatch):
+    from adapters import install_store
+
+    rows: list[dict] = []
+    practices: list[list[dict]] = []
+    exemplars: list[list[dict]] = []
+    monkeypatch.setattr(install_store, "put_ledger_row", lambda row: rows.__setitem__(slice(None), [row]))
+    monkeypatch.setattr(install_store, "list_ledger_rows", lambda repo: list(rows))
+    monkeypatch.setattr(
+        install_store,
+        "put_repo_practices",
+        lambda repo, data: practices.append(data),
+    )
+    monkeypatch.setattr(
+        install_store,
+        "put_repo_exemplars",
+        lambda repo, data: exemplars.append(data),
+    )
+
+    assert cr_reactions._record_reaction_learning(
+        _learning_record(comment_id=5), "confirmed",
+    ) is True
+
+    assert rows[0]["verdict"] == "declined"
+    assert rows[0]["class"] == "null-deref"
+    assert rows[0]["evidence"] == "github-review-comment:5"
+    assert practices[0][0]["finding_class"] == "null-deref"
+    assert exemplars[0][0]["class"] == "null-deref"
+
+
+def test_false_positive_reaction_refreshes_negative_prompt_guidance(monkeypatch):
+    """A trusted thumbs-down must change later behavior, not only precision
+    telemetry. It creates an AVOID practice while remaining excluded from the
+    positive few-shot examples."""
+    from adapters import install_store
+
+    rows: list[dict] = []
+    practices: list[list[dict]] = []
+    exemplars: list[list[dict]] = []
+    monkeypatch.setattr(
+        install_store,
+        "put_ledger_row",
+        lambda row: rows.__setitem__(slice(None), [row]),
+    )
+    monkeypatch.setattr(install_store, "list_ledger_rows", lambda repo: list(rows))
+    monkeypatch.setattr(
+        install_store,
+        "put_repo_practices",
+        lambda repo, data: practices.append(data),
+    )
+    monkeypatch.setattr(
+        install_store,
+        "put_repo_exemplars",
+        lambda repo, data: exemplars.append(data),
+    )
+
+    assert cr_reactions._record_reaction_learning(
+        _learning_record(comment_id=6), "false_positive",
+    ) is True
+
+    assert rows[0]["verdict"] == "false-positive"
+    assert practices[0][0]["disposition"] == "avoid"
+    assert practices[0][0]["rule"] == (
+        "Optional value is dereferenced without a guard."
+    )
+    assert exemplars == [[]]
+
+
+def test_untrusted_record_cannot_update_learning_store():
+    record = _learning_record(comment_id=6)
+    record["trust_reactors"] = False
+
+    assert cr_reactions._record_reaction_learning(
+        record, "false_positive",
+    ) is False
+
+
+def test_poll_and_annotate_fans_out_to_all_persisted_origins(
+    monkeypatch, _patch_store,
+):
+    """A reaction on a merged inline finding trains every model span that
+    produced it, then advances the per-comment dedup baseline once."""
+    submitted = _patch_annotate(monkeypatch)
+
+    with patch("httpx.get", return_value=_reactions_response(["+1"])):
+        n = cr_reactions.poll_and_annotate(
+            [_ensemble_record(comment_id=5)],
+            install_id=1,
+            fetch_token=lambda: "tok",
+        )
+
+    assert n == 1
+    assert [s["review_span_context"] for s in submitted] == [
+        {"span_id": "poolside-span"},
+        {"span_id": "openrouter-span"},
+    ]
+    assert [s["tags"]["source_backend"] for s in submitted] == [
+        "poolside",
+        "openrouter",
+    ]
+    assert _patch_store == [
+        {"install_id": 1, "comment_id": 5, "verdict": "confirmed"},
+    ]
+
+
+def test_origin_submit_failure_does_not_skip_sibling_or_advance_baseline(
+    monkeypatch, _patch_store,
+):
+    """A failed first producer remains retryable without depriving the
+    second producer of the current human signal."""
+    submit = MagicMock(side_effect=[RuntimeError("DD intake 500"), None])
+    monkeypatch.setattr(cr_reactions, "submit_reaction_annotation", submit)
+
+    with patch("httpx.get", return_value=_reactions_response(["-1"])):
+        n = cr_reactions.poll_and_annotate(
+            [_ensemble_record(comment_id=5)],
+            install_id=1,
+            fetch_token=lambda: "tok",
+        )
+
+    assert submit.call_count == 2
+    assert n == 0
+    assert _patch_store == []
 
 
 def test_poll_and_annotate_dedups_unchanged_verdict(monkeypatch, _patch_store):
@@ -164,6 +359,68 @@ def test_poll_and_annotate_skips_record_without_span_context(monkeypatch, _patch
         )
     assert n == 0
     assert submitted == []
+
+
+def test_poll_learns_without_span_when_trusted_fields_exist(monkeypatch, _patch_store):
+    record = _learning_record(comment_id=5)
+    record["review_span_context"] = None
+    learned = MagicMock(return_value=True)
+    monkeypatch.setattr(cr_reactions, "_record_reaction_learning", learned)
+    monkeypatch.setattr(
+        cr_reactions, "_has_write_permission", lambda *args: True,
+    )
+    submitted = _patch_annotate(monkeypatch)
+    response = MagicMock(spec=httpx.Response)
+    response.raise_for_status = MagicMock()
+    response.json = MagicMock(return_value=[
+        {"content": "+1", "user": {"login": "evan"}},
+    ])
+
+    with patch("httpx.get", return_value=response):
+        n = cr_reactions.poll_and_annotate(
+            [record], install_id=1, fetch_token=lambda: "tok",
+        )
+
+    assert n == 1
+    assert submitted == []
+    learned.assert_called_once_with(record, "confirmed")
+    assert _patch_store == [
+        {"install_id": 1, "comment_id": 5, "verdict": "confirmed"},
+    ]
+
+
+def test_write_permission_check_uses_collaborator_endpoint(monkeypatch):
+    response = MagicMock(spec=httpx.Response)
+    response.status_code = 200
+    response.raise_for_status = MagicMock()
+    response.json = MagicMock(return_value={"permission": "write"})
+    captured: dict = {}
+
+    def get(url, **kwargs):
+        captured["url"] = url
+        return response
+
+    monkeypatch.setattr(httpx, "get", get)
+
+    assert cr_reactions._has_write_permission("tok", "o", "r", "evan") is True
+    assert captured["url"].endswith("/repos/o/r/collaborators/evan/permission")
+
+
+def test_reaction_poll_quotes_repository_coordinates(monkeypatch):
+    response = _reactions_response(["+1"])
+    captured: dict = {}
+
+    def get(url, **kwargs):
+        captured["url"] = url
+        return response
+
+    monkeypatch.setattr(httpx, "get", get)
+
+    cr_reactions.poll_comment_reactions("tok", "org name", "repo#one", 7)
+
+    assert "/repos/org%20name/repo%23one/pulls/comments/7/reactions" in (
+        captured["url"]
+    )
 
 
 def test_poll_and_annotate_skips_malformed_repo_without_aborting(monkeypatch, _patch_store):

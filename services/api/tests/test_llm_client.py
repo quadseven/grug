@@ -15,6 +15,9 @@ def _patch_keys(monkeypatch):
     """Avoid the real SSM round-trip in tests."""
     monkeypatch.setattr(lc, "_load_poolside_key", lambda: "test-pool-key")
     monkeypatch.setattr(lc, "_load_openrouter_key", lambda: "test-or-key")
+    # Legacy unit cases exercise first-success/fallback. Deep mode has focused
+    # coverage in the webhook suite and is the production default.
+    monkeypatch.setenv("GRUG_REVIEW_DEPTH", "fast")
 
 
 def _hunk(path="src/x.py", body="@@ -1 +1 @@\n-foo\n+bar") -> Hunk:
@@ -198,9 +201,7 @@ def test_request_uses_openai_chat_completions_shape() -> None:
     assert body.get("response_format") == {"type": "json_object"}
     # Authorization header carries the loaded key.
     assert captured[0]["headers"]["Authorization"].startswith("Bearer ")
-    # 60s timeout (raised from 30s — a large diff review can exceed 30s; 30s
-    # caused ReadTimeouts that silently dropped Elder reviews).
-    assert captured[0]["timeout"] == 60
+    assert captured[0]["timeout"] == lc._REVIEW_TIMEOUT_SECONDS
 
 
 def test_malformed_llm_json_returns_parse_failed_kind() -> None:
@@ -329,8 +330,9 @@ def test_transport_failure_on_both_backends_returns_all_failed(monkeypatch) -> N
 
     assert out.kind == "all_failed"
     assert out.backend_used is None
-    # 3 retries × 2 backends = 6 attempts total.
-    assert len(call_log) == 6
+    # Long review timeouts are not retried; one attempt per backend bounds the
+    # generation phase while quick 429/503 responses still retry.
+    assert len(call_log) == 2
     # Both backends represented (one of each URL).
     assert any("poolside" in u for u in call_log)
     assert any("openrouter" in u for u in call_log)

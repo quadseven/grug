@@ -35,7 +35,7 @@ from github_checks_client import CheckConclusion, CheckRunResult, post_check_run
 from github_reviews_client import (
     InlineComment, ReviewEvent, ReviewResult, get_review_comments, post_review,
 )
-from llm_client import Hunk as LlmHunk, LlmReviewResponse, review_diff
+from llm_client import Hunk as LlmHunk, LlmReviewResponse, PrContext, review_diff
 from review_types import EFFORTS
 from personas.code_reviewer.dedup import (
     dedup_findings, finding_key, parse_rule, prior_keys_from_comments,
@@ -54,7 +54,11 @@ from personas.code_reviewer.judge import (
 from personas.code_reviewer.persona import (
     CodeReviewEvaluation, Finding, evaluate_diff, with_findings,
 )
-from adapters.install_store import put_comment_record  # type: ignore
+from personas.code_reviewer.snapshot import review_snapshot_id_from_pr
+from adapters.install_store import (  # type: ignore
+    CommentFindingOrigin,
+    put_comment_record,
+)
 
 log = logging.getLogger(f"{os.getenv('DD_SERVICE', 'grug')}.persona.code_reviewer")
 
@@ -93,21 +97,158 @@ PersonaResultStr = Literal[
 
 
 def _fetch_pr_diff(
-    install_token: str, owner: str, repo: str, pull_number: int,
+    install_token: str,
+    owner: str,
+    repo: str,
+    pull_number: int,
+    *,
+    base_sha: str = "",
+    head_sha: str = "",
 ) -> str:
-    """GET the PR unified diff. `Accept: application/vnd.github.diff`
-    returns the raw diff body rather than the JSON metadata."""
+    """GET an immutable base/head diff, falling back when compare is unavailable."""
+    repo_url = (
+        f"https://api.github.com/repos/{quote(owner, safe='')}/"
+        f"{quote(repo, safe='')}"
+    )
+    headers = {
+        "Authorization": f"Bearer {install_token}",
+        "Accept": "application/vnd.github.diff",
+        "X-GitHub-Api-Version": "2022-11-28",
+    }
+    if base_sha and head_sha:
+        url = (
+            f"{repo_url}/compare/{quote(base_sha, safe='')}..."
+            f"{quote(head_sha, safe='')}"
+        )
+    else:
+        url = f"{repo_url}/pulls/{pull_number}"
     resp = httpx.get(
-        f"https://api.github.com/repos/{quote(owner, safe='')}/{quote(repo, safe='')}/pulls/{pull_number}",
+        url,
+        headers=headers,
+        timeout=_DIFF_FETCH_TIMEOUT,
+    )
+    if base_sha and head_sha and resp.status_code in {404, 422}:
+        # GitHub can reject compare requests for forked or recently rewritten
+        # histories while the PR diff remains readable. Snapshot checks before
+        # and after inference still prevent this mutable fallback from being
+        # published after the PR moves.
+        log.info(
+            "immutable_compare_unavailable_falling_back",
+            extra={
+                "owner": owner,
+                "repo": repo,
+                "pull_number": pull_number,
+                "status_code": resp.status_code,
+            },
+        )
+        resp = httpx.get(
+            f"{repo_url}/pulls/{pull_number}",
+            headers=headers,
+            timeout=_DIFF_FETCH_TIMEOUT,
+        )
+    resp.raise_for_status()
+    return resp.text
+
+
+def _fetch_current_review_snapshot(
+    install_token: str, owner: str, repo: str, pull_number: int,
+) -> tuple[str, str, str, bool]:
+    """Read current snapshot identity, head SHA, state, and draft status."""
+    resp = httpx.get(
+        f"https://api.github.com/repos/{quote(owner, safe='')}/"
+        f"{quote(repo, safe='')}/pulls/{pull_number}",
         headers={
             "Authorization": f"Bearer {install_token}",
-            "Accept": "application/vnd.github.diff",
+            "Accept": "application/vnd.github+json",
             "X-GitHub-Api-Version": "2022-11-28",
         },
         timeout=_DIFF_FETCH_TIMEOUT,
     )
     resp.raise_for_status()
-    return resp.text
+    body = resp.json()
+    if not isinstance(body, dict):
+        raise ValueError("GitHub PR response is not an object")
+    head_sha = str((body.get("head") or {}).get("sha") or "")
+    if not head_sha:
+        raise ValueError("GitHub PR response has no head SHA")
+    return (
+        review_snapshot_id_from_pr(body),
+        head_sha,
+        str(body.get("state") or ""),
+        bool(body.get("draft", False)),
+    )
+
+
+def _review_snapshot_freshness_failure(
+    *,
+    installation_id: int,
+    owner: str,
+    repo_name: str,
+    pull_number: int,
+    expected_snapshot_id: str,
+    expected_head_sha: str,
+) -> dict[str, str] | None:
+    """Return a non-publishing result when a durable review input is stale."""
+    try:
+        (
+            current_snapshot_id,
+            current_head_sha,
+            current_state,
+            current_draft,
+        ) = with_install_token_retry(
+            installation_id,
+            lambda token: _fetch_current_review_snapshot(
+                token, owner, repo_name, pull_number,
+            ),
+        )
+    except (httpx.HTTPStatusError, httpx.RequestError, ValueError) as e:
+        log.warning(
+            "code_review_freshness_check_failed",
+            extra={
+                "installation_id": installation_id,
+                "pr": f"{owner}/{repo_name}#{pull_number}",
+                "kind": type(e).__name__,
+            },
+        )
+        return {
+            "persona": "code_reviewer",
+            "result": "skipped",
+            "degraded_reason": "freshness_check_failed",
+        }
+    if current_state != "open" or current_draft:
+        log.info(
+            "code_review_ineligible_before_publish",
+            extra={
+                "installation_id": installation_id,
+                "pr": f"{owner}/{repo_name}#{pull_number}",
+                "head_sha": current_head_sha[:8],
+                "state": current_state,
+                "draft": current_draft,
+            },
+        )
+        return {
+            "persona": "code_reviewer",
+            "result": "skipped",
+            "degraded_reason": "pr_ineligible",
+        }
+    if current_snapshot_id == expected_snapshot_id:
+        return None
+    log.info(
+        "code_review_stale_before_publish",
+        extra={
+            "installation_id": installation_id,
+            "pr": f"{owner}/{repo_name}#{pull_number}",
+            "reviewed_head_sha": expected_head_sha[:8],
+            "current_head_sha": current_head_sha[:8],
+            "reviewed_snapshot_id": expected_snapshot_id[:11],
+            "current_snapshot_id": current_snapshot_id[:11],
+        },
+    )
+    return {
+        "persona": "code_reviewer",
+        "result": "skipped",
+        "degraded_reason": "stale_snapshot",
+    }
 
 
 # Full-file context (#336). Cap the number of changed files we fetch full
@@ -258,6 +399,33 @@ def _summary_markdown(
         if suppressed_count
         else ""
     )
+    if evaluation.degraded_reason == "partial":
+        title = (
+            "Grug deep review incomplete - "
+            f"{len(evaluation.findings)} provisional finding(s)"
+        )
+        if not evaluation.findings:
+            return title, (
+                "Only one deep-review backend returned a usable response. "
+                "This pass is advisory and will be retried; no clean result "
+                "has been recorded."
+            ) + held
+        rows = [
+            "| Severity | File | Line | Rule | Message |",
+            "|---|---|---|---|---|",
+        ]
+        for finding in evaluation.findings:
+            rows.append(
+                f"| {finding.severity} | `{finding.file}` | {finding.line} | "
+                f"`{finding.rule_name}` | {_defused(finding.message)} |"
+            )
+        return title, (
+            "Only one deep-review backend returned a usable response. These "
+            "findings are provisional and the durable review will retry.\n\n"
+            + "\n".join(rows)
+            + held
+            + f"\n\n{_consolidated_agent_prompt(evaluation)}"
+        )
     if evaluation.degraded_reason:
         title = f"⚠️ Grug eyes clouded ({evaluation.degraded_reason})"
         return title, (
@@ -489,14 +657,16 @@ def _build_review_result(
 ) -> ReviewResult | None:
     """Build the ReviewResult, or None if nothing NEW to post.
 
-    Skips entirely on degraded responses. `prior_keys` (non-empty only
+    Skips entirely on degraded responses except a partial deep pass, whose
+    useful findings remain advisory while the durable worker retries.
+    `prior_keys` (non-empty only
     on a synchronize/reopened push) dedups findings already commented
     on unchanged lines (#189) — so a re-review doesn't flood the PR with
     duplicate inline comments. If every finding was already posted,
     returns None (nothing new). NOTE: dedup affects only the inline
     REVIEW; the check-run summary/conclusion still reflect ALL current
     findings (the bugs are still there)."""
-    if evaluation.degraded_reason:
+    if evaluation.degraded_reason and evaluation.degraded_reason != "partial":
         return None
     new_findings = dedup_findings(evaluation.findings, prior_keys)
     if not new_findings:
@@ -523,7 +693,9 @@ def _capture_comment_records(
     install_id: int,
     repo: str,
     pr_number: int,
-    review_span_context: dict,
+    review_span_context: dict | None,
+    head_sha: str,
+    author_login: str,
 ) -> int:
     """Persist each posted inline comment as a CommentRecord for later
     reaction polling (#247). Matches each comment to the Finding that
@@ -557,14 +729,42 @@ def _capture_comment_records(
             continue
         if finding is None:
             continue
+        finding_origins: list[CommentFindingOrigin] = [
+            {
+                "backend": origin.backend.value,
+                "model": origin.model,
+                "review_span_context": origin.review_span_context,
+            }
+            for origin in finding.origins
+        ]
+        traced_origins = [
+            origin for origin in finding_origins
+            if origin["review_span_context"] is not None
+        ]
+        if traced_origins:
+            # Preserve the historical scalar for old poller versions, but use
+            # an actual origin for this finding rather than the response-level
+            # first success (which may be a different backend).
+            fallback_span_context = traced_origins[0]["review_span_context"]
+        elif finding.origins:
+            # Provenance exists but trace export failed. Unknown is more honest
+            # than attributing the reaction to another backend's span.
+            fallback_span_context = None
+        else:
+            fallback_span_context = review_span_context
         try:
             put_comment_record(
                 install_id=install_id,
                 comment_id=int(cid),
                 repo=repo,
                 pr_number=pr_number,
-                review_span_context=review_span_context,
+                review_span_context=fallback_span_context,
                 finding_tags=eval_tags(finding),
+                finding_origins=finding_origins,
+                finding_text=finding.message,
+                head_sha=head_sha,
+                author_login=author_login,
+                trust_reactors=True,
             )
             persisted += 1
         except Exception as e:  # noqa: BLE001 — per-comment: one DDB blip
@@ -601,14 +801,48 @@ def dispatch_code_review(
     repo_name = repo["name"]
     pull_number = int(pr["number"])
     head_sha = pr["head"]["sha"]
+    author_login = str((pr.get("user") or {}).get("login") or "")
     installation_id = int(installation["id"])
+    base_sha = str((pr.get("base") or {}).get("sha", ""))
+    snapshot_id = review_snapshot_id_from_pr(pr)
+    pr_context: PrContext = {
+        "installation_id": installation_id,
+        "repo": f"{owner}/{repo_name}",
+        "pr_number": pull_number,
+        "head_sha": head_sha,
+        "base_sha": base_sha,
+        "title": str(pr.get("title") or ""),
+        "body": str(pr.get("body") or ""),
+    }
+
+    # A queued message can already be stale when the consumer starts it. Check
+    # the complete review input before spending model tokens: unchanged head
+    # does not imply unchanged diff or intent when base/title/body moved.
+    if action == "review":
+        stale = _review_snapshot_freshness_failure(
+            installation_id=installation_id,
+            owner=owner,
+            repo_name=repo_name,
+            pull_number=pull_number,
+            expected_snapshot_id=snapshot_id,
+            expected_head_sha=head_sha,
+        )
+        if stale is not None:
+            return stale
 
     # DiffParseError → advisory neutral so a fetcher bug or GitHub
     # format drift cannot 500 the webhook.
     try:
         diff_text = with_install_token_retry(
             installation_id,
-            lambda token: _fetch_pr_diff(token, owner, repo_name, pull_number),
+            lambda token: _fetch_pr_diff(
+                token,
+                owner,
+                repo_name,
+                pull_number,
+                base_sha=base_sha,
+                head_sha=head_sha,
+            ),
         )
         hunks = parse_diff(diff_text)
     except (httpx.HTTPStatusError, httpx.RequestError, DiffParseError) as e:
@@ -620,6 +854,19 @@ def dispatch_code_review(
                 "kind": type(e).__name__,
             },
         )
+        # Do not publish even a degraded check for an input that changed while
+        # the immutable diff was being fetched/parsed.
+        if action == "review":
+            stale = _review_snapshot_freshness_failure(
+                installation_id=installation_id,
+                owner=owner,
+                repo_name=repo_name,
+                pull_number=pull_number,
+                expected_snapshot_id=snapshot_id,
+                expected_head_sha=head_sha,
+            )
+            if stale is not None:
+                return stale
         degraded = _publish_degraded(
             installation_id, owner, repo_name, pull_number, head_sha,
             reason="fetch_or_parse_failed",
@@ -705,21 +952,17 @@ def dispatch_code_review(
             },
         )
 
-    # `pr_context` flows into DD LLM Obs span tags so traces are
-    # filterable by repo / PR / installation in the LLM Obs UI.
+    # PR context supplies both trace identity and author intent. The prompt
+    # treats title/body as untrusted repository data before sending it.
     llm_response: LlmReviewResponse = review_diff(
         _to_llm_hunks(hunks),
         installation_id=installation_id,
         file_contents=file_contents,
         cross_file_contents=cross_file_contents,
         runtime_context=runtime_context,
-        pr_context={
-            "installation_id": installation_id,
-            "repo": f"{owner}/{repo_name}",
-            "pr_number": pull_number,
-            "head_sha": head_sha,
-        },
+        pr_context=pr_context,
     )
+    needs_cave_fallback = llm_response.kind == "all_failed"
     if llm_response.kind != "reviewed":
         # Without this log, a 100% LLM-outage rate looks identical to
         # "no findings" in operational dashboards — both yield
@@ -734,20 +977,6 @@ def dispatch_code_review(
                 "error": llm_response.error,
             },
         )
-        if llm_response.kind == "all_failed":
-            # Both cloud LLM backends failed — enqueue Elder's owned fallback to
-            # the Cave over the SQS airlock (ADR-0005). Best-effort + flag-gated:
-            # a no-op unless enabled, and never raises. The degraded `errored`
-            # verdict is still published below; the connector heals it later.
-            from cave_fallback import enqueue_fallback
-
-            enqueue_fallback(
-                _to_llm_hunks(hunks),
-                installation_id=installation_id,
-                repo=f"{owner}/{repo_name}",
-                pr_number=pull_number,
-                head_sha=head_sha,
-            )
 
     evaluation = evaluate_diff(hunks, llm_response)
 
@@ -767,13 +996,10 @@ def dispatch_code_review(
     graded_findings = evaluation.findings
     judge_verdicts = grade_findings(
         evaluation, hunks, installation_id,
-        pr_context={
-            "installation_id": installation_id,
-            "repo": f"{owner}/{repo_name}",
-            "pr_number": pull_number,
-            "head_sha": head_sha,
-        },
+        pr_context=pr_context,
         file_contents=file_contents,
+        cross_file_contents=cross_file_contents,
+        runtime_context=runtime_context,
     )
     kept, suppressed = partition_findings(evaluation.findings, judge_verdicts)
     if suppressed:
@@ -786,6 +1012,35 @@ def dispatch_code_review(
                 "suppressed": len(suppressed),
                 "published": len(kept),
             },
+        )
+
+    # Durable reviews can spend several minutes in inference. Re-check the
+    # complete input after reasoning so changes to code, base, or intent cannot
+    # publish a result for an obsolete snapshot. The durable caller enqueues the
+    # freshly fetched replacement snapshot rather than assuming another event.
+    if action == "review":
+        stale = _review_snapshot_freshness_failure(
+            installation_id=installation_id,
+            owner=owner,
+            repo_name=repo_name,
+            pull_number=pull_number,
+            expected_snapshot_id=snapshot_id,
+            expected_head_sha=head_sha,
+        )
+        if stale is not None:
+            return stale
+
+    if needs_cave_fallback:
+        # Do not enqueue fallback work until the full input snapshot has passed
+        # the same freshness gate as direct publication.
+        from cave_fallback import enqueue_fallback
+
+        enqueue_fallback(
+            _to_llm_hunks(hunks),
+            installation_id=installation_id,
+            repo=f"{owner}/{repo_name}",
+            pr_number=pull_number,
+            head_sha=head_sha,
         )
 
     # Both clients are independent — a 5xx on review post must not
@@ -829,7 +1084,7 @@ def dispatch_code_review(
     # skip the fetch entirely.
     prior_keys: frozenset[str] = frozenset()
     dedup_degraded = False
-    if action in {"synchronize", "reopened"}:
+    if action in {"synchronize", "reopened", "review"}:
         prior_keys, dedup_degraded = _prior_finding_keys(
             installation_id, owner, repo_name, pull_number,
         )
@@ -860,14 +1115,10 @@ def dispatch_code_review(
     # Capture inline-comment IDs for later reaction polling (#247). BEST-
     # EFFORT, post-publish, own try/except — a capture failure must never
     # change the review outcome (`result` is computed below, unaffected).
-    # Gated on: the review actually posted, AND a review span exists to
-    # attach future `human_verdict` annotations to (else the poller would
-    # skip the record anyway, so persisting it just wastes the poll batch).
-    if (
-        review_resp is not None
-        and not review_publish_failed
-        and llm_response.review_span_context is not None
-    ):
+    # Persist posted findings even if trace export failed: a later trusted
+    # maintainer reaction can still teach the repository ledger without DD span
+    # attribution.
+    if review_resp is not None and not review_publish_failed:
         review_id = review_resp.get("id")
         if review_id is not None:
             try:
@@ -884,6 +1135,8 @@ def dispatch_code_review(
                     repo=f"{owner}/{repo_name}",
                     pr_number=pull_number,
                     review_span_context=llm_response.review_span_context,
+                    head_sha=head_sha,
+                    author_login=author_login,
                 )
                 # Observability: a 0-of-N capture (e.g. a comment↔finding
                 # shape regression) silently empties the poller's batch with
@@ -941,6 +1194,10 @@ def dispatch_code_review(
                 if llm_response.backend_used is not None else None
             ),
             "model": llm_response.model_name,
+            "backends": [
+                backend.value for backend in llm_response.backends_used
+            ],
+            "models": list(llm_response.models_used),
             "findings_count": len(evaluation.findings),
             "dropped_hallucinations": evaluation.dropped_hallucinations,
             "degraded_reason": evaluation.degraded_reason,
@@ -1000,10 +1257,13 @@ def dispatch_code_review(
 
     # Result shape mirrors TPM's `{persona, result}` so dispatcher can
     # treat both uniformly. The outer dispatcher wraps with `status`.
-    return {
+    response = {
         "persona": "code_reviewer",
         "result": result,
     }
+    if evaluation.degraded_reason:
+        response["degraded_reason"] = evaluation.degraded_reason
+    return response
 
 
 def _publish_degraded(
@@ -1051,4 +1311,5 @@ def _publish_degraded(
     return {
         "persona": "code_reviewer",
         "result": "publish_failed" if publish_failed else "skipped",
+        "degraded_reason": reason,
     }

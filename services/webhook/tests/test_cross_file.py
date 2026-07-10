@@ -218,8 +218,6 @@ def test_dispatch_threads_cross_file_context_to_review(monkeypatch):
     """The dispatch fetches cross-file context and passes it into
     review_diff; a fetch failure degrades to {} without breaking the
     review (fail-safe acceptance criterion)."""
-    from unittest.mock import MagicMock
-
     from llm_client import Backend, LlmReviewResponse
     from personas.code_reviewer import dispatch as cr_dispatch
 
@@ -242,7 +240,7 @@ def test_dispatch_threads_cross_file_context_to_review(monkeypatch):
     )
     monkeypatch.setattr(
         cr_dispatch, "_fetch_pr_diff",
-        lambda token, o, r, n: "diff --git a/src/api.py b/src/api.py\n"
+        lambda token, o, r, n, **kw: "diff --git a/src/api.py b/src/api.py\n"
         "--- a/src/api.py\n+++ b/src/api.py\n@@ -1,1 +1,2 @@\n context\n"
         "+def fetch_user(user_id, *, tenant):\n",
     )
@@ -286,7 +284,7 @@ def test_dispatch_cross_file_failure_degrades_to_diff_only(monkeypatch):
     )
     monkeypatch.setattr(
         cr_dispatch, "_fetch_pr_diff",
-        lambda token, o, r, n: "diff --git a/src/api.py b/src/api.py\n"
+        lambda token, o, r, n, **kw: "diff --git a/src/api.py b/src/api.py\n"
         "--- a/src/api.py\n+++ b/src/api.py\n@@ -1,1 +1,2 @@\n context\n"
         "+def fetch_user(user_id, *, tenant):\n",
     )
