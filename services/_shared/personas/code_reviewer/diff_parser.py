@@ -47,6 +47,10 @@ class DiffHunk:
     `new_start >= 1` (1-based line numbers per unified-diff spec),
     `body` starts with `@@`. Each invariant catches a parser regression
     at the boundary rather than letting a malformed hunk reach the LLM.
+    They raise `DiffParseError` — NOT `assert` — because the dispatch
+    degrade contract only catches DiffParseError: an AssertionError here
+    escaped both personas' catch clauses and crash-looped the consumer
+    into the rerun DLQ (grug PR #577 emptied-file hunk, 2026-07-10).
     """
 
     file_path: str
@@ -55,14 +59,17 @@ class DiffHunk:
     body: str
 
     def __post_init__(self) -> None:
-        assert self.file_path, "DiffHunk.file_path must be non-empty"
-        assert self.new_start >= 1, (
-            f"DiffHunk.new_start must be >= 1 (got {self.new_start}); "
-            "unified-diff line numbers are 1-based"
-        )
-        assert self.body.startswith("@@"), (
-            "DiffHunk.body must start with the @@ hunk header"
-        )
+        if not self.file_path:
+            raise DiffParseError("DiffHunk.file_path must be non-empty")
+        if self.new_start < 1:
+            raise DiffParseError(
+                f"DiffHunk.new_start must be >= 1 (got {self.new_start}); "
+                "unified-diff line numbers are 1-based"
+            )
+        if not self.body.startswith("@@"):
+            raise DiffParseError(
+                "DiffHunk.body must start with the @@ hunk header"
+            )
 
 
 # Captures `+++ b/<path>` or `+++ /dev/null` (deletion). Group 1 is the
@@ -162,6 +169,28 @@ def parse_diff(unified_diff: str) -> tuple[DiffHunk, ...]:
                     f"malformed `@@` hunk header at line {i + 1}: {line!r}"
                 )
             new_start = int(m.group(1))
+            if new_start == 0:
+                # A zero START is only legal with a zero COUNT: `+0,0`.
+                # `+0,N` / a bare `+0` (implied count 1) are malformed -
+                # fall through to fail loudly rather than silently
+                # swallowing hunks (CodeRabbit PR #580).
+                if m.group(2) != "0":
+                    raise DiffParseError(
+                        f"malformed zero-start hunk header at line {i + 1}: {line!r}"
+                    )
+                # `+0,0` — the change leaves NOTHING on the new side to
+                # review. `+++ /dev/null` deletions are skipped above, but
+                # a file EMPTIED to zero bytes keeps its `+++ b/<path>`
+                # line and still emits `@@ -1,N +0,0 @@` (GitHub does this
+                # for truncate-to-empty commits). Consume the hunk body and
+                # move on, exactly like the deletion case.
+                i += 1
+                while i < len(lines):
+                    hline = lines[i]
+                    if hline.startswith(_HUNK_BOUNDARY_PREFIXES):
+                        break
+                    i += 1
+                continue
             # Walk the hunk body collecting added + context-with-removed
             # lines. Body capture starts at the @@ header so the LLM
             # gets full context.

@@ -359,8 +359,10 @@ def test_reviewed_response_has_no_degraded_reason() -> None:
 
 def test_diff_hunk_rejects_missing_at_at_in_body() -> None:
     """Boundary check — catches a parser regression that loses the @@
-    header before the body string is captured."""
+    header before the body string is captured. Raises DiffParseError
+    (the exception the dispatch degrade contract catches), never a bare
+    AssertionError that would escape it and poison the consumer."""
     import pytest as _pytest
-    from personas.code_reviewer.diff_parser import DiffHunk as _DH
-    with _pytest.raises(AssertionError, match="@@ hunk header"):
+    from personas.code_reviewer.diff_parser import DiffHunk as _DH, DiffParseError as _DPE
+    with _pytest.raises(_DPE, match="@@ hunk header"):
         _DH(file_path="x.py", new_start=1, new_lines=frozenset({1}), body="no header here")
