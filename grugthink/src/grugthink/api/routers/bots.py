@@ -322,26 +322,27 @@ async def get_bot_logs(bot_id: str):
         for handler in logging.getLogger().handlers:
             if hasattr(handler, "get_recent_logs"):
                 all_logs = handler.get_recent_logs()
-                bot_logs = [log for log in all_logs if log.get("bot_id") == bot_id]
+                bot_logs = [entry for entry in all_logs if entry.get("bot_id") == bot_id]
 
                 # Clean up any problematic float values
                 cleaned_logs = []
-                for log in bot_logs[-100:]:
-                    cleaned_log = {}
-                    for key, value in log.items():
+                for entry in bot_logs[-100:]:
+                    cleaned_entry = {}
+                    for key, value in entry.items():
                         if isinstance(value, float):
                             if value != value:  # NaN check
-                                cleaned_log[key] = None
+                                cleaned_entry[key] = None
                             elif value == float("inf") or value == float("-inf"):
-                                cleaned_log[key] = None
+                                cleaned_entry[key] = None
                             else:
-                                cleaned_log[key] = value
+                                cleaned_entry[key] = value
                         else:
-                            cleaned_log[key] = value
-                    cleaned_logs.append(cleaned_log)
+                            cleaned_entry[key] = value
+                    cleaned_logs.append(cleaned_entry)
 
                 return {"logs": cleaned_logs}
         return {"logs": []}
     except Exception as e:
-        log.error(f"Error getting bot logs: {e}")
-        return {"logs": [], "error": str(e)}
+        # Log the detail server-side; do not leak internals to the API caller.
+        log.error("Error getting bot logs", extra={"bot_id": bot_id, "error": str(e)})
+        return {"logs": [], "error": "failed to retrieve bot logs"}

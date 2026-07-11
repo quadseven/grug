@@ -40,7 +40,16 @@ class LRUCache:
 
 def clean_statement(text: str) -> str:
     """Clean statement by removing URLs and mentions."""
-    text = re.sub(r"http[s]?://(?:[a-zA-Z]|[0-9]|[$-_@.&+]|[!*\\(\\),]|(?:%[0-9a-fA-F][0-9a-fA-F]))+", "", text)
+    # URL body chars. The literal hyphen is placed last so it is not read as a
+    # range operator (the old "[$-_...]" form was an overly-large range spanning
+    # 0x24-0x5F; CodeQL py/overly-large-range). The explicit set below keeps the
+    # path/query delimiters (/ : ? # = ; ~) that range happened to cover, so full
+    # URLs are still stripped, not just up to the domain.
+    text = re.sub(
+        r"http[s]?://(?:[a-zA-Z0-9]|[$_@.&+/:?#=;~-]|[!*\\(\\),]|(?:%[0-9a-fA-F][0-9a-fA-F]))+",
+        "",
+        text,
+    )
     text = re.sub(r"<@[!&]?[0-9]+>", "", text)
     text = re.sub(r"<#[0-9]+>", "", text)
     text = " ".join(text.split())

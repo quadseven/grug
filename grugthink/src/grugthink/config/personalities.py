@@ -6,11 +6,36 @@ Handles personality configuration CRUD operations.
 """
 
 import os
+import re
 from typing import Any, Dict, Optional
 
 from ..grug_structured_logger import get_logger
 
 log = get_logger(__name__)
+
+# Personality ids become file names under personalities/<id>.yaml and arrive
+# from the admin API, so a value like "../../etc/x" would escape the directory.
+# Restrict ids to a conservative slug; this fullmatch is the sanitizer barrier
+# that clears CodeQL py/path-injection at every personalities/ file sink.
+_SAFE_PERSONALITY_ID = re.compile(r"[A-Za-z0-9_-]{1,64}")
+_PERSONALITIES_DIR = "personalities"
+
+
+def is_safe_personality_id(personality_id: str) -> bool:
+    """Return True if personality_id is a safe slug usable as a file name."""
+    return bool(personality_id) and _SAFE_PERSONALITY_ID.fullmatch(personality_id) is not None
+
+
+def personality_file_path(personality_id: str) -> str:
+    """Return the on-disk YAML path for a personality.
+
+    Raises ValueError if personality_id is not a safe slug, so no user-provided
+    value can traverse outside the personalities/ directory.
+    """
+    if not is_safe_personality_id(personality_id):
+        raise ValueError(f"unsafe personality id: {personality_id!r}")
+    return os.path.join(_PERSONALITIES_DIR, f"{personality_id}.yaml")
+
 
 # Optional YAML support
 try:
@@ -96,8 +121,13 @@ def save_personality_to_file(personality_id: str, data: Dict[str, Any]) -> bool:
         log.warning("PyYAML not available; cannot save personality file", extra={"personality_id": personality_id})
         return False
 
-    os.makedirs("personalities", exist_ok=True)
-    file_path = os.path.join("personalities", f"{personality_id}.yaml")
+    try:
+        file_path = personality_file_path(personality_id)
+    except ValueError:
+        log.error("Refusing to save personality with unsafe id", extra={"personality_id": personality_id})
+        return False
+
+    os.makedirs(_PERSONALITIES_DIR, exist_ok=True)
 
     try:
         with open(file_path, "w") as f:
@@ -117,11 +147,13 @@ def remove_personality(config_manager, personality_id: str) -> bool:
         config_manager.set_config("personalities", personalities)
 
         # Also remove the physical file from personalities directory
-        file_path = os.path.join("personalities", f"{personality_id}.yaml")
         try:
+            file_path = personality_file_path(personality_id)
             if os.path.exists(file_path):
                 os.remove(file_path)
                 log.debug("Removed personality file", extra={"personality_id": personality_id, "file": file_path})
+        except ValueError:
+            log.warning("Skipping file removal for unsafe personality id", extra={"personality_id": personality_id})
         except Exception as e:
             log.warning("Failed to remove personality file", extra={"personality_id": personality_id, "error": str(e)})
 
