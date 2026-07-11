@@ -367,6 +367,19 @@ _BACKEND_CONFIGS: dict[Backend, BackendConfig] = {
 
 def _review_backend_config(backend: Backend) -> BackendConfig:
     """Return backend settings scoped to the expensive Elder review pass."""
+    if backend == Backend.CAVE:
+        # Cave-primary: the owned in-cluster spark-gateway is the sole review
+        # backend. Raise (not KeyError) when unconfigured so review_diff's
+        # _BackendConfigError arm records it as a clean backend failure.
+        cave = _cave_review_config()
+        if cave is None:
+            raise _BackendConfigError("GRUG_CAVE_GATEWAY_URL not set - cannot run Cave review")
+        return replace(
+            cave,
+            timeout_seconds=_REVIEW_TIMEOUT_SECONDS,
+            retry_attempts=_REVIEW_RETRY_ATTEMPTS,
+            transport_retry_attempts=_REVIEW_TRANSPORT_RETRY_ATTEMPTS,
+        )
     config = _BACKEND_CONFIGS[backend]
     if backend == Backend.OPENROUTER:
         return replace(
@@ -404,6 +417,24 @@ def _cave_judge_config() -> "BackendConfig | None":
         backend=Backend.CAVE,
         url=f"{base}/v1/chat/completions",
         model=os.getenv("GRUG_CAVE_JUDGE_MODEL", _CAVE_JUDGE_DEFAULT_MODEL),
+        key_loader=lambda: "in-cluster",  # gateway is unauthenticated in-cluster
+    )
+
+
+def _cave_review_config() -> "BackendConfig | None":
+    """BackendConfig for the in-cluster spark-gateway as the SOLE review
+    backend (Cave-primary). Returns None when GRUG_CAVE_GATEWAY_URL is unset,
+    which review_diff surfaces as `all_failed` (there is no SaaS review backend
+    to fall back to any more - OpenRouter/Poolside were retired to keep review
+    on the owned GPU, no SaaS spend). Review may use a different (larger) model
+    than the judge via GRUG_CAVE_REVIEW_MODEL, defaulting to the judge model."""
+    base = os.getenv("GRUG_CAVE_GATEWAY_URL", "").strip().rstrip("/")
+    if not base:
+        return None
+    return BackendConfig(
+        backend=Backend.CAVE,
+        url=f"{base}/v1/chat/completions",
+        model=os.getenv("GRUG_CAVE_REVIEW_MODEL", os.getenv("GRUG_CAVE_JUDGE_MODEL", _CAVE_JUDGE_DEFAULT_MODEL)),
         key_loader=lambda: "in-cluster",  # gateway is unauthenticated in-cluster
     )
 
@@ -1134,10 +1165,12 @@ def review_diff(
     if not hunks:
         return LlmReviewResponse(kind="no_diff")
 
-    primary = select_backend(installation_id)
-    secondary = (
-        Backend.OPENROUTER if primary == Backend.POOLSIDE else Backend.POOLSIDE
-    )
+    # Cave-primary reviews: the owned spark-gateway is the ONLY review backend.
+    # The SaaS round-robin (OpenRouter/Poolside) is retired - review runs on the
+    # owned GPU, no SaaS spend and no SaaS-credit outage (was: 402 from OpenRouter
+    # silently degrading every review to the fallback). No secondary any more, so
+    # a Cave failure surfaces directly instead of masking a first backend's error.
+    review_backends: tuple[Backend, ...] = (Backend.CAVE,)
     depth = os.getenv("GRUG_REVIEW_DEPTH", "deep").strip().lower()
     deep = depth != "fast"
     # Deep is the production quality path and always uses the recall-oriented
@@ -1159,7 +1192,7 @@ def review_diff(
     # than collapsing to `all_failed`.
     first_parse_fail = None
     successes: list[_SuccessfulReview] = []
-    for backend in (primary, secondary):
+    for backend in review_backends:
         config = _review_backend_config(backend)
         # Open one LLM Obs span per backend attempt. Annotate on every
         # CAUGHT exit path (success + the three explicit `except` arms)

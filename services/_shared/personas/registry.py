@@ -146,7 +146,13 @@ REGISTRY: tuple[PersonaSpec, ...] = (
         blocking_flag="code_reviewer_blocking",
         blocking_default=False,
         dispatch_style="async",
-        missing_repo_policy="disabled",
+        # "enabled": Elder reviews EVERY repo the app is installed on, even with
+        # no explicit repo config (was "disabled" = opt-in per repo). Advisory by
+        # default (blocking_default=False), so a new repo gets counsel, never a
+        # merge block. Safe now that review runs on the owned Cave (no SaaS spend
+        # per repo). Guard stays opt-in ("disabled") - security gating is a
+        # per-repo decision, and it currently struggles on very large diffs.
+        missing_repo_policy="enabled",
         events=("pull_request",),
         dispatch_module="personas.code_reviewer.webhook_dispatch",
     ),
