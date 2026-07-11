@@ -39,4 +39,4 @@ HEALTHCHECK --interval=30s --timeout=5s --start-period=30s --retries=3 \
 
 # Multi-bot manager + dashboard on 8080. init-config seeds a default config
 # into the (persistent) /data volume on first start.
-CMD ["/bin/bash", "-c", "/usr/local/bin/init-config.sh && python grugthink.py multi-bot --api-port 8080"]
+CMD ["/bin/bash", "-c", "/usr/local/bin/init-config.sh && exec python grugthink.py multi-bot --api-port 8080"]

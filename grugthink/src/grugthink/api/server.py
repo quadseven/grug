@@ -65,18 +65,18 @@ def create_app(bot_manager: BotManager, config_manager: ConfigManager) -> FastAP
     else:
         disable_oauth = os.getenv("DISABLE_OAUTH", "false").lower() == "true"
 
+    if not session_secret and not disable_oauth:
+        # Only fail if OAuth is enabled and no secret is set.
+        raise RuntimeError(
+            "SESSION_SECRET (or SESSION_SECRET_KEY) must be set when OAuth is enabled"
+        )
     if not session_secret:
-        if disable_oauth:
-            # No login flow -> an ephemeral secret is fine (sessions reset on restart).
-            session_secret = secrets.token_urlsafe(32)
-        else:
-            # Fail closed: a login flow with an unset/guessable secret is unsafe.
-            raise RuntimeError(
-                "SESSION_SECRET (or SESSION_SECRET_KEY) must be set when OAuth is enabled"
-            )
+        # If we are here, either OAuth is disabled or we have a secret? Actually, if we have a secret we wouldn't be here.
+        # So we are here only when there's no secret and OAuth is disabled -> use ephemeral.
+        session_secret = secrets.token_urlsafe(32)
 
-    if not disable_oauth:
-        app.add_middleware(SessionMiddleware, secret_key=session_secret)
+    # Always add SessionMiddleware, but if OAuth is disabled we use an ephemeral secret (already set above if needed)
+    app.add_middleware(SessionMiddleware, secret_key=session_secret)
 
     # CORS: restrict to a configured allowlist - never "*" with credentials.
     allowed_origins = "http://localhost:8080"
@@ -188,6 +188,17 @@ def create_app(bot_manager: BotManager, config_manager: ConfigManager) -> FastAP
 
     @app.get("/callback")
     async def auth_callback(request: Request):
+        # Check if OAuth is disabled
+        disable_oauth = False
+        if config_manager:
+            disable_oauth = config_manager.get_env_var("DISABLE_OAUTH", "false").lower() == "true"
+        else:
+            disable_oauth = os.getenv("DISABLE_OAUTH", "false").lower() == "true"
+        
+        if disable_oauth:
+            # If OAuth is disabled, redirect to dashboard
+            return RedirectResponse("/")
+
         code = request.query_params.get("code")
         if not code:
             return {"error": "Missing code"}

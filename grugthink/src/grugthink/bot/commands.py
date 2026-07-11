@@ -1007,15 +1007,8 @@ async def diagnose(interaction, bot: "GrugThinkBot") -> None:
 
     # Test API call
     try:
-        import google.generativeai as genai
-
-        genai.configure(api_key=config.GEMINI_API_KEY)
-        model = genai.GenerativeModel(model_name=config.GEMINI_MODEL)
-        test_response = model.generate_content("Say 'API test successful'", stream=False)
-        if test_response.text:
-            diagnostics.append("✅ API Test: Successful")
-        else:
-            diagnostics.append("❌ API Test: No response")
+        # Gemini is intentionally removed in v2 - see requirements.txt
+        diagnostics.append("ℹ️ Gemini API Test: Skipped (disabled in v2)")
     except Exception as e:
         diagnostics.append(f"❌ API Test Failed: {str(e)}")
 
