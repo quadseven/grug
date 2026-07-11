@@ -62,15 +62,20 @@ class BotManager:
 
     async def delete_bot(self, bot_id: str) -> bool:
         """Delete a bot configuration."""
-        if bot_id not in self.bots:
+        with self._lock:
+            instance = self.bots.get(bot_id)
+        if instance is None:
             return False
 
-        # Stop the bot if running - must await this!
-        if self.bots[bot_id].runtime_status == "running":
+        # Stop the bot if running - must await this (outside the lock).
+        if instance.runtime_status == "running":
             await stop_bot(self, bot_id)
 
         with self._lock:
-            del self.bots[bot_id]
+            # Re-check under the lock: a concurrent delete_bot may have already
+            # removed this entry (pop avoids the KeyError that a bare del races).
+            if self.bots.pop(bot_id, None) is None:
+                return False
             # Remove from persistent configuration
             if self.config_manager:
                 self.config_manager.remove_bot_config(bot_id)
@@ -150,7 +155,11 @@ class BotManager:
 
     def list_bots(self) -> List[Dict[str, Any]]:
         """List all bot configurations and their status."""
-        return [self.get_bot_status(bot_id) for bot_id in self.bots.keys()]
+        # Snapshot ids under the lock so a concurrent create/delete cannot raise
+        # "dictionary changed size during iteration".
+        with self._lock:
+            bot_ids = list(self.bots.keys())
+        return [status for bot_id in bot_ids if (status := self.get_bot_status(bot_id)) is not None]
 
     async def start_bot(self, bot_id: str) -> bool:
         """Start a specific bot instance."""
@@ -168,7 +177,11 @@ class BotManager:
         """Start all configured bots."""
         self.running = True
 
-        for bot_id in self.bots.keys():
+        # Snapshot ids under the lock: the loop awaits, so a concurrent
+        # create/delete would otherwise mutate self.bots mid-iteration.
+        with self._lock:
+            bot_ids = list(self.bots.keys())
+        for bot_id in bot_ids:
             await self.start_bot(bot_id)
             await asyncio.sleep(5)  # Stagger starts to avoid rate limits
 
@@ -176,10 +189,9 @@ class BotManager:
         """Stop all running bots."""
         self.running = False
 
-        tasks = []
-        for bot_id in self.bots.keys():
-            if self.bots[bot_id].runtime_status == "running":
-                tasks.append(self.stop_bot(bot_id))
+        with self._lock:
+            snapshot = [(bot_id, inst) for bot_id, inst in self.bots.items()]
+        tasks = [self.stop_bot(bot_id) for bot_id, inst in snapshot if inst.runtime_status == "running"]
 
         if tasks:
             await asyncio.gather(*tasks, return_exceptions=True)

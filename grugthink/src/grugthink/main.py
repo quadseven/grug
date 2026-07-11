@@ -319,8 +319,13 @@ async def create_demo_configuration():
             log.warning("No Discord tokens configured. Add tokens via the web interface or config file.")
             return
 
-        available_token = config_manager.get_available_discord_token()
-        if not available_token:
+        # create_bot references tokens by id, not by value - pick the first
+        # active token's id.
+        demo_token_id = next(
+            (t["id"] for t in config_manager.get_discord_tokens() if t.get("active", True)),
+            None,
+        )
+        if not demo_token_id:
             log.warning("No available Discord tokens found")
             return
 
@@ -331,12 +336,12 @@ async def create_demo_configuration():
         ]
 
         created_bots = []
-        for i, bot_config in enumerate(demo_bots):
-            # Use the same token for demo - in practice you'd use different tokens
+        for bot_config in demo_bots:
+            # Same token id for every demo bot - in production use separate tokens.
             bot_id = bot_manager.create_bot(
                 name=bot_config["name"],
-                discord_token=available_token,  # Same token for demo
-                # In production, you'd want separate tokens per bot
+                discord_token_id=demo_token_id,
+                template_id=bot_config["template"],
             )
             created_bots.append((bot_id, bot_config["name"]))
 
