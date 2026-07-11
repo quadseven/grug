@@ -121,13 +121,14 @@ def save_personality_to_file(personality_id: str, data: Dict[str, Any]) -> bool:
         log.warning("PyYAML not available; cannot save personality file", extra={"personality_id": personality_id})
         return False
 
-    try:
-        file_path = personality_file_path(personality_id)
-    except ValueError:
+    # Inline allowlist guard on the tainted id immediately before the path sink,
+    # so CodeQL sees the regex barrier dominating open() (py/path-injection).
+    if not _SAFE_PERSONALITY_ID.fullmatch(personality_id or ""):
         log.error("Refusing to save personality with unsafe id", extra={"personality_id": personality_id})
         return False
 
     os.makedirs(_PERSONALITIES_DIR, exist_ok=True)
+    file_path = os.path.join(_PERSONALITIES_DIR, f"{personality_id}.yaml")
 
     try:
         with open(file_path, "w") as f:
@@ -146,16 +147,20 @@ def remove_personality(config_manager, personality_id: str) -> bool:
         del personalities[personality_id]
         config_manager.set_config("personalities", personalities)
 
-        # Also remove the physical file from personalities directory
-        try:
-            file_path = personality_file_path(personality_id)
-            if os.path.exists(file_path):
-                os.remove(file_path)
-                log.debug("Removed personality file", extra={"personality_id": personality_id, "file": file_path})
-        except ValueError:
+        # Also remove the physical file. Inline allowlist guard on the tainted id
+        # right before the path sinks so CodeQL sees the regex barrier.
+        if not _SAFE_PERSONALITY_ID.fullmatch(personality_id or ""):
             log.warning("Skipping file removal for unsafe personality id", extra={"personality_id": personality_id})
-        except Exception as e:
-            log.warning("Failed to remove personality file", extra={"personality_id": personality_id, "error": str(e)})
+        else:
+            file_path = os.path.join(_PERSONALITIES_DIR, f"{personality_id}.yaml")
+            try:
+                if os.path.exists(file_path):
+                    os.remove(file_path)
+                    log.debug("Removed personality file", extra={"personality_id": personality_id, "file": file_path})
+            except Exception as e:
+                log.warning(
+                    "Failed to remove personality file", extra={"personality_id": personality_id, "error": str(e)}
+                )
 
         log.info("Removed personality", extra={"personality_id": personality_id})
         return True
