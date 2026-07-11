@@ -23,10 +23,9 @@ if HAS_FASTAPI:
 
         sys.modules["uvicorn"] = types.SimpleNamespace()
 
-    from src.grugthink.api_server import APIServer
-    from src.grugthink.config_manager import ConfigManager
-
+    from src.grugthink.api.server import create_app
     from src.grugthink.bot_manager import BotManager
+    from src.grugthink.config.manager import ConfigManager
 
 
 def make_server(tmp_cfg: Path):
@@ -35,8 +34,8 @@ def make_server(tmp_cfg: Path):
     # Disable OAuth for tests
     cm.set_env_var("DISABLE_OAUTH", "true")
     bm = BotManager(config_manager=cm)
-    api = APIServer(bm, cm)
-    return api, cm
+    app = create_app(bm, cm)
+    return app, cm
 
 
 def test_admin_settings_get_and_put():
@@ -44,8 +43,8 @@ def test_admin_settings_get_and_put():
         pytest.skip("fastapi/uvicorn not installed in this environment")
     with tempfile.TemporaryDirectory() as td:
         cfg = Path(td) / "grugthink_config.yaml"
-        api, cm = make_server(cfg)
-        client = TestClient(api.app)
+        app, cm = make_server(cfg)
+        client = TestClient(app)
 
         # GET default settings
         r = client.get("/api/admin/settings")

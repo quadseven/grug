@@ -38,6 +38,9 @@ async def start_bot(bot_manager, bot_id: str) -> bool:
         instance.logger.warning("Bot is disabled in configuration")
         return False
 
+    # Bind before the try so the except handler can always restore os.environ,
+    # even if create_bot_environment (or later setup) raises before we populate it.
+    original_env = {}
     try:
         instance.runtime_status = "starting"
         instance.logger.info("Starting bot", extra={"bot_name": config.name})
@@ -52,7 +55,6 @@ async def start_bot(bot_manager, bot_id: str) -> bool:
         )
 
         # Set environment variables before importing any bot modules
-        original_env = {}
         for key, value in bot_env.items():
             original_env[key] = os.environ.get(key)
             os.environ[key] = value
@@ -107,7 +109,9 @@ async def start_bot(bot_manager, bot_id: str) -> bool:
         intents.guilds = True
         intents.members = True
 
-        client = commands.Bot(command_prefix="/", intents=intents, loop=asyncio.get_running_loop())
+        # discord.py 2.0 removed the Client/Bot `loop=` parameter (asyncio.run
+        # owns the loop now); passing it raises TypeError and the bot never starts.
+        client = commands.Bot(command_prefix="/", intents=intents)
         instance.client = client
 
         # Import and setup bot commands
