@@ -1193,7 +1193,17 @@ def review_diff(
     first_parse_fail = None
     successes: list[_SuccessfulReview] = []
     for backend in review_backends:
-        config = _review_backend_config(backend)
+        # Resolve the backend config BEFORE opening the LLM-Obs span: a
+        # misconfiguration (e.g. GRUG_CAVE_GATEWAY_URL unset) must degrade to a
+        # clean backend failure, not raise out of review_diff. With the Cave the
+        # sole review backend, this is the only path when the gateway env is
+        # missing, so it decides whether Elder degrades (neutral) or 500s.
+        try:
+            config = _review_backend_config(backend)
+        except _BackendConfigError as e:
+            log.error("llm_backend_misconfigured", extra={"backend": backend.value, "detail": str(e)})
+            last_error = f"{backend.value} misconfigured: {e}"
+            continue
         # Open one LLM Obs span per backend attempt. Annotate on every
         # CAUGHT exit path (success + the three explicit `except` arms)
         # so DD captures latency tails and per-backend error rates. A
