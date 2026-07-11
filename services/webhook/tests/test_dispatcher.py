@@ -300,13 +300,12 @@ def test_pull_request_threads_delivery_id_to_enqueue():
     assert kwargs["blocking"] is True  # plumbed from code_reviewer_blocking
 
 
-def test_pull_request_missing_repo_id_skips_elder_but_runs_tpm():
-    """Asymmetric contract documented in `_handle_pull_request`:
-    missing `repo_id` (payload-shape glitch) → TPM dispatches anyway
-    (legacy enabled-by-default), Elder skips with reason=no_repo_id
-    since it can't call is_persona_enabled without a repo_id. A
-    refactor unifying the two branches would silently flip Elder to
-    enabled-by-default. This test pins the asymmetry."""
+def test_pull_request_missing_repo_id_runs_elder_and_tpm():
+    """With Elder's missing_repo_policy now "enabled", a payload missing `repo_id`
+    (a shape glitch) no longer skips Elder: both Chief (TPM) and Elder dispatch
+    via the enabled default (`_handle_pull_request` line ~304). Elder enqueues
+    with blocking=blocking_default (True) since there's no repo config to read.
+    It degrades to neutral downstream if it cannot fetch the diff (fail-open)."""
     payload = _full_pr_payload()
     payload["repository"].pop("id", None)
 
@@ -319,9 +318,10 @@ def test_pull_request_missing_repo_id_skips_elder_but_runs_tpm():
         mock_eval.return_value = type("R", (), {"passed": True})()
         out = dispatch("pull_request", payload)
 
-    assert len(out["personas"]) == 1
-    assert out["personas"][0]["persona"] == "tpm"
-    mock_enq.assert_not_called()
+    personas_ran = [p["persona"] for p in out["personas"]]
+    assert "tpm" in personas_ran
+    assert "code_reviewer" in personas_ran
+    mock_enq.assert_called_once()
 
 
 def test_pull_request_code_reviewer_disabled_skips_only_elder():

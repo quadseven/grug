@@ -205,10 +205,14 @@ class Backend(str, Enum):
 
     POOLSIDE = "poolside"
     OPENROUTER = "openrouter"
-    # In-cluster spark-gateway (ADR-0009). NOT a review backend yet - only
-    # the exposed-secret judge routes here (#439); select_backend's
-    # round-robin stays pinned to the two SaaS backends below.
+    # Owned in-cluster review ensemble (ADR-0009), both fronted by the same
+    # spark-gateway (it routes by model name to ollama-sparkles vs sparkicus
+    # vLLM). CAVE = the coder arm (qwen3-coder-next), CAVE_REASONER = the
+    # reasoner arm (nemotron-3-super). Deep review runs BOTH and merges - the
+    # brain+hands split that replaces the retired SaaS pair. The exposed-secret
+    # judge (#439) also routes to CAVE.
     CAVE = "cave"
+    CAVE_REASONER = "cave-reasoner"
 
 
 # `Severity` + `SEVERITIES` now live in the shared leaf `review_types` (#250)
@@ -367,11 +371,11 @@ _BACKEND_CONFIGS: dict[Backend, BackendConfig] = {
 
 def _review_backend_config(backend: Backend) -> BackendConfig:
     """Return backend settings scoped to the expensive Elder review pass."""
-    if backend == Backend.CAVE:
-        # Cave-primary: the owned in-cluster spark-gateway is the sole review
-        # backend. Raise (not KeyError) when unconfigured so review_diff's
-        # _BackendConfigError arm records it as a clean backend failure.
-        cave = _cave_review_config()
+    if backend in (Backend.CAVE, Backend.CAVE_REASONER):
+        # Owned review ensemble arm (coder or reasoner). Raise (not KeyError)
+        # when unconfigured so review_diff's _BackendConfigError arm records it
+        # as a clean backend failure rather than crashing the review.
+        cave = _cave_review_config(backend)
         if cave is None:
             raise _BackendConfigError("GRUG_CAVE_GATEWAY_URL not set - cannot run Cave review")
         return replace(
@@ -423,20 +427,32 @@ def _cave_judge_config() -> "BackendConfig | None":
     )
 
 
-def _cave_review_config() -> "BackendConfig | None":
-    """BackendConfig for the in-cluster spark-gateway as the SOLE review
-    backend (Cave-primary). Returns None when GRUG_CAVE_GATEWAY_URL is unset,
-    which review_diff surfaces as `all_failed` (there is no SaaS review backend
-    to fall back to any more - OpenRouter/Poolside were retired to keep review
-    on the owned GPU, no SaaS spend). Review may use a different (larger) model
-    than the judge via GRUG_CAVE_REVIEW_MODEL, defaulting to the judge model."""
+# The owned review ensemble: a coder arm and a reasoner arm, BOTH fronted by the
+# same spark-gateway (it routes by model name to ollama-sparkles / sparkicus
+# vLLM). Deep review runs both and merges; the SaaS pair is retired.
+_CAVE_REVIEW_CODER_DEFAULT_MODEL = "qwen3-coder-next:q8_0"
+_CAVE_REVIEW_REASONER_DEFAULT_MODEL = "nemotron-3-super:120b"
+
+
+def _cave_review_config(backend: Backend) -> "BackendConfig | None":
+    """BackendConfig for one arm of the owned in-cluster review ensemble.
+
+    `backend` is CAVE (coder) or CAVE_REASONER (reasoner). Both hit the same
+    GRUG_CAVE_GATEWAY_URL, differing only in `model`. Returns None when the
+    gateway URL is unset, which review_diff surfaces as a clean backend failure
+    (no SaaS backend to fall back to - OpenRouter/Poolside were retired). Models
+    are overridable per arm via GRUG_CAVE_REVIEW_MODEL / GRUG_CAVE_REASONER_MODEL."""
     base = os.getenv("GRUG_CAVE_GATEWAY_URL", "").strip().rstrip("/")
     if not base:
         return None
+    if backend == Backend.CAVE_REASONER:
+        model = os.getenv("GRUG_CAVE_REASONER_MODEL", _CAVE_REVIEW_REASONER_DEFAULT_MODEL)
+    else:
+        model = os.getenv("GRUG_CAVE_REVIEW_MODEL", _CAVE_REVIEW_CODER_DEFAULT_MODEL)
     return BackendConfig(
-        backend=Backend.CAVE,
+        backend=backend,
         url=f"{base}/v1/chat/completions",
-        model=os.getenv("GRUG_CAVE_REVIEW_MODEL", os.getenv("GRUG_CAVE_JUDGE_MODEL", _CAVE_JUDGE_DEFAULT_MODEL)),
+        model=model,
         key_loader=lambda: "in-cluster",  # gateway is unauthenticated in-cluster
     )
 
@@ -1167,12 +1183,12 @@ def review_diff(
     if not hunks:
         return LlmReviewResponse(kind="no_diff")
 
-    # Cave-primary reviews: the owned spark-gateway is the ONLY review backend.
-    # The SaaS round-robin (OpenRouter/Poolside) is retired - review runs on the
-    # owned GPU, no SaaS spend and no SaaS-credit outage (was: 402 from OpenRouter
-    # silently degrading every review to the fallback). No secondary any more, so
-    # a Cave failure surfaces directly instead of masking a first backend's error.
-    review_backends: tuple[Backend, ...] = (Backend.CAVE,)
+    # Owned review ensemble (replaces the retired SaaS pair): coder arm
+    # (qwen3-coder-next) + reasoner arm (nemotron-3-super), both via the Cave
+    # gateway. Deep runs both and merges (brain+hands); fast returns after the
+    # coder arm. No SaaS spend, no 402 outage. Order = coder first so fast mode
+    # uses the code specialist.
+    review_backends: tuple[Backend, ...] = (Backend.CAVE, Backend.CAVE_REASONER)
     depth = os.getenv("GRUG_REVIEW_DEPTH", "deep").strip().lower()
     deep = depth != "fast"
     # Deep is the production quality path and always uses the recall-oriented
@@ -1203,6 +1219,19 @@ def review_diff(
         try:
             config = _review_backend_config(backend)
         except _BackendConfigError as e:
+            # Still emit a span so DD sees config errors (gateway/secret missing),
+            # not just transport errors - but do it here, BEFORE the main span,
+            # so a bad config can never raise out of review_diff.
+            cfg_start_ns = time.monotonic_ns()
+            with _llmobs_llm(
+                model_name=backend.value, model_provider=backend.value, name=_LLMOBS_NAME,
+            ) as cfg_span:
+                _llmobs_annotate(
+                    span=cfg_span, input_data=_redact_payload(messages),
+                    metadata={"backend": backend.value, "variant_id": variant, "error": "config"},
+                    metrics={"latency_ms": _elapsed_ms(cfg_start_ns)},
+                    tags=pr_tags,
+                )
             log.error("llm_backend_misconfigured", extra={"backend": backend.value, "detail": str(e)})
             last_error = f"{backend.value} misconfigured: {e}"
             continue
