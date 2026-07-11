@@ -85,7 +85,6 @@ class ConfigManager:
                     extra={
                         "env_vars_count": len(self.env_vars),
                         "env_vars_keys": sorted(self.env_vars.keys()),
-                        "env_vars_data": {k: v for k, v in self.env_vars.items()},
                         "config_file": self.config_file,
                     },
                 )
