@@ -144,14 +144,22 @@ REGISTRY: tuple[PersonaSpec, ...] = (
         enabled_flag="code_reviewer_enabled",
         enabled_default=True,
         blocking_flag="code_reviewer_blocking",
-        blocking_default=False,
+        # blocking_default=True: Elder BLOCKS merge on real findings (CodeRabbit
+        # style) - conclusion "failure" + REQUEST_CHANGES. Safe because the gate
+        # in dispatch.py fails OPEN on any degraded review (LLM outage, parse
+        # failure, empty/huge diff) -> neutral, never a block; and the block
+        # clears when findings are fixed and re-pushed (Elder dedups + re-reviews).
+        # NOTE: GitHub only *enforces* the block if "Grug - Code Review" is a
+        # REQUIRED status check in each repo's ruleset (managed via Pulumi in the
+        # infra-github project) - the persona conclusion alone shows a red X but
+        # does not prevent the merge button.
+        blocking_default=True,
         dispatch_style="async",
         # "enabled": Elder reviews EVERY repo the app is installed on, even with
-        # no explicit repo config (was "disabled" = opt-in per repo). Advisory by
-        # default (blocking_default=False), so a new repo gets counsel, never a
-        # merge block. Safe now that review runs on the owned Cave (no SaaS spend
-        # per repo). Guard stays opt-in ("disabled") - security gating is a
-        # per-repo decision, and it currently struggles on very large diffs.
+        # no explicit repo config (was "disabled" = opt-in per repo). Safe now
+        # that review runs on the owned Cave (no SaaS spend per repo). Guard
+        # stays opt-in ("disabled") - security gating is a per-repo decision, and
+        # it currently struggles on very large diffs.
         missing_repo_policy="enabled",
         events=("pull_request",),
         dispatch_module="personas.code_reviewer.webhook_dispatch",
