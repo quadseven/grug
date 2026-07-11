@@ -13,8 +13,8 @@ Unauthenticated in-cluster.
 Config (env):
   SPARK_GATEWAY_URL / GRUGTHINK_LLM_URL - gateway base URL. Falls back to the
     first OLLAMA_URLS entry, then the in-cluster default.
-  GRUGTHINK_LLM_MODEL   - chat model (default qwen3-coder-next:latest).
-  GRUGTHINK_EMBED_MODEL - embedding model (default nomic-embed-text).
+  GRUGTHINK_LLM_MODEL   - chat model (default qwen3-coder-next:q8_0).
+  GRUGTHINK_EMBED_MODEL - embedding model (default nomic-embed-text:v1.5).
   GRUGTHINK_LLM_TIMEOUT - per-request seconds (default 60).
 """
 from __future__ import annotations
@@ -44,11 +44,13 @@ def base_url() -> str:
 
 
 def chat_model() -> str:
-    return os.getenv("GRUGTHINK_LLM_MODEL", "qwen3-coder-next:latest")
+    # Pinned Q8_0 tag (was ":latest"): the exact model srv-sparkles serves.
+    return os.getenv("GRUGTHINK_LLM_MODEL", "qwen3-coder-next:q8_0")
 
 
 def embed_model() -> str:
-    return os.getenv("GRUGTHINK_EMBED_MODEL", "nomic-embed-text")
+    # Pinned version (was bare "nomic-embed-text").
+    return os.getenv("GRUGTHINK_EMBED_MODEL", "nomic-embed-text:v1.5")
 
 
 def _timeout() -> float:
