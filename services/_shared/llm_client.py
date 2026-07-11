@@ -398,7 +398,9 @@ def _review_backend_config(backend: Backend) -> BackendConfig:
     )
 
 
-_CAVE_JUDGE_DEFAULT_MODEL = "qwen3-coder-next:latest"
+# Pinned Q8_0 tag (was ":latest") - the exact model srv-sparkles serves; ":latest"
+# is a moving target that can silently swap the model under the reviewer.
+_CAVE_JUDGE_DEFAULT_MODEL = "qwen3-coder-next:q8_0"
 
 
 def _cave_judge_config() -> "BackendConfig | None":
