@@ -6,6 +6,7 @@ Handles Discord bot token CRUD operations.
 """
 
 import time
+import uuid
 from typing import Any, Dict, List, Optional
 
 from ..grug_structured_logger import get_logger
@@ -18,7 +19,7 @@ def add_discord_token(config_manager, name: str, token: str) -> str:
     tokens = config_manager.get_config("api_keys.discord.tokens") or []
 
     token_entry = {
-        "id": str(len(tokens) + 1),
+        "id": str(uuid.uuid4()),
         "name": name,
         "token": token,
         "added_at": time.time(),

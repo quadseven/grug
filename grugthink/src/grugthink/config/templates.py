@@ -80,18 +80,16 @@ def list_templates(
     """List all available templates."""
     templates = {}
 
-    # Load templates from config file first (higher priority)
+    # Always start with hardcoded defaults so they remain discoverable.
+    templates.update(default_templates)
+
+    # Load templates from config file (higher priority, overrides defaults with same id)
     config_templates = config_data.get("bot_templates", {})
     for template_id, template_data in config_templates.items():
         try:
             templates[template_id] = ConfigTemplate(**template_data)
         except Exception as e:
             log.error("Invalid template in config", extra={"template_id": template_id, "error": str(e)})
-
-    # Only add hardcoded templates if no config templates exist (for backwards compatibility)
-    if not config_templates:
-        for template_id, template in default_templates.items():
-            templates[template_id] = template
 
     return templates
 

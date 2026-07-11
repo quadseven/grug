@@ -33,7 +33,24 @@ def _get_unique_db_path():
 
 DB_PATH = _get_unique_db_path()
 GRUGBOT_VARIANT = os.getenv("GRUGBOT_VARIANT", "prod")
-TRUSTED_USER_IDS = [int(uid) for uid in os.getenv("TRUSTED_USER_IDS", "").split(",") if uid.strip()]
+
+
+def _parse_trusted_ids(raw: str) -> list:
+    ids = []
+    for uid in raw.split(","):
+        uid = uid.strip()
+        if not uid:
+            continue
+        try:
+            ids.append(int(uid))
+        except ValueError:
+            import logging
+
+            logging.getLogger(__name__).warning("Ignoring invalid TRUSTED_USER_IDS entry: %s", uid)
+    return ids
+
+
+TRUSTED_USER_IDS = _parse_trusted_ids(os.getenv("TRUSTED_USER_IDS", ""))
 
 # Whether to load the heavy embedding model at startup. Set to 'False' for lightweight deployments.
 LOAD_EMBEDDER = os.getenv("LOAD_EMBEDDER", "True").lower() == "true"

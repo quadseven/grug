@@ -5,6 +5,7 @@ Configuration Manager
 Main ConfigManager class that coordinates all configuration operations.
 """
 
+import copy
 import os
 import threading
 from pathlib import Path
@@ -130,7 +131,8 @@ class ConfigManager:
                 else:
                     return None
 
-            return data
+            # Return a deep copy so callers can't mutate internal state outside the lock
+            return copy.deepcopy(data)
 
     def set_config(self, key: str, value: Any):
         """Set configuration value."""
@@ -147,8 +149,11 @@ class ConfigManager:
             # Set value
             data[keys[-1]] = value
 
-            # Save to file
-            self._save_config()
+            # Snapshot the completed mutation for the write below
+            snapshot = copy.deepcopy(self.config_data)
+
+        # Save to file outside the lock so disk I/O doesn't block other config access
+        loader.save_config(self.config_file, snapshot)
 
     def get_env_var(self, key: str, default: str = None) -> str:
         """Get environment variable with fallback to config."""

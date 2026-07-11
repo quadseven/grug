@@ -1,6 +1,34 @@
 import json
 import logging
 
+# Attributes reserved by logging.Logger.makeRecord(); passing any of these
+# through the "extra" kwarg raises KeyError ("Attempt to overwrite ... in
+# LogRecord"). Keep them in the JSON log_struct only, not in kwargs["extra"].
+_RESERVED_LOG_RECORD_KEYS = {
+    "name",
+    "msg",
+    "args",
+    "levelname",
+    "levelno",
+    "pathname",
+    "filename",
+    "module",
+    "exc_info",
+    "exc_text",
+    "stack_info",
+    "lineno",
+    "funcName",
+    "created",
+    "msecs",
+    "relativeCreated",
+    "thread",
+    "threadName",
+    "processName",
+    "process",
+    "message",
+    "asctime",
+}
+
 
 class StructuredLogger(logging.LoggerAdapter):
     """
@@ -15,6 +43,10 @@ class StructuredLogger(logging.LoggerAdapter):
         # The main message is merged into the structure under the 'message' key
         log_struct = {"message": msg}
         log_struct.update(extra)
+
+        # Sanitize before handing off to the stdlib logger; the serialized
+        # message above remains the authoritative record of all fields.
+        kwargs["extra"] = {k: v for k, v in extra.items() if k not in _RESERVED_LOG_RECORD_KEYS}
 
         return json.dumps(log_struct), kwargs
 

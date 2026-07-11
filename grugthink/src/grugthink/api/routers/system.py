@@ -78,7 +78,7 @@ async def get_system_stats(bot_manager: BotManager = Depends(get_bot_manager)):
     )
 
 
-@router.get("/system/logs")
+@router.get("/system/logs", dependencies=[Depends(admin_required)])
 async def get_system_logs():
     """Get recent system logs."""
     for handler in logging.getLogger().handlers:
@@ -87,13 +87,13 @@ async def get_system_logs():
     return {"logs": []}
 
 
-@router.get("/debug/test")
+@router.get("/debug/test", dependencies=[Depends(admin_required)])
 async def debug_test():
     """Simple test endpoint to verify route registration."""
     return {"message": "Test endpoint working"}
 
 
-@router.get("/debug/routes")
+@router.get("/debug/routes", dependencies=[Depends(admin_required)])
 async def list_routes():
     """Debug endpoint to list all routes (requires app context)."""
     # This endpoint needs to be registered differently to access app.routes

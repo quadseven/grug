@@ -3,7 +3,6 @@
 import asyncio
 import os
 import secrets
-import signal
 from pathlib import Path
 
 import requests
@@ -11,7 +10,7 @@ import uvicorn
 from fastapi import FastAPI, Request
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.middleware.gzip import GZipMiddleware
-from fastapi.responses import FileResponse, RedirectResponse
+from fastapi.responses import FileResponse, JSONResponse, RedirectResponse
 from fastapi.staticfiles import StaticFiles
 from starlette.middleware.sessions import SessionMiddleware
 
@@ -67,12 +66,10 @@ def create_app(bot_manager: BotManager, config_manager: ConfigManager) -> FastAP
 
     if not session_secret and not disable_oauth:
         # Only fail if OAuth is enabled and no secret is set.
-        raise RuntimeError(
-            "SESSION_SECRET (or SESSION_SECRET_KEY) must be set when OAuth is enabled"
-        )
+        raise RuntimeError("SESSION_SECRET (or SESSION_SECRET_KEY) must be set when OAuth is enabled")
     if not session_secret:
-        # If we are here, either OAuth is disabled or we have a secret? Actually, if we have a secret we wouldn't be here.
-        # So we are here only when there's no secret and OAuth is disabled -> use ephemeral.
+        # Reached only when OAuth is disabled and no secret is set: use an
+        # ephemeral per-process secret (sessions do not survive a restart).
         session_secret = secrets.token_urlsafe(32)
 
     # Always add SessionMiddleware, but if OAuth is disabled we use an ephemeral secret (already set above if needed)
@@ -194,7 +191,7 @@ def create_app(bot_manager: BotManager, config_manager: ConfigManager) -> FastAP
             disable_oauth = config_manager.get_env_var("DISABLE_OAUTH", "false").lower() == "true"
         else:
             disable_oauth = os.getenv("DISABLE_OAUTH", "false").lower() == "true"
-        
+
         if disable_oauth:
             # If OAuth is disabled, redirect to dashboard
             return RedirectResponse("/")
@@ -233,13 +230,19 @@ def create_app(bot_manager: BotManager, config_manager: ConfigManager) -> FastAP
             "redirect_uri": redirect_uri,
         }
         headers = {"Content-Type": "application/x-www-form-urlencoded"}
-        token_res = requests.post("https://discord.com/api/oauth2/token", data=data, headers=headers)
+        # Use a thread + explicit timeout: `requests` is synchronous and would
+        # otherwise block the event loop and hang indefinitely against Discord.
+        token_res = await asyncio.to_thread(
+            requests.post, "https://discord.com/api/oauth2/token", data=data, headers=headers, timeout=10
+        )
         token_res.raise_for_status()
         access_token = token_res.json()["access_token"]
 
-        user_res = requests.get(
+        user_res = await asyncio.to_thread(
+            requests.get,
             "https://discord.com/api/users/@me",
             headers={"Authorization": f"Bearer {access_token}"},
+            timeout=10,
         )
         user_res.raise_for_status()
         user = user_res.json()
@@ -271,7 +274,7 @@ def create_app(bot_manager: BotManager, config_manager: ConfigManager) -> FastAP
 
         user = request.session.get("user")
         if not user:
-            return {"error": "Not authenticated"}, 401
+            return JSONResponse(status_code=401, content={"error": "Not authenticated"})
         return user
 
     @app.get("/simple-admin")
@@ -329,17 +332,9 @@ async def run_server(bot_manager: BotManager, config_manager: ConfigManager):
     monitoring_task = asyncio.create_task(bot_manager.monitor_bots())
 
     try:
-        # Register signal handler for graceful shutdown
-        loop = asyncio.get_running_loop()
-        stop_event = asyncio.Event()
-
-        def handle_sigterm():
-            log.info("SIGTERM received, initiating graceful shutdown...")
-            stop_event.set()
-
-        signal.signal(signal.SIGTERM, lambda *args: loop.call_soon_threadsafe(handle_sigterm))
-
-        # Run the server
+        # Run the server. uvicorn.Server.serve() installs its own SIGINT/SIGTERM
+        # handling (via capture_signals()) for graceful shutdown, so no custom
+        # signal registration is needed here.
         host = os.getenv("API_HOST", "0.0.0.0")
         port = int(os.getenv("API_PORT", "8080"))
         config = uvicorn.Config(app, host=host, port=port)

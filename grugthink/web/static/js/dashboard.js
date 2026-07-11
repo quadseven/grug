@@ -161,9 +161,9 @@ class Dashboard {
             const chatFreqCell = `<td id="chat-freq-${bot.bot_id}">Loading...</td>`;
             
             row.innerHTML = `
-                <td>${bot.name}</td>
+                <td>${this.escapeHtml(bot.name)}</td>
                 <td>${statusBadge}</td>
-                <td>${bot.personality || 'Default'}</td>
+                <td>${this.escapeHtml(bot.personality || 'Default')}</td>
                 <td>${serverCount}</td>
                 <td>${uptime}</td>
                 ${chatFreqCell}
@@ -213,21 +213,23 @@ class Dashboard {
 
     getBotActionButtons(bot) {
         const buttons = [];
-        
+        const botId = this.escapeJsString(bot.bot_id);
+        const botName = this.escapeJsString(bot.name);
+
         // Fix status check - use 'status' field instead of 'runtime_status'
         if (bot.status === 'running') {
-            buttons.push(`<button class="btn btn-outline-warning" onclick="dashboard.stopBot('${bot.bot_id}')" title="Stop Bot"><i class="bi bi-stop-fill"></i></button>`);
-            buttons.push(`<button class="btn btn-outline-info" onclick="dashboard.restartBot('${bot.bot_id}')" title="Restart Bot"><i class="bi bi-arrow-clockwise"></i></button>`);
+            buttons.push(`<button class="btn btn-outline-warning" onclick="dashboard.stopBot('${botId}')" title="Stop Bot"><i class="bi bi-stop-fill"></i></button>`);
+            buttons.push(`<button class="btn btn-outline-info" onclick="dashboard.restartBot('${botId}')" title="Restart Bot"><i class="bi bi-arrow-clockwise"></i></button>`);
         } else {
-            buttons.push(`<button class="btn btn-outline-success" onclick="dashboard.startBot('${bot.bot_id}')" title="Start Bot"><i class="bi bi-play-fill"></i></button>`);
+            buttons.push(`<button class="btn btn-outline-success" onclick="dashboard.startBot('${botId}')" title="Start Bot"><i class="bi bi-play-fill"></i></button>`);
         }
-        
-        buttons.push(`<button class="btn btn-outline-primary" onclick="dashboard.editBot('${bot.bot_id}')" title="Edit Bot"><i class="bi bi-pencil"></i></button>`);
-        buttons.push(`<button class="btn btn-outline-secondary" onclick="dashboard.viewBotLogs('${bot.bot_id}')" title="View Logs"><i class="bi bi-journal-text"></i></button>`);
-        buttons.push(`<button class="btn btn-outline-success" onclick="dashboard.openChatSettings('${bot.bot_id}', '${bot.name}')" title="Chat Settings"><i class="bi bi-chat-dots"></i></button>`);
-        buttons.push(`<button class="btn btn-outline-info" onclick="dashboard.openMemoryManagement('${bot.bot_id}', '${bot.name}')" title="Manage Memory"><i class="bi bi-memory"></i></button>`);
-        buttons.push(`<button class="btn btn-outline-danger" onclick="dashboard.deleteBot('${bot.bot_id}')" title="Delete Bot"><i class="bi bi-trash"></i></button>`);
-        
+
+        buttons.push(`<button class="btn btn-outline-primary" onclick="dashboard.editBot('${botId}')" title="Edit Bot"><i class="bi bi-pencil"></i></button>`);
+        buttons.push(`<button class="btn btn-outline-secondary" onclick="dashboard.viewBotLogs('${botId}')" title="View Logs"><i class="bi bi-journal-text"></i></button>`);
+        buttons.push(`<button class="btn btn-outline-success" onclick="dashboard.openChatSettings('${botId}', '${botName}')" title="Chat Settings"><i class="bi bi-chat-dots"></i></button>`);
+        buttons.push(`<button class="btn btn-outline-info" onclick="dashboard.openMemoryManagement('${botId}', '${botName}')" title="Manage Memory"><i class="bi bi-memory"></i></button>`);
+        buttons.push(`<button class="btn btn-outline-danger" onclick="dashboard.deleteBot('${botId}')" title="Delete Bot"><i class="bi bi-trash"></i></button>`);
+
         return buttons.join(' ');
     }
 
@@ -474,10 +476,10 @@ class Dashboard {
                             <p class="card-text">${this.escapeHtml(memory.content)}</p>
                             <small class="text-muted">
                                 Added: ${new Date(memory.timestamp).toLocaleString()}
-                                ${memory.server_name ? `• Server: ${memory.server_name}` : ''}
+                                ${memory.server_name ? `• Server: ${this.escapeHtml(memory.server_name)}` : ''}
                             </small>
                         </div>
-                        <button class="btn btn-outline-danger btn-sm ms-2" onclick="dashboard.deleteMemory('${memory.id}')" title="Delete Memory">
+                        <button class="btn btn-outline-danger btn-sm ms-2" onclick="dashboard.deleteMemory('${this.escapeJsString(memory.id)}')" title="Delete Memory">
                             <i class="bi bi-trash"></i>
                         </button>
                     </div>
@@ -895,16 +897,6 @@ class Dashboard {
         container.scrollTop = 0;
     }
 
-    getLogLevelClass(level) {
-        const classes = {
-            'DEBUG': 'border-secondary',
-            'INFO': 'border-primary',
-            'WARNING': 'border-warning',
-            'ERROR': 'border-danger'
-        };
-        return classes[level.toUpperCase()] || 'border-secondary';
-    }
-
     getLogLevelBadge(level) {
         const badges = {
             'DEBUG': 'bg-secondary',
@@ -1066,10 +1058,10 @@ class Dashboard {
             tokenItem.innerHTML = `
                 <div class="d-flex justify-content-between align-items-center">
                     <div>
-                        <strong>${token.name}</strong>
-                        <div class="text-muted small">ID: ${token.id}</div>
+                        <strong>${this.escapeHtml(token.name)}</strong>
+                        <div class="text-muted small">ID: ${this.escapeHtml(token.id)}</div>
                     </div>
-                    <button class="btn btn-outline-danger btn-sm" onclick="dashboard.deleteToken('${token.id}')">
+                    <button class="btn btn-outline-danger btn-sm" onclick="dashboard.deleteToken('${this.escapeJsString(token.id)}')">
                         <i class="bi bi-trash"></i>
                     </button>
                 </div>
@@ -1465,7 +1457,7 @@ class Dashboard {
             'ERROR': 'border-danger text-danger',
             'CRITICAL': 'border-danger text-danger bg-danger bg-opacity-10'
         };
-        return levelClasses[level] || 'border-secondary text-muted';
+        return levelClasses[String(level).toUpperCase()] || 'border-secondary text-muted';
     }
 
     formatLogExtra(extra) {
@@ -1483,14 +1475,23 @@ class Dashboard {
         return div.innerHTML;
     }
 
+    // Escape a value for safe use inside a single-quoted JS string literal
+    // embedded in an inline onclick="..." HTML attribute.
+    escapeJsString(value) {
+        return this.escapeHtml(String(value)).replace(/'/g, "\\'");
+    }
+
     showAlert(message, type = 'info') {
         const alertContainer = document.createElement('div');
         alertContainer.className = `alert alert-${type} alert-dismissible fade show position-fixed`;
         alertContainer.style.cssText = 'top: 20px; right: 20px; z-index: 9999; max-width: 400px;';
-        alertContainer.innerHTML = `
-            ${message}
-            <button type="button" class="btn-close" data-bs-dismiss="alert"></button>
-        `;
+        const text = document.createElement('span');
+        text.textContent = message;
+        const closeBtn = document.createElement('button');
+        closeBtn.type = 'button';
+        closeBtn.className = 'btn-close';
+        closeBtn.setAttribute('data-bs-dismiss', 'alert');
+        alertContainer.append(text, closeBtn);
         document.body.appendChild(alertContainer);
         
         setTimeout(() => {

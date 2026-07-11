@@ -43,8 +43,8 @@ if (SENTRY_ENABLED && SENTRY_DSN) {
                         }),
                         new Sentry.Replay({
                             // Session replay for debugging
-                            maskAllText: false,
-                            blockAllMedia: false,
+                            maskAllText: true,
+                            blockAllMedia: true,
                         }),
                     ],
 

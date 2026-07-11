@@ -52,14 +52,21 @@ def load_configs(bot_manager, config_file: str = "bot_configs.json"):
                 bot_manager._migrated = True
                 log.info("Migration completed", extra={"migrated_count": len(migration_map), "json_file": config_file})
 
-                # Optionally back up the old JSON file
-                backup_file = config_file + ".migrated.backup"
-                os.rename(config_file, backup_file)
-                log.info("Backed up old JSON config", extra={"backup_file": backup_file})
-
             except Exception as e:
                 log.error("Migration failed, falling back to JSON loading", extra={"error": str(e)})
                 load_configs_from_json(bot_manager, config_file)
+                return
+
+            # Back up the old JSON file. Best-effort and isolated from the migration
+            # try/except above: a rename failure here must not fall through to the
+            # JSON fallback, which would overwrite the already-migrated BotConfig
+            # entries in bot_manager.bots.
+            try:
+                backup_file = config_file + ".migrated.backup"
+                os.rename(config_file, backup_file)
+                log.info("Backed up old JSON config", extra={"backup_file": backup_file})
+            except OSError as e:
+                log.warning("Failed to back up migrated JSON config", extra={"error": str(e), "json_file": config_file})
     else:
         # No ConfigManager, load from JSON (legacy mode)
         load_configs_from_json(bot_manager, config_file)

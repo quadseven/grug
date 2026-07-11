@@ -163,7 +163,7 @@ def test_log_initial_settings(mock_log_info, monkeypatch):
 
 def test_save_personality_to_file(tmp_path, monkeypatch):
     monkeypatch.chdir(tmp_path)
-    from src.grugthink.config_manager import ConfigManager
+    from src.grugthink.config.manager import ConfigManager
 
     manager = ConfigManager(config_file="config.yaml")
     data = {"name": "Test", "description": "Test personality"}

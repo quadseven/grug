@@ -96,14 +96,14 @@ class SimpleDashboard {
                             ${this.escapeHtml(template.description || 'No description available')}
                         </p>
                         <div class="mt-3">
-                            <span class="badge bg-primary">${template.id}</span>
-                            ${template.traits ? template.traits.slice(0, 3).map(trait => 
+                            <span class="badge bg-primary">${this.escapeHtml(template.id)}</span>
+                            ${template.traits ? template.traits.slice(0, 3).map(trait =>
                                 `<span class="badge bg-secondary ms-1">${this.escapeHtml(trait)}</span>`
                             ).join('') : ''}
                         </div>
                     </div>
                     <div class="card-footer bg-transparent">
-                        <button class="btn btn-outline-primary btn-sm" onclick="this.useTemplate('${template.id}')">
+                        <button class="btn btn-outline-primary btn-sm" onclick="simpleDashboard.useTemplate('${this.escapeJsString(template.id)}')">
                             <i class="bi bi-plus-circle"></i> Use Template
                         </button>
                     </div>
@@ -156,7 +156,7 @@ class SimpleDashboard {
             return `
                 <div class="log-entry mb-1">
                     <span class="text-muted small">${timestamp}</span>
-                    <span class="badge bg-${levelClass} ms-2">${log.level}</span>
+                    <span class="badge bg-${levelClass} ms-2">${this.escapeHtml(log.level)}</span>
                     <span class="ms-2">${this.escapeHtml(log.message)}</span>
                 </div>
             `;
@@ -199,23 +199,26 @@ class SimpleDashboard {
             return;
         }
         
-        tbody.innerHTML = bots.map(bot => `
+        tbody.innerHTML = bots.map(bot => {
+            const botId = this.escapeJsString(bot.bot_id);
+            return `
             <tr>
                 <td><strong>${this.escapeHtml(bot.name)}</strong></td>
-                <td><span class="badge bg-${bot.status === 'running' ? 'success' : 'secondary'}">${bot.status}</span></td>
+                <td><span class="badge bg-${bot.status === 'running' ? 'success' : 'secondary'}">${this.escapeHtml(bot.status)}</span></td>
                 <td>${this.escapeHtml(bot.personality || 'Default')}</td>
                 <td>${bot.guild_count || 0}</td>
                 <td>${bot.uptime || 'N/A'}</td>
                 <td>${bot.chat_frequency || 0}%</td>
                 <td>
-                    ${bot.status === 'running' ? 
-                        `<button class="btn btn-outline-warning btn-sm" onclick="simpleDashboard.stopBot('${bot.bot_id}')">Stop</button>` :
-                        `<button class="btn btn-outline-success btn-sm" onclick="simpleDashboard.startBot('${bot.bot_id}')">Start</button>`
+                    ${bot.status === 'running' ?
+                        `<button class="btn btn-outline-warning btn-sm" onclick="simpleDashboard.stopBot('${botId}')">Stop</button>` :
+                        `<button class="btn btn-outline-success btn-sm" onclick="simpleDashboard.startBot('${botId}')">Start</button>`
                     }
-                    <button class="btn btn-outline-danger btn-sm" onclick="simpleDashboard.deleteBot('${bot.bot_id}')">Delete</button>
+                    <button class="btn btn-outline-danger btn-sm" onclick="simpleDashboard.deleteBot('${botId}')">Delete</button>
                 </td>
             </tr>
-        `).join('');
+        `;
+        }).join('');
     }
 
     updateStats(bots) {
@@ -286,6 +289,12 @@ class SimpleDashboard {
         const div = document.createElement('div');
         div.textContent = text;
         return div.innerHTML;
+    }
+
+    // Escape a value for safe use inside a single-quoted JS string literal
+    // embedded in an inline onclick="..." HTML attribute.
+    escapeJsString(value) {
+        return this.escapeHtml(String(value)).replace(/'/g, "\\'");
     }
 }
 

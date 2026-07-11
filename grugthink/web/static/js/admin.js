@@ -28,7 +28,9 @@ class AdminPanel {
     populateForm() {
         // Authentication settings
         this.setFieldValue('disable_oauth', this.settings.DISABLE_OAUTH || 'true');
-        this.setFieldValue('session_secret', this.settings.SESSION_SECRET || '');
+        // SESSION_SECRET is write-only: never populate the field with the current
+        // (possibly redacted) value. Leave it blank; blank on save means "keep unchanged".
+        this.setFieldValue('session_secret', '');
         this.setFieldValue('trusted_user_ids', this.settings.TRUSTED_USER_IDS || '');
         this.setFieldValue('trusted_memory_ids', this.settings.TRUSTED_MEMORY_IDS || '');
 
@@ -75,7 +77,6 @@ class AdminPanel {
             // Collect all form values
             const updates = {
                 DISABLE_OAUTH: document.getElementById('disable_oauth').value,
-                SESSION_SECRET: document.getElementById('session_secret').value,
                 TRUSTED_USER_IDS: document.getElementById('trusted_user_ids').value,
                 TRUSTED_MEMORY_IDS: document.getElementById('trusted_memory_ids').value,
                 LOG_LEVEL: document.getElementById('log_level').value,
@@ -94,6 +95,13 @@ class AdminPanel {
                 ENABLE_CONFIG_RELOAD: document.getElementById('enable_config_reload').checked ? 'True' : 'False',
                 WEBSOCKET_ENABLED: document.getElementById('websocket_enabled').checked ? 'True' : 'False'
             };
+
+            // SESSION_SECRET is write-only: only send it if the admin typed a new
+            // value. A blank field means "leave unchanged" server-side.
+            const sessionSecretValue = document.getElementById('session_secret').value;
+            if (sessionSecretValue) {
+                updates.SESSION_SECRET = sessionSecretValue;
+            }
 
             const response = await fetch('/api/admin/settings', {
                 method: 'PUT',
@@ -128,18 +136,18 @@ class AdminPanel {
                     <h6>System Status</h6>
                     <ul class="list-unstyled">
                         <li><i class="bi bi-circle-fill text-success me-2"></i>OAuth: ${this.settings.DISABLE_OAUTH === 'true' ? 'Disabled (Dev Mode)' : 'Enabled (Prod Mode)'}</li>
-                        <li><i class="bi bi-circle-fill text-info me-2"></i>Log Level: ${this.settings.LOG_LEVEL || 'INFO'}</li>
-                        <li><i class="bi bi-circle-fill text-primary me-2"></i>Environment: ${this.settings.GRUGBOT_VARIANT || 'dev'}</li>
+                        <li><i class="bi bi-circle-fill text-info me-2"></i>Log Level: ${this.escapeHtml(this.settings.LOG_LEVEL || 'INFO')}</li>
+                        <li><i class="bi bi-circle-fill text-primary me-2"></i>Environment: ${this.escapeHtml(this.settings.GRUGBOT_VARIANT || 'dev')}</li>
                         <li><i class="bi bi-circle-fill text-warning me-2"></i>ML Features: ${this.settings.LOAD_EMBEDDER === 'True' ? 'Enabled' : 'Disabled'}</li>
                     </ul>
                 </div>
                 <div class="col-md-6">
                     <h6>Health Monitoring</h6>
                     <ul class="list-unstyled">
-                        <li><i class="bi bi-heart-pulse me-2"></i>Check Interval: ${this.settings.HEALTH_CHECK_INTERVAL || '30'}s</li>
-                        <li><i class="bi bi-clock me-2"></i>Heartbeat Timeout: ${this.settings.BOT_HEARTBEAT_TIMEOUT || '300'}s</li>
-                        <li><i class="bi bi-arrow-clockwise me-2"></i>Max Failures: ${this.settings.BOT_MAX_CONSECUTIVE_FAILURES || '5'}</li>
-                        <li><i class="bi bi-speedometer2 me-2"></i>Latency Threshold: ${this.settings.BOT_HIGH_LATENCY_THRESHOLD || '5.0'}s</li>
+                        <li><i class="bi bi-heart-pulse me-2"></i>Check Interval: ${this.escapeHtml(this.settings.HEALTH_CHECK_INTERVAL || '30')}s</li>
+                        <li><i class="bi bi-clock me-2"></i>Heartbeat Timeout: ${this.escapeHtml(this.settings.BOT_HEARTBEAT_TIMEOUT || '300')}s</li>
+                        <li><i class="bi bi-arrow-clockwise me-2"></i>Max Failures: ${this.escapeHtml(this.settings.BOT_MAX_CONSECUTIVE_FAILURES || '5')}</li>
+                        <li><i class="bi bi-speedometer2 me-2"></i>Latency Threshold: ${this.escapeHtml(this.settings.BOT_HIGH_LATENCY_THRESHOLD || '5.0')}s</li>
                     </ul>
                 </div>
             </div>
@@ -171,9 +179,8 @@ class AdminPanel {
     }
 
     getCurrentFormValues() {
-        return {
+        const values = {
             DISABLE_OAUTH: document.getElementById('disable_oauth').value,
-            SESSION_SECRET: document.getElementById('session_secret').value,
             TRUSTED_USER_IDS: document.getElementById('trusted_user_ids').value,
             TRUSTED_MEMORY_IDS: document.getElementById('trusted_memory_ids').value,
             LOG_LEVEL: document.getElementById('log_level').value,
@@ -192,16 +199,34 @@ class AdminPanel {
             ENABLE_CONFIG_RELOAD: document.getElementById('enable_config_reload').checked ? 'True' : 'False',
             WEBSOCKET_ENABLED: document.getElementById('websocket_enabled').checked ? 'True' : 'False'
         };
+
+        // SESSION_SECRET is write-only: only factor it into change detection
+        // when the admin has typed a new value.
+        const sessionSecretValue = document.getElementById('session_secret').value;
+        if (sessionSecretValue) {
+            values.SESSION_SECRET = sessionSecretValue;
+        }
+
+        return values;
+    }
+
+    escapeHtml(value) {
+        const div = document.createElement('div');
+        div.textContent = String(value);
+        return div.innerHTML;
     }
 
     showAlert(message, type = 'info') {
         const alertContainer = document.createElement('div');
         alertContainer.className = `alert alert-${type} alert-dismissible fade show position-fixed`;
         alertContainer.style.cssText = 'top: 20px; right: 20px; z-index: 9999; max-width: 400px;';
-        alertContainer.innerHTML = `
-            ${message}
-            <button type="button" class="btn-close" data-bs-dismiss="alert"></button>
-        `;
+        const text = document.createElement('span');
+        text.textContent = message;
+        const closeBtn = document.createElement('button');
+        closeBtn.type = 'button';
+        closeBtn.className = 'btn-close';
+        closeBtn.setAttribute('data-bs-dismiss', 'alert');
+        alertContainer.append(text, closeBtn);
         document.body.appendChild(alertContainer);
         
         setTimeout(() => {

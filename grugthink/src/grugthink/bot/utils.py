@@ -46,7 +46,7 @@ def clean_statement(text: str) -> str:
     # path/query delimiters (/ : ? # = ; ~) that range happened to cover, so full
     # URLs are still stripped, not just up to the domain.
     text = re.sub(
-        r"http[s]?://(?:[a-zA-Z0-9]|[$_@.&+/:?#=;~-]|[!*\\(\\),]|(?:%[0-9a-fA-F][0-9a-fA-F]))+",
+        r"http[s]?://(?:[a-zA-Z0-9]|[$_@.&+/:?#=;~-]|[!*(),]|(?:%[0-9a-fA-F][0-9a-fA-F]))+",
         "",
         text,
     )

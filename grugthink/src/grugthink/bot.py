@@ -461,7 +461,7 @@ class GrugThinkBot(commands.Cog):
         content_lower = content.lower()
         bot_name_lower = bot_name.lower()
 
-        self.log.info(
+        self.log.debug(
             "Checking bot mention",
             extra={
                 "bot_id": self.get_bot_id(),
@@ -487,7 +487,7 @@ class GrugThinkBot(commands.Cog):
             self.log.info("Bot @mentioned", extra={"bot_id": self.get_bot_id(), "mention_type": "nickname"})
             return True
 
-        self.log.info(
+        self.log.debug(
             "Bot not mentioned",
             extra={"bot_id": self.get_bot_id(), "content_lower": content_lower, "bot_name_lower": bot_name_lower},
         )
@@ -511,7 +511,7 @@ class GrugThinkBot(commands.Cog):
         for bot_name in bot_names:
             # Check primary name
             if re.search(rf"\b{re.escape(bot_name.lower())}\b", content_lower):
-                self.log.info(
+                self.log.debug(
                     "Detected bot mention in content",
                     extra={"bot_id": self.get_bot_id(), "mentioned_bot": bot_name, "content": content},
                 )
@@ -522,7 +522,7 @@ class GrugThinkBot(commands.Cog):
                 if bot_name == main_name:
                     for variation in variations:
                         if re.search(rf"\b{re.escape(variation.lower())}\b", content_lower):
-                            self.log.info(
+                            self.log.debug(
                                 "Detected bot mention via variation",
                                 extra={
                                     "bot_id": self.get_bot_id(),
@@ -636,7 +636,7 @@ class GrugThinkBot(commands.Cog):
             )
 
         # Clean the message content for verification
-        self.log.info(
+        self.log.debug(
             "Cleaning message content",
             extra={"bot_id": bot_id, "original_content": message.content, "content_length": len(message.content)},
         )
@@ -644,7 +644,7 @@ class GrugThinkBot(commands.Cog):
 
         # Remove bot name mentions to get the actual statement
         bot_name = personality.chosen_name or personality.name
-        self.log.info(
+        self.log.debug(
             "Removing bot name mentions",
             extra={"bot_id": bot_id, "bot_name": bot_name, "content_before": clean_content},
         )
@@ -658,7 +658,7 @@ class GrugThinkBot(commands.Cog):
         # Clean up extra whitespace
         clean_content = re.sub(r"\s+", " ", clean_content).strip()
 
-        self.log.info(
+        self.log.debug(
             "Content cleaning complete",
             extra={"bot_id": bot_id, "cleaned_content": clean_content, "cleaned_length": len(clean_content)},
         )
@@ -740,7 +740,7 @@ class GrugThinkBot(commands.Cog):
             server_db = self.get_server_db(message.guild.id if message.guild else "dm")
 
             # Run verification in executor to avoid blocking
-            self.log.info(
+            self.log.debug(
                 "About to call query_model",
                 extra={
                     "bot_id": bot_id,
@@ -755,7 +755,7 @@ class GrugThinkBot(commands.Cog):
                 None, query_model, clean_content, server_db, server_id, self.personality_engine, self.get_bot_id()
             )
 
-            self.log.info(
+            self.log.debug(
                 "query_model completed",
                 extra={
                     "bot_id": bot_id,
@@ -856,7 +856,13 @@ class GrugThinkBot(commands.Cog):
             )
             # Use personality for error message
             error_msg = self.personality_engine.get_error_message(server_id)
-            await thinking_message.delete()
+            try:
+                await thinking_message.delete()
+            except Exception as delete_error:
+                self.log.warning(
+                    "Failed to delete thinking message during error handling",
+                    extra={"bot_id": bot_id, "error": str(delete_error)},
+                )
             await message.channel.send(f"💥 {error_msg}")
 
     async def handle_natural_chat_engagement(self, message, server_id, personality, bot_name):

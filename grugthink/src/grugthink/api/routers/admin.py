@@ -21,7 +21,7 @@ async def get_admin_settings(config_manager: ConfigManager = Depends(get_config_
     # Provide a stable shape with sensible defaults
     defaults = {
         "DISABLE_OAUTH": env_vars.get("DISABLE_OAUTH", "true"),
-        "SESSION_SECRET": env_vars.get("SESSION_SECRET", ""),
+        "SESSION_SECRET": "***REDACTED***" if env_vars.get("SESSION_SECRET") else "",
         "TRUSTED_USER_IDS": env_vars.get("TRUSTED_USER_IDS", ""),
         "TRUSTED_MEMORY_IDS": env_vars.get("TRUSTED_MEMORY_IDS", ""),
         "LOG_LEVEL": env_vars.get("LOG_LEVEL", os.getenv("LOG_LEVEL", "INFO")),

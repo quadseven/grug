@@ -30,11 +30,11 @@ class BotConfig:
     force_personality: Optional[str] = None  # Deprecated, use personality instead
     load_embedder: bool = False  # Default to False to avoid memory issues in containers
     log_level: str = "DEBUG"
-    data_dir: str = None  # Will be set from environment in __post_init__
+    data_dir: Optional[str] = None  # Will be set from environment in __post_init__
     trusted_user_ids: Optional[str] = None
     enabled: bool = True  # Whether this bot should be enabled (configuration state)
     auto_start: Optional[bool] = None  # Whether to auto-start this bot on container startup
-    created_at: float = None
+    created_at: Optional[float] = None
 
     # Override settings (optional)
     override_gemini_key: Optional[str] = None
@@ -63,11 +63,11 @@ class BotInstance:
     bot_manager: Optional[Any] = None  # Reference to parent bot manager for cross-bot access
     thread: Optional[threading.Thread] = None
     task: Optional[asyncio.Task] = None
-    last_heartbeat: float = None
+    last_heartbeat: Optional[float] = None
     forced_personality: Optional[str] = None
     # Runtime status (memory only, not persisted)
     runtime_status: str = "stopped"  # stopped, starting, running, stopping, error
     # Health monitoring
     consecutive_failures: int = 0
-    last_restart_attempt: float = None
+    last_restart_attempt: Optional[float] = None
     restart_count: int = 0

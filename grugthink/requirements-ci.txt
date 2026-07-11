@@ -1,10 +1,10 @@
 # Lightweight dependencies for CI testing
-discord.py
-python-dotenv
-requests
-numpy<2
-google-generativeai
-google-api-python-client
+discord.py>=2.3.0
+python-dotenv>=1.0.0
+requests>=2.31.0
+numpy>=1.24,<2
+google-generativeai>=0.3.0
+google-api-python-client>=2.0.0
 setuptools>=78.1.1
 
 # Multi-bot container dependencies (lightweight)

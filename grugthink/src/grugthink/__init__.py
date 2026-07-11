@@ -5,7 +5,8 @@ A sophisticated multi-bot container system with personality evolution,
 web dashboard management, and real-time monitoring capabilities.
 """
 
-__version__ = "3.4.0"
+from .__version__ import __version__ as __version__
+
 __author__ = "GrugThink Contributors"
 __description__ = "Adaptable Discord Personality Engine with Multi-Bot Container Support"
 
@@ -16,15 +17,6 @@ from .config.templates import ConfigTemplate
 from .grug_db import GrugDB
 from .grug_structured_logger import get_logger
 from .personality_engine import PersonalityEngine, PersonalityState, PersonalityTemplate
-
-# Optional API server (requires uvicorn/fastapi)
-try:
-    from .api_server import APIServer
-
-    _API_SERVER_AVAILABLE = True
-except ImportError:
-    APIServer = None
-    _API_SERVER_AVAILABLE = False
 
 __all__ = [
     "PersonalityEngine",
@@ -39,10 +31,6 @@ __all__ = [
     "ConfigTemplate",
     "GrugThinkBot",
 ]
-
-# Only export APIServer if available
-if _API_SERVER_AVAILABLE:
-    __all__.append("APIServer")
 
 
 def __getattr__(name: str):

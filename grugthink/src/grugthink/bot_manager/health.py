@@ -74,14 +74,14 @@ async def check_bot_health(bot_manager, bot_id: str, instance):
             latency = instance.client.latency
             if latency > high_latency_threshold:
                 health_issues.append(f"High latency: {latency:.2f}s (threshold: {high_latency_threshold}s)")
-            else:
-                # Bot is healthy - update heartbeat and reset failure count
-                instance.last_heartbeat = current_time
-                instance.consecutive_failures = 0
 
         # If health issues found, attempt restart
         if health_issues:
             await attempt_bot_restart(bot_manager, bot_id, instance, f"Health issues: {', '.join(health_issues)}")
+        else:
+            # Bot is healthy - update heartbeat and reset failure count
+            instance.last_heartbeat = current_time
+            instance.consecutive_failures = 0
 
 
 async def attempt_bot_restart(bot_manager, bot_id: str, instance, reason: str):

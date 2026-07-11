@@ -13,6 +13,7 @@ Benefits:
 """
 
 from typing import List, Union
+from urllib.parse import urlparse
 
 import numpy as np
 import requests
@@ -20,6 +21,17 @@ import requests
 from ..grug_structured_logger import get_logger
 
 log = get_logger(__name__)
+
+_ALLOWED_SCHEMES = ("http", "https")
+
+
+def _is_valid_ollama_url(url: str) -> bool:
+    """Minimal scheme/host check to guard against SSRF via unvalidated URLs."""
+    try:
+        parsed = urlparse(url)
+    except ValueError:
+        return False
+    return parsed.scheme in _ALLOWED_SCHEMES and bool(parsed.hostname)
 
 
 class OllamaEmbedder:
@@ -41,6 +53,9 @@ class OllamaEmbedder:
             dimension: Embedding dimension (768 for nomic-embed-text, 384 for all-minilm)
             timeout: Request timeout in seconds
         """
+        if not _is_valid_ollama_url(ollama_url):
+            raise ValueError(f"Invalid Ollama URL: {ollama_url!r}")
+
         self.ollama_url = ollama_url.rstrip("/")
         self.model = model
         self.dimension = dimension

@@ -31,3 +31,10 @@ ENV PIP_DISABLE_PIP_VERSION_CHECK=1
 # Persisted model cache locations (containers can override)
 ENV HF_HOME=/data/hf
 ENV TRANSFORMERS_CACHE=/data/hf
+
+# Non-root, matching the app image's hardening. HEALTHCHECK is intentionally
+# deferred to the app/K8s layer.
+RUN mkdir -p /data/hf \
+    && useradd -u 10001 -m grug \
+    && chown -R grug:grug /app /data
+USER 10001

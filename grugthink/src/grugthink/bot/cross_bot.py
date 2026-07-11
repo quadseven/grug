@@ -58,7 +58,7 @@ def store_bot_response_for_cross_reference(response: str, personality_name: str,
 
         log.info(
             "Stored bot response for cross-reference",
-            extra={"bot_name": personality_name, "topic": topic, "response": response[:100]},
+            extra={"bot_name": personality_name, "topic": topic},
         )
 
 
@@ -161,6 +161,7 @@ def get_cross_bot_memories(statement: str, server_id: str, server_manager, curre
                 if os.path.isdir(bot_data_path) and bot_dir != current_bot_id:
                     facts_db_path = os.path.join(bot_data_path, "facts.db")
                     if os.path.exists(facts_db_path):
+                        temp_manager = None
                         try:
                             # Create a temporary server manager to access other bot's memories
                             temp_manager = GrugServerManager(facts_db_path)
@@ -191,7 +192,7 @@ def get_cross_bot_memories(statement: str, server_id: str, server_manager, curre
                                 if matched_personality:
                                     style = matched_personality.get("response_style", "")
                                     traits = matched_personality.get("personality_traits", {})
-                                    bot_name = matched_personality.get("name", bot_dir)
+                                    bot_name = matched_personality.get("bot_name", bot_dir)
 
                                     if style == "caveman":
                                         bot_info = f" ({bot_name} - caveman who fights sabertooths and hunts mammoth)"
@@ -217,6 +218,9 @@ def get_cross_bot_memories(statement: str, server_id: str, server_manager, curre
                             log.debug(
                                 "Could not access cross-bot memories", extra={"bot_dir": bot_dir, "error": str(e)}
                             )
+                        finally:
+                            if temp_manager is not None:
+                                temp_manager.close_all()
 
         return cross_bot_context.strip()
     except Exception as e:

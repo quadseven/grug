@@ -96,6 +96,7 @@ def save_config(config_file: str, config_data: Dict[str, Any]):
 
     except Exception as e:
         log.error("Failed to save configuration", extra={"error": str(e)})
+        raise
 
 
 def create_default_config(config_file: str, templates: Dict) -> Dict[str, Any]:
@@ -134,7 +135,7 @@ def create_default_config(config_file: str, templates: Dict) -> Dict[str, Any]:
 
     except Exception as e:
         log.error("Failed to create default configuration", extra={"error": str(e)})
-        return default_config
+        raise
 
 
 def reload_config(config_manager, old_config: Dict[str, Any], old_env: Dict[str, str]):
@@ -207,14 +208,21 @@ def import_config(config_file: str, filename: str, config_manager) -> Dict[str, 
                 imported_config = json.load(f)
 
         with config_manager._lock:
+            old_config = config_manager.config_data.copy()
+            old_env = config_manager.env_vars.copy()
+
+        # Persist before committing in-memory state, so a failed write doesn't
+        # leave config_manager out of sync with what's on disk.
+        save_config(config_file, imported_config)
+
+        with config_manager._lock:
             config_manager.config_data = imported_config
             config_manager.env_vars = imported_config.get("environment", {})
-            save_config(config_file, imported_config)
 
         log.info("Configuration imported", extra={"filename": filename})
 
-        # Notify callbacks
-        reload_config(config_manager, {}, {})
+        # Notify callbacks with the actual pre-import state
+        reload_config(config_manager, old_config, old_env)
 
         return imported_config
 

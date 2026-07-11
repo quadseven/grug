@@ -32,7 +32,9 @@ if _WATCHDOG_AVAILABLE:
             self.config_manager = config_manager
 
         def on_modified(self, event):
-            if not event.is_directory and event.src_path == self.config_manager.config_file:
+            if not event.is_directory and os.path.abspath(event.src_path) == os.path.abspath(
+                self.config_manager.config_file
+            ):
                 self.config_manager._reload_config()
 else:
 

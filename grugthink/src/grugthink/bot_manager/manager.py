@@ -93,12 +93,11 @@ class BotManager:
         instance = self.bots[bot_id]
         config = instance.config
 
-        # Update configuration
-        for key, value in kwargs.items():
-            if hasattr(config, key):
-                setattr(config, key, value)
-
         with self._lock:
+            # Update configuration
+            for key, value in kwargs.items():
+                if hasattr(config, key):
+                    setattr(config, key, value)
             save_configs(self)
 
         log.info("Updated bot configuration", extra={"bot_id": bot_id, "updated_fields": list(kwargs.keys())})

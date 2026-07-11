@@ -105,6 +105,8 @@ async def get_bot_memories(
                 "servers": list(server_manager.server_dbs.keys()) if hasattr(server_manager, "server_dbs") else [],
             }
 
+    except HTTPException:
+        raise
     except Exception as e:
         log.error("Failed to get bot memories", extra={"bot_id": bot_id, "error": str(e)})
         raise HTTPException(status_code=500, detail=f"Failed to get memories: {str(e)}")
@@ -148,6 +150,8 @@ async def add_bot_memory(bot_id: str, memory: Dict[str, str], bot_manager: BotMa
         else:
             return {"message": "Memory already exists", "content": content}
 
+    except HTTPException:
+        raise
     except Exception as e:
         log.error("Failed to add bot memory", extra={"bot_id": bot_id, "error": str(e)})
         raise HTTPException(status_code=500, detail=f"Failed to add memory: {str(e)}")
@@ -187,6 +191,8 @@ async def delete_bot_memory(bot_id: str, memory: Dict[str, str], bot_manager: Bo
         else:
             raise HTTPException(status_code=404, detail="Memory not found")
 
+    except HTTPException:
+        raise
     except Exception as e:
         log.error("Failed to delete bot memory", extra={"bot_id": bot_id, "error": str(e)})
         raise HTTPException(status_code=500, detail=f"Failed to delete memory: {str(e)}")

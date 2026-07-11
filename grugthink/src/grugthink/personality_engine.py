@@ -78,8 +78,6 @@ class PersonalityEngine:
         self._init_db()
         self._load_all_personalities()
 
-        # Debug logging
-        print(f"🔍 PersonalityEngine INIT: db_path={db_path}, forced_personality={forced_personality}")
         log.info(
             "PersonalityEngine initialized",
             extra={
@@ -331,10 +329,6 @@ based on your experiences in this specific Discord server.""",
                 self._create_new_personality(server_id)
 
             final_personality = self.personalities[server_id]
-            print(
-                f"🔍 RETURNING PERSONALITY: name={final_personality.name}, "
-                f"style={final_personality.response_style}, forced={self.forced_personality}"
-            )
             log.info(
                 "Returning personality",
                 extra={

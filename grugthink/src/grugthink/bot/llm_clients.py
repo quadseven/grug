@@ -171,7 +171,12 @@ def query_gemini_api(
 
         genai.configure(api_key=config.GEMINI_API_KEY)
         model = genai.GenerativeModel(model_name=config.GEMINI_MODEL)
-        resp = model.generate_content(prompt_text, stream=False, generation_config={"temperature": 0.3, "top_p": 0.5})
+        resp = model.generate_content(
+            prompt_text,
+            stream=False,
+            generation_config={"temperature": 0.3, "top_p": 0.5},
+            request_options={"timeout": 30},
+        )
 
         log.info(
             "Gemini API response received",

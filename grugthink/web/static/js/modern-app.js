@@ -175,32 +175,6 @@ class GrugThinkApp {
         this.initializePage(page);
     }
     
-    initializePage(page) {
-        switch (page) {
-            case 'dashboard':
-                this.refreshDashboard();
-                break;
-            case 'bots':
-                this.loadBotInstances();
-                break;
-            case 'templates':
-                this.loadBotTemplates();
-                break;
-            case 'tokens':
-                console.log('Discord Tokens page initialized');
-                break;
-            case 'settings':
-                console.log('Settings page initialized');
-                break;
-            case 'analytics':
-                console.log('Analytics page initialized');
-                break;
-            case 'logs':
-                console.log('System Logs page initialized');
-                break;
-        }
-    }
-    
     // ==========================================================================
     // SIDEBAR & MOBILE NAVIGATION
     // ==========================================================================
@@ -636,8 +610,8 @@ class GrugThinkApp {
             <div class="flex items-start gap-3">
                 <i data-lucide="${this.getToastIcon(type)}" class="w-5 h-5 mt-0.5 animate-bounce"></i>
                 <div class="flex-1">
-                    <h4 class="font-medium text-sm">${title}</h4>
-                    <p class="text-xs opacity-80">${message}</p>
+                    <h4 class="font-medium text-sm">${this.escapeHtml(title)}</h4>
+                    <p class="text-xs opacity-80">${this.escapeHtml(message)}</p>
                 </div>
                 <button onclick="app.removeToast('${toastId}')" class="opacity-60 hover:opacity-100 transition-opacity">
                     <i data-lucide="x" class="w-4 h-4"></i>
@@ -830,10 +804,10 @@ class GrugThinkApp {
                     <div class="border-b border-gray-700 pb-2 mb-2">
                         <div class="flex items-center gap-2">
                             <span class="text-xs text-gray-500">${timestamp}</span>
-                            <span class="text-xs ${levelClass} font-bold uppercase">${log.level}</span>
+                            <span class="text-xs ${levelClass} font-bold uppercase">${this.escapeHtml(log.level)}</span>
                         </div>
-                        <div class="text-sm text-gray-300 mt-1">${log.message}</div>
-                        ${log.logger ? `<div class="text-xs text-gray-600 mt-1">${log.logger}</div>` : ''}
+                        <div class="text-sm text-gray-300 mt-1">${this.escapeHtml(log.message)}</div>
+                        ${log.logger ? `<div class="text-xs text-gray-600 mt-1">${this.escapeHtml(log.logger)}</div>` : ''}
                     </div>
                 `;
             }).join('');
@@ -1154,7 +1128,7 @@ class GrugThinkApp {
                             <h3 class="font-semibold text-primary">${this.escapeHtml(template.name)}</h3>
                             <p class="text-xs text-muted">${template.usage_count} instances created</p>
                         </div>
-                        <span class="badge badge-primary">${template.personality}</span>
+                        <span class="badge badge-primary">${this.escapeHtml(template.personality)}</span>
                     </div>
                     <p class="text-sm text-secondary">${this.escapeHtml(template.description)}</p>
                 </div>
@@ -1441,7 +1415,7 @@ class GrugThinkApp {
 
             // Populate dropdown with Ollama models
             modelSelect.innerHTML = models.map(m =>
-                `<option value="${m}">${m}</option>`
+                `<option value="${this.escapeHtml(m)}">${this.escapeHtml(m)}</option>`
             ).join('');
 
         } catch (error) {

@@ -4,6 +4,7 @@ Manages Grug's long-term memory using a relational database for facts
 and a vector index for semantic search.
 """
 
+import contextlib
 import logging
 import os
 import sqlite3
@@ -70,6 +71,20 @@ def _intern_string(s):
     return s
 
 
+def _get_model_cache_dir():
+    """Get the directory where sentence-transformer models should be cached."""
+    # Use standard cache directories based on the environment
+    if os.environ.get("XDG_CACHE_HOME"):
+        cache_root = os.environ["XDG_CACHE_HOME"]
+    elif os.environ.get("HOME"):
+        cache_root = os.path.join(os.environ["HOME"], ".cache")
+    else:
+        # Fallback to current directory/.cache for environments without HOME
+        cache_root = os.path.join(os.getcwd(), ".cache")
+
+    return os.path.join(cache_root, "grugthink", "sentence-transformers")
+
+
 def download_model(model_name="all-MiniLM-L6-v2"):
     """Pre-download a SentenceTransformer model for offline use."""
     SentenceTransformer = _get_sentence_transformer()
@@ -78,15 +93,7 @@ def download_model(model_name="all-MiniLM-L6-v2"):
         return False
 
     try:
-        # Determine cache directory
-        if os.environ.get("XDG_CACHE_HOME"):
-            cache_root = os.environ["XDG_CACHE_HOME"]
-        elif os.environ.get("HOME"):
-            cache_root = os.path.join(os.environ["HOME"], ".cache")
-        else:
-            cache_root = os.path.join(os.getcwd(), ".cache")
-
-        cache_dir = os.path.join(cache_root, "grugthink", "sentence-transformers")
+        cache_dir = _get_model_cache_dir()
         model_path = os.path.join(cache_dir, model_name)
 
         if os.path.exists(model_path):
@@ -120,34 +127,8 @@ class GrugDB:
         self.index = None
         self.lock = threading.Lock()
 
-        # Connection pool for better performance
-        self._connection_pool = []
-        self._pool_lock = threading.Lock()
-        self._max_pool_size = 5
-
-        # Prepared statements cache
-        self._prepared_statements = {}
-
         self._init_db()
         self._load_index()
-
-    def _get_connection(self):
-        """Get a database connection from the pool."""
-        with self._pool_lock:
-            if self._connection_pool:
-                return self._connection_pool.pop()
-            else:
-                conn = sqlite3.connect(self.db_path, timeout=30.0)
-                conn.row_factory = sqlite3.Row
-                return conn
-
-    def _return_connection(self, conn):
-        """Return a database connection to the pool."""
-        with self._pool_lock:
-            if len(self._connection_pool) < self._max_pool_size:
-                self._connection_pool.append(conn)
-            else:
-                conn.close()
 
     def _ensure_embedder_loaded(self):
         if not self.load_embedder:
@@ -216,10 +197,11 @@ class GrugDB:
                                 self.dimension = self.embedder.get_sentence_embedding_dimension()
                             else:
                                 log.warning("SentenceTransformer not available, semantic search will be disabled.")
-                        else:
-                            # Try to load from cache directory first, download if needed
-                            cache_dir = self._get_model_cache_dir()
-                            local_model_path = os.path.join(cache_dir, self.model_name)
+                            return
+
+                        # Try to load from cache directory first, download if needed
+                        cache_dir = self._get_model_cache_dir()
+                        local_model_path = os.path.join(cache_dir, self.model_name)
 
                         try:
                             # Try loading from cache first
@@ -245,16 +227,7 @@ class GrugDB:
 
     def _get_model_cache_dir(self):
         """Get the directory where models should be cached."""
-        # Use standard cache directories based on the environment
-        if os.environ.get("XDG_CACHE_HOME"):
-            cache_root = os.environ["XDG_CACHE_HOME"]
-        elif os.environ.get("HOME"):
-            cache_root = os.path.join(os.environ["HOME"], ".cache")
-        else:
-            # Fallback to current directory/.cache for environments without HOME
-            cache_root = os.path.join(os.getcwd(), ".cache")
-
-        return os.path.join(cache_root, "grugthink", "sentence-transformers")
+        return _get_model_cache_dir()
 
     def _init_db(self):
         """Initialize SQLite database and create facts table."""
@@ -428,9 +401,8 @@ class GrugDB:
                 results = []
                 cursor = self.conn.cursor()
                 for i in indices[0]:
-                    # FAISS indices are 0-based, SQLite IDs are 1-based
-                    # This assumes a direct mapping, which is true if we only add.
-                    # For a robust system, we'd use faiss.IndexIDMap
+                    # The index is a faiss.IndexIDMap built via add_with_ids(), so
+                    # returned indices are already the real SQLite fact ids.
                     cursor.execute("SELECT content FROM facts WHERE id=? AND server_id=?", (int(i), self.server_id))
                     row = cursor.fetchone()
                     if row:
@@ -463,17 +435,19 @@ class GrugDB:
                 cursor.execute("DELETE FROM facts WHERE server_id = ? AND content = ?", (self.server_id, fact_content))
                 deleted_count = cursor.rowcount
                 self.conn.commit()
-
-                if deleted_count > 0:
-                    log.info("Deleted fact", extra={"fact": fact_content, "count": deleted_count})
-                    return True
-                else:
-                    log.warning("Fact not found for deletion", extra={"fact": fact_content})
-                    return False
-
             except Exception as e:
                 log.error("Error deleting fact", extra={"error": str(e), "fact": fact_content})
                 return False
+
+        if deleted_count > 0:
+            log.info("Deleted fact", extra={"fact": fact_content, "count": deleted_count})
+            # Keep the FAISS index in sync with SQLite after a deletion (lock
+            # released above since rebuild_index() acquires it itself).
+            self.rebuild_index()
+            return True
+        else:
+            log.warning("Fact not found for deletion", extra={"fact": fact_content})
+            return False
 
     def save_index(self):
         """Save the FAISS index to disk."""
@@ -574,22 +548,22 @@ class GrugServerManager:
         with self.lock:
             try:
                 # Find facts without server_id (old format)
-                cursor = sqlite3.connect(self.base_db_path).cursor()
-                cursor.execute("SELECT id, content FROM facts WHERE server_id IS NULL OR server_id = ''")
-                old_facts = cursor.fetchall()
+                with contextlib.closing(sqlite3.connect(self.base_db_path)) as migration_conn:
+                    cursor = migration_conn.cursor()
+                    cursor.execute("SELECT id, content FROM facts WHERE server_id IS NULL OR server_id = ''")
+                    old_facts = cursor.fetchall()
 
-                if old_facts:
-                    log.info(f"Migrating {len(old_facts)} global facts to server {target_server_id}")
-                    # Update them to belong to the target server
-                    cursor.execute(
-                        "UPDATE facts SET server_id = ? WHERE server_id IS NULL OR server_id = ''", (target_server_id,)
-                    )
-                    cursor.connection.commit()
-                    log.info("Migration completed successfully")
-                else:
-                    log.info("No global facts found to migrate")
-
-                cursor.connection.close()
+                    if old_facts:
+                        log.info(f"Migrating {len(old_facts)} global facts to server {target_server_id}")
+                        # Update them to belong to the target server
+                        cursor.execute(
+                            "UPDATE facts SET server_id = ? WHERE server_id IS NULL OR server_id = ''",
+                            (target_server_id,),
+                        )
+                        migration_conn.commit()
+                        log.info("Migration completed successfully")
+                    else:
+                        log.info("No global facts found to migrate")
             except Exception as e:
                 log.error("Error migrating global facts", extra={"error": str(e)})
 

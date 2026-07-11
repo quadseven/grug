@@ -34,8 +34,9 @@ if SENTRY_DSN:
             # Set profiles_sample_rate to 1.0 to profile 100% of sampled transactions.
             # Adjust this value in production to reduce volume
             profiles_sample_rate=float(os.getenv("SENTRY_PROFILES_SAMPLE_RATE", "0.1")),
-            # Add request headers and user data for better error context
-            send_default_pii=True,
+            # Request headers and user data are PII-sensitive - keep this
+            # opt-in only via explicit env var, never on by default.
+            send_default_pii=os.getenv("SENTRY_SEND_DEFAULT_PII", "false").lower() == "true",
             # Set environment tag
             environment=os.getenv("GRUGBOT_VARIANT", "production"),
             # Enable integrations

@@ -1,14 +1,12 @@
 #!/usr/bin/env python3
 """
 Download script for GrugThink embedding models.
-This can be run separately to pre-download models for offline use.
+Run separately via `python -m grugthink.download_models` to pre-download
+models for offline use (relative imports below require package context).
 """
 
 import os
 import sys
-
-# Add current directory to path for imports
-sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
 from .grug_db import download_model
 from .grug_structured_logger import get_logger

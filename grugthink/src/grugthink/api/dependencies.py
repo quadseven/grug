@@ -1,6 +1,6 @@
 """FastAPI dependency injection functions."""
 
-from typing import Any, Dict
+from typing import Any, Dict, List
 
 from fastapi import Depends, HTTPException, Request
 
@@ -38,6 +38,12 @@ def get_config_manager() -> ConfigManager:
     return _config_manager
 
 
+def _parse_id_list(config_manager: ConfigManager, key: str) -> List[str]:
+    """Read a comma-separated ID list from config/env and normalize it."""
+    raw = config_manager.get_env_var(key, "")
+    return [item.strip() for item in raw.split(",") if item.strip()]
+
+
 def get_current_user(request: Request, config_manager: ConfigManager = Depends(get_config_manager)) -> Dict[str, Any]:
     """Get current authenticated user from session."""
     # Check if OAuth is disabled
@@ -65,8 +71,7 @@ def admin_required(
         return user
 
     # Get trusted users from config manager
-    trusted_str = config_manager.get_env_var("TRUSTED_USER_IDS", "")
-    trusted = [t.strip() for t in trusted_str.split(",") if t.strip()]
+    trusted = _parse_id_list(config_manager, "TRUSTED_USER_IDS")
 
     if user["id"] not in trusted:
         raise HTTPException(status_code=403, detail="Forbidden")
@@ -84,16 +89,14 @@ def memory_manager_required(
         return user
 
     # Get trusted admin users (they have full access)
-    admin_str = config_manager.get_env_var("TRUSTED_USER_IDS", "")
-    admin_users = [t.strip() for t in admin_str.split(",") if t.strip()]
+    admin_users = _parse_id_list(config_manager, "TRUSTED_USER_IDS")
 
     # Check if user is admin (full access)
     if user["id"] in admin_users:
         return user
 
     # Get memory management users
-    memory_str = config_manager.get_env_var("TRUSTED_MEMORY_IDS", "")
-    memory_users = [t.strip() for t in memory_str.split(",") if t.strip()]
+    memory_users = _parse_id_list(config_manager, "TRUSTED_MEMORY_IDS")
 
     # Check if user has memory management access
     if user["id"] not in memory_users:

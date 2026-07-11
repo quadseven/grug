@@ -86,6 +86,8 @@ async def create_bot(
 
         return BotActionResponse(success=True, message=f"Bot '{request.name}' created successfully", bot_id=bot_id)
 
+    except HTTPException:
+        raise
     except Exception as e:
         log.error("Failed to create bot", extra={"error": str(e)})
         raise HTTPException(status_code=500, detail=str(e))
@@ -96,7 +98,7 @@ async def update_bot(bot_id: str, request: UpdateBotRequest, bot_manager: BotMan
     """Update bot configuration."""
     try:
         updates = {}
-        for field, value in request.dict(exclude_unset=True).items():
+        for field, value in request.model_dump(exclude_unset=True).items():
             if value is not None:
                 updates[field] = value
 
@@ -109,6 +111,8 @@ async def update_bot(bot_id: str, request: UpdateBotRequest, bot_manager: BotMan
 
         return BotActionResponse(success=True, message="Bot configuration updated successfully", bot_id=bot_id)
 
+    except HTTPException:
+        raise
     except Exception as e:
         log.error("Failed to update bot", extra={"bot_id": bot_id, "error": str(e)})
         raise HTTPException(status_code=500, detail=str(e))
@@ -127,6 +131,8 @@ async def delete_bot(bot_id: str, bot_manager: BotManager = Depends(get_bot_mana
 
         return BotActionResponse(success=True, message="Bot deleted successfully", bot_id=bot_id)
 
+    except HTTPException:
+        raise
     except Exception as e:
         log.error("Failed to delete bot", extra={"bot_id": bot_id, "error": str(e)})
         raise HTTPException(status_code=500, detail=str(e))
@@ -191,6 +197,15 @@ async def restart_bot(
         raise HTTPException(status_code=500, detail=str(e))
 
 
+def _find_bot_cog(bot, attr: str):
+    """Find the first loaded cog on a bot's Discord client that has the given attribute."""
+    if bot.client and bot.client.cogs:
+        for cog_instance in bot.client.cogs.values():
+            if hasattr(cog_instance, attr):
+                return cog_instance
+    return None
+
+
 @router.get("/{bot_id}/chat-settings", dependencies=[Depends(admin_required)])
 async def get_bot_chat_settings(
     bot_id: str, server_id: str = "admin", bot_manager: BotManager = Depends(get_bot_manager)
@@ -201,12 +216,7 @@ async def get_bot_chat_settings(
         raise HTTPException(status_code=404, detail=f"Bot '{bot_id}' not found")
 
     # Get the GrugThinkBot cog to access chat settings
-    cog = None
-    if bot.client and bot.client.cogs:
-        for cog_instance in bot.client.cogs.values():
-            if hasattr(cog_instance, "chat_frequencies"):
-                cog = cog_instance
-                break
+    cog = _find_bot_cog(bot, "chat_frequencies")
 
     if not cog:
         return {
@@ -261,12 +271,7 @@ async def set_bot_chat_frequency(
         raise HTTPException(status_code=400, detail="Frequency must be a valid integer")
 
     # Get the GrugThinkBot cog to update chat settings
-    cog = None
-    if bot.client and bot.client.cogs:
-        for cog_instance in bot.client.cogs.values():
-            if hasattr(cog_instance, "chat_frequencies"):
-                cog = cog_instance
-                break
+    cog = _find_bot_cog(bot, "chat_frequencies")
 
     if not cog:
         raise HTTPException(status_code=500, detail="Bot cog not loaded or bot not running")
@@ -296,12 +301,7 @@ async def reset_bot_activity(bot_id: str, bot_manager: BotManager = Depends(get_
         raise HTTPException(status_code=404, detail=f"Bot '{bot_id}' not found")
 
     # Get the GrugThinkBot cog to reset activity
-    cog = None
-    if bot.client and bot.client.cogs:
-        for cog_instance in bot.client.cogs.values():
-            if hasattr(cog_instance, "channel_activity"):
-                cog = cog_instance
-                break
+    cog = _find_bot_cog(bot, "channel_activity")
 
     if not cog:
         raise HTTPException(status_code=500, detail="Bot cog not loaded or bot not running")
