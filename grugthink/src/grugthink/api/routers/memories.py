@@ -5,8 +5,15 @@ delete_fact) are BLOCKING: first use lazily loads the gateway embedder (a
 network self-test), and the pgvector backend embeds via a synchronous HTTP call
 that can take up to its 30s timeout when the Spark is busy loading the chat
 model. Run them in the threadpool -- executed inline on the event loop they
-starve /api/health, the readiness probe flips (ingress 502s), and the liveness
-probe SIGKILLs the pod. Observed live during the pgvector cutover.
+starve /api/health, the readiness probe flips (ingress 502s), and repeated
+liveness failures get the container killed. Observed live during the pgvector
+cutover.
+
+Capacity note: anyio's default worker-thread limiter is 40 tokens shared across
+the whole app, so a burst of slow-embedding requests queues other offloaded work
+rather than growing unbounded -- acceptable for this single-admin surface. A
+client disconnect does not cancel an in-flight threadpool call; it just runs to
+completion in the background.
 """
 
 from typing import Dict
@@ -62,15 +69,16 @@ async def get_bot_memories(
             # Get memories from specific server
             server_db = await run_in_threadpool(server_manager.get_server_db, server_id)
 
+            all_facts = await run_in_threadpool(server_db.get_all_facts)
             if search:
                 facts = await run_in_threadpool(server_db.search_facts, search, limit)
             else:
-                facts = (await run_in_threadpool(server_db.get_all_facts))[:limit]
+                facts = all_facts[:limit]
 
             return {
                 "bot_id": bot_id,
                 "server_id": server_id,
-                "total_memories": len(await run_in_threadpool(server_db.get_all_facts)),
+                "total_memories": len(all_facts),
                 "memories": [{"id": i, "content": fact, "server_id": server_id} for i, fact in enumerate(facts)],
                 "search": search,
                 "limit": limit,
@@ -82,7 +90,18 @@ async def get_bot_memories(
 
             # Access the internal server_dbs dict to get all servers this bot knows about
             if hasattr(server_manager, "server_dbs"):
-                for srv_id, srv_db in list(server_manager.server_dbs.items()):
+                # Snapshot under the manager lock (in the threadpool -- the lock
+                # can be held for a slow first-time embedder load): a concurrent
+                # get_server_db() mutating the dict mid-iteration would raise
+                # "dictionary changed size during iteration".
+                def _snapshot_server_dbs():
+                    lock = getattr(server_manager, "lock", None)
+                    if lock is not None:
+                        with lock:
+                            return list(server_manager.server_dbs.items())
+                    return list(server_manager.server_dbs.items())
+
+                for srv_id, srv_db in await run_in_threadpool(_snapshot_server_dbs):
                     srv_facts = await run_in_threadpool(srv_db.get_all_facts)
                     total_memories += len(srv_facts)
 

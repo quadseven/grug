@@ -105,9 +105,10 @@ spec:
             httpGet: {path: /api/health, port: http}
             initialDelaySeconds: 30
             periodSeconds: 30
-            # Default 1s timeout SIGKILLed the pod whenever a blocking call
-            # briefly held the event loop; 5s tolerates transient stalls while
-            # still catching a truly wedged process within ~2min (3 failures).
+            # With the default 1s timeout, transient event-loop stalls made
+            # probes time out; after failureThreshold (3) consecutive failures
+            # the kubelet restarts the container. 5s tolerates brief stalls
+            # while 3x30s periods still catch a truly wedged process in ~2min.
             timeoutSeconds: 5
           resources:
             requests: {cpu: 100m, memory: 256Mi}
