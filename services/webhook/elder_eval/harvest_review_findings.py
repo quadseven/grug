@@ -120,16 +120,18 @@ def parse_inline_header_comment(repo: str, raw: dict[str, Any]) -> BotFinding | 
     pr = _pr_number(str(raw.get("pull_request_url") or ""))
     if pr is None:
         return None
-    # Search from the END of the header so a bold string in any preamble
-    # (quoted text, prior-section chatter) can never masquerade as the title
-    # (review finding on #608 - corrupted `finding` text in the corpus).
-    title_m = _INLINE_TITLE_RE.search(body, header.end())
-    if title_m:
-        finding = title_m.group("title")
-    else:
-        after = body[header.end():].strip()
-        finding = after.splitlines()[0] if after else body.splitlines()[0]
-    finding = finding.strip()
+    # Title = the FIRST non-blank line after the header, bold-stripped when
+    # present. Anchoring after the header stops preamble bold text from
+    # masquerading as the title, and taking the first line (rather than
+    # searching the whole remainder for a bold span) stops a bold string deep
+    # in the detail text from being grabbed either (review findings on #608).
+    # header.end() is mid-line (the severity match); skip past the header
+    # LINE's newline so trailing chips ("| Quick win") are never the title.
+    nl = body.find("\n", header.end())
+    after = body[nl + 1:] if nl != -1 else ""
+    first_line = next((ln.strip() for ln in after.splitlines() if ln.strip()), "")
+    bold_m = _INLINE_TITLE_RE.match(first_line)
+    finding = (bold_m.group("title") if bold_m else first_line).strip()
     line = raw.get("line")
     original_line = raw.get("original_line")
     return BotFinding(
@@ -215,7 +217,11 @@ def parse_grug_comment(repo: str, raw: dict[str, Any]) -> BotFinding | None:
     pr = _pr_number(str(raw.get("pull_request_url") or ""))
     if pr is None:
         return None
-    first_line = next((ln for ln in body.splitlines() if ln.strip()), "")
+    # First non-blank line AFTER the header LINE = the descriptive text; the
+    # header line itself would just duplicate severity/category.
+    nl = body.find("\n", header.end())
+    after = body[nl + 1:] if nl != -1 else ""
+    first_line = next((ln.strip() for ln in after.splitlines() if ln.strip()), "")
     line = raw.get("line")
     original_line = raw.get("original_line")
     return BotFinding(
@@ -264,10 +270,14 @@ def recall_report(
         line = row.get("line")
         elder_index.setdefault(key, []).append(int(line) if line is not None else None)
 
-    def elder_has(repo: str, pr: int, path: str, line: int | None) -> bool:
+    def elder_has(repo: str, pr: int, path: str, line: Any) -> bool:
         lines = elder_index.get((repo, pr, path))
         if lines is None:
             return False
+        try:
+            line = int(line) if line is not None else None
+        except (TypeError, ValueError):
+            line = None  # malformed anchor -> match on path alone
         if line is None:
             return True
         return any(el is None or abs(el - line) <= _LINE_SLACK for el in lines)

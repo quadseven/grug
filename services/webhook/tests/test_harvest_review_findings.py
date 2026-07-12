@@ -92,6 +92,18 @@ class TestInlineHeaderParser:
         assert f is not None
         assert f.finding == "The real finding title."
 
+    def test_bold_in_detail_text_not_grabbed_as_title(self):
+        """The title is the first line after the header; a bold span deep in
+        the detail text must not be grabbed when the title line is plain."""
+        body = (
+            "_🎯 Functional Correctness_ | _🟠 Major_\n\n"
+            "Plain title line without bold.\n\n"
+            "Detail with **bold emphasis** later on.\n"
+        )
+        f = parse_inline_header_comment("o/r", _inline_raw(body=body))
+        assert f is not None
+        assert f.finding == "Plain title line without bold."
+
     def test_severity_scale(self):
         for label, expect in (
             ("Critical", "critical"), ("Major", "high"),
@@ -110,6 +122,10 @@ class TestGrugParser:
         assert f.source == "grug"
         assert f.severity == "high"
         assert f.category == "caller-not-updated"
+        # The finding text is the DESCRIPTIVE line after the header, never a
+        # duplicate of the severity/category header itself.
+        assert f.finding.startswith("Grug see call site")
+        assert "HIGH" not in f.finding
 
     def test_walkthrough_chatter_skipped(self):
         raw = _inline_raw(body="<!-- grug-teller:walkthrough -->\nGrug walk the diff...")
