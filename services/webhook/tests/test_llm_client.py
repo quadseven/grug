@@ -149,9 +149,9 @@ def test_coder_arm_failure_falls_back_to_reasoner_arm(monkeypatch) -> None:
 
 
 def _is_reasoner(kwargs) -> bool:
-    """True when this request targets the reasoner arm (nemotron), by inspecting
+    """True when this request targets the reasoner arm (qwen3.5), by inspecting
     the model in the outgoing body - both arms share the gateway URL now."""
-    return "nemotron" in (kwargs.get("json") or {}).get("model", "")
+    return "qwen3.5" in (kwargs.get("json") or {}).get("model", "")
 
 
 def test_deep_review_consults_both_arms_and_merges_findings(monkeypatch) -> None:
@@ -172,7 +172,7 @@ def test_deep_review_consults_both_arms_and_merges_findings(monkeypatch) -> None
                 '"rule": "null-deref", "severity": "high", '
                 '"message": "unchecked optional"}]}'
             )
-            model = "nemotron-3-super:120b"
+            model = "qwen3.5:122b"
         else:
             content = '{"findings": []}'
             model = "qwen3-coder-next:q8_0"
@@ -187,7 +187,7 @@ def test_deep_review_consults_both_arms_and_merges_findings(monkeypatch) -> None
     assert out.kind == "reviewed"
     assert out.backends_used == (Backend.CAVE, Backend.CAVE_REASONER)
     assert out.models_used == (
-        "qwen3-coder-next:q8_0", "nemotron-3-super:120b",
+        "qwen3-coder-next:q8_0", "qwen3.5:122b",
     )
     assert len(out.findings) == 1
     assert out.findings[0].origins[0].backend == Backend.CAVE_REASONER
@@ -313,7 +313,7 @@ def test_timeout_treated_as_failure(monkeypatch) -> None:
         model = (kwargs.get("json") or {}).get("model", "")
         call_log.append(model)
         # Coder arm times out; the reasoner arm answers.
-        if "nemotron" in model:
+        if "qwen3.5" in model:
             return success
         raise httpx.ReadTimeout("timeout")
 
@@ -322,7 +322,7 @@ def test_timeout_treated_as_failure(monkeypatch) -> None:
 
     assert out.kind == "reviewed"
     assert out.backend_used == Backend.CAVE_REASONER
-    assert any("nemotron" in m for m in call_log)
+    assert any("qwen3.5" in m for m in call_log)
 
 
 def test_request_uses_openai_chat_completions_shape() -> None:
@@ -460,9 +460,11 @@ def test_transport_failure_on_both_backends_returns_all_failed(monkeypatch) -> N
     # Long review timeouts are not retried; one attempt per arm bounds the deep
     # generation phase even though quick 429/503 responses still retry.
     assert len(call_log) == 2
-    # Both arms represented (coder + reasoner models).
-    assert any("nemotron" in m for m in call_log)
-    assert any("qwen" in m for m in call_log)
+    # Both arms represented (coder + reasoner models). Assert the coder
+    # substring explicitly: "qwen" alone also matches the reasoner
+    # (qwen3.5), so it could pass on two reasoner calls.
+    assert any("qwen3.5" in m for m in call_log)
+    assert any("qwen3-coder" in m for m in call_log)
 
 
 def test_parse_failed_attributes_secondary_backend(monkeypatch) -> None:
@@ -475,7 +477,7 @@ def test_parse_failed_attributes_secondary_backend(monkeypatch) -> None:
     parse_fail_envelope = _openai_json_response("sorry, I cannot do that")
 
     def staged(url, *args, **kwargs):
-        if "nemotron" not in (kwargs.get("json") or {}).get("model", ""):
+        if "qwen3.5" not in (kwargs.get("json") or {}).get("model", ""):
             raise httpx.ReadTimeout("coder arm down")
         return httpx.Response(200, json=parse_fail_envelope)
 
@@ -502,7 +504,7 @@ def test_parse_failure_on_primary_falls_back_to_secondary(monkeypatch) -> None:
 
     def staged(url, *args, **kwargs):
         # Coder arm (primary) parse-fails; reasoner arm (secondary) returns clean.
-        if "nemotron" not in (kwargs.get("json") or {}).get("model", ""):
+        if "qwen3.5" not in (kwargs.get("json") or {}).get("model", ""):
             return httpx.Response(200, json=bad)
         return httpx.Response(200, json=good)
 
