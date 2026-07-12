@@ -199,7 +199,7 @@ _STR_REPO_FLAGS = frozenset({"elder_voice"})
 _DEFAULT_PERSONA_CONFIG = {
     "tpm_enabled": True,
     "code_reviewer_enabled": True,
-    "code_reviewer_blocking": False,
+    "code_reviewer_blocking": True,  # Elder blocks on real findings (fails open on degraded); matches registry blocking_default
     "guard_enabled": True,
     "guard_blocking": False,
     "warder_enabled": False,

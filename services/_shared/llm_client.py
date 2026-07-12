@@ -205,10 +205,14 @@ class Backend(str, Enum):
 
     POOLSIDE = "poolside"
     OPENROUTER = "openrouter"
-    # In-cluster spark-gateway (ADR-0009). NOT a review backend yet - only
-    # the exposed-secret judge routes here (#439); select_backend's
-    # round-robin stays pinned to the two SaaS backends below.
+    # Owned in-cluster review ensemble (ADR-0009), both fronted by the same
+    # spark-gateway (it routes by model name to ollama-sparkles vs sparkicus
+    # vLLM). CAVE = the coder arm (qwen3-coder-next), CAVE_REASONER = the
+    # reasoner arm (nemotron-3-super). Deep review runs BOTH and merges - the
+    # brain+hands split that replaces the retired SaaS pair. The exposed-secret
+    # judge (#439) also routes to CAVE.
     CAVE = "cave"
+    CAVE_REASONER = "cave-reasoner"
 
 
 # `Severity` + `SEVERITIES` now live in the shared leaf `review_types` (#250)
@@ -367,6 +371,19 @@ _BACKEND_CONFIGS: dict[Backend, BackendConfig] = {
 
 def _review_backend_config(backend: Backend) -> BackendConfig:
     """Return backend settings scoped to the expensive Elder review pass."""
+    if backend in (Backend.CAVE, Backend.CAVE_REASONER):
+        # Owned review ensemble arm (coder or reasoner). Raise (not KeyError)
+        # when unconfigured so review_diff's _BackendConfigError arm records it
+        # as a clean backend failure rather than crashing the review.
+        cave = _cave_review_config(backend)
+        if cave is None:
+            raise _BackendConfigError("GRUG_CAVE_GATEWAY_URL not set - cannot run Cave review")
+        return replace(
+            cave,
+            timeout_seconds=_REVIEW_TIMEOUT_SECONDS,
+            retry_attempts=_REVIEW_RETRY_ATTEMPTS,
+            transport_retry_attempts=_REVIEW_TRANSPORT_RETRY_ATTEMPTS,
+        )
     config = _BACKEND_CONFIGS[backend]
     if backend == Backend.OPENROUTER:
         return replace(
@@ -385,7 +402,9 @@ def _review_backend_config(backend: Backend) -> BackendConfig:
     )
 
 
-_CAVE_JUDGE_DEFAULT_MODEL = "qwen3-coder-next:latest"
+# Pinned Q8_0 tag (was ":latest") - the exact model srv-sparkles serves; ":latest"
+# is a moving target that can silently swap the model under the reviewer.
+_CAVE_JUDGE_DEFAULT_MODEL = "qwen3-coder-next:q8_0"
 
 
 def _cave_judge_config() -> "BackendConfig | None":
@@ -404,6 +423,36 @@ def _cave_judge_config() -> "BackendConfig | None":
         backend=Backend.CAVE,
         url=f"{base}/v1/chat/completions",
         model=os.getenv("GRUG_CAVE_JUDGE_MODEL", _CAVE_JUDGE_DEFAULT_MODEL),
+        key_loader=lambda: "in-cluster",  # gateway is unauthenticated in-cluster
+    )
+
+
+# The owned review ensemble: a coder arm and a reasoner arm, BOTH fronted by the
+# same spark-gateway (it routes by model name to ollama-sparkles / sparkicus
+# vLLM). Deep review runs both and merges; the SaaS pair is retired.
+_CAVE_REVIEW_CODER_DEFAULT_MODEL = "qwen3-coder-next:q8_0"
+_CAVE_REVIEW_REASONER_DEFAULT_MODEL = "nemotron-3-super:120b"
+
+
+def _cave_review_config(backend: Backend) -> "BackendConfig | None":
+    """BackendConfig for one arm of the owned in-cluster review ensemble.
+
+    `backend` is CAVE (coder) or CAVE_REASONER (reasoner). Both hit the same
+    GRUG_CAVE_GATEWAY_URL, differing only in `model`. Returns None when the
+    gateway URL is unset, which review_diff surfaces as a clean backend failure
+    (no SaaS backend to fall back to - OpenRouter/Poolside were retired). Models
+    are overridable per arm via GRUG_CAVE_REVIEW_MODEL / GRUG_CAVE_REASONER_MODEL."""
+    base = os.getenv("GRUG_CAVE_GATEWAY_URL", "").strip().rstrip("/")
+    if not base:
+        return None
+    if backend == Backend.CAVE_REASONER:
+        model = os.getenv("GRUG_CAVE_REASONER_MODEL", _CAVE_REVIEW_REASONER_DEFAULT_MODEL)
+    else:
+        model = os.getenv("GRUG_CAVE_REVIEW_MODEL", _CAVE_REVIEW_CODER_DEFAULT_MODEL)
+    return BackendConfig(
+        backend=backend,
+        url=f"{base}/v1/chat/completions",
+        model=model,
         key_loader=lambda: "in-cluster",  # gateway is unauthenticated in-cluster
     )
 
@@ -1134,10 +1183,12 @@ def review_diff(
     if not hunks:
         return LlmReviewResponse(kind="no_diff")
 
-    primary = select_backend(installation_id)
-    secondary = (
-        Backend.OPENROUTER if primary == Backend.POOLSIDE else Backend.POOLSIDE
-    )
+    # Owned review ensemble (replaces the retired SaaS pair): coder arm
+    # (qwen3-coder-next) + reasoner arm (nemotron-3-super), both via the Cave
+    # gateway. Deep runs both and merges (brain+hands); fast returns after the
+    # coder arm. No SaaS spend, no 402 outage. Order = coder first so fast mode
+    # uses the code specialist.
+    review_backends: tuple[Backend, ...] = (Backend.CAVE, Backend.CAVE_REASONER)
     depth = os.getenv("GRUG_REVIEW_DEPTH", "deep").strip().lower()
     deep = depth != "fast"
     # Deep is the production quality path and always uses the recall-oriented
@@ -1159,8 +1210,31 @@ def review_diff(
     # than collapsing to `all_failed`.
     first_parse_fail = None
     successes: list[_SuccessfulReview] = []
-    for backend in (primary, secondary):
-        config = _review_backend_config(backend)
+    for backend in review_backends:
+        # Resolve the backend config BEFORE opening the LLM-Obs span: a
+        # misconfiguration (e.g. GRUG_CAVE_GATEWAY_URL unset) must degrade to a
+        # clean backend failure, not raise out of review_diff. With the Cave the
+        # sole review backend, this is the only path when the gateway env is
+        # missing, so it decides whether Elder degrades (neutral) or 500s.
+        try:
+            config = _review_backend_config(backend)
+        except _BackendConfigError as e:
+            # Still emit a span so DD sees config errors (gateway/secret missing),
+            # not just transport errors - but do it here, BEFORE the main span,
+            # so a bad config can never raise out of review_diff.
+            cfg_start_ns = time.monotonic_ns()
+            with _llmobs_llm(
+                model_name=backend.value, model_provider=backend.value, name=_LLMOBS_NAME,
+            ) as cfg_span:
+                _llmobs_annotate(
+                    span=cfg_span, input_data=_redact_payload(messages),
+                    metadata={"backend": backend.value, "variant_id": variant, "error": "config"},
+                    metrics={"latency_ms": _elapsed_ms(cfg_start_ns)},
+                    tags=pr_tags,
+                )
+            log.error("llm_backend_misconfigured", extra={"backend": backend.value, "detail": str(e)})
+            last_error = f"{backend.value} misconfigured: {e}"
+            continue
         # Open one LLM Obs span per backend attempt. Annotate on every
         # CAUGHT exit path (success + the three explicit `except` arms)
         # so DD captures latency tails and per-backend error rates. A
