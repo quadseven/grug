@@ -69,7 +69,7 @@ def test_poll_dispatches_esm_shaped_event_and_deletes():
 
 def test_poll_handler_raise_leaves_message_for_redrive():
     """The rerun contract: a raise must NOT delete — the message reappears
-    after the visibility timeout and redrives to the DLQ after 3 receives,
+    after the visibility timeout and redrives to the DLQ after 5 receives,
     exactly like the Lambda ESM retry path."""
     handler = MagicMock(side_effect=RuntimeError("re-run failed"))
     with (

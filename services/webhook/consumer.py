@@ -14,7 +14,8 @@ Delivery semantics preserved per queue (mirrors the ESM config):
 - **rerun-jobs** (`rerun.handle_rerun_jobs`): the handler RAISES on a
   failed re-run. We then do NOT delete — the message reappears after the
   queue's 900s fallback visibility timeout and redrives to the DLQ after
-  maxReceiveCount=3, exactly like the ESM retry path.
+  maxReceiveCount=5 (raised from 3 for deploy-restart headroom, #607),
+  exactly like the ESM retry path.
 - **cave-results** (`cave_fallback.handle_fallback_result`): the handler
   never raises (logs + skips bad records), so every received message is
   deleted. A defensive catch still deletes on an unexpected raise — the
@@ -623,12 +624,17 @@ def main() -> None:
     # branch above. Never let a dead thread exit 0.
     if not terminated_by_signal.is_set() and not all(t.is_alive() for t in threads):
         died = True
-    # Long-poll wait is 20s, so threads notice _stop well inside the pod's
-    # default 30s terminationGracePeriod; in-flight handlers finish first.
+    # SHARED join deadline (not per-thread): five threads x a per-thread 30s
+    # join could eat 150s while the pod is SIGKILLed at its grace period,
+    # which would skip the claim sweep below (CodeRabbit/Qodo on #607). 15s
+    # total gives quick handlers a chance to finish and still leaves most of
+    # the grace window for the sweep. Long-poll wait is 20s, so idle threads
+    # notice _stop almost immediately.
+    join_deadline = time.monotonic() + 15.0
     for t in threads:
-        t.join(timeout=30.0)
+        t.join(timeout=max(0.0, join_deadline - time.monotonic()))
     # Release any snapshot claims still held by handlers that did NOT finish
-    # inside the grace period (Elder reviews run minutes; every deploy rolls
+    # inside the join budget (Elder reviews run minutes; every deploy rolls
     # this pod). Without this the orphaned lease makes the SQS redelivery
     # bounce off "claim busy" for up to the 900s lease, burning receives
     # toward the DLQ while the PR waits on its REQUIRED check (grug#515).
