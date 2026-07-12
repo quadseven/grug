@@ -59,6 +59,23 @@ def _get_sentence_transformer():
 
 log = get_logger(__name__)
 
+
+def make_server_manager(base_db_path, model_name="all-MiniLM-L6-v2", load_embedder: bool = True):
+    """Return the memory backend selected by environment.
+
+    When a Postgres DSN is configured (GRUGTHINK_DATABASE_URL / GRUG_DATABASE_URL)
+    Grug's memory lives in pgvector -- one row per fact, no node-pinned PVC and no
+    SQLite+FAISS to keep in sync. Otherwise fall back to the local SQLite+FAISS
+    store (dev and tests without a database). Both expose the same public API, so
+    callers construct through this factory and never branch on the backend.
+    """
+    from .pgvector_store import PgVectorServerManager, pgvector_enabled
+
+    if pgvector_enabled():
+        return PgVectorServerManager(base_db_path, model_name=model_name, load_embedder=load_embedder)
+    return GrugServerManager(base_db_path, model_name=model_name, load_embedder=load_embedder)
+
+
 # String interning cache for performance (common server IDs, personalities, etc.)
 _string_cache = {}
 

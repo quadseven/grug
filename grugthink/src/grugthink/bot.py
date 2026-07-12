@@ -44,7 +44,7 @@ from .bot.prompts import (  # noqa: E402
     query_model,
 )
 from .bot.utils import LRUCache, clean_statement, generate_shit_talk  # noqa: E402
-from .grug_db import GrugServerManager  # noqa: E402
+from .grug_db import make_server_manager  # noqa: E402
 from .logging_config import get_logger  # noqa: E402
 
 log = get_logger(__name__)
@@ -57,7 +57,7 @@ cross_bot_responses = LRUCache(max_size=200, ttl_seconds=600)
 cross_bot_topic_responses = LRUCache(max_size=100, ttl_seconds=1800)  # Store bot responses by topic for 30 minutes
 
 # Initialize Server Manager and Personality Engine
-server_manager = GrugServerManager(config.DB_PATH, load_embedder=config.LOAD_EMBEDDER)
+server_manager = make_server_manager(config.DB_PATH, load_embedder=config.LOAD_EMBEDDER)
 
 
 def store_bot_response_for_cross_reference(response: str, personality_name: str):

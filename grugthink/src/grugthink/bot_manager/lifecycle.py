@@ -12,7 +12,7 @@ import time
 import discord
 from discord.ext import commands
 
-from ..grug_db import GrugServerManager
+from ..grug_db import make_server_manager
 from ..grug_structured_logger import get_logger
 from ..personality_engine import PersonalityEngine
 
@@ -96,7 +96,7 @@ async def start_bot(bot_manager, bot_id: str) -> bool:
         # Initialize server manager for this bot (each bot gets its own data directory)
         # Get load_embedder from environment (defaults to "true" if not set, converts to boolean)
         load_embedder_env = bot_env.get("LOAD_EMBEDDER", "true").lower() in ("true", "1", "yes")
-        server_manager = GrugServerManager(
+        server_manager = make_server_manager(
             base_db_path=os.path.join(data_dir, "facts.db"),
             model_name="all-MiniLM-L6-v2",
             load_embedder=load_embedder_env,
