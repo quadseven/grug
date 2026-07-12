@@ -195,6 +195,49 @@ def test_trusted_reaction_refreshes_ledger_practices_and_examples(monkeypatch):
     assert exemplars[0][0]["class"] == "null-deref"
 
 
+def test_reaction_reviewers_split_per_model_with_legacy_fallback():
+    """#540: each producing model gets its own ledger `reviewer` label; a
+    finding with no origin keeps the single legacy label."""
+    ens = _ensemble_record()
+    assert cr_reactions._reaction_reviewers(ens) == [
+        "grug-elder/poolside/laguna-m.1",
+        "grug-elder/anthropic/claude-opus-4.7",
+    ]
+    # legacy: no finding_origins
+    assert cr_reactions._reaction_reviewers(_record()) == ["grug-elder"]
+
+
+def test_ensemble_verdict_writes_one_ledger_row_per_model(monkeypatch):
+    """#540: a confirmed verdict on an ensemble finding credits BOTH producing
+    models, so reviewer_precision() can score each backend separately."""
+    from adapters import install_store
+    from ledger import parse_row, reviewer_precision
+
+    rows: list[dict] = []
+    monkeypatch.setattr(install_store, "put_ledger_row", lambda row: rows.append(row))
+    monkeypatch.setattr(install_store, "list_ledger_rows", lambda repo: list(rows))
+    monkeypatch.setattr(install_store, "put_repo_practices", lambda repo, data: None)
+    monkeypatch.setattr(install_store, "put_repo_exemplars", lambda repo, data: None)
+
+    rec = _ensemble_record(comment_id=9)
+    rec.update({"finding_text": "unchecked optional", "head_sha": "abc",
+                "trust_reactors": True})
+    rec["finding_tags"]["severity"] = "high"
+
+    assert cr_reactions._record_reaction_learning(rec, "confirmed") is True
+
+    reviewers = {r["reviewer"] for r in rows}
+    assert reviewers == {
+        "grug-elder/poolside/laguna-m.1",
+        "grug-elder/anthropic/claude-opus-4.7",
+    }
+    assert all(r["verdict"] == "declined" for r in rows)  # confirmed -> accepted
+    prec = reviewer_precision([parse_row(r) for r in rows])
+    # each model has one accepted finding -> precision 1.0, tracked separately
+    assert set(prec) == reviewers
+    assert prec["grug-elder/poolside/laguna-m.1"].accepted == 1
+
+
 def test_false_positive_reaction_refreshes_negative_prompt_guidance(monkeypatch):
     """A trusted thumbs-down must change later behavior, not only precision
     telemetry. It creates an AVOID practice while remaining excluded from the
