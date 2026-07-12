@@ -223,6 +223,15 @@ def handler(event: dict[str, Any], context: Any) -> dict[str, int | str]:
                             extra={"install_id": iid, "repo": full,
                                    "kind": type(e).__name__},
                         )
+                        # #518: a detection FAILURE must be visible as its own
+                        # gauge state, never a silent gap next to real "none"
+                        # rows - an auth/rate-limit outage across the install
+                        # would otherwise read as "nothing enforced anywhere"
+                        # going dark, which nobody pages on.
+                        try:
+                            emit_enforcement_metric(full, "error")
+                        except Exception:  # noqa: BLE001 - best-effort gauge
+                            pass
                 return n
 
             enforcement_emitted += (

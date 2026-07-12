@@ -226,6 +226,12 @@ def delete_ruleset(
     resp.raise_for_status()
 
 
+# Rulesets are per-repo config, not data: even ruleset-heavy repos carry a
+# handful. 5 pages x 100 is far past plausible; the cap exists so a pagination
+# bug can never spin (same posture as _INSTALL_REPOS_MAX_PAGES).
+_RULESETS_MAX_PAGES = 5
+
+
 def list_rulesets(
     install_token: str,
     owner: str,
@@ -234,19 +240,36 @@ def list_rulesets(
     """List all rulesets for a repository. Resilient to GitHub's secondary
     rate limit (the dashboard fan-out burst) via bounded jittered retries.
 
+    Paginated (grug#570): the endpoint defaults to 30 per page, so a repo
+    with more rulesets than one page would silently hide the rest from
+    enforcement detection. Same log-and-truncate cap posture as
+    ``list_installation_repos`` - never spin.
+
     GitHub's LIST endpoint returns SUMMARIES ONLY - id, name, target,
     enforcement, source, timestamps - it does NOT include ``rules``
     (verified live, grug#567). Callers that need to inspect a ruleset's
     actual rules (e.g. required_status_checks) must fetch full detail
     per candidate via ``get_ruleset()``.
     """
-    resp = _get_with_retry(
-        f"{_GH_API}/repos/{quote(owner, safe='')}/{quote(repo, safe='')}/rulesets",
-        install_token=install_token,
-        op="list_rulesets",
-    )
-    resp.raise_for_status()
-    return resp.json()
+    out: list[dict] = []
+    for page in range(1, _RULESETS_MAX_PAGES + 1):
+        resp = _get_with_retry(
+            f"{_GH_API}/repos/{quote(owner, safe='')}/{quote(repo, safe='')}"
+            f"/rulesets?per_page=100&page={page}",
+            install_token=install_token,
+            op="list_rulesets",
+        )
+        resp.raise_for_status()
+        batch = resp.json() or []
+        out.extend(batch)
+        if len(batch) < 100:
+            break
+    else:
+        log.warning(
+            "rulesets_pagination_cap",
+            extra={"owner": owner, "repo": repo, "count": len(out)},
+        )
+    return out
 
 
 def get_ruleset(

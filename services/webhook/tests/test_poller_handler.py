@@ -374,9 +374,11 @@ def test_enforcement_pass_honors_store_opt_out(monkeypatch):
 
 
 def test_enforcement_pass_one_repo_failure_does_not_starve_the_rest(monkeypatch, caplog):
-    """Per-REPO best-effort: one repo's GitHub error is logged and the
-    install's remaining repos still get their gauge (no install-level
-    failure count either - the token was fine)."""
+    """Per-REPO best-effort: one repo's GitHub error is logged, emits an
+    explicit "error" gauge state (#518: a detection failure must never be a
+    silent gap mistakable for real "none" rows), and the install's remaining
+    repos still get their gauge (no install-level failure count either - the
+    token was fine)."""
     import logging as _logging
 
     emitted = []
@@ -401,10 +403,44 @@ def test_enforcement_pass_one_repo_failure_does_not_starve_the_rest(monkeypatch,
     )
     with caplog.at_level(_logging.WARNING):
         out = poller_handler.handler({}, None)
-    assert emitted == [("o/good", "external")]
+    assert emitted == [("o/bad", "error"), ("o/good", "external")]
+    # The errored repo is not counted as an emitted SUCCESS.
     assert out["enforcement_emitted"] == 1
     assert out["enforcement_failed_installs"] == 0
     assert any(r.msg == "enforcement_emit_repo_failed" for r in caplog.records)
+
+
+def test_enforcement_pass_error_emit_failure_is_swallowed(monkeypatch, caplog):
+    """The #518 error-gauge emit is best-effort: if DogStatsD emission itself
+    raises for the errored repo, the loop still reaches the remaining repos."""
+    import logging as _logging
+
+    emitted = []
+
+    def _detect(token, owner, repo, branch, check_name, stored_ruleset_id=None):
+        if repo == "bad":
+            raise RuntimeError("GH 500")
+        return "external"
+
+    def _emit(full, state, **kw):
+        if state == "error":
+            raise OSError("dogstatsd send failed")
+        emitted.append((full, state))
+
+    _wire_enforcement(
+        monkeypatch,
+        installs=[1],
+        gh_repos=[
+            {"id": 1, "full_name": "o/bad", "default_branch": "main"},
+            {"id": 2, "full_name": "o/good", "default_branch": "main"},
+        ],
+        detect=_detect,
+    )
+    monkeypatch.setattr("observability.emit_enforcement_metric", _emit)
+    with caplog.at_level(_logging.WARNING):
+        out = poller_handler.handler({}, None)
+    assert emitted == [("o/good", "external")]
+    assert out["enforcement_emitted"] == 1
 
 
 def test_enforcement_pass_one_install_failure_does_not_abort_cycle(monkeypatch, caplog):
