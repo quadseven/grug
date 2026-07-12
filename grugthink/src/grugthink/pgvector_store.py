@@ -141,6 +141,20 @@ def _to_vector(embedding):
     return vec
 
 
+def _vec_literal(vec):
+    """Render a vector as a pgvector text literal, e.g. "[0.1,0.2]".
+
+    Passed with an explicit ``%s::vector`` cast so the value arrives typed as
+    ``vector`` at both the INSERT and the ``<=>`` operator. A bare Python list
+    would be sent as ``double precision[]`` -- which INSERT can assignment-cast
+    into the column but the ``<=>`` operator cannot (no implicit cast), so search
+    would fail with "operator does not exist: vector <=> double precision[]".
+    """
+    if vec is None:
+        return None
+    return "[" + ",".join(repr(float(x)) for x in vec) + "]"
+
+
 class PgVectorGrugDB:
     """pgvector-backed store for one (namespace, server_id) scope.
 
@@ -172,11 +186,11 @@ class PgVectorGrugDB:
                 cur = conn.execute(
                     f"""
                     INSERT INTO {_TABLE} (namespace, server_id, content, embedding)
-                    VALUES (%s, %s, %s, %s)
+                    VALUES (%s, %s, %s, %s::vector)
                     ON CONFLICT (namespace, server_id, content) DO NOTHING
                     RETURNING id
                     """,
-                    (self.namespace, self.server_id, fact_text, vec),
+                    (self.namespace, self.server_id, fact_text, _vec_literal(vec)),
                 )
                 inserted = cur.fetchone() is not None
                 conn.commit()
@@ -200,10 +214,10 @@ class PgVectorGrugDB:
                     f"""
                     SELECT content FROM {_TABLE}
                     WHERE namespace = %s AND server_id = %s AND embedding IS NOT NULL
-                    ORDER BY embedding <=> %s
+                    ORDER BY embedding <=> %s::vector
                     LIMIT %s
                     """,
-                    (self.namespace, self.server_id, vec, k),
+                    (self.namespace, self.server_id, _vec_literal(vec), k),
                 )
                 results = [row[0] for row in cur.fetchall()]
             log.info("Found results for query", extra={"query": query, "results": len(results)})
