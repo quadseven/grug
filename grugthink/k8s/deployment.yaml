@@ -88,6 +88,13 @@ spec:
           envFrom:
             # SESSION_SECRET, generated in-cluster by the deploy step.
             - secretRef: {name: grugthink-secrets}
+            # GRUGTHINK_DATABASE_URL -> Grug's long-term memory on Postgres+
+            # pgvector (grugthink_facts) in the shared CNPG cluster, replacing the
+            # node-pinned SQLite+FAISS PVC (#599, docs/pgvector-memory.md). The
+            # secret is created out-of-band from SSM /githumps/grugthink/database_url
+            # (grugthink role, infra cnpg-cluster tenant). Its presence flips
+            # make_server_manager() to the pgvector backend.
+            - secretRef: {name: grugthink-db}
           readinessProbe:
             httpGet: {path: /api/health, port: http}
             initialDelaySeconds: 15
