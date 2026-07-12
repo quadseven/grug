@@ -91,6 +91,45 @@ _HUNK_BOUNDARY_PREFIXES: tuple[str, ...] = (
 )
 
 
+# Paths whose diffs carry no review signal for an LLM and actively degrade
+# the arms (#609): a large JSONL/lockfile hunk balloons the prompt past what
+# the models answer coherently (observed live: parse_failed on a PR whose
+# diff was mostly a data file) and slows every review. Conservative,
+# extension/dir-based; excluded paths are NAMED in the check summary so the
+# walkthrough stays honest, and full-file context still covers code files.
+_REVIEW_EXCLUDED_PATH_RE = re.compile(
+    r"(?:^|/)("
+    r"node_modules|vendor|__snapshots__|dist"
+    r")/"
+    r"|\.(?:jsonl|csv|tsv|parquet|min\.js|min\.css|svg|map|lock)$"
+    r"|(?:^|/)(?:package-lock\.json|yarn\.lock|pnpm-lock\.yaml|uv\.lock|"
+    r"poetry\.lock|Cargo\.lock|go\.sum|Gemfile\.lock|composer\.lock)$"
+)
+
+
+def is_review_excluded_path(path: str) -> bool:
+    """True when a changed file is data/generated/vendored - no LLM review
+    signal (#609). Pure; the single source the split + tests share."""
+    return _REVIEW_EXCLUDED_PATH_RE.search(path) is not None
+
+
+def split_reviewable_hunks(
+    hunks: tuple[DiffHunk, ...],
+) -> tuple[tuple[DiffHunk, ...], tuple[str, ...]]:
+    """Partition hunks into (reviewable, excluded_paths).
+
+    Excluded paths are deduped, order-preserving, so the check summary can
+    name exactly what the LLM did not see. Pure."""
+    kept: list[DiffHunk] = []
+    excluded: dict[str, None] = {}
+    for h in hunks:
+        if is_review_excluded_path(h.file_path):
+            excluded[h.file_path] = None
+        else:
+            kept.append(h)
+    return tuple(kept), tuple(excluded)
+
+
 def parse_diff(unified_diff: str) -> tuple[DiffHunk, ...]:
     """Parse a unified diff into structured hunks.
 
