@@ -206,11 +206,12 @@ class Backend(str, Enum):
     POOLSIDE = "poolside"
     OPENROUTER = "openrouter"
     # Owned in-cluster review ensemble (ADR-0009), both fronted by the same
-    # spark-gateway (it routes by model name to ollama-sparkles vs sparkicus
-    # vLLM). CAVE = the coder arm (qwen3-coder-next), CAVE_REASONER = the
-    # reasoner arm (nemotron-3-super). Deep review runs BOTH and merges - the
-    # brain+hands split that replaces the retired SaaS pair. The exposed-secret
-    # judge (#439) also routes to CAVE.
+    # spark-gateway (it routes by model name to whichever Spark carries it,
+    # warm-first). CAVE = the coder arm (qwen3-coder-next on sparkles),
+    # CAVE_REASONER = the reasoner arm (qwen3.5 - permanently resident on
+    # sparkicus ollama since the nemotron vLLM was retired 2026-07-12). Deep
+    # review runs BOTH and merges - the brain+hands split that replaces the
+    # retired SaaS pair. The exposed-secret judge (#439) also routes to CAVE.
     CAVE = "cave"
     CAVE_REASONER = "cave-reasoner"
 
@@ -428,10 +429,17 @@ def _cave_judge_config() -> "BackendConfig | None":
 
 
 # The owned review ensemble: a coder arm and a reasoner arm, BOTH fronted by the
-# same spark-gateway (it routes by model name to ollama-sparkles / sparkicus
-# vLLM). Deep review runs both and merges; the SaaS pair is retired.
+# same spark-gateway (it routes by model name, warm targets first). Deep review
+# runs both and merges; the SaaS pair is retired.
+#
+# Reasoner default is qwen3.5 (permanently resident on sparkicus ollama), NOT
+# nemotron-3-super: the nemotron vLLM was retired 2026-07-12 to keep qwen3.5
+# always-hot, and with vLLM gone the gateway failed nemotron over to a COLD
+# ollama - an ~87GB load per review that read-timed out every Elder call
+# (llm_backend_transport_failed) and starved the coder Spark. Defaults must
+# name models that are actually warm somewhere.
 _CAVE_REVIEW_CODER_DEFAULT_MODEL = "qwen3-coder-next:q8_0"
-_CAVE_REVIEW_REASONER_DEFAULT_MODEL = "nemotron-3-super:120b"
+_CAVE_REVIEW_REASONER_DEFAULT_MODEL = "qwen3.5:122b"
 
 
 def _cave_review_config(backend: Backend) -> "BackendConfig | None":
@@ -1184,10 +1192,10 @@ def review_diff(
         return LlmReviewResponse(kind="no_diff")
 
     # Owned review ensemble (replaces the retired SaaS pair): coder arm
-    # (qwen3-coder-next) + reasoner arm (nemotron-3-super), both via the Cave
-    # gateway. Deep runs both and merges (brain+hands); fast returns after the
-    # coder arm. No SaaS spend, no 402 outage. Order = coder first so fast mode
-    # uses the code specialist.
+    # (qwen3-coder-next) + reasoner arm (qwen3.5, always-hot on sparkicus),
+    # both via the Cave gateway. Deep runs both and merges (brain+hands); fast
+    # returns after the coder arm. No SaaS spend, no 402 outage. Order = coder
+    # first so fast mode uses the code specialist.
     review_backends: tuple[Backend, ...] = (Backend.CAVE, Backend.CAVE_REASONER)
     depth = os.getenv("GRUG_REVIEW_DEPTH", "deep").strip().lower()
     deep = depth != "fast"
