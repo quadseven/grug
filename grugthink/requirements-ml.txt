@@ -2,5 +2,5 @@
 # embeddings now come from the owned gateway, so sentence-transformers + torch
 # are gone - only the lightweight local index (faiss + numpy) remains.
 numpy==1.26.4
-faiss-cpu==1.7.4
+faiss-cpu==1.8.0
 

@@ -2,7 +2,7 @@
 # ML base (torch + sentence-transformers, ~2GB); v2 runs chat + embeddings on
 # the spark-gateway, so the image is just the app + faiss/numpy for the local
 # vector index. Non-root, matching grug's hardening.
-FROM python:3.13-slim
+FROM python:3.12-slim
 
 WORKDIR /app
 
