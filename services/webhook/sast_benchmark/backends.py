@@ -51,6 +51,45 @@ _OPENROUTER_EXTRA_BODY = {
 # broke JSON parse — see llm_client). Disable it for the benchmark too.
 _POOLSIDE_EXTRA_BODY = {"chat_template_kwargs": {"enable_thinking": False}}
 
+# #544: the Cave's require-keys response schema. Ollama maps a bare
+# `{"type": "json_object"}` to `format=json`, which silently TRUNCATES
+# multi-item answers (the known estate trap) — the #537 Cave baseline
+# (catch 0.125) likely undercounted because of it. A json_schema with
+# required keys forces the full findings envelope. The shape mirrors what
+# Elder's parser (`llm_client._parse_response` -> `_coerce_finding`)
+# requires: {"findings": [{path, line, rule, severity, message}]} with
+# severity from review_types.SEVERITIES. Cloud backends KEEP json_object so
+# their numbers stay comparable with the #537 baselines.
+_CAVE_FINDINGS_RESPONSE_FORMAT = {
+    "type": "json_schema",
+    "json_schema": {
+        "name": "review_findings",
+        "schema": {
+            "type": "object",
+            "properties": {
+                "findings": {
+                    "type": "array",
+                    "items": {
+                        "type": "object",
+                        "properties": {
+                            "path": {"type": "string"},
+                            "line": {"type": "integer"},
+                            "rule": {"type": "string"},
+                            "severity": {
+                                "type": "string",
+                                "enum": ["low", "medium", "high", "critical"],
+                            },
+                            "message": {"type": "string"},
+                        },
+                        "required": ["path", "line", "rule", "severity", "message"],
+                    },
+                },
+            },
+            "required": ["findings"],
+        },
+    },
+}
+
 
 def configured_backends() -> list[BenchBackend]:
     """Build the backend list from env. A cloud backend is included when its
@@ -101,6 +140,10 @@ def configured_backends() -> list[BenchBackend]:
                 url=cave_url,
                 model=cave_model,
                 api_key=os.getenv("GRUG_BENCH_CAVE_KEY", ""),
+                # #544: extra_body lands AFTER the runner's default
+                # response_format in the POST body dict, so this replaces the
+                # truncation-prone json_object for the Cave only.
+                extra_body={"response_format": _CAVE_FINDINGS_RESPONSE_FORMAT},
             )
         )
 
