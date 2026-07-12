@@ -1,0 +1,40 @@
+# GrugThink Base Image - Heavy ML Dependencies
+FROM python:3.11-slim
+
+WORKDIR /app
+
+# Install system dependencies
+RUN apt-get update && apt-get install -y \
+    gcc \
+    g++ \
+    curl \
+    --no-install-recommends \
+    && apt-get clean \
+    && rm -rf /var/lib/apt/lists/* /tmp/* /var/tmp/*
+
+# Install heavy ML dependencies that rarely change
+COPY requirements-ml.txt ./
+RUN pip install --no-cache-dir --no-compile --disable-pip-version-check \
+    --prefer-binary -r requirements-ml.txt \
+    && find /usr/local/lib/python3.11/site-packages -name '*.pyc' -delete \
+    && find /usr/local/lib/python3.11/site-packages -name '__pycache__' -delete -type d
+
+# Keep compilers for other dependencies that might need them
+# (they'll be removed in the final app image)
+
+# Set basic environment
+ENV PYTHONUNBUFFERED=1
+ENV PYTHONDONTWRITEBYTECODE=1
+ENV PIP_NO_CACHE_DIR=1
+ENV PIP_DISABLE_PIP_VERSION_CHECK=1
+
+# Persisted model cache locations (containers can override)
+ENV HF_HOME=/data/hf
+ENV TRANSFORMERS_CACHE=/data/hf
+
+# Non-root, matching the app image's hardening. HEALTHCHECK is intentionally
+# deferred to the app/K8s layer.
+RUN mkdir -p /data/hf \
+    && useradd -u 10001 -m grug \
+    && chown -R grug:grug /app /data
+USER 10001

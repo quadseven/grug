@@ -1,0 +1,119 @@
+# grugthink on OKE (v2). Modern k8s-oke pattern, mirroring grug's own
+# deployments: arm64-pinned, registry-pull, non-root, DD-tagged. Image
+# registry + tag are PLACEHOLDERS the deploy workflow rewrites (no registry
+# host committed). Secrets come from SSM /githumps/grugthink/* seeded into the
+# `grugthink-secrets` Secret by the deploy step (never committed here).
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: grugthink
+  labels: {app.kubernetes.io/part-of: grug}
+---
+# Config + bot data (faiss index, grugthink_config.yaml the dashboard writes)
+# must survive restarts - the #1 grugthink prod bug was losing config on
+# restart because it lived on ephemeral container storage.
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: grugthink-data
+  namespace: grugthink
+spec:
+  accessModes: [ReadWriteOnce]
+  resources:
+    requests: {storage: 5Gi}
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: grugthink
+  namespace: grugthink
+  labels:
+    app: grugthink
+    tags.datadoghq.com/service: grugthink
+    tags.datadoghq.com/env: prod
+spec:
+  replicas: 1
+  # RWO PVC - one writer at a time; recreate so the old pod releases the
+  # volume before the new one mounts it.
+  strategy: {type: Recreate}
+  selector:
+    matchLabels: {app: grugthink}
+  template:
+    metadata:
+      labels:
+        app: grugthink
+        tags.datadoghq.com/service: grugthink
+        tags.datadoghq.com/env: prod
+    spec:
+      automountServiceAccountToken: false
+      nodeSelector:
+        kubernetes.io/arch: arm64
+      imagePullSecrets:
+        - name: registry-pull
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 10001
+        fsGroup: 10001
+        seccompProfile: {type: RuntimeDefault}
+      containers:
+        - name: grugthink
+          image: REGISTRY_PLACEHOLDER/grugthink:TAG_PLACEHOLDER
+          imagePullPolicy: Always
+          ports:
+            - {name: http, containerPort: 8080}
+          env:
+            # LLM: owned spark-gateway only (v2). No Gemini/SaaS key set, so the
+            # engine stays fully on the gateway for chat AND embeddings.
+            - {name: SPARK_GATEWAY_URL, value: http://spark-gateway.spark-gateway.svc:8080}
+            - {name: OLLAMA_URLS, value: http://spark-gateway.spark-gateway.svc:8080}
+            - {name: USE_OLLAMA_EMBEDDINGS, value: "true"}
+            - {name: GRUGBOT_DATA_DIR, value: /data}
+            - {name: LOG_LEVEL, value: INFO}
+            - {name: MULTIBOT_API_PORT, value: "8080"}
+            # Dashboard is reached only in-cluster / over the tailnet, so OAuth
+            # login is disabled; admin endpoints are network-isolated. Flip to
+            # false + wire DISCORD_CLIENT_ID/SECRET to require Discord login.
+            - {name: DISABLE_OAUTH, value: "true"}
+            - {name: DD_SERVICE, value: grugthink}
+            - {name: DD_ENV, value: prod}
+            - name: DD_AGENT_HOST
+              valueFrom: {fieldRef: {fieldPath: status.hostIP}}
+          envFrom:
+            # SESSION_SECRET (+ any future creds) seeded from SSM.
+            - secretRef: {name: grugthink-secrets}
+          readinessProbe:
+            httpGet: {path: /health, port: http}
+            initialDelaySeconds: 15
+            periodSeconds: 10
+            timeoutSeconds: 5
+            failureThreshold: 3
+          livenessProbe:
+            httpGet: {path: /health, port: http}
+            initialDelaySeconds: 30
+            periodSeconds: 30
+          resources:
+            requests: {cpu: 100m, memory: 256Mi}
+            limits: {cpu: "1", memory: 1Gi}
+          securityContext:
+            allowPrivilegeEscalation: false
+            capabilities: {drop: ["ALL"]}
+            readOnlyRootFilesystem: true
+          volumeMounts:
+            - {name: data, mountPath: /data}
+            - {name: tmp, mountPath: /tmp}
+      volumes:
+        - name: data
+          persistentVolumeClaim: {claimName: grugthink-data}
+        - name: tmp
+          emptyDir: {sizeLimit: 128Mi}
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: grugthink
+  namespace: grugthink
+  labels: {app: grugthink}
+spec:
+  selector: {app: grugthink}
+  ports:
+    - {name: http, port: 8080, targetPort: http}
