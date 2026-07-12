@@ -1,0 +1,128 @@
+api_keys:
+  discord:
+    # Discord Bot Tokens
+    tokens:
+    - active: true
+      added_at: 1751235258.9580536
+      id: '1'
+      name: Discord - Dev - Grug
+      token: YOUR_DISCORD_BOT_TOKEN_HERE
+    - active: true
+      added_at: 1751235288.872912
+      id: '2'
+      name: Discord - Prod - Grug
+      token: YOUR_SECOND_BOT_TOKEN_HERE
+    - active: true
+      added_at: 1751239583.612938
+      id: '3'
+      name: Discord - Prod - Big Rob
+      token: YOUR_THIRD_BOT_TOKEN_HERE
+  gemini:
+    primary: YOUR_GEMINI_API_KEY_HERE
+    secondary: ""  # Optional backup key
+    fallback: ""   # Optional third key
+  google_search:
+    api_key: YOUR_GOOGLE_API_KEY_HERE
+    cse_id: YOUR_GOOGLE_CSE_ID_HERE
+
+# Global Environment Variables
+# These replace the .env file and are used by both single-bot and multi-bot deployments
+environment:
+  # Discord OAuth for Web Dashboard
+  DISCORD_CLIENT_ID: "YOUR_DISCORD_APPLICATION_CLIENT_ID"
+  DISCORD_CLIENT_SECRET: "YOUR_DISCORD_APPLICATION_CLIENT_SECRET"
+  DISCORD_REDIRECT_URI: "https://yourdomain.com/callback"
+  
+  # Security & Access
+  TRUSTED_USER_IDS: "YOUR_DISCORD_USER_ID"  # Who can access dashboard and /learn command
+  SESSION_SECRET: "your-random-session-secret-key"
+  
+  # Bot Configuration
+  GRUGBOT_DATA_DIR: "/data"  # Where bot stores its databases
+  GRUGBOT_VARIANT: "prod"  # 'dev' or 'prod'
+  LOG_LEVEL: "INFO"  # DEBUG, INFO, WARNING, ERROR
+  LOAD_EMBEDDER: "True"  # Enable semantic search (True/False)
+  
+  # Multi-Bot Settings
+  MULTIBOT_API_PORT: "8080"
+  ENABLE_CONFIG_RELOAD: "True"
+  WEBSOCKET_ENABLED: "True"
+  
+  # Health Check Settings
+  HEALTH_CHECK_INTERVAL: "30"
+  HEALTH_CHECK_TIMEOUT: "10"
+  
+  # Model Configuration
+  GEMINI_MODEL: "gemini-1.5-flash"
+
+# Bot Templates - Used for creating new bot instances
+bot_templates:
+  pure_grug:
+    name: "Pure Grug"
+    description: "Caveman personality only, no evolution"
+    personality: "grug"
+    load_embedder: true
+    default_gemini_key: true
+    default_google_search: true
+    default_ollama: false
+    custom_env: {}
+  
+  pure_big_rob:
+    name: "Pure Big Rob"
+    description: "norf FC lad personality only, no evolution"
+    personality: "big_rob"
+    load_embedder: true
+    default_gemini_key: true
+    default_google_search: false
+    default_ollama: false
+    custom_env: {}
+  
+  evolution_bot:
+    name: "Evolution Bot"
+    description: "Adaptive personality that evolves per server"
+    personality: "adaptive"
+    load_embedder: true
+    default_gemini_key: true
+    default_google_search: false
+    default_ollama: false
+    custom_env: {}
+  
+  lightweight_grug:
+    name: "Lightweight Grug"
+    description: "Grug personality without semantic search"
+    personality: "grug"
+    load_embedder: false
+    default_gemini_key: true
+    default_google_search: false
+    default_ollama: false
+    custom_env: {}
+  
+  ollama_bot:
+    name: "Ollama Bot"
+    description: "Uses local Ollama instead of Gemini"
+    personality: "adaptive"
+    load_embedder: true
+    default_gemini_key: false
+    default_ollama: true
+    custom_env:
+      OLLAMA_URLS: "http://localhost:11434"
+      OLLAMA_MODELS: "llama3.2:3b"
+
+# Bot Configurations - Individual bot instances
+bot_configs:
+  example-grug:
+    bot_id: example-grug
+    name: "Example Grug Bot"
+    discord_token_id: '1'  # References token ID above
+    template_id: pure_grug
+    personality: grug
+    load_embedder: true
+    log_level: INFO
+    data_dir: "./data"
+    status: stopped
+    auto_start: true
+    created_at: 1751237609.9030309
+
+# Personalities are now loaded from personalities/ directory
+# Each personality is defined in its own YAML file (e.g., personalities/grug.yaml)
+# Available personalities: grug, big_rob, adaptive

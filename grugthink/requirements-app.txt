@@ -1,0 +1,26 @@
+# Lightweight app/runtime dependencies (installed on top of ML base)
+requests>=2.31.0
+setuptools>=78.1.1
+python-dotenv>=1.0.0
+pyyaml>=6.0.1
+
+# Discord and Bot dependencies
+discord.py>=2.3.0
+
+# Google Custom Search for fact-checking (lightweight). v2 drops Gemini
+# (google-generativeai) - chat + embeddings run on the owned spark-gateway.
+google-api-python-client>=2.0.0
+
+# Web framework dependencies
+fastapi>=0.104.0
+uvicorn[standard]>=0.24.0
+pydantic>=2.4.0
+itsdangerous>=2.1.0
+httpx>=0.25.0
+
+# Monitoring and observability
+sentry-sdk>=1.40.0
+
+# Optional dependencies for development (safe in runtime)
+watchdog>=3.0.0
+

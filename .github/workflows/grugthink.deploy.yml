@@ -1,0 +1,104 @@
+name: Deploy · grugthink (Discord bot manager)
+
+# grugthink is a SEPARATE service from grug's webhook/api (its own dir, image,
+# namespace, dashboard on :8080). It does NOT share grug's ADR-0016 services/
+# promotion flow, so it gets its own simple build->push->apply here. Same
+# credentials as deploy.k8s.yml (registry, tailnet, kubeconfig, SSM via OIDC).
+# Secrets come from SSM /githumps/grugthink/*; NO personal host is committed -
+# the tailnet ingress (grug.ts.ehumps.me) lives in the private infra repo's
+# Caddy configmap, reverse-proxying grugthink.grugthink.svc:8080.
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - 'grugthink/**'
+      - '.github/workflows/grugthink.deploy.yml'
+  workflow_dispatch: {}
+
+permissions:
+  contents: read
+  id-token: write  # AWS OIDC for SSM
+
+concurrency:
+  group: grugthink-deploy
+  cancel-in-progress: false
+
+jobs:
+  deploy:
+    runs-on: ubuntu-24.04-arm  # cluster is arm64 - build native
+    environment: k8s-prod
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+
+      - name: Join tailnet (ephemeral)
+        uses: tailscale/github-action@306e68a486fd2350f2bfc3b19fcd143891a4a2d8 # v4
+        with:
+          authkey: ${{ secrets.TS_AUTHKEY }}
+          tags: tag:ci
+
+      - name: Registry login
+        env:
+          REGISTRY_HOST: ${{ vars.DEPLOY_REGISTRY_HOST }}
+          REGISTRY_USERNAME: ${{ secrets.REGISTRY_USERNAME }}
+          REGISTRY_PASSWORD: ${{ secrets.REGISTRY_PASSWORD }}
+        run: |
+          echo "$REGISTRY_PASSWORD" | docker login "$REGISTRY_HOST" \
+            --username "$REGISTRY_USERNAME" --password-stdin
+
+      - name: Build + push image (native arm64)
+        env:
+          REGISTRY_HOST: ${{ vars.DEPLOY_REGISTRY_HOST }}
+        run: |
+          set -euo pipefail
+          TAG="${GITHUB_SHA::12}"
+          docker build grugthink -f grugthink/Dockerfile \
+            -t "$REGISTRY_HOST/grugthink:$TAG"
+          docker push "$REGISTRY_HOST/grugthink:$TAG"
+          echo "TAG=$TAG" >> "$GITHUB_ENV"
+
+      - name: AWS credentials (OIDC) for SSM
+        uses: aws-actions/configure-aws-credentials@cabfdba3510de1431bac9dba27511d97497fc100 # v5
+        with:
+          role-to-assume: arn:aws:iam::${{ secrets.AWS_ACCOUNT_ID }}:role/grug-gha-deploy
+          aws-region: us-east-1
+
+      - name: Write kubeconfig
+        env:
+          KUBECONFIG_B64: ${{ secrets.KUBECONFIG_B64 }}
+        run: |
+          mkdir -p "$HOME/.kube"
+          echo "$KUBECONFIG_B64" | base64 -d > "$HOME/.kube/config"
+          chmod 600 "$HOME/.kube/config"
+
+      - name: Namespace + secrets (SSM) + registry pull secret
+        env:
+          REGISTRY_HOST: ${{ vars.DEPLOY_REGISTRY_HOST }}
+          REGISTRY_USERNAME: ${{ secrets.REGISTRY_USERNAME }}
+          REGISTRY_PASSWORD: ${{ secrets.REGISTRY_PASSWORD }}
+        run: |
+          set -euo pipefail
+          kubectl create namespace grugthink --dry-run=client -o yaml | kubectl apply -f -
+          # App secret from SSM (never printed). Add more --from-literal lines as
+          # /githumps/grugthink/* grows (discord tokens are added via the dashboard).
+          SESSION_SECRET="$(aws ssm get-parameter --name /githumps/grugthink/session_secret \
+            --with-decryption --query Parameter.Value --output text)"
+          kubectl create secret generic grugthink-secrets -n grugthink \
+            --from-literal=SESSION_SECRET="$SESSION_SECRET" \
+            --dry-run=client -o yaml | kubectl apply -f -
+          # Registry pull secret from the same push credential.
+          kubectl create secret docker-registry registry-pull -n grugthink \
+            --docker-server="$REGISTRY_HOST" \
+            --docker-username="$REGISTRY_USERNAME" \
+            --docker-password="$REGISTRY_PASSWORD" \
+            --dry-run=client -o yaml | kubectl apply -f -
+
+      - name: Apply manifests
+        env:
+          REGISTRY_HOST: ${{ vars.DEPLOY_REGISTRY_HOST }}
+        run: |
+          set -euo pipefail
+          sed -e "s#REGISTRY_PLACEHOLDER#${REGISTRY_HOST}#" \
+              -e "s#TAG_PLACEHOLDER#${TAG}#" \
+              grugthink/k8s/deployment.yaml | kubectl apply -f -
+          kubectl rollout status deploy/grugthink -n grugthink --timeout=240s
