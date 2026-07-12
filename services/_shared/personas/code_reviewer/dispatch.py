@@ -48,6 +48,7 @@ from personas.code_reviewer.diff_parser import (
 from personas.code_reviewer.precedent import (
     class_precision, match_precedent, render_precedent_note,
 )
+from personas.code_reviewer.complexity import scan_complexity
 from personas.code_reviewer.cross_file import (
     extract_symbols, fetch_cross_file_context,
 )
@@ -56,7 +57,7 @@ from personas.code_reviewer.judge import (
     eval_tags, grade_findings, partition_findings, submit_evals,
 )
 from personas.code_reviewer.persona import (
-    CodeReviewEvaluation, Finding, evaluate_diff, with_findings,
+    CodeReviewEvaluation, Finding, evaluate_diff, with_extra_findings, with_findings,
 )
 from personas.code_reviewer.snapshot import review_snapshot_id_from_pr
 from adapters.install_store import (  # type: ignore
@@ -1084,6 +1085,22 @@ def dispatch_code_review(
                 "pr": f"{owner}/{repo_name}#{pull_number}",
                 "suppressed": len(suppressed),
                 "published": len(kept),
+            },
+        )
+
+    # #532: deterministic complexity source. A changed Python function over the
+    # cyclomatic/cognitive cap merges as an advisory MEDIUM finding - no LLM, no
+    # judge (it is precise by construction). It rides the SAME merge rule as the
+    # SAST suite; MEDIUM means it never blocks a merge on its own.
+    complexity_findings = scan_complexity(hunks, file_contents)
+    if complexity_findings:
+        evaluation = with_extra_findings(evaluation, complexity_findings)
+        log.info(
+            "code_review_complexity_findings",
+            extra={
+                "installation_id": installation_id,
+                "pr": f"{owner}/{repo_name}#{pull_number}",
+                "count": len(complexity_findings),
             },
         )
 
