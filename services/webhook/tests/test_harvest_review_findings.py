@@ -185,3 +185,59 @@ class TestRecallReport:
     def test_lineless_bot_row_matches_on_path(self):
         report = recall_report([self._bot(line=None)], [self._grug(line=99)])
         assert report["matched"] == 1
+
+
+# --- secret redaction + committed-corpus self-verification -------------------
+
+import json as _json
+import pathlib as _pathlib
+
+from elder_eval.harvest_review_findings import recall_report as _rr, redact_finding_text
+
+
+class TestSecretRedaction:
+    def test_long_hex_masked_everywhere(self):
+        out = redact_finding_text("token 6a2da7b19c4e8f20d13aa4b2 leaked", "anything")
+        assert "6a2da7b19c4e8f20d13aa4b2" not in out
+        assert "REDACTED[24]" in out
+
+    def test_secret_category_masks_token_runs(self):
+        out = redact_finding_text(
+            "webhook id AbC123_xyz-987654321000 in file", "secret-in-log-or-trace",
+        )
+        assert "AbC123_xyz-987654321000" not in out
+        assert "REDACTED" in out
+
+    def test_non_secret_category_keeps_identifiers(self):
+        text = "call test_enforcement_pass_error_emit path unchanged"
+        assert redact_finding_text(text, "caller-not-updated") == text
+
+
+class TestCommittedCorpusSelfVerifies:
+    """#608 review: the checked-in corpus must reproduce the manifest's
+    published counts + baseline, and carry no unredacted credential runs."""
+
+    _ROOT = _pathlib.Path(__file__).resolve().parents[3]
+
+    def _load(self):
+        corpus_p = self._ROOT / "logs" / "review-findings.jsonl"
+        manifest_p = self._ROOT / "logs" / "review-findings.manifest.json"
+        rows = [_json.loads(l) for l in corpus_p.read_text().splitlines() if l.strip()]
+        manifest = _json.loads(manifest_p.read_text())
+        return rows, manifest
+
+    def test_counts_and_baseline_match_manifest(self):
+        rows, manifest = self._load()
+        assert manifest["total_rows"] == len(rows)
+        for k, v in manifest["by_source"].items():
+            assert v == sum(1 for r in rows if r["source"] == k), k
+        corpus = [r for r in rows if r["source"] in ("src-a", "src-b")]
+        grug = [r for r in rows if r["source"] == "grug"]
+        assert _rr(corpus, grug) == manifest["recall_report"]
+
+    def test_no_unredacted_credential_runs_in_secret_rows(self):
+        rows, _ = self._load()
+        import re
+        hex_run = re.compile(r"\b[0-9a-fA-F]{16,}\b")
+        for r in rows:
+            assert not hex_run.search(r["finding"]), (r["repo"], r["pr"])

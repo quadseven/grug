@@ -100,6 +100,34 @@ def _kebab(label: str) -> str:
     return _NORM_RE.sub("-", label.lower()).strip("-")
 
 
+# Secret-class findings quote the credential material they flag; committing
+# that verbatim republishes it (observed on #608: a webhook token from a
+# PRIVATE repo's review landed in this PUBLIC corpus - Critical). Mask
+# credential-shaped runs at generation time: long hex everywhere, plus any
+# long token run inside secret-class findings. Masked form keeps a 4-char
+# prefix + length so rows stay matchable without being usable.
+_HEX_RUN_RE = re.compile(r"\b[0-9a-fA-F]{16,}\b")
+_TOKEN_RUN_RE = re.compile(r"\b[A-Za-z0-9+/_\-]{20,}\b")
+_SECRET_CATEGORY_RE = re.compile(r"secret|credential|token|api-?key", re.IGNORECASE)
+
+
+def _mask(match: re.Match) -> str:
+    t = match.group(0)
+    return f"{t[:4]}\u2026REDACTED[{len(t)}]"
+
+
+def redact_finding_text(text: str, category: str) -> str:
+    """Mask credential-shaped substrings in a finding's text (pure).
+
+    Long hex runs are masked unconditionally; inside secret-class categories
+    every long token run is masked (those findings exist to point AT a
+    credential, so any long run is presumed material)."""
+    out = _HEX_RUN_RE.sub(_mask, text)
+    if _SECRET_CATEGORY_RE.search(category or ""):
+        out = _TOKEN_RUN_RE.sub(_mask, out)
+    return out
+
+
 def _pr_number(pull_request_url: str) -> int | None:
     m = re.search(r"/pulls/(\d+)$", pull_request_url or "")
     return int(m.group(1)) if m else None
@@ -144,7 +172,7 @@ def parse_inline_header_comment(repo: str, raw: dict[str, Any]) -> BotFinding | 
         ),
         severity=_INLINE_SEVERITY_MAP[header.group("severity").lower()],
         category=_kebab(header.group("category")),
-        finding=finding[:300],
+        finding=redact_finding_text(finding, _kebab(header.group("category")))[:300],
         # `line` null with `original_line` set == GitHub says the position is
         # outdated (the code moved after the comment) -- a weak "addressed"
         # signal the eval can weigh.
@@ -187,7 +215,7 @@ def parse_summary_block_comment(
                 line=int(file_m.group("line")) if file_m else None,
                 severity=severity,
                 category="review-bug",
-                finding=title[:300],
+                finding=redact_finding_text(title, "review-bug")[:300],
                 outdated=False,
                 ts=ts,
                 url=url,
@@ -234,7 +262,7 @@ def parse_grug_comment(repo: str, raw: dict[str, Any]) -> BotFinding | None:
         ),
         severity=header.group("severity").lower(),
         category=_kebab(header.group("category")),
-        finding=first_line[:300],
+        finding=redact_finding_text(first_line, header.group("category"))[:300],
         outdated=line is None and original_line is not None,
         ts=str(raw.get("created_at") or ""),
         url=str(raw.get("html_url") or ""),
@@ -270,7 +298,7 @@ def recall_report(
         line = row.get("line")
         elder_index.setdefault(key, []).append(int(line) if line is not None else None)
 
-    def elder_has(repo: str, pr: int, path: str, line: Any) -> bool:
+    def elder_has(repo: str, pr: int, path: str, line: "int | str | None") -> bool:
         lines = elder_index.get((repo, pr, path))
         if lines is None:
             return False
@@ -443,9 +471,23 @@ def main() -> None:
     rows = [asdict(f) for f in findings]
     corpus = [r for r in rows if r["source"] in ("src-a", "src-b")]
     grug = [r for r in rows if r["source"] == "grug"]
+    report = recall_report(corpus, grug)
+    # Self-verifying corpus (#608 review): a manifest of the counts/baseline
+    # is committed beside the JSONL so a test can assert the checked-in data
+    # reproduces the published metrics.
+    manifest = {
+        "total_rows": len(rows),
+        "by_source": {
+            k: sum(1 for r in rows if r["source"] == k)
+            for k in sorted({r["source"] for r in rows})
+        },
+        "recall_report": report,
+    }
+    with open(args.out.replace(".jsonl", ".manifest.json"), "w", encoding="utf-8") as fh:
+        json.dump(manifest, fh, indent=2, sort_keys=True)
     print(f"wrote {len(rows)} findings -> {args.out} "
           f"(corpus={len(corpus)}, grug={len(grug)})")
-    print(json.dumps(recall_report(corpus, grug), indent=2))
+    print(json.dumps(report, indent=2))
 
 
 if __name__ == "__main__":
