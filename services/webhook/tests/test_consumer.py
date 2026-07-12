@@ -68,9 +68,11 @@ def test_poll_dispatches_esm_shaped_event_and_deletes():
 
 
 def test_poll_handler_raise_leaves_message_for_redrive():
-    """The rerun contract: a raise must NOT delete — the message reappears
-    after the visibility timeout and redrives to the DLQ after 5 receives,
-    exactly like the Lambda ESM retry path."""
+    """The rerun contract's consumer half: a raise must NOT delete, so the
+    message reappears after the visibility timeout (like the Lambda ESM retry
+    path). The DLQ threshold itself (maxReceiveCount=5) is queue config owned
+    by infra/pulumi/__main__.py, not observable from a single poll - this
+    test only pins the no-delete-on-raise behavior."""
     handler = MagicMock(side_effect=RuntimeError("re-run failed"))
     with (
         patch.object(
