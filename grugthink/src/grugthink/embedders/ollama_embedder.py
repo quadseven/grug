@@ -161,8 +161,13 @@ class OllamaEmbedder:
             True if connection successful and model available, False otherwise
         """
         try:
-            # Test basic connectivity
-            response = requests.get(f"{self.ollama_url}/api/tags", timeout=5)
+            # Test basic connectivity. Use the full request timeout (not a short
+            # hardcoded 5s): the in-cluster spark-gateway aggregates backends and
+            # /api/tags can exceed 5s under load. A transient tags timeout here
+            # marked the embedder dead -> fell back to SentenceTransformer (absent
+            # in the light image) -> vector search silently disabled. The real
+            # /api/embeddings call already uses self.timeout and works fine.
+            response = requests.get(f"{self.ollama_url}/api/tags", timeout=self.timeout)
             if response.status_code != 200:
                 log.error(
                     "Ollama server not reachable",
