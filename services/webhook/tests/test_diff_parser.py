@@ -343,3 +343,47 @@ index abc..def 100644
 """
     with pytest.raises(DiffParseError, match="malformed zero-start"):
         parse_diff(diff)
+
+
+# --- #609: review-exclusion split -------------------------------------------
+
+from personas.code_reviewer.diff_parser import (  # noqa: E402
+    is_review_excluded_path, split_reviewable_hunks,
+)
+
+
+class TestReviewExclusionSplit:
+    def _hunk(self, path):
+        return DiffHunk(file_path=path, new_start=1, new_lines=frozenset({1}), body="@@ -1 +1 @@\n+x")
+
+    def test_data_and_lockfiles_excluded(self):
+        for p in (
+            "logs/review-findings.jsonl", "data/x.csv", "web/app.min.js",
+            "package-lock.json", "uv.lock", "poetry.lock", "go.sum",
+            "assets/logo.svg", "node_modules/a/b.js", "vendor/lib.py",
+        ):
+            assert is_review_excluded_path(p), p
+
+    def test_code_paths_kept(self):
+        for p in (
+            "services/webhook/consumer.py", "k8s/deployment.yaml",
+            "src/locker.py", "docs/adr/0001.md", "a/distance.py",
+            "web/index.js", "config.json",
+        ):
+            assert not is_review_excluded_path(p), p
+
+    def test_split_partitions_and_dedupes(self):
+        hunks = (
+            self._hunk("src/a.py"),
+            self._hunk("logs/corpus.jsonl"),
+            self._hunk("logs/corpus.jsonl"),   # second hunk, same file
+            self._hunk("src/b.py"),
+        )
+        kept, excluded = split_reviewable_hunks(hunks)
+        assert [h.file_path for h in kept] == ["src/a.py", "src/b.py"]
+        assert excluded == ("logs/corpus.jsonl",)
+
+    def test_all_excluded_yields_empty_kept(self):
+        kept, excluded = split_reviewable_hunks((self._hunk("x.lock"),))
+        assert kept == ()
+        assert excluded == ("x.lock",)

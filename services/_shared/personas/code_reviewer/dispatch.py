@@ -43,7 +43,7 @@ from personas.code_reviewer.dedup import (
     rule_marker,
 )
 from personas.code_reviewer.diff_parser import (
-    DiffHunk, DiffParseError, parse_diff,
+    DiffHunk, DiffParseError, parse_diff, split_reviewable_hunks,
 )
 from personas.code_reviewer.cross_file import (
     extract_symbols, fetch_cross_file_context,
@@ -386,6 +386,7 @@ def _to_llm_hunks(hunks: tuple[DiffHunk, ...]) -> list[LlmHunk]:
 
 def _summary_markdown(
     evaluation: CodeReviewEvaluation, *, suppressed_count: int = 0,
+    excluded_paths: tuple[str, ...] = (),
 ) -> tuple[str, str]:
     """Render a (title, summary) pair for the check-run output.
 
@@ -400,6 +401,17 @@ def _summary_markdown(
         if suppressed_count
         else ""
     )
+    if excluded_paths:
+        # Paths are author-controlled: strip backticks so a crafted filename
+        # cannot break out of the inline code span into the summary markdown.
+        shown = ", ".join(
+            f"`{p.replace(chr(96), '')}`" for p in excluded_paths[:10]
+        )
+        more = f" (+{len(excluded_paths) - 10} more)" if len(excluded_paths) > 10 else ""
+        held += (
+            f"\n\nGrug not read {len(excluded_paths)} data/generated "
+            f"file(s) - no meat for review there: {shown}{more}."
+        )
     if evaluation.degraded_reason:
         title = f"⚠️ Grug eyes clouded ({evaluation.degraded_reason})"
         return title, (
@@ -841,6 +853,19 @@ def dispatch_code_review(
             ),
         )
         hunks = parse_diff(diff_text)
+        # #609: drop data/generated/vendored files from the LLM's plate - a
+        # big JSONL/lockfile hunk balloons the prompt into parse_failed and
+        # carries no review signal. Named in the summary, never silent.
+        hunks, excluded_paths = split_reviewable_hunks(hunks)
+        if excluded_paths:
+            log.info(
+                "code_review_paths_excluded",
+                extra={
+                    "pr": f"{owner}/{repo_name}#{pull_number}",
+                    "excluded": list(excluded_paths)[:20],
+                    "count": len(excluded_paths),
+                },
+            )
     except (httpx.HTTPStatusError, httpx.RequestError, DiffParseError) as e:
         log.warning(
             "code_review_fetch_or_parse_failed",
@@ -1043,7 +1068,10 @@ def dispatch_code_review(
     # Both clients are independent — a 5xx on review post must not
     # skip the check-run post.
     conclusion, event = _publish_shape(evaluation, mode=mode)
-    title, summary = _summary_markdown(evaluation, suppressed_count=len(suppressed))
+    title, summary = _summary_markdown(
+        evaluation, suppressed_count=len(suppressed),
+        excluded_paths=excluded_paths,
+    )
     check_result = CheckRunResult(
         name=_CHECK_NAME,
         head_sha=head_sha,
