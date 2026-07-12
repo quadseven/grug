@@ -285,6 +285,11 @@ class PgVectorServerManager:
         self.load_embedder = load_embedder
         self.server_dbs = {}
         self.lock = threading.Lock()
+        # Separate lock for the embedder: get_server_db() holds self.lock and
+        # calls _get_embedder(), so the two critical sections MUST NOT be the
+        # same non-reentrant lock or the thread self-deadlocks (froze the event
+        # loop -> liveness SIGKILL -> crash loop).
+        self._embedder_lock = threading.Lock()
         self._embedder = None
         self._embedder_loaded = False
         log.info(
@@ -296,7 +301,7 @@ class PgVectorServerManager:
         """Build the shared OllamaEmbedder once (same gateway path as GrugDB)."""
         if self._embedder_loaded:
             return self._embedder
-        with self.lock:
+        with self._embedder_lock:
             if self._embedder_loaded:
                 return self._embedder
             self._embedder_loaded = True

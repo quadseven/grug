@@ -92,6 +92,41 @@ def test_factory_selects_pgvector_with_dsn(monkeypatch, tmp_path):
     assert isinstance(mgr, pgvector_store.PgVectorServerManager)
 
 
+def test_get_server_db_loads_embedder_without_deadlock(monkeypatch):
+    """get_server_db() holds self.lock and calls _get_embedder(); the two must
+    use different locks or the thread self-deadlocks (froze the loop in prod).
+
+    Runs in a worker thread with a join timeout so a regression HANGS the test
+    (detected) rather than blocking the whole suite.
+    """
+    import threading
+
+    class _StubEmbedder:
+        def __init__(self, *a, **k):
+            pass
+
+        def test_connection(self):
+            return True
+
+    monkeypatch.setenv("USE_OLLAMA_EMBEDDINGS", "true")
+    monkeypatch.setenv("OLLAMA_URLS", "http://gateway:11434")
+    monkeypatch.setattr("src.grugthink.embedders.OllamaEmbedder", _StubEmbedder)
+
+    mgr = pgvector_store.PgVectorServerManager("/data/deadlock-check/facts.db", load_embedder=True)
+
+    result = {}
+
+    def _call():
+        db = mgr.get_server_db("srv")
+        result["ok"] = db is not None and mgr._embedder is not None
+
+    t = threading.Thread(target=_call, daemon=True)
+    t.start()
+    t.join(timeout=5)
+    assert not t.is_alive(), "get_server_db deadlocked (embedder lock == manager lock)"
+    assert result.get("ok") is True
+
+
 # --------------------------------------------------------------------------- #
 # Store tests (real pgvector Postgres)
 # --------------------------------------------------------------------------- #
