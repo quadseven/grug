@@ -148,6 +148,31 @@ def test_coder_arm_failure_falls_back_to_reasoner_arm(monkeypatch) -> None:
     assert len(out.findings) == 1
 
 
+def test_cave_arms_carry_require_keys_json_schema(monkeypatch) -> None:
+    """#609: both Cave arms must send the require-keys findings json_schema
+    (extra_body replaces the default json_object, which ollama maps to a
+    truncation-prone bare format=json - the #544 estate trap, production
+    edition). The schema mirrors _coerce_finding's required fields."""
+    monkeypatch.setenv("GRUG_REVIEW_DEPTH", "deep")
+    seen = []
+
+    def respond(url, **kwargs):
+        body = kwargs.get("json") or {}
+        seen.append((body.get("model", ""), body.get("response_format", {})))
+        return httpx.Response(200, json=_openai_json_response('{"findings": []}'))
+
+    with patch.object(httpx, "post", side_effect=respond):
+        review_diff([_hunk()], installation_id=1)
+
+    assert len(seen) == 2
+    for model, rf in seen:
+        assert rf.get("type") == "json_schema", model
+        schema = rf["json_schema"]["schema"]
+        assert schema["required"] == ["findings"]
+        item = schema["properties"]["findings"]["items"]
+        assert item["required"] == ["path", "line", "rule", "severity", "message"]
+
+
 def _is_reasoner(kwargs) -> bool:
     """True when this request targets the reasoner arm (qwen3.5), by inspecting
     the model in the outgoing body - both arms share the gateway URL now."""
@@ -341,8 +366,9 @@ def test_request_uses_openai_chat_completions_shape() -> None:
     assert isinstance(body["messages"], list)
     assert body["messages"][0]["role"] == "system"
     assert body["messages"][1]["role"] == "user"
-    # OpenAI-compatible JSON-mode hint to coerce structured response
-    assert body.get("response_format") == {"type": "json_object"}
+    # #609: Cave arms carry the require-keys findings json_schema (extra_body
+    # replaces the default json_object - the truncation-prone bare format=json).
+    assert body.get("response_format", {}).get("type") == "json_schema"
     # Authorization header carries the loaded key (in-cluster placeholder).
     assert captured[0]["headers"]["Authorization"].startswith("Bearer ")
     # Review gets a multi-minute read budget.

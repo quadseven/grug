@@ -441,6 +441,44 @@ def _cave_judge_config() -> "BackendConfig | None":
 _CAVE_REVIEW_CODER_DEFAULT_MODEL = "qwen3-coder-next:q8_0"
 _CAVE_REVIEW_REASONER_DEFAULT_MODEL = "qwen3.5:122b"
 
+# #609: require-keys response schema for the Cave arms. The gateway's ollama
+# backends map a bare `{"type": "json_object"}` to `format=json`, which
+# silently TRUNCATES multi-item answers (the known estate trap; same fix as
+# the bench transport, #544) - a large diff reliably came back unparseable
+# (parse_failed). The schema mirrors exactly what `_coerce_finding` requires;
+# additional fields (e.g. `suggestion`) remain allowed. SaaS-style backends
+# keep plain json_object via the default body (this rides extra_body, which
+# merges AFTER the default response_format and so replaces it per-backend).
+_CAVE_FINDINGS_RESPONSE_FORMAT = {
+    "type": "json_schema",
+    "json_schema": {
+        "name": "review_findings",
+        "schema": {
+            "type": "object",
+            "properties": {
+                "findings": {
+                    "type": "array",
+                    "items": {
+                        "type": "object",
+                        "properties": {
+                            "path": {"type": "string"},
+                            "line": {"type": "integer"},
+                            "rule": {"type": "string"},
+                            "severity": {
+                                "type": "string",
+                                "enum": ["low", "medium", "high", "critical"],
+                            },
+                            "message": {"type": "string"},
+                        },
+                        "required": ["path", "line", "rule", "severity", "message"],
+                    },
+                },
+            },
+            "required": ["findings"],
+        },
+    },
+}
+
 
 def _cave_review_config(backend: Backend) -> "BackendConfig | None":
     """BackendConfig for one arm of the owned in-cluster review ensemble.
@@ -462,6 +500,8 @@ def _cave_review_config(backend: Backend) -> "BackendConfig | None":
         url=f"{base}/v1/chat/completions",
         model=model,
         key_loader=lambda: "in-cluster",  # gateway is unauthenticated in-cluster
+        # #609: replaces the default json_object for the Cave arms only.
+        extra_body={"response_format": _CAVE_FINDINGS_RESPONSE_FORMAT},
     )
 
 
