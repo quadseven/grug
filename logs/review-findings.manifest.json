@@ -1,0 +1,48 @@
+{
+  "by_source": {
+    "grug": 302,
+    "src-a": 546,
+    "src-b": 350
+  },
+  "recall_report": {
+    "by_severity": {
+      "critical": {
+        "matched": 0,
+        "recall": 0.0,
+        "total": 17
+      },
+      "high": {
+        "matched": 5,
+        "recall": 0.0188,
+        "total": 266
+      },
+      "low": {
+        "matched": 3,
+        "recall": 0.0148,
+        "total": 203
+      },
+      "medium": {
+        "matched": 8,
+        "recall": 0.0219,
+        "total": 366
+      }
+    },
+    "by_source": {
+      "src-a": {
+        "matched": 7,
+        "recall": 0.0128,
+        "total": 546
+      },
+      "src-b": {
+        "matched": 9,
+        "recall": 0.0294,
+        "total": 306
+      }
+    },
+    "denominator": 852,
+    "matched": 16,
+    "recall": 0.0188,
+    "unanchored_excluded": 44
+  },
+  "total_rows": 1198
+}
