@@ -1164,7 +1164,14 @@ def dispatch_code_review(
         prior_keys, dedup_degraded = _prior_finding_keys(
             installation_id, owner, repo_name, pull_number,
         )
-    precedent_notes = _precedent_notes_for(f"{owner}/{repo_name}", evaluation.findings)
+    # Only pay the ledger fetch when there is something to annotate: a
+    # degraded eval publishes no inline review, and no findings means no
+    # notes (CodeRabbit on #614).
+    precedent_notes = (
+        _precedent_notes_for(f"{owner}/{repo_name}", evaluation.findings)
+        if evaluation.findings and not evaluation.degraded_reason
+        else {}
+    )
     review_result = _build_review_result(
         evaluation, head_sha=head_sha, event=event, prior_keys=prior_keys,
         precedent_notes=precedent_notes,

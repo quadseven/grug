@@ -33,6 +33,23 @@ class TestClassPrecision:
         assert round(p["sync-io-in-async"].precision, 3) == 0.667
         assert p["flaky"].precision == 1.0
 
+    def test_declined_counts_as_accepted_and_is_cited(self):
+        """Ledger fact: `declined` = Grug was right, human chose not to change
+        it -> ACCEPTED (citable + counted in precision), NOT a rejection."""
+        rows = [
+            _row(10, "c", "declined", path="services/webhook/consumer.py",
+                 ts="2026-06-01T00:00:00Z"),
+            _row(11, "c", "false-positive", path="services/webhook/consumer.py"),
+        ]
+        p = class_precision(rows)
+        assert p["c"].accepted == 1     # declined counts as accepted
+        assert p["c"].rejected == 1
+        m = match_precedent(finding_class="c",
+                            finding_path="services/webhook/consumer.py", ledger_rows=rows)
+        assert [pr for pr, _ in m.citations] == [10]
+        assert m.citations[0][1] == "declined"
+        assert "kept" in render_precedent_note(m)  # verdict word, not "fixed"
+
     def test_unlabeled_class_is_half_not_one(self):
         cp = ClassPrecision("x", 0, 0)
         assert cp.labeled == 0

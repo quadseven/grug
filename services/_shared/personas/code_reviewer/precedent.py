@@ -109,6 +109,9 @@ class PrecedentMatch:
 
 _MIN_TOKEN_OVERLAP = 1  # one meaningful shared atom == same region, heuristically
 
+# How each accepted verdict reads in a citation.
+_VERDICT_WORD = {"fixed": "fixed", "declined": "kept, Grug right"}
+
 
 def match_precedent(
     *,
@@ -162,11 +165,12 @@ def render_precedent_note(match: PrecedentMatch) -> str:
         return ""
     parts: list[str] = []
     if match.has_precedent:
-        prs = ", ".join(f"#{pr}" for pr, _ in match.citations)
+        # Cite each PR with its actual verdict word: "fixed" (patched) vs
+        # "declined" (Grug was right, human chose not to change it) - both
+        # count as accepted precedent, but they are not the same story.
+        cited = ", ".join(f"#{pr} ({_VERDICT_WORD.get(v, v)})" for pr, v in match.citations)
         n = len(match.citations)
-        parts.append(
-            f"Grug see this before -- {n} time(s) fixed here ({prs})."
-        )
+        parts.append(f"Grug see this before -- {n} time(s) here ({cited}).")
     if match.labeled_history:
         parts.append(
             f"Grug tribe judge this kind `{match.confidence_label}` "
