@@ -460,9 +460,11 @@ def test_transport_failure_on_both_backends_returns_all_failed(monkeypatch) -> N
     # Long review timeouts are not retried; one attempt per arm bounds the deep
     # generation phase even though quick 429/503 responses still retry.
     assert len(call_log) == 2
-    # Both arms represented (coder + reasoner models).
+    # Both arms represented (coder + reasoner models). Assert the coder
+    # substring explicitly: "qwen" alone also matches the reasoner
+    # (qwen3.5), so it could pass on two reasoner calls.
     assert any("qwen3.5" in m for m in call_log)
-    assert any("qwen" in m for m in call_log)
+    assert any("qwen3-coder" in m for m in call_log)
 
 
 def test_parse_failed_attributes_secondary_backend(monkeypatch) -> None:

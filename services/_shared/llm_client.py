@@ -1194,8 +1194,9 @@ def review_diff(
     # Owned review ensemble (replaces the retired SaaS pair): coder arm
     # (qwen3-coder-next) + reasoner arm (qwen3.5, always-hot on sparkicus),
     # both via the Cave gateway. Deep runs both and merges (brain+hands); fast
-    # returns after the coder arm. No SaaS spend, no 402 outage. Order = coder
-    # first so fast mode uses the code specialist.
+    # returns after the FIRST SUCCESSFUL arm - coder first so fast mode uses
+    # the code specialist, falling over to the reasoner only if the coder arm
+    # fails. No SaaS spend, no 402 outage.
     review_backends: tuple[Backend, ...] = (Backend.CAVE, Backend.CAVE_REASONER)
     depth = os.getenv("GRUG_REVIEW_DEPTH", "deep").strip().lower()
     deep = depth != "fast"
