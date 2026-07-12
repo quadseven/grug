@@ -626,7 +626,7 @@ def main() -> None:
         died = True
     # SHARED join deadline (not per-thread): five threads x a per-thread 30s
     # join could eat 150s while the pod is SIGKILLed at its grace period,
-    # which would skip the claim sweep below (CodeRabbit/Qodo on #607). 15s
+    # which would skip the claim sweep below (review findings on PR #607). 15s
     # total gives quick handlers a chance to finish and still leaves most of
     # the grace window for the sweep. Long-poll wait is 20s, so idle threads
     # notice _stop almost immediately.
