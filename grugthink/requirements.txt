@@ -10,7 +10,7 @@ discord.py>=2.3.0
 
 # Vector index (local). v2: embeddings come from the spark-gateway, so
 # sentence-transformers + torch are dropped.
-faiss-cpu==1.7.4
+faiss-cpu==1.8.0
 
 # Google Custom Search for fact-checking (lightweight). Gemini
 # (google-generativeai) is dropped - chat/embeddings run on the spark-gateway.
