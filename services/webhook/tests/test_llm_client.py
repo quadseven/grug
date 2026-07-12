@@ -156,7 +156,7 @@ def test_cave_arms_carry_require_keys_json_schema(monkeypatch) -> None:
     monkeypatch.setenv("GRUG_REVIEW_DEPTH", "deep")
     seen = []
 
-    def respond(url, **kwargs):
+    def respond(_url, **kwargs) -> httpx.Response:
         body = kwargs.get("json") or {}
         seen.append((body.get("model", ""), body.get("response_format", {})))
         return httpx.Response(200, json=_openai_json_response('{"findings": []}'))
@@ -169,8 +169,12 @@ def test_cave_arms_carry_require_keys_json_schema(monkeypatch) -> None:
         assert rf.get("type") == "json_schema", model
         schema = rf["json_schema"]["schema"]
         assert schema["required"] == ["findings"]
+        assert schema["properties"]["findings"]["type"] == "array"
         item = schema["properties"]["findings"]["items"]
         assert item["required"] == ["path", "line", "rule", "severity", "message"]
+        assert item["properties"]["severity"]["enum"] == [
+            "low", "medium", "high", "critical",
+        ]
 
 
 def _is_reasoner(kwargs) -> bool:
