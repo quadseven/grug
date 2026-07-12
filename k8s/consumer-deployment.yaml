@@ -35,6 +35,11 @@ spec:
       # (k8s/smasher-trial-namespace.yaml + ADR-0013) with none in `grug`.
       serviceAccountName: grug-smasher-launcher
       automountServiceAccountToken: true
+      # 60s (default 30): shutdown budget = 15s shared thread-join + the
+      # orphaned-claim release sweep (#607). The sweep MUST complete before
+      # SIGKILL or a killed Elder review's claim bounces redeliveries off
+      # "claim busy" while the PR waits on its REQUIRED check (grug#515).
+      terminationGracePeriodSeconds: 60
       nodeSelector:
         kubernetes.io/arch: arm64
       imagePullSecrets:

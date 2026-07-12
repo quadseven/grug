@@ -441,6 +441,71 @@ def test_hot_review_dispatch_error_releases_claim_and_raises_for_redrive(monkeyp
     complete.assert_not_called()
 
 
+def test_shutdown_release_frees_claims_orphaned_by_a_killed_review(monkeypatch):
+    """grug#515 blocking hardening: a consumer pod killed mid-review never
+    reaches its except/finally, orphaning the snapshot claim for up to the
+    900s lease and bouncing the SQS redelivery off "claim busy". main() calls
+    release_active_review_claims() on shutdown; every still-registered claim
+    must be released exactly once and the registry drained."""
+    release = MagicMock(return_value=True)
+    monkeypatch.setattr("adapters.install_store.release_review_claim", release)
+
+    args = {
+        "install_id": 11, "repo": "o/r", "pr_number": 7,
+        "persona": "code_reviewer", "head_sha": "snap", "owner_token": "tok-1",
+    }
+    rerun._register_active_review_claim("tok-1", args)
+
+    assert rerun.release_active_review_claims() == 1
+    release.assert_called_once_with(**args)
+    # Registry drained: a second sweep has nothing to do.
+    assert rerun.release_active_review_claims() == 0
+
+
+def test_shutdown_release_is_best_effort_per_claim(monkeypatch):
+    """One claim whose release raises (or lost ownership) must not stop the
+    rest of the sweep - shutdown has a hard deadline."""
+    calls = []
+
+    def _release(**kw):
+        calls.append(kw["owner_token"])
+        if kw["owner_token"] == "tok-a":
+            raise RuntimeError("store down")
+        return True
+
+    monkeypatch.setattr("adapters.install_store.release_review_claim", _release)
+    base = {"install_id": 1, "repo": "o/r", "pr_number": 1,
+            "persona": "code_reviewer", "head_sha": "s"}
+    rerun._register_active_review_claim("tok-a", {**base, "owner_token": "tok-a"})
+    rerun._register_active_review_claim("tok-b", {**base, "owner_token": "tok-b"})
+
+    assert rerun.release_active_review_claims() == 1  # tok-b released
+    assert set(calls) == {"tok-a", "tok-b"}
+
+
+def test_in_process_exits_unregister_so_shutdown_sweep_sees_nothing(monkeypatch):
+    """Every IN-PROCESS exit (here: dispatch error -> except-release -> raise)
+    must unregister its claim, so the shutdown sweep never double-releases a
+    claim the handler already released itself."""
+    monkeypatch.setattr(
+        rerun,
+        "with_install_token_retry",
+        lambda iid, fn: _pr_data(head_sha="unreg-head"),
+    )
+    monkeypatch.setattr(rerun, "get_repo_config", lambda iid, rid: {})
+    _patch_hot_claims(monkeypatch)
+    monkeypatch.setattr(
+        rerun,
+        "dispatch_code_review",
+        MagicMock(side_effect=RuntimeError("review crashed")),
+    )
+
+    with pytest.raises(RuntimeError, match="review crashed"):
+        rerun._run_one(_job(kind="review", settle_seconds=0))
+
+    assert rerun.release_active_review_claims() == 0
+
+
 def test_hot_review_publish_failure_releases_claim_and_raises_for_redrive(monkeypatch):
     monkeypatch.setattr(
         rerun,
