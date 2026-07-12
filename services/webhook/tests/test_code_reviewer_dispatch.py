@@ -316,6 +316,54 @@ def test_inline_comment_body_includes_suggestion_block(monkeypatch):
     assert "<!-- grug-rule:null-deref -->" in body  # marker still appended
 
 
+def test_inline_comment_body_appends_precedent_note():
+    """#555: a precedent note renders as a blockquote under the message,
+    before the hidden dedup marker."""
+    from personas.code_reviewer.persona import Finding
+    f = Finding(
+        file="x.py", line=1, severity="high", rule_name="sync-io-in-async",
+        message="blocking call", suggestion=None,
+    )
+    body = cr_dispatch._inline_comment_body(
+        f, precedent_note="Grug see this before -- 2 time(s) fixed here (#400, #366).",
+    )
+    assert "> Grug see this before" in body
+    assert "#400" in body
+    assert body.index("Grug see this before") < body.index("grug-rule:sync-io-in-async")
+
+
+def test_precedent_notes_for_is_best_effort_on_store_failure(monkeypatch):
+    """A ledger fetch failure yields {} - a review is never blocked by
+    missing precedent (the finding just posts without its citation)."""
+    def _boom(repo, *a, **k):
+        raise RuntimeError("store down")
+    monkeypatch.setattr("adapters.install_store.list_ledger_rows", _boom, raising=False)
+    from personas.code_reviewer.persona import Finding
+    findings = (Finding(file="x.py", line=1, severity="high", rule_name="r", message="m", suggestion=None),)
+    assert cr_dispatch._precedent_notes_for("o/r", findings) == {}
+
+
+def test_precedent_notes_for_cites_matching_ledger_row(monkeypatch):
+    """A finding whose class+file match a prior ACCEPTED ledger row gets a
+    keyed precedent note."""
+    rows = [
+        {"repo": "o/r", "pr": 400, "reviewer": "claude/x", "severity": "HIGH",
+         "class": "sync-io-in-async", "finding": "blocking call in async",
+         "verdict": "fixed", "evidence": "re-targeted services/webhook/consumer.py",
+         "ts": "2026-06-10T00:00:00Z"},
+    ]
+    monkeypatch.setattr("adapters.install_store.list_ledger_rows",
+                        lambda repo, *a, **k: rows, raising=False)
+    from personas.code_reviewer.dedup import finding_key
+    from personas.code_reviewer.persona import Finding
+    f = Finding(file="services/webhook/consumer.py", line=42, severity="high",
+                rule_name="sync-io-in-async", message="m", suggestion=None)
+    notes = cr_dispatch._precedent_notes_for("o/r", (f,))
+    key = finding_key(f.file, f.line, f.rule_name)
+    assert key in notes
+    assert "#400" in notes[key]
+
+
 def test_summary_markdown_renders_findings_table():
     """The findings table (severity icons + blocking count) is otherwise
     only reached on a real review; assert the row format + high/critical

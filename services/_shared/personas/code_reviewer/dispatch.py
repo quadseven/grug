@@ -45,6 +45,9 @@ from personas.code_reviewer.dedup import (
 from personas.code_reviewer.diff_parser import (
     DiffHunk, DiffParseError, parse_diff, split_reviewable_hunks,
 )
+from personas.code_reviewer.precedent import (
+    class_precision, match_precedent, render_precedent_note,
+)
 from personas.code_reviewer.cross_file import (
     extract_symbols, fetch_cross_file_context,
 )
@@ -545,7 +548,7 @@ def _agent_prompt_block(f: Finding) -> str:
     return _details_block("Prompt for AI agents", "\n".join(content))
 
 
-def _inline_comment_body(f: Finding) -> str:
+def _inline_comment_body(f: Finding, precedent_note: str = "") -> str:
     """Format one finding as an inline-comment Markdown body (#553:
     committable suggestion block + effort chip + agent prompt).
 
@@ -557,6 +560,12 @@ def _inline_comment_body(f: Finding) -> str:
     if f.effort in _EFFORT_LABELS:
         chip += f" · {_EFFORT_LABELS[f.effort]}"
     head = f"{chip}\n\n{_defused(f.message)}"
+    if precedent_note:
+        # #555: ledger-grounded citation + measured-confidence chip, as a
+        # blockquote under the message. _defused() neutralizes any user text
+        # that reached the note via file paths; the note itself is our own
+        # rendered string.
+        head += f"\n\n> {_defused(precedent_note)}"
     # strip wrapping NEWLINES only (not spaces): GitHub commits the block
     # verbatim as the full replacement line, so leading indentation must
     # survive, but a bare "\n\n\n" suggestion must not slip through as a
@@ -637,9 +646,45 @@ def _publish_shape(
     return evaluation.conclusion, "COMMENT"
 
 
+def _precedent_notes_for(
+    repo_full: str, findings: "tuple[Finding, ...] | list[Finding]",
+) -> dict[str, str]:
+    """Ledger-grounded precedent note per finding, keyed by finding_key (#555).
+
+    Best-effort: any store/parse failure yields {} so a review is never blocked
+    by a missing or slow ledger - the finding just posts without its citation.
+    """
+    try:
+        from adapters.install_store import list_ledger_rows  # type: ignore
+        from ledger import parse_row
+
+        raw = list_ledger_rows(repo_full) or []
+        rows = [r for r in (parse_row(d) for d in raw) if r is not None]
+        if not rows:
+            return {}
+        precisions = class_precision(rows)
+        out: dict[str, str] = {}
+        for f in findings:
+            note = render_precedent_note(
+                match_precedent(
+                    finding_class=f.rule_name,
+                    finding_path=f.file,
+                    ledger_rows=rows,
+                    precisions=precisions,
+                )
+            )
+            if note:
+                out[finding_key(f.file, f.line, f.rule_name)] = note
+        return out
+    except Exception as e:  # noqa: BLE001 - precedent is enrichment, never load-bearing
+        log.info("precedent_notes_unavailable", extra={"repo": repo_full, "kind": type(e).__name__})
+        return {}
+
+
 def _build_review_result(
     evaluation: CodeReviewEvaluation, *, head_sha: str, event: ReviewEvent,
     prior_keys: frozenset[str] = frozenset(),
+    precedent_notes: dict[str, str] | None = None,
 ) -> ReviewResult | None:
     """Build the ReviewResult, or None if nothing NEW to post.
 
@@ -655,8 +700,14 @@ def _build_review_result(
     new_findings = dedup_findings(evaluation.findings, prior_keys)
     if not new_findings:
         return None
+    notes = precedent_notes or {}
     comments = tuple(
-        InlineComment(path=f.file, line=f.line, body=_inline_comment_body(f))
+        InlineComment(
+            path=f.file, line=f.line,
+            body=_inline_comment_body(
+                f, precedent_note=notes.get(finding_key(f.file, f.line, f.rule_name), ""),
+            ),
+        )
         for f in new_findings
     )
     return ReviewResult(
@@ -1113,8 +1164,10 @@ def dispatch_code_review(
         prior_keys, dedup_degraded = _prior_finding_keys(
             installation_id, owner, repo_name, pull_number,
         )
+    precedent_notes = _precedent_notes_for(f"{owner}/{repo_name}", evaluation.findings)
     review_result = _build_review_result(
         evaluation, head_sha=head_sha, event=event, prior_keys=prior_keys,
+        precedent_notes=precedent_notes,
     )
     review_resp: dict[str, Any] | None = None
     if review_result is not None:
