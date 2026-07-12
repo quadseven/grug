@@ -157,12 +157,15 @@ def emit_enforcement_metric(
     Extension; after the Lambda-to-k8s migration every emit was silently
     swallowed and the metric went dark.
 
-    Tags: repo, persona, enforcement_type (grug_managed|external|none), env.
-    Value: 1.0 for grug_managed, 0.5 for external, 0.0 for none.
+    Tags: repo, persona, enforcement_type (grug_managed|external|none|error),
+    env. Value: 1.0 grug_managed, 0.5 external, 0.0 none, -1.0 error (#518:
+    a detection FAILURE must be distinguishable from a real "none" - the
+    negative value makes an auth/rate-limit outage visually unmistakable on
+    the gauge instead of masquerading as "nothing enforced").
     Never raises into the enforcement path; failures log a WARNING (not
     debug - a silent emit path is how this metric died the first time).
     """
-    value_map = {"grug_managed": 1.0, "external": 0.5, "none": 0.0}
+    value_map = {"grug_managed": 1.0, "external": 0.5, "none": 0.0, "error": -1.0}
     value = value_map.get(enforcement_type, 0.0)
     env = os.getenv("DD_ENV") or os.getenv("GRUG_ENV", "prod")
     host = os.getenv("DD_AGENT_HOST", "")

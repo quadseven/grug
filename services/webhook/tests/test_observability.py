@@ -132,8 +132,11 @@ def test_emit_enforcement_metric_value_mapping(monkeypatch):
     emit_enforcement_metric("o/r", "grug_managed")
     emit_enforcement_metric("o/r", "external")
     emit_enforcement_metric("o/r", "none")
+    # #518: detection failure is its own state with a NEGATIVE value so an
+    # auth/rate-limit outage can never masquerade as a real "none".
+    emit_enforcement_metric("o/r", "error")
     values = [p.split(b":")[1].split(b"|")[0] for p, _ in sent]
-    assert values == [b"1.0", b"0.5", b"0.0"]
+    assert values == [b"1.0", b"0.5", b"0.0", b"-1.0"]
 
 
 def test_emit_enforcement_metric_skips_without_agent_host(monkeypatch, caplog):

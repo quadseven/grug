@@ -122,11 +122,32 @@ def test_list_rulesets_url_and_auth():
     with patch("httpx.get", return_value=_ok_response(rulesets)) as mock_get:
         out = list_rulesets("tok-3", "myorg", "myrepo")
 
+    # A short (<100) page terminates pagination after one call (#570).
     mock_get.assert_called_once()
     args, kwargs = mock_get.call_args
-    assert args[0] == "https://api.github.com/repos/myorg/myrepo/rulesets"
+    assert args[0] == (
+        "https://api.github.com/repos/myorg/myrepo/rulesets?per_page=100&page=1"
+    )
     assert kwargs["headers"]["Authorization"] == "Bearer tok-3"
     assert out == rulesets
+
+
+def test_list_rulesets_paginates_past_first_page():
+    """#570: a full first page must trigger a second fetch; results concatenate.
+    The endpoint defaults to 30/page, so an unpaginated client silently hid
+    any ruleset beyond the first page from enforcement detection."""
+    page1 = [{"id": i, "name": f"rs-{i}"} for i in range(100)]
+    page2 = [{"id": 100, "name": "rs-100"}]
+    responses = iter([_ok_response(page1), _ok_response(page2)])
+    with patch("httpx.get", side_effect=lambda *a, **kw: next(responses)) as mock_get:
+        out = list_rulesets("tok", "o", "r")
+
+    assert mock_get.call_count == 2
+    urls = [c.args[0] for c in mock_get.call_args_list]
+    assert urls[0].endswith("/rulesets?per_page=100&page=1")
+    assert urls[1].endswith("/rulesets?per_page=100&page=2")
+    assert len(out) == 101
+    assert out[0]["id"] == 0 and out[-1]["id"] == 100
 
 
 def test_list_rulesets_empty():
