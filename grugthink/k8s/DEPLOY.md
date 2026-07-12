@@ -1,5 +1,14 @@
 # Deploy grugthink on OKE
 
+> **Automated:** `.github/workflows/grugthink.deploy.yml` runs on every push to
+> `main` under `grugthink/**` (and via manual dispatch): it builds the arm64
+> image, pushes it, seeds the namespace + `grugthink-secrets` from SSM + the
+> registry pull secret, and applies the manifests. The steps below are the
+> manual equivalent / reference. The tailnet host `grug.ts.ehumps.me` is served
+> by the Caddy front in the private `infra` repo (reverse-proxy to
+> `grugthink.grugthink.svc:8080`), never committed here.
+
+
 grugthink v2 runs as one lightweight service on the OKE cluster: the multi-bot
 manager + web dashboard, with chat/embeddings on the in-cluster **spark-gateway**
 (no SaaS). You launch individual bots (Grug, Big Rob, ...) from the dashboard at
