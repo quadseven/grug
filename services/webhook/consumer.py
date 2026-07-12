@@ -627,6 +627,16 @@ def main() -> None:
     # default 30s terminationGracePeriod; in-flight handlers finish first.
     for t in threads:
         t.join(timeout=30.0)
+    # Release any snapshot claims still held by handlers that did NOT finish
+    # inside the grace period (Elder reviews run minutes; every deploy rolls
+    # this pod). Without this the orphaned lease makes the SQS redelivery
+    # bounce off "claim busy" for up to the 900s lease, burning receives
+    # toward the DLQ while the PR waits on its REQUIRED check (grug#515).
+    from rerun import release_active_review_claims  # type: ignore[attr-defined]
+
+    released = release_active_review_claims()
+    if released:
+        log.info("consumer_shutdown_released_claims", extra={"count": released})
     if died:
         raise SystemExit(1)
 
