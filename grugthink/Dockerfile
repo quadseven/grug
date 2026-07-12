@@ -7,8 +7,10 @@ FROM python:3.12-slim
 WORKDIR /app
 
 RUN apt-get update \
-    && apt-get install -y --no-install-recommends curl \
+    && apt-get install -y --no-install-recommends curl libgomp1 \
     && rm -rf /var/lib/apt/lists/*
+# libgomp1: faiss-cpu links OpenMP at runtime; without it `import faiss` raises
+# ImportError on the slim base -> vector search silently disabled.
 
 # Python deps (light now - no torch). Layer-cached before app code.
 COPY requirements.txt ./
