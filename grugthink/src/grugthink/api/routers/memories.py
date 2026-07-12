@@ -1,8 +1,18 @@
-"""Memory management API endpoints."""
+"""Memory management API endpoints.
+
+The store calls (get_server_db / add_fact / search_facts / get_all_facts /
+delete_fact) are BLOCKING: first use lazily loads the gateway embedder (a
+network self-test), and the pgvector backend embeds via a synchronous HTTP call
+that can take up to its 30s timeout when the Spark is busy loading the chat
+model. Run them in the threadpool -- executed inline on the event loop they
+starve /api/health, the readiness probe flips (ingress 502s), and the liveness
+probe SIGKILLs the pod. Observed live during the pgvector cutover.
+"""
 
 from typing import Dict
 
 from fastapi import APIRouter, Depends, HTTPException
+from starlette.concurrency import run_in_threadpool
 
 from ...bot_manager import BotManager
 from ...logging_config import get_logger
@@ -50,17 +60,17 @@ async def get_bot_memories(
 
         if server_id:
             # Get memories from specific server
-            server_db = server_manager.get_server_db(server_id)
+            server_db = await run_in_threadpool(server_manager.get_server_db, server_id)
 
             if search:
-                facts = server_db.search_facts(search, k=limit)
+                facts = await run_in_threadpool(server_db.search_facts, search, limit)
             else:
-                facts = server_db.get_all_facts()[:limit]
+                facts = (await run_in_threadpool(server_db.get_all_facts))[:limit]
 
             return {
                 "bot_id": bot_id,
                 "server_id": server_id,
-                "total_memories": len(server_db.get_all_facts()),
+                "total_memories": len(await run_in_threadpool(server_db.get_all_facts)),
                 "memories": [{"id": i, "content": fact, "server_id": server_id} for i, fact in enumerate(facts)],
                 "search": search,
                 "limit": limit,
@@ -72,8 +82,8 @@ async def get_bot_memories(
 
             # Access the internal server_dbs dict to get all servers this bot knows about
             if hasattr(server_manager, "server_dbs"):
-                for srv_id, srv_db in server_manager.server_dbs.items():
-                    srv_facts = srv_db.get_all_facts()
+                for srv_id, srv_db in list(server_manager.server_dbs.items()):
+                    srv_facts = await run_in_threadpool(srv_db.get_all_facts)
                     total_memories += len(srv_facts)
 
                     # Add server context to each fact
@@ -130,8 +140,8 @@ async def add_bot_memory(bot_id: str, memory: Dict[str, str], bot_manager: BotMa
         if not server_manager:
             raise HTTPException(status_code=500, detail="Server manager not available")
 
-        server_db = server_manager.get_server_db(server_id)
-        success = server_db.add_fact(content)
+        server_db = await run_in_threadpool(server_manager.get_server_db, server_id)
+        success = await run_in_threadpool(server_db.add_fact, content)
 
         # Audit log for memory management
         log.info(
@@ -175,10 +185,10 @@ async def delete_bot_memory(bot_id: str, memory: Dict[str, str], bot_manager: Bo
         if not server_manager:
             raise HTTPException(status_code=500, detail="Server manager not available")
 
-        server_db = server_manager.get_server_db(server_id)
+        server_db = await run_in_threadpool(server_manager.get_server_db, server_id)
 
         # Delete fact from database
-        success = server_db.delete_fact(content)
+        success = await run_in_threadpool(server_db.delete_fact, content)
 
         # Audit log for memory management
         log.info(
