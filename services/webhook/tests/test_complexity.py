@@ -46,7 +46,7 @@ class TestMetrics:
 
 
 def _hunk(path, start, added):
-    body = "@@ -1 +%d @@\n" % start + "\n".join("+" + ln for ln in added)
+    body = f"@@ -1 +{start} @@\n" + "\n".join("+" + ln for ln in added)
     return DiffHunk(
         file_path=path, new_start=start,
         new_lines=frozenset(range(start, start + len(added))), body=body,

@@ -25,8 +25,19 @@ from personas.code_reviewer.persona import Finding
 # Defaults chosen from common linter conventions (radon/flake8-cognitive):
 # cyclomatic > 15 is "high", cognitive > 25 is "hard to follow". Env-tunable
 # for a global dial; a per-repo override is a follow-up (config key).
-_DEFAULT_CYCLOMATIC_CAP = int(os.getenv("GRUG_COMPLEXITY_CYCLO_CAP", "15"))
-_DEFAULT_COGNITIVE_CAP = int(os.getenv("GRUG_COMPLEXITY_COGNITIVE_CAP", "25"))
+def _cap_env(name: str, default: int) -> int:
+    """Env-tunable cap that degrades to the default on a non-numeric value -
+    an operator typo must not crash module import (and thus the whole
+    dispatch chain), it just falls back."""
+    raw = os.getenv(name, "")
+    try:
+        return int(raw) if raw else default
+    except ValueError:
+        return default
+
+
+_DEFAULT_CYCLOMATIC_CAP = _cap_env("GRUG_COMPLEXITY_CYCLO_CAP", 15)
+_DEFAULT_COGNITIVE_CAP = _cap_env("GRUG_COMPLEXITY_COGNITIVE_CAP", 25)
 
 _RULE = "high-complexity"
 
@@ -37,7 +48,7 @@ def _changed_lines(hunk: DiffHunk) -> set[int]:
     out: set[int] = set()
     lineno = hunk.new_start
     for raw in hunk.body.splitlines():
-        if raw.startswith("@@") or raw.startswith("+++") or raw.startswith("---"):
+        if raw.startswith(("@@", "+++", "---")):
             continue
         if raw.startswith("+"):
             out.add(lineno)

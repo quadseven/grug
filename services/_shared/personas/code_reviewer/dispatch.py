@@ -1092,7 +1092,14 @@ def dispatch_code_review(
     # cyclomatic/cognitive cap merges as an advisory MEDIUM finding - no LLM, no
     # judge (it is precise by construction). It rides the SAME merge rule as the
     # SAST suite; MEDIUM means it never blocks a merge on its own.
-    complexity_findings = scan_complexity(hunks, file_contents)
+    try:
+        complexity_findings = scan_complexity(hunks, file_contents)
+    except Exception as e:  # noqa: BLE001 - enrichment must never abort a review
+        log.info(
+            "code_review_complexity_scan_failed",
+            extra={"pr": f"{owner}/{repo_name}#{pull_number}", "kind": type(e).__name__},
+        )
+        complexity_findings = ()
     if complexity_findings:
         evaluation = with_extra_findings(evaluation, complexity_findings)
         log.info(
