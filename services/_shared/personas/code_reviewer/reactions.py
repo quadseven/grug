@@ -161,6 +161,27 @@ def _trusted_reactions(
     return trusted
 
 
+def _reaction_reviewers(record: CommentRecord) -> list[str]:
+    """The ledger `reviewer` label(s) to credit for this finding's verdict.
+
+    One per DISTINCT producing model (#540): `grug-elder/<model>`, falling back
+    to `grug-elder/<backend>` when a model has no name, and to the single legacy
+    `grug-elder` when the finding carries no producer provenance. Order-stable
+    and deduped so re-polls overwrite the same rows."""
+    seen: dict[str, None] = {}
+    for origin in record.get("finding_origins", []) or []:
+        model = origin.get("model")
+        backend = origin.get("backend")
+        label = None
+        if isinstance(model, str) and model:
+            label = f"grug-elder/{model}"
+        elif isinstance(backend, str) and backend:
+            label = f"grug-elder/{backend}"
+        if label is not None:
+            seen.setdefault(label, None)
+    return list(seen) or ["grug-elder"]
+
+
 def _record_reaction_learning(
     record: CommentRecord, verdict: ReactionVerdict,
 ) -> bool:
@@ -184,20 +205,27 @@ def _record_reaction_learning(
     from few_shot import exemplars_from_rows, exemplars_to_dicts
     from ledger import accepted_findings_by_class, parse_row
 
-    row = {
+    ledger_verdict = "declined" if verdict == "confirmed" else "false-positive"
+    base_row = {
         "repo": record["repo"],
         "pr": record["pr_number"],
-        "reviewer": "grug-elder",
         "severity": severity,
         "class": rule_name,
         "finding": finding_text,
-        "verdict": "declined" if verdict == "confirmed" else "false-positive",
-        # Stable evidence makes a reaction flip overwrite the same ledger row.
+        "verdict": ledger_verdict,
+        # Stable evidence makes a reaction flip overwrite the same ledger row
+        # (the ledger key also includes `reviewer`, so per-model rows below are
+        # distinct yet each idempotent under a flip).
         "evidence": f"github-review-comment:{record['comment_id']}",
         "ts": "",
         "commit": record.get("head_sha") or None,
     }
-    put_ledger_row(row)
+    # #540: attribute the human verdict to the MODEL(s) that produced the
+    # finding, so reviewer_precision() splits per backend/model -> the routing
+    # signal (a low-precision arm gets weighted down). One row per distinct
+    # producer; legacy findings with no origin keep the single "grug-elder" row.
+    for reviewer in _reaction_reviewers(record):
+        put_ledger_row({**base_row, "reviewer": reviewer})
     parsed_rows = [
         parsed
         for raw in list_ledger_rows(record["repo"])
