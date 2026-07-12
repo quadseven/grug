@@ -1,8 +1,8 @@
 # grugthink on OKE (v2). Modern k8s-oke pattern, mirroring grug's own
 # deployments: arm64-pinned, registry-pull, non-root, DD-tagged. Image
 # registry + tag are PLACEHOLDERS the deploy workflow rewrites (no registry
-# host committed). Secrets come from SSM /githumps/grugthink/* seeded into the
-# `grugthink-secrets` Secret by the deploy step (never committed here).
+# host committed). SESSION_SECRET is generated in-cluster by the deploy step
+# into the `grugthink-secrets` Secret (idempotent - kept across redeploys).
 apiVersion: v1
 kind: Namespace
 metadata:
@@ -19,6 +19,11 @@ metadata:
   namespace: grugthink
 spec:
   accessModes: [ReadWriteOnce]
+  # local-path (node-local disk): the pod is pinned to a BYON LAN node (mac-air)
+  # via nodeSelector, and OCI block volumes (oci-bv, the cluster default) can't
+  # attach to non-OCI nodes. The Postgres/pgvector rearchitecture will retire
+  # this PVC entirely.
+  storageClassName: local-path
   resources:
     requests: {storage: 5Gi}
 ---
@@ -79,16 +84,16 @@ spec:
             - name: DD_AGENT_HOST
               valueFrom: {fieldRef: {fieldPath: status.hostIP}}
           envFrom:
-            # SESSION_SECRET (+ any future creds) seeded from SSM.
+            # SESSION_SECRET, generated in-cluster by the deploy step.
             - secretRef: {name: grugthink-secrets}
           readinessProbe:
-            httpGet: {path: /health, port: http}
+            httpGet: {path: /api/health, port: http}
             initialDelaySeconds: 15
             periodSeconds: 10
             timeoutSeconds: 5
             failureThreshold: 3
           livenessProbe:
-            httpGet: {path: /health, port: http}
+            httpGet: {path: /api/health, port: http}
             initialDelaySeconds: 30
             periodSeconds: 30
           resources:
