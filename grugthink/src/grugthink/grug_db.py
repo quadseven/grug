@@ -150,13 +150,13 @@ class GrugDB:
                             # Use first Ollama URL if multiple are provided
                             ollama_url = ollama_urls.split(",")[0].strip()
 
-                            # Determine embedding model based on configured model
-                            if "minilm" in self.model_name.lower():
-                                embedding_model = "all-minilm"
-                                dimension = 384
-                            else:
-                                embedding_model = "nomic-embed-text"
-                                dimension = 768
+                            # The gateway serves ONE embed model: nomic-embed-text:v1.5
+                            # (768-dim). The old "all-minilm" mapping asked for a model
+                            # the gateway doesn't have -> "model not found" -> semantic
+                            # search silently disabled. Use the gateway's model (env-
+                            # overridable), and match its dimension.
+                            embedding_model = os.getenv("GRUGTHINK_EMBED_MODEL", "nomic-embed-text:v1.5")
+                            dimension = int(os.getenv("GRUGTHINK_EMBED_DIM", "768"))
 
                             self.embedder = OllamaEmbedder(
                                 ollama_url=ollama_url, model=embedding_model, dimension=dimension

@@ -18,7 +18,6 @@ on:
 
 permissions:
   contents: read
-  id-token: write  # AWS OIDC for SSM
 
 concurrency:
   group: grugthink-deploy
@@ -57,12 +56,6 @@ jobs:
           docker push "$REGISTRY_HOST/grugthink:$TAG"
           echo "TAG=$TAG" >> "$GITHUB_ENV"
 
-      - name: AWS credentials (OIDC) for SSM
-        uses: aws-actions/configure-aws-credentials@cabfdba3510de1431bac9dba27511d97497fc100 # v5
-        with:
-          role-to-assume: arn:aws:iam::${{ secrets.AWS_ACCOUNT_ID }}:role/grug-gha-deploy
-          aws-region: us-east-1
-
       - name: Write kubeconfig
         env:
           KUBECONFIG_B64: ${{ secrets.KUBECONFIG_B64 }}
@@ -71,7 +64,7 @@ jobs:
           echo "$KUBECONFIG_B64" | base64 -d > "$HOME/.kube/config"
           chmod 600 "$HOME/.kube/config"
 
-      - name: Namespace + secrets (SSM) + registry pull secret
+      - name: Namespace + secrets + registry pull secret
         env:
           REGISTRY_HOST: ${{ vars.DEPLOY_REGISTRY_HOST }}
           REGISTRY_USERNAME: ${{ secrets.REGISTRY_USERNAME }}
@@ -79,13 +72,15 @@ jobs:
         run: |
           set -euo pipefail
           kubectl create namespace grugthink --dry-run=client -o yaml | kubectl apply -f -
-          # App secret from SSM (never printed). Add more --from-literal lines as
-          # /githumps/grugthink/* grows (discord tokens are added via the dashboard).
-          SESSION_SECRET="$(aws ssm get-parameter --name /githumps/grugthink/session_secret \
-            --with-decryption --query Parameter.Value --output text)"
-          kubectl create secret generic grugthink-secrets -n grugthink \
-            --from-literal=SESSION_SECRET="$SESSION_SECRET" \
-            --dry-run=client -o yaml | kubectl apply -f -
+          # SESSION_SECRET is just a session-signing key (OAuth is off; dashboard
+          # is tailnet-internal). Generate it in-cluster ONCE and keep it across
+          # redeploys so sessions survive - do NOT overwrite an existing secret.
+          # (The grug-gha-deploy OIDC role has no ssm:GetParameter on
+          # /githumps/grugthink/*, and this value need not come from SSM.)
+          if ! kubectl get secret grugthink-secrets -n grugthink >/dev/null 2>&1; then
+            kubectl create secret generic grugthink-secrets -n grugthink \
+              --from-literal=SESSION_SECRET="$(openssl rand -hex 32)"
+          fi
           # Registry pull secret from the same push credential.
           kubectl create secret docker-registry registry-pull -n grugthink \
             --docker-server="$REGISTRY_HOST" \

@@ -67,10 +67,19 @@ def query_ollama_api(
                 "model": raw_model,
                 "prompt": prompt_text,
                 "stream": False,
-                "options": {"num_predict": 80, "temperature": 0.3, "top_p": 0.5, "stop": ["<END>"]},
+                # Disable the model's reasoning mode. Qwen3 (and other thinking
+                # models on the gateway) otherwise spend the WHOLE num_predict
+                # budget on internal <think> tokens, returning an empty `response`
+                # (done_reason=length) - which the caller reads as None and the
+                # bot posts nothing. Verified live: think=false -> real reply.
+                "think": False,
+                # 150 (was 80): richer replies now that reasoning tokens no longer
+                # eat the budget. temperature 0.5 for a little more personality.
+                "options": {"num_predict": 150, "temperature": 0.5, "top_p": 0.7, "stop": ["<END>"]},
             }
-            # Use tuple timeout: (connect_timeout, read_timeout)
-            r = session.post(f"{url}/api/generate", json=payload, timeout=(10, 30))
+            # (connect, read). Read raised 30->60s: the 122B chat model is slower
+            # than the old 3B default even with thinking off.
+            r = session.post(f"{url}/api/generate", json=payload, timeout=(10, 60))
             if r.status_code == 200:
                 response = r.json().get("response", "").strip()
                 log.info(
