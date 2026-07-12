@@ -322,6 +322,9 @@ def test_pull_request_missing_repo_id_runs_elder_and_tpm():
     assert "tpm" in personas_ran
     assert "code_reviewer" in personas_ran
     mock_enq.assert_called_once()
+    # Assert the blocking contract, not just the enqueue: with no repo config to
+    # read, Elder must dispatch at blocking_default (True), not silently non-blocking.
+    assert mock_enq.call_args.kwargs.get("blocking") is True
 
 
 def test_pull_request_code_reviewer_disabled_skips_only_elder():
