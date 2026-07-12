@@ -51,11 +51,11 @@ def test_default_config_matches_store_ssot():
     assert registry.default_persona_config() == _DEFAULT_PERSONA_CONFIG
 
 
-def test_missing_repo_policy_is_explicit_and_opposite():
-    # The two live personas deliberately differ (Chief on, Elder off) - the
-    # registry records the choice instead of leaving it as dispatcher folklore.
+def test_missing_repo_policy_is_explicit():
+    # Chief + Elder review every repo the app sees (enabled); Guard stays opt-in.
+    # The registry records the choice instead of leaving it as dispatcher folklore.
     assert registry.by_key("tpm").missing_repo_policy == "enabled"
-    assert registry.by_key("code_reviewer").missing_repo_policy == "disabled"
+    assert registry.by_key("code_reviewer").missing_repo_policy == "enabled"
     assert registry.by_key("guard").missing_repo_policy == "disabled"
 
 

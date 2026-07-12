@@ -13,12 +13,16 @@ from llm_client import Backend, Finding, Hunk, LlmReviewResponse, review_diff
 
 @pytest.fixture(autouse=True)
 def _patch_keys(monkeypatch):
-    """Avoid the real SSM round-trip in tests."""
+    """Avoid the real SSM round-trip and point review at the owned Cave.
+
+    Review now runs the owned ensemble (coder + reasoner) via the spark-gateway;
+    tests set GRUG_CAVE_GATEWAY_URL so _cave_review_config resolves. The SaaS key
+    patches stay for the judge/select_backend paths that still use them."""
     monkeypatch.setattr(lc, "_load_poolside_key", lambda: "test-pool-key")
     monkeypatch.setattr(lc, "_load_openrouter_key", lambda: "test-or-key")
-    # Most tests below pin the legacy single-success/fallback contract. Deep
-    # review has dedicated tests so a second backend call cannot make every
-    # transport fixture accidentally exercise two independent reviews.
+    monkeypatch.setenv("GRUG_CAVE_GATEWAY_URL", "http://cave.test")
+    # Fast = single (coder) arm; the deep tests below opt into both arms so a
+    # second backend call cannot make every transport fixture run two reviews.
     monkeypatch.setenv("GRUG_REVIEW_DEPTH", "fast")
 
 
@@ -59,7 +63,7 @@ def test_empty_hunks_returns_no_diff_kind_without_llm_call() -> None:
     mock_post.assert_not_called()
 
 
-def test_review_diff_via_poolside_returns_structured_response() -> None:
+def test_review_diff_via_cave_coder_returns_structured_response() -> None:
     findings_json = (
         '{"findings": [{"path": "src/x.py", "line": 1, '
         '"rule": "secret-in-log", "severity": "high", '
@@ -72,7 +76,8 @@ def test_review_diff_via_poolside_returns_structured_response() -> None:
 
     assert isinstance(out, LlmReviewResponse)
     assert out.kind == "reviewed"
-    assert out.backend_used == Backend.POOLSIDE
+    # Fast mode returns after the first (coder) arm of the owned ensemble.
+    assert out.backend_used == Backend.CAVE
     assert out.model_name == "test-model-id"
     assert len(out.findings) == 1
     assert isinstance(out.findings[0], Finding)
@@ -80,7 +85,7 @@ def test_review_diff_via_poolside_returns_structured_response() -> None:
     assert out.findings[0].severity == "high"
 
 
-def test_review_diff_via_openrouter_returns_structured_response() -> None:
+def test_review_diff_empty_findings_returns_reviewed() -> None:
     findings_json = '{"findings": []}'
     response = httpx.Response(200, json=_openai_json_response(findings_json))
 
@@ -88,12 +93,12 @@ def test_review_diff_via_openrouter_returns_structured_response() -> None:
         out = review_diff([_hunk()], installation_id=1)
 
     assert out.kind == "reviewed"
-    assert out.backend_used == Backend.OPENROUTER
+    assert out.backend_used == Backend.CAVE
     assert out.findings == ()
 
 
 def test_429_triggers_retry_with_backoff(monkeypatch) -> None:
-    """OpenRouter free tier sends 429 under burst; client retries."""
+    """A 429 (gateway under burst) is retried on the same arm before giving up."""
     monkeypatch.setattr(lc, "_RETRY_SLEEP", lambda s: None)  # no real sleep
     seq = [
         httpx.Response(429, json={"error": {"message": "rate limited"}}),
@@ -111,16 +116,22 @@ def test_429_triggers_retry_with_backoff(monkeypatch) -> None:
         out = review_diff([_hunk()], installation_id=1)
 
     assert idx["n"] == 3, "should have made 3 attempts (2 retries after 429)"
-    assert out.backend_used == Backend.OPENROUTER
+    assert out.backend_used == Backend.CAVE
 
 
-def test_primary_failure_falls_back_to_secondary(monkeypatch) -> None:
-    """5xx on primary → no per-backend retry (might be a permanent issue);
-    fall back to the other backend immediately."""
+def test_coder_arm_failure_falls_back_to_reasoner_arm(monkeypatch) -> None:
+    """5xx on the coder arm → no per-arm retry (might be permanent); fall back to
+    the reasoner arm immediately. Both arms are owned (Cave gateway)."""
     monkeypatch.setattr(lc, "_RETRY_SLEEP", lambda s: None)
     seq = [
-        httpx.Response(500, json={"error": "upstream"}),  # Poolside
-        httpx.Response(200, json=_openai_json_response('{"findings": [{"rule": "x", "path": "p", "line": 1, "severity": "low"}]}')),  # OpenRouter
+        httpx.Response(500, json={"error": "upstream"}),  # coder arm
+        httpx.Response(
+            200,
+            json=_openai_json_response(
+                '{"findings": [{"rule": "x", "path": "p", "line": 1, '
+                '"severity": "low", "message": "msg"}]}'
+            ),
+        ),  # reasoner arm
     ]
     idx = {"n": 0}
 
@@ -129,44 +140,42 @@ def test_primary_failure_falls_back_to_secondary(monkeypatch) -> None:
         idx["n"] += 1
         return seq[i]
 
-    seq[1] = httpx.Response(
-        200,
-        json=_openai_json_response(
-            '{"findings": [{"rule": "x", "path": "p", "line": 1, '
-            '"severity": "low", "message": "msg"}]}'
-        ),
-    )
-
     with patch.object(httpx, "post", side_effect=staged_post):
-        out = review_diff([_hunk()], installation_id=2)  # even → Poolside first
+        out = review_diff([_hunk()], installation_id=2)
 
     assert out.kind == "reviewed"
-    assert out.backend_used == Backend.OPENROUTER
+    assert out.backend_used == Backend.CAVE_REASONER
     assert len(out.findings) == 1
 
 
-def test_deep_review_consults_both_backends_and_merges_findings(monkeypatch) -> None:
-    """A parseable empty first answer must not end a deep review. Both
-    independent backends run and their candidates are merged with source
+def _is_reasoner(kwargs) -> bool:
+    """True when this request targets the reasoner arm (nemotron), by inspecting
+    the model in the outgoing body - both arms share the gateway URL now."""
+    return "nemotron" in (kwargs.get("json") or {}).get("model", "")
+
+
+def test_deep_review_consults_both_arms_and_merges_findings(monkeypatch) -> None:
+    """A parseable empty first answer must not end a deep review. Both owned
+    arms (coder + reasoner) run and their candidates are merged with source
     attribution for later human/judge evaluations."""
     monkeypatch.setenv("GRUG_REVIEW_DEPTH", "deep")
     span_contexts = iter((
-        {"trace_id": "or-trace", "span_id": "or-span"},
-        {"trace_id": "pool-trace", "span_id": "pool-span"},
+        {"trace_id": "coder-trace", "span_id": "coder-span"},
+        {"trace_id": "reasoner-trace", "span_id": "reasoner-span"},
     ))
     monkeypatch.setattr(lc, "_llmobs_export", lambda span: next(span_contexts))
 
     def respond(url, **kwargs):
-        if "openrouter" in url:
-            content = '{"findings": []}'
-            model = "anthropic/claude-opus-4.7"
-        else:
+        if _is_reasoner(kwargs):
             content = (
                 '{"findings": [{"path": "src/x.py", "line": 1, '
                 '"rule": "null-deref", "severity": "high", '
                 '"message": "unchecked optional"}]}'
             )
-            model = "poolside/laguna-m.1"
+            model = "nemotron-3-super:120b"
+        else:
+            content = '{"findings": []}'
+            model = "qwen3-coder-next:q8_0"
         body = _openai_json_response(content)
         body["model"] = model
         return httpx.Response(200, json=body)
@@ -176,18 +185,18 @@ def test_deep_review_consults_both_backends_and_merges_findings(monkeypatch) -> 
 
     assert mock_post.call_count == 2
     assert out.kind == "reviewed"
-    assert out.backends_used == (Backend.OPENROUTER, Backend.POOLSIDE)
+    assert out.backends_used == (Backend.CAVE, Backend.CAVE_REASONER)
     assert out.models_used == (
-        "anthropic/claude-opus-4.7", "poolside/laguna-m.1",
+        "qwen3-coder-next:q8_0", "nemotron-3-super:120b",
     )
     assert len(out.findings) == 1
-    assert out.findings[0].origins[0].backend == Backend.POOLSIDE
+    assert out.findings[0].origins[0].backend == Backend.CAVE_REASONER
     assert out.findings[0].origins[0].review_span_context == {
-        "trace_id": "pool-trace", "span_id": "pool-span",
+        "trace_id": "reasoner-trace", "span_id": "reasoner-span",
     }
 
 
-def test_deep_review_deduplicates_same_candidate_across_backends(monkeypatch) -> None:
+def test_deep_review_deduplicates_same_candidate_across_arms(monkeypatch) -> None:
     monkeypatch.setenv("GRUG_REVIEW_DEPTH", "deep")
     content = (
         '{"findings": [{"path": "src/x.py", "line": 1, '
@@ -200,7 +209,7 @@ def test_deep_review_deduplicates_same_candidate_across_backends(monkeypatch) ->
 
     assert len(out.findings) == 1
     assert tuple(origin.backend for origin in out.findings[0].origins) == (
-        Backend.OPENROUTER, Backend.POOLSIDE,
+        Backend.CAVE, Backend.CAVE_REASONER,
     )
 
 
@@ -208,11 +217,11 @@ def test_deep_review_uses_stronger_duplicate_explanation(monkeypatch) -> None:
     monkeypatch.setenv("GRUG_REVIEW_DEPTH", "deep")
 
     def respond(url, **kwargs):
-        if "openrouter" in url:
-            severity, message = "low", "maybe wrong"
-        else:
+        if _is_reasoner(kwargs):
             severity = "high"
             message = "the unchecked optional is dereferenced on this path"
+        else:
+            severity, message = "low", "maybe wrong"
         content = (
             '{"findings": [{"path": "src/x.py", "line": 1, '
             '"rule": "null-deref", '
@@ -229,14 +238,14 @@ def test_deep_review_uses_stronger_duplicate_explanation(monkeypatch) -> None:
     )
 
 
-def test_deep_review_one_backend_reply_is_a_complete_review(monkeypatch) -> None:
-    # The two deep backends are best-effort free tier: ONE reply is a complete
-    # review (never provisional/retryable), so an OpenRouter 402/5xx cannot
-    # block a review that Poolside answered.
+def test_deep_review_one_arm_reply_is_a_complete_review(monkeypatch) -> None:
+    # The two owned arms are best-effort: ONE reply is a complete review (never
+    # provisional/retryable), so a reasoner-arm 402/5xx cannot block a review the
+    # coder arm answered.
     monkeypatch.setenv("GRUG_REVIEW_DEPTH", "deep")
 
     def respond(url, **kwargs):
-        if "openrouter" in url:
+        if _is_reasoner(kwargs):
             return httpx.Response(402, json={"error": "Payment Required"})
         return httpx.Response(
             200,
@@ -250,8 +259,8 @@ def test_deep_review_one_backend_reply_is_a_complete_review(monkeypatch) -> None
         out = review_diff([_hunk()], installation_id=1)
 
     assert out.kind == "reviewed"
-    assert not out.error  # one backend answering is not an error
-    assert out.backends_used == (Backend.POOLSIDE,)
+    assert not out.error  # one arm answering is not an error
+    assert out.backends_used == (Backend.CAVE,)
     assert [finding.rule for finding in out.findings] == ["lost-error"]
 
 
@@ -263,7 +272,7 @@ def test_review_depth_defaults_to_deep(monkeypatch) -> None:
         out = review_diff([_hunk()], installation_id=1)
 
     assert post.call_count == 2
-    assert out.backends_used == (Backend.OPENROUTER, Backend.POOLSIDE)
+    assert out.backends_used == (Backend.CAVE, Backend.CAVE_REASONER)
 
 
 def test_openrouter_review_uses_opus_with_high_adaptive_reasoning() -> None:
@@ -293,17 +302,18 @@ def test_both_backends_fail_returns_all_failed_kind() -> None:
 
 
 def test_timeout_treated_as_failure(monkeypatch) -> None:
-    """A timeout (httpx.ReadTimeout) on the primary should trigger
-    fallback to the other backend, not crash the webhook."""
+    """A timeout (httpx.ReadTimeout) on the coder arm should fall back to the
+    reasoner arm, not crash the webhook. Both arms share the gateway URL, so the
+    mock dispatches on the model in the outgoing body."""
     monkeypatch.setattr(lc, "_RETRY_SLEEP", lambda s: None)
     call_log: list = []
     success = httpx.Response(200, json=_openai_json_response('{"findings":[]}'))
 
     def staged(url, *args, **kwargs):
-        call_log.append(url)
-        # First 3 calls (Poolside primary + retries) raise timeout;
-        # subsequent fallback call to OpenRouter succeeds.
-        if "openrouter" in url:
+        model = (kwargs.get("json") or {}).get("model", "")
+        call_log.append(model)
+        # Coder arm times out; the reasoner arm answers.
+        if "nemotron" in model:
             return success
         raise httpx.ReadTimeout("timeout")
 
@@ -311,8 +321,8 @@ def test_timeout_treated_as_failure(monkeypatch) -> None:
         out = review_diff([_hunk()], installation_id=2)
 
     assert out.kind == "reviewed"
-    assert out.backend_used == Backend.OPENROUTER
-    assert any("openrouter" in u for u in call_log)
+    assert out.backend_used == Backend.CAVE_REASONER
+    assert any("nemotron" in m for m in call_log)
 
 
 def test_request_uses_openai_chat_completions_shape() -> None:
@@ -333,34 +343,10 @@ def test_request_uses_openai_chat_completions_shape() -> None:
     assert body["messages"][1]["role"] == "user"
     # OpenAI-compatible JSON-mode hint to coerce structured response
     assert body.get("response_format") == {"type": "json_object"}
-    # Authorization header carries the loaded key.
+    # Authorization header carries the loaded key (in-cluster placeholder).
     assert captured[0]["headers"]["Authorization"].startswith("Bearer ")
-    # Max-reasoning review gets a multi-minute read budget.
+    # Review gets a multi-minute read budget.
     assert captured[0]["timeout"] == lc._REVIEW_TIMEOUT_SECONDS
-    # installation_id=1 is odd -> OpenRouter. Reasoning config is specific to
-    # that backend; the Poolside vLLM switch must not leak into the request.
-    assert "chat_template_kwargs" not in body
-    assert body["reasoning"] == {"effort": "high", "exclude": True}
-    assert body["max_tokens"] == 32_768
-
-
-def test_poolside_request_disables_thinking() -> None:
-    """Poolside's laguna-m.1 runs thinking ON by default — it blew past the
-    read timeout (72s measured) and leaked reasoning into `content` (broke JSON
-    parse), taking Elder dark. The Poolside backend MUST send the vLLM
-    `chat_template_kwargs.enable_thinking=false` switch; OpenRouter must NOT
-    (claude rejects the key)."""
-    captured: list = []
-
-    def capture(url, *, json, headers, timeout):
-        captured.append(json)
-        return httpx.Response(200, json=_openai_json_response('{"findings":[]}'))
-
-    # installation_id=2 is even -> Poolside.
-    with patch.object(httpx, "post", side_effect=capture):
-        review_diff([_hunk()], installation_id=2)
-
-    assert captured[0].get("chat_template_kwargs") == {"enable_thinking": False}
 
 
 def test_malformed_llm_json_returns_parse_failed_kind() -> None:
@@ -375,7 +361,7 @@ def test_malformed_llm_json_returns_parse_failed_kind() -> None:
 
     assert out.kind == "parse_failed"
     assert out.findings == ()
-    assert out.backend_used == Backend.OPENROUTER
+    assert out.backend_used == Backend.CAVE
     assert "parse" in out.error.lower()
 
 
@@ -419,30 +405,12 @@ def test_findings_with_missing_fields_are_dropped() -> None:
     assert out.findings[0].rule == "ok"
 
 
-def test_empty_api_key_falls_back_not_crashes(monkeypatch) -> None:
-    """Empty key → _BackendConfigError → fall back to the other backend.
-    Without the narrow exception split, a misconfig would 500 the
-    webhook handler instead of degrading to advisory mode."""
-    monkeypatch.setattr(lc, "_load_poolside_key", lambda: "")  # broken
-    monkeypatch.setattr(lc, "_load_openrouter_key", lambda: "real-or-key")
-
-    response = httpx.Response(
-        200,
-        json=_openai_json_response(
-            '{"findings": [{"path": "x", "line": 1, "rule": "ok", '
-            '"severity": "low", "message": ""}]}'
-        ),
-    )
-    with patch.object(httpx, "post", return_value=response):
-        out = review_diff([_hunk()], installation_id=2)  # primary = Poolside
-
-    assert out.kind == "reviewed"
-    assert out.backend_used == Backend.OPENROUTER  # fallback
-
-
-def test_both_backends_misconfigured_returns_all_failed(monkeypatch) -> None:
-    monkeypatch.setattr(lc, "_load_poolside_key", lambda: "")
-    monkeypatch.setattr(lc, "_load_openrouter_key", lambda: "")
+def test_unconfigured_cave_gateway_returns_all_failed(monkeypatch) -> None:
+    """No GRUG_CAVE_GATEWAY_URL → both ensemble arms are misconfigured →
+    all_failed, and no HTTP call is made (the guard runs before the span).
+    Without the narrow exception split, this would 500 the webhook handler
+    instead of degrading to advisory neutral."""
+    monkeypatch.delenv("GRUG_CAVE_GATEWAY_URL", raising=False)
     with patch.object(httpx, "post") as mock_post:
         out = review_diff([_hunk()], installation_id=1)
     assert out.kind == "all_failed"
@@ -469,7 +437,7 @@ def test_503_retried_alongside_429(monkeypatch) -> None:
         out = review_diff([_hunk()], installation_id=1)
 
     assert out.kind == "reviewed"
-    assert out.backend_used == Backend.OPENROUTER
+    assert out.backend_used == Backend.CAVE
     assert idx["n"] == 2  # one retry + one success
 
 
@@ -481,7 +449,7 @@ def test_transport_failure_on_both_backends_returns_all_failed(monkeypatch) -> N
     call_log: list[str] = []
 
     def always_timeout(url, *args, **kwargs):
-        call_log.append(url)
+        call_log.append((kwargs.get("json") or {}).get("model", ""))
         raise httpx.ReadTimeout("timeout")
 
     with patch.object(httpx, "post", side_effect=always_timeout):
@@ -489,12 +457,12 @@ def test_transport_failure_on_both_backends_returns_all_failed(monkeypatch) -> N
 
     assert out.kind == "all_failed"
     assert out.backend_used is None
-    # Long review timeouts are not retried; one attempt per backend bounds the
-    # deep generation phase even though quick 429/503 responses still retry.
+    # Long review timeouts are not retried; one attempt per arm bounds the deep
+    # generation phase even though quick 429/503 responses still retry.
     assert len(call_log) == 2
-    # Both backends represented (one of each URL).
-    assert any("poolside" in u for u in call_log)
-    assert any("openrouter" in u for u in call_log)
+    # Both arms represented (coder + reasoner models).
+    assert any("nemotron" in m for m in call_log)
+    assert any("qwen" in m for m in call_log)
 
 
 def test_parse_failed_attributes_secondary_backend(monkeypatch) -> None:
@@ -507,15 +475,15 @@ def test_parse_failed_attributes_secondary_backend(monkeypatch) -> None:
     parse_fail_envelope = _openai_json_response("sorry, I cannot do that")
 
     def staged(url, *args, **kwargs):
-        if "poolside" in url:
-            raise httpx.ReadTimeout("primary down")
+        if "nemotron" not in (kwargs.get("json") or {}).get("model", ""):
+            raise httpx.ReadTimeout("coder arm down")
         return httpx.Response(200, json=parse_fail_envelope)
 
     with patch.object(httpx, "post", side_effect=staged):
-        out = review_diff([_hunk()], installation_id=2)  # even → Poolside primary
+        out = review_diff([_hunk()], installation_id=2)
 
     assert out.kind == "parse_failed"
-    assert out.backend_used == Backend.OPENROUTER
+    assert out.backend_used == Backend.CAVE_REASONER
     assert "parse" in out.error.lower()
 
 
@@ -533,8 +501,8 @@ def test_parse_failure_on_primary_falls_back_to_secondary(monkeypatch) -> None:
     bad = _openai_json_response("sorry, no JSON here")
 
     def staged(url, *args, **kwargs):
-        # installation_id=1 is odd -> OpenRouter primary, Poolside secondary.
-        if "openrouter" in url:
+        # Coder arm (primary) parse-fails; reasoner arm (secondary) returns clean.
+        if "nemotron" not in (kwargs.get("json") or {}).get("model", ""):
             return httpx.Response(200, json=bad)
         return httpx.Response(200, json=good)
 
@@ -542,7 +510,7 @@ def test_parse_failure_on_primary_falls_back_to_secondary(monkeypatch) -> None:
         out = review_diff([_hunk()], installation_id=1)
 
     assert out.kind == "reviewed"
-    assert out.backend_used == Backend.POOLSIDE
+    assert out.backend_used == Backend.CAVE_REASONER
     assert len(out.findings) == 1
 
 
@@ -553,9 +521,9 @@ def test_both_parse_fail_returns_parse_failed_attributed_to_primary(monkeypatch)
     monkeypatch.setattr(lc, "_RETRY_SLEEP", lambda s: None)
     bad = httpx.Response(200, json=_openai_json_response("nope, prose only"))
     with patch.object(httpx, "post", return_value=bad):
-        out = review_diff([_hunk()], installation_id=1)  # odd -> OpenRouter primary
+        out = review_diff([_hunk()], installation_id=1)
     assert out.kind == "parse_failed"
-    assert out.backend_used == Backend.OPENROUTER
+    assert out.backend_used == Backend.CAVE  # first (coder) arm
 
 
 def test_non_dict_finding_entries_dropped() -> None:
@@ -731,8 +699,8 @@ def test_review_diff_emits_llmobs_span_on_success(monkeypatch) -> None:
     assert metrics["output_tokens"] == 25
     assert "latency_ms" in metrics
     assert metrics["latency_ms"] >= 0
-    # Metadata names the backend.
-    assert call["metadata"]["backend"] == "openrouter"  # installation_id=1 → odd
+    # Metadata names the backend (fast mode returns after the coder arm).
+    assert call["metadata"]["backend"] == "cave"
     # #191: and the prompt experiment arm, so DD can slice eval results by it.
     assert call["metadata"]["variant_id"] == "v1"  # default mode off → v1
 
@@ -871,8 +839,8 @@ def test_llmobs_config_error_annotates_with_error_config(monkeypatch) -> None:
     Without this signal DD dashboards see only transport errors and
     can't tell `secret missing` from `backend down`."""
     monkeypatch.setattr(lc, "_RETRY_SLEEP", lambda s: None)
-    monkeypatch.setattr(lc, "_load_poolside_key", lambda: "")
-    monkeypatch.setattr(lc, "_load_openrouter_key", lambda: "")
+    # No gateway URL → both ensemble arms raise _BackendConfigError before any HTTP.
+    monkeypatch.delenv("GRUG_CAVE_GATEWAY_URL", raising=False)
     # Force the v2 arm so we assert the experiment arm rides the config-error
     # span too (not just success) — #191 failure-rate-by-arm depends on it.
     monkeypatch.setattr(lc, "get_prompt_experiment_mode", lambda: "all_v2")
@@ -883,7 +851,7 @@ def test_llmobs_config_error_annotates_with_error_config(monkeypatch) -> None:
 
     assert out.kind == "all_failed"
     mock_post.assert_not_called()
-    # Two backends each fail config check → 2 spans, both error=config.
+    # Two arms each fail config check → 2 spans, both error=config.
     assert len(annotate_calls) == 2
     for call in annotate_calls:
         assert call["metadata"].get("error") == "config"
@@ -968,7 +936,7 @@ def test_llmobs_body_reparse_failure_logs_warning(monkeypatch, caplog) -> None:
         "llm_body_reparse_failed" in r.message for r in caplog.records
     )
     # Span still emitted, just with empty output.
-    assert annotate_calls[0]["metadata"]["backend"] == "openrouter"
+    assert annotate_calls[0]["metadata"]["backend"] == "cave"
 
 
 def test_redact_secrets_strips_aws_github_pem_env_patterns() -> None:

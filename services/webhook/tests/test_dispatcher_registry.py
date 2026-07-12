@@ -208,10 +208,16 @@ def test_toy_persona_missing_repo_policy_disabled_skips(monkeypatch):
         mock_eval.return_value = type("R", (), {"passed": True})()
         out = dispatch("pull_request", payload)
 
-    # TPM (policy: enabled) ran; Elder + toy (policy: disabled) skipped.
-    assert [r["persona"] for r in out["personas"]] == ["tpm"]
-    assert seen == []
-    mock_enq.assert_not_called()
+    # TPM + Elder (both policy: enabled) ran; the toy (policy: disabled) skipped.
+    # Elder's missing_repo_policy is now "enabled" (reviews every repo, advisory-
+    # safe), so the assertion here is specifically that the DISABLED toy is the
+    # one skipped, not Elder.
+    personas_ran = [r["persona"] for r in out["personas"]]
+    assert "tpm" in personas_ran
+    assert "code_reviewer" in personas_ran
+    assert "toy" not in personas_ran
+    assert seen == []  # the disabled toy's dispatch never fired
+    mock_enq.assert_called_once()  # Elder (enabled) enqueued its async review
 
 
 def test_dispatch_leaves_payload_unmutated():
