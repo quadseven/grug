@@ -8,9 +8,18 @@ pyyaml>=6.0.1
 # Discord and Bot dependencies
 discord.py>=2.3.0
 
-# Vector index (local). v2: embeddings come from the spark-gateway, so
-# sentence-transformers + torch are dropped.
+# Vector index (local fallback). v2: embeddings come from the spark-gateway, so
+# sentence-transformers + torch are dropped. When GRUGTHINK_DATABASE_URL is set,
+# memory lives in Postgres+pgvector instead (see docs/pgvector-memory.md) and
+# faiss is unused; it is kept for the no-database (dev/test) fallback backend.
 faiss-cpu==1.8.0
+
+# Postgres + pgvector backend for long-term memory. Reuses the CloudNativePG
+# cluster grug already runs; one row per fact holds text + a vector(768), so
+# there is no node-pinned PVC and no SQLite/FAISS pair to keep in sync.
+psycopg[binary]>=3.1,<4
+psycopg-pool>=3.2,<4
+pgvector>=0.3,<1
 
 # Google Custom Search for fact-checking (lightweight). Gemini
 # (google-generativeai) is dropped - chat/embeddings run on the spark-gateway.
