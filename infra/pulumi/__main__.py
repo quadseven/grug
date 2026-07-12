@@ -346,8 +346,15 @@ _rerun_jobs_queue = aws.sqs.Queue(
     # deploy. Healthy consumers renew a 600s per-message lease every 120s, so
     # a pod death normally redrives much sooner than this shared 15m ceiling.
     visibility_timeout_seconds=900,
+    # maxReceiveCount 3 -> 5 (grug#515 blocking hardening): a consumer pod
+    # killed mid-review consumes one receive, and its orphaned snapshot lease
+    # can bounce the redelivery off "claim busy" for another - two deploys in
+    # a review's lifetime used to leave ONE receive of headroom before the
+    # DLQ swallowed the (now merge-REQUIRED) review. The shutdown claim
+    # release removes the bounce; the extra receives are the belt to those
+    # suspenders.
     redrive_policy=_rerun_dlq.arn.apply(
-        lambda arn: json.dumps({"deadLetterTargetArn": arn, "maxReceiveCount": 3})
+        lambda arn: json.dumps({"deadLetterTargetArn": arn, "maxReceiveCount": 5})
     ),
     tags={"app": "grug", "service": "grug-rerun"},
 )

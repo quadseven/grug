@@ -459,6 +459,77 @@ def _review_claim_heartbeat_loop(
         return
 
 
+# --- Active-claim registry (graceful-shutdown release) ----------------------
+# A consumer pod that dies mid-review (every deploy rolls it; reviews run
+# minutes, the terminationGracePeriod is 30s) orphans its snapshot claim: the
+# in-function except/finally never runs, the lease outlives the pod by up to
+# _REVIEW_CLAIM_LEASE_SECONDS, and the SQS redelivery bounces off
+# "claim busy" - burning receives toward the DLQ (maxReceiveCount) while the
+# PR sits without its (now REQUIRED, grug#515) check. The registry tracks
+# every in-flight claim so main() can release them all on SIGTERM; the next
+# consumer's redelivery then acquires cleanly on its first attempt.
+_ACTIVE_REVIEW_CLAIMS: dict[str, dict[str, Any]] = {}
+_ACTIVE_REVIEW_CLAIMS_LOCK = threading.Lock()
+
+
+def _register_active_review_claim(token: str, owned_claim_args: dict[str, Any]) -> None:
+    with _ACTIVE_REVIEW_CLAIMS_LOCK:
+        _ACTIVE_REVIEW_CLAIMS[token] = owned_claim_args
+
+
+def _unregister_active_review_claim(token: str) -> None:
+    with _ACTIVE_REVIEW_CLAIMS_LOCK:
+        _ACTIVE_REVIEW_CLAIMS.pop(token, None)
+
+
+def release_active_review_claims() -> int:
+    """Release every still-registered review claim (graceful shutdown).
+
+    Called by the consumer's main() after its threads were asked to stop: any
+    claim still registered belongs to a review that will not finish in this
+    process. Releasing lets the SQS redelivery acquire immediately instead of
+    bouncing off the orphaned lease. Best-effort per claim - one failed
+    release (e.g. ownership already lost to a completing handler racing the
+    shutdown) must not stop the rest. Returns the number released."""
+    with _ACTIVE_REVIEW_CLAIMS_LOCK:
+        claims = list(_ACTIVE_REVIEW_CLAIMS.items())
+        _ACTIVE_REVIEW_CLAIMS.clear()
+    released = 0
+    if not claims:
+        return 0
+    from adapters.install_store import release_review_claim
+
+    for _token, owned_claim_args in claims:
+        try:
+            if release_review_claim(**owned_claim_args):
+                released += 1
+                log.info(
+                    "elder_review_claim_released_on_shutdown",
+                    extra={
+                        "repo": owned_claim_args.get("repo"),
+                        "pr": owned_claim_args.get("pr_number"),
+                    },
+                )
+            else:
+                log.warning(
+                    "elder_review_claim_shutdown_release_lost_ownership",
+                    extra={
+                        "repo": owned_claim_args.get("repo"),
+                        "pr": owned_claim_args.get("pr_number"),
+                    },
+                )
+        except Exception:  # noqa: BLE001 - best-effort during shutdown
+            log.warning(
+                "elder_review_claim_shutdown_release_failed",
+                extra={
+                    "repo": owned_claim_args.get("repo"),
+                    "pr": owned_claim_args.get("pr_number"),
+                },
+                exc_info=True,
+            )
+    return released
+
+
 def _start_review_claim_heartbeat(
     owned_claim_args: dict[str, Any],
 ) -> _ReviewClaimHeartbeat:
@@ -573,6 +644,10 @@ def _run_hot_review(
         raise RuntimeError("Elder review snapshot claim is still in progress")
 
     heartbeat: _ReviewClaimHeartbeat | None = None
+    # Register for graceful-shutdown release; the finally-unregister runs on
+    # every in-process exit (normal, except-release, raise), so the shutdown
+    # sweep only ever sees claims whose handler was killed mid-flight.
+    _register_active_review_claim(owner_token, owned_claim_args)
     try:
         heartbeat = _start_review_claim_heartbeat(owned_claim_args)
         settle_seconds = min(
@@ -725,6 +800,8 @@ def _run_hot_review(
                 exc_info=True,
             )
         raise
+    finally:
+        _unregister_active_review_claim(owner_token)
     log.info(
         "elder_review_durable_done",
         extra={"repo": repo_full, "pr": pr_number, **result},
