@@ -402,7 +402,11 @@ def _summary_markdown(
         else ""
     )
     if excluded_paths:
-        shown = ", ".join(f"`{p}`" for p in excluded_paths[:10])
+        # Paths are author-controlled: strip backticks so a crafted filename
+        # cannot break out of the inline code span into the summary markdown.
+        shown = ", ".join(
+            f"`{p.replace(chr(96), '')}`" for p in excluded_paths[:10]
+        )
         more = f" (+{len(excluded_paths) - 10} more)" if len(excluded_paths) > 10 else ""
         held += (
             f"\n\nGrug not read {len(excluded_paths)} data/generated "
