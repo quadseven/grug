@@ -80,16 +80,24 @@ def query_ollama_api(
             # (connect, read). Read raised 30->60s: the 122B chat model is slower
             # than the old 3B default even with thinking off.
             #
-            # X-Spark-Priority (githumps/infra#1768/#1770): this URL is the
-            # in-cluster spark-gateway (OLLAMA_URLS is set to it in
+            # X-Spark-Priority (githumps/infra#1768/#1770/#1773): this URL is
+            # the in-cluster spark-gateway (OLLAMA_URLS is set to it in
             # k8s/deployment.yaml, not to the Sparks directly) - a Discord
             # reply is latency-sensitive and must never queue behind one of
             # Hermes's long agentic turns on the shared Ollama target.
+            # "realtime" (not "interactive"): live incident 2026-07-13 -
+            # this call queued behind Grug's OWN code-review calls (both
+            # tagged "interactive", FIFO within the tier put chat second)
+            # for 24+ minutes with no client-side timeout ever firing (the
+            # gateway's queue-wait heartbeat kept resetting it). A stalled
+            # Discord reply reads as "the bot is broken" within seconds, so
+            # it needs to win over Grug's own async review work, not just
+            # over Hermes's batch turns.
             # X-Spark-Caller identifies this consumer in the gateway's own
             # metrics/dashboard instead of falling back to a generic
             # "python (ip)" UA guess. Harmless if OLLAMA_URLS ever points
             # straight at a Spark instead - Ollama ignores unknown headers.
-            headers = {"X-Spark-Priority": "interactive", "X-Spark-Caller": "grugthink-chat"}
+            headers = {"X-Spark-Priority": "realtime", "X-Spark-Caller": "grugthink-chat"}
             r = session.post(f"{url}/api/generate", json=payload, headers=headers, timeout=(10, 60))
             if r.status_code == 200:
                 response = r.json().get("response", "").strip()

@@ -92,7 +92,26 @@ class OllamaEmbedder:
             try:
                 response = requests.post(
                     f"{self.ollama_url}/api/embeddings",
-                    json={"model": self.model, "prompt": text},
+                    json={
+                        "model": self.model,
+                        "prompt": text,
+                        # Keep the (tiny, ~270MB) embed model resident
+                        # indefinitely instead of Ollama's default 5-minute
+                        # eviction - it shares the box with a permanently
+                        # resident 84GB chat model with ~37GB of headroom to
+                        # spare, so there is no memory pressure trade-off,
+                        # only a repeated cold-load tax to avoid.
+                        "keep_alive": -1,
+                    },
+                    # githumps/infra#1768/#1770/#1773: realtime priority so
+                    # this queues ahead of Grug's own review calls and
+                    # Hermes's batch turns on the shared gateway target
+                    # (matches bot/llm_clients.py's chat call); X-Spark-
+                    # Caller identifies this consumer in the gateway's
+                    # metrics instead of an anonymous python client. Harmless
+                    # if ollama_url ever points straight at a Spark instead
+                    # of the gateway - Ollama ignores unknown headers.
+                    headers={"X-Spark-Priority": "realtime", "X-Spark-Caller": "grugthink-embed"},
                     timeout=self.timeout,
                 )
 
