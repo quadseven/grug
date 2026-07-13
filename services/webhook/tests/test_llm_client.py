@@ -379,6 +379,25 @@ def test_request_uses_openai_chat_completions_shape() -> None:
     assert captured[0]["timeout"] == lc._REVIEW_TIMEOUT_SECONDS
 
 
+def test_cave_calls_are_tagged_interactive_priority() -> None:
+    """Grug's own review + elder-fallback calls carry X-Spark-Priority:
+    interactive so the spark-gateway priority queue (infra#1763-1767 ADR
+    follow-up) lets them jump ahead of Hermes's long agentic turns on the
+    same shared, single-generation-slot Ollama target - the exact 2026-07-12
+    incident this header exists to prevent."""
+    captured: list = []
+
+    def capture(url, *, json, headers, timeout):
+        captured.append(headers)
+        return httpx.Response(200, json=_openai_json_response('{"findings":[]}'))
+
+    with patch.object(httpx, "post", side_effect=capture):
+        review_diff([_hunk()], installation_id=1)
+
+    assert captured
+    assert all(h.get("X-Spark-Priority") == "interactive" for h in captured)
+
+
 def test_malformed_llm_json_returns_parse_failed_kind() -> None:
     """LLM occasionally returns prose around the JSON or just refuses
     to comply. Don't crash the webhook on a parse error — discriminated
