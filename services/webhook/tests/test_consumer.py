@@ -161,6 +161,17 @@ def test_review_job_health_uses_an_absolute_wall_clock_deadline(monkeypatch):
         consumer._unregister_active_review_job("receipt-1")
 
 
+def test_review_job_timeout_clamps_and_falls_back(monkeypatch):
+    monkeypatch.setenv("GRUG_REVIEW_JOB_TIMEOUT_S", "10")
+    assert consumer._review_job_timeout_s() == consumer._MIN_REVIEW_JOB_TIMEOUT_S
+
+    monkeypatch.setenv("GRUG_REVIEW_JOB_TIMEOUT_S", "10000")
+    assert consumer._review_job_timeout_s() == consumer._MAX_REVIEW_JOB_TIMEOUT_S
+
+    monkeypatch.setenv("GRUG_REVIEW_JOB_TIMEOUT_S", "not-a-number")
+    assert consumer._review_job_timeout_s() == consumer._DEFAULT_REVIEW_JOB_TIMEOUT_S
+
+
 def test_shutdown_returns_sqs_leases_before_releasing_review_claims(monkeypatch):
     """Redelivery must be runnable before its durable claim is made available."""
     order: list[str] = []
