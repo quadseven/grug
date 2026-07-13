@@ -386,3 +386,28 @@ class TestLLMClientIntegration:
 
                 assert result is not None
                 assert "grug" in result.lower()
+
+    def test_query_ollama_api_tags_interactive_priority_and_caller(self, mock_ollama_api, monkeypatch):
+        """Chat replies are latency-sensitive and must never queue behind
+        a long agentic turn on the shared gateway target (githumps/infra
+        #1768/#1770) - and must identify themselves in gateway metrics
+        instead of showing up as an anonymous python client."""
+        from unittest.mock import MagicMock, patch
+
+        mock_config = MagicMock()
+        mock_config.OLLAMA_URLS = ["http://localhost:11434"]
+        mock_config.OLLAMA_MODELS = ["llama2"]
+
+        with patch("src.grugthink.bot.prompts.validate_and_process_response") as mock_validate:
+            mock_validate.return_value = "Grug think this good."
+
+            with patch("src.grugthink.bot.llm_clients.config", mock_config):
+                from src.grugthink.bot.llm_clients import query_ollama_api
+
+                query_ollama_api(
+                    prompt_text="Grug need help", cache_key="test_key", personality_name="grug", bot_id="test_bot"
+                )
+
+        assert len(mock_ollama_api.call_history) == 1
+        headers = mock_ollama_api.call_history[0]["headers"]
+        assert headers == {"X-Spark-Priority": "interactive", "X-Spark-Caller": "grugthink-chat"}

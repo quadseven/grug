@@ -800,9 +800,9 @@ def mock_ollama_api(monkeypatch):
     mock_session = MagicMock()
     call_history = []
 
-    def _mock_post(url: str, json=None, timeout: int = 60, **kwargs):
+    def _mock_post(url: str, json=None, timeout: int = 60, headers=None, **kwargs):
         """Mock POST request handler."""
-        call_history.append({"url": url, "json": json, "timeout": timeout})
+        call_history.append({"url": url, "json": json, "timeout": timeout, "headers": headers})
 
         # Parse URL to determine endpoint
         if "/api/generate" in url:
