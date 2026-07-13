@@ -284,6 +284,15 @@ class BackendConfig:
     # (verified live: 72s→<1s, reasoning_tokens 1106→0). claude/OpenRouter
     # rejects this key, so it MUST be per-backend, never on the shared body.
     extra_body: dict = field(default_factory=dict)
+    # Vendor-agnostic outgoing headers, merged before Authorization (which
+    # always wins - _call_backend rejects an extra_headers entry named
+    # Authorization outright). Today this is only the Cave arms'
+    # X-Spark-Priority: interactive (githumps/infra#1768) - the spark-gateway
+    # priority queue that keeps Grug's short-timeout calls from starving
+    # behind Hermes's long agentic turns on a shared, single-generation-slot
+    # Ollama target. SaaS backends don't look at it; harmless to send
+    # everywhere it's set.
+    extra_headers: dict = field(default_factory=dict)
     timeout_seconds: float = _TIMEOUT_SECONDS
     retry_attempts: int = _RETRY_ATTEMPTS
     # Long review calls should still retry quick 429/503 responses, but must not
@@ -425,6 +434,9 @@ def _cave_judge_config() -> "BackendConfig | None":
         url=f"{base}/v1/chat/completions",
         model=os.getenv("GRUG_CAVE_JUDGE_MODEL", _CAVE_JUDGE_DEFAULT_MODEL),
         key_loader=lambda: "in-cluster",  # gateway is unauthenticated in-cluster
+        # Short client timeout (_REVIEW_TIMEOUT_SECONDS) - must not queue
+        # behind a long-running agentic turn on a shared Ollama target.
+        extra_headers={"X-Spark-Priority": "interactive"},
     )
 
 
@@ -502,6 +514,9 @@ def _cave_review_config(backend: Backend) -> "BackendConfig | None":
         key_loader=lambda: "in-cluster",  # gateway is unauthenticated in-cluster
         # #609: replaces the default json_object for the Cave arms only.
         extra_body={"response_format": _CAVE_FINDINGS_RESPONSE_FORMAT},
+        # Short client timeout (_REVIEW_TIMEOUT_SECONDS) - must not queue
+        # behind a long-running agentic turn on a shared Ollama target.
+        extra_headers={"X-Spark-Priority": "interactive"},
     )
 
 
@@ -758,7 +773,11 @@ def _call_backend(
         "response_format": {"type": "json_object"},
         **config.extra_body,
     }
-    headers = {"Authorization": f"Bearer {key}"}
+    if any(name.lower() == "authorization" for name in config.extra_headers):
+        raise _BackendConfigError(
+            f"{config.backend.value} extra_headers must not contain Authorization"
+        )
+    headers = {**config.extra_headers, "Authorization": f"Bearer {key}"}
 
     if config.retry_attempts < 1:
         raise _BackendConfigError(
