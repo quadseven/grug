@@ -92,6 +92,11 @@ spec:
             - {name: GRUG_REVIEW_DEPTH, value: deep}
             - {name: GRUG_OPENROUTER_REVIEW_MODEL, value: anthropic/claude-opus-4.7}
             - {name: GRUG_RERUN_WORKERS, value: "4"}
+            # Absolute per-review wall clock. The watchdog returns the SQS
+            # receipt, releases the snapshot claim, and replaces the process
+            # if a live worker exceeds this budget. Keep below SQS's 900s
+            # fallback visibility so cleanup retains operational headroom.
+            - {name: GRUG_REVIEW_JOB_TIMEOUT_S, value: "720"}
             # Four handlers plus their short claim-renewal heartbeats may touch
             # Postgres concurrently; keep pool headroom above the worker count.
             - {name: GRUG_PG_POOL_MAX, value: "10"}

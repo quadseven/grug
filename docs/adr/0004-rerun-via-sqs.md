@@ -24,7 +24,7 @@ Options considered for the hand-off/queue:
 - API endpoint `POST /installations/{id}/repos/{repo_id}/rerun` returns **202** and enqueues; a batch variant enqueues every current `errored` row.
 - **FIFO + content-based dedup** on `(install, repo, pr, persona)` → a double-click within the 5-min window is dropped (free double-click guard).
 - **Bounded workload groups** - normal reviews serialize per PR, explicit reruns per PR/persona, and questions per PR. Four consumer workers let unrelated groups progress concurrently without removing FIFO ordering inside one workload.
-- **Consumer** = the `grug-consumer` deployment. It reuses dispatch + GitHub + LLM clients, renews long-review visibility/claim leases, fetches the PR's current snapshot, runs the named persona, and upserts the `CheckVerdictRecord`.
+- **Consumer** = the `grug-consumer` deployment. It reuses dispatch + GitHub + LLM clients, renews long-review visibility/claim leases, fetches the PR's current snapshot, runs the named persona, and upserts the `CheckVerdictRecord`. Each review also has an absolute wall-clock deadline (`GRUG_REVIEW_JOB_TIMEOUT_S`, 720 seconds in production). The main-thread watchdog treats an over-budget live worker as unhealthy, stops all renewals, resets active SQS receipts to visibility zero, releases snapshot claims, and hard-exits so Kubernetes replaces threads that Python cannot safely cancel.
 - **DLQ** with redrive (`maxReceiveCount ~3`) + a Datadog monitor on DLQ depth, so a stuck re-run pages instead of vanishing.
 - All Pulumi-managed (queue, DLQ, IAM: api → enqueue, webhook → consume).
 
@@ -35,6 +35,7 @@ Options considered for the hand-off/queue:
 - The backfill path the outage proved was missing: one click recovers a failed review; "Re-run all errored" recovers a batch.
 - Durable + retried + DLQ-backed — strictly better than the fire-and-forget offload.
 - Free double-click guard, bounded concurrency, and FIFO ordering per workload.
+- Worker health includes progress time, not only thread liveness; a socket that remains alive on upstream heartbeats cannot lease a review forever.
 - ~$0: SQS free tier is 1M requests/month (always-free); volume is dozens/month. Zero ops; stays in the all-AWS-serverless architecture.
 
 ### Negative

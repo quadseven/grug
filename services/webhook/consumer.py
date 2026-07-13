@@ -67,6 +67,9 @@ _RECEIVE_ERROR_BACKOFF_S = 30.0
 # ChangeMessageVisibility yet; normal rerun/ask messages keep that base lease.
 _REVIEW_VISIBILITY_TIMEOUT_S = 600
 _REVIEW_VISIBILITY_HEARTBEAT_S = 120.0
+_DEFAULT_REVIEW_JOB_TIMEOUT_S = 720.0
+_MIN_REVIEW_JOB_TIMEOUT_S = 60.0
+_MAX_REVIEW_JOB_TIMEOUT_S = 840.0
 _DEFAULT_RERUN_WORKERS = 4
 _MAX_RERUN_WORKERS = 16
 
@@ -90,6 +93,124 @@ class QueueSpec:
 class _VisibilityHeartbeat:
     stop: threading.Event
     thread: threading.Thread
+
+
+@dataclass(frozen=True, slots=True)
+class _ActiveReviewJob:
+    queue_url: str
+    receipt: str
+    message_id: str
+    worker: str
+    started_at: float
+    deadline_at: float
+    lease_stop: threading.Event
+
+
+_ACTIVE_REVIEW_JOBS: dict[str, _ActiveReviewJob] = {}
+_ACTIVE_REVIEW_JOBS_LOCK = threading.Lock()
+
+
+def _review_job_timeout_s() -> float:
+    """Absolute review budget, clamped below the queue's 900s base lease."""
+    raw = os.getenv(
+        "GRUG_REVIEW_JOB_TIMEOUT_S", str(_DEFAULT_REVIEW_JOB_TIMEOUT_S),
+    )
+    try:
+        value = float(raw)
+    except ValueError:
+        log.warning("consumer_review_timeout_invalid", extra={"value": raw})
+        return _DEFAULT_REVIEW_JOB_TIMEOUT_S
+    return min(_MAX_REVIEW_JOB_TIMEOUT_S, max(_MIN_REVIEW_JOB_TIMEOUT_S, value))
+
+
+def _register_active_review_job(
+    queue_url: str,
+    receipt: str,
+    message_id: str,
+    *,
+    now: float | None = None,
+) -> _ActiveReviewJob:
+    started_at = time.monotonic() if now is None else now
+    job = _ActiveReviewJob(
+        queue_url=queue_url,
+        receipt=receipt,
+        message_id=message_id,
+        worker=threading.current_thread().name,
+        started_at=started_at,
+        deadline_at=started_at + _review_job_timeout_s(),
+        lease_stop=threading.Event(),
+    )
+    with _ACTIVE_REVIEW_JOBS_LOCK:
+        _ACTIVE_REVIEW_JOBS[receipt] = job
+    return job
+
+
+def _unregister_active_review_job(receipt: str) -> None:
+    with _ACTIVE_REVIEW_JOBS_LOCK:
+        _ACTIVE_REVIEW_JOBS.pop(receipt, None)
+
+
+def _expired_review_jobs(*, now: float | None = None) -> list[_ActiveReviewJob]:
+    checked_at = time.monotonic() if now is None else now
+    with _ACTIVE_REVIEW_JOBS_LOCK:
+        return [
+            job for job in _ACTIVE_REVIEW_JOBS.values()
+            if checked_at >= job.deadline_at
+        ]
+
+
+def _release_active_review_leases() -> int:
+    """Stop renewals and make every in-flight review immediately visible."""
+    with _ACTIVE_REVIEW_JOBS_LOCK:
+        jobs = list(_ACTIVE_REVIEW_JOBS.values())
+    released = 0
+    for job in jobs:
+        job.lease_stop.set()
+        try:
+            _sqs.change_message_visibility(
+                QueueUrl=job.queue_url,
+                ReceiptHandle=job.receipt,
+                VisibilityTimeout=0,
+            )
+            released += 1
+        except Exception as e:  # noqa: BLE001 - shutdown remains best-effort
+            log.warning(
+                "consumer_review_lease_release_failed",
+                extra={"message_id": job.message_id, "kind": type(e).__name__},
+            )
+    return released
+
+
+def _release_active_review_claims() -> int:
+    from rerun import release_active_review_claims  # type: ignore[attr-defined]
+
+    return release_active_review_claims()
+
+
+def _release_inflight_reviews() -> tuple[int, int]:
+    """Return SQS work first, then release the claims required to retry it."""
+    leases = _release_active_review_leases()
+    claims = _release_active_review_claims()
+    return leases, claims
+
+
+def _hard_exit(code: int) -> None:
+    """Terminate wedged non-daemon workers that Python cannot cancel safely."""
+    os._exit(code)
+
+
+def _exit_if_workers_remain(
+    threads: list[threading.Thread], *, died: bool,
+) -> None:
+    remaining = [thread.name for thread in threads if thread.is_alive()]
+    if not remaining:
+        return
+    code = 1 if died else 0
+    log.warning(
+        "consumer_shutdown_workers_stuck",
+        extra={"threads": remaining, "exit_code": code},
+    )
+    _hard_exit(code)
 
 
 def _rerun_workers() -> int:
@@ -195,12 +316,16 @@ def _review_visibility_loop(
 
 
 def _start_review_visibility_heartbeat(
-    queue_url: str, receipt: str, message_id: str,
+    queue_url: str,
+    receipt: str,
+    message_id: str,
+    *,
+    stop: threading.Event | None = None,
 ) -> _VisibilityHeartbeat | None:
     """Start a renewable visibility lease, or use queue fallback on failure."""
     if not _extend_review_visibility(queue_url, receipt, message_id):
         return None
-    stop = threading.Event()
+    stop = threading.Event() if stop is None else stop
     thread = threading.Thread(
         target=_review_visibility_loop,
         args=(queue_url, receipt, message_id, stop),
@@ -381,9 +506,14 @@ def _poll_once(spec: QueueSpec, queue_url: str, arn: str) -> int:
     message = messages[0]
     receipt = message.get("ReceiptHandle", "")
     heartbeat = None
+    active_review = None
     if receipt and _is_durable_review(spec, message):
+        active_review = _register_active_review_job(
+            queue_url, receipt, str(message.get("MessageId", "")),
+        )
         heartbeat = _start_review_visibility_heartbeat(
             queue_url, receipt, str(message.get("MessageId", "")),
+            stop=active_review.lease_stop,
         )
     delete = True
     try:
@@ -401,6 +531,8 @@ def _poll_once(spec: QueueSpec, queue_url: str, arn: str) -> int:
         )
     finally:
         _stop_review_visibility_heartbeat(heartbeat)
+        if active_review is not None:
+            _unregister_active_review_job(active_review.receipt)
     if delete and receipt:
         try:
             _sqs.delete_message(QueueUrl=queue_url, ReceiptHandle=receipt)
@@ -607,6 +739,31 @@ def main() -> None:
     # restarts the pod (CrashLoopBackOff paces a persistent failure).
     died = False
     while not _stop.is_set():
+        expired = _expired_review_jobs()
+        if expired:
+            now = time.monotonic()
+            log.error(
+                "consumer_review_deadline_exceeded",
+                extra={
+                    "jobs": [
+                        {
+                            "message_id": job.message_id,
+                            "worker": job.worker,
+                            "age_s": round(now - job.started_at, 1),
+                            "deadline_s": round(job.deadline_at - job.started_at, 1),
+                        }
+                        for job in expired
+                    ],
+                },
+            )
+            _stop.set()
+            leases, claims = _release_inflight_reviews()
+            log.error(
+                "consumer_stuck_worker_restarting",
+                extra={"leases_released": leases, "claims_released": claims},
+            )
+            _hard_exit(1)
+            return
         if not all(t.is_alive() for t in threads):
             died = True
             log.error(
@@ -633,16 +790,16 @@ def main() -> None:
     join_deadline = time.monotonic() + 15.0
     for t in threads:
         t.join(timeout=max(0.0, join_deadline - time.monotonic()))
-    # Release any snapshot claims still held by handlers that did NOT finish
-    # inside the join budget (Elder reviews run minutes; every deploy rolls
-    # this pod). Without this the orphaned lease makes the SQS redelivery
-    # bounce off "claim busy" for up to the 900s lease, burning receives
-    # toward the DLQ while the PR waits on its REQUIRED check (grug#515).
-    from rerun import release_active_review_claims  # type: ignore[attr-defined]
-
-    released = release_active_review_claims()
-    if released:
-        log.info("consumer_shutdown_released_claims", extra={"count": released})
+    # Return every still-active SQS receipt BEFORE releasing its snapshot
+    # claim. A replacement worker can then receive immediately and acquire a
+    # clean claim instead of waiting through two independent orphan leases.
+    leases, claims = _release_inflight_reviews()
+    if leases or claims:
+        log.info(
+            "consumer_shutdown_released_work",
+            extra={"leases": leases, "claims": claims},
+        )
+    _exit_if_workers_remain(threads, died=died)
     if died:
         raise SystemExit(1)
 

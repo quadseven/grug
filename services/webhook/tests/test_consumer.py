@@ -148,6 +148,63 @@ def test_poll_review_heartbeat_failure_uses_base_visibility_and_still_runs():
     mock_delete.assert_called_once()
 
 
+def test_review_job_health_uses_an_absolute_wall_clock_deadline(monkeypatch):
+    """A live handler thread must become unhealthy even while leases renew."""
+    monkeypatch.setenv("GRUG_REVIEW_JOB_TIMEOUT_S", "120")
+    job = consumer._register_active_review_job(
+        "https://q", "receipt-1", "message-1", now=1_000.0,
+    )
+    try:
+        assert consumer._expired_review_jobs(now=1_119.9) == []
+        assert consumer._expired_review_jobs(now=1_120.0) == [job]
+    finally:
+        consumer._unregister_active_review_job("receipt-1")
+
+
+def test_shutdown_returns_sqs_leases_before_releasing_review_claims(monkeypatch):
+    """Redelivery must be runnable before its durable claim is made available."""
+    order: list[str] = []
+    monkeypatch.setattr(
+        consumer, "_release_active_review_leases",
+        lambda: order.append("leases") or 2,
+    )
+    monkeypatch.setattr(
+        consumer, "_release_active_review_claims",
+        lambda: order.append("claims") or 2,
+    )
+
+    assert consumer._release_inflight_reviews() == (2, 2)
+    assert order == ["leases", "claims"]
+
+
+def test_active_review_lease_release_stops_renewal_and_resets_visibility():
+    job = consumer._register_active_review_job(
+        "https://q", "receipt-2", "message-2", now=1_000.0,
+    )
+    try:
+        with patch.object(consumer._sqs, "change_message_visibility") as change:
+            assert consumer._release_active_review_leases() == 1
+        assert job.lease_stop.is_set()
+        change.assert_called_once_with(
+            QueueUrl="https://q", ReceiptHandle="receipt-2", VisibilityTimeout=0,
+        )
+    finally:
+        consumer._unregister_active_review_job("receipt-2")
+
+
+def test_shutdown_hard_exits_when_a_worker_misses_the_join_budget(monkeypatch):
+    """Returning from main cannot leave a wedged non-daemon worker alive."""
+    exits: list[int] = []
+    monkeypatch.setattr(consumer, "_hard_exit", exits.append)
+    worker = MagicMock()
+    worker.name = "consume-rerun-jobs-2"
+    worker.is_alive.return_value = True
+
+    consumer._exit_if_workers_remain([worker], died=False)
+
+    assert exits == [0]
+
+
 def test_poll_handler_raise_still_deletes_when_policy_says_so():
     """cave-results defensive path: the handler never raises by contract,
     but if it ever does, retrying a poison result message buys nothing —
@@ -287,6 +344,39 @@ def test_main_exits_nonzero_when_a_poll_thread_dies(monkeypatch):
         with pytest.raises(SystemExit) as exc:
             consumer.main()
         assert exc.value.code == 1
+    finally:
+        consumer._stop.clear()
+
+
+def test_watchdog_returns_work_and_hard_exits_for_an_expired_review(monkeypatch):
+    """A live-but-stuck worker must take down the process at its deadline."""
+    consumer._stop.clear()
+    monkeypatch.setattr(consumer, "_warm_trace_writer", lambda: None)
+    monkeypatch.setattr(consumer, "_startup_check", lambda: None)
+    monkeypatch.setattr(consumer, "_specs", lambda: [_spec(True, lambda e: None)])
+    monkeypatch.setattr(consumer, "_consume", lambda _spec: consumer._stop.wait())
+    monkeypatch.setattr(consumer, "_flush_traces", lambda: None)
+    expired = MagicMock(
+        message_id="stuck-1", worker="consume-rerun-jobs-1",
+        started_at=100.0, deadline_at=220.0,
+    )
+    monkeypatch.setattr(consumer, "_expired_review_jobs", lambda: [expired])
+    calls: list[object] = []
+    monkeypatch.setattr(
+        consumer, "_release_inflight_reviews",
+        lambda: calls.append("release") or (1, 1),
+    )
+
+    def hard_exit(code: int) -> None:
+        calls.append(("exit", code))
+        raise SystemExit(code)
+
+    monkeypatch.setattr(consumer, "_hard_exit", hard_exit)
+    try:
+        with pytest.raises(SystemExit) as exc:
+            consumer.main()
+        assert exc.value.code == 1
+        assert calls == ["release", ("exit", 1)]
     finally:
         consumer._stop.clear()
 
