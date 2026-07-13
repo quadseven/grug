@@ -82,6 +82,7 @@ _DEFAULT_REVIEW_JOB_TIMEOUT_S = 720.0
 _MIN_REVIEW_JOB_TIMEOUT_S = 60.0
 _MAX_REVIEW_JOB_TIMEOUT_S = 840.0
 _REVIEW_CLEANUP_TIMEOUT_S = 5.0
+_REVIEW_VISIBILITY_LOCK_TIMEOUT_S = 1.0
 _DEFAULT_RERUN_WORKERS = 4
 _MAX_RERUN_WORKERS = 16
 
@@ -184,19 +185,31 @@ def _release_active_review_leases() -> int:
         job.lease_stop.set()
     released = 0
     for job in jobs:
+        acquired = False
         try:
-            with job.visibility_lock:
-                _sqs_cleanup.change_message_visibility(
-                    QueueUrl=job.queue_url,
-                    ReceiptHandle=job.receipt,
-                    VisibilityTimeout=0,
+            acquired = job.visibility_lock.acquire(
+                timeout=_REVIEW_VISIBILITY_LOCK_TIMEOUT_S,
+            )
+            if not acquired:
+                log.warning(
+                    "consumer_review_visibility_lock_timed_out",
+                    extra={"message_id": job.message_id},
                 )
+                continue
+            _sqs_cleanup.change_message_visibility(
+                QueueUrl=job.queue_url,
+                ReceiptHandle=job.receipt,
+                VisibilityTimeout=0,
+            )
             released += 1
         except Exception as e:  # noqa: BLE001 - shutdown remains best-effort
             log.warning(
                 "consumer_review_lease_release_failed",
                 extra={"message_id": job.message_id, "kind": type(e).__name__},
             )
+        finally:
+            if acquired:
+                job.visibility_lock.release()
     return released
 
 
@@ -227,7 +240,14 @@ def _release_inflight_reviews_bounded() -> tuple[int, int]:
 
     def _release() -> None:
         nonlocal result
-        result = _release_inflight_reviews()
+        try:
+            result = _release_inflight_reviews()
+        except Exception as e:  # noqa: BLE001 - cleanup is best-effort before exit
+            log.error(
+                "consumer_review_cleanup_failed",
+                extra={"kind": type(e).__name__},
+                exc_info=True,
+            )
 
     thread = threading.Thread(
         target=_release,
@@ -342,7 +362,7 @@ def _extend_review_visibility(
     queue_url: str, receipt: str, message_id: str,
 ) -> bool:
     try:
-        _sqs.change_message_visibility(
+        _sqs_cleanup.change_message_visibility(
             QueueUrl=queue_url,
             ReceiptHandle=receipt,
             VisibilityTimeout=_REVIEW_VISIBILITY_TIMEOUT_S,
@@ -379,10 +399,13 @@ def _start_review_visibility_heartbeat(
     visibility_lock: threading.Lock | None = None,
 ) -> _VisibilityHeartbeat | None:
     """Start a renewable visibility lease, or use queue fallback on failure."""
-    if not _extend_review_visibility(queue_url, receipt, message_id):
-        return None
     stop = threading.Event() if stop is None else stop
     visibility_lock = threading.Lock() if visibility_lock is None else visibility_lock
+    with visibility_lock:
+        if stop.is_set() or not _extend_review_visibility(
+            queue_url, receipt, message_id,
+        ):
+            return None
     thread = threading.Thread(
         target=_review_visibility_loop,
         args=(queue_url, receipt, message_id, stop, visibility_lock),

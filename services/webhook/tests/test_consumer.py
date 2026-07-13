@@ -105,7 +105,7 @@ def test_poll_hot_review_renews_visibility_until_handler_finishes(monkeypatch):
             consumer._sqs, "receive_message", return_value={"Messages": [_REVIEW_MSG]},
         ),
         patch.object(
-            consumer._sqs,
+            consumer._sqs_cleanup,
             "change_message_visibility",
             side_effect=change_visibility,
         ) as mock_change,
@@ -133,7 +133,7 @@ def test_poll_review_heartbeat_failure_uses_base_visibility_and_still_runs():
             consumer._sqs, "receive_message", return_value={"Messages": [_REVIEW_MSG]},
         ),
         patch.object(
-            consumer._sqs,
+            consumer._sqs_cleanup,
             "change_message_visibility",
             side_effect=RuntimeError("SQS unavailable"),
         ),
@@ -229,6 +229,22 @@ def test_shutdown_cleanup_has_an_absolute_wait_budget(monkeypatch, caplog):
     )
 
 
+def test_shutdown_cleanup_reports_unexpected_thread_failure(monkeypatch, caplog):
+    monkeypatch.setattr(
+        consumer,
+        "_release_inflight_reviews",
+        MagicMock(side_effect=RuntimeError("unexpected cleanup failure")),
+    )
+
+    assert consumer._release_inflight_reviews_bounded() == (0, 0)
+    failures = [
+        record for record in caplog.records
+        if record.msg == "consumer_review_cleanup_failed"
+    ]
+    assert len(failures) == 1
+    assert failures[0].kind == "RuntimeError"
+
+
 def test_active_review_lease_release_stops_renewal_and_resets_visibility():
     job = consumer._register_active_review_job(
         "https://q", "receipt-2", "message-2", now=1_000.0,
@@ -244,6 +260,87 @@ def test_active_review_lease_release_stops_renewal_and_resets_visibility():
         )
     finally:
         consumer._unregister_active_review_job("receipt-2")
+
+
+def test_stuck_visibility_lock_does_not_starve_later_receipts(
+    monkeypatch, caplog,
+):
+    first = consumer._register_active_review_job(
+        "https://q", "receipt-stuck", "message-stuck", now=1_000.0,
+    )
+    second = consumer._register_active_review_job(
+        "https://q", "receipt-ready", "message-ready", now=1_000.0,
+    )
+    first.visibility_lock.acquire()
+    monkeypatch.setattr(consumer, "_REVIEW_VISIBILITY_LOCK_TIMEOUT_S", 0.01)
+    try:
+        with patch.object(
+            consumer._sqs_cleanup, "change_message_visibility",
+        ) as change:
+            assert consumer._release_active_review_leases() == 1
+        change.assert_called_once_with(
+            QueueUrl="https://q",
+            ReceiptHandle="receipt-ready",
+            VisibilityTimeout=0,
+        )
+        assert first.lease_stop.is_set()
+        assert second.lease_stop.is_set()
+        assert any(
+            record.msg == "consumer_review_visibility_lock_timed_out"
+            for record in caplog.records
+        )
+    finally:
+        first.visibility_lock.release()
+        consumer._unregister_active_review_job("receipt-stuck")
+        consumer._unregister_active_review_job("receipt-ready")
+
+
+def test_initial_visibility_extension_finishes_before_cleanup_reset(monkeypatch):
+    job = consumer._register_active_review_job(
+        "https://q", "receipt-starting", "message-starting", now=1_000.0,
+    )
+    initial_started = threading.Event()
+    allow_initial_finish = threading.Event()
+    reset_finished = threading.Event()
+    order: list[str] = []
+
+    def extend(*_args):
+        initial_started.set()
+        assert allow_initial_finish.wait(timeout=1.0)
+        order.append("extend")
+        return True
+
+    def reset(**_kwargs):
+        order.append("reset")
+        reset_finished.set()
+
+    monkeypatch.setattr(consumer, "_extend_review_visibility", extend)
+    monkeypatch.setattr(
+        consumer._sqs_cleanup, "change_message_visibility", reset,
+    )
+    starter = threading.Thread(
+        target=consumer._start_review_visibility_heartbeat,
+        args=("https://q", "receipt-starting", "message-starting"),
+        kwargs={
+            "stop": job.lease_stop,
+            "visibility_lock": job.visibility_lock,
+        },
+    )
+    starter.start()
+    assert initial_started.wait(timeout=1.0)
+    releaser = threading.Thread(target=consumer._release_active_review_leases)
+    releaser.start()
+    assert not reset_finished.wait(timeout=0.05)
+    allow_initial_finish.set()
+    starter.join(timeout=1.0)
+    releaser.join(timeout=1.0)
+
+    try:
+        assert not starter.is_alive()
+        assert not releaser.is_alive()
+        assert order == ["extend", "reset"]
+    finally:
+        consumer._unregister_active_review_job("receipt-starting")
 
 
 def test_stopped_heartbeat_cannot_extend_after_visibility_reset_starts(
