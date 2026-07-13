@@ -783,6 +783,90 @@ class MockOllamaResponse:
             raise requests.HTTPError(f"{self.status_code} Error", response=self)
 
 
+def _mock_ollama_generate_response(prompt: str) -> str:
+    """Generate realistic Ollama response based on prompt."""
+    prompt_lower = prompt.lower()
+
+    if "grug" in prompt_lower or "caveman" in prompt_lower:
+        return "Grug think this good. Rock smash problem. Fire make warm."
+
+    if "verify" in prompt_lower:
+        return "TRUE - Statement check out good."
+
+    if "what is" in prompt_lower or "define" in prompt_lower:
+        return "This is mock definition from Ollama local model."
+
+    return "Mock response from Ollama API for testing."
+
+
+def _mock_ollama_handle_generate(payload: dict | None) -> MockOllamaResponse:
+    """Handle /api/generate endpoint (mock_ollama_api fixture)."""
+    if not payload:
+        return MockOllamaResponse(
+            status_code=400, json_data={"error": "Invalid request - missing payload"}, text="Bad Request"
+        )
+
+    model = payload.get("model", "")
+    prompt = payload.get("prompt", "")
+    stream = payload.get("stream", False)
+
+    # Simulate model not found
+    if "nonexistent" in model:
+        return MockOllamaResponse(status_code=404, json_data={"error": "model not found"}, text="Not Found")
+
+    # Generate response based on prompt
+    response_text = _mock_ollama_generate_response(prompt)
+
+    if stream:
+        # For streaming, return newline-delimited JSON
+        stream_chunks = [f'{{"response": "{word} "}}' for word in response_text.split()]
+        stream_chunks.append('{"done": true}')
+        return MockOllamaResponse(status_code=200, json_data={}, text="\n".join(stream_chunks))
+    else:
+        # Non-streaming response
+        return MockOllamaResponse(
+            status_code=200,
+            json_data={
+                "model": model,
+                "response": response_text,
+                "done": True,
+                "context": [1, 2, 3],
+                "total_duration": 1000000000,
+                "load_duration": 100000000,
+                "prompt_eval_count": 10,
+                "eval_count": 20,
+            },
+        )
+
+
+def _mock_ollama_handle_tags() -> MockOllamaResponse:
+    """Handle /api/tags endpoint (mock_ollama_api fixture)."""
+    return MockOllamaResponse(
+        status_code=200,
+        json_data={
+            "models": [
+                {"name": "llama2:latest", "size": 3826793677},
+                {"name": "mistral:latest", "size": 4108916688},
+            ]
+        },
+    )
+
+
+def _mock_ollama_handle_show(payload: dict | None) -> MockOllamaResponse:
+    """Handle /api/show endpoint (mock_ollama_api fixture)."""
+    if not payload or "name" not in payload:
+        return MockOllamaResponse(status_code=400, text="Bad Request")
+
+    return MockOllamaResponse(
+        status_code=200,
+        json_data={
+            "modelfile": "# Modelfile content",
+            "parameters": "temperature 0.8",
+            "template": "{{ .Prompt }}",
+        },
+    )
+
+
 @pytest.fixture
 def mock_ollama_api(monkeypatch):
     """Mock Ollama API HTTP responses.
@@ -806,93 +890,13 @@ def mock_ollama_api(monkeypatch):
 
         # Parse URL to determine endpoint
         if "/api/generate" in url:
-            return _handle_generate(json)
+            return _mock_ollama_handle_generate(json)
         elif "/api/tags" in url:
-            return _handle_tags()
+            return _mock_ollama_handle_tags()
         elif "/api/show" in url:
-            return _handle_show(json)
+            return _mock_ollama_handle_show(json)
         else:
             return MockOllamaResponse(status_code=404, text="Not Found")
-
-    def _handle_generate(payload: dict | None) -> MockOllamaResponse:
-        """Handle /api/generate endpoint."""
-        if not payload:
-            return MockOllamaResponse(
-                status_code=400, json_data={"error": "Invalid request - missing payload"}, text="Bad Request"
-            )
-
-        model = payload.get("model", "")
-        prompt = payload.get("prompt", "")
-        stream = payload.get("stream", False)
-
-        # Simulate model not found
-        if "nonexistent" in model:
-            return MockOllamaResponse(status_code=404, json_data={"error": "model not found"}, text="Not Found")
-
-        # Generate response based on prompt
-        response_text = _generate_ollama_response(prompt)
-
-        if stream:
-            # For streaming, return newline-delimited JSON
-            stream_chunks = [f'{{"response": "{word} "}}' for word in response_text.split()]
-            stream_chunks.append('{"done": true}')
-            return MockOllamaResponse(status_code=200, json_data={}, text="\n".join(stream_chunks))
-        else:
-            # Non-streaming response
-            return MockOllamaResponse(
-                status_code=200,
-                json_data={
-                    "model": model,
-                    "response": response_text,
-                    "done": True,
-                    "context": [1, 2, 3],
-                    "total_duration": 1000000000,
-                    "load_duration": 100000000,
-                    "prompt_eval_count": 10,
-                    "eval_count": 20,
-                },
-            )
-
-    def _handle_tags() -> MockOllamaResponse:
-        """Handle /api/tags endpoint."""
-        return MockOllamaResponse(
-            status_code=200,
-            json_data={
-                "models": [
-                    {"name": "llama2:latest", "size": 3826793677},
-                    {"name": "mistral:latest", "size": 4108916688},
-                ]
-            },
-        )
-
-    def _handle_show(payload: dict | None) -> MockOllamaResponse:
-        """Handle /api/show endpoint."""
-        if not payload or "name" not in payload:
-            return MockOllamaResponse(status_code=400, text="Bad Request")
-
-        return MockOllamaResponse(
-            status_code=200,
-            json_data={
-                "modelfile": "# Modelfile content",
-                "parameters": "temperature 0.8",
-                "template": "{{ .Prompt }}",
-            },
-        )
-
-    def _generate_ollama_response(prompt: str) -> str:
-        """Generate realistic Ollama response based on prompt."""
-        prompt_lower = prompt.lower()
-
-        if "grug" in prompt_lower or "caveman" in prompt_lower:
-            return "Grug think this good. Rock smash problem. Fire make warm."
-
-        if "verify" in prompt_lower:
-            return "TRUE - Statement check out good."
-
-        if "what is" in prompt_lower or "define" in prompt_lower:
-            return "This is mock definition from Ollama local model."
-
-        return "Mock response from Ollama API for testing."
 
     mock_session.post = _mock_post
     mock_session.call_history = call_history
