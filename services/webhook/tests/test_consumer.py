@@ -326,20 +326,27 @@ def test_initial_visibility_extension_finishes_before_cleanup_reset(monkeypatch)
             "visibility_lock": job.visibility_lock,
         },
     )
-    starter.start()
-    assert initial_started.wait(timeout=1.0)
     releaser = threading.Thread(target=consumer._release_active_review_leases)
-    releaser.start()
-    assert not reset_finished.wait(timeout=0.05)
-    allow_initial_finish.set()
-    starter.join(timeout=1.0)
-    releaser.join(timeout=1.0)
-
+    releaser_started = False
     try:
+        starter.start()
+        assert initial_started.wait(timeout=1.0)
+        releaser.start()
+        releaser_started = True
+        assert not reset_finished.wait(timeout=0.05)
+        allow_initial_finish.set()
+        starter.join(timeout=1.0)
+        releaser.join(timeout=1.0)
         assert not starter.is_alive()
         assert not releaser.is_alive()
         assert order == ["extend", "reset"]
     finally:
+        allow_initial_finish.set()
+        job.lease_stop.set()
+        if starter.is_alive():
+            starter.join(timeout=1.0)
+        if releaser_started and releaser.is_alive():
+            releaser.join(timeout=1.0)
         consumer._unregister_active_review_job("receipt-starting")
 
 
