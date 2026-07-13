@@ -284,12 +284,14 @@ class BackendConfig:
     # (verified live: 72s→<1s, reasoning_tokens 1106→0). claude/OpenRouter
     # rejects this key, so it MUST be per-backend, never on the shared body.
     extra_body: dict = field(default_factory=dict)
-    # Vendor-agnostic outgoing headers, merged after Authorization. Today
-    # this is only the Cave arms' X-Spark-Priority: interactive (#1763-1767
-    # ADR follow-up) - the spark-gateway priority queue that keeps Grug's
-    # short-timeout calls from starving behind Hermes's long agentic turns
-    # on a shared, single-generation-slot Ollama target. SaaS backends don't
-    # look at it; harmless to send everywhere it's set.
+    # Vendor-agnostic outgoing headers, merged before Authorization (which
+    # always wins - _call_backend rejects an extra_headers entry named
+    # Authorization outright). Today this is only the Cave arms'
+    # X-Spark-Priority: interactive (githumps/infra#1768) - the spark-gateway
+    # priority queue that keeps Grug's short-timeout calls from starving
+    # behind Hermes's long agentic turns on a shared, single-generation-slot
+    # Ollama target. SaaS backends don't look at it; harmless to send
+    # everywhere it's set.
     extra_headers: dict = field(default_factory=dict)
     timeout_seconds: float = _TIMEOUT_SECONDS
     retry_attempts: int = _RETRY_ATTEMPTS
@@ -771,7 +773,11 @@ def _call_backend(
         "response_format": {"type": "json_object"},
         **config.extra_body,
     }
-    headers = {"Authorization": f"Bearer {key}", **config.extra_headers}
+    if any(name.lower() == "authorization" for name in config.extra_headers):
+        raise _BackendConfigError(
+            f"{config.backend.value} extra_headers must not contain Authorization"
+        )
+    headers = {**config.extra_headers, "Authorization": f"Bearer {key}"}
 
     if config.retry_attempts < 1:
         raise _BackendConfigError(

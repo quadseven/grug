@@ -379,23 +379,44 @@ def test_request_uses_openai_chat_completions_shape() -> None:
     assert captured[0]["timeout"] == lc._REVIEW_TIMEOUT_SECONDS
 
 
-def test_cave_calls_are_tagged_interactive_priority() -> None:
-    """Grug's own review + elder-fallback calls carry X-Spark-Priority:
-    interactive so the spark-gateway priority queue (infra#1763-1767 ADR
-    follow-up) lets them jump ahead of Hermes's long agentic turns on the
-    same shared, single-generation-slot Ollama target - the exact 2026-07-12
-    incident this header exists to prevent."""
+def test_cave_calls_are_tagged_interactive_priority(monkeypatch) -> None:
+    """Grug's own review ensemble (coder + reasoner arms) carries
+    X-Spark-Priority: interactive so the spark-gateway priority queue
+    (githumps/infra#1768) lets it jump ahead of Hermes's long agentic turns
+    on the same shared, single-generation-slot Ollama target - the exact
+    2026-07-12 incident this header exists to prevent. Deep depth so BOTH
+    arms fire (see test_deep_review_consults_both_arms_and_merges_findings)
+    - a coder-only run would pass even if the reasoner arm's config lost
+    the header."""
+    monkeypatch.setenv("GRUG_REVIEW_DEPTH", "deep")
     captured: list = []
 
-    def capture(url, *, json, headers, timeout):
+    def capture(_url, *, headers, **_kwargs) -> httpx.Response:
         captured.append(headers)
         return httpx.Response(200, json=_openai_json_response('{"findings":[]}'))
 
     with patch.object(httpx, "post", side_effect=capture):
         review_diff([_hunk()], installation_id=1)
 
-    assert captured
+    assert len(captured) == 2
     assert all(h.get("X-Spark-Priority") == "interactive" for h in captured)
+
+
+def test_extra_headers_cannot_override_authorization(monkeypatch) -> None:
+    """CodeRabbit #618: extra_headers is caller-controlled config, not user
+    input, but a future backend accidentally setting Authorization in it
+    (any case) must not silently replace the real bearer token - fail loud
+    instead."""
+    monkeypatch.setattr(lc, "_load_poolside_key", lambda: "test-pool-key")
+    config = lc.BackendConfig(
+        backend=Backend.POOLSIDE,
+        url="http://example.test/v1/chat/completions",
+        model="m",
+        key_loader=lambda: "test-pool-key",
+        extra_headers={"authorization": "Bearer evil"},
+    )
+    with pytest.raises(lc._BackendConfigError, match="must not contain Authorization"):
+        lc._call_backend(config, messages=[{"role": "user", "content": "hi"}])
 
 
 def test_malformed_llm_json_returns_parse_failed_kind() -> None:
