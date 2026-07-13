@@ -40,5 +40,7 @@ HEALTHCHECK --interval=30s --timeout=5s --start-period=30s --retries=3 \
     CMD curl -fsS http://localhost:8080/health || exit 1
 
 # Multi-bot manager + dashboard on 8080. init-config seeds a default config
-# into the (persistent) /data volume on first start.
-CMD ["/bin/bash", "-c", "/usr/local/bin/init-config.sh && exec python grugthink.py multi-bot --api-port 8080"]
+# into the (persistent) /data volume on first start. `ddtrace-run` (same
+# process-wrapper convention as grug's own services, k8s/consumer-deployment.yaml)
+# activates APM + LLM Obs; harmless no-op when DD_LLMOBS_ENABLED is unset.
+CMD ["/bin/bash", "-c", "/usr/local/bin/init-config.sh && exec ddtrace-run python grugthink.py multi-bot --api-port 8080"]
