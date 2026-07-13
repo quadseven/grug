@@ -85,6 +85,14 @@ spec:
             - {name: DD_ENV, value: prod}
             - name: DD_AGENT_HOST
               valueFrom: {fieldRef: {fieldPath: status.hostIP}}
+            # LLM Observability (2026-07-13): grug-elder already emits real
+            # ml_app:grug-elder spans (services/webhook, services/api); grugthink's
+            # Discord chat had none at all - a genuine gap, not a UI/filter issue.
+            # Distinct ml_app so the two review/chat pipelines don't merge into one
+            # DD "application". Activated via ddtrace-run (Dockerfile CMD); the
+            # actual span is emitted by bot/llm_clients.py's query_ollama_api.
+            - {name: DD_LLMOBS_ENABLED, value: "true"}
+            - {name: DD_LLMOBS_ML_APP, value: grugthink-chat}
           envFrom:
             # SESSION_SECRET, generated in-cluster by the deploy step.
             - secretRef: {name: grugthink-secrets}

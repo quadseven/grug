@@ -32,7 +32,11 @@ pydantic>=2.4.0
 itsdangerous>=2.1.0
 httpx>=0.25.0
 
-# Monitoring and observability
+# Monitoring and observability. ddtrace activates via the `ddtrace-run`
+# wrapper (Dockerfile CMD) - same convention as grug's own services - and
+# feeds DD APM + LLM Obs (bot/llm_clients.py annotates the chat-completion
+# span). Absent DD_LLMOBS_ENABLED (local dev/tests) it's a no-op exporter.
+ddtrace>=3.5,<4
 sentry-sdk>=1.40.0
 
 # Optional dependencies for development

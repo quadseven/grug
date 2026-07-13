@@ -5,6 +5,9 @@ This module handles communication with different LLM backends:
 - Google Gemini API (cloud-based models)
 """
 
+import time
+from typing import Any
+
 import requests
 
 from .. import config_legacy as config
@@ -14,6 +17,46 @@ log = get_logger(__name__)
 
 # Shared requests session for connection pooling
 session = requests.Session()
+
+# DD LLM Observability seam, same lazy-import/no-op-fallback shape as grug's
+# own services/_shared/llm_client.py: local dev/tests (no ddtrace installed,
+# or DD_LLMOBS_ENABLED unset) get a no-op span instead of an ImportError.
+# Wrapped behind module-level indirection so tests can monkeypatch
+# `_llmobs_llm` / `_llmobs_annotate` without touching the real SDK. Prior to
+# this, grugthink had NO LLM Obs instrumentation at all (2026-07-13 audit) -
+# grug-elder's review pipeline was already emitting real ml_app:grug-elder
+# spans, but Discord chat was invisible in the DD LLM Obs UI because there
+# was genuinely nothing shipping, not because of a filter/view issue.
+try:  # pragma: no cover — import-time guard
+    from ddtrace.llmobs import LLMObs as _LLMObs
+
+    def _llmobs_llm(**kwargs: Any) -> Any:
+        return _LLMObs.llm(**kwargs)
+
+    def _llmobs_annotate(**kwargs: Any) -> None:
+        _LLMObs.annotate(**kwargs)
+except ImportError:  # pragma: no cover — local dev without ddtrace
+
+    class _NoopSpan:
+        def __enter__(self) -> "_NoopSpan":
+            return self
+
+        def __exit__(self, *a: Any) -> bool:
+            return False
+
+    def _llmobs_llm(**kwargs: Any) -> Any:
+        return _NoopSpan()
+
+    def _llmobs_annotate(**kwargs: Any) -> None:
+        return None
+
+
+_LLMOBS_NAME = "grugthink_chat_reply"
+
+
+def _elapsed_ms(start_ns: int) -> int:
+    """`time.monotonic_ns` avoids clock-skew during the span."""
+    return (time.monotonic_ns() - start_ns) // 1_000_000
 
 
 def query_ollama_api(
@@ -62,102 +105,148 @@ def query_ollama_api(
 
     for idx, url in enumerate(config.OLLAMA_URLS):
         raw_model = config.OLLAMA_MODELS[idx] if idx < len(config.OLLAMA_MODELS) else config.OLLAMA_MODELS[0]
-        try:
-            payload = {
-                "model": raw_model,
-                "prompt": prompt_text,
-                "stream": False,
-                # Disable the model's reasoning mode. Qwen3 (and other thinking
-                # models on the gateway) otherwise spend the WHOLE num_predict
-                # budget on internal <think> tokens, returning an empty `response`
-                # (done_reason=length) - which the caller reads as None and the
-                # bot posts nothing. Verified live: think=false -> real reply.
-                "think": False,
-                # 150 (was 80): richer replies now that reasoning tokens no longer
-                # eat the budget. temperature 0.5 for a little more personality.
-                "options": {"num_predict": 150, "temperature": 0.5, "top_p": 0.7, "stop": ["<END>"]},
-            }
-            # (connect, read). Read raised 30->60s: the 122B chat model is slower
-            # than the old 3B default even with thinking off.
-            #
-            # X-Spark-Priority (githumps/infra#1768/#1770/#1773): this URL is
-            # the in-cluster spark-gateway (OLLAMA_URLS is set to it in
-            # k8s/deployment.yaml, not to the Sparks directly) - a Discord
-            # reply is latency-sensitive and must never queue behind one of
-            # Hermes's long agentic turns on the shared Ollama target.
-            # "realtime" (not "interactive"): live incident 2026-07-13 -
-            # this call queued behind Grug's OWN code-review calls (both
-            # tagged "interactive", FIFO within the tier put chat second)
-            # for 24+ minutes with no client-side timeout ever firing (the
-            # gateway's queue-wait heartbeat kept resetting it). A stalled
-            # Discord reply reads as "the bot is broken" within seconds, so
-            # it needs to win over Grug's own async review work, not just
-            # over Hermes's batch turns.
-            # X-Spark-Caller identifies this consumer in the gateway's own
-            # metrics/dashboard instead of falling back to a generic
-            # "python (ip)" UA guess. Harmless if OLLAMA_URLS ever points
-            # straight at a Spark instead - Ollama ignores unknown headers.
-            headers = {"X-Spark-Priority": "realtime", "X-Spark-Caller": "grugthink-chat"}
-            r = session.post(f"{url}/api/generate", json=payload, headers=headers, timeout=(10, 60))
-            if r.status_code == 200:
-                response = r.json().get("response", "").strip()
-                log.info(
-                    "Ollama API response received",
+        span_tags = {"bot_id": str(bot_id or ""), "personality": str(personality_name or "")}
+        start_ns = time.monotonic_ns()
+        with _llmobs_llm(model_name=raw_model, model_provider="ollama", name=_LLMOBS_NAME) as span:
+            try:
+                payload = {
+                    "model": raw_model,
+                    "prompt": prompt_text,
+                    "stream": False,
+                    # Disable the model's reasoning mode. Qwen3 (and other thinking
+                    # models on the gateway) otherwise spend the WHOLE num_predict
+                    # budget on internal <think> tokens, returning an empty `response`
+                    # (done_reason=length) - which the caller reads as None and the
+                    # bot posts nothing. Verified live: think=false -> real reply.
+                    "think": False,
+                    # 150 (was 80): richer replies now that reasoning tokens no longer
+                    # eat the budget. temperature 0.5 for a little more personality.
+                    "options": {"num_predict": 150, "temperature": 0.5, "top_p": 0.7, "stop": ["<END>"]},
+                }
+                # (connect, read). Read raised 30->60s: the 122B chat model is slower
+                # than the old 3B default even with thinking off.
+                #
+                # X-Spark-Priority (githumps/infra#1768/#1770/#1773): this URL is
+                # the in-cluster spark-gateway (OLLAMA_URLS is set to it in
+                # k8s/deployment.yaml, not to the Sparks directly) - a Discord
+                # reply is latency-sensitive and must never queue behind one of
+                # Hermes's long agentic turns on the shared Ollama target.
+                # "realtime" (not "interactive"): live incident 2026-07-13 -
+                # this call queued behind Grug's OWN code-review calls (both
+                # tagged "interactive", FIFO within the tier put chat second)
+                # for 24+ minutes with no client-side timeout ever firing (the
+                # gateway's queue-wait heartbeat kept resetting it). A stalled
+                # Discord reply reads as "the bot is broken" within seconds, so
+                # it needs to win over Grug's own async review work, not just
+                # over Hermes's batch turns.
+                # X-Spark-Caller identifies this consumer in the gateway's own
+                # metrics/dashboard instead of falling back to a generic
+                # "python (ip)" UA guess. Harmless if OLLAMA_URLS ever points
+                # straight at a Spark instead - Ollama ignores unknown headers.
+                headers = {"X-Spark-Priority": "realtime", "X-Spark-Caller": "grugthink-chat"}
+                r = session.post(f"{url}/api/generate", json=payload, headers=headers, timeout=(10, 60))
+                if r.status_code == 200:
+                    response = r.json().get("response", "").strip()
+                    log.info(
+                        "Ollama API response received",
+                        extra={
+                            "bot_id": bot_id,
+                            "personality": personality_name,
+                            "model": raw_model,
+                            "url": url,
+                            "response_length": len(response),
+                            "cache_key": cache_key,
+                        },
+                    )
+                    _llmobs_annotate(
+                        span=span,
+                        input_data=prompt_text,
+                        output_data=response,
+                        metadata={"model": raw_model, "url": url, "status_code": r.status_code},
+                        metrics={"latency_ms": _elapsed_ms(start_ns)},
+                        tags=span_tags,
+                    )
+                    validated = validate_and_process_response(response, cache_key, server_db, personality_name, bot_id)
+                    if validated:
+                        return validated
+                else:
+                    log.warning(
+                        "Ollama API returned error",
+                        extra={"bot_id": bot_id, "url": url, "status_code": r.status_code, "model": raw_model},
+                    )
+                    _llmobs_annotate(
+                        span=span,
+                        input_data=prompt_text,
+                        metadata={"model": raw_model, "url": url, "error": f"http_{r.status_code}"},
+                        metrics={"latency_ms": _elapsed_ms(start_ns)},
+                        tags=span_tags,
+                    )
+            except requests.exceptions.Timeout as e:
+                log.error(
+                    "Ollama request timed out",
                     extra={
                         "bot_id": bot_id,
-                        "personality": personality_name,
-                        "model": raw_model,
                         "url": url,
-                        "response_length": len(response),
-                        "cache_key": cache_key,
+                        "model": raw_model,
+                        "error": str(e),
+                        "timeout": "30s read, 10s connect",
                     },
                 )
-                validated = validate_and_process_response(response, cache_key, server_db, personality_name, bot_id)
-                if validated:
-                    return validated
-            else:
-                log.warning(
-                    "Ollama API returned error",
-                    extra={"bot_id": bot_id, "url": url, "status_code": r.status_code, "model": raw_model},
+                _llmobs_annotate(
+                    span=span,
+                    input_data=prompt_text,
+                    metadata={"model": raw_model, "url": url, "error": "Timeout"},
+                    metrics={"latency_ms": _elapsed_ms(start_ns)},
+                    tags=span_tags,
                 )
-        except requests.exceptions.Timeout as e:
-            log.error(
-                "Ollama request timed out",
-                extra={
-                    "bot_id": bot_id,
-                    "url": url,
-                    "model": raw_model,
-                    "error": str(e),
-                    "timeout": "30s read, 10s connect",
-                },
-            )
-        except requests.exceptions.ConnectionError as e:
-            log.error(
-                "Ollama connection failed",
-                extra={"bot_id": bot_id, "url": url, "model": raw_model, "error": str(e)},
-            )
-        except requests.exceptions.RequestException as e:
-            log.error(
-                "Ollama request failed",
-                extra={
-                    "bot_id": bot_id,
-                    "url": url,
-                    "model": raw_model,
-                    "error": str(e),
-                    "error_type": type(e).__name__,
-                },
-            )
-        except Exception as e:
-            log.error(
-                "Unexpected error in Ollama request",
-                extra={
-                    "bot_id": bot_id,
-                    "url": url,
-                    "model": raw_model,
-                    "error": str(e),
-                    "error_type": type(e).__name__,
-                },
-            )
+            except requests.exceptions.ConnectionError as e:
+                log.error(
+                    "Ollama connection failed",
+                    extra={"bot_id": bot_id, "url": url, "model": raw_model, "error": str(e)},
+                )
+                _llmobs_annotate(
+                    span=span,
+                    input_data=prompt_text,
+                    metadata={"model": raw_model, "url": url, "error": "ConnectionError"},
+                    metrics={"latency_ms": _elapsed_ms(start_ns)},
+                    tags=span_tags,
+                )
+            except requests.exceptions.RequestException as e:
+                log.error(
+                    "Ollama request failed",
+                    extra={
+                        "bot_id": bot_id,
+                        "url": url,
+                        "model": raw_model,
+                        "error": str(e),
+                        "error_type": type(e).__name__,
+                    },
+                )
+                _llmobs_annotate(
+                    span=span,
+                    input_data=prompt_text,
+                    metadata={"model": raw_model, "url": url, "error": type(e).__name__},
+                    metrics={"latency_ms": _elapsed_ms(start_ns)},
+                    tags=span_tags,
+                )
+            except Exception as e:
+                log.error(
+                    "Unexpected error in Ollama request",
+                    extra={
+                        "bot_id": bot_id,
+                        "url": url,
+                        "model": raw_model,
+                        "error": str(e),
+                        "error_type": type(e).__name__,
+                    },
+                )
+                _llmobs_annotate(
+                    span=span,
+                    input_data=prompt_text,
+                    metadata={"model": raw_model, "url": url, "error": type(e).__name__},
+                    metrics={"latency_ms": _elapsed_ms(start_ns)},
+                    tags=span_tags,
+                )
     return None
 
 

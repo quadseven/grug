@@ -414,3 +414,165 @@ class TestLLMClientIntegration:
         assert len(mock_ollama_api.call_history) == 1
         headers = mock_ollama_api.call_history[0]["headers"]
         assert headers == {"X-Spark-Priority": "realtime", "X-Spark-Caller": "grugthink-chat"}
+
+
+class TestQueryOllamaApiLlmObs:
+    """query_ollama_api must emit a DD LLM Obs span per attempt (2026-07-13:
+    grugthink had zero LLM Obs instrumentation - grug-elder's review pipeline
+    already had real ml_app:grug-elder spans, but Discord chat was invisible
+    in the DD LLM Obs UI because nothing was ever shipped, not a filter/view
+    issue). Same `_llmobs_llm`/`_llmobs_annotate` monkeypatch shape as grug's
+    own services/webhook/tests/test_llm_client.py."""
+
+    @staticmethod
+    def _capture_llmobs(monkeypatch):
+        import src.grugthink.bot.llm_clients as llm_clients
+
+        annotate_calls: list[dict] = []
+
+        class _FakeSpan:
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *a):
+                return False
+
+        monkeypatch.setattr(llm_clients, "_llmobs_llm", lambda **kw: _FakeSpan())
+        monkeypatch.setattr(llm_clients, "_llmobs_annotate", lambda **kw: annotate_calls.append(kw))
+        return annotate_calls
+
+    def test_emits_llmobs_span_on_success(self, mock_ollama_api, monkeypatch):
+        from unittest.mock import MagicMock, patch
+
+        annotate_calls = self._capture_llmobs(monkeypatch)
+        mock_config = MagicMock()
+        mock_config.OLLAMA_URLS = ["http://localhost:11434"]
+        mock_config.OLLAMA_MODELS = ["llama2"]
+
+        with patch("src.grugthink.bot.prompts.validate_and_process_response") as mock_validate:
+            mock_validate.return_value = "Grug think this good."
+            with patch("src.grugthink.bot.llm_clients.config", mock_config):
+                from src.grugthink.bot.llm_clients import query_ollama_api
+
+                query_ollama_api(
+                    prompt_text="Grug need help", cache_key="test_key", personality_name="grug", bot_id="test_bot"
+                )
+
+        assert len(annotate_calls) == 1
+        call = annotate_calls[0]
+        assert call["input_data"] == "Grug need help"
+        assert call["output_data"]  # the raw (pre-validation) model response
+        assert call["metadata"]["model"] == "llama2"
+        assert call["metadata"]["status_code"] == 200
+        assert "error" not in call["metadata"]
+        assert call["metrics"]["latency_ms"] >= 0
+        assert call["tags"] == {"bot_id": "test_bot", "personality": "grug"}
+
+    def test_emits_llmobs_span_on_timeout(self, mock_ollama_errors, monkeypatch):
+        from unittest.mock import MagicMock, patch
+
+        annotate_calls = self._capture_llmobs(monkeypatch)
+        mock_config = MagicMock()
+        mock_config.OLLAMA_URLS = ["http://localhost:11434"]
+        mock_config.OLLAMA_MODELS = ["llama2"]
+        mock_ollama_errors("timeout")
+
+        with patch("src.grugthink.bot.llm_clients.config", mock_config):
+            from src.grugthink.bot.llm_clients import query_ollama_api
+
+            result = query_ollama_api(prompt_text="Grug need help", cache_key="test_key", bot_id="test_bot")
+
+        assert result is None
+        assert len(annotate_calls) == 1
+        call = annotate_calls[0]
+        assert call["metadata"]["error"] == "Timeout"
+        assert "output_data" not in call
+        assert call["metrics"]["latency_ms"] >= 0
+
+    def test_no_llmobs_span_when_urls_empty(self, monkeypatch):
+        """The empty-config short-circuit returns before the per-target loop
+        even starts, so it must not emit a span at all."""
+        from unittest.mock import MagicMock, patch
+
+        annotate_calls = self._capture_llmobs(monkeypatch)
+        mock_config = MagicMock()
+        mock_config.OLLAMA_URLS = []
+        mock_config.OLLAMA_MODELS = []
+
+        with patch("src.grugthink.bot.llm_clients.config", mock_config):
+            from src.grugthink.bot.llm_clients import query_ollama_api
+
+            result = query_ollama_api(prompt_text="Grug need help", cache_key="test_key", bot_id="test_bot")
+
+        assert result is None
+        assert annotate_calls == []
+
+    def test_emits_llmobs_span_on_http_error(self, mock_ollama_errors, monkeypatch):
+        from unittest.mock import MagicMock, patch
+
+        annotate_calls = self._capture_llmobs(monkeypatch)
+        mock_config = MagicMock()
+        mock_config.OLLAMA_URLS = ["http://localhost:11434"]
+        mock_config.OLLAMA_MODELS = ["llama2"]
+        mock_ollama_errors("http")
+
+        with patch("src.grugthink.bot.llm_clients.config", mock_config):
+            from src.grugthink.bot.llm_clients import query_ollama_api
+
+            result = query_ollama_api(prompt_text="Grug need help", cache_key="test_key", bot_id="test_bot")
+
+        assert result is None
+        assert len(annotate_calls) == 1
+        call = annotate_calls[0]
+        assert call["metadata"]["error"] == "http_500"
+        assert "output_data" not in call
+        assert call["metrics"]["latency_ms"] >= 0
+
+    def test_emits_llmobs_span_on_connection_error(self, mock_ollama_errors, monkeypatch):
+        from unittest.mock import MagicMock, patch
+
+        annotate_calls = self._capture_llmobs(monkeypatch)
+        mock_config = MagicMock()
+        mock_config.OLLAMA_URLS = ["http://localhost:11434"]
+        mock_config.OLLAMA_MODELS = ["llama2"]
+        mock_ollama_errors("connection")
+
+        with patch("src.grugthink.bot.llm_clients.config", mock_config):
+            from src.grugthink.bot.llm_clients import query_ollama_api
+
+            result = query_ollama_api(prompt_text="Grug need help", cache_key="test_key", bot_id="test_bot")
+
+        assert result is None
+        assert len(annotate_calls) == 1
+        call = annotate_calls[0]
+        assert call["metadata"]["error"] == "ConnectionError"
+        assert "output_data" not in call
+        assert call["metrics"]["latency_ms"] >= 0
+
+    def test_emits_llmobs_span_on_unexpected_exception(self, monkeypatch):
+        """A non-`requests` exception (e.g. a bug in a downstream call) must
+        still fall through to the catch-all branch and annotate the span -
+        not crash the whole query_ollama_api call."""
+        from unittest.mock import MagicMock, patch
+
+        annotate_calls = self._capture_llmobs(monkeypatch)
+        mock_config = MagicMock()
+        mock_config.OLLAMA_URLS = ["http://localhost:11434"]
+        mock_config.OLLAMA_MODELS = ["llama2"]
+
+        def _raise_value_error(*args, **kwargs):
+            raise ValueError("unexpected")
+
+        monkeypatch.setattr("src.grugthink.bot.llm_clients.session.post", _raise_value_error)
+
+        with patch("src.grugthink.bot.llm_clients.config", mock_config):
+            from src.grugthink.bot.llm_clients import query_ollama_api
+
+            result = query_ollama_api(prompt_text="Grug need help", cache_key="test_key", bot_id="test_bot")
+
+        assert result is None
+        assert len(annotate_calls) == 1
+        call = annotate_calls[0]
+        assert call["metadata"]["error"] == "ValueError"
+        assert "output_data" not in call
+        assert call["metrics"]["latency_ms"] >= 0
