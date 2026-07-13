@@ -391,7 +391,7 @@ def test_cave_calls_are_tagged_interactive_priority(monkeypatch) -> None:
     monkeypatch.setenv("GRUG_REVIEW_DEPTH", "deep")
     captured: list = []
 
-    def capture(_url, *, headers, **_kwargs) -> httpx.Response:
+    def capture(_url, *, headers, **_kwargs: object) -> httpx.Response:
         captured.append(headers)
         return httpx.Response(200, json=_openai_json_response('{"findings":[]}'))
 
