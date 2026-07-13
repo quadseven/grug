@@ -69,6 +69,48 @@ class TestOllamaEmbedderTimeout:
         assert kwargs["timeout"] == 30
 
 
+class TestOllamaEmbedderPriorityAndKeepAlive:
+    """githumps/infra#1768/#1770/#1773 - live incident 2026-07-13: embedding
+    calls sent no priority header (defaulted to batch) and no keep_alive, so
+    they both queued behind unrelated chat generations on the shared gateway
+    target AND paid a repeated cold-load tax. Both fixed at the request
+    level; verified here rather than via a live gateway."""
+
+    def test_encode_sends_realtime_priority_and_caller_headers(self):
+        embedder = OllamaEmbedder("http://gateway:11434", dimension=768)
+
+        resp = MagicMock()
+        resp.status_code = 200
+        resp.json.return_value = {"embedding": [0.0] * 768}
+
+        with patch(
+            "src.grugthink.embedders.ollama_embedder.requests.post", return_value=resp
+        ) as mock_post:
+            embedder.encode("Ugga is Grug wife")
+
+        _, kwargs = mock_post.call_args
+        assert kwargs["headers"] == {
+            "X-Spark-Priority": "realtime",
+            "X-Spark-Caller": "grugthink-embed",
+        }
+
+    def test_encode_pins_keep_alive_indefinite(self):
+        embedder = OllamaEmbedder("http://gateway:11434", model="nomic-embed-text:v1.5", dimension=768)
+
+        resp = MagicMock()
+        resp.status_code = 200
+        resp.json.return_value = {"embedding": [0.0] * 768}
+
+        with patch(
+            "src.grugthink.embedders.ollama_embedder.requests.post", return_value=resp
+        ) as mock_post:
+            embedder.encode("Ugga is Grug wife")
+
+        _, kwargs = mock_post.call_args
+        assert kwargs["json"]["keep_alive"] == -1
+        assert kwargs["json"]["model"] == "nomic-embed-text:v1.5"
+
+
 class TestOllamaEmbedderUrlValidation:
     """URL scheme/host guard (SSRF hardening) stays intact."""
 
