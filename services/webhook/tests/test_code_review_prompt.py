@@ -236,6 +236,22 @@ def test_positional_parse_drops_holes_rule_present():
     )
 
 
+def test_nonreentrant_lock_self_deadlock_rule_present():
+    """Weekly harvest: a method holding a non-reentrant Lock that calls a
+    sibling which re-acquires the SAME lock self-deadlocks; a liveness probe
+    then SIGKILLs the hung pod into a crash-loop. Fix is a distinct lock (or
+    RLock). Distinct from race-condition, which is a MISSING lock (grug #601
+    PgVectorServerManager embedder-load deadlock)."""
+    rule = next(
+        (r for r in crp.RULES if r.name == "nonreentrant-lock-self-deadlock"),
+        None,
+    )
+    assert rule is not None, "nonreentrant-lock-self-deadlock missing from RULES"
+    assert rule.bug_class == "concurrency"
+    assert rule.severity == "high"
+    assert "nonreentrant-lock-self-deadlock" in crp.build_system_prompt()
+
+
 def test_voice_has_mandatory_bookend_structure():
     """#343: the voice instruction mandates the structural bookends that
     keep the caveman cadence from slipping to plain English under technical

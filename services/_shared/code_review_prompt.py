@@ -438,6 +438,31 @@ RULES: tuple[ReviewRule, ...] = (
         "future mismatch a loud ValueError instead of a silent truncation",
         severity="high",
     ),
+    # ── weekly harvest: non-reentrant lock re-entered while held (grug #601) ──
+    ReviewRule(
+        name="nonreentrant-lock-self-deadlock",
+        bug_class="concurrency",
+        description="A method acquires a NON-reentrant lock (`threading.Lock` "
+        "or `asyncio.Lock` — NOT `RLock`) and, WHILE STILL HOLDING it, calls a "
+        "sibling method/function that re-acquires the SAME lock instance — the "
+        "thread/task blocks forever on the second acquire (a plain Lock is not "
+        "reentrant), a self-deadlock. A liveness/health probe then SIGKILLs the "
+        "hung pod (exit 137) into a crash-loop. Flag ONLY when the WHOLE FILE "
+        "shows BOTH the outer `with self._lock:`/`self._lock.acquire()` AND, "
+        "reached from a call made INSIDE that held region, a second acquire of "
+        "the SAME lock object. Do NOT flag an `RLock`/reentrant lock (reentry "
+        "is legal by design), a DIFFERENT lock instance in the nested section, "
+        "or a nested acquire whose body you cannot see in this file. Distinct "
+        "from race-condition (that is a MISSING lock / check-then-act); this is "
+        "one lock held too broadly and re-entered.",
+        bad_example="def get(self):\n    with self._lock:\n        return "
+        "self._load()\ndef _load(self):\n    with self._lock:  # SAME Lock "
+        "re-acquired while held -> deadlock\n        ...",
+        good_example="def get(self):\n    with self._lock:\n        return "
+        "self._load()\ndef _load(self):\n    with self._embedder_lock:  # "
+        "distinct lock (or make self._lock a reentrant RLock)\n        ...",
+        severity="high",
+    ),
 )
 
 
