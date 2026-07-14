@@ -116,9 +116,9 @@ def _generic_literal_value(match: re.Match[str]) -> str | None:
     value = quoted if quoted is not None else match.group("bare").rstrip(",;")
     if not value or "://" in value:
         return None
-    if any(marker in value for marker in ("$", "?", "(", ")", "{", "}", "[", "]")):
-        return None
     if quoted is None:
+        if any(marker in value for marker in ("$", "?", "(", ")", "{", "}", "[", "]")):
+            return None
         if _RUNTIME_MEMBER_RE.fullmatch(value):
             return None
         # A bare alphabetic identifier is a reference, not a literal. Generic
@@ -187,11 +187,10 @@ def _detect(text: str) -> tuple[str, str, str] | None:
         m = pat.regex.search(text)
         if m:
             return pat.kind, m.group(0), _mask(m.group(0))
-    m = _GENERIC_RE.search(text)
-    if m:
+    for m in _GENERIC_RE.finditer(text):
         value = _generic_literal_value(m)
         if value is None:
-            return None
+            continue
         if len(value) >= _MIN_GENERIC_LEN and _shannon_entropy(value) >= _MIN_ENTROPY:
             return f"secret-like assignment to `{m.group('key')}`", value, _mask(value)
     return None

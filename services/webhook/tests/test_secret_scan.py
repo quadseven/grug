@@ -106,6 +106,20 @@ def test_runtime_secret_references_are_not_committed_secret_values():
     assert scan_secrets(_hunks(diff)) == ()
 
 
+def test_quoted_secret_punctuation_is_literal_material():
+    value = "Ab3$Cd4?Ef5(Gh6)Ij7"
+    cands = scan_secrets(_hunks(_diff("config.py", f'api_key = "{value}"')))
+    assert len(cands) == 1
+    assert value not in cands[0].snippet
+
+
+def test_filtered_reference_does_not_hide_later_literal_on_same_line():
+    line = f'token = credentials.token; api_key = "{_HIGH_ENTROPY}"'
+    cands = scan_secrets(_hunks(_diff("app.py", line)))
+    assert len(cands) == 1
+    assert "api_key" in cands[0].snippet
+
+
 # --- diff-scoping + dedup + cap --------------------------------------------
 
 
