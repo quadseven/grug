@@ -248,6 +248,7 @@ def test_nonreentrant_lock_self_deadlock_rule_present():
     )
     assert rule is not None, "nonreentrant-lock-self-deadlock missing from RULES"
     assert rule.bug_class == "concurrency"
+    assert rule.severity == "high"
     assert "nonreentrant-lock-self-deadlock" in crp.build_system_prompt()
 
 
