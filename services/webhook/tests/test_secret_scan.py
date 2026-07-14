@@ -113,6 +113,18 @@ def test_quoted_secret_punctuation_is_literal_material():
     assert value not in cands[0].snippet
 
 
+def test_quoted_whole_value_runtime_references_are_not_literals():
+    diff = _diff(
+        "config.txt",
+        'registryPassword = "$REGISTRY_PASSWORD"',
+        'password = "${DB_PASSWORD}"',
+        'authToken = "$env:AUTH_TOKEN"',
+        'clientSecret = "${{ secrets.CLIENT_SECRET }}"',
+        'token = "\\(credentials.token)"',
+    )
+    assert scan_secrets(_hunks(diff)) == ()
+
+
 def test_filtered_reference_does_not_hide_later_literal_on_same_line():
     line = f'token = credentials.token; api_key = "{_HIGH_ENTROPY}"'
     cands = scan_secrets(_hunks(_diff("app.py", line)))

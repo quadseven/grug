@@ -101,6 +101,15 @@ _RUNTIME_MEMBER_RE = re.compile(
     r"[A-Za-z_][A-Za-z0-9_]*(?:\??\.[A-Za-z_][A-Za-z0-9_]*)+"
 )
 _IDENTIFIER_RE = re.compile(r"[A-Za-z_][A-Za-z0-9_]*")
+_QUOTED_RUNTIME_REFERENCE_RE = re.compile(
+    r"(?:"
+    r"\$\{\{[^{}\r\n]+\}\}"
+    r"|\$\{[A-Za-z_][A-Za-z0-9_.:-]*\}"
+    r"|\$env:[A-Za-z_][A-Za-z0-9_]*"
+    r"|\$[A-Za-z_][A-Za-z0-9_]*"
+    r"|\\\([^()\r\n]+\)"
+    r")"
+)
 
 
 def _generic_literal_value(match: re.Match[str]) -> str | None:
@@ -115,6 +124,8 @@ def _generic_literal_value(match: re.Match[str]) -> str | None:
     quoted = match.group("quoted")
     value = quoted if quoted is not None else match.group("bare").rstrip(",;")
     if not value or "://" in value:
+        return None
+    if quoted is not None and _QUOTED_RUNTIME_REFERENCE_RE.fullmatch(value):
         return None
     if quoted is None:
         if any(marker in value for marker in ("$", "?", "(", ")", "{", "}", "[", "]")):
