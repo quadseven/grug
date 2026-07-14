@@ -91,6 +91,87 @@ def test_non_secret_assignment_ignored():
     assert scan_secrets(_hunks(_diff("app.py", f'username = "{_HIGH_ENTROPY}"'))) == ()
 
 
+def test_runtime_secret_references_are_not_committed_secret_values():
+    diff = _diff(
+        "app.swift",
+        "guard let transactionToken = credentials?.token, !Task.isCancelled else {",
+        "let token = credentials.token",
+        "authToken = fetch_context()",
+        "apiKey = process.env.API_KEY",
+        "clientSecret = config.clientSecret",
+        "password = os.environ['DB_PASSWORD']",
+        "registryPassword = $REGISTRY_PASSWORD",
+        "secret = f.read().strip()",
+    )
+    assert scan_secrets(_hunks(diff)) == ()
+
+
+def test_quoted_secret_punctuation_is_literal_material():
+    value = "Ab3$Cd4?Ef5(Gh6)Ij7"
+    cands = scan_secrets(_hunks(_diff("config.py", f'api_key = "{value}"')))
+    assert len(cands) == 1
+    assert value not in cands[0].snippet
+
+
+def test_bare_secret_punctuation_is_literal_material():
+    value = "Ab3$Cd4?Ef5(Gh6)Ij7"
+    cands = scan_secrets(_hunks(_diff("settings.yaml", f"api_key: {value}")))
+    assert len(cands) == 1
+    assert value not in cands[0].snippet
+
+
+def test_quoted_whole_value_runtime_references_are_not_literals():
+    diff = _diff(
+        "config.txt",
+        'registryPassword = "$REGISTRY_PASSWORD"',
+        'password = "${DB_PASSWORD}"',
+        'authToken = "$env:AUTH_TOKEN"',
+        'clientSecret = "${{ secrets.CLIENT_SECRET }}"',
+        'token = "\\(credentials.token)"',
+    )
+    assert scan_secrets(_hunks(diff)) == ()
+
+
+def test_chained_subscript_and_call_runtime_expressions_are_not_literals():
+    """Chains with MORE than one call/subscript segment (`config["a"]["b"]`,
+    `credential_provider()[0]`) must be recognized as runtime references too,
+    not just a single-anchor member/call/subscript access."""
+    diff = _diff(
+        "app.py",
+        'token = config["credentials"]["token"]',
+        "apiKey = credential_provider()[0]",
+        'secret = get_creds()["secret"].strip()',
+    )
+    assert scan_secrets(_hunks(diff)) == ()
+
+
+def test_powershell_env_reference_is_case_insensitive():
+    diff = _diff(
+        "deploy.ps1",
+        'authToken = "$Env:AUTH_TOKEN"',
+        'apiKey = "$ENV:API_KEY"',
+    )
+    assert scan_secrets(_hunks(diff)) == ()
+
+
+def test_filtered_reference_does_not_hide_later_literal_on_same_line():
+    line = f'token = credentials.token; api_key = "{_HIGH_ENTROPY}"'
+    cands = scan_secrets(_hunks(_diff("app.py", line)))
+    assert len(cands) == 1
+    assert "api_key" in cands[0].snippet
+
+
+def test_reports_each_generic_literal_on_same_line():
+    other = "Zx8Cv6Bn4Mm2Qq9Ww7Ee"
+    line = f'api_key = "{_HIGH_ENTROPY}"; client_secret = "{other}"'
+    cands = scan_secrets(_hunks(_diff("app.py", line)))
+    assert len(cands) == 2
+    assert {"api_key", "client_secret"} == {
+        "api_key" if "api_key" in candidate.snippet else "client_secret"
+        for candidate in cands
+    }
+
+
 # --- diff-scoping + dedup + cap --------------------------------------------
 
 
@@ -150,6 +231,15 @@ def test_dedups_same_secret_across_lines():
     # Same credential repeated in a file -> reported once (content-dedup, like
     # SCA; bounds judge cost).
     diff = _diff(".env", f"K1={_AWS_KEY}", f"K2={_AWS_KEY}")
+    assert len(scan_secrets(_hunks(diff))) == 1
+
+
+def test_dedups_same_generic_secret_across_different_keys():
+    diff = _diff(
+        "config.yaml",
+        f"api_key: {_HIGH_ENTROPY}",
+        f"client_secret: {_HIGH_ENTROPY}",
+    )
     assert len(scan_secrets(_hunks(diff))) == 1
 
 

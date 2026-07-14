@@ -10,14 +10,14 @@ a secret committed to a `.env`, YAML, shell, JS, or Dockerfile is invisible to
 it. This detector is file-type-agnostic and diff-scoped (added lines only, like
 the SAST/SCA sources).
 
-Two recall rules, deliberately LIBERAL (a detector miss is unrecoverable; an
-over-flag is recovered by the judge):
+Two recall rules:
   (A) high-signal provider token patterns (AWS access-key id, GitHub / Slack /
       Google / Stripe tokens, PEM private-key header) - recognizable formats
       that need no key-name context.
   (B) a generic secret-ish assignment (`api_key = "..."`, `token: ...`) whose
-      value clears a Shannon-entropy gate, so low-entropy placeholders like
-      `your-key-here` never become candidates (and never cost a judge call).
+      LITERAL value clears a Shannon-entropy gate, so low-entropy placeholders
+      and runtime references such as `credentials.token` never become
+      candidates (and never cost a judge call).
 
 No-echo invariant: the snippet MASKS the value (a few leading/trailing chars
 only), so the raw credential is never written into the finding message, the
@@ -94,8 +94,62 @@ _GENERIC_RE = re.compile(
     r"client[_-]?secret|auth[_-]?token|apikey)"
     r"[A-Za-z0-9_.-]{0,64})"
     r"[ \t]*[:=][ \t]*"
-    r"""['"]?(?P<value>[^'"\s]+)['"]?"""
+    r"""(?:(?P<quote>['"])(?P<quoted>[^'"]+)(?P=quote)|(?P<bare>[^'"\s]+))"""
 )
+
+# One base identifier followed by ONE OR MORE chained segments -- member
+# access, a call, or a subscript, in any order/combination -- covers
+# `credentials?.token`, `fetch_token()`, `config["credentials"]["token"]`,
+# and `credential_provider()[0]` alike. A single alternation-based pattern
+# (rather than three separate one-anchor patterns) means an expression
+# chaining more than one call/subscript segment is still recognized as a
+# runtime reference instead of falling through to entropy scoring.
+_RUNTIME_SEGMENT = r"(?:\??\.[A-Za-z_][A-Za-z0-9_]*|\([^()\r\n]*\)|\[[^\]\r\n]+\])"
+_RUNTIME_EXPR_RE = re.compile(
+    rf"[A-Za-z_][A-Za-z0-9_]*{_RUNTIME_SEGMENT}+"
+)
+_IDENTIFIER_RE = re.compile(r"[A-Za-z_][A-Za-z0-9_]*")
+_QUOTED_RUNTIME_REFERENCE_RE = re.compile(
+    r"(?:"
+    r"\$\{\{[^{}\r\n]+\}\}"
+    r"|\$\{[A-Za-z_][A-Za-z0-9_.:-]*\}"
+    r"|\$(?i:env):[A-Za-z_][A-Za-z0-9_]*"
+    r"|\$[A-Za-z_][A-Za-z0-9_]*"
+    r"|\\\([^()\r\n]+\)"
+    r")"
+)
+
+
+def _generic_literal_value(match: re.Match[str]) -> str | None:
+    """Return only a committed literal from a generic assignment.
+
+    Secret-shaped variable names are common around legitimate credential
+    plumbing. Runtime references and expressions are not committed secret
+    material and must never become candidates merely because their source text
+    has high entropy (for example ``credentials?.token`` or ``fetch_token()``).
+    Provider-format detection remains independent and runs first.
+    """
+    quoted = match.group("quoted")
+    value = quoted if quoted is not None else match.group("bare").rstrip(",;")
+    if not value or "://" in value:
+        return None
+    if quoted is not None and _QUOTED_RUNTIME_REFERENCE_RE.fullmatch(value):
+        return None
+    if quoted is None:
+        if _QUOTED_RUNTIME_REFERENCE_RE.fullmatch(value):
+            return None
+        if (
+            _RUNTIME_EXPR_RE.fullmatch(value)
+            or (value.startswith("{") and value.endswith("}"))
+            or (value.startswith("[") and value.endswith("]"))
+        ):
+            return None
+        # A bare alphabetic identifier is a reference, not a literal. Generic
+        # unquoted tokens remain detectable when they carry numeric/symbolic
+        # token material; quoted all-letter secrets remain detectable too.
+        if _IDENTIFIER_RE.fullmatch(value) and not any(ch.isdigit() for ch in value):
+            return None
+    return value
 
 
 @dataclass(frozen=True, slots=True)
@@ -147,27 +201,33 @@ def _mask(value: str) -> str:
     return f"{value[:4]}...{value[-4:]}"
 
 
-def _detect(text: str) -> tuple[str, str, str] | None:
-    """Return `(kind, raw, masked)` if an added line looks like it carries a
-    secret, else None. `raw` is the exact matched credential, used ONLY for
-    in-memory dedup (never published/logged); `masked` is the safe snippet form.
-    Provider patterns win over the generic rule."""
+def _detect(text: str) -> tuple[tuple[str, str, str], ...]:
+    """Return every ``(kind, raw, masked)`` secret detected on an added line.
+
+    ``raw`` is used only for in-memory dedup and is never published or logged.
+    Provider patterns win over the generic rule for the same raw value, without
+    hiding a second credential that happens to share the line.
+    """
+    hits: list[tuple[str, str, str]] = []
+    provider_values: set[str] = set()
     for pat in _PROVIDER_PATTERNS:
-        m = pat.regex.search(text)
-        if m:
-            return pat.kind, m.group(0), _mask(m.group(0))
-    m = _GENERIC_RE.search(text)
-    if m:
-        value = m.group("value")
+        for m in pat.regex.finditer(text):
+            value = m.group(0)
+            provider_values.add(value)
+            hits.append((pat.kind, value, _mask(value)))
+    for m in _GENERIC_RE.finditer(text):
+        value = _generic_literal_value(m)
+        if value is None or value in provider_values:
+            continue
         if len(value) >= _MIN_GENERIC_LEN and _shannon_entropy(value) >= _MIN_ENTROPY:
-            return f"secret-like assignment to `{m.group('key')}`", value, _mask(value)
-    return None
+            hits.append((f"secret-like assignment to `{m.group('key')}`", value, _mask(value)))
+    return tuple(hits)
 
 
 def scan_secrets(hunks: tuple[DiffHunk, ...]) -> tuple[Candidate, ...]:
     """Secret-scanning candidate source: a Candidate per committed credential a
     PR introduces, across ANY file type. Diff-scoped, content-deduped by the
-    EXACT matched credential per `(file, kind)` (the same credential repeated in
+    EXACT matched credential per file (the same credential repeated in
     a file is reported once - bounds judge cost, mirrors SCA; deduping on the
     exact value, not the lossy mask, so two distinct secrets sharing a masked
     prefix/suffix are both kept), capped at `_MAX_SECRETS`. Same `Candidate`
@@ -176,7 +236,7 @@ def scan_secrets(hunks: tuple[DiffHunk, ...]) -> tuple[Candidate, ...]:
     used only for in-memory dedup; the published snippet is masked - the raw
     value is never echoed into a Candidate or a log."""
     secrets: list[_Secret] = []
-    seen: set[tuple[str, str, str]] = set()
+    seen: set[tuple[str, str]] = set()
     scanned = 0
     for hunk in hunks:
         for lineno, text in _added_lines(hunk):
@@ -185,17 +245,14 @@ def scan_secrets(hunks: tuple[DiffHunk, ...]) -> tuple[Candidate, ...]:
             scanned += len(text)
             if scanned > _MAX_SCAN_BYTES:
                 return _to_candidates(secrets)
-            hit = _detect(text)
-            if hit is None:
-                continue
-            kind, raw, masked = hit
-            key = (hunk.file_path, kind, raw)
-            if key in seen:
-                continue
-            seen.add(key)
-            secrets.append(_Secret(file=hunk.file_path, line=lineno, kind=kind, masked=masked))
-            if len(secrets) >= _MAX_SECRETS:
-                return _to_candidates(secrets)
+            for kind, raw, masked in _detect(text):
+                key = (hunk.file_path, raw)
+                if key in seen:
+                    continue
+                seen.add(key)
+                secrets.append(_Secret(file=hunk.file_path, line=lineno, kind=kind, masked=masked))
+                if len(secrets) >= _MAX_SECRETS:
+                    return _to_candidates(secrets)
     return _to_candidates(secrets)
 
 
