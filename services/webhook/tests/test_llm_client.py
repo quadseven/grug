@@ -376,7 +376,36 @@ def test_request_uses_openai_chat_completions_shape() -> None:
     # Authorization header carries the loaded key (in-cluster placeholder).
     assert captured[0]["headers"]["Authorization"].startswith("Bearer ")
     # Review gets a multi-minute read budget.
-    assert captured[0]["timeout"] == lc._REVIEW_TIMEOUT_SECONDS
+    assert captured[0]["timeout"] == lc._DEFAULT_REVIEW_TIMEOUT_SECONDS
+
+
+def test_review_llm_timeout_default_covers_measured_slow_pass() -> None:
+    """The default per-arm budget must clear the ~318s reasoner pass measured
+    live on 2026-07-13 (the old 150s value made every big-diff review degrade
+    to all_failed), while two sequential arms still fit inside the 720s
+    durable-job deadline from #623."""
+    assert lc._review_llm_timeout_s() == 330.0
+    assert lc._DEFAULT_REVIEW_TIMEOUT_SECONDS > 318
+    assert 2 * lc._MAX_REVIEW_TIMEOUT_SECONDS < 720
+
+
+def test_review_llm_timeout_env_override(monkeypatch) -> None:
+    monkeypatch.setenv("GRUG_REVIEW_LLM_TIMEOUT_S", "200")
+    assert lc._review_llm_timeout_s() == 200.0
+
+
+def test_review_llm_timeout_clamps_to_deadline_hierarchy(monkeypatch) -> None:
+    """Values that would break 2 x arm < GRUG_REVIEW_JOB_TIMEOUT_S clamp to
+    the ceiling; absurdly small values clamp to the floor."""
+    monkeypatch.setenv("GRUG_REVIEW_LLM_TIMEOUT_S", "10000")
+    assert lc._review_llm_timeout_s() == lc._MAX_REVIEW_TIMEOUT_SECONDS
+    monkeypatch.setenv("GRUG_REVIEW_LLM_TIMEOUT_S", "1")
+    assert lc._review_llm_timeout_s() == lc._MIN_REVIEW_TIMEOUT_SECONDS
+
+
+def test_review_llm_timeout_invalid_value_falls_back_to_default(monkeypatch) -> None:
+    monkeypatch.setenv("GRUG_REVIEW_LLM_TIMEOUT_S", "not-a-number")
+    assert lc._review_llm_timeout_s() == lc._DEFAULT_REVIEW_TIMEOUT_SECONDS
 
 
 def test_cave_calls_are_tagged_interactive_priority(monkeypatch) -> None:
