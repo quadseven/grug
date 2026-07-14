@@ -91,6 +91,21 @@ def test_non_secret_assignment_ignored():
     assert scan_secrets(_hunks(_diff("app.py", f'username = "{_HIGH_ENTROPY}"'))) == ()
 
 
+def test_runtime_secret_references_are_not_committed_secret_values():
+    diff = _diff(
+        "app.swift",
+        "guard let transactionToken = credentials?.token, !Task.isCancelled else {",
+        "let token = credentials.token",
+        "authToken = fetch_context()",
+        "apiKey = process.env.API_KEY",
+        "clientSecret = config.clientSecret",
+        "password = os.environ['DB_PASSWORD']",
+        "registryPassword = $REGISTRY_PASSWORD",
+        "secret = f.read().strip()",
+    )
+    assert scan_secrets(_hunks(diff)) == ()
+
+
 # --- diff-scoping + dedup + cap --------------------------------------------
 
 

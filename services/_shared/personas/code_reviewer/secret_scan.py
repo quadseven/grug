@@ -10,14 +10,14 @@ a secret committed to a `.env`, YAML, shell, JS, or Dockerfile is invisible to
 it. This detector is file-type-agnostic and diff-scoped (added lines only, like
 the SAST/SCA sources).
 
-Two recall rules, deliberately LIBERAL (a detector miss is unrecoverable; an
-over-flag is recovered by the judge):
+Two recall rules:
   (A) high-signal provider token patterns (AWS access-key id, GitHub / Slack /
       Google / Stripe tokens, PEM private-key header) - recognizable formats
       that need no key-name context.
   (B) a generic secret-ish assignment (`api_key = "..."`, `token: ...`) whose
-      value clears a Shannon-entropy gate, so low-entropy placeholders like
-      `your-key-here` never become candidates (and never cost a judge call).
+      LITERAL value clears a Shannon-entropy gate, so low-entropy placeholders
+      and runtime references such as `credentials.token` never become
+      candidates (and never cost a judge call).
 
 No-echo invariant: the snippet MASKS the value (a few leading/trailing chars
 only), so the raw credential is never written into the finding message, the
@@ -94,8 +94,39 @@ _GENERIC_RE = re.compile(
     r"client[_-]?secret|auth[_-]?token|apikey)"
     r"[A-Za-z0-9_.-]{0,64})"
     r"[ \t]*[:=][ \t]*"
-    r"""['"]?(?P<value>[^'"\s]+)['"]?"""
+    r"""(?:(?P<quote>['"])(?P<quoted>[^'"]+)(?P=quote)|(?P<bare>[^'"\s]+))"""
 )
+
+_RUNTIME_MEMBER_RE = re.compile(
+    r"[A-Za-z_][A-Za-z0-9_]*(?:\??\.[A-Za-z_][A-Za-z0-9_]*)+"
+)
+_IDENTIFIER_RE = re.compile(r"[A-Za-z_][A-Za-z0-9_]*")
+
+
+def _generic_literal_value(match: re.Match[str]) -> str | None:
+    """Return only a committed literal from a generic assignment.
+
+    Secret-shaped variable names are common around legitimate credential
+    plumbing. Runtime references and expressions are not committed secret
+    material and must never become candidates merely because their source text
+    has high entropy (for example ``credentials?.token`` or ``fetch_token()``).
+    Provider-format detection remains independent and runs first.
+    """
+    quoted = match.group("quoted")
+    value = quoted if quoted is not None else match.group("bare").rstrip(",;")
+    if not value or "://" in value:
+        return None
+    if any(marker in value for marker in ("$", "?", "(", ")", "{", "}", "[", "]")):
+        return None
+    if quoted is None:
+        if _RUNTIME_MEMBER_RE.fullmatch(value):
+            return None
+        # A bare alphabetic identifier is a reference, not a literal. Generic
+        # unquoted tokens remain detectable when they carry numeric/symbolic
+        # token material; quoted all-letter secrets remain detectable too.
+        if _IDENTIFIER_RE.fullmatch(value) and not any(ch.isdigit() for ch in value):
+            return None
+    return value
 
 
 @dataclass(frozen=True, slots=True)
@@ -158,7 +189,9 @@ def _detect(text: str) -> tuple[str, str, str] | None:
             return pat.kind, m.group(0), _mask(m.group(0))
     m = _GENERIC_RE.search(text)
     if m:
-        value = m.group("value")
+        value = _generic_literal_value(m)
+        if value is None:
+            return None
         if len(value) >= _MIN_GENERIC_LEN and _shannon_entropy(value) >= _MIN_ENTROPY:
             return f"secret-like assignment to `{m.group('key')}`", value, _mask(value)
     return None
