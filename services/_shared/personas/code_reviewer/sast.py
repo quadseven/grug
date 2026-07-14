@@ -179,6 +179,26 @@ def _budget_files(file_contents: dict[str, str]) -> tuple[dict[str, str], list[s
     return kept, skipped
 
 
+def _write_scan_files(tmp: str, kept_files: dict[str, str]) -> None:
+    """Materialize the budgeted head-SHA file contents under `tmp` for the
+    semgrep subprocess to scan."""
+    tmp_real = os.path.realpath(tmp)
+    for path, content in kept_files.items():
+        dest = os.path.join(tmp, path)
+        # Containment guard: `path` is PR-controlled (from the diff's
+        # `+++ b/<path>`). A crafted `../../etc/foo` would escape the
+        # temp dir into an arbitrary write — refuse anything that does
+        # not resolve to UNDER tmp (defensive even though the pod is
+        # readOnlyRootFilesystem + non-root).
+        dest_real = os.path.realpath(dest)
+        if dest_real != tmp_real and not dest_real.startswith(tmp_real + os.sep):
+            log.warning("sast_semgrep_path_escape_skipped", extra={"path": path})
+            continue
+        os.makedirs(os.path.dirname(dest) or tmp, exist_ok=True)
+        with open(dest, "w", encoding="utf-8") as f:
+            f.write(content)
+
+
 def scan_semgrep(
     hunks: tuple[DiffHunk, ...], file_contents: dict[str, str]
 ) -> tuple[Candidate, ...]:
@@ -212,21 +232,7 @@ def scan_semgrep(
     added = _added_lines_by_file(hunks)
     try:
         with tempfile.TemporaryDirectory(prefix="grug-sast-") as tmp:
-            tmp_real = os.path.realpath(tmp)
-            for path, content in kept_files.items():
-                dest = os.path.join(tmp, path)
-                # Containment guard: `path` is PR-controlled (from the diff's
-                # `+++ b/<path>`). A crafted `../../etc/foo` would escape the
-                # temp dir into an arbitrary write — refuse anything that does
-                # not resolve to UNDER tmp (defensive even though the pod is
-                # readOnlyRootFilesystem + non-root).
-                dest_real = os.path.realpath(dest)
-                if dest_real != tmp_real and not dest_real.startswith(tmp_real + os.sep):
-                    log.warning("sast_semgrep_path_escape_skipped", extra={"path": path})
-                    continue
-                os.makedirs(os.path.dirname(dest) or tmp, exist_ok=True)
-                with open(dest, "w", encoding="utf-8") as f:
-                    f.write(content)
+            _write_scan_files(tmp, kept_files)
             # Semgrep initializes settings/cache under $HOME (~/.semgrep) at
             # startup. The pods run as uid 10001 created with --no-create-home
             # on a readOnlyRootFilesystem, so that mkdir crashed semgrep with
