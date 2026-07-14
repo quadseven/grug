@@ -1,16 +1,16 @@
 {
   "backends": {
     "sparkles": {
-      "cases_scored": 21,
+      "cases_scored": 22,
       "errored_cases": [],
       "noise_rate": 0.0,
-      "overall_catch": 0.11940298507462686,
+      "overall_catch": 0.08450704225352113,
       "per_class_catch": {
-        "correctness": 0.125,
+        "correctness": 0.1875,
         "security-scope": 0.0,
-        "silent-failure": 0.14285714285714285,
+        "silent-failure": 0.0,
         "simplification": 0.0,
-        "test-gap": 0.09090909090909091,
+        "test-gap": 0.0,
         "type-design": 0.0,
         "upstream-semantics": 0.42857142857142855
       },
@@ -20,5 +20,5 @@
       ]
     }
   },
-  "prompt_sha": "3b295fbae3767c904ecb09a8eea9422e3a216d65e52f0407a3b9893cd4780851"
+  "prompt_sha": "961b20e336bb63d1f543e9592cad9acbc76253f9363d8fbaa5c8ddce533e8568"
 }
