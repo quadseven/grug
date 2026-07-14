@@ -276,6 +276,15 @@ def scan_semgrep(
         log.warning("sast_semgrep_run_failed", extra={"kind": type(e).__name__})
         return ()
 
+    return _map_semgrep_results(data, added, tmp_prefix)
+
+
+def _map_semgrep_results(
+    data: dict, added: dict[str, set[int]], tmp_prefix: str
+) -> tuple[Candidate, ...]:
+    """Map raw semgrep JSON results to Candidates: strip the temp-dir prefix
+    back to repo-relative paths, require the rule's metadata.vuln_class, and
+    keep only findings on lines THIS PR added/changed."""
     candidates: list[Candidate] = []
     for r in data.get("results", []):
         rel = r.get("path", "")
@@ -285,7 +294,6 @@ def scan_semgrep(
         vuln_class = (r.get("extra", {}).get("metadata") or {}).get("vuln_class")
         if not (rel and line and vuln_class):
             continue
-        # Only flag lines THIS PR added/changed.
         if line not in added.get(rel, set()):
             continue
         snippet = (r.get("extra", {}).get("lines") or "").strip()
