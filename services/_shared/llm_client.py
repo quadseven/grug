@@ -1,12 +1,18 @@
 """LLM client abstraction for the Code-Reviewer (Elder) persona.
 
-Deep reviews ask Poolside and OpenRouter independently, then return the
-deterministic union of their findings. Backend selection remains stable per
-install and determines call order; it no longer prevents the other model from
-looking for omissions. `GRUG_REVIEW_DEPTH=fast` retains the historical
-first-success/fallback behavior as an operational rollback.
+Deep reviews ask the owned Cave ensemble (coder + reasoner arm, both via
+spark-gateway) independently, then return the deterministic union of their
+findings. `GRUG_REVIEW_DEPTH=fast` returns after the first successful arm
+instead. If BOTH Cave arms produce nothing usable, OpenRouter and Poolside
+step in as a bounded, single-shot last-resort fallback (see
+`_saas_overload_fallback_config`) rather than leaving the review `all_failed`
+- Evan's explicit 2026-07-14 call to bring the SaaS pair back as an overload
+valve, not the primary path. `judge_findings`, `summarize_pr`, and
+`answer_pr_question` still use Poolside/OpenRouter as their primary backend
+via `select_backend`'s stable per-install round robin, unrelated to Elder's
+deep-review Cave path.
 
-Both backends use the OpenAI-compatible chat-completions API so the
+All backends use the OpenAI-compatible chat-completions API so the
 request shape is identical. Only the base URL, auth header, and
 default model name differ. Response is constrained to JSON via
 `response_format={"type": "json_object"}` and parsed defensively —
@@ -233,8 +239,10 @@ class Backend(str, Enum):
     # warm-first). CAVE = the coder arm (qwen3-coder-next on sparkles),
     # CAVE_REASONER = the reasoner arm (qwen3.5 - permanently resident on
     # sparkicus ollama since the nemotron vLLM was retired 2026-07-12). Deep
-    # review runs BOTH and merges - the brain+hands split that replaces the
-    # retired SaaS pair. The exposed-secret judge (#439) also routes to CAVE.
+    # review runs BOTH and merges - the brain+hands split that is now the
+    # PRIMARY review path (POOLSIDE/OPENROUTER above are a bounded overload
+    # fallback only - see _saas_overload_fallback_config). The exposed-secret
+    # judge (#439) also routes to CAVE.
     CAVE = "cave"
     CAVE_REASONER = "cave-reasoner"
 
@@ -521,9 +529,12 @@ def _cave_review_config(backend: Backend) -> "BackendConfig | None":
 
     `backend` is CAVE (coder) or CAVE_REASONER (reasoner). Both hit the same
     GRUG_CAVE_GATEWAY_URL, differing only in `model`. Returns None when the
-    gateway URL is unset, which review_diff surfaces as a clean backend failure
-    (no SaaS backend to fall back to - OpenRouter/Poolside were retired). Models
-    are overridable per arm via GRUG_CAVE_REVIEW_MODEL / GRUG_CAVE_REASONER_MODEL."""
+    gateway URL is unset, which review_diff surfaces as a clean backend
+    failure - OpenRouter/Poolside are no longer the primary review pair, but
+    review_diff still reaches for them as the last-resort overload fallback
+    (see `_saas_overload_fallback_config`) when Cave produces nothing usable.
+    Models are overridable per arm via GRUG_CAVE_REVIEW_MODEL /
+    GRUG_CAVE_REASONER_MODEL."""
     base = os.getenv("GRUG_CAVE_GATEWAY_URL", "").strip().rstrip("/")
     if not base:
         return None
@@ -541,6 +552,33 @@ def _cave_review_config(backend: Backend) -> "BackendConfig | None":
         # Short client timeout (_review_llm_timeout_s()) - must not queue
         # behind a long-running agentic turn on a shared Ollama target.
         extra_headers={"X-Spark-Priority": "interactive"},
+    )
+
+
+# Last-resort overload valve (Evan's explicit 2026-07-14 call): when BOTH
+# Cave arms produce nothing usable, try OpenRouter/Poolside once each before
+# giving up entirely - "let it be used potentially if/when grug cave... are
+# overloaded", explicitly NOT the primary review path (that stays Cave-only,
+# owned-hardware-first). Deliberately reuses each backend's fast, low-latency
+# DEFAULT model (Poolside laguna-m.1 thinking-disabled, OpenRouter Haiku 4.5)
+# from `_BACKEND_CONFIGS`, NOT the Opus-plus-high-reasoning review override
+# in `_review_backend_config` - that config is tuned for a multi-minute
+# quality pass, not a bounded emergency valve. Single-shot (no retry budget):
+# this tier must fail fast and cleanly, not spend its slim reserved slack on
+# a 429/503 backoff.
+_SAAS_OVERLOAD_FALLBACK_TIMEOUT_SECONDS = 40.0
+
+
+def _saas_overload_fallback_config(backend: Backend) -> BackendConfig:
+    """Poolside/OpenRouter config for the post-Cave-failure last resort. Two
+    sequential single-shot attempts at this timeout (80s worst case) are sized
+    to fit inside the slack GRUG_REVIEW_JOB_TIMEOUT_S reserves ahead of the
+    Cave arms' own worst-case budget (see the k8s manifest comment)."""
+    return replace(
+        _BACKEND_CONFIGS[backend],
+        timeout_seconds=_SAAS_OVERLOAD_FALLBACK_TIMEOUT_SECONDS,
+        retry_attempts=1,
+        transport_retry_attempts=1,
     )
 
 
@@ -1260,12 +1298,14 @@ def review_diff(
 
     Returns one of five discriminated states (`response.kind`):
       - `no_diff`: empty hunks short-circuit, no LLM call made.
-      - `reviewed`: at least one deep backend answered. The two backends are
-        best-effort free tier, so ONE reply is a complete review (findings
-        merge whatever came back); the Cave/Spark judge grades them downstream.
-      - `parse_failed`: LLM responded but the content wasn't usable JSON.
-      - `all_failed`: every backend errored or timed out (the Cave fallback
-        then reviews).
+      - `reviewed`: at least one deep backend answered. The two Cave arms are
+        best-effort, so ONE reply is a complete review (findings merge
+        whatever came back); the Cave/Spark judge grades them downstream. A
+        successful OpenRouter/Poolside overload fallback (see below) also
+        returns `reviewed`, attributed to whichever of the two answered.
+      - `parse_failed`: an LLM responded but the content wasn't usable JSON.
+      - `all_failed`: both Cave arms AND the OpenRouter/Poolside overload
+        fallback errored or timed out.
 
     `pr_context` carries span tags plus bounded PR intent. Title and body are
     explicitly framed as untrusted repository data and redacted before either
@@ -1274,12 +1314,14 @@ def review_diff(
     if not hunks:
         return LlmReviewResponse(kind="no_diff")
 
-    # Owned review ensemble (replaces the retired SaaS pair): coder arm
-    # (qwen3-coder-next) + reasoner arm (qwen3.5, always-hot on sparkicus),
-    # both via the Cave gateway. Deep runs both and merges (brain+hands); fast
-    # returns after the FIRST SUCCESSFUL arm - coder first so fast mode uses
-    # the code specialist, falling over to the reasoner only if the coder arm
-    # fails. No SaaS spend, no 402 outage.
+    # Owned review ensemble, PRIMARY: coder arm (qwen3-coder-next) + reasoner
+    # arm (qwen3.5, always-hot on sparkicus), both via the Cave gateway. Deep
+    # runs both and merges (brain+hands); fast returns after the FIRST
+    # SUCCESSFUL arm - coder first so fast mode uses the code specialist,
+    # falling over to the reasoner only if the coder arm fails. No SaaS spend
+    # in the common case. If BOTH arms produce nothing usable, OpenRouter/
+    # Poolside step in below as a bounded last resort - see
+    # _saas_overload_fallback_config.
     review_backends: tuple[Backend, ...] = (Backend.CAVE, Backend.CAVE_REASONER)
     depth = os.getenv("GRUG_REVIEW_DEPTH", "deep").strip().lower()
     deep = depth != "fast"
@@ -1464,6 +1506,120 @@ def review_diff(
         )
         last_error = f"{backend.value}: {err}"
 
+    if not successes and first_parse_fail is None:
+        # Both Cave arms produced NO usable response at all (misconfigured,
+        # transport error, or timeout) - the strongest signal the owned
+        # hardware itself is unavailable. Evan's 2026-07-14 call: OpenRouter
+        # and Poolside come back here as a bounded, single-shot LAST RESORT
+        # ("let it be used potentially if/when grug cave... are overloaded",
+        # explicitly not the primary path). Skipped when a Cave arm DID
+        # respond but unparseably (first_parse_fail set) - that is a
+        # model/prompt bug, not overload, and SaaS retrying it would not
+        # help. Each attempt uses _saas_overload_fallback_config's short,
+        # single-shot budget so trying both backends always fits inside the
+        # slack GRUG_REVIEW_JOB_TIMEOUT_S reserves ahead of the Cave arms'
+        # own worst-case 2x_review_llm_timeout_s() budget (see the k8s
+        # manifest comment on GRUG_REVIEW_JOB_TIMEOUT_S).
+        for backend in (Backend.POOLSIDE, Backend.OPENROUTER):
+            config = _saas_overload_fallback_config(backend)
+            start_ns = time.monotonic_ns()
+            with _llmobs_llm(
+                model_name=config.model, model_provider=backend.value, name=_LLMOBS_NAME,
+            ) as span:
+                try:
+                    resp = _call_backend(config, messages)
+                except _BackendConfigError as e:
+                    log.error(
+                        "llm_backend_misconfigured",
+                        extra={"backend": backend.value, "detail": str(e)},
+                    )
+                    _llmobs_annotate(
+                        span=span, input_data=_redact_payload(messages),
+                        metadata={"backend": backend.value, "variant_id": variant, "error": "config"},
+                        metrics={"latency_ms": _elapsed_ms(start_ns)},
+                        tags=pr_tags,
+                    )
+                    last_error = f"{backend.value} misconfigured: {e}"
+                    continue
+                except (httpx.RequestError, httpx.TimeoutException) as e:
+                    log.warning(
+                        "llm_saas_overload_fallback_transport_failed",
+                        extra={"backend": backend.value, "kind": type(e).__name__},
+                    )
+                    _llmobs_annotate(
+                        span=span, input_data=_redact_payload(messages),
+                        metadata={"backend": backend.value, "variant_id": variant, "error": type(e).__name__},
+                        metrics={"latency_ms": _elapsed_ms(start_ns)},
+                        tags=pr_tags,
+                    )
+                    last_error = f"{backend.value}: {type(e).__name__}"
+                    continue
+                findings, model, err = _parse_response(resp)
+                try:
+                    body = resp.json() if resp.status_code == 200 else {}
+                except (ValueError, json.JSONDecodeError):
+                    log.warning(
+                        "llm_body_reparse_failed",
+                        extra={"backend": backend.value, "status_code": resp.status_code},
+                    )
+                    body = {}
+                content = ""
+                if isinstance(body, dict):
+                    choices = body.get("choices") or []
+                    if choices and isinstance(choices[0], dict):
+                        content = (choices[0].get("message") or {}).get("content", "")
+                usage_metrics = _extract_usage_metrics(body)
+                _llmobs_annotate(
+                    span=span,
+                    input_data=_redact_payload(messages),
+                    output_data=_redact_payload(content) if content else None,
+                    metadata={
+                        "backend": backend.value,
+                        "variant_id": variant,
+                        "status_code": resp.status_code,
+                        "kind": "reviewed" if not err else (
+                            "parse_failed" if resp.status_code == 200 else "http_error"
+                        ),
+                    },
+                    metrics={"latency_ms": _elapsed_ms(start_ns), **usage_metrics},
+                    tags=pr_tags,
+                )
+                span_context = _llmobs_export(span) if not err else None
+            if not err:
+                resolved_model = model or config.model
+                log.info(
+                    "llm_saas_overload_fallback_used",
+                    extra={"backend": backend.value, "installation_id": installation_id},
+                )
+                origin = FindingOrigin(
+                    backend=backend, model=resolved_model, review_span_context=span_context,
+                )
+                return LlmReviewResponse(
+                    kind="reviewed",
+                    findings=tuple(
+                        replace(finding, origins=(origin,)) for finding in findings
+                    ),
+                    backend_used=backend,
+                    model_name=resolved_model,
+                    review_span_context=span_context,
+                    backends_used=(backend,),
+                    models_used=(resolved_model,),
+                )
+            if resp.status_code == 200:
+                log.warning(
+                    "llm_response_parse_failed",
+                    extra={"backend": backend.value, "model": model, "error": err},
+                )
+                if first_parse_fail is None:
+                    first_parse_fail = (backend, model, err)
+                last_error = f"{backend.value}: parse_failed: {err}"
+                continue
+            log.warning(
+                "llm_backend_http_failed",
+                extra={"backend": backend.value, "status": resp.status_code, "error": err},
+            )
+            last_error = f"{backend.value}: {err}"
+
     if successes:
         first = successes[0]
         # Deep review fans out to two FREE-TIER backends (Poolside + OpenRouter)
@@ -1514,7 +1670,7 @@ def review_diff(
         )
     return LlmReviewResponse(
         kind="all_failed",
-        error=last_error or "both backends failed",
+        error=last_error or "all backends failed",
     )
 
 

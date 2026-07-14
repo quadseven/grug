@@ -509,17 +509,36 @@ def test_findings_with_missing_fields_are_dropped() -> None:
     assert out.findings[0].rule == "ok"
 
 
-def test_unconfigured_cave_gateway_returns_all_failed(monkeypatch) -> None:
-    """No GRUG_CAVE_GATEWAY_URL → both ensemble arms are misconfigured →
-    all_failed, and no HTTP call is made (the guard runs before the span).
-    Without the narrow exception split, this would 500 the webhook handler
-    instead of degrading to advisory neutral."""
+def test_unconfigured_cave_gateway_falls_back_to_saas(monkeypatch) -> None:
+    """No GRUG_CAVE_GATEWAY_URL → both ensemble arms are misconfigured, no
+    HTTP call made for either (the guard runs before the span) → but Cave
+    produced nothing usable, so the OpenRouter/Poolside overload fallback
+    still gets a shot rather than leaving the review all_failed outright."""
     monkeypatch.delenv("GRUG_CAVE_GATEWAY_URL", raising=False)
-    with patch.object(httpx, "post") as mock_post:
+    monkeypatch.setattr(lc, "_RETRY_SLEEP", lambda s: None)
+    success = httpx.Response(200, json=_openai_json_response('{"findings":[]}'))
+    with patch.object(httpx, "post", return_value=success) as mock_post:
+        out = review_diff([_hunk()], installation_id=1)
+    assert out.kind == "reviewed"
+    assert out.backend_used == Backend.POOLSIDE
+    mock_post.assert_called_once()  # Cave never dialed; only the fallback
+
+
+def test_unconfigured_cave_gateway_and_saas_down_returns_all_failed(monkeypatch) -> None:
+    """Same as above, but the overload fallback ALSO fails - still degrades
+    cleanly to all_failed rather than crashing the webhook handler."""
+    monkeypatch.delenv("GRUG_CAVE_GATEWAY_URL", raising=False)
+    monkeypatch.setattr(lc, "_RETRY_SLEEP", lambda s: None)
+    with patch.object(httpx, "post", side_effect=httpx.ConnectError("down")) as mock_post:
         out = review_diff([_hunk()], installation_id=1)
     assert out.kind == "all_failed"
-    assert "misconfigured" in out.error.lower()
-    mock_post.assert_not_called()  # never made an HTTP call
+    # last_error reflects the LAST attempt (OpenRouter's transport failure) -
+    # Cave's earlier misconfiguration is superseded, not lost (both are
+    # logged individually via llm_backend_misconfigured).
+    assert "connecterror" in out.error.lower()
+    # Cave never dialed (config guard runs before the span); only the two
+    # single-shot overload-fallback attempts (Poolside, OpenRouter).
+    assert mock_post.call_count == 2
 
 
 def test_503_retried_alongside_429(monkeypatch) -> None:
@@ -562,13 +581,129 @@ def test_transport_failure_on_both_backends_returns_all_failed(monkeypatch) -> N
     assert out.kind == "all_failed"
     assert out.backend_used is None
     # Long review timeouts are not retried; one attempt per arm bounds the deep
-    # generation phase even though quick 429/503 responses still retry.
-    assert len(call_log) == 2
-    # Both arms represented (coder + reasoner models). Assert the coder
+    # generation phase even though quick 429/503 responses still retry. Both
+    # Cave arms fail (2) -> the OpenRouter/Poolside overload fallback also
+    # gets one single-shot attempt each (2) since Cave produced nothing
+    # usable = 4 total.
+    assert len(call_log) == 4
+    # Both Cave arms represented (coder + reasoner models). Assert the coder
     # substring explicitly: "qwen" alone also matches the reasoner
     # (qwen3.5), so it could pass on two reasoner calls.
     assert any("qwen3.5" in m for m in call_log)
     assert any("qwen3-coder" in m for m in call_log)
+    # The overload fallback tier also fired, in order, after both Cave arms -
+    # each backend's fast default model (not the Opus review override).
+    assert call_log[2:] == [lc._POOLSIDE_MODEL, lc._OPENROUTER_MODEL]
+
+
+def test_saas_overload_fallback_rescues_review_when_cave_fully_down(monkeypatch) -> None:
+    """Evan's 2026-07-14 call: when both Cave arms are unreachable (the
+    Sparks/spark-gateway overloaded), OpenRouter/Poolside step in as a
+    last-resort so the review still completes instead of going all_failed."""
+    monkeypatch.setattr(lc, "_RETRY_SLEEP", lambda s: None)
+
+    def respond(url, **kwargs):
+        model = (kwargs.get("json") or {}).get("model", "")
+        if model in ("qwen3-coder-next:q8_0", "qwen3.5:122b"):
+            raise httpx.ConnectTimeout("cave overloaded")
+        assert model == lc._POOLSIDE_MODEL  # Poolside tried before OpenRouter
+        return httpx.Response(
+            200,
+            json=_openai_json_response(
+                '{"findings": [{"path": "src/x.py", "line": 1, '
+                '"rule": "lost-error", "severity": "high", "message": "bug"}]}'
+            ),
+        )
+
+    with patch.object(httpx, "post", side_effect=respond):
+        out = review_diff([_hunk()], installation_id=1)
+
+    assert out.kind == "reviewed"
+    assert out.backend_used == Backend.POOLSIDE
+    assert out.backends_used == (Backend.POOLSIDE,)
+    assert [finding.rule for finding in out.findings] == ["lost-error"]
+
+
+def test_saas_overload_fallback_tries_openrouter_after_poolside_fails(monkeypatch) -> None:
+    """Poolside also down -> OpenRouter gets a shot before giving up."""
+    monkeypatch.setattr(lc, "_RETRY_SLEEP", lambda s: None)
+
+    def respond(url, **kwargs):
+        model = (kwargs.get("json") or {}).get("model", "")
+        if model == lc._OPENROUTER_MODEL:
+            return httpx.Response(200, json=_openai_json_response('{"findings":[]}'))
+        raise httpx.ConnectTimeout("down")
+
+    with patch.object(httpx, "post", side_effect=respond):
+        out = review_diff([_hunk()], installation_id=1)
+
+    assert out.kind == "reviewed"
+    assert out.backend_used == Backend.OPENROUTER
+
+
+def test_saas_overload_fallback_uses_fast_default_model_not_review_opus(monkeypatch) -> None:
+    """The fallback tier must NOT inherit the Opus-plus-high-reasoning review
+    override - that config is tuned for a multi-minute quality pass and would
+    blow the tier's tight reserved time budget. It gets each backend's fast,
+    low-latency shared-config default instead."""
+    monkeypatch.setattr(lc, "_RETRY_SLEEP", lambda s: None)
+    captured: list[dict] = []
+
+    def respond(url, **kwargs):
+        model = (kwargs.get("json") or {}).get("model", "")
+        if model in ("qwen3-coder-next:q8_0", "qwen3.5:122b"):
+            raise httpx.ConnectTimeout("cave overloaded")
+        captured.append(kwargs)
+        return httpx.Response(200, json=_openai_json_response('{"findings":[]}'))
+
+    with patch.object(httpx, "post", side_effect=respond):
+        review_diff([_hunk()], installation_id=1)
+
+    assert captured[0]["json"]["model"] == lc._POOLSIDE_MODEL
+    assert captured[0]["json"]["model"] != lc._OPENROUTER_REVIEW_MODEL
+    assert captured[0]["timeout"] == lc._SAAS_OVERLOAD_FALLBACK_TIMEOUT_SECONDS
+
+
+def test_saas_overload_fallback_never_engages_when_a_cave_arm_succeeds(monkeypatch) -> None:
+    """The fallback tier is a last resort, not a race - it must not fire at
+    all when Cave itself produced a usable review."""
+    monkeypatch.setenv("GRUG_REVIEW_DEPTH", "fast")
+    call_log: list[str] = []
+
+    def respond(url, **kwargs):
+        model = (kwargs.get("json") or {}).get("model", "")
+        call_log.append(model)
+        return httpx.Response(200, json=_openai_json_response('{"findings":[]}'))
+
+    with patch.object(httpx, "post", side_effect=respond):
+        out = review_diff([_hunk()], installation_id=1)
+
+    assert out.kind == "reviewed"
+    assert out.backend_used == Backend.CAVE
+    assert len(call_log) == 1  # fast mode short-circuits on the first success
+    assert lc._POOLSIDE_MODEL not in call_log
+    assert lc._OPENROUTER_MODEL not in call_log
+
+
+def test_saas_overload_fallback_skipped_when_cave_returns_parse_failed(monkeypatch) -> None:
+    """A Cave arm that DID respond but unparseably is a model/prompt bug, not
+    overload - the fallback must not engage (retrying on SaaS would not fix
+    a prompt/parsing issue) and parse_failed must still win over all_failed."""
+    monkeypatch.setenv("GRUG_REVIEW_DEPTH", "deep")
+    call_log: list[str] = []
+
+    def respond(url, **kwargs):
+        model = (kwargs.get("json") or {}).get("model", "")
+        call_log.append(model)
+        return httpx.Response(200, json=_openai_json_response("not json"))
+
+    with patch.object(httpx, "post", side_effect=respond):
+        out = review_diff([_hunk()], installation_id=1)
+
+    assert out.kind == "parse_failed"
+    assert len(call_log) == 2  # both Cave arms only, no SaaS fallback
+    assert lc._POOLSIDE_MODEL not in call_log
+    assert lc._OPENROUTER_MODEL not in call_log
 
 
 def test_parse_failed_attributes_secondary_backend(monkeypatch) -> None:
@@ -715,8 +850,10 @@ def test_non_retryable_5xx_does_not_burn_retry_budget(monkeypatch) -> None:
         out = review_diff([_hunk()], installation_id=2)
 
     assert out.kind == "all_failed"
-    # 1 attempt per backend × 2 backends = 2 calls. Not 6 (would be retried).
-    assert len(call_log) == 2
+    # 1 attempt per backend x 4 backends (both Cave arms, then the
+    # OpenRouter/Poolside overload fallback since Cave produced nothing
+    # usable) = 4 calls. Not 12 (would be retried).
+    assert len(call_log) == 4
 
 
 def test_envelope_non_json_returns_parse_failed(monkeypatch) -> None:
@@ -860,8 +997,9 @@ def test_review_diff_emits_llmobs_span_on_transport_failure(monkeypatch) -> None
         out = review_diff([_hunk()], installation_id=1)
 
     assert out.kind == "all_failed"
-    # Two backends tried → two spans.
-    assert len(annotate_calls) == 2
+    # Both Cave arms tried, then the OpenRouter/Poolside overload fallback
+    # (Cave produced nothing usable) → four spans.
+    assert len(annotate_calls) == 4
     for call in annotate_calls:
         # Error class captured in metadata.
         assert call["metadata"].get("error") == "ReadTimeout"
@@ -896,10 +1034,13 @@ def test_llmobs_span_annotate_called_exactly_once_per_backend_attempt(monkeypatc
     adding an early `continue` could double-annotate; lock the count."""
     monkeypatch.setattr(lc, "_RETRY_SLEEP", lambda s: None)
     annotate_calls = _capture_llmobs(monkeypatch)
-    # Primary backend exhausts its 3 retries on timeout (3 httpx.post
-    # calls), then secondary backend succeeds.
+    # Primary (coder) arm times out (no retry - review transport errors get
+    # exactly one attempt), secondary (reasoner) arm succeeds on its own
+    # first attempt - Cave produces a usable response, so the OpenRouter/
+    # Poolside overload fallback never engages (kept out of this test
+    # deliberately; it has its own dedicated span-count coverage).
     seq: list = [
-        httpx.ReadTimeout("p1"), httpx.ReadTimeout("p2"), httpx.ReadTimeout("p3"),
+        httpx.ReadTimeout("p1"),
         httpx.Response(200, json=_openai_json_response('{"findings":[]}')),
     ]
     idx = {"n": 0}
@@ -916,7 +1057,7 @@ def test_llmobs_span_annotate_called_exactly_once_per_backend_attempt(monkeypatc
         review_diff([_hunk()], installation_id=1)
 
     # Exactly 2 spans (one per backend attempt — primary timeout +
-    # secondary success). Not 4 (one per httpx.post retry) — the span
+    # secondary success). Not 3 (one per httpx.post retry) — the span
     # wraps the whole `_call_backend`, not each retry.
     assert len(annotate_calls) == 2
 
@@ -952,19 +1093,30 @@ def test_llmobs_config_error_annotates_with_error_config(monkeypatch) -> None:
     monkeypatch.setattr(lc, "get_prompt_experiment_mode", lambda: "all_v2")
     annotate_calls = _capture_llmobs(monkeypatch)
 
-    with patch.object(httpx, "post") as mock_post:
+    # Cave arms fail the config guard before any HTTP call; the OpenRouter/
+    # Poolside overload fallback that follows (Cave produced nothing usable)
+    # IS configured (autouse _patch_keys), so it does make HTTP calls - give
+    # it a clean transport failure so its spans are distinguishable
+    # (error=ConnectError, not error=config) from the Cave arms' spans.
+    with patch.object(httpx, "post", side_effect=httpx.ConnectError("down")) as mock_post:
         out = review_diff([_hunk()], installation_id=1)
 
     assert out.kind == "all_failed"
-    mock_post.assert_not_called()
-    # Two arms each fail config check → 2 spans, both error=config.
-    assert len(annotate_calls) == 2
-    for call in annotate_calls:
+    # Cave never dialed HTTP; only the two overload-fallback attempts did.
+    assert mock_post.call_count == 2
+    # Two Cave arms each fail config check (error=config), then two SaaS
+    # overload-fallback attempts each transport-fail (error=ConnectError).
+    assert len(annotate_calls) == 4
+    cave_calls, saas_calls = annotate_calls[:2], annotate_calls[2:]
+    for call in cave_calls:
         assert call["metadata"].get("error") == "config"
         # output_data absent on config error.
         assert call.get("output_data") is None
         # #191: arm attribution present on the config-error path.
         assert call["metadata"]["variant_id"] == "v2"
+    for call in saas_calls:
+        assert call["metadata"].get("error") == "ConnectError"
+        assert call.get("output_data") is None
 
 
 def test_llmobs_metadata_kind_parse_failed_on_200_with_bad_content(monkeypatch) -> None:

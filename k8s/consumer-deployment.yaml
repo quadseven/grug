@@ -96,12 +96,18 @@ spec:
             # receipt, releases the snapshot claim, and replaces the process
             # if a live worker exceeds this budget. Keep below SQS's 900s
             # fallback visibility so cleanup retains operational headroom.
-            - {name: GRUG_REVIEW_JOB_TIMEOUT_S, value: "720"}
+            # 800 (not 720): reserves ~100s of slack ahead of the Cave arms'
+            # own 700s worst case (2 x 350) for the OpenRouter/Poolside
+            # overload fallback (2026-07-14) - two single-shot 40s attempts
+            # (llm_client._SAAS_OVERLOAD_FALLBACK_TIMEOUT_SECONDS) plus
+            # parsing/logging overhead, still 100s under the 900s SQS lease.
+            - {name: GRUG_REVIEW_JOB_TIMEOUT_S, value: "800"}
             # Per-arm LLM transport timeout for the deep review ensemble. Must
-            # satisfy 2 x this < GRUG_REVIEW_JOB_TIMEOUT_S (the two arms run
-            # sequentially): 2 x 330 = 660 < 720. The old 150s default made
-            # every big-diff review degrade to all_failed - a large-diff
-            # reasoner pass was measured at ~318s live (2026-07-13).
+            # satisfy 2 x this + ~100s (SaaS fallback slack) <=
+            # GRUG_REVIEW_JOB_TIMEOUT_S (the two arms run sequentially):
+            # 2 x 330 = 660 < 700 <= 800. The old 150s default made every
+            # big-diff review degrade to all_failed - a large-diff reasoner
+            # pass was measured at ~318s live (2026-07-13).
             - {name: GRUG_REVIEW_LLM_TIMEOUT_S, value: "330"}
             # Four handlers plus their short claim-renewal heartbeats may touch
             # Postgres concurrently; keep pool headroom above the worker count.
