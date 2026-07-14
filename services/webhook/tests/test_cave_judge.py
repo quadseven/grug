@@ -47,7 +47,12 @@ def test_cave_config_builds_from_env(monkeypatch):
     # spark-gateway priority queue (infra#1763-1767): the judge's client
     # timeout is short, so it must jump ahead of Hermes's long agentic
     # turns on the same shared Ollama target rather than queue behind them.
-    assert cfg.extra_headers == {"X-Spark-Priority": "interactive"}
+    # X-Spark-Caller (2026-07-14 fix): the judge was previously invisible in
+    # the gateway's per-consumer attribution, falling back to a pod-IP guess.
+    assert cfg.extra_headers == {
+        "X-Spark-Priority": "interactive",
+        "X-Spark-Caller": "grug-elder-judge",
+    }
 
 
 def test_judge_messages_redact_masks_secret():
