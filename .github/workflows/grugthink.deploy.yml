@@ -21,7 +21,6 @@ on:
 
 permissions:
   contents: read
-  id-token: write  # AWS OIDC (grug-gha-deploy) - SSM read for the LLM fallback keys below
 
 concurrency:
   group: grugthink-deploy
@@ -31,6 +30,9 @@ jobs:
   deploy:
     runs-on: ubuntu-24.04-arm  # cluster is arm64 - build native
     environment: k8s-prod
+    permissions:
+      contents: read
+      id-token: write  # AWS OIDC (grug-gha-deploy) - SSM read for the LLM fallback keys below
     steps:
       - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
 
@@ -120,18 +122,39 @@ jobs:
         # SESSION_SECRET) - a rotated SSM key should reach the pod on the
         # next redeploy without a manual `kubectl delete secret`.
         #
-        # Tolerant of a missing/inaccessible parameter: `|| true` degrades
-        # to an empty value rather than failing `set -e` and aborting the
-        # WHOLE grugthink deploy (primary chat path, Ollama-only, doesn't
-        # need this at all) over an optional resilience feature. An empty
-        # key is exactly what config_legacy.py's POOLSIDE_API_KEY/
+        # Tolerant of a genuinely MISSING parameter (never provisioned) -
+        # an empty key is exactly what config_legacy.py's POOLSIDE_API_KEY/
         # OPENROUTER_API_KEY already treat as "tier not configured, skip
-        # cleanly" (see llm_clients.py's _query_saas_fallback).
+        # cleanly" (see llm_clients.py's _query_saas_fallback) - but a
+        # throttle/auth/network failure fetching a param that DOES exist is
+        # a different signal (CodeRabbit #630: collapsing both into the
+        # same empty-key silence makes a real SSM outage indistinguishable
+        # from "feature just not configured yet"). get_ssm distinguishes
+        # AWS's ParameterNotFound (silently empty, same as before) from any
+        # other error (loud ::error:: annotation naming the real failure) -
+        # still never aborts the deploy itself, since the primary
+        # Ollama-only chat path doesn't need these keys at all.
         run: |
           set -euo pipefail
           get_ssm() {
-            aws ssm get-parameter --name "$1" --with-decryption \
-              --query Parameter.Value --output text 2>/dev/null || echo ""
+            local name="$1" out err_file
+            err_file="$(mktemp)"
+            if out=$(aws ssm get-parameter --name "$name" --with-decryption \
+                       --query Parameter.Value --output text 2>"$err_file"); then
+              rm -f "$err_file"
+              printf '%s' "$out"
+              return 0
+            fi
+            if grep -q "ParameterNotFound" "$err_file"; then
+              rm -f "$err_file"
+              printf ''
+              return 0
+            fi
+            echo "::error::SSM fetch for $name failed with a non-ParameterNotFound error (throttle/auth/network?) - degrading to tier-skipped, but this is NOT the same as 'not configured':"
+            cat "$err_file" >&2
+            rm -f "$err_file"
+            printf ''
+            return 0
           }
           POOLSIDE_KEY="$(get_ssm /infra/llm/poolside_api_key)"
           OPENROUTER_KEY="$(get_ssm /infra/llm/openrouter_api_key)"

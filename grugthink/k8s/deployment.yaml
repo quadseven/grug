@@ -118,8 +118,12 @@ spec:
             # GRUG_*_API_KEY_SSM env-var-held parameter NAMES via their own
             # Roles Anywhere identity. Refreshed on every deploy (unlike
             # SESSION_SECRET's create-once), so an SSM key rotation reaches
-            # the pod on the next redeploy.
-            - secretRef: {name: grugthink-llm-fallback}
+            # the pod on the next redeploy. optional:true (CodeRabbit #630):
+            # this is a last-resort fallback tier, not needed by the primary
+            # Ollama/Cave chat path - a missing Secret (first deploy before
+            # the seed step ever ran, or a manually deleted Secret) must not
+            # block the whole pod from starting.
+            - secretRef: {name: grugthink-llm-fallback, optional: true}
           readinessProbe:
             httpGet: {path: /api/health, port: http}
             initialDelaySeconds: 15
