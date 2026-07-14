@@ -181,10 +181,33 @@ _OPENROUTER_REVIEW_EXTRA_BODY: dict[str, Any] = {
 # request budget and need materially more reasoning time.
 _TIMEOUT_SECONDS = 60
 _RETRY_ATTEMPTS = 3
-# Each deep backend gets one long attempt. With two sequential backends this
-# bounds the review generation phase to five minutes while allowing Opus to
-# reason materially longer than the historical 60-second call.
-_REVIEW_TIMEOUT_SECONDS = 150
+# Each deep backend gets one long attempt. The default must clear a REAL
+# slow pass, not just an average one: a large-diff Elder review on the
+# reasoner arm (qwen3.5:122b) was measured at ~318s live on 2026-07-13 —
+# with the old 150s value BOTH arms timed out and every big-diff review
+# degraded to all_failed (infra#1776 follow-up). The value is bounded above
+# by the durable-review deadline hierarchy, worst case both arms exhausting
+# sequentially: 2 x 330s = 660s, inside GRUG_REVIEW_JOB_TIMEOUT_S (720s),
+# itself inside the 900s SQS visibility fallback. The clamp ceiling (350)
+# is what keeps that chain intact; raising it requires parallelizing the
+# arms first. Same guarded parse-and-clamp shape as consumer.py's
+# _review_job_timeout_s so a typo'd env value degrades, never crashes.
+_DEFAULT_REVIEW_TIMEOUT_SECONDS = 330.0
+_MIN_REVIEW_TIMEOUT_SECONDS = 60.0
+_MAX_REVIEW_TIMEOUT_SECONDS = 350.0
+
+
+def _review_llm_timeout_s() -> float:
+    """Per-arm review transport timeout from GRUG_REVIEW_LLM_TIMEOUT_S."""
+    raw = os.getenv(
+        "GRUG_REVIEW_LLM_TIMEOUT_S", str(_DEFAULT_REVIEW_TIMEOUT_SECONDS),
+    )
+    try:
+        value = float(raw)
+    except ValueError:
+        log.warning("review_llm_timeout_invalid", extra={"value": raw})
+        return _DEFAULT_REVIEW_TIMEOUT_SECONDS
+    return min(_MAX_REVIEW_TIMEOUT_SECONDS, max(_MIN_REVIEW_TIMEOUT_SECONDS, value))
 _REVIEW_RETRY_ATTEMPTS = 3
 _REVIEW_TRANSPORT_RETRY_ATTEMPTS = 1
 # Exponential backoff applies on every attempt except the final one,
@@ -296,7 +319,8 @@ class BackendConfig:
     timeout_seconds: float = _TIMEOUT_SECONDS
     retry_attempts: int = _RETRY_ATTEMPTS
     # Long review calls should still retry quick 429/503 responses, but must not
-    # repeat a full 150-second transport timeout. None follows retry_attempts.
+    # repeat a full _review_llm_timeout_s() transport timeout. None follows
+    # retry_attempts.
     transport_retry_attempts: Optional[int] = None
 
 
@@ -390,7 +414,7 @@ def _review_backend_config(backend: Backend) -> BackendConfig:
             raise _BackendConfigError("GRUG_CAVE_GATEWAY_URL not set - cannot run Cave review")
         return replace(
             cave,
-            timeout_seconds=_REVIEW_TIMEOUT_SECONDS,
+            timeout_seconds=_review_llm_timeout_s(),
             retry_attempts=_REVIEW_RETRY_ATTEMPTS,
             transport_retry_attempts=_REVIEW_TRANSPORT_RETRY_ATTEMPTS,
         )
@@ -400,13 +424,13 @@ def _review_backend_config(backend: Backend) -> BackendConfig:
             config,
             model=_OPENROUTER_REVIEW_MODEL,
             extra_body={**config.extra_body, **_OPENROUTER_REVIEW_EXTRA_BODY},
-            timeout_seconds=_REVIEW_TIMEOUT_SECONDS,
+            timeout_seconds=_review_llm_timeout_s(),
             retry_attempts=_REVIEW_RETRY_ATTEMPTS,
             transport_retry_attempts=_REVIEW_TRANSPORT_RETRY_ATTEMPTS,
         )
     return replace(
         config,
-        timeout_seconds=_REVIEW_TIMEOUT_SECONDS,
+        timeout_seconds=_review_llm_timeout_s(),
         retry_attempts=_REVIEW_RETRY_ATTEMPTS,
         transport_retry_attempts=_REVIEW_TRANSPORT_RETRY_ATTEMPTS,
     )
@@ -434,7 +458,7 @@ def _cave_judge_config() -> "BackendConfig | None":
         url=f"{base}/v1/chat/completions",
         model=os.getenv("GRUG_CAVE_JUDGE_MODEL", _CAVE_JUDGE_DEFAULT_MODEL),
         key_loader=lambda: "in-cluster",  # gateway is unauthenticated in-cluster
-        # Short client timeout (_REVIEW_TIMEOUT_SECONDS) - must not queue
+        # Short client timeout (_review_llm_timeout_s()) - must not queue
         # behind a long-running agentic turn on a shared Ollama target.
         extra_headers={"X-Spark-Priority": "interactive"},
     )
@@ -514,7 +538,7 @@ def _cave_review_config(backend: Backend) -> "BackendConfig | None":
         key_loader=lambda: "in-cluster",  # gateway is unauthenticated in-cluster
         # #609: replaces the default json_object for the Cave arms only.
         extra_body={"response_format": _CAVE_FINDINGS_RESPONSE_FORMAT},
-        # Short client timeout (_REVIEW_TIMEOUT_SECONDS) - must not queue
+        # Short client timeout (_review_llm_timeout_s()) - must not queue
         # behind a long-running agentic turn on a shared Ollama target.
         extra_headers={"X-Spark-Priority": "interactive"},
     )
