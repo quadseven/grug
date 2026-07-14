@@ -468,7 +468,11 @@ def _cave_judge_config() -> "BackendConfig | None":
         key_loader=lambda: "in-cluster",  # gateway is unauthenticated in-cluster
         # Short client timeout (_review_llm_timeout_s()) - must not queue
         # behind a long-running agentic turn on a shared Ollama target.
-        extra_headers={"X-Spark-Priority": "interactive"},
+        # X-Spark-Caller (2026-07-14 fix - grug Elder was the one production
+        # caller with NO caller attribution at all, despite being the
+        # highest-volume consumer; the gateway's dashboard/metrics `source`
+        # tag fell back to a pod-IP guess for every one of its requests).
+        extra_headers={"X-Spark-Priority": "interactive", "X-Spark-Caller": "grug-elder-judge"},
     )
 
 
@@ -551,7 +555,15 @@ def _cave_review_config(backend: Backend) -> "BackendConfig | None":
         extra_body={"response_format": _CAVE_FINDINGS_RESPONSE_FORMAT},
         # Short client timeout (_review_llm_timeout_s()) - must not queue
         # behind a long-running agentic turn on a shared Ollama target.
-        extra_headers={"X-Spark-Priority": "interactive"},
+        # X-Spark-Caller (2026-07-14 fix, see _cave_judge_config) - per-arm
+        # so the gateway dashboard can tell coder vs reasoner load apart,
+        # not just "grug" as one blob.
+        extra_headers={
+            "X-Spark-Priority": "interactive",
+            "X-Spark-Caller": (
+                "grug-elder-reasoner" if backend == Backend.CAVE_REASONER else "grug-elder-coder"
+            ),
+        },
     )
 
 

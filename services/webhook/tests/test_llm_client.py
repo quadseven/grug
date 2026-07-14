@@ -436,6 +436,28 @@ def test_cave_calls_are_tagged_interactive_priority(monkeypatch) -> None:
     assert all(h.get("X-Spark-Priority") == "interactive" for h in captured)
 
 
+def test_cave_calls_carry_per_arm_caller_attribution(monkeypatch) -> None:
+    """X-Spark-Caller (2026-07-14 fix): grug's Elder review was the one
+    production caller with NO caller attribution at all, despite being the
+    highest-volume consumer - the gateway dashboard's `source` tag fell back
+    to a pod-IP guess for every single one of its requests. Distinguishes
+    coder vs reasoner so the dashboard can tell them apart too."""
+    monkeypatch.setenv("GRUG_REVIEW_DEPTH", "deep")
+    captured: list = []
+
+    def capture(_url, *, json, headers, **_kwargs: object) -> httpx.Response:
+        captured.append((json.get("model", ""), headers.get("X-Spark-Caller")))
+        return httpx.Response(200, json=_openai_json_response('{"findings":[]}'))
+
+    with patch.object(httpx, "post", side_effect=capture):
+        review_diff([_hunk()], installation_id=1)
+
+    assert len(captured) == 2
+    callers_by_model = dict(captured)
+    assert callers_by_model["qwen3-coder-next:q8_0"] == "grug-elder-coder"
+    assert callers_by_model["qwen3.5:122b"] == "grug-elder-reasoner"
+
+
 def test_extra_headers_cannot_override_authorization(monkeypatch) -> None:
     """CodeRabbit #618: extra_headers is caller-controlled config, not user
     input, but a future backend accidentally setting Authorization in it
