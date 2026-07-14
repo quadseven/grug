@@ -113,6 +113,13 @@ def test_quoted_secret_punctuation_is_literal_material():
     assert value not in cands[0].snippet
 
 
+def test_bare_secret_punctuation_is_literal_material():
+    value = "Ab3$Cd4?Ef5(Gh6)Ij7"
+    cands = scan_secrets(_hunks(_diff("settings.yaml", f"api_key: {value}")))
+    assert len(cands) == 1
+    assert value not in cands[0].snippet
+
+
 def test_quoted_whole_value_runtime_references_are_not_literals():
     diff = _diff(
         "config.txt",
@@ -202,6 +209,15 @@ def test_dedups_same_secret_across_lines():
     # Same credential repeated in a file -> reported once (content-dedup, like
     # SCA; bounds judge cost).
     diff = _diff(".env", f"K1={_AWS_KEY}", f"K2={_AWS_KEY}")
+    assert len(scan_secrets(_hunks(diff))) == 1
+
+
+def test_dedups_same_generic_secret_across_different_keys():
+    diff = _diff(
+        "config.yaml",
+        f"api_key: {_HIGH_ENTROPY}",
+        f"client_secret: {_HIGH_ENTROPY}",
+    )
     assert len(scan_secrets(_hunks(diff))) == 1
 
 

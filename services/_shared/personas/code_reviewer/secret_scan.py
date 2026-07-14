@@ -100,6 +100,14 @@ _GENERIC_RE = re.compile(
 _RUNTIME_MEMBER_RE = re.compile(
     r"[A-Za-z_][A-Za-z0-9_]*(?:\??\.[A-Za-z_][A-Za-z0-9_]*)+"
 )
+_RUNTIME_CALL_RE = re.compile(
+    r"[A-Za-z_][A-Za-z0-9_]*(?:\??\.[A-Za-z_][A-Za-z0-9_]*)*"
+    r"\([^()\r\n]*\)(?:\??\.[A-Za-z_][A-Za-z0-9_]*(?:\([^()\r\n]*\))?)*"
+)
+_RUNTIME_SUBSCRIPT_RE = re.compile(
+    r"[A-Za-z_][A-Za-z0-9_]*(?:\??\.[A-Za-z_][A-Za-z0-9_]*)*"
+    r"\[[^\]\r\n]+\](?:\??\.[A-Za-z_][A-Za-z0-9_]*)*"
+)
 _IDENTIFIER_RE = re.compile(r"[A-Za-z_][A-Za-z0-9_]*")
 _QUOTED_RUNTIME_REFERENCE_RE = re.compile(
     r"(?:"
@@ -128,9 +136,15 @@ def _generic_literal_value(match: re.Match[str]) -> str | None:
     if quoted is not None and _QUOTED_RUNTIME_REFERENCE_RE.fullmatch(value):
         return None
     if quoted is None:
-        if any(marker in value for marker in ("$", "?", "(", ")", "{", "}", "[", "]")):
+        if _QUOTED_RUNTIME_REFERENCE_RE.fullmatch(value):
             return None
-        if _RUNTIME_MEMBER_RE.fullmatch(value):
+        if (
+            _RUNTIME_MEMBER_RE.fullmatch(value)
+            or _RUNTIME_CALL_RE.fullmatch(value)
+            or _RUNTIME_SUBSCRIPT_RE.fullmatch(value)
+            or (value.startswith("{") and value.endswith("}"))
+            or (value.startswith("[") and value.endswith("]"))
+        ):
             return None
         # A bare alphabetic identifier is a reference, not a literal. Generic
         # unquoted tokens remain detectable when they carry numeric/symbolic
@@ -215,7 +229,7 @@ def _detect(text: str) -> tuple[tuple[str, str, str], ...]:
 def scan_secrets(hunks: tuple[DiffHunk, ...]) -> tuple[Candidate, ...]:
     """Secret-scanning candidate source: a Candidate per committed credential a
     PR introduces, across ANY file type. Diff-scoped, content-deduped by the
-    EXACT matched credential per `(file, kind)` (the same credential repeated in
+    EXACT matched credential per file (the same credential repeated in
     a file is reported once - bounds judge cost, mirrors SCA; deduping on the
     exact value, not the lossy mask, so two distinct secrets sharing a masked
     prefix/suffix are both kept), capped at `_MAX_SECRETS`. Same `Candidate`
@@ -224,7 +238,7 @@ def scan_secrets(hunks: tuple[DiffHunk, ...]) -> tuple[Candidate, ...]:
     used only for in-memory dedup; the published snippet is masked - the raw
     value is never echoed into a Candidate or a log."""
     secrets: list[_Secret] = []
-    seen: set[tuple[str, str, str]] = set()
+    seen: set[tuple[str, str]] = set()
     scanned = 0
     for hunk in hunks:
         for lineno, text in _added_lines(hunk):
@@ -234,7 +248,7 @@ def scan_secrets(hunks: tuple[DiffHunk, ...]) -> tuple[Candidate, ...]:
             if scanned > _MAX_SCAN_BYTES:
                 return _to_candidates(secrets)
             for kind, raw, masked in _detect(text):
-                key = (hunk.file_path, kind, raw)
+                key = (hunk.file_path, raw)
                 if key in seen:
                     continue
                 seen.add(key)
