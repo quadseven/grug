@@ -178,10 +178,14 @@ jobs:
           BASE_URL=$(aws ssm get-parameter --name /grug/database-url --with-decryption --query Parameter.Value --output text)
           printf '%s' "$BASE_URL" | SCHEMA="$SCHEMA" uv run --with 'psycopg[binary]' python3 -c '
           import os, sys, psycopg
-          url = sys.stdin.read().strip()
+          # schema pre-extracted to a variable: a \" escape INSIDE an f-string
+          # expression is a SyntaxError ("unexpected character after line
+          # continuation character") - it broke every teardown run silently
+          # until 2026-07-14. The setup step above uses this same shape.
+          url = sys.stdin.read().strip(); schema = os.environ["SCHEMA"]
           with psycopg.connect(url, autocommit=True) as c:
-              c.execute(f"DROP SCHEMA IF EXISTS \"{os.environ[\"SCHEMA\"]}\" CASCADE")
-          print("dropped schema", os.environ["SCHEMA"])'
+              c.execute(f"DROP SCHEMA IF EXISTS \"{schema}\" CASCADE")
+          print("dropped schema", schema)'
           echo "reaped preview for PR ${PR}" >> "$GITHUB_STEP_SUMMARY"
       - name: Cleanup kubeconfig
         if: always()
