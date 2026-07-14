@@ -105,7 +105,7 @@ def test_poll_hot_review_renews_visibility_until_handler_finishes(monkeypatch):
             consumer._sqs, "receive_message", return_value={"Messages": [_REVIEW_MSG]},
         ),
         patch.object(
-            consumer._sqs,
+            consumer._sqs_cleanup,
             "change_message_visibility",
             side_effect=change_visibility,
         ) as mock_change,
@@ -133,7 +133,7 @@ def test_poll_review_heartbeat_failure_uses_base_visibility_and_still_runs():
             consumer._sqs, "receive_message", return_value={"Messages": [_REVIEW_MSG]},
         ),
         patch.object(
-            consumer._sqs,
+            consumer._sqs_cleanup,
             "change_message_visibility",
             side_effect=RuntimeError("SQS unavailable"),
         ),
@@ -171,6 +171,13 @@ def test_review_job_timeout_clamps_and_falls_back(monkeypatch):
     monkeypatch.setenv("GRUG_REVIEW_JOB_TIMEOUT_S", "not-a-number")
     assert consumer._review_job_timeout_s() == consumer._DEFAULT_REVIEW_JOB_TIMEOUT_S
 
+    for value in ("nan", "inf", "-inf"):
+        monkeypatch.setenv("GRUG_REVIEW_JOB_TIMEOUT_S", value)
+        assert (
+            consumer._review_job_timeout_s()
+            == consumer._DEFAULT_REVIEW_JOB_TIMEOUT_S
+        )
+
 
 def test_shutdown_returns_sqs_leases_before_releasing_review_claims(monkeypatch):
     """Redelivery must be runnable before its durable claim is made available."""
@@ -188,12 +195,64 @@ def test_shutdown_returns_sqs_leases_before_releasing_review_claims(monkeypatch)
     assert order == ["leases", "claims"]
 
 
+def test_shutdown_cleanup_claim_failure_is_reported_without_raising(
+    monkeypatch, caplog,
+):
+    monkeypatch.setattr(consumer, "_release_active_review_leases", lambda: 2)
+    monkeypatch.setattr(
+        consumer,
+        "_release_active_review_claims",
+        MagicMock(side_effect=RuntimeError("database unavailable")),
+    )
+
+    assert consumer._release_inflight_reviews() == (2, 0)
+    failures = [
+        record for record in caplog.records
+        if record.msg == "consumer_review_claim_release_failed"
+    ]
+    assert len(failures) == 1
+    assert failures[0].kind == "RuntimeError"
+
+
+def test_shutdown_cleanup_has_an_absolute_wait_budget(monkeypatch, caplog):
+    release = threading.Event()
+    monkeypatch.setattr(consumer, "_REVIEW_CLEANUP_TIMEOUT_S", 0.01)
+    monkeypatch.setattr(consumer, "_release_inflight_reviews", release.wait)
+
+    try:
+        assert consumer._release_inflight_reviews_bounded() == (0, 0)
+    finally:
+        release.set()
+    assert any(
+        record.msg == "consumer_review_cleanup_timed_out"
+        for record in caplog.records
+    )
+
+
+def test_shutdown_cleanup_reports_unexpected_thread_failure(monkeypatch, caplog):
+    monkeypatch.setattr(
+        consumer,
+        "_release_inflight_reviews",
+        MagicMock(side_effect=RuntimeError("unexpected cleanup failure")),
+    )
+
+    assert consumer._release_inflight_reviews_bounded() == (0, 0)
+    failures = [
+        record for record in caplog.records
+        if record.msg == "consumer_review_cleanup_failed"
+    ]
+    assert len(failures) == 1
+    assert failures[0].kind == "RuntimeError"
+
+
 def test_active_review_lease_release_stops_renewal_and_resets_visibility():
     job = consumer._register_active_review_job(
         "https://q", "receipt-2", "message-2", now=1_000.0,
     )
     try:
-        with patch.object(consumer._sqs, "change_message_visibility") as change:
+        with patch.object(
+            consumer._sqs_cleanup, "change_message_visibility",
+        ) as change:
             assert consumer._release_active_review_leases() == 1
         assert job.lease_stop.is_set()
         change.assert_called_once_with(
@@ -201,6 +260,129 @@ def test_active_review_lease_release_stops_renewal_and_resets_visibility():
         )
     finally:
         consumer._unregister_active_review_job("receipt-2")
+
+
+def test_stuck_visibility_lock_does_not_starve_later_receipts(
+    monkeypatch, caplog,
+):
+    first = consumer._register_active_review_job(
+        "https://q", "receipt-stuck", "message-stuck", now=1_000.0,
+    )
+    second = consumer._register_active_review_job(
+        "https://q", "receipt-ready", "message-ready", now=1_000.0,
+    )
+    first.visibility_lock.acquire()
+    monkeypatch.setattr(consumer, "_REVIEW_VISIBILITY_LOCK_TIMEOUT_S", 0.01)
+    try:
+        with patch.object(
+            consumer._sqs_cleanup, "change_message_visibility",
+        ) as change:
+            assert consumer._release_active_review_leases() == 1
+        change.assert_called_once_with(
+            QueueUrl="https://q",
+            ReceiptHandle="receipt-ready",
+            VisibilityTimeout=0,
+        )
+        assert first.lease_stop.is_set()
+        assert second.lease_stop.is_set()
+        assert any(
+            record.msg == "consumer_review_visibility_lock_timed_out"
+            for record in caplog.records
+        )
+    finally:
+        first.visibility_lock.release()
+        consumer._unregister_active_review_job("receipt-stuck")
+        consumer._unregister_active_review_job("receipt-ready")
+
+
+def test_initial_visibility_extension_finishes_before_cleanup_reset(monkeypatch):
+    job = consumer._register_active_review_job(
+        "https://q", "receipt-starting", "message-starting", now=1_000.0,
+    )
+    initial_started = threading.Event()
+    allow_initial_finish = threading.Event()
+    reset_finished = threading.Event()
+    order: list[str] = []
+
+    def extend(*_args):
+        initial_started.set()
+        assert allow_initial_finish.wait(timeout=1.0)
+        order.append("extend")
+        return True
+
+    def reset(**_kwargs):
+        order.append("reset")
+        reset_finished.set()
+
+    monkeypatch.setattr(consumer, "_extend_review_visibility", extend)
+    monkeypatch.setattr(
+        consumer._sqs_cleanup, "change_message_visibility", reset,
+    )
+    starter = threading.Thread(
+        target=consumer._start_review_visibility_heartbeat,
+        args=("https://q", "receipt-starting", "message-starting"),
+        kwargs={
+            "stop": job.lease_stop,
+            "visibility_lock": job.visibility_lock,
+        },
+    )
+    releaser = threading.Thread(target=consumer._release_active_review_leases)
+    releaser_started = False
+    try:
+        starter.start()
+        assert initial_started.wait(timeout=1.0)
+        releaser.start()
+        releaser_started = True
+        assert not reset_finished.wait(timeout=0.05)
+        allow_initial_finish.set()
+        starter.join(timeout=1.0)
+        releaser.join(timeout=1.0)
+        assert not starter.is_alive()
+        assert not releaser.is_alive()
+        assert order == ["extend", "reset"]
+    finally:
+        allow_initial_finish.set()
+        job.lease_stop.set()
+        if starter.is_alive():
+            starter.join(timeout=1.0)
+        if releaser_started and releaser.is_alive():
+            releaser.join(timeout=1.0)
+        consumer._unregister_active_review_job("receipt-starting")
+
+
+def test_stopped_heartbeat_cannot_extend_after_visibility_reset_starts(
+    monkeypatch,
+):
+    stop = threading.Event()
+    locked = threading.Lock()
+    locked.acquire()
+    heartbeat_waiting = threading.Event()
+
+    class SignalingLock:
+        def __enter__(self):
+            heartbeat_waiting.set()
+            locked.acquire()
+
+        def __exit__(self, *_args):
+            locked.release()
+
+    visibility_lock = SignalingLock()
+    extend = MagicMock()
+    monkeypatch.setattr(consumer, "_extend_review_visibility", extend)
+    monkeypatch.setattr(consumer, "_REVIEW_VISIBILITY_HEARTBEAT_S", 0.0)
+    heartbeat = threading.Thread(
+        target=consumer._review_visibility_loop,
+        args=("https://q", "receipt", "message", stop, visibility_lock),
+    )
+    heartbeat.start()
+
+    assert heartbeat_waiting.wait(timeout=1.0)
+    stop.set()
+    locked.release()
+    heartbeat.join(timeout=1.0)
+
+    assert not heartbeat.is_alive()
+    extend.assert_not_called()
 
 
 def test_shutdown_hard_exits_when_a_worker_misses_the_join_budget(monkeypatch):
@@ -374,7 +556,7 @@ def test_watchdog_returns_work_and_hard_exits_for_an_expired_review(monkeypatch)
     monkeypatch.setattr(consumer, "_expired_review_jobs", lambda: [expired])
     calls: list[object] = []
     monkeypatch.setattr(
-        consumer, "_release_inflight_reviews",
+        consumer, "_release_inflight_reviews_bounded",
         lambda: calls.append("release") or (1, 1),
     )
 
@@ -390,6 +572,67 @@ def test_watchdog_returns_work_and_hard_exits_for_an_expired_review(monkeypatch)
         assert calls == ["release", ("exit", 1)]
     finally:
         consumer._stop.clear()
+
+
+def test_watchdog_hard_exits_when_cleanup_raises(monkeypatch):
+    consumer._stop.clear()
+    monkeypatch.setattr(consumer, "_warm_trace_writer", lambda: None)
+    monkeypatch.setattr(consumer, "_startup_check", lambda: None)
+    monkeypatch.setattr(consumer, "_specs", lambda: [_spec(True, lambda e: None)])
+    monkeypatch.setattr(consumer, "_consume", lambda _spec: consumer._stop.wait())
+    monkeypatch.setattr(consumer, "_flush_traces", lambda: None)
+    expired = MagicMock(
+        message_id="stuck-1", worker="consume-rerun-jobs-1",
+        started_at=100.0, deadline_at=220.0,
+    )
+    monkeypatch.setattr(consumer, "_expired_review_jobs", lambda: [expired])
+    monkeypatch.setattr(
+        consumer,
+        "_release_inflight_reviews_bounded",
+        MagicMock(side_effect=RuntimeError("cleanup failed")),
+    )
+    exits: list[int] = []
+
+    def hard_exit(code: int) -> None:
+        exits.append(code)
+        raise SystemExit(code)
+
+    monkeypatch.setattr(consumer, "_hard_exit", hard_exit)
+    try:
+        with pytest.raises(SystemExit, match="1"):
+            consumer.main()
+    finally:
+        consumer._stop.clear()
+    assert exits == [1]
+
+
+def test_shutdown_checks_stuck_workers_when_cleanup_raises(monkeypatch):
+    consumer._stop.set()
+    worker = MagicMock()
+    worker.is_alive.return_value = True
+    monkeypatch.setattr(consumer, "_warm_trace_writer", lambda: None)
+    monkeypatch.setattr(consumer, "_startup_check", lambda: None)
+    monkeypatch.setattr(consumer, "_consumer_threads", lambda _specs: [worker])
+    monkeypatch.setattr(consumer, "_specs", lambda: [])
+    monkeypatch.setattr(consumer.signal, "signal", lambda *_args: None)
+    monkeypatch.setattr(
+        consumer,
+        "_release_inflight_reviews_bounded",
+        MagicMock(side_effect=RuntimeError("cleanup failed")),
+    )
+    checked: list[tuple[list[object], bool]] = []
+    monkeypatch.setattr(
+        consumer,
+        "_exit_if_workers_remain",
+        lambda threads, *, died: checked.append((threads, died)),
+    )
+
+    try:
+        with pytest.raises(RuntimeError, match="cleanup failed"):
+            consumer.main()
+    finally:
+        consumer._stop.clear()
+    assert checked == [([worker], False)]
 
 
 def test_main_aborts_before_spawning_threads_when_startup_check_fails(monkeypatch):
