@@ -179,6 +179,26 @@ def _budget_files(file_contents: dict[str, str]) -> tuple[dict[str, str], list[s
     return kept, skipped
 
 
+def _write_scan_files(tmp: str, kept_files: dict[str, str]) -> None:
+    """Materialize the budgeted head-SHA file contents under `tmp` for the
+    semgrep subprocess to scan."""
+    tmp_real = os.path.realpath(tmp)
+    for path, content in kept_files.items():
+        dest = os.path.join(tmp, path)
+        # Containment guard: `path` is PR-controlled (from the diff's
+        # `+++ b/<path>`). A crafted `../../etc/foo` would escape the
+        # temp dir into an arbitrary write — refuse anything that does
+        # not resolve to UNDER tmp (defensive even though the pod is
+        # readOnlyRootFilesystem + non-root).
+        dest_real = os.path.realpath(dest)
+        if dest_real != tmp_real and not dest_real.startswith(tmp_real + os.sep):
+            log.warning("sast_semgrep_path_escape_skipped", extra={"path": path})
+            continue
+        os.makedirs(os.path.dirname(dest) or tmp, exist_ok=True)
+        with open(dest, "w", encoding="utf-8") as f:
+            f.write(content)
+
+
 def scan_semgrep(
     hunks: tuple[DiffHunk, ...], file_contents: dict[str, str]
 ) -> tuple[Candidate, ...]:
@@ -212,37 +232,41 @@ def scan_semgrep(
     added = _added_lines_by_file(hunks)
     try:
         with tempfile.TemporaryDirectory(prefix="grug-sast-") as tmp:
-            tmp_real = os.path.realpath(tmp)
-            for path, content in kept_files.items():
-                dest = os.path.join(tmp, path)
-                # Containment guard: `path` is PR-controlled (from the diff's
-                # `+++ b/<path>`). A crafted `../../etc/foo` would escape the
-                # temp dir into an arbitrary write — refuse anything that does
-                # not resolve to UNDER tmp (defensive even though the pod is
-                # readOnlyRootFilesystem + non-root).
-                dest_real = os.path.realpath(dest)
-                if dest_real != tmp_real and not dest_real.startswith(tmp_real + os.sep):
-                    log.warning("sast_semgrep_path_escape_skipped", extra={"path": path})
-                    continue
-                os.makedirs(os.path.dirname(dest) or tmp, exist_ok=True)
-                with open(dest, "w", encoding="utf-8") as f:
-                    f.write(content)
+            _write_scan_files(tmp, kept_files)
+            # Semgrep initializes settings/cache under $HOME (~/.semgrep) at
+            # startup. The pods run as uid 10001 created with --no-create-home
+            # on a readOnlyRootFilesystem, so that mkdir crashed semgrep with
+            # exit 1 before it scanned anything - every production scan
+            # silently degraded to zero findings (found live 2026-07-13, the
+            # infra#1776 sweep). Point HOME (+ XDG cache) at the scan's own
+            # temp dir, the one path we know is writable and gets cleaned up.
+            sem_env = {
+                **os.environ,
+                "HOME": tmp,
+                "XDG_CACHE_HOME": os.path.join(tmp, ".cache"),
+            }
             proc = subprocess.run(
                 ["semgrep", "scan", "--config", _RULES_DIR, "--json", "--quiet",
                  "--disable-version-check", "--no-rewrite-rule-ids", tmp],
                 capture_output=True, text=True, timeout=_SEMGREP_TIMEOUT_S,
+                env=sem_env,
+                # We inspect returncode ourselves below (a non-zero exit with
+                # parseable JSON is a real degrade path, #77), so never raise.
+                check=False,
             )
             if proc.returncode != 0:
                 # Version-dependent, semgrep can exit non-zero AND emit
                 # parseable-but-empty JSON - without this check that
-                # degrades to a silent zero-findings scan.
+                # degrades to a silent zero-findings scan. Keep enough stderr
+                # to actually diagnose: the old 200-char cap hid the failing
+                # path of the exact home-dir crash this env fix addresses.
                 log.warning(
                     "sast_semgrep_run_failed",
                     extra={
                         "kind": "NonZeroExit",
                         "returncode": proc.returncode,
                         "rules_dir": _RULES_DIR,
-                        "stderr": (proc.stderr or "")[:200],
+                        "stderr": (proc.stderr or "")[-2000:],
                     },
                 )
                 return ()
@@ -255,6 +279,15 @@ def scan_semgrep(
         log.warning("sast_semgrep_run_failed", extra={"kind": type(e).__name__})
         return ()
 
+    return _map_semgrep_results(data, added, tmp_prefix)
+
+
+def _map_semgrep_results(
+    data: dict, added: dict[str, set[int]], tmp_prefix: str
+) -> tuple[Candidate, ...]:
+    """Map raw semgrep JSON results to Candidates: strip the temp-dir prefix
+    back to repo-relative paths, require the rule's metadata.vuln_class, and
+    keep only findings on lines THIS PR added/changed."""
     candidates: list[Candidate] = []
     for r in data.get("results", []):
         rel = r.get("path", "")
@@ -264,7 +297,6 @@ def scan_semgrep(
         vuln_class = (r.get("extra", {}).get("metadata") or {}).get("vuln_class")
         if not (rel and line and vuln_class):
             continue
-        # Only flag lines THIS PR added/changed.
         if line not in added.get(rel, set()):
             continue
         snippet = (r.get("extra", {}).get("lines") or "").strip()

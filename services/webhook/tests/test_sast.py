@@ -195,6 +195,32 @@ def test_scan_semgrep_run_failure_fails_safe(monkeypatch):
     assert scan_semgrep((_hunk("a.py", {1}),), {"a.py": "x"}) == ()
 
 
+def test_scan_semgrep_points_home_at_writable_scan_dir(monkeypatch):
+    """Semgrep initializes ~/.semgrep at startup. The pods run as uid 10001
+    with --no-create-home on a readOnlyRootFilesystem, so inheriting the pod
+    HOME crashed semgrep with a mkdir PermissionError (exit 1) before it
+    scanned anything - every production scan silently degraded to zero
+    findings (2026-07-13, infra#1776 sweep; reproduced locally against real
+    semgrep 1.169). The subprocess env must point HOME and XDG_CACHE_HOME
+    inside the scan's own temp dir."""
+    seen = {}
+    def _capture(cmd, **kw):
+        tmp = cmd[-1]
+        seen["tmp"] = tmp
+        seen["env"] = kw.get("env")
+        return _semgrep_json([])
+    monkeypatch.setattr(sast.subprocess, "run", _capture)
+    scan_semgrep((_hunk("a.py", {1}),), {"a.py": "x = 1\n"})
+    import os as _os
+    assert seen["env"] is not None, "semgrep must run with an explicit env"
+    assert seen["env"]["HOME"] == seen["tmp"]
+    # XDG_CACHE_HOME must be a real subdirectory of the scan tmp dir, not just
+    # a string sharing its prefix (a sibling like "<tmp>.cache" would pass a
+    # bare startswith but still land outside the writable, self-cleaning dir).
+    assert seen["env"]["XDG_CACHE_HOME"] == _os.path.join(seen["tmp"], ".cache")
+    assert seen["env"]["XDG_CACHE_HOME"].startswith(seen["tmp"] + _os.sep)
+
+
 def test_scan_semgrep_skips_files_over_byte_budget(monkeypatch):
     """AC5: a file beyond the byte budget is not scanned (cost bound)."""
     monkeypatch.setattr(sast, "_MAX_SCAN_BYTES", 50)
