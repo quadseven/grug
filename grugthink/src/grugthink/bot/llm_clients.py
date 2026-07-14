@@ -1,8 +1,18 @@
 """LLM API client functions for GrugThink bot.
 
 This module handles communication with different LLM backends:
-- Ollama API (local/self-hosted models)
-- Google Gemini API (cloud-based models)
+- Ollama API (local/self-hosted models) - the ALWAYS-tried-first primary,
+  via the owned in-cluster spark-gateway.
+- Poolside / OpenRouter (query_poolside_api / query_openrouter_api) - a
+  bounded, single-shot, short-timeout fallback chain engaged ONLY when
+  Ollama/Cave produces no usable reply. Same last-resort-overload-valve
+  pattern grug's Elder review persona uses (services/_shared/llm_client.py
+  `_saas_overload_fallback_config`), sized for a realtime Discord reply
+  instead of a multi-minute review pass - see the timeout comments on each
+  function for the full worst-case-time math.
+- Google Gemini API (cloud-based models) - final bonus fallback tier, gated
+  on GEMINI_API_KEY being configured (query_model in prompts.py wires the
+  chain; this module just provides the per-backend calls).
 """
 
 import time
@@ -248,6 +258,250 @@ def query_ollama_api(
                     tags=span_tags,
                 )
     return None
+
+
+# --- Bounded SaaS fallback chain (Poolside, then OpenRouter) -------------
+#
+# Engaged ONLY when query_ollama_api above returns None (Cave/spark-gateway
+# genuinely produced nothing usable - not on a successful reply). Mirrors
+# services/_shared/llm_client.py's Backend.POOLSIDE/OPENROUTER wire shape
+# (same OpenAI-compatible /v1/chat/completions endpoints, same default
+# models, same enable_thinking=false switch on Poolside) but NOT its
+# multi-minute review-scale timeout/retry budget - a Discord reply needs to
+# feel close to instant even in the failure case, per a past incident
+# (Poolside's laguna-m.1 defaults to thinking ON: an early, unbounded config
+# blew a 30s read timeout - measured 72s for even a tiny prompt - and each
+# review call could still retry 3x on top of that; see grug's
+# `_saas_overload_fallback_config` for the same lesson learned the hard way
+# on the review side). Both tiers here are SINGLE-SHOT: one POST, no retry,
+# no backoff - a 429/503 falls straight through to the next tier instead of
+# spending time re-hitting the one that just said no.
+#
+# Timeout math (mirrors the worked-example comment style on grug's
+# `_SAAS_OVERLOAD_FALLBACK_TIMEOUT_SECONDS`):
+#   - Primary (query_ollama_api above): prod OLLAMA_URLS is the single
+#     spark-gateway URL (k8s/deployment.yaml) with timeout=(10, 60) - one
+#     70s-worst-case attempt, unchanged by this fallback chain.
+#   - Each fallback tier below: (5, 10) - 5s to connect, 10s to read - a
+#     15s worst case per backend. Generous headroom over the observed live
+#     latency (Poolside thinking-disabled + OpenRouter Haiku 4.5 both
+#     measured well under 1s on grug's Elder path) while staying an order
+#     of magnitude short of grug review's 330-350s scale, appropriate for a
+#     realtime chat reply rather than a durable background job.
+#   - Total worst case if EVERYTHING fails: 70s (primary) + 15s (Poolside)
+#     + 15s (OpenRouter) [+ 30s Gemini bonus tier, query_gemini_api's own
+#     existing request_options timeout, if GEMINI_API_KEY is configured]
+#     = 100s (130s with Gemini). No SQS/job-timeout ceiling applies here
+#     (unlike grug's review chain) - the operative bound is Discord's own
+#     interaction-followup window (15 minutes), which this stays two
+#     orders of magnitude inside of even in the total-failure case.
+_FALLBACK_TIMEOUT = (5, 10)  # (connect, read) seconds - see math above.
+
+_POOLSIDE_URL = "https://inference.poolside.ai/v1/chat/completions"
+_POOLSIDE_MODEL = "poolside/laguna-m.1"
+_OPENROUTER_URL = "https://openrouter.ai/api/v1/chat/completions"
+_OPENROUTER_MODEL = "anthropic/claude-haiku-4.5"
+
+
+def _query_saas_fallback(
+    backend: str,
+    url: str,
+    model: str,
+    api_key: str | None,
+    extra_body: dict[str, Any],
+    prompt_text: str,
+    cache_key: str,
+    server_db=None,
+    personality_name: str = None,
+    bot_id: str = None,
+) -> str | None:
+    """Shared single-shot OpenAI-compatible chat-completions call used by
+    both query_poolside_api and query_openrouter_api - they differ only in
+    URL/model/key/extra_body, so the transport + logging + LLM Obs shape
+    lives here once rather than duplicated per backend."""
+    # Import here to avoid circular dependency (same reason query_ollama_api
+    # and query_gemini_api import it lazily above).
+    from .prompts import validate_and_process_response
+
+    if not api_key:
+        log.warning(
+            "saas_fallback_skipped_not_configured",
+            extra={"backend": backend, "bot_id": bot_id, "personality": personality_name, "cache_key": cache_key},
+        )
+        return None
+
+    span_tags = {"bot_id": str(bot_id or ""), "personality": str(personality_name or "")}
+    start_ns = time.monotonic_ns()
+    with _llmobs_llm(model_name=model, model_provider=backend, name=_LLMOBS_NAME) as span:
+        try:
+            payload = {
+                "model": model,
+                "messages": [{"role": "user", "content": prompt_text}],
+                **extra_body,
+            }
+            headers = {"Authorization": f"Bearer {api_key}"}
+            # Single-shot: exactly one POST, no retry loop, no backoff - see
+            # the module-level timeout comment above for the full math.
+            r = session.post(url, json=payload, headers=headers, timeout=_FALLBACK_TIMEOUT)
+            if r.status_code == 200:
+                body = r.json()
+                choices = body.get("choices") or []
+                response = ""
+                if choices and isinstance(choices[0], dict):
+                    response = ((choices[0].get("message") or {}).get("content") or "").strip()
+                log.info(
+                    "saas_fallback_response_received",
+                    extra={
+                        "bot_id": bot_id,
+                        "personality": personality_name,
+                        "backend": backend,
+                        "model": model,
+                        "response_length": len(response),
+                        "cache_key": cache_key,
+                    },
+                )
+                _llmobs_annotate(
+                    span=span,
+                    input_data=prompt_text,
+                    output_data=response,
+                    metadata={"backend": backend, "model": model, "status_code": r.status_code},
+                    metrics={"latency_ms": _elapsed_ms(start_ns)},
+                    tags=span_tags,
+                )
+                validated = validate_and_process_response(response, cache_key, server_db, personality_name, bot_id)
+                if validated:
+                    return validated
+            else:
+                log.warning(
+                    "saas_fallback_http_error",
+                    extra={"backend": backend, "model": model, "status_code": r.status_code, "bot_id": bot_id},
+                )
+                _llmobs_annotate(
+                    span=span,
+                    input_data=prompt_text,
+                    metadata={"backend": backend, "model": model, "error": f"http_{r.status_code}"},
+                    metrics={"latency_ms": _elapsed_ms(start_ns)},
+                    tags=span_tags,
+                )
+        except requests.exceptions.Timeout as e:
+            log.error(
+                "saas_fallback_timeout",
+                extra={"backend": backend, "model": model, "bot_id": bot_id, "error": str(e)},
+            )
+            _llmobs_annotate(
+                span=span,
+                input_data=prompt_text,
+                metadata={"backend": backend, "model": model, "error": "Timeout"},
+                metrics={"latency_ms": _elapsed_ms(start_ns)},
+                tags=span_tags,
+            )
+        except requests.exceptions.ConnectionError as e:
+            log.error(
+                "saas_fallback_connection_failed",
+                extra={"backend": backend, "model": model, "bot_id": bot_id, "error": str(e)},
+            )
+            _llmobs_annotate(
+                span=span,
+                input_data=prompt_text,
+                metadata={"backend": backend, "model": model, "error": "ConnectionError"},
+                metrics={"latency_ms": _elapsed_ms(start_ns)},
+                tags=span_tags,
+            )
+        except requests.exceptions.RequestException as e:
+            log.error(
+                "saas_fallback_request_failed",
+                extra={
+                    "backend": backend,
+                    "model": model,
+                    "bot_id": bot_id,
+                    "error": str(e),
+                    "error_type": type(e).__name__,
+                },
+            )
+            _llmobs_annotate(
+                span=span,
+                input_data=prompt_text,
+                metadata={"backend": backend, "model": model, "error": type(e).__name__},
+                metrics={"latency_ms": _elapsed_ms(start_ns)},
+                tags=span_tags,
+            )
+        except Exception as e:
+            log.error(
+                "saas_fallback_unexpected_error",
+                extra={
+                    "backend": backend,
+                    "model": model,
+                    "bot_id": bot_id,
+                    "error": str(e),
+                    "error_type": type(e).__name__,
+                },
+            )
+            _llmobs_annotate(
+                span=span,
+                input_data=prompt_text,
+                metadata={"backend": backend, "model": model, "error": type(e).__name__},
+                metrics={"latency_ms": _elapsed_ms(start_ns)},
+                tags=span_tags,
+            )
+    return None
+
+
+def query_poolside_api(
+    prompt_text: str, cache_key: str, server_db=None, personality_name: str = None, bot_id: str = None
+) -> str | None:
+    """First fallback tier, tried only after query_ollama_api fails. Single-
+    shot, short-timeout - see the module-level comment above _FALLBACK_TIMEOUT
+    for the full worst-case-time math.
+
+    Returns:
+        Validated response string, or None if not configured / call failed.
+    """
+    return _query_saas_fallback(
+        backend="poolside",
+        url=_POOLSIDE_URL,
+        model=_POOLSIDE_MODEL,
+        api_key=config.POOLSIDE_API_KEY,
+        # Poolside's laguna-m.1 defaults to thinking ON - disables it so the
+        # reply lands well inside _FALLBACK_TIMEOUT instead of spending the
+        # whole budget on hidden reasoning tokens (same fix grug's Elder
+        # applies on its own Poolside config, measured 72s->under 1s live).
+        extra_body={"chat_template_kwargs": {"enable_thinking": False}},
+        prompt_text=prompt_text,
+        cache_key=cache_key,
+        server_db=server_db,
+        personality_name=personality_name,
+        bot_id=bot_id,
+    )
+
+
+def query_openrouter_api(
+    prompt_text: str, cache_key: str, server_db=None, personality_name: str = None, bot_id: str = None
+) -> str | None:
+    """Second fallback tier, tried only after query_ollama_api AND
+    query_poolside_api both fail. Single-shot, short-timeout - see the
+    module-level comment above _FALLBACK_TIMEOUT for the full worst-case-
+    time math.
+
+    Deliberately uses the fast default Haiku 4.5 model, NOT the Opus-plus-
+    high-reasoning override grug's Elder review persona configures via
+    GRUG_OPENROUTER_REVIEW_MODEL - that combination is tuned for a multi-
+    minute deep-review pass and is unsuited to a realtime chat reply.
+
+    Returns:
+        Validated response string, or None if not configured / call failed.
+    """
+    return _query_saas_fallback(
+        backend="openrouter",
+        url=_OPENROUTER_URL,
+        model=_OPENROUTER_MODEL,
+        api_key=config.OPENROUTER_API_KEY,
+        extra_body={},
+        prompt_text=prompt_text,
+        cache_key=cache_key,
+        server_db=server_db,
+        personality_name=personality_name,
+        bot_id=bot_id,
+    )
 
 
 def query_gemini_api(

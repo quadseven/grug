@@ -8,7 +8,15 @@ from unittest.mock import AsyncMock, MagicMock
 
 import pytest
 
-# Import LLM API mock fixtures from main conftest
+# Import LLM API mock fixtures (mock_gemini_api, mock_ollama_api,
+# mock_ollama_errors, mock_gemini_module, mock_gemini_errors, etc.) from the
+# main package conftest. This was previously just a comment with no actual
+# import - every test in tests/test_llm_api_mocks.py using those fixtures
+# failed at collection with "fixture 'mock_gemini_api' not found" (pytest
+# only auto-discovers conftest.py files in a test's own directory and its
+# ancestors; src/grugthink/conftest.py is not an ancestor of tests/, so it
+# was silently never loaded). `pytest_plugins` explicitly registers it.
+pytest_plugins = ["src.grugthink.conftest"]
 
 # ============================================================================
 # Discord.py Mocks for Testing Bot Commands

@@ -67,8 +67,13 @@ spec:
           ports:
             - {name: http, containerPort: 8080}
           env:
-            # LLM: owned spark-gateway only (v2). No Gemini/SaaS key set, so the
-            # engine stays fully on the gateway for chat AND embeddings.
+            # LLM: owned spark-gateway is the ALWAYS-tried-first primary for
+            # chat AND embeddings (no Gemini key set here, so that bonus
+            # fallback tier stays disabled). POOLSIDE_API_KEY/
+            # OPENROUTER_API_KEY below (envFrom grugthink-llm-fallback) are a
+            # bounded, single-shot LAST-RESORT chat fallback, engaged only
+            # when the gateway produces nothing usable - see bot/prompts.py's
+            # query_model and llm_clients.py's _FALLBACK_TIMEOUT comment.
             - {name: SPARK_GATEWAY_URL, value: http://spark-gateway.spark-gateway.svc:8080}
             - {name: OLLAMA_URLS, value: http://spark-gateway.spark-gateway.svc:8080}
             # Chat model on the Cave gateway (was defaulting to llama3.2:3b -> 503).
@@ -103,6 +108,18 @@ spec:
             # (grugthink role, infra cnpg-cluster tenant). Its presence flips
             # make_server_manager() to the pgvector backend.
             - secretRef: {name: grugthink-db}
+            # POOLSIDE_API_KEY / OPENROUTER_API_KEY - bounded chat fallback
+            # (see the env comment above). Resolved from SSM
+            # /infra/llm/{poolside,openrouter}_api_key at DEPLOY time by the
+            # grugthink.deploy.yml workflow's own OIDC session and injected
+            # here as plain literals - this pod has no runtime AWS
+            # credential path of its own (automountServiceAccountToken is
+            # false below), unlike grug's webhook/consumer pods which read
+            # GRUG_*_API_KEY_SSM env-var-held parameter NAMES via their own
+            # Roles Anywhere identity. Refreshed on every deploy (unlike
+            # SESSION_SECRET's create-once), so an SSM key rotation reaches
+            # the pod on the next redeploy.
+            - secretRef: {name: grugthink-llm-fallback}
           readinessProbe:
             httpGet: {path: /api/health, port: http}
             initialDelaySeconds: 15

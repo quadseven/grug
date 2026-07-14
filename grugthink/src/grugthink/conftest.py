@@ -599,7 +599,11 @@ class MockGeminiModel:
         self.call_count = 0
 
     def generate_content(
-        self, prompt: str, stream: bool = False, generation_config: dict | None = None
+        self,
+        prompt: str,
+        stream: bool = False,
+        generation_config: dict | None = None,
+        request_options: dict | None = None,
     ) -> MockGeminiResponse:
         """Generate content from prompt.
 
@@ -607,6 +611,12 @@ class MockGeminiModel:
             prompt: The input prompt text
             stream: Whether to stream the response
             generation_config: Optional generation configuration
+            request_options: Optional request options (e.g. {"timeout": 30});
+                accepted so this mock's signature matches the real
+                google.generativeai call in bot/llm_clients.py's
+                query_gemini_api - pre-existing gap where the real code
+                passed request_options but this mock didn't accept it,
+                which made every mocked Gemini call TypeError.
 
         Returns:
             MockGeminiResponse object with generated text
@@ -901,8 +911,23 @@ def mock_ollama_api(monkeypatch):
     mock_session.post = _mock_post
     mock_session.call_history = call_history
 
-    # Patch both requests.Session.post and the session instance used by llm_clients
-    monkeypatch.setattr("requests.Session.post", _mock_post)
+    # Patch only the session instance used by llm_clients - NOT
+    # requests.Session.post at the class level. _mock_post has no `self`
+    # parameter, so a class-level assignment (`Session.post = _mock_post`)
+    # makes Python's normal descriptor protocol auto-bind it on ANY
+    # instance access (`some_session.post(url, ...)` becomes
+    # `_mock_post(some_session, url, ...)`), which immediately collides
+    # with the explicit `url`/`json` keyword args ("got multiple values for
+    # argument 'json'"). Worse, because llm_clients.session is a
+    # module-level singleton shared across the whole test session,
+    # monkeypatch's teardown (`setattr`, never `delattr`) leaves a
+    # permanent bound-method poisoned into session.__dict__["post"] that
+    # silently shadows every LATER test's class-only patch (e.g.
+    # mock_ollama_errors) for the rest of the run. No test here actually
+    # needs the class-level patch (every caller either goes through this
+    # returned `mock_session.post` directly or through
+    # llm_clients.session.post), so dropping it removes the poisoning at
+    # the source instead of trying to out-order it.
     monkeypatch.setattr("src.grugthink.bot.llm_clients.session.post", _mock_post)
 
     return mock_session
@@ -937,7 +962,18 @@ def mock_ollama_errors(monkeypatch):
             else:
                 raise requests.exceptions.RequestException(f"Mock error: {error_type}")
 
+        # Class-level patch covers ad-hoc `requests.Session().post(...)`
+        # calls (TestOllamaAPIErrors below). It does NOT reach
+        # llm_clients.session specifically: that module-level singleton
+        # accumulates its own instance-dict "post" entry the first time ANY
+        # test patches it via the dotted-path form (see mock_ollama_api's
+        # comment above) - once that happens, instance-dict lookup always
+        # wins over the class, so a class-only patch silently never fires
+        # for THAT session and a real network call is attempted instead.
+        # Patch the instance directly too so query_ollama_api's real error
+        # handling (TestQueryOllamaApiLlmObs) is actually exercised.
         monkeypatch.setattr("requests.Session.post", _error_post)
+        monkeypatch.setattr("src.grugthink.bot.llm_clients.session.post", _error_post)
 
     return _create_error_mock
 

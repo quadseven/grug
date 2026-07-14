@@ -152,6 +152,21 @@ def __getattr__(name):
         # Dynamically compute based on current GEMINI_API_KEY value
         return bool(__getattr__("GEMINI_API_KEY"))
 
+    elif name == "POOLSIDE_API_KEY":
+        # Bounded chat fallback (grugthink issue: Ollama/Cave-only, no
+        # resilience). Plain env var, NOT the GRUG_POOLSIDE_API_KEY_SSM
+        # name-indirection scheme grug's own webhook/consumer pods use -
+        # this pod has no runtime AWS credential path (no Roles Anywhere
+        # mount, automountServiceAccountToken: false), so the value is
+        # resolved from SSM at DEPLOY time (grugthink.deploy.yml) and
+        # injected here as an already-decrypted literal, same convention
+        # as GEMINI_API_KEY/DISCORD_TOKEN/SESSION_SECRET.
+        return os.getenv("POOLSIDE_API_KEY")
+
+    elif name == "OPENROUTER_API_KEY":
+        # See POOLSIDE_API_KEY above - same deploy-time-resolved convention.
+        return os.getenv("OPENROUTER_API_KEY")
+
     elif name == "CAN_SEARCH":
         return bool(GOOGLE_API_KEY and GOOGLE_CSE_ID)
 
