@@ -1541,7 +1541,9 @@ def review_diff(
                 try:
                     resp = _call_backend(config, messages)
                 except _BackendConfigError as e:
-                    log.error(
+                    # log.exception (not log.error) retains the traceback -
+                    # CodeRabbit #629, ruff TRY400.
+                    log.exception(
                         "llm_backend_misconfigured",
                         extra={"backend": backend.value, "detail": str(e)},
                     )
