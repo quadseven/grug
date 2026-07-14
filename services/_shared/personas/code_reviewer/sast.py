@@ -227,22 +227,37 @@ def scan_semgrep(
                 os.makedirs(os.path.dirname(dest) or tmp, exist_ok=True)
                 with open(dest, "w", encoding="utf-8") as f:
                     f.write(content)
+            # Semgrep initializes settings/cache under $HOME (~/.semgrep) at
+            # startup. The pods run as uid 10001 created with --no-create-home
+            # on a readOnlyRootFilesystem, so that mkdir crashed semgrep with
+            # exit 1 before it scanned anything - every production scan
+            # silently degraded to zero findings (found live 2026-07-13, the
+            # infra#1776 sweep). Point HOME (+ XDG cache) at the scan's own
+            # temp dir, the one path we know is writable and gets cleaned up.
+            sem_env = {
+                **os.environ,
+                "HOME": tmp,
+                "XDG_CACHE_HOME": os.path.join(tmp, ".cache"),
+            }
             proc = subprocess.run(
                 ["semgrep", "scan", "--config", _RULES_DIR, "--json", "--quiet",
                  "--disable-version-check", "--no-rewrite-rule-ids", tmp],
                 capture_output=True, text=True, timeout=_SEMGREP_TIMEOUT_S,
+                env=sem_env,
             )
             if proc.returncode != 0:
                 # Version-dependent, semgrep can exit non-zero AND emit
                 # parseable-but-empty JSON - without this check that
-                # degrades to a silent zero-findings scan.
+                # degrades to a silent zero-findings scan. Keep enough stderr
+                # to actually diagnose: the old 200-char cap hid the failing
+                # path of the exact home-dir crash this env fix addresses.
                 log.warning(
                     "sast_semgrep_run_failed",
                     extra={
                         "kind": "NonZeroExit",
                         "returncode": proc.returncode,
                         "rules_dir": _RULES_DIR,
-                        "stderr": (proc.stderr or "")[:200],
+                        "stderr": (proc.stderr or "")[-2000:],
                     },
                 )
                 return ()
