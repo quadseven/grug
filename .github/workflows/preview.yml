@@ -178,10 +178,12 @@ jobs:
           BASE_URL=$(aws ssm get-parameter --name /grug/database-url --with-decryption --query Parameter.Value --output text)
           printf '%s' "$BASE_URL" | SCHEMA="$SCHEMA" uv run --with 'psycopg[binary]' python3 -c '
           import os, sys, psycopg
-          # schema pre-extracted to a variable: a \" escape INSIDE an f-string
-          # expression is a SyntaxError ("unexpected character after line
-          # continuation character") - it broke every teardown run silently
-          # until 2026-07-14. The setup step above uses this same shape.
+          # CAUSE of the 2026-07-14 teardown failures: the old line put
+          # os.environ[\"SCHEMA\"] inside the f-string braces, and a
+          # backslash-escaped quote inside an f-string EXPRESSION is a
+          # SyntaxError. Pre-extracting `schema` is the mechanism that keeps
+          # the expression quote-free (same shape as the setup step above);
+          # the statement order itself carries no behavior.
           url = sys.stdin.read().strip(); schema = os.environ["SCHEMA"]
           with psycopg.connect(url, autocommit=True) as c:
               c.execute(f"DROP SCHEMA IF EXISTS \"{schema}\" CASCADE")
