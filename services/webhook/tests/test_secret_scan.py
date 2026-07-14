@@ -132,6 +132,28 @@ def test_quoted_whole_value_runtime_references_are_not_literals():
     assert scan_secrets(_hunks(diff)) == ()
 
 
+def test_chained_subscript_and_call_runtime_expressions_are_not_literals():
+    """Chains with MORE than one call/subscript segment (`config["a"]["b"]`,
+    `credential_provider()[0]`) must be recognized as runtime references too,
+    not just a single-anchor member/call/subscript access."""
+    diff = _diff(
+        "app.py",
+        'token = config["credentials"]["token"]',
+        "apiKey = credential_provider()[0]",
+        'secret = get_creds()["secret"].strip()',
+    )
+    assert scan_secrets(_hunks(diff)) == ()
+
+
+def test_powershell_env_reference_is_case_insensitive():
+    diff = _diff(
+        "deploy.ps1",
+        'authToken = "$Env:AUTH_TOKEN"',
+        'apiKey = "$ENV:API_KEY"',
+    )
+    assert scan_secrets(_hunks(diff)) == ()
+
+
 def test_filtered_reference_does_not_hide_later_literal_on_same_line():
     line = f'token = credentials.token; api_key = "{_HIGH_ENTROPY}"'
     cands = scan_secrets(_hunks(_diff("app.py", line)))

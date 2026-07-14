@@ -97,23 +97,23 @@ _GENERIC_RE = re.compile(
     r"""(?:(?P<quote>['"])(?P<quoted>[^'"]+)(?P=quote)|(?P<bare>[^'"\s]+))"""
 )
 
-_RUNTIME_MEMBER_RE = re.compile(
-    r"[A-Za-z_][A-Za-z0-9_]*(?:\??\.[A-Za-z_][A-Za-z0-9_]*)+"
-)
-_RUNTIME_CALL_RE = re.compile(
-    r"[A-Za-z_][A-Za-z0-9_]*(?:\??\.[A-Za-z_][A-Za-z0-9_]*)*"
-    r"\([^()\r\n]*\)(?:\??\.[A-Za-z_][A-Za-z0-9_]*(?:\([^()\r\n]*\))?)*"
-)
-_RUNTIME_SUBSCRIPT_RE = re.compile(
-    r"[A-Za-z_][A-Za-z0-9_]*(?:\??\.[A-Za-z_][A-Za-z0-9_]*)*"
-    r"\[[^\]\r\n]+\](?:\??\.[A-Za-z_][A-Za-z0-9_]*)*"
+# One base identifier followed by ONE OR MORE chained segments -- member
+# access, a call, or a subscript, in any order/combination -- covers
+# `credentials?.token`, `fetch_token()`, `config["credentials"]["token"]`,
+# and `credential_provider()[0]` alike. A single alternation-based pattern
+# (rather than three separate one-anchor patterns) means an expression
+# chaining more than one call/subscript segment is still recognized as a
+# runtime reference instead of falling through to entropy scoring.
+_RUNTIME_SEGMENT = r"(?:\??\.[A-Za-z_][A-Za-z0-9_]*|\([^()\r\n]*\)|\[[^\]\r\n]+\])"
+_RUNTIME_EXPR_RE = re.compile(
+    rf"[A-Za-z_][A-Za-z0-9_]*{_RUNTIME_SEGMENT}+"
 )
 _IDENTIFIER_RE = re.compile(r"[A-Za-z_][A-Za-z0-9_]*")
 _QUOTED_RUNTIME_REFERENCE_RE = re.compile(
     r"(?:"
     r"\$\{\{[^{}\r\n]+\}\}"
     r"|\$\{[A-Za-z_][A-Za-z0-9_.:-]*\}"
-    r"|\$env:[A-Za-z_][A-Za-z0-9_]*"
+    r"|\$(?i:env):[A-Za-z_][A-Za-z0-9_]*"
     r"|\$[A-Za-z_][A-Za-z0-9_]*"
     r"|\\\([^()\r\n]+\)"
     r")"
@@ -139,9 +139,7 @@ def _generic_literal_value(match: re.Match[str]) -> str | None:
         if _QUOTED_RUNTIME_REFERENCE_RE.fullmatch(value):
             return None
         if (
-            _RUNTIME_MEMBER_RE.fullmatch(value)
-            or _RUNTIME_CALL_RE.fullmatch(value)
-            or _RUNTIME_SUBSCRIPT_RE.fullmatch(value)
+            _RUNTIME_EXPR_RE.fullmatch(value)
             or (value.startswith("{") and value.endswith("}"))
             or (value.startswith("[") and value.endswith("]"))
         ):
