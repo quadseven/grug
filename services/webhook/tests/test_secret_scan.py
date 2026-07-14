@@ -120,6 +120,17 @@ def test_filtered_reference_does_not_hide_later_literal_on_same_line():
     assert "api_key" in cands[0].snippet
 
 
+def test_reports_each_generic_literal_on_same_line():
+    other = "Zx8Cv6Bn4Mm2Qq9Ww7Ee"
+    line = f'api_key = "{_HIGH_ENTROPY}"; client_secret = "{other}"'
+    cands = scan_secrets(_hunks(_diff("app.py", line)))
+    assert len(cands) == 2
+    assert {"api_key", "client_secret"} == {
+        "api_key" if "api_key" in candidate.snippet else "client_secret"
+        for candidate in cands
+    }
+
+
 # --- diff-scoping + dedup + cap --------------------------------------------
 
 

@@ -178,22 +178,27 @@ def _mask(value: str) -> str:
     return f"{value[:4]}...{value[-4:]}"
 
 
-def _detect(text: str) -> tuple[str, str, str] | None:
-    """Return `(kind, raw, masked)` if an added line looks like it carries a
-    secret, else None. `raw` is the exact matched credential, used ONLY for
-    in-memory dedup (never published/logged); `masked` is the safe snippet form.
-    Provider patterns win over the generic rule."""
+def _detect(text: str) -> tuple[tuple[str, str, str], ...]:
+    """Return every ``(kind, raw, masked)`` secret detected on an added line.
+
+    ``raw`` is used only for in-memory dedup and is never published or logged.
+    Provider patterns win over the generic rule for the same raw value, without
+    hiding a second credential that happens to share the line.
+    """
+    hits: list[tuple[str, str, str]] = []
+    provider_values: set[str] = set()
     for pat in _PROVIDER_PATTERNS:
-        m = pat.regex.search(text)
-        if m:
-            return pat.kind, m.group(0), _mask(m.group(0))
+        for m in pat.regex.finditer(text):
+            value = m.group(0)
+            provider_values.add(value)
+            hits.append((pat.kind, value, _mask(value)))
     for m in _GENERIC_RE.finditer(text):
         value = _generic_literal_value(m)
-        if value is None:
+        if value is None or value in provider_values:
             continue
         if len(value) >= _MIN_GENERIC_LEN and _shannon_entropy(value) >= _MIN_ENTROPY:
-            return f"secret-like assignment to `{m.group('key')}`", value, _mask(value)
-    return None
+            hits.append((f"secret-like assignment to `{m.group('key')}`", value, _mask(value)))
+    return tuple(hits)
 
 
 def scan_secrets(hunks: tuple[DiffHunk, ...]) -> tuple[Candidate, ...]:
@@ -217,17 +222,14 @@ def scan_secrets(hunks: tuple[DiffHunk, ...]) -> tuple[Candidate, ...]:
             scanned += len(text)
             if scanned > _MAX_SCAN_BYTES:
                 return _to_candidates(secrets)
-            hit = _detect(text)
-            if hit is None:
-                continue
-            kind, raw, masked = hit
-            key = (hunk.file_path, kind, raw)
-            if key in seen:
-                continue
-            seen.add(key)
-            secrets.append(_Secret(file=hunk.file_path, line=lineno, kind=kind, masked=masked))
-            if len(secrets) >= _MAX_SECRETS:
-                return _to_candidates(secrets)
+            for kind, raw, masked in _detect(text):
+                key = (hunk.file_path, kind, raw)
+                if key in seen:
+                    continue
+                seen.add(key)
+                secrets.append(_Secret(file=hunk.file_path, line=lineno, kind=kind, masked=masked))
+                if len(secrets) >= _MAX_SECRETS:
+                    return _to_candidates(secrets)
     return _to_candidates(secrets)
 
 
