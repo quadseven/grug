@@ -384,9 +384,14 @@ def test_review_llm_timeout_default_covers_measured_slow_pass() -> None:
     live on 2026-07-13 (the old 150s value made every big-diff review degrade
     to all_failed), while two sequential arms still fit inside the 720s
     durable-job deadline from #623."""
+    import consumer
+
     assert lc._review_llm_timeout_s() == 330.0
     assert lc._DEFAULT_REVIEW_TIMEOUT_SECONDS > 318
-    assert 2 * lc._MAX_REVIEW_TIMEOUT_SECONDS < 720
+    # Compare against the REAL durable-job budget, not a hard-coded 720, so
+    # the hierarchy assertion tracks consumer.py if the deadline ever moves
+    # (CodeRabbit on #625).
+    assert 2 * lc._MAX_REVIEW_TIMEOUT_SECONDS < consumer._review_job_timeout_s()
 
 
 def test_review_llm_timeout_env_override(monkeypatch) -> None:
