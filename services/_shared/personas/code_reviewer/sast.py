@@ -250,6 +250,9 @@ def scan_semgrep(
                  "--disable-version-check", "--no-rewrite-rule-ids", tmp],
                 capture_output=True, text=True, timeout=_SEMGREP_TIMEOUT_S,
                 env=sem_env,
+                # We inspect returncode ourselves below (a non-zero exit with
+                # parseable JSON is a real degrade path, #77), so never raise.
+                check=False,
             )
             if proc.returncode != 0:
                 # Version-dependent, semgrep can exit non-zero AND emit

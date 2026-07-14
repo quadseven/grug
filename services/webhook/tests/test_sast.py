@@ -211,9 +211,14 @@ def test_scan_semgrep_points_home_at_writable_scan_dir(monkeypatch):
         return _semgrep_json([])
     monkeypatch.setattr(sast.subprocess, "run", _capture)
     scan_semgrep((_hunk("a.py", {1}),), {"a.py": "x = 1\n"})
+    import os as _os
     assert seen["env"] is not None, "semgrep must run with an explicit env"
     assert seen["env"]["HOME"] == seen["tmp"]
-    assert seen["env"]["XDG_CACHE_HOME"].startswith(seen["tmp"])
+    # XDG_CACHE_HOME must be a real subdirectory of the scan tmp dir, not just
+    # a string sharing its prefix (a sibling like "<tmp>.cache" would pass a
+    # bare startswith but still land outside the writable, self-cleaning dir).
+    assert seen["env"]["XDG_CACHE_HOME"] == _os.path.join(seen["tmp"], ".cache")
+    assert seen["env"]["XDG_CACHE_HOME"].startswith(seen["tmp"] + _os.sep)
 
 
 def test_scan_semgrep_skips_files_over_byte_budget(monkeypatch):
