@@ -3,10 +3,13 @@ name: Deploy · grugthink (Discord bot manager)
 # grugthink is a SEPARATE service from grug's webhook/api (its own dir, image,
 # namespace, dashboard on :8080). It does NOT share grug's ADR-0016 services/
 # promotion flow, so it gets its own simple build->push->apply here. Same
-# credentials as deploy.k8s.yml (registry, tailnet, kubeconfig, SSM via OIDC).
-# Secrets come from SSM /githumps/grugthink/*; NO personal host is committed -
-# the tailnet ingress (grug.ts.ehumps.me) lives in the private infra repo's
-# Caddy configmap, reverse-proxying grugthink.grugthink.svc:8080.
+# credentials as deploy.k8s.yml (registry, tailnet, kubeconfig) - SSM via OIDC
+# is now ALSO shared (see the AWS credentials step below), added for the
+# bounded chat fallback (Poolside/OpenRouter). Bot-specific secrets still come
+# from SSM /githumps/grugthink/* (seeded manually per k8s/DEPLOY.md, not by
+# this workflow); NO personal host is committed - the tailnet ingress
+# (grug.ts.ehumps.me) lives in the private infra repo's Caddy configmap,
+# reverse-proxying grugthink.grugthink.svc:8080.
 
 on:
   push:
@@ -27,6 +30,9 @@ jobs:
   deploy:
     runs-on: ubuntu-24.04-arm  # cluster is arm64 - build native
     environment: k8s-prod
+    permissions:
+      contents: read
+      id-token: write  # AWS OIDC (grug-gha-deploy) - SSM read for the LLM fallback keys below
     steps:
       - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
 
@@ -35,6 +41,18 @@ jobs:
         with:
           authkey: ${{ secrets.TS_AUTHKEY }}
           tags: tag:ci
+
+      - name: Configure AWS credentials (LLM fallback key seed)
+        # Same grug-gha-deploy OIDC role deploy.k8s.yml uses (infra/pulumi's
+        # oidc_role.create trust policy already allows the `k8s-prod`
+        # environment for githumps/grug - this job runs in that environment
+        # too, so no infra/Pulumi change was needed to add this step; the
+        # role's policy already grants ssm:GetParameter* on /infra/llm/*,
+        # the same path grug's webhook/consumer read from for years).
+        uses: aws-actions/configure-aws-credentials@cabfdba3510de1431bac9dba27511d97497fc100 # v5
+        with:
+          role-to-assume: arn:aws:iam::${{ secrets.AWS_ACCOUNT_ID }}:role/grug-gha-deploy
+          aws-region: us-east-1
 
       - name: Registry login
         env:
@@ -86,6 +104,69 @@ jobs:
             --docker-server="$REGISTRY_HOST" \
             --docker-username="$REGISTRY_USERNAME" \
             --docker-password="$REGISTRY_PASSWORD" \
+            --dry-run=client -o yaml | kubectl apply -f -
+
+      - name: Seed chat fallback keys (Poolside/OpenRouter) from SSM
+        # grugthink's pod has NO runtime AWS credential path (no Roles
+        # Anywhere mount, automountServiceAccountToken: false on the
+        # Deployment - unlike grug's own webhook/consumer pods) - so unlike
+        # GRUG_OPENROUTER_API_KEY_SSM/GRUG_POOLSIDE_API_KEY_SSM (an env var
+        # holding the SSM *name*, resolved by the pod itself at runtime),
+        # these values are resolved HERE, at deploy time, by the GHA
+        # runner's own OIDC session, and injected as already-decrypted
+        # literals - same convention as grugthink's other secrets
+        # (SESSION_SECRET above, grugthink-db/GRUGTHINK_DATABASE_URL per
+        # k8s/DEPLOY.md). A SEPARATE secret (not merged into
+        # grugthink-secrets) so it can be refreshed on every deploy
+        # (`kubectl apply`, not create-once-keep-forever like
+        # SESSION_SECRET) - a rotated SSM key should reach the pod on the
+        # next redeploy without a manual `kubectl delete secret`.
+        #
+        # Tolerant of a genuinely MISSING parameter (never provisioned) -
+        # an empty key is exactly what config_legacy.py's POOLSIDE_API_KEY/
+        # OPENROUTER_API_KEY already treat as "tier not configured, skip
+        # cleanly" (see llm_clients.py's _query_saas_fallback) - but a
+        # throttle/auth/network failure fetching a param that DOES exist is
+        # a different signal (CodeRabbit #630: collapsing both into the
+        # same empty-key silence makes a real SSM outage indistinguishable
+        # from "feature just not configured yet"). get_ssm distinguishes
+        # AWS's ParameterNotFound (silently empty, same as before) from any
+        # other error (loud ::error:: annotation naming the real failure) -
+        # still never aborts the deploy itself, since the primary
+        # Ollama-only chat path doesn't need these keys at all.
+        run: |
+          set -euo pipefail
+          get_ssm() {
+            local name="$1" out err_file
+            err_file="$(mktemp)"
+            if out=$(aws ssm get-parameter --name "$name" --with-decryption \
+                       --query Parameter.Value --output text 2>"$err_file"); then
+              rm -f "$err_file"
+              printf '%s' "$out"
+              return 0
+            fi
+            if grep -q "ParameterNotFound" "$err_file"; then
+              rm -f "$err_file"
+              printf ''
+              return 0
+            fi
+            echo "::error::SSM fetch for $name failed with a non-ParameterNotFound error (throttle/auth/network?) - degrading to tier-skipped, but this is NOT the same as 'not configured':"
+            cat "$err_file" >&2
+            rm -f "$err_file"
+            printf ''
+            return 0
+          }
+          POOLSIDE_KEY="$(get_ssm /infra/llm/poolside_api_key)"
+          OPENROUTER_KEY="$(get_ssm /infra/llm/openrouter_api_key)"
+          if [ -z "$POOLSIDE_KEY" ]; then
+            echo "::warning::poolside_api_key not readable from SSM - Poolside chat fallback tier will be skipped at runtime"
+          fi
+          if [ -z "$OPENROUTER_KEY" ]; then
+            echo "::warning::openrouter_api_key not readable from SSM - OpenRouter chat fallback tier will be skipped at runtime"
+          fi
+          kubectl create secret generic grugthink-llm-fallback -n grugthink \
+            --from-literal=POOLSIDE_API_KEY="$POOLSIDE_KEY" \
+            --from-literal=OPENROUTER_API_KEY="$OPENROUTER_KEY" \
             --dry-run=client -o yaml | kubectl apply -f -
 
       - name: Apply manifests

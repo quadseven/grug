@@ -21,7 +21,7 @@ import requests
 
 from .. import config_legacy as config
 from ..bot import cross_bot
-from ..bot.llm_clients import query_gemini_api, query_ollama_api
+from ..bot.llm_clients import query_gemini_api, query_ollama_api, query_openrouter_api, query_poolside_api
 from ..bot.lore import extract_lore_from_response
 from ..bot.utils import LRUCache, clean_statement, get_cache_key
 from ..logging_config import get_logger
@@ -312,12 +312,30 @@ def store_bot_response_for_cross_reference(response: str, personality_name: str)
         pass
 
 
+def _is_usable_result(result: Optional[str]) -> bool:
+    """True when a backend call produced a real, non-error reply.
+
+    Shared by every tier in query_model's fallback chain (Ollama/Cave,
+    Poolside, OpenRouter, Gemini) so "did this tier succeed" is defined
+    exactly once - None (transport failure/timeout) and an "Error:"-prefixed
+    string (Gemini's own not-configured/call-failed sentinel) both count as
+    NOT usable, which is what lets the chain fall through to the next tier.
+    """
+    return bool(result) and not result.startswith("Error:")
+
+
 def query_model(
     statement: str, server_db, server_id: str, personality_engine, current_bot_id: Optional[str] = None
 ) -> Optional[str]:
     """Query the LLM with personality context and server-specific knowledge.
 
-    This is the main entry point for querying the LLM (either Ollama or Gemini).
+    This is the main entry point for querying the LLM. Ollama/Cave (the owned
+    spark-gateway) is ALWAYS tried first; only on genuine failure (transport
+    error, timeout, empty/malformed response - never merely "Ollama was
+    slower than an alternative") does a bounded, single-shot fallback chain
+    engage: Poolside, then OpenRouter, then Gemini as a final bonus tier
+    (gated on GEMINI_API_KEY being configured). See llm_clients.py's
+    `_FALLBACK_TIMEOUT` comment for the worst-case-time math.
     It handles caching, statement cleaning, knowledge retrieval, cross-bot memories,
     prompt building, personality evolution tracking, and LLM API calls.
 
@@ -446,21 +464,68 @@ def query_model(
     personality_name = personality.chosen_name or personality.name
 
     try:
+        # Ollama/Cave (spark-gateway) is ALWAYS tried first - it's the owned,
+        # no-SaaS-spend primary path. Only when it produces nothing usable
+        # (transport error, timeout, empty/malformed response) does the
+        # bounded, single-shot fallback chain below engage: Poolside, then
+        # OpenRouter, then (if configured) Gemini as a final bonus tier. See
+        # llm_clients.py's `_FALLBACK_TIMEOUT` comment for the full
+        # worst-case-time math - this must never engage when Ollama already
+        # answered, and never retry-loops or races the primary.
+        result = query_ollama_api(prompt_text, cache_key, server_db, personality_name, current_bot_id)
+        if _is_usable_result(result):
+            return result
+        if result:
+            # Defensive: no current backend returns an "Error:"-prefixed
+            # string from query_ollama_api, but the check is cheap and
+            # keeps this branch honest if that ever changes.
+            log.error("Ollama/Cave returned an error result", extra={"bot_id": current_bot_id, "error_message": result})
+
+        log.warning(
+            "Ollama/Cave primary produced no usable reply - engaging bounded fallback chain",
+            extra={"bot_id": current_bot_id, "cache_key": cache_key},
+        )
+
+        result = query_poolside_api(prompt_text, cache_key, server_db, personality_name, current_bot_id)
+        if _is_usable_result(result):
+            log.info("Fallback engaged: Poolside answered after Ollama/Cave failure", extra={"bot_id": current_bot_id})
+            return result
+
+        result = query_openrouter_api(prompt_text, cache_key, server_db, personality_name, current_bot_id)
+        if _is_usable_result(result):
+            log.info(
+                "Fallback engaged: OpenRouter answered after Ollama/Cave + Poolside failure",
+                extra={"bot_id": current_bot_id},
+            )
+            return result
+
+        # Final bonus tier: query_gemini_api already handles its own
+        # "not configured" case, but config.USE_GEMINI (== bool(GEMINI_API_KEY))
+        # gates the call entirely so an unconfigured deployment doesn't pay
+        # for a doomed request on every single chat failure.
         if config.USE_GEMINI:
             result = query_gemini_api(prompt_text, cache_key, server_db, personality_name, current_bot_id)
-        else:
-            result = query_ollama_api(prompt_text, cache_key, server_db, personality_name, current_bot_id)
+            if _is_usable_result(result):
+                log.info(
+                    "Fallback engaged: Gemini answered after Ollama/Cave + Poolside + OpenRouter failure",
+                    extra={"bot_id": current_bot_id},
+                )
+                return result
+            if result:
+                log.error(
+                    "Gemini fallback returned an error result",
+                    extra={"bot_id": current_bot_id, "error_message": result},
+                )
 
-        if result and result.startswith("Error:"):
-            # API returned an error message, log it and return None to trigger fallback
-            log.error("API returned error", extra={"bot_id": current_bot_id, "error_message": result})
-            return None
-
-        return result
-    except Exception as e:
         log.error(
-            "Query model failed", extra={"bot_id": current_bot_id, "error": str(e), "use_gemini": config.USE_GEMINI}
+            "All backends failed (Ollama/Cave + Poolside + OpenRouter"
+            + (" + Gemini" if config.USE_GEMINI else "")
+            + ")",
+            extra={"bot_id": current_bot_id, "cache_key": cache_key},
         )
+        return None
+    except Exception as e:
+        log.error("Query model failed", extra={"bot_id": current_bot_id, "error": str(e)})
         return None
 
 

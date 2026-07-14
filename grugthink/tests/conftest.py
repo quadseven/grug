@@ -8,7 +8,12 @@ from unittest.mock import AsyncMock, MagicMock
 
 import pytest
 
-# Import LLM API mock fixtures from main conftest
+# The LLM API mock fixtures (mock_gemini_api, mock_ollama_api,
+# mock_ollama_errors, mock_gemini_module, mock_gemini_errors, etc.) are
+# registered via pytest_plugins in the top-level grugthink/conftest.py
+# (CodeRabbit #630: pytest_plugins must live in the ROOT conftest, not a
+# nested one like this file - current pytest rejects it here at collection
+# time). See that file for the actual registration.
 
 # ============================================================================
 # Discord.py Mocks for Testing Bot Commands
