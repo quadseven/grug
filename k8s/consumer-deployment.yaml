@@ -24,6 +24,8 @@ spec:
     matchLabels: {app: grug-consumer}
   template:
     metadata:
+      annotations:
+        ad.datadoghq.com/consumer.logs: '[{"source":"python","service":"grug-consumer"}]'
       labels:
         app: grug-consumer
         tags.datadoghq.com/service: grug-consumer

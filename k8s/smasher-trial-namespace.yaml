@@ -221,6 +221,8 @@ spec:
       ttlSecondsAfterFinished: 300
       template:
         metadata:
+          annotations:
+            ad.datadoghq.com/janitor.logs: '[{"source":"python","service":"grug-trial-janitor"}]'
           labels: {app: grug-trial-janitor, grug-trial-role: janitor}
         spec:
           serviceAccountName: grug-trial-janitor

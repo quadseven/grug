@@ -56,6 +56,9 @@ spec:
       backoffLimit: 1
       activeDeadlineSeconds: 300
       template:
+        metadata:
+          annotations:
+            ad.datadoghq.com/janitor.logs: '[{"source":"python","service":"grug-preview-janitor"}]'
         spec:
           serviceAccountName: grug-preview-janitor
           restartPolicy: Never
