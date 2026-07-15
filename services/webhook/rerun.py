@@ -71,12 +71,25 @@ _MAX_SETTLE_SECONDS = 300
 # the same cadence as the SQS visibility heartbeat while a review is active.
 _REVIEW_CLAIM_LEASE_SECONDS = 900
 _REVIEW_CLAIM_HEARTBEAT_SECONDS = 120.0
+# How often the mid-flight staleness watcher re-fetches the PR while Elder is
+# actually generating (#635 follow-up). Separate from the 120s claim-lease
+# heartbeat above, which exists to stop SQS redelivery, not to catch a
+# superseding commit quickly - a superseded review should die within roughly
+# this many seconds of the new commit landing, not run to its full budget.
+_STALENESS_WATCH_INTERVAL_S = 10.0
 
 
 @dataclass(frozen=True, slots=True)
 class _ReviewClaimHeartbeat:
     stop: threading.Event
     ownership_lost: threading.Event
+    thread: threading.Thread
+
+
+@dataclass(frozen=True, slots=True)
+class _StalenessWatch:
+    stop: threading.Event
+    cancel: threading.Event
     thread: threading.Thread
 
 
@@ -459,6 +472,46 @@ def _review_claim_heartbeat_loop(
         return
 
 
+def _review_staleness_watch_loop(
+    install_id: int, owner: str, repo_name: str, pr_number: int,
+    expected_snapshot_id: str,
+    stop: threading.Event,
+    cancel: threading.Event,
+) -> None:
+    """Poll the PR every `_STALENESS_WATCH_INTERVAL_S` while Elder is
+    actually generating a review (#635 follow-up: mid-flight cancellation).
+
+    Elder's per-arm network calls have no natural checkpoint mid-generation
+    - once `_call_backend` starts, nothing inside it re-checks the PR. This
+    loop is what lets a superseded review die within roughly
+    `_STALENESS_WATCH_INTERVAL_S` of the new commit landing, instead of
+    always running to its full ~330-660s budget for a snapshot that's
+    already known stale.
+
+    A transient GitHub hiccup must never cancel a genuinely current review,
+    so a fetch failure is logged and skipped, not treated as staleness."""
+    while not stop.wait(_STALENESS_WATCH_INTERVAL_S):
+        try:
+            latest = _fetch_current_pr(install_id, owner, repo_name, pr_number)
+        except Exception as error:  # noqa: BLE001 - transient fetch failure, keep watching
+            log.warning(
+                "elder_review_staleness_watch_fetch_failed",
+                extra={
+                    "repo": f"{owner}/{repo_name}",
+                    "pr": pr_number,
+                    "kind": type(error).__name__,
+                },
+            )
+            continue
+        if review_snapshot_id_from_pr(latest) != expected_snapshot_id:
+            cancel.set()
+            log.info(
+                "elder_review_cancelled_mid_flight",
+                extra={"repo": f"{owner}/{repo_name}", "pr": pr_number},
+            )
+            return
+
+
 # --- Active-claim registry (graceful-shutdown release) ----------------------
 # A consumer pod that dies mid-review (every deploy rolls it; reviews run
 # minutes, the terminationGracePeriod is 30s) orphans its snapshot claim: the
@@ -557,6 +610,29 @@ def _stop_review_claim_heartbeat(
     heartbeat.stop.set()
     heartbeat.thread.join(timeout=1.0)
     return not heartbeat.ownership_lost.is_set()
+
+
+def _start_staleness_watch(
+    install_id: int, owner: str, repo_name: str, pr_number: int,
+    expected_snapshot_id: str,
+) -> _StalenessWatch:
+    stop = threading.Event()
+    cancel = threading.Event()
+    thread = threading.Thread(
+        target=_review_staleness_watch_loop,
+        args=(install_id, owner, repo_name, pr_number, expected_snapshot_id, stop, cancel),
+        name="review-staleness-watch",
+        daemon=True,
+    )
+    thread.start()
+    return _StalenessWatch(stop=stop, cancel=cancel, thread=thread)
+
+
+def _stop_staleness_watch(watch: _StalenessWatch | None) -> None:
+    if watch is None:
+        return
+    watch.stop.set()
+    watch.thread.join(timeout=2.0)
 
 
 def _run_hot_review(
@@ -720,16 +796,34 @@ def _run_hot_review(
             return "stale_snapshot"
 
         cfg = get_repo_config(install_id, repo_id)
-        result = dispatch_code_review(
-            _review_payload(
-                install_id=install_id,
-                owner=owner,
-                repo_name=repo_name,
-                pr_number=pr_number,
-                pr=after,
-            ),
-            blocking=bool(cfg.get("code_reviewer_blocking", False)),
+        # Mid-flight cancellation (#635 follow-up): current_snapshot_id is the
+        # snapshot this job is ABOUT to spend the Elder budget on (checked
+        # fresh, immediately above). The watch loop re-fetches the PR every
+        # _STALENESS_WATCH_INTERVAL_S for as long as dispatch_code_review is
+        # running and sets `cancel` the moment that snapshot changes.
+        # dispatch_code_review then returns almost immediately instead of
+        # waiting out the arm calls' full remaining duration - the arm
+        # calls themselves keep running in the background and get their
+        # results discarded (see _call_backend's docstring for why this is
+        # "stop waiting on it", not "truly kill it"), but THIS job no
+        # longer holds its queue slot / SQS message hostage to them.
+        watch = _start_staleness_watch(
+            install_id, owner, repo_name, pr_number, current_snapshot_id,
         )
+        try:
+            result = dispatch_code_review(
+                _review_payload(
+                    install_id=install_id,
+                    owner=owner,
+                    repo_name=repo_name,
+                    pr_number=pr_number,
+                    pr=after,
+                ),
+                blocking=bool(cfg.get("code_reviewer_blocking", False)),
+                cancel_event=watch.cancel,
+            )
+        finally:
+            _stop_staleness_watch(watch)
         degraded_reason = result.get("degraded_reason", "")
         if degraded_reason == "stale_snapshot":
             latest = _fetch_current_pr(

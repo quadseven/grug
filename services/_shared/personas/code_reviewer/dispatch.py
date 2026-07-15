@@ -24,6 +24,7 @@ from __future__ import annotations
 import logging
 import os
 import re
+import threading
 from typing import Any, Literal
 from urllib.parse import quote
 
@@ -815,6 +816,7 @@ def _capture_comment_records(
 
 def dispatch_code_review(
     payload: dict[str, Any], *, blocking: bool,
+    cancel_event: threading.Event | None = None,
 ) -> dict[str, str]:
     """Entry point — orchestrate one Elder review pass.
 
@@ -827,6 +829,12 @@ def dispatch_code_review(
     exception — LLM outages, parse errors, and publish failures all
     degrade to advisory neutral so this persona cannot 500 the
     webhook handler.
+
+    `cancel_event` (#635 follow-up): passed straight through to
+    `review_diff`, which aborts an in-flight Cave arm call the moment it
+    fires. The caller (rerun.py's `_run_hot_review`) owns setting it, via a
+    background watcher that re-fetches the PR every few seconds for as long
+    as this call is running.
     """
     mode: ReviewMode = "blocking" if blocking else "advisory"
     action = payload.get("action", "")
@@ -1035,6 +1043,7 @@ def dispatch_code_review(
         runtime_context=runtime_context,
         pr_context=pr_context,
         voice=voice,
+        cancel_event=cancel_event,
     )
     needs_cave_fallback = llm_response.kind == "all_failed"
     if llm_response.kind != "reviewed":

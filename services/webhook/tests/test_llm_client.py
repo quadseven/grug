@@ -252,6 +252,86 @@ def test_deep_review_runs_both_arms_concurrently_not_sequentially(monkeypatch) -
     assert elapsed < 0.35, f"expected concurrent arms (~0.2s), took {elapsed:.3f}s"
 
 
+def test_call_backend_cancel_event_aborts_in_flight_request() -> None:
+    """Mid-flight cancellation (#635 follow-up): a MOCKED httpx.post would
+    never prove this, since a Python mock body ignores client.close()
+    entirely - the watcher's cancellation has to interrupt a REAL blocked
+    socket read. A local HTTP server holds the connection open for 5s
+    before responding; cancel_event fires after ~0.3s. If _call_backend's
+    watcher genuinely closes the client out from under the request, this
+    returns in well under the 5s the server would otherwise hold it for."""
+    import http.server
+    import socketserver
+    import threading
+    import time
+
+    class _SlowHandler(http.server.BaseHTTPRequestHandler):
+        def do_POST(self) -> None:
+            time.sleep(5.0)
+            self.send_response(200)
+            self.send_header("Content-Type", "application/json")
+            self.end_headers()
+            self.wfile.write(b'{"choices":[{"message":{"content":"{}"}}]}')
+
+        def log_message(self, format: str, *args) -> None:  # noqa: A002 - stdlib signature; quiet test output
+            pass
+
+    # ThreadingTCPServer (not TCPServer) + daemon_threads=True (CodeRabbit,
+    # #637): plain TCPServer.shutdown() blocks until the CURRENT request
+    # finishes, so the abandoned 5s-sleeping handler would make every test
+    # run pay close to the full 5s in teardown even though the assertions
+    # above already passed. A threading server's shutdown() doesn't wait on
+    # in-flight (daemon) request threads.
+    class _ThreadingServer(socketserver.ThreadingMixIn, http.server.HTTPServer):
+        daemon_threads = True
+
+    server = _ThreadingServer(("127.0.0.1", 0), _SlowHandler)
+    port = server.server_address[1]
+    server_thread = threading.Thread(target=server.serve_forever, daemon=True)
+    server_thread.start()
+    try:
+        config = lc.BackendConfig(
+            backend=Backend.CAVE,
+            url=f"http://127.0.0.1:{port}/v1/chat/completions",
+            model="test-model",
+            key_loader=lambda: "test-key",
+            timeout_seconds=10.0,
+            retry_attempts=1,
+        )
+        cancel_event = threading.Event()
+        threading.Thread(
+            target=lambda: (time.sleep(0.3), cancel_event.set()), daemon=True,
+        ).start()
+
+        start = time.monotonic()
+        with pytest.raises((httpx.RequestError, httpx.TimeoutException)):
+            lc._call_backend(config, [{"role": "user", "content": "hi"}], cancel_event=cancel_event)
+        elapsed = time.monotonic() - start
+    finally:
+        server.shutdown()
+        server.server_close()
+
+    assert elapsed < 2.0, f"expected cancellation within ~1s, took {elapsed:.2f}s (server holds for 5s)"
+
+
+def test_call_backend_without_cancel_event_uses_plain_httpx_post() -> None:
+    """Backward compat: callers that pass no cancel_event (the judge, the
+    walkthrough summary, the SaaS fallback) keep hitting the module-level
+    httpx.post - not a Client - so their existing test mocks (patch.object
+    httpx, "post") keep working unmodified."""
+    body = _openai_json_response('{"findings": []}')
+
+    with patch.object(httpx, "post", return_value=httpx.Response(200, json=body)) as mock_post:
+        config = lc.BackendConfig(
+            backend=Backend.CAVE, url="http://cave.test/v1/chat/completions",
+            model="test-model", key_loader=lambda: "test-key",
+        )
+        resp = lc._call_backend(config, [{"role": "user", "content": "hi"}])
+
+    mock_post.assert_called_once()
+    assert resp.status_code == 200
+
+
 def test_deep_review_deduplicates_same_candidate_across_arms(monkeypatch) -> None:
     monkeypatch.setenv("GRUG_REVIEW_DEPTH", "deep")
     content = (
@@ -643,6 +723,27 @@ def test_transport_failure_on_both_backends_returns_all_failed(monkeypatch) -> N
     # The overload fallback tier also fired, in order, after both Cave arms -
     # each backend's fast default model (not the Opus review override).
     assert call_log[2:] == [lc._POOLSIDE_MODEL, lc._OPENROUTER_MODEL]
+
+
+def test_review_diff_skips_saas_fallback_when_cancelled(monkeypatch) -> None:
+    """Mid-flight cancellation (#635 follow-up): when both Cave arms fail
+    because cancel_event was already set, review_diff must return
+    all_failed WITHOUT trying OpenRouter/Poolside - that would burn a real
+    SaaS call chasing a snapshot the pre-publish freshness check is about
+    to discard anyway. cancel_event pre-set makes _call_backend raise
+    before any network call, so the mock should never fire at all."""
+    import threading
+
+    monkeypatch.setenv("GRUG_REVIEW_DEPTH", "deep")
+    cancel_event = threading.Event()
+    cancel_event.set()
+
+    with patch.object(httpx, "post") as mock_post:
+        out = review_diff([_hunk()], installation_id=1, cancel_event=cancel_event)
+
+    mock_post.assert_not_called()
+    assert out.kind == "all_failed"
+    assert out.error == "cancelled: superseded by a newer commit"
 
 
 def test_saas_overload_fallback_rescues_review_when_cave_fully_down(monkeypatch) -> None:
