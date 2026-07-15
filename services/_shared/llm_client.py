@@ -1380,7 +1380,10 @@ def _run_review_arm(
                 metrics={"latency_ms": _elapsed_ms(cfg_start_ns)},
                 tags=pr_tags,
             )
-        log.error("llm_backend_misconfigured", extra={"backend": backend.value, "detail": str(e)})
+        # log.exception (not log.error) retains the traceback - CodeRabbit
+        # #629, ruff TRY400 - same fix already applied to the SaaS-fallback
+        # block below.
+        log.exception("llm_backend_misconfigured", extra={"backend": backend.value, "detail": str(e)})
         return _ArmOutcome(
             backend=backend, kind="config_error",
             error_text=f"{backend.value} misconfigured: {e}",
@@ -1400,7 +1403,9 @@ def _run_review_arm(
         try:
             resp = _call_backend(config, messages)
         except _BackendConfigError as e:
-            log.error(
+            # log.exception (not log.error) retains the traceback -
+            # CodeRabbit #629, ruff TRY400.
+            log.exception(
                 "llm_backend_misconfigured",
                 extra={"backend": backend.value, "detail": str(e)},
             )
@@ -1562,6 +1567,12 @@ def _review_diff_dispatch(
         # order -- every downstream tie-break (first success wins
         # successes[0], first parse failure recorded) is unchanged from the
         # sequential version.
+        # `list(...)` is load-bearing, not decorative: it fully consumes
+        # `pool.map`'s (lazy) iterator BEFORE the `with` block exits, so
+        # every arm has actually completed and its outcome is captured
+        # here -- ThreadPoolExecutor.__exit__ also joins any still-running
+        # workers regardless, so this can't return early with a truncated
+        # result even without the explicit list() (belt-and-suspenders).
         with ThreadPoolExecutor(max_workers=len(review_backends)) as pool:
             arm_outcomes = list(pool.map(
                 lambda b: _run_review_arm(b, messages, variant, pr_tags),
