@@ -958,6 +958,14 @@ def _post_with_retries_cancellable(
         except Exception as e:  # noqa: BLE001 - re-raised on the waiting side
             result_q.put(("error", e))
 
+    # Re-check immediately before spawning (CodeRabbit, #637): _call_backend's
+    # own top-level guard only catches cancellation that was ALREADY set
+    # before key_loader()/body/header construction ran - if it fires during
+    # that window, this is the last chance to skip starting a doomed
+    # background request instead of spawning it just to abandon it moments
+    # later in the loop below.
+    if cancel_event.is_set():
+        raise httpx.RequestError("cancelled before dispatch")
     threading.Thread(target=_do_call, daemon=True).start()
     while True:
         if cancel_event.is_set():
