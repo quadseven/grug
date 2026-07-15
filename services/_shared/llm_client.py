@@ -27,6 +27,8 @@ from __future__ import annotations
 import json
 import logging
 import os
+import queue
+import threading
 import time
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, field, replace
@@ -819,15 +821,62 @@ class _BackendConfigError(Exception):
     back to the other backend without retry-burning the broken one."""
 
 
+def _post_with_retries(
+    url: str, body: dict[str, Any], headers: dict[str, str],
+    timeout_seconds: float, retry_attempts: int, transport_attempts: int,
+) -> httpx.Response:
+    """The actual 429/503-retrying HTTP call, shared by both `_call_backend`
+    paths below. Always goes through the bare `httpx.post()` convenience
+    function (not an explicit `httpx.Client`) - tests mock `httpx.post`
+    directly, and this keeps that working unmodified for every caller."""
+    for attempt in range(retry_attempts):
+        try:
+            resp = httpx.post(url, json=body, headers=headers, timeout=timeout_seconds)
+        except (httpx.RequestError, httpx.TimeoutException):
+            if attempt < transport_attempts - 1:
+                _RETRY_SLEEP(_RETRY_BASE_DELAY * (2 ** attempt))
+                continue
+            raise
+        if resp.status_code in _RETRYABLE_STATUSES and attempt < retry_attempts - 1:
+            _RETRY_SLEEP(_RETRY_BASE_DELAY * (2 ** attempt))
+            continue
+        return resp
+    # Unreachable: every iteration either returns, continues, or raises.
+    raise AssertionError("retry loop exited without producing a response")
+
+
 def _call_backend(
-    config: BackendConfig, messages: list[dict[str, str]]
+    config: BackendConfig, messages: list[dict[str, str]],
+    cancel_event: threading.Event | None = None,
 ) -> httpx.Response:
     """Single backend call with 429/503 retry + backoff. Raises
     `httpx.RequestError`/`httpx.TimeoutException` on transport failure
     or `_BackendConfigError` on misconfig — caller catches and falls
     back. Narrow exception scope deliberately: `httpx.InvalidURL`,
     `httpx.UnsupportedProtocol`, `httpx.CookieConflict` are config
-    bugs that should crash loudly, not retry silently."""
+    bugs that should crash loudly, not retry silently.
+
+    `cancel_event` (#635 follow-up, mid-flight review cancellation): closing
+    an `httpx.Client` from another thread does NOT actually interrupt an
+    in-flight synchronous request - verified against a real local HTTP
+    server before settling on this design, not assumed. So instead of
+    trying to truly kill the blocked call, the request runs on a background
+    thread and this function races it against `cancel_event`: whichever
+    resolves first wins. If cancellation wins, `_call_backend` returns
+    control to the caller immediately - the background thread is abandoned
+    (daemon, unjoined) and keeps running to its own natural conclusion, its
+    result silently discarded. This does NOT reduce server-side Spark
+    compute (ollama has no way to know the caller gave up - a separate,
+    already-documented limitation). What it DOES do is stop a superseded
+    review from holding its queue slot / SQS message for the network call's
+    full remaining duration, so the PR's next (current) commit doesn't have
+    to wait behind it.
+
+    Every other caller (the judge, the walkthrough summary, the SaaS
+    overload fallback) passes no `cancel_event` and takes the direct,
+    unmodified path below - no extra thread, no behavior change."""
+    if cancel_event is not None and cancel_event.is_set():
+        raise httpx.RequestError("cancelled before dispatch")
     try:
         key = config.key_loader()
     except Exception as e:
@@ -878,28 +927,40 @@ def _call_backend(
             f"({transport_attempts}) must not exceed retry_attempts "
             f"({config.retry_attempts})"
         )
-    for attempt in range(config.retry_attempts):
+    if cancel_event is None:
+        return _post_with_retries(
+            config.url, body, headers, config.timeout_seconds,
+            config.retry_attempts, transport_attempts,
+        )
+
+    # Cancellable path (#635 follow-up): run the real call on a background
+    # thread, race it against cancel_event via a 1-item queue. Whichever
+    # resolves first wins - see the docstring above for why this is
+    # "abandon the loser", not "kill the loser".
+    result_q: queue.Queue = queue.Queue(maxsize=1)
+
+    def _do_call() -> None:
         try:
-            resp = httpx.post(
-                config.url,
-                json=body,
-                headers=headers,
-                timeout=config.timeout_seconds,
+            resp = _post_with_retries(
+                config.url, body, headers, config.timeout_seconds,
+                config.retry_attempts, transport_attempts,
             )
-        except (httpx.RequestError, httpx.TimeoutException):
-            if attempt < transport_attempts - 1:
-                _RETRY_SLEEP(_RETRY_BASE_DELAY * (2 ** attempt))
-                continue
-            raise
-        if (
-            resp.status_code in _RETRYABLE_STATUSES
-            and attempt < config.retry_attempts - 1
-        ):
-            _RETRY_SLEEP(_RETRY_BASE_DELAY * (2 ** attempt))
+            result_q.put(("ok", resp))
+        except Exception as e:  # noqa: BLE001 - re-raised on the waiting side
+            result_q.put(("error", e))
+
+    threading.Thread(target=_do_call, daemon=True).start()
+    while True:
+        if cancel_event.is_set():
+            raise httpx.RequestError("cancelled mid-flight")
+        try:
+            kind, payload = result_q.get(timeout=0.25)
+            break
+        except queue.Empty:
             continue
-        return resp
-    # Unreachable: every iteration either returns, continues, or raises.
-    raise AssertionError("retry loop exited without producing a response")
+    if kind == "error":
+        raise payload
+    return payload
 
 
 # Message length cap (#553 audit): the check-run findings table repeats
@@ -1306,6 +1367,7 @@ def review_diff(
     cross_file_contents: dict[str, str] | None = None,
     runtime_context: str | None = None,
     voice: VoiceSelection = "caveman",
+    cancel_event: threading.Event | None = None,
 ) -> LlmReviewResponse:
     """Review a diff with both models in deep mode, or fallback in fast mode.
 
@@ -1323,11 +1385,21 @@ def review_diff(
     `pr_context` carries span tags plus bounded PR intent. Title and body are
     explicitly framed as untrusted repository data and redacted before either
     provider receives them.
+
+    `cancel_event` (#635 follow-up): when the caller sets this Event while a
+    Cave arm's network call is in flight, `_call_backend` stops waiting on
+    it and returns control immediately - the call itself is abandoned in the
+    background, not truly killed (see `_call_backend`'s docstring for why).
+    Optional and unused by every other caller (the judge, the walkthrough
+    summary) - this is scoped to the durable per-PR review path only.
     """
     if not hunks:
         return LlmReviewResponse(kind="no_diff")
 
-    return _review_diff_dispatch(hunks, installation_id, pr_context, file_contents, cross_file_contents, runtime_context, voice)
+    return _review_diff_dispatch(
+        hunks, installation_id, pr_context, file_contents, cross_file_contents,
+        runtime_context, voice, cancel_event,
+    )
 
 
 @dataclass
@@ -1357,13 +1429,18 @@ def _run_review_arm(
     messages: list[dict[str, str]],
     variant: PromptVariant,
     pr_tags: dict[str, str],
+    cancel_event: threading.Event | None = None,
 ) -> _ArmOutcome:
     """Run one review arm: resolve config, call the backend, parse, annotate
     the LLM-Obs span. Extracted verbatim from the original sequential loop
-    body (#XXXX, arm parallelization) so deep mode can run two of these
+    body (arm parallelization) so deep mode can run two of these
     concurrently via ThreadPoolExecutor -- this function reads only its own
     arguments and touches no caller-owned state, so it is safe to call from
-    either a plain loop (fast mode) or a worker thread (deep mode)."""
+    either a plain loop (fast mode) or a worker thread (deep mode).
+
+    `cancel_event` (#635 follow-up) is passed straight through to
+    `_call_backend`, which aborts its in-flight request the moment the event
+    is set - see that function's docstring for how."""
     try:
         config = _review_backend_config(backend)
     except _BackendConfigError as e:
@@ -1401,7 +1478,7 @@ def _run_review_arm(
         name=_LLMOBS_NAME,
     ) as span:
         try:
-            resp = _call_backend(config, messages)
+            resp = _call_backend(config, messages, cancel_event=cancel_event)
         except _BackendConfigError as e:
             # log.exception (not log.error) retains the traceback -
             # CodeRabbit #629, ruff TRY400.
@@ -1524,6 +1601,7 @@ def _review_diff_dispatch(
     cross_file_contents: dict[str, str] | None,
     runtime_context: str | None,
     voice: VoiceSelection,
+    cancel_event: threading.Event | None,
 ) -> LlmReviewResponse:
     # Owned review ensemble, PRIMARY: coder arm (qwen3-coder-next) + reasoner
     # arm (qwen3.5, always-hot on sparkicus), both via the Cave gateway. Deep
@@ -1575,7 +1653,7 @@ def _review_diff_dispatch(
         # result even without the explicit list() (belt-and-suspenders).
         with ThreadPoolExecutor(max_workers=len(review_backends)) as pool:
             arm_outcomes = list(pool.map(
-                lambda b: _run_review_arm(b, messages, variant, pr_tags),
+                lambda b: _run_review_arm(b, messages, variant, pr_tags, cancel_event),
                 review_backends,
             ))
     else:
@@ -1586,7 +1664,7 @@ def _review_diff_dispatch(
         # defeating that.
         arm_outcomes = []
         for backend in review_backends:
-            outcome = _run_review_arm(backend, messages, variant, pr_tags)
+            outcome = _run_review_arm(backend, messages, variant, pr_tags, cancel_event)
             arm_outcomes.append(outcome)
             if outcome.kind == "success":
                 break
@@ -1635,6 +1713,16 @@ def _review_diff_dispatch(
         last_error = outcome.error_text
 
     if not successes and first_parse_fail is None:
+        if cancel_event is not None and cancel_event.is_set():
+            # Superseded mid-flight (#635 follow-up): both Cave arms were
+            # deliberately aborted because a newer commit landed, not
+            # because the owned hardware is unavailable. Trying OpenRouter/
+            # Poolside here would burn a real SaaS call chasing a snapshot
+            # the pre-publish freshness check is about to discard anyway -
+            # skip the overload fallback and fail fast instead.
+            return LlmReviewResponse(
+                kind="all_failed", error="cancelled: superseded by a newer commit",
+            )
         # Both Cave arms produced NO usable response at all (misconfigured,
         # transport error, or timeout) - the strongest signal the owned
         # hardware itself is unavailable. Evan's 2026-07-14 call: OpenRouter

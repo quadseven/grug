@@ -225,7 +225,7 @@ def test_dispatch_threads_cross_file_context_to_review(monkeypatch):
 
     def fake_review_diff(hunks, installation_id, pr_context=None,
                          file_contents=None, cross_file_contents=None,
-                         runtime_context=None, voice="caveman"):
+                         runtime_context=None, voice="caveman", cancel_event=None):
         captured["xf"] = cross_file_contents
         return LlmReviewResponse(kind="reviewed", findings=(), backend_used=Backend.POOLSIDE)
 
@@ -269,7 +269,7 @@ def test_dispatch_cross_file_failure_degrades_to_diff_only(monkeypatch):
 
     def fake_review_diff(hunks, installation_id, pr_context=None,
                          file_contents=None, cross_file_contents=None,
-                         runtime_context=None, voice="caveman"):
+                         runtime_context=None, voice="caveman", cancel_event=None):
         captured["xf"] = cross_file_contents
         return LlmReviewResponse(kind="reviewed", findings=(), backend_used=Backend.POOLSIDE)
 
