@@ -80,11 +80,20 @@ spec:
             # deliberately disabled.
             - {name: GRUG_K8S_RUNTIME, value: "1"}
             # Durable Elder hot path: stamp each webhook head onto the existing
-            # rerun FIFO, then let the consumer require 90s of head stability
-            # before spending the deep-review budget. A moved head is stale and
-            # cancelled; its newer webhook event owns the next message.
+            # rerun FIFO, then let the consumer require N seconds of head
+            # stability before spending the deep-review budget. A moved head
+            # is stale and cancelled; its newer webhook event owns the next
+            # message. Raised 90 -> 180 (2026-07-15): per-PR reviews are
+            # strictly ordered (SQS FIFO MessageGroupId = one PR), so an
+            # iterative fixup-commit cadence (a push every 2-4 min while
+            # responding to review comments) was outrunning the old 90s
+            # window often enough that most of those pushes still paid the
+            # full ~330-660s Elder budget only to be superseded moments
+            # later. 180s is still well under the 300s hard clamp
+            # (_MAX_SETTLE_SECONDS in rerun.py) and the SQS visibility/lease
+            # budget has ample room.
             - {name: GRUG_ELDER_DURABLE_QUEUE, value: "1"}
-            - {name: GRUG_ELDER_SETTLE_SECONDS, value: "90"}
+            - {name: GRUG_ELDER_SETTLE_SECONDS, value: "180"}
             # Keep review configuration on both Elder-capable workloads. The
             # Opus override is review-only; judge, Teller, and /grug ask retain
             # their existing lower-cost OpenRouter model configuration.

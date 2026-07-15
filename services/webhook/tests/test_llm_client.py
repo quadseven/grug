@@ -225,6 +225,33 @@ def test_deep_review_consults_both_arms_and_merges_findings(monkeypatch) -> None
     }
 
 
+def test_deep_review_runs_both_arms_concurrently_not_sequentially(monkeypatch) -> None:
+    """Arm parallelization: deep mode's two arms must overlap in wall-clock,
+    not sum. Each mocked backend call sleeps 0.2s; sequential execution would
+    take >=0.4s, concurrent execution should finish close to 0.2s. A generous
+    upper bound (0.35s) absorbs scheduling/GIL-release jitter without letting
+    a regression back to sequential silently pass."""
+    import time
+
+    monkeypatch.setenv("GRUG_REVIEW_DEPTH", "deep")
+
+    def respond(url, **kwargs):
+        time.sleep(0.2)
+        content = '{"findings": []}'
+        body = _openai_json_response(content)
+        body["model"] = "qwen3.5:122b" if _is_reasoner(kwargs) else "qwen3-coder-next:q8_0"
+        return httpx.Response(200, json=body)
+
+    with patch.object(httpx, "post", side_effect=respond) as mock_post:
+        start = time.monotonic()
+        out = review_diff([_hunk()], installation_id=1)
+        elapsed = time.monotonic() - start
+
+    assert mock_post.call_count == 2
+    assert out.kind == "reviewed"
+    assert elapsed < 0.35, f"expected concurrent arms (~0.2s), took {elapsed:.3f}s"
+
+
 def test_deep_review_deduplicates_same_candidate_across_arms(monkeypatch) -> None:
     monkeypatch.setenv("GRUG_REVIEW_DEPTH", "deep")
     content = (
