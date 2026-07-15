@@ -932,11 +932,20 @@ def _call_backend(
             config.url, body, headers, config.timeout_seconds,
             config.retry_attempts, transport_attempts,
         )
+    return _post_with_retries_cancellable(
+        config, body, headers, transport_attempts, cancel_event,
+    )
 
-    # Cancellable path (#635 follow-up): run the real call on a background
-    # thread, race it against cancel_event via a 1-item queue. Whichever
-    # resolves first wins - see the docstring above for why this is
-    # "abandon the loser", not "kill the loser".
+
+def _post_with_retries_cancellable(
+    config: BackendConfig, body: dict[str, Any], headers: dict[str, str],
+    transport_attempts: int, cancel_event: threading.Event,
+) -> httpx.Response:
+    """`_call_backend`'s cancellable path (#635 follow-up), split out to keep
+    that function's own branch count down. Runs the real call on a
+    background thread, races it against `cancel_event` via a 1-item queue -
+    whichever resolves first wins. See `_call_backend`'s docstring for why
+    this is "abandon the loser", not "kill the loser"."""
     result_q: queue.Queue = queue.Queue(maxsize=1)
 
     def _do_call() -> None:
