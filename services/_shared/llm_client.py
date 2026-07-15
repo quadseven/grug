@@ -28,6 +28,7 @@ import json
 import logging
 import os
 import time
+from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, field, replace
 from enum import Enum
 from typing import Any, Callable, Literal, Optional, TypedDict, cast, get_args
@@ -1326,6 +1327,199 @@ def review_diff(
     if not hunks:
         return LlmReviewResponse(kind="no_diff")
 
+    return _review_diff_dispatch(hunks, installation_id, pr_context, file_contents, cross_file_contents, runtime_context, voice)
+
+
+@dataclass
+class _ArmOutcome:
+    """Self-contained result of running one review arm (`_run_review_arm`).
+
+    Deep mode runs two of these concurrently and processes the results
+    sequentially afterward in `review_backends` order (coder, then
+    reasoner) -- this dataclass is what crosses the thread boundary, so it
+    must carry everything the original inline loop body used to compute
+    live, and nothing beyond that (no shared mutable state)."""
+
+    backend: "Backend"
+    kind: Literal["config_error", "transport_error", "success", "parse_failed", "http_failed"]
+    error_text: str = ""
+    model: str | None = None
+    findings: tuple["Finding", ...] = ()
+    span_context: dict | None = None
+    # Raw `_parse_response` error string (distinct from `error_text`, the
+    # composed last_error message) -- `first_parse_fail` downstream expects
+    # this exact raw value, unpacked into `LlmReviewResponse.error`.
+    parse_err: str = ""
+
+
+def _run_review_arm(
+    backend: "Backend",
+    messages: list[dict[str, str]],
+    variant: PromptVariant,
+    pr_tags: dict[str, str],
+) -> _ArmOutcome:
+    """Run one review arm: resolve config, call the backend, parse, annotate
+    the LLM-Obs span. Extracted verbatim from the original sequential loop
+    body (#XXXX, arm parallelization) so deep mode can run two of these
+    concurrently via ThreadPoolExecutor -- this function reads only its own
+    arguments and touches no caller-owned state, so it is safe to call from
+    either a plain loop (fast mode) or a worker thread (deep mode)."""
+    try:
+        config = _review_backend_config(backend)
+    except _BackendConfigError as e:
+        # Still emit a span so DD sees config errors (gateway/secret missing),
+        # not just transport errors - but do it here, BEFORE the main span,
+        # so a bad config can never raise out of review_diff.
+        cfg_start_ns = time.monotonic_ns()
+        with _llmobs_llm(
+            model_name=backend.value, model_provider=backend.value, name=_LLMOBS_NAME,
+        ) as cfg_span:
+            _llmobs_annotate(
+                span=cfg_span, input_data=_redact_payload(messages),
+                metadata={"backend": backend.value, "variant_id": variant, "error": "config"},
+                metrics={"latency_ms": _elapsed_ms(cfg_start_ns)},
+                tags=pr_tags,
+            )
+        log.error("llm_backend_misconfigured", extra={"backend": backend.value, "detail": str(e)})
+        return _ArmOutcome(
+            backend=backend, kind="config_error",
+            error_text=f"{backend.value} misconfigured: {e}",
+        )
+
+    # Open one LLM Obs span per backend attempt. Annotate on every CAUGHT
+    # exit path (success + the three explicit `except` arms) so DD captures
+    # latency tails and per-backend error rates. A surprise exception
+    # escaping `_call_backend` would propagate without annotation - that's
+    # intentional (it's a bug worth seeing in Seer, not a routine signal).
+    start_ns = time.monotonic_ns()
+    with _llmobs_llm(
+        model_name=config.model,
+        model_provider=backend.value,
+        name=_LLMOBS_NAME,
+    ) as span:
+        try:
+            resp = _call_backend(config, messages)
+        except _BackendConfigError as e:
+            log.error(
+                "llm_backend_misconfigured",
+                extra={"backend": backend.value, "detail": str(e)},
+            )
+            _llmobs_annotate(
+                span=span, input_data=_redact_payload(messages),
+                metadata={"backend": backend.value, "variant_id": variant, "error": "config"},
+                metrics={"latency_ms": _elapsed_ms(start_ns)},
+                tags=pr_tags,
+            )
+            return _ArmOutcome(
+                backend=backend, kind="config_error",
+                error_text=f"{backend.value} misconfigured: {e}",
+            )
+        except (httpx.RequestError, httpx.TimeoutException) as e:
+            log.warning(
+                "llm_backend_transport_failed",
+                extra={"backend": backend.value, "kind": type(e).__name__},
+            )
+            _llmobs_annotate(
+                span=span, input_data=_redact_payload(messages),
+                metadata={"backend": backend.value, "variant_id": variant, "error": type(e).__name__},
+                metrics={"latency_ms": _elapsed_ms(start_ns)},
+                tags=pr_tags,
+            )
+            return _ArmOutcome(
+                backend=backend, kind="transport_error",
+                error_text=f"{backend.value}: {type(e).__name__}",
+            )
+        findings, model, err = _parse_response(resp)
+        # Annotate AFTER the response so we capture the raw content
+        # + token counts. httpx.Response.json() re-parses from the
+        # cached .content bytes; review response bodies are small,
+        # so the cost is negligible vs the LLM round-trip.
+        try:
+            body = resp.json() if resp.status_code == 200 else {}
+        except (ValueError, json.JSONDecodeError):
+            # Triggered when the first parse also failed (CF HTML
+            # interstitial, truncated body) OR — rarely — when
+            # the cache diverges. Either way the LLM Obs span
+            # would otherwise silently emit kind=reviewed with
+            # empty content and undercount DD token-cost
+            # dashboards.
+            log.warning(
+                "llm_body_reparse_failed",
+                extra={
+                    "backend": backend.value,
+                    "status_code": resp.status_code,
+                },
+            )
+            body = {}
+        content = ""
+        if isinstance(body, dict):
+            choices = body.get("choices") or []
+            if choices and isinstance(choices[0], dict):
+                content = (choices[0].get("message") or {}).get("content", "")
+        usage_metrics = _extract_usage_metrics(body)
+        _llmobs_annotate(
+            span=span,
+            input_data=_redact_payload(messages),
+            output_data=_redact_payload(content) if content else None,
+            metadata={
+                "backend": backend.value,
+                "variant_id": variant,  # #191 prompt A/B arm
+                "status_code": resp.status_code,
+                "kind": "reviewed" if not err else (
+                    "parse_failed" if resp.status_code == 200 else "http_error"
+                ),
+            },
+            metrics={
+                "latency_ms": _elapsed_ms(start_ns),
+                **usage_metrics,
+            },
+            tags=pr_tags,
+        )
+        # Export inside the `with` block — the span must be active
+        # for export to capture its trace/span IDs.
+        span_context = _llmobs_export(span) if not err else None
+
+    if not err:
+        resolved_model = model or config.model
+        return _ArmOutcome(
+            backend=backend, kind="success", model=resolved_model,
+            findings=findings, span_context=span_context,
+        )
+    if resp.status_code == 200:
+        # 200 + parse failure — the LLM responded but the content wasn't
+        # usable JSON. FALL BACK to the other backend: the two backends run
+        # DIFFERENT models (OpenRouter=claude, Poolside=laguna), so a parse
+        # failure on one does NOT predict the other (the old "same prose"
+        # assumption is stale post the per-backend model split). Record the
+        # FIRST parse failure so a both-fail outcome still returns the
+        # specific `parse_failed` kind (caller posts an advisory check-run).
+        log.warning(
+            "llm_response_parse_failed",
+            extra={"backend": backend.value, "model": model, "error": err},
+        )
+        return _ArmOutcome(
+            backend=backend, kind="parse_failed", model=model,
+            error_text=f"{backend.value}: parse_failed: {err}", parse_err=err,
+        )
+    log.warning(
+        "llm_backend_http_failed",
+        extra={"backend": backend.value, "status": resp.status_code, "error": err},
+    )
+    return _ArmOutcome(
+        backend=backend, kind="http_failed",
+        error_text=f"{backend.value}: {err}",
+    )
+
+
+def _review_diff_dispatch(
+    hunks: list[Hunk],
+    installation_id: int,
+    pr_context: Optional[PrContext],
+    file_contents: dict[str, str] | None,
+    cross_file_contents: dict[str, str] | None,
+    runtime_context: str | None,
+    voice: VoiceSelection,
+) -> LlmReviewResponse:
     # Owned review ensemble, PRIMARY: coder arm (qwen3-coder-next) + reasoner
     # arm (qwen3.5, always-hot on sparkicus), both via the Cave gateway. Deep
     # runs both and merges (brain+hands); fast returns after the FIRST
@@ -1356,134 +1550,59 @@ def review_diff(
     # than collapsing to `all_failed`.
     first_parse_fail = None
     successes: list[_SuccessfulReview] = []
-    for backend in review_backends:
-        # Resolve the backend config BEFORE opening the LLM-Obs span: a
-        # misconfiguration (e.g. GRUG_CAVE_GATEWAY_URL unset) must degrade to a
-        # clean backend failure, not raise out of review_diff. With the Cave the
-        # sole review backend, this is the only path when the gateway env is
-        # missing, so it decides whether Elder degrades (neutral) or 500s.
-        try:
-            config = _review_backend_config(backend)
-        except _BackendConfigError as e:
-            # Still emit a span so DD sees config errors (gateway/secret missing),
-            # not just transport errors - but do it here, BEFORE the main span,
-            # so a bad config can never raise out of review_diff.
-            cfg_start_ns = time.monotonic_ns()
-            with _llmobs_llm(
-                model_name=backend.value, model_provider=backend.value, name=_LLMOBS_NAME,
-            ) as cfg_span:
-                _llmobs_annotate(
-                    span=cfg_span, input_data=_redact_payload(messages),
-                    metadata={"backend": backend.value, "variant_id": variant, "error": "config"},
-                    metrics={"latency_ms": _elapsed_ms(cfg_start_ns)},
-                    tags=pr_tags,
-                )
-            log.error("llm_backend_misconfigured", extra={"backend": backend.value, "detail": str(e)})
-            last_error = f"{backend.value} misconfigured: {e}"
+
+    if deep:
+        # Deep mode needs BOTH arms unconditionally (findings are MERGED,
+        # never first-wins) -- running them concurrently does the exact
+        # same total work in wall-clock bounded by the SLOWER arm instead
+        # of their sum (was up to 2x330s sequential; now up to 330s).
+        # ThreadPoolExecutor.map preserves the INPUT order in its returned
+        # list regardless of which arm actually finishes first, so the
+        # processing loop below still sees (coder, reasoner) in that fixed
+        # order -- every downstream tie-break (first success wins
+        # successes[0], first parse failure recorded) is unchanged from the
+        # sequential version.
+        with ThreadPoolExecutor(max_workers=len(review_backends)) as pool:
+            arm_outcomes = list(pool.map(
+                lambda b: _run_review_arm(b, messages, variant, pr_tags),
+                review_backends,
+            ))
+    else:
+        # Fast mode deliberately stays sequential with a real early exit:
+        # it stops at the FIRST successful arm specifically so the second
+        # arm's Spark capacity is never spent at all, not merely to save
+        # time. Parallelizing here would burn both arms unconditionally,
+        # defeating that.
+        arm_outcomes = []
+        for backend in review_backends:
+            outcome = _run_review_arm(backend, messages, variant, pr_tags)
+            arm_outcomes.append(outcome)
+            if outcome.kind == "success":
+                break
+
+    for outcome in arm_outcomes:
+        backend = outcome.backend
+        if outcome.kind in ("config_error", "transport_error"):
+            last_error = outcome.error_text
             continue
-        # Open one LLM Obs span per backend attempt. Annotate on every
-        # CAUGHT exit path (success + the three explicit `except` arms)
-        # so DD captures latency tails and per-backend error rates. A
-        # surprise exception escaping `_call_backend` would propagate
-        # without annotation — that's intentional (it's a bug worth
-        # seeing in Seer, not a routine signal).
-        start_ns = time.monotonic_ns()
-        with _llmobs_llm(
-            model_name=config.model,
-            model_provider=backend.value,
-            name=_LLMOBS_NAME,
-        ) as span:
-            try:
-                resp = _call_backend(config, messages)
-            except _BackendConfigError as e:
-                log.error(
-                    "llm_backend_misconfigured",
-                    extra={"backend": backend.value, "detail": str(e)},
-                )
-                _llmobs_annotate(
-                    span=span, input_data=_redact_payload(messages),
-                    metadata={"backend": backend.value, "variant_id": variant, "error": "config"},
-                    metrics={"latency_ms": _elapsed_ms(start_ns)},
-                    tags=pr_tags,
-                )
-                last_error = f"{backend.value} misconfigured: {e}"
-                continue
-            except (httpx.RequestError, httpx.TimeoutException) as e:
-                log.warning(
-                    "llm_backend_transport_failed",
-                    extra={"backend": backend.value, "kind": type(e).__name__},
-                )
-                _llmobs_annotate(
-                    span=span, input_data=_redact_payload(messages),
-                    metadata={"backend": backend.value, "variant_id": variant, "error": type(e).__name__},
-                    metrics={"latency_ms": _elapsed_ms(start_ns)},
-                    tags=pr_tags,
-                )
-                last_error = f"{backend.value}: {type(e).__name__}"
-                continue
-            findings, model, err = _parse_response(resp)
-            # Annotate AFTER the response so we capture the raw content
-            # + token counts. httpx.Response.json() re-parses from the
-            # cached .content bytes; review response bodies are small,
-            # so the cost is negligible vs the LLM round-trip.
-            try:
-                body = resp.json() if resp.status_code == 200 else {}
-            except (ValueError, json.JSONDecodeError):
-                # Triggered when the first parse also failed (CF HTML
-                # interstitial, truncated body) OR — rarely — when
-                # the cache diverges. Either way the LLM Obs span
-                # would otherwise silently emit kind=reviewed with
-                # empty content and undercount DD token-cost
-                # dashboards.
-                log.warning(
-                    "llm_body_reparse_failed",
-                    extra={
-                        "backend": backend.value,
-                        "status_code": resp.status_code,
-                    },
-                )
-                body = {}
-            content = ""
-            if isinstance(body, dict):
-                choices = body.get("choices") or []
-                if choices and isinstance(choices[0], dict):
-                    content = (choices[0].get("message") or {}).get("content", "")
-            usage_metrics = _extract_usage_metrics(body)
-            _llmobs_annotate(
-                span=span,
-                input_data=_redact_payload(messages),
-                output_data=_redact_payload(content) if content else None,
-                metadata={
-                    "backend": backend.value,
-                    "variant_id": variant,  # #191 prompt A/B arm
-                    "status_code": resp.status_code,
-                    "kind": "reviewed" if not err else (
-                        "parse_failed" if resp.status_code == 200 else "http_error"
-                    ),
-                },
-                metrics={
-                    "latency_ms": _elapsed_ms(start_ns),
-                    **usage_metrics,
-                },
-                tags=pr_tags,
-            )
-            # Export inside the `with` block — the span must be active
-            # for export to capture its trace/span IDs.
-            span_context = _llmobs_export(span) if not err else None
-        if not err:
-            resolved_model = model or config.model
+        if outcome.kind == "success":
+            # _run_review_arm always sets `model` (to `model or config.model`,
+            # never empty) on the success path - only the other outcome
+            # kinds leave it None.
+            assert outcome.model is not None
+            resolved_model = outcome.model
             origin = FindingOrigin(
                 backend=backend,
                 model=resolved_model,
-                review_span_context=span_context,
+                review_span_context=outcome.span_context,
             )
             successes.append(_SuccessfulReview(
                 backend=backend,
                 model=resolved_model,
                 findings=tuple(
-                    replace(finding, origins=(origin,)) for finding in findings
+                    replace(finding, origins=(origin,)) for finding in outcome.findings
                 ),
-                review_span_context=span_context,
+                review_span_context=outcome.span_context,
             ))
             if not deep:
                 return LlmReviewResponse(
@@ -1491,32 +1610,18 @@ def review_diff(
                     findings=successes[0].findings,
                     backend_used=backend,
                     model_name=resolved_model,
-                    review_span_context=span_context,
+                    review_span_context=outcome.span_context,
                     backends_used=(backend,),
                     models_used=(resolved_model,),
                 )
             continue
-        if resp.status_code == 200:
-            # 200 + parse failure — the LLM responded but the content wasn't
-            # usable JSON. FALL BACK to the other backend: the two backends run
-            # DIFFERENT models (OpenRouter=claude, Poolside=laguna), so a parse
-            # failure on one does NOT predict the other (the old "same prose"
-            # assumption is stale post the per-backend model split). Record the
-            # FIRST parse failure so a both-fail outcome still returns the
-            # specific `parse_failed` kind (caller posts an advisory check-run).
-            log.warning(
-                "llm_response_parse_failed",
-                extra={"backend": backend.value, "model": model, "error": err},
-            )
+        if outcome.kind == "parse_failed":
             if first_parse_fail is None:
-                first_parse_fail = (backend, model, err)
-            last_error = f"{backend.value}: parse_failed: {err}"
+                first_parse_fail = (backend, outcome.model, outcome.parse_err)
+            last_error = outcome.error_text
             continue
-        log.warning(
-            "llm_backend_http_failed",
-            extra={"backend": backend.value, "status": resp.status_code, "error": err},
-        )
-        last_error = f"{backend.value}: {err}"
+        # http_failed
+        last_error = outcome.error_text
 
     if not successes and first_parse_fail is None:
         # Both Cave arms produced NO usable response at all (misconfigured,
