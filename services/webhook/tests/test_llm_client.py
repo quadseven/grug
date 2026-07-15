@@ -276,7 +276,16 @@ def test_call_backend_cancel_event_aborts_in_flight_request() -> None:
         def log_message(self, format: str, *args) -> None:  # noqa: A002 - stdlib signature; quiet test output
             pass
 
-    server = socketserver.TCPServer(("127.0.0.1", 0), _SlowHandler)
+    # ThreadingTCPServer (not TCPServer) + daemon_threads=True (CodeRabbit,
+    # #637): plain TCPServer.shutdown() blocks until the CURRENT request
+    # finishes, so the abandoned 5s-sleeping handler would make every test
+    # run pay close to the full 5s in teardown even though the assertions
+    # above already passed. A threading server's shutdown() doesn't wait on
+    # in-flight (daemon) request threads.
+    class _ThreadingServer(socketserver.ThreadingMixIn, http.server.HTTPServer):
+        daemon_threads = True
+
+    server = _ThreadingServer(("127.0.0.1", 0), _SlowHandler)
     port = server.server_address[1]
     server_thread = threading.Thread(target=server.serve_forever, daemon=True)
     server_thread.start()
