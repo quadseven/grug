@@ -54,8 +54,13 @@ _STATIC_SCALAR_RE = re.compile(
 
 def _changed_line_text(hunk: DiffHunk, target_line: int) -> str | None:
     """Return target new-side text from one unified-diff hunk."""
+    # DiffHunk.body is typed str and validated at parse time, but callers may
+    # pass synthetic hunks in tests; never AttributeError on empty/missing body.
+    body = getattr(hunk, "body", None)
+    if not body:
+        return None
     new_line = hunk.new_start
-    for raw in hunk.body.splitlines()[1:]:
+    for raw in body.splitlines()[1:]:
         if raw.startswith("\\"):
             continue
         if raw.startswith("-"):
