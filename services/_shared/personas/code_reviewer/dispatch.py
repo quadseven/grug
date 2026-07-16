@@ -36,7 +36,14 @@ from github_checks_client import CheckConclusion, CheckRunResult, post_check_run
 from github_reviews_client import (
     InlineComment, ReviewEvent, ReviewResult, get_review_comments, post_review,
 )
-from llm_client import Hunk as LlmHunk, LlmReviewResponse, PrContext, review_diff
+from llm_client import (
+    Hunk as LlmHunk,
+    LlmReviewResponse,
+    PrContext,
+    decide_deep_escalation,
+    review_diff,
+    review_reasoner_diff,
+)
 from voice_pack import VoiceSelection, entitled_voice
 from review_types import EFFORTS
 from personas.code_reviewer.dedup import (
@@ -1544,6 +1551,44 @@ def dispatch_code_review(
                     "kind": type(e).__name__,
                 },
             )
+
+    # Async deep append (#646): Tier-1 (coder) already published the required
+    # check. When tiered escalation fires, run the reasoner arm now and append
+    # any new findings. Failures here never change `result` — the required
+    # check already completed.
+    try:
+        _async_deep_append_if_needed(
+            installation_id=installation_id,
+            owner=owner,
+            repo_name=repo_name,
+            pull_number=pull_number,
+            head_sha=head_sha,
+            action=action,
+            snapshot_id=snapshot_id,
+            mode=mode,
+            blocking=blocking,
+            hunks=hunks,
+            llm_hunks=_to_llm_hunks(hunks),
+            pr_context=pr_context,
+            file_contents=file_contents,
+            cross_file_contents=cross_file_contents,
+            runtime_context=runtime_context,
+            voice=voice,
+            living_range=living_range,
+            evaluation=evaluation,
+            prior_keys=prior_keys,
+            check_publish_failed=check_publish_failed,
+            cancel_event=cancel_event,
+        )
+    except Exception as e:  # noqa: BLE001 - deep append is best-effort
+        log.warning(
+            "elder_async_deep_append_failed",
+            extra={
+                "pr": f"{owner}/{repo_name}#{pull_number}",
+                "kind": type(e).__name__,
+            },
+        )
+
     # LLM-as-a-judge DD evals (#190) submit AFTER the review + check-run are
     # POSTed, so recording can't delay the developer seeing the review. The
     # judge LLM CALL already ran pre-publish (grade_findings, #467) to gate
@@ -1576,6 +1621,218 @@ def dispatch_code_review(
     if evaluation.degraded_reason:
         response["degraded_reason"] = evaluation.degraded_reason
     return response
+
+
+def _async_deep_enabled() -> bool:
+    """Async deep append on for tiered unless GRUG_DEEP_ASYNC=0."""
+    raw = os.getenv("GRUG_DEEP_ASYNC", "1").strip().lower()
+    return raw not in {"0", "false", "off", "no"}
+
+
+def _async_deep_append_if_needed(
+    *,
+    installation_id: int,
+    owner: str,
+    repo_name: str,
+    pull_number: int,
+    head_sha: str,
+    action: str,
+    snapshot_id: str,
+    mode: str,
+    blocking: bool,
+    hunks: tuple[DiffHunk, ...],
+    llm_hunks: list[LlmHunk],
+    pr_context: PrContext,
+    file_contents: dict[str, str] | None,
+    cross_file_contents: dict[str, str] | None,
+    runtime_context: str | None,
+    voice: VoiceSelection,
+    living_range: str,
+    evaluation: CodeReviewEvaluation,
+    prior_keys: frozenset[str],
+    check_publish_failed: bool,
+    cancel_event: threading.Event | None,
+) -> None:
+    """Run reasoner after Tier-1 publish when tiered escalation fires (#646).
+
+    Posts additional inline comments and a second completed check-run summary
+    that includes deep findings. Never raises to the caller.
+    """
+    if check_publish_failed:
+        return
+    if not _async_deep_enabled():
+        return
+    depth = os.getenv("GRUG_REVIEW_DEPTH", "tiered").strip().lower()
+    if depth != "tiered":
+        return
+    if evaluation.degraded_reason not in (None, "", "no_diff"):
+        return
+    if cancel_event is not None and cancel_event.is_set():
+        return
+    decision = decide_deep_escalation(list(llm_hunks), pr_context)
+    if not decision.escalate:
+        return
+
+    log.info(
+        "elder_async_deep_start",
+        extra={
+            "pr": f"{owner}/{repo_name}#{pull_number}",
+            "reasons": list(decision.reasons),
+            "added_lines": decision.added_lines,
+        },
+    )
+
+    if action == "review":
+        stale = _review_snapshot_freshness_failure(
+            installation_id=installation_id,
+            owner=owner,
+            repo_name=repo_name,
+            pull_number=pull_number,
+            expected_snapshot_id=snapshot_id,
+            expected_head_sha=head_sha,
+        )
+        if stale is not None:
+            log.info(
+                "elder_async_deep_skipped_stale",
+                extra={"pr": f"{owner}/{repo_name}#{pull_number}"},
+            )
+            return
+
+    deep_llm = review_reasoner_diff(
+        llm_hunks,
+        installation_id=installation_id,
+        file_contents=file_contents,
+        cross_file_contents=cross_file_contents,
+        runtime_context=runtime_context,
+        pr_context=pr_context,
+        voice=voice,
+        cancel_event=cancel_event,
+    )
+    if deep_llm.kind != "reviewed":
+        log.info(
+            "elder_async_deep_arm_empty",
+            extra={
+                "pr": f"{owner}/{repo_name}#{pull_number}",
+                "kind": deep_llm.kind,
+                "error": deep_llm.error,
+            },
+        )
+        return
+
+    deep_eval = evaluate_diff(hunks, deep_llm)
+    deep_verdicts = grade_findings(
+        deep_eval, hunks, installation_id,
+        pr_context=pr_context,
+        file_contents=file_contents,
+        cross_file_contents=cross_file_contents,
+        runtime_context=runtime_context,
+    )
+    deep_kept, deep_suppressed = partition_findings(
+        deep_eval.findings, deep_verdicts,
+    )
+    if deep_suppressed:
+        deep_eval = with_findings(deep_eval, deep_kept)
+
+    # Dedupe against already-posted Tier-1 + prior-push comments.
+    tier1_keys = frozenset(
+        finding_key(f.file, f.line, f.rule_name) for f in evaluation.findings
+    )
+    all_prior = prior_keys | tier1_keys
+    if not deep_eval.findings:
+        log.info(
+            "elder_async_deep_no_findings",
+            extra={"pr": f"{owner}/{repo_name}#{pull_number}"},
+        )
+        # Still refresh check summary so operators see deep completed.
+        combined = evaluation
+    else:
+        combined = with_extra_findings(evaluation, deep_eval.findings)
+
+    conclusion, event = _publish_shape(combined, mode=mode)
+    title, summary = _summary_markdown(
+        combined,
+        suppressed_count=len(deep_suppressed),
+        living_range=living_range,
+    )
+    title = f"{title} (deep append)"
+    summary = (
+        f"_Deep reasoner arm appended after Tier-1 completed "
+        f"({', '.join(decision.reasons)})._\n\n{summary}"
+    )
+    try:
+        with_install_token_retry(
+            installation_id,
+            lambda token: post_check_run(
+                token, owner, repo_name,
+                CheckRunResult(
+                    name=_CHECK_NAME,
+                    head_sha=head_sha,
+                    status="completed",
+                    conclusion=conclusion,
+                    title=title,
+                    summary=summary,
+                ),
+                external_id=(
+                    f"grug-cr-deep:{owner}/{repo_name}#{pull_number}:{head_sha}"
+                ),
+            ),
+        )
+    except (httpx.HTTPStatusError, httpx.RequestError) as e:
+        log.warning(
+            "elder_async_deep_check_publish_failed",
+            extra={
+                "pr": f"{owner}/{repo_name}#{pull_number}",
+                "kind": type(e).__name__,
+            },
+        )
+
+    review_result = _build_review_result(
+        deep_eval if deep_eval.findings else combined,
+        head_sha=head_sha,
+        event=event,
+        prior_keys=all_prior,
+        precedent_notes={},
+    )
+    if review_result is not None and deep_eval.findings:
+        try:
+            with_install_token_retry(
+                installation_id,
+                lambda token: post_review(
+                    token, owner, repo_name,
+                    pull_number=pull_number, result=review_result,
+                ),
+            )
+        except (httpx.HTTPStatusError, httpx.RequestError) as e:
+            log.warning(
+                "elder_async_deep_review_publish_failed",
+                extra={
+                    "pr": f"{owner}/{repo_name}#{pull_number}",
+                    "kind": type(e).__name__,
+                },
+            )
+
+    try:
+        submit_evals(
+            deep_eval.findings, deep_verdicts,
+            review_span_context=deep_llm.review_span_context,
+        )
+    except Exception as e:  # noqa: BLE001
+        log.warning(
+            "elder_async_deep_evals_failed",
+            extra={
+                "pr": f"{owner}/{repo_name}#{pull_number}",
+                "kind": type(e).__name__,
+            },
+        )
+
+    log.info(
+        "elder_async_deep_done",
+        extra={
+            "pr": f"{owner}/{repo_name}#{pull_number}",
+            "deep_findings": len(deep_eval.findings),
+            "reasons": list(decision.reasons),
+        },
+    )
 
 
 def _publish_degraded(

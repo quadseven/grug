@@ -94,6 +94,8 @@ spec:
             # Escalation knobs (llm_client.decide_deep_escalation):
             - {name: GRUG_DEEP_SAMPLE_RATE, value: "0.12"}
             - {name: GRUG_DEEP_DIFF_LINES, value: "300"}
+            # #646: reasoner after Tier-1 publish (0 = disable async deep)
+            - {name: GRUG_DEEP_ASYNC, value: "1"}
             - {name: GRUG_OPENROUTER_REVIEW_MODEL, value: anthropic/claude-opus-4.7}
             # Apex: more concurrent durable reviews so a busy multi-repo
             # night does not serialize Elder behind unrelated large PRs.

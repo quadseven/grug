@@ -75,8 +75,10 @@ Escalation decisions log `llm_tiered_escalation` with reasons for DD.
 - Any large "premier" deep model only with **always-hot** residency and
   eval within an agreed band of the current reasoner; keep current reasoner
   warm-loadable as rollback.
-- Preferred later check semantics: required check completes on Tier 1;
-  deep **appends** asynchronously (not yet required for this ADR).
+- Check semantics (#646): required check completes on Tier 1 (coder);
+  when escalation fires, the reasoner arm runs **after** that publish and
+  appends findings (second check-run external_id `grug-cr-deep:…` + extra
+  review comments). Kill switch: `GRUG_DEEP_ASYNC=0`.
 
 ### Rollback
 

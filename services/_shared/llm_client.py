@@ -1,11 +1,13 @@
 """LLM client abstraction for the Code-Reviewer (Elder) persona.
 
-Owned Cave review modes (`GRUG_REVIEW_DEPTH`, default `tiered` - #645):
+Owned Cave review modes (`GRUG_REVIEW_DEPTH`, default `tiered` - #645/#646):
 
-- `tiered` (production): always run the coder arm; run the reasoner arm only
-  when escalation triggers fire (large diff, high-risk paths, explicit
-  deep-review marker, or random sample). Ordinary PRs hold one Cave slot.
-- `deep` (rollback / max recall): both Cave arms concurrent, merge findings.
+- `tiered` (production): always run the coder arm for the required check.
+  Escalation still decides whether dispatch runs the reasoner *after*
+  Tier-1 publish (async deep append - #646); `review_diff` itself never
+  waits on the reasoner in tiered mode.
+- `deep` (rollback / max recall): both Cave arms concurrent, merge findings
+  before publish.
 - `fast`: coder first; stop on first success (reasoner only if coder fails).
 
 If Cave produces nothing usable, OpenRouter and Poolside step in as a
@@ -1396,6 +1398,69 @@ def _merge_review_findings(
     return tuple(merged.values())
 
 
+def review_reasoner_diff(
+    hunks: list[Hunk],
+    installation_id: int,
+    pr_context: Optional[PrContext] = None,
+    file_contents: dict[str, str] | None = None,
+    cross_file_contents: dict[str, str] | None = None,
+    runtime_context: str | None = None,
+    voice: VoiceSelection = "caveman",
+    cancel_event: threading.Event | None = None,
+) -> LlmReviewResponse:
+    """Cave reasoner arm only — post-publish deep append for tiered mode (#646).
+
+    Uses the same prompt construction as deep/tiered (v2 recall). Never
+    falls back to SaaS here: overload insurance already ran on the Tier-1
+    path; a slow reasoner outage must not re-burn SaaS after the required
+    check already completed.
+    """
+    if not hunks:
+        return LlmReviewResponse(kind="no_diff")
+    variant: PromptVariant = "v2"
+    messages = _build_messages(
+        hunks, variant, file_contents, cross_file_contents, runtime_context,
+        team_practices=_team_practices_block(pr_context),
+        few_shot_examples=_few_shot_block(pr_context),
+        pr_context=pr_context,
+        voice=voice,
+    )
+    pr_tags = _llmobs_tags(pr_context)
+    outcome = _run_review_arm(
+        Backend.CAVE_REASONER, messages, variant, pr_tags, cancel_event,
+    )
+    if outcome.kind == "success":
+        assert outcome.model is not None
+        origin = FindingOrigin(
+            backend=Backend.CAVE_REASONER,
+            model=outcome.model,
+            review_span_context=outcome.span_context,
+        )
+        return LlmReviewResponse(
+            kind="reviewed",
+            findings=tuple(
+                replace(f, origins=(origin,)) for f in outcome.findings
+            ),
+            backend_used=Backend.CAVE_REASONER,
+            model_name=outcome.model,
+            review_span_context=outcome.span_context,
+            backends_used=(Backend.CAVE_REASONER,),
+            models_used=(outcome.model,),
+        )
+    if outcome.kind == "parse_failed":
+        return LlmReviewResponse(
+            kind="parse_failed",
+            error=outcome.error_text or outcome.parse_err,
+            backend_used=Backend.CAVE_REASONER,
+            model_name=outcome.model,
+        )
+    return LlmReviewResponse(
+        kind="all_failed",
+        error=outcome.error_text or "cave-reasoner failed",
+        backend_used=Backend.CAVE_REASONER,
+    )
+
+
 def review_diff(
     hunks: list[Hunk],
     installation_id: int,
@@ -1839,23 +1904,25 @@ def _review_diff_dispatch(
     first_parse_fail = None
     successes: list[_SuccessfulReview] = []
 
-    # run_both: concurrent dual-arm (deep always; tiered only when escalated).
-    # early_exit: return after first success (fast only).
-    # tiered without escalate runs coder alone - reasoner capacity stays free.
+    # run_both: concurrent dual-arm before publish (`deep` only).
+    # early_exit: return after first success (`fast` only).
+    # tiered: coder only here; reasoner is dispatch's post-publish deep
+    # append when `decide_deep_escalation` fires (#646).
     escalation: DeepEscalationDecision | None = None
     if depth == "deep":
         run_both = True
         early_exit = False
     elif depth == "tiered":
         escalation = decide_deep_escalation(hunks, pr_context)
-        run_both = escalation.escalate
-        early_exit = not run_both
+        run_both = False
+        early_exit = True
         log.info(
             "llm_tiered_escalation",
             extra={
                 "escalate": escalation.escalate,
                 "reasons": list(escalation.reasons),
                 "added_lines": escalation.added_lines,
+                "async_deep": escalation.escalate,
                 "installation_id": installation_id,
                 "repo": (pr_context or {}).get("repo"),
                 "pr_number": (pr_context or {}).get("pr_number"),
@@ -1888,7 +1955,7 @@ def _review_diff_dispatch(
             if outcome.kind == "success":
                 break
     else:
-        # tiered, no escalate: coder only.
+        # tiered: coder only (async deep append is the reasoner path).
         review_backends = (Backend.CAVE,)
         arm_outcomes = [
             _run_review_arm(Backend.CAVE, messages, variant, pr_tags, cancel_event),

@@ -479,7 +479,8 @@ def test_decide_deep_escalation_sample_is_deterministic() -> None:
     assert none.escalate is False
 
 
-def test_tiered_escalates_on_risky_path_runs_both_arms(monkeypatch) -> None:
+def test_tiered_risky_path_stays_coder_only_for_required_path(monkeypatch) -> None:
+    """#646: tiered never waits on reasoner inside review_diff (async append)."""
     monkeypatch.setenv("GRUG_REVIEW_DEPTH", "tiered")
     monkeypatch.setenv("GRUG_DEEP_SAMPLE_RATE", "0")
     monkeypatch.setenv("GRUG_DEEP_DIFF_LINES", "99999")
@@ -491,8 +492,20 @@ def test_tiered_escalates_on_risky_path_runs_both_arms(monkeypatch) -> None:
             installation_id=1,
         )
 
-    assert post.call_count == 2
-    assert out.backends_used == (Backend.CAVE, Backend.CAVE_REASONER)
+    assert post.call_count == 1
+    assert out.backends_used == (Backend.CAVE,)
+
+
+def test_review_reasoner_diff_runs_only_reasoner_arm(monkeypatch) -> None:
+    monkeypatch.setenv("GRUG_CAVE_GATEWAY_URL", "http://cave.test")
+    response = httpx.Response(200, json=_openai_json_response('{"findings": []}'))
+
+    with patch.object(httpx, "post", return_value=response) as post:
+        out = lc.review_reasoner_diff([_hunk()], installation_id=1)
+
+    assert post.call_count == 1
+    assert out.kind == "reviewed"
+    assert out.backends_used == (Backend.CAVE_REASONER,)
 
 
 def test_openrouter_review_uses_opus_with_high_adaptive_reasoning() -> None:
