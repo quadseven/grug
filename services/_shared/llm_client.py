@@ -1,10 +1,15 @@
 """LLM client abstraction for the Code-Reviewer (Elder) persona.
 
-Deep reviews ask the owned Cave ensemble (coder + reasoner arm, both via
-spark-gateway) independently, then return the deterministic union of their
-findings. `GRUG_REVIEW_DEPTH=fast` returns after the first successful arm
-instead. If BOTH Cave arms produce nothing usable, OpenRouter and Poolside
-step in as a bounded, single-shot last-resort fallback (see
+Owned Cave review modes (`GRUG_REVIEW_DEPTH`, default `tiered` - #645):
+
+- `tiered` (production): always run the coder arm; run the reasoner arm only
+  when escalation triggers fire (large diff, high-risk paths, explicit
+  deep-review marker, or random sample). Ordinary PRs hold one Cave slot.
+- `deep` (rollback / max recall): both Cave arms concurrent, merge findings.
+- `fast`: coder first; stop on first success (reasoner only if coder fails).
+
+If Cave produces nothing usable, OpenRouter and Poolside step in as a
+bounded, single-shot last-resort fallback (see
 `_saas_overload_fallback_config`) rather than leaving the review `all_failed`
 - Evan's explicit 2026-07-14 call to bring the SaaS pair back as an overload
 valve, not the primary path. `judge_findings`, `summarize_pr`, and
@@ -24,11 +29,13 @@ paths so this module only ever runs from the webhook process.
 """
 from __future__ import annotations
 
+import hashlib
 import json
 import logging
 import math
 import os
 import queue
+import re
 import threading
 import time
 from concurrent.futures import ThreadPoolExecutor
@@ -1623,6 +1630,175 @@ def _run_review_arm(
     )
 
 
+# --- Tiered deep escalation (#645) -------------------------------------------
+# Production default is single-arm coder; reasoner only when these fire.
+# All thresholds are env-tunable so ops can tighten/loosen without a deploy
+# of new code (values still land via the usual k8s env roll).
+
+_DEFAULT_DEEP_SAMPLE_RATE = 0.12
+_DEFAULT_DEEP_DIFF_LINES = 300
+# Substrings matched case-insensitively against changed file paths.
+_DEFAULT_DEEP_PATH_MARKERS = (
+    "auth",
+    "crypto",
+    "oauth",
+    "jwt",
+    "payment",
+    "billing",
+    "password",
+    "secret",
+    "kms",
+    "credential",
+    "/iam",
+    "terraform",
+    ".tf",
+    "helm",
+    "k8s/",
+    "kubernetes",
+    "dockerfile",
+    "compose.yml",
+    "compose.yaml",
+)
+_DEEP_REVIEW_MARKER_RE = re.compile(r"\bdeep[-_ ]?review\b", re.IGNORECASE)
+
+ReviewDepth = Literal["tiered", "fast", "deep"]
+
+
+def _review_depth() -> ReviewDepth:
+    """Resolve GRUG_REVIEW_DEPTH; unknown values fall back to tiered."""
+    raw = os.getenv("GRUG_REVIEW_DEPTH", "tiered").strip().lower()
+    if raw in ("tiered", "fast", "deep"):
+        return cast(ReviewDepth, raw)
+    log.warning("review_depth_invalid", extra={"value": raw})
+    return "tiered"
+
+
+def _deep_sample_rate() -> float:
+    raw = os.getenv("GRUG_DEEP_SAMPLE_RATE", str(_DEFAULT_DEEP_SAMPLE_RATE))
+    try:
+        value = float(raw)
+    except ValueError:
+        log.warning("deep_sample_rate_invalid", extra={"value": raw})
+        return _DEFAULT_DEEP_SAMPLE_RATE
+    return min(1.0, max(0.0, value))
+
+
+def _deep_diff_line_threshold() -> int:
+    raw = os.getenv("GRUG_DEEP_DIFF_LINES", str(_DEFAULT_DEEP_DIFF_LINES))
+    try:
+        value = int(raw)
+    except ValueError:
+        log.warning("deep_diff_lines_invalid", extra={"value": raw})
+        return _DEFAULT_DEEP_DIFF_LINES
+    return max(0, value)
+
+
+def _deep_path_markers() -> tuple[str, ...]:
+    raw = os.getenv("GRUG_DEEP_PATH_MARKERS", "").strip()
+    if not raw:
+        return _DEFAULT_DEEP_PATH_MARKERS
+    parts = tuple(p.strip().lower() for p in raw.split(",") if p.strip())
+    return parts or _DEFAULT_DEEP_PATH_MARKERS
+
+
+def _count_added_lines(hunks: list[Hunk]) -> int:
+    """Count added lines across hunks (lines starting with '+' but not '+++')."""
+    total = 0
+    for hunk in hunks:
+        for line in hunk.body.splitlines():
+            if line.startswith("+") and not line.startswith("+++"):
+                total += 1
+    return total
+
+
+def _high_risk_paths(hunks: list[Hunk], markers: tuple[str, ...]) -> tuple[str, ...]:
+    hits: list[str] = []
+    seen: set[str] = set()
+    for hunk in hunks:
+        path_l = hunk.path.lower()
+        if any(marker in path_l for marker in markers):
+            if hunk.path not in seen:
+                seen.add(hunk.path)
+                hits.append(hunk.path)
+    return tuple(hits)
+
+
+def _deep_sample_hits(pr_context: Optional[PrContext], sample_rate: float) -> bool:
+    """Deterministic sample so the same PR head does not flip-flop mid-retry."""
+    if sample_rate <= 0.0:
+        return False
+    if sample_rate >= 1.0:
+        return True
+    ctx = pr_context or {}
+    key = (
+        f"{ctx.get('repo', '')}:"
+        f"{ctx.get('pr_number', 0)}:"
+        f"{ctx.get('head_sha', '')}"
+    )
+    digest = hashlib.sha256(key.encode("utf-8")).digest()
+    bucket = int.from_bytes(digest[:8], "big") / float(1 << 64)
+    return bucket < sample_rate
+
+
+def _explicit_deep_request(pr_context: Optional[PrContext]) -> bool:
+    """Opt-in via title/body marker until label plumbing is wired."""
+    if not pr_context:
+        return False
+    blob = f"{pr_context.get('title') or ''}\n{pr_context.get('body') or ''}"
+    return bool(_DEEP_REVIEW_MARKER_RE.search(blob))
+
+
+@dataclass(frozen=True, slots=True)
+class DeepEscalationDecision:
+    """Whether tiered mode should spend the reasoner arm, and why."""
+
+    escalate: bool
+    reasons: tuple[str, ...]
+    added_lines: int
+
+
+def decide_deep_escalation(
+    hunks: list[Hunk],
+    pr_context: Optional[PrContext] = None,
+    *,
+    sample_rate: float | None = None,
+    diff_line_threshold: int | None = None,
+    path_markers: tuple[str, ...] | None = None,
+) -> DeepEscalationDecision:
+    """Pure escalation policy for tiered review (#645).
+
+    Injectable thresholds keep unit tests free of env mutation races.
+    """
+    rate = _deep_sample_rate() if sample_rate is None else sample_rate
+    threshold = (
+        _deep_diff_line_threshold()
+        if diff_line_threshold is None
+        else max(0, diff_line_threshold)
+    )
+    markers = _deep_path_markers() if path_markers is None else path_markers
+    added = _count_added_lines(hunks)
+    reasons: list[str] = []
+
+    if added >= threshold and threshold > 0:
+        reasons.append(f"diff_lines:{added}>={threshold}")
+
+    risky = _high_risk_paths(hunks, markers)
+    if risky:
+        reasons.append(f"high_risk_paths:{len(risky)}")
+
+    if _explicit_deep_request(pr_context):
+        reasons.append("explicit_deep_review")
+
+    if _deep_sample_hits(pr_context, rate):
+        reasons.append(f"sample:{rate}")
+
+    return DeepEscalationDecision(
+        escalate=bool(reasons),
+        reasons=tuple(reasons),
+        added_lines=added,
+    )
+
+
 def _review_diff_dispatch(
     hunks: list[Hunk],
     installation_id: int,
@@ -1633,20 +1809,19 @@ def _review_diff_dispatch(
     voice: VoiceSelection,
     cancel_event: threading.Event | None,
 ) -> LlmReviewResponse:
-    # Owned review ensemble, PRIMARY: coder arm (qwen3-coder-next) + reasoner
-    # arm (qwen3.5, always-hot on sparkicus), both via the Cave gateway. Deep
-    # runs both and merges (brain+hands); fast returns after the FIRST
-    # SUCCESSFUL arm - coder first so fast mode uses the code specialist,
-    # falling over to the reasoner only if the coder arm fails. No SaaS spend
-    # in the common case. If BOTH arms produce nothing usable, OpenRouter/
-    # Poolside step in below as a bounded last resort - see
+    # Owned review ensemble, PRIMARY: coder arm + optional reasoner arm via
+    # the Cave gateway. Modes (#645):
+    #   tiered (default) - coder always; reasoner only on escalation
+    #   deep - both concurrent, merge
+    #   fast - coder first; reasoner only if coder fails
+    # No SaaS spend in the common case. If Cave produces nothing usable,
+    # OpenRouter/Poolside step in below as a bounded last resort - see
     # _saas_overload_fallback_config.
-    review_backends: tuple[Backend, ...] = (Backend.CAVE, Backend.CAVE_REASONER)
-    depth = os.getenv("GRUG_REVIEW_DEPTH", "deep").strip().lower()
-    deep = depth != "fast"
-    # Deep is the production quality path and always uses the recall-oriented
-    # prompt. `fast` retains the experiment selector for rollback/comparison.
-    variant: PromptVariant = "v2" if deep else select_prompt_variant(installation_id)
+    depth = _review_depth()
+    # Recall-oriented v2 for tiered + deep; fast keeps the SSM experiment.
+    variant: PromptVariant = (
+        "v2" if depth != "fast" else select_prompt_variant(installation_id)
+    )
     messages = _build_messages(
         hunks, variant, file_contents, cross_file_contents, runtime_context,
         team_practices=_team_practices_block(pr_context),
@@ -1664,40 +1839,60 @@ def _review_diff_dispatch(
     first_parse_fail = None
     successes: list[_SuccessfulReview] = []
 
-    if deep:
-        # Deep mode needs BOTH arms unconditionally (findings are MERGED,
-        # never first-wins) -- running them concurrently does the exact
-        # same total work in wall-clock bounded by the SLOWER arm instead
-        # of their sum (was up to 2x330s sequential; now up to 330s).
-        # ThreadPoolExecutor.map preserves the INPUT order in its returned
-        # list regardless of which arm actually finishes first, so the
-        # processing loop below still sees (coder, reasoner) in that fixed
-        # order -- every downstream tie-break (first success wins
-        # successes[0], first parse failure recorded) is unchanged from the
-        # sequential version.
-        # `list(...)` is load-bearing, not decorative: it fully consumes
-        # `pool.map`'s (lazy) iterator BEFORE the `with` block exits, so
-        # every arm has actually completed and its outcome is captured
-        # here -- ThreadPoolExecutor.__exit__ also joins any still-running
-        # workers regardless, so this can't return early with a truncated
-        # result even without the explicit list() (belt-and-suspenders).
+    # run_both: concurrent dual-arm (deep always; tiered only when escalated).
+    # early_exit: return after first success (fast only).
+    # tiered without escalate runs coder alone - reasoner capacity stays free.
+    escalation: DeepEscalationDecision | None = None
+    if depth == "deep":
+        run_both = True
+        early_exit = False
+    elif depth == "tiered":
+        escalation = decide_deep_escalation(hunks, pr_context)
+        run_both = escalation.escalate
+        early_exit = not run_both
+        log.info(
+            "llm_tiered_escalation",
+            extra={
+                "escalate": escalation.escalate,
+                "reasons": list(escalation.reasons),
+                "added_lines": escalation.added_lines,
+                "installation_id": installation_id,
+                "repo": (pr_context or {}).get("repo"),
+                "pr_number": (pr_context or {}).get("pr_number"),
+            },
+        )
+    else:  # fast
+        run_both = False
+        early_exit = True
+
+    if run_both:
+        review_backends: tuple[Backend, ...] = (Backend.CAVE, Backend.CAVE_REASONER)
+        # Concurrent dual-arm: wall-clock bounded by the slower arm. Findings
+        # are MERGED (never first-wins). ThreadPoolExecutor.map preserves
+        # input order so downstream tie-breaks stay (coder, reasoner).
+        # `list(...)` fully consumes the lazy iterator before the with-block
+        # exits so both outcomes are captured.
         with ThreadPoolExecutor(max_workers=len(review_backends)) as pool:
             arm_outcomes = list(pool.map(
                 lambda b: _run_review_arm(b, messages, variant, pr_tags, cancel_event),
                 review_backends,
             ))
-    else:
-        # Fast mode deliberately stays sequential with a real early exit:
-        # it stops at the FIRST successful arm specifically so the second
-        # arm's Spark capacity is never spent at all, not merely to save
-        # time. Parallelizing here would burn both arms unconditionally,
-        # defeating that.
+    elif depth == "fast":
+        # Sequential coder -> reasoner with early exit so a healthy coder
+        # never spends the reasoner slot.
+        review_backends = (Backend.CAVE, Backend.CAVE_REASONER)
         arm_outcomes = []
         for backend in review_backends:
             outcome = _run_review_arm(backend, messages, variant, pr_tags, cancel_event)
             arm_outcomes.append(outcome)
             if outcome.kind == "success":
                 break
+    else:
+        # tiered, no escalate: coder only.
+        review_backends = (Backend.CAVE,)
+        arm_outcomes = [
+            _run_review_arm(Backend.CAVE, messages, variant, pr_tags, cancel_event),
+        ]
 
     for outcome in arm_outcomes:
         backend = outcome.backend
@@ -1723,7 +1918,7 @@ def _review_diff_dispatch(
                 ),
                 review_span_context=outcome.span_context,
             ))
-            if not deep:
+            if early_exit:
                 return LlmReviewResponse(
                     kind="reviewed",
                     findings=successes[0].findings,

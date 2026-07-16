@@ -280,19 +280,20 @@ readable by the Elder workloads; `code_reviewer_enabled=True` and
 `code_reviewer_blocking=False` on the test repo's RepoConfig (defaults).
 Production manifests must show `GRUG_ELDER_DURABLE_QUEUE=1` and
 `GRUG_ELDER_SETTLE_SECONDS=90` on `grug-webhook`, plus
-`GRUG_REVIEW_DEPTH=deep` and
-`GRUG_OPENROUTER_REVIEW_MODEL=anthropic/claude-opus-4.7` on both webhook and
-consumer.
+`GRUG_REVIEW_DEPTH=tiered` (or `deep` only during a deliberate dual-arm
+rollback) and `GRUG_OPENROUTER_REVIEW_MODEL=anthropic/claude-opus-4.7` on
+both webhook and consumer.
 
 **Steps:** open a small PR on a Grug-installed repo and leave its head unchanged
-for at least 90 seconds. Verify (1) webhook log `elder_review_enqueued`, (2)
-consumer log `elder_review_settling`, (3) two `elder_code_review` LLM-Obs spans,
-one for Poolside/Laguna and one for OpenRouter/Opus 4.7, and (4) the Elder
-check-run (`neutral` in advisory mode) plus any inline `(file, line)` findings.
-The consumer's `code_reviewer_dispatched` / `elder_review_durable_done` logs
-must carry the stable head and final result. Deep inference starts only after
-the quiet window, so a normal end-to-end check takes materially longer than
-the old single-pass ~30-second path.
+for at least the settle window. Verify (1) webhook log `elder_review_enqueued`,
+(2) consumer log `elder_review_settling`, (3) consumer log
+`llm_tiered_escalation` with `escalate=false` for ordinary small PRs and a
+single Cave coder `elder_code_review` span (reasoner only when escalate is
+true), and (4) the Elder check-run (`neutral` in advisory mode) plus any
+inline `(file, line)` findings. The consumer's `code_reviewer_dispatched` /
+`elder_review_durable_done` logs must carry the stable head and final result.
+Inference starts only after the quiet window (Swift Hunt shortens it for
+tiny PRs).
 
 **Failure-mode checks:** no check-run -> DD
 `@event:(code_review_fetch_or_parse_failed OR code_review_check_run_publish_failed OR code_review_degraded_publish_failed)`;
@@ -465,20 +466,24 @@ store failure retries the idempotent learning update on the next poll.
 
 ### Rollback
 
-For an immediate latency/cost rollback without disabling Elder, set
-`GRUG_REVIEW_DEPTH=fast` on **both** review-capable deployments:
+Production default is **tiered** (ADR-0019): single coder arm unless
+escalation fires. Rollbacks:
 
 ```bash
+# Max-recall dual-arm (old production default)
+kubectl -n grug set env deploy/grug-webhook deploy/grug-consumer \
+  GRUG_REVIEW_DEPTH=deep
+
+# Coder-only with reasoner only if coder fails (no sample deep)
 kubectl -n grug set env deploy/grug-webhook deploy/grug-consumer \
   GRUG_REVIEW_DEPTH=fast
+
 kubectl -n grug rollout status deploy/grug-webhook
 kubectl -n grug rollout status deploy/grug-consumer
 ```
 
-This restores one primary review backend with the other used only on failure;
-it does not change the judge, Teller, or `/grug ask` model. The manifest remains
-`deep`, so this live override is temporary and the next deploy restores deep
-mode unless the manifest is changed in a reviewed rollback.
+These do not change the judge, Teller, or `/grug ask` model. Live overrides
+are temporary unless the manifests in `k8s/*-deployment.yaml` match.
 
 If the durable queue path itself is the fault, remove
 `GRUG_ELDER_DURABLE_QUEUE` from the webhook deployment to use the compatibility

@@ -400,12 +400,96 @@ def test_deep_review_one_arm_reply_is_a_complete_review(monkeypatch) -> None:
     assert [finding.rule for finding in out.findings] == ["lost-error"]
 
 
-def test_review_depth_defaults_to_deep(monkeypatch) -> None:
+def test_review_depth_defaults_to_tiered_single_arm(monkeypatch) -> None:
+    """Unset depth = tiered: ordinary small diff spends only the coder arm."""
     monkeypatch.delenv("GRUG_REVIEW_DEPTH", raising=False)
+    monkeypatch.setenv("GRUG_DEEP_SAMPLE_RATE", "0")
+    monkeypatch.setenv("GRUG_DEEP_DIFF_LINES", "99999")
     response = httpx.Response(200, json=_openai_json_response('{"findings": []}'))
 
     with patch.object(httpx, "post", return_value=response) as post:
         out = review_diff([_hunk()], installation_id=1)
+
+    assert post.call_count == 1
+    assert out.backends_used == (Backend.CAVE,)
+
+
+def test_review_depth_deep_still_runs_both_arms(monkeypatch) -> None:
+    monkeypatch.setenv("GRUG_REVIEW_DEPTH", "deep")
+    response = httpx.Response(200, json=_openai_json_response('{"findings": []}'))
+
+    with patch.object(httpx, "post", return_value=response) as post:
+        out = review_diff([_hunk()], installation_id=1)
+
+    assert post.call_count == 2
+    assert out.backends_used == (Backend.CAVE, Backend.CAVE_REASONER)
+
+
+def test_decide_deep_escalation_diff_lines() -> None:
+    body = "@@ -1 +1 @@\n" + "\n".join(f"+line{i}" for i in range(10))
+    decision = lc.decide_deep_escalation(
+        [_hunk(body=body)],
+        sample_rate=0.0,
+        diff_line_threshold=5,
+        path_markers=(),
+    )
+    assert decision.escalate is True
+    assert decision.added_lines == 10
+    assert any(r.startswith("diff_lines:") for r in decision.reasons)
+
+
+def test_decide_deep_escalation_high_risk_path() -> None:
+    decision = lc.decide_deep_escalation(
+        [_hunk(path="services/auth/login.py")],
+        sample_rate=0.0,
+        diff_line_threshold=99999,
+        path_markers=("auth",),
+    )
+    assert decision.escalate is True
+    assert any(r.startswith("high_risk_paths:") for r in decision.reasons)
+
+
+def test_decide_deep_escalation_explicit_marker() -> None:
+    decision = lc.decide_deep_escalation(
+        [_hunk()],
+        pr_context={"title": "please deep-review this", "body": ""},
+        sample_rate=0.0,
+        diff_line_threshold=99999,
+        path_markers=(),
+    )
+    assert decision.escalate is True
+    assert "explicit_deep_review" in decision.reasons
+
+
+def test_decide_deep_escalation_sample_is_deterministic() -> None:
+    ctx = {"repo": "o/r", "pr_number": 7, "head_sha": "abc123"}
+    a = lc.decide_deep_escalation(
+        [_hunk()], pr_context=ctx, sample_rate=1.0,
+        diff_line_threshold=99999, path_markers=(),
+    )
+    b = lc.decide_deep_escalation(
+        [_hunk()], pr_context=ctx, sample_rate=1.0,
+        diff_line_threshold=99999, path_markers=(),
+    )
+    assert a.escalate is True and b.escalate is True
+    none = lc.decide_deep_escalation(
+        [_hunk()], pr_context=ctx, sample_rate=0.0,
+        diff_line_threshold=99999, path_markers=(),
+    )
+    assert none.escalate is False
+
+
+def test_tiered_escalates_on_risky_path_runs_both_arms(monkeypatch) -> None:
+    monkeypatch.setenv("GRUG_REVIEW_DEPTH", "tiered")
+    monkeypatch.setenv("GRUG_DEEP_SAMPLE_RATE", "0")
+    monkeypatch.setenv("GRUG_DEEP_DIFF_LINES", "99999")
+    response = httpx.Response(200, json=_openai_json_response('{"findings": []}'))
+
+    with patch.object(httpx, "post", return_value=response) as post:
+        out = review_diff(
+            [_hunk(path="pkg/crypto/keys.py")],
+            installation_id=1,
+        )
 
     assert post.call_count == 2
     assert out.backends_used == (Backend.CAVE, Backend.CAVE_REASONER)
