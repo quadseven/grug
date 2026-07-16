@@ -98,11 +98,11 @@ def adaptive_elder_settle_seconds(
     changed = max(0, changed)
     if changed == 0 and churn == 0:
         return base
-    # Swift Hunt: small, focused PR — start deep review immediately.
-    if changed <= 3 and churn <= 80:
+    # Swift Hunt: small, focused PR — start review immediately.
+    if changed <= 5 and churn <= 120:
         return 0
     # Steady Hunt: medium PR — short settle only.
-    if changed <= 8 and churn <= 300:
-        return min(base, 5)
+    if changed <= 12 and churn <= 400:
+        return min(base, 3)
     # Full Hunt: large / noisy PR — full quiet window.
     return base

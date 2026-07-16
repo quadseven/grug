@@ -95,14 +95,16 @@ spec:
             # needs to cover GitHub's normal read-after-write lag before the
             # very first check.
             - {name: GRUG_ELDER_DURABLE_QUEUE, value: "1"}
-            - {name: GRUG_ELDER_SETTLE_SECONDS, value: "10"}
+            # Base settle; Swift Hunt still zeros tiny PRs and caps medium at 5s.
+            - {name: GRUG_ELDER_SETTLE_SECONDS, value: "5"}
             # Keep review configuration on both Elder-capable workloads. The
             # Opus override is review-only; judge, Teller, and /grug ask retain
             # their existing lower-cost OpenRouter model configuration.
             # Tiered Elder (#645): see consumer-deployment for full comments.
             - {name: GRUG_REVIEW_DEPTH, value: tiered}
-            - {name: GRUG_DEEP_SAMPLE_RATE, value: "0.12"}
-            - {name: GRUG_DEEP_DIFF_LINES, value: "300"}
+            # Tighter deep escalation = less reasoner contention (speed).
+            - {name: GRUG_DEEP_SAMPLE_RATE, value: "0.05"}
+            - {name: GRUG_DEEP_DIFF_LINES, value: "500"}
             - {name: GRUG_DEEP_ASYNC, value: "1"}
             - {name: GRUG_OPENROUTER_REVIEW_MODEL, value: anthropic/claude-opus-4.7}
             - {name: GITHUB_APP_ID_SSM, value: /grug/github-app-id}

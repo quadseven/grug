@@ -52,9 +52,9 @@ def test_adaptive_settle_swift_for_tiny_pr():
     assert adaptive_elder_settle_seconds(pr, base_seconds=10) == 0
 
 
-def test_adaptive_settle_medium_caps_at_five():
+def test_adaptive_settle_medium_caps_at_three():
     pr = {"additions": 100, "deletions": 40, "changed_files": 6}
-    assert adaptive_elder_settle_seconds(pr, base_seconds=10) == 5
+    assert adaptive_elder_settle_seconds(pr, base_seconds=10) == 3
 
 
 def test_adaptive_settle_large_keeps_base():
