@@ -422,20 +422,33 @@ def _durable_elder_settle_seconds(pr: dict[str, Any]) -> int:
 
 
 
+def _elder_draft_skips_durable_enqueue(payload: dict[str, Any]) -> bool:
+    """Draft PRs must not consume the FIFO snapshot dedup key."""
+    pr = payload.get("pull_request") or {}
+    return bool(pr.get("draft", False)) and payload.get("action") != "ready_for_review"
+
+
+def _pr_churn(pr: dict[str, Any]) -> int | None:
+    try:
+        return int(pr.get("additions") or 0) + int(pr.get("deletions") or 0)
+    except (TypeError, ValueError):
+        return None
+
+
 def _enqueue_elder_durable(
     *, payload: dict[str, Any], delivery_id: str,
 ) -> bool:
     """Durable SQS path for Elder (draft skip, settle, enqueue, log)."""
-    pr = payload.get("pull_request") or {}
-    if bool(pr.get("draft", False)) and payload.get("action") != "ready_for_review":
-        # Do not consume SQS's five-minute snapshot dedup key for a
-        # draft. A later ready_for_review event can carry the exact
-        # same input and must still enqueue the first real review.
+    if _elder_draft_skips_durable_enqueue(payload):
+        # A later ready_for_review can carry the same input and must still
+        # enqueue the first real review.
         log.info(
             "elder_enqueue_draft_skipped",
             extra={"delivery_id": delivery_id},
         )
         return True
+
+    pr = payload.get("pull_request") or {}
     install_id, repo, pr_number = _pr_ids(payload)
     head_sha = str((pr.get("head") or {}).get("sha") or "")
     if not (install_id and repo and pr_number and head_sha):
@@ -444,8 +457,8 @@ def _enqueue_elder_durable(
             extra={"delivery_id": delivery_id},
         )
         raise ValueError("durable Elder enqueue requires complete PR identity")
-    settle_seconds = _durable_elder_settle_seconds(pr)
 
+    settle_seconds = _durable_elder_settle_seconds(pr)
     from rerun import enqueue_review  # type: ignore[attr-defined]
 
     enqueue_review(
@@ -458,12 +471,6 @@ def _enqueue_elder_durable(
         requested_body=str(pr.get("body") or ""),
         settle_seconds=settle_seconds,
     )
-    try:
-        churn: int | None = int(pr.get("additions") or 0) + int(
-            pr.get("deletions") or 0
-        )
-    except (TypeError, ValueError):
-        churn = None
     log.info(
         "elder_enqueue_durable",
         extra={
@@ -473,7 +480,7 @@ def _enqueue_elder_durable(
             "head_sha": head_sha[:8],
             "settle_seconds": settle_seconds,
             "changed_files": pr.get("changed_files"),
-            "churn": churn,
+            "churn": _pr_churn(pr),
         },
     )
     return True
