@@ -22,14 +22,14 @@
 Grug is a modular GitHub bot with focused **personas** across the SDLC. Four
 are enabled by default:
 
-- **Chief** (`Grug — Chief`) - plan readiness before the hunt leaves the cave
-- **Elder** (`Grug — Elder`) - durable Cave review with Markings, Lore, Omen
-- **Guard** (`Grug — Guard`) - cave-mouth security (SAST, secrets, SCA, IaC + Seer)
-- **Teller** (`Grug — Teller`) - tale of the hunt (walkthrough + mermaid map)
+- **Chief** (`Grug - Chief`) - plan readiness before the hunt leaves the cave
+- **Elder** (`Grug - Elder`) - durable Cave review with Markings, Lore, Omen
+- **Guard** (`Grug - Guard`) - cave-mouth security (SAST, secrets, SCA, IaC + Seer)
+- **Teller** (`Grug - Teller`) - tale of the hunt (walkthrough + mermaid map)
 
 **Smasher**, **Warder**, and **Pulse** are wired as opt-in tracers. Omen runtime
 signal already augments Elder where a repository-to-service mapping exists.
-Check titles use caveman names (`Grug — <Persona>`); legacy aliases dual-post
+Check titles use caveman names (`Grug - <Persona>`); legacy aliases dual-post
 during cutover so old required-status rulesets keep working.
 
 Grug live in GitHub. Grug post Check Runs. Grug never spam comments. **You ship. Grug guard.**
@@ -83,7 +83,7 @@ the adaptive quiet window:
 
 - **Swift Hunt settle** - tiny PRs skip the quiet wait; medium PRs settle a few
   seconds; large multi-file storms keep the full window. Elder posts an
-  `in_progress` `Grug — Elder` check the moment the durable job is
+  `in_progress` `Grug - Elder` check the moment the durable job is
   queued, so required-status rulesets show pending instead of "check missing".
 - **Tiered Cave review** (ADR-0019 / #645) - default is a single **coder** arm
   for ordinary PRs; the **reasoner** arm escalates only on large diffs,

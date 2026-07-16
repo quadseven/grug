@@ -317,7 +317,7 @@ function RepoRow({ repo, installId, onToggle, onGuardToggle, onFix, fixPending, 
   let enf: { cls: string; label: string; title: string } | null = null;
   if (on) {
     if (degraded && (state === "grug_managed" || state === "external")) enf = { cls: "unknown", label: "unconfirmed", title: "Last-known state — GitHub was rate-limited and couldn't confirm. Refresh to re-check." };
-    else if (state === "grug_managed") enf = { cls: "live", label: "ENFORCED", title: "Chief's plan check is REQUIRED to merge — a Grug-managed ruleset blocks PRs that fail Grug — Chief." };
+    else if (state === "grug_managed") enf = { cls: "live", label: "ENFORCED", title: "Chief's plan check is REQUIRED to merge — a Grug-managed ruleset blocks PRs that fail Grug - Chief." };
     else if (state === "external") enf = { cls: "live", label: "EXTERNAL", title: "The check is required by a non-Grug ruleset or branch protection." };
     else if (state === "none") enf = { cls: "warn", label: "⚠ not enforced", title: "Grug reviews PRs here, but its check is NOT required to merge — a failing PR can still be merged. Click 'fix' to make it required (blocking)." };
     else if (state === "unknown") enf = { cls: "unknown", label: "unknown", title: "Couldn't reach GitHub to determine enforcement. Refresh." };

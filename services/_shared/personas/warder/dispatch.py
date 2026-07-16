@@ -1,6 +1,6 @@
 """Warder persona dispatch (#471, epic #464 slice 7) - the release
 manager TRACER: on a PR merged to the default branch, post a
-"Grug — Warder" check-run with a drafted changelog (grouped from
+"Grug - Warder" check-run with a drafted changelog (grouped from
 Conventional-Commit prefixes since the last tag) and a semver hint.
 
 Seam choice (the spec's "pick ONE"): the MERGED-PR event
@@ -158,7 +158,7 @@ def dispatch_warder_release(
                 "kind": type(e).__name__,
             },
         )
-        title = "⚠️ Warder eyes clouded"
+        title = "WARN Warder eyes clouded"
         summary = (
             "Grug Warder could not read the marks (commit fetch failed). "
             "This only counsel — merge already done."

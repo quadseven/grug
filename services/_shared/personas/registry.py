@@ -127,7 +127,7 @@ REGISTRY: tuple[PersonaSpec, ...] = (
     PersonaSpec(
         key="tpm",
         canonical="chief",
-        check_run_name="Grug — Chief",
+        check_run_name="Grug - Chief",
         enabled_flag="tpm_enabled",
         enabled_default=True,
         blocking_flag=None,
@@ -140,7 +140,7 @@ REGISTRY: tuple[PersonaSpec, ...] = (
     PersonaSpec(
         key="code_reviewer",
         canonical="elder",
-        check_run_name="Grug — Elder",
+        check_run_name="Grug - Elder",
         enabled_flag="code_reviewer_enabled",
         enabled_default=True,
         blocking_flag="code_reviewer_blocking",
@@ -149,8 +149,8 @@ REGISTRY: tuple[PersonaSpec, ...] = (
         # in dispatch.py fails OPEN on any degraded review (LLM outage, parse
         # failure, empty/huge diff) -> neutral, never a block; and the block
         # clears when findings are fixed and re-pushed (Elder dedups + re-reviews).
-        # NOTE: GitHub only *enforces* the block if "Grug — Elder" (or the
-        # legacy alias "Grug — Code Review") is a REQUIRED status check -
+        # NOTE: GitHub only *enforces* the block if "Grug - Elder" (or the
+        # legacy alias "Grug - Code Review") is a REQUIRED status check -
         # the persona conclusion alone shows a red X but does not prevent merge.
         blocking_default=True,
         dispatch_style="async",
@@ -166,7 +166,7 @@ REGISTRY: tuple[PersonaSpec, ...] = (
     PersonaSpec(
         key="guard",
         canonical="guard",
-        check_run_name="Grug — Guard",
+        check_run_name="Grug - Guard",
         enabled_flag="guard_enabled",
         enabled_default=True,
         blocking_flag="guard_blocking",
@@ -179,7 +179,7 @@ REGISTRY: tuple[PersonaSpec, ...] = (
     PersonaSpec(
         key="warder",
         canonical="warder",
-        check_run_name="Grug — Warder",
+        check_run_name="Grug - Warder",
         enabled_flag="warder_enabled",
         enabled_default=False,  # tracer: opt-in per repo (#471)
         blocking_flag=None,
@@ -193,9 +193,9 @@ REGISTRY: tuple[PersonaSpec, ...] = (
     PersonaSpec(
         key="smasher",
         canonical="smasher",
-        # Matches the existing check-run family ("Grug — Guard" etc.) so the
+        # Matches the existing check-run family ("Grug - Guard" etc.) so the
         # checks group consistently in the GitHub UI.
-        check_run_name="Grug — Smasher",
+        check_run_name="Grug - Smasher",
         enabled_flag="smasher_enabled",
         enabled_default=False,  # execution tracer: opt-in per repo (#469)
         blocking_flag=None,     # mutation findings are inherently advisory
@@ -210,7 +210,7 @@ REGISTRY: tuple[PersonaSpec, ...] = (
         canonical="teller",
         # No real check-run posts (comment-only, like Pulse); this name is
         # the roster/Activity-feed identity record_check_verdict carries.
-        check_run_name="Grug — Teller",
+        check_run_name="Grug - Teller",
         enabled_flag="walkthrough_enabled",
         enabled_default=True,  # trial-harvest gap 1: default ON (#554, #522)
         blocking_flag=None,
@@ -223,7 +223,7 @@ REGISTRY: tuple[PersonaSpec, ...] = (
     PersonaSpec(
         key="pulse",
         canonical="pulse",
-        check_run_name="Grug — Pulse",
+        check_run_name="Grug - Pulse",
         enabled_flag="pulse_enabled",
         enabled_default=False,  # tracer: opt-in per repo (#472)
         blocking_flag=None,

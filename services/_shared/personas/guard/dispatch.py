@@ -4,7 +4,7 @@ The security suite that shipped INSIDE Elder - four deterministic
 candidate sources (SAST `sast.py`, dependency-CVE `sca.py`, committed
 secrets `secret_scan.py`, IaC misconfig `iac_scan.py`) feeding the ONE
 exploitability judge (`judge_candidates`) - now posts its OWN check-run
-("Grug — Guard") with its own advisory/blocking flag. Elder keeps the
+("Grug - Guard") with its own advisory/blocking flag. Elder keeps the
 LLM diff review; users can see, toggle, and (eventually) block on
 security findings separately.
 
@@ -59,31 +59,31 @@ _CHECK_NAME = CHECK_GUARD
 def _summary_markdown(evaluation: CodeReviewEvaluation) -> tuple[str, str]:
     """Guard-voice (title, summary) for the check-run output."""
     if evaluation.degraded_reason:
-        title = f"⚠️ Guard eyes clouded ({evaluation.degraded_reason})"
+        title = f"WARN Guard eyes clouded ({evaluation.degraded_reason})"
         return title, (
             "Grug Guard could not watch the pass this time. The mist: "
             f"`{evaluation.degraded_reason}`. This only counsel — merge "
             "not blocked."
         )
     if not evaluation.findings:
-        title = "✅ Guard find no evil"
+        title = "PASS Guard find no evil"
         return title, (
             "Grug Guard watch the diff for leaked secrets, weak code, sick "
             "dependencies, and open doors. Nothing evil pass. Guard nod."
         )
     severity_icon = {
-        "critical": "🛑", "high": "❌", "medium": "⚠️", "low": "ℹ️",
+        "critical": "BLOCK", "high": "FAIL", "medium": "WARN", "low": "info",
     }
     blocking = sum(
         1 for f in evaluation.findings if f.severity in ("high", "critical")
     )
     title = (
-        f"❌ Guard see evil — {blocking} blocking · "
+        f"FAIL Guard see evil - {blocking} blocking / "
         f"{len(evaluation.findings)} finding(s) in all"
     )
     rows = ["| Severity | File | Line | Rule | Message |", "|---|---|---|---|---|"]
     for f in evaluation.findings:
-        icon = severity_icon.get(f.severity, "•")
+        icon = severity_icon.get(f.severity, "-")
         rows.append(
             f"| {icon} {f.severity} | `{f.file}` | {f.line} | "
             f"`{f.rule_name}` | {f.message} |"

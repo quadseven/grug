@@ -82,11 +82,11 @@ def _summary(results: list[CheckResult]) -> tuple[str, str]:
     lines = ["| Check | Status | Detail |", "|---|---|---|"]
     for r in results:
         if r.passed:
-            icon = "✅"
+            icon = "pass"
         elif r.name in _ADVISORY_CHECKS:
-            icon = "⚠️"
+            icon = "warn"
         else:
-            icon = "❌"
+            icon = "fail"
         lines.append(f"| {r.name} | {icon} | {r.detail} |")
     return title, "\n".join(lines)
 

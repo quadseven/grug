@@ -321,7 +321,7 @@ def test_enforcement_pass_threads_stored_ruleset_id_per_repo(monkeypatch):
     repo's OWN stored enforcement_ruleset_id through to detect_enforcement
     - not None, and not another repo's ID - so a ruleset whose live name
     has drifted from the Grug prefix (the exact bug: "Grug TPM gate" vs
-    "Grug — ...") still gets found by ID."""
+    "Grug - ...") still gets found by ID."""
     detected_ids = []
 
     def _detect(token, owner, repo, branch, check_name, stored_ruleset_id=None):

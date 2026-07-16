@@ -93,7 +93,7 @@ def post_check_run(
     primary = resp.json()
 
     # Tribe nomenclature cutover: dual-post legacy titles (e.g. "Grug —
-    # Code Review" for "Grug — Elder") so required-status rulesets that
+    # Code Review" for "Grug - Elder") so required-status rulesets that
     # still name the old context keep working. Best-effort; primary win
     # already returned. Skip when the name has no aliases or IS an alias
     # (avoid infinite alias-of-alias posts).

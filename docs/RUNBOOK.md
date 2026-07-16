@@ -1,4 +1,4 @@
-# Grug — Operations Runbook
+# Grug - Operations Runbook
 
 Living doc for deploying, rotating secrets, debugging, and recovering grug.
 Updated as patterns lock in.

@@ -3,7 +3,7 @@
 ## Status
 
 Accepted (2026-06-06). Amended 2026-07-16: GitHub check-run titles are
-`Grug — <Caveman>` (Chief/Elder/…); SSOT in `personas/tribe.py`.
+`Grug - <Caveman>` (Chief/Elder/…); SSOT in `personas/tribe.py`.
 
 ## Context
 
@@ -46,9 +46,9 @@ The map (`tpm → Chief`, `code_reviewer → Elder`) was previously written **no
 
 ## Amendment (2026-07-16) — tribe check titles
 
-Product check-run names are now `Grug — Chief`, `Grug — Elder`, etc., matching
-dashboard and Activity. Legacy titles (`Grug — Definition of Ready`,
-`Grug — Code Review`) dual-post as alias status checks and remain accepted by
+Product check-run names are now `Grug - Chief`, `Grug - Elder`, etc., matching
+dashboard and Activity. Legacy titles (`Grug - Definition of Ready`,
+`Grug - Code Review`) dual-post as alias status checks and remain accepted by
 `detect_enforcement` so required-status rulesets do not brick merges mid-cutover.
 Capability voice: **Seer** (exploitability filter), **Omen**, **Lore**,
 **Markings**, **Cave**, hunt settle tiers.

@@ -17,7 +17,7 @@ import httpx
 
 _GH_API = "https://api.github.com"
 
-GRUG_RULESET_PREFIX = "Grug — "
+GRUG_RULESET_PREFIX = "Grug - "
 
 EnforcementState = Literal["grug_managed", "external", "none"]
 

@@ -25,7 +25,7 @@ def _ok_response(json_body=None):
 
 def test_post_check_run_url_and_auth():
     result = CheckRunResult(
-        name="Grug — Chief",
+        name="Grug - Chief",
         head_sha="abc123",
         status="completed",
         conclusion="success",
@@ -198,7 +198,7 @@ def test_post_check_run_truncates_oversize_summary():
     # multi-byte content: a byte-length truncation bug (vs char-length)
     # would only surface with non-ASCII input.
     result = CheckRunResult(
-        name="Grug — Elder", head_sha="a" * 40, status="completed",
+        name="Grug - Elder", head_sha="a" * 40, status="completed",
         conclusion="neutral", title="t", summary="日" * 70000,
     )
     with patch("httpx.post", side_effect=fake_post):
