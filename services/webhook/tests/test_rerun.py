@@ -908,3 +908,30 @@ def test_elder_check_already_terminal_treats_any_completed_conclusion(monkeypatc
         )
         assert reason is not None
         assert reason.startswith("already_completed_"), (conclusion, reason)
+
+
+def test_elder_check_already_terminal_accepts_legacy_alias(monkeypatch):
+    """Cutover: a completed legacy 'Grug - Code Review' still blocks re-post."""
+    def fake_get(url, **kwargs):
+        class Resp:
+            def raise_for_status(self):
+                return None
+
+            def json(self):
+                return {
+                    "check_runs": [
+                        {
+                            "name": "Grug - Code Review",
+                            "status": "completed",
+                            "conclusion": "success",
+                        }
+                    ]
+                }
+        return Resp()
+
+    monkeypatch.setattr(rerun, "with_install_token_retry", lambda iid, fn: fn("tok"))
+    monkeypatch.setattr(rerun.httpx, "get", fake_get)
+    reason = rerun._elder_check_already_terminal_or_pending(
+        install_id=1, owner="o", repo_name="r", head_sha="h" * 40,
+    )
+    assert reason == "already_completed_success"

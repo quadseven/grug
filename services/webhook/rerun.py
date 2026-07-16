@@ -162,10 +162,13 @@ def _elder_check_already_terminal_or_pending(
     it. Listing the latest check-run for this name+head is the ground truth.
     """
     def _do(token: str) -> str | None:
+        # List without check_name so legacy titles (Grug - Code Review /
+        # em-dash variants) still count as Elder during the nomenclature
+        # cutover; filter client-side with _ELDER_CHECK_NAMES.
         resp = httpx.get(
             f"{_GH_API}/repos/{quote(owner, safe='')}/{quote(repo_name, safe='')}"
             f"/commits/{quote(head_sha, safe='')}/check-runs",
-            params={"check_name": _ELDER_CHECK_NAME, "filter": "latest", "per_page": 10},
+            params={"filter": "latest", "per_page": 100},
             headers={
                 "Authorization": f"Bearer {token}",
                 "Accept": "application/vnd.github+json",
