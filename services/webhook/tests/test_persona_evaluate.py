@@ -82,7 +82,7 @@ def test_summary_pass_renders_check_count():
         CheckResult("acceptance", True, "3 bullets"),
     ]
     title, summary = persona._summary(results)
-    assert "Chief pass" in title or "✅" in title
+    assert "Hunt Plan ready" in title or "Chief pass" in title or "✅" in title
     assert "all 2 checks" in title
     assert "| why | ✅ |" in summary
 
@@ -94,7 +94,7 @@ def test_summary_fail_counts_blocking():
         CheckResult("estimate", False, "no Size"),
     ]
     title, summary = persona._summary(results)
-    assert "Chief hold" in title or "❌" in title
+    assert "Hunt Plan hold" in title or "Chief hold" in title or "❌" in title
     assert "2/3 plan checks fail" in title or "2/3 blocking" in title
     assert "| why | ✅ |" in summary
     assert "| acceptance | ❌ |" in summary
@@ -169,7 +169,7 @@ def test_summary_advisory_check_renders_warning_icon():
         CheckResult("issue-link", False, "no link"),
     ]
     title, summary = persona._summary(results)
-    assert "Chief pass" in title or "✅" in title  # overall pass (issue-link is advisory)
+    assert "Hunt Plan ready" in title or "Chief pass" in title or "✅" in title
     assert "⚠️" in summary
     assert "❌" not in summary
 
@@ -245,7 +245,7 @@ def test_publish_tpm_evaluation_posts_on_failure():
             )
 
     assert captured["conclusion"] == "failure"
-    assert "Chief hold" in captured["title"] or "❌" in captured["title"]
+    assert "Hunt Plan hold" in captured["title"] or "Chief hold" in captured["title"] or "❌" in captured["title"]
     assert out == {"persona": "tpm", "result": "fail"}
 
 

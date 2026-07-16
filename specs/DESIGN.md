@@ -19,8 +19,8 @@ The vocabulary used in `services/`, `infra/`, and `web/`. Terms map to identifie
 
 | Term | Definition |
 |---|---|
-| **Definition of Ready (DoR)** | The standard a PR description must meet before it can merge. Enforced as a set of `CheckResult`s combined into a single GitHub check-run named `Grug — Chief`. |
-| **DoR check** | Individual rule: `why`, `acceptance`, `estimate`, `scope-fence`, `issue-link`. Defined in [`services/_shared/personas/tpm/dor_checks.py`](services/_shared/personas/tpm/dor_checks.py) (shared - services/_shared/, ADR-0014). The five rule names are the prose label — there is no `DoRCheck` class; rules are functions returning `CheckResult`. |
+| **Hunt Plan** | Product name for Chief's PR-body gate (was industry jargon "Definition of Ready"). Enforced as plan checks rolled into `Grug — Chief`. Module path still `dor_checks.py`. |
+| **Plan check** | Individual Hunt Plan rule: `why`, `acceptance`, `estimate`, `scope-fence`, `issue-link`. Defined in [`services/_shared/personas/tpm/dor_checks.py`](services/_shared/personas/tpm/dor_checks.py). |
 | **CheckResult** | Outcome of one `DoR check` against one PR body. Frozen dataclass — fields `name: str`, `passed: bool`, `detail: str`. Pass/fail only — no third "warn" state. |
 | **TpmEvaluation** | Aggregate result of running all `DoR check`s against one PR. Frozen dataclass returned by `evaluate_pull_request(...)` in `personas/tpm/persona.py`. Composes into a `CheckRunResult` for GitHub. |
 | **CheckRunResult** | Frozen dataclass that maps directly onto GitHub's Checks API `POST /repos/{owner}/{repo}/check-runs` payload. Carries the `status=completed` ↔ `conclusion` cross-field invariant — enforced in `__post_init__`. See [`services/_shared/github_checks_client.py`](services/_shared/github_checks_client.py). |

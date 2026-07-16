@@ -46,6 +46,9 @@ LEGACY_RULESET_CHIEF = "Grug — TPM Enforcement"
 
 # --- Capability names (not full personas; product voice) --------------------
 
+# Chief's gate on PR body shape (was industry jargon "Definition of Ready").
+# Product surfaces say Hunt Plan; code still has dor_checks.py as the module.
+HUNT_PLAN = "Hunt Plan"
 # Exploitability filter for Guard/Elder findings (was "judge").
 SEER = "Seer"
 # Production-signal fusion into Elder (#470).

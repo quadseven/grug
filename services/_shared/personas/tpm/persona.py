@@ -75,9 +75,9 @@ def _summary(results: list[CheckResult]) -> tuple[str, str]:
     """Build (title, summary) markdown for the check-run output."""
     blocking = _blocking_failures(results)
     title = (
-        f"Chief pass — plan ready, all {len(results)} checks"
+        f"Hunt Plan ready — all {len(results)} checks"
         if not blocking
-        else f"Chief hold — {len(blocking)}/{len(results)} plan checks fail"
+        else f"Hunt Plan hold — {len(blocking)}/{len(results)} plan checks fail"
     )
     lines = ["| Check | Status | Detail |", "|---|---|---|"]
     for r in results:

@@ -61,17 +61,18 @@ pulumi up                   # provision AWS infra (SSM refs, SQS, KMS, DD monito
 # done. Grug guard now.
 ```
 
-## What Chief checks (Definition of Ready)
+## What Chief checks (Hunt Plan)
 
-Static checks on PR body — **4 blocking, 1 advisory:**
+Before the tribe leave the cave, Chief reads the **Hunt Plan** on the PR body —
+**4 blocking plan checks, 1 advisory:**
 
-| | Check | Pass when | Blocks? |
+| | Plan check | Pass when | Blocks? |
 |---|---|---|---|
-| ✅ | `why` | Has `## Why` (or `## Summary`) section ≥5 words | **yes** |
-| ✅ | `acceptance` | Has `## Acceptance criteria` (or `## Test plan`) with ≥3 bullets | **yes** |
-| ✅ | `estimate` | Body or label includes `Size: XS/S/M/L` (XL must be split) | **yes** |
-| ✅ | `scope-fence` | Has `## Out of scope` section | **yes** |
-| ⚠️ | `issue-link` | Body links an issue via `closes #N` | advisory |
+| yes | `why` | Has `## Why` (or `## Summary`) section, enough words to name the hunt | **yes** |
+| yes | `acceptance` | Has `## Acceptance criteria` (or `## Test plan`) with enough bullets | **yes** |
+| yes | `estimate` | Body or label includes `Size: XS/S/M/L` (XL must be split) | **yes** |
+| yes | `scope-fence` | Has `## Out of scope` section | **yes** |
+| soft | `issue-link` | Body links an issue via `closes #N` | advisory |
 
 ## What Elder and Guard check
 
@@ -156,7 +157,7 @@ PRD #21 + slice issues #22-#34 track v1.
 
 ## Contributing
 
-Issues + PRs welcome. Use the DoR template — Grug will gate your own PR. Fair is fair.
+Issues + PRs welcome. Use the Hunt Plan template — Grug will gate your own PR. Fair is fair.
 
 PR body must have `## Why`, `## Acceptance criteria`, `## Out of scope`, `Size:`, and `closes #N`.
 
