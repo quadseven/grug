@@ -466,7 +466,7 @@ def test_dispatch_truncated_files_logs_warning_and_hedges_the_comment(monkeypatc
 
     assert "walkthrough_file_fetch_capped" in caplog.text
     assert "at least 500" in posted["body"]
-    assert "sprawl wide" in posted["body"]
+    assert "File list is partial" in posted["body"]
 
 
 def test_dispatch_diff_fetch_failure_enqueues_self_recovery(monkeypatch):
