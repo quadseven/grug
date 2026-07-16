@@ -1900,3 +1900,18 @@ def test_summary_markdown_escapes_hostile_finding_fields():
     assert "`rule|withticks`" in summary
     assert "msg with \\| pipe and newline" in summary
     assert summary.count("| Severity | Effort | File | Line | Rule | Marking |") == 1
+
+
+def test_inline_comment_body_defuses_tilde_fences_in_message():
+    """A model message with ~~~ must not open a GFM fence in unfenced prose."""
+    from personas.code_reviewer.persona import Finding
+    f = Finding(
+        file="x.py", line=1, severity="high", rule_name="null-deref",
+        message="~~~\nsecret\n~~~", suggestion=None,
+    )
+    body = cr_dispatch._inline_comment_body(f)
+    # Prose head (before agent-prompt details) must not carry a live fence.
+    head = body.split("<details>", 1)[0]
+    assert "~~~" not in head
+    assert "**Where:**" in head
+    assert "<!-- grug-rule:null-deref -->" in body

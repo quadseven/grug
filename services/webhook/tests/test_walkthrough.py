@@ -147,12 +147,14 @@ def test_walkthrough_body_carries_marker_summary_table_diagram_effort():
     assert body.startswith(MARKER)
     assert "## Walkthrough" in body
     assert "Adds a guard clause." in body
-    assert "x.py" in body and "tweak" in body
+    assert "x.py" in body
+    assert "tweak" in body
     assert "```mermaid" in body
     assert "quick" in body
     assert "aaaaaaaaaaaa" in body  # truncated head sha
     # Detail is collapsed by default (short PR timeline).
-    assert "<details>" in body and "<summary>Changed files (1)</summary>" in body
+    assert "<details>" in body
+    assert "<summary>Changed files (1)</summary>" in body
     assert "<summary>Shape of the change</summary>" in body
     assert "deterministic sketch" not in body  # not degraded
 
@@ -311,3 +313,14 @@ def test_build_diagram_not_confused_by_directory_named_subgraph():
     assert diagram is not None
     from personas.walkthrough.mermaid import _is_balanced
     assert _is_balanced(diagram)
+
+
+def test_changed_files_table_escapes_html_that_could_close_details():
+    files = [FileStat(
+        path="a.py", additions=1, deletions=0,
+        summary="oops </details><script>x</script>",
+    )]
+    table = changed_files_table(files)
+    assert "</details>" not in table
+    assert "&lt;/details&gt;" in table
+    assert "&lt;script&gt;" in table

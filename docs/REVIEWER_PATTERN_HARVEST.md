@@ -30,6 +30,7 @@ harvest.
 ## Harvest by reviewer class (behavior, not branding)
 
 ### Dense inline analyst
+
 - Severity | effort | category header on every thread
 - Analysis chain in collapsible (scripts / evidence)
 - Autofix prompt for agent tools
@@ -41,6 +42,7 @@ prompt. Next: optional category dimension; never reopen a completed check on
 deduped enqueue (fixed this PR).
 
 ### Ticket-aware summary bot
+
 - Issue-comment PR summary with effort estimate and mermaid
 - Alternative-approach tradeoff table
 - Cross-file and confidence language
@@ -51,6 +53,7 @@ effort. Chief ticket compliance should keep linking closes #N. Elder Lore
 cites prior PR numbers - keep expanding ledger ingest.
 
 ### Workflow / secret surface hunter
+
 - High-severity "missing environment / secret not loaded" findings
 - Concrete suggested YAML patches
 - Short AI agent remediation block
@@ -73,3 +76,12 @@ own release/workflow shape. Do not fold into Elder Markings.
 - Living Markings: edit findings Resolved/Dismissed/Addressed (#556)
 - Call of the Elder: @grug interactive (#617)
 - Stronger Omen fusion when service map present (#346 pillar 2)
+
+
+## Harvest addendum (PR 643 bot rounds)
+
+- Treat any `status=completed` check as terminal when deciding whether to
+  post pending (not only success/failure allowlists).
+- Defuse both backtick and tilde fences in finding prose.
+- When putting model text inside HTML `<details>`, escape `<`/`>`/`&`.
+- Prefer collapsible detail blocks over always-open walls of table/mermaid.

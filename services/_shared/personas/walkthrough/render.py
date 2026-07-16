@@ -50,6 +50,19 @@ def _neutralize_headings(text: str) -> str:
     return _HEADING_RE.sub(lambda m: "\u200b" + m.group(1) + m.group(2), text)
 
 
+def _escape_html(text: str) -> str:
+    """Neutralize HTML specials in model-authored prose.
+
+    File blurbs sit inside <details> blocks; a raw </details> (or any
+    tag) would close the collapsible early and corrupt the comment.
+    """
+    return (
+        text.replace("&", "&amp;")
+        .replace("<", "&lt;")
+        .replace(">", "&gt;")
+    )
+
+
 def _escape_table_cell(text: str) -> str:
     """For a PLAIN-TEXT table cell (the Summary column): a bare `|` or
     newline lets model-authored text break the row into extra columns or
@@ -94,9 +107,9 @@ def changed_files_table(files: list[FileStat]) -> str:
     rows = ["| File | Summary | Changes |", "|---|---|---|"]
     for f in files[:_MAX_TABLE_ROWS]:
         path = _escape_code_span_cell(_neutralize_mentions(f.path))
-        summary = _escape_table_cell(_neutralize_mentions(
+        summary = _escape_html(_escape_table_cell(_neutralize_mentions(
             (f.summary or "")[:_MAX_FILE_SUMMARY_CHARS]
-        )) or "-"
+        ))) or "-"
         rows.append(f"| `{path}` | {summary} | +{f.additions}/-{f.deletions} |")
     table = "\n".join(rows)
     cut = len(files) - _MAX_TABLE_ROWS

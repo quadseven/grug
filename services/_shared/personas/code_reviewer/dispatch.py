@@ -540,12 +540,13 @@ def _details_block(summary: str, content: str) -> str:
 
 
 def _defused(prose: str) -> str:
-    """Neutralize fence-capable backtick runs in PROSE surfaces (comment
-    head, table cells): an unterminated ``` in a model message would open
-    a fence that swallows the rest of the body - including the dedup
-    marker and the suggestion block. Inline code spans (1-2 backticks)
-    render untouched."""
-    return re.sub(r"`{3,}", "``", prose)
+    """Neutralize fence-capable runs in PROSE surfaces (comment head,
+    table cells): an unterminated ``` or ~~~ in a model message would
+    open a fence that swallows the rest of the body - including the
+    dedup marker and the suggestion block. Inline code spans (1-2
+    backticks) render untouched."""
+    out = re.sub(r"`{3,}", "``", prose)
+    return re.sub(r"~{3,}", "~~", out)
 
 
 def _md_code_span(text: str) -> str:

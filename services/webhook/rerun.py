@@ -179,12 +179,10 @@ def _elder_check_already_terminal_or_pending(
             conclusion = str(run.get("conclusion") or "")
             if status in {"queued", "in_progress"}:
                 return f"already_{status}"
-            if status == "completed" and conclusion in {
-                "success", "failure", "neutral", "cancelled", "skipped", "timed_out",
-            }:
-                # A completed Elder check for this head means the durable
-                # lane already finished (or explicitly skipped). Do not
-                # reopen it as pending on a FIFO-deduped re-enqueue.
+            if status == "completed":
+                # Any completed conclusion is terminal (including
+                # action_required / stale). Creating a NEW in_progress run
+                # would reopen the required check with no worker guaranteed.
                 return f"already_completed_{conclusion or 'unknown'}"
         return None
 

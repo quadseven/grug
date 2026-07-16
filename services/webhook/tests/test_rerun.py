@@ -857,3 +857,54 @@ def test_run_one_dispatches_guard(monkeypatch):
     }))
     assert status == "dispatched"
     assert called["blocking"] is True
+
+
+def test_elder_check_already_terminal_treats_any_completed_conclusion(monkeypatch):
+    """action_required and stale are completed; do not reopen as in_progress."""
+    for conclusion in ("action_required", "stale", "success", ""):
+        captured = {}
+
+        def with_token(install_id, fn, _c=conclusion):
+            class Resp:
+                def raise_for_status(self):
+                    return None
+
+                def json(self):
+                    return {
+                        "check_runs": [
+                            {
+                                "name": "Grug — Code Review",
+                                "status": "completed",
+                                "conclusion": _c,
+                            }
+                        ]
+                    }
+
+            import httpx as _httpx
+            # inject via monkeypatch on httpx.get below
+            return fn("tok")
+
+        def fake_get(url, **kwargs):
+            class Resp:
+                def raise_for_status(self):
+                    return None
+
+                def json(self):
+                    return {
+                        "check_runs": [
+                            {
+                                "name": "Grug — Code Review",
+                                "status": "completed",
+                                "conclusion": conclusion,
+                            }
+                        ]
+                    }
+            return Resp()
+
+        monkeypatch.setattr(rerun, "with_install_token_retry", lambda iid, fn: fn("tok"))
+        monkeypatch.setattr(rerun.httpx, "get", fake_get)
+        reason = rerun._elder_check_already_terminal_or_pending(
+            install_id=1, owner="o", repo_name="r", head_sha="h" * 40,
+        )
+        assert reason is not None
+        assert reason.startswith("already_completed_"), (conclusion, reason)

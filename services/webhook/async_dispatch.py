@@ -421,6 +421,64 @@ def _durable_elder_settle_seconds(pr: dict[str, Any]) -> int:
     return adaptive_elder_settle_seconds(pr, base_seconds=settle_seconds)
 
 
+
+def _enqueue_elder_durable(
+    *, payload: dict[str, Any], delivery_id: str,
+) -> bool:
+    """Durable SQS path for Elder (draft skip, settle, enqueue, log)."""
+    pr = payload.get("pull_request") or {}
+    if bool(pr.get("draft", False)) and payload.get("action") != "ready_for_review":
+        # Do not consume SQS's five-minute snapshot dedup key for a
+        # draft. A later ready_for_review event can carry the exact
+        # same input and must still enqueue the first real review.
+        log.info(
+            "elder_enqueue_draft_skipped",
+            extra={"delivery_id": delivery_id},
+        )
+        return True
+    install_id, repo, pr_number = _pr_ids(payload)
+    head_sha = str((pr.get("head") or {}).get("sha") or "")
+    if not (install_id and repo and pr_number and head_sha):
+        log.warning(
+            "elder_enqueue_durable_missing_ids",
+            extra={"delivery_id": delivery_id},
+        )
+        raise ValueError("durable Elder enqueue requires complete PR identity")
+    settle_seconds = _durable_elder_settle_seconds(pr)
+
+    from rerun import enqueue_review  # type: ignore[attr-defined]
+
+    enqueue_review(
+        install_id=install_id,
+        repo=repo,
+        pr_number=pr_number,
+        requested_base_sha=str((pr.get("base") or {}).get("sha") or ""),
+        requested_head_sha=head_sha,
+        requested_title=str(pr.get("title") or ""),
+        requested_body=str(pr.get("body") or ""),
+        settle_seconds=settle_seconds,
+    )
+    try:
+        churn: int | None = int(pr.get("additions") or 0) + int(
+            pr.get("deletions") or 0
+        )
+    except (TypeError, ValueError):
+        churn = None
+    log.info(
+        "elder_enqueue_durable",
+        extra={
+            "delivery_id": delivery_id,
+            "repo": repo,
+            "pr": pr_number,
+            "head_sha": head_sha[:8],
+            "settle_seconds": settle_seconds,
+            "changed_files": pr.get("changed_files"),
+            "churn": churn,
+        },
+    )
+    return True
+
+
 def enqueue_elder_review(
     *, payload: dict[str, Any], delivery_id: str, blocking: bool,
 ) -> bool:
@@ -435,59 +493,7 @@ def enqueue_elder_review(
     """
     if os.getenv("GRUG_ELDER_DURABLE_QUEUE", "").lower() in {"1", "true", "yes"}:
         try:
-            pr = payload.get("pull_request") or {}
-            if bool(pr.get("draft", False)) and payload.get("action") != "ready_for_review":
-                # Do not consume SQS's five-minute snapshot dedup key for a
-                # draft. A later ready_for_review event can carry the exact
-                # same input and must still enqueue the first real review.
-                log.info(
-                    "elder_enqueue_draft_skipped",
-                    extra={"delivery_id": delivery_id},
-                )
-                return True
-            install_id, repo, pr_number = _pr_ids(payload)
-            head_sha = str(
-                (pr.get("head") or {}).get("sha")
-                or ""
-            )
-            if not (install_id and repo and pr_number and head_sha):
-                log.warning(
-                    "elder_enqueue_durable_missing_ids",
-                    extra={"delivery_id": delivery_id},
-                )
-                raise ValueError("durable Elder enqueue requires complete PR identity")
-            # Swift Hunt: base settle from env, then adaptive cap by PR size.
-            settle_seconds = _durable_elder_settle_seconds(pr)
-
-            from rerun import enqueue_review  # type: ignore[attr-defined]
-
-            enqueue_review(
-                install_id=install_id,
-                repo=repo,
-                pr_number=pr_number,
-                requested_base_sha=str((pr.get("base") or {}).get("sha") or ""),
-                requested_head_sha=head_sha,
-                requested_title=str(pr.get("title") or ""),
-                requested_body=str(pr.get("body") or ""),
-                settle_seconds=settle_seconds,
-            )
-            try:
-                _churn = int(pr.get("additions") or 0) + int(pr.get("deletions") or 0)
-            except (TypeError, ValueError):
-                _churn = None
-            log.info(
-                "elder_enqueue_durable",
-                extra={
-                    "delivery_id": delivery_id,
-                    "repo": repo,
-                    "pr": pr_number,
-                    "head_sha": head_sha[:8],
-                    "settle_seconds": settle_seconds,
-                    "changed_files": pr.get("changed_files"),
-                    "churn": _churn,
-                },
-            )
-            return True
+            return _enqueue_elder_durable(payload=payload, delivery_id=delivery_id)
         except Exception as e:  # noqa: BLE001 - normalize the retryable handoff error
             log.error(
                 "elder_enqueue_failed",
