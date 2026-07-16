@@ -83,7 +83,7 @@ _STALENESS_WATCH_INTERVAL_S = 10.0
 # REQUIRED status-check context on grug-gated repos. Posting it as
 # in_progress at enqueue time is what stops GitHub rulesets from treating a
 # multi-minute durable review as "required check never ran" (BLOCKED).
-# Accept legacy "Grug — Code Review" when listing existing runs mid-cutover.
+# Accept legacy "Grug - Code Review" when listing existing runs mid-cutover.
 _ELDER_CHECK_NAME = CHECK_ELDER
 _ELDER_CHECK_NAMES = frozenset(acceptable_check_names(CHECK_ELDER))
 
@@ -212,7 +212,7 @@ def _post_elder_in_progress_check(
     head_sha: str,
     settle_seconds: int,
 ) -> None:
-    """Best-effort: mark `Grug — Code Review` in_progress for this head.
+    """Best-effort: mark `Grug - Code Review` in_progress for this head.
 
     Elder is durable + settle-windowed; a deep review routinely takes minutes
     and can be mid-flight-cancelled/re-enqueued when base/title/body moves.
@@ -339,7 +339,7 @@ def enqueue_review(
     trusted as the source of review evidence.
 
     After a successful SQS send, posts a best-effort in_progress
-    `Grug — Code Review` check so required-status rulesets show pending
+    `Grug - Code Review` check so required-status rulesets show pending
     rather than "check never ran" while the durable lane works.
     """
     if not _RERUN_QUEUE_URL:
