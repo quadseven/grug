@@ -1,15 +1,18 @@
 """Synthetic long-context review fixtures for latency replay (#648).
 
 These are NOT quality ground truth — they exist to stress prefill + decode
-with Elder-shaped prompts (real `_build_messages` path). No secrets, no
-real hostnames, no customer code.
+with Elder-shaped prompts. No secrets, no real hostnames, no customer code.
+
+Uses llm_client._build_messages deliberately (same pattern as elder_eval /
+sast_benchmark runners): the harness must measure Elder's real prompt path,
+not a reimplementation that can drift.
 """
 
 from __future__ import annotations
 
 from dataclasses import dataclass
 
-from llm_client import Hunk, _build_messages
+from llm_client import Hunk, _build_messages  # noqa: PLC2701 - Elder path on purpose
 
 
 @dataclass(frozen=True, slots=True)

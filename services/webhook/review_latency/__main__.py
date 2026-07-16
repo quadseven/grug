@@ -109,9 +109,10 @@ def main(argv: list[str] | None = None) -> int:
         print(f"  {f.name}: ~{f.added_lines} added lines, {f.prompt_chars} prompt chars")
 
     all_trials = []
+    all_walls: dict[tuple[str, int], float] = {}
     for backend in backends:
         print(f"\n=== backend={backend.name} model={backend.model} ===")
-        trials = sweep(
+        trials, walls = sweep(
             backend,
             fixtures,
             levels,
@@ -119,27 +120,34 @@ def main(argv: list[str] | None = None) -> int:
             timeout_s=args.timeout_s,
         )
         all_trials.extend(trials)
+        all_walls.update(walls)
 
-    report = summarize_trials(all_trials)
+    report = summarize_trials(all_trials, cell_wall_s=all_walls)
     print()
     print(report.as_markdown())
 
     if args.json_path:
         path = Path(args.json_path)
-        payload = [
-            {
-                "concurrency": t.concurrency,
-                "fixture": t.fixture,
-                "backend": t.backend,
-                "ttft_s": t.ttft_s,
-                "complete_s": t.complete_s,
-                "parse_ok": t.parse_ok,
-                "errored": t.errored,
-                "prompt_chars": t.prompt_chars,
-                "response_chars": t.response_chars,
-            }
-            for t in all_trials
-        ]
+        payload = {
+            "cell_wall_s": {
+                f"{b}|c={c}": w for (b, c), w in sorted(all_walls.items())
+            },
+            "trials": [
+                {
+                    "concurrency": t.concurrency,
+                    "fixture": t.fixture,
+                    "backend": t.backend,
+                    "ttft_s": t.ttft_s,
+                    "complete_s": t.complete_s,
+                    "parse_ok": t.parse_ok,
+                    "errored": t.errored,
+                    "prompt_chars": t.prompt_chars,
+                    "response_chars": t.response_chars,
+                    "completion_tokens": t.completion_tokens,
+                }
+                for t in all_trials
+            ],
+        }
         path.write_text(json.dumps(payload, indent=2) + "\n", encoding="utf-8")
         print(f"Wrote {path}")
 
