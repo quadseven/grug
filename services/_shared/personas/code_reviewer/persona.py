@@ -47,8 +47,8 @@ assert frozenset(get_args(Severity)) == _BLOCKING_SEVERITIES | _ADVISORY_SEVERIT
 
 _DECLARATIVE_PATH_RE = re.compile(r"\.(?:ya?ml|json|toml)$", re.IGNORECASE)
 _STATIC_SCALAR_RE = re.compile(
-    r"^\s*[A-Za-z0-9_.\/-]+:\s*"
-    r"(?:[A-Za-z0-9_.\/-]+|['\"][^$'{\"}]*['\"])\s*$"
+    r"^\s*(?:[A-Za-z0-9_.\/-]+|\"[^\"]+\")\s*[:=]\s*"
+    r"(?:[A-Za-z0-9_.\/-]+|['\"][^$'{\"}]*['\"])\s*,?\s*$"
 )
 
 
