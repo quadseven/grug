@@ -2,8 +2,13 @@
 
 from __future__ import annotations
 
-from personas.code_reviewer.claim_check import scan_claim_checks
+from personas.code_reviewer.claim_check import (
+    filter_novel_claim_findings,
+    scan_claim_checks,
+    _added_lines,
+)
 from personas.code_reviewer.diff_parser import DiffHunk
+from personas.code_reviewer.persona import Finding
 
 
 def _hunk(path: str, start: int, added: list[str]) -> DiffHunk:
@@ -181,10 +186,54 @@ class TestIntraPrClaimConflict:
             ),
         )
         out = scan_claim_checks(hunks, {})
-        # Outliers vs mode: 5 appears once, 3 once - both are modes tied.
-        # Counter.most_common(1) picks one; the other is flagged.
-        assert len(out) >= 1
+        # Ties: both sides must be flagged (not mode-outliers only).
+        assert len(out) == 2
         assert all(f.rule_name == "doc-code-claim-drift" for f in out)
+        assert {f.line for f in out} == {10}
+
+
+class TestAddedLinesWalk:
+    def test_no_newline_marker_does_not_advance(self):
+        body = (
+            "@@ -1 +1 @@\n"
+            "+# caps medium at 5s\n"
+            "\\ No newline at end of file\n"
+            "+more\n"
+        )
+        h = DiffHunk(
+            file_path="x.yaml", new_start=1,
+            new_lines=frozenset({1, 2}), body=body,
+        )
+        lines = _added_lines(h)
+        assert lines == [(1, "# caps medium at 5s"), (2, "more")]
+
+    def test_plus_plus_content_is_added_line(self):
+        # Content that begins with ++ is still an added line (raw "+++foo").
+        body = "@@ -1 +1 @@\n+++not a file header, content\n"
+        h = DiffHunk(
+            file_path="x.txt", new_start=10,
+            new_lines=frozenset({10}), body=body,
+        )
+        lines = _added_lines(h)
+        assert lines == [(10, "++not a file header, content")]
+
+
+class TestFilterNovel:
+    def test_drops_duplicate_llm_anchor(self):
+        claim = Finding(
+            file="a.yaml", line=3, severity="medium",
+            rule_name="doc-code-claim-drift", message="m", suggestion=None,
+        )
+        prior = Finding(
+            file="a.yaml", line=3, severity="medium",
+            rule_name="doc-code-claim-drift", message="llm", suggestion=None,
+        )
+        assert filter_novel_claim_findings((claim,), (prior,)) == ()
+        other = Finding(
+            file="a.yaml", line=4, severity="medium",
+            rule_name="doc-code-claim-drift", message="m", suggestion=None,
+        )
+        assert filter_novel_claim_findings((claim, other), (prior,)) == (other,)
 
 
 class TestNonClaimNoise:

@@ -96,19 +96,26 @@ class _Claim:
 
 
 def _added_lines(hunk: DiffHunk) -> list[tuple[int, str]]:
-    """New-side (lineno, text) for each ADDED line in a hunk."""
+    """New-side (lineno, text) for each ADDED line in a hunk.
+
+    Unified-diff walk: advance only on added/context lines. Annotation
+    lines (backslash + " No newline at end of file") never advance. A raw
+    line starting with ``+`` is always an addition (including content that
+    itself begins with ``++``) - do not special-case ``+++`` as a header
+    inside the hunk body (file headers live outside DiffHunk.body).
+    """
     out: list[tuple[int, str]] = []
     lineno = hunk.new_start
     for raw in hunk.body.splitlines():
-        if raw.startswith(("@@", "+++", "---")):
-            continue
+        if raw.startswith("@@") or raw.startswith(chr(92)):
+            continue  # header / no-newline marker - no new-side advance
         if raw.startswith("+"):
             out.append((lineno, raw[1:]))
             lineno += 1
         elif raw.startswith("-"):
             continue
         else:
-            lineno += 1
+            lineno += 1  # context (leading space or empty)
     return out
 
 
@@ -331,19 +338,21 @@ def _intra_pr_settle_conflicts(
     claims: list[_Claim],
     seen: set[tuple[str, int, str]],
 ) -> list[Finding]:
-    """Flag ADDED settle claims that disagree with each other (no code facts)."""
+    """Flag ADDED settle claims that disagree with each other (no code facts).
+
+    When two or more distinct values appear, flag EVERY claim that
+    participates - not only outliers vs a mode (ties must not hide one side).
+    """
     settle_claims = [c for c in claims if c.kind == "settle_medium_cap"]
     if len(settle_claims) < 2:
         return []
-    counts = Counter(int(c.value) for c in settle_claims)  # type: ignore[arg-type]
-    if len(counts) < 2:
+    values = sorted({int(c.value) for c in settle_claims})  # type: ignore[arg-type]
+    if len(values) < 2:
         return []
-    mode_val, _ = counts.most_common(1)[0]
+    others = ", ".join(f"{v}s" for v in values)
     out: list[Finding] = []
     for claim in settle_claims:
         claimed = int(claim.value)  # type: ignore[arg-type]
-        if claimed == mode_val:
-            continue
         key = (claim.file, claim.line, "settle-conflict")
         if key in seen:
             continue
@@ -353,7 +362,7 @@ def _intra_pr_settle_conflicts(
                 claim,
                 (
                     f"PR comments disagree on medium settle cap: this line "
-                    f"says {claimed}s, other added comments say {mode_val}s. "
+                    f"says {claimed}s; added comments claim {others}. "
                     f"Align every claim with the code (`min(base, N)` in the "
                     f"settle helper)."
                 ),
@@ -391,3 +400,19 @@ def scan_claim_checks(
         findings.extend(_intra_pr_settle_conflicts(claims, seen))
 
     return tuple(findings)
+
+
+def filter_novel_claim_findings(
+    claim_findings: tuple[Finding, ...],
+    existing: tuple[Finding, ...],
+) -> tuple[Finding, ...]:
+    """Drop claim findings that duplicate an existing (file, line, rule) row.
+
+    Prevents double-publish when the LLM also emits doc-code-claim-drift on
+    the same anchor the deterministic scanner already flagged.
+    """
+    prior = {(f.file, f.line, f.rule_name) for f in existing}
+    return tuple(
+        f for f in claim_findings
+        if (f.file, f.line, f.rule_name) not in prior
+    )

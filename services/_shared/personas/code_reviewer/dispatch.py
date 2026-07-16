@@ -57,7 +57,10 @@ from personas.code_reviewer.diff_parser import (
 from personas.code_reviewer.precedent import (
     class_precision, match_precedent, render_precedent_note,
 )
-from personas.code_reviewer.claim_check import scan_claim_checks
+from personas.code_reviewer.claim_check import (
+    filter_novel_claim_findings,
+    scan_claim_checks,
+)
 from personas.code_reviewer.complexity import scan_complexity
 from personas.code_reviewer.cross_file import (
     extract_symbols, fetch_cross_file_context,
@@ -1655,6 +1658,10 @@ def dispatch_code_review(
             installation_id, owner, repo_name, head_sha, file_contents, hunks,
         )
         claim_findings = scan_claim_checks(hunks, claim_file_contents)
+        # Drop rows the LLM already published under the same rule/anchor.
+        claim_findings = filter_novel_claim_findings(
+            claim_findings, evaluation.findings,
+        )
     except Exception as e:  # noqa: BLE001 - enrichment must never abort a review
         log.info(
             "code_review_claim_check_failed",
