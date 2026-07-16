@@ -37,7 +37,7 @@ Open a fresh PR on the target repo. PR body should INTENTIONALLY miss
 DoR sections (e.g. drop the `## Why`) to confirm the FAILURE path
 works. Then update body with valid DoR sections to confirm SUCCESS.
 
-Look for `Grug — Definition of Ready` (no `Grug · DoR check / `
+Look for `Grug — Chief` (no `Grug · DoR check / `
 prefix — that prefix is the legacy reusable-workflow check name).
 
 ### 3. Update branch protection
@@ -53,7 +53,7 @@ gh api "repos/${REPO}/branches/main/protection/required_status_checks" \
 # add the App-posted name:
 gh api -X PATCH "repos/${REPO}/branches/main/protection/required_status_checks" \
   -f strict=true \
-  -f 'contexts[]=Grug — Definition of Ready' \
+  -f 'contexts[]=Grug — Chief' \
   -f 'contexts[]=<other context>' -f 'contexts[]=...'
   # ... keep DD/Snyk/etc. contexts from the snapshot above
 ```
@@ -72,7 +72,7 @@ git rm .github/workflows/grug.pr-gate.yml
 git commit -m "chore: cut over to grug.lol GitHub App
 
 Closes the migration off the legacy githumps/grug reusable workflow.
-The hosted App at grug.lol now posts the 'Grug — Definition of Ready'
+The hosted App at grug.lol now posts the 'Grug — Chief'
 check on every PR.
 
 Per githumps/grug Slice $SLICE_NUM cutover."
@@ -89,7 +89,7 @@ the cutover is verified.
 After merge:
 - Open another PR on the target → check-run should still post
 - `gh api repos/${REPO}/commits/<head_sha>/check-runs --jq '.check_runs[] | .name'`
-  should list `Grug — Definition of Ready` (no workflow-prefix)
+  should list `Grug — Chief` (no workflow-prefix)
 
 If anything broke, re-add `.github/workflows/grug.pr-gate.yml` from
 git history and revert step 3's branch protection change. Cutover is

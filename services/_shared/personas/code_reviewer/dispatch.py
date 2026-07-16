@@ -69,6 +69,7 @@ from personas.code_reviewer.persona import (
     CodeReviewEvaluation, Finding, evaluate_diff, with_extra_findings, with_findings,
 )
 from personas.code_reviewer.snapshot import review_snapshot_id_from_pr
+from personas.tribe import CHECK_ELDER
 from adapters.install_store import (  # type: ignore
     CommentFindingOrigin,
     put_comment_record,
@@ -83,7 +84,7 @@ log = logging.getLogger(f"{os.getenv('DD_SERVICE', 'grug')}.persona.code_reviewe
 _PERSONA = "Elder"
 _PERSONA_PORTRAIT = "https://grug.lol/assets/grug_elder.png"
 
-_CHECK_NAME = "Grug — Code Review"
+_CHECK_NAME = CHECK_ELDER
 # 10s (was 30s) — a GitHub diff fetch is fast; the over-generous 30s let a
 # hung fetch alone eat most of the webhook Lambda budget (#252). Well under
 # the 60s budget. NOTE: the FULL synchronous path (diff + review LLM + publish

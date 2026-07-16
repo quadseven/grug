@@ -24,6 +24,7 @@ import httpx
 
 from activity_log import record_check_verdict
 from adapters.install_store import claim_pulse_nudge, get_repo_config, release_pulse_nudge
+from personas.tribe import CHECK_CHIEF, acceptable_check_names
 
 log = logging.getLogger(f"{os.getenv('DD_SERVICE', 'grug')}.persona.pulse")
 
@@ -33,7 +34,8 @@ _MAX_NUDGES_PER_INSTALL_RUN = 3
 _MAX_REPOS_PER_INSTALL = 30
 _MAX_PRS_PER_REPO = 30
 _FETCH_TIMEOUT = 10
-_DOR_CHECK_NAME = "Grug — Definition of Ready"
+_DOR_CHECK_NAME = CHECK_CHIEF
+_DOR_CHECK_NAMES = frozenset(acceptable_check_names(CHECK_CHIEF))
 
 _NUDGE_BODY = (
     "Grug Pulse see this PR sleep {days} sunrises. Plan is ready (Chief "
@@ -118,7 +120,7 @@ def _dor_green(token: str, owner: str, repo: str, head_sha: str) -> bool:
     )
     resp.raise_for_status()
     for run in (resp.json() or {}).get("check_runs", []):
-        if run.get("name") == _DOR_CHECK_NAME:
+        if run.get("name") in _DOR_CHECK_NAMES:
             return run.get("conclusion") == "success"
     return False
 

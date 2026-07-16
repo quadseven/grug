@@ -25,10 +25,11 @@ import httpx
 from activity_log import record_check_verdict
 from github_app_auth import with_install_token_retry
 from github_checks_client import CheckRunResult, post_check_run
+from personas.tribe import CHECK_WARDER
 
 log = logging.getLogger(f"{os.getenv('DD_SERVICE', 'grug')}.persona.warder")
 
-_CHECK_NAME = "Grug — Warder"
+_CHECK_NAME = CHECK_WARDER
 _FETCH_TIMEOUT = 10
 # Conventional-Commit prefixes we group by; anything else lands in
 # "other" (the non-conventional degrade path).

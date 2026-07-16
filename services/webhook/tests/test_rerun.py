@@ -211,7 +211,7 @@ def test_enqueue_review_posts_in_progress_check_after_sqs(monkeypatch):
     assert posted["owner"] == "myorg"
     assert posted["repo"] == "myrepo"
     result = posted["result"]
-    assert result.name == "Grug — Code Review"
+    assert result.name == "Grug — Elder"
     assert result.head_sha == "head-123"
     assert result.status == "in_progress"
     assert result.conclusion is None
@@ -873,7 +873,7 @@ def test_elder_check_already_terminal_treats_any_completed_conclusion(monkeypatc
                     return {
                         "check_runs": [
                             {
-                                "name": "Grug — Code Review",
+                                "name": "Grug — Elder",
                                 "status": "completed",
                                 "conclusion": _c,
                             }
@@ -893,7 +893,7 @@ def test_elder_check_already_terminal_treats_any_completed_conclusion(monkeypatc
                     return {
                         "check_runs": [
                             {
-                                "name": "Grug — Code Review",
+                                "name": "Grug — Elder",
                                 "status": "completed",
                                 "conclusion": conclusion,
                             }

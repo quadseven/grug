@@ -2,7 +2,8 @@
 
 ## Status
 
-Accepted (2026-06-06)
+Accepted (2026-06-06). Amended 2026-07-16: GitHub check-run titles are
+`Grug — <Caveman>` (Chief/Elder/…); SSOT in `personas/tribe.py`.
 
 ## Context
 
@@ -40,9 +41,21 @@ The map (`tpm → Chief`, `code_reviewer → Elder`) was previously written **no
 
 - A full rename of `personas/tpm/` → `personas/chief/` (and `code_reviewer` → `elder`) lands — at which point the legacy keys disappear and this ADR's "two names" tension dissolves.
 - A roadmap persona (Guard/Smasher/Warder) ships and needs its own caveman↔key entry.
+- Check-run titles diverge from caveman names again (the 2026-07-16 tribe polish
+  closed the "Definition of Ready" / "Code Review" gap).
+
+## Amendment (2026-07-16) — tribe check titles
+
+Product check-run names are now `Grug — Chief`, `Grug — Elder`, etc., matching
+dashboard and Activity. Legacy titles (`Grug — Definition of Ready`,
+`Grug — Code Review`) dual-post as alias status checks and remain accepted by
+`detect_enforcement` so required-status rulesets do not brick merges mid-cutover.
+Capability voice: **Seer** (exploitability filter), **Omen**, **Lore**,
+**Markings**, **Cave**, hunt settle tiers.
 
 ## References
 
 - PRD #301 (Activity feed backend + re-run)
 - ADR-0001 (mirror discipline — the mapper is a mirrored boundary)
 - `CONTEXT.md` — `Persona`, `Chief`, `Elder`
+- `services/_shared/personas/tribe.py` — check-title SSOT

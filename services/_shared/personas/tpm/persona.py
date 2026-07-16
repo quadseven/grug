@@ -23,6 +23,7 @@ from dataclasses import dataclass
 from github_checks_client import CheckConclusion
 from personas.publish_check import PUBLISH_FAILED, publish_persona_check
 from personas.tpm.dor_checks import CheckResult, run_all
+from personas.tribe import CHECK_CHIEF
 
 
 @dataclass(frozen=True)
@@ -58,7 +59,7 @@ class TpmEvaluation:
 # one hardcoded per-service divergence in the mirror set (ADR-0014).
 log = logging.getLogger(f"{os.getenv('DD_SERVICE', 'grug')}.persona.tpm")
 
-_CHECK_NAME = "Grug — Definition of Ready"
+_CHECK_NAME = CHECK_CHIEF
 _ADVISORY_CHECKS: frozenset[str] = frozenset({"issue-link"})
 
 
@@ -74,9 +75,9 @@ def _summary(results: list[CheckResult]) -> tuple[str, str]:
     """Build (title, summary) markdown for the check-run output."""
     blocking = _blocking_failures(results)
     title = (
-        f"✅ DoR pass — all {len(results)} checks"
+        f"Chief pass — plan ready, all {len(results)} checks"
         if not blocking
-        else f"❌ DoR fail — {len(blocking)}/{len(results)} blocking"
+        else f"Chief hold — {len(blocking)}/{len(results)} plan checks fail"
     )
     lines = ["| Check | Status | Detail |", "|---|---|---|"]
     for r in results:

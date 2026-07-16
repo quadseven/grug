@@ -290,23 +290,35 @@ def get_ruleset(
     return resp.json()
 
 
+def _acceptable_names(check_name: str) -> tuple[str, ...]:
+    """Primary check title plus cutover aliases (tribe nomenclature)."""
+    try:
+        from personas.tribe import acceptable_check_names
+        return acceptable_check_names(check_name)
+    except Exception:  # noqa: BLE001 - rulesets client must not depend on tribe import
+        return (check_name,)
+
+
 def _check_name_in_ruleset(ruleset: dict, check_name: str) -> bool:
-    """Return True if any required_status_checks rule in the ruleset matches check_name."""
+    """Return True if any required_status_checks rule matches primary or alias."""
+    names = set(_acceptable_names(check_name))
     for rule in ruleset.get("rules", []):
         if rule.get("type") != "required_status_checks":
             continue
         for check in rule.get("parameters", {}).get("required_status_checks", []):
-            if check.get("context") == check_name:
+            if check.get("context") in names:
                 return True
     return False
 
 
 def _check_name_in_legacy(legacy_data: dict, check_name: str) -> bool:
     """Check both legacy ``contexts`` and newer ``checks`` array formats."""
-    if check_name in legacy_data.get("contexts", []):
-        return True
+    names = set(_acceptable_names(check_name))
+    for ctx in legacy_data.get("contexts", []):
+        if ctx in names:
+            return True
     for check in legacy_data.get("checks", []):
-        if isinstance(check, dict) and check.get("context") == check_name:
+        if isinstance(check, dict) and check.get("context") in names:
             return True
     return False
 

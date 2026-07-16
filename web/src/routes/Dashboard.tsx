@@ -42,11 +42,13 @@ const PANELS: { id: Panel; idx: string; label: string; badge?: string }[] = [
 ];
 
 const PERSONAS = [
-  { id: "smasher", code: "F-01", name: "Smasher", img: "grug_smasher.png", desc: "Static analysis + symbolic exec + LLM diff review. Null-derefs, races, off-by-ones.", meta: ["static analysis", "diff review"] },
-  { id: "guard", code: "F-02", name: "Guard", img: "grug_guard.png", desc: "SCA, secret scanning, SAST on the diff, hourly CVE feed. Evil shall not pass.", meta: ["SCA + secrets", "SAST on diff"] },
-  { id: "elder", code: "F-03", name: "Elder", img: "grug_elder.png", desc: "Line-by-line review for naming, complexity, coverage, dead code.", meta: ["BYO model key", "inline suggestions"] },
-  { id: "chief", code: "F-04", name: "Chief", img: "grug_chief.png", desc: "Definition-of-Ready on every PR. Acceptance criteria, estimate, rollback plan.", meta: ["5 checks", "strict mode"] },
-  { id: "warder", code: "F-05", name: "Warder", img: "grug_mystic.png", desc: "Ward off bad release. Auto-changelog, semver hint, deploy gate.", meta: ["beta", "coming soon"], soon: true },
+  { id: "smasher", code: "F-01", name: "Smasher", img: "grug_smasher.png", desc: "Hunt bugs that hide. Mutate markings, run the tribe's own tests, name what still lives.", meta: ["mutation trial", "diff-scoped"] },
+  { id: "guard", code: "F-02", name: "Guard", img: "grug_guard.png", desc: "Watch the cave mouth. Secrets, sick deps, weak IaC, SAST. Evil shall not pass.", meta: ["SCA + secrets", "SAST on diff"] },
+  { id: "elder", code: "F-03", name: "Elder", img: "grug_elder.png", desc: "Read markings one line at a time. Name the bad omen before it bite. Lore + Omen fused.", meta: ["Cave review", "Markings Board"] },
+  { id: "chief", code: "F-04", name: "Chief", img: "grug_chief.png", desc: "Before the hunt, Chief ask: plan have name? meat counted? path home known?", meta: ["plan checks", "strict mode"] },
+  { id: "teller", code: "F-05", name: "Teller", img: "grug_smile.png", desc: "Tell the tale of the hunt before Elder judge. Walkthrough, map, effort chip.", meta: ["walkthrough", "mermaid"] },
+  { id: "warder", code: "F-06", name: "Warder", img: "grug_mystic.png", desc: "Shaman at the gate. Changelog scroll, semver hint, ward bad release from tribe.", meta: ["beta", "release scroll"] },
+  { id: "pulse", code: "F-07", name: "Pulse", img: "grug_mullet.png", desc: "Walk the camp at night. Poke sleeping hunts Chief already blessed.", meta: ["stale nudge", "scheduled"] },
 ] as const;
 
 const SKINS = [
@@ -315,7 +317,7 @@ function RepoRow({ repo, installId, onToggle, onGuardToggle, onFix, fixPending, 
   let enf: { cls: string; label: string; title: string } | null = null;
   if (on) {
     if (degraded && (state === "grug_managed" || state === "external")) enf = { cls: "unknown", label: "unconfirmed", title: "Last-known state — GitHub was rate-limited and couldn't confirm. Refresh to re-check." };
-    else if (state === "grug_managed") enf = { cls: "live", label: "ENFORCED", title: "Grug's DoR check is REQUIRED to merge — a Grug-managed ruleset blocks PRs that fail it." };
+    else if (state === "grug_managed") enf = { cls: "live", label: "ENFORCED", title: "Chief's plan check is REQUIRED to merge — a Grug-managed ruleset blocks PRs that fail Grug — Chief." };
     else if (state === "external") enf = { cls: "live", label: "EXTERNAL", title: "The check is required by a non-Grug ruleset or branch protection." };
     else if (state === "none") enf = { cls: "warn", label: "⚠ not enforced", title: "Grug reviews PRs here, but its check is NOT required to merge — a failing PR can still be merged. Click 'fix' to make it required (blocking)." };
     else if (state === "unknown") enf = { cls: "unknown", label: "unknown", title: "Couldn't reach GitHub to determine enforcement. Refresh." };
@@ -329,7 +331,7 @@ function RepoRow({ repo, installId, onToggle, onGuardToggle, onFix, fixPending, 
       {on && state === "none" && !fixPending && <button className="fixbtn" onClick={onFix} title="Create a branch ruleset that REQUIRES Grug's check to pass before a PR can merge.">fix</button>}
       {fixPending && <span className="state paused">fixing…</span>}
       {fixError && !fixPending && <span className="fixerr" title={fixError}>⚠ fix failed</span>}
-      <span className={`state ${guardOn ? "live" : "paused"}`} title={guardOn ? "GUARD ON: the security suite (secrets, SAST, dependency CVEs, IaC) posts its own 'Grug — Guard' check-run on every PR here." : "GUARD OFF: no security check-run on this repo's PRs."}>{guardOn ? "GUARD" : "GUARD OFF"}</span>
+      <span className={`state ${guardOn ? "live" : "paused"}`} title={guardOn ? "GUARD ON: Guard watches the cave mouth (secrets, SAST, sick deps, IaC) on every PR." : "GUARD OFF: no Guard check-run on this repo's PRs."}>{guardOn ? "GUARD" : "GUARD OFF"}</span>
       <div className={`sw${guardOn ? " on" : ""}`} onClick={() => onGuardToggle(!guardOn)} role="switch" aria-checked={guardOn} title="Toggle the Guard (security) persona for this repo"></div>
       <span className={`state ${on ? "live" : "paused"}`} title={on ? "GUARDED: Grug watches this repo and posts a Check Run on every PR. Toggle off to silence Grug here." : "PAUSED: Grug is asleep on this repo. Toggle on to guard it."}>{on ? "GUARDED" : "PAUSED"}</span>
       <div className={`sw${on ? " on" : ""}`} onClick={() => onToggle(!on)} role="switch" aria-checked={on}></div>
@@ -502,7 +504,15 @@ function AccountPanel({ show, me, pauseAll, setPause }: { show: boolean; me: { l
   );
 }
 
-const _PERSONA_LABEL: Record<string, string> = { chief: "Chief", elder: "Elder" };
+const _PERSONA_LABEL: Record<string, string> = {
+  chief: "Chief",
+  elder: "Elder",
+  guard: "Guard",
+  teller: "Teller",
+  warder: "Warder",
+  smasher: "Smasher",
+  pulse: "Pulse",
+};
 const _VERDICT_SYM: Record<string, string> = { block: "×", warn: "!", pass: "✓", errored: "‼" };
 
 function ActivityPanel({ show, installId }: { show: boolean; installId?: number }) {

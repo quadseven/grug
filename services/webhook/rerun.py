@@ -45,6 +45,7 @@ from personas.code_reviewer.snapshot import (
 from personas.guard.dispatch import dispatch_guard_review
 from personas.smasher.dispatch import dispatch_smasher_review
 from personas.walkthrough.dispatch import dispatch_walkthrough_review
+from personas.tribe import CHECK_ELDER, acceptable_check_names
 from rerun_personas import (
     GUARD as _GUARD,
     RERUNNABLE as _RERUNNABLE,
@@ -82,7 +83,9 @@ _STALENESS_WATCH_INTERVAL_S = 10.0
 # REQUIRED status-check context on grug-gated repos. Posting it as
 # in_progress at enqueue time is what stops GitHub rulesets from treating a
 # multi-minute durable review as "required check never ran" (BLOCKED).
-_ELDER_CHECK_NAME = "Grug — Code Review"
+# Accept legacy "Grug — Code Review" when listing existing runs mid-cutover.
+_ELDER_CHECK_NAME = CHECK_ELDER
+_ELDER_CHECK_NAMES = frozenset(acceptable_check_names(CHECK_ELDER))
 
 
 @dataclass(frozen=True, slots=True)
@@ -173,7 +176,7 @@ def _elder_check_already_terminal_or_pending(
         resp.raise_for_status()
         runs = (resp.json() or {}).get("check_runs") or []
         for run in runs:
-            if str(run.get("name") or "") != _ELDER_CHECK_NAME:
+            if str(run.get("name") or "") not in _ELDER_CHECK_NAMES:
                 continue
             status = str(run.get("status") or "")
             conclusion = str(run.get("conclusion") or "")

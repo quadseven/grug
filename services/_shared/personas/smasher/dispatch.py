@@ -44,10 +44,11 @@ from personas.code_reviewer.persona import (
     with_findings,
 )
 from personas.smasher.sandbox import SurvivedMutant, TrialResult, extract_target_lines
+from personas.tribe import CHECK_SMASHER
 
 log = logging.getLogger(f"{os.getenv('DD_SERVICE', 'grug')}.persona.smasher")
 
-_CHECK_NAME = "Grug — Smasher"
+_CHECK_NAME = CHECK_SMASHER
 
 # Trial budgets (ADR-0013 kill switches). The total budget is ALSO enforced by
 # the Job's activeDeadlineSeconds (the kubelet-level hard stop); these bound the

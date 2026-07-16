@@ -19,10 +19,20 @@ from github_rulesets_client import (
     list_rulesets,
 )
 
+from personas.tribe import (
+    CHECK_CHIEF,
+    LEGACY_RULESET_CHIEF,
+    RULESET_CHIEF,
+)
+
 log = logging.getLogger("grug.enforcement")
 
-GRUG_TPM_RULESET_NAME = "Grug — TPM Enforcement"
-GRUG_DOR_CHECK_NAME = "Grug — Definition of Ready"
+# Canonical tribe names (personas.tribe). Legacy aliases re-exported so
+# existing imports keep working during the cutover.
+GRUG_TPM_RULESET_NAME = RULESET_CHIEF
+GRUG_DOR_CHECK_NAME = CHECK_CHIEF
+# Back-compat spellings for scripts / tests that imported the old literals.
+LEGACY_TPM_RULESET_NAME = LEGACY_RULESET_CHIEF
 
 
 def ensure_enforcement(

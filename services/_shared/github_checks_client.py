@@ -90,4 +90,36 @@ def post_check_run(
         timeout=10,
     )
     resp.raise_for_status()
-    return resp.json()
+    primary = resp.json()
+
+    # Tribe nomenclature cutover: dual-post legacy titles (e.g. "Grug —
+    # Code Review" for "Grug — Elder") so required-status rulesets that
+    # still name the old context keep working. Best-effort; primary win
+    # already returned. Skip when the name has no aliases or IS an alias
+    # (avoid infinite alias-of-alias posts).
+    try:
+        from personas.tribe import check_aliases, primary_check_name
+        if primary_check_name(result.name) != result.name:
+            return primary  # this post is already a legacy mirror
+        for alias in check_aliases(result.name):
+            alias_body = dict(body)
+            alias_body["name"] = alias
+            if external_id:
+                alias_body["external_id"] = f"{external_id}:legacy"
+            alias_resp = httpx.post(
+                f"{_GH_API}/repos/{quote(owner, safe='')}/{quote(repo, safe='')}/check-runs",
+                json=alias_body,
+                headers={
+                    "Authorization": f"Bearer {install_token}",
+                    "Accept": "application/vnd.github+json",
+                    "X-GitHub-Api-Version": "2022-11-28",
+                },
+                timeout=10,
+            )
+            # Soft-fail alias: do not raise on 4xx/5xx for the mirror.
+            if alias_resp.status_code >= 400:
+                continue
+    except Exception:  # noqa: BLE001 - cutover insurance never blocks primary
+        pass
+
+    return primary

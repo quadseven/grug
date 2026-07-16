@@ -142,7 +142,7 @@ def test_publish_failure_records_check_publish_failed_and_returns_publish_failed
     out = publish_persona_check(
         persona_key="code_reviewer",
         persona_prefix="cr",
-        check_name="Grug — Code Review",
+        check_name="Grug — Elder",
         installation_id=1,
         owner="o",
         repo="r",
@@ -406,7 +406,7 @@ def test_non_httpx_exception_from_auth_chain_still_records_honest_verdict(monkey
     out = publish_check.publish_persona_check(
         persona_key="tpm",
         persona_prefix="tpm",
-        check_name="Grug — Definition of Ready",
+        check_name="Grug — Chief",
         installation_id=1,
         owner="o",
         repo="r",

@@ -127,7 +127,7 @@ REGISTRY: tuple[PersonaSpec, ...] = (
     PersonaSpec(
         key="tpm",
         canonical="chief",
-        check_run_name="Grug — Definition of Ready",
+        check_run_name="Grug — Chief",
         enabled_flag="tpm_enabled",
         enabled_default=True,
         blocking_flag=None,
@@ -140,7 +140,7 @@ REGISTRY: tuple[PersonaSpec, ...] = (
     PersonaSpec(
         key="code_reviewer",
         canonical="elder",
-        check_run_name="Grug — Code Review",
+        check_run_name="Grug — Elder",
         enabled_flag="code_reviewer_enabled",
         enabled_default=True,
         blocking_flag="code_reviewer_blocking",
@@ -149,10 +149,9 @@ REGISTRY: tuple[PersonaSpec, ...] = (
         # in dispatch.py fails OPEN on any degraded review (LLM outage, parse
         # failure, empty/huge diff) -> neutral, never a block; and the block
         # clears when findings are fixed and re-pushed (Elder dedups + re-reviews).
-        # NOTE: GitHub only *enforces* the block if "Grug - Code Review" is a
-        # REQUIRED status check in each repo's ruleset (managed via Pulumi in the
-        # infra-github project) - the persona conclusion alone shows a red X but
-        # does not prevent the merge button.
+        # NOTE: GitHub only *enforces* the block if "Grug — Elder" (or the
+        # legacy alias "Grug — Code Review") is a REQUIRED status check -
+        # the persona conclusion alone shows a red X but does not prevent merge.
         blocking_default=True,
         dispatch_style="async",
         # "enabled": Elder reviews EVERY repo the app is installed on, even with

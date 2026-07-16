@@ -82,7 +82,7 @@ def test_summary_pass_renders_check_count():
         CheckResult("acceptance", True, "3 bullets"),
     ]
     title, summary = persona._summary(results)
-    assert "✅" in title
+    assert "Chief pass" in title or "✅" in title
     assert "all 2 checks" in title
     assert "| why | ✅ |" in summary
 
@@ -94,8 +94,8 @@ def test_summary_fail_counts_blocking():
         CheckResult("estimate", False, "no Size"),
     ]
     title, summary = persona._summary(results)
-    assert "❌" in title
-    assert "2/3 blocking" in title
+    assert "Chief hold" in title or "❌" in title
+    assert "2/3 plan checks fail" in title or "2/3 blocking" in title
     assert "| why | ✅ |" in summary
     assert "| acceptance | ❌ |" in summary
 
@@ -159,7 +159,7 @@ def test_evaluate_mixed_advisory_and_blocking_failure():
     assert scope.passed is False
     assert link.passed is False
     title, summary = persona._summary(list(evaluation.results))
-    assert "1/5 blocking" in title  # only scope-fence counts, not issue-link
+    assert "1/5 plan checks fail" in title or "1/5 blocking" in title
 
 
 def test_summary_advisory_check_renders_warning_icon():
@@ -169,7 +169,7 @@ def test_summary_advisory_check_renders_warning_icon():
         CheckResult("issue-link", False, "no link"),
     ]
     title, summary = persona._summary(results)
-    assert "✅" in title  # overall pass (issue-link is advisory)
+    assert "Chief pass" in title or "✅" in title  # overall pass (issue-link is advisory)
     assert "⚠️" in summary
     assert "❌" not in summary
 
@@ -245,7 +245,7 @@ def test_publish_tpm_evaluation_posts_on_failure():
             )
 
     assert captured["conclusion"] == "failure"
-    assert "❌" in captured["title"]
+    assert "Chief hold" in captured["title"] or "❌" in captured["title"]
     assert out == {"persona": "tpm", "result": "fail"}
 
 
@@ -266,7 +266,7 @@ def test_publish_tpm_evaluation_uses_grug_check_name():
 
     # Branch protection ruleset relies on this exact string. Drift = silent
     # cutover regression.
-    assert captured["name"] == "Grug — Definition of Ready"
+    assert captured["name"] == "Grug — Chief"
 
 
 def test_publish_tpm_evaluation_external_id_format():

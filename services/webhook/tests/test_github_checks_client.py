@@ -25,7 +25,7 @@ def _ok_response(json_body=None):
 
 def test_post_check_run_url_and_auth():
     result = CheckRunResult(
-        name="Grug — Definition of Ready",
+        name="Grug — Chief",
         head_sha="abc123",
         status="completed",
         conclusion="success",
@@ -35,7 +35,8 @@ def test_post_check_run_url_and_auth():
     with patch("httpx.post", return_value=_ok_response()) as mock_post:
         out = post_check_run("tok-123", "myorg", "myrepo", result)
 
-    mock_post.assert_called_once()
+    assert mock_post.call_count >= 1
+    # primary + optional legacy alias dual-post
     args, kwargs = mock_post.call_args
     assert args[0] == "https://api.github.com/repos/myorg/myrepo/check-runs"
     assert kwargs["headers"]["Authorization"] == "Bearer tok-123"
@@ -197,7 +198,7 @@ def test_post_check_run_truncates_oversize_summary():
     # multi-byte content: a byte-length truncation bug (vs char-length)
     # would only surface with non-ASCII input.
     result = CheckRunResult(
-        name="Grug — Code Review", head_sha="a" * 40, status="completed",
+        name="Grug — Elder", head_sha="a" * 40, status="completed",
         conclusion="neutral", title="t", summary="日" * 70000,
     )
     with patch("httpx.post", side_effect=fake_post):

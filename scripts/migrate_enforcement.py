@@ -36,8 +36,11 @@ import jwt
 
 _GH_API = "https://api.github.com"
 GRUG_RULESET_PREFIX = "Grug — "
-GRUG_TPM_RULESET_NAME = "Grug — TPM Enforcement"
-GRUG_DOR_CHECK_NAME = "Grug — Definition of Ready"
+GRUG_TPM_RULESET_NAME = "Grug — Chief Enforcement"
+GRUG_DOR_CHECK_NAME = "Grug — Chief"
+# Legacy titles still accepted when scanning existing rulesets.
+LEGACY_TPM_RULESET_NAME = "Grug — TPM Enforcement"
+LEGACY_DOR_CHECK_NAME = "Grug — Definition of Ready"
 
 _HEADERS_TEMPLATE = {
     "Accept": "application/vnd.github+json",

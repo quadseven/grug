@@ -106,7 +106,7 @@ def test_remove_deletes_by_stored_id():
 def test_remove_falls_back_to_list_when_no_stored_id():
     """No stored ID → list rulesets, find by prefix, delete."""
     rulesets = [
-        {"id": 99, "name": "Grug — TPM Enforcement"},
+        {"id": 99, "name": "Grug — Chief Enforcement"},
         {"id": 50, "name": "CI Required"},
     ]
     with patch("adapters.install_store.get_enforcement_id", return_value=None), \
@@ -163,11 +163,11 @@ def test_enable_then_disable_lifecycle():
 # ── constants ────────────────────────────────────────────────────────
 
 def test_ruleset_name():
-    assert GRUG_TPM_RULESET_NAME == "Grug — TPM Enforcement"
+    assert GRUG_TPM_RULESET_NAME == "Grug — Chief Enforcement"
 
 
 def test_check_name():
-    assert GRUG_DOR_CHECK_NAME == "Grug — Definition of Ready"
+    assert GRUG_DOR_CHECK_NAME == "Grug — Chief"
 
 
 # ── heal_enforcement ────────────────────────────────────────────────
