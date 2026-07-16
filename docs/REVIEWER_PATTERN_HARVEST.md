@@ -81,6 +81,22 @@ Shipped after the dense-inline-analyst harvest comparison:
    actionable count, severity breakdown, markings table, consolidated agent prompt
 5. Autofix push still out of scope (comment-only + suggestion + agent prompt)
 
+## Caveman chrome chips (CR density, tribe glyphs)
+
+Closed alphabet for Markings / Guard scan surfaces (identifiers stay ASCII):
+
+| Signal | Chip |
+|---|---|
+| critical | skull critical |
+| high | fire high |
+| medium | orange medium |
+| low | eye low |
+| quick-win | bolt quick win |
+| heavy-lift | rock heavy lift |
+
+Header shape on inline markings (CR-dense):
+`{sev chip} | _{category}_ | \`rule\` | {effort chip}`
+
 ## Smarter Elder: docs/code claim floor
 
 Qodo/CodeRabbit caught settle-comment and exclusive-bound drift that pure

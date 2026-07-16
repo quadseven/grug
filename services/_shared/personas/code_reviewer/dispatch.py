@@ -550,9 +550,6 @@ def _summary_markdown(
             )
         return hunt_title(title), ("## Markings Board\n\n" + scope) + held + hunt
 
-    severity_icon = {
-        "critical": "critical", "high": "high", "medium": "medium", "low": "low",
-    }
     blocking = sum(
         1 for f in evaluation.findings if f.severity in ("high", "critical")
     )
@@ -566,13 +563,8 @@ def _summary_markdown(
         "|---|---|---|---|---|---|",
     ]
     for f in evaluation.findings:
-        effort = (
-            _EFFORT_LABELS.get(f.effort, "-")
-            if f.effort in _EFFORT_LABELS
-            else "-"
-        )
         rows.append(
-            f"| {severity_icon.get(f.severity, f.severity)} | {effort} | "
+            f"| {_severity_chip(f.severity)} | {_effort_chip(f.effort)} | "
             f"`{_md_code_span(f.file)}` | {f.line} | "
             f"`{_md_code_span(f.rule_name)}` | "
             f"{_md_table_cell(f.message)} |"
@@ -636,7 +628,8 @@ def _consolidated_agent_prompt(evaluation: CodeReviewEvaluation) -> str:
         cat = _category_for_rule(f.rule_name)
         entry = (
             f"- {_md_code_span(f.file)}:{f.line} "
-            f"[{f.severity}/{cat}/{_md_code_span(f.rule_name)}] {f.message}"
+            f"[{_severity_chip(f.severity)} | {cat} | "
+            f"{_md_code_span(f.rule_name)}] {f.message}"
         )
         if f.suggestion:
             entry += f"\n  Suggested fix: {f.suggestion}"
@@ -665,6 +658,30 @@ def _consolidated_agent_prompt(evaluation: CodeReviewEvaluation) -> str:
 # Derived from the shared vocabulary so a new effort level can never
 # silently drop its chip (the Severity-partition-assert drift class).
 _EFFORT_LABELS = {e: e.replace("-", " ") for e in EFFORTS}
+
+# Closed caveman-inspired chrome chips (CodeRabbit-density scanability).
+# Identifiers and check *names* stay plain ASCII; Markings surface uses these.
+_SEVERITY_CHIP: dict[str, str] = {
+    "critical": "💀 critical",
+    "high": "🔥 high",
+    "medium": "🟠 medium",
+    "low": "👁 low",
+}
+_EFFORT_CHIP: dict[str, str] = {
+    "quick-win": "⚡ quick win",
+    "heavy-lift": "🪨 heavy lift",
+}
+
+
+def _severity_chip(severity: str) -> str:
+    return _SEVERITY_CHIP.get(severity, severity)
+
+
+def _effort_chip(effort: str | None) -> str:
+    if not effort:
+        return "-"
+    return _EFFORT_CHIP.get(effort, effort.replace("-", " "))
+
 
 # Markings v2: rule_name -> ReviewRule for category (bug_class) chips.
 _RULES_BY_NAME = {r.name: r for r in RULES}
@@ -827,12 +844,13 @@ def _inline_comment_body(f: Finding, precedent_note: str = "") -> str:
     finding for dedup (#189) — see dedup.parse_rule. The marker stays
     LAST (dedup.parse_rule reads the last marker in the body)."""
     cat = _category_for_rule(f.rule_name)
+    # CR-dense header: severity chip | category | rule | effort chip
     chip = (
-        f"**{f.severity.upper()}** · _{_md_code_span(cat)}_ · "
+        f"{_severity_chip(f.severity)} | _{_md_code_span(cat)}_ | "
         f"`{_md_code_span(f.rule_name)}`"
     )
-    if f.effort in _EFFORT_LABELS:
-        chip += f" · {_EFFORT_LABELS[f.effort]}"
+    if f.effort:
+        chip += f" | {_effort_chip(f.effort)}"
     head = (
         f"{chip}\n\n"
         f"**What Elder sees**\n\n{_defused(f.message)}\n\n"

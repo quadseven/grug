@@ -273,26 +273,32 @@ def _deep_mismatch_message(claimed: Bound, actual: Bound) -> str:
     )
 
 
-def _finding_vs_facts(
+def _settle_finding_vs_facts(
     claim: _Claim,
     facts: _PolicyFacts,
     seen: set[tuple[str, int, str]],
 ) -> Finding | None:
-    """One finding when a claim disagrees with implementation facts."""
-    if claim.kind == "settle_medium_cap":
-        if facts.settle_medium_cap is None:
-            return None
-        claimed = int(claim.value)  # type: ignore[arg-type]
-        if claimed == facts.settle_medium_cap:
-            return None
-        key = (claim.file, claim.line, "settle")
-        if key in seen:
-            return None
-        seen.add(key)
-        return _finding_for_claim(
-            claim, _settle_mismatch_message(claimed, facts.settle_medium_cap),
-        )
+    """Settle-cap claim vs min(base, N) fact."""
+    if facts.settle_medium_cap is None:
+        return None
+    claimed = int(claim.value)  # type: ignore[arg-type]
+    if claimed == facts.settle_medium_cap:
+        return None
+    key = (claim.file, claim.line, "settle")
+    if key in seen:
+        return None
+    seen.add(key)
+    return _finding_for_claim(
+        claim, _settle_mismatch_message(claimed, facts.settle_medium_cap),
+    )
 
+
+def _deep_finding_vs_facts(
+    claim: _Claim,
+    facts: _PolicyFacts,
+    seen: set[tuple[str, int, str]],
+) -> Finding | None:
+    """Deep-bound claim vs exclusive/inclusive fact."""
     if facts.deep_bound is None:
         return None
     claimed_b = claim.value  # exclusive | inclusive
@@ -306,6 +312,19 @@ def _finding_vs_facts(
         claim,
         _deep_mismatch_message(claimed_b, facts.deep_bound),  # type: ignore[arg-type]
     )
+
+
+def _finding_vs_facts(
+    claim: _Claim,
+    facts: _PolicyFacts,
+    seen: set[tuple[str, int, str]],
+) -> Finding | None:
+    """One finding when a claim disagrees with implementation facts."""
+    if claim.kind == "settle_medium_cap":
+        return _settle_finding_vs_facts(claim, facts, seen)
+    if claim.kind == "deep_bound":
+        return _deep_finding_vs_facts(claim, facts, seen)
+    return None
 
 
 def _intra_pr_settle_conflicts(
