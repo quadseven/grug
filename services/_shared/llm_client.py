@@ -26,6 +26,7 @@ from __future__ import annotations
 
 import json
 import logging
+import math
 import os
 import queue
 import threading
@@ -1135,19 +1136,29 @@ def _llmobs_tags(pr_context: Optional[PrContext]) -> dict[str, str]:
     return tags
 
 
-def _extract_usage_metrics(body: Any) -> dict[str, Optional[int]]:
+def _extract_usage_metrics(body: Any) -> dict[str, int | float]:
     """Pull token counts from an OpenAI-compat response body. Missing
     `usage` is normal (OpenRouter free-tier omits it sometimes) and
-    must not crash the span emission."""
+    must not crash the span emission. LLMObs rejects None and non-finite
+    values, so unavailable or malformed counts are omitted entirely."""
     if not isinstance(body, dict):
-        return {"input_tokens": None, "output_tokens": None}
+        return {}
     usage = body.get("usage") or {}
     if not isinstance(usage, dict):
-        return {"input_tokens": None, "output_tokens": None}
-    return {
-        "input_tokens": usage.get("prompt_tokens"),
-        "output_tokens": usage.get("completion_tokens"),
-    }
+        return {}
+
+    metrics: dict[str, int | float] = {}
+    for metric, field_name in (
+        ("input_tokens", "prompt_tokens"),
+        ("output_tokens", "completion_tokens"),
+    ):
+        value = usage.get(field_name)
+        if isinstance(value, bool) or not isinstance(value, (int, float)):
+            continue
+        if isinstance(value, float) and not math.isfinite(value):
+            continue
+        metrics[metric] = value
+    return metrics
 
 
 @dataclass(frozen=True, slots=True)

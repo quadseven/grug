@@ -1162,7 +1162,7 @@ def test_review_diff_emits_llmobs_span_on_transport_failure(monkeypatch) -> None
 
 def test_review_diff_llmobs_span_handles_missing_usage(monkeypatch) -> None:
     """OpenRouter free-tier sometimes omits the `usage` field. Span
-    must not crash — token metrics surface as None."""
+    must not crash - unavailable token metrics are omitted."""
     annotate_calls = _capture_llmobs(monkeypatch)
     # OpenAI shape but NO usage key.
     body = {"choices": [{"message": {"content": '{"findings":[]}'}}], "model": "x"}
@@ -1173,8 +1173,8 @@ def test_review_diff_llmobs_span_handles_missing_usage(monkeypatch) -> None:
     metrics = annotate_calls[0]["metrics"]
     # latency must still be present even when tokens are missing.
     assert "latency_ms" in metrics
-    assert metrics.get("input_tokens") is None
-    assert metrics.get("output_tokens") is None
+    assert "input_tokens" not in metrics
+    assert "output_tokens" not in metrics
 
 
 def test_llmobs_span_annotate_called_exactly_once_per_backend_attempt(monkeypatch) -> None:
@@ -1304,14 +1304,26 @@ def test_extract_usage_metrics_handles_non_dict_usage() -> None:
     one — removing it would AttributeError on `.get()`."""
     # body with usage=list (degenerate).
     out = lc._extract_usage_metrics({"usage": [1, 2, 3]})
-    assert out == {"input_tokens": None, "output_tokens": None}
+    assert out == {}
     # body that itself isn't a dict.
     out = lc._extract_usage_metrics("not a dict")
-    assert out == {"input_tokens": None, "output_tokens": None}
+    assert out == {}
     # body=None (defensive — the upstream re-parse fallback sets body={}
     # but a future caller might pass None).
     out = lc._extract_usage_metrics(None)
-    assert out == {"input_tokens": None, "output_tokens": None}
+    assert out == {}
+
+
+def test_extract_usage_metrics_keeps_only_finite_numeric_values() -> None:
+    assert lc._extract_usage_metrics({
+        "usage": {"prompt_tokens": 12, "completion_tokens": 4.5},
+    }) == {"input_tokens": 12, "output_tokens": 4.5}
+    assert lc._extract_usage_metrics({
+        "usage": {"prompt_tokens": "12", "completion_tokens": None},
+    }) == {}
+    assert lc._extract_usage_metrics({
+        "usage": {"prompt_tokens": True, "completion_tokens": float("nan")},
+    }) == {}
 
 
 def test_llmobs_body_reparse_failure_logs_warning(monkeypatch, caplog) -> None:
