@@ -17,6 +17,7 @@ Fail-open: any parse glitch yields no finding rather than aborting review.
 from __future__ import annotations
 
 import re
+from collections import Counter
 from dataclasses import dataclass
 from typing import Literal
 
@@ -24,8 +25,6 @@ from personas.code_reviewer.diff_parser import DiffHunk
 from personas.code_reviewer.persona import Finding
 
 _RULE = "doc-code-claim-drift"
-
-# --- implementation facts (from Python at head) -----------------------------
 
 # Steady Hunt medium quiet window: `return min(base, N)`.
 _SETTLE_CAP_CODE = re.compile(
@@ -35,8 +34,6 @@ _SETTLE_CAP_CODE = re.compile(
 # Deep escalation bound: exclusive `added > threshold` vs inclusive `>=`.
 _DEEP_EXCLUSIVE_CODE = re.compile(r"\badded\s*>\s*threshold\b")
 _DEEP_INCLUSIVE_CODE = re.compile(r"\badded\s*>=\s*threshold\b")
-
-# --- claim patterns on ADDED comment / doc / yaml lines ---------------------
 
 # "caps medium (Steady) at 5s", "cap medium at 3 seconds", etc.
 _SETTLE_CLAIM_RES: tuple[re.Pattern[str], ...] = (
@@ -61,7 +58,6 @@ _SETTLE_CLAIM_RES: tuple[re.Pattern[str], ...] = (
     ),
 )
 
-# Deep-bound claims in prose near escalation / diff-line language.
 _DEEP_TOPIC = re.compile(
     r"(?i)(?:deep[_\s-]?diff|deep[_\s-]?escalat|GRUG_DEEP_DIFF|"
     r"added\s+lines?|auto-?deep|reasoner\s+only)",
@@ -81,6 +77,7 @@ _DEEP_CLAIM_INCLUSIVE = re.compile(
 )
 
 Bound = Literal["exclusive", "inclusive"]
+ClaimKind = Literal["settle_medium_cap", "deep_bound"]
 
 
 @dataclass(frozen=True, slots=True)
@@ -91,7 +88,7 @@ class _PolicyFacts:
 
 @dataclass(frozen=True, slots=True)
 class _Claim:
-    kind: Literal["settle_medium_cap", "deep_bound"]
+    kind: ClaimKind
     value: int | Bound
     file: str
     line: int
@@ -117,19 +114,14 @@ def _added_lines(hunk: DiffHunk) -> list[tuple[int, str]]:
 
 def _is_comment_or_doc_line(path: str, text: str) -> bool:
     """True for comment / doc / markdown lines we treat as claims."""
-    lower = path.lower()
-    if lower.endswith((".md", ".rst", ".txt", ".adoc")):
+    if path.lower().endswith((".md", ".rst", ".txt", ".adoc")):
         return True
     stripped = text.lstrip()
     if not stripped:
         return False
     if stripped.startswith(("#", "//", "/*", "*", "<!--", "--")):
         return True
-    # YAML / k8s inline comments: "  # ... " already covered by #.
-    # Trailing comment on a value line: treat the comment tail as claim text.
-    if " #" in text or "\t#" in text:
-        return True
-    return False
+    return " #" in text or "\t#" in text
 
 
 def _claim_text(text: str) -> str:
@@ -141,6 +133,26 @@ def _claim_text(text: str) -> str:
     return text
 
 
+def _settle_from_source(path: str, source: str, current: int | None) -> int | None:
+    settle = current
+    for m in _SETTLE_CAP_CODE.finditer(source):
+        n = int(m.group(1))
+        lower = path.lower()
+        if "settle" in lower or "snapshot" in lower:
+            return n
+        if settle is None:
+            settle = n
+    return settle
+
+
+def _deep_from_source(source: str, current: Bound | None) -> Bound | None:
+    if _DEEP_EXCLUSIVE_CODE.search(source):
+        return "exclusive"
+    if current is None and _DEEP_INCLUSIVE_CODE.search(source):
+        return "inclusive"
+    return current
+
+
 def _extract_facts(file_contents: dict[str, str]) -> _PolicyFacts:
     """Pull settle cap + deep bound from Python sources at head."""
     settle: int | None = None
@@ -148,18 +160,39 @@ def _extract_facts(file_contents: dict[str, str]) -> _PolicyFacts:
     for path, source in file_contents.items():
         if not path.endswith(".py"):
             continue
-        for m in _SETTLE_CAP_CODE.finditer(source):
-            # Prefer settle-related modules when multiple min(base, N) exist.
-            n = int(m.group(1))
-            if "settle" in path.lower() or "snapshot" in path.lower():
-                settle = n
-            elif settle is None:
-                settle = n
-        if _DEEP_EXCLUSIVE_CODE.search(source):
-            deep = "exclusive"
-        elif _DEEP_INCLUSIVE_CODE.search(source) and deep is None:
-            deep = "inclusive"
+        settle = _settle_from_source(path, source, settle)
+        deep = _deep_from_source(source, deep)
     return _PolicyFacts(settle_medium_cap=settle, deep_bound=deep)
+
+
+def _parse_settle_claim(path: str, lineno: int, text: str, claim_src: str) -> _Claim | None:
+    for pat in _SETTLE_CLAIM_RES:
+        m = pat.search(claim_src)
+        if m:
+            return _Claim(
+                kind="settle_medium_cap",
+                value=int(m.group(1)),
+                file=path,
+                line=lineno,
+                snippet=text.strip()[:200],
+            )
+    return None
+
+
+def _parse_deep_claim(path: str, lineno: int, text: str, claim_src: str) -> _Claim | None:
+    if not _DEEP_TOPIC.search(claim_src):
+        return None
+    exclusive = bool(_DEEP_CLAIM_EXCLUSIVE.search(claim_src))
+    inclusive = bool(_DEEP_CLAIM_INCLUSIVE.search(claim_src))
+    if exclusive == inclusive:
+        return None  # both or neither: ambiguous, skip
+    return _Claim(
+        kind="deep_bound",
+        value="exclusive" if exclusive else "inclusive",
+        file=path,
+        line=lineno,
+        snippet=text.strip()[:200],
+    )
 
 
 def _extract_claims(hunks: tuple[DiffHunk, ...]) -> list[_Claim]:
@@ -176,44 +209,12 @@ def _extract_claims(hunks: tuple[DiffHunk, ...]) -> list[_Claim]:
             if not _is_comment_or_doc_line(path, text):
                 continue
             claim_src = _claim_text(text)
-            for pat in _SETTLE_CLAIM_RES:
-                m = pat.search(claim_src)
-                if m:
-                    claims.append(
-                        _Claim(
-                            kind="settle_medium_cap",
-                            value=int(m.group(1)),
-                            file=path,
-                            line=lineno,
-                            snippet=text.strip()[:200],
-                        )
-                    )
-                    break
-            if _DEEP_TOPIC.search(claim_src):
-                if _DEEP_CLAIM_EXCLUSIVE.search(claim_src) and not _DEEP_CLAIM_INCLUSIVE.search(
-                    claim_src
-                ):
-                    claims.append(
-                        _Claim(
-                            kind="deep_bound",
-                            value="exclusive",
-                            file=path,
-                            line=lineno,
-                            snippet=text.strip()[:200],
-                        )
-                    )
-                elif _DEEP_CLAIM_INCLUSIVE.search(claim_src) and not _DEEP_CLAIM_EXCLUSIVE.search(
-                    claim_src
-                ):
-                    claims.append(
-                        _Claim(
-                            kind="deep_bound",
-                            value="inclusive",
-                            file=path,
-                            line=lineno,
-                            snippet=text.strip()[:200],
-                        )
-                    )
+            settle = _parse_settle_claim(path, lineno, text, claim_src)
+            if settle is not None:
+                claims.append(settle)
+            deep = _parse_deep_claim(path, lineno, text, claim_src)
+            if deep is not None:
+                claims.append(deep)
     return claims
 
 
@@ -227,6 +228,96 @@ def _finding_for_claim(claim: _Claim, message: str) -> Finding:
         suggestion=None,
         effort="quick-win",
     )
+
+
+def _settle_mismatch_message(claimed: int, actual: int) -> str:
+    return (
+        f"Comment/docs claim Steady/medium settle cap of {claimed}s, but code "
+        f"has `min(base, {actual})`. Doc/code claim drift - update the comment "
+        f"or the implementation so they match. Grug say: number in mouth must "
+        f"equal number in hand."
+    )
+
+
+def _deep_mismatch_message(claimed: Bound, actual: Bound) -> str:
+    code_op = ">" if actual == "exclusive" else ">="
+    claim_op = ">" if claimed == "exclusive" else ">="
+    return (
+        f"Comment/docs describe deep-diff escalation as {claimed} "
+        f"(`added {claim_op} threshold`), but code uses {actual} "
+        f"(`added {code_op} threshold`). Doc/code claim drift - align the "
+        f"bound language with `decide_deep_escalation`."
+    )
+
+
+def _finding_vs_facts(
+    claim: _Claim,
+    facts: _PolicyFacts,
+    seen: set[tuple[str, int, str]],
+) -> Finding | None:
+    """One finding when a claim disagrees with implementation facts."""
+    if claim.kind == "settle_medium_cap":
+        if facts.settle_medium_cap is None:
+            return None
+        claimed = int(claim.value)  # type: ignore[arg-type]
+        if claimed == facts.settle_medium_cap:
+            return None
+        key = (claim.file, claim.line, "settle")
+        if key in seen:
+            return None
+        seen.add(key)
+        return _finding_for_claim(
+            claim, _settle_mismatch_message(claimed, facts.settle_medium_cap),
+        )
+
+    if facts.deep_bound is None:
+        return None
+    claimed_b = claim.value  # exclusive | inclusive
+    if claimed_b == facts.deep_bound:
+        return None
+    key = (claim.file, claim.line, "deep")
+    if key in seen:
+        return None
+    seen.add(key)
+    return _finding_for_claim(
+        claim,
+        _deep_mismatch_message(claimed_b, facts.deep_bound),  # type: ignore[arg-type]
+    )
+
+
+def _intra_pr_settle_conflicts(
+    claims: list[_Claim],
+    seen: set[tuple[str, int, str]],
+) -> list[Finding]:
+    """Flag ADDED settle claims that disagree with each other (no code facts)."""
+    settle_claims = [c for c in claims if c.kind == "settle_medium_cap"]
+    if len(settle_claims) < 2:
+        return []
+    counts = Counter(int(c.value) for c in settle_claims)  # type: ignore[arg-type]
+    if len(counts) < 2:
+        return []
+    mode_val, _ = counts.most_common(1)[0]
+    out: list[Finding] = []
+    for claim in settle_claims:
+        claimed = int(claim.value)  # type: ignore[arg-type]
+        if claimed == mode_val:
+            continue
+        key = (claim.file, claim.line, "settle-conflict")
+        if key in seen:
+            continue
+        seen.add(key)
+        out.append(
+            _finding_for_claim(
+                claim,
+                (
+                    f"PR comments disagree on medium settle cap: this line "
+                    f"says {claimed}s, other added comments say {mode_val}s. "
+                    f"Align every claim with the code (`min(base, N)` in the "
+                    f"settle helper)."
+                ),
+            )
+        )
+    return out
 
 
 def scan_claim_checks(
@@ -249,97 +340,12 @@ def scan_claim_checks(
 
     findings: list[Finding] = []
     seen: set[tuple[str, int, str]] = set()
-
     for claim in claims:
-        if claim.kind == "settle_medium_cap":
-            if facts.settle_medium_cap is None:
-                continue
-            claimed = int(claim.value)  # type: ignore[arg-type]
-            if claimed == facts.settle_medium_cap:
-                continue
-            key = (claim.file, claim.line, "settle")
-            if key in seen:
-                continue
-            seen.add(key)
-            findings.append(
-                _finding_for_claim(
-                    claim,
-                    (
-                        f"Comment/docs claim Steady/medium settle cap of "
-                        f"{claimed}s, but code has `min(base, "
-                        f"{facts.settle_medium_cap})`. Doc/code claim drift "
-                        f"- update the comment or the implementation so they "
-                        f"match. Grug say: number in mouth must equal number "
-                        f"in hand."
-                    ),
-                )
-            )
-        elif claim.kind == "deep_bound":
-            if facts.deep_bound is None:
-                continue
-            claimed_b = claim.value  # exclusive | inclusive
-            if claimed_b == facts.deep_bound:
-                continue
-            key = (claim.file, claim.line, "deep")
-            if key in seen:
-                continue
-            seen.add(key)
-            code_op = ">" if facts.deep_bound == "exclusive" else ">="
-            claim_op = ">" if claimed_b == "exclusive" else ">="
-            findings.append(
-                _finding_for_claim(
-                    claim,
-                    (
-                        f"Comment/docs describe deep-diff escalation as "
-                        f"{claimed_b} (`added {claim_op} threshold`), but "
-                        f"code uses {facts.deep_bound} (`added {code_op} "
-                        f"threshold`). Doc/code claim drift - align the "
-                        f"bound language with `decide_deep_escalation`."
-                    ),
-                )
-            )
+        hit = _finding_vs_facts(claim, facts, seen)
+        if hit is not None:
+            findings.append(hit)
 
-    # Intra-PR claim-vs-claim: two ADDED comments disagree on the same
-    # policy even when code is not in file_contents.
-    settle_vals = {
-        int(c.value)  # type: ignore[arg-type]
-        for c in claims
-        if c.kind == "settle_medium_cap"
-    }
-    if len(settle_vals) > 1 and facts.settle_medium_cap is None:
-        # Flag every claim that is not the mode (smallest wins as "likely code")
-        # - actually without code, flag all but the first-seen majority is hard.
-        # Flag all claims that differ from the minimum (conservative: medium cap
-        # is usually the smaller number vs base settle). Prefer flagging outliers
-        # vs the most common value.
-        from collections import Counter
-
-        counts = Counter(
-            int(c.value)  # type: ignore[arg-type]
-            for c in claims
-            if c.kind == "settle_medium_cap"
-        )
-        mode_val, _ = counts.most_common(1)[0]
-        for claim in claims:
-            if claim.kind != "settle_medium_cap":
-                continue
-            claimed = int(claim.value)  # type: ignore[arg-type]
-            if claimed == mode_val:
-                continue
-            key = (claim.file, claim.line, "settle-conflict")
-            if key in seen:
-                continue
-            seen.add(key)
-            findings.append(
-                _finding_for_claim(
-                    claim,
-                    (
-                        f"PR comments disagree on medium settle cap: this "
-                        f"line says {claimed}s, other added comments say "
-                        f"{mode_val}s. Align every claim with the code "
-                        f"(`min(base, N)` in the settle helper)."
-                    ),
-                )
-            )
+    if facts.settle_medium_cap is None:
+        findings.extend(_intra_pr_settle_conflicts(claims, seen))
 
     return tuple(findings)
