@@ -60,7 +60,10 @@ def test_fetch_pr_diff_scope_reports_full_fallback(monkeypatch):
             request=httpx.Request("GET", "https://pull"),
         ),
     ]
-    monkeypatch.setattr(cr_dispatch.httpx, "get", lambda *a, **k: responses.pop(0))
+    monkeypatch.setattr(
+        cr_dispatch.httpx, "get",
+        lambda *_args, **_kwargs: responses.pop(0),
+    )
 
     diff, used_compare = cr_dispatch._fetch_pr_diff_with_scope(
         "token", "owner", "repo", 7, base_sha="abc", head_sha="def",
