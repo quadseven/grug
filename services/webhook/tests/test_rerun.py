@@ -908,3 +908,30 @@ def test_elder_check_already_terminal_treats_any_completed_conclusion(monkeypatc
         )
         assert reason is not None
         assert reason.startswith("already_completed_"), (conclusion, reason)
+
+
+def test_complete_elder_check_open_posts_neutral(monkeypatch):
+    """Fail-open: infra skip completes the required check (never stuck)."""
+    posted = {}
+
+    def fake_post(token, owner, repo, result, external_id=None):
+        posted["result"] = result
+        posted["external_id"] = external_id
+        return {"id": 1}
+
+    monkeypatch.setattr(rerun, "with_install_token_retry", lambda iid, fn: fn("tok"))
+    monkeypatch.setattr(rerun, "post_check_run", fake_post)
+    rerun._complete_elder_check_open(
+        install_id=1,
+        owner="o",
+        repo_name="r",
+        pr_number=9,
+        head_sha="a" * 40,
+        title="Elder eyes clouded - GitHub unavailable",
+        summary="fail open",
+        conclusion="neutral",
+    )
+    assert posted["result"].status == "completed"
+    assert posted["result"].conclusion == "neutral"
+    assert posted["result"].name == rerun._ELDER_CHECK_NAME
+    assert "open" in posted["external_id"]

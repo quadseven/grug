@@ -201,6 +201,72 @@ def _elder_check_already_terminal_or_pending(
         return None
 
 
+
+def _complete_elder_check_open(
+    *,
+    install_id: int,
+    owner: str,
+    repo_name: str,
+    pr_number: int,
+    head_sha: str,
+    title: str,
+    summary: str,
+    conclusion: str = "neutral",
+) -> None:
+    """Post a TERMINAL Elder check so required-status never sticks in_progress.
+
+    CodeRabbit-style fail-open: infra failure / GH brownout / superseded head
+    must complete the required check as neutral (passes merge) with an honest
+    title, never leave "in_progress" forever. Best-effort; never raises.
+    """
+    if not (owner and repo_name and head_sha):
+        return
+    check = CheckRunResult(
+        name=_ELDER_CHECK_NAME,
+        head_sha=head_sha,
+        status="completed",
+        conclusion=conclusion,  # type: ignore[arg-type]
+        title=title,
+        summary=summary,
+    )
+    try:
+        with_install_token_retry(
+            install_id,
+            lambda token: post_check_run(
+                token,
+                owner,
+                repo_name,
+                check,
+                external_id=(
+                    f"grug-cr-open:{owner}/{repo_name}"
+                    f"#{pr_number}:{head_sha}"
+                ),
+            ),
+        )
+        log.info(
+            "elder_check_fail_open_completed",
+            extra={
+                "install_id": install_id,
+                "repo": f"{owner}/{repo_name}",
+                "pr": pr_number,
+                "head_sha": head_sha[:8],
+                "conclusion": conclusion,
+                "title": title[:80],
+            },
+        )
+    except Exception as error:  # noqa: BLE001 - visibility path
+        log.warning(
+            "elder_check_fail_open_failed",
+            extra={
+                "install_id": install_id,
+                "repo": f"{owner}/{repo_name}",
+                "pr": pr_number,
+                "head_sha": head_sha[:8],
+                "kind": type(error).__name__,
+            },
+        )
+
+
 def _post_elder_in_progress_check(
     *,
     install_id: int,
@@ -1019,6 +1085,21 @@ def _run_hot_review(
             _stop_staleness_watch(watch)
         degraded_reason = result.get("degraded_reason", "")
         if degraded_reason == "stale_snapshot":
+            # Close the abandoned head so required-status does not stick.
+            _complete_elder_check_open(
+                install_id=install_id,
+                owner=owner,
+                repo_name=repo_name,
+                pr_number=pr_number,
+                head_sha=head_sha,
+                title="Elder superseded - new head",
+                summary=(
+                    "A newer commit or intent change arrived while Elder was "
+                    "reviewing. This head is closed as neutral (fail-open). "
+                    "A fresh review is enqueued for the current head."
+                ),
+                conclusion="neutral",
+            )
             latest = _fetch_current_pr(
                 install_id, owner, repo_name, pr_number,
             )
@@ -1044,6 +1125,19 @@ def _run_hot_review(
                 else "pr_ineligible"
             )
         if degraded_reason == "pr_ineligible":
+            _complete_elder_check_open(
+                install_id=install_id,
+                owner=owner,
+                repo_name=repo_name,
+                pr_number=pr_number,
+                head_sha=head_sha,
+                title="Elder skipped - PR not reviewable",
+                summary=(
+                    "PR is closed or draft. Elder posts neutral so required "
+                    "status checks do not block on a non-reviewable PR."
+                ),
+                conclusion="neutral",
+            )
             if not _stop_review_claim_heartbeat(heartbeat):
                 raise RuntimeError(
                     "Elder review claim ownership lost during dispatch"
@@ -1056,11 +1150,59 @@ def _run_hot_review(
         result_status = result.get("result")
         if result_status == "publish_failed":
             raise RuntimeError("Elder review publication failed")
-        if result_status == "skipped" and degraded_reason != "no_diff":
-            raise RuntimeError(
-                f"Elder review degraded: {degraded_reason or 'unknown'}"
+        # Fail-open like CodeRabbit: infra / GH brownout must COMPLETE the
+        # required check as neutral, never leave in_progress forever and
+        # never redrive forever. Real model findings still use pass/fail.
+        if result_status == "skipped" and degraded_reason == "freshness_check_failed":
+            _complete_elder_check_open(
+                install_id=install_id,
+                owner=owner,
+                repo_name=repo_name,
+                pr_number=pr_number,
+                head_sha=head_sha,
+                title="Elder eyes clouded - GitHub unavailable",
+                summary=(
+                    "Could not re-fetch the PR to confirm snapshot freshness "
+                    "(GitHub 5xx / transport). Grug fail-open: required check "
+                    "concludes **neutral** so merge is not blocked by infra. "
+                    "Push again or re-run Elder when GitHub is healthy."
+                ),
+                conclusion="neutral",
             )
-        if result_status not in {"pass", "fail", "skipped"}:
+            if not _stop_review_claim_heartbeat(heartbeat):
+                raise RuntimeError(
+                    "Elder review claim ownership lost after fail-open"
+                )
+            if not complete_review_claim(**owned_claim_args):
+                # Prefer release over hang if complete fails.
+                release_review_claim(**owned_claim_args)
+            return "fail_open_freshness"
+        if result_status == "skipped" and degraded_reason not in (
+            "no_diff", "fail_open_freshness",
+        ):
+            # Unknown skip: still fail-open rather than infinite redrive.
+            _complete_elder_check_open(
+                install_id=install_id,
+                owner=owner,
+                repo_name=repo_name,
+                pr_number=pr_number,
+                head_sha=head_sha,
+                title=f"Elder skipped - {degraded_reason or 'unknown'}",
+                summary=(
+                    f"Review returned skipped ({degraded_reason or 'unknown'}). "
+                    "Grug fail-open: required check concludes **neutral** so "
+                    "infra cannot brick the merge. Re-run Elder if needed."
+                ),
+                conclusion="neutral",
+            )
+            if not _stop_review_claim_heartbeat(heartbeat):
+                raise RuntimeError(
+                    "Elder review claim ownership lost after fail-open skip"
+                )
+            if not complete_review_claim(**owned_claim_args):
+                release_review_claim(**owned_claim_args)
+            return f"fail_open_{degraded_reason or 'skipped'}"
+        if result_status not in {"pass", "fail", "skipped"} and not str(result_status).startswith("fail_open"):
             raise RuntimeError(
                 f"Elder review returned unexpected result: {result_status!r}"
             )
