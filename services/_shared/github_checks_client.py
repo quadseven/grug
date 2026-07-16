@@ -105,7 +105,12 @@ def post_check_run(
             alias_body = dict(body)
             alias_body["name"] = alias
             if external_id:
-                alias_body["external_id"] = f"{external_id}:legacy"
+                # Unique per alias name so multi-alias dual-post is not
+                # collapsed by GitHub external_id de-dupe.
+                safe = "".join(
+                    ch if ch.isalnum() else "_" for ch in alias
+                )[:80]
+                alias_body["external_id"] = f"{external_id}:legacy:{safe}"
             alias_resp = httpx.post(
                 f"{_GH_API}/repos/{quote(owner, safe='')}/{quote(repo, safe='')}/check-runs",
                 json=alias_body,

@@ -36,7 +36,10 @@ def test_post_check_run_url_and_auth():
         out = post_check_run("tok-123", "myorg", "myrepo", result)
 
     assert mock_post.call_count >= 1
-    # primary + optional legacy alias dual-post
+    # primary first, then optional legacy alias dual-posts
+    first = mock_post.call_args_list[0]
+    assert first.kwargs["json"]["name"] == "Grug - Chief"
+
     args, kwargs = mock_post.call_args
     assert args[0] == "https://api.github.com/repos/myorg/myrepo/check-runs"
     assert kwargs["headers"]["Authorization"] == "Bearer tok-123"

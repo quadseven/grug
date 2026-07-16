@@ -159,7 +159,7 @@ def test_evaluate_mixed_advisory_and_blocking_failure():
     assert scope.passed is False
     assert link.passed is False
     title, summary = persona._summary(list(evaluation.results))
-    assert "1/5 plan checks fail" in title or "1/5 blocking" in title
+    assert title == "Hunt Plan hold - 1/5 plan checks fail"
 
 
 def test_summary_advisory_check_renders_warning_icon():

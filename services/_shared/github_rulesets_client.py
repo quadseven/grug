@@ -18,6 +18,7 @@ import httpx
 _GH_API = "https://api.github.com"
 
 GRUG_RULESET_PREFIX = "Grug - "
+GRUG_RULESET_PREFIXES = (GRUG_RULESET_PREFIX, "Grug " + "\u2014" + " ")
 
 EnforcementState = Literal["grug_managed", "external", "none"]
 
@@ -409,7 +410,9 @@ def detect_enforcement(
         if stored_ruleset_id is not None and rs.get("id") == stored_ruleset_id:
             grug_match = True
             break
-        elif rs.get("name", "").startswith(GRUG_RULESET_PREFIX):
+        elif any(rs.get("name", "").startswith(p) for p in (
+            GRUG_RULESET_PREFIX, "Grug " + chr(0x2014) + " ",
+        )):
             grug_match = True
             break
         else:

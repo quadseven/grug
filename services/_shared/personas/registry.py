@@ -19,6 +19,11 @@ from __future__ import annotations
 from dataclasses import dataclass
 from typing import Any, Literal
 
+from personas.tribe import (
+    CHECK_CHIEF, CHECK_ELDER, CHECK_GUARD, CHECK_PULSE,
+    CHECK_SMASHER, CHECK_TELLER, CHECK_WARDER,
+)
+
 # How a persona runs relative to the webhook ACK path.
 #   "inline" — runs synchronously in dispatch (fast, no LLM), like Chief/TPM.
 #   "async"  — offloaded off the ACK path (LLM latency), like Elder.
@@ -127,7 +132,7 @@ REGISTRY: tuple[PersonaSpec, ...] = (
     PersonaSpec(
         key="tpm",
         canonical="chief",
-        check_run_name="Grug - Chief",
+        check_run_name=CHECK_CHIEF,
         enabled_flag="tpm_enabled",
         enabled_default=True,
         blocking_flag=None,
@@ -140,7 +145,7 @@ REGISTRY: tuple[PersonaSpec, ...] = (
     PersonaSpec(
         key="code_reviewer",
         canonical="elder",
-        check_run_name="Grug - Elder",
+        check_run_name=CHECK_ELDER,
         enabled_flag="code_reviewer_enabled",
         enabled_default=True,
         blocking_flag="code_reviewer_blocking",
@@ -166,7 +171,7 @@ REGISTRY: tuple[PersonaSpec, ...] = (
     PersonaSpec(
         key="guard",
         canonical="guard",
-        check_run_name="Grug - Guard",
+        check_run_name=CHECK_GUARD,
         enabled_flag="guard_enabled",
         enabled_default=True,
         blocking_flag="guard_blocking",
@@ -179,7 +184,7 @@ REGISTRY: tuple[PersonaSpec, ...] = (
     PersonaSpec(
         key="warder",
         canonical="warder",
-        check_run_name="Grug - Warder",
+        check_run_name=CHECK_WARDER,
         enabled_flag="warder_enabled",
         enabled_default=False,  # tracer: opt-in per repo (#471)
         blocking_flag=None,
@@ -195,7 +200,7 @@ REGISTRY: tuple[PersonaSpec, ...] = (
         canonical="smasher",
         # Matches the existing check-run family ("Grug - Guard" etc.) so the
         # checks group consistently in the GitHub UI.
-        check_run_name="Grug - Smasher",
+        check_run_name=CHECK_SMASHER,
         enabled_flag="smasher_enabled",
         enabled_default=False,  # execution tracer: opt-in per repo (#469)
         blocking_flag=None,     # mutation findings are inherently advisory
@@ -210,7 +215,7 @@ REGISTRY: tuple[PersonaSpec, ...] = (
         canonical="teller",
         # No real check-run posts (comment-only, like Pulse); this name is
         # the roster/Activity-feed identity record_check_verdict carries.
-        check_run_name="Grug - Teller",
+        check_run_name=CHECK_TELLER,
         enabled_flag="walkthrough_enabled",
         enabled_default=True,  # trial-harvest gap 1: default ON (#554, #522)
         blocking_flag=None,
@@ -223,7 +228,7 @@ REGISTRY: tuple[PersonaSpec, ...] = (
     PersonaSpec(
         key="pulse",
         canonical="pulse",
-        check_run_name="Grug - Pulse",
+        check_run_name=CHECK_PULSE,
         enabled_flag="pulse_enabled",
         enabled_default=False,  # tracer: opt-in per repo (#472)
         blocking_flag=None,

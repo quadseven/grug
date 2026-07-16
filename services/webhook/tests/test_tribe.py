@@ -16,10 +16,15 @@ def test_check_names_are_caveman():
 
 
 def test_legacy_aliases_accepted_for_detection():
+    em = "\u2014"
     assert tribe.is_same_check("Grug - Definition of Ready", tribe.CHECK_CHIEF)
     assert tribe.is_same_check("Grug - Code Review", tribe.CHECK_ELDER)
+    assert tribe.is_same_check(f"Grug {em} Definition of Ready", tribe.CHECK_CHIEF)
+    assert tribe.is_same_check(f"Grug {em} Code Review", tribe.CHECK_ELDER)
+    assert tribe.is_same_check(f"Grug {em} Chief", tribe.CHECK_CHIEF)
     assert tribe.is_same_check("Grug - Chief", tribe.CHECK_CHIEF)
     assert not tribe.is_same_check("Grug - Guard", tribe.CHECK_CHIEF)
+    assert tribe.primary_check_name(f"Grug {em} Elder") == tribe.CHECK_ELDER
 
 
 def test_primary_maps_legacy_back():
