@@ -58,16 +58,6 @@ def test_build_system_prompt_carries_finding_json_contract():
         assert sev in prompt
 
 
-def test_external_input_rule_requires_real_taint_source():
-    """Static manifest values are not hypothetical injection sources."""
-    rule = next(
-        r for r in crp.RULES if r.name == "unvalidated-external-input"
-    )
-    assert "demonstrated data-flow" in rule.description
-    assert "hard-coded literal" in rule.description
-    assert "hypothetical future" in rule.description
-
-
 def test_build_system_prompt_is_deterministic():
     """Stable output — rule order doesn't shuffle between calls (matters
     for DD LLM Obs A/B prompt-variant comparison + cache stability)."""

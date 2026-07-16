@@ -82,6 +82,52 @@ def test_finding_on_wrong_file_is_dropped() -> None:
     assert out.findings == ()
 
 
+def test_static_manifest_scalar_is_not_external_input() -> None:
+    diff = """diff --git a/values.yaml b/values.yaml
+--- a/values.yaml
++++ b/values.yaml
+@@ -1,1 +1,2 @@
+ clusterChecksRunner:
++  node.ehumps.me/location: oci
+"""
+    llm = LlmReviewResponse(
+        kind="reviewed",
+        findings=(_llm_finding(
+            path="values.yaml", line=2, severity="critical",
+            rule="unvalidated-external-input",
+            message="hard-coded selector might someday be user input",
+        ),),
+        backend_used=Backend.POOLSIDE,
+    )
+
+    out = evaluate_diff(parse_diff(diff), llm)
+
+    assert out.findings == ()
+    assert out.conclusion == "success"
+
+
+def test_templated_manifest_value_can_still_be_external_input() -> None:
+    diff = """diff --git a/values.yaml b/values.yaml
+--- a/values.yaml
++++ b/values.yaml
+@@ -1,1 +1,2 @@
+ command:
++  target: ${USER_TARGET}
+"""
+    llm = LlmReviewResponse(
+        kind="reviewed",
+        findings=(_llm_finding(
+            path="values.yaml", line=2, severity="critical",
+            rule="unvalidated-external-input",
+        ),),
+        backend_used=Backend.POOLSIDE,
+    )
+
+    out = evaluate_diff(parse_diff(diff), llm)
+
+    assert len(out.findings) == 1
+
+
 def test_critical_finding_flips_passed_to_false() -> None:
     hunks = parse_diff(_DIFF)
     llm = LlmReviewResponse(

@@ -172,12 +172,8 @@ RULES: tuple[ReviewRule, ...] = (
     ReviewRule(
         name="unvalidated-external-input",
         bug_class="security",
-        description="User/remote input with a demonstrated data-flow into a "
-        "query, path, command, or URL without validation or escaping "
-        "(injection / traversal). A hard-coded literal or repository-owned "
-        "declarative configuration scalar is not external input and cannot "
-        "be flagged under this rule. Do not speculate that a literal might "
-        "become user-controlled in a hypothetical future change.",
+        description="User/remote input flowing into a query, path, command, "
+        "or URL without validation or escaping (injection / traversal).",
         bad_example="open(f'/data/{user_path}')",
         good_example="safe = pathlib.Path('/data') / pathlib.Path(user_path).name",
         severity="critical",

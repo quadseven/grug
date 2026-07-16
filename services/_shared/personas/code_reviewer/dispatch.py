@@ -1026,17 +1026,33 @@ def dispatch_code_review(
     # DiffParseError → advisory neutral so a fetcher bug or GitHub
     # format drift cannot 500 the webhook.
     try:
-        diff_text, used_living_compare = with_install_token_retry(
-            installation_id,
-            lambda token: _fetch_pr_diff_with_scope(
-                token,
-                owner,
-                repo_name,
-                pull_number,
-                base_sha=living_prior_sha or base_sha,
-                head_sha=head_sha,
-            ),
-        )
+        if living_prior_sha:
+            diff_text, used_living_compare = with_install_token_retry(
+                installation_id,
+                lambda token: _fetch_pr_diff_with_scope(
+                    token,
+                    owner,
+                    repo_name,
+                    pull_number,
+                    base_sha=living_prior_sha,
+                    head_sha=head_sha,
+                ),
+            )
+        else:
+            # Retain the established fetch seam for ordinary full reviews;
+            # Guard/Smasher and focused dispatch tests share this helper.
+            diff_text = with_install_token_retry(
+                installation_id,
+                lambda token: _fetch_pr_diff(
+                    token,
+                    owner,
+                    repo_name,
+                    pull_number,
+                    base_sha=base_sha,
+                    head_sha=head_sha,
+                ),
+            )
+            used_living_compare = False
         if living_prior_sha and not used_living_compare:
             living_prior_sha = ""
             living_range = ""
