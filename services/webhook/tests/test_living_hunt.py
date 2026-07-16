@@ -60,9 +60,14 @@ def test_fetch_pr_diff_scope_reports_full_fallback(monkeypatch):
             request=httpx.Request("GET", "https://pull"),
         ),
     ]
+    requested_urls: list[str] = []
+
+    def fake_get(url: str, **_kwargs):
+        requested_urls.append(url)
+        return responses.pop(0)
+
     monkeypatch.setattr(
-        cr_dispatch.httpx, "get",
-        lambda *_args, **_kwargs: responses.pop(0),
+        cr_dispatch.httpx, "get", fake_get,
     )
 
     diff, used_compare = cr_dispatch._fetch_pr_diff_with_scope(
@@ -71,6 +76,10 @@ def test_fetch_pr_diff_scope_reports_full_fallback(monkeypatch):
 
     assert diff == "full diff"
     assert used_compare is False
+    assert requested_urls == [
+        "https://api.github.com/repos/owner/repo/compare/abc...def",
+        "https://api.github.com/repos/owner/repo/pulls/7",
+    ]
 
 
 def test_elder_last_sk_is_stable():

@@ -109,6 +109,7 @@ _RUNTIME_EXPR_RE = re.compile(
     rf"[A-Za-z_][A-Za-z0-9_]*{_RUNTIME_SEGMENT}+"
 )
 _IDENTIFIER_RE = re.compile(r"[A-Za-z_][A-Za-z0-9_]*")
+_MULTILINE_CALL_START_RE = re.compile(r"[A-Za-z_][A-Za-z0-9_]*\(")
 _QUOTED_RUNTIME_REFERENCE_RE = re.compile(
     r"(?:"
     r"\$\{\{[^{}\r\n]+\}\}"
@@ -140,6 +141,7 @@ def _generic_literal_value(match: re.Match[str]) -> str | None:
             return None
         if (
             _RUNTIME_EXPR_RE.fullmatch(value)
+            or _MULTILINE_CALL_START_RE.fullmatch(value)
             or (value.startswith("{") and value.endswith("}"))
             or (value.startswith("[") and value.endswith("]"))
         ):
