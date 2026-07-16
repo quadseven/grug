@@ -464,6 +464,37 @@ repo's `LEDGER#<owner/repo>` rows when feedback is not appearing. The ledger
 write and cache refresh happen before `last_verdict` advances, so a transient
 store failure retries the idempotent learning update on the next poll.
 
+### Review latency harness (#648)
+
+Short Ollama smokes do not model long-context review prefill. The
+`review_latency` package replays Elder-shaped prompts (real
+`_build_messages` path) at concurrency 1/2/4/8 and reports p50/p95
+complete wall-clock (and TTFT when streaming works).
+
+Pure unit tests ship in `make webhook-test`. Live runs are **manual /
+on-demand only** (never per-PR CI):
+
+```bash
+# From a host that can reach the Cave OpenAI-compatible endpoint.
+# Do not commit private URLs or keys.
+cd services/webhook
+export GRUG_BENCH_CAVE_URL='https://<your-cave-chat-completions-url>'
+export GRUG_BENCH_CAVE_MODEL='qwen3-coder-next:q8_0'   # or reasoner model
+# optional second arm:
+# export GRUG_BENCH_REASONER_URL=...
+# export GRUG_BENCH_REASONER_MODEL=...
+
+make -C ../.. review-latency
+# or:
+PYTHONPATH=../_shared uv run --with httpx python -m review_latency \
+  --levels 1,2,4,8 --json /tmp/latency-trials.json
+```
+
+Compare a candidate runtime (e.g. vLLM) by pointing `GRUG_BENCH_CAVE_URL`
+at that server with the same model id and re-running; keep the fixture
+set identical. Decision rule for #649: only cut over if p95 complete at
+C=4/8 improves without a parse-fail regression.
+
 ### Rollback
 
 Production default is **tiered** (ADR-0019): single coder arm unless
