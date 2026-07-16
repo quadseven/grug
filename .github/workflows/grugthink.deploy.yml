@@ -29,6 +29,7 @@ concurrency:
 jobs:
   deploy:
     runs-on: ubuntu-24.04-arm  # cluster is arm64 - build native
+    timeout-minutes: 30  # hygiene Rule 7: don't inherit the 6h default (matches deploy.k8s.yml)
     environment: k8s-prod
     permissions:
       contents: read
