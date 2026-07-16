@@ -57,6 +57,7 @@ from personas.code_reviewer.diff_parser import (
 from personas.code_reviewer.precedent import (
     class_precision, match_precedent, render_precedent_note,
 )
+from personas.code_reviewer.claim_check import scan_claim_checks
 from personas.code_reviewer.complexity import scan_complexity
 from personas.code_reviewer.cross_file import (
     extract_symbols, fetch_cross_file_context,
@@ -333,6 +334,63 @@ def _fetch_file_contents(
                 extra={"path": path, "ref": ref, "error": str(e)},
             )
     return contents
+
+
+# When a PR only retouches k8s/docs comments about settle/deep policy, the
+# implementation source of truth may not be in `changed_paths`. Pull these
+# known helpers (best-effort) so the claim-check detector can still compare
+# numbers. Harmless no-ops on foreign repos (404 -> skip).
+_CLAIM_CHECK_POLICY_PATHS: tuple[str, ...] = (
+    "services/_shared/personas/code_reviewer/snapshot.py",
+    "services/_shared/llm_client.py",
+)
+_CLAIM_HINT_RE = re.compile(
+    r"(?i)(?:settle|steady\s+hunt|swift\s+hunt|deep[_\s-]?diff|"
+    r"GRUG_DEEP_DIFF|GRUG_ELDER_SETTLE|min\(\s*base)",
+)
+
+
+def _enrich_claim_check_sources(
+    installation_id: int,
+    owner: str,
+    repo_name: str,
+    head_sha: str,
+    file_contents: dict[str, str],
+    hunks: tuple[DiffHunk, ...],
+) -> dict[str, str]:
+    """Return file_contents plus policy sources needed for claim checks.
+
+    Only fetches when the diff shows claim-ish language and a known policy
+    path is missing. Fail-open: any fetch error returns the original map.
+    """
+    if not any(
+        _CLAIM_HINT_RE.search(raw)
+        for h in hunks
+        for raw in h.body.splitlines()
+        if raw.startswith("+")
+    ):
+        return file_contents
+    missing = tuple(p for p in _CLAIM_CHECK_POLICY_PATHS if p not in file_contents)
+    if not missing:
+        return file_contents
+    try:
+        extra = with_install_token_retry(
+            installation_id,
+            lambda token: _fetch_file_contents(
+                token, owner, repo_name, missing, head_sha,
+            ),
+        )
+    except (httpx.HTTPStatusError, httpx.RequestError) as e:
+        log.info(
+            "code_review_claim_check_sources_unavailable",
+            extra={"pr": f"{owner}/{repo_name}", "error": str(e)},
+        )
+        return file_contents
+    if not extra:
+        return file_contents
+    merged = dict(file_contents)
+    merged.update(extra)
+    return merged
 
 
 def _fetch_pr_review_comments(
@@ -909,7 +967,15 @@ def _review_stack_body(
             "",
         ])
     else:
-        parts.extend(["", "---", "", "No agent prompt — nothing to remediate.", ""])
+        # Degraded (all_failed / parse_failed / ...) with empty findings is
+        # not a clean review - say so instead of "nothing to remediate".
+        if evaluation.degraded_reason:
+            status = (
+                "No agent prompt — review degraded; no usable findings were produced."
+            )
+        else:
+            status = "No agent prompt — nothing to remediate."
+        parts.extend(["", "---", "", status, ""])
     return "\n".join(parts)
 
 
@@ -1560,6 +1626,31 @@ def dispatch_code_review(
                 "installation_id": installation_id,
                 "pr": f"{owner}/{repo_name}#{pull_number}",
                 "count": len(complexity_findings),
+            },
+        )
+
+    # Deterministic docs/code claim check: catch comment/env prose that
+    # asserts the wrong settle cap or deep-diff bound (the Qodo/CR class
+    # on #664). Pure + advisory MEDIUM; never aborts the review.
+    try:
+        claim_file_contents = _enrich_claim_check_sources(
+            installation_id, owner, repo_name, head_sha, file_contents, hunks,
+        )
+        claim_findings = scan_claim_checks(hunks, claim_file_contents)
+    except Exception as e:  # noqa: BLE001 - enrichment must never abort a review
+        log.info(
+            "code_review_claim_check_failed",
+            extra={"pr": f"{owner}/{repo_name}#{pull_number}", "kind": type(e).__name__},
+        )
+        claim_findings = ()
+    if claim_findings:
+        evaluation = with_extra_findings(evaluation, claim_findings)
+        log.info(
+            "code_review_claim_check_findings",
+            extra={
+                "installation_id": installation_id,
+                "pr": f"{owner}/{repo_name}#{pull_number}",
+                "count": len(claim_findings),
             },
         )
 

@@ -81,6 +81,19 @@ Shipped after the dense-inline-analyst harvest comparison:
    actionable count, severity breakdown, markings table, consolidated agent prompt
 5. Autofix push still out of scope (comment-only + suggestion + agent prompt)
 
+## Smarter Elder: docs/code claim floor
+
+Qodo/CodeRabbit caught settle-comment and exclusive-bound drift that pure
+LLM review missed on speed PRs (#664 class). Shipped:
+
+1. Deterministic `claim_check.scan_claim_checks` - compares ADDED comment/doc
+   claims (Steady medium settle cap, deep-diff exclusive vs inclusive) to
+   implementation facts at head; advisory MEDIUM, no judge.
+2. Dispatch enrich: when the diff mentions settle/deep policy, also fetch
+   known policy sources (`snapshot.py`, `llm_client.py`) if missing from
+   changed paths so comment-only PRs still get a floor.
+3. LLM rule `doc-code-claim-drift` for the general numeric claim class.
+
 ## Next slices (tracked)
 
 - Living Hunt: commit-range scoped re-review (#557)
