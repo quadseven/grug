@@ -36,6 +36,7 @@ import httpx
 
 from adapters.install_store import get_repo_config  # type: ignore
 from github_app_auth import with_install_token_retry
+from github_checks_client import CheckRunResult, post_check_run
 from personas.code_reviewer.dispatch import dispatch_code_review
 from personas.code_reviewer.snapshot import (
     review_snapshot_id,
@@ -77,6 +78,11 @@ _REVIEW_CLAIM_HEARTBEAT_SECONDS = 120.0
 # superseding commit quickly - a superseded review should die within roughly
 # this many seconds of the new commit landing, not run to its full budget.
 _STALENESS_WATCH_INTERVAL_S = 10.0
+# Must match personas/code_reviewer/dispatch.py:_CHECK_NAME — this is the
+# REQUIRED status-check context on grug-gated repos. Posting it as
+# in_progress at enqueue time is what stops GitHub rulesets from treating a
+# multi-minute durable review as "required check never ran" (BLOCKED).
+_ELDER_CHECK_NAME = "Grug — Code Review"
 
 
 @dataclass(frozen=True, slots=True)
@@ -136,6 +142,181 @@ def enqueue_rerun(*, install_id: int, repo: str, pr_number: int, persona: str) -
     )
 
 
+
+def _elder_check_already_terminal_or_pending(
+    *,
+    install_id: int,
+    owner: str,
+    repo_name: str,
+    head_sha: str,
+) -> str | None:
+    """Return a skip reason if re-posting in_progress would reopen a settled
+    or already-pending Elder check on this head.
+
+    FIFO SQS can accept a send while suppressing delivery for 5 minutes
+    (same MessageDeduplicationId). Re-posting in_progress on that path can
+    reopen a completed required check with no worker guaranteed to finish
+    it. Listing the latest check-run for this name+head is the ground truth.
+    """
+    def _do(token: str) -> str | None:
+        resp = httpx.get(
+            f"{_GH_API}/repos/{quote(owner, safe='')}/{quote(repo_name, safe='')}"
+            f"/commits/{quote(head_sha, safe='')}/check-runs",
+            params={"check_name": _ELDER_CHECK_NAME, "filter": "latest", "per_page": 10},
+            headers={
+                "Authorization": f"Bearer {token}",
+                "Accept": "application/vnd.github+json",
+                "X-GitHub-Api-Version": "2022-11-28",
+            },
+            timeout=_FETCH_TIMEOUT,
+        )
+        resp.raise_for_status()
+        runs = (resp.json() or {}).get("check_runs") or []
+        for run in runs:
+            if str(run.get("name") or "") != _ELDER_CHECK_NAME:
+                continue
+            status = str(run.get("status") or "")
+            conclusion = str(run.get("conclusion") or "")
+            if status in {"queued", "in_progress"}:
+                return f"already_{status}"
+            if status == "completed":
+                # Any completed conclusion is terminal (including
+                # action_required / stale). Creating a NEW in_progress run
+                # would reopen the required check with no worker guaranteed.
+                return f"already_completed_{conclusion or 'unknown'}"
+        return None
+
+    try:
+        return with_install_token_retry(install_id, _do)
+    except Exception as error:  # noqa: BLE001 - visibility path; prefer post over silent skip on list failure
+        log.warning(
+            "elder_in_progress_check_list_failed",
+            extra={
+                "install_id": install_id,
+                "repo": f"{owner}/{repo_name}",
+                "head_sha": head_sha[:8],
+                "kind": type(error).__name__,
+            },
+        )
+        return None
+
+
+def _post_elder_in_progress_check(
+    *,
+    install_id: int,
+    repo: str,
+    pr_number: int,
+    head_sha: str,
+    settle_seconds: int,
+) -> None:
+    """Best-effort: mark `Grug — Code Review` in_progress for this head.
+
+    Elder is durable + settle-windowed; a deep review routinely takes minutes
+    and can be mid-flight-cancelled/re-enqueued when base/title/body moves.
+    Without an in_progress check, GitHub required-status rulesets treat the
+    PR as BLOCKED ("check missing") for the entire queue+LLM window — the
+    failure mode agents keep reading as "Grug Code Review never ran".
+
+    Failures here MUST NOT fail the enqueue: the durable SQS job is the
+    correctness path; the pending check is a visibility/UX gate only.
+    """
+    if "/" not in repo:
+        log.warning(
+            "elder_in_progress_check_bad_repo",
+            extra={"install_id": install_id, "repo": repo, "pr": pr_number},
+        )
+        return
+    owner, repo_name = repo.split("/", 1)
+    if not (owner and repo_name and head_sha):
+        log.warning(
+            "elder_in_progress_check_missing_ids",
+            extra={
+                "install_id": install_id,
+                "repo": repo,
+                "pr": pr_number,
+                "head_sha": head_sha[:8] if head_sha else "",
+            },
+        )
+        return
+    skip_reason = _elder_check_already_terminal_or_pending(
+        install_id=install_id,
+        owner=owner,
+        repo_name=repo_name,
+        head_sha=head_sha,
+    )
+    if skip_reason:
+        log.info(
+            "elder_in_progress_check_skipped",
+            extra={
+                "install_id": install_id,
+                "repo": repo,
+                "pr": pr_number,
+                "head_sha": head_sha[:8],
+                "reason": skip_reason,
+            },
+        )
+        return
+    settle_line = (
+        "Swift Hunt: no quiet wait - deep review starts now."
+        if settle_seconds <= 0
+        else (
+            f"Quiet window {settle_seconds}s, then dual-arm deep review "
+            "(coder + reasoner on the Cave)."
+        )
+    )
+    check = CheckRunResult(
+        name=_ELDER_CHECK_NAME,
+        head_sha=head_sha,
+        status="in_progress",
+        conclusion=None,
+        title="Elder is reading the markings",
+        summary=(
+            f"{settle_line}\n\n"
+            "Grug posts this check as soon as the durable review is queued so "
+            "required-status rulesets show **pending**, never 'missing'. "
+            "Lore (prior findings), Omen (runtime signal), and cross-file "
+            "context ride the same pass. Mid-flight cancels re-enqueue when "
+            "base/head or real author intent change."
+        ),
+    )
+    try:
+        with_install_token_retry(
+            install_id,
+            lambda token: post_check_run(
+                token,
+                owner,
+                repo_name,
+                check,
+                external_id=(
+                    f"grug-cr-pending:{owner}/{repo_name}"
+                    f"#{pr_number}:{head_sha}"
+                ),
+            ),
+        )
+    except Exception as error:  # noqa: BLE001 - visibility only; never fail enqueue
+        log.warning(
+            "elder_in_progress_check_failed",
+            extra={
+                "install_id": install_id,
+                "repo": repo,
+                "pr": pr_number,
+                "head_sha": head_sha[:8],
+                "kind": type(error).__name__,
+            },
+        )
+        return
+    log.info(
+        "elder_in_progress_check_posted",
+        extra={
+            "install_id": install_id,
+            "repo": repo,
+            "pr": pr_number,
+            "head_sha": head_sha[:8],
+            "settle_seconds": settle_seconds,
+        },
+    )
+
+
 def enqueue_review(
     *,
     install_id: int,
@@ -153,6 +334,10 @@ def enqueue_review(
     complete review input, not only the head. The consumer still fetches the
     current PR before and after settling, so queued title/body text is never
     trusted as the source of review evidence.
+
+    After a successful SQS send, posts a best-effort in_progress
+    `Grug — Code Review` check so required-status rulesets show pending
+    rather than "check never ran" while the durable lane works.
     """
     if not _RERUN_QUEUE_URL:
         raise RuntimeError("GRUG_RERUN_QUEUE_URL not configured")
@@ -193,6 +378,14 @@ def enqueue_review(
             "snapshot_id": requested_snapshot_id[:11],
             "settle_seconds": settle,
         },
+    )
+    # After SQS only: a pre-send check would hang forever if enqueue failed.
+    _post_elder_in_progress_check(
+        install_id=install_id,
+        repo=repo,
+        pr_number=pr_number,
+        head_sha=requested_head_sha,
+        settle_seconds=settle,
     )
 
 # Persona rerun sets + dispatch-routing groups come from the shared

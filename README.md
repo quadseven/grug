@@ -24,7 +24,7 @@ are enabled by default:
 
 - **Chief** (`Grug - Definition of Ready`) - static PR-readiness checks and
   branch-ruleset self-heal.
-- **Elder** (`Grug - Code Review`) - durable, deep LLM diff review with
+- **Elder** (`Grug — Code Review`) - durable, deep LLM diff review with
   whole-file, cross-file, PR-intent, and runtime context.
 - **Guard** (`Grug - Guard`) - Semgrep, dependency-CVE, secret, and IaC
   detection filtered through an exploitability judge.
@@ -77,25 +77,32 @@ Static checks on PR body — **4 blocking, 1 advisory:**
 
 ## What Elder and Guard check
 
-### Elder: deep code review
+### Elder: deep code review (Apex)
 
-Every PR snapshot, after its base, head, title, and body remain stable for the
-quiet window:
+Every PR snapshot, after its base, head, and real author intent stay stable for
+the adaptive quiet window:
 
-- **LLM review** - after a durable 90-second quiet-snapshot window, the default
-  deep pass sends whole-file context plus untrusted PR intent to both Poolside
-  and OpenRouter (review-only Opus 4.7 with high-effort reasoning), merges
-  deduplicated findings, and preserves backend/model provenance. It covers 25+
-  named correctness, error-handling, concurrency, and security-shape rules;
-  `GRUG_REVIEW_DEPTH=fast` is the one-primary-plus-fallback rollback. A
-  self-hosted fallback remains behind an SQS airlock when both clouds fail
-  (ADR-0005). If only one deep backend succeeds, its findings are published as
-  provisional advice and the durable job retries instead of recording a clean
-  completed review.
+- **Swift Hunt settle** - tiny PRs skip the quiet wait; medium PRs settle a few
+  seconds; large multi-file storms keep the full window. Elder posts an
+  `in_progress` `Grug — Code Review` check the moment the durable job is
+  queued, so required-status rulesets show pending instead of "check missing".
+- **Dual-arm deep review** - coder + reasoner arms on the owned Cave run in
+  parallel, merge findings, and grade through the judge. Covers 25+ named
+  correctness, error-handling, concurrency, and security-shape rules. Whole-file
+  + 1-hop cross-file context + PR intent ride every pass. `GRUG_REVIEW_DEPTH=fast`
+  is the one-arm rollback. SaaS overload fallback stays last-resort (ADR-0005).
+- **Markings Board** - structured inline findings: severity, effort, What Elder
+  sees, Fix (one-click when safe), Lore citations from prior tribe history, and
+  a copy-paste agent repair prompt. Check-run summary is a full findings table.
+- **Lore + Omen** - accepted/rejected ledger history becomes measured confidence
+  and few-shot practices; Datadog runtime signal (Omen) fuses when a service map
+  exists - a moat that comes from owning the stack end-to-end.
+- **Stable snapshot identity** - bot HTML footers no longer thrash mid-flight
+  reviews; only base/head or real human intent changes re-queue Elder.
 - **Feedback learning** - judge labels and write-authorized maintainer reactions
   retain per-model provenance. Confirmed findings refresh positive practices and
   few-shot examples; false positives become bounded AVOID guidance for later
-  reviews. Reactions from users without write access cannot steer the prompt.
+  reviews.
 
 ### Guard: deterministic security review
 

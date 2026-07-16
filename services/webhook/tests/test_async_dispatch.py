@@ -154,6 +154,25 @@ def test_enqueue_elder_uses_durable_quiet_window_queue(monkeypatch):
     thread.assert_not_called()
 
 
+
+def test_durable_elder_swift_settle_for_tiny_pr(monkeypatch):
+    """Swift Hunt: tiny PR drops the quiet window to 0 while still durable."""
+    monkeypatch.setenv("GRUG_ELDER_DURABLE_QUEUE", "1")
+    monkeypatch.setenv("GRUG_ELDER_SETTLE_SECONDS", "120")
+    payload = _full_gh_payload()
+    payload["pull_request"]["additions"] = 10
+    payload["pull_request"]["deletions"] = 2
+    payload["pull_request"]["changed_files"] = 1
+
+    with patch("rerun.enqueue_review") as enqueue:
+        ok = ad.enqueue_elder_review(
+            payload=payload, delivery_id="swift-1", blocking=False,
+        )
+
+    assert ok is True
+    assert enqueue.call_args.kwargs["settle_seconds"] == 0
+
+
 def test_durable_elder_draft_does_not_consume_ready_event_dedup_key(monkeypatch):
     monkeypatch.setenv("GRUG_ELDER_DURABLE_QUEUE", "1")
     payload = _full_gh_payload()

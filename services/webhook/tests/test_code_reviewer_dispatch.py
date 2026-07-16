@@ -312,7 +312,9 @@ def test_inline_comment_body_includes_suggestion_block(monkeypatch):
         message="m", suggestion="add a None guard",
     )
     body = cr_dispatch._inline_comment_body(f)
-    assert "Suggested fix" in body and "add a None guard" in body
+    assert "**Fix**" in body
+    assert "add a None guard" in body
+    assert "What Elder sees" in body
     assert "<!-- grug-rule:null-deref -->" in body  # marker still appended
 
 
@@ -327,6 +329,7 @@ def test_inline_comment_body_appends_precedent_note():
     body = cr_dispatch._inline_comment_body(
         f, precedent_note="Grug see this before -- 2 time(s) fixed here (#400, #366).",
     )
+    assert "**Lore**" in body
     assert "> Grug see this before" in body
     assert "#400" in body
     assert body.index("Grug see this before") < body.index("grug-rule:sync-io-in-async")
@@ -378,8 +381,14 @@ def test_summary_markdown_renders_findings_table():
     )
     title, summary = cr_dispatch._summary_markdown(ev)
     assert "1 blocking" in title  # one critical, one low
+    assert "Markings Board" in summary
+    assert "| Severity | Effort | File | Line | Rule | Marking |" in summary
     assert "secret-in-log-or-trace" in summary and "dead-code" in summary
     assert "`x.py`" in summary
+    # Effort column present for every finding row (dash when unknown).
+    assert summary.count("| - |") + summary.count("| quick win |") + summary.count(
+        "| heavy lift |"
+    ) >= 2
 
 
 def test_fetch_pr_review_comments_caps_pages(monkeypatch, caplog):
@@ -1697,7 +1706,7 @@ def test_inline_comment_body_fence_unsafe_suggestion_degrades_to_prose():
     )
     body = cr_dispatch._inline_comment_body(f)
     assert "```suggestion" not in body
-    assert "Suggested fix" in body
+    assert "**Fix**" in body
 
 
 def test_inline_comment_body_effort_chip_and_agent_prompt():
@@ -1850,7 +1859,7 @@ def test_unterminated_fence_in_message_cannot_swallow_the_body():
     assert "```suggestion\nuse(x)\n```" in body
     assert body.rstrip().endswith("<!-- grug-rule:null-deref -->")
     # the head's backtick run was defused below fence-capability
-    head = body.split("**Suggested fix", 1)[0]
+    head = body.split("**Fix", 1)[0]
     assert "```" not in head
 
 
@@ -1867,3 +1876,42 @@ def test_all_newline_suggestion_never_produces_empty_committable_block():
     body = cr_dispatch._inline_comment_body(f)
     assert "```suggestion\n\n```" not in body
     assert "```suggestion" not in body
+
+
+def test_summary_markdown_escapes_hostile_finding_fields():
+    """LLM-controlled file/rule/message must not break Markings table or code spans."""
+    from personas.code_reviewer.persona import CodeReviewEvaluation, Finding
+    ev = CodeReviewEvaluation(
+        findings=(
+            Finding(
+                file="evil`path|x.py",
+                line=1,
+                severity="high",
+                rule_name="rule|with`ticks",
+                message="msg with | pipe and\nnewline",
+                suggestion=None,
+            ),
+        ),
+        conclusion="failure",
+    )
+    _, summary = cr_dispatch._summary_markdown(ev)
+    # Table cells: backticks stripped from code spans; pipes escaped in message.
+    assert "`evilpath|x.py`" in summary
+    assert "`rule|withticks`" in summary
+    assert "msg with \\| pipe and newline" in summary
+    assert summary.count("| Severity | Effort | File | Line | Rule | Marking |") == 1
+
+
+def test_inline_comment_body_defuses_tilde_fences_in_message():
+    """A model message with ~~~ must not open a GFM fence in unfenced prose."""
+    from personas.code_reviewer.persona import Finding
+    f = Finding(
+        file="x.py", line=1, severity="high", rule_name="null-deref",
+        message="~~~\nsecret\n~~~", suggestion=None,
+    )
+    body = cr_dispatch._inline_comment_body(f)
+    # Prose head (before agent-prompt details) must not carry a live fence.
+    head = body.split("<details>", 1)[0]
+    assert "~~~" not in head
+    assert "**Where:**" in head
+    assert "<!-- grug-rule:null-deref -->" in body

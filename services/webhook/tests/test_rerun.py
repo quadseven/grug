@@ -122,6 +122,9 @@ def test_enqueue_review_is_snapshot_scoped_and_carries_quiet_window(monkeypatch)
     monkeypatch.setattr(
         rerun._sqs, "send_message", lambda **kwargs: sent.update(kwargs),
     )
+    # Visibility check is best-effort and out of scope for the FIFO shape
+    # assertion; pin it so a real token path is not exercised.
+    monkeypatch.setattr(rerun, "_post_elder_in_progress_check", lambda **kwargs: None)
 
     rerun.enqueue_review(
         install_id=11,
@@ -153,6 +156,139 @@ def test_enqueue_review_is_snapshot_scoped_and_carries_quiet_window(monkeypatch)
     )
     assert len(sent["MessageDeduplicationId"]) <= 128
     assert len(sent["MessageGroupId"]) <= 128
+
+
+def test_enqueue_review_posts_in_progress_check_after_sqs(monkeypatch):
+    """Required-check rulesets treat a missing Elder check as BLOCKED. Post
+    in_progress immediately after the durable enqueue so agents see pending
+    instead of 'never ran' while deep review runs for minutes."""
+    order: list[str] = []
+    posted: dict = {}
+
+    def send_message(**kwargs):
+        order.append("sqs")
+        return {"MessageId": "m-1"}
+
+    def with_token(install_id, fn):
+        order.append("token")
+        assert install_id == 11
+        return fn("tok-1")
+
+    def post_check(token, owner, repo_name, result, external_id=None):
+        order.append("check")
+        posted.update(
+            {
+                "token": token,
+                "owner": owner,
+                "repo": repo_name,
+                "result": result,
+                "external_id": external_id,
+            }
+        )
+        return {"id": 99}
+
+    monkeypatch.setattr(rerun, "_RERUN_QUEUE_URL", "https://sqs.example/review.fifo")
+    monkeypatch.setattr(rerun._sqs, "send_message", send_message)
+    monkeypatch.setattr(
+        rerun, "_elder_check_already_terminal_or_pending", lambda **k: None,
+    )
+    monkeypatch.setattr(rerun, "with_install_token_retry", with_token)
+    monkeypatch.setattr(rerun, "post_check_run", post_check)
+
+    rerun.enqueue_review(
+        install_id=11,
+        repo="myorg/myrepo",
+        pr_number=7,
+        requested_base_sha="base-123",
+        requested_head_sha="head-123",
+        requested_title="t",
+        requested_body="b",
+        settle_seconds=10,
+    )
+
+    assert order == ["sqs", "token", "check"]
+    assert posted["token"] == "tok-1"
+    assert posted["owner"] == "myorg"
+    assert posted["repo"] == "myrepo"
+    result = posted["result"]
+    assert result.name == "Grug — Code Review"
+    assert result.head_sha == "head-123"
+    assert result.status == "in_progress"
+    assert result.conclusion is None
+    assert posted["external_id"] == "grug-cr-pending:myorg/myrepo#7:head-123"
+
+
+
+def test_enqueue_review_skips_in_progress_when_check_already_terminal(monkeypatch):
+    """FIFO-deduped re-enqueue must not reopen a completed Elder check."""
+    sent = {}
+    posts = []
+
+    monkeypatch.setattr(rerun, "_RERUN_QUEUE_URL", "https://sqs.example/review.fifo")
+    monkeypatch.setattr(
+        rerun._sqs, "send_message", lambda **kwargs: sent.update(kwargs),
+    )
+    monkeypatch.setattr(
+        rerun,
+        "_elder_check_already_terminal_or_pending",
+        lambda **k: "already_completed_success",
+    )
+    monkeypatch.setattr(
+        rerun,
+        "post_check_run",
+        lambda *a, **k: posts.append((a, k)) or {"id": 1},
+    )
+    monkeypatch.setattr(
+        rerun, "with_install_token_retry", lambda iid, fn: fn("tok"),
+    )
+
+    rerun.enqueue_review(
+        install_id=11,
+        repo="myorg/myrepo",
+        pr_number=7,
+        requested_base_sha="base-123",
+        requested_head_sha="head-123",
+        requested_title="t",
+        requested_body="b",
+        settle_seconds=10,
+    )
+
+    assert sent["QueueUrl"].endswith("review.fifo")
+    assert posts == []
+
+
+def test_enqueue_review_survives_in_progress_check_failure(monkeypatch):
+    """A GitHub blip on the pending check must not fail the durable enqueue —
+    the SQS job is the correctness path; visibility is best-effort."""
+    sent = {}
+
+    monkeypatch.setattr(rerun, "_RERUN_QUEUE_URL", "https://sqs.example/review.fifo")
+    monkeypatch.setattr(
+        rerun._sqs, "send_message", lambda **kwargs: sent.update(kwargs),
+    )
+    monkeypatch.setattr(
+        rerun, "_elder_check_already_terminal_or_pending", lambda **k: None,
+    )
+    monkeypatch.setattr(
+        rerun,
+        "with_install_token_retry",
+        lambda iid, fn: (_ for _ in ()).throw(RuntimeError("github 500")),
+    )
+
+    # Must not raise.
+    rerun.enqueue_review(
+        install_id=11,
+        repo="myorg/myrepo",
+        pr_number=7,
+        requested_base_sha="base-123",
+        requested_head_sha="head-123",
+        requested_title="t",
+        requested_body="b",
+        settle_seconds=10,
+    )
+
+    assert sent["QueueUrl"] == "https://sqs.example/review.fifo"
+    assert json.loads(sent["MessageBody"])["kind"] == "review"
 
 
 def test_review_dedup_id_is_bounded_and_snapshot_scoped_for_long_repo_names():
@@ -721,3 +857,54 @@ def test_run_one_dispatches_guard(monkeypatch):
     }))
     assert status == "dispatched"
     assert called["blocking"] is True
+
+
+def test_elder_check_already_terminal_treats_any_completed_conclusion(monkeypatch):
+    """action_required and stale are completed; do not reopen as in_progress."""
+    for conclusion in ("action_required", "stale", "success", ""):
+        captured = {}
+
+        def with_token(install_id, fn, _c=conclusion):
+            class Resp:
+                def raise_for_status(self):
+                    return None
+
+                def json(self):
+                    return {
+                        "check_runs": [
+                            {
+                                "name": "Grug — Code Review",
+                                "status": "completed",
+                                "conclusion": _c,
+                            }
+                        ]
+                    }
+
+            import httpx as _httpx
+            # inject via monkeypatch on httpx.get below
+            return fn("tok")
+
+        def fake_get(url, **kwargs):
+            class Resp:
+                def raise_for_status(self):
+                    return None
+
+                def json(self):
+                    return {
+                        "check_runs": [
+                            {
+                                "name": "Grug — Code Review",
+                                "status": "completed",
+                                "conclusion": conclusion,
+                            }
+                        ]
+                    }
+            return Resp()
+
+        monkeypatch.setattr(rerun, "with_install_token_retry", lambda iid, fn: fn("tok"))
+        monkeypatch.setattr(rerun.httpx, "get", fake_get)
+        reason = rerun._elder_check_already_terminal_or_pending(
+            install_id=1, owner="o", repo_name="r", head_sha="h" * 40,
+        )
+        assert reason is not None
+        assert reason.startswith("already_completed_"), (conclusion, reason)
