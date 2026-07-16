@@ -23,6 +23,8 @@ spec:
     matchLabels: {app: grug-api}
   template:
     metadata:
+      annotations:
+        ad.datadoghq.com/webhook.logs: '[{"source":"python","service":"grug-api"}]'
       labels:
         app: grug-api
         tags.datadoghq.com/service: grug-api
