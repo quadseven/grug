@@ -541,7 +541,11 @@ def _summary_markdown(
         f"{phase_line} "
         "Inline comments carry Fix + agent prompt on each marking.\n\n"
     )
-    return title, f"{legend}{table}{held}{hunt}\n\n{_consolidated_agent_prompt(evaluation)}"
+    summary = f"{legend}{table}{held}{hunt}"
+    agent = _consolidated_agent_prompt(evaluation)
+    if agent:
+        summary = f"{summary}\n\n{agent}"
+    return title, summary
 
 
 # GitHub caps check-run summaries at 65536 chars; the findings table is
@@ -553,7 +557,14 @@ _CONSOLIDATED_PROMPT_BUDGET = 8000
 def _consolidated_agent_prompt(evaluation: CodeReviewEvaluation) -> str:
     """One copy-paste prompt covering the findings (#553), deterministic
     and bounded. Truncates by whole findings and SAYS how many were cut -
-    a silently-partial prompt would read as the complete work list."""
+    a silently-partial prompt would read as the complete work list.
+
+    Returns empty string when there are no findings — never emit a hollow
+    "Address each finding below" shell with nothing under it.
+    """
+    if not evaluation.findings:
+        return ""
+
     header = [
         _AGENT_META_PREAMBLE,
         "",
@@ -864,8 +875,7 @@ def _review_stack_body(
         rows.append(f"| … | +{n - 25} more | | | |")
     table = "\n".join(rows) if findings else "_No inline markings this pass._"
 
-    agent = _consolidated_agent_prompt(evaluation)
-    return "\n".join([
+    parts = [
         _STACK_MARKER,
         "",
         f'<img src="{_PERSONA_PORTRAIT}" width="46" align="left" alt="Grug Elder" />',
@@ -880,18 +890,27 @@ def _review_stack_body(
         "### Markings",
         "",
         table,
-        "",
-        "### Prompt for AI agents",
-        "",
-        agent if agent else "_No findings to remediate._",
-        "",
-        "---",
-        "",
-        "Inline comments carry Fix + agent prompt on each marking. "
-        "Autofix push is not enabled — apply suggestions or hand the agent prompt "
-        "to your coding agent.",
-        "",
-    ])
+    ]
+    # Only when there is something to fix — empty "Address each finding"
+    # shells are noise (and look broken).
+    agent = _consolidated_agent_prompt(evaluation)
+    if agent:
+        parts.extend([
+            "",
+            "### Prompt for AI agents",
+            "",
+            agent,
+            "",
+            "---",
+            "",
+            "Inline comments carry Fix + agent prompt on each marking. "
+            "Autofix push is not enabled — apply suggestions or hand the agent "
+            "prompt to your coding agent.",
+            "",
+        ])
+    else:
+        parts.extend(["", "---", "", "No agent prompt — nothing to remediate.", ""])
+    return "\n".join(parts)
 
 
 def _find_stack_comment_id(
