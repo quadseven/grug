@@ -419,6 +419,7 @@ def _summary_markdown(
     evaluation: CodeReviewEvaluation, *, suppressed_count: int = 0,
     excluded_paths: tuple[str, ...] = (),
     living_range: str = "",
+    review_phase: Literal["tier1", "deep", "dual"] = "dual",
 ) -> tuple[str, str]:
     """Render a (title, summary) pair for the check-run output.
 
@@ -429,6 +430,8 @@ def _summary_markdown(
     finding is never a silent gap.
     `living_range` (#557) when set is the prior..head delta Elder reviewed
     (Living Hunt) instead of the full PR base..head.
+    `review_phase` (#646): tier1 = coder-only legend; deep = append legend;
+    dual = both arms before publish (deep depth / rollback).
     """
     held = (
         f"\n\nGrug held back {suppressed_count} weak finding(s) his judge doubted."
@@ -516,10 +519,25 @@ def _summary_markdown(
             f"{_md_table_cell(f.message)} |"
         )
     table = "\n".join(rows)
+    if review_phase == "tier1":
+        phase_line = (
+            "Tier-1 coder-arm review on the Cave (reasoner may append later "
+            "if escalated), graded by the judge, grounded in Lore when prior "
+            "tribe history exists."
+        )
+    elif review_phase == "deep":
+        phase_line = (
+            "Deep reasoner arm appended after Tier-1 completed, graded by "
+            "the judge, grounded in Lore when prior tribe history exists."
+        )
+    else:
+        phase_line = (
+            "Dual-arm deep review (coder + reasoner on the Cave), graded by "
+            "the judge, grounded in Lore when prior tribe history exists."
+        )
     legend = (
         "## Markings Board\n\n"
-        "Dual-arm deep review (coder + reasoner on the Cave), graded by "
-        "the judge, grounded in Lore when prior tribe history exists. "
+        f"{phase_line} "
         "Inline comments carry Fix + agent prompt on each marking.\n\n"
     )
     return title, f"{legend}{table}{held}{hunt}\n\n{_consolidated_agent_prompt(evaluation)}"
@@ -1304,10 +1322,15 @@ def dispatch_code_review(
     # Both clients are independent — a 5xx on review post must not
     # skip the check-run post.
     conclusion, event = _publish_shape(evaluation, mode=mode)
+    depth_now = os.getenv("GRUG_REVIEW_DEPTH", "tiered").strip().lower()
+    tier1_phase: Literal["tier1", "deep", "dual"] = (
+        "tier1" if depth_now == "tiered" else "dual"
+    )
     title, summary = _summary_markdown(
         evaluation, suppressed_count=len(suppressed),
         excluded_paths=excluded_paths,
         living_range=living_range,
+        review_phase=tier1_phase,
     )
     check_result = CheckRunResult(
         name=_CHECK_NAME,
@@ -1720,6 +1743,9 @@ def _async_deep_append_if_needed(
         return
 
     deep_eval = evaluate_diff(hunks, deep_llm)
+    # Keep the full graded set for eval telemetry before publication gate
+    # mutates the published list (verdict indices bind to this tuple).
+    deep_graded = deep_eval.findings
     deep_verdicts = grade_findings(
         deep_eval, hunks, installation_id,
         pr_context=pr_context,
@@ -1728,31 +1754,60 @@ def _async_deep_append_if_needed(
         runtime_context=runtime_context,
     )
     deep_kept, deep_suppressed = partition_findings(
-        deep_eval.findings, deep_verdicts,
+        deep_graded, deep_verdicts,
     )
     if deep_suppressed:
         deep_eval = with_findings(deep_eval, deep_kept)
 
-    # Dedupe against already-posted Tier-1 + prior-push comments.
+    # Supersession after long reasoner/judge work (#646 CodeRabbit).
+    if cancel_event is not None and cancel_event.is_set():
+        log.info(
+            "elder_async_deep_skipped_cancelled",
+            extra={"pr": f"{owner}/{repo_name}#{pull_number}"},
+        )
+        return
+    if action == "review":
+        stale = _review_snapshot_freshness_failure(
+            installation_id=installation_id,
+            owner=owner,
+            repo_name=repo_name,
+            pull_number=pull_number,
+            expected_snapshot_id=snapshot_id,
+            expected_head_sha=head_sha,
+        )
+        if stale is not None:
+            log.info(
+                "elder_async_deep_skipped_stale",
+                extra={"pr": f"{owner}/{repo_name}#{pull_number}", "when": "post_infer"},
+            )
+            return
+
+    # Dedupe against already-posted Tier-1 + prior-push comments AND drop
+    # reasoner duplicates from the combined check summary.
     tier1_keys = frozenset(
         finding_key(f.file, f.line, f.rule_name) for f in evaluation.findings
     )
     all_prior = prior_keys | tier1_keys
-    if not deep_eval.findings:
+    novel_deep = tuple(
+        f for f in deep_eval.findings
+        if finding_key(f.file, f.line, f.rule_name) not in tier1_keys
+    )
+    if novel_deep:
+        deep_eval = with_findings(deep_eval, novel_deep)
+        combined = with_extra_findings(evaluation, novel_deep)
+    else:
         log.info(
             "elder_async_deep_no_findings",
             extra={"pr": f"{owner}/{repo_name}#{pull_number}"},
         )
-        # Still refresh check summary so operators see deep completed.
         combined = evaluation
-    else:
-        combined = with_extra_findings(evaluation, deep_eval.findings)
 
     conclusion, event = _publish_shape(combined, mode=mode)
     title, summary = _summary_markdown(
         combined,
         suppressed_count=len(deep_suppressed),
         living_range=living_range,
+        review_phase="deep",
     )
     title = f"{title} (deep append)"
     summary = (
@@ -1786,34 +1841,35 @@ def _async_deep_append_if_needed(
             },
         )
 
-    review_result = _build_review_result(
-        deep_eval if deep_eval.findings else combined,
-        head_sha=head_sha,
-        event=event,
-        prior_keys=all_prior,
-        precedent_notes={},
-    )
-    if review_result is not None and deep_eval.findings:
-        try:
-            with_install_token_retry(
-                installation_id,
-                lambda token: post_review(
-                    token, owner, repo_name,
-                    pull_number=pull_number, result=review_result,
-                ),
-            )
-        except (httpx.HTTPStatusError, httpx.RequestError) as e:
-            log.warning(
-                "elder_async_deep_review_publish_failed",
-                extra={
-                    "pr": f"{owner}/{repo_name}#{pull_number}",
-                    "kind": type(e).__name__,
-                },
-            )
+    if novel_deep:
+        review_result = _build_review_result(
+            deep_eval,
+            head_sha=head_sha,
+            event=event,
+            prior_keys=all_prior,
+            precedent_notes={},
+        )
+        if review_result is not None:
+            try:
+                with_install_token_retry(
+                    installation_id,
+                    lambda token: post_review(
+                        token, owner, repo_name,
+                        pull_number=pull_number, result=review_result,
+                    ),
+                )
+            except (httpx.HTTPStatusError, httpx.RequestError) as e:
+                log.warning(
+                    "elder_async_deep_review_publish_failed",
+                    extra={
+                        "pr": f"{owner}/{repo_name}#{pull_number}",
+                        "kind": type(e).__name__,
+                    },
+                )
 
     try:
         submit_evals(
-            deep_eval.findings, deep_verdicts,
+            deep_graded, deep_verdicts,
             review_span_context=deep_llm.review_span_context,
         )
     except Exception as e:  # noqa: BLE001
@@ -1829,7 +1885,7 @@ def _async_deep_append_if_needed(
         "elder_async_deep_done",
         extra={
             "pr": f"{owner}/{repo_name}#{pull_number}",
-            "deep_findings": len(deep_eval.findings),
+            "deep_findings": len(novel_deep),
             "reasons": list(decision.reasons),
         },
     )
