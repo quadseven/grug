@@ -22,6 +22,7 @@ publisher (next slice) has a stable place to read the fix hint.
 """
 from __future__ import annotations
 
+import re
 from dataclasses import dataclass, field
 from typing import get_args
 
@@ -43,6 +44,46 @@ _ADVISORY_SEVERITIES: frozenset[Severity] = frozenset(("low", "medium"))
 assert frozenset(get_args(Severity)) == _BLOCKING_SEVERITIES | _ADVISORY_SEVERITIES, (
     "Severity Literal drifted from blocking/advisory partition"
 )
+
+_DECLARATIVE_PATH_RE = re.compile(r"\.(?:ya?ml|json|toml)$", re.IGNORECASE)
+_STATIC_SCALAR_RE = re.compile(
+    r"^\s*(?:[A-Za-z0-9_.\/-]+|\"[^$'\"{}]+\")\s*[:=]\s*"
+    r"(?:[A-Za-z0-9_.\/-]+|['\"][^$'{\"}]*['\"])\s*,?\s*$"
+)
+
+
+def _changed_line_text(hunk: DiffHunk, target_line: int) -> str | None:
+    """Return target new-side text from one unified-diff hunk."""
+    # DiffHunk.body is typed str and validated at parse time, but callers may
+    # pass synthetic hunks in tests; never AttributeError on empty/missing body.
+    body = getattr(hunk, "body", None)
+    if not body:
+        return None
+    new_line = hunk.new_start
+    for raw in body.splitlines()[1:]:
+        if raw.startswith("\\"):
+            continue
+        if raw.startswith("-"):
+            continue
+        text = raw[1:] if raw.startswith(("+", " ")) else raw
+        if new_line == target_line:
+            return text
+        new_line += 1
+    return None
+
+
+def _is_static_declarative_scalar(
+    path: str, line: int, hunks: tuple[DiffHunk, ...],
+) -> bool:
+    """True for literal manifest values with no template/input expression."""
+    if _DECLARATIVE_PATH_RE.search(path) is None:
+        return False
+    for hunk in hunks:
+        if hunk.file_path != path or line not in hunk.new_lines:
+            continue
+        text = _changed_line_text(hunk, line)
+        return text is not None and _STATIC_SCALAR_RE.fullmatch(text) is not None
+    return False
 
 
 @dataclass(frozen=True, slots=True)
@@ -219,6 +260,14 @@ def evaluate_diff(
             # "100% hallucination" from "no findings at all" — both
             # yield findings=() but only one is a real clean PR.
             dropped += 1
+            continue
+        # A repository-owned literal manifest scalar has no external taint
+        # source. Reject the exact false-positive class seen on infra#1806;
+        # templated values (`{{ }}`, `${...}`) deliberately do not match.
+        if (
+            raw.rule == "unvalidated-external-input"
+            and _is_static_declarative_scalar(raw.path, raw.line, hunks)
+        ):
             continue
         kept.append(
             Finding(

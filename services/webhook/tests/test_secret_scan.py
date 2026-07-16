@@ -106,6 +106,15 @@ def test_runtime_secret_references_are_not_committed_secret_values():
     assert scan_secrets(_hunks(diff)) == ()
 
 
+def test_multiline_lambda_call_is_not_a_committed_token():
+    diff = _diff(
+        "dispatch.py",
+        "lambda token: _fetch_pr_diff_with_scope(",
+        "lambda token: _fetch_current_review_snapshot(",
+    )
+    assert scan_secrets(_hunks(diff)) == ()
+
+
 def test_quoted_secret_punctuation_is_literal_material():
     value = "Ab3$Cd4?Ef5(Gh6)Ij7"
     cands = scan_secrets(_hunks(_diff("config.py", f'api_key = "{value}"')))

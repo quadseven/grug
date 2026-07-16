@@ -109,6 +109,7 @@ _RUNTIME_EXPR_RE = re.compile(
     rf"[A-Za-z_][A-Za-z0-9_]*{_RUNTIME_SEGMENT}+"
 )
 _IDENTIFIER_RE = re.compile(r"[A-Za-z_][A-Za-z0-9_]*")
+_MULTILINE_CALL_START_RE = re.compile(r"[A-Za-z_][A-Za-z0-9_]*\(")
 _QUOTED_RUNTIME_REFERENCE_RE = re.compile(
     r"(?:"
     r"\$\{\{[^{}\r\n]+\}\}"
@@ -118,6 +119,17 @@ _QUOTED_RUNTIME_REFERENCE_RE = re.compile(
     r"|\\\([^()\r\n]+\)"
     r")"
 )
+
+
+def _is_runtime_reference(value: str) -> bool:
+    """Return whether an unquoted assignment value is computed at runtime."""
+    return bool(
+        _QUOTED_RUNTIME_REFERENCE_RE.fullmatch(value)
+        or _RUNTIME_EXPR_RE.fullmatch(value)
+        or _MULTILINE_CALL_START_RE.fullmatch(value)
+        or (value.startswith("{") and value.endswith("}"))
+        or (value.startswith("[") and value.endswith("]"))
+    )
 
 
 def _generic_literal_value(match: re.Match[str]) -> str | None:
@@ -136,13 +148,7 @@ def _generic_literal_value(match: re.Match[str]) -> str | None:
     if quoted is not None and _QUOTED_RUNTIME_REFERENCE_RE.fullmatch(value):
         return None
     if quoted is None:
-        if _QUOTED_RUNTIME_REFERENCE_RE.fullmatch(value):
-            return None
-        if (
-            _RUNTIME_EXPR_RE.fullmatch(value)
-            or (value.startswith("{") and value.endswith("}"))
-            or (value.startswith("[") and value.endswith("]"))
-        ):
+        if _is_runtime_reference(value):
             return None
         # A bare alphabetic identifier is a reference, not a literal. Generic
         # unquoted tokens remain detectable when they carry numeric/symbolic

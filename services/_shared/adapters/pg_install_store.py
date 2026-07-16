@@ -576,6 +576,68 @@ def list_check_verdicts(
     return out if limit is None else out[:limit]
 
 
+# --- Living Hunt: last completed Elder head per PR (#557) -----------------
+# After a successful Elder pass we remember the head we reviewed so the next
+# synchronize can scope the LLM to the delta (last..head) instead of the full
+# PR base..head. SK is install-scoped; data carries the full repo name.
+
+_ELDER_LAST_TTL_DAYS = 90
+
+
+def _elder_last_sk(repo: str, pr_number: int) -> str:
+    return f"ELDER#LAST#{repo}#{int(pr_number)}"
+
+
+def put_elder_last_reviewed(
+    *,
+    install_id: int,
+    repo: str,
+    pr_number: int,
+    head_sha: str,
+) -> None:
+    """Record the head Elder just finished reviewing for this PR."""
+    if not head_sha:
+        return
+    ttl = int(
+        datetime.now(timezone.utc).timestamp() + _ELDER_LAST_TTL_DAYS * 86400
+    )
+    attrs = {
+        "repo": repo,
+        "pr_number": int(pr_number),
+        "head_sha": head_sha,
+        "reviewed_at": datetime.now(timezone.utc).isoformat(),
+    }
+    with get_pool().connection() as conn:
+        conn.execute(
+            """
+            INSERT INTO grug_kv (pk, sk, data, ttl)
+            VALUES (%(pk)s, %(sk)s, %(data)s, %(ttl)s)
+            ON CONFLICT (pk, sk) DO UPDATE
+                SET data = %(data)s, ttl = %(ttl)s
+            """,
+            {
+                "pk": _inst_pk(install_id),
+                "sk": _elder_last_sk(repo, pr_number),
+                "data": encode_attrs(attrs),
+                "ttl": ttl,
+            },
+        )
+
+
+def get_elder_last_reviewed(
+    *,
+    install_id: int,
+    repo: str,
+    pr_number: int,
+) -> str | None:
+    """Return the last Elder-reviewed head for this PR, or None."""
+    item = _get_item(_inst_pk(install_id), _elder_last_sk(repo, pr_number))
+    if not item:
+        return None
+    head = item.get("head_sha")
+    return str(head) if head else None
+
+
 # --- Review-findings ledger (#361 slice 1) ------------------------------
 # Ledger rows are REPO-scoped (not install-scoped like the activity feed),
 # so they live under their own pk=`LEDGER#<repo>` partition. The access

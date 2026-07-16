@@ -112,6 +112,23 @@ def _fetch_pr_diff(
     head_sha: str = "",
 ) -> str:
     """GET an immutable base/head diff, falling back when compare is unavailable."""
+    diff, _ = _fetch_pr_diff_with_scope(
+        install_token, owner, repo, pull_number,
+        base_sha=base_sha, head_sha=head_sha,
+    )
+    return diff
+
+
+def _fetch_pr_diff_with_scope(
+    install_token: str,
+    owner: str,
+    repo: str,
+    pull_number: int,
+    *,
+    base_sha: str = "",
+    head_sha: str = "",
+) -> tuple[str, bool]:
+    """Return the diff and whether an immutable compare supplied it."""
     repo_url = (
         f"https://api.github.com/repos/{quote(owner, safe='')}/"
         f"{quote(repo, safe='')}"
@@ -133,7 +150,8 @@ def _fetch_pr_diff(
         headers=headers,
         timeout=_DIFF_FETCH_TIMEOUT,
     )
-    if base_sha and head_sha and resp.status_code in {404, 422}:
+    used_compare = bool(base_sha and head_sha)
+    if used_compare and resp.status_code in {404, 422}:
         # GitHub can reject compare requests for forked or recently rewritten
         # histories while the PR diff remains readable. Snapshot checks before
         # and after inference still prevent this mutable fallback from being
@@ -152,8 +170,9 @@ def _fetch_pr_diff(
             headers=headers,
             timeout=_DIFF_FETCH_TIMEOUT,
         )
+        used_compare = False
     resp.raise_for_status()
-    return resp.text
+    return resp.text, used_compare
 
 
 def _fetch_current_review_snapshot(
@@ -392,6 +411,7 @@ def _to_llm_hunks(hunks: tuple[DiffHunk, ...]) -> list[LlmHunk]:
 def _summary_markdown(
     evaluation: CodeReviewEvaluation, *, suppressed_count: int = 0,
     excluded_paths: tuple[str, ...] = (),
+    living_range: str = "",
 ) -> tuple[str, str]:
     """Render a (title, summary) pair for the check-run output.
 
@@ -400,6 +420,8 @@ def _summary_markdown(
     `suppressed_count` (#467) is how many weak findings the judge held back
     from publication - surfaced as a transparency line so a suppressed
     finding is never a silent gap.
+    `living_range` (#557) when set is the prior..head delta Elder reviewed
+    (Living Hunt) instead of the full PR base..head.
     """
     held = (
         f"\n\nGrug held back {suppressed_count} weak finding(s) his judge doubted."
@@ -417,20 +439,34 @@ def _summary_markdown(
             f"\n\nGrug not read {len(excluded_paths)} data/generated "
             f"file(s) - no meat for review there: {shown}{more}."
         )
+    hunt = (
+        ("\n\nLiving Hunt: reviewing `" + living_range +
+         "` (files changed since the last completed Elder pass).")
+        if living_range else ""
+    )
+    def hunt_title(title: str) -> str:
+        return f"Living Hunt {living_range} - {title}" if living_range else title
+
     if evaluation.degraded_reason:
         title = f"⚠️ Grug eyes clouded ({evaluation.degraded_reason})"
-        return title, (
+        return hunt_title(title), (
             "Grug Elder could not see the diff this pass. The mist: "
             f"`{evaluation.degraded_reason}`. Grug stay his club — this "
             "only counsel, merge not blocked."
-        ) + held
+        ) + held + hunt
     if not evaluation.findings:
         title = (
             "Elder clear - no markings"
             if not suppressed_count
             else "Elder clear - weak markings held back"
         )
-        if excluded_paths:
+        if living_range:
+            scope = (
+                "Elder walked the delta diff (full file + cross-file + Omen "
+                "runtime signal when mapped). No markings survived the judge. "
+                "Code walk steady."
+            )
+        elif excluded_paths:
             scope = (
                 "Elder walked the reviewable diff (full file + cross-file + "
                 "Omen when mapped), skipping data/generated paths listed "
@@ -443,7 +479,7 @@ def _summary_markdown(
                 "runtime signal when mapped). No markings survived the judge. "
                 "Code walk steady."
             )
-        return title, ("## Markings Board\n\n" + scope) + held
+        return hunt_title(title), ("## Markings Board\n\n" + scope) + held + hunt
 
     severity_icon = {
         "critical": "critical", "high": "high", "medium": "medium", "low": "low",
@@ -455,6 +491,7 @@ def _summary_markdown(
         f"Elder markings - {blocking} blocking, "
         f"{len(evaluation.findings)} total"
     )
+    title = hunt_title(title)
     rows = [
         "| Severity | Effort | File | Line | Rule | Marking |",
         "|---|---|---|---|---|---|",
@@ -478,7 +515,7 @@ def _summary_markdown(
         "the judge, grounded in Lore when prior tribe history exists. "
         "Inline comments carry Fix + agent prompt on each marking.\n\n"
     )
-    return title, f"{legend}{table}{held}\n\n{_consolidated_agent_prompt(evaluation)}"
+    return title, f"{legend}{table}{held}{hunt}\n\n{_consolidated_agent_prompt(evaluation)}"
 
 
 # GitHub caps check-run summaries at 65536 chars; the findings table is
@@ -922,6 +959,31 @@ def dispatch_code_review(
         "body": str(pr.get("body") or ""),
     }
 
+    # Living Hunt (#557): if we already finished a review on an older head
+    # for this PR, scope the LLM to the delta (prior..head) instead of the
+    # full PR base..head. Best-effort: store blips fall back to full review.
+    living_prior_sha = ""
+    living_range = ""
+    try:
+        from adapters.install_store import get_elder_last_reviewed
+
+        prior = get_elder_last_reviewed(
+            install_id=installation_id,
+            repo=f"{owner}/{repo_name}",
+            pr_number=pull_number,
+        )
+        if prior and prior != head_sha:
+            living_prior_sha = prior
+            living_range = f"{prior[:8]}..{head_sha[:8]}"
+    except Exception as e:  # noqa: BLE001 - never fail a review for memory
+        log.warning(
+            "elder_living_hunt_lookup_failed",
+            extra={
+                "pr": f"{owner}/{repo_name}#{pull_number}",
+                "kind": type(e).__name__,
+            },
+        )
+
     # Elder voice pack (#288/#578): sage for entitled installs that opted in
     # via repo config, caveman (the free default) otherwise. Entitlement is
     # re-checked HERE at use-time (not just at config write) so an install that
@@ -964,17 +1026,37 @@ def dispatch_code_review(
     # DiffParseError → advisory neutral so a fetcher bug or GitHub
     # format drift cannot 500 the webhook.
     try:
-        diff_text = with_install_token_retry(
-            installation_id,
-            lambda token: _fetch_pr_diff(
-                token,
-                owner,
-                repo_name,
-                pull_number,
-                base_sha=base_sha,
-                head_sha=head_sha,
-            ),
-        )
+        if living_prior_sha:
+            diff_text, used_living_compare = with_install_token_retry(
+                installation_id,
+                lambda token: _fetch_pr_diff_with_scope(
+                    token,
+                    owner,
+                    repo_name,
+                    pull_number,
+                    base_sha=living_prior_sha,
+                    head_sha=head_sha,
+                ),
+            )
+        else:
+            # Retain the established fetch seam for ordinary full reviews;
+            # Guard/Smasher and focused dispatch tests share this helper.
+            diff_text = with_install_token_retry(
+                installation_id,
+                lambda token: _fetch_pr_diff(
+                    token,
+                    owner,
+                    repo_name,
+                    pull_number,
+                    base_sha=base_sha,
+                    head_sha=head_sha,
+                ),
+            )
+            used_living_compare = False
+        if living_prior_sha and not used_living_compare:
+            living_prior_sha = ""
+            living_range = ""
+        pr_context["base_sha"] = living_prior_sha or base_sha
         hunks = parse_diff(diff_text)
         # #609: drop data/generated/vendored files from the LLM's plate - a
         # big JSONL/lockfile hunk balloons the prompt into parse_failed and
@@ -1218,6 +1300,7 @@ def dispatch_code_review(
     title, summary = _summary_markdown(
         evaluation, suppressed_count=len(suppressed),
         excluded_paths=excluded_paths,
+        living_range=living_range,
     )
     check_result = CheckRunResult(
         name=_CHECK_NAME,
@@ -1413,6 +1496,54 @@ def dispatch_code_review(
             or ("check_publish_failed" if check_publish_failed else None)
         ),
     )
+    # Living Hunt: remember this head only when the check actually landed
+    # and the review was not an infra skip (so the next push can delta).
+    if (
+        result in {"pass", "fail", "skipped"}
+        and not check_publish_failed
+        and evaluation.degraded_reason in (None, "", "no_diff")
+    ):
+        try:
+            from adapters.install_store import put_elder_last_reviewed
+
+            _, current_head_sha, _, _ = with_install_token_retry(
+                installation_id,
+                lambda token: _fetch_current_review_snapshot(
+                    token, owner, repo_name, pull_number,
+                ),
+            )
+            if current_head_sha == head_sha:
+                put_elder_last_reviewed(
+                    install_id=installation_id,
+                    repo=f"{owner}/{repo_name}",
+                    pr_number=pull_number,
+                    head_sha=head_sha,
+                )
+                if living_range:
+                    log.info(
+                        "elder_living_hunt_delta_done",
+                        extra={
+                            "pr": f"{owner}/{repo_name}#{pull_number}",
+                            "range": living_range,
+                        },
+                    )
+            else:
+                log.info(
+                    "elder_living_hunt_stale_anchor_skipped",
+                    extra={
+                        "pr": f"{owner}/{repo_name}#{pull_number}",
+                        "review_head": head_sha,
+                        "current_head": current_head_sha,
+                    },
+                )
+        except Exception as e:  # noqa: BLE001 - memory must not fail publish
+            log.warning(
+                "elder_living_hunt_put_failed",
+                extra={
+                    "pr": f"{owner}/{repo_name}#{pull_number}",
+                    "kind": type(e).__name__,
+                },
+            )
     # LLM-as-a-judge DD evals (#190) submit AFTER the review + check-run are
     # POSTed, so recording can't delay the developer seeing the review. The
     # judge LLM CALL already ran pre-publish (grade_findings, #467) to gate
