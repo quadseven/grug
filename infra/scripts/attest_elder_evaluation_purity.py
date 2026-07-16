@@ -56,7 +56,7 @@ ALLOWED_PARAM_METHODS_EVALUATE_DIFF: frozenset[tuple[str, str]] = frozenset()
 
 # Allowlist for `evaluate_diff` body.
 ALLOWED_IN_EVALUATE_DIFF: frozenset[str] = frozenset({
-    "_hunk_line_index",
+    "_hunk_line_index", "_is_static_declarative_scalar",
     "CodeReviewEvaluation", "Finding",
     "tuple", "list", "set", "frozenset", "len", "all", "any", "isinstance",
 })
