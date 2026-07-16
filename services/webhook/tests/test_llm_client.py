@@ -1324,6 +1324,15 @@ def test_extract_usage_metrics_keeps_only_finite_numeric_values() -> None:
     assert lc._extract_usage_metrics({
         "usage": {"prompt_tokens": True, "completion_tokens": float("nan")},
     }) == {}
+    assert lc._extract_usage_metrics({
+        "usage": {"prompt_tokens": 12, "completion_tokens": None},
+    }) == {"input_tokens": 12}
+    assert lc._extract_usage_metrics({
+        "usage": {"prompt_tokens": float("inf"), "completion_tokens": 4},
+    }) == {"output_tokens": 4}
+    assert lc._extract_usage_metrics({
+        "usage": {"prompt_tokens": float("-inf"), "completion_tokens": -1},
+    }) == {}
 
 
 def test_llmobs_body_reparse_failure_logs_warning(monkeypatch, caplog) -> None:

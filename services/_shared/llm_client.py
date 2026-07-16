@@ -1136,7 +1136,7 @@ def _llmobs_tags(pr_context: Optional[PrContext]) -> dict[str, str]:
     return tags
 
 
-def _extract_usage_metrics(body: Any) -> dict[str, int | float]:
+def _extract_usage_metrics(body: object) -> dict[str, int | float]:
     """Pull token counts from an OpenAI-compat response body. Missing
     `usage` is normal (OpenRouter free-tier omits it sometimes) and
     must not crash the span emission. LLMObs rejects None and non-finite
@@ -1156,6 +1156,8 @@ def _extract_usage_metrics(body: Any) -> dict[str, int | float]:
         if isinstance(value, bool) or not isinstance(value, (int, float)):
             continue
         if isinstance(value, float) and not math.isfinite(value):
+            continue
+        if value < 0:
             continue
         metrics[metric] = value
     return metrics
