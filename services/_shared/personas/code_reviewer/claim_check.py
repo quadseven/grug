@@ -133,36 +133,59 @@ def _claim_text(text: str) -> str:
     return text
 
 
-def _settle_from_source(path: str, source: str, current: int | None) -> int | None:
-    settle = current
-    for m in _SETTLE_CAP_CODE.finditer(source):
-        n = int(m.group(1))
-        lower = path.lower()
-        if "settle" in lower or "snapshot" in lower:
-            return n
-        if settle is None:
-            settle = n
-    return settle
+# Only these paths may supply implementation facts. Scanning every changed
+# .py (tests, fixtures, unrelated helpers) lets a fixture like
+# `added > threshold` poison the policy fact and hide real drift.
+_SETTLE_FACT_PATH_SUFFIXES: tuple[str, ...] = (
+    "personas/code_reviewer/snapshot.py",
+    "/snapshot.py",
+)
+_DEEP_FACT_PATH_SUFFIXES: tuple[str, ...] = (
+    "services/_shared/llm_client.py",
+    "/llm_client.py",
+)
 
 
-def _deep_from_source(source: str, current: Bound | None) -> Bound | None:
+def _path_matches(path: str, suffixes: tuple[str, ...]) -> bool:
+    normalized = path.replace("\\", "/")
+    return any(normalized.endswith(s) for s in suffixes)
+
+
+def _unique_or_none(values: set[int] | set[Bound]) -> int | Bound | None:
+    """Single agreed value, or None when missing/conflicting (no last-wins)."""
+    if len(values) == 1:
+        return next(iter(values))
+    return None
+
+
+def _settle_caps_in(source: str) -> set[int]:
+    return {int(m.group(1)) for m in _SETTLE_CAP_CODE.finditer(source)}
+
+
+def _deep_bounds_in(source: str) -> set[Bound]:
+    found: set[Bound] = set()
     if _DEEP_EXCLUSIVE_CODE.search(source):
-        return "exclusive"
-    if current is None and _DEEP_INCLUSIVE_CODE.search(source):
-        return "inclusive"
-    return current
+        found.add("exclusive")
+    if _DEEP_INCLUSIVE_CODE.search(source):
+        found.add("inclusive")
+    return found
 
 
 def _extract_facts(file_contents: dict[str, str]) -> _PolicyFacts:
-    """Pull settle cap + deep bound from Python sources at head."""
-    settle: int | None = None
-    deep: Bound | None = None
+    """Pull settle cap + deep bound only from known policy helper sources."""
+    settle_vals: set[int] = set()
+    deep_vals: set[Bound] = set()
     for path, source in file_contents.items():
         if not path.endswith(".py"):
             continue
-        settle = _settle_from_source(path, source, settle)
-        deep = _deep_from_source(source, deep)
-    return _PolicyFacts(settle_medium_cap=settle, deep_bound=deep)
+        if _path_matches(path, _SETTLE_FACT_PATH_SUFFIXES):
+            settle_vals |= _settle_caps_in(source)
+        if _path_matches(path, _DEEP_FACT_PATH_SUFFIXES):
+            deep_vals |= _deep_bounds_in(source)
+    return _PolicyFacts(
+        settle_medium_cap=_unique_or_none(settle_vals),  # type: ignore[arg-type]
+        deep_bound=_unique_or_none(deep_vals),  # type: ignore[arg-type]
+    )
 
 
 def _parse_settle_claim(path: str, lineno: int, text: str, claim_src: str) -> _Claim | None:

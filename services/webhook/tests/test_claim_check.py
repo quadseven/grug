@@ -205,3 +205,51 @@ class TestNonClaimNoise:
         # The ADDED line is code, not a comment claim; and it's the
         # implementation itself - no finding expected from claim scanner.
         assert out == ()
+
+    def test_fixture_added_gt_threshold_does_not_poison_deep_fact(self):
+        """CodeRabbit: test/fixture files must not overwrite policy facts."""
+        hunks = (
+            _hunk(
+                "k8s/consumer-deployment.yaml",
+                95,
+                [
+                    "            # auto-deep only when added lines > 500 "
+                    "(exclusive; see decide_deep_escalation).",
+                ],
+            ),
+        )
+        # Real policy is exclusive; a fixture file claims inclusive.
+        out = scan_claim_checks(
+            hunks,
+            {
+                "services/_shared/llm_client.py": _DEEP_EXCLUSIVE,
+                "services/webhook/tests/test_llm_client.py": (
+                    "def test_fixture():\n"
+                    "    if added >= threshold:\n"
+                    "        pass\n"
+                ),
+            },
+        )
+        # Still clean: exclusive claim matches exclusive policy; fixture ignored.
+        assert out == ()
+
+    def test_conflicting_policy_values_are_unknown_not_last_wins(self):
+        """Two different min(base, N) in snapshot.py -> no fact, no finding."""
+        hunks = (
+            _hunk(
+                "k8s/webhook-deployment.yaml",
+                98,
+                ["# caps medium (Steady) at 5s."],
+            ),
+        )
+        src = (
+            "def adaptive_elder_settle_seconds(pr, *, base_seconds: int) -> int:\n"
+            "    if tiny:\n"
+            "        return min(base, 0)\n"
+            "    return min(base, 3)\n"
+        )
+        out = scan_claim_checks(
+            hunks,
+            {"services/_shared/personas/code_reviewer/snapshot.py": src},
+        )
+        assert out == ()
