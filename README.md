@@ -24,7 +24,7 @@ are enabled by default:
 
 - **Chief** (`Grug - Definition of Ready`) - static PR-readiness checks and
   branch-ruleset self-heal.
-- **Elder** (`Grug - Code Review`) - durable, deep LLM diff review with
+- **Elder** (`Grug — Code Review`) - durable, deep LLM diff review with
   whole-file, cross-file, PR-intent, and runtime context.
 - **Guard** (`Grug - Guard`) - Semgrep, dependency-CVE, secret, and IaC
   detection filtered through an exploitability judge.
@@ -84,7 +84,7 @@ the adaptive quiet window:
 
 - **Swift Hunt settle** - tiny PRs skip the quiet wait; medium PRs settle a few
   seconds; large multi-file storms keep the full window. Elder posts an
-  `in_progress` `Grug - Code Review` check the moment the durable job is
+  `in_progress` `Grug — Code Review` check the moment the durable job is
   queued, so required-status rulesets show pending instead of "check missing".
 - **Dual-arm deep review** - coder + reasoner arms on the owned Cave run in
   parallel, merge findings, and grade through the judge. Covers 25+ named

@@ -430,12 +430,20 @@ def _summary_markdown(
             if not suppressed_count
             else "Elder clear - weak markings held back"
         )
-        return title, (
-            "## Markings Board\n\n"
-            "Elder walked the whole diff (full file + cross-file + Omen "
-            "runtime signal when mapped). No markings survived the judge. "
-            "Code walk steady."
-        ) + held
+        if excluded_paths:
+            scope = (
+                "Elder walked the reviewable diff (full file + cross-file + "
+                "Omen when mapped), skipping data/generated paths listed "
+                "below. No markings survived the judge on the reviewed paths. "
+                "Code walk steady."
+            )
+        else:
+            scope = (
+                "Elder walked the whole diff (full file + cross-file + Omen "
+                "runtime signal when mapped). No markings survived the judge. "
+                "Code walk steady."
+            )
+        return title, ("## Markings Board\n\n" + scope) + held
 
     severity_icon = {
         "critical": "critical", "high": "high", "medium": "medium", "low": "low",
@@ -459,8 +467,9 @@ def _summary_markdown(
         )
         rows.append(
             f"| {severity_icon.get(f.severity, f.severity)} | {effort} | "
-            f"`{f.file}` | {f.line} | `{f.rule_name}` | "
-            f"{_defused(f.message)} |"
+            f"`{_md_code_span(f.file)}` | {f.line} | "
+            f"`{_md_code_span(f.rule_name)}` | "
+            f"{_md_table_cell(f.message)} |"
         )
     table = "\n".join(rows)
     legend = (
@@ -491,7 +500,7 @@ def _consolidated_agent_prompt(evaluation: CodeReviewEvaluation) -> str:
     used = sum(len(x) + 1 for x in header)
     included = 0
     for f in evaluation.findings:
-        entry = f"- {f.file}:{f.line} [{f.severity}/{f.rule_name}] {f.message}"
+        entry = f"- {_md_code_span(f.file)}:{f.line} [{f.severity}/{_md_code_span(f.rule_name)}] {f.message}"
         if f.suggestion:
             entry += f"\n  Suggested fix: {f.suggestion}"
         if used + len(entry) + 1 > _CONSOLIDATED_PROMPT_BUDGET:
@@ -539,6 +548,32 @@ def _defused(prose: str) -> str:
     return re.sub(r"`{3,}", "``", prose)
 
 
+def _md_code_span(text: str) -> str:
+    """Sanitize text for a single backtick-wrapped inline code span.
+
+    Paths and rule names are model-controlled: strip backticks and collapse
+    newlines so they cannot terminate the span or inject a second line.
+    """
+    cleaned = (text or "").replace("`", "")
+    cleaned = cleaned.replace('\r', " ").replace('\n', " ")
+    cleaned = re.sub(r" +", " ", cleaned).strip()
+    return cleaned or "?"
+
+
+def _md_table_cell(text: str) -> str:
+    """Escape review-controlled prose for a GitHub Markdown table cell.
+
+    Pipes break column structure; newlines break the row. Also run the
+    prose defuser so an unterminated fence in a finding message cannot
+    swallow the rest of the Markings Board.
+    """
+    cleaned = _defused(text or "")
+    cleaned = cleaned.replace("|", '\\|')
+    cleaned = cleaned.replace('\r', " ").replace('\n', " ")
+    cleaned = re.sub(r" +", " ", cleaned).strip()
+    return cleaned
+
+
 def _fenced(text: str) -> str:
     """Wrap text in a code fence GUARANTEED to contain it: the fence is one
     backtick longer than the longest backtick run inside (CommonMark).
@@ -581,13 +616,13 @@ def _inline_comment_body(f: Finding, precedent_note: str = "") -> str:
     so a later `synchronize` push can recognise this comment as a Grug
     finding for dedup (#189) — see dedup.parse_rule. The marker stays
     LAST (dedup.parse_rule reads the last marker in the body)."""
-    chip = f"**{f.severity.upper()} · `{f.rule_name}`**"
+    chip = f"**{f.severity.upper()} · `{_md_code_span(f.rule_name)}`**"
     if f.effort in _EFFORT_LABELS:
         chip += f" · {_EFFORT_LABELS[f.effort]}"
     head = (
         f"{chip}\n\n"
         f"**What Elder sees**\n\n{_defused(f.message)}\n\n"
-        f"**Where:** `{_defused(f.file)}:{f.line}`"
+        f"**Where:** `{_md_code_span(f.file)}:{f.line}`"
     )
     if precedent_note:
         # #555: ledger-grounded citation + measured-confidence chip, as a

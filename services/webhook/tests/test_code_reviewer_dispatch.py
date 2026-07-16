@@ -312,7 +312,8 @@ def test_inline_comment_body_includes_suggestion_block(monkeypatch):
         message="m", suggestion="add a None guard",
     )
     body = cr_dispatch._inline_comment_body(f)
-    assert "**Fix**" in body and "add a None guard" in body
+    assert "**Fix**" in body
+    assert "add a None guard" in body
     assert "What Elder sees" in body
     assert "<!-- grug-rule:null-deref -->" in body  # marker still appended
 
@@ -381,8 +382,13 @@ def test_summary_markdown_renders_findings_table():
     title, summary = cr_dispatch._summary_markdown(ev)
     assert "1 blocking" in title  # one critical, one low
     assert "Markings Board" in summary
+    assert "| Severity | Effort | File | Line | Rule | Marking |" in summary
     assert "secret-in-log-or-trace" in summary and "dead-code" in summary
     assert "`x.py`" in summary
+    # Effort column present for every finding row (dash when unknown).
+    assert summary.count("| - |") + summary.count("| quick win |") + summary.count(
+        "| heavy lift |"
+    ) >= 2
 
 
 def test_fetch_pr_review_comments_caps_pages(monkeypatch, caplog):
@@ -1870,3 +1876,27 @@ def test_all_newline_suggestion_never_produces_empty_committable_block():
     body = cr_dispatch._inline_comment_body(f)
     assert "```suggestion\n\n```" not in body
     assert "```suggestion" not in body
+
+
+def test_summary_markdown_escapes_hostile_finding_fields():
+    """LLM-controlled file/rule/message must not break Markings table or code spans."""
+    from personas.code_reviewer.persona import CodeReviewEvaluation, Finding
+    ev = CodeReviewEvaluation(
+        findings=(
+            Finding(
+                file="evil`path|x.py",
+                line=1,
+                severity="high",
+                rule_name="rule|with`ticks",
+                message="msg with | pipe and\nnewline",
+                suggestion=None,
+            ),
+        ),
+        conclusion="failure",
+    )
+    _, summary = cr_dispatch._summary_markdown(ev)
+    # Table cells: backticks stripped from code spans; pipes escaped in message.
+    assert "`evilpath|x.py`" in summary
+    assert "`rule|withticks`" in summary
+    assert "msg with \\| pipe and newline" in summary
+    assert summary.count("| Severity | Effort | File | Line | Rule | Marking |") == 1

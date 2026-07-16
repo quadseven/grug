@@ -112,7 +112,7 @@ spec:
             # every big-diff review degrade to all_failed - a large-diff
             # reasoner pass was measured at ~318s live (2026-07-13).
             - {name: GRUG_REVIEW_LLM_TIMEOUT_S, value: "330"}
-            # Four handlers plus their short claim-renewal heartbeats may touch
+            # Six handlers plus their short claim-renewal heartbeats may touch
             # Postgres concurrently; keep pool headroom above the worker count.
             - {name: GRUG_PG_POOL_MAX, value: "10"}
             # In-cluster spark-gateway for the exposed-secret judge (#439,
@@ -149,7 +149,7 @@ spec:
           # process itself; if a consumer thread dies the process exits
           # (thread join in main) and the kubelet restarts the pod.
           resources:
-            # Four network-heavy review workers share this process. Leave room
+            # Six network-heavy review workers share this process. Leave room
             # for concurrent prompts and occasional Semgrep reruns without an
             # OOM restart halfway through a leased review.
             requests: {cpu: 100m, memory: 256Mi}

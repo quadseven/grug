@@ -189,6 +189,9 @@ def test_enqueue_review_posts_in_progress_check_after_sqs(monkeypatch):
 
     monkeypatch.setattr(rerun, "_RERUN_QUEUE_URL", "https://sqs.example/review.fifo")
     monkeypatch.setattr(rerun._sqs, "send_message", send_message)
+    monkeypatch.setattr(
+        rerun, "_elder_check_already_terminal_or_pending", lambda **k: None,
+    )
     monkeypatch.setattr(rerun, "with_install_token_retry", with_token)
     monkeypatch.setattr(rerun, "post_check_run", post_check)
 
@@ -215,6 +218,45 @@ def test_enqueue_review_posts_in_progress_check_after_sqs(monkeypatch):
     assert posted["external_id"] == "grug-cr-pending:myorg/myrepo#7:head-123"
 
 
+
+def test_enqueue_review_skips_in_progress_when_check_already_terminal(monkeypatch):
+    """FIFO-deduped re-enqueue must not reopen a completed Elder check."""
+    sent = {}
+    posts = []
+
+    monkeypatch.setattr(rerun, "_RERUN_QUEUE_URL", "https://sqs.example/review.fifo")
+    monkeypatch.setattr(
+        rerun._sqs, "send_message", lambda **kwargs: sent.update(kwargs),
+    )
+    monkeypatch.setattr(
+        rerun,
+        "_elder_check_already_terminal_or_pending",
+        lambda **k: "already_completed_success",
+    )
+    monkeypatch.setattr(
+        rerun,
+        "post_check_run",
+        lambda *a, **k: posts.append((a, k)) or {"id": 1},
+    )
+    monkeypatch.setattr(
+        rerun, "with_install_token_retry", lambda iid, fn: fn("tok"),
+    )
+
+    rerun.enqueue_review(
+        install_id=11,
+        repo="myorg/myrepo",
+        pr_number=7,
+        requested_base_sha="base-123",
+        requested_head_sha="head-123",
+        requested_title="t",
+        requested_body="b",
+        settle_seconds=10,
+    )
+
+    assert sent["QueueUrl"].endswith("review.fifo")
+    assert posts == []
+
+
 def test_enqueue_review_survives_in_progress_check_failure(monkeypatch):
     """A GitHub blip on the pending check must not fail the durable enqueue —
     the SQS job is the correctness path; visibility is best-effort."""
@@ -223,6 +265,9 @@ def test_enqueue_review_survives_in_progress_check_failure(monkeypatch):
     monkeypatch.setattr(rerun, "_RERUN_QUEUE_URL", "https://sqs.example/review.fifo")
     monkeypatch.setattr(
         rerun._sqs, "send_message", lambda **kwargs: sent.update(kwargs),
+    )
+    monkeypatch.setattr(
+        rerun, "_elder_check_already_terminal_or_pending", lambda **k: None,
     )
     monkeypatch.setattr(
         rerun,

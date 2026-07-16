@@ -142,6 +142,67 @@ def enqueue_rerun(*, install_id: int, repo: str, pr_number: int, persona: str) -
     )
 
 
+
+def _elder_check_already_terminal_or_pending(
+    *,
+    install_id: int,
+    owner: str,
+    repo_name: str,
+    head_sha: str,
+) -> str | None:
+    """Return a skip reason if re-posting in_progress would reopen a settled
+    or already-pending Elder check on this head.
+
+    FIFO SQS can accept a send while suppressing delivery for 5 minutes
+    (same MessageDeduplicationId). Re-posting in_progress on that path can
+    reopen a completed required check with no worker guaranteed to finish
+    it. Listing the latest check-run for this name+head is the ground truth.
+    """
+    def _do(token: str) -> str | None:
+        resp = httpx.get(
+            f"{_GH_API}/repos/{quote(owner, safe='')}/{quote(repo_name, safe='')}"
+            f"/commits/{quote(head_sha, safe='')}/check-runs",
+            params={"check_name": _ELDER_CHECK_NAME, "filter": "latest", "per_page": 10},
+            headers={
+                "Authorization": f"Bearer {token}",
+                "Accept": "application/vnd.github+json",
+                "X-GitHub-Api-Version": "2022-11-28",
+            },
+            timeout=_FETCH_TIMEOUT,
+        )
+        resp.raise_for_status()
+        runs = (resp.json() or {}).get("check_runs") or []
+        for run in runs:
+            if str(run.get("name") or "") != _ELDER_CHECK_NAME:
+                continue
+            status = str(run.get("status") or "")
+            conclusion = str(run.get("conclusion") or "")
+            if status in {"queued", "in_progress"}:
+                return f"already_{status}"
+            if status == "completed" and conclusion in {
+                "success", "failure", "neutral", "cancelled", "skipped", "timed_out",
+            }:
+                # A completed Elder check for this head means the durable
+                # lane already finished (or explicitly skipped). Do not
+                # reopen it as pending on a FIFO-deduped re-enqueue.
+                return f"already_completed_{conclusion or 'unknown'}"
+        return None
+
+    try:
+        return with_install_token_retry(install_id, _do)
+    except Exception as error:  # noqa: BLE001 - visibility path; prefer post over silent skip on list failure
+        log.warning(
+            "elder_in_progress_check_list_failed",
+            extra={
+                "install_id": install_id,
+                "repo": f"{owner}/{repo_name}",
+                "head_sha": head_sha[:8],
+                "kind": type(error).__name__,
+            },
+        )
+        return None
+
+
 def _post_elder_in_progress_check(
     *,
     install_id: int,
@@ -176,6 +237,24 @@ def _post_elder_in_progress_check(
                 "repo": repo,
                 "pr": pr_number,
                 "head_sha": head_sha[:8] if head_sha else "",
+            },
+        )
+        return
+    skip_reason = _elder_check_already_terminal_or_pending(
+        install_id=install_id,
+        owner=owner,
+        repo_name=repo_name,
+        head_sha=head_sha,
+    )
+    if skip_reason:
+        log.info(
+            "elder_in_progress_check_skipped",
+            extra={
+                "install_id": install_id,
+                "repo": repo,
+                "pr": pr_number,
+                "head_sha": head_sha[:8],
+                "reason": skip_reason,
             },
         )
         return

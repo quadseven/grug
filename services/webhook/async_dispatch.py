@@ -400,6 +400,27 @@ def _run_job(spec: _AsyncPersonaSpec, event: dict[str, Any]) -> dict[str, str]:
 # pre-generalization functions exactly.
 
 
+
+def _durable_elder_settle_seconds(pr: dict[str, Any]) -> int:
+    """Resolve base settle env + Swift Hunt adaptive cap for one PR."""
+    raw_settle = os.getenv(
+        "GRUG_ELDER_SETTLE_SECONDS",
+        str(_DEFAULT_ELDER_SETTLE_SECONDS),
+    )
+    try:
+        settle_seconds = int(raw_settle)
+    except ValueError:
+        log.warning(
+            "elder_settle_seconds_invalid",
+            extra={"value": raw_settle},
+        )
+        settle_seconds = _DEFAULT_ELDER_SETTLE_SECONDS
+    settle_seconds = min(
+        _MAX_ELDER_SETTLE_SECONDS, max(0, settle_seconds),
+    )
+    return adaptive_elder_settle_seconds(pr, base_seconds=settle_seconds)
+
+
 def enqueue_elder_review(
     *, payload: dict[str, Any], delivery_id: str, blocking: bool,
 ) -> bool:
@@ -435,27 +456,8 @@ def enqueue_elder_review(
                     extra={"delivery_id": delivery_id},
                 )
                 raise ValueError("durable Elder enqueue requires complete PR identity")
-            raw_settle = os.getenv(
-                "GRUG_ELDER_SETTLE_SECONDS",
-                str(_DEFAULT_ELDER_SETTLE_SECONDS),
-            )
-            try:
-                settle_seconds = int(raw_settle)
-            except ValueError:
-                log.warning(
-                    "elder_settle_seconds_invalid",
-                    extra={"value": raw_settle},
-                )
-                settle_seconds = _DEFAULT_ELDER_SETTLE_SECONDS
-            settle_seconds = min(
-                _MAX_ELDER_SETTLE_SECONDS, max(0, settle_seconds),
-            )
-            # Swift Elder: shrink (or drop) the quiet window for small PRs so
-            # tiny focused changes get markings in seconds, not after a full
-            # settle that only helps large multi-push storms.
-            settle_seconds = adaptive_elder_settle_seconds(
-                pr, base_seconds=settle_seconds,
-            )
+            # Swift Hunt: base settle from env, then adaptive cap by PR size.
+            settle_seconds = _durable_elder_settle_seconds(pr)
 
             from rerun import enqueue_review  # type: ignore[attr-defined]
 
