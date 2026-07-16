@@ -1710,8 +1710,8 @@ def test_inline_comment_body_fence_unsafe_suggestion_degrades_to_prose():
 
 
 def test_inline_comment_body_effort_chip_and_agent_prompt():
-    """#553: effort chip renders on the header line; every finding carries
-    a deterministic Prompt-for-AI-agents collapsible."""
+    """#553 / Markings v2: effort chip, category, why-it-matters, CR-style
+    agent meta contract on every finding."""
     from personas.code_reviewer.persona import Finding
     f = Finding(
         file="x.py", line=42, severity="medium", rule_name="dead-code",
@@ -1723,6 +1723,46 @@ def test_inline_comment_body_effort_chip_and_agent_prompt():
     assert "x.py:42" in body and "dead-code" in body
     # deterministic assembly: the finding message rides the prompt block
     assert "Grug see unused path" in body
+    assert "Why it matters" in body
+    assert "Verify each finding against the current code" in body
+    # dead-code rule maps to maintainability in RULES
+    assert "maintainability" in body
+    assert cr_dispatch._category_for_rule("dead-code") == "maintainability"
+
+
+def test_why_it_matters_covers_every_rules_bug_class():
+    """Every RULES bug_class must have a specific impact one-liner."""
+    from code_review_prompt import RULES
+    classes = {r.bug_class for r in RULES}
+    missing = classes - set(cr_dispatch._WHY_IT_MATTERS)
+    assert not missing, f"missing _WHY_IT_MATTERS keys: {sorted(missing)}"
+
+
+def test_review_stack_body_has_marker_and_actionable_count():
+    """Markings v2 PR-timeline stack comment."""
+    from personas.code_reviewer.persona import CodeReviewEvaluation, Finding
+    ev = CodeReviewEvaluation(
+        findings=(
+            Finding(
+                file="a.py", line=1, severity="high", rule_name="null-deref",
+                message="npe", suggestion=None,
+            ),
+            Finding(
+                file="b.py", line=2, severity="low", rule_name="dead-code",
+                message="unused", suggestion=None,
+            ),
+        ),
+        conclusion="failure",
+    )
+    body = cr_dispatch._review_stack_body(
+        ev, conclusion="neutral", living_range="abc..def", review_phase="tier1",
+    )
+    assert cr_dispatch._STACK_MARKER in body
+    assert "2 actionable marking" in body
+    assert "null-deref" in body
+    assert "Prompt for AI agents" in body
+    assert "Living Hunt range" in body
+    assert "Tier-1" in body
 
 
 def test_summary_markdown_appends_bounded_consolidated_agent_prompt():

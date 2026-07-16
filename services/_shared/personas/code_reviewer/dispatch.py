@@ -31,7 +31,8 @@ from urllib.parse import quote
 import httpx
 
 from activity_log import record_check_verdict
-from github_app_auth import with_install_token_retry
+from code_review_prompt import RULES
+from github_app_auth import get_app_id, with_install_token_retry
 from github_checks_client import CheckConclusion, CheckRunResult, post_check_run
 from github_reviews_client import (
     InlineComment, ReviewEvent, ReviewResult, get_review_comments, post_review,
@@ -554,15 +555,20 @@ def _consolidated_agent_prompt(evaluation: CodeReviewEvaluation) -> str:
     and bounded. Truncates by whole findings and SAYS how many were cut -
     a silently-partial prompt would read as the complete work list."""
     header = [
-        "Address each finding below. Keep every fix minimal and scoped to "
-        "the named line; do not refactor beyond the findings.",
+        _AGENT_META_PREAMBLE,
+        "",
+        "Address each finding below.",
     ]
 
     body: list[str] = []
     used = sum(len(x) + 1 for x in header)
     included = 0
     for f in evaluation.findings:
-        entry = f"- {_md_code_span(f.file)}:{f.line} [{f.severity}/{_md_code_span(f.rule_name)}] {f.message}"
+        cat = _category_for_rule(f.rule_name)
+        entry = (
+            f"- {_md_code_span(f.file)}:{f.line} "
+            f"[{f.severity}/{cat}/{_md_code_span(f.rule_name)}] {f.message}"
+        )
         if f.suggestion:
             entry += f"\n  Suggested fix: {f.suggestion}"
         if used + len(entry) + 1 > _CONSOLIDATED_PROMPT_BUDGET:
@@ -590,6 +596,72 @@ def _consolidated_agent_prompt(evaluation: CodeReviewEvaluation) -> str:
 # Derived from the shared vocabulary so a new effort level can never
 # silently drop its chip (the Severity-partition-assert drift class).
 _EFFORT_LABELS = {e: e.replace("-", " ") for e in EFFORTS}
+
+# Markings v2: rule_name -> ReviewRule for category (bug_class) chips.
+_RULES_BY_NAME = {r.name: r for r in RULES}
+
+# Impact one-liners by bug_class (closed taxonomy in code_review_prompt).
+_WHY_IT_MATTERS: dict[str, str] = {
+    "silent failure": (
+        "Errors swallowed hide real failures and make outages hard to debug."
+    ),
+    "correctness": (
+        "Logic bugs ship wrong behavior to users and are expensive to reverse."
+    ),
+    "async blocker": (
+        "Blocking work on async paths freezes event loops and stalls requests."
+    ),
+    "concurrency": (
+        "Race conditions are intermittent, hard to reproduce, and production-only."
+    ),
+    "test fidelity": (
+        "Tests that do not match production behavior give false confidence."
+    ),
+    "robustness": (
+        "Missing guards turn edge cases into crashes under real load."
+    ),
+    "security": (
+        "Security findings can be exploited; treat high/critical before merge."
+    ),
+    "type design": (
+        "Weak types let invalid states compile and fail later at runtime."
+    ),
+    "maintainability": (
+        "Hard-to-follow code slows every future change and hides more bugs."
+    ),
+    "test coverage": (
+        "Unguarded paths regress silently; coverage gaps become merge risk."
+    ),
+    "performance": (
+        "Hot-path waste compounds under concurrency and burns latency budget."
+    ),
+}
+
+# CR-style agent contract: deterministic, no extra LLM call.
+_AGENT_META_PREAMBLE = (
+    "Verify each finding against the current code. Fix only if still valid; "
+    "skip with a brief reason if already fixed or not applicable. Keep every "
+    "change minimal and scoped to the named file/line; do not refactor beyond "
+    "the finding. Validate after applying (tests or a focused check)."
+)
+
+# Upsert-by-marker issue comment for the Elder review stack (PR timeline).
+_STACK_MARKER = "<!-- grug-elder-stack -->"
+_STACK_COMMENT_TIMEOUT = 10.0
+
+
+def _category_for_rule(rule_name: str) -> str:
+    """Display category from the RULES table; unknown rules stay general."""
+    rule = _RULES_BY_NAME.get(rule_name)
+    return rule.bug_class if rule is not None else "general"
+
+
+def _why_it_matters(rule_name: str) -> str:
+    cat = _category_for_rule(rule_name)
+    return _WHY_IT_MATTERS.get(
+        cat,
+        "Left unfixed, this can become user-visible breakage or review debt.",
+    )
 
 
 def _details_block(summary: str, content: str) -> str:
@@ -651,11 +723,16 @@ def _fenced(text: str) -> str:
 def _agent_prompt_block(f: Finding) -> str:
     """The copy-paste remediation prompt (#553), assembled DETERMINISTICALLY
     from finding fields - no extra LLM call, so it can never hallucinate
-    beyond what the finding already claims."""
+    beyond what the finding already claims. Markings v2 adds a CR-style
+    verify/skip/minimal meta contract shared with the consolidated prompt."""
+    cat = _category_for_rule(f.rule_name)
     content = [
-        f"In {f.file}:{f.line} address this {f.severity} finding "
-        f"({f.rule_name}):",
+        _AGENT_META_PREAMBLE,
+        "",
+        f"In `{f.file}:{f.line}` address this {f.severity} / {cat} finding "
+        f"(`{f.rule_name}`):",
         f.message,
+        f"Why it matters: {_why_it_matters(f.rule_name)}",
         "Fix focus: change only what the finding names; keep the fix "
         "minimal and line-exact; do not refactor beyond it.",
     ]
@@ -665,26 +742,32 @@ def _agent_prompt_block(f: Finding) -> str:
 
 
 def _inline_comment_body(f: Finding, precedent_note: str = "") -> str:
-    """Format one finding as a structured Marking (#553 / #617).
+    """Format one finding as a structured Marking (#553 / #617 / Markings v2).
 
     Shape (Markings Board):
-      - severity · rule · effort chip
+      - severity · category · rule · effort chip
       - What Elder sees (the finding)
+      - Why it matters (taxonomy impact one-liner)
       - Where (file:line, always)
       - Fix (committable suggestion when safe, else fenced prose)
       - Lore (precedent + measured confidence when the ledger has history)
-      - Prompt for AI agents (copy-paste repair brief)
+      - Prompt for AI agents (CR-style verify + copy-paste repair brief)
 
     Appends a hidden `grug-rule` marker (rendered invisibly by GitHub)
     so a later `synchronize` push can recognise this comment as a Grug
     finding for dedup (#189) — see dedup.parse_rule. The marker stays
     LAST (dedup.parse_rule reads the last marker in the body)."""
-    chip = f"**{f.severity.upper()} · `{_md_code_span(f.rule_name)}`**"
+    cat = _category_for_rule(f.rule_name)
+    chip = (
+        f"**{f.severity.upper()}** · _{_md_code_span(cat)}_ · "
+        f"`{_md_code_span(f.rule_name)}`"
+    )
     if f.effort in _EFFORT_LABELS:
         chip += f" · {_EFFORT_LABELS[f.effort]}"
     head = (
         f"{chip}\n\n"
         f"**What Elder sees**\n\n{_defused(f.message)}\n\n"
+        f"**Why it matters**\n\n{_defused(_why_it_matters(f.rule_name))}\n\n"
         f"**Where:** `{_md_code_span(f.file)}:{f.line}`"
     )
     if precedent_note:
@@ -726,6 +809,177 @@ def _inline_comment_body(f: Finding, precedent_note: str = "") -> str:
     else:
         body = head
     return f"{body}\n\n{_agent_prompt_block(f)}\n\n{rule_marker(f.rule_name)}"
+
+
+def _review_stack_body(
+    evaluation: CodeReviewEvaluation,
+    *,
+    conclusion: CheckConclusion,
+    living_range: str = "",
+    suppressed_count: int = 0,
+    review_phase: Literal["tier1", "deep", "dual"] = "dual",
+) -> str:
+    """PR-timeline review stack comment (Markings v2 / CodeRabbit-style shell).
+
+    Deterministic markdown only — no extra LLM. Upserted by marker so
+    synchronize edits in place rather than spamming the PR.
+    """
+    findings = evaluation.findings
+    n = len(findings)
+    by_sev: dict[str, int] = {}
+    for f in findings:
+        by_sev[f.severity] = by_sev.get(f.severity, 0) + 1
+    sev_bits = ", ".join(
+        f"{k}={by_sev[k]}" for k in ("critical", "high", "medium", "low") if k in by_sev
+    ) or "none"
+    phase_label = {
+        "tier1": "Tier-1 coder arm (deep may append later)",
+        "deep": "Deep reasoner append",
+        "dual": "Dual-arm Cave review",
+    }.get(review_phase, review_phase)
+    hunt = f"\n- Living Hunt range: `{living_range}`" if living_range else ""
+    held = (
+        f"\n- Judge held back {suppressed_count} weak finding(s)"
+        if suppressed_count
+        else ""
+    )
+    if evaluation.degraded_reason:
+        status_line = f"Degraded (`{evaluation.degraded_reason}`) — advisory only"
+    elif n == 0:
+        status_line = "Clear — no markings published"
+    else:
+        status_line = f"**{n} actionable marking(s)** ({sev_bits})"
+
+    rows = [
+        "| Severity | Category | File | Line | Rule |",
+        "|---|---|---|---|---|",
+    ]
+    for f in findings[:25]:
+        rows.append(
+            f"| {f.severity} | {_md_code_span(_category_for_rule(f.rule_name))} | "
+            f"`{_md_code_span(f.file)}` | {f.line} | "
+            f"`{_md_code_span(f.rule_name)}` |"
+        )
+    if n > 25:
+        rows.append(f"| … | +{n - 25} more | | | |")
+    table = "\n".join(rows) if findings else "_No inline markings this pass._"
+
+    agent = _consolidated_agent_prompt(evaluation)
+    return "\n".join([
+        _STACK_MARKER,
+        "",
+        f'<img src="{_PERSONA_PORTRAIT}" width="46" align="left" alt="Grug Elder" />',
+        "",
+        f"**Grug Elder** review stack · check conclusion `{conclusion}`",
+        "",
+        "### Review stack",
+        f"- Phase: {phase_label}",
+        f"- Status: {status_line}{held}{hunt}",
+        f"- Check-run: `{_CHECK_NAME}`",
+        "",
+        "### Markings",
+        "",
+        table,
+        "",
+        "### Prompt for AI agents",
+        "",
+        agent if agent else "_No findings to remediate._",
+        "",
+        "---",
+        "",
+        "Inline comments carry Fix + agent prompt on each marking. "
+        "Autofix push is not enabled — apply suggestions or hand the agent prompt "
+        "to your coding agent.",
+        "",
+    ])
+
+
+def _find_stack_comment_id(
+    token: str, owner: str, repo: str, pr_number: int,
+) -> int | None:
+    """Locate our Elder stack issue comment by marker + app id."""
+    own_app_id = get_app_id()
+    base = (
+        f"https://api.github.com/repos/{quote(owner, safe='')}/"
+        f"{quote(repo, safe='')}"
+    )
+    page = 1
+    while page <= 20:
+        resp = httpx.get(
+            f"{base}/issues/{pr_number}/comments",
+            params={"per_page": 100, "page": page},
+            headers={
+                "Authorization": f"Bearer {token}",
+                "Accept": "application/vnd.github+json",
+                "X-GitHub-Api-Version": "2022-11-28",
+            },
+            timeout=_STACK_COMMENT_TIMEOUT,
+        )
+        resp.raise_for_status()
+        batch = resp.json()
+        for c in batch:
+            app = c.get("performed_via_github_app")
+            if not app or str(app.get("id")) != own_app_id:
+                continue
+            if _STACK_MARKER in (c.get("body") or ""):
+                return int(c["id"])
+        if len(batch) < 100:
+            return None
+        page += 1
+    return None
+
+
+def _upsert_review_stack_comment(
+    token: str, owner: str, repo: str, pr_number: int, body: str,
+) -> None:
+    """PATCH existing stack comment or POST a new one (Teller discipline).
+
+    Concurrent dispatch (redelivery / race) can TOCTOU: both find nothing and
+    both POST. Mitigations: re-find immediately before write; if POST fails
+    or races, re-find and PATCH the winner. with_install_token_retry only
+    retries 401 (not generic 5xx), so successful POSTs are not re-fired.
+    """
+    headers = {
+        "Authorization": f"Bearer {token}",
+        "Accept": "application/vnd.github+json",
+        "X-GitHub-Api-Version": "2022-11-28",
+    }
+    base = (
+        f"https://api.github.com/repos/{quote(owner, safe='')}/"
+        f"{quote(repo, safe='')}"
+    )
+
+    def _patch(comment_id: int) -> None:
+        httpx.patch(
+            f"{base}/issues/comments/{comment_id}",
+            json={"body": body},
+            headers=headers,
+            timeout=_STACK_COMMENT_TIMEOUT,
+        ).raise_for_status()
+
+    existing = _find_stack_comment_id(token, owner, repo, pr_number)
+    if existing is not None:
+        _patch(existing)
+        return
+    # Second look immediately before create (shrink race window).
+    existing = _find_stack_comment_id(token, owner, repo, pr_number)
+    if existing is not None:
+        _patch(existing)
+        return
+    try:
+        httpx.post(
+            f"{base}/issues/{pr_number}/comments",
+            json={"body": body},
+            headers=headers,
+            timeout=_STACK_COMMENT_TIMEOUT,
+        ).raise_for_status()
+    except httpx.HTTPStatusError:
+        # Lost the race or transient create error: heal via PATCH if present.
+        existing = _find_stack_comment_id(token, owner, repo, pr_number)
+        if existing is not None:
+            _patch(existing)
+            return
+        raise
 
 
 def _resolve_result(
@@ -1466,6 +1720,42 @@ def dispatch_code_review(
                     },
                     exc_info=True,
                 )
+
+    # Markings v2 review stack: upsert PR-timeline summary (actionable count
+    # + consolidated agent prompt). Best-effort — never fails the check/review
+    # that already published. Skipped when the check never landed.
+    if not check_publish_failed:
+        try:
+            stack_body = _review_stack_body(
+                evaluation,
+                conclusion=conclusion,
+                living_range=living_range,
+                suppressed_count=len(suppressed),
+                review_phase=tier1_phase,
+            )
+            with_install_token_retry(
+                installation_id,
+                lambda token: _upsert_review_stack_comment(
+                    token, owner, repo_name, pull_number, stack_body,
+                ),
+            )
+            log.info(
+                "elder_review_stack_upserted",
+                extra={
+                    "installation_id": installation_id,
+                    "pr": f"{owner}/{repo_name}#{pull_number}",
+                    "findings": len(evaluation.findings),
+                },
+            )
+        except Exception as e:  # noqa: BLE001 - stack is cosmetic UX
+            log.warning(
+                "elder_review_stack_upsert_failed",
+                extra={
+                    "installation_id": installation_id,
+                    "pr": f"{owner}/{repo_name}#{pull_number}",
+                    "kind": type(e).__name__,
+                },
+            )
 
     result = _resolve_result(
         evaluation,

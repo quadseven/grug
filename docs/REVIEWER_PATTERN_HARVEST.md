@@ -70,6 +70,17 @@ own release/workflow shape. Do not fold into Elder Markings.
 5. Swift Hunt adaptive settle (small PRs feel instant)
 6. Stable snapshot ignoring HTML footers (less thrash)
 
+## Markings v2 (review-stack shell)
+
+Shipped after the dense-inline-analyst harvest comparison:
+
+1. Category chip on every inline marking (RULES `bug_class`)
+2. **Why it matters** impact one-liner (taxonomy map, no extra LLM)
+3. CR-style agent meta preamble (verify / skip-if-fixed / minimal / validate)
+4. PR-timeline **Elder review stack** issue comment (upsert by marker):
+   actionable count, severity breakdown, markings table, consolidated agent prompt
+5. Autofix push still out of scope (comment-only + suggestion + agent prompt)
+
 ## Next slices (tracked)
 
 - Living Hunt: commit-range scoped re-review (#557)
