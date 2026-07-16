@@ -105,6 +105,16 @@ def changed_files_table(files: list[FileStat]) -> str:
     return table
 
 
+def _details(summary: str, body: str) -> str:
+    """Collapsible block. Keeps the default PR view short; expand for detail."""
+    return (
+        f"<details>\n"
+        f"<summary>{summary}</summary>\n\n"
+        f"{body}\n\n"
+        f"</details>"
+    )
+
+
 def walkthrough_body(
     *,
     summary: str,
@@ -115,46 +125,73 @@ def walkthrough_body(
     degraded: bool,
     files_truncated: bool = False,
 ) -> str:
-    """Assemble the full comment body. `degraded` marks a summary that
-    fell back to the deterministic form (LLM call failed/timed out) -
-    the comment says so rather than presenting a fallback as the real
-    thing. `files_truncated` marks a PR whose changed-file count exceeded
-    our fetch cap (GitHub's own /files cap is far higher) - every number
-    below is then a floor, not an exact count, and the comment says so.
-    `summary` is model-authored: mentions and line-leading `#` headings
-    are neutralized before this prose posts under the app's own
-    installation-token identity (round 4, codex) - a prompt-injected diff
-    could otherwise get a real GitHub user pinged, or a fake heading
-    impersonating a new section of Teller's own comment, as if Teller
-    itself did it."""
-    parts = [MARKER, "## Grug Teller walk the PR before the tribe judge it", ""]
-    parts.append(_neutralize_headings(_neutralize_mentions(summary[:_MAX_SUMMARY_CHARS])))
+    """Assemble a short walkthrough comment (default-collapsed detail).
+
+    Layout goal: one screen of useful signal when collapsed, like a review
+    summary card - not a wall of tables and mermaid.
+
+      ## Walkthrough
+      {short summary}
+      Review effort: ...
+      <details> Changed files (N) </details>
+      <details> Shape of the change </details>
+      _Last walked at ..._
+
+    `degraded` marks a summary that fell back to the deterministic form
+    (LLM call failed/timed out) - the comment says so rather than
+    presenting a fallback as the real thing. `files_truncated` marks a PR
+    whose changed-file count exceeded our fetch cap - every number below
+    is then a floor, not an exact count. `summary` is model-authored:
+    mentions and line-leading `#` headings are neutralized before this
+    prose posts under the app's own installation-token identity.
+    """
+    parts = [MARKER, "## Walkthrough", ""]
+    parts.append(
+        _neutralize_headings(_neutralize_mentions(summary[:_MAX_SUMMARY_CHARS]))
+    )
+    notes: list[str] = []
     if degraded:
-        parts.append(
-            "\n_(Teller's voice was quiet this pass - a deterministic "
-            "summary stands in; the table and diagram below are unaffected.)_"
+        notes.append(
+            "Summary fell back to a deterministic sketch; file list and "
+            "diagram (if any) are still live."
         )
     if files_truncated:
-        parts.append(
-            f"\n_(This hunt sprawl wide - Teller counted only the first "
-            f"{len(files)} file(s); the true count runs higher.)_"
+        notes.append(
+            f"File list is partial: first {len(files)} files only; "
+            "the PR has more."
         )
-    parts.append(f"\n**Effort to review:** {effort_label(effort)}")
+    if notes:
+        parts.append("")
+        parts.extend(f"- {n}" for n in notes)
+    parts.append("")
+    parts.append(f"Review effort: {effort_label(effort)}")
+
     table = changed_files_table(files)
     if table:
-        parts.append(f"\n### Changed files\n\n{table}")
+        n = len(files)
+        label = f"Changed files ({n})"
+        if files_truncated:
+            label = f"Changed files (first {n})"
+        parts.append("")
+        parts.append(_details(label, table))
+
     if diagram:
-        parts.append(f"\n### Shape of the change\n\n```mermaid\n{diagram}\n```")
-    elif files:
-        # A stated degradation reason, not a silent omission (Qodo #559:
-        # "Compliance ID 6 requires... a diagram, or if absent, a stated
-        # degradation reason"). build_diagram() can return None for three
-        # bounded cases (no files, too many top-level directories, or its
-        # own balance-check failing) - all collapse honestly to "too big
-        # or complex to draw," without over-claiming which one occurred.
+        parts.append("")
         parts.append(
-            "\n_(No diagram this pass - the change was too large or "
-            "complex to visualize cleanly.)_"
+            _details("Shape of the change", f"```mermaid\n{diagram}\n```")
         )
-    parts.append(f"\n_Last walked at commit `{head_sha[:12]}`._")
+    elif files:
+        # Stated reason when files exist but diagram could not be drawn
+        # (too many top-level dirs, balance check failed, and so on).
+        parts.append("")
+        parts.append(
+            _details(
+                "Shape of the change",
+                "No diagram this pass - the change was too large or "
+                "complex to visualize cleanly.",
+            )
+        )
+
+    parts.append("")
+    parts.append(f"_Last walked at `{head_sha[:12]}`._")
     return "\n".join(parts)

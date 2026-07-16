@@ -145,12 +145,16 @@ def test_walkthrough_body_carries_marker_summary_table_diagram_effort():
         degraded=False,
     )
     assert body.startswith(MARKER)
+    assert "## Walkthrough" in body
     assert "Adds a guard clause." in body
     assert "x.py" in body and "tweak" in body
     assert "```mermaid" in body
     assert "quick" in body
     assert "aaaaaaaaaaaa" in body  # truncated head sha
-    assert "quiet this pass" not in body  # not degraded
+    # Detail is collapsed by default (short PR timeline).
+    assert "<details>" in body and "<summary>Changed files (1)</summary>" in body
+    assert "<summary>Shape of the change</summary>" in body
+    assert "deterministic sketch" not in body  # not degraded
 
 
 def test_walkthrough_body_no_diagram_and_no_files_omits_the_section_silently():
@@ -162,6 +166,7 @@ def test_walkthrough_body_no_diagram_and_no_files_omits_the_section_silently():
     )
     assert "```mermaid" not in body
     assert "too large or complex" not in body
+    assert "Shape of the change" not in body
 
 
 def test_walkthrough_body_no_diagram_with_files_states_a_degradation_reason():
@@ -176,6 +181,7 @@ def test_walkthrough_body_no_diagram_with_files_states_a_degradation_reason():
     )
     assert "```mermaid" not in body
     assert "too large or complex" in body
+    assert "<summary>Shape of the change</summary>" in body
 
 
 def test_walkthrough_body_degraded_says_so_honestly():
@@ -183,7 +189,7 @@ def test_walkthrough_body_degraded_says_so_honestly():
         summary="fallback summary", files=[], diagram=None, effort="quick",
         head_sha="c" * 40, degraded=True,
     )
-    assert "quiet this pass" in body
+    assert "deterministic sketch" in body
 
 
 def test_estimate_effort_logs_rejected_off_vocabulary_value(caplog):
@@ -205,7 +211,8 @@ def test_walkthrough_body_files_truncated_hedges_the_count():
         effort="extensive", head_sha="d" * 40, degraded=True,
         files_truncated=True,
     )
-    assert "sprawl wide" in body
+    assert "File list is partial" in body
+    assert "first 0 files" in body
 
 
 def test_walkthrough_body_not_truncated_by_default():
@@ -213,7 +220,7 @@ def test_walkthrough_body_not_truncated_by_default():
         summary="s", files=[], diagram=None, effort="quick",
         head_sha="e" * 40, degraded=False,
     )
-    assert "sprawl wide" not in body
+    assert "File list is partial" not in body
 
 
 # --- output sanitization: mentions + table-breaking chars (round 4, codex) -
