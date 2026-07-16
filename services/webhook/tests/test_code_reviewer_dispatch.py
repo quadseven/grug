@@ -1725,8 +1725,17 @@ def test_inline_comment_body_effort_chip_and_agent_prompt():
     assert "Grug see unused path" in body
     assert "Why it matters" in body
     assert "Verify each finding against the current code" in body
-    # category from RULES bug_class for dead-code
-    assert "maintainability" in body or "test coverage" in body or "general" in body
+    # dead-code rule maps to maintainability in RULES
+    assert "maintainability" in body
+    assert cr_dispatch._category_for_rule("dead-code") == "maintainability"
+
+
+def test_why_it_matters_covers_every_rules_bug_class():
+    """Every RULES bug_class must have a specific impact one-liner."""
+    from code_review_prompt import RULES
+    classes = {r.bug_class for r in RULES}
+    missing = classes - set(cr_dispatch._WHY_IT_MATTERS)
+    assert not missing, f"missing _WHY_IT_MATTERS keys: {sorted(missing)}"
 
 
 def test_review_stack_body_has_marker_and_actionable_count():

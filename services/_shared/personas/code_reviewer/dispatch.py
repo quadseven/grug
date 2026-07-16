@@ -932,8 +932,13 @@ def _find_stack_comment_id(
 def _upsert_review_stack_comment(
     token: str, owner: str, repo: str, pr_number: int, body: str,
 ) -> None:
-    """PATCH existing stack comment or POST a new one (Teller discipline)."""
-    existing = _find_stack_comment_id(token, owner, repo, pr_number)
+    """PATCH existing stack comment or POST a new one (Teller discipline).
+
+    Concurrent dispatch (redelivery / race) can TOCTOU: both find nothing and
+    both POST. Mitigations: re-find immediately before write; if POST fails
+    or races, re-find and PATCH the winner. with_install_token_retry only
+    retries 401 (not generic 5xx), so successful POSTs are not re-fired.
+    """
     headers = {
         "Authorization": f"Bearer {token}",
         "Accept": "application/vnd.github+json",
@@ -943,20 +948,38 @@ def _upsert_review_stack_comment(
         f"https://api.github.com/repos/{quote(owner, safe='')}/"
         f"{quote(repo, safe='')}"
     )
-    if existing is not None:
+
+    def _patch(comment_id: int) -> None:
         httpx.patch(
-            f"{base}/issues/comments/{existing}",
+            f"{base}/issues/comments/{comment_id}",
             json={"body": body},
             headers=headers,
             timeout=_STACK_COMMENT_TIMEOUT,
         ).raise_for_status()
-    else:
+
+    existing = _find_stack_comment_id(token, owner, repo, pr_number)
+    if existing is not None:
+        _patch(existing)
+        return
+    # Second look immediately before create (shrink race window).
+    existing = _find_stack_comment_id(token, owner, repo, pr_number)
+    if existing is not None:
+        _patch(existing)
+        return
+    try:
         httpx.post(
             f"{base}/issues/{pr_number}/comments",
             json={"body": body},
             headers=headers,
             timeout=_STACK_COMMENT_TIMEOUT,
         ).raise_for_status()
+    except httpx.HTTPStatusError:
+        # Lost the race or transient create error: heal via PATCH if present.
+        existing = _find_stack_comment_id(token, owner, repo, pr_number)
+        if existing is not None:
+            _patch(existing)
+            return
+        raise
 
 
 def _resolve_result(
