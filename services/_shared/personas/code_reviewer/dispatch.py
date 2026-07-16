@@ -112,6 +112,23 @@ def _fetch_pr_diff(
     head_sha: str = "",
 ) -> str:
     """GET an immutable base/head diff, falling back when compare is unavailable."""
+    diff, _ = _fetch_pr_diff_with_scope(
+        install_token, owner, repo, pull_number,
+        base_sha=base_sha, head_sha=head_sha,
+    )
+    return diff
+
+
+def _fetch_pr_diff_with_scope(
+    install_token: str,
+    owner: str,
+    repo: str,
+    pull_number: int,
+    *,
+    base_sha: str = "",
+    head_sha: str = "",
+) -> tuple[str, bool]:
+    """Return the diff and whether an immutable compare supplied it."""
     repo_url = (
         f"https://api.github.com/repos/{quote(owner, safe='')}/"
         f"{quote(repo, safe='')}"
@@ -133,7 +150,8 @@ def _fetch_pr_diff(
         headers=headers,
         timeout=_DIFF_FETCH_TIMEOUT,
     )
-    if base_sha and head_sha and resp.status_code in {404, 422}:
+    used_compare = bool(base_sha and head_sha)
+    if used_compare and resp.status_code in {404, 422}:
         # GitHub can reject compare requests for forked or recently rewritten
         # histories while the PR diff remains readable. Snapshot checks before
         # and after inference still prevent this mutable fallback from being
@@ -152,8 +170,9 @@ def _fetch_pr_diff(
             headers=headers,
             timeout=_DIFF_FETCH_TIMEOUT,
         )
+        used_compare = False
     resp.raise_for_status()
-    return resp.text
+    return resp.text, used_compare
 
 
 def _fetch_current_review_snapshot(
@@ -425,9 +444,12 @@ def _summary_markdown(
          "` (files changed since the last completed Elder pass).")
         if living_range else ""
     )
+    def hunt_title(title: str) -> str:
+        return f"Living Hunt {living_range} - {title}" if living_range else title
+
     if evaluation.degraded_reason:
         title = f"⚠️ Grug eyes clouded ({evaluation.degraded_reason})"
-        return title, (
+        return hunt_title(title), (
             "Grug Elder could not see the diff this pass. The mist: "
             f"`{evaluation.degraded_reason}`. Grug stay his club — this "
             "only counsel, merge not blocked."
@@ -438,7 +460,13 @@ def _summary_markdown(
             if not suppressed_count
             else "Elder clear - weak markings held back"
         )
-        if excluded_paths:
+        if living_range:
+            scope = (
+                "Elder walked the delta diff (full file + cross-file + Omen "
+                "runtime signal when mapped). No markings survived the judge. "
+                "Code walk steady."
+            )
+        elif excluded_paths:
             scope = (
                 "Elder walked the reviewable diff (full file + cross-file + "
                 "Omen when mapped), skipping data/generated paths listed "
@@ -451,7 +479,7 @@ def _summary_markdown(
                 "runtime signal when mapped). No markings survived the judge. "
                 "Code walk steady."
             )
-        return title, ("## Markings Board\n\n" + scope) + held + hunt
+        return hunt_title(title), ("## Markings Board\n\n" + scope) + held + hunt
 
     severity_icon = {
         "critical": "critical", "high": "high", "medium": "medium", "low": "low",
@@ -463,8 +491,7 @@ def _summary_markdown(
         f"Elder markings - {blocking} blocking, "
         f"{len(evaluation.findings)} total"
     )
-    if living_range:
-        title = f"Living Hunt {living_range} - {title}"
+    title = hunt_title(title)
     rows = [
         "| Severity | Effort | File | Line | Rule | Marking |",
         "|---|---|---|---|---|---|",
@@ -999,9 +1026,9 @@ def dispatch_code_review(
     # DiffParseError → advisory neutral so a fetcher bug or GitHub
     # format drift cannot 500 the webhook.
     try:
-        diff_text = with_install_token_retry(
+        diff_text, used_living_compare = with_install_token_retry(
             installation_id,
-            lambda token: _fetch_pr_diff(
+            lambda token: _fetch_pr_diff_with_scope(
                 token,
                 owner,
                 repo_name,
@@ -1010,6 +1037,10 @@ def dispatch_code_review(
                 head_sha=head_sha,
             ),
         )
+        if living_prior_sha and not used_living_compare:
+            living_prior_sha = ""
+            living_range = ""
+        pr_context["base_sha"] = living_prior_sha or base_sha
         hunks = parse_diff(diff_text)
         # #609: drop data/generated/vendored files from the LLM's plate - a
         # big JSONL/lockfile hunk balloons the prompt into parse_failed and
@@ -1459,18 +1490,34 @@ def dispatch_code_review(
         try:
             from adapters.install_store import put_elder_last_reviewed
 
-            put_elder_last_reviewed(
-                install_id=installation_id,
-                repo=f"{owner}/{repo_name}",
-                pr_number=pull_number,
-                head_sha=head_sha,
+            _, current_head_sha, _, _ = with_install_token_retry(
+                installation_id,
+                lambda token: _fetch_current_review_snapshot(
+                    token, owner, repo_name, pull_number,
+                ),
             )
-            if living_range:
+            if current_head_sha == head_sha:
+                put_elder_last_reviewed(
+                    install_id=installation_id,
+                    repo=f"{owner}/{repo_name}",
+                    pr_number=pull_number,
+                    head_sha=head_sha,
+                )
+                if living_range:
+                    log.info(
+                        "elder_living_hunt_delta_done",
+                        extra={
+                            "pr": f"{owner}/{repo_name}#{pull_number}",
+                            "range": living_range,
+                        },
+                    )
+            else:
                 log.info(
-                    "elder_living_hunt_delta_done",
+                    "elder_living_hunt_stale_anchor_skipped",
                     extra={
                         "pr": f"{owner}/{repo_name}#{pull_number}",
-                        "range": living_range,
+                        "review_head": head_sha,
+                        "current_head": current_head_sha,
                     },
                 )
         except Exception as e:  # noqa: BLE001 - memory must not fail publish
