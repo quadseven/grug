@@ -99,7 +99,10 @@ spec:
             # Keep review configuration on both Elder-capable workloads. The
             # Opus override is review-only; judge, Teller, and /grug ask retain
             # their existing lower-cost OpenRouter model configuration.
-            - {name: GRUG_REVIEW_DEPTH, value: deep}
+            # Tiered Elder (#645): see consumer-deployment for full comments.
+            - {name: GRUG_REVIEW_DEPTH, value: tiered}
+            - {name: GRUG_DEEP_SAMPLE_RATE, value: "0.12"}
+            - {name: GRUG_DEEP_DIFF_LINES, value: "300"}
             - {name: GRUG_OPENROUTER_REVIEW_MODEL, value: anthropic/claude-opus-4.7}
             - {name: GITHUB_APP_ID_SSM, value: /grug/github-app-id}
             - {name: GITHUB_APP_PRIVATE_KEY_SSM, value: /grug/github-app-private-key}

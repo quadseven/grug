@@ -86,11 +86,13 @@ the adaptive quiet window:
   seconds; large multi-file storms keep the full window. Elder posts an
   `in_progress` `Grug — Code Review` check the moment the durable job is
   queued, so required-status rulesets show pending instead of "check missing".
-- **Dual-arm deep review** - coder + reasoner arms on the owned Cave run in
-  parallel, merge findings, and grade through the judge. Covers 25+ named
-  correctness, error-handling, concurrency, and security-shape rules. Whole-file
-  + 1-hop cross-file context + PR intent ride every pass. `GRUG_REVIEW_DEPTH=fast`
-  is the one-arm rollback. SaaS overload fallback stays last-resort (ADR-0005).
+- **Tiered Cave review** (ADR-0019 / #645) - default is a single **coder** arm
+  for ordinary PRs; the **reasoner** arm escalates only on large diffs,
+  high-risk paths, explicit `deep-review`, or a calibration sample. Dual-arm
+  `GRUG_REVIEW_DEPTH=deep` remains the max-recall rollback. Covers 25+ named
+  correctness, error-handling, concurrency, and security-shape rules.
+  Whole-file + 1-hop cross-file context + PR intent ride every pass. SaaS
+  overload fallback stays last-resort (ADR-0005).
 - **Markings Board** - structured inline findings: severity, effort, What Elder
   sees, Fix (one-click when safe), Lore citations from prior tribe history, and
   a copy-paste agent repair prompt. Check-run summary is a full findings table.

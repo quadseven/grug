@@ -87,11 +87,13 @@ spec:
             - {name: GRUG_OPENROUTER_API_KEY_SSM, value: /infra/llm/openrouter_api_key}
             - {name: GRUG_POOLSIDE_API_KEY_SSM, value: /infra/llm/poolside_api_key}
             - {name: GRUG_PROMPT_EXPERIMENT_SSM, value: /grug/elder-prompt-experiment}
-            # Production Elder runs both review backends and merges their
-            # findings. Opus is scoped to the OpenRouter REVIEW pass only.
-            # Set GRUG_REVIEW_DEPTH=fast on both deployments for the immediate
-            # one-primary-plus-fallback latency/cost rollback.
-            - {name: GRUG_REVIEW_DEPTH, value: deep}
+            # Tiered Elder (#645): coder arm on every PR; reasoner only on
+            # escalation / sample. Rollback to always-on dual-arm: deep.
+            # Fast = coder-first with reasoner only if coder fails.
+            - {name: GRUG_REVIEW_DEPTH, value: tiered}
+            # Escalation knobs (llm_client.decide_deep_escalation):
+            - {name: GRUG_DEEP_SAMPLE_RATE, value: "0.12"}
+            - {name: GRUG_DEEP_DIFF_LINES, value: "300"}
             - {name: GRUG_OPENROUTER_REVIEW_MODEL, value: anthropic/claude-opus-4.7}
             # Apex: more concurrent durable reviews so a busy multi-repo
             # night does not serialize Elder behind unrelated large PRs.
