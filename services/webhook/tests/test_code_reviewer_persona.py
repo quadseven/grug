@@ -149,6 +149,48 @@ def test_static_json_scalar_is_not_external_input() -> None:
     assert evaluate_diff(parse_diff(diff), llm).findings == ()
 
 
+def test_templated_json_key_can_still_be_external_input() -> None:
+    diff = """diff --git a/config.json b/config.json
+--- a/config.json
++++ b/config.json
+@@ -1,2 +1,3 @@
+ {
++  "${TOKEN}": "oci",
+ }
+"""
+    llm = LlmReviewResponse(
+        kind="reviewed",
+        findings=(_llm_finding(
+            path="config.json", line=2, severity="critical",
+            rule="unvalidated-external-input",
+        ),),
+        backend_used=Backend.POOLSIDE,
+    )
+
+    assert len(evaluate_diff(parse_diff(diff), llm).findings) == 1
+
+
+def test_diff_annotation_does_not_shift_static_scalar_lookup() -> None:
+    diff = """diff --git a/values.yaml b/values.yaml
+--- a/values.yaml
++++ b/values.yaml
+@@ -1,1 +1,2 @@
++first: value
+\\ No newline at end of file
++target: ${USER_TARGET}
+"""
+    llm = LlmReviewResponse(
+        kind="reviewed",
+        findings=(_llm_finding(
+            path="values.yaml", line=2, severity="critical",
+            rule="unvalidated-external-input",
+        ),),
+        backend_used=Backend.POOLSIDE,
+    )
+
+    assert len(evaluate_diff(parse_diff(diff), llm).findings) == 1
+
+
 def test_critical_finding_flips_passed_to_false() -> None:
     hunks = parse_diff(_DIFF)
     llm = LlmReviewResponse(

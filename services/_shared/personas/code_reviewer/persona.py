@@ -47,7 +47,7 @@ assert frozenset(get_args(Severity)) == _BLOCKING_SEVERITIES | _ADVISORY_SEVERIT
 
 _DECLARATIVE_PATH_RE = re.compile(r"\.(?:ya?ml|json|toml)$", re.IGNORECASE)
 _STATIC_SCALAR_RE = re.compile(
-    r"^\s*(?:[A-Za-z0-9_.\/-]+|\"[^\"]+\")\s*[:=]\s*"
+    r"^\s*(?:[A-Za-z0-9_.\/-]+|\"[^$'\"{}]+\")\s*[:=]\s*"
     r"(?:[A-Za-z0-9_.\/-]+|['\"][^$'{\"}]*['\"])\s*,?\s*$"
 )
 
@@ -56,6 +56,8 @@ def _changed_line_text(hunk: DiffHunk, target_line: int) -> str | None:
     """Return target new-side text from one unified-diff hunk."""
     new_line = hunk.new_start
     for raw in hunk.body.splitlines()[1:]:
+        if raw.startswith("\\"):
+            continue
         if raw.startswith("-"):
             continue
         text = raw[1:] if raw.startswith(("+", " ")) else raw
