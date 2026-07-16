@@ -91,7 +91,9 @@ spec:
             # one-primary-plus-fallback latency/cost rollback.
             - {name: GRUG_REVIEW_DEPTH, value: deep}
             - {name: GRUG_OPENROUTER_REVIEW_MODEL, value: anthropic/claude-opus-4.7}
-            - {name: GRUG_RERUN_WORKERS, value: "4"}
+            # Apex: more concurrent durable reviews so a busy multi-repo
+            # night does not serialize Elder behind unrelated large PRs.
+            - {name: GRUG_RERUN_WORKERS, value: "6"}
             # Absolute per-review wall clock. The watchdog returns the SQS
             # receipt, releases the snapshot claim, and replaces the process
             # if a live worker exceeds this budget. Keep below SQS's 900s

@@ -59,7 +59,10 @@ import threading
 from dataclasses import dataclass
 from typing import Any
 
-from personas.code_reviewer.snapshot import review_snapshot_id_from_pr
+from personas.code_reviewer.snapshot import (
+    adaptive_elder_settle_seconds,
+    review_snapshot_id_from_pr,
+)
 
 log = logging.getLogger(f"{os.getenv('DD_SERVICE', 'grug')}.async_dispatch")
 
@@ -447,6 +450,12 @@ def enqueue_elder_review(
             settle_seconds = min(
                 _MAX_ELDER_SETTLE_SECONDS, max(0, settle_seconds),
             )
+            # Swift Elder: shrink (or drop) the quiet window for small PRs so
+            # tiny focused changes get markings in seconds, not after a full
+            # settle that only helps large multi-push storms.
+            settle_seconds = adaptive_elder_settle_seconds(
+                pr, base_seconds=settle_seconds,
+            )
 
             from rerun import enqueue_review  # type: ignore[attr-defined]
 
@@ -460,6 +469,10 @@ def enqueue_elder_review(
                 requested_body=str(pr.get("body") or ""),
                 settle_seconds=settle_seconds,
             )
+            try:
+                _churn = int(pr.get("additions") or 0) + int(pr.get("deletions") or 0)
+            except (TypeError, ValueError):
+                _churn = None
             log.info(
                 "elder_enqueue_durable",
                 extra={
@@ -468,6 +481,8 @@ def enqueue_elder_review(
                     "pr": pr_number,
                     "head_sha": head_sha[:8],
                     "settle_seconds": settle_seconds,
+                    "changed_files": pr.get("changed_files"),
+                    "churn": _churn,
                 },
             )
             return True

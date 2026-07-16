@@ -426,34 +426,50 @@ def _summary_markdown(
         ) + held
     if not evaluation.findings:
         title = (
-            "✅ Grug find nothing — code good"
+            "Elder clear - no markings"
             if not suppressed_count
-            else "✅ Grug find nothing worth the club"
+            else "Elder clear - weak markings held back"
         )
         return title, (
-            "Grug Elder look long upon the diff and find nothing to fear. "
-            "Code walk steady. Grug nod."
+            "## Markings Board\n\n"
+            "Elder walked the whole diff (full file + cross-file + Omen "
+            "runtime signal when mapped). No markings survived the judge. "
+            "Code walk steady."
         ) + held
 
     severity_icon = {
-        "critical": "🛑", "high": "❌", "medium": "⚠️", "low": "ℹ️",
+        "critical": "critical", "high": "high", "medium": "medium", "low": "low",
     }
     blocking = sum(
         1 for f in evaluation.findings if f.severity in ("high", "critical")
     )
     title = (
-        f"❌ Grug see trouble — {blocking} blocking · "
-        f"{len(evaluation.findings)} finding(s) in all"
+        f"Elder markings - {blocking} blocking, "
+        f"{len(evaluation.findings)} total"
     )
-    rows = ["| Severity | File | Line | Rule | Message |", "|---|---|---|---|---|"]
+    rows = [
+        "| Severity | Effort | File | Line | Rule | Marking |",
+        "|---|---|---|---|---|---|",
+    ]
     for f in evaluation.findings:
-        icon = severity_icon.get(f.severity, "•")
+        effort = (
+            _EFFORT_LABELS.get(f.effort, "-")
+            if f.effort in _EFFORT_LABELS
+            else "-"
+        )
         rows.append(
-            f"| {icon} {f.severity} | `{f.file}` | {f.line} | "
-            f"`{f.rule_name}` | {_defused(f.message)} |"
+            f"| {severity_icon.get(f.severity, f.severity)} | {effort} | "
+            f"`{f.file}` | {f.line} | `{f.rule_name}` | "
+            f"{_defused(f.message)} |"
         )
     table = "\n".join(rows)
-    return title, f"{table}{held}\n\n{_consolidated_agent_prompt(evaluation)}"
+    legend = (
+        "## Markings Board\n\n"
+        "Dual-arm deep review (coder + reasoner on the Cave), graded by "
+        "the judge, grounded in Lore when prior tribe history exists. "
+        "Inline comments carry Fix + agent prompt on each marking.\n\n"
+    )
+    return title, f"{legend}{table}{held}\n\n{_consolidated_agent_prompt(evaluation)}"
 
 
 # GitHub caps check-run summaries at 65536 chars; the findings table is
@@ -551,8 +567,15 @@ def _agent_prompt_block(f: Finding) -> str:
 
 
 def _inline_comment_body(f: Finding, precedent_note: str = "") -> str:
-    """Format one finding as an inline-comment Markdown body (#553:
-    committable suggestion block + effort chip + agent prompt).
+    """Format one finding as a structured Marking (#553 / #617).
+
+    Shape (Markings Board):
+      - severity · rule · effort chip
+      - What Elder sees (the finding)
+      - Where (file:line, always)
+      - Fix (committable suggestion when safe, else fenced prose)
+      - Lore (precedent + measured confidence when the ledger has history)
+      - Prompt for AI agents (copy-paste repair brief)
 
     Appends a hidden `grug-rule` marker (rendered invisibly by GitHub)
     so a later `synchronize` push can recognise this comment as a Grug
@@ -561,13 +584,17 @@ def _inline_comment_body(f: Finding, precedent_note: str = "") -> str:
     chip = f"**{f.severity.upper()} · `{f.rule_name}`**"
     if f.effort in _EFFORT_LABELS:
         chip += f" · {_EFFORT_LABELS[f.effort]}"
-    head = f"{chip}\n\n{_defused(f.message)}"
+    head = (
+        f"{chip}\n\n"
+        f"**What Elder sees**\n\n{_defused(f.message)}\n\n"
+        f"**Where:** `{_defused(f.file)}:{f.line}`"
+    )
     if precedent_note:
         # #555: ledger-grounded citation + measured-confidence chip, as a
         # blockquote under the message. _defused() neutralizes any user text
         # that reached the note via file paths; the note itself is our own
         # rendered string.
-        head += f"\n\n> {_defused(precedent_note)}"
+        head += f"\n\n**Lore**\n\n> {_defused(precedent_note)}"
     # strip wrapping NEWLINES only (not spaces): GitHub commits the block
     # verbatim as the full replacement line, so leading indentation must
     # survive, but a bare "\n\n\n" suggestion must not slip through as a
@@ -585,7 +612,7 @@ def _inline_comment_body(f: Finding, precedent_note: str = "") -> str:
         # multi-line suggestion applied there duplicates the following
         # original lines - confident-looking one-click corruption.
         body = (
-            f"{head}\n\n**Suggested fix:**\n"
+            f"{head}\n\n**Fix** (one-click, line-exact):\n"
             f"```suggestion\n{stripped_suggestion}\n```"
         )
     elif f.suggestion:
@@ -594,7 +621,7 @@ def _inline_comment_body(f: Finding, precedent_note: str = "") -> str:
         # ```suggestion would otherwise render as a live committable block
         # - the sanitizer must not route the payload around itself).
         body = (
-            f"{head}\n\n**Suggested fix** "
+            f"{head}\n\n**Fix** "
             f"(anchored at line {f.line} - verify scope before applying):\n"
             f"{_fenced(f.suggestion)}"
         )

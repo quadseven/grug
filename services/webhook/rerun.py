@@ -179,6 +179,14 @@ def _post_elder_in_progress_check(
             },
         )
         return
+    settle_line = (
+        "Swift Hunt: no quiet wait - deep review starts now."
+        if settle_seconds <= 0
+        else (
+            f"Quiet window {settle_seconds}s, then dual-arm deep review "
+            "(coder + reasoner on the Cave)."
+        )
+    )
     check = CheckRunResult(
         name=_ELDER_CHECK_NAME,
         head_sha=head_sha,
@@ -186,11 +194,12 @@ def _post_elder_in_progress_check(
         conclusion=None,
         title="Elder is reading the markings",
         summary=(
-            "Durable Elder review is queued "
-            f"(settle window {settle_seconds}s, then deep LLM review). "
-            "This check stays in progress until the review finishes; "
-            "it is not missing. Mid-flight cancels re-enqueue automatically "
-            "when base/head/title/body change."
+            f"{settle_line}\n\n"
+            "Grug posts this check as soon as the durable review is queued so "
+            "required-status rulesets show **pending**, never 'missing'. "
+            "Lore (prior findings), Omen (runtime signal), and cross-file "
+            "context ride the same pass. Mid-flight cancels re-enqueue when "
+            "base/head or real author intent change."
         ),
     )
     try:

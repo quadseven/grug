@@ -312,7 +312,8 @@ def test_inline_comment_body_includes_suggestion_block(monkeypatch):
         message="m", suggestion="add a None guard",
     )
     body = cr_dispatch._inline_comment_body(f)
-    assert "Suggested fix" in body and "add a None guard" in body
+    assert "**Fix**" in body and "add a None guard" in body
+    assert "What Elder sees" in body
     assert "<!-- grug-rule:null-deref -->" in body  # marker still appended
 
 
@@ -327,6 +328,7 @@ def test_inline_comment_body_appends_precedent_note():
     body = cr_dispatch._inline_comment_body(
         f, precedent_note="Grug see this before -- 2 time(s) fixed here (#400, #366).",
     )
+    assert "**Lore**" in body
     assert "> Grug see this before" in body
     assert "#400" in body
     assert body.index("Grug see this before") < body.index("grug-rule:sync-io-in-async")
@@ -378,6 +380,7 @@ def test_summary_markdown_renders_findings_table():
     )
     title, summary = cr_dispatch._summary_markdown(ev)
     assert "1 blocking" in title  # one critical, one low
+    assert "Markings Board" in summary
     assert "secret-in-log-or-trace" in summary and "dead-code" in summary
     assert "`x.py`" in summary
 
@@ -1697,7 +1700,7 @@ def test_inline_comment_body_fence_unsafe_suggestion_degrades_to_prose():
     )
     body = cr_dispatch._inline_comment_body(f)
     assert "```suggestion" not in body
-    assert "Suggested fix" in body
+    assert "**Fix**" in body
 
 
 def test_inline_comment_body_effort_chip_and_agent_prompt():
@@ -1850,7 +1853,7 @@ def test_unterminated_fence_in_message_cannot_swallow_the_body():
     assert "```suggestion\nuse(x)\n```" in body
     assert body.rstrip().endswith("<!-- grug-rule:null-deref -->")
     # the head's backtick run was defused below fence-capability
-    head = body.split("**Suggested fix", 1)[0]
+    head = body.split("**Fix", 1)[0]
     assert "```" not in head
 
 
