@@ -222,15 +222,18 @@ def _complete_elder_check_open(
     title: str,
     summary: str,
     conclusion: str = "neutral",
-) -> None:
+) -> bool:
     """Post a TERMINAL Elder check so required-status never sticks in_progress.
 
     CodeRabbit-style fail-open: infra failure / GH brownout / superseded head
     must complete the required check as neutral (passes merge) with an honest
-    title, never leave "in_progress" forever. Best-effort; never raises.
-    """
+    title, never leave "in_progress" forever. Never raises. Returns False
+    only on a transient post failure (the completion did NOT land, so the
+    check may still be stuck); callers on a current-head exit should redrive
+    in that case rather than silently finishing the job."""
     if not (owner and repo_name and head_sha):
-        return
+        # Nothing addressable to complete; retrying cannot help.
+        return True
     check = CheckRunResult(
         name=_ELDER_CHECK_NAME,
         head_sha=head_sha,
@@ -264,6 +267,7 @@ def _complete_elder_check_open(
                 "title": title[:80],
             },
         )
+        return True
     except Exception as error:  # noqa: BLE001 - visibility path
         log.warning(
             "elder_check_fail_open_failed",
@@ -275,6 +279,7 @@ def _complete_elder_check_open(
                 "kind": type(error).__name__,
             },
         )
+        return False
 
 
 def _post_elder_in_progress_check(
@@ -1095,24 +1100,32 @@ def _run_hot_review(
             _stop_staleness_watch(watch)
         degraded_reason = result.get("degraded_reason", "")
         if degraded_reason == "stale_snapshot":
-            # Close the abandoned head so required-status does not stick.
-            _complete_elder_check_open(
-                install_id=install_id,
-                owner=owner,
-                repo_name=repo_name,
-                pr_number=pr_number,
-                head_sha=head_sha,
-                title="Elder superseded - new head",
-                summary=(
-                    "A newer commit or intent change arrived while Elder was "
-                    "reviewing. This head is closed as neutral (fail-open). "
-                    "A fresh review is enqueued for the current head."
-                ),
-                conclusion="neutral",
-            )
             latest = _fetch_current_pr(
                 install_id, owner, repo_name, pr_number,
             )
+            latest_head = str((latest.get("head") or {}).get("sha") or "")
+            if latest_head and latest_head != head_sha:
+                # Head actually moved: close the abandoned head's check so it
+                # never sticks in_progress. Best-effort - required-status
+                # evaluates the NEW head, so a failed post here is cosmetic.
+                _complete_elder_check_open(
+                    install_id=install_id,
+                    owner=owner,
+                    repo_name=repo_name,
+                    pr_number=pr_number,
+                    head_sha=head_sha,
+                    title="Elder superseded - new head",
+                    summary=(
+                        "A newer commit arrived while Elder was reviewing. "
+                        "This head is closed as neutral (fail-open). A fresh "
+                        "review is enqueued for the current head."
+                    ),
+                    conclusion="neutral",
+                )
+            # Same-SHA staleness (title/body intent change): leave the check
+            # in_progress - the requeued review on this same head completes
+            # it. A terminal neutral here would prematurely green the merge
+            # button before the fresh review runs.
             if _review_eligible(latest):
                 _enqueue_current_review(
                     install_id=install_id,
@@ -1164,7 +1177,7 @@ def _run_hot_review(
         # required check as neutral, never leave in_progress forever and
         # never redrive forever. Real model findings still use pass/fail.
         if result_status == "skipped" and degraded_reason == "freshness_check_failed":
-            _complete_elder_check_open(
+            posted = _complete_elder_check_open(
                 install_id=install_id,
                 owner=owner,
                 repo_name=repo_name,
@@ -1179,6 +1192,14 @@ def _run_hot_review(
                 ),
                 conclusion="neutral",
             )
+            if not posted:
+                # The same brownout ate the neutral completion: finishing the
+                # job now would leave the required check in_progress forever
+                # with no retry - the exact bug fail-open exists to prevent.
+                # Raise for redrive; a later attempt reviews or re-posts.
+                raise RuntimeError(
+                    "Elder fail-open completion did not land (freshness outage)"
+                )
             if not _stop_review_claim_heartbeat(heartbeat):
                 raise RuntimeError(
                     "Elder review claim ownership lost after fail-open"
@@ -1201,7 +1222,7 @@ def _run_hot_review(
             "no_diff", "fail_open_freshness",
         ):
             # Unknown skip: still fail-open rather than infinite redrive.
-            _complete_elder_check_open(
+            posted = _complete_elder_check_open(
                 install_id=install_id,
                 owner=owner,
                 repo_name=repo_name,
@@ -1215,6 +1236,13 @@ def _run_hot_review(
                 ),
                 conclusion="neutral",
             )
+            if not posted:
+                # Fail-open only counts if the completion landed; otherwise
+                # redrive so the check cannot stay in_progress forever.
+                raise RuntimeError(
+                    "Elder fail-open completion did not land "
+                    f"(skip: {degraded_reason or 'unknown'})"
+                )
             if not _stop_review_claim_heartbeat(heartbeat):
                 raise RuntimeError(
                     "Elder review claim ownership lost after fail-open skip"
