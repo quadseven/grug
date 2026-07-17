@@ -273,7 +273,17 @@ def dispatch_walkthrough_review(
     try:
         from llm_client import summarize_pr  # lazy: heavy import, webhook+api both use this module
 
-        llm_summary = summarize_pr(diff_text, [f.path for f in files], installation_id)
+        llm_summary = summarize_pr(
+            diff_text,
+            [f.path for f in files],
+            installation_id,
+            pr_context={
+                "installation_id": installation_id,
+                "repo": f"{owner}/{repo_name}",
+                "pr_number": pull_number,
+                "head_sha": head_sha,
+            },
+        )
     except Exception as e:  # noqa: BLE001 - a summary hiccup must not drop the comment
         log.warning(
             "walkthrough_summarize_failed",

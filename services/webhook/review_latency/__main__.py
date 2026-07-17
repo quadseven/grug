@@ -12,6 +12,12 @@ Env (same family as sast_benchmark / elder_eval):
 Optional second arm:
   GRUG_BENCH_REASONER_URL / GRUG_BENCH_REASONER_MODEL / GRUG_BENCH_REASONER_KEY
 
+LLMObs export (agentless; lands on Evaluations UI):
+  GRUG_BENCH_LLMOBS=1     enable span + eval export per trial
+  DD_API_KEY              required when export enabled
+  DD_LLMOBS_ML_APP        default grug-elder-bakeoff
+  DD_SITE                 default datadoghq.com
+
 Flags:
   --levels 1,2,4,8     concurrency levels (default)
   --no-stream          wall-clock only
@@ -38,6 +44,7 @@ from pathlib import Path
 from sast_benchmark.backends import BenchBackend
 
 from .fixtures import default_fixtures
+from .llmobs_export import _DEFAULT_ML_APP, flush, maybe_enable
 from .runner import sweep
 from .scoring import summarize_trials
 
@@ -104,52 +111,64 @@ def main(argv: list[str] | None = None) -> int:
         print("No fixtures selected", file=sys.stderr)
         return 2
 
+    llmobs_on = maybe_enable()
     print("Fixtures:")
     for f in fixtures:
         print(f"  {f.name}: ~{f.added_lines} added lines, {f.prompt_chars} prompt chars")
+    if llmobs_on:
+        ml = (os.getenv("DD_LLMOBS_ML_APP") or _DEFAULT_ML_APP).strip() or _DEFAULT_ML_APP
+        print(f"LLMObs export: ON (ml_app={ml})")
+    else:
+        print(
+            "LLMObs export: OFF "
+            "(set GRUG_BENCH_LLMOBS=1 + DD_API_KEY to ship spans/evals)"
+        )
 
     all_trials = []
     all_walls: dict[tuple[str, int], float] = {}
-    for backend in backends:
-        print(f"\n=== backend={backend.name} model={backend.model} ===")
-        trials, walls = sweep(
-            backend,
-            fixtures,
-            levels,
-            stream=not args.no_stream,
-            timeout_s=args.timeout_s,
-        )
-        all_trials.extend(trials)
-        all_walls.update(walls)
+    try:
+        for backend in backends:
+            print(f"\n=== backend={backend.name} model={backend.model} ===")
+            trials, walls = sweep(
+                backend,
+                fixtures,
+                levels,
+                stream=not args.no_stream,
+                timeout_s=args.timeout_s,
+            )
+            all_trials.extend(trials)
+            all_walls.update(walls)
 
-    report = summarize_trials(all_trials, cell_wall_s=all_walls)
-    print()
-    print(report.as_markdown())
+        report = summarize_trials(all_trials, cell_wall_s=all_walls)
+        print()
+        print(report.as_markdown())
 
-    if args.json_path:
-        path = Path(args.json_path)
-        payload = {
-            "cell_wall_s": {
-                f"{b}|c={c}": w for (b, c), w in sorted(all_walls.items())
-            },
-            "trials": [
-                {
-                    "concurrency": t.concurrency,
-                    "fixture": t.fixture,
-                    "backend": t.backend,
-                    "ttft_s": t.ttft_s,
-                    "complete_s": t.complete_s,
-                    "parse_ok": t.parse_ok,
-                    "errored": t.errored,
-                    "prompt_chars": t.prompt_chars,
-                    "response_chars": t.response_chars,
-                    "completion_tokens": t.completion_tokens,
-                }
-                for t in all_trials
-            ],
-        }
-        path.write_text(json.dumps(payload, indent=2) + "\n", encoding="utf-8")
-        print(f"Wrote {path}")
+        if args.json_path:
+            path = Path(args.json_path)
+            payload = {
+                "cell_wall_s": {
+                    f"{b}|c={c}": w for (b, c), w in sorted(all_walls.items())
+                },
+                "trials": [
+                    {
+                        "concurrency": t.concurrency,
+                        "fixture": t.fixture,
+                        "backend": t.backend,
+                        "ttft_s": t.ttft_s,
+                        "complete_s": t.complete_s,
+                        "parse_ok": t.parse_ok,
+                        "errored": t.errored,
+                        "prompt_chars": t.prompt_chars,
+                        "response_chars": t.response_chars,
+                        "completion_tokens": t.completion_tokens,
+                    }
+                    for t in all_trials
+                ],
+            }
+            path.write_text(json.dumps(payload, indent=2) + "\n", encoding="utf-8")
+            print(f"Wrote {path}")
+    finally:
+        flush()
 
     return 0
 
