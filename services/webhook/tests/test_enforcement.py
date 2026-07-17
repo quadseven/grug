@@ -157,6 +157,23 @@ def test_remove_deletes_all_matching_rulesets_during_cutover():
     mock_set.assert_called_once_with(1, 2, None)
 
 
+def test_remove_fallback_ignores_unrelated_prefixed_user_ruleset():
+    """A user ruleset that merely SHARES the 'Grug - ' prefix but is not one
+    of grug's own enforcement names must NOT be deleted by the fallback."""
+    rulesets = [
+        {"id": 88, "name": "Grug - my custom branch rules"},
+        {"id": 99, "name": "Grug - Chief Enforcement"},
+    ]
+    with patch("adapters.install_store.get_enforcement_id", return_value=None), \
+         patch("enforcement.list_rulesets", return_value=rulesets), \
+         patch("enforcement.delete_ruleset") as mock_del, \
+         patch("adapters.install_store.set_enforcement_id"):
+        remove_enforcement("tok", "o", "r", 1, 2)
+
+    # Only the real enforcement ruleset (99); the user's 88 is left alone.
+    mock_del.assert_called_once_with("tok", "o", "r", 99)
+
+
 def test_remove_noop_when_nothing_exists():
     """No stored ID, no Grug-prefixed rulesets → nothing to do."""
     with patch("adapters.install_store.get_enforcement_id", return_value=None), \

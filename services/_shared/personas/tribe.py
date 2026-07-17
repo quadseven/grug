@@ -69,6 +69,17 @@ LEGACY_RULESET_CHIEF = "Grug - TPM Enforcement"
 LEGACY_RULESET_CHIEF_EM = f"Grug {_EM} TPM Enforcement"
 LEGACY_RULESET_CHIEF_EM_SHORT = f"Grug {_EM} Chief Enforcement"
 
+# Every exact name grug's own Chief enforcement ruleset has ever carried
+# (canonical + the TPM/em-dash legacies). Matching these EXACT names - not a
+# broad "Grug - " prefix - is what keeps the no-stored-id delete fallback from
+# removing an unrelated user ruleset that merely shares the prefix.
+_ENFORCEMENT_RULESET_NAMES: frozenset[str] = frozenset({
+    RULESET_CHIEF,
+    LEGACY_RULESET_CHIEF,
+    LEGACY_RULESET_CHIEF_EM,
+    LEGACY_RULESET_CHIEF_EM_SHORT,
+})
+
 # --- Capability names (not full personas; product voice) --------------------
 
 # Chief's gate on PR body shape (was industry jargon "Definition of Ready").
@@ -89,6 +100,16 @@ SWIFT_HUNT = "Swift Hunt"
 STEADY_HUNT = "Steady Hunt"
 FULL_HUNT = "Full Hunt"
 LIVING_HUNT = "Living Hunt"
+
+
+def is_enforcement_ruleset_name(name: str) -> bool:
+    """True if `name` is one of grug's own Chief enforcement ruleset names.
+
+    Exact-match against the known set (canonical + legacies), NOT a prefix
+    test: a user ruleset named e.g. "Grug - my rules" shares the ownership
+    prefix but is not grug's enforcement and must never be deleted by the
+    no-stored-id fallback."""
+    return name in _ENFORCEMENT_RULESET_NAMES
 
 
 def check_aliases(check_name: str) -> tuple[str, ...]:

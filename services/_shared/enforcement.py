@@ -8,11 +8,9 @@ with with_install_token_retry.
 from __future__ import annotations
 
 import logging
-from typing import Any
 
 from github_rulesets_client import (
     EnforcementState,
-    GRUG_RULESET_PREFIXES,
     create_ruleset,
     delete_ruleset,
     detect_enforcement,
@@ -23,6 +21,7 @@ from personas.tribe import (
     CHECK_CHIEF,
     LEGACY_RULESET_CHIEF,
     RULESET_CHIEF,
+    is_enforcement_ruleset_name,
 )
 
 log = logging.getLogger("grug.enforcement")
@@ -142,10 +141,12 @@ def remove_enforcement(
     ruleset_id = get_enforcement_id(install_id, repo_id)
 
     # Collect every ruleset to delete. With a stored ID we trust it; without,
-    # we fall back to name-prefix matching - and must delete ALL matches, not
-    # just the first: during the nomenclature cutover a canonical "Grug - "
-    # and a legacy "Grug — " ruleset can coexist, and deleting only one
-    # would leave the other active + orphaned after the store is cleared.
+    # we fall back to matching the EXACT names grug's own Chief enforcement
+    # ruleset has used (canonical + legacies) - NOT a broad "Grug - " prefix,
+    # which would also delete an unrelated user ruleset that merely shares the
+    # prefix. Delete ALL exact matches, not just the first: during the
+    # nomenclature cutover a canonical and a legacy enforcement ruleset can
+    # coexist, and deleting only one would leave the other active + orphaned.
     to_delete: list = []
     if ruleset_id is not None:
         to_delete = [ruleset_id]
@@ -154,7 +155,7 @@ def remove_enforcement(
         to_delete = [
             rs["id"]
             for rs in rulesets
-            if any(rs.get("name", "").startswith(p) for p in GRUG_RULESET_PREFIXES)
+            if is_enforcement_ruleset_name(rs.get("name", ""))
         ]
 
     if not to_delete:
