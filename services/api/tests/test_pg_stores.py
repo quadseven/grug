@@ -1005,3 +1005,29 @@ def test_ledger_exemplars_cache_and_corpus_scan_exclusion(pg):
     assert exemplars == [{"class": "correctness", "severity": "HIGH",
                           "finding": "real row", "pr": 1}]
     assert store.get_repo_exemplars("o/none") == []
+
+
+def test_learning_timestamps_normalized_to_utc(pg):
+    """Caller-supplied stamps in other offsets normalize to UTC ISO, so the
+    text ORDER BY stays chronological across mixed inputs."""
+    from adapters import pg_install_store as store
+
+    # +05:00 offset: 2026-01-01T10:00+05:00 == 2026-01-01T05:00Z, which is
+    # EARLIER than 2026-01-01T06:00Z despite sorting later as raw text.
+    store.put_learning(repo="o/tz", text="rule A",
+                       created_at="2026-01-01T10:00:00+05:00")
+    store.put_learning(repo="o/tz", text="rule B",
+                       created_at="2026-01-01T06:00:00+00:00")
+    rows = store.list_learnings("o/tz")
+    assert [r["text"] for r in rows] == ["rule A", "rule B"]  # true time order
+    assert rows[0]["created_at"].endswith("+00:00")  # normalized to UTC
+
+
+def test_get_learning_by_source_comment(pg):
+    from adapters import pg_install_store as store
+
+    store.put_learning(repo="o/r2", text="taught rule", source_comment_id=777)
+    hit = store.get_learning_by_source_comment("o/r2", 777)
+    assert hit is not None and hit["text"] == "taught rule"
+    assert store.get_learning_by_source_comment("o/r2", 999) is None
+    assert store.get_learning_by_source_comment("o/r2", 0) is None

@@ -794,6 +794,20 @@ def _learning_sk(digest: str) -> str:
     return f"LEARNING#{digest}"
 
 
+def _normalize_utc_iso(stamp: str) -> str:
+    """Coerce a timestamp string to UTC ISO-8601 (+00:00), or now() when
+    empty/unparseable. Uniform format keeps text ordering == time ordering."""
+    if stamp:
+        try:
+            parsed = datetime.fromisoformat(stamp)
+            if parsed.tzinfo is None:
+                parsed = parsed.replace(tzinfo=timezone.utc)
+            return parsed.astimezone(timezone.utc).isoformat()
+        except ValueError:
+            pass
+    return datetime.now(timezone.utc).isoformat()
+
+
 # Learnings decay if never reinforced: a taught rule that stays relevant gets
 # re-taught (or its finding keeps recurring and the maintainer re-confirms),
 # refreshing the TTL; a now-wrong rule ages out on its own. This bounds the
@@ -821,7 +835,12 @@ def put_learning(
     rule = text.strip()
     if not (repo and rule):
         return
-    now = created_at or datetime.now(timezone.utc).isoformat()
+    # Normalize the timestamp to a uniform UTC ISO format: listing orders by
+    # this value AS TEXT, and lexicographic == chronological only when every
+    # stored stamp shares one format/offset. A caller-supplied stamp in
+    # another offset or precision would misorder the newest-first prompt
+    # window (Qodo correctness).
+    now = _normalize_utc_iso(created_at)
     ttl = int(datetime.now(timezone.utc).timestamp() + _LEARNING_TTL_DAYS * 86400)
     with get_pool().connection() as conn:
         conn.execute(
@@ -877,6 +896,21 @@ def list_learnings(repo: str, limit: int | None = None) -> list[Learning]:
         ).fetchall()
     out = [cast("Learning", decode_item(pk, sk, data)) for pk, sk, data in rows]
     return out if limit is None else out[:limit]
+
+
+def get_learning_by_source_comment(
+    repo: str, source_comment_id: int,
+) -> Optional[Learning]:
+    """The learning taught by a specific reply comment, or None. Lets an SQS
+    redelivery detect that this reply was already classified-and-stored, so
+    it skips the non-deterministic classifier instead of re-running it and
+    possibly storing a second, differently-worded rule (Qodo reliability)."""
+    if not source_comment_id:
+        return None
+    for row in list_learnings(repo):
+        if int(row.get("source_comment_id") or 0) == int(source_comment_id):
+            return row
+    return None
 
 
 def get_comment_record(

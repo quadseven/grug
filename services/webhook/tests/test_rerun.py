@@ -1271,6 +1271,10 @@ def test_run_learn_durable_stores_and_acks(monkeypatch):
     put_calls = []
     posted = []
     monkeypatch.setattr(
+        "adapters.install_store.get_learning_by_source_comment",
+        lambda repo, cid: None,
+    )
+    monkeypatch.setattr(
         "adapters.install_store.get_comment_record",
         lambda iid, cid: {
             "finding_text": "consider nested try/except",
@@ -1305,6 +1309,10 @@ def test_run_learn_one_off_declines_without_storing(monkeypatch):
     put_calls = []
     posted = []
     monkeypatch.setattr(
+        "adapters.install_store.get_learning_by_source_comment",
+        lambda repo, cid: None,
+    )
+    monkeypatch.setattr(
         "adapters.install_store.get_comment_record",
         lambda iid, cid: {"finding_text": "x", "finding_tags": {"rule_name": "r"}},
     )
@@ -1326,6 +1334,10 @@ def test_run_learn_one_off_declines_without_storing(monkeypatch):
 def test_run_learn_classifier_none_raises_for_redrive(monkeypatch):
     posted = []
     monkeypatch.setattr(
+        "adapters.install_store.get_learning_by_source_comment",
+        lambda repo, cid: None,
+    )
+    monkeypatch.setattr(
         "adapters.install_store.get_comment_record",
         lambda iid, cid: {"finding_text": "x", "finding_tags": {"rule_name": "r"}},
     )
@@ -1345,6 +1357,10 @@ def test_run_learn_classifier_none_raises_for_redrive(monkeypatch):
 def test_run_learn_redelivery_is_win_once(monkeypatch):
     posted = []
     monkeypatch.setattr(
+        "adapters.install_store.get_learning_by_source_comment",
+        lambda repo, cid: None,
+    )
+    monkeypatch.setattr(
         "adapters.install_store.get_comment_record",
         lambda iid, cid: {"finding_text": "x", "finding_tags": {"rule_name": "r"}},
     )
@@ -1361,6 +1377,7 @@ def test_run_learn_redelivery_is_win_once(monkeypatch):
 
 def test_run_learn_no_parent_record_is_silent(monkeypatch):
     posted = []
+    monkeypatch.setattr("adapters.install_store.get_learning_by_source_comment", lambda repo, cid: None)
     monkeypatch.setattr("adapters.install_store.get_comment_record", lambda iid, cid: None)
     monkeypatch.setattr(rerun, "_gh_post", lambda token, url, body: posted.append(body))
 
@@ -1413,6 +1430,10 @@ def test_enqueue_learn_dedup_id_is_bounded(monkeypatch):
 def test_run_learn_ack_failure_keeps_learning_and_does_not_raise(monkeypatch):
     put_calls = []
     monkeypatch.setattr(
+        "adapters.install_store.get_learning_by_source_comment",
+        lambda repo, cid: None,
+    )
+    monkeypatch.setattr(
         "adapters.install_store.get_comment_record",
         lambda iid, cid: {"finding_text": "x", "finding_tags": {"rule_name": "r"}},
     )
@@ -1430,3 +1451,38 @@ def test_run_learn_ack_failure_keeps_learning_and_does_not_raise(monkeypatch):
     result = rerun._run_learn(11, "o/r", 7, 5001, 4000, "x", "dev")
     assert result == "learned"
     assert put_calls  # the learning WAS stored despite the ack failure
+
+
+def test_run_learn_redelivery_skips_classifier_and_reuses_stored_rule(monkeypatch):
+    """A redelivery whose reply already produced a stored learning must NOT
+    re-run the non-deterministic classifier (a re-run could store a second,
+    differently-worded row); the claim still gates the ack win-once."""
+    posted = []
+    monkeypatch.setattr(
+        "adapters.install_store.get_comment_record",
+        lambda iid, cid: {"finding_text": "x", "finding_tags": {"rule_name": "r"}},
+    )
+    monkeypatch.setattr(
+        "adapters.install_store.get_learning_by_source_comment",
+        lambda repo, cid: {"text": "stored rule", "scope_path": "", "source_comment_id": cid},
+    )
+    monkeypatch.setattr(
+        "llm_client.classify_learning",
+        lambda *a, **k: (_ for _ in ()).throw(AssertionError("classifier must not run")),
+    )
+    monkeypatch.setattr(
+        "adapters.install_store.put_learning",
+        lambda **kw: None,  # idempotent re-store is harmless if reached
+    )
+    # Ack already claimed on the first delivery -> no duplicate ack.
+    monkeypatch.setattr("adapters.install_store.claim_delivery", lambda k: False)
+    monkeypatch.setattr(rerun, "_gh_post", lambda token, url, body: posted.append(body))
+
+    assert rerun._run_learn(11, "o/r", 7, 5001, 4000, "x", "dev") == "learn_duplicate"
+    assert posted == []
+
+
+def test_defuse_md_breaks_mentions():
+    out = rerun._defuse_md("thanks @org/team and @user")
+    assert "@org" not in out  # zwsp inserted after @ breaks the mention
+    assert "@​org/team" in out and "@​user" in out

@@ -651,6 +651,10 @@ def _defuse_md(s: str) -> str:
         s.replace("<", "&lt;").replace(">", "&gt;")
         .replace("`", "'").replace("|", "\\|")
         .replace("\r", " ").replace("\n", " ")
+        # A zero-width space after @ breaks GitHub's mention parsing, so a
+        # model-restated "@org/team" cannot ping people from grug's ack
+        # (renders identically to the reader).
+        .replace("@", "@\u200b")
     )[:600]
 
 
@@ -691,7 +695,8 @@ def _run_learn(
     finding thread never gets duplicate acknowledgments."""
     from urllib.parse import quote as _q
     from adapters.install_store import (  # type: ignore
-        claim_delivery, get_comment_record, put_learning,
+        claim_delivery, get_comment_record, get_learning_by_source_comment,
+        put_learning,
     )
     from llm_client import classify_learning  # type: ignore
     from observability import emit_gauge  # type: ignore
@@ -705,15 +710,28 @@ def _run_learn(
             "repo": repo_full, "pr": pr_number, "parent": parent_comment_id})
         return "learn_no_parent"
 
-    finding_text = str(record.get("finding_text", ""))
-    finding_tags = dict(record.get("finding_tags", {}))
-    classification = classify_learning(
-        reply_text, finding_text, finding_tags, install_id,
-        pr_context={
-            "installation_id": install_id, "repo": repo_full,
-            "pr_number": pr_number,
-        },
-    )
+    # Redelivery fast-path: if THIS reply already produced a stored learning,
+    # skip the non-deterministic classifier (a re-run could word the rule
+    # differently and store a second row) and reuse the stored rule; the
+    # win-once claim below still gates the ack. A transient failure BEFORE
+    # the store leaves no row, so the retry classifies cleanly.
+    already = get_learning_by_source_comment(repo_full, comment_id)
+    if already is not None:
+        classification: Any = {
+            "durable": True,
+            "learning": str(already.get("text", "")),
+            "scope_path": str(already.get("scope_path", "")),
+        }
+    else:
+        finding_text = str(record.get("finding_text", ""))
+        finding_tags = dict(record.get("finding_tags", {}))
+        classification = classify_learning(
+            reply_text, finding_text, finding_tags, install_id,
+            pr_context={
+                "installation_id": install_id, "repo": repo_full,
+                "pr_number": pr_number,
+            },
+        )
     if classification is None:
         # Transient: backend down or unparseable. Raise for redrive rather
         # than tell the maintainer their durable rule was judged one-off.
