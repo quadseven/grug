@@ -104,12 +104,7 @@ def run_one_stream(
     timeout_s: float = _DEFAULT_TIMEOUT_S,
 ) -> TrialResult:
     """One request with streaming TTFT when the server supports SSE."""
-    with trial_span(
-        backend,
-        fixture.messages,
-        concurrency=concurrency_label,
-        fixture_name=fixture.name,
-    ) as obs:
+    with trial_span(backend, fixture.messages) as obs:
         t0 = time.perf_counter()
         ttft: float | None = None
         chunks: list[str] = []
@@ -187,11 +182,30 @@ def run_one_stream(
                     "kind": type(e).__name__,
                 },
             )
-            # Stream-hostile or flaky transport: one non-stream retry.
-            # Note: nested trial_span will open a second span for the retry.
-            return run_one_blocking(
-                backend, fixture, concurrency_label=concurrency_label, timeout_s=timeout_s,
+            # Finish THIS span as the errored stream attempt; the blocking
+            # retry below runs outside it with its own span, so DD never
+            # sees an unfinished outer span or a nested double-count.
+            obs.finish(
+                TrialResult(
+                    concurrency=concurrency_label,
+                    fixture=fixture.name,
+                    backend=backend.name,
+                    ttft_s=ttft,
+                    complete_s=time.perf_counter() - t0,
+                    parse_ok=False,
+                    errored=True,
+                    prompt_chars=fixture.prompt_chars,
+                    response_chars=0,
+                    completion_tokens=None,
+                ),
+                output_preview=f"stream transport failed: {type(e).__name__}",
             )
+    # Only the stream-transport-failure path falls through the `with` (all
+    # other paths return inside it): one non-stream retry, outside the
+    # stream attempt's span.
+    return run_one_blocking(
+        backend, fixture, concurrency_label=concurrency_label, timeout_s=timeout_s,
+    )
 
 
 def _sse_to_content(raw: str) -> str:
@@ -228,12 +242,7 @@ def run_one_blocking(
     timeout_s: float = _DEFAULT_TIMEOUT_S,
 ) -> TrialResult:
     """Non-stream POST: complete wall-clock only (TTFT left None)."""
-    with trial_span(
-        backend,
-        fixture.messages,
-        concurrency=concurrency_label,
-        fixture_name=fixture.name,
-    ) as obs:
+    with trial_span(backend, fixture.messages) as obs:
         t0 = time.perf_counter()
         try:
             resp = httpx.post(

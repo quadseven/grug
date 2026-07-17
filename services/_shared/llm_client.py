@@ -73,7 +73,15 @@ try:  # pragma: no cover — import-time guard
         return _LLMObs.llm(**kwargs)
 
     def _llmobs_annotate(**kwargs: Any) -> None:
-        _LLMObs.annotate(**kwargs)
+        # Observability must stay strictly additive: an annotate failure
+        # (SDK validation drift, non-serializable value) must never discard
+        # an already-computed model result or fail a job.
+        try:
+            _LLMObs.annotate(**kwargs)
+        except Exception as e:  # noqa: BLE001 - o11y never outranks the result
+            log.warning(
+                "llmobs_annotate_failed", extra={"kind": type(e).__name__},
+            )
 
     def _llmobs_export(span: Any) -> Optional[dict]:
         return cast(Optional[dict], _LLMObs.export_span(span=span))
@@ -1210,6 +1218,52 @@ def _interactive_tags(
     return tags
 
 
+def _choices_content(body: Any) -> str:
+    """Assistant text from an OpenAI-compatible response body ('' if absent)."""
+    if not isinstance(body, dict):
+        return ""
+    choices = body.get("choices") or []
+    if choices and isinstance(choices[0], dict):
+        return (choices[0].get("message") or {}).get("content", "") or ""
+    return ""
+
+
+def _annotate_interactive(
+    span: Any,
+    *,
+    backend: Backend,
+    kind: str,
+    messages: list[dict[str, str]],
+    start_ns: int,
+    pr_tags: dict[str, str],
+    content: str = "",
+    body: Optional[dict] = None,
+    status_code: Optional[int] = None,
+    error: str = "",
+) -> None:
+    """One span annotation for an interactive (Teller / /grug ask) attempt.
+
+    `kind` taxonomy: transport_error (no response), http_error (non-2xx -
+    availability, NOT model output), parse_failed (2xx but unusable model
+    output), summarized/answered (success)."""
+    metadata: dict[str, Any] = {"backend": backend.value, "kind": kind}
+    if status_code is not None:
+        metadata["status_code"] = status_code
+    if error:
+        metadata["error"] = error
+    metrics: dict[str, Any] = {"latency_ms": _elapsed_ms(start_ns)}
+    if body is not None:
+        metrics.update(_extract_usage_metrics(body))
+    _llmobs_annotate(
+        span=span,
+        input_data=_redact_payload(messages),
+        output_data=_redact_payload(content) if content else None,
+        metadata=metadata,
+        metrics=metrics,
+        tags=pr_tags,
+    )
+
+
 def summarize_pr(
     diff_text: str,
     file_paths: list[str],
@@ -1258,90 +1312,58 @@ def summarize_pr(
             try:
                 resp = _call_backend(config, messages)
             except (_BackendConfigError, httpx.RequestError, httpx.TimeoutException) as e:
-                _llmobs_annotate(
-                    span=span,
-                    input_data=_redact_payload(messages),
-                    metadata={
-                        "backend": backend.value,
-                        "kind": "transport_error",
-                        "error": type(e).__name__,
-                    },
-                    metrics={"latency_ms": _elapsed_ms(start_ns)},
-                    tags=pr_tags,
+                _annotate_interactive(
+                    span, backend=backend, kind="transport_error",
+                    messages=messages, start_ns=start_ns, pr_tags=pr_tags,
+                    error=type(e).__name__,
                 )
                 continue
-            content = ""
-            body: dict = {}
+            if not 200 <= resp.status_code < 300:
+                # Availability, not model output: a 429/5xx storm must not
+                # read as parse failures in the DD kind facet.
+                _annotate_interactive(
+                    span, backend=backend, kind="http_error",
+                    messages=messages, start_ns=start_ns, pr_tags=pr_tags,
+                    status_code=resp.status_code,
+                )
+                continue
             try:
-                body = resp.json() if resp.status_code == 200 else {}
-                if isinstance(body, dict):
-                    choices = body.get("choices") or []
-                    if choices and isinstance(choices[0], dict):
-                        content = (choices[0].get("message") or {}).get("content", "") or ""
+                body = resp.json()
+            except ValueError:
+                body = {}
+            if not isinstance(body, dict):
+                body = {}
+            content = _choices_content(body)
+            summary = ""
+            file_summaries: dict[str, str] = {}
+            effort: str | None = None
+            try:
                 data = _json.loads(content) if content else {}
                 if not isinstance(data, dict):
                     raise ValueError("summary payload not a dict")
                 summary = str(data.get("summary", "")).strip()
-                if not summary:
-                    _llmobs_annotate(
-                        span=span,
-                        input_data=_redact_payload(messages),
-                        output_data=_redact_payload(content) if content else None,
-                        metadata={
-                            "backend": backend.value,
-                            "kind": "parse_failed",
-                            "status_code": resp.status_code,
-                        },
-                        metrics={
-                            "latency_ms": _elapsed_ms(start_ns),
-                            **_extract_usage_metrics(body),
-                        },
-                        tags=pr_tags,
-                    )
-                    continue
                 raw_files = data.get("file_summaries")
-                file_summaries = (
-                    {str(k): str(v) for k, v in raw_files.items()}
-                    if isinstance(raw_files, dict)
-                    else {}
-                )
+                if isinstance(raw_files, dict):
+                    file_summaries = {str(k): str(v) for k, v in raw_files.items()}
                 raw_effort = data.get("effort")
                 effort = raw_effort if isinstance(raw_effort, str) else None
-                _llmobs_annotate(
-                    span=span,
-                    input_data=_redact_payload(messages),
-                    output_data=_redact_payload(content),
-                    metadata={
-                        "backend": backend.value,
-                        "kind": "summarized",
-                        "status_code": resp.status_code,
-                    },
-                    metrics={
-                        "latency_ms": _elapsed_ms(start_ns),
-                        **_extract_usage_metrics(body),
-                    },
-                    tags=pr_tags,
-                )
-                return WalkthroughSummary(
-                    summary=summary, file_summaries=file_summaries, effort=effort,
-                )
             except (KeyError, ValueError, TypeError, AttributeError, json.JSONDecodeError):
-                _llmobs_annotate(
-                    span=span,
-                    input_data=_redact_payload(messages),
-                    output_data=_redact_payload(content) if content else None,
-                    metadata={
-                        "backend": backend.value,
-                        "kind": "parse_failed",
-                        "status_code": getattr(resp, "status_code", None),
-                    },
-                    metrics={
-                        "latency_ms": _elapsed_ms(start_ns),
-                        **_extract_usage_metrics(body),
-                    },
-                    tags=pr_tags,
+                summary = ""
+            if not summary:
+                _annotate_interactive(
+                    span, backend=backend, kind="parse_failed",
+                    messages=messages, start_ns=start_ns, pr_tags=pr_tags,
+                    content=content, body=body, status_code=resp.status_code,
                 )
                 continue
+            _annotate_interactive(
+                span, backend=backend, kind="summarized",
+                messages=messages, start_ns=start_ns, pr_tags=pr_tags,
+                content=content, body=body, status_code=resp.status_code,
+            )
+            return WalkthroughSummary(
+                summary=summary, file_summaries=file_summaries, effort=effort,
+            )
     return None
 
 
@@ -1382,76 +1404,52 @@ def answer_pr_question(
             try:
                 resp = _call_backend(config, messages)
             except (_BackendConfigError, httpx.RequestError, httpx.TimeoutException) as e:
-                _llmobs_annotate(
-                    span=span,
-                    input_data=_redact_payload(messages),
-                    metadata={
-                        "backend": backend.value,
-                        "kind": "transport_error",
-                        "error": type(e).__name__,
-                    },
-                    metrics={"latency_ms": _elapsed_ms(start_ns)},
-                    tags=pr_tags,
+                _annotate_interactive(
+                    span, backend=backend, kind="transport_error",
+                    messages=messages, start_ns=start_ns, pr_tags=pr_tags,
+                    error=type(e).__name__,
                 )
                 continue
-            content = ""
-            body: dict = {}
+            if not 200 <= resp.status_code < 300:
+                # Availability, not model output: a 429/5xx storm must not
+                # read as parse failures in the DD kind facet.
+                _annotate_interactive(
+                    span, backend=backend, kind="http_error",
+                    messages=messages, start_ns=start_ns, pr_tags=pr_tags,
+                    status_code=resp.status_code,
+                )
+                continue
             try:
-                body = resp.json() if resp.status_code == 200 else {}
-                if isinstance(body, dict):
-                    choices = body.get("choices") or []
-                    if choices and isinstance(choices[0], dict):
-                        content = (choices[0].get("message") or {}).get("content", "") or ""
-                answer = str(_json.loads(content).get("answer", "")).strip() if content else ""
-                if answer:
-                    _llmobs_annotate(
-                        span=span,
-                        input_data=_redact_payload(messages),
-                        output_data=_redact_payload(content),
-                        metadata={
-                            "backend": backend.value,
-                            "kind": "answered",
-                            "status_code": resp.status_code,
-                        },
-                        metrics={
-                            "latency_ms": _elapsed_ms(start_ns),
-                            **_extract_usage_metrics(body),
-                        },
-                        tags=pr_tags,
-                    )
-                    return answer
-                _llmobs_annotate(
-                    span=span,
-                    input_data=_redact_payload(messages),
-                    output_data=_redact_payload(content) if content else None,
-                    metadata={
-                        "backend": backend.value,
-                        "kind": "parse_failed",
-                        "status_code": resp.status_code,
-                    },
-                    metrics={
-                        "latency_ms": _elapsed_ms(start_ns),
-                        **_extract_usage_metrics(body),
-                    },
-                    tags=pr_tags,
-                )
-            except (KeyError, ValueError, TypeError, json.JSONDecodeError):
-                _llmobs_annotate(
-                    span=span,
-                    input_data=_redact_payload(messages),
-                    output_data=_redact_payload(content) if content else None,
-                    metadata={
-                        "backend": backend.value,
-                        "kind": "parse_failed",
-                        "status_code": getattr(resp, "status_code", None),
-                    },
-                    metrics={
-                        "latency_ms": _elapsed_ms(start_ns),
-                        **_extract_usage_metrics(body),
-                    },
-                    tags=pr_tags,
+                body = resp.json()
+            except ValueError:
+                body = {}
+            if not isinstance(body, dict):
+                body = {}
+            content = _choices_content(body)
+            answer = ""
+            try:
+                data = _json.loads(content) if content else {}
+                if not isinstance(data, dict):
+                    raise ValueError("ask payload not a dict")
+                raw_answer = data.get("answer", "")
+                # A non-string answer (dict/list) is a parse failure, never
+                # str()-coerced into a Python repr posted on the PR.
+                answer = raw_answer.strip() if isinstance(raw_answer, str) else ""
+            except (KeyError, ValueError, TypeError, AttributeError, json.JSONDecodeError):
+                answer = ""
+            if not answer:
+                _annotate_interactive(
+                    span, backend=backend, kind="parse_failed",
+                    messages=messages, start_ns=start_ns, pr_tags=pr_tags,
+                    content=content, body=body, status_code=resp.status_code,
                 )
                 continue
+            _annotate_interactive(
+                span, backend=backend, kind="answered",
+                messages=messages, start_ns=start_ns, pr_tags=pr_tags,
+                content=content, body=body, status_code=resp.status_code,
+            )
+            return answer
     return None
 
 
