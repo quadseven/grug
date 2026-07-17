@@ -18,6 +18,7 @@ from github_rulesets_client import (
     delete_ruleset,
     list_rulesets,
     get_ruleset,
+    update_ruleset,
     detect_enforcement,
     GRUG_RULESET_PREFIX,
 )
@@ -91,6 +92,58 @@ def test_create_ruleset_401_propagates(mock_transport_client):
     with patch("httpx.post", side_effect=lambda *a, **kw: client.post(*a, **kw)):
         with pytest.raises(httpx.HTTPStatusError) as exc:
             create_ruleset("stale", "o", "r", "Grug - DoR", ["ctx"])
+    assert exc.value.response.status_code == 401
+
+
+# ── update_ruleset ───────────────────────────────────────────────────
+
+def test_update_ruleset_url_and_auth():
+    with patch("httpx.put", return_value=_ok_response({"id": 555}, 200)) as mock_put:
+        out = update_ruleset("tok-3", "myorg", "myrepo", 555, ["Grug - Chief"])
+
+    mock_put.assert_called_once()
+    args, kwargs = mock_put.call_args
+    assert args[0] == "https://api.github.com/repos/myorg/myrepo/rulesets/555"
+    assert kwargs["headers"]["Authorization"] == "Bearer tok-3"
+    assert kwargs["headers"]["Accept"] == "application/vnd.github+json"
+    assert kwargs["headers"]["X-GitHub-Api-Version"] == "2022-11-28"
+    assert kwargs["timeout"] == 10
+    assert out == {"id": 555}
+
+
+def test_update_ruleset_body_shape():
+    with patch("httpx.put", return_value=_ok_response({"id": 1}, 200)) as mock_put:
+        update_ruleset("tok", "o", "r", 1, ["Grug - Chief"])
+
+    body = mock_put.call_args.kwargs["json"]
+    rules = body["rules"]
+    assert len(rules) == 1
+    assert rules[0]["type"] == "required_status_checks"
+    checks = rules[0]["parameters"]["required_status_checks"]
+    assert len(checks) == 1
+    assert checks[0]["context"] == "Grug - Chief"
+    assert "integration_id" not in checks[0]
+    # update body has no name/target/enforcement/conditions - only the rule change
+    assert "name" not in body
+    assert "conditions" not in body
+
+
+def test_update_ruleset_multiple_contexts():
+    with patch("httpx.put", return_value=_ok_response({"id": 2}, 200)) as mock_put:
+        update_ruleset("tok", "o", "r", 2, ["check-a", "check-b"])
+
+    body = mock_put.call_args.kwargs["json"]
+    checks = body["rules"][0]["parameters"]["required_status_checks"]
+    assert len(checks) == 2
+    assert checks[0]["context"] == "check-a"
+    assert checks[1]["context"] == "check-b"
+
+
+def test_update_ruleset_401_propagates(mock_transport_client):
+    client = mock_transport_client(status_codes=[401])
+    with patch("httpx.put", side_effect=lambda *a, **kw: client.put(*a, **kw)):
+        with pytest.raises(httpx.HTTPStatusError) as exc:
+            update_ruleset("stale", "o", "r", 1, ["ctx"])
     assert exc.value.response.status_code == 401
 
 

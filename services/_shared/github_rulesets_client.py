@@ -212,6 +212,53 @@ def create_ruleset(
     return resp.json()
 
 
+def update_ruleset(
+    install_token: str,
+    owner: str,
+    repo: str,
+    ruleset_id: int,
+    status_check_contexts: list[str],
+) -> dict:
+    """Replace an existing ruleset's required_status_checks contexts.
+
+    Used to heal a Grug-managed ruleset that still names a stale check
+    title (e.g. a pre-rename em-dash alias) after the canonical check
+    name changes — without this, an already-enrolled repo's required
+    check is silently pinned to a title Grug no longer posts as primary.
+    """
+    body = {
+        "rules": [
+            {
+                "type": "required_status_checks",
+                "parameters": {
+                    "strict_required_status_checks_policy": False,
+                    "required_status_checks": [
+                        {"context": ctx}
+                        for ctx in status_check_contexts
+                    ],
+                },
+            },
+        ],
+    }
+    resp = httpx.put(
+        f"{_GH_API}/repos/{quote(owner, safe='')}/{quote(repo, safe='')}/rulesets/{ruleset_id}",
+        json=body,
+        headers=_auth_headers(install_token),
+        timeout=10,
+    )
+    if resp.status_code >= 400:
+        log.warning(
+            "update_ruleset_rejected",
+            extra={
+                "owner": owner, "repo": repo, "ruleset_id": ruleset_id,
+                "status": resp.status_code,
+                "body": resp.text[:600],
+            },
+        )
+    resp.raise_for_status()
+    return resp.json()
+
+
 def delete_ruleset(
     install_token: str,
     owner: str,

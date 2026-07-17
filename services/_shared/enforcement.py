@@ -14,7 +14,9 @@ from github_rulesets_client import (
     create_ruleset,
     delete_ruleset,
     detect_enforcement,
+    get_ruleset,
     list_rulesets,
+    update_ruleset,
 )
 
 from personas.tribe import (
@@ -32,6 +34,40 @@ GRUG_TPM_RULESET_NAME = RULESET_CHIEF
 GRUG_DOR_CHECK_NAME = CHECK_CHIEF
 # Back-compat spellings for scripts / tests that imported the old literals.
 LEGACY_TPM_RULESET_NAME = LEGACY_RULESET_CHIEF
+
+
+def migrate_check_context(
+    install_token: str,
+    owner: str,
+    repo: str,
+    ruleset_id: int,
+) -> bool:
+    """Heal a Grug-managed ruleset whose required_status_checks context is
+    a stale legacy alias (e.g. a pre-rename em-dash title) instead of the
+    current canonical check name.
+
+    Every check-name rename (Chief/Hunt Plan cutover, and any future one)
+    ships a dual-post insurance mirror in github_checks_client so old
+    rulesets keep passing - but nothing previously updated the ruleset's
+    OWN required-check context to the new canonical name, so an
+    already-enrolled repo stayed pinned to the old title forever (and,
+    for the earliest em-dash titles, to a non-ASCII check name visible in
+    the GitHub UI). Returns True if the ruleset was updated, False if it
+    already names the canonical check.
+    """
+    ruleset = get_ruleset(install_token, owner, repo, ruleset_id)
+    for rule in ruleset.get("rules", []):
+        if rule.get("type") != "required_status_checks":
+            continue
+        contexts = [
+            c.get("context")
+            for c in rule.get("parameters", {}).get("required_status_checks", [])
+        ]
+        if not contexts or GRUG_DOR_CHECK_NAME in contexts:
+            return False
+        update_ruleset(install_token, owner, repo, ruleset_id, [GRUG_DOR_CHECK_NAME])
+        return True
+    return False
 
 
 def ensure_enforcement(
@@ -52,6 +88,30 @@ def ensure_enforcement(
         stored_ruleset_id=get_enforcement_id(install_id, repo_id),
     )
     if state != "none":
+        if state == "grug_managed":
+            ruleset_id = get_enforcement_id(install_id, repo_id)
+            if ruleset_id is not None:
+                try:
+                    if migrate_check_context(install_token, owner, repo, ruleset_id):
+                        log.info(
+                            "enforcement_check_context_healed",
+                            extra={
+                                "owner": owner, "repo": repo,
+                                "install_id": install_id, "repo_id": repo_id,
+                                "ruleset_id": ruleset_id,
+                            },
+                        )
+                except Exception as e:  # noqa: BLE001 - self-heal never blocks the existing-state return
+                    log.warning(
+                        "enforcement_check_context_heal_failed",
+                        extra={
+                            "owner": owner, "repo": repo,
+                            "install_id": install_id, "repo_id": repo_id,
+                            "ruleset_id": ruleset_id,
+                            "kind": type(e).__name__,
+                            "detail": str(e)[:200],
+                        },
+                    )
         log.info(
             "enforcement_already_present",
             extra={

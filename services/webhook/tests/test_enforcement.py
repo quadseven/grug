@@ -82,6 +82,7 @@ def test_ensure_passes_stored_id_to_detect():
     """
     with patch("enforcement.detect_enforcement", return_value="grug_managed") as mock_detect, \
          patch("adapters.install_store.get_enforcement_id", return_value=555), \
+         patch("enforcement.migrate_check_context", return_value=False), \
          patch("enforcement.create_ruleset") as mock_create:
         result = ensure_enforcement("tok", "o", "r", "main", 1, 2)
 
@@ -90,6 +91,104 @@ def test_ensure_passes_stored_id_to_detect():
         "tok", "o", "r", "main", GRUG_DOR_CHECK_NAME, stored_ruleset_id=555,
     )
     mock_create.assert_not_called()
+
+
+def test_ensure_heals_stale_check_context_when_grug_managed():
+    """grug_managed + a stored ruleset ID → self-heal a stale check
+    context (e.g. a pre-rename em-dash title) via migrate_check_context."""
+    with patch("enforcement.detect_enforcement", return_value="grug_managed"), \
+         patch("adapters.install_store.get_enforcement_id", return_value=555), \
+         patch("enforcement.migrate_check_context", return_value=True) as mock_migrate, \
+         patch("enforcement.create_ruleset") as mock_create:
+        result = ensure_enforcement("tok", "o", "r", "main", 1, 2)
+
+    assert result == "grug_managed"
+    mock_migrate.assert_called_once_with("tok", "o", "r", 555)
+    mock_create.assert_not_called()
+
+
+def test_ensure_skips_heal_when_no_stored_ruleset_id():
+    """grug_managed but no stored ID (name-heuristic match only) →
+    nothing to heal, migrate_check_context is not even attempted."""
+    with patch("enforcement.detect_enforcement", return_value="grug_managed"), \
+         patch("adapters.install_store.get_enforcement_id", return_value=None), \
+         patch("enforcement.migrate_check_context") as mock_migrate:
+        result = ensure_enforcement("tok", "o", "r", "main", 1, 2)
+
+    assert result == "grug_managed"
+    mock_migrate.assert_not_called()
+
+
+def test_ensure_heal_failure_is_best_effort_and_does_not_raise():
+    """A heal failure (network blip, 403, whatever) must never break the
+    existing-enforcement return - it's cutover insurance, not a gate."""
+    with patch("enforcement.detect_enforcement", return_value="grug_managed"), \
+         patch("adapters.install_store.get_enforcement_id", return_value=555), \
+         patch("enforcement.migrate_check_context", side_effect=RuntimeError("boom")):
+        result = ensure_enforcement("tok", "o", "r", "main", 1, 2)
+
+    assert result == "grug_managed"
+
+
+def test_ensure_external_state_never_attempts_heal():
+    """External enforcement isn't Grug's ruleset to touch - no heal call."""
+    with patch("enforcement.detect_enforcement", return_value="external"), \
+         patch("adapters.install_store.get_enforcement_id", return_value=555), \
+         patch("enforcement.migrate_check_context") as mock_migrate, \
+         patch("enforcement.create_ruleset"):
+        result = ensure_enforcement("tok", "o", "r", "main", 1, 2)
+
+    assert result == "external"
+    mock_migrate.assert_not_called()
+
+
+# ── migrate_check_context ───────────────────────────────────────────
+
+def test_migrate_check_context_updates_stale_legacy_context():
+    """A ruleset still requiring the pre-rename em-dash title gets PUT
+    with the canonical check name."""
+    from enforcement import migrate_check_context
+    stale_ruleset = {
+        "rules": [{
+            "type": "required_status_checks",
+            "parameters": {"required_status_checks": [{"context": "Grug — Definition of Ready"}]},
+        }],
+    }
+    with patch("enforcement.get_ruleset", return_value=stale_ruleset), \
+         patch("enforcement.update_ruleset") as mock_update:
+        changed = migrate_check_context("tok", "o", "r", 555)
+
+    assert changed is True
+    mock_update.assert_called_once_with("tok", "o", "r", 555, [GRUG_DOR_CHECK_NAME])
+
+
+def test_migrate_check_context_noop_when_already_canonical():
+    """Already-canonical context → no PUT, returns False."""
+    from enforcement import migrate_check_context
+    canonical_ruleset = {
+        "rules": [{
+            "type": "required_status_checks",
+            "parameters": {"required_status_checks": [{"context": GRUG_DOR_CHECK_NAME}]},
+        }],
+    }
+    with patch("enforcement.get_ruleset", return_value=canonical_ruleset), \
+         patch("enforcement.update_ruleset") as mock_update:
+        changed = migrate_check_context("tok", "o", "r", 555)
+
+    assert changed is False
+    mock_update.assert_not_called()
+
+
+def test_migrate_check_context_noop_when_no_required_status_checks_rule():
+    """A ruleset with no required_status_checks rule at all → nothing to heal."""
+    from enforcement import migrate_check_context
+    empty_ruleset = {"rules": [{"type": "creation"}]}
+    with patch("enforcement.get_ruleset", return_value=empty_ruleset), \
+         patch("enforcement.update_ruleset") as mock_update:
+        changed = migrate_check_context("tok", "o", "r", 555)
+
+    assert changed is False
+    mock_update.assert_not_called()
 
 
 # ── remove_enforcement ───────────────────────────────────────────────
