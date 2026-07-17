@@ -214,8 +214,8 @@ def test_owned_queue_queries_tag_exact_queue_names() -> None:
         assert " OR " not in q and " AND " not in q
 
 
-def test_backlog_queries_use_sustained_semantics_and_health_is_intermittent_proof() -> None:
-    """Backlog monitors require depth across the FULL window (min > 0);
+def test_backlog_queries_use_stalled_semantics_and_health_is_intermittent_proof() -> None:
+    """Backlog monitors require a stalled signal across the FULL window;
     DLQ monitors are any-message (max > 0). The health query is avg-of-avg
     per queue < 0.5 so an INTERMITTENT partial failure cannot hide behind
     one good sweep (codex peer review) and a single blip does not flap."""
@@ -224,6 +224,14 @@ def test_backlog_queries_use_sustained_semantics_and_health_is_intermittent_proo
     assert m.cave_jobs_backlog_query("prod").startswith("min(last_15m):")
     assert m.rerun_backlog_query("prod").startswith("min(last_15m):")
     assert m.cave_results_backlog_query("prod").startswith("min(last_15m):")
+    assert all(
+        "grug.sqs.stalled" in query
+        for query in (
+            m.cave_jobs_backlog_query("prod"),
+            m.rerun_backlog_query("prod"),
+            m.cave_results_backlog_query("prod"),
+        )
+    )
     assert m.rerun_dlq_depth_query("prod").startswith("max(last_15m):")
     assert m.cave_jobs_dlq_depth_query("prod").startswith("max(last_15m):")
     assert m.cave_results_dlq_depth_query("prod").startswith("max(last_15m):")

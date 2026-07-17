@@ -879,8 +879,10 @@ def test_telemetry_interval_clamped_and_never_raises(monkeypatch):
     assert consumer._telemetry_interval_s() == 45.0
 
 
-def test_emit_queue_depth_emits_both_gauges_per_queue(telemetry_env, captured_gauges):
-    """Every telemetry queue gets messages_visible + messages_not_visible
+def test_emit_queue_depth_emits_depth_and_stall_gauges_per_queue(
+    telemetry_env, captured_gauges,
+):
+    """Every telemetry queue gets depth, in-flight, and stalled gauges
     gauges tagged with its exact name, requesting exactly the two
     attributes (real SQS returns only what is requested - a dropped
     AttributeName would silently emit fake zeros forever)."""
@@ -907,6 +909,25 @@ def test_emit_queue_depth_emits_both_gauges_per_queue(telemetry_env, captured_ga
                if m == "grug.sqs.messages_visible")
     assert all(v == 1.0 for m, v, t in captured_gauges
                if m == "grug.sqs.messages_not_visible")
+    stalled = [v for m, v, t in captured_gauges if m == "grug.sqs.stalled"]
+    assert stalled == [0.0] * len(consumer._TELEMETRY_QUEUE_NAMES)
+
+
+def test_emit_queue_depth_marks_waiting_queue_stalled_without_inflight_work(
+    telemetry_env, captured_gauges,
+):
+    with patch.object(
+        consumer._sqs_telemetry,
+        "get_queue_attributes",
+        return_value={"Attributes": {
+            "ApproximateNumberOfMessages": "2",
+            "ApproximateNumberOfMessagesNotVisible": "0",
+        }},
+    ):
+        consumer._emit_queue_depth_once()
+
+    stalled = [v for m, v, t in captured_gauges if m == "grug.sqs.stalled"]
+    assert stalled == [1.0] * len(consumer._TELEMETRY_QUEUE_NAMES)
 
 
 def test_emit_queue_depth_emits_per_queue_ok_boolean(telemetry_env, captured_gauges):
