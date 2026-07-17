@@ -814,10 +814,10 @@ def put_learning(
 ) -> None:
     """Upsert one durable learning under LEARN#<repo>. Keyed by the rule
     text's content digest. A re-teach of the same text REFRESHES the mutable
-    metadata (scope, source, author) and the TTL, but PRESERVES the original
-    created_at and usage counters - so the newest teaching's scope wins (the
-    ack the maintainer sees matches the stored/applied state) while first-taught
-    provenance and use history survive."""
+    metadata (scope, source, author), the TTL, and `reinforced_at`, but
+    PRESERVES the original created_at and usage counters. Listing orders by
+    reinforced_at, so a re-taught old rule moves back into the prompt window
+    (matching the 'remembered' ack) while first-taught provenance survives."""
     rule = text.strip()
     if not (repo and rule):
         return
@@ -829,9 +829,9 @@ def put_learning(
             INSERT INTO grug_kv (pk, sk, data, ttl)
             VALUES (%(pk)s, %(sk)s, %(data)s, %(ttl)s)
             ON CONFLICT (pk, sk) DO UPDATE
-                -- take the NEW row's fields, but keep the ORIGINAL created_at
-                -- and usage counters from the existing row. Refreshes the TTL
-                -- (use-it-or-lose-it) and lets a narrowed scope win.
+                -- take the NEW row's fields (incl. a fresh reinforced_at), but
+                -- keep the ORIGINAL created_at + usage counters. Refreshes the
+                -- TTL (use-it-or-lose-it) and lets a narrowed scope win.
                 SET ttl = %(ttl)s,
                     data = EXCLUDED.data || jsonb_build_object(
                         'created_at', grug_kv.data->'created_at',
@@ -851,6 +851,7 @@ def put_learning(
                     "source_comment_id": int(source_comment_id),
                     "author": author,
                     "created_at": now,
+                    "reinforced_at": now,
                     "usage_count": 0,
                     "last_used_at": "",
                 }),
@@ -866,7 +867,11 @@ def list_learnings(repo: str, limit: int | None = None) -> list[Learning]:
             f"""
             SELECT pk, sk, data FROM grug_kv
             WHERE pk = %s AND sk LIKE 'LEARNING#%%' AND {TTL_LIVE}
-            ORDER BY (data->>'created_at') ASC, sk COLLATE "C" ASC
+            -- order by REINFORCED time (a re-teach bumps it), so a just-
+            -- reinforced old rule moves into the newest-first prompt window;
+            -- fall back to created_at for pre-reinforced_at rows.
+            ORDER BY COALESCE(data->>'reinforced_at', data->>'created_at') ASC,
+                     sk COLLATE "C" ASC
             """,
             (_learning_pk(repo),),
         ).fetchall()

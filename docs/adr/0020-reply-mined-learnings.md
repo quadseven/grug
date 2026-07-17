@@ -40,8 +40,8 @@ and org-wide scope to later slices.
 ### What slice 1 does
 
 1. Receive the reply. Add a `pull_request_review_comment` case to the webhook
-   dispatcher. A new handler gates on trust (the reply author is the PR author
-   or a write-or-above collaborator, the same gate the reaction loop uses),
+   dispatcher. A new handler gates on trust (the reply author must have
+   write-or-above access, unconditionally, including the PR author),
    joins the reply back to grug's finding through `comment.in_reply_to_id`, and
    enqueues a job. It never runs the language model inline, so the webhook still
    acknowledges within GitHub's timeout.

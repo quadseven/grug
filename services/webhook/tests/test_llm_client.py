@@ -2496,3 +2496,21 @@ def test_render_learnings_block_sanitizes_scope() -> None:
     block = lc._render_learnings_block(rows)
     assert "\n\ninjected" not in block  # newlines flattened out of the scope
     assert "some rule" in block
+
+
+def test_classify_learning_string_durable_is_rejected() -> None:
+    # bool("false") is True; a string "false" must NOT persist as durable.
+    payload = json.dumps({"durable": "false", "learning": "x", "scope_path": ""})
+    response = httpx.Response(200, json=_openai_json_response(payload))
+    with patch.object(httpx, "post", return_value=response):
+        out = lc.classify_learning("q", "f", {"rule_name": "r"}, installation_id=2)
+    # non-boolean durable -> parse failure on both backends -> None (redrive)
+    assert out is None
+
+
+def test_render_learnings_block_redacts_secret_before_truncation() -> None:
+    # A secret-shaped value must be masked even when it sits near the byte cut.
+    fake = "AKIA" + "".join(["ABCDEFGHIJKLMNOP"[i % 16] for i in range(16)])
+    rows = [{"text": f"allow key {fake} in fixtures", "scope_path": ""}]
+    block = lc._render_learnings_block(rows)
+    assert fake not in block  # redacted before it reached the block

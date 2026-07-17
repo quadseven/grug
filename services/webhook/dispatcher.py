@@ -639,10 +639,11 @@ def _handle_review_comment_reply(payload: dict[str, Any]) -> dict[str, str]:
     """A maintainer replied to an inline review-comment thread. If the reply
     answers one of grug's OWN findings, enqueue a learnings-classification job
     (#670, ADR-0020). The LLM classifier runs in the consumer, never inline,
-    so the webhook stays within GitHub's delivery timeout. Same trust gate as
-    /grug commands: only the PR author or a write-or-above collaborator can
-    teach, so a random commenter on a public-listed app cannot poison the
-    corpus."""
+    so the webhook stays within GitHub's delivery timeout. Trust gate: the
+    reply author must have write-or-above access - unconditionally, including
+    the PR author, since a fork contributor is the author of their own fork PR
+    yet has no write access and a learning poisons the corpus for every future
+    review."""
     if payload.get("action", "") != "created":
         return {"status": "no_op", "reason": "review_comment action not created"}
 
@@ -734,8 +735,10 @@ def _handle_review_comment_reply(payload: dict[str, Any]) -> dict[str, str]:
             reply_text=body,
             author=sender_login,
         )
-    except RuntimeError as e:
-        # Queue not configured (local/dev) - best-effort, never a webhook 500.
+    except Exception as e:  # noqa: BLE001 - queue-not-configured (RuntimeError)
+        # OR any botocore/SQS send failure. Enqueue is best-effort: a queue
+        # outage returns skip, never a webhook 500 (which GitHub would redeliver
+        # as duplicate work). CodeRabbit stability fix.
         log.warning("learn_enqueue_failed", extra={"kind": type(e).__name__})
         return {"status": "skip", "reason": "enqueue_failed"}
 

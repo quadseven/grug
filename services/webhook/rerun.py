@@ -555,7 +555,11 @@ def enqueue_learn(
             "reply_text": reply_text, "author": author,
         }),
         MessageGroupId=_learn_group_id(install_id, repo, pr_number),
-        MessageDeduplicationId=f"{install_id}:{repo}:{pr_number}:learn:{comment_id}",
+        # Hash the dedup id: a long owner/repo can push the plain string past
+        # SQS's 128-char limit and fail send_message (same fix as the group id).
+        MessageDeduplicationId="learn:" + hashlib.sha256(
+            f"{install_id}\x1f{repo}\x1f{pr_number}\x1f{comment_id}".encode("utf-8")
+        ).hexdigest(),
     )
     log.info("learn_enqueued", extra={"install_id": install_id, "repo": repo,
                                       "pr": pr_number, "comment_id": comment_id})
@@ -713,17 +717,14 @@ def _run_learn(
     if classification is None:
         # Transient: backend down or unparseable. Raise for redrive rather
         # than tell the maintainer their durable rule was judged one-off.
-        # No ack + no claim, so the retry re-classifies cleanly (or DLQs).
+        # No store, no claim, no ack, so the retry re-classifies cleanly.
         raise RuntimeError("learn classifier unavailable")
 
-    # Win-once per reply comment: a redelivery (or a duplicate GitHub delivery)
-    # must not re-classify and re-ack. A genuine RE-TEACH is a NEW reply comment
-    # (distinct comment_id -> distinct claim), so it correctly acks again.
-    if not claim_delivery(f"learn:{comment_id}"):
-        log.info("learn_already_processed", extra={
-            "repo": repo_full, "pr": pr_number, "comment_id": comment_id})
-        return "learn_duplicate"
-
+    # STORE FIRST, before the win-once claim. put_learning is idempotent (keyed
+    # on the rule digest), so a redelivery re-storing is a harmless no-op - but
+    # storing before the claim means a later put/ack failure can never lose the
+    # learning (the claim, made only for the ACK, would otherwise short-circuit
+    # the retry and drop the rule entirely). CodeRabbit data-integrity fix.
     if classification["durable"]:
         put_learning(
             repo=repo_full,
@@ -742,6 +743,14 @@ def _run_learn(
         ack = _LEARN_DECLINE_BODY
         result = "learn_one_off"
 
+    # The claim guards ONLY the ack (the one non-idempotent side effect): a
+    # redelivery whose learning is already stored must not re-post the reply.
+    # A genuine RE-TEACH is a NEW reply comment (distinct claim), so it acks.
+    if not claim_delivery(f"learn:{comment_id}"):
+        log.info("learn_already_acked", extra={
+            "repo": repo_full, "pr": pr_number, "comment_id": comment_id})
+        return "learn_duplicate"
+
     def _reply(token: str) -> None:
         _gh_post(
             token,
@@ -749,7 +758,15 @@ def _run_learn(
             f"/pulls/{pr_number}/comments/{parent_comment_id}/replies",
             {"body": ack},
         )
-    with_install_token_retry(install_id, _reply)
+    # Best-effort: the learning is already durably stored, so a transient reply
+    # failure must NOT redrive (which would re-classify + risk a wrong verdict)
+    # nor raise - it just costs the courtesy ack, which a re-teach would repost.
+    try:
+        with_install_token_retry(install_id, _reply)
+    except Exception as e:  # noqa: BLE001
+        log.warning("learn_ack_post_failed", extra={
+            "repo": repo_full, "pr": pr_number, "comment_id": comment_id,
+            "kind": type(e).__name__})
     try:
         emit_gauge("grug.learnings.classified", 1)
     except Exception:  # noqa: BLE001

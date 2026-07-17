@@ -1395,3 +1395,38 @@ def test_learn_ack_defuses_model_markdown():
     assert "&lt;/details&gt;" in body       # injected HTML escaped
     assert "`code`" not in body             # backticks neutralized
     assert "&lt;/b&gt;" in body             # scope HTML escaped too
+
+
+def test_enqueue_learn_dedup_id_is_bounded(monkeypatch):
+    # A long owner/repo must not push the FIFO dedup id past SQS's 128 limit.
+    sent = {}
+    monkeypatch.setattr(rerun, "_RERUN_QUEUE_URL", "https://sqs.example/q.fifo")
+    monkeypatch.setattr(rerun._sqs, "send_message", lambda **kw: sent.update(kw))
+    rerun.enqueue_learn(
+        install_id=11, repo="a" * 90 + "/" + "b" * 90, pr_number=7,
+        comment_id=5001, parent_comment_id=4000, reply_text="x", author="dev",
+    )
+    assert len(sent["MessageDeduplicationId"]) <= 128
+    assert len(sent["MessageGroupId"]) <= 128
+
+
+def test_run_learn_ack_failure_keeps_learning_and_does_not_raise(monkeypatch):
+    put_calls = []
+    monkeypatch.setattr(
+        "adapters.install_store.get_comment_record",
+        lambda iid, cid: {"finding_text": "x", "finding_tags": {"rule_name": "r"}},
+    )
+    monkeypatch.setattr("adapters.install_store.put_learning",
+                        lambda **kw: put_calls.append(kw))
+    monkeypatch.setattr("adapters.install_store.claim_delivery", lambda k: True)
+    monkeypatch.setattr("llm_client.classify_learning",
+                        lambda *a, **k: {"durable": True, "learning": "r", "scope_path": ""})
+    # The threaded reply POST fails transiently.
+    monkeypatch.setattr(rerun, "with_install_token_retry",
+                        lambda iid, fn: (_ for _ in ()).throw(httpx.ConnectError("down")))
+
+    # Learning is already stored, so a failed ack must NOT raise (which would
+    # redrive + risk a different verdict) - it degrades to no courtesy reply.
+    result = rerun._run_learn(11, "o/r", 7, 5001, 4000, "x", "dev")
+    assert result == "learned"
+    assert put_calls  # the learning WAS stored despite the ack failure

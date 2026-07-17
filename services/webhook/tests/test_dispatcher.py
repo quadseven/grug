@@ -647,3 +647,17 @@ def test_review_reply_write_collaborator_enqueues():
         out = dispatch("pull_request_review_comment", payload)
     assert out == {"status": "enqueued", "kind": "learn"}
     mock_enq.assert_called_once()
+
+
+def test_review_reply_enqueue_sqs_failure_is_skip_not_500():
+    # A botocore/SQS send failure must return skip, never bubble to a 500.
+    class _Boom(Exception):
+        pass
+    def _raise_enqueue(**kw):
+        raise _Boom("sqs unavailable")
+    with patch("dispatcher.is_install_allowlisted", return_value=True), \
+         patch("dispatcher.is_persona_enabled", return_value=True), \
+         patch("github_app_auth.with_install_token_retry", side_effect=lambda iid, fn: "write"), \
+         patch("rerun.enqueue_learn", side_effect=_raise_enqueue):
+        out = dispatch("pull_request_review_comment", _review_reply_payload())
+    assert out["status"] == "skip" and out["reason"] == "enqueue_failed"

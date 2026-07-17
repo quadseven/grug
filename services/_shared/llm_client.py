@@ -1553,7 +1553,14 @@ def classify_learning(
                 data = _json.loads(content) if content else {}
                 if not isinstance(data, dict):
                     raise ValueError("learn payload not a dict")
-                durable = bool(data.get("durable", False))
+                raw_durable = data.get("durable", False)
+                # Require an ACTUAL JSON boolean: bool("false") is True, so a
+                # string "false"/"no" from a sloppy backend must NOT persist a
+                # one-off as durable. A non-bool is a schema mismatch -> parse
+                # failure -> redrive (safer than guessing).
+                if not isinstance(raw_durable, bool):
+                    raise ValueError("durable is not a boolean")
+                durable = raw_durable
                 learning = data.get("learning", "")
                 learning = learning.strip() if isinstance(learning, str) else ""
                 scope = data.get("scope_path", "")
@@ -1596,8 +1603,9 @@ def _repo_learnings_block(pr_context: Optional[PrContext]) -> str:
         rows = list_learnings(str(pr_context["repo"]))
         if not rows:
             return ""
-        block = _render_learnings_block(cast("list[dict[str, Any]]", rows))
-        return _redact_secrets(block) if block else ""
+        # Redaction happens PER ROW inside the renderer (before truncation),
+        # so a secret cut at the byte boundary cannot leak a partial value.
+        return _render_learnings_block(cast("list[dict[str, Any]]", rows))
     except Exception as e:  # noqa: BLE001 - learnings never break a review, but log
         log.warning("repo_learnings_fetch_failed", extra={
             "repo": str(pr_context.get("repo", "")), "kind": type(e).__name__})
@@ -1624,13 +1632,15 @@ def _render_learnings_block(rows: list[dict[str, Any]], *, max_chars: int = 1400
         text = str(row.get("text", "")).strip()
         if not text:
             continue
-        # Sanitize BOTH the rule text and the scope glob: scope is
-        # classifier-produced from an untrusted reply, so newlines/control
-        # chars in it would break the bullet layout and widen the injection
-        # surface the same way unsanitized text would (Qodo security).
-        scope = _sanitize(str(row.get("scope_path", "")).strip())
+        # Redact secret-shaped values PER ROW, before sanitize + the byte
+        # truncation below, so a secret cannot leak a partial value at a cut
+        # boundary (CodeRabbit security). Sanitize BOTH text and the scope
+        # glob: scope is classifier-produced from an untrusted reply, so
+        # newlines/control chars there widen the injection surface too (Qodo).
+        text = _sanitize(_redact_secrets(text))
+        scope = _sanitize(_redact_secrets(str(row.get("scope_path", "")).strip()))
         prefix = f"({scope}) " if scope else ""
-        lines.append(f"- {prefix}{_sanitize(text)}")
+        lines.append(f"- {prefix}{text}")
     if not lines:
         return ""
     body = "\n".join(lines)
