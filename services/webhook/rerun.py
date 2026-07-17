@@ -86,8 +86,10 @@ _ELDER_CHECK_NAME = "Grug — Code Review"
 
 # Skip reasons where a retry can plausibly succeed (model backend outage,
 # unparseable model output, transient diff-fetch error). These raise for SQS
-# redrive instead of failing open; head-permanent reasons (stale snapshot,
-# ineligible PR, GitHub freshness brownout) fail open as neutral instead.
+# redrive instead of terminal fail-open completion. Moved-head staleness,
+# freshness brownouts, and unknown skips complete neutral; same-head
+# staleness and ineligible (draft/closed) exits intentionally stay
+# non-terminal - the requeued/reopen review completes the pending check.
 _RETRYABLE_SKIP_REASONS = frozenset({
     "all_failed",
     "parse_failed",
