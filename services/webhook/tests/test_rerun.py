@@ -469,7 +469,9 @@ def test_hot_review_stops_when_pr_becomes_draft_during_settle(monkeypatch):
 def test_hot_review_requeues_latest_when_dispatch_detects_stale(monkeypatch):
     original = _pr_data(head_sha="same-head", title="Before")
     latest = _pr_data(head_sha="same-head", title="After")
-    pulls = iter((original, original, latest))
+    # Third slot absorbs the fail-open neutral check post (also routed
+    # through with_install_token_retry); the final fetch must see latest.
+    pulls = iter((original, original, original, latest))
     monkeypatch.setattr(
         rerun, "with_install_token_retry", lambda iid, fn: next(pulls),
     )

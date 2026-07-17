@@ -84,6 +84,16 @@ _STALENESS_WATCH_INTERVAL_S = 10.0
 # multi-minute durable review as "required check never ran" (BLOCKED).
 _ELDER_CHECK_NAME = "Grug — Code Review"
 
+# Skip reasons where a retry can plausibly succeed (model backend outage,
+# unparseable model output, transient diff-fetch error). These raise for SQS
+# redrive instead of failing open; head-permanent reasons (stale snapshot,
+# ineligible PR, GitHub freshness brownout) fail open as neutral instead.
+_RETRYABLE_SKIP_REASONS = frozenset({
+    "all_failed",
+    "parse_failed",
+    "fetch_or_parse_failed",
+})
+
 
 @dataclass(frozen=True, slots=True)
 class _ReviewClaimHeartbeat:
@@ -1177,6 +1187,16 @@ def _run_hot_review(
                 # Prefer release over hang if complete fails.
                 release_review_claim(**owned_claim_args)
             return "fail_open_freshness"
+        if result_status == "skipped" and degraded_reason in _RETRYABLE_SKIP_REASONS:
+            # Model/content-side transient (backend outage, unparseable
+            # output, diff fetch blip): a retry can succeed, so release the
+            # claim and raise for SQS redrive instead of failing open. These
+            # paths publish their own completed degraded check (or redrive
+            # re-runs the review), so they cannot stick in_progress; the DLQ
+            # poison monitor covers a sustained outage.
+            raise RuntimeError(
+                f"Elder review degraded: {degraded_reason}"
+            )
         if result_status == "skipped" and degraded_reason not in (
             "no_diff", "fail_open_freshness",
         ):
