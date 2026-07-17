@@ -44,7 +44,7 @@ from pathlib import Path
 from sast_benchmark.backends import BenchBackend
 
 from .fixtures import default_fixtures
-from .llmobs_export import flush, maybe_enable
+from .llmobs_export import _DEFAULT_ML_APP, flush, maybe_enable
 from .runner import sweep
 from .scoring import summarize_trials
 
@@ -116,7 +116,7 @@ def main(argv: list[str] | None = None) -> int:
     for f in fixtures:
         print(f"  {f.name}: ~{f.added_lines} added lines, {f.prompt_chars} prompt chars")
     if llmobs_on:
-        ml = os.getenv("DD_LLMOBS_ML_APP", "grug-elder-bakeoff")
+        ml = (os.getenv("DD_LLMOBS_ML_APP") or _DEFAULT_ML_APP).strip() or _DEFAULT_ML_APP
         print(f"LLMObs export: ON (ml_app={ml})")
     else:
         print(

@@ -281,6 +281,7 @@ def dispatch_walkthrough_review(
                 "installation_id": installation_id,
                 "repo": f"{owner}/{repo_name}",
                 "pr_number": pull_number,
+                "head_sha": head_sha,
             },
         )
     except Exception as e:  # noqa: BLE001 - a summary hiccup must not drop the comment

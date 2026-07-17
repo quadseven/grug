@@ -23,6 +23,7 @@ from __future__ import annotations
 
 import logging
 import os
+import sys
 from contextlib import contextmanager
 from typing import Any, Iterator, Optional, Sequence
 
@@ -40,7 +41,7 @@ _enable_attempted = False
 
 
 def _want_llmobs() -> bool:
-    if os.getenv("GRUG_BENCH_LLMOBS", "").strip() in ("1", "true", "yes", "on"):
+    if os.getenv("GRUG_BENCH_LLMOBS", "").strip().lower() in ("1", "true", "yes", "on"):
         return True
     return os.getenv("DD_LLMOBS_ENABLED", "").strip().lower() in (
         "1", "true", "yes", "on",
@@ -116,15 +117,12 @@ class _TrialSpan:
         span: Any,
         backend: BenchBackend,
         fixture_messages: Sequence[dict[str, str]],
-        concurrency: int,
-        fixture_name: str,
     ) -> None:
+        # fixture/concurrency come from the TrialResult at finish() time.
         self._llmobs = llmobs
         self._span = span
         self._backend = backend
         self._messages = fixture_messages
-        self._concurrency = concurrency
-        self._fixture_name = fixture_name
 
     def finish(self, trial: TrialResult, *, output_preview: str = "") -> None:
         tags = {
@@ -138,14 +136,14 @@ class _TrialSpan:
             "errored" if trial.errored
             else ("parse_ok" if trial.parse_ok else "parse_failed")
         )
+        # ms-convention span metrics only; the seconds-unit quantities ship
+        # as submit_evaluation(complete_s / ttft_s) below, not duplicated here.
         metrics: dict[str, float | int] = {
             "latency_ms": int(trial.complete_s * 1000),
-            "complete_s": float(trial.complete_s),
             "prompt_chars": trial.prompt_chars,
             "response_chars": trial.response_chars,
         }
         if trial.ttft_s is not None:
-            metrics["ttft_s"] = float(trial.ttft_s)
             metrics["ttft_ms"] = int(trial.ttft_s * 1000)
         if trial.completion_tokens is not None:
             metrics["output_tokens"] = int(trial.completion_tokens)
@@ -220,9 +218,6 @@ class _NoopTrialSpan:
 def trial_span(
     backend: BenchBackend,
     fixture_messages: Sequence[dict[str, str]],
-    *,
-    concurrency: int,
-    fixture_name: str,
 ) -> Iterator[_TrialSpan | _NoopTrialSpan]:
     """Open an LLMObs span around the HTTP trial so duration == wall-clock."""
     if not _enabled and not maybe_enable():
@@ -234,26 +229,54 @@ def trial_span(
         yield _NoopTrialSpan()
         return
 
+    # Open the span WITHOUT wrapping the yield: a try/except around a
+    # @contextmanager yield catches the CALLER's with-body exception and a
+    # second yield then raises RuntimeError("generator didn't stop after
+    # throw()"), masking the real error. Only span open/close is guarded.
+    span_cm = None
+    handle: _TrialSpan | _NoopTrialSpan
     try:
-        with LLMObs.llm(
+        span_cm = LLMObs.llm(
             model_name=backend.model,
             model_provider=backend.name,
             name=_LLMOBS_NAME,
-        ) as span:
-            yield _TrialSpan(
-                llmobs=LLMObs,
-                span=span,
-                backend=backend,
-                fixture_messages=fixture_messages,
-                concurrency=concurrency,
-                fixture_name=fixture_name,
-            )
-    except Exception as e:  # noqa: BLE001
+        )
+        span = span_cm.__enter__()
+        handle = _TrialSpan(
+            llmobs=LLMObs,
+            span=span,
+            backend=backend,
+            fixture_messages=fixture_messages,
+        )
+    except Exception as e:  # noqa: BLE001 - bakeoff must not die on o11y
         log.warning(
             "review_latency_llmobs_span_failed",
             extra={"kind": type(e).__name__, "backend": backend.name},
         )
-        yield _NoopTrialSpan()
+        span_cm = None
+        handle = _NoopTrialSpan()
+    try:
+        yield handle
+    except BaseException:
+        if span_cm is not None:
+            try:
+                span_cm.__exit__(*sys.exc_info())
+            except Exception as e:  # noqa: BLE001
+                log.warning(
+                    "review_latency_llmobs_span_close_failed",
+                    extra={"kind": type(e).__name__, "backend": backend.name},
+                )
+            span_cm = None
+        raise
+    finally:
+        if span_cm is not None:
+            try:
+                span_cm.__exit__(None, None, None)
+            except Exception as e:  # noqa: BLE001
+                log.warning(
+                    "review_latency_llmobs_span_close_failed",
+                    extra={"kind": type(e).__name__, "backend": backend.name},
+                )
 
 
 def emit_trial(
@@ -263,11 +286,7 @@ def emit_trial(
     *,
     output_preview: str = "",
 ) -> None:
-    """Backward-compat: post-hoc span (duration will be ~0). Prefer trial_span."""
-    with trial_span(
-        backend,
-        fixture_messages,
-        concurrency=trial.concurrency,
-        fixture_name=trial.fixture,
-    ) as handle:
+    """Post-hoc span for callers without a live span (duration will be ~0).
+    Prefer trial_span, which wraps the HTTP call so duration == wall-clock."""
+    with trial_span(backend, fixture_messages) as handle:
         handle.finish(trial, output_preview=output_preview)

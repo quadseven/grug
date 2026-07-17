@@ -2297,3 +2297,90 @@ def test_summarize_pr_ignores_non_dict_file_summaries() -> None:
         out = lc.summarize_pr("diff", ["x.py"], installation_id=2)
     assert out is not None
     assert out.file_summaries == {}
+
+
+def test_answer_pr_question_non_dict_json_falls_back_never_raises(monkeypatch) -> None:
+    """Valid JSON that is not an object (bare list/scalar) is a parse failure
+    on that backend: fail over, never raise past the caller (#528 contract:
+    _run_ask never raises past the job)."""
+    annotate_calls = _capture_llmobs(monkeypatch)
+    response = httpx.Response(200, json=_openai_json_response('["answer"]'))
+    with patch.object(httpx, "post", return_value=response):
+        out = lc.answer_pr_question("q", "diff", installation_id=2)
+    assert out is None
+    assert len(annotate_calls) == 2
+    assert all(c["metadata"]["kind"] == "parse_failed" for c in annotate_calls)
+
+
+def test_answer_pr_question_non_string_answer_fails_over_not_repr(monkeypatch) -> None:
+    """{"answer": {...}} must fail over - never post a str()-coerced Python
+    repr as the /grug ask reply on the PR."""
+    annotate_calls = _capture_llmobs(monkeypatch)
+    payload = json.dumps({"answer": {"text": "the fix is..."}})
+    response = httpx.Response(200, json=_openai_json_response(payload))
+    with patch.object(httpx, "post", return_value=response):
+        out = lc.answer_pr_question("q", "diff", installation_id=2)
+    assert out is None
+    assert all(c["metadata"]["kind"] == "parse_failed" for c in annotate_calls)
+
+
+def test_answer_pr_question_non_200_annotates_http_error(monkeypatch) -> None:
+    """A 429/5xx is an availability failure: kind=http_error, never
+    parse_failed (a rate-limit storm must not read as bad model output)."""
+    annotate_calls = _capture_llmobs(monkeypatch)
+    response = httpx.Response(429, json={"error": "rate limited"})
+    with patch.object(httpx, "post", return_value=response):
+        out = lc.answer_pr_question("q", "diff", installation_id=2)
+    assert out is None
+    assert len(annotate_calls) == 2
+    assert all(c["metadata"]["kind"] == "http_error" for c in annotate_calls)
+    assert all(c["metadata"]["status_code"] == 429 for c in annotate_calls)
+
+
+def test_summarize_pr_non_200_annotates_http_error(monkeypatch) -> None:
+    annotate_calls = _capture_llmobs(monkeypatch)
+    response = httpx.Response(503, text="upstream down")
+    with patch.object(httpx, "post", return_value=response):
+        out = lc.summarize_pr("diff", ["x.py"], installation_id=2)
+    assert out is None
+    assert annotate_calls
+    assert all(c["metadata"]["kind"] == "http_error" for c in annotate_calls)
+
+
+def test_summarize_pr_accepts_2xx_non_200() -> None:
+    """A proxy returning 201/206 with a valid completion body still counts."""
+    payload = json.dumps({"summary": "Adds retry logic."})
+    response = httpx.Response(201, json=_openai_json_response(payload))
+    with patch.object(httpx, "post", return_value=response):
+        out = lc.summarize_pr("diff", ["x.py"], installation_id=2)
+    assert out is not None
+    assert out.summary == "Adds retry logic."
+
+
+def test_annotate_failure_never_discards_a_valid_answer(monkeypatch) -> None:
+    """Observability is strictly additive: LLMObs.annotate raising must not
+    cost the already-parsed model result or trigger a spurious failover."""
+    class _NoopSpanCm:
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *a):
+            return False
+
+    class _RaisingLLMObs:
+        @staticmethod
+        def llm(**kwargs):
+            return _NoopSpanCm()
+
+        @staticmethod
+        def annotate(**kwargs):
+            raise TypeError("sdk validation drift")
+
+    # _llmobs_annotate resolves _LLMObs at call time from module globals;
+    # raising=False keeps the test valid in a no-ddtrace env (noop branch).
+    monkeypatch.setattr(lc, "_LLMObs", _RaisingLLMObs, raising=False)
+    payload = json.dumps({"answer": "It adds a retry loop."})
+    response = httpx.Response(200, json=_openai_json_response(payload))
+    with patch.object(httpx, "post", return_value=response):
+        out = lc.answer_pr_question("q", "diff", installation_id=2)
+    assert out == "It adds a retry loop."

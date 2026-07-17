@@ -3,6 +3,10 @@
 from __future__ import annotations
 
 import sys
+from unittest.mock import MagicMock
+
+import httpx
+import pytest
 
 from review_latency.fixtures import default_fixtures
 from review_latency.scoring import (
@@ -189,8 +193,6 @@ def test_llmobs_trial_span_submits_span_and_evals(monkeypatch):
     with le.trial_span(
         backend,
         [{"role": "user", "content": "review me"}],
-        concurrency=1,
-        fixture_name="small",
     ) as handle:
         handle.finish(trial, output_preview='{"findings":[]}')
     assert llm_kwargs and llm_kwargs[0]["name"] == "elder_latency_bakeoff"
@@ -202,3 +204,139 @@ def test_llmobs_trial_span_submits_span_and_evals(monkeypatch):
     assert parse_eval["value"] == "true"
     complete_eval = next(c for c in eval_calls if c["label"] == "complete_s")
     assert complete_eval["value"] == 3.5
+
+
+def _install_fake_llmobs(monkeypatch, le):
+    """Enable export against a fake LLMObs; returns (llm_kwargs, exits)."""
+    llm_kwargs: list[dict] = []
+    exits: list[tuple] = []
+
+    class _FakeSpan:
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *a):
+            exits.append(a)
+            return False
+
+    class _FakeLLMObs:
+        @staticmethod
+        def enable(**kwargs):
+            return None
+
+        @staticmethod
+        def llm(**kwargs):
+            llm_kwargs.append(kwargs)
+            return _FakeSpan()
+
+        @staticmethod
+        def annotate(**kwargs):
+            return None
+
+        @staticmethod
+        def export_span(span=None):
+            return None
+
+        @staticmethod
+        def submit_evaluation(**kwargs):
+            return None
+
+        @staticmethod
+        def flush():
+            return None
+
+    monkeypatch.setattr(le, "_enabled", False)
+    monkeypatch.setattr(le, "_enable_attempted", False)
+    monkeypatch.setenv("DD_API_KEY", "test-key")
+    fake_mod = type(sys)("ddtrace.llmobs")
+    fake_mod.LLMObs = _FakeLLMObs
+    monkeypatch.setitem(sys.modules, "ddtrace", type(sys)("ddtrace"))
+    monkeypatch.setitem(sys.modules, "ddtrace.llmobs", fake_mod)
+    return llm_kwargs, exits
+
+
+def test_llmobs_trial_span_propagates_caller_exception(monkeypatch):
+    """An exception in the with-body must PROPAGATE (never be swallowed by
+    the o11y guard or masked by contextlib's 'generator didn't stop after
+    throw()') and the span must still be closed with the error info."""
+    from review_latency import llmobs_export as le
+    from sast_benchmark.backends import BenchBackend
+
+    monkeypatch.setenv("GRUG_BENCH_LLMOBS", "1")
+    llm_kwargs, exits = _install_fake_llmobs(monkeypatch, le)
+    assert le.maybe_enable() is True
+    backend = BenchBackend(name="cave", url="http://x", model="m", api_key="")
+
+    with pytest.raises(httpx.DecodingError):
+        with le.trial_span(
+            backend, [{"role": "user", "content": "x"}],
+        ):
+            raise httpx.DecodingError("corrupt gzip")
+    assert llm_kwargs, "span must have been opened"
+    assert exits and exits[0][0] is httpx.DecodingError, (
+        "span must close with the caller's exc info"
+    )
+
+
+def test_llmobs_flag_is_case_insensitive(monkeypatch):
+    """GRUG_BENCH_LLMOBS=TRUE must enable export like DD_LLMOBS_ENABLED."""
+    from review_latency import llmobs_export as le
+
+    monkeypatch.setenv("GRUG_BENCH_LLMOBS", "TRUE")
+    monkeypatch.delenv("DD_LLMOBS_ENABLED", raising=False)
+    assert le._want_llmobs() is True
+
+
+def test_run_one_stream_transport_failure_finishes_span_then_retries(monkeypatch):
+    """The failed stream attempt's span is finished (errored) INSIDE its own
+    trial_span; the blocking retry runs OUTSIDE it - no unfinished outer span,
+    no nested double-count."""
+    from review_latency import runner as rn
+
+    finished: list = []
+
+    class _Obs:
+        def finish(self, trial, *, output_preview=""):
+            finished.append((trial, output_preview))
+
+    from contextlib import contextmanager
+
+    span_state = {"open": 0}
+
+    @contextmanager
+    def _fake_trial_span(*a, **kw):
+        span_state["open"] += 1
+        try:
+            yield _Obs()
+        finally:
+            span_state["open"] -= 1
+
+    monkeypatch.setattr(rn, "trial_span", _fake_trial_span)
+
+    def _fake_blocking(backend, fixture, *, concurrency_label, timeout_s):
+        assert span_state["open"] == 0, "retry must run outside the stream span"
+        return TrialResult(
+            concurrency=concurrency_label, fixture=fixture.name,
+            backend=backend.name, ttft_s=None, complete_s=1.0,
+            parse_ok=True, errored=False, prompt_chars=1,
+            response_chars=1, completion_tokens=None,
+        )
+
+    monkeypatch.setattr(rn, "run_one_blocking", _fake_blocking)
+    monkeypatch.setattr(
+        rn.httpx, "stream",
+        MagicMock(side_effect=httpx.ConnectError("stream-hostile")),
+    )
+    from sast_benchmark.backends import BenchBackend
+
+    backend = BenchBackend(name="cave", url="http://x", model="m", api_key="")
+    fixture = rn.LatencyFixture(
+        name="small", added_lines=1,
+        messages=({"role": "user", "content": "x"},),
+        prompt_chars=1,
+    )
+    out = rn.run_one_stream(backend, fixture, concurrency_label=1)
+    assert out.parse_ok is True and out.errored is False
+    assert len(finished) == 1, "stream attempt span must be finished exactly once"
+    assert finished[0][0].errored is True
+    assert "stream transport failed" in finished[0][1]
