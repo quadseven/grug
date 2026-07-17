@@ -146,6 +146,7 @@ Grug uses **Datadog LLM Observability** to track Elder model calls and collect t
 |---|---|
 | **ML app name** | Datadog organizes traces by ML app. Grug uses `grug-elder` (set on the webhook and consumer workloads). |
 | **Review span name** | Each Elder producer call creates an `elder_code_review` LLMObs span in `services/_shared/llm_client.py`. A deep review can create both Poolside and OpenRouter spans for one snapshot. |
+| **Other LLM spans** | `elder_judge` (finding grader), `teller_walkthrough` (PR summary), `grug_ask` (`/grug ask`). Offline latency bakeoff emits `elder_latency_bakeoff` under ml_app `grug-elder-bakeoff` when `GRUG_BENCH_LLMOBS=1`. |
 | **DD_SERVICE tag** | The workload identity is `grug-webhook` for webhook handling and `grug-consumer` for durable review execution. This is APM service identity, not the LLMObs ML app. |
 | **Reaction polling** | The `grug-poller` CronJob polls reactions on Grug review comments every 15 minutes. Only reactions from users with repository write/admin permission can steer repository learning. |
 | **Producer provenance** | A merged finding retains every backend/model origin. Judge and reaction evaluations attach only to exported spans that actually produced that finding. |

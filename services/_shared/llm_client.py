@@ -115,6 +115,10 @@ except ImportError:  # pragma: no cover — local dev without ddtrace
         )
 
 _LLMOBS_NAME = "elder_code_review"
+# Teller walkthrough + /grug ask are separate span names so DD can filter
+# review arms from interactive / summary traffic without conflating latency.
+_LLMOBS_TELLER_NAME = "teller_walkthrough"
+_LLMOBS_ASK_NAME = "grug_ask"
 _LLMOBS_HEAD_SHA_TAG_LEN = 8  # truncated to keep tag cardinality bounded
 
 # Per-payload cap on input/output captured in LLM Obs spans. Bounded
@@ -1188,14 +1192,39 @@ class WalkthroughSummary:
     effort: str | None
 
 
+def _interactive_backend_order(installation_id: int) -> tuple[Backend, Backend]:
+    """Primary + failover backend for Teller / /grug ask (Poolside/OpenRouter)."""
+    primary = select_backend(installation_id)
+    failover = (
+        Backend.OPENROUTER if primary == Backend.POOLSIDE else Backend.POOLSIDE
+    )
+    return primary, failover
+
+
+def _interactive_tags(
+    installation_id: int, pr_context: Optional[PrContext],
+) -> dict[str, str]:
+    """PR tags for interactive LLM spans; always include installation_id."""
+    tags = dict(_llmobs_tags(pr_context))
+    tags.setdefault("installation_id", str(installation_id))
+    return tags
+
+
 def summarize_pr(
-    diff_text: str, file_paths: list[str], installation_id: int,
+    diff_text: str,
+    file_paths: list[str],
+    installation_id: int,
+    pr_context: Optional[PrContext] = None,
 ) -> WalkthroughSummary | None:
     """One bounded, JSON-constrained call for Teller's walkthrough (#554).
     Reuses the round-robin backend + redaction (same shape as
     `answer_pr_question`). Returns None on any backend/parse failure - the
     caller renders a deterministic fallback summary, never blocks the
-    comment on this call."""
+    comment on this call.
+
+    Emits one `teller_walkthrough` LLMObs span per backend attempt so DD
+    can filter walkthrough latency/quality separately from Elder review.
+    Optional `pr_context` attaches repo/pr_number/head_sha tags."""
     import json as _json
 
     diff_text = _redact_secrets(diff_text)[:24000]
@@ -1217,39 +1246,118 @@ def summarize_pr(
             f"CHANGED FILES:\n{paths_block}\n\nDIFF:\n{diff_text}"
         )},
     ]
-    for backend in (select_backend(installation_id),
-                    Backend.OPENROUTER if select_backend(installation_id) == Backend.POOLSIDE else Backend.POOLSIDE):
-        try:
-            resp = _call_backend(_BACKEND_CONFIGS[backend], messages)
-            content = resp.json()["choices"][0]["message"]["content"]
-            data = _json.loads(content)
-            summary = str(data.get("summary", "")).strip()
-            if not summary:
+    pr_tags = _interactive_tags(installation_id, pr_context)
+    for backend in _interactive_backend_order(installation_id):
+        config = _BACKEND_CONFIGS[backend]
+        start_ns = time.monotonic_ns()
+        with _llmobs_llm(
+            model_name=config.model,
+            model_provider=backend.value,
+            name=_LLMOBS_TELLER_NAME,
+        ) as span:
+            try:
+                resp = _call_backend(config, messages)
+            except (_BackendConfigError, httpx.RequestError, httpx.TimeoutException) as e:
+                _llmobs_annotate(
+                    span=span,
+                    input_data=_redact_payload(messages),
+                    metadata={
+                        "backend": backend.value,
+                        "kind": "transport_error",
+                        "error": type(e).__name__,
+                    },
+                    metrics={"latency_ms": _elapsed_ms(start_ns)},
+                    tags=pr_tags,
+                )
                 continue
-            raw_files = data.get("file_summaries")
-            file_summaries = (
-                {str(k): str(v) for k, v in raw_files.items()}
-                if isinstance(raw_files, dict)
-                else {}
-            )
-            raw_effort = data.get("effort")
-            effort = raw_effort if isinstance(raw_effort, str) else None
-            return WalkthroughSummary(
-                summary=summary, file_summaries=file_summaries, effort=effort,
-            )
-        except (httpx.RequestError, httpx.TimeoutException, _BackendConfigError,
-                KeyError, ValueError, TypeError, AttributeError):
-            continue
+            content = ""
+            body: dict = {}
+            try:
+                body = resp.json() if resp.status_code == 200 else {}
+                if isinstance(body, dict):
+                    choices = body.get("choices") or []
+                    if choices and isinstance(choices[0], dict):
+                        content = (choices[0].get("message") or {}).get("content", "") or ""
+                data = _json.loads(content) if content else {}
+                if not isinstance(data, dict):
+                    raise ValueError("summary payload not a dict")
+                summary = str(data.get("summary", "")).strip()
+                if not summary:
+                    _llmobs_annotate(
+                        span=span,
+                        input_data=_redact_payload(messages),
+                        output_data=_redact_payload(content) if content else None,
+                        metadata={
+                            "backend": backend.value,
+                            "kind": "parse_failed",
+                            "status_code": resp.status_code,
+                        },
+                        metrics={
+                            "latency_ms": _elapsed_ms(start_ns),
+                            **_extract_usage_metrics(body),
+                        },
+                        tags=pr_tags,
+                    )
+                    continue
+                raw_files = data.get("file_summaries")
+                file_summaries = (
+                    {str(k): str(v) for k, v in raw_files.items()}
+                    if isinstance(raw_files, dict)
+                    else {}
+                )
+                raw_effort = data.get("effort")
+                effort = raw_effort if isinstance(raw_effort, str) else None
+                _llmobs_annotate(
+                    span=span,
+                    input_data=_redact_payload(messages),
+                    output_data=_redact_payload(content),
+                    metadata={
+                        "backend": backend.value,
+                        "kind": "summarized",
+                        "status_code": resp.status_code,
+                    },
+                    metrics={
+                        "latency_ms": _elapsed_ms(start_ns),
+                        **_extract_usage_metrics(body),
+                    },
+                    tags=pr_tags,
+                )
+                return WalkthroughSummary(
+                    summary=summary, file_summaries=file_summaries, effort=effort,
+                )
+            except (KeyError, ValueError, TypeError, AttributeError, json.JSONDecodeError):
+                _llmobs_annotate(
+                    span=span,
+                    input_data=_redact_payload(messages),
+                    output_data=_redact_payload(content) if content else None,
+                    metadata={
+                        "backend": backend.value,
+                        "kind": "parse_failed",
+                        "status_code": getattr(resp, "status_code", None),
+                    },
+                    metrics={
+                        "latency_ms": _elapsed_ms(start_ns),
+                        **_extract_usage_metrics(body),
+                    },
+                    tags=pr_tags,
+                )
+                continue
     return None
 
 
 def answer_pr_question(
-    question: str, diff_text: str, installation_id: int,
+    question: str,
+    diff_text: str,
+    installation_id: int,
+    pr_context: Optional[PrContext] = None,
 ) -> str | None:
     """Answer a maintainer's `/grug ask` question about a PR diff (#528).
     Reuses the round-robin backend + JSON-constrained call. Returns the
     answer text, or None on any backend/parse failure (the caller posts a
-    graceful fallback). Read-only: it reasons over the diff, never mutates."""
+    graceful fallback). Read-only: it reasons over the diff, never mutates.
+
+    Emits one `grug_ask` LLMObs span per backend attempt. Optional
+    `pr_context` attaches repo/pr_number tags for DD filtering."""
     import json as _json
     diff_text = _redact_secrets(diff_text)[:24000]  # bound the context + scrub secrets
     messages = [
@@ -1262,17 +1370,88 @@ def answer_pr_question(
         )},
         {"role": "user", "content": f"QUESTION: {question}\n\nDIFF:\n{diff_text}"},
     ]
-    for backend in (select_backend(installation_id),
-                    Backend.OPENROUTER if select_backend(installation_id) == Backend.POOLSIDE else Backend.POOLSIDE):
-        try:
-            resp = _call_backend(_BACKEND_CONFIGS[backend], messages)
-            content = (resp.json()["choices"][0]["message"]["content"])
-            answer = _json.loads(content).get("answer", "").strip()
-            if answer:
-                return answer
-        except (httpx.RequestError, httpx.TimeoutException, _BackendConfigError,
-                KeyError, ValueError, TypeError):
-            continue
+    pr_tags = _interactive_tags(installation_id, pr_context)
+    for backend in _interactive_backend_order(installation_id):
+        config = _BACKEND_CONFIGS[backend]
+        start_ns = time.monotonic_ns()
+        with _llmobs_llm(
+            model_name=config.model,
+            model_provider=backend.value,
+            name=_LLMOBS_ASK_NAME,
+        ) as span:
+            try:
+                resp = _call_backend(config, messages)
+            except (_BackendConfigError, httpx.RequestError, httpx.TimeoutException) as e:
+                _llmobs_annotate(
+                    span=span,
+                    input_data=_redact_payload(messages),
+                    metadata={
+                        "backend": backend.value,
+                        "kind": "transport_error",
+                        "error": type(e).__name__,
+                    },
+                    metrics={"latency_ms": _elapsed_ms(start_ns)},
+                    tags=pr_tags,
+                )
+                continue
+            content = ""
+            body: dict = {}
+            try:
+                body = resp.json() if resp.status_code == 200 else {}
+                if isinstance(body, dict):
+                    choices = body.get("choices") or []
+                    if choices and isinstance(choices[0], dict):
+                        content = (choices[0].get("message") or {}).get("content", "") or ""
+                answer = str(_json.loads(content).get("answer", "")).strip() if content else ""
+                if answer:
+                    _llmobs_annotate(
+                        span=span,
+                        input_data=_redact_payload(messages),
+                        output_data=_redact_payload(content),
+                        metadata={
+                            "backend": backend.value,
+                            "kind": "answered",
+                            "status_code": resp.status_code,
+                        },
+                        metrics={
+                            "latency_ms": _elapsed_ms(start_ns),
+                            **_extract_usage_metrics(body),
+                        },
+                        tags=pr_tags,
+                    )
+                    return answer
+                _llmobs_annotate(
+                    span=span,
+                    input_data=_redact_payload(messages),
+                    output_data=_redact_payload(content) if content else None,
+                    metadata={
+                        "backend": backend.value,
+                        "kind": "parse_failed",
+                        "status_code": resp.status_code,
+                    },
+                    metrics={
+                        "latency_ms": _elapsed_ms(start_ns),
+                        **_extract_usage_metrics(body),
+                    },
+                    tags=pr_tags,
+                )
+            except (KeyError, ValueError, TypeError, json.JSONDecodeError):
+                _llmobs_annotate(
+                    span=span,
+                    input_data=_redact_payload(messages),
+                    output_data=_redact_payload(content) if content else None,
+                    metadata={
+                        "backend": backend.value,
+                        "kind": "parse_failed",
+                        "status_code": getattr(resp, "status_code", None),
+                    },
+                    metrics={
+                        "latency_ms": _elapsed_ms(start_ns),
+                        **_extract_usage_metrics(body),
+                    },
+                    tags=pr_tags,
+                )
+                continue
     return None
 
 

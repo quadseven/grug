@@ -19,6 +19,7 @@ from llm_client import _parse_response  # noqa: PLC2701 - Elder path on purpose
 from sast_benchmark.backends import BenchBackend
 
 from .fixtures import LatencyFixture
+from .llmobs_export import trial_span
 from .scoring import TrialResult
 
 log = logging.getLogger("grug.review_latency")
@@ -103,83 +104,94 @@ def run_one_stream(
     timeout_s: float = _DEFAULT_TIMEOUT_S,
 ) -> TrialResult:
     """One request with streaming TTFT when the server supports SSE."""
-    t0 = time.perf_counter()
-    ttft: float | None = None
-    chunks: list[str] = []
-    try:
-        with httpx.stream(
-            "POST",
-            backend.url,
-            json=_post_body(backend, fixture.messages, stream=True),
-            headers=_headers(backend),
-            timeout=timeout_s,
-        ) as resp:
-            resp.raise_for_status()
-            for line in resp.iter_lines():
-                if not line:
-                    continue
-                if ttft is None:
-                    ttft = time.perf_counter() - t0
-                if line.startswith("data:"):
-                    payload = line[5:].strip()
-                    if payload == "[DONE]":
-                        break
-                    chunks.append(payload)
-                else:
-                    chunks.append(line)
-        complete = time.perf_counter() - t0
-        raw = "\n".join(chunks)
+    with trial_span(
+        backend,
+        fixture.messages,
+        concurrency=concurrency_label,
+        fixture_name=fixture.name,
+    ) as obs:
+        t0 = time.perf_counter()
+        ttft: float | None = None
+        chunks: list[str] = []
         try:
-            fake = _response_from_stream_raw(raw, backend.model)
-            findings, _model, err = _parse_response(fake)
-            _ = findings
-            tokens = _parse_completion_tokens(raw)
-            return TrialResult(
-                concurrency=concurrency_label,
-                fixture=fixture.name,
-                backend=backend.name,
-                ttft_s=ttft,
-                complete_s=complete,
-                parse_ok=not err,
-                errored=False,
-                prompt_chars=fixture.prompt_chars,
-                response_chars=len(fake.text),
-                completion_tokens=tokens,
-            )
-        except Exception as e:  # noqa: BLE001 - local parse/rebuild, no second POST
+            with httpx.stream(
+                "POST",
+                backend.url,
+                json=_post_body(backend, fixture.messages, stream=True),
+                headers=_headers(backend),
+                timeout=timeout_s,
+            ) as resp:
+                resp.raise_for_status()
+                for line in resp.iter_lines():
+                    if not line:
+                        continue
+                    if ttft is None:
+                        ttft = time.perf_counter() - t0
+                    if line.startswith("data:"):
+                        payload = line[5:].strip()
+                        if payload == "[DONE]":
+                            break
+                        chunks.append(payload)
+                    else:
+                        chunks.append(line)
+            complete = time.perf_counter() - t0
+            raw = "\n".join(chunks)
+            try:
+                fake = _response_from_stream_raw(raw, backend.model)
+                findings, _model, err = _parse_response(fake)
+                _ = findings
+                tokens = _parse_completion_tokens(raw)
+                trial = TrialResult(
+                    concurrency=concurrency_label,
+                    fixture=fixture.name,
+                    backend=backend.name,
+                    ttft_s=ttft,
+                    complete_s=complete,
+                    parse_ok=not err,
+                    errored=False,
+                    prompt_chars=fixture.prompt_chars,
+                    response_chars=len(fake.text),
+                    completion_tokens=tokens,
+                )
+                obs.finish(trial, output_preview=fake.text[:2000])
+                return trial
+            except Exception as e:  # noqa: BLE001 - local parse/rebuild, no second POST
+                log.warning(
+                    "latency_trial_stream_parse_failed",
+                    extra={
+                        "backend": backend.name,
+                        "fixture": fixture.name,
+                        "kind": type(e).__name__,
+                    },
+                )
+                trial = TrialResult(
+                    concurrency=concurrency_label,
+                    fixture=fixture.name,
+                    backend=backend.name,
+                    ttft_s=ttft,
+                    complete_s=complete,
+                    parse_ok=False,
+                    errored=True,
+                    prompt_chars=fixture.prompt_chars,
+                    response_chars=len(raw),
+                    completion_tokens=None,
+                )
+                obs.finish(trial, output_preview=raw[:500])
+                return trial
+        except (httpx.TransportError, httpx.HTTPStatusError, httpx.TimeoutException) as e:
             log.warning(
-                "latency_trial_stream_parse_failed",
+                "latency_trial_stream_transport_failed",
                 extra={
                     "backend": backend.name,
                     "fixture": fixture.name,
                     "kind": type(e).__name__,
                 },
             )
-            return TrialResult(
-                concurrency=concurrency_label,
-                fixture=fixture.name,
-                backend=backend.name,
-                ttft_s=ttft,
-                complete_s=complete,
-                parse_ok=False,
-                errored=True,
-                prompt_chars=fixture.prompt_chars,
-                response_chars=len(raw),
-                completion_tokens=None,
+            # Stream-hostile or flaky transport: one non-stream retry.
+            # Note: nested trial_span will open a second span for the retry.
+            return run_one_blocking(
+                backend, fixture, concurrency_label=concurrency_label, timeout_s=timeout_s,
             )
-    except (httpx.TransportError, httpx.HTTPStatusError, httpx.TimeoutException) as e:
-        log.warning(
-            "latency_trial_stream_transport_failed",
-            extra={
-                "backend": backend.name,
-                "fixture": fixture.name,
-                "kind": type(e).__name__,
-            },
-        )
-        # Stream-hostile or flaky transport: one non-stream retry.
-        return run_one_blocking(
-            backend, fixture, concurrency_label=concurrency_label, timeout_s=timeout_s,
-        )
 
 
 def _sse_to_content(raw: str) -> str:
@@ -216,53 +228,63 @@ def run_one_blocking(
     timeout_s: float = _DEFAULT_TIMEOUT_S,
 ) -> TrialResult:
     """Non-stream POST: complete wall-clock only (TTFT left None)."""
-    t0 = time.perf_counter()
-    try:
-        resp = httpx.post(
-            backend.url,
-            json=_post_body(backend, fixture.messages, stream=False),
-            headers=_headers(backend),
-            timeout=timeout_s,
-        )
-        complete = time.perf_counter() - t0
-        resp.raise_for_status()
-        findings, _model, err = _parse_response(resp)
-        _ = findings
-        tokens = _parse_completion_tokens(resp.text)
-        return TrialResult(
-            concurrency=concurrency_label,
-            fixture=fixture.name,
-            backend=backend.name,
-            ttft_s=None,
-            complete_s=complete,
-            parse_ok=not err,
-            errored=False,
-            prompt_chars=fixture.prompt_chars,
-            response_chars=len(resp.text),
-            completion_tokens=tokens,
-        )
-    except Exception as e:  # noqa: BLE001
-        complete = time.perf_counter() - t0
-        log.warning(
-            "latency_trial_failed",
-            extra={
-                "backend": backend.name,
-                "fixture": fixture.name,
-                "kind": type(e).__name__,
-            },
-        )
-        return TrialResult(
-            concurrency=concurrency_label,
-            fixture=fixture.name,
-            backend=backend.name,
-            ttft_s=None,
-            complete_s=complete,
-            parse_ok=False,
-            errored=True,
-            prompt_chars=fixture.prompt_chars,
-            response_chars=0,
-            completion_tokens=None,
-        )
+    with trial_span(
+        backend,
+        fixture.messages,
+        concurrency=concurrency_label,
+        fixture_name=fixture.name,
+    ) as obs:
+        t0 = time.perf_counter()
+        try:
+            resp = httpx.post(
+                backend.url,
+                json=_post_body(backend, fixture.messages, stream=False),
+                headers=_headers(backend),
+                timeout=timeout_s,
+            )
+            complete = time.perf_counter() - t0
+            resp.raise_for_status()
+            findings, _model, err = _parse_response(resp)
+            _ = findings
+            tokens = _parse_completion_tokens(resp.text)
+            trial = TrialResult(
+                concurrency=concurrency_label,
+                fixture=fixture.name,
+                backend=backend.name,
+                ttft_s=None,
+                complete_s=complete,
+                parse_ok=not err,
+                errored=False,
+                prompt_chars=fixture.prompt_chars,
+                response_chars=len(resp.text),
+                completion_tokens=tokens,
+            )
+            obs.finish(trial, output_preview=resp.text[:2000])
+            return trial
+        except Exception as e:  # noqa: BLE001
+            complete = time.perf_counter() - t0
+            log.warning(
+                "latency_trial_failed",
+                extra={
+                    "backend": backend.name,
+                    "fixture": fixture.name,
+                    "kind": type(e).__name__,
+                },
+            )
+            trial = TrialResult(
+                concurrency=concurrency_label,
+                fixture=fixture.name,
+                backend=backend.name,
+                ttft_s=None,
+                complete_s=complete,
+                parse_ok=False,
+                errored=True,
+                prompt_chars=fixture.prompt_chars,
+                response_chars=0,
+                completion_tokens=None,
+            )
+            obs.finish(trial)
+            return trial
 
 
 def run_concurrency_cell(

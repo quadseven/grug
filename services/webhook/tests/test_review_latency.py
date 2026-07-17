@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import sys
+
 from review_latency.fixtures import default_fixtures
 from review_latency.scoring import (
     TrialResult,
@@ -92,3 +94,111 @@ def test_main_exits_2_without_backends(monkeypatch):
     monkeypatch.delenv("GRUG_BENCH_CAVE_MODEL", raising=False)
     monkeypatch.delenv("GRUG_BENCH_REASONER_URL", raising=False)
     assert main_mod.main(["--levels", "1"]) == 2
+
+
+def test_llmobs_export_noop_when_disabled(monkeypatch):
+    """Default (no env) must not require ddtrace or ship anything."""
+    from review_latency import llmobs_export as le
+    from sast_benchmark.backends import BenchBackend
+
+    # Reset module latch so this test controls enablement.
+    monkeypatch.setattr(le, "_enabled", False)
+    monkeypatch.setattr(le, "_enable_attempted", False)
+    monkeypatch.delenv("GRUG_BENCH_LLMOBS", raising=False)
+    monkeypatch.delenv("DD_LLMOBS_ENABLED", raising=False)
+    monkeypatch.delenv("DD_API_KEY", raising=False)
+
+    assert le.maybe_enable() is False
+    trial = TrialResult(
+        concurrency=1, fixture="small", backend="cave",
+        ttft_s=0.1, complete_s=1.0, parse_ok=True, errored=False,
+        prompt_chars=10, response_chars=5, completion_tokens=1,
+    )
+    backend = BenchBackend(
+        name="cave", url="http://x/v1/chat/completions", model="m", api_key="",
+    )
+    # Must not raise when disabled.
+    le.emit_trial(backend, [{"role": "user", "content": "hi"}], trial)
+    le.flush()
+
+
+def test_llmobs_trial_span_submits_span_and_evals(monkeypatch):
+    """When enabled, trial_span wraps the call and submits parse_ok + complete_s."""
+    from review_latency import llmobs_export as le
+    from sast_benchmark.backends import BenchBackend
+
+    annotate_calls: list[dict] = []
+    eval_calls: list[dict] = []
+    llm_kwargs: list[dict] = []
+
+    class _FakeSpan:
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *a):
+            return False
+
+    class _FakeLLMObs:
+        @staticmethod
+        def enable(**kwargs):
+            return None
+
+        @staticmethod
+        def llm(**kwargs):
+            llm_kwargs.append(kwargs)
+            return _FakeSpan()
+
+        @staticmethod
+        def annotate(**kwargs):
+            annotate_calls.append(kwargs)
+
+        @staticmethod
+        def export_span(span=None):
+            return {"span_id": "1", "trace_id": "2"}
+
+        @staticmethod
+        def submit_evaluation(**kwargs):
+            eval_calls.append(kwargs)
+
+        @staticmethod
+        def flush():
+            return None
+
+    monkeypatch.setattr(le, "_enabled", False)
+    monkeypatch.setattr(le, "_enable_attempted", False)
+    monkeypatch.setenv("GRUG_BENCH_LLMOBS", "1")
+    monkeypatch.setenv("DD_API_KEY", "test-key")
+
+    fake_mod = type(sys)("ddtrace.llmobs")
+    fake_mod.LLMObs = _FakeLLMObs
+    monkeypatch.setitem(sys.modules, "ddtrace", type(sys)("ddtrace"))
+    monkeypatch.setitem(sys.modules, "ddtrace.llmobs", fake_mod)
+
+    assert le.maybe_enable() is True
+    trial = TrialResult(
+        concurrency=1, fixture="small", backend="cave",
+        ttft_s=0.2, complete_s=3.5, parse_ok=True, errored=False,
+        prompt_chars=100, response_chars=50, completion_tokens=12,
+    )
+    backend = BenchBackend(
+        name="cave",
+        url="http://x/v1/chat/completions",
+        model="north-mini-code-1.0:bf16",
+        api_key="",
+    )
+    with le.trial_span(
+        backend,
+        [{"role": "user", "content": "review me"}],
+        concurrency=1,
+        fixture_name="small",
+    ) as handle:
+        handle.finish(trial, output_preview='{"findings":[]}')
+    assert llm_kwargs and llm_kwargs[0]["name"] == "elder_latency_bakeoff"
+    assert llm_kwargs[0]["model_name"] == "north-mini-code-1.0:bf16"
+    assert annotate_calls and annotate_calls[0]["metadata"]["kind"] == "parse_ok"
+    labels = {c["label"] for c in eval_calls}
+    assert labels >= {"parse_ok", "complete_s", "ttft_s"}
+    parse_eval = next(c for c in eval_calls if c["label"] == "parse_ok")
+    assert parse_eval["value"] == "true"
+    complete_eval = next(c for c in eval_calls if c["label"] == "complete_s")
+    assert complete_eval["value"] == 3.5

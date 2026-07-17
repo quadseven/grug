@@ -553,7 +553,16 @@ def _run_ask(install_id: int, repo_full: str, pr_number: int, question: str) -> 
             f"{_GH_API}/repos/{_q(owner, safe='')}/{_q(repo_name, safe='')}/pulls/{pr_number}",
             accept="application/vnd.github.v3.diff",
         )
-        answer = answer_pr_question(q, diff, install_id)
+        answer = answer_pr_question(
+            q,
+            diff,
+            install_id,
+            pr_context={
+                "installation_id": install_id,
+                "repo": repo_full,
+                "pr_number": pr_number,
+            },
+        )
         body = (f"{answer}\n\n*(Grug answered from the PR diff - may be wrong; verify.)*"
                 if answer else
                 "Grug could not answer that right now (the thinking-rock is tired). Try again.")
