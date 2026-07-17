@@ -369,6 +369,35 @@ def test_migrate_check_context_untouched_entry_keeps_its_integration_id():
     assert checks[1] == {"context": GRUG_DOR_CHECK_NAME}
 
 
+def test_migrate_check_context_dedup_key_includes_integration_id():
+    """CodeRabbit #685: dedup must key on (canonical, integration_id), not
+    canonical alone - the same context scoped to two DIFFERENT GitHub Apps
+    is two distinct requirements, not a duplicate. A legacy-alias entry
+    scoped to app 1 and a canonical entry scoped to app 2 must both
+    survive; only a genuine same-app duplicate collapses."""
+    from enforcement import migrate_check_context
+    ruleset = {
+        "rules": [{
+            "type": "required_status_checks",
+            "parameters": {"required_status_checks": [
+                {"context": GRUG_DOR_CHECK_NAME, "integration_id": 1},
+                {"context": "Grug — Definition of Ready", "integration_id": 2},
+            ]},
+        }],
+    }
+    with patch("enforcement.get_ruleset", return_value=ruleset), \
+         patch("enforcement.update_ruleset") as mock_update:
+        changed = migrate_check_context("tok", "o", "r", 555)
+
+    assert changed is True
+    new_rules = mock_update.call_args.args[4]
+    checks = new_rules[0]["parameters"]["required_status_checks"]
+    assert checks == [
+        {"context": GRUG_DOR_CHECK_NAME, "integration_id": 1},
+        {"context": GRUG_DOR_CHECK_NAME, "integration_id": 2},
+    ]
+
+
 # --- remove_enforcement -----------------------------------------------
 
 def test_remove_deletes_by_stored_id():

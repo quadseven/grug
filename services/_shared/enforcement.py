@@ -98,26 +98,30 @@ def migrate_check_context(
             new_rules.append(rule)
             continue
         new_checks: list[dict] = []
-        seen: set[str] = set()
+        seen: set[tuple] = set()
         rule_changed = False
         for check in old_checks:
             ctx = check.get("context")
             canonical = primary_check_name(ctx)
             if canonical == ctx:
                 # Untouched entry: byte-for-byte, integration_id and all.
-                if canonical in seen:
+                # Dedup key includes integration_id - same context scoped
+                # to different GitHub Apps are NOT the same requirement.
+                key = (canonical, check.get("integration_id"))
+                if key in seen:
                     rule_changed = True  # a genuine pre-existing duplicate
                     continue
-                seen.add(canonical)
+                seen.add(key)
                 new_checks.append(check)
                 continue
             rule_changed = True
             new_check = {**check, "context": canonical}
             if new_check.get("integration_id") is None:
                 new_check.pop("integration_id", None)
-            if canonical in seen:
+            key = (canonical, new_check.get("integration_id"))
+            if key in seen:
                 continue
-            seen.add(canonical)
+            seen.add(key)
             new_checks.append(new_check)
         if not rule_changed:
             new_rules.append(rule)
