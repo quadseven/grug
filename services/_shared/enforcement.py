@@ -172,6 +172,7 @@ def remove_enforcement(
                 "install_id": install_id, "repo_id": repo_id,
                 "stored_ruleset_id": ruleset_id,
                 "kind": type(e).__name__,
+                "detail": str(e)[:200],
             },
         )
     to_delete = sorted(to_delete_ids)
