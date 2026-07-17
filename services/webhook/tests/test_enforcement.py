@@ -136,6 +136,27 @@ def test_remove_fallback_still_finds_legacy_emdash_prefix():
     mock_set.assert_called_once_with(1, 2, None)
 
 
+def test_remove_deletes_all_matching_rulesets_during_cutover():
+    """No stored ID + BOTH canonical and legacy Grug rulesets present:
+    delete every match, not just the first, or the second stays active +
+    orphaned after the store is cleared."""
+    rulesets = [
+        {"id": 99, "name": "Grug - Chief Enforcement"},
+        {"id": 77, "name": "Grug — Chief Enforcement"},
+        {"id": 50, "name": "CI Required"},
+    ]
+    with patch("adapters.install_store.get_enforcement_id", return_value=None), \
+         patch("enforcement.list_rulesets", return_value=rulesets), \
+         patch("enforcement.delete_ruleset") as mock_del, \
+         patch("adapters.install_store.set_enforcement_id") as mock_set:
+        remove_enforcement("tok", "o", "r", 1, 2)
+
+    assert mock_del.call_count == 2
+    deleted_ids = {c.args[3] for c in mock_del.call_args_list}
+    assert deleted_ids == {99, 77}
+    mock_set.assert_called_once_with(1, 2, None)
+
+
 def test_remove_noop_when_nothing_exists():
     """No stored ID, no Grug-prefixed rulesets → nothing to do."""
     with patch("adapters.install_store.get_enforcement_id", return_value=None), \

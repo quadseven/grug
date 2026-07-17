@@ -1185,7 +1185,8 @@ def test_elder_check_already_terminal_accepts_legacy_alias(monkeypatch):
     # Guard the cutover contract server-side too: a check_name param would
     # make GitHub filter OUT the legacy alias run and this test would pass
     # for the wrong reason.
-    assert seen_params and "check_name" not in seen_params[0]
+    assert seen_params
+    assert "check_name" not in seen_params[0]
 
 
 def test_complete_elder_check_open_posts_neutral(monkeypatch):

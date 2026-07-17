@@ -83,9 +83,19 @@ const esc = (s: string) =>
     { "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" }[c] as string
   ));
 
+// Clamp a persona's mode to the ones the backend can honor for it (a stale
+// default or an old localStorage value - e.g. smasher="block" before Smasher
+// was capped to warn/off - would otherwise render the control with nothing
+// selected). Falls back to the persona's first supported mode, then "off".
+function clampPersonaMode(id: string, mode: PMode): PMode {
+  const supported = PERSONAS.find((p) => p.id === id)?.modes ?? [];
+  if (supported.length === 0) return "off"; // informational persona
+  return (supported as readonly PMode[]).includes(mode) ? mode : (supported[0] as PMode);
+}
+
 function loadLocal() {
   const def = {
-    personas: { smasher: "block", guard: "block", elder: "warn", chief: "block", warder: "off" } as Record<string, PMode>,
+    personas: { smasher: "warn", guard: "block", elder: "warn", chief: "block", teller: "off", warder: "warn", pulse: "off" } as Record<string, PMode>,
     skin: "classic",
     tone: "caveman",
     mood: "GRUG.MOOD = ANGRY",
@@ -95,9 +105,13 @@ function loadLocal() {
   };
   try {
     const s = JSON.parse(localStorage.getItem(LS) || "{}");
+    const mergedPersonas = { ...def.personas, ...(s.personas || {}) };
+    const personas = Object.fromEntries(
+      Object.entries(mergedPersonas).map(([id, m]) => [id, clampPersonaMode(id, m as PMode)]),
+    ) as Record<string, PMode>;
     return {
       ...def, ...s,
-      personas: { ...def.personas, ...(s.personas || {}) },
+      personas,
       notif: { ...def.notif, ...(s.notif || {}) },
     };
   } catch { return def; }

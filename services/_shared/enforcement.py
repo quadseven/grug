@@ -141,16 +141,23 @@ def remove_enforcement(
 
     ruleset_id = get_enforcement_id(install_id, repo_id)
 
-    if ruleset_id is None:
+    # Collect every ruleset to delete. With a stored ID we trust it; without,
+    # we fall back to name-prefix matching - and must delete ALL matches, not
+    # just the first: during the nomenclature cutover a canonical "Grug - "
+    # and a legacy "Grug — " ruleset can coexist, and deleting only one
+    # would leave the other active + orphaned after the store is cleared.
+    to_delete: list = []
+    if ruleset_id is not None:
+        to_delete = [ruleset_id]
+    else:
         rulesets = list_rulesets(install_token, owner, repo)
-        for rs in rulesets:
-            if any(
-                rs.get("name", "").startswith(p) for p in GRUG_RULESET_PREFIXES
-            ):
-                ruleset_id = rs["id"]
-                break
+        to_delete = [
+            rs["id"]
+            for rs in rulesets
+            if any(rs.get("name", "").startswith(p) for p in GRUG_RULESET_PREFIXES)
+        ]
 
-    if ruleset_id is None:
+    if not to_delete:
         log.info(
             "enforcement_nothing_to_remove",
             extra={"owner": owner, "repo": repo,
@@ -158,7 +165,8 @@ def remove_enforcement(
         )
         return
 
-    delete_ruleset(install_token, owner, repo, ruleset_id)
+    for rid in to_delete:
+        delete_ruleset(install_token, owner, repo, rid)
     set_enforcement_id(install_id, repo_id, None)
 
     log.info(
@@ -166,7 +174,7 @@ def remove_enforcement(
         extra={
             "owner": owner, "repo": repo,
             "install_id": install_id, "repo_id": repo_id,
-            "ruleset_id": ruleset_id,
+            "ruleset_ids": to_delete,
         },
     )
     from observability import emit_enforcement_metric  # type: ignore

@@ -376,10 +376,20 @@ def detect_enforcement(
     Checks the Rulesets API first, then falls back to legacy branch
     protection. Returns ``"grug_managed"`` if a ruleset enforces the
     check AND either matches ``stored_ruleset_id`` (the ID Grug itself
-    created, tracked in the install store) or - when no ID is on file,
-    e.g. a repo Grug hasn't enrolled yet - falls back to the ``Grug —``
-    name-prefix heuristic. ``"external"`` if enforced by a non-Grug
-    mechanism, or ``"none"`` if not enforced at all.
+    created, tracked in the install store) or matches the ``Grug -`` /
+    ``Grug —`` name-prefix heuristic. ``"external"`` if enforced by a
+    non-Grug mechanism, or ``"none"`` if not enforced at all.
+
+    The prefix heuristic is consulted for any check-enforcing ruleset
+    the stored ID did not already claim - NOT only when no ID is on
+    file. This is deliberate and load-bearing: the branch is reached
+    only after ``_check_name_in_ruleset`` confirms the ruleset actually
+    enforces ``check_name``, so a Grug-named ruleset that enforces the
+    check IS grug-managed even when the stored ID is stale (deleted or
+    pointing at a different ruleset). Gating the heuristic on
+    ``stored_ruleset_id is None`` would misclassify that live ruleset as
+    ``external`` and make ``ensure_enforcement`` try to create a second
+    one - a guaranteed 422 "Name must be unique" collision.
 
     The ID check is load-bearing, not cosmetic: a rename, a manual
     rename of the ruleset itself, or any other drift between the
