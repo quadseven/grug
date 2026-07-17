@@ -97,9 +97,15 @@ def test_create_ruleset_401_propagates(mock_transport_client):
 
 # --- update_ruleset --------------------------------------------------------
 
+_ONE_CHECK_RULE = [{
+    "type": "required_status_checks",
+    "parameters": {"required_status_checks": [{"context": "Grug - Chief"}]},
+}]
+
+
 def test_update_ruleset_url_and_auth():
     with patch("httpx.put", return_value=_ok_response({"id": 555}, 200)) as mock_put:
-        out = update_ruleset("tok-3", "myorg", "myrepo", 555, ["Grug - Chief"])
+        out = update_ruleset("tok-3", "myorg", "myrepo", 555, _ONE_CHECK_RULE)
 
     mock_put.assert_called_once()
     args, kwargs = mock_put.call_args
@@ -113,37 +119,35 @@ def test_update_ruleset_url_and_auth():
 
 def test_update_ruleset_body_shape():
     with patch("httpx.put", return_value=_ok_response({"id": 1}, 200)) as mock_put:
-        update_ruleset("tok", "o", "r", 1, ["Grug - Chief"])
+        update_ruleset("tok", "o", "r", 1, _ONE_CHECK_RULE)
 
     body = mock_put.call_args.kwargs["json"]
-    rules = body["rules"]
-    assert len(rules) == 1
-    assert rules[0]["type"] == "required_status_checks"
-    checks = rules[0]["parameters"]["required_status_checks"]
-    assert len(checks) == 1
-    assert checks[0]["context"] == "Grug - Chief"
-    assert "integration_id" not in checks[0]
-    # update body has no name/target/enforcement/conditions - only the rule change
-    assert "name" not in body
-    assert "conditions" not in body
+    # body sends exactly the rules array the caller passed - no synthesis,
+    # no other top-level fields added or dropped by this client.
+    assert body == {"rules": _ONE_CHECK_RULE}
 
 
-def test_update_ruleset_multiple_contexts():
+def test_update_ruleset_preserves_unrelated_rules_verbatim():
+    """CodeRabbit #685: update_ruleset must not synthesize a body from only
+    the required_status_checks rule - it sends back whatever `rules` the
+    caller passes, including any other rule types untouched."""
+    rules = [
+        {"type": "deletion"},
+        {"type": "required_status_checks", "parameters": {"required_status_checks": [{"context": "x"}]}},
+        {"type": "non_fast_forward"},
+    ]
     with patch("httpx.put", return_value=_ok_response({"id": 2}, 200)) as mock_put:
-        update_ruleset("tok", "o", "r", 2, ["check-a", "check-b"])
+        update_ruleset("tok", "o", "r", 2, rules)
 
     body = mock_put.call_args.kwargs["json"]
-    checks = body["rules"][0]["parameters"]["required_status_checks"]
-    assert len(checks) == 2
-    assert checks[0]["context"] == "check-a"
-    assert checks[1]["context"] == "check-b"
+    assert body == {"rules": rules}
 
 
 def test_update_ruleset_401_propagates(mock_transport_client):
     client = mock_transport_client(status_codes=[401])
     with patch("httpx.put", side_effect=lambda *a, **kw: client.put(*a, **kw)):
         with pytest.raises(httpx.HTTPStatusError) as exc:
-            update_ruleset("stale", "o", "r", 1, ["ctx"])
+            update_ruleset("stale", "o", "r", 1, _ONE_CHECK_RULE)
     assert exc.value.response.status_code == 401
 
 

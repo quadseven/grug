@@ -217,29 +217,26 @@ def update_ruleset(
     owner: str,
     repo: str,
     ruleset_id: int,
-    status_check_contexts: list[str],
+    rules: list[dict],
 ) -> dict:
-    """Replace an existing ruleset's required_status_checks contexts.
+    """Replace an existing ruleset's rules array.
 
     Used to heal a Grug-managed ruleset that still names a stale check
     title (e.g. a pre-rename em-dash alias) after the canonical check
     name changes - without this, an already-enrolled repo's required
     check is silently pinned to a title Grug no longer posts as primary.
+
+    Takes the FULL `rules` array (every rule the ruleset has, with only the
+    specific rule/contexts the caller means to change actually modified),
+    not a synthesized required_status_checks-only list (CodeRabbit #685):
+    PUT /rulesets/{id} is not documented as a partial-update endpoint, and
+    a body built from only the one rule type this client cares about risks
+    silently dropping any OTHER rule (deletion protection, non-fast-forward,
+    etc.) an admin added to the same ruleset. The caller is responsible for
+    fetching the current ruleset (get_ruleset) and passing back its `rules`
+    with the minimal targeted edit applied.
     """
-    body = {
-        "rules": [
-            {
-                "type": "required_status_checks",
-                "parameters": {
-                    "strict_required_status_checks_policy": False,
-                    "required_status_checks": [
-                        {"context": ctx}
-                        for ctx in status_check_contexts
-                    ],
-                },
-            },
-        ],
-    }
+    body = {"rules": rules}
     resp = httpx.put(
         f"{_GH_API}/repos/{quote(owner, safe='')}/{quote(repo, safe='')}/rulesets/{ruleset_id}",
         json=body,

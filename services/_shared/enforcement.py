@@ -57,23 +57,40 @@ def migrate_check_context(
 
     Rewrites ONLY known legacy aliases of the Chief check to the canonical
     name; every other required context is preserved unchanged (Qodo on
-    #685: an earlier version replaced the whole list with a Chief-only
-    singleton, which would have silently dropped any other required check
-    a ruleset carries). Also dedupes so a ruleset that somehow ended up
-    with both the canonical name and a stale alias collapses to one entry.
+    #685: an earlier version replaced the whole checks list with a
+    Chief-only singleton, which would have silently dropped any other
+    required check a ruleset carries). Also dedupes so a ruleset that
+    somehow ended up with both the canonical name and a stale alias
+    collapses to one entry.
+
+    Sends update_ruleset the ruleset's FULL `rules` array with only the
+    matching required_status_checks rule's contexts changed - every other
+    rule (and that rule's other parameters, e.g.
+    strict_required_status_checks_policy) passes through byte-for-byte
+    (CodeRabbit #685: PUT /rulesets/{id} is not a documented partial-update
+    endpoint, so a body built from a synthesized single rule risks
+    silently dropping any OTHER rule type an admin added to the same
+    ruleset). Rebuilt required_status_checks entries omit integration_id
+    (matches create_ruleset's own guard - GitHub 422s on
+    integration_id: null).
     """
     from personas.tribe import primary_check_name
 
     ruleset = get_ruleset(install_token, owner, repo, ruleset_id)
-    for rule in ruleset.get("rules", []):
-        if rule.get("type") != "required_status_checks":
+    rules = ruleset.get("rules", [])
+    new_rules: list[dict] = []
+    changed = False
+    for rule in rules:
+        if changed or rule.get("type") != "required_status_checks":
+            new_rules.append(rule)
             continue
         old_contexts = [
             c.get("context")
             for c in rule.get("parameters", {}).get("required_status_checks", [])
         ]
         if not old_contexts:
-            return False
+            new_rules.append(rule)
+            continue
         new_contexts: list[str] = []
         seen: set[str] = set()
         for ctx in old_contexts:
@@ -82,10 +99,20 @@ def migrate_check_context(
                 seen.add(canonical)
                 new_contexts.append(canonical)
         if new_contexts == old_contexts:
-            return False
-        update_ruleset(install_token, owner, repo, ruleset_id, new_contexts)
-        return True
-    return False
+            new_rules.append(rule)
+            continue
+        changed = True
+        new_rules.append({
+            **rule,
+            "parameters": {
+                **rule.get("parameters", {}),
+                "required_status_checks": [{"context": ctx} for ctx in new_contexts],
+            },
+        })
+    if not changed:
+        return False
+    update_ruleset(install_token, owner, repo, ruleset_id, new_rules)
+    return True
 
 
 def ensure_enforcement(

@@ -159,7 +159,10 @@ def test_migrate_check_context_updates_stale_legacy_context():
         changed = migrate_check_context("tok", "o", "r", 555)
 
     assert changed is True
-    mock_update.assert_called_once_with("tok", "o", "r", 555, [GRUG_DOR_CHECK_NAME])
+    mock_update.assert_called_once_with("tok", "o", "r", 555, [{
+        "type": "required_status_checks",
+        "parameters": {"required_status_checks": [{"context": GRUG_DOR_CHECK_NAME}]},
+    }])
 
 
 def test_migrate_check_context_noop_when_already_canonical():
@@ -192,8 +195,8 @@ def test_migrate_check_context_noop_when_no_required_status_checks_rule():
 
 
 def test_migrate_check_context_preserves_other_required_contexts():
-    """Qodo on #685: an earlier version replaced the WHOLE list with just
-    the canonical Chief check, which would silently drop any other
+    """Qodo on #685: an earlier version replaced the WHOLE checks list with
+    just the canonical Chief check, which would silently drop any other
     required context a ruleset carries. Only the stale alias is rewritten;
     unrelated contexts pass through untouched, in their original order."""
     from enforcement import migrate_check_context
@@ -211,9 +214,13 @@ def test_migrate_check_context_preserves_other_required_contexts():
         changed = migrate_check_context("tok", "o", "r", 555)
 
     assert changed is True
-    mock_update.assert_called_once_with(
-        "tok", "o", "r", 555, ["some-other-required-check", GRUG_DOR_CHECK_NAME],
-    )
+    mock_update.assert_called_once_with("tok", "o", "r", 555, [{
+        "type": "required_status_checks",
+        "parameters": {"required_status_checks": [
+            {"context": "some-other-required-check"},
+            {"context": GRUG_DOR_CHECK_NAME},
+        ]},
+    }])
 
 
 def test_migrate_check_context_dedupes_canonical_and_stale_alias():
@@ -235,7 +242,82 @@ def test_migrate_check_context_dedupes_canonical_and_stale_alias():
         changed = migrate_check_context("tok", "o", "r", 555)
 
     assert changed is True
-    mock_update.assert_called_once_with("tok", "o", "r", 555, [GRUG_DOR_CHECK_NAME])
+    mock_update.assert_called_once_with("tok", "o", "r", 555, [{
+        "type": "required_status_checks",
+        "parameters": {"required_status_checks": [{"context": GRUG_DOR_CHECK_NAME}]},
+    }])
+
+
+def test_migrate_check_context_preserves_unrelated_rule_types():
+    """CodeRabbit #685: the fix must not synthesize a body from only the
+    required_status_checks rule - other rule types on the SAME ruleset
+    (deletion protection, non-fast-forward, whatever an admin added) must
+    pass through byte-for-byte, in their original position."""
+    from enforcement import migrate_check_context
+    deletion_rule = {"type": "deletion"}
+    nff_rule = {"type": "non_fast_forward"}
+    ruleset = {
+        "rules": [
+            deletion_rule,
+            {
+                "type": "required_status_checks",
+                "parameters": {"required_status_checks": [{"context": "Grug — Definition of Ready"}]},
+            },
+            nff_rule,
+        ],
+    }
+    with patch("enforcement.get_ruleset", return_value=ruleset), \
+         patch("enforcement.update_ruleset") as mock_update:
+        changed = migrate_check_context("tok", "o", "r", 555)
+
+    assert changed is True
+    new_rules = mock_update.call_args.args[4]
+    assert new_rules[0] is deletion_rule
+    assert new_rules[2] is nff_rule
+    assert new_rules[1]["parameters"]["required_status_checks"] == [{"context": GRUG_DOR_CHECK_NAME}]
+
+
+def test_migrate_check_context_preserves_other_rule_parameters():
+    """The required_status_checks rule's OTHER parameters (e.g.
+    strict_required_status_checks_policy) survive the heal untouched -
+    only required_status_checks itself is rewritten."""
+    from enforcement import migrate_check_context
+    ruleset = {
+        "rules": [{
+            "type": "required_status_checks",
+            "parameters": {
+                "strict_required_status_checks_policy": True,
+                "required_status_checks": [{"context": "Grug — Definition of Ready"}],
+            },
+        }],
+    }
+    with patch("enforcement.get_ruleset", return_value=ruleset), \
+         patch("enforcement.update_ruleset") as mock_update:
+        migrate_check_context("tok", "o", "r", 555)
+
+    new_rules = mock_update.call_args.args[4]
+    assert new_rules[0]["parameters"]["strict_required_status_checks_policy"] is True
+
+
+def test_migrate_check_context_rebuilt_entries_omit_integration_id():
+    """create_ruleset's own guard: GitHub 422s on integration_id: null.
+    A rebuilt required_status_checks entry must never carry it, even if
+    the fetched ruleset's original entry had integration_id: null."""
+    from enforcement import migrate_check_context
+    ruleset = {
+        "rules": [{
+            "type": "required_status_checks",
+            "parameters": {"required_status_checks": [
+                {"context": "Grug — Definition of Ready", "integration_id": None},
+            ]},
+        }],
+    }
+    with patch("enforcement.get_ruleset", return_value=ruleset), \
+         patch("enforcement.update_ruleset") as mock_update:
+        migrate_check_context("tok", "o", "r", 555)
+
+    new_rules = mock_update.call_args.args[4]
+    assert new_rules[0]["parameters"]["required_status_checks"] == [{"context": GRUG_DOR_CHECK_NAME}]
 
 
 # --- remove_enforcement -----------------------------------------------
