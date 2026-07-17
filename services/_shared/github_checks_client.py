@@ -6,11 +6,14 @@ fetched per-installation via github_app_auth.
 
 from __future__ import annotations
 
+import logging
 from dataclasses import dataclass
 from typing import Literal
 from urllib.parse import quote
 
 import httpx
+
+log = logging.getLogger("grug.checks_client")
 
 _GH_API = "https://api.github.com"
 
@@ -124,7 +127,11 @@ def post_check_run(
             # Soft-fail alias: do not raise on 4xx/5xx for the mirror.
             if alias_resp.status_code >= 400:
                 continue
-    except Exception:  # noqa: BLE001 - cutover insurance never blocks primary
-        pass
+    except Exception as e:  # noqa: BLE001 - cutover insurance never blocks primary
+        # Named so a broken alias mirror is visible in logs, not silent.
+        log.warning(
+            "check_run_alias_mirror_failed",
+            extra={"kind": type(e).__name__, "check": result.name},
+        )
 
     return primary

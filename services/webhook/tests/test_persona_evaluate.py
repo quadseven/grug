@@ -165,8 +165,8 @@ def test_evaluate_mixed_advisory_and_blocking_failure():
 def test_summary_advisory_check_renders_warning_icon():
     """Advisory checks that fail should render warn not fail in the summary."""
     results = [
-        CheckResult("why", True, "ok"),
-        CheckResult("issue-link", False, "no link"),
+        CheckResult("why", passed=True, detail="ok"),
+        CheckResult("issue-link", passed=False, detail="no link"),
     ]
     title, summary = persona._summary(results)
     assert "Hunt Plan ready" in title or "Chief pass" in title

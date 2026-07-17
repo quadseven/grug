@@ -119,6 +119,23 @@ def test_remove_falls_back_to_list_when_no_stored_id():
     mock_set.assert_called_once_with(1, 2, None)
 
 
+def test_remove_fallback_still_finds_legacy_emdash_prefix():
+    """Cutover: existing 'Grug \u2014 ...' rulesets must stay deletable via
+    the prefix fallback - both prefixes remain supported."""
+    rulesets = [
+        {"id": 77, "name": "Grug \u2014 Chief Enforcement"},
+        {"id": 50, "name": "CI Required"},
+    ]
+    with patch("adapters.install_store.get_enforcement_id", return_value=None), \
+         patch("enforcement.list_rulesets", return_value=rulesets), \
+         patch("enforcement.delete_ruleset") as mock_del, \
+         patch("adapters.install_store.set_enforcement_id") as mock_set:
+        remove_enforcement("tok", "o", "r", 1, 2)
+
+    mock_del.assert_called_once_with("tok", "o", "r", 77)
+    mock_set.assert_called_once_with(1, 2, None)
+
+
 def test_remove_noop_when_nothing_exists():
     """No stored ID, no Grug-prefixed rulesets → nothing to do."""
     with patch("adapters.install_store.get_enforcement_id", return_value=None), \

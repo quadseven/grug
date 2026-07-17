@@ -912,12 +912,16 @@ def test_elder_check_already_terminal_treats_any_completed_conclusion(monkeypatc
 
 def test_elder_check_already_terminal_accepts_legacy_alias(monkeypatch):
     """Cutover: a completed legacy 'Grug - Code Review' still blocks re-post."""
-    def fake_get(url, **kwargs):
+    seen_params: list[dict] = []
+
+    def fake_get(_url: str, **kwargs: object) -> object:
+        seen_params.append(dict(kwargs.get("params") or {}))  # type: ignore[call-overload]
+
         class Resp:
-            def raise_for_status(self):
+            def raise_for_status(self) -> None:
                 return None
 
-            def json(self):
+            def json(self) -> dict:
                 return {
                     "check_runs": [
                         {
@@ -935,3 +939,7 @@ def test_elder_check_already_terminal_accepts_legacy_alias(monkeypatch):
         install_id=1, owner="o", repo_name="r", head_sha="h" * 40,
     )
     assert reason == "already_completed_success"
+    # Guard the cutover contract server-side too: a check_name param would
+    # make GitHub filter OUT the legacy alias run and this test would pass
+    # for the wrong reason.
+    assert seen_params and "check_name" not in seen_params[0]

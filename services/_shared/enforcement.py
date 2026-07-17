@@ -12,7 +12,7 @@ from typing import Any
 
 from github_rulesets_client import (
     EnforcementState,
-    GRUG_RULESET_PREFIX,
+    GRUG_RULESET_PREFIXES,
     create_ruleset,
     delete_ruleset,
     detect_enforcement,
@@ -144,7 +144,9 @@ def remove_enforcement(
     if ruleset_id is None:
         rulesets = list_rulesets(install_token, owner, repo)
         for rs in rulesets:
-            if rs.get("name", "").startswith(GRUG_RULESET_PREFIX):
+            if any(
+                rs.get("name", "").startswith(p) for p in GRUG_RULESET_PREFIXES
+            ):
                 ruleset_id = rs["id"]
                 break
 

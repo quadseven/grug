@@ -41,14 +41,18 @@ const PANELS: { id: Panel; idx: string; label: string; badge?: string }[] = [
   { id: "activity", idx: "07", label: "Activity" },
 ];
 
+// `modes`: which of BLOCK/WARN/OFF the backend can actually honor for this
+// persona. Comment-only or scheduled personas (no merge-gating check-run)
+// list none and render an informational chip instead of the segmented
+// control, so users can never select a mode the backend ignores.
 const PERSONAS = [
-  { id: "smasher", code: "F-01", name: "Smasher", img: "grug_smasher.png", desc: "Hunt bugs that hide. Mutate markings, run the tribe's own tests, name what still lives.", meta: ["mutation trial", "diff-scoped"] },
-  { id: "guard", code: "F-02", name: "Guard", img: "grug_guard.png", desc: "Watch the cave mouth. Secrets, sick deps, weak IaC, SAST. Evil shall not pass.", meta: ["SCA + secrets", "SAST on diff"] },
-  { id: "elder", code: "F-03", name: "Elder", img: "grug_elder.png", desc: "Read markings one line at a time. Name the bad omen before it bite. Lore + Omen fused.", meta: ["Cave review", "Markings Board"] },
-  { id: "chief", code: "F-04", name: "Chief", img: "grug_chief.png", desc: "Before the hunt, Chief ask: plan have name? meat counted? path home known?", meta: ["plan checks", "strict mode"] },
-  { id: "teller", code: "F-05", name: "Teller", img: "grug_smile.png", desc: "Tell the tale of the hunt before Elder judge. Walkthrough, map, effort chip.", meta: ["walkthrough", "mermaid"] },
-  { id: "warder", code: "F-06", name: "Warder", img: "grug_mystic.png", desc: "Shaman at the gate. Changelog scroll, semver hint, ward bad release from tribe.", meta: ["beta", "release scroll"] },
-  { id: "pulse", code: "F-07", name: "Pulse", img: "grug_mullet.png", desc: "Walk the camp at night. Poke sleeping hunts Chief already blessed.", meta: ["stale nudge", "scheduled"] },
+  { id: "smasher", code: "F-01", name: "Smasher", img: "grug_smasher.png", desc: "Hunt bugs that hide. Mutate markings, run the tribe's own tests, name what still lives.", meta: ["mutation trial", "diff-scoped"], modes: ["warn", "off"] },
+  { id: "guard", code: "F-02", name: "Guard", img: "grug_guard.png", desc: "Watch the cave mouth. Secrets, sick deps, weak IaC, SAST. Evil shall not pass.", meta: ["SCA + secrets", "SAST on diff"], modes: ["block", "warn", "off"] },
+  { id: "elder", code: "F-03", name: "Elder", img: "grug_elder.png", desc: "Read markings one line at a time. Name the bad omen before it bite. Lore + Omen fused.", meta: ["Cave review", "Markings Board"], modes: ["block", "warn", "off"] },
+  { id: "chief", code: "F-04", name: "Chief", img: "grug_chief.png", desc: "Before the hunt, Chief ask: plan have name? meat counted? path home known?", meta: ["plan checks", "strict mode"], modes: ["block", "warn", "off"] },
+  { id: "teller", code: "F-05", name: "Teller", img: "grug_smile.png", desc: "Tell the tale of the hunt before Elder judge. Walkthrough, map, effort chip.", meta: ["walkthrough", "mermaid"], modes: [], info: "comment-only" },
+  { id: "warder", code: "F-06", name: "Warder", img: "grug_mystic.png", desc: "Shaman at the gate. Changelog scroll, semver hint, ward bad release from tribe.", meta: ["beta", "release scroll"], modes: ["warn", "off"] },
+  { id: "pulse", code: "F-07", name: "Pulse", img: "grug_mullet.png", desc: "Walk the camp at night. Poke sleeping hunts Chief already blessed.", meta: ["stale nudge", "scheduled"], modes: [], info: "scheduled" },
 ] as const;
 
 const SKINS = [
@@ -361,11 +365,15 @@ function PersonasPanel({ show, modes, setMode }: { show: boolean; modes: Record<
                   <div className="meta">{p.meta.map((m) => <span key={m}>{m}</span>)}</div>
                 </div>
                 <div className="ctrl">
-                  <div className="seg">
-                    {(["block", "warn", "off"] as PMode[]).map((v) => (
-                      <button key={v} data-v={v} className={mode === v ? "on" : ""} onClick={() => setMode(p.id, v)}>{v.toUpperCase()}</button>
-                    ))}
-                  </div>
+                  {p.modes.length > 0 ? (
+                    <div className="seg">
+                      {(p.modes as readonly PMode[]).map((v) => (
+                        <button key={v} data-v={v} className={mode === v ? "on" : ""} onClick={() => setMode(p.id, v)}>{v.toUpperCase()}</button>
+                      ))}
+                    </div>
+                  ) : (
+                    <span className="state paused" title="No merge-gating check-run for this persona - it is informational by design.">{"info" in p ? p.info : "advisory"}</span>
+                  )}
                 </div>
               </div>
             );

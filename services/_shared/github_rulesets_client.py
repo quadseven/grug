@@ -410,13 +410,10 @@ def detect_enforcement(
         if stored_ruleset_id is not None and rs.get("id") == stored_ruleset_id:
             grug_match = True
             break
-        elif any(rs.get("name", "").startswith(p) for p in (
-            GRUG_RULESET_PREFIX, "Grug " + chr(0x2014) + " ",
-        )):
+        if any(rs.get("name", "").startswith(p) for p in GRUG_RULESET_PREFIXES):
             grug_match = True
             break
-        else:
-            external_match = True
+        external_match = True
 
     if grug_match:
         return "grug_managed"
