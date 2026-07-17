@@ -223,7 +223,7 @@ def update_ruleset(
 
     Used to heal a Grug-managed ruleset that still names a stale check
     title (e.g. a pre-rename em-dash alias) after the canonical check
-    name changes — without this, an already-enrolled repo's required
+    name changes - without this, an already-enrolled repo's required
     check is silently pinned to a title Grug no longer posts as primary.
     """
     body = {

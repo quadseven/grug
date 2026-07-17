@@ -54,18 +54,36 @@ def migrate_check_context(
     for the earliest em-dash titles, to a non-ASCII check name visible in
     the GitHub UI). Returns True if the ruleset was updated, False if it
     already names the canonical check.
+
+    Rewrites ONLY known legacy aliases of the Chief check to the canonical
+    name; every other required context is preserved unchanged (Qodo on
+    #685: an earlier version replaced the whole list with a Chief-only
+    singleton, which would have silently dropped any other required check
+    a ruleset carries). Also dedupes so a ruleset that somehow ended up
+    with both the canonical name and a stale alias collapses to one entry.
     """
+    from personas.tribe import primary_check_name
+
     ruleset = get_ruleset(install_token, owner, repo, ruleset_id)
     for rule in ruleset.get("rules", []):
         if rule.get("type") != "required_status_checks":
             continue
-        contexts = [
+        old_contexts = [
             c.get("context")
             for c in rule.get("parameters", {}).get("required_status_checks", [])
         ]
-        if not contexts or GRUG_DOR_CHECK_NAME in contexts:
+        if not old_contexts:
             return False
-        update_ruleset(install_token, owner, repo, ruleset_id, [GRUG_DOR_CHECK_NAME])
+        new_contexts: list[str] = []
+        seen: set[str] = set()
+        for ctx in old_contexts:
+            canonical = primary_check_name(ctx)
+            if canonical not in seen:
+                seen.add(canonical)
+                new_contexts.append(canonical)
+        if new_contexts == old_contexts:
+            return False
+        update_ruleset(install_token, owner, repo, ruleset_id, new_contexts)
         return True
     return False
 
@@ -83,13 +101,14 @@ def ensure_enforcement(
     Returns the resulting enforcement state after the operation.
     """
     from adapters.install_store import get_enforcement_id  # type: ignore
+    stored_ruleset_id = get_enforcement_id(install_id, repo_id)
     state = detect_enforcement(
         install_token, owner, repo, default_branch, GRUG_DOR_CHECK_NAME,
-        stored_ruleset_id=get_enforcement_id(install_id, repo_id),
+        stored_ruleset_id=stored_ruleset_id,
     )
     if state != "none":
         if state == "grug_managed":
-            ruleset_id = get_enforcement_id(install_id, repo_id)
+            ruleset_id = stored_ruleset_id
             if ruleset_id is not None:
                 try:
                     if migrate_check_context(install_token, owner, repo, ruleset_id):

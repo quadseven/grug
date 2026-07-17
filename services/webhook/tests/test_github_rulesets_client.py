@@ -95,7 +95,7 @@ def test_create_ruleset_401_propagates(mock_transport_client):
     assert exc.value.response.status_code == 401
 
 
-# ── update_ruleset ───────────────────────────────────────────────────
+# --- update_ruleset --------------------------------------------------------
 
 def test_update_ruleset_url_and_auth():
     with patch("httpx.put", return_value=_ok_response({"id": 555}, 200)) as mock_put:

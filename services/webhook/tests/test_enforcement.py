@@ -94,7 +94,7 @@ def test_ensure_passes_stored_id_to_detect():
 
 
 def test_ensure_heals_stale_check_context_when_grug_managed():
-    """grug_managed + a stored ruleset ID → self-heal a stale check
+    """grug_managed + a stored ruleset ID -> self-heal a stale check
     context (e.g. a pre-rename em-dash title) via migrate_check_context."""
     with patch("enforcement.detect_enforcement", return_value="grug_managed"), \
          patch("adapters.install_store.get_enforcement_id", return_value=555), \
@@ -108,7 +108,7 @@ def test_ensure_heals_stale_check_context_when_grug_managed():
 
 
 def test_ensure_skips_heal_when_no_stored_ruleset_id():
-    """grug_managed but no stored ID (name-heuristic match only) →
+    """grug_managed but no stored ID (name-heuristic match only) ->
     nothing to heal, migrate_check_context is not even attempted."""
     with patch("enforcement.detect_enforcement", return_value="grug_managed"), \
          patch("adapters.install_store.get_enforcement_id", return_value=None), \
@@ -142,7 +142,7 @@ def test_ensure_external_state_never_attempts_heal():
     mock_migrate.assert_not_called()
 
 
-# ── migrate_check_context ───────────────────────────────────────────
+# --- migrate_check_context ------------------------------------------------
 
 def test_migrate_check_context_updates_stale_legacy_context():
     """A ruleset still requiring the pre-rename em-dash title gets PUT
@@ -163,7 +163,7 @@ def test_migrate_check_context_updates_stale_legacy_context():
 
 
 def test_migrate_check_context_noop_when_already_canonical():
-    """Already-canonical context → no PUT, returns False."""
+    """Already-canonical context -> no PUT, returns False."""
     from enforcement import migrate_check_context
     canonical_ruleset = {
         "rules": [{
@@ -180,7 +180,7 @@ def test_migrate_check_context_noop_when_already_canonical():
 
 
 def test_migrate_check_context_noop_when_no_required_status_checks_rule():
-    """A ruleset with no required_status_checks rule at all → nothing to heal."""
+    """A ruleset with no required_status_checks rule at all -> nothing to heal."""
     from enforcement import migrate_check_context
     empty_ruleset = {"rules": [{"type": "creation"}]}
     with patch("enforcement.get_ruleset", return_value=empty_ruleset), \
@@ -191,7 +191,54 @@ def test_migrate_check_context_noop_when_no_required_status_checks_rule():
     mock_update.assert_not_called()
 
 
-# ── remove_enforcement ───────────────────────────────────────────────
+def test_migrate_check_context_preserves_other_required_contexts():
+    """Qodo on #685: an earlier version replaced the WHOLE list with just
+    the canonical Chief check, which would silently drop any other
+    required context a ruleset carries. Only the stale alias is rewritten;
+    unrelated contexts pass through untouched, in their original order."""
+    from enforcement import migrate_check_context
+    ruleset = {
+        "rules": [{
+            "type": "required_status_checks",
+            "parameters": {"required_status_checks": [
+                {"context": "some-other-required-check"},
+                {"context": "Grug — Definition of Ready"},
+            ]},
+        }],
+    }
+    with patch("enforcement.get_ruleset", return_value=ruleset), \
+         patch("enforcement.update_ruleset") as mock_update:
+        changed = migrate_check_context("tok", "o", "r", 555)
+
+    assert changed is True
+    mock_update.assert_called_once_with(
+        "tok", "o", "r", 555, ["some-other-required-check", GRUG_DOR_CHECK_NAME],
+    )
+
+
+def test_migrate_check_context_dedupes_canonical_and_stale_alias():
+    """A ruleset that somehow ended up requiring BOTH the canonical name
+    and a stale alias for the same check (the duplicated-checks-UI
+    symptom) collapses to one entry."""
+    from enforcement import migrate_check_context
+    ruleset = {
+        "rules": [{
+            "type": "required_status_checks",
+            "parameters": {"required_status_checks": [
+                {"context": GRUG_DOR_CHECK_NAME},
+                {"context": "Grug — Definition of Ready"},
+            ]},
+        }],
+    }
+    with patch("enforcement.get_ruleset", return_value=ruleset), \
+         patch("enforcement.update_ruleset") as mock_update:
+        changed = migrate_check_context("tok", "o", "r", 555)
+
+    assert changed is True
+    mock_update.assert_called_once_with("tok", "o", "r", 555, [GRUG_DOR_CHECK_NAME])
+
+
+# --- remove_enforcement -----------------------------------------------
 
 def test_remove_deletes_by_stored_id():
     """Stored ruleset_id → delete it (plus any exact-name matches; none here)."""
