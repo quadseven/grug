@@ -463,6 +463,27 @@ RULES: tuple[ReviewRule, ...] = (
         "distinct lock (or make self._lock a reentrant RLock)\n        ...",
         severity="high",
     ),
+    # ── docs/code claim drift (Qodo/CR class on #664: settle comment vs min) ──
+    ReviewRule(
+        name="doc-code-claim-drift",
+        bug_class="correctness",
+        description="A comment, k8s/env annotation, ADR, or README asserts a "
+        "NUMERIC or BOUND policy that the code does not implement: settle/"
+        "quiet-window seconds (e.g. 'caps medium at 5s' while code is "
+        "`min(base, 3)`), threshold comparisons (comment says `>= N` / "
+        "inclusive while code uses exclusive `>`), timeout budgets, sample "
+        "rates, or default env values restated wrong in prose. Flag when the "
+        "ADDED or nearby comment claims a concrete number/bound AND the "
+        "implementation (same file or visible policy helper) uses a different "
+        "one. Do NOT flag aspirational docs that do not claim current behavior, "
+        "or comments that correctly describe a DIFFERENT knob (base settle vs "
+        "medium cap). Anchor on the claim line.",
+        bad_example="# caps medium (Steady) at 5s\n"
+        "return min(base, 3)  # comment still says 5",
+        good_example="# caps medium (Steady) at 3s\n"
+        "return min(base, 3)",
+        severity="medium",
+    ),
 )
 
 

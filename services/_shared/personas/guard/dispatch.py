@@ -57,34 +57,33 @@ _CHECK_NAME = "Grug — Guard"
 
 def _summary_markdown(evaluation: CodeReviewEvaluation) -> tuple[str, str]:
     """Guard-voice (title, summary) for the check-run output."""
+    # Same closed caveman chip alphabet as Elder Markings (CR-dense scan).
+    from personas.code_reviewer.dispatch import _severity_chip
+
     if evaluation.degraded_reason:
-        title = f"⚠️ Guard eyes clouded ({evaluation.degraded_reason})"
+        title = f"👁 Guard eyes clouded ({evaluation.degraded_reason})"
         return title, (
             "Grug Guard could not watch the pass this time. The mist: "
-            f"`{evaluation.degraded_reason}`. This only counsel — merge "
+            f"`{evaluation.degraded_reason}`. This only counsel - merge "
             "not blocked."
         )
     if not evaluation.findings:
-        title = "✅ Guard find no evil"
+        title = "🪨 Guard find no evil"
         return title, (
             "Grug Guard watch the diff for leaked secrets, weak code, sick "
             "dependencies, and open doors. Nothing evil pass. Guard nod."
         )
-    severity_icon = {
-        "critical": "🛑", "high": "❌", "medium": "⚠️", "low": "ℹ️",
-    }
     blocking = sum(
         1 for f in evaluation.findings if f.severity in ("high", "critical")
     )
     title = (
-        f"❌ Guard see evil — {blocking} blocking · "
+        f"🔥 Guard see evil - {blocking} blocking / "
         f"{len(evaluation.findings)} finding(s) in all"
     )
     rows = ["| Severity | File | Line | Rule | Message |", "|---|---|---|---|---|"]
     for f in evaluation.findings:
-        icon = severity_icon.get(f.severity, "•")
         rows.append(
-            f"| {icon} {f.severity} | `{f.file}` | {f.line} | "
+            f"| {_severity_chip(f.severity)} | `{f.file}` | {f.line} | "
             f"`{f.rule_name}` | {f.message} |"
         )
     return title, "\n".join(rows)

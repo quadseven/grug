@@ -95,7 +95,7 @@ spec:
             # needs to cover GitHub's normal read-after-write lag before the
             # very first check.
             - {name: GRUG_ELDER_DURABLE_QUEUE, value: "1"}
-            # Base settle; Swift Hunt still zeros tiny PRs and caps medium at 5s.
+            # Base settle; Swift Hunt zeros tiny PRs and caps medium (Steady) at 3s.
             - {name: GRUG_ELDER_SETTLE_SECONDS, value: "5"}
             # Keep review configuration on both Elder-capable workloads. The
             # Opus override is review-only; judge, Teller, and /grug ask retain

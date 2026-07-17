@@ -57,6 +57,10 @@ from personas.code_reviewer.diff_parser import (
 from personas.code_reviewer.precedent import (
     class_precision, match_precedent, render_precedent_note,
 )
+from personas.code_reviewer.claim_check import (
+    filter_novel_claim_findings,
+    scan_claim_checks,
+)
 from personas.code_reviewer.complexity import scan_complexity
 from personas.code_reviewer.cross_file import (
     extract_symbols, fetch_cross_file_context,
@@ -335,6 +339,63 @@ def _fetch_file_contents(
     return contents
 
 
+# When a PR only retouches k8s/docs comments about settle/deep policy, the
+# implementation source of truth may not be in `changed_paths`. Pull these
+# known helpers (best-effort) so the claim-check detector can still compare
+# numbers. Harmless no-ops on foreign repos (404 -> skip).
+_CLAIM_CHECK_POLICY_PATHS: tuple[str, ...] = (
+    "services/_shared/personas/code_reviewer/snapshot.py",
+    "services/_shared/llm_client.py",
+)
+_CLAIM_HINT_RE = re.compile(
+    r"(?i)(?:settle|steady\s+hunt|swift\s+hunt|deep[_\s-]?diff|"
+    r"GRUG_DEEP_DIFF|GRUG_ELDER_SETTLE|min\(\s*base)",
+)
+
+
+def _enrich_claim_check_sources(
+    installation_id: int,
+    owner: str,
+    repo_name: str,
+    head_sha: str,
+    file_contents: dict[str, str],
+    hunks: tuple[DiffHunk, ...],
+) -> dict[str, str]:
+    """Return file_contents plus policy sources needed for claim checks.
+
+    Only fetches when the diff shows claim-ish language and a known policy
+    path is missing. Fail-open: any fetch error returns the original map.
+    """
+    if not any(
+        _CLAIM_HINT_RE.search(raw)
+        for h in hunks
+        for raw in h.body.splitlines()
+        if raw.startswith("+")
+    ):
+        return file_contents
+    missing = tuple(p for p in _CLAIM_CHECK_POLICY_PATHS if p not in file_contents)
+    if not missing:
+        return file_contents
+    try:
+        extra = with_install_token_retry(
+            installation_id,
+            lambda token: _fetch_file_contents(
+                token, owner, repo_name, missing, head_sha,
+            ),
+        )
+    except (httpx.HTTPStatusError, httpx.RequestError) as e:
+        log.info(
+            "code_review_claim_check_sources_unavailable",
+            extra={"pr": f"{owner}/{repo_name}", "error": str(e)},
+        )
+        return file_contents
+    if not extra:
+        return file_contents
+    merged = dict(file_contents)
+    merged.update(extra)
+    return merged
+
+
 def _fetch_pr_review_comments(
     install_token: str, owner: str, repo: str, pull_number: int,
 ) -> list[dict]:
@@ -492,9 +553,6 @@ def _summary_markdown(
             )
         return hunt_title(title), ("## Markings Board\n\n" + scope) + held + hunt
 
-    severity_icon = {
-        "critical": "critical", "high": "high", "medium": "medium", "low": "low",
-    }
     blocking = sum(
         1 for f in evaluation.findings if f.severity in ("high", "critical")
     )
@@ -508,13 +566,8 @@ def _summary_markdown(
         "|---|---|---|---|---|---|",
     ]
     for f in evaluation.findings:
-        effort = (
-            _EFFORT_LABELS.get(f.effort, "-")
-            if f.effort in _EFFORT_LABELS
-            else "-"
-        )
         rows.append(
-            f"| {severity_icon.get(f.severity, f.severity)} | {effort} | "
+            f"| {_severity_chip(f.severity)} | {_effort_chip(f.effort)} | "
             f"`{_md_code_span(f.file)}` | {f.line} | "
             f"`{_md_code_span(f.rule_name)}` | "
             f"{_md_table_cell(f.message)} |"
@@ -541,7 +594,11 @@ def _summary_markdown(
         f"{phase_line} "
         "Inline comments carry Fix + agent prompt on each marking.\n\n"
     )
-    return title, f"{legend}{table}{held}{hunt}\n\n{_consolidated_agent_prompt(evaluation)}"
+    summary = f"{legend}{table}{held}{hunt}"
+    agent = _consolidated_agent_prompt(evaluation)
+    if agent:
+        summary = f"{summary}\n\n{agent}"
+    return title, summary
 
 
 # GitHub caps check-run summaries at 65536 chars; the findings table is
@@ -553,7 +610,14 @@ _CONSOLIDATED_PROMPT_BUDGET = 8000
 def _consolidated_agent_prompt(evaluation: CodeReviewEvaluation) -> str:
     """One copy-paste prompt covering the findings (#553), deterministic
     and bounded. Truncates by whole findings and SAYS how many were cut -
-    a silently-partial prompt would read as the complete work list."""
+    a silently-partial prompt would read as the complete work list.
+
+    Returns empty string when there are no findings — never emit a hollow
+    "Address each finding below" shell with nothing under it.
+    """
+    if not evaluation.findings:
+        return ""
+
     header = [
         _AGENT_META_PREAMBLE,
         "",
@@ -567,7 +631,8 @@ def _consolidated_agent_prompt(evaluation: CodeReviewEvaluation) -> str:
         cat = _category_for_rule(f.rule_name)
         entry = (
             f"- {_md_code_span(f.file)}:{f.line} "
-            f"[{f.severity}/{cat}/{_md_code_span(f.rule_name)}] {f.message}"
+            f"[{_severity_chip(f.severity)} | {cat} | "
+            f"{_md_code_span(f.rule_name)}] {f.message}"
         )
         if f.suggestion:
             entry += f"\n  Suggested fix: {f.suggestion}"
@@ -596,6 +661,30 @@ def _consolidated_agent_prompt(evaluation: CodeReviewEvaluation) -> str:
 # Derived from the shared vocabulary so a new effort level can never
 # silently drop its chip (the Severity-partition-assert drift class).
 _EFFORT_LABELS = {e: e.replace("-", " ") for e in EFFORTS}
+
+# Closed caveman-inspired chrome chips (CodeRabbit-density scanability).
+# Identifiers and check *names* stay plain ASCII; Markings surface uses these.
+_SEVERITY_CHIP: dict[str, str] = {
+    "critical": "💀 critical",
+    "high": "🔥 high",
+    "medium": "🟠 medium",
+    "low": "👁 low",
+}
+_EFFORT_CHIP: dict[str, str] = {
+    "quick-win": "⚡ quick win",
+    "heavy-lift": "🪨 heavy lift",
+}
+
+
+def _severity_chip(severity: str) -> str:
+    return _SEVERITY_CHIP.get(severity, severity)
+
+
+def _effort_chip(effort: str | None) -> str:
+    if not effort:
+        return "-"
+    return _EFFORT_CHIP.get(effort, effort.replace("-", " "))
+
 
 # Markings v2: rule_name -> ReviewRule for category (bug_class) chips.
 _RULES_BY_NAME = {r.name: r for r in RULES}
@@ -758,12 +847,13 @@ def _inline_comment_body(f: Finding, precedent_note: str = "") -> str:
     finding for dedup (#189) — see dedup.parse_rule. The marker stays
     LAST (dedup.parse_rule reads the last marker in the body)."""
     cat = _category_for_rule(f.rule_name)
+    # CR-dense header: severity chip | category | rule | effort chip
     chip = (
-        f"**{f.severity.upper()}** · _{_md_code_span(cat)}_ · "
+        f"{_severity_chip(f.severity)} | _{_md_code_span(cat)}_ | "
         f"`{_md_code_span(f.rule_name)}`"
     )
-    if f.effort in _EFFORT_LABELS:
-        chip += f" · {_EFFORT_LABELS[f.effort]}"
+    if f.effort:
+        chip += f" | {_effort_chip(f.effort)}"
     head = (
         f"{chip}\n\n"
         f"**What Elder sees**\n\n{_defused(f.message)}\n\n"
@@ -864,8 +954,7 @@ def _review_stack_body(
         rows.append(f"| … | +{n - 25} more | | | |")
     table = "\n".join(rows) if findings else "_No inline markings this pass._"
 
-    agent = _consolidated_agent_prompt(evaluation)
-    return "\n".join([
+    parts = [
         _STACK_MARKER,
         "",
         f'<img src="{_PERSONA_PORTRAIT}" width="46" align="left" alt="Grug Elder" />',
@@ -880,18 +969,35 @@ def _review_stack_body(
         "### Markings",
         "",
         table,
-        "",
-        "### Prompt for AI agents",
-        "",
-        agent if agent else "_No findings to remediate._",
-        "",
-        "---",
-        "",
-        "Inline comments carry Fix + agent prompt on each marking. "
-        "Autofix push is not enabled — apply suggestions or hand the agent prompt "
-        "to your coding agent.",
-        "",
-    ])
+    ]
+    # Only when there is something to fix — empty "Address each finding"
+    # shells are noise (and look broken).
+    agent = _consolidated_agent_prompt(evaluation)
+    if agent:
+        parts.extend([
+            "",
+            "### Prompt for AI agents",
+            "",
+            agent,
+            "",
+            "---",
+            "",
+            "Inline comments carry Fix + agent prompt on each marking. "
+            "Autofix push is not enabled — apply suggestions or hand the agent "
+            "prompt to your coding agent.",
+            "",
+        ])
+    else:
+        # Degraded (all_failed / parse_failed / ...) with empty findings is
+        # not a clean review - say so instead of "nothing to remediate".
+        if evaluation.degraded_reason:
+            status = (
+                "No agent prompt — review degraded; no usable findings were produced."
+            )
+        else:
+            status = "No agent prompt — nothing to remediate."
+        parts.extend(["", "---", "", status, ""])
+    return "\n".join(parts)
 
 
 def _find_stack_comment_id(
@@ -1541,6 +1647,35 @@ def dispatch_code_review(
                 "installation_id": installation_id,
                 "pr": f"{owner}/{repo_name}#{pull_number}",
                 "count": len(complexity_findings),
+            },
+        )
+
+    # Deterministic docs/code claim check: catch comment/env prose that
+    # asserts the wrong settle cap or deep-diff bound (the Qodo/CR class
+    # on #664). Pure + advisory MEDIUM; never aborts the review.
+    try:
+        claim_file_contents = _enrich_claim_check_sources(
+            installation_id, owner, repo_name, head_sha, file_contents, hunks,
+        )
+        claim_findings = scan_claim_checks(hunks, claim_file_contents)
+        # Drop rows the LLM already published under the same rule/anchor.
+        claim_findings = filter_novel_claim_findings(
+            claim_findings, evaluation.findings,
+        )
+    except Exception as e:  # noqa: BLE001 - enrichment must never abort a review
+        log.info(
+            "code_review_claim_check_failed",
+            extra={"pr": f"{owner}/{repo_name}#{pull_number}", "kind": type(e).__name__},
+        )
+        claim_findings = ()
+    if claim_findings:
+        evaluation = with_extra_findings(evaluation, claim_findings)
+        log.info(
+            "code_review_claim_check_findings",
+            extra={
+                "installation_id": installation_id,
+                "pr": f"{owner}/{repo_name}#{pull_number}",
+                "count": len(claim_findings),
             },
         )
 

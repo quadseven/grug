@@ -438,6 +438,20 @@ def test_decide_deep_escalation_diff_lines() -> None:
     assert any(r.startswith("diff_lines:") for r in decision.reasons)
 
 
+def test_decide_deep_escalation_diff_lines_exclusive_bound() -> None:
+    """Threshold N means above N, not at exactly N (GRUG_DEEP_DIFF_LINES=500)."""
+    at = "@@ -1 +1 @@\n" + "\n".join(f"+line{i}" for i in range(5))
+    over = "@@ -1 +1 @@\n" + "\n".join(f"+line{i}" for i in range(6))
+    at_bound = lc.decide_deep_escalation(
+        [_hunk(body=at)], sample_rate=0.0, diff_line_threshold=5, path_markers=(),
+    )
+    above = lc.decide_deep_escalation(
+        [_hunk(body=over)], sample_rate=0.0, diff_line_threshold=5, path_markers=(),
+    )
+    assert at_bound.escalate is False
+    assert above.escalate is True
+
+
 def test_decide_deep_escalation_high_risk_path() -> None:
     decision = lc.decide_deep_escalation(
         [_hunk(path="services/auth/login.py")],
