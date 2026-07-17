@@ -637,13 +637,29 @@ def _run_ask(install_id: int, repo_full: str, pr_number: int, question: str) -> 
     return result
 
 
+def _defuse_md(s: str) -> str:
+    """Neutralize model-produced text before it lands in a GitHub comment
+    body. The learning/scope come from the classifier (derived from an
+    untrusted reply), so strip HTML-significant chars (a stray </details>
+    would break out of the ack's collapsible), backticks/pipes, and flatten
+    newlines; cap to bound a hostile payload."""
+    return (
+        s.replace("<", "&lt;").replace(">", "&gt;")
+        .replace("`", "'").replace("|", "\\|")
+        .replace("\r", " ").replace("\n", " ")
+    )[:600]
+
+
 def _learn_ack_body(learning: str, scope_path: str) -> str:
-    """The 'Markings remembered' threaded reply for a stored learning."""
-    scope = f"\n> Scope: `{scope_path}`" if scope_path else ""
+    """The 'Markings remembered' threaded reply for a stored learning. The
+    model-produced fields are markdown-defused so they cannot corrupt the
+    comment's <details> rendering or inject unintended mentions."""
+    rule = _defuse_md(learning)
+    scope = f"\n> Scope: '{_defuse_md(scope_path)}'" if scope_path else ""
     return (
         "Grug remember this.\n\n"
         "<details><summary>Markings remembered</summary>\n\n"
-        f"> {learning}{scope}\n\n"
+        f"> {rule}{scope}\n\n"
         "Grug will apply this to future reviews on this repo. "
         "So speaks Grug.\n</details>"
     )

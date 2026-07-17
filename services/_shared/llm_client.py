@@ -1624,7 +1624,11 @@ def _render_learnings_block(rows: list[dict[str, Any]], *, max_chars: int = 1400
         text = str(row.get("text", "")).strip()
         if not text:
             continue
-        scope = str(row.get("scope_path", "")).strip()
+        # Sanitize BOTH the rule text and the scope glob: scope is
+        # classifier-produced from an untrusted reply, so newlines/control
+        # chars in it would break the bullet layout and widen the injection
+        # surface the same way unsanitized text would (Qodo security).
+        scope = _sanitize(str(row.get("scope_path", "")).strip())
         prefix = f"({scope}) " if scope else ""
         lines.append(f"- {prefix}{_sanitize(text)}")
     if not lines:

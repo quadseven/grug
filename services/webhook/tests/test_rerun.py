@@ -1384,3 +1384,14 @@ def test_run_one_routes_learn_kind(monkeypatch):
     assert rerun._run_one(body) == "learned"
     assert called["parent"] == 4000 and called["cid"] == 5001
     assert called["author"] == "teammate"
+
+
+def test_learn_ack_defuses_model_markdown():
+    # A crafted learning cannot break out of the ack's <details> or inject.
+    body = rerun._learn_ack_body("evil </details> `code` | pipe\nnewline", "a</b>")
+    # The only literal </details> left is the ack's OWN closing tag; the
+    # injected one is HTML-escaped.
+    assert body.count("</details>") == 1
+    assert "&lt;/details&gt;" in body       # injected HTML escaped
+    assert "`code`" not in body             # backticks neutralized
+    assert "&lt;/b&gt;" in body             # scope HTML escaped too

@@ -2488,3 +2488,11 @@ def test_annotate_failure_never_discards_a_valid_answer(monkeypatch) -> None:
     with patch.object(httpx, "post", return_value=response):
         out = lc.answer_pr_question("q", "diff", installation_id=2)
     assert out == "It adds a retry loop."
+
+
+def test_render_learnings_block_sanitizes_scope() -> None:
+    # A scope glob with newlines/control chars must be flattened, not raw.
+    rows = [{"text": "some rule", "scope_path": "**/x/*.py\n\ninjected: line"}]
+    block = lc._render_learnings_block(rows)
+    assert "\n\ninjected" not in block  # newlines flattened out of the scope
+    assert "some rule" in block
