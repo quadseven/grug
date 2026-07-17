@@ -443,16 +443,20 @@ def test_learnings_roundtrip_dedup_and_ttl(pg):
     assert row["usage_count"] == 0 and row["last_used_at"] == ""
     first_created = row["created_at"]
 
-    # Re-teaching the SAME rule (whitespace-different) is a no-op: same digest,
-    # first teach's provenance + created_at win, no duplicate row.
+    # Re-teaching the SAME rule (whitespace-different) heals in place: same
+    # digest, no duplicate row. The LATEST teaching's mutable fields win (so a
+    # scope change is honored and the ack stays truthful), but created_at and
+    # usage counters are preserved from the first teach.
     store.put_learning(
         repo="o/r", text="prefer early returns with error codes",
-        source_pr=9, author="other",
+        scope_path="**/api/*.py", source_pr=9, author="other",
     )
     again = store.list_learnings("o/r")
     assert len(again) == 1
-    assert again[0]["created_at"] == first_created
-    assert again[0]["source_pr"] == 7  # original provenance preserved
+    assert again[0]["created_at"] == first_created  # first-taught time preserved
+    assert again[0]["usage_count"] == 0  # counters preserved
+    assert again[0]["scope_path"] == "**/api/*.py"  # newest scope wins
+    assert again[0]["source_pr"] == 9  # newest provenance wins
 
     # A DIFFERENT rule is a distinct row; repo-scoped isolation holds.
     store.put_learning(repo="o/r", text="name the caller when it is not updated")

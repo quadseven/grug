@@ -672,7 +672,6 @@ def _handle_review_comment_reply(payload: dict[str, Any]) -> dict[str, str]:
     pr_number = pr.get("number")
     comment_id = comment.get("id")
     sender_login = sender.get("login", "")
-    pr_author_login = (pr.get("user") or {}).get("login", "")
 
     if not all([installation_id, owner, repo_name, pr_number, comment_id]):
         return {"status": "skip", "reason": "incomplete_payload"}
@@ -680,44 +679,49 @@ def _handle_review_comment_reply(payload: dict[str, Any]) -> dict[str, str]:
     if not is_install_allowlisted(int(installation_id)):
         return {"status": "no_op", "reason": "installer not allowlisted"}
 
+    # Gate on the REVIEWER persona: learnings steer Elder's review prompt, so
+    # a repo running review but not the tpm/DoR persona must still learn.
     repo_id = repo.get("id")
     if repo_id is not None and not is_persona_enabled(
-        int(installation_id), int(repo_id), "tpm",
+        int(installation_id), int(repo_id), "code_reviewer",
     ):
-        return {"status": "no_op", "reason": "tpm disabled for this repo"}
+        return {"status": "no_op", "reason": "code_reviewer disabled for this repo"}
 
     from urllib.parse import quote as _q
     from github_app_auth import with_install_token_retry  # type: ignore
     import httpx  # type: ignore
 
-    # Trust gate: author OR write+ collaborator, same as /grug commands.
-    if sender_login != pr_author_login:
-        def _check_perm(token: str) -> str:
-            r = httpx.get(
-                f"https://api.github.com/repos/{_q(owner, safe='')}/"
-                f"{_q(repo_name, safe='')}/collaborators/"
-                f"{_q(sender_login, safe='')}/permission",
-                headers={
-                    "Authorization": f"token {token}",
-                    "Accept": "application/vnd.github+json",
-                },
-                timeout=10,
-            )
-            r.raise_for_status()
-            return (r.json() or {}).get("permission", "")
+    # Trust gate: ALWAYS require write-or-above, even for the PR author. Unlike
+    # /grug recheck (an author re-running their own PR is harmless), a learning
+    # poisons the review corpus for EVERY future PR, so a fork contributor (who
+    # is the pr.user on their own fork PR but has no write access) must not be
+    # able to teach. This is the corpus-poisoning guard ADR-0020 relies on.
+    def _check_perm(token: str) -> str:
+        r = httpx.get(
+            f"https://api.github.com/repos/{_q(owner, safe='')}/"
+            f"{_q(repo_name, safe='')}/collaborators/"
+            f"{_q(sender_login, safe='')}/permission",
+            headers={
+                "Authorization": f"token {token}",
+                "Accept": "application/vnd.github+json",
+            },
+            timeout=10,
+        )
+        r.raise_for_status()
+        return (r.json() or {}).get("permission", "")
 
-        try:
-            perm = with_install_token_retry(int(installation_id), _check_perm)
-        except httpx.HTTPStatusError as e:
-            log.warning("learn_perm_lookup_failed", extra={
-                "sender": sender_login, "status": e.response.status_code})
-            return {"status": "skip", "reason": "perm_lookup_failed"}
-        except httpx.RequestError as e:
-            log.warning("learn_perm_lookup_transport_failed", extra={
-                "sender": sender_login, "kind": type(e).__name__})
-            return {"status": "skip", "reason": "perm_lookup_transport_failed"}
-        if perm not in _AUTHORIZED_ROLES:
-            return {"status": "no_op", "reason": "reply author lacks write perm"}
+    try:
+        perm = with_install_token_retry(int(installation_id), _check_perm)
+    except httpx.HTTPStatusError as e:
+        log.warning("learn_perm_lookup_failed", extra={
+            "sender": sender_login, "status": e.response.status_code})
+        return {"status": "skip", "reason": "perm_lookup_failed"}
+    except httpx.RequestError as e:
+        log.warning("learn_perm_lookup_transport_failed", extra={
+            "sender": sender_login, "kind": type(e).__name__})
+        return {"status": "skip", "reason": "perm_lookup_transport_failed"}
+    if perm not in _AUTHORIZED_ROLES:
+        return {"status": "no_op", "reason": "reply author lacks write perm"}
 
     from rerun import enqueue_learn  # type: ignore
     try:
@@ -728,6 +732,7 @@ def _handle_review_comment_reply(payload: dict[str, Any]) -> dict[str, str]:
             comment_id=int(comment_id),
             parent_comment_id=int(in_reply_to),
             reply_text=body,
+            author=sender_login,
         )
     except RuntimeError as e:
         # Queue not configured (local/dev) - best-effort, never a webhook 500.

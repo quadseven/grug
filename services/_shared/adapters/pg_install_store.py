@@ -794,6 +794,14 @@ def _learning_sk(digest: str) -> str:
     return f"LEARNING#{digest}"
 
 
+# Learnings decay if never reinforced: a taught rule that stays relevant gets
+# re-taught (or its finding keeps recurring and the maintainer re-confirms),
+# refreshing the TTL; a now-wrong rule ages out on its own. This bounds the
+# blast radius of a stale rule in slice 1, which ships no delete command yet
+# (the sibling PRACTICES/EXEMPLARS caches that ride the same prompt also expire).
+_LEARNING_TTL_DAYS = 180
+
+
 def put_learning(
     *,
     repo: str,
@@ -805,26 +813,36 @@ def put_learning(
     created_at: str = "",
 ) -> None:
     """Upsert one durable learning under LEARN#<repo>. Keyed by the rule
-    text's content digest, so re-teaching the same preference heals the row
-    (and preserves its created_at) instead of adding a duplicate. Usage
-    counters seed at zero; the increment-on-apply pass is a later slice."""
+    text's content digest. A re-teach of the same text REFRESHES the mutable
+    metadata (scope, source, author) and the TTL, but PRESERVES the original
+    created_at and usage counters - so the newest teaching's scope wins (the
+    ack the maintainer sees matches the stored/applied state) while first-taught
+    provenance and use history survive."""
     rule = text.strip()
     if not (repo and rule):
         return
     now = created_at or datetime.now(timezone.utc).isoformat()
+    ttl = int(datetime.now(timezone.utc).timestamp() + _LEARNING_TTL_DAYS * 86400)
     with get_pool().connection() as conn:
         conn.execute(
             """
-            INSERT INTO grug_kv (pk, sk, data)
-            VALUES (%(pk)s, %(sk)s, %(data)s)
-            -- Identical rule text is the same learning (digest keys on text
-            -- alone), so the first teach's provenance + created_at + counters
-            -- win; a re-teach is a no-op rather than a duplicate.
-            ON CONFLICT (pk, sk) DO NOTHING
+            INSERT INTO grug_kv (pk, sk, data, ttl)
+            VALUES (%(pk)s, %(sk)s, %(data)s, %(ttl)s)
+            ON CONFLICT (pk, sk) DO UPDATE
+                -- take the NEW row's fields, but keep the ORIGINAL created_at
+                -- and usage counters from the existing row. Refreshes the TTL
+                -- (use-it-or-lose-it) and lets a narrowed scope win.
+                SET ttl = %(ttl)s,
+                    data = EXCLUDED.data || jsonb_build_object(
+                        'created_at', grug_kv.data->'created_at',
+                        'usage_count', grug_kv.data->'usage_count',
+                        'last_used_at', grug_kv.data->'last_used_at'
+                    )
             """,
             {
                 "pk": _learning_pk(repo),
                 "sk": _learning_sk(_learning_digest(rule)),
+                "ttl": ttl,
                 "data": encode_attrs({
                     "text": rule,
                     "repo": repo,

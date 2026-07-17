@@ -1282,6 +1282,7 @@ def test_run_learn_durable_stores_and_acks(monkeypatch):
         "adapters.install_store.put_learning",
         lambda **kw: put_calls.append(kw),
     )
+    monkeypatch.setattr("adapters.install_store.claim_delivery", lambda k: True)
     monkeypatch.setattr(
         "llm_client.classify_learning",
         lambda *a, **k: {"durable": True, "learning": "prefer early returns",
@@ -1290,10 +1291,11 @@ def test_run_learn_durable_stores_and_acks(monkeypatch):
     monkeypatch.setattr(rerun, "with_install_token_retry", lambda iid, fn: fn("tok"))
     monkeypatch.setattr(rerun, "_gh_post", lambda token, url, body: posted.append((url, body)))
 
-    result = rerun._run_learn(11, "o/r", 7, 5001, 4000, "we prefer early returns")
+    result = rerun._run_learn(11, "o/r", 7, 5001, 4000, "we prefer early returns", "teammate")
 
     assert result == "learned"
     assert put_calls and put_calls[0]["text"] == "prefer early returns"
+    assert put_calls[0]["author"] == "teammate"  # the teacher, not the PR author
     assert put_calls[0]["scope_path"] == "**/mw/*.py" and put_calls[0]["source_pr"] == 7
     assert posted and "/pulls/7/comments/4000/replies" in posted[0][0]
     assert "Markings remembered" in posted[0][1]["body"]
@@ -1308,6 +1310,7 @@ def test_run_learn_one_off_declines_without_storing(monkeypatch):
     )
     monkeypatch.setattr("adapters.install_store.put_learning",
                         lambda **kw: put_calls.append(kw))
+    monkeypatch.setattr("adapters.install_store.claim_delivery", lambda k: True)
     monkeypatch.setattr("llm_client.classify_learning",
                         lambda *a, **k: {"durable": False, "learning": "", "scope_path": ""})
     monkeypatch.setattr(rerun, "with_install_token_retry", lambda iid, fn: fn("tok"))
@@ -1320,7 +1323,7 @@ def test_run_learn_one_off_declines_without_storing(monkeypatch):
     assert posted and "did not carve" in posted[0][1]["body"]
 
 
-def test_run_learn_classifier_none_declines(monkeypatch):
+def test_run_learn_classifier_none_raises_for_redrive(monkeypatch):
     posted = []
     monkeypatch.setattr(
         "adapters.install_store.get_comment_record",
@@ -1328,12 +1331,32 @@ def test_run_learn_classifier_none_declines(monkeypatch):
     )
     monkeypatch.setattr("adapters.install_store.put_learning",
                         lambda **kw: (_ for _ in ()).throw(AssertionError("must not store")))
+    monkeypatch.setattr("adapters.install_store.claim_delivery",
+                        lambda k: (_ for _ in ()).throw(AssertionError("must not claim")))
     monkeypatch.setattr("llm_client.classify_learning", lambda *a, **k: None)
-    monkeypatch.setattr(rerun, "with_install_token_retry", lambda iid, fn: fn("tok"))
     monkeypatch.setattr(rerun, "_gh_post", lambda token, url, body: posted.append(body))
 
-    assert rerun._run_learn(11, "o/r", 7, 5001, 4000, "?") == "learn_one_off"
-    assert posted  # still acknowledged
+    # A transient classifier failure must redrive, NOT mislabel as one-off.
+    with pytest.raises(RuntimeError, match="classifier unavailable"):
+        rerun._run_learn(11, "o/r", 7, 5001, 4000, "?")
+    assert posted == []  # no misleading ack posted on the failure path
+
+
+def test_run_learn_redelivery_is_win_once(monkeypatch):
+    posted = []
+    monkeypatch.setattr(
+        "adapters.install_store.get_comment_record",
+        lambda iid, cid: {"finding_text": "x", "finding_tags": {"rule_name": "r"}},
+    )
+    monkeypatch.setattr("adapters.install_store.put_learning", lambda **kw: None)
+    # claim_delivery returns False -> already processed (redelivery).
+    monkeypatch.setattr("adapters.install_store.claim_delivery", lambda k: False)
+    monkeypatch.setattr("llm_client.classify_learning",
+                        lambda *a, **k: {"durable": True, "learning": "r", "scope_path": ""})
+    monkeypatch.setattr(rerun, "_gh_post", lambda token, url, body: posted.append(body))
+
+    assert rerun._run_learn(11, "o/r", 7, 5001, 4000, "x") == "learn_duplicate"
+    assert posted == []  # no duplicate ack on the finding thread
 
 
 def test_run_learn_no_parent_record_is_silent(monkeypatch):
@@ -1349,12 +1372,15 @@ def test_run_one_routes_learn_kind(monkeypatch):
     called = {}
     monkeypatch.setattr(
         rerun, "_run_learn",
-        lambda iid, repo, pr, cid, parent, text: called.update(
-            iid=iid, repo=repo, pr=pr, cid=cid, parent=parent, text=text) or "learned",
+        lambda iid, repo, pr, cid, parent, text, author="": called.update(
+            iid=iid, repo=repo, pr=pr, cid=cid, parent=parent, text=text,
+            author=author) or "learned",
     )
     body = json.dumps({
         "kind": "learn", "install_id": 11, "repo": "o/r", "pr_number": 7,
         "comment_id": 5001, "parent_comment_id": 4000, "reply_text": "hi",
+        "author": "teammate",
     })
     assert rerun._run_one(body) == "learned"
     assert called["parent"] == 4000 and called["cid"] == 5001
+    assert called["author"] == "teammate"

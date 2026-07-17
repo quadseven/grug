@@ -54,6 +54,7 @@ from rerun_personas import (
 )
 from rerun_queue import (
     ask_group_id as _ask_group_id,
+    learn_group_id as _learn_group_id,
     rerun_group_id as _rerun_group_id,
     review_group_id as _review_group_id,
 )
@@ -535,12 +536,14 @@ def enqueue_ask(*, install_id: int, repo: str, pr_number: int, comment_id: int, 
 
 def enqueue_learn(
     *, install_id: int, repo: str, pr_number: int, comment_id: int,
-    parent_comment_id: int, reply_text: str,
+    parent_comment_id: int, reply_text: str, author: str = "",
 ) -> None:
     """Enqueue a learnings-classification job (#670, ADR-0020) so the LLM
     classifier runs in the consumer, NOT inline in the webhook ACK path.
     `comment_id` is the maintainer's REPLY (the dedup key - a re-delivered
-    reply collapses); `parent_comment_id` is grug's finding it answers."""
+    reply collapses); `parent_comment_id` is grug's finding it answers;
+    `author` is the maintainer who taught it (the reply's sender). Runs in
+    its OWN FIFO group so a slow classify never serializes with /grug ask."""
     if not _RERUN_QUEUE_URL:
         raise RuntimeError("GRUG_RERUN_QUEUE_URL not configured")
     _sqs.send_message(
@@ -549,9 +552,9 @@ def enqueue_learn(
             "schema_version": SCHEMA_VERSION, "kind": "learn",
             "install_id": install_id, "repo": repo, "pr_number": pr_number,
             "comment_id": comment_id, "parent_comment_id": parent_comment_id,
-            "reply_text": reply_text,
+            "reply_text": reply_text, "author": author,
         }),
-        MessageGroupId=_ask_group_id(install_id, repo, pr_number),
+        MessageGroupId=_learn_group_id(install_id, repo, pr_number),
         MessageDeduplicationId=f"{install_id}:{repo}:{pr_number}:learn:{comment_id}",
     )
     log.info("learn_enqueued", extra={"install_id": install_id, "repo": repo,
@@ -656,13 +659,20 @@ _LEARN_DECLINE_BODY = (
 def _run_learn(
     install_id: int, repo_full: str, pr_number: int,
     comment_id: int, parent_comment_id: int, reply_text: str,
+    author: str = "",
 ) -> str:
     """Classify a maintainer's reply to a finding and, if it is a durable team
-    preference, store it and acknowledge in the thread (#670, ADR-0020). Never
-    raises past the job: a classifier or store hiccup degrades to no learning.
-    Posts a threaded reply either way so the maintainer always gets a signal."""
+    preference, store it and acknowledge in the thread (#670, ADR-0020).
+
+    A classifier BACKEND failure raises for SQS redrive (a transient outage
+    must not be mislabeled a deliberate one-off, and no ack is posted so the
+    retry can succeed). A definite verdict (durable OR one-off) is win-once
+    per reply comment: the first run acks, a redelivery is a no-op, so the
+    finding thread never gets duplicate acknowledgments."""
     from urllib.parse import quote as _q
-    from adapters.install_store import get_comment_record, put_learning  # type: ignore
+    from adapters.install_store import (  # type: ignore
+        claim_delivery, get_comment_record, put_learning,
+    )
     from llm_client import classify_learning  # type: ignore
     from observability import emit_gauge  # type: ignore
 
@@ -684,23 +694,35 @@ def _run_learn(
             "pr_number": pr_number,
         },
     )
+    if classification is None:
+        # Transient: backend down or unparseable. Raise for redrive rather
+        # than tell the maintainer their durable rule was judged one-off.
+        # No ack + no claim, so the retry re-classifies cleanly (or DLQs).
+        raise RuntimeError("learn classifier unavailable")
 
-    if classification and classification["durable"]:
+    # Win-once per reply comment: a redelivery (or a duplicate GitHub delivery)
+    # must not re-classify and re-ack. A genuine RE-TEACH is a NEW reply comment
+    # (distinct comment_id -> distinct claim), so it correctly acks again.
+    if not claim_delivery(f"learn:{comment_id}"):
+        log.info("learn_already_processed", extra={
+            "repo": repo_full, "pr": pr_number, "comment_id": comment_id})
+        return "learn_duplicate"
+
+    if classification["durable"]:
         put_learning(
             repo=repo_full,
             text=classification["learning"],
             scope_path=classification["scope_path"],
             source_pr=pr_number,
             source_comment_id=comment_id,
-            author=str(record.get("author_login", "")),
+            author=author,  # the maintainer who TAUGHT it (reply sender)
         )
         ack = _learn_ack_body(
             classification["learning"], classification["scope_path"],
         )
         result = "learned"
     else:
-        # One-off, or the classifier could not decide: acknowledge without
-        # storing (the classifier errs toward not storing by design).
+        # Deliberate one-off: acknowledge without storing.
         ack = _LEARN_DECLINE_BODY
         result = "learn_one_off"
 
@@ -741,6 +763,7 @@ def _run_one(body: str) -> str:
             int(job.get("comment_id", 0)),
             int(job.get("parent_comment_id", 0)),
             str(job.get("reply_text", "")),
+            str(job.get("author", "")),
         )
     if job.get("kind") == "review":
         return _run_hot_review(job, install_id, repo_full, pr_number)

@@ -84,14 +84,25 @@ honest: grug can quote the exact stored learning.
 
 ### Trust and safety
 
-- Only the PR author or a write-or-above collaborator can teach a learning. A
-  random commenter on a public-listed app cannot poison the corpus.
+- Only a write-or-above collaborator can teach a learning. The permission check
+  runs even for the PR author, because a fork contributor is the author on their
+  own fork PR yet has no write access; a learning poisons every future review,
+  so unlike a `/grug recheck` (which an author may harmlessly run on their own
+  PR) teaching requires real write access.
 - The learning text is untrusted repository data. It is redacted for
   secret-shaped values before it reaches a third-party backend, the same guard
   the practices and exemplars blocks use, and it is neutralized against prompt
   injection with the existing sanitizer.
-- The learnings block is bounded in size, so a flood of learnings cannot crowd
-  out the static rules.
+- The learnings block is bounded by count and then by bytes, newest first, so a
+  flood cannot crowd out the static rules and a just-taught rule always survives
+  truncation. Grug never acknowledges a rule that would then fall out of the
+  prompt.
+- Learnings carry a 180-day TTL that a re-teach refreshes. A reinforced rule
+  persists; a now-wrong rule ages out on its own. This bounds the blast radius
+  in slice 1, which ships no delete command yet.
+- A classifier backend failure raises for redrive rather than telling the
+  maintainer their durable rule was judged a one-off. Storing and acknowledging
+  are win-once per reply comment, so a redelivery never double-acks the thread.
 
 ## Scope
 

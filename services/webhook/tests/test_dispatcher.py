@@ -570,16 +570,34 @@ def _review_reply_payload(**over):
     return p
 
 
-def test_review_reply_enqueues_learn_for_pr_author():
+def test_review_reply_enqueues_for_write_author():
+    # The PR author teaches, AND has write perm -> enqueued, author threaded.
     with patch("dispatcher.is_install_allowlisted", return_value=True), \
          patch("dispatcher.is_persona_enabled", return_value=True), \
+         patch("github_app_auth.with_install_token_retry", side_effect=lambda iid, fn: "admin"), \
          patch("rerun.enqueue_learn") as mock_enq:
         out = dispatch("pull_request_review_comment", _review_reply_payload())
     assert out == {"status": "enqueued", "kind": "learn"}
-    mock_enq.assert_called_once()
     kw = mock_enq.call_args.kwargs
     assert kw["repo"] == "githumps/infra" and kw["parent_comment_id"] == 4000
     assert kw["comment_id"] == 5001 and kw["pr_number"] == 42
+    assert kw["author"] == "dev"  # the reply sender is the teacher
+
+
+def test_review_reply_fork_author_without_write_is_blocked():
+    # THE poisoning guard: a fork contributor IS the PR author on their own
+    # fork PR but has only read access -> must NOT be able to teach.
+    payload = _review_reply_payload(
+        pull_request={"number": 42, "user": {"login": "forkuser"}},
+        sender={"login": "forkuser"},
+    )
+    with patch("dispatcher.is_install_allowlisted", return_value=True), \
+         patch("dispatcher.is_persona_enabled", return_value=True), \
+         patch("github_app_auth.with_install_token_retry", side_effect=lambda iid, fn: "read"), \
+         patch("rerun.enqueue_learn") as mock_enq:
+        out = dispatch("pull_request_review_comment", payload)
+    assert out["status"] == "no_op" and "lacks write perm" in out["reason"]
+    mock_enq.assert_not_called()
 
 
 def test_review_reply_not_a_reply_is_no_op():
@@ -610,12 +628,13 @@ def test_review_reply_from_non_collaborator_is_blocked():
     mock_enq.assert_not_called()
 
 
-def test_review_reply_tpm_disabled_is_no_op():
+def test_review_reply_reviewer_disabled_is_no_op():
+    # Gated on the REVIEWER persona (learnings feed Elder), not tpm.
     with patch("dispatcher.is_install_allowlisted", return_value=True), \
          patch("dispatcher.is_persona_enabled", return_value=False), \
          patch("rerun.enqueue_learn") as mock_enq:
         out = dispatch("pull_request_review_comment", _review_reply_payload())
-    assert out["status"] == "no_op" and "tpm disabled" in out["reason"]
+    assert out["status"] == "no_op" and "code_reviewer disabled" in out["reason"]
     mock_enq.assert_not_called()
 
 

@@ -25,3 +25,9 @@ def rerun_group_id(
 def ask_group_id(install_id: int, repo: str, pr_number: int) -> str:
     """Serialize questions per PR without blocking unrelated workloads."""
     return _group_id("ask-pr", install_id, repo, pr_number)
+
+
+def learn_group_id(install_id: int, repo: str, pr_number: int) -> str:
+    """Serialize learnings classification per PR in its OWN group, so a slow
+    classify never queues behind (or ahead of) a /grug ask for the same PR."""
+    return _group_id("learn-pr", install_id, repo, pr_number)

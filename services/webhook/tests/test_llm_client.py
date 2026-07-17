@@ -2347,8 +2347,17 @@ def test_render_learnings_block_empty_on_no_usable_rows() -> None:
 def test_render_learnings_block_truncates_a_flood() -> None:
     rows = [{"text": "rule " + "x" * 200, "scope_path": ""} for _ in range(50)]
     block = lc._render_learnings_block(rows, max_chars=300)
-    assert "more learnings omitted" in block
+    assert "older learnings omitted" in block
     assert len(block) < 700
+
+
+def test_render_learnings_block_keeps_newest_when_truncated() -> None:
+    # Oldest-first input; the NEWEST rule must survive count+byte truncation.
+    rows = [{"text": f"old rule {i}", "scope_path": ""} for i in range(60)]
+    rows.append({"text": "BRAND NEW RULE", "scope_path": ""})
+    block = lc._render_learnings_block(rows, max_chars=2000)
+    assert "BRAND NEW RULE" in block  # newest kept
+    assert "old rule 0" not in block  # oldest dropped by the count cap
 
 
 def test_summarize_pr_tolerates_missing_optional_fields() -> None:

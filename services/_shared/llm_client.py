@@ -1604,13 +1604,23 @@ def _repo_learnings_block(pr_context: Optional[PrContext]) -> str:
         return ""
 
 
+# Cap the NUMBER of learnings in the prompt, newest first, before the byte
+# bound applies. Ordering newest-first guarantees a just-taught rule is
+# included (the byte truncation drops the OLDEST tail), so grug never
+# acknowledges remembering a rule that then falls out of the prompt.
+_MAX_LEARNINGS_IN_PROMPT = 40
+
+
 def _render_learnings_block(rows: list[dict[str, Any]], *, max_chars: int = 1400) -> str:
     """Render learnings as a bounded, sanitized prompt block. Pure (no I/O)
-    so it is unit-testable without a store. Bounded like the practices block
-    so a flood of learnings cannot crowd out the static rules."""
+    so it is unit-testable without a store. `rows` arrive oldest-first (store
+    order); this renders NEWEST first and bounds by count then bytes, so a
+    flood cannot crowd out the static rules AND the most recent teaching
+    always survives truncation."""
     from best_practices import _sanitize  # type: ignore
+    newest_first = list(reversed(rows))[:_MAX_LEARNINGS_IN_PROMPT]
     lines: list[str] = []
-    for row in rows:
+    for row in newest_first:
         text = str(row.get("text", "")).strip()
         if not text:
             continue
@@ -1621,7 +1631,7 @@ def _render_learnings_block(rows: list[dict[str, Any]], *, max_chars: int = 1400
         return ""
     body = "\n".join(lines)
     if len(body) > max_chars:
-        body = body[:max_chars].rstrip() + "\n- ... (more learnings omitted)"
+        body = body[:max_chars].rstrip() + "\n- ... (older learnings omitted)"
     return (
         "WHAT YOUR TRIBE TOLD GRUG (team-taught preferences from replies to "
         "past findings - apply them, and do not re-flag what they tell you to "
