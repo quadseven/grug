@@ -484,11 +484,22 @@ export GRUG_BENCH_CAVE_MODEL='qwen3-coder-next:q8_0'   # or reasoner model
 # export GRUG_BENCH_REASONER_URL=...
 # export GRUG_BENCH_REASONER_MODEL=...
 
+# Ship each trial as an LLMObs span + parse_ok/complete_s evaluations
+# (ml_app=grug-elder-bakeoff by default; agentless, no local DD agent):
+export GRUG_BENCH_LLMOBS=1
+export DD_API_KEY="$(aws ssm get-parameter --name /grug/dd-api-key \
+  --with-decryption --query Parameter.Value --output text)"
+# optional: export DD_LLMOBS_ML_APP=grug-elder-bakeoff
+
 make -C ../.. review-latency
 # or:
-PYTHONPATH=../_shared uv run --with httpx python -m review_latency \
+PYTHONPATH=../_shared uv run --with httpx --with ddtrace python -m review_latency \
   --levels 1,2,4,8 --json /tmp/latency-trials.json
 ```
+
+Inspect bakeoff results in Datadog LLM Evaluations:
+`https://app.datadoghq.com/llm/evaluations?query=%40ml_app%3Agrug-elder-bakeoff`
+and production Elder traffic under `ml_app:grug-elder`.
 
 Compare a candidate runtime (e.g. vLLM) by pointing `GRUG_BENCH_CAVE_URL`
 at that server with the same model id and re-running; keep the fixture
