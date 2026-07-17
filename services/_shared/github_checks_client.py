@@ -124,14 +124,31 @@ def post_check_run(
                 },
                 timeout=10,
             )
-            # Soft-fail alias: do not raise on 4xx/5xx for the mirror.
+            # Soft-fail alias: do not raise on 4xx/5xx for the mirror, but
+            # LOG it - a repo that still requires the legacy context would
+            # otherwise silently lose its required check with no signal.
             if alias_resp.status_code >= 400:
+                log.warning(
+                    "check_run_alias_mirror_rejected",
+                    extra={
+                        "repo": f"{owner}/{repo}",
+                        "check": result.name,
+                        "alias": alias,
+                        "status_code": alias_resp.status_code,
+                        "head_sha": result.head_sha[:8],
+                    },
+                )
                 continue
     except Exception as e:  # noqa: BLE001 - cutover insurance never blocks primary
         # Named so a broken alias mirror is visible in logs, not silent.
         log.warning(
             "check_run_alias_mirror_failed",
-            extra={"kind": type(e).__name__, "check": result.name},
+            extra={
+                "repo": f"{owner}/{repo}",
+                "check": result.name,
+                "kind": type(e).__name__,
+                "detail": str(e)[:200],
+            },
         )
 
     return primary

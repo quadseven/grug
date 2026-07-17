@@ -177,19 +177,39 @@ def _elder_check_already_terminal_or_pending(
         # List without check_name so legacy titles (Grug - Code Review /
         # em-dash variants) still count as Elder during the nomenclature
         # cutover; filter client-side with _ELDER_CHECK_NAMES.
-        resp = httpx.get(
+        #
+        # Paginate: a busy commit can carry >100 distinct check names even
+        # under filter=latest (one run per name), and the Elder run could sit
+        # on a later page. Missing it would wrongly re-post in_progress over a
+        # settled required check - the exact reopen this guard prevents. Cap
+        # the page walk as a runaway backstop (1000 runs >> any real commit).
+        _MAX_PAGES = 10
+        headers = {
+            "Authorization": f"Bearer {token}",
+            "Accept": "application/vnd.github+json",
+            "X-GitHub-Api-Version": "2022-11-28",
+        }
+        url = (
             f"{_GH_API}/repos/{quote(owner, safe='')}/{quote(repo_name, safe='')}"
-            f"/commits/{quote(head_sha, safe='')}/check-runs",
-            params={"filter": "latest", "per_page": 100},
-            headers={
-                "Authorization": f"Bearer {token}",
-                "Accept": "application/vnd.github+json",
-                "X-GitHub-Api-Version": "2022-11-28",
-            },
-            timeout=_FETCH_TIMEOUT,
+            f"/commits/{quote(head_sha, safe='')}/check-runs"
         )
-        resp.raise_for_status()
-        runs = (resp.json() or {}).get("check_runs") or []
+        runs: list = []
+        seen = 0
+        for page in range(1, _MAX_PAGES + 1):
+            resp = httpx.get(
+                url,
+                params={"filter": "latest", "per_page": 100, "page": page},
+                headers=headers,
+                timeout=_FETCH_TIMEOUT,
+            )
+            resp.raise_for_status()
+            payload = resp.json() or {}
+            total = int(payload.get("total_count") or 0)
+            batch = payload.get("check_runs") or []
+            runs.extend(batch)
+            seen += len(batch)
+            if not batch or seen >= total:
+                break
         for run in runs:
             if str(run.get("name") or "") not in _ELDER_CHECK_NAMES:
                 continue
