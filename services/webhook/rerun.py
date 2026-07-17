@@ -190,7 +190,15 @@ def _elder_check_already_terminal_or_pending(
             if status in {"queued", "in_progress"}:
                 return f"already_{status}"
             if status == "completed":
-                # Any completed conclusion is terminal (including
+                # A FAIL-OPEN completion (grug-cr-open external_id) must not
+                # suppress a fresh review's pending state: this enqueue IS
+                # the worker that will re-complete the check, and leaving the
+                # neutral standing keeps the merge button green with a real
+                # review in flight (e.g. right after a freshness brownout).
+                external = str(run.get("external_id") or "")
+                if external.startswith("grug-cr-open:"):
+                    return None
+                # Any REAL completed conclusion is terminal (including
                 # action_required / stale). Creating a NEW in_progress run
                 # would reopen the required check with no worker guaranteed.
                 return f"already_completed_{conclusion or 'unknown'}"
@@ -1148,19 +1156,12 @@ def _run_hot_review(
                 else "pr_ineligible"
             )
         if degraded_reason == "pr_ineligible":
-            _complete_elder_check_open(
-                install_id=install_id,
-                owner=owner,
-                repo_name=repo_name,
-                pr_number=pr_number,
-                head_sha=head_sha,
-                title="Elder skipped - PR not reviewable",
-                summary=(
-                    "PR is closed or draft. Elder posts neutral so required "
-                    "status checks do not block on a non-reviewable PR."
-                ),
-                conclusion="neutral",
-            )
+            # NO terminal completion here: a draft/closed PR cannot merge, so
+            # a lingering in_progress check blocks nothing - but a terminal
+            # neutral on this head WOULD satisfy the required check the
+            # moment the PR is reopened/marked ready, before the freshly
+            # scheduled review posts. Leave the check pending; the
+            # ready_for_review/reopen enqueue completes it via a real review.
             if not _stop_review_claim_heartbeat(heartbeat):
                 raise RuntimeError(
                     "Elder review claim ownership lost during dispatch"
@@ -1205,8 +1206,14 @@ def _run_hot_review(
                     "Elder review claim ownership lost after fail-open"
                 )
             if not complete_review_claim(**owned_claim_args):
-                # Prefer release over hang if complete fails.
-                release_review_claim(**owned_claim_args)
+                # Prefer release over hang if complete fails - but if the
+                # fallback release ALSO fails, the claim is still held and
+                # silently returning would report success while blocking
+                # every future attempt until lease expiry. Raise for redrive.
+                if not release_review_claim(**owned_claim_args):
+                    raise RuntimeError(
+                        "Elder fail-open claim settlement failed (freshness)"
+                    )
             return "fail_open_freshness"
         if result_status == "skipped" and degraded_reason in _RETRYABLE_SKIP_REASONS:
             # Model/content-side transient (backend outage, unparseable
@@ -1248,7 +1255,12 @@ def _run_hot_review(
                     "Elder review claim ownership lost after fail-open skip"
                 )
             if not complete_review_claim(**owned_claim_args):
-                release_review_claim(**owned_claim_args)
+                # Same both-failed guard as the freshness branch above.
+                if not release_review_claim(**owned_claim_args):
+                    raise RuntimeError(
+                        "Elder fail-open claim settlement failed "
+                        f"(skip: {degraded_reason or 'unknown'})"
+                    )
             return f"fail_open_{degraded_reason or 'skipped'}"
         if result_status not in {"pass", "fail", "skipped"} and not str(result_status).startswith("fail_open"):
             raise RuntimeError(

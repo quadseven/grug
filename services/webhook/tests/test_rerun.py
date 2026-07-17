@@ -654,6 +654,97 @@ def test_hot_review_freshness_outage_post_failure_raises_for_redrive(monkeypatch
     complete.assert_not_called()
 
 
+def test_hot_review_ineligible_dispatch_leaves_check_non_terminal(monkeypatch):
+    """Draft/closed dispatch exits must NOT terminal-complete the check: a
+    neutral on this head would satisfy the required check the moment the PR
+    is reopened, before the fresh review posts."""
+    posted: list = []
+    monkeypatch.setattr(
+        rerun, "with_install_token_retry", lambda iid, fn: _pr_data(),
+    )
+    monkeypatch.setattr(
+        rerun, "post_check_run",
+        lambda *a, **kw: posted.append(a) or {"id": 1},
+    )
+    monkeypatch.setattr(rerun, "get_repo_config", lambda iid, rid: {})
+    _patch_hot_claims(monkeypatch)
+    monkeypatch.setattr(
+        rerun,
+        "dispatch_code_review",
+        MagicMock(return_value={
+            "persona": "code_reviewer",
+            "result": "skipped",
+            "degraded_reason": "pr_ineligible",
+        }),
+    )
+
+    assert rerun._run_one(_job(kind="review", settle_seconds=0)) == "pr_ineligible"
+    assert posted == []
+
+
+def test_elder_terminal_guard_ignores_fail_open_completions(monkeypatch):
+    """A grug-cr-open (fail-open) completion must not suppress a fresh
+    review's in_progress post - the new enqueue IS the worker that will
+    re-complete the check."""
+    def fake_get(_url: str, **kwargs: object) -> object:
+        class Resp:
+            def raise_for_status(self) -> None:
+                return None
+
+            def json(self) -> dict:
+                return {
+                    "check_runs": [
+                        {
+                            "name": rerun._ELDER_CHECK_NAME,
+                            "status": "completed",
+                            "conclusion": "neutral",
+                            "external_id": "grug-cr-open:o/r#9:" + "a" * 40,
+                        }
+                    ]
+                }
+        return Resp()
+
+    monkeypatch.setattr(rerun, "with_install_token_retry", lambda iid, fn: fn("tok"))
+    monkeypatch.setattr(rerun.httpx, "get", fake_get)
+    reason = rerun._elder_check_already_terminal_or_pending(
+        install_id=1, owner="o", repo_name="r", head_sha="a" * 40,
+    )
+    assert reason is None
+
+
+def test_hot_review_fail_open_both_claim_settlements_failing_raises(monkeypatch):
+    """complete fails AND fallback release fails -> raise for redrive, never
+    report success with the claim still held."""
+    pr = _pr_data(head_sha="fresh-head")
+    fetches = iter((pr, pr))
+
+    def _fake_token_retry(iid, fn):
+        try:
+            return next(fetches)
+        except StopIteration:
+            return fn("tok")
+
+    monkeypatch.setattr(rerun, "with_install_token_retry", _fake_token_retry)
+    monkeypatch.setattr(
+        rerun, "post_check_run",
+        lambda token, owner, repo, result, external_id=None: {"id": 1},
+    )
+    monkeypatch.setattr(rerun, "get_repo_config", lambda iid, rid: {})
+    _patch_hot_claims(monkeypatch, complete_result=False, release_result=False)
+    monkeypatch.setattr(
+        rerun,
+        "dispatch_code_review",
+        MagicMock(return_value={
+            "persona": "code_reviewer",
+            "result": "skipped",
+            "degraded_reason": "freshness_check_failed",
+        }),
+    )
+
+    with pytest.raises(RuntimeError, match="claim settlement failed"):
+        rerun._run_one(_job(kind="review", settle_seconds=0))
+
+
 def test_hot_review_duplicate_current_snapshot_skips_without_wait(monkeypatch):
     monkeypatch.setattr(
         rerun, "with_install_token_retry", lambda iid, fn: _pr_data(head_sha="same"),
