@@ -86,11 +86,15 @@ const esc = (s: string) =>
 // Clamp a persona's mode to the ones the backend can honor for it (a stale
 // default or an old localStorage value - e.g. smasher="block" before Smasher
 // was capped to warn/off - would otherwise render the control with nothing
-// selected). Falls back to the persona's first supported mode, then "off".
-function clampPersonaMode(id: string, mode: PMode): PMode {
-  const supported = PERSONAS.find((p) => p.id === id)?.modes ?? [];
+// selected). An invalid value falls back to the persona's CONFIGURED default
+// when that is itself supported, otherwise to its first supported mode, then
+// "off" for informational personas.
+function clampPersonaMode(id: string, mode: PMode, configuredDefault?: PMode): PMode {
+  const supported = (PERSONAS.find((p) => p.id === id)?.modes ?? []) as readonly PMode[];
   if (supported.length === 0) return "off"; // informational persona
-  return (supported as readonly PMode[]).includes(mode) ? mode : (supported[0] as PMode);
+  if (supported.includes(mode)) return mode;
+  if (configuredDefault && supported.includes(configuredDefault)) return configuredDefault;
+  return supported[0];
 }
 
 function loadLocal() {
@@ -107,7 +111,9 @@ function loadLocal() {
     const s = JSON.parse(localStorage.getItem(LS) || "{}");
     const mergedPersonas = { ...def.personas, ...(s.personas || {}) };
     const personas = Object.fromEntries(
-      Object.entries(mergedPersonas).map(([id, m]) => [id, clampPersonaMode(id, m as PMode)]),
+      Object.entries(mergedPersonas).map(
+        ([id, m]) => [id, clampPersonaMode(id, m as PMode, def.personas[id])],
+      ),
     ) as Record<string, PMode>;
     return {
       ...def, ...s,

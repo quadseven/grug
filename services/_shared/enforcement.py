@@ -140,23 +140,22 @@ def remove_enforcement(
 
     ruleset_id = get_enforcement_id(install_id, repo_id)
 
-    # Collect every ruleset to delete. With a stored ID we trust it; without,
-    # we fall back to matching the EXACT names grug's own Chief enforcement
-    # ruleset has used (canonical + legacies) - NOT a broad "Grug - " prefix,
-    # which would also delete an unrelated user ruleset that merely shares the
-    # prefix. Delete ALL exact matches, not just the first: during the
-    # nomenclature cutover a canonical and a legacy enforcement ruleset can
-    # coexist, and deleting only one would leave the other active + orphaned.
-    to_delete: list = []
+    # Collect every ruleset to delete. ALWAYS scan by exact name in addition
+    # to the stored ID and take the UNION: during the nomenclature cutover a
+    # canonical (stored-ID) enforcement ruleset and a legacy em-dash one can
+    # coexist, so deleting only the stored ID would leave the legacy ruleset
+    # active + orphaned - still gating merges while the store/UI report
+    # enforcement removed. Match the EXACT names grug's own Chief enforcement
+    # has used (canonical + legacies), NOT a broad "Grug - " prefix, so an
+    # unrelated user ruleset that merely shares the prefix is never touched.
+    to_delete_ids: set = set()
     if ruleset_id is not None:
-        to_delete = [ruleset_id]
-    else:
-        rulesets = list_rulesets(install_token, owner, repo)
-        to_delete = [
-            rs["id"]
-            for rs in rulesets
-            if is_enforcement_ruleset_name(rs.get("name", ""))
-        ]
+        to_delete_ids.add(ruleset_id)
+    rulesets = list_rulesets(install_token, owner, repo)
+    for rs in rulesets:
+        if is_enforcement_ruleset_name(rs.get("name", "")):
+            to_delete_ids.add(rs["id"])
+    to_delete = sorted(to_delete_ids)
 
     if not to_delete:
         log.info(

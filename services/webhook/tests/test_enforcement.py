@@ -93,14 +93,35 @@ def test_ensure_passes_stored_id_to_detect():
 # ── remove_enforcement ───────────────────────────────────────────────
 
 def test_remove_deletes_by_stored_id():
-    """Stored ruleset_id → delete directly, clear DDB."""
+    """Stored ruleset_id → delete it (plus any exact-name matches; none here)."""
     with patch("adapters.install_store.get_enforcement_id", return_value=42), \
+         patch("enforcement.list_rulesets", return_value=[{"id": 42, "name": "Grug - Chief Enforcement"}]), \
          patch("enforcement.delete_ruleset") as mock_del, \
          patch("adapters.install_store.set_enforcement_id") as mock_set:
         remove_enforcement("tok", "myorg", "myrepo", 100, 200)
 
     mock_del.assert_called_once_with("tok", "myorg", "myrepo", 42)
     mock_set.assert_called_once_with(100, 200, None)
+
+
+def test_remove_stored_id_plus_coexisting_legacy_deletes_both():
+    """A stored canonical ID AND a coexisting legacy 'Grug — ...' ruleset:
+    delete BOTH, or the legacy stays an orphaned merge gate while the store
+    reports enforcement removed (found by CodeRabbit + Qodo on this PR)."""
+    rulesets = [
+        {"id": 42, "name": "Grug - Chief Enforcement"},       # the stored one
+        {"id": 77, "name": "Grug — Chief Enforcement"},       # coexisting legacy
+        {"id": 50, "name": "CI Required"},
+    ]
+    with patch("adapters.install_store.get_enforcement_id", return_value=42), \
+         patch("enforcement.list_rulesets", return_value=rulesets), \
+         patch("enforcement.delete_ruleset") as mock_del, \
+         patch("adapters.install_store.set_enforcement_id") as mock_set:
+        remove_enforcement("tok", "o", "r", 1, 2)
+
+    assert mock_del.call_count == 2
+    assert {c.args[3] for c in mock_del.call_args_list} == {42, 77}
+    mock_set.assert_called_once_with(1, 2, None)
 
 
 def test_remove_falls_back_to_list_when_no_stored_id():
@@ -207,6 +228,7 @@ def test_enable_then_disable_lifecycle():
     mock_set.assert_called_with(1, 2, 55)
 
     with patch("adapters.install_store.get_enforcement_id", return_value=55), \
+         patch("enforcement.list_rulesets", return_value=[{"id": 55, "name": "Grug - Chief Enforcement"}]), \
          patch("enforcement.delete_ruleset") as mock_del, \
          patch("adapters.install_store.set_enforcement_id") as mock_set2:
         remove_enforcement("tok", "o", "r", 1, 2)
