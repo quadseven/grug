@@ -320,6 +320,55 @@ def test_migrate_check_context_rebuilt_entries_omit_integration_id():
     assert new_rules[0]["parameters"]["required_status_checks"] == [{"context": GRUG_DOR_CHECK_NAME}]
 
 
+def test_migrate_check_context_preserves_real_integration_id_on_healed_entry():
+    """CodeRabbit #685 (security): a legacy-alias entry scoped to a
+    specific GitHub App must keep that scoping after its context is
+    rewritten - only the null-integration_id case gets dropped, a real
+    one must survive."""
+    from enforcement import migrate_check_context
+    ruleset = {
+        "rules": [{
+            "type": "required_status_checks",
+            "parameters": {"required_status_checks": [
+                {"context": "Grug — Definition of Ready", "integration_id": 42},
+            ]},
+        }],
+    }
+    with patch("enforcement.get_ruleset", return_value=ruleset), \
+         patch("enforcement.update_ruleset") as mock_update:
+        migrate_check_context("tok", "o", "r", 555)
+
+    new_rules = mock_update.call_args.args[4]
+    assert new_rules[0]["parameters"]["required_status_checks"] == [
+        {"context": GRUG_DOR_CHECK_NAME, "integration_id": 42},
+    ]
+
+
+def test_migrate_check_context_untouched_entry_keeps_its_integration_id():
+    """CodeRabbit #685 (security): an entry that ISN'T a legacy Chief
+    alias must pass through byte-for-byte, integration_id (null or real)
+    included - only the entry actually being healed is touched."""
+    from enforcement import migrate_check_context
+    other_entry = {"context": "some-app-scoped-check", "integration_id": 7}
+    ruleset = {
+        "rules": [{
+            "type": "required_status_checks",
+            "parameters": {"required_status_checks": [
+                other_entry,
+                {"context": "Grug — Definition of Ready"},
+            ]},
+        }],
+    }
+    with patch("enforcement.get_ruleset", return_value=ruleset), \
+         patch("enforcement.update_ruleset") as mock_update:
+        migrate_check_context("tok", "o", "r", 555)
+
+    new_rules = mock_update.call_args.args[4]
+    checks = new_rules[0]["parameters"]["required_status_checks"]
+    assert checks[0] is other_entry
+    assert checks[1] == {"context": GRUG_DOR_CHECK_NAME}
+
+
 # --- remove_enforcement -----------------------------------------------
 
 def test_remove_deletes_by_stored_id():

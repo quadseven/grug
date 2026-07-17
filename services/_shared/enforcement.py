@@ -70,9 +70,18 @@ def migrate_check_context(
     (CodeRabbit #685: PUT /rulesets/{id} is not a documented partial-update
     endpoint, so a body built from a synthesized single rule risks
     silently dropping any OTHER rule type an admin added to the same
-    ruleset). Rebuilt required_status_checks entries omit integration_id
-    (matches create_ruleset's own guard - GitHub 422s on
-    integration_id: null).
+    ruleset).
+
+    Within required_status_checks itself, an entry whose context is
+    already canonical (or isn't a known Chief alias at all) is kept
+    byte-for-byte, including any `integration_id` scoping it to a
+    specific GitHub App (CodeRabbit #685: an earlier version rebuilt
+    every entry as bare {"context": ...}, silently dropping that scoping
+    and collapsing same-named checks from different integrations). Only a
+    legacy-alias entry's `context` field is rewritten; a null
+    `integration_id` on THAT entry is dropped (matches create_ruleset's
+    own guard - GitHub 422s on integration_id: null), but a real one is
+    preserved.
     """
     from personas.tribe import primary_check_name
 
@@ -84,21 +93,33 @@ def migrate_check_context(
         if changed or rule.get("type") != "required_status_checks":
             new_rules.append(rule)
             continue
-        old_contexts = [
-            c.get("context")
-            for c in rule.get("parameters", {}).get("required_status_checks", [])
-        ]
-        if not old_contexts:
+        old_checks = rule.get("parameters", {}).get("required_status_checks", [])
+        if not old_checks:
             new_rules.append(rule)
             continue
-        new_contexts: list[str] = []
+        new_checks: list[dict] = []
         seen: set[str] = set()
-        for ctx in old_contexts:
+        rule_changed = False
+        for check in old_checks:
+            ctx = check.get("context")
             canonical = primary_check_name(ctx)
-            if canonical not in seen:
+            if canonical == ctx:
+                # Untouched entry: byte-for-byte, integration_id and all.
+                if canonical in seen:
+                    rule_changed = True  # a genuine pre-existing duplicate
+                    continue
                 seen.add(canonical)
-                new_contexts.append(canonical)
-        if new_contexts == old_contexts:
+                new_checks.append(check)
+                continue
+            rule_changed = True
+            new_check = {**check, "context": canonical}
+            if new_check.get("integration_id") is None:
+                new_check.pop("integration_id", None)
+            if canonical in seen:
+                continue
+            seen.add(canonical)
+            new_checks.append(new_check)
+        if not rule_changed:
             new_rules.append(rule)
             continue
         changed = True
@@ -106,7 +127,7 @@ def migrate_check_context(
             **rule,
             "parameters": {
                 **rule.get("parameters", {}),
-                "required_status_checks": [{"context": ctx} for ctx in new_contexts],
+                "required_status_checks": new_checks,
             },
         })
     if not changed:
