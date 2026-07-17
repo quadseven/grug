@@ -87,6 +87,18 @@ _STALENESS_WATCH_INTERVAL_S = 10.0
 _ELDER_CHECK_NAME = CHECK_ELDER
 _ELDER_CHECK_NAMES = frozenset(acceptable_check_names(CHECK_ELDER))
 
+# Skip reasons where a retry can plausibly succeed (model backend outage,
+# unparseable model output, transient diff-fetch error). These raise for SQS
+# redrive instead of terminal fail-open completion. Moved-head staleness,
+# freshness brownouts, and unknown skips complete neutral; same-head
+# staleness and ineligible (draft/closed) exits intentionally stay
+# non-terminal - the requeued/reopen review completes the pending check.
+_RETRYABLE_SKIP_REASONS = frozenset({
+    "all_failed",
+    "parse_failed",
+    "fetch_or_parse_failed",
+})
+
 
 @dataclass(frozen=True, slots=True)
 class _ReviewClaimHeartbeat:
@@ -186,7 +198,15 @@ def _elder_check_already_terminal_or_pending(
             if status in {"queued", "in_progress"}:
                 return f"already_{status}"
             if status == "completed":
-                # Any completed conclusion is terminal (including
+                # A FAIL-OPEN completion (grug-cr-open external_id) must not
+                # suppress a fresh review's pending state: this enqueue IS
+                # the worker that will re-complete the check, and leaving the
+                # neutral standing keeps the merge button green with a real
+                # review in flight (e.g. right after a freshness brownout).
+                external = str(run.get("external_id") or "")
+                if external.startswith("grug-cr-open:"):
+                    return None
+                # Any REAL completed conclusion is terminal (including
                 # action_required / stale). Creating a NEW in_progress run
                 # would reopen the required check with no worker guaranteed.
                 return f"already_completed_{conclusion or 'unknown'}"
@@ -205,6 +225,77 @@ def _elder_check_already_terminal_or_pending(
             },
         )
         return None
+
+
+
+def _complete_elder_check_open(
+    *,
+    install_id: int,
+    owner: str,
+    repo_name: str,
+    pr_number: int,
+    head_sha: str,
+    title: str,
+    summary: str,
+    conclusion: str = "neutral",
+) -> bool:
+    """Post a TERMINAL Elder check so required-status never sticks in_progress.
+
+    CodeRabbit-style fail-open: infra failure / GH brownout / superseded head
+    must complete the required check as neutral (passes merge) with an honest
+    title, never leave "in_progress" forever. Never raises. Returns False
+    only on a transient post failure (the completion did NOT land, so the
+    check may still be stuck); callers on a current-head exit should redrive
+    in that case rather than silently finishing the job."""
+    if not (owner and repo_name and head_sha):
+        # Nothing addressable to complete; retrying cannot help.
+        return True
+    check = CheckRunResult(
+        name=_ELDER_CHECK_NAME,
+        head_sha=head_sha,
+        status="completed",
+        conclusion=conclusion,  # type: ignore[arg-type]
+        title=title,
+        summary=summary,
+    )
+    try:
+        with_install_token_retry(
+            install_id,
+            lambda token: post_check_run(
+                token,
+                owner,
+                repo_name,
+                check,
+                external_id=(
+                    f"grug-cr-open:{owner}/{repo_name}"
+                    f"#{pr_number}:{head_sha}"
+                ),
+            ),
+        )
+        log.info(
+            "elder_check_fail_open_completed",
+            extra={
+                "install_id": install_id,
+                "repo": f"{owner}/{repo_name}",
+                "pr": pr_number,
+                "head_sha": head_sha[:8],
+                "conclusion": conclusion,
+                "title": title[:80],
+            },
+        )
+        return True
+    except Exception as error:  # noqa: BLE001 - visibility path
+        log.warning(
+            "elder_check_fail_open_failed",
+            extra={
+                "install_id": install_id,
+                "repo": f"{owner}/{repo_name}",
+                "pr": pr_number,
+                "head_sha": head_sha[:8],
+                "kind": type(error).__name__,
+            },
+        )
+        return False
 
 
 def _post_elder_in_progress_check(
@@ -1028,6 +1119,29 @@ def _run_hot_review(
             latest = _fetch_current_pr(
                 install_id, owner, repo_name, pr_number,
             )
+            latest_head = str((latest.get("head") or {}).get("sha") or "")
+            if latest_head and latest_head != head_sha:
+                # Head actually moved: close the abandoned head's check so it
+                # never sticks in_progress. Best-effort - required-status
+                # evaluates the NEW head, so a failed post here is cosmetic.
+                _complete_elder_check_open(
+                    install_id=install_id,
+                    owner=owner,
+                    repo_name=repo_name,
+                    pr_number=pr_number,
+                    head_sha=head_sha,
+                    title="Elder superseded - new head",
+                    summary=(
+                        "A newer commit arrived while Elder was reviewing. "
+                        "This head is closed as neutral (fail-open). A fresh "
+                        "review is enqueued for the current head."
+                    ),
+                    conclusion="neutral",
+                )
+            # Same-SHA staleness (title/body intent change): leave the check
+            # in_progress - the requeued review on this same head completes
+            # it. A terminal neutral here would prematurely green the merge
+            # button before the fresh review runs.
             if _review_eligible(latest):
                 _enqueue_current_review(
                     install_id=install_id,
@@ -1050,6 +1164,12 @@ def _run_hot_review(
                 else "pr_ineligible"
             )
         if degraded_reason == "pr_ineligible":
+            # NO terminal completion here: a draft/closed PR cannot merge, so
+            # a lingering in_progress check blocks nothing - but a terminal
+            # neutral on this head WOULD satisfy the required check the
+            # moment the PR is reopened/marked ready, before the freshly
+            # scheduled review posts. Leave the check pending; the
+            # ready_for_review/reopen enqueue completes it via a real review.
             if not _stop_review_claim_heartbeat(heartbeat):
                 raise RuntimeError(
                     "Elder review claim ownership lost during dispatch"
@@ -1062,11 +1182,95 @@ def _run_hot_review(
         result_status = result.get("result")
         if result_status == "publish_failed":
             raise RuntimeError("Elder review publication failed")
-        if result_status == "skipped" and degraded_reason != "no_diff":
-            raise RuntimeError(
-                f"Elder review degraded: {degraded_reason or 'unknown'}"
+        # Fail-open like CodeRabbit: infra / GH brownout must COMPLETE the
+        # required check as neutral, never leave in_progress forever and
+        # never redrive forever. Real model findings still use pass/fail.
+        if result_status == "skipped" and degraded_reason == "freshness_check_failed":
+            posted = _complete_elder_check_open(
+                install_id=install_id,
+                owner=owner,
+                repo_name=repo_name,
+                pr_number=pr_number,
+                head_sha=head_sha,
+                title="Elder eyes clouded - GitHub unavailable",
+                summary=(
+                    "Could not re-fetch the PR to confirm snapshot freshness "
+                    "(GitHub 5xx / transport). Grug fail-open: required check "
+                    "concludes **neutral** so merge is not blocked by infra. "
+                    "Push again or re-run Elder when GitHub is healthy."
+                ),
+                conclusion="neutral",
             )
-        if result_status not in {"pass", "fail", "skipped"}:
+            if not posted:
+                # The same brownout ate the neutral completion: finishing the
+                # job now would leave the required check in_progress forever
+                # with no retry - the exact bug fail-open exists to prevent.
+                # Raise for redrive; a later attempt reviews or re-posts.
+                raise RuntimeError(
+                    "Elder fail-open completion did not land (freshness outage)"
+                )
+            if not _stop_review_claim_heartbeat(heartbeat):
+                raise RuntimeError(
+                    "Elder review claim ownership lost after fail-open"
+                )
+            if not complete_review_claim(**owned_claim_args):
+                # Prefer release over hang if complete fails - but if the
+                # fallback release ALSO fails, the claim is still held and
+                # silently returning would report success while blocking
+                # every future attempt until lease expiry. Raise for redrive.
+                if not release_review_claim(**owned_claim_args):
+                    raise RuntimeError(
+                        "Elder fail-open claim settlement failed (freshness)"
+                    )
+            return "fail_open_freshness"
+        if result_status == "skipped" and degraded_reason in _RETRYABLE_SKIP_REASONS:
+            # Model/content-side transient (backend outage, unparseable
+            # output, diff fetch blip): a retry can succeed, so release the
+            # claim and raise for SQS redrive instead of failing open. These
+            # paths publish their own completed degraded check (or redrive
+            # re-runs the review), so they cannot stick in_progress; the DLQ
+            # poison monitor covers a sustained outage.
+            raise RuntimeError(
+                f"Elder review degraded: {degraded_reason}"
+            )
+        if result_status == "skipped" and degraded_reason not in (
+            "no_diff", "fail_open_freshness",
+        ):
+            # Unknown skip: still fail-open rather than infinite redrive.
+            posted = _complete_elder_check_open(
+                install_id=install_id,
+                owner=owner,
+                repo_name=repo_name,
+                pr_number=pr_number,
+                head_sha=head_sha,
+                title=f"Elder skipped - {degraded_reason or 'unknown'}",
+                summary=(
+                    f"Review returned skipped ({degraded_reason or 'unknown'}). "
+                    "Grug fail-open: required check concludes **neutral** so "
+                    "infra cannot brick the merge. Re-run Elder if needed."
+                ),
+                conclusion="neutral",
+            )
+            if not posted:
+                # Fail-open only counts if the completion landed; otherwise
+                # redrive so the check cannot stay in_progress forever.
+                raise RuntimeError(
+                    "Elder fail-open completion did not land "
+                    f"(skip: {degraded_reason or 'unknown'})"
+                )
+            if not _stop_review_claim_heartbeat(heartbeat):
+                raise RuntimeError(
+                    "Elder review claim ownership lost after fail-open skip"
+                )
+            if not complete_review_claim(**owned_claim_args):
+                # Same both-failed guard as the freshness branch above.
+                if not release_review_claim(**owned_claim_args):
+                    raise RuntimeError(
+                        "Elder fail-open claim settlement failed "
+                        f"(skip: {degraded_reason or 'unknown'})"
+                    )
+            return f"fail_open_{degraded_reason or 'skipped'}"
+        if result_status not in {"pass", "fail", "skipped"} and not str(result_status).startswith("fail_open"):
             raise RuntimeError(
                 f"Elder review returned unexpected result: {result_status!r}"
             )
