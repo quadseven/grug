@@ -54,6 +54,7 @@ from rerun_personas import (
 )
 from rerun_queue import (
     ask_group_id as _ask_group_id,
+    learn_group_id as _learn_group_id,
     rerun_group_id as _rerun_group_id,
     review_group_id as _review_group_id,
 )
@@ -533,6 +534,37 @@ def enqueue_ask(*, install_id: int, repo: str, pr_number: int, comment_id: int, 
                                     "pr": pr_number, "comment_id": comment_id})
 
 
+def enqueue_learn(
+    *, install_id: int, repo: str, pr_number: int, comment_id: int,
+    parent_comment_id: int, reply_text: str, author: str = "",
+) -> None:
+    """Enqueue a learnings-classification job (#670, ADR-0020) so the LLM
+    classifier runs in the consumer, NOT inline in the webhook ACK path.
+    `comment_id` is the maintainer's REPLY (the dedup key - a re-delivered
+    reply collapses); `parent_comment_id` is grug's finding it answers;
+    `author` is the maintainer who taught it (the reply's sender). Runs in
+    its OWN FIFO group so a slow classify never serializes with /grug ask."""
+    if not _RERUN_QUEUE_URL:
+        raise RuntimeError("GRUG_RERUN_QUEUE_URL not configured")
+    _sqs.send_message(
+        QueueUrl=_RERUN_QUEUE_URL,
+        MessageBody=json.dumps({
+            "schema_version": SCHEMA_VERSION, "kind": "learn",
+            "install_id": install_id, "repo": repo, "pr_number": pr_number,
+            "comment_id": comment_id, "parent_comment_id": parent_comment_id,
+            "reply_text": reply_text, "author": author,
+        }),
+        MessageGroupId=_learn_group_id(install_id, repo, pr_number),
+        # Hash the dedup id: a long owner/repo can push the plain string past
+        # SQS's 128-char limit and fail send_message (same fix as the group id).
+        MessageDeduplicationId="learn:" + hashlib.sha256(
+            f"{install_id}\x1f{repo}\x1f{pr_number}\x1f{comment_id}".encode("utf-8")
+        ).hexdigest(),
+    )
+    log.info("learn_enqueued", extra={"install_id": install_id, "repo": repo,
+                                      "pr": pr_number, "comment_id": comment_id})
+
+
 def _gh_get(token: str, url: str) -> dict[str, Any]:
     resp = httpx.get(
         url,
@@ -609,6 +641,160 @@ def _run_ask(install_id: int, repo_full: str, pr_number: int, question: str) -> 
     return result
 
 
+def _defuse_md(s: str) -> str:
+    """Neutralize model-produced text before it lands in a GitHub comment
+    body. The learning/scope come from the classifier (derived from an
+    untrusted reply), so strip HTML-significant chars (a stray </details>
+    would break out of the ack's collapsible), backticks/pipes, and flatten
+    newlines; cap to bound a hostile payload."""
+    return (
+        s.replace("<", "&lt;").replace(">", "&gt;")
+        .replace("`", "'").replace("|", "\\|")
+        .replace("\r", " ").replace("\n", " ")
+        # A zero-width space after @ breaks GitHub's mention parsing, so a
+        # model-restated "@org/team" cannot ping people from grug's ack
+        # (renders identically to the reader).
+        .replace("@", "@\u200b")
+    )[:600]
+
+
+def _learn_ack_body(learning: str, scope_path: str) -> str:
+    """The 'Markings remembered' threaded reply for a stored learning. The
+    model-produced fields are markdown-defused so they cannot corrupt the
+    comment's <details> rendering or inject unintended mentions."""
+    rule = _defuse_md(learning)
+    scope = f"\n> Scope: '{_defuse_md(scope_path)}'" if scope_path else ""
+    return (
+        "Grug remember this.\n\n"
+        "<details><summary>Markings remembered</summary>\n\n"
+        f"> {rule}{scope}\n\n"
+        "Grug will apply this to future reviews on this repo. "
+        "So speaks Grug.\n</details>"
+    )
+
+
+_LEARN_DECLINE_BODY = (
+    "Grug read this, but hear it as one-time talk for this hunt - "
+    "Grug did not carve a lasting marking. Tell Grug a rule for the whole "
+    "tribe if you want it remembered."
+)
+
+
+def _run_learn(
+    install_id: int, repo_full: str, pr_number: int,
+    comment_id: int, parent_comment_id: int, reply_text: str,
+    author: str = "",
+) -> str:
+    """Classify a maintainer's reply to a finding and, if it is a durable team
+    preference, store it and acknowledge in the thread (#670, ADR-0020).
+
+    A classifier BACKEND failure raises for SQS redrive (a transient outage
+    must not be mislabeled a deliberate one-off, and no ack is posted so the
+    retry can succeed). A definite verdict (durable OR one-off) is win-once
+    per reply comment: the first run acks, a redelivery is a no-op, so the
+    finding thread never gets duplicate acknowledgments."""
+    from urllib.parse import quote as _q
+    from adapters.install_store import (  # type: ignore
+        claim_delivery, get_comment_record, get_learning_by_source_comment,
+        put_learning,
+    )
+    from llm_client import classify_learning  # type: ignore
+    from observability import emit_gauge  # type: ignore
+
+    owner, _, repo_name = repo_full.partition("/")
+    record = get_comment_record(install_id, parent_comment_id)
+    if record is None:
+        # The reply is not to one of grug's tracked findings (or the record
+        # TTL-expired). Nothing to learn from; do not post noise.
+        log.info("learn_no_parent_record", extra={
+            "repo": repo_full, "pr": pr_number, "parent": parent_comment_id})
+        return "learn_no_parent"
+
+    # Redelivery fast-path: if THIS reply already produced a stored learning,
+    # skip the non-deterministic classifier (a re-run could word the rule
+    # differently and store a second row) and reuse the stored rule; the
+    # win-once claim below still gates the ack. A transient failure BEFORE
+    # the store leaves no row, so the retry classifies cleanly.
+    already = get_learning_by_source_comment(repo_full, comment_id)
+    if already is not None:
+        classification: Any = {
+            "durable": True,
+            "learning": str(already.get("text", "")),
+            "scope_path": str(already.get("scope_path", "")),
+        }
+    else:
+        finding_text = str(record.get("finding_text", ""))
+        finding_tags = dict(record.get("finding_tags", {}))
+        classification = classify_learning(
+            reply_text, finding_text, finding_tags, install_id,
+            pr_context={
+                "installation_id": install_id, "repo": repo_full,
+                "pr_number": pr_number,
+            },
+        )
+    if classification is None:
+        # Transient: backend down or unparseable. Raise for redrive rather
+        # than tell the maintainer their durable rule was judged one-off.
+        # No store, no claim, no ack, so the retry re-classifies cleanly.
+        raise RuntimeError("learn classifier unavailable")
+
+    # STORE FIRST, before the win-once claim. put_learning is idempotent (keyed
+    # on the rule digest), so a redelivery re-storing is a harmless no-op - but
+    # storing before the claim means a later put/ack failure can never lose the
+    # learning (the claim, made only for the ACK, would otherwise short-circuit
+    # the retry and drop the rule entirely). CodeRabbit data-integrity fix.
+    if classification["durable"]:
+        put_learning(
+            repo=repo_full,
+            text=classification["learning"],
+            scope_path=classification["scope_path"],
+            source_pr=pr_number,
+            source_comment_id=comment_id,
+            author=author,  # the maintainer who TAUGHT it (reply sender)
+        )
+        ack = _learn_ack_body(
+            classification["learning"], classification["scope_path"],
+        )
+        result = "learned"
+    else:
+        # Deliberate one-off: acknowledge without storing.
+        ack = _LEARN_DECLINE_BODY
+        result = "learn_one_off"
+
+    # The claim guards ONLY the ack (the one non-idempotent side effect): a
+    # redelivery whose learning is already stored must not re-post the reply.
+    # A genuine RE-TEACH is a NEW reply comment (distinct claim), so it acks.
+    if not claim_delivery(f"learn:{comment_id}"):
+        log.info("learn_already_acked", extra={
+            "repo": repo_full, "pr": pr_number, "comment_id": comment_id})
+        return "learn_duplicate"
+
+    def _reply(token: str) -> None:
+        _gh_post(
+            token,
+            f"{_GH_API}/repos/{_q(owner, safe='')}/{_q(repo_name, safe='')}"
+            f"/pulls/{pr_number}/comments/{parent_comment_id}/replies",
+            {"body": ack},
+        )
+    # Best-effort: the learning is already durably stored, so a transient reply
+    # failure must NOT redrive (which would re-classify + risk a wrong verdict)
+    # nor raise - it just costs the courtesy ack, which a re-teach would repost.
+    try:
+        with_install_token_retry(install_id, _reply)
+    except Exception as e:  # noqa: BLE001
+        log.warning("learn_ack_post_failed", extra={
+            "repo": repo_full, "pr": pr_number, "comment_id": comment_id,
+            "kind": type(e).__name__})
+    try:
+        emit_gauge("grug.learnings.classified", 1)
+    except Exception:  # noqa: BLE001
+        pass
+    log.info("learn_classified", extra={
+        "repo": repo_full, "pr": pr_number, "comment_id": comment_id,
+        "result": result})
+    return result
+
+
 def _run_one(body: str) -> str:
     """Re-run ONE job. Raises on a malformed message or an infra fetch failure
     (→ ESM retry → DLQ). Returns a short status for the batch summary log.
@@ -622,6 +808,14 @@ def _run_one(body: str) -> str:
     pr_number = int(job["pr_number"])
     if job.get("kind") == "ask":
         return _run_ask(install_id, repo_full, pr_number, str(job.get("question", "")))
+    if job.get("kind") == "learn":
+        return _run_learn(
+            install_id, repo_full, pr_number,
+            int(job.get("comment_id", 0)),
+            int(job.get("parent_comment_id", 0)),
+            str(job.get("reply_text", "")),
+            str(job.get("author", "")),
+        )
     if job.get("kind") == "review":
         return _run_hot_review(job, install_id, repo_full, pr_number)
     persona = str(job.get("persona", "elder"))

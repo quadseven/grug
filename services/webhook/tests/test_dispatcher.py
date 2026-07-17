@@ -543,3 +543,121 @@ def test_pull_request_publish_success_runs_ticket_compliance():
 
     assert out["personas"][0] == {"persona": "tpm", "result": "pass"}
     mock_compliance.assert_called_once()
+
+
+# --- reply-mined learnings inbound handler (#670, ADR-0020) -----------------
+
+def _review_reply_payload(**over):
+    p = {
+        "action": "created",
+        "comment": {
+            "id": 5001,
+            "in_reply_to_id": 4000,
+            "body": "we always prefer early returns here, monitoring tracks the codes",
+            "user": {"login": "dev", "type": "User"},
+        },
+        "pull_request": {"number": 42, "user": {"login": "dev"}},
+        "repository": {"id": 7777, "name": "infra", "owner": {"login": "githumps"},
+                       "full_name": "githumps/infra"},
+        "installation": {"id": 999},
+        "sender": {"login": "dev"},
+    }
+    for k, v in over.items():
+        if k in ("comment", "pull_request", "sender") and isinstance(v, dict):
+            p[k] = {**p[k], **v}
+        else:
+            p[k] = v
+    return p
+
+
+def test_review_reply_enqueues_for_write_author():
+    # The PR author teaches, AND has write perm -> enqueued, author threaded.
+    with patch("dispatcher.is_install_allowlisted", return_value=True), \
+         patch("dispatcher.is_persona_enabled", return_value=True), \
+         patch("github_app_auth.with_install_token_retry", side_effect=lambda iid, fn: "admin"), \
+         patch("rerun.enqueue_learn") as mock_enq:
+        out = dispatch("pull_request_review_comment", _review_reply_payload())
+    assert out == {"status": "enqueued", "kind": "learn"}
+    kw = mock_enq.call_args.kwargs
+    assert kw["repo"] == "githumps/infra" and kw["parent_comment_id"] == 4000
+    assert kw["comment_id"] == 5001 and kw["pr_number"] == 42
+    assert kw["author"] == "dev"  # the reply sender is the teacher
+
+
+def test_review_reply_fork_author_without_write_is_blocked():
+    # THE poisoning guard: a fork contributor IS the PR author on their own
+    # fork PR but has only read access -> must NOT be able to teach.
+    payload = _review_reply_payload(
+        pull_request={"number": 42, "user": {"login": "forkuser"}},
+        sender={"login": "forkuser"},
+    )
+    with patch("dispatcher.is_install_allowlisted", return_value=True), \
+         patch("dispatcher.is_persona_enabled", return_value=True), \
+         patch("github_app_auth.with_install_token_retry", side_effect=lambda iid, fn: "read"), \
+         patch("rerun.enqueue_learn") as mock_enq:
+        out = dispatch("pull_request_review_comment", payload)
+    assert out["status"] == "no_op" and "lacks write perm" in out["reason"]
+    mock_enq.assert_not_called()
+
+
+def test_review_reply_not_a_reply_is_no_op():
+    payload = _review_reply_payload(comment={"in_reply_to_id": None})
+    with patch("rerun.enqueue_learn") as mock_enq:
+        out = dispatch("pull_request_review_comment", payload)
+    assert out["status"] == "no_op" and out["reason"] == "not a reply"
+    mock_enq.assert_not_called()
+
+
+def test_review_reply_from_bot_is_ignored():
+    payload = _review_reply_payload(comment={"user": {"login": "grug[bot]", "type": "Bot"}})
+    with patch("rerun.enqueue_learn") as mock_enq:
+        out = dispatch("pull_request_review_comment", payload)
+    assert out["status"] == "no_op" and out["reason"] == "reply author is a bot"
+    mock_enq.assert_not_called()
+
+
+def test_review_reply_from_non_collaborator_is_blocked():
+    # sender != PR author, and the permission lookup returns "read".
+    payload = _review_reply_payload(sender={"login": "randopublic"})
+    with patch("dispatcher.is_install_allowlisted", return_value=True), \
+         patch("dispatcher.is_persona_enabled", return_value=True), \
+         patch("github_app_auth.with_install_token_retry", side_effect=lambda iid, fn: "read"), \
+         patch("rerun.enqueue_learn") as mock_enq:
+        out = dispatch("pull_request_review_comment", payload)
+    assert out["status"] == "no_op" and "lacks write perm" in out["reason"]
+    mock_enq.assert_not_called()
+
+
+def test_review_reply_reviewer_disabled_is_no_op():
+    # Gated on the REVIEWER persona (learnings feed Elder), not tpm.
+    with patch("dispatcher.is_install_allowlisted", return_value=True), \
+         patch("dispatcher.is_persona_enabled", return_value=False), \
+         patch("rerun.enqueue_learn") as mock_enq:
+        out = dispatch("pull_request_review_comment", _review_reply_payload())
+    assert out["status"] == "no_op" and "code_reviewer disabled" in out["reason"]
+    mock_enq.assert_not_called()
+
+
+def test_review_reply_write_collaborator_enqueues():
+    payload = _review_reply_payload(sender={"login": "teammate"})
+    with patch("dispatcher.is_install_allowlisted", return_value=True), \
+         patch("dispatcher.is_persona_enabled", return_value=True), \
+         patch("github_app_auth.with_install_token_retry", side_effect=lambda iid, fn: "write"), \
+         patch("rerun.enqueue_learn") as mock_enq:
+        out = dispatch("pull_request_review_comment", payload)
+    assert out == {"status": "enqueued", "kind": "learn"}
+    mock_enq.assert_called_once()
+
+
+def test_review_reply_enqueue_sqs_failure_is_skip_not_500():
+    # A botocore/SQS send failure must return skip, never bubble to a 500.
+    class _Boom(Exception):
+        pass
+    def _raise_enqueue(**kw):
+        raise _Boom("sqs unavailable")
+    with patch("dispatcher.is_install_allowlisted", return_value=True), \
+         patch("dispatcher.is_persona_enabled", return_value=True), \
+         patch("github_app_auth.with_install_token_retry", side_effect=lambda iid, fn: "write"), \
+         patch("rerun.enqueue_learn", side_effect=_raise_enqueue):
+        out = dispatch("pull_request_review_comment", _review_reply_payload())
+    assert out["status"] == "skip" and out["reason"] == "enqueue_failed"

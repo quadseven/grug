@@ -22,7 +22,7 @@ from __future__ import annotations
 
 import logging
 from datetime import datetime, timezone
-from typing import Any, Literal, NotRequired, Optional, TypedDict
+from typing import Any, Literal, NotRequired, Optional, TypedDict, cast
 
 from psycopg.types.json import Jsonb
 
@@ -756,6 +756,172 @@ def get_repo_exemplars(repo: str) -> list[dict[str, Any]]:
     """The cached few-shot exemplars for a repo, or [] if none derived."""
     item = _get_item(_ledger_pk(repo), "EXEMPLARS")
     return list(item.get("exemplars", [])) if item else []
+
+
+# --- Reply-mined learnings (#670 slice 1, ADR-0020) ---------------------
+# Learnings are OPERATOR-taught: a maintainer replied to a finding with a
+# preference and grug's classifier restated it as a durable rule. They are
+# repo-scoped like the ledger but live under their OWN partition
+# (LEARN#<repo>) so they never collide with the ledger corpus scan or its
+# PRACTICES / EXEMPLARS cache rows. Distinct from the outcome-taught ledger:
+# see ADR-0020 for why the two corpora stay separate.
+
+
+class Learning(TypedDict):
+    text: str
+    repo: str
+    scope_path: NotRequired[str]
+    source_pr: NotRequired[int]
+    source_comment_id: NotRequired[int]
+    author: NotRequired[str]
+    created_at: NotRequired[str]
+    usage_count: NotRequired[int]
+    last_used_at: NotRequired[str]
+
+
+def _learning_pk(repo: str) -> str:
+    return f"LEARN#{repo}"
+
+
+def _learning_digest(text: str) -> str:
+    """Stable 12-hex identity of a learning from its rule text, so the same
+    preference taught twice heals in place instead of duplicating."""
+    import hashlib
+    return hashlib.sha256(text.strip().encode("utf-8")).hexdigest()[:12]
+
+
+def _learning_sk(digest: str) -> str:
+    return f"LEARNING#{digest}"
+
+
+def _normalize_utc_iso(stamp: str) -> str:
+    """Coerce a timestamp string to UTC ISO-8601 (+00:00), or now() when
+    empty/unparseable. Uniform format keeps text ordering == time ordering."""
+    if stamp:
+        try:
+            parsed = datetime.fromisoformat(stamp)
+            if parsed.tzinfo is None:
+                parsed = parsed.replace(tzinfo=timezone.utc)
+            return parsed.astimezone(timezone.utc).isoformat()
+        except ValueError:
+            pass
+    return datetime.now(timezone.utc).isoformat()
+
+
+# Learnings decay if never reinforced: a taught rule that stays relevant gets
+# re-taught (or its finding keeps recurring and the maintainer re-confirms),
+# refreshing the TTL; a now-wrong rule ages out on its own. This bounds the
+# blast radius of a stale rule in slice 1, which ships no delete command yet
+# (the sibling PRACTICES/EXEMPLARS caches that ride the same prompt also expire).
+_LEARNING_TTL_DAYS = 180
+
+
+def put_learning(
+    *,
+    repo: str,
+    text: str,
+    scope_path: str = "",
+    source_pr: int = 0,
+    source_comment_id: int = 0,
+    author: str = "",
+    created_at: str = "",
+) -> None:
+    """Upsert one durable learning under LEARN#<repo>. Keyed by the rule
+    text's content digest. A re-teach of the same text REFRESHES the mutable
+    metadata (scope, source, author), the TTL, and `reinforced_at`, but
+    PRESERVES the original created_at and usage counters. Listing orders by
+    reinforced_at, so a re-taught old rule moves back into the prompt window
+    (matching the 'remembered' ack) while first-taught provenance survives."""
+    rule = text.strip()
+    if not (repo and rule):
+        return
+    # Normalize the timestamp to a uniform UTC ISO format: listing orders by
+    # this value AS TEXT, and lexicographic == chronological only when every
+    # stored stamp shares one format/offset. A caller-supplied stamp in
+    # another offset or precision would misorder the newest-first prompt
+    # window (Qodo correctness).
+    now = _normalize_utc_iso(created_at)
+    ttl = int(datetime.now(timezone.utc).timestamp() + _LEARNING_TTL_DAYS * 86400)
+    with get_pool().connection() as conn:
+        conn.execute(
+            """
+            INSERT INTO grug_kv (pk, sk, data, ttl)
+            VALUES (%(pk)s, %(sk)s, %(data)s, %(ttl)s)
+            ON CONFLICT (pk, sk) DO UPDATE
+                -- take the NEW row's fields (incl. a fresh reinforced_at), but
+                -- keep the ORIGINAL created_at + usage counters. Refreshes the
+                -- TTL (use-it-or-lose-it) and lets a narrowed scope win.
+                SET ttl = %(ttl)s,
+                    data = EXCLUDED.data || jsonb_build_object(
+                        'created_at', grug_kv.data->'created_at',
+                        'usage_count', grug_kv.data->'usage_count',
+                        'last_used_at', grug_kv.data->'last_used_at'
+                    )
+            """,
+            {
+                "pk": _learning_pk(repo),
+                "sk": _learning_sk(_learning_digest(rule)),
+                "ttl": ttl,
+                "data": encode_attrs({
+                    "text": rule,
+                    "repo": repo,
+                    "scope_path": scope_path,
+                    "source_pr": int(source_pr),
+                    "source_comment_id": int(source_comment_id),
+                    "author": author,
+                    "created_at": now,
+                    "reinforced_at": now,
+                    "usage_count": 0,
+                    "last_used_at": "",
+                }),
+            },
+        )
+
+
+def list_learnings(repo: str, limit: int | None = None) -> list[Learning]:
+    """Every durable learning for a repo, oldest first. Read at review time
+    to steer Elder's prompt (ADR-0020). Empty list when none taught yet."""
+    with get_pool().connection() as conn:
+        rows = conn.execute(
+            f"""
+            SELECT pk, sk, data FROM grug_kv
+            WHERE pk = %s AND sk LIKE 'LEARNING#%%' AND {TTL_LIVE}
+            -- order by REINFORCED time (a re-teach bumps it), so a just-
+            -- reinforced old rule moves into the newest-first prompt window;
+            -- fall back to created_at for pre-reinforced_at rows.
+            ORDER BY COALESCE(data->>'reinforced_at', data->>'created_at') ASC,
+                     sk COLLATE "C" ASC
+            """,
+            (_learning_pk(repo),),
+        ).fetchall()
+    out = [cast("Learning", decode_item(pk, sk, data)) for pk, sk, data in rows]
+    return out if limit is None else out[:limit]
+
+
+def get_learning_by_source_comment(
+    repo: str, source_comment_id: int,
+) -> Optional[Learning]:
+    """The learning taught by a specific reply comment, or None. Lets an SQS
+    redelivery detect that this reply was already classified-and-stored, so
+    it skips the non-deterministic classifier instead of re-running it and
+    possibly storing a second, differently-worded rule (Qodo reliability)."""
+    if not source_comment_id:
+        return None
+    for row in list_learnings(repo):
+        if int(row.get("source_comment_id") or 0) == int(source_comment_id):
+            return row
+    return None
+
+
+def get_comment_record(
+    install_id: int, comment_id: int | str,
+) -> Optional[CommentRecord]:
+    """The stored CommentRecord for one of grug's own finding comments, or
+    None. Used to join a maintainer's inline REPLY (via in_reply_to_id) back
+    to the finding it answers - the same identity the reaction poller uses,
+    but keyed to a single comment instead of scanning the whole install."""
+    item = _get_item(_inst_pk(install_id), _comment_record_sk(comment_id))
+    return cast("Optional[CommentRecord]", item) if item else None
 
 
 _DELIVERY_CLAIM_TTL_HOURS = 24

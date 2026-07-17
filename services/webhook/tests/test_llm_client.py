@@ -2270,6 +2270,96 @@ def test_answer_pr_question_returns_none_on_backend_failure(monkeypatch) -> None
     assert all(c["metadata"]["kind"] == "transport_error" for c in annotate_calls)
 
 
+# --- reply-mined learnings (#670, ADR-0020) --------------------------------
+
+def test_classify_learning_durable_returns_rule_and_scope() -> None:
+    payload = json.dumps({
+        "durable": True,
+        "learning": "In auth middleware, prefer early returns with error codes.",
+        "scope_path": "**/middleware/*.py",
+    })
+    response = httpx.Response(200, json=_openai_json_response(payload))
+    with patch.object(httpx, "post", return_value=response):
+        out = lc.classify_learning(
+            "we always do early returns here, our monitoring tracks the codes",
+            "consider nested try/except", {"rule_name": "error-handling"},
+            installation_id=2,
+        )
+    assert out is not None
+    assert out["durable"] is True
+    assert "early returns" in out["learning"]
+    assert out["scope_path"] == "**/middleware/*.py"
+
+
+def test_classify_learning_one_off_does_not_store() -> None:
+    payload = json.dumps({"durable": False, "learning": "", "scope_path": ""})
+    response = httpx.Response(200, json=_openai_json_response(payload))
+    with patch.object(httpx, "post", return_value=response):
+        out = lc.classify_learning(
+            "yeah that's fine just for this PR", "finding text",
+            {"rule_name": "r"}, installation_id=2,
+        )
+    assert out is not None
+    assert out["durable"] is False and out["learning"] == ""
+
+
+def test_classify_learning_durable_but_empty_rule_coerced_to_one_off() -> None:
+    # A 'durable' verdict with no rule text is unusable - never store empty.
+    payload = json.dumps({"durable": True, "learning": "  ", "scope_path": ""})
+    response = httpx.Response(200, json=_openai_json_response(payload))
+    with patch.object(httpx, "post", return_value=response):
+        out = lc.classify_learning("x", "y", {"rule_name": "r"}, installation_id=2)
+    assert out is not None and out["durable"] is False
+
+
+def test_classify_learning_non_string_rule_is_one_off() -> None:
+    payload = json.dumps({"durable": True, "learning": {"nested": "obj"}})
+    response = httpx.Response(200, json=_openai_json_response(payload))
+    with patch.object(httpx, "post", return_value=response):
+        out = lc.classify_learning("x", "y", {"rule_name": "r"}, installation_id=2)
+    assert out is not None and out["durable"] is False and out["learning"] == ""
+
+
+def test_classify_learning_returns_none_on_backend_failure() -> None:
+    with patch.object(httpx, "post", side_effect=httpx.ConnectError("down")):
+        out = lc.classify_learning("x", "y", {"rule_name": "r"}, installation_id=2)
+    assert out is None
+
+
+def test_render_learnings_block_bounded_and_sanitized() -> None:
+    rows = [
+        {"text": "prefer early returns", "scope_path": "**/mw/*.py"},
+        {"text": "name the caller when not updated", "scope_path": ""},
+        {"text": "   ", "scope_path": ""},  # blank -> skipped
+    ]
+    block = lc._render_learnings_block(rows)
+    assert "WHAT YOUR TRIBE TOLD GRUG" in block
+    assert "(**/mw/*.py) prefer early returns" in block
+    assert "- name the caller when not updated" in block
+    assert block.count("\n-") == 2  # the blank row is skipped
+
+
+def test_render_learnings_block_empty_on_no_usable_rows() -> None:
+    assert lc._render_learnings_block([]) == ""
+    assert lc._render_learnings_block([{"text": ""}]) == ""
+
+
+def test_render_learnings_block_truncates_a_flood() -> None:
+    rows = [{"text": "rule " + "x" * 200, "scope_path": ""} for _ in range(50)]
+    block = lc._render_learnings_block(rows, max_chars=300)
+    assert "older learnings omitted" in block
+    assert len(block) < 700
+
+
+def test_render_learnings_block_keeps_newest_when_truncated() -> None:
+    # Oldest-first input; the NEWEST rule must survive count+byte truncation.
+    rows = [{"text": f"old rule {i}", "scope_path": ""} for i in range(60)]
+    rows.append({"text": "BRAND NEW RULE", "scope_path": ""})
+    block = lc._render_learnings_block(rows, max_chars=2000)
+    assert "BRAND NEW RULE" in block  # newest kept
+    assert "old rule 0" not in block  # oldest dropped by the count cap
+
+
 def test_summarize_pr_tolerates_missing_optional_fields() -> None:
     payload = json.dumps({"summary": "A small fix."})
     response = httpx.Response(200, json=_openai_json_response(payload))
@@ -2398,3 +2488,29 @@ def test_annotate_failure_never_discards_a_valid_answer(monkeypatch) -> None:
     with patch.object(httpx, "post", return_value=response):
         out = lc.answer_pr_question("q", "diff", installation_id=2)
     assert out == "It adds a retry loop."
+
+
+def test_render_learnings_block_sanitizes_scope() -> None:
+    # A scope glob with newlines/control chars must be flattened, not raw.
+    rows = [{"text": "some rule", "scope_path": "**/x/*.py\n\ninjected: line"}]
+    block = lc._render_learnings_block(rows)
+    assert "\n\ninjected" not in block  # newlines flattened out of the scope
+    assert "some rule" in block
+
+
+def test_classify_learning_string_durable_is_rejected() -> None:
+    # bool("false") is True; a string "false" must NOT persist as durable.
+    payload = json.dumps({"durable": "false", "learning": "x", "scope_path": ""})
+    response = httpx.Response(200, json=_openai_json_response(payload))
+    with patch.object(httpx, "post", return_value=response):
+        out = lc.classify_learning("q", "f", {"rule_name": "r"}, installation_id=2)
+    # non-boolean durable -> parse failure on both backends -> None (redrive)
+    assert out is None
+
+
+def test_render_learnings_block_redacts_secret_before_truncation() -> None:
+    # A secret-shaped value must be masked even when it sits near the byte cut.
+    fake = "AKIA" + "".join(["ABCDEFGHIJKLMNOP"[i % 16] for i in range(16)])
+    rows = [{"text": f"allow key {fake} in fixtures", "scope_path": ""}]
+    block = lc._render_learnings_block(rows)
+    assert fake not in block  # redacted before it reached the block

@@ -426,6 +426,73 @@ def test_comment_records_roundtrip_and_ttl_filtering(pg):
     assert store.list_comment_records(1) == []
 
 
+def test_learnings_roundtrip_dedup_and_ttl(pg):
+    from adapters import pg_install_store as store
+
+    store.put_learning(
+        repo="o/r", text="  prefer early returns with error codes  ",
+        scope_path="**/middleware/*.py", source_pr=7,
+        source_comment_id=100, author="dev",
+    )
+    got = store.list_learnings("o/r")
+    assert len(got) == 1
+    row = got[0]
+    assert row["text"] == "prefer early returns with error codes"  # stripped
+    assert row["scope_path"] == "**/middleware/*.py"
+    assert row["source_pr"] == 7 and row["author"] == "dev"
+    assert row["usage_count"] == 0 and row["last_used_at"] == ""
+    first_created = row["created_at"]
+    assert row["reinforced_at"] == first_created  # first teach: same as created
+
+    # Re-teaching the SAME rule (whitespace-different) heals in place: same
+    # digest, no duplicate row. The LATEST teaching's mutable fields win (so a
+    # scope change is honored and the ack stays truthful), but created_at and
+    # usage counters are preserved from the first teach.
+    store.put_learning(
+        repo="o/r", text="prefer early returns with error codes",
+        scope_path="**/api/*.py", source_pr=9, author="other",
+        created_at="2099-01-01T00:00:00+00:00",  # a distinct re-teach stamp
+    )
+    again = store.list_learnings("o/r")
+    assert len(again) == 1
+    assert again[0]["created_at"] == first_created  # first-taught time preserved
+    assert again[0]["usage_count"] == 0  # counters preserved
+    assert again[0]["scope_path"] == "**/api/*.py"  # newest scope wins
+    assert again[0]["source_pr"] == 9  # newest provenance wins
+    # reinforced_at moved to the re-teach stamp (drives prompt-window ordering),
+    # while created_at stayed at the first teach.
+    assert again[0]["reinforced_at"] == "2099-01-01T00:00:00+00:00"
+
+    # A DIFFERENT rule is a distinct row; repo-scoped isolation holds.
+    store.put_learning(repo="o/r", text="name the caller when it is not updated")
+    assert len(store.list_learnings("o/r")) == 2
+    assert store.list_learnings("other/repo") == []
+
+    # Expired learnings vanish from reads even before any purge runs.
+    with store.get_pool().connection() as conn:
+        conn.execute(
+            "UPDATE grug_kv SET ttl = EXTRACT(EPOCH FROM now())::bigint - 10 "
+            "WHERE pk = 'LEARN#o/r'"
+        )
+    assert store.list_learnings("o/r") == []
+
+
+def test_get_comment_record_single_lookup(pg):
+    from adapters import pg_install_store as store
+
+    store.put_comment_record(
+        install_id=1, comment_id=555, repo="o/r", pr_number=5,
+        review_span_context=None, finding_tags={"rule_name": "early-return"},
+        finding_text="consider early return",
+    )
+    rec = store.get_comment_record(1, 555)
+    assert rec is not None
+    assert rec["comment_id"] == 555 and rec["repo"] == "o/r"
+    assert rec["finding_tags"]["rule_name"] == "early-return"
+    # Unknown comment id -> None (a reply to a non-grug comment).
+    assert store.get_comment_record(1, 999) is None
+
+
 # ---------------------------------------------------------------------------
 # user store (KMS faked - the envelope is out of scope, storage is not)
 # ---------------------------------------------------------------------------
@@ -938,3 +1005,29 @@ def test_ledger_exemplars_cache_and_corpus_scan_exclusion(pg):
     assert exemplars == [{"class": "correctness", "severity": "HIGH",
                           "finding": "real row", "pr": 1}]
     assert store.get_repo_exemplars("o/none") == []
+
+
+def test_learning_timestamps_normalized_to_utc(pg):
+    """Caller-supplied stamps in other offsets normalize to UTC ISO, so the
+    text ORDER BY stays chronological across mixed inputs."""
+    from adapters import pg_install_store as store
+
+    # +05:00 offset: 2026-01-01T10:00+05:00 == 2026-01-01T05:00Z, which is
+    # EARLIER than 2026-01-01T06:00Z despite sorting later as raw text.
+    store.put_learning(repo="o/tz", text="rule A",
+                       created_at="2026-01-01T10:00:00+05:00")
+    store.put_learning(repo="o/tz", text="rule B",
+                       created_at="2026-01-01T06:00:00+00:00")
+    rows = store.list_learnings("o/tz")
+    assert [r["text"] for r in rows] == ["rule A", "rule B"]  # true time order
+    assert rows[0]["created_at"].endswith("+00:00")  # normalized to UTC
+
+
+def test_get_learning_by_source_comment(pg):
+    from adapters import pg_install_store as store
+
+    store.put_learning(repo="o/r2", text="taught rule", source_comment_id=777)
+    hit = store.get_learning_by_source_comment("o/r2", 777)
+    assert hit is not None and hit["text"] == "taught rule"
+    assert store.get_learning_by_source_comment("o/r2", 999) is None
+    assert store.get_learning_by_source_comment("o/r2", 0) is None
