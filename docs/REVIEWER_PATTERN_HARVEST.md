@@ -23,7 +23,7 @@ harvest.
 | Commit-range / delta review | Re-review only files since last pass | full re-review each time | #557 Living Hunt |
 | Dedup prior findings | Do not re-spam fixed lines | dedup markers | Living Markings #556 |
 | Fingerprint / stable id | Comment identity across pushes | grug-rule marker | Keep |
-| Checklist / test plan | Actionable verify steps | Chief DoR | Keep |
+| Checklist / test plan | Actionable verify steps | Chief Hunt Plan | Keep |
 | Runtime / production link | Tie code risk to live signal | Omen | Expand service map |
 | Autofix checkbox UX | One-click "push a fix commit" | agent prompt only | Optional later |
 

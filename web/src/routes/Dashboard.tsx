@@ -33,7 +33,7 @@ type Panel =
 
 const PANELS: { id: Panel; idx: string; label: string; badge?: string }[] = [
   { id: "repos", idx: "01", label: "Repositories" },
-  { id: "personas", idx: "02", label: "Personas", badge: "5" },
+  { id: "personas", idx: "02", label: "Personas", badge: "7" },
   { id: "appearance", idx: "03", label: "Appearance" },
   { id: "usage", idx: "04", label: "Usage & billing" },
   { id: "notifications", idx: "05", label: "Notifications" },
@@ -41,12 +41,18 @@ const PANELS: { id: Panel; idx: string; label: string; badge?: string }[] = [
   { id: "activity", idx: "07", label: "Activity" },
 ];
 
+// `modes`: which of BLOCK/WARN/OFF the backend can actually honor for this
+// persona. Comment-only or scheduled personas (no merge-gating check-run)
+// list none and render an informational chip instead of the segmented
+// control, so users can never select a mode the backend ignores.
 const PERSONAS = [
-  { id: "smasher", code: "F-01", name: "Smasher", img: "grug_smasher.png", desc: "Static analysis + symbolic exec + LLM diff review. Null-derefs, races, off-by-ones.", meta: ["static analysis", "diff review"] },
-  { id: "guard", code: "F-02", name: "Guard", img: "grug_guard.png", desc: "SCA, secret scanning, SAST on the diff, hourly CVE feed. Evil shall not pass.", meta: ["SCA + secrets", "SAST on diff"] },
-  { id: "elder", code: "F-03", name: "Elder", img: "grug_elder.png", desc: "Line-by-line review for naming, complexity, coverage, dead code.", meta: ["BYO model key", "inline suggestions"] },
-  { id: "chief", code: "F-04", name: "Chief", img: "grug_chief.png", desc: "Definition-of-Ready on every PR. Acceptance criteria, estimate, rollback plan.", meta: ["5 checks", "strict mode"] },
-  { id: "warder", code: "F-05", name: "Warder", img: "grug_mystic.png", desc: "Ward off bad release. Auto-changelog, semver hint, deploy gate.", meta: ["beta", "coming soon"], soon: true },
+  { id: "smasher", code: "F-01", name: "Smasher", img: "grug_smasher.png", desc: "Hunt bugs that hide. Mutate markings, run the tribe's own tests, name what still lives.", meta: ["mutation trial", "diff-scoped"], modes: ["warn", "off"] },
+  { id: "guard", code: "F-02", name: "Guard", img: "grug_guard.png", desc: "Watch the cave mouth. Secrets, sick deps, weak IaC, SAST. Evil shall not pass.", meta: ["SCA + secrets", "SAST on diff"], modes: ["block", "warn", "off"] },
+  { id: "elder", code: "F-03", name: "Elder", img: "grug_elder.png", desc: "Read markings one line at a time. Name the bad omen before it bite. Lore + Omen fused.", meta: ["Cave review", "Markings Board"], modes: ["block", "warn", "off"] },
+  { id: "chief", code: "F-04", name: "Chief", img: "grug_chief.png", desc: "Before the hunt, Chief ask: plan have name? meat counted? path home known?", meta: ["plan checks", "strict mode"], modes: ["block", "warn", "off"] },
+  { id: "teller", code: "F-05", name: "Teller", img: "grug_smile.png", desc: "Tell the tale of the hunt before Elder judge. Walkthrough, map, effort chip.", meta: ["walkthrough", "mermaid"], modes: [], info: "comment-only" },
+  { id: "warder", code: "F-06", name: "Warder", img: "grug_mystic.png", desc: "Shaman at the gate. Changelog scroll, semver hint, ward bad release from tribe.", meta: ["beta", "release scroll"], modes: ["warn", "off"] },
+  { id: "pulse", code: "F-07", name: "Pulse", img: "grug_mullet.png", desc: "Walk the camp at night. Poke sleeping hunts Chief already blessed.", meta: ["stale nudge", "scheduled"], modes: [], info: "scheduled" },
 ] as const;
 
 const SKINS = [
@@ -77,9 +83,23 @@ const esc = (s: string) =>
     { "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" }[c] as string
   ));
 
+// Clamp a persona's mode to the ones the backend can honor for it (a stale
+// default or an old localStorage value - e.g. smasher="block" before Smasher
+// was capped to warn/off - would otherwise render the control with nothing
+// selected). An invalid value falls back to the persona's CONFIGURED default
+// when that is itself supported, otherwise to its first supported mode, then
+// "off" for informational personas.
+function clampPersonaMode(id: string, mode: PMode, configuredDefault?: PMode): PMode {
+  const supported = (PERSONAS.find((p) => p.id === id)?.modes ?? []) as readonly PMode[];
+  if (supported.length === 0) return "off"; // informational persona
+  if (supported.includes(mode)) return mode;
+  if (configuredDefault && supported.includes(configuredDefault)) return configuredDefault;
+  return supported[0];
+}
+
 function loadLocal() {
   const def = {
-    personas: { smasher: "block", guard: "block", elder: "warn", chief: "block", warder: "off" } as Record<string, PMode>,
+    personas: { smasher: "warn", guard: "block", elder: "warn", chief: "block", teller: "off", warder: "warn", pulse: "off" } as Record<string, PMode>,
     skin: "classic",
     tone: "caveman",
     mood: "GRUG.MOOD = ANGRY",
@@ -89,9 +109,15 @@ function loadLocal() {
   };
   try {
     const s = JSON.parse(localStorage.getItem(LS) || "{}");
+    const mergedPersonas = { ...def.personas, ...(s.personas || {}) };
+    const personas = Object.fromEntries(
+      Object.entries(mergedPersonas).map(
+        ([id, m]) => [id, clampPersonaMode(id, m as PMode, def.personas[id])],
+      ),
+    ) as Record<string, PMode>;
     return {
       ...def, ...s,
-      personas: { ...def.personas, ...(s.personas || {}) },
+      personas,
       notif: { ...def.notif, ...(s.notif || {}) },
     };
   } catch { return def; }
@@ -315,9 +341,9 @@ function RepoRow({ repo, installId, onToggle, onGuardToggle, onFix, fixPending, 
   let enf: { cls: string; label: string; title: string } | null = null;
   if (on) {
     if (degraded && (state === "grug_managed" || state === "external")) enf = { cls: "unknown", label: "unconfirmed", title: "Last-known state — GitHub was rate-limited and couldn't confirm. Refresh to re-check." };
-    else if (state === "grug_managed") enf = { cls: "live", label: "ENFORCED", title: "Grug's DoR check is REQUIRED to merge — a Grug-managed ruleset blocks PRs that fail it." };
+    else if (state === "grug_managed") enf = { cls: "live", label: "ENFORCED", title: "Chief's plan check is REQUIRED to merge - a Grug-managed ruleset blocks PRs that fail Grug - Chief." };
     else if (state === "external") enf = { cls: "live", label: "EXTERNAL", title: "The check is required by a non-Grug ruleset or branch protection." };
-    else if (state === "none") enf = { cls: "warn", label: "⚠ not enforced", title: "Grug reviews PRs here, but its check is NOT required to merge — a failing PR can still be merged. Click 'fix' to make it required (blocking)." };
+    else if (state === "none") enf = { cls: "warn", label: "⚠ not enforced", title: "Grug reviews PRs here, but its check is NOT required to merge - a failing PR can still be merged. Click 'fix' to make it required (blocking)." };
     else if (state === "unknown") enf = { cls: "unknown", label: "unknown", title: "Couldn't reach GitHub to determine enforcement. Refresh." };
   }
 
@@ -329,7 +355,7 @@ function RepoRow({ repo, installId, onToggle, onGuardToggle, onFix, fixPending, 
       {on && state === "none" && !fixPending && <button className="fixbtn" onClick={onFix} title="Create a branch ruleset that REQUIRES Grug's check to pass before a PR can merge.">fix</button>}
       {fixPending && <span className="state paused">fixing…</span>}
       {fixError && !fixPending && <span className="fixerr" title={fixError}>⚠ fix failed</span>}
-      <span className={`state ${guardOn ? "live" : "paused"}`} title={guardOn ? "GUARD ON: the security suite (secrets, SAST, dependency CVEs, IaC) posts its own 'Grug — Guard' check-run on every PR here." : "GUARD OFF: no security check-run on this repo's PRs."}>{guardOn ? "GUARD" : "GUARD OFF"}</span>
+      <span className={`state ${guardOn ? "live" : "paused"}`} title={guardOn ? "GUARD ON: Guard watches the cave mouth (secrets, SAST, sick deps, IaC) on every PR." : "GUARD OFF: no Guard check-run on this repo's PRs."}>{guardOn ? "GUARD" : "GUARD OFF"}</span>
       <div className={`sw${guardOn ? " on" : ""}`} onClick={() => onGuardToggle(!guardOn)} role="switch" aria-checked={guardOn} title="Toggle the Guard (security) persona for this repo"></div>
       <span className={`state ${on ? "live" : "paused"}`} title={on ? "GUARDED: Grug watches this repo and posts a Check Run on every PR. Toggle off to silence Grug here." : "PAUSED: Grug is asleep on this repo. Toggle on to guard it."}>{on ? "GUARDED" : "PAUSED"}</span>
       <div className={`sw${on ? " on" : ""}`} onClick={() => onToggle(!on)} role="switch" aria-checked={on}></div>
@@ -359,11 +385,15 @@ function PersonasPanel({ show, modes, setMode }: { show: boolean; modes: Record<
                   <div className="meta">{p.meta.map((m) => <span key={m}>{m}</span>)}</div>
                 </div>
                 <div className="ctrl">
-                  <div className="seg">
-                    {(["block", "warn", "off"] as PMode[]).map((v) => (
-                      <button key={v} data-v={v} className={mode === v ? "on" : ""} onClick={() => setMode(p.id, v)}>{v.toUpperCase()}</button>
-                    ))}
-                  </div>
+                  {p.modes.length > 0 ? (
+                    <div className="seg">
+                      {(p.modes as readonly PMode[]).map((v) => (
+                        <button key={v} data-v={v} className={mode === v ? "on" : ""} onClick={() => setMode(p.id, v)}>{v.toUpperCase()}</button>
+                      ))}
+                    </div>
+                  ) : (
+                    <span className="state paused" title="No merge-gating check-run for this persona - it is informational by design.">{"info" in p ? p.info : "advisory"}</span>
+                  )}
                 </div>
               </div>
             );
@@ -502,7 +532,15 @@ function AccountPanel({ show, me, pauseAll, setPause }: { show: boolean; me: { l
   );
 }
 
-const _PERSONA_LABEL: Record<string, string> = { chief: "Chief", elder: "Elder" };
+const _PERSONA_LABEL: Record<string, string> = {
+  chief: "Chief",
+  elder: "Elder",
+  guard: "Guard",
+  teller: "Teller",
+  warder: "Warder",
+  smasher: "Smasher",
+  pulse: "Pulse",
+};
 const _VERDICT_SYM: Record<string, string> = { block: "×", warn: "!", pass: "✓", errored: "‼" };
 
 function ActivityPanel({ show, installId }: { show: boolean; installId?: number }) {

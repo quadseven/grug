@@ -44,10 +44,11 @@ from personas.code_reviewer.persona import (
     with_findings,
 )
 from personas.smasher.sandbox import SurvivedMutant, TrialResult, extract_target_lines
+from personas.tribe import CHECK_SMASHER
 
 log = logging.getLogger(f"{os.getenv('DD_SERVICE', 'grug')}.persona.smasher")
 
-_CHECK_NAME = "Grug — Smasher"
+_CHECK_NAME = CHECK_SMASHER
 
 # Trial budgets (ADR-0013 kill switches). The total budget is ALSO enforced by
 # the Job's activeDeadlineSeconds (the kubelet-level hard stop); these bound the
@@ -61,13 +62,13 @@ def _summary_markdown(evaluation: CodeReviewEvaluation) -> tuple[str, str]:
     """Smasher-voice (title, summary) for the check-run output."""
     if evaluation.degraded_reason:
         return (
-            f"⚠️ Smasher club not swing ({evaluation.degraded_reason})",
+            f"WARN Smasher club not swing ({evaluation.degraded_reason})",
             "Grug Smasher could not run the trial this time. The trouble: "
             f"`{evaluation.degraded_reason}`. This only counsel - merge not blocked.",
         )
     if not evaluation.findings:
         return (
-            "✅ Smasher find no weak test",
+            "PASS Smasher find no weak test",
             "Grug Smasher change the new code many ways and the tribe's tests "
             "still catch every change. Tests strong. Smasher nod.",
         )
@@ -75,7 +76,7 @@ def _summary_markdown(evaluation: CodeReviewEvaluation) -> tuple[str, str]:
     for f in evaluation.findings:
         rows.append(f"| `{f.file}` | {f.line} | {f.rule_name} | {f.message} |")
     return (
-        f"❌ Smasher slip {len(evaluation.findings)} change past the tests",
+        f"FAIL Smasher slip {len(evaluation.findings)} change past the tests",
         "Grug Smasher change the new code and the tests still pass - a test "
         "is missing. Each row is a mutation no test caught:\n\n" + "\n".join(rows),
     )

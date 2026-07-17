@@ -4,7 +4,7 @@ The security suite that shipped INSIDE Elder - four deterministic
 candidate sources (SAST `sast.py`, dependency-CVE `sca.py`, committed
 secrets `secret_scan.py`, IaC misconfig `iac_scan.py`) feeding the ONE
 exploitability judge (`judge_candidates`) - now posts its OWN check-run
-("Grug — Guard") with its own advisory/blocking flag. Elder keeps the
+("Grug - Guard") with its own advisory/blocking flag. Elder keeps the
 LLM diff review; users can see, toggle, and (eventually) block on
 security findings separately.
 
@@ -49,10 +49,11 @@ from personas.code_reviewer.persona import CodeReviewEvaluation, with_extra_find
 from personas.code_reviewer.sast import judge_candidates, scan_candidates
 from personas.code_reviewer.sca import scan_dependencies
 from personas.code_reviewer.secret_scan import scan_secrets
+from personas.tribe import CHECK_GUARD
 
 log = logging.getLogger(f"{os.getenv('DD_SERVICE', 'grug')}.persona.guard")
 
-_CHECK_NAME = "Grug — Guard"
+_CHECK_NAME = CHECK_GUARD
 
 
 def _summary_markdown(evaluation: CodeReviewEvaluation) -> tuple[str, str]:

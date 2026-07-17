@@ -12,7 +12,7 @@ The landing page sells "Guard" (SCA, secret scanning, SAST) as its own
 persona; in reality that work shipped INSIDE Elder - four deterministic
 candidate sources (`sast.py`, `sca.py`, `secret_scan.py`, `iac_scan.py`)
 feeding the exploitability judge, merged into Elder's evaluation and
-published under "Grug — Code Review". Users could not see, toggle, or block
+published under "Grug - Code Review". Users could not see, toggle, or block
 on security findings separately, and the roster over-promised. The
 detectors exist and are benchmarked; extraction is packaging.
 
@@ -56,7 +56,7 @@ the other. Per-head-SHA idempotency reuses `claim_review` with
 `persona="guard"` (already persona-parameterized). GitHub delivery GUIDs
 are UUIDs and cannot contain `:guard`, so the namespace cannot collide.
 
-**4. Guard's surfaces.** Own check-run ("Grug — Guard", Guard voice), own
+**4. Guard's surfaces.** Own check-run ("Grug - Guard", Guard voice), own
 RepoConfig flags (`guard_enabled` default True, `guard_blocking` default
 False - advisory-first like Elder), own Activity rows
 (`review_types.Persona` += "guard"; the caveman name IS "guard"), inline

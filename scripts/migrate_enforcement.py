@@ -35,9 +35,25 @@ import jwt
 # ── Constants ───────────────────────────────────────────────────────
 
 _GH_API = "https://api.github.com"
-GRUG_RULESET_PREFIX = "Grug — "
-GRUG_TPM_RULESET_NAME = "Grug — TPM Enforcement"
-GRUG_DOR_CHECK_NAME = "Grug — Definition of Ready"
+GRUG_RULESET_PREFIX = "Grug - "
+GRUG_TPM_RULESET_NAME = "Grug - Chief Enforcement"
+GRUG_DOR_CHECK_NAME = "Grug - Chief"
+# Legacy titles still accepted when scanning existing rulesets (ASCII + em-dash).
+LEGACY_TPM_RULESET_NAME = "Grug - TPM Enforcement"
+LEGACY_DOR_CHECK_NAME = "Grug - Definition of Ready"
+_EM = "\u2014"
+_CHIEF_CHECK_NAMES = frozenset({
+    GRUG_DOR_CHECK_NAME,
+    LEGACY_DOR_CHECK_NAME,
+    f"Grug {_EM} Chief",
+    f"Grug {_EM} Definition of Ready",
+})
+_CHIEF_RULESET_NAMES = frozenset({
+    GRUG_TPM_RULESET_NAME,
+    LEGACY_TPM_RULESET_NAME,
+    f"Grug {_EM} Chief Enforcement",
+    f"Grug {_EM} TPM Enforcement",
+})
 
 _HEADERS_TEMPLATE = {
     "Accept": "application/vnd.github+json",
@@ -129,12 +145,13 @@ def _detect_enforcement(token: str, owner: str, repo: str, branch: str) -> str:
             if rule.get("type") != "required_status_checks":
                 continue
             for check in rule.get("parameters", {}).get("required_status_checks", []):
-                if check.get("context") == GRUG_DOR_CHECK_NAME:
+                if check.get("context") in _CHIEF_CHECK_NAMES:
                     has_check = True
                     break
         if not has_check:
             continue
-        if rs.get("name", "").startswith(GRUG_RULESET_PREFIX):
+        name = rs.get("name", "")
+        if name.startswith(GRUG_RULESET_PREFIX) or name in _CHIEF_RULESET_NAMES:
             grug_match = True
         else:
             external_match = True
@@ -153,10 +170,10 @@ def _detect_enforcement(token: str, owner: str, repo: str, branch: str) -> str:
         )
         legacy_resp.raise_for_status()
         data = legacy_resp.json()
-        if GRUG_DOR_CHECK_NAME in data.get("contexts", []):
+        if any(c in _CHIEF_CHECK_NAMES for c in data.get("contexts", [])):
             return "external"
         for check in data.get("checks", []):
-            if isinstance(check, dict) and check.get("context") == GRUG_DOR_CHECK_NAME:
+            if isinstance(check, dict) and check.get("context") in _CHIEF_CHECK_NAMES:
                 return "external"
     except httpx.HTTPStatusError as e:
         if e.response.status_code not in (404, 403):

@@ -73,6 +73,7 @@ from personas.code_reviewer.persona import (
     CodeReviewEvaluation, Finding, evaluate_diff, with_extra_findings, with_findings,
 )
 from personas.code_reviewer.snapshot import review_snapshot_id_from_pr
+from personas.tribe import CHECK_ELDER
 from adapters.install_store import (  # type: ignore
     CommentFindingOrigin,
     put_comment_record,
@@ -87,7 +88,7 @@ log = logging.getLogger(f"{os.getenv('DD_SERVICE', 'grug')}.persona.code_reviewe
 _PERSONA = "Elder"
 _PERSONA_PORTRAIT = "https://grug.lol/assets/grug_elder.png"
 
-_CHECK_NAME = "Grug — Code Review"
+_CHECK_NAME = CHECK_ELDER
 # 10s (was 30s) — a GitHub diff fetch is fast; the over-generous 30s let a
 # hung fetch alone eat most of the webhook Lambda budget (#252). Well under
 # the 60s budget. NOTE: the FULL synchronous path (diff + review LLM + publish
@@ -520,7 +521,7 @@ def _summary_markdown(
         return f"Living Hunt {living_range} - {title}" if living_range else title
 
     if evaluation.degraded_reason:
-        title = f"⚠️ Grug eyes clouded ({evaluation.degraded_reason})"
+        title = f"WARN Grug eyes clouded ({evaluation.degraded_reason})"
         return hunt_title(title), (
             "Grug Elder could not see the diff this pass. The mist: "
             f"`{evaluation.degraded_reason}`. Grug stay his club — this "
@@ -1596,7 +1597,7 @@ def dispatch_code_review(
     # NOTE (#466, ADR-0012): the deterministic security suite (SAST + SCA +
     # secret + IaC scans -> exploitability judge) that used to merge into
     # THIS evaluation now runs as the GUARD persona with its own check-run
-    # ("Grug — Guard") - see personas/guard/dispatch.py. Elder is the LLM
+    # ("Grug - Guard") - see personas/guard/dispatch.py. Elder is the LLM
     # diff review only.
 
     # Judge-gated publication (#467, ADR-0011): grade the findings with the
@@ -2323,7 +2324,7 @@ def _publish_degraded(
     """Post the "skipped" check-run when fetch/parse fails. Best-effort —
     a publish failure here is also swallowed since we can't do anything
     useful with it (would need its own degraded publish, etc)."""
-    title = f"⚠️ Code review skipped ({reason})"
+    title = f"WARN Elder review skipped ({reason})"
     summary = (
         f"Elder could not run this pass: `{reason}`. Advisory neutral "
         "— PR merge is not blocked."

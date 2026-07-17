@@ -140,7 +140,7 @@ def test_handle_result_heals_publishes_check_and_records_verdict():
     _, args, kwargs = post.mock_calls[0]
     assert args[0] == "tok" and args[1] == "acme" and args[2] == "widget"
     check = args[3]
-    assert check.name == "Grug — Code Review"
+    assert check.name == "Grug - Elder"
     assert check.head_sha == "deadbeef0000"
     assert check.conclusion == "neutral"
     # Verdict healed: errored → reviewed, real findings_count, no degraded_reason.

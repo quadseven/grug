@@ -56,7 +56,7 @@ def test_publish_success_records_honest_verdict_and_matching_external_id(monkeyp
     out = publish_persona_check(
         persona_key="guard",
         persona_prefix="guard",
-        check_name="Grug — Guard",
+        check_name="Grug - Guard",
         installation_id=42,
         owner="o",
         repo="r",
@@ -74,7 +74,7 @@ def test_publish_success_records_honest_verdict_and_matching_external_id(monkeyp
 
     assert out == {"persona": "guard", "result": "pass"}
     assert posted["external_id"] == "grug-guard:o/r#7:abc123"
-    assert posted["result"].name == "Grug — Guard"
+    assert posted["result"].name == "Grug - Guard"
     assert posted["result"].conclusion == "neutral"
     assert posted["result"].title == "t"
     assert posted["result"].summary == "s"
@@ -106,7 +106,7 @@ def test_success_preserves_callers_own_degraded_reason(monkeypatch):
     out = publish_persona_check(
         persona_key="warder",
         persona_prefix="warder",
-        check_name="Grug — Warder",
+        check_name="Grug - Warder",
         installation_id=1,
         owner="o",
         repo="r",
@@ -142,7 +142,7 @@ def test_publish_failure_records_check_publish_failed_and_returns_publish_failed
     out = publish_persona_check(
         persona_key="code_reviewer",
         persona_prefix="cr",
-        check_name="Grug — Code Review",
+        check_name="Grug - Elder",
         installation_id=1,
         owner="o",
         repo="r",
@@ -180,7 +180,7 @@ def test_publish_failure_preserves_evaluations_own_degraded_reason_via_merge(
     publish_persona_check(
         persona_key="smasher",
         persona_prefix="smasher",
-        check_name="Grug — Smasher",
+        check_name="Grug - Smasher",
         installation_id=1,
         owner="o",
         repo="r",
@@ -212,7 +212,7 @@ def test_publish_failure_emits_persona_named_log_line_verbatim(monkeypatch, capl
         publish_persona_check(
             persona_key="guard",
             persona_prefix="guard",
-            check_name="Grug — Guard",
+            check_name="Grug - Guard",
             installation_id=1,
             owner="o",
             repo="r",
@@ -247,7 +247,7 @@ def test_publish_failure_log_carries_status_code_and_error_detail(monkeypatch, c
         publish_persona_check(
             persona_key="guard",
             persona_prefix="guard",
-            check_name="Grug — Guard",
+            check_name="Grug - Guard",
             installation_id=1,
             owner="o",
             repo="r",
@@ -295,7 +295,7 @@ def test_record_check_verdict_raising_does_not_crash_publish(monkeypatch, caplog
         out = publish_persona_check(
             persona_key="guard",
             persona_prefix="guard",
-            check_name="Grug — Guard",
+            check_name="Grug - Guard",
             installation_id=1,
             owner="o",
             repo="r",
@@ -333,7 +333,7 @@ def test_success_result_cannot_collide_with_publish_failed_sentinel():
         ppc(
             persona_key="guard",
             persona_prefix="guard",
-            check_name="Grug — Guard",
+            check_name="Grug - Guard",
             installation_id=1,
             owner="o",
             repo="r",
@@ -368,7 +368,7 @@ def test_inconsistent_conclusion_raises_before_any_network_call(monkeypatch):
         publish_check.publish_persona_check(
             persona_key="guard",
             persona_prefix="guard",
-            check_name="Grug — Guard",
+            check_name="Grug - Guard",
             installation_id=1,
             owner="o",
             repo="r",
@@ -406,7 +406,7 @@ def test_non_httpx_exception_from_auth_chain_still_records_honest_verdict(monkey
     out = publish_check.publish_persona_check(
         persona_key="tpm",
         persona_prefix="tpm",
-        check_name="Grug — Definition of Ready",
+        check_name="Grug - Chief",
         installation_id=1,
         owner="o",
         repo="r",
@@ -442,7 +442,7 @@ def test_request_error_with_no_response_attribute_does_not_crash(monkeypatch, ca
         out = publish_check.publish_persona_check(
             persona_key="guard",
             persona_prefix="guard",
-            check_name="Grug — Guard",
+            check_name="Grug - Guard",
             installation_id=1,
             owner="o",
             repo="r",

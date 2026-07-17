@@ -22,17 +22,15 @@
 Grug is a modular GitHub bot with focused **personas** across the SDLC. Four
 are enabled by default:
 
-- **Chief** (`Grug - Definition of Ready`) - static PR-readiness checks and
-  branch-ruleset self-heal.
-- **Elder** (`Grug — Code Review`) - durable, deep LLM diff review with
-  whole-file, cross-file, PR-intent, and runtime context.
-- **Guard** (`Grug - Guard`) - Semgrep, dependency-CVE, secret, and IaC
-  detection filtered through an exploitability judge.
-- **Teller** (`Grug - Teller`) - an updatable PR walkthrough with file and
-  effort summaries.
+- **Chief** (`Grug - Chief`) - plan readiness before the hunt leaves the cave
+- **Elder** (`Grug - Elder`) - durable Cave review with Markings, Lore, Omen
+- **Guard** (`Grug - Guard`) - cave-mouth security (SAST, secrets, SCA, IaC + Seer)
+- **Teller** (`Grug - Teller`) - tale of the hunt (walkthrough + mermaid map)
 
 **Smasher**, **Warder**, and **Pulse** are wired as opt-in tracers. Omen runtime
 signal already augments Elder where a repository-to-service mapping exists.
+Check titles use caveman names (`Grug - <Persona>`); legacy aliases dual-post
+during cutover so old required-status rulesets keep working.
 
 Grug live in GitHub. Grug post Check Runs. Grug never spam comments. **You ship. Grug guard.**
 
@@ -63,17 +61,18 @@ pulumi up                   # provision AWS infra (SSM refs, SQS, KMS, DD monito
 # done. Grug guard now.
 ```
 
-## What Chief checks (Definition of Ready)
+## What Chief checks (Hunt Plan)
 
-Static checks on PR body — **4 blocking, 1 advisory:**
+Before the tribe leave the cave, Chief reads the **Hunt Plan** on the PR body —
+**4 blocking plan checks, 1 advisory:**
 
-| | Check | Pass when | Blocks? |
+| | Plan check | Pass when | Blocks? |
 |---|---|---|---|
-| ✅ | `why` | Has `## Why` (or `## Summary`) section ≥5 words | **yes** |
-| ✅ | `acceptance` | Has `## Acceptance criteria` (or `## Test plan`) with ≥3 bullets | **yes** |
-| ✅ | `estimate` | Body or label includes `Size: XS/S/M/L` (XL must be split) | **yes** |
-| ✅ | `scope-fence` | Has `## Out of scope` section | **yes** |
-| ⚠️ | `issue-link` | Body links an issue via `closes #N` | advisory |
+| yes | `why` | Has `## Why` (or `## Summary`) section, enough words to name the hunt | **yes** |
+| yes | `acceptance` | Has `## Acceptance criteria` (or `## Test plan`) with enough bullets | **yes** |
+| yes | `estimate` | Body or label includes `Size: XS/S/M/L` (XL must be split) | **yes** |
+| yes | `scope-fence` | Has `## Out of scope` section | **yes** |
+| soft | `issue-link` | Body links an issue via `closes #N` | advisory |
 
 ## What Elder and Guard check
 
@@ -84,7 +83,7 @@ the adaptive quiet window:
 
 - **Swift Hunt settle** - tiny PRs skip the quiet wait; medium PRs settle a few
   seconds; large multi-file storms keep the full window. Elder posts an
-  `in_progress` `Grug — Code Review` check the moment the durable job is
+  `in_progress` `Grug - Elder` check the moment the durable job is
   queued, so required-status rulesets show pending instead of "check missing".
 - **Tiered Cave review** (ADR-0019 / #645) - default is a single **coder** arm
   for ordinary PRs; the **reasoner** arm escalates only on large diffs,
@@ -158,7 +157,7 @@ PRD #21 + slice issues #22-#34 track v1.
 
 ## Contributing
 
-Issues + PRs welcome. Use the DoR template — Grug will gate your own PR. Fair is fair.
+Issues + PRs welcome. Use the Hunt Plan template — Grug will gate your own PR. Fair is fair.
 
 PR body must have `## Why`, `## Acceptance criteria`, `## Out of scope`, `Size:`, and `closes #N`.
 

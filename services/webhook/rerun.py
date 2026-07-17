@@ -45,6 +45,7 @@ from personas.code_reviewer.snapshot import (
 from personas.guard.dispatch import dispatch_guard_review
 from personas.smasher.dispatch import dispatch_smasher_review
 from personas.walkthrough.dispatch import dispatch_walkthrough_review
+from personas.tribe import CHECK_ELDER, acceptable_check_names
 from rerun_personas import (
     GUARD as _GUARD,
     RERUNNABLE as _RERUNNABLE,
@@ -82,7 +83,9 @@ _STALENESS_WATCH_INTERVAL_S = 10.0
 # REQUIRED status-check context on grug-gated repos. Posting it as
 # in_progress at enqueue time is what stops GitHub rulesets from treating a
 # multi-minute durable review as "required check never ran" (BLOCKED).
-_ELDER_CHECK_NAME = "Grug — Code Review"
+# Accept legacy "Grug - Code Review" when listing existing runs mid-cutover.
+_ELDER_CHECK_NAME = CHECK_ELDER
+_ELDER_CHECK_NAMES = frozenset(acceptable_check_names(CHECK_ELDER))
 
 # Skip reasons where a retry can plausibly succeed (model backend outage,
 # unparseable model output, transient diff-fetch error). These raise for SQS
@@ -171,21 +174,44 @@ def _elder_check_already_terminal_or_pending(
     it. Listing the latest check-run for this name+head is the ground truth.
     """
     def _do(token: str) -> str | None:
-        resp = httpx.get(
+        # List without check_name so legacy titles (Grug - Code Review /
+        # em-dash variants) still count as Elder during the nomenclature
+        # cutover; filter client-side with _ELDER_CHECK_NAMES.
+        #
+        # Paginate: a busy commit can carry >100 distinct check names even
+        # under filter=latest (one run per name), and the Elder run could sit
+        # on a later page. Missing it would wrongly re-post in_progress over a
+        # settled required check - the exact reopen this guard prevents. Cap
+        # the page walk as a runaway backstop (1000 runs >> any real commit).
+        _MAX_PAGES = 10
+        headers = {
+            "Authorization": f"Bearer {token}",
+            "Accept": "application/vnd.github+json",
+            "X-GitHub-Api-Version": "2022-11-28",
+        }
+        url = (
             f"{_GH_API}/repos/{quote(owner, safe='')}/{quote(repo_name, safe='')}"
-            f"/commits/{quote(head_sha, safe='')}/check-runs",
-            params={"check_name": _ELDER_CHECK_NAME, "filter": "latest", "per_page": 10},
-            headers={
-                "Authorization": f"Bearer {token}",
-                "Accept": "application/vnd.github+json",
-                "X-GitHub-Api-Version": "2022-11-28",
-            },
-            timeout=_FETCH_TIMEOUT,
+            f"/commits/{quote(head_sha, safe='')}/check-runs"
         )
-        resp.raise_for_status()
-        runs = (resp.json() or {}).get("check_runs") or []
+        runs: list = []
+        seen = 0
+        for page in range(1, _MAX_PAGES + 1):
+            resp = httpx.get(
+                url,
+                params={"filter": "latest", "per_page": 100, "page": page},
+                headers=headers,
+                timeout=_FETCH_TIMEOUT,
+            )
+            resp.raise_for_status()
+            payload = resp.json() or {}
+            total = int(payload.get("total_count") or 0)
+            batch = payload.get("check_runs") or []
+            runs.extend(batch)
+            seen += len(batch)
+            if not batch or seen >= total:
+                break
         for run in runs:
-            if str(run.get("name") or "") != _ELDER_CHECK_NAME:
+            if str(run.get("name") or "") not in _ELDER_CHECK_NAMES:
                 continue
             status = str(run.get("status") or "")
             conclusion = str(run.get("conclusion") or "")
@@ -300,7 +326,7 @@ def _post_elder_in_progress_check(
     head_sha: str,
     settle_seconds: int,
 ) -> None:
-    """Best-effort: mark `Grug — Code Review` in_progress for this head.
+    """Best-effort: mark `Grug - Code Review` in_progress for this head.
 
     Elder is durable + settle-windowed; a deep review routinely takes minutes
     and can be mid-flight-cancelled/re-enqueued when base/title/body moves.
@@ -427,7 +453,7 @@ def enqueue_review(
     trusted as the source of review evidence.
 
     After a successful SQS send, posts a best-effort in_progress
-    `Grug — Code Review` check so required-status rulesets show pending
+    `Grug - Code Review` check so required-status rulesets show pending
     rather than "check never ran" while the durable lane works.
     """
     if not _RERUN_QUEUE_URL:

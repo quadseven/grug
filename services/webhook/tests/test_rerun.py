@@ -211,7 +211,7 @@ def test_enqueue_review_posts_in_progress_check_after_sqs(monkeypatch):
     assert posted["owner"] == "myorg"
     assert posted["repo"] == "myrepo"
     result = posted["result"]
-    assert result.name == "Grug — Code Review"
+    assert result.name == "Grug - Elder"
     assert result.head_sha == "head-123"
     assert result.status == "in_progress"
     assert result.conclusion is None
@@ -1116,7 +1116,7 @@ def test_elder_check_already_terminal_treats_any_completed_conclusion(monkeypatc
                     return {
                         "check_runs": [
                             {
-                                "name": "Grug — Code Review",
+                                "name": "Grug - Elder",
                                 "status": "completed",
                                 "conclusion": _c,
                             }
@@ -1136,7 +1136,7 @@ def test_elder_check_already_terminal_treats_any_completed_conclusion(monkeypatc
                     return {
                         "check_runs": [
                             {
-                                "name": "Grug — Code Review",
+                                "name": "Grug - Elder",
                                 "status": "completed",
                                 "conclusion": conclusion,
                             }
@@ -1151,6 +1151,91 @@ def test_elder_check_already_terminal_treats_any_completed_conclusion(monkeypatc
         )
         assert reason is not None
         assert reason.startswith("already_completed_"), (conclusion, reason)
+
+
+def test_elder_check_already_terminal_accepts_legacy_alias(monkeypatch):
+    """Cutover: a completed legacy 'Grug - Code Review' still blocks re-post."""
+    seen_params: list[dict] = []
+
+    def fake_get(_url: str, **kwargs: object) -> object:
+        seen_params.append(dict(kwargs.get("params") or {}))  # type: ignore[call-overload]
+
+        class Resp:
+            def raise_for_status(self) -> None:
+                return None
+
+            def json(self) -> dict:
+                return {
+                    "check_runs": [
+                        {
+                            "name": "Grug - Code Review",
+                            "status": "completed",
+                            "conclusion": "success",
+                        }
+                    ]
+                }
+        return Resp()
+
+    monkeypatch.setattr(rerun, "with_install_token_retry", lambda iid, fn: fn("tok"))
+    monkeypatch.setattr(rerun.httpx, "get", fake_get)
+    reason = rerun._elder_check_already_terminal_or_pending(
+        install_id=1, owner="o", repo_name="r", head_sha="h" * 40,
+    )
+    assert reason == "already_completed_success"
+    # Guard the cutover contract server-side too: a check_name param on ANY
+    # request would make GitHub filter OUT the legacy alias run and this test
+    # would pass for the wrong reason. Also pin the params that make the
+    # pagination guard correct so a refactor can't silently drop them.
+    assert seen_params
+    for params in seen_params:
+        assert "check_name" not in params
+        assert params.get("filter") == "latest"
+        assert params.get("per_page") == 100
+
+
+def test_elder_terminal_guard_paginates_to_find_later_page_run(monkeypatch):
+    """A busy commit can push the Elder run onto a later page; the guard must
+    paginate or it would miss it and wrongly re-post in_progress."""
+    pages = {
+        1: {
+            "total_count": 150,
+            "check_runs": [
+                {"name": f"CI-{i}", "status": "completed", "conclusion": "success"}
+                for i in range(100)
+            ],
+        },
+        2: {
+            "total_count": 150,
+            "check_runs": (
+                [{"name": f"CI-{i}", "status": "completed", "conclusion": "success"}
+                 for i in range(100, 149)]
+                + [{"name": "Grug — Code Review", "status": "completed",
+                    "conclusion": "success", "external_id": "grug-cr:x"}]
+            ),
+        },
+    }
+    seen_pages: list[int] = []
+
+    def fake_get(_url: str, **kwargs: object) -> object:
+        params = dict(kwargs.get("params") or {})  # type: ignore[call-overload]
+        page = int(params.get("page", 1))
+        seen_pages.append(page)
+
+        class Resp:
+            def raise_for_status(self) -> None:
+                return None
+
+            def json(self) -> dict:
+                return pages[page]
+        return Resp()
+
+    monkeypatch.setattr(rerun, "with_install_token_retry", lambda iid, fn: fn("tok"))
+    monkeypatch.setattr(rerun.httpx, "get", fake_get)
+    reason = rerun._elder_check_already_terminal_or_pending(
+        install_id=1, owner="o", repo_name="r", head_sha="h" * 40,
+    )
+    assert reason == "already_completed_success"
+    assert seen_pages == [1, 2], "must walk to page 2 to find the Elder run"
 
 
 def test_complete_elder_check_open_posts_neutral(monkeypatch):

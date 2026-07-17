@@ -40,3 +40,5 @@ graphify-out/.graphify_*
 # Web build outputs (re-installable from package-lock + tsconfig)
 web/node_modules/
 web/tsconfig.tsbuildinfo
+.claude/
+logs/model-evals/

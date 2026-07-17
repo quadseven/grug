@@ -27,6 +27,7 @@ from activity_log import record_check_verdict
 from github_app_auth import with_install_token_retry
 from github_checks_client import CheckRunResult, post_check_run
 from llm_client import Hunk
+from personas.tribe import CHECK_ELDER
 
 # Shared Spark-Cave airlock library (#1610). Vendored from githumps/infra-public
 # (see spark_cave/VENDOR.md), so grug (public) and the macchina lane (private)
@@ -260,7 +261,7 @@ def enqueue_fallback(
 # MUST match the persona's check name so the fallback heals the SAME check-run
 # (post_check_run is idempotent on (name, head_sha)) rather than posting a
 # duplicate. Kept in sync with personas/code_reviewer/dispatch.py:_CHECK_NAME.
-_CHECK_NAME = "Grug — Code Review"
+_CHECK_NAME = CHECK_ELDER
 
 # Legacy persona code key; record_check_verdict maps it to the caveman name
 # "elder" (ADR-0002) at the write boundary.

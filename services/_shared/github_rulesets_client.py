@@ -17,7 +17,8 @@ import httpx
 
 _GH_API = "https://api.github.com"
 
-GRUG_RULESET_PREFIX = "Grug — "
+GRUG_RULESET_PREFIX = "Grug - "
+GRUG_RULESET_PREFIXES = (GRUG_RULESET_PREFIX, "Grug " + "\u2014" + " ")
 
 EnforcementState = Literal["grug_managed", "external", "none"]
 
@@ -290,23 +291,35 @@ def get_ruleset(
     return resp.json()
 
 
+def _acceptable_names(check_name: str) -> tuple[str, ...]:
+    """Primary check title plus cutover aliases (tribe nomenclature)."""
+    try:
+        from personas.tribe import acceptable_check_names
+        return acceptable_check_names(check_name)
+    except Exception:  # noqa: BLE001 - rulesets client must not depend on tribe import
+        return (check_name,)
+
+
 def _check_name_in_ruleset(ruleset: dict, check_name: str) -> bool:
-    """Return True if any required_status_checks rule in the ruleset matches check_name."""
+    """Return True if any required_status_checks rule matches primary or alias."""
+    names = set(_acceptable_names(check_name))
     for rule in ruleset.get("rules", []):
         if rule.get("type") != "required_status_checks":
             continue
         for check in rule.get("parameters", {}).get("required_status_checks", []):
-            if check.get("context") == check_name:
+            if check.get("context") in names:
                 return True
     return False
 
 
 def _check_name_in_legacy(legacy_data: dict, check_name: str) -> bool:
     """Check both legacy ``contexts`` and newer ``checks`` array formats."""
-    if check_name in legacy_data.get("contexts", []):
-        return True
+    names = set(_acceptable_names(check_name))
+    for ctx in legacy_data.get("contexts", []):
+        if ctx in names:
+            return True
     for check in legacy_data.get("checks", []):
-        if isinstance(check, dict) and check.get("context") == check_name:
+        if isinstance(check, dict) and check.get("context") in names:
             return True
     return False
 
@@ -363,10 +376,20 @@ def detect_enforcement(
     Checks the Rulesets API first, then falls back to legacy branch
     protection. Returns ``"grug_managed"`` if a ruleset enforces the
     check AND either matches ``stored_ruleset_id`` (the ID Grug itself
-    created, tracked in the install store) or - when no ID is on file,
-    e.g. a repo Grug hasn't enrolled yet - falls back to the ``Grug —``
-    name-prefix heuristic. ``"external"`` if enforced by a non-Grug
-    mechanism, or ``"none"`` if not enforced at all.
+    created, tracked in the install store) or matches the ``Grug -`` /
+    ``Grug —`` name-prefix heuristic. ``"external"`` if enforced by a
+    non-Grug mechanism, or ``"none"`` if not enforced at all.
+
+    The prefix heuristic is consulted for any check-enforcing ruleset
+    the stored ID did not already claim - NOT only when no ID is on
+    file. This is deliberate and load-bearing: the branch is reached
+    only after ``_check_name_in_ruleset`` confirms the ruleset actually
+    enforces ``check_name``, so a Grug-named ruleset that enforces the
+    check IS grug-managed even when the stored ID is stale (deleted or
+    pointing at a different ruleset). Gating the heuristic on
+    ``stored_ruleset_id is None`` would misclassify that live ruleset as
+    ``external`` and make ``ensure_enforcement`` try to create a second
+    one - a guaranteed 422 "Name must be unique" collision.
 
     The ID check is load-bearing, not cosmetic: a rename, a manual
     rename of the ruleset itself, or any other drift between the
@@ -397,11 +420,10 @@ def detect_enforcement(
         if stored_ruleset_id is not None and rs.get("id") == stored_ruleset_id:
             grug_match = True
             break
-        elif rs.get("name", "").startswith(GRUG_RULESET_PREFIX):
+        if any(rs.get("name", "").startswith(p) for p in GRUG_RULESET_PREFIXES):
             grug_match = True
             break
-        else:
-            external_match = True
+        external_match = True
 
     if grug_match:
         return "grug_managed"

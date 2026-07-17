@@ -25,7 +25,7 @@ def test_smasher_is_advisory_async_optin():
     assert smasher.enabled_default is False
     assert smasher.blocking_flag is None
     assert smasher.missing_repo_policy == "disabled"
-    assert smasher.check_run_name == "Grug — Smasher"
+    assert smasher.check_run_name == "Grug - Smasher"
 
 
 def test_canonical_names_match_adr_0002():

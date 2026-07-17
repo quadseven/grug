@@ -451,7 +451,7 @@ def test_new_permissions_accepted_backfills_when_no_existing_row():
 
 def _ruleset_deleted_payload(
     *,
-    ruleset_name: str = "Grug — TPM Enforcement",
+    ruleset_name: str = "Grug - TPM Enforcement",
     ruleset_id: int = 42,
     install_id: int = 999,
     repo_id: int = 7777,

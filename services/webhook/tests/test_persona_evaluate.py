@@ -82,9 +82,9 @@ def test_summary_pass_renders_check_count():
         CheckResult("acceptance", True, "3 bullets"),
     ]
     title, summary = persona._summary(results)
-    assert "✅" in title
+    assert "Hunt Plan ready" in title or "Chief pass" in title
     assert "all 2 checks" in title
-    assert "| why | ✅ |" in summary
+    assert "| why | pass |" in summary
 
 
 def test_summary_fail_counts_blocking():
@@ -94,10 +94,10 @@ def test_summary_fail_counts_blocking():
         CheckResult("estimate", False, "no Size"),
     ]
     title, summary = persona._summary(results)
-    assert "❌" in title
-    assert "2/3 blocking" in title
-    assert "| why | ✅ |" in summary
-    assert "| acceptance | ❌ |" in summary
+    assert "Hunt Plan hold" in title or "Chief hold" in title
+    assert "2/3 plan checks fail" in title or "2/3 blocking" in title
+    assert "| why | pass |" in summary
+    assert "| acceptance | fail |" in summary
 
 
 def test_summary_table_header_present():
@@ -159,19 +159,19 @@ def test_evaluate_mixed_advisory_and_blocking_failure():
     assert scope.passed is False
     assert link.passed is False
     title, summary = persona._summary(list(evaluation.results))
-    assert "1/5 blocking" in title  # only scope-fence counts, not issue-link
+    assert title == "Hunt Plan hold - 1/5 plan checks fail"
 
 
 def test_summary_advisory_check_renders_warning_icon():
-    """Advisory checks that fail should render ⚠️ not ❌ in the summary."""
+    """Advisory checks that fail should render warn not fail in the summary."""
     results = [
-        CheckResult("why", True, "ok"),
-        CheckResult("issue-link", False, "no link"),
+        CheckResult("why", passed=True, detail="ok"),
+        CheckResult("issue-link", passed=False, detail="no link"),
     ]
     title, summary = persona._summary(results)
-    assert "✅" in title  # overall pass (issue-link is advisory)
-    assert "⚠️" in summary
-    assert "❌" not in summary
+    assert "Hunt Plan ready" in title or "Chief pass" in title
+    assert "warn" in summary
+    assert "fail" not in summary
 
 
 def test_evaluate_pull_request_is_pure_no_external_calls():
@@ -245,7 +245,7 @@ def test_publish_tpm_evaluation_posts_on_failure():
             )
 
     assert captured["conclusion"] == "failure"
-    assert "❌" in captured["title"]
+    assert "Hunt Plan hold" in captured["title"] or "Chief hold" in captured["title"]
     assert out == {"persona": "tpm", "result": "fail"}
 
 
@@ -266,7 +266,7 @@ def test_publish_tpm_evaluation_uses_grug_check_name():
 
     # Branch protection ruleset relies on this exact string. Drift = silent
     # cutover regression.
-    assert captured["name"] == "Grug — Definition of Ready"
+    assert captured["name"] == "Grug - Chief"
 
 
 def test_publish_tpm_evaluation_external_id_format():

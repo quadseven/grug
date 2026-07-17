@@ -128,7 +128,7 @@ egress-deny is inert and the test phase CAN reach the network. Therefore:
 ### Persona packaging
 
 Smasher joins the registry (ADR-0010): `key=smasher`, canonical `smasher`,
-check-run `Grug — Smasher`, `smasher_enabled` default OFF, no blocking mode
+check-run `Grug - Smasher`, `smasher_enabled` default OFF, no blocking mode
 (mutation findings are inherently advisory), `dispatch_style=async` (like Elder
 and Guard — the Job round-trip is far over the ACK budget). Survived mutants
 become ordinary `Finding`s published through the SHARED Guard/Elder publish
