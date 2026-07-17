@@ -9,6 +9,8 @@ from __future__ import annotations
 
 from unittest.mock import patch
 
+import pytest
+
 from enforcement import (
     ensure_enforcement,
     heal_enforcement,
@@ -122,6 +124,30 @@ def test_remove_stored_id_plus_coexisting_legacy_deletes_both():
     assert mock_del.call_count == 2
     assert {c.args[3] for c in mock_del.call_args_list} == {42, 77}
     mock_set.assert_called_once_with(1, 2, None)
+
+
+def test_remove_stored_id_survives_list_rulesets_failure():
+    """A transient list_rulesets failure must NOT block deleting a known
+    stored ID - the name scan is a best-effort supplement, not a gate."""
+    with patch("adapters.install_store.get_enforcement_id", return_value=42), \
+         patch("enforcement.list_rulesets", side_effect=RuntimeError("GitHub 503")), \
+         patch("enforcement.delete_ruleset") as mock_del, \
+         patch("adapters.install_store.set_enforcement_id") as mock_set:
+        remove_enforcement("tok", "o", "r", 1, 2)
+
+    mock_del.assert_called_once_with("tok", "o", "r", 42)
+    mock_set.assert_called_once_with(1, 2, None)
+
+
+def test_remove_no_stored_id_reraises_on_list_failure():
+    """No stored ID AND listing fails -> nothing safe to delete; surface the
+    error so the caller retries rather than silently reporting removed."""
+    with patch("adapters.install_store.get_enforcement_id", return_value=None), \
+         patch("enforcement.list_rulesets", side_effect=RuntimeError("GitHub 503")), \
+         patch("enforcement.delete_ruleset") as mock_del:
+        with pytest.raises(RuntimeError, match="GitHub 503"):
+            remove_enforcement("tok", "o", "r", 1, 2)
+    mock_del.assert_not_called()
 
 
 def test_remove_falls_back_to_list_when_no_stored_id():

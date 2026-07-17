@@ -151,10 +151,29 @@ def remove_enforcement(
     to_delete_ids: set = set()
     if ruleset_id is not None:
         to_delete_ids.add(ruleset_id)
-    rulesets = list_rulesets(install_token, owner, repo)
-    for rs in rulesets:
-        if is_enforcement_ruleset_name(rs.get("name", "")):
-            to_delete_ids.add(rs["id"])
+    # The name scan is a best-effort SUPPLEMENT to catch a coexisting legacy
+    # ruleset; it must never block deleting a known stored ID. If listing
+    # fails (GitHub 5xx / rate limit) we still delete the stored ID and pick
+    # up any legacy orphan on the next disable/reconcile. Only when there is
+    # NO stored ID does a listing failure leave us nothing safe to do - then
+    # re-raise so the caller retries rather than silently reporting removed.
+    try:
+        rulesets = list_rulesets(install_token, owner, repo)
+        for rs in rulesets:
+            if is_enforcement_ruleset_name(rs.get("name", "")):
+                to_delete_ids.add(rs["id"])
+    except Exception as e:  # noqa: BLE001 - listing is supplemental to stored ID
+        if ruleset_id is None:
+            raise
+        log.warning(
+            "enforcement_supplemental_scan_failed",
+            extra={
+                "owner": owner, "repo": repo,
+                "install_id": install_id, "repo_id": repo_id,
+                "stored_ruleset_id": ruleset_id,
+                "kind": type(e).__name__,
+            },
+        )
     to_delete = sorted(to_delete_ids)
 
     if not to_delete:
