@@ -1263,3 +1263,98 @@ def test_complete_elder_check_open_posts_neutral(monkeypatch):
     assert posted["result"].conclusion == "neutral"
     assert posted["result"].name == rerun._ELDER_CHECK_NAME
     assert "open" in posted["external_id"]
+
+
+# --- reply-mined learnings consumer job (#670, ADR-0020) --------------------
+
+def test_run_learn_durable_stores_and_acks(monkeypatch):
+    put_calls = []
+    posted = []
+    monkeypatch.setattr(
+        "adapters.install_store.get_comment_record",
+        lambda iid, cid: {
+            "finding_text": "consider nested try/except",
+            "finding_tags": {"rule_name": "error-handling"},
+            "author_login": "dev",
+        },
+    )
+    monkeypatch.setattr(
+        "adapters.install_store.put_learning",
+        lambda **kw: put_calls.append(kw),
+    )
+    monkeypatch.setattr(
+        "llm_client.classify_learning",
+        lambda *a, **k: {"durable": True, "learning": "prefer early returns",
+                         "scope_path": "**/mw/*.py"},
+    )
+    monkeypatch.setattr(rerun, "with_install_token_retry", lambda iid, fn: fn("tok"))
+    monkeypatch.setattr(rerun, "_gh_post", lambda token, url, body: posted.append((url, body)))
+
+    result = rerun._run_learn(11, "o/r", 7, 5001, 4000, "we prefer early returns")
+
+    assert result == "learned"
+    assert put_calls and put_calls[0]["text"] == "prefer early returns"
+    assert put_calls[0]["scope_path"] == "**/mw/*.py" and put_calls[0]["source_pr"] == 7
+    assert posted and "/pulls/7/comments/4000/replies" in posted[0][0]
+    assert "Markings remembered" in posted[0][1]["body"]
+
+
+def test_run_learn_one_off_declines_without_storing(monkeypatch):
+    put_calls = []
+    posted = []
+    monkeypatch.setattr(
+        "adapters.install_store.get_comment_record",
+        lambda iid, cid: {"finding_text": "x", "finding_tags": {"rule_name": "r"}},
+    )
+    monkeypatch.setattr("adapters.install_store.put_learning",
+                        lambda **kw: put_calls.append(kw))
+    monkeypatch.setattr("llm_client.classify_learning",
+                        lambda *a, **k: {"durable": False, "learning": "", "scope_path": ""})
+    monkeypatch.setattr(rerun, "with_install_token_retry", lambda iid, fn: fn("tok"))
+    monkeypatch.setattr(rerun, "_gh_post", lambda token, url, body: posted.append((url, body)))
+
+    result = rerun._run_learn(11, "o/r", 7, 5001, 4000, "just for this PR")
+
+    assert result == "learn_one_off"
+    assert put_calls == []  # nothing stored
+    assert posted and "did not carve" in posted[0][1]["body"]
+
+
+def test_run_learn_classifier_none_declines(monkeypatch):
+    posted = []
+    monkeypatch.setattr(
+        "adapters.install_store.get_comment_record",
+        lambda iid, cid: {"finding_text": "x", "finding_tags": {"rule_name": "r"}},
+    )
+    monkeypatch.setattr("adapters.install_store.put_learning",
+                        lambda **kw: (_ for _ in ()).throw(AssertionError("must not store")))
+    monkeypatch.setattr("llm_client.classify_learning", lambda *a, **k: None)
+    monkeypatch.setattr(rerun, "with_install_token_retry", lambda iid, fn: fn("tok"))
+    monkeypatch.setattr(rerun, "_gh_post", lambda token, url, body: posted.append(body))
+
+    assert rerun._run_learn(11, "o/r", 7, 5001, 4000, "?") == "learn_one_off"
+    assert posted  # still acknowledged
+
+
+def test_run_learn_no_parent_record_is_silent(monkeypatch):
+    posted = []
+    monkeypatch.setattr("adapters.install_store.get_comment_record", lambda iid, cid: None)
+    monkeypatch.setattr(rerun, "_gh_post", lambda token, url, body: posted.append(body))
+
+    assert rerun._run_learn(11, "o/r", 7, 5001, 4000, "reply") == "learn_no_parent"
+    assert posted == []  # no noise on a reply to a non-grug comment
+
+
+def test_run_one_routes_learn_kind(monkeypatch):
+    called = {}
+    monkeypatch.setattr(
+        rerun, "_run_learn",
+        lambda iid, repo, pr, cid, parent, text: called.update(
+            iid=iid, repo=repo, pr=pr, cid=cid, parent=parent, text=text) or "learned",
+    )
+    body = json.dumps({
+        "kind": "learn", "install_id": 11, "repo": "o/r", "pr_number": 7,
+        "comment_id": 5001, "parent_comment_id": 4000, "reply_text": "hi",
+    })
+    assert rerun._run_one(body) == "learned"
+    assert called["parent"] == 4000 and called["cid"] == 5001

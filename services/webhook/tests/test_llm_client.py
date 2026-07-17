@@ -2270,6 +2270,87 @@ def test_answer_pr_question_returns_none_on_backend_failure(monkeypatch) -> None
     assert all(c["metadata"]["kind"] == "transport_error" for c in annotate_calls)
 
 
+# --- reply-mined learnings (#670, ADR-0020) --------------------------------
+
+def test_classify_learning_durable_returns_rule_and_scope() -> None:
+    payload = json.dumps({
+        "durable": True,
+        "learning": "In auth middleware, prefer early returns with error codes.",
+        "scope_path": "**/middleware/*.py",
+    })
+    response = httpx.Response(200, json=_openai_json_response(payload))
+    with patch.object(httpx, "post", return_value=response):
+        out = lc.classify_learning(
+            "we always do early returns here, our monitoring tracks the codes",
+            "consider nested try/except", {"rule_name": "error-handling"},
+            installation_id=2,
+        )
+    assert out is not None
+    assert out["durable"] is True
+    assert "early returns" in out["learning"]
+    assert out["scope_path"] == "**/middleware/*.py"
+
+
+def test_classify_learning_one_off_does_not_store() -> None:
+    payload = json.dumps({"durable": False, "learning": "", "scope_path": ""})
+    response = httpx.Response(200, json=_openai_json_response(payload))
+    with patch.object(httpx, "post", return_value=response):
+        out = lc.classify_learning(
+            "yeah that's fine just for this PR", "finding text",
+            {"rule_name": "r"}, installation_id=2,
+        )
+    assert out is not None
+    assert out["durable"] is False and out["learning"] == ""
+
+
+def test_classify_learning_durable_but_empty_rule_coerced_to_one_off() -> None:
+    # A 'durable' verdict with no rule text is unusable - never store empty.
+    payload = json.dumps({"durable": True, "learning": "  ", "scope_path": ""})
+    response = httpx.Response(200, json=_openai_json_response(payload))
+    with patch.object(httpx, "post", return_value=response):
+        out = lc.classify_learning("x", "y", {"rule_name": "r"}, installation_id=2)
+    assert out is not None and out["durable"] is False
+
+
+def test_classify_learning_non_string_rule_is_one_off() -> None:
+    payload = json.dumps({"durable": True, "learning": {"nested": "obj"}})
+    response = httpx.Response(200, json=_openai_json_response(payload))
+    with patch.object(httpx, "post", return_value=response):
+        out = lc.classify_learning("x", "y", {"rule_name": "r"}, installation_id=2)
+    assert out is not None and out["durable"] is False and out["learning"] == ""
+
+
+def test_classify_learning_returns_none_on_backend_failure() -> None:
+    with patch.object(httpx, "post", side_effect=httpx.ConnectError("down")):
+        out = lc.classify_learning("x", "y", {"rule_name": "r"}, installation_id=2)
+    assert out is None
+
+
+def test_render_learnings_block_bounded_and_sanitized() -> None:
+    rows = [
+        {"text": "prefer early returns", "scope_path": "**/mw/*.py"},
+        {"text": "name the caller when not updated", "scope_path": ""},
+        {"text": "   ", "scope_path": ""},  # blank -> skipped
+    ]
+    block = lc._render_learnings_block(rows)
+    assert "WHAT YOUR TRIBE TOLD GRUG" in block
+    assert "(**/mw/*.py) prefer early returns" in block
+    assert "- name the caller when not updated" in block
+    assert block.count("\n-") == 2  # the blank row is skipped
+
+
+def test_render_learnings_block_empty_on_no_usable_rows() -> None:
+    assert lc._render_learnings_block([]) == ""
+    assert lc._render_learnings_block([{"text": ""}]) == ""
+
+
+def test_render_learnings_block_truncates_a_flood() -> None:
+    rows = [{"text": "rule " + "x" * 200, "scope_path": ""} for _ in range(50)]
+    block = lc._render_learnings_block(rows, max_chars=300)
+    assert "more learnings omitted" in block
+    assert len(block) < 700
+
+
 def test_summarize_pr_tolerates_missing_optional_fields() -> None:
     payload = json.dumps({"summary": "A small fix."})
     response = httpx.Response(200, json=_openai_json_response(payload))

@@ -22,7 +22,7 @@ from __future__ import annotations
 
 import logging
 from datetime import datetime, timezone
-from typing import Any, Literal, NotRequired, Optional, TypedDict
+from typing import Any, Literal, NotRequired, Optional, TypedDict, cast
 
 from psycopg.types.json import Jsonb
 
@@ -756,6 +756,115 @@ def get_repo_exemplars(repo: str) -> list[dict[str, Any]]:
     """The cached few-shot exemplars for a repo, or [] if none derived."""
     item = _get_item(_ledger_pk(repo), "EXEMPLARS")
     return list(item.get("exemplars", [])) if item else []
+
+
+# --- Reply-mined learnings (#670 slice 1, ADR-0020) ---------------------
+# Learnings are OPERATOR-taught: a maintainer replied to a finding with a
+# preference and grug's classifier restated it as a durable rule. They are
+# repo-scoped like the ledger but live under their OWN partition
+# (LEARN#<repo>) so they never collide with the ledger corpus scan or its
+# PRACTICES / EXEMPLARS cache rows. Distinct from the outcome-taught ledger:
+# see ADR-0020 for why the two corpora stay separate.
+
+
+class Learning(TypedDict):
+    text: str
+    repo: str
+    scope_path: NotRequired[str]
+    source_pr: NotRequired[int]
+    source_comment_id: NotRequired[int]
+    author: NotRequired[str]
+    created_at: NotRequired[str]
+    usage_count: NotRequired[int]
+    last_used_at: NotRequired[str]
+
+
+def _learning_pk(repo: str) -> str:
+    return f"LEARN#{repo}"
+
+
+def _learning_digest(text: str) -> str:
+    """Stable 12-hex identity of a learning from its rule text, so the same
+    preference taught twice heals in place instead of duplicating."""
+    import hashlib
+    return hashlib.sha256(text.strip().encode("utf-8")).hexdigest()[:12]
+
+
+def _learning_sk(digest: str) -> str:
+    return f"LEARNING#{digest}"
+
+
+def put_learning(
+    *,
+    repo: str,
+    text: str,
+    scope_path: str = "",
+    source_pr: int = 0,
+    source_comment_id: int = 0,
+    author: str = "",
+    created_at: str = "",
+) -> None:
+    """Upsert one durable learning under LEARN#<repo>. Keyed by the rule
+    text's content digest, so re-teaching the same preference heals the row
+    (and preserves its created_at) instead of adding a duplicate. Usage
+    counters seed at zero; the increment-on-apply pass is a later slice."""
+    rule = text.strip()
+    if not (repo and rule):
+        return
+    now = created_at or datetime.now(timezone.utc).isoformat()
+    with get_pool().connection() as conn:
+        conn.execute(
+            """
+            INSERT INTO grug_kv (pk, sk, data)
+            VALUES (%(pk)s, %(sk)s, %(data)s)
+            -- Identical rule text is the same learning (digest keys on text
+            -- alone), so the first teach's provenance + created_at + counters
+            -- win; a re-teach is a no-op rather than a duplicate.
+            ON CONFLICT (pk, sk) DO NOTHING
+            """,
+            {
+                "pk": _learning_pk(repo),
+                "sk": _learning_sk(_learning_digest(rule)),
+                "data": encode_attrs({
+                    "text": rule,
+                    "repo": repo,
+                    "scope_path": scope_path,
+                    "source_pr": int(source_pr),
+                    "source_comment_id": int(source_comment_id),
+                    "author": author,
+                    "created_at": now,
+                    "usage_count": 0,
+                    "last_used_at": "",
+                }),
+            },
+        )
+
+
+def list_learnings(repo: str, limit: int | None = None) -> list[Learning]:
+    """Every durable learning for a repo, oldest first. Read at review time
+    to steer Elder's prompt (ADR-0020). Empty list when none taught yet."""
+    with get_pool().connection() as conn:
+        rows = conn.execute(
+            f"""
+            SELECT pk, sk, data FROM grug_kv
+            WHERE pk = %s AND sk LIKE 'LEARNING#%%' AND {TTL_LIVE}
+            ORDER BY (data->>'created_at') ASC, sk COLLATE "C" ASC
+            """,
+            (_learning_pk(repo),),
+        ).fetchall()
+    out = [cast("Learning", decode_item(pk, sk, data)) for pk, sk, data in rows]
+    return out if limit is None else out[:limit]
+
+
+def get_comment_record(
+    install_id: int, comment_id: int | str,
+) -> Optional[CommentRecord]:
+    """The stored CommentRecord for one of grug's own finding comments, or
+    None. Used to join a maintainer's inline REPLY (via in_reply_to_id) back
+    to the finding it answers - the same identity the reaction poller uses,
+    but keyed to a single comment instead of scanning the whole install."""
+    item = _get_item(_inst_pk(install_id), _comment_record_sk(comment_id))
+    return cast("Optional[CommentRecord]", item) if item else None
 
 
 _DELIVERY_CLAIM_TTL_HOURS = 24

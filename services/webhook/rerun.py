@@ -533,6 +533,31 @@ def enqueue_ask(*, install_id: int, repo: str, pr_number: int, comment_id: int, 
                                     "pr": pr_number, "comment_id": comment_id})
 
 
+def enqueue_learn(
+    *, install_id: int, repo: str, pr_number: int, comment_id: int,
+    parent_comment_id: int, reply_text: str,
+) -> None:
+    """Enqueue a learnings-classification job (#670, ADR-0020) so the LLM
+    classifier runs in the consumer, NOT inline in the webhook ACK path.
+    `comment_id` is the maintainer's REPLY (the dedup key - a re-delivered
+    reply collapses); `parent_comment_id` is grug's finding it answers."""
+    if not _RERUN_QUEUE_URL:
+        raise RuntimeError("GRUG_RERUN_QUEUE_URL not configured")
+    _sqs.send_message(
+        QueueUrl=_RERUN_QUEUE_URL,
+        MessageBody=json.dumps({
+            "schema_version": SCHEMA_VERSION, "kind": "learn",
+            "install_id": install_id, "repo": repo, "pr_number": pr_number,
+            "comment_id": comment_id, "parent_comment_id": parent_comment_id,
+            "reply_text": reply_text,
+        }),
+        MessageGroupId=_ask_group_id(install_id, repo, pr_number),
+        MessageDeduplicationId=f"{install_id}:{repo}:{pr_number}:learn:{comment_id}",
+    )
+    log.info("learn_enqueued", extra={"install_id": install_id, "repo": repo,
+                                      "pr": pr_number, "comment_id": comment_id})
+
+
 def _gh_get(token: str, url: str) -> dict[str, Any]:
     resp = httpx.get(
         url,
@@ -609,6 +634,94 @@ def _run_ask(install_id: int, repo_full: str, pr_number: int, question: str) -> 
     return result
 
 
+def _learn_ack_body(learning: str, scope_path: str) -> str:
+    """The 'Markings remembered' threaded reply for a stored learning."""
+    scope = f"\n> Scope: `{scope_path}`" if scope_path else ""
+    return (
+        "Grug remember this.\n\n"
+        "<details><summary>Markings remembered</summary>\n\n"
+        f"> {learning}{scope}\n\n"
+        "Grug will apply this to future reviews on this repo. "
+        "So speaks Grug.\n</details>"
+    )
+
+
+_LEARN_DECLINE_BODY = (
+    "Grug read this, but hear it as one-time talk for this hunt - "
+    "Grug did not carve a lasting marking. Tell Grug a rule for the whole "
+    "tribe if you want it remembered."
+)
+
+
+def _run_learn(
+    install_id: int, repo_full: str, pr_number: int,
+    comment_id: int, parent_comment_id: int, reply_text: str,
+) -> str:
+    """Classify a maintainer's reply to a finding and, if it is a durable team
+    preference, store it and acknowledge in the thread (#670, ADR-0020). Never
+    raises past the job: a classifier or store hiccup degrades to no learning.
+    Posts a threaded reply either way so the maintainer always gets a signal."""
+    from urllib.parse import quote as _q
+    from adapters.install_store import get_comment_record, put_learning  # type: ignore
+    from llm_client import classify_learning  # type: ignore
+    from observability import emit_gauge  # type: ignore
+
+    owner, _, repo_name = repo_full.partition("/")
+    record = get_comment_record(install_id, parent_comment_id)
+    if record is None:
+        # The reply is not to one of grug's tracked findings (or the record
+        # TTL-expired). Nothing to learn from; do not post noise.
+        log.info("learn_no_parent_record", extra={
+            "repo": repo_full, "pr": pr_number, "parent": parent_comment_id})
+        return "learn_no_parent"
+
+    finding_text = str(record.get("finding_text", ""))
+    finding_tags = dict(record.get("finding_tags", {}))
+    classification = classify_learning(
+        reply_text, finding_text, finding_tags, install_id,
+        pr_context={
+            "installation_id": install_id, "repo": repo_full,
+            "pr_number": pr_number,
+        },
+    )
+
+    if classification and classification["durable"]:
+        put_learning(
+            repo=repo_full,
+            text=classification["learning"],
+            scope_path=classification["scope_path"],
+            source_pr=pr_number,
+            source_comment_id=comment_id,
+            author=str(record.get("author_login", "")),
+        )
+        ack = _learn_ack_body(
+            classification["learning"], classification["scope_path"],
+        )
+        result = "learned"
+    else:
+        # One-off, or the classifier could not decide: acknowledge without
+        # storing (the classifier errs toward not storing by design).
+        ack = _LEARN_DECLINE_BODY
+        result = "learn_one_off"
+
+    def _reply(token: str) -> None:
+        _gh_post(
+            token,
+            f"{_GH_API}/repos/{_q(owner, safe='')}/{_q(repo_name, safe='')}"
+            f"/pulls/{pr_number}/comments/{parent_comment_id}/replies",
+            {"body": ack},
+        )
+    with_install_token_retry(install_id, _reply)
+    try:
+        emit_gauge("grug.learnings.classified", 1)
+    except Exception:  # noqa: BLE001
+        pass
+    log.info("learn_classified", extra={
+        "repo": repo_full, "pr": pr_number, "comment_id": comment_id,
+        "result": result})
+    return result
+
+
 def _run_one(body: str) -> str:
     """Re-run ONE job. Raises on a malformed message or an infra fetch failure
     (→ ESM retry → DLQ). Returns a short status for the batch summary log.
@@ -622,6 +735,13 @@ def _run_one(body: str) -> str:
     pr_number = int(job["pr_number"])
     if job.get("kind") == "ask":
         return _run_ask(install_id, repo_full, pr_number, str(job.get("question", "")))
+    if job.get("kind") == "learn":
+        return _run_learn(
+            install_id, repo_full, pr_number,
+            int(job.get("comment_id", 0)),
+            int(job.get("parent_comment_id", 0)),
+            str(job.get("reply_text", "")),
+        )
     if job.get("kind") == "review":
         return _run_hot_review(job, install_id, repo_full, pr_number)
     persona = str(job.get("persona", "elder"))

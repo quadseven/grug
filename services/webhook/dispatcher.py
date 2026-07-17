@@ -53,6 +53,8 @@ def dispatch(
         return _handle_pull_request(payload, delivery_id=delivery_id)
     if event_name == "issue_comment":
         return _handle_issue_comment(payload)
+    if event_name == "pull_request_review_comment":
+        return _handle_review_comment_reply(payload)
     if event_name == "repository_ruleset":
         return _handle_repository_ruleset(payload)
     return {"status": "no_op", "reason": f"no handler for event {event_name}"}
@@ -631,3 +633,105 @@ def _handle_issue_comment(payload: dict[str, Any]) -> dict[str, str]:
         "trigger": "recheck",
         "result": "pass" if evaluation.passed else "fail",
     }
+
+
+def _handle_review_comment_reply(payload: dict[str, Any]) -> dict[str, str]:
+    """A maintainer replied to an inline review-comment thread. If the reply
+    answers one of grug's OWN findings, enqueue a learnings-classification job
+    (#670, ADR-0020). The LLM classifier runs in the consumer, never inline,
+    so the webhook stays within GitHub's delivery timeout. Same trust gate as
+    /grug commands: only the PR author or a write-or-above collaborator can
+    teach, so a random commenter on a public-listed app cannot poison the
+    corpus."""
+    if payload.get("action", "") != "created":
+        return {"status": "no_op", "reason": "review_comment action not created"}
+
+    comment = payload.get("comment") or {}
+    in_reply_to = comment.get("in_reply_to_id")
+    if not in_reply_to:
+        # A NEW inline comment (a thread root), not a reply. Grug only learns
+        # from replies to its findings; a root comment has nothing to join.
+        return {"status": "no_op", "reason": "not a reply"}
+
+    # Never learn from a bot's reply (grug's own acknowledgments, other bots).
+    if str((comment.get("user") or {}).get("type", "")) == "Bot":
+        return {"status": "no_op", "reason": "reply author is a bot"}
+
+    body = (comment.get("body") or "").strip()
+    if not body:
+        return {"status": "no_op", "reason": "empty reply"}
+
+    repo = payload.get("repository") or {}
+    installation = payload.get("installation") or {}
+    pr = payload.get("pull_request") or {}
+    sender = payload.get("sender") or {}
+
+    installation_id = installation.get("id")
+    owner = (repo.get("owner") or {}).get("login") or repo.get("full_name", "").split("/")[0]
+    repo_name = repo.get("name")
+    pr_number = pr.get("number")
+    comment_id = comment.get("id")
+    sender_login = sender.get("login", "")
+    pr_author_login = (pr.get("user") or {}).get("login", "")
+
+    if not all([installation_id, owner, repo_name, pr_number, comment_id]):
+        return {"status": "skip", "reason": "incomplete_payload"}
+
+    if not is_install_allowlisted(int(installation_id)):
+        return {"status": "no_op", "reason": "installer not allowlisted"}
+
+    repo_id = repo.get("id")
+    if repo_id is not None and not is_persona_enabled(
+        int(installation_id), int(repo_id), "tpm",
+    ):
+        return {"status": "no_op", "reason": "tpm disabled for this repo"}
+
+    from urllib.parse import quote as _q
+    from github_app_auth import with_install_token_retry  # type: ignore
+    import httpx  # type: ignore
+
+    # Trust gate: author OR write+ collaborator, same as /grug commands.
+    if sender_login != pr_author_login:
+        def _check_perm(token: str) -> str:
+            r = httpx.get(
+                f"https://api.github.com/repos/{_q(owner, safe='')}/"
+                f"{_q(repo_name, safe='')}/collaborators/"
+                f"{_q(sender_login, safe='')}/permission",
+                headers={
+                    "Authorization": f"token {token}",
+                    "Accept": "application/vnd.github+json",
+                },
+                timeout=10,
+            )
+            r.raise_for_status()
+            return (r.json() or {}).get("permission", "")
+
+        try:
+            perm = with_install_token_retry(int(installation_id), _check_perm)
+        except httpx.HTTPStatusError as e:
+            log.warning("learn_perm_lookup_failed", extra={
+                "sender": sender_login, "status": e.response.status_code})
+            return {"status": "skip", "reason": "perm_lookup_failed"}
+        except httpx.RequestError as e:
+            log.warning("learn_perm_lookup_transport_failed", extra={
+                "sender": sender_login, "kind": type(e).__name__})
+            return {"status": "skip", "reason": "perm_lookup_transport_failed"}
+        if perm not in _AUTHORIZED_ROLES:
+            return {"status": "no_op", "reason": "reply author lacks write perm"}
+
+    from rerun import enqueue_learn  # type: ignore
+    try:
+        enqueue_learn(
+            install_id=int(installation_id),
+            repo=f"{owner}/{repo_name}",
+            pr_number=int(pr_number),
+            comment_id=int(comment_id),
+            parent_comment_id=int(in_reply_to),
+            reply_text=body,
+        )
+    except RuntimeError as e:
+        # Queue not configured (local/dev) - best-effort, never a webhook 500.
+        log.warning("learn_enqueue_failed", extra={"kind": type(e).__name__})
+        return {"status": "skip", "reason": "enqueue_failed"}
+
+    return {"status": "enqueued", "kind": "learn"}

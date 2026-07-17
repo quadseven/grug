@@ -426,6 +426,64 @@ def test_comment_records_roundtrip_and_ttl_filtering(pg):
     assert store.list_comment_records(1) == []
 
 
+def test_learnings_roundtrip_dedup_and_ttl(pg):
+    from adapters import pg_install_store as store
+
+    store.put_learning(
+        repo="o/r", text="  prefer early returns with error codes  ",
+        scope_path="**/middleware/*.py", source_pr=7,
+        source_comment_id=100, author="dev",
+    )
+    got = store.list_learnings("o/r")
+    assert len(got) == 1
+    row = got[0]
+    assert row["text"] == "prefer early returns with error codes"  # stripped
+    assert row["scope_path"] == "**/middleware/*.py"
+    assert row["source_pr"] == 7 and row["author"] == "dev"
+    assert row["usage_count"] == 0 and row["last_used_at"] == ""
+    first_created = row["created_at"]
+
+    # Re-teaching the SAME rule (whitespace-different) is a no-op: same digest,
+    # first teach's provenance + created_at win, no duplicate row.
+    store.put_learning(
+        repo="o/r", text="prefer early returns with error codes",
+        source_pr=9, author="other",
+    )
+    again = store.list_learnings("o/r")
+    assert len(again) == 1
+    assert again[0]["created_at"] == first_created
+    assert again[0]["source_pr"] == 7  # original provenance preserved
+
+    # A DIFFERENT rule is a distinct row; repo-scoped isolation holds.
+    store.put_learning(repo="o/r", text="name the caller when it is not updated")
+    assert len(store.list_learnings("o/r")) == 2
+    assert store.list_learnings("other/repo") == []
+
+    # Expired learnings vanish from reads even before any purge runs.
+    with store.get_pool().connection() as conn:
+        conn.execute(
+            "UPDATE grug_kv SET ttl = EXTRACT(EPOCH FROM now())::bigint - 10 "
+            "WHERE pk = 'LEARN#o/r'"
+        )
+    assert store.list_learnings("o/r") == []
+
+
+def test_get_comment_record_single_lookup(pg):
+    from adapters import pg_install_store as store
+
+    store.put_comment_record(
+        install_id=1, comment_id=555, repo="o/r", pr_number=5,
+        review_span_context=None, finding_tags={"rule_name": "early-return"},
+        finding_text="consider early return",
+    )
+    rec = store.get_comment_record(1, 555)
+    assert rec is not None
+    assert rec["comment_id"] == 555 and rec["repo"] == "o/r"
+    assert rec["finding_tags"]["rule_name"] == "early-return"
+    # Unknown comment id -> None (a reply to a non-grug comment).
+    assert store.get_comment_record(1, 999) is None
+
+
 # ---------------------------------------------------------------------------
 # user store (KMS faked - the envelope is out of scope, storage is not)
 # ---------------------------------------------------------------------------
