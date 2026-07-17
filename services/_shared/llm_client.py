@@ -1844,8 +1844,10 @@ def decide_deep_escalation(
     added = _count_added_lines(hunks)
     reasons: list[str] = []
 
-    if added >= threshold and threshold > 0:
-        reasons.append(f"diff_lines:{added}>={threshold}")
+    # Exclusive bound: env value N means "more than N added lines" so
+    # GRUG_DEEP_DIFF_LINES=500 escalates only above 500, not at exactly 500.
+    if threshold > 0 and added > threshold:
+        reasons.append(f"diff_lines:{added}>{threshold}")
 
     risky = _high_risk_paths(hunks, markers)
     if risky:

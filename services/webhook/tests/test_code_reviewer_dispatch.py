@@ -1761,8 +1761,38 @@ def test_review_stack_body_has_marker_and_actionable_count():
     assert "2 actionable marking" in body
     assert "null-deref" in body
     assert "Prompt for AI agents" in body
+    assert "Address each finding below" in body
     assert "Living Hunt range" in body
     assert "Tier-1" in body
+
+
+def test_review_stack_and_summary_omit_empty_agent_prompt():
+    """Clear pass must not ship a hollow 'Address each finding' shell."""
+    from personas.code_reviewer.persona import CodeReviewEvaluation
+    ev = CodeReviewEvaluation(findings=(), conclusion="success")
+    assert cr_dispatch._consolidated_agent_prompt(ev) == ""
+    stack = cr_dispatch._review_stack_body(ev, conclusion="success")
+    assert "Prompt for AI agents" not in stack
+    assert "Address each finding" not in stack
+    assert "nothing to remediate" in stack.lower() or "No agent prompt" in stack
+    assert "review degraded" not in stack.lower()
+    _, summary = cr_dispatch._summary_markdown(ev)
+    assert "Prompt for AI agents" not in summary
+    assert "Address each finding" not in summary
+
+
+def test_review_stack_degraded_empty_findings_not_nothing_to_remediate():
+    """CodeRabbit #665: degraded + empty findings is not a clean clear pass."""
+    from personas.code_reviewer.persona import CodeReviewEvaluation
+    ev = CodeReviewEvaluation(
+        findings=(),
+        conclusion="neutral",
+        degraded_reason="all_failed",
+    )
+    stack = cr_dispatch._review_stack_body(ev, conclusion="neutral")
+    assert "nothing to remediate" not in stack.lower()
+    assert "review degraded" in stack.lower()
+    assert "no usable findings" in stack.lower()
 
 
 def test_summary_markdown_appends_bounded_consolidated_agent_prompt():

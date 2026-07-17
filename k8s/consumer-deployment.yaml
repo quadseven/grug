@@ -92,7 +92,8 @@ spec:
             # Fast = coder-first with reasoner only if coder fails.
             - {name: GRUG_REVIEW_DEPTH, value: tiered}
             # Escalation knobs (llm_client.decide_deep_escalation) — tuned for
-            # speed: fewer free samples, larger diff before auto-deep.
+            # speed: fewer free samples; auto-deep only when added lines > 500
+            # (exclusive; see llm_client.decide_deep_escalation).
             - {name: GRUG_DEEP_SAMPLE_RATE, value: "0.05"}
             - {name: GRUG_DEEP_DIFF_LINES, value: "500"}
             # #646: reasoner after Tier-1 publish (0 = disable async deep)

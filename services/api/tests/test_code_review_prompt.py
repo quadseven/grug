@@ -206,6 +206,18 @@ def test_positional_parse_drops_holes_rule_present():
     )
 
 
+def test_doc_code_claim_drift_rule_present():
+    """Qodo/CR class: comment/env prose asserts wrong settle cap or bound."""
+    rule = next(
+        (r for r in crp.RULES if r.name == "doc-code-claim-drift"),
+        None,
+    )
+    assert rule is not None, "doc-code-claim-drift missing from RULES"
+    assert rule.bug_class == "correctness"
+    assert rule.severity == "medium"
+    assert "doc-code-claim-drift" in crp.build_system_prompt()
+
+
 def test_nonreentrant_lock_self_deadlock_rule_present():
     """Weekly harvest: a method holding a non-reentrant Lock that calls a
     sibling which re-acquires the SAME lock self-deadlocks; a liveness probe

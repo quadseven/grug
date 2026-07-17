@@ -57,6 +57,38 @@ def test_adaptive_settle_medium_caps_at_three():
     assert adaptive_elder_settle_seconds(pr, base_seconds=10) == 3
 
 
+def test_adaptive_settle_swift_boundaries():
+    """At 5 files / 120 churn stay Swift (0); one past either bound is Steady."""
+    assert adaptive_elder_settle_seconds(
+        {"additions": 120, "deletions": 0, "changed_files": 5},
+        base_seconds=10,
+    ) == 0
+    assert adaptive_elder_settle_seconds(
+        {"additions": 121, "deletions": 0, "changed_files": 5},
+        base_seconds=10,
+    ) == 3
+    assert adaptive_elder_settle_seconds(
+        {"additions": 50, "deletions": 0, "changed_files": 6},
+        base_seconds=10,
+    ) == 3
+
+
+def test_adaptive_settle_steady_boundaries():
+    """At 12 files / 400 churn stay Steady (3); one past either bound is Full."""
+    assert adaptive_elder_settle_seconds(
+        {"additions": 400, "deletions": 0, "changed_files": 12},
+        base_seconds=10,
+    ) == 3
+    assert adaptive_elder_settle_seconds(
+        {"additions": 401, "deletions": 0, "changed_files": 12},
+        base_seconds=10,
+    ) == 10
+    assert adaptive_elder_settle_seconds(
+        {"additions": 100, "deletions": 0, "changed_files": 13},
+        base_seconds=10,
+    ) == 10
+
+
 def test_adaptive_settle_large_keeps_base():
     pr = {"additions": 800, "deletions": 200, "changed_files": 40}
     assert adaptive_elder_settle_seconds(pr, base_seconds=10) == 10
