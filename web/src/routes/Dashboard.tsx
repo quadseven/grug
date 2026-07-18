@@ -173,7 +173,7 @@ export function Dashboard() {
             <a className={panel !== "activity" ? "active" : ""} onClick={() => setPanel("repos")}>Dashboard</a>
             <a className={panel === "activity" ? "active" : ""} onClick={() => setPanel("activity")}>Activity</a>
             {me.data.role === "admin" && <Link to="/admin">Admin</Link>}
-            <a href="https://github.com/githumps/grug">Docs</a>
+            <a href="https://github.com/quadseven/grug">Docs</a>
           </nav>
           <div className="userchip">
             <div className="who"><b>@{me.data.login}</b><span>{me.data.role}</span></div>

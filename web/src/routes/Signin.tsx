@@ -30,7 +30,7 @@ export function Signin() {
           </a>
           <nav className="links">
             <a href="/">Home</a>
-            <a href="https://github.com/githumps/grug">Docs</a>
+            <a href="https://github.com/quadseven/grug">Docs</a>
           </nav>
         </div>
       </header>

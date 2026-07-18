@@ -136,7 +136,7 @@ def query_ollama_api(
                 # (connect, read). Read raised 30->60s: the 122B chat model is slower
                 # than the old 3B default even with thinking off.
                 #
-                # X-Spark-Priority (githumps/infra#1768/#1770/#1773): this URL is
+                # X-Spark-Priority (quadseven/infra#1768/#1770/#1773): this URL is
                 # the in-cluster spark-gateway (OLLAMA_URLS is set to it in
                 # k8s/deployment.yaml, not to the Sparks directly) - a Discord
                 # reply is latency-sensitive and must never queue behind one of

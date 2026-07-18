@@ -15,7 +15,7 @@ from ledger import (
 
 def _row(**kw):
     base = dict(
-        repo="githumps/grug", pr=1, reviewer="codex", severity="HIGH",
+        repo="quadseven/grug", pr=1, reviewer="codex", severity="HIGH",
         finding_class="silent-failure", finding="swallowed exception",
         verdict="fixed", evidence="", ts="2026-07-05T00:00:00Z", commit=None,
     )

@@ -45,7 +45,7 @@ export function Admin() {
           <nav className="links">
             <Link to="/dashboard">Dashboard</Link>
             <Link to="/admin" className="active">Admin</Link>
-            <a href="https://github.com/githumps/grug">Docs</a>
+            <a href="https://github.com/quadseven/grug">Docs</a>
           </nav>
           <div className="userchip">
             <div className="who"><b>@{me.data.login}</b><span>admin</span></div>

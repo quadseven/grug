@@ -59,7 +59,7 @@ re-seeded from SSM on every `deploy.k8s.yml` run, so the rotation pattern is:
 
 ```bash
 # Re-seed grug-secrets from SSM and roll, without a code change:
-gh workflow run deploy.k8s.yml --repo githumps/grug --ref main
+gh workflow run deploy.k8s.yml --repo quadseven/grug --ref main
 # (or, if grug-secrets already holds the new value, just force a re-read:)
 kubectl -n grug rollout restart deploy/grug-api deploy/grug-webhook deploy/grug-consumer
 ```

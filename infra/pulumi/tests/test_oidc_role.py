@@ -54,7 +54,7 @@ def test_deploy_role_ssm_scope_is_exactly_the_pinned_set():
     _CAPTURED.clear()
     bundle = oidc_role.create(
         name="grug-gha-deploy-test",
-        repo="githumps/grug",
+        repo="quadseven/grug",
         branches=["main"],
     )
 

@@ -39,7 +39,7 @@ def _full_gh_payload(body=""):
             "user": {"login": "evan"},
         },
         "repository": {
-            "owner": {"login": "githumps", "id": 999, "url": "https://x"},
+            "owner": {"login": "quadseven", "id": 999, "url": "https://x"},
             "name": "grug",
             "description": "x" * 1000,  # bulky — must be dropped
         },
@@ -63,7 +63,7 @@ def test_slim_payload_keeps_bounded_review_context():
             "draft": False,
             "user": {"login": "evan"},
         },
-        "repository": {"owner": {"login": "githumps"}, "name": "grug"},
+        "repository": {"owner": {"login": "quadseven"}, "name": "grug"},
         "installation": {"id": 555},
     }
 
@@ -143,7 +143,7 @@ def test_enqueue_elder_uses_durable_quiet_window_queue(monkeypatch):
     assert ok is True
     enqueue.assert_called_once_with(
         install_id=555,
-        repo="githumps/grug",
+        repo="quadseven/grug",
         pr_number=7,
         requested_base_sha="base123",
         requested_head_sha="abc123",
@@ -297,7 +297,7 @@ _FULL_JOB = {
     "blocking": False,
     "payload": {
         "installation": {"id": 99},
-        "repository": {"owner": {"login": "githumps"}, "name": "grug"},
+        "repository": {"owner": {"login": "quadseven"}, "name": "grug"},
         "pull_request": {"number": 415, "head": {"sha": "abc"}},
     },
 }
@@ -318,7 +318,7 @@ def test_run_elder_job_self_recovers_on_dispatch_error():
         out = ad.run_elder_job(_FULL_JOB)
     assert out == {"persona": "code_reviewer", "result": "unhandled_error"}
     mock_enq.assert_called_once_with(
-        install_id=99, repo="githumps/grug", pr_number=415, persona="elder"
+        install_id=99, repo="quadseven/grug", pr_number=415, persona="elder"
     )
 
 
@@ -532,7 +532,7 @@ _SHA_JOB = {
     "blocking": False,
     "payload": {
         "installation": {"id": 7},
-        "repository": {"owner": {"login": "githumps"}, "name": "grug"},
+        "repository": {"owner": {"login": "quadseven"}, "name": "grug"},
         "pull_request": {"number": 12, "head": {"sha": "sha-aaa"}},
     },
 }
@@ -565,7 +565,7 @@ def test_run_elder_job_reviews_when_snapshot_unclaimed():
         out = ad.run_elder_job(_SHA_JOB)
     mock_d.assert_called_once()
     mock_c.assert_called_once_with(
-        install_id=7, repo="githumps/grug", pr_number=12,
+        install_id=7, repo="quadseven/grug", pr_number=12,
         persona="code_reviewer",
         head_sha=ad.review_snapshot_id_from_pr(
             _SHA_JOB["payload"]["pull_request"],
@@ -856,7 +856,7 @@ def test_run_walkthrough_job_reviews_when_snapshot_unclaimed():
         out = ad.run_walkthrough_job(job)
     mock_d.assert_called_once()
     mock_c.assert_called_once_with(
-        install_id=7, repo="githumps/grug", pr_number=12,
+        install_id=7, repo="quadseven/grug", pr_number=12,
         persona="walkthrough",
         head_sha=ad.review_snapshot_id_from_pr(
             _SHA_JOB["payload"]["pull_request"],

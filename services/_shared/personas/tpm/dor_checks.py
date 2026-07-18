@@ -1,7 +1,7 @@
 """Static DoR checks for PR bodies.
 
 Ported from scripts/tpm.py with the bullet-count regex tightened per
-githumps/grug#20: empty `- [ ]` placeholders no longer count toward the
+quadseven/grug#20: empty `- [ ]` placeholders no longer count toward the
 ≥3 minimum (security: an unfilled template should NOT pass).
 
 5 checks (per PRD #21 + memory `feedback_health_endpoint_standard`):

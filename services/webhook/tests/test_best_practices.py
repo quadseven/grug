@@ -13,7 +13,7 @@ from ledger import parse_row
 
 
 def _r(pr, cls, finding, verdict="fixed"):
-    return parse_row({"repo": "githumps/grug", "pr": pr, "reviewer": "codex",
+    return parse_row({"repo": "quadseven/grug", "pr": pr, "reviewer": "codex",
                       "severity": "HIGH", "class": cls, "finding": finding,
                       "verdict": verdict, "ts": "", "evidence": ""})
 

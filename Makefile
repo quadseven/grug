@@ -86,12 +86,12 @@ rebuild: tear-down
 	@echo ">> step 2/5: pulumi up — recreate AWS infra (SSM/KMS/SQS/S3/IAM/DD)"
 	cd infra/pulumi && pulumi up --stack dev --yes
 	@echo ">> step 3/5: trigger deploy.k8s.yml — build+push images, apply k8s/"
-	gh workflow run deploy.k8s.yml --ref $$(git branch --show-current) --repo githumps/grug
+	gh workflow run deploy.k8s.yml --ref $$(git branch --show-current) --repo quadseven/grug
 	@echo ">>   waiting for run to start..."
 	@sleep 10
-	@RUN_ID=$$(gh run list --workflow=deploy.k8s.yml --branch=$$(git branch --show-current) --repo githumps/grug --limit=1 --json databaseId --jq '.[0].databaseId'); \
+	@RUN_ID=$$(gh run list --workflow=deploy.k8s.yml --branch=$$(git branch --show-current) --repo quadseven/grug --limit=1 --json databaseId --jq '.[0].databaseId'); \
 	  echo ">>   following run $$RUN_ID"; \
-	  gh run watch $$RUN_ID --exit-status --repo githumps/grug
+	  gh run watch $$RUN_ID --exit-status --repo quadseven/grug
 	@echo ">> step 4/5: CF Workers re-deploy + admin re-seed"
 	bash infra/cloudflare/deploy.sh
 	@test -n "$(GRUG_ADMIN_USER_ID)" || { echo "FATAL: set GRUG_ADMIN_USER_ID (and GRUG_ADMIN_LOGIN/GRUG_ADMIN_INSTALL_ID) to YOUR own GitHub identity before seeding admin"; exit 1; }

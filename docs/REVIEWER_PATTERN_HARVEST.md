@@ -1,6 +1,6 @@
 # Reviewer pattern harvest (org-wide)
 
-Internal notes from sampling recent PR review surfaces across githumps
+Internal notes from sampling recent PR review surfaces across quadseven
 repos. Product codenames for what we build next stay pure Grug (Elder,
 Markings Board, Lore, Omen, Swift Hunt, Living Hunt). This file does not
 name third-party products in product copy - only as data sources for the

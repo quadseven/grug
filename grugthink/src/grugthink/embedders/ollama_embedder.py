@@ -103,7 +103,7 @@ class OllamaEmbedder:
                         # only a repeated cold-load tax to avoid.
                         "keep_alive": -1,
                     },
-                    # githumps/infra#1768/#1770/#1773: realtime priority so
+                    # quadseven/infra#1768/#1770/#1773: realtime priority so
                     # this queues ahead of Grug's own review calls and
                     # Hermes's batch turns on the shared gateway target
                     # (matches bot/llm_clients.py's chat call); X-Spark-

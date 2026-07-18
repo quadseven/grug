@@ -40,7 +40,7 @@ def _row(
     verdict: str = "fixed",
     reviewer: str = "codex",
     severity: str = "HIGH",
-    repo: str = "githumps/grug",
+    repo: str = "quadseven/grug",
 ) -> LedgerRow:
     return LedgerRow(
         repo=repo,
@@ -133,7 +133,7 @@ def test_parse_row_normalizes_annotated_verdicts():
     from ledger import parse_row
 
     row = parse_row({
-        "repo": "githumps/grug", "pr": 1, "reviewer": "codex",
+        "repo": "quadseven/grug", "pr": 1, "reviewer": "codex",
         "class": "correctness", "finding": "f",
         "verdict": "declined(bounded: advisory only)",
     })
@@ -166,13 +166,13 @@ def test_score_catch_rate_per_class():
     ]
     cases = build_cases(rows)
     replays = {
-        "githumps/grug#1": CaseReplay(
-            case_id="githumps/grug#1",
+        "quadseven/grug#1": CaseReplay(
+            case_id="quadseven/grug#1",
             emitted={"silent-failure": 1},
             errored=False,
         ),
-        "githumps/grug#2": CaseReplay(
-            case_id="githumps/grug#2",
+        "quadseven/grug#2": CaseReplay(
+            case_id="quadseven/grug#2",
             emitted={"correctness": 2},
             errored=False,
         ),
@@ -191,8 +191,8 @@ def test_score_catch_via_alias():
     rows = [_row(5, "test-gap")]
     cases = build_cases(rows)
     replays = {
-        "githumps/grug#5": CaseReplay(
-            case_id="githumps/grug#5",
+        "quadseven/grug#5": CaseReplay(
+            case_id="quadseven/grug#5",
             emitted={"test-coverage": 1},
             errored=False,
         ),
@@ -211,8 +211,8 @@ def test_score_noise_counts_fp_only_emissions():
     ]
     cases = build_cases(rows)
     replays = {
-        "githumps/grug#7": CaseReplay(
-            case_id="githumps/grug#7",
+        "quadseven/grug#7": CaseReplay(
+            case_id="quadseven/grug#7",
             # 3 noise emissions (known-FP cell, counted PER FINDING not
             # per class) + 3 other findings.
             emitted={"silent-failure": 3, "correctness": 2, "performance": 1},
@@ -227,8 +227,8 @@ def test_score_noise_vacuous_zero_when_nothing_emitted():
     rows = [_row(8, "correctness")]
     cases = build_cases(rows)
     replays = {
-        "githumps/grug#8": CaseReplay(
-            case_id="githumps/grug#8", emitted={}, errored=False
+        "quadseven/grug#8": CaseReplay(
+            case_id="quadseven/grug#8", emitted={}, errored=False
         ),
     }
     report = score(cases, replays)
@@ -246,26 +246,26 @@ def test_score_errored_case_excluded_from_denominators():
     ]
     cases = build_cases(rows)
     replays = {
-        "githumps/grug#10": CaseReplay(
-            case_id="githumps/grug#10", emitted={"correctness": 1}, errored=False
+        "quadseven/grug#10": CaseReplay(
+            case_id="quadseven/grug#10", emitted={"correctness": 1}, errored=False
         ),
-        "githumps/grug#11": CaseReplay(
-            case_id="githumps/grug#11", emitted={}, errored=True
+        "quadseven/grug#11": CaseReplay(
+            case_id="quadseven/grug#11", emitted={}, errored=True
         ),
     }
     report = score(cases, replays)
     # The errored case must NOT drag catch to 0.5 - it is not a miss, it is
     # a non-run. It is reported, not scored.
     assert report.per_class_catch["correctness"] == 1.0
-    assert report.errored_cases == ("githumps/grug#11",)
+    assert report.errored_cases == ("quadseven/grug#11",)
 
 
 def test_score_all_errored_guard():
     rows = [_row(20, "correctness")]
     cases = build_cases(rows)
     replays = {
-        "githumps/grug#20": CaseReplay(
-            case_id="githumps/grug#20", emitted={}, errored=True
+        "quadseven/grug#20": CaseReplay(
+            case_id="quadseven/grug#20", emitted={}, errored=True
         ),
     }
     report = score(cases, replays)
@@ -284,8 +284,8 @@ def _report(rows, replays):
 def test_baseline_roundtrip_and_no_regression_on_identical():
     rows = [_row(1, "correctness")]
     replays = {
-        "githumps/grug#1": CaseReplay(
-            case_id="githumps/grug#1", emitted={"correctness": 1}, errored=False
+        "quadseven/grug#1": CaseReplay(
+            case_id="quadseven/grug#1", emitted={"correctness": 1}, errored=False
         ),
     }
     report = _report(rows, replays)
@@ -300,13 +300,13 @@ def test_compare_to_baseline_flags_catch_drop_and_noise_rise():
         _row(1, "silent-failure", verdict="false-positive"),
     ]
     good = {
-        "githumps/grug#1": CaseReplay(
-            case_id="githumps/grug#1", emitted={"correctness": 1}, errored=False
+        "quadseven/grug#1": CaseReplay(
+            case_id="quadseven/grug#1", emitted={"correctness": 1}, errored=False
         ),
     }
     bad = {
-        "githumps/grug#1": CaseReplay(
-            case_id="githumps/grug#1",
+        "quadseven/grug#1": CaseReplay(
+            case_id="quadseven/grug#1",
             emitted={"silent-failure": 5},  # misses correctness, emits known FP
             errored=False,
         ),
@@ -323,19 +323,19 @@ def test_compare_to_baseline_flags_catch_drop_and_noise_rise():
 def test_compare_to_baseline_flags_coverage_loss():
     rows = [_row(1, "correctness"), _row(2, "correctness")]
     full = {
-        "githumps/grug#1": CaseReplay(
-            case_id="githumps/grug#1", emitted={"correctness": 1}, errored=False
+        "quadseven/grug#1": CaseReplay(
+            case_id="quadseven/grug#1", emitted={"correctness": 1}, errored=False
         ),
-        "githumps/grug#2": CaseReplay(
-            case_id="githumps/grug#2", emitted={"correctness": 1}, errored=False
+        "quadseven/grug#2": CaseReplay(
+            case_id="quadseven/grug#2", emitted={"correctness": 1}, errored=False
         ),
     }
     partial = {
-        "githumps/grug#1": CaseReplay(
-            case_id="githumps/grug#1", emitted={"correctness": 1}, errored=False
+        "quadseven/grug#1": CaseReplay(
+            case_id="quadseven/grug#1", emitted={"correctness": 1}, errored=False
         ),
-        "githumps/grug#2": CaseReplay(
-            case_id="githumps/grug#2", emitted={}, errored=True
+        "quadseven/grug#2": CaseReplay(
+            case_id="quadseven/grug#2", emitted={}, errored=True
         ),
     }
     baseline = to_baseline_dict(_report(rows, full), prompt_sha="abc", backend="cave")
@@ -352,11 +352,11 @@ def test_compare_to_baseline_flags_coverage_loss():
 def test_compare_to_baseline_tolerates_within_tolerance():
     rows = [_row(1, "correctness"), _row(2, "correctness")]
     full = {
-        "githumps/grug#1": CaseReplay(
-            case_id="githumps/grug#1", emitted={"correctness": 1}, errored=False
+        "quadseven/grug#1": CaseReplay(
+            case_id="quadseven/grug#1", emitted={"correctness": 1}, errored=False
         ),
-        "githumps/grug#2": CaseReplay(
-            case_id="githumps/grug#2", emitted={"correctness": 1}, errored=False
+        "quadseven/grug#2": CaseReplay(
+            case_id="quadseven/grug#2", emitted={"correctness": 1}, errored=False
         ),
     }
     report = _report(rows, full)
@@ -375,8 +375,8 @@ def test_score_raises_on_orphan_replay():
 
     cases = build_cases([_row(1, "correctness")])
     orphan = {
-        "githumps/grug#999": CaseReplay(
-            case_id="githumps/grug#999", emitted={}, errored=False
+        "quadseven/grug#999": CaseReplay(
+            case_id="quadseven/grug#999", emitted={}, errored=False
         ),
     }
     with pytest.raises(ValueError, match="unknown cases"):
@@ -393,8 +393,8 @@ def test_score_unscorable_case_counts_rows_without_erroring():
     ]
     cases = build_cases(rows)
     replays = {
-        "githumps/grug#1": CaseReplay(
-            case_id="githumps/grug#1", emitted={"correctness": 1}, errored=False
+        "quadseven/grug#1": CaseReplay(
+            case_id="quadseven/grug#1", emitted={"correctness": 1}, errored=False
         ),
     }
     report = score(cases, replays)
@@ -408,7 +408,7 @@ def test_score_case_with_no_replay_is_errored():
     in errored_cases, not silently shrink the corpus."""
     cases = build_cases([_row(1, "correctness")])
     report = score(cases, {})
-    assert report.errored_cases == ("githumps/grug#1",)
+    assert report.errored_cases == ("quadseven/grug#1",)
     assert report.all_errored
 
 
@@ -477,17 +477,17 @@ def test_score_threads_truncated_cases_into_report():
     rows = [_row(1, "correctness")]
     cases = build_cases(rows)
     replays = {
-        "githumps/grug#1": CaseReplay(
-            case_id="githumps/grug#1",
+        "quadseven/grug#1": CaseReplay(
+            case_id="quadseven/grug#1",
             emitted={"correctness": 1},
             errored=False,
             truncated=True,
         ),
     }
     report = score(cases, replays)
-    assert report.truncated_cases == ("githumps/grug#1",)
+    assert report.truncated_cases == ("quadseven/grug#1",)
     baseline = to_baseline_dict(report, prompt_sha="abc", backend="cave")
-    assert baseline["backends"]["cave"]["truncated_cases"] == ["githumps/grug#1"]
+    assert baseline["backends"]["cave"]["truncated_cases"] == ["quadseven/grug#1"]
 
 
 def test_run_case_parse_failure_is_errored(monkeypatch):

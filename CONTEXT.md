@@ -118,7 +118,7 @@ The single copy of every cross-service module lives in `services/_shared/` - a P
 | **Cloudflare tunnel + Worker** | `api.grug.lol` / `webhook.grug.lol` resolve via CF DNS to the per-service `<service>-host-rewrite` Worker, which injects `X-Grug-CF-Secret` and rewrites `Host` to the in-cluster upstream; a `cloudflared` tunnel transports that to the k8s Service on `:8080`. App-layer gating is the CF shared secret + HMAC + signed session (no Cognito). (Was a CF Worker → Lambda Function URL proxy pre-#354.) |
 | **Postgres store (CNPG)** | The single-table store `grug_kv` on a shared CloudNativePG cluster (`GRUG_DATABASE_URL`, `psycopg`). Replaced the DynamoDB `grug-main` table at #354; key/attribute semantics preserved exactly. |
 | **Pulumi stack** | One stack per environment. Manages the AWS-side infra (SSM refs, SQS, KMS, OIDC, IAM users, DD monitors/dashboard/RUM); the k8s manifests are applied by `deploy.k8s.yml`, not Pulumi. Stack/project structure under [`infra/pulumi/`](infra/pulumi/). |
-| **Grugboard** | GitHub Projects (v2) board at https://github.com/users/githumps/projects/1. Target of the future `Pulse (roadmap)` persona's label sync + issue reprefixing. |
+| **Grugboard** | GitHub Projects (v2) board at https://github.com/users/quadseven/projects/1. Target of the future `Pulse (roadmap)` persona's label sync + issue reprefixing. |
 
 ## Operational concepts
 

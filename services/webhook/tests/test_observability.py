@@ -116,9 +116,9 @@ def test_emit_enforcement_metric_sends_dogstatsd_datagram(monkeypatch):
     monkeypatch.setenv("GRUG_ENV", "prod")
     monkeypatch.delenv("DD_ENV", raising=False)
     sent = _sent_datagrams(monkeypatch)
-    emit_enforcement_metric("githumps/infra", "grug_managed")
+    emit_enforcement_metric("quadseven/infra", "grug_managed")
     assert sent == [(
-        b"grug.enforcement.state:1.0|g|#repo:githumps/infra,persona:tpm,"
+        b"grug.enforcement.state:1.0|g|#repo:quadseven/infra,persona:tpm,"
         b"enforcement_type:grug_managed,env:prod",
         ("10.0.0.99", 8125),
     )]

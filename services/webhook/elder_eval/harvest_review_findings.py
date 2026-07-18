@@ -1,6 +1,6 @@
 """Build a review-findings eval corpus from PR review history (#595).
 
-githumps PRs accumulate line-anchored inline review findings from several
+quadseven PRs accumulate line-anchored inline review findings from several
 reviewer accounts (human and automated). This module collects that history
 into ``logs/review-findings.jsonl`` and scores Grug's reviewer against it:
 "of the findings recorded on our PRs, how many did Elder also flag?" -- the
@@ -447,7 +447,7 @@ def main() -> None:
     import sys
 
     ap = argparse.ArgumentParser(description="Build the review-findings eval corpus (#595)")
-    ap.add_argument("--owner", default="githumps")
+    ap.add_argument("--owner", default="quadseven")
     ap.add_argument("--repos", default=",".join(_DEFAULT_REPOS))
     ap.add_argument("--since", required=True, help="ISO date, e.g. 2026-06-01")
     ap.add_argument("--out", default="logs/review-findings.jsonl")

@@ -26,7 +26,7 @@ def _full_pr_payload():
             "body": "## Why\nbecause\n## Acceptance criteria\n- a\n- b\n- c\n## Out of scope\nx\nSize: S\ncloses #1",
             "head": {"sha": "abc123def456"},
         },
-        "repository": {"id": 7777, "name": "infra", "owner": {"login": "githumps"}, "full_name": "githumps/infra"},
+        "repository": {"id": 7777, "name": "infra", "owner": {"login": "quadseven"}, "full_name": "quadseven/infra"},
         "installation": {"id": 999},
     }
 
@@ -86,7 +86,7 @@ def test_toy_persona_dispatches_via_registry_only(monkeypatch):
     # event coordinates without any toy-specific dispatcher plumbing.
     ctx = seen[0]
     assert ctx.installation_id == 999
-    assert ctx.owner == "githumps"
+    assert ctx.owner == "quadseven"
     assert ctx.repo_name == "infra"
     assert ctx.head_sha == "abc123def456"
     assert ctx.pr_number == 42

@@ -29,7 +29,7 @@ from github_checks_client import CheckRunResult, post_check_run
 from llm_client import Hunk
 from personas.tribe import CHECK_ELDER
 
-# Shared Spark-Cave airlock library (#1610). Vendored from githumps/infra-public
+# Shared Spark-Cave airlock library (#1610). Vendored from quadseven/infra-public
 # (see spark_cave/VENDOR.md), so grug (public) and the macchina lane (private)
 # share ONE persona-generic wire envelope read by one connector. grug's rich
 # review fields (install_id/repo/pr/head_sha/diff_ref) ride INSIDE the generic

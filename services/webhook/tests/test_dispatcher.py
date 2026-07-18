@@ -49,7 +49,7 @@ def _full_pr_payload():
             "body": "## Why\nbecause we need it badly\n## Acceptance criteria\n- a\n- b\n- c\n## Out of scope\nx\nSize: S\ncloses #1",
             "head": {"sha": "abc123def456"},
         },
-        "repository": {"id": 7777, "name": "infra", "owner": {"login": "githumps"}, "full_name": "githumps/infra"},
+        "repository": {"id": 7777, "name": "infra", "owner": {"login": "quadseven"}, "full_name": "quadseven/infra"},
         "installation": {"id": 999},
     }
 
@@ -352,16 +352,16 @@ def test_installation_created_records_row():
         "action": "created",
         "installation": {
             "id": 555,
-            "account": {"login": "githumps", "type": "User", "id": 100},
+            "account": {"login": "quadseven", "type": "User", "id": 100},
         },
-        "sender": {"id": 100, "login": "githumps"},
+        "sender": {"id": 100, "login": "quadseven"},
     }
     with patch("dispatcher.record_installation") as mock_rec, \
          patch("dispatcher.is_install_allowlisted", return_value=False):
         out = dispatch("installation", payload)
     assert out["status"] == "recorded" and out["action"] == "created"
     mock_rec.assert_called_once_with(
-        install_id=555, account_login="githumps", account_type="User",
+        install_id=555, account_login="quadseven", account_type="User",
         installed_by_user_id=100,
     )
 
@@ -455,7 +455,7 @@ def _ruleset_deleted_payload(
     ruleset_id: int = 42,
     install_id: int = 999,
     repo_id: int = 7777,
-    repo_full_name: str = "githumps/infra",
+    repo_full_name: str = "quadseven/infra",
     default_branch: str = "main",
 ):
     return {
@@ -557,8 +557,8 @@ def _review_reply_payload(**over):
             "user": {"login": "dev", "type": "User"},
         },
         "pull_request": {"number": 42, "user": {"login": "dev"}},
-        "repository": {"id": 7777, "name": "infra", "owner": {"login": "githumps"},
-                       "full_name": "githumps/infra"},
+        "repository": {"id": 7777, "name": "infra", "owner": {"login": "quadseven"},
+                       "full_name": "quadseven/infra"},
         "installation": {"id": 999},
         "sender": {"login": "dev"},
     }
@@ -579,7 +579,7 @@ def test_review_reply_enqueues_for_write_author():
         out = dispatch("pull_request_review_comment", _review_reply_payload())
     assert out == {"status": "enqueued", "kind": "learn"}
     kw = mock_enq.call_args.kwargs
-    assert kw["repo"] == "githumps/infra" and kw["parent_comment_id"] == 4000
+    assert kw["repo"] == "quadseven/infra" and kw["parent_comment_id"] == 4000
     assert kw["comment_id"] == 5001 and kw["pr_number"] == 42
     assert kw["author"] == "dev"  # the reply sender is the teacher
 
