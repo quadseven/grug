@@ -546,16 +546,29 @@ proof.
 Procedure (abort = uncordon immediately and file what was found):
 
 1. DD downtime first, scoped to the node (infra repo):
-   `make dd-downtime-start SCOPE="node:<node>" MIN=90 MSG="chaos drill"`.
+   `make dd-downtime-start SCOPE="node:<node>" MIN=90 MSG="chaos drill"` -
+   record the printed DOWNTIME_ID; you need it to cancel in step 5.
 2. Snapshot placement: `kubectl get pods -A -o wide --field-selector
-   spec.nodeName=<node>` - note every NON-grug workload that will evict;
-   check their nodeSelectors for landing spots BEFORE draining.
+   spec.nodeName=<node>` - note every NON-grug workload that will evict,
+   and preflight ALL scheduling constraints for landing spots BEFORE
+   draining, not just nodeSelectors: pod (anti-)affinity, tolerations,
+   and PVC node-affinity (`kubectl get pvc -A` + describe the PVs of any
+   local-path claims - both 2026-07-18 Pending findings were PVC pins a
+   nodeSelector-only check missed).
 3. `kubectl cordon <node>` then `kubectl drain <node> --ignore-daemonsets
    --delete-emptydir-data --timeout=300s`.
-4. During the drain, verify live: webhook readyz + api endpoint 200s, a
-   real PR review completing, plus every other product the node hosted.
-5. `kubectl uncordon <node>`, wait for stuck pods to recover, cancel the
-   downtime, file findings.
+4. During the drain, verify live:
+   `curl -m 10 https://webhook.grug.lol/readyz` and
+   `curl -m 10 https://grug.lol/api/me` both 200; a real PR review
+   completing end-to-end (open a throwaway test PR if no organic traffic,
+   pattern: PR #705); plus every other product the node hosted (e.g.
+   `curl -m 10 https://macchina.app/` and
+   `kubectl logs -n home deploy/homey-thermostat --since=3m` showing live
+   reconcile decisions).
+5. `kubectl uncordon <node>`, wait for stuck pods to recover
+   (`kubectl get pods -A | grep -v Running | grep -v Completed`), cancel
+   the downtime (`make dd-downtime-cancel ID=<DOWNTIME_ID>`), file
+   findings.
 
 Observed 2026-07-18 (the numbers to beat next time):
 
@@ -569,6 +582,10 @@ Observed 2026-07-18 (the numbers to beat next time):
   findings): grugthink and owntone are pinned by node-bound local-path
   PVCs (grug#603, infra#1842), and wispr cascades from owntone via a
   required pod-affinity. All three recovered on uncordon without help.
-- kubectl client-side throttling slows a many-pod drain's eviction
-  echoes; the evictions themselves proceed - do not panic-abort on the
-  "Waited before sending request" lines.
+- kubectl client-side throttling slowed this ~17-pod drain's eviction
+  ECHOES (the "Waited before sending request" lines) by a few seconds
+  each; the evictions themselves proceeded and the whole drain finished
+  well inside the 300s timeout. Don't abort on those lines alone - the
+  real stall signals are the drain exceeding its --timeout, or an
+  eviction blocked >5 min on a PDB (`kubectl get pdb -A` shows 0 allowed
+  disruptions that never recover), per the #702 abort criteria.
