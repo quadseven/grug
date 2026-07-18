@@ -35,10 +35,8 @@ def test_post_check_run_url_and_auth():
     with patch("httpx.post", return_value=_ok_response()) as mock_post:
         out = post_check_run("tok-123", "myorg", "myrepo", result)
 
-    assert mock_post.call_count >= 1
-    # primary first, then optional legacy alias dual-posts
-    first = mock_post.call_args_list[0]
-    assert first.kwargs["json"]["name"] == "Grug - Chief"
+    mock_post.assert_called_once()
+    assert mock_post.call_args.kwargs["json"]["name"] == "Grug - Chief"
 
     args, kwargs = mock_post.call_args
     assert args[0] == "https://api.github.com/repos/myorg/myrepo/check-runs"
@@ -47,6 +45,26 @@ def test_post_check_run_url_and_auth():
     assert kwargs["headers"]["X-GitHub-Api-Version"] == "2022-11-28"
     assert kwargs["timeout"] == 10
     assert out == {"id": 12345, "status": "completed"}
+
+
+def test_post_check_run_never_dual_posts_a_legacy_alias():
+    """The em-dash legacy-title mirror was retired: every githumps repo's
+    required-check context is now the canonical ASCII title (infra#1829),
+    so no ruleset anywhere still needs the alias. One POST per check-run,
+    named exactly what the caller asked for."""
+    result = CheckRunResult(
+        name="Grug - Elder",
+        head_sha="abc123",
+        status="completed",
+        conclusion="success",
+        title="Elder done",
+        summary="...",
+    )
+    with patch("httpx.post", return_value=_ok_response()) as mock_post:
+        post_check_run("tok", "myorg", "myrepo", result)
+
+    mock_post.assert_called_once()
+    assert mock_post.call_args.kwargs["json"]["name"] == "Grug - Elder"
 
 
 def test_post_check_run_body_with_conclusion():
