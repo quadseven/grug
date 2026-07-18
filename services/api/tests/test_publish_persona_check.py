@@ -625,3 +625,61 @@ def test_env_number_rejects_non_finite_values(monkeypatch, caplog):
             out = publish_check._env_number("GRUG_TEST_RETRY_KNOB", 2, cap=5)
         assert out == 2, raw
     assert any(r.getMessage() == "publish_retry_env_invalid" for r in caplog.records)
+
+
+def test_backoff_delay_sequence_is_exponential(monkeypatch):
+    """CodeRabbit, PR #698: exercise the real backoff math (the autouse
+    fixture zeroes the base for speed everywhere else). With base=0.5 and
+    two failures before success, the recorded sleeps must be 0.5 then 1.0."""
+    from personas import publish_check
+
+    monkeypatch.setattr(publish_check, "_TRANSIENT_BACKOFF_BASE_S", 0.5)
+    slept = []
+    monkeypatch.setattr(publish_check.time, "sleep", slept.append)
+
+    calls = {"n": 0}
+
+    def _flaky_twice(installation_id, fn):
+        calls["n"] += 1
+        if calls["n"] <= 2:
+            raise httpx.ConnectError("blip")
+        return fn("tok")
+
+    monkeypatch.setattr(publish_check, "with_install_token_retry", _flaky_twice)
+    monkeypatch.setattr(
+        publish_check, "post_check_run",
+        lambda token, owner, repo, result, external_id=None: {},
+    )
+    monkeypatch.setattr(publish_check, "record_check_verdict", lambda **kw: None)
+
+    out = publish_persona_check(**_persona_kwargs("tpm"))
+
+    assert out == {"persona": "tpm", "result": "pass"}
+    assert slept == [0.5, 1.0]
+
+
+def test_cumulative_backoff_budget_is_capped(monkeypatch):
+    """CodeRabbit, PR #698: the per-knob caps alone still allowed
+    retries=5 x base=2.0 -> 62s of cumulative sleep, blowing the 10s
+    webhook ACK window. The total-sleep ceiling truncates the last delay
+    and exhausts the retry once the budget is spent."""
+    from personas import publish_check
+
+    monkeypatch.setattr(publish_check, "_TRANSIENT_RETRIES", 5)
+    monkeypatch.setattr(publish_check, "_TRANSIENT_BACKOFF_BASE_S", 2.0)
+    slept = []
+    monkeypatch.setattr(publish_check.time, "sleep", slept.append)
+    monkeypatch.setattr(
+        publish_check, "with_install_token_retry",
+        _raising(httpx.ConnectError("down hard")),
+    )
+    monkeypatch.setattr(publish_check, "record_check_verdict", lambda **kw: None)
+    monkeypatch.setattr("observability.emit_gauge", lambda *a, **kw: None)
+
+    out = publish_persona_check(**_persona_kwargs("tpm"))
+
+    assert out == {"persona": "tpm", "result": "publish_failed"}
+    # 2.0 + 4.0 spends 6 of the 8s budget; the third delay truncates to 2.0
+    # and the fourth attempt finds the budget exhausted - never 62s.
+    assert slept == [2.0, 4.0, 2.0]
+    assert sum(slept) <= publish_check._TRANSIENT_TOTAL_SLEEP_CAP_S

@@ -85,24 +85,39 @@ def _emit_retry_exhausted_gauge(persona_key: str) -> None:
         pass
 
 
+# Hard ceiling on CUMULATIVE retry sleep (CodeRabbit, PR #698): the per-knob
+# caps alone still allow retries=5 x base=2.0 -> 2+4+8+16+32 = 62s of sleep,
+# blowing the 10s webhook ACK window the budget exists to respect. The last
+# retry's delay is truncated to whatever budget remains; when it hits zero
+# the attempt counts as exhausted.
+_TRANSIENT_TOTAL_SLEEP_CAP_S = 8.0
+
+
 def _publish_with_transient_retry(
     persona_key: str, installation_id: int, publish_fn,
 ) -> None:
     """Run `publish_fn` (the token-retry-wrapped check-run POST), retrying
     ONLY transport-level failures (DNS, connect, timeout) up to the small
     bounded budget above. HTTPStatusError and every non-httpx exception
-    propagate immediately - the outer publish boundary owns those."""
+    propagate immediately - the outer publish boundary owns those.
+
+    Safe to retry the POST itself: GitHub supersedes check-runs per
+    (name, head_sha) - a replayed create after a lost response yields an
+    identical, newest-wins check-run, not a visible duplicate (see
+    post_check_run's idempotency note)."""
     attempt = 0
+    slept = 0.0
     while True:
         try:
             publish_fn()
             return
         except httpx.TransportError as e:
             attempt += 1
-            if attempt > _TRANSIENT_RETRIES:
+            budget_left = _TRANSIENT_TOTAL_SLEEP_CAP_S - slept
+            if attempt > _TRANSIENT_RETRIES or budget_left <= 0:
                 _emit_retry_exhausted_gauge(persona_key)
                 raise
-            delay = _TRANSIENT_BACKOFF_BASE_S * (2 ** (attempt - 1))
+            delay = min(_TRANSIENT_BACKOFF_BASE_S * (2 ** (attempt - 1)), budget_left)
             log.warning(
                 "check_publish_transient_retry",
                 extra={
@@ -115,6 +130,7 @@ def _publish_with_transient_retry(
                 },
             )
             time.sleep(delay)
+            slept += delay
 
 # Reserved: the seam's failure sentinel (returned + recorded when the
 # check-run publish itself fails). A caller's own `success_result` must
