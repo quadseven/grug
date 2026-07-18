@@ -37,8 +37,32 @@ log = logging.getLogger(f"{os.getenv('DD_SERVICE', 'grug')}.persona.publish_chec
 # the delivery ACK. httpx.TransportError covers connect/DNS/read/write/
 # timeout failures but NOT HTTPStatusError - a real 4xx/5xx response from
 # GitHub still fails fast (retrying those wastes the ACK window for no win).
-_TRANSIENT_RETRIES = int(os.getenv("GRUG_PUBLISH_TRANSIENT_RETRIES", "2"))
-_TRANSIENT_BACKOFF_BASE_S = float(os.getenv("GRUG_PUBLISH_RETRY_BASE_SECONDS", "0.5"))
+
+
+def _env_number(name: str, default: float, *, cap: float) -> float:
+    """Operator-tunable numeric env var, parsed defensively (Qodo review,
+    PR #698): a malformed value must degrade to the default with a warning,
+    not crash the service at import (this module loads inside webhook
+    startup - a bad deploy config would otherwise take down check
+    publishing entirely). Clamped to [0, cap]: negative values would make
+    time.sleep raise, and an oversized budget would burn the 10s webhook
+    ACK window."""
+    raw = os.getenv(name)
+    if raw is None:
+        return default
+    try:
+        value = float(raw)
+    except ValueError:
+        log.warning(
+            "publish_retry_env_invalid",
+            extra={"env": name, "raw": raw[:50], "fallback": default},
+        )
+        return default
+    return min(max(value, 0.0), cap)
+
+
+_TRANSIENT_RETRIES = int(_env_number("GRUG_PUBLISH_TRANSIENT_RETRIES", 2, cap=5))
+_TRANSIENT_BACKOFF_BASE_S = _env_number("GRUG_PUBLISH_RETRY_BASE_SECONDS", 0.5, cap=2.0)
 
 
 def _emit_retry_exhausted_gauge(persona_key: str) -> None:

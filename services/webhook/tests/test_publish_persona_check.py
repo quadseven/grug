@@ -586,3 +586,27 @@ def test_http_status_error_does_not_retry(monkeypatch):
 
     assert out == {"persona": "guard", "result": "publish_failed"}
     assert calls["n"] == 1
+
+
+def test_env_number_malformed_value_falls_back_with_warning(monkeypatch, caplog):
+    """Qodo review, PR #698: a malformed operator env value must degrade to
+    the default with a warning, never crash the module import (this loads
+    inside webhook startup)."""
+    from personas import publish_check
+
+    monkeypatch.setenv("GRUG_TEST_RETRY_KNOB", "two")
+    with caplog.at_level(logging.WARNING):
+        out = publish_check._env_number("GRUG_TEST_RETRY_KNOB", 2, cap=5)
+    assert out == 2
+    assert any(r.getMessage() == "publish_retry_env_invalid" for r in caplog.records)
+
+
+def test_env_number_clamps_negative_and_oversized(monkeypatch):
+    """Negative values would make time.sleep raise; oversized budgets would
+    burn the 10s webhook ACK window - both clamp instead."""
+    from personas import publish_check
+
+    monkeypatch.setenv("GRUG_TEST_RETRY_KNOB", "-3")
+    assert publish_check._env_number("GRUG_TEST_RETRY_KNOB", 2, cap=5) == 0.0
+    monkeypatch.setenv("GRUG_TEST_RETRY_KNOB", "99")
+    assert publish_check._env_number("GRUG_TEST_RETRY_KNOB", 2, cap=5) == 5.0

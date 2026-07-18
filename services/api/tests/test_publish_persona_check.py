@@ -11,8 +11,18 @@ from __future__ import annotations
 import logging
 
 import httpx
+import pytest
 
 from personas.publish_check import publish_persona_check
+
+
+@pytest.fixture(autouse=True)
+def _zero_retry_backoff(monkeypatch):
+    """#697's transient-retry sleeps are real time.sleep calls; zero the
+    backoff so the retry-path tests (and the pre-existing ConnectError
+    tests, which now retry before failing) stay instant."""
+    from personas import publish_check
+    monkeypatch.setattr(publish_check, "_TRANSIENT_BACKOFF_BASE_S", 0.0)
 
 
 def _fake_retry_ok(installation_id, fn):
@@ -463,3 +473,140 @@ def test_request_error_with_no_response_attribute_does_not_crash(monkeypatch, ca
         r for r in caplog.records if r.getMessage() == "guard_check_run_publish_failed"
     )
     assert record.status_code is None
+
+
+# --- transient-network retry (#697) -----------------------------------
+
+def _persona_kwargs(persona: str) -> dict:
+    """Shared kwargs for the retry tests - persona-parameterized so the
+    Chief and Guard cases (#697's two named victims) read identically."""
+    return dict(
+        persona_key=persona,
+        persona_prefix=persona,
+        check_name=f"Grug - {persona}",
+        installation_id=1,
+        owner="o",
+        repo="r",
+        pr_number=2,
+        head_sha="sha",
+        conclusion="neutral",
+        title="t",
+        summary="s",
+        findings_count=0,
+        blocking=False,
+        degraded_reason=None,
+        success_result="pass",
+        publish_failed_log_name=f"{persona}_publish_failed",
+    )
+
+
+@pytest.mark.parametrize("persona", ["tpm", "guard"])
+def test_transient_connect_error_retries_then_succeeds(monkeypatch, persona):
+    """#697: a one-shot DNS/connect blip (the digital-ledger#204 incident)
+    must be absorbed by the bounded retry, not leave the check-run
+    permanently un-posted."""
+    from personas import publish_check
+
+    calls = {"n": 0}
+
+    def _flaky_retry(installation_id, fn):
+        calls["n"] += 1
+        if calls["n"] == 1:
+            raise httpx.ConnectError("[Errno -5] No address associated with hostname")
+        return fn("tok")
+
+    monkeypatch.setattr(publish_check, "with_install_token_retry", _flaky_retry)
+    monkeypatch.setattr(
+        publish_check, "post_check_run",
+        lambda token, owner, repo, result, external_id=None: {},
+    )
+    monkeypatch.setattr(publish_check, "record_check_verdict", lambda **kw: None)
+
+    out = publish_persona_check(**_persona_kwargs(persona))
+
+    assert out == {"persona": persona, "result": "pass"}
+    assert calls["n"] == 2
+
+
+def test_transient_retries_exhausted_emits_gauge_and_fails(monkeypatch, caplog):
+    """#697: an outage that outlasts the bounded budget must fail LOUDLY -
+    the retry warnings, the exhaustion gauge, and the existing
+    publish-failed error log all fire; the result is still the honest
+    publish_failed sentinel."""
+    from personas import publish_check
+
+    calls = {"n": 0}
+
+    def _always_down(installation_id, fn):
+        calls["n"] += 1
+        raise httpx.ConnectError("[Errno -5] No address associated with hostname")
+
+    gauges = []
+    monkeypatch.setattr(publish_check, "with_install_token_retry", _always_down)
+    monkeypatch.setattr(publish_check, "record_check_verdict", lambda **kw: None)
+    monkeypatch.setattr(
+        "observability.emit_gauge",
+        lambda metric, value, tags=None: gauges.append((metric, value, tags)),
+    )
+
+    with caplog.at_level(logging.WARNING):
+        out = publish_persona_check(**_persona_kwargs("tpm"))
+
+    assert out == {"persona": "tpm", "result": "publish_failed"}
+    # 1 initial attempt + _TRANSIENT_RETRIES retries, all failed
+    assert calls["n"] == 1 + publish_check._TRANSIENT_RETRIES
+    retry_logs = [r for r in caplog.records
+                  if r.getMessage() == "check_publish_transient_retry"]
+    assert len(retry_logs) == publish_check._TRANSIENT_RETRIES
+    assert gauges == [
+        ("grug.check_publish.transient_retries_exhausted", 1, {"persona": "tpm"}),
+    ]
+
+
+def test_http_status_error_does_not_retry(monkeypatch):
+    """A real 4xx/5xx RESPONSE from GitHub is not a transient transport
+    failure - retrying it would burn the webhook ACK window for no win.
+    Exactly one attempt, straight to the honest failure path."""
+    from personas import publish_check
+
+    calls = {"n": 0}
+
+    def _hard_500(installation_id, fn):
+        calls["n"] += 1
+        raise httpx.HTTPStatusError(
+            "500 Server Error",
+            request=httpx.Request("POST", "https://api.github.com/x"),
+            response=httpx.Response(500),
+        )
+
+    monkeypatch.setattr(publish_check, "with_install_token_retry", _hard_500)
+    monkeypatch.setattr(publish_check, "record_check_verdict", lambda **kw: None)
+
+    out = publish_persona_check(**_persona_kwargs("guard"))
+
+    assert out == {"persona": "guard", "result": "publish_failed"}
+    assert calls["n"] == 1
+
+
+def test_env_number_malformed_value_falls_back_with_warning(monkeypatch, caplog):
+    """Qodo review, PR #698: a malformed operator env value must degrade to
+    the default with a warning, never crash the module import (this loads
+    inside webhook startup)."""
+    from personas import publish_check
+
+    monkeypatch.setenv("GRUG_TEST_RETRY_KNOB", "two")
+    with caplog.at_level(logging.WARNING):
+        out = publish_check._env_number("GRUG_TEST_RETRY_KNOB", 2, cap=5)
+    assert out == 2
+    assert any(r.getMessage() == "publish_retry_env_invalid" for r in caplog.records)
+
+
+def test_env_number_clamps_negative_and_oversized(monkeypatch):
+    """Negative values would make time.sleep raise; oversized budgets would
+    burn the 10s webhook ACK window - both clamp instead."""
+    from personas import publish_check
+
+    monkeypatch.setenv("GRUG_TEST_RETRY_KNOB", "-3")
+    assert publish_check._env_number("GRUG_TEST_RETRY_KNOB", 2, cap=5) == 0.0
+    monkeypatch.setenv("GRUG_TEST_RETRY_KNOB", "99")
+    assert publish_check._env_number("GRUG_TEST_RETRY_KNOB", 2, cap=5) == 5.0
