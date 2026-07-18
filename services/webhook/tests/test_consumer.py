@@ -890,6 +890,14 @@ def _gauge_tags(captured_gauges, metric):
     return [t or {} for m, v, t in captured_gauges if m == metric]
 
 
+def _assert_queue_tags(captured_gauges, metric, queue_names):
+    """A missing/wrong `queue` tag on any gauge - not just messages_visible -
+    would silently disable that gauge's per-queue monitor filter (CodeRabbit
+    #684)."""
+    tags = _gauge_tags(captured_gauges, metric)
+    assert [t.get("queue") for t in tags] == queue_names
+
+
 def test_emit_queue_depth_emits_depth_and_stall_gauges_per_queue(
     telemetry_env, captured_gauges,
 ):
@@ -914,8 +922,9 @@ def test_emit_queue_depth_emits_depth_and_stall_gauges_per_queue(
         for c in mock_attrs.call_args_list
     )
     queue_names = list(consumer._TELEMETRY_QUEUE_NAMES)
-    visible_tags = _gauge_tags(captured_gauges, "grug.sqs.messages_visible")
-    assert [t.get("queue") for t in visible_tags] == queue_names
+    _assert_queue_tags(captured_gauges, "grug.sqs.messages_visible", queue_names)
+    _assert_queue_tags(captured_gauges, "grug.sqs.messages_not_visible", queue_names)
+    _assert_queue_tags(captured_gauges, "grug.sqs.stalled", queue_names)
     assert _gauge_values(captured_gauges, "grug.sqs.messages_visible") == [2.0] * len(queue_names)
     assert _gauge_values(captured_gauges, "grug.sqs.messages_not_visible") == [1.0] * len(queue_names)
     assert _gauge_values(captured_gauges, "grug.sqs.stalled") == [0.0] * len(queue_names)
