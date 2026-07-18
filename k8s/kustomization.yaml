@@ -10,6 +10,7 @@ resources:
   - smasher-trial-namespace.yaml
   - webhook-deployment.yaml
   - api-deployment.yaml
+  - pdb.yaml
   - poller-cronjob.yaml
   - consumer-deployment.yaml
   - pki-certificate.yaml
