@@ -24,7 +24,13 @@ _JWT_TTL_SECONDS = 9 * 60  # GitHub allows up to 10min; refresh at 9min
 
 def _app_id() -> str:
     from secrets_loader import _get_ssm_secure_string  # type: ignore
-    return _get_ssm_secure_string(os.environ["GITHUB_APP_ID_SSM"])
+    # Strip: unlike several other SSM reads in secrets_loader.py, this raw
+    # fetch has no normalization - a stray trailing newline in the SSM
+    # parameter would make every performed_via_github_app.id string
+    # comparison in _find_marker_comment (#554/#560/#561) fail forever,
+    # silently duplicating marker comments instead of matching our own
+    # (Qodo review, PR #694).
+    return _get_ssm_secure_string(os.environ["GITHUB_APP_ID_SSM"]).strip()
 
 
 def get_app_id() -> str:

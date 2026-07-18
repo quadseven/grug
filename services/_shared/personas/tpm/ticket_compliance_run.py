@@ -19,6 +19,7 @@ from urllib.parse import quote
 
 import httpx  # type: ignore
 
+from github_app_auth import get_app_id
 from personas.tpm.ticket_compliance import (
     acceptance_criteria,
     advisory_markdown,
@@ -84,8 +85,21 @@ def _changed_files(token: str, owner: str, repo: str, pr_number: int) -> list[st
 def _find_marker_comment(token: str, owner: str, repo: str, pr_number: int) -> int | None:
     # Paginate: on a busy PR the marker may sit past page 1, and missing it
     # would POST a duplicate instead of PATCHing (Qodo review #535).
+    #
+    # `performed_via_github_app` is populated server-side ONLY for comments
+    # created via a GitHub App installation token - a human contributor
+    # posting the literal marker string ahead of Chief's own run would
+    # otherwise make this match a decoy comment the app can't PATCH,
+    # 403/404ing every subsequent dispatch until manually removed (#560,
+    # same class as Teller's #554 round-3 fix). A bare non-null check only
+    # proves "some GitHub App posted this," not "WE did" - compare the
+    # app's own numeric ID to rule out a decoy from a DIFFERENT installed
+    # app too. `get_app_id()` is guaranteed to already have succeeded once
+    # by this point - it backs the very token exchange that produced
+    # `token` - so no fallback-on-failure path exists here.
+    own_app_id = get_app_id()
     page = 1
-    while page <= 20:  # bound the scan (>2000 comments = give up, post fresh)
+    while page <= 20:  # bound the scan (>2000 comments = give up, post fresh, warn below)
         resp = httpx.get(
             f"{_API}/repos/{_repo_path(owner, repo)}/issues/{pr_number}/comments",
             params={"per_page": 100, "page": page}, headers=_headers(token), timeout=_TIMEOUT,
@@ -93,11 +107,22 @@ def _find_marker_comment(token: str, owner: str, repo: str, pr_number: int) -> i
         resp.raise_for_status()
         batch = resp.json()
         for c in batch:
+            app = c.get("performed_via_github_app")
+            if not app or str(app.get("id")) != own_app_id:
+                continue
             if _MARKER in (c.get("body") or ""):
                 return int(c["id"])
         if len(batch) < 100:
             return None
         page += 1
+    # Gave up at the cap without finding the marker - distinguish this from
+    # the ordinary "no marker" exit above (Qodo review, PR #694), or a
+    # duplicate-comment-growth bug on an extreme PR (>2000 comments) would
+    # go unnoticed forever, same as walkthrough/dispatch.py already does.
+    log.warning(
+        "ticket_compliance_marker_scan_capped",
+        extra={"repo": f"{owner}/{repo}", "pr": pr_number},
+    )
     return None
 
 
