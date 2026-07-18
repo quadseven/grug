@@ -398,6 +398,78 @@ def test_migrate_check_context_dedup_key_includes_integration_id():
     ]
 
 
+def test_migrate_check_context_heals_every_required_status_checks_rule():
+    """Qodo #685: GitHub does not document a one-rule-per-type limit on
+    rulesets. A second required_status_checks rule later in the array must
+    also get healed, not just the first."""
+    from enforcement import migrate_check_context
+    ruleset = {
+        "rules": [
+            {
+                "type": "required_status_checks",
+                "parameters": {"required_status_checks": [{"context": "Grug — Definition of Ready"}]},
+            },
+            {"type": "deletion"},
+            {
+                "type": "required_status_checks",
+                "parameters": {"required_status_checks": [{"context": "Grug — Code Review"}]},
+            },
+        ],
+    }
+    with patch("enforcement.get_ruleset", return_value=ruleset), \
+         patch("enforcement.update_ruleset") as mock_update:
+        changed = migrate_check_context("tok", "o", "r", 555)
+
+    assert changed is True
+    new_rules = mock_update.call_args.args[4]
+    assert new_rules[0]["parameters"]["required_status_checks"] == [{"context": GRUG_DOR_CHECK_NAME}]
+    assert new_rules[1] == {"type": "deletion"}
+    assert new_rules[2]["parameters"]["required_status_checks"] == [{"context": "Grug - Elder"}]
+
+
+def test_migrate_check_context_untouched_entry_null_integration_id_stripped():
+    """Qodo #685: GitHub 422s the whole PUT on integration_id: null,
+    including on an UNTOUCHED entry re-sent verbatim - null and absent
+    mean the same thing to GitHub's model, so stripping it changes
+    nothing about what the entry actually requires. This alone counts as
+    a healable change (the ruleset still gets PUT to drop the null)."""
+    from enforcement import migrate_check_context
+    ruleset = {
+        "rules": [{
+            "type": "required_status_checks",
+            "parameters": {"required_status_checks": [
+                {"context": "some-untouched-check", "integration_id": None},
+            ]},
+        }],
+    }
+    with patch("enforcement.get_ruleset", return_value=ruleset), \
+         patch("enforcement.update_ruleset") as mock_update:
+        changed = migrate_check_context("tok", "o", "r", 555)
+
+    assert changed is True
+    new_rules = mock_update.call_args.args[4]
+    assert new_rules[0]["parameters"]["required_status_checks"] == [{"context": "some-untouched-check"}]
+
+
+def test_migrate_check_context_non_string_context_left_alone():
+    """Qodo #685: a malformed entry (context missing/non-string) must not
+    make the healed PUT itself malformed - primary_check_name is never
+    called on it, and if it's the only entry, no PUT happens at all."""
+    from enforcement import migrate_check_context
+    ruleset = {
+        "rules": [{
+            "type": "required_status_checks",
+            "parameters": {"required_status_checks": [{"context": None}]},
+        }],
+    }
+    with patch("enforcement.get_ruleset", return_value=ruleset), \
+         patch("enforcement.update_ruleset") as mock_update:
+        changed = migrate_check_context("tok", "o", "r", 555)
+
+    assert changed is False
+    mock_update.assert_not_called()
+
+
 # --- remove_enforcement -----------------------------------------------
 
 def test_remove_deletes_by_stored_id():
