@@ -33,6 +33,10 @@ def get_build_hash():
             capture_output=True,
             text=True,
             cwd=Path(__file__).parent.parent.parent,
+            # Bounded (#712; ported from the standalone repo's last fix
+            # wave): a hung git (e.g. stale index lock) must fall through
+            # to the BUILD_HASH env fallback, not block module import.
+            timeout=2.0,
         )
         if result.returncode == 0:
             return result.stdout.strip()
