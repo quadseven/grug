@@ -35,3 +35,14 @@ def test_neutralize_mentions_leaves_bare_at_sign_alone():
 
 def test_neutralize_mentions_empty_string():
     assert neutralize_mentions("") == ""
+
+
+def test_neutralize_mentions_preserves_email_addresses():
+    """CodeRabbit review on #694: the un-anchored `@(?=\\w)` pattern also
+    matched the `@` in an email's local-part boundary (e.g.
+    owner@example.com), corrupting user-visible text that was never a
+    mention. Require a non-word character (or start of string) before
+    `@` so an email's `@` - always preceded by a word character - is
+    left alone."""
+    out = neutralize_mentions("contact owner@example.com for access")
+    assert out == "contact owner@example.com for access"

@@ -1500,12 +1500,12 @@ def test_run_ask_neutralizes_mention_in_posted_answer(monkeypatch):
     authority, that would notify a real GitHub user as if Grug itself
     pinged them (#561, same class as Teller's #554 round-4 fix)."""
     posted = []
-    monkeypatch.setattr(rerun, "with_install_token_retry", lambda iid, fn: fn("tok"))
-    monkeypatch.setattr(rerun, "_gh_get_text", lambda token, url, accept=None: "diff --git a b")
-    monkeypatch.setattr(rerun, "_gh_post", lambda token, url, body: posted.append(body))
+    monkeypatch.setattr(rerun, "with_install_token_retry", lambda _iid, fn: fn("tok"))
+    monkeypatch.setattr(rerun, "_gh_get_text", lambda _token, _url, accept=None: "diff --git a b")
+    monkeypatch.setattr(rerun, "_gh_post", lambda _token, _url, body: posted.append(body))
     monkeypatch.setattr(
         "llm_client.answer_pr_question",
-        lambda q, diff, iid, pr_context=None: "ping @cait to review this",
+        lambda _q, _diff, _iid, pr_context=None: "ping @cait to review this",
     )
     monkeypatch.setattr("llm_client._redact_secrets", lambda s: s)
 
@@ -1522,12 +1522,12 @@ def test_run_ask_no_answer_falls_back_without_crashing_on_none(monkeypatch):
     """answer_pr_question returning None (degraded) must not raise inside
     the mention-neutralization step - None has no mentions to break."""
     posted = []
-    monkeypatch.setattr(rerun, "with_install_token_retry", lambda iid, fn: fn("tok"))
-    monkeypatch.setattr(rerun, "_gh_get_text", lambda token, url, accept=None: "diff --git a b")
-    monkeypatch.setattr(rerun, "_gh_post", lambda token, url, body: posted.append(body))
+    monkeypatch.setattr(rerun, "with_install_token_retry", lambda _iid, fn: fn("tok"))
+    monkeypatch.setattr(rerun, "_gh_get_text", lambda _token, _url, accept=None: "diff --git a b")
+    monkeypatch.setattr(rerun, "_gh_post", lambda _token, _url, body: posted.append(body))
     monkeypatch.setattr(
         "llm_client.answer_pr_question",
-        lambda q, diff, iid, pr_context=None: None,
+        lambda _q, _diff, _iid, pr_context=None: None,
     )
     monkeypatch.setattr("llm_client._redact_secrets", lambda s: s)
 

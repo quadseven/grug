@@ -10,7 +10,7 @@ _OWN_APP_ID = "1"  # matches performed_via_github_app.id in the fixtures below
 
 
 @pytest.fixture(autouse=True)
-def _stub_own_app_id(monkeypatch):
+def _stub_own_app_id(monkeypatch) -> None:
     """Every test exercises _find_marker_comment's own-app-identity check
     (#560, same class as Teller's #554 round-3 fix) - stub it once rather
     than per-test, since the real get_app_id() reads GITHUB_APP_ID_SSM

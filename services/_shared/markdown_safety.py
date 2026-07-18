@@ -11,7 +11,7 @@ from __future__ import annotations
 
 import re
 
-_MENTION_RE = re.compile(r"@(?=\w)")
+_MENTION_RE = re.compile(r"(?<!\w)@(?=\w)")
 
 
 def neutralize_mentions(text: str) -> str:
