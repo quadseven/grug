@@ -23,12 +23,15 @@ spec:
   # #701). Per-pod GRUG_RERUN_WORKERS halved 6->3 so TOTAL in-flight Elder
   # concurrency is unchanged - this buys availability, not throughput.
   # RollingUpdate (was Recreate): with 2 replicas Recreate would kill both
-  # on every deploy; brief rollout overlap is the same safety case as
-  # steady-state active-active.
+  # on every deploy. Surge-free (maxSurge 0, maxUnavailable 1): a surge pod
+  # would briefly run 3 pods = 9 workers, exceeding the 6-worker budget the
+  # halved GRUG_RERUN_WORKERS exists to hold (CodeRabbit, PR #704); replacing
+  # one pod at a time instead dips to 3 workers for the rollout window while
+  # the queue buffers, and always keeps a live pod.
   replicas: 2
   strategy:
     type: RollingUpdate
-    rollingUpdate: {maxUnavailable: 0, maxSurge: 1}
+    rollingUpdate: {maxUnavailable: 1, maxSurge: 0}
   selector:
     matchLabels: {app: grug-consumer}
   template:
@@ -148,8 +151,9 @@ spec:
             # every big-diff review degrade to all_failed - a large-diff
             # reasoner pass was measured at ~318s live (2026-07-13).
             - {name: GRUG_REVIEW_LLM_TIMEOUT_S, value: "330"}
-            # Six handlers plus their short claim-renewal heartbeats may touch
-            # Postgres concurrently; keep pool headroom above the worker count.
+            # Three handlers per pod (six across the pair, #701) plus their
+            # short claim-renewal heartbeats may touch Postgres concurrently;
+            # keep per-process pool headroom above the per-pod worker count.
             - {name: GRUG_PG_POOL_MAX, value: "10"}
             # In-cluster spark-gateway for the exposed-secret judge (#439,
             # ADR-0009). Non-secret Service DNS (named in the ADR); unset =
@@ -185,9 +189,10 @@ spec:
           # process itself; if a consumer thread dies the process exits
           # (thread join in main) and the kubelet restarts the pod.
           resources:
-            # Six network-heavy review workers share this process. Leave room
-            # for concurrent prompts and occasional Semgrep reruns without an
-            # OOM restart halfway through a leased review.
+            # Three network-heavy review workers share this process (six
+            # across the two-replica pair, #701). Leave room for concurrent
+            # prompts and occasional Semgrep reruns without an OOM restart
+            # halfway through a leased review.
             requests: {cpu: 100m, memory: 256Mi}
             limits: {memory: 1Gi}
           securityContext:
