@@ -228,3 +228,19 @@ def test_get_app_id_exposes_the_private_accessor(_stub_secrets):
     import github_app_auth as gh
 
     assert gh.get_app_id() == "12345"
+
+
+def test_app_id_strips_whitespace_from_the_raw_ssm_value(monkeypatch):
+    """Qodo review, PR #694: _get_ssm_secure_string does no normalization,
+    unlike several other SSM reads in secrets_loader.py. A stray trailing
+    newline in the SSM parameter would make every performed_via_github_
+    app.id string comparison in _find_marker_comment (#554/#560/#561)
+    fail forever, silently duplicating marker comments instead of
+    matching our own."""
+    import github_app_auth as gh
+
+    monkeypatch.setenv("GITHUB_APP_ID_SSM", "/githumps/grug/app_id")
+    monkeypatch.setattr(
+        "secrets_loader._get_ssm_secure_string", lambda name: "12345\n"
+    )
+    assert gh.get_app_id() == "12345"

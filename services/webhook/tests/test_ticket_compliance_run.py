@@ -170,6 +170,27 @@ def test_find_marker_comment_ignores_user_authored_decoy(monkeypatch):
     assert result == 222
 
 
+def test_find_marker_comment_logs_when_scan_cap_exhausted(monkeypatch, caplog):
+    """Qodo review, PR #694: giving up at the 20-page cap without finding
+    the marker must be distinguishable from the ordinary 'no marker' exit
+    - silent here means an unbounded duplicate-comment bug on an extreme
+    PR (>2000 comments) would go unnoticed forever, mirroring
+    walkthrough/dispatch.py's test_find_marker_comment_logs_when_scan_
+    cap_exhausted."""
+    full_page = _Resp(200, [
+        {"id": i, "body": "unrelated", "performed_via_github_app": {"id": 1}}
+        for i in range(100)
+    ])
+    routes = {("get", "/issues/1/comments"): full_page}
+    _install(monkeypatch, routes)
+
+    with caplog.at_level("WARNING", logger="grug.persona.tpm.ticket_compliance"):
+        result = run._find_marker_comment("t", "o", "r", 1)
+
+    assert result is None
+    assert "ticket_compliance_marker_scan_capped" in caplog.text
+
+
 def test_decoy_marker_causes_post_not_patch(monkeypatch):
     """End-to-end: a human-authored decoy marker comment exists, but no
     genuine app-authored one - the runner must POST a fresh comment, not

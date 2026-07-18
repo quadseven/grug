@@ -99,7 +99,7 @@ def _find_marker_comment(token: str, owner: str, repo: str, pr_number: int) -> i
     # `token` - so no fallback-on-failure path exists here.
     own_app_id = get_app_id()
     page = 1
-    while page <= 20:  # bound the scan (>2000 comments = give up, post fresh)
+    while page <= 20:  # bound the scan (>2000 comments = give up, post fresh, warn below)
         resp = httpx.get(
             f"{_API}/repos/{_repo_path(owner, repo)}/issues/{pr_number}/comments",
             params={"per_page": 100, "page": page}, headers=_headers(token), timeout=_TIMEOUT,
@@ -115,6 +115,14 @@ def _find_marker_comment(token: str, owner: str, repo: str, pr_number: int) -> i
         if len(batch) < 100:
             return None
         page += 1
+    # Gave up at the cap without finding the marker - distinguish this from
+    # the ordinary "no marker" exit above (Qodo review, PR #694), or a
+    # duplicate-comment-growth bug on an extreme PR (>2000 comments) would
+    # go unnoticed forever, same as walkthrough/dispatch.py already does.
+    log.warning(
+        "ticket_compliance_marker_scan_capped",
+        extra={"repo": f"{owner}/{repo}", "pr": pr_number},
+    )
     return None
 
 
