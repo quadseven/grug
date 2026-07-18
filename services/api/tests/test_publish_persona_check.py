@@ -610,3 +610,18 @@ def test_env_number_clamps_negative_and_oversized(monkeypatch):
     assert publish_check._env_number("GRUG_TEST_RETRY_KNOB", 2, cap=5) == 0.0
     monkeypatch.setenv("GRUG_TEST_RETRY_KNOB", "99")
     assert publish_check._env_number("GRUG_TEST_RETRY_KNOB", 2, cap=5) == 5.0
+
+
+def test_env_number_rejects_non_finite_values(monkeypatch, caplog):
+    """CodeRabbit, PR #698: NaN parses as a float and SURVIVES the clamp
+    (every NaN comparison is False, so min/max pass it through) - int(nan)
+    would then crash the import. Non-finite values must route through the
+    same warning-and-fallback path as malformed strings."""
+    from personas import publish_check
+
+    for raw in ("NaN", "inf", "-inf"):
+        monkeypatch.setenv("GRUG_TEST_RETRY_KNOB", raw)
+        with caplog.at_level(logging.WARNING):
+            out = publish_check._env_number("GRUG_TEST_RETRY_KNOB", 2, cap=5)
+        assert out == 2, raw
+    assert any(r.getMessage() == "publish_retry_env_invalid" for r in caplog.records)

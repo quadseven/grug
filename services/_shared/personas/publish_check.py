@@ -15,6 +15,7 @@ seam" (kept there, not here, so this docstring cannot rot per-slice).
 from __future__ import annotations
 
 import logging
+import math
 import os
 import time
 
@@ -52,6 +53,11 @@ def _env_number(name: str, default: float, *, cap: float) -> float:
         return default
     try:
         value = float(raw)
+        # NaN/inf parse fine and NaN SURVIVES the clamp (every NaN
+        # comparison is False, so min/max pass it through) - int(nan)
+        # would then crash the import anyway (CodeRabbit, PR #698).
+        if not math.isfinite(value):
+            raise ValueError(raw)
     except ValueError:
         log.warning(
             "publish_retry_env_invalid",
