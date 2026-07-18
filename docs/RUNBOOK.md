@@ -534,3 +534,41 @@ thread path while repairing SQS; this gives up pod-restart durability and the
 quiet/stale-head gate. Disable Elder entirely per repo by flipping
 `code_reviewer_enabled=False` in Postgres `grug_kv` or through the admin
 dashboard. A global SSM kill switch is not implemented.
+
+## Node-outage drill (#702, resiliency epic #699)
+
+Executed live 2026-07-18: full `kubectl drain` of the mac-air worker (the
+node that historically hosted every grug pod) with a scoped DD downtime.
+Repeat this drill after any change to the scheduling posture (replicas,
+spread constraints, PDBs) - merged manifests are a claim, the drill is the
+proof.
+
+Procedure (abort = uncordon immediately and file what was found):
+
+1. DD downtime first, scoped to the node (infra repo):
+   `make dd-downtime-start SCOPE="node:<node>" MIN=90 MSG="chaos drill"`.
+2. Snapshot placement: `kubectl get pods -A -o wide --field-selector
+   spec.nodeName=<node>` - note every NON-grug workload that will evict;
+   check their nodeSelectors for landing spots BEFORE draining.
+3. `kubectl cordon <node>` then `kubectl drain <node> --ignore-daemonsets
+   --delete-emptydir-data --timeout=300s`.
+4. During the drain, verify live: webhook readyz + api endpoint 200s, a
+   real PR review completing, plus every other product the node hosted.
+5. `kubectl uncordon <node>`, wait for stuck pods to recover, cancel the
+   downtime, file findings.
+
+Observed 2026-07-18 (the numbers to beat next time):
+
+- grug: zero impact - webhook/api/consumer pairs already spanned zones;
+  both endpoints served 200s throughout (~0.15-0.6s).
+- Every main-vlan home workload rescheduled to the other main-vlan node
+  and was Running within ~1 minute; the thermostat resumed live Nest
+  reconciliation immediately. macchina's pods landed on OCI and stayed
+  serving.
+- Three pods sat Pending for the whole outage window (the drill's real
+  findings): grugthink and owntone are pinned by node-bound local-path
+  PVCs (grug#603, infra#1842), and wispr cascades from owntone via a
+  required pod-affinity. All three recovered on uncordon without help.
+- kubectl client-side throttling slows a many-pod drain's eviction
+  echoes; the evictions themselves proceed - do not panic-abort on the
+  "Waited before sending request" lines.
