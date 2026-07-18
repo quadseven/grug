@@ -1,0 +1,29 @@
+# PodDisruptionBudgets for the multi-replica stateless services (grug#697
+# follow-up: single-node blast-radius reduction). minAvailable: 1 means a
+# voluntary disruption (node drain for maintenance/reboot - see the k8s-oke
+# reboot runbook) can never evict BOTH replicas at once; combined with the
+# zone-spread constraints in the deployments, draining any one node leaves
+# a serving replica in another zone.
+#
+# grug-consumer deliberately has NO PDB: it is a single-replica Recreate
+# deployment by design (SQS FIFO claim semantics) - a PDB with
+# minAvailable: 1 on a 1-replica workload would BLOCK node drains forever.
+apiVersion: policy/v1
+kind: PodDisruptionBudget
+metadata:
+  name: grug-webhook
+  namespace: grug
+spec:
+  minAvailable: 1
+  selector:
+    matchLabels: {app: grug-webhook}
+---
+apiVersion: policy/v1
+kind: PodDisruptionBudget
+metadata:
+  name: grug-api
+  namespace: grug
+spec:
+  minAvailable: 1
+  selector:
+    matchLabels: {app: grug-api}

@@ -11,7 +11,10 @@ metadata:
     tags.datadoghq.com/service: grug-api
     tags.datadoghq.com/env: prod
 spec:
-  replicas: 1
+  # 2 replicas spread across zones - same rationale as webhook-deployment
+  # (single-node blast radius, grug#697 incident); api is stateless
+  # (Postgres-backed session/install stores).
+  replicas: 2
   # RollingUpdate with maxUnavailable:0 so the dependency-aware /readyz (#404)
   # actually self-limits a bad deploy: the new pod must pass readiness before
   # the serving pod is removed, so a dep-broken rollout stalls on the last-good
@@ -36,6 +39,24 @@ spec:
       # (review F2).
       nodeSelector:
         kubernetes.io/arch: arm64
+      # Spread the replicas across zones (lan / oci-iad / oci-ord node
+      # labels) and nodes. Both SOFT (ScheduleAnyway / preferred): a strict
+      # constraint would count a dead zone as an empty domain and block the
+      # replacement pod during exactly the outage this exists to survive.
+      topologySpreadConstraints:
+        - maxSkew: 1
+          topologyKey: topology.kubernetes.io/zone
+          whenUnsatisfiable: ScheduleAnyway
+          labelSelector:
+            matchLabels: {app: grug-api}
+      affinity:
+        podAntiAffinity:
+          preferredDuringSchedulingIgnoredDuringExecution:
+            - weight: 100
+              podAffinityTerm:
+                topologyKey: kubernetes.io/hostname
+                labelSelector:
+                  matchLabels: {app: grug-api}
       imagePullSecrets:
         - name: registry-pull
       securityContext:
