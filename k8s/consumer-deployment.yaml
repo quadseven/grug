@@ -15,11 +15,20 @@ metadata:
     tags.datadoghq.com/service: grug-consumer
     tags.datadoghq.com/env: prod
 spec:
-  # One pod with a bounded in-process rerun worker pool. FIFO message groups
-  # preserve per-PR ordering while unrelated reviews and /grug ask jobs run in
-  # parallel; the watchdog restarts the pod if any worker dies.
-  replicas: 1
-  strategy: {type: Recreate}
+  # Active-active pair (#701, resiliency epic #699): safe by construction -
+  # review claims are Postgres owner-token leases (contended acquire returns
+  # busy, expired leases are reclaimable), SQS FIFO message groups serialize
+  # per-PR work across any number of consumers, and the cave-results handler
+  # is stateless w.r.t. the dispatching process (full invariant inventory on
+  # #701). Per-pod GRUG_RERUN_WORKERS halved 6->3 so TOTAL in-flight Elder
+  # concurrency is unchanged - this buys availability, not throughput.
+  # RollingUpdate (was Recreate): with 2 replicas Recreate would kill both
+  # on every deploy; brief rollout overlap is the same safety case as
+  # steady-state active-active.
+  replicas: 2
+  strategy:
+    type: RollingUpdate
+    rollingUpdate: {maxUnavailable: 0, maxSurge: 1}
   selector:
     matchLabels: {app: grug-consumer}
   template:
@@ -44,6 +53,23 @@ spec:
       terminationGracePeriodSeconds: 60
       nodeSelector:
         kubernetes.io/arch: arm64
+      # Same soft spread pattern as webhook/api (#700): bias the pair across
+      # zones (lan / oci-iad / oci-ord) and hosts; never block scheduling
+      # during the outage this exists to survive.
+      topologySpreadConstraints:
+        - maxSkew: 1
+          topologyKey: topology.kubernetes.io/zone
+          whenUnsatisfiable: ScheduleAnyway
+          labelSelector:
+            matchLabels: {app: grug-consumer}
+      affinity:
+        podAntiAffinity:
+          preferredDuringSchedulingIgnoredDuringExecution:
+            - weight: 100
+              podAffinityTerm:
+                topologyKey: kubernetes.io/hostname
+                labelSelector:
+                  matchLabels: {app: grug-consumer}
       imagePullSecrets:
         - name: registry-pull
       securityContext:
@@ -101,7 +127,9 @@ spec:
             - {name: GRUG_OPENROUTER_REVIEW_MODEL, value: anthropic/claude-opus-4.7}
             # Apex: more concurrent durable reviews so a busy multi-repo
             # night does not serialize Elder behind unrelated large PRs.
-            - {name: GRUG_RERUN_WORKERS, value: "6"}
+            # 3 per pod x 2 replicas (#701) = the same total 6 the single
+            # pod ran - active-active must not double spark-gateway load.
+            - {name: GRUG_RERUN_WORKERS, value: "3"}
             # Absolute per-review wall clock. The watchdog returns the SQS
             # receipt, releases the snapshot claim, and replaces the process
             # if a live worker exceeds this budget. Keep below SQS's 900s
