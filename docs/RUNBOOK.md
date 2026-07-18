@@ -534,3 +534,68 @@ thread path while repairing SQS; this gives up pod-restart durability and the
 quiet/stale-head gate. Disable Elder entirely per repo by flipping
 `code_reviewer_enabled=False` in Postgres `grug_kv` or through the admin
 dashboard. A global SSM kill switch is not implemented.
+
+## Node-outage drill (#702, resiliency epic #699)
+
+Executed live 2026-07-18: full `kubectl drain` of the mac-air worker (the
+node that historically hosted every grug pod) with a scoped DD downtime.
+Repeat this drill after any change to the scheduling posture (replicas,
+spread constraints, PDBs) - merged manifests are a claim, the drill is the
+proof.
+
+Procedure (abort = uncordon immediately, cancel the downtime with
+`make dd-downtime-cancel ID=<DOWNTIME_ID>`, and file what was found - the
+downtime must be cancelled on EVERY exit path, success or abort, or the
+node stays silenced in DD until the MIN expiry):
+
+1. DD downtime first, scoped to the node (infra repo):
+   `make dd-downtime-start SCOPE="node:<node>" MIN=90 MSG="chaos drill"` -
+   record the printed DOWNTIME_ID; you need it to cancel in step 5.
+2. Snapshot placement: `kubectl get pods -A -o wide --field-selector
+   spec.nodeName=<node>` - note every NON-grug workload that will evict,
+   and preflight ALL scheduling constraints for landing spots BEFORE
+   draining, not just nodeSelectors: pod (anti-)affinity, tolerations,
+   and PVC node-affinity (`kubectl get pvc -A` + describe the PVs of any
+   local-path claims - both 2026-07-18 Pending findings were PVC pins a
+   nodeSelector-only check missed).
+3. `kubectl cordon <node>` then `kubectl drain <node> --ignore-daemonsets
+   --delete-emptydir-data --timeout=300s`.
+4. During the drain, verify live:
+   `curl -fsS -m 10 https://webhook.grug.lol/readyz` and
+   `curl -fsS -m 10 https://grug.lol/api/me` both exit 0 (-f makes curl
+   fail on non-2xx, so the check cannot silently pass on an error page);
+   a real PR review
+   completing end-to-end (open a throwaway test PR if no organic traffic,
+   pattern: PR #705); plus every other product the node hosted (e.g.
+   `curl -fsS -m 10 https://macchina.app/` and
+   `kubectl logs -n home deploy/homey-thermostat -f --tail=5` streaming
+   NEW reconcile decisions - a live follow proves the controller is
+   deciding now, where a --since snapshot could show only pre-eviction
+   lines; Ctrl-C after a couple of fresh entries).
+5. `kubectl uncordon <node>`, then WAIT until recovery is real before
+   cancelling the downtime - a one-shot listing can pass while pods are
+   still Pending:
+   `until [ "$(kubectl get pods -A --no-headers | grep -vE 'Running|Completed' | wc -l)" = "0" ]; do sleep 10; done`
+   (pre-existing Error pods from old cronjobs count here; subtract them
+   or clean them up first). Only then
+   `make dd-downtime-cancel ID=<DOWNTIME_ID>`, and file findings.
+
+Observed 2026-07-18 (the numbers to beat next time):
+
+- grug: zero impact - webhook/api/consumer pairs already spanned zones;
+  both endpoints served 200s throughout (~0.15-0.6s).
+- Every main-vlan home workload rescheduled to the other main-vlan node
+  and was Running within ~1 minute; the thermostat resumed live Nest
+  reconciliation immediately. macchina's pods landed on OCI and stayed
+  serving.
+- Three pods sat Pending for the whole outage window (the drill's real
+  findings): grugthink and owntone are pinned by node-bound local-path
+  PVCs (grug#603, infra#1842), and wispr cascades from owntone via a
+  required pod-affinity. All three recovered on uncordon without help.
+- kubectl client-side throttling slowed this ~17-pod drain's eviction
+  ECHOES (the "Waited before sending request" lines) by a few seconds
+  each; the evictions themselves proceeded and the whole drain finished
+  well inside the 300s timeout. Don't abort on those lines alone - the
+  real stall signals are the drain exceeding its --timeout, or an
+  eviction blocked >5 min on a PDB (`kubectl get pdb -A` shows 0 allowed
+  disruptions that never recover), per the #702 abort criteria.
