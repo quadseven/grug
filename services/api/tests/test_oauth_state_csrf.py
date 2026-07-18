@@ -93,10 +93,19 @@ def test_verify_accepts_state_within_ttl(_oauth_mod, monkeypatch):
 
 
 def test_different_secrets_yield_different_signatures(monkeypatch):
+    """#91 (greptile P1, re-verified during #563 disposition): the original
+    assertion OR'd the signature comparison with a rand-component comparison,
+    which is near-always true regardless of the signature (rand is
+    independently random per call) - a broken/constant-signature HMAC would
+    still have passed. Hold rand+ts fixed across both calls so the
+    signature comparison is the only thing that can make this pass."""
     monkeypatch.setenv("GITHUB_APP_WEBHOOK_SECRET_SSM", "/grug/test-webhook-secret")
     import importlib
     import auth.github_oauth as mod
     importlib.reload(mod)
+
+    monkeypatch.setattr(mod.secrets, "token_urlsafe", lambda n: "fixed-rand")
+    monkeypatch.setattr(mod.time, "time", lambda: 1700000000)
 
     monkeypatch.setattr(mod, "_state_secret", lambda: "secret-A")
     state_a = mod._make_state()
@@ -104,9 +113,9 @@ def test_different_secrets_yield_different_signatures(monkeypatch):
     monkeypatch.setattr(mod, "_state_secret", lambda: "secret-B")
     state_b = mod._make_state()
 
-    # Different secrets → different signatures even if rand+ts match by chance
-    assert state_a.split(".")[2] != state_b.split(".")[2] or \
-           state_a.split(".")[0] != state_b.split(".")[0]
+    assert state_a.split(".")[0] == state_b.split(".")[0] == "fixed-rand"
+    assert state_a.split(".")[1] == state_b.split(".")[1]
+    assert state_a.split(".")[2] != state_b.split(".")[2]
 
     # Cross-secret verify must REJECT
     monkeypatch.setattr(mod, "_state_secret", lambda: "secret-A")
