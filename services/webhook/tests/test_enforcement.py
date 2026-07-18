@@ -82,6 +82,7 @@ def test_ensure_passes_stored_id_to_detect():
     """
     with patch("enforcement.detect_enforcement", return_value="grug_managed") as mock_detect, \
          patch("adapters.install_store.get_enforcement_id", return_value=555), \
+         patch("enforcement.migrate_check_context", return_value=False), \
          patch("enforcement.create_ruleset") as mock_create:
         result = ensure_enforcement("tok", "o", "r", "main", 1, 2)
 
@@ -92,7 +93,410 @@ def test_ensure_passes_stored_id_to_detect():
     mock_create.assert_not_called()
 
 
-# ── remove_enforcement ───────────────────────────────────────────────
+def test_ensure_heals_stale_check_context_when_grug_managed():
+    """grug_managed + a stored ruleset ID -> self-heal a stale check
+    context (e.g. a pre-rename em-dash title) via migrate_check_context."""
+    with patch("enforcement.detect_enforcement", return_value="grug_managed"), \
+         patch("adapters.install_store.get_enforcement_id", return_value=555), \
+         patch("enforcement.migrate_check_context", return_value=True) as mock_migrate, \
+         patch("enforcement.create_ruleset") as mock_create:
+        result = ensure_enforcement("tok", "o", "r", "main", 1, 2)
+
+    assert result == "grug_managed"
+    mock_migrate.assert_called_once_with("tok", "o", "r", 555)
+    mock_create.assert_not_called()
+
+
+def test_ensure_skips_heal_when_no_stored_ruleset_id():
+    """grug_managed but no stored ID (name-heuristic match only) ->
+    nothing to heal, migrate_check_context is not even attempted."""
+    with patch("enforcement.detect_enforcement", return_value="grug_managed"), \
+         patch("adapters.install_store.get_enforcement_id", return_value=None), \
+         patch("enforcement.migrate_check_context") as mock_migrate:
+        result = ensure_enforcement("tok", "o", "r", "main", 1, 2)
+
+    assert result == "grug_managed"
+    mock_migrate.assert_not_called()
+
+
+def test_ensure_heal_failure_is_best_effort_and_does_not_raise():
+    """A heal failure (network blip, 403, whatever) must never break the
+    existing-enforcement return - it's cutover insurance, not a gate."""
+    with patch("enforcement.detect_enforcement", return_value="grug_managed"), \
+         patch("adapters.install_store.get_enforcement_id", return_value=555), \
+         patch("enforcement.migrate_check_context", side_effect=RuntimeError("boom")):
+        result = ensure_enforcement("tok", "o", "r", "main", 1, 2)
+
+    assert result == "grug_managed"
+
+
+def test_ensure_external_state_never_attempts_heal():
+    """External enforcement isn't Grug's ruleset to touch - no heal call."""
+    with patch("enforcement.detect_enforcement", return_value="external"), \
+         patch("adapters.install_store.get_enforcement_id", return_value=555), \
+         patch("enforcement.migrate_check_context") as mock_migrate, \
+         patch("enforcement.create_ruleset"):
+        result = ensure_enforcement("tok", "o", "r", "main", 1, 2)
+
+    assert result == "external"
+    mock_migrate.assert_not_called()
+
+
+# --- migrate_check_context ------------------------------------------------
+
+def test_migrate_check_context_updates_stale_legacy_context():
+    """A ruleset still requiring the pre-rename em-dash title gets PUT
+    with the canonical check name."""
+    from enforcement import migrate_check_context
+    stale_ruleset = {
+        "rules": [{
+            "type": "required_status_checks",
+            "parameters": {"required_status_checks": [{"context": "Grug — Definition of Ready"}]},
+        }],
+    }
+    with patch("enforcement.get_ruleset", return_value=stale_ruleset), \
+         patch("enforcement.update_ruleset") as mock_update:
+        changed = migrate_check_context("tok", "o", "r", 555)
+
+    assert changed is True
+    mock_update.assert_called_once_with("tok", "o", "r", 555, [{
+        "type": "required_status_checks",
+        "parameters": {"required_status_checks": [{"context": GRUG_DOR_CHECK_NAME}]},
+    }])
+
+
+def test_migrate_check_context_noop_when_already_canonical():
+    """Already-canonical context -> no PUT, returns False."""
+    from enforcement import migrate_check_context
+    canonical_ruleset = {
+        "rules": [{
+            "type": "required_status_checks",
+            "parameters": {"required_status_checks": [{"context": GRUG_DOR_CHECK_NAME}]},
+        }],
+    }
+    with patch("enforcement.get_ruleset", return_value=canonical_ruleset), \
+         patch("enforcement.update_ruleset") as mock_update:
+        changed = migrate_check_context("tok", "o", "r", 555)
+
+    assert changed is False
+    mock_update.assert_not_called()
+
+
+def test_migrate_check_context_noop_when_no_required_status_checks_rule():
+    """A ruleset with no required_status_checks rule at all -> nothing to heal."""
+    from enforcement import migrate_check_context
+    empty_ruleset = {"rules": [{"type": "creation"}]}
+    with patch("enforcement.get_ruleset", return_value=empty_ruleset), \
+         patch("enforcement.update_ruleset") as mock_update:
+        changed = migrate_check_context("tok", "o", "r", 555)
+
+    assert changed is False
+    mock_update.assert_not_called()
+
+
+def test_migrate_check_context_preserves_other_required_contexts():
+    """Qodo on #685: an earlier version replaced the WHOLE checks list with
+    just the canonical Chief check, which would silently drop any other
+    required context a ruleset carries. Only the stale alias is rewritten;
+    unrelated contexts pass through untouched, in their original order."""
+    from enforcement import migrate_check_context
+    ruleset = {
+        "rules": [{
+            "type": "required_status_checks",
+            "parameters": {"required_status_checks": [
+                {"context": "some-other-required-check"},
+                {"context": "Grug — Definition of Ready"},
+            ]},
+        }],
+    }
+    with patch("enforcement.get_ruleset", return_value=ruleset), \
+         patch("enforcement.update_ruleset") as mock_update:
+        changed = migrate_check_context("tok", "o", "r", 555)
+
+    assert changed is True
+    mock_update.assert_called_once_with("tok", "o", "r", 555, [{
+        "type": "required_status_checks",
+        "parameters": {"required_status_checks": [
+            {"context": "some-other-required-check"},
+            {"context": GRUG_DOR_CHECK_NAME},
+        ]},
+    }])
+
+
+def test_migrate_check_context_dedupes_canonical_and_stale_alias():
+    """A ruleset that somehow ended up requiring BOTH the canonical name
+    and a stale alias for the same check (the duplicated-checks-UI
+    symptom) collapses to one entry."""
+    from enforcement import migrate_check_context
+    ruleset = {
+        "rules": [{
+            "type": "required_status_checks",
+            "parameters": {"required_status_checks": [
+                {"context": GRUG_DOR_CHECK_NAME},
+                {"context": "Grug — Definition of Ready"},
+            ]},
+        }],
+    }
+    with patch("enforcement.get_ruleset", return_value=ruleset), \
+         patch("enforcement.update_ruleset") as mock_update:
+        changed = migrate_check_context("tok", "o", "r", 555)
+
+    assert changed is True
+    mock_update.assert_called_once_with("tok", "o", "r", 555, [{
+        "type": "required_status_checks",
+        "parameters": {"required_status_checks": [{"context": GRUG_DOR_CHECK_NAME}]},
+    }])
+
+
+def test_migrate_check_context_preserves_unrelated_rule_types():
+    """CodeRabbit #685: the fix must not synthesize a body from only the
+    required_status_checks rule - other rule types on the SAME ruleset
+    (deletion protection, non-fast-forward, whatever an admin added) must
+    pass through byte-for-byte, in their original position."""
+    from enforcement import migrate_check_context
+    deletion_rule = {"type": "deletion"}
+    nff_rule = {"type": "non_fast_forward"}
+    ruleset = {
+        "rules": [
+            deletion_rule,
+            {
+                "type": "required_status_checks",
+                "parameters": {"required_status_checks": [{"context": "Grug — Definition of Ready"}]},
+            },
+            nff_rule,
+        ],
+    }
+    with patch("enforcement.get_ruleset", return_value=ruleset), \
+         patch("enforcement.update_ruleset") as mock_update:
+        changed = migrate_check_context("tok", "o", "r", 555)
+
+    assert changed is True
+    new_rules = mock_update.call_args.args[4]
+    assert new_rules[0] is deletion_rule
+    assert new_rules[2] is nff_rule
+    assert new_rules[1]["parameters"]["required_status_checks"] == [{"context": GRUG_DOR_CHECK_NAME}]
+
+
+def test_migrate_check_context_preserves_other_rule_parameters():
+    """The required_status_checks rule's OTHER parameters (e.g.
+    strict_required_status_checks_policy) survive the heal untouched -
+    only required_status_checks itself is rewritten."""
+    from enforcement import migrate_check_context
+    ruleset = {
+        "rules": [{
+            "type": "required_status_checks",
+            "parameters": {
+                "strict_required_status_checks_policy": True,
+                "required_status_checks": [{"context": "Grug — Definition of Ready"}],
+            },
+        }],
+    }
+    with patch("enforcement.get_ruleset", return_value=ruleset), \
+         patch("enforcement.update_ruleset") as mock_update:
+        migrate_check_context("tok", "o", "r", 555)
+
+    new_rules = mock_update.call_args.args[4]
+    assert new_rules[0]["parameters"]["strict_required_status_checks_policy"] is True
+
+
+def test_migrate_check_context_rebuilt_entries_omit_integration_id():
+    """create_ruleset's own guard: GitHub 422s on integration_id: null.
+    A rebuilt required_status_checks entry must never carry it, even if
+    the fetched ruleset's original entry had integration_id: null."""
+    from enforcement import migrate_check_context
+    ruleset = {
+        "rules": [{
+            "type": "required_status_checks",
+            "parameters": {"required_status_checks": [
+                {"context": "Grug — Definition of Ready", "integration_id": None},
+            ]},
+        }],
+    }
+    with patch("enforcement.get_ruleset", return_value=ruleset), \
+         patch("enforcement.update_ruleset") as mock_update:
+        migrate_check_context("tok", "o", "r", 555)
+
+    new_rules = mock_update.call_args.args[4]
+    assert new_rules[0]["parameters"]["required_status_checks"] == [{"context": GRUG_DOR_CHECK_NAME}]
+
+
+def test_migrate_check_context_preserves_real_integration_id_on_healed_entry():
+    """CodeRabbit #685 (security): a legacy-alias entry scoped to a
+    specific GitHub App must keep that scoping after its context is
+    rewritten - only the null-integration_id case gets dropped, a real
+    one must survive."""
+    from enforcement import migrate_check_context
+    ruleset = {
+        "rules": [{
+            "type": "required_status_checks",
+            "parameters": {"required_status_checks": [
+                {"context": "Grug — Definition of Ready", "integration_id": 42},
+            ]},
+        }],
+    }
+    with patch("enforcement.get_ruleset", return_value=ruleset), \
+         patch("enforcement.update_ruleset") as mock_update:
+        migrate_check_context("tok", "o", "r", 555)
+
+    new_rules = mock_update.call_args.args[4]
+    assert new_rules[0]["parameters"]["required_status_checks"] == [
+        {"context": GRUG_DOR_CHECK_NAME, "integration_id": 42},
+    ]
+
+
+def test_migrate_check_context_untouched_entry_keeps_its_integration_id():
+    """CodeRabbit #685 (security): an entry that ISN'T a legacy Chief
+    alias must pass through byte-for-byte, integration_id (null or real)
+    included - only the entry actually being healed is touched."""
+    from enforcement import migrate_check_context
+    other_entry = {"context": "some-app-scoped-check", "integration_id": 7}
+    ruleset = {
+        "rules": [{
+            "type": "required_status_checks",
+            "parameters": {"required_status_checks": [
+                other_entry,
+                {"context": "Grug — Definition of Ready"},
+            ]},
+        }],
+    }
+    with patch("enforcement.get_ruleset", return_value=ruleset), \
+         patch("enforcement.update_ruleset") as mock_update:
+        migrate_check_context("tok", "o", "r", 555)
+
+    new_rules = mock_update.call_args.args[4]
+    checks = new_rules[0]["parameters"]["required_status_checks"]
+    assert checks[0] is other_entry
+    assert checks[1] == {"context": GRUG_DOR_CHECK_NAME}
+
+
+def test_migrate_check_context_dedup_key_includes_integration_id():
+    """CodeRabbit #685: dedup must key on (canonical, integration_id), not
+    canonical alone - the same context scoped to two DIFFERENT GitHub Apps
+    is two distinct requirements, not a duplicate. A legacy-alias entry
+    scoped to app 1 and a canonical entry scoped to app 2 must both
+    survive; only a genuine same-app duplicate collapses."""
+    from enforcement import migrate_check_context
+    ruleset = {
+        "rules": [{
+            "type": "required_status_checks",
+            "parameters": {"required_status_checks": [
+                {"context": GRUG_DOR_CHECK_NAME, "integration_id": 1},
+                {"context": "Grug — Definition of Ready", "integration_id": 2},
+            ]},
+        }],
+    }
+    with patch("enforcement.get_ruleset", return_value=ruleset), \
+         patch("enforcement.update_ruleset") as mock_update:
+        changed = migrate_check_context("tok", "o", "r", 555)
+
+    assert changed is True
+    new_rules = mock_update.call_args.args[4]
+    checks = new_rules[0]["parameters"]["required_status_checks"]
+    assert checks == [
+        {"context": GRUG_DOR_CHECK_NAME, "integration_id": 1},
+        {"context": GRUG_DOR_CHECK_NAME, "integration_id": 2},
+    ]
+
+
+def test_migrate_check_context_heals_every_required_status_checks_rule():
+    """Qodo #685: GitHub does not document a one-rule-per-type limit on
+    rulesets. A second required_status_checks rule later in the array must
+    also get healed, not just the first."""
+    from enforcement import migrate_check_context
+    ruleset = {
+        "rules": [
+            {
+                "type": "required_status_checks",
+                "parameters": {"required_status_checks": [{"context": "Grug — Definition of Ready"}]},
+            },
+            {"type": "deletion"},
+            {
+                "type": "required_status_checks",
+                "parameters": {"required_status_checks": [{"context": "Grug — Code Review"}]},
+            },
+        ],
+    }
+    with patch("enforcement.get_ruleset", return_value=ruleset), \
+         patch("enforcement.update_ruleset") as mock_update:
+        changed = migrate_check_context("tok", "o", "r", 555)
+
+    assert changed is True
+    new_rules = mock_update.call_args.args[4]
+    assert new_rules[0]["parameters"]["required_status_checks"] == [{"context": GRUG_DOR_CHECK_NAME}]
+    assert new_rules[1] == {"type": "deletion"}
+    assert new_rules[2]["parameters"]["required_status_checks"] == [{"context": "Grug - Elder"}]
+
+
+def test_migrate_check_context_untouched_entry_null_integration_id_stripped():
+    """Qodo #685: GitHub 422s the whole PUT on integration_id: null,
+    including on an UNTOUCHED entry re-sent verbatim - null and absent
+    mean the same thing to GitHub's model, so stripping it changes
+    nothing about what the entry actually requires. This alone counts as
+    a healable change (the ruleset still gets PUT to drop the null)."""
+    from enforcement import migrate_check_context
+    ruleset = {
+        "rules": [{
+            "type": "required_status_checks",
+            "parameters": {"required_status_checks": [
+                {"context": "some-untouched-check", "integration_id": None},
+            ]},
+        }],
+    }
+    with patch("enforcement.get_ruleset", return_value=ruleset), \
+         patch("enforcement.update_ruleset") as mock_update:
+        changed = migrate_check_context("tok", "o", "r", 555)
+
+    assert changed is True
+    new_rules = mock_update.call_args.args[4]
+    assert new_rules[0]["parameters"]["required_status_checks"] == [{"context": "some-untouched-check"}]
+
+
+def test_migrate_check_context_non_string_context_left_alone():
+    """Qodo #685: a malformed entry (context missing/non-string) must not
+    make the healed PUT itself malformed - primary_check_name is never
+    called on it, and if it's the only entry, no PUT happens at all."""
+    from enforcement import migrate_check_context
+    ruleset = {
+        "rules": [{
+            "type": "required_status_checks",
+            "parameters": {"required_status_checks": [{"context": None}]},
+        }],
+    }
+    with patch("enforcement.get_ruleset", return_value=ruleset), \
+         patch("enforcement.update_ruleset") as mock_update:
+        changed = migrate_check_context("tok", "o", "r", 555)
+
+    assert changed is False
+    mock_update.assert_not_called()
+
+
+def test_migrate_check_context_unhashable_context_does_not_crash():
+    """Qodo #685: a malformed entry with a dict/list context (non-string,
+    so left alone per the previous fix) must not blow up the dedup set -
+    an unhashable value can never be dedup-keyed, so it's just kept."""
+    from enforcement import migrate_check_context
+    malformed = {"context": {"nested": "dict"}}
+    ruleset = {
+        "rules": [{
+            "type": "required_status_checks",
+            "parameters": {"required_status_checks": [
+                malformed,
+                {"context": "Grug — Definition of Ready"},
+            ]},
+        }],
+    }
+    with patch("enforcement.get_ruleset", return_value=ruleset), \
+         patch("enforcement.update_ruleset") as mock_update:
+        changed = migrate_check_context("tok", "o", "r", 555)
+
+    assert changed is True
+    new_rules = mock_update.call_args.args[4]
+    checks = new_rules[0]["parameters"]["required_status_checks"]
+    assert checks[0] is malformed
+    assert checks[1] == {"context": GRUG_DOR_CHECK_NAME}
+
+
+# --- remove_enforcement -----------------------------------------------
 
 def test_remove_deletes_by_stored_id():
     """Stored ruleset_id → delete it (plus any exact-name matches; none here)."""

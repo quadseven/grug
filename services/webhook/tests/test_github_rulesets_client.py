@@ -18,6 +18,7 @@ from github_rulesets_client import (
     delete_ruleset,
     list_rulesets,
     get_ruleset,
+    update_ruleset,
     detect_enforcement,
     GRUG_RULESET_PREFIX,
 )
@@ -91,6 +92,62 @@ def test_create_ruleset_401_propagates(mock_transport_client):
     with patch("httpx.post", side_effect=lambda *a, **kw: client.post(*a, **kw)):
         with pytest.raises(httpx.HTTPStatusError) as exc:
             create_ruleset("stale", "o", "r", "Grug - DoR", ["ctx"])
+    assert exc.value.response.status_code == 401
+
+
+# --- update_ruleset --------------------------------------------------------
+
+_ONE_CHECK_RULE = [{
+    "type": "required_status_checks",
+    "parameters": {"required_status_checks": [{"context": "Grug - Chief"}]},
+}]
+
+
+def test_update_ruleset_url_and_auth():
+    with patch("httpx.put", return_value=_ok_response({"id": 555}, 200)) as mock_put:
+        out = update_ruleset("tok-3", "myorg", "myrepo", 555, _ONE_CHECK_RULE)
+
+    mock_put.assert_called_once()
+    args, kwargs = mock_put.call_args
+    assert args[0] == "https://api.github.com/repos/myorg/myrepo/rulesets/555"
+    assert kwargs["headers"]["Authorization"] == "Bearer tok-3"
+    assert kwargs["headers"]["Accept"] == "application/vnd.github+json"
+    assert kwargs["headers"]["X-GitHub-Api-Version"] == "2022-11-28"
+    assert kwargs["timeout"] == 10
+    assert out == {"id": 555}
+
+
+def test_update_ruleset_body_shape():
+    with patch("httpx.put", return_value=_ok_response({"id": 1}, 200)) as mock_put:
+        update_ruleset("tok", "o", "r", 1, _ONE_CHECK_RULE)
+
+    body = mock_put.call_args.kwargs["json"]
+    # body sends exactly the rules array the caller passed - no synthesis,
+    # no other top-level fields added or dropped by this client.
+    assert body == {"rules": _ONE_CHECK_RULE}
+
+
+def test_update_ruleset_preserves_unrelated_rules_verbatim():
+    """CodeRabbit #685: update_ruleset must not synthesize a body from only
+    the required_status_checks rule - it sends back whatever `rules` the
+    caller passes, including any other rule types untouched."""
+    rules = [
+        {"type": "deletion"},
+        {"type": "required_status_checks", "parameters": {"required_status_checks": [{"context": "x"}]}},
+        {"type": "non_fast_forward"},
+    ]
+    with patch("httpx.put", return_value=_ok_response({"id": 2}, 200)) as mock_put:
+        update_ruleset("tok", "o", "r", 2, rules)
+
+    body = mock_put.call_args.kwargs["json"]
+    assert body == {"rules": rules}
+
+
+def test_update_ruleset_401_propagates(mock_transport_client):
+    client = mock_transport_client(status_codes=[401])
+    with patch("httpx.put", side_effect=lambda *a, **kw: client.put(*a, **kw)):
+        with pytest.raises(httpx.HTTPStatusError) as exc:
+            update_ruleset("stale", "o", "r", 1, _ONE_CHECK_RULE)
     assert exc.value.response.status_code == 401
 
 
