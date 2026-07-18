@@ -16,12 +16,75 @@ from __future__ import annotations
 
 import logging
 import os
+import time
+
+import httpx
 
 from activity_log import record_check_verdict
 from github_app_auth import with_install_token_retry
 from github_checks_client import CheckConclusion, CheckRunResult, post_check_run
 
 log = logging.getLogger(f"{os.getenv('DD_SERVICE', 'grug')}.persona.publish_check")
+
+# Transient-network retry budget (#697). A one-time DNS blip on the webhook
+# pod (httpx ConnectError, digital-ledger#204 2026-07-18) left Chief's and
+# Guard's check-runs permanently un-posted - GitHub showed the REQUIRED
+# check stuck on "Expected - Waiting for status" with no self-healing,
+# because this synchronous publish path had no retry (Elder alone recovered,
+# via its durable queue). Budget is deliberately small: Chief publishes
+# inline in the webhook handler BEFORE the HTTP 200, and GitHub's delivery
+# timeout is 10s - two quick retries catch sub-second blips without risking
+# the delivery ACK. httpx.TransportError covers connect/DNS/read/write/
+# timeout failures but NOT HTTPStatusError - a real 4xx/5xx response from
+# GitHub still fails fast (retrying those wastes the ACK window for no win).
+_TRANSIENT_RETRIES = int(os.getenv("GRUG_PUBLISH_TRANSIENT_RETRIES", "2"))
+_TRANSIENT_BACKOFF_BASE_S = float(os.getenv("GRUG_PUBLISH_RETRY_BASE_SECONDS", "0.5"))
+
+
+def _emit_retry_exhausted_gauge(persona_key: str) -> None:
+    """Best-effort DD signal that the transient-retry budget ran out (#697)
+    - distinct from the check_publish_failed error log so a monitor can
+    key on 'transient outage outlasted the budget' specifically."""
+    try:
+        from observability import emit_gauge  # type: ignore
+        emit_gauge(
+            "grug.check_publish.transient_retries_exhausted", 1,
+            tags={"persona": persona_key},
+        )
+    except Exception:  # noqa: BLE001 - telemetry never breaks the publish path
+        pass
+
+
+def _publish_with_transient_retry(
+    persona_key: str, installation_id: int, publish_fn,
+) -> None:
+    """Run `publish_fn` (the token-retry-wrapped check-run POST), retrying
+    ONLY transport-level failures (DNS, connect, timeout) up to the small
+    bounded budget above. HTTPStatusError and every non-httpx exception
+    propagate immediately - the outer publish boundary owns those."""
+    attempt = 0
+    while True:
+        try:
+            publish_fn()
+            return
+        except httpx.TransportError as e:
+            attempt += 1
+            if attempt > _TRANSIENT_RETRIES:
+                _emit_retry_exhausted_gauge(persona_key)
+                raise
+            delay = _TRANSIENT_BACKOFF_BASE_S * (2 ** (attempt - 1))
+            log.warning(
+                "check_publish_transient_retry",
+                extra={
+                    "persona": persona_key,
+                    "installation_id": installation_id,
+                    "attempt": attempt,
+                    "max_retries": _TRANSIENT_RETRIES,
+                    "delay_s": delay,
+                    "kind": type(e).__name__,
+                },
+            )
+            time.sleep(delay)
 
 # Reserved: the seam's failure sentinel (returned + recorded when the
 # check-run publish itself fails). A caller's own `success_result` must
@@ -104,10 +167,14 @@ def publish_persona_check(
 
     publish_failed = False
     try:
-        with_install_token_retry(
+        _publish_with_transient_retry(
+            persona_key,
             installation_id,
-            lambda token: post_check_run(
-                token, owner, repo, check_result, external_id=external_id,
+            lambda: with_install_token_retry(
+                installation_id,
+                lambda token: post_check_run(
+                    token, owner, repo, check_result, external_id=external_id,
+                ),
             ),
         )
     except Exception as e:  # noqa: BLE001 — this IS the total publish boundary
