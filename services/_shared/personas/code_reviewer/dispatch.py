@@ -73,6 +73,7 @@ from personas.code_reviewer.persona import (
     CodeReviewEvaluation, Finding, evaluate_diff, with_extra_findings, with_findings,
 )
 from personas.code_reviewer.snapshot import review_snapshot_id_from_pr
+from personas.code_reviewer.verify import verify_findings
 from personas.tribe import CHECK_ELDER
 from adapters.install_store import (  # type: ignore
     CommentFindingOrigin,
@@ -1627,6 +1628,40 @@ def dispatch_code_review(
                 "published": len(kept),
             },
         )
+
+    # Repo-grounded verification pass (#708, epic #707): the judge grades
+    # plausibility from the model's own frame; this step checks the
+    # load-bearing CLAIM against the fetched file contents and kills
+    # contradicted findings (prose file with an execution-class claim,
+    # async-family claim in a provably-sync context, suggested fix already
+    # on the anchored line). Runs on the LLM findings only - the
+    # deterministic sources merged below (complexity, claim-check) are
+    # precise by construction. One structured log row per kill so the
+    # #707 scoreboard can track precision contribution AND false kills.
+    verified, killed = verify_findings(evaluation.findings, file_contents)
+    if killed:
+        evaluation = with_findings(evaluation, verified)
+        for kf in killed:
+            log.info(
+                "code_review_verification_killed",
+                extra={
+                    "installation_id": installation_id,
+                    "pr": f"{owner}/{repo_name}#{pull_number}",
+                    "path": kf.finding.file,
+                    "line": kf.finding.line,
+                    "rule": kf.finding.rule_name,
+                    "severity": kf.finding.severity,
+                    "reason": kf.reason,
+                },
+            )
+        try:
+            from observability import emit_gauge  # type: ignore
+            emit_gauge(
+                "grug.elder.verification_killed", len(killed),
+                tags={"repo": f"{owner}/{repo_name}"},
+            )
+        except Exception:  # noqa: BLE001 - telemetry never breaks the review
+            pass
 
     # #532: deterministic complexity source. A changed Python function over the
     # cyclomatic/cognitive cap merges as an advisory MEDIUM finding - no LLM, no

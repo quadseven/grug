@@ -1,0 +1,259 @@
+"""Repo-grounded verification pass tests (#708, epic #707).
+
+Each of the three kill classes reproduces a REAL Elder marking rejected by
+the PR author on 2026-07-18 (PRs #694/#698/#706) - the regression contract
+is: with verification in place, that marking dies before publication, with
+a machine-readable reason. The false-kill guards pin the other direction:
+verification must never kill a finding whose claim the repo evidence
+actually supports (or cannot refute).
+"""
+
+from __future__ import annotations
+
+from personas.code_reviewer.persona import Finding
+from personas.code_reviewer.verify import verify_findings
+
+
+def _finding(**kw) -> Finding:
+    base = dict(
+        file="services/webhook/x.py",
+        line=5,
+        severity="high",
+        rule_name="some-rule",
+        message="msg",
+        suggestion=None,
+    )
+    base.update(kw)
+    return Finding(**base)
+
+
+# --- class 1: non-code file (PR #706: runbook prose flagged as command
+# injection) ---------------------------------------------------------------
+
+_RUNBOOK = """# Ops Runbook
+
+Drain procedure:
+
+1. `kubectl drain <node> --ignore-daemonsets`
+2. `make dd-downtime-start SCOPE="node:<node>"`
+"""
+
+
+def test_code_execution_rule_on_prose_file_is_killed():
+    f = _finding(
+        file="docs/RUNBOOK.md",
+        line=5,
+        rule_name="unvalidated-external-input",
+        message="command injection hole in user-supplied node name",
+    )
+    kept, killed = verify_findings((f,), {"docs/RUNBOOK.md": _RUNBOOK})
+    assert kept == ()
+    assert len(killed) == 1
+    assert killed[0].reason == "non_code_file"
+    assert killed[0].finding is f
+
+
+def test_docs_claim_rule_on_prose_file_survives():
+    """Prose files still get PROSE-class findings (claim drift, typos) -
+    only code-execution-class rules die there."""
+    f = _finding(
+        file="docs/RUNBOOK.md",
+        line=5,
+        rule_name="doc-code-claim-drift",
+        message="the documented cap does not match the env default",
+    )
+    kept, killed = verify_findings((f,), {"docs/RUNBOOK.md": _RUNBOOK})
+    assert kept == (f,)
+    assert killed == ()
+
+
+# --- class 2: sync context (PR #698: time.sleep / missing-await flagged
+# inside a plain def that runs via asyncio.to_thread) ----------------------
+
+_SYNC_MODULE = '''\
+import time
+
+
+def publish_with_retry(fn):
+    while True:
+        try:
+            fn()
+            return
+        except OSError:
+            time.sleep(0.5)
+'''
+
+_ASYNC_MODULE = '''\
+import asyncio
+import time
+
+
+async def handler():
+    time.sleep(0.5)
+    return 1
+'''
+
+
+def test_async_family_rule_in_sync_def_is_killed():
+    f = _finding(
+        file="services/x.py",
+        line=9,
+        rule_name="sync-io-in-async",
+        message="blocking time.sleep stalls the async event loop",
+    )
+    kept, killed = verify_findings((f,), {"services/x.py": _SYNC_MODULE})
+    assert kept == ()
+    assert killed[0].reason == "sync_context"
+
+
+def test_async_family_rule_in_async_def_survives():
+    f = _finding(
+        file="services/x.py",
+        line=6,
+        rule_name="sync-io-in-async",
+        message="blocking time.sleep stalls the async event loop",
+    )
+    kept, killed = verify_findings((f,), {"services/x.py": _ASYNC_MODULE})
+    assert kept == (f,)
+    assert killed == ()
+
+
+def test_missing_await_in_sync_def_is_killed():
+    """PR #698 round 2: 'that call is async and must be awaited' - inside a
+    plain def, where await is a syntax error and nothing is a coroutine."""
+    f = _finding(
+        file="services/x.py",
+        line=7,
+        rule_name="missing-await",
+        message="the coroutine is created but never runs; add await",
+    )
+    kept, killed = verify_findings((f,), {"services/x.py": _SYNC_MODULE})
+    assert kept == ()
+    assert killed[0].reason == "sync_context"
+
+
+def test_async_rule_at_module_level_is_inconclusive_and_survives():
+    """A flagged line outside any function cannot be proven sync-context
+    (module-level code CAN run inside a loop via exec/import tricks) -
+    inconclusive keeps the finding."""
+    f = _finding(
+        file="services/x.py",
+        line=1,
+        rule_name="sync-io-in-async",
+        message="blocking import-time sleep",
+    )
+    kept, killed = verify_findings((f,), {"services/x.py": _SYNC_MODULE})
+    assert kept == (f,)
+    assert killed == ()
+
+
+def test_async_rule_on_unparseable_file_survives():
+    f = _finding(
+        file="services/x.py",
+        line=2,
+        rule_name="sync-io-in-async",
+        message="blocking sleep",
+    )
+    kept, killed = verify_findings((f,), {"services/x.py": "def broken(:\n    pass"})
+    assert kept == (f,)
+    assert killed == ()
+
+
+# --- class 3: fix already present (PR #694: 'strip the raw SSM value' on
+# the exact line that already calls .strip()) ------------------------------
+
+_STRIPPED_MODULE = '''\
+import os
+
+
+def _app_id() -> str:
+    return _get(os.environ["GITHUB_APP_ID_SSM"]).strip()
+'''
+
+
+def test_suggested_fix_already_on_anchored_line_is_killed():
+    f = _finding(
+        file="services/auth.py",
+        line=5,
+        rule_name="moderate-string-comparison-failure",
+        message="app ID compared unstripped; whitespace breaks comparison",
+        suggestion="apply .strip() to the raw SSM value",
+    )
+    kept, killed = verify_findings((f,), {"services/auth.py": _STRIPPED_MODULE})
+    assert kept == ()
+    assert killed[0].reason == "fix_already_present"
+
+
+def test_suggested_fix_absent_from_anchor_survives():
+    f = _finding(
+        file="services/auth.py",
+        line=5,
+        rule_name="moderate-string-comparison-failure",
+        message="app ID compared unstripped",
+        suggestion="apply .casefold() before comparing",
+    )
+    kept, killed = verify_findings((f,), {"services/auth.py": _STRIPPED_MODULE})
+    assert kept == (f,)
+    assert killed == ()
+
+
+def test_no_suggestion_skips_already_present_check():
+    f = _finding(
+        file="services/auth.py",
+        line=5,
+        rule_name="moderate-string-comparison-failure",
+        message="app ID compared unstripped",
+        suggestion=None,
+    )
+    kept, killed = verify_findings((f,), {"services/auth.py": _STRIPPED_MODULE})
+    assert kept == (f,)
+
+
+def test_prose_suggestion_without_code_tokens_skips_the_check():
+    """A suggestion with no code-ish token ('rethink this design') must not
+    trigger substring kills on ordinary words."""
+    f = _finding(
+        file="services/auth.py",
+        line=5,
+        rule_name="moderate-string-comparison-failure",
+        message="msg",
+        suggestion="rethink the comparison design entirely",
+    )
+    kept, killed = verify_findings((f,), {"services/auth.py": _STRIPPED_MODULE})
+    assert kept == (f,)
+
+
+# --- cross-cutting guards -------------------------------------------------
+
+
+def test_file_missing_from_contents_is_inconclusive_and_survives():
+    f = _finding(file="services/nowhere.py", rule_name="sync-io-in-async")
+    kept, killed = verify_findings((f,), {})
+    assert kept == (f,)
+    assert killed == ()
+
+
+def test_ordinary_finding_on_code_file_passes_through():
+    f = _finding(
+        file="services/x.py", line=9, rule_name="null-deref",
+        message="x may be None here",
+    )
+    kept, killed = verify_findings((f,), {"services/x.py": _SYNC_MODULE})
+    assert kept == (f,)
+    assert killed == ()
+
+
+def test_order_preserved_and_mixed_verdicts():
+    dead = _finding(
+        file="docs/a.md", line=1, rule_name="sql-injection", message="inject",
+    )
+    alive1 = _finding(file="services/x.py", line=9, rule_name="null-deref")
+    alive2 = _finding(
+        file="services/x.py", line=6, rule_name="broad-except-masks-bug",
+    )
+    kept, killed = verify_findings(
+        (alive1, dead, alive2),
+        {"docs/a.md": "# doc", "services/x.py": _SYNC_MODULE},
+    )
+    assert kept == (alive1, alive2)
+    assert [k.finding for k in killed] == [dead]
