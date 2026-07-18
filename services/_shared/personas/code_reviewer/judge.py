@@ -331,3 +331,82 @@ def run_judge(
     submit_evals(
         evaluation.findings, verdicts, review_span_context=review_span_context,
     )
+
+
+# --- Refute gate (#714, epic #707) ------------------------------------
+
+# Kill bar for the refute gate: deliberately far above the suppression
+# floor - an evidence-backed confident refutation is a different epistemic
+# standard from a plausibility grade, and it is allowed to kill
+# HIGH/CRITICAL findings (narrowing the #467-era always-publish rule for
+# exactly this gate).
+_REFUTE_CONFIDENCE_FLOOR = 0.9
+
+
+def refute_findings(
+    findings: tuple[Finding, ...],
+    hunks: tuple[DiffHunk, ...],
+    installation_id: int,
+    *,
+    pr_context: Optional[PrContext] = None,
+    file_contents: Optional[dict[str, str]] = None,
+    cross_file_contents: Optional[dict[str, str]] = None,
+    runtime_context: str | None = None,
+) -> tuple[FindingJudgement, ...]:
+    """Adversarial evidence-check (#714) for the HIGH/CRITICAL findings
+    that survived the deterministic verification pass. One refute-framed
+    judge call (the burden inverts: the adjudicator must ground the claim
+    in quoted code or refute it); the semantic-misreading class - two
+    same-day production instances (grug PR #710, digital-ledger#208) -
+    passed the plausibility judge because nothing forced a line-level
+    check of the claim itself. Fail-OPEN like grade_findings: any error
+    returns () and everything publishes. Callers pass ONLY the
+    high/critical subset (cost bound: typically 0-2 findings)."""
+    if not findings:
+        return ()
+    wire_hunks = [Hunk(path=h.file_path, body=h.body) for h in hunks]
+    reprs = [_finding_to_repr(f) for f in findings[:JUDGE_BATCH_SIZE]]
+    try:
+        return judge_findings(
+            reprs,
+            wire_hunks,
+            installation_id=installation_id,
+            pr_context=pr_context,
+            file_contents=file_contents,
+            cross_file_contents=cross_file_contents,
+            runtime_context=runtime_context,
+            redact=True,
+            refute=True,
+        )
+    except Exception as e:  # noqa: BLE001 - fail-open, mirror grade_findings
+        log.error(
+            "refute_gate_failed",
+            extra={"kind": type(e).__name__, "count": len(reprs)},
+            exc_info=True,
+        )
+        return ()
+
+
+def partition_refuted(
+    findings: tuple[Finding, ...],
+    verdicts: tuple[FindingJudgement, ...],
+    *,
+    confidence_floor: float = _REFUTE_CONFIDENCE_FLOOR,
+) -> tuple[tuple[Finding, ...], tuple[Finding, ...]]:
+    """Split (KEPT, REFUTED) on the refute-gate verdicts. A finding is
+    REFUTED iff the gate graded it not-real with confidence >= the refute
+    floor. No verdict (outage, index miss, over budget) = KEPT - the gate
+    only ever kills on decisive quoted-evidence refutation. Pure - no IO."""
+    by_index: dict[int, FindingJudgement] = {}
+    for v in verdicts:
+        if 0 <= v.finding_index < len(findings) and v.finding_index not in by_index:
+            by_index[v.finding_index] = v
+    kept: list[Finding] = []
+    refuted: list[Finding] = []
+    for i, f in enumerate(findings):
+        v = by_index.get(i)
+        if v is not None and not v.is_real_bug and v.confidence >= confidence_floor:
+            refuted.append(f)
+        else:
+            kept.append(f)
+    return tuple(kept), tuple(refuted)
