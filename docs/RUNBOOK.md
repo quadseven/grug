@@ -543,7 +543,10 @@ Repeat this drill after any change to the scheduling posture (replicas,
 spread constraints, PDBs) - merged manifests are a claim, the drill is the
 proof.
 
-Procedure (abort = uncordon immediately and file what was found):
+Procedure (abort = uncordon immediately, cancel the downtime with
+`make dd-downtime-cancel ID=<DOWNTIME_ID>`, and file what was found - the
+downtime must be cancelled on EVERY exit path, success or abort, or the
+node stays silenced in DD until the MIN expiry):
 
 1. DD downtime first, scoped to the node (infra repo):
    `make dd-downtime-start SCOPE="node:<node>" MIN=90 MSG="chaos drill"` -
@@ -558,13 +561,17 @@ Procedure (abort = uncordon immediately and file what was found):
 3. `kubectl cordon <node>` then `kubectl drain <node> --ignore-daemonsets
    --delete-emptydir-data --timeout=300s`.
 4. During the drain, verify live:
-   `curl -m 10 https://webhook.grug.lol/readyz` and
-   `curl -m 10 https://grug.lol/api/me` both 200; a real PR review
+   `curl -fsS -m 10 https://webhook.grug.lol/readyz` and
+   `curl -fsS -m 10 https://grug.lol/api/me` both exit 0 (-f makes curl
+   fail on non-2xx, so the check cannot silently pass on an error page);
+   a real PR review
    completing end-to-end (open a throwaway test PR if no organic traffic,
    pattern: PR #705); plus every other product the node hosted (e.g.
-   `curl -m 10 https://macchina.app/` and
-   `kubectl logs -n home deploy/homey-thermostat --since=3m` showing live
-   reconcile decisions).
+   `curl -fsS -m 10 https://macchina.app/` and
+   `kubectl logs -n home deploy/homey-thermostat -f --tail=5` streaming
+   NEW reconcile decisions - a live follow proves the controller is
+   deciding now, where a --since snapshot could show only pre-eviction
+   lines; Ctrl-C after a couple of fresh entries).
 5. `kubectl uncordon <node>`, wait for stuck pods to recover
    (`kubectl get pods -A | grep -v Running | grep -v Completed`), cancel
    the downtime (`make dd-downtime-cancel ID=<DOWNTIME_ID>`), file
