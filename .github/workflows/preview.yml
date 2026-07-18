@@ -99,10 +99,21 @@ jobs:
           # via search_path. Secret piped to python via stdin (never argv
           # or a shell var) - the same discipline the deploy uses.
           BASE_URL=$(aws ssm get-parameter --name /grug/database-url --with-decryption --query Parameter.Value --output text)
-          printf '%s' "$BASE_URL" | SCHEMA="$SCHEMA" uv run --with 'psycopg[binary]' python3 -c '
+          # See the teardown step's note: the DB host is cluster-internal DNS,
+          # unresolvable from this hosted runner, so tunnel via port-forward and
+          # override host/port (the runtime PREVIEW_DB_URL below keeps the real
+          # cluster host - the in-cluster preview pods resolve it fine; only the
+          # CI-side schema reset needs the tunnel).
+          kubectl -n databases port-forward svc/postgres-rw 25432:5432 >/tmp/grug-db-pf.log 2>&1 &
+          PF_PID=$!
+          trap 'kill $PF_PID 2>/dev/null || true' EXIT
+          for i in $(seq 1 30); do grep -q "Forwarding from" /tmp/grug-db-pf.log && break; sleep 1; done
+          grep -q "Forwarding from" /tmp/grug-db-pf.log \
+            || { echo "::error::port-forward to postgres-rw did not establish"; cat /tmp/grug-db-pf.log; exit 1; }
+          printf '%s' "$BASE_URL" | SCHEMA="$SCHEMA" LPORT=25432 uv run --with 'psycopg[binary]' python3 -c '
           import os, sys, psycopg
-          url = sys.stdin.read().strip(); schema = os.environ["SCHEMA"]
-          with psycopg.connect(url, autocommit=True) as c:
+          url = sys.stdin.read().strip(); schema = os.environ["SCHEMA"]; lport = int(os.environ["LPORT"])
+          with psycopg.connect(url, host="127.0.0.1", port=lport, sslmode="require", autocommit=True) as c:
               c.execute(f"DROP SCHEMA IF EXISTS \"{schema}\" CASCADE")
               c.execute(f"CREATE SCHEMA \"{schema}\"")
           print("schema reset:", schema)'
@@ -176,16 +187,29 @@ jobs:
           NS="grug-pr-${PR}"; SCHEMA="grug_pr_${PR}"
           kubectl delete namespace "$NS" --ignore-not-found --wait=false
           BASE_URL=$(aws ssm get-parameter --name /grug/database-url --with-decryption --query Parameter.Value --output text)
-          printf '%s' "$BASE_URL" | SCHEMA="$SCHEMA" uv run --with 'psycopg[binary]' python3 -c '
+          # /grug/database-url points at postgres-rw.databases.svc.cluster.local
+          # - CLUSTER-INTERNAL DNS, unresolvable from this GitHub-hosted runner
+          # (chronic teardown failures since grug's DB moved to in-cluster CNPG:
+          # `[Errno -3] Temporary failure in name resolution`). exec/logs are
+          # dead on this BYON node (apiserver can't reach kubelet:10250), but
+          # port-forward works, so tunnel to the DB and connect over localhost,
+          # overriding only host/port (keep the URL's creds/dbname). Proven live
+          # 2026-07-18: tunnel up -> SELECT 1 -> 1.
+          kubectl -n databases port-forward svc/postgres-rw 25432:5432 >/tmp/grug-db-pf.log 2>&1 &
+          PF_PID=$!
+          trap 'kill $PF_PID 2>/dev/null || true' EXIT
+          for i in $(seq 1 30); do grep -q "Forwarding from" /tmp/grug-db-pf.log && break; sleep 1; done
+          grep -q "Forwarding from" /tmp/grug-db-pf.log \
+            || { echo "::error::port-forward to postgres-rw did not establish"; cat /tmp/grug-db-pf.log; exit 1; }
+          printf '%s' "$BASE_URL" | SCHEMA="$SCHEMA" LPORT=25432 uv run --with 'psycopg[binary]' python3 -c '
           import os, sys, psycopg
-          # CAUSE of the 2026-07-14 teardown failures: the old line put
-          # os.environ[\"SCHEMA\"] inside the f-string braces, and a
-          # backslash-escaped quote inside an f-string EXPRESSION is a
-          # SyntaxError. Pre-extracting `schema` is the mechanism that keeps
-          # the expression quote-free (same shape as the setup step above);
-          # the statement order itself carries no behavior.
-          url = sys.stdin.read().strip(); schema = os.environ["SCHEMA"]
-          with psycopg.connect(url, autocommit=True) as c:
+          # host/port overridden to the local tunnel; sslmode=require encrypts
+          # without cert-hostname verification (the endpoint is 127.0.0.1, the
+          # cert names the service). Pre-extracting `schema` keeps the f-string
+          # expression quote-free (a backslash-escaped quote inside an f-string
+          # EXPRESSION is a SyntaxError - the 2026-07-14 teardown bug).
+          url = sys.stdin.read().strip(); schema = os.environ["SCHEMA"]; lport = int(os.environ["LPORT"])
+          with psycopg.connect(url, host="127.0.0.1", port=lport, sslmode="require", autocommit=True) as c:
               c.execute(f"DROP SCHEMA IF EXISTS \"{schema}\" CASCADE")
           print("dropped schema", schema)'
           echo "reaped preview for PR ${PR}" >> "$GITHUB_STEP_SUMMARY"
