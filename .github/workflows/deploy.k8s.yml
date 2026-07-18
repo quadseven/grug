@@ -560,9 +560,14 @@ jobs:
           # 60s soak: no container restarts and both services still ready
           # (the owned stand-in for a DD error-rate window - the deploy
           # role has no DD keys by design; see ADR-0017).
-          base=$(kubectl -n grug get pods -o jsonpath='{range .items[*]}{range .status.containerStatuses[*]}{.restartCount}{"\n"}{end}{end}' | awk '{s+=$1} END {print s+0}')
+          # Label-scoped to the 3 deployed apps (#563/#525) - the grug
+          # namespace also runs poller-cronjob and preview-janitor pods;
+          # an unscoped `get pods` would let an unrelated cronjob restart
+          # trigger a false rollback of this deploy.
+          RESTART_SELECTOR='app in (grug-webhook,grug-api,grug-consumer)'
+          base=$(kubectl -n grug get pods -l "$RESTART_SELECTOR" -o jsonpath='{range .items[*]}{range .status.containerStatuses[*]}{.restartCount}{"\n"}{end}{end}' | awk '{s+=$1} END {print s+0}')
           sleep 60
-          after=$(kubectl -n grug get pods -o jsonpath='{range .items[*]}{range .status.containerStatuses[*]}{.restartCount}{"\n"}{end}{end}' | awk '{s+=$1} END {print s+0}')
+          after=$(kubectl -n grug get pods -l "$RESTART_SELECTOR" -o jsonpath='{range .items[*]}{range .status.containerStatuses[*]}{.restartCount}{"\n"}{end}{end}' | awk '{s+=$1} END {print s+0}')
           [ "$after" -le "$base" ] || fail "container restarts during soak (${base} -> ${after})"
           # Post-soak readiness recheck via the API (BYON-safe): all
           # workloads must still be Available after the soak window.
