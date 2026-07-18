@@ -46,14 +46,18 @@ def migrate_check_context(
     a stale legacy alias (e.g. a pre-rename em-dash title) instead of the
     current canonical check name.
 
-    Every check-name rename (Chief/Hunt Plan cutover, and any future one)
-    ships a dual-post insurance mirror in github_checks_client so old
-    rulesets keep passing - but nothing previously updated the ruleset's
-    OWN required-check context to the new canonical name, so an
-    already-enrolled repo stayed pinned to the old title forever (and,
-    for the earliest em-dash titles, to a non-ASCII check name visible in
-    the GitHub UI). Returns True if the ruleset was updated, False if it
-    already names the canonical check.
+    Historically, a check-name rename (Chief/Hunt Plan cutover, and any
+    future one) shipped a dual-post insurance mirror in github_checks_client
+    so old rulesets kept passing - but nothing updated the ruleset's OWN
+    required-check context to the new canonical name, so an already-enrolled
+    repo stayed pinned to the old title forever (and, for the earliest
+    em-dash titles, to a non-ASCII check name visible in the GitHub UI).
+    The dual-post mirror itself was retired (grug#687) once fleet
+    verification confirmed no ruleset anywhere still needed it; this
+    healer remains as the actual fix for a ruleset's OWN stale context,
+    for any Grug-managed ruleset ensure_enforcement still touches.
+    Returns True if the ruleset was updated, False if it already names
+    the canonical check.
 
     Rewrites ONLY known legacy aliases of a Grug persona check (Chief,
     Elder, Guard, ...) to that check's canonical name; every other
