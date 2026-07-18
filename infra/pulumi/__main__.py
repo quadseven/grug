@@ -120,6 +120,14 @@ _deploy_role_bundle = oidc_role.create(
     # docs/runbooks or the preview.yml fix commit for the full story).
     environments=["k8s-prod", "k8s-preview"],
     tags_pattern="v*",
+    # Account rename githumps -> quadseven (2026-07-18): GitHub's default
+    # OIDC sub now embeds immutable owner+repo IDs, so the plain
+    # `repo:quadseven/grug:...` subs above no longer match a real token.
+    # This ID-anchored twin (owner_id 59060157, repo_id 1227364190 - grug's
+    # numeric ids, which survive any future rename) is what actually matches,
+    # and keeps this stack's `pulumi up` from reverting the live emergency
+    # trust patch. Both shapes trusted; drop the name shape in a later sweep.
+    immutable_repo="quadseven@59060157/grug@1227364190",
 )
 gha_deploy_role = _deploy_role_bundle.role
 # Sleep waiter that gates KMS-using Lambda Function ops on the deploy

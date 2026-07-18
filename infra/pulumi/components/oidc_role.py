@@ -60,19 +60,35 @@ def create(
     branches: list[str],
     tags_pattern: str | None = None,
     environments: list[str] | None = None,
+    immutable_repo: str | None = None,
 ) -> DeployRole:
     provider_arn = _ensure_oidc_provider()
 
-    sub_patterns = [f"repo:{repo}:ref:refs/heads/{b}" for b in branches]
-    if tags_pattern:
-        sub_patterns.append(f"repo:{repo}:ref:refs/tags/{tags_pattern}")
-    # Jobs that declare a GitHub `environment:` present a DIFFERENT OIDC
-    # sub shape (`repo:<repo>:environment:<name>`), NOT the ref-based one.
-    # Without an explicit entry STS rejects with "Not authorized to
-    # perform sts:AssumeRoleWithWebIdentity" - hit live on the first
-    # deploy.k8s dispatch (#354), same trap the infra repo documented.
-    for env in environments or []:
-        sub_patterns.append(f"repo:{repo}:environment:{env}")
+    # `immutable_repo`: the ID-anchored `<owner>@<owner_id>/<repo>@<repo_id>`
+    # form of the SAME repo. GitHub's default OIDC sub now embeds immutable
+    # owner+repo numeric IDs (`repo:quadseven@59060157/grug@1227364190:...`),
+    # a platform change confirmed via CloudTrail during the githumps ->
+    # quadseven account rename (2026-07-18) - the plain name-based subs no
+    # longer match ANY token. We emit BOTH shapes (name for any legacy token
+    # form, ID-anchored for the current default) so a live AWS patch of this
+    # role isn't reverted the next time this stack runs `pulumi up`. The
+    # ID-anchored form is also rename-proof: owner_id/repo_id never change.
+    def _subs_for(r: str) -> list[str]:
+        out = [f"repo:{r}:ref:refs/heads/{b}" for b in branches]
+        if tags_pattern:
+            out.append(f"repo:{r}:ref:refs/tags/{tags_pattern}")
+        # Jobs that declare a GitHub `environment:` present a DIFFERENT OIDC
+        # sub shape (`repo:<repo>:environment:<name>`), NOT the ref-based one.
+        # Without an explicit entry STS rejects with "Not authorized to
+        # perform sts:AssumeRoleWithWebIdentity" - hit live on the first
+        # deploy.k8s dispatch (#354), same trap the infra repo documented.
+        for env in environments or []:
+            out.append(f"repo:{r}:environment:{env}")
+        return out
+
+    sub_patterns = _subs_for(repo)
+    if immutable_repo:
+        sub_patterns.extend(_subs_for(immutable_repo))
 
     assume = json.dumps(
         {
