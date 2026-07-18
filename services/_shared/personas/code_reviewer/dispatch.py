@@ -1654,14 +1654,18 @@ def dispatch_code_review(
                     "reason": kf.reason,
                 },
             )
-        try:
-            from observability import emit_gauge  # type: ignore
-            emit_gauge(
-                "grug.elder.verification_killed", len(killed),
-                tags={"repo": f"{owner}/{repo_name}"},
-            )
-        except Exception:  # noqa: BLE001 - telemetry never breaks the review
-            pass
+    # Gauge emitted on EVERY review, kills or not (workflow review on PR
+    # #710): a kills-only gauge makes a silently-disabled verifier
+    # indistinguishable from healthy zero-kill traffic - the zero IS the
+    # liveness signal.
+    try:
+        from observability import emit_gauge  # type: ignore
+        emit_gauge(
+            "grug.elder.verification_killed", len(killed),
+            tags={"repo": f"{owner}/{repo_name}"},
+        )
+    except Exception:  # noqa: BLE001 - telemetry never breaks the review
+        pass
 
     # #532: deterministic complexity source. A changed Python function over the
     # cyclomatic/cognitive cap merges as an advisory MEDIUM finding - no LLM, no
@@ -2219,6 +2223,27 @@ def _async_deep_append_if_needed(
     )
     if deep_suppressed:
         deep_eval = with_findings(deep_eval, deep_kept)
+
+    # Same verification gate as the tier-1 arm (#708; workflow review on
+    # PR #710 caught the gap): without it, a finding class killed in
+    # tier-1 resurrects unverified through the deep reasoner.
+    deep_verified, deep_killed = verify_findings(deep_eval.findings, file_contents)
+    if deep_killed:
+        deep_eval = with_findings(deep_eval, deep_verified)
+        for kf in deep_killed:
+            log.info(
+                "code_review_verification_killed",
+                extra={
+                    "installation_id": installation_id,
+                    "pr": f"{owner}/{repo_name}#{pull_number}",
+                    "path": kf.finding.file,
+                    "line": kf.finding.line,
+                    "rule": kf.finding.rule_name,
+                    "severity": kf.finding.severity,
+                    "reason": kf.reason,
+                    "arm": "deep",
+                },
+            )
 
     # Supersession after long reasoner/judge work (#646 CodeRabbit).
     if cancel_event is not None and cancel_event.is_set():

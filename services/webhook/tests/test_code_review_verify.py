@@ -118,9 +118,11 @@ def test_async_family_rule_in_async_def_survives():
     assert killed == ()
 
 
-def test_missing_await_in_sync_def_is_killed():
-    """PR #698 round 2: 'that call is async and must be awaited' - inside a
-    plain def, where await is a syntax error and nothing is a coroutine."""
+def test_missing_await_is_not_sync_context_killable():
+    """Workflow review on PR #710 (reversing an earlier kill): an imported
+    coroutine callable invoked in an all-sync module is a REAL
+    coroutine-never-awaited bug - the module's own lack of async syntax
+    proves nothing about imported callables. missing-await survives."""
     f = _finding(
         file="services/x.py",
         line=7,
@@ -128,8 +130,8 @@ def test_missing_await_in_sync_def_is_killed():
         message="the coroutine is created but never runs; add await",
     )
     kept, killed = verify_findings((f,), {"services/x.py": _SYNC_MODULE})
-    assert kept == ()
-    assert killed[0].reason == "sync_context"
+    assert kept == (f,)
+    assert killed == ()
 
 
 def test_async_rule_at_module_level_is_inconclusive_and_survives():
@@ -329,6 +331,76 @@ def test_fix_token_on_neighboring_line_only_does_not_kill():
         rule_name="moderate-string-comparison-failure",
         message="raw compared unstripped",
         suggestion="apply .strip() to raw before comparing",
+    )
+    kept, killed = verify_findings((f,), {"services/x.py": src})
+    assert kept == (f,)
+    assert killed == ()
+
+
+# --- PR #710 review tightenings (workflow round 2) ------------------------
+
+
+def test_credential_leak_on_readme_survives_prose_kill():
+    """Workflow review on PR #710: prose files genuinely carry leaked
+    secrets - a README token is a real critical, not a category error."""
+    f = _finding(
+        file="README.md",
+        line=3,
+        severity="critical",
+        rule_name="credential-leak",
+        message="hardcoded API token in the curl example",
+    )
+    kept, killed = verify_findings((f,), {"README.md": "# x\n\ncurl -H 'tok'\n"})
+    assert kept == (f,)
+    assert killed == ()
+
+
+def test_word_boundary_markers_do_not_collide_with_prose_words():
+    """'grace' must not hit 'race', 'nullable' must not hit 'null',
+    'out of sync' must not hit 'sync' - markers are word-boundaried."""
+    f = _finding(
+        file="docs/guide.md",
+        line=2,
+        rule_name="stale-guidance",
+        message="the grace period for nullable fields is out of sync",
+    )
+    kept, killed = verify_findings((f,), {"docs/guide.md": "# g\ntext\n"})
+    assert kept == (f,)
+    assert killed == ()
+
+
+def test_txt_files_are_not_prose():
+    """CMakeLists.txt / requirements.txt are executable/dependency code -
+    .txt earns no prose exemption."""
+    f = _finding(
+        file="CMakeLists.txt",
+        line=1,
+        rule_name="command-injection",
+        message="unquoted variable expansion in execute_process",
+    )
+    kept, killed = verify_findings(
+        (f,), {"CMakeLists.txt": "execute_process(COMMAND ${X})\n"},
+    )
+    assert kept == (f,)
+    assert killed == ()
+
+
+def test_thread_deadlock_rule_in_sync_code_survives():
+    """A 'blocking' thread-deadlock claim is TRUE in fully synchronous
+    code - bare 'blocking' rules are no longer sync_context-killable."""
+    src = (
+        "import threading\n"
+        "lock = threading.Lock()\n"
+        "\n"
+        "def worker():\n"
+        "    lock.acquire()\n"
+        "    lock.acquire()\n"
+    )
+    f = _finding(
+        file="services/x.py",
+        line=6,
+        rule_name="blocking-lock-deadlock",
+        message="second acquire self-deadlocks the worker thread",
     )
     kept, killed = verify_findings((f,), {"services/x.py": src})
     assert kept == (f,)

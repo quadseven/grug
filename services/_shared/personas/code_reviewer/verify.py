@@ -12,16 +12,19 @@ and BEFORE publication, over the `file_contents` snapshot the dispatch
 already fetched (zero extra network), and kills findings whose claim the
 evidence contradicts:
 
-- ``non_code_file``: a code-execution-class rule (injection, async/sync,
-  null-deref, ...) anchored in prose (docs/markdown). Prose-class rules
-  (claim drift, typos) survive on prose files.
-- ``sync_context``: an async-blocker-family rule (sync-io-in-async,
-  missing-await, event-loop stalls) whose anchored line sits inside a
-  plain ``def`` with no ``async`` anywhere in the enclosing chain -
-  nothing there can block an event loop or need an ``await``.
-- ``fix_already_present``: every code-ish token of the finding's own
-  ``suggestion`` already appears verbatim in the anchored line span -
-  the marking describes a fix that is already in the code under review.
+- ``non_code_file``: a rule whose claim requires EXECUTION (injection,
+  event-loop, deadlock, ...; word-boundary matched) anchored in a
+  document format (markdown/rst). Docs-class rules (claim drift, typos)
+  and secret/credential findings survive - prose genuinely carries
+  leaked tokens.
+- ``sync_context``: a rule EXPLICITLY claiming async-context execution
+  (sync-io-in-async, event-loop) whose anchored line sits inside a
+  plain ``def`` in a module containing zero async constructs - nothing
+  in-file can put that line on an event loop.
+- ``fix_already_present``: every code-ish token (call/attr forms only)
+  of the finding's own ``suggestion`` already appears verbatim on the
+  anchored line itself - the marking describes a fix that is already
+  in the code under review.
 
 Inconclusive is NOT a kill: a missing file, an unparseable module, a
 module-level line, or a suggestion with no code tokens all keep the
@@ -53,15 +56,20 @@ class KilledFinding:
 
 
 # Prose file suffixes: findings about EXECUTING these are category errors.
-_PROSE_SUFFIXES = (".md", ".markdown", ".rst", ".txt", ".adoc")
+# NOT .txt (workflow review on PR #710): CMakeLists.txt is executable build
+# code and requirements.txt is a dependency manifest with real security
+# findings - only unambiguous document formats qualify.
+_PROSE_SUFFIXES = (".md", ".markdown", ".rst", ".adoc")
 
-# Rule-slug markers implying the flagged code EXECUTES. Substring-matched
-# against rule_name; a prose file cannot have an event loop, an injection
-# sink, or a null deref.
-_CODE_EXECUTION_MARKERS = (
-    "injection", "await", "async", "sync", "event-loop", "blocking",
-    "deadlock", "race", "leak", "null", "deref", "except", "error-handling",
-    "timeout", "overflow", "sleep", "thread",
+# Markers implying the flagged code EXECUTES, matched with word boundaries
+# (workflow review on PR #710: substring matching made "grace" hit "race",
+# "nullable" hit "null", "out of sync" hit "sync"). The list is trimmed to
+# claims that are execution-only by nature: secret/credential "leak"
+# findings are deliberately ABSENT because prose files genuinely carry
+# leaked secrets - a README token is a real critical, not a category error.
+_CODE_EXECUTION_RE = re.compile(
+    r"(?<![a-z0-9])(?:injection|event-loop|deadlock|deref|overflow"
+    r"|blocking|thread|sleep|xss|sql)(?![a-z0-9])"
 )
 
 # Docs-class rule markers: these rules are ABOUT prose (claim drift, stale
@@ -73,10 +81,13 @@ _DOCS_CLASS_MARKERS = (
     "doc", "claim", "typo", "comment", "link", "readme", "changelog",
 )
 
-# Rule-slug markers for the async-blocker family (the sync_context check).
-_ASYNC_FAMILY_MARKERS = (
-    "await", "async", "event-loop", "sync-io", "sync-in-async", "blocking",
-)
+# Rule-slug markers for rules that EXPLICITLY claim async-context
+# execution - only these are sync_context-killable. Narrowed (workflow
+# review on PR #710): "missing-await" is OUT because an imported coroutine
+# callable in an all-sync module is a real coroutine-never-awaited bug;
+# bare "blocking" is OUT because thread deadlocks and unbounded blocking
+# calls are real bugs in fully synchronous code.
+_ASYNC_FAMILY_MARKERS = ("in-async", "event-loop", "asyncio")
 
 # Code-ish tokens inside a suggestion: identifiers glued to call or attr
 # syntax. Ordinary prose words never match. Bare-assign tokens (timeout=)
@@ -171,8 +182,8 @@ def _verify_one(finding: "Finding", contents: dict[str, str]) -> str | None:
         _is_prose_file(finding.file)
         and not _rule_matches(finding.rule_name, _DOCS_CLASS_MARKERS)
         and (
-            _rule_matches(finding.rule_name, _CODE_EXECUTION_MARKERS)
-            or _rule_matches(finding.message, _CODE_EXECUTION_MARKERS)
+            _CODE_EXECUTION_RE.search(finding.rule_name.lower())
+            or _CODE_EXECUTION_RE.search(finding.message.lower())
         )
     ):
         return "non_code_file"
