@@ -879,6 +879,17 @@ def test_telemetry_interval_clamped_and_never_raises(monkeypatch):
     assert consumer._telemetry_interval_s() == 45.0
 
 
+def _gauge_values(captured_gauges, metric):
+    """Values emitted for one gauge metric name, in capture order."""
+    return [v for m, v, t in captured_gauges if m == metric]
+
+
+def _gauge_tags(captured_gauges, metric):
+    """Tag dicts emitted for one gauge metric name, in capture order
+    (never-tagged calls normalize to {} so callers can .get() safely)."""
+    return [t or {} for m, v, t in captured_gauges if m == metric]
+
+
 def test_emit_queue_depth_emits_depth_and_stall_gauges_per_queue(
     telemetry_env, captured_gauges,
 ):
@@ -902,15 +913,12 @@ def test_emit_queue_depth_emits_depth_and_stall_gauges_per_queue(
         set(c.kwargs["AttributeNames"]) == _BOTH_ATTRS
         for c in mock_attrs.call_args_list
     )
-    visible = [(t or {}).get("queue") for m, v, t in captured_gauges
-               if m == "grug.sqs.messages_visible"]
-    assert visible == list(consumer._TELEMETRY_QUEUE_NAMES)
-    assert all(v == 2.0 for m, v, t in captured_gauges
-               if m == "grug.sqs.messages_visible")
-    assert all(v == 1.0 for m, v, t in captured_gauges
-               if m == "grug.sqs.messages_not_visible")
-    stalled = [v for m, v, t in captured_gauges if m == "grug.sqs.stalled"]
-    assert stalled == [0.0] * len(consumer._TELEMETRY_QUEUE_NAMES)
+    queue_names = list(consumer._TELEMETRY_QUEUE_NAMES)
+    visible_tags = _gauge_tags(captured_gauges, "grug.sqs.messages_visible")
+    assert [t.get("queue") for t in visible_tags] == queue_names
+    assert _gauge_values(captured_gauges, "grug.sqs.messages_visible") == [2.0] * len(queue_names)
+    assert _gauge_values(captured_gauges, "grug.sqs.messages_not_visible") == [1.0] * len(queue_names)
+    assert _gauge_values(captured_gauges, "grug.sqs.stalled") == [0.0] * len(queue_names)
 
 
 def test_emit_queue_depth_marks_waiting_queue_stalled_without_inflight_work(
