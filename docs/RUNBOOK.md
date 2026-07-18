@@ -572,10 +572,13 @@ node stays silenced in DD until the MIN expiry):
    NEW reconcile decisions - a live follow proves the controller is
    deciding now, where a --since snapshot could show only pre-eviction
    lines; Ctrl-C after a couple of fresh entries).
-5. `kubectl uncordon <node>`, wait for stuck pods to recover
-   (`kubectl get pods -A | grep -v Running | grep -v Completed`), cancel
-   the downtime (`make dd-downtime-cancel ID=<DOWNTIME_ID>`), file
-   findings.
+5. `kubectl uncordon <node>`, then WAIT until recovery is real before
+   cancelling the downtime - a one-shot listing can pass while pods are
+   still Pending:
+   `until [ "$(kubectl get pods -A --no-headers | grep -vE 'Running|Completed' | wc -l)" = "0" ]; do sleep 10; done`
+   (pre-existing Error pods from old cronjobs count here; subtract them
+   or clean them up first). Only then
+   `make dd-downtime-cancel ID=<DOWNTIME_ID>`, and file findings.
 
 Observed 2026-07-18 (the numbers to beat next time):
 
