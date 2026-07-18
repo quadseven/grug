@@ -2081,8 +2081,11 @@ def dispatch_code_review(
     # POSTed, so recording can't delay the developer seeing the review. The
     # judge LLM CALL already ran pre-publish (grade_findings, #467) to gate
     # publication; here we only submit its verdicts to DD LLM Obs - for the
-    # FULL `graded_findings` set (published AND suppressed) so the precision
-    # denominator and the learning corpus keep every judged row. `submit_evals`
+    # FULL `graded_findings` set (published AND suppressed AND
+    # verification-killed, #708) so the precision denominator and the
+    # learning corpus keep every judged row: these evals measure the JUDGE
+    # stage, and downstream gates (judge suppression, verification kills)
+    # each carry their own telemetry. `submit_evals`
     # is self-guarding (never raises); wrap anyway - evals must never affect
     # the dispatch result the developer already has.
     try:
