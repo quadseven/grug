@@ -2035,3 +2035,67 @@ def test_dispatch_verification_kills_contradicted_finding(monkeypatch, caplog):
     assert row.reason == "sync_context"
     assert row.rule == "sync-io-in-async"
     assert row.path == "src/x.py"
+
+
+def test_dispatch_refute_gate_kills_confidently_refuted_high_finding(monkeypatch, caplog):
+    """#714 wiring: a HIGH finding that survives the plausibility judge and
+    deterministic verification but is confidently refuted by the evidence
+    gate is killed before publication (reason 'refuted'); medium findings
+    never reach the gate."""
+    import logging
+
+    from llm_client import FindingJudgement as FJ
+
+    llm = LlmReviewResponse(
+        kind="reviewed",
+        findings=(
+            LlmFinding(
+                path="src/x.py", line=2, rule="inverted-logic",
+                severity="high", message="condition reads backwards",  # type: ignore[arg-type]
+            ),
+            LlmFinding(
+                path="src/x.py", line=3, rule="nit",
+                severity="medium", message="minor style point",  # type: ignore[arg-type]
+            ),
+        ),
+        backend_used=Backend.POOLSIDE,
+        review_span_context={"span_id": "rs1"},
+    )
+    monkeypatch.setattr(cr_dispatch, "review_diff", lambda *a, **kw: llm)
+    monkeypatch.setattr(cr_dispatch, "post_check_run", lambda *a, **kw: {})
+    monkeypatch.setattr(
+        cr_dispatch, "grade_findings",
+        lambda *a, **kw: (FJ(0, True, "plausible", 0.9), FJ(1, True, "real nit", 0.9)),
+    )
+    monkeypatch.setattr(
+        cr_dispatch, "_fetch_file_contents",
+        lambda token, owner, repo, paths, sha: {"src/x.py": "x = 1\ny = 2\nz = 3\n"},
+    )
+    refute_calls = []
+
+    def _fake_refute(findings, hunks, installation_id, **kw):
+        refute_calls.append(findings)
+        return (FJ(0, False, "quoted code shows the opposite of the claim", 0.95),)
+
+    monkeypatch.setattr(cr_dispatch, "refute_findings", _fake_refute)
+    posted_reviews: list = []
+    monkeypatch.setattr(
+        cr_dispatch, "post_review",
+        lambda *a, **kw: posted_reviews.append(kw) or {},
+    )
+
+    with patch("httpx.get", return_value=_diff_response()), \
+         caplog.at_level(logging.INFO):
+        out = cr_dispatch.dispatch_code_review(_payload(), blocking=False)
+
+    # Only the HIGH finding reached the refute gate.
+    assert len(refute_calls) == 1
+    assert [f.severity for f in refute_calls[0]] == ["high"]
+    # The refuted high finding died; the medium survived and published.
+    assert len(posted_reviews) == 1
+    row = next(
+        r for r in caplog.records
+        if r.getMessage() == "code_review_verification_killed" and r.reason == "refuted"
+    )
+    assert row.rule == "inverted-logic"
+    assert out["result"] == "pass"

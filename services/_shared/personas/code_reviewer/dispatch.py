@@ -67,7 +67,8 @@ from personas.code_reviewer.cross_file import (
 )
 from personas.code_reviewer.omen import build_runtime_context
 from personas.code_reviewer.judge import (
-    eval_tags, grade_findings, partition_findings, submit_evals,
+    eval_tags, grade_findings, partition_findings, partition_refuted,
+    refute_findings, submit_evals,
 )
 from personas.code_reviewer.persona import (
     CodeReviewEvaluation, Finding, evaluate_diff, with_extra_findings, with_findings,
@@ -1645,6 +1646,15 @@ def dispatch_code_review(
         killed, installation_id=installation_id, owner=owner,
         repo_name=repo_name, pull_number=pull_number, arm="tier1",
     )
+    surviving = _apply_refute_gate(
+        evaluation.findings, hunks, installation_id,
+        pr_context=pr_context, file_contents=file_contents,
+        cross_file_contents=cross_file_contents,
+        runtime_context=runtime_context, owner=owner,
+        repo_name=repo_name, pull_number=pull_number, arm="tier1",
+    )
+    if len(surviving) != len(evaluation.findings):
+        evaluation = with_findings(evaluation, surviving)
 
     # #532: deterministic complexity source. A changed Python function over the
     # cyclomatic/cognitive cap merges as an advisory MEDIUM finding - no LLM, no
@@ -2094,6 +2104,41 @@ def dispatch_code_review(
 
 
 
+def _apply_refute_gate(
+    findings, hunks, installation_id, *, pr_context, file_contents,
+    cross_file_contents, runtime_context, owner, repo_name, pull_number, arm,
+):
+    """Refute gate (#714): adversarial evidence-check for the HIGH/CRITICAL
+    findings that survived deterministic verification - the semantic-
+    misreading class no grep can refute. Returns the surviving findings;
+    kills are recorded through the same telemetry as verification kills
+    (reason "refuted") so the #707 scoreboard attributes them and the
+    false-kill hunt covers this gate too. Fail-open end to end."""
+    high = tuple(f for f in findings if f.severity in ("high", "critical"))
+    if not high:
+        return findings
+    verdicts = refute_findings(
+        high, hunks, installation_id,
+        pr_context=pr_context,
+        file_contents=file_contents,
+        cross_file_contents=cross_file_contents,
+        runtime_context=runtime_context,
+    )
+    if not verdicts:
+        return findings
+    _, refuted = partition_refuted(high, verdicts)
+    if not refuted:
+        return findings
+    from personas.code_reviewer.verify import KilledFinding
+    _record_verification_kills(
+        tuple(KilledFinding(finding=f, reason="refuted") for f in refuted),
+        installation_id=installation_id, owner=owner,
+        repo_name=repo_name, pull_number=pull_number, arm=arm,
+    )
+    dead = set(id(f) for f in refuted)
+    return tuple(f for f in findings if id(f) not in dead)
+
+
 def _record_verification_kills(
     killed, *, installation_id: int, owner: str, repo_name: str,
     pull_number: int, arm: str,
@@ -2253,6 +2298,15 @@ def _async_deep_append_if_needed(
         deep_killed, installation_id=installation_id, owner=owner,
         repo_name=repo_name, pull_number=pull_number, arm="deep",
     )
+    deep_surviving = _apply_refute_gate(
+        deep_eval.findings, hunks, installation_id,
+        pr_context=pr_context, file_contents=file_contents,
+        cross_file_contents=cross_file_contents,
+        runtime_context=runtime_context, owner=owner,
+        repo_name=repo_name, pull_number=pull_number, arm="deep",
+    )
+    if len(deep_surviving) != len(deep_eval.findings):
+        deep_eval = with_findings(deep_eval, deep_surviving)
 
     # Supersession after long reasoner/judge work (#646 CodeRabbit).
     if cancel_event is not None and cancel_event.is_set():
