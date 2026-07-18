@@ -1641,31 +1641,10 @@ def dispatch_code_review(
     verified, killed = verify_findings(evaluation.findings, file_contents)
     if killed:
         evaluation = with_findings(evaluation, verified)
-        for kf in killed:
-            log.info(
-                "code_review_verification_killed",
-                extra={
-                    "installation_id": installation_id,
-                    "pr": f"{owner}/{repo_name}#{pull_number}",
-                    "path": kf.finding.file,
-                    "line": kf.finding.line,
-                    "rule": kf.finding.rule_name,
-                    "severity": kf.finding.severity,
-                    "reason": kf.reason,
-                },
-            )
-    # Gauge emitted on EVERY review, kills or not (workflow review on PR
-    # #710): a kills-only gauge makes a silently-disabled verifier
-    # indistinguishable from healthy zero-kill traffic - the zero IS the
-    # liveness signal.
-    try:
-        from observability import emit_gauge  # type: ignore
-        emit_gauge(
-            "grug.elder.verification_killed", len(killed),
-            tags={"repo": f"{owner}/{repo_name}"},
-        )
-    except Exception:  # noqa: BLE001 - telemetry never breaks the review
-        pass
+    _record_verification_kills(
+        killed, installation_id=installation_id, owner=owner,
+        repo_name=repo_name, pull_number=pull_number, arm="tier1",
+    )
 
     # #532: deterministic complexity source. A changed Python function over the
     # cyclomatic/cognitive cap merges as an advisory MEDIUM finding - no LLM, no
@@ -2114,6 +2093,43 @@ def dispatch_code_review(
     return response
 
 
+
+def _record_verification_kills(
+    killed, *, installation_id: int, owner: str, repo_name: str,
+    pull_number: int, arm: str,
+) -> None:
+    """One structured log row per verification kill plus the ALWAYS-emitted
+    arm-tagged gauge (#708; PR #710 reviews). The gauge fires on zero too -
+    a kills-only gauge made a silently-disabled verifier indistinguishable
+    from healthy zero-kill traffic. Shared by the tier-1 and deep arms so
+    the telemetry contract cannot drift between them."""
+    for kf in killed:
+        log.info(
+            "code_review_verification_killed",
+            extra={
+                "installation_id": installation_id,
+                "pr": f"{owner}/{repo_name}#{pull_number}",
+                "path": kf.finding.file,
+                "line": kf.finding.line,
+                "rule": kf.finding.rule_name,
+                "severity": kf.finding.severity,
+                "reason": kf.reason,
+                "arm": arm,
+            },
+        )
+    try:
+        from observability import emit_gauge  # type: ignore
+        emit_gauge(
+            "grug.elder.verification_killed", len(killed),
+            tags={"repo": f"{owner}/{repo_name}", "arm": arm},
+        )
+    except Exception as e:  # noqa: BLE001 - telemetry never breaks the review
+        log.debug(
+            "code_review_verification_gauge_failed",
+            extra={"kind": type(e).__name__},
+        )
+
+
 def _async_deep_enabled() -> bool:
     """Async deep append on for tiered unless GRUG_DEEP_ASYNC=0."""
     raw = os.getenv("GRUG_DEEP_ASYNC", "1").strip().lower()
@@ -2233,20 +2249,10 @@ def _async_deep_append_if_needed(
     deep_verified, deep_killed = verify_findings(deep_eval.findings, file_contents)
     if deep_killed:
         deep_eval = with_findings(deep_eval, deep_verified)
-        for kf in deep_killed:
-            log.info(
-                "code_review_verification_killed",
-                extra={
-                    "installation_id": installation_id,
-                    "pr": f"{owner}/{repo_name}#{pull_number}",
-                    "path": kf.finding.file,
-                    "line": kf.finding.line,
-                    "rule": kf.finding.rule_name,
-                    "severity": kf.finding.severity,
-                    "reason": kf.reason,
-                    "arm": "deep",
-                },
-            )
+    _record_verification_kills(
+        deep_killed, installation_id=installation_id, owner=owner,
+        repo_name=repo_name, pull_number=pull_number, arm="deep",
+    )
 
     # Supersession after long reasoner/judge work (#646 CodeRabbit).
     if cancel_event is not None and cancel_event.is_set():
