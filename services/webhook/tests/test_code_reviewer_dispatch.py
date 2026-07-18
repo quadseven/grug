@@ -1985,3 +1985,53 @@ def test_inline_comment_body_defuses_tilde_fences_in_message():
     assert "~~~" not in head
     assert "**Where:**" in head
     assert "<!-- grug-rule:null-deref -->" in body
+
+
+def test_dispatch_verification_kills_contradicted_finding(monkeypatch, caplog):
+    """#708 wiring: a judge-approved finding whose claim the repo evidence
+    contradicts (async-family rule anchored in a provably-sync def) is
+    killed before publication, with one structured log row carrying the
+    machine-readable reason."""
+    import logging
+
+    llm = LlmReviewResponse(
+        kind="reviewed",
+        findings=(LlmFinding(
+            path="src/x.py", line=2, rule="sync-io-in-async",
+            severity="high", message="blocking sleep stalls the event loop",  # type: ignore[arg-type]
+        ),),
+        backend_used=Backend.POOLSIDE,
+        review_span_context={"span_id": "rs1"},
+    )
+    monkeypatch.setattr(cr_dispatch, "review_diff", lambda *a, **kw: llm)
+    monkeypatch.setattr(cr_dispatch, "post_check_run", lambda *a, **kw: {})
+    # Judge says REAL - verification must still kill on repo evidence.
+    monkeypatch.setattr(
+        cr_dispatch, "grade_findings",
+        lambda *a, **kw: (FindingJudgement(0, True, "real", 0.9),),
+    )
+    monkeypatch.setattr(
+        cr_dispatch, "_fetch_file_contents",
+        lambda token, owner, repo, paths, sha: {
+            "src/x.py": "def handler(fn):\n    fn()\n    return 1\n",
+        },
+    )
+    posted_reviews: list = []
+    monkeypatch.setattr(
+        cr_dispatch, "post_review",
+        lambda *a, **kw: posted_reviews.append(kw) or {},
+    )
+
+    with patch("httpx.get", return_value=_diff_response()), \
+         caplog.at_level(logging.INFO):
+        out = cr_dispatch.dispatch_code_review(_payload(), blocking=False)
+
+    assert posted_reviews == []  # killed finding produced no inline review
+    assert out["result"] == "pass"
+    row = next(
+        r for r in caplog.records
+        if r.getMessage() == "code_review_verification_killed"
+    )
+    assert row.reason == "sync_context"
+    assert row.rule == "sync-io-in-async"
+    assert row.path == "src/x.py"

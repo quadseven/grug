@@ -73,6 +73,7 @@ from personas.code_reviewer.persona import (
     CodeReviewEvaluation, Finding, evaluate_diff, with_extra_findings, with_findings,
 )
 from personas.code_reviewer.snapshot import review_snapshot_id_from_pr
+from personas.code_reviewer.verify import verify_findings
 from personas.tribe import CHECK_ELDER
 from adapters.install_store import (  # type: ignore
     CommentFindingOrigin,
@@ -1628,6 +1629,23 @@ def dispatch_code_review(
             },
         )
 
+    # Repo-grounded verification pass (#708, epic #707): the judge grades
+    # plausibility from the model's own frame; this step checks the
+    # load-bearing CLAIM against the fetched file contents and kills
+    # contradicted findings (prose file with an execution-class claim,
+    # async-family claim in a provably-sync context, suggested fix already
+    # on the anchored line). Runs on the LLM findings only - the
+    # deterministic sources merged below (complexity, claim-check) are
+    # precise by construction. One structured log row per kill so the
+    # #707 scoreboard can track precision contribution AND false kills.
+    verified, killed = verify_findings(evaluation.findings, file_contents)
+    if killed:
+        evaluation = with_findings(evaluation, verified)
+    _record_verification_kills(
+        killed, installation_id=installation_id, owner=owner,
+        repo_name=repo_name, pull_number=pull_number, arm="tier1",
+    )
+
     # #532: deterministic complexity source. A changed Python function over the
     # cyclomatic/cognitive cap merges as an advisory MEDIUM finding - no LLM, no
     # judge (it is precise by construction). It rides the SAME merge rule as the
@@ -2042,8 +2060,11 @@ def dispatch_code_review(
     # POSTed, so recording can't delay the developer seeing the review. The
     # judge LLM CALL already ran pre-publish (grade_findings, #467) to gate
     # publication; here we only submit its verdicts to DD LLM Obs - for the
-    # FULL `graded_findings` set (published AND suppressed) so the precision
-    # denominator and the learning corpus keep every judged row. `submit_evals`
+    # FULL `graded_findings` set (published AND suppressed AND
+    # verification-killed, #708) so the precision denominator and the
+    # learning corpus keep every judged row: these evals measure the JUDGE
+    # stage, and downstream gates (judge suppression, verification kills)
+    # each carry their own telemetry. `submit_evals`
     # is self-guarding (never raises); wrap anyway - evals must never affect
     # the dispatch result the developer already has.
     try:
@@ -2070,6 +2091,43 @@ def dispatch_code_review(
     if evaluation.degraded_reason:
         response["degraded_reason"] = evaluation.degraded_reason
     return response
+
+
+
+def _record_verification_kills(
+    killed, *, installation_id: int, owner: str, repo_name: str,
+    pull_number: int, arm: str,
+) -> None:
+    """One structured log row per verification kill plus the ALWAYS-emitted
+    arm-tagged gauge (#708; PR #710 reviews). The gauge fires on zero too -
+    a kills-only gauge made a silently-disabled verifier indistinguishable
+    from healthy zero-kill traffic. Shared by the tier-1 and deep arms so
+    the telemetry contract cannot drift between them."""
+    for kf in killed:
+        log.info(
+            "code_review_verification_killed",
+            extra={
+                "installation_id": installation_id,
+                "pr": f"{owner}/{repo_name}#{pull_number}",
+                "path": kf.finding.file,
+                "line": kf.finding.line,
+                "rule": kf.finding.rule_name,
+                "severity": kf.finding.severity,
+                "reason": kf.reason,
+                "arm": arm,
+            },
+        )
+    try:
+        from observability import emit_gauge  # type: ignore
+        emit_gauge(
+            "grug.elder.verification_killed", len(killed),
+            tags={"repo": f"{owner}/{repo_name}", "arm": arm},
+        )
+    except Exception as e:  # noqa: BLE001 - telemetry never breaks the review
+        log.debug(
+            "code_review_verification_gauge_failed",
+            extra={"kind": type(e).__name__},
+        )
 
 
 def _async_deep_enabled() -> bool:
@@ -2184,6 +2242,17 @@ def _async_deep_append_if_needed(
     )
     if deep_suppressed:
         deep_eval = with_findings(deep_eval, deep_kept)
+
+    # Same verification gate as the tier-1 arm (#708; workflow review on
+    # PR #710 caught the gap): without it, a finding class killed in
+    # tier-1 resurrects unverified through the deep reasoner.
+    deep_verified, deep_killed = verify_findings(deep_eval.findings, file_contents)
+    if deep_killed:
+        deep_eval = with_findings(deep_eval, deep_verified)
+    _record_verification_kills(
+        deep_killed, installation_id=installation_id, owner=owner,
+        repo_name=repo_name, pull_number=pull_number, arm="deep",
+    )
 
     # Supersession after long reasoner/judge work (#646 CodeRabbit).
     if cancel_event is not None and cancel_event.is_set():
