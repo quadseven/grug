@@ -534,3 +534,5 @@ thread path while repairing SQS; this gives up pod-restart durability and the
 quiet/stale-head gate. Disable Elder entirely per repo by flipping
 `code_reviewer_enabled=False` in Postgres `grug_kv` or through the admin
 dashboard. A global SSM kill switch is not implemented.
+
+<!-- grug#701 pair-verification marker: consumer active-active live test 2026-07-18 -->
