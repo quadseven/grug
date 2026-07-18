@@ -5,8 +5,10 @@ GitHub check-run titles use ``Grug - <Caveman>`` (ASCII hyphen) so the
 checks UI matches the dashboard, Activity feed, and PR comments.
 
 Historical titles (em-dash ``Grug - `` variants and pre-polish names)
-remain accepted for ruleset detection and are dual-posted as thin alias
-status checks so existing required-status rulesets keep working.
+remain accepted for ruleset detection and healing (grug#687: the
+check-run dual-post mirror itself was retired once fleet verification
+confirmed no ruleset anywhere still names a legacy context) - only
+canonical titles are posted now.
 This module is plain ASCII source; em-dash aliases use \\u escapes.
 """
 
@@ -36,7 +38,8 @@ LEGACY_CHECK_SMASHER_EM = f"Grug {_EM} Smasher"
 LEGACY_CHECK_TELLER_EM = f"Grug {_EM} Teller"
 LEGACY_CHECK_PULSE_EM = f"Grug {_EM} Pulse"
 
-# primary -> aliases that mean the same gate (dual-post + detect)
+# primary -> aliases that mean the same gate (detection + healing only -
+# post_check_run no longer dual-posts these, grug#687)
 _CHECK_ALIASES: dict[str, tuple[str, ...]] = {
     CHECK_CHIEF: (
         LEGACY_CHECK_CHIEF,
