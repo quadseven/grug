@@ -15,13 +15,122 @@ seam" (kept there, not here, so this docstring cannot rot per-slice).
 from __future__ import annotations
 
 import logging
+import math
 import os
+import time
+
+import httpx
 
 from activity_log import record_check_verdict
 from github_app_auth import with_install_token_retry
 from github_checks_client import CheckConclusion, CheckRunResult, post_check_run
 
 log = logging.getLogger(f"{os.getenv('DD_SERVICE', 'grug')}.persona.publish_check")
+
+# Transient-network retry budget (#697). A one-time DNS blip on the webhook
+# pod (httpx ConnectError, digital-ledger#204 2026-07-18) left Chief's and
+# Guard's check-runs permanently un-posted - GitHub showed the REQUIRED
+# check stuck on "Expected - Waiting for status" with no self-healing,
+# because this synchronous publish path had no retry (Elder alone recovered,
+# via its durable queue). Budget is deliberately small: Chief publishes
+# inline in the webhook handler BEFORE the HTTP 200, and GitHub's delivery
+# timeout is 10s - two quick retries catch sub-second blips without risking
+# the delivery ACK. httpx.TransportError covers connect/DNS/read/write/
+# timeout failures but NOT HTTPStatusError - a real 4xx/5xx response from
+# GitHub still fails fast (retrying those wastes the ACK window for no win).
+
+
+def _env_number(name: str, default: float, *, cap: float) -> float:
+    """Operator-tunable numeric env var, parsed defensively (Qodo review,
+    PR #698): a malformed value must degrade to the default with a warning,
+    not crash the service at import (this module loads inside webhook
+    startup - a bad deploy config would otherwise take down check
+    publishing entirely). Clamped to [0, cap]: negative values would make
+    time.sleep raise, and an oversized budget would burn the 10s webhook
+    ACK window."""
+    raw = os.getenv(name)
+    if raw is None:
+        return default
+    try:
+        value = float(raw)
+        # NaN/inf parse fine and NaN SURVIVES the clamp (every NaN
+        # comparison is False, so min/max pass it through) - int(nan)
+        # would then crash the import anyway (CodeRabbit, PR #698).
+        if not math.isfinite(value):
+            raise ValueError(raw)
+    except ValueError:
+        log.warning(
+            "publish_retry_env_invalid",
+            extra={"env": name, "raw": raw[:50], "fallback": default},
+        )
+        return default
+    return min(max(value, 0.0), cap)
+
+
+_TRANSIENT_RETRIES = int(_env_number("GRUG_PUBLISH_TRANSIENT_RETRIES", 2, cap=5))
+_TRANSIENT_BACKOFF_BASE_S = _env_number("GRUG_PUBLISH_RETRY_BASE_SECONDS", 0.5, cap=2.0)
+
+
+def _emit_retry_exhausted_gauge(persona_key: str) -> None:
+    """Best-effort DD signal that the transient-retry budget ran out (#697)
+    - distinct from the check_publish_failed error log so a monitor can
+    key on 'transient outage outlasted the budget' specifically."""
+    try:
+        from observability import emit_gauge  # type: ignore
+        emit_gauge(
+            "grug.check_publish.transient_retries_exhausted", 1,
+            tags={"persona": persona_key},
+        )
+    except Exception:  # noqa: BLE001 - telemetry never breaks the publish path
+        pass
+
+
+# Hard ceiling on CUMULATIVE retry sleep (CodeRabbit, PR #698): the per-knob
+# caps alone still allow retries=5 x base=2.0 -> 2+4+8+16+32 = 62s of sleep,
+# blowing the 10s webhook ACK window the budget exists to respect. The last
+# retry's delay is truncated to whatever budget remains; when it hits zero
+# the attempt counts as exhausted.
+_TRANSIENT_TOTAL_SLEEP_CAP_S = 8.0
+
+
+def _publish_with_transient_retry(
+    persona_key: str, installation_id: int, publish_fn,
+) -> None:
+    """Run `publish_fn` (the token-retry-wrapped check-run POST), retrying
+    ONLY transport-level failures (DNS, connect, timeout) up to the small
+    bounded budget above. HTTPStatusError and every non-httpx exception
+    propagate immediately - the outer publish boundary owns those.
+
+    Safe to retry the POST itself: GitHub supersedes check-runs per
+    (name, head_sha) - a replayed create after a lost response yields an
+    identical, newest-wins check-run, not a visible duplicate (see
+    post_check_run's idempotency note)."""
+    attempt = 0
+    slept = 0.0
+    while True:
+        try:
+            publish_fn()
+            return
+        except httpx.TransportError as e:
+            attempt += 1
+            budget_left = _TRANSIENT_TOTAL_SLEEP_CAP_S - slept
+            if attempt > _TRANSIENT_RETRIES or budget_left <= 0:
+                _emit_retry_exhausted_gauge(persona_key)
+                raise
+            delay = min(_TRANSIENT_BACKOFF_BASE_S * (2 ** (attempt - 1)), budget_left)
+            log.warning(
+                "check_publish_transient_retry",
+                extra={
+                    "persona": persona_key,
+                    "installation_id": installation_id,
+                    "attempt": attempt,
+                    "max_retries": _TRANSIENT_RETRIES,
+                    "delay_s": delay,
+                    "kind": type(e).__name__,
+                },
+            )
+            time.sleep(delay)
+            slept += delay
 
 # Reserved: the seam's failure sentinel (returned + recorded when the
 # check-run publish itself fails). A caller's own `success_result` must
@@ -104,10 +213,14 @@ def publish_persona_check(
 
     publish_failed = False
     try:
-        with_install_token_retry(
+        _publish_with_transient_retry(
+            persona_key,
             installation_id,
-            lambda token: post_check_run(
-                token, owner, repo, check_result, external_id=external_id,
+            lambda: with_install_token_retry(
+                installation_id,
+                lambda token: post_check_run(
+                    token, owner, repo, check_result, external_id=external_id,
+                ),
             ),
         )
     except Exception as e:  # noqa: BLE001 — this IS the total publish boundary
