@@ -603,6 +603,7 @@ def _run_ask(install_id: int, repo_full: str, pr_number: int, question: str) -> 
     the job (a bad answer degrades to a fallback reply)."""
     from urllib.parse import quote as _q
     from llm_client import _redact_secrets, answer_pr_question  # type: ignore
+    from markdown_safety import neutralize_mentions  # type: ignore
     from observability import emit_gauge  # type: ignore
     owner, _, repo_name = repo_full.partition("/")
     q = _redact_secrets(question)
@@ -623,8 +624,13 @@ def _run_ask(install_id: int, repo_full: str, pr_number: int, question: str) -> 
                 "pr_number": pr_number,
             },
         )
-        body = (f"{answer}\n\n*(Grug answered from the PR diff - may be wrong; verify.)*"
-                if answer else
+        # The answer is model-authored over an attacker-influenceable diff,
+        # posted under Grug's own installation-token authority - a live
+        # @mention in it would notify a real GitHub user as if Grug itself
+        # pinged them (#561, same class as Teller's #554 round-4 fix).
+        safe_answer = neutralize_mentions(answer) if answer else answer
+        body = (f"{safe_answer}\n\n*(Grug answered from the PR diff - may be wrong; verify.)*"
+                if safe_answer else
                 "Grug could not answer that right now (the thinking-rock is tired). Try again.")
         _gh_post(
             token,

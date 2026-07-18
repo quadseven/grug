@@ -2,7 +2,20 @@
 
 from __future__ import annotations
 
+import pytest
+
 import personas.tpm.ticket_compliance_run as run
+
+_OWN_APP_ID = "1"  # matches performed_via_github_app.id in the fixtures below
+
+
+@pytest.fixture(autouse=True)
+def _stub_own_app_id(monkeypatch):
+    """Every test exercises _find_marker_comment's own-app-identity check
+    (#560, same class as Teller's #554 round-3 fix) - stub it once rather
+    than per-test, since the real get_app_id() reads GITHUB_APP_ID_SSM
+    (unset in this env)."""
+    monkeypatch.setattr(run, "get_app_id", lambda: _OWN_APP_ID)
 
 
 class _Resp:
@@ -82,7 +95,10 @@ def test_existing_marker_patches_not_posts(monkeypatch):
     routes = {
         ("get", "/pulls/1/files"): _Resp(200, [{"filename": "README.md"}]),
         ("get", "/issues/5"): _Resp(200, {"body": _ISSUE}),
-        ("get", "/issues/1/comments"): _Resp(200, [{"id": 77, "body": f"{run._MARKER} old"}]),
+        ("get", "/issues/1/comments"): _Resp(200, [{
+            "id": 77, "body": f"{run._MARKER} old",
+            "performed_via_github_app": {"id": 1, "slug": "grug"},
+        }]),
     }
     fake = _install(monkeypatch, routes)
     run.run_ticket_compliance("t", owner="o", repo="r", pr_number=1, pr_body="closes #5")
@@ -96,7 +112,10 @@ def test_all_addressed_clears_stale_advisory(monkeypatch):
         ("get", "/pulls/1/files"): _Resp(200, [{"filename": "nist_ghsa_merged_feed.py"},
                                                {"filename": "dogstatsd_gauge.py"}]),
         ("get", "/issues/5"): _Resp(200, {"body": _ISSUE}),
-        ("get", "/issues/1/comments"): _Resp(200, [{"id": 77, "body": f"{run._MARKER} old"}]),
+        ("get", "/issues/1/comments"): _Resp(200, [{
+            "id": 77, "body": f"{run._MARKER} old",
+            "performed_via_github_app": {"id": 1, "slug": "grug"},
+        }]),
     }
     fake = _install(monkeypatch, routes)
     res = run.run_ticket_compliance("t", owner="o", repo="r", pr_number=1, pr_body="closes #5")
@@ -131,3 +150,38 @@ def test_global_kill_switch(monkeypatch):
     res = run.run_ticket_compliance("t", owner="o", repo="r", pr_number=1, pr_body="closes #5")
     assert res["reason"] == "disabled"
     assert fake.calls == []
+
+
+# --- own-app-identity check on the marker comment (#560) ------------------
+
+def test_find_marker_comment_ignores_user_authored_decoy(monkeypatch):
+    """#560 (same class as Teller's #554 round-3 fix): a PR commenter who
+    posts the literal marker string before Chief's first run must not be
+    mistaken for Chief's own comment - only performed_via_github_app (set
+    server-side, unforgeable by a human commenter) counts."""
+    routes = {
+        ("get", "/issues/1/comments"): _Resp(200, [
+            {"id": 111, "body": run._MARKER, "performed_via_github_app": None},
+            {"id": 222, "body": run._MARKER, "performed_via_github_app": {"id": 1, "slug": "grug"}},
+        ]),
+    }
+    _install(monkeypatch, routes)
+    result = run._find_marker_comment("t", "o", "r", 1)
+    assert result == 222
+
+
+def test_decoy_marker_causes_post_not_patch(monkeypatch):
+    """End-to-end: a human-authored decoy marker comment exists, but no
+    genuine app-authored one - the runner must POST a fresh comment, not
+    attempt (and fail) a PATCH against a comment it can't edit."""
+    routes = {
+        ("get", "/pulls/1/files"): _Resp(200, [{"filename": "services/webhook/consumer.py"}]),
+        ("get", "/issues/5"): _Resp(200, {"body": _ISSUE}),
+        ("get", "/issues/1/comments"): _Resp(200, [
+            {"id": 999, "body": run._MARKER, "performed_via_github_app": None},
+        ]),
+    }
+    fake = _install(monkeypatch, routes)
+    run.run_ticket_compliance("t", owner="o", repo="r", pr_number=1, pr_body="closes #5")
+    assert any(c[0] == "post" for c in fake.calls)
+    assert not any(c[0] == "patch" for c in fake.calls)

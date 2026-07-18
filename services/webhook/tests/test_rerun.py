@@ -1486,3 +1486,52 @@ def test_defuse_md_breaks_mentions():
     out = rerun._defuse_md("thanks @org/team and @user")
     assert "@org" not in out  # zwsp inserted after @ breaks the mention
     assert "@​org/team" in out and "@​user" in out
+
+
+# --- _run_ask mention neutralization (#561) ---------------------------
+
+_ZWSP = chr(0x200B)  # kept as a runtime chr() call, not a literal
+# character, so this source file stays 7-bit ASCII on disk.
+
+
+def test_run_ask_neutralizes_mention_in_posted_answer(monkeypatch):
+    """A prompt-injected diff could get the model to include a live
+    @mention in its answer; posted under Grug's own installation-token
+    authority, that would notify a real GitHub user as if Grug itself
+    pinged them (#561, same class as Teller's #554 round-4 fix)."""
+    posted = []
+    monkeypatch.setattr(rerun, "with_install_token_retry", lambda iid, fn: fn("tok"))
+    monkeypatch.setattr(rerun, "_gh_get_text", lambda token, url, accept=None: "diff --git a b")
+    monkeypatch.setattr(rerun, "_gh_post", lambda token, url, body: posted.append(body))
+    monkeypatch.setattr(
+        "llm_client.answer_pr_question",
+        lambda q, diff, iid, pr_context=None: "ping @cait to review this",
+    )
+    monkeypatch.setattr("llm_client._redact_secrets", lambda s: s)
+
+    result = rerun._run_ask(11, "o/r", 7, "who should review this?")
+
+    assert result == "answered"
+    assert posted, "expected a comment to be posted"
+    body = posted[0]["body"]
+    assert "@cait" not in body
+    assert f"@{_ZWSP}cait" in body
+
+
+def test_run_ask_no_answer_falls_back_without_crashing_on_none(monkeypatch):
+    """answer_pr_question returning None (degraded) must not raise inside
+    the mention-neutralization step - None has no mentions to break."""
+    posted = []
+    monkeypatch.setattr(rerun, "with_install_token_retry", lambda iid, fn: fn("tok"))
+    monkeypatch.setattr(rerun, "_gh_get_text", lambda token, url, accept=None: "diff --git a b")
+    monkeypatch.setattr(rerun, "_gh_post", lambda token, url, body: posted.append(body))
+    monkeypatch.setattr(
+        "llm_client.answer_pr_question",
+        lambda q, diff, iid, pr_context=None: None,
+    )
+    monkeypatch.setattr("llm_client._redact_secrets", lambda s: s)
+
+    result = rerun._run_ask(11, "o/r", 7, "who should review this?")
+
+    assert result == "ask_no_answer"
+    assert "thinking-rock is tired" in posted[0]["body"]

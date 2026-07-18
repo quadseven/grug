@@ -12,6 +12,7 @@ from __future__ import annotations
 import re
 from dataclasses import dataclass
 
+from markdown_safety import neutralize_mentions as _neutralize_mentions
 from personas.walkthrough.effort import ReviewEffort, effort_label
 
 MARKER = "<!-- grug-teller:walkthrough -->"
@@ -22,19 +23,7 @@ _MAX_TABLE_ROWS = 60
 _MAX_SUMMARY_CHARS = 2000
 _MAX_FILE_SUMMARY_CHARS = 160
 
-_MENTION_RE = re.compile(r"@(?=\w)")
 _HEADING_RE = re.compile(r"^(#{1,6})(\s)", re.MULTILINE)
-
-
-def _neutralize_mentions(text: str) -> str:
-    """Break `@user` into `@<ZWSP>user` before it reaches GitHub's markdown
-    renderer. The comment posts with the app's OWN installation-token
-    authority, so a live mention in model-authored (or repo-controlled
-    path) text would notify a real GitHub user as if Teller/Grug itself
-    pinged them - a prompt-injected diff can influence this text (#554
-    peer review round 4, codex). Visually identical to a reader; GitHub's
-    mention parser requires an unbroken `@word` token."""
-    return _MENTION_RE.sub("@\u200b", text)
 
 
 def _neutralize_headings(text: str) -> str:
