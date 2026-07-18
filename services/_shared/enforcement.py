@@ -114,11 +114,20 @@ def migrate_check_context(
                 rule_changed = True
             if canonical != ctx:
                 rule_changed = True
-            key = (canonical, new_check.get("integration_id"))
-            if key in seen:
+            try:
+                key = (canonical, new_check.get("integration_id"))
+                duplicate = key in seen
+            except TypeError:
+                # Unhashable context (a malformed entry - e.g. dict/list,
+                # not the str/None this ruleset shape is meant to carry):
+                # can't meaningfully dedupe it, so never treat it as one.
+                key = None
+                duplicate = False
+            if duplicate:
                 rule_changed = True  # dedup drop
                 continue
-            seen.add(key)
+            if key is not None:
+                seen.add(key)
             new_checks.append(new_check)
         if not rule_changed:
             new_rules.append(rule)

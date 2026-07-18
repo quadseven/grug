@@ -470,6 +470,32 @@ def test_migrate_check_context_non_string_context_left_alone():
     mock_update.assert_not_called()
 
 
+def test_migrate_check_context_unhashable_context_does_not_crash():
+    """Qodo #685: a malformed entry with a dict/list context (non-string,
+    so left alone per the previous fix) must not blow up the dedup set -
+    an unhashable value can never be dedup-keyed, so it's just kept."""
+    from enforcement import migrate_check_context
+    malformed = {"context": {"nested": "dict"}}
+    ruleset = {
+        "rules": [{
+            "type": "required_status_checks",
+            "parameters": {"required_status_checks": [
+                malformed,
+                {"context": "Grug — Definition of Ready"},
+            ]},
+        }],
+    }
+    with patch("enforcement.get_ruleset", return_value=ruleset), \
+         patch("enforcement.update_ruleset") as mock_update:
+        changed = migrate_check_context("tok", "o", "r", 555)
+
+    assert changed is True
+    new_rules = mock_update.call_args.args[4]
+    checks = new_rules[0]["parameters"]["required_status_checks"]
+    assert checks[0] is malformed
+    assert checks[1] == {"context": GRUG_DOR_CHECK_NAME}
+
+
 # --- remove_enforcement -----------------------------------------------
 
 def test_remove_deletes_by_stored_id():
