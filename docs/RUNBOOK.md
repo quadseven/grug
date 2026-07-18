@@ -348,11 +348,12 @@ and check the anchor with `kubectl -n grug get configmap grug-last-good -o yaml`
 <a id="elder-async-offload"></a>
 
 **Queue-depth telemetry + monitors (#379):** the consumer emits
-`grug.sqs.messages_visible` / `grug.sqs.messages_not_visible` and a 1/0
+`grug.sqs.messages_visible` / `grug.sqs.messages_not_visible`, a derived
+`grug.sqs.stalled` gauge, and a 1/0
 `grug.sqs.telemetry_queue_ok` boolean (all tagged `queue:<name>`) every
 ~60s for all six grug queues; aws.sqs.* is NOT collected in this org, so
 these owned gauges are the only queue signal. Alert meanings: backlog
-monitors = that queue never drained across 15min; DLQ monitors = a poison
+monitors = visible work had no message in flight across 15min; DLQ monitors = a poison
 message landed (inspect it via the AWS console or `aws sqs
 receive-message` on the DLQ); `Queue telemetry degraded` firing on VALUES
 = that queue's probe success rate fell below half (check

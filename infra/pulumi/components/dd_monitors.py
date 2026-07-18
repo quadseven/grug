@@ -135,15 +135,18 @@ def all_ksm_monitor_queries() -> list[str]:
 # monitor on it is permanent No Data with notify_no_data=false - silently
 # blind (three shipped that way). The consumer emits owned gauges instead;
 # full rationale + semantics live in specs/DESIGN.md ("Owned queue-depth
-# telemetry"). Backlog monitors use SUSTAINED depth (min over the window,
-# per queue) because age-of-oldest is CloudWatch-only; at grug's sparse
-# volumes that approximates the age signal (a continuously-busy-but-
-# draining queue would false-positive, and a lone poison message cycling
-# through its visibility timeout is caught by the DLQ monitors after
-# redrive, not here).
+# telemetry"). Backlog monitors use a SUSTAINED owned stalled signal: work
+# is visible while nothing is in flight for the entire window. This avoids
+# paging on healthy long-review bursts (#610). Poison messages remain covered
+# by worker deadlines and DLQ monitors.
 
 _QUEUE_GAUGE = "grug.sqs.messages_visible"
 _TELEMETRY_OK_GAUGE = "grug.sqs.telemetry_queue_ok"
+
+# Stalled is computed by the consumer from the same GetQueueAttributes
+# response: visible > 0 AND not-visible == 0. Long reviews keep an in-flight
+# message, so healthy worker saturation no longer looks like a dead consumer.
+_STALL_GAUGE = "grug.sqs.stalled"
 
 # Every query filters env explicitly (gemini peer review, PR #516): the
 # owned gauges carry a reliable env tag (emit_gauge appends it), and an
@@ -154,9 +157,8 @@ _TELEMETRY_OK_GAUGE = "grug.sqs.telemetry_queue_ok"
 
 
 def _backlog_query(env: str, queue: str) -> str:
-    """SUSTAINED depth: the queue held messages across the FULL window
-    (min > 0 = never drained once). Per-queue simple filter."""
-    return f"min(last_15m):max:{_QUEUE_GAUGE}{{env:{env},queue:{queue}}} > 0"
+    """SUSTAINED stall: work waited with nothing in flight for the full window."""
+    return f"min(last_15m):max:{_STALL_GAUGE}{{env:{env},queue:{queue}}} > 0"
 
 
 def _dlq_query(env: str, queue: str) -> str:
@@ -171,8 +173,7 @@ def cave_jobs_backlog_query(env: str) -> str:
 
 
 def rerun_backlog_query(env: str) -> str:
-    """The consumer's rerun queue not draining for 15m - a stuck/poisoned
-    consumer loop the pod watchdog can't see (#379's original ask)."""
+    """The rerun queue waited unclaimed for 15m (#610)."""
     return _backlog_query(env, "grug-rerun-jobs.fifo")
 
 
@@ -344,9 +345,9 @@ def create_owned_queue_monitors(
     rerun_backlog = _monitor(
         "grug-rerun-backlog",
         "[grug-consumer] rerun queue not draining (15min)",
-        "grug-rerun-jobs has had messages sitting for a full 15min window "
-        "- the consumer is stuck (poisoned loop, IAM regression) even if "
-        "its pod reads healthy.",
+        "grug-rerun-jobs has had visible work with no message in flight for "
+        "a full 15min window - the consumer is not claiming work even if "
+        "its pod reads healthy. Healthy long reviews do not trigger this.",
         rerun_backlog_query(env),
         "grug-consumer",
     )
@@ -354,8 +355,8 @@ def create_owned_queue_monitors(
     cave_results_backlog = _monitor(
         "grug-cave-results-backlog",
         "[grug-consumer] cave-results queue not draining (15min)",
-        "grug-cave-results has had messages sitting for a full 15min "
-        "window - the consumer is stuck (poisoned loop, IAM regression) "
+        "grug-cave-results has had visible work with no message in flight "
+        "for a full 15min window - the consumer is not claiming results "
         "even if its pod reads healthy.",
         cave_results_backlog_query(env),
         "grug-consumer",

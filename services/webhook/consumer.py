@@ -515,14 +515,23 @@ def _emit_queue_depth_once() -> int:
                     "ApproximateNumberOfMessagesNotVisible",
                 ],
             )["Attributes"]
-            emit_gauge(
-                "grug.sqs.messages_visible",
-                float(attrs.get("ApproximateNumberOfMessages", 0)),
-                {"queue": name},
+            visible = float(attrs.get("ApproximateNumberOfMessages", 0))
+            in_flight = float(
+                attrs.get("ApproximateNumberOfMessagesNotVisible", 0)
             )
+            emit_gauge("grug.sqs.messages_visible", visible, {"queue": name})
             emit_gauge(
-                "grug.sqs.messages_not_visible",
-                float(attrs.get("ApproximateNumberOfMessagesNotVisible", 0)),
+                "grug.sqs.messages_not_visible", in_flight, {"queue": name}
+            )
+            # SQS only exposes age-of-oldest through CloudWatch, which this
+            # deployment intentionally does not ingest. This owned signal
+            # distinguishes a healthy saturated worker pool (waiting AND
+            # in-flight work) from a queue whose consumer has stopped
+            # claiming messages. The monitor requires this state throughout
+            # its full window, so a normal between-claims instant cannot page.
+            emit_gauge(
+                "grug.sqs.stalled",
+                1.0 if visible > 0 and in_flight == 0 else 0.0,
                 {"queue": name},
             )
             probed += 1
