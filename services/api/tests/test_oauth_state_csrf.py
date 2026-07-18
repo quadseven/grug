@@ -104,7 +104,7 @@ def test_different_secrets_yield_different_signatures(monkeypatch):
     import auth.github_oauth as mod
     importlib.reload(mod)
 
-    monkeypatch.setattr(mod.secrets, "token_urlsafe", lambda n: "fixed-rand")
+    monkeypatch.setattr(mod.secrets, "token_urlsafe", lambda _n: "fixed-rand")
     monkeypatch.setattr(mod.time, "time", lambda: 1700000000)
 
     monkeypatch.setattr(mod, "_state_secret", lambda: "secret-A")
