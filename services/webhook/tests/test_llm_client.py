@@ -634,7 +634,7 @@ def test_review_llm_timeout_invalid_value_falls_back_to_default(monkeypatch) -> 
 def test_cave_calls_are_tagged_interactive_priority(monkeypatch) -> None:
     """Grug's own review ensemble (coder + reasoner arms) carries
     X-Spark-Priority: interactive so the spark-gateway priority queue
-    (githumps/infra#1768) lets it jump ahead of Hermes's long agentic turns
+    (quadseven/infra#1768) lets it jump ahead of Hermes's long agentic turns
     on the same shared, single-generation-slot Ollama target - the exact
     2026-07-12 incident this header exists to prevent. Deep depth so BOTH
     arms fire (see test_deep_review_consults_both_arms_and_merges_findings)
@@ -2214,7 +2214,7 @@ def test_summarize_pr_emits_llmobs_span_on_success(monkeypatch) -> None:
     response = httpx.Response(200, json=_openai_json_response(payload))
     pr_context = {
         "installation_id": 9,
-        "repo": "githumps/grug",
+        "repo": "quadseven/grug",
         "pr_number": 666,
     }
     with patch.object(httpx, "post", return_value=response):
@@ -2225,7 +2225,7 @@ def test_summarize_pr_emits_llmobs_span_on_success(monkeypatch) -> None:
     assert len(annotate_calls) == 1
     assert annotate_calls[0]["metadata"]["kind"] == "summarized"
     assert annotate_calls[0]["tags"]["pr_number"] == "666"
-    assert annotate_calls[0]["tags"]["repo"] == "githumps/grug"
+    assert annotate_calls[0]["tags"]["repo"] == "quadseven/grug"
     assert "latency_ms" in annotate_calls[0]["metrics"]
     assert llm_kwargs[0]["name"] == lc._LLMOBS_TELLER_NAME
 

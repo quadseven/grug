@@ -6,7 +6,7 @@ name: Deploy · grugthink (Discord bot manager)
 # credentials as deploy.k8s.yml (registry, tailnet, kubeconfig) - SSM via OIDC
 # is now ALSO shared (see the AWS credentials step below), added for the
 # bounded chat fallback (Poolside/OpenRouter). Bot-specific secrets still come
-# from SSM /githumps/grugthink/* (seeded manually per k8s/DEPLOY.md, not by
+# from SSM /quadseven/grugthink/* (seeded manually per k8s/DEPLOY.md, not by
 # this workflow); NO personal host is committed - the tailnet ingress
 # (grug.ts.ehumps.me) lives in the private infra repo's Caddy configmap,
 # reverse-proxying grugthink.grugthink.svc:8080.
@@ -46,7 +46,7 @@ jobs:
       - name: Configure AWS credentials (LLM fallback key seed)
         # Same grug-gha-deploy OIDC role deploy.k8s.yml uses (infra/pulumi's
         # oidc_role.create trust policy already allows the `k8s-prod`
-        # environment for githumps/grug - this job runs in that environment
+        # environment for quadseven/grug - this job runs in that environment
         # too, so no infra/Pulumi change was needed to add this step; the
         # role's policy already grants ssm:GetParameter* on /infra/llm/*,
         # the same path grug's webhook/consumer read from for years).
@@ -95,7 +95,7 @@ jobs:
           # is tailnet-internal). Generate it in-cluster ONCE and keep it across
           # redeploys so sessions survive - do NOT overwrite an existing secret.
           # (The grug-gha-deploy OIDC role has no ssm:GetParameter on
-          # /githumps/grugthink/*, and this value need not come from SSM.)
+          # /quadseven/grugthink/*, and this value need not come from SSM.)
           if ! kubectl get secret grugthink-secrets -n grugthink >/dev/null 2>&1; then
             kubectl create secret generic grugthink-secrets -n grugthink \
               --from-literal=SESSION_SECRET="$(openssl rand -hex 32)"

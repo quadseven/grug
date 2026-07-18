@@ -1,5 +1,5 @@
 # GrugThink App Image - Fast-changing application code
-FROM ghcr.io/githumps/grugthink:base
+FROM ghcr.io/quadseven/grugthink:base
 
 WORKDIR /app
 

@@ -8,7 +8,7 @@ from ingest_ledger import ingest_text
 
 
 def _line(**kw):
-    base = dict(repo="githumps/grug", pr=1, reviewer="codex",
+    base = dict(repo="quadseven/grug", pr=1, reviewer="codex",
                 severity="HIGH", finding="f", verdict="fixed")
     base.update(kw)
     return json.dumps({**base, "class": kw.get("finding_class", "silent-failure")})

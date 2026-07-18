@@ -1,4 +1,4 @@
-# HITL prerequisites — Slice 1 (githumps/grug#22)
+# HITL prerequisites — Slice 1 (quadseven/grug#22)
 
 Before `pulumi up` succeeds, you (Evan) must complete these manual steps. They're one-time, not redone on every deploy.
 

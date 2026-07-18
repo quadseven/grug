@@ -344,7 +344,7 @@ class BackendConfig:
     # Vendor-agnostic outgoing headers, merged before Authorization (which
     # always wins - _call_backend rejects an extra_headers entry named
     # Authorization outright). Today this is only the Cave arms'
-    # X-Spark-Priority: interactive (githumps/infra#1768) - the spark-gateway
+    # X-Spark-Priority: interactive (quadseven/infra#1768) - the spark-gateway
     # priority queue that keeps Grug's short-timeout calls from starving
     # behind Hermes's long agentic turns on a shared, single-generation-slot
     # Ollama target. SaaS backends don't look at it; harmless to send

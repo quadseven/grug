@@ -47,9 +47,9 @@ def _inline_raw(**over):
         "path": "services/webhook/tests/test_consumer.py",
         "line": 73,
         "original_line": 73,
-        "pull_request_url": "https://api.github.com/repos/githumps/grug/pulls/607",
+        "pull_request_url": "https://api.github.com/repos/quadseven/grug/pulls/607",
         "created_at": "2026-07-12T06:00:00Z",
-        "html_url": "https://github.com/githumps/grug/pull/607#discussion_r1",
+        "html_url": "https://github.com/quadseven/grug/pull/607#discussion_r1",
         "user": {"login": "reviewer-a[bot]"},
     }
     raw.update(over)
@@ -58,7 +58,7 @@ def _inline_raw(**over):
 
 class TestInlineHeaderParser:
     def test_finding_comment_parses(self):
-        f = parse_inline_header_comment("githumps/grug", _inline_raw())
+        f = parse_inline_header_comment("quadseven/grug", _inline_raw())
         assert f is not None
         assert f.source == "src-a"
         assert f.pr == 607
@@ -70,11 +70,11 @@ class TestInlineHeaderParser:
         assert f.outdated is False
 
     def test_reply_without_header_is_skipped(self):
-        raw = _inline_raw(body="`@githumps` Thanks for confirming — resolved.")
-        assert parse_inline_header_comment("githumps/grug", raw) is None
+        raw = _inline_raw(body="`@quadseven` Thanks for confirming — resolved.")
+        assert parse_inline_header_comment("quadseven/grug", raw) is None
 
     def test_outdated_position_flagged(self):
-        f = parse_inline_header_comment("githumps/grug", _inline_raw(line=None, original_line=61))
+        f = parse_inline_header_comment("quadseven/grug", _inline_raw(line=None, original_line=61))
         assert f is not None
         assert f.line == 61
         assert f.outdated is True
@@ -117,7 +117,7 @@ class TestInlineHeaderParser:
 class TestGrugParser:
     def test_finding_comment_parses(self):
         raw = _inline_raw(body=_GRUG_BODY, user={"login": "grug-tribe[bot]"})
-        f = parse_grug_comment("githumps/grug", raw)
+        f = parse_grug_comment("quadseven/grug", raw)
         assert f is not None
         assert f.source == "grug"
         assert f.severity == "high"
@@ -129,13 +129,13 @@ class TestGrugParser:
 
     def test_walkthrough_chatter_skipped(self):
         raw = _inline_raw(body="<!-- grug-teller:walkthrough -->\nGrug walk the diff...")
-        assert parse_grug_comment("githumps/grug", raw) is None
+        assert parse_grug_comment("quadseven/grug", raw) is None
 
 
 class TestSummaryBlockParser:
     def test_blocks_parse_with_stars_and_anchor(self):
         out = parse_summary_block_comment(
-            "githumps/grug", 598, _SUMMARY_BODY, "2026-07-12T06:00:00Z", "u",
+            "quadseven/grug", 598, _SUMMARY_BODY, "2026-07-12T06:00:00Z", "u",
         )
         assert len(out) == 2
         first, second = out

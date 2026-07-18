@@ -5,7 +5,7 @@ Q17: cold start re-signs JWT (~10ms) + re-fetches install token (~150ms).
 Acceptable for v1; revisit if cold start dominates p99.
 
 A `TokenCache` Protocol previously lived here as a hypothetical seam for
-a future `DdbTokenCache`. Removed per githumps/grug#141 — one adapter
+a future `DdbTokenCache`. Removed per quadseven/grug#141 — one adapter
 makes the Protocol speculative. Re-introduce when a second concrete
 implementation is committed to a milestone (rule-of-three; see ADR-0001).
 

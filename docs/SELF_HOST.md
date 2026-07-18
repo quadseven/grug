@@ -212,5 +212,5 @@ https://www.gnu.org/licenses/agpl-3.0.html for the full text.
 
 ## Getting help
 
-- File issues at https://github.com/githumps/grug/issues
+- File issues at https://github.com/quadseven/grug/issues
 - Hosted SaaS questions: https://grug.lol

@@ -64,7 +64,7 @@ def main() -> int:
     p = argparse.ArgumentParser()
     p.add_argument("--github-user-id", required=True, type=int,
                    help="GitHub numeric user ID (curl https://api.github.com/users/<login> | jq .id)")
-    p.add_argument("--login", required=True, help="GitHub login (e.g. githumps)")
+    p.add_argument("--login", required=True, help="GitHub login (e.g. quadseven)")
     p.add_argument("--database-url", default=os.environ.get("GRUG_DATABASE_URL", ""),
                    help="Postgres URL (defaults to $GRUG_DATABASE_URL)")
     p.add_argument("--role", default="admin", choices=["admin", "user"])

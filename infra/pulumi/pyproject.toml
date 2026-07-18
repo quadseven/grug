@@ -1,7 +1,7 @@
 [project]
 name = "grug-infra"
 version = "0.1.0"
-description = "Pulumi IaC for Grug — modular GitHub bot SaaS (PRD githumps/grug#21)"
+description = "Pulumi IaC for Grug — modular GitHub bot SaaS (PRD quadseven/grug#21)"
 requires-python = ">=3.11"
 dependencies = [
     "pulumi>=3.120.0,<4.0.0",

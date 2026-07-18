@@ -48,7 +48,7 @@ def test_post_check_run_url_and_auth():
 
 
 def test_post_check_run_never_dual_posts_a_legacy_alias():
-    """The em-dash legacy-title mirror was retired: every githumps repo's
+    """The em-dash legacy-title mirror was retired: every quadseven repo's
     required-check context is now the canonical ASCII title (infra#1829),
     so no ruleset anywhere still needs the alias. One POST per check-run,
     named exactly what the caller asked for."""

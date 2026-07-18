@@ -428,7 +428,7 @@ def migrate(dry_run: bool = True) -> None:
                 _emit({"action": "skip", "reason": "external", "repo": full_name})
                 stats["external"] += 1
 
-                is_grug_repo = full_name.lower() in ("githumps/grug",)
+                is_grug_repo = full_name.lower() in ("quadseven/grug",)
                 if is_grug_repo:
                     _emit({"action": "legacy_bp_migration_candidate", "repo": full_name})
                     if not dry_run:

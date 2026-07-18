@@ -24,7 +24,7 @@ NOW=$(date -u +%Y-%m-%dT%H:%M:%SZ)
 # Lookup: gh api /users/<login> --jq .id
 ADMINS=(
     # github_user_id|login|tier
-    "59060157|githumps|lifetime"
+    "59060157|quadseven|lifetime"
     # "<gf_id>|<gf_login>|lifetime"  # uncomment + fill in for GF
 )
 

@@ -1,4 +1,4 @@
-"""Composition root for Grug SaaS Pulumi project (PRD githumps/grug#21).
+"""Composition root for Grug SaaS Pulumi project (PRD quadseven/grug#21).
 
 Per `feedback_pulumi_export_single_source` from the user's memory:
 component factories return resources, this file alone exports stack outputs.
@@ -98,19 +98,19 @@ _poolside_api_key = aws.ssm.get_parameter(
 # triggers an image rebuild via CI on next merge/dispatch.
 _dd_extension_version = config.get("dd_extension_version") or "65"
 
-# OIDC trust for GitHub Actions deploys from githumps/grug. Per
+# OIDC trust for GitHub Actions deploys from quadseven/grug. Per
 # `feedback_prefer_ssm_over_1p` — no long-lived AWS creds in the repo.
 _deploy_role_bundle = oidc_role.create(
     name="grug-gha-deploy",
-    repo="githumps/grug",
+    repo="quadseven/grug",
     # Trust ONLY `main` (+ `v*` tags below). The SaaS conversion is past
     # cutover, so the permissive `feat/*` / `fix/*` / `hotfix/*` patterns
     # (closes #64) are retired: they let anyone who could push such a
-    # branch to githumps/grug assume the deploy role and act in the AWS
+    # branch to quadseven/grug assume the deploy role and act in the AWS
     # account. `pulumi up` only runs from `main` anyway (the deploy job is
     # gated on it), so a feature branch never legitimately needs the role.
     # (Audit #2.) Forks are already excluded — the trust is repo-scoped to
-    # githumps/grug, so this only ever governed first-party branches.
+    # quadseven/grug, so this only ever governed first-party branches.
     branches=["main"],
     # deploy.k8s runs inside the k8s-prod environment (#354). preview.yml's
     # deploy/teardown jobs run inside k8s-preview (a separate, no-branch-
@@ -120,6 +120,14 @@ _deploy_role_bundle = oidc_role.create(
     # docs/runbooks or the preview.yml fix commit for the full story).
     environments=["k8s-prod", "k8s-preview"],
     tags_pattern="v*",
+    # Account rename githumps -> quadseven (2026-07-18): GitHub's default
+    # OIDC sub now embeds immutable owner+repo IDs, so the plain
+    # `repo:quadseven/grug:...` subs above no longer match a real token.
+    # This ID-anchored twin (owner_id 59060157, repo_id 1227364190 - grug's
+    # numeric ids, which survive any future rename) is what actually matches,
+    # and keeps this stack's `pulumi up` from reverting the live emergency
+    # trust patch. Both shapes trusted; drop the name shape in a later sweep.
+    immutable_repo="quadseven@59060157/grug@1227364190",
 )
 gha_deploy_role = _deploy_role_bundle.role
 # Sleep waiter that gates KMS-using Lambda Function ops on the deploy

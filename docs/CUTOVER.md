@@ -43,7 +43,7 @@ prefix — that prefix is the legacy reusable-workflow check name).
 ### 3. Update branch protection
 
 ```bash
-REPO=githumps/<target-repo>
+REPO=quadseven/<target-repo>
 
 # Snapshot current required checks (so we can re-add them):
 gh api "repos/${REPO}/branches/main/protection/required_status_checks" \
@@ -71,11 +71,11 @@ git checkout -b chore/cutover-to-grug-app
 git rm .github/workflows/grug.pr-gate.yml
 git commit -m "chore: cut over to grug.lol GitHub App
 
-Closes the migration off the legacy githumps/grug reusable workflow.
+Closes the migration off the legacy quadseven/grug reusable workflow.
 The hosted App at grug.lol now posts the 'Grug - Chief'
 check on every PR.
 
-Per githumps/grug Slice $SLICE_NUM cutover."
+Per quadseven/grug Slice $SLICE_NUM cutover."
 git push origin chore/cutover-to-grug-app
 gh pr create --title "chore: cut over to grug.lol GitHub App" --body "..."
 ```
@@ -120,9 +120,9 @@ plus a few PRs per repo to merge.
 After all 10 consumer repos migrated:
 
 - Delete `.github/workflows/_reusable.grug-pr-gate.yml` from
-  `githumps/grug` (no consumers left)
-- Delete `.github/workflows/grug.pr-gate.yml` from `githumps/grug`
+  `quadseven/grug` (no consumers left)
+- Delete `.github/workflows/grug.pr-gate.yml` from `quadseven/grug`
   (the self-check; switches to App-posted check on grug repo too —
-  install Grug App on `githumps/grug` itself first)
-- Update branch protection on `githumps/grug` main accordingly
+  install Grug App on `quadseven/grug` itself first)
+- Update branch protection on `quadseven/grug` main accordingly
 - Close PRD #21

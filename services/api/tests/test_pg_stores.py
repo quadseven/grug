@@ -232,7 +232,7 @@ def test_claim_review_per_head_sha_win_once_and_distinct_sha(pg):
     from adapters import pg_install_store as store
 
     base = dict(
-        install_id=7, repo="githumps/grug", pr_number=12, persona="code_reviewer",
+        install_id=7, repo="quadseven/grug", pr_number=12, persona="code_reviewer",
     )
     assert store.claim_review(**base, head_sha="sha-aaa") is True
     assert store.claim_review(**base, head_sha="sha-aaa") is False  # same SHA loses
@@ -240,7 +240,7 @@ def test_claim_review_per_head_sha_win_once_and_distinct_sha(pg):
     assert store.claim_review(**base, head_sha="") is True  # fails OPEN
     # Keyed on PR too: a different PR at the same SHA is a distinct claim.
     assert store.claim_review(
-        install_id=7, repo="githumps/grug", pr_number=99,
+        install_id=7, repo="quadseven/grug", pr_number=99,
         persona="code_reviewer", head_sha="sha-aaa",
     ) is True
 
@@ -250,7 +250,7 @@ def test_claim_review_per_head_sha_win_once_and_distinct_sha(pg):
         conn.execute(
             "UPDATE grug_kv SET ttl = EXTRACT(EPOCH FROM now())::bigint - 10 "
             "WHERE pk = %s",
-            ("REVIEW#7:githumps/grug:12:code_reviewer:sha-aaa",),
+            ("REVIEW#7:quadseven/grug:12:code_reviewer:sha-aaa",),
         )
     assert store.claim_review(**base, head_sha="sha-aaa") is True
 
@@ -261,7 +261,7 @@ def test_release_review_claim_makes_failed_head_retryable(pg):
 
     claim = dict(
         install_id=7,
-        repo="githumps/grug",
+        repo="quadseven/grug",
         pr_number=12,
         persona="code_reviewer",
         head_sha="sha-retry",
@@ -277,7 +277,7 @@ def test_durable_review_claim_lease_lifecycle(pg):
 
     claim = dict(
         install_id=7,
-        repo="githumps/grug",
+        repo="quadseven/grug",
         pr_number=12,
         persona="code_reviewer",
         head_sha="snapshot-lease",
@@ -289,7 +289,7 @@ def test_durable_review_claim_lease_lifecycle(pg):
         ttl, lease_expires_at = conn.execute(
             "SELECT ttl, (data->>'lease_expires_at')::bigint FROM grug_kv "
             "WHERE pk = %s",
-            ("REVIEW#7:githumps/grug:12:code_reviewer:snapshot-lease",),
+            ("REVIEW#7:quadseven/grug:12:code_reviewer:snapshot-lease",),
         ).fetchone()
     assert ttl - lease_expires_at > 29 * 86400
     assert store.acquire_review_claim(
@@ -324,7 +324,7 @@ def test_durable_review_claim_expiry_allows_safe_takeover(pg):
 
     claim = dict(
         install_id=7,
-        repo="githumps/grug",
+        repo="quadseven/grug",
         pr_number=12,
         persona="code_reviewer",
         head_sha="snapshot-takeover",
@@ -336,7 +336,7 @@ def test_durable_review_claim_expiry_allows_safe_takeover(pg):
         conn.execute(
             "UPDATE grug_kv SET ttl = EXTRACT(EPOCH FROM now())::bigint - 10 "
             "WHERE pk = %s",
-            ("REVIEW#7:githumps/grug:12:code_reviewer:snapshot-takeover",),
+            ("REVIEW#7:quadseven/grug:12:code_reviewer:snapshot-takeover",),
         )
 
     assert store.acquire_review_claim(

@@ -25,7 +25,7 @@ def _row(
     finding: str = "synthetic finding",
 ) -> LedgerRow:
     return LedgerRow(
-        repo="githumps/grug",
+        repo="quadseven/grug",
         pr=pr,
         reviewer="codex",
         severity=severity,
@@ -169,7 +169,7 @@ def test_ingest_refreshes_exemplars_beside_practices():
     from ingest_ledger import ingest_text
 
     line = (
-        '{"ts": "t", "repo": "githumps/grug", "pr": 3, "reviewer": "codex",'
+        '{"ts": "t", "repo": "quadseven/grug", "pr": 3, "reviewer": "codex",'
         ' "severity": "HIGH", "class": "correctness",'
         ' "finding": "exemplar seed", "verdict": "fixed"}'
     )
@@ -183,8 +183,8 @@ def test_ingest_refreshes_exemplars_beside_practices():
         put_exemplars=lambda repo, e: exemplar_calls.append((repo, e)),
     )
     assert result["ingested"] == 1
-    assert practice_calls and practice_calls[0][0] == "githumps/grug"
-    assert exemplar_calls and exemplar_calls[0][0] == "githumps/grug"
+    assert practice_calls and practice_calls[0][0] == "quadseven/grug"
+    assert exemplar_calls and exemplar_calls[0][0] == "quadseven/grug"
     assert any(d.get("finding") == "exemplar seed" for d in exemplar_calls[0][1])
 
 

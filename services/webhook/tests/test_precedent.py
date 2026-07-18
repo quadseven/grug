@@ -13,7 +13,7 @@ from personas.code_reviewer.precedent import (
 
 def _row(pr, cls, verdict, *, path="services/webhook/consumer.py", finding="x", ts=""):
     return LedgerRow(
-        repo="githumps/grug", pr=pr, reviewer="claude/x", severity="HIGH",
+        repo="quadseven/grug", pr=pr, reviewer="claude/x", severity="HIGH",
         finding_class=cls, finding=finding, verdict=verdict,
         evidence=f"re-targeted {path}", ts=ts,
     )

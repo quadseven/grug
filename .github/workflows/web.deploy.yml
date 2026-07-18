@@ -210,7 +210,7 @@ jobs:
   # "wrangler succeeded but CF cache served the previous build" failure
   # mode and any URL-canon drift. Migrated to the shared reusable so the
   # curl-retry + content-assert pattern lives in one place
-  # (githumps/infra-public#24, githumps/infrastructure#840). The 30s
+  # (quadseven/infra-public#24, quadseven/infrastructure#840). The 30s
   # pre-delay covers Cloudflare Pages propagation. SHA-pinned to the
   # reusable PR branch tip; repins to the merge commit once that PR lands.
   smoke:
@@ -218,7 +218,7 @@ jobs:
     if: github.ref == 'refs/heads/main' || startsWith(github.ref, 'refs/tags/v')
     permissions:
       contents: read
-    uses: githumps/infra-public/.github/workflows/_reusable.smoke-test.yml@25bd74d115a964fdbe0b9bc035750c2cac3c2690
+    uses: quadseven/infra-public/.github/workflows/_reusable.smoke-test.yml@25bd74d115a964fdbe0b9bc035750c2cac3c2690
     with:
       retries: 3
       retry-delay: 5

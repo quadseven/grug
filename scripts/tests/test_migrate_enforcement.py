@@ -44,32 +44,32 @@ def _ddb_table(monkeypatch):
         table = ddb.Table("grug-test")
         table.put_item(Item={
             "PK": "INST#100", "SK": "META",
-            "account_login": "githumps", "account_type": "User",
+            "account_login": "quadseven", "account_type": "User",
             "installed_by_user_id": "59060157",
         })
         table.put_item(Item={
             "PK": "INST#100", "SK": "REPO#7777",
-            "tpm_enabled": True, "repo_full_name": "githumps/infra",
+            "tpm_enabled": True, "repo_full_name": "quadseven/infra",
         })
         table.put_item(Item={
             "PK": "INST#100", "SK": "REPO#8888",
-            "tpm_enabled": True, "repo_full_name": "githumps/grug",
+            "tpm_enabled": True, "repo_full_name": "quadseven/grug",
         })
         table.put_item(Item={
             "PK": "INST#100", "SK": "REPO#9999",
-            "tpm_enabled": False, "repo_full_name": "githumps/disabled-repo",
+            "tpm_enabled": False, "repo_full_name": "quadseven/disabled-repo",
         })
         yield table
 
 
 def _mock_repos():
     return [
-        {"id": 7777, "full_name": "githumps/infra", "name": "infra",
-         "owner": {"login": "githumps"}, "default_branch": "main"},
-        {"id": 8888, "full_name": "githumps/grug", "name": "grug",
-         "owner": {"login": "githumps"}, "default_branch": "main"},
-        {"id": 9999, "full_name": "githumps/disabled-repo", "name": "disabled-repo",
-         "owner": {"login": "githumps"}, "default_branch": "main"},
+        {"id": 7777, "full_name": "quadseven/infra", "name": "infra",
+         "owner": {"login": "quadseven"}, "default_branch": "main"},
+        {"id": 8888, "full_name": "quadseven/grug", "name": "grug",
+         "owner": {"login": "quadseven"}, "default_branch": "main"},
+        {"id": 9999, "full_name": "quadseven/disabled-repo", "name": "disabled-repo",
+         "owner": {"login": "quadseven"}, "default_branch": "main"},
     ]
 
 
@@ -140,7 +140,7 @@ def test_skips_already_grug_managed(_ddb_table, capsys, monkeypatch):
 
 
 def test_grug_repo_legacy_migration(_ddb_table, capsys, monkeypatch):
-    """githumps/grug with external enforcement triggers legacy BP migration."""
+    """quadseven/grug with external enforcement triggers legacy BP migration."""
     monkeypatch.setenv("GITHUB_APP_ID_SSM", "/test/app-id")
     monkeypatch.setenv("GITHUB_APP_PRIVATE_KEY_SSM", "/test/key")
 

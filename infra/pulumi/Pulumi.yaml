@@ -1,5 +1,5 @@
 name: grug
-description: Pulumi IaC for Grug — modular GitHub bot SaaS at grug.lol (PRD githumps/grug#21)
+description: Pulumi IaC for Grug — modular GitHub bot SaaS at grug.lol (PRD quadseven/grug#21)
 runtime:
   name: python
   options:
