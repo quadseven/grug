@@ -64,17 +64,29 @@ _CODE_EXECUTION_MARKERS = (
     "timeout", "overflow", "sleep", "thread",
 )
 
+# Docs-class rule markers: these rules are ABOUT prose (claim drift, stale
+# comments, typos, broken links) and legitimately anchor in markdown - they
+# are exempt from the prose kill even when their slug or message quotes
+# execution vocabulary like "timeout" (CodeRabbit on PR #710: a
+# `doc-async-claim-drift` finding must survive on a .md file).
+_DOCS_CLASS_MARKERS = (
+    "doc", "claim", "typo", "comment", "link", "readme", "changelog",
+)
+
 # Rule-slug markers for the async-blocker family (the sync_context check).
 _ASYNC_FAMILY_MARKERS = (
     "await", "async", "event-loop", "sync-io", "sync-in-async", "blocking",
 )
 
-# Code-ish tokens inside a suggestion: identifiers glued to call/attr/assign
-# syntax. Ordinary prose words never match.
+# Code-ish tokens inside a suggestion: identifiers glued to call or attr
+# syntax. Ordinary prose words never match. Bare-assign tokens (timeout=)
+# are deliberately NOT extracted (CodeRabbit on PR #710): truncating
+# `timeout=30` to `timeout=` would match an unrelated `timeout=None` and
+# false-kill; without a value-aware representation the assign form cannot
+# prove the suggested fix is present.
 _CODE_TOKEN_RE = re.compile(
     r"[A-Za-z_][A-Za-z0-9_]*\s*\("   # call:  strip(  /  to_thread(
     r"|\.[A-Za-z_][A-Za-z0-9_]*"     # attr:  .strip  /  .casefold
-    r"|[A-Za-z_][A-Za-z0-9_]*\s*="   # assign: timeout=
 )
 
 
@@ -121,6 +133,21 @@ def _suggestion_tokens(suggestion: str) -> tuple[str, ...]:
     return tuple({m.group(0).strip() for m in _CODE_TOKEN_RE.finditer(suggestion)})
 
 
+def _module_has_async(source: str) -> bool:
+    """True if the module contains ANY async construct. Cheap text probe
+    first; ast confirms (a comment mentioning 'async' must not count)."""
+    if "async" not in source and "await" not in source:
+        return False
+    try:
+        tree = ast.parse(source)
+    except SyntaxError:
+        return True  # unparseable + async-ish text: treat as async-capable
+    for node in ast.walk(tree):
+        if isinstance(node, (ast.AsyncFunctionDef, ast.Await, ast.AsyncFor, ast.AsyncWith)):
+            return True
+    return False
+
+
 def _anchor_window(source: str, line: int, radius: int = 2) -> str:
     lines = source.splitlines()
     lo = max(0, line - 1 - radius)
@@ -132,28 +159,49 @@ def _verify_one(finding: "Finding", contents: dict[str, str]) -> str | None:
     """Return a kill reason, or None to keep."""
     source = contents.get(finding.file)
 
-    # The execution claim may live in the slug OR the prose (the PR #706
-    # instance was rule `unvalidated-external-input` with "command
-    # injection" only in the message) - check both.
-    if _is_prose_file(finding.file) and (
-        _rule_matches(finding.rule_name, _CODE_EXECUTION_MARKERS)
-        or _rule_matches(finding.message, _CODE_EXECUTION_MARKERS)
+    # Prose kill. Docs-class rules (claim drift, typos, stale comments) are
+    # exempt FIRST - they legitimately anchor in markdown even when their
+    # text quotes execution vocabulary (CodeRabbit on PR #710). For the
+    # rest, the execution claim may live in the slug OR the prose (the PR
+    # #706 instance was rule `unvalidated-external-input` with "command
+    # injection" only in the message) - check both. The evidence here is
+    # the PATH itself (present by construction), so this check does not
+    # need `source`.
+    if (
+        _is_prose_file(finding.file)
+        and not _rule_matches(finding.rule_name, _DOCS_CLASS_MARKERS)
+        and (
+            _rule_matches(finding.rule_name, _CODE_EXECUTION_MARKERS)
+            or _rule_matches(finding.message, _CODE_EXECUTION_MARKERS)
+        )
     ):
         return "non_code_file"
 
     if source is None:
         return None  # no evidence either way - keep
 
-    if not _is_prose_file(finding.file) and _rule_matches(
-        finding.rule_name, _ASYNC_FAMILY_MARKERS
+    # Sync-context kill, tightened per CodeRabbit on PR #710: a lexically
+    # sync def could still block a loop if an async caller invokes it
+    # directly, so the kill additionally requires the MODULE to contain no
+    # async code at all - then nothing in-file can put the flagged line on
+    # an event loop. Cross-file async callers of a module with zero async
+    # remain a residual risk, accepted under the inconclusive-keeps bias
+    # and monitored via the false-kill scoreboard.
+    if (
+        not _is_prose_file(finding.file)
+        and _rule_matches(finding.rule_name, _ASYNC_FAMILY_MARKERS)
+        and _enclosing_chain_is_sync(source, finding.line) is True
+        and not _module_has_async(source)
     ):
-        if _enclosing_chain_is_sync(source, finding.line) is True:
-            return "sync_context"
+        return "sync_context"
 
     if finding.suggestion:
         tokens = _suggestion_tokens(finding.suggestion)
         if tokens:
-            window = _anchor_window(source, finding.line)
+            # Anchor line ONLY (radius 0, CodeRabbit on PR #710): a wider
+            # window let an unrelated neighboring `.strip()` prove the
+            # wrong claim.
+            window = _anchor_window(source, finding.line, radius=0)
             if all(t in window for t in tokens):
                 return "fix_already_present"
 

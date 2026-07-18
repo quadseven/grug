@@ -257,3 +257,79 @@ def test_order_preserved_and_mixed_verdicts():
     )
     assert kept == (alive1, alive2)
     assert [k.finding for k in killed] == [dead]
+
+
+# --- PR #710 review tightenings (CodeRabbit round 1) ----------------------
+
+
+def test_docs_class_rule_with_execution_vocabulary_survives_on_prose():
+    """A claim-drift rule quoting execution vocabulary ('timeout') must not
+    prose-kill - docs-class rules legitimately anchor in markdown."""
+    f = _finding(
+        file="docs/RUNBOOK.md",
+        line=5,
+        rule_name="doc-async-claim-drift",
+        message="the documented timeout does not match the env default",
+    )
+    kept, killed = verify_findings((f,), {"docs/RUNBOOK.md": _RUNBOOK})
+    assert kept == (f,)
+    assert killed == ()
+
+
+def test_sync_def_in_module_with_async_code_survives():
+    """A lexically-sync helper in a module that ALSO has async code could
+    be called from the loop directly - inconclusive keeps it."""
+    src = (
+        "import time\n"
+        "\n"
+        "async def handler():\n"
+        "    helper()\n"
+        "\n"
+        "def helper():\n"
+        "    time.sleep(1)\n"
+    )
+    f = _finding(
+        file="services/x.py",
+        line=7,
+        rule_name="sync-io-in-async",
+        message="blocking sleep in a helper reachable from the handler",
+    )
+    kept, killed = verify_findings((f,), {"services/x.py": src})
+    assert kept == (f,)
+    assert killed == ()
+
+
+def test_bare_assign_suggestion_token_no_longer_extracted():
+    """`timeout=30` must not truncate to `timeout=` and match an unrelated
+    `timeout=None` - assign-form tokens are not extracted at all."""
+    src = "def f():\n    call(timeout=None)\n"
+    f = _finding(
+        file="services/x.py",
+        line=2,
+        rule_name="missing-timeout-guard",
+        message="the call needs a bounded timeout",
+        suggestion="pass timeout=30 to the call",
+    )
+    kept, killed = verify_findings((f,), {"services/x.py": src})
+    assert kept == (f,)
+    assert killed == ()
+
+
+def test_fix_token_on_neighboring_line_only_does_not_kill():
+    """The already-present check reads the ANCHOR line only - a matching
+    token two lines away proves nothing about the flagged line."""
+    src = (
+        "def f(raw, other):\n"
+        "    a = other.strip()\n"
+        "    return compare(raw)\n"
+    )
+    f = _finding(
+        file="services/x.py",
+        line=3,
+        rule_name="moderate-string-comparison-failure",
+        message="raw compared unstripped",
+        suggestion="apply .strip() to raw before comparing",
+    )
+    kept, killed = verify_findings((f,), {"services/x.py": src})
+    assert kept == (f,)
+    assert killed == ()
