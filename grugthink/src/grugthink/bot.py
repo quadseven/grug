@@ -428,15 +428,7 @@ class GrugThinkBot(commands.Cog):
                 return
 
             clean_content = self._clean_mention_content(message, personality)
-            if task_relay.looks_like_task(clean_content):
-                self.log.info(
-                    "Task-shaped mention detected, relaying to Hermes",
-                    extra={"bot_id": bot_id, "user_id": message.author.id, "server_id": server_id},
-                )
-                # Launched as a background task, not awaited: relaying and
-                # watching for Hermes' reply can take many minutes, and
-                # must not block this bot from processing other messages.
-                asyncio.create_task(task_relay.relay_to_hermes(self.client, message, bot_name, clean_content))
+            if self._maybe_relay_task(message, bot_id, server_id, bot_name, clean_content):
                 return
 
             self.log.info(
@@ -608,6 +600,27 @@ class GrugThinkBot(commands.Cog):
     def detect_cross_bot_mentions_in_text(self, text: str) -> list:
         """Detect mentions of other bot names in text content."""
         return cross_bot.detect_cross_bot_mentions_in_text(text)
+
+    def _maybe_relay_task(self, message, bot_id: str, server_id: str, bot_name: str, clean_content: str) -> bool:
+        """If clean_content looks like a work request, hand it to Hermes and
+        return True (the caller should stop - this message is handled).
+        Returns False for ordinary chat/verify statements the caller should
+        keep processing normally. Split out of on_message's own branching to
+        keep that function's complexity from growing with every new relay
+        path (grug#720 Elder review, `high-complexity` finding).
+        """
+        if not task_relay.looks_like_task(clean_content):
+            return False
+
+        self.log.info(
+            "Task-shaped mention detected, relaying to Hermes",
+            extra={"bot_id": bot_id, "user_id": message.author.id, "server_id": server_id},
+        )
+        # Launched as a background task, not awaited: relaying and watching
+        # for Hermes' reply can take many minutes, and must not block this
+        # bot from processing other messages.
+        asyncio.create_task(task_relay.relay_to_hermes(self.client, message, bot_name, clean_content))
+        return True
 
     def _clean_mention_content(self, message, personality) -> str:
         """Strip the bot's name/mentions out of a message, leaving the

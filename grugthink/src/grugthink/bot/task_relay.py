@@ -263,6 +263,17 @@ async def _watch_and_relay(
             await original_message.channel.send(f"{bot_name} still wait on Hermes...")
             last_activity = time.monotonic()
             continue
+        except Exception:
+            # This runs as a detached asyncio.create_task with nothing else
+            # awaiting it - an unhandled exception here (a dropped gateway
+            # connection, discord.py internals, anything unexpected) would
+            # otherwise vanish silently, leaving the earlier "go ask Hermes,
+            # wait" ack as a promise that's never fulfilled or explained.
+            log.exception("task_relay: unexpected error while watching for Hermes' reply")
+            await original_message.channel.send(
+                f"{bot_name} lose Hermes' trail - something break. Check the thread yourself: {thread.jump_url}"
+            )
+            return
 
         got_any_reply = True
         last_activity = time.monotonic()
