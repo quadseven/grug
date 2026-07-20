@@ -98,6 +98,16 @@ spec:
             # actual span is emitted by bot/llm_clients.py's query_ollama_api.
             - {name: DD_LLMOBS_ENABLED, value: "true"}
             - {name: DD_LLMOBS_ML_APP, value: grugthink-chat}
+            # Task-relay-to-Hermes feature (bot/task_relay.py, bot/review_relay.py):
+            # fail-closed/fail-safe by design, so an empty value here means the
+            # feature stays off, not "open to everyone". Set
+            # TASK_RELAY_ALLOWED_USER_IDS to a comma-separated list of Discord
+            # user IDs before anyone can trigger a relay to Hermes at all.
+            # HERMES_BOT_USER_ID is Hermes' own Discord user (not a repo
+            # channel ID) - without it Grug will relay a request but never
+            # trust any reply as genuinely coming from Hermes.
+            - {name: TASK_RELAY_ALLOWED_USER_IDS, value: ""}
+            - {name: HERMES_BOT_USER_ID, value: ""}
           envFrom:
             # SESSION_SECRET, generated in-cluster by the deploy step.
             - secretRef: {name: grugthink-secrets}
@@ -124,6 +134,16 @@ spec:
             # the seed step ever ran, or a manually deleted Secret) must not
             # block the whole pod from starting.
             - secretRef: {name: grugthink-llm-fallback, optional: true}
+            # GRUGTHINK_GITHUB_CHECKS_TOKEN - read-only "checks:read" PAT for
+            # bot/review_relay.py to fetch the real Grug - Elder check-run
+            # result. Deliberately its own token, not Hermes' broader
+            # GH_TOKEN: this module only ever reads check-run output, never
+            # writes anything. Provisioned out-of-band from SSM
+            # /githumps/grugthink/github_checks_token, same pattern as
+            # grugthink-db above. optional:true - a missing token degrades to
+            # "Grug can't answer that yet" (fetch_elder_verdict returns None),
+            # it must not block the whole pod from starting.
+            - secretRef: {name: grugthink-github, optional: true}
           readinessProbe:
             httpGet: {path: /api/health, port: http}
             initialDelaySeconds: 15

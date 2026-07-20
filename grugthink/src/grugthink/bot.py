@@ -39,6 +39,7 @@ else:
 from . import llm  # noqa: E402  (v2 spark-gateway LLM engine)
 from .bot import (  # noqa: E402
     cross_bot,
+    review_relay,
     task_relay,
 )
 from .bot.prompts import (  # noqa: E402
@@ -429,6 +430,19 @@ class GrugThinkBot(commands.Cog):
 
             clean_content = self._clean_mention_content(message, personality)
             if task_relay.looks_like_task(clean_content):
+                pr_number = review_relay.extract_pr_number(clean_content)
+                repo = task_relay.resolve_repo(clean_content)
+                if pr_number is not None and repo is not None:
+                    # A specific PR is named - this is "what did Elder say",
+                    # not "go implement something". Read the real check-run
+                    # rather than asking Hermes to do anything.
+                    self.log.info(
+                        "Review-shaped mention detected, relaying Elder's verdict",
+                        extra={"bot_id": bot_id, "user_id": message.author.id, "server_id": server_id, "repo": repo},
+                    )
+                    asyncio.create_task(review_relay.relay_review(message, bot_name, repo, pr_number))
+                    return
+
                 self.log.info(
                     "Task-shaped mention detected, relaying to Hermes",
                     extra={"bot_id": bot_id, "user_id": message.author.id, "server_id": server_id},
