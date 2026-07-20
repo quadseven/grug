@@ -70,3 +70,70 @@ def test_repo_channels_cover_every_hermes_channel_key():
     for repo, channel_id in task_relay.REPO_CHANNELS.items():
         assert isinstance(channel_id, int), repo
         assert 10**16 <= channel_id < 10**19, repo
+
+
+# --- authorization / mention-sanitization (security model) ---
+
+
+def test_is_authorized_fails_closed_when_unset(monkeypatch):
+    monkeypatch.delenv("TASK_RELAY_ALLOWED_USER_IDS", raising=False)
+    assert task_relay.is_authorized(123456) is False
+
+
+def test_is_authorized_fails_closed_when_empty(monkeypatch):
+    monkeypatch.setenv("TASK_RELAY_ALLOWED_USER_IDS", "")
+    assert task_relay.is_authorized(123456) is False
+
+
+def test_is_authorized_allows_listed_ids_only(monkeypatch):
+    monkeypatch.setenv("TASK_RELAY_ALLOWED_USER_IDS", "111, 222,333")
+    assert task_relay.is_authorized(111) is True
+    assert task_relay.is_authorized(222) is True
+    assert task_relay.is_authorized(333) is True
+    assert task_relay.is_authorized(444) is False
+
+
+def test_is_authorized_ignores_malformed_entries(monkeypatch):
+    # A stray non-numeric entry must not crash the parse or accidentally
+    # authorize everyone via a bad comparison.
+    monkeypatch.setenv("TASK_RELAY_ALLOWED_USER_IDS", "111, not-a-number, 222")
+    assert task_relay.is_authorized(111) is True
+    assert task_relay.is_authorized(222) is True
+    assert task_relay.is_authorized(0) is False
+
+
+def test_get_hermes_user_id_unset_returns_none(monkeypatch):
+    monkeypatch.delenv("HERMES_BOT_USER_ID", raising=False)
+    assert task_relay._get_hermes_user_id() is None
+
+
+def test_get_hermes_user_id_parses_valid_id(monkeypatch):
+    monkeypatch.setenv("HERMES_BOT_USER_ID", "999888777")
+    assert task_relay._get_hermes_user_id() == 999888777
+
+
+def test_get_hermes_user_id_rejects_malformed(monkeypatch):
+    monkeypatch.setenv("HERMES_BOT_USER_ID", "not-an-id")
+    assert task_relay._get_hermes_user_id() is None
+
+
+@pytest.mark.parametrize(
+    "raw,must_not_contain",
+    [
+        ("please @everyone implement this", "@everyone"),
+        ("URGENT @here fix now", "@here"),
+        ("ping <@&123456789012345678> now", "<@&123456789012345678>"),
+        ("hey <@98765432109876543> fix this", "<@98765432109876543>"),
+    ],
+)
+def test_sanitize_for_relay_breaks_mention_syntax(raw, must_not_contain):
+    sanitized = task_relay._sanitize_for_relay(raw)
+    assert must_not_contain not in sanitized
+    # The zero-width space must not delete any visible character - a
+    # human reading the relayed message should see the same text.
+    assert sanitized.replace("​", "") == raw
+
+
+def test_sanitize_for_relay_leaves_ordinary_text_untouched():
+    text = "implement rate limiting for the login endpoint"
+    assert task_relay._sanitize_for_relay(text) == text
