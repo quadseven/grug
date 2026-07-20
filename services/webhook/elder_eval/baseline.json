@@ -4,13 +4,13 @@
       "cases_scored": 22,
       "errored_cases": [],
       "noise_rate": 0.0,
-      "overall_catch": 0.08450704225352113,
+      "overall_catch": 0.18309859154929578,
       "per_class_catch": {
-        "correctness": 0.1875,
-        "security-scope": 0.0,
-        "silent-failure": 0.0,
+        "correctness": 0.125,
+        "security-scope": 0.36363636363636365,
+        "silent-failure": 0.06666666666666667,
         "simplification": 0.0,
-        "test-gap": 0.0,
+        "test-gap": 0.25,
         "type-design": 0.0,
         "upstream-semantics": 0.42857142857142855
       },
@@ -20,5 +20,5 @@
       ]
     }
   },
-  "prompt_sha": "f7c19b7edeff69bb0fe45fd2ff37083555a5f89c0d0257df38167431df3110f4"
+  "prompt_sha": "05d158700d8629eddb40ba5b299ba0c7522efeb42ef60e16e98f759c3699653b"
 }

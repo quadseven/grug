@@ -264,6 +264,20 @@ def test_doc_code_claim_drift_rule_present():
     assert "doc-code-claim-drift" in crp.build_system_prompt()
 
 
+def test_env_file_static_delimiter_injection_rule_present():
+    """Weekly harvest 2026-07-20: appending a non-constant value to
+    $GITHUB_ENV/$GITHUB_OUTPUT with a FIXED heredoc delimiter lets an injected
+    value line close the block early and forge later-step env vars/outputs.
+    Fix is a per-write random delimiter + printf (infra #1884, #1885)."""
+    rule = next(
+        (r for r in crp.RULES if r.name == "env-file-static-delimiter-injection"),
+        None,
+    )
+    assert rule is not None, "env-file-static-delimiter-injection missing from RULES"
+    assert rule.bug_class == "security"
+    assert "env-file-static-delimiter-injection" in crp.build_system_prompt()
+
+
 def test_voice_has_mandatory_bookend_structure():
     """#343: the voice instruction mandates the structural bookends that
     keep the caveman cadence from slipping to plain English under technical

@@ -484,6 +484,29 @@ RULES: tuple[ReviewRule, ...] = (
         "return min(base, 3)",
         severity="medium",
     ),
+    # ── CI env-file injection (harvest 2026-07-20: infra #1884, #1885) ──
+    ReviewRule(
+        name="env-file-static-delimiter-injection",
+        bug_class="security",
+        description="A CI step appends a NON-CONSTANT value (an input, secret, "
+        "path, or command output) to $GITHUB_ENV or $GITHUB_OUTPUT using a "
+        "FIXED heredoc delimiter (NAME<<EOF ... EOF) or a bare NAME=$value for "
+        "a possibly-multiline value. A value line equal to the delimiter, or "
+        "containing a newline, closes the block early and forges arbitrary "
+        "later-step env vars or step outputs -- a privilege-escalation vector. "
+        "Flag any append to $GITHUB_ENV or $GITHUB_OUTPUT of a non-literal "
+        "value that uses a constant delimiter, and echo (not printf) for the "
+        "value line, since a value beginning -n or -e is eaten as an echo "
+        "flag. Fix: a per-write random delimiter (openssl rand / /dev/urandom) "
+        "with printf. Do NOT flag a write of a compile-time-constant literal.",
+        bad_example='echo "KUBECONFIG<<EOF" >> "$GITHUB_ENV"\n'
+        'echo "$KCFG" >> "$GITHUB_ENV"\n'
+        'echo "EOF"  >> "$GITHUB_ENV"',
+        good_example='d="KCFG_$(openssl rand -hex 16)"\n'
+        '{ printf "KUBECONFIG<<%s\\n" "$d"; printf "%s\\n" "$KCFG"; '
+        'printf "%s\\n" "$d"; } >> "$GITHUB_ENV"',
+        severity="high",
+    ),
 )
 
 
