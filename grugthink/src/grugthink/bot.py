@@ -37,7 +37,10 @@ else:
 # cross_bot can be imported normally as it doesn't have decorator issues
 # from .bot import commands as bot_commands  # Imported lazily in __init__
 from . import llm  # noqa: E402  (v2 spark-gateway LLM engine)
-from .bot import cross_bot  # noqa: E402
+from .bot import (  # noqa: E402
+    cross_bot,
+    task_relay,
+)
 from .bot.prompts import (  # noqa: E402
     get_personality_engine,
     is_rate_limited,
@@ -424,6 +427,18 @@ class GrugThinkBot(commands.Cog):
                     await message.channel.send("Please wait a moment.", delete_after=5)
                 return
 
+            clean_content = self._clean_mention_content(message, personality)
+            if task_relay.looks_like_task(clean_content):
+                self.log.info(
+                    "Task-shaped mention detected, relaying to Hermes",
+                    extra={"bot_id": bot_id, "user_id": message.author.id, "server_id": server_id},
+                )
+                # Launched as a background task, not awaited: relaying and
+                # watching for Hermes' reply can take many minutes, and
+                # must not block this bot from processing other messages.
+                asyncio.create_task(task_relay.relay_to_hermes(self.client, message, bot_name, clean_content))
+                return
+
             self.log.info(
                 "Processing bot mention",
                 extra={
@@ -594,6 +609,23 @@ class GrugThinkBot(commands.Cog):
         """Detect mentions of other bot names in text content."""
         return cross_bot.detect_cross_bot_mentions_in_text(text)
 
+    def _clean_mention_content(self, message, personality) -> str:
+        """Strip the bot's name/mentions out of a message, leaving the
+        actual statement or request. Shared by handle_auto_verification and
+        the task-relay classification check in on_message so the two paths
+        agree on what the user actually said.
+        """
+        clean_content = clean_statement(message.content)
+
+        bot_name = personality.chosen_name or personality.name
+        clean_content = re.sub(rf"\b{re.escape(bot_name.lower())}\b", "", clean_content, flags=re.IGNORECASE)
+
+        if self.client.user:
+            clean_content = clean_content.replace(f"<@{self.client.user.id}>", "")
+            clean_content = clean_content.replace(f"<@!{self.client.user.id}>", "")
+
+        return re.sub(r"\s+", " ", clean_content).strip()
+
     async def handle_auto_verification(self, message, server_id: str, personality, mentioned_bots=None):
         """Handle automatic verification when bot name is mentioned."""
         bot_id = self.get_bot_id()
@@ -640,23 +672,8 @@ class GrugThinkBot(commands.Cog):
             "Cleaning message content",
             extra={"bot_id": bot_id, "original_content": message.content, "content_length": len(message.content)},
         )
-        clean_content = clean_statement(message.content)
-
-        # Remove bot name mentions to get the actual statement
         bot_name = personality.chosen_name or personality.name
-        self.log.debug(
-            "Removing bot name mentions",
-            extra={"bot_id": bot_id, "bot_name": bot_name, "content_before": clean_content},
-        )
-        clean_content = re.sub(rf"\b{re.escape(bot_name.lower())}\b", "", clean_content, flags=re.IGNORECASE)
-
-        # Remove @mentions
-        if self.client.user:
-            clean_content = clean_content.replace(f"<@{self.client.user.id}>", "")
-            clean_content = clean_content.replace(f"<@!{self.client.user.id}>", "")
-
-        # Clean up extra whitespace
-        clean_content = re.sub(r"\s+", " ", clean_content).strip()
+        clean_content = self._clean_mention_content(message, personality)
 
         self.log.debug(
             "Content cleaning complete",
