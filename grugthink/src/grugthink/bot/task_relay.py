@@ -7,11 +7,31 @@ statement, Grug posts it into the repo channel Hermes already monitors,
 waits, and relays Hermes' own milestone messages back into the original
 conversation in character. Grug never touches git or the GitHub API
 itself - it is strictly a front door onto an engine that already works.
+
+SECURITY MODEL - this relay sits in front of an agent (Hermes) with real
+GH_TOKEN write access, so it is a confused-deputy risk by construction:
+anyone who can get a message to Grug could otherwise get Hermes to act on
+their behalf with Grug's own channel-send privilege standing in for them.
+Three things close that gap:
+
+- ``is_authorized`` gates every relay on ``TASK_RELAY_ALLOWED_USER_IDS``,
+  fail-closed (unset/empty = nobody authorized, not "everyone"). Only
+  Discord users Evan explicitly lists can trigger a relay at all.
+- ``_sanitize_for_relay`` strips @everyone/@here/role-mention syntax out
+  of the relayed request before it reaches a channel Grug can post
+  broadly in, so an authorized-but-malicious (or just careless) request
+  can't mass-ping the server through Grug's own send permission.
+- ``_watch_and_relay`` only treats a reply as "from Hermes" if it matches
+  ``HERMES_BOT_USER_ID`` specifically, fail-safe (unset = don't
+  relay-watch at all). Matching "any bot" would let any other bot in the
+  guild impersonate Hermes' reply and have Grug faithfully repeat it as
+  if it were real.
 """
 
 from __future__ import annotations
 
 import asyncio
+import os
 import re
 import time
 from typing import Optional
@@ -21,6 +41,18 @@ import discord
 from ..logging_config import get_logger
 
 log = get_logger(__name__)
+
+# Discord user IDs allowed to trigger a Hermes relay, comma-separated.
+# Fail-closed: unset or empty means nobody is authorized. This is a new
+# capability that indirectly grants repo-write access via Hermes, so the
+# safe default is "off until Evan configures it", not "on for anyone who
+# can talk to Grug".
+_ALLOWED_USERS_ENV_VAR = "TASK_RELAY_ALLOWED_USER_IDS"
+
+# The specific Discord user ID of Hermes' own bot account. Required for
+# _watch_and_relay to trust a reply as genuinely from Hermes - see the
+# module docstring's SECURITY MODEL section.
+_HERMES_USER_ID_ENV_VAR = "HERMES_BOT_USER_ID"
 
 # Mirrors infra's production/oke/manifests/hermes-discord/configmap.yaml
 # discord.free_response_channels (guild 781626163591249930, category
@@ -80,6 +112,41 @@ def looks_like_task(clean_content: str) -> bool:
     return bool(_TASK_PATTERN.search(clean_content))
 
 
+def _parse_id_list(raw: Optional[str]) -> frozenset[int]:
+    if not raw:
+        return frozenset()
+    ids = set()
+    for part in raw.split(","):
+        part = part.strip()
+        if part.isdigit():
+            ids.add(int(part))
+    return frozenset(ids)
+
+
+def is_authorized(user_id: int) -> bool:
+    """Fail-closed check: only IDs listed in TASK_RELAY_ALLOWED_USER_IDS
+    may trigger a relay to Hermes. See the module docstring."""
+    allowed = _parse_id_list(os.environ.get(_ALLOWED_USERS_ENV_VAR))
+    return user_id in allowed
+
+
+def _get_hermes_user_id() -> Optional[int]:
+    raw = os.environ.get(_HERMES_USER_ID_ENV_VAR)
+    return int(raw) if raw and raw.isdigit() else None
+
+
+_MENTION_PATTERN = re.compile(r"@everyone|@here|<@&?!?\d+>")
+
+
+def _sanitize_for_relay(text: str) -> str:
+    """Neutralize @everyone/@here/role/user mention syntax before it's
+    embedded in a message Grug sends into a channel it can broadly post
+    in - a zero-width space breaks Discord's mention parser without
+    changing how the text reads. Same technique grug's own Teller
+    persona uses for the same reason (render.py)."""
+    return _MENTION_PATTERN.sub(lambda m: m.group(0)[0] + "​" + m.group(0)[1:], text)
+
+
 def resolve_repo(clean_content: str) -> Optional[str]:
     """Find a known repo name mentioned in the request.
 
@@ -104,6 +171,14 @@ async def relay_to_hermes(
     ``asyncio.create_task`` from ``on_message`` - it polls for up to
     ``MAX_WAIT_S`` and must not block the caller.
     """
+    if not is_authorized(original_message.author.id):
+        log.warning(
+            "task_relay: relay attempt from unauthorized user",
+            extra={"user_id": original_message.author.id, "user_name": str(original_message.author)},
+        )
+        await original_message.channel.send(f"{bot_name} no know you well enough for that. Ask Evan to add you first.")
+        return
+
     repo = resolve_repo(clean_content)
     if repo is None:
         await original_message.channel.send(
@@ -124,7 +199,7 @@ async def relay_to_hermes(
         return
 
     requester = original_message.author.display_name or original_message.author.name
-    relay_content = f"Grug bring word from {requester}: {clean_content}"
+    relay_content = f"Grug bring word from {requester}: {_sanitize_for_relay(clean_content)}"
 
     try:
         relay_message = await channel.send(relay_content)
@@ -148,13 +223,27 @@ async def _watch_and_relay(
     """Relay each message Hermes posts in the relay thread back to the
     original conversation, in character, until Hermes goes quiet for
     ``QUIET_DONE_S`` after at least one reply, or ``MAX_WAIT_S`` elapses.
+
+    Fail-safe: if HERMES_BOT_USER_ID isn't configured, this does not
+    watch at all - relaying an unverified bot's message as if it came
+    from Hermes would let anything else in the guild impersonate Hermes'
+    reply. Grug still posts the ack in relay_to_hermes either way; the
+    human can check the relay thread directly in that case.
     """
+    hermes_id = _get_hermes_user_id()
+    if hermes_id is None:
+        log.warning("task_relay: HERMES_BOT_USER_ID not configured - not watching for a reply")
+        await original_message.channel.send(
+            f"{bot_name} no know which grug is Hermes yet - check the thread yourself: {thread.jump_url}"
+        )
+        return
+
     deadline = time.monotonic() + MAX_WAIT_S
     got_any_reply = False
     last_activity = time.monotonic()
 
     def is_hermes(m: discord.Message) -> bool:
-        return m.author.bot and m.author != client.user
+        return m.author.id == hermes_id
 
     while time.monotonic() < deadline:
         quiet_budget = QUIET_DONE_S if got_any_reply else HEARTBEAT_INTERVAL_S
