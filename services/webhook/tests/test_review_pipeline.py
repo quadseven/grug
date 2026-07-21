@@ -81,3 +81,55 @@ def test_many_small_files_are_bounded_by_path_count() -> None:
     plan = plan_review(hunks, max_cohort_chars=100, max_cohort_paths=2)
 
     assert [len(cohort.paths) for cohort in plan.cohorts] == [2, 2, 1]
+
+
+def test_foundational_contracts_are_ordered_before_consumers_and_tests() -> None:
+    plan = plan_review(
+        [
+            _Hunk("tests/test_user.py", "t" * 60),
+            _Hunk("src/user_service.py", "i" * 60),
+            _Hunk("schemas/user.py", "s" * 60),
+        ],
+        max_cohort_chars=70,
+    )
+
+    assert [cohort.label for cohort in plan.cohorts] == [
+        "schemas",
+        "src",
+        "tests",
+    ]
+    assert [cohort.layers for cohort in plan.cohorts] == [
+        ("contract",),
+        ("implementation",),
+        ("verification",),
+    ]
+
+
+def test_reviewability_reports_oversized_hunk_and_cross_cohort_module() -> None:
+    plan = plan_review(
+        [
+            _Hunk("src/tangled.py", "a" * 120),
+            _Hunk("src/tangled.py", "b" * 80),
+        ],
+        max_cohort_chars=100,
+    )
+
+    assert {concern.kind for concern in plan.concerns} == {
+        "oversized-hunk",
+        "cross-cohort-module",
+    }
+    cross = next(c for c in plan.concerns if c.kind == "cross-cohort-module")
+    assert cross.paths == ("src/tangled.py",)
+
+
+def test_review_map_exposes_layers_and_reviewability_without_diff_content() -> None:
+    plan = plan_review(
+        [_Hunk("src/tangled.py", "SECRET" * 30)],
+        max_cohort_chars=100,
+    )
+
+    rendered = render_review_map(plan)
+
+    assert "layers: implementation" in rendered
+    assert "Reviewability warning" in rendered
+    assert "SECRET" not in rendered

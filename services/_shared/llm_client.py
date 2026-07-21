@@ -43,7 +43,7 @@ import time
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, field, replace
 from enum import Enum
-from typing import Any, Callable, Literal, Optional, TypedDict, cast, get_args
+from typing import Any, Callable, Literal, Optional, Sequence, TypedDict, cast, get_args
 
 import httpx
 
@@ -54,6 +54,8 @@ from review_pipeline import (
     DEFAULT_MAX_COHORT_CHARS,
     DEFAULT_MAX_COHORT_PATHS,
     ReviewCohort,
+    ReviewCoverage,
+    ReviewPlan,
     plan_review,
     render_review_map,
 )
@@ -345,6 +347,31 @@ class FindingOrigin:
     backend: Backend
     model: str
     review_span_context: Optional[dict] = field(default=None, compare=False)
+    cohort_index: int | None = None
+    cohort_count: int | None = None
+    evidence_paths: tuple[str, ...] = ()
+    head_sha: str = ""
+
+
+def _finding_origin(
+    *,
+    backend: Backend,
+    model: str,
+    review_span_context: Optional[dict],
+    pr_context: Optional[PrContext],
+    hunks: Sequence[Hunk],
+) -> FindingOrigin:
+    """Attach the immutable review scope that produced one candidate."""
+    context = pr_context or {}
+    return FindingOrigin(
+        backend=backend,
+        model=model,
+        review_span_context=review_span_context,
+        cohort_index=context.get("cohort_index"),
+        cohort_count=context.get("cohort_count"),
+        evidence_paths=tuple(dict.fromkeys(hunk.path for hunk in hunks)),
+        head_sha=context.get("head_sha", ""),
+    )
 
 
 @dataclass(frozen=True, slots=True)
@@ -448,6 +475,7 @@ class LlmReviewResponse:
     # compatibility with historical callers and old persisted records.
     backends_used: tuple[Backend, ...] = field(default_factory=tuple)
     models_used: tuple[str, ...] = field(default_factory=tuple)
+    coverage: ReviewCoverage | None = None
 
 
 # Test hook — replaced with a no-op in unit tests to avoid real sleeps.
@@ -1854,6 +1882,7 @@ def _merge_cohort_responses(
     responses: list[LlmReviewResponse],
     installation_id: int,
     pr_context: Optional[PrContext],
+    plan: ReviewPlan,
 ) -> LlmReviewResponse:
     """Reduce independent cohort results into Elder's existing response type."""
     successful: list[_SuccessfulReview] = []
@@ -1872,6 +1901,13 @@ def _merge_cohort_responses(
             ))
         else:
             failed_indexes.append(index)
+    coverage = ReviewCoverage(
+        total_cohorts=len(plan.cohorts),
+        completed_cohorts=len(responses) - len(failed_indexes),
+        failed_cohorts=tuple(failed_indexes),
+        cohort_labels=tuple(cohort.label for cohort in plan.cohorts),
+        concerns=plan.concerns,
+    )
 
     if successful:
         first = successful[0]
@@ -1908,6 +1944,7 @@ def _merge_cohort_responses(
                 f"partial review: cohorts {failed_indexes} failed"
                 if failed_indexes else ""
             ),
+            coverage=coverage,
         )
 
     parse_failed = next(
@@ -1915,13 +1952,14 @@ def _merge_cohort_responses(
         None,
     )
     if parse_failed is not None:
-        return parse_failed
+        return replace(parse_failed, coverage=coverage)
     errors = "; ".join(
         response.error for response in responses if response.error
     )
     return LlmReviewResponse(
         kind="all_failed",
         error=errors or "all review cohorts failed",
+        coverage=coverage,
     )
 
 
@@ -2110,7 +2148,7 @@ def review_reasoner_diff(
         reserve_seconds=_review_llm_timeout_s(),
         cancel_event=cancel_event,
     )
-    return _merge_cohort_responses(responses, installation_id, pr_context)
+    return _merge_cohort_responses(responses, installation_id, pr_context, plan)
 
 
 def _review_reasoner_diff_once(
@@ -2149,10 +2187,12 @@ def _review_reasoner_diff_once(
     )
     if outcome.kind == "success":
         assert outcome.model is not None
-        origin = FindingOrigin(
+        origin = _finding_origin(
             backend=Backend.CAVE_REASONER,
             model=outcome.model,
             review_span_context=outcome.span_context,
+            pr_context=pr_context,
+            hunks=hunks,
         )
         return LlmReviewResponse(
             kind="reviewed",
@@ -2289,7 +2329,7 @@ def review_diff(
         ),
         cancel_event=cancel_event,
     )
-    return _merge_cohort_responses(responses, installation_id, pr_context)
+    return _merge_cohort_responses(responses, installation_id, pr_context, plan)
 
 
 @dataclass
@@ -2765,10 +2805,12 @@ def _review_diff_dispatch(
             # kinds leave it None.
             assert outcome.model is not None
             resolved_model = outcome.model
-            origin = FindingOrigin(
+            origin = _finding_origin(
                 backend=backend,
                 model=resolved_model,
                 review_span_context=outcome.span_context,
+                pr_context=pr_context,
+                hunks=hunks,
             )
             successes.append(_SuccessfulReview(
                 backend=backend,
@@ -2894,8 +2936,12 @@ def _review_diff_dispatch(
                     "llm_saas_overload_fallback_used",
                     extra={"backend": backend.value, "installation_id": installation_id},
                 )
-                origin = FindingOrigin(
-                    backend=backend, model=resolved_model, review_span_context=span_context,
+                origin = _finding_origin(
+                    backend=backend,
+                    model=resolved_model,
+                    review_span_context=span_context,
+                    pr_context=pr_context,
+                    hunks=hunks,
                 )
                 return LlmReviewResponse(
                     kind="reviewed",

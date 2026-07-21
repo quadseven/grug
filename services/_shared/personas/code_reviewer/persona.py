@@ -30,6 +30,7 @@ from github_checks_client import CheckConclusion
 from llm_client import FindingOrigin, LlmReviewResponse
 from personas.code_reviewer.diff_parser import DiffHunk
 from review_types import Effort, Severity  # single source (#250)
+from review_pipeline import ReviewCoverage
 
 # A finding at one of these severities flips the aggregate verdict.
 # Medium + low remain advisory: reported in the check-run summary but
@@ -164,6 +165,7 @@ class CodeReviewEvaluation:
     conclusion: CheckConclusion
     dropped_hallucinations: int = 0
     degraded_reason: str | None = None
+    coverage: ReviewCoverage | None = None
 
     @property
     def passed(self) -> bool:
@@ -194,6 +196,7 @@ def with_extra_findings(
         conclusion=conclusion,
         dropped_hallucinations=evaluation.dropped_hallucinations,
         degraded_reason=evaluation.degraded_reason,
+        coverage=evaluation.coverage,
     )
 
 
@@ -217,6 +220,7 @@ def with_findings(
         conclusion=conclusion,
         dropped_hallucinations=evaluation.dropped_hallucinations,
         degraded_reason=evaluation.degraded_reason,
+        coverage=evaluation.coverage,
     )
 
 
@@ -247,6 +251,7 @@ def evaluate_diff(
             findings=(),
             conclusion="neutral",
             degraded_reason=llm_response.kind,
+            coverage=llm_response.coverage,
         )
 
     line_index = _hunk_line_index(hunks)
@@ -300,4 +305,5 @@ def evaluate_diff(
             if llm_response.error.startswith("partial review:")
             else None
         ),
+        coverage=llm_response.coverage,
     )

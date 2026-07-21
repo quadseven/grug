@@ -29,15 +29,17 @@ Large Elder reviews use a map-review-reduce pipeline.
 
 `review_pipeline.plan_review` is a pure, model-independent planner. Diffs at or
 below `GRUG_REVIEW_COHORT_CHARS` remain one cohort. Larger diffs are grouped by
-top-level repository area and packed to the configured character budget. An
+repository area, ordered into contract, implementation, verification, and
+documentation layers, then packed to the configured character budget. An
 oversized individual hunk is kept intact in its own cohort metadata, but is not
 sent to a model: splitting it would corrupt line anchors and sending it would
 break the prompt bound. Elder reports that cohort as failed and partial (or
 fully degraded when it is the only cohort). Elder never silently truncates a
 hunk.
 
-The planner renders a compact REVIEW MAP listing every cohort and its changed
-paths. It contains no diff bodies. The prompt treats the map and PR intent as
+The planner renders a compact REVIEW MAP listing every cohort, dependency
+layer, changed path, and structural reviewability concern. It contains no diff
+bodies. The prompt treats the map and PR intent as
 untrusted data and tells each reviewer to report findings only on its current
 diff.
 
@@ -93,6 +95,18 @@ Duplicate `(path, line, rule)` findings merge exactly as multi-model findings
 already did: strongest severity wins, useful remediation fields survive, and
 all producer span origins remain attached.
 
+The reduced response now also carries structured coverage: total, completed,
+and failed cohort indexes, cohort labels, and reviewability concerns. Each
+finding origin records its model, bounded evidence paths, cohort coordinates,
+and immutable head SHA. GitHub comments expose this in a collapsed provenance
+section; the check summary reports exact coverage rather than only a generic
+partial warning.
+
+Reviewability concerns are separate from model capacity. Elder flags an
+indivisible oversized hunk or a module that spans multiple bounded units as a
+proof/maintainability risk. It does not call a cohesive change bad merely for
+being large.
+
 If one cohort fails but another returns a valid review, successful findings are
 kept and the response carries a partial-review error. Validated findings still
 publish, while the GitHub check is explicitly marked partial and forced
@@ -116,8 +130,9 @@ deduplication, check-run publication, and reaction learning.
 - The hot reasoner spends its context proving or refuting concrete candidates,
   instead of repeating code discovery over unrelated files.
 - Small PR behavior, API shape, scoring, and publication remain compatible.
-- Bakeoffs can now compare cohort and role behavior instead of only an
-  all-or-nothing monolithic pass.
+- `elder_eval --production` now compares the shipped staged discovery path
+  instead of only a monolithic backend prompt. It refuses to score partial
+  coverage as misses or as a clean zero.
 - Every candidate model, including Nemotron, gets a more representative test:
   bounded review cohorts rather than a trivial smoke or a maximum-size prompt.
 
@@ -137,8 +152,9 @@ deduplication, check-run publication, and reaction learning.
 
 - Feed a trusted, snapshot-scoped Teller summary into the REVIEW MAP without
   adding a second summarization call or a hidden SaaS dependency.
-- Extend `elder_eval` reporting with cohort count, partial coverage, per-cohort
-  latency, and role-specific model scores.
+- Extend `elder_eval` reporting with per-cohort latency and final
+  post-adjudication precision; the first production mode covers staged
+  discovery and exact completeness, not GitHub publication.
 - Add dependency-graph clustering so related source and test files can share a
   cohort even when they live under different top-level directories.
 - Re-run the 22-PR real corpus against the staged endpoint before changing the

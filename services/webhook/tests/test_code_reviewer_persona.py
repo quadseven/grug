@@ -13,6 +13,7 @@ from personas.code_reviewer.persona import (
     Finding,
     evaluate_diff,
 )
+from review_pipeline import ReviewCoverage
 
 
 _DIFF = """diff --git a/src/x.py b/src/x.py
@@ -510,12 +511,19 @@ def test_partial_review_keeps_valid_findings_and_marks_coverage_degraded() -> No
         findings=(_llm_finding(line=2),),
         backend_used=Backend.POOLSIDE,
         error="partial review: cohorts [2] failed",
+        coverage=ReviewCoverage(
+            total_cohorts=2,
+            completed_cohorts=1,
+            failed_cohorts=(2,),
+            cohort_labels=("src", "tests"),
+        ),
     )
 
     out = evaluate_diff(hunks, llm)
 
     assert len(out.findings) == 1
     assert out.degraded_reason == "partial_review"
+    assert out.coverage == llm.coverage
 
 
 def test_diff_hunk_rejects_missing_at_at_in_body() -> None:

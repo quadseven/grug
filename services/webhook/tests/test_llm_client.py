@@ -180,6 +180,11 @@ def test_large_review_keeps_success_when_one_cohort_is_unparseable(monkeypatch) 
     assert out.kind == "reviewed"
     assert [finding.rule for finding in out.findings] == ["test-bug"]
     assert out.error == "partial review: cohorts [1] failed"
+    assert out.coverage is not None
+    assert out.coverage.total_cohorts == 2
+    assert out.coverage.completed_cohorts == 1
+    assert out.coverage.failed_cohorts == (1,)
+    assert out.coverage.complete is False
 
 
 def test_staged_scheduler_runs_one_cohort_at_a_time() -> None:

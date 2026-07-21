@@ -43,7 +43,7 @@ from .gate import (
     load_baseline,
     merge_baseline,
 )
-from .runner import run_eval
+from .runner import run_eval, run_production_eval
 from .scoring import EvalReport, compare_to_baseline, score, to_baseline_dict
 
 _REPO_ROOT = Path(__file__).resolve().parents[3]
@@ -109,6 +109,11 @@ def main(argv: list[str] | None = None) -> int:
     )
     parser.add_argument("--backend", help="run only this configured backend")
     parser.add_argument(
+        "--production",
+        action="store_true",
+        help="replay through shipped staged review_diff instead of one monolithic bench prompt",
+    )
+    parser.add_argument(
         "--ab-practices",
         action="store_true",
         help="also replay WITH the #527 practices block and print the delta",
@@ -140,33 +145,41 @@ def main(argv: list[str] | None = None) -> int:
         print("corpus has no scorable cases - nothing to eval", file=sys.stderr)
         return 2
 
-    from sast_benchmark.backends import configured_backends
-
-    backends = [
-        b for b in configured_backends()
-        if not args.backend or b.name == args.backend
-    ]
-    if not backends:
-        print(
-            "No bench backend configured/matched. Set GRUG_BENCH_"
-            "{OPENROUTER,POOLSIDE}_KEY and/or GRUG_BENCH_CAVE_URL+MODEL.",
-            file=sys.stderr,
-        )
-        return 2
-    backend = backends[0]
-    skipped_backends = [b.name for b in backends[1:]]
-    if skipped_backends:
-        print(
-            f"running backend {backend.name!r}; skipping configured "
-            f"{', '.join(skipped_backends)} (use --backend to select)"
-        )
     token = os.getenv("GITHUB_TOKEN", "")
+    if args.production:
+        if args.backend or args.ab_practices or args.ab_few_shot:
+            parser.error("--production cannot be combined with backend or prompt A/B modes")
+        backend = None
+        backend_name = "production-staged"
+        replays = run_production_eval(cases, token=token)
+    else:
+        from sast_benchmark.backends import configured_backends
+
+        backends = [
+            b for b in configured_backends()
+            if not args.backend or b.name == args.backend
+        ]
+        if not backends:
+            print(
+                "No bench backend configured/matched. Set GRUG_BENCH_"
+                "{OPENROUTER,POOLSIDE}_KEY and/or GRUG_BENCH_CAVE_URL+MODEL.",
+                file=sys.stderr,
+            )
+            return 2
+        backend = backends[0]
+        backend_name = backend.name
+        skipped_backends = [b.name for b in backends[1:]]
+        if skipped_backends:
+            print(
+                f"running backend {backend.name!r}; skipping configured "
+                f"{', '.join(skipped_backends)} (use --backend to select)"
+            )
+        replays = run_eval(backend, cases, token=token)
 
     # Score over ALL cases: unscorable ones contribute their excluded-row
     # tallies to the report without being replayed or read as errored.
-    replays = run_eval(backend, cases, token=token)
     report = score(all_cases, replays)
-    _print_report(backend.name, report)
+    _print_report(backend_name, report)
 
     if report.all_errored:
         print(
@@ -189,6 +202,7 @@ def main(argv: list[str] | None = None) -> int:
             "skipping ON arm (delta would be A/A noise)"
         )
     if block:
+        assert backend is not None
         _run_ab_arm(
             backend, all_cases, cases, token, report,
             label="practices (#527)", block=block, kwarg="team_practices",
@@ -210,6 +224,7 @@ def main(argv: list[str] | None = None) -> int:
             "A/A noise)"
         )
     if examples:
+        assert backend is not None
         _run_ab_arm(
             backend, all_cases, cases, token, report,
             label="few-shot (#538)", block=examples, kwarg="few_shot",
@@ -230,7 +245,7 @@ def main(argv: list[str] | None = None) -> int:
             )
             return 3
         fresh = to_baseline_dict(
-            report, prompt_sha=compute_prompt_sha(), backend=backend.name
+            report, prompt_sha=compute_prompt_sha(), backend=backend_name
         )
         if BASELINE_PATH.exists():
             fresh, dropped = merge_baseline(load_baseline(), fresh)
@@ -250,9 +265,9 @@ def main(argv: list[str] | None = None) -> int:
                   file=sys.stderr)
             return 2
         baseline = load_baseline()
-        backend_baseline = baseline.get("backends", {}).get(backend.name)
+        backend_baseline = baseline.get("backends", {}).get(backend_name)
         if backend_baseline is None:
-            print(f"baseline has no entry for backend {backend.name!r}",
+            print(f"baseline has no entry for backend {backend_name!r}",
                   file=sys.stderr)
             return 2
         regressions = compare_to_baseline(report, backend_baseline)

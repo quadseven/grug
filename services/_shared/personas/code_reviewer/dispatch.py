@@ -504,6 +504,26 @@ def _summary_markdown(
         if suppressed_count
         else ""
     )
+    if evaluation.coverage is not None:
+        coverage = evaluation.coverage
+        failed = (
+            f"; failed: {', '.join(str(index) for index in coverage.failed_cohorts)}"
+            if coverage.failed_cohorts else ""
+        )
+        held += (
+            f"\n\nCoverage: {coverage.completed_cohorts}/{coverage.total_cohorts} "
+            f"cohorts completed{failed}."
+        )
+        if coverage.concerns:
+            held += "\n\n**Reviewability**"
+            for concern in coverage.concerns:
+                paths = ", ".join(
+                    f"`{_md_code_span(path)}`" for path in concern.paths[:6]
+                )
+                held += (
+                    f"\n- `{_md_code_span(concern.kind)}`: "
+                    f"{_defused(concern.message)} Paths: {paths}"
+                )
     if excluded_paths:
         # Paths are author-controlled: strip backticks so a crafted filename
         # cannot break out of the inline code span into the summary markdown.
@@ -841,6 +861,38 @@ def _agent_prompt_block(f: Finding) -> str:
     return _details_block("Prompt for AI agents", "\n".join(content))
 
 
+def _provenance_block(f: Finding) -> str:
+    """Render bounded, immutable discovery scope for a finding."""
+    if not f.origins:
+        return ""
+    lines: list[str] = []
+    seen: set[tuple] = set()
+    for origin in f.origins:
+        key = (
+            origin.backend,
+            origin.model,
+            origin.cohort_index,
+            origin.cohort_count,
+            origin.evidence_paths,
+            origin.head_sha,
+        )
+        if key in seen:
+            continue
+        seen.add(key)
+        scope = ""
+        if origin.cohort_index is not None and origin.cohort_count is not None:
+            scope = f"; cohort {origin.cohort_index}/{origin.cohort_count}"
+        sha = f"; head `{_md_code_span(origin.head_sha[:12])}`" if origin.head_sha else ""
+        paths = ", ".join(
+            f"`{_md_code_span(path)}`" for path in origin.evidence_paths[:8]
+        )
+        path_note = f"; evidence paths: {paths}" if paths else ""
+        lines.append(
+            f"- `{_md_code_span(origin.model)}` ({origin.backend.value}){scope}{sha}{path_note}"
+        )
+    return _details_block("Evidence and provenance", "\n".join(lines))
+
+
 def _inline_comment_body(f: Finding, precedent_note: str = "") -> str:
     """Format one finding as a structured Marking (#553 / #617 / Markings v2).
 
@@ -909,6 +961,9 @@ def _inline_comment_body(f: Finding, precedent_note: str = "") -> str:
         )
     else:
         body = head
+    provenance = _provenance_block(f)
+    if provenance:
+        body += f"\n\n{provenance}"
     return f"{body}\n\n{_agent_prompt_block(f)}\n\n{rule_marker(f.rule_name)}"
 
 
