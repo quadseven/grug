@@ -4,7 +4,9 @@ from __future__ import annotations
 import asyncio
 from unittest.mock import patch
 
-import grugthink.llm as llm
+import pytest
+
+from src.grugthink import llm
 
 
 class _AsyncResp:
@@ -26,6 +28,16 @@ class _AsyncClient:
         _AsyncClient.last_url = url
         _AsyncClient.last_body = json
         return _AsyncResp()
+
+
+class _EmptyAsyncResp(_AsyncResp):
+    def json(self):
+        return {"choices": [{"message": {"content": ""}}]}
+
+
+class _EmptyAsyncClient(_AsyncClient):
+    async def post(self, url, json=None):
+        return _EmptyAsyncResp()
 
 
 class _EmbedResp:
@@ -55,6 +67,18 @@ def test_chat_hits_openai_endpoint_and_returns_text(monkeypatch):
     assert out == "Grug say hi."
     assert _AsyncClient.last_url.endswith("/v1/chat/completions")
     assert _AsyncClient.last_body["stream"] is False
+
+
+def test_chat_uses_small_conversation_model_by_default(monkeypatch):
+    monkeypatch.delenv("GRUGTHINK_LLM_MODEL", raising=False)
+
+    assert llm.chat_model() == "nemotron-3-nano:30b-a3b-q4_K_M"
+
+
+def test_chat_rejects_success_response_with_no_visible_content():
+    with patch("httpx.AsyncClient", lambda *a, **k: _EmptyAsyncClient()):
+        with pytest.raises(llm.LLMError, match="empty content"):
+            asyncio.run(llm.chat([{"role": "user", "content": "hi"}]))
 
 
 def test_embed_single_and_batch(monkeypatch):

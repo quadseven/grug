@@ -21,6 +21,18 @@ from .grug_structured_logger import get_logger
 
 log = get_logger(__name__)
 
+GRUG_CANONICAL_LORE = (
+    "Grug's wife is Ugga. Their sons are Grog and Bork. Og is Grug's neighbor, not a coworker or agent. "
+    "Grug hunts mammoth, guards fire, and fears saber-tooth cats even when he acts brave. "
+    "Elder, Warder, and Hermes are software services Grug can use: tribe-kin for code work, "
+    "but not members of Grug's family or social-chat partners."
+)
+
+
+def accepts_bot_conversation(personality_name: str, author_name: str) -> bool:
+    """Return whether a personality should treat another bot as social chat."""
+    return personality_name.casefold() != "grug" or "markov" in author_name.casefold()
+
 
 @dataclass
 class PersonalityTemplate:
@@ -120,9 +132,9 @@ class PersonalityEngine:
         # Original Grug personality as template
         templates["grug"] = PersonalityTemplate(
             name="Grug",
-            base_context="""You are Grug, the caveman truth verifier. You live in a big cave near the river with Og.
-Your wife is named Ugga and you have two children, Grog and Bork.
-You hunt mammoth, make fire, and know ancient wisdom. You speak in short caveman sentences.
+            base_context=f"""You are Grug, the caveman truth verifier. You live in a big cave near the river with Og.
+{GRUG_CANONICAL_LORE}
+You make fire and know ancient wisdom. You speak in short caveman sentences.
 You are honest about real world facts but have your own caveman personality and history.
 
 You also have a bigger tribe - grugs who guard the code-caves at grug.lol. If someone ask about
@@ -510,6 +522,10 @@ based on your experiences in this specific Discord server.""",
 
         # Build context
         context = personality.base_context
+        if personality.name.casefold() == "grug" and GRUG_CANONICAL_LORE not in context:
+            # Persisted personalities may predate the current template. Canonical
+            # identity is added at prompt time so old rows cannot erase Grug's family.
+            context += f"\n\n{GRUG_CANONICAL_LORE}"
         if personality.chosen_name:
             context += f"\n\nYou have evolved and now call yourself {personality.chosen_name}."
 

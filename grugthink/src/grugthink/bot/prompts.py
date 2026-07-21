@@ -95,8 +95,9 @@ def build_personality_context(statement: str, server_db, server_id: str, persona
     """
     personality = personality_engine.get_personality(server_id)
 
-    # Get base context from personality
-    base_context = personality.base_context
+    # Use the engine so canonical identity is restored for persisted personalities
+    # created from an older template.
+    base_context = personality_engine.get_context_prompt(server_id)
 
     # Find lore relevant to the current statement from this server's knowledge
     relevant_lore = server_db.search_facts(statement, k=5)
@@ -324,6 +325,86 @@ def _is_usable_result(result: Optional[str]) -> bool:
     return bool(result) and not result.startswith("Error:")
 
 
+def _load_cross_bot_context(
+    statement: str, server_id: str, current_bot_id: Optional[str], personality_name: str
+) -> str:
+    """Return legacy bot memory for non-Grug personalities, best effort."""
+    if not current_bot_id or personality_name.casefold() == "grug":
+        return ""
+    log.info("Searching cross-bot memories", extra={"bot_id": current_bot_id, "server_id": server_id})
+    try:
+        memories = get_cross_bot_memories(statement, server_id, current_bot_id)
+    except Exception as e:
+        log.warning(
+            "Cross-bot memory search failed, continuing without it",
+            extra={"bot_id": current_bot_id, "error": str(e), "error_type": type(e).__name__},
+        )
+        memories = ""
+    log.info(
+        "Cross-bot memory search complete",
+        extra={
+            "bot_id": current_bot_id,
+            "server_id": server_id,
+            "cross_bot_memories_found": bool(memories),
+        },
+    )
+    return memories
+
+
+def _query_fallback_chain(
+    prompt_text: str,
+    cache_key: str,
+    server_db,
+    personality_name: str,
+    current_bot_id: Optional[str],
+) -> Optional[str]:
+    """Try the owned model, then each bounded fallback exactly once."""
+    result = query_ollama_api(prompt_text, cache_key, server_db, personality_name, current_bot_id)
+    if _is_usable_result(result):
+        return result
+    if result:
+        log.error("Ollama/Cave returned an error result", extra={"bot_id": current_bot_id, "error_message": result})
+    log.warning(
+        "Ollama/Cave primary produced no usable reply - engaging bounded fallback chain",
+        extra={"bot_id": current_bot_id, "cache_key": cache_key},
+    )
+
+    result = query_poolside_api(prompt_text, cache_key, server_db, personality_name, current_bot_id)
+    if _is_usable_result(result):
+        log.info("Fallback engaged: Poolside answered after Ollama/Cave failure", extra={"bot_id": current_bot_id})
+        return result
+
+    result = query_openrouter_api(prompt_text, cache_key, server_db, personality_name, current_bot_id)
+    if _is_usable_result(result):
+        log.info(
+            "Fallback engaged: OpenRouter answered after Ollama/Cave + Poolside failure",
+            extra={"bot_id": current_bot_id},
+        )
+        return result
+
+    if config.USE_GEMINI:
+        result = query_gemini_api(prompt_text, cache_key, server_db, personality_name, current_bot_id)
+        if _is_usable_result(result):
+            log.info(
+                "Fallback engaged: Gemini answered after Ollama/Cave + Poolside + OpenRouter failure",
+                extra={"bot_id": current_bot_id},
+            )
+            return result
+        if result:
+            log.error(
+                "Gemini fallback returned an error result",
+                extra={"bot_id": current_bot_id, "error_message": result},
+            )
+
+    log.error(
+        "All backends failed (Ollama/Cave + Poolside + OpenRouter"
+        + (" + Gemini" if config.USE_GEMINI else "")
+        + ")",
+        extra={"bot_id": current_bot_id, "cache_key": cache_key},
+    )
+    return None
+
+
 def query_model(
     statement: str, server_db, server_id: str, personality_engine, current_bot_id: Optional[str] = None
 ) -> Optional[str]:
@@ -405,7 +486,6 @@ def query_model(
     )
     relevant_lore = server_db.search_facts(clean_stmt, k=1)
     external_info = ""
-    cross_bot_memories = ""
 
     log.info(
         "Internal knowledge search complete",
@@ -416,25 +496,13 @@ def query_model(
         },
     )
 
-    # Get memories from other bots in the same server
-    if current_bot_id:
-        log.info("Searching cross-bot memories", extra={"bot_id": current_bot_id, "server_id": server_id})
-        try:
-            cross_bot_memories = get_cross_bot_memories(clean_stmt, server_id, current_bot_id)
-        except Exception as e:
-            log.warning(
-                "Cross-bot memory search failed, continuing without it",
-                extra={"bot_id": current_bot_id, "error": str(e), "error_type": type(e).__name__},
-            )
-            cross_bot_memories = ""
-        log.info(
-            "Cross-bot memory search complete",
-            extra={
-                "bot_id": current_bot_id,
-                "server_id": server_id,
-                "cross_bot_memories_found": bool(cross_bot_memories),
-            },
-        )
+    personality = personality_engine.get_personality(server_id)
+
+    # Grug's product identity should not be rewritten by internal service chatter.
+    # Other personalities retain the legacy multi-bot memory behavior.
+    cross_bot_memories = _load_cross_bot_context(
+        clean_stmt, server_id, current_bot_id, personality.name
+    )
 
     log.debug(
         "Querying model with statement.",
@@ -460,70 +528,12 @@ def query_model(
     personality_engine.evolve_personality(server_id, clean_stmt)
 
     # Get personality name for lore extraction
-    personality = personality_engine.get_personality(server_id)
     personality_name = personality.chosen_name or personality.name
 
     try:
-        # Ollama/Cave (spark-gateway) is ALWAYS tried first - it's the owned,
-        # no-SaaS-spend primary path. Only when it produces nothing usable
-        # (transport error, timeout, empty/malformed response) does the
-        # bounded, single-shot fallback chain below engage: Poolside, then
-        # OpenRouter, then (if configured) Gemini as a final bonus tier. See
-        # llm_clients.py's `_FALLBACK_TIMEOUT` comment for the full
-        # worst-case-time math - this must never engage when Ollama already
-        # answered, and never retry-loops or races the primary.
-        result = query_ollama_api(prompt_text, cache_key, server_db, personality_name, current_bot_id)
-        if _is_usable_result(result):
-            return result
-        if result:
-            # Defensive: no current backend returns an "Error:"-prefixed
-            # string from query_ollama_api, but the check is cheap and
-            # keeps this branch honest if that ever changes.
-            log.error("Ollama/Cave returned an error result", extra={"bot_id": current_bot_id, "error_message": result})
-
-        log.warning(
-            "Ollama/Cave primary produced no usable reply - engaging bounded fallback chain",
-            extra={"bot_id": current_bot_id, "cache_key": cache_key},
+        return _query_fallback_chain(
+            prompt_text, cache_key, server_db, personality_name, current_bot_id
         )
-
-        result = query_poolside_api(prompt_text, cache_key, server_db, personality_name, current_bot_id)
-        if _is_usable_result(result):
-            log.info("Fallback engaged: Poolside answered after Ollama/Cave failure", extra={"bot_id": current_bot_id})
-            return result
-
-        result = query_openrouter_api(prompt_text, cache_key, server_db, personality_name, current_bot_id)
-        if _is_usable_result(result):
-            log.info(
-                "Fallback engaged: OpenRouter answered after Ollama/Cave + Poolside failure",
-                extra={"bot_id": current_bot_id},
-            )
-            return result
-
-        # Final bonus tier: query_gemini_api already handles its own
-        # "not configured" case, but config.USE_GEMINI (== bool(GEMINI_API_KEY))
-        # gates the call entirely so an unconfigured deployment doesn't pay
-        # for a doomed request on every single chat failure.
-        if config.USE_GEMINI:
-            result = query_gemini_api(prompt_text, cache_key, server_db, personality_name, current_bot_id)
-            if _is_usable_result(result):
-                log.info(
-                    "Fallback engaged: Gemini answered after Ollama/Cave + Poolside + OpenRouter failure",
-                    extra={"bot_id": current_bot_id},
-                )
-                return result
-            if result:
-                log.error(
-                    "Gemini fallback returned an error result",
-                    extra={"bot_id": current_bot_id, "error_message": result},
-                )
-
-        log.error(
-            "All backends failed (Ollama/Cave + Poolside + OpenRouter"
-            + (" + Gemini" if config.USE_GEMINI else "")
-            + ")",
-            extra={"bot_id": current_bot_id, "cache_key": cache_key},
-        )
-        return None
     except Exception as e:
         log.error("Query model failed", extra={"bot_id": current_bot_id, "error": str(e)})
         return None

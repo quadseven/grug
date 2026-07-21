@@ -11,4 +11,4 @@ To resolve the import conflict, GrugThinkBot must be imported via grugthink pack
 # Note: Submodules are NOT imported here to avoid early initialization of Discord commands
 # Import them explicitly when needed: from grugthink.bot import commands
 
-__all__ = ["commands", "cross_bot", "llm_clients", "lore", "prompts", "utils"]
+__all__ = ["commands", "cross_bot", "llm_clients", "lore", "prompts", "task_relay", "utils"]
