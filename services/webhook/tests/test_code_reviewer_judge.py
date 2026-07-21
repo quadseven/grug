@@ -601,7 +601,7 @@ def test_grade_findings_uses_owned_reasoner_then_redacted_fallback(monkeypatch):
     )
 
     assert len(verdicts) == 1
-    assert calls[0]["config"].model == "qwen3.5:122b"
+    assert calls[0]["config"].model == "poolside/Laguna-S-2.1-NVFP4"
     assert calls[0]["redact"] is False
     assert calls[1]["config"] is None
     assert calls[1]["redact"] is True

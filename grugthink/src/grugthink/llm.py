@@ -13,7 +13,7 @@ Unauthenticated in-cluster.
 Config (env):
   SPARK_GATEWAY_URL / GRUGTHINK_LLM_URL - gateway base URL. Falls back to the
     first OLLAMA_URLS entry, then the in-cluster default.
-  GRUGTHINK_LLM_MODEL   - chat model (default Nemotron-3-Nano).
+  GRUGTHINK_LLM_MODEL   - chat model (default Laguna S 2.1).
   GRUGTHINK_EMBED_MODEL - embedding model (default nomic-embed-text:v1.5).
   GRUGTHINK_LLM_TIMEOUT - per-request seconds (default 60).
 """
@@ -44,9 +44,9 @@ def base_url() -> str:
 
 
 def chat_model() -> str:
-    # Keep the conversational front door small and fast. Coding and review
-    # work is relayed to Hermes/Elder and uses their task-specific models.
-    return os.getenv("GRUGTHINK_LLM_MODEL", "nemotron-3-nano:30b-a3b-q4_K_M")
+    # Shared fleet default. Realtime chat disables long-form thinking in
+    # chat(), while coding and review keep their task-specific settings.
+    return os.getenv("GRUGTHINK_LLM_MODEL", "poolside/Laguna-S-2.1-NVFP4")
 
 
 def embed_model() -> str:
@@ -76,12 +76,17 @@ async def chat(
         "messages": list(messages),
         "stream": False,
         "temperature": temperature,
+        "chat_template_kwargs": {"enable_thinking": False},
     }
     if max_tokens:
         body["max_tokens"] = max_tokens
     try:
         async with httpx.AsyncClient(timeout=_timeout()) as client:
-            resp = await client.post(f"{base_url()}/v1/chat/completions", json=body)
+            resp = await client.post(
+                f"{base_url()}/v1/chat/completions",
+                json=body,
+                headers={"X-Spark-Priority": "realtime", "X-Spark-Caller": "grugthink-v2-chat"},
+            )
             resp.raise_for_status()
             content = resp.json()["choices"][0]["message"]["content"]
             if not isinstance(content, str) or not content.strip():

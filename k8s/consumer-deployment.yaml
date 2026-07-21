@@ -162,14 +162,14 @@ spec:
             # permanently hot reasoner adjudicates bounded candidate packets;
             # cloud fallback receives redacted evidence only.
             - {name: GRUG_CAVE_GATEWAY_URL, value: http://spark-gateway.spark-gateway.svc:8080}
-            - {name: GRUG_CAVE_JUDGE_MODEL, value: qwen3.5:122b}
+            - {name: GRUG_CAVE_JUDGE_MODEL, value: poolside/Laguna-S-2.1-NVFP4}
             # Review ensemble arms (#593). Coder = qwen3-coder-next on sparkles;
             # reasoner = qwen3.5, permanently resident on sparkicus ollama (the
             # nemotron vLLM was retired 2026-07-12 - pointing at it made every
             # Elder review cold-load 87GB on a Spark and time out). Tags are
             # PINNED: a bare :latest resolves to a tag the Sparks don't carry.
             - {name: GRUG_CAVE_REVIEW_MODEL, value: qwen3-coder-next:q8_0}
-            - {name: GRUG_CAVE_REASONER_MODEL, value: qwen3.5:122b}
+            - {name: GRUG_CAVE_REASONER_MODEL, value: poolside/Laguna-S-2.1-NVFP4}
             # Omen production-signal fusion (#470). All three fail-open:
             # absent params/mapping = zero DD calls = today's review.
             - {name: GRUG_DD_API_KEY_SSM, value: /grug/dd-api-key}

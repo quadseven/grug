@@ -24,9 +24,10 @@ class _AsyncClient:
     async def __aexit__(self, *a):
         return False
 
-    async def post(self, url, json=None):
+    async def post(self, url, json=None, headers=None):
         _AsyncClient.last_url = url
         _AsyncClient.last_body = json
+        _AsyncClient.last_headers = headers
         return _AsyncResp()
 
 
@@ -36,7 +37,7 @@ class _EmptyAsyncResp(_AsyncResp):
 
 
 class _EmptyAsyncClient(_AsyncClient):
-    async def post(self, url, json=None):
+    async def post(self, url, json=None, headers=None):
         return _EmptyAsyncResp()
 
 
@@ -67,12 +68,14 @@ def test_chat_hits_openai_endpoint_and_returns_text(monkeypatch):
     assert out == "Grug say hi."
     assert _AsyncClient.last_url.endswith("/v1/chat/completions")
     assert _AsyncClient.last_body["stream"] is False
+    assert _AsyncClient.last_body["chat_template_kwargs"] == {"enable_thinking": False}
+    assert _AsyncClient.last_headers["X-Spark-Priority"] == "realtime"
 
 
 def test_chat_uses_small_conversation_model_by_default(monkeypatch):
     monkeypatch.delenv("GRUGTHINK_LLM_MODEL", raising=False)
 
-    assert llm.chat_model() == "nemotron-3-nano:30b-a3b-q4_K_M"
+    assert llm.chat_model() == "poolside/Laguna-S-2.1-NVFP4"
 
 
 def test_chat_rejects_success_response_with_no_visible_content():

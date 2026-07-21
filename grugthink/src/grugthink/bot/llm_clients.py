@@ -15,6 +15,7 @@ This module handles communication with different LLM backends:
   chain; this module just provides the per-backend calls).
 """
 
+import os
 import time
 from typing import Any
 
@@ -115,6 +116,7 @@ def query_ollama_api(
 
     for idx, url in enumerate(config.OLLAMA_URLS):
         raw_model = config.OLLAMA_MODELS[idx] if idx < len(config.OLLAMA_MODELS) else config.OLLAMA_MODELS[0]
+        openai_compatible = os.getenv("GRUGTHINK_LLM_API", "ollama").lower() == "openai"
         span_tags = {"bot_id": str(bot_id or ""), "personality": str(personality_name or "")}
         start_ns = time.monotonic_ns()
         with _llmobs_llm(model_name=raw_model, model_provider="ollama", name=_LLMOBS_NAME) as span:
@@ -154,9 +156,25 @@ def query_ollama_api(
                 # "python (ip)" UA guess. Harmless if OLLAMA_URLS ever points
                 # straight at a Spark instead - Ollama ignores unknown headers.
                 headers = {"X-Spark-Priority": "realtime", "X-Spark-Caller": "grugthink-chat"}
-                r = session.post(f"{url}/api/generate", json=payload, headers=headers, timeout=(10, 60))
+                endpoint = f"{url}/api/generate"
+                if openai_compatible:
+                    endpoint = f"{url}/v1/chat/completions"
+                    payload = {
+                        "model": raw_model,
+                        "messages": [{"role": "user", "content": prompt_text}],
+                        "stream": False,
+                        "temperature": 0.5,
+                        "top_p": 0.7,
+                        "max_tokens": 150,
+                        "chat_template_kwargs": {"enable_thinking": False},
+                    }
+                r = session.post(endpoint, json=payload, headers=headers, timeout=(10, 60))
                 if r.status_code == 200:
-                    response = r.json().get("response", "").strip()
+                    response_body = r.json()
+                    if openai_compatible:
+                        response = response_body["choices"][0]["message"]["content"].strip()
+                    else:
+                        response = response_body.get("response", "").strip()
                     log.info(
                         "Ollama API response received",
                         extra={
