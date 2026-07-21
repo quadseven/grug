@@ -31,7 +31,7 @@ from elder_eval.scoring import (
     to_baseline_dict,
 )
 from ledger import LedgerRow
-from llm_client import Backend, Finding, LlmReviewResponse
+from llm_client import Backend, Finding, FindingJudgement, LlmReviewResponse
 from review_pipeline import ReviewCoverage
 
 
@@ -584,6 +584,52 @@ def test_production_case_refuses_to_score_partial_coverage():
 
     assert replay.errored is True
     assert replay.emitted == {}
+
+
+def test_production_case_can_score_post_judge_published_findings():
+    from elder_eval.runner import run_production_case
+
+    (case,) = build_cases([_row(32, "correctness")])
+    diff = (
+        "diff --git a/src/a.py b/src/a.py\n--- a/src/a.py\n+++ b/src/a.py\n"
+        "@@ -1 +1 @@\n-old\n+new\n"
+    )
+
+    def review(_hunks, **_kwargs):
+        return LlmReviewResponse(
+            kind="reviewed",
+            findings=(
+                Finding(
+                    path="src/a.py",
+                    line=1,
+                    rule="correctness",
+                    severity="medium",
+                    message="looks wrong",
+                ),
+            ),
+        )
+
+    def grade(evaluation, _hunks, _installation_id, **_kwargs):
+        assert evaluation.findings[0].rule_name == "correctness"
+        return (
+            FindingJudgement(
+                finding_index=0,
+                is_real_bug=False,
+                reasoning="contradicted by evidence",
+                confidence=0.95,
+            ),
+        )
+
+    replay = run_production_case(
+        case,
+        diff,
+        review=review,
+        published=True,
+        grade=grade,
+    )
+
+    assert replay.emitted == {}
+    assert replay.errored is False
 
 
 # --- the CI gate: prompt changes require a re-recorded baseline --------------

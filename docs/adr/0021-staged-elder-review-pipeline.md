@@ -130,9 +130,16 @@ deduplication, check-run publication, and reaction learning.
 - The hot reasoner spends its context proving or refuting concrete candidates,
   instead of repeating code discovery over unrelated files.
 - Small PR behavior, API shape, scoring, and publication remain compatible.
-- `elder_eval --production` now compares the shipped staged discovery path
-  instead of only a monolithic backend prompt. It refuses to score partial
-  coverage as misses or as a clean zero.
+- `elder_eval --production` compares the shipped staged discovery path instead
+  of only a monolithic backend prompt. `--production --published` separately
+  scores findings surviving anchor validation, judge suppression, diff-only
+  verification, and the high-severity refute gate. Full-file-dependent verifier
+  rules remain inconclusive until the follow-up below. Both modes refuse to
+  score partial coverage as misses or as a clean zero.
+- Conventionally matched implementation and test files share one semantic
+  cohort when they fit. When that proof unit exceeds its bound, review coverage
+  carries a `cross-cohort-proof` concern asking authors to split the change or
+  reduce coupling.
 - Every candidate model, including Nemotron, gets a more representative test:
   bounded review cohorts rather than a trivial smoke or a maximum-size prompt.
 
@@ -152,11 +159,10 @@ deduplication, check-run publication, and reaction learning.
 
 - Feed a trusted, snapshot-scoped Teller summary into the REVIEW MAP without
   adding a second summarization call or a hidden SaaS dependency.
-- Extend `elder_eval` reporting with per-cohort latency and final
-  post-adjudication precision; the first production mode covers staged
-  discovery and exact completeness, not GitHub publication.
-- Add dependency-graph clustering so related source and test files can share a
-  cohort even when they live under different top-level directories.
+- Extend `elder_eval` reporting with per-cohort latency and fetch immutable
+  full-file snapshots so its repository verification matches dispatch exactly.
+- Replace filename-based implementation/test pairing with dependency-graph and
+  symbol clustering for relationships that naming conventions cannot express.
 - Re-run the 22-PR real corpus against the staged endpoint before changing the
   production discovery-model assignment. Report discovery catch rate and final
   post-adjudication precision separately.

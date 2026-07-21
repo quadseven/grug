@@ -27,6 +27,7 @@ from code_review_prompt import RULES
 # runner must follow (measuring the shipped prompt is the whole point).
 from llm_client import (
     Finding,
+    FindingJudgement,
     Hunk,
     LlmReviewResponse,
     _build_messages,
@@ -34,6 +35,17 @@ from llm_client import (
     review_diff,
 )
 from personas.code_reviewer.diff_parser import parse_diff
+from personas.code_reviewer.judge import (
+    grade_findings,
+    partition_findings,
+    partition_refuted,
+    refute_findings,
+)
+from personas.code_reviewer.persona import (
+    Finding as PublishedFinding,
+    evaluate_diff,
+)
+from personas.code_reviewer.verify import verify_findings
 from sast_benchmark.backends import BenchBackend
 from sast_benchmark.runner import _post
 
@@ -58,16 +70,63 @@ if len(_RULE_TO_CLASS) != len(RULES):
     raise ValueError("duplicate ReviewRule.name in RULES")
 
 
-def classes_for_findings(findings: Iterable[Finding]) -> dict[str, int]:
+def classes_for_findings(
+    findings: Iterable[Finding | PublishedFinding],
+) -> dict[str, int]:
     """ELDER-normalized class -> finding count. A rule outside the RULES
     table (the model improvised a name) falls back to its own normalized
     name - it can never match an expected cell, so it only widens the
     noise denominator honestly."""
     out: dict[str, int] = {}
     for f in findings:
-        cls = _RULE_TO_CLASS.get(f.rule, normalize_class(f.rule))
+        rule = f.rule if isinstance(f, Finding) else f.rule_name
+        cls = _RULE_TO_CLASS.get(rule, normalize_class(rule))
         out[cls] = out.get(cls, 0) + 1
     return out
+
+
+def _published_findings(
+    response: LlmReviewResponse,
+    hunks,
+    pr_context,
+    *,
+    grade: Callable[..., tuple[FindingJudgement, ...]] = grade_findings,
+    refute: Callable[..., tuple[FindingJudgement, ...]] = refute_findings,
+) -> tuple[PublishedFinding, ...]:
+    """Replay publication gates available from the corpus diff alone.
+
+    Full-file-dependent verifier rules remain inconclusive until the evaluator
+    fetches immutable head contents; the judge and refute gates still receive
+    the exact scoped diff evidence used by this replay.
+    """
+    diff_hunks = tuple(hunks)
+    evaluation = evaluate_diff(diff_hunks, response)
+    verdicts = grade(
+        evaluation,
+        diff_hunks,
+        0,
+        pr_context=pr_context,
+        file_contents={},
+        cross_file_contents={},
+        runtime_context=None,
+    )
+    kept, _ = partition_findings(evaluation.findings, verdicts)
+    verified, _ = verify_findings(kept, {})
+    high = tuple(
+        finding for finding in verified if finding.severity in ("high", "critical")
+    )
+    refuted_verdicts = refute(
+        high,
+        diff_hunks,
+        0,
+        pr_context=pr_context,
+        file_contents={},
+        cross_file_contents={},
+        runtime_context=None,
+    )
+    _, refuted = partition_refuted(high, refuted_verdicts)
+    refuted_ids = {id(finding) for finding in refuted}
+    return tuple(finding for finding in verified if id(finding) not in refuted_ids)
 
 
 def diff_to_hunks(diff_text: str) -> list[Hunk]:
@@ -167,6 +226,9 @@ def run_production_case(
     diff_text: str,
     *,
     review: Callable[..., LlmReviewResponse] = review_diff,
+    published: bool = False,
+    grade: Callable[..., tuple[FindingJudgement, ...]] = grade_findings,
+    refute: Callable[..., tuple[FindingJudgement, ...]] = refute_findings,
 ) -> CaseReplay:
     """Replay one case through production's staged discovery path.
 
@@ -177,17 +239,19 @@ def run_production_case(
     a complete baseline.
     """
     try:
-        hunks = diff_to_hunks(diff_text)
-        if not hunks:
+        diff_hunks = parse_diff(diff_text)
+        hunks = [Hunk(path=hunk.file_path, body=hunk.body) for hunk in diff_hunks]
+        if not diff_hunks:
             return CaseReplay(case_id=case.case_id, emitted={}, errored=True)
+        pr_context = {
+            "repo": case.repo,
+            "pr_number": case.pr,
+            "review_phase": "eval-production",
+        }
         response = review(
             hunks,
             installation_id=0,
-            pr_context={
-                "repo": case.repo,
-                "pr_number": case.pr,
-                "review_phase": "eval-production",
-            },
+            pr_context=pr_context,
         )
     except Exception as e:  # noqa: BLE001 - one case must not abort the sweep
         log.warning(
@@ -208,9 +272,18 @@ def run_production_case(
             response.error,
         )
         return CaseReplay(case_id=case.case_id, emitted={}, errored=True)
+    findings: Iterable[Finding | PublishedFinding] = response.findings
+    if published:
+        findings = _published_findings(
+            response,
+            diff_hunks,
+            pr_context,
+            grade=grade,
+            refute=refute,
+        )
     return CaseReplay(
         case_id=case.case_id,
-        emitted=classes_for_findings(response.findings),
+        emitted=classes_for_findings(findings),
         errored=False,
     )
 
@@ -221,6 +294,7 @@ def run_production_eval(
     fetch: Callable[[str, int, str], str] = fetch_pr_diff,
     token: str = "",
     review: Callable[..., LlmReviewResponse] = review_diff,
+    published: bool = False,
 ) -> dict[str, CaseReplay]:
     """Replay the corpus through the shipped staged discovery pipeline."""
     replays: dict[str, CaseReplay] = {}
@@ -239,7 +313,9 @@ def run_production_eval(
                 errored=True,
             )
             continue
-        replays[case.case_id] = run_production_case(case, diff, review=review)
+        replays[case.case_id] = run_production_case(
+            case, diff, review=review, published=published
+        )
     return replays
 
 

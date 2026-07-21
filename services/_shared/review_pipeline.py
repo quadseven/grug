@@ -126,6 +126,18 @@ def _area(path: str) -> str:
     return parts[0] if len(parts) > 1 else "repository root"
 
 
+def _semantic_stem(path: str) -> str:
+    """Normalize common test filenames to the implementation they verify."""
+    stem = PurePosixPath(path.lower()).stem
+    for prefix in ("test_", "spec_"):
+        if stem.startswith(prefix):
+            stem = stem[len(prefix) :]
+    for suffix in ("_test", "_spec", ".test", ".spec"):
+        if stem.endswith(suffix):
+            stem = stem[: -len(suffix)]
+    return stem
+
+
 def _layer(path: str) -> str:
     """Classify a changed path into a dependency-oriented review layer."""
     lowered = path.lower()
@@ -167,10 +179,9 @@ def _cohort(
     )
 
 
-def _reviewability_concerns(
+def _oversized_hunk_concern(
     cohorts: Sequence[ReviewCohort], hunks: Sequence[ReviewHunk], max_cohort_chars: int
-) -> tuple[ReviewabilityConcern, ...]:
-    concerns: list[ReviewabilityConcern] = []
+) -> ReviewabilityConcern | None:
     oversized_paths = tuple(
         dict.fromkeys(
             hunks[index].path
@@ -182,45 +193,111 @@ def _reviewability_concerns(
     )
     # Use each cohort's own oversized bit instead of raw PR size. This calls
     # out an indivisible proof burden, not a merely large cohesive change.
-    if any(cohort.oversized for cohort in cohorts):
-        paths = oversized_paths or tuple(
-            dict.fromkeys(
-                path for cohort in cohorts if cohort.oversized for path in cohort.paths
-            )
+    if not any(cohort.oversized for cohort in cohorts):
+        return None
+    paths = oversized_paths or tuple(
+        dict.fromkeys(
+            path for cohort in cohorts if cohort.oversized for path in cohort.paths
         )
-        concerns.append(
-            ReviewabilityConcern(
-                kind="oversized-hunk",
-                message="One diff hunk exceeds a bounded review unit and cannot be independently verified.",
-                paths=paths,
-            )
-        )
+    )
+    return ReviewabilityConcern(
+        kind="oversized-hunk",
+        message="One diff hunk exceeds a bounded review unit and cannot be independently verified.",
+        paths=paths,
+    )
 
+
+def _cross_cohort_module_concern(
+    cohorts: Sequence[ReviewCohort],
+) -> ReviewabilityConcern | None:
     memberships: dict[str, int] = {}
     for cohort in cohorts:
         for path in cohort.paths:
             memberships[path] = memberships.get(path, 0) + 1
     crossing = tuple(path for path, count in memberships.items() if count > 1)
-    if crossing:
-        concerns.append(
-            ReviewabilityConcern(
-                kind="cross-cohort-module",
-                message=(
-                    "A module spans multiple bounded review units; consider separating responsibilities "
-                    "or splitting the change so its contracts can be verified once."
-                ),
-                paths=crossing,
+    if not crossing:
+        return None
+    return ReviewabilityConcern(
+        kind="cross-cohort-module",
+        message=(
+            "A module spans multiple bounded review units; consider separating responsibilities "
+            "or splitting the change so its contracts can be verified once."
+        ),
+        paths=crossing,
+    )
+
+
+def _cross_cohort_proof_concerns(
+    cohorts: Sequence[ReviewCohort],
+) -> tuple[ReviewabilityConcern, ...]:
+    split_units: OrderedDict[str, list[ReviewCohort]] = OrderedDict()
+    for cohort in cohorts:
+        marker = " (part "
+        if marker in cohort.label:
+            split_units.setdefault(cohort.label.partition(marker)[0], []).append(cohort)
+    concerns: list[ReviewabilityConcern] = []
+    for parts in split_units.values():
+        layers = {layer for cohort in parts for layer in cohort.layers}
+        if {"implementation", "verification"}.issubset(layers):
+            concerns.append(
+                ReviewabilityConcern(
+                    kind="cross-cohort-proof",
+                    message=(
+                        "Related implementation and verification changes do not fit in one "
+                        "bounded proof unit; split the pull request or reduce coupling so "
+                        "behavior and its evidence can be reviewed together."
+                    ),
+                    paths=tuple(
+                        dict.fromkeys(
+                            path for cohort in parts for path in cohort.paths
+                        )
+                    ),
+                )
             )
-        )
     return tuple(concerns)
 
 
+def _reviewability_concerns(
+    cohorts: Sequence[ReviewCohort], hunks: Sequence[ReviewHunk], max_cohort_chars: int
+) -> tuple[ReviewabilityConcern, ...]:
+    concerns = [
+        concern
+        for concern in (
+            _oversized_hunk_concern(cohorts, hunks, max_cohort_chars),
+            _cross_cohort_module_concern(cohorts),
+        )
+        if concern is not None
+    ]
+    return (*concerns, *_cross_cohort_proof_concerns(cohorts))
+
+
 def _ordered_areas(hunks: Sequence[ReviewHunk]) -> list[tuple[str, list[int]]]:
-    areas: OrderedDict[str, list[int]] = OrderedDict()
+    """Build stable semantic units, falling back to top-level areas.
+
+    An unambiguous implementation path and its conventionally named tests are
+    one proof unit.  Ambiguous basenames retain the directory grouping rather
+    than accidentally joining unrelated modules.
+    """
+    paths_by_stem: dict[str, set[str]] = {}
+    verification_stems: set[str] = set()
+    for hunk in hunks:
+        stem = _semantic_stem(hunk.path)
+        layer = _layer(hunk.path)
+        if layer == "verification":
+            verification_stems.add(stem)
+        elif layer == "implementation":
+            paths_by_stem.setdefault(stem, set()).add(hunk.path)
+    paired_stems = {
+        stem for stem in verification_stems if len(paths_by_stem.get(stem, ())) == 1
+    }
+
+    areas: OrderedDict[tuple[str, str], list[int]] = OrderedDict()
     for index, hunk in enumerate(hunks):
-        areas.setdefault(_area(hunk.path), []).append(index)
+        stem = _semantic_stem(hunk.path)
+        key = ("semantic", stem) if stem in paired_stems else ("area", _area(hunk.path))
+        areas.setdefault(key, []).append(index)
     return sorted(
-        areas.items(),
+        ((key[1], indexes) for key, indexes in areas.items()),
         key=lambda item: min(
             _LAYER_RANK[_layer(hunks[index].path)] for index in item[1]
         ),
