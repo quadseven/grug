@@ -34,7 +34,8 @@ import asyncio
 import os
 import re
 import time
-from typing import Optional
+from dataclasses import dataclass
+from typing import Literal, Optional
 
 import discord
 
@@ -79,14 +80,32 @@ REPO_CHANNELS: dict[str, int] = {
     "aws-solutions-architect-study": 1524608438120743043,
 }
 
-_TASK_PATTERN = re.compile(
+TaskKind = Literal["change", "review"]
+
+
+@dataclass(frozen=True)
+class TaskRequest:
+    """A user request that Grug can hand to the coding agent."""
+
+    kind: TaskKind
+    content: str
+
+
+_CHANGE_PATTERN = re.compile(
     r"\b("
     r"implement|fix|build|refactor|patch|"
     r"write (some |the )?code|"
     r"open (a |the )?(pr|pull request)|"
-    r"create (a |the )?(pr|pull request)|"
-    r"(review|look at) (this|the|that|a) (pr|pull request|diff|code)|"
-    r"code review"
+    r"create (a |the )?(pr|pull request)"
+    r")\b",
+    re.IGNORECASE,
+)
+
+_REVIEW_PATTERN = re.compile(
+    r"\b("
+    r"(review|look at|audit|inspect) (this|the|that|a|my)?\s*(pr|pull request|diff|code|changes)|"
+    r"(code|pr|pull request|diff|peer) review|"
+    r"review (pr|pull request)\s*#?\d+"
     r")\b",
     re.IGNORECASE,
 )
@@ -109,7 +128,34 @@ def looks_like_task(clean_content: str) -> bool:
     is live. An LLM-based fallback for ambiguous phrasing is a reasonable
     follow-up once there's real usage data to tune it against.
     """
-    return bool(_TASK_PATTERN.search(clean_content))
+    return classify_task(clean_content) is not None
+
+
+def classify_task(clean_content: str) -> Optional[TaskRequest]:
+    """Classify a work request without asking an LLM.
+
+    Review wins when a sentence contains both change and review language. This
+    keeps "review the PR and fix nothing" on the read-only path.
+    """
+    if _REVIEW_PATTERN.search(clean_content):
+        return TaskRequest(kind="review", content=clean_content)
+    if _CHANGE_PATTERN.search(clean_content):
+        return TaskRequest(kind="change", content=clean_content)
+    return None
+
+
+def format_relay_request(task: TaskRequest, requester: str) -> str:
+    """Build the transport-neutral instruction sent to the coding agent."""
+    request = _sanitize_for_relay(task.content)
+    if task.kind == "review":
+        return (
+            f"Grug bring review request from {requester}: {request}\n\n"
+            "Treat this as read-only review work. Inspect the real diff and repository context. "
+            "Use independent peer-review or audit tools when available, consolidate duplicate findings, "
+            "and report actionable findings with file and line evidence. Do not edit code or open a PR "
+            "unless the requester explicitly asks for fixes."
+        )
+    return f"Grug bring coding request from {requester}: {request}"
 
 
 def _parse_id_list(raw: Optional[str]) -> frozenset[int]:
@@ -198,8 +244,14 @@ async def relay_to_hermes(
         )
         return
 
+    task = classify_task(clean_content)
+    if task is None:
+        log.warning("task_relay: relay called for non-task content")
+        await original_message.channel.send(f"{bot_name} no find coding work in that request.")
+        return
+
     requester = original_message.author.display_name or original_message.author.name
-    relay_content = f"Grug bring word from {requester}: {_sanitize_for_relay(clean_content)}"
+    relay_content = format_relay_request(task, requester)
 
     try:
         relay_message = await channel.send(relay_content)

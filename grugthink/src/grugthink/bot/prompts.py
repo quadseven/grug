@@ -95,8 +95,9 @@ def build_personality_context(statement: str, server_db, server_id: str, persona
     """
     personality = personality_engine.get_personality(server_id)
 
-    # Get base context from personality
-    base_context = personality.base_context
+    # Use the engine so canonical identity is restored for persisted personalities
+    # created from an older template.
+    base_context = personality_engine.get_context_prompt(server_id)
 
     # Find lore relevant to the current statement from this server's knowledge
     relevant_lore = server_db.search_facts(statement, k=5)
@@ -416,8 +417,11 @@ def query_model(
         },
     )
 
-    # Get memories from other bots in the same server
-    if current_bot_id:
+    personality = personality_engine.get_personality(server_id)
+
+    # Grug's product identity should not be rewritten by internal service chatter.
+    # Other personalities retain the legacy multi-bot memory behavior.
+    if current_bot_id and personality.name.casefold() != "grug":
         log.info("Searching cross-bot memories", extra={"bot_id": current_bot_id, "server_id": server_id})
         try:
             cross_bot_memories = get_cross_bot_memories(clean_stmt, server_id, current_bot_id)
@@ -460,7 +464,6 @@ def query_model(
     personality_engine.evolve_personality(server_id, clean_stmt)
 
     # Get personality name for lore extraction
-    personality = personality_engine.get_personality(server_id)
     personality_name = personality.chosen_name or personality.name
 
     try:

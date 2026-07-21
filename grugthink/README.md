@@ -41,7 +41,7 @@ Chat and embeddings run against the owned, in-cluster **spark-gateway**
 
 - `SPARK_GATEWAY_URL` (or `OLLAMA_URLS`) - the gateway base URL, e.g.
   `http://spark-gateway.spark-gateway.svc:8080`.
-- `GRUGTHINK_LLM_MODEL` - chat model (default `qwen3-coder-next:latest`).
+- `GRUGTHINK_LLM_MODEL` - chat model (default `nemotron-3-nano:30b-a3b-q4_K_M`).
 - `GRUGTHINK_EMBED_MODEL` - embedding model (default `nomic-embed-text`).
 
 Leaving Gemini unset (`GEMINI_API_KEY` empty) keeps the bot fully on the

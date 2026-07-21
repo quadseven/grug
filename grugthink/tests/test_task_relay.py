@@ -1,10 +1,11 @@
 """Tests for the Grug -> Hermes task-relay classifier.
 
-Only the pure, deterministic pieces (looks_like_task, resolve_repo) are
-covered here - relay_to_hermes/_watch_and_relay are live Discord I/O and
-can only be meaningfully verified against the real bots (see grug PR that
-introduced this module for the live-verification plan).
+The pure routing contract is covered here. Discord itself is mocked only at
+the transport boundary so the exact instruction handed to Hermes is tested.
+The long-running reply watcher still requires a live-bot smoke test.
 """
+
+from unittest.mock import AsyncMock, MagicMock
 
 import pytest
 
@@ -27,6 +28,8 @@ from src.grugthink.bot import task_relay
         "review the pr for macchina",
         "look at this diff",
         "can you do a code review",
+        "audit the changes in grug",
+        "peer review PR #720 in grug",
     ],
 )
 def test_looks_like_task_true(statement):
@@ -46,6 +49,36 @@ def test_looks_like_task_true(statement):
 )
 def test_looks_like_task_false(statement):
     assert task_relay.looks_like_task(statement) is False
+
+
+@pytest.mark.parametrize(
+    "statement",
+    [
+        "review this PR",
+        "audit the changes in grug",
+        "peer review PR #720 in grug",
+        "implement the fix, then review the diff",
+    ],
+)
+def test_review_requests_use_read_only_intent(statement):
+    request = task_relay.classify_task(statement)
+
+    assert request is not None and request.kind == "review"
+
+
+def test_change_requests_use_change_intent():
+    request = task_relay.classify_task("implement rate limiting in grug")
+
+    assert request is not None and request.kind == "change"
+
+
+def test_review_instruction_requests_peer_review_without_edits():
+    request = task_relay.TaskRequest(kind="review", content="review PR #720 in grug")
+
+    instruction = task_relay.format_relay_request(request, "Evan")
+
+    assert "independent peer-review or audit tools" in instruction
+    assert "Do not edit code" in instruction
 
 
 def test_resolve_repo_finds_known_repo():
@@ -137,3 +170,33 @@ def test_sanitize_for_relay_breaks_mention_syntax(raw, must_not_contain):
 def test_sanitize_for_relay_leaves_ordinary_text_untouched():
     text = "implement rate limiting for the login endpoint"
     assert task_relay._sanitize_for_relay(text) == text
+
+
+@pytest.mark.asyncio
+async def test_relay_sends_review_contract_to_hermes(monkeypatch):
+    monkeypatch.setenv("TASK_RELAY_ALLOWED_USER_IDS", "111")
+    original_channel = MagicMock()
+    original_channel.send = AsyncMock()
+    original_message = MagicMock()
+    original_message.id = 720
+    original_message.author.id = 111
+    original_message.author.display_name = "Evan"
+    original_message.channel = original_channel
+
+    thread = MagicMock()
+    relay_message = MagicMock()
+    relay_message.create_thread = AsyncMock(return_value=thread)
+    hermes_channel = MagicMock()
+    hermes_channel.send = AsyncMock(return_value=relay_message)
+    client = MagicMock()
+    client.get_channel.return_value = hermes_channel
+
+    watch = AsyncMock()
+    monkeypatch.setattr(task_relay, "_watch_and_relay", watch)
+
+    await task_relay.relay_to_hermes(client, original_message, "Grug", "peer review PR #720 in grug")
+
+    relayed = hermes_channel.send.await_args.args[0]
+    assert "Treat this as read-only review work" in relayed
+    assert "independent peer-review or audit tools" in relayed
+    watch.assert_awaited_once_with(client, thread, original_message, "Grug")

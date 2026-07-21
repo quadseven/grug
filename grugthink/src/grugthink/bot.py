@@ -49,6 +49,7 @@ from .bot.prompts import (  # noqa: E402
 from .bot.utils import LRUCache, clean_statement, generate_shit_talk  # noqa: E402
 from .grug_db import make_server_manager  # noqa: E402
 from .logging_config import get_logger  # noqa: E402
+from .personality_engine import accepts_bot_conversation  # noqa: E402
 
 log = get_logger(__name__)
 
@@ -336,6 +337,16 @@ class GrugThinkBot(commands.Cog):
                 "personality_style": personality.response_style,
             },
         )
+
+        # Grug is the human-facing product front door. Internal bots and
+        # services must not pull him into role-play conversations. Markov is
+        # retained as the one explicit legacy entertainment integration.
+        if message.author.bot and not accepts_bot_conversation(personality.name, message.author.name):
+            self.log.info(
+                "Ignoring non-Markov bot message for Grug identity",
+                extra={"bot_id": bot_id, "author_name": message.author.name},
+            )
+            return
 
         # Track channel activity for intelligent conversation triggers
         channel_id = str(message.channel.id)
@@ -1075,7 +1086,8 @@ class GrugThinkBot(commands.Cog):
             context = "\n".join(context_lines)
 
             # Create a natural engagement prompt
-            prompt = f"""You are {personality.name} with {personality.response_style} personality.
+            personality_context = self.personality_engine.get_context_prompt(server_id)
+            prompt = f"""{personality_context}
 
 Recent conversation:
 {context}
@@ -1104,7 +1116,10 @@ Response:"""
                         {"role": "user", "content": prompt},
                     ],
                     temperature=0.7,
-                    max_tokens=120,
+                    # Reasoning models may spend the first 100+ completion
+                    # tokens in the hidden reasoning field. Leave enough room
+                    # for the promised 1-2 sentence visible answer.
+                    max_tokens=300,
                 )
             except llm.LLMError as gateway_error:
                 self.log.warning(

@@ -13,7 +13,7 @@ Unauthenticated in-cluster.
 Config (env):
   SPARK_GATEWAY_URL / GRUGTHINK_LLM_URL - gateway base URL. Falls back to the
     first OLLAMA_URLS entry, then the in-cluster default.
-  GRUGTHINK_LLM_MODEL   - chat model (default qwen3-coder-next:q8_0).
+  GRUGTHINK_LLM_MODEL   - chat model (default Nemotron-3-Nano).
   GRUGTHINK_EMBED_MODEL - embedding model (default nomic-embed-text:v1.5).
   GRUGTHINK_LLM_TIMEOUT - per-request seconds (default 60).
 """
@@ -44,8 +44,9 @@ def base_url() -> str:
 
 
 def chat_model() -> str:
-    # Pinned Q8_0 tag (was ":latest"): the exact model srv-sparkles serves.
-    return os.getenv("GRUGTHINK_LLM_MODEL", "qwen3-coder-next:q8_0")
+    # Keep the conversational front door small and fast. Coding and review
+    # work is relayed to Hermes/Elder and uses their task-specific models.
+    return os.getenv("GRUGTHINK_LLM_MODEL", "nemotron-3-nano:30b-a3b-q4_K_M")
 
 
 def embed_model() -> str:
@@ -82,7 +83,12 @@ async def chat(
         async with httpx.AsyncClient(timeout=_timeout()) as client:
             resp = await client.post(f"{base_url()}/v1/chat/completions", json=body)
             resp.raise_for_status()
-            return resp.json()["choices"][0]["message"]["content"]
+            content = resp.json()["choices"][0]["message"]["content"]
+            if not isinstance(content, str) or not content.strip():
+                raise LLMError("spark-gateway chat returned empty content")
+            return content
+    except LLMError:
+        raise
     except (httpx.HTTPError, KeyError, IndexError, ValueError) as e:
         raise LLMError(f"spark-gateway chat failed: {type(e).__name__}: {e}") from e
 
