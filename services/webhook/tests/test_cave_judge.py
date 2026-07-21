@@ -42,6 +42,10 @@ def test_cave_config_builds_from_env(monkeypatch):
     assert cfg.url == "http://gw.example.svc:8080/v1/chat/completions"
     assert cfg.model == "test-model:latest"
     assert cfg.key_loader()  # non-empty placeholder (gateway unauthenticated)
+    assert cfg.extra_body == {
+        "chat_template_kwargs": {"enable_thinking": False},
+        "max_tokens": 4_096,
+    }
     # spark-gateway priority queue (infra#1763-1767): the judge's client
     # timeout is short, so it must jump ahead of Hermes's long agentic
     # turns on the same shared Ollama target rather than queue behind them.
