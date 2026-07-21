@@ -662,15 +662,23 @@ def _cave_review_config(backend: Backend) -> "BackendConfig | None":
         return None
     if backend == Backend.CAVE_REASONER:
         model = os.getenv("GRUG_CAVE_REASONER_MODEL", _CAVE_REVIEW_REASONER_DEFAULT_MODEL)
+        # The HTTP client can time out before vLLM notices the disconnect.
+        # Keep deep reasoning enabled, but give the server its own hard stop so
+        # an abandoned review cannot monopolize the shared Laguna GPU.
+        extra_body = {
+            "response_format": _CAVE_FINDINGS_RESPONSE_FORMAT,
+            "max_tokens": 6_144,
+        }
     else:
         model = os.getenv("GRUG_CAVE_REVIEW_MODEL", _CAVE_REVIEW_CODER_DEFAULT_MODEL)
+        extra_body = {"response_format": _CAVE_FINDINGS_RESPONSE_FORMAT}
     return BackendConfig(
         backend=backend,
         url=f"{base}/v1/chat/completions",
         model=model,
         key_loader=lambda: "in-cluster",  # gateway is unauthenticated in-cluster
         # #609: replaces the default json_object for the Cave arms only.
-        extra_body={"response_format": _CAVE_FINDINGS_RESPONSE_FORMAT},
+        extra_body=extra_body,
         # Short client timeout (_review_llm_timeout_s()) - must not queue
         # behind a long-running agentic turn on a shared Ollama target.
         # X-Spark-Caller (2026-07-14 fix, see _cave_judge_config) - per-arm
