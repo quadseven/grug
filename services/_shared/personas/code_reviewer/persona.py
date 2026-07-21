@@ -302,7 +302,7 @@ def evaluate_diff(
         # inline findings are still valid, diff-anchored evidence.
         degraded_reason=(
             "partial_review"
-            if llm_response.error.startswith("partial review:")
+            if llm_response.error[:15] == "partial review:"
             else None
         ),
         coverage=llm_response.coverage,
