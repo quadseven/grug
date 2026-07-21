@@ -84,6 +84,43 @@ class ReviewCoverage:
         return self.completed_cohorts == self.total_cohorts and not self.failed_cohorts
 
 
+@dataclass(slots=True)
+class _CohortAccumulator:
+    """Mutable packing state kept out of :func:`plan_review`."""
+
+    hunks: Sequence[ReviewHunk]
+    max_chars: int
+    cohorts: list[ReviewCohort]
+    indexes: list[int]
+    areas: list[str]
+    paths: set[str]
+    chars: int = 0
+
+    @classmethod
+    def empty(cls, hunks: Sequence[ReviewHunk], max_chars: int) -> _CohortAccumulator:
+        return cls(hunks, max_chars, [], [], [], set())
+
+    def flush(self) -> None:
+        if self.indexes:
+            self.cohorts.append(
+                _cohort(
+                    " + ".join(self.areas), self.indexes, self.hunks, self.max_chars
+                )
+            )
+        self.indexes = []
+        self.areas = []
+        self.paths = set()
+        self.chars = 0
+
+    def add_area(
+        self, area: str, indexes: Sequence[int], paths: set[str], chars: int
+    ) -> None:
+        self.indexes.extend(indexes)
+        self.areas.append(area)
+        self.paths.update(paths)
+        self.chars += chars
+
+
 def _area(path: str) -> str:
     parts = PurePosixPath(path).parts
     return parts[0] if len(parts) > 1 else "repository root"
@@ -94,12 +131,16 @@ def _layer(path: str) -> str:
     lowered = path.lower()
     parts = PurePosixPath(lowered).parts
     name = parts[-1] if parts else lowered
-    if (
-        any(part in {"schema", "schemas", "migration", "migrations", "types", "interfaces"} for part in parts)
-        or any(token in name for token in ("schema", "model", "types", "contract", "interface"))
+    if any(
+        part in {"schema", "schemas", "migration", "migrations", "types", "interfaces"}
+        for part in parts
+    ) or any(
+        token in name for token in ("schema", "model", "types", "contract", "interface")
     ):
         return "contract"
-    if any(part in {"test", "tests", "spec", "specs"} for part in parts) or name.startswith(("test_", "spec_")):
+    if any(
+        part in {"test", "tests", "spec", "specs"} for part in parts
+    ) or name.startswith(("test_", "spec_")):
         return "verification"
     if any(part in {"doc", "docs"} for part in parts) or name.endswith((".md", ".rst")):
         return "documentation"
@@ -113,7 +154,9 @@ def _cohort(
     max_cohort_chars: int,
 ) -> ReviewCohort:
     paths = tuple(dict.fromkeys(hunks[index].path for index in indexes))
-    layers = tuple(sorted({_layer(path) for path in paths}, key=_LAYER_RANK.__getitem__))
+    layers = tuple(
+        sorted({_layer(path) for path in paths}, key=_LAYER_RANK.__getitem__)
+    )
     return ReviewCohort(
         label=label,
         hunk_indexes=tuple(indexes),
@@ -128,24 +171,30 @@ def _reviewability_concerns(
     cohorts: Sequence[ReviewCohort], hunks: Sequence[ReviewHunk], max_cohort_chars: int
 ) -> tuple[ReviewabilityConcern, ...]:
     concerns: list[ReviewabilityConcern] = []
-    oversized_paths = tuple(dict.fromkeys(
-        hunks[index].path
-        for cohort in cohorts
-        if cohort.oversized
-        for index in cohort.hunk_indexes
-        if len(hunks[index].body) > max_cohort_chars
-    ))
+    oversized_paths = tuple(
+        dict.fromkeys(
+            hunks[index].path
+            for cohort in cohorts
+            if cohort.oversized
+            for index in cohort.hunk_indexes
+            if len(hunks[index].body) > max_cohort_chars
+        )
+    )
     # Use each cohort's own oversized bit instead of raw PR size. This calls
     # out an indivisible proof burden, not a merely large cohesive change.
     if any(cohort.oversized for cohort in cohorts):
-        paths = oversized_paths or tuple(dict.fromkeys(
-            path for cohort in cohorts if cohort.oversized for path in cohort.paths
-        ))
-        concerns.append(ReviewabilityConcern(
-            kind="oversized-hunk",
-            message="One diff hunk exceeds a bounded review unit and cannot be independently verified.",
-            paths=paths,
-        ))
+        paths = oversized_paths or tuple(
+            dict.fromkeys(
+                path for cohort in cohorts if cohort.oversized for path in cohort.paths
+            )
+        )
+        concerns.append(
+            ReviewabilityConcern(
+                kind="oversized-hunk",
+                message="One diff hunk exceeds a bounded review unit and cannot be independently verified.",
+                paths=paths,
+            )
+        )
 
     memberships: dict[str, int] = {}
     for cohort in cohorts:
@@ -153,15 +202,96 @@ def _reviewability_concerns(
             memberships[path] = memberships.get(path, 0) + 1
     crossing = tuple(path for path, count in memberships.items() if count > 1)
     if crossing:
-        concerns.append(ReviewabilityConcern(
-            kind="cross-cohort-module",
-            message=(
-                "A module spans multiple bounded review units; consider separating responsibilities "
-                "or splitting the change so its contracts can be verified once."
-            ),
-            paths=crossing,
-        ))
+        concerns.append(
+            ReviewabilityConcern(
+                kind="cross-cohort-module",
+                message=(
+                    "A module spans multiple bounded review units; consider separating responsibilities "
+                    "or splitting the change so its contracts can be verified once."
+                ),
+                paths=crossing,
+            )
+        )
     return tuple(concerns)
+
+
+def _ordered_areas(hunks: Sequence[ReviewHunk]) -> list[tuple[str, list[int]]]:
+    areas: OrderedDict[str, list[int]] = OrderedDict()
+    for index, hunk in enumerate(hunks):
+        areas.setdefault(_area(hunk.path), []).append(index)
+    return sorted(
+        areas.items(),
+        key=lambda item: min(
+            _LAYER_RANK[_layer(hunks[index].path)] for index in item[1]
+        ),
+    )
+
+
+def _split_area(
+    area: str,
+    indexes: Sequence[int],
+    hunks: Sequence[ReviewHunk],
+    *,
+    max_chars: int,
+    max_paths: int,
+) -> list[ReviewCohort]:
+    """Split one oversized area without truncating an indivisible hunk."""
+    chunks: list[list[int]] = []
+    chunk: list[int] = []
+    chunk_paths: set[str] = set()
+    chunk_chars = 0
+    for index in indexes:
+        hunk = hunks[index]
+        path_would_overflow = (
+            hunk.path not in chunk_paths and len(chunk_paths) >= max_paths
+        )
+        if chunk and (chunk_chars + len(hunk.body) > max_chars or path_would_overflow):
+            chunks.append(chunk)
+            chunk = []
+            chunk_paths = set()
+            chunk_chars = 0
+        chunk.append(index)
+        chunk_paths.add(hunk.path)
+        chunk_chars += len(hunk.body)
+    if chunk:
+        chunks.append(chunk)
+    return [
+        _cohort(
+            area if len(chunks) == 1 else f"{area} (part {part})",
+            part_indexes,
+            hunks,
+            max_chars,
+        )
+        for part, part_indexes in enumerate(chunks, start=1)
+    ]
+
+
+def _pack_areas(
+    hunks: Sequence[ReviewHunk], *, max_chars: int, max_paths: int
+) -> tuple[ReviewCohort, ...]:
+    packing = _CohortAccumulator.empty(hunks, max_chars)
+    for area, raw_indexes in _ordered_areas(hunks):
+        indexes = sorted(
+            raw_indexes, key=lambda index: _LAYER_RANK[_layer(hunks[index].path)]
+        )
+        area_chars = sum(len(hunks[index].body) for index in indexes)
+        area_paths = {hunks[index].path for index in indexes}
+        area_fits = area_chars <= max_chars and len(area_paths) <= max_paths
+        pending_overflows = packing.indexes and (
+            packing.chars + area_chars > max_chars
+            or len(packing.paths | area_paths) > max_paths
+        )
+        if area_fits:
+            if pending_overflows:
+                packing.flush()
+            packing.add_area(area, indexes, area_paths, area_chars)
+            continue
+        packing.flush()
+        packing.cohorts.extend(
+            _split_area(area, indexes, hunks, max_chars=max_chars, max_paths=max_paths)
+        )
+    packing.flush()
+    return tuple(packing.cohorts)
 
 
 def plan_review(
@@ -195,89 +325,9 @@ def plan_review(
             concerns=_reviewability_concerns(single_cohort, hunks, max_cohort_chars),
         )
 
-    areas: OrderedDict[str, list[int]] = OrderedDict()
-    for index, hunk in enumerate(hunks):
-        areas.setdefault(_area(hunk.path), []).append(index)
-
-    cohorts: list[ReviewCohort] = []
-    pending_indexes: list[int] = []
-    pending_areas: list[str] = []
-    pending_paths: set[str] = set()
-    pending_chars = 0
-
-    def flush() -> None:
-        nonlocal pending_indexes, pending_areas, pending_paths, pending_chars
-        if not pending_indexes:
-            return
-        cohorts.append(
-            _cohort(
-                " + ".join(pending_areas),
-                pending_indexes,
-                hunks,
-                max_cohort_chars,
-            )
-        )
-        pending_indexes = []
-        pending_areas = []
-        pending_paths = set()
-        pending_chars = 0
-
-    ordered_areas = sorted(
-        areas.items(),
-        key=lambda item: min(_LAYER_RANK[_layer(hunks[index].path)] for index in item[1]),
+    frozen_cohorts = _pack_areas(
+        hunks, max_chars=max_cohort_chars, max_paths=max_cohort_paths
     )
-    for area, indexes in ordered_areas:
-        indexes = sorted(indexes, key=lambda index: _LAYER_RANK[_layer(hunks[index].path)])
-        area_chars = sum(len(hunks[index].body) for index in indexes)
-        area_paths = {hunks[index].path for index in indexes}
-        if area_chars <= max_cohort_chars and len(area_paths) <= max_cohort_paths:
-            if pending_indexes and (
-                pending_chars + area_chars > max_cohort_chars
-                or len(pending_paths | area_paths) > max_cohort_paths
-            ):
-                flush()
-            pending_indexes.extend(indexes)
-            pending_areas.append(area)
-            pending_paths.update(area_paths)
-            pending_chars += area_chars
-            continue
-
-        flush()
-        chunk: list[int] = []
-        chunk_paths: set[str] = set()
-        chunk_chars = 0
-        part = 1
-        for index in indexes:
-            hunk_chars = len(hunks[index].body)
-            hunk_path = hunks[index].path
-            if chunk and (
-                chunk_chars + hunk_chars > max_cohort_chars
-                or (
-                    hunk_path not in chunk_paths
-                    and len(chunk_paths) >= max_cohort_paths
-                )
-            ):
-                cohorts.append(
-                    _cohort(
-                        f"{area} (part {part})",
-                        chunk,
-                        hunks,
-                        max_cohort_chars,
-                    )
-                )
-                part += 1
-                chunk = []
-                chunk_paths = set()
-                chunk_chars = 0
-            chunk.append(index)
-            chunk_paths.add(hunk_path)
-            chunk_chars += hunk_chars
-        if chunk:
-            label = area if part == 1 else f"{area} (part {part})"
-            cohorts.append(_cohort(label, chunk, hunks, max_cohort_chars))
-    flush()
-
-    frozen_cohorts = tuple(cohorts)
     return ReviewPlan(
         cohorts=frozen_cohorts,
         total_diff_chars=total_chars,
@@ -307,5 +357,7 @@ def render_review_map(plan: ReviewPlan, *, max_paths_per_cohort: int = 12) -> st
         lines.append(f"Cohort {number} - {cohort.label} (layers: {layers}): {paths}")
     for concern in plan.concerns:
         paths = ", ".join(concern.paths[:max_paths_per_cohort])
-        lines.append(f"Reviewability warning - {concern.kind}: {concern.message} Paths: {paths}")
+        lines.append(
+            f"Reviewability warning - {concern.kind}: {concern.message} Paths: {paths}"
+        )
     return "\n".join(lines)
