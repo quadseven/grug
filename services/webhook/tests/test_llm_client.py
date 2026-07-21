@@ -97,6 +97,155 @@ def test_review_diff_empty_findings_returns_reviewed() -> None:
     assert out.findings == ()
 
 
+def test_large_review_runs_bounded_cohorts_and_merges_findings(monkeypatch) -> None:
+    monkeypatch.setenv("GRUG_REVIEW_COHORT_CHARS", "8000")
+    annotate_calls = _capture_llmobs(monkeypatch)
+    hunks = [
+        _hunk("src/x.py", "@@ -1 +1 @@\n+SRC_CHANGE\n" + "s" * 4100),
+        _hunk("tests/test_x.py", "@@ -1 +1 @@\n+TEST_CHANGE\n" + "t" * 4100),
+    ]
+    prompts: list[str] = []
+
+    def respond(_url, **kwargs) -> httpx.Response:
+        prompt = kwargs["json"]["messages"][1]["content"]
+        prompts.append(prompt)
+        if "SRC_CHANGE" in prompt:
+            finding = (
+                '{"path":"src/x.py","line":1,"rule":"src-bug",'
+                '"severity":"high","message":"source bug"}'
+            )
+        else:
+            finding = (
+                '{"path":"tests/test_x.py","line":1,"rule":"test-bug",'
+                '"severity":"medium","message":"test bug"}'
+            )
+        return httpx.Response(
+            200,
+            json=_openai_json_response(f'{{"findings":[{finding}]}}'),
+        )
+
+    with patch.object(httpx, "post", side_effect=respond):
+        out = review_diff(
+            hunks,
+            installation_id=2,
+            file_contents={
+                "src/x.py": "SOURCE_FULL_FILE",
+                "tests/test_x.py": "TEST_FULL_FILE",
+            },
+        )
+
+    assert out.kind == "reviewed"
+    assert {finding.rule for finding in out.findings} == {"src-bug", "test-bug"}
+    assert len(prompts) == 2
+    assert all("### REVIEW MAP" in prompt for prompt in prompts)
+    source_prompt = next(prompt for prompt in prompts if "SRC_CHANGE" in prompt)
+    test_prompt = next(prompt for prompt in prompts if "TEST_CHANGE" in prompt)
+    assert "TEST_CHANGE" not in source_prompt
+    assert "TEST_FULL_FILE" not in source_prompt
+    assert "SRC_CHANGE" not in test_prompt
+    assert "SOURCE_FULL_FILE" not in test_prompt
+    assert {
+        (
+            call["tags"]["review_phase"],
+            call["tags"]["cohort_index"],
+            call["tags"]["cohort_count"],
+        )
+        for call in annotate_calls
+    } == {("tier1", "1", "2"), ("tier1", "2", "2")}
+
+
+def test_large_review_keeps_success_when_one_cohort_is_unparseable(monkeypatch) -> None:
+    monkeypatch.setenv("GRUG_REVIEW_COHORT_CHARS", "8000")
+    hunks = [
+        _hunk("src/x.py", "@@ -1 +1 @@\n+SRC_CHANGE\n" + "s" * 4100),
+        _hunk("tests/test_x.py", "@@ -1 +1 @@\n+TEST_CHANGE\n" + "t" * 4100),
+    ]
+
+    def respond(_url, **kwargs) -> httpx.Response:
+        prompt = kwargs["json"]["messages"][1]["content"]
+        if "SRC_CHANGE" in prompt:
+            return httpx.Response(200, json=_openai_json_response("not json"))
+        return httpx.Response(
+            200,
+            json=_openai_json_response(
+                '{"findings":[{"path":"tests/test_x.py","line":1,'
+                '"rule":"test-bug","severity":"medium",'
+                '"message":"test bug"}]}'
+            ),
+        )
+
+    with patch.object(httpx, "post", side_effect=respond):
+        out = review_diff(hunks, installation_id=2)
+
+    assert out.kind == "reviewed"
+    assert [finding.rule for finding in out.findings] == ["test-bug"]
+    assert out.error == "partial review: cohorts [1] failed"
+
+
+def test_staged_scheduler_runs_one_cohort_at_a_time() -> None:
+    active = 0
+    max_active = 0
+    order: list[int] = []
+
+    def run(index: int) -> LlmReviewResponse:
+        nonlocal active, max_active
+        active += 1
+        max_active = max(max_active, active)
+        order.append(index)
+        active -= 1
+        return LlmReviewResponse(kind="all_failed", error=str(index))
+
+    responses = lc._run_staged_cohorts(
+        cohort_count=3,
+        run_cohort=run,
+        budget_seconds=700,
+        reserve_seconds=100,
+        cancel_event=None,
+    )
+
+    assert order == [0, 1, 2]
+    assert max_active == 1
+    assert len(responses) == 3
+
+
+def test_staged_scheduler_marks_unstarted_cohorts_partial_when_budget_is_low() -> None:
+    times = iter((0.0, 650.0))
+    ran: list[int] = []
+
+    responses = lc._run_staged_cohorts(
+        cohort_count=3,
+        run_cohort=lambda index: (
+            ran.append(index)
+            or LlmReviewResponse(kind="reviewed", backend_used=Backend.CAVE,
+                                 model_name="coder")
+        ),
+        budget_seconds=700,
+        reserve_seconds=100,
+        cancel_event=None,
+        clock=lambda: next(times),
+    )
+
+    assert ran == [0]
+    assert len(responses) == 3
+    assert responses[1].kind == "all_failed"
+    assert responses[1].error == "cohort skipped: staged review budget exhausted"
+    assert responses[2].error == "cohort skipped: staged review budget exhausted"
+
+
+def test_single_oversized_hunk_degrades_without_calling_model(monkeypatch) -> None:
+    monkeypatch.setenv("GRUG_REVIEW_COHORT_CHARS", "8000")
+
+    with patch.object(httpx, "post") as mock_post:
+        out = review_diff(
+            [_hunk("src/generated.py", "@@ -1 +1 @@\n+x\n" + "x" * 8100)],
+            installation_id=2,
+        )
+
+    assert out.kind == "all_failed"
+    assert "hunk over the review budget" in out.error
+    mock_post.assert_not_called()
+
+
 def test_429_triggers_retry_with_backoff(monkeypatch) -> None:
     """A 429 (gateway under burst) is retried on the same arm before giving up."""
     monkeypatch.setattr(lc, "_RETRY_SLEEP", lambda s: None)  # no real sleep
@@ -2017,9 +2166,12 @@ def test_build_messages_redacts_and_bounds_pr_intent():
 
 
 def test_render_file_block_skips_oversized_file():
-    """A file beyond the line budget degrades to diff-only (token guard)."""
+    """A file beyond either budget degrades to diff-only (token guard)."""
     big = "\n".join(f"x{i}" for i in range(lc._MAX_FILE_CONTEXT_LINES + 1))
     assert lc._render_file_block("big.py", big) == ""
+    assert lc._render_file_block(
+        "wide.py", "x" * (lc._MAX_FILE_CONTEXT_CHARS + 1),
+    ) == ""
     assert lc._render_file_block("none.py", None) == ""
     assert lc._render_file_block("none.py", "") == ""
 

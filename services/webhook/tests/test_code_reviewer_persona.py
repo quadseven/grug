@@ -503,6 +503,21 @@ def test_reviewed_response_has_no_degraded_reason() -> None:
     assert out.degraded_reason is None
 
 
+def test_partial_review_keeps_valid_findings_and_marks_coverage_degraded() -> None:
+    hunks = parse_diff(_DIFF)
+    llm = LlmReviewResponse(
+        kind="reviewed",
+        findings=(_llm_finding(line=2),),
+        backend_used=Backend.POOLSIDE,
+        error="partial review: cohorts [2] failed",
+    )
+
+    out = evaluate_diff(hunks, llm)
+
+    assert len(out.findings) == 1
+    assert out.degraded_reason == "partial_review"
+
+
 def test_diff_hunk_rejects_missing_at_at_in_body() -> None:
     """Boundary check — catches a parser regression that loses the @@
     header before the body string is captured. Raises DiffParseError

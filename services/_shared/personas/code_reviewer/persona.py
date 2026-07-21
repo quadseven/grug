@@ -154,9 +154,10 @@ class CodeReviewEvaluation:
 
     `degraded_reason` carries the `LlmReviewResponse.kind` value when
     not `"reviewed"` (`no_diff`, `all_failed`, `parse_failed`) - these
-    contain no usable findings. All degraded states
-    map to `conclusion="neutral"` but the cause is preserved so caller
-    metrics can distinguish empty PR vs LLM provider outage.
+    contain no usable findings. It carries `partial_review` when bounded
+    cohorts returned a mix of usable and failed results; those findings remain
+    publishable, but dispatch forces the check advisory. The cause is preserved
+    so caller metrics can distinguish empty PR, partial coverage, and outage.
     """
 
     findings: tuple[Finding, ...]
@@ -291,5 +292,12 @@ def evaluate_diff(
         findings=tuple(kept),
         conclusion=conclusion,
         dropped_hallucinations=dropped,
-        degraded_reason=None,
+        # Staged review preserves useful findings when another cohort fails,
+        # but the check must say coverage was partial and stay advisory. The
+        # inline findings are still valid, diff-anchored evidence.
+        degraded_reason=(
+            "partial_review"
+            if llm_response.error.startswith("partial review:")
+            else None
+        ),
     )

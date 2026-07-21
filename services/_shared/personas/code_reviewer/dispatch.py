@@ -43,6 +43,7 @@ from llm_client import (
     PrContext,
     decide_deep_escalation,
     review_diff,
+    review_is_staged,
     review_reasoner_diff,
 )
 from voice_pack import VoiceSelection, entitled_voice
@@ -522,6 +523,13 @@ def _summary_markdown(
     def hunt_title(title: str) -> str:
         return f"Living Hunt {living_range} - {title}" if living_range else title
 
+    if evaluation.degraded_reason == "partial_review":
+        title = "WARN Elder review coverage partial"
+        return hunt_title(title), (
+            "Grug reviewed part of the diff, but one or more bounded cohorts "
+            "did not return usable output. Validated markings from completed "
+            "cohorts are still published below; this check stays advisory."
+        ) + held + hunt
     if evaluation.degraded_reason:
         title = f"WARN Grug eyes clouded ({evaluation.degraded_reason})"
         return hunt_title(title), (
@@ -1178,14 +1186,15 @@ def _build_review_result(
 ) -> ReviewResult | None:
     """Build the ReviewResult, or None if nothing NEW to post.
 
-    Skips entirely on degraded responses. `prior_keys` (non-empty only
-    on a synchronize/reopened push) dedups findings already commented
+    Skips entirely on fully degraded responses. A partial staged review still
+    publishes its validated findings, but stays advisory. `prior_keys`
+    (non-empty only on a synchronize/reopened push) dedups findings already commented
     on unchanged lines (#189) — so a re-review doesn't flood the PR with
     duplicate inline comments. If every finding was already posted,
     returns None (nothing new). NOTE: dedup affects only the inline
     REVIEW; the check-run summary/conclusion still reflect ALL current
     findings (the bugs are still there)."""
-    if evaluation.degraded_reason:
+    if evaluation.degraded_reason not in (None, "", "partial_review"):
         return None
     new_findings = dedup_findings(evaluation.findings, prior_keys)
     if not new_findings:
@@ -1791,12 +1800,12 @@ def dispatch_code_review(
         prior_keys, dedup_degraded = _prior_finding_keys(
             installation_id, owner, repo_name, pull_number,
         )
-    # Only pay the ledger fetch when there is something to annotate: a
-    # degraded eval publishes no inline review, and no findings means no
-    # notes (CodeRabbit on #614).
+    # Only pay the ledger fetch when there is something to annotate. A fully
+    # degraded eval publishes no inline review; a partial staged review does.
     precedent_notes = (
         _precedent_notes_for(f"{owner}/{repo_name}", evaluation.findings)
-        if evaluation.findings and not evaluation.degraded_reason
+        if evaluation.findings
+        and evaluation.degraded_reason in (None, "", "partial_review")
         else {}
     )
     review_result = _build_review_result(
@@ -2190,7 +2199,7 @@ def _async_deep_append_if_needed(
     head_sha: str,
     action: str,
     snapshot_id: str,
-    mode: str,
+    mode: ReviewMode,
     blocking: bool,
     hunks: tuple[DiffHunk, ...],
     llm_hunks: list[LlmHunk],
@@ -2217,7 +2226,16 @@ def _async_deep_append_if_needed(
     depth = os.getenv("GRUG_REVIEW_DEPTH", "tiered").strip().lower()
     if depth != "tiered":
         return
-    if evaluation.degraded_reason not in (None, "", "no_diff"):
+    if review_is_staged(llm_hunks):
+        # Tier-1 staging may already consume most of the durable job budget.
+        # Its candidates still receive the hot evidence-scoped judge; do not
+        # start a second multi-cohort discovery pass in the same job.
+        log.info(
+            "elder_async_deep_skipped_staged_review",
+            extra={"pr": f"{owner}/{repo_name}#{pull_number}"},
+        )
+        return
+    if evaluation.degraded_reason not in (None, "", "no_diff", "partial_review"):
         return
     if cancel_event is not None and cancel_event.is_set():
         return
@@ -2291,7 +2309,9 @@ def _async_deep_append_if_needed(
     # Same verification gate as the tier-1 arm (#708; workflow review on
     # PR #710 caught the gap): without it, a finding class killed in
     # tier-1 resurrects unverified through the deep reasoner.
-    deep_verified, deep_killed = verify_findings(deep_eval.findings, file_contents)
+    deep_verified, deep_killed = verify_findings(
+        deep_eval.findings, file_contents or {},
+    )
     if deep_killed:
         deep_eval = with_findings(deep_eval, deep_verified)
     _record_verification_kills(

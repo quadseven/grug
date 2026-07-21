@@ -1795,6 +1795,35 @@ def test_review_stack_degraded_empty_findings_not_nothing_to_remediate():
     assert "no usable findings" in stack.lower()
 
 
+def test_partial_review_stays_advisory_but_publishes_validated_findings():
+    from personas.code_reviewer.persona import CodeReviewEvaluation, Finding
+
+    evaluation = CodeReviewEvaluation(
+        findings=(Finding(
+            file="src/x.py",
+            line=2,
+            severity="high",
+            rule_name="null-deref",
+            message="validated cohort finding",
+            suggestion=None,
+        ),),
+        conclusion="failure",
+        degraded_reason="partial_review",
+    )
+
+    assert cr_dispatch._publish_shape(
+        evaluation, mode="blocking",
+    ) == ("neutral", "COMMENT")
+    result = cr_dispatch._build_review_result(
+        evaluation, head_sha="a" * 40, event="COMMENT",
+    )
+    assert result is not None
+    assert len(result.comments) == 1
+    title, summary = cr_dispatch._summary_markdown(evaluation)
+    assert "coverage partial" in title
+    assert "still published" in summary
+
+
 def test_summary_markdown_appends_bounded_consolidated_agent_prompt():
     """#553: the check-run summary carries ONE consolidated agent prompt
     covering the findings, bounded so the 65536 body cap stays safe."""

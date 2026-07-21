@@ -130,6 +130,9 @@ spec:
             - {name: GRUG_DEEP_SAMPLE_RATE, value: "0.05"}
             - {name: GRUG_DEEP_DIFF_LINES, value: "500"}
             - {name: GRUG_DEEP_ASYNC, value: "1"}
+            # Keep the compatibility worker's staging policy identical to the
+            # durable consumer even though production uses the consumer path.
+            - {name: GRUG_STAGED_REVIEW_BUDGET_S, value: "700"}
             - {name: GRUG_OPENROUTER_REVIEW_MODEL, value: anthropic/claude-opus-4.7}
             - {name: GITHUB_APP_ID_SSM, value: /grug/github-app-id}
             - {name: GITHUB_APP_PRIVATE_KEY_SSM, value: /grug/github-app-private-key}
@@ -140,11 +143,10 @@ spec:
             - {name: GRUG_OPENROUTER_API_KEY_SSM, value: /infra/llm/openrouter_api_key}
             - {name: GRUG_POOLSIDE_API_KEY_SSM, value: /infra/llm/poolside_api_key}
             - {name: GRUG_PROMPT_EXPERIMENT_SSM, value: /grug/elder-prompt-experiment}
-            # In-cluster spark-gateway for the exposed-secret judge (#439,
-            # ADR-0009). Non-secret Service DNS (named in the ADR); unset =
-            # feature off, SaaS judge as before (fail-open).
+            # In-cluster spark-gateway for the evidence-scoped judge. Keep the
+            # role assignment identical on both Elder-capable workloads.
             - {name: GRUG_CAVE_GATEWAY_URL, value: http://spark-gateway.spark-gateway.svc:8080}
-            - {name: GRUG_CAVE_JUDGE_MODEL, value: qwen3-coder-next:q8_0}
+            - {name: GRUG_CAVE_JUDGE_MODEL, value: qwen3.5:122b}
             # Review ensemble arms (#593). Coder = qwen3-coder-next on sparkles;
             # reasoner = qwen3.5, permanently resident on sparkicus ollama (the
             # nemotron vLLM was retired 2026-07-12 - pointing at it made every

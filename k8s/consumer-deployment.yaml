@@ -144,6 +144,9 @@ spec:
             # (llm_client._SAAS_OVERLOAD_FALLBACK_TIMEOUT_SECONDS) plus
             # parsing/logging overhead, still 100s under the 900s SQS lease.
             - {name: GRUG_REVIEW_JOB_TIMEOUT_S, value: "800"}
+            # Staged discovery stops starting new cohorts at this wall-clock
+            # budget, leaving 100s for judge, publication, and cleanup.
+            - {name: GRUG_STAGED_REVIEW_BUDGET_S, value: "700"}
             # Per-arm LLM transport timeout for the deep review ensemble. Must
             # satisfy 2 x this + ~80s (SaaS fallback worst case) <=
             # GRUG_REVIEW_JOB_TIMEOUT_S (the two arms run sequentially):
@@ -155,11 +158,11 @@ spec:
             # short claim-renewal heartbeats may touch Postgres concurrently;
             # keep per-process pool headroom above the per-pod worker count.
             - {name: GRUG_PG_POOL_MAX, value: "10"}
-            # In-cluster spark-gateway for the exposed-secret judge (#439,
-            # ADR-0009). Non-secret Service DNS (named in the ADR); unset =
-            # feature off, SaaS judge as before (fail-open).
+            # In-cluster spark-gateway for the evidence-scoped judge. The
+            # permanently hot reasoner adjudicates bounded candidate packets;
+            # cloud fallback receives redacted evidence only.
             - {name: GRUG_CAVE_GATEWAY_URL, value: http://spark-gateway.spark-gateway.svc:8080}
-            - {name: GRUG_CAVE_JUDGE_MODEL, value: qwen3-coder-next:q8_0}
+            - {name: GRUG_CAVE_JUDGE_MODEL, value: qwen3.5:122b}
             # Review ensemble arms (#593). Coder = qwen3-coder-next on sparkles;
             # reasoner = qwen3.5, permanently resident on sparkicus ollama (the
             # nemotron vLLM was retired 2026-07-12 - pointing at it made every

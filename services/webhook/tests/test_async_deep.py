@@ -177,3 +177,36 @@ def test_async_deep_skipped_when_disabled(monkeypatch):
         cr_dispatch.dispatch_code_review(_payload(), blocking=False)
 
     assert reasoner_calls == []
+
+
+def test_async_deep_skipped_after_staged_tier1(monkeypatch):
+    tier1 = LlmReviewResponse(
+        kind="reviewed", findings=(),
+        backend_used=Backend.CAVE, model_name="coder",
+        backends_used=(Backend.CAVE,), models_used=("coder",),
+    )
+    reasoner_calls = []
+
+    monkeypatch.setattr(cr_dispatch, "review_diff", lambda *a, **kw: tier1)
+    monkeypatch.setattr(cr_dispatch, "review_is_staged", lambda hunks: True)
+    monkeypatch.setattr(
+        cr_dispatch, "review_reasoner_diff",
+        lambda *a, **kw: reasoner_calls.append(1) or tier1,
+    )
+    monkeypatch.setattr(
+        cr_dispatch, "post_check_run", lambda *a, **k: {"id": 1},
+    )
+    monkeypatch.setattr(
+        cr_dispatch, "post_review", lambda *a, **k: {"id": 2},
+    )
+    monkeypatch.setattr(cr_dispatch, "grade_findings", lambda *a, **kw: ())
+    monkeypatch.setattr(
+        cr_dispatch, "_fetch_current_review_snapshot",
+        lambda *a, **k: ("base5678ijkl", "abcd1234efgh", "t", "b"),
+    )
+    with patch("adapters.install_store.put_elder_last_reviewed", lambda **k: None), \
+         patch("adapters.install_store.get_elder_last_reviewed", return_value=None), \
+         patch("httpx.get", return_value=_diff_response()):
+        cr_dispatch.dispatch_code_review(_payload(), blocking=False)
+
+    assert reasoner_calls == []

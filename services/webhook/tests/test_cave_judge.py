@@ -8,8 +8,6 @@ DETECTION never regresses.
 """
 from __future__ import annotations
 
-from unittest.mock import patch
-
 import llm_client
 from llm_client import Backend, FindingJudgement, Hunk, _build_judge_messages, _cave_judge_config
 from personas.code_reviewer import sast
@@ -53,6 +51,16 @@ def test_cave_config_builds_from_env(monkeypatch):
         "X-Spark-Priority": "interactive",
         "X-Spark-Caller": "grug-elder-judge",
     }
+
+
+def test_cave_config_defaults_to_permanently_hot_reasoner(monkeypatch):
+    monkeypatch.setenv("GRUG_CAVE_GATEWAY_URL", "http://gw.example.svc:8080")
+    monkeypatch.delenv("GRUG_CAVE_JUDGE_MODEL", raising=False)
+
+    cfg = _cave_judge_config()
+
+    assert cfg is not None
+    assert cfg.model == "qwen3.5:122b"
 
 
 def test_judge_messages_redact_masks_secret():
