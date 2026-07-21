@@ -117,6 +117,7 @@ HEARTBEAT_INTERVAL_S = 5 * 60
 QUIET_DONE_S = 3 * 60
 # Absolute ceiling regardless of the above.
 MAX_WAIT_S = 20 * 60
+DISCORD_MESSAGE_LIMIT = 2000
 
 
 def looks_like_task(clean_content: str) -> bool:
@@ -147,15 +148,16 @@ def classify_task(clean_content: str) -> Optional[TaskRequest]:
 def format_relay_request(task: TaskRequest, requester: str) -> str:
     """Build the transport-neutral instruction sent to the coding agent."""
     request = _sanitize_for_relay(task.content)
+    safe_requester = _sanitize_for_relay(requester)
     if task.kind == "review":
         return (
-            f"Grug bring review request from {requester}: {request}\n\n"
+            f"Grug bring review request from {safe_requester}: {request}\n\n"
             "Treat this as read-only review work. Inspect the real diff and repository context. "
             "Use independent peer-review or audit tools when available, consolidate duplicate findings, "
             "and report actionable findings with file and line evidence. Do not edit code or open a PR "
             "unless the requester explicitly asks for fixes."
         )
-    return f"Grug bring coding request from {requester}: {request}"
+    return f"Grug bring coding request from {safe_requester}: {request}"
 
 
 def _parse_id_list(raw: Optional[str]) -> frozenset[int]:
@@ -193,6 +195,35 @@ def _sanitize_for_relay(text: str) -> str:
     return _MENTION_PATTERN.sub(lambda m: m.group(0)[0] + "​" + m.group(0)[1:], text)
 
 
+def split_relay_response(bot_name: str, content: str) -> list[str]:
+    """Split a sanitized Hermes reply into Discord-sized messages."""
+    prefix = f"{bot_name} hear from Hermes: "
+    safe_content = _sanitize_for_relay(content)
+    first_budget = DISCORD_MESSAGE_LIMIT - len(prefix)
+    if len(safe_content) <= first_budget:
+        return [prefix + safe_content]
+
+    chunks = [prefix + safe_content[:first_budget]]
+    remaining = safe_content[first_budget:]
+    continuation = f"{bot_name} hear more: "
+    continuation_budget = DISCORD_MESSAGE_LIMIT - len(continuation)
+    chunks.extend(
+        continuation + remaining[index : index + continuation_budget]
+        for index in range(0, len(remaining), continuation_budget)
+    )
+    return chunks
+
+
+async def _safe_send(channel, content: str) -> bool:
+    """Send without mentions and turn Discord delivery errors into state."""
+    try:
+        await channel.send(content, allowed_mentions=discord.AllowedMentions.none())
+        return True
+    except discord.HTTPException:
+        log.exception("task_relay: Discord message delivery failed")
+        return False
+
+
 def resolve_repo(clean_content: str) -> Optional[str]:
     """Find a known repo name mentioned in the request.
 
@@ -222,12 +253,16 @@ async def relay_to_hermes(
             "task_relay: relay attempt from unauthorized user",
             extra={"user_id": original_message.author.id, "user_name": str(original_message.author)},
         )
-        await original_message.channel.send(f"{bot_name} no know you well enough for that. Ask Evan to add you first.")
+        await _safe_send(
+            original_message.channel,
+            f"{bot_name} no know you well enough for that. Ask Evan to add you first.",
+        )
         return
 
     repo = resolve_repo(clean_content)
     if repo is None:
-        await original_message.channel.send(
+        await _safe_send(
+            original_message.channel,
             f"{bot_name} no know which cave you mean. Say repo name - one of: {', '.join(sorted(REPO_CHANNELS))}."
         )
         return
@@ -238,7 +273,8 @@ async def relay_to_hermes(
             "task_relay: cannot see Hermes repo channel - likely missing Discord permission grant",
             extra={"repo": repo, "channel_id": REPO_CHANNELS[repo]},
         )
-        await original_message.channel.send(
+        await _safe_send(
+            original_message.channel,
             f"{bot_name} try reach Hermes cave for {repo} but door locked. "
             f"Tell Evan: Grug need Discord permission on that channel."
         )
@@ -247,21 +283,35 @@ async def relay_to_hermes(
     task = classify_task(clean_content)
     if task is None:
         log.warning("task_relay: relay called for non-task content")
-        await original_message.channel.send(f"{bot_name} no find coding work in that request.")
+        await _safe_send(original_message.channel, f"{bot_name} no find coding work in that request.")
         return
 
     requester = original_message.author.display_name or original_message.author.name
     relay_content = format_relay_request(task, requester)
 
     try:
-        relay_message = await channel.send(relay_content)
-        thread = await relay_message.create_thread(name=f"grug-relay-{original_message.id}")
+        relay_message = await channel.send(relay_content, allowed_mentions=discord.AllowedMentions.none())
     except discord.HTTPException:
         log.exception("task_relay: failed to relay task into Hermes channel", extra={"repo": repo})
-        await original_message.channel.send(f"{bot_name} try reach Hermes but stumble. Try again little later.")
+        await _safe_send(original_message.channel, f"{bot_name} try reach Hermes but stumble. Try again little later.")
         return
 
-    await original_message.channel.send(f"{bot_name} go ask Hermes about {repo}. {bot_name} wait.")
+    try:
+        thread = await relay_message.create_thread(name=f"grug-relay-{original_message.id}")
+    except discord.HTTPException:
+        log.exception(
+            "task_relay: task dispatched but thread creation failed",
+            extra={"repo": repo, "relay_message_id": relay_message.id},
+        )
+        await _safe_send(
+            original_message.channel,
+            f"{bot_name} delivered task to Hermes for {repo}, but could not make reply thread. "
+            f"Do not retry. Follow task here: {relay_message.jump_url}",
+        )
+        return
+
+    if not await _safe_send(original_message.channel, f"{bot_name} go ask Hermes about {repo}. {bot_name} wait."):
+        return
 
     await _watch_and_relay(client, thread, original_message, bot_name)
 
@@ -285,7 +335,8 @@ async def _watch_and_relay(
     hermes_id = _get_hermes_user_id()
     if hermes_id is None:
         log.warning("task_relay: HERMES_BOT_USER_ID not configured - not watching for a reply")
-        await original_message.channel.send(
+        await _safe_send(
+            original_message.channel,
             f"{bot_name} no know which grug is Hermes yet - check the thread yourself: {thread.jump_url}"
         )
         return
@@ -310,9 +361,10 @@ async def _watch_and_relay(
         except asyncio.TimeoutError:
             if got_any_reply:
                 # Quiet long enough after at least one reply - call it done.
-                await original_message.channel.send(f"{bot_name} done listen. Hermes finish - see above.")
+                await _safe_send(original_message.channel, f"{bot_name} done listen. Hermes finish - see above.")
                 return
-            await original_message.channel.send(f"{bot_name} still wait on Hermes...")
+            if not await _safe_send(original_message.channel, f"{bot_name} still wait on Hermes..."):
+                return
             last_activity = time.monotonic()
             continue
         except Exception:
@@ -322,15 +374,19 @@ async def _watch_and_relay(
             # otherwise vanish silently, leaving the earlier "go ask Hermes,
             # wait" ack as a promise that's never fulfilled or explained.
             log.exception("task_relay: unexpected error while watching for Hermes' reply")
-            await original_message.channel.send(
+            await _safe_send(
+                original_message.channel,
                 f"{bot_name} lose Hermes' trail - something break. Check the thread yourself: {thread.jump_url}"
             )
             return
 
         got_any_reply = True
         last_activity = time.monotonic()
-        await original_message.channel.send(f"{bot_name} hear from Hermes: {reply.content}")
+        for chunk in split_relay_response(bot_name, reply.content):
+            if not await _safe_send(original_message.channel, chunk):
+                return
 
-    await original_message.channel.send(
+    await _safe_send(
+        original_message.channel,
         f"{bot_name} wait long time. Check thread for latest word from Hermes: {thread.jump_url}"
     )

@@ -81,6 +81,14 @@ def test_review_instruction_requests_peer_review_without_edits():
     assert "Do not edit code" in instruction
 
 
+def test_relay_instruction_sanitizes_requester_name():
+    request = task_relay.TaskRequest(kind="change", content="fix auth in grug")
+
+    instruction = task_relay.format_relay_request(request, "@everyone")
+
+    assert "@everyone" not in instruction
+
+
 def test_resolve_repo_finds_known_repo():
     assert task_relay.resolve_repo("implement X in the macchina repo") == "macchina"
     assert task_relay.resolve_repo("fix a thing in digital-ledger please") == "digital-ledger"
@@ -172,6 +180,14 @@ def test_sanitize_for_relay_leaves_ordinary_text_untouched():
     assert task_relay._sanitize_for_relay(text) == text
 
 
+def test_long_hermes_response_is_split_with_mentions_disabled():
+    chunks = task_relay.split_relay_response("Grug", "@everyone " + "x" * 4000)
+
+    assert len(chunks) == 3
+    assert all(len(chunk) <= task_relay.DISCORD_MESSAGE_LIMIT for chunk in chunks)
+    assert all("@everyone" not in chunk for chunk in chunks)
+
+
 @pytest.mark.asyncio
 async def test_relay_sends_review_contract_to_hermes(monkeypatch):
     monkeypatch.setenv("TASK_RELAY_ALLOWED_USER_IDS", "111")
@@ -199,4 +215,37 @@ async def test_relay_sends_review_contract_to_hermes(monkeypatch):
     relayed = hermes_channel.send.await_args.args[0]
     assert "Treat this as read-only review work" in relayed
     assert "independent peer-review or audit tools" in relayed
+    assert hermes_channel.send.await_args.kwargs["allowed_mentions"].everyone is False
     watch.assert_awaited_once_with(client, thread, original_message, "Grug")
+
+
+@pytest.mark.asyncio
+async def test_thread_failure_reports_dispatched_task_without_inviting_retry(monkeypatch):
+    monkeypatch.setenv("TASK_RELAY_ALLOWED_USER_IDS", "111")
+    original_channel = MagicMock()
+    original_channel.send = AsyncMock()
+    original_message = MagicMock()
+    original_message.id = 721
+    original_message.author.id = 111
+    original_message.author.display_name = "Evan"
+    original_message.channel = original_channel
+
+    relay_message = MagicMock()
+    relay_message.id = 999
+    relay_message.jump_url = "https://discord.example/messages/999"
+    relay_message.create_thread = AsyncMock(side_effect=task_relay.discord.HTTPException(MagicMock(), "failed"))
+    hermes_channel = MagicMock()
+    hermes_channel.send = AsyncMock(return_value=relay_message)
+    client = MagicMock()
+    client.get_channel.return_value = hermes_channel
+
+    watch = AsyncMock()
+    monkeypatch.setattr(task_relay, "_watch_and_relay", watch)
+
+    await task_relay.relay_to_hermes(client, original_message, "Grug", "fix auth in grug")
+
+    notice = original_channel.send.await_args.args[0]
+    assert "delivered task" in notice
+    assert "Do not retry" in notice
+    assert relay_message.jump_url in notice
+    watch.assert_not_awaited()
