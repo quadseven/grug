@@ -26,7 +26,7 @@ def test_small_diff_stays_on_single_review_path() -> None:
     assert render_review_map(plan) == ""
 
 
-def test_large_diff_keeps_related_directories_together() -> None:
+def test_large_diff_keeps_matching_implementation_and_test_together() -> None:
     hunks = [
         _Hunk("src/a.py", "a" * 40),
         _Hunk("tests/test_a.py", "t" * 40),
@@ -36,9 +36,9 @@ def test_large_diff_keeps_related_directories_together() -> None:
     plan = plan_review(hunks, max_cohort_chars=90)
 
     assert plan.staged
-    assert [cohort.label for cohort in plan.cohorts] == ["src", "tests"]
-    assert plan.cohorts[0].hunk_indexes == (0, 2)
-    assert plan.cohorts[1].hunk_indexes == (1,)
+    assert plan.cohorts[0].hunk_indexes == (0, 1)
+    assert plan.cohorts[0].layers == ("implementation", "verification")
+    assert plan.cohorts[1].hunk_indexes == (2,)
 
 
 def test_oversized_area_is_split_without_splitting_hunks() -> None:
@@ -120,6 +120,20 @@ def test_reviewability_reports_oversized_hunk_and_cross_cohort_module() -> None:
     }
     cross = next(c for c in plan.concerns if c.kind == "cross-cohort-module")
     assert cross.paths == ("src/tangled.py",)
+
+
+def test_reviewability_reports_semantic_proof_split_across_cohorts() -> None:
+    plan = plan_review(
+        [
+            _Hunk("src/account.py", "a" * 60),
+            _Hunk("tests/test_account.py", "t" * 60),
+        ],
+        max_cohort_chars=100,
+    )
+
+    concern = next(item for item in plan.concerns if item.kind == "cross-cohort-proof")
+    assert concern.paths == ("src/account.py", "tests/test_account.py")
+    assert "implementation and verification" in concern.message
 
 
 def test_review_map_exposes_layers_and_reviewability_without_diff_content() -> None:

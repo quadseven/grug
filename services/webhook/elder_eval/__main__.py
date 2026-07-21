@@ -7,6 +7,9 @@
     python -m elder_eval --check             # ... and exit 1 on regression vs baseline
     python -m elder_eval --ab-practices      # also measure the #527 practices delta
     python -m elder_eval --ab-few-shot       # also measure the #538 few-shot delta
+    python -m elder_eval --production         # shipped staged discovery
+    python -m elder_eval --production --published
+                                             # findings surviving publication gates
 
 Corpus source: `--repo <owner/name>` reads the INGESTED store rows (needs
 the DB env; the in-cluster path), else `--jsonl <path>` parses the
@@ -116,6 +119,11 @@ def _parse_args(
         help="replay through shipped staged review_diff instead of one monolithic bench prompt",
     )
     parser.add_argument(
+        "--published",
+        action="store_true",
+        help="with --production, score findings after diff-only publication gates",
+    )
+    parser.add_argument(
         "--ab-practices",
         action="store_true",
         help="also replay WITH the #527 practices block and print the delta",
@@ -146,12 +154,19 @@ def _load_corpus(args):
 
 
 def _run_requested_mode(parser, args, cases, token):
+    if args.published and not args.production:
+        parser.error("--published requires --production")
     if args.production:
         if args.backend or args.ab_practices or args.ab_few_shot:
             parser.error(
                 "--production cannot be combined with backend or prompt A/B modes"
             )
-        return None, "production-staged", run_production_eval(cases, token=token)
+        name = "production-published" if args.published else "production-discovery"
+        return (
+            None,
+            name,
+            run_production_eval(cases, token=token, published=args.published),
+        )
 
     from sast_benchmark.backends import configured_backends
 

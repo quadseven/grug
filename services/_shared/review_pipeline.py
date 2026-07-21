@@ -126,6 +126,18 @@ def _area(path: str) -> str:
     return parts[0] if len(parts) > 1 else "repository root"
 
 
+def _semantic_stem(path: str) -> str:
+    """Normalize common test filenames to the implementation they verify."""
+    stem = PurePosixPath(path.lower()).stem
+    for prefix in ("test_", "spec_"):
+        if stem.startswith(prefix):
+            stem = stem[len(prefix) :]
+    for suffix in ("_test", "_spec", ".test", ".spec"):
+        if stem.endswith(suffix):
+            stem = stem[: -len(suffix)]
+    return stem
+
+
 def _layer(path: str) -> str:
     """Classify a changed path into a dependency-oriented review layer."""
     lowered = path.lower()
@@ -212,15 +224,58 @@ def _reviewability_concerns(
                 paths=crossing,
             )
         )
+
+    split_units: OrderedDict[str, list[ReviewCohort]] = OrderedDict()
+    for cohort in cohorts:
+        marker = " (part "
+        if marker in cohort.label:
+            split_units.setdefault(cohort.label.partition(marker)[0], []).append(cohort)
+    for parts in split_units.values():
+        layers = {layer for cohort in parts for layer in cohort.layers}
+        if not {"implementation", "verification"}.issubset(layers):
+            continue
+        paths = tuple(dict.fromkeys(path for cohort in parts for path in cohort.paths))
+        concerns.append(
+            ReviewabilityConcern(
+                kind="cross-cohort-proof",
+                message=(
+                    "Related implementation and verification changes do not fit in one "
+                    "bounded proof unit; split the pull request or reduce coupling so "
+                    "behavior and its evidence can be reviewed together."
+                ),
+                paths=paths,
+            )
+        )
     return tuple(concerns)
 
 
 def _ordered_areas(hunks: Sequence[ReviewHunk]) -> list[tuple[str, list[int]]]:
-    areas: OrderedDict[str, list[int]] = OrderedDict()
+    """Build stable semantic units, falling back to top-level areas.
+
+    An unambiguous implementation path and its conventionally named tests are
+    one proof unit.  Ambiguous basenames retain the directory grouping rather
+    than accidentally joining unrelated modules.
+    """
+    paths_by_stem: dict[str, set[str]] = {}
+    verification_stems: set[str] = set()
+    for hunk in hunks:
+        stem = _semantic_stem(hunk.path)
+        layer = _layer(hunk.path)
+        if layer == "verification":
+            verification_stems.add(stem)
+        elif layer == "implementation":
+            paths_by_stem.setdefault(stem, set()).add(hunk.path)
+    paired_stems = {
+        stem for stem in verification_stems if len(paths_by_stem.get(stem, ())) == 1
+    }
+
+    areas: OrderedDict[tuple[str, str], list[int]] = OrderedDict()
     for index, hunk in enumerate(hunks):
-        areas.setdefault(_area(hunk.path), []).append(index)
+        stem = _semantic_stem(hunk.path)
+        key = ("semantic", stem) if stem in paired_stems else ("area", _area(hunk.path))
+        areas.setdefault(key, []).append(index)
     return sorted(
-        areas.items(),
+        ((key[1], indexes) for key, indexes in areas.items()),
         key=lambda item: min(
             _LAYER_RANK[_layer(hunks[index].path)] for index in item[1]
         ),
