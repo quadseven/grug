@@ -163,11 +163,9 @@ spec:
             # cloud fallback receives redacted evidence only.
             - {name: GRUG_CAVE_GATEWAY_URL, value: http://spark-gateway.spark-gateway.svc:8080}
             - {name: GRUG_CAVE_JUDGE_MODEL, value: poolside/Laguna-S-2.1-NVFP4}
-            # Review ensemble arms (#593). Coder = qwen3-coder-next on sparkles;
-            # reasoner = qwen3.5, permanently resident on sparkicus ollama (the
-            # nemotron vLLM was retired 2026-07-12 - pointing at it made every
-            # Elder review cold-load 87GB on a Spark and time out). Tags are
-            # PINNED: a bare :latest resolves to a tag the Sparks don't carry.
+            # Review ensemble arms (#593). Qwen coder stays on Sparkles;
+            # Laguna is the permanently resident Sparkicus vLLM reasoner.
+            # Model names are pinned to the exact names exposed by each server.
             - {name: GRUG_CAVE_REVIEW_MODEL, value: qwen3-coder-next:q8_0}
             - {name: GRUG_CAVE_REASONER_MODEL, value: poolside/Laguna-S-2.1-NVFP4}
             # Omen production-signal fusion (#470). All three fail-open:
