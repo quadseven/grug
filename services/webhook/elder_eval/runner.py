@@ -25,7 +25,14 @@ from code_review_prompt import RULES
 # Elder's exact prompt + parser - deliberate private imports, same
 # rationale + caveat as the SAST runner: if their signatures change, this
 # runner must follow (measuring the shipped prompt is the whole point).
-from llm_client import Finding, Hunk, _build_messages, _parse_response
+from llm_client import (
+    Finding,
+    Hunk,
+    LlmReviewResponse,
+    _build_messages,
+    _parse_response,
+    review_diff,
+)
 from personas.code_reviewer.diff_parser import parse_diff
 from sast_benchmark.backends import BenchBackend
 from sast_benchmark.runner import _post
@@ -153,6 +160,87 @@ def run_case(
         errored=False,
         truncated=truncated,
     )
+
+
+def run_production_case(
+    case: EvalCase,
+    diff_text: str,
+    *,
+    review: Callable[..., LlmReviewResponse] = review_diff,
+) -> CaseReplay:
+    """Replay one case through production's staged discovery path.
+
+    Unlike the historical backend bakeoff, this deliberately sends every
+    parsed hunk to ``review_diff`` so its real cohort planner, specialist
+    routing, merge, and coverage contract are measured. Partial coverage is a
+    non-run for scoring: its apparent misses cannot honestly be compared with
+    a complete baseline.
+    """
+    try:
+        hunks = diff_to_hunks(diff_text)
+        if not hunks:
+            return CaseReplay(case_id=case.case_id, emitted={}, errored=True)
+        response = review(
+            hunks,
+            installation_id=0,
+            pr_context={
+                "repo": case.repo,
+                "pr_number": case.pr,
+                "review_phase": "eval-production",
+            },
+        )
+    except Exception as e:  # noqa: BLE001 - one case must not abort the sweep
+        log.warning(
+            "eval_production_case_errored case=%s kind=%s",
+            case.case_id,
+            type(e).__name__,
+        )
+        return CaseReplay(case_id=case.case_id, emitted={}, errored=True)
+
+    incomplete = (
+        response.coverage is not None and not response.coverage.complete
+    ) or response.error.startswith("partial review:")
+    if response.kind != "reviewed" or incomplete:
+        log.warning(
+            "eval_production_case_incomplete case=%s kind=%s error=%s",
+            case.case_id,
+            response.kind,
+            response.error,
+        )
+        return CaseReplay(case_id=case.case_id, emitted={}, errored=True)
+    return CaseReplay(
+        case_id=case.case_id,
+        emitted=classes_for_findings(response.findings),
+        errored=False,
+    )
+
+
+def run_production_eval(
+    cases: Sequence[EvalCase],
+    *,
+    fetch: Callable[[str, int, str], str] = fetch_pr_diff,
+    token: str = "",
+    review: Callable[..., LlmReviewResponse] = review_diff,
+) -> dict[str, CaseReplay]:
+    """Replay the corpus through the shipped staged discovery pipeline."""
+    replays: dict[str, CaseReplay] = {}
+    for case in cases:
+        try:
+            diff = fetch(case.repo, case.pr, token)
+        except Exception as e:  # noqa: BLE001 - fetch failure is an errored case
+            log.warning(
+                "eval_diff_fetch_failed case=%s kind=%s",
+                case.case_id,
+                type(e).__name__,
+            )
+            replays[case.case_id] = CaseReplay(
+                case_id=case.case_id,
+                emitted={},
+                errored=True,
+            )
+            continue
+        replays[case.case_id] = run_production_case(case, diff, review=review)
+    return replays
 
 
 def run_eval(

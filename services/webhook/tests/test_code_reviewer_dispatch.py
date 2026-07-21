@@ -18,6 +18,7 @@ from llm_client import (
     LlmReviewResponse,
 )
 from personas.code_reviewer import dispatch as cr_dispatch
+from review_pipeline import ReviewCoverage, ReviewabilityConcern
 
 
 _DIFF = """diff --git a/src/x.py b/src/x.py
@@ -335,6 +336,35 @@ def test_inline_comment_body_appends_precedent_note():
     assert body.index("Grug see this before") < body.index("grug-rule:sync-io-in-async")
 
 
+def test_inline_comment_body_exposes_bounded_model_provenance():
+    from personas.code_reviewer.persona import Finding
+
+    f = Finding(
+        file="src/x.py",
+        line=2,
+        severity="high",
+        rule_name="null-deref",
+        message="missing guard",
+        suggestion=None,
+        origins=(FindingOrigin(
+            backend=Backend.CAVE,
+            model="code-specialist",
+            review_span_context=None,
+            cohort_index=2,
+            cohort_count=3,
+            evidence_paths=("src/x.py", "src/types.py"),
+            head_sha="abc123",
+        ),),
+    )
+
+    body = cr_dispatch._inline_comment_body(f)
+
+    assert "Evidence and provenance" in body
+    assert "cohort 2/3" in body
+    assert "src/types.py" in body
+    assert "abc123" in body
+
+
 def test_precedent_notes_for_is_best_effort_on_store_failure(monkeypatch):
     """A ledger fetch failure yields {} - a review is never blocked by
     missing precedent (the finding just posts without its citation)."""
@@ -389,6 +419,35 @@ def test_summary_markdown_renders_findings_table():
     assert summary.count("| - |") + summary.count("| quick win |") + summary.count(
         "| heavy lift |"
     ) >= 2
+
+
+def test_summary_markdown_reports_exact_coverage_and_reviewability_debt():
+    from personas.code_reviewer.persona import CodeReviewEvaluation
+
+    coverage = ReviewCoverage(
+        total_cohorts=3,
+        completed_cohorts=2,
+        failed_cohorts=(3,),
+        cohort_labels=("schemas", "src", "tests"),
+        concerns=(ReviewabilityConcern(
+            kind="cross-cohort-module",
+            message="Module spans independent proof units.",
+            paths=("src/tangled.py",),
+        ),),
+    )
+    ev = CodeReviewEvaluation(
+        findings=(),
+        conclusion="neutral",
+        degraded_reason="partial_review",
+        coverage=coverage,
+    )
+
+    _, summary = cr_dispatch._summary_markdown(ev)
+
+    assert "Coverage: 2/3 cohorts" in summary
+    assert "failed: 3" in summary
+    assert "Reviewability" in summary
+    assert "src/tangled.py" in summary
 
 
 def test_fetch_pr_review_comments_caps_pages(monkeypatch, caplog):
@@ -1793,6 +1852,35 @@ def test_review_stack_degraded_empty_findings_not_nothing_to_remediate():
     assert "nothing to remediate" not in stack.lower()
     assert "review degraded" in stack.lower()
     assert "no usable findings" in stack.lower()
+
+
+def test_partial_review_stays_advisory_but_publishes_validated_findings():
+    from personas.code_reviewer.persona import CodeReviewEvaluation, Finding
+
+    evaluation = CodeReviewEvaluation(
+        findings=(Finding(
+            file="src/x.py",
+            line=2,
+            severity="high",
+            rule_name="null-deref",
+            message="validated cohort finding",
+            suggestion=None,
+        ),),
+        conclusion="failure",
+        degraded_reason="partial_review",
+    )
+
+    assert cr_dispatch._publish_shape(
+        evaluation, mode="blocking",
+    ) == ("neutral", "COMMENT")
+    result = cr_dispatch._build_review_result(
+        evaluation, head_sha="a" * 40, event="COMMENT",
+    )
+    assert result is not None
+    assert len(result.comments) == 1
+    title, summary = cr_dispatch._summary_markdown(evaluation)
+    assert "coverage partial" in title
+    assert "still published" in summary
 
 
 def test_summary_markdown_appends_bounded_consolidated_agent_prompt():

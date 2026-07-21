@@ -31,7 +31,8 @@ from elder_eval.scoring import (
     to_baseline_dict,
 )
 from ledger import LedgerRow
-from llm_client import Finding
+from llm_client import Backend, Finding, LlmReviewResponse
+from review_pipeline import ReviewCoverage
 
 
 def _row(
@@ -514,6 +515,74 @@ def test_run_case_parse_failure_is_errored(monkeypatch):
     )
     replay = runner.run_case(backend, case, diff)
     assert replay.errored
+
+
+def test_production_case_uses_full_diff_and_scores_complete_staged_result():
+    from elder_eval.runner import run_production_case
+
+    (case,) = build_cases([_row(30, "correctness")])
+    diff = (
+        "diff --git a/src/a.py b/src/a.py\n--- a/src/a.py\n+++ b/src/a.py\n"
+        "@@ -1 +1 @@\n-old\n+new\n"
+        "diff --git a/tests/test_a.py b/tests/test_a.py\n--- a/tests/test_a.py\n+++ b/tests/test_a.py\n"
+        "@@ -1 +1 @@\n-old\n+new\n"
+    )
+    seen = {}
+
+    def review(hunks, **kwargs):
+        seen["paths"] = [h.path for h in hunks]
+        seen["context"] = kwargs["pr_context"]
+        return LlmReviewResponse(
+            kind="reviewed",
+            findings=(Finding(
+                path="src/a.py",
+                line=1,
+                rule="correctness",
+                severity="high",
+                message="wrong result",
+            ),),
+            backend_used=Backend.CAVE,
+            model_name="specialist",
+            coverage=ReviewCoverage(
+                total_cohorts=2,
+                completed_cohorts=2,
+                failed_cohorts=(),
+                cohort_labels=("src", "tests"),
+            ),
+        )
+
+    replay = run_production_case(case, diff, review=review)
+
+    assert seen["paths"] == ["src/a.py", "tests/test_a.py"]
+    assert seen["context"]["review_phase"] == "eval-production"
+    assert replay.emitted == {"correctness": 1}
+    assert replay.errored is False
+
+
+def test_production_case_refuses_to_score_partial_coverage():
+    from elder_eval.runner import run_production_case
+
+    (case,) = build_cases([_row(31, "correctness")])
+    diff = (
+        "diff --git a/src/a.py b/src/a.py\n--- a/src/a.py\n+++ b/src/a.py\n"
+        "@@ -1 +1 @@\n-old\n+new\n"
+    )
+
+    def review(_hunks, **_kwargs):
+        return LlmReviewResponse(
+            kind="reviewed",
+            coverage=ReviewCoverage(
+                total_cohorts=2,
+                completed_cohorts=1,
+                failed_cohorts=(2,),
+                cohort_labels=("src", "tests"),
+            ),
+            error="partial review: cohorts [2] failed",
+        )
+
+    replay = run_production_case(case, diff, review=review)
+
+    assert replay.errored is True
     assert replay.emitted == {}
 
 

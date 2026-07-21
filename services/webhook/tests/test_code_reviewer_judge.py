@@ -24,9 +24,11 @@ _DIFF = """diff --git a/src/x.py b/src/x.py
 """
 
 
-def _finding(rule="r", line=2, severity="medium", origins=()) -> Finding:
+def _finding(
+    rule="r", line=2, severity="medium", origins=(), file="src/x.py",
+) -> Finding:
     return Finding(
-        file="src/x.py", line=line, severity=severity, rule_name=rule,
+        file=file, line=line, severity=severity, rule_name=rule,
         message="m", suggestion=None, origins=origins,
     )
 
@@ -531,13 +533,27 @@ def test_grade_findings_caps_total_batches_and_leaves_remainder_ungraded(
     assert any(record.message == "judge_total_cap_reached" for record in caplog.records)
 
 
-def test_grade_findings_forwards_full_review_context_and_redacts(monkeypatch):
+def test_grade_findings_scopes_review_evidence_to_candidate_files(monkeypatch):
+    diff = """diff --git a/src/x.py b/src/x.py
+--- a/src/x.py
++++ b/src/x.py
+@@ -1 +1 @@
+-old
++new
+diff --git a/tests/test_y.py b/tests/test_y.py
+--- a/tests/test_y.py
++++ b/tests/test_y.py
+@@ -1 +1 @@
+-old_test
++new_test
+"""
     evaluation = CodeReviewEvaluation(
         findings=(_finding(rule="caller-not-updated"),), conclusion="success",
     )
     captured: dict = {}
 
-    def judge_batch(reprs, *args, **kwargs):
+    def judge_batch(reprs, hunks, *args, **kwargs):
+        captured["hunks"] = hunks
         captured.update(kwargs)
         return (FindingJudgement(0, True, "real"),)
 
@@ -545,15 +561,105 @@ def test_grade_findings_forwards_full_review_context_and_redacts(monkeypatch):
 
     verdicts = cr_judge.grade_findings(
         evaluation,
-        parse_diff(_DIFF),
+        parse_diff(diff),
         installation_id=1,
         pr_context={"title": "contract"},
-        file_contents={"src/x.py": "changed"},
+        file_contents={
+            "src/x.py": "changed",
+            "tests/test_y.py": "unrelated",
+        },
         cross_file_contents={"src/caller.py": "old_call()"},
         runtime_context="10 errors",
     )
 
     assert len(verdicts) == 1
+    assert [h.path for h in captured["hunks"]] == ["src/x.py"]
+    assert captured["file_contents"] == {"src/x.py": "changed"}
     assert captured["cross_file_contents"] == {"src/caller.py": "old_call()"}
     assert captured["runtime_context"] == "10 errors"
     assert captured["redact"] is True
+
+
+def test_grade_findings_uses_owned_reasoner_then_redacted_fallback(monkeypatch):
+    monkeypatch.setenv("GRUG_CAVE_GATEWAY_URL", "http://gateway")
+    monkeypatch.delenv("GRUG_CAVE_JUDGE_MODEL", raising=False)
+    evaluation = CodeReviewEvaluation(
+        findings=(_finding(rule="caller-not-updated"),), conclusion="success",
+    )
+    calls: list[dict] = []
+
+    def judge_batch(reprs, hunks, *args, **kwargs):
+        calls.append(kwargs)
+        if kwargs["config"] is not None:
+            return ()
+        return (FindingJudgement(0, True, "confirmed"),)
+
+    monkeypatch.setattr(cr_judge, "judge_findings", judge_batch)
+
+    verdicts = cr_judge.grade_findings(
+        evaluation, parse_diff(_DIFF), installation_id=1,
+    )
+
+    assert len(verdicts) == 1
+    assert calls[0]["config"].model == "qwen3.5:122b"
+    assert calls[0]["redact"] is False
+    assert calls[1]["config"] is None
+    assert calls[1]["redact"] is True
+
+
+def test_grade_findings_falls_back_when_owned_reasoner_is_partial(monkeypatch):
+    monkeypatch.setenv("GRUG_CAVE_GATEWAY_URL", "http://gateway")
+    evaluation = CodeReviewEvaluation(
+        findings=(_finding(rule="one"), _finding(rule="two", line=3)),
+        conclusion="success",
+    )
+    calls: list[str] = []
+
+    def judge_batch(reprs, hunks, *args, **kwargs):
+        owned = kwargs["config"] is not None
+        calls.append("owned" if owned else "fallback")
+        if owned:
+            return (FindingJudgement(0, True, "only one"),)
+        return tuple(
+            FindingJudgement(i, True, "complete") for i in range(len(reprs))
+        )
+
+    monkeypatch.setattr(cr_judge, "judge_findings", judge_batch)
+
+    verdicts = cr_judge.grade_findings(
+        evaluation, parse_diff(_DIFF), installation_id=1,
+    )
+
+    assert calls == ["owned", "fallback"]
+    assert len(verdicts) == 2
+
+
+def test_refute_findings_scopes_review_evidence_to_candidate_files(monkeypatch):
+    monkeypatch.delenv("GRUG_CAVE_GATEWAY_URL", raising=False)
+    diff = _DIFF + """diff --git a/src/y.py b/src/y.py
+--- a/src/y.py
++++ b/src/y.py
+@@ -1 +1 @@
+-old_y
++new_y
+"""
+    captured: dict = {}
+
+    def judge_batch(reprs, hunks, *args, **kwargs):
+        captured["hunks"] = hunks
+        captured.update(kwargs)
+        return (FindingJudgement(0, True, "confirmed"),)
+
+    monkeypatch.setattr(cr_judge, "judge_findings", judge_batch)
+
+    verdicts = cr_judge.refute_findings(
+        (_finding(severity="high"),),
+        parse_diff(diff),
+        installation_id=1,
+        file_contents={"src/x.py": "changed", "src/y.py": "unrelated"},
+    )
+
+    assert len(verdicts) == 1
+    assert [h.path for h in captured["hunks"]] == ["src/x.py"]
+    assert captured["file_contents"] == {"src/x.py": "changed"}
+    assert captured["refute"] is True

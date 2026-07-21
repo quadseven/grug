@@ -25,6 +25,7 @@ from dataclasses import replace
 from typing import Optional
 
 from llm_client import (
+    BackendConfig,
     FindingJudgement,
     FindingOrigin,
     Hunk,
@@ -32,6 +33,7 @@ from llm_client import (
     JUDGE_MAX_FINDINGS,
     JudgeFindingRepr,
     PrContext,
+    _cave_judge_config,
     judge_findings,
     submit_finding_evaluation,
 )
@@ -50,6 +52,93 @@ _JUDGE_CONFIDENCE_FLOOR = 0.7
 # Only these severities are ever judge-suppressible - a high/critical finding
 # ALWAYS publishes, so a judge FP on a critical can never hide it (#346).
 _SUPPRESSIBLE_SEVERITIES: frozenset[Severity] = frozenset(("low", "medium"))
+
+
+def _scope_evidence(
+    findings: list[JudgeFindingRepr],
+    hunks: list[Hunk],
+    file_contents: Optional[dict[str, str]],
+) -> tuple[list[Hunk], Optional[dict[str, str]]]:
+    """Build the smallest evidence packet that can prove this batch.
+
+    Discovery may inspect an entire review cohort, but adjudication should not
+    recreate a whole-PR prompt. Cross-file snippets stay available because
+    they were selected upstream as bounded dependency evidence.
+    """
+    paths = {finding["file"] for finding in findings}
+    scoped_hunks = [hunk for hunk in hunks if hunk.path in paths]
+    scoped_files = (
+        {path: body for path, body in file_contents.items() if path in paths}
+        if file_contents is not None
+        else None
+    )
+    return scoped_hunks, scoped_files
+
+
+def _judge_evidence_packet(
+    findings: list[JudgeFindingRepr],
+    hunks: list[Hunk],
+    installation_id: int,
+    *,
+    pr_context: Optional[PrContext],
+    file_contents: Optional[dict[str, str]],
+    cross_file_contents: Optional[dict[str, str]],
+    runtime_context: str | None,
+    refute: bool = False,
+) -> tuple[FindingJudgement, ...]:
+    """Use the owned hot reasoner first, then a redacted cloud fallback."""
+    cave_config: BackendConfig | None = _cave_judge_config()
+    if cave_config is not None:
+        try:
+            verdicts = judge_findings(
+                findings,
+                hunks,
+                installation_id=installation_id,
+                pr_context=pr_context,
+                file_contents=file_contents,
+                cross_file_contents=cross_file_contents,
+                runtime_context=runtime_context,
+                config=cave_config,
+                redact=False,
+                refute=refute,
+            )
+            expected_indices = set(range(len(findings)))
+            actual_indices = {verdict.finding_index for verdict in verdicts}
+            if (
+                len(verdicts) == len(findings)
+                and actual_indices == expected_indices
+            ):
+                return verdicts
+            log.warning(
+                "judge_owned_reasoner_incomplete_falling_back",
+                extra={
+                    "findings": len(findings),
+                    "verdicts": len(verdicts),
+                    "refute": refute,
+                },
+            )
+        except Exception as e:  # noqa: BLE001 - bounded fallback below
+            log.error(
+                "judge_owned_reasoner_failed_falling_back",
+                extra={
+                    "kind": type(e).__name__,
+                    "findings": len(findings),
+                    "refute": refute,
+                },
+                exc_info=True,
+            )
+    return judge_findings(
+        findings,
+        hunks,
+        installation_id=installation_id,
+        pr_context=pr_context,
+        file_contents=file_contents,
+        cross_file_contents=cross_file_contents,
+        runtime_context=runtime_context,
+        config=None,
+        redact=True,
+        refute=refute,
+    )
 
 
 def _finding_to_repr(f: Finding) -> JudgeFindingRepr:
@@ -149,19 +238,18 @@ def grade_findings(
         )
     for start in range(0, len(graded_reprs), JUDGE_BATCH_SIZE):
         batch = graded_reprs[start:start + JUDGE_BATCH_SIZE]
+        scoped_hunks, scoped_files = _scope_evidence(
+            batch, wire_hunks, file_contents,
+        )
         try:
-            batch_verdicts = judge_findings(
+            batch_verdicts = _judge_evidence_packet(
                 batch,
-                wire_hunks,
+                scoped_hunks,
                 installation_id=installation_id,
                 pr_context=pr_context,
-                file_contents=file_contents,
+                file_contents=scoped_files,
                 cross_file_contents=cross_file_contents,
                 runtime_context=runtime_context,
-                # Elder's cloud judge must receive the same secret-masked
-                # evidence as the cloud review pass. Cave-only callers opt out
-                # explicitly at the lower-level judge_findings boundary.
-                redact=True,
             )
         except Exception as e:  # noqa: BLE001 - fail-open per bounded batch
             failed_batches += 1
@@ -366,16 +454,18 @@ def refute_findings(
         return ()
     wire_hunks = [Hunk(path=h.file_path, body=h.body) for h in hunks]
     reprs = [_finding_to_repr(f) for f in findings[:JUDGE_BATCH_SIZE]]
+    scoped_hunks, scoped_files = _scope_evidence(
+        reprs, wire_hunks, file_contents,
+    )
     try:
-        return judge_findings(
+        return _judge_evidence_packet(
             reprs,
-            wire_hunks,
+            scoped_hunks,
             installation_id=installation_id,
             pr_context=pr_context,
-            file_contents=file_contents,
+            file_contents=scoped_files,
             cross_file_contents=cross_file_contents,
             runtime_context=runtime_context,
-            redact=True,
             refute=True,
         )
     except Exception as e:  # noqa: BLE001 - fail-open, mirror grade_findings

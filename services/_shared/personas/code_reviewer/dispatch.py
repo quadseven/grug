@@ -38,11 +38,13 @@ from github_reviews_client import (
     InlineComment, ReviewEvent, ReviewResult, get_review_comments, post_review,
 )
 from llm_client import (
+    DeepEscalationDecision,
     Hunk as LlmHunk,
     LlmReviewResponse,
     PrContext,
     decide_deep_escalation,
     review_diff,
+    review_is_staged,
     review_reasoner_diff,
 )
 from voice_pack import VoiceSelection, entitled_voice
@@ -480,8 +482,107 @@ def _to_llm_hunks(hunks: tuple[DiffHunk, ...]) -> list[LlmHunk]:
     return [LlmHunk(path=h.file_path, body=h.body) for h in hunks]
 
 
+def _review_transparency(
+    evaluation: CodeReviewEvaluation,
+    suppressed_count: int,
+    excluded_paths: tuple[str, ...],
+) -> str:
+    lines = (
+        f"\n\nGrug held back {suppressed_count} weak finding(s) his judge doubted."
+        if suppressed_count
+        else ""
+    )
+    coverage = evaluation.coverage
+    if coverage is not None:
+        failed = (
+            f"; failed: {', '.join(str(index) for index in coverage.failed_cohorts)}"
+            if coverage.failed_cohorts
+            else ""
+        )
+        lines += (
+            f"\n\nCoverage: {coverage.completed_cohorts}/{coverage.total_cohorts} "
+            f"cohorts completed{failed}."
+        )
+        for concern in coverage.concerns:
+            paths = ", ".join(f"`{_md_code_span(path)}`" for path in concern.paths[:6])
+            lines += (
+                f"\n- `{_md_code_span(concern.kind)}`: "
+                f"{_defused(concern.message)} Paths: {paths}"
+            )
+        if coverage.concerns:
+            marker = lines.index("\n- ", lines.index("Coverage:"))
+            lines = f"{lines[:marker]}\n\n**Reviewability**{lines[marker:]}"
+    if excluded_paths:
+        shown = ", ".join(
+            f"`{path.replace(chr(96), '')}`" for path in excluded_paths[:10]
+        )
+        more = (
+            f" (+{len(excluded_paths) - 10} more)" if len(excluded_paths) > 10 else ""
+        )
+        lines += (
+            f"\n\nGrug not read {len(excluded_paths)} data/generated "
+            f"file(s) - no meat for review there: {shown}{more}."
+        )
+    return lines
+
+
+def _clean_review_scope(living_range: str, excluded_paths: tuple[str, ...]) -> str:
+    if living_range:
+        return (
+            "Elder walked the delta diff (full file + cross-file + Omen "
+            "runtime signal when mapped). No markings survived the judge. "
+            "Code walk steady."
+        )
+    if excluded_paths:
+        return (
+            "Elder walked the reviewable diff (full file + cross-file + "
+            "Omen when mapped), skipping data/generated paths listed "
+            "below. No markings survived the judge on the reviewed paths. "
+            "Code walk steady."
+        )
+    return (
+        "Elder walked the whole diff (full file + cross-file + Omen "
+        "runtime signal when mapped). No markings survived the judge. "
+        "Code walk steady."
+    )
+
+
+def _review_phase_line(review_phase: Literal["tier1", "deep", "dual"]) -> str:
+    if review_phase == "tier1":
+        return (
+            "Tier-1 coder-arm review on the Cave (reasoner may append later "
+            "if escalated), graded by the judge, grounded in Lore when prior "
+            "tribe history exists."
+        )
+    if review_phase == "deep":
+        return (
+            "Deep reasoner arm appended after Tier-1 completed, graded by "
+            "the judge, grounded in Lore when prior tribe history exists."
+        )
+    return (
+        "Dual-arm deep review (coder + reasoner on the Cave), graded by "
+        "the judge, grounded in Lore when prior tribe history exists."
+    )
+
+
+def _findings_table(evaluation: CodeReviewEvaluation) -> str:
+    rows = [
+        "| Severity | Effort | File | Line | Rule | Marking |",
+        "|---|---|---|---|---|---|",
+    ]
+    rows.extend(
+        f"| {_severity_chip(f.severity)} | {_effort_chip(f.effort)} | "
+        f"`{_md_code_span(f.file)}` | {f.line} | "
+        f"`{_md_code_span(f.rule_name)}` | {_md_table_cell(f.message)} |"
+        for f in evaluation.findings
+    )
+    return "\n".join(rows)
+
+
 def _summary_markdown(
-    evaluation: CodeReviewEvaluation, *, suppressed_count: int = 0,
+    evaluation: CodeReviewEvaluation,
+    *,
+    suppressed_count: int = 0,
     excluded_paths: tuple[str, ...] = (),
     living_range: str = "",
     review_phase: Literal["tier1", "deep", "dual"] = "dual",
@@ -498,30 +599,27 @@ def _summary_markdown(
     `review_phase` (#646): tier1 = coder-only legend; deep = append legend;
     dual = both arms before publish (deep depth / rollback).
     """
-    held = (
-        f"\n\nGrug held back {suppressed_count} weak finding(s) his judge doubted."
-        if suppressed_count
+    held = _review_transparency(evaluation, suppressed_count, excluded_paths)
+    hunt = (
+        (
+            "\n\nLiving Hunt: reviewing `"
+            + living_range
+            + "` (files changed since the last completed Elder pass)."
+        )
+        if living_range
         else ""
     )
-    if excluded_paths:
-        # Paths are author-controlled: strip backticks so a crafted filename
-        # cannot break out of the inline code span into the summary markdown.
-        shown = ", ".join(
-            f"`{p.replace(chr(96), '')}`" for p in excluded_paths[:10]
-        )
-        more = f" (+{len(excluded_paths) - 10} more)" if len(excluded_paths) > 10 else ""
-        held += (
-            f"\n\nGrug not read {len(excluded_paths)} data/generated "
-            f"file(s) - no meat for review there: {shown}{more}."
-        )
-    hunt = (
-        ("\n\nLiving Hunt: reviewing `" + living_range +
-         "` (files changed since the last completed Elder pass).")
-        if living_range else ""
-    )
+
     def hunt_title(title: str) -> str:
         return f"Living Hunt {living_range} - {title}" if living_range else title
 
+    if evaluation.degraded_reason == "partial_review":
+        title = "WARN Elder review coverage partial"
+        return hunt_title(title), (
+            "Grug reviewed part of the diff, but one or more bounded cohorts "
+            "did not return usable output. Validated markings from completed "
+            "cohorts are still published below; this check stays advisory."
+        ) + held + hunt
     if evaluation.degraded_reason:
         title = f"WARN Grug eyes clouded ({evaluation.degraded_reason})"
         return hunt_title(title), (
@@ -535,63 +633,14 @@ def _summary_markdown(
             if not suppressed_count
             else "Elder clear - weak markings held back"
         )
-        if living_range:
-            scope = (
-                "Elder walked the delta diff (full file + cross-file + Omen "
-                "runtime signal when mapped). No markings survived the judge. "
-                "Code walk steady."
-            )
-        elif excluded_paths:
-            scope = (
-                "Elder walked the reviewable diff (full file + cross-file + "
-                "Omen when mapped), skipping data/generated paths listed "
-                "below. No markings survived the judge on the reviewed paths. "
-                "Code walk steady."
-            )
-        else:
-            scope = (
-                "Elder walked the whole diff (full file + cross-file + Omen "
-                "runtime signal when mapped). No markings survived the judge. "
-                "Code walk steady."
-            )
+        scope = _clean_review_scope(living_range, excluded_paths)
         return hunt_title(title), ("## Markings Board\n\n" + scope) + held + hunt
 
-    blocking = sum(
-        1 for f in evaluation.findings if f.severity in ("high", "critical")
-    )
-    title = (
-        f"Elder markings - {blocking} blocking, "
-        f"{len(evaluation.findings)} total"
-    )
+    blocking = sum(1 for f in evaluation.findings if f.severity in ("high", "critical"))
+    title = f"Elder markings - {blocking} blocking, {len(evaluation.findings)} total"
     title = hunt_title(title)
-    rows = [
-        "| Severity | Effort | File | Line | Rule | Marking |",
-        "|---|---|---|---|---|---|",
-    ]
-    for f in evaluation.findings:
-        rows.append(
-            f"| {_severity_chip(f.severity)} | {_effort_chip(f.effort)} | "
-            f"`{_md_code_span(f.file)}` | {f.line} | "
-            f"`{_md_code_span(f.rule_name)}` | "
-            f"{_md_table_cell(f.message)} |"
-        )
-    table = "\n".join(rows)
-    if review_phase == "tier1":
-        phase_line = (
-            "Tier-1 coder-arm review on the Cave (reasoner may append later "
-            "if escalated), graded by the judge, grounded in Lore when prior "
-            "tribe history exists."
-        )
-    elif review_phase == "deep":
-        phase_line = (
-            "Deep reasoner arm appended after Tier-1 completed, graded by "
-            "the judge, grounded in Lore when prior tribe history exists."
-        )
-    else:
-        phase_line = (
-            "Dual-arm deep review (coder + reasoner on the Cave), graded by "
-            "the judge, grounded in Lore when prior tribe history exists."
-        )
+    table = _findings_table(evaluation)
+    phase_line = _review_phase_line(review_phase)
     legend = (
         "## Markings Board\n\n"
         f"{phase_line} "
@@ -833,6 +882,38 @@ def _agent_prompt_block(f: Finding) -> str:
     return _details_block("Prompt for AI agents", "\n".join(content))
 
 
+def _provenance_block(f: Finding) -> str:
+    """Render bounded, immutable discovery scope for a finding."""
+    if not f.origins:
+        return ""
+    lines: list[str] = []
+    seen: set[tuple] = set()
+    for origin in f.origins:
+        key = (
+            origin.backend,
+            origin.model,
+            origin.cohort_index,
+            origin.cohort_count,
+            origin.evidence_paths,
+            origin.head_sha,
+        )
+        if key in seen:
+            continue
+        seen.add(key)
+        scope = ""
+        if origin.cohort_index is not None and origin.cohort_count is not None:
+            scope = f"; cohort {origin.cohort_index}/{origin.cohort_count}"
+        sha = f"; head `{_md_code_span(origin.head_sha[:12])}`" if origin.head_sha else ""
+        paths = ", ".join(
+            f"`{_md_code_span(path)}`" for path in origin.evidence_paths[:8]
+        )
+        path_note = f"; evidence paths: {paths}" if paths else ""
+        lines.append(
+            f"- `{_md_code_span(origin.model)}` ({origin.backend.value}){scope}{sha}{path_note}"
+        )
+    return _details_block("Evidence and provenance", "\n".join(lines))
+
+
 def _inline_comment_body(f: Finding, precedent_note: str = "") -> str:
     """Format one finding as a structured Marking (#553 / #617 / Markings v2).
 
@@ -901,6 +982,9 @@ def _inline_comment_body(f: Finding, precedent_note: str = "") -> str:
         )
     else:
         body = head
+    provenance = _provenance_block(f)
+    if provenance:
+        body += f"\n\n{provenance}"
     return f"{body}\n\n{_agent_prompt_block(f)}\n\n{rule_marker(f.rule_name)}"
 
 
@@ -1178,14 +1262,15 @@ def _build_review_result(
 ) -> ReviewResult | None:
     """Build the ReviewResult, or None if nothing NEW to post.
 
-    Skips entirely on degraded responses. `prior_keys` (non-empty only
-    on a synchronize/reopened push) dedups findings already commented
+    Skips entirely on fully degraded responses. A partial staged review still
+    publishes its validated findings, but stays advisory. `prior_keys`
+    (non-empty only on a synchronize/reopened push) dedups findings already commented
     on unchanged lines (#189) — so a re-review doesn't flood the PR with
     duplicate inline comments. If every finding was already posted,
     returns None (nothing new). NOTE: dedup affects only the inline
     REVIEW; the check-run summary/conclusion still reflect ALL current
     findings (the bugs are still there)."""
-    if evaluation.degraded_reason:
+    if evaluation.degraded_reason not in (None, "", "partial_review"):
         return None
     new_findings = dedup_findings(evaluation.findings, prior_keys)
     if not new_findings:
@@ -1791,12 +1876,12 @@ def dispatch_code_review(
         prior_keys, dedup_degraded = _prior_finding_keys(
             installation_id, owner, repo_name, pull_number,
         )
-    # Only pay the ledger fetch when there is something to annotate: a
-    # degraded eval publishes no inline review, and no findings means no
-    # notes (CodeRabbit on #614).
+    # Only pay the ledger fetch when there is something to annotate. A fully
+    # degraded eval publishes no inline review; a partial staged review does.
     precedent_notes = (
         _precedent_notes_for(f"{owner}/{repo_name}", evaluation.findings)
-        if evaluation.findings and not evaluation.degraded_reason
+        if evaluation.findings
+        and evaluation.degraded_reason in (None, "", "partial_review")
         else {}
     )
     review_result = _build_review_result(
@@ -2181,6 +2266,234 @@ def _async_deep_enabled() -> bool:
     return raw not in {"0", "false", "off", "no"}
 
 
+def _async_deep_decision(
+    *,
+    check_publish_failed: bool,
+    llm_hunks: list[LlmHunk],
+    pr_context: PrContext,
+    evaluation: CodeReviewEvaluation,
+    cancel_event: threading.Event | None,
+    owner: str,
+    repo_name: str,
+    pull_number: int,
+) -> DeepEscalationDecision | None:
+    """Return the escalation decision only when deep append may safely start."""
+    depth = os.getenv("GRUG_REVIEW_DEPTH", "tiered").strip().lower()
+    unavailable = (
+        check_publish_failed
+        or not _async_deep_enabled()
+        or depth != "tiered"
+        or evaluation.degraded_reason not in (None, "", "no_diff", "partial_review")
+        or (cancel_event is not None and cancel_event.is_set())
+    )
+    if unavailable:
+        return None
+    if review_is_staged(llm_hunks):
+        log.info(
+            "elder_async_deep_skipped_staged_review",
+            extra={"pr": f"{owner}/{repo_name}#{pull_number}"},
+        )
+        return None
+    decision = decide_deep_escalation(list(llm_hunks), pr_context)
+    return decision if decision.escalate else None
+
+
+def _deep_snapshot_is_stale(
+    *,
+    action: str,
+    installation_id: int,
+    owner: str,
+    repo_name: str,
+    pull_number: int,
+    snapshot_id: str,
+    head_sha: str,
+    when: str = "pre_infer",
+) -> bool:
+    if action != "review":
+        return False
+    stale = _review_snapshot_freshness_failure(
+        installation_id=installation_id,
+        owner=owner,
+        repo_name=repo_name,
+        pull_number=pull_number,
+        expected_snapshot_id=snapshot_id,
+        expected_head_sha=head_sha,
+    )
+    if stale is not None:
+        log.info(
+            "elder_async_deep_skipped_stale",
+            extra={"pr": f"{owner}/{repo_name}#{pull_number}", "when": when},
+        )
+    return stale is not None
+
+
+def _grade_deep_response(
+    deep_llm: LlmReviewResponse,
+    hunks: tuple[DiffHunk, ...],
+    installation_id: int,
+    *,
+    pr_context: PrContext,
+    file_contents: dict[str, str] | None,
+    cross_file_contents: dict[str, str] | None,
+    runtime_context: str | None,
+    owner: str,
+    repo_name: str,
+    pull_number: int,
+) -> tuple[CodeReviewEvaluation, tuple[Finding, ...], tuple[Any, ...], int]:
+    deep_eval = evaluate_diff(hunks, deep_llm)
+    deep_graded = deep_eval.findings
+    deep_verdicts = grade_findings(
+        deep_eval,
+        hunks,
+        installation_id,
+        pr_context=pr_context,
+        file_contents=file_contents,
+        cross_file_contents=cross_file_contents,
+        runtime_context=runtime_context,
+    )
+    deep_kept, deep_suppressed = partition_findings(deep_graded, deep_verdicts)
+    if deep_suppressed:
+        deep_eval = with_findings(deep_eval, deep_kept)
+    deep_verified, deep_killed = verify_findings(
+        deep_eval.findings,
+        file_contents or {},
+    )
+    if deep_killed:
+        deep_eval = with_findings(deep_eval, deep_verified)
+    _record_verification_kills(
+        deep_killed,
+        installation_id=installation_id,
+        owner=owner,
+        repo_name=repo_name,
+        pull_number=pull_number,
+        arm="deep",
+    )
+    deep_surviving = _apply_refute_gate(
+        deep_eval.findings,
+        hunks,
+        installation_id,
+        pr_context=pr_context,
+        file_contents=file_contents,
+        cross_file_contents=cross_file_contents,
+        runtime_context=runtime_context,
+        owner=owner,
+        repo_name=repo_name,
+        pull_number=pull_number,
+        arm="deep",
+    )
+    if len(deep_surviving) != len(deep_eval.findings):
+        deep_eval = with_findings(deep_eval, deep_surviving)
+    return deep_eval, deep_graded, deep_verdicts, len(deep_suppressed)
+
+
+def _publish_deep_check(
+    *,
+    installation_id: int,
+    owner: str,
+    repo_name: str,
+    pull_number: int,
+    head_sha: str,
+    conclusion: CheckConclusion,
+    title: str,
+    summary: str,
+) -> None:
+    try:
+        with_install_token_retry(
+            installation_id,
+            lambda token: post_check_run(
+                token,
+                owner,
+                repo_name,
+                CheckRunResult(
+                    name=_CHECK_NAME,
+                    head_sha=head_sha,
+                    status="completed",
+                    conclusion=conclusion,
+                    title=title,
+                    summary=summary,
+                ),
+                external_id=f"grug-cr-deep:{owner}/{repo_name}#{pull_number}:{head_sha}",
+            ),
+        )
+    except (httpx.HTTPStatusError, httpx.RequestError) as error:
+        log.warning(
+            "elder_async_deep_check_publish_failed",
+            extra={
+                "pr": f"{owner}/{repo_name}#{pull_number}",
+                "kind": type(error).__name__,
+            },
+        )
+
+
+def _publish_deep_review(
+    deep_eval: CodeReviewEvaluation,
+    *,
+    novel_deep: tuple[Finding, ...],
+    head_sha: str,
+    event: ReviewEvent,
+    all_prior: frozenset[str],
+    installation_id: int,
+    owner: str,
+    repo_name: str,
+    pull_number: int,
+) -> None:
+    if not novel_deep:
+        return
+    review_result = _build_review_result(
+        deep_eval,
+        head_sha=head_sha,
+        event=event,
+        prior_keys=all_prior,
+        precedent_notes={},
+    )
+    if review_result is None:
+        return
+    try:
+        with_install_token_retry(
+            installation_id,
+            lambda token: post_review(
+                token,
+                owner,
+                repo_name,
+                pull_number=pull_number,
+                result=review_result,
+            ),
+        )
+    except (httpx.HTTPStatusError, httpx.RequestError) as error:
+        log.warning(
+            "elder_async_deep_review_publish_failed",
+            extra={
+                "pr": f"{owner}/{repo_name}#{pull_number}",
+                "kind": type(error).__name__,
+            },
+        )
+
+
+def _submit_deep_evals(
+    deep_graded: tuple[Finding, ...],
+    deep_verdicts: tuple[Any, ...],
+    deep_llm: LlmReviewResponse,
+    *,
+    owner: str,
+    repo_name: str,
+    pull_number: int,
+) -> None:
+    try:
+        submit_evals(
+            deep_graded,
+            deep_verdicts,
+            review_span_context=deep_llm.review_span_context,
+        )
+    except Exception as error:  # noqa: BLE001
+        log.warning(
+            "elder_async_deep_evals_failed",
+            extra={
+                "pr": f"{owner}/{repo_name}#{pull_number}",
+                "kind": type(error).__name__,
+            },
+        )
+
+
 def _async_deep_append_if_needed(
     *,
     installation_id: int,
@@ -2190,7 +2503,7 @@ def _async_deep_append_if_needed(
     head_sha: str,
     action: str,
     snapshot_id: str,
-    mode: str,
+    mode: ReviewMode,
     blocking: bool,
     hunks: tuple[DiffHunk, ...],
     llm_hunks: list[LlmHunk],
@@ -2210,19 +2523,17 @@ def _async_deep_append_if_needed(
     Posts additional inline comments and a second completed check-run summary
     that includes deep findings. Never raises to the caller.
     """
-    if check_publish_failed:
-        return
-    if not _async_deep_enabled():
-        return
-    depth = os.getenv("GRUG_REVIEW_DEPTH", "tiered").strip().lower()
-    if depth != "tiered":
-        return
-    if evaluation.degraded_reason not in (None, "", "no_diff"):
-        return
-    if cancel_event is not None and cancel_event.is_set():
-        return
-    decision = decide_deep_escalation(list(llm_hunks), pr_context)
-    if not decision.escalate:
+    decision = _async_deep_decision(
+        check_publish_failed=check_publish_failed,
+        llm_hunks=llm_hunks,
+        pr_context=pr_context,
+        evaluation=evaluation,
+        cancel_event=cancel_event,
+        owner=owner,
+        repo_name=repo_name,
+        pull_number=pull_number,
+    )
+    if decision is None:
         return
 
     log.info(
@@ -2234,21 +2545,16 @@ def _async_deep_append_if_needed(
         },
     )
 
-    if action == "review":
-        stale = _review_snapshot_freshness_failure(
-            installation_id=installation_id,
-            owner=owner,
-            repo_name=repo_name,
-            pull_number=pull_number,
-            expected_snapshot_id=snapshot_id,
-            expected_head_sha=head_sha,
-        )
-        if stale is not None:
-            log.info(
-                "elder_async_deep_skipped_stale",
-                extra={"pr": f"{owner}/{repo_name}#{pull_number}"},
-            )
-            return
+    if _deep_snapshot_is_stale(
+        action=action,
+        installation_id=installation_id,
+        owner=owner,
+        repo_name=repo_name,
+        pull_number=pull_number,
+        snapshot_id=snapshot_id,
+        head_sha=head_sha,
+    ):
+        return
 
     deep_llm = review_reasoner_diff(
         llm_hunks,
@@ -2271,42 +2577,18 @@ def _async_deep_append_if_needed(
         )
         return
 
-    deep_eval = evaluate_diff(hunks, deep_llm)
-    # Keep the full graded set for eval telemetry before publication gate
-    # mutates the published list (verdict indices bind to this tuple).
-    deep_graded = deep_eval.findings
-    deep_verdicts = grade_findings(
-        deep_eval, hunks, installation_id,
+    deep_eval, deep_graded, deep_verdicts, deep_suppressed_count = _grade_deep_response(
+        deep_llm,
+        hunks,
+        installation_id,
         pr_context=pr_context,
         file_contents=file_contents,
         cross_file_contents=cross_file_contents,
         runtime_context=runtime_context,
+        owner=owner,
+        repo_name=repo_name,
+        pull_number=pull_number,
     )
-    deep_kept, deep_suppressed = partition_findings(
-        deep_graded, deep_verdicts,
-    )
-    if deep_suppressed:
-        deep_eval = with_findings(deep_eval, deep_kept)
-
-    # Same verification gate as the tier-1 arm (#708; workflow review on
-    # PR #710 caught the gap): without it, a finding class killed in
-    # tier-1 resurrects unverified through the deep reasoner.
-    deep_verified, deep_killed = verify_findings(deep_eval.findings, file_contents)
-    if deep_killed:
-        deep_eval = with_findings(deep_eval, deep_verified)
-    _record_verification_kills(
-        deep_killed, installation_id=installation_id, owner=owner,
-        repo_name=repo_name, pull_number=pull_number, arm="deep",
-    )
-    deep_surviving = _apply_refute_gate(
-        deep_eval.findings, hunks, installation_id,
-        pr_context=pr_context, file_contents=file_contents,
-        cross_file_contents=cross_file_contents,
-        runtime_context=runtime_context, owner=owner,
-        repo_name=repo_name, pull_number=pull_number, arm="deep",
-    )
-    if len(deep_surviving) != len(deep_eval.findings):
-        deep_eval = with_findings(deep_eval, deep_surviving)
 
     # Supersession after long reasoner/judge work (#646 CodeRabbit).
     if cancel_event is not None and cancel_event.is_set():
@@ -2315,21 +2597,17 @@ def _async_deep_append_if_needed(
             extra={"pr": f"{owner}/{repo_name}#{pull_number}"},
         )
         return
-    if action == "review":
-        stale = _review_snapshot_freshness_failure(
-            installation_id=installation_id,
-            owner=owner,
-            repo_name=repo_name,
-            pull_number=pull_number,
-            expected_snapshot_id=snapshot_id,
-            expected_head_sha=head_sha,
-        )
-        if stale is not None:
-            log.info(
-                "elder_async_deep_skipped_stale",
-                extra={"pr": f"{owner}/{repo_name}#{pull_number}", "when": "post_infer"},
-            )
-            return
+    if _deep_snapshot_is_stale(
+        action=action,
+        installation_id=installation_id,
+        owner=owner,
+        repo_name=repo_name,
+        pull_number=pull_number,
+        snapshot_id=snapshot_id,
+        head_sha=head_sha,
+        when="post_infer",
+    ):
+        return
 
     # Dedupe against already-posted Tier-1 + prior-push comments AND drop
     # reasoner duplicates from the combined check summary.
@@ -2338,7 +2616,8 @@ def _async_deep_append_if_needed(
     )
     all_prior = prior_keys | tier1_keys
     novel_deep = tuple(
-        f for f in deep_eval.findings
+        f
+        for f in deep_eval.findings
         if finding_key(f.file, f.line, f.rule_name) not in tier1_keys
     )
     if novel_deep:
@@ -2354,7 +2633,7 @@ def _async_deep_append_if_needed(
     conclusion, event = _publish_shape(combined, mode=mode)
     title, summary = _summary_markdown(
         combined,
-        suppressed_count=len(deep_suppressed),
+        suppressed_count=deep_suppressed_count,
         living_range=living_range,
         review_phase="deep",
     )
@@ -2363,72 +2642,35 @@ def _async_deep_append_if_needed(
         f"_Deep reasoner arm appended after Tier-1 completed "
         f"({', '.join(decision.reasons)})._\n\n{summary}"
     )
-    try:
-        with_install_token_retry(
-            installation_id,
-            lambda token: post_check_run(
-                token, owner, repo_name,
-                CheckRunResult(
-                    name=_CHECK_NAME,
-                    head_sha=head_sha,
-                    status="completed",
-                    conclusion=conclusion,
-                    title=title,
-                    summary=summary,
-                ),
-                external_id=(
-                    f"grug-cr-deep:{owner}/{repo_name}#{pull_number}:{head_sha}"
-                ),
-            ),
-        )
-    except (httpx.HTTPStatusError, httpx.RequestError) as e:
-        log.warning(
-            "elder_async_deep_check_publish_failed",
-            extra={
-                "pr": f"{owner}/{repo_name}#{pull_number}",
-                "kind": type(e).__name__,
-            },
-        )
-
-    if novel_deep:
-        review_result = _build_review_result(
-            deep_eval,
-            head_sha=head_sha,
-            event=event,
-            prior_keys=all_prior,
-            precedent_notes={},
-        )
-        if review_result is not None:
-            try:
-                with_install_token_retry(
-                    installation_id,
-                    lambda token: post_review(
-                        token, owner, repo_name,
-                        pull_number=pull_number, result=review_result,
-                    ),
-                )
-            except (httpx.HTTPStatusError, httpx.RequestError) as e:
-                log.warning(
-                    "elder_async_deep_review_publish_failed",
-                    extra={
-                        "pr": f"{owner}/{repo_name}#{pull_number}",
-                        "kind": type(e).__name__,
-                    },
-                )
-
-    try:
-        submit_evals(
-            deep_graded, deep_verdicts,
-            review_span_context=deep_llm.review_span_context,
-        )
-    except Exception as e:  # noqa: BLE001
-        log.warning(
-            "elder_async_deep_evals_failed",
-            extra={
-                "pr": f"{owner}/{repo_name}#{pull_number}",
-                "kind": type(e).__name__,
-            },
-        )
+    _publish_deep_check(
+        installation_id=installation_id,
+        owner=owner,
+        repo_name=repo_name,
+        pull_number=pull_number,
+        head_sha=head_sha,
+        conclusion=conclusion,
+        title=title,
+        summary=summary,
+    )
+    _publish_deep_review(
+        deep_eval,
+        novel_deep=novel_deep,
+        head_sha=head_sha,
+        event=event,
+        all_prior=all_prior,
+        installation_id=installation_id,
+        owner=owner,
+        repo_name=repo_name,
+        pull_number=pull_number,
+    )
+    _submit_deep_evals(
+        deep_graded,
+        deep_verdicts,
+        deep_llm,
+        owner=owner,
+        repo_name=repo_name,
+        pull_number=pull_number,
+    )
 
     log.info(
         "elder_async_deep_done",

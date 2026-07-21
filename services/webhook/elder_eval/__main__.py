@@ -43,7 +43,7 @@ from .gate import (
     load_baseline,
     merge_baseline,
 )
-from .runner import run_eval
+from .runner import run_eval, run_production_eval
 from .scoring import EvalReport, compare_to_baseline, score, to_baseline_dict
 
 _REPO_ROOT = Path(__file__).resolve().parents[3]
@@ -93,7 +93,9 @@ def _run_ab_arm(
     )
 
 
-def main(argv: list[str] | None = None) -> int:
+def _parse_args(
+    argv: list[str] | None,
+) -> tuple[argparse.ArgumentParser, argparse.Namespace]:
     parser = argparse.ArgumentParser(prog="elder_eval")
     src = parser.add_mutually_exclusive_group()
     src.add_argument("--repo", help="read the ingested store corpus for this repo")
@@ -109,6 +111,11 @@ def main(argv: list[str] | None = None) -> int:
     )
     parser.add_argument("--backend", help="run only this configured backend")
     parser.add_argument(
+        "--production",
+        action="store_true",
+        help="replay through shipped staged review_diff instead of one monolithic bench prompt",
+    )
+    parser.add_argument(
         "--ab-practices",
         action="store_true",
         help="also replay WITH the #527 practices block and print the delta",
@@ -118,33 +125,40 @@ def main(argv: list[str] | None = None) -> int:
         action="store_true",
         help="also replay WITH the #538 few-shot EXAMPLES and print the delta",
     )
-    args = parser.parse_args(argv)
+    return parser, parser.parse_args(argv)
 
-    logging.basicConfig(level=logging.INFO, format="%(message)s")
 
-    if args.repo:
-        rows = rows_from_store(args.repo)
-    else:
-        rows = parse_jsonl(Path(args.jsonl).read_text())
+def _load_corpus(args):
+    rows = (
+        rows_from_store(args.repo)
+        if args.repo
+        else parse_jsonl(Path(args.jsonl).read_text())
+    )
     all_cases = build_cases(rows)
-    cases = tuple(c for c in all_cases if c.scorable)
+    cases = tuple(case for case in all_cases if case.scorable)
     skipped = len(all_cases) - len(cases)
     if skipped:
-        # Unscorable cases (nothing accepted or FP'd inside Elder's
-        # taxonomy) are skipped LLM calls - skip loudly, never silently.
         print(
             f"skipping {skipped} unscorable case(s) "
             "(no accepted/false-positive rows in Elder's taxonomy)"
         )
-    if not cases:
-        print("corpus has no scorable cases - nothing to eval", file=sys.stderr)
-        return 2
+    return rows, all_cases, cases
+
+
+def _run_requested_mode(parser, args, cases, token):
+    if args.production:
+        if args.backend or args.ab_practices or args.ab_few_shot:
+            parser.error(
+                "--production cannot be combined with backend or prompt A/B modes"
+            )
+        return None, "production-staged", run_production_eval(cases, token=token)
 
     from sast_benchmark.backends import configured_backends
 
     backends = [
-        b for b in configured_backends()
-        if not args.backend or b.name == args.backend
+        backend
+        for backend in configured_backends()
+        if not args.backend or backend.name == args.backend
     ]
     if not backends:
         print(
@@ -152,21 +166,127 @@ def main(argv: list[str] | None = None) -> int:
             "{OPENROUTER,POOLSIDE}_KEY and/or GRUG_BENCH_CAVE_URL+MODEL.",
             file=sys.stderr,
         )
-        return 2
+        return None, "", None
     backend = backends[0]
-    skipped_backends = [b.name for b in backends[1:]]
-    if skipped_backends:
+    if len(backends) > 1:
         print(
             f"running backend {backend.name!r}; skipping configured "
-            f"{', '.join(skipped_backends)} (use --backend to select)"
+            f"{', '.join(item.name for item in backends[1:])} "
+            "(use --backend to select)"
         )
-    token = os.getenv("GITHUB_TOKEN", "")
+    return backend, backend.name, run_eval(backend, cases, token=token)
 
-    # Score over ALL cases: unscorable ones contribute their excluded-row
-    # tallies to the report without being replayed or read as errored.
-    replays = run_eval(backend, cases, token=token)
+
+def _run_ab_modes(args, rows, all_cases, cases, token, report, backend) -> None:
+    block = ""
+    if args.ab_practices:
+        from best_practices import derive_practices, practices_block
+
+        block = practices_block(derive_practices(list(rows)))
+        if not block:
+            print(
+                "#527 practices: no practices derivable from this corpus - "
+                "skipping ON arm (delta would be A/A noise)"
+            )
+    if block:
+        _run_ab_arm(
+            backend,
+            all_cases,
+            cases,
+            token,
+            report,
+            label="practices (#527)",
+            block=block,
+            kwarg="team_practices",
+        )
+
+    examples = ""
+    if args.ab_few_shot:
+        from few_shot import exemplars_block, exemplars_from_rows
+        from ledger import accepted_findings_by_class
+
+        examples = exemplars_block(
+            exemplars_from_rows(accepted_findings_by_class(list(rows)))
+        )
+        if not examples:
+            print(
+                "#538 few-shot: no exemplars derivable from this corpus "
+                "(0 accepted findings) - skipping ON arm (delta would be "
+                "A/A noise)"
+            )
+    if examples:
+        _run_ab_arm(
+            backend,
+            all_cases,
+            cases,
+            token,
+            report,
+            label="few-shot (#538)",
+            block=examples,
+            kwarg="few_shot",
+        )
+
+
+def _record_report(report: EvalReport, backend_name: str) -> int:
+    if report.errored_cases:
+        print(
+            "refusing --record: "
+            f"{len(report.errored_cases)} case(s) errored "
+            f"({', '.join(report.errored_cases)}) - a baseline must "
+            "come from a complete run; fix or prune the cases and re-run",
+            file=sys.stderr,
+        )
+        return 3
+    fresh = to_baseline_dict(
+        report, prompt_sha=compute_prompt_sha(), backend=backend_name
+    )
+    if BASELINE_PATH.exists():
+        fresh, dropped = merge_baseline(load_baseline(), fresh)
+        if dropped:
+            print(
+                "prompt changed since the last record - dropping "
+                f"stale backend baseline(s): {', '.join(dropped)} "
+                "(re-record them against the new prompt)"
+            )
+    BASELINE_PATH.write_text(json.dumps(fresh, indent=2, sort_keys=True) + "\n")
+    print(f"baseline recorded -> {BASELINE_PATH}")
+    return 0
+
+
+def _check_report(report: EvalReport, backend_name: str) -> int:
+    if not BASELINE_PATH.exists():
+        print("no baseline.json to check against - record one first", file=sys.stderr)
+        return 2
+    backend_baseline = load_baseline().get("backends", {}).get(backend_name)
+    if backend_baseline is None:
+        print(f"baseline has no entry for backend {backend_name!r}", file=sys.stderr)
+        return 2
+    regressions = compare_to_baseline(report, backend_baseline)
+    if regressions:
+        print("\nREGRESSIONS vs baseline:")
+        for regression in regressions:
+            print(f"  - {regression}")
+        return 1
+    print("\nno regression vs baseline")
+    return 0
+
+
+def main(argv: list[str] | None = None) -> int:
+    parser, args = _parse_args(argv)
+
+    logging.basicConfig(level=logging.INFO, format="%(message)s")
+    rows, all_cases, cases = _load_corpus(args)
+    if not cases:
+        print("corpus has no scorable cases - nothing to eval", file=sys.stderr)
+        return 2
+
+    token = os.getenv("GITHUB_TOKEN", "")
+    backend, backend_name, replays = _run_requested_mode(parser, args, cases, token)
+    if replays is None:
+        return 2
+
     report = score(all_cases, replays)
-    _print_report(backend.name, report)
+    _print_report(backend_name, report)
 
     if report.all_errored:
         print(
@@ -175,93 +295,14 @@ def main(argv: list[str] | None = None) -> int:
         )
         return 3
 
-    if args.ab_practices:
-        from best_practices import derive_practices, practices_block
-
-        block = practices_block(derive_practices(list(rows)))
-    else:
-        block = ""
-    if args.ab_practices and not block:
-        # An empty block makes the ON arm byte-identical to baseline -
-        # the "delta" would be pure sampling noise dressed as a result.
-        print(
-            "#527 practices: no practices derivable from this corpus - "
-            "skipping ON arm (delta would be A/A noise)"
-        )
-    if block:
-        _run_ab_arm(
-            backend, all_cases, cases, token, report,
-            label="practices (#527)", block=block, kwarg="team_practices",
-        )
-
-    if args.ab_few_shot:
-        from few_shot import exemplars_block, exemplars_from_rows
-        from ledger import accepted_findings_by_class
-
-        examples = exemplars_block(
-            exemplars_from_rows(accepted_findings_by_class(list(rows)))
-        )
-    else:
-        examples = ""
-    if args.ab_few_shot and not examples:
-        print(
-            "#538 few-shot: no exemplars derivable from this corpus "
-            "(0 accepted findings) - skipping ON arm (delta would be "
-            "A/A noise)"
-        )
-    if examples:
-        _run_ab_arm(
-            backend, all_cases, cases, token, report,
-            label="few-shot (#538)", block=examples, kwarg="few_shot",
-        )
+    if backend is not None:
+        _run_ab_modes(args, rows, all_cases, cases, token, report, backend)
 
     if args.record:
-        if report.errored_cases:
-            # A partial run must never become the committed ruler: an
-            # errored case would permanently shrink cases_scored and the
-            # missing slice of the corpus would silently stop gating
-            # Elder (codex+poolside peer review, PR #543).
-            print(
-                "refusing --record: "
-                f"{len(report.errored_cases)} case(s) errored "
-                f"({', '.join(report.errored_cases)}) - a baseline must "
-                "come from a complete run; fix or prune the cases and re-run",
-                file=sys.stderr,
-            )
-            return 3
-        fresh = to_baseline_dict(
-            report, prompt_sha=compute_prompt_sha(), backend=backend.name
-        )
-        if BASELINE_PATH.exists():
-            fresh, dropped = merge_baseline(load_baseline(), fresh)
-            if dropped:
-                print(
-                    "prompt changed since the last record - dropping "
-                    f"stale backend baseline(s): {', '.join(dropped)} "
-                    "(re-record them against the new prompt)"
-                )
-        BASELINE_PATH.write_text(json.dumps(fresh, indent=2, sort_keys=True) + "\n")
-        print(f"baseline recorded -> {BASELINE_PATH}")
-        return 0
+        return _record_report(report, backend_name)
 
     if args.check:
-        if not BASELINE_PATH.exists():
-            print("no baseline.json to check against - record one first",
-                  file=sys.stderr)
-            return 2
-        baseline = load_baseline()
-        backend_baseline = baseline.get("backends", {}).get(backend.name)
-        if backend_baseline is None:
-            print(f"baseline has no entry for backend {backend.name!r}",
-                  file=sys.stderr)
-            return 2
-        regressions = compare_to_baseline(report, backend_baseline)
-        if regressions:
-            print("\nREGRESSIONS vs baseline:")
-            for r in regressions:
-                print(f"  - {r}")
-            return 1
-        print("\nno regression vs baseline")
+        return _check_report(report, backend_name)
     return 0
 
 

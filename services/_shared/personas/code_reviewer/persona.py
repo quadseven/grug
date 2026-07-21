@@ -30,6 +30,7 @@ from github_checks_client import CheckConclusion
 from llm_client import FindingOrigin, LlmReviewResponse
 from personas.code_reviewer.diff_parser import DiffHunk
 from review_types import Effort, Severity  # single source (#250)
+from review_pipeline import ReviewCoverage
 
 # A finding at one of these severities flips the aggregate verdict.
 # Medium + low remain advisory: reported in the check-run summary but
@@ -154,15 +155,17 @@ class CodeReviewEvaluation:
 
     `degraded_reason` carries the `LlmReviewResponse.kind` value when
     not `"reviewed"` (`no_diff`, `all_failed`, `parse_failed`) - these
-    contain no usable findings. All degraded states
-    map to `conclusion="neutral"` but the cause is preserved so caller
-    metrics can distinguish empty PR vs LLM provider outage.
+    contain no usable findings. It carries `partial_review` when bounded
+    cohorts returned a mix of usable and failed results; those findings remain
+    publishable, but dispatch forces the check advisory. The cause is preserved
+    so caller metrics can distinguish empty PR, partial coverage, and outage.
     """
 
     findings: tuple[Finding, ...]
     conclusion: CheckConclusion
     dropped_hallucinations: int = 0
     degraded_reason: str | None = None
+    coverage: ReviewCoverage | None = None
 
     @property
     def passed(self) -> bool:
@@ -193,6 +196,7 @@ def with_extra_findings(
         conclusion=conclusion,
         dropped_hallucinations=evaluation.dropped_hallucinations,
         degraded_reason=evaluation.degraded_reason,
+        coverage=evaluation.coverage,
     )
 
 
@@ -216,6 +220,7 @@ def with_findings(
         conclusion=conclusion,
         dropped_hallucinations=evaluation.dropped_hallucinations,
         degraded_reason=evaluation.degraded_reason,
+        coverage=evaluation.coverage,
     )
 
 
@@ -246,6 +251,7 @@ def evaluate_diff(
             findings=(),
             conclusion="neutral",
             degraded_reason=llm_response.kind,
+            coverage=llm_response.coverage,
         )
 
     line_index = _hunk_line_index(hunks)
@@ -291,5 +297,13 @@ def evaluate_diff(
         findings=tuple(kept),
         conclusion=conclusion,
         dropped_hallucinations=dropped,
-        degraded_reason=None,
+        # Staged review preserves useful findings when another cohort fails,
+        # but the check must say coverage was partial and stay advisory. The
+        # inline findings are still valid, diff-anchored evidence.
+        degraded_reason=(
+            "partial_review"
+            if llm_response.error[:15] == "partial review:"
+            else None
+        ),
+        coverage=llm_response.coverage,
     )
