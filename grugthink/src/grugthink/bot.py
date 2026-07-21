@@ -637,10 +637,194 @@ class GrugThinkBot(commands.Cog):
 
         return re.sub(r"\s+", " ", clean_content).strip()
 
+    def _log_auto_interaction(self, message, server_id: str, *, is_markov_bot: bool, is_other_bot: bool) -> None:
+        if is_markov_bot:
+            kind = "Markov bot interaction"
+            detail = {"markov_bot_name": message.author.name}
+        elif is_other_bot:
+            kind = "GrugThink bot interaction"
+            detail = {"other_bot_name": message.author.name}
+        else:
+            return
+        self.log.info(
+            kind,
+            extra={
+                "bot_id": self.get_bot_id(),
+                **detail,
+                "server_id": server_id,
+                "message_length": len(message.content),
+            },
+        )
+
+    def _auto_cross_bot_context(self, message, clean_content: str, bot_name: str, mentioned_bots: list) -> str:
+        if message.author.bot or mentioned_bots:
+            return ""
+        context = self.get_cross_bot_topic_context(clean_content, bot_name)
+        if context:
+            log.info(
+                "Adding cross-bot topic context to response",
+                extra={"bot_id": self.get_bot_id(), "topic_context": context[:50]},
+            )
+        return context
+
+    @staticmethod
+    def _auto_acknowledgement(
+        message, personality, bot_name: str, cross_bot_context: str,
+        *, is_markov_bot: bool, is_other_bot: bool,
+    ) -> str:
+        style = personality.response_style
+        if is_markov_bot:
+            return {
+                "caveman": f"{bot_name} hear robot friend call!",
+                "british_working_class": "alright robot mate, wot you sayin, nuff said",
+            }.get(style, "Hello fellow bot! What would you like me to verify?")
+        if is_other_bot:
+            other = message.author.display_name or message.author.name
+            return {
+                "caveman": f"{bot_name} hear {other} call! What {other} want know?",
+                "british_working_class": f"alright {other} mate, wot you after then, nuff said",
+            }.get(style, f"Hello {other}! What would you like me to verify?")
+        return {
+            "caveman": f"{bot_name} hear you call!{cross_bot_context}",
+            "british_working_class": f"wot you want mate, nuff said{cross_bot_context}",
+        }.get(style, f"I'm listening. What would you like me to verify?{cross_bot_context}")
+
+    @staticmethod
+    def _auto_thinking_text(message, personality, bot_name: str, *, is_markov_bot: bool, is_other_bot: bool) -> str:
+        style = personality.response_style
+        if is_markov_bot:
+            return {
+                "caveman": f"{bot_name} think about robot friend words...",
+                "british_working_class": f"{bot_name} checkin wot robot mate said...",
+            }.get(style, f"{bot_name} analyzing bot input...")
+        if is_other_bot:
+            other = message.author.display_name or message.author.name
+            return {
+                "caveman": f"{bot_name} think about {other} words...",
+                "british_working_class": f"{bot_name} checkin wot {other} said...",
+            }.get(style, f"{bot_name} considering {other}'s statement...")
+        return f"{bot_name} thinking..."
+
+    async def _query_auto_verification(self, message, server_id: str, clean_content: str):
+        server_db = self.get_server_db(message.guild.id if message.guild else "dm")
+        self.log.debug(
+            "About to call query_model",
+            extra={
+                "bot_id": self.get_bot_id(),
+                "clean_content_length": len(clean_content),
+                "clean_content_preview": clean_content[:100],
+                "server_id": server_id,
+            },
+        )
+        result = await asyncio.get_running_loop().run_in_executor(
+            None, query_model, clean_content, server_db, server_id,
+            self.personality_engine, self.get_bot_id(),
+        )
+        self.log.debug(
+            "query_model completed",
+            extra={
+                "bot_id": self.get_bot_id(),
+                "result_exists": result is not None,
+                "result_length": len(result) if result else 0,
+                "result_preview": result[:100] if result else "None",
+            },
+        )
+        return result
+
+    async def _deliver_auto_result(
+        self, message, thinking_message, server_id: str, clean_content: str,
+        result: str, cross_bot_context: str, *, is_markov_bot: bool, is_other_bot: bool,
+    ) -> None:
+        styled_result = self.personality_engine.get_response_with_style(server_id, result)
+        if cross_bot_context:
+            styled_result += cross_bot_context
+        await thinking_message.delete()
+        await message.channel.send(styled_result)
+        self.log.info(
+            "Auto-verification completed",
+            extra={
+                "bot_id": self.get_bot_id(),
+                "user_id": str(message.author.id),
+                "server_id": server_id,
+                "statement_length": len(clean_content),
+                "result_length": len(styled_result),
+                "is_markov_bot": is_markov_bot,
+                "is_grugthink_bot": is_other_bot,
+                "author_name": message.author.name if (is_markov_bot or is_other_bot) else None,
+            },
+        )
+
+    async def _deliver_auto_query_failure(self, message, thinking_message, server_id: str) -> None:
+        bot_id = self.get_bot_id()
+        self.log.warning(
+            "Query model returned None",
+            extra={
+                "bot_id": bot_id,
+                "server_id": server_id,
+                "use_gemini": config.USE_GEMINI,
+                "has_gemini_key": bool(config.GEMINI_API_KEY),
+                "ollama_urls": config.OLLAMA_URLS if not config.USE_GEMINI else "N/A",
+            },
+        )
+        try:
+            await thinking_message.delete()
+        except Exception as error:
+            self.log.warning(
+                "Failed to delete thinking message",
+                extra={"bot_id": bot_id, "error": str(error), "error_type": type(error).__name__},
+            )
+        try:
+            if config.USE_GEMINI and not config.GEMINI_API_KEY:
+                message_text = "\u274c Gemini API key not configured. Please set GEMINI_API_KEY."
+            elif config.USE_GEMINI:
+                message_text = "\u274c Gemini API unavailable. Please check configuration or try again later."
+            elif not config.OLLAMA_URLS:
+                message_text = "\u274c No AI service configured. Please configure Gemini or Ollama."
+            else:
+                message_text = f"\u2753 {self.personality_engine.get_error_message(server_id)}"
+            await message.channel.send(message_text)
+        except Exception as error:
+            self.log.error(
+                "Failed to send error message to user",
+                extra={
+                    "bot_id": bot_id,
+                    "error": str(error),
+                    "error_type": type(error).__name__,
+                    "channel_id": str(message.channel.id),
+                },
+            )
+
+    async def _deliver_auto_exception(
+        self, message, thinking_message, server_id: str, clean_content: str, error: Exception,
+    ) -> None:
+        import traceback
+
+        self.log.error(
+            "Auto-verification error",
+            extra={
+                "bot_id": self.get_bot_id(),
+                "error": str(error),
+                "error_type": type(error).__name__,
+                "traceback": traceback.format_exc(),
+                "user_id": str(message.author.id),
+                "server_id": server_id,
+                "clean_content_length": len(clean_content),
+                "clean_content_preview": clean_content[:100] if clean_content else "Empty",
+            },
+        )
+        error_msg = self.personality_engine.get_error_message(server_id)
+        try:
+            await thinking_message.delete()
+        except Exception as delete_error:
+            self.log.warning(
+                "Failed to delete thinking message during error handling",
+                extra={"bot_id": self.get_bot_id(), "error": str(delete_error)},
+            )
+        await message.channel.send(f"\U0001f4a5 {error_msg}")
+
     async def handle_auto_verification(self, message, server_id: str, personality, mentioned_bots=None):
         """Handle automatic verification when bot name is mentioned."""
         bot_id = self.get_bot_id()
-
         self.log.info(
             "Starting response generation",
             extra={
@@ -652,246 +836,50 @@ class GrugThinkBot(commands.Cog):
                 "original_content_length": len(message.content),
             },
         )
-
-        # Log if this is a bot interaction
         is_markov_bot = message.author.bot and "markov" in message.author.name.lower()
-        is_other_grugthink_bot = message.author.bot and not is_markov_bot
-
-        if is_markov_bot:
-            self.log.info(
-                "Markov bot interaction",
-                extra={
-                    "bot_id": bot_id,
-                    "markov_bot_name": message.author.name,
-                    "server_id": server_id,
-                    "message_length": len(message.content),
-                },
-            )
-        elif is_other_grugthink_bot:
-            self.log.info(
-                "GrugThink bot interaction",
-                extra={
-                    "bot_id": bot_id,
-                    "other_bot_name": message.author.name,
-                    "server_id": server_id,
-                    "message_length": len(message.content),
-                },
-            )
-
-        # Clean the message content for verification
+        is_other_bot = message.author.bot and not is_markov_bot
+        self._log_auto_interaction(
+            message, server_id, is_markov_bot=is_markov_bot, is_other_bot=is_other_bot,
+        )
         self.log.debug(
             "Cleaning message content",
             extra={"bot_id": bot_id, "original_content": message.content, "content_length": len(message.content)},
         )
         bot_name = personality.chosen_name or personality.name
         clean_content = self._clean_mention_content(message, personality)
-
         self.log.debug(
             "Content cleaning complete",
             extra={"bot_id": bot_id, "cleaned_content": clean_content, "cleaned_length": len(clean_content)},
         )
-
-        # Prepare contextual info from other bots (only for human messages that
-        # don't mention other bots)
-        cross_bot_context = ""
         mentioned_bots = mentioned_bots or []
-
-        if not message.author.bot and not mentioned_bots:
-            topic_context = self.get_cross_bot_topic_context(clean_content, bot_name)
-
-            if topic_context:
-                cross_bot_context = topic_context
-                log.info(
-                    "Adding cross-bot topic context to response",
-                    extra={
-                        "bot_id": self.get_bot_id(),
-                        "topic_context": topic_context[:50],
-                    },
-                )
-
-        # Skip if the remaining content is too short or just punctuation
+        cross_bot_context = self._auto_cross_bot_context(
+            message, clean_content, bot_name, mentioned_bots,
+        )
         if len(clean_content) < 5 or not re.search(r"[a-zA-Z]", clean_content):
-            # Respond with a personality-appropriate acknowledgment
-            if is_markov_bot:
-                # Special responses for Markov bot interactions
-                if personality.response_style == "caveman":
-                    response = f"{bot_name} hear robot friend call!"
-                elif personality.response_style == "british_working_class":
-                    response = "alright robot mate, wot you sayin, nuff said"
-                else:
-                    response = "Hello fellow bot! What would you like me to verify?"
-            elif is_other_grugthink_bot:
-                # Special responses for other GrugThink bot interactions
-                other_bot_name = message.author.display_name or message.author.name
-                if personality.response_style == "caveman":
-                    response = f"{bot_name} hear {other_bot_name} call! What {other_bot_name} want know?"
-                elif personality.response_style == "british_working_class":
-                    response = f"alright {other_bot_name} mate, wot you after then, nuff said"
-                else:
-                    response = f"Hello {other_bot_name}! What would you like me to verify?"
-            else:
-                # Normal human responses - include cross-bot context if available
-                if personality.response_style == "caveman":
-                    response = f"{bot_name} hear you call!{cross_bot_context}"
-                elif personality.response_style == "british_working_class":
-                    response = f"wot you want mate, nuff said{cross_bot_context}"
-                else:
-                    response = f"I'm listening. What would you like me to verify?{cross_bot_context}"
-
+            response = self._auto_acknowledgement(
+                message, personality, bot_name, cross_bot_context,
+                is_markov_bot=is_markov_bot, is_other_bot=is_other_bot,
+            )
             await message.channel.send(response)
             return
-
-        # Send thinking message
-        bot_name_display = personality.chosen_name or personality.name
-        if is_markov_bot:
-            if personality.response_style == "caveman":
-                thinking_msg = f"{bot_name_display} think about robot friend words..."
-            elif personality.response_style == "british_working_class":
-                thinking_msg = f"{bot_name_display} checkin wot robot mate said..."
-            else:
-                thinking_msg = f"{bot_name_display} analyzing bot input..."
-        elif is_other_grugthink_bot:
-            other_bot_name = message.author.display_name or message.author.name
-            if personality.response_style == "caveman":
-                thinking_msg = f"{bot_name_display} think about {other_bot_name} words..."
-            elif personality.response_style == "british_working_class":
-                thinking_msg = f"{bot_name_display} checkin wot {other_bot_name} said..."
-            else:
-                thinking_msg = f"{bot_name_display} considering {other_bot_name}'s statement..."
-        else:
-            thinking_msg = f"{bot_name_display} thinking..."
-
-        thinking_message = await message.channel.send(thinking_msg)
-
+        thinking_text = self._auto_thinking_text(
+            message, personality, bot_name,
+            is_markov_bot=is_markov_bot, is_other_bot=is_other_bot,
+        )
+        thinking_message = await message.channel.send(thinking_text)
         try:
-            # Get the server-specific database
-            server_db = self.get_server_db(message.guild.id if message.guild else "dm")
-
-            # Run verification in executor to avoid blocking
-            self.log.debug(
-                "About to call query_model",
-                extra={
-                    "bot_id": bot_id,
-                    "clean_content_length": len(clean_content),
-                    "clean_content_preview": clean_content[:100],
-                    "server_id": server_id,
-                },
-            )
-
-            loop = asyncio.get_running_loop()
-            result = await loop.run_in_executor(
-                None, query_model, clean_content, server_db, server_id, self.personality_engine, self.get_bot_id()
-            )
-
-            self.log.debug(
-                "query_model completed",
-                extra={
-                    "bot_id": bot_id,
-                    "result_exists": result is not None,
-                    "result_length": len(result) if result else 0,
-                    "result_preview": result[:100] if result else "None",
-                },
-            )
-
+            result = await self._query_auto_verification(message, server_id, clean_content)
             if result:
-                # Apply personality style to response
-                styled_result = self.personality_engine.get_response_with_style(server_id, result)
-
-                # Add cross-bot context if available
-                if cross_bot_context:
-                    styled_result = styled_result + cross_bot_context
-
-                # Delete the thinking message and post final response as new message
-                # This ensures Discord triggers on_message for cross-bot detection
-                await thinking_message.delete()
-                await message.channel.send(styled_result)
-
-                self.log.info(
-                    "Auto-verification completed",
-                    extra={
-                        "bot_id": bot_id,
-                        "user_id": str(message.author.id),
-                        "server_id": server_id,
-                        "statement_length": len(clean_content),
-                        "result_length": len(styled_result),
-                        "is_markov_bot": is_markov_bot,
-                        "is_grugthink_bot": is_other_grugthink_bot,
-                        "author_name": message.author.name if (is_markov_bot or is_other_grugthink_bot) else None,
-                    },
+                await self._deliver_auto_result(
+                    message, thinking_message, server_id, clean_content, result,
+                    cross_bot_context, is_markov_bot=is_markov_bot, is_other_bot=is_other_bot,
                 )
             else:
-                # API call failed - provide helpful error message
-                self.log.warning(
-                    "Query model returned None",
-                    extra={
-                        "bot_id": bot_id,
-                        "server_id": server_id,
-                        "use_gemini": config.USE_GEMINI,
-                        "has_gemini_key": bool(config.GEMINI_API_KEY),
-                        "ollama_urls": config.OLLAMA_URLS if not config.USE_GEMINI else "N/A",
-                    },
-                )
-
-                # Safely delete thinking message
-                try:
-                    await thinking_message.delete()
-                except Exception as delete_error:
-                    self.log.warning(
-                        "Failed to delete thinking message",
-                        extra={"bot_id": bot_id, "error": str(delete_error), "error_type": type(delete_error).__name__},
-                    )
-
-                # Provide more helpful error message based on configuration
-                try:
-                    if config.USE_GEMINI and not config.GEMINI_API_KEY:
-                        await message.channel.send("❌ Gemini API key not configured. Please set GEMINI_API_KEY.")
-                    elif config.USE_GEMINI:
-                        await message.channel.send(
-                            "❌ Gemini API unavailable. Please check configuration or try again later."
-                        )
-                    elif not config.OLLAMA_URLS:
-                        await message.channel.send("❌ No AI service configured. Please configure Gemini or Ollama.")
-                    else:
-                        # Use personality-appropriate error message as fallback
-                        error_msg = self.personality_engine.get_error_message(server_id)
-                        await message.channel.send(f"❓ {error_msg}")
-                except Exception as send_error:
-                    self.log.error(
-                        "Failed to send error message to user",
-                        extra={
-                            "bot_id": bot_id,
-                            "error": str(send_error),
-                            "error_type": type(send_error).__name__,
-                            "channel_id": str(message.channel.id),
-                        },
-                    )
-
-        except Exception as exc:
-            import traceback
-
-            self.log.error(
-                "Auto-verification error",
-                extra={
-                    "bot_id": bot_id,
-                    "error": str(exc),
-                    "error_type": type(exc).__name__,
-                    "traceback": traceback.format_exc(),
-                    "user_id": str(message.author.id),
-                    "server_id": server_id,
-                    "clean_content_length": len(clean_content),
-                    "clean_content_preview": clean_content[:100] if clean_content else "Empty",
-                },
+                await self._deliver_auto_query_failure(message, thinking_message, server_id)
+        except Exception as error:
+            await self._deliver_auto_exception(
+                message, thinking_message, server_id, clean_content, error,
             )
-            # Use personality for error message
-            error_msg = self.personality_engine.get_error_message(server_id)
-            try:
-                await thinking_message.delete()
-            except Exception as delete_error:
-                self.log.warning(
-                    "Failed to delete thinking message during error handling",
-                    extra={"bot_id": bot_id, "error": str(delete_error)},
-                )
-            await message.channel.send(f"💥 {error_msg}")
 
     async def handle_natural_chat_engagement(self, message, server_id, personality, bot_name):
         """Handle natural bot chat engagement based on conversation flow."""
