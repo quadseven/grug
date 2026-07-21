@@ -556,7 +556,7 @@ def _review_backend_config(backend: Backend) -> BackendConfig:
 # The judge receives small, finding-specific evidence packets and benefits from
 # the permanently resident reasoner on sparkicus. Discovery uses the coder on
 # the cold Spark; adjudication must not load a second copy there.
-_CAVE_JUDGE_DEFAULT_MODEL = "qwen3.5:122b"
+_CAVE_JUDGE_DEFAULT_MODEL = "poolside/Laguna-S-2.1-NVFP4"
 
 
 def _cave_judge_config() -> "BackendConfig | None":
@@ -576,6 +576,14 @@ def _cave_judge_config() -> "BackendConfig | None":
         url=f"{base}/v1/chat/completions",
         model=os.getenv("GRUG_CAVE_JUDGE_MODEL", _CAVE_JUDGE_DEFAULT_MODEL),
         key_loader=lambda: "in-cluster",  # gateway is unauthenticated in-cluster
+        # The judge labels a bounded evidence packet; it does not discover
+        # bugs. Laguna's default long-form reasoning turned this small call
+        # into a five-minute constrained-decoding pass and triggered xgrammar
+        # FSM errors live. Deep thinking remains enabled on the reasoner arm.
+        extra_body={
+            "chat_template_kwargs": {"enable_thinking": False},
+            "max_tokens": 4_096,
+        },
         # Short client timeout (_review_llm_timeout_s()) - must not queue
         # behind a long-running agentic turn on a shared Ollama target.
         # X-Spark-Caller (2026-07-14 fix - grug Elder was the one production
@@ -597,7 +605,7 @@ def _cave_judge_config() -> "BackendConfig | None":
 # (llm_backend_transport_failed) and starved the coder Spark. Defaults must
 # name models that are actually warm somewhere.
 _CAVE_REVIEW_CODER_DEFAULT_MODEL = "qwen3-coder-next:q8_0"
-_CAVE_REVIEW_REASONER_DEFAULT_MODEL = "qwen3.5:122b"
+_CAVE_REVIEW_REASONER_DEFAULT_MODEL = "poolside/Laguna-S-2.1-NVFP4"
 
 # #609: require-keys response schema for the Cave arms. The gateway's ollama
 # backends map a bare `{"type": "json_object"}` to `format=json`, which

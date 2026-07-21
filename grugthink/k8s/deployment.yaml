@@ -77,7 +77,9 @@ spec:
             - {name: SPARK_GATEWAY_URL, value: http://spark-gateway.spark-gateway.svc:8080}
             - {name: OLLAMA_URLS, value: http://spark-gateway.spark-gateway.svc:8080}
             # Chat model on the Cave gateway (was defaulting to llama3.2:3b -> 503).
-            - {name: OLLAMA_MODELS, value: "qwen3.5:122b"}
+            - {name: OLLAMA_MODELS, value: "poolside/Laguna-S-2.1-NVFP4"}
+            - {name: GRUGTHINK_LLM_MODEL, value: "poolside/Laguna-S-2.1-NVFP4"}
+            - {name: GRUGTHINK_LLM_API, value: "openai"}
             - {name: USE_OLLAMA_EMBEDDINGS, value: "true"}
             - {name: GRUGBOT_DATA_DIR, value: /data}
             - {name: LOG_LEVEL, value: INFO}

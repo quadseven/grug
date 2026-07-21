@@ -57,7 +57,7 @@ def _make_router(*, ollama=None, poolside=None, openrouter=None):
 
     def _post(url, json=None, headers=None, timeout=None, **kwargs):
         call_log.append({"url": url, "json": json, "headers": headers, "timeout": timeout})
-        if "/api/generate" in url:
+        if "/api/generate" in url or "localhost:11434/v1/chat/completions" in url:
             handler = ollama
         elif "poolside.ai" in url:
             handler = poolside
@@ -126,6 +126,21 @@ def _run_query_model(monkeypatch, router, mock_config, statement="The sky is blu
 
 
 class TestFallbackEngagement:
+    def test_primary_can_use_openai_compatible_gateway(self, monkeypatch):
+        monkeypatch.setenv("GRUGTHINK_LLM_API", "openai")
+        router = _make_router(ollama=lambda: _chat_completion_ok("LAGUNA_REPLY"))
+        result = _run_query_model(
+            monkeypatch,
+            router,
+            _mock_config(OLLAMA_MODELS=["poolside/Laguna-S-2.1-NVFP4"]),
+        )
+
+        assert result == "LAGUNA_REPLY"
+        call = router.call_log[0]
+        assert call["url"] == "http://localhost:11434/v1/chat/completions"
+        assert call["json"]["messages"][0]["content"]
+        assert call["json"]["chat_template_kwargs"] == {"enable_thinking": False}
+
     def test_fallback_not_engaged_on_primary_success(self, monkeypatch):
         """Ollama/Cave answering must short-circuit the whole chain - the
         fallback must NEVER be called on a genuine success."""
