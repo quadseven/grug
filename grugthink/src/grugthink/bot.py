@@ -299,7 +299,36 @@ class GrugThinkBot(commands.Cog):
     async def on_message(self, message):
         """Handle incoming messages and detect name mentions for auto-verification."""
         bot_id = self.get_bot_id()
+        self._log_incoming_message(message, bot_id)
+        is_markov_bot = self._classify_bot_message(message, bot_id)
+        server_id = str(message.guild.id) if message.guild else "dm"
+        personality = self.personality_engine.get_personality(server_id)
+        bot_name = personality.chosen_name or personality.name
+        self._log_loaded_personality(bot_id, server_id, bot_name, personality)
 
+        # Grug is the human-facing product front door. Internal bots and
+        # services must not pull him into role-play conversations. Markov is
+        # retained as the one explicit legacy entertainment integration.
+        if message.author.bot and not accepts_bot_conversation(personality.name, message.author.name):
+            self.log.info(
+                "Ignoring non-Markov bot message for Grug identity",
+                extra={"bot_id": bot_id, "author_name": message.author.name},
+            )
+            return
+
+        channel_id = str(message.channel.id)
+        current_time = time.time()
+        self._track_channel_activity(message, channel_id, current_time)
+        mentioned_bots = self._record_cross_bot_mentions(message)
+
+        if await self._handle_bot_message(message, server_id, bot_name, personality, is_markov_bot):
+            return
+        if self.is_bot_mentioned(message.content, bot_name):
+            await self._handle_direct_mention(message, bot_id, server_id, bot_name, personality, mentioned_bots)
+            return
+        await self._handle_unmentioned_message(message, server_id, personality, bot_name, channel_id, current_time)
+
+    def _log_incoming_message(self, message, bot_id: str) -> None:
         self.log.info(
             "Processing message",
             extra={
@@ -314,20 +343,16 @@ class GrugThinkBot(commands.Cog):
             },
         )
 
-        # Ignore messages from bots, except for Markov bots and other GrugThink bots
-        is_markov_bot = False
+    def _classify_bot_message(self, message, bot_id: str) -> bool:
+        is_markov_bot = message.author.bot and "markov" in message.author.name.lower()
         if message.author.bot:
-            is_markov_bot = "markov" in message.author.name.lower()
             self.log.info(
                 "Bot message detected",
                 extra={"bot_id": bot_id, "is_markov_bot": is_markov_bot, "author_name": message.author.name},
             )
+        return is_markov_bot
 
-        # Get personality for this server
-        server_id = str(message.guild.id) if message.guild else "dm"
-        personality = self.personality_engine.get_personality(server_id)
-        bot_name = personality.chosen_name or personality.name
-
+    def _log_loaded_personality(self, bot_id: str, server_id: str, bot_name: str, personality) -> None:
         self.log.info(
             "Personality loaded",
             extra={
@@ -338,141 +363,103 @@ class GrugThinkBot(commands.Cog):
             },
         )
 
-        # Grug is the human-facing product front door. Internal bots and
-        # services must not pull him into role-play conversations. Markov is
-        # retained as the one explicit legacy entertainment integration.
-        if message.author.bot and not accepts_bot_conversation(personality.name, message.author.name):
-            self.log.info(
-                "Ignoring non-Markov bot message for Grug identity",
-                extra={"bot_id": bot_id, "author_name": message.author.name},
-            )
-            return
-
-        # Track channel activity for intelligent conversation triggers
-        channel_id = str(message.channel.id)
-        current_time = time.time()
-
-        if channel_id not in self.channel_activity:
-            self.channel_activity[channel_id] = {
-                "last_human_message": 0,
-                "last_bot_message": 0,
-                "message_count": 0,
-                "recent_authors": set(),
-            }
-
-        activity = self.channel_activity[channel_id]
+    def _track_channel_activity(self, message, channel_id: str, current_time: float) -> None:
+        activity = self.channel_activity.setdefault(
+            channel_id,
+            {"last_human_message": 0, "last_bot_message": 0, "message_count": 0, "recent_authors": set()},
+        )
         activity["message_count"] += 1
         activity["recent_authors"].add(message.author.display_name or message.author.name)
+        timestamp_key = "last_bot_message" if message.author.bot else "last_human_message"
+        activity[timestamp_key] = current_time
 
-        # Track human vs bot activity
-        if not message.author.bot:
-            activity["last_human_message"] = current_time
-        elif message.author.bot:
-            activity["last_bot_message"] = current_time
-
-        # Detect and store cross-bot mentions from all messages
+    def _record_cross_bot_mentions(self, message) -> list[str]:
         mentioned_bots = self.detect_cross_bot_mentions(message)
         if mentioned_bots:
             message_author = message.author.display_name or message.author.name
-            if message.author.bot:
-                self.store_cross_bot_mention(message_author, mentioned_bots, message)
-            else:
-                self.store_cross_bot_mention(f"user:{message_author}", mentioned_bots, message)
+            source = message_author if message.author.bot else f"user:{message_author}"
+            self.store_cross_bot_mention(source, mentioned_bots, message)
+        return mentioned_bots
 
-        # If another bot explicitly talks about this bot, fire back with a short insult once
-        if (
-            message.author.bot
-            and self.is_bot_mentioned(message.content, bot_name)
-            and message.author != self.client.user
-            and not is_markov_bot
-        ):
-            channel_id = str(message.channel.id)
-            other_name = message.author.display_name or message.author.name
-            pair_key = _pair_key(other_name, bot_name, server_id, channel_id)
-            pair_state = cross_bot_responses.get(pair_key)
-            if pair_state is None:
-                pair_state = {other_name.lower(): True, bot_name.lower(): False}
-            else:
-                pair_state[other_name.lower()] = True
+    async def _handle_bot_message(self, message, server_id, bot_name, personality, is_markov_bot: bool) -> bool:
+        if not message.author.bot or is_markov_bot:
+            return False
+        if not self.is_bot_mentioned(message.content, bot_name) or message.author == self.client.user:
+            return True
 
-            if not pair_state.get(bot_name.lower(), False):
-                pair_state[bot_name.lower()] = True
-                cross_bot_responses.put(pair_key, pair_state)
-                insult = generate_shit_talk(other_name, personality.response_style)
-                # Wait a moment to let the other bot finish their main response first
-                await asyncio.sleep(2)
-                await message.channel.send(insult)
-            else:
-                cross_bot_responses.put(pair_key, pair_state)
-            return
-
-        if message.author.bot and not is_markov_bot:
-            # Ignore other bot messages that don't mention us
-            return
-
-        # Check if bot name is mentioned in the message by a human
-        if self.is_bot_mentioned(message.content, bot_name):
-            # Process commands first
-            await self.client.process_commands(message)
-            self.log.info(
-                "Bot mentioned by user",
-                extra={
-                    "bot_id": bot_id,
-                    "user_id": message.author.id,
-                    "server_id": server_id,
-                    "channel_id": channel_id,
-                    "bot_name": bot_name,
-                    "message_preview": message.content[:100],
-                },
-            )
-
-            if is_rate_limited(message.author.id, self.get_bot_id()):
-                self.log.info(
-                    "User rate limited", extra={"bot_id": bot_id, "user_id": message.author.id, "server_id": server_id}
-                )
-                if personality.response_style == "caveman":
-                    await message.channel.send("Grug need rest. Wait little.", delete_after=5)
-                elif personality.response_style == "british_working_class":
-                    await message.channel.send("slow down mate, too much carlin last nite, simple as", delete_after=5)
-                else:
-                    await message.channel.send("Please wait a moment.", delete_after=5)
-                return
-
-            clean_content = self._clean_mention_content(message, personality)
-            if self._maybe_relay_task(message, bot_id, server_id, bot_name, clean_content):
-                return
-
-            self.log.info(
-                "Processing bot mention",
-                extra={
-                    "bot_id": bot_id,
-                    "user_id": message.author.id,
-                    "server_id": server_id,
-                    "starting_response_generation": True,
-                },
-            )
-            await self.handle_auto_verification(message, server_id, personality, mentioned_bots)
+        channel_id = str(message.channel.id)
+        other_name = message.author.display_name or message.author.name
+        pair_key = _pair_key(other_name, bot_name, server_id, channel_id)
+        pair_state = cross_bot_responses.get(pair_key) or {other_name.lower(): True, bot_name.lower(): False}
+        pair_state[other_name.lower()] = True
+        if not pair_state.get(bot_name.lower(), False):
+            pair_state[bot_name.lower()] = True
+            cross_bot_responses.put(pair_key, pair_state)
+            await asyncio.sleep(2)
+            await message.channel.send(generate_shit_talk(other_name, personality.response_style))
         else:
-            # Only do engagement logic if no specific bot is mentioned
-            any_bot_mentioned = self.detect_any_bot_mentioned(message.content)
-            if not any_bot_mentioned:
-                self.log.info(
-                    "No bot mentioned, checking engagement logic",
-                    extra={"bot_id": bot_id, "server_id": server_id, "user_id": message.author.id},
-                )
+            cross_bot_responses.put(pair_key, pair_state)
+        return True
 
-                # Check for intelligent bot-to-bot conversation triggers
-                await self.handle_intelligent_bot_conversation(
-                    message, server_id, personality, bot_name, channel_id, current_time
-                )
+    async def _handle_direct_mention(self, message, bot_id, server_id, bot_name, personality, mentioned_bots) -> None:
+        await self.client.process_commands(message)
+        self.log.info(
+            "Bot mentioned by user",
+            extra={
+                "bot_id": bot_id,
+                "user_id": message.author.id,
+                "server_id": server_id,
+                "channel_id": str(message.channel.id),
+                "bot_name": bot_name,
+                "message_preview": message.content[:100],
+            },
+        )
+        if is_rate_limited(message.author.id, self.get_bot_id()):
+            await self._send_rate_limit_message(message, personality)
+            return
 
-                # Natural chat engagement logic
-                await self.handle_natural_chat_engagement(message, server_id, personality, bot_name)
-            else:
-                self.log.info(
-                    "Another bot mentioned, skipping all engagement logic",
-                    extra={"bot_id": bot_id, "server_id": server_id, "other_bot_mentioned": True},
-                )
+        clean_content = self._clean_mention_content(message, personality)
+        if self._maybe_relay_task(message, bot_id, server_id, bot_name, clean_content):
+            return
+        self.log.info(
+            "Processing bot mention",
+            extra={
+                "bot_id": bot_id,
+                "user_id": message.author.id,
+                "server_id": server_id,
+                "starting_response_generation": True,
+            },
+        )
+        await self.handle_auto_verification(message, server_id, personality, mentioned_bots)
+
+    async def _send_rate_limit_message(self, message, personality) -> None:
+        self.log.info(
+            "User rate limited",
+            extra={"bot_id": self.get_bot_id(), "user_id": message.author.id},
+        )
+        responses = {
+            "caveman": "Grug need rest. Wait little.",
+            "british_working_class": "slow down mate, too much carlin last nite, simple as",
+        }
+        await message.channel.send(responses.get(personality.response_style, "Please wait a moment."), delete_after=5)
+
+    async def _handle_unmentioned_message(
+        self, message, server_id, personality, bot_name, channel_id: str, current_time: float
+    ) -> None:
+        if self.detect_any_bot_mentioned(message.content):
+            self.log.info(
+                "Another bot mentioned, skipping all engagement logic",
+                extra={"bot_id": self.get_bot_id(), "server_id": server_id, "other_bot_mentioned": True},
+            )
+            return
+        self.log.info(
+            "No bot mentioned, checking engagement logic",
+            extra={"bot_id": self.get_bot_id(), "server_id": server_id, "user_id": message.author.id},
+        )
+        await self.handle_intelligent_bot_conversation(
+            message, server_id, personality, bot_name, channel_id, current_time
+        )
+        await self.handle_natural_chat_engagement(message, server_id, personality, bot_name)
 
     def is_bot_mentioned(self, content: str, bot_name: str) -> bool:
         """Check if the bot name is mentioned in the message content."""
