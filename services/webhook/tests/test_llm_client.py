@@ -676,6 +676,17 @@ def test_review_reasoner_diff_runs_only_reasoner_arm(monkeypatch) -> None:
     assert out.backends_used == (Backend.CAVE_REASONER,)
 
 
+def test_cave_reasoner_has_server_side_completion_budget() -> None:
+    """A timed-out client must not leave Laguna generating indefinitely."""
+    reasoner = lc._cave_review_config(Backend.CAVE_REASONER)
+    coder = lc._cave_review_config(Backend.CAVE)
+
+    assert reasoner is not None
+    assert reasoner.extra_body["max_tokens"] == 6_144
+    assert coder is not None
+    assert "max_tokens" not in coder.extra_body
+
+
 def test_openrouter_review_uses_opus_with_high_adaptive_reasoning() -> None:
     config = lc._review_backend_config(Backend.OPENROUTER)
     assert config.model == "anthropic/claude-opus-4.7"
