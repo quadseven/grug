@@ -2464,6 +2464,14 @@ def _publish_deep_review(
     deep_suppressed_count: int,
     combined_eval: CodeReviewEvaluation,
 ) -> None:
+    """Publish the async deep review's novel findings as a GitHub review.
+
+    No-op if `novel_deep` is empty (deep found nothing new beyond Tier-1).
+    On a successful post, also captures the review's inline-comment IDs
+    (#730, via `_capture_review_comments`, best-effort) and refreshes the
+    PR-timeline stack comment using `combined_eval` (Tier-1 + deep) so the
+    canonical projection carries every finding, not just the deep ones.
+    """
     if not novel_deep:
         return
     review_result = _build_review_result(
