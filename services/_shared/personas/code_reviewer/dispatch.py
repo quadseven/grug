@@ -2141,6 +2141,7 @@ def dispatch_code_review(
             prior_keys=prior_keys,
             check_publish_failed=check_publish_failed,
             cancel_event=cancel_event,
+            author_login=author_login,
         )
     except Exception as e:  # noqa: BLE001 - deep append is best-effort
         log.warning(
@@ -2436,6 +2437,11 @@ def _publish_deep_review(
     owner: str,
     repo_name: str,
     pull_number: int,
+    deep_llm: LlmReviewResponse,
+    author_login: str,
+    mode: ReviewMode,
+    living_range: str,
+    deep_suppressed_count: int,
 ) -> None:
     if not novel_deep:
         return
@@ -2448,8 +2454,9 @@ def _publish_deep_review(
     )
     if review_result is None:
         return
+    review_resp: dict[str, Any] | None = None
     try:
-        with_install_token_retry(
+        review_resp = with_install_token_retry(
             installation_id,
             lambda token: post_review(
                 token,
@@ -2462,6 +2469,65 @@ def _publish_deep_review(
     except (httpx.HTTPStatusError, httpx.RequestError) as error:
         log.warning(
             "elder_async_deep_review_publish_failed",
+            extra={
+                "pr": f"{owner}/{repo_name}#{pull_number}",
+                "kind": type(error).__name__,
+            },
+        )
+        return
+
+    # #730: capture the deep review's inline-comment IDs so the hardest-won
+    # findings are visible to the reaction/reply learning loops - the same
+    # durable contract the synchronous path uses (#247). Best-effort: a
+    # capture failure must never change the deep review outcome.
+    review_id = review_resp.get("id") if review_resp else None
+    if review_id is not None:
+        try:
+            comments = with_install_token_retry(
+                installation_id,
+                lambda token: get_review_comments(
+                    token, owner, repo_name,
+                    pull_number=pull_number, review_id=int(review_id),
+                ),
+            )
+            _capture_comment_records(
+                comments, deep_eval.findings,
+                install_id=installation_id,
+                repo=f"{owner}/{repo_name}",
+                pr_number=pull_number,
+                review_span_context=deep_llm.review_span_context,
+                head_sha=head_sha,
+                author_login=author_login,
+            )
+        except Exception as error:  # noqa: BLE001 - capture is best-effort
+            log.warning(
+                "elder_async_deep_comment_capture_failed",
+                extra={
+                    "pr": f"{owner}/{repo_name}#{pull_number}",
+                    "kind": type(error).__name__,
+                },
+            )
+
+    # #730: refresh the PR-timeline stack comment so the deep findings appear
+    # in the canonical review projection alongside the Tier-1 findings.
+    try:
+        conclusion, _ = _publish_shape(deep_eval, mode=mode)
+        stack_body = _review_stack_body(
+            deep_eval,
+            conclusion=conclusion,
+            living_range=living_range,
+            suppressed_count=deep_suppressed_count,
+            review_phase="deep",
+        )
+        with_install_token_retry(
+            installation_id,
+            lambda token: _upsert_review_stack_comment(
+                token, owner, repo_name, pull_number, stack_body,
+            ),
+        )
+    except Exception as error:  # noqa: BLE001 - stack is cosmetic UX
+        log.warning(
+            "elder_async_deep_stack_upsert_failed",
             extra={
                 "pr": f"{owner}/{repo_name}#{pull_number}",
                 "kind": type(error).__name__,
@@ -2517,6 +2583,7 @@ def _async_deep_append_if_needed(
     prior_keys: frozenset[str],
     check_publish_failed: bool,
     cancel_event: threading.Event | None,
+    author_login: str,
 ) -> None:
     """Run reasoner after Tier-1 publish when tiered escalation fires (#646).
 
@@ -2662,6 +2729,11 @@ def _async_deep_append_if_needed(
         owner=owner,
         repo_name=repo_name,
         pull_number=pull_number,
+        deep_llm=deep_llm,
+        author_login=author_login,
+        mode=mode,
+        living_range=living_range,
+        deep_suppressed_count=deep_suppressed_count,
     )
     _submit_deep_evals(
         deep_graded,
