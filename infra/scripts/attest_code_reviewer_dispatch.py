@@ -451,12 +451,19 @@ def _check_dispatch(tree: ast.AST, path: Path) -> list[str]:
                     "rollup must consult both independent publish surfaces"
                 )
 
-    # #247a comment-capture is BEST-EFFORT post-publish: a `_capture_comment_records`
-    # helper exists, and the capture fetch (get_review_comments) is wrapped in its
-    # own try/except catching a wire exception — a capture failure can't alter the
-    # review outcome. The capture logic may live in `_capture_review_comments`
-    # (shared by synchronous + deep paths) or inline in dispatch; either way,
-    # `get_review_comments` must be in a try/except catching a wire exception.
+    fails.extend(_check_capture(tree, f, path))
+    return fails
+
+
+def _check_capture(tree: ast.AST, f: ast.FunctionDef, path: Path) -> list[str]:
+    """#247a comment-capture is BEST-EFFORT post-publish: a `_capture_comment_records`
+    helper exists, and the capture fetch (get_review_comments) is wrapped in its
+    own try/except catching a wire exception - a capture failure can't alter the
+    review outcome. The capture logic may live in `_capture_review_comments`
+    (shared by synchronous + deep paths) or inline in dispatch; either way,
+    `get_review_comments` must be in a try/except catching a wire exception.
+    """
+    fails: list[str] = []
     if _find_funcdef(tree, "_capture_comment_records") is None:
         fails.append(
             f"FAIL: {path} — _capture_comment_records helper missing (#247 capture)"
