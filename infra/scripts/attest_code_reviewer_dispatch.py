@@ -332,21 +332,10 @@ def _check_ssot_flow(
     return fails
 
 
-def _check_dispatch(tree: ast.AST, path: Path) -> list[str]:
-    f = _find_funcdef(tree, "dispatch_code_review")
-    if f is None:
-        return [f"FAIL: {path} — exactly one `dispatch_code_review` expected"]
+def _check_mode_derivation(f: ast.FunctionDef, path: Path) -> list[str]:
+    """Validate that `mode` is derived from the `blocking` flag and never
+    reassigned to a constant."""
     fails: list[str] = []
-
-    # No dead-code guards anywhere (kills `... and False` around post_review etc).
-    dead = _dead_branch_tests(f)
-    if dead:
-        fails.append(
-            f"FAIL: {path} — dispatch_code_review has dead-code branch test(s) at "
-            f"line(s) {dead}; a constant-false guard hides a skipped publish surface"
-        )
-
-    # mode derives from the blocking flag and is never reassigned to a constant.
     params = {a.arg for a in (f.args.args + f.args.kwonlyargs)}
     if "blocking" not in params:
         fails.append(f"FAIL: {path} — dispatch_code_review has no `blocking` param")
@@ -363,9 +352,17 @@ def _check_dispatch(tree: ast.AST, path: Path) -> list[str]:
             f"FAIL: {path} — `mode` is reassigned to a constant, overriding the "
             "RepoConfig-derived value"
         )
+    return fails
 
-    # the value handed to _publish_shape must be the `mode` Name, not a literal.
+
+def _check_publish_shape_mode(
+    f: ast.FunctionDef, path: Path,
+) -> tuple[list[ast.Call], list[str]]:
+    """Validate that _publish_shape is called and its `mode` argument is the
+    derived `mode` Name (not a literal). Returns (ps_calls, fails).
+    """
     ps_calls = _calls_named(f, "_publish_shape")
+    fails: list[str] = []
     if not ps_calls:
         fails.append(f"FAIL: {path} — _publish_shape is never called in dispatch")
     for c in ps_calls:
@@ -380,23 +377,19 @@ def _check_dispatch(tree: ast.AST, path: Path) -> list[str]:
                 f"FAIL: {path} — _publish_shape called with a non-`mode` argument at "
                 f"line {c.lineno}; the gate must consume the derived mode"
             )
+    return ps_calls, fails
 
-    # SSOT no-drift: the (conclusion, event) pair _publish_shape returns must
-    # be the SAME values published — conclusion into CheckRunResult(conclusion=),
-    # event into _build_review_result(event=). Without this, a mutation could
-    # recompute `event` independently and the two surfaces would drift.
-    fails.extend(_check_ssot_flow(f, path, ps_calls))
 
-    # check-run + review on independent surfaces.
-    check_tries = _try_blocks_containing(f, "post_check_run")
-    review_tries = _try_blocks_containing(f, "post_review")
-    if not check_tries:
-        fails.append(f"FAIL: {path} — post_check_run is not wrapped in try/except")
-    if not review_tries:
-        fails.append(
-            f"FAIL: {path} — post_review not wrapped in its own try (independent surface)"
-        )
-
+def _check_publish_handlers(
+    path: Path,
+    check_tries: list[ast.Try], review_tries: list[ast.Try],
+) -> list[str]:
+    """Validate the try/except handlers around post_check_run and post_review.
+    Check-run handlers must: catch a wire exception, not early-return, and
+    record the failure via check_publish_failed = True. Review handlers must
+    catch a wire exception.
+    """
+    fails: list[str] = []
     for tnode in check_tries:
         # handler types must be able to catch a wire 5xx
         for handler in tnode.handlers:
@@ -430,6 +423,47 @@ def _check_dispatch(tree: ast.AST, path: Path) -> list[str]:
                     f"FAIL: {path} — review except catches {sorted(names) or 'nothing'}; "
                     f"must catch a wire exception"
                 )
+    return fails
+
+
+def _check_dispatch(tree: ast.AST, path: Path) -> list[str]:
+    f = _find_funcdef(tree, "dispatch_code_review")
+    if f is None:
+        return [f"FAIL: {path} — exactly one `dispatch_code_review` expected"]
+    fails: list[str] = []
+
+    # No dead-code guards anywhere (kills `... and False` around post_review etc).
+    dead = _dead_branch_tests(f)
+    if dead:
+        fails.append(
+            f"FAIL: {path} — dispatch_code_review has dead-code branch test(s) at "
+            f"line(s) {dead}; a constant-false guard hides a skipped publish surface"
+        )
+
+    # mode derives from the blocking flag and is never reassigned to a constant.
+    fails.extend(_check_mode_derivation(f, path))
+
+    # the value handed to _publish_shape must be the `mode` Name, not a literal.
+    ps_calls, mode_fails = _check_publish_shape_mode(f, path)
+    fails.extend(mode_fails)
+
+    # SSOT no-drift: the (conclusion, event) pair _publish_shape returns must
+    # be the SAME values published — conclusion into CheckRunResult(conclusion=),
+    # event into _build_review_result(event=). Without this, a mutation could
+    # recompute `event` independently and the two surfaces would drift.
+    fails.extend(_check_ssot_flow(f, path, ps_calls))
+
+    # check-run + review on independent surfaces.
+    check_tries = _try_blocks_containing(f, "post_check_run")
+    review_tries = _try_blocks_containing(f, "post_review")
+    if not check_tries:
+        fails.append(f"FAIL: {path} — post_check_run is not wrapped in try/except")
+    if not review_tries:
+        fails.append(
+            f"FAIL: {path} — post_review not wrapped in its own try (independent surface)"
+        )
+
+    fails.extend(_check_publish_handlers(path, check_tries, review_tries))
 
     # never-raise: fetch/parse degrade fallback present.
     if not _calls_named(f, "_publish_degraded"):
@@ -451,27 +485,52 @@ def _check_dispatch(tree: ast.AST, path: Path) -> list[str]:
                     "rollup must consult both independent publish surfaces"
                 )
 
-    # #247a comment-capture is BEST-EFFORT post-publish: a `_capture_comment_records`
-    # helper exists, and the capture fetch (get_review_comments) is wrapped in its
-    # own try/except catching a wire exception — a capture failure can't alter the
-    # review outcome.
+    fails.extend(_check_capture(tree, f, path))
+    return fails
+
+
+def _check_capture(tree: ast.AST, f: ast.FunctionDef, path: Path) -> list[str]:
+    """#247a comment-capture is BEST-EFFORT post-publish: a `_capture_comment_records`
+    helper exists, and the capture fetch (get_review_comments) is wrapped in its
+    own try/except catching a wire exception - a capture failure can't alter the
+    review outcome. The capture logic may live in `_capture_review_comments`
+    (shared by synchronous + deep paths) or inline in dispatch; either way,
+    `get_review_comments` must be in a try/except catching a wire exception.
+    """
+    fails: list[str] = []
     if _find_funcdef(tree, "_capture_comment_records") is None:
         fails.append(
             f"FAIL: {path} — _capture_comment_records helper missing (#247 capture)"
         )
     capture_tries = _try_blocks_containing(f, "get_review_comments")
-    if not capture_tries:
+    capture_helper = _find_funcdef(tree, "_capture_review_comments")
+    if capture_helper is not None:
+        # When the helper exists, it MUST contain a guarded get_review_comments
+        # call - capture_tries is only for inline capture in dispatch.
+        helper_tries = _try_blocks_containing(capture_helper, "get_review_comments")
+        if not helper_tries:
+            fails.append(
+                f"FAIL: {path} — _capture_review_comments helper exists but has no "
+                "guarded get_review_comments call; capture must be best-effort "
+                "post-publish"
+            )
+        all_capture_tries = helper_tries
+    elif not capture_tries:
+        # No helper - capture must be inline in dispatch.
         fails.append(
             f"FAIL: {path} — comment capture (get_review_comments) is not wrapped in "
             "try/except; it must be best-effort post-publish"
         )
-    for tnode in capture_tries:
+        all_capture_tries = []
+    else:
+        all_capture_tries = capture_tries
+    for tnode in all_capture_tries:
         for handler in tnode.handlers:
             names = _handler_exc_names(handler)
             if not (names & ALLOWED_WIRE_EXC):
                 fails.append(
                     f"FAIL: {path} — capture except catches {sorted(names) or 'nothing'}; "
-                    "must catch a wire exception (best-effort)"
+                    f"must catch a wire exception (best-effort)"
                 )
     return fails
 
