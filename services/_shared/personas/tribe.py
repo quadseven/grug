@@ -23,6 +23,7 @@ CHECK_WARDER = "Grug - Warder"
 CHECK_SMASHER = "Grug - Smasher"
 CHECK_TELLER = "Grug - Teller"
 CHECK_PULSE = "Grug - Pulse"
+CHECK_SENTINEL = "Grug - Sentinel"
 
 # Pre-polish / em-dash titles still live on some rulesets and old check-runs.
 _EM = "\u2014"  # historical em dash used in early "Grug - X" titles

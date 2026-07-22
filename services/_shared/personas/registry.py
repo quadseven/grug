@@ -21,7 +21,7 @@ from typing import Any, Literal
 
 from personas.tribe import (
     CHECK_CHIEF, CHECK_ELDER, CHECK_GUARD, CHECK_PULSE,
-    CHECK_SMASHER, CHECK_TELLER, CHECK_WARDER,
+    CHECK_SENTINEL, CHECK_SMASHER, CHECK_TELLER, CHECK_WARDER,
 )
 
 # How a persona runs relative to the webhook ACK path.
@@ -194,6 +194,29 @@ REGISTRY: tuple[PersonaSpec, ...] = (
         events=("pull_request",),
         dispatch_module="personas.warder.webhook_dispatch",
         actions=("closed",),  # merged-PR seam; merged flag checked in-module
+    ),
+    PersonaSpec(
+        key="sentinel",
+        canonical="sentinel",
+        # No real check-run posts (comment-only, like Teller/Pulse); this
+        # name is the roster/Activity-feed identity record_check_verdict
+        # carries.
+        check_run_name=CHECK_SENTINEL,
+        enabled_flag="sentinel_enabled",
+        # Safety net, not an opt-in feature (grug#721: a PR closed over an
+        # unresolved critical finding and nobody noticed for days) -
+        # maximum default coverage, same stance as Elder, not Warder's
+        # opt-in tracer stance.
+        enabled_default=True,
+        blocking_flag=None,  # purely advisory - the PR is already closed
+        blocking_default=False,
+        dispatch_style="inline",  # one store read + at most one comment,
+                                   # no LLM call
+        missing_repo_policy="enabled",
+        events=("pull_request",),
+        dispatch_module="personas.sentinel.webhook_dispatch",
+        actions=("closed",),  # same seam as Warder (#471) - the PR's
+                               # terminal state, merged or not
     ),
     PersonaSpec(
         key="smasher",

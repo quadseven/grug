@@ -32,7 +32,7 @@ Verdict = Literal["block", "warn", "pass", "errored"]
 VERDICTS: frozenset[str] = frozenset(get_args(Verdict))
 
 # Canonical caveman persona keys used in new code + the Activity feed (ADR-0002).
-Persona = Literal["chief", "elder", "guard", "warder", "pulse", "smasher", "teller"]
+Persona = Literal["chief", "elder", "guard", "warder", "pulse", "smasher", "teller", "sentinel"]
 PERSONAS: frozenset[str] = frozenset(get_args(Persona))
 
 # The ONE place the caveman name <-> legacy code key map lives. The persona
@@ -45,7 +45,7 @@ PERSONAS: frozenset[str] = frozenset(get_args(Persona))
 _KEY_TO_PERSONA: dict[str, Persona] = {
     "tpm": "chief", "code_reviewer": "elder", "guard": "guard",
     "warder": "warder", "pulse": "pulse", "smasher": "smasher",
-    "walkthrough": "teller",
+    "walkthrough": "teller", "sentinel": "sentinel",
 }
 _PERSONA_TO_KEY: dict[Persona, str] = {v: k for k, v in _KEY_TO_PERSONA.items()}
 

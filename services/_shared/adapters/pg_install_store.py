@@ -203,6 +203,7 @@ _DEFAULT_PERSONA_CONFIG = {
     "guard_enabled": True,
     "guard_blocking": False,
     "warder_enabled": False,
+    "sentinel_enabled": True,  # safety net, not an opt-in tracer (grug#721)
     "pulse_enabled": False,
     "smasher_enabled": False,  # execution tracer (#469): opt-in per repo
     "walkthrough_enabled": True,  # Teller PR-walkthrough comment (#554)
@@ -536,6 +537,19 @@ def put_check_verdict(
                 "ttl": ttl,
             },
         )
+
+
+def get_check_verdict(
+    install_id: int, head_sha: str, persona: str,
+) -> Optional[CheckVerdictRecord]:
+    """One persona's stored Check verdict for one commit, or None if that
+    persona never posted a verdict for this head_sha (or it has expired
+    past its 90-day TTL). Direct pk+sk point lookup - same shape as
+    `get_comment_record` - so a caller checking "did Elder's last review
+    on this PR still have blocking findings" costs one row read, not a
+    bulk `list_check_verdicts` scan."""
+    item = _get_item(_inst_pk(install_id), _check_verdict_sk(head_sha, persona))
+    return cast("Optional[CheckVerdictRecord]", item) if item else None
 
 
 def list_check_verdicts(
