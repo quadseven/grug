@@ -1915,60 +1915,20 @@ def dispatch_code_review(
     # Persist posted findings even if trace export failed: a later trusted
     # maintainer reaction can still teach the repository ledger without DD span
     # attribution.
-    if review_resp is not None and not review_publish_failed:
-        review_id = review_resp.get("id")
-        if review_id is not None:
-            try:
-                comments = with_install_token_retry(
-                    installation_id,
-                    lambda token: get_review_comments(
-                        token, owner, repo_name,
-                        pull_number=pull_number, review_id=int(review_id),
-                    ),
-                )
-                persisted = _capture_comment_records(
-                    comments, evaluation.findings,
-                    install_id=installation_id,
-                    repo=f"{owner}/{repo_name}",
-                    pr_number=pull_number,
-                    review_span_context=llm_response.review_span_context,
-                    head_sha=head_sha,
-                    author_login=author_login,
-                )
-                # Observability: a 0-of-N capture (e.g. a comment↔finding
-                # shape regression) silently empties the poller's batch with
-                # no other signal — alarm on it; otherwise record the count.
-                if comments and persisted == 0:
-                    log.warning(
-                        "code_review_comment_capture_zero",
-                        extra={
-                            "installation_id": installation_id,
-                            "pr": f"{owner}/{repo_name}#{pull_number}",
-                            "fetched": len(comments),
-                        },
-                    )
-                else:
-                    log.info(
-                        "code_review_comments_captured",
-                        extra={
-                            "installation_id": installation_id,
-                            "pr": f"{owner}/{repo_name}#{pull_number}",
-                            "fetched": len(comments),
-                            "persisted": persisted,
-                        },
-                    )
-            except Exception as e:  # noqa: BLE001 — capture is best-effort; a
-                # GH 5xx (get_review_comments) OR a DDB error (put_comment_record)
-                # must never 500 dispatch. Broad like run_judge's guard below.
-                log.error(
-                    "code_review_comment_capture_failed",
-                    extra={
-                        "installation_id": installation_id,
-                        "pr": f"{owner}/{repo_name}#{pull_number}",
-                        "kind": type(e).__name__,
-                    },
-                    exc_info=True,
-                )
+    review_id = review_resp.get("id") if review_resp else None
+    if review_id is not None:
+        _capture_review_comments(
+            installation_id=installation_id,
+            owner=owner,
+            repo_name=repo_name,
+            pull_number=pull_number,
+            review_id=review_id,
+            findings=evaluation.findings,
+            review_span_context=llm_response.review_span_context,
+            head_sha=head_sha,
+            author_login=author_login,
+            failure_log="code_review_comment_capture_failed",
+        )
 
     # Markings v2 review stack: upsert PR-timeline summary (actionable count
     # + consolidated agent prompt). Best-effort — never fails the check/review
@@ -2426,6 +2386,66 @@ def _publish_deep_check(
         )
 
 
+def _capture_review_comments(
+    *,
+    installation_id: int,
+    owner: str,
+    repo_name: str,
+    pull_number: int,
+    review_id: str,
+    findings: tuple[Finding, ...],
+    review_span_context: dict[str, Any] | None,
+    head_sha: str,
+    author_login: str,
+    failure_log: str,
+) -> None:
+    """Fetch a review's inline comments and persist them for reaction polling.
+
+    Shared by the synchronous publish path (#247) and the async deep path
+    (#730). Best-effort: any failure is logged under `failure_log` and
+    never re-raised - a capture failure must never change the review
+    outcome.
+    """
+    try:
+        comments = with_install_token_retry(
+            installation_id,
+            lambda token: get_review_comments(
+                token, owner, repo_name,
+                pull_number=pull_number, review_id=int(review_id),
+            ),
+        )
+        persisted = _capture_comment_records(
+            comments, findings,
+            install_id=installation_id,
+            repo=f"{owner}/{repo_name}",
+            pr_number=pull_number,
+            review_span_context=review_span_context,
+            head_sha=head_sha,
+            author_login=author_login,
+        )
+        # Observability: a 0-of-N capture (e.g. a comment<->finding shape
+        # regression) silently empties the poller's batch with no other
+        # signal - alarm on it; otherwise the count is recorded by
+        # _capture_comment_records.
+        if comments and persisted == 0:
+            log.warning(
+                "code_review_comment_capture_zero",
+                extra={
+                    "installation_id": installation_id,
+                    "pr": f"{owner}/{repo_name}#{pull_number}",
+                    "fetched": len(comments),
+                },
+            )
+    except Exception as error:  # noqa: BLE001 - capture is best-effort
+        log.warning(
+            failure_log,
+            extra={
+                "pr": f"{owner}/{repo_name}#{pull_number}",
+                "kind": type(error).__name__,
+            },
+        )
+
+
 def _publish_deep_review(
     deep_eval: CodeReviewEvaluation,
     *,
@@ -2482,31 +2502,18 @@ def _publish_deep_review(
     # capture failure must never change the deep review outcome.
     review_id = review_resp.get("id") if review_resp else None
     if review_id is not None:
-        try:
-            comments = with_install_token_retry(
-                installation_id,
-                lambda token: get_review_comments(
-                    token, owner, repo_name,
-                    pull_number=pull_number, review_id=int(review_id),
-                ),
-            )
-            _capture_comment_records(
-                comments, deep_eval.findings,
-                install_id=installation_id,
-                repo=f"{owner}/{repo_name}",
-                pr_number=pull_number,
-                review_span_context=deep_llm.review_span_context,
-                head_sha=head_sha,
-                author_login=author_login,
-            )
-        except Exception as error:  # noqa: BLE001 - capture is best-effort
-            log.warning(
-                "elder_async_deep_comment_capture_failed",
-                extra={
-                    "pr": f"{owner}/{repo_name}#{pull_number}",
-                    "kind": type(error).__name__,
-                },
-            )
+        _capture_review_comments(
+            installation_id=installation_id,
+            owner=owner,
+            repo_name=repo_name,
+            pull_number=pull_number,
+            review_id=review_id,
+            findings=deep_eval.findings,
+            review_span_context=deep_llm.review_span_context,
+            head_sha=head_sha,
+            author_login=author_login,
+            failure_log="elder_async_deep_comment_capture_failed",
+        )
 
     # #730: refresh the PR-timeline stack comment so the deep findings appear
     # in the canonical review projection alongside the Tier-1 findings.
