@@ -463,18 +463,26 @@ def _check_dispatch(tree: ast.AST, path: Path) -> list[str]:
         )
     capture_tries = _try_blocks_containing(f, "get_review_comments")
     capture_helper = _find_funcdef(tree, "_capture_review_comments")
-    if not capture_tries and capture_helper is None:
+    if capture_helper is not None:
+        # When the helper exists, it MUST contain a guarded get_review_comments
+        # call - capture_tries is only for inline capture in dispatch.
+        helper_tries = _try_blocks_containing(capture_helper, "get_review_comments")
+        if not helper_tries:
+            fails.append(
+                f"FAIL: {path} - _capture_review_comments helper exists but has no "
+                "guarded get_review_comments call; capture must be best-effort "
+                "post-publish"
+            )
+        all_capture_tries = helper_tries
+    elif not capture_tries:
+        # No helper - capture must be inline in dispatch.
         fails.append(
             f"FAIL: {path} — comment capture (get_review_comments) is not wrapped in "
             "try/except; it must be best-effort post-publish"
         )
-    # Check the helper's try/except if capture is extracted there.
-    helper_tries = (
-        _try_blocks_containing(capture_helper, "get_review_comments")
-        if capture_helper is not None
-        else []
-    )
-    all_capture_tries = capture_tries + helper_tries
+        all_capture_tries = []
+    else:
+        all_capture_tries = capture_tries
     for tnode in all_capture_tries:
         for handler in tnode.handlers:
             names = _handler_exc_names(handler)
