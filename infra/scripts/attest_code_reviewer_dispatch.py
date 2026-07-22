@@ -332,6 +332,75 @@ def _check_ssot_flow(
     return fails
 
 
+def _check_mode_derivation(f: ast.FunctionDef, path: Path) -> list[str]:
+    """Validate that `mode` is derived from the `blocking` flag and never
+    reassigned to a constant."""
+    fails: list[str] = []
+    params = {a.arg for a in (f.args.args + f.args.kwonlyargs)}
+    if "blocking" not in params:
+        fails.append(f"FAIL: {path} - dispatch_code_review has no `blocking` param")
+    mode_vals = _mode_values(f)
+    if not mode_vals:
+        fails.append(f"FAIL: {path} - `mode` is never assigned")
+    elif not any(_is_blocking_ternary(v) for v in mode_vals):
+        fails.append(
+            f"FAIL: {path} - `mode` not derived as "
+            "`'blocking' if blocking else 'advisory'`"
+        )
+    if any(isinstance(v, ast.Constant) for v in mode_vals):
+        fails.append(
+            f"FAIL: {path} - `mode` is reassigned to a constant, overriding the "
+            "RepoConfig-derived value"
+        )
+    return fails
+
+
+def _check_publish_handlers(
+    f: ast.FunctionDef, path: Path,
+    check_tries: list[ast.Try], review_tries: list[ast.Try],
+) -> list[str]:
+    """Validate the try/except handlers around post_check_run and post_review.
+    Check-run handlers must: catch a wire exception, not early-return, and
+    record the failure via check_publish_failed = True. Review handlers must
+    catch a wire exception.
+    """
+    fails: list[str] = []
+    for tnode in check_tries:
+        # handler types must be able to catch a wire 5xx
+        for handler in tnode.handlers:
+            names = _handler_exc_names(handler)
+            if not (names & ALLOWED_WIRE_EXC):
+                fails.append(
+                    f"FAIL: {path} - check-run except catches {sorted(names) or 'nothing'}; "
+                    f"must catch a wire exception {sorted(ALLOWED_WIRE_EXC)}"
+                )
+            # must NOT early-return (would skip the independent review post)
+            if any(
+                isinstance(n, ast.Return)
+                for stmt in handler.body for n in _walk_no_nested(stmt)
+            ):
+                fails.append(
+                    f"FAIL: {path} - check-run except returns early; a check-run "
+                    "failure would skip the independent review post"
+                )
+            # must RECORD the failure (Assign True, not a logged string)
+            if not _handler_assigns_true(handler, "check_publish_failed"):
+                fails.append(
+                    f"FAIL: {path} - check-run except does not set "
+                    "`check_publish_failed = True`"
+                )
+
+    for tnode in review_tries:
+        for handler in tnode.handlers:
+            names = _handler_exc_names(handler)
+            if not (names & ALLOWED_WIRE_EXC):
+                fails.append(
+                    f"FAIL: {path} - review except catches {sorted(names) or 'nothing'}; "
+                    f"must catch a wire exception"
+                )
+    return fails
+
+
 def _check_dispatch(tree: ast.AST, path: Path) -> list[str]:
     f = _find_funcdef(tree, "dispatch_code_review")
     if f is None:
@@ -347,27 +416,12 @@ def _check_dispatch(tree: ast.AST, path: Path) -> list[str]:
         )
 
     # mode derives from the blocking flag and is never reassigned to a constant.
-    params = {a.arg for a in (f.args.args + f.args.kwonlyargs)}
-    if "blocking" not in params:
-        fails.append(f"FAIL: {path} — dispatch_code_review has no `blocking` param")
-    mode_vals = _mode_values(f)
-    if not mode_vals:
-        fails.append(f"FAIL: {path} — `mode` is never assigned")
-    elif not any(_is_blocking_ternary(v) for v in mode_vals):
-        fails.append(
-            f"FAIL: {path} — `mode` not derived as "
-            "`'blocking' if blocking else 'advisory'`"
-        )
-    if any(isinstance(v, ast.Constant) for v in mode_vals):
-        fails.append(
-            f"FAIL: {path} — `mode` is reassigned to a constant, overriding the "
-            "RepoConfig-derived value"
-        )
+    fails.extend(_check_mode_derivation(f, path))
 
     # the value handed to _publish_shape must be the `mode` Name, not a literal.
     ps_calls = _calls_named(f, "_publish_shape")
     if not ps_calls:
-        fails.append(f"FAIL: {path} — _publish_shape is never called in dispatch")
+        fails.append(f"FAIL: {path} - _publish_shape is never called in dispatch")
     for c in ps_calls:
         mode_arg: ast.expr | None = None
         for kw in c.keywords:
@@ -377,7 +431,7 @@ def _check_dispatch(tree: ast.AST, path: Path) -> list[str]:
             mode_arg = c.args[1]
         if not (isinstance(mode_arg, ast.Name) and mode_arg.id == "mode"):
             fails.append(
-                f"FAIL: {path} — _publish_shape called with a non-`mode` argument at "
+                f"FAIL: {path} - _publish_shape called with a non-`mode` argument at "
                 f"line {c.lineno}; the gate must consume the derived mode"
             )
 
@@ -397,39 +451,7 @@ def _check_dispatch(tree: ast.AST, path: Path) -> list[str]:
             f"FAIL: {path} — post_review not wrapped in its own try (independent surface)"
         )
 
-    for tnode in check_tries:
-        # handler types must be able to catch a wire 5xx
-        for handler in tnode.handlers:
-            names = _handler_exc_names(handler)
-            if not (names & ALLOWED_WIRE_EXC):
-                fails.append(
-                    f"FAIL: {path} — check-run except catches {sorted(names) or 'nothing'}; "
-                    f"must catch a wire exception {sorted(ALLOWED_WIRE_EXC)}"
-                )
-            # must NOT early-return (would skip the independent review post)
-            if any(
-                isinstance(n, ast.Return)
-                for stmt in handler.body for n in _walk_no_nested(stmt)
-            ):
-                fails.append(
-                    f"FAIL: {path} — check-run except returns early; a check-run "
-                    "failure would skip the independent review post"
-                )
-            # must RECORD the failure (Assign True, not a logged string)
-            if not _handler_assigns_true(handler, "check_publish_failed"):
-                fails.append(
-                    f"FAIL: {path} — check-run except does not set "
-                    "`check_publish_failed = True`"
-                )
-
-    for tnode in review_tries:
-        for handler in tnode.handlers:
-            names = _handler_exc_names(handler)
-            if not (names & ALLOWED_WIRE_EXC):
-                fails.append(
-                    f"FAIL: {path} — review except catches {sorted(names) or 'nothing'}; "
-                    f"must catch a wire exception"
-                )
+    fails.extend(_check_publish_handlers(f, path, check_tries, review_tries))
 
     # never-raise: fetch/parse degrade fallback present.
     if not _calls_named(f, "_publish_degraded"):
