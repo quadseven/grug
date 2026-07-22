@@ -338,18 +338,18 @@ def _check_mode_derivation(f: ast.FunctionDef, path: Path) -> list[str]:
     fails: list[str] = []
     params = {a.arg for a in (f.args.args + f.args.kwonlyargs)}
     if "blocking" not in params:
-        fails.append(f"FAIL: {path} - dispatch_code_review has no `blocking` param")
+        fails.append(f"FAIL: {path} — dispatch_code_review has no `blocking` param")
     mode_vals = _mode_values(f)
     if not mode_vals:
-        fails.append(f"FAIL: {path} - `mode` is never assigned")
+        fails.append(f"FAIL: {path} — `mode` is never assigned")
     elif not any(_is_blocking_ternary(v) for v in mode_vals):
         fails.append(
-            f"FAIL: {path} - `mode` not derived as "
+            f"FAIL: {path} — `mode` not derived as "
             "`'blocking' if blocking else 'advisory'`"
         )
     if any(isinstance(v, ast.Constant) for v in mode_vals):
         fails.append(
-            f"FAIL: {path} - `mode` is reassigned to a constant, overriding the "
+            f"FAIL: {path} — `mode` is reassigned to a constant, overriding the "
             "RepoConfig-derived value"
         )
     return fails
@@ -364,7 +364,7 @@ def _check_publish_shape_mode(
     ps_calls = _calls_named(f, "_publish_shape")
     fails: list[str] = []
     if not ps_calls:
-        fails.append(f"FAIL: {path} - _publish_shape is never called in dispatch")
+        fails.append(f"FAIL: {path} — _publish_shape is never called in dispatch")
     for c in ps_calls:
         mode_arg: ast.expr | None = None
         for kw in c.keywords:
@@ -374,7 +374,7 @@ def _check_publish_shape_mode(
             mode_arg = c.args[1]
         if not (isinstance(mode_arg, ast.Name) and mode_arg.id == "mode"):
             fails.append(
-                f"FAIL: {path} - _publish_shape called with a non-`mode` argument at "
+                f"FAIL: {path} — _publish_shape called with a non-`mode` argument at "
                 f"line {c.lineno}; the gate must consume the derived mode"
             )
     return ps_calls, fails
@@ -396,7 +396,7 @@ def _check_publish_handlers(
             names = _handler_exc_names(handler)
             if not (names & ALLOWED_WIRE_EXC):
                 fails.append(
-                    f"FAIL: {path} - check-run except catches {sorted(names) or 'nothing'}; "
+                    f"FAIL: {path} — check-run except catches {sorted(names) or 'nothing'}; "
                     f"must catch a wire exception {sorted(ALLOWED_WIRE_EXC)}"
                 )
             # must NOT early-return (would skip the independent review post)
@@ -405,13 +405,13 @@ def _check_publish_handlers(
                 for stmt in handler.body for n in _walk_no_nested(stmt)
             ):
                 fails.append(
-                    f"FAIL: {path} - check-run except returns early; a check-run "
+                    f"FAIL: {path} — check-run except returns early; a check-run "
                     "failure would skip the independent review post"
                 )
             # must RECORD the failure (Assign True, not a logged string)
             if not _handler_assigns_true(handler, "check_publish_failed"):
                 fails.append(
-                    f"FAIL: {path} - check-run except does not set "
+                    f"FAIL: {path} — check-run except does not set "
                     "`check_publish_failed = True`"
                 )
 
@@ -420,7 +420,7 @@ def _check_publish_handlers(
             names = _handler_exc_names(handler)
             if not (names & ALLOWED_WIRE_EXC):
                 fails.append(
-                    f"FAIL: {path} - review except catches {sorted(names) or 'nothing'}; "
+                    f"FAIL: {path} — review except catches {sorted(names) or 'nothing'}; "
                     f"must catch a wire exception"
                 )
     return fails
@@ -510,7 +510,7 @@ def _check_capture(tree: ast.AST, f: ast.FunctionDef, path: Path) -> list[str]:
         helper_tries = _try_blocks_containing(capture_helper, "get_review_comments")
         if not helper_tries:
             fails.append(
-                f"FAIL: {path} - _capture_review_comments helper exists but has no "
+                f"FAIL: {path} — _capture_review_comments helper exists but has no "
                 "guarded get_review_comments call; capture must be best-effort "
                 "post-publish"
             )
