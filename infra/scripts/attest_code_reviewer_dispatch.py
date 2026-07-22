@@ -355,8 +355,33 @@ def _check_mode_derivation(f: ast.FunctionDef, path: Path) -> list[str]:
     return fails
 
 
-def _check_publish_handlers(
+def _check_publish_shape_mode(
     f: ast.FunctionDef, path: Path,
+) -> tuple[list[ast.Call], list[str]]:
+    """Validate that _publish_shape is called and its `mode` argument is the
+    derived `mode` Name (not a literal). Returns (ps_calls, fails).
+    """
+    ps_calls = _calls_named(f, "_publish_shape")
+    fails: list[str] = []
+    if not ps_calls:
+        fails.append(f"FAIL: {path} - _publish_shape is never called in dispatch")
+    for c in ps_calls:
+        mode_arg: ast.expr | None = None
+        for kw in c.keywords:
+            if kw.arg == "mode":
+                mode_arg = kw.value
+        if mode_arg is None and len(c.args) >= 2:
+            mode_arg = c.args[1]
+        if not (isinstance(mode_arg, ast.Name) and mode_arg.id == "mode"):
+            fails.append(
+                f"FAIL: {path} - _publish_shape called with a non-`mode` argument at "
+                f"line {c.lineno}; the gate must consume the derived mode"
+            )
+    return ps_calls, fails
+
+
+def _check_publish_handlers(
+    path: Path,
     check_tries: list[ast.Try], review_tries: list[ast.Try],
 ) -> list[str]:
     """Validate the try/except handlers around post_check_run and post_review.
@@ -419,21 +444,8 @@ def _check_dispatch(tree: ast.AST, path: Path) -> list[str]:
     fails.extend(_check_mode_derivation(f, path))
 
     # the value handed to _publish_shape must be the `mode` Name, not a literal.
-    ps_calls = _calls_named(f, "_publish_shape")
-    if not ps_calls:
-        fails.append(f"FAIL: {path} - _publish_shape is never called in dispatch")
-    for c in ps_calls:
-        mode_arg: ast.expr | None = None
-        for kw in c.keywords:
-            if kw.arg == "mode":
-                mode_arg = kw.value
-        if mode_arg is None and len(c.args) >= 2:
-            mode_arg = c.args[1]
-        if not (isinstance(mode_arg, ast.Name) and mode_arg.id == "mode"):
-            fails.append(
-                f"FAIL: {path} - _publish_shape called with a non-`mode` argument at "
-                f"line {c.lineno}; the gate must consume the derived mode"
-            )
+    ps_calls, mode_fails = _check_publish_shape_mode(f, path)
+    fails.extend(mode_fails)
 
     # SSOT no-drift: the (conclusion, event) pair _publish_shape returns must
     # be the SAME values published — conclusion into CheckRunResult(conclusion=),
@@ -451,7 +463,7 @@ def _check_dispatch(tree: ast.AST, path: Path) -> list[str]:
             f"FAIL: {path} — post_review not wrapped in its own try (independent surface)"
         )
 
-    fails.extend(_check_publish_handlers(f, path, check_tries, review_tries))
+    fails.extend(_check_publish_handlers(path, check_tries, review_tries))
 
     # never-raise: fetch/parse degrade fallback present.
     if not _calls_named(f, "_publish_degraded"):
