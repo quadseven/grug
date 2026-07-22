@@ -2272,7 +2272,9 @@ def test_deep_review_publishes_and_captures_comment_records(monkeypatch):
 
 def test_deep_review_capture_failure_does_not_change_result(monkeypatch):
     """#730: a capture failure (GH 5xx or DDB error) must be swallowed -
-    the deep review already posted, so dispatch's outer result is unaffected."""
+    the deep review already posted, so dispatch's outer result is unaffected.
+    Exercises the outer try/except in _capture_review_comments around the
+    get_review_comments fetch (not the inner per-comment put)."""
     deep_llm = _deep_llm_with_finding()
     tier1_llm = LlmReviewResponse(
         kind="reviewed", findings=(), backend_used=Backend.POOLSIDE,
@@ -2282,15 +2284,10 @@ def test_deep_review_capture_failure_does_not_change_result(monkeypatch):
     monkeypatch.setattr(cr_dispatch, "post_check_run", lambda *a, **kw: {"id": 1})
     monkeypatch.setattr(cr_dispatch, "post_review", lambda *a, **kw: {"id": 77})
     monkeypatch.setattr(cr_dispatch, "grade_findings", lambda *a, **kw: ())
-    monkeypatch.setattr(
-        cr_dispatch, "get_review_comments",
-        lambda *a, **kw: [{"id": 9, "path": "src/x.py", "line": 2,
-                           "body": "m\n<!-- grug-rule:deep-bug -->"}],
-    )
 
-    def _ddb_boom(**kw):
-        raise RuntimeError("DDB throttle")
-    monkeypatch.setattr(cr_dispatch, "put_comment_record", _ddb_boom)
+    def _gh_boom(*a, **kw):
+        raise RuntimeError("GH 5xx")
+    monkeypatch.setattr(cr_dispatch, "get_review_comments", _gh_boom)
     monkeypatch.setattr(cr_dispatch, "review_is_staged", lambda hunks: False)
     monkeypatch.setattr(
         cr_dispatch, "decide_deep_escalation",
@@ -2309,16 +2306,26 @@ def test_deep_review_capture_failure_does_not_change_result(monkeypatch):
     with patch("httpx.get", return_value=_diff_response()):
         out = cr_dispatch.dispatch_code_review(_payload(), blocking=False)
 
-    # Deep review posted and capture failed, but dispatch did not raise.
+    # Deep review posted and capture failed (GH 5xx), but dispatch did not raise.
     assert out["result"] == "pass"
 
 
-def test_deep_review_refreshes_stack_comment(monkeypatch):
+def test_deep_review_refreshes_stack_comment_with_tier1_findings(monkeypatch):
     """#730: the PR-timeline stack comment is refreshed after deep findings
-    publish, so the canonical projection includes the deep findings."""
+    publish, so the canonical projection includes deep findings.
+
+    Regression for CodeRabbit finding: the deep-phase stack refresh must
+    use the combined (Tier-1 + deep) evaluation, not just novel_deep, so
+    Tier-1 findings are preserved in the refreshed stack body."""
     deep_llm = _deep_llm_with_finding()
+    # Tier-1 returns a finding that should be preserved in the deep stack.
     tier1_llm = LlmReviewResponse(
-        kind="reviewed", findings=(), backend_used=Backend.POOLSIDE,
+        kind="reviewed",
+        findings=(LlmFinding(
+            path="src/x.py", line=2, rule="tier1-bug",
+            severity="low", message="tier1 finding",  # type: ignore[arg-type]
+        ),),
+        backend_used=Backend.POOLSIDE,
         model_name="laguna",
     )
     monkeypatch.setattr(cr_dispatch, "review_diff", lambda *a, **kw: tier1_llm)
@@ -2356,7 +2363,8 @@ def test_deep_review_refreshes_stack_comment(monkeypatch):
 
     # The stack was refreshed: Tier-1 + deep append (2 total).
     assert len(stack_bodies) == 2
-    # The last (deep) body includes the deep phase + finding.
+    # The last (deep) body must include BOTH Tier-1 and deep findings.
     deep_body = stack_bodies[-1]
     assert "deep" in deep_body.lower()
     assert "deep-bug" in deep_body
+    assert "tier1-bug" in deep_body  # Tier-1 finding preserved via combined_eval

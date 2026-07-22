@@ -2462,6 +2462,7 @@ def _publish_deep_review(
     mode: ReviewMode,
     living_range: str,
     deep_suppressed_count: int,
+    combined_eval: CodeReviewEvaluation,
 ) -> None:
     if not novel_deep:
         return
@@ -2517,10 +2518,12 @@ def _publish_deep_review(
 
     # #730: refresh the PR-timeline stack comment so the deep findings appear
     # in the canonical review projection alongside the Tier-1 findings.
+    # Use combined_eval (Tier-1 + deep) so the stack preserves all findings,
+    # severity, and actionable counts - not just novel_deep.
     try:
-        conclusion, _ = _publish_shape(deep_eval, mode=mode)
+        conclusion, _ = _publish_shape(combined_eval, mode=mode)
         stack_body = _review_stack_body(
-            deep_eval,
+            combined_eval,
             conclusion=conclusion,
             living_range=living_range,
             suppressed_count=deep_suppressed_count,
@@ -2741,6 +2744,7 @@ def _async_deep_append_if_needed(
         mode=mode,
         living_range=living_range,
         deep_suppressed_count=deep_suppressed_count,
+        combined_eval=combined,
     )
     _submit_deep_evals(
         deep_graded,
