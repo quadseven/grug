@@ -12,7 +12,7 @@ def test_registered_personas():
     keys = {p.key for p in registry.REGISTRY}
     assert keys == {
         "tpm", "code_reviewer", "guard", "warder", "pulse", "smasher",
-        "walkthrough",
+        "walkthrough", "sentinel",
     }
 
 
