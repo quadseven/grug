@@ -69,10 +69,16 @@ kubectl get secret registry-pull -n grug -o yaml \
 # GH_TOKEN. Skip this if the review-relay feature isn't wanted yet -
 # it's optional:true in deployment.yaml and degrades to "Grug can't
 # answer that yet" without it.
+umask 077
+token_file="$(mktemp)"
+trap 'rm -f "$token_file"' EXIT
+if ! aws ssm get-parameter \
+      --name /githumps/grugthink/github_checks_token --with-decrypt \
+      --query Parameter.Value --output text >"$token_file" 2>/dev/null; then
+  : >"$token_file"
+fi
 kubectl create secret generic grugthink-github -n grugthink \
-  --from-literal=GRUGTHINK_GITHUB_CHECKS_TOKEN="$(aws ssm get-parameter \
-      --name /githumps/grugthink/github_checks_token --with-decryption \
-      --query Parameter.Value --output text 2>/dev/null || echo '')" \
+  --from-file=GRUGTHINK_GITHUB_CHECKS_TOKEN="$token_file" \
   --dry-run=client -o yaml | kubectl apply -f -
 ```
 
@@ -120,7 +126,7 @@ config + memory across restarts.
   Discord user ID, so a reply is only trusted if it's verifiably from
   Hermes) are set on the Deployment. Also needs Grug's Discord role
   granted visibility + send permission on the per-repo channels under
-  the "Github" category - the same one-time step already done for
+  the "GitHub" category - the same one-time step already done for
   Hermes. See the module docstrings for the full security model.
 - `readOnlyRootFilesystem` is intentionally not set yet - harden it once the
   container's write paths (beyond `/data` and `/tmp`) are confirmed.

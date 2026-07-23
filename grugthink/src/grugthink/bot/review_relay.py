@@ -99,10 +99,41 @@ async def fetch_elder_verdict(repo: str, pr_number: int) -> Optional[ElderVerdic
         try:
             pr_resp = await client.get(f"/repos/{GITHUB_ORG}/{repo}/pulls/{pr_number}")
             pr_resp.raise_for_status()
-            head_sha = pr_resp.json()["head"]["sha"]
+            pr_json = pr_resp.json()
+            head_sha = pr_json.get("head", {}).get("sha")
+            if not head_sha:
+                log.warning(
+                    "review_relay: PR payload missing head.sha",
+                    extra={"repo": repo, "pr_number": pr_number},
+                )
+                return None
 
-            checks_resp = await client.get(f"/repos/{GITHUB_ORG}/{repo}/commits/{head_sha}/check-runs")
-            checks_resp.raise_for_status()
+            # Iterate all CHECK_ELDER_NAMES aliases via check_name parameter
+            # to avoid missing the Elder check on a paginated first page.
+            for elder_name in CHECK_ELDER_NAMES:
+                params = {"check_name": elder_name}
+                page = 1
+                while True:
+                    checks_resp = await client.get(
+                        f"/repos/{GITHUB_ORG}/{repo}/commits/{head_sha}/check-runs",
+                        params={**params, "page": page},
+                    )
+                    checks_resp.raise_for_status()
+                    checks_json = checks_resp.json()
+                    runs = checks_json.get("check_runs", [])
+                    for run in runs:
+                        if run.get("name") in CHECK_ELDER_NAMES:
+                            output = run.get("output") or {}
+                            return ElderVerdict(
+                                conclusion=run.get("conclusion"),
+                                title=output.get("title"),
+                                summary=output.get("summary"),
+                                html_url=run.get("html_url"),
+                            )
+                    if page >= checks_json.get("total_count", 0) // 100 + 1:
+                        break
+                    page += 1
+            return None
         except httpx.HTTPStatusError as exc:
             # Deliberately log.warning (not log.exception/exc_info=True) with
             # only safe, scalar fields - never the exception object itself,
@@ -115,24 +146,13 @@ async def fetch_elder_verdict(repo: str, pr_number: int) -> Optional[ElderVerdic
                 extra={"repo": repo, "pr_number": pr_number, "status_code": exc.response.status_code},
             )
             return None
-        except httpx.HTTPError:
+        except (httpx.HTTPError, ValueError) as exc:
+            # ValueError covers JSONDecodeError from malformed API responses.
             log.warning(
-                "review_relay: GitHub API call failed (network error)",
-                extra={"repo": repo, "pr_number": pr_number},
+                "review_relay: GitHub API call failed (network/decode error)",
+                extra={"repo": repo, "pr_number": pr_number, "kind": type(exc).__name__},
             )
             return None
-
-    for run in checks_resp.json().get("check_runs", []):
-        if run.get("name") in CHECK_ELDER_NAMES:
-            output = run.get("output") or {}
-            return ElderVerdict(
-                conclusion=run.get("conclusion"),
-                title=output.get("title"),
-                summary=output.get("summary"),
-                html_url=run.get("html_url"),
-            )
-
-    return None
 
 
 _VERDICT_LINES = {
@@ -191,4 +211,7 @@ async def relay_review(
         return
 
     verdict = await fetch_elder_verdict(repo, pr_number)
-    await original_message.channel.send(format_verdict(verdict, bot_name, repo, pr_number))
+    await original_message.channel.send(
+        format_verdict(verdict, bot_name, repo, pr_number),
+        allowed_mentions=discord.AllowedMentions.none(),
+    )
