@@ -263,7 +263,7 @@ async def relay_to_hermes(
     if repo is None:
         await _safe_send(
             original_message.channel,
-            f"{bot_name} no know which cave you mean. Say repo name - one of: {', '.join(sorted(REPO_CHANNELS))}."
+            f"{bot_name} no know which cave you mean. Say repo name - one of: {', '.join(sorted(REPO_CHANNELS))}.",
         )
         return
 
@@ -276,7 +276,7 @@ async def relay_to_hermes(
         await _safe_send(
             original_message.channel,
             f"{bot_name} try reach Hermes cave for {repo} but door locked. "
-            f"Tell Evan: Grug need Discord permission on that channel."
+            f"Tell Evan: Grug need Discord permission on that channel.",
         )
         return
 
@@ -337,7 +337,7 @@ async def _watch_and_relay(
         log.warning("task_relay: HERMES_BOT_USER_ID not configured - not watching for a reply")
         await _safe_send(
             original_message.channel,
-            f"{bot_name} no know which grug is Hermes yet - check the thread yourself: {thread.jump_url}"
+            f"{bot_name} no know which grug is Hermes yet - check the thread yourself: {thread.jump_url}",
         )
         return
 
@@ -376,7 +376,7 @@ async def _watch_and_relay(
             log.exception("task_relay: unexpected error while watching for Hermes' reply")
             await _safe_send(
                 original_message.channel,
-                f"{bot_name} lose Hermes' trail - something break. Check the thread yourself: {thread.jump_url}"
+                f"{bot_name} lose Hermes' trail - something break. Check the thread yourself: {thread.jump_url}",
             )
             return
 
@@ -388,5 +388,5 @@ async def _watch_and_relay(
 
     await _safe_send(
         original_message.channel,
-        f"{bot_name} wait long time. Check thread for latest word from Hermes: {thread.jump_url}"
+        f"{bot_name} wait long time. Check thread for latest word from Hermes: {thread.jump_url}",
     )

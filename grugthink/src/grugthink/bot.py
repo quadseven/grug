@@ -39,6 +39,7 @@ else:
 from . import llm  # noqa: E402  (v2 spark-gateway LLM engine)
 from .bot import (  # noqa: E402
     cross_bot,
+    review_relay,
     task_relay,
 )
 from .bot.prompts import (  # noqa: E402
@@ -419,6 +420,8 @@ class GrugThinkBot(commands.Cog):
             return
 
         clean_content = self._clean_mention_content(message, personality)
+        if self._maybe_relay_review(message, bot_id, server_id, bot_name, clean_content):
+            return
         if self._maybe_relay_task(message, bot_id, server_id, bot_name, clean_content):
             return
         self.log.info(
@@ -599,6 +602,40 @@ class GrugThinkBot(commands.Cog):
         """Detect mentions of other bot names in text content."""
         return cross_bot.detect_cross_bot_mentions_in_text(text)
 
+    def _maybe_relay_review(self, message, bot_id: str, server_id: str, bot_name: str, clean_content: str) -> bool:
+        """If clean_content explicitly asks about a specific PR's review
+        ("review PR #123", "what did elder say about #123"), that's a
+        request to read grug's real Elder verdict, not to ask Hermes to do
+        anything - route it there instead and return True. Returns False
+        for everything else, including task-shaped requests with no PR
+        number, which _maybe_relay_task handles. Checked before
+        _maybe_relay_task for the same reason that method is split out of
+        on_message's own branching (grug#721 Elder review,
+        `high-complexity` finding).
+
+        Deliberately requires review_relay.looks_like_review_request, NOT
+        just task_relay.looks_like_task - "fix infra #123" matches the
+        generic "fix" task keyword and has both a PR-shaped number and a
+        resolvable repo, but almost certainly means implement a fix for
+        issue #123, not "read Elder's verdict on PR #123" (CodeRabbit
+        finding on grug#742, confirmed real: that phrasing would otherwise
+        get silently diverted to a read-only lookup instead of Hermes).
+        """
+        if not review_relay.looks_like_review_request(clean_content):
+            return False
+
+        pr_number = review_relay.extract_pr_number(clean_content)
+        repo = task_relay.resolve_repo(clean_content)
+        if pr_number is None or repo is None:
+            return False
+
+        self.log.info(
+            "Review-shaped mention detected, relaying Elder's verdict",
+            extra={"bot_id": bot_id, "user_id": message.author.id, "server_id": server_id, "repo": repo},
+        )
+        asyncio.create_task(review_relay.relay_review(message, bot_name, repo, pr_number))
+        return True
+
     def _maybe_relay_task(self, message, bot_id: str, server_id: str, bot_name: str, clean_content: str) -> bool:
         """If clean_content looks like a work request, hand it to Hermes and
         return True (the caller should stop - this message is handled).
@@ -669,8 +706,13 @@ class GrugThinkBot(commands.Cog):
 
     @staticmethod
     def _auto_acknowledgement(
-        message, personality, bot_name: str, cross_bot_context: str,
-        *, is_markov_bot: bool, is_other_bot: bool,
+        message,
+        personality,
+        bot_name: str,
+        cross_bot_context: str,
+        *,
+        is_markov_bot: bool,
+        is_other_bot: bool,
     ) -> str:
         style = personality.response_style
         if is_markov_bot:
@@ -717,8 +759,13 @@ class GrugThinkBot(commands.Cog):
             },
         )
         result = await asyncio.get_running_loop().run_in_executor(
-            None, query_model, clean_content, server_db, server_id,
-            self.personality_engine, self.get_bot_id(),
+            None,
+            query_model,
+            clean_content,
+            server_db,
+            server_id,
+            self.personality_engine,
+            self.get_bot_id(),
         )
         self.log.debug(
             "query_model completed",
@@ -732,8 +779,16 @@ class GrugThinkBot(commands.Cog):
         return result
 
     async def _deliver_auto_result(
-        self, message, thinking_message, server_id: str, clean_content: str,
-        result: str, cross_bot_context: str, *, is_markov_bot: bool, is_other_bot: bool,
+        self,
+        message,
+        thinking_message,
+        server_id: str,
+        clean_content: str,
+        result: str,
+        cross_bot_context: str,
+        *,
+        is_markov_bot: bool,
+        is_other_bot: bool,
     ) -> None:
         styled_result = self.personality_engine.get_response_with_style(server_id, result)
         if cross_bot_context:
@@ -795,7 +850,12 @@ class GrugThinkBot(commands.Cog):
             )
 
     async def _deliver_auto_exception(
-        self, message, thinking_message, server_id: str, clean_content: str, error: Exception,
+        self,
+        message,
+        thinking_message,
+        server_id: str,
+        clean_content: str,
+        error: Exception,
     ) -> None:
         import traceback
 
@@ -839,7 +899,10 @@ class GrugThinkBot(commands.Cog):
         is_markov_bot = message.author.bot and "markov" in message.author.name.lower()
         is_other_bot = message.author.bot and not is_markov_bot
         self._log_auto_interaction(
-            message, server_id, is_markov_bot=is_markov_bot, is_other_bot=is_other_bot,
+            message,
+            server_id,
+            is_markov_bot=is_markov_bot,
+            is_other_bot=is_other_bot,
         )
         self.log.debug(
             "Cleaning message content",
@@ -853,32 +916,52 @@ class GrugThinkBot(commands.Cog):
         )
         mentioned_bots = mentioned_bots or []
         cross_bot_context = self._auto_cross_bot_context(
-            message, clean_content, bot_name, mentioned_bots,
+            message,
+            clean_content,
+            bot_name,
+            mentioned_bots,
         )
         if len(clean_content) < 5 or not re.search(r"[a-zA-Z]", clean_content):
             response = self._auto_acknowledgement(
-                message, personality, bot_name, cross_bot_context,
-                is_markov_bot=is_markov_bot, is_other_bot=is_other_bot,
+                message,
+                personality,
+                bot_name,
+                cross_bot_context,
+                is_markov_bot=is_markov_bot,
+                is_other_bot=is_other_bot,
             )
             await message.channel.send(response)
             return
         thinking_text = self._auto_thinking_text(
-            message, personality, bot_name,
-            is_markov_bot=is_markov_bot, is_other_bot=is_other_bot,
+            message,
+            personality,
+            bot_name,
+            is_markov_bot=is_markov_bot,
+            is_other_bot=is_other_bot,
         )
         thinking_message = await message.channel.send(thinking_text)
         try:
             result = await self._query_auto_verification(message, server_id, clean_content)
             if result:
                 await self._deliver_auto_result(
-                    message, thinking_message, server_id, clean_content, result,
-                    cross_bot_context, is_markov_bot=is_markov_bot, is_other_bot=is_other_bot,
+                    message,
+                    thinking_message,
+                    server_id,
+                    clean_content,
+                    result,
+                    cross_bot_context,
+                    is_markov_bot=is_markov_bot,
+                    is_other_bot=is_other_bot,
                 )
             else:
                 await self._deliver_auto_query_failure(message, thinking_message, server_id)
         except Exception as error:
             await self._deliver_auto_exception(
-                message, thinking_message, server_id, clean_content, error,
+                message,
+                thinking_message,
+                server_id,
+                clean_content,
+                error,
             )
 
     async def handle_natural_chat_engagement(self, message, server_id, personality, bot_name):
