@@ -32,11 +32,12 @@ log = get_logger(__name__)
 # LEGACY_CHECK_ELDER_EM_SHORT). grugthink is a separate deployment from
 # grug's webhook/api services and can't import that module directly, so
 # the names are duplicated here - keep in sync if tribe.py's names change.
+_EM = "\u2014"  # historical em dash used in early "Grug - X" titles
 CHECK_ELDER_NAMES = (
     "Grug - Elder",
     "Grug - Code Review",
-    "Grug — Code Review",
-    "Grug — Elder",
+    f"Grug {_EM} Code Review",
+    f"Grug {_EM} Elder",
 )
 
 # Every repo in task_relay.REPO_CHANNELS lives under this GitHub org.
