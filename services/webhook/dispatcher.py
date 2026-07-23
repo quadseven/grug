@@ -414,6 +414,70 @@ _RECHECK_PAT = _re.compile(r"^\s*/grug\s+recheck\b", _re.IGNORECASE | _re.MULTIL
 _AUTHORIZED_ROLES = {"admin", "maintain", "write"}
 
 
+def _actor_has_write(
+    installation_id: int,
+    owner: str,
+    repo_name: str,
+    sender_login: str,
+    *,
+    allow_author: bool = False,
+    pr_author_login: str = "",
+) -> bool | None:
+    """Fetch the sender's collaborator permission for the repo.
+
+    Returns True if the sender has an authorized role (admin/maintain/write),
+    or if allow_author is True and sender_login == pr_author_login.
+    Returns False if they have a non-authorized role.
+    Returns None if the permission lookup failed (HTTP error or transport
+    error) - the caller decides whether to skip or no-op.
+
+    Encapsulates the shared trust gate used by both /grug recheck and the
+    learnings reply handler. The allow_author flag controls the author
+    short-circuit: /grug recheck auto-trusts the PR author (harmless),
+    while the learnings handler always requires write+ (corpus-poisoning
+    guard ADR-0020).
+    """
+    from urllib.parse import quote as _q
+    from github_app_auth import with_install_token_retry  # type: ignore
+    import httpx  # type: ignore
+
+    # Author short-circuit: if allow_author is True and the sender is the
+    # PR author, auto-trust without an API call. Used by /grug recheck
+    # (an author re-running their own PR is harmless). The learnings
+    # handler passes allow_author=False so fork authors are always checked.
+    if allow_author and sender_login == pr_author_login:
+        return True
+
+    def _check_perm(token: str) -> str:
+        r = httpx.get(
+            f"https://api.github.com/repos/{_q(owner, safe='')}/"
+            f"{_q(repo_name, safe='')}/collaborators/"
+            f"{_q(sender_login, safe='')}/permission",
+            headers={
+                "Authorization": f"token {token}",
+                "Accept": "application/vnd.github+json",
+            },
+            timeout=10,
+        )
+        r.raise_for_status()
+        return (r.json() or {}).get("permission", "")
+
+    try:
+        perm = with_install_token_retry(int(installation_id), _check_perm)
+    except httpx.HTTPStatusError as e:
+        log.warning(
+            "perm_lookup_failed",
+            extra={"sender": sender_login, "status": e.response.status_code},
+        )
+        return None
+    except httpx.RequestError:
+        # Transport-level failure (timeout, DNS, connection-reset).
+        # Re-raise so the caller can return a distinct skip reason
+        # (mirrors the PR-fetch path's transport catch). F-01.
+        raise
+    return perm in _AUTHORIZED_ROLES
+
+
 def _handle_issue_comment(payload: dict[str, Any]) -> dict[str, str]:
     action = payload.get("action", "")
     if action != "created":
@@ -476,50 +540,28 @@ def _handle_issue_comment(payload: dict[str, Any]) -> dict[str, str]:
     # interpolated query strings" pattern.
     from urllib.parse import quote as _q
 
-    if sender_login != pr_author_login:
-        def _check_perm(token: str) -> str:
-            r = httpx.get(
-                f"https://api.github.com/repos/{_q(owner, safe='')}/"
-                f"{_q(repo_name, safe='')}/collaborators/"
-                f"{_q(sender_login, safe='')}/permission",
-                headers={
-                    "Authorization": f"token {token}",
-                    "Accept": "application/vnd.github+json",
-                },
-                timeout=10,
-            )
-            r.raise_for_status()
-            return (r.json() or {}).get("permission", "")
-
-        # Catch BOTH HTTPStatusError (4xx/5xx from GH) AND RequestError
-        # (transport: timeout, DNS, connection-reset). Earlier code only
-        # caught HTTPStatusError; transport blips surfaced as webhook 500s,
-        # which the replay poller could later redeliver as duplicate work.
-        # async-blocker-hunter F-01.
-        try:
-            perm = with_install_token_retry(int(installation_id), _check_perm)
-        except httpx.HTTPStatusError as e:
-            log.warning(
-                "recheck_perm_lookup_failed",
-                extra={"sender": sender_login, "status": e.response.status_code},
-            )
-            return {"status": "skip", "reason": "perm_lookup_failed"}
-        except httpx.RequestError as e:
-            log.warning(
-                "recheck_perm_lookup_transport_failed",
-                extra={"sender": sender_login, "kind": type(e).__name__},
-            )
-            return {"status": "skip", "reason": "perm_lookup_transport_failed"}
-
-        if perm not in _AUTHORIZED_ROLES:
-            log.info(
-                "recheck_unauthorized",
-                extra={
-                    "sender": sender_login, "perm": perm, "owner": owner,
-                    "repo": repo_name, "pr_number": pr_number,
-                },
-            )
-            return {"status": "no_op", "reason": "sender lacks write perm"}
+    try:
+        has_write = _actor_has_write(
+            int(installation_id), owner, repo_name, sender_login,
+            allow_author=True, pr_author_login=pr_author_login,
+        )
+    except httpx.RequestError as e:
+        log.warning(
+            "perm_lookup_transport_failed",
+            extra={"sender": sender_login, "kind": type(e).__name__},
+        )
+        return {"status": "skip", "reason": "perm_lookup_transport_failed"}
+    if has_write is None:
+        return {"status": "skip", "reason": "perm_lookup_failed"}
+    if not has_write:
+        log.info(
+            "recheck_unauthorized",
+            extra={
+                "sender": sender_login, "owner": owner,
+                "repo": repo_name, "pr_number": pr_number,
+            },
+        )
+        return {"status": "no_op", "reason": "sender lacks write perm"}
 
     # Re-fetch PR to get current head_sha + body (issue payload only has
     # the issue mirror, not the PR head). One API call per recheck.
@@ -697,31 +739,19 @@ def _handle_review_comment_reply(payload: dict[str, Any]) -> dict[str, str]:
     # poisons the review corpus for EVERY future PR, so a fork contributor (who
     # is the pr.user on their own fork PR but has no write access) must not be
     # able to teach. This is the corpus-poisoning guard ADR-0020 relies on.
-    def _check_perm(token: str) -> str:
-        r = httpx.get(
-            f"https://api.github.com/repos/{_q(owner, safe='')}/"
-            f"{_q(repo_name, safe='')}/collaborators/"
-            f"{_q(sender_login, safe='')}/permission",
-            headers={
-                "Authorization": f"token {token}",
-                "Accept": "application/vnd.github+json",
-            },
-            timeout=10,
-        )
-        r.raise_for_status()
-        return (r.json() or {}).get("permission", "")
-
     try:
-        perm = with_install_token_retry(int(installation_id), _check_perm)
-    except httpx.HTTPStatusError as e:
-        log.warning("learn_perm_lookup_failed", extra={
-            "sender": sender_login, "status": e.response.status_code})
-        return {"status": "skip", "reason": "perm_lookup_failed"}
+        has_write = _actor_has_write(
+            int(installation_id), owner, repo_name, sender_login,
+        )
     except httpx.RequestError as e:
-        log.warning("learn_perm_lookup_transport_failed", extra={
-            "sender": sender_login, "kind": type(e).__name__})
+        log.warning(
+            "perm_lookup_transport_failed",
+            extra={"sender": sender_login, "kind": type(e).__name__},
+        )
         return {"status": "skip", "reason": "perm_lookup_transport_failed"}
-    if perm not in _AUTHORIZED_ROLES:
+    if has_write is None:
+        return {"status": "skip", "reason": "perm_lookup_failed"}
+    if not has_write:
         return {"status": "no_op", "reason": "reply author lacks write perm"}
 
     from rerun import enqueue_learn  # type: ignore

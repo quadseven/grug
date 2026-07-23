@@ -505,6 +505,13 @@ def _check_capture(tree: ast.AST, f: ast.FunctionDef, path: Path) -> list[str]:
     capture_tries = _try_blocks_containing(f, "get_review_comments")
     capture_helper = _find_funcdef(tree, "_capture_review_comments")
     if capture_helper is not None:
+        # When the helper exists, dispatch_code_review MUST call it -
+        # otherwise the synchronous path silently drops comment capture.
+        if not _calls_named(f, "_capture_review_comments"):
+            fails.append(
+                f"FAIL: {path} - _capture_review_comments helper exists but is "
+                "never called from dispatch_code_review"
+            )
         # When the helper exists, it MUST contain a guarded get_review_comments
         # call - capture_tries is only for inline capture in dispatch.
         helper_tries = _try_blocks_containing(capture_helper, "get_review_comments")
