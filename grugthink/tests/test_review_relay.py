@@ -264,3 +264,115 @@ async def test_fetch_elder_verdict_handles_malformed_pr_payload(monkeypatch, cap
     assert result is None
     all_log_text = "\n".join(r.getMessage() for r in caplog.records)
     assert _FAKE_TOKEN not in all_log_text
+
+
+# --- defensive type validation (CodeRabbit finding on grug#742: a
+# valid-JSON, wrong-shape payload must degrade to None, not crash with an
+# AttributeError three .get() calls deep in a detached asyncio task) ---
+
+
+@pytest.mark.parametrize(
+    "pr_json,expected",
+    [
+        ({"head": {"sha": "abc123"}}, "abc123"),
+        ({"head": []}, None),  # head is a list, not a dict
+        ({"head": {"sha": 12345}}, None),  # sha is not a string
+        ({"head": {}}, None),  # sha missing entirely
+        ({}, None),
+        ("not even a dict", None),
+        (None, None),
+    ],
+)
+def test_extract_head_sha_handles_malformed_shapes(pr_json, expected):
+    assert review_relay._extract_head_sha(pr_json) == expected
+
+
+@pytest.mark.parametrize(
+    "checks_json,expected_found",
+    [
+        ({"check_runs": [{"name": "Grug - Elder", "conclusion": "success"}]}, True),
+        ({"check_runs": {}}, False),  # check_runs is a dict, not a list
+        ({"check_runs": ["not a dict", 42, None]}, False),  # entries aren't dicts
+        ({"check_runs": []}, False),
+        ({}, False),
+        ("not even a dict", False),
+    ],
+)
+def test_extract_elder_run_handles_malformed_shapes(checks_json, expected_found):
+    result = review_relay._extract_elder_run(checks_json)
+    assert (result is not None) == expected_found
+
+
+@pytest.mark.parametrize(
+    "checks_json,expected",
+    [
+        ({"check_runs": [{"name": "x"}], "total_count": 5}, ([{"name": "x"}], 5)),
+        ({"check_runs": {}, "total_count": 5}, ([], 5)),  # check_runs wrong type
+        ({"check_runs": [], "total_count": "not a number"}, ([], 0)),  # total_count wrong type
+        ({}, ([], 0)),
+    ],
+)
+def test_page_count_hint_handles_malformed_shapes(checks_json, expected):
+    assert review_relay._page_count_hint(checks_json) == expected
+
+
+@pytest.mark.asyncio
+async def test_fetch_elder_verdict_handles_malformed_check_runs_shape(monkeypatch, caplog):
+    """check_runs present but shaped as a dict, not a list - must degrade
+    to None instead of crashing when iterating."""
+    monkeypatch.setenv("GRUGTHINK_GITHUB_CHECKS_TOKEN", _FAKE_TOKEN)
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        if request.url.path.endswith("/pulls/1851"):
+            return httpx.Response(200, json={"head": {"sha": "deadbeef"}})
+        return httpx.Response(200, json={"check_runs": {}, "total_count": 0})
+
+    transport = httpx.MockTransport(handler)
+    real_client_cls = httpx.AsyncClient
+
+    def patched_client(*args, **kwargs):
+        kwargs["transport"] = transport
+        return real_client_cls(*args, **kwargs)
+
+    monkeypatch.setattr(httpx, "AsyncClient", patched_client)
+
+    with caplog.at_level(logging.DEBUG):
+        result = await review_relay.fetch_elder_verdict("infra", 1851)
+
+    assert result is None
+    all_log_text = "\n".join(r.getMessage() for r in caplog.records)
+    assert _FAKE_TOKEN not in all_log_text
+
+
+@pytest.mark.asyncio
+async def test_fetch_elder_verdict_handles_non_dict_output(monkeypatch):
+    """Elder's own check-run has a non-dict `output` field - must still
+    return a verdict with title/summary as None, not crash."""
+    monkeypatch.setenv("GRUGTHINK_GITHUB_CHECKS_TOKEN", _FAKE_TOKEN)
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        if request.url.path.endswith("/pulls/1851"):
+            return httpx.Response(200, json={"head": {"sha": "deadbeef"}})
+        return httpx.Response(
+            200,
+            json={
+                "check_runs": [{"name": "Grug - Elder", "conclusion": "success", "output": ["not", "a", "dict"]}],
+                "total_count": 1,
+            },
+        )
+
+    transport = httpx.MockTransport(handler)
+    real_client_cls = httpx.AsyncClient
+
+    def patched_client(*args, **kwargs):
+        kwargs["transport"] = transport
+        return real_client_cls(*args, **kwargs)
+
+    monkeypatch.setattr(httpx, "AsyncClient", patched_client)
+
+    result = await review_relay.fetch_elder_verdict("infra", 1851)
+
+    assert result is not None
+    assert result.conclusion == "success"
+    assert result.title is None
+    assert result.summary is None

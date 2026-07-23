@@ -105,6 +105,50 @@ def _get_token() -> Optional[str]:
     return os.environ.get(_TOKEN_ENV_VAR) or None
 
 
+def _extract_head_sha(pr_json: object) -> Optional[str]:
+    """Defensively pull head.sha out of a PR payload.
+
+    GitHub's own contract guarantees this shape, but a valid-JSON,
+    wrong-shape response (``{"head": []}``, a non-string sha, ...) must
+    degrade to None here, not crash with an AttributeError three calls
+    deep inside a detached asyncio.create_task nothing else observes.
+    """
+    if not isinstance(pr_json, dict):
+        return None
+    head = pr_json.get("head")
+    if not isinstance(head, dict):
+        return None
+    sha = head.get("sha")
+    return sha if isinstance(sha, str) and sha else None
+
+
+def _extract_elder_run(checks_json: object) -> Optional[dict]:
+    """Defensively find the Elder check-run entry in one check-runs page,
+    tolerating ``{"check_runs": {}}`` or a non-dict entry in the list."""
+    if not isinstance(checks_json, dict):
+        return None
+    runs = checks_json.get("check_runs")
+    if not isinstance(runs, list):
+        return None
+    for run in runs:
+        if isinstance(run, dict) and run.get("name") in CHECK_ELDER_NAMES:
+            return run
+    return None
+
+
+def _page_count_hint(checks_json: object) -> tuple[list, int]:
+    """Returns (runs, total_count) from a check-runs page payload, coerced
+    to safe defaults on any type mismatch so the pagination loop's own
+    arithmetic can't raise on a malformed response."""
+    if not isinstance(checks_json, dict):
+        return [], 0
+    runs = checks_json.get("check_runs")
+    runs = runs if isinstance(runs, list) else []
+    total = checks_json.get("total_count")
+    total = total if isinstance(total, int) else 0
+    return runs, total
+
+
 async def fetch_elder_verdict(repo: str, pr_number: int) -> Optional[ElderVerdict]:
     """Look up the Grug - Elder check-run for a PR's current head commit.
 
@@ -127,11 +171,10 @@ async def fetch_elder_verdict(repo: str, pr_number: int) -> Optional[ElderVerdic
         try:
             pr_resp = await client.get(f"/repos/{GITHUB_ORG}/{repo}/pulls/{pr_number}")
             pr_resp.raise_for_status()
-            pr_json = pr_resp.json()
-            head_sha = pr_json.get("head", {}).get("sha")
+            head_sha = _extract_head_sha(pr_resp.json())
             if not head_sha:
                 log.warning(
-                    "review_relay: PR payload missing head.sha",
+                    "review_relay: PR payload missing or malformed head.sha",
                     extra={"repo": repo, "pr_number": pr_number},
                 )
                 return None
@@ -154,17 +197,17 @@ async def fetch_elder_verdict(repo: str, pr_number: int) -> Optional[ElderVerdic
                 )
                 checks_resp.raise_for_status()
                 checks_json = checks_resp.json()
-                runs = checks_json.get("check_runs", [])
-                for run in runs:
-                    if run.get("name") in CHECK_ELDER_NAMES:
-                        output = run.get("output") or {}
-                        return ElderVerdict(
-                            conclusion=run.get("conclusion"),
-                            title=output.get("title"),
-                            summary=output.get("summary"),
-                            html_url=run.get("html_url"),
-                        )
-                total = checks_json.get("total_count", 0)
+                elder_run = _extract_elder_run(checks_json)
+                if elder_run is not None:
+                    output = elder_run.get("output")
+                    output = output if isinstance(output, dict) else {}
+                    return ElderVerdict(
+                        conclusion=elder_run.get("conclusion"),
+                        title=output.get("title"),
+                        summary=output.get("summary"),
+                        html_url=elder_run.get("html_url"),
+                    )
+                runs, total = _page_count_hint(checks_json)
                 if not runs or page * 100 >= total:
                     break
                 page += 1
