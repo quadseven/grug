@@ -109,31 +109,31 @@ async def fetch_elder_verdict(repo: str, pr_number: int) -> Optional[ElderVerdic
                 )
                 return None
 
-            # Iterate all CHECK_ELDER_NAMES aliases via check_name parameter
-            # to avoid missing the Elder check on a paginated first page.
-            for elder_name in CHECK_ELDER_NAMES:
-                params = {"check_name": elder_name}
-                page = 1
-                while True:
-                    checks_resp = await client.get(
-                        f"/repos/{GITHUB_ORG}/{repo}/commits/{head_sha}/check-runs",
-                        params={**params, "page": page},
-                    )
-                    checks_resp.raise_for_status()
-                    checks_json = checks_resp.json()
-                    runs = checks_json.get("check_runs", [])
-                    for run in runs:
-                        if run.get("name") in CHECK_ELDER_NAMES:
-                            output = run.get("output") or {}
-                            return ElderVerdict(
-                                conclusion=run.get("conclusion"),
-                                title=output.get("title"),
-                                summary=output.get("summary"),
-                                html_url=run.get("html_url"),
-                            )
-                    if page >= checks_json.get("total_count", 0) // 100 + 1:
-                        break
-                    page += 1
+            # Iterate all pages of check-runs to avoid missing the Elder
+            # check on a paginated first page. The check-runs API does not
+            # support filtering by check_name, so we page through all results.
+            page = 1
+            while True:
+                checks_resp = await client.get(
+                    f"/repos/{GITHUB_ORG}/{repo}/commits/{head_sha}/check-runs",
+                    params={"page": page},
+                )
+                checks_resp.raise_for_status()
+                checks_json = checks_resp.json()
+                runs = checks_json.get("check_runs", [])
+                for run in runs:
+                    if run.get("name") in CHECK_ELDER_NAMES:
+                        output = run.get("output") or {}
+                        return ElderVerdict(
+                            conclusion=run.get("conclusion"),
+                            title=output.get("title"),
+                            summary=output.get("summary"),
+                            html_url=run.get("html_url"),
+                        )
+                total = checks_json.get("total_count", 0)
+                if not runs or page * 100 >= total:
+                    break
+                page += 1
             return None
         except httpx.HTTPStatusError as exc:
             # Deliberately log.warning (not log.exception/exc_info=True) with
