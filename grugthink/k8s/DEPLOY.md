@@ -62,6 +62,18 @@ kubectl create secret generic grugthink-llm-fallback -n grugthink \
 # Copy grug's registry pull secret into the namespace:
 kubectl get secret registry-pull -n grug -o yaml \
   | sed 's/namespace: grug/namespace: grugthink/' | kubectl apply -f -
+
+# Optional: review-relay's read-only GitHub token (bot/review_relay.py -
+# fetches the real Grug - Elder check-run for "@grug review PR #N").
+# checks:read scope only, deliberately separate from Hermes' broader
+# GH_TOKEN. Skip this if the review-relay feature isn't wanted yet -
+# it's optional:true in deployment.yaml and degrades to "Grug can't
+# answer that yet" without it.
+kubectl create secret generic grugthink-github -n grugthink \
+  --from-literal=GRUGTHINK_GITHUB_CHECKS_TOKEN="$(aws ssm get-parameter \
+      --name /githumps/grugthink/github_checks_token --with-decryption \
+      --query Parameter.Value --output text 2>/dev/null || echo '')" \
+  --dry-run=client -o yaml | kubectl apply -f -
 ```
 
 ## 3. Pin image placeholders + apply
@@ -101,5 +113,14 @@ config + memory across restarts.
 - OAuth login is disabled (`DISABLE_OAUTH=true`) - the dashboard is
   network-isolated (port-forward / tailnet). To require Discord login, set
   `DISABLE_OAUTH=false` and add `DISCORD_CLIENT_ID`/`DISCORD_CLIENT_SECRET`.
+- Task relay to Hermes (`bot/task_relay.py`, `bot/review_relay.py`) is
+  fail-closed/fail-safe by design - it does nothing until both
+  `TASK_RELAY_ALLOWED_USER_IDS` (comma-separated Discord user IDs
+  authorized to trigger a relay) and `HERMES_BOT_USER_ID` (Hermes' own
+  Discord user ID, so a reply is only trusted if it's verifiably from
+  Hermes) are set on the Deployment. Also needs Grug's Discord role
+  granted visibility + send permission on the per-repo channels under
+  the "Github" category - the same one-time step already done for
+  Hermes. See the module docstrings for the full security model.
 - `readOnlyRootFilesystem` is intentionally not set yet - harden it once the
   container's write paths (beyond `/data` and `/tmp`) are confirmed.
