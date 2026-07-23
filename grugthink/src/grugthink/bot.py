@@ -603,7 +603,8 @@ class GrugThinkBot(commands.Cog):
         return cross_bot.detect_cross_bot_mentions_in_text(text)
 
     def _maybe_relay_review(self, message, bot_id: str, server_id: str, bot_name: str, clean_content: str) -> bool:
-        """If clean_content names a specific PR ("review PR #123"), that's a
+        """If clean_content explicitly asks about a specific PR's review
+        ("review PR #123", "what did elder say about #123"), that's a
         request to read grug's real Elder verdict, not to ask Hermes to do
         anything - route it there instead and return True. Returns False
         for everything else, including task-shaped requests with no PR
@@ -611,8 +612,16 @@ class GrugThinkBot(commands.Cog):
         _maybe_relay_task for the same reason that method is split out of
         on_message's own branching (grug#721 Elder review,
         `high-complexity` finding).
+
+        Deliberately requires review_relay.looks_like_review_request, NOT
+        just task_relay.looks_like_task - "fix infra #123" matches the
+        generic "fix" task keyword and has both a PR-shaped number and a
+        resolvable repo, but almost certainly means implement a fix for
+        issue #123, not "read Elder's verdict on PR #123" (CodeRabbit
+        finding on grug#742, confirmed real: that phrasing would otherwise
+        get silently diverted to a read-only lookup instead of Hermes).
         """
-        if not task_relay.looks_like_task(clean_content):
+        if not review_relay.looks_like_review_request(clean_content):
             return False
 
         pr_number = review_relay.extract_pr_number(clean_content)

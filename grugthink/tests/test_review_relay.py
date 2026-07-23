@@ -32,6 +32,41 @@ def test_extract_pr_number(statement, expected):
     assert review_relay.extract_pr_number(statement) == expected
 
 
+@pytest.mark.parametrize(
+    "statement",
+    [
+        "review PR #123 for macchina",
+        "what did elder say about #4567",
+        "review the pr for infra",
+        "look at this pr",
+        "can you do a code review",
+        "elder verdict on #99",
+        "check the check-run for #12",
+    ],
+)
+def test_looks_like_review_request_true(statement):
+    assert review_relay.looks_like_review_request(statement) is True
+
+
+@pytest.mark.parametrize(
+    "statement",
+    [
+        # CodeRabbit finding on grug#742: this matches task_relay's generic
+        # "fix" keyword and has both a PR-shaped number and a resolvable
+        # repo, but means "implement a fix for issue #123", not "read
+        # Elder's verdict on PR #123" - must NOT be treated as a review
+        # request.
+        "fix infra #123",
+        "implement the change from #45 in macchina",
+        "build a dashboard",
+        "what is the capital of France",
+        "",
+    ],
+)
+def test_looks_like_review_request_false(statement):
+    assert review_relay.looks_like_review_request(statement) is False
+
+
 def test_get_token_unset_returns_none(monkeypatch):
     monkeypatch.delenv("GRUGTHINK_GITHUB_CHECKS_TOKEN", raising=False)
     assert review_relay._get_token() is None
@@ -152,3 +187,80 @@ async def test_fetch_elder_verdict_never_logs_the_token_on_network_error(monkeyp
     all_log_text = "\n".join(r.getMessage() for r in caplog.records)
     assert _FAKE_TOKEN not in all_log_text
     assert not any(r.exc_info for r in caplog.records)
+
+
+@pytest.mark.asyncio
+async def test_fetch_elder_verdict_finds_elder_on_a_later_page(monkeypatch):
+    """The check-runs API's own default is 30 per page, but the loop's
+    termination math (page * 100 >= total) assumes 100 - so the request
+    MUST explicitly ask for per_page=100, or a commit with more than 30
+    check-runs would silently stop after page 1 and never find Elder if
+    it landed on page 2. Regression for that exact bug."""
+    monkeypatch.setenv("GRUGTHINK_GITHUB_CHECKS_TOKEN", _FAKE_TOKEN)
+
+    # 100 unrelated check-runs on page 1 (filling exactly one full page at
+    # the per_page=100 this code is expected to request), Elder itself
+    # arrives only on page 2 - total_count reflects both pages.
+    page_1_runs = [{"name": f"Some Other Check {i}"} for i in range(100)]
+    page_2_runs = [
+        {
+            "name": "Grug - Elder",
+            "conclusion": "success",
+            "html_url": "https://grug.lol/some/check",
+            "output": {"title": "Elder: 0 findings", "summary": "No issues found."},
+        }
+    ]
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        if request.url.path.endswith("/pulls/1851"):
+            return httpx.Response(200, json={"head": {"sha": "deadbeef"}})
+
+        assert request.url.params.get("per_page") == "100", (
+            "must request per_page=100 to match the page*100>=total termination check"
+        )
+        page = int(request.url.params.get("page", "1"))
+        if page == 1:
+            return httpx.Response(200, json={"check_runs": page_1_runs, "total_count": 101})
+        return httpx.Response(200, json={"check_runs": page_2_runs, "total_count": 101})
+
+    transport = httpx.MockTransport(handler)
+    real_client_cls = httpx.AsyncClient
+
+    def patched_client(*args, **kwargs):
+        kwargs["transport"] = transport
+        return real_client_cls(*args, **kwargs)
+
+    monkeypatch.setattr(httpx, "AsyncClient", patched_client)
+
+    result = await review_relay.fetch_elder_verdict("infra", 1851)
+
+    assert result is not None
+    assert result.conclusion == "success"
+    assert result.title == "Elder: 0 findings"
+
+
+@pytest.mark.asyncio
+async def test_fetch_elder_verdict_handles_malformed_pr_payload(monkeypatch, caplog):
+    """A valid-JSON-but-wrong-shape PR payload (missing head.sha) must
+    degrade to None, not raise out of a detached asyncio.create_task
+    where nothing would ever see the exception."""
+    monkeypatch.setenv("GRUGTHINK_GITHUB_CHECKS_TOKEN", _FAKE_TOKEN)
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(200, json={"head": {}})
+
+    transport = httpx.MockTransport(handler)
+    real_client_cls = httpx.AsyncClient
+
+    def patched_client(*args, **kwargs):
+        kwargs["transport"] = transport
+        return real_client_cls(*args, **kwargs)
+
+    monkeypatch.setattr(httpx, "AsyncClient", patched_client)
+
+    with caplog.at_level(logging.DEBUG):
+        result = await review_relay.fetch_elder_verdict("infra", 1851)
+
+    assert result is None
+    all_log_text = "\n".join(r.getMessage() for r in caplog.records)
+    assert _FAKE_TOKEN not in all_log_text

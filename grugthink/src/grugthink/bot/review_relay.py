@@ -52,6 +52,33 @@ _TOKEN_ENV_VAR = "GRUGTHINK_GITHUB_CHECKS_TOKEN"
 
 _PR_REF_PATTERN = re.compile(r"#(\d+)\b")
 
+# Deliberately narrower than task_relay's looks_like_task: "fix infra #123"
+# matches task_relay's generic "fix" keyword and has both a PR-shaped number
+# and a resolvable repo, but the user almost certainly means implement a fix
+# for issue #123, not "read Elder's verdict on PR #123" - routing that to a
+# read-only lookup would silently drop the actual work request instead of
+# handing it to Hermes. Requiring explicit review/Elder language here keeps
+# only genuine "what did Elder say" requests off the task-relay path
+# (CodeRabbit finding on grug#742).
+_REVIEW_INTENT_PATTERN = re.compile(
+    r"\b("
+    r"(review|look at) (this|the|that|a)? ?(pr|pull request|diff|code)|"
+    r"code review|"
+    r"elder|"
+    r"verdict|"
+    r"check-?run"
+    r")\b",
+    re.IGNORECASE,
+)
+
+
+def looks_like_review_request(clean_content: str) -> bool:
+    """True only for explicit review/Elder-verdict intent - see
+    _REVIEW_INTENT_PATTERN's comment for why this is narrower than
+    task_relay.looks_like_task."""
+    return bool(_REVIEW_INTENT_PATTERN.search(clean_content))
+
+
 # Elder's summary is a full findings table meant for GitHub's markdown
 # renderer - trimmed hard so a Discord relay stays a relay, not a wall of
 # text. Full detail always stays reachable via html_url.
@@ -111,12 +138,19 @@ async def fetch_elder_verdict(repo: str, pr_number: int) -> Optional[ElderVerdic
 
             # Iterate all pages of check-runs to avoid missing the Elder
             # check on a paginated first page. The check-runs API does not
-            # support filtering by check_name, so we page through all results.
+            # support filtering by check_name, so we page through all
+            # results. per_page is explicit (GitHub's max, 100) because the
+            # termination math below assumes it - the API's own default is
+            # only 30 per page, which would otherwise stop this loop after
+            # page 1 on any commit with 31-100 check-runs (easily reached:
+            # this repo alone posts CodeQL/Analyze/infra-test/memory-tests/
+            # meta/Grug-Chief/Elder/Guard plus CodeRabbit/Qodo), silently
+            # missing Elder on later pages instead of raising.
             page = 1
             while True:
                 checks_resp = await client.get(
                     f"/repos/{GITHUB_ORG}/{repo}/commits/{head_sha}/check-runs",
-                    params={"page": page},
+                    params={"page": page, "per_page": 100},
                 )
                 checks_resp.raise_for_status()
                 checks_json = checks_resp.json()

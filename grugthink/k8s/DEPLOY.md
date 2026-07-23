@@ -73,7 +73,7 @@ umask 077
 token_file="$(mktemp)"
 trap 'rm -f "$token_file"' EXIT
 if ! aws ssm get-parameter \
-      --name /githumps/grugthink/github_checks_token --with-decrypt \
+      --name /githumps/grugthink/github_checks_token --with-decryption \
       --query Parameter.Value --output text >"$token_file" 2>/dev/null; then
   : >"$token_file"
 fi
