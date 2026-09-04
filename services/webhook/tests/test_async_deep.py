@@ -286,3 +286,138 @@ def test_async_deep_partial_coverage_never_publishes_success(monkeypatch):
         "deep arm hit partial coverage but its check-run reported success - "
         "coverage honesty regression"
     )
+
+
+def _clean_tier1() -> LlmReviewResponse:
+    return LlmReviewResponse(
+        kind="reviewed", findings=(),
+        backend_used=Backend.CAVE, model_name="coder",
+        backends_used=(Backend.CAVE,), models_used=("coder",),
+    )
+
+
+def _run_escalated_review(monkeypatch, *, deep: LlmReviewResponse) -> list[dict]:
+    """Drive one escalated tiered review (clean Tier-1, `deep` from the
+    reasoner) in blocking mode and return every posted check-run.
+
+    `blocking=True` on purpose: advisory mode forces `neutral` unconditionally
+    and would hide a Tier-1 `success` left standing by a failed deep arm."""
+    posted_checks: list[dict] = []
+
+    def _fake_post_check(token, owner, repo, result, external_id=None):
+        posted_checks.append({
+            "external_id": external_id,
+            "conclusion": result.conclusion,
+            "title": result.title,
+            "summary": result.summary,
+        })
+        return {"id": len(posted_checks)}
+
+    monkeypatch.setattr(cr_dispatch, "review_diff", lambda *a, **kw: _clean_tier1())
+    monkeypatch.setattr(cr_dispatch, "review_reasoner_diff", lambda *a, **kw: deep)
+    monkeypatch.setattr(cr_dispatch, "post_check_run", _fake_post_check)
+    monkeypatch.setattr(cr_dispatch, "post_review", lambda *a, **k: {"id": 1})
+    monkeypatch.setattr(cr_dispatch, "grade_findings", lambda *a, **kw: ())
+    monkeypatch.setattr(
+        cr_dispatch, "_fetch_current_review_snapshot",
+        lambda *a, **k: ("base5678ijkl", "abcd1234efgh", "t", "b"),
+    )
+    with patch("adapters.install_store.put_elder_last_reviewed", lambda **k: None), \
+         patch("adapters.install_store.get_elder_last_reviewed", return_value=None), \
+         patch("httpx.get", return_value=_diff_response()):
+        cr_dispatch.dispatch_code_review(_payload(), blocking=True)
+    return posted_checks
+
+
+def _deep_checks(posted_checks: list[dict]) -> list[dict]:
+    return [
+        c for c in posted_checks
+        if (c["external_id"] or "").startswith("grug-cr-deep:")
+    ]
+
+
+@pytest.mark.parametrize(
+    "failed_deep",
+    [
+        LlmReviewResponse(
+            kind="all_failed", error="cave-reasoner: ConnectError",
+            backend_used=Backend.CAVE_REASONER,
+        ),
+        LlmReviewResponse(
+            kind="parse_failed", error="content was prose, not JSON",
+            backend_used=Backend.CAVE_REASONER, model_name="reasoner",
+        ),
+    ],
+    ids=["all_failed", "parse_failed"],
+)
+def test_async_deep_arm_failure_never_leaves_tier1_success_unqualified(
+    monkeypatch, caplog, failed_deep,
+):
+    """grug#848: Tier-1 is clean and publishes `success` with the promise
+    "reasoner may append later if escalated". Escalation fires, and the
+    reasoner arm then fails outright (transport error, or a reply that
+    never parsed). Before the fix `_async_deep_append_if_needed` logged
+    `elder_async_deep_arm_empty` and returned - no check-run, no note - so
+    the Tier-1 `success` stood unqualified and the author could not tell
+    "the reasoner looked and agreed" from "the reasoner never looked".
+
+    MUST fail on main (no `grug-cr-deep:` check-run is ever posted) and pass
+    once the failed arm folds into Tier-1 through `with_degradation` /
+    `_derive_conclusion` and completes the deep check-run `neutral`."""
+    with caplog.at_level("INFO"):
+        posted = _run_escalated_review(monkeypatch, deep=failed_deep)
+
+    # The branch is exercised (issue acceptance: the log gains a test) ...
+    empty = [r for r in caplog.records if r.message == "elder_async_deep_arm_empty"]
+    assert len(empty) == 1
+    assert empty[0].kind == failed_deep.kind  # type: ignore[attr-defined]
+    # ... and it is no longer silent.
+    deep = _deep_checks(posted)
+    assert deep, (
+        "deep arm failed outright but no deep check-run was posted - the "
+        "Tier-1 success stands unqualified"
+    )
+    assert deep[-1]["conclusion"] == "neutral"
+    assert "did not run" in deep[-1]["title"]
+    assert failed_deep.kind in deep[-1]["title"]
+    # The Tier-1 verdict is not disowned: this is "the second look never
+    # happened", not "Grug could not see the diff".
+    assert "could not see the diff" not in deep[-1]["summary"]
+    assert "did not run" in deep[-1]["summary"]
+    # Raw backend/parse error text never reaches the author-facing surface
+    # (a parse failure's text can be model prose) - the log carries it.
+    assert failed_deep.error not in deep[-1]["summary"]
+
+
+def test_async_deep_arm_ran_clean_still_publishes_success(monkeypatch):
+    """The other half of the #848 distinction: a reasoner that RAN and found
+    nothing is a legitimately clean deep pass. The failure handling must not
+    turn every escalated-but-clean review into a neutral - `success`, with a
+    summary that says the arm ran, not that it was skipped."""
+    ran_clean = LlmReviewResponse(
+        kind="reviewed", findings=(),
+        backend_used=Backend.CAVE_REASONER, model_name="reasoner",
+        backends_used=(Backend.CAVE_REASONER,), models_used=("reasoner",),
+    )
+
+    posted = _run_escalated_review(monkeypatch, deep=ran_clean)
+
+    deep = _deep_checks(posted)
+    assert deep, "deep check-run was never posted"
+    assert deep[-1]["conclusion"] == "success"
+    assert "did not run" not in deep[-1]["title"]
+    assert "did not run" not in deep[-1]["summary"]
+    assert "appended after Tier-1 completed" in deep[-1]["summary"]
+
+
+def test_async_deep_arm_no_diff_is_not_a_failure(monkeypatch, caplog):
+    """`no_diff` from the reasoner means there was nothing for it to look at
+    (BENIGN_DEGRADATIONS) - not a failure to look. It must not manufacture a
+    degraded deep check-run over a clean Tier-1."""
+    with caplog.at_level("INFO"):
+        posted = _run_escalated_review(
+            monkeypatch, deep=LlmReviewResponse(kind="no_diff"),
+        )
+
+    assert [r for r in caplog.records if r.message == "elder_async_deep_arm_empty"]
+    assert _deep_checks(posted) == []

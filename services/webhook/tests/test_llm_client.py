@@ -785,7 +785,7 @@ def test_deep_review_uses_stronger_duplicate_explanation(monkeypatch) -> None:
 def test_deep_review_one_arm_reply_is_a_complete_review(monkeypatch) -> None:
     # The two owned arms are best-effort: ONE reply is a complete review (never
     # provisional/retryable), so a reasoner-arm 402/5xx cannot block a review the
-    # coder arm answered.
+    # coder arm answered - `kind` stays `reviewed` and the findings publish.
     monkeypatch.setenv("GRUG_REVIEW_DEPTH", "deep")
 
     def respond(url, **kwargs):
@@ -803,9 +803,90 @@ def test_deep_review_one_arm_reply_is_a_complete_review(monkeypatch) -> None:
         out = review_diff([_hunk()], installation_id=1)
 
     assert out.kind == "reviewed"
-    assert not out.error  # one arm answering is not an error
+    # grug#848: this used to assert `not out.error` ("one arm answering is
+    # not an error"). Complete-enough-to-publish and complete are not the
+    # same claim: the check-run must not vouch `success` for a look the
+    # second arm never took, so the missing arm now reads as partial
+    # coverage (the same seam PR #844 built) while the findings still post.
+    assert out.error.startswith("partial review:")
     assert out.backends_used == (Backend.CAVE,)
     assert [finding.rule for finding in out.findings] == ["lost-error"]
+
+
+def test_deep_review_one_arm_failure_routes_through_derive_conclusion(monkeypatch) -> None:
+    """grug#848 (sibling of the tiered path): the concurrent dual-arm merge
+    returned `kind="reviewed"`, `error=""` when only one of two arms
+    succeeded, so `evaluate_diff` could not tell it from a clean two-arm
+    pass and the check-run read `success` over a look the reasoner never
+    took. Latent today (both deployments pin `GRUG_REVIEW_DEPTH=tiered`),
+    which is exactly why it needs a test: a future flip to `deep` would
+    reintroduce the bug wholesale.
+
+    MUST fail on main (`out.error == ""`, `conclusion == "success"`) and
+    pass once the missing arm is folded into the SAME `"partial review:"`
+    -> `degraded_reason="partial_review"` -> `_derive_conclusion` seam
+    PR #844 established for cohort coverage - no new vocabulary."""
+    monkeypatch.setenv("GRUG_REVIEW_DEPTH", "deep")
+
+    def respond(url, **kwargs):
+        if _is_reasoner(kwargs):
+            raise httpx.ConnectError("reasoner down")
+        # The emptiest, most "looks clean" reply - the one most likely to be
+        # mistaken for a full two-arm pass.
+        return httpx.Response(200, json=_openai_json_response('{"findings": []}'))
+
+    with patch.object(httpx, "post", side_effect=respond):
+        out = review_diff([_hunk()], installation_id=1)
+
+    assert out.kind == "reviewed"
+    assert out.backends_used == (Backend.CAVE,)
+    assert out.error.startswith("partial review:"), (
+        f"error={out.error!r} - one of two arms failed outright but the "
+        "merge reads as a clean two-arm pass"
+    )
+    assert "cave-reasoner" in out.error
+
+    evaluation = evaluate_diff((), out)
+    assert evaluation.degraded_reason == "partial_review"
+    assert evaluation.conclusion == "neutral", (
+        f"conclusion={evaluation.conclusion!r} - a one-arm review must never "
+        "surface as an unqualified success"
+    )
+
+
+def test_deep_review_both_arms_answering_is_not_partial(monkeypatch) -> None:
+    """Guard against over-correction: two clean arms are a clean two-arm
+    pass - `error` stays empty and the conclusion stays `success`."""
+    monkeypatch.setenv("GRUG_REVIEW_DEPTH", "deep")
+    response = httpx.Response(200, json=_openai_json_response('{"findings": []}'))
+
+    with patch.object(httpx, "post", return_value=response):
+        out = review_diff([_hunk()], installation_id=1)
+
+    assert out.backends_used == (Backend.CAVE, Backend.CAVE_REASONER)
+    assert out.error == ""
+    assert evaluate_diff((), out).conclusion == "success"
+
+
+def test_fast_review_reasoner_fallback_is_not_partial(monkeypatch) -> None:
+    """`fast` is coder-first with the reasoner as FALLBACK, not a second
+    arm: one reply is the whole design, so a coder failure rescued by the
+    reasoner must not read as partial coverage. Only the concurrent
+    dual-arm (`deep`) merge expects both arms to answer."""
+    monkeypatch.setenv("GRUG_REVIEW_DEPTH", "fast")
+    monkeypatch.setattr(lc, "_RETRY_SLEEP", lambda s: None)
+
+    def respond(url, **kwargs):
+        if _is_reasoner(kwargs):
+            return httpx.Response(200, json=_openai_json_response('{"findings": []}'))
+        return httpx.Response(500, json={"error": "upstream"})
+
+    with patch.object(httpx, "post", side_effect=respond):
+        out = review_diff([_hunk()], installation_id=1)
+
+    assert out.kind == "reviewed"
+    assert out.backends_used == (Backend.CAVE_REASONER,)
+    assert out.error == ""
 
 
 def test_review_depth_defaults_to_tiered_single_arm(monkeypatch) -> None:
