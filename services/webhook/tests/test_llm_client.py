@@ -3760,3 +3760,91 @@ def test_parse_response_normalises_a_responses_envelope() -> None:
     assert err == ""
     assert model == "gpt-5.6-luna"
     assert len(findings) == 1 and findings[0].severity == "high"
+
+
+# --- grug#939: a starved cohort is not a failed one -------------------------
+#
+# `_run_staged_cohorts` synthesizes a placeholder for every cohort it never
+# reaches, which is what makes them countable at all - but the placeholder is
+# `kind="all_failed"`, so a cohort nobody opened arrived at the author
+# indistinguishable from one that called a model and broke.
+
+
+def test_retried_cohort_starves_the_cohorts_after_it() -> None:
+    """The cascade behind the live reports: one retryable failure spends two
+    model calls before the NEXT cohort is attempted at all, so a later cohort
+    is skipped for budget and never runs."""
+    elapsed = [0.0]
+    attempted: list[int] = []
+
+    def run(index: int) -> LlmReviewResponse:
+        attempted.append(index)
+        elapsed[0] += 200.0
+        if index == 1:
+            return LlmReviewResponse(kind="parse_failed", error="unparseable")
+        return LlmReviewResponse(
+            kind="reviewed", backend_used=Backend.CAVE, model_name="coder",
+        )
+
+    responses = lc._run_staged_cohorts(
+        cohort_count=4, run_cohort=run, budget_seconds=700,
+        reserve_seconds=100, cancel_event=None, clock=lambda: elapsed[0],
+    )
+
+    # Cohort 2 (index 1) burned its retry, so cohort 4 (index 3) never ran.
+    assert attempted == [0, 1, 1, 2], attempted
+    _, failed = lc._partition_cohort_responses(responses)
+    assert failed == [2, 4], failed
+    assert lc._unattempted_cohort_indexes(responses) == (4,), (
+        "cohort 4 was never attempted and must not be lumped in with cohort 2, "
+        "which ran and failed"
+    )
+
+
+def test_unattempted_cohorts_are_a_subset_of_failed_not_a_replacement() -> None:
+    """`completed_cohorts`/`fraction` must not move (the eval harness reads
+    them); the new field only says which of the shortfall was never opened."""
+    plan = ReviewPlan(
+        cohorts=(_plan_cohort("a"), _plan_cohort("b"), _plan_cohort("c")),
+        total_diff_chars=100,
+        total_cohorts_planned=3,
+    )
+    responses = [
+        LlmReviewResponse(
+            kind="reviewed", findings=(), backend_used=Backend.CAVE, model_name="m",
+        ),
+        LlmReviewResponse(kind="parse_failed", error="unparseable"),
+        LlmReviewResponse(
+            kind="all_failed",
+            error="cohort skipped: staged review budget exhausted",
+        ),
+    ]
+
+    merged = lc._merge_cohort_responses(responses, 1, None, plan)
+    coverage = merged.coverage
+
+    assert coverage.completed_cohorts == 1
+    assert coverage.failed_cohorts == (2, 3)
+    assert coverage.unattempted_cohorts == (3,)
+    assert set(coverage.unattempted_cohorts) <= set(coverage.failed_cohorts)
+
+
+def test_cohort_failure_reasons_carry_the_cause_not_just_the_index() -> None:
+    """grug#818 needs to tell transient from terminal in telemetry; the index
+    alone cannot."""
+    responses = [
+        LlmReviewResponse(
+            kind="reviewed", backend_used=Backend.CAVE, model_name="m",
+        ),
+        LlmReviewResponse(kind="parse_failed", error="unparseable"),
+        LlmReviewResponse(
+            kind="all_failed",
+            error="cohort skipped: staged review budget exhausted",
+        ),
+    ]
+
+    reasons = lc._cohort_failure_reasons(responses, [2, 3])
+
+    assert reasons["2"].startswith("parse_failed: unparseable")
+    assert "budget exhausted" in reasons["3"]
+    assert "1" not in reasons

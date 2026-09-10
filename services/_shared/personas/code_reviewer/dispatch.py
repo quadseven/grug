@@ -596,15 +596,26 @@ def _coverage_lines(coverage) -> str:
     Split out of _review_transparency for the same cap: the concern loop and
     its heading marker are self-contained and were the densest branch cluster
     in a function that had five other independent blocks.
+
+    "failed" and "never attempted" are reported separately (grug#939). They
+    used to share one list, so a cohort the scheduler ran out of budget before
+    reaching was announced to the author as a cohort that had been reviewed and
+    broken. The two ask for opposite things - a re-run may fix the first and
+    can never fix the second - and Elder must not imply it looked at ground it
+    never opened.
     """
-    failed = (
-        f"; failed: {', '.join(str(index) for index in coverage.failed_cohorts)}"
-        if coverage.failed_cohorts
-        else ""
+    unattempted = coverage.unattempted_cohorts
+    ran_and_failed = tuple(
+        index for index in coverage.failed_cohorts if index not in unattempted
     )
+    parts = ""
+    if ran_and_failed:
+        parts += f"; failed: {', '.join(str(i) for i in ran_and_failed)}"
+    if unattempted:
+        parts += f"; never attempted: {', '.join(str(i) for i in unattempted)}"
     lines = (
         f"\n\nCoverage: {coverage.completed_cohorts}/{coverage.total_cohorts} "
-        f"cohorts completed{failed}."
+        f"cohorts completed{parts}."
     )
     for concern in coverage.concerns:
         paths = ", ".join(f"`{_md_code_span(path)}`" for path in concern.paths[:6])
