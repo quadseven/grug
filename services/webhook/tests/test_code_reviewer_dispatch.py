@@ -3083,3 +3083,32 @@ def test_resolve_result_rejected_review_precedence():
     assert cr_dispatch._resolve_result(
         degraded, check_publish_failed=False, review_publish_rejected=True,
     ) == "skipped"
+
+
+def test_summary_does_not_call_an_unopened_cohort_a_failed_one():
+    """grug#939: a cohort the scheduler never reached was announced to the
+    author as `failed: N`, which reads as "Grug reviewed it and it broke".
+    A re-run can fix that; it can never fix ground nobody opened."""
+    from personas.code_reviewer.persona import CodeReviewEvaluation
+
+    coverage = ReviewCoverage(
+        total_cohorts=4,
+        completed_cohorts=1,
+        failed_cohorts=(2, 3, 4),
+        unattempted_cohorts=(3, 4),
+        cohort_labels=("a", "b", "c", "d"),
+    )
+    ev = CodeReviewEvaluation(
+        findings=(),
+        conclusion="neutral",
+        degraded_reason="partial_review",
+        coverage=coverage,
+    )
+
+    _, summary = cr_dispatch._summary_markdown(ev)
+
+    assert "Coverage: 1/4 cohorts" in summary
+    # Only cohort 2 actually ran and failed.
+    assert "failed: 2" in summary
+    assert "never attempted: 3, 4" in summary
+    assert "failed: 2, 3, 4" not in summary

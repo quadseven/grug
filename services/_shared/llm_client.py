@@ -305,6 +305,14 @@ _MAX_REVIEW_COHORTS = 64
 # Re-asking cannot change the answer, so the scheduler must not retry it.
 _OVERSIZED_COHORT_ERROR = "cohort budget exceeded"
 
+# Marks a cohort that was NEVER ATTEMPTED - the scheduler ran out of budget or
+# the review was cancelled before reaching it. Distinct from a cohort that ran
+# and failed, because the two ask the author for opposite things: a cohort that
+# broke may pass on a re-run, while ground nobody opened stays unread until the
+# diff is split or the budget rises (grug#939). The prefix is matched, not
+# re-spelled, so the classifier cannot drift from the reason strings below.
+_SKIPPED_COHORT_PREFIX = "cohort skipped: "
+
 # One extra attempt per cohort. A second failure is treated as real: further
 # attempts spend budget the remaining cohorts need, and the failure modes that
 # survive one retry (a sustained backend outage, a model that cannot produce
@@ -2477,6 +2485,47 @@ def _partition_cohort_responses(
     return successful, failed_indexes
 
 
+def _unattempted_cohort_indexes(
+    responses: Sequence[LlmReviewResponse],
+) -> tuple[int, ...]:
+    """1-based indexes of cohorts the scheduler never ran.
+
+    `_run_staged_cohorts` synthesizes a placeholder response for every cohort
+    it skips, which is what makes them visible at all - but the placeholder is
+    `kind="all_failed"`, indistinguishable from a cohort that really did call a
+    model and fail. The reason string is the only thing separating them, so it
+    is matched here once and turned into a fact the rest of the pipeline can
+    carry.
+    """
+    return tuple(
+        index
+        for index, response in enumerate(responses, start=1)
+        if (response.error or "").startswith(_SKIPPED_COHORT_PREFIX)
+    )
+
+
+def _cohort_failure_reasons(
+    responses: Sequence[LlmReviewResponse], failed_indexes: Sequence[int],
+) -> dict[str, str]:
+    """Per-cohort cause, keyed by index, for the partial-review log.
+
+    `_partition_cohort_responses` reduces a failed cohort to a bare integer and
+    drops `kind`/`error` on the floor, so `llm_staged_review_partial` could say
+    WHICH cohorts did not complete but never WHY. That left the question
+    grug#818's first acceptance criterion asks - how many degradations are
+    transient, how many terminal - unanswerable from telemetry without joining
+    three other events by hand.
+    """
+    by_index = {index: response for index, response in enumerate(responses, start=1)}
+    reasons: dict[str, str] = {}
+    for index in failed_indexes:
+        response = by_index.get(index)
+        if response is None:
+            continue
+        reasons[str(index)] = f"{response.kind}: {(response.error or '')[:120]}"
+    return reasons
+
+
 def _cohort_coverage(
     plan: ReviewPlan,
     responses: Sequence[LlmReviewResponse],
@@ -2491,11 +2540,17 @@ def _cohort_coverage(
     reads as a full pass). The true total makes `coverage.complete` and
     `coverage.fraction` honest about cohorts that were planned but never
     attempted, not just the ones that ran and failed.
+
+    `unattempted_cohorts` is a SUBSET of `failed_cohorts`, not a replacement:
+    every cohort that did not complete still counts against `completed_cohorts`
+    and `fraction` exactly as before, so the eval harness's numbers do not move
+    (grug#939). What it adds is which of those the scheduler never reached.
     """
     return ReviewCoverage(
         total_cohorts=plan.total_cohorts_planned,
         completed_cohorts=len(responses) - len(failed_indexes),
         failed_cohorts=tuple(failed_indexes),
+        unattempted_cohorts=_unattempted_cohort_indexes(responses),
         cohort_labels=tuple(cohort.label for cohort in plan.cohorts),
         concerns=plan.concerns,
     )
@@ -2530,6 +2585,14 @@ def _log_partial_cohorts(
         "llm_staged_review_partial",
         extra={
             "failed_cohorts": list(failed_indexes),
+            # WHICH of the failures were never even attempted, and WHY each one
+            # did not complete (grug#939/#818). Without these two, a partial
+            # review reads as N anonymous failures and the cause has to be
+            # reconstructed by joining the retry and skip events by hand.
+            "unattempted_cohorts": list(_unattempted_cohort_indexes(responses)),
+            "cohort_failure_reasons": _cohort_failure_reasons(
+                responses, failed_indexes,
+            ),
             "cohort_count": len(responses),
             # The number, not the mood (#645 eval harness): how much of the
             # planned review actually ran, as a fraction in [0, 1].
@@ -2687,10 +2750,8 @@ def _run_staged_cohorts(
             and now() - started_at + reserve_seconds > budget_seconds
         )
         if cancelled or out_of_budget:
-            reason = (
-                "cohort skipped: review cancelled"
-                if cancelled
-                else "cohort skipped: staged review budget exhausted"
+            reason = _SKIPPED_COHORT_PREFIX + (
+                "review cancelled" if cancelled else "staged review budget exhausted"
             )
             skipped = cohort_count - cohort_index
             log.warning(

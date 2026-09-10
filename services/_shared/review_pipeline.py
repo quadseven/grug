@@ -103,6 +103,13 @@ class ReviewCoverage:
     failed_cohorts: tuple[int, ...]
     cohort_labels: tuple[str, ...]
     concerns: tuple[ReviewabilityConcern, ...] = ()
+    # A SUBSET of `failed_cohorts`: the ones the scheduler never reached at all
+    # (budget exhausted, or the review was cancelled). Kept as a subset rather
+    # than a separate bucket so `completed_cohorts`, `complete` and `fraction`
+    # keep their existing meaning; this only says which of the shortfall was
+    # never looked at, because "ran and broke" and "never opened" ask the
+    # author for opposite things (grug#939).
+    unattempted_cohorts: tuple[int, ...] = ()
 
     @property
     def complete(self) -> bool:
