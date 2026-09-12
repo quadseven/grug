@@ -58,20 +58,100 @@ def test_retry_on_401_invalidates_and_refetches(_stub_token, mock_transport_clie
         "retry must force_refresh — otherwise cache returns same bad token"
 
 
-def test_non_401_status_propagates_without_retry(_stub_token, mock_transport_client):
-    client = mock_transport_client(status_codes=[500])
+def test_permanent_4xx_propagates_without_retry(_stub_token, mock_transport_client):
+    """A 404 is neither a stale-token 401 nor a transient 5xx/rate-limit
+    (grug#946) - the identical request would fail identically forever, so
+    retrying it wastes the same budget grug#770 exists to protect."""
+    client = mock_transport_client(status_codes=[404])
     calls: list[str] = []
 
-    def fn(token: str) -> str:
+    def fn(token: str) -> None:
         calls.append(token)
         resp = client.get("https://api.github.com/repos")
         resp.raise_for_status()
-        return None
 
     with pytest.raises(httpx.HTTPStatusError) as ei:
         gh_auth.with_install_token_retry(123, fn)
-    assert ei.value.response.status_code == 500
-    assert len(calls) == 1, "non-401 must NOT retry"
+    assert ei.value.response.status_code == 404
+    assert len(calls) == 1, "a permanent 4xx must NOT retry"
+
+
+@pytest.fixture(autouse=True)
+def _no_real_sleep(monkeypatch: pytest.MonkeyPatch):
+    """Retry tests below exercise real backoff math over several attempts -
+    without this a run would actually sleep for several seconds."""
+    monkeypatch.setattr(gh_auth.time, "sleep", lambda _seconds: None)
+
+
+def test_5xx_retries_then_succeeds(_stub_token, mock_transport_client):
+    """grug#946: the 2026-08-17 degradation aborted a review outright on
+    the first 503 instead of riding out a transient blip."""
+    client = mock_transport_client(status_codes=[503, 503, 200], json_bodies=[{}, {}, {"ok": True}])
+    calls: list[str] = []
+
+    def fn(token: str) -> bool:
+        calls.append(token)
+        resp = client.get("https://api.github.com/repos")
+        resp.raise_for_status()
+        return resp.json()["ok"]
+
+    assert gh_auth.with_install_token_retry(123, fn) is True
+    assert len(calls) == 3, "two 503s then a 200: three attempts total"
+
+
+def test_secondary_rate_limit_retries_then_succeeds(_stub_token, mock_transport_client):
+    """A secondary rate limit is a 403/429 that is NOT the primary
+    per-hour limit - GitHub's own docs say to back off and retry, not
+    treat it as a permission denial."""
+    client = mock_transport_client(
+        status_codes=[403, 200],
+        json_bodies=[{"message": "You have exceeded a secondary rate limit"}, {"ok": True}],
+    )
+    calls: list[str] = []
+
+    def fn(token: str) -> bool:
+        calls.append(token)
+        resp = client.get("https://api.github.com/repos")
+        resp.raise_for_status()
+        return resp.json()["ok"]
+
+    assert gh_auth.with_install_token_retry(123, fn) is True
+    assert len(calls) == 2
+
+
+def test_permanent_403_does_not_retry(_stub_token, mock_transport_client):
+    """A plain permission-denied 403 (no Retry-After, no rate-limit
+    wording) must NOT be mistaken for a secondary rate limit."""
+    client = mock_transport_client(status_codes=[403], json_bodies=[{"message": "Resource not accessible"}])
+    calls: list[str] = []
+
+    def fn(token: str) -> None:
+        calls.append(token)
+        resp = client.get("https://api.github.com/repos")
+        resp.raise_for_status()
+
+    with pytest.raises(httpx.HTTPStatusError):
+        gh_auth.with_install_token_retry(123, fn)
+    assert len(calls) == 1, "a genuine permission denial must NOT retry"
+
+
+def test_retry_ceiling_stops_and_raises(_stub_token, mock_transport_client):
+    """A sustained outage (every attempt 503) must still fail in bounded
+    time rather than retry forever."""
+    client = mock_transport_client(status_codes=[503] * 10, json_bodies=[{}] * 10)
+    calls: list[str] = []
+
+    def fn(token: str) -> None:
+        calls.append(token)
+        resp = client.get("https://api.github.com/repos")
+        resp.raise_for_status()
+
+    with pytest.raises(httpx.HTTPStatusError) as ei:
+        gh_auth.with_install_token_retry(123, fn)
+    assert ei.value.response.status_code == 503
+    assert len(calls) == gh_auth._RETRY_MAX_ATTEMPTS, (
+        "must stop at the retry ceiling, not retry indefinitely"
+    )
 
 
 def test_success_first_try_does_not_refresh(_stub_token):

@@ -7,6 +7,7 @@ from __future__ import annotations
 
 import logging
 import os
+import random
 import time
 from datetime import datetime, timedelta, timezone
 
@@ -20,6 +21,23 @@ log = logging.getLogger(f"{os.getenv('DD_SERVICE', 'grug')}.github_app_auth")
 _cache = InMemoryTokenCache()
 _GH_API = "https://api.github.com"
 _JWT_TTL_SECONDS = 9 * 60  # GitHub allows up to 10min; refresh at 9min
+
+# grug#946: bounded retry for a transient GitHub outage. 5 attempts at
+# base=1s/factor=2 is 1+2+4+8=15s of backoff before the 5th and final
+# try - long enough to ride out a short blip, short enough that a
+# sustained outage (2026-08-17: tens of minutes of GraphQL 503s) still
+# fails in well under a minute and falls back to the existing durable
+# redrive/DLQ machinery instead of blocking a worker.
+_RETRY_MAX_ATTEMPTS = 5
+_RETRY_BASE_SECONDS = 1.0
+_RETRY_BACKOFF_FACTOR = 2.0
+# GitHub's own secondary-rate-limit guidance: honor Retry-After literally
+# rather than out-guessing it with exponential backoff, but still capped -
+# an uncapped Retry-After would let GitHub's response dictate how long a
+# worker blocks.
+_RETRY_MAX_SLEEP_SECONDS = 30.0
+_RETRYABLE_STATUS = frozenset({500, 502, 503, 504})
+_RATE_LIMIT_STATUS = frozenset({403, 429})
 
 
 def _app_id() -> str:
@@ -151,19 +169,86 @@ def get_scoped_install_token(
         ) from e
 
 
-def with_install_token_retry(installation_id: int, fn):
-    """Run `fn(token)` once. On httpx 401, invalidate cache + retry once.
+def _is_secondary_rate_limit(response: httpx.Response) -> bool:
+    """GitHub's secondary rate limit is a 403/429 that is NOT the primary
+    per-hour limit. The primary limit carries `X-RateLimit-Remaining: 0`;
+    the secondary one is everything else in that status range - a
+    `Retry-After` header, or a body naming it, per GitHub's own docs.
+    Treated as retryable either way: both mean "slow down", not "denied"."""
+    if response.headers.get("Retry-After"):
+        return True
+    try:
+        text = response.text.lower()
+    except Exception:
+        return False
+    return "secondary rate limit" in text or "abuse detection" in text
 
-    Use this for any API call that depends on a cached install token —
-    GitHub revokes tokens out-of-band on App reinstall, perm change, or
-    secret rotation, and the long-lived process would otherwise reuse the bad
+
+def _is_retryable_github_error(response: httpx.Response) -> bool:
+    status = response.status_code
+    if status in _RETRYABLE_STATUS:
+        return True
+    if status in _RATE_LIMIT_STATUS:
+        return _is_secondary_rate_limit(response)
+    return False
+
+
+def _retry_sleep_seconds(attempt: int, response: httpx.Response) -> float:
+    """Exponential backoff + jitter, but a server-supplied `Retry-After`
+    wins when it asks for longer - GitHub's guidance for its own
+    secondary rate limit is to honor that value, not out-guess it.
+    Jitter avoids every retrying worker waking on the same tick."""
+    retry_after = response.headers.get("Retry-After")
+    if retry_after:
+        try:
+            server_wait = float(retry_after)
+        except ValueError:
+            server_wait = 0.0
+    else:
+        server_wait = 0.0
+    backoff = _RETRY_BASE_SECONDS * (_RETRY_BACKOFF_FACTOR ** (attempt - 1))
+    jitter = random.uniform(0, backoff * 0.5)  # noqa: S311 - retry timing jitter, not a security use
+    return min(max(backoff + jitter, server_wait), _RETRY_MAX_SLEEP_SECONDS)
+
+
+def with_install_token_retry(installation_id: int, fn):
+    """Run `fn(token)`, retrying transient failures.
+
+    On httpx 401, invalidate the cached token and retry once - GitHub
+    revokes tokens out-of-band on App reinstall, perm change, or secret
+    rotation, and the long-lived process would otherwise reuse the bad
     cached token until the 55-min TTL elapsed (Codex post-review #50).
+
+    On a 5xx or secondary rate limit (grug#946 - the 2026-08-17 GraphQL
+    degradation aborted an in-flight review outright instead of riding
+    out a transient blip), retry with bounded exponential backoff and
+    jitter, honoring a server `Retry-After` when it asks for longer.
+    Any other 4xx (permission denied, not found, unprocessable) is
+    PERMANENT - the identical request would fail identically forever, so
+    retrying it only wastes the same budget grug#770 exists to protect.
     """
     token = get_install_token(installation_id)
-    try:
-        return fn(token)
-    except httpx.HTTPStatusError as e:
-        if e.response.status_code != 401:
+    refreshed_401 = False
+    for attempt in range(1, _RETRY_MAX_ATTEMPTS + 1):
+        try:
+            return fn(token)
+        except httpx.HTTPStatusError as e:
+            status = e.response.status_code
+            if status == 401 and not refreshed_401:
+                refreshed_401 = True
+                token = get_install_token(installation_id, force_refresh=True)
+                continue
+            if attempt < _RETRY_MAX_ATTEMPTS and _is_retryable_github_error(e.response):
+                sleep_seconds = _retry_sleep_seconds(attempt, e.response)
+                log.warning(
+                    "github_api_retry",
+                    extra={
+                        "installation_id": installation_id,
+                        "status": status,
+                        "attempt": attempt,
+                        "sleep_seconds": round(sleep_seconds, 2),
+                    },
+                )
+                time.sleep(sleep_seconds)
+                continue
             raise
-        token = get_install_token(installation_id, force_refresh=True)
-        return fn(token)
