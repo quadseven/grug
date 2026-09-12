@@ -1395,3 +1395,129 @@ def test_committed_corpus_yields_no_prless_cases():
     cases = build_cases(parse_jsonl(p.read_text()))
     assert all(c.pr is not None for c in cases)
     assert not any("#None" in c.case_id for c in cases)
+
+
+# --- grug#916: backend attribution + the anonymous-GitHub guard ------------
+
+
+def _reviewed(backends, findings=()):
+    """An LlmReviewResponse that SUCCEEDS, attributed to `backends`."""
+    return LlmReviewResponse(
+        kind="reviewed",
+        findings=tuple(findings),
+        backends_used=tuple(backends),
+        models_used=tuple(b.value for b in backends),
+    )
+
+
+def test_production_case_records_the_backend_that_actually_answered():
+    """grug#916: `review_diff`'s cloud chain falls back to Cave WITHOUT
+    raising, so a case configured for the cloud tier can be served by the
+    fallback and still score. The replay must name who answered."""
+    from elder_eval.runner import run_production_case
+
+    (case,) = build_cases([_row(40, "correctness")])
+    diff = (
+        "diff --git a/src/a.py b/src/a.py\n--- a/src/a.py\n+++ b/src/a.py\n"
+        "@@ -1 +1 @@\n-old\n+new\n"
+    )
+    finding = Finding(
+        path="src/a.py", line=1, rule="correctness",
+        severity="high", message="wrong result",
+    )
+
+    replay = run_production_case(
+        case, diff, review=lambda *_a, **_k: _reviewed([Backend.CAVE], [finding])
+    )
+
+    assert replay.errored is False
+    assert replay.emitted == {"correctness": 1}
+    # The whole point: the fallback is NAMED, not silently absorbed.
+    assert replay.backends == ("cave",)
+
+
+def test_production_case_attribution_falls_back_to_the_singular_field():
+    """An older response shape carries only `backend_used`. It must still
+    attribute - reporting nothing would read as "no fallback happened"."""
+    from elder_eval.runner import run_production_case
+
+    (case,) = build_cases([_row(41, "correctness")])
+    diff = (
+        "diff --git a/src/a.py b/src/a.py\n--- a/src/a.py\n+++ b/src/a.py\n"
+        "@@ -1 +1 @@\n-old\n+new\n"
+    )
+
+    def review(*_a, **_k):
+        return LlmReviewResponse(kind="reviewed", backend_used=Backend.OPENCODE_GO)
+
+    assert run_production_case(case, diff, review=review).backends == ("opencode-go",)
+
+
+def test_score_aggregates_backend_attribution_over_scored_cases():
+    """A run served by two different backends must say so per backend, and
+    an ERRORED case must not be attributed to anyone (it never ran)."""
+    cases = build_cases([_row(50, "correctness"), _row(51, "correctness"),
+                         _row(52, "correctness")])
+    replays = {
+        "quadseven/grug#50": CaseReplay(
+            case_id="quadseven/grug#50", emitted={"correctness": 1},
+            errored=False, backends=("opencode-go",),
+        ),
+        "quadseven/grug#51": CaseReplay(
+            case_id="quadseven/grug#51", emitted={"correctness": 1},
+            errored=False, backends=("cave",),
+        ),
+        "quadseven/grug#52": CaseReplay(
+            case_id="quadseven/grug#52", emitted={}, errored=True,
+            backends=("cave",),
+        ),
+    }
+
+    report = score(cases, replays)
+
+    assert report.backend_attribution == {"opencode-go": 1, "cave": 1}
+    assert to_baseline_dict(report, prompt_sha="x", backend="production")[
+        "backends"
+    ]["production"]["backend_attribution"] == {"cave": 1, "opencode-go": 1}
+
+
+def test_score_attribution_is_empty_for_bench_replays():
+    """Bench mode posts to ONE configured backend, so its replays carry no
+    attribution and the report must not invent one."""
+    cases = build_cases([_row(53, "correctness")])
+    replays = {
+        "quadseven/grug#53": CaseReplay(
+            case_id="quadseven/grug#53", emitted={"correctness": 1}, errored=False,
+        )
+    }
+
+    assert score(cases, replays).backend_attribution == {}
+
+
+def test_main_refuses_to_run_without_a_github_token(monkeypatch, capsys):
+    """grug#916 root cause: the 2026-08-28 run scored 8 of 18 cases and
+    errored 10 on the anonymous 60/hr cap, and the 0.19 catch rate it
+    printed was read as a backend signal. Refuse instead."""
+    from elder_eval.__main__ import main
+
+    monkeypatch.delenv("GITHUB_TOKEN", raising=False)
+
+    assert main([]) == 2
+    err = capsys.readouterr().err
+    assert "GITHUB_TOKEN is not set" in err
+    assert "--allow-anonymous" in err
+
+
+def test_main_allow_anonymous_opts_past_the_token_guard(monkeypatch, capsys):
+    """The escape hatch must actually get past the guard - a genuinely
+    tiny public corpus can still be replayed tokenless on purpose."""
+    from elder_eval import __main__ as cli
+
+    monkeypatch.delenv("GITHUB_TOKEN", raising=False)
+    monkeypatch.setattr(cli, "_run_requested_mode",
+                        lambda *_a, **_k: (None, "", None))
+
+    # Reaches _run_requested_mode (whose None replays exit 2) rather than
+    # being stopped by the token guard, which prints the anonymous error.
+    assert cli.main(["--allow-anonymous"]) == 2
+    assert "GITHUB_TOKEN is not set" not in capsys.readouterr().err

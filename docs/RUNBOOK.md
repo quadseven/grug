@@ -469,6 +469,65 @@ repo's `LEDGER#<owner/repo>` rows when feedback is not appearing. The ledger
 write and cache refresh happen before `last_verdict` advances, so a transient
 store failure retries the idempotent learning update on the next poll.
 
+### Elder replay eval, run locally (grug#916)
+
+`make elder-eval` replays the committed ledger corpus and scores catch
+rate vs noise. Two things about running it by hand have cost real
+debugging time; both are prerequisites, not optional polish.
+
+**1. `GITHUB_TOKEN` is mandatory.** Each case costs several GitHub API
+requests, not one: an anchored case (#545) pays base-sha +
+fix-commit-parent + compare on top of the diff fetch, and the corpus
+names this repo under its PRE-RENAME owner, so every one of those pays a
+301 that also spends quota. Measured on the committed corpus:
+
+```
+18 cases -> 96 GitHub API requests (47 of them redirects)
+anonymous budget: 60/hr
+```
+
+An anonymous run therefore does not fail cleanly - it scores the prefix
+of the corpus that fits, 403s the rest, and prints a catch rate over
+whatever survived. That is how grug#916's "10 of 18 errored, catch 0.19"
+was produced and briefly read as a backend quality signal; the 10
+errored cases never reached a backend at all. The CLI now refuses to
+start without a token (`--allow-anonymous` to override deliberately):
+
+```bash
+export GITHUB_TOKEN="$(gh auth token)"
+```
+
+**2. `--production` needs the Cave gateway, which is in-cluster only.**
+`GRUG_CAVE_GATEWAY_URL` is `http://spark-gateway.spark-gateway.svc:8080`
+- not resolvable from a laptop. Port-forward it and point the eval at
+the local end:
+
+```bash
+kubectl port-forward -n spark-gateway svc/spark-gateway 18080:8080 &
+export GRUG_CAVE_GATEWAY_URL=http://127.0.0.1:18080
+export GRUG_CAVE_REVIEW_MODEL='qwen3-coder-next:q8_0'
+export GRUG_CAVE_REASONER_MODEL='spark:warm-any'
+export GRUG_CAVE_JUDGE_MODEL='spark:warm-any'
+# match whatever the live deployment runs:
+#   kubectl get deploy grug-consumer -n grug -o yaml | grep GRUG_CAVE
+make elder-eval ARGS="--production"
+```
+
+**3. Read the `backend(s) that actually answered` line before trusting a
+`--production` number.** With `GRUG_REVIEW_BACKEND_PRIORITY=cloud` the
+chain degrades WITHOUT erroring: a tier-1 timeout is caught and control
+falls through to the Cave arms, so the case still scores and the report
+still says "production". A run whose attribution line names only `cave`
+measured Cave, whatever the priority env said - the report now flags
+that case explicitly rather than leaving it to be inferred.
+
+Note the instrument's own resolution. `sast_benchmark.runner._post`
+records two identical runs of the same 18 cases against the same model
+scoring **0.30 and 0.17** (2026-08-15) at `temperature=0`, and
+`compare_to_baseline` carries a 0.10 catch tolerance for that reason. A
+single run's overall catch is not separable from sampling noise at this
+corpus size; only differences well outside that band mean anything.
+
 ### Review latency harness (#648)
 
 Short Ollama smokes do not model long-context review prefill. The

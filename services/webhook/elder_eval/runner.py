@@ -449,6 +449,28 @@ def run_case(
     )
 
 
+def _response_backends(response: LlmReviewResponse) -> tuple[str, ...]:
+    """The backend(s) that ACTUALLY answered this review (grug#916).
+
+    `review_diff`'s chain degrades WITHOUT raising: with
+    `GRUG_REVIEW_BACKEND_PRIORITY=cloud`, a tier-1 timeout is caught,
+    logged, and control falls through to the Cave arms - the response
+    still comes back `kind="reviewed"`, so the case scores normally and
+    nothing in the replay says a different backend produced it. Reading
+    such a run as a measurement of the CONFIGURED backend is exactly the
+    mistake grug#916 was opened to correct: two `--production` runs, one
+    per priority setting, reported near-identical per-class catch rates
+    because both were in fact served by the same fallback.
+
+    Prefers the plural `backends_used` (deep/staged reviews merge several
+    arms) and falls back to the singular legacy field, so an older
+    response shape still attributes rather than reporting nothing."""
+    used = response.backends_used or (
+        (response.backend_used,) if response.backend_used else ()
+    )
+    return tuple(sorted({b.value if hasattr(b, "value") else str(b) for b in used}))
+
+
 def run_production_case(
     case: EvalCase,
     diff_text: str,
@@ -515,6 +537,7 @@ def run_production_case(
         emitted=classes_for_findings(findings),
         errored=False,
         anchored=anchored,
+        backends=_response_backends(response),
     )
 
 

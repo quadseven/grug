@@ -23,7 +23,7 @@ Metrics:
 from __future__ import annotations
 
 from collections import Counter
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Mapping, Sequence
 
 from .corpus import EvalCase
@@ -52,6 +52,15 @@ class CaseReplay:
     # this case's number describes a different methodology than an
     # unstaged replay - not silently the same measurement, just faster.
     staged: bool = False
+    # grug#916: which backend(s) ACTUALLY produced this replay's findings.
+    # `--production` drives `review_diff`, whose chain falls back on its
+    # own (cloud tier -> Cave) without raising, so the backend an operator
+    # CONFIGURED is not necessarily the backend that answered. Recording
+    # the response's real attribution is what keeps a run that silently
+    # fell through to the fallback from being read as a measurement of
+    # the configured tier. Empty = the replay carried no attribution
+    # (bench mode, where the single configured backend IS the answer).
+    backends: tuple[str, ...] = ()
 
 
 @dataclass(frozen=True)
@@ -78,6 +87,12 @@ class EvalReport:
     # more than one call) so the comparability caveat is visible, not
     # inferred.
     staged_cases: tuple[str, ...] = ()
+    # grug#916: backend name -> scored cases it answered for. A
+    # `--production` run configured for one backend priority can be served
+    # entirely by the chain's FALLBACK without erroring anywhere, so the
+    # report must name who actually answered rather than let the reader
+    # assume it was whoever they configured.
+    backend_attribution: dict[str, int] = field(default_factory=dict)
 
     @property
     def all_errored(self) -> bool:
@@ -98,6 +113,7 @@ def score(
     truncated: list[str] = []
     anchored: list[str] = []
     staged: list[str] = []
+    attribution: Counter[str] = Counter()
     out_of_taxonomy: Counter[str] = Counter()
     unknown_verdicts: Counter[str] = Counter()
     scored = 0
@@ -126,6 +142,8 @@ def score(
             anchored.append(case.case_id)
         if replay.staged:
             staged.append(case.case_id)
+        for backend_name in replay.backends:
+            attribution[backend_name] += 1
         scored += 1
         emitted_classes = {c for c, n in replay.emitted.items() if n > 0}
         for ledger_cls, elder_set in case.expected_classes.items():
@@ -154,6 +172,7 @@ def score(
         cases_scored=scored,
         anchored_cases=tuple(anchored),
         staged_cases=tuple(staged),
+        backend_attribution=dict(attribution),
     )
 
 
@@ -181,6 +200,13 @@ def to_baseline_dict(report: EvalReport, *, prompt_sha: str, backend: str) -> di
                 # request - the comparability caveat a reader needs before
                 # treating those cases' numbers as a like-for-like rerun.
                 "staged_cases": sorted(report.staged_cases),
+                # grug#916: who actually answered. A baseline that does not
+                # record this cannot be compared against a later run - the
+                # two may name the same configured backend and have been
+                # served by different ones.
+                "backend_attribution": dict(
+                    sorted(report.backend_attribution.items())
+                ),
             }
         },
     }

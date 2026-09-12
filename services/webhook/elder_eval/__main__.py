@@ -37,16 +37,34 @@ quoted in PR #846) gets read as an Elder number.
 
 `--production` drives the SHIPPED `review_diff` pipeline instead, so its
 number reflects what the deployed reviewer actually does. It needs the
-Cave gateway (GRUG_BENCH_CAVE_URL, a private tailnet address) reachable -
-`review_diff`'s coder arm always calls Cave first, falling back to
-OpenRouter/Poolside only as a bounded overload fallback, never as a
-substitute for it. Without network access to Cave (e.g. this repo's local
-dev/CI environment outside the tailnet), every case's `review()` call
-raises or times out and the run reports `all_errored`, never a fabricated
-score - that is the honest-failure behavior working as designed, not a
-bug. `benchmark.elder-eval.yml`'s `workflow_dispatch` inputs do not
-currently offer a production mode (`mode` is record/check/report against
-the bench backends only) - wiring that dispatch path is still open.
+Cave gateway (GRUG_CAVE_GATEWAY_URL, an in-cluster address - port-forward
+it for a local run, see docs/RUNBOOK.md) reachable. Without network
+access to Cave, every case's `review()` call raises or times out and the
+run reports `all_errored`, never a fabricated score - that is the
+honest-failure behavior working as designed, not a bug.
+`benchmark.elder-eval.yml`'s `workflow_dispatch` inputs do not currently
+offer a production mode (`mode` is record/check/report against the bench
+backends only) - wiring that dispatch path is still open.
+
+WHICH BACKEND A `--production` RUN MEASURES IS NOT THE ONE YOU SET
+(grug#916). Under `GRUG_REVIEW_BACKEND_PRIORITY=cloud` the grug#910
+chain degrades WITHOUT raising: a tier-1 timeout is caught, logged, and
+control falls through to the Cave arms, so the case still returns
+`kind="reviewed"` and still scores. Two `--production` runs differing
+only in that env var can therefore report near-identical numbers because
+BOTH were served by Cave. Every report prints
+`backend(s) that actually answered` from the response's own attribution,
+and says so loudly when a cloud-priority run was served entirely by the
+fallback - read that line before comparing two runs.
+
+GITHUB_TOKEN IS REQUIRED (grug#916). The corpus costs ~96 GitHub API
+requests for 18 cases (anchored cases fetch base-sha + fix-commit-parent
++ compare, and a repo referenced under a pre-rename name pays a
+quota-spending 301 on each), against an anonymous cap of 60/hr. A
+tokenless run scores the prefix that fits and 403s the rest, printing a
+catch rate that reads like a backend result and is a rate-limit
+artifact - which is exactly what happened on 2026-08-28. `--allow-anonymous`
+overrides deliberately.
 """
 
 from __future__ import annotations
@@ -73,6 +91,31 @@ from .scoring import EvalReport, compare_to_baseline, score, to_baseline_dict
 _REPO_ROOT = Path(__file__).resolve().parents[3]
 _DEFAULT_JSONL = _REPO_ROOT / "logs" / "review-ledger.jsonl"
 
+# grug#916: every case costs SEVERAL GitHub API calls, not one. An
+# anchored case (#545) pays base-sha + fix-commit-parent + compare on top
+# of the diff fetch, and a corpus naming a repo under its PRE-RENAME name
+# pays a 301 on EVERY one of those, each of which spends quota too. The
+# committed corpus measured 96 requests for 18 cases (47 of them pure
+# redirects) - against an anonymous budget of 60/hr. So a tokenless run
+# does not fail cleanly: it scores the handful of cases that fit, errors
+# the rest on 403, and reports a catch rate computed over whichever
+# prefix of the corpus happened to fit in the budget. That is worse than
+# no number, because it LOOKS like a result: the 2026-08-28 run that
+# opened grug#916 reported "10 of 18 errored, catch 0.19" and was read as
+# a signal about the backend under test, which had not been called once
+# for those 10 cases.
+_ANONYMOUS_GITHUB_ERROR = """GITHUB_TOKEN is not set - refusing to run.
+
+This corpus has {cases} case(s) and each one costs several GitHub API
+requests (diff + anchor resolution, plus a redirect apiece for any repo
+referenced under a previous name). Unauthenticated calls are capped at
+60/hr, so an anonymous run exhausts the budget partway through and
+reports a catch rate over whatever prefix of the corpus fit - which
+reads as a backend result but is a rate-limit artifact.
+
+Fix:  export GITHUB_TOKEN="$(gh auth token)"
+Or:   pass --allow-anonymous to accept the above and run anyway."""
+
 
 def _methodology_note(name: str) -> str:
     """A one-line self-description of what `name`'s number actually
@@ -98,6 +141,18 @@ def _methodology_note(name: str) -> str:
     )
 
 
+def _cloud_chain_backend_names() -> set[str]:
+    """Backend names the grug#910 cloud chain can be served BY (grug#916).
+
+    Read from `_cloud_chain_tiers()` rather than restated here, for the
+    same reason `review_cohort_char_budget` is exported rather than
+    duplicated: a chain that gains or loses a tier must not leave this
+    check silently asserting yesterday's roster."""
+    from llm_client import _cloud_chain_tiers
+
+    return {tier.backend.value for tier in _cloud_chain_tiers()}
+
+
 def _print_report(name: str, report: EvalReport) -> None:
     print(f"\n=== backend: {name} ===")
     print(_methodology_note(name))
@@ -116,6 +171,22 @@ def _print_report(name: str, report: EvalReport) -> None:
         )
     for cls in sorted(report.per_class_catch):
         print(f"    {cls:28s} catch={report.per_class_catch[cls]:.2f}")
+    if report.backend_attribution:
+        served = ", ".join(
+            f"{backend}x{n}"
+            for backend, n in sorted(report.backend_attribution.items())
+        )
+        print(f"  backend(s) that actually answered: {served}")
+        configured = os.getenv("GRUG_REVIEW_BACKEND_PRIORITY", "cave").strip().lower()
+        if configured == "cloud" and not (
+            report.backend_attribution.keys() & _cloud_chain_backend_names()
+        ):
+            print(
+                "  !! GRUG_REVIEW_BACKEND_PRIORITY=cloud but NO case was "
+                "answered by the cloud chain - every case fell through to "
+                "the fallback. This number measures the FALLBACK, not the "
+                "cloud backend you configured."
+            )
     if report.errored_cases:
         print(f"  !! errored (not scored): {', '.join(report.errored_cases)}")
     if report.truncated_cases:
@@ -182,6 +253,14 @@ def _parse_args(
         "--published",
         action="store_true",
         help="with --production, score findings after diff-only publication gates",
+    )
+    parser.add_argument(
+        "--allow-anonymous",
+        action="store_true",
+        help=(
+            "run without GITHUB_TOKEN, accepting the 60/hr anonymous cap "
+            "(see the startup error for why this usually invalidates a run)"
+        ),
     )
     parser.add_argument(
         "--ab-practices",
@@ -356,6 +435,12 @@ def main(argv: list[str] | None = None) -> int:
         return 2
 
     token = os.getenv("GITHUB_TOKEN", "")
+    if not token and not args.allow_anonymous:
+        print(
+            _ANONYMOUS_GITHUB_ERROR.format(cases=len(cases)), file=sys.stderr
+        )
+        return 2
+
     backend, backend_name, replays = _run_requested_mode(parser, args, cases, token)
     if replays is None:
         return 2
