@@ -26,6 +26,7 @@ from elder_eval.gate import (
 from elder_eval.runner import classes_for_findings, diff_to_hunks
 from elder_eval.scoring import (
     CaseReplay,
+    EvalReport,
     compare_to_baseline,
     score,
     to_baseline_dict,
@@ -1521,3 +1522,64 @@ def test_main_allow_anonymous_opts_past_the_token_guard(monkeypatch, capsys):
     # being stopped by the token guard, which prints the anonymous error.
     assert cli.main(["--allow-anonymous"]) == 2
     assert "GITHUB_TOKEN is not set" not in capsys.readouterr().err
+
+
+# --- methodology note reflects the executed plan, not a fixed string (#894) -
+
+def _bare_report(*, staged_cases=(), cases_scored=1):
+    return EvalReport(
+        per_class_catch={}, overall_catch=0.0, noise_rate=0.0,
+        errored_cases=(), truncated_cases=(), out_of_taxonomy={},
+        unknown_verdicts={}, cases_scored=cases_scored,
+        staged_cases=staged_cases,
+    )
+
+
+def test_methodology_note_states_one_call_when_nothing_staged():
+    """The 2026-08-16 Cave run's own report listed 16 staged cases eleven
+    lines below a methodology line still claiming ONE monolithic call -
+    a self-contradiction. Unstaged, ONE call is still the honest claim."""
+    from elder_eval.__main__ import _methodology_note
+
+    note = _methodology_note("sparkles", staged=False)
+    assert "ONE monolithic backend call" in note
+    assert "staged" not in note.lower()
+
+
+def test_methodology_note_states_staged_calls_when_something_staged():
+    from elder_eval.__main__ import _methodology_note
+
+    note = _methodology_note("sparkles", staged=True)
+    assert "staged cohort calls" in note
+    assert "ONE monolithic" not in note
+    # The parts that remain true regardless of staging are preserved verbatim.
+    assert "bypasses the deployed pipeline" in note
+    assert "NOT comparable to a --production run" in note
+
+
+def test_methodology_note_derives_staged_from_the_report_not_hand_maintained():
+    """_print_report must pass report.staged_cases through, not a literal -
+    the whole point is that this cannot rot the next time a run stages or
+    stops staging."""
+    from elder_eval.__main__ import _print_report
+
+    calls = []
+    import elder_eval.__main__ as cli
+    original = cli._methodology_note
+    cli._methodology_note = lambda name, staged=False: calls.append(staged) or original(name, staged=staged)
+    try:
+        _print_report("sparkles", _bare_report(staged_cases=("case-1",)))
+        _print_report("sparkles", _bare_report(staged_cases=()))
+    finally:
+        cli._methodology_note = original
+    assert calls == [True, False]
+
+
+def test_methodology_note_production_mode_unaffected_by_staged_kwarg():
+    """Production mode's wording describes the shipped pipeline, not the
+    bench's call count - `staged` must not leak into it."""
+    from elder_eval.__main__ import _methodology_note
+
+    assert _methodology_note("production", staged=True) == _methodology_note(
+        "production", staged=False
+    )

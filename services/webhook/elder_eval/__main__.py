@@ -117,13 +117,21 @@ Fix:  export GITHUB_TOKEN="$(gh auth token)"
 Or:   pass --allow-anonymous to accept the above and run anyway."""
 
 
-def _methodology_note(name: str) -> str:
+def _methodology_note(name: str, *, staged: bool = False) -> str:
     """A one-line self-description of what `name`'s number actually
     measures. The reported "overall catch 0.16" that circulated as if it
     were Elder's number came from the DEFAULT bench mode - one monolithic
     backend call that never touches `review_diff` - printed with no such
     label. Whatever this harness prints must say which pipeline produced
-    it."""
+    it.
+
+    `staged` (#894) must reflect what THIS run actually did, not a fixed
+    string: #872 added cohort staging to bench mode, so a run with any
+    `EvalReport.staged_cases` made several backend calls for the oversized
+    cases, not one monolithic call. Saying "ONE" when several calls
+    happened is precisely the self-contradiction (a report claiming one
+    call while its own staged-cases line lists per-case staging) this
+    note exists to prevent."""
     if name.startswith("production"):
         gates = "cohort planner, Cave coder+reasoner arms, judge/verify/refute"
         if "published" in name:
@@ -133,10 +141,15 @@ def _methodology_note(name: str) -> str:
             "requires the private Cave gateway to be reachable; this is "
             "what actually posts to a PR"
         )
+    call_shape = (
+        "staged cohort calls via sast_benchmark.backends (several requests "
+        "for cases too big for one cohort, one request for the rest)"
+        if staged
+        else "ONE monolithic backend call via sast_benchmark.backends"
+    )
     return (
-        "  methodology: ONE monolithic backend call via "
-        "sast_benchmark.backends - bypasses the deployed pipeline (cohort "
-        "planner, Cave coder+reasoner arms, judge/verify/refute, "
+        f"  methodology: {call_shape} - bypasses the deployed pipeline "
+        "(cohort planner, Cave coder+reasoner arms, judge/verify/refute, "
         "publication gates); NOT comparable to a --production run"
     )
 
@@ -155,7 +168,7 @@ def _cloud_chain_backend_names() -> set[str]:
 
 def _print_report(name: str, report: EvalReport) -> None:
     print(f"\n=== backend: {name} ===")
-    print(_methodology_note(name))
+    print(_methodology_note(name, staged=bool(report.staged_cases)))
     print(
         f"  overall catch: {report.overall_catch:.2f}   "
         f"noise: {report.noise_rate:.2f}   "
