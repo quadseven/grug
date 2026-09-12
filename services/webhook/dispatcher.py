@@ -6,6 +6,10 @@ Routes GitHub events to active personas. Handles:
     registered persona whose `events` include pull_request dispatches
     through the uniform `dispatch_pull_request(ctx)` seam
   - issue_comment: the `/grug recheck` slash command
+  - check_run / check_suite (`rerequested` only, grug#948): GitHub's own
+    "Re-run" button - re-dispatches a synthetic pull_request event,
+    scoped to just the rerequested persona for check_run, everyone
+    enabled for check_suite
   - repository_ruleset: enforcement self-healing
 
 Allowlist gate (Slice 5 #26): non-allowlisted installs no_op silently
@@ -67,6 +71,10 @@ def dispatch(
         return _handle_issue_comment(payload)
     if event_name == "pull_request_review_comment":
         return _handle_review_comment_reply(payload)
+    if event_name == "check_run":
+        return _handle_check_run(payload)
+    if event_name == "check_suite":
+        return _handle_check_suite(payload)
     if event_name == "repository_ruleset":
         return _handle_repository_ruleset(payload)
     return {"status": "no_op", "reason": f"no handler for event {event_name}"}
@@ -819,6 +827,180 @@ def _handle_issue_comment(payload: dict[str, Any]) -> dict[str, str]:
         "trigger": "recheck",
         "result": "pass" if evaluation.passed else "fail",
     }
+
+
+def _fetch_pr_for_rerequest(
+    installation_id: int, owner: str, repo_name: str, pr_number: int,
+) -> dict[str, Any] | None:
+    """Re-fetch a PR by number so a rerequest dispatch carries a real
+    `body` (grug#948) - `check_run`/`check_suite` payloads only ever
+    carry a MINIMAL pull_requests entry (id/number/head/base, no body),
+    and TPM's DoR check needs the real body to evaluate acceptance
+    criteria correctly. Same fetch shape `/grug recheck` already uses.
+    Returns None on any fetch failure (logged) rather than raising -
+    one PR's fetch failing must not crash the whole rerequest."""
+    import httpx  # type: ignore
+    from urllib.parse import quote as _q
+
+    def _fetch(token: str) -> dict[str, Any]:
+        r = httpx.get(
+            f"https://api.github.com/repos/{_q(owner, safe='')}/"
+            f"{_q(repo_name, safe='')}/pulls/{int(pr_number)}",
+            headers={
+                "Authorization": f"token {token}",
+                "Accept": "application/vnd.github+json",
+            },
+            timeout=10,
+        )
+        r.raise_for_status()
+        return r.json()
+
+    from github_app_auth import with_install_token_retry  # type: ignore
+    try:
+        return with_install_token_retry(installation_id, _fetch)
+    except httpx.HTTPStatusError as e:
+        log.warning(
+            "rerequest_pr_fetch_failed",
+            extra={"pr_number": pr_number, "status": e.response.status_code},
+        )
+        return None
+    except httpx.RequestError as e:
+        log.warning(
+            "rerequest_pr_fetch_transport_failed",
+            extra={"pr_number": pr_number, "kind": type(e).__name__},
+        )
+        return None
+
+
+def _dispatch_rerequest_for_pr(
+    installation_id: int,
+    owner: str,
+    repo_name: str,
+    repo_id: int | None,
+    pr_ref: dict[str, Any],
+    skip_personas: frozenset[str],
+) -> dict[str, Any]:
+    """Re-fetch one PR and dispatch a synthetic `pull_request` event for
+    it, `skip_personas`-filtered. Shared by both rerequest handlers -
+    only what they skip differs (see each handler's own docstring)."""
+    pr_number = pr_ref.get("number")
+    if not pr_number:
+        return {"status": "skip", "reason": "pull_requests entry has no number"}
+    pr = _fetch_pr_for_rerequest(installation_id, owner, repo_name, int(pr_number))
+    if pr is None:
+        return {"status": "skip", "reason": "pr_fetch_failed", "pr_number": pr_number}
+    head_sha = (pr.get("head") or {}).get("sha")
+    if not head_sha:
+        return {"status": "skip", "reason": "pr_has_no_head_sha", "pr_number": pr_number}
+    synthetic_payload = {
+        "action": "synchronize",
+        "pull_request": {
+            "number": int(pr_number),
+            "body": pr.get("body") or "",
+            "head": {"sha": head_sha},
+        },
+        "repository": {
+            "id": repo_id,
+            "name": repo_name,
+            "full_name": f"{owner}/{repo_name}",
+            "owner": {"login": owner},
+        },
+        "installation": {"id": installation_id},
+    }
+    return dispatch("pull_request", synthetic_payload, skip_personas=skip_personas)
+
+
+def _resolve_rerequest_target(
+    payload: dict[str, Any], pull_requests: list[dict[str, Any]],
+) -> tuple[int, str, str, int | None] | dict[str, Any]:
+    """Installation/owner/repo extraction plus the allowlist gate, shared
+    by both `check_run` and `check_suite` rerequest handlers (grug#948) -
+    returns the handler's early-return response dict on failure, or the
+    resolved fields on success."""
+    repo = payload.get("repository") or {}
+    installation = payload.get("installation") or {}
+    installation_id = installation.get("id")
+    owner = (repo.get("owner") or {}).get("login") or repo.get("full_name", "").split("/")[0]
+    repo_name = repo.get("name")
+    repo_id = repo.get("id")
+    if not all([installation_id, owner, repo_name]) or not pull_requests:
+        return {"status": "skip", "reason": "incomplete_payload_or_no_linked_pr"}
+    # Defense-in-depth (Slice 5 #26), same gate every other event handler
+    # applies before doing any work.
+    if not is_install_allowlisted(int(installation_id)):
+        return {"status": "no_op", "reason": "installer not allowlisted"}
+    return int(installation_id), owner, repo_name, repo_id
+
+
+def _handle_check_run(payload: dict[str, Any]) -> dict[str, Any]:
+    """`check_run.rerequested` (grug#948): GitHub's own "Re-run" button on
+    one check run. No actor-permission check needed here - unlike the
+    `/grug recheck` slash command (a raw text comment anyone could post),
+    GitHub only ever sends this event when someone who already has
+    re-run permission on the repo clicked the button through GitHub's
+    own UI.
+
+    Re-runs ONLY the persona that owns the rerequested check-run's name -
+    a rerun of "Grug - Chief" must not also re-review with Elder. Built
+    with skip_personas = every OTHER registered persona, reusing
+    grug#947's dispatch-loop filter as an allowlist rather than adding a
+    second mechanism.
+    """
+    action = payload.get("action", "")
+    if action != "rerequested":
+        return {"status": "no_op", "reason": f"check_run action={action} not gated"}
+
+    check_run = payload.get("check_run") or {}
+    check_run_name = check_run.get("name") or ""
+    target = next(
+        (spec for spec in persona_registry.REGISTRY if spec.check_run_name == check_run_name),
+        None,
+    )
+    if target is None:
+        return {"status": "no_op", "reason": f"check_run name {check_run_name!r} not ours"}
+
+    pull_requests = check_run.get("pull_requests") or []
+    resolved = _resolve_rerequest_target(payload, pull_requests)
+    if isinstance(resolved, dict):
+        return resolved
+    installation_id, owner, repo_name, repo_id = resolved
+
+    all_other_keys = frozenset(
+        spec.key for spec in persona_registry.REGISTRY if spec.key != target.key
+    )
+    results = [
+        _dispatch_rerequest_for_pr(
+            installation_id, owner, repo_name, repo_id, pr_ref, all_other_keys,
+        )
+        for pr_ref in pull_requests
+    ]
+    return {"status": "dispatched", "trigger": "check_run_rerequested",
+            "persona": target.key, "results": results}
+
+
+def _handle_check_suite(payload: dict[str, Any]) -> dict[str, Any]:
+    """`check_suite.rerequested` (grug#948): GitHub's "Re-run all checks"
+    at the SUITE level, not one named check - so unlike `_handle_check_run`
+    this dispatches with an EMPTY skip_personas (every enabled persona
+    runs), the same as an ordinary fresh `pull_request` webhook."""
+    action = payload.get("action", "")
+    if action != "rerequested":
+        return {"status": "no_op", "reason": f"check_suite action={action} not gated"}
+
+    check_suite = payload.get("check_suite") or {}
+    pull_requests = check_suite.get("pull_requests") or []
+    resolved = _resolve_rerequest_target(payload, pull_requests)
+    if isinstance(resolved, dict):
+        return resolved
+    installation_id, owner, repo_name, repo_id = resolved
+
+    results = [
+        _dispatch_rerequest_for_pr(
+            installation_id, owner, repo_name, repo_id, pr_ref, frozenset(),
+        )
+        for pr_ref in pull_requests
+    ]
+    return {"status": "dispatched", "trigger": "check_suite_rerequested", "results": results}
 
 
 def _handle_review_comment_reply(payload: dict[str, Any]) -> dict[str, str]:

@@ -9,9 +9,11 @@ from __future__ import annotations
 
 from unittest.mock import MagicMock, patch
 
+import httpx
 import personas.tpm.persona  # noqa: F401 — register submodule for patch path
 import pytest
 from dispatcher import dispatch
+from personas import registry as persona_registry
 
 
 def test_unknown_event_no_op():
@@ -820,3 +822,271 @@ def test_issues_dispatches_when_flag_on():
 def test_issues_incomplete_payload_skips():
     out = dispatch("issues", _issue_payload(installation={}))
     assert out["status"] == "skip"
+
+
+# --- check_run / check_suite rerequested (grug#948) -------------------------
+# GitHub's own "Re-run" button. check_run carries a single named check
+# (re-dispatch only the persona that owns it); check_suite carries no name
+# (re-dispatch everyone enabled, same as a fresh pull_request webhook).
+
+def _check_run_payload(**over):
+    p = {
+        "action": "rerequested",
+        "check_run": {
+            "name": "Grug - Chief",
+            "head_sha": "abc123",
+            "pull_requests": [
+                {"number": 42, "id": 1, "head": {"sha": "abc123"}, "base": {"sha": "basesha"}},
+            ],
+        },
+        "repository": {"id": 7777, "name": "infra", "owner": {"login": "quadseven"},
+                       "full_name": "quadseven/infra"},
+        "installation": {"id": 999},
+    }
+    for k, v in over.items():
+        if k in ("check_run", "repository") and isinstance(v, dict):
+            p[k] = {**p[k], **v}
+        else:
+            p[k] = v
+    return p
+
+
+def _check_suite_payload(**over):
+    p = {
+        "action": "rerequested",
+        "check_suite": {
+            "pull_requests": [
+                {"number": 42, "id": 1, "head": {"sha": "abc123"}, "base": {"sha": "basesha"}},
+            ],
+        },
+        "repository": {"id": 7777, "name": "infra", "owner": {"login": "quadseven"},
+                       "full_name": "quadseven/infra"},
+        "installation": {"id": 999},
+    }
+    for k, v in over.items():
+        if k in ("check_suite", "repository") and isinstance(v, dict):
+            p[k] = {**p[k], **v}
+        else:
+            p[k] = v
+    return p
+
+
+def test_check_run_unhandled_action_no_ops():
+    out = dispatch("check_run", _check_run_payload(action="completed"))
+    assert out["status"] == "no_op" and "completed" in out["reason"]
+
+
+def test_check_run_unknown_name_no_ops():
+    """A check-run belonging to some other GitHub App entirely - must not
+    match any persona and must not dispatch anything."""
+    out = dispatch("check_run", _check_run_payload(check_run={"name": "Some Other App"}))
+    assert out["status"] == "no_op" and "not ours" in out["reason"]
+
+
+def test_check_run_incomplete_payload_skips():
+    out = dispatch(
+        "check_run",
+        _check_run_payload(installation={}),
+    )
+    assert out["status"] == "skip" and out["reason"] == "incomplete_payload_or_no_linked_pr"
+
+
+def test_check_run_no_linked_pr_skips():
+    out = dispatch("check_run", _check_run_payload(check_run={"pull_requests": []}))
+    assert out["status"] == "skip" and out["reason"] == "incomplete_payload_or_no_linked_pr"
+
+
+def test_check_run_not_allowlisted_no_ops():
+    with patch("dispatcher.is_install_allowlisted", return_value=False), \
+         patch("dispatcher._dispatch_rerequest_for_pr") as mock_redispatch:
+        out = dispatch("check_run", _check_run_payload())
+    assert out["status"] == "no_op" and "not allowlisted" in out["reason"]
+    mock_redispatch.assert_not_called()
+
+
+def test_check_run_rerequest_skips_every_other_persona():
+    """The whole point of #948's check_run handling: a rerun of just
+    "Grug - Chief" must not also re-trigger Elder, Guard, etc."""
+    with patch("dispatcher.is_install_allowlisted", return_value=True), \
+         patch("dispatcher._dispatch_rerequest_for_pr",
+               return_value={"status": "ok"}) as mock_redispatch:
+        out = dispatch("check_run", _check_run_payload())
+
+    assert out == {
+        "status": "dispatched", "trigger": "check_run_rerequested",
+        "persona": "tpm", "results": [{"status": "ok"}],
+    }
+    mock_redispatch.assert_called_once()
+    args = mock_redispatch.call_args.args
+    assert args[0] == 999 and args[1] == "quadseven" and args[2] == "infra" and args[3] == 7777
+    assert args[4] == {"number": 42, "id": 1, "head": {"sha": "abc123"}, "base": {"sha": "basesha"}}
+    skip_personas = args[5]
+    assert "tpm" not in skip_personas
+    assert skip_personas == frozenset(
+        spec.key for spec in persona_registry.REGISTRY if spec.key != "tpm"
+    )
+
+
+def test_check_run_dispatches_one_rerequest_per_linked_pr():
+    payload = _check_run_payload(check_run={
+        "pull_requests": [
+            {"number": 42, "id": 1, "head": {"sha": "a"}, "base": {"sha": "b"}},
+            {"number": 43, "id": 2, "head": {"sha": "c"}, "base": {"sha": "d"}},
+        ],
+    })
+    with patch("dispatcher.is_install_allowlisted", return_value=True), \
+         patch("dispatcher._dispatch_rerequest_for_pr",
+               return_value={"status": "ok"}) as mock_redispatch:
+        out = dispatch("check_run", payload)
+    assert len(out["results"]) == 2
+    assert mock_redispatch.call_count == 2
+
+
+def test_check_suite_unhandled_action_no_ops():
+    out = dispatch("check_suite", _check_suite_payload(action="completed"))
+    assert out["status"] == "no_op" and "completed" in out["reason"]
+
+
+def test_check_suite_incomplete_payload_skips():
+    out = dispatch("check_suite", _check_suite_payload(check_suite={"pull_requests": []}))
+    assert out["status"] == "skip" and out["reason"] == "incomplete_payload_or_no_linked_pr"
+
+
+def test_check_suite_not_allowlisted_no_ops():
+    with patch("dispatcher.is_install_allowlisted", return_value=False), \
+         patch("dispatcher._dispatch_rerequest_for_pr") as mock_redispatch:
+        out = dispatch("check_suite", _check_suite_payload())
+    assert out["status"] == "no_op" and "not allowlisted" in out["reason"]
+    mock_redispatch.assert_not_called()
+
+
+def test_check_suite_rerequest_skips_nobody():
+    """A "re-run all checks" click - every enabled persona should run,
+    same as a fresh pull_request webhook, unlike the single-check case."""
+    with patch("dispatcher.is_install_allowlisted", return_value=True), \
+         patch("dispatcher._dispatch_rerequest_for_pr",
+               return_value={"status": "ok"}) as mock_redispatch:
+        out = dispatch("check_suite", _check_suite_payload())
+
+    assert out == {
+        "status": "dispatched", "trigger": "check_suite_rerequested",
+        "results": [{"status": "ok"}],
+    }
+    mock_redispatch.assert_called_once()
+    assert mock_redispatch.call_args.args[5] == frozenset()
+
+
+def test_dispatch_rerequest_for_pr_no_number_skips():
+    with patch("dispatcher.is_install_allowlisted", return_value=True), \
+         patch("dispatcher._fetch_pr_for_rerequest") as mock_fetch:
+        out = dispatch(
+            "check_suite",
+            _check_suite_payload(check_suite={"pull_requests": [{"head": {"sha": "x"}}]}),
+        )
+    assert out["results"][0] == {"status": "skip", "reason": "pull_requests entry has no number"}
+    mock_fetch.assert_not_called()
+
+
+def test_dispatch_rerequest_for_pr_fetch_failure_skips():
+    with patch("dispatcher.is_install_allowlisted", return_value=True), \
+         patch("dispatcher._fetch_pr_for_rerequest", return_value=None), \
+         patch("dispatcher.dispatch") as mock_dispatch:
+        out = dispatch("check_suite", _check_suite_payload())
+    assert out["results"][0] == {"status": "skip", "reason": "pr_fetch_failed", "pr_number": 42}
+    mock_dispatch.assert_not_called()
+
+
+def test_dispatch_rerequest_for_pr_no_head_sha_skips():
+    with patch("dispatcher.is_install_allowlisted", return_value=True), \
+         patch("dispatcher._fetch_pr_for_rerequest", return_value={"number": 42, "head": {}}), \
+         patch("dispatcher.dispatch") as mock_dispatch:
+        out = dispatch("check_suite", _check_suite_payload())
+    assert out["results"][0] == {"status": "skip", "reason": "pr_has_no_head_sha", "pr_number": 42}
+    mock_dispatch.assert_not_called()
+
+
+def test_dispatch_rerequest_for_pr_builds_synthetic_pull_request_event():
+    """The re-fetched PR's real `body` must flow into the synthetic event -
+    the raw check_run/check_suite payload only ever carries a minimal
+    pull_requests entry with no body, and TPM's DoR check needs the real
+    one."""
+    pr_json = {"number": 42, "body": "## Why\nreal body\n", "head": {"sha": "freshsha"}}
+    with patch("dispatcher.is_install_allowlisted", return_value=True), \
+         patch("dispatcher._fetch_pr_for_rerequest", return_value=pr_json), \
+         patch("dispatcher.dispatch") as mock_dispatch:
+        mock_dispatch.return_value = {"status": "dispatched", "personas": []}
+        dispatch("check_suite", _check_suite_payload())
+
+    mock_dispatch.assert_called_once()
+    event_name, synthetic = mock_dispatch.call_args.args
+    assert event_name == "pull_request"
+    assert mock_dispatch.call_args.kwargs["skip_personas"] == frozenset()
+    assert synthetic["action"] == "synchronize"
+    assert synthetic["pull_request"] == {
+        "number": 42, "body": "## Why\nreal body\n", "head": {"sha": "freshsha"},
+    }
+    assert synthetic["repository"] == {
+        "id": 7777, "name": "infra", "full_name": "quadseven/infra",
+        "owner": {"login": "quadseven"},
+    }
+    assert synthetic["installation"] == {"id": 999}
+
+
+def test_dispatch_rerequest_for_pr_missing_body_defaults_to_empty_string():
+    pr_json = {"number": 42, "head": {"sha": "freshsha"}}  # no "body" key at all
+    with patch("dispatcher.is_install_allowlisted", return_value=True), \
+         patch("dispatcher._fetch_pr_for_rerequest", return_value=pr_json), \
+         patch("dispatcher.dispatch") as mock_dispatch:
+        mock_dispatch.return_value = {"status": "dispatched", "personas": []}
+        dispatch("check_suite", _check_suite_payload())
+    assert mock_dispatch.call_args.args[1]["pull_request"]["body"] == ""
+
+
+def test_fetch_pr_for_rerequest_hits_correct_url_with_real_token_wiring():
+    """End-to-end through the real `_fetch_pr_for_rerequest` + the real
+    `with_install_token_retry` wiring (only `httpx.get` itself is mocked) -
+    pins the URL shape and confirms the fetched body reaches the synthetic
+    payload."""
+    pr_resp = MagicMock(spec=httpx.Response)
+    pr_resp.raise_for_status = MagicMock()
+    pr_resp.json = MagicMock(return_value={
+        "number": 42, "body": "fetched live", "head": {"sha": "livesha"},
+    })
+    with patch("dispatcher.is_install_allowlisted", return_value=True), \
+         patch("github_app_auth.with_install_token_retry", side_effect=lambda iid, fn: fn("tok")), \
+         patch("httpx.get", return_value=pr_resp) as mock_get, \
+         patch("dispatcher.dispatch") as mock_dispatch:
+        mock_dispatch.return_value = {"status": "dispatched", "personas": []}
+        dispatch("check_suite", _check_suite_payload())
+
+    mock_get.assert_called_once()
+    url = mock_get.call_args.args[0]
+    assert url == "https://api.github.com/repos/quadseven/infra/pulls/42"
+    headers = mock_get.call_args.kwargs["headers"]
+    assert headers["Authorization"] == "token tok"
+    synthetic = mock_dispatch.call_args.args[1]
+    assert synthetic["pull_request"]["body"] == "fetched live"
+    assert synthetic["pull_request"]["head"]["sha"] == "livesha"
+
+
+def test_fetch_pr_for_rerequest_http_status_error_skips_that_pr():
+    """A permanent 4xx/5xx on the re-fetch must skip just this PR, not
+    crash the whole rerequest (other linked PRs, if any, still proceed)."""
+    resp = MagicMock(status_code=404)
+    err = httpx.HTTPStatusError("not found", request=MagicMock(), response=resp)
+    with patch("dispatcher.is_install_allowlisted", return_value=True), \
+         patch("github_app_auth.with_install_token_retry", side_effect=err), \
+         patch("dispatcher.dispatch") as mock_dispatch:
+        out = dispatch("check_suite", _check_suite_payload())
+    assert out["results"][0] == {"status": "skip", "reason": "pr_fetch_failed", "pr_number": 42}
+    mock_dispatch.assert_not_called()
+
+
+def test_fetch_pr_for_rerequest_transport_error_skips_that_pr():
+    with patch("dispatcher.is_install_allowlisted", return_value=True), \
+         patch("github_app_auth.with_install_token_retry",
+               side_effect=httpx.RequestError("github unreachable")), \
+         patch("dispatcher.dispatch") as mock_dispatch:
+        out = dispatch("check_suite", _check_suite_payload())
+    assert out["results"][0] == {"status": "skip", "reason": "pr_fetch_failed", "pr_number": 42}
+    mock_dispatch.assert_not_called()
