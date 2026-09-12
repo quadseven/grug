@@ -1017,6 +1017,21 @@ def test_dep_watch_flag_and_targeting(pg):
     assert store.claim_dep_watch_report(4, "o/dep") is False
 
 
+def test_check_run_reconcile_flag_and_targeting(pg):
+    """grug#947: check_run_reconcile_enabled is an EXTRA repo flag (default
+    off, store-driven targeting), same shape as dep_watch."""
+    from adapters import pg_install_store as store
+
+    cfg = store.get_repo_config(5, 301)
+    assert cfg["check_run_reconcile_enabled"] is False
+    store.set_repo_config(install_id=5, repo_id=301, repo_full_name="o/on",
+                          updated_by_user_id="9", check_run_reconcile_enabled=True)
+    store.set_repo_config(install_id=5, repo_id=302, repo_full_name="o/off",
+                          updated_by_user_id="9")
+    assert store.get_repo_config(5, 301)["check_run_reconcile_enabled"] is True
+    assert store.list_check_run_reconcile_repos(5) == [{"id": 301, "full_name": "o/on"}]
+
+
 def test_guard_hygiene_dead_ref_patterns_round_trip(pg):
     """#778: dead-ref patterns are per-install DATA, not a bool flag - the
     store must round-trip a list of strings, default to an empty tuple on

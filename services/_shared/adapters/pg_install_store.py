@@ -195,6 +195,10 @@ _EXTRA_REPO_FLAGS = frozenset({
     # turning Chief on for pull requests must not silently start
     # commenting on every issue in the repo. Default OFF.
     "issue_dor_enabled",
+    # grug#947: opt-in for the check-run sweep/reconcile periodic pass -
+    # same store-driven targeting as dep_watch/pulse, not a blanket
+    # every-repo scan. Default OFF.
+    "check_run_reconcile_enabled",
 })
 
 # Repo-level flags whose value is a STRING, not a bool (the persona flags and
@@ -1147,6 +1151,12 @@ def list_reopen_watch_repos(install_id: int) -> list[dict[str, Any]]:
     """Repo rows with reopen_watch_enabled=true (grug#730 audit finding) -
     same store-driven targeting pattern as dep_watch/pulse."""
     return _list_flag_enabled_repos(install_id, "reopen_watch_enabled")
+
+
+def list_check_run_reconcile_repos(install_id: int) -> list[dict[str, Any]]:
+    """Repo rows with check_run_reconcile_enabled=true (grug#947) - same
+    store-driven targeting pattern as dep_watch/pulse/reopen_watch."""
+    return _list_flag_enabled_repos(install_id, "check_run_reconcile_enabled")
 
 
 def list_hygiene_watch_repos(install_id: int) -> list[dict[str, Any]]:

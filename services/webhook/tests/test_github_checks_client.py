@@ -227,3 +227,51 @@ def test_post_check_run_truncates_oversize_summary():
     sent = captured["body"]["output"]["summary"]
     assert len(sent) <= 65100
     assert sent.endswith("(summary truncated)")
+
+
+# --- grug#947: list + patch, the ground-truth-by-listing seam --------------
+
+
+def test_list_check_runs_for_ref_url_and_params():
+    from github_checks_client import list_check_runs_for_ref
+
+    resp = _ok_response({"total_count": 1, "check_runs": [{"id": 1, "name": "Grug - Chief"}]})
+    with patch("httpx.get", return_value=resp) as mock_get:
+        out = list_check_runs_for_ref("tok-123", "myorg", "myrepo", "abc123")
+
+    mock_get.assert_called_once()
+    args, kwargs = mock_get.call_args
+    assert args[0] == "https://api.github.com/repos/myorg/myrepo/commits/abc123/check-runs"
+    assert kwargs["params"]["filter"] == "latest"
+    assert kwargs["headers"]["Authorization"] == "Bearer tok-123"
+    assert out == [{"id": 1, "name": "Grug - Chief"}]
+
+
+def test_list_check_runs_for_ref_paginates_until_total_seen():
+    from github_checks_client import list_check_runs_for_ref
+
+    page1 = _ok_response({"total_count": 3, "check_runs": [{"id": 1}, {"id": 2}]})
+    page2 = _ok_response({"total_count": 3, "check_runs": [{"id": 3}]})
+    with patch("httpx.get", side_effect=[page1, page2]) as mock_get:
+        out = list_check_runs_for_ref("tok", "o", "r", "sha")
+
+    assert mock_get.call_count == 2
+    assert [r["id"] for r in out] == [1, 2, 3]
+
+
+def test_patch_check_run_url_and_body():
+    result = CheckRunResult(
+        name="Grug - Elder", head_sha="unused-by-patch", status="completed",
+        conclusion="failure", title="stuck", summary="closed by the sweeper",
+    )
+    resp = _ok_response({"id": 999, "status": "completed"})
+    with patch("httpx.patch", return_value=resp) as mock_patch:
+        from github_checks_client import patch_check_run
+        out = patch_check_run("tok-123", "myorg", "myrepo", 999, result)
+
+    mock_patch.assert_called_once()
+    args, kwargs = mock_patch.call_args
+    assert args[0] == "https://api.github.com/repos/myorg/myrepo/check-runs/999"
+    assert kwargs["json"]["conclusion"] == "failure"
+    assert "head_sha" not in kwargs["json"], "PATCH targets an id, not a head_sha"
+    assert out == {"id": 999, "status": "completed"}
