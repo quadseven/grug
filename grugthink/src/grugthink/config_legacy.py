@@ -85,92 +85,122 @@ def is_valid_url(url):
 # Solution: Use Python 3.7+ module __getattr__ to read from os.environ on every access.
 
 
+def _lazy_ollama_urls():
+    import logging
+
+    _log = logging.getLogger(__name__)
+    raw_value = os.getenv("OLLAMA_URLS", "")
+    urls = [url.strip() for url in raw_value.split(",") if url.strip()]
+
+    # Log what we're returning for debugging
+    _log.debug(
+        "Loading OLLAMA_URLS from environment",
+        extra={
+            "raw_env_value": raw_value,
+            "parsed_urls": urls,
+            "count": len(urls),
+            "source": "os.environ" if "OLLAMA_URLS" in os.environ else "default",
+        },
+    )
+
+    # Validate URLs (only if we have URLs to validate)
+    if urls:
+        for url in urls:
+            if not is_valid_url(url):
+                raise ValueError(f"Invalid OLLAMA_URL: {url}")
+    else:
+        # CRITICAL: Log when OLLAMA_URLS is empty - this is likely a configuration error
+        _log.warning(
+            "OLLAMA_URLS is empty - LLM queries via Ollama will fail",
+            extra={"raw_env_value": raw_value, "parsed_urls": urls},
+        )
+
+    return urls
+
+
+def _lazy_ollama_models():
+    import logging
+
+    _log = logging.getLogger(__name__)
+    raw_value = os.getenv("OLLAMA_MODELS", "llama3.2:3b")
+    models = [model.strip() for model in raw_value.split(",") if model.strip()]
+
+    _log.debug(
+        "Loading OLLAMA_MODELS from environment",
+        extra={"raw_env_value": raw_value, "parsed_models": models, "count": len(models)},
+    )
+
+    # Validate model names
+    for model in models:
+        if not re.match(r"^[\w\-\.:]+$", model):
+            raise ValueError(f"Invalid model name: {model}")
+    return models
+
+
+def _lazy_gemini_api_key():
+    key = os.getenv("GEMINI_API_KEY")
+    if key and not re.match(r"^[\w\-]+$", key):
+        raise ValueError("Invalid GEMINI_API_KEY")
+    return key
+
+
+def _lazy_gemini_model():
+    return os.getenv("GEMINI_MODEL", "gemini-pro")
+
+
+def _lazy_use_gemini():
+    # Dynamically compute based on current GEMINI_API_KEY value
+    return bool(_lazy_gemini_api_key())
+
+
+def _lazy_poolside_api_key():
+    # Bounded chat fallback (grugthink issue: Ollama/Cave-only, no
+    # resilience). Plain env var, NOT the GRUG_POOLSIDE_API_KEY_SSM
+    # name-indirection scheme grug's own webhook/consumer pods use -
+    # this pod has no runtime AWS credential path (no Roles Anywhere
+    # mount, automountServiceAccountToken: false), so the value is
+    # resolved from SSM at DEPLOY time (grugthink.deploy.yml) and
+    # injected here as an already-decrypted literal, same convention
+    # as GEMINI_API_KEY/DISCORD_TOKEN/SESSION_SECRET.
+    return os.getenv("POOLSIDE_API_KEY")
+
+
+def _lazy_openrouter_api_key():
+    # See _lazy_poolside_api_key above - same deploy-time-resolved convention.
+    return os.getenv("OPENROUTER_API_KEY")
+
+
+def _lazy_can_search():
+    return bool(GOOGLE_API_KEY and GOOGLE_CSE_ID)
+
+
+# Name -> zero-arg loader, one per branch __getattr__ used to hand-dispatch
+# (grug#632: that function alone measured cyclomatic 20 / cognitive 58, both
+# well over cap). Each loader keeps its own logic and log lines byte-for-byte
+# unchanged; only the dispatch shape moved.
+_LAZY_ATTRS = {
+    "OLLAMA_URLS": _lazy_ollama_urls,
+    "OLLAMA_MODELS": _lazy_ollama_models,
+    "GEMINI_API_KEY": _lazy_gemini_api_key,
+    "GEMINI_MODEL": _lazy_gemini_model,
+    "USE_GEMINI": _lazy_use_gemini,
+    "POOLSIDE_API_KEY": _lazy_poolside_api_key,
+    "OPENROUTER_API_KEY": _lazy_openrouter_api_key,
+    "CAN_SEARCH": _lazy_can_search,
+}
+
+
 def __getattr__(name):
     """Lazy-load configuration values from environment at runtime.
 
     This allows multi-bot mode to set environment variables AFTER module import.
     Without this, cached values would be empty/defaults from import time.
     """
-    import logging
-
-    _log = logging.getLogger(__name__)
-
-    if name == "OLLAMA_URLS":
-        raw_value = os.getenv("OLLAMA_URLS", "")
-        urls = [url.strip() for url in raw_value.split(",") if url.strip()]
-
-        # Log what we're returning for debugging
-        _log.debug(
-            "Loading OLLAMA_URLS from environment",
-            extra={
-                "raw_env_value": raw_value,
-                "parsed_urls": urls,
-                "count": len(urls),
-                "source": "os.environ" if "OLLAMA_URLS" in os.environ else "default",
-            },
-        )
-
-        # Validate URLs (only if we have URLs to validate)
-        if urls:
-            for url in urls:
-                if not is_valid_url(url):
-                    raise ValueError(f"Invalid OLLAMA_URL: {url}")
-        else:
-            # CRITICAL: Log when OLLAMA_URLS is empty - this is likely a configuration error
-            _log.warning(
-                "OLLAMA_URLS is empty - LLM queries via Ollama will fail",
-                extra={"raw_env_value": raw_value, "parsed_urls": urls},
-            )
-
-        return urls
-
-    elif name == "OLLAMA_MODELS":
-        raw_value = os.getenv("OLLAMA_MODELS", "llama3.2:3b")
-        models = [model.strip() for model in raw_value.split(",") if model.strip()]
-
-        _log.debug(
-            "Loading OLLAMA_MODELS from environment",
-            extra={"raw_env_value": raw_value, "parsed_models": models, "count": len(models)},
-        )
-
-        # Validate model names
-        for model in models:
-            if not re.match(r"^[\w\-\.:]+$", model):
-                raise ValueError(f"Invalid model name: {model}")
-        return models
-
-    elif name == "GEMINI_API_KEY":
-        key = os.getenv("GEMINI_API_KEY")
-        if key and not re.match(r"^[\w\-]+$", key):
-            raise ValueError("Invalid GEMINI_API_KEY")
-        return key
-
-    elif name == "GEMINI_MODEL":
-        return os.getenv("GEMINI_MODEL", "gemini-pro")
-
-    elif name == "USE_GEMINI":
-        # Dynamically compute based on current GEMINI_API_KEY value
-        return bool(__getattr__("GEMINI_API_KEY"))
-
-    elif name == "POOLSIDE_API_KEY":
-        # Bounded chat fallback (grugthink issue: Ollama/Cave-only, no
-        # resilience). Plain env var, NOT the GRUG_POOLSIDE_API_KEY_SSM
-        # name-indirection scheme grug's own webhook/consumer pods use -
-        # this pod has no runtime AWS credential path (no Roles Anywhere
-        # mount, automountServiceAccountToken: false), so the value is
-        # resolved from SSM at DEPLOY time (grugthink.deploy.yml) and
-        # injected here as an already-decrypted literal, same convention
-        # as GEMINI_API_KEY/DISCORD_TOKEN/SESSION_SECRET.
-        return os.getenv("POOLSIDE_API_KEY")
-
-    elif name == "OPENROUTER_API_KEY":
-        # See POOLSIDE_API_KEY above - same deploy-time-resolved convention.
-        return os.getenv("OPENROUTER_API_KEY")
-
-    elif name == "CAN_SEARCH":
-        return bool(GOOGLE_API_KEY and GOOGLE_CSE_ID)
-
-    raise AttributeError(f"module '{__name__}' has no attribute '{name}'")
+    try:
+        loader = _LAZY_ATTRS[name]
+    except KeyError:
+        raise AttributeError(f"module '{__name__}' has no attribute '{name}'") from None
+    return loader()
 
 
 def log_initial_settings():
