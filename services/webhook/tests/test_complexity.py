@@ -7,6 +7,7 @@ from personas.code_reviewer.complexity import (
     cognitive_complexity,
     cyclomatic_complexity,
     scan_complexity,
+    scan_complexity_full,
 )
 import ast
 
@@ -168,3 +169,60 @@ def test_unparseable_base_degrades_to_absolute_not_silence():
     out = scan_complexity(_one_hunk(), {"a.py": _tangled()},
                           base_contents={"a.py": "def broken(:\n"})
     assert len(out) == 1
+
+
+# --- suppression visibility (#781): the gate must be countable, not just quiet --
+
+def test_scan_complexity_matches_the_findings_half_of_the_full_scan():
+    """scan_complexity is a thin view over scan_complexity_full - same
+    findings, every time, for every case above."""
+    hunks, contents = _one_hunk(), {"a.py": _tangled(6)}
+    base = {"a.py": _tangled()}
+    assert scan_complexity(hunks, contents, base_contents=base) == (
+        scan_complexity_full(hunks, contents, base_contents=base).findings
+    )
+
+
+def test_not_worsened_over_cap_function_is_counted_suppressed():
+    scan = scan_complexity_full(_one_hunk(), {"a.py": _tangled()},
+                                base_contents={"a.py": _tangled()})
+    assert scan.findings == ()
+    assert len(scan.suppressed) == 1
+    s = scan.suppressed[0]
+    assert s.file == "a.py"
+    assert s.function == "handler"
+    assert s.cyclomatic == s.base_cyclomatic
+    assert s.cognitive == s.base_cognitive
+
+
+def test_improved_over_cap_function_is_counted_suppressed():
+    scan = scan_complexity_full(_one_hunk(), {"a.py": _tangled()},
+                                base_contents={"a.py": _tangled(10)})
+    assert scan.findings == ()
+    assert len(scan.suppressed) == 1
+    assert scan.suppressed[0].cyclomatic < scan.suppressed[0].base_cyclomatic
+
+
+def test_material_worsening_reports_and_suppresses_nothing():
+    scan = scan_complexity_full(_one_hunk(), {"a.py": _tangled(6)},
+                                base_contents={"a.py": _tangled()})
+    assert len(scan.findings) == 1
+    assert scan.suppressed == ()
+
+
+def test_no_base_never_populates_suppressed():
+    """Without a base, _is_regression always returns True (fall back to
+    absolute behaviour), so nothing can land in `suppressed` - there is no
+    base score to compare against and call a non-regression."""
+    scan = scan_complexity_full(_one_hunk(), {"a.py": _tangled()})
+    assert len(scan.findings) == 1
+    assert scan.suppressed == ()
+
+
+def test_under_cap_function_is_neither_reported_nor_suppressed():
+    src = "def ok(x):\n    if x:\n        return 1\n    return 0\n"
+    hunks = (_hunk("services/y.py", 2, ["        return 1"]),)
+    scan = scan_complexity_full(hunks, {"services/y.py": src},
+                                base_contents={"services/y.py": src})
+    assert scan.findings == ()
+    assert scan.suppressed == ()
