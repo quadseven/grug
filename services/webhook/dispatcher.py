@@ -46,9 +46,7 @@ def dispatch(
     if event_name == "installation":
         return _handle_installation(payload)
     if event_name == "installation_repositories":
-        # Repo-list change on an existing install — install row already
-        # exists; per-repo config lives in services/api/installations.py.
-        return {"status": "no_op", "reason": "installation_repositories acknowledged"}
+        return _handle_installation_repositories(payload)
     if event_name == "pull_request":
         return _handle_pull_request(payload, delivery_id=delivery_id)
     if event_name == "issues":
@@ -117,6 +115,37 @@ def _handle_installation(payload: dict[str, Any]) -> dict[str, str]:
         return {"status": "no_op", "reason": f"{action} ack — installer preserved"}
 
     return {"status": "no_op", "reason": f"installation action={action} unhandled"}
+
+
+def _handle_installation_repositories(payload: dict[str, Any]) -> dict[str, Any]:
+    """Repo-list change on an EXISTING install (grug#833). The install row
+    already exists (`installation` created it) - this only needs to close
+    the enforcement gap: a repo added here got zero `installation.created`
+    treatment, so without this it sat ungated until the enforcement-gap
+    monitor caught it (2026-08-08, quadseven/switch-tools, promoted by
+    hand in infra PR #2325). `repositories_removed` needs no action - a
+    deleted/transferred-out repo's ruleset goes with it.
+
+    Same allowlist gate as `_handle_installation`'s created path (Slice 5
+    #26 defense-in-depth): a non-allowlisted install's repos are never
+    auto-enforced, added or not."""
+    install = payload.get("installation") or {}
+    install_id = install.get("id")
+    if not install_id:
+        return {"status": "skip", "reason": "no installation.id"}
+
+    action = payload.get("action", "")
+    if action != "added":
+        return {
+            "status": "no_op",
+            "reason": f"installation_repositories action={action} not gated",
+        }
+
+    added = payload.get("repositories_added") or []
+    if is_install_allowlisted(int(install_id)):
+        _enforce_on_repos(int(install_id), added)
+
+    return {"status": "recorded", "action": "repositories_added", "count": len(added)}
 
 
 def _handle_repository_ruleset(payload: dict[str, Any]) -> dict[str, str]:

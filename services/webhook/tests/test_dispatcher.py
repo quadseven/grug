@@ -24,9 +24,58 @@ def test_pull_request_review_placeholder():
     assert out["status"] == "no_op" and "code-reviewer" not in out["reason"]
 
 
-def test_installation_repositories_no_op():
+def test_installation_repositories_no_id_skips():
     out = dispatch("installation_repositories", {})
+    assert out["status"] == "skip"
+
+
+def test_installation_repositories_removed_no_ops():
+    """grug#833 out of scope: a removed repo's ruleset goes with it."""
+    payload = {
+        "action": "removed",
+        "installation": {"id": 555},
+        "repositories_removed": [{"id": 1, "full_name": "quadseven/gone"}],
+    }
+    with patch("dispatcher._enforce_on_repos") as mock_enforce:
+        out = dispatch("installation_repositories", payload)
     assert out["status"] == "no_op"
+    mock_enforce.assert_not_called()
+
+
+def test_installation_repositories_added_enforces_exactly_those_repos():
+    """grug#833: a repo added to an EXISTING install used to sit ungated -
+    dispatcher no-op'd this event entirely and only a persona toggle ever
+    called `_enforce_on_repos`. Live 2026-08-08: quadseven/switch-tools was
+    ungated for >1h until the enforcement-gap monitor fired."""
+    payload = {
+        "action": "added",
+        "installation": {"id": 555},
+        "repositories_added": [
+            {"id": 1, "full_name": "quadseven/new-repo", "default_branch": "main"},
+        ],
+        "repositories_removed": [],
+    }
+    with patch("dispatcher.is_install_allowlisted", return_value=True), \
+         patch("dispatcher._enforce_on_repos") as mock_enforce:
+        out = dispatch("installation_repositories", payload)
+    assert out["status"] == "recorded" and out["action"] == "repositories_added"
+    mock_enforce.assert_called_once_with(555, payload["repositories_added"])
+
+
+def test_installation_repositories_added_skips_non_allowlisted():
+    """Same defense-in-depth allowlist gate as the `installation` created
+    path (Slice 5 #26) - a non-allowlisted install's added repos are never
+    auto-enforced."""
+    payload = {
+        "action": "added",
+        "installation": {"id": 555},
+        "repositories_added": [{"id": 1, "full_name": "quadseven/new-repo"}],
+    }
+    with patch("dispatcher.is_install_allowlisted", return_value=False), \
+         patch("dispatcher._enforce_on_repos") as mock_enforce:
+        out = dispatch("installation_repositories", payload)
+    assert out["status"] == "recorded"
+    mock_enforce.assert_not_called()
 
 
 def test_pull_request_unhandled_action_skips():
