@@ -25,6 +25,7 @@ import logging
 import os
 import re
 import threading
+import time
 from typing import Any, Literal
 from urllib.parse import quote
 
@@ -1820,6 +1821,37 @@ def _build_review_result(
     )
 
 
+def _comment_record_origins(
+    finding: Finding, review_span_context: dict | None,
+) -> tuple[list[CommentFindingOrigin], dict | None]:
+    """The finding's origin list plus the one span context a captured
+    CommentRecord attributes a later reaction to. Split out of
+    `_capture_comment_records` purely to shed one branch from that
+    function's own complexity score (#967 follow-up); no behavior change."""
+    finding_origins: list[CommentFindingOrigin] = [
+        {
+            "backend": origin.backend.value,
+            "model": origin.model,
+            "review_span_context": origin.review_span_context,
+        }
+        for origin in finding.origins
+    ]
+    traced_origins = [
+        origin for origin in finding_origins
+        if origin["review_span_context"] is not None
+    ]
+    if traced_origins:
+        # Preserve the historical scalar for old poller versions, but use
+        # an actual origin for this finding rather than the response-level
+        # first success (which may be a different backend).
+        return finding_origins, traced_origins[0]["review_span_context"]
+    if finding.origins:
+        # Provenance exists but trace export failed. Unknown is more honest
+        # than attributing the reaction to another backend's span.
+        return finding_origins, None
+    return finding_origins, review_span_context
+
+
 def _capture_comment_records(
     comments: list[dict],
     findings: tuple[Finding, ...],
@@ -1861,9 +1893,6 @@ def _capture_comment_records(
     }
     persisted = 0
     for c in comments:
-        log.warning(  # TEMP #967 DEBUG round 2 - remove before merge
-            "debug_967v2_raw_comment", extra={"raw": {k: v for k, v in c.items() if k != "body"}},
-        )
         cid, path = c.get("id"), c.get("path")
         line = c.get("line")
         if line is None:
@@ -1879,29 +1908,9 @@ def _capture_comment_records(
             continue
         if finding is None:
             continue
-        finding_origins: list[CommentFindingOrigin] = [
-            {
-                "backend": origin.backend.value,
-                "model": origin.model,
-                "review_span_context": origin.review_span_context,
-            }
-            for origin in finding.origins
-        ]
-        traced_origins = [
-            origin for origin in finding_origins
-            if origin["review_span_context"] is not None
-        ]
-        if traced_origins:
-            # Preserve the historical scalar for old poller versions, but use
-            # an actual origin for this finding rather than the response-level
-            # first success (which may be a different backend).
-            fallback_span_context = traced_origins[0]["review_span_context"]
-        elif finding.origins:
-            # Provenance exists but trace export failed. Unknown is more honest
-            # than attributing the reaction to another backend's span.
-            fallback_span_context = None
-        else:
-            fallback_span_context = review_span_context
+        finding_origins, fallback_span_context = _comment_record_origins(
+            finding, review_span_context,
+        )
         try:
             put_comment_record(
                 install_id=install_id,
@@ -3111,6 +3120,31 @@ def _publish_deep_check(
         )
 
 
+# grug#967: GitHub's REST API computes a JUST-created review comment's
+# human-readable `line`/`original_line` asynchronously, on its own backend -
+# fetching it in the same synchronous round-trip `post_review` runs in
+# (this function's whole reason to exist) reliably returns a comment
+# carrying only `position`/`original_position` (the comment's offset
+# WITHIN THE DIFF PATCH TEXT, not a file line number, and not usable as a
+# substitute) for a short window. Confirmed live: every real comment this
+# path was ever handed had this shape, a 100%-reproducing capture failure.
+# Bounded retry: short, and only pays the cost when there's actually a
+# marked finding still missing both line fields.
+_COMMENT_LINE_RETRY_DELAYS_S = (1.0, 2.0)
+
+
+def _comments_missing_line_data(comments: list[dict]) -> bool:
+    """True when a Grug-marked comment has neither `line` nor
+    `original_line` - see `_COMMENT_LINE_RETRY_DELAYS_S`'s comment. An
+    unmarked (human) comment is irrelevant here; it is never looked up by
+    line in `_capture_comment_records` either way."""
+    return any(
+        c.get("line") is None and c.get("original_line") is None
+        for c in comments
+        if parse_rule(c.get("body", "")) is not None
+    )
+
+
 def _capture_review_comments(
     *,
     installation_id: int,
@@ -3132,13 +3166,21 @@ def _capture_review_comments(
     outcome.
     """
     try:
-        comments = with_install_token_retry(
-            installation_id,
-            lambda token: get_review_comments(
-                token, owner, repo_name,
-                pull_number=pull_number, review_id=int(review_id),
-            ),
-        )
+        def _fetch() -> list[dict]:
+            return with_install_token_retry(
+                installation_id,
+                lambda token: get_review_comments(
+                    token, owner, repo_name,
+                    pull_number=pull_number, review_id=int(review_id),
+                ),
+            )
+
+        comments = _fetch()
+        for delay_s in _COMMENT_LINE_RETRY_DELAYS_S:
+            if not _comments_missing_line_data(comments):
+                break
+            time.sleep(delay_s)
+            comments = _fetch()
         persisted = _capture_comment_records(
             comments, findings,
             install_id=installation_id,

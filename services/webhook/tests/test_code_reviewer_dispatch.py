@@ -1632,9 +1632,107 @@ def test_dispatch_capture_falls_back_to_original_line_when_line_is_null(monkeypa
     assert captured[0]["comment_id"] == 555
 
 
+def test_dispatch_capture_retries_and_recovers_once_github_backfills_line(monkeypatch):
+    """grug#967's complete shape: the FIRST fetch, run in the same
+    synchronous round-trip as `post_review`, returns the comment carrying
+    only `position`/`original_position` (a diff-patch offset, not a file
+    line number - GitHub has not yet computed the human-readable fields).
+    A bounded retry re-fetches; once GitHub backfills `original_line`, the
+    comment captures correctly."""
+    captured = []
+    sleeps = []
+    calls = {"n": 0}
+
+    def _fetch(*a, **kw):
+        calls["n"] += 1
+        if calls["n"] == 1:
+            return [{
+                "id": 555, "path": "src/x.py", "line": None, "original_line": None,
+                "position": 2, "original_position": 2,
+                "body": "m\n<!-- grug-rule:silent-failure -->",
+            }]
+        return [{
+            "id": 555, "path": "src/x.py", "line": None, "original_line": 2,
+            "body": "m\n<!-- grug-rule:silent-failure -->",
+        }]
+
+    monkeypatch.setattr(cr_dispatch, "review_diff", lambda *a, **kw: _llm_with_span())
+    monkeypatch.setattr(cr_dispatch, "post_check_run", lambda *a, **kw: {"id": 1})
+    monkeypatch.setattr(cr_dispatch, "post_review", lambda *a, **kw: {"id": 77})
+    monkeypatch.setattr(cr_dispatch, "get_review_comments", _fetch)
+    monkeypatch.setattr(cr_dispatch.time, "sleep", lambda s: sleeps.append(s))
+    monkeypatch.setattr(
+        cr_dispatch, "put_comment_record",
+        lambda **kw: captured.append(kw),
+    )
+    with patch("httpx.get", return_value=_diff_response()):
+        cr_dispatch.dispatch_code_review(_payload(), blocking=False)
+    assert calls["n"] == 2  # one retry, then it had what it needed
+    assert sleeps == [cr_dispatch._COMMENT_LINE_RETRY_DELAYS_S[0]]
+    assert len(captured) == 1
+    assert captured[0]["comment_id"] == 555
+
+
+def test_dispatch_capture_gives_up_after_bounded_retries(monkeypatch):
+    """A comment that never gets line data within the retry budget still
+    degrades to a skip, not an infinite loop - and the retry count is
+    exactly the configured budget, not open-ended."""
+    captured = []
+    sleeps = []
+    calls = {"n": 0}
+
+    def _fetch(*a, **kw):
+        calls["n"] += 1
+        return [{
+            "id": 556, "path": "src/x.py", "line": None, "original_line": None,
+            "position": 2, "original_position": 2,
+            "body": "m\n<!-- grug-rule:silent-failure -->",
+        }]
+
+    monkeypatch.setattr(cr_dispatch, "review_diff", lambda *a, **kw: _llm_with_span())
+    monkeypatch.setattr(cr_dispatch, "post_check_run", lambda *a, **kw: {"id": 1})
+    monkeypatch.setattr(cr_dispatch, "post_review", lambda *a, **kw: {"id": 77})
+    monkeypatch.setattr(cr_dispatch, "get_review_comments", _fetch)
+    monkeypatch.setattr(cr_dispatch.time, "sleep", lambda s: sleeps.append(s))
+    monkeypatch.setattr(cr_dispatch, "put_comment_record", lambda **kw: captured.append(kw))
+    with patch("httpx.get", return_value=_diff_response()):
+        cr_dispatch.dispatch_code_review(_payload(), blocking=False)
+    assert calls["n"] == 1 + len(cr_dispatch._COMMENT_LINE_RETRY_DELAYS_S)
+    assert sleeps == list(cr_dispatch._COMMENT_LINE_RETRY_DELAYS_S)
+    assert captured == []
+
+
+def test_dispatch_capture_no_retry_when_line_present_on_first_fetch(monkeypatch):
+    """The common case (line already usable) must not pay any retry cost -
+    exactly one fetch, no sleep."""
+    captured = []
+    sleeps = []
+    calls = {"n": 0}
+
+    def _fetch(*a, **kw):
+        calls["n"] += 1
+        return [{
+            "id": 557, "path": "src/x.py", "line": 2,
+            "body": "m\n<!-- grug-rule:silent-failure -->",
+        }]
+
+    monkeypatch.setattr(cr_dispatch, "review_diff", lambda *a, **kw: _llm_with_span())
+    monkeypatch.setattr(cr_dispatch, "post_check_run", lambda *a, **kw: {"id": 1})
+    monkeypatch.setattr(cr_dispatch, "post_review", lambda *a, **kw: {"id": 77})
+    monkeypatch.setattr(cr_dispatch, "get_review_comments", _fetch)
+    monkeypatch.setattr(cr_dispatch.time, "sleep", lambda s: sleeps.append(s))
+    monkeypatch.setattr(cr_dispatch, "put_comment_record", lambda **kw: captured.append(kw))
+    with patch("httpx.get", return_value=_diff_response()):
+        cr_dispatch.dispatch_code_review(_payload(), blocking=False)
+    assert calls["n"] == 1
+    assert sleeps == []
+    assert len(captured) == 1
+
+
 def test_dispatch_capture_skips_when_both_line_and_original_line_are_null(monkeypatch):
-    """A genuinely unusable comment (neither line nor original_line present -
-    e.g. a file-level comment) still degrades to skip, not a crash."""
+    """A genuinely unusable comment (neither line nor original_line present
+    even after the retry budget - e.g. a file-level comment) still
+    degrades to skip, not a crash."""
     captured = []
     monkeypatch.setattr(cr_dispatch, "review_diff", lambda *a, **kw: _llm_with_span())
     monkeypatch.setattr(cr_dispatch, "post_check_run", lambda *a, **kw: {"id": 1})
@@ -1646,6 +1744,7 @@ def test_dispatch_capture_skips_when_both_line_and_original_line_are_null(monkey
             "body": "m\n<!-- grug-rule:silent-failure -->",
         }],
     )
+    monkeypatch.setattr(cr_dispatch.time, "sleep", lambda s: None)
     monkeypatch.setattr(cr_dispatch, "put_comment_record", lambda **kw: captured.append(kw))
     with patch("httpx.get", return_value=_diff_response()):
         cr_dispatch.dispatch_code_review(_payload(), blocking=False)
