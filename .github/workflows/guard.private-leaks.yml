@@ -24,6 +24,28 @@ name: Guard · Private leaks
 # The pattern list lives in scripts/check_private_leaks.py and contains only
 # generic SHAPES, never specific host names - a deny-list naming the real hosts
 # could not live in a public repo without being the leak it prevents.
+#
+# LAYER 2 (grug#921). Shapes cannot match a PERSON: a first name has no shape.
+#   The specific terms - people, products, host codenames - live in the SSM
+#   SecureString named below and are fetched at run time. This workflow shipped
+#   without passing --deny-list-ssm on either step, so for its entire life the
+#   guard ran on 6 generic patterns, reported "clean", and was structurally
+#   incapable of matching the operator's own first name while it sat in ten
+#   source files. Both steps now pass the flag, and
+#   scripts/tests/test_check_private_leaks.py asserts they still do.
+#
+# CREDENTIALS. GitHub OIDC into grug-gha-leak-guard - a role whose ENTIRE
+#   policy is "read that one parameter". Deliberately NOT grug-gha-deploy:
+#   that role can write SSM, IAM and S3, and trusting it from a pull_request
+#   would hand full deploy rights to anyone who can open a PR (the same reason
+#   its feat/* branch trust was retired). Defined in
+#   infra/pulumi/components/leak_guard_role.py.
+#
+# FORK PRs. A pull_request from a fork gets read-only token permissions, so it
+#   cannot mint an OIDC token and cannot read the deny-list. That case FAILS
+#   LOUDLY below rather than quietly running layer 1 only: a check that goes
+#   green while covering half of what it claims is how this guard was broken in
+#   the first place. A maintainer re-runs such a PR from a branch in this repo.
 
 on:
   pull_request:
@@ -32,6 +54,11 @@ on:
 permissions:
   contents: read
   pull-requests: read
+  # Mint the OIDC token for grug-gha-leak-guard. Without this the AWS creds
+  # step fails with "Could not load credentials from any providers" - the
+  # token cannot be requested at all, which is a confusing way to learn that
+  # a permissions block is missing (same trap preview.yml documents).
+  id-token: write
 
 concurrency:
   group: guard-private-leaks-${{ github.event.pull_request.number }}
@@ -48,15 +75,36 @@ jobs:
         with:
           fetch-depth: 0
 
-      - name: "2. Scan the PR diff"
+      - name: "2. Refuse to run half-armed on a fork PR"
+        # Explicit, before the credentials step, so the failure reads as a
+        # policy decision instead of an opaque OIDC error.
+        if: github.event.pull_request.head.repo.full_name != github.repository
+        run: |
+          echo "::error::Leak guard cannot run on a fork PR."
+          echo "A fork's token cannot mint OIDC, so the deny-list is unreadable."
+          echo "This guard will not report a green check while its people and"
+          echo "product layer is off. A maintainer must re-open this change from"
+          echo "a branch in this repository."
+          exit 1
+
+      - name: "3. AWS credentials (read-only, one parameter)"
+        uses: aws-actions/configure-aws-credentials@ec61189d14ec14c8efccab744f656cffd0e33f37 # v6.1.0
+        with:
+          role-to-assume: arn:aws:iam::${{ secrets.AWS_ACCOUNT_ID }}:role/grug-gha-leak-guard
+          aws-region: us-east-1
+
+      - name: "4. Scan the PR diff"
         env:
           BASE_SHA: ${{ github.event.pull_request.base.sha }}
           HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+          # Path, not a secret. The VALUES are the secret, and they live only
+          # in this SecureString - never in this repo.
+          DENY_LIST: /grug/leak-guard-deny-list
         run: |
           set -euo pipefail
-          python3 scripts/check_private_leaks.py --diff "${BASE_SHA}..${HEAD_SHA}"
+          python3 scripts/check_private_leaks.py --diff "${BASE_SHA}..${HEAD_SHA}" --deny-list-ssm "${DENY_LIST}"
 
-      - name: "3. Scan the PR title and body"
+      - name: "5. Scan the PR title and body"
         # Through a FILE via env, never interpolated into the script: a PR body
         # is attacker-controlled text and `${{ }}` inside run: is a command
         # injection. Writing it out and scanning the file keeps it inert.
@@ -64,7 +112,10 @@ jobs:
         env:
           PR_TITLE: ${{ github.event.pull_request.title }}
           PR_BODY: ${{ github.event.pull_request.body }}
+          # Path, not a secret. The VALUES are the secret, and they live only
+          # in this SecureString - never in this repo.
+          DENY_LIST: /grug/leak-guard-deny-list
         run: |
           set -euo pipefail
           printf '%s\n%s\n' "$PR_TITLE" "$PR_BODY" > /tmp/pr-text.md
-          python3 scripts/check_private_leaks.py --text-file /tmp/pr-text.md
+          python3 scripts/check_private_leaks.py --text-file /tmp/pr-text.md --deny-list-ssm "${DENY_LIST}"

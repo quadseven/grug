@@ -29,6 +29,7 @@ from components import (
     dd_rum,
     ddb_table,
     kms_cmk,
+    leak_guard_role,
     oidc_role,
     ssm_secrets,
 )
@@ -130,6 +131,27 @@ _deploy_role_bundle = oidc_role.create(
     immutable_repo="quadseven@59060157/grug@1227364190",
 )
 gha_deploy_role = _deploy_role_bundle.role
+
+# Read-only OIDC role for the private-leaks guard (grug#921). Separate from the
+# deploy role ON PURPOSE: the guard runs on `pull_request`, and trusting the
+# deploy role from that subject would let anyone who can open a PR assume a
+# principal that writes SSM, IAM and S3. This one can read exactly one
+# parameter. The parameter NAME is public (it is a path); its VALUE - the
+# people/product/codename terms with no generic shape - is the thing being
+# protected and is pre-loaded by hand per docs/HITL_PREREQUISITES.md, the same
+# way every other secret in this stack is. Keep this constant in step with the
+# DENY_LIST env in .github/workflows/guard.private-leaks.yml; a test pins them
+# together (infra/pulumi/tests/test_leak_guard_role.py).
+LEAK_GUARD_DENY_LIST_PARAM = "/grug/leak-guard-deny-list"
+_leak_guard_bundle = leak_guard_role.create(
+    name="grug-gha-leak-guard",
+    deny_list_param=LEAK_GUARD_DENY_LIST_PARAM,
+    # Both OIDC subject shapes, same reason as the deploy role above: the
+    # ID-anchored form is what a real token carries after the 2026-07-18
+    # account rename; the name form is kept for any legacy token shape.
+    repos=["quadseven/grug", "quadseven@59060157/grug@1227364190"],
+)
+gha_leak_guard_role = _leak_guard_bundle.role
 # Sleep waiter that gates KMS-using Lambda Function ops on the deploy
 # role's IAM policy having propagated. Closes #88 — replaces workflow-
 # layer retry hack with in-IaC dependency edge.

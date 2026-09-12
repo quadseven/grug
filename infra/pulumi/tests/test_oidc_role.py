@@ -51,6 +51,10 @@ EXPECTED_SSM_READ_PATHS = {
 
 @pulumi.runtime.test
 def test_deploy_role_ssm_scope_is_exactly_the_pinned_set():
+    # Re-install THIS module's mocks: `set_mocks` is a single global slot, so
+    # another test module importing later would otherwise capture this
+    # component's resources into its own dict and leave `_CAPTURED` empty.
+    pulumi.runtime.set_mocks(_PulumiMocks())
     _CAPTURED.clear()
     bundle = oidc_role.create(
         name="grug-gha-deploy-test",
