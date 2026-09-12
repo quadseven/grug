@@ -51,7 +51,7 @@ const PERSONAS = [
   { id: "elder", code: "F-03", name: "Elder", img: "grug_elder.png", desc: "Read markings one line at a time. Name the bad omen before it bite. Lore + Omen fused.", meta: ["Cave review", "Markings Board"], modes: ["block", "warn", "off"] },
   { id: "chief", code: "F-04", name: "Chief", img: "grug_chief.png", desc: "Before the hunt, Chief ask: plan have name? meat counted? path home known?", meta: ["plan checks", "strict mode"], modes: ["block", "warn", "off"] },
   { id: "teller", code: "F-05", name: "Teller", img: "grug_smile.png", desc: "Tell the tale of the hunt before Elder judge. Walkthrough, map, effort chip.", meta: ["walkthrough", "mermaid"], modes: [], info: "comment-only" },
-  { id: "warder", code: "F-06", name: "Warder", img: "grug_mystic.png", desc: "Shaman at the gate. Changelog scroll, semver hint, ward bad release from tribe.", meta: ["beta", "release scroll"], modes: ["warn", "off"] },
+  { id: "warder", code: "F-06", name: "Warder", img: "grug_mystic.png", desc: "Shaman at the gate. Changelog scroll, semver hint, ward bad release from tribe.", meta: ["release scroll", "SLO gate"], modes: ["block", "warn", "off"] },
   { id: "pulse", code: "F-07", name: "Pulse", img: "grug_mullet.png", desc: "Walk the camp at night. Poke sleeping hunts Chief already blessed.", meta: ["stale nudge", "scheduled"], modes: [], info: "scheduled" },
   { id: "sentinel", code: "F-08", name: "Sentinel", img: "grug_guard.png", desc: "Watch hunts that end wrong. Name markings left unanswered when PR close or merge.", meta: ["abandoned findings", "safety net"], modes: [], info: "comment-only" },
 ] as const;

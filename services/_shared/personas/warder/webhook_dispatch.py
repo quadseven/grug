@@ -41,4 +41,5 @@ def dispatch_pull_request(ctx: PullRequestContext) -> dict[str, str]:
         repo_name=ctx.repo_name,
         head_sha=sha,
         pr_number=ctx.pr_number,
+        gate_blocking=ctx.blocking,
     )

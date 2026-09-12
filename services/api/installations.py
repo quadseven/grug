@@ -76,6 +76,9 @@ class RepoConfigPayload(BaseModel):
     guard_enabled: bool | None = Field(default=None)
     guard_blocking: bool | None = Field(default=None)
     warder_enabled: bool | None = Field(default=None)
+    # grug#533: SLO/monitor deploy-gate on Warder's release check. Advisory
+    # (neutral) when False; a breach fails the check-run when True.
+    warder_gate_blocking: bool | None = Field(default=None)
     sentinel_enabled: bool | None = Field(default=None)
     pulse_enabled: bool | None = Field(default=None)
     smasher_enabled: bool | None = Field(default=None)
@@ -465,6 +468,7 @@ def update_repo_config(
         guard_enabled=body.guard_enabled,
         guard_blocking=body.guard_blocking,
         warder_enabled=body.warder_enabled,
+        warder_gate_blocking=body.warder_gate_blocking,
         sentinel_enabled=body.sentinel_enabled,
         pulse_enabled=body.pulse_enabled,
         smasher_enabled=body.smasher_enabled,

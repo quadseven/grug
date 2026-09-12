@@ -221,6 +221,7 @@ _DEFAULT_PERSONA_CONFIG = {
     "guard_enabled": True,
     "guard_blocking": False,
     "warder_enabled": False,
+    "warder_gate_blocking": False,  # grug#533: SLO/monitor deploy-gate, advisory by default
     "sentinel_enabled": True,  # safety net, not an opt-in tracer (grug#721)
     "pulse_enabled": False,
     "smasher_enabled": False,  # execution tracer (#469): opt-in per repo
