@@ -301,6 +301,50 @@ def test_cave_carries_require_keys_json_schema_others_keep_json_object(monkeypat
     assert sent["anthropic/claude-opus-4.7"] == "json_object"
 
 
+def test_cave_and_poolside_disable_thinking_openrouter_untouched(monkeypatch):
+    """#894: production sends chat_template_kwargs.enable_thinking=False at
+    three llm_client.py call sites; the Cave bench backend didn't, so a
+    thinking model burns its whole completion budget reasoning under this
+    module's constrained json_schema decoder and comes back {"findings": []}
+    - a clean-looking review that scores as "found nothing", indistinguishable
+    from a model that genuinely found nothing. Poolside already carried the
+    switch (a real production incident); the Cave now matches it."""
+    from sast_benchmark import backends, runner
+
+    monkeypatch.setenv("GRUG_BENCH_OPENROUTER_KEY", "k")
+    monkeypatch.setenv("GRUG_BENCH_POOLSIDE_KEY", "p")
+    monkeypatch.setenv("GRUG_BENCH_CAVE_URL", "http://cave.example/v1/chat/completions")
+    monkeypatch.setenv("GRUG_BENCH_CAVE_MODEL", "qwen-coder")
+    configured = {b.name: b for b in backends.configured_backends()}
+
+    off = {"chat_template_kwargs": {"enable_thinking": False}}
+    assert configured["sparkles"].extra_body["chat_template_kwargs"] == off["chat_template_kwargs"]
+    assert configured["poolside"].extra_body["chat_template_kwargs"] == off["chat_template_kwargs"]
+    assert "chat_template_kwargs" not in configured["openrouter"].extra_body
+
+    # The Cave's response_format override survives sitting alongside it -
+    # two independent extra_body keys, not one clobbering the other.
+    assert configured["sparkles"].extra_body["response_format"]["type"] == "json_schema"
+
+    sent = {}
+
+    def _capture(url, json=None, headers=None, timeout=None):
+        sent[json["model"]] = json.get("chat_template_kwargs")
+
+        class _R:
+            status_code = 200
+
+        return _R()
+
+    monkeypatch.setattr(runner.httpx, "post", _capture)
+    runner._post(configured["sparkles"], [{"role": "user", "content": "x"}])
+    runner._post(configured["poolside"], [{"role": "user", "content": "x"}])
+    runner._post(configured["openrouter"], [{"role": "user", "content": "x"}])
+    assert sent["qwen-coder"] == {"enable_thinking": False}
+    assert sent[backends._POOLSIDE_DEFAULT_MODEL] == {"enable_thinking": False}
+    assert sent["anthropic/claude-opus-4.7"] is None
+
+
 # --- runner wiring (no real LLM) -------------------------------------------
 
 

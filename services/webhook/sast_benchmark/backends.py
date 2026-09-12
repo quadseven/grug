@@ -76,8 +76,14 @@ _OPENROUTER_EXTRA_BODY = {
 _FREE_TIER_OPENROUTER_REASONING = {"enabled": False}
 
 # Poolside's laguna-s-2.1 runs thinking ON by default (blew the read timeout +
-# broke JSON parse — see llm_client). Disable it for the benchmark too.
-_POOLSIDE_EXTRA_BODY = {"chat_template_kwargs": {"enable_thinking": False}}
+# broke JSON parse — see llm_client). Production sends this same switch at
+# three call sites in llm_client.py to keep it off; #894: the Cave backend
+# below needs it too, for the identical reason - a thinking model burns its
+# whole completion budget reasoning under this module's constrained
+# json_schema decoder and emits an empty findings list, which then scores as
+# a clean review that "found nothing" rather than as the truncation it is.
+_DISABLE_THINKING_EXTRA_BODY = {"chat_template_kwargs": {"enable_thinking": False}}
+_POOLSIDE_EXTRA_BODY = _DISABLE_THINKING_EXTRA_BODY
 
 # #544: the Cave's require-keys response schema. Ollama maps a bare
 # `{"type": "json_object"}` to `format=json`, which silently TRUNCATES
@@ -188,8 +194,15 @@ def configured_backends() -> list[BenchBackend]:
                 api_key=os.getenv("GRUG_BENCH_CAVE_KEY", ""),
                 # #544: extra_body lands AFTER the runner's default
                 # response_format in the POST body dict, so this replaces the
-                # truncation-prone json_object for the Cave only.
-                extra_body={"response_format": _CAVE_FINDINGS_RESPONSE_FORMAT},
+                # truncation-prone json_object for the Cave only. #894: also
+                # carries the same thinking-off switch production sends -
+                # without it, a thinking model spends its whole budget
+                # reasoning under this schema and comes back {"findings": []},
+                # which scores as a clean pass instead of the failure it is.
+                extra_body={
+                    "response_format": _CAVE_FINDINGS_RESPONSE_FORMAT,
+                    **_DISABLE_THINKING_EXTRA_BODY,
+                },
             )
         )
 
