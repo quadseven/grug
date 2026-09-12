@@ -145,6 +145,52 @@ def _fetch_pr_diff(
     return diff
 
 
+def _compare_is_clean_ancestor(
+    install_token: str, owner: str, repo: str, base_sha: str, head_sha: str,
+) -> bool:
+    """Whether `base_sha` is a clean ancestor of `head_sha` per GitHub's own
+    compare `status` (grug#845) - the only shape where `base_sha..head_sha`
+    is a real, reviewable delta rather than a diff between two unrelated
+    points in history. After a force-push, rebase or amend, `base_sha` can
+    stop being an ancestor of the PR's head; GitHub's compare endpoint still
+    answers with a real diff in that case (a "diverged" or "behind"
+    comparison), not an error, so nothing about a bare diff fetch reveals
+    it. This asks the SAME compare with the JSON media type, which - unlike
+    the diff media type - carries a `status` field.
+
+    Fail closed: any 4xx/5xx, a malformed body, or a `status` other than
+    "ahead" is NOT a clean ancestor - an unreadable status is not proof of
+    a clean history, so the caller falls back to the full PR diff exactly
+    as it already does for a compare that 404s/422s outright."""
+    try:
+        resp = httpx.get(
+            f"https://api.github.com/repos/{quote(owner, safe='')}/"
+            f"{quote(repo, safe='')}/compare/{quote(base_sha, safe='')}..."
+            f"{quote(head_sha, safe='')}",
+            headers={
+                "Authorization": f"Bearer {install_token}",
+                "Accept": "application/vnd.github+json",
+                "X-GitHub-Api-Version": "2022-11-28",
+            },
+            timeout=_DIFF_FETCH_TIMEOUT,
+        )
+    except httpx.RequestError:
+        return False
+    if resp.status_code >= 400:
+        return False
+    try:
+        body = resp.json()
+    except ValueError:
+        return False
+    if not isinstance(body, dict):
+        return False
+    # "ahead": base IS an ancestor, head has commits base lacks - the only
+    # trustworthy shape. "diverged" (both sides have commits the other
+    # lacks - exactly a force-push/rebase/amend) and "behind" (head is
+    # BEHIND base) both mean base is not a valid delta-review base point.
+    return body.get("status") == "ahead" and body.get("behind_by", 0) == 0
+
+
 def _fetch_pr_diff_with_scope(
     install_token: str,
     owner: str,
@@ -190,6 +236,25 @@ def _fetch_pr_diff_with_scope(
                 "pull_number": pull_number,
                 "status_code": resp.status_code,
             },
+        )
+        resp = httpx.get(
+            f"{repo_url}/pulls/{pull_number}",
+            headers=headers,
+            timeout=_DIFF_FETCH_TIMEOUT,
+        )
+        used_compare = False
+    elif used_compare and not _compare_is_clean_ancestor(
+        install_token, owner, repo, base_sha, head_sha,
+    ):
+        # grug#845: the diff-media-type compare above returned 200 with a
+        # REAL diff even though base is not an ancestor of head (diverged/
+        # rewritten history) - GitHub raises no error for this. Reviewing
+        # that diff would silently review the wrong code, reported as a
+        # partial review of the right code. Fall back to the full PR diff,
+        # same as the 404/422 branch above.
+        log.info(
+            "immutable_compare_diverged_falling_back",
+            extra={"owner": owner, "repo": repo, "pull_number": pull_number},
         )
         resp = httpx.get(
             f"{repo_url}/pulls/{pull_number}",
