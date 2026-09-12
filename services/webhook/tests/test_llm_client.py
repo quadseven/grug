@@ -3179,6 +3179,152 @@ def test_render_learnings_block_keeps_newest_when_truncated() -> None:
     assert "old rule 0" not in block  # oldest dropped by the count cap
 
 
+# --- in-repo agent guidelines (#674, FLINT pattern) -------------------------
+
+def _gh_raw_response(status_code: int, text: str = "") -> httpx.Response:
+    return httpx.Response(
+        status_code, text=text,
+        request=httpx.Request("GET", "https://api.github.com/repos/x/y/contents/z"),
+    )
+
+
+def test_fetch_guideline_files_skips_missing_and_keeps_found(monkeypatch) -> None:
+    monkeypatch.setattr("github_app_auth.get_install_token", lambda *a, **k: "fake-token")
+
+    def _fake_get(url, params=None, headers=None, timeout=None):
+        if url.endswith("CLAUDE.md"):
+            return _gh_raw_response(200, "never use bare except")
+        return _gh_raw_response(404)
+
+    with patch.object(httpx, "get", side_effect=_fake_get):
+        files = lc._fetch_guideline_files(1, "quadseven", "grug", "abc123")
+    assert files == {"CLAUDE.md": "never use bare except"}
+
+
+def test_fetch_guideline_files_one_transport_error_does_not_kill_the_rest(monkeypatch) -> None:
+    """Missing files = zero-cost no-op (#674 AC3): one candidate erroring
+    must not cost the others their fetch."""
+    monkeypatch.setattr("github_app_auth.get_install_token", lambda *a, **k: "fake-token")
+
+    def _fake_get(url, params=None, headers=None, timeout=None):
+        if url.endswith("CLAUDE.md"):
+            raise httpx.ConnectError("down")
+        if url.endswith("AGENTS.md"):
+            return _gh_raw_response(200, "prefer early returns")
+        return _gh_raw_response(404)
+
+    with patch.object(httpx, "get", side_effect=_fake_get):
+        files = lc._fetch_guideline_files(1, "quadseven", "grug", "abc123")
+    assert files == {"AGENTS.md": "prefer early returns"}
+
+
+def test_fetch_guideline_files_no_candidates_present_is_empty_dict(monkeypatch) -> None:
+    monkeypatch.setattr("github_app_auth.get_install_token", lambda *a, **k: "fake-token")
+    with patch.object(httpx, "get", return_value=_gh_raw_response(404)):
+        files = lc._fetch_guideline_files(1, "quadseven", "grug", "abc123")
+    assert files == {}
+
+
+def test_render_guidelines_block_bounded_and_sanitized() -> None:
+    files = {"CLAUDE.md": "never use bare except", "AGENTS.md": "   "}
+    block = lc._render_guidelines_block(files)
+    assert "TRIBE'S OWN CARVINGS" in block
+    assert "--- CLAUDE.md ---" in block
+    assert "never use bare except" in block
+    assert "AGENTS.md" not in block  # blank file skipped entirely
+
+
+def test_render_guidelines_block_empty_on_no_usable_files() -> None:
+    assert lc._render_guidelines_block({}) == ""
+    assert lc._render_guidelines_block({"CLAUDE.md": "   "}) == ""
+
+
+def test_render_guidelines_block_truncates_a_flood() -> None:
+    files = {"CLAUDE.md": "x" * 5000}
+    block = lc._render_guidelines_block(files)
+    assert "guidelines truncated" in block
+    assert len(block) < 2500
+
+
+def test_render_guidelines_block_deterministic_candidate_order() -> None:
+    # dict insertion order deliberately reversed from _GUIDELINE_CANDIDATES.
+    files = {"AGENTS.md": "b rule", "CLAUDE.md": "a rule"}
+    block = lc._render_guidelines_block(files)
+    assert block.index("a rule") < block.index("b rule")
+
+
+def test_repo_guidelines_block_empty_without_full_pr_context() -> None:
+    assert lc._repo_guidelines_block(None) == ""
+    assert lc._repo_guidelines_block({}) == ""
+    assert lc._repo_guidelines_block({"repo": "quadseven/grug"}) == ""
+    assert lc._repo_guidelines_block(
+        {"repo": "quadseven/grug", "installation_id": 1}
+    ) == ""  # no head_sha
+
+
+def test_repo_guidelines_block_fetch_failure_returns_empty(monkeypatch) -> None:
+    """Malformed/unreachable files never fail the review (#674 AC3)."""
+    def _boom(*a, **k):
+        raise RuntimeError("boom")
+
+    monkeypatch.setattr(lc, "_fetch_guideline_files", _boom)
+    out = lc._repo_guidelines_block(
+        {"repo": "quadseven/grug", "installation_id": 1, "head_sha": "abc123"}
+    )
+    assert out == ""
+
+
+def test_repo_guidelines_block_end_to_end(monkeypatch) -> None:
+    monkeypatch.setattr("github_app_auth.get_install_token", lambda *a, **k: "fake-token")
+
+    def _fake_get(url, params=None, headers=None, timeout=None):
+        if url.endswith("CLAUDE.md"):
+            return _gh_raw_response(200, "never use bare except")
+        return _gh_raw_response(404)
+
+    with patch.object(httpx, "get", side_effect=_fake_get):
+        block = lc._repo_guidelines_block(
+            {"repo": "quadseven/grug", "installation_id": 1, "head_sha": "abc123"}
+        )
+    assert "never use bare except" in block
+
+
+def test_review_system_prompt_places_guidelines_after_learnings() -> None:
+    """#674 precedence: a guideline must outrank a taught learning. Per
+    this prompt's own established recency=authority convention (see
+    `_review_system_prompt`'s comments), that means guidelines append
+    AFTER learnings, not before."""
+    system = lc._review_system_prompt(
+        "v2", voice="caveman", has_intent=False, review_map="",
+        team_practices="", few_shot_examples="",
+        learnings="WHAT YOUR TRIBE TOLD GRUG: some learning",
+        guidelines="TRIBE'S OWN CARVINGS: some guideline",
+    )
+    assert system.index("some learning") < system.index("some guideline")
+
+
+def test_review_system_prompt_omits_guidelines_block_when_empty() -> None:
+    system = lc._review_system_prompt(
+        "v2", voice="caveman", has_intent=False, review_map="",
+        team_practices="", few_shot_examples="", learnings="",
+    )
+    assert "CARVINGS" not in system
+
+
+def test_build_messages_threads_guidelines_into_the_system_prompt() -> None:
+    """#674 AC4 shape: a specific guideline rule reaches the actual prompt
+    the model receives, not just that some string was returned somewhere -
+    the distinguishing evidence a compliant reviewer needs is IN the
+    system message, exactly where a live model would read it."""
+    hunks = [Hunk(path="a.py", body="+x = 1")]
+    messages = lc._build_messages(
+        hunks, "v2",
+        guidelines="TRIBE'S OWN CARVINGS: never use bare except",
+    )
+    system = next(m["content"] for m in messages if m["role"] == "system")
+    assert "never use bare except" in system
+
+
 def test_summarize_pr_tolerates_missing_optional_fields() -> None:
     payload = json.dumps({"summary": "A small fix."})
     response = httpx.Response(200, json=_openai_json_response(payload))

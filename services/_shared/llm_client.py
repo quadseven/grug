@@ -1224,6 +1224,7 @@ def _review_system_prompt(
     team_practices: str,
     few_shot_examples: str,
     learnings: str,
+    guidelines: str = "",
 ) -> str:
     """Compose trusted review instructions separately from repository data."""
     # Redact secret-shaped values from the diff + file context BEFORE they reach
@@ -1256,12 +1257,18 @@ def _review_system_prompt(
     # repo-specific rationale as team_practices.
     if few_shot_examples:
         system = f"{system}\n\n{few_shot_examples}"
-    # Operator-taught learnings (#670, ADR-0020) append LAST: practices and
-    # examples are what Grug inferred; learnings are what the team explicitly
-    # told Grug, so they get the final, strongest word. Same call-time,
-    # repo-specific rationale as team_practices.
+    # Operator-taught learnings (#670, ADR-0020): practices and examples are
+    # what Grug inferred; learnings are what the team explicitly told Grug.
+    # Same call-time, repo-specific rationale as team_practices.
     if learnings:
         system = f"{system}\n\n{learnings}"
+    # In-repo agent guidelines (#674, FLINT pattern) append LAST, after
+    # learnings: CLAUDE.md/AGENTS.md/etc. are the repo's own versioned,
+    # team-authored standard, and outrank a one-off taught preference that
+    # may be stale or narrowly scoped - see `_repo_guidelines_block`'s
+    # docstring for the precedence statement given to the model itself.
+    if guidelines:
+        system = f"{system}\n\n{guidelines}"
     return system
 
 
@@ -1274,6 +1281,7 @@ def _build_messages(
     team_practices: str = "",
     few_shot_examples: str = "",
     learnings: str = "",
+    guidelines: str = "",
     pr_context: Optional[PrContext] = None,
     voice: VoiceSelection = "caveman",
     review_map: str = "",
@@ -1294,6 +1302,7 @@ def _build_messages(
         team_practices=team_practices,
         few_shot_examples=few_shot_examples,
         learnings=learnings,
+        guidelines=guidelines,
     )
     return [
         {"role": "system", "content": system},
@@ -2343,6 +2352,124 @@ def _render_learnings_block(rows: list[dict[str, Any]], *, max_chars: int = 1400
     )
 
 
+def _repo_guidelines_block(pr_context: Optional[PrContext]) -> str:
+    """Fetch + render the repo's own in-repo agent-guideline files for the
+    prompt (#674, FLINT pattern): CLAUDE.md, AGENTS.md, .cursorrules,
+    .github/copilot-instructions.md, .windsurfrules. Repos in this fleet
+    already encode team standards in these files for coding agents; without
+    this, Elder ignores them and re-derives (or contradicts) the same rules.
+
+    Best-effort: any failure (no repo, no install id, no files present,
+    fetch error) returns "" so the review runs without them - a missing or
+    unreadable guideline file must never fail a review."""
+    if not pr_context or "repo" not in pr_context or "installation_id" not in pr_context:
+        return ""
+    repo = str(pr_context["repo"])
+    if "/" not in repo:
+        return ""
+    owner, repo_name = repo.split("/", 1)
+    ref = str(pr_context.get("head_sha", ""))
+    if not ref:
+        return ""
+    try:
+        files = _fetch_guideline_files(
+            int(pr_context["installation_id"]), owner, repo_name, ref,
+        )
+        if not files:
+            return ""
+        return _render_guidelines_block(files)
+    except Exception as e:  # noqa: BLE001 - guidelines never break a review, but log
+        log.warning("repo_guidelines_fetch_failed", extra={
+            "repo": repo, "kind": type(e).__name__})
+        return ""
+
+
+# Checked in this fixed order so a repo carrying more than one renders
+# deterministically across runs. Candidate list is deliberately closed (#674
+# out of scope: no operator-configurable path) - the FLINT pattern is these
+# five well-known conventions, not an arbitrary glob.
+_GUIDELINE_CANDIDATES = (
+    "CLAUDE.md", "AGENTS.md", ".cursorrules",
+    ".github/copilot-instructions.md", ".windsurfrules",
+)
+_GUIDELINE_FETCH_TIMEOUT = 10.0
+
+
+def _fetch_guideline_files(
+    installation_id: int, owner: str, repo: str, ref: str,
+) -> dict[str, str]:
+    """Fetch whichever of `_GUIDELINE_CANDIDATES` exist at `ref`. Per-file
+    best-effort (mirrors `dispatch._fetch_file_contents`'s contract, not
+    imported from it - llm_client must not import the persona layer): a
+    404/binary/timeout on one candidate is skipped, never raised, so one
+    unreadable file cannot cost the others."""
+    from urllib.parse import quote
+
+    from github_app_auth import with_install_token_retry  # type: ignore
+
+    def _do(token: str) -> dict[str, str]:
+        found: dict[str, str] = {}
+        for path in _GUIDELINE_CANDIDATES:
+            try:
+                resp = httpx.get(
+                    f"https://api.github.com/repos/{owner}/{repo}/contents/"
+                    f"{quote(path, safe='/')}",
+                    params={"ref": ref},
+                    headers={
+                        "Authorization": f"Bearer {token}",
+                        "Accept": "application/vnd.github.raw",
+                        "X-GitHub-Api-Version": "2022-11-28",
+                    },
+                    timeout=_GUIDELINE_FETCH_TIMEOUT,
+                )
+                resp.raise_for_status()
+                found[path] = resp.text
+            except (httpx.HTTPStatusError, httpx.RequestError):
+                continue
+        return found
+
+    return with_install_token_retry(installation_id, _do) or {}
+
+
+# Bounded like the diff cap (#609): a guideline file can be arbitrarily long,
+# and this rides the SYSTEM prompt on every review in the repo, not just
+# once. Truncation is stated in the block itself so a reader (human or
+# model) never mistakes a cut file for its whole content.
+_MAX_GUIDELINES_CHARS = 2000
+
+
+def _strip_control_chars(text: str) -> str:
+    """Drop control characters (a fake-message-boundary injection vector,
+    #541 LORE) while KEEPING newlines/tabs - unlike `best_practices._sanitize`
+    (built for one single-line, 220-char-capped ledger rule), a guideline
+    file is meant to be read as structured prose/markdown, and
+    `_MAX_GUIDELINES_CHARS` below bounds its length instead."""
+    return "".join(c for c in text if c.isprintable() or c in "\n\t")
+
+
+def _render_guidelines_block(files: dict[str, str]) -> str:
+    """Render detected guideline files as one bounded, sanitized prompt
+    block (#674). Pure (no IO). Iterates `_GUIDELINE_CANDIDATES` order so
+    output is deterministic regardless of dict/fetch ordering."""
+    sections: list[str] = []
+    for path in _GUIDELINE_CANDIDATES:
+        text = files.get(path, "").strip()
+        if not text:
+            continue
+        sections.append(f"--- {path} ---\n{_strip_control_chars(_redact_secrets(text))}")
+    if not sections:
+        return ""
+    body = "\n\n".join(sections)
+    if len(body) > _MAX_GUIDELINES_CHARS:
+        body = body[:_MAX_GUIDELINES_CHARS].rstrip() + "\n... (guidelines truncated)"
+    return (
+        "TRIBE'S OWN CARVINGS (this repo's own agent-guideline files - "
+        "versioned, team-authored standards; if one of these conflicts with "
+        "a taught preference above, follow the carving - it is the current, "
+        "official word):\n\n" + body
+    )
+
+
 def _team_practices_block(pr_context: Optional[PrContext]) -> str:
     """Fetch + render the repo's cached best-practices for the prompt (#527).
     Best-effort: any failure (no repo, store down, none derived) returns ""
@@ -2986,6 +3113,7 @@ def _review_reasoner_diff_once(
         team_practices=_team_practices_block(pr_context),
         few_shot_examples=_few_shot_block(pr_context),
         learnings=_repo_learnings_block(pr_context),
+        guidelines=_repo_guidelines_block(pr_context),
         pr_context=pr_context,
         voice=voice,
         review_map=review_map,
@@ -3748,6 +3876,7 @@ def _review_diff_dispatch(
             team_practices=_team_practices_block(pr_context),
             few_shot_examples=_few_shot_block(pr_context),
             learnings=_repo_learnings_block(pr_context),
+            guidelines=_repo_guidelines_block(pr_context),
             pr_context=pr_context,
             voice=voice,
             review_map=review_map,
@@ -3796,6 +3925,7 @@ def _review_diff_dispatch_cave_primary(
         team_practices=_team_practices_block(pr_context),
         few_shot_examples=_few_shot_block(pr_context),
         learnings=_repo_learnings_block(pr_context),
+        guidelines=_repo_guidelines_block(pr_context),
         pr_context=pr_context,
         voice=voice,
         review_map=review_map,
