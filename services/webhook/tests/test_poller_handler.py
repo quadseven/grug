@@ -28,22 +28,18 @@ def _wire(monkeypatch, *, installs, records_for, retry, poll):
     # GitHub and their exact-result assertions stay about the reaction poll.
     monkeypatch.setattr(poller_handler, "_replay_missed_deliveries", lambda: {})
     # #472: default the Pulse pass to idle (no enabled repos) so the
-    # reaction-poll assertions stay about the reaction poll.
-    monkeypatch.setattr(
-        "adapters.install_store.list_pulse_enabled_repos", lambda iid: [],
-    )
-    monkeypatch.setattr(
-        "adapters.install_store.list_dep_watch_repos", lambda iid: [],
-    )
+    # reaction-poll assertions stay about the reaction poll. grug#767:
+    # patched on poller_handler's OWN namespace - the four store-driven
+    # passes import their lister at module scope (not lazily inside the
+    # loop like before extraction), same reasoning already documented
+    # below for the check-run reconcile pass.
+    monkeypatch.setattr(poller_handler, "list_pulse_enabled_repos", lambda iid: [])
+    monkeypatch.setattr(poller_handler, "list_dep_watch_repos", lambda iid: [])
     # 2026-07-24: default the reopen-watch pass to idle (no enabled repos)
     # so the reaction-poll assertions stay about the reaction poll.
-    monkeypatch.setattr(
-        "adapters.install_store.list_reopen_watch_repos", lambda iid: [],
-    )
+    monkeypatch.setattr(poller_handler, "list_reopen_watch_repos", lambda iid: [])
     # #655: same, for the hygiene-watch pass.
-    monkeypatch.setattr(
-        "adapters.install_store.list_hygiene_watch_repos", lambda iid: [],
-    )
+    monkeypatch.setattr(poller_handler, "list_hygiene_watch_repos", lambda iid: [])
     # grug#947: same, for the check-run reconcile pass. Patched on the
     # reconciler's OWN module namespace - it imports the name at module
     # scope (not lazily inside a function like the passes above), so
@@ -139,12 +135,8 @@ def test_poller_skips_installs_with_no_records(monkeypatch):
     acquire one token per install by design - its GitHub repo listing is
     the denominator - so exactly one retry call remains."""
     touched = []
-    monkeypatch.setattr(
-        "adapters.install_store.list_pulse_enabled_repos", lambda iid: [],
-    )
-    monkeypatch.setattr(
-        "adapters.install_store.list_dep_watch_repos", lambda iid: [],
-    )
+    monkeypatch.setattr(poller_handler, "list_pulse_enabled_repos", lambda iid: [])
+    monkeypatch.setattr(poller_handler, "list_dep_watch_repos", lambda iid: [])
     _wire(
         monkeypatch,
         installs=[7],
@@ -155,6 +147,129 @@ def test_poller_skips_installs_with_no_records(monkeypatch):
     out = poller_handler.handler({}, None)
     assert touched == [7]   # the enforcement pass's single token acquisition
     assert out == {"installs": 1, "records": 0, "submitted": 0, "failed_installs": 0, "pulse_nudges": 0, "pulse_failed_installs": 0, "dep_watch_reports": 0, "dep_watch_failed_installs": 0, "reopen_watch_escalated": 0, "reopen_watch_failed_installs": 0, "hygiene_watch_reports": 0, "hygiene_watch_failed_installs": 0, "check_run_reconciled": 0, "check_run_reconcile_failed_installs": 0, "enforcement_emitted": 0, "enforcement_failed_installs": 0}
+
+
+# --- grug#767: per-pass isolation --------------------------------------------
+# `_run_repo_scoped_pass` is the shared mechanism behind pulse/dep_watch/
+# reopen_watch/hygiene_watch; acceptance #4 wants this proven per pass
+# rather than by one generic all-fail test - each one here patches ONLY
+# that pass's own lister + runner (via poller_handler's module namespace,
+# where the shared helper's `Callable` params are resolved) so a failure
+# in one pass cannot be confused with a failure in another, and confirms
+# install 2 still runs despite install 1's runner blowing up.
+
+def _idle_wire(monkeypatch, *, installs):
+    """Base wiring with every store-driven pass idle - callers then
+    override exactly the one pass under test."""
+    _wire(
+        monkeypatch, installs=installs, records_for=lambda iid: [],
+        retry=lambda iid, fn: fn("tok"), poll=lambda *a, **k: 0,
+    )
+
+
+def test_pulse_pass_one_install_failure_does_not_abort_the_others(monkeypatch):
+    _idle_wire(monkeypatch, installs=[1, 2])
+    monkeypatch.setattr(
+        poller_handler, "list_pulse_enabled_repos",
+        lambda iid: [{"id": iid, "full_name": f"o/r{iid}"}],
+    )
+
+    def _runner(token, install_id, repos):
+        if install_id == 1:
+            raise RuntimeError("pulse boom")
+        return 3, 0
+    monkeypatch.setattr(poller_handler, "_pulse_runner", _runner)
+
+    out = poller_handler.handler({}, None)
+    assert out["pulse_nudges"] == 3            # install 2 still ran
+    assert out["pulse_failed_installs"] == 1   # install 1 counted, not silently dropped
+    # unaffected: no cross-talk into the other passes' counters
+    assert out["dep_watch_failed_installs"] == 0
+    assert out["reopen_watch_failed_installs"] == 0
+    assert out["hygiene_watch_failed_installs"] == 0
+
+
+def test_dep_watch_pass_one_install_failure_does_not_abort_the_others(monkeypatch):
+    _idle_wire(monkeypatch, installs=[1, 2])
+    monkeypatch.setattr(
+        poller_handler, "list_dep_watch_repos",
+        lambda iid: [{"id": iid, "full_name": f"o/r{iid}"}],
+    )
+
+    def _runner(token, install_id, repos):
+        if install_id == 1:
+            raise RuntimeError("dep_watch boom")
+        return 2, 0
+    monkeypatch.setattr(poller_handler, "_dep_watch_runner", _runner)
+
+    out = poller_handler.handler({}, None)
+    assert out["dep_watch_reports"] == 2
+    assert out["dep_watch_failed_installs"] == 1
+    assert out["pulse_failed_installs"] == 0
+    assert out["reopen_watch_failed_installs"] == 0
+    assert out["hygiene_watch_failed_installs"] == 0
+
+
+def test_reopen_watch_pass_one_install_failure_does_not_abort_the_others(monkeypatch):
+    _idle_wire(monkeypatch, installs=[1, 2])
+    monkeypatch.setattr(
+        poller_handler, "list_reopen_watch_repos",
+        lambda iid: [{"id": iid, "full_name": f"o/r{iid}"}],
+    )
+
+    def _runner(token, install_id, repos):
+        if install_id == 1:
+            raise RuntimeError("reopen_watch boom")
+        return 4, 0
+    monkeypatch.setattr(poller_handler, "_reopen_watch_runner", _runner)
+
+    out = poller_handler.handler({}, None)
+    assert out["reopen_watch_escalated"] == 4
+    assert out["reopen_watch_failed_installs"] == 1
+    assert out["pulse_failed_installs"] == 0
+    assert out["dep_watch_failed_installs"] == 0
+    assert out["hygiene_watch_failed_installs"] == 0
+
+
+def test_hygiene_watch_pass_one_install_failure_does_not_abort_the_others(monkeypatch):
+    _idle_wire(monkeypatch, installs=[1, 2])
+    monkeypatch.setattr(
+        poller_handler, "list_hygiene_watch_repos",
+        lambda iid: [{"id": iid, "full_name": f"o/r{iid}"}],
+    )
+
+    def _runner(token, install_id, repos):
+        if install_id == 1:
+            raise RuntimeError("hygiene_watch boom")
+        return 1, 0
+    monkeypatch.setattr(poller_handler, "_hygiene_watch_runner", _runner)
+
+    out = poller_handler.handler({}, None)
+    assert out["hygiene_watch_reports"] == 1
+    assert out["hygiene_watch_failed_installs"] == 1
+    assert out["pulse_failed_installs"] == 0
+    assert out["dep_watch_failed_installs"] == 0
+    assert out["reopen_watch_failed_installs"] == 0
+
+
+def test_run_repo_scoped_pass_skips_installs_the_lister_has_nothing_for(monkeypatch):
+    """The shared helper itself, isolated from any real pass: an install
+    with no opted-in repos costs no runner call at all."""
+    monkeypatch.setattr(poller_handler, "with_install_token_retry", lambda iid, fn: fn("tok"))
+    calls = []
+
+    def runner(token, install_id, repos):
+        calls.append(install_id)
+        return 1, 0
+
+    done, failed = poller_handler._run_repo_scoped_pass(
+        [1, 2],
+        lister=lambda iid: [{"id": iid}] if iid == 2 else [],
+        runner=runner,
+        failed_log_event="unit_test_pass_failed",
+    )
+    assert calls == [2]
+    assert (done, failed) == (1, 0)
 
 
 # --- #407: auto-replay wiring -----------------------------------------------
