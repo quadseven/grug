@@ -66,7 +66,7 @@ from personas.code_reviewer.claim_check import (
     scan_claim_checks,
 )
 from personas import board
-from personas.code_reviewer.complexity import scan_complexity
+from personas.code_reviewer.complexity import ComplexityScan, scan_complexity_full
 from personas.code_reviewer.lint import scan_ruff
 from personas.code_reviewer.cross_file import (
     extract_symbols, fetch_cross_file_context,
@@ -2409,7 +2409,7 @@ def dispatch_code_review(
     # judge (it is precise by construction). It rides the SAME merge rule as the
     # SAST suite; MEDIUM means it never blocks a merge on its own.
     try:
-        complexity_findings = scan_complexity(
+        complexity_scan = scan_complexity_full(
             hunks, file_contents,
             base_contents=base_file_contents or None,
         )
@@ -2418,15 +2418,29 @@ def dispatch_code_review(
             "code_review_complexity_scan_failed",
             extra={"pr": f"{owner}/{repo_name}#{pull_number}", "kind": type(e).__name__},
         )
-        complexity_findings = ()
-    if complexity_findings:
-        evaluation = with_extra_findings(evaluation, complexity_findings)
+        complexity_scan = ComplexityScan(findings=(), suppressed=())
+    if complexity_scan.findings:
+        evaluation = with_extra_findings(evaluation, complexity_scan.findings)
         log.info(
             "code_review_complexity_findings",
             extra={
                 "installation_id": installation_id,
                 "pr": f"{owner}/{repo_name}#{pull_number}",
-                "count": len(complexity_findings),
+                "count": len(complexity_scan.findings),
+            },
+        )
+    if complexity_scan.suppressed:
+        # #781: the regression gate held these back (over cap, but this PR
+        # did not make them worse) - a structured count so the #707
+        # scoreboard can measure how many markings the gate removes, the
+        # same way judge_suppressed_findings tracks the judge's own gate.
+        log.info(
+            "code_review_complexity_suppressed",
+            extra={
+                "installation_id": installation_id,
+                "pr": f"{owner}/{repo_name}#{pull_number}",
+                "suppressed": len(complexity_scan.suppressed),
+                "published": len(complexity_scan.findings),
             },
         )
 

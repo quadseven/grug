@@ -18,6 +18,7 @@ from __future__ import annotations
 
 import ast
 import os
+from dataclasses import dataclass
 
 from personas.code_reviewer.diff_parser import DiffHunk
 from personas.code_reviewer.persona import Finding
@@ -47,6 +48,27 @@ _REGRESSION_CYCLO = _cap_env("GRUG_COMPLEXITY_REGRESSION_CYCLO", 3)
 _REGRESSION_COG = _cap_env("GRUG_COMPLEXITY_REGRESSION_COG", 5)
 
 _RULE = "high-complexity"
+
+
+@dataclass(frozen=True)
+class SuppressedComplexity:
+    """A function the regression gate held back (#781): over cap, but this PR
+    did not make it worse. Exists so the caller can log a count distinct from
+    published findings - the #707 scoreboard has no way to measure how many
+    markings the gate removes without one."""
+
+    file: str
+    function: str
+    cyclomatic: int
+    cognitive: int
+    base_cyclomatic: int
+    base_cognitive: int
+
+
+@dataclass(frozen=True)
+class ComplexityScan:
+    findings: tuple[Finding, ...]
+    suppressed: tuple[SuppressedComplexity, ...]
 
 
 def _changed_lines(hunk: DiffHunk) -> set[int]:
@@ -198,7 +220,7 @@ def _scan_one_file(
     path: str, source: str, changed_lines: set[int],
     base: dict[str, tuple[int, int]], had_base: bool,
     cyclo_cap: int, cog_cap: int,
-) -> list[Finding]:
+) -> tuple[list[Finding], list[SuppressedComplexity]]:
     """Findings for one file. Split out of `scan_complexity` because that
     function tripped its OWN cap once the regression gate landed (19/30 vs
     16/26 on main) - a complexity rule that cannot pass its own rule is not
@@ -206,9 +228,10 @@ def _scan_one_file(
     try:
         tree = ast.parse(source)
     except (SyntaxError, ValueError):
-        return []  # unparseable (partial file, py2, generated) -> skip
+        return [], []  # unparseable (partial file, py2, generated) -> skip
 
     out: list[Finding] = []
+    suppressed: list[SuppressedComplexity] = []
     for node in ast.walk(tree):
         if not isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
             continue
@@ -223,6 +246,14 @@ def _scan_one_file(
 
         base_cyclo, base_cog = base.get(node.name, (None, None))
         if not _is_regression(base_cyclo, base_cog, cyclo, cog, cyclo_cap, cog_cap):
+            # Only a function WITH a base can land here (no base -> _is_regression
+            # always True), so base_cyclo/base_cog are never None here.
+            assert base_cyclo is not None and base_cog is not None
+            suppressed.append(SuppressedComplexity(
+                file=path, function=node.name,
+                cyclomatic=cyclo, cognitive=cog,
+                base_cyclomatic=base_cyclo, base_cognitive=base_cog,
+            ))
             continue
 
         over = []
@@ -244,18 +275,19 @@ def _scan_one_file(
             suggestion=None,
             effort="heavy-lift",
         ))
-    return out
+    return out, suppressed
 
 
-def scan_complexity(
+def scan_complexity_full(
     hunks: tuple[DiffHunk, ...],
     file_contents: dict[str, str],
     *,
     cyclomatic_cap: int | None = None,
     cognitive_cap: int | None = None,
     base_contents: dict[str, str] | None = None,
-) -> tuple[Finding, ...]:
-    """Advisory Findings for functions THIS PR pushed over a complexity cap.
+) -> ComplexityScan:
+    """Advisory Findings for functions THIS PR pushed over a complexity cap,
+    plus the functions the regression gate held back (#781).
 
     Only functions whose span overlaps a changed line are scanned, and the
     finding anchors on the smallest changed line inside the function so it
@@ -268,7 +300,10 @@ def scan_complexity(
     baseline, on a function it had not touched (#767). An adversarial audit of
     the last 120 findings put this rule at 85 of them, 71% of all output, with
     most replies saying "pre-existing". With `base_contents`, only a crossed
-    cap, a material worsening, or a new over-cap function is published.
+    cap, a material worsening, or a new over-cap function is published; the
+    rest come back as `suppressed` so the caller can log a count (#781) -
+    the #707 scoreboard otherwise has no way to measure how many markings
+    this gate removes.
 
     Pure: no IO.
     """
@@ -278,13 +313,33 @@ def scan_complexity(
         path: _score_functions(src) for path, src in (base_contents or {}).items()
     }
     findings: list[Finding] = []
+    suppressed: list[SuppressedComplexity] = []
     for path, changed_lines in _changed_by_file(hunks).items():
         source = file_contents.get(path)
         if not path.endswith(".py") or not changed_lines or not source:
             continue
-        findings.extend(_scan_one_file(
+        file_findings, file_suppressed = _scan_one_file(
             path, source, changed_lines,
             base_scores.get(path, {}), bool(base_scores),
             cyclo_cap, cog_cap,
-        ))
-    return tuple(findings)
+        )
+        findings.extend(file_findings)
+        suppressed.extend(file_suppressed)
+    return ComplexityScan(findings=tuple(findings), suppressed=tuple(suppressed))
+
+
+def scan_complexity(
+    hunks: tuple[DiffHunk, ...],
+    file_contents: dict[str, str],
+    *,
+    cyclomatic_cap: int | None = None,
+    cognitive_cap: int | None = None,
+    base_contents: dict[str, str] | None = None,
+) -> tuple[Finding, ...]:
+    """Findings-only view of `scan_complexity_full`, kept for callers that
+    don't need suppression visibility. Pure: no IO."""
+    return scan_complexity_full(
+        hunks, file_contents,
+        cyclomatic_cap=cyclomatic_cap, cognitive_cap=cognitive_cap,
+        base_contents=base_contents,
+    ).findings
