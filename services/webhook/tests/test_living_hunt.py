@@ -87,6 +87,121 @@ def test_fetch_pr_diff_scope_reports_full_fallback(monkeypatch):
     ]
 
 
+def test_fetch_pr_diff_scope_zippie_127_diverged_baseline_falls_back(monkeypatch):
+    """grug#845, reproduced live on quadseven/zippie PR #127 and verified
+    independently against the GitHub compare API: a diff-media-type
+    compare between a non-ancestor base and the PR head returns 200 with a
+    REAL (but wrong) diff - nothing about that response says the history
+    diverged. Using the recorded compare response
+    (`GET .../compare/4dbd2011...2a913a31` -> `status: diverged, ahead_by:
+    18, behind_by: 2`) rather than a live call, per acceptance criterion 2."""
+    responses = [
+        # 1. the diff-media-type compare "succeeds" with a real diff of
+        #    unrelated history - exactly what fooled the caller before this
+        #    fix (it names files nowhere in the actual PR).
+        httpx.Response(
+            200,
+            text="diff --git a/companion-android/x.kt b/companion-android/x.kt\n...",
+            request=httpx.Request("GET", "https://compare-diff"),
+        ),
+        # 2. the JSON-media-type re-check on the SAME range - the recorded
+        #    zippie #127 response.
+        httpx.Response(
+            200,
+            json={"status": "diverged", "ahead_by": 18, "behind_by": 2},
+            request=httpx.Request("GET", "https://compare-json"),
+        ),
+        # 3. fallback: the ordinary mutable PR diff.
+        httpx.Response(
+            200, text="the real PR #127 diff",
+            request=httpx.Request("GET", "https://pull"),
+        ),
+    ]
+    requested_urls: list[str] = []
+
+    def fake_get(url: str, **_kwargs):
+        requested_urls.append(url)
+        return responses.pop(0)
+
+    monkeypatch.setattr(cr_dispatch.httpx, "get", fake_get)
+
+    diff, used_compare = cr_dispatch._fetch_pr_diff_with_scope(
+        "token", "quadseven", "zippie", 127,
+        base_sha="4dbd2011", head_sha="2a913a31",
+    )
+
+    assert diff == "the real PR #127 diff"
+    assert used_compare is False   # rejected baseline - never silently trusted
+    assert requested_urls == [
+        "https://api.github.com/repos/quadseven/zippie/compare/4dbd2011...2a913a31",
+        "https://api.github.com/repos/quadseven/zippie/compare/4dbd2011...2a913a31",
+        "https://api.github.com/repos/quadseven/zippie/pulls/127",
+    ]
+
+
+def test_fetch_pr_diff_scope_behind_baseline_falls_back(monkeypatch):
+    """A base AHEAD of head (status: behind) is just as unusable as
+    diverged - head moved backward relative to the stored pointer, which
+    should never happen for an honest git history but must still degrade
+    safely rather than being trusted."""
+    responses = [
+        httpx.Response(200, text="wrong diff", request=httpx.Request("GET", "https://compare-diff")),
+        httpx.Response(
+            200, json={"status": "behind", "ahead_by": 0, "behind_by": 3},
+            request=httpx.Request("GET", "https://compare-json"),
+        ),
+        httpx.Response(200, text="full diff", request=httpx.Request("GET", "https://pull")),
+    ]
+    monkeypatch.setattr(cr_dispatch.httpx, "get", lambda url, **kw: responses.pop(0))
+
+    diff, used_compare = cr_dispatch._fetch_pr_diff_with_scope(
+        "token", "owner", "repo", 7, base_sha="abc", head_sha="def",
+    )
+    assert diff == "full diff"
+    assert used_compare is False
+
+
+def test_fetch_pr_diff_scope_clean_ahead_baseline_uses_compare(monkeypatch):
+    """The happy path is unchanged: a genuine ancestor base (status: ahead,
+    behind_by: 0) still returns the scoped delta diff, not the full PR."""
+    responses = [
+        httpx.Response(200, text="the real delta diff", request=httpx.Request("GET", "https://compare-diff")),
+        httpx.Response(
+            200, json={"status": "ahead", "ahead_by": 3, "behind_by": 0},
+            request=httpx.Request("GET", "https://compare-json"),
+        ),
+    ]
+    monkeypatch.setattr(cr_dispatch.httpx, "get", lambda url, **kw: responses.pop(0))
+
+    diff, used_compare = cr_dispatch._fetch_pr_diff_with_scope(
+        "token", "owner", "repo", 7, base_sha="abc", head_sha="def",
+    )
+    assert diff == "the real delta diff"
+    assert used_compare is True
+
+
+def test_compare_is_clean_ancestor_fails_closed_on_transport_error(monkeypatch):
+    """An unreadable status is not proof of a clean history - a compare
+    that cannot even be checked must never be trusted."""
+    def _raise(url, **kw):
+        raise httpx.ConnectTimeout("gh down", request=httpx.Request("GET", url))
+
+    monkeypatch.setattr(cr_dispatch.httpx, "get", _raise)
+    assert cr_dispatch._compare_is_clean_ancestor(
+        "token", "owner", "repo", "abc", "def",
+    ) is False
+
+
+def test_compare_is_clean_ancestor_fails_closed_on_malformed_body(monkeypatch):
+    monkeypatch.setattr(
+        cr_dispatch.httpx, "get",
+        lambda url, **kw: httpx.Response(200, text="not json", request=httpx.Request("GET", url)),
+    )
+    assert cr_dispatch._compare_is_clean_ancestor(
+        "token", "owner", "repo", "abc", "def",
+    ) is False
+
+
 def test_elder_last_sk_is_stable():
     from adapters.pg_install_store import _elder_last_sk
 
