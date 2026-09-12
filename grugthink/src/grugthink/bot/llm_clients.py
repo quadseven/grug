@@ -321,6 +321,17 @@ _OPENROUTER_URL = "https://openrouter.ai/api/v1/chat/completions"
 _OPENROUTER_MODEL = "anthropic/claude-haiku-4.5"
 
 
+def _extract_chat_message(body: dict) -> str:
+    """The assistant message text from an OpenAI-compatible chat-completions
+    body, or "" if the shape is missing/malformed. Pure - split out of
+    _query_saas_fallback (grug#632) purely to shed one branch from that
+    function's own complexity score; no behavior change."""
+    choices = body.get("choices") or []
+    if choices and isinstance(choices[0], dict):
+        return ((choices[0].get("message") or {}).get("content") or "").strip()
+    return ""
+
+
 def _query_saas_fallback(
     backend: str,
     url: str,
@@ -362,11 +373,7 @@ def _query_saas_fallback(
             # the module-level timeout comment above for the full math.
             r = session.post(url, json=payload, headers=headers, timeout=_FALLBACK_TIMEOUT)
             if r.status_code == 200:
-                body = r.json()
-                choices = body.get("choices") or []
-                response = ""
-                if choices and isinstance(choices[0], dict):
-                    response = ((choices[0].get("message") or {}).get("content") or "").strip()
+                response = _extract_chat_message(r.json())
                 log.info(
                     "saas_fallback_response_received",
                     extra={
