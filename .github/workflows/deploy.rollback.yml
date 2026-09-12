@@ -26,20 +26,23 @@ jobs:
     timeout-minutes: 15
     environment: k8s-prod
     steps:
+      # grug#735: this job previously did no checkout at all - it needs
+      # none of its OWN logic (pure digest re-apply + kubectl), but a
+      # LOCAL composite action (./.github/actions/...) can only resolve
+      # from a checked-out workspace. The added clone is a few seconds
+      # against a 15-minute budget; the alternative was leaving this one
+      # job's bootstrap un-deduplicated.
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+
       - name: Join tailnet (ephemeral)
-        uses: tailscale/github-action@306e68a486fd2350f2bfc3b19fcd143891a4a2d8 # v4
+        uses: ./.github/actions/join-tailnet
         with:
           authkey: ${{ secrets.TS_AUTHKEY }}
-          tags: tag:ci
-          use-cache: 'true'
 
       - name: Write kubeconfig
-        env:
-          KUBECONFIG_B64: ${{ secrets.KUBECONFIG_B64 }}
-        run: |
-          install -m 700 -d "$HOME/.kube"
-          echo "$KUBECONFIG_B64" | base64 -d > "$HOME/.kube/config"
-          chmod 600 "$HOME/.kube/config"
+        uses: ./.github/actions/write-kubeconfig
+        with:
+          kubeconfig-b64: ${{ secrets.KUBECONFIG_B64 }}
 
       - name: Re-apply last-good digests
         run: |

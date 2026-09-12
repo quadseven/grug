@@ -55,13 +55,11 @@ jobs:
       - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
 
       - name: Join tailnet (ephemeral)
-        uses: tailscale/github-action@306e68a486fd2350f2bfc3b19fcd143891a4a2d8 # v4
+        uses: ./.github/actions/join-tailnet
         with:
           # Pre-minted tag:ci authkey (ephemeral+reusable, 90-day expiry
           # tracked in the parameter store) - no OAuth client needed.
           authkey: ${{ secrets.TS_AUTHKEY }}
-          tags: tag:ci
-          use-cache: 'true'
 
       - name: Configure AWS credentials (app-secret seed)
         uses: aws-actions/configure-aws-credentials@cabfdba3510de1431bac9dba27511d97497fc100 # v5
@@ -245,12 +243,9 @@ jobs:
           done
 
       - name: Write kubeconfig
-        env:
-          KUBECONFIG_B64: ${{ secrets.KUBECONFIG_B64 }}
-        run: |
-          install -m 700 -d "$HOME/.kube"
-          echo "$KUBECONFIG_B64" | base64 -d > "$HOME/.kube/config"
-          chmod 600 "$HOME/.kube/config"
+        uses: ./.github/actions/write-kubeconfig
+        with:
+          kubeconfig-b64: ${{ secrets.KUBECONFIG_B64 }}
 
       - name: Record last-good digests (rollback anchor, #499)
         # Runs BEFORE the destructive secret seed (codex r10): a failure
