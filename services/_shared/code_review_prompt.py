@@ -409,9 +409,23 @@ RULES: tuple[ReviewRule, ...] = (
         "on the CHANGED line in the diff (the new signature/raise) - never "
         "on the unchanged context file - and name the caller's path and "
         "line in the message (e.g. 'caller src/jobs.py:42 still passes the "
-        "old 2-arg form').",
-        bad_example="-def fetch(id):\n+def fetch(id, *, tenant):  # caller src/jobs.py:42 still calls fetch(1)",
-        good_example="+def fetch(id, *, tenant=None):  # optional keeps old call sites valid",
+        "old 2-arg form'). Two lists that share vocabulary are NOT "
+        "necessarily coupled: growing a rule registry does not by itself "
+        "mean a differently-scoped allowlist (e.g. one enumerating AST call "
+        "targets inside a specific function) must grow too - confirm from "
+        "the actual cross-file context that the second list's membership "
+        "rule depends on the first, not just that the names look similar. "
+        "If the cross-file context already shows an attester, assertion, or "
+        "test that evaluates the exact claim you are about to make, and "
+        "nothing in the diff contradicts it, the claim is already covered - "
+        "do not flag it as broken.",
+        bad_example="registry.append('check_new_rule')  # 'the allowlist "
+        "in a different, unrelated file must also grow' - unproven; that "
+        "file enumerates call targets in one function's AST, not registry "
+        "entries, and nothing shows the new rule is dispatched from there",
+        good_example="registry.append('check_new_rule')  # dispatched "
+        "inside run_all(), never called from the AST-scoped function - the "
+        "unrelated allowlist correctly does not need this entry",
         severity="high",
     ),
     ReviewRule(
