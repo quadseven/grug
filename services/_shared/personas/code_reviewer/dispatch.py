@@ -1861,6 +1861,9 @@ def _capture_comment_records(
     }
     persisted = 0
     for c in comments:
+        log.warning(  # TEMP #967 DEBUG round 2 - remove before merge
+            "debug_967v2_raw_comment", extra={"raw": {k: v for k, v in c.items() if k != "body"}},
+        )
         cid, path = c.get("id"), c.get("path")
         line = c.get("line")
         if line is None:
