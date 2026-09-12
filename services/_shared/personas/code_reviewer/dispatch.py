@@ -1849,16 +1849,36 @@ def _capture_comment_records(
     by_key: dict[str, Finding] = {
         finding_key(f.file, f.line, f.rule_name): f for f in findings
     }
+    log.warning(  # TEMP #967 DEBUG - remove before merge
+        "debug_967_by_key", extra={"keys": list(by_key.keys())},
+    )
     persisted = 0
     for c in comments:
         cid, path, line = c.get("id"), c.get("path"), c.get("line")
         if cid is None or path is None or line is None:
+            log.warning(  # TEMP #967 DEBUG - remove before merge
+                "debug_967_comment_skipped_early",
+                extra={"cid": cid, "path": path, "line": line},
+            )
             continue
         rule = parse_rule(c.get("body", ""))
         if rule is None:
+            log.warning(  # TEMP #967 DEBUG - remove before merge
+                "debug_967_no_rule_marker",
+                extra={"cid": cid, "body_tail": c.get("body", "")[-80:]},
+            )
             continue
         try:
-            finding = by_key.get(finding_key(path, int(line), rule))
+            lookup_key = finding_key(path, int(line), rule)
+            finding = by_key.get(lookup_key)
+            log.warning(  # TEMP #967 DEBUG - remove before merge
+                "debug_967_lookup",
+                extra={
+                    "cid": cid, "lookup_key": lookup_key,
+                    "found": finding is not None,
+                    "path_repr": repr(path), "rule_repr": repr(rule),
+                },
+            )
         except (TypeError, ValueError):
             continue
         if finding is None:
