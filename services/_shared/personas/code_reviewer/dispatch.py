@@ -3128,9 +3128,13 @@ def _publish_deep_check(
 # WITHIN THE DIFF PATCH TEXT, not a file line number, and not usable as a
 # substitute) for a short window. Confirmed live: every real comment this
 # path was ever handed had this shape, a 100%-reproducing capture failure.
-# Bounded retry: short, and only pays the cost when there's actually a
-# marked finding still missing both line fields.
-_COMMENT_LINE_RETRY_DELAYS_S = (1.0, 2.0)
+# Bounded retry, paid only when a marked finding still lacks both line
+# fields. A first attempt at (1.0, 2.0) - 3s total - was measured live as
+# INSUFFICIENT: a follow-up test still saw the gap at the ~6s mark. This
+# runs in a background consumer well after the expensive LLM calls already
+# completed, not a user-facing request, so a generous ceiling costs
+# throughput on this one queue worker, never a human's wait.
+_COMMENT_LINE_RETRY_DELAYS_S = (2.0, 4.0, 8.0, 16.0)
 
 
 def _comments_missing_line_data(comments: list[dict]) -> bool:
