@@ -163,7 +163,16 @@ RULES: tuple[ReviewRule, ...] = (
         name="missing-error-handling",
         bug_class="robustness",
         description="An external call (network, disk, parse) with no "
-        "handling for its documented failure modes — the happy path only.",
+        "handling for its documented failure modes — the happy path only. "
+        "A shell command's exit status IS handled when it drives control "
+        "flow: `if cmd`, `if ! cmd`, `while`/`until cmd`, `cmd && ...` / "
+        "`cmd || ...`, a `case \"$?\"` branch, an explicit `|| true` / "
+        "`|| exit N` / `|| return N`, or a captured `if out=$(cmd); then`. "
+        "A file-scope `set -e` / `set -euo pipefail` makes every otherwise-"
+        "bare invocation in that file checked by default too. Read the "
+        "surrounding control flow and script-scope flags before flagging a "
+        "shell command as unchecked — do not pattern-match the invocation "
+        "alone.",
         bad_example="data = json.loads(resp.text)",
         good_example="try: data = json.loads(resp.text)\nexcept "
         "json.JSONDecodeError: return _fallback()",

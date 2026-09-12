@@ -306,3 +306,23 @@ def test_voice_has_mandatory_bookend_structure():
     assert "STOP and re-cast" in p          # the anti-plain-English clause
     assert "await fetch_user" in p          # the modern high-density example
     assert "WRAPPER" in p                    # cadence-wraps, core-stays-exact
+
+
+def test_missing_error_handling_rule_teaches_shell_control_flow():
+    """#771: `if ! dig ...; then exit 1; fi` under `set -euo pipefail` IS
+    the check - Elder flagged it as unchecked anyway, pattern-matching the
+    invocation without reading the surrounding control flow. Pin every
+    form the description now names, so a future edit can't quietly drop
+    one and reopen this exact FP."""
+    rule = next(r for r in crp.RULES if r.name == "missing-error-handling")
+    for form in (
+        "if cmd", "if ! cmd", "while", "until cmd",
+        "cmd && ...", "cmd || ...", 'case "$?"',
+        "|| true", "|| exit N", "|| return N",
+        "if out=$(cmd); then",
+        "set -e", "set -euo pipefail",
+    ):
+        assert form in rule.description, f"{form!r} missing from description"
+    assert "checked by default" in rule.description
+    assert "do not pattern-match the invocation alone" in rule.description
+    assert "missing-error-handling" in crp.build_system_prompt()
