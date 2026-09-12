@@ -1,0 +1,26 @@
+name: Join tailnet (ephemeral)
+description: >-
+  grug#735: shared tailnet-join bootstrap. Was duplicated inline in 5 job
+  steps across 4 deploy workflows (deploy.k8s.yml, grugthink.deploy.yml,
+  deploy.rollback.yml, preview.yml x2) - a version bump or a tag/authkey
+  change needed the same edit 5 times and could silently drift if one was
+  missed. Behaviour-neutral: `use-cache: 'true'` here matches
+  tailscale/github-action's own documented default, so the one call site
+  that omitted it (grugthink.deploy.yml) already got this value.
+
+inputs:
+  authkey:
+    description: >-
+      Tailscale tag:ci authkey (callers pass their own secrets.TS_AUTHKEY -
+      a composite action has no secrets context of its own).
+    required: true
+
+runs:
+  using: composite
+  steps:
+    - name: Join tailnet (ephemeral)
+      uses: tailscale/github-action@306e68a486fd2350f2bfc3b19fcd143891a4a2d8 # v4
+      with:
+        authkey: ${{ inputs.authkey }}
+        tags: tag:ci
+        use-cache: 'true'

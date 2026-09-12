@@ -1,0 +1,29 @@
+name: Write kubeconfig
+description: >-
+  grug#735: shared kubeconfig-decode bootstrap. Was duplicated inline in 5
+  job steps across 4 deploy workflows - a kubeconfig secret rotation or a
+  permissions-mode change needed the same edit 5 times. `install -m 700 -d`
+  is the majority form (3 of 4 call sites); grugthink.deploy.yml's own
+  inline block used a bare `mkdir -p` with no explicit directory mode -
+  unifying on the stricter, more common form rather than propagating the
+  laxer one.
+
+inputs:
+  kubeconfig-b64:
+    description: >-
+      Base64-encoded kubeconfig (callers pass their own
+      secrets.KUBECONFIG_B64 - a composite action has no secrets context
+      of its own).
+    required: true
+
+runs:
+  using: composite
+  steps:
+    - name: Write kubeconfig
+      shell: bash
+      env:
+        KUBECONFIG_B64: ${{ inputs.kubeconfig-b64 }}
+      run: |
+        install -m 700 -d "$HOME/.kube"
+        echo "$KUBECONFIG_B64" | base64 -d > "$HOME/.kube/config"
+        chmod 600 "$HOME/.kube/config"

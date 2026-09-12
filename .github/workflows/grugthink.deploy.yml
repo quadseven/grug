@@ -42,10 +42,9 @@ jobs:
       - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
 
       - name: Join tailnet (ephemeral)
-        uses: tailscale/github-action@306e68a486fd2350f2bfc3b19fcd143891a4a2d8 # v4
+        uses: ./.github/actions/join-tailnet
         with:
           authkey: ${{ secrets.TS_AUTHKEY }}
-          tags: tag:ci
 
       - name: Configure AWS credentials (LLM fallback key seed)
         # Same grug-gha-deploy OIDC role deploy.k8s.yml uses (infra/pulumi's
@@ -80,12 +79,9 @@ jobs:
           echo "TAG=$TAG" >> "$GITHUB_ENV"
 
       - name: Write kubeconfig
-        env:
-          KUBECONFIG_B64: ${{ secrets.KUBECONFIG_B64 }}
-        run: |
-          mkdir -p "$HOME/.kube"
-          echo "$KUBECONFIG_B64" | base64 -d > "$HOME/.kube/config"
-          chmod 600 "$HOME/.kube/config"
+        uses: ./.github/actions/write-kubeconfig
+        with:
+          kubeconfig-b64: ${{ secrets.KUBECONFIG_B64 }}
 
       - name: Namespace + secrets + registry pull secret
         env:
