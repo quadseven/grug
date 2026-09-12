@@ -792,6 +792,22 @@ def _summary_markdown(
             "from the ground Grug walked are published below; this check stays "
             "advisory. Coverage detail is in the table above."
         ) + held + hunt
+    if review_phase == "deep" and is_blackout(evaluation.degraded_reason):
+        # grug#848: a blackout in the deep phase is the REASONER arm's -
+        # `_async_deep_decision` never starts the deep append over a
+        # blacked-out Tier-1 - so the generic "could not see the diff" below
+        # would be false here: Tier-1 did see it and its verdict stands. The
+        # news is that the second look Tier-1 promised ("reasoner may append
+        # later if escalated") never happened, and this neutral is not the
+        # reasoner agreeing.
+        title = f"WARN Elder deep arm did not run ({evaluation.degraded_reason})"
+        return hunt_title(title), (
+            "Tier-1 coder-arm review completed and its markings stand. The "
+            "deep reasoner arm promised on escalation did not run this pass "
+            f"- the mist: `{evaluation.degraded_reason}`. Grug not say the "
+            "deeper look agreed; it never looked. This only counsel, merge "
+            "not blocked."
+        ) + held + hunt
     if evaluation.degraded_reason:
         title = f"WARN Grug eyes clouded ({evaluation.degraded_reason})"
         return hunt_title(title), (
@@ -3271,7 +3287,8 @@ def _async_deep_append_if_needed(
         voice=voice,
         cancel_event=cancel_event,
     )
-    if deep_llm.kind != "reviewed":
+    arm_ran = deep_llm.kind == "reviewed"
+    if not arm_ran:
         log.info(
             "elder_async_deep_arm_empty",
             extra={
@@ -3280,20 +3297,39 @@ def _async_deep_append_if_needed(
                 "error": deep_llm.error,
             },
         )
-        return
-
-    deep_eval, deep_graded, deep_verdicts, deep_suppressed_count = _grade_deep_response(
-        deep_llm,
-        hunks,
-        installation_id,
-        pr_context=pr_context,
-        file_contents=file_contents,
-        cross_file_contents=cross_file_contents,
-        runtime_context=runtime_context,
-        owner=owner,
-        repo_name=repo_name,
-        pull_number=pull_number,
-    )
+        if not is_blackout(deep_llm.kind):
+            # `no_diff`: nothing for the reasoner to look at is not a
+            # failure to look (BENIGN_DEGRADATIONS) - nothing to qualify.
+            return
+        # grug#848: the reasoner did NOT run (transport or parse failure).
+        # This used to `return` here, leaving Tier-1's already-published
+        # `success` standing over a promise its own check-run text made
+        # ("reasoner may append later if escalated") and never kept - the
+        # author could not tell "the reasoner looked and agreed" from "the
+        # reasoner never looked". Nothing to grade, so build the deep
+        # arm's evaluation directly: `evaluate_diff` turns a failed
+        # response into an empty pass carrying `degraded_reason=kind`, and
+        # `with_degradation` below folds that into Tier-1 through the same
+        # `_derive_conclusion` seam #844 established for partial coverage.
+        # The deep check-run then completes `neutral`, naming the arm that
+        # never ran, in place of the unqualified Tier-1 `success`.
+        deep_eval = evaluate_diff(hunks, deep_llm)
+        deep_graded: tuple[Finding, ...] = ()
+        deep_verdicts: tuple[Any, ...] = ()
+        deep_suppressed_count = 0
+    else:
+        deep_eval, deep_graded, deep_verdicts, deep_suppressed_count = _grade_deep_response(
+            deep_llm,
+            hunks,
+            installation_id,
+            pr_context=pr_context,
+            file_contents=file_contents,
+            cross_file_contents=cross_file_contents,
+            runtime_context=runtime_context,
+            owner=owner,
+            repo_name=repo_name,
+            pull_number=pull_number,
+        )
 
     # Supersession after long reasoner/judge work (#646 FLINT).
     if cancel_event is not None and cancel_event.is_set():
@@ -3353,10 +3389,22 @@ def _async_deep_append_if_needed(
         review_phase="deep",
     )
     title = f"{title} (deep append)"
-    summary = (
-        f"_Deep reasoner arm appended after Tier-1 completed "
-        f"({', '.join(decision.reasons)})._\n\n{summary}"
+    # The author-facing distinction #848 asks for: "the reasoner ran and
+    # found nothing" and "the reasoner did not run" are different news, and
+    # this preamble says which one this is even when `_summary_markdown`'s
+    # wording is owned by a Tier-1 degradation (first-degradation-wins in
+    # `with_degradation`). Only `kind` is quoted - the raw error text stays
+    # in the log, since a parse failure's text can be model prose.
+    reasons = ", ".join(decision.reasons)
+    preamble = (
+        f"_Deep reasoner arm appended after Tier-1 completed ({reasons})._"
+        if arm_ran
+        else (
+            f"_Deep reasoner arm did not run after Tier-1 completed "
+            f"({reasons}): `{deep_llm.kind}`. Nothing was appended._"
+        )
     )
+    summary = f"{preamble}\n\n{summary}"
     _publish_deep_check(
         installation_id=installation_id,
         owner=owner,
@@ -3401,6 +3449,8 @@ def _async_deep_append_if_needed(
             "pr": f"{owner}/{repo_name}#{pull_number}",
             "deep_findings": len(novel_deep),
             "reasons": list(decision.reasons),
+            "arm_kind": deep_llm.kind,
+            "conclusion": conclusion,
         },
     )
 

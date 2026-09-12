@@ -3181,6 +3181,49 @@ def _truncation_error(backends: Sequence["Backend"]) -> str:
     )
 
 
+def _dual_arm_partial_error(
+    expected: Sequence["Backend"],
+    successes: Sequence["_SuccessfulReview"],
+    last_error: str,
+) -> str:
+    """The `error` string for a concurrent dual-arm merge, empty only when
+    every expected arm answered AND none was truncated.
+
+    grug#848: when only one of the two arms succeeded, the merge used to
+    return `kind="reviewed"` with `error=""` - indistinguishable, to
+    `evaluate_diff` and therefore to the check-run, from a clean two-arm
+    pass. One reply is still a COMPLETE-ENOUGH review to publish (the arms
+    are best-effort; a reasoner outage must not block a review the coder
+    answered), but complete-enough-to-publish and complete are different
+    claims: Elder vouches only for the ground it walked, and the missing
+    arm never walked any. So the missing arm folds into the SAME
+    `"partial review: ..."` seam `_partial_review_reason` (PR #844) and
+    `_truncation_error` (grug#851) use - `evaluate_diff` maps it to
+    `degraded_reason="partial_review"` and `_derive_conclusion` keeps the
+    conclusion off `success` - instead of a new vocabulary term. Every
+    downstream consumer of `partial_review` (board wording, advisory
+    forcing, `worth_an_email`) keeps working unchanged.
+
+    `last_error` is the composed transport/parse/http text of the arm that
+    failed; it stays in this log-only string and never reaches an
+    author-facing surface (a parse failure's text can be model prose).
+    """
+    answered = {review.backend for review in successes}
+    reasons: list[str] = []
+    missing = tuple(backend for backend in expected if backend not in answered)
+    if missing:
+        names = ", ".join(backend.value for backend in missing)
+        reasons.append(
+            f"arm {names} did not answer ({last_error or 'no usable response'})"
+        )
+    truncated = _truncation_error(
+        tuple(review.backend for review in successes if review.truncated),
+    )
+    if truncated:
+        reasons.append(truncated.removeprefix("partial review: "))
+    return f"partial review: {'; '.join(reasons)}" if reasons else ""
+
+
 def _run_review_arm(
     backend: "Backend",
     messages: list[dict[str, str]],
@@ -3999,7 +4042,13 @@ def _review_diff_dispatch_cave_primary(
         # either free backend's outage (e.g. an OpenRouter 402) block EVERY
         # review. We merge whatever came back (1 or 2 backends) and the
         # Cave/Spark judge does the final grading downstream regardless. Log
-        # which backend(s) answered for observability, but never degrade/retry.
+        # which backend(s) answered for observability, but never retry.
+        #
+        # "Never degrade" used to be part of that sentence (grug#848): a
+        # one-arm reply returned `error=""`, so the check-run published
+        # `success` over a look the missing arm never took. The findings
+        # still publish; the missing arm now reads as partial coverage via
+        # `_dual_arm_partial_error` below, the same seam PR #844 built.
         if len(successes) < 2:
             # Carry PR/install identifiers so operators can find WHICH PRs were
             # reviewed on a single backend during a free-tier outage - the
@@ -4027,9 +4076,11 @@ def _review_diff_dispatch_cave_primary(
             review_span_context=first.review_span_context,
             backends_used=tuple(review.backend for review in successes),
             models_used=tuple(review.model for review in successes),
-            error=_truncation_error(
-                tuple(review.backend for review in successes if review.truncated),
-            ),
+            # Only the concurrent dual-arm (`run_both`) merge reaches here
+            # with successes - `fast`/`tiered` early-exit on the first success
+            # above - so `review_backends` is exactly the set of arms that
+            # were expected to answer.
+            error=_dual_arm_partial_error(review_backends, successes, last_error),
         )
 
     # Every backend failed. Prefer the specific parse_failed kind (a backend
