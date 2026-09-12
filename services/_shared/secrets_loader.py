@@ -164,6 +164,30 @@ def get_omen_service_map() -> dict[str, str]:
     return parsed
 
 
+def get_warder_slo_map() -> dict[str, int]:
+    """Operator-managed repo->DD-monitor-id mapping for Warder's deploy
+    gate (#533): a JSON object {"owner/repo": monitor_id} in a plain
+    String param. Same explicit-allow shape as `get_omen_service_map` -
+    {} (feature off) on ANY error or malformation, logged so a
+    fat-fingered map is distinguishable from an absent one. Reuses the
+    Omen DD-key gate (`get_dd_api_key`/`get_dd_app_key`) - no new secret
+    surface, only this new mapping param."""
+    name = os.getenv("GRUG_WARDER_SLO_MAP_SSM", "")
+    if not name:
+        return {}
+    try:
+        raw = _ssm.get_parameter(Name=name)["Parameter"]["Value"]
+    except Exception as e:  # noqa: BLE001 — absent param = feature off
+        log.info("warder_slo_map_unavailable", extra={"kind": type(e).__name__})
+        return {}
+    from personas.warder.slo_gate import _slo_map_from_json
+
+    parsed = _slo_map_from_json(raw)
+    if raw.strip() and not parsed:
+        log.warning("warder_slo_map_malformed", extra={"param": name})
+    return parsed
+
+
 def get_smasher_enabled() -> bool:
     """Global master kill switch for the Smasher Trial (#469), from the
     `/grug/smasher-enabled` SSM param (plain String, e.g. "true").

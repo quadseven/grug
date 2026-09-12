@@ -187,7 +187,10 @@ REGISTRY: tuple[PersonaSpec, ...] = (
         check_run_name=CHECK_WARDER,
         enabled_flag="warder_enabled",
         enabled_default=False,  # tracer: opt-in per repo (#471)
-        blocking_flag=None,
+        # grug#533: the release-tracer itself never blocks (its own
+        # conclusion is hardcoded "neutral"); this flag governs ONLY the
+        # optional SLO/monitor deploy-gate section - advisory by default.
+        blocking_flag="warder_gate_blocking",
         blocking_default=False,
         dispatch_style="inline",
         missing_repo_policy="disabled",
