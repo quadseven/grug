@@ -1845,40 +1845,33 @@ def _capture_comment_records(
     ours) or no matching finding is skipped. Best-effort per comment: a
     malformed dict or a single DDB blip is skipped, never raised. Returns
     count persisted.
-    """
+
+    `line` vs `original_line` (#967): GitHub's REST API is eventually
+    consistent for a JUST-created review comment's `line` field - fetching
+    it in the same synchronous round-trip this function runs in (moments
+    after `post_review` returns) reliably returns `line: null` even though
+    the identical comment, queried again seconds later, has the correct
+    value. `original_line` (the position AT CREATION time) does not share
+    this lag and is what we actually have evidence for anyway. Falling back
+    to it when `line` is absent fixed a 100%-reproducing capture failure -
+    every comment this function ever saw was silently dropped by the
+    `line is None` check before this fix, confirmed live (grug#967)."""
     by_key: dict[str, Finding] = {
         finding_key(f.file, f.line, f.rule_name): f for f in findings
     }
-    log.warning(  # TEMP #967 DEBUG - remove before merge
-        "debug_967_by_key", extra={"keys": list(by_key.keys())},
-    )
     persisted = 0
     for c in comments:
-        cid, path, line = c.get("id"), c.get("path"), c.get("line")
+        cid, path = c.get("id"), c.get("path")
+        line = c.get("line")
+        if line is None:
+            line = c.get("original_line")
         if cid is None or path is None or line is None:
-            log.warning(  # TEMP #967 DEBUG - remove before merge
-                "debug_967_comment_skipped_early",
-                extra={"cid": cid, "path": path, "line": line},
-            )
             continue
         rule = parse_rule(c.get("body", ""))
         if rule is None:
-            log.warning(  # TEMP #967 DEBUG - remove before merge
-                "debug_967_no_rule_marker",
-                extra={"cid": cid, "body_tail": c.get("body", "")[-80:]},
-            )
             continue
         try:
-            lookup_key = finding_key(path, int(line), rule)
-            finding = by_key.get(lookup_key)
-            log.warning(  # TEMP #967 DEBUG - remove before merge
-                "debug_967_lookup",
-                extra={
-                    "cid": cid, "lookup_key": lookup_key,
-                    "found": finding is not None,
-                    "path_repr": repr(path), "rule_repr": repr(rule),
-                },
-            )
+            finding = by_key.get(finding_key(path, int(line), rule))
         except (TypeError, ValueError):
             continue
         if finding is None:

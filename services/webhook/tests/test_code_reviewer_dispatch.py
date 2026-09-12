@@ -1601,6 +1601,57 @@ def test_dispatch_capture_skips_marked_comment_with_no_matching_finding(monkeypa
     assert captured == []
 
 
+def test_dispatch_capture_falls_back_to_original_line_when_line_is_null(monkeypatch):
+    """grug#967: GitHub's REST API is eventually consistent for a JUST-
+    created review comment's `line` field - fetching it in the same
+    synchronous round-trip this capture step runs in (moments after
+    `post_review` returns) reliably returns `line: null`, confirmed live,
+    even though the identical comment queried again seconds later has the
+    correct value. This was a 100%-reproducing capture failure: every real
+    comment this function ever saw was silently dropped. `original_line`
+    (populated immediately, at creation time) does not share the lag and is
+    what we actually have evidence for regardless."""
+    captured = []
+    monkeypatch.setattr(cr_dispatch, "review_diff", lambda *a, **kw: _llm_with_span())
+    monkeypatch.setattr(cr_dispatch, "post_check_run", lambda *a, **kw: {"id": 1})
+    monkeypatch.setattr(cr_dispatch, "post_review", lambda *a, **kw: {"id": 77})
+    monkeypatch.setattr(
+        cr_dispatch, "get_review_comments",
+        lambda *a, **kw: [{
+            "id": 555, "path": "src/x.py", "line": None, "original_line": 2,
+            "body": "m\n<!-- grug-rule:silent-failure -->",
+        }],
+    )
+    monkeypatch.setattr(
+        cr_dispatch, "put_comment_record",
+        lambda **kw: captured.append(kw),
+    )
+    with patch("httpx.get", return_value=_diff_response()):
+        cr_dispatch.dispatch_code_review(_payload(), blocking=False)
+    assert len(captured) == 1
+    assert captured[0]["comment_id"] == 555
+
+
+def test_dispatch_capture_skips_when_both_line_and_original_line_are_null(monkeypatch):
+    """A genuinely unusable comment (neither line nor original_line present -
+    e.g. a file-level comment) still degrades to skip, not a crash."""
+    captured = []
+    monkeypatch.setattr(cr_dispatch, "review_diff", lambda *a, **kw: _llm_with_span())
+    monkeypatch.setattr(cr_dispatch, "post_check_run", lambda *a, **kw: {"id": 1})
+    monkeypatch.setattr(cr_dispatch, "post_review", lambda *a, **kw: {"id": 77})
+    monkeypatch.setattr(
+        cr_dispatch, "get_review_comments",
+        lambda *a, **kw: [{
+            "id": 556, "path": "src/x.py", "line": None, "original_line": None,
+            "body": "m\n<!-- grug-rule:silent-failure -->",
+        }],
+    )
+    monkeypatch.setattr(cr_dispatch, "put_comment_record", lambda **kw: captured.append(kw))
+    with patch("httpx.get", return_value=_diff_response()):
+        cr_dispatch.dispatch_code_review(_payload(), blocking=False)
+    assert captured == []
+
+
 def test_dispatch_capture_zero_alarm_logged(monkeypatch, caplog):
     """0-of-N capture (non-empty fetch, nothing matched) fires the
     code_review_comment_capture_zero alarm — the only signal that a
