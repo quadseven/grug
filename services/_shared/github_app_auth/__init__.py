@@ -207,7 +207,7 @@ def _retry_sleep_seconds(attempt: int, response: httpx.Response) -> float:
     else:
         server_wait = 0.0
     backoff = _RETRY_BASE_SECONDS * (_RETRY_BACKOFF_FACTOR ** (attempt - 1))
-    jitter = random.uniform(0, backoff * 0.5)
+    jitter = random.uniform(0, backoff * 0.5)  # noqa: S311 - retry timing jitter, not a security use
     return min(max(backoff + jitter, server_wait), _RETRY_MAX_SLEEP_SECONDS)
 
 
