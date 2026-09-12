@@ -7,7 +7,7 @@ patched.
 
 from __future__ import annotations
 
-from unittest.mock import patch
+from unittest.mock import MagicMock, patch
 
 import personas.tpm.persona  # noqa: F401 — register submodule for patch path
 import pytest
@@ -76,6 +76,38 @@ def test_installation_repositories_added_skips_non_allowlisted():
         out = dispatch("installation_repositories", payload)
     assert out["status"] == "recorded"
     mock_enforce.assert_not_called()
+
+
+def test_pull_request_skip_personas_omits_named_persona_only(monkeypatch):
+    """grug#947: the reconciler passes skip_personas for a persona whose
+    check-run already exists on this head SHA - dispatch must skip
+    exactly that one and still run everything else enabled, never both
+    or neither."""
+    import personas.code_reviewer.webhook_dispatch
+
+    mock_tpm_eval = MagicMock(return_value=type("R", (), {"passed": True})())
+    mock_tpm_pub = MagicMock(return_value={"persona": "tpm", "result": "pass"})
+    mock_cr_dispatch = MagicMock(return_value={"persona": "code_reviewer", "result": "queued"})
+    monkeypatch.setattr(
+        personas.code_reviewer.webhook_dispatch, "dispatch_pull_request", mock_cr_dispatch,
+    )
+    with patch("dispatcher.is_install_allowlisted", return_value=True), \
+         patch(
+             "dispatcher.is_persona_enabled",
+             side_effect=lambda *a: a[2] in {"tpm", "code_reviewer"},
+         ), \
+         patch("dispatcher.get_repo_config", return_value={}), \
+         patch("personas.tpm.persona.evaluate_pull_request", mock_tpm_eval), \
+         patch("personas.tpm.persona.publish_tpm_evaluation", mock_tpm_pub):
+        out = dispatch(
+            "pull_request", _full_pr_payload(), skip_personas=frozenset({"tpm"}),
+        )
+
+    assert out["status"] == "dispatched"
+    keys = {p["persona"] for p in out["personas"]}
+    assert keys == {"code_reviewer"}, "tpm must be skipped, code_reviewer must still run"
+    mock_tpm_eval.assert_not_called()
+    mock_cr_dispatch.assert_called_once()
 
 
 def test_pull_request_unhandled_action_skips():

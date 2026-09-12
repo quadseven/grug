@@ -34,7 +34,11 @@ log = logging.getLogger("grug.webhook.dispatcher")
 
 
 def dispatch(
-    event_name: str, payload: dict[str, Any], *, delivery_id: str = "",
+    event_name: str,
+    payload: dict[str, Any],
+    *,
+    delivery_id: str = "",
+    skip_personas: frozenset[str] = frozenset(),
 ) -> dict[str, str]:
     """Route a webhook event to its persona handlers. Returns audit dict.
 
@@ -42,13 +46,21 @@ def dispatch(
     to the pull_request handler so the async Elder offload (#272) can key
     its idempotency claim on it. Defaults to "" for non-PR events (which
     don't enqueue async work) and for older call sites/tests.
+
+    `skip_personas` (grug#947): persona `spec.key`s to skip even though
+    they are enabled and would otherwise match this event - the check-run
+    reconciler's way of saying "this one already has a check-run for this
+    head SHA, do not post a duplicate." Empty by default so ordinary
+    webhook dispatch is unaffected; only the reconciler ever passes it.
     """
     if event_name == "installation":
         return _handle_installation(payload)
     if event_name == "installation_repositories":
         return _handle_installation_repositories(payload)
     if event_name == "pull_request":
-        return _handle_pull_request(payload, delivery_id=delivery_id)
+        return _handle_pull_request(
+            payload, delivery_id=delivery_id, skip_personas=skip_personas,
+        )
     if event_name == "issues":
         return _handle_issues(payload)
     if event_name == "issue_comment":
@@ -249,7 +261,10 @@ def _enforce_on_repos(install_id: int, repositories: list[dict]) -> None:
 
 
 def _handle_pull_request(
-    payload: dict[str, Any], *, delivery_id: str = "",
+    payload: dict[str, Any],
+    *,
+    delivery_id: str = "",
+    skip_personas: frozenset[str] = frozenset(),
 ) -> dict[str, Any]:
     """Returns either a short {status, reason} dict (allowlist or
     payload skip) OR an aggregated {status, personas: [...]} dict
@@ -327,6 +342,20 @@ def _handle_pull_request(
         if action not in spec.actions:
             # e.g. Warder only wakes on "closed"; the update personas
             # don't. Silent skip - costs no store read, not a disable.
+            continue
+        if spec.key in skip_personas:
+            # grug#947: the reconciler already found a check-run for this
+            # persona on this head SHA - dispatching again would duplicate
+            # it (post_check_run has no server-side dedup; see its
+            # docstring). Not a disable, so it gets its own reason.
+            log.info(
+                "persona_reconcile_skip_already_present",
+                extra={
+                    "installation_id": installation_id,
+                    "owner": owner, "repo": repo_name, "pr_number": pr_number,
+                    "persona": spec.key,
+                },
+            )
             continue
 
         if repo_id is None:

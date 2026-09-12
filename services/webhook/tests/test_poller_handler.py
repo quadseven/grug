@@ -44,6 +44,13 @@ def _wire(monkeypatch, *, installs, records_for, retry, poll):
     monkeypatch.setattr(
         "adapters.install_store.list_hygiene_watch_repos", lambda iid: [],
     )
+    # grug#947: same, for the check-run reconcile pass. Patched on the
+    # reconciler's OWN module namespace - it imports the name at module
+    # scope (not lazily inside a function like the passes above), so
+    # patching adapters.install_store here would not reach it.
+    monkeypatch.setattr(
+        "check_run_reconciler.list_check_run_reconcile_repos", lambda iid: [],
+    )
     # #460: default the enforcement re-emission pass to idle (GitHub
     # reports no repos) so the reaction-poll assertions stay about the
     # reaction poll. NOTE the pass still acquires one token per install
@@ -71,7 +78,7 @@ def test_poller_polls_each_allowlisted_install(monkeypatch):
     )
     out = poller_handler.handler({}, None)
     assert polled == [11, 22]
-    assert out == {"installs": 2, "records": 2, "submitted": 4, "failed_installs": 0, "pulse_nudges": 0, "pulse_failed_installs": 0, "dep_watch_reports": 0, "dep_watch_failed_installs": 0, "reopen_watch_escalated": 0, "reopen_watch_failed_installs": 0, "hygiene_watch_reports": 0, "hygiene_watch_failed_installs": 0, "enforcement_emitted": 0, "enforcement_failed_installs": 0}
+    assert out == {"installs": 2, "records": 2, "submitted": 4, "failed_installs": 0, "pulse_nudges": 0, "pulse_failed_installs": 0, "dep_watch_reports": 0, "dep_watch_failed_installs": 0, "reopen_watch_escalated": 0, "reopen_watch_failed_installs": 0, "hygiene_watch_reports": 0, "hygiene_watch_failed_installs": 0, "check_run_reconciled": 0, "check_run_reconcile_failed_installs": 0, "enforcement_emitted": 0, "enforcement_failed_installs": 0}
 
 
 def test_poller_one_install_failure_does_not_abort_cycle(monkeypatch, caplog):
@@ -147,7 +154,7 @@ def test_poller_skips_installs_with_no_records(monkeypatch):
     )
     out = poller_handler.handler({}, None)
     assert touched == [7]   # the enforcement pass's single token acquisition
-    assert out == {"installs": 1, "records": 0, "submitted": 0, "failed_installs": 0, "pulse_nudges": 0, "pulse_failed_installs": 0, "dep_watch_reports": 0, "dep_watch_failed_installs": 0, "reopen_watch_escalated": 0, "reopen_watch_failed_installs": 0, "hygiene_watch_reports": 0, "hygiene_watch_failed_installs": 0, "enforcement_emitted": 0, "enforcement_failed_installs": 0}
+    assert out == {"installs": 1, "records": 0, "submitted": 0, "failed_installs": 0, "pulse_nudges": 0, "pulse_failed_installs": 0, "dep_watch_reports": 0, "dep_watch_failed_installs": 0, "reopen_watch_escalated": 0, "reopen_watch_failed_installs": 0, "hygiene_watch_reports": 0, "hygiene_watch_failed_installs": 0, "check_run_reconciled": 0, "check_run_reconcile_failed_installs": 0, "enforcement_emitted": 0, "enforcement_failed_installs": 0}
 
 
 # --- #407: auto-replay wiring -----------------------------------------------
@@ -237,7 +244,7 @@ def test_poller_all_installs_fail_logs_error(monkeypatch, caplog):
     )
     with caplog.at_level(_logging.WARNING):
         out = poller_handler.handler({}, None)
-    assert out == {"installs": 2, "records": 2, "submitted": 0, "failed_installs": 2, "pulse_nudges": 0, "pulse_failed_installs": 0, "dep_watch_reports": 0, "dep_watch_failed_installs": 0, "reopen_watch_escalated": 0, "reopen_watch_failed_installs": 0, "hygiene_watch_reports": 0, "hygiene_watch_failed_installs": 0, "enforcement_emitted": 0, "enforcement_failed_installs": 2}
+    assert out == {"installs": 2, "records": 2, "submitted": 0, "failed_installs": 2, "pulse_nudges": 0, "pulse_failed_installs": 0, "dep_watch_reports": 0, "dep_watch_failed_installs": 0, "reopen_watch_escalated": 0, "reopen_watch_failed_installs": 0, "hygiene_watch_reports": 0, "hygiene_watch_failed_installs": 0, "check_run_reconciled": 0, "check_run_reconcile_failed_installs": 0, "enforcement_emitted": 0, "enforcement_failed_installs": 2}
     errs = [r for r in caplog.records if r.msg == "reaction_poll_all_installs_failed"]
     assert errs and errs[0].levelno == _logging.ERROR
     # a partial failure (not ALL) must NOT escalate to error
@@ -254,7 +261,7 @@ def test_poller_no_installs_is_a_clean_noop(monkeypatch):
         poll=lambda *a, **k: 1,
     )
     out = poller_handler.handler({}, None)
-    assert out == {"installs": 0, "records": 0, "submitted": 0, "failed_installs": 0, "pulse_nudges": 0, "pulse_failed_installs": 0, "dep_watch_reports": 0, "dep_watch_failed_installs": 0, "reopen_watch_escalated": 0, "reopen_watch_failed_installs": 0, "hygiene_watch_reports": 0, "hygiene_watch_failed_installs": 0, "enforcement_emitted": 0, "enforcement_failed_installs": 0}
+    assert out == {"installs": 0, "records": 0, "submitted": 0, "failed_installs": 0, "pulse_nudges": 0, "pulse_failed_installs": 0, "dep_watch_reports": 0, "dep_watch_failed_installs": 0, "reopen_watch_escalated": 0, "reopen_watch_failed_installs": 0, "hygiene_watch_reports": 0, "hygiene_watch_failed_installs": 0, "check_run_reconciled": 0, "check_run_reconcile_failed_installs": 0, "enforcement_emitted": 0, "enforcement_failed_installs": 0}
 
 
 # --- #460: enforcement-gauge re-emission pass --------------------------------

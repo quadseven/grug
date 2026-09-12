@@ -242,6 +242,14 @@ def handler(event: dict[str, Any], context: Any) -> dict[str, int | str]:
 
     hygiene_reports, hygiene_watch_failed = _hygiene_watch_pass(installs)
 
+    # Check-run sweep/reconcile (grug#947, epic #887): same store-driven,
+    # best-effort shape as the passes above. Own module rather than
+    # inlined - this file's `handler` is already well over the persona
+    # complexity caps (see _hygiene_watch_pass's docstring).
+    from check_run_reconciler import reconcile_installs
+
+    check_run_reconciled, check_run_reconcile_failed = reconcile_installs(installs)
+
     # Enforcement-gauge re-emission (#460): grug.enforcement.state was only
     # emitted on enforcement CONFIG events (dashboard toggle, repo-added
     # heal), so in steady state the enforcement-gap monitor sat in permanent
@@ -355,6 +363,8 @@ def handler(event: dict[str, Any], context: Any) -> dict[str, int | str]:
         "reopen_watch_failed_installs": reopen_watch_failed,
         "hygiene_watch_reports": hygiene_reports,
         "hygiene_watch_failed_installs": hygiene_watch_failed,
+        "check_run_reconciled": check_run_reconciled,
+        "check_run_reconcile_failed_installs": check_run_reconcile_failed,
         "enforcement_emitted": enforcement_emitted,
         "enforcement_failed_installs": enforcement_failed,
         **replay,
