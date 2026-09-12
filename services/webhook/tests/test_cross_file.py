@@ -214,6 +214,56 @@ def test_prompt_has_caller_not_updated_rule():
     assert "caller-not-updated" in names
 
 
+def test_caller_not_updated_rule_warns_off_shared_vocabulary_lists():
+    """grug#763: Elder flagged a false positive on PR #762 by seeing a rule
+    REGISTRY grow and asserting a differently-scoped call-target ALLOWLIST
+    in another file must grow too - the two lists share the `check_*`
+    vocabulary but have unrelated membership rules. Pins the sharpened
+    guidance so it cannot regress out of the rule."""
+    from code_review_prompt import RULES
+
+    rule = next(r for r in RULES if r.name == "caller-not-updated")
+    assert "share vocabulary" in rule.description
+    assert "membership rule depends on" in rule.description
+    assert "already covered" in rule.description
+
+
+def test_caller_not_updated_context_shows_the_pr_762_shape():
+    """Reproduces the PR #762 input shape: a rule registry gains an entry
+    (the diff) while an unrelated, AST-scoped call-target allowlist (the
+    cross-file context) does not, with the allowlist's own docstring
+    stating its membership rule. Proves the distinguishing evidence a
+    compliant reviewer needs actually reaches the prompt - the FP was a
+    reasoning failure on available context, not a missing-context one.
+    This cannot prove an LLM won't flag it anyway (see the sharpened
+    `caller-not-updated` description, pinned separately, for that half)."""
+    from llm_client import Hunk, _build_messages
+
+    registry_diff = (
+        "@@ -30,6 +30,7 @@ CANONICAL_RULES = [\n"
+        "     'check_five_a',\n"
+        "     'check_five_b',\n"
+        "+    'check_new_rule',\n"
+        " ]\n"
+    )
+    allowlist_context = (
+        "ALLOWED_CALL_NAMES = {\n"
+        "    # AST call-target enumeration for evaluate_pull_request ONLY -\n"
+        "    # unrelated to any rule registry; a name lands here iff it is\n"
+        "    # actually CALLED inside that one function's body.\n"
+        "    'check_five_a', 'check_five_b',\n"
+        "}\n"
+    )
+    hunks = [Hunk(path="dor_checks.py", body=registry_diff)]
+    msgs = _build_messages(
+        hunks, "v1", None, {"attest_persona_purity.py": allowlist_context},
+    )
+    user = msgs[1]["content"]
+    assert "check_new_rule" in user
+    assert "AST call-target enumeration" in user
+    assert "unrelated to any rule registry" in user
+
+
 def test_dispatch_threads_cross_file_context_to_review(monkeypatch):
     """The dispatch fetches cross-file context and passes it into
     review_diff; a fetch failure degrades to {} without breaking the
