@@ -910,6 +910,28 @@ def _dispatch_rerequest_for_pr(
     return dispatch("pull_request", synthetic_payload, skip_personas=skip_personas)
 
 
+def _resolve_rerequest_target(
+    payload: dict[str, Any], pull_requests: list[dict[str, Any]],
+) -> tuple[int, str, str, int | None] | dict[str, Any]:
+    """Installation/owner/repo extraction plus the allowlist gate, shared
+    by both `check_run` and `check_suite` rerequest handlers (grug#948) -
+    returns the handler's early-return response dict on failure, or the
+    resolved fields on success."""
+    repo = payload.get("repository") or {}
+    installation = payload.get("installation") or {}
+    installation_id = installation.get("id")
+    owner = (repo.get("owner") or {}).get("login") or repo.get("full_name", "").split("/")[0]
+    repo_name = repo.get("name")
+    repo_id = repo.get("id")
+    if not all([installation_id, owner, repo_name]) or not pull_requests:
+        return {"status": "skip", "reason": "incomplete_payload_or_no_linked_pr"}
+    # Defense-in-depth (Slice 5 #26), same gate every other event handler
+    # applies before doing any work.
+    if not is_install_allowlisted(int(installation_id)):
+        return {"status": "no_op", "reason": "installer not allowlisted"}
+    return int(installation_id), owner, repo_name, repo_id
+
+
 def _handle_check_run(payload: dict[str, Any]) -> dict[str, Any]:
     """`check_run.rerequested` (grug#948): GitHub's own "Re-run" button on
     one check run. No actor-permission check needed here - unlike the
@@ -937,27 +959,18 @@ def _handle_check_run(payload: dict[str, Any]) -> dict[str, Any]:
     if target is None:
         return {"status": "no_op", "reason": f"check_run name {check_run_name!r} not ours"}
 
-    repo = payload.get("repository") or {}
-    installation = payload.get("installation") or {}
-    installation_id = installation.get("id")
-    owner = (repo.get("owner") or {}).get("login") or repo.get("full_name", "").split("/")[0]
-    repo_name = repo.get("name")
-    repo_id = repo.get("id")
     pull_requests = check_run.get("pull_requests") or []
-    if not all([installation_id, owner, repo_name]) or not pull_requests:
-        return {"status": "skip", "reason": "incomplete_payload_or_no_linked_pr"}
-
-    # Defense-in-depth (Slice 5 #26), same gate every other event handler
-    # applies before doing any work.
-    if not is_install_allowlisted(int(installation_id)):
-        return {"status": "no_op", "reason": "installer not allowlisted"}
+    resolved = _resolve_rerequest_target(payload, pull_requests)
+    if isinstance(resolved, dict):
+        return resolved
+    installation_id, owner, repo_name, repo_id = resolved
 
     all_other_keys = frozenset(
         spec.key for spec in persona_registry.REGISTRY if spec.key != target.key
     )
     results = [
         _dispatch_rerequest_for_pr(
-            int(installation_id), owner, repo_name, repo_id, pr_ref, all_other_keys,
+            installation_id, owner, repo_name, repo_id, pr_ref, all_other_keys,
         )
         for pr_ref in pull_requests
     ]
@@ -975,22 +988,15 @@ def _handle_check_suite(payload: dict[str, Any]) -> dict[str, Any]:
         return {"status": "no_op", "reason": f"check_suite action={action} not gated"}
 
     check_suite = payload.get("check_suite") or {}
-    repo = payload.get("repository") or {}
-    installation = payload.get("installation") or {}
-    installation_id = installation.get("id")
-    owner = (repo.get("owner") or {}).get("login") or repo.get("full_name", "").split("/")[0]
-    repo_name = repo.get("name")
-    repo_id = repo.get("id")
     pull_requests = check_suite.get("pull_requests") or []
-    if not all([installation_id, owner, repo_name]) or not pull_requests:
-        return {"status": "skip", "reason": "incomplete_payload_or_no_linked_pr"}
-
-    if not is_install_allowlisted(int(installation_id)):
-        return {"status": "no_op", "reason": "installer not allowlisted"}
+    resolved = _resolve_rerequest_target(payload, pull_requests)
+    if isinstance(resolved, dict):
+        return resolved
+    installation_id, owner, repo_name, repo_id = resolved
 
     results = [
         _dispatch_rerequest_for_pr(
-            int(installation_id), owner, repo_name, repo_id, pr_ref, frozenset(),
+            installation_id, owner, repo_name, repo_id, pr_ref, frozenset(),
         )
         for pr_ref in pull_requests
     ]
