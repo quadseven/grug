@@ -5,18 +5,24 @@ Proves a NECESSARY condition for these bools:
 
   - `with_install_token_retry_invalidates_then_refetches_once_per_identity_concepts`
   - `retry_does_not_loop_on_repeated_401_per_identity_concepts`
+  - `transient_github_errors_retry_within_a_bound_per_identity_concepts` (#946)
 
 Asserts that `services/{api,webhook}/github_app_auth/__init__.py:with_install_token_retry`:
   1. Catches `httpx.HTTPStatusError`.
-  2. Checks `status_code == 401` (or `!= 401: raise`) — non-401 propagates.
+  2. Checks `status_code == 401` (or `!= 401: raise`) — the 401 path is
+     still distinguished from the general retry path.
   3. Calls `get_install_token(...)` with `force_refresh=True` (or kwarg-equivalent).
-  4. Calls `fn(token)` EXACTLY TWICE in total (one initial + one retry) — no
-     loop, no third attempt. The "exactly twice" guarantee is what makes the
-     retry safe against perma-401 (revoked App perms): the second 401
-     propagates instead of looping forever.
+  4. Calls `fn(token)` from inside a `for ... in range(...)` loop, never a
+     bare `while True` or unconditional recursion. #946 widened this from a
+     fixed "exactly twice" (401-only) shape to a bounded retry that also
+     covers 5xx/secondary-rate-limit - the loop-over-`range` shape is what
+     keeps ANY retry class, present or future, provably finite: `range`
+     cannot iterate forever, so this is a structural bound rather than a
+     count of literal call sites in the source (which #946 collapsed from
+     two `return fn(token)` sites to one, inside the loop).
 
 Sufficiency requires runtime testing — this static check proves the structural
-shape of the retry-once invariant.
+shape of the bounded-retry invariant, not the retry policy's specific values.
 """
 from __future__ import annotations
 
@@ -82,15 +88,25 @@ def _has_force_refresh_call(func: ast.FunctionDef) -> bool:
     return False
 
 
-def _exactly_two_fn_calls(func: ast.FunctionDef) -> bool:
-    """Body must call `fn(token)` exactly twice — once initial, once on retry.
-    A third call would mean an unbounded loop; zero/one would mean no retry."""
-    fn_call_count = 0
+def _fn_call_is_bounded(func: ast.FunctionDef) -> bool:
+    """#946: `fn(token)` must be called from inside a `for ... in range(...)`
+    loop - a structural proof the retry is finite regardless of how many
+    retry CLASSES exist (401, 5xx, secondary rate limit), without pinning
+    the exact attempt count (a policy value, not a structural invariant).
+    A `while True` or a call outside any loop both fail this - the first
+    because it cannot be proven to terminate by inspection, the second
+    because it means no retry at all."""
+    def _is_fn_call(node: ast.AST) -> bool:
+        return isinstance(node, ast.Call) and isinstance(node.func, ast.Name) and node.func.id == "fn"
+
+    def _is_range_call(node: ast.AST) -> bool:
+        return isinstance(node, ast.Call) and isinstance(node.func, ast.Name) and node.func.id == "range"
+
     for node in ast.walk(func):
-        if (isinstance(node, ast.Call) and isinstance(node.func, ast.Name)
-                and node.func.id == "fn"):
-            fn_call_count += 1
-    return fn_call_count == 2
+        if isinstance(node, ast.For) and _is_range_call(node.iter):
+            if any(_is_fn_call(inner) for inner in ast.walk(node)):
+                return True
+    return False
 
 
 def main() -> int:
@@ -113,11 +129,14 @@ def main() -> int:
         if not _catches_http_status_error(retry):
             problems.append("no `except httpx.HTTPStatusError` handler")
         if not _checks_401_status(retry):
-            problems.append("no `status_code == 401` (or `!= 401`) check — retry would fire on 5xx too")
+            problems.append("no `status_code == 401` (or `!= 401`) check — the 401 refresh path is gone")
         if not _has_force_refresh_call(retry):
             problems.append("no `get_install_token(..., force_refresh=True)` call — cache invalidation missing")
-        if not _exactly_two_fn_calls(retry):
-            problems.append("`fn(token)` is not called exactly twice — risks unbounded retry loop OR no retry at all")
+        if not _fn_call_is_bounded(retry):
+            problems.append(
+                "`fn(token)` is not called from inside a `for ... in range(...)` loop "
+                "— risks an unbounded retry loop OR no retry at all"
+            )
         if problems:
             failures.append(f"FAIL: {path}:\n" + "\n".join(f"  - {p}" for p in problems))
 
