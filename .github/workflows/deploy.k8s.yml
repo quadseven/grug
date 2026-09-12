@@ -517,7 +517,7 @@ jobs:
             # FastAPI trailing-slash with the CF worker's redirect:manual,
             # so a redirect would silently pass the gate).
             for _ in 1 2 3 4 5; do
-              code=$(curl -s -o /dev/null -w '%{http_code}' -m 12 "$1" 2>/dev/null || echo 000)
+              code=$(curl -s -o /dev/null -w '%{http_code}' --connect-timeout 5 -m 12 "$1" 2>/dev/null || echo 000)
               [ "$code" = "200" ] && return 0
               sleep 6
             done
@@ -549,7 +549,7 @@ jobs:
           PING_BODY='{"zen":"synthetic deploy self-test","hook_id":0}'
           PING_SIG=$(aws ssm get-parameter --name /grug/github-app-webhook-secret --with-decryption --query 'Parameter.Value' --output text \
             | PING_BODY="$PING_BODY" python3 -c 'import hashlib, hmac, os, sys; secret = sys.stdin.read().rstrip("\n").encode(); print(hmac.new(secret, os.environ["PING_BODY"].encode(), hashlib.sha256).hexdigest())')
-          ping_code=$(curl -s -o "$RUNNER_TEMP/ping.out" -w '%{http_code}' -m 20 -X POST \
+          ping_code=$(curl -s -o "$RUNNER_TEMP/ping.out" -w '%{http_code}' --connect-timeout 5 -m 20 -X POST \
             -H "X-GitHub-Event: ping" \
             -H "X-GitHub-Delivery: synthetic-${GITHUB_SHA}" \
             -H "X-Hub-Signature-256: sha256=${PING_SIG}" \
