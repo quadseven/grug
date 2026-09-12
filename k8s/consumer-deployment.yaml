@@ -204,10 +204,14 @@ spec:
             - {name: GRUG_DD_APP_KEY_SSM, value: /grug/dd-app-key}
             - {name: GRUG_OMEN_SERVICE_MAP_SSM, value: /grug/omen-service-map}
             - {name: GRUG_FALLBACK_ENABLED_SSM, value: /grug/elder-fallback-enabled}
-            # SAST detection engine (#401): Semgrep OSS over the vendored
-            # offline rules - the consumer runs full Elder re-runs, so it needs
-            # the same engine as the webhook. The semgrep CLI ships in the image.
-            - {name: GRUG_SAST_ENGINE, value: semgrep}
+            # SAST detection engine (#401, engine swapped #858): Opengrep - the
+            # LGPL-2.1 community fork of Semgrep CE - over the vendored offline
+            # rules. The consumer runs full Elder re-runs, so it needs the same
+            # engine as the webhook. The opengrep binary ships in the image;
+            # semgrep does NOT - it was removed from requirements.txt in #858.
+            # NOTE: this engine covers 10 hand-written PYTHON rules only. It is
+            # not general security coverage - see #859 before trusting it.
+            - {name: GRUG_SAST_ENGINE, value: opengrep}
             # Stable, writable, per-pod cache path for the engine
             # (#865). Unset falls back to the scan dir: correct but
             # re-extracts ~242M every scan.

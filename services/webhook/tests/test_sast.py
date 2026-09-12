@@ -669,3 +669,45 @@ def test_opengrep_home_falls_back_when_cache_dir_is_not_writable(tmp_path, monke
         assert env["HOME"] == str(scan)
     finally:
         blocked.chmod(0o700)
+
+
+def test_sast_engine_matches_across_both_review_workloads():
+    """The two review workloads must name the SAME engine, and it must be one
+    the image actually ships.
+
+    #858 swapped semgrep -> opengrep and removed semgrep from
+    requirements.txt, but only `webhook-deployment.yaml` was updated. The
+    consumer sat on `GRUG_SAST_ENGINE: semgrep` for six days with a comment
+    still claiming "the semgrep CLI ships in the image", which by then was
+    false. It kept scanning purely because `scan_candidates` aliases the
+    legacy name (pinned by
+    `test_legacy_semgrep_engine_name_still_scans` above) - so the drift was
+    invisible from behaviour and only the manifest text showed it.
+
+    That alias is a compatibility shim, not a licence to leave a manifest
+    naming a binary the image no longer contains. This is the same
+    both-review-workloads parity check `test_lint.py` already applies to
+    GRUG_LINT_EVIDENCE, pointed at the sibling scanner that drifted.
+    """
+    from pathlib import Path
+
+    import yaml
+
+    k8s = Path(__file__).resolve().parents[3] / "k8s"
+
+    engines = {}
+    for manifest in ("webhook-deployment.yaml", "consumer-deployment.yaml"):
+        docs = [d for d in yaml.safe_load_all((k8s / manifest).read_text()) if d]
+        (deploy,) = [d for d in docs if d.get("kind") == "Deployment"]
+        (container,) = deploy["spec"]["template"]["spec"]["containers"]
+        env = {e["name"]: e.get("value") for e in container.get("env", [])}
+        engines[manifest] = env.get("GRUG_SAST_ENGINE")
+
+    assert len(set(engines.values())) == 1, (
+        f"review workloads disagree on the SAST engine: {engines} - a full "
+        "Elder re-run on the consumer would not match the webhook's review"
+    )
+    assert set(engines.values()) == {"opengrep"}, (
+        f"expected the shipped engine 'opengrep', got {engines} - semgrep was "
+        "removed from the image in #858 and no longer exists to run"
+    )
