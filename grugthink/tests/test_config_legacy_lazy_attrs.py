@@ -17,9 +17,9 @@ import os
 # guard test_llm_fallback.py uses ahead of its own module-level import.
 os.environ.setdefault("DISCORD_TOKEN", "fake_token")
 
-from src.grugthink import config_legacy  # noqa: E402
-
 import pytest  # noqa: E402
+
+from src.grugthink import config_legacy  # noqa: E402
 
 
 @pytest.fixture(autouse=True)
@@ -44,7 +44,7 @@ class TestOllamaUrls:
     def test_invalid_url_raises(self, monkeypatch):
         monkeypatch.setenv("OLLAMA_URLS", "not-a-valid-url")
         with pytest.raises(ValueError, match="Invalid OLLAMA_URL"):
-            config_legacy.OLLAMA_URLS
+            _ = config_legacy.OLLAMA_URLS
 
 
 class TestOllamaModels:
@@ -58,7 +58,7 @@ class TestOllamaModels:
     def test_invalid_model_name_raises(self, monkeypatch):
         monkeypatch.setenv("OLLAMA_MODELS", "invalid/model name")
         with pytest.raises(ValueError, match="Invalid model name"):
-            config_legacy.OLLAMA_MODELS
+            _ = config_legacy.OLLAMA_MODELS
 
 
 class TestGeminiApiKey:
@@ -72,7 +72,7 @@ class TestGeminiApiKey:
     def test_invalid_key_raises(self, monkeypatch):
         monkeypatch.setenv("GEMINI_API_KEY", "bad key with spaces")
         with pytest.raises(ValueError, match="Invalid GEMINI_API_KEY"):
-            config_legacy.GEMINI_API_KEY
+            _ = config_legacy.GEMINI_API_KEY
 
 
 class TestDerivedAndPassthroughAttrs:
@@ -110,7 +110,7 @@ class TestDerivedAndPassthroughAttrs:
 
 def test_unknown_attribute_raises_attribute_error():
     with pytest.raises(AttributeError, match="has no attribute 'NOT_A_REAL_ATTR'"):
-        config_legacy.NOT_A_REAL_ATTR
+        _ = config_legacy.NOT_A_REAL_ATTR
 
 
 def test_getattr_dispatch_covers_every_lazy_attr_name():
