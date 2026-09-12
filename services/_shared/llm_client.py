@@ -418,8 +418,8 @@ class Backend(str, Enum):
     # Owned in-cluster review ensemble (ADR-0009), both fronted by the same
     # spark-gateway (it routes by model name to whichever Spark carries it,
     # warm-first). CAVE = the coder arm (qwen3-coder-next on sparkles),
-    # CAVE_REASONER = the reasoner arm (qwen3.5 - permanently resident on
-    # sparkicus ollama since the nemotron vLLM was retired 2026-07-12). Deep
+    # CAVE_REASONER = the reasoner arm (default below is Laguna, and BOTH
+    # deployments override it to `spark:warm-any` - see #843). Deep
     # review runs BOTH and merges - the brain+hands split that is now the
     # PRIMARY review path (POOLSIDE/OPENROUTER above are a bounded overload
     # fallback only - see _saas_overload_fallback_config). The exposed-secret
@@ -774,9 +774,20 @@ def _review_backend_config(backend: Backend) -> BackendConfig:
     )
 
 
-# The judge receives small, finding-specific evidence packets and benefits from
-# the permanently resident reasoner on sparkicus. Discovery uses the coder on
-# the cold Spark; adjudication must not load a second copy there.
+# The judge receives small, finding-specific evidence packets and wants a
+# model already warm somewhere. Discovery uses the coder on the cold Spark;
+# adjudication must not load a second copy there.
+#
+# What actually runs in production is NOT this default: both
+# k8s/webhook-deployment.yaml and k8s/consumer-deployment.yaml set
+# GRUG_CAVE_JUDGE_MODEL=spark:warm-any, so the gateway picks whichever Spark
+# model is warm. This literal is the fallback for any deploy that does not
+# set that env var.
+#
+# #843 is open on this value: the eval that promoted Laguna
+# (docs/research/laguna-s-2.1-dgx-spark-elder-eval-2026-07-21.md) recommends
+# AGAINST it as a blanket default and measures it at 0.000 on the test-gap
+# class. Do not read this line as a settled choice.
 _CAVE_JUDGE_DEFAULT_MODEL = "poolside/Laguna-S-2.1-NVFP4"
 
 
@@ -819,12 +830,16 @@ def _cave_judge_config() -> "BackendConfig | None":
 # same spark-gateway (it routes by model name, warm targets first). Deep review
 # runs both and merges; the SaaS pair is retired.
 #
-# Reasoner default is qwen3.5 (permanently resident on sparkicus ollama), NOT
-# nemotron-3-super: the nemotron vLLM was retired 2026-07-12 to keep qwen3.5
-# always-hot, and with vLLM gone the gateway failed nemotron over to a COLD
-# ollama - an ~87GB load per review that read-timed out every Elder call
-# (llm_backend_transport_failed) and starved the coder Spark. Defaults must
-# name models that are actually warm somewhere.
+# Defaults must name models that are actually warm somewhere. That rule comes
+# from nemotron-3-super: the nemotron vLLM was retired 2026-07-12, and with
+# vLLM gone the gateway failed nemotron over to a COLD ollama - an ~87GB load
+# per review that read-timed out every Elder call (llm_backend_transport_failed)
+# and starved the coder Spark.
+#
+# The reasoner default was qwen3.5 when that was written; it is Laguna now
+# (#728). As with the judge above, production does not use this literal -
+# both deployments set GRUG_CAVE_REASONER_MODEL=spark:warm-any - and #843 is
+# open on whether Laguna should be the default at all.
 _CAVE_REVIEW_CODER_DEFAULT_MODEL = "qwen3-coder-next:q8_0"
 _CAVE_REVIEW_REASONER_DEFAULT_MODEL = "poolside/Laguna-S-2.1-NVFP4"
 
