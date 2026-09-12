@@ -149,6 +149,13 @@ def create(
                             "iam:UpdateRole", "iam:UpdateAssumeRolePolicy",
                             "iam:TagRole", "iam:UntagRole",
                             "iam:ListRolePolicies", "iam:ListAttachedRolePolicies",
+                            # grug#952: AWS's DeleteRole internally calls this
+                            # before it will delete a role, even with nothing
+                            # attached - missing it 403s the delete outright,
+                            # which failed `pulumi up` on every single push
+                            # once grug-gha-leak-guard was removed from source
+                            # (page-tier CI-dead alert, 2026-09-12).
+                            "iam:ListInstanceProfilesForRole",
                             "iam:ListRoleTags",
                             "iam:PutRolePolicy", "iam:GetRolePolicy",
                             "iam:DeleteRolePolicy",
