@@ -64,7 +64,11 @@ jobs:
       # different target).
       - name: install opengrep (pinned to match services/Dockerfile)
         run: |
-          curl -fsSL -o /usr/local/bin/opengrep \
+          # #896: a ~100MB fetch over a public CDN is not fast, so
+          # --max-time is generous (5 min); --retry covers a transient
+          # stall without failing the whole job for it.
+          curl -fsSL --connect-timeout 10 --max-time 300 --retry 3 \
+            --retry-connrefused -o /usr/local/bin/opengrep \
             "https://github.com/opengrep/opengrep/releases/download/v1.27.1/opengrep_manylinux_x86"
           chmod 0755 /usr/local/bin/opengrep
           opengrep --version
