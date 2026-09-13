@@ -211,6 +211,42 @@ def _retry_sleep_seconds(attempt: int, response: httpx.Response) -> float:
     return min(max(backoff + jitter, server_wait), _RETRY_MAX_SLEEP_SECONDS)
 
 
+_APP_INSTALLATIONS_MAX_PAGES = 10  # 1000 installations - generous cap, log + truncate never spin
+
+
+def list_app_installations() -> list[dict]:
+    """Enumerate every installation of THIS GitHub App (`GET /app/installations`,
+    paginated, App-JWT authed - not `with_install_token_retry`: an install
+    missing from our own store has no cached install token to retry with,
+    which is exactly the gap this exists to find, grug#842).
+
+    Returns GitHub's raw installation objects (`id`, `account`, ...) - no
+    field here identifies WHO installed it (that only ever arrives on the
+    `installation.created` webhook's `sender`), so a caller repairing a
+    missing store row from this list has no real `installed_by_user_id` to
+    give `record_installation`. Page cap mirrors `list_installation_repos`:
+    log + truncate, never spin.
+    """
+    out: list[dict] = []
+    for page in range(1, _APP_INSTALLATIONS_MAX_PAGES + 1):
+        resp = httpx.get(
+            f"{_GH_API}/app/installations",
+            params={"per_page": 100, "page": page},
+            headers={
+                "Authorization": f"Bearer {get_app_jwt()}",
+                "Accept": "application/vnd.github+json",
+                "X-GitHub-Api-Version": "2022-11-28",
+            },
+            timeout=10,
+        )
+        resp.raise_for_status()
+        page_items = resp.json() or []
+        if not page_items:
+            break
+        out.extend(page_items)
+    return out
+
+
 def with_install_token_retry(installation_id: int, fn):
     """Run `fn(token)`, retrying transient failures.
 

@@ -54,6 +54,11 @@ def _wire(monkeypatch, *, installs, records_for, retry, poll):
     monkeypatch.setattr(
         "github_rulesets_client.list_installation_repos", lambda token: [],
     )
+    # grug#842: default the install-reconciliation pass to idle (no gap
+    # found) so the reaction-poll assertions stay about the reaction poll.
+    monkeypatch.setattr(
+        poller_handler, "_install_reconciliation_pass", lambda: (0, 0, 0),
+    )
 
 
 def test_poller_polls_each_allowlisted_install(monkeypatch):
@@ -74,7 +79,7 @@ def test_poller_polls_each_allowlisted_install(monkeypatch):
     )
     out = poller_handler.handler({}, None)
     assert polled == [11, 22]
-    assert out == {"installs": 2, "records": 2, "submitted": 4, "failed_installs": 0, "pulse_nudges": 0, "pulse_failed_installs": 0, "dep_watch_reports": 0, "dep_watch_failed_installs": 0, "reopen_watch_escalated": 0, "reopen_watch_failed_installs": 0, "hygiene_watch_reports": 0, "hygiene_watch_failed_installs": 0, "check_run_reconciled": 0, "check_run_reconcile_failed_installs": 0, "enforcement_emitted": 0, "enforcement_failed_installs": 0}
+    assert out == {"installs": 2, "records": 2, "submitted": 4, "failed_installs": 0, "pulse_nudges": 0, "pulse_failed_installs": 0, "dep_watch_reports": 0, "dep_watch_failed_installs": 0, "reopen_watch_escalated": 0, "reopen_watch_failed_installs": 0, "hygiene_watch_reports": 0, "hygiene_watch_failed_installs": 0, "check_run_reconciled": 0, "check_run_reconcile_failed_installs": 0, "install_reconciliation_repaired": 0, "install_reconciliation_stale": 0, "install_reconciliation_failed": 0, "enforcement_emitted": 0, "enforcement_failed_installs": 0}
 
 
 def test_poller_one_install_failure_does_not_abort_cycle(monkeypatch, caplog):
@@ -146,7 +151,7 @@ def test_poller_skips_installs_with_no_records(monkeypatch):
     )
     out = poller_handler.handler({}, None)
     assert touched == [7]   # the enforcement pass's single token acquisition
-    assert out == {"installs": 1, "records": 0, "submitted": 0, "failed_installs": 0, "pulse_nudges": 0, "pulse_failed_installs": 0, "dep_watch_reports": 0, "dep_watch_failed_installs": 0, "reopen_watch_escalated": 0, "reopen_watch_failed_installs": 0, "hygiene_watch_reports": 0, "hygiene_watch_failed_installs": 0, "check_run_reconciled": 0, "check_run_reconcile_failed_installs": 0, "enforcement_emitted": 0, "enforcement_failed_installs": 0}
+    assert out == {"installs": 1, "records": 0, "submitted": 0, "failed_installs": 0, "pulse_nudges": 0, "pulse_failed_installs": 0, "dep_watch_reports": 0, "dep_watch_failed_installs": 0, "reopen_watch_escalated": 0, "reopen_watch_failed_installs": 0, "hygiene_watch_reports": 0, "hygiene_watch_failed_installs": 0, "check_run_reconciled": 0, "check_run_reconcile_failed_installs": 0, "install_reconciliation_repaired": 0, "install_reconciliation_stale": 0, "install_reconciliation_failed": 0, "enforcement_emitted": 0, "enforcement_failed_installs": 0}
 
 
 # --- grug#767: per-pass isolation --------------------------------------------
@@ -359,7 +364,7 @@ def test_poller_all_installs_fail_logs_error(monkeypatch, caplog):
     )
     with caplog.at_level(_logging.WARNING):
         out = poller_handler.handler({}, None)
-    assert out == {"installs": 2, "records": 2, "submitted": 0, "failed_installs": 2, "pulse_nudges": 0, "pulse_failed_installs": 0, "dep_watch_reports": 0, "dep_watch_failed_installs": 0, "reopen_watch_escalated": 0, "reopen_watch_failed_installs": 0, "hygiene_watch_reports": 0, "hygiene_watch_failed_installs": 0, "check_run_reconciled": 0, "check_run_reconcile_failed_installs": 0, "enforcement_emitted": 0, "enforcement_failed_installs": 2}
+    assert out == {"installs": 2, "records": 2, "submitted": 0, "failed_installs": 2, "pulse_nudges": 0, "pulse_failed_installs": 0, "dep_watch_reports": 0, "dep_watch_failed_installs": 0, "reopen_watch_escalated": 0, "reopen_watch_failed_installs": 0, "hygiene_watch_reports": 0, "hygiene_watch_failed_installs": 0, "check_run_reconciled": 0, "check_run_reconcile_failed_installs": 0, "install_reconciliation_repaired": 0, "install_reconciliation_stale": 0, "install_reconciliation_failed": 0, "enforcement_emitted": 0, "enforcement_failed_installs": 2}
     errs = [r for r in caplog.records if r.msg == "reaction_poll_all_installs_failed"]
     assert errs and errs[0].levelno == _logging.ERROR
     # a partial failure (not ALL) must NOT escalate to error
@@ -376,7 +381,108 @@ def test_poller_no_installs_is_a_clean_noop(monkeypatch):
         poll=lambda *a, **k: 1,
     )
     out = poller_handler.handler({}, None)
-    assert out == {"installs": 0, "records": 0, "submitted": 0, "failed_installs": 0, "pulse_nudges": 0, "pulse_failed_installs": 0, "dep_watch_reports": 0, "dep_watch_failed_installs": 0, "reopen_watch_escalated": 0, "reopen_watch_failed_installs": 0, "hygiene_watch_reports": 0, "hygiene_watch_failed_installs": 0, "check_run_reconciled": 0, "check_run_reconcile_failed_installs": 0, "enforcement_emitted": 0, "enforcement_failed_installs": 0}
+    assert out == {"installs": 0, "records": 0, "submitted": 0, "failed_installs": 0, "pulse_nudges": 0, "pulse_failed_installs": 0, "dep_watch_reports": 0, "dep_watch_failed_installs": 0, "reopen_watch_escalated": 0, "reopen_watch_failed_installs": 0, "hygiene_watch_reports": 0, "hygiene_watch_failed_installs": 0, "check_run_reconciled": 0, "check_run_reconcile_failed_installs": 0, "install_reconciliation_repaired": 0, "install_reconciliation_stale": 0, "install_reconciliation_failed": 0, "enforcement_emitted": 0, "enforcement_failed_installs": 0}
+
+
+# --- grug#842: install reconciliation pass -----------------------------------
+
+
+def test_install_reconciliation_repairs_missing_from_store(monkeypatch):
+    """An install GitHub has but the store doesn't is repaired via the
+    existing idempotent record_installation - the exact gap #842 filed on."""
+    repaired = []
+    gauges = []
+    monkeypatch.setattr(
+        "github_app_auth.list_app_installations",
+        lambda: [
+            {"id": 1, "account": {"id": 1001, "login": "acme", "type": "Organization"}},
+            {"id": 2, "account": {"id": 2002, "login": "solo-dev", "type": "User"}},
+        ],
+    )
+    monkeypatch.setattr("adapters.install_store.list_all_install_ids", lambda: [1])
+    monkeypatch.setattr(
+        "adapters.install_store.record_installation",
+        lambda **kw: repaired.append(kw),
+    )
+    monkeypatch.setattr(
+        "observability.emit_gauge", lambda metric, value, tags=None: gauges.append((metric, value)),
+    )
+    out = poller_handler._install_reconciliation_pass()
+    assert out == (1, 0, 0)  # repaired=1, stale=0, failed=0
+    assert repaired == [{
+        "install_id": 2, "account_login": "solo-dev",
+        "account_type": "User", "installed_by_user_id": 2002,
+    }]
+    assert ("grug.install_reconciliation.missing_from_store", 1.0) in gauges
+    assert ("grug.install_reconciliation.stale_store_rows", 0.0) in gauges
+
+
+def test_install_reconciliation_flags_stale_row_without_deleting(monkeypatch):
+    """An INST# row for an install GitHub no longer has is reported (stale
+    count), never auto-deleted - the issue asks for visibility only."""
+    repaired = []
+    monkeypatch.setattr(
+        "github_app_auth.list_app_installations",
+        lambda: [{"id": 1, "account": {"id": 1001, "login": "acme", "type": "Organization"}}],
+    )
+    monkeypatch.setattr("adapters.install_store.list_all_install_ids", lambda: [1, 2])
+    monkeypatch.setattr(
+        "adapters.install_store.record_installation", lambda **kw: repaired.append(kw),
+    )
+    monkeypatch.setattr("observability.emit_gauge", lambda *a, **k: None)
+    out = poller_handler._install_reconciliation_pass()
+    assert out == (0, 1, 0)  # repaired=0, stale=1, failed=0
+    assert repaired == []    # no repair action for a stale row
+
+
+def test_install_reconciliation_stays_quiet_once_repaired(monkeypatch):
+    """Once GitHub and the store agree, the pass reports nothing - the
+    other half of #842's 'detect... and stay quiet once repaired'."""
+    repaired = []
+    monkeypatch.setattr(
+        "github_app_auth.list_app_installations",
+        lambda: [
+            {"id": 1, "account": {"id": 1001, "login": "acme", "type": "Organization"}},
+            {"id": 2, "account": {"id": 2002, "login": "solo-dev", "type": "User"}},
+        ],
+    )
+    monkeypatch.setattr("adapters.install_store.list_all_install_ids", lambda: [1, 2])
+    monkeypatch.setattr(
+        "adapters.install_store.record_installation", lambda **kw: repaired.append(kw),
+    )
+    monkeypatch.setattr("observability.emit_gauge", lambda *a, **k: None)
+    assert poller_handler._install_reconciliation_pass() == (0, 0, 0)
+    assert repaired == []
+
+
+def test_install_reconciliation_pass_failure_is_best_effort(monkeypatch):
+    """A GitHub/store failure during reconciliation must not raise into the
+    cron - it degrades to failed=1, same best-effort contract as every
+    other pass."""
+    monkeypatch.setattr(
+        "github_app_auth.list_app_installations",
+        lambda: (_ for _ in ()).throw(RuntimeError("GitHub down")),
+    )
+    assert poller_handler._install_reconciliation_pass() == (0, 0, 1)
+
+
+def test_handler_surfaces_install_reconciliation_counts(monkeypatch):
+    """The cron summary carries the reconciliation counts so an operator/DD
+    sees a repaired or stale install without reading raw poller logs."""
+    _wire(
+        monkeypatch,
+        installs=[],
+        records_for=lambda iid: [],
+        retry=lambda iid, fn: fn("tok"),
+        poll=lambda *a, **k: 0,
+    )
+    monkeypatch.setattr(
+        poller_handler, "_install_reconciliation_pass", lambda: (1, 2, 0),
+    )
+    out = poller_handler.handler({}, None)
+    assert out["install_reconciliation_repaired"] == 1
+    assert out["install_reconciliation_stale"] == 2
+    assert out["install_reconciliation_failed"] == 0
 
 
 # --- #460: enforcement-gauge re-emission pass --------------------------------
