@@ -155,13 +155,12 @@ def is_install_allowlisted(install_id: int) -> bool:
     return allowlisted
 
 
-def list_allowlisted_installs() -> list[int]:
-    """Install_ids whose installer is allowlisted (poller batch, #247b).
-
-    The DDB version SCANned; here a single WHERE does it. The per-id
-    re-check via is_install_allowlisted is kept for log parity (the
-    allowlist_miss_* events are how the operator debugs poller gaps).
-    """
+def list_all_install_ids() -> list[int]:
+    """Every live INST#<id> row's id, regardless of allowlist status
+    (grug#842: reconciliation needs the UNFILTERED set - a row whose
+    installer fell off the allowlist is still a row that exists, and an
+    install missing from GitHub entirely is exactly what this compares
+    against `list_app_installations()` to find)."""
     with get_pool().connection() as conn:
         rows = conn.execute(
             f"SELECT pk FROM grug_kv WHERE sk = 'META' AND pk LIKE %s AND {TTL_LIVE}",
@@ -173,13 +172,20 @@ def list_allowlisted_installs() -> list[int]:
         if not sep:
             continue
         try:
-            iid = int(id_str)
+            install_ids.append(int(id_str))
         except (TypeError, ValueError):
             log.warning("install_pk_unparsable", extra={"pk": pk})
-            continue
-        if is_install_allowlisted(iid):
-            install_ids.append(iid)
     return install_ids
+
+
+def list_allowlisted_installs() -> list[int]:
+    """Install_ids whose installer is allowlisted (poller batch, #247b).
+
+    The DDB version SCANned; here a single WHERE does it. The per-id
+    re-check via is_install_allowlisted is kept for log parity (the
+    allowlist_miss_* events are how the operator debugs poller gaps).
+    """
+    return [iid for iid in list_all_install_ids() if is_install_allowlisted(iid)]
 
 
 # ---------------------------------------------------------------------------

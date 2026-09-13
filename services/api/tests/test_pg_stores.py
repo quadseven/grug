@@ -893,6 +893,24 @@ def test_allowlist_edges_missing_row_and_mixed_set(pg):
     assert store.list_allowlisted_installs() == [1, 3]
 
 
+def test_list_all_install_ids_is_unfiltered_by_allowlist(pg):
+    """grug#842: reconciliation needs every INST# row's id, including one
+    whose installer never got allowlisted - list_allowlisted_installs
+    filters exactly this away, so it cannot be the source of truth for
+    the missing-from-store/stale-in-store comparison."""
+    from adapters import pg_install_store as store
+
+    assert store.list_all_install_ids() == []
+    store.record_installation(
+        install_id=1, account_login="a1", account_type="User", installed_by_user_id=11,
+    )
+    store.record_installation(
+        install_id=2, account_login="a2", account_type="User", installed_by_user_id=22,
+    )
+    assert sorted(store.list_all_install_ids()) == [1, 2]
+    assert store.list_allowlisted_installs() == []  # neither installer is allowlisted
+
+
 def test_scan_meta_items_excludes_ttl_expired(pg):
     from adapters import pg_user_store as users
 

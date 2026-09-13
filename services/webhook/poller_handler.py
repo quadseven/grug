@@ -299,6 +299,80 @@ def _enforcement_reemission_pass(installs: list[int]) -> tuple[int, int]:
     return enforcement_emitted, enforcement_failed
 
 
+def _install_reconciliation_pass() -> tuple[int, int, int]:
+    """Compare GitHub's live installation list against the store's INST#
+    rows (grug#842): an install present at GitHub but missing its row is
+    completely silent - webhooks drop at `is_install_allowlisted`'s
+    `allowlist_miss_no_install`, an INFO log nobody watches. An INST# row
+    for an install GitHub no longer has is stale in the other direction.
+    Both directions are fleet-wide, not per-install, so this does its own
+    top-level GitHub + store fetch rather than looping the
+    already-allowlist-filtered `installs` the other passes share.
+
+    Repairs the missing-from-store direction via the existing idempotent
+    `record_installation`. GitHub's app-level listing has no field
+    identifying WHO installed it (only `installation.created`'s webhook
+    `sender` does) - a repaired row's `installed_by_user_id` is the
+    account's own id, a documented placeholder that unblocks the
+    allowlist gate but will never resolve a real human in
+    `list_user_installations`'s dashboard lookup. That's acceptable: this
+    repair exists to stop webhooks from silently dropping, not to
+    backfill dashboard ownership. The reverse direction (a stale row) is
+    reported only, never auto-deleted - the issue asks for visibility,
+    not an unattended delete of state whose downstream effects (REPO#
+    rows, etc.) are out of scope here.
+
+    Returns (repaired, stale_flagged, failed). `failed` is 0 or 1: this is
+    one top-level GitHub/store comparison, not a per-install loop, so a
+    single failure aborts this pass (never the cron) rather than needing
+    its own per-item counter.
+    """
+    try:
+        from adapters.install_store import list_all_install_ids, record_installation
+        from github_app_auth import list_app_installations
+        from observability import emit_gauge
+
+        gh_installs = list_app_installations()
+        gh_ids = {inst["id"] for inst in gh_installs if "id" in inst}
+        store_ids = set(list_all_install_ids())
+        missing_from_store = gh_ids - store_ids
+        stale_in_store = store_ids - gh_ids
+
+        repaired = 0
+        for inst in gh_installs:
+            iid = inst.get("id")
+            if iid not in missing_from_store:
+                continue
+            account = inst.get("account") or {}
+            try:
+                record_installation(
+                    install_id=iid,
+                    account_login=account.get("login", ""),
+                    account_type=account.get("type", ""),
+                    installed_by_user_id=account.get("id") or 0,
+                )
+                repaired += 1
+                log.warning(
+                    "install_reconciliation_repaired",
+                    extra={"install_id": iid, "account_login": account.get("login", "")},
+                )
+            except Exception as e:  # noqa: BLE001 — one bad row must not drop the rest
+                log.warning(
+                    "install_reconciliation_repair_failed",
+                    extra={"install_id": iid, "kind": type(e).__name__},
+                )
+
+        for iid in stale_in_store:
+            log.warning("install_reconciliation_stale_store_row", extra={"install_id": iid})
+
+        emit_gauge("grug.install_reconciliation.missing_from_store", float(len(missing_from_store)))
+        emit_gauge("grug.install_reconciliation.stale_store_rows", float(len(stale_in_store)))
+        return repaired, len(stale_in_store), 0
+    except Exception as e:  # noqa: BLE001 — this pass must never abort the cron
+        log.warning("install_reconciliation_pass_failed", extra={"kind": type(e).__name__})
+        return 0, 0, 1
+
+
 def handler(event: dict[str, Any], context: Any) -> dict[str, int | str]:
     """Poll reactions for every allowlisted install. Returns a summary
     dict (installs scanned, records polled, verdicts submitted) — also
@@ -351,6 +425,10 @@ def handler(event: dict[str, Any], context: Any) -> dict[str, int | str]:
 
     check_run_reconciled, check_run_reconcile_failed = reconcile_installs(installs)
 
+    install_repaired, install_stale, install_reconciliation_failed = (
+        _install_reconciliation_pass()
+    )
+
     # Enforcement-gauge re-emission (#460): same best-effort shape as the
     # passes above, plus per-REPO best-effort so one repo's GitHub error
     # can't starve the rest of their gauge - see _enforcement_reemission_pass.
@@ -380,6 +458,9 @@ def handler(event: dict[str, Any], context: Any) -> dict[str, int | str]:
         "hygiene_watch_failed_installs": hygiene_watch_failed,
         "check_run_reconciled": check_run_reconciled,
         "check_run_reconcile_failed_installs": check_run_reconcile_failed,
+        "install_reconciliation_repaired": install_repaired,
+        "install_reconciliation_stale": install_stale,
+        "install_reconciliation_failed": install_reconciliation_failed,
         "enforcement_emitted": enforcement_emitted,
         "enforcement_failed_installs": enforcement_failed,
         **replay,
