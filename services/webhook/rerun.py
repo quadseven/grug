@@ -1247,6 +1247,20 @@ def _run_hot_review(
     skip immediately. Base, head, title, or body movement during the quiet
     window cancels this job; the event for the new snapshot owns the next
     durable message.
+
+    grug#892: `job["requested_head_sha"]` is checked against this SAME live
+    fetch before anything else runs (no claim acquired, no settle, no
+    dispatch) - a mismatch means a newer push already superseded this job,
+    and per FIFO ordering (MessageGroupId is per-PR-per-persona) whatever
+    pushed the head also enqueued a fresh job for it, so retiring here is
+    safe: the real review happens under that job's own identity and retry
+    budget instead of this one's. This is decided ONLY against live PR
+    state (`before`, fetched either way) - a consumer cannot reliably
+    inspect the queue for a newer message, so the queue is never consulted.
+    A stale job that instead failed mid-flight (a GitHub 403, in the
+    incident that filed this) used to burn its full SQS retry budget
+    before dead-lettering, blocking the real job for the current head
+    behind it in the same FIFO group for as long as that took.
     """
     owner, sep, repo_name = repo_full.partition("/")
     if not sep or not owner or not repo_name:
@@ -1256,6 +1270,37 @@ def _run_hot_review(
     head_sha = str((before.get("head") or {}).get("sha") or "")
     if not head_sha:
         raise ValueError("current PR has no head SHA")
+
+    requested_head_sha = str(job.get("requested_head_sha") or "")
+    if requested_head_sha and requested_head_sha != head_sha:
+        log.info(
+            "elder_review_superseded_at_entry",
+            extra={
+                "repo": repo_full,
+                "pr": pr_number,
+                "requested_head_sha": requested_head_sha[:8],
+                "current_head_sha": head_sha[:8],
+            },
+        )
+        # Best-effort, never raises (see _complete_elder_check_open) - close
+        # the SUPERSEDED head's own check so it never sticks in_progress.
+        # The current head's check (posted by ITS OWN enqueue) is untouched.
+        _complete_elder_check_open(
+            install_id=install_id,
+            owner=owner,
+            repo_name=repo_name,
+            pr_number=pr_number,
+            head_sha=requested_head_sha,
+            title="Elder superseded - new head",
+            summary=(
+                "A newer commit arrived before this review started. This "
+                "head is closed as neutral (fail-open). The review already "
+                "queued for the current head handles the real check."
+            ),
+            conclusion="neutral",
+        )
+        return "superseded_at_entry"
+
     if bool(before.get("draft", False)):
         log.info(
             "elder_review_draft_skipped",
@@ -1656,7 +1701,7 @@ def handle_rerun_jobs(event: dict[str, Any]) -> dict[str, int]:
             1 for status in statuses
             if status in {
                 "skipped_persona", "duplicate_snapshot", "stale_snapshot",
-                "draft_skipped", "pr_ineligible",
+                "draft_skipped", "pr_ineligible", "superseded_at_entry",
             }
         ),
     }

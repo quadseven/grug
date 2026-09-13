@@ -368,7 +368,7 @@ def test_hot_review_settles_then_dispatches_same_current_snapshot(monkeypatch):
     monkeypatch.setattr(rerun, "dispatch_code_review", dispatch)
 
     status = rerun._run_one(_job(
-        kind="review", requested_head_sha="event-head", settle_seconds=90,
+        kind="review", requested_head_sha="latest", settle_seconds=90,
     ))
 
     assert status == "dispatched"
@@ -503,6 +503,102 @@ def test_hot_review_requeues_latest_when_dispatch_detects_stale(monkeypatch):
     release.assert_called_once()
     assert release.call_args.kwargs["owner_token"] == acquire.call_args.kwargs["owner_token"]
     complete.assert_not_called()
+
+
+def test_hot_review_retires_at_entry_when_already_superseded(monkeypatch):
+    """grug#892: a job whose requested_head_sha no longer matches the live
+    current head retires BEFORE any claim/settle/dispatch work - the exact
+    incident shape (a stale job burning its retry budget on GitHub errors
+    tied to a commit nobody cares about anymore, blocking the real job for
+    the current head behind it in the same FIFO group)."""
+    fetches = iter((_pr_data(head_sha="fresh-head"),))
+    posted: list = []
+
+    def _fake_token_retry(iid, fn):
+        try:
+            return next(fetches)
+        except StopIteration:
+            # Fetch exhausted: this is the check-post call.
+            return fn("tok")
+
+    monkeypatch.setattr(rerun, "with_install_token_retry", _fake_token_retry)
+    monkeypatch.setattr(
+        rerun, "post_check_run",
+        lambda token, owner, repo, result, external_id=None: posted.append(result) or {"id": 1},
+    )
+    acquire, complete, release = _patch_hot_claims(monkeypatch)
+    dispatch = MagicMock()
+    monkeypatch.setattr(rerun, "dispatch_code_review", dispatch)
+
+    status = rerun._run_one(_job(
+        kind="review", requested_head_sha="stale-head", settle_seconds=90,
+    ))
+
+    assert status == "superseded_at_entry"
+    acquire.assert_not_called()   # no claim work for a job that never runs
+    dispatch.assert_not_called()  # never reaches the real review
+    complete.assert_not_called()
+    release.assert_not_called()
+    assert len(posted) == 1
+    assert posted[0].head_sha == "stale-head"  # closes the SUPERSEDED head
+    assert posted[0].status == "completed"
+    assert posted[0].conclusion == "neutral"
+
+
+def test_hot_review_does_not_retire_when_requested_head_matches_current(monkeypatch):
+    """The other half of #892's contract: a job whose head IS current must
+    proceed exactly as before - no early-retire false positive."""
+    fetches = iter((_pr_data(head_sha="current-head"),))
+    posted: list = []
+    monkeypatch.setattr(
+        rerun, "with_install_token_retry", lambda iid, fn: next(fetches),
+    )
+    monkeypatch.setattr(
+        rerun, "post_check_run",
+        lambda token, owner, repo, result, external_id=None: posted.append(result) or {"id": 1},
+    )
+    acquire, complete, release = _patch_hot_claims(monkeypatch, status="completed")
+
+    status = rerun._run_one(_job(
+        kind="review", requested_head_sha="current-head", settle_seconds=90,
+    ))
+
+    assert status == "duplicate_snapshot"  # reached the claim step, not retired
+    acquire.assert_called_once()
+    assert posted == []  # no superseded-head check posted
+
+
+def test_hot_review_newer_job_dispatches_when_stale_job_precedes_it_in_group(monkeypatch):
+    """grug#892 acceptance: the newer job for the current head is processed
+    even though an older, now-superseded job for the same PR precedes it in
+    the same FIFO group's batch - the stale one retires without blocking it.
+
+    Decouples the check-post token call from PR-data fetches (rather than
+    one flat with_install_token_retry iterator, per the other tests here) -
+    with two jobs in one batch, the stale job's check-post call would
+    otherwise land BETWEEN the two jobs' real PR fetches and desync a
+    single shared iterator's exhaustion point from which call is which."""
+    pr_fetches = iter((
+        _pr_data(head_sha="fresh-head"),   # stale job's entry check
+        _pr_data(head_sha="fresh-head"),   # fresh job's entry check
+        _pr_data(head_sha="fresh-head"),   # fresh job's post-settle check
+    ))
+    monkeypatch.setattr(rerun, "with_install_token_retry", lambda iid, fn: fn("tok"))
+    monkeypatch.setattr(rerun, "_fetch_current_pr", lambda *a, **k: next(pr_fetches))
+    monkeypatch.setattr(rerun, "post_check_run", lambda *a, **k: {"id": 1})
+    monkeypatch.setattr(rerun, "get_repo_config", lambda iid, rid: {})
+    acquire, complete, release = _patch_hot_claims(monkeypatch)
+    dispatch = MagicMock(return_value={"persona": "code_reviewer", "result": "pass"})
+    monkeypatch.setattr(rerun, "dispatch_code_review", dispatch)
+
+    out = rerun.handle_rerun_jobs(_event(
+        _job(kind="review", requested_head_sha="stale-head", settle_seconds=0),
+        _job(kind="review", requested_head_sha="fresh-head", settle_seconds=0),
+    ))
+
+    assert out == {"records": 2, "dispatched": 1, "skipped": 1}
+    dispatch.assert_called_once()  # only the fresh job's job ever reached dispatch
+    acquire.assert_called_once()   # only the fresh job ever acquired a claim
 
 
 def test_hot_review_stale_with_moved_head_closes_abandoned_check(monkeypatch):
