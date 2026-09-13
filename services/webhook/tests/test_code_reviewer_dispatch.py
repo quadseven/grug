@@ -1601,16 +1601,18 @@ def test_dispatch_capture_skips_marked_comment_with_no_matching_finding(monkeypa
     assert captured == []
 
 
-def test_dispatch_capture_falls_back_to_original_line_when_line_is_null(monkeypatch):
+def test_dispatch_capture_ignores_null_line_and_original_line(monkeypatch):
     """grug#967: GitHub's REST API is eventually consistent for a JUST-
-    created review comment's `line` field - fetching it in the same
-    synchronous round-trip this capture step runs in (moments after
-    `post_review` returns) reliably returns `line: null`, confirmed live,
-    even though the identical comment queried again seconds later has the
-    correct value. This was a 100%-reproducing capture failure: every real
-    comment this function ever saw was silently dropped. `original_line`
-    (populated immediately, at creation time) does not share the lag and is
-    what we actually have evidence for regardless."""
+    created review comment's `line`/`original_line` fields - fetching them
+    in the same synchronous round-trip this capture step runs in (moments
+    after `post_review` returns) reliably returns both null, confirmed
+    live, even though the identical comment queried again seconds later has
+    the correct values. This was a 100%-reproducing capture failure: every
+    real comment this function ever saw was silently dropped. The fix
+    (grug#967) stopped reading `line`/`original_line` from the fetched
+    comment at all - `path` and the rule marker are matched against the
+    Finding directly, so a comment lacking BOTH fields still captures on
+    the very first fetch, no retry needed."""
     captured = []
     monkeypatch.setattr(cr_dispatch, "review_diff", lambda *a, **kw: _llm_with_span())
     monkeypatch.setattr(cr_dispatch, "post_check_run", lambda *a, **kw: {"id": 1})
@@ -1618,7 +1620,7 @@ def test_dispatch_capture_falls_back_to_original_line_when_line_is_null(monkeypa
     monkeypatch.setattr(
         cr_dispatch, "get_review_comments",
         lambda *a, **kw: [{
-            "id": 555, "path": "src/x.py", "line": None, "original_line": 2,
+            "id": 555, "path": "src/x.py", "line": None, "original_line": None,
             "body": "m\n<!-- grug-rule:silent-failure -->",
         }],
     )
@@ -1632,123 +1634,68 @@ def test_dispatch_capture_falls_back_to_original_line_when_line_is_null(monkeypa
     assert captured[0]["comment_id"] == 555
 
 
-def test_dispatch_capture_retries_and_recovers_once_github_backfills_line(monkeypatch):
-    """grug#967's complete shape: the FIRST fetch, run in the same
-    synchronous round-trip as `post_review`, returns the comment carrying
-    only `position`/`original_position` (a diff-patch offset, not a file
-    line number - GitHub has not yet computed the human-readable fields).
-    A bounded retry re-fetches; once GitHub backfills `original_line`, the
-    comment captures correctly."""
-    captured = []
-    sleeps = []
-    calls = {"n": 0}
-
-    def _fetch(*a, **kw):
-        calls["n"] += 1
-        if calls["n"] == 1:
-            return [{
-                "id": 555, "path": "src/x.py", "line": None, "original_line": None,
-                "position": 2, "original_position": 2,
-                "body": "m\n<!-- grug-rule:silent-failure -->",
-            }]
-        return [{
-            "id": 555, "path": "src/x.py", "line": None, "original_line": 2,
-            "body": "m\n<!-- grug-rule:silent-failure -->",
-        }]
-
-    monkeypatch.setattr(cr_dispatch, "review_diff", lambda *a, **kw: _llm_with_span())
-    monkeypatch.setattr(cr_dispatch, "post_check_run", lambda *a, **kw: {"id": 1})
-    monkeypatch.setattr(cr_dispatch, "post_review", lambda *a, **kw: {"id": 77})
-    monkeypatch.setattr(cr_dispatch, "get_review_comments", _fetch)
-    monkeypatch.setattr(cr_dispatch.time, "sleep", lambda s: sleeps.append(s))
-    monkeypatch.setattr(
-        cr_dispatch, "put_comment_record",
-        lambda **kw: captured.append(kw),
-    )
-    with patch("httpx.get", return_value=_diff_response()):
-        cr_dispatch.dispatch_code_review(_payload(), blocking=False)
-    assert calls["n"] == 2  # one retry, then it had what it needed
-    assert sleeps == [cr_dispatch._COMMENT_LINE_RETRY_DELAYS_S[0]]
-    assert len(captured) == 1
-    assert captured[0]["comment_id"] == 555
-
-
-def test_dispatch_capture_gives_up_after_bounded_retries(monkeypatch):
-    """A comment that never gets line data within the retry budget still
-    degrades to a skip, not an infinite loop - and the retry count is
-    exactly the configured budget, not open-ended."""
-    captured = []
-    sleeps = []
+def test_dispatch_capture_succeeds_on_position_only_comment_no_retry(monkeypatch):
+    """grug#967's complete shape, confirmed live via a throwaway PR: the
+    FIRST (and, post-fix, ONLY) fetch, run in the same synchronous
+    round-trip as `post_review`, can return a comment carrying only
+    `position`/`original_position` (a diff-patch offset, not a file line
+    number) - GitHub had not yet computed ANY human-readable field, and a
+    live measurement showed that gap can outlast even a 30-second bounded
+    retry. The fix never needs those fields: exactly one fetch happens, no
+    sleep, and the comment still captures via its path + rule marker."""
     calls = {"n": 0}
 
     def _fetch(*a, **kw):
         calls["n"] += 1
         return [{
-            "id": 556, "path": "src/x.py", "line": None, "original_line": None,
+            "id": 556, "path": "src/x.py",
             "position": 2, "original_position": 2,
             "body": "m\n<!-- grug-rule:silent-failure -->",
         }]
 
-    monkeypatch.setattr(cr_dispatch, "review_diff", lambda *a, **kw: _llm_with_span())
-    monkeypatch.setattr(cr_dispatch, "post_check_run", lambda *a, **kw: {"id": 1})
-    monkeypatch.setattr(cr_dispatch, "post_review", lambda *a, **kw: {"id": 77})
-    monkeypatch.setattr(cr_dispatch, "get_review_comments", _fetch)
-    monkeypatch.setattr(cr_dispatch.time, "sleep", lambda s: sleeps.append(s))
-    monkeypatch.setattr(cr_dispatch, "put_comment_record", lambda **kw: captured.append(kw))
-    with patch("httpx.get", return_value=_diff_response()):
-        cr_dispatch.dispatch_code_review(_payload(), blocking=False)
-    assert calls["n"] == 1 + len(cr_dispatch._COMMENT_LINE_RETRY_DELAYS_S)
-    assert sleeps == list(cr_dispatch._COMMENT_LINE_RETRY_DELAYS_S)
-    assert captured == []
-
-
-def test_dispatch_capture_no_retry_when_line_present_on_first_fetch(monkeypatch):
-    """The common case (line already usable) must not pay any retry cost -
-    exactly one fetch, no sleep."""
     captured = []
-    sleeps = []
-    calls = {"n": 0}
-
-    def _fetch(*a, **kw):
-        calls["n"] += 1
-        return [{
-            "id": 557, "path": "src/x.py", "line": 2,
-            "body": "m\n<!-- grug-rule:silent-failure -->",
-        }]
-
     monkeypatch.setattr(cr_dispatch, "review_diff", lambda *a, **kw: _llm_with_span())
     monkeypatch.setattr(cr_dispatch, "post_check_run", lambda *a, **kw: {"id": 1})
     monkeypatch.setattr(cr_dispatch, "post_review", lambda *a, **kw: {"id": 77})
     monkeypatch.setattr(cr_dispatch, "get_review_comments", _fetch)
-    monkeypatch.setattr(cr_dispatch.time, "sleep", lambda s: sleeps.append(s))
     monkeypatch.setattr(cr_dispatch, "put_comment_record", lambda **kw: captured.append(kw))
     with patch("httpx.get", return_value=_diff_response()):
         cr_dispatch.dispatch_code_review(_payload(), blocking=False)
     assert calls["n"] == 1
-    assert sleeps == []
     assert len(captured) == 1
+    assert captured[0]["comment_id"] == 556
 
 
-def test_dispatch_capture_skips_when_both_line_and_original_line_are_null(monkeypatch):
-    """A genuinely unusable comment (neither line nor original_line present
-    even after the retry budget - e.g. a file-level comment) still
-    degrades to skip, not a crash."""
+def test_dispatch_capture_same_rule_two_lines_matches_in_order(monkeypatch):
+    """(file, rule) alone is ambiguous when the SAME rule fires twice in one
+    file at different lines - capture must not cross-wire them. Each
+    matching comment claims the next unclaimed finding for that (file,
+    rule) in the order `_build_review_result` posted them."""
+    llm = LlmReviewResponse(
+        kind="reviewed",
+        findings=(
+            LlmFinding(path="src/x.py", line=2, rule="null-deref", severity="medium", message="first"),  # type: ignore[arg-type]
+            LlmFinding(path="src/x.py", line=3, rule="null-deref", severity="medium", message="second"),  # type: ignore[arg-type]
+        ),
+        backend_used=Backend.POOLSIDE,
+        review_span_context={"span_id": "s", "trace_id": "t"},
+    )
     captured = []
-    monkeypatch.setattr(cr_dispatch, "review_diff", lambda *a, **kw: _llm_with_span())
+    monkeypatch.setattr(cr_dispatch, "review_diff", lambda *a, **kw: llm)
     monkeypatch.setattr(cr_dispatch, "post_check_run", lambda *a, **kw: {"id": 1})
     monkeypatch.setattr(cr_dispatch, "post_review", lambda *a, **kw: {"id": 77})
     monkeypatch.setattr(
         cr_dispatch, "get_review_comments",
-        lambda *a, **kw: [{
-            "id": 556, "path": "src/x.py", "line": None, "original_line": None,
-            "body": "m\n<!-- grug-rule:silent-failure -->",
-        }],
+        lambda *a, **kw: [
+            {"id": 1, "path": "src/x.py", "body": "first\n<!-- grug-rule:null-deref -->"},
+            {"id": 2, "path": "src/x.py", "body": "second\n<!-- grug-rule:null-deref -->"},
+        ],
     )
-    monkeypatch.setattr(cr_dispatch.time, "sleep", lambda s: None)
     monkeypatch.setattr(cr_dispatch, "put_comment_record", lambda **kw: captured.append(kw))
     with patch("httpx.get", return_value=_diff_response()):
         cr_dispatch.dispatch_code_review(_payload(), blocking=False)
-    assert captured == []
+    by_id = {c["comment_id"]: c["finding_text"] for c in captured}
+    assert by_id == {1: "first", 2: "second"}
 
 
 def test_dispatch_capture_zero_alarm_logged(monkeypatch, caplog):
@@ -2126,11 +2073,12 @@ def test_partial_review_stays_advisory_but_publishes_validated_findings():
     assert cr_dispatch._publish_shape(
         evaluation, mode="blocking",
     ) == ("neutral", "COMMENT")
-    result = cr_dispatch._build_review_result(
+    result, posted_findings = cr_dispatch._build_review_result(
         evaluation, head_sha="a" * 40, event="COMMENT",
     )
     assert result is not None
     assert len(result.comments) == 1
+    assert posted_findings == evaluation.findings
     title, summary = cr_dispatch._summary_markdown(evaluation)
     assert "coverage partial" in title
     # The findings Elder DID validate are published, not withheld because
@@ -2943,7 +2891,7 @@ def test_no_board_for_a_degradation_that_will_be_retried():
 
     complexity_only = CodeReviewEvaluation(
         findings=(Finding(file="a.py", line=677, severity="medium",
-                          rule_name="high-complexity", message="tangled",
+                          rule_name="null-deref", message="tangled",
                           suggestion=None),),
         conclusion="neutral",
         degraded_reason="all_failed",

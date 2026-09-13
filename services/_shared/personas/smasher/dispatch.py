@@ -347,7 +347,7 @@ def _publish(
         prior_keys, _dedup_degraded = _prior_finding_keys(
             installation_id, owner, repo, pull_number,
         )
-    review_result = _build_review_result(
+    review_result, _posted_findings = _build_review_result(
         evaluation, head_sha=head_sha, event=event, prior_keys=prior_keys,
     )
     if review_result is not None:

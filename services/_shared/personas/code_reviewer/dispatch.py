@@ -25,7 +25,7 @@ import logging
 import os
 import re
 import threading
-import time
+from collections import deque
 from typing import Any, Literal
 from urllib.parse import quote
 
@@ -1784,22 +1784,29 @@ def _build_review_result(
     evaluation: CodeReviewEvaluation, *, head_sha: str, event: ReviewEvent,
     prior_keys: frozenset[str] = frozenset(),
     precedent_notes: dict[str, str] | None = None,
-) -> ReviewResult | None:
-    """Build the ReviewResult, or None if nothing NEW to post.
+) -> tuple[ReviewResult | None, tuple[Finding, ...]]:
+    """Build the ReviewResult, or (None, ()) if nothing NEW to post.
 
     Skips entirely on fully degraded responses. A partial staged review still
     publishes its validated findings, but stays advisory. `prior_keys`
     (non-empty only on a synchronize/reopened push) dedups findings already commented
     on unchanged lines (#189) — so a re-review doesn't flood the PR with
     duplicate inline comments. If every finding was already posted,
-    returns None (nothing new). NOTE: dedup affects only the inline
+    returns (None, ()) (nothing new). NOTE: dedup affects only the inline
     REVIEW; the check-run summary/conclusion still reflect ALL current
-    findings (the bugs are still there)."""
+    findings (the bugs are still there).
+
+    The second return value is `new_findings` itself, in the exact order
+    used to build `comments` below - one `InlineComment` per finding, same
+    order. Callers MUST thread it into `_capture_review_comments` as
+    `findings=`: that function pairs GitHub's freshly-fetched comments with
+    this tuple by POSITION (grug#967), so an order mismatch here would
+    mis-attribute captured comments."""
     if evaluation.degraded_reason not in (None, "", "partial_review"):
-        return None
+        return None, ()
     new_findings = dedup_findings(evaluation.findings, prior_keys)
     if not new_findings:
-        return None
+        return None, ()
     notes = precedent_notes or {}
     comments = tuple(
         InlineComment(
@@ -1818,7 +1825,7 @@ def _build_review_result(
             f"\n\n**Grug {_PERSONA}** gaze upon your PR · {len(comments)} finding(s)"
         ),
         comments=comments,
-    )
+    ), new_findings
 
 
 def _comment_record_origins(
@@ -1865,49 +1872,52 @@ def _capture_comment_records(
 ) -> int:
     """Persist each posted inline comment as a CommentRecord for later
     reaction polling (#247). Matches each comment to the Finding that
-    produced it by (file, line, RULE) so the stored `finding_tags` are the
-    SAME `eval_tags` the judge used — the poller's `human_verdict` then
-    shares finding identity with the judge's `is_real_bug`.
+    produced it by (file, RULE) — recovered from the comment's `path` and
+    its hidden `<!-- grug-rule:NAME -->` marker (parsed by `parse_rule`,
+    the same marker `dedup` uses) — never by re-deriving a line number from
+    anything GitHub computes.
 
-    Keying includes the rule (not just file+line): two distinct rules can
-    post two comments on the SAME line (dedup keys on rule for exactly this
-    reason), so a (file, line) map would collapse them and mis-tag one. The
-    rule is recovered from each comment body's hidden `<!-- grug-rule:NAME -->`
-    marker (the same marker dedup parses), so a comment with no marker (not
-    ours) or no matching finding is skipped. Best-effort per comment: a
-    malformed dict or a single DDB blip is skipped, never raised. Returns
-    count persisted.
+    grug#967: an earlier version of this function matched by
+    `finding_key(file, line, rule)`, looking `line`/`original_line` up on
+    the fetched comment. GitHub computes a JUST-created review comment's
+    `line`/`original_line` asynchronously on its own backend - live testing
+    showed a comment can carry ONLY `position`/`original_position`, with
+    neither human-readable field populated, for over 30 seconds. We
+    already know each comment's file+line: it is exactly what
+    `_build_review_result` told GitHub to place it at when building this
+    same review. Reading it back from GitHub's response was always
+    redundant, and the one field this function actually needs from that
+    response — the comment `id`, for reaction polling — is present
+    immediately, no matter how long the human-readable fields take.
 
-    `line` vs `original_line` (#967): GitHub's REST API is eventually
-    consistent for a JUST-created review comment's `line` field - fetching
-    it in the same synchronous round-trip this function runs in (moments
-    after `post_review` returns) reliably returns `line: null` even though
-    the identical comment, queried again seconds later, has the correct
-    value. `original_line` (the position AT CREATION time) does not share
-    this lag and is what we actually have evidence for anyway. Falling back
-    to it when `line` is absent fixed a 100%-reproducing capture failure -
-    every comment this function ever saw was silently dropped by the
-    `line is None` check before this fix, confirmed live (grug#967)."""
-    by_key: dict[str, Finding] = {
-        finding_key(f.file, f.line, f.rule_name): f for f in findings
-    }
+    (file, rule) can collide — two findings for the SAME rule can land in
+    the same file at different lines in one batch — so each (file, rule)
+    maps to a FIFO queue of findings in the order `_build_review_result`
+    listed them, and each matching comment claims the next one off that
+    queue. This assumes GitHub returns one review's own comments in the
+    order they were submitted (true for comments belonging to a single
+    review — see `get_review_comments`'s docstring), but only WITHIN a
+    (file, rule) group, not across the whole list — so an unrelated extra
+    comment, or a comment for a rule that already exhausted its queue,
+    is simply skipped, same as a stale prior-review comment always was.
+    Best-effort per comment: a single DDB blip is skipped, never raised.
+    Returns count persisted."""
+    queues: dict[tuple[str, str], deque[Finding]] = {}
+    for f in findings:
+        queues.setdefault((f.file, f.rule_name), deque()).append(f)
+
     persisted = 0
     for c in comments:
         cid, path = c.get("id"), c.get("path")
-        line = c.get("line")
-        if line is None:
-            line = c.get("original_line")
-        if cid is None or path is None or line is None:
+        if cid is None or path is None:
             continue
         rule = parse_rule(c.get("body", ""))
         if rule is None:
             continue
-        try:
-            finding = by_key.get(finding_key(path, int(line), rule))
-        except (TypeError, ValueError):
+        queue = queues.get((path, rule))
+        if not queue:
             continue
-        if finding is None:
-            continue
+        finding = queue.popleft()
         finding_origins, fallback_span_context = _comment_record_origins(
             finding, review_span_context,
         )
@@ -2594,7 +2604,7 @@ def dispatch_code_review(
         and evaluation.degraded_reason in (None, "", "partial_review")
         else {}
     )
-    review_result = _build_review_result(
+    review_result, posted_findings = _build_review_result(
         evaluation, head_sha=head_sha, event=event, prior_keys=prior_keys,
         precedent_notes=precedent_notes,
     )
@@ -2645,7 +2655,7 @@ def dispatch_code_review(
             repo_name=repo_name,
             pull_number=pull_number,
             review_id=review_id,
-            findings=evaluation.findings,
+            findings=posted_findings,
             review_span_context=llm_response.review_span_context,
             head_sha=head_sha,
             author_login=author_login,
@@ -3120,35 +3130,6 @@ def _publish_deep_check(
         )
 
 
-# grug#967: GitHub's REST API computes a JUST-created review comment's
-# human-readable `line`/`original_line` asynchronously, on its own backend -
-# fetching it in the same synchronous round-trip `post_review` runs in
-# (this function's whole reason to exist) reliably returns a comment
-# carrying only `position`/`original_position` (the comment's offset
-# WITHIN THE DIFF PATCH TEXT, not a file line number, and not usable as a
-# substitute) for a short window. Confirmed live: every real comment this
-# path was ever handed had this shape, a 100%-reproducing capture failure.
-# Bounded retry, paid only when a marked finding still lacks both line
-# fields. A first attempt at (1.0, 2.0) - 3s total - was measured live as
-# INSUFFICIENT: a follow-up test still saw the gap at the ~6s mark. This
-# runs in a background consumer well after the expensive LLM calls already
-# completed, not a user-facing request, so a generous ceiling costs
-# throughput on this one queue worker, never a human's wait.
-_COMMENT_LINE_RETRY_DELAYS_S = (2.0, 4.0, 8.0, 16.0)
-
-
-def _comments_missing_line_data(comments: list[dict]) -> bool:
-    """True when a Grug-marked comment has neither `line` nor
-    `original_line` - see `_COMMENT_LINE_RETRY_DELAYS_S`'s comment. An
-    unmarked (human) comment is irrelevant here; it is never looked up by
-    line in `_capture_comment_records` either way."""
-    return any(
-        c.get("line") is None and c.get("original_line") is None
-        for c in comments
-        if parse_rule(c.get("body", "")) is not None
-    )
-
-
 def _capture_review_comments(
     *,
     installation_id: int,
@@ -3168,23 +3149,22 @@ def _capture_review_comments(
     (#730). Best-effort: any failure is logged under `failure_log` and
     never re-raised - a capture failure must never change the review
     outcome.
+
+    `findings` should be the `new_findings` tuple `_build_review_result`
+    returned alongside the `ReviewResult` this review was built from (not
+    the caller's full unfiltered findings set) - see
+    `_capture_comment_records` for how it matches them to comments (grug#967:
+    no retry here anymore, since a fresh fetch already carries everything
+    this function needs).
     """
     try:
-        def _fetch() -> list[dict]:
-            return with_install_token_retry(
-                installation_id,
-                lambda token: get_review_comments(
-                    token, owner, repo_name,
-                    pull_number=pull_number, review_id=int(review_id),
-                ),
-            )
-
-        comments = _fetch()
-        for delay_s in _COMMENT_LINE_RETRY_DELAYS_S:
-            if not _comments_missing_line_data(comments):
-                break
-            time.sleep(delay_s)
-            comments = _fetch()
+        comments = with_install_token_retry(
+            installation_id,
+            lambda token: get_review_comments(
+                token, owner, repo_name,
+                pull_number=pull_number, review_id=int(review_id),
+            ),
+        )
         persisted = _capture_comment_records(
             comments, findings,
             install_id=installation_id,
@@ -3247,7 +3227,7 @@ def _publish_deep_review(
     """
     if not novel_deep:
         return
-    review_result = _build_review_result(
+    review_result, posted_findings = _build_review_result(
         deep_eval,
         head_sha=head_sha,
         event=event,
@@ -3290,7 +3270,7 @@ def _publish_deep_review(
             repo_name=repo_name,
             pull_number=pull_number,
             review_id=review_id,
-            findings=deep_eval.findings,
+            findings=posted_findings,
             review_span_context=deep_llm.review_span_context,
             head_sha=head_sha,
             author_login=author_login,
