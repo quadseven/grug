@@ -1368,3 +1368,72 @@ def test_reserve_slot_concurrent_processes_admit_exactly_the_limit(pg):
             (f"RATELIMIT#{name}",),
         ).fetchone()
     assert row is not None and int(row[0]) == limit
+
+
+def test_reserve_slot_concurrent_processes_stress_measures_failure_rate(pg):
+    """THROWAWAY DIAGNOSTIC for grug#877 - not meant to stay in the suite.
+
+    #877's own "what would actually settle it" section: "Quantify, do not
+    sample. Run the multi-process test in a loop (50-100 iterations) at
+    n=16 and record the failure RATE. A defect that shows up 1 run in 8 is
+    invisible to a single CI run." This runs the EXACT same scenario as
+    the test above 50 times with a fresh rate-limit key each round (so
+    rounds cannot interfere with each other) and prints a rate rather than
+    asserting pass/fail on every round - the point is the NUMBER, read
+    from this run's CI log, not whether this test itself is green.
+    """
+    from adapters import pg_base
+
+    limit = 5
+    n = 16
+    rounds = 50
+    over_admissions = 0
+    exact_matches = 0
+    failure_shapes: list[str] = []
+
+    for round_index in range(rounds):
+        name = f"rl-mp-stress-{uuid.uuid4()}"
+        ctx = multiprocessing.get_context("spawn")
+        barrier = ctx.Barrier(n)
+        result_queue: multiprocessing.Queue = ctx.Queue()
+        procs = [
+            ctx.Process(
+                target=_mp_free_tier_worker,
+                args=(_TEST_DB, name, limit, barrier, result_queue, i),
+            )
+            for i in range(n)
+        ]
+        for p in procs:
+            p.start()
+        results = [result_queue.get(timeout=30) for _ in range(n)]
+        for p in procs:
+            p.join(timeout=30)
+        for p in procs:
+            assert p.exitcode == 0, (
+                f"round {round_index}: worker process {p.pid} exited {p.exitcode}"
+            )
+
+        admitted_count = sum(1 for _, ok in results if ok)
+        if admitted_count == limit:
+            exact_matches += 1
+        else:
+            over_admissions += 1
+            failure_shapes.append(
+                f"round {round_index}: admitted {admitted_count} of {n} "
+                f"(expected {limit})"
+            )
+
+    rate = over_admissions / rounds
+    summary = (
+        f"grug#877 STRESS RESULT: {over_admissions}/{rounds} rounds "
+        f"over-admitted (rate={rate:.3f}), {exact_matches}/{rounds} exact. "
+        f"n={n} limit={limit}.\n"
+        + "\n".join(failure_shapes)
+    )
+    # ALWAYS fails, on purpose - pytest captures stdout by default and only
+    # shows it on failure, and this diagnostic exists to be READ from this
+    # throwaway PR's CI log, not to pass or fail cleanly. The rate itself
+    # is the deliverable; a real assertion here would just be another
+    # single-sample result dressed up as 50, the exact failure mode #877
+    # was filed to stop repeating.
+    raise AssertionError(summary)
