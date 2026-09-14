@@ -1402,6 +1402,28 @@ def _build_request_body(
     return body
 
 
+def _merged_headers(config: BackendConfig, key: str) -> dict[str, str]:
+    """The final outgoing header set for one call: static `extra_headers`,
+    then `dynamic_headers` resolved at call time, then the bearer token -
+    in that order, so Authorization always wins the merge even if a caller
+    tried to sneak a same-named entry into either of the other two dicts.
+    Extracted from `_call_backend` purely to shed one branch from that
+    function's own complexity score (grug#984 follow-up); no behavior
+    change - FLINT #618's guard now covers both header dicts."""
+    if any(
+        name.lower() == "authorization"
+        for name in (*config.extra_headers, *config.dynamic_headers)
+    ):
+        raise _BackendConfigError(
+            f"{config.backend.value} extra_headers must not contain Authorization"
+        )
+    return {
+        **config.extra_headers,
+        **{name: fn() for name, fn in config.dynamic_headers.items()},
+        "Authorization": f"Bearer {key}",
+    }
+
+
 def _call_backend(
     config: BackendConfig, messages: list[dict[str, str]],
     cancel_event: threading.Event | None = None,
@@ -1470,18 +1492,7 @@ def _call_backend(
         )
 
     body = _build_request_body(config, messages)
-    if any(
-        name.lower() == "authorization"
-        for name in (*config.extra_headers, *config.dynamic_headers)
-    ):
-        raise _BackendConfigError(
-            f"{config.backend.value} extra_headers must not contain Authorization"
-        )
-    headers = {
-        **config.extra_headers,
-        **{name: fn() for name, fn in config.dynamic_headers.items()},
-        "Authorization": f"Bearer {key}",
-    }
+    headers = _merged_headers(config, key)
 
     if config.retry_attempts < 1:
         raise _BackendConfigError(
