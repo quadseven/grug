@@ -51,6 +51,25 @@ def _looks_like_sha(value: str | None) -> bool:
     return bool(value) and bool(_SHA_RE.fullmatch(value.strip().lower()))
 
 
+# Permanently unresolvable cases (#895): the PR itself (not just an
+# anchor) is gone from GitHub, so `diff_for_case`'s own anchor-resolution
+# fallback (fetch the PR's current merged diff) is doomed too - confirmed
+# via `run_eval`'s existing 404/406 handling, which already logs "the
+# ledger references a PR whose diff cannot be fetched; prune or annotate
+# it" for exactly this case. Listing it here is that action: `build_cases`
+# stamps the reason onto the case, the runner skips attempting a replay
+# for it, and `scoring.score` reports it in its own stable bucket instead
+# of `errored_cases` (reserved for NEW, possibly-transient breakage) -
+# every eval run re-hitting the same known-dead PR is corpus rot, not a
+# fresh signal.
+_KNOWN_UNRESOLVABLE_CASES: dict[tuple[str, int], str] = {
+    ("quadseven/zippie", 165): (
+        "PR #165 and its recorded commit (e3a58c73) are both absent from "
+        "quadseven/zippie's current history; the repo was recreated "
+        "2026-08-28, after this finding was recorded (2026-08-12) - see #895."
+    ),
+}
+
 ELDER_CLASSES: frozenset[str] = frozenset(normalize_class(c) for c in _BUG_CLASSES)
 
 # Ledger vocabulary -> Elder vocabulary, where the words differ but the
@@ -105,6 +124,12 @@ class EvalCase:
     against the PRE-FIX snapshot instead of the PR's final merged diff -
     see `anchored`. At most one is set; `anchor_head_sha` wins when both a
     row's `head_sha` and another row's `commit` would qualify.
+
+    `unresolvable_reason` (#895): set when this (repo, pr) is a KNOWN,
+    permanently dead reference (see `_KNOWN_UNRESOLVABLE_CASES`) - the
+    runner skips replaying it and `scoring.score` reports it separately
+    from `errored_cases`, so a stable, already-diagnosed corpus problem
+    stops being re-flagged as if it were new.
     """
 
     repo: str
@@ -115,6 +140,7 @@ class EvalCase:
     unknown_verdicts: dict[str, int]
     anchor_head_sha: str | None = None
     anchor_fix_commit: str | None = None
+    unresolvable_reason: str | None = None
 
     @property
     def case_id(self) -> str:
@@ -256,6 +282,7 @@ def build_cases(rows: Iterable[LedgerRow]) -> tuple[EvalCase, ...]:
                 anchor_fix_commit=anchor_fix_commit,
                 out_of_taxonomy=dict(out_of_taxonomy),
                 unknown_verdicts=dict(unknown_verdicts),
+                unresolvable_reason=_KNOWN_UNRESOLVABLE_CASES.get((repo, pr)),
             )
         )
     return tuple(cases)

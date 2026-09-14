@@ -555,6 +555,11 @@ def run_production_eval(
     snapshot first and falls back to it."""
     replays: dict[str, CaseReplay] = {}
     for case in cases:
+        if case.unresolvable_reason:
+            # #895: a KNOWN, permanently dead PR - `diff_for_case` would
+            # only rediscover the same 404 every run. `scoring.score`
+            # reports it without needing a replay entry.
+            continue
         try:
             diff, anchored = diff_for_case(case, token, fetch_final=fetch)
         except Exception as e:  # noqa: BLE001 - fetch failure is an errored case
@@ -592,6 +597,11 @@ def run_eval(
     log.info("eval_start backend=%s cases=%d", backend.name, len(cases))
     replays: dict[str, CaseReplay] = {}
     for case in cases:
+        if case.unresolvable_reason:
+            # #895: a KNOWN, permanently dead PR - this is exactly the
+            # "prune or annotate it" case the 404/406 branch below already
+            # calls out; pruned here means never re-attempted.
+            continue
         try:
             diff, anchored = diff_for_case(case, token, fetch_final=fetch)
         except httpx.HTTPStatusError as e:

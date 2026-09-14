@@ -166,6 +166,38 @@ def _cloud_chain_backend_names() -> set[str]:
     return {tier.backend.value for tier in _cloud_chain_tiers()}
 
 
+def _print_exclusion_notes(report: EvalReport) -> None:
+    """The report's per-bucket exclusion/caveat lines - split out of
+    `_print_report` (#895) so that function's branching stays under the
+    complexity cap; each bucket here is an independent, unconditional
+    print with no shared state."""
+    if report.errored_cases:
+        print(f"  !! errored (not scored): {', '.join(report.errored_cases)}")
+    if report.unresolvable_cases:
+        ur = "; ".join(
+            f"{cid} ({reason})"
+            for cid, reason in sorted(report.unresolvable_cases.items())
+        )
+        print(f"  excluded (known-dead PR, corpus rot - see #895): {ur}")
+    if report.truncated_cases:
+        print(
+            "  !! diff hunk-bounded (misses may be amputation, not Elder): "
+            f"{', '.join(report.truncated_cases)}"
+        )
+    if report.staged_cases:
+        print(
+            "  staged (too big for one cohort call - reviewed via several "
+            f"instead of a monolithic one, #859 follow-up): "
+            f"{', '.join(report.staged_cases)}"
+        )
+    if report.out_of_taxonomy:
+        oot = ", ".join(f"{c}x{n}" for c, n in sorted(report.out_of_taxonomy.items()))
+        print(f"  out-of-taxonomy (excluded, not misses): {oot}")
+    if report.unknown_verdicts:
+        uv = ", ".join(f"{v}x{n}" for v, n in sorted(report.unknown_verdicts.items()))
+        print(f"  !! unknown verdicts (excluded - fix the corpus labels): {uv}")
+
+
 def _print_report(name: str, report: EvalReport) -> None:
     print(f"\n=== backend: {name} ===")
     print(_methodology_note(name, staged=bool(report.staged_cases)))
@@ -200,25 +232,7 @@ def _print_report(name: str, report: EvalReport) -> None:
                 "the fallback. This number measures the FALLBACK, not the "
                 "cloud backend you configured."
             )
-    if report.errored_cases:
-        print(f"  !! errored (not scored): {', '.join(report.errored_cases)}")
-    if report.truncated_cases:
-        print(
-            "  !! diff hunk-bounded (misses may be amputation, not Elder): "
-            f"{', '.join(report.truncated_cases)}"
-        )
-    if report.staged_cases:
-        print(
-            "  staged (too big for one cohort call - reviewed via several "
-            f"instead of a monolithic one, #859 follow-up): "
-            f"{', '.join(report.staged_cases)}"
-        )
-    if report.out_of_taxonomy:
-        oot = ", ".join(f"{c}x{n}" for c, n in sorted(report.out_of_taxonomy.items()))
-        print(f"  out-of-taxonomy (excluded, not misses): {oot}")
-    if report.unknown_verdicts:
-        uv = ", ".join(f"{v}x{n}" for v, n in sorted(report.unknown_verdicts.items()))
-        print(f"  !! unknown verdicts (excluded - fix the corpus labels): {uv}")
+    _print_exclusion_notes(report)
 
 
 
