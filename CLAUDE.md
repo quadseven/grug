@@ -9,3 +9,6 @@ separate so the substantive rules live in the one place every AI tool
 If `AGENTS.md` is missing from this repo, stop and say so rather than
 proceeding without it — its absence is a gap to fix, not permission to
 skip the policy.
+
+<!-- Everything above the next line is synced from quadseven/infra-public and replaced on every sync. Put this repo's own content below it. -->
+<!-- repo-specific below -->
