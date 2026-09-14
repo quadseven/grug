@@ -240,6 +240,25 @@ def test_build_cases_anchor_conflict_keeps_first_seen_and_does_not_crash():
     assert case.anchor_head_sha == _SHA_A
 
 
+def test_build_cases_stamps_known_unresolvable_reason():
+    """#895: quadseven/zippie#165's PR and anchor commit are both gone from
+    GitHub for good (repo recreated after the finding was recorded) -
+    `build_cases` must stamp a reason so the runner never re-attempts a
+    doomed fetch and the report can tell this apart from a fresh error."""
+    (case,) = build_cases([_row(165, "test-gap", commit="e3a58c73", repo="quadseven/zippie")])
+    assert case.unresolvable_reason is not None
+    assert "165" in case.unresolvable_reason
+    assert "e3a58c73" in case.unresolvable_reason
+
+
+def test_build_cases_leaves_unrelated_cases_unmarked():
+    """Only the specific, known-dead (repo, pr) is stamped - nothing else
+    is guessed at from shape alone (e.g. sharing the same PR number on a
+    different repo)."""
+    (case,) = build_cases([_row(165, "correctness")])  # quadseven/grug#165
+    assert case.unresolvable_reason is None
+
+
 # --- scoring: catch-rate ----------------------------------------------------
 
 
@@ -495,6 +514,28 @@ def test_score_case_with_no_replay_is_errored():
     report = score(cases, {})
     assert report.errored_cases == ("quadseven/grug#1",)
     assert report.all_errored
+
+
+def test_score_unresolvable_case_excluded_and_reported_separately_from_errored():
+    """#895: a known-dead PR never gets a replay entry (the runner skips
+    it outright) but it must NOT be misread as a fresh error - it lands
+    in its own bucket instead, distinct from errored_cases."""
+    rows = [
+        _row(1, "correctness"),
+        _row(165, "test-gap", commit="e3a58c73", repo="quadseven/zippie"),
+    ]
+    cases = build_cases(rows)
+    replays = {
+        "quadseven/grug#1": CaseReplay(
+            case_id="quadseven/grug#1", emitted={"correctness": 1}, errored=False
+        ),
+    }
+    report = score(cases, replays)
+    assert report.errored_cases == ()
+    assert set(report.unresolvable_cases) == {"quadseven/zippie#165"}
+    assert "e3a58c73" in report.unresolvable_cases["quadseven/zippie#165"]
+    assert report.cases_scored == 1
+    assert not report.all_errored
 
 
 def test_merge_baseline_same_prompt_keeps_other_backends():
@@ -1107,6 +1148,40 @@ def test_classes_for_findings_unknown_rule_falls_back_to_rule_name():
         ),
     )
     assert classes_for_findings(findings) == {"some-novel-rule": 1}
+
+
+def test_run_eval_skips_known_unresolvable_case_without_fetching():
+    """#895: a known-dead PR must never trigger diff_for_case - the fetch
+    is guaranteed to 404 every time, and re-attempting it every run is
+    exactly the corpus rot this mechanism exists to stop."""
+    from elder_eval.runner import run_eval
+    from sast_benchmark.backends import BenchBackend
+
+    rows = [_row(165, "test-gap", commit="e3a58c73", repo="quadseven/zippie")]
+    cases = build_cases(rows)
+    backend = BenchBackend(name="fake", url="http://invalid", model="m", api_key="")
+
+    def must_not_be_called(*_a, **_kw):
+        raise AssertionError("run_eval must not fetch a known-unresolvable case's diff")
+
+    replays = run_eval(backend, cases, fetch=must_not_be_called)
+    assert replays == {}
+
+
+def test_run_production_eval_skips_known_unresolvable_case_without_fetching():
+    """Same guarantee on the production replay path (#895)."""
+    from elder_eval.runner import run_production_eval
+
+    rows = [_row(165, "test-gap", commit="e3a58c73", repo="quadseven/zippie")]
+    cases = build_cases(rows)
+
+    def must_not_be_called(*_a, **_kw):
+        raise AssertionError(
+            "run_production_eval must not fetch a known-unresolvable case's diff"
+        )
+
+    replays = run_production_eval(cases, fetch=must_not_be_called)
+    assert replays == {}
 
 
 def test_run_eval_fetch_failure_is_errored_case():

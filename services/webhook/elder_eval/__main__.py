@@ -202,6 +202,12 @@ def _print_report(name: str, report: EvalReport) -> None:
             )
     if report.errored_cases:
         print(f"  !! errored (not scored): {', '.join(report.errored_cases)}")
+    if report.unresolvable_cases:
+        ur = "; ".join(
+            f"{cid} ({reason})"
+            for cid, reason in sorted(report.unresolvable_cases.items())
+        )
+        print(f"  excluded (known-dead PR, corpus rot - see #895): {ur}")
     if report.truncated_cases:
         print(
             "  !! diff hunk-bounded (misses may be amputation, not Elder): "

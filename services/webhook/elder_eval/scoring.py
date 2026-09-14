@@ -76,6 +76,11 @@ class EvalReport:
     out_of_taxonomy: dict[str, int]
     unknown_verdicts: dict[str, int]
     cases_scored: int
+    # #895: cases whose PR is a KNOWN, permanently dead GitHub reference
+    # (case_id -> reason) - excluded from every denominator like an errored
+    # case, but reported separately: unlike `errored_cases`, this bucket
+    # names an already-diagnosed corpus problem, not a fresh one.
+    unresolvable_cases: dict[str, str] = field(default_factory=dict)
     # #545: scored cases replayed against the pre-fix snapshot, not the PR's
     # final merged diff. `cases_scored - len(anchored_cases)` scored on the
     # final diff instead - the KNOWN METHODOLOGY BIAS corpus slice.
@@ -116,6 +121,7 @@ def score(
     attribution: Counter[str] = Counter()
     out_of_taxonomy: Counter[str] = Counter()
     unknown_verdicts: Counter[str] = Counter()
+    unresolvable: dict[str, str] = {}
     scored = 0
 
     # An orphan replay (no matching case) would silently vanish from every
@@ -127,6 +133,13 @@ def score(
     for case in cases:
         out_of_taxonomy.update(case.out_of_taxonomy)
         unknown_verdicts.update(case.unknown_verdicts)
+        if case.unresolvable_reason:
+            # #895: a KNOWN, permanently dead PR - never attempted (the
+            # runner skips it), so it carries no replay entry either way.
+            # Reported on its own, not folded into `errored_cases`, which
+            # is meant to flag NEW breakage.
+            unresolvable[case.case_id] = case.unresolvable_reason
+            continue
         if not case.scorable:
             # Nothing replayable, but its excluded-row counts (above) must
             # still reach the report - a fully out-of-taxonomy case is not
@@ -173,6 +186,7 @@ def score(
         anchored_cases=tuple(anchored),
         staged_cases=tuple(staged),
         backend_attribution=dict(attribution),
+        unresolvable_cases=unresolvable,
     )
 
 
