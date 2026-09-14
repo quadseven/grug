@@ -102,6 +102,29 @@ certificate - see the Roles Anywhere section below.
 | `cf_shared_secret_mismatch` burst | CF shared-secret drifted vs SSM, or a direct-to-origin probe | the CF auth-boundary monitor pages; reconcile the secret |
 | A required PR check stuck/missing after a brief outage | the inline DoR/TPM delivery errored and GitHub does not auto-redeliver (infra #1254) | self-heals: the `grug-poller` CronJob replays errored deliveries every 15m (#407); force it with the manual replay below |
 
+### GitHub API error rate
+
+`[grug] GitHub API error rate elevated (15min)` (#948) fires when more than
+1 in 5 calls through `with_install_token_retry` exhausted their retry budget
+over the last 15 minutes. `grug.github_api.error` is dense (emits 0.0 on
+every success too), so this is a real elevated rate, not a monitor gone
+quiet. Check `github_api_retry` log lines for the status codes involved: a
+run of 401s means the App's credentials need attention (rotation, revoked
+install); a run of 5xx/secondary-rate-limit means GitHub itself is
+degraded and this should self-clear once it recovers.
+
+### Check run stuck
+
+`[grug] A check run sat in_progress too long and was swept (1h)` (#948)
+fires when the check-run reconciler (#947, `check_run_reconciler.py`)
+closes one of grug's own check runs that sat `in_progress` past
+`GRUG_CHECK_RUN_STUCK_MAX_AGE_MINUTES` (default 60). The run is already
+closed out honestly (`conclusion: failure`, a summary saying it errored) -
+this alert exists only so an operator knows it happened, almost always
+during a GitHub or grug outage mid-review. No action needed beyond
+confirming the underlying degradation (see the error-rate signal above)
+has cleared; the author gets a real review on their next push.
+
 ## Missed-delivery replay (#407)
 
 The DoR/TPM check runs inline on the webhook. GitHub does not automatically

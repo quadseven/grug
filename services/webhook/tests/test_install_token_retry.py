@@ -99,6 +99,100 @@ def test_5xx_retries_then_succeeds(_stub_token, mock_transport_client):
     assert len(calls) == 3, "two 503s then a 200: three attempts total"
 
 
+def test_success_emits_dense_error_gauge_at_zero(
+    _stub_token, mock_transport_client, monkeypatch: pytest.MonkeyPatch,
+):
+    """grug#948: the error-rate signal must be DENSE - a clean call still
+    emits, at 0.0, so a healthy stretch is distinguishable from no data at
+    all rather than looking identical to it."""
+    import observability  # type: ignore
+
+    emitted: list[tuple[str, float]] = []
+    monkeypatch.setattr(
+        observability, "emit_gauge",
+        lambda metric, value, **_kw: emitted.append((metric, value)),
+    )
+    client = mock_transport_client(status_codes=[200], json_bodies=[{"ok": True}])
+
+    def fn(token: str) -> bool:
+        resp = client.get("https://api.github.com/repos")
+        resp.raise_for_status()
+        return resp.json()["ok"]
+
+    assert gh_auth.with_install_token_retry(123, fn) is True
+    assert emitted == [("grug.github_api.error", 0.0)]
+
+
+def test_exhausted_retry_emits_dense_error_gauge_at_one(
+    _stub_token, mock_transport_client, monkeypatch: pytest.MonkeyPatch,
+):
+    """The failure half of the same dense signal - a call that never
+    recovers emits 1.0, not silence."""
+    import observability  # type: ignore
+
+    emitted: list[tuple[str, float]] = []
+    monkeypatch.setattr(
+        observability, "emit_gauge",
+        lambda metric, value, **_kw: emitted.append((metric, value)),
+    )
+    client = mock_transport_client(status_codes=[503] * 5)
+
+    def fn(token: str) -> None:
+        resp = client.get("https://api.github.com/repos")
+        resp.raise_for_status()
+
+    with pytest.raises(httpx.HTTPStatusError):
+        gh_auth.with_install_token_retry(123, fn)
+    assert emitted == [("grug.github_api.error", 1.0)]
+
+
+def test_transport_error_emits_dense_error_gauge_and_reraises(
+    _stub_token, mock_transport_client, monkeypatch: pytest.MonkeyPatch,
+):
+    """Elder-flagged gap: a DNS/connect/timeout failure never reaches
+    raise_for_status(), so it would otherwise escape with the error gauge
+    never observing it - grug.lol staying "healthy" while every GitHub
+    call is actually failing, the exact shape #948 exists to catch."""
+    import observability  # type: ignore
+
+    emitted: list[tuple[str, float]] = []
+    monkeypatch.setattr(
+        observability, "emit_gauge",
+        lambda metric, value, **_kw: emitted.append((metric, value)),
+    )
+    client = mock_transport_client(raise_exc=httpx.ConnectError("boom"))
+
+    def fn(token: str) -> None:
+        client.get("https://api.github.com/repos")
+
+    with pytest.raises(httpx.ConnectError):
+        gh_auth.with_install_token_retry(123, fn)
+    assert emitted == [("grug.github_api.error", 1.0)]
+
+
+def test_permanent_4xx_also_emits_dense_error_gauge(
+    _stub_token, mock_transport_client, monkeypatch: pytest.MonkeyPatch,
+):
+    """A non-retryable 4xx still counts toward the error rate - it is a
+    real failed call, just not one worth retrying."""
+    import observability  # type: ignore
+
+    emitted: list[tuple[str, float]] = []
+    monkeypatch.setattr(
+        observability, "emit_gauge",
+        lambda metric, value, **_kw: emitted.append((metric, value)),
+    )
+    client = mock_transport_client(status_codes=[404])
+
+    def fn(token: str) -> None:
+        resp = client.get("https://api.github.com/repos")
+        resp.raise_for_status()
+
+    with pytest.raises(httpx.HTTPStatusError):
+        gh_auth.with_install_token_retry(123, fn)
+    assert emitted == [("grug.github_api.error", 1.0)]
+
+
 def test_secondary_rate_limit_retries_then_succeeds(_stub_token, mock_transport_client):
     """A secondary rate limit is a 403/429 that is NOT the primary
     per-hour limit - GitHub's own docs say to back off and retry, not

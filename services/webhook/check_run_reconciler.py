@@ -276,6 +276,23 @@ def reconcile_repo(
     return dispatched, swept
 
 
+def _emit_stuck_check_run_metric(count: int) -> None:
+    """grug#948: a DENSE gauge for the one alert #887 explicitly asked for
+    - "a grug check run has been in_progress longer than N minutes" - fed
+    by THIS pass's own stuck-run detection (`_split_missing_present_stuck`
+    via `reconcile_repo`), never a second implementation of it. Emitted
+    every poller tick regardless of `count` (0 included): the poller runs
+    on a fixed schedule, so a monitor thresholding this VALUE (`> 0`)
+    never goes quiet on a healthy stretch the way a fire-only-on-bad-news
+    metric would (ADR-0022's same reasoning). Best-effort; telemetry must
+    never affect the reconcile pass itself."""
+    try:
+        from observability import emit_gauge  # type: ignore
+        emit_gauge("grug.check_run.stuck_count", float(count))
+    except Exception as e:  # noqa: BLE001 - telemetry never breaks the cron
+        log.debug("check_run_stuck_gauge_emit_failed", extra={"kind": type(e).__name__})
+
+
 def reconcile_installs(installs: list[int]) -> tuple[int, int]:
     """Top-level entry for the poller cron. Returns (dispatched_plus_swept,
     installs_failed) - same two-int shape as `_hygiene_watch_pass`, summed
@@ -283,6 +300,7 @@ def reconcile_installs(installs: list[int]) -> tuple[int, int]:
     numbers still sees real activity, not just a repo count."""
     total = 0
     failed = 0
+    total_swept = 0
     for install_id in installs:
         try:
             repos = list_check_run_reconcile_repos(install_id)
@@ -297,10 +315,12 @@ def reconcile_installs(installs: list[int]) -> tuple[int, int]:
                 ],
             ) or []
             total += sum(dispatched + swept for dispatched, swept in results)
+            total_swept += sum(swept for _, swept in results)
         except Exception as e:  # noqa: BLE001 — one install must not abort the cron
             log.warning(
                 "check_run_reconcile_install_failed",
                 extra={"install_id": install_id, "kind": type(e).__name__},
             )
             failed += 1
+    _emit_stuck_check_run_metric(total_swept)
     return total, failed

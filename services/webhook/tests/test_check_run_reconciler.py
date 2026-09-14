@@ -235,3 +235,34 @@ def test_reconcile_installs_one_install_failure_does_not_abort_the_cron():
         total, failed = reconciler.reconcile_installs([1, 2])
     assert total == 1
     assert failed == 1
+
+
+def test_reconcile_installs_emits_dense_stuck_count_metric_when_nothing_stuck():
+    """grug#948: the stuck-check-run alert signal must be DENSE - a clean
+    pass (nothing swept) still emits 0.0, not silence, so a healthy
+    stretch is distinguishable from no data at all."""
+    import observability  # type: ignore
+
+    emitted: list[tuple[str, float]] = []
+    with patch("check_run_reconciler.list_check_run_reconcile_repos",
+               return_value=[{"id": 9, "full_name": "o/r"}]), \
+         patch("check_run_reconciler.with_install_token_retry", return_value=[(1, 0)]), \
+         patch.object(observability, "emit_gauge",
+                      lambda metric, value, **_kw: emitted.append((metric, value))):
+        reconciler.reconcile_installs([1])
+    assert emitted == [("grug.check_run.stuck_count", 0.0)]
+
+
+def test_reconcile_installs_emits_stuck_count_metric_summed_across_repos():
+    """The metric feeds the same detection `reconcile_repo` already does
+    (never a second implementation of it) - it just sums what came back."""
+    import observability  # type: ignore
+
+    emitted: list[tuple[str, float]] = []
+    with patch("check_run_reconciler.list_check_run_reconcile_repos",
+               return_value=[{"id": 9, "full_name": "o/r"}, {"id": 10, "full_name": "o/r2"}]), \
+         patch("check_run_reconciler.with_install_token_retry", return_value=[(0, 2), (1, 1)]), \
+         patch.object(observability, "emit_gauge",
+                      lambda metric, value, **_kw: emitted.append((metric, value))):
+        reconciler.reconcile_installs([1])
+    assert emitted == [("grug.check_run.stuck_count", 3.0)]

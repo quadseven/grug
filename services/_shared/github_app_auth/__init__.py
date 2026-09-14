@@ -247,6 +247,25 @@ def list_app_installations() -> list[dict]:
     return out
 
 
+def _emit_github_api_result(ok: bool) -> None:
+    """grug#948: a DENSE error gauge (1.0 = this call ended in error after
+    exhausting retries, 0.0 = it succeeded), emitted on EVERY call through
+    `with_install_token_retry` - never only on the bad case.
+    `grug.check_publish.transient_retries_exhausted` (publish_check.py)
+    only ever fires on failure, which is fine for a one-off "the budget
+    ran out" ping but cannot answer "what fraction of calls are failing" -
+    that needs the successes in the same series too, or a quiet healthy
+    stretch and a quiet fully-broken stretch look identical to a monitor.
+    Same reasoning as `emit_enforcement_metric` (ADR-0022): threshold the
+    VALUE, never gate emission on the outcome. Best-effort; telemetry must
+    never affect the retry path itself."""
+    try:
+        from observability import emit_gauge  # type: ignore
+        emit_gauge("grug.github_api.error", 0.0 if ok else 1.0)
+    except Exception as e:  # noqa: BLE001 - telemetry never breaks a GitHub call
+        log.debug("github_api_error_gauge_emit_failed", extra={"kind": type(e).__name__})
+
+
 def with_install_token_retry(installation_id: int, fn):
     """Run `fn(token)`, retrying transient failures.
 
@@ -267,7 +286,17 @@ def with_install_token_retry(installation_id: int, fn):
     refreshed_401 = False
     for attempt in range(1, _RETRY_MAX_ATTEMPTS + 1):
         try:
-            return fn(token)
+            result = fn(token)
+        except httpx.RequestError:
+            # A transport failure (DNS, connect, timeout) never reaches
+            # raise_for_status(), so it would otherwise escape this
+            # function without ever recording grug.github_api.error -
+            # exactly the "grug.lol answered 200 while its GitHub calls
+            # were failing" shape #948 exists to make visible. Not
+            # retried here (unchanged from before this metric existed);
+            # only observed, then re-raised untouched.
+            _emit_github_api_result(False)
+            raise
         except httpx.HTTPStatusError as e:
             status = e.response.status_code
             if status == 401 and not refreshed_401:
@@ -287,4 +316,8 @@ def with_install_token_retry(installation_id: int, fn):
                 )
                 time.sleep(sleep_seconds)
                 continue
+            _emit_github_api_result(False)
             raise
+        else:
+            _emit_github_api_result(True)
+            return result
