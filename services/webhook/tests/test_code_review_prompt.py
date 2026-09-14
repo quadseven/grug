@@ -296,6 +296,32 @@ def test_unbounded_fanout_shared_backend_rule_present():
     assert "unbounded-fanout-shared-backend" in crp.build_system_prompt()
 
 
+def test_alert_latches_no_recovery_path_rule_is_present():
+    """Weekly harvest 2026-08-09: an alert that can go red but has no path
+    back to OK stays red long after the condition cleared, and the next real
+    incident is invisible underneath it.
+
+    Two shapes, both diff-visible in the query string. (a) The query filters
+    on the state it alerts on: grug #815 / ADR-0022 had
+    `{enforcement_type:none} ... < 0.5`, so a repo that GAINED enforcement
+    stopped matching and its multi-alert group kept its last verdict for
+    Datadog's 24h retention -- measured live 2026-08-01, Alert for 3h18m with
+    ZERO repos actually in the gap. The emitter-side twin is a poller that
+    `continue`s past an opted-out repo instead of emitting a healthy value.
+    (b) A bare threshold on a cumulative counter: infra #2299 alerted on
+    `telemetry.dropped`, counted since process start, so 1591 drops in a
+    90-minute episode held the monitor red for the following eight hours with
+    no way back short of restarting the agent (infra #2282)."""
+    rule = next(
+        (r for r in crp.RULES if r.name == "alert-latches-no-recovery-path"),
+        None,
+    )
+    assert rule is not None, "alert-latches-no-recovery-path missing from RULES"
+    assert rule.bug_class == "correctness"
+    assert rule.severity == "high"
+    assert "alert-latches-no-recovery-path" in crp.build_system_prompt()
+
+
 def test_voice_has_mandatory_bookend_structure():
     """#343: the voice instruction mandates the structural bookends that
     keep the caveman cadence from slipping to plain English under technical

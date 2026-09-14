@@ -534,6 +534,40 @@ RULES: tuple[ReviewRule, ...] = (
         "verdicts = await asyncio.gather(*(_bounded(c) for c in candidates))",
         severity="medium",
     ),
+    # ── alert with no way back to OK (harvest 2026-08-09: grug #815 /
+    #    ADR-0022, infra #2299) ──
+    ReviewRule(
+        name="alert-latches-no-recovery-path",
+        bug_class="correctness",
+        description="A monitor/alert query that can ENTER the alerting state "
+        "but has no path back to OK, so it stays red long after the condition "
+        "cleared and the next real incident is invisible underneath it. Two "
+        "diff-visible shapes. (a) The query FILTERS ON THE VERY STATE IT "
+        "ALERTS ON -- a tag/label selector like `{status:none}` on a monitor "
+        "that alerts when status is none. Recovery makes the series stop "
+        "matching rather than report a healthy value, and a grouped monitor "
+        "holds a vanished group in its LAST state (Datadog: 24h, not "
+        "shortenable for `metric alert`). The same defect reached from the "
+        "emitter side is a poller that `continue`s past a healthy/opted-out "
+        "entity instead of emitting a healthy value for it. (b) A bare "
+        "threshold on a CUMULATIVE counter -- one that only grows within a "
+        "process lifetime (`*.dropped`, `*_total`, `errors_since_start`) -- "
+        "which answers 'have there EVER been' rather than 'is this happening "
+        "now', so it cannot fall back under the bar until a restart. Fix: "
+        "threshold on the VALUE and let every entity report every cycle "
+        "including the healthy ones; for a counter, alert on the delta/rate "
+        "over a window. Do NOT flag a state-tag filter used merely to SCOPE a "
+        "monitor to a fixed subject (`{env:prod}`, `{service:api}`), or a "
+        "counter read through `change()`/`derivative()`/`*_delta`.",
+        bad_example='# alerts on `none`, and filters on `none`: a repo that\n'
+        '# GAINS enforcement drops out and stays red for 24h\n'
+        'query = ("min(last_1h):min:grug.enforcement.state"\n'
+        '         "{enforcement_type:none,env:prod} by {repo} < 0.5")',
+        good_example='# every repo reports every cycle; threshold the value\n'
+        'query = ("min(last_1h):min:grug.enforcement.state"\n'
+        '         "{env:prod} by {repo} < 0.5")',
+        severity="high",
+    ),
 )
 
 
