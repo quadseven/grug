@@ -1,0 +1,21 @@
+name: sync.public-repo-docs
+
+# Thin caller for the reusable public-repo AGENTS.md/CLAUDE.md sync. Keeps
+# this repo's copies in sync with the canonical ones at
+# quadseven/infra-public/templates/public-repo/ - see that workflow's own
+# comments for the full mechanism. Adopted here by hand-reviewed PR (#992)
+# rather than the sync bot itself, given this repo's own scale; wiring in
+# ongoing sync is safe once the sync only touches a file that is still
+# byte-identical to the template (never a customized one).
+
+on:
+  schedule:
+    - cron: "17 6 * * 1"
+  workflow_dispatch: {}
+
+jobs:
+  sync:
+    uses: quadseven/infra-public/.github/workflows/sync.public-repo-docs.yml@0243f644274ea3ebceee6cb18d21f32d924d5544
+    permissions:
+      contents: write
+      pull-requests: write
