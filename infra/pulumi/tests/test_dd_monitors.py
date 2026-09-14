@@ -560,6 +560,8 @@ def test_stuck_check_run_query_is_env_scoped_and_thresholded():
     q = stuck_check_run_query("prod")
     assert "grug.check_run.stuck_count" in q
     assert "env:prod" in q
+    assert "env:dev" not in q
+    assert "> 0" in q
 
 
 # --- every grug-owned monitor must self-identify as Pulumi-owned -----------
@@ -623,11 +625,9 @@ def test_every_monitor_carries_managed_by_pulumi_tag():
     )
 
     def _check(all_tags):
-        for (name, _), tags in zip(resources, all_tags):
+        for (name, _), tags in zip(resources, all_tags, strict=True):
             assert "managed_by:pulumi" in (tags or []), (
                 f"{name}: missing managed_by:pulumi tag, got {tags}"
             )
 
     return pulumi.Output.all(*[r.tags for _, r in resources]).apply(_check)
-    assert "env:dev" not in q
-    assert "> 0" in q
