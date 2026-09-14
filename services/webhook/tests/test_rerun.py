@@ -438,6 +438,84 @@ def test_hot_review_cancels_when_snapshot_moves_during_quiet_window(monkeypatch)
         pr_number=7,
         pr=_pr_data(head_sha="same-head", title="After"),
         settle_seconds=90,
+        redrive_count=1,
+    )
+
+
+def test_hot_review_gives_up_at_entry_once_the_redrive_cap_is_exhausted(monkeypatch):
+    """grug#773 AC3: a review discarded and re-enqueued against the SAME
+    head_sha _MAX_INTENT_DRIFT_REDRIVES times running gives up with a
+    terminal neutral check instead of looping forever - the backstop for a
+    PR whose title/body keeps changing faster than Elder can finish."""
+    pulls = iter((
+        _pr_data(head_sha="same-head", title="Before"),
+        _pr_data(head_sha="same-head", title="After"),
+    ))
+
+    def _fake_token_retry(iid, fn):
+        try:
+            return next(pulls)
+        except StopIteration:
+            return fn("tok")  # the give-up check-post call
+
+    monkeypatch.setattr(rerun, "with_install_token_retry", _fake_token_retry)
+    posted: list = []
+    monkeypatch.setattr(
+        rerun, "post_check_run",
+        lambda token, owner, repo, result, external_id=None: posted.append(result) or {"id": 1},
+    )
+    acquire, complete, release = _patch_hot_claims(monkeypatch)
+    monkeypatch.setattr(rerun.time, "sleep", lambda seconds: None)
+    requeue = MagicMock()
+    monkeypatch.setattr(rerun, "_enqueue_current_review", requeue)
+    dispatch = MagicMock()
+    monkeypatch.setattr(rerun, "dispatch_code_review", dispatch)
+
+    status = rerun._run_one(_job(
+        kind="review", requested_head_sha="same-head", settle_seconds=90,
+        redrive_count=rerun._MAX_INTENT_DRIFT_REDRIVES,
+    ))
+
+    assert status == "intent_drift_exhausted"
+    requeue.assert_not_called()  # never loops again
+    dispatch.assert_not_called()
+    assert len(posted) == 1
+    assert posted[0].head_sha == "same-head"
+    assert posted[0].status == "completed"
+    assert posted[0].conclusion == "neutral"
+
+
+def test_hot_review_new_head_resets_the_redrive_count(monkeypatch):
+    """A genuinely new commit always redrives with a fresh count - AC3 bounds
+    looping on an UNCHANGED sha, never an ordinary incremental push, even if
+    the job carried an exhausted count from the OLD head's own loop."""
+    pulls = iter((
+        _pr_data(head_sha="same-head", title="Before"),
+        _pr_data(head_sha="new-head", title="Before"),
+    ))
+    monkeypatch.setattr(
+        rerun, "with_install_token_retry", lambda iid, fn: next(pulls),
+    )
+    acquire, complete, release = _patch_hot_claims(monkeypatch)
+    monkeypatch.setattr(rerun.time, "sleep", lambda seconds: None)
+    requeue = MagicMock()
+    monkeypatch.setattr(rerun, "_enqueue_current_review", requeue)
+    dispatch = MagicMock()
+    monkeypatch.setattr(rerun, "dispatch_code_review", dispatch)
+
+    status = rerun._run_one(_job(
+        kind="review", requested_head_sha="same-head", settle_seconds=90,
+        redrive_count=rerun._MAX_INTENT_DRIFT_REDRIVES,
+    ))
+
+    assert status == "stale_snapshot"
+    requeue.assert_called_once_with(
+        install_id=11,
+        repo_full="myorg/myrepo",
+        pr_number=7,
+        pr=_pr_data(head_sha="new-head", title="Before"),
+        settle_seconds=90,
+        redrive_count=0,
     )
 
 
@@ -499,10 +577,59 @@ def test_hot_review_requeues_latest_when_dispatch_detects_stale(monkeypatch):
         pr_number=7,
         pr=latest,
         settle_seconds=0,
+        redrive_count=1,
     )
     release.assert_called_once()
     assert release.call_args.kwargs["owner_token"] == acquire.call_args.kwargs["owner_token"]
     complete.assert_not_called()
+
+
+def test_hot_review_gives_up_mid_flight_once_the_redrive_cap_is_exhausted(monkeypatch):
+    """grug#773 AC3's other call site: the EXPENSIVE mid-flight staleness
+    path (a real dispatch already ran) must also stop redriving once the
+    cap is hit, rather than repeating a full reasoner-model call forever."""
+    original = _pr_data(head_sha="same-head", title="Before")
+    latest = _pr_data(head_sha="same-head", title="After")
+    fetches = iter((original, original, latest))
+    posted: list = []
+
+    def _fake_token_retry(iid, fn):
+        try:
+            return next(fetches)
+        except StopIteration:
+            return fn("tok")  # the give-up check-post call
+
+    monkeypatch.setattr(rerun, "with_install_token_retry", _fake_token_retry)
+    monkeypatch.setattr(
+        rerun, "post_check_run",
+        lambda token, owner, repo, result, external_id=None: posted.append(result) or {"id": 1},
+    )
+    monkeypatch.setattr(rerun, "get_repo_config", lambda iid, rid: {})
+    acquire, complete, release = _patch_hot_claims(monkeypatch)
+    requeue = MagicMock()
+    monkeypatch.setattr(rerun, "_enqueue_current_review", requeue)
+    monkeypatch.setattr(
+        rerun,
+        "dispatch_code_review",
+        MagicMock(return_value={
+            "persona": "code_reviewer",
+            "result": "skipped",
+            "degraded_reason": "stale_snapshot",
+        }),
+    )
+
+    status = rerun._run_one(_job(
+        kind="review", settle_seconds=0,
+        redrive_count=rerun._MAX_INTENT_DRIFT_REDRIVES,
+    ))
+
+    assert status == "intent_drift_exhausted"
+    requeue.assert_not_called()
+    assert len(posted) == 1
+    assert posted[0].head_sha == "same-head"
+    assert posted[0].status == "completed"
+    assert posted[0].conclusion == "neutral"
+    release.assert_called_once()
 
 
 def test_hot_review_retires_at_entry_when_already_superseded(monkeypatch):

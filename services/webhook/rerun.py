@@ -74,6 +74,12 @@ _sqs = boto3.client("sqs")
 _RERUN_QUEUE_URL = os.getenv("GRUG_RERUN_QUEUE_URL", "")
 SCHEMA_VERSION = 1
 _MAX_SETTLE_SECONDS = 300
+# grug#773 AC3: a review discarded and re-enqueued against the SAME head_sha
+# this many times running gives up with a terminal neutral check instead of
+# looping forever - the backstop for a PR whose title/body keeps changing
+# faster than Elder can finish reviewing it. A genuinely new commit always
+# resets this to 0; it only counts same-sha redrives.
+_MAX_INTENT_DRIFT_REDRIVES = 3
 # The lease matches the queue's fallback visibility timeout and is renewed on
 # the same cadence as the SQS visibility heartbeat while a review is active.
 _REVIEW_CLAIM_LEASE_SECONDS = 900
@@ -465,6 +471,7 @@ def enqueue_review(
     requested_title: str,
     requested_body: str,
     settle_seconds: int,
+    redrive_count: int = 0,
 ) -> None:
     """Enqueue one normal Elder review on the durable consumer lane.
 
@@ -500,6 +507,7 @@ def enqueue_review(
             "requested_head_sha": requested_head_sha,
             "requested_snapshot_id": requested_snapshot_id,
             "settle_seconds": settle,
+            "redrive_count": redrive_count,
         }),
         MessageGroupId=_review_group_id(install_id, repo, pr_number),
         MessageDeduplicationId=_review_dedup_id(
@@ -515,6 +523,7 @@ def enqueue_review(
             "head_sha": requested_head_sha[:8],
             "snapshot_id": requested_snapshot_id[:11],
             "settle_seconds": settle,
+            "redrive_count": redrive_count,
         },
     )
     # After SQS only: a pre-send check would hang forever if enqueue failed.
@@ -972,6 +981,7 @@ def _enqueue_current_review(
     pr_number: int,
     pr: dict[str, Any],
     settle_seconds: int,
+    redrive_count: int = 0,
 ) -> None:
     """Durably hand the freshly fetched eligible snapshot back to the lane."""
     enqueue_review(
@@ -983,7 +993,76 @@ def _enqueue_current_review(
         requested_title=str(pr.get("title") or ""),
         requested_body=str(pr.get("body") or ""),
         settle_seconds=settle_seconds,
+        redrive_count=redrive_count,
     )
+
+
+def _redrive_or_give_up(
+    *,
+    install_id: int,
+    owner: str,
+    repo_name: str,
+    pr_number: int,
+    pr: dict[str, Any],
+    settle_seconds: int,
+    claimed_head_sha: str,
+    current_head_sha: str,
+    job_redrive_count: int,
+) -> bool:
+    """Re-enqueue the freshly fetched snapshot for another pass, or give up
+    permanently once a review has been discarded and re-enqueued against the
+    SAME head_sha `_MAX_INTENT_DRIFT_REDRIVES` times running (grug#773 AC3) -
+    the backstop for a PR whose title/body keeps changing faster than Elder
+    can finish reviewing it, which would otherwise repeat this exact
+    cancel-then-redrive cycle forever with the check-run stuck `pending`.
+
+    A genuinely NEW commit (current_head_sha != claimed_head_sha) always
+    redrives with a fresh count - AC3 is about looping on an UNCHANGED sha,
+    never about penalizing an ordinary incremental push. Fail-open (neutral,
+    not failure) on giving up, matching the advisory posture every other
+    degraded path here already takes.
+
+    Returns True if re-enqueued, False if it gave up instead."""
+    repo_full = f"{owner}/{repo_name}"
+    same_sha = current_head_sha == claimed_head_sha
+    next_redrive_count = job_redrive_count + 1 if same_sha else 0
+    if same_sha and next_redrive_count > _MAX_INTENT_DRIFT_REDRIVES:
+        log.warning(
+            "elder_review_intent_drift_exhausted",
+            extra={
+                "repo": repo_full,
+                "pr": pr_number,
+                "head_sha": claimed_head_sha[:8],
+                "redrive_count": job_redrive_count,
+            },
+        )
+        _complete_elder_check_open(
+            install_id=install_id,
+            owner=owner,
+            repo_name=repo_name,
+            pr_number=pr_number,
+            head_sha=claimed_head_sha,
+            title="Elder gave up - PR kept changing mid-review",
+            summary=(
+                f"This PR's title or body changed {job_redrive_count} times "
+                "while Elder was reviewing the same commit, faster than a "
+                "review could finish. Elder gave up rather than loop "
+                "forever (fail-open, merge not blocked). Push a no-op "
+                "commit, or wait for edits to settle, then re-request "
+                "review."
+            ),
+            conclusion="neutral",
+        )
+        return False
+    _enqueue_current_review(
+        install_id=install_id,
+        repo_full=repo_full,
+        pr_number=pr_number,
+        pr=pr,
+        settle_seconds=settle_seconds,
+        redrive_count=next_redrive_count,
+    )
+    return True
 
 
 def _review_claim_heartbeat_loop(
@@ -1415,12 +1494,16 @@ def _run_hot_review(
             )
             return "pr_ineligible"
         if current_snapshot_id != snapshot_id:
-            _enqueue_current_review(
+            redrived = _redrive_or_give_up(
                 install_id=install_id,
-                repo_full=repo_full,
+                owner=owner,
+                repo_name=repo_name,
                 pr_number=pr_number,
                 pr=after,
                 settle_seconds=settle_seconds,
+                claimed_head_sha=head_sha,
+                current_head_sha=current_head,
+                job_redrive_count=int(job.get("redrive_count", 0)),
             )
             if not _stop_review_claim_heartbeat(heartbeat):
                 raise RuntimeError(
@@ -1441,7 +1524,7 @@ def _run_hot_review(
                     "current_snapshot_id": current_snapshot_id[:11],
                 },
             )
-            return "stale_snapshot"
+            return "stale_snapshot" if redrived else "intent_drift_exhausted"
 
         cfg = get_repo_config(install_id, repo_id)
         # Mid-flight cancellation (#635 follow-up): current_snapshot_id is the
@@ -1506,15 +1589,24 @@ def _run_hot_review(
             # Same-SHA staleness (title/body intent change): leave the check
             # in_progress - the requeued review on this same head completes
             # it. A terminal neutral here would prematurely green the merge
-            # button before the fresh review runs.
-            if _review_eligible(latest):
-                _enqueue_current_review(
+            # button before the fresh review runs. Unless grug#773 AC3's
+            # redrive cap is exhausted, in which case _redrive_or_give_up
+            # itself posts the terminal neutral instead of redriving again.
+            redrived = (
+                _redrive_or_give_up(
                     install_id=install_id,
-                    repo_full=repo_full,
+                    owner=owner,
+                    repo_name=repo_name,
                     pr_number=pr_number,
                     pr=latest,
                     settle_seconds=settle_seconds,
+                    claimed_head_sha=head_sha,
+                    current_head_sha=latest_head,
+                    job_redrive_count=int(job.get("redrive_count", 0)),
                 )
+                if _review_eligible(latest)
+                else False
+            )
             if not _stop_review_claim_heartbeat(heartbeat):
                 raise RuntimeError(
                     "Elder review claim ownership lost during dispatch"
@@ -1523,11 +1615,9 @@ def _run_hot_review(
                 raise RuntimeError(
                     "Elder review claim ownership lost after stale dispatch"
                 )
-            return (
-                "stale_snapshot"
-                if _review_eligible(latest)
-                else "pr_ineligible"
-            )
+            if not _review_eligible(latest):
+                return "pr_ineligible"
+            return "stale_snapshot" if redrived else "intent_drift_exhausted"
         if degraded_reason == "pr_ineligible":
             # NO terminal completion here: a draft/closed PR cannot merge, so
             # a lingering in_progress check blocks nothing - but a terminal
@@ -1702,6 +1792,7 @@ def handle_rerun_jobs(event: dict[str, Any]) -> dict[str, int]:
             if status in {
                 "skipped_persona", "duplicate_snapshot", "stale_snapshot",
                 "draft_skipped", "pr_ineligible", "superseded_at_entry",
+                "intent_drift_exhausted",
             }
         ),
     }
