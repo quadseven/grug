@@ -40,6 +40,7 @@ import queue
 import re
 import threading
 import time
+import uuid
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, field, replace
 from enum import Enum
@@ -535,6 +536,19 @@ class BackendConfig:
     # Ollama target. SaaS backends don't look at it; harmless to send
     # everywhere it's set.
     extra_headers: dict = field(default_factory=dict)
+    # Headers whose VALUE must be computed per call, not once at config
+    # definition time (grug#984). opencode Go's `x-opencode-session`
+    # needs a value that is fresh per outgoing request - re-sending the
+    # same literal string for the process's entire lifetime would still
+    # satisfy the "header present" check that actually gates the 400
+    # below, but would defeat the routing/prompt-caching optimization the
+    # header exists for (every unrelated PR's review would collide on one
+    # cache key) and reads as exactly the kind of static, non-conversation
+    # -scoped traffic opencode Go's abuse monitoring is watching for.
+    # Callable, same lazy-at-call-time shape as `key_loader` above, for
+    # the same reason: a bare value captured here would be frozen at
+    # `_BACKEND_CONFIGS` module-load time, not regenerated per call.
+    dynamic_headers: dict[str, Callable[[], str]] = field(default_factory=dict)
     timeout_seconds: float = _TIMEOUT_SECONDS
     retry_attempts: int = _RETRY_ATTEMPTS
     # Long review calls should still retry quick 429/503 responses, but must not
@@ -654,6 +668,19 @@ _BACKEND_CONFIGS: dict[Backend, BackendConfig] = {
         url=os.getenv("GRUG_OPENCODE_GO_URL", _OPENCODE_GO_URL),
         model=os.getenv("GRUG_OPENCODE_GO_MODEL", _OPENCODE_GO_DEFAULT_MODEL),
         key_loader=lambda: _load_opencode_go_key(),
+        # opencode Go started 400ing EVERY call today (confirmed live,
+        # grug#984): `{"type":"MissingSessionID","message":"Request is
+        # missing x-opencode-session and cannot be routed efficiently."}`.
+        # Their docs (opencode.ai/docs/go/, updated the same day) newly
+        # document three requirements for any non-CLI HTTP client: a
+        # distinctive User-Agent (httpx's default is exactly the "generic
+        # HTTP-library name" they call out), a stable-per-conversation
+        # `x-opencode-session`, and "typical coding agent traffic." A
+        # fresh UUID per call satisfies this - grug's calls are single-
+        # shot (no multi-turn state), so "per call" and "per conversation"
+        # coincide here.
+        extra_headers={"User-Agent": "grug/1.0 (+https://grug.lol)"},
+        dynamic_headers={"x-opencode-session": lambda: str(uuid.uuid4())},
         wire=cast(
             'Literal["chat", "responses"]',
             os.getenv("GRUG_OPENCODE_GO_WIRE", _OPENCODE_GO_DEFAULT_WIRE),
@@ -1443,11 +1470,18 @@ def _call_backend(
         )
 
     body = _build_request_body(config, messages)
-    if any(name.lower() == "authorization" for name in config.extra_headers):
+    if any(
+        name.lower() == "authorization"
+        for name in (*config.extra_headers, *config.dynamic_headers)
+    ):
         raise _BackendConfigError(
             f"{config.backend.value} extra_headers must not contain Authorization"
         )
-    headers = {**config.extra_headers, "Authorization": f"Bearer {key}"}
+    headers = {
+        **config.extra_headers,
+        **{name: fn() for name, fn in config.dynamic_headers.items()},
+        "Authorization": f"Bearer {key}",
+    }
 
     if config.retry_attempts < 1:
         raise _BackendConfigError(

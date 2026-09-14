@@ -3920,6 +3920,63 @@ def test_responses_wire_sends_input_and_text_format(monkeypatch) -> None:
     assert "max_tokens" not in body
 
 
+def test_opencode_go_sends_session_and_user_agent_headers(monkeypatch) -> None:
+    """grug#984: opencode Go started 400ing every call with MissingSessionID
+    once it began enforcing a distinctive User-Agent + a per-conversation
+    x-opencode-session header on non-CLI HTTP clients - confirmed live against
+    the real API. Both headers must be on every opencode-go request."""
+    captured: dict = {}
+
+    def fake_post(url, json=None, headers=None, timeout=None):
+        captured["headers"] = headers
+        return httpx.Response(200, json={"model": "gpt-5.6-luna", "output": []})
+
+    monkeypatch.setattr(lc.httpx, "post", fake_post)
+    cfg = lc.replace(lc._BACKEND_CONFIGS[lc.Backend.OPENCODE_GO], key_loader=lambda: "k")
+    lc._call_backend(cfg, [{"role": "user", "content": "hi"}])
+
+    headers = captured["headers"]
+    assert "python-httpx" not in headers.get("User-Agent", "")
+    assert headers.get("User-Agent", "") != ""
+    assert headers.get("x-opencode-session", "") != ""
+
+
+def test_opencode_go_session_header_is_fresh_per_call(monkeypatch) -> None:
+    """A session id frozen at _BACKEND_CONFIGS module-load time would still
+    clear the 400 (the error only checks presence) but would collide every
+    unrelated PR's review onto one opencode Go cache/routing key for the
+    process's whole lifetime - exactly what dynamic_headers's lazy-callable
+    shape (mirroring key_loader) exists to avoid."""
+    captured: list = []
+
+    def fake_post(url, json=None, headers=None, timeout=None):
+        captured.append(headers["x-opencode-session"])
+        return httpx.Response(200, json={"model": "gpt-5.6-luna", "output": []})
+
+    monkeypatch.setattr(lc.httpx, "post", fake_post)
+    cfg = lc.replace(lc._BACKEND_CONFIGS[lc.Backend.OPENCODE_GO], key_loader=lambda: "k")
+    lc._call_backend(cfg, [{"role": "user", "content": "hi"}])
+    lc._call_backend(cfg, [{"role": "user", "content": "hi"}])
+
+    assert len(captured) == 2
+    assert captured[0] != captured[1]
+
+
+def test_dynamic_headers_cannot_override_authorization(monkeypatch) -> None:
+    """Same FLINT #618 guard as extra_headers, extended to dynamic_headers -
+    a lazily-computed header must not be able to silently replace the real
+    bearer token either."""
+    config = lc.BackendConfig(
+        backend=Backend.POOLSIDE,
+        url="http://example.test/v1/chat/completions",
+        model="m",
+        key_loader=lambda: "test-pool-key",
+        dynamic_headers={"Authorization": lambda: "Bearer evil"},
+    )
+    with pytest.raises(lc._BackendConfigError, match="must not contain Authorization"):
+        lc._call_backend(config, messages=[{"role": "user", "content": "hi"}])
+
+
 def test_chat_wire_is_unchanged(monkeypatch) -> None:
     captured: dict = {}
 
