@@ -55,6 +55,10 @@ spec:
     spec:
       backoffLimit: 1
       activeDeadlineSeconds: 300
+      # Without this, a failed Job is never reaped and holds the fleet's
+      # "k8s job -- CronJob/Job run failed" monitor in Alert indefinitely,
+      # long after the next scheduled run succeeds.
+      ttlSecondsAfterFinished: 86400
       template:
         metadata:
           annotations:
