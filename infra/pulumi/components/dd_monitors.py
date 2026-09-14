@@ -82,7 +82,7 @@ class _MonitorBundle:
 
 
 def _common_tags(env: str, service: str) -> list[str]:
-    return [f"env:{env}", f"service:{service}", "team:grug"]
+    return [f"env:{env}", f"service:{service}", "team:grug", "managed_by:pulumi"]
 
 
 # --- k8s-native query builders (#406) ---------------------------------------
@@ -383,7 +383,7 @@ def create_deploy_monitors(
             "Runbook: docs/RUNBOOK.md#deploy-rollback"
         ),
         query=deploy_rollback_query(env),
-        tags=[f"env:{env}", "service:grug-webhook", "team:grug"],
+        tags=_common_tags(env, "grug-webhook"),
         notify_no_data=False,
         require_full_window=False,
         priority=2,
@@ -440,7 +440,7 @@ def create_owned_queue_monitors(
             name=display_name,
             message=f"{_DIGEST}\n{body}\n{runbook}",
             query=query,
-            tags=[f"env:{env}", f"service:{service}", "team:grug"],
+            tags=_common_tags(env, service),
             notify_no_data=notify_no_data,
             no_data_timeframe=no_data_timeframe,
             require_full_window=False,

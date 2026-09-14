@@ -523,7 +523,7 @@ _cave_fallback_fired_monitor = _datadog.Monitor(
         f'logs("service:grug-webhook env:{env} elder_fallback_enqueued")'
         '.index("*").rollup("count").last("1h") >= 1'
     ),
-    tags=[f"env:{env}", "service:grug-webhook", "team:grug"],
+    tags=[f"env:{env}", "service:grug-webhook", "team:grug", "managed_by:pulumi"],
     notify_no_data=False,
     priority=4,
     opts=pulumi.ResourceOptions(provider=_dd_provider),

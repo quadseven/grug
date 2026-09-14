@@ -560,5 +560,74 @@ def test_stuck_check_run_query_is_env_scoped_and_thresholded():
     q = stuck_check_run_query("prod")
     assert "grug.check_run.stuck_count" in q
     assert "env:prod" in q
+
+
+# --- every grug-owned monitor must self-identify as Pulumi-owned -----------
+
+_ALL_MONITOR_FIELDS = (
+    "workload_not_ready",
+    "crashloop",
+    "restart_spike",
+    "poller_cronjob",
+    "sig_verify_fail",
+    "elder_offload_fail",
+    "persona_dispatch_unhandled",
+    "elder_llm_degraded",
+    "enforcement_gap",
+    "github_api_errors",
+    "check_run_stuck",
+    "backend_unusable",
+    "cf_secret_mismatch",
+    "uptime",
+    "credential_acquisition_fail",
+)
+
+_ALL_QUEUE_MONITOR_FIELDS = (
+    "cave_jobs_backlog",
+    "rerun_backlog",
+    "cave_results_backlog",
+    "rerun_dlq",
+    "cave_jobs_dlq",
+    "cave_results_dlq",
+    "telemetry_health",
+)
+
+
+@pulumi.runtime.test
+def test_every_monitor_carries_managed_by_pulumi_tag():
+    """The infrastructure org's fleet-wide 'hand-made monitor' audit flags any
+    Datadog monitor without a `managed_by:pulumi` tag as not Pulumi-owned,
+    even when it demonstrably is. Every monitor this stack creates - across
+    all three builders, not just the ones routed through `_common_tags` -
+    must carry it, or the audit keeps false-flagging grug's own monitors."""
+    import pulumi_datadog as datadog
+
+    from components import dd_monitors
+
+    provider = datadog.Provider("test-dd-managed-by", api_key="x", app_key="y")
+
+    all_bundle = dd_monitors.create_all(
+        env="prod",
+        notify_handle="@webhook-grug-discord-monitoring",
+        webhook_public_url="https://webhook.example/webhook/github",
+        api_public_url="https://api.example",
+        provider=provider,
+    )
+    deploy_bundle = dd_monitors.create_deploy_monitors(env="prod", provider=provider)
+    queue_bundle = dd_monitors.create_owned_queue_monitors(env="prod", provider=provider)
+
+    resources = (
+        [(f, getattr(all_bundle, f)) for f in _ALL_MONITOR_FIELDS]
+        + [("rollback_fired", deploy_bundle.rollback_fired)]
+        + [(f, getattr(queue_bundle, f)) for f in _ALL_QUEUE_MONITOR_FIELDS]
+    )
+
+    def _check(all_tags):
+        for (name, _), tags in zip(resources, all_tags):
+            assert "managed_by:pulumi" in (tags or []), (
+                f"{name}: missing managed_by:pulumi tag, got {tags}"
+            )
+
+    return pulumi.Output.all(*[r.tags for _, r in resources]).apply(_check)
     assert "env:dev" not in q
     assert "> 0" in q
