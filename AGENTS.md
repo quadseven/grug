@@ -121,3 +121,6 @@ words — which is where nearly everything this file exists to prevent
 actually showed up. Scanners still belong in CI as a backstop for the
 shapes they *can* catch; this file is the layer above that, for the judgment
 a scanner doesn't have.
+
+<!-- Everything above the next line is synced from quadseven/infra-public and replaced on every sync. Put this repo's own content below it. -->
+<!-- repo-specific below -->
