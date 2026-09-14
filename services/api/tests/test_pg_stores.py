@@ -1374,7 +1374,19 @@ def _stress_rate(n: int, limit: int, rounds: int) -> str:
     """Loop the multi-process rate-limiter scenario `rounds` times at
     concurrency `n`, fresh rate-limit key per round, and return a one-line
     summary of the over-admission rate. Shared by both n values #877 asks
-    for (16 and 40) so the diagnostic test below stays a thin driver."""
+    for (16 and 40) so the diagnostic test below stays a thin driver.
+
+    Pins each spawned worker's own pool to a single connection
+    (`GRUG_PG_POOL_MAX=1`, inherited by the spawned child's environment):
+    at n=40 the default max_size=5 lets 40 independent per-process pools
+    warm up to as many as 200 real Postgres connections for one round,
+    which blows past CI's shared Postgres's connection ceiling
+    (`too many clients already`) before the round even runs its query.
+    Each worker only ever issues one synchronous query, so min_size=1
+    already satisfies it - capping max_size to match changes nothing
+    about what is being measured.
+    """
+    os.environ["GRUG_PG_POOL_MAX"] = "1"
     over_admissions = 0
     exact_matches = 0
     failure_shapes: list[str] = []
