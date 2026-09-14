@@ -1370,23 +1370,11 @@ def test_reserve_slot_concurrent_processes_admit_exactly_the_limit(pg):
     assert row is not None and int(row[0]) == limit
 
 
-def test_reserve_slot_concurrent_processes_stress_measures_failure_rate(pg):
-    """THROWAWAY DIAGNOSTIC for grug#877 - not meant to stay in the suite.
-
-    #877's own "what would actually settle it" section: "Quantify, do not
-    sample. Run the multi-process test in a loop (50-100 iterations) at
-    n=16 and record the failure RATE. A defect that shows up 1 run in 8 is
-    invisible to a single CI run." This runs the EXACT same scenario as
-    the test above 50 times with a fresh rate-limit key each round (so
-    rounds cannot interfere with each other) and prints a rate rather than
-    asserting pass/fail on every round - the point is the NUMBER, read
-    from this run's CI log, not whether this test itself is green.
-    """
-    from adapters import pg_base
-
-    limit = 5
-    n = 16
-    rounds = 50
+def _stress_rate(n: int, limit: int, rounds: int) -> str:
+    """Loop the multi-process rate-limiter scenario `rounds` times at
+    concurrency `n`, fresh rate-limit key per round, and return a one-line
+    summary of the over-admission rate. Shared by both n values #877 asks
+    for (16 and 40) so the diagnostic test below stays a thin driver."""
     over_admissions = 0
     exact_matches = 0
     failure_shapes: list[str] = []
@@ -1410,7 +1398,7 @@ def test_reserve_slot_concurrent_processes_stress_measures_failure_rate(pg):
             p.join(timeout=30)
         for p in procs:
             assert p.exitcode == 0, (
-                f"round {round_index}: worker process {p.pid} exited {p.exitcode}"
+                f"n={n} round {round_index}: worker process {p.pid} exited {p.exitcode}"
             )
 
         admitted_count = sum(1 for _, ok in results if ok)
@@ -1419,21 +1407,37 @@ def test_reserve_slot_concurrent_processes_stress_measures_failure_rate(pg):
         else:
             over_admissions += 1
             failure_shapes.append(
-                f"round {round_index}: admitted {admitted_count} of {n} "
+                f"n={n} round {round_index}: admitted {admitted_count} of {n} "
                 f"(expected {limit})"
             )
 
     rate = over_admissions / rounds
-    summary = (
-        f"grug#877 STRESS RESULT: {over_admissions}/{rounds} rounds "
+    return (
+        f"grug#877 STRESS RESULT n={n}: {over_admissions}/{rounds} rounds "
         f"over-admitted (rate={rate:.3f}), {exact_matches}/{rounds} exact. "
-        f"n={n} limit={limit}.\n"
-        + "\n".join(failure_shapes)
+        f"limit={limit}.\n" + "\n".join(failure_shapes)
     )
+
+
+def test_reserve_slot_concurrent_processes_stress_measures_failure_rate(pg):
+    """THROWAWAY DIAGNOSTIC for grug#877 - not meant to stay in the suite.
+
+    #877's own "what would actually settle it" section: "Quantify, do not
+    sample. Run the multi-process test in a loop (50-100 iterations) at
+    n=16 AND n=40 and record the failure RATE. A defect that shows up 1 run
+    in 8 is invisible to a single CI run." Runs 50 rounds at BOTH n=16 and
+    n=40 and prints both rates rather than asserting pass/fail on every
+    round - the point is the NUMBERS, read from this run's CI log, not
+    whether this test itself is green.
+    """
+    from adapters import pg_base
+
+    summary_16 = _stress_rate(n=16, limit=5, rounds=50)
+    summary_40 = _stress_rate(n=40, limit=5, rounds=50)
     # ALWAYS fails, on purpose - pytest captures stdout by default and only
     # shows it on failure, and this diagnostic exists to be READ from this
-    # throwaway PR's CI log, not to pass or fail cleanly. The rate itself
-    # is the deliverable; a real assertion here would just be another
-    # single-sample result dressed up as 50, the exact failure mode #877
-    # was filed to stop repeating.
-    raise AssertionError(summary)
+    # throwaway PR's CI log, not to pass or fail cleanly. The rates
+    # themselves are the deliverable; a real assertion here would just be
+    # another single-sample result dressed up as 100, the exact failure
+    # mode #877 was filed to stop repeating.
+    raise AssertionError(summary_16 + "\n\n" + summary_40)
