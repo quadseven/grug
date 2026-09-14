@@ -262,8 +262,8 @@ def _emit_github_api_result(ok: bool) -> None:
     try:
         from observability import emit_gauge  # type: ignore
         emit_gauge("grug.github_api.error", 0.0 if ok else 1.0)
-    except Exception:  # noqa: BLE001 - telemetry never breaks a GitHub call
-        pass
+    except Exception as e:  # noqa: BLE001 - telemetry never breaks a GitHub call
+        log.debug("github_api_error_gauge_emit_failed", extra={"kind": type(e).__name__})
 
 
 def with_install_token_retry(installation_id: int, fn):
@@ -287,6 +287,16 @@ def with_install_token_retry(installation_id: int, fn):
     for attempt in range(1, _RETRY_MAX_ATTEMPTS + 1):
         try:
             result = fn(token)
+        except httpx.RequestError:
+            # A transport failure (DNS, connect, timeout) never reaches
+            # raise_for_status(), so it would otherwise escape this
+            # function without ever recording grug.github_api.error -
+            # exactly the "grug.lol answered 200 while its GitHub calls
+            # were failing" shape #948 exists to make visible. Not
+            # retried here (unchanged from before this metric existed);
+            # only observed, then re-raised untouched.
+            _emit_github_api_result(False)
+            raise
         except httpx.HTTPStatusError as e:
             status = e.response.status_code
             if status == 401 and not refreshed_401:

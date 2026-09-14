@@ -289,8 +289,8 @@ def _emit_stuck_check_run_metric(count: int) -> None:
     try:
         from observability import emit_gauge  # type: ignore
         emit_gauge("grug.check_run.stuck_count", float(count))
-    except Exception:  # noqa: BLE001 - telemetry never breaks the cron
-        pass
+    except Exception as e:  # noqa: BLE001 - telemetry never breaks the cron
+        log.debug("check_run_stuck_gauge_emit_failed", extra={"kind": type(e).__name__})
 
 
 def reconcile_installs(installs: list[int]) -> tuple[int, int]:

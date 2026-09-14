@@ -146,6 +146,30 @@ def test_exhausted_retry_emits_dense_error_gauge_at_one(
     assert emitted == [("grug.github_api.error", 1.0)]
 
 
+def test_transport_error_emits_dense_error_gauge_and_reraises(
+    _stub_token, mock_transport_client, monkeypatch: pytest.MonkeyPatch,
+):
+    """Elder-flagged gap: a DNS/connect/timeout failure never reaches
+    raise_for_status(), so it would otherwise escape with the error gauge
+    never observing it - grug.lol staying "healthy" while every GitHub
+    call is actually failing, the exact shape #948 exists to catch."""
+    import observability  # type: ignore
+
+    emitted: list[tuple[str, float]] = []
+    monkeypatch.setattr(
+        observability, "emit_gauge",
+        lambda metric, value, **_kw: emitted.append((metric, value)),
+    )
+    client = mock_transport_client(raise_exc=httpx.ConnectError("boom"))
+
+    def fn(token: str) -> None:
+        client.get("https://api.github.com/repos")
+
+    with pytest.raises(httpx.ConnectError):
+        gh_auth.with_install_token_retry(123, fn)
+    assert emitted == [("grug.github_api.error", 1.0)]
+
+
 def test_permanent_4xx_also_emits_dense_error_gauge(
     _stub_token, mock_transport_client, monkeypatch: pytest.MonkeyPatch,
 ):
