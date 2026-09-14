@@ -73,6 +73,8 @@ class _MonitorBundle:
     persona_dispatch_unhandled: datadog.Monitor
     elder_llm_degraded: datadog.Monitor
     enforcement_gap: datadog.Monitor
+    github_api_errors: datadog.Monitor
+    check_run_stuck: datadog.Monitor
     backend_unusable: datadog.Monitor
     cf_secret_mismatch: datadog.Monitor
     uptime: datadog.SyntheticsTest
@@ -195,6 +197,44 @@ def enforcement_gap_query(env: str) -> str:
     return (
         "min(last_1h):min:grug.enforcement.state"
         "{env:" + env + "} by {repo} < 0.5"
+    )
+
+
+def github_api_error_rate_query(env: str) -> str:
+    """grug#948: reaching GitHub needs to be observable from the outside -
+    the 2026-08-17 degradation had grug.lol answering 200 throughout while
+    its GitHub API calls (and thus its event stream) were failing, and
+    nothing distinguished those two states.
+
+    `grug.github_api.error` (github_app_auth.py's `with_install_token_retry`)
+    is emitted DENSELY - 0.0 on every successful call, 1.0 on every call
+    that exhausts its retry budget - never only on the bad case, so a
+    threshold on the VALUE never goes quiet on a healthy stretch the way a
+    fire-only-on-failure metric would (same ADR-0022 reasoning as
+    `enforcement_gap_query`). `avg > 0.2` reads as "more than one in five
+    GitHub calls failed over the window", well above the occasional
+    permanent-4xx noise a real outage would swamp regardless.
+    """
+    return (
+        "avg(last_15m):avg:grug.github_api.error"
+        "{env:" + env + "} > 0.2"
+    )
+
+
+def stuck_check_run_query(env: str) -> str:
+    """grug#948: the operator-facing half of #887's sweeper (#947) - a
+    check run that sat `in_progress` too long self-heals going forward,
+    but an operator should still know it HAPPENED, not just trust the
+    silent self-heal.
+
+    `grug.check_run.stuck_count` (check_run_reconciler.py's
+    `reconcile_installs`) is the sweeper's own detection, summed across
+    every opted-in repo and emitted every poller tick including zero -
+    never a second implementation of the detection, and never sparse.
+    """
+    return (
+        "max(last_1h):max:grug.check_run.stuck_count"
+        "{env:" + env + "} > 0"
     )
 
 
@@ -827,6 +867,51 @@ def create_all(
         opts=opts,
     )
 
+    # 5b) grug#948: reaching GitHub needs to be observable from the outside -
+    #     the 2026-08-17 degradation had grug.lol answering 200 throughout
+    #     while its own GitHub API calls (and event stream) were failing.
+    github_api_errors = datadog.Monitor(
+        "grug-github-api-error-rate",
+        type="metric alert",
+        name="[grug] GitHub API error rate elevated (15min)",
+        message=(
+            f"{_DIGEST}\n"
+            "More than 1 in 5 GitHub API calls (through "
+            "with_install_token_retry) failed after exhausting retries "
+            "over the last 15 minutes - grug may be healthy while GitHub "
+            "reachability isn't, or the App's credentials/permissions "
+            "regressed.\n"
+            "Runbook: docs/RUNBOOK.md#github-api-error-rate"
+        ),
+        query=github_api_error_rate_query(env),
+        tags=_common_tags(env, "grug") + ["github:api"],
+        notify_no_data=False,
+        priority=2,
+        opts=opts,
+    )
+
+    # 5c) grug#948: the operator-facing signal for #887's sweeper (#947) -
+    #     a self-heal is not the same as an operator knowing it happened.
+    check_run_stuck = datadog.Monitor(
+        "grug-check-run-stuck",
+        type="metric alert",
+        name="[grug] A check run sat in_progress too long and was swept (1h)",
+        message=(
+            f"{_DIGEST}\n"
+            "The check-run reconciler closed at least one of grug's own "
+            "check runs that sat in_progress past its bounded age - "
+            "almost always a GitHub or grug outage mid-review. The run "
+            "was already closed out with an honest failure; this alert is "
+            "so an operator knows it happened at all.\n"
+            "Runbook: docs/RUNBOOK.md#check-run-stuck"
+        ),
+        query=stuck_check_run_query(env),
+        tags=_common_tags(env, "grug-webhook") + ["check-run:stuck"],
+        notify_no_data=False,
+        priority=3,
+        opts=opts,
+    )
+
     # 6) CF→AWS auth-boundary header-mismatch rate. A burst means the
     #    secret got out of sync between the CF Worker binding and the
     #    SSM param the Lambda middleware reads — usually a rotation
@@ -910,6 +995,8 @@ def create_all(
         persona_dispatch_unhandled=persona_dispatch_unhandled,
         elder_llm_degraded=elder_llm_degraded,
         enforcement_gap=enforcement_gap,
+        github_api_errors=github_api_errors,
+        check_run_stuck=check_run_stuck,
         backend_unusable=backend_unusable,
         cf_secret_mismatch=cf_secret_mismatch,
         uptime=uptime,

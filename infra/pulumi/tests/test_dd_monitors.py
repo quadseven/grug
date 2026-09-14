@@ -22,8 +22,10 @@ from components.dd_monitors import (
     all_ksm_monitor_queries,
     crashloop_query,
     enforcement_gap_query,
+    github_api_error_rate_query,
     poller_cronjob_unhealthy_query,
     restart_spike_query,
+    stuck_check_run_query,
     workload_not_ready_query,
 )
 
@@ -420,6 +422,8 @@ def test_only_three_monitors_can_page_and_every_handle_is_recovery_gated():
         "elder_offload_fail": bundle.elder_offload_fail,
         "persona_dispatch_unhandled": bundle.persona_dispatch_unhandled,
         "enforcement_gap": bundle.enforcement_gap,
+        "github_api_errors": bundle.github_api_errors,
+        "check_run_stuck": bundle.check_run_stuck,
         "cf_secret_mismatch": bundle.cf_secret_mismatch,
         "credential_acquisition_fail": bundle.credential_acquisition_fail,
     }
@@ -532,3 +536,29 @@ def test_backend_unusable_query_targets_the_terminal_token_only() -> None:
         "alerting on the overload token would be pure noise"
     )
     assert "env:prod" in q
+
+
+# --- #948: observing GitHub reachability from the outside -------------------
+
+
+def test_github_api_error_rate_query_is_env_scoped_and_thresholded():
+    q = github_api_error_rate_query("prod")
+    assert "grug.github_api.error" in q
+    assert "env:prod" in q
+    assert "env:dev" not in q
+    assert "> 0.2" in q
+
+
+def test_github_api_error_rate_query_has_no_state_tag_to_latch_on():
+    """Same ADR-0022 shape as enforcement_gap_query: no tag filter that
+    could make the series vanish - only the dense metric's own value."""
+    q = github_api_error_rate_query("prod")
+    assert "outcome:" not in q and "status:" not in q
+
+
+def test_stuck_check_run_query_is_env_scoped_and_thresholded():
+    q = stuck_check_run_query("prod")
+    assert "grug.check_run.stuck_count" in q
+    assert "env:prod" in q
+    assert "env:dev" not in q
+    assert "> 0" in q
