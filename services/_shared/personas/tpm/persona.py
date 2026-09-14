@@ -118,7 +118,16 @@ def _summary(results: list[CheckResult]) -> tuple[str, str]:
         if skipped:
             title = f"Hunt Plan ready - {total - len(skipped)}/{total} checks"
     else:
-        title = f"Hunt Plan hold - {len(blocking)}/{total} plan checks fail"
+        # The per-check breakdown lives only in this check-run's own
+        # `output.summary` (the table built below) - GitHub's PR checks
+        # list shows just this title inline, so a reader who doesn't
+        # click into "Details" sees a fail with no idea why. Relayed
+        # live: three agents mistook a run of these for an outage before
+        # finding the summary was the only place the reason lived.
+        title = (
+            f"Hunt Plan hold - {len(blocking)}/{total} plan checks fail "
+            "- see Details for which"
+        )
     if skipped:
         names = ", ".join(check_display_name(r.name) for r in skipped)
         title += f" ({names} skipped)"
