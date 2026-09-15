@@ -3894,8 +3894,13 @@ def test_cave_priority_is_byte_identical_to_pre_906_behavior(monkeypatch) -> Non
 
 
 def test_responses_wire_sends_input_and_text_format(monkeypatch) -> None:
-    """opencode Go serves gpt-5.6-luna ONLY from /v1/responses, whose request
-    shape differs from chat-completions in three ways that all matter."""
+    """opencode Go serves models like gpt-5.6-luna ONLY from /v1/responses,
+    whose request shape differs from chat-completions in three ways that
+    all matter. The OPENCODE_GO backend itself now defaults to the chat
+    wire (deepseek-v4.1-flash, since 2026-09-15) - this test forces the
+    responses wire explicitly rather than reading that default, so it keeps
+    covering the responses-wire code path regardless of which model
+    opencode-go currently points at."""
     captured: dict = {}
 
     def fake_post(url, json=None, headers=None, timeout=None):
@@ -3906,6 +3911,9 @@ def test_responses_wire_sends_input_and_text_format(monkeypatch) -> None:
     monkeypatch.setattr(lc.httpx, "post", fake_post)
     cfg = lc.replace(
         lc._BACKEND_CONFIGS[lc.Backend.OPENCODE_GO],
+        url="https://opencode.ai/zen/go/v1/responses",
+        model="gpt-5.6-luna",
+        wire="responses",
         key_loader=lambda: "k",
         extra_body={"max_tokens": 1234},
     )
