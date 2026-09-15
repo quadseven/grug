@@ -239,18 +239,27 @@ _OPENROUTER_MODEL = "anthropic/claude-haiku-4.5"
 # disproven). Model id has NO vendor prefix on this endpoint - verified via
 # GET /v1/models, not assumed from docs (the docs-implied "opencode-go/
 # deepseek-v4-flash" 404s).
-# gpt-5.6-luna is served ONLY from /v1/responses - opencode Go splits its
-# catalogue three ways (/v1/responses for luna, grok-4.6 and muse-spark;
-# /v1/messages for minimax and qwen; /v1/chat/completions for the rest), and
-# sending the wrong shape returns HTTP 500, not a 4xx that names the problem.
-# Both URL and model stay env-overridable together, because they are a PAIR:
-# changing the model without the matching endpoint is the 500 above.
-_OPENCODE_GO_URL = "https://opencode.ai/zen/go/v1/responses"
-_OPENCODE_GO_DEFAULT_MODEL = "gpt-5.6-luna"
-# Chat-completions is still the right wire for most of the catalogue, so an
-# operator repointing GRUG_OPENCODE_GO_MODEL at e.g. deepseek-v4-flash must
-# set GRUG_OPENCODE_GO_URL and GRUG_OPENCODE_GO_WIRE to match.
-_OPENCODE_GO_DEFAULT_WIRE = "responses"
+# opencode Go splits its catalogue three ways (/v1/responses for luna,
+# grok-4.6 and muse-spark; /v1/messages for minimax and qwen;
+# /v1/chat/completions for the rest), and sending the wrong shape returns
+# HTTP 500, not a 4xx that names the problem. URL, model and wire stay
+# env-overridable together, because they are a PAIR: changing the model
+# without the matching endpoint+wire is the 500 above.
+#
+# SWAPPED 2026-09-15 from gpt-5.6-luna to deepseek-v4.1-flash: the operator
+# was running low on the shared $10/mo Go subscription (this chain is
+# Elder's PRIMARY review backend, so it is the dominant consumer) and
+# deepseek-v4.1-flash carries a temporary 4x usage-cap promo ($60/mo
+# instead of the normal $15, "Ends Sep 20" per opencode.ai/docs/go/ as of
+# this date) - same $10 subscription, roughly 4x the review headroom until
+# the promo ends. deepseek-v4.1-flash is /v1/chat/completions-shaped
+# (wire "chat"), not luna's /v1/responses - both changed together, per the
+# pairing rule above. Model id verified live against GET /v1/models
+# (bare "deepseek-v4.1-flash", no vendor prefix, matching this file's own
+# established practice of never trusting the docs-implied id format).
+_OPENCODE_GO_URL = "https://opencode.ai/zen/go/v1/chat/completions"
+_OPENCODE_GO_DEFAULT_MODEL = "deepseek-v4.1-flash"
+_OPENCODE_GO_DEFAULT_WIRE = "chat"
 
 # Review-only OpenRouter configuration. Teller, /grug ask, and the judge keep
 # their low-latency shared backend config; exhaustive reasoning belongs only on
