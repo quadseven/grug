@@ -23,6 +23,7 @@ from components.dd_monitors import (
     crashloop_query,
     enforcement_gap_query,
     github_api_error_rate_query,
+    inbound_webhook_silence_query,
     poller_cronjob_unhealthy_query,
     restart_spike_query,
     stuck_check_run_query,
@@ -424,6 +425,7 @@ def test_only_three_monitors_can_page_and_every_handle_is_recovery_gated():
         "enforcement_gap": bundle.enforcement_gap,
         "github_api_errors": bundle.github_api_errors,
         "check_run_stuck": bundle.check_run_stuck,
+        "inbound_webhook_silence": bundle.inbound_webhook_silence,
         "cf_secret_mismatch": bundle.cf_secret_mismatch,
         "credential_acquisition_fail": bundle.credential_acquisition_fail,
     }
@@ -564,6 +566,26 @@ def test_stuck_check_run_query_is_env_scoped_and_thresholded():
     assert "> 0" in q
 
 
+# --- 2026-09-17: GitHub traffic not reaching grug at all --------------------
+
+
+def test_inbound_webhook_silence_query_is_env_scoped_and_thresholded():
+    q = inbound_webhook_silence_query("prod")
+    assert "service:grug-webhook" in q
+    assert "webhook_received" in q
+    assert "env:prod" in q
+    assert "env:dev" not in q
+    assert "< 1" in q
+
+
+def test_inbound_webhook_silence_query_uses_a_generous_window():
+    """A short window would page on ordinary quiet stretches (nights,
+    weekends) across every repo the App watches - the whole point of this
+    monitor is to catch a SUSTAINED silence, not normal gaps between PRs."""
+    q = inbound_webhook_silence_query("prod")
+    assert '.last("4h")' in q
+
+
 # --- every grug-owned monitor must self-identify as Pulumi-owned -----------
 
 _ALL_MONITOR_FIELDS = (
@@ -578,6 +600,7 @@ _ALL_MONITOR_FIELDS = (
     "enforcement_gap",
     "github_api_errors",
     "check_run_stuck",
+    "inbound_webhook_silence",
     "backend_unusable",
     "cf_secret_mismatch",
     "uptime",

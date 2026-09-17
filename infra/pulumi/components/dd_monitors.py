@@ -75,6 +75,7 @@ class _MonitorBundle:
     enforcement_gap: datadog.Monitor
     github_api_errors: datadog.Monitor
     check_run_stuck: datadog.Monitor
+    inbound_webhook_silence: datadog.Monitor
     backend_unusable: datadog.Monitor
     cf_secret_mismatch: datadog.Monitor
     uptime: datadog.SyntheticsTest
@@ -235,6 +236,35 @@ def stuck_check_run_query(env: str) -> str:
     return (
         "max(last_1h):max:grug.check_run.stuck_count"
         "{env:" + env + "} > 0"
+    )
+
+
+def inbound_webhook_silence_query(env: str) -> str:
+    """2026-09-17 incident: Cloudflare's edge started returning 403 to
+    every `GitHub-Hookshot/*` request to `webhook.grug.lol/webhook/github`
+    (a bot-protection rule, not a grug or GitHub outage) - the pod stayed
+    `2/2 Ready`, `/livez` and `/readyz` kept answering 200, and every
+    existing monitor watches grug's OWN health, not whether GitHub's
+    traffic is reaching it at all. Zero inbound deliveries went unpaged
+    for 9+ hours across every repo the App is installed on, discovered
+    only when an operator asked why a specific PR had no checks.
+
+    `webhook_received` (services/webhook/main.py) logs once per HMAC-
+    verified delivery, for every event type on every repo - the broadest
+    possible "GitHub can still reach us" heartbeat, upstream of any
+    per-persona or per-repo gating. A LOG rollup re-evaluates fresh each
+    cycle (0 is a real count, not held "last known" state the way a
+    sparse custom METRIC is - see `reference_sparse_metric_monitors_
+    never_recover`), so this does not need the dense-emission workaround
+    `github_api_error_rate_query` and `stuck_check_run_query` use.
+
+    4h window: generous enough that a genuinely quiet stretch across every
+    repo the App watches doesn't page, tight enough to have caught today's
+    gap by its second occurrence instead of its two hundredth.
+    """
+    return (
+        f'logs("service:grug-webhook env:{env} webhook_received")'
+        '.index("*").rollup("count").last("4h") < 1'
     )
 
 
@@ -912,6 +942,36 @@ def create_all(
         opts=opts,
     )
 
+    # 5d) 2026-09-17: catches the failure class no other monitor here can
+    #     see - grug healthy, GitHub healthy, but GitHub's traffic not
+    #     reaching grug at all (that day: an edge bot-protection rule
+    #     403ing GitHub-Hookshot specifically). Digest tier deliberately -
+    #     see the paging-tier test's own docstring for why that bar stays
+    #     at three.
+    inbound_webhook_silence = datadog.Monitor(
+        "grug-inbound-webhook-silence",
+        type="log alert",
+        name="[grug] No inbound GitHub webhook deliveries (4h)",
+        message=(
+            f"{_DIGEST}\n"
+            "Zero HMAC-verified webhook deliveries reached grug-webhook "
+            "in 4 hours, across every installed repo. grug's own health "
+            "checks can be green throughout - this has nothing to do "
+            "with the pod. Check whether GitHub can actually reach "
+            "webhook.grug.lol: an edge/WAF/bot-protection rule blocking "
+            "GitHub's delivery traffic specifically (verify with the "
+            "GitHub-Hookshot user agent, not a browser or curl - those "
+            "can pass while Hookshot is blocked) is the confirmed cause "
+            "of the first occurrence.\n"
+            "Runbook: docs/RUNBOOK.md#inbound-webhook-silence"
+        ),
+        query=inbound_webhook_silence_query(env),
+        tags=_common_tags(env, "grug-webhook") + ["webhook:silence"],
+        notify_no_data=False,
+        priority=2,
+        opts=opts,
+    )
+
     # 6) CF→AWS auth-boundary header-mismatch rate. A burst means the
     #    secret got out of sync between the CF Worker binding and the
     #    SSM param the Lambda middleware reads — usually a rotation
@@ -997,6 +1057,7 @@ def create_all(
         enforcement_gap=enforcement_gap,
         github_api_errors=github_api_errors,
         check_run_stuck=check_run_stuck,
+        inbound_webhook_silence=inbound_webhook_silence,
         backend_unusable=backend_unusable,
         cf_secret_mismatch=cf_secret_mismatch,
         uptime=uptime,

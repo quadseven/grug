@@ -125,6 +125,33 @@ during a GitHub or grug outage mid-review. No action needed beyond
 confirming the underlying degradation (see the error-rate signal above)
 has cleared; the author gets a real review on their next push.
 
+### Inbound webhook silence
+
+`[grug] No inbound GitHub webhook deliveries (4h)` fires when
+`webhook_received` (services/webhook/main.py, logged once per HMAC-verified
+delivery) has logged zero events across every installed repo for 4 hours.
+
+**This does not mean grug is unhealthy.** The confirmed cause on
+2026-09-17: Cloudflare's edge started returning 403 to every
+`GitHub-Hookshot/*` request to `webhook.grug.lol/webhook/github` (a
+bot-protection rule), while `/livez`/`/readyz` kept answering 200 and the
+pods stayed `2/2 Ready` throughout — every other monitor here watches
+grug's own health, none of them watch whether GitHub's traffic is reaching
+it at all. Zero deliveries went unpaged for 9+ hours before this monitor
+existed.
+
+To confirm this same cause: check the Cloudflare zone's Security → Bots /
+WAF settings for a rule affecting the `GitHub-Hookshot` user agent or
+GitHub's published webhook IP ranges — a generic `curl`/browser request to
+the same URL can succeed while Hookshot specifically is blocked, so testing
+with a browser or `curl` does NOT rule this out. If that's clear, check
+GitHub's own status (githubstatus.com) and whether the App's webhook
+delivery is otherwise configured correctly (Settings → Webhooks on the
+`grug-tribe` App). The check-run reconciler (`check_run_reconcile_enabled`,
+grug#947) dispatches missing checks via grug's own outbound GitHub API
+calls, independent of inbound delivery — enabling it per-repo is a
+mitigation for this exact failure class, not a fix for the block itself.
+
 ## Missed-delivery replay (#407)
 
 The DoR/TPM check runs inline on the webhook. GitHub does not automatically
