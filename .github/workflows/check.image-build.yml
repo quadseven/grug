@@ -55,12 +55,23 @@ jobs:
         # DD_GIT_COMMIT_SHA = the PR HEAD sha: if this digest is promoted,
         # ADR-0016 rule 3b guarantees the merge tree is identical, so the
         # baked source link stays truthful.
+        #
+        # Every value reaches the script through env:, never `${{ }}` inline.
+        # An interpolation is pasted into the script TEXT before the shell
+        # sees it, so quoting cannot contain it (canonical hygiene Rule 9,
+        # infra #1852). These three are platform- or repo-controlled today,
+        # so this is shape, not an exploit -- and shape is the point: the
+        # next value added here does not have to be re-reasoned about.
+        env:
+          SVC: ${{ matrix.svc }}
+          REPO: ${{ github.repository }}
+          HEAD_SHA: ${{ github.event.pull_request.head.sha }}
         run: |
           docker build services -f services/Dockerfile \
-            --build-arg SERVICE="${{ matrix.svc }}" \
-            --build-arg DD_GIT_REPOSITORY_URL="github.com/${{ github.repository }}" \
-            --build-arg DD_GIT_COMMIT_SHA="${{ github.event.pull_request.head.sha }}" \
-            -t "grug-${{ matrix.svc }}:pr-smoke"
+            --build-arg SERVICE="$SVC" \
+            --build-arg DD_GIT_REPOSITORY_URL="github.com/$REPO" \
+            --build-arg DD_GIT_COMMIT_SHA="$HEAD_SHA" \
+            -t "grug-$SVC:pr-smoke"
       - name: Import smoke (inside the image)
         run: |
           set -euo pipefail
