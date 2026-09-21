@@ -244,8 +244,14 @@ spec:
             initialDelaySeconds: 10
             periodSeconds: 30
           resources:
-            requests: {cpu: 50m, memory: 192Mi}
-            limits: {memory: 512Mi}
+            # Measured over 7 days from the cluster's own per-pod metrics: working
+            # set p95 450Mi, peak 511Mi against the old 512Mi limit, and the pod
+            # before the current ones was last terminated as OOMKilled. The old
+            # 192Mi request under-counted this pod by more than half, so the
+            # scheduler packed nodes as if it were small. Request follows the
+            # p95; the limit is 1.5x the observed peak. CPU is unchanged.
+            requests: {cpu: 50m, memory: 448Mi}
+            limits: {memory: 768Mi}
           securityContext:
             allowPrivilegeEscalation: false
             readOnlyRootFilesystem: true
