@@ -256,7 +256,7 @@ def test_linked_issue_unchecked_under_exempt_heading_passes():
 
     It is also NOT "all checkboxes ticked": that heading is the only place a
     box appears, so the issue has no criteria to check and the check is
-    skipped, not earned (infra#3125). This test used to assert the vacuous
+    skipped, not earned. This test used to assert the vacuous
     "all checkboxes ticked" over zero counted criteria.
     """
     body = "closes #42\n**Size:** M"
@@ -278,7 +278,7 @@ def test_exempt_unchecked_box_beside_a_real_ticked_criterion_is_an_earned_pass()
     assert "all checkboxes ticked" in r.detail
 
 
-# --- infra#3125: zero criteria is not "all ticked" -------------------------
+# --- zero criteria is not "all ticked" -----------------------------------
 
 def test_prose_only_issue_is_skipped_not_an_earned_pass():
     """No checkboxes at all: nothing unchecked, but nothing was verified either."""
@@ -453,7 +453,7 @@ def test_terse_out_of_scope_still_passes():
 
 
 def test_scan_checklist_returns_unchecked_items_and_the_total():
-    """The total is what tells "every criterion met" from "no criteria" (infra#3125)."""
+    """The total is what tells "every criterion met" from "no criteria" ."""
     assert _scan_checklist("## A\n- [x] a\n- [X] b\n- [ ] c\n") == (["c"], 3)
     assert _scan_checklist("Just prose.") == ([], 0)
     assert _scan_checklist("## Out of scope\n- [ ] x\n- [x] y\n") == ([], 0)

@@ -243,7 +243,7 @@ def _scan_checklist(issue_body: str) -> tuple[list[str], int]:
 
     `total` is what separates "every criterion is met" from "there were no
     criteria": with zero checkboxes nothing is unchecked either, and reading
-    that as a pass is the vacuous-truth bug of infra#3125.
+    that as a pass is the vacuous-truth bug (zero of zero criteria met).
 
     Unchecked item texts are stripped and truncated to 100 chars.
     """
@@ -352,7 +352,7 @@ def check_linked_issue_completeness(
 
     # No failures found. An issue with NO checkbox criteria was not evaluated
     # either: nothing was unchecked because nothing was there to check, and
-    # "all checkboxes ticked" over zero checkboxes is a lie (infra#3125). Pass
+    # "all checkboxes ticked" over zero checkboxes is a lie. Pass
     # (blocking every PR that closes a prose issue is a policy change, not a
     # bug fix) but mark it `skipped`, so the rollup names it and drops it from
     # the "all N checks" claim.
