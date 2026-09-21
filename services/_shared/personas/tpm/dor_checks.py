@@ -231,30 +231,53 @@ def check_issue_link(body: str) -> CheckResult:
     )
 
 
-def _scan_unchecked_items(issue_body: str) -> list[str]:
-    """Scan an issue body for unchecked non-exempt checkbox items.
+def _scan_checklist(issue_body: str) -> tuple[list[str], int]:
+    """Scan an issue body for checkbox criteria: (unchecked items, total items).
 
     Mirrors the algorithm in infra-public's check.issue-close-completeness.yml:
     - Heading lines (## ... or **bold**) toggle the exempt-section skip flag.
-    - Unchecked `- [ ]` / `* [ ]` items under a non-exempt section are collected.
-    - Items under an exempt heading/bold-label are skipped.
+    - `- [ ]` / `* [ ]` (unchecked) and `- [x]` (checked) items under a
+      non-exempt section are counted; only the unchecked ones are returned.
+    - Items under an exempt heading/bold-label, and inside fenced code blocks,
+      count for neither.
 
-    Returns the list of unchecked item texts (stripped, truncated to 100 chars).
+    `total` is what separates "every criterion is met" from "there were no
+    criteria": with zero checkboxes nothing is unchecked either, and reading
+    that as a pass is the vacuous-truth bug (zero of zero criteria met).
+
+    Unchecked item texts are stripped and truncated to 100 chars.
     """
     skipping = False
+    in_fence = False
     open_items: list[str] = []
+    total = 0
     for raw in issue_body.split("\n"):
         line = raw.strip()
+        if line.startswith("```"):
+            in_fence = not in_fence
+            continue
+        if in_fence:
+            continue
         # Heading or bold-label line: update exempt-section skip flag.
         if re.match(r"^#{1,6}\s+", line) or re.match(r"^\*\*[^*]+\*\*\s*$", line):
             label_text = line.replace("#", "").replace("*", "").strip()
             skipping = bool(_EXEMPT_SECTION_PAT.search(label_text))
             continue
-        # Unchecked checkbox item (only when not in an exempt section).
-        if not skipping and re.match(r"^[-*]\s+\[\s\]\s+", line):
+        if skipping:
+            continue
+        # Unchecked checkbox item.
+        if re.match(r"^[-*]\s+\[\s\]\s+", line):
             item_text = re.sub(r"^[-*]\s+\[\s\]\s+", "", line)
             open_items.append(item_text[:100])
-    return open_items
+            total += 1
+        elif re.match(r"^[-*]\s+\[[xX]\]\s+", line):
+            total += 1
+    return open_items, total
+
+
+def _scan_unchecked_items(issue_body: str) -> list[str]:
+    """The unchecked non-exempt items only (see `_scan_checklist`)."""
+    return _scan_checklist(issue_body)[0]
 
 
 def check_linked_issue_completeness(
@@ -304,6 +327,7 @@ def check_linked_issue_completeness(
     # Step 3: fetch each issue body and scan for unchecked items.
     failures: list[str] = []
     fetch_failures: list[int] = []
+    no_criteria: list[int] = []
     for num in issue_numbers:
         try:
             issue_body = fetch_issue(num)
@@ -315,16 +339,36 @@ def check_linked_issue_completeness(
             )
             fetch_failures.append(num)
             continue
-        open_items = _scan_unchecked_items(issue_body)
+        open_items, total_items = _scan_checklist(issue_body)
         if open_items:
             items_str = "; ".join(open_items)
             failures.append(f"#{num}: {items_str}")
+        elif total_items == 0:
+            no_criteria.append(num)
 
     if failures:
         detail = "linked issue(s) have unchecked items: " + "; ".join(failures)
         return CheckResult("linked-issue-completeness", False, detail)
 
-    # No failures found. If any fetches failed, we fail open (pass) but
+    # No failures found. An issue with NO checkbox criteria was not evaluated
+    # either: nothing was unchecked because nothing was there to check, and
+    # "all checkboxes ticked" over zero checkboxes is a lie. Pass
+    # (blocking every PR that closes a prose issue is a policy change, not a
+    # bug fix) but mark it `skipped`, so the rollup names it and drops it from
+    # the "all N checks" claim.
+    if no_criteria:
+        checked = [n for n in issue_numbers if n not in no_criteria and n not in fetch_failures]
+        detail = (
+            f"linked issue(s) #{no_criteria} have no acceptance criteria to check "
+            "(no checkboxes); nothing was verified"
+        )
+        if checked:
+            detail += f"; #{checked} all checkboxes ticked"
+        if fetch_failures:
+            detail += f"; fetch failed for #{fetch_failures} (fail-open)"
+        return CheckResult("linked-issue-completeness", True, detail, skipped=True)
+
+    # If any fetches failed, we fail open (pass) but
     # mark the check `skipped`: a partly-fetched issue list was not fully
     # evaluated, and the rollup must not count it toward "all N checks".
     if fetch_failures:
