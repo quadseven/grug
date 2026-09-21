@@ -18,6 +18,7 @@ from personas.tpm.dor_checks import (
     check_why,
     run_all,
 )
+from personas.tpm.dor_checks import _scan_checklist
 
 
 def test_why_passes_with_5_words():
@@ -251,13 +252,107 @@ def test_code_span_strip_cannot_fuse_words():
 
 
 def test_linked_issue_unchecked_under_exempt_heading_passes():
-    """An unchecked box under an exempt heading (Out of scope) -> pass."""
+    """An unchecked box under an exempt heading (Out of scope) does not block.
+
+    It is also NOT "all checkboxes ticked": that heading is the only place a
+    box appears, so the issue has no criteria to check and the check is
+    skipped, not earned (infra#3125). This test used to assert the vacuous
+    "all checkboxes ticked" over zero counted criteria.
+    """
     body = "closes #42\n**Size:** M"
     def fetcher(_num: int) -> str:
         return "## Out of scope\n- [ ] deferred item\n"
     r = check_linked_issue_completeness(body, fetch_issue=fetcher)
     assert r.passed
+    assert r.skipped
+    assert "no acceptance criteria to check" in r.detail
+    assert "all checkboxes ticked" not in r.detail
+
+
+def test_exempt_unchecked_box_beside_a_real_ticked_criterion_is_an_earned_pass():
+    """The exempt item is ignored, the real criterion is ticked: evaluated, not skipped."""
+    def fetcher(_num: int) -> str:
+        return "## Acceptance\n- [x] done\n\n## Out of scope\n- [ ] later\n"
+    r = check_linked_issue_completeness("closes #42\n**Size:** M", fetch_issue=fetcher)
+    assert r.passed and not r.skipped
     assert "all checkboxes ticked" in r.detail
+
+
+# --- infra#3125: zero criteria is not "all ticked" -------------------------
+
+def test_prose_only_issue_is_skipped_not_an_earned_pass():
+    """No checkboxes at all: nothing unchecked, but nothing was verified either."""
+    def fetcher(_num: int) -> str:
+        return "## What\nFix the thing so it works.\n"
+    r = check_linked_issue_completeness("closes #7\n**Size:** M", fetch_issue=fetcher)
+    assert r.passed
+    assert r.skipped
+    assert "#[7]" in r.detail
+    assert "no acceptance criteria to check" in r.detail
+    assert "all checkboxes ticked" not in r.detail
+
+
+def test_empty_issue_body_is_skipped_too():
+    r = check_linked_issue_completeness("closes #7\n**Size:** M", fetch_issue=lambda _n: "")
+    assert r.passed and r.skipped
+
+
+def test_checkboxes_only_inside_a_code_fence_are_not_criteria():
+    """A template pasted in a fence is not this issue's acceptance list."""
+    def fetcher(_num: int) -> str:
+        return "Example:\n\n```\n- [x] not a real criterion\n- [ ] nor this\n```\n"
+    r = check_linked_issue_completeness("closes #7\n**Size:** M", fetch_issue=fetcher)
+    assert r.passed and r.skipped
+
+
+def test_an_unchecked_box_inside_a_code_fence_does_not_block_a_ticked_issue():
+    def fetcher(_num: int) -> str:
+        return "## Acceptance\n- [x] done\n\n```\n- [ ] sample\n```\n"
+    r = check_linked_issue_completeness("closes #7\n**Size:** M", fetch_issue=fetcher)
+    assert r.passed and not r.skipped
+
+
+def test_a_real_gap_still_blocks_even_beside_a_no_criteria_issue():
+    """The no-criteria verdict must not mask a genuine failure on another issue."""
+    def fetcher(num: int) -> str:
+        return "Prose only." if num == 10 else "## Acceptance\n- [ ] missing\n"
+    r = check_linked_issue_completeness("closes #10 closes #20\n**Size:** M", fetch_issue=fetcher)
+    assert not r.passed
+    assert "#20" in r.detail and "missing" in r.detail
+
+
+def test_mixed_no_criteria_and_ticked_names_both_and_is_skipped():
+    def fetcher(num: int) -> str:
+        return "Prose only." if num == 10 else "## Acceptance\n- [x] done\n"
+    r = check_linked_issue_completeness("closes #10 closes #20\n**Size:** M", fetch_issue=fetcher)
+    assert r.passed and r.skipped
+    assert "#[10] have no acceptance criteria" in r.detail
+    assert "#[20] all checkboxes ticked" in r.detail
+
+
+def test_no_criteria_and_a_failed_fetch_report_both():
+    def fetcher(num: int) -> str:
+        if num == 20:
+            raise RuntimeError("boom")
+        return "Prose only."
+    r = check_linked_issue_completeness("closes #10 closes #20\n**Size:** M", fetch_issue=fetcher)
+    assert r.passed and r.skipped
+    assert "no acceptance criteria" in r.detail
+    assert "fetch failed for #[20]" in r.detail
+
+
+def test_rollup_title_names_the_no_criteria_check_and_drops_the_all_claim():
+    """The reader of the PR checks list must see which row was not evaluated."""
+    from personas.tpm import persona
+
+    r = check_linked_issue_completeness(
+        "closes #7\n**Size:** M", fetch_issue=lambda _n: "Prose only.",
+    )
+    title, summary = persona._summary([CheckResult("why", True, "ok"), r])
+    assert "1/2 checks" in title
+    assert "skipped" in title
+    assert "all 2 checks" not in title
+    assert "no acceptance criteria to check" in summary
 
 
 def test_linked_issue_multiple_only_one_has_gap_fails():
@@ -355,3 +450,12 @@ def test_terse_out_of_scope_still_passes():
     from personas.tpm.dor_checks import check_scope_fence
     for terse in ("Deferred.", "Not now.", "nothing", "stuff"):
         assert check_scope_fence(f"## Out of scope\n{terse}").passed, terse
+
+
+def test_scan_checklist_returns_unchecked_items_and_the_total():
+    """The total is what tells "every criterion met" from "no criteria" (infra#3125)."""
+    assert _scan_checklist("## A\n- [x] a\n- [X] b\n- [ ] c\n") == (["c"], 3)
+    assert _scan_checklist("Just prose.") == ([], 0)
+    assert _scan_checklist("## Out of scope\n- [ ] x\n- [x] y\n") == ([], 0)
+    assert _scan_checklist("```\n- [ ] x\n```\n") == ([], 0)
+    assert _scan_checklist("* [ ] star bullet\n") == (["star bullet"], 1)
