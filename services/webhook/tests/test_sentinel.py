@@ -56,6 +56,22 @@ def test_skips_when_last_verdict_not_blocking_and_no_high_severity_records(monke
     assert out == {"persona": "sentinel", "result": "skipped"}
 
 
+def test_skips_merge_over_advisory_findings_in_a_blocking_mode_repo(monkeypatch):
+    """Live 2026-09-22: repo in blocking MODE (stored
+    `blocking=True`), but the check concluded `success` because the only
+    finding was a medium advisory. Nothing gated the merge, so there is no
+    "blocking check still failing" to report."""
+    verdict = {**_verdict(blocking=True, findings_count=1), "conclusion": "success", "verdict": "warn"}
+    monkeypatch.setattr(sentinel, "get_check_verdict", lambda iid, sha, persona: verdict)
+    _no_candidates(monkeypatch)
+    monkeypatch.setattr(
+        sentinel, "with_install_token_retry",
+        lambda iid, fn: (_ for _ in ()).throw(AssertionError("no GitHub call expected")),
+    )
+    out = sentinel.dispatch_pull_request(_ctx({"pull_request": {"merged": True}}))
+    assert out == {"persona": "sentinel", "result": "skipped"}
+
+
 def test_flags_unmerged_close_with_blocking_verdict(monkeypatch):
     monkeypatch.setattr(sentinel, "get_check_verdict", lambda iid, sha, persona: _verdict(blocking=True))
     _no_candidates(monkeypatch)
