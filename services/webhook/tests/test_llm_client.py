@@ -3859,6 +3859,40 @@ def test_opencode_go_chain_config_uses_short_timeout_and_bounded_tokens() -> Non
     assert cfg.extra_body["max_tokens"] == lc._CLOUD_CHAIN_MAX_TOKENS
 
 
+def test_opencode_go_chain_request_disables_deepseek_thinking(monkeypatch) -> None:
+    """Live 2026-09-22: deepseek-v4.1-flash with thinking on spent all 8192
+    output tokens on reasoning and returned no content - a billed call with
+    nothing to parse. The chain tier's actual request body must carry
+    `thinking: disabled` alongside its token cap."""
+    captured: dict = {}
+
+    def fake_post(url, json=None, headers=None, timeout=None):
+        captured["body"] = json
+        return httpx.Response(
+            200, json={"choices": [{"message": {"content": '{"findings": []}'}}]},
+        )
+
+    monkeypatch.setattr(lc.httpx, "post", fake_post)
+    cfg = lc.replace(lc._opencode_go_chain_config(), key_loader=lambda: "k")
+    lc._call_backend(cfg, [{"role": "user", "content": "hi"}])
+
+    assert captured["body"]["thinking"] == {"type": "disabled"}
+    assert captured["body"]["max_tokens"] == lc._CLOUD_CHAIN_MAX_TOKENS
+
+
+def test_opencode_go_thinking_toggle_scope(monkeypatch) -> None:
+    monkeypatch.delenv("GRUG_OPENCODE_GO_THINKING", raising=False)
+    assert lc._opencode_go_extra_body("deepseek-v4.1-flash", "chat") == {
+        "thinking": {"type": "disabled"},
+    }
+    # DeepSeek-specific parameter: never sent to other models, and never on
+    # the Responses wire, where the field is not part of the schema.
+    assert lc._opencode_go_extra_body("kimi-k2.6", "chat") == {}
+    assert lc._opencode_go_extra_body("deepseek-v4.1-flash", "responses") == {}
+    monkeypatch.setenv("GRUG_OPENCODE_GO_THINKING", "enabled")
+    assert lc._opencode_go_extra_body("deepseek-v4.1-flash", "chat") == {}
+
+
 def test_poolside_never_appears_in_the_cloud_chain(monkeypatch) -> None:
     """grug#910: Poolside is DROPPED, confirmed unfunded - not merely
     deprioritized. Must never appear regardless of what else is configured."""
