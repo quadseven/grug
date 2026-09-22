@@ -309,7 +309,13 @@ def dispatch_pull_request(ctx: PullRequestContext) -> dict[str, str]:
     head_sha = ctx.head_sha
 
     verdict = get_check_verdict(ctx.installation_id, head_sha, "elder")
-    verdict_blocking = bool(verdict and verdict.get("blocking"))
+    # The check GATED the merge only when it concluded `failure`. The stored
+    # `blocking` field is the repo's review MODE (code_reviewer_blocking), so
+    # reading it here flagged every merge in a blocking-mode repo that carried
+    # a single medium advisory as "merged with its blocking check still
+    # failing" - 30 such notices in the week to 2026-09-22, each over a
+    # `success` check.
+    verdict_blocking = bool(verdict and verdict.get("conclusion") == "failure")
 
     evidence = _gather_flag_evidence(ctx, verdict, verdict_blocking)
     if evidence is None:
