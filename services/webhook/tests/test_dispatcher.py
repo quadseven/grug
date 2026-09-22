@@ -805,8 +805,9 @@ def test_issues_is_off_unless_its_own_flag_is_on():
 def test_issues_dispatches_when_flag_on():
     seen = {}
 
-    def _run(token, owner, repo, number, body):
-        seen.update(owner=owner, repo=repo, number=number, body=body)
+    def _run(token, owner, repo, number, body, *, fetch_facts, refresh_only):
+        seen.update(owner=owner, repo=repo, number=number, body=body,
+                    refresh_only=refresh_only, has_facts=callable(fetch_facts))
         return {"status": "ok", "reason": "advisory posted"}
 
     with patch("dispatcher.is_install_allowlisted", return_value=True), \
@@ -816,12 +817,62 @@ def test_issues_dispatches_when_flag_on():
                side_effect=lambda iid, fn: fn("tok")):
         out = dispatch("issues", _issue_payload())
     assert out["status"] == "ok"
-    assert seen == {"owner": "o", "repo": "r", "number": 7, "body": "bare"}
+    assert seen == {"owner": "o", "repo": "r", "number": 7, "body": "bare",
+                    "refresh_only": False, "has_facts": True}
 
 
 def test_issues_incomplete_payload_skips():
     out = dispatch("issues", _issue_payload(installation={}))
     assert out["status"] == "skip"
+
+
+# --- sub_issues: a link changed, refresh the advisory (grug#1035) ------------
+
+def _sub_payload(action):
+    return {
+        "action": action,
+        "sub_issue": {"number": 7, "body": "child body"},
+        "parent_issue": {"number": 3, "body": "parent body"},
+        "repository": {"id": 5, "name": "r", "owner": {"login": "o"}},
+        "installation": {"id": 1},
+    }
+
+
+@pytest.mark.parametrize("action,number,body", [
+    ("parent_issue_added", 7, "child body"),
+    ("parent_issue_removed", 7, "child body"),
+    ("sub_issue_added", 3, "parent body"),
+    ("sub_issue_removed", 3, "parent body"),
+])
+def test_sub_issues_refreshes_the_issue_whose_membership_changed(action, number, body):
+    """The child's `epic` line clears or returns; the parent becomes or stops
+    being an epic. Always refresh-only: a link event never starts a comment."""
+    seen = {}
+
+    def _run(token, owner, repo, n, b, *, fetch_facts, refresh_only):
+        seen.update(number=n, body=b, refresh_only=refresh_only)
+        return {"status": "ok", "reason": "advisory refreshed"}
+
+    with patch("dispatcher.is_install_allowlisted", return_value=True), \
+         patch("dispatcher.get_repo_config", return_value={"issue_dor_enabled": True}), \
+         patch("personas.tpm.issue_dor.run_issue_dor", _run), \
+         patch("github_app_auth.with_install_token_retry",
+               side_effect=lambda iid, fn: fn("tok")):
+        out = dispatch("sub_issues", _sub_payload(action))
+    assert out["status"] == "ok"
+    assert seen == {"number": number, "body": body, "refresh_only": True}
+
+
+def test_sub_issues_other_actions_are_not_gated():
+    out = dispatch("sub_issues", _sub_payload("transferred"))
+    assert out["status"] == "no_op" and "not gated" in out["reason"]
+
+
+def test_sub_issues_respects_the_repo_flag():
+    with patch("dispatcher.is_install_allowlisted", return_value=True), \
+         patch("dispatcher.get_repo_config", return_value={}):
+        out = dispatch("sub_issues", _sub_payload("parent_issue_added"))
+    assert out["status"] == "no_op" and "issue_dor_enabled off" in out["reason"]
 
 
 # --- check_run / check_suite rerequested (grug#948) -------------------------

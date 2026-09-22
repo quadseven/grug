@@ -53,54 +53,57 @@ def build_issue_fetcher(
     return _fetch_issue_body
 
 
+def issue_facts(token: str, owner: str, repo: str, number: int) -> IssueFacts:
+    """One issue's epic facts, read with a token already in hand (grug#1034,
+    #1035). Two reads: the issue, and its native parent, where a 404 means "no
+    parent" rather than a failure. Anything else raises; every caller treats
+    that as fail-open."""
+    from urllib.parse import quote
+    import httpx  # type: ignore
+
+    base = (
+        f"https://api.github.com/repos/{quote(owner, safe='')}/"
+        f"{quote(repo, safe='')}/issues/{int(number)}"
+    )
+    headers = {
+        "Authorization": f"token {token}",
+        "Accept": "application/vnd.github+json",
+    }
+    r = httpx.get(base, headers=headers, timeout=10)
+    r.raise_for_status()
+    issue = r.json() or {}
+    p = httpx.get(f"{base}/parent", headers=headers, timeout=10)
+    if p.status_code == 404:
+        parent = None
+    else:
+        p.raise_for_status()
+        parent = (p.json() or {}).get("number")
+    return IssueFacts(
+        number=int(number),
+        title=issue.get("title") or "",
+        body=issue.get("body") or "",
+        labels=tuple(
+            (label.get("name") or "") if isinstance(label, dict) else str(label)
+            for label in issue.get("labels") or []
+        ),
+        sub_issue_count=int((issue.get("sub_issues_summary") or {}).get("total") or 0),
+        parent_number=parent,
+        is_pull_request=bool(issue.get("pull_request")),
+    )
+
+
 def build_issue_facts_fetcher(
     *, installation_id: int, owner: str, repo: str,
 ) -> IssueFactsFetcher:
     """Return a `number -> IssueFacts` callable for the `which epic` check
-    (grug#1034). Two reads: the issue itself, and its native parent, where a
-    404 means "no parent" rather than a failure. Any other failure raises, and
+    (grug#1034), acquiring the install token per call. Failures raise, and
     `check_linked_issue_in_epic` fails OPEN with the check marked `skipped`.
     """
 
     def _fetch(number: int) -> IssueFacts:
-        from urllib.parse import quote
-        import httpx  # type: ignore
-
-        base = (
-            f"https://api.github.com/repos/{quote(owner, safe='')}/"
-            f"{quote(repo, safe='')}/issues/{int(number)}"
-        )
-
-        def _get(token: str) -> IssueFacts:
-            headers = {
-                "Authorization": f"token {token}",
-                "Accept": "application/vnd.github+json",
-            }
-            r = httpx.get(base, headers=headers, timeout=10)
-            r.raise_for_status()
-            issue = r.json() or {}
-            p = httpx.get(f"{base}/parent", headers=headers, timeout=10)
-            if p.status_code == 404:
-                parent = None
-            else:
-                p.raise_for_status()
-                parent = (p.json() or {}).get("number")
-            return IssueFacts(
-                number=int(number),
-                title=issue.get("title") or "",
-                body=issue.get("body") or "",
-                labels=tuple(
-                    (label.get("name") or "") if isinstance(label, dict) else str(label)
-                    for label in issue.get("labels") or []
-                ),
-                sub_issue_count=int(
-                    (issue.get("sub_issues_summary") or {}).get("total") or 0
-                ),
-                parent_number=parent,
-                is_pull_request=bool(issue.get("pull_request")),
-            )
-
         from github_app_auth import with_install_token_retry  # type: ignore
-        return with_install_token_retry(installation_id, _get)
+        return with_install_token_retry(
+            installation_id, lambda token: issue_facts(token, owner, repo, number),
+        )
 
     return _fetch

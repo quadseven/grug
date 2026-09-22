@@ -48,7 +48,8 @@ from urllib.parse import quote
 import httpx
 
 from personas.tpm.dor_checks import (
-    CheckResult, check_acceptance, check_estimate, check_scope_fence, check_why,
+    CheckResult, IssueFactsFetcher, belongs_to_epic, check_acceptance,
+    check_estimate, check_scope_fence, check_why, is_epic,
 )
 
 log = logging.getLogger(f"{os.getenv('DD_SERVICE', 'grug')}.persona.chief.issue_dor")
@@ -72,12 +73,64 @@ _REMEDY = {
     "estimate": "Add a `Size: XS|S|M|L` line. XL is not accepted - split it.",
     "scope-fence": "Add an `## Out of scope` section. Naming what this is "
                    "NOT is what stops a slice growing while it is built.",
+    "epic": "Add this ticket as a sub-issue of an epic, or write "
+            "`Part of #<epic>` in its body. A PR closing it cannot merge "
+            "until it has one (grug#1034).",
 }
 
 
-def evaluate_issue(body: str) -> list[CheckResult]:
-    """Run the issue-time DoR subset over an issue body. Pure."""
-    return [check(body or "") for check in _ISSUE_CHECKS]
+def _emit_epic_fetch_failed() -> None:
+    """Best-effort gauge when the epic facts cannot be read (Grug Elder on
+    #1038), the same shape as ticket-compliance's `_emit_metric`: a skipped
+    epic line is silent in the comment, so the count is what shows an outage."""
+    try:
+        from observability import emit_gauge  # type: ignore
+        emit_gauge("grug.chief.issue_dor.epic_fetch_failed", 1)
+    except Exception as exc:  # noqa: BLE001 - telemetry never breaks the advisory
+        # LOGGED, not passed (ruff S110 via Grug on #1038): a broken emitter or
+        # import path must be visible, just never fatal to the comment.
+        log.warning(
+            "issue_dor_epic_gauge_failed",
+            extra={"error_type": type(exc).__name__, "error": str(exc)},
+        )
+
+
+def check_issue_epic(issue_number: int, fetch_facts: IssueFactsFetcher | None) -> CheckResult | None:
+    """The ticket itself is an epic or belongs to one (grug#1035).
+
+    The SAME predicates as the PR-time `which epic` check (`is_epic`,
+    `belongs_to_epic`), so the two surfaces cannot disagree. Returns None -
+    no line at all - when there is no fetcher or the fetch fails: this
+    surface is advisory, and a GitHub blip must not become a nag.
+    """
+    if fetch_facts is None:
+        return None
+    try:
+        facts = fetch_facts(issue_number)
+    except (httpx.HTTPError, ValueError) as exc:
+        # NARROW on purpose (Grug Elder on #1038): a GitHub status error, a
+        # transport failure or an unparseable body falls open; a TypeError or
+        # NameError of our own must still surface as the bug it is.
+        log.warning(
+            "issue_dor_epic_fetch_failed",
+            extra={"issue": issue_number, "error": str(exc)},
+        )
+        _emit_epic_fetch_failed()
+        return None
+    if is_epic(facts):
+        return CheckResult("epic", True, "this ticket is an epic")
+    if belongs_to_epic(facts):
+        return CheckResult("epic", True, "belongs to an epic")
+    return CheckResult("epic", False, "belongs to no epic")
+
+
+def evaluate_issue(body: str, epic: CheckResult | None = None) -> list[CheckResult]:
+    """Run the issue-time DoR subset over an issue body. Pure. `epic` is the
+    already-evaluated epic line (`check_issue_epic`), appended when present."""
+    results = [check(body or "") for check in _ISSUE_CHECKS]
+    if epic is not None:
+        results.append(epic)
+    return results
 
 
 def advisory_markdown(results: list[CheckResult]) -> str | None:
@@ -155,16 +208,26 @@ def _existing_comment(
 
 def run_issue_dor(
     token: str, owner: str, repo: str, issue_number: int, body: str,
+    *,
+    fetch_facts: IssueFactsFetcher | None = None,
+    refresh_only: bool = False,
 ) -> dict[str, str]:
     """Evaluate one issue and post/refresh/clear Chief's advisory.
 
     Returns an audit dict for the dispatcher. Raises nothing on a clean
     ticket with no prior comment - that is the common path and it costs
     exactly one GitHub read.
+
+    `refresh_only` is for the `sub_issues` event (grug#1035): a link being
+    added or removed may update or clear an advisory Chief already posted,
+    but must never START one. Linking an old issue to an epic is not a
+    moment to lecture it about its `## Why`.
     """
-    results = evaluate_issue(body)
+    results = evaluate_issue(body, check_issue_epic(issue_number, fetch_facts))
     advisory = advisory_markdown(results)
     existing = _existing_comment(token, owner, repo, issue_number)
+    if refresh_only and existing is None:
+        return {"status": "no_op", "reason": "link event, no prior advisory to refresh"}
     base = (
         f"https://api.github.com/repos/{quote(owner, safe='')}/{quote(repo, safe='')}"
         f"/issues/{issue_number}/comments"

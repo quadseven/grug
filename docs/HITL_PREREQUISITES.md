@@ -17,7 +17,7 @@ URL: <https://github.com/settings/apps/new>
 | Repository permissions — Contents | **Read** |
 | Repository permissions — Metadata | **Read** *(default, required)* |
 | Repository permissions — Checks | **Read & write** |
-| Subscribe to events | `pull_request`, `pull_request_review`, `issue_comment`, `pull_request_review_comment`, `issues` *(`pull_request_review_comment` feeds reply-mined learnings, #670 / ADR-0020 — without it grug never sees a maintainer's reply to a finding. `issues` feeds Chief's issue-time DoR advisory — **without it that surface is inert no matter what the repo flag says**, because GitHub never delivers the event and the handler is never reached.)* |
+| Subscribe to events | `pull_request`, `pull_request_review`, `issue_comment`, `pull_request_review_comment`, `issues`, `sub_issues` (shown as "Sub issues") *(`pull_request_review_comment` feeds reply-mined learnings, #670 / ADR-0020 — without it grug never sees a maintainer's reply to a finding. `issues` feeds Chief's issue-time DoR advisory — **without it that surface is inert no matter what the repo flag says**, because GitHub never delivers the event and the handler is never reached. `sub_issues` lets that advisory clear its `epic` line the moment a ticket is linked to an epic, grug#1035; without it the line only refreshes on the ticket's next edit.)* |
 | Where can this app be installed? | **Any account** |
 
 After creating:
