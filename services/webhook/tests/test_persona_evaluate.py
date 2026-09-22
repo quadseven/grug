@@ -151,7 +151,7 @@ def test_evaluate_pull_request_passes_on_good_body():
 
     assert evaluation.passed is True
     assert evaluation.conclusion == "success"
-    assert len(evaluation.results) == 6  # 6 dor checks
+    assert len(evaluation.results) == 7  # 7 dor checks
     assert all(r.passed for r in evaluation.results)
 
 
@@ -165,8 +165,9 @@ def test_evaluate_pull_request_without_fetcher_marks_linked_issue_skipped():
     lic = next(r for r in evaluation.results if r.name == "linked-issue-completeness")
     assert lic.skipped is True
     title, _ = persona._summary(list(evaluation.results))
-    assert "all 6 checks" not in title
-    assert "5/6 checks (ticket done skipped)" in title
+    assert "all 7 checks" not in title
+    # Both IO checks name the ticket and have no fetcher here (grug#1034).
+    assert "5/7 checks (ticket done, which epic skipped)" in title
 
 
 def test_evaluate_pull_request_fails_on_empty_body():
@@ -211,7 +212,7 @@ def test_evaluate_mixed_advisory_and_blocking_failure():
     assert scope.passed is False
     assert link.passed is False
     title, summary = persona._summary(list(evaluation.results))
-    assert title == "Hunt Plan hold - 1/6 plan checks fail - see Details for which"
+    assert title == "Hunt Plan hold - 1/7 plan checks fail - see Details for which"
 
 
 def test_summary_advisory_check_renders_warning_icon():

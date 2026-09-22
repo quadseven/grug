@@ -14,7 +14,9 @@ from personas.tpm.dor_checks import (
     check_estimate,
     check_issue_link,
     check_linked_issue_completeness,
+    check_linked_issue_in_epic,
     check_scope_fence,
+    IssueFacts,
     check_why,
     run_all,
 )
@@ -135,12 +137,12 @@ def test_issue_link_missing():
     assert not check_issue_link("just text").passed
 
 
-def test_run_all_returns_6():
+def test_run_all_returns_7():
     results = run_all("")
-    assert len(results) == 6
+    assert len(results) == 7
     assert {r.name for r in results} == {
         "why", "acceptance", "estimate", "scope-fence", "issue-link",
-        "linked-issue-completeness",
+        "linked-issue-completeness", "linked-issue-epic",
     }
 
 
@@ -459,3 +461,105 @@ def test_scan_checklist_returns_unchecked_items_and_the_total():
     assert _scan_checklist("## Out of scope\n- [ ] x\n- [x] y\n") == ([], 0)
     assert _scan_checklist("```\n- [ ] x\n```\n") == ([], 0)
     assert _scan_checklist("* [ ] star bullet\n") == (["star bullet"], 1)
+
+
+# --- grug#1034: `which epic` - every named ticket is an epic or in one ---
+
+
+def _facts(number, *, title="a ticket", body="", labels=(), subs=0, parent=None, pr=False):
+    return IssueFacts(
+        number=number, title=title, body=body, labels=tuple(labels),
+        sub_issue_count=subs, parent_number=parent, is_pull_request=pr,
+    )
+
+
+def _fetcher(**by_number):
+    def fetch(n):
+        value = by_number[f"i{n}"]
+        if isinstance(value, Exception):
+            raise value
+        return value
+    return fetch
+
+
+def test_epic_check_passes_for_a_ticket_with_a_native_parent():
+    r = check_linked_issue_in_epic("Closes #5", fetch_issue_facts=_fetcher(i5=_facts(5, parent=1)))
+    assert r.passed and not r.skipped
+
+
+@pytest.mark.parametrize("body", [
+    "## Dependencies\n\nPart of #1\n",
+    "- Part of #1",
+    "Parent #1",
+    "## Parent\n#1",
+    "Part of quadseven/infra#1",
+])
+def test_epic_check_passes_for_a_body_link_the_hunt_collector_reads(body):
+    r = check_linked_issue_in_epic("fixes #5", fetch_issue_facts=_fetcher(i5=_facts(5, body=body)))
+    assert r.passed and not r.skipped, body
+
+
+@pytest.mark.parametrize("facts", [
+    _facts(5, labels=["epic"]),
+    _facts(5, title="Epic: a root"),
+    _facts(5, subs=3),
+])
+def test_an_epic_is_its_own_root_and_passes(facts):
+    """grug marks epics by title and has no `epic` label; other repos use the
+    label; a parent with children is an epic either way."""
+    r = check_linked_issue_in_epic("Part of #5", fetch_issue_facts=_fetcher(i5=facts))
+    assert r.passed
+
+
+def test_an_orphan_ticket_blocks_and_names_the_fix():
+    r = check_linked_issue_in_epic(
+        "Closes #5\nRefs #6",
+        fetch_issue_facts=_fetcher(i5=_facts(5), i6=_facts(6, parent=2)),
+    )
+    assert r.passed is False
+    assert "#5" in r.detail and "#6" not in r.detail
+    assert "sub-issue" in r.detail and "Part of #" in r.detail
+
+
+def test_a_part_of_line_inside_a_code_span_is_not_membership():
+    r = check_linked_issue_in_epic(
+        "Closes #5", fetch_issue_facts=_fetcher(i5=_facts(5, body="write `Part of #1` like this")),
+    )
+    assert r.passed is False
+
+
+def test_no_ticket_named_passes_with_nothing_to_check():
+    r = check_linked_issue_in_epic("just prose", fetch_issue_facts=_fetcher())
+    assert r.passed and not r.skipped
+
+
+def test_blocked_by_and_relates_to_are_not_the_ticket():
+    """A blocker that belongs to no epic must not block every PR naming it."""
+    r = check_linked_issue_in_epic("Blocked by #9\nRelates to #8", fetch_issue_facts=_fetcher())
+    assert r.passed and not r.skipped
+
+
+def test_a_pull_request_reference_needs_no_epic():
+    r = check_linked_issue_in_epic("Refs #5", fetch_issue_facts=_fetcher(i5=_facts(5, pr=True)))
+    assert r.passed
+
+
+def test_no_fetcher_fails_open_and_is_marked_skipped():
+    r = check_linked_issue_in_epic("Closes #5")
+    assert r.passed and r.skipped
+
+
+def test_a_fetch_failure_fails_open_and_is_marked_skipped():
+    r = check_linked_issue_in_epic(
+        "Closes #5", fetch_issue_facts=_fetcher(i5=RuntimeError("github down")),
+    )
+    assert r.passed and r.skipped
+    assert "#[5]" in r.detail
+
+
+def test_an_orphan_still_blocks_when_another_fetch_failed():
+    r = check_linked_issue_in_epic(
+        "Closes #5\nCloses #6",
+        fetch_issue_facts=_fetcher(i5=_facts(5), i6=RuntimeError("down")),
+    )
+    assert r.passed is False and "#5" in r.detail

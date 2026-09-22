@@ -4,13 +4,14 @@ Ported from scripts/tpm.py with the bullet-count regex tightened per
 quadseven/grug#20: empty `- [ ]` placeholders no longer count toward the
 >=3 minimum (security: an unfilled template should NOT pass).
 
-6 checks (per PRD #21 + memory `feedback_health_endpoint_standard`):
+7 checks (per PRD #21 + memory `feedback_health_endpoint_standard`):
   why          - ## Why >=5 words
   acceptance   - ## Acceptance criteria (or ## Test plan) >=3 NON-EMPTY bullets
   estimate     - Size: XS|S|M|L|XL anywhere in body
   scope-fence  - ## Out of scope present
   issue-link   - closes #N OR Part of #N OR fixes #N
   linked-issue-completeness - linked issue(s) have all non-exempt checkboxes ticked
+  linked-issue-epic - every ticket the PR names is an epic or belongs to one (grug#1034)
 """
 
 from __future__ import annotations
@@ -385,13 +386,133 @@ def check_linked_issue_completeness(
     )
 
 
-ALL_CHECKS = (
+@dataclass(frozen=True)
+class IssueFacts:
+    """What `check_linked_issue_in_epic` needs to know about one issue."""
+
+    number: int
+    title: str
+    body: str
+    labels: tuple[str, ...]
+    sub_issue_count: int
+    parent_number: int | None
+    is_pull_request: bool = False
+
+
+IssueFactsFetcher = Callable[[int], IssueFacts]
+
+# The tickets a PR names: closing keywords plus the two reference forms that
+# point at the work item rather than merely something nearby. `Blocked by` and
+# `Relates to` are deliberately left out: they name OTHER work, and requiring an
+# epic of a blocker would make one orphan block every PR that mentions it.
+_TICKET_REF_PAT = re.compile(
+    r"\b(?:close(?:s|d)?|fix(?:es|ed)?|resolve(?:s|d)?|refs|part\s+of)\s+#(\d+)",
+    re.IGNORECASE,
+)
+
+# The body forms of epic membership that the hunt collector already reads
+# (infra production/scripts/backlog-emitter/collect_backlog.py): a line reading
+# `Part of #N` or `Parent #N`, optionally as a list item, or a `## Parent`
+# heading. A native sub-issue link is the other form and is read separately.
+_BODY_PARENT_PAT = re.compile(
+    r"^\s*(?:[-*]\s+)?(?:part\s+of|parent:?)\s+(?:[\w.-]+/[\w.-]+)?#\d+"
+    r"|^\s*##\s*parent\b",
+    re.IGNORECASE | re.MULTILINE,
+)
+
+
+def is_epic(facts: IssueFacts) -> bool:
+    """An epic is a root: labelled `epic`, titled `Epic: ...`, or already a
+    parent. Repos differ on which of these they use (grug marks epics by title
+    and has no `epic` label), so any one is enough."""
+    return (
+        any(label.lower() == "epic" for label in facts.labels)
+        or facts.title.strip().lower().startswith("epic:")
+        or facts.sub_issue_count > 0
+    )
+
+
+def belongs_to_epic(facts: IssueFacts) -> bool:
+    return facts.parent_number is not None or bool(
+        _BODY_PARENT_PAT.search(strip_code_spans(facts.body))
+    )
+
+
+def check_linked_issue_in_epic(
+    body: str,
+    *,
+    fetch_issue_facts: IssueFactsFetcher | None = None,
+) -> CheckResult:
+    """Every ticket the PR names must be an epic or belong to one (grug#1034).
+
+    BLOCKING, by the operator's choice on 2026-09-22: every quadseven repo
+    writes the rule down and nothing enforced it, and a triage that day found
+    ~230 orphan tickets across 18 repos. The fix is one click (add the ticket
+    as a sub-issue of an epic) or one line (`Part of #N` in its body).
+
+    Fails OPEN on a fetch failure and marks itself `skipped`, exactly like
+    `ticket done` (#782): a GitHub blip must never freeze merges, and must
+    never read as a pass either. A PR naming no ticket passes here with
+    nothing to check - `which ticket` already speaks to that.
+    """
+    numbers = sorted({int(n) for n in _TICKET_REF_PAT.findall(strip_code_spans(body))})
+    if not numbers:
+        return CheckResult(
+            "linked-issue-epic", True, "no ticket named, so no epic to check",
+        )
+    if fetch_issue_facts is None:
+        return CheckResult(
+            "linked-issue-epic", True,
+            f"tickets #{numbers} but no fetcher provided (fail-open)",
+            skipped=True,
+        )
+
+    orphans: list[int] = []
+    fetch_failures: list[int] = []
+    for num in numbers:
+        try:
+            facts = fetch_issue_facts(num)
+        except Exception as exc:
+            log.warning(
+                "linked_issue_epic_fetch_failed",
+                extra={"issue_number": num, "error": str(exc)},
+            )
+            fetch_failures.append(num)
+            continue
+        if facts.is_pull_request or is_epic(facts) or belongs_to_epic(facts):
+            continue
+        orphans.append(num)
+
+    if orphans:
+        named = ", ".join(f"#{n}" for n in orphans)
+        return CheckResult(
+            "linked-issue-epic", False,
+            f"{named} belong to no epic - add each as a sub-issue of an epic, "
+            "or write `Part of #<epic>` in its body",
+        )
+    if fetch_failures:
+        return CheckResult(
+            "linked-issue-epic", True,
+            f"tickets #{numbers} checked; fetch failed for #{fetch_failures} (fail-open)",
+            skipped=True,
+        )
+    return CheckResult(
+        "linked-issue-epic", True, f"ticket(s) #{numbers} each belong to an epic",
+    )
+
+
+_PURE_CHECKS = (
     check_why,
     check_acceptance,
     check_estimate,
     check_scope_fence,
     check_issue_link,
+)
+
+ALL_CHECKS = (
+    *_PURE_CHECKS,
     check_linked_issue_completeness,
+    check_linked_issue_in_epic,
 )
 
 
@@ -399,16 +520,17 @@ def run_all(
     body: str,
     *,
     fetch_issue: IssueFetcher | None = None,
+    fetch_issue_facts: IssueFactsFetcher | None = None,
 ) -> list[CheckResult]:
     """Run all DoR checks over the PR body.
 
-    `fetch_issue` is passed through to check_linked_issue_completeness.
-    When None, that check fails open (pass).
+    `fetch_issue` is passed through to check_linked_issue_completeness and
+    `fetch_issue_facts` to check_linked_issue_in_epic. When either is None,
+    its check fails open (pass, marked `skipped`).
     """
-    # The first 5 checks are pure (body -> CheckResult).
-    # The last check (check_linked_issue_completeness) needs IO via fetch_issue.
-    pure_checks = ALL_CHECKS[:-1]
-    io_check = ALL_CHECKS[-1]  # check_linked_issue_completeness
-    results = [check(body) for check in pure_checks]
-    results.append(io_check(body, fetch_issue=fetch_issue))
+    # The first 5 checks are pure (body -> CheckResult); the last two need IO
+    # through their injected fetchers.
+    results = [check(body) for check in _PURE_CHECKS]
+    results.append(check_linked_issue_completeness(body, fetch_issue=fetch_issue))
+    results.append(check_linked_issue_in_epic(body, fetch_issue_facts=fetch_issue_facts))
     return results

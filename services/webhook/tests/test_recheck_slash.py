@@ -326,7 +326,7 @@ def _pull_request_payload():
     }
 
 
-def _fake_github(issue_7=_ISSUE_7_ONE_BOX_OPEN, *, issue_exc=None):
+def _fake_github(issue_7=_ISSUE_7_ONE_BOX_OPEN, *, issue_exc=None, parent_of_7=1):
     """One fake GitHub for BOTH paths: the PR re-fetch only recheck needs,
     and the linked-issue fetch both paths must make. Anything else is a
     call the test did not model and must not be silently absorbed."""
@@ -334,6 +334,8 @@ def _fake_github(issue_7=_ISSUE_7_ONE_BOX_OPEN, *, issue_exc=None):
         class _R:
             def __init__(self, body):
                 self._body = body
+
+            status_code = 200
 
             def raise_for_status(self):
                 pass
@@ -343,6 +345,15 @@ def _fake_github(issue_7=_ISSUE_7_ONE_BOX_OPEN, *, issue_exc=None):
 
         if url.endswith("/repos/myorg/myrepo/pulls/42"):
             return _R({"head": {"sha": "abc123"}, "body": _PR_BODY_CLOSES_7})
+        if url.endswith("/repos/myorg/myrepo/issues/7/parent"):
+            # grug#1034's facts fetcher: 404 means "no parent", not a failure.
+            if issue_exc is not None:
+                raise issue_exc
+            if parent_of_7 is None:
+                r = _R({"message": "Not Found"})
+                r.status_code = 404
+                return r
+            return _R({"number": parent_of_7})
         if url.endswith("/repos/myorg/myrepo/issues/7"):
             if issue_exc is not None:
                 raise issue_exc
@@ -426,6 +437,31 @@ def test_recheck_fetch_failure_still_fails_open_but_visibly_skipped(_tpm_only):
     assert lic.passed is True and lic.skipped is True
 
     title, summary = tpm_persona._summary(list(recheck_eval.results))
-    assert "all 6 checks" not in title
-    assert "5/6 checks" in title and "ticket done skipped" in title
+    assert "all 7 checks" not in title
+    assert "5/7 checks" in title and "ticket done, which epic skipped" in title
     assert "| ticket done | skipped |" in summary
+
+
+def test_recheck_and_webhook_agree_that_an_orphan_ticket_blocks(_tpm_only):
+    """grug#1034 through the REAL evaluator on both paths: #7's boxes are all
+    ticked, so the only red is `which epic` - its native parent is missing
+    (404) and its body names none."""
+    webhook_out, webhook_eval, recheck_out, recheck_eval = _run_both_paths(
+        _fake_github(issue_7="## Acceptance criteria\n- [x] done\n", parent_of_7=None),
+    )
+    assert recheck_eval.results == webhook_eval.results
+    assert webhook_out["personas"][0]["result"] == "fail"
+    assert recheck_out["result"] == "fail"
+    epic = {r.name: r for r in recheck_eval.results}["linked-issue-epic"]
+    assert epic.passed is False and epic.skipped is False and "#7" in epic.detail
+
+
+def test_recheck_and_webhook_pass_when_the_ticket_has_a_parent(_tpm_only):
+    webhook_out, webhook_eval, recheck_out, recheck_eval = _run_both_paths(
+        _fake_github(issue_7="## Acceptance criteria\n- [x] done\n", parent_of_7=3),
+    )
+    assert recheck_eval.results == webhook_eval.results
+    assert webhook_out["personas"][0]["result"] == "pass"
+    assert recheck_out["result"] == "pass"
+    epic = {r.name: r for r in recheck_eval.results}["linked-issue-epic"]
+    assert epic.passed is True and epic.skipped is False
