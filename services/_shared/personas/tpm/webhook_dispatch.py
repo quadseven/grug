@@ -35,7 +35,9 @@ def dispatch_pull_request(ctx: PullRequestContext) -> dict[str, str]:
     """
     try:
         from personas.publish_check import PUBLISH_FAILED  # type: ignore
-        from personas.tpm.issue_fetcher import build_issue_fetcher  # type: ignore
+        from personas.tpm.issue_fetcher import (  # type: ignore
+            build_issue_facts_fetcher, build_issue_fetcher,
+        )
         from personas.tpm.persona import (  # type: ignore
             evaluate_pull_request, publish_tpm_evaluation,
         )
@@ -48,7 +50,13 @@ def dispatch_pull_request(ctx: PullRequestContext) -> dict[str, str]:
             installation_id=ctx.installation_id,
             owner=ctx.owner, repo=ctx.repo_name,
         )
-        evaluation = evaluate_pull_request(ctx.pr_body, fetch_issue=fetcher)
+        facts_fetcher = build_issue_facts_fetcher(
+            installation_id=ctx.installation_id,
+            owner=ctx.owner, repo=ctx.repo_name,
+        )
+        evaluation = evaluate_pull_request(
+            ctx.pr_body, fetch_issue=fetcher, fetch_issue_facts=facts_fetcher,
+        )
         result_map = publish_tpm_evaluation(
             evaluation,
             installation_id=ctx.installation_id,

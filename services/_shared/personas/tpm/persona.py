@@ -22,7 +22,7 @@ from dataclasses import dataclass
 
 from github_checks_client import CheckConclusion
 from personas.publish_check import PUBLISH_FAILED, publish_persona_check
-from personas.tpm.dor_checks import CheckResult, run_all
+from personas.tpm.dor_checks import CheckResult, IssueFactsFetcher, run_all
 from personas.tpm.dor_checks import IssueFetcher
 from personas.tribe import CHECK_CHIEF
 
@@ -84,6 +84,7 @@ _CHECK_DISPLAY: dict[str, str] = {
     "scope-fence": "where stop",
     "issue-link": "which ticket",
     "linked-issue-completeness": "ticket done",
+    "linked-issue-epic": "which epic",
 }
 
 
@@ -149,8 +150,9 @@ def evaluate_pull_request(
     pr_body: str,
     *,
     fetch_issue: IssueFetcher | None = None,
+    fetch_issue_facts: IssueFactsFetcher | None = None,
 ) -> TpmEvaluation:
-    """Pure: run all 6 DoR rules over pr_body and return the rollup.
+    """Pure: run all 7 DoR rules over pr_body and return the rollup.
 
     No network IO, no AWS calls, no logging side-effects. Callers wrap
     the result in `publish_tpm_evaluation(...)` to POST the check-run.
@@ -163,7 +165,9 @@ def evaluate_pull_request(
     attestation (attest_persona_purity.py) sees only the allowlisted
     `run_all` call.
     """
-    results = run_all(pr_body, fetch_issue=fetch_issue)
+    results = run_all(
+        pr_body, fetch_issue=fetch_issue, fetch_issue_facts=fetch_issue_facts,
+    )
     blocking = _blocking_failures(results)
     conclusion: CheckConclusion = "success" if not blocking else "failure"
     return TpmEvaluation(

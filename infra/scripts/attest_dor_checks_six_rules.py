@@ -9,7 +9,7 @@ Proves four bools against the real source files:
   - `check_result_is_frozen_dataclass_per_process_gate_concepts`
 
 Asserts that the single shared `services/_shared/personas/tpm/dor_checks.py`
-defines exactly the 6 canonical `check_*` functions matching the rule
+defines exactly the 7 canonical `check_*` functions (the file name predates the seventh, grug#1034) matching the rule
 names in CONTEXT.md section "Process-gate concepts" AND that the
 `CheckResult` dataclass is declared with `frozen=True` (peer-review HIGH
 found a frozen=False regression that the DorCheck attester falsely passed).
@@ -26,7 +26,9 @@ import sys
 from pathlib import Path
 
 CANONICAL_RULES: frozenset[str] = frozenset(
-    {"check_why", "check_acceptance", "check_estimate", "check_scope_fence", "check_issue_link", "check_linked_issue_completeness"}
+    {"check_why", "check_acceptance", "check_estimate", "check_scope_fence", "check_issue_link", "check_linked_issue_completeness",
+     # grug#1034: every ticket the PR names is an epic or belongs to one.
+     "check_linked_issue_in_epic"}
 )
 
 DOR_CHECK_PATHS: tuple[Path, ...] = (

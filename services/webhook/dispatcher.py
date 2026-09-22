@@ -671,7 +671,9 @@ def _handle_issue_comment(payload: dict[str, Any]) -> dict[str, str]:
     # cheap when only PR events fire.
     from github_app_auth import with_install_token_retry  # type: ignore
     from personas.publish_check import PUBLISH_FAILED  # type: ignore
-    from personas.tpm.issue_fetcher import build_issue_fetcher  # type: ignore
+    from personas.tpm.issue_fetcher import (  # type: ignore
+        build_issue_facts_fetcher, build_issue_fetcher,
+    )
     from personas.tpm.persona import evaluate_pull_request, publish_tpm_evaluation  # type: ignore
     import httpx  # type: ignore
 
@@ -770,7 +772,13 @@ def _handle_issue_comment(payload: dict[str, Any]) -> dict[str, str]:
         fetcher = build_issue_fetcher(
             installation_id=int(installation_id), owner=owner, repo=repo_name,
         )
-        evaluation = evaluate_pull_request(pr_body, fetch_issue=fetcher)
+        # Same shared builder for the `which epic` facts (grug#1034).
+        facts_fetcher = build_issue_facts_fetcher(
+            installation_id=int(installation_id), owner=owner, repo=repo_name,
+        )
+        evaluation = evaluate_pull_request(
+            pr_body, fetch_issue=fetcher, fetch_issue_facts=facts_fetcher,
+        )
         # publish_tpm_evaluation never raises on a failed publish since
         # #550 — the seam classifies ANY publish failure into the
         # returned "publish_failed" sentinel, logs it under
