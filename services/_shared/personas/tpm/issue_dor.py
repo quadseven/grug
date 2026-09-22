@@ -86,8 +86,13 @@ def _emit_epic_fetch_failed() -> None:
     try:
         from observability import emit_gauge  # type: ignore
         emit_gauge("grug.chief.issue_dor.epic_fetch_failed", 1)
-    except Exception:  # noqa: BLE001 - telemetry never breaks the advisory
-        pass
+    except Exception as exc:  # noqa: BLE001 - telemetry never breaks the advisory
+        # LOGGED, not passed (ruff S110 via Grug on #1038): a broken emitter or
+        # import path must be visible, just never fatal to the comment.
+        log.warning(
+            "issue_dor_epic_gauge_failed",
+            extra={"error_type": type(exc).__name__, "error": str(exc)},
+        )
 
 
 def check_issue_epic(issue_number: int, fetch_facts: IssueFactsFetcher | None) -> CheckResult | None:
