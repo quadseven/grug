@@ -5,7 +5,7 @@ dispatcher gates (allowlist, collaborator, tpm-enabled) and executes; this
 just recognizes the command, so the recognition has a unit-test seam.
 
 Supported verbs (all default-safe - none mutate code):
-  /grug recheck        re-run the DoR + review (pre-existing)
+  /grug recheck        re-run Chief's DoR check (NOT Elder - use improve)
   /grug improve        Elder re-reviews and re-posts its findings
   /grug ask <question> scoped Q&A over the PR diff, answered as a reply
   /grug test-gaps      the pr-test lens on demand

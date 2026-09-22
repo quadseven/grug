@@ -110,6 +110,9 @@ class ReviewCoverage:
     # never looked at, because "ran and broke" and "never opened" ask the
     # author for opposite things (grug#939).
     unattempted_cohorts: tuple[int, ...] = ()
+    # Files in any cohort that did not complete, sorted. What a reader of a
+    # partial review needs: WHERE Elder did not look, not how many cohorts.
+    unwalked_paths: tuple[str, ...] = ()
 
     @property
     def complete(self) -> bool:

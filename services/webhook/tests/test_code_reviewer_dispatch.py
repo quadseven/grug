@@ -2110,6 +2110,30 @@ def test_board_speaks_partial_coverage_not_blackout():
     assert "not walked" in stack
 
 
+def test_partial_review_names_the_files_it_did_not_walk():
+    """Live 2026-09-22: "Some ground not walked" with no location gave the author
+    nothing to act on. The note must name the files."""
+    from personas.code_reviewer.persona import CodeReviewEvaluation
+
+    coverage = ReviewCoverage(
+        total_cohorts=3, completed_cohorts=1, failed_cohorts=(2, 3),
+        cohort_labels=("a", "b", "c"),
+        unwalked_paths=tuple(f"pkg/m{i}.py" for i in range(10)),
+    )
+    ev = CodeReviewEvaluation(
+        findings=(), conclusion="neutral", degraded_reason="partial_review",
+        coverage=coverage,
+    )
+
+    stack = cr_dispatch._review_stack_body(ev, conclusion="neutral")
+
+    assert "`pkg/m0.py`" in stack and "`pkg/m7.py`" in stack
+    assert "`pkg/m8.py`" not in stack
+    assert "(+2 more)" in stack
+    # `/grug improve` re-runs Elder; `/grug recheck` only re-runs Chief.
+    assert "/grug improve" in stack
+
+
 def test_board_still_speaks_blackout_for_a_real_outage():
     """Splitting partial coverage out must not soften a genuine blackout."""
     from personas.code_reviewer.persona import CodeReviewEvaluation
