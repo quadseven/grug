@@ -648,6 +648,28 @@ def _load_opencode_go_key() -> str:
     return get_opencode_go_api_key()
 
 
+_OPENCODE_GO_MODEL = os.getenv("GRUG_OPENCODE_GO_MODEL", _OPENCODE_GO_DEFAULT_MODEL)
+_OPENCODE_GO_WIRE = os.getenv("GRUG_OPENCODE_GO_WIRE", _OPENCODE_GO_DEFAULT_WIRE)
+
+
+def _opencode_go_extra_body(model: str, wire: str) -> dict:
+    """Turn DeepSeek's hidden reasoning off on the chat wire.
+
+    Measured live 2026-09-22 on a real 7k-token review prompt: with thinking
+    on, deepseek-v4.1-flash spent all 8192 output tokens on reasoning,
+    returned empty content (`finish_reason=length`) and took 33s - past the
+    25s chain timeout, and unparseable even when it finished. Every such
+    call is billed in full. With `thinking: disabled` the same prompt
+    returned a complete review in 10s on 1.8k output tokens.
+    `GRUG_OPENCODE_GO_THINKING=enabled` restores the vendor default.
+    """
+    if wire != "chat" or not model.startswith("deepseek"):
+        return {}
+    if os.getenv("GRUG_OPENCODE_GO_THINKING", "disabled").strip().lower() == "enabled":
+        return {}
+    return {"thinking": {"type": "disabled"}}
+
+
 # Single source of truth for per-backend dispatch data. Adding a third
 # backend = one new entry; review_diff's "try every backend" loop
 # generalizes without touching the type-design.
@@ -675,8 +697,9 @@ _BACKEND_CONFIGS: dict[Backend, BackendConfig] = {
     Backend.OPENCODE_GO: BackendConfig(
         backend=Backend.OPENCODE_GO,
         url=os.getenv("GRUG_OPENCODE_GO_URL", _OPENCODE_GO_URL),
-        model=os.getenv("GRUG_OPENCODE_GO_MODEL", _OPENCODE_GO_DEFAULT_MODEL),
+        model=_OPENCODE_GO_MODEL,
         key_loader=lambda: _load_opencode_go_key(),
+        extra_body=_opencode_go_extra_body(_OPENCODE_GO_MODEL, _OPENCODE_GO_WIRE),
         # opencode Go started 400ing EVERY call today (confirmed live,
         # grug#984): `{"type":"MissingSessionID","message":"Request is
         # missing x-opencode-session and cannot be routed efficiently."}`.
@@ -690,10 +713,7 @@ _BACKEND_CONFIGS: dict[Backend, BackendConfig] = {
         # coincide here.
         extra_headers={"User-Agent": "grug/1.0 (+https://grug.lol)"},
         dynamic_headers={"x-opencode-session": lambda: str(uuid.uuid4())},
-        wire=cast(
-            'Literal["chat", "responses"]',
-            os.getenv("GRUG_OPENCODE_GO_WIRE", _OPENCODE_GO_DEFAULT_WIRE),
-        ),
+        wire=cast('Literal["chat", "responses"]', _OPENCODE_GO_WIRE),
     ),
 }
 
@@ -712,7 +732,10 @@ def _opencode_go_chain_config() -> BackendConfig:
     """opencode Go as the FIRST cloud chain tier (grug#910)."""
     return replace(
         _BACKEND_CONFIGS[Backend.OPENCODE_GO],
-        extra_body={"max_tokens": _CLOUD_CHAIN_MAX_TOKENS},
+        extra_body={
+            **_BACKEND_CONFIGS[Backend.OPENCODE_GO].extra_body,
+            "max_tokens": _CLOUD_CHAIN_MAX_TOKENS,
+        },
         timeout_seconds=_CLOUD_CHAIN_TIMEOUT_SECONDS,
         retry_attempts=1,
         transport_retry_attempts=1,
