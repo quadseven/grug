@@ -487,3 +487,73 @@ def test_mitigation_kill_needs_the_file():
     kept, killed = verify_findings((f,), {})
     assert kept == (f,)
     assert killed == ()
+
+
+# --- fix_block_present (live 2026-09-22): the model anchored on a
+# docstring and proposed, as its fix, the exact block already below it ------
+
+_MEMBERS_MODULE = """import registry
+
+
+def _fetch_members() -> dict:
+    \"\"\"Every group the registry lists.
+
+    One read and one guard.
+    \"\"\"
+    names = registry.names()
+    holes = ", ".join(["%s"] * len(names))
+    conn = _connect()
+    try:
+        with conn.cursor() as cur:
+            rows = _wide_guarded(cur, _MEMBER_QUERY.format(holes=holes),  # noqa: S608
+                                 tuple(names), "", "member")
+    finally:
+        conn.close()
+    return {"rows": rows, "names": names}
+
+
+def _fetch_other() -> dict:
+    conn = _connect()
+    rows = conn.cursor().fetchall()
+    return {"rows": rows}
+"""
+
+_MEMBERS_FIX = """    conn = _connect()
+    try:
+        with conn.cursor() as cur:
+            rows = _wide_guarded(cur, _MEMBER_QUERY.format(holes=holes),  # noqa: S608
+                                 tuple(names), "", "member")
+    finally:
+        conn.close()"""
+
+
+def test_suggested_block_already_in_flagged_function_is_killed():
+    f = _finding(
+        file="map_server.py", line=5, severity="medium", rule_name="resource-leak",
+        message="connection fetched outside the shelter of try",
+        suggestion=_MEMBERS_FIX,
+    )
+    kept, killed = verify_findings((f,), {"map_server.py": _MEMBERS_MODULE})
+    assert kept == ()
+    assert killed[0].reason == "fix_block_present"
+
+
+def test_suggested_block_absent_from_flagged_function_survives():
+    # `_fetch_other` really does leak its connection; the same suggestion
+    # existing in a DIFFERENT function must not prove it fixed.
+    f = _finding(
+        file="map_server.py", line=23, severity="medium", rule_name="resource-leak",
+        message="connection never closed", suggestion=_MEMBERS_FIX,
+    )
+    kept, killed = verify_findings((f,), {"map_server.py": _MEMBERS_MODULE})
+    assert kept == (f,)
+    assert killed == ()
+
+
+def test_short_suggestion_block_never_proves_anything():
+    f = _finding(
+        file="map_server.py", line=5, severity="medium", rule_name="resource-leak",
+        message="close the connection", suggestion="    finally:\n        conn.close()",
+    )
+    kept, _ = verify_findings((f,), {"map_server.py": _MEMBERS_MODULE})
+    assert kept == (f,)

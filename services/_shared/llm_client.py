@@ -2749,7 +2749,22 @@ def _cohort_coverage(
         unattempted_cohorts=_unattempted_cohort_indexes(responses),
         cohort_labels=tuple(cohort.label for cohort in plan.cohorts),
         concerns=plan.concerns,
+        unwalked_paths=_unwalked_paths(plan, failed_indexes),
     )
+
+
+def _unwalked_paths(plan: ReviewPlan, failed_indexes: Sequence[int]) -> tuple[str, ...]:
+    """Files in failed cohorts (1-based indexes into `plan.cohorts`) plus the
+    ones the planner's `plan-truncated` concern names as cut before any ran."""
+    paths = {
+        path
+        for concern in plan.concerns if concern.kind == "plan-truncated"
+        for path in concern.paths
+    }
+    for index in failed_indexes:
+        if 1 <= index <= len(plan.cohorts):
+            paths.update(plan.cohorts[index - 1].paths)
+    return tuple(sorted(paths))
 
 
 def _cohort_attribution(

@@ -1407,6 +1407,30 @@ def _stack_status_line(
     return f"**{n} actionable marking(s)** ({sev_bits})"
 
 
+_UNWALKED_PATHS_SHOWN = 8
+
+
+def _unwalked_ground_note(evaluation: CodeReviewEvaluation) -> str:
+    """Name the files a partial pass did not finish. "Some ground not
+    walked" with no location gave the reader nothing to act on - they could
+    neither check those files themselves nor tell whether it mattered."""
+    paths = evaluation.coverage.unwalked_paths if evaluation.coverage else ()
+    if not paths:
+        return (
+            "Some ground not walked this pass - part of the diff did not fit "
+            "one look. What Grug did walk is above. Grug not say trail safe "
+            "for ground Grug not walk."
+        )
+    shown = ", ".join(f"`{p}`" for p in paths[:_UNWALKED_PATHS_SHOWN])
+    extra = len(paths) - _UNWALKED_PATHS_SHOWN
+    more = f" (+{extra} more)" if extra > 0 else ""
+    return (
+        f"Grug did not finish walking {shown}{more}. Markings above cover "
+        "the rest. Grug not say trail safe in those files - comment "
+        "`/grug recheck` to walk them again."
+    )
+
+
 def _stack_closing_note(evaluation: CodeReviewEvaluation) -> list[str]:
     """The board section's tail: what to do next, or why there is nothing.
 
@@ -1431,15 +1455,7 @@ def _stack_closing_note(evaluation: CodeReviewEvaluation) -> list[str]:
     if is_partial_coverage(evaluation.degraded_reason):
         # Elder DID review - just not all of it. "Grug could not see" would
         # discard real work and read as a tool failure.
-        return [
-            "",
-            "---",
-            "",
-            "Some ground not walked this pass - part of the diff did not fit "
-            "one look. What Grug did walk is above. Grug not say trail safe "
-            "for ground Grug not walk.",
-            "",
-        ]
+        return ["", "---", "", _unwalked_ground_note(evaluation), ""]
     if is_real_degradation(evaluation.degraded_reason):
         # Degraded with empty findings is not a clean review, and the one thing
         # that must never happen is a reader taking it for one.

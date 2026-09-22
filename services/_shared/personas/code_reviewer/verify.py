@@ -65,7 +65,9 @@ if TYPE_CHECKING:  # import cycle guard: persona imports nothing from here
 @dataclass(frozen=True, slots=True)
 class KilledFinding:
     finding: "Finding"
-    reason: str  # "non_code_file" | "sync_context" | "fix_already_present"
+    # "non_code_file" | "sync_context" | "fix_already_present" |
+    # "fix_block_present" | "mitigation_present"
+    reason: str
 
 
 # Prose file suffixes: findings about EXECUTING these are category errors.
@@ -224,6 +226,58 @@ def _anchor_window(source: str, line: int, radius: int = 2) -> str:
     return "\n".join(lines[lo:hi])
 
 
+# A suggested block must be at least this many non-blank lines before its
+# presence can prove anything: a one- or two-line match ("try:",
+# "finally:") is ordinary structure, not evidence.
+_MIN_FIX_BLOCK_LINES = 3
+
+
+def _normalized_nonblank(text: str) -> list[str]:
+    return [" ".join(line.split()) for line in text.splitlines() if line.strip()]
+
+
+def _enclosing_def_span(source: str, line: int) -> tuple[int, int] | None:
+    """(first, last) line of the innermost function containing `line`."""
+    try:
+        tree = ast.parse(source)
+    except SyntaxError:
+        return None
+    best: tuple[int, int] | None = None
+    for node in ast.walk(tree):
+        if not isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
+            continue
+        end = node.end_lineno or node.lineno
+        if node.lineno <= line <= end and (best is None or node.lineno >= best[0]):
+            best = (node.lineno, end)
+    return best
+
+
+def _kills_as_fix_block_present(finding: "Finding", source: str) -> bool:
+    """The model's whole multi-line suggested block already sits, verbatim
+    modulo whitespace, inside the function it flagged - applying the "fix"
+    changes nothing, so the claimed defect contradicts the code.
+
+    Complements `fix_already_present`, which is anchor-line-only and so
+    cannot see a block the model anchored a few lines away from. Live
+    instance 2026-09-22: a function's docstring was flagged as a resource
+    leak, with the six-line `conn = _connect()` / `try` /
+    `finally: conn.close()` block that already followed it five lines
+    later proposed as the fix. Python only, and only inside the anchor's own function, so an
+    identical block elsewhere in the module can never prove this claim.
+    """
+    if not finding.suggestion or not finding.file.endswith(".py"):
+        return False
+    want = _normalized_nonblank(finding.suggestion)
+    if len(want) < _MIN_FIX_BLOCK_LINES:
+        return False
+    span = _enclosing_def_span(source, finding.line)
+    if span is None:
+        return False
+    body = _normalized_nonblank("\n".join(source.splitlines()[span[0] - 1:span[1]]))
+    width = len(want)
+    return any(body[i:i + width] == want for i in range(len(body) - width + 1))
+
+
 def _kills_as_non_code_file(finding: "Finding") -> bool:
     """Execution-class claim anchored in a document format. Docs-class rules
     are exempt FIRST - they legitimately anchor in markdown even when their
@@ -315,6 +369,8 @@ def _verify_one(finding: "Finding", contents: dict[str, str]) -> str | None:
             window = _anchor_window(source, finding.line, radius=0)
             if all(t in window for t in tokens):
                 return "fix_already_present"
+        if _kills_as_fix_block_present(finding, source):
+            return "fix_block_present"
 
     # Mitigation-present kill. Same anchor-line-only discipline as
     # fix_already_present (radius 0), and the same asymmetric bias: only a

@@ -4140,3 +4140,22 @@ def test_cohort_failure_reasons_carry_the_cause_not_just_the_index() -> None:
     assert reasons["2"].startswith("parse_failed: unparseable")
     assert "budget exhausted" in reasons["3"]
     assert "1" not in reasons
+
+
+def test_unwalked_paths_cover_failed_and_truncated_cohorts() -> None:
+    from review_pipeline import ReviewabilityConcern
+
+    plan = ReviewPlan(
+        cohorts=(
+            ReviewCohort(label="a", hunk_indexes=(0,), paths=("a.py",), diff_chars=1,
+                         oversized=False, layers=()),
+            ReviewCohort(label="b", hunk_indexes=(1,), paths=("b.py", "c.py"), diff_chars=1,
+                         oversized=False, layers=()),
+        ),
+        total_diff_chars=2,
+        concerns=(ReviewabilityConcern(kind="plan-truncated", message="1 cut",
+                                       paths=("z.py",)),),
+        total_cohorts_planned=3,
+    )
+    assert lc._unwalked_paths(plan, [2]) == ("b.py", "c.py", "z.py")
+    assert lc._unwalked_paths(plan, []) == ("z.py",)
