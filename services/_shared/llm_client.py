@@ -32,6 +32,7 @@ paths so this module only ever runs from the webhook process.
 from __future__ import annotations
 
 import hashlib
+import fnmatch
 import json
 import logging
 import math
@@ -2249,6 +2250,22 @@ class LearningClassification(TypedDict):
     scope_path: str
 
 
+def _scope_covering_finding(scope: str, finding_file: str) -> str:
+    """Keep a classifier-proposed scope glob only if it matches the file the
+    finding was on. The classifier invents globs: live 2026-09-22 it scoped a
+    rule learned on `server.py` to `*team*member*.py`, which matches no
+    file in that repo, so the rule could never apply. A scope that does not
+    even cover its own source file is wrong; repo-wide is the safe fallback."""
+    if not scope or not finding_file:
+        return scope
+    if fnmatch.fnmatch(finding_file, scope) or fnmatch.fnmatch(
+        finding_file, scope.replace("**/", "")
+    ):
+        return scope
+    log.info("learning_scope_dropped", extra={"scope": scope[:120], "file": finding_file[:200]})
+    return ""
+
+
 def classify_learning(
     reply_text: str,
     finding_text: str,
@@ -2279,6 +2296,13 @@ def classify_learning(
             "(a convention, a standard, a reason to stop flagging a pattern). "
             "A reply that just explains this one case, disagrees without a "
             "general reason, or asks a question is NOT durable. "
+            "A reply that ACCEPTS the finding ('fixed in <sha>', 'valid, "
+            "done', 'already fixed') is NOT durable either: the finding's own "
+            "advice is already how you review, so storing it teaches nothing. "
+            "The replies worth remembering usually CORRECT you - the finding "
+            "was wrong, for a reason that holds beyond this one line (an "
+            "invariant the codebase guarantees, a convention, a pattern that "
+            "is safe here and should stop being flagged). "
             "When durable, restate the preference as ONE short imperative rule "
             "in your own words, self-contained, explaining the WHY when the "
             "reply gave one. Optionally set a file-glob scope if the reply is "
@@ -2341,6 +2365,7 @@ def classify_learning(
                 learning = learning.strip() if isinstance(learning, str) else ""
                 scope = data.get("scope_path", "")
                 scope = scope.strip() if isinstance(scope, str) else ""
+                scope = _scope_covering_finding(scope, finding_tags.get("file", ""))
                 # A "durable" verdict with no rule text is unusable - treat as
                 # one-off so we never store an empty learning.
                 if durable and not learning:
@@ -2395,7 +2420,15 @@ def _repo_learnings_block(pr_context: Optional[PrContext]) -> str:
 _MAX_LEARNINGS_IN_PROMPT = 40
 
 
-def _render_learnings_block(rows: list[dict[str, Any]], *, max_chars: int = 1400) -> str:
+# ~25 rules. At 1400 chars only ~9 fit, so on a repo that teaches a few
+# rules a day (the busiest: 55 in 30 days) a "Grug remember this" ack stopped
+# being true within days - the rule was stored but never reached a prompt.
+_LEARNINGS_BLOCK_MAX_CHARS = 4000
+
+
+def _render_learnings_block(
+    rows: list[dict[str, Any]], *, max_chars: int = _LEARNINGS_BLOCK_MAX_CHARS,
+) -> str:
     """Render learnings as a bounded, sanitized prompt block. Pure (no I/O)
     so it is unit-testable without a store. `rows` arrive oldest-first (store
     order); this renders NEWEST first and bounds by count then bytes, so a

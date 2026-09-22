@@ -3145,6 +3145,54 @@ def test_classify_learning_returns_none_on_backend_failure() -> None:
     assert out is None
 
 
+def test_classify_learning_drops_a_scope_that_misses_the_findings_file() -> None:
+    """Live 2026-09-22: a rule learned on `server.py` came back scoped to
+    `*team*member*.py`, a glob matching no file in the repo."""
+    payload = json.dumps({
+        "durable": True, "learning": "Prefer one membership query over per-group fetches.",
+        "scope_path": "*team*member*.py",
+    })
+    response = httpx.Response(200, json=_openai_json_response(payload))
+    with patch.object(httpx, "post", return_value=response):
+        out = lc.classify_learning(
+            "r", "f", {"rule_name": "query-in-loop", "file": "server.py"}, installation_id=2,
+        )
+    assert out is not None and out["durable"] is True
+    assert out["scope_path"] == ""
+
+
+def test_scope_covering_finding_keeps_globs_that_match() -> None:
+    assert lc._scope_covering_finding("**/middleware/*.py", "svc/middleware/auth.py") == "**/middleware/*.py"
+    assert lc._scope_covering_finding("**/middleware/*.py", "middleware/auth.py") == "**/middleware/*.py"
+    assert lc._scope_covering_finding("server.py", "server.py") == "server.py"
+    assert lc._scope_covering_finding("*.swift", "server.py") == ""
+
+
+def test_classify_learning_tells_the_model_an_acceptance_is_not_durable() -> None:
+    """Most remembered markings were replies like "Fixed in b77f639" - the
+    classifier restated Elder's own finding as a team preference."""
+    captured: dict = {}
+
+    def fake_post(url, json=None, headers=None, timeout=None):
+        captured["system"] = json["messages"][0]["content"]
+        return httpx.Response(200, json=_openai_json_response(
+            '{"durable": false, "learning": "", "scope_path": ""}'))
+
+    with patch.object(httpx, "post", side_effect=fake_post):
+        lc.classify_learning("Fixed in b77f639.", "f", {"rule_name": "r"}, installation_id=2)
+    assert "ACCEPTS the finding" in captured["system"]
+    assert "CORRECT you" in captured["system"]
+
+
+def test_learnings_block_fits_twenty_realistic_rules() -> None:
+    """At the old 1400-char cap only ~9 of these fit, so a repo teaching a
+    few rules a day lost most of them from the prompt within days."""
+    rows = [{"text": f"Rule {i}: " + "x" * 110, "scope_path": ""} for i in range(20)]
+    block = lc._render_learnings_block(rows)
+    assert "Rule 0:" in block and "Rule 19:" in block
+    assert "older learnings omitted" not in block
+
+
 def test_render_learnings_block_bounded_and_sanitized() -> None:
     rows = [
         {"text": "prefer early returns", "scope_path": "**/mw/*.py"},
