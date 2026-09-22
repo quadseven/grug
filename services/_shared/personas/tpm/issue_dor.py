@@ -79,6 +79,17 @@ _REMEDY = {
 }
 
 
+def _emit_epic_fetch_failed() -> None:
+    """Best-effort gauge when the epic facts cannot be read (Grug Elder on
+    #1038), the same shape as ticket-compliance's `_emit_metric`: a skipped
+    epic line is silent in the comment, so the count is what shows an outage."""
+    try:
+        from observability import emit_gauge  # type: ignore
+        emit_gauge("grug.chief.issue_dor.epic_fetch_failed", 1)
+    except Exception:  # noqa: BLE001 - telemetry never breaks the advisory
+        pass
+
+
 def check_issue_epic(issue_number: int, fetch_facts: IssueFactsFetcher | None) -> CheckResult | None:
     """The ticket itself is an epic or belongs to one (grug#1035).
 
@@ -91,11 +102,15 @@ def check_issue_epic(issue_number: int, fetch_facts: IssueFactsFetcher | None) -
         return None
     try:
         facts = fetch_facts(issue_number)
-    except Exception as exc:
+    except (httpx.HTTPError, ValueError) as exc:
+        # NARROW on purpose (Grug Elder on #1038): a GitHub status error, a
+        # transport failure or an unparseable body falls open; a TypeError or
+        # NameError of our own must still surface as the bug it is.
         log.warning(
             "issue_dor_epic_fetch_failed",
             extra={"issue": issue_number, "error": str(exc)},
         )
+        _emit_epic_fetch_failed()
         return None
     if is_epic(facts):
         return CheckResult("epic", True, "this ticket is an epic")

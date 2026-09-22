@@ -225,3 +225,28 @@ def test_refresh_only_still_updates_an_existing_advisory(monkeypatch):
     idor.run_issue_dor("tok", "o", "r", 7, _GOOD,
                        fetch_facts=lambda n: _facts(), refresh_only=True)
     assert calls and calls[0][0] == "patch"
+
+
+def test_a_fetch_failure_is_counted(monkeypatch):
+    emitted = []
+    monkeypatch.setattr(idor, "_emit_epic_fetch_failed", lambda: emitted.append(1))
+    _wire(monkeypatch)
+
+    def boom(n):
+        raise httpx.ConnectError("down")
+
+    idor.run_issue_dor("tok", "o", "r", 7, _GOOD, fetch_facts=boom)
+    assert emitted == [1]
+
+
+def test_a_programming_error_in_the_fetcher_is_not_swallowed(monkeypatch):
+    """Only GitHub-shaped failures fall open; our own bug must surface."""
+    import pytest
+
+    _wire(monkeypatch)
+
+    def bug(n):
+        raise TypeError("wrong arguments")
+
+    with pytest.raises(TypeError):
+        idor.run_issue_dor("tok", "o", "r", 7, _GOOD, fetch_facts=bug)
