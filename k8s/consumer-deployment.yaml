@@ -120,8 +120,8 @@ spec:
             # Elder-capable workloads (this is the PRODUCTION review path).
             - {name: GRUG_REVIEW_BACKEND_PRIORITY, value: cloud}
             - {name: GRUG_OPENCODE_GO_API_KEY_SSM, value: /infra/llm/opencode_go_api_key}
-            # grug#916: tier 2, full rationale in webhook-deployment.yaml.
-            - {name: GRUG_CLOUD_FREE_TIER_MODEL, value: "openrouter/free"}
+            # GRUG_CLOUD_FREE_TIER_MODEL deliberately unset - rationale in
+            # webhook-deployment.yaml.
             - {name: GRUG_PROMPT_EXPERIMENT_SSM, value: /grug/elder-prompt-experiment}
             # Tiered Elder (#645): coder arm on every PR; reasoner only on
             # escalation / sample. Rollback to always-on dual-arm: deep.

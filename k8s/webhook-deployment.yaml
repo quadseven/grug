@@ -162,20 +162,17 @@ spec:
             # small/medium diffs fast (1-9s) and deterministic; occasional
             # instability on large diffs (grug#910's own evidence) - bounded
             # by the chain's 25s timeout, safe because Cave is the guaranteed
-            # fallback. GRUG_CLOUD_FREE_TIER_MODEL (tier 2): openrouter/free,
-            # OpenRouter's random router across `:free` models (grug#916).
-            # Deliberately accepted despite it being able to land on
-            # poolside/laguna-s-2.1:free - the exact model grug#883 found
-            # degenerates 3-of-5 requests - with no way to pin it out; two
-            # SINGLE-model :free candidates were tried first and rejected for
-            # worse failures. The operator, 2026-08-28: chosen anyway. Bounded by the
-            # SAME 25s/8192-token chain config as opencode Go above. Only
-            # reached when tier 1 already failed; a garbled tier-2 response
-            # is a real (if degraded) answer per _try_cloud_primary's own
-            # design - it does NOT fall through to Cave, it publishes
-            # advisory/reduced-coverage, never a blocked merge.
+            # fallback. GRUG_CLOUD_FREE_TIER_MODEL is deliberately UNSET: the
+            # OpenRouter `:free` tier (grug#916) is off the review chain. A
+            # tier-2 parse failure is returned as the answer and never falls
+            # through, so a garbled free response blocked the Cave fallback
+            # that works. Measured 2026-09-22: 212 free-tier parse failures in
+            # a week (42 from a content-safety classifier), and a head-to-head
+            # of six :free models on one real review returned zero usable
+            # JSON (two 429s, one 8191-token runaway, three past 120s), while
+            # the Sparks answered the same prompt in 13-25s. Setting the
+            # variable again restores the tier with no code change.
             - {name: GRUG_OPENCODE_GO_API_KEY_SSM, value: /infra/llm/opencode_go_api_key}
-            - {name: GRUG_CLOUD_FREE_TIER_MODEL, value: "openrouter/free"}
             - {name: GRUG_PROMPT_EXPERIMENT_SSM, value: /grug/elder-prompt-experiment}
             # In-cluster spark-gateway for the evidence-scoped judge. Keep the
             # role assignment identical on both Elder-capable workloads.
