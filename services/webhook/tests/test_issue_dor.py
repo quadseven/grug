@@ -163,3 +163,65 @@ def test_no_marker_means_no_existing_comment(monkeypatch):
             request=httpx.Request("GET", url)),
     )
     assert idor._existing_comment("tok", "o", "r", 7) is None
+
+
+# --- the epic line (grug#1035) ------------------------------------------------
+
+from personas.tpm.dor_checks import IssueFacts  # noqa: E402
+
+
+def _facts(**over):
+    base = dict(number=7, title="a ticket", body="", labels=(), sub_issue_count=0,
+                parent_number=None, is_pull_request=False)
+    base.update(over)
+    return IssueFacts(**base)
+
+
+def test_a_ready_ticket_with_no_epic_gets_an_advisory_naming_it(monkeypatch):
+    calls = _wire(monkeypatch)
+    out = idor.run_issue_dor("tok", "o", "r", 7, _GOOD, fetch_facts=lambda n: _facts())
+    assert out["status"] == "ok" and len(calls) == 1
+    body = calls[0][2]["body"]
+    assert "`epic`" in body and "sub-issue of an epic" in body
+
+
+def test_a_ticket_in_an_epic_stays_silent(monkeypatch):
+    calls = _wire(monkeypatch)
+    for facts in (_facts(parent_number=3), _facts(body="Part of #3"),
+                  _facts(title="Epic: a root"), _facts(labels=("epic",)), _facts(sub_issue_count=2)):
+        out = idor.run_issue_dor("tok", "o", "r", 7, _GOOD, fetch_facts=lambda n, f=facts: f)
+        assert out["status"] == "no_op", facts
+    assert calls == []
+
+
+def test_linking_the_epic_clears_the_advisory_in_place(monkeypatch):
+    calls = _wire(monkeypatch, existing=42)
+    out = idor.run_issue_dor("tok", "o", "r", 7, _GOOD, fetch_facts=lambda n: _facts(parent_number=3))
+    assert "cleared" in out["reason"]
+    assert calls[0][0] == "patch" and calls[0][1].endswith("/comments/42")
+
+
+def test_a_fetch_failure_adds_no_epic_line(monkeypatch):
+    """Advisory surface: a GitHub blip must not become a nag."""
+    calls = _wire(monkeypatch)
+
+    def boom(n):
+        raise httpx.ConnectError("down")
+
+    out = idor.run_issue_dor("tok", "o", "r", 7, _GOOD, fetch_facts=boom)
+    assert out["status"] == "no_op" and calls == []
+
+
+def test_refresh_only_never_starts_a_comment(monkeypatch):
+    """A link event on an old, gappy issue must not post a fresh lecture."""
+    calls = _wire(monkeypatch)
+    out = idor.run_issue_dor("tok", "o", "r", 7, _BAD,
+                             fetch_facts=lambda n: _facts(), refresh_only=True)
+    assert out["status"] == "no_op" and calls == []
+
+
+def test_refresh_only_still_updates_an_existing_advisory(monkeypatch):
+    calls = _wire(monkeypatch, existing=42)
+    idor.run_issue_dor("tok", "o", "r", 7, _GOOD,
+                       fetch_facts=lambda n: _facts(), refresh_only=True)
+    assert calls and calls[0][0] == "patch"

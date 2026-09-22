@@ -67,6 +67,8 @@ def dispatch(
         )
     if event_name == "issues":
         return _handle_issues(payload)
+    if event_name == "sub_issues":
+        return _handle_sub_issues(payload)
     if event_name == "issue_comment":
         return _handle_issue_comment(payload)
     if event_name == "pull_request_review_comment":
@@ -577,8 +579,52 @@ def _handle_issues(payload: dict[str, Any]) -> dict[str, str]:
     if issue.get("pull_request"):
         return {"status": "no_op", "reason": "issues event on a PR"}
 
-    repo = payload.get("repository") or {}
-    installation = payload.get("installation") or {}
+    return _run_issue_dor_for(
+        payload.get("installation") or {}, payload.get("repository") or {},
+        issue, refresh_only=False,
+    )
+
+
+def _handle_sub_issues(payload: dict[str, Any]) -> dict[str, str]:
+    """A sub-issue link added or removed: refresh Chief's issue-time advisory
+    on the issue whose epic membership just changed (grug#1035).
+
+    `parent_issue_*` is delivered for the CHILD, whose `epic` line may now
+    clear or return. `sub_issue_*` is delivered for the PARENT, which becomes
+    or stops being an epic by gaining or losing children. Refresh-only: a link
+    event may edit or clear an advisory Chief already posted, never start one.
+
+    Needs the App subscribed to "Sub issues" events
+    (docs/HITL_PREREQUISITES.md). Without that, GitHub never delivers this and
+    the advisory refreshes only on the next `issues.edited`.
+    """
+    action = payload.get("action", "")
+    if action in ("parent_issue_added", "parent_issue_removed"):
+        issue = payload.get("sub_issue") or {}
+        repo = payload.get("sub_issue_repo") or payload.get("repository") or {}
+    elif action in ("sub_issue_added", "sub_issue_removed"):
+        issue = payload.get("parent_issue") or {}
+        repo = payload.get("parent_issue_repo") or payload.get("repository") or {}
+    else:
+        return {"status": "no_op", "reason": f"sub_issues action={action} not gated"}
+    if issue.get("pull_request"):
+        return {"status": "no_op", "reason": "sub_issues event on a PR"}
+    return _run_issue_dor_for(
+        payload.get("installation") or {}, repo, issue, refresh_only=True,
+    )
+
+
+def _run_issue_dor_for(
+    installation: dict[str, Any],
+    repo: dict[str, Any],
+    issue: dict[str, Any],
+    *,
+    refresh_only: bool,
+) -> dict[str, str]:
+    """The gates and the call shared by `issues` and `sub_issues`: an
+    allowlisted install, a known repo id, and the repo's own
+    `issue_dor_enabled` flag, then Chief's advisory for this one issue with
+    the epic facts read under the same token."""
     installation_id = installation.get("id")
     owner = (repo.get("owner") or {}).get("login") or repo.get("full_name", "").split("/")[0]
     repo_name = repo.get("name")
@@ -609,12 +655,15 @@ def _handle_issues(payload: dict[str, Any]) -> dict[str, str]:
 
     from github_app_auth import with_install_token_retry  # type: ignore
     from personas.tpm.issue_dor import run_issue_dor
+    from personas.tpm.issue_fetcher import issue_facts
 
     body = issue.get("body") or ""
     return with_install_token_retry(
         int(installation_id),
         lambda token: run_issue_dor(
             token, owner, repo_name, int(issue_number), body,
+            fetch_facts=lambda n: issue_facts(token, owner, repo_name, n),
+            refresh_only=refresh_only,
         ),
     ) or {"status": "skip", "reason": "token acquisition failed"}
 
