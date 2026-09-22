@@ -2130,7 +2130,8 @@ def test_partial_review_names_the_files_it_did_not_walk():
     assert "`pkg/m0.py`" in stack and "`pkg/m7.py`" in stack
     assert "`pkg/m8.py`" not in stack
     assert "(+2 more)" in stack
-    assert "/grug recheck" in stack
+    # `/grug improve` re-runs Elder; `/grug recheck` only re-runs Chief.
+    assert "/grug improve" in stack
 
 
 def test_board_still_speaks_blackout_for_a_real_outage():

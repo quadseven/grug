@@ -1427,7 +1427,7 @@ def _unwalked_ground_note(evaluation: CodeReviewEvaluation) -> str:
     return (
         f"Grug did not finish walking {shown}{more}. Markings above cover "
         "the rest. Grug not say trail safe in those files - comment "
-        "`/grug recheck` to walk them again."
+        "`/grug improve` to walk them again."
     )
 
 
