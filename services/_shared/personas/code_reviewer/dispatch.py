@@ -1327,11 +1327,12 @@ RETRIED_DEGRADATIONS = frozenset({
 # attempt every ten minutes. The degraded check it publishes is terminal, so
 # rerun treats it as self-completing.
 #
-# Only the 406. Other 4xx on this fetch (a 403 permission, a 404 visibility
-# blip, a 422) stay retryable: a retry or a DLQ page is the right outcome for
-# those, and completing them neutral would make a review quietly disappear.
+# Only that 406, recognised by status AND GitHub's `too_large` error code
+# (see `_is_diff_too_large`). Other 4xx on this fetch (a 403 permission, a
+# 404 visibility blip, a 422, a 406 for any other reason) stay retryable: a
+# retry or a DLQ page is the right outcome for those, and completing them
+# with an author-facing "split the PR" would misname the cause.
 DIFF_TOO_LARGE = "diff_too_large"
-_DIFF_TOO_LARGE_STATUS = 406
 
 
 def worth_an_email(evaluation: CodeReviewEvaluation) -> bool:
@@ -2033,6 +2034,31 @@ def _http_error_detail(error: Exception) -> dict[str, object]:
     return detail
 
 
+def _is_diff_too_large(error: Exception) -> bool:
+    """Is this GitHub's "the diff is past the API size limit" answer?
+
+    #1047: GitHub answers the diff media type with a 406 whose JSON body
+    carries `errors[].code == "too_large"` (field `diff`). Both are required.
+    A 406 alone could be media-type negotiation or a proxy, and treating that
+    as terminal would tell the author to split a PR that is not too big.
+    Unlike `_is_permanent_rejection` this does read the body, but only the
+    machine-readable error code, never GitHub's prose."""
+    response = _safe_attr(error, "response")
+    if getattr(response, "status_code", None) != 406:
+        return False
+    try:
+        body = response.json()  # type: ignore[union-attr]
+    except Exception:  # noqa: BLE001 - an unreadable body is not the size limit
+        return False
+    errors = body.get("errors") if isinstance(body, dict) else None
+    if not isinstance(errors, list):
+        return False
+    return any(
+        isinstance(item, dict) and item.get("code") == "too_large"
+        for item in errors
+    )
+
+
 def _is_permanent_rejection(error: Exception) -> bool:
     """Is this HTTP failure a verdict on the PAYLOAD rather than on the wire?
 
@@ -2259,10 +2285,7 @@ def dispatch_code_review(
                 },
             )
     except (httpx.HTTPStatusError, httpx.RequestError, DiffParseError) as e:
-        diff_too_large = (
-            _safe_attr(_safe_attr(e, "response"), "status_code")
-            == _DIFF_TOO_LARGE_STATUS
-        )
+        diff_too_large = _is_diff_too_large(e)
         log.warning(
             "code_review_fetch_or_parse_failed",
             extra={

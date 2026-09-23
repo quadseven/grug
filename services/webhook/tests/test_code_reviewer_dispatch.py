@@ -3298,6 +3298,14 @@ def test_diff_over_githubs_size_limit_is_terminal_not_retried(monkeypatch):
         _diff_status_error(404),
         _diff_status_error(400),
         _diff_status_error(422),
+        # A 406 that is NOT the size limit (media-type negotiation, a proxy,
+        # a body that is not GitHub's JSON) must not tell the author to split
+        # the PR.
+        _diff_status_error(406),
+        _diff_status_error(406, body="<html>Not Acceptable</html>"),
+        _diff_status_error(
+            406, body='{"message":"Unsupported media type","errors":[]}',
+        ),
     ],
 )
 def test_only_the_size_limit_406_is_terminal(monkeypatch, error):
