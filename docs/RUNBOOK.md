@@ -852,4 +852,4 @@ An OpenRouter 403 whose body reads `Key limit exceeded (total limit)` is the
 key's own credit limit, not the model or a region block. Check it without
 printing the key: `GET https://openrouter.ai/api/v1/key` returns `limit`,
 `limit_remaining` and `usage`. The fix is raising the limit on the key in the
-OpenRouter dashboard, or rotating `/infra/llm/openrouter_api_key`.
+OpenRouter dashboard, or rotating the key in its secret store.
