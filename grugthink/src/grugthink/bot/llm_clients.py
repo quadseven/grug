@@ -205,9 +205,13 @@ def _post_before(endpoint: str, payload: dict[str, Any], remaining_s: float, dea
 
 
 def _ollama_reply_text(body: Any, openai_compatible: bool) -> str:
+    """The reply text, or "" for a malformed body (which then counts as no
+    usable reply, so the fallback chain engages)."""
+    if not isinstance(body, dict):
+        return ""
     if openai_compatible:
-        return body["choices"][0]["message"]["content"].strip()
-    return body.get("response", "").strip()
+        return _extract_chat_message(body)
+    return (body.get("response") or "").strip()
 
 
 def query_ollama_api(

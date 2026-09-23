@@ -303,6 +303,19 @@ class TestOllamaDeadline:
         assert "Unexpected error in Ollama request" not in messages
         assert resp.closed
 
+    @pytest.mark.parametrize("openai", [False, True])
+    @pytest.mark.parametrize(
+        "body",
+        [b"[]", b"{}", b'{"response": null}', b'{"choices": []}', b'{"choices": [{"message": null}]}'],
+    )
+    def test_malformed_200_body_is_no_reply_not_a_crash(self, monkeypatch, clock, openai, body):
+        monkeypatch.delenv("GRUGTHINK_OLLAMA_TIMEOUT_S", raising=False)
+        monkeypatch.setenv("GRUGTHINK_LLM_API", "openai" if openai else "ollama")
+        resp = _StreamedResponse(clock, [body], step_s=1)
+        with patch.object(llm_clients_module.log, "error") as log_error:
+            assert self._run(monkeypatch, lambda *a, **k: resp) is None
+        assert "Unexpected error in Ollama request" not in [c.args[0] for c in log_error.call_args_list]
+
     def test_timeout_log_reports_the_budget(self, monkeypatch, clock):
         monkeypatch.setenv("GRUGTHINK_OLLAMA_TIMEOUT_S", "120")
         with patch.object(llm_clients_module.log, "error") as log_error:
