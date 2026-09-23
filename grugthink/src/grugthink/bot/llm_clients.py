@@ -130,7 +130,84 @@ def _read_json_before(r: requests.Response, deadline: float) -> Any:
         chunks.append(chunk)
         if time.monotonic() > deadline:
             raise requests.exceptions.ReadTimeout("Ollama primary deadline passed while reading the response")
-    return json.loads(b"".join(chunks))
+    body = b"".join(chunks)
+    try:
+        return json.loads(body)
+    except ValueError as e:
+        # A truncated or non-JSON 200 body (a proxy error page, a gateway that
+        # died after the headers) is a transport failure: raise it as one so
+        # the RequestException handler names it and the fallback engages.
+        raise requests.exceptions.InvalidJSONError(
+            f"Ollama 200 response body is not JSON ({len(body)} bytes): {e}"
+        ) from e
+
+
+# X-Spark-Priority: this URL is the in-cluster spark-gateway (OLLAMA_URLS is
+# set to it in k8s/deployment.yaml, not to the Sparks directly) - a Discord
+# reply is latency-sensitive and must never queue behind one of Hermes's
+# long agentic turns on the shared Ollama target. "realtime" (not
+# "interactive"): live incident 2026-07-13 - this call queued behind Grug's
+# OWN code-review calls (both tagged "interactive", FIFO within the tier put
+# chat second) for 24+ minutes with no client-side timeout ever firing (the
+# gateway's queue-wait heartbeat kept resetting it). A stalled Discord reply
+# reads as "the bot is broken" within seconds, so it needs to win over
+# Grug's own async review work, not just over Hermes's batch turns.
+# X-Spark-Caller identifies this consumer in the gateway's own
+# metrics/dashboard instead of falling back to a generic "python (ip)" UA
+# guess. Harmless if OLLAMA_URLS ever points straight at a Spark instead -
+# Ollama ignores unknown headers.
+_OLLAMA_HEADERS = {"X-Spark-Priority": "realtime", "X-Spark-Caller": "grugthink-chat"}
+
+
+def _ollama_request(url: str, model: str, prompt_text: str, openai_compatible: bool) -> tuple[str, dict[str, Any]]:
+    """(endpoint, payload) for one primary attempt."""
+    if openai_compatible:
+        return f"{url}/v1/chat/completions", {
+            "model": model,
+            "messages": [{"role": "user", "content": prompt_text}],
+            "stream": False,
+            "temperature": 0.5,
+            "top_p": 0.7,
+            "max_tokens": 150,
+            "chat_template_kwargs": {"enable_thinking": False},
+        }
+    return f"{url}/api/generate", {
+        "model": model,
+        "prompt": prompt_text,
+        "stream": False,
+        # Disable the model's reasoning mode. Qwen3 (and other thinking
+        # models on the gateway) otherwise spend the WHOLE num_predict
+        # budget on internal <think> tokens, returning an empty `response`
+        # (done_reason=length) - which the caller reads as None and the
+        # bot posts nothing. Verified live: think=false -> real reply.
+        "think": False,
+        # 150 (was 80): richer replies now that reasoning tokens no longer
+        # eat the budget. temperature 0.5 for a little more personality.
+        "options": {"num_predict": 150, "temperature": 0.5, "top_p": 0.7, "stop": ["<END>"]},
+    }
+
+
+def _post_before(endpoint: str, payload: dict[str, Any], remaining_s: float, deadline: float) -> tuple[int, Any]:
+    """One primary POST inside the remaining budget: (status_code, parsed
+    body or None for a non-200). The connection is always released."""
+    r = session.post(
+        endpoint,
+        json=payload,
+        headers=_OLLAMA_HEADERS,
+        timeout=(min(_OLLAMA_CONNECT_TIMEOUT_S, remaining_s), remaining_s),
+        stream=True,
+    )
+    try:
+        body = _read_json_before(r, deadline) if r.status_code == 200 else None
+    finally:
+        r.close()
+    return r.status_code, body
+
+
+def _ollama_reply_text(body: Any, openai_compatible: bool) -> str:
+    if openai_compatible:
+        return body["choices"][0]["message"]["content"].strip()
+    return body.get("response", "").strip()
 
 
 def query_ollama_api(
@@ -193,66 +270,10 @@ def query_ollama_api(
         start_ns = time.monotonic_ns()
         with _llmobs_llm(model_name=raw_model, model_provider="ollama", name=_LLMOBS_NAME) as span:
             try:
-                payload = {
-                    "model": raw_model,
-                    "prompt": prompt_text,
-                    "stream": False,
-                    # Disable the model's reasoning mode. Qwen3 (and other thinking
-                    # models on the gateway) otherwise spend the WHOLE num_predict
-                    # budget on internal <think> tokens, returning an empty `response`
-                    # (done_reason=length) - which the caller reads as None and the
-                    # bot posts nothing. Verified live: think=false -> real reply.
-                    "think": False,
-                    # 150 (was 80): richer replies now that reasoning tokens no longer
-                    # eat the budget. temperature 0.5 for a little more personality.
-                    "options": {"num_predict": 150, "temperature": 0.5, "top_p": 0.7, "stop": ["<END>"]},
-                }
-                # X-Spark-Priority (quadseven/infra#1768/#1770/#1773): this URL is
-                # the in-cluster spark-gateway (OLLAMA_URLS is set to it in
-                # k8s/deployment.yaml, not to the Sparks directly) - a Discord
-                # reply is latency-sensitive and must never queue behind one of
-                # Hermes's long agentic turns on the shared Ollama target.
-                # "realtime" (not "interactive"): live incident 2026-07-13 -
-                # this call queued behind Grug's OWN code-review calls (both
-                # tagged "interactive", FIFO within the tier put chat second)
-                # for 24+ minutes with no client-side timeout ever firing (the
-                # gateway's queue-wait heartbeat kept resetting it). A stalled
-                # Discord reply reads as "the bot is broken" within seconds, so
-                # it needs to win over Grug's own async review work, not just
-                # over Hermes's batch turns.
-                # X-Spark-Caller identifies this consumer in the gateway's own
-                # metrics/dashboard instead of falling back to a generic
-                # "python (ip)" UA guess. Harmless if OLLAMA_URLS ever points
-                # straight at a Spark instead - Ollama ignores unknown headers.
-                headers = {"X-Spark-Priority": "realtime", "X-Spark-Caller": "grugthink-chat"}
-                endpoint = f"{url}/api/generate"
-                if openai_compatible:
-                    endpoint = f"{url}/v1/chat/completions"
-                    payload = {
-                        "model": raw_model,
-                        "messages": [{"role": "user", "content": prompt_text}],
-                        "stream": False,
-                        "temperature": 0.5,
-                        "top_p": 0.7,
-                        "max_tokens": 150,
-                        "chat_template_kwargs": {"enable_thinking": False},
-                    }
-                r = session.post(
-                    endpoint,
-                    json=payload,
-                    headers=headers,
-                    timeout=(min(_OLLAMA_CONNECT_TIMEOUT_S, remaining_s), remaining_s),
-                    stream=True,
-                )
-                try:
-                    response_body = _read_json_before(r, deadline) if r.status_code == 200 else None
-                finally:
-                    r.close()
-                if r.status_code == 200:
-                    if openai_compatible:
-                        response = response_body["choices"][0]["message"]["content"].strip()
-                    else:
-                        response = response_body.get("response", "").strip()
+                endpoint, payload = _ollama_request(url, raw_model, prompt_text, openai_compatible)
+                status_code, response_body = _post_before(endpoint, payload, remaining_s, deadline)
+                if status_code == 200:
+                    response = _ollama_reply_text(response_body, openai_compatible)
                     log.info(
                         "Ollama API response received",
                         extra={
@@ -268,7 +289,7 @@ def query_ollama_api(
                         span=span,
                         input_data=prompt_text,
                         output_data=response,
-                        metadata={"model": raw_model, "url": url, "status_code": r.status_code},
+                        metadata={"model": raw_model, "url": url, "status_code": status_code},
                         metrics={"latency_ms": _elapsed_ms(start_ns)},
                         tags=span_tags,
                     )
@@ -278,12 +299,12 @@ def query_ollama_api(
                 else:
                     log.warning(
                         "Ollama API returned error",
-                        extra={"bot_id": bot_id, "url": url, "status_code": r.status_code, "model": raw_model},
+                        extra={"bot_id": bot_id, "url": url, "status_code": status_code, "model": raw_model},
                     )
                     _llmobs_annotate(
                         span=span,
                         input_data=prompt_text,
-                        metadata={"model": raw_model, "url": url, "error": f"http_{r.status_code}"},
+                        metadata={"model": raw_model, "url": url, "error": f"http_{status_code}"},
                         metrics={"latency_ms": _elapsed_ms(start_ns)},
                         tags=span_tags,
                     )

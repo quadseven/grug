@@ -66,6 +66,12 @@ class TestVerdictLayerNeverDestroysContent:
         text = "Grug say TRUE. Grug mean it. Fire hot and Bork scared."
         assert _validate(text) == text
 
+    def test_capitalized_closing_word_is_not_a_trailer(self):
+        """The trailer marker is case-sensitive: only UPPERCASE TRUE/FALSE
+        is the prompt's format label."""
+        text = "Grug hunt all morning and find nothing. False: Grug find one rabbit."
+        assert _validate(text) == text
+
     def test_lowercase_true_inside_prose_is_not_a_verdict(self):
         text = "Grug think that is true, fire hot and Bork scared of big flame."
         assert _validate(text) == text
@@ -282,6 +288,19 @@ class TestOllamaDeadline:
         body = b'{"response": "TRUE - Grug fine today."}'
         resp = _StreamedResponse(clock, [b" ", b" ", body], step_s=15)
         assert self._run(monkeypatch, lambda *a, **k: resp) == "TRUE - Grug fine today."
+        assert resp.closed
+
+    def test_non_json_200_body_is_a_named_request_failure(self, monkeypatch, clock):
+        """A truncated or HTML 200 body must surface as a RequestException
+        (so the transport handler names it), not as an 'unexpected' error."""
+        monkeypatch.delenv("GRUGTHINK_OLLAMA_TIMEOUT_S", raising=False)
+        resp = _StreamedResponse(clock, [b"<html>bad gateway"], step_s=1)
+        with patch.object(llm_clients_module.log, "error") as log_error:
+            assert self._run(monkeypatch, lambda *a, **k: resp) is None
+
+        messages = [c.args[0] for c in log_error.call_args_list]
+        assert "Ollama request failed" in messages
+        assert "Unexpected error in Ollama request" not in messages
         assert resp.closed
 
     def test_timeout_log_reports_the_budget(self, monkeypatch, clock):

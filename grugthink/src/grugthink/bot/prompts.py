@@ -582,7 +582,7 @@ def _final_trailer(response: str) -> Optional[re.Match]:
 
 
 def _is_substantive(text: str) -> bool:
-    """Minimum bar for a reply worth posting: 4+ words, 20+ characters."""
+    """Minimum bar for a reply worth posting: at least 4 words and 20 characters."""
     return len(text.split()) >= 4 and len(text) >= 20
 
 
