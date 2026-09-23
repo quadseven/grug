@@ -742,6 +742,24 @@ _LEARN_UNUSABLE_BODY = (
 _LEARN_UNUSABLE: Any = object()  # sentinel: classifier refused, not a verdict
 
 
+def _post_learn_reply(
+    install_id: int, owner: str, repo_name: str, pr_number: int,
+    parent_comment_id: int, body: str,
+) -> None:
+    """Reply in the finding's review thread. Raises on failure; each caller
+    decides whether that failure is worth a redrive."""
+    from urllib.parse import quote as _q
+
+    def _reply(token: str) -> None:
+        _gh_post(
+            token,
+            f"{_GH_API}/repos/{_q(owner, safe='')}/{_q(repo_name, safe='')}"
+            f"/pulls/{pr_number}/comments/{parent_comment_id}/replies",
+            {"body": body},
+        )
+    with_install_token_retry(install_id, _reply)
+
+
 def _run_learn(
     install_id: int, repo_full: str, pr_number: int,
     comment_id: int, parent_comment_id: int, reply_text: str,
@@ -752,10 +770,11 @@ def _run_learn(
 
     A classifier BACKEND failure raises for SQS redrive (a transient outage
     must not be mislabeled a deliberate one-off, and no ack is posted so the
-    retry can succeed). A definite verdict (durable OR one-off) is win-once
+    retry can succeed). The exception is every backend answering 401/402/
+    403/404, which no retry clears: the job completes with a notice in the
+    thread instead. A definite verdict (durable OR one-off) is win-once
     per reply comment: the first run acks, a redelivery is a no-op, so the
     finding thread never gets duplicate acknowledgments."""
-    from urllib.parse import quote as _q
     from adapters.install_store import (  # type: ignore
         claim_delivery, get_comment_record, get_learning_by_source_comment,
         put_learning,
@@ -818,14 +837,21 @@ def _run_learn(
     # storing before the claim means a later put/ack failure can never lose the
     # learning (the claim, made only for the ACK, would otherwise short-circuit
     # the retry and drop the rule entirely). FLINT data-integrity fix.
-    claim_key = f"learn:{comment_id}"
     if classification is _LEARN_UNUSABLE:
-        # Nothing to store. Own claim key, so this notice can never block the
-        # ack of a later successful classification of the same reply.
-        ack = _LEARN_UNUSABLE_BODY
-        result = "learn_classifier_unusable"
-        claim_key = f"learn-unusable:{comment_id}"
-    elif classification["durable"]:
+        # Nothing to store. Unlike the courtesy ack this notice is the
+        # maintainer's only cue to re-reply, so it is at-least-once: no
+        # win-once claim (a claim taken before a failed post would swallow
+        # the retry), and a failed post raises for redrive. A rare SQS
+        # duplicate delivery can repeat it; a lost one cannot be recovered.
+        _post_learn_reply(
+            install_id, owner, repo_name, pr_number, parent_comment_id,
+            _LEARN_UNUSABLE_BODY,
+        )
+        log.info("learn_classified", extra={
+            "repo": repo_full, "pr": pr_number, "comment_id": comment_id,
+            "result": "learn_classifier_unusable"})
+        return "learn_classifier_unusable"
+    if classification["durable"]:
         put_learning(
             repo=repo_full,
             text=classification["learning"],
@@ -846,32 +872,26 @@ def _run_learn(
     # The claim guards ONLY the ack (the one non-idempotent side effect): a
     # redelivery whose learning is already stored must not re-post the reply.
     # A genuine RE-TEACH is a NEW reply comment (distinct claim), so it acks.
-    if not claim_delivery(claim_key):
+    if not claim_delivery(f"learn:{comment_id}"):
         log.info("learn_already_acked", extra={
             "repo": repo_full, "pr": pr_number, "comment_id": comment_id})
         return "learn_duplicate"
 
-    def _reply(token: str) -> None:
-        _gh_post(
-            token,
-            f"{_GH_API}/repos/{_q(owner, safe='')}/{_q(repo_name, safe='')}"
-            f"/pulls/{pr_number}/comments/{parent_comment_id}/replies",
-            {"body": ack},
-        )
     # Best-effort: the learning is already durably stored, so a transient reply
     # failure must NOT redrive (which would re-classify + risk a wrong verdict)
     # nor raise - it just costs the courtesy ack, which a re-teach would repost.
     try:
-        with_install_token_retry(install_id, _reply)
+        _post_learn_reply(
+            install_id, owner, repo_name, pr_number, parent_comment_id, ack,
+        )
     except Exception as e:  # noqa: BLE001
         log.warning("learn_ack_post_failed", extra={
             "repo": repo_full, "pr": pr_number, "comment_id": comment_id,
             "kind": type(e).__name__})
-    if result != "learn_classifier_unusable":  # not a classification
-        try:
-            emit_gauge("grug.learnings.classified", 1)
-        except Exception:  # noqa: BLE001
-            pass
+    try:
+        emit_gauge("grug.learnings.classified", 1)
+    except Exception:  # noqa: BLE001
+        pass
     log.info("learn_classified", extra={
         "repo": repo_full, "pr": pr_number, "comment_id": comment_id,
         "result": result})

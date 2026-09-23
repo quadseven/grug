@@ -2251,8 +2251,8 @@ class LearningClassification(TypedDict):
 
 
 class LearnClassifierUnusable(RuntimeError):
-    """Every classifier backend refused for a config/billing reason
-    (401/402/403/404, or a missing key). No redrive can succeed until an
+    """Every classifier backend answered 401/402/403/404: a dead key, an
+    unpaid bill, or a gone model. No redrive can succeed until an
     operator fixes the backend, so the caller completes instead of retrying.
     `statuses` names each backend and why, e.g. "openrouter:http_403"."""
 
@@ -2355,15 +2355,10 @@ def classify_learning(
         ) as span:
             try:
                 resp = _call_backend(config, messages)
-            except _BackendConfigError as e:
-                unusable.append(f"{backend.value}:config")
-                _annotate_interactive(
-                    span, backend=backend, kind="transport_error",
-                    messages=messages, start_ns=start_ns, pr_tags=pr_tags,
-                    error=type(e).__name__,
-                )
-                continue
-            except (httpx.RequestError, httpx.TimeoutException) as e:
+            except (_BackendConfigError, httpx.RequestError, httpx.TimeoutException) as e:
+                # Not counted as unusable: _BackendConfigError also wraps a
+                # transient SSM failure loading the key, which a retry clears.
+                # Only the backend's own 401/402/403/404 answer is proof.
                 _annotate_interactive(
                     span, backend=backend, kind="transport_error",
                     messages=messages, start_ns=start_ns, pr_tags=pr_tags,

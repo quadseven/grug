@@ -3573,6 +3573,19 @@ def test_classify_learning_one_terminal_one_transient_stays_retryable(monkeypatc
     assert out is None
 
 
+def test_classify_learning_key_load_failure_stays_retryable(monkeypatch) -> None:
+    # _BackendConfigError also wraps a transient SSM failure loading the key,
+    # which a retry clears, so it must never count as unusable.
+    def ssm_blip():
+        raise RuntimeError("ssm throttled")
+    monkeypatch.setattr(lc, "_load_poolside_key", ssm_blip)
+    monkeypatch.setattr(lc, "_load_openrouter_key", ssm_blip)
+    with patch.object(httpx, "post") as post:
+        out = lc.classify_learning("q", "f", {"rule_name": "r"}, installation_id=2)
+    assert out is None
+    assert post.call_count == 0
+
+
 def test_classify_learning_logs_a_terminal_status_as_unusable(caplog) -> None:
     # The llm_backend_unusable monitor is the operator's only signal that a
     # key is dead. The learn path never emitted it, so a key rejected on

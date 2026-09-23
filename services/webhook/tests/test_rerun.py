@@ -1697,10 +1697,9 @@ def test_run_learn_every_backend_unusable_completes_without_redrive(monkeypatch,
     When EVERY backend is unusable for a config/billing reason no redrive can
     succeed, so the job completes: nothing stored, and the maintainer is told
     in the thread that the reply was not judged (re-replying is the replay
-    path), under a claim key that cannot block a later real ack."""
+    path). No win-once claim: it would swallow the retry of a failed post."""
     import llm_client
     posted = []
-    claims = []
     monkeypatch.setattr(
         "adapters.install_store.get_learning_by_source_comment",
         lambda repo, cid: None,
@@ -1712,7 +1711,7 @@ def test_run_learn_every_backend_unusable_completes_without_redrive(monkeypatch,
     monkeypatch.setattr("adapters.install_store.put_learning",
                         lambda **kw: (_ for _ in ()).throw(AssertionError("must not store")))
     monkeypatch.setattr("adapters.install_store.claim_delivery",
-                        lambda k: claims.append(k) or True)
+                        lambda k: (_ for _ in ()).throw(AssertionError("must not claim")))
     gauges = []
     monkeypatch.setattr("observability.emit_gauge", lambda *a, **k: gauges.append(a))
 
@@ -1726,7 +1725,6 @@ def test_run_learn_every_backend_unusable_completes_without_redrive(monkeypatch,
         result = rerun._run_learn(11, "o/r", 7, 5001, 4000, "?")
 
     assert result == "learn_classifier_unusable"
-    assert claims == ["learn-unusable:5001"]  # never the success ack's key
     assert posted and "/pulls/7/comments/4000/replies" in posted[0][0]
     assert posted[0][1]["body"] == rerun._LEARN_UNUSABLE_BODY
     assert gauges == []  # not a classification
@@ -1734,9 +1732,10 @@ def test_run_learn_every_backend_unusable_completes_without_redrive(monkeypatch,
     assert unusable_logs and unusable_logs[0].statuses == ["openrouter:http_403", "poolside:http_401"]
 
 
-def test_run_learn_unusable_notice_is_win_once(monkeypatch):
+def test_run_learn_unusable_notice_post_failure_redrives(monkeypatch):
+    """The notice is the maintainer's only replay cue, so a failed post must
+    raise for redrive rather than complete the job with nothing said."""
     import llm_client
-    posted = []
     monkeypatch.setattr(
         "adapters.install_store.get_learning_by_source_comment",
         lambda repo, cid: None,
@@ -1745,16 +1744,18 @@ def test_run_learn_unusable_notice_is_win_once(monkeypatch):
         "adapters.install_store.get_comment_record",
         lambda iid, cid: {"finding_text": "x", "finding_tags": {"rule_name": "r"}},
     )
-    monkeypatch.setattr("adapters.install_store.claim_delivery", lambda k: False)
 
     def unusable(*a, **k):
         raise llm_client.LearnClassifierUnusable(("openrouter:http_403",))
     monkeypatch.setattr("llm_client.classify_learning", unusable)
     monkeypatch.setattr(rerun, "with_install_token_retry", lambda iid, fn: fn("tok"))
-    monkeypatch.setattr(rerun, "_gh_post", lambda token, url, body: posted.append(body))
 
-    assert rerun._run_learn(11, "o/r", 7, 5001, 4000, "?") == "learn_duplicate"
-    assert posted == []
+    def github_down(token, url, body):
+        raise httpx.ConnectError("github down")
+    monkeypatch.setattr(rerun, "_gh_post", github_down)
+
+    with pytest.raises(httpx.ConnectError):
+        rerun._run_learn(11, "o/r", 7, 5001, 4000, "?")
 
 
 def test_run_learn_redelivery_is_win_once(monkeypatch):
