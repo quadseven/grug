@@ -750,7 +750,7 @@ def _run_learn(
         claim_delivery, get_comment_record, get_learning_by_source_comment,
         put_learning,
     )
-    from llm_client import classify_learning  # type: ignore
+    from llm_client import LearnClassifierUnusable, classify_learning  # type: ignore
     from observability import emit_gauge  # type: ignore
 
     owner, _, repo_name = repo_full.partition("/")
@@ -777,13 +777,23 @@ def _run_learn(
     else:
         finding_text = str(record.get("finding_text", ""))
         finding_tags = dict(record.get("finding_tags", {}))
-        classification = classify_learning(
-            reply_text, finding_text, finding_tags, install_id,
-            pr_context={
-                "installation_id": install_id, "repo": repo_full,
-                "pr_number": pr_number,
-            },
-        )
+        try:
+            classification = classify_learning(
+                reply_text, finding_text, finding_tags, install_id,
+                pr_context={
+                    "installation_id": install_id, "repo": repo_full,
+                    "pr_number": pr_number,
+                },
+            )
+        except LearnClassifierUnusable as e:
+            # Every backend refused for a config/billing reason (a dead or
+            # over-limit key). No redrive clears that, so retrying only walks
+            # the job into the rerun DLQ. Complete without store/claim/ack;
+            # the operator signal is llm_backend_unusable plus this line.
+            log.error("learn_classifier_unusable", extra={
+                "repo": repo_full, "pr": pr_number, "comment_id": comment_id,
+                "statuses": list(e.statuses)})
+            return "learn_classifier_unusable"
     if classification is None:
         # Transient: backend down or unparseable. Raise for redrive rather
         # than tell the maintainer their durable rule was judged one-off.

@@ -7,6 +7,7 @@ skipped (not retried); an infra failure RAISES so the ESM retries → DLQ.
 from __future__ import annotations
 
 import json
+import logging
 import threading
 from unittest.mock import ANY, MagicMock, patch
 
@@ -1688,6 +1689,40 @@ def test_run_learn_classifier_none_raises_for_redrive(monkeypatch):
     with pytest.raises(RuntimeError, match="classifier unavailable"):
         rerun._run_learn(11, "o/r", 7, 5001, 4000, "?")
     assert posted == []  # no misleading ack posted on the failure path
+
+
+def test_run_learn_every_backend_unusable_completes_without_redrive(monkeypatch, caplog):
+    """2026-09-23: with the OpenRouter key over its limit, every retry of a
+    learn job whose other backend also failed walked toward the rerun DLQ.
+    When EVERY backend is unusable for a config/billing reason no redrive can
+    succeed, so the job completes (no store, no claim, no ack) and says why."""
+    import llm_client
+    posted = []
+    monkeypatch.setattr(
+        "adapters.install_store.get_learning_by_source_comment",
+        lambda repo, cid: None,
+    )
+    monkeypatch.setattr(
+        "adapters.install_store.get_comment_record",
+        lambda iid, cid: {"finding_text": "x", "finding_tags": {"rule_name": "r"}},
+    )
+    monkeypatch.setattr("adapters.install_store.put_learning",
+                        lambda **kw: (_ for _ in ()).throw(AssertionError("must not store")))
+    monkeypatch.setattr("adapters.install_store.claim_delivery",
+                        lambda k: (_ for _ in ()).throw(AssertionError("must not claim")))
+
+    def unusable(*a, **k):
+        raise llm_client.LearnClassifierUnusable(("openrouter:http_403", "poolside:http_401"))
+    monkeypatch.setattr("llm_client.classify_learning", unusable)
+    monkeypatch.setattr(rerun, "_gh_post", lambda token, url, body: posted.append(body))
+
+    with caplog.at_level(logging.ERROR):
+        result = rerun._run_learn(11, "o/r", 7, 5001, 4000, "?")
+
+    assert result == "learn_classifier_unusable"
+    assert posted == []
+    unusable_logs = [r for r in caplog.records if r.msg == "learn_classifier_unusable"]
+    assert unusable_logs and unusable_logs[0].statuses == ["openrouter:http_403", "poolside:http_401"]
 
 
 def test_run_learn_redelivery_is_win_once(monkeypatch):

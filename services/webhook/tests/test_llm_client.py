@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import json
+import logging
 from dataclasses import replace
 from unittest.mock import patch
 
@@ -3519,6 +3520,73 @@ def test_classify_learning_string_durable_is_rejected() -> None:
         out = lc.classify_learning("q", "f", {"rule_name": "r"}, installation_id=2)
     # non-boolean durable -> parse failure on both backends -> None (redrive)
     assert out is None
+
+
+@pytest.mark.parametrize("content", [
+    # Both shapes are live Poolside answers from 2026-09-23 that failed to
+    # parse and fell over to a dead OpenRouter key: a complete JSON object
+    # followed by a stray bracket, and one followed by a prose note.
+    '{"durable": false, "learning": "", "scope_path": ""}]',
+    '{\n  "durable": false,\n  "learning": "",\n  "scope_path": ""\n}\n\n'
+    'Grug note: reply only verifies this one file and one PR',
+])
+def test_classify_learning_accepts_a_complete_object_with_trailing_text(content) -> None:
+    response = httpx.Response(200, json=_openai_json_response(content))
+    with patch.object(httpx, "post", return_value=response) as post:
+        out = lc.classify_learning("q", "f", {"rule_name": "r"}, installation_id=2)
+    assert out == {"durable": False, "learning": "", "scope_path": ""}
+    assert post.call_count == 1  # the primary answered; no failover spent
+
+
+def test_classify_learning_still_rejects_prose_before_the_object() -> None:
+    # Only TRAILING text is tolerated: an answer that opens with prose is not
+    # the JSON-only shape asked for, so it stays a parse failure (redrive).
+    content = 'Sure! {"durable": true, "learning": "x", "scope_path": ""}'
+    response = httpx.Response(200, json=_openai_json_response(content))
+    with patch.object(httpx, "post", return_value=response):
+        out = lc.classify_learning("q", "f", {"rule_name": "r"}, installation_id=2)
+    assert out is None
+
+
+@pytest.mark.parametrize("status", [401, 402, 403, 404])
+def test_classify_learning_raises_unusable_when_every_backend_is_terminal(status) -> None:
+    # 2026-09-23: OpenRouter answered "Key limit exceeded (total limit)" 403
+    # on every call. When EVERY backend is unusable for a config/billing
+    # reason no redrive can succeed, so the caller must be told that apart
+    # from a transient miss.
+    response = httpx.Response(status, json={"error": {"code": status}})
+    with patch.object(httpx, "post", return_value=response):
+        with pytest.raises(lc.LearnClassifierUnusable) as info:
+            lc.classify_learning("q", "f", {"rule_name": "r"}, installation_id=2)
+    assert set(info.value.statuses) == {f"poolside:http_{status}", f"openrouter:http_{status}"}
+
+
+def test_classify_learning_one_terminal_one_transient_stays_retryable(monkeypatch) -> None:
+    # The live mix: one backend dead (403), the other merely flaky (503).
+    # A retry can still succeed on the flaky one, so this is a plain None.
+    monkeypatch.setattr(lc, "_RETRY_SLEEP", lambda s: None)
+
+    def fake_post(url, **kw):
+        return httpx.Response(403 if "openrouter" in url else 503, json={})
+    with patch.object(httpx, "post", side_effect=fake_post):
+        out = lc.classify_learning("q", "f", {"rule_name": "r"}, installation_id=2)
+    assert out is None
+
+
+def test_classify_learning_logs_a_terminal_status_as_unusable(caplog) -> None:
+    # The llm_backend_unusable monitor is the operator's only signal that a
+    # key is dead. The learn path never emitted it, so a key rejected on
+    # every call since 2026-09-22 went unpaged.
+    def fake_post(url, **kw):
+        if "openrouter" in url:
+            return httpx.Response(403, json={})
+        return httpx.Response(200, json=_openai_json_response(
+            '{"durable": false, "learning": "", "scope_path": ""}'))
+    with caplog.at_level(logging.ERROR, logger=lc.log.name):
+        with patch.object(httpx, "post", side_effect=fake_post):
+            out = lc.classify_learning("q", "f", {"rule_name": "r"}, installation_id=3)
+    assert out is not None  # odd install: OpenRouter primary, Poolside answers
+    assert [r.msg for r in caplog.records] == ["llm_backend_unusable"]
 
 
 def test_render_learnings_block_redacts_secret_before_truncation() -> None:
