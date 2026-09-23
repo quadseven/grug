@@ -731,6 +731,16 @@ _LEARN_DECLINE_BODY = (
     "tribe if you want it remembered."
 )
 
+# Every classifier backend is refusing for a config/billing reason. The reply
+# was NOT judged; saying so (instead of silence) is the maintainer's cue that a
+# re-reply later is how it gets remembered.
+_LEARN_UNUSABLE_BODY = (
+    "Grug could not think on this right now - the thinking-stones are cold, "
+    "and Grug did not judge it. Nothing was remembered. If this is a rule for "
+    "the whole tribe, reply again later and Grug will carve it."
+)
+_LEARN_UNUSABLE: Any = object()  # sentinel: classifier refused, not a verdict
+
 
 def _run_learn(
     install_id: int, repo_full: str, pr_number: int,
@@ -788,12 +798,15 @@ def _run_learn(
         except LearnClassifierUnusable as e:
             # Every backend refused for a config/billing reason (a dead or
             # over-limit key). No redrive clears that, so retrying only walks
-            # the job into the rerun DLQ. Complete without store/claim/ack;
-            # the operator signal is llm_backend_unusable plus this line.
+            # the job into the rerun DLQ. Complete instead, and tell the
+            # maintainer in the thread: re-replying after the fix is the
+            # replay path (a new reply is a new job), so the reply is never
+            # dropped silently. Operators get llm_backend_unusable plus this
+            # line, which names the reply to replay.
             log.error("learn_classifier_unusable", extra={
                 "repo": repo_full, "pr": pr_number, "comment_id": comment_id,
                 "statuses": list(e.statuses)})
-            return "learn_classifier_unusable"
+            classification = _LEARN_UNUSABLE
     if classification is None:
         # Transient: backend down or unparseable. Raise for redrive rather
         # than tell the maintainer their durable rule was judged one-off.
@@ -805,7 +818,14 @@ def _run_learn(
     # storing before the claim means a later put/ack failure can never lose the
     # learning (the claim, made only for the ACK, would otherwise short-circuit
     # the retry and drop the rule entirely). FLINT data-integrity fix.
-    if classification["durable"]:
+    claim_key = f"learn:{comment_id}"
+    if classification is _LEARN_UNUSABLE:
+        # Nothing to store. Own claim key, so this notice can never block the
+        # ack of a later successful classification of the same reply.
+        ack = _LEARN_UNUSABLE_BODY
+        result = "learn_classifier_unusable"
+        claim_key = f"learn-unusable:{comment_id}"
+    elif classification["durable"]:
         put_learning(
             repo=repo_full,
             text=classification["learning"],
@@ -826,7 +846,7 @@ def _run_learn(
     # The claim guards ONLY the ack (the one non-idempotent side effect): a
     # redelivery whose learning is already stored must not re-post the reply.
     # A genuine RE-TEACH is a NEW reply comment (distinct claim), so it acks.
-    if not claim_delivery(f"learn:{comment_id}"):
+    if not claim_delivery(claim_key):
         log.info("learn_already_acked", extra={
             "repo": repo_full, "pr": pr_number, "comment_id": comment_id})
         return "learn_duplicate"
@@ -847,10 +867,11 @@ def _run_learn(
         log.warning("learn_ack_post_failed", extra={
             "repo": repo_full, "pr": pr_number, "comment_id": comment_id,
             "kind": type(e).__name__})
-    try:
-        emit_gauge("grug.learnings.classified", 1)
-    except Exception:  # noqa: BLE001
-        pass
+    if result != "learn_classifier_unusable":  # not a classification
+        try:
+            emit_gauge("grug.learnings.classified", 1)
+        except Exception:  # noqa: BLE001
+            pass
     log.info("learn_classified", extra={
         "repo": repo_full, "pr": pr_number, "comment_id": comment_id,
         "result": result})
