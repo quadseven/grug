@@ -2048,7 +2048,7 @@ def _is_diff_too_large(error: Exception) -> bool:
         return False
     try:
         body = response.json()  # type: ignore[union-attr]
-    except (ValueError, AttributeError):  # unreadable or non-JSON body: not the size limit
+    except ValueError:  # unreadable or non-JSON body: not the size limit
         return False
     errors = body.get("errors") if isinstance(body, dict) else None
     if not isinstance(errors, list):
