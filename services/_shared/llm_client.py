@@ -2250,6 +2250,28 @@ class LearningClassification(TypedDict):
     scope_path: str
 
 
+class LearnClassifierUnusable(RuntimeError):
+    """Every classifier backend answered 401/402/403/404: a dead key, an
+    unpaid bill, or a gone model. No redrive can succeed until an
+    operator fixes the backend, so the caller completes instead of retrying.
+    `statuses` names each backend and why, e.g. "openrouter:http_403"."""
+
+    def __init__(self, statuses: tuple[str, ...]) -> None:
+        super().__init__(f"learn classifier unusable: {', '.join(statuses)}")
+        self.statuses = statuses
+
+
+def _loads_leading_object(content: str) -> Any:
+    """Parse the JSON value the answer OPENS with, ignoring trailing text.
+
+    Live 2026-09-23, Poolside answered a well-formed object followed by a
+    stray `]` or a prose "Grug note", and `json.loads` rejected the whole
+    answer. Only trailing text is tolerated: an answer that opens with prose
+    is not the JSON-only shape asked for and still fails."""
+    value, _end = json.JSONDecoder().raw_decode(content.lstrip())
+    return value
+
+
 def _scope_covering_finding(scope: str, finding_file: str) -> str:
     """Keep a classifier-proposed scope glob only if it matches the file the
     finding was on. The classifier invents globs: live 2026-09-22 it scoped a
@@ -2275,8 +2297,9 @@ def classify_learning(
 ) -> Optional[LearningClassification]:
     """Decide whether a maintainer's reply to a finding is a DURABLE team
     preference to remember, or a one-off (#670, ADR-0020). Returns the
-    classification, or None on any backend/parse failure so the caller
-    declines gracefully. Biased toward one-off: `durable` is only true when
+    classification, or None on a failure a retry could clear (transport,
+    429/5xx, unparseable answer). Raises LearnClassifierUnusable when EVERY
+    backend refused for a config/billing reason, which no retry clears. Biased toward one-off: `durable` is only true when
     the model is confident the reply states a team-wide rule.
 
     When durable, `learning` is the reply restated as a short self-instructive
@@ -2317,7 +2340,12 @@ def classify_learning(
         )},
     ]
     pr_tags = _interactive_tags(installation_id, pr_context)
-    for backend in _interactive_backend_order(installation_id):
+    backends = _interactive_backend_order(installation_id)
+    # Backends that refused for a reason no retry changes. When this covers
+    # EVERY backend the failure is not transient, and saying so is what
+    # keeps a dead key from walking each learn job into the rerun DLQ.
+    unusable: list[str] = []
+    for backend in backends:
         config = _BACKEND_CONFIGS[backend]
         start_ns = time.monotonic_ns()
         with _llmobs_llm(
@@ -2328,6 +2356,9 @@ def classify_learning(
             try:
                 resp = _call_backend(config, messages)
             except (_BackendConfigError, httpx.RequestError, httpx.TimeoutException) as e:
+                # Not counted as unusable: _BackendConfigError also wraps a
+                # transient SSM failure loading the key, which a retry clears.
+                # Only the backend's own 401/402/403/404 answer is proof.
                 _annotate_interactive(
                     span, backend=backend, kind="transport_error",
                     messages=messages, start_ns=start_ns, pr_tags=pr_tags,
@@ -2335,6 +2366,14 @@ def classify_learning(
                 )
                 continue
             if not 200 <= resp.status_code < 300:
+                # Same token the review path uses, so the unusable-backend
+                # monitor sees a dead key on this path too.
+                _log_backend_failure(
+                    backend_value=backend.value, status=resp.status_code,
+                    error=f"http_{resp.status_code}",
+                )
+                if is_terminal_backend_failure(resp.status_code):
+                    unusable.append(f"{backend.value}:http_{resp.status_code}")
                 _annotate_interactive(
                     span, backend=backend, kind="http_error",
                     messages=messages, start_ns=start_ns, pr_tags=pr_tags,
@@ -2350,7 +2389,7 @@ def classify_learning(
             content = _choices_content(body)
             result: Optional[LearningClassification] = None
             try:
-                data = _json.loads(content) if content else {}
+                data = _loads_leading_object(content) if content else {}
                 if not isinstance(data, dict):
                     raise ValueError("learn payload not a dict")
                 raw_durable = data.get("durable", False)
@@ -2389,6 +2428,8 @@ def classify_learning(
                 content=content, body=body, status_code=resp.status_code,
             )
             return result
+    if len(unusable) == len(backends):
+        raise LearnClassifierUnusable(tuple(unusable))
     return None
 
 

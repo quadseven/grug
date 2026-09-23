@@ -7,6 +7,7 @@ skipped (not retried); an infra failure RAISES so the ESM retries → DLQ.
 from __future__ import annotations
 
 import json
+import logging
 import threading
 from unittest.mock import ANY, MagicMock, patch
 
@@ -1688,6 +1689,73 @@ def test_run_learn_classifier_none_raises_for_redrive(monkeypatch):
     with pytest.raises(RuntimeError, match="classifier unavailable"):
         rerun._run_learn(11, "o/r", 7, 5001, 4000, "?")
     assert posted == []  # no misleading ack posted on the failure path
+
+
+def test_run_learn_every_backend_unusable_completes_without_redrive(monkeypatch, caplog):
+    """2026-09-23: with the OpenRouter key over its limit, every retry of a
+    learn job whose other backend also failed walked toward the rerun DLQ.
+    When EVERY backend is unusable for a config/billing reason no redrive can
+    succeed, so the job completes: nothing stored, and the maintainer is told
+    in the thread that the reply was not judged (re-replying is the replay
+    path). No win-once claim: it would swallow the retry of a failed post."""
+    import llm_client
+    posted = []
+    monkeypatch.setattr(
+        "adapters.install_store.get_learning_by_source_comment",
+        lambda repo, cid: None,
+    )
+    monkeypatch.setattr(
+        "adapters.install_store.get_comment_record",
+        lambda iid, cid: {"finding_text": "x", "finding_tags": {"rule_name": "r"}},
+    )
+    monkeypatch.setattr("adapters.install_store.put_learning",
+                        lambda **kw: (_ for _ in ()).throw(AssertionError("must not store")))
+    monkeypatch.setattr("adapters.install_store.claim_delivery",
+                        lambda k: (_ for _ in ()).throw(AssertionError("must not claim")))
+    gauges = []
+    monkeypatch.setattr("observability.emit_gauge", lambda *a, **k: gauges.append(a))
+
+    def unusable(*a, **k):
+        raise llm_client.LearnClassifierUnusable(("openrouter:http_403", "poolside:http_401"))
+    monkeypatch.setattr("llm_client.classify_learning", unusable)
+    monkeypatch.setattr(rerun, "with_install_token_retry", lambda iid, fn: fn("tok"))
+    monkeypatch.setattr(rerun, "_gh_post", lambda token, url, body: posted.append((url, body)))
+
+    with caplog.at_level(logging.ERROR):
+        result = rerun._run_learn(11, "o/r", 7, 5001, 4000, "?")
+
+    assert result == "learn_classifier_unusable"
+    assert posted and "/pulls/7/comments/4000/replies" in posted[0][0]
+    assert posted[0][1]["body"] == rerun._LEARN_UNUSABLE_BODY
+    assert gauges == []  # not a classification
+    unusable_logs = [r for r in caplog.records if r.msg == "learn_classifier_unusable"]
+    assert unusable_logs and unusable_logs[0].statuses == ["openrouter:http_403", "poolside:http_401"]
+
+
+def test_run_learn_unusable_notice_post_failure_redrives(monkeypatch):
+    """The notice is the maintainer's only replay cue, so a failed post must
+    raise for redrive rather than complete the job with nothing said."""
+    import llm_client
+    monkeypatch.setattr(
+        "adapters.install_store.get_learning_by_source_comment",
+        lambda repo, cid: None,
+    )
+    monkeypatch.setattr(
+        "adapters.install_store.get_comment_record",
+        lambda iid, cid: {"finding_text": "x", "finding_tags": {"rule_name": "r"}},
+    )
+
+    def unusable(*a, **k):
+        raise llm_client.LearnClassifierUnusable(("openrouter:http_403",))
+    monkeypatch.setattr("llm_client.classify_learning", unusable)
+    monkeypatch.setattr(rerun, "with_install_token_retry", lambda iid, fn: fn("tok"))
+
+    def github_down(token, url, body):
+        raise httpx.ConnectError("github down")
+    monkeypatch.setattr(rerun, "_gh_post", github_down)
+
+    with pytest.raises(httpx.ConnectError):
+        rerun._run_learn(11, "o/r", 7, 5001, 4000, "?")
 
 
 def test_run_learn_redelivery_is_win_once(monkeypatch):

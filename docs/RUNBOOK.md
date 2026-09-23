@@ -836,3 +836,20 @@ fallback rather than degrading it evenly.
 OpenRouter as their **primary** backend via `select_backend`'s per-install
 round robin - not as a fallback. A dead SaaS backend degrades those directly,
 not just Elder's safety net.
+
+The reply-mined learn classifier (`classify_learning`, run from the rerun
+queue) does the same: primary by round robin, the other backend as failover.
+It logs `llm_backend_unusable` for a 401/402/403/404 like the review path.
+When EVERY backend refuses that way, the learn job completes with
+`learn_classifier_unusable` instead of redriving, because no retry clears a
+dead key and each retry walks the job toward the rerun DLQ. Nothing is
+stored; grug replies in the thread that it did not judge the reply, and the
+maintainer re-replying after the fix is the replay path. The
+`learn_classifier_unusable` log names the repo, PR and comment for each one.
+A 429/5xx or an unparseable answer still redrives.
+
+An OpenRouter 403 whose body reads `Key limit exceeded (total limit)` is the
+key's own credit limit, not the model or a region block. Check it without
+printing the key: `GET https://openrouter.ai/api/v1/key` returns `limit`,
+`limit_remaining` and `usage`. The fix is raising the limit on the key in the
+OpenRouter dashboard, or rotating the key in its secret store.
