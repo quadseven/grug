@@ -15,6 +15,7 @@ This module handles communication with different LLM backends:
   chain; this module just provides the per-backend calls).
 """
 
+import json
 import os
 import time
 from typing import Any
@@ -70,6 +71,68 @@ def _elapsed_ms(start_ns: int) -> int:
     return (time.monotonic_ns() - start_ns) // 1_000_000
 
 
+# Primary (Ollama/spark-gateway) budget: one wall-clock deadline for the
+# whole primary phase, across every OLLAMA_URLS entry.
+#
+# Defaults to 60s, overridable with GRUGTHINK_OLLAMA_TIMEOUT_S so a heavier
+# resident model can be given more room without a code change. 60s is
+# sized from measurements, not guessed (#1045, 2026-09-23, the persona
+# prompt at num_predict=150 through the gateway's spark:warm-any): warm
+# reply 0.85s end to end, cold model load plus reply 5.4s, so more than 10x
+# headroom over a cold load. The 2026-07 incident that raised this came
+# from a 122B model under two concurrent long coding turns; the resident
+# chat model is now a 30B MoE and chat is tagged realtime at the gateway.
+#
+# Why a deadline and not just a requests read timeout: a read timeout is
+# socket INACTIVITY, and the gateway sends a filler byte every ~15s while a
+# request is queued, which resets it every time. `_read_json_before` checks
+# the deadline between chunks, and each attempt's socket timeouts are the
+# budget remaining when it is sent, so the primary phase ends within 2x the
+# budget in the worst case (a read that starts just before the deadline).
+#
+# A client timeout does not cancel the generation on the server; it only
+# orphans it. The bounded fallback chain below still answers when the
+# primary truly stalls, so the budget only has to cover real latency.
+_OLLAMA_CONNECT_TIMEOUT_S = 10
+_OLLAMA_BUDGET_DEFAULT_S = 60
+# Upper bound on the override. At the cap the primary phase ends within
+# 2 x 400 = 800s, and every fallback tier (15 + 15 + 30s) still fits inside
+# Discord's 900s interaction-followup window.
+_OLLAMA_BUDGET_MAX_S = 400
+_OLLAMA_BUDGET_ENV = "GRUGTHINK_OLLAMA_TIMEOUT_S"
+_READ_CHUNK_BYTES = 8192
+
+
+def _ollama_budget_s() -> int:
+    """Wall-clock seconds for the primary phase. An unset, unparseable, or
+    out-of-range override falls back to the default, never to no limit."""
+    raw = os.getenv(_OLLAMA_BUDGET_ENV, "").strip()
+    if not raw:
+        return _OLLAMA_BUDGET_DEFAULT_S
+    try:
+        value = int(raw)
+    except ValueError:
+        value = 0
+    if 1 <= value <= _OLLAMA_BUDGET_MAX_S:
+        return value
+    log.warning(
+        "Ignoring invalid Ollama timeout override",
+        extra={"env": _OLLAMA_BUDGET_ENV, "value": raw, "default_s": _OLLAMA_BUDGET_DEFAULT_S},
+    )
+    return _OLLAMA_BUDGET_DEFAULT_S
+
+
+def _read_json_before(r: requests.Response, deadline: float) -> Any:
+    """Read a streamed JSON body, giving up once `deadline` (monotonic) has
+    passed even if filler bytes keep arriving."""
+    chunks = []
+    for chunk in r.iter_content(chunk_size=_READ_CHUNK_BYTES):
+        chunks.append(chunk)
+        if time.monotonic() > deadline:
+            raise requests.exceptions.ReadTimeout("Ollama primary deadline passed while reading the response")
+    return json.loads(b"".join(chunks))
+
+
 def query_ollama_api(
     prompt_text: str, cache_key: str, server_db=None, personality_name: str = None, bot_id: str = None
 ) -> str | None:
@@ -114,7 +177,16 @@ def query_ollama_api(
         )
         return None
 
+    budget_s = _ollama_budget_s()
+    deadline = time.monotonic() + budget_s
     for idx, url in enumerate(config.OLLAMA_URLS):
+        remaining_s = deadline - time.monotonic()
+        if remaining_s <= 0:
+            log.error(
+                "Ollama primary budget exhausted before trying every URL",
+                extra={"bot_id": bot_id, "budget_s": budget_s, "urls_tried": idx, "cache_key": cache_key},
+            )
+            break
         raw_model = config.OLLAMA_MODELS[idx] if idx < len(config.OLLAMA_MODELS) else config.OLLAMA_MODELS[0]
         openai_compatible = os.getenv("GRUGTHINK_LLM_API", "ollama").lower() == "openai"
         span_tags = {"bot_id": str(bot_id or ""), "personality": str(personality_name or "")}
@@ -135,9 +207,6 @@ def query_ollama_api(
                     # eat the budget. temperature 0.5 for a little more personality.
                     "options": {"num_predict": 150, "temperature": 0.5, "top_p": 0.7, "stop": ["<END>"]},
                 }
-                # (connect, read). Read raised 30->60s: the 122B chat model is slower
-                # than the old 3B default even with thinking off.
-                #
                 # X-Spark-Priority (quadseven/infra#1768/#1770/#1773): this URL is
                 # the in-cluster spark-gateway (OLLAMA_URLS is set to it in
                 # k8s/deployment.yaml, not to the Sparks directly) - a Discord
@@ -168,9 +237,18 @@ def query_ollama_api(
                         "max_tokens": 150,
                         "chat_template_kwargs": {"enable_thinking": False},
                     }
-                r = session.post(endpoint, json=payload, headers=headers, timeout=(10, 60))
+                r = session.post(
+                    endpoint,
+                    json=payload,
+                    headers=headers,
+                    timeout=(min(_OLLAMA_CONNECT_TIMEOUT_S, remaining_s), remaining_s),
+                    stream=True,
+                )
+                try:
+                    response_body = _read_json_before(r, deadline) if r.status_code == 200 else None
+                finally:
+                    r.close()
                 if r.status_code == 200:
-                    response_body = r.json()
                     if openai_compatible:
                         response = response_body["choices"][0]["message"]["content"].strip()
                     else:
@@ -217,7 +295,8 @@ def query_ollama_api(
                         "url": url,
                         "model": raw_model,
                         "error": str(e),
-                        "timeout": "30s read, 10s connect",
+                        "budget_s": budget_s,
+                        "attempt_timeout_s": round(remaining_s, 1),
                     },
                 )
                 _llmobs_annotate(
@@ -298,21 +377,23 @@ def query_ollama_api(
 # Timeout math (mirrors the worked-example comment style on grug's
 # `_SAAS_OVERLOAD_FALLBACK_TIMEOUT_SECONDS`):
 #   - Primary (query_ollama_api above): prod OLLAMA_URLS is the single
-#     spark-gateway URL (k8s/deployment.yaml) with timeout=(10, 60) - one
-#     70s-worst-case attempt, unchanged by this fallback chain.
+#     spark-gateway URL (k8s/deployment.yaml) under one _ollama_budget_s()
+#     deadline, default 60s - typically done by 60s, 120s at the very
+#     worst (see the budget comment above; more only if
+#     GRUGTHINK_OLLAMA_TIMEOUT_S raises it), unchanged by this chain.
 #   - Each fallback tier below: (5, 10) - 5s to connect, 10s to read - a
 #     15s worst case per backend. Generous headroom over the observed live
 #     latency (Poolside thinking-disabled + OpenRouter Haiku 4.5 both
 #     measured well under 1s on grug's Elder path) while staying an order
 #     of magnitude short of grug review's 330-350s scale, appropriate for a
 #     realtime chat reply rather than a durable background job.
-#   - Total worst case if EVERYTHING fails: 70s (primary) + 15s (Poolside)
+#   - Total worst case if EVERYTHING fails: 120s (primary) + 15s (Poolside)
 #     + 15s (OpenRouter) [+ 30s Gemini bonus tier, query_gemini_api's own
 #     existing request_options timeout, if GEMINI_API_KEY is configured]
-#     = 100s (130s with Gemini). No SQS/job-timeout ceiling applies here
+#     = 150s (180s with Gemini). No SQS/job-timeout ceiling applies here
 #     (unlike grug's review chain) - the operative bound is Discord's own
-#     interaction-followup window (15 minutes), which this stays two
-#     orders of magnitude inside of even in the total-failure case.
+#     interaction-followup window (15 minutes), which this stays 5x inside
+#     of even in the total-failure case.
 _FALLBACK_TIMEOUT = (5, 10)  # (connect, read) seconds - see math above.
 
 _POOLSIDE_URL = "https://inference.poolside.ai/v1/chat/completions"

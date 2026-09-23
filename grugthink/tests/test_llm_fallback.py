@@ -12,6 +12,7 @@ fallback at all - a Cave/spark-gateway failure just returned None):
   - each tier is single-shot: exactly one HTTP call per backend, no retries
 """
 
+import json as json_module
 import os
 
 # config_legacy.py raises at IMPORT time if DISCORD_TOKEN is unset (module
@@ -39,6 +40,13 @@ class _FakeResponse:
 
     def json(self) -> dict:
         return self._json_data
+
+    def iter_content(self, chunk_size: int = 1):
+        """The primary path streams the body to enforce its deadline."""
+        yield json_module.dumps(self._json_data).encode()
+
+    def close(self) -> None:
+        pass
 
 
 def _ollama_ok(text: str) -> _FakeResponse:

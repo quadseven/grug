@@ -539,55 +539,122 @@ def query_model(
         return None
 
 
+# --- Reply extraction (#1045) ----------------------------------------
+#
+# The prompt asks for "TRUE/FALSE - explanation", but models (and especially
+# the SaaS fallback tiers) often answer a chat message in plain prose and
+# sometimes append a self-labeling verdict line after it. A verdict is
+# therefore only recognized in two places:
+#   - LEADING: the reply opens with it (optionally after markdown/quotes and
+#     followed by a separator), e.g. "TRUE - ..." or "**FALSE**: ...".
+#   - TRAILER: an UPPERCASE "TRUE -"/"FALSE:" that starts the FINAL sentence
+#     or line, or a bare closing "TRUE."/"FALSE." sentence. That is the prompt's own answer format showing up as a label
+#     after the real answer. The prose before it is the reply; the trailer
+#     is only used when that prose is too short to stand on its own. A
+#     marker followed by more than one sentence is not a trailer, so at most
+#     one closing label sentence is ever dropped.
+# Anything else, including an ordinary "true"/"false" inside a sentence, is
+# prose and is delivered verbatim. The old parser matched TRUE/FALSE
+# anywhere, case-insensitively, and kept only what followed it, which threw
+# away a whole in-character reply and posted its trailer instead.
+_VERDICT_SEPARATOR = r"[-\u2013\u2014:.,!]"  # hyphen, en dash, em dash, and punctuation
+_LEADING_VERDICT_RE = re.compile(
+    r"^[\s*_#>\"'(\[]*(?P<verdict>TRUE|FALSE)\b[*_]*\s*(?P<sep>" + _VERDICT_SEPARATOR + r")?\s*(?P<rest>.*)$",
+    re.IGNORECASE | re.DOTALL,
+)
+# Separator form ("TRUE - why"), or a bare closing label ("... Day good. TRUE.",
+# seen live 2026-09-23 from the resident chat model).
+_TRAILER_MARKER_RE = re.compile(
+    r"(?:(?<=[.!?])\s+|\n\s*)[*_(\[]*(?P<verdict>TRUE|FALSE)\b[*_)\]]*(?:\s*[-\u2013\u2014:]\s*|[.!]?\s*$)"
+)
+_MORE_THAN_ONE_SENTENCE_RE = re.compile(r"[.!?]\s+\S")
+
+
+def _final_trailer(response: str) -> Optional[re.Match]:
+    """The last verdict marker, if what follows it is a single sentence."""
+    markers = list(_TRAILER_MARKER_RE.finditer(response))
+    if not markers:
+        return None
+    last = markers[-1]
+    if _MORE_THAN_ONE_SENTENCE_RE.search(response[last.end() :].strip()):
+        return None
+    return last
+
+
+def _is_substantive(text: str) -> bool:
+    """Minimum bar for a reply worth posting: 4+ words, 20+ characters."""
+    return len(text.split()) >= 4 and len(text) >= 20
+
+
+def _finish_sentence(text: str) -> str:
+    text = re.sub(r"\s+", " ", text).strip()
+    if text and not text.endswith((".", "!", "?")):
+        text += "."
+    return text
+
+
+def _format_verdict(verdict: str, explanation: str) -> Optional[str]:
+    explanation = re.sub(r"\s+", " ", explanation).strip().lstrip(".,;:!?-\u2013\u2014*_ ")
+    if not explanation:
+        return None
+    return _finish_sentence(f"{verdict.upper()} - {explanation}")
+
+
+def _extract_reply(response: str) -> tuple[Optional[str], Optional[str]]:
+    """Pure parse of one raw model reply into (reply_text, verdict).
+
+    Returns (None, None) when nothing substantive is left, so the caller can
+    fall through to the next backend (and, in the end, a clean error
+    message) instead of posting a fragment.
+    """
+    leading = _LEADING_VERDICT_RE.match(response)
+    if leading and (leading.group("sep") or leading.group("verdict").isupper()):
+        reply = _format_verdict(leading.group("verdict"), leading.group("rest"))
+        if reply and _is_substantive(reply):
+            return reply, leading.group("verdict").upper()
+        return None, None
+
+    trailer = _final_trailer(response)
+    if trailer:
+        head = _finish_sentence(response[: trailer.start()])
+        if _is_substantive(head):
+            return head, None
+        reply = _format_verdict(trailer.group("verdict"), response[trailer.end() :])
+        if reply and _is_substantive(reply):
+            return reply, trailer.group("verdict")
+        return None, None
+
+    reply = _finish_sentence(response)
+    if _is_substantive(reply):
+        return reply, None
+    return None, None
+
+
 def validate_and_process_response(
     response: str, cache_key: str, server_db=None, personality_name: Optional[str] = None, bot_id: Optional[str] = None
 ) -> Optional[str]:
-    """Validate and process LLM response with lore extraction and caching.
+    """Turn one raw model reply into the text posted to Discord, or None.
 
-    Validates that the response follows the expected format (TRUE/FALSE - explanation),
-    extracts the verdict and explanation, caches valid responses, extracts lore into
-    the server database, and stores the response for cross-bot awareness.
+    The reply is parsed by `_extract_reply` (see the comment above it): a
+    leading TRUE/FALSE verdict is normalized to "VERDICT - explanation", a
+    trailing self-labeling verdict line is dropped in favor of the prose
+    before it, and plain prose is delivered as-is. The verdict layer only
+    ever reformats; it never replaces a substantive reply with a fragment.
 
-    Args:
-        response: The raw response string from the LLM.
-        cache_key: The cache key for storing this response.
-        server_db: Optional server database instance for lore extraction. If None,
-            lore extraction is skipped. Defaults to None.
-        personality_name: Optional personality name for lore attribution and logging.
-            Defaults to None.
-        bot_id: Optional bot identifier for logging purposes. Defaults to None.
+    Side effects on success: the reply is cached under `cache_key`, lore is
+    extracted into `server_db` (when given), and the reply is stored for
+    cross-bot awareness.
 
     Returns:
-        Optional[str]: The validated and formatted response string (e.g.,
-            "TRUE - The sky is blue because of light scattering."), or None if the
-            response format is invalid or doesn't meet minimum quality requirements.
-
-    Note:
-        Valid responses must:
-        - Contain TRUE or FALSE
-        - Include an explanation after the verdict
-        - Have at least 4 words and 20 characters total
-        - End with proper punctuation (added if missing)
-
-        This function has several side effects:
-        - Updates the response cache
-        - Extracts and stores lore in the server database
-        - Stores response for cross-bot awareness
-        - Logs extensive validation and processing information
+        The reply to post, or None when the model produced nothing
+        substantive (fewer than 4 words / 20 characters after cleanup), so
+        the fallback chain can try the next backend.
 
     Example:
-        >>> raw_response = "TRUE - The Earth orbits the Sun. This is basic astronomy. <END>"
-        >>> validated = validate_and_process_response(
-        ...     raw_response,
-        ...     "cache_key_123",
-        ...     server_db=db,
-        ...     personality_name="Grug",
-        ...     bot_id="bot_1"
-        ... )
-        >>> print(validated)
-        TRUE - The Earth orbits the Sun. This is basic astronomy.
+        >>> validate_and_process_response("TRUE - The Earth orbits the Sun <END>", "k")
+        'TRUE - The Earth orbits the Sun.'
     """
-    response = response.split("<END>")[0].strip()
+    response = (response or "").split("<END>")[0].strip()
     log.info(
         "Processing model response",
         extra={
@@ -599,95 +666,24 @@ def validate_and_process_response(
         },
     )
 
-    true_match = re.search(r"\bTRUE\b", response, re.IGNORECASE)
-    false_match = re.search(r"\bFALSE\b", response, re.IGNORECASE)
+    reply, verdict = _extract_reply(response)
+    if reply is None:
+        log.warning("Invalid format, discarding", extra={"bot_id": bot_id, "response": response[:200]})
+        return None
 
-    if true_match or false_match:
-        verdict = "TRUE" if true_match else "FALSE"
-        pattern = rf"\b{verdict}\b\s*[-–—:]?\s*(.*)"
-        match = re.search(pattern, response, re.IGNORECASE | re.DOTALL)
-        if match:
-            explanation = re.sub(r"\s+", " ", match.group(1).strip())
-            # Strip leading punctuation (e.g., ". Me Grug..." -> "Me Grug...")
-            explanation = explanation.lstrip(".,;:!?-–—")
-            if explanation:
-                full_response = f"{verdict} - {explanation}"
-                if not full_response.rstrip().endswith((".", "!", "?")):
-                    full_response += "."
+    response_cache.put(cache_key, reply)
+    if server_db:
+        extract_lore_from_response(reply, server_db, personality_name)
+    store_bot_response_for_cross_reference(reply, personality_name)
 
-                if len(full_response.split()) >= 4 and len(full_response) >= 20:
-                    response_cache.put(cache_key, full_response)
-                    log.info(
-                        "Response cached",
-                        extra={"bot_id": bot_id, "cache_key": cache_key, "response_length": len(full_response)},
-                    )
-
-                    if server_db:
-                        log.info(
-                            "Extracting lore from response",
-                            extra={
-                                "bot_id": bot_id,
-                                "personality": personality_name,
-                                "response_preview": full_response[:100],
-                            },
-                        )
-                        extract_lore_from_response(full_response, server_db, personality_name)
-
-                    # Store bot response for cross-bot awareness
-                    log.info(
-                        "Storing response for cross-bot reference",
-                        extra={
-                            "bot_id": bot_id,
-                            "personality": personality_name,
-                            "response_length": len(full_response),
-                        },
-                    )
-                    store_bot_response_for_cross_reference(full_response, personality_name)
-
-                    log.info(
-                        "Validated response ready",
-                        extra={
-                            "bot_id": bot_id,
-                            "response": full_response[:200],
-                            "verdict": verdict,
-                            "explanation_length": len(explanation),
-                        },
-                    )
-                    return full_response
-
-    # Fallback: Accept any response without TRUE/FALSE if it's long enough and meaningful
-    # This handles cases where LLM doesn't follow format but gives valid answer
-    if len(response.split()) >= 4 and len(response) >= 20:
-        # Clean up the response
-        cleaned_response = re.sub(r"\s+", " ", response.strip())
-        if not cleaned_response.rstrip().endswith((".", "!", "?")):
-            cleaned_response += "."
-
-        log.info(
-            "Accepting response without TRUE/FALSE format",
-            extra={
-                "bot_id": bot_id,
-                "personality": personality_name,
-                "response_preview": cleaned_response[:100],
-            },
-        )
-
-        response_cache.put(cache_key, cleaned_response)
-
-        if server_db:
-            extract_lore_from_response(cleaned_response, server_db, personality_name)
-
-        store_bot_response_for_cross_reference(cleaned_response, personality_name)
-
-        log.info(
-            "Validated response ready (no format)",
-            extra={
-                "bot_id": bot_id,
-                "response": cleaned_response[:200],
-                "response_length": len(cleaned_response),
-            },
-        )
-        return cleaned_response
-
-    log.warning("Invalid format, discarding", extra={"response": response[:200]})
-    return None
+    log.info(
+        "Validated response ready",
+        extra={
+            "bot_id": bot_id,
+            "response": reply[:200],
+            "response_length": len(reply),
+            "raw_response_length": len(response),
+            "verdict": verdict,
+        },
+    )
+    return reply
