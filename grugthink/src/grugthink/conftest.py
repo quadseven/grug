@@ -785,6 +785,15 @@ class MockOllamaResponse:
             raise self._error
         return self._json_data
 
+    def iter_content(self, chunk_size: int = 1):
+        """Streamed body, as the Ollama client reads it to enforce its deadline."""
+        import json
+
+        yield json.dumps(self.json()).encode()
+
+    def close(self) -> None:
+        """Streamed responses are closed after reading; nothing to release here."""
+
     def raise_for_status(self):
         """Raise HTTPError for bad status codes."""
         if self.status_code >= 400:

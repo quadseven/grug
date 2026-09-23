@@ -54,3 +54,8 @@ jobs:
           pip install -r requirements.txt pytest
       - name: pgvector memory tests (real pgvector Postgres)
         run: PYTHONPATH=. python -m pytest tests/test_pgvector_store.py tests/test_ollama_embedder.py -v
+      # Chat reply path: the Ollama -> SaaS fallback chain and the reply
+      # parser that once posted a model's verdict trailer instead of its
+      # answer (#1045). Pure mocks, no network, no database.
+      - name: chat reply path tests (fallback chain + reply parsing)
+        run: PYTHONPATH=. python -m pytest tests/test_llm_fallback.py tests/test_llm_api_mocks.py tests/test_llm_response_parsing.py -v
