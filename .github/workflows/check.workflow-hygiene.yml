@@ -1,0 +1,56 @@
+name: Check · workflow hygiene
+
+# Runs the fleet's workflow-hygiene linter on every PR that touches this
+# repo's workflows or shell scripts, and fails the PR on any violation.
+# Without it, violations landed on main and were only ever found by a sweep
+# from outside the repo (#899: an unbounded curl for five days; #1010: a
+# github.event value pasted into a run: script).
+#
+# The canonical linter lives in the private infra repo, which this public
+# repo's CI cannot read without holding a private-repo credential. The public
+# copy in quadseven/infra-public ports the repo-agnostic rules (1, 1b, 5, 6,
+# 7, 9) and is pinned here by SHA; bump the pin to pick up newly ported rules.
+
+on:
+  pull_request:
+    branches: [main]
+    paths:
+      - '.github/workflows/**'
+      - '.github/**/*.sh'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  lint:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - name: 01. Checkout
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          persist-credentials: false
+
+      - name: 02. Fetch the pinned public linter
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          repository: quadseven/infra-public
+          ref: efd2c4ed4d011064a353bec181685088faf29eb0
+          path: .hygiene/infra-public
+          persist-credentials: false
+
+      # The scanned-file count is asserted, not just the exit status: a glob
+      # that silently matched nothing would also print "clean". 16 is the
+      # workflow count when this gate was added; lower it only when workflows
+      # are actually removed.
+      - name: 03. Lint workflows
+        run: |
+          set -euo pipefail
+          out=$(python3 .hygiene/infra-public/.github/scripts/workflow_hygiene.py) || { echo "$out"; exit 1; }
+          echo "$out"
+          n=$(printf '%s\n' "$out" | sed -n 's/.*clean (\([0-9][0-9]*\) files checked).*/\1/p')
+          if [ -z "$n" ] || [ "$n" -lt 16 ]; then
+            echo "::error::workflow-hygiene scanned ${n:-no} files, expected at least 16 - a sweep that matches nothing must not pass as clean"
+            exit 1
+          fi
