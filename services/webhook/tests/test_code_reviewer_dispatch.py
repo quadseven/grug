@@ -3255,11 +3255,11 @@ _TOO_LARGE_BODY = (
 )
 
 
-def test_diff_over_githubs_size_limit_is_rejected_not_retried(monkeypatch):
+def test_diff_over_githubs_size_limit_is_terminal_not_retried(monkeypatch):
     """GitHub answers a diff past its size limit with a 406, identically on
     every attempt. Classified as `fetch_or_parse_failed` it was in
     RETRIED_DEGRADATIONS, so the durable lane redrove it five times into the
-    DLQ. It must come back as DIFF_REJECTED, which the lane does not retry,
+    DLQ. It must come back as DIFF_TOO_LARGE, which the lane does not retry,
     with a check that tells the author to split the PR."""
     recorded: dict = {}
     posted: list = []
@@ -3274,9 +3274,9 @@ def test_diff_over_githubs_size_limit_is_rejected_not_retried(monkeypatch):
         result = cr_dispatch.dispatch_code_review(_payload(), blocking=False)
 
     assert result["result"] == "skipped"
-    assert result["degraded_reason"] == cr_dispatch.DIFF_REJECTED
-    assert cr_dispatch.DIFF_REJECTED not in cr_dispatch.RETRIED_DEGRADATIONS
-    assert recorded["degraded_reason"] == cr_dispatch.DIFF_REJECTED
+    assert result["degraded_reason"] == cr_dispatch.DIFF_TOO_LARGE
+    assert cr_dispatch.DIFF_TOO_LARGE not in cr_dispatch.RETRIED_DEGRADATIONS
+    assert recorded["degraded_reason"] == cr_dispatch.DIFF_TOO_LARGE
     assert recorded["conclusion"] == "neutral"
     assert len(posted) == 1
     assert posted[0].conclusion == "neutral"
@@ -3291,11 +3291,18 @@ def test_diff_over_githubs_size_limit_is_rejected_not_retried(monkeypatch):
         _diff_status_error(502),
         _diff_status_error(429),
         _diff_status_error(403, headers={"retry-after": "60"}),
+        # Other 4xx stay retryable too: a permission 403, a 404 visibility
+        # blip or a 422 must redrive (and page from the DLQ if it persists),
+        # never complete neutral and make the review quietly disappear.
+        _diff_status_error(403),
+        _diff_status_error(404),
+        _diff_status_error(400),
+        _diff_status_error(422),
     ],
 )
-def test_transient_diff_fetch_failure_stays_retryable(monkeypatch, error):
-    """The other side of the line: a transport error, a 5xx or a throttle
-    can succeed on the next attempt, so it keeps the retried reason."""
+def test_only_the_size_limit_406_is_terminal(monkeypatch, error):
+    """The other side of the line: anything that is not GitHub's size-limit
+    406 keeps the retried reason."""
     recorded: dict = {}
     monkeypatch.setattr(cr_dispatch, "record_check_verdict", lambda **kw: recorded.update(kw))
     monkeypatch.setattr(cr_dispatch, "post_check_run", lambda *a, **kw: {})

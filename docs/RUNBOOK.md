@@ -448,11 +448,10 @@ reach the rerun DLQ.
   `elder_review_durable_done`, `elder_review_stale_snapshot_cancelled`, or
   `elder_review_duplicate_snapshot_skipped`. A consumer exception leaves the
   message for visibility redrive; persistent failures land in the rerun DLQ and
-  page through the owned queue monitors. A diff GitHub refuses with a
-  permanent 4xx (a 406 means the PR is past its diff size limit) is not
-  retried: it completes with a neutral `diff_rejected` check telling the
-  author to split the PR (#1047). A `diff_rejected` job in the DLQ means that
-  classification regressed.
+  page through the owned queue monitors. A diff fetch GitHub answers
+  with 406 (the PR is past its diff size limit) is not retried: it completes
+  with a neutral `diff_too_large` check telling the author to split the PR
+  (#1047). Other 4xx on the diff fetch still redrive.
 - **`[grug-webhook] Elder fallback failed`** (P2): the cave fallback is LIVE
   (ADR-0005, #310/#316/#313). A one-cloud failure is visible as a provisional
   partial review and is retried rather than marked complete.

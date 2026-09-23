@@ -1319,15 +1319,19 @@ RETRIED_DEGRADATIONS = frozenset({
 })
 
 
-# GitHub refused the diff fetch with a PERMANENT 4xx (#1047). A 406 is
-# how GitHub answers for a diff past its API size limit; a 404 or a
-# non-throttle 403 names a PR or a permission that is not there. The same
-# fetch gets the same answer on every attempt, so this is deliberately NOT a
-# member of RETRIED_DEGRADATIONS: a pull request past the size limit took
-# all five redrives of the durable lane into the DLQ, one attempt every ten
-# minutes, before this reason existed. The degraded check it publishes is
-# terminal, so rerun treats it as self-completing.
-DIFF_REJECTED = "diff_rejected"
+# GitHub will not serve this diff at all (#1047): the diff media type
+# answers 406 when a pull request's diff is past the API's size limit, and
+# the same fetch gets the same 406 on every attempt. So this is deliberately
+# NOT a member of RETRIED_DEGRADATIONS: before this reason existed, one such
+# pull request took all five redrives of the durable lane into the DLQ, one
+# attempt every ten minutes. The degraded check it publishes is terminal, so
+# rerun treats it as self-completing.
+#
+# Only the 406. Other 4xx on this fetch (a 403 permission, a 404 visibility
+# blip, a 422) stay retryable: a retry or a DLQ page is the right outcome for
+# those, and completing them neutral would make a review quietly disappear.
+DIFF_TOO_LARGE = "diff_too_large"
+_DIFF_TOO_LARGE_STATUS = 406
 
 
 def worth_an_email(evaluation: CodeReviewEvaluation) -> bool:
@@ -2255,10 +2259,9 @@ def dispatch_code_review(
                 },
             )
     except (httpx.HTTPStatusError, httpx.RequestError, DiffParseError) as e:
-        # Only an HTTP answer can be permanent: a transport error or a parse
-        # failure says nothing about what the next attempt will get.
-        diff_rejected = (
-            isinstance(e, httpx.HTTPStatusError) and _is_permanent_rejection(e)
+        diff_too_large = (
+            _safe_attr(_safe_attr(e, "response"), "status_code")
+            == _DIFF_TOO_LARGE_STATUS
         )
         log.warning(
             "code_review_fetch_or_parse_failed",
@@ -2266,7 +2269,7 @@ def dispatch_code_review(
                 "installation_id": installation_id,
                 "pr": f"{owner}/{repo_name}#{pull_number}",
                 "kind": type(e).__name__,
-                "permanent": diff_rejected,
+                "diff_too_large": diff_too_large,
                 **_http_error_detail(e),
             },
         )
@@ -2283,12 +2286,16 @@ def dispatch_code_review(
             )
             if stale is not None:
                 return stale
-        if diff_rejected:
-            status = _safe_attr(_safe_attr(e, "response"), "status_code")
-            reason = DIFF_REJECTED
-            check_summary: str | None = _diff_rejected_summary(status)
+        if diff_too_large:
+            reason = DIFF_TOO_LARGE
+            check_summary: str | None = (
+                "GitHub refused to serve this pull request's diff (HTTP 406): "
+                "it is over the API's diff size limit. Split the change into "
+                "smaller pull requests to get an Elder review. Advisory "
+                "neutral - PR merge is not blocked."
+            )
             verdict_summary = (
-                f"Grug could not look - GitHub refused the diff (HTTP {status})"
+                "Grug could not look - diff is over GitHub's size limit"
             )
         else:
             reason = "fetch_or_parse_failed"
@@ -3618,26 +3625,6 @@ def _async_deep_append_if_needed(
             "conclusion": conclusion,
         },
     )
-
-
-def _diff_rejected_summary(status: object) -> str:
-    """Check-run text for a diff GitHub will never serve (DIFF_REJECTED).
-
-    Says what the author can do about it, because unlike a transient
-    degradation no retry is coming: a 406 is the size limit, and only a
-    smaller pull request gets under it."""
-    if status == 406:
-        cause = (
-            "GitHub refused to serve this pull request's diff (HTTP 406): "
-            "it is over the API's diff size limit. Split the change into "
-            "smaller pull requests to get an Elder review."
-        )
-    else:
-        cause = (
-            f"GitHub refused to serve this pull request's diff (HTTP {status}), "
-            "and the same request gets the same answer on every attempt."
-        )
-    return f"{cause} Advisory neutral - PR merge is not blocked."
 
 
 def _publish_degraded(

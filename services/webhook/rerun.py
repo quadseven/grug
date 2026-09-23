@@ -38,7 +38,7 @@ from adapters.install_store import get_repo_config  # type: ignore
 from github_app_auth import with_install_token_retry
 from github_checks_client import CheckRunResult, post_check_run
 from personas.code_reviewer.dispatch import (
-    DIFF_REJECTED,
+    DIFF_TOO_LARGE,
     RETRIED_DEGRADATIONS,
     dispatch_code_review,
 )
@@ -122,14 +122,14 @@ _RETRYABLE_SKIP_REASONS = RETRIED_DEGRADATIONS
 # - advisory only" - two surfaces describing one pass in different words,
 # because two different code paths wrote them.
 #
-# DIFF_REJECTED belongs here for the same reason: its degraded check already
-# says GitHub refused the diff and what to do about it, and no retry changes
-# GitHub's answer.
+# DIFF_TOO_LARGE belongs here for the same reason: its degraded check already
+# says the diff is over GitHub's size limit and what to do about it, and no
+# retry changes GitHub's answer.
 _SELF_COMPLETING_SKIP_REASONS = frozenset({
     "no_diff",
     "fail_open_freshness",
     "partial_review",
-    DIFF_REJECTED,
+    DIFF_TOO_LARGE,
 })
 
 

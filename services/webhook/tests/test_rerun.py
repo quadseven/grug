@@ -1979,13 +1979,12 @@ def test_staleness_watch_ignores_a_transient_fetch_failure(monkeypatch):
     assert cancel.is_set() is False
 
 
-def test_diff_rejected_completes_instead_of_redriving(monkeypatch):
-    """A diff GitHub refuses permanently (a PR past the API's diff size
-    limit) used to raise "Elder review degraded" for SQS redrive, and the
+def test_diff_too_large_completes_instead_of_redriving(monkeypatch):
+    """A diff past GitHub's API size limit used to raise "Elder review degraded" for SQS redrive, and the
     identical answer took the job through all five receives into the DLQ.
     The dispatch already published a terminal neutral check naming the
     cause, so the lane must complete the claim and leave that check alone."""
-    from personas.code_reviewer.dispatch import DIFF_REJECTED
+    from personas.code_reviewer.dispatch import DIFF_TOO_LARGE
 
     pr = _pr_data(head_sha="fresh-head")
     fetches = iter((pr, pr))
@@ -2010,7 +2009,7 @@ def test_diff_rejected_completes_instead_of_redriving(monkeypatch):
         MagicMock(return_value={
             "persona": "code_reviewer",
             "result": "skipped",
-            "degraded_reason": DIFF_REJECTED,
+            "degraded_reason": DIFF_TOO_LARGE,
         }),
     )
 
