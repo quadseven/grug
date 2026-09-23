@@ -3234,3 +3234,73 @@ def test_summary_does_not_call_an_unopened_cohort_a_failed_one():
     assert "failed: 2" in summary
     assert "never attempted: 3, 4" in summary
     assert "failed: 2, 3, 4" not in summary
+
+
+def _diff_status_error(
+    status: int, body: str = "", headers: dict[str, str] | None = None,
+) -> httpx.HTTPStatusError:
+    request = httpx.Request(
+        "GET", "https://api.github.com/repos/myorg/myrepo/pulls/7",
+    )
+    response = httpx.Response(
+        status, request=request, text=body, headers=headers or {},
+    )
+    return httpx.HTTPStatusError(str(status), request=request, response=response)
+
+
+_TOO_LARGE_BODY = (
+    '{"message":"Sorry, the diff exceeded the maximum number of lines (20000)",'
+    '"errors":[{"resource":"PullRequest","field":"diff","code":"too_large"}],'
+    '"status":"406"}'
+)
+
+
+def test_diff_over_githubs_size_limit_is_rejected_not_retried(monkeypatch):
+    """GitHub answers a diff past its size limit with a 406, identically on
+    every attempt. Classified as `fetch_or_parse_failed` it was in
+    RETRIED_DEGRADATIONS, so the durable lane redrove it five times into the
+    DLQ. It must come back as DIFF_REJECTED, which the lane does not retry,
+    with a check that tells the author to split the PR."""
+    recorded: dict = {}
+    posted: list = []
+    monkeypatch.setattr(cr_dispatch, "record_check_verdict", lambda **kw: recorded.update(kw))
+    monkeypatch.setattr(
+        cr_dispatch, "post_check_run",
+        lambda token, owner, repo, result, **kw: posted.append(result) or {},
+    )
+    with patch(
+        "httpx.get", side_effect=_diff_status_error(406, body=_TOO_LARGE_BODY),
+    ):
+        result = cr_dispatch.dispatch_code_review(_payload(), blocking=False)
+
+    assert result["result"] == "skipped"
+    assert result["degraded_reason"] == cr_dispatch.DIFF_REJECTED
+    assert cr_dispatch.DIFF_REJECTED not in cr_dispatch.RETRIED_DEGRADATIONS
+    assert recorded["degraded_reason"] == cr_dispatch.DIFF_REJECTED
+    assert recorded["conclusion"] == "neutral"
+    assert len(posted) == 1
+    assert posted[0].conclusion == "neutral"
+    assert "HTTP 406" in posted[0].summary
+    assert "size limit" in posted[0].summary
+
+
+@pytest.mark.parametrize(
+    "error",
+    [
+        httpx.ConnectError("gh down"),
+        _diff_status_error(502),
+        _diff_status_error(429),
+        _diff_status_error(403, headers={"retry-after": "60"}),
+    ],
+)
+def test_transient_diff_fetch_failure_stays_retryable(monkeypatch, error):
+    """The other side of the line: a transport error, a 5xx or a throttle
+    can succeed on the next attempt, so it keeps the retried reason."""
+    recorded: dict = {}
+    monkeypatch.setattr(cr_dispatch, "record_check_verdict", lambda **kw: recorded.update(kw))
+    monkeypatch.setattr(cr_dispatch, "post_check_run", lambda *a, **kw: {})
+    with patch("httpx.get", side_effect=error):
+        result = cr_dispatch.dispatch_code_review(_payload(), blocking=False)
+
+    assert result["degraded_reason"] == "fetch_or_parse_failed"
+    assert recorded["degraded_reason"] == "fetch_or_parse_failed"

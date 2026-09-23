@@ -1319,6 +1319,17 @@ RETRIED_DEGRADATIONS = frozenset({
 })
 
 
+# GitHub refused the diff fetch with a PERMANENT 4xx (#1047). A 406 is
+# how GitHub answers for a diff past its API size limit; a 404 or a
+# non-throttle 403 names a PR or a permission that is not there. The same
+# fetch gets the same answer on every attempt, so this is deliberately NOT a
+# member of RETRIED_DEGRADATIONS: a pull request past the size limit took
+# all five redrives of the durable lane into the DLQ, one attempt every ten
+# minutes, before this reason existed. The degraded check it publishes is
+# terminal, so rerun treats it as self-completing.
+DIFF_REJECTED = "diff_rejected"
+
+
 def worth_an_email(evaluation: CodeReviewEvaluation) -> bool:
     """Should a review that found THIS be allowed to create the board?
 
@@ -2244,12 +2255,18 @@ def dispatch_code_review(
                 },
             )
     except (httpx.HTTPStatusError, httpx.RequestError, DiffParseError) as e:
+        # Only an HTTP answer can be permanent: a transport error or a parse
+        # failure says nothing about what the next attempt will get.
+        diff_rejected = (
+            isinstance(e, httpx.HTTPStatusError) and _is_permanent_rejection(e)
+        )
         log.warning(
             "code_review_fetch_or_parse_failed",
             extra={
                 "installation_id": installation_id,
                 "pr": f"{owner}/{repo_name}#{pull_number}",
                 "kind": type(e).__name__,
+                "permanent": diff_rejected,
                 **_http_error_detail(e),
             },
         )
@@ -2266,9 +2283,20 @@ def dispatch_code_review(
             )
             if stale is not None:
                 return stale
+        if diff_rejected:
+            status = _safe_attr(_safe_attr(e, "response"), "status_code")
+            reason = DIFF_REJECTED
+            check_summary: str | None = _diff_rejected_summary(status)
+            verdict_summary = (
+                f"Grug could not look - GitHub refused the diff (HTTP {status})"
+            )
+        else:
+            reason = "fetch_or_parse_failed"
+            check_summary = None
+            verdict_summary = "Grug could not look — diff fetch/parse failed"
         degraded = _publish_degraded(
             installation_id, owner, repo_name, pull_number, head_sha,
-            reason="fetch_or_parse_failed",
+            reason=reason, summary=check_summary,
         )
         # Errored Activity row (PRD #301): Grug couldn't even fetch/parse the
         # diff — record it so it surfaces as `errored` (re-runnable in S3a),
@@ -2280,10 +2308,10 @@ def dispatch_code_review(
             pr_number=pull_number,
             head_sha=head_sha,
             conclusion="neutral",
-            summary="Grug could not look — diff fetch/parse failed",
+            summary=verdict_summary,
             findings_count=0,
             blocking=blocking,
-            degraded_reason="fetch_or_parse_failed",
+            degraded_reason=reason,
         )
         return degraded
 
@@ -3592,15 +3620,35 @@ def _async_deep_append_if_needed(
     )
 
 
+def _diff_rejected_summary(status: object) -> str:
+    """Check-run text for a diff GitHub will never serve (DIFF_REJECTED).
+
+    Says what the author can do about it, because unlike a transient
+    degradation no retry is coming: a 406 is the size limit, and only a
+    smaller pull request gets under it."""
+    if status == 406:
+        cause = (
+            "GitHub refused to serve this pull request's diff (HTTP 406): "
+            "it is over the API's diff size limit. Split the change into "
+            "smaller pull requests to get an Elder review."
+        )
+    else:
+        cause = (
+            f"GitHub refused to serve this pull request's diff (HTTP {status}), "
+            "and the same request gets the same answer on every attempt."
+        )
+    return f"{cause} Advisory neutral - PR merge is not blocked."
+
+
 def _publish_degraded(
     installation_id: int, owner: str, repo_name: str, pull_number: int,
-    head_sha: str, *, reason: str,
+    head_sha: str, *, reason: str, summary: str | None = None,
 ) -> dict[str, str]:
     """Post the "skipped" check-run when fetch/parse fails. Best-effort —
     a publish failure here is also swallowed since we can't do anything
     useful with it (would need its own degraded publish, etc)."""
     title = f"WARN Elder review skipped ({reason})"
-    summary = (
+    summary = summary or (
         f"Elder could not run this pass: `{reason}`. Advisory neutral "
         "— PR merge is not blocked."
     )
