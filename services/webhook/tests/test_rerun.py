@@ -1977,3 +1977,45 @@ def test_staleness_watch_ignores_a_transient_fetch_failure(monkeypatch):
         "aaaa1111", stop, cancel,
     )
     assert cancel.is_set() is False
+
+
+def test_diff_too_large_completes_instead_of_redriving(monkeypatch):
+    """A diff past GitHub's API size limit used to raise "Elder review degraded" for SQS redrive, and the
+    identical answer took the job through all five receives into the DLQ.
+    The dispatch already published a terminal neutral check naming the
+    cause, so the lane must complete the claim and leave that check alone."""
+    from personas.code_reviewer.dispatch import DIFF_TOO_LARGE
+
+    pr = _pr_data(head_sha="fresh-head")
+    fetches = iter((pr, pr))
+
+    def _fake_token_retry(iid, fn):
+        try:
+            return next(fetches)
+        except StopIteration:
+            return fn("tok")
+
+    posted: list = []
+    monkeypatch.setattr(rerun, "with_install_token_retry", _fake_token_retry)
+    monkeypatch.setattr(
+        rerun, "post_check_run",
+        lambda token, owner, repo, result, external_id=None: posted.append(result) or {"id": 1},
+    )
+    monkeypatch.setattr(rerun, "get_repo_config", lambda iid, rid: {})
+    acquire, complete, release = _patch_hot_claims(monkeypatch)
+    monkeypatch.setattr(
+        rerun,
+        "dispatch_code_review",
+        MagicMock(return_value={
+            "persona": "code_reviewer",
+            "result": "skipped",
+            "degraded_reason": DIFF_TOO_LARGE,
+        }),
+    )
+
+    status = rerun._run_one(_job(kind="review", settle_seconds=0))
+
+    assert status == "dispatched"
+    assert posted == []
+    complete.assert_called_once()
+    release.assert_not_called()

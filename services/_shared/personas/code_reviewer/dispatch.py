@@ -1319,6 +1319,22 @@ RETRIED_DEGRADATIONS = frozenset({
 })
 
 
+# GitHub will not serve this diff at all (#1047): the diff media type
+# answers 406 when a pull request's diff is past the API's size limit, and
+# the same fetch gets the same 406 on every attempt. So this is deliberately
+# NOT a member of RETRIED_DEGRADATIONS: before this reason existed, one such
+# pull request took all five redrives of the durable lane into the DLQ, one
+# attempt every ten minutes. The degraded check it publishes is terminal, so
+# rerun treats it as self-completing.
+#
+# Only that 406, recognised by status AND GitHub's `too_large` error code
+# (see `_is_diff_too_large`). Other 4xx on this fetch (a 403 permission, a
+# 404 visibility blip, a 422, a 406 for any other reason) stay retryable: a
+# retry or a DLQ page is the right outcome for those, and completing them
+# with an author-facing "split the PR" would misname the cause.
+DIFF_TOO_LARGE = "diff_too_large"
+
+
 def worth_an_email(evaluation: CodeReviewEvaluation) -> bool:
     """Should a review that found THIS be allowed to create the board?
 
@@ -2018,6 +2034,31 @@ def _http_error_detail(error: Exception) -> dict[str, object]:
     return detail
 
 
+def _is_diff_too_large(error: Exception) -> bool:
+    """Is this GitHub's "the diff is past the API size limit" answer?
+
+    #1047: GitHub answers the diff media type with a 406 whose JSON body
+    carries `errors[].code == "too_large"` (field `diff`). Both are required.
+    A 406 alone could be media-type negotiation or a proxy, and treating that
+    as terminal would tell the author to split a PR that is not too big.
+    Unlike `_is_permanent_rejection` this does read the body, but only the
+    machine-readable error code, never GitHub's prose."""
+    response = _safe_attr(error, "response")
+    if getattr(response, "status_code", None) != 406:
+        return False
+    try:
+        body = response.json()  # type: ignore[union-attr]
+    except ValueError:  # unreadable or non-JSON body: not the size limit
+        return False
+    errors = body.get("errors") if isinstance(body, dict) else None
+    if not isinstance(errors, list):
+        return False
+    return any(
+        isinstance(item, dict) and item.get("code") == "too_large"
+        for item in errors
+    )
+
+
 def _is_permanent_rejection(error: Exception) -> bool:
     """Is this HTTP failure a verdict on the PAYLOAD rather than on the wire?
 
@@ -2244,12 +2285,14 @@ def dispatch_code_review(
                 },
             )
     except (httpx.HTTPStatusError, httpx.RequestError, DiffParseError) as e:
+        diff_too_large = _is_diff_too_large(e)
         log.warning(
             "code_review_fetch_or_parse_failed",
             extra={
                 "installation_id": installation_id,
                 "pr": f"{owner}/{repo_name}#{pull_number}",
                 "kind": type(e).__name__,
+                "diff_too_large": diff_too_large,
                 **_http_error_detail(e),
             },
         )
@@ -2266,9 +2309,24 @@ def dispatch_code_review(
             )
             if stale is not None:
                 return stale
+        if diff_too_large:
+            reason = DIFF_TOO_LARGE
+            check_summary: str | None = (
+                "GitHub refused to serve this pull request's diff (HTTP 406): "
+                "it is over the API's diff size limit. Split the change into "
+                "smaller pull requests to get an Elder review. Advisory "
+                "neutral - PR merge is not blocked."
+            )
+            verdict_summary = (
+                "Grug could not look - diff is over GitHub's size limit"
+            )
+        else:
+            reason = "fetch_or_parse_failed"
+            check_summary = None
+            verdict_summary = "Grug could not look — diff fetch/parse failed"
         degraded = _publish_degraded(
             installation_id, owner, repo_name, pull_number, head_sha,
-            reason="fetch_or_parse_failed",
+            reason=reason, summary=check_summary,
         )
         # Errored Activity row (PRD #301): Grug couldn't even fetch/parse the
         # diff — record it so it surfaces as `errored` (re-runnable in S3a),
@@ -2280,10 +2338,10 @@ def dispatch_code_review(
             pr_number=pull_number,
             head_sha=head_sha,
             conclusion="neutral",
-            summary="Grug could not look — diff fetch/parse failed",
+            summary=verdict_summary,
             findings_count=0,
             blocking=blocking,
-            degraded_reason="fetch_or_parse_failed",
+            degraded_reason=reason,
         )
         return degraded
 
@@ -3594,13 +3652,13 @@ def _async_deep_append_if_needed(
 
 def _publish_degraded(
     installation_id: int, owner: str, repo_name: str, pull_number: int,
-    head_sha: str, *, reason: str,
+    head_sha: str, *, reason: str, summary: str | None = None,
 ) -> dict[str, str]:
     """Post the "skipped" check-run when fetch/parse fails. Best-effort —
     a publish failure here is also swallowed since we can't do anything
     useful with it (would need its own degraded publish, etc)."""
     title = f"WARN Elder review skipped ({reason})"
-    summary = (
+    summary = summary or (
         f"Elder could not run this pass: `{reason}`. Advisory neutral "
         "— PR merge is not blocked."
     )
