@@ -639,8 +639,9 @@ def create_all(
         query=crashloop_query(),
         tags=_common_tags(env, "grug"),  # all-workload (see workload-not-ready)
         # CONDITIONAL metric: the waiting-reason series only exists while a pod
-        # is actually in CrashLoopBackOff, so No Data == healthy here. (Unlike
-        # the continuous gauges above, which page on No Data.)
+        # is actually in CrashLoopBackOff. default_zero in the query makes that
+        # healthy absence read 0 (OK) instead of No Data. (Unlike the
+        # continuous gauges above, which page on No Data.)
         notify_no_data=False,
         priority=2,
         opts=opts,
