@@ -58,7 +58,7 @@ jobs:
       # Path, not a secret. The VALUES are the secret and live only in this
       # SecureString, never in this repo.
       deny-list-ssm-param: /grug/leak-guard-deny-list
-      scanner-ref: f138bba57e6dc6366d5fc171e5d643a4f4c052ac
+      scanner-ref: 5a855cf1310d248d4fd7da8a8081d44262a21c8e
     secrets:
       # Empty (not a half-built ARN) when AWS_ACCOUNT_ID is unavailable, e.g.
       # on a fork PR, so the reusable's explicit "secret is empty" refusal
