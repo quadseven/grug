@@ -111,11 +111,15 @@ people, products, host codenames - and it is fetched at run time from
 `/grug/leak-guard-deny-list`. **The literal terms cannot live in this repo:
 this repo is public, and a file listing them would BE the leak it prevents.**
 
-CI (`guard.private-leaks.yml`) reads it through `grug-gha-leak-guard`, a role
-whose entire policy is "read that one parameter". If the parameter is missing,
-unreadable, or holds no terms, the guard **fails the job** - it never degrades
-to layer 1 and reports green. That downgrade is exactly what shipped for
-months.
+CI (`guard.private-leaks.yml`) no longer reads this parameter. Since
+grug#1057 it reads the fleet's shared list, `/infra/leak-scan/deny-list`
+(seeded from this one, same terms), through the role in the
+`LEAK_SCAN_ROLE_ARN` repo secret, whose entire policy is "read that one
+parameter". Add a new term to the shared list; this parameter and
+`grug-gha-leak-guard` are retired under grug#1057. If the list CI reads is
+missing, unreadable, or holds no terms, the guard **fails the job** - it never
+degrades to layer 1 and reports green. That downgrade is exactly what shipped
+for months.
 
 Format: one term per line. Blank lines and `#` comments ignored. Matching is
 case-insensitive and anchored on word-ish boundaries, so a short first name
