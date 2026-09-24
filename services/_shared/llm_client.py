@@ -2364,6 +2364,72 @@ def _is_retry_later_status(failure_class: BackendFailureClass, status: int) -> b
     return failure_class == "rate_limited" or status == 408 or status >= 500
 
 
+def _record_learn_http_failure(
+    backend: Backend, resp: httpx.Response,
+    unusable: list[str], unavailable: list[str],
+) -> None:
+    """Log one classifier backend's non-2xx answer and file it by kind.
+
+    Same log helper as the review path, so the unusable-backend monitor sees
+    a dead key here too, and a free-tier refusal logs the non-paging
+    rate-limited token instead. Anything neither unusable nor retry-later (a
+    400/422: a request or wire regression) is filed nowhere: it keeps the
+    plain redrive toward the DLQ, whose monitor surfaces it, instead of a
+    quiet week of deferral."""
+    failure_class = _log_backend_failure(
+        backend_value=backend.value, status=resp.status_code,
+        error=f"http_{resp.status_code}",
+        error_message=_backend_error_message(resp),
+    )
+    status_tag = f"{backend.value}:http_{resp.status_code}"
+    if failure_class == "unusable":
+        unusable.append(status_tag)
+    elif _is_retry_later_status(failure_class, resp.status_code):
+        unavailable.append(status_tag)
+
+
+def _response_json_dict(resp: httpx.Response) -> dict:
+    """The response body as a dict, or {} when it is not a JSON object."""
+    try:
+        body = resp.json()
+    except ValueError:
+        return {}
+    return body if isinstance(body, dict) else {}
+
+
+def _parse_learning_classification(
+    content: str, finding_file: str,
+) -> Optional[LearningClassification]:
+    """The classifier's answer as a classification, or None when it does not
+    parse into the asked-for shape (a redrive re-asks)."""
+    try:
+        data = _loads_leading_object(content) if content else {}
+    except (ValueError, TypeError, AttributeError):
+        # JSONDecodeError is a ValueError; a non-string content is the rest.
+        return None
+    if not isinstance(data, dict):
+        return None
+    raw_durable = data.get("durable", False)
+    # Require an ACTUAL JSON boolean: bool("false") is True, so a string
+    # "false"/"no" from a sloppy backend must NOT persist a one-off as
+    # durable. A non-bool is a schema mismatch -> parse failure -> redrive
+    # (safer than guessing).
+    if not isinstance(raw_durable, bool):
+        return None
+    learning = data.get("learning", "")
+    learning = learning.strip() if isinstance(learning, str) else ""
+    scope = data.get("scope_path", "")
+    scope = scope.strip() if isinstance(scope, str) else ""
+    scope = _scope_covering_finding(scope, finding_file)
+    # A "durable" verdict with no rule text is unusable - treat as one-off
+    # so we never store an empty learning.
+    return {
+        "durable": raw_durable and bool(learning),
+        "learning": learning,
+        "scope_path": scope,
+    }
+
+
 class LearnClassifierUnavailable(RuntimeError):
     """No classifier backend gave a verdict, and at least one refused for a
     retry-LATER reason: rate limited (including OpenRouter's free-tier limit),
@@ -2493,59 +2559,18 @@ def classify_learning(
                 # Same token the review path uses, so the unusable-backend
                 # monitor sees a dead key on this path too, and a free-tier
                 # refusal logs the non-paging rate-limited token instead.
-                failure_class = _log_backend_failure(
-                    backend_value=backend.value, status=resp.status_code,
-                    error=f"http_{resp.status_code}",
-                    error_message=_backend_error_message(resp),
-                )
-                status_tag = f"{backend.value}:http_{resp.status_code}"
-                if failure_class == "unusable":
-                    unusable.append(status_tag)
-                elif _is_retry_later_status(failure_class, resp.status_code):
-                    unavailable.append(status_tag)
-                # Anything else (a 400/422: a request or wire regression) is
-                # neither: it keeps the plain redrive toward the DLQ, whose
-                # monitor surfaces it, instead of a quiet week of deferral.
+                _record_learn_http_failure(backend, resp, unusable, unavailable)
                 _annotate_interactive(
                     span, backend=backend, kind="http_error",
                     messages=messages, start_ns=start_ns, pr_tags=pr_tags,
                     status_code=resp.status_code,
                 )
                 continue
-            try:
-                body = resp.json()
-            except ValueError:
-                body = {}
-            if not isinstance(body, dict):
-                body = {}
+            body = _response_json_dict(resp)
             content = _choices_content(body)
-            result: Optional[LearningClassification] = None
-            try:
-                data = _loads_leading_object(content) if content else {}
-                if not isinstance(data, dict):
-                    raise ValueError("learn payload not a dict")
-                raw_durable = data.get("durable", False)
-                # Require an ACTUAL JSON boolean: bool("false") is True, so a
-                # string "false"/"no" from a sloppy backend must NOT persist a
-                # one-off as durable. A non-bool is a schema mismatch -> parse
-                # failure -> redrive (safer than guessing).
-                if not isinstance(raw_durable, bool):
-                    raise ValueError("durable is not a boolean")
-                durable = raw_durable
-                learning = data.get("learning", "")
-                learning = learning.strip() if isinstance(learning, str) else ""
-                scope = data.get("scope_path", "")
-                scope = scope.strip() if isinstance(scope, str) else ""
-                scope = _scope_covering_finding(scope, finding_tags.get("file", ""))
-                # A "durable" verdict with no rule text is unusable - treat as
-                # one-off so we never store an empty learning.
-                if durable and not learning:
-                    durable = False
-                result = {
-                    "durable": durable, "learning": learning, "scope_path": scope,
-                }
-            except (KeyError, ValueError, TypeError, AttributeError, json.JSONDecodeError):
-                result = None
+            result = _parse_learning_classification(
+                content, finding_tags.get("file", ""),
+            )
             if result is None:
                 _annotate_interactive(
                     span, backend=backend, kind="parse_failed",
