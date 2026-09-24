@@ -60,10 +60,6 @@ RUN apt-get update && apt-get install -y --no-install-recommends curl ca-certifi
 
 FROM python:3.13-slim AS runtime
 
-ARG DD_GIT_REPOSITORY_URL=""
-ARG DD_GIT_COMMIT_SHA=""
-ENV DD_GIT_REPOSITORY_URL=${DD_GIT_REPOSITORY_URL}
-ENV DD_GIT_COMMIT_SHA=${DD_GIT_COMMIT_SHA}
 ENV PYTHONUNBUFFERED=1
 # Force UTF-8. The image sets no locale, so a bundled-interpreter binary
 # (opengrep ships its own Python) falls back to the ASCII codec and dies
@@ -101,6 +97,22 @@ COPY --from=opengrep-fetch /opengrep /usr/local/bin/opengrep
 RUN /usr/local/bin/opengrep --version
 COPY _shared/ ./_shared/
 COPY ${SERVICE}/ ./
+
+# DELIBERATELY the last cache-key steps, below the pip install above.
+# DD_GIT_COMMIT_SHA is a different value on EVERY build (check.image-build.yml
+# passes the PR head sha, deploy.k8s.yml passes GITHUB_SHA). An ENV is a
+# cache-key step, so while these sat at the top of the stage they invalidated
+# every layer beneath them - the ~127 MB dependency layer was rebuilt and
+# re-pushed under a fresh digest on every commit, even when requirements.txt
+# had not changed, and the registry stored six copies of it. Down here the
+# per-commit value only invalidates what already changes per commit (the
+# source COPY above). ENV persists into the final image wherever it is
+# declared, so the baked values - and ADR-0016's promotion check that verifies
+# DD_GIT_COMMIT_SHA against head.sha - are unaffected.
+ARG DD_GIT_REPOSITORY_URL=""
+ARG DD_GIT_COMMIT_SHA=""
+ENV DD_GIT_REPOSITORY_URL=${DD_GIT_REPOSITORY_URL}
+ENV DD_GIT_COMMIT_SHA=${DD_GIT_COMMIT_SHA}
 
 RUN useradd --uid 10001 --no-create-home grug
 USER 10001
