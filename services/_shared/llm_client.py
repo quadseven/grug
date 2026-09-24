@@ -2357,6 +2357,13 @@ class LearnClassifierUnusable(RuntimeError):
         self.statuses = statuses
 
 
+def _is_retry_later_status(failure_class: BackendFailureClass, status: int) -> bool:
+    """Does this non-2xx answer clear on its own? Rate limits (including the
+    OpenRouter free-tier body), 408 and 5xx do. Other 4xx do not: a 400/422
+    is a deterministic request or wire mismatch that waiting never fixes."""
+    return failure_class == "rate_limited" or status == 408 or status >= 500
+
+
 class LearnClassifierUnavailable(RuntimeError):
     """No classifier backend gave a verdict, and at least one refused for a
     retry-LATER reason: rate limited (including OpenRouter's free-tier limit),
@@ -2494,8 +2501,11 @@ def classify_learning(
                 status_tag = f"{backend.value}:http_{resp.status_code}"
                 if failure_class == "unusable":
                     unusable.append(status_tag)
-                else:
+                elif _is_retry_later_status(failure_class, resp.status_code):
                     unavailable.append(status_tag)
+                # Anything else (a 400/422: a request or wire regression) is
+                # neither: it keeps the plain redrive toward the DLQ, whose
+                # monitor surfaces it, instead of a quiet week of deferral.
                 _annotate_interactive(
                     span, backend=backend, kind="http_error",
                     messages=messages, start_ns=start_ns, pr_tags=pr_tags,

@@ -4479,3 +4479,27 @@ def test_review_arm_free_tier_refusal_does_not_page(caplog) -> None:
     msgs = [r.msg for r in caplog.records]
     assert "llm_backend_rate_limited" in msgs
     assert "llm_backend_unusable" not in msgs
+
+
+@pytest.mark.parametrize("status", [400, 422])
+def test_classify_learning_permanent_4xx_redrives_rather_than_defers(status) -> None:
+    # Codex adversarial review: a 400/422 is a request or wire regression
+    # that waiting never fixes. Deferring it would hide it for a week; it
+    # keeps the plain redrive toward the DLQ, whose monitor surfaces it.
+    response = httpx.Response(status, json={"error": {"message": "bad request"}})
+    with patch.object(httpx, "post", return_value=response):
+        out = lc.classify_learning("q", "f", {"rule_name": "r"}, installation_id=2)
+    assert out is None
+
+
+def test_classify_learning_permanent_4xx_plus_free_tier_refusal_defers() -> None:
+    # One backend has a request bug, the other is only rate limited: the
+    # rate-limited one can still answer later, so the job waits for it.
+    def fake_post(url, **kw):
+        if "openrouter" in url:
+            return httpx.Response(403, json=_FREE_TIER_403)
+        return httpx.Response(400, json={})
+    with patch.object(httpx, "post", side_effect=fake_post):
+        with pytest.raises(lc.LearnClassifierUnavailable) as info:
+            lc.classify_learning("q", "f", {"rule_name": "r"}, installation_id=2)
+    assert info.value.statuses == ("openrouter:http_403",)
