@@ -176,6 +176,12 @@ def backend_unusable_query(env: str) -> str:
     failing a review, so with it dead a Cave blip went straight to "Grug
     could not review this" - and the only person told was the PR author, who
     can do nothing about an unpaid invoice.
+
+    Free-tier refusals do not match. grug's OpenRouter key runs only on the
+    free tier, which answers `403 Key limit exceeded` sometimes and not others
+    (operator decision 2026-09-23). grug logs those, and any 429, as
+    `llm_backend_rate_limited`, which this query must never match: paging on
+    a dependency known to be flaky would get the real signal muted.
     """
     return (
         f'logs("service:grug-* env:{env} llm_backend_unusable")'
@@ -865,7 +871,9 @@ def create_all(
             f"{_DIGEST}\n"
             "A review backend returned 401/402/403/404 - it is not overloaded, "
             "it is unusable. 402 = unpaid, 401/403 = key wrong or revoked, "
-            "404 = endpoint or model name gone.\n"
+            "404 = endpoint or model name gone. OpenRouter free-tier limit "
+            "refusals log llm_backend_rate_limited instead and do not fire "
+            "this.\n"
             "This does NOT fail reviews on its own: the Cave is the primary "
             "path. It removes the FALLBACK, so the next Cave outage has "
             "nothing behind it and authors get told Grug could not review.\n"

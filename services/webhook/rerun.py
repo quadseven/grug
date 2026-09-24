@@ -58,6 +58,7 @@ from rerun_personas import (
     TELLER as _TELLER,
 )
 from rerun_queue import (
+    JobNotDue,
     ask_group_id as _ask_group_id,
     learn_group_id as _learn_group_id,
     rerun_group_id as _rerun_group_id,
@@ -81,6 +82,30 @@ _MAX_SETTLE_SECONDS = 300
 # faster than Elder can finish reviewing it. A genuinely new commit always
 # resets this to 0; it only counts same-sha redrives.
 _MAX_INTENT_DRIFT_REDRIVES = 3
+# A learn job whose classifier backends are all rate limited or down (the
+# OpenRouter key is free-tier only and refuses intermittently - operator
+# decision 2026-09-23) is DEFERRED: re-enqueued as a fresh message with a
+# `not_before`, so the wait never counts toward the rerun DLQ's
+# maxReceiveCount. Backoff doubles from 15m to a 6h cap (one SQS visibility
+# hide covers it; SQS allows 12h). Past 7 days the job completes with the
+# in-thread "reply again later" notice, so a reply is never dead-lettered
+# and never silently lost.
+_LEARN_DEFER_BASE_SECONDS = 900
+_LEARN_DEFER_MAX_SECONDS = 6 * 3600
+_LEARN_DEFER_MAX_AGE_SECONDS = 7 * 86400
+
+
+def _now() -> float:
+    """Wall clock, as a seam tests can pin."""
+    return time.time()
+
+
+def _learn_defer_delay(defer_count: int) -> int:
+    """Seconds to wait before the next classify attempt of a deferred job."""
+    return min(
+        _LEARN_DEFER_MAX_SECONDS,
+        _LEARN_DEFER_BASE_SECONDS * 2 ** min(max(defer_count, 0), 16),
+    )
 # The lease matches the queue's fallback visibility timeout and is renewed on
 # the same cadence as the SQS visibility heartbeat while a review is active.
 _REVIEW_CLAIM_LEASE_SECONDS = 900
@@ -572,28 +597,48 @@ def enqueue_ask(*, install_id: int, repo: str, pr_number: int, comment_id: int, 
 def enqueue_learn(
     *, install_id: int, repo: str, pr_number: int, comment_id: int,
     parent_comment_id: int, reply_text: str, author: str = "",
+    defer_count: int = 0, not_before: float = 0.0, first_deferred_at: float = 0.0,
+    requeue_of: str = "",
 ) -> None:
     """Enqueue a learnings-classification job (#670, ADR-0020) so the LLM
     classifier runs in the consumer, NOT inline in the webhook ACK path.
     `comment_id` is the maintainer's REPLY (the dedup key - a re-delivered
     reply collapses); `parent_comment_id` is grug's finding it answers;
     `author` is the maintainer who taught it (the reply's sender). Runs in
-    its OWN FIFO group so a slow classify never serializes with /grug ask."""
+    its OWN FIFO group so a slow classify never serializes with /grug ask.
+
+    `defer_count`/`not_before`/`first_deferred_at` are set only when a job
+    is re-enqueued because every classifier backend was rate limited or
+    down; the consumer holds it until `not_before`. `requeue_of` is the SQS
+    message id of a not-yet-due copy being replaced by a fresh one."""
     if not _RERUN_QUEUE_URL:
         raise RuntimeError("GRUG_RERUN_QUEUE_URL not configured")
+    job: dict[str, Any] = {
+        "schema_version": SCHEMA_VERSION, "kind": "learn",
+        "install_id": install_id, "repo": repo, "pr_number": pr_number,
+        "comment_id": comment_id, "parent_comment_id": parent_comment_id,
+        "reply_text": reply_text, "author": author,
+    }
+    dedup_material = f"{install_id}\x1f{repo}\x1f{pr_number}\x1f{comment_id}"
+    if defer_count > 0:
+        job.update({
+            "defer_count": defer_count, "not_before": not_before,
+            "first_deferred_at": first_deferred_at,
+        })
+        # A distinct dedup id per deferral: the original's id is still inside
+        # SQS's 5-minute dedup window when the first deferral is sent, and a
+        # collapsed send would lose the job.
+        dedup_material += f"\x1fdefer{defer_count}"
+    if requeue_of:
+        dedup_material += f"\x1frequeue{requeue_of}"
     _sqs.send_message(
         QueueUrl=_RERUN_QUEUE_URL,
-        MessageBody=json.dumps({
-            "schema_version": SCHEMA_VERSION, "kind": "learn",
-            "install_id": install_id, "repo": repo, "pr_number": pr_number,
-            "comment_id": comment_id, "parent_comment_id": parent_comment_id,
-            "reply_text": reply_text, "author": author,
-        }),
+        MessageBody=json.dumps(job),
         MessageGroupId=_learn_group_id(install_id, repo, pr_number),
         # Hash the dedup id: a long owner/repo can push the plain string past
         # SQS's 128-char limit and fail send_message (same fix as the group id).
         MessageDeduplicationId="learn:" + hashlib.sha256(
-            f"{install_id}\x1f{repo}\x1f{pr_number}\x1f{comment_id}".encode("utf-8")
+            dedup_material.encode("utf-8")
         ).hexdigest(),
     )
     log.info("learn_enqueued", extra={"install_id": install_id, "repo": repo,
@@ -740,6 +785,8 @@ _LEARN_UNUSABLE_BODY = (
     "the whole tribe, reply again later and Grug will carve it."
 )
 _LEARN_UNUSABLE: Any = object()  # sentinel: classifier refused, not a verdict
+# sentinel: backends stayed rate limited or down past the defer horizon
+_LEARN_DEFER_EXHAUSTED: Any = object()
 
 
 def _post_learn_reply(
@@ -760,26 +807,65 @@ def _post_learn_reply(
     with_install_token_retry(install_id, _reply)
 
 
+def _defer_learn(
+    install_id: int, repo_full: str, pr_number: int,
+    comment_id: int, parent_comment_id: int, reply_text: str, author: str,
+    defer_count: int, first_deferred_at: float, statuses: tuple[str, ...],
+) -> bool:
+    """Re-enqueue a learn job whose classifier backends are all rate limited
+    or down. Returns False when the job is past the defer horizon instead.
+
+    Raises if the send fails, so the CURRENT message redrives rather than
+    completing with no copy left anywhere."""
+    now = _now()
+    started = first_deferred_at or now
+    if now - started >= _LEARN_DEFER_MAX_AGE_SECONDS:
+        log.warning("learn_classifier_defer_exhausted", extra={
+            "repo": repo_full, "pr": pr_number, "comment_id": comment_id,
+            "defer_count": defer_count, "statuses": list(statuses)})
+        return False
+    delay = _learn_defer_delay(defer_count)
+    enqueue_learn(
+        install_id=install_id, repo=repo_full, pr_number=pr_number,
+        comment_id=comment_id, parent_comment_id=parent_comment_id,
+        reply_text=reply_text, author=author,
+        defer_count=defer_count + 1, not_before=now + delay,
+        first_deferred_at=started,
+    )
+    # Warning, not error: on this deployment the free-tier key refusing is
+    # expected, and nothing pages on this line.
+    log.warning("learn_classifier_deferred", extra={
+        "repo": repo_full, "pr": pr_number, "comment_id": comment_id,
+        "defer_count": defer_count + 1, "delay_s": delay,
+        "statuses": list(statuses)})
+    return True
+
+
 def _run_learn(
     install_id: int, repo_full: str, pr_number: int,
     comment_id: int, parent_comment_id: int, reply_text: str,
-    author: str = "",
+    author: str = "", *, defer_count: int = 0, first_deferred_at: float = 0.0,
 ) -> str:
     """Classify a maintainer's reply to a finding and, if it is a durable team
     preference, store it and acknowledge in the thread (#670, ADR-0020).
 
-    A classifier BACKEND failure raises for SQS redrive (a transient outage
-    must not be mislabeled a deliberate one-off, and no ack is posted so the
-    retry can succeed). The exception is every backend answering 401/402/
-    403/404, which no retry clears: the job completes with a notice in the
-    thread instead. A definite verdict (durable OR one-off) is win-once
-    per reply comment: the first run acks, a redelivery is a no-op, so the
-    finding thread never gets duplicate acknowledgments."""
+    Backend failures split three ways. Every backend rate limited, down or
+    unreachable (the free-tier OpenRouter key refuses intermittently) DEFERS
+    the job: a delayed copy is enqueued and this message completes, so the
+    wait never counts toward the DLQ. Every backend answering 401/402/403/404
+    for a config reason completes the job with a notice in the thread, since
+    no retry clears it. Answers that do not parse raise for SQS redrive (a
+    miss must not be mislabeled a deliberate one-off, and no ack is posted so
+    the retry can succeed). A definite verdict (durable OR one-off) is
+    win-once per reply comment: the first run acks, a redelivery is a no-op,
+    so the finding thread never gets duplicate acknowledgments."""
     from adapters.install_store import (  # type: ignore
         claim_delivery, get_comment_record, get_learning_by_source_comment,
         put_learning,
     )
-    from llm_client import LearnClassifierUnusable, classify_learning  # type: ignore
+    from llm_client import (  # type: ignore
+        LearnClassifierUnavailable, LearnClassifierUnusable, classify_learning,
+    )
     from observability import emit_gauge  # type: ignore
 
     owner, _, repo_name = repo_full.partition("/")
@@ -826,6 +912,14 @@ def _run_learn(
                 "repo": repo_full, "pr": pr_number, "comment_id": comment_id,
                 "statuses": list(e.statuses)})
             classification = _LEARN_UNUSABLE
+        except LearnClassifierUnavailable as e:
+            if _defer_learn(
+                install_id, repo_full, pr_number, comment_id,
+                parent_comment_id, reply_text, author,
+                defer_count, first_deferred_at, e.statuses,
+            ):
+                return "learn_deferred"
+            classification = _LEARN_DEFER_EXHAUSTED
     if classification is None:
         # Transient: backend down or unparseable. Raise for redrive rather
         # than tell the maintainer their durable rule was judged one-off.
@@ -837,7 +931,7 @@ def _run_learn(
     # storing before the claim means a later put/ack failure can never lose the
     # learning (the claim, made only for the ACK, would otherwise short-circuit
     # the retry and drop the rule entirely). FLINT data-integrity fix.
-    if classification is _LEARN_UNUSABLE:
+    if classification is _LEARN_UNUSABLE or classification is _LEARN_DEFER_EXHAUSTED:
         # Nothing to store. Unlike the courtesy ack this notice is the
         # maintainer's only cue to re-reply, so it is at-least-once: no
         # win-once claim (a claim taken before a failed post would swallow
@@ -847,10 +941,14 @@ def _run_learn(
             install_id, owner, repo_name, pr_number, parent_comment_id,
             _LEARN_UNUSABLE_BODY,
         )
+        result = (
+            "learn_classifier_unusable" if classification is _LEARN_UNUSABLE
+            else "learn_defer_exhausted"
+        )
         log.info("learn_classified", extra={
             "repo": repo_full, "pr": pr_number, "comment_id": comment_id,
-            "result": "learn_classifier_unusable"})
-        return "learn_classifier_unusable"
+            "result": result})
+        return result
     if classification["durable"]:
         put_learning(
             repo=repo_full,
@@ -898,7 +996,39 @@ def _run_learn(
     return result
 
 
-def _run_one(body: str) -> str:
+def _hold_or_requeue_learn(
+    job: dict[str, Any], remaining: float, receive_count: int, message_id: str,
+) -> str:
+    """A deferred learn job arrived before its `not_before`.
+
+    On its first receive, ask the consumer to hide it until due (JobNotDue).
+    A not-due job seen AGAIN means that hide failed, and every early receive
+    counts toward the DLQ's maxReceiveCount - left alone, a visibility-API
+    outage would dead-letter the reply. So a repeat early arrival is replaced
+    by a fresh copy (its own receive count) and this one completes. If that
+    send fails too, the raise redrives as usual."""
+    if receive_count < 2 or not message_id:
+        raise JobNotDue(remaining)
+    enqueue_learn(
+        install_id=int(job["install_id"]), repo=str(job["repo"]),
+        pr_number=int(job["pr_number"]),
+        comment_id=int(job.get("comment_id", 0)),
+        parent_comment_id=int(job.get("parent_comment_id", 0)),
+        reply_text=str(job.get("reply_text", "")),
+        author=str(job.get("author", "")),
+        defer_count=max(1, int(job.get("defer_count", 0) or 0)),
+        not_before=float(job.get("not_before", 0) or 0),
+        first_deferred_at=float(job.get("first_deferred_at", 0) or 0),
+        requeue_of=message_id,
+    )
+    log.warning("learn_deferred_requeued", extra={
+        "repo": str(job["repo"]), "pr": int(job["pr_number"]),
+        "comment_id": int(job.get("comment_id", 0)),
+        "receive_count": receive_count, "remaining_s": int(remaining)})
+    return "learn_deferred"
+
+
+def _run_one(body: str, *, receive_count: int = 0, message_id: str = "") -> str:
     """Re-run ONE job. Raises on a malformed message or an infra fetch failure
     (→ ESM retry → DLQ). Returns a short status for the batch summary log.
 
@@ -912,12 +1042,19 @@ def _run_one(body: str) -> str:
     if job.get("kind") == "ask":
         return _run_ask(install_id, repo_full, pr_number, str(job.get("question", "")))
     if job.get("kind") == "learn":
+        # A deferred job (every classifier backend was rate limited) arrives
+        # at once; FIFO queues have no per-message delay. Hold it until due.
+        remaining = float(job.get("not_before", 0) or 0) - _now()
+        if remaining > 0:
+            return _hold_or_requeue_learn(job, remaining, receive_count, message_id)
         return _run_learn(
             install_id, repo_full, pr_number,
             int(job.get("comment_id", 0)),
             int(job.get("parent_comment_id", 0)),
             str(job.get("reply_text", "")),
             str(job.get("author", "")),
+            defer_count=int(job.get("defer_count", 0) or 0),
+            first_deferred_at=float(job.get("first_deferred_at", 0) or 0),
         )
     if job.get("kind") == "review":
         return _run_hot_review(job, install_id, repo_full, pr_number)
@@ -1840,7 +1977,16 @@ def handle_rerun_jobs(event: dict[str, Any]) -> dict[str, int]:
     statuses: list[str] = []
     for rec in records:
         body = rec.get("body", "") if isinstance(rec, dict) else ""
-        statuses.append(_run_one(body))  # may raise → ESM retry → DLQ
+        attrs = rec.get("attributes", {}) if isinstance(rec, dict) else {}
+        try:
+            receive_count = int((attrs or {}).get("ApproximateReceiveCount", 0))
+        except (TypeError, ValueError):
+            receive_count = 0
+        message_id = str(rec.get("messageId", "")) if isinstance(rec, dict) else ""
+        # may raise -> ESM retry -> DLQ
+        statuses.append(_run_one(
+            body, receive_count=receive_count, message_id=message_id,
+        ))
     return {
         "records": len(records),
         "dispatched": statuses.count("dispatched"),

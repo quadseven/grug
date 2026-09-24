@@ -1035,6 +1035,9 @@ def _saas_overload_fallback_config(backend: Backend) -> BackendConfig:
 # wrong or revoked. 402 = the bill is unpaid. 404 = the endpoint or model name
 # is gone. All four are operator problems with an operator fix.
 _TERMINAL_BACKEND_STATUSES = frozenset({401, 402, 403, 404})
+# Status alone over-calls OpenRouter: its free tier answers 402/403 for a
+# spent limit, which clears on its own. `classify_backend_failure` reads the
+# body too, and is what call sites use.
 
 
 def is_terminal_backend_failure(status: int) -> bool:
@@ -1055,30 +1058,110 @@ def is_terminal_backend_failure(status: int) -> bool:
     return status in _TERMINAL_BACKEND_STATUSES
 
 
-def _log_backend_failure(*, backend_value: str, status: int, error: str) -> None:
-    """Log a backend HTTP failure under a token that matches its KIND.
+BackendFailureClass = Literal["unusable", "rate_limited", "transient"]
+
+# Words in OpenRouter's own 402/403 error message that mean "this key's
+# free-tier or credit limit is spent for now", as opposed to a key that is
+# wrong. Live 2026-09-22/23: `403 Key limit exceeded (total limit)`; OpenRouter
+# documents 402 as `Insufficient credits` and 429 as `Rate limit exceeded`.
+_OPENROUTER_LIMIT_MARKERS = ("limit", "credit", "quota")
+
+
+def _backend_error_message(resp: httpx.Response) -> str:
+    """The provider's own error message from a non-2xx body, redacted and
+    capped, or "" when the body carries none. OpenAI-compatible providers
+    answer `{"error": {"message": ...}}`; a bare string `error` or a
+    top-level `message` is accepted too."""
+    try:
+        body = resp.json()
+    except ValueError:
+        return ""
+    if not isinstance(body, dict):
+        return ""
+    err = body.get("error")
+    if isinstance(err, dict):
+        msg = err.get("message")
+    elif isinstance(err, str):
+        msg = err
+    else:
+        msg = body.get("message")
+    return _redact_secrets(msg)[:200] if isinstance(msg, str) else ""
+
+
+def classify_backend_failure(
+    *, backend_value: str, status: int, error_message: str = "",
+) -> BackendFailureClass:
+    """What KIND of failure a backend's non-2xx answer is.
+
+    - `rate_limited`: retry later. Any 429, and OpenRouter's 402/403 whose
+      message names a limit or credits. Operator decision 2026-09-23: grug's
+      OpenRouter key runs only on the free tier, which refuses sometimes and
+      not others. The operator will not raise the limit, so that refusal is
+      known flakiness, never a page.
+    - `unusable`: no retry changes it (`is_terminal_backend_failure`). A 401
+      is always here: OpenRouter answers an invalid or revoked key with 401,
+      so a genuinely dead key still pages.
+    - `transient`: 5xx and anything else - ordinary overload.
+    """
+    if status == 429:
+        return "rate_limited"
+    if (
+        backend_value == Backend.OPENROUTER.value
+        and status in (402, 403)
+        and any(m in error_message.lower() for m in _OPENROUTER_LIMIT_MARKERS)
+    ):
+        return "rate_limited"
+    if is_terminal_backend_failure(status):
+        return "unusable"
+    return "transient"
+
+
+def _log_backend_failure(
+    *, backend_value: str, status: int, error: str, error_message: str = "",
+) -> BackendFailureClass:
+    """Log a backend HTTP failure under a token that matches its KIND, and
+    return that kind.
 
     Terminal failures get their own token so a monitor can alert on them.
     Alerting on `llm_backend_http_failed` is not an option - it fires for
     ordinary overload too, so it would be pure noise, which is why a dead
     OpenRouter key sat unnoticed while it silently removed Elder's fallback.
+    Free-tier and 429 refusals get `llm_backend_rate_limited`, which nothing
+    pages on: on this deployment they are expected, and paging on them would
+    get the real `llm_backend_unusable` signal muted along with them.
     """
-    if is_terminal_backend_failure(status):
+    failure_class = classify_backend_failure(
+        backend_value=backend_value, status=status, error_message=error_message,
+    )
+    if failure_class == "unusable":
         log.error(
             "llm_backend_unusable",
             extra={
                 "backend": backend_value,
                 "status": status,
                 "error": error,
+                "detail": error_message,
                 # Named so the runbook and the monitor agree on vocabulary.
                 "failure_class": "config_or_billing",
             },
         )
-        return
-    log.warning(
-        "llm_backend_http_failed",
-        extra={"backend": backend_value, "status": status, "error": error},
-    )
+    elif failure_class == "rate_limited":
+        log.warning(
+            "llm_backend_rate_limited",
+            extra={
+                "backend": backend_value,
+                "status": status,
+                "error": error,
+                "detail": error_message,
+                "failure_class": "rate_limited",
+            },
+        )
+    else:
+        log.warning(
+            "llm_backend_http_failed",
+            extra={"backend": backend_value, "status": status, "error": error},
+        )
+    return failure_class
 
 
 def select_backend(installation_id: int) -> Backend:
@@ -1985,12 +2068,21 @@ class WalkthroughSummary:
     effort: str | None
 
 
-def _interactive_backend_order(installation_id: int) -> tuple[Backend, Backend]:
-    """Primary + failover backend for Teller / /grug ask (Poolside/OpenRouter)."""
+def _interactive_backend_order(installation_id: int) -> tuple[Backend, ...]:
+    """Backends for Teller, /grug ask and the learn classifier, in order.
+
+    Primary + failover (Poolside/OpenRouter), then opencode Go when this
+    deployment already has its key configured (the review chain's first tier,
+    grug#910). OpenRouter here is a free-tier key that refuses intermittently
+    (operator decision 2026-09-23), so a third, already-provisioned backend
+    is what keeps these calls answering through a refusal. No key parameter
+    configured means no third tier, never a guessed one."""
     primary = select_backend(installation_id)
     failover = (
         Backend.OPENROUTER if primary == Backend.POOLSIDE else Backend.POOLSIDE
     )
+    if os.getenv("GRUG_OPENCODE_GO_API_KEY_SSM", "").strip():
+        return primary, failover, Backend.OPENCODE_GO
     return primary, failover
 
 
@@ -2004,9 +2096,13 @@ def _interactive_tags(
 
 
 def _choices_content(body: Any) -> str:
-    """Assistant text from an OpenAI-compatible response body ('' if absent)."""
+    """Assistant text from an OpenAI-compatible response body ('' if absent).
+    A Responses-API reply (opencode Go on the "responses" wire) is normalised
+    to the chat shape first, the same way `_parse_response` does."""
     if not isinstance(body, dict):
         return ""
+    if "choices" not in body and "output" in body:
+        body = _responses_envelope_to_chat(body)
     choices = body.get("choices") or []
     if choices and isinstance(choices[0], dict):
         return (choices[0].get("message") or {}).get("content", "") or ""
@@ -2261,6 +2357,92 @@ class LearnClassifierUnusable(RuntimeError):
         self.statuses = statuses
 
 
+def _is_retry_later_status(failure_class: BackendFailureClass, status: int) -> bool:
+    """Does this non-2xx answer clear on its own? Rate limits (including the
+    OpenRouter free-tier body), 408 and 5xx do. Other 4xx do not: a 400/422
+    is a deterministic request or wire mismatch that waiting never fixes."""
+    return failure_class == "rate_limited" or status == 408 or status >= 500
+
+
+def _record_learn_http_failure(
+    backend: Backend, resp: httpx.Response,
+    unusable: list[str], unavailable: list[str],
+) -> None:
+    """Log one classifier backend's non-2xx answer and file it by kind.
+
+    Same log helper as the review path, so the unusable-backend monitor sees
+    a dead key here too, and a free-tier refusal logs the non-paging
+    rate-limited token instead. Anything neither unusable nor retry-later (a
+    400/422: a request or wire regression) is filed nowhere: it keeps the
+    plain redrive toward the DLQ, whose monitor surfaces it, instead of a
+    quiet week of deferral."""
+    failure_class = _log_backend_failure(
+        backend_value=backend.value, status=resp.status_code,
+        error=f"http_{resp.status_code}",
+        error_message=_backend_error_message(resp),
+    )
+    status_tag = f"{backend.value}:http_{resp.status_code}"
+    if failure_class == "unusable":
+        unusable.append(status_tag)
+    elif _is_retry_later_status(failure_class, resp.status_code):
+        unavailable.append(status_tag)
+
+
+def _response_json_dict(resp: httpx.Response) -> dict:
+    """The response body as a dict, or {} when it is not a JSON object."""
+    try:
+        body = resp.json()
+    except ValueError:
+        return {}
+    return body if isinstance(body, dict) else {}
+
+
+def _parse_learning_classification(
+    content: str, finding_file: str,
+) -> Optional[LearningClassification]:
+    """The classifier's answer as a classification, or None when it does not
+    parse into the asked-for shape (a redrive re-asks)."""
+    try:
+        data = _loads_leading_object(content) if content else {}
+    except (ValueError, TypeError, AttributeError):
+        # JSONDecodeError is a ValueError; a non-string content is the rest.
+        return None
+    if not isinstance(data, dict):
+        return None
+    raw_durable = data.get("durable", False)
+    # Require an ACTUAL JSON boolean: bool("false") is True, so a string
+    # "false"/"no" from a sloppy backend must NOT persist a one-off as
+    # durable. A non-bool is a schema mismatch -> parse failure -> redrive
+    # (safer than guessing).
+    if not isinstance(raw_durable, bool):
+        return None
+    learning = data.get("learning", "")
+    learning = learning.strip() if isinstance(learning, str) else ""
+    scope = data.get("scope_path", "")
+    scope = scope.strip() if isinstance(scope, str) else ""
+    scope = _scope_covering_finding(scope, finding_file)
+    # A "durable" verdict with no rule text is unusable - treat as one-off
+    # so we never store an empty learning.
+    return {
+        "durable": raw_durable and bool(learning),
+        "learning": learning,
+        "scope_path": scope,
+    }
+
+
+class LearnClassifierUnavailable(RuntimeError):
+    """No classifier backend gave a verdict, and at least one refused for a
+    retry-LATER reason: rate limited (including OpenRouter's free-tier limit),
+    overloaded (5xx), or unreachable. The caller defers the job with a long
+    backoff rather than redriving it toward the DLQ or dropping it: on this
+    deployment the free-tier key refuses sometimes and not others (operator
+    decision 2026-09-23). `statuses` names each backend and why."""
+
+    def __init__(self, statuses: tuple[str, ...]) -> None:
+        super().__init__(f"learn classifier unavailable: {', '.join(statuses)}")
+        self.statuses = statuses
+
+
 def _loads_leading_object(content: str) -> Any:
     """Parse the JSON value the answer OPENS with, ignoring trailing text.
 
@@ -2296,11 +2478,15 @@ def classify_learning(
     pr_context: Optional[PrContext] = None,
 ) -> Optional[LearningClassification]:
     """Decide whether a maintainer's reply to a finding is a DURABLE team
-    preference to remember, or a one-off (#670, ADR-0020). Returns the
-    classification, or None on a failure a retry could clear (transport,
-    429/5xx, unparseable answer). Raises LearnClassifierUnusable when EVERY
-    backend refused for a config/billing reason, which no retry clears. Biased toward one-off: `durable` is only true when
-    the model is confident the reply states a team-wide rule.
+    preference to remember, or a one-off (#670, ADR-0020). Every backend in
+    `_interactive_backend_order` is tried before giving up. Returns the
+    classification, or None when the backends answered but no answer parsed
+    (a model flake a prompt redrive clears). Raises LearnClassifierUnavailable
+    when at least one backend refused for a retry-later reason (429, free-tier
+    limit, 5xx, unreachable), and LearnClassifierUnusable when EVERY backend
+    refused for a config/billing reason, which no retry clears. Biased toward
+    one-off: `durable` is only true when the model is confident the reply
+    states a team-wide rule.
 
     When durable, `learning` is the reply restated as a short self-instructive
     rule Grug can apply verbatim, and `scope_path` is an optional glob (e.g.
@@ -2345,6 +2531,9 @@ def classify_learning(
     # EVERY backend the failure is not transient, and saying so is what
     # keeps a dead key from walking each learn job into the rerun DLQ.
     unusable: list[str] = []
+    # Backends that refused for a reason that clears on its own. Any one of
+    # these makes the whole miss an outage to wait out, not a verdict.
+    unavailable: list[str] = []
     for backend in backends:
         config = _BACKEND_CONFIGS[backend]
         start_ns = time.monotonic_ns()
@@ -2359,6 +2548,7 @@ def classify_learning(
                 # Not counted as unusable: _BackendConfigError also wraps a
                 # transient SSM failure loading the key, which a retry clears.
                 # Only the backend's own 401/402/403/404 answer is proof.
+                unavailable.append(f"{backend.value}:{type(e).__name__}")
                 _annotate_interactive(
                     span, backend=backend, kind="transport_error",
                     messages=messages, start_ns=start_ns, pr_tags=pr_tags,
@@ -2367,53 +2557,20 @@ def classify_learning(
                 continue
             if not 200 <= resp.status_code < 300:
                 # Same token the review path uses, so the unusable-backend
-                # monitor sees a dead key on this path too.
-                _log_backend_failure(
-                    backend_value=backend.value, status=resp.status_code,
-                    error=f"http_{resp.status_code}",
-                )
-                if is_terminal_backend_failure(resp.status_code):
-                    unusable.append(f"{backend.value}:http_{resp.status_code}")
+                # monitor sees a dead key on this path too, and a free-tier
+                # refusal logs the non-paging rate-limited token instead.
+                _record_learn_http_failure(backend, resp, unusable, unavailable)
                 _annotate_interactive(
                     span, backend=backend, kind="http_error",
                     messages=messages, start_ns=start_ns, pr_tags=pr_tags,
                     status_code=resp.status_code,
                 )
                 continue
-            try:
-                body = resp.json()
-            except ValueError:
-                body = {}
-            if not isinstance(body, dict):
-                body = {}
+            body = _response_json_dict(resp)
             content = _choices_content(body)
-            result: Optional[LearningClassification] = None
-            try:
-                data = _loads_leading_object(content) if content else {}
-                if not isinstance(data, dict):
-                    raise ValueError("learn payload not a dict")
-                raw_durable = data.get("durable", False)
-                # Require an ACTUAL JSON boolean: bool("false") is True, so a
-                # string "false"/"no" from a sloppy backend must NOT persist a
-                # one-off as durable. A non-bool is a schema mismatch -> parse
-                # failure -> redrive (safer than guessing).
-                if not isinstance(raw_durable, bool):
-                    raise ValueError("durable is not a boolean")
-                durable = raw_durable
-                learning = data.get("learning", "")
-                learning = learning.strip() if isinstance(learning, str) else ""
-                scope = data.get("scope_path", "")
-                scope = scope.strip() if isinstance(scope, str) else ""
-                scope = _scope_covering_finding(scope, finding_tags.get("file", ""))
-                # A "durable" verdict with no rule text is unusable - treat as
-                # one-off so we never store an empty learning.
-                if durable and not learning:
-                    durable = False
-                result = {
-                    "durable": durable, "learning": learning, "scope_path": scope,
-                }
-            except (KeyError, ValueError, TypeError, AttributeError, json.JSONDecodeError):
-                result = None
+            result = _parse_learning_classification(
+                content, finding_tags.get("file", ""),
+            )
             if result is None:
                 _annotate_interactive(
                     span, backend=backend, kind="parse_failed",
@@ -2428,6 +2585,8 @@ def classify_learning(
                 content=content, body=body, status_code=resp.status_code,
             )
             return result
+    if unavailable:
+        raise LearnClassifierUnavailable(tuple(unavailable + unusable))
     if len(unusable) == len(backends):
         raise LearnClassifierUnusable(tuple(unusable))
     return None
@@ -3725,6 +3884,7 @@ def _run_review_arm(
         )
     _log_backend_failure(
         backend_value=backend.value, status=resp.status_code, error=err,
+        error_message=_backend_error_message(resp),
     )
     return _ArmOutcome(
         backend=backend, kind="http_failed",
@@ -4342,6 +4502,7 @@ def _review_diff_dispatch_cave_primary(
                 continue
             _log_backend_failure(
                 backend_value=backend.value, status=resp.status_code, error=err,
+                error_message=_backend_error_message(resp),
             )
             last_error = f"{backend.value}: {err}"
 

@@ -1365,3 +1365,46 @@ def test_handler_raised_log_carries_the_message_not_just_the_class(monkeypatch, 
     assert "403 Forbidden on /compare" in joined, (
         f"the exception MESSAGE must reach the log, got: {joined[:300]}"
     )
+
+
+def test_poll_not_yet_due_job_is_hidden_until_due_without_redrive_noise(caplog):
+    """A deferred learn job (free-tier outage) arrives before its due time.
+    The consumer hides it for the remaining delay instead of treating it as
+    a failure: no delete, no handler_raised warning, no DLQ announcement."""
+    from rerun_queue import JobNotDue
+
+    handler = MagicMock(side_effect=JobNotDue(1234.2))
+    with (
+        patch.object(
+            consumer._sqs, "receive_message", return_value={"Messages": [_MSG]}
+        ),
+        patch.object(consumer._sqs, "delete_message") as mock_delete,
+        patch.object(consumer._sqs, "change_message_visibility") as mock_vis,
+        patch.object(consumer, "_announce_terminal_failure") as announce,
+        caplog.at_level("INFO"),
+    ):
+        n = consumer._poll_once(_spec(False, handler), "https://q", "arn")
+    assert n == 1
+    mock_delete.assert_not_called()
+    announce.assert_not_called()
+    mock_vis.assert_called_once_with(
+        QueueUrl="https://q", ReceiptHandle="r-1", VisibilityTimeout=1235,
+    )
+    msgs = [r.msg for r in caplog.records]
+    assert "consumer_job_not_due" in msgs
+    assert "consumer_handler_raised" not in msgs
+
+
+def test_poll_not_yet_due_visibility_is_capped_below_the_sqs_maximum():
+    from rerun_queue import JobNotDue
+
+    handler = MagicMock(side_effect=JobNotDue(10 * 86400))
+    with (
+        patch.object(
+            consumer._sqs, "receive_message", return_value={"Messages": [_MSG]}
+        ),
+        patch.object(consumer._sqs, "delete_message"),
+        patch.object(consumer._sqs, "change_message_visibility") as mock_vis,
+    ):
+        consumer._poll_once(_spec(False, handler), "https://q", "arn")
+    assert mock_vis.call_args.kwargs["VisibilityTimeout"] <= 43200

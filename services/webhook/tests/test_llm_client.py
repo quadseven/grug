@@ -3140,10 +3140,11 @@ def test_classify_learning_non_string_rule_is_one_off() -> None:
     assert out is not None and out["durable"] is False and out["learning"] == ""
 
 
-def test_classify_learning_returns_none_on_backend_failure() -> None:
+def test_classify_learning_defers_when_every_backend_is_unreachable() -> None:
+    # No backend reachable is an outage, not a verdict: the caller defers.
     with patch.object(httpx, "post", side_effect=httpx.ConnectError("down")):
-        out = lc.classify_learning("x", "y", {"rule_name": "r"}, installation_id=2)
-    assert out is None
+        with pytest.raises(lc.LearnClassifierUnavailable):
+            lc.classify_learning("x", "y", {"rule_name": "r"}, installation_id=2)
 
 
 def test_classify_learning_drops_a_scope_that_misses_the_findings_file() -> None:
@@ -3561,19 +3562,20 @@ def test_classify_learning_raises_unusable_when_every_backend_is_terminal(status
     assert set(info.value.statuses) == {f"poolside:http_{status}", f"openrouter:http_{status}"}
 
 
-def test_classify_learning_one_terminal_one_transient_stays_retryable(monkeypatch) -> None:
-    # The live mix: one backend dead (403), the other merely flaky (503).
-    # A retry can still succeed on the flaky one, so this is a plain None.
+def test_classify_learning_one_terminal_one_transient_is_deferred(monkeypatch) -> None:
+    # One backend dead (403), the other merely flaky (503). A later try can
+    # still succeed on the flaky one, so the job defers rather than completes.
     monkeypatch.setattr(lc, "_RETRY_SLEEP", lambda s: None)
 
     def fake_post(url, **kw):
         return httpx.Response(403 if "openrouter" in url else 503, json={})
     with patch.object(httpx, "post", side_effect=fake_post):
-        out = lc.classify_learning("q", "f", {"rule_name": "r"}, installation_id=2)
-    assert out is None
+        with pytest.raises(lc.LearnClassifierUnavailable) as info:
+            lc.classify_learning("q", "f", {"rule_name": "r"}, installation_id=2)
+    assert set(info.value.statuses) == {"openrouter:http_403", "poolside:http_503"}
 
 
-def test_classify_learning_key_load_failure_stays_retryable(monkeypatch) -> None:
+def test_classify_learning_key_load_failure_is_deferred_not_unusable(monkeypatch) -> None:
     # _BackendConfigError also wraps a transient SSM failure loading the key,
     # which a retry clears, so it must never count as unusable.
     def ssm_blip():
@@ -3581,8 +3583,8 @@ def test_classify_learning_key_load_failure_stays_retryable(monkeypatch) -> None
     monkeypatch.setattr(lc, "_load_poolside_key", ssm_blip)
     monkeypatch.setattr(lc, "_load_openrouter_key", ssm_blip)
     with patch.object(httpx, "post") as post:
-        out = lc.classify_learning("q", "f", {"rule_name": "r"}, installation_id=2)
-    assert out is None
+        with pytest.raises(lc.LearnClassifierUnavailable):
+            lc.classify_learning("q", "f", {"rule_name": "r"}, installation_id=2)
     assert post.call_count == 0
 
 
@@ -4322,3 +4324,182 @@ def test_unwalked_paths_cover_failed_and_truncated_cohorts() -> None:
     )
     assert lc._unwalked_paths(plan, [2]) == ("b.py", "c.py", "z.py")
     assert lc._unwalked_paths(plan, []) == ("z.py",)
+
+
+# --- OpenRouter free-tier refusals are a retry-later outage (epic #869) -----
+#
+# Operator decision 2026-09-23: grug's OpenRouter key runs ONLY on the free
+# tier, which refuses intermittently with a 403 "Key limit exceeded" (or a 402
+# about credits). That is known flakiness, not a dead key: it must fall
+# through, defer the learn job, and never page. A real revoked key (401) still
+# must.
+
+_FREE_TIER_403 = {"error": {"code": 403, "message": "Key limit exceeded (total limit)"}}
+_FREE_TIER_402 = {"error": {"code": 402, "message": "Insufficient credits. Add more using https://openrouter.ai/settings/credits"}}
+_INVALID_KEY_401 = {"error": {"code": 401, "message": "User not found."}}
+
+
+@pytest.mark.parametrize("status,body", [
+    (403, _FREE_TIER_403),
+    (402, _FREE_TIER_402),
+    (429, {"error": {"code": 429, "message": "Rate limit exceeded: free-models-per-day"}}),
+])
+def test_openrouter_free_tier_refusals_classify_as_rate_limited(status, body) -> None:
+    text = lc._backend_error_message(httpx.Response(status, json=body))
+    assert lc.classify_backend_failure(
+        backend_value="openrouter", status=status, error_message=text,
+    ) == "rate_limited"
+
+
+@pytest.mark.parametrize("backend_value,status,body", [
+    ("openrouter", 401, _INVALID_KEY_401),
+    ("openrouter", 403, {"error": {"code": 403, "message": "Your input was flagged"}}),
+    ("openrouter", 403, {}),
+    ("openrouter", 404, {"error": {"message": "No endpoints found"}}),
+    # Only OpenRouter's refusal bodies are known to mean "free tier, later".
+    ("poolside", 402, {"error": {"message": "out of credits"}}),
+])
+def test_genuine_config_failures_stay_unusable(backend_value, status, body) -> None:
+    text = lc._backend_error_message(httpx.Response(status, json=body))
+    assert lc.classify_backend_failure(
+        backend_value=backend_value, status=status, error_message=text,
+    ) == "unusable"
+
+
+def test_free_tier_refusal_logs_the_non_paging_token(caplog) -> None:
+    # The llm_backend_unusable monitor pages. A free-tier refusal is expected
+    # flakiness on this deployment, so it gets its own token.
+    with caplog.at_level(logging.INFO, logger=lc.log.name):
+        lc._log_backend_failure(
+            backend_value="openrouter", status=403, error="http_403",
+            error_message="Key limit exceeded (total limit)",
+        )
+        lc._log_backend_failure(
+            backend_value="openrouter", status=401, error="http_401",
+            error_message="User not found.",
+        )
+    msgs = [r.msg for r in caplog.records]
+    assert msgs == ["llm_backend_rate_limited", "llm_backend_unusable"]
+
+
+def test_classify_learning_free_tier_403_falls_through_to_poolside(caplog) -> None:
+    # Odd install: OpenRouter is primary and refuses with the free-tier body;
+    # Poolside answers, so the reply is classified with no page.
+    def fake_post(url, **kw):
+        if "openrouter" in url:
+            return httpx.Response(403, json=_FREE_TIER_403)
+        return httpx.Response(200, json=_openai_json_response(
+            '{"durable": false, "learning": "", "scope_path": ""}'))
+    with caplog.at_level(logging.INFO, logger=lc.log.name):
+        with patch.object(httpx, "post", side_effect=fake_post):
+            out = lc.classify_learning("q", "f", {"rule_name": "r"}, installation_id=3)
+    assert out == {"durable": False, "learning": "", "scope_path": ""}
+    msgs = [r.msg for r in caplog.records]
+    assert "llm_backend_rate_limited" in msgs
+    assert "llm_backend_unusable" not in msgs
+
+
+def test_classify_learning_every_backend_free_tier_refusing_is_deferred(monkeypatch, caplog) -> None:
+    # Every backend refusing for a retry-later reason: not a verdict, not
+    # unusable. The caller defers the job instead of completing or DLQing it.
+    monkeypatch.setattr(lc, "_RETRY_SLEEP", lambda s: None)
+
+    def fake_post(url, **kw):
+        if "openrouter" in url:
+            return httpx.Response(403, json=_FREE_TIER_403)
+        return httpx.Response(429, json={"error": {"message": "slow down"}})
+    with caplog.at_level(logging.INFO, logger=lc.log.name):
+        with patch.object(httpx, "post", side_effect=fake_post):
+            with pytest.raises(lc.LearnClassifierUnavailable) as info:
+                lc.classify_learning("q", "f", {"rule_name": "r"}, installation_id=2)
+    assert set(info.value.statuses) == {"openrouter:http_403", "poolside:http_429"}
+    assert "llm_backend_unusable" not in [r.msg for r in caplog.records]
+
+
+def test_classify_learning_free_tier_plus_dead_backend_is_deferred(monkeypatch) -> None:
+    # The live 2026-09-23 mix: Poolside unfunded (402), OpenRouter free tier
+    # over its limit. The free tier recovers on its own, so this defers
+    # rather than dropping the reply as #1050 did.
+    def fake_post(url, **kw):
+        if "openrouter" in url:
+            return httpx.Response(403, json=_FREE_TIER_403)
+        return httpx.Response(402, json={"error": {"message": "payment required"}})
+    with patch.object(httpx, "post", side_effect=fake_post):
+        with pytest.raises(lc.LearnClassifierUnavailable):
+            lc.classify_learning("q", "f", {"rule_name": "r"}, installation_id=2)
+
+
+def test_classify_learning_invalid_key_401_everywhere_is_still_unusable(caplog) -> None:
+    response = httpx.Response(401, json=_INVALID_KEY_401)
+    with caplog.at_level(logging.ERROR, logger=lc.log.name):
+        with patch.object(httpx, "post", return_value=response):
+            with pytest.raises(lc.LearnClassifierUnusable):
+                lc.classify_learning("q", "f", {"rule_name": "r"}, installation_id=2)
+    assert [r.msg for r in caplog.records] == ["llm_backend_unusable"] * 2
+
+
+def test_interactive_order_adds_opencode_go_only_when_configured(monkeypatch) -> None:
+    monkeypatch.delenv("GRUG_OPENCODE_GO_API_KEY_SSM", raising=False)
+    assert lc._interactive_backend_order(2) == (Backend.POOLSIDE, Backend.OPENROUTER)
+    monkeypatch.setenv("GRUG_OPENCODE_GO_API_KEY_SSM", "/some/param")
+    assert lc._interactive_backend_order(3) == (
+        Backend.OPENROUTER, Backend.POOLSIDE, Backend.OPENCODE_GO,
+    )
+
+
+def test_classify_learning_falls_through_to_opencode_go(monkeypatch) -> None:
+    # Both free/unfunded backends refusing: the already-configured opencode Go
+    # tier answers, so the job needs no deferral at all.
+    monkeypatch.setenv("GRUG_OPENCODE_GO_API_KEY_SSM", "/some/param")
+
+    def fake_post(url, **kw):
+        if "openrouter" in url:
+            return httpx.Response(403, json=_FREE_TIER_403)
+        if "opencode" in url:
+            return httpx.Response(200, json=_openai_json_response(
+                '{"durable": false, "learning": "", "scope_path": ""}'))
+        return httpx.Response(402, json={})
+    with patch.object(httpx, "post", side_effect=fake_post) as post:
+        out = lc.classify_learning("q", "f", {"rule_name": "r"}, installation_id=2)
+    assert out == {"durable": False, "learning": "", "scope_path": ""}
+    assert post.call_count == 3
+
+
+def test_review_arm_free_tier_refusal_does_not_page(caplog) -> None:
+    # The review path logs through the same helper; its SaaS arm must not
+    # emit the paging token for a free-tier refusal either.
+    response = httpx.Response(403, json=_FREE_TIER_403)
+    with caplog.at_level(logging.INFO, logger=lc.log.name):
+        with patch.object(httpx, "post", return_value=response):
+            outcome = lc._run_review_arm(
+                Backend.OPENROUTER, [{"role": "user", "content": "x"}], "v1", {},
+                config_override=lc._BACKEND_CONFIGS[Backend.OPENROUTER],
+            )
+    assert outcome.kind == "http_failed"
+    msgs = [r.msg for r in caplog.records]
+    assert "llm_backend_rate_limited" in msgs
+    assert "llm_backend_unusable" not in msgs
+
+
+@pytest.mark.parametrize("status", [400, 422])
+def test_classify_learning_permanent_4xx_redrives_rather_than_defers(status) -> None:
+    # Codex adversarial review: a 400/422 is a request or wire regression
+    # that waiting never fixes. Deferring it would hide it for a week; it
+    # keeps the plain redrive toward the DLQ, whose monitor surfaces it.
+    response = httpx.Response(status, json={"error": {"message": "bad request"}})
+    with patch.object(httpx, "post", return_value=response):
+        out = lc.classify_learning("q", "f", {"rule_name": "r"}, installation_id=2)
+    assert out is None
+
+
+def test_classify_learning_permanent_4xx_plus_free_tier_refusal_defers() -> None:
+    # One backend has a request bug, the other is only rate limited: the
+    # rate-limited one can still answer later, so the job waits for it.
+    def fake_post(url, **kw):
+        if "openrouter" in url:
+            return httpx.Response(403, json=_FREE_TIER_403)
+        return httpx.Response(400, json={})
+    with patch.object(httpx, "post", side_effect=fake_post):
+        with pytest.raises(lc.LearnClassifierUnavailable) as info:
+            lc.classify_learning("q", "f", {"rule_name": "r"}, installation_id=2)
+    assert info.value.statuses == ("openrouter:http_403",)
