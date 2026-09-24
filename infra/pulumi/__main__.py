@@ -65,9 +65,9 @@ secrets = ssm_secrets.reference_existing(
 
 # Datadog API key — the shared INFRA DD key (`/infra/datadog/api_key`), the
 # same pair the operator's shared infrastructure Pulumi uses. Consolidated here
-# (#258 follow-up) so grug doesn't maintain its own DD credentials: the prior
-# `/shared/datadog-*` keys were revoked out-of-band and grug had no reason to
-# carry a separate key. Lambda extension reads DD_API_KEY to ship traces/logs.
+# (#258 follow-up) so grug doesn't maintain its own DD credentials: grug had
+# no reason to carry a separate key. The prior per-project keys are gone.
+# Lambda extension reads DD_API_KEY to ship traces/logs.
 _dd_api_key = aws.ssm.get_parameter(
     name="/infra/datadog/api_key",
     with_decryption=True,
@@ -428,9 +428,9 @@ _rerun_jobs_queue = aws.sqs.Queue(
 
 # Datadog monitors (Slice 9 #30). Provider reads DD creds from SSM — the
 # shared INFRA DD app key (`/infra/datadog/app_key`), paired with the infra
-# API key above. One shared DD key pair rather than a grug-specific one (the
-# old per-project `/shared/datadog-app-key/github-grug` was revoked
-# out-of-band; consolidating removes a key grug had no reason to own).
+# API key above. One shared DD key pair rather than a grug-specific one
+# (consolidating removes a key grug had no reason to own). The old per-project
+# app key outlived that move and was revoked on 2026-09-24.
 _dd_app_key = aws.ssm.get_parameter(
     name="/infra/datadog/app_key", with_decryption=True,
 )
