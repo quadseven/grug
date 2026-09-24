@@ -123,7 +123,7 @@ def test_trust_is_pull_request_only_and_not_a_branch_or_wildcard():
 
 def test_workflow_asks_for_the_parameter_this_role_is_scoped_to():
     text = GUARD_WORKFLOW.read_text(encoding="utf-8")
-    assert f"DENY_LIST: {DENY_LIST_PARAM}" in text
+    assert f"deny-list-ssm-param: {DENY_LIST_PARAM}" in text
     assert "role/grug-gha-leak-guard" in text
     # Never the deploy role: it can write SSM/IAM/S3 and this workflow runs on
     # pull_request. Assumed here rather than left to review.

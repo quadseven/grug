@@ -1,121 +1,66 @@
 name: Guard · Private leaks
 
 # PURPOSE: this repo is PUBLIC. Stop private-infrastructure identifiers -
-#   hostnames, cluster/node names, private-range IPs, cross-repo issue refs -
-#   from reaching it.
+#   hostnames, cluster/node names, private-range IPs, cross-repo issue refs,
+#   and the names of people and products - from reaching it.
 #
-# WHY IT EXISTS. On 2026-08-15 a working session spanning this repo and a
-#   private infrastructure repo leaked cluster node names, private repo names
-#   and cross-repo ticket numbers into public commits, issues and PR bodies.
-#   None of it was secret-SHAPED - no key, no token - so the existing secret
-#   scanning had no opinion, and neither did review. What leaked was topology,
-#   which is what makes infrastructure enumerable.
+# THIS IS NOW A THIN CALLER for the fleet's shared leak scan,
+#   quadseven/infra-public/.github/workflows/_reusable.leak-scan.yml, the same
+#   one every other first-party public repo runs (infra#2997). This repo's
+#   copy of the scanner was the origin of the shared one; running two copies
+#   in CI meant a pattern fix landed in one and not the other. The local
+#   scripts/check_private_leaks.py stays for the pre-commit hook
+#   (.githooks/pre-commit), which runs before a commit exists and needs no
+#   network.
 #
-# WHY BOTH A HOOK AND THIS. .githooks/pre-commit is faster and blocks before
-#   the commit exists, but it only works in a clone where someone ran
-#   `git config core.hooksPath .githooks`. This is the backstop for a fresh
-#   clone, another machine, a worktree, or an agent that never ran it - which is
-#   exactly the situation that produced the leak.
+# WHAT IT SCANS. The PR diff AND the PR title/body. Most of the 2026-08-15
+#   leaks were in prose, not code.
 #
-# WHAT IT SCANS. The PR diff AND the PR body/title. That second part is not
-#   incidental: most of the 2026-08-15 leaks were in prose, not code, and no
-#   code scanner would have looked at them.
+# LAYER 2 IS ON (grug#921). Shapes cannot match a PERSON: a first name has no
+#   shape. The specific terms live in the SSM SecureString below and are
+#   fetched at run time through grug-gha-leak-guard, a role whose ENTIRE
+#   policy is "read that one parameter" (infra/pulumi/components/
+#   leak_guard_role.py). Deliberately NOT grug-gha-deploy: trusting that from
+#   a pull_request would hand deploy rights to anyone who can open a PR.
+#   scripts/tests/test_check_private_leaks.py asserts this caller still passes
+#   the parameter, so dropping it fails a test instead of silently un-arming
+#   the guard - which is how this guard ran for months.
 #
-# The pattern list lives in scripts/check_private_leaks.py and contains only
-# generic SHAPES, never specific host names - a deny-list naming the real hosts
-# could not live in a public repo without being the leak it prevents.
+# FAIL CLOSED. A deny-list that cannot be read, or holds no terms, is a red
+#   check. So is a scanner that could not run. A deny-list hit is redacted in
+#   the log, never echoed: this log is public.
 #
-# LAYER 2 (grug#921). Shapes cannot match a PERSON: a first name has no shape.
-#   The specific terms - people, products, host codenames - live in the SSM
-#   SecureString named below and are fetched at run time. This workflow shipped
-#   without passing --deny-list-ssm on either step, so for its entire life the
-#   guard ran on 6 generic patterns, reported "clean", and was structurally
-#   incapable of matching the operator's own first name while it sat in ten
-#   source files. Both steps now pass the flag, and
-#   scripts/tests/test_check_private_leaks.py asserts they still do.
+# FORK PRs. A fork PR gets no secrets and cannot mint OIDC, so the role ARN
+#   below resolves to empty and the reusable fails with "deny-list-ssm-param is
+#   set but the aws-role-arn secret is empty" rather than quietly running layer
+#   1 only. A maintainer re-opens such a change from a branch in this repo.
 #
-# CREDENTIALS. GitHub OIDC into grug-gha-leak-guard - a role whose ENTIRE
-#   policy is "read that one parameter". Deliberately NOT grug-gha-deploy:
-#   that role can write SSM, IAM and S3, and trusting it from a pull_request
-#   would hand full deploy rights to anyone who can open a PR (the same reason
-#   its feat/* branch trust was retired). Defined in
-#   infra/pulumi/components/leak_guard_role.py.
-#
-# FORK PRs. A pull_request from a fork gets read-only token permissions, so it
-#   cannot mint an OIDC token and cannot read the deny-list. That case FAILS
-#   LOUDLY below rather than quietly running layer 1 only: a check that goes
-#   green while covering half of what it claims is how this guard was broken in
-#   the first place. A maintainer re-runs such a PR from a branch in this repo.
+# scanner-ref: pinned to the infra-public commit that makes the shared scanner
+#   read the deny-list one term per line and redact deny-list hits
+#   (infra-public#106). Before that change the shared scanner split the list on
+#   whitespace and echoed matched terms, so it must not read this list at main
+#   until that merges. Drop this input (back to the default, `main`) once it
+#   has.
 
 on:
   pull_request:
     types: [opened, synchronize, reopened, edited]
 
-permissions:
-  contents: read
-  pull-requests: read
-  # Mint the OIDC token for grug-gha-leak-guard. Without this the AWS creds
-  # step fails with "Could not load credentials from any providers" - the
-  # token cannot be requested at all, which is a confusing way to learn that
-  # a permissions block is missing (same trap preview.yml documents).
-  id-token: write
-
-concurrency:
-  group: guard-private-leaks-${{ github.event.pull_request.number }}
-  cancel-in-progress: true
-
 jobs:
-  scan:
-    name: Scan diff and PR text for private identifiers
-    runs-on: ubuntu-latest
-    timeout-minutes: 5
-    steps:
-      - name: "1. Checkout with enough history to diff the PR"
-        uses: actions/checkout@08c6903cd8c0fde910a37f88322edcfb5dd907a8 # v5
-        with:
-          fetch-depth: 0
-
-      - name: "2. Refuse to run half-armed on a fork PR"
-        # Explicit, before the credentials step, so the failure reads as a
-        # policy decision instead of an opaque OIDC error.
-        if: github.event.pull_request.head.repo.full_name != github.repository
-        run: |
-          echo "::error::Leak guard cannot run on a fork PR."
-          echo "A fork's token cannot mint OIDC, so the deny-list is unreadable."
-          echo "This guard will not report a green check while its people and"
-          echo "product layer is off. A maintainer must re-open this change from"
-          echo "a branch in this repository."
-          exit 1
-
-      - name: "3. AWS credentials (read-only, one parameter)"
-        uses: aws-actions/configure-aws-credentials@ec61189d14ec14c8efccab744f656cffd0e33f37 # v6.1.0
-        with:
-          role-to-assume: arn:aws:iam::${{ secrets.AWS_ACCOUNT_ID }}:role/grug-gha-leak-guard
-          aws-region: us-east-1
-
-      - name: "4. Scan the PR diff"
-        env:
-          BASE_SHA: ${{ github.event.pull_request.base.sha }}
-          HEAD_SHA: ${{ github.event.pull_request.head.sha }}
-          # Path, not a secret. The VALUES are the secret, and they live only
-          # in this SecureString - never in this repo.
-          DENY_LIST: /grug/leak-guard-deny-list
-        run: |
-          set -euo pipefail
-          python3 scripts/check_private_leaks.py --diff "${BASE_SHA}..${HEAD_SHA}" --deny-list-ssm "${DENY_LIST}"
-
-      - name: "5. Scan the PR title and body"
-        # Through a FILE via env, never interpolated into the script: a PR body
-        # is attacker-controlled text and `${{ }}` inside run: is a command
-        # injection. Writing it out and scanning the file keeps it inert.
-        if: always()
-        env:
-          PR_TITLE: ${{ github.event.pull_request.title }}
-          PR_BODY: ${{ github.event.pull_request.body }}
-          # Path, not a secret. The VALUES are the secret, and they live only
-          # in this SecureString - never in this repo.
-          DENY_LIST: /grug/leak-guard-deny-list
-        run: |
-          set -euo pipefail
-          printf '%s\n%s\n' "$PR_TITLE" "$PR_BODY" > /tmp/pr-text.md
-          python3 scripts/check_private_leaks.py --text-file /tmp/pr-text.md --deny-list-ssm "${DENY_LIST}"
+  leak-scan:
+    uses: quadseven/infra-public/.github/workflows/_reusable.leak-scan.yml@c9bd945704f0d33f1fa576eb4a5d469910c483df
+    permissions:
+      contents: read
+      # Mint the OIDC token for grug-gha-leak-guard.
+      id-token: write
+    with:
+      allowed-repo-refs: infra, infra-public
+      # Path, not a secret. The VALUES are the secret and live only in this
+      # SecureString, never in this repo.
+      deny-list-ssm-param: /grug/leak-guard-deny-list
+      scanner-ref: f138bba57e6dc6366d5fc171e5d643a4f4c052ac
+    secrets:
+      # Empty (not a half-built ARN) when AWS_ACCOUNT_ID is unavailable, e.g.
+      # on a fork PR, so the reusable's explicit "secret is empty" refusal
+      # fires instead of an opaque AssumeRole error.
+      aws-role-arn: ${{ secrets.AWS_ACCOUNT_ID && format('arn:aws:iam::{0}:role/grug-gha-leak-guard', secrets.AWS_ACCOUNT_ID) || '' }}
