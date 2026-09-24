@@ -7,10 +7,11 @@ that keep the shortcut from creeping back in:
 
   1. the role reads exactly ONE parameter, never the `/grug/*` path that also
      holds the GitHub App private key and the database URL, and
-  2. the workflow asks for the same parameter this role is scoped to - a drift
-     there means the guard fetches a path it has no permission for, which
-     surfaces as a red CI job rather than a silent downgrade, but is still
-     better caught here.
+  2. the workflow never assumes the deploy role. Since grug#1057 the
+     workflow reads the fleet's shared deny-list through the shared
+     LEAK_SCAN_ROLE_ARN role instead of this one; this role is retired in
+     that issue's follow-up, and scripts/tests/test_check_private_leaks.py
+     pins the workflow's parameter and secret.
 """
 
 from __future__ import annotations
@@ -121,10 +122,9 @@ def test_trust_is_pull_request_only_and_not_a_branch_or_wildcard():
     return pulumi.Output.all(bundle.role.urn, bundle.policy.urn).apply(check)
 
 
-def test_workflow_asks_for_the_parameter_this_role_is_scoped_to():
+def test_workflow_never_assumes_the_deploy_role():
     text = GUARD_WORKFLOW.read_text(encoding="utf-8")
-    assert f"deny-list-ssm-param: {DENY_LIST_PARAM}" in text
-    assert "role/grug-gha-leak-guard" in text
+    assert "aws-role-arn: ${{ secrets.LEAK_SCAN_ROLE_ARN }}" in text
     # Never the deploy role: it can write SSM/IAM/S3 and this workflow runs on
     # pull_request. Assumed here rather than left to review.
     assert "role/grug-gha-deploy" not in text

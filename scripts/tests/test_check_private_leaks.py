@@ -271,8 +271,14 @@ def test_ci_workflow_passes_the_deny_list_on_every_invocation():
         ln for ln in text.splitlines() if not ln.lstrip().startswith("#")
     )
     assert "infra-public/.github/workflows/_reusable.leak-scan.yml@" in live
-    assert "deny-list-ssm-param: /grug/leak-guard-deny-list" in live
-    assert "aws-role-arn:" in live, "deny-list set but no role to read it"
+    # The fleet's shared list (grug#1057), seeded from grug's own and
+    # holding the same terms.
+    assert "deny-list-ssm-param: /infra/leak-scan/deny-list" in live
+    assert "aws-role-arn: ${{ secrets.LEAK_SCAN_ROLE_ARN }}" in live, (
+        "deny-list set but no role to read it"
+    )
+    # enforce stays on: a finding must fail this check, not warn.
+    assert "enforce: false" not in live
     assert "id-token: write" in live, "cannot mint OIDC without it"
     # The old two local invocations must not linger as a second,
     # un-armed path.

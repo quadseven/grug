@@ -17,11 +17,15 @@ name: Guard · Private leaks
 #   leaks were in prose, not code.
 #
 # LAYER 2 IS ON (grug#921). Shapes cannot match a PERSON: a first name has no
-#   shape. The specific terms live in the SSM SecureString below and are
-#   fetched at run time through grug-gha-leak-guard, a role whose ENTIRE
-#   policy is "read that one parameter" (infra/pulumi/components/
-#   leak_guard_role.py). Deliberately NOT grug-gha-deploy: trusting that from
-#   a pull_request would hand deploy rights to anyone who can open a PR.
+#   shape. The specific terms live in the fleet's shared SSM SecureString
+#   below (the same list every first-party public repo scans with, infra#2997)
+#   and are fetched at run time through the role in the LEAK_SCAN_ROLE_ARN
+#   secret. That role's ENTIRE policy is "read that one parameter", and it
+#   trusts only pull_request runs of the public repos that share it.
+#   Deliberately NOT grug-gha-deploy: trusting that from a pull_request would
+#   hand deploy rights to anyone who can open a PR. This used to be grug's own
+#   copy of the list behind grug-gha-leak-guard; the shared list was seeded
+#   from it and holds the same terms, so one list now serves the fleet.
 #   scripts/tests/test_check_private_leaks.py asserts this caller still passes
 #   the parameter, so dropping it fails a test instead of silently un-arming
 #   the guard - which is how this guard ran for months.
@@ -35,12 +39,9 @@ name: Guard · Private leaks
 #   set but the aws-role-arn secret is empty" rather than quietly running layer
 #   1 only. A maintainer re-opens such a change from a branch in this repo.
 #
-# scanner-ref: pinned to the infra-public commit that makes the shared scanner
-#   read the deny-list one term per line and redact deny-list hits
-#   (infra-public#106). Before that change the shared scanner split the list on
-#   whitespace and echoed matched terms, so it must not read this list at main
-#   until that merges. Drop this input (back to the default, `main`) once it
-#   has.
+# scanner-ref: left at the default (`main`). infra-public#106, which makes the
+#   shared scanner read the deny-list one term per line and redact deny-list
+#   hits, has merged, and the `uses:` pin below is at or after it.
 
 on:
   pull_request:
@@ -48,19 +49,17 @@ on:
 
 jobs:
   leak-scan:
-    uses: quadseven/infra-public/.github/workflows/_reusable.leak-scan.yml@c9bd945704f0d33f1fa576eb4a5d469910c483df
+    uses: quadseven/infra-public/.github/workflows/_reusable.leak-scan.yml@273755079c88172df39501ee6914fd878c0920bc
     permissions:
       contents: read
-      # Mint the OIDC token for grug-gha-leak-guard.
+      # Mint the OIDC token for the deny-list read role.
       id-token: write
     with:
       allowed-repo-refs: infra, infra-public
       # Path, not a secret. The VALUES are the secret and live only in this
       # SecureString, never in this repo.
-      deny-list-ssm-param: /grug/leak-guard-deny-list
-      scanner-ref: 5a855cf1310d248d4fd7da8a8081d44262a21c8e
+      deny-list-ssm-param: /infra/leak-scan/deny-list
     secrets:
-      # Empty (not a half-built ARN) when AWS_ACCOUNT_ID is unavailable, e.g.
-      # on a fork PR, so the reusable's explicit "secret is empty" refusal
-      # fires instead of an opaque AssumeRole error.
-      aws-role-arn: ${{ secrets.AWS_ACCOUNT_ID && format('arn:aws:iam::{0}:role/grug-gha-leak-guard', secrets.AWS_ACCOUNT_ID) || '' }}
+      # Empty on a fork PR (no secrets), so the reusable's explicit "secret
+      # is empty" refusal fires instead of an opaque AssumeRole error.
+      aws-role-arn: ${{ secrets.LEAK_SCAN_ROLE_ARN }}
