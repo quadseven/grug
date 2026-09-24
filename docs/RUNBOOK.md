@@ -860,7 +860,10 @@ backend failed:
 
 A deferral never counts toward the rerun DLQ: FIFO queues have no
 per-message delay, so the copy is a new message carrying `not_before`, and the
-consumer hides it until then (`consumer_job_not_due`). The wait starts at 15
+consumer hides it until then (`consumer_job_not_due`). If that hide fails
+(`consumer_not_due_hide_failed`), the copy comes back early; a second early
+arrival is replaced by a fresh copy (`learn_deferred_requeued`) so early
+receives never reach maxReceiveCount. The wait starts at 15
 minutes and doubles to a 6 hour cap. Each deferral logs
 `learn_classifier_deferred` (repo, PR, comment, `defer_count`, the backend
 statuses). After 7 days of deferral the job completes as

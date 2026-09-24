@@ -598,6 +598,7 @@ def enqueue_learn(
     *, install_id: int, repo: str, pr_number: int, comment_id: int,
     parent_comment_id: int, reply_text: str, author: str = "",
     defer_count: int = 0, not_before: float = 0.0, first_deferred_at: float = 0.0,
+    requeue_of: str = "",
 ) -> None:
     """Enqueue a learnings-classification job (#670, ADR-0020) so the LLM
     classifier runs in the consumer, NOT inline in the webhook ACK path.
@@ -608,7 +609,8 @@ def enqueue_learn(
 
     `defer_count`/`not_before`/`first_deferred_at` are set only when a job
     is re-enqueued because every classifier backend was rate limited or
-    down; the consumer holds it until `not_before`."""
+    down; the consumer holds it until `not_before`. `requeue_of` is the SQS
+    message id of a not-yet-due copy being replaced by a fresh one."""
     if not _RERUN_QUEUE_URL:
         raise RuntimeError("GRUG_RERUN_QUEUE_URL not configured")
     job: dict[str, Any] = {
@@ -627,6 +629,8 @@ def enqueue_learn(
         # SQS's 5-minute dedup window when the first deferral is sent, and a
         # collapsed send would lose the job.
         dedup_material += f"\x1fdefer{defer_count}"
+    if requeue_of:
+        dedup_material += f"\x1frequeue{requeue_of}"
     _sqs.send_message(
         QueueUrl=_RERUN_QUEUE_URL,
         MessageBody=json.dumps(job),
@@ -992,7 +996,39 @@ def _run_learn(
     return result
 
 
-def _run_one(body: str) -> str:
+def _hold_or_requeue_learn(
+    job: dict[str, Any], remaining: float, receive_count: int, message_id: str,
+) -> str:
+    """A deferred learn job arrived before its `not_before`.
+
+    On its first receive, ask the consumer to hide it until due (JobNotDue).
+    A not-due job seen AGAIN means that hide failed, and every early receive
+    counts toward the DLQ's maxReceiveCount - left alone, a visibility-API
+    outage would dead-letter the reply. So a repeat early arrival is replaced
+    by a fresh copy (its own receive count) and this one completes. If that
+    send fails too, the raise redrives as usual."""
+    if receive_count < 2 or not message_id:
+        raise JobNotDue(remaining)
+    enqueue_learn(
+        install_id=int(job["install_id"]), repo=str(job["repo"]),
+        pr_number=int(job["pr_number"]),
+        comment_id=int(job.get("comment_id", 0)),
+        parent_comment_id=int(job.get("parent_comment_id", 0)),
+        reply_text=str(job.get("reply_text", "")),
+        author=str(job.get("author", "")),
+        defer_count=max(1, int(job.get("defer_count", 0) or 0)),
+        not_before=float(job.get("not_before", 0) or 0),
+        first_deferred_at=float(job.get("first_deferred_at", 0) or 0),
+        requeue_of=message_id,
+    )
+    log.warning("learn_deferred_requeued", extra={
+        "repo": str(job["repo"]), "pr": int(job["pr_number"]),
+        "comment_id": int(job.get("comment_id", 0)),
+        "receive_count": receive_count, "remaining_s": int(remaining)})
+    return "learn_deferred"
+
+
+def _run_one(body: str, *, receive_count: int = 0, message_id: str = "") -> str:
     """Re-run ONE job. Raises on a malformed message or an infra fetch failure
     (→ ESM retry → DLQ). Returns a short status for the batch summary log.
 
@@ -1010,7 +1046,7 @@ def _run_one(body: str) -> str:
         # at once; FIFO queues have no per-message delay. Hold it until due.
         remaining = float(job.get("not_before", 0) or 0) - _now()
         if remaining > 0:
-            raise JobNotDue(remaining)
+            return _hold_or_requeue_learn(job, remaining, receive_count, message_id)
         return _run_learn(
             install_id, repo_full, pr_number,
             int(job.get("comment_id", 0)),
@@ -1941,7 +1977,16 @@ def handle_rerun_jobs(event: dict[str, Any]) -> dict[str, int]:
     statuses: list[str] = []
     for rec in records:
         body = rec.get("body", "") if isinstance(rec, dict) else ""
-        statuses.append(_run_one(body))  # may raise → ESM retry → DLQ
+        attrs = rec.get("attributes", {}) if isinstance(rec, dict) else {}
+        try:
+            receive_count = int((attrs or {}).get("ApproximateReceiveCount", 0))
+        except (TypeError, ValueError):
+            receive_count = 0
+        message_id = str(rec.get("messageId", "")) if isinstance(rec, dict) else ""
+        # may raise → ESM retry → DLQ
+        statuses.append(_run_one(
+            body, receive_count=receive_count, message_id=message_id,
+        ))
     return {
         "records": len(records),
         "dispatched": statuses.count("dispatched"),

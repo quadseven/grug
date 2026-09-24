@@ -2215,3 +2215,51 @@ def test_run_one_learn_due_passes_the_deferral_state(monkeypatch):
     })
     assert rerun._run_one(body) == "learned"
     assert seen["defer_count"] == 2 and seen["first_deferred_at"] == 100.0
+
+
+def test_not_due_learn_seen_again_is_replaced_by_a_fresh_copy(monkeypatch):
+    """Codex adversarial review: if the consumer's visibility hide fails, the
+    not-due copy comes back every 15 minutes and each receive counts toward
+    maxReceiveCount, so a visibility-API outage would dead-letter the reply.
+    A repeat early arrival is replaced by a fresh copy (fresh receive count)
+    and the current one completes."""
+    sent = []
+    monkeypatch.setattr(rerun, "_RERUN_QUEUE_URL", "https://sqs.example/q.fifo")
+    monkeypatch.setattr(rerun._sqs, "send_message", lambda **kw: sent.append(kw))
+    monkeypatch.setattr(rerun, "_now", lambda: 1_000.0)
+    monkeypatch.setattr(rerun, "_run_learn",
+                        lambda *a, **k: (_ for _ in ()).throw(AssertionError("too early")))
+    job = {
+        "kind": "learn", "install_id": 11, "repo": "o/r", "pr_number": 7,
+        "comment_id": 5001, "parent_comment_id": 4000, "reply_text": "hi",
+        "author": "dev", "defer_count": 2, "not_before": 9_000.0,
+        "first_deferred_at": 100.0,
+    }
+    event = {"Records": [{
+        "body": json.dumps(job), "messageId": "m-9",
+        "attributes": {"ApproximateReceiveCount": "2"},
+    }]}
+    rerun.handle_rerun_jobs(event)
+    assert len(sent) == 1
+    copy = json.loads(sent[0]["MessageBody"])
+    for key in ("comment_id", "reply_text", "author", "defer_count",
+                "not_before", "first_deferred_at"):
+        assert copy[key] == job[key], key
+    # Distinct from the copy it replaces, or SQS dedup would swallow it.
+    rerun.enqueue_learn(install_id=11, repo="o/r", pr_number=7, comment_id=5001,
+                        parent_comment_id=4000, reply_text="hi", defer_count=2,
+                        not_before=9_000.0, first_deferred_at=100.0)
+    assert sent[1]["MessageDeduplicationId"] != sent[0]["MessageDeduplicationId"]
+
+
+def test_not_due_learn_first_receive_is_hidden_not_copied(monkeypatch):
+    from rerun_queue import JobNotDue
+    monkeypatch.setattr(rerun, "_now", lambda: 1_000.0)
+    monkeypatch.setattr(rerun._sqs, "send_message",
+                        lambda **kw: (_ for _ in ()).throw(AssertionError("no copy")))
+    job = {"kind": "learn", "install_id": 11, "repo": "o/r", "pr_number": 7,
+           "comment_id": 5001, "defer_count": 1, "not_before": 2_000.0}
+    event = {"Records": [{"body": json.dumps(job), "messageId": "m-9",
+                          "attributes": {"ApproximateReceiveCount": "1"}}]}
+    with pytest.raises(JobNotDue):
+        rerun.handle_rerun_jobs(event)
