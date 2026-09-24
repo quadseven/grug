@@ -1983,7 +1983,7 @@ def handle_rerun_jobs(event: dict[str, Any]) -> dict[str, int]:
         except (TypeError, ValueError):
             receive_count = 0
         message_id = str(rec.get("messageId", "")) if isinstance(rec, dict) else ""
-        # may raise → ESM retry → DLQ
+        # may raise -> ESM retry -> DLQ
         statuses.append(_run_one(
             body, receive_count=receive_count, message_id=message_id,
         ))
