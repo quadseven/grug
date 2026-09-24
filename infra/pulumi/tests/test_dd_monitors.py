@@ -65,6 +65,8 @@ def test_crashloop_query_detects_crashloopbackoff_per_pod() -> None:
     assert "kube_namespace:grug" in q
     assert "by {pod_name}" in q
     assert "> 0" in q
+    # infra#2081: healthy must read OK, not No Data.
+    assert q.startswith("max(last_5m):default_zero(max:")
 
 
 def test_restart_spike_query_is_namespace_scoped() -> None:
@@ -359,6 +361,8 @@ def test_deploy_rollback_query_shape() -> None:
     q = deploy_rollback_query("prod")
     assert "grug.deploy.rollback" in q and "env:prod" in q
     assert q.endswith("> 0") and ".as_count()" in q
+    # infra#2081: a quiet window must read OK, not No Data.
+    assert "default_zero(sum:grug.deploy.rollback{" in q
 
 
 @pulumi.runtime.test

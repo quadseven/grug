@@ -112,10 +112,14 @@ def workload_not_ready_query() -> str:
 
 def crashloop_query() -> str:
     """Any grug pod (incl grug-consumer) in CrashLoopBackOff. DD lowercases
-    tag values, so the waiting reason is `crashloopbackoff`."""
+    tag values, so the waiting reason is `crashloopbackoff`.
+
+    default_zero (quadseven/infra#2081): the waiting gauge exists only while
+    a pod crash-loops, so a healthy namespace read No Data. Under max() a
+    filled 0 cannot hide a real crash-loop."""
     return (
-        "max(last_5m):max:kubernetes_state.container.status_report.count.waiting"
-        "{" + _NS + ",reason:crashloopbackoff} by {pod_name} > 0"
+        "max(last_5m):default_zero(max:kubernetes_state.container.status_report.count.waiting"
+        "{" + _NS + ",reason:crashloopbackoff} by {pod_name}) > 0"
     )
 
 
@@ -373,9 +377,12 @@ def deploy_rollback_query(env: str) -> str:
     digests were re-applied (or a manual rollback dispatch ran). The
     runner emits grug.deploy.rollback as a COUNT via DogStatsD to a
     node's agent hostPort; any occurrence pages - a rollback is always
-    operator-relevant. notify_no_data=false (fires rarely by design)."""
+    operator-relevant. notify_no_data=false (fires rarely by design).
+
+    default_zero (quadseven/infra#2081): only rollbacks send a point, so a
+    quiet 30 minutes read No Data instead of OK."""
     return (
-        f"sum(last_30m):sum:grug.deploy.rollback{{env:{env}}}.as_count() > 0"
+        f"sum(last_30m):default_zero(sum:grug.deploy.rollback{{env:{env}}}.as_count()) > 0"
     )
 
 
