@@ -1793,7 +1793,7 @@ def test_run_one_routes_learn_kind(monkeypatch):
     called = {}
     monkeypatch.setattr(
         rerun, "_run_learn",
-        lambda iid, repo, pr, cid, parent, text, author="": called.update(
+        lambda iid, repo, pr, cid, parent, text, author="", **_defer: called.update(
             iid=iid, repo=repo, pr=pr, cid=cid, parent=parent, text=text,
             author=author) or "learned",
     )
@@ -2087,3 +2087,131 @@ def test_diff_too_large_completes_instead_of_redriving(monkeypatch):
     assert posted == []
     complete.assert_called_once()
     release.assert_not_called()
+
+
+# --- free-tier outage defers a learn job (operator decision 2026-09-23) ------
+
+
+def _learn_unavailable_fixture(monkeypatch):
+    """Every classifier backend refusing for a retry-later reason."""
+    import llm_client
+    monkeypatch.setattr(
+        "adapters.install_store.get_learning_by_source_comment",
+        lambda repo, cid: None,
+    )
+    monkeypatch.setattr(
+        "adapters.install_store.get_comment_record",
+        lambda iid, cid: {"finding_text": "x", "finding_tags": {"rule_name": "r"}},
+    )
+    monkeypatch.setattr("adapters.install_store.put_learning",
+                        lambda **kw: (_ for _ in ()).throw(AssertionError("must not store")))
+    monkeypatch.setattr("adapters.install_store.claim_delivery",
+                        lambda k: (_ for _ in ()).throw(AssertionError("must not claim")))
+
+    def unavailable(*a, **k):
+        raise llm_client.LearnClassifierUnavailable(
+            ("openrouter:http_403", "poolside:http_429"))
+    monkeypatch.setattr("llm_client.classify_learning", unavailable)
+    posted = []
+    monkeypatch.setattr(rerun, "with_install_token_retry", lambda iid, fn: fn("tok"))
+    monkeypatch.setattr(rerun, "_gh_post", lambda token, url, body: posted.append((url, body)))
+    sent = []
+    monkeypatch.setattr(rerun, "_RERUN_QUEUE_URL", "https://sqs.example/q.fifo")
+    monkeypatch.setattr(rerun._sqs, "send_message", lambda **kw: sent.append(kw))
+    monkeypatch.setattr(rerun, "_now", lambda: 1_000_000.0)
+    return posted, sent
+
+
+def test_run_learn_all_backends_rate_limited_defers_instead_of_completing(monkeypatch):
+    """The free-tier key refuses sometimes. That must neither drop the reply
+    (complete as unusable) nor walk it into the DLQ (raise): the job is
+    re-enqueued as a fresh message with a delay, and the current one ends."""
+    posted, sent = _learn_unavailable_fixture(monkeypatch)
+
+    result = rerun._run_learn(11, "o/r", 7, 5001, 4000, "a rule", "teammate")
+
+    assert result == "learn_deferred"
+    assert posted == []  # nothing said in the thread yet: it WILL be judged
+    assert len(sent) == 1
+    job = json.loads(sent[0]["MessageBody"])
+    assert job["kind"] == "learn" and job["comment_id"] == 5001
+    assert job["reply_text"] == "a rule" and job["author"] == "teammate"
+    assert job["defer_count"] == 1
+    assert job["not_before"] == 1_000_000.0 + rerun._LEARN_DEFER_BASE_SECONDS
+    assert job["first_deferred_at"] == 1_000_000.0
+    # A new dedup id per deferral, or SQS would collapse it into the original.
+    first_dedup = sent[0]["MessageDeduplicationId"]
+    rerun.enqueue_learn(install_id=11, repo="o/r", pr_number=7, comment_id=5001,
+                        parent_comment_id=4000, reply_text="a rule")
+    assert sent[1]["MessageDeduplicationId"] != first_dedup
+
+
+def test_learn_defer_backoff_grows_and_is_bounded():
+    delays = [rerun._learn_defer_delay(n) for n in range(12)]
+    assert delays[0] == rerun._LEARN_DEFER_BASE_SECONDS
+    assert delays == sorted(delays)
+    assert max(delays) == rerun._LEARN_DEFER_MAX_SECONDS
+    # SQS caps a visibility timeout at 12h; the delay must fit in one hide.
+    assert rerun._LEARN_DEFER_MAX_SECONDS < 12 * 3600
+
+
+def test_run_learn_deferral_carries_the_first_deferral_time(monkeypatch):
+    _posted, sent = _learn_unavailable_fixture(monkeypatch)
+    rerun._run_learn(11, "o/r", 7, 5001, 4000, "?", defer_count=3,
+                     first_deferred_at=900_000.0)
+    job = json.loads(sent[0]["MessageBody"])
+    assert job["defer_count"] == 4
+    assert job["first_deferred_at"] == 900_000.0
+    assert job["not_before"] == 1_000_000.0 + rerun._learn_defer_delay(3)
+
+
+def test_run_learn_deferral_past_the_horizon_tells_the_thread(monkeypatch):
+    """Bounded: after the defer horizon the job completes with the same
+    in-thread notice as an unusable backend, so the reply is never silently
+    lost and never dead-lettered."""
+    posted, sent = _learn_unavailable_fixture(monkeypatch)
+    started = 1_000_000.0 - rerun._LEARN_DEFER_MAX_AGE_SECONDS
+    result = rerun._run_learn(11, "o/r", 7, 5001, 4000, "?", defer_count=30,
+                              first_deferred_at=started)
+    assert result == "learn_defer_exhausted"
+    assert sent == []
+    assert posted and posted[0][1]["body"] == rerun._LEARN_UNUSABLE_BODY
+
+
+def test_run_learn_deferral_enqueue_failure_redrives(monkeypatch):
+    # If the deferred copy cannot be sent, the current message must survive.
+    _learn_unavailable_fixture(monkeypatch)
+
+    def sqs_down(**kw):
+        raise RuntimeError("sqs down")
+    monkeypatch.setattr(rerun._sqs, "send_message", sqs_down)
+    with pytest.raises(RuntimeError, match="sqs down"):
+        rerun._run_learn(11, "o/r", 7, 5001, 4000, "?")
+
+
+def test_run_one_learn_not_yet_due_asks_the_consumer_to_hide_it(monkeypatch):
+    from rerun_queue import JobNotDue
+    monkeypatch.setattr(rerun, "_now", lambda: 1_000.0)
+    monkeypatch.setattr(rerun, "_run_learn",
+                        lambda *a, **k: (_ for _ in ()).throw(AssertionError("too early")))
+    body = json.dumps({
+        "kind": "learn", "install_id": 11, "repo": "o/r", "pr_number": 7,
+        "comment_id": 5001, "parent_comment_id": 4000, "reply_text": "hi",
+        "defer_count": 1, "not_before": 1_900.0, "first_deferred_at": 100.0,
+    })
+    with pytest.raises(JobNotDue) as info:
+        rerun._run_one(body)
+    assert info.value.delay_seconds == 900.0
+
+
+def test_run_one_learn_due_passes_the_deferral_state(monkeypatch):
+    seen = {}
+    monkeypatch.setattr(rerun, "_now", lambda: 5_000.0)
+    monkeypatch.setattr(rerun, "_run_learn", lambda *a, **k: seen.update(k) or "learned")
+    body = json.dumps({
+        "kind": "learn", "install_id": 11, "repo": "o/r", "pr_number": 7,
+        "comment_id": 5001, "parent_comment_id": 4000, "reply_text": "hi",
+        "defer_count": 2, "not_before": 4_000.0, "first_deferred_at": 100.0,
+    })
+    assert rerun._run_one(body) == "learned"
+    assert seen["defer_count"] == 2 and seen["first_deferred_at"] == 100.0

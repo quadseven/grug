@@ -793,6 +793,15 @@ it clears itself within 24h.
 The `[grug] LLM backend unusable` monitor fires when a review backend answers
 401, 402, 403 or 404. That is not overload - it is broken.
 
+One exception does NOT fire it. grug's OpenRouter key runs only on the free
+tier, which refuses sometimes and not others (operator decision 2026-09-23:
+the limit stays as it is). An OpenRouter 402 or 403 whose error message names
+a limit or credits (for example `Key limit exceeded (total limit)`), and any
+429 from any backend, log `llm_backend_rate_limited` instead. Nothing pages on
+that token: the caller falls through to the next backend, and the learn
+classifier defers its job (below). A 401 is never reclassified, so a revoked
+or invalid key still pages.
+
 | Status | Meaning | Fix |
 |---|---|---|
 | 401 / 403 | API key wrong or revoked | Rotate the key in SSM, redeploy |
@@ -838,18 +847,29 @@ round robin - not as a fallback. A dead SaaS backend degrades those directly,
 not just Elder's safety net.
 
 The reply-mined learn classifier (`classify_learning`, run from the rerun
-queue) does the same: primary by round robin, the other backend as failover.
-It logs `llm_backend_unusable` for a 401/402/403/404 like the review path.
-When EVERY backend refuses that way, the learn job completes with
-`learn_classifier_unusable` instead of redriving, because no retry clears a
-dead key and each retry walks the job toward the rerun DLQ. Nothing is
-stored; grug replies in the thread that it did not judge the reply, and the
-maintainer re-replying after the fix is the replay path. The
-`learn_classifier_unusable` log names the repo, PR and comment for each one.
-A 429/5xx or an unparseable answer still redrives.
+queue) does the same: primary by round robin, the other backend as failover,
+then opencode Go when the deployment has its key configured. It logs through
+the same helper as the review path. The job's outcome depends on how every
+backend failed:
+
+| Every backend... | Outcome |
+|---|---|
+| refused, and at least one was rate limited (429 or the free-tier body), 5xx or unreachable | `learn_deferred`: a delayed copy is re-enqueued and this message completes |
+| answered 401/402/403/404 with a genuine config/billing reason | `learn_classifier_unusable`: completes, grug replies in the thread |
+| answered, but nothing parsed | raises for redrive, as before |
+
+A deferral never counts toward the rerun DLQ: FIFO queues have no
+per-message delay, so the copy is a new message carrying `not_before`, and the
+consumer hides it until then (`consumer_job_not_due`). The wait starts at 15
+minutes and doubles to a 6 hour cap. Each deferral logs
+`learn_classifier_deferred` (repo, PR, comment, `defer_count`, the backend
+statuses). After 7 days of deferral the job completes as
+`learn_defer_exhausted` with the same in-thread notice as an unusable backend,
+so the reply is never dead-lettered and never silently lost; re-replying is
+the replay path.
 
 An OpenRouter 403 whose body reads `Key limit exceeded (total limit)` is the
-key's own credit limit, not the model or a region block. Check it without
-printing the key: `GET https://openrouter.ai/api/v1/key` returns `limit`,
-`limit_remaining` and `usage`. The fix is raising the limit on the key in the
-OpenRouter dashboard, or rotating the key in its secret store.
+key's own credit limit, not the model or a region block. On this deployment
+that is expected and not an action item. Check it without printing the key:
+`GET https://openrouter.ai/api/v1/key` returns `limit`, `limit_remaining` and
+`usage`.
