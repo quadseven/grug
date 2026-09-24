@@ -856,7 +856,7 @@ backend failed:
 |---|---|
 | refused, and at least one was rate limited (429 or the free-tier body), 5xx or unreachable | `learn_deferred`: a delayed copy is re-enqueued and this message completes |
 | answered 401/402/403/404 with a genuine config/billing reason | `learn_classifier_unusable`: completes, grug replies in the thread |
-| answered, but nothing parsed | raises for redrive, as before |
+| answered, but nothing parsed, or answered another 4xx (400/422: a request bug waiting cannot fix) | raises for redrive toward the DLQ, as before |
 
 A deferral never counts toward the rerun DLQ: FIFO queues have no
 per-message delay, so the copy is a new message carrying `not_before`, and the
