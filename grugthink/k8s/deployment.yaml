@@ -1,4 +1,4 @@
-# grugthink on OKE (v2). Modern k8s-oke pattern, mirroring grug's own
+# grugthink on OKE (v2). Modern cluster pattern, mirroring grug's own
 # deployments: arm64-pinned, registry-pull, non-root, DD-tagged. Image
 # registry + tag are PLACEHOLDERS the deploy workflow rewrites (no registry
 # host committed). SESSION_SECRET is generated in-cluster by the deploy step
@@ -115,8 +115,12 @@ spec:
             # HERMES_BOT_USER_ID is Hermes' own Discord user (not a repo
             # channel ID) - without it Grug will relay a request but never
             # trust any reply as genuinely coming from Hermes.
+            # TASK_RELAY_REPO_CHANNELS is the repo -> Hermes channel map
+            # (`repo=channel_id,...`); it names private repos, so its value
+            # is never committed here (see k8s/DEPLOY.md).
             - {name: TASK_RELAY_ALLOWED_USER_IDS, value: ""}
             - {name: HERMES_BOT_USER_ID, value: ""}
+            - {name: TASK_RELAY_REPO_CHANNELS, value: ""}
           envFrom:
             # SESSION_SECRET, generated in-cluster by the deploy step.
             - secretRef: {name: grugthink-secrets}

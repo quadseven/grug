@@ -328,7 +328,7 @@ RULES: tuple[ReviewRule, ...] = (
         good_example="items = []  # loop until a short page / no cursor",
         severity="high",
     ),
-    # ── weekly harvest: runaway-process class (claude-stuff #356, #368) ──
+    # ── weekly harvest: runaway-process class (a private tooling repo) ──
     ReviewRule(
         name="subprocess-no-timeout",
         bug_class="robustness",
@@ -507,7 +507,7 @@ RULES: tuple[ReviewRule, ...] = (
         'printf "%s\\n" "$d"; } >> "$GITHUB_ENV"',
         severity="high",
     ),
-    # ── unbounded async fan-out (harvest 2026-07-27: macchina #2059/#2061) ──
+    # ── unbounded async fan-out (harvest 2026-07-27: a private app repo) ──
     ReviewRule(
         name="unbounded-fanout-shared-backend",
         bug_class="performance",

@@ -47,7 +47,7 @@ def _payload(action: str = "opened") -> dict:
             "base": {"sha": "base5678ijkl"},
             "title": "Preserve PR intent",
             "body": "Reviewer should understand the requested behavior.",
-            "user": {"login": "evan"},
+            "user": {"login": "alice"},
         },
     }
 
@@ -821,7 +821,7 @@ def test_dispatch_emits_structured_log_on_success(monkeypatch, caplog):
     extra = dispatched_records[0].__dict__
     # Operator must be able to filter by install + PR coords.
     assert extra.get("installation_id") == 11
-    assert extra.get("pr") == "myorg/myrepo#7"
+    assert extra.get("pr") == "myorg/myrepo#7"  # leak-guard-allow: placeholder repo, not a real one
     # Backend + model attribution for DD LLM Obs / per-backend dashboards.
     assert extra.get("backend") == "poolside"
     assert extra.get("model") == "poolside/laguna-m.1"
@@ -1339,7 +1339,7 @@ def test_dispatch_captures_comment_records_on_publish(monkeypatch):
     assert rec["finding_tags"]["line"] == "2"
     assert rec["finding_text"] == "m"
     assert rec["head_sha"] == "abcd1234efgh"
-    assert rec["author_login"] == "evan"
+    assert rec["author_login"] == "alice"
     assert rec["trust_reactors"] is True
 
 
@@ -1558,7 +1558,7 @@ def test_dispatch_captures_learning_record_when_review_span_absent(monkeypatch):
     assert out["result"] == "pass"
     assert captured[0]["review_span_context"] is None
     assert captured[0]["finding_text"] == "m"
-    assert captured[0]["author_login"] == "evan"
+    assert captured[0]["author_login"] == "alice"
 
 
 def test_dispatch_capture_skips_unmarked_human_comment(monkeypatch):
@@ -2549,7 +2549,7 @@ def test_deep_review_publishes_and_captures_comment_records(monkeypatch):
     assert rec["comment_id"] == 555
     assert rec["review_span_context"] == {"span_id": "deep-span", "trace_id": "deep-trace"}
     assert rec["finding_tags"]["rule_name"] == "deep-bug"
-    assert rec["author_login"] == "evan"
+    assert rec["author_login"] == "alice"
 
 
 def test_deep_review_capture_failure_does_not_change_result(monkeypatch):

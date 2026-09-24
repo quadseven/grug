@@ -11,7 +11,7 @@ The enforcement-gap monitor latched. On 2026-08-01 it read `Alert` for over
 three hours while **zero** repos were in the gap:
 
 ```
-04:00:00Z  quadseven/yuzu-yard-sale emits its LAST datapoint (opted out)
+04:00:00Z  a private fleet repo emits its LAST datapoint (opted out)
 07:18:15Z  monitor 308376323 status = Alert
            last_triggered_ts  = 2026-07-28T16:50:23Z   (3.5 days stale)
            repos in gap       = NONE
@@ -22,7 +22,7 @@ keeps its last verdict.**
 
 1. **The repo left the denominator.** `poller_handler` hit `continue` for any
    repo with `tpm_enabled=false`, so an opted-out repo vanished from the gauge
-   entirely. This is what yuzu-yard-sale did, and it is what the measurement
+   entirely. This is what that repo did, and it is what the measurement
    above actually proves.
 
 2. **The query filtered on the state tag.** `{enforcement_type:none}` meant a

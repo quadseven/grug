@@ -283,7 +283,7 @@ def test_blocking_verdict_with_zero_findings_does_not_warn(monkeypatch):
     True when Elder's judge HELD BACK weak findings, and when a degraded
     review fails closed. Nothing was published, so nothing can have shipped.
 
-    Observed live on macchina#2115: "merged ... (0 finding(s), severity
+    Observed live on a private app repo: "merged ... (0 finding(s), severity
     high/critical). This means the finding(s) below may have SHIPPED", whose
     own quoted evidence read "Elder clear - weak markings held back"."""
     _no_candidates(monkeypatch)

@@ -443,10 +443,9 @@ def list_installation_repos(install_token: str) -> list[dict]:
             #
             # Live proof (2026-07-26): the enforcement-gap monitor was red on
             # four repos. Three - gluetun, flood, vibetunnel - are forks with
-            # ZERO PRs each; gluetun was forked that afternoon purely so
-            # production/docker/gluetun-portfix could build from a patch
-            # branch (upstream passteque/gluetun#3409), and it paged an hour
-            # later. The fourth, `yuzu-yard-sale`, is NOT a fork and stays
+            # ZERO PRs each; gluetun was forked that afternoon purely so a
+            # private build could use an upstream patch branch, and it paged an
+            # hour later. The fourth, a first-party repo, is NOT a fork and stays
             # counted - it is a genuine unenforced first-party repo.
             #
             # Note this differs from the archived case above: grug COULD

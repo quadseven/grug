@@ -211,7 +211,7 @@ jobs:
   # "wrangler succeeded but CF cache served the previous build" failure
   # mode and any URL-canon drift. Migrated to the shared reusable so the
   # curl-retry + content-assert pattern lives in one place
-  # (quadseven/infra-public#24, quadseven/infrastructure#840). The 30s
+  # (quadseven/infra-public#24, infra#840). The 30s
   # pre-delay covers Cloudflare Pages propagation. SHA-pinned to the
   # reusable PR branch tip; repins to the merge commit once that PR lands.
   smoke:

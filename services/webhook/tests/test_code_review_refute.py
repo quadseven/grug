@@ -4,7 +4,7 @@ The gate exists for the semantic-misreading false-positive class that
 survived the deterministic verification pass - two same-day production
 instances: Elder's inverted-logic claim on grug PR #710 (read a
 return-a-reason-kills contract as its opposite) and the inverted-logic
-claim on digital-ledger#208 (refuted by a traced run: 2 calls, not 200).
+claim on a private repo (refuted by a traced run: 2 calls, not 200).
 Both were HIGH severity and sailed through the plausibility judge.
 """
 

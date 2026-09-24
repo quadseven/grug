@@ -198,7 +198,7 @@ def test_new_high_value_rules_present(monkeypatch):
 def test_subprocess_no_timeout_rule_present():
     """Weekly harvest: an external/blocking subprocess (or shell node/curl)
     call without a timeout is the runaway-process class — one wedged
-    provider hangs the whole chain (claude-stuff #356, #368)."""
+    provider hangs the whole chain (a private tooling repo)."""
     assert any(r.name == "subprocess-no-timeout" for r in crp.RULES)
     assert "subprocess-no-timeout" in crp.build_system_prompt()
 
@@ -283,7 +283,7 @@ def test_unbounded_fanout_shared_backend_rule_present():
     coroutines all hit ONE shared/contended backend has no ceiling, so the
     batch is bounded by that backend's saturation point rather than by
     parallelism -- latency can exceed the sequential version and other
-    consumers of the backend starve. macchina #2059 replaced sequential judge
+    consumers of the backend starve. a private app repo replaced sequential judge
     calls with a bare gather; #2061 had to add an `asyncio.Semaphore` the same
     day after `mode: schedule` still took 28.9s with calls clustering at the
     8s timeout, a second consumer contending for the same model."""

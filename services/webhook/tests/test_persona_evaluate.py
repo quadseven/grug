@@ -275,7 +275,7 @@ def test_publish_tpm_evaluation_posts_on_success():
 
     assert captured["status"] == "completed"
     assert captured["conclusion"] == "success"
-    assert captured["external_id"] == f"grug-tpm:myorg/myrepo#42:{'abc123def456' + '0' * 28}"
+    assert captured["external_id"] == f"grug-tpm:myorg/myrepo#42:{'abc123def456' + '0' * 28}"  # leak-guard-allow: placeholder repo, not a real one
     assert out == {"persona": "tpm", "result": "pass"}
 
 
@@ -341,7 +341,7 @@ def test_publish_tpm_evaluation_external_id_format():
                 pr_number=99,
             )
 
-    assert captured["external_id"] == "grug-tpm:myorg/myrepo#99:deadbeef" + "0" * 32
+    assert captured["external_id"] == "grug-tpm:myorg/myrepo#99:deadbeef" + "0" * 32  # leak-guard-allow: placeholder repo, not a real one
 
 
 # --- #550 regression: publish failure must leave an honest Activity row ---

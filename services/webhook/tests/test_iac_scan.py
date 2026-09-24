@@ -104,7 +104,7 @@ def test_only_added_lines_are_scanned():
         "diff --git a/main.tf b/main.tf\n--- a/main.tf\n+++ b/main.tf\n"
         "@@ -1,2 +1,2 @@\n"
         '-  cidr_blocks = ["0.0.0.0/0"]\n'
-        '+  cidr_blocks = ["10.0.0.0/8"]\n'
+        '+  cidr_blocks = ["10.0.0.0/8"]\n'  # leak-guard-allow: an RFC1918 range as an IaC fixture, not a host
     )
     assert scan_iac(_hunks(diff)) == ()
 

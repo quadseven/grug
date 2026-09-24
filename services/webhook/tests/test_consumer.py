@@ -910,7 +910,7 @@ _BOTH_ATTRS = {"ApproximateNumberOfMessages", "ApproximateNumberOfMessagesNotVis
 def telemetry_env(monkeypatch):
     """Baseline env for a sweep: known queue URL + agent host present."""
     monkeypatch.setenv("GRUG_RERUN_QUEUE_URL", _RERUN_URL)
-    monkeypatch.setenv("DD_AGENT_HOST", "10.0.0.99")
+    monkeypatch.setenv("DD_AGENT_HOST", "192.0.2.99")
     return _BASE
 
 
@@ -1125,7 +1125,7 @@ def test_emit_queue_depth_skips_sweep_without_agent_host(monkeypatch, caplog):
 def test_emit_queue_depth_warns_without_base_url(monkeypatch, caplog):
     import logging as _logging
 
-    monkeypatch.setenv("DD_AGENT_HOST", "10.0.0.99")
+    monkeypatch.setenv("DD_AGENT_HOST", "192.0.2.99")
     monkeypatch.delenv("GRUG_RERUN_QUEUE_URL", raising=False)
     monkeypatch.delenv("GRUG_CAVE_RESULTS_QUEUE_URL", raising=False)
     with caplog.at_level(_logging.WARNING):

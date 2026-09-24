@@ -46,8 +46,8 @@ That's it. Webhook is wired, check-runs post on every PR.
 
 > **Note:** the hosted instance is **allowlist-gated**. Request access by
 > opening a GitHub issue on this repo (no bracket prefix needed, `gh issue
-> create` works fine) - a maintainer will pick it up even if `@evan`
-> specifically hasn't. Self-host (below) is the open path and needs nobody's
+> create` works fine) - a maintainer will pick it up.
+> Self-host (below) is the open path and needs nobody's
 > approval.
 
 ### Self-host (run Grug in your own cave)

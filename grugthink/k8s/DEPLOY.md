@@ -64,7 +64,7 @@ kubectl get secret registry-pull -n grug -o yaml \
   | sed 's/namespace: grug/namespace: grugthink/' | kubectl apply -f -
 
 # Optional: review-relay's read-only GitHub token (bot/review_relay.py -
-# fetches the real Grug - Elder check-run for "@grug review PR #N").
+# fetches the real Grug - Elder check-run for "grug review PR #N").
 # checks:read scope only, deliberately separate from Hermes' broader
 # GH_TOKEN. Skip this if the review-relay feature isn't wanted yet -
 # it's optional:true in deployment.yaml and degrades to "Grug can't
@@ -124,7 +124,11 @@ config + memory across restarts.
   `TASK_RELAY_ALLOWED_USER_IDS` (comma-separated Discord user IDs
   authorized to trigger a relay) and `HERMES_BOT_USER_ID` (Hermes' own
   Discord user ID, so a reply is only trusted if it's verifiably from
-  Hermes) are set on the Deployment. Also needs Grug's Discord role
+  Hermes) are set on the Deployment. It also needs
+  `TASK_RELAY_REPO_CHANNELS` (comma-separated `repo=channel_id` pairs,
+  copied from Hermes' own Discord channel config): no repo resolves
+  without it, and it stays out of this public repo because it names
+  private repos and channel IDs. Also needs Grug's Discord role
   granted visibility + send permission on the per-repo channels under
   the "GitHub" category - the same one-time step already done for
   Hermes. See the module docstrings for the full security model.

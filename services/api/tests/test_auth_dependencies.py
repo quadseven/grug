@@ -29,7 +29,7 @@ from adapters.user_store import UserIdentity
 def _user(*, role="user"):
     return UserIdentity(
         github_user_id="100",
-        login="evan",
+        login="alice",
         role=role,
         tier="free",
         allowlisted=True,

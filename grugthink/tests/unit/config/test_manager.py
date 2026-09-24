@@ -223,13 +223,13 @@ class TestValidConfig:
     def test_valid_config_ollama(self, temp_config_file, mock_watcher, monkeypatch):
         """Test valid Ollama configuration."""
         monkeypatch.delenv("GEMINI_API_KEY", raising=False)
-        monkeypatch.setenv("OLLAMA_URLS", "http://localhost:11434,http://192.168.1.100:11434")
+        monkeypatch.setenv("OLLAMA_URLS", "http://localhost:11434,http://192.0.2.100:11434")
         monkeypatch.setenv("OLLAMA_MODELS", "llama3.2:3b,grug:latest")
 
         config_data = {
             "version": "2.0",
             "environment": {
-                "OLLAMA_URLS": "http://localhost:11434,http://192.168.1.100:11434",
+                "OLLAMA_URLS": "http://localhost:11434,http://192.0.2.100:11434",
                 "OLLAMA_MODELS": "llama3.2:3b,grug:latest",
             },
             "api_keys": {"gemini": {}, "discord": {"tokens": []}},
@@ -244,7 +244,7 @@ class TestValidConfig:
 
         # Verify Ollama configuration
         ollama_urls = config_manager.get_env_var("OLLAMA_URLS")
-        assert ollama_urls == "http://localhost:11434,http://192.168.1.100:11434"
+        assert ollama_urls == "http://localhost:11434,http://192.0.2.100:11434"
 
         ollama_models = config_manager.get_env_var("OLLAMA_MODELS")
         assert ollama_models == "llama3.2:3b,grug:latest"

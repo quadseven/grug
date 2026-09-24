@@ -13,18 +13,18 @@
 # Wiring a production dispatch path is open follow-up work (see #545's PR
 # for the anchored-replay half of this eval's known issues); a manual
 # `--production` run still needs GRUG_BENCH_CAVE_URL reachable over this
-# job's tailnet join, same as sparkles below.
+# job's tailnet join, same as the Cave below.
 #
 # PUBLIC-REPO DISCIPLINE: every endpoint/key arrives via secrets - the Cave
-# (sparkles) URL is a private tailnet address and is NEVER committed.
+# (Cave) URL is a private tailnet address and is NEVER committed.
 #
 # Secrets (operator-seeded; backends whose secrets are absent are simply
 # not configured):
-#   secrets.TS_AUTHKEY                  - tag-scoped ephemeral tailnet join (for sparkles)
+#   secrets.TS_AUTHKEY                  - tag-scoped ephemeral tailnet join (for the Cave)
 #   secrets.GRUG_BENCH_OPENROUTER_KEY   - free OpenRouter key
 #   secrets.GRUG_BENCH_POOLSIDE_KEY    - free Poolside key
-#   secrets.GRUG_BENCH_CAVE_URL         - sparkles/Cave OpenAI-compatible endpoint (tailnet)
-#   secrets.GRUG_BENCH_CAVE_MODEL       - sparkles model id
+#   secrets.GRUG_BENCH_CAVE_URL         - Cave OpenAI-compatible endpoint (tailnet)
+#   secrets.GRUG_BENCH_CAVE_MODEL       - Cave model id
 #   secrets.GRUG_BENCH_CAVE_KEY         - optional (Ollama usually needs none)
 name: benchmark.elder-eval
 
@@ -76,8 +76,8 @@ jobs:
           # must not persist in git config for the rest of the job.
           persist-credentials: false
 
-      # Tailnet join so the Cave/sparkles endpoint is reachable. If TS_AUTHKEY
-      # is absent the step is skipped and sparkles is simply not available.
+      # Tailnet join so the Cave endpoint is reachable. If TS_AUTHKEY
+      # is absent the step is skipped and the Cave is simply not available.
       - name: Join tailnet (ephemeral)
         if: env.HAS_TS_AUTHKEY == 'true'
         uses: tailscale/github-action@306e68a486fd2350f2bfc3b19fcd143891a4a2d8 # v4

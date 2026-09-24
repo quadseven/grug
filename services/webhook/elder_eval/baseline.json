@@ -1,6 +1,6 @@
 {
   "backends": {
-    "sparkles": {
+    "cave": {
       "cases_scored": 17,
       "errored_cases": [],
       "noise_rate": 0.0,
@@ -20,5 +20,5 @@
       ]
     }
   },
-  "prompt_sha": "7e5e81ea45396acf6845302fed521d58b1ad7d7603700f313dd57fc69008f09d"
+  "prompt_sha": "54a544f20164620c775675f4685d9f350a2d830efcfc2bf027e29e47eefb6a39"
 }

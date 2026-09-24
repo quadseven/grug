@@ -19,7 +19,7 @@ from adapters.user_store import UserIdentity
 
 def _user(user_id="100", role="user"):
     return UserIdentity(
-        github_user_id=user_id, login="evan", role=role, tier="free",
+        github_user_id=user_id, login="alice", role=role, tier="free",
         allowlisted=True, created_at="",
         allowlisted_at=None, allowlisted_by=None,
     )

@@ -325,7 +325,7 @@ def test_living_hunt_delta_done_log_on_successful_persist(monkeypatch, caplog):
                         "base": {"sha": "base5678ijkl"},
                         "title": "t",
                         "body": "b",
-                        "user": {"login": "evan"},
+                        "user": {"login": "alice"},
                     },
                 },
                 blocking=False,

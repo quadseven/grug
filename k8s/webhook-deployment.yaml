@@ -13,7 +13,7 @@ metadata:
 spec:
   # 2 replicas spread across zones: before this, every grug pod sat on ONE
   # home-LAN node - a single node (or home-internet) outage took the whole
-  # product down, and the 2026-07-18 node-local DNS blip (digital-ledger#204,
+  # product down, and the 2026-07-18 node-local DNS blip (a private repo,
   # grug#697) showed even a soft failure on that one node has total blast
   # radius. Webhook is stateless (Postgres-backed claim_delivery dedup; heavy
   # work enqueues to SQS), so replicas are safe.
@@ -177,15 +177,15 @@ spec:
             # In-cluster spark-gateway for the evidence-scoped judge. Keep the
             # role assignment identical on both Elder-capable workloads.
             - {name: GRUG_CAVE_GATEWAY_URL, value: http://spark-gateway.spark-gateway.svc:8080}
-            # infra#2451/#2454 precedent: the sparkicus vLLM resident is not a
+            # infra#2451/#2454 precedent: the second GPU host's vLLM resident is not a
             # fixed identity (infra#2452 swapped poolside/Laguna-S-2.1-NVFP4 ->
             # Qwen/Qwen3.8-27B-FP8 same-day). spark_gateway.py's `spark:warm-any`
             # sentinel routes to whichever vLLM target is reachable and rewrites
             # the outgoing model name to what it actually serves, so this stops
-            # needing a lockstep edit on every future sparkicus swap - the same
-            # fix already applied to macchina-cave-connector/the judge (#2450)
+            # needing a lockstep edit on every future swap on that host - the same
+            # fix already applied to another owned consumer and the judge (#2450)
             # and hermes-discord (#2454). The review lane was pinned to a
-            # Qwen coder tag on Sparkles; both Sparks now serve ONE
+            # Qwen coder tag on the first GPU host; both GPU hosts now serve ONE
             # tensor-parallel DeepSeek and no Ollama, and an exact tag is a
             # strict membership test in the router, so all three lanes ask
             # for whatever is resident (2026-09-02).

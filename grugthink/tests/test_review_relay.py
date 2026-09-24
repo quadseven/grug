@@ -21,7 +21,7 @@ from src.grugthink.bot.review_relay import ElderVerdict
 @pytest.mark.parametrize(
     "statement,expected",
     [
-        ("review PR #123 for macchina", 123),
+        ("review PR #123 for widget", 123),
         ("what did elder say about #4567", 4567),
         ("look at #1", 1),
         ("no pr number here", None),
@@ -35,7 +35,7 @@ def test_extract_pr_number(statement, expected):
 @pytest.mark.parametrize(
     "statement",
     [
-        "review PR #123 for macchina",
+        "review PR #123 for widget",
         "what did elder say about #4567",
         "review the pr for infra",
         "look at this pr",
@@ -57,7 +57,7 @@ def test_looks_like_review_request_true(statement):
         # Elder's verdict on PR #123" - must NOT be treated as a review
         # request.
         "fix infra #123",
-        "implement the change from #45 in macchina",
+        "implement the change from #45 in widget",
         "build a dashboard",
         "what is the capital of France",
         "",
@@ -78,9 +78,9 @@ def test_get_token_returns_configured_value(monkeypatch):
 
 
 def test_format_verdict_none_means_not_found_or_not_answerable():
-    message = review_relay.format_verdict(None, "Grug", "macchina", 42)
+    message = review_relay.format_verdict(None, "Grug", "widget", 42)
     assert "Grug" in message
-    assert "macchina" in message
+    assert "widget" in message
     assert "42" in message
 
 

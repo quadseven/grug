@@ -6,7 +6,7 @@ only a pointer. The S3 put/get are INJECTED as callables, so this module is pure
 and unit-testable with no boto3.
 """
 
-# Spark-authored: cohere north-mini-code-1.0:bf16 on an on-prem DGX Spark,
+# Spark-authored: cohere north-mini-code-1.0:bf16 on an on-prem GPU host,
 # 2026-06-27 -- the model's first production job. The pack/unpack logic below is
 # its generation; reviewed + hardened by Claude.
 # (git grep "Spark-authored" lists all on-prem-model-generated code.)

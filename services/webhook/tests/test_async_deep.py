@@ -38,7 +38,7 @@ def _payload() -> dict:
             "base": {"sha": "base5678ijkl"},
             "title": "auth change",
             "body": "deep-review please",
-            "user": {"login": "evan"},
+            "user": {"login": "alice"},
         },
     }
 

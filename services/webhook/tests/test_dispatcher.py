@@ -47,7 +47,7 @@ def test_installation_repositories_removed_no_ops():
 def test_installation_repositories_added_enforces_exactly_those_repos():
     """grug#833: a repo added to an EXISTING install used to sit ungated -
     dispatcher no-op'd this event entirely and only a persona toggle ever
-    called `_enforce_on_repos`. Live 2026-08-08: quadseven/switch-tools was
+    called `_enforce_on_repos`. Live 2026-08-08: a private fleet repo was
     ungated for >1h until the enforcement-gap monitor fired."""
     payload = {
         "action": "added",
@@ -457,7 +457,7 @@ def test_installation_created_org_uses_sender_id():
             "id": 555,
             "account": {"login": "acme-org", "type": "Organization", "id": 9},
         },
-        "sender": {"id": 100, "login": "evan"},
+        "sender": {"id": 100, "login": "alice"},
     }
     with patch("dispatcher.record_installation") as mock_rec, \
          patch("dispatcher.is_install_allowlisted", return_value=False):
@@ -519,8 +519,8 @@ def test_new_permissions_accepted_backfills_when_no_existing_row():
     """Edge case: missed the `created` event somehow → record now."""
     payload = {
         "action": "new_permissions_accepted",
-        "installation": {"id": 555, "account": {"login": "evan", "type": "User", "id": 100}},
-        "sender": {"id": 100, "login": "evan"},
+        "installation": {"id": 555, "account": {"login": "alice", "type": "User", "id": 100}},
+        "sender": {"id": 100, "login": "alice"},
     }
     with patch("dispatcher.get_installation", return_value=None), \
          patch("dispatcher.record_installation") as mock_rec:

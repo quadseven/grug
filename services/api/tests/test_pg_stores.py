@@ -863,7 +863,7 @@ def test_comment_record_span_and_tags_round_trip(pg):
         finding_origins=origins,
         finding_text="Exception is silently discarded.",
         head_sha="abc123",
-        author_login="evan",
+        author_login="alice",
     )
     rec = store.list_comment_records(1)[0]
     assert rec["review_span_context"] == {"trace_id": "t1", "span_id": "s1"}
@@ -871,7 +871,7 @@ def test_comment_record_span_and_tags_round_trip(pg):
     assert rec["finding_origins"] == origins
     assert rec["finding_text"] == "Exception is silently discarded."
     assert rec["head_sha"] == "abc123"
-    assert rec["author_login"] == "evan"
+    assert rec["author_login"] == "alice"
     assert rec["trust_reactors"] is True
 
 

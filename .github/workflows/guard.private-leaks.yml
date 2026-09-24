@@ -49,13 +49,16 @@ on:
 
 jobs:
   leak-scan:
-    uses: quadseven/infra-public/.github/workflows/_reusable.leak-scan.yml@273755079c88172df39501ee6914fd878c0920bc
+    uses: quadseven/infra-public/.github/workflows/_reusable.leak-scan.yml@0cf16bf5d6163cb070b8cba66c493d7bfa993deb
     permissions:
       contents: read
       # Mint the OIDC token for the deny-list read role.
       id-token: write
     with:
-      allowed-repo-refs: infra, infra-public
+      # Same list as the full-tree sweep (guard.private-leaks-full-tree.yml,
+      # which explains each entry), so a line the sweep accepts is not
+      # blocked when a PR next touches it.
+      allowed-repo-refs: infra, infra-public, zippie, USER, INST, REVIEW, CRCOMMENT, PR
       # Path, not a secret. The VALUES are the secret and live only in this
       # SecureString, never in this repo.
       deny-list-ssm-param: /infra/leak-scan/deny-list

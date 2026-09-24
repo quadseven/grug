@@ -16,7 +16,7 @@ index, both living on a node-pinned local-path PVC. That has three problems:
 
 We already run a CloudNativePG Postgres (the same cluster grug's persona/install
 store uses, `postgres-rw.databases.svc.cluster.local`, PG 18, pgvector 0.8.2
-available) and the macchina project already stores recipe/nutrient embeddings in
+available) and a private app already stores recipe/nutrient embeddings in
 it with pgvector. Grug's memory should use the same store the same way.
 
 ## What
@@ -28,7 +28,7 @@ both the text and its embedding, so there is exactly one store and no sync step.
 - `namespace` = the bot's base db path (stable per bot instance) so multiple bots
   and multiple Discord servers stay isolated exactly as the separate files did.
 - Retrieval is `ORDER BY embedding <=> $q LIMIT k` (cosine distance), the same
-  operator and 768-dim `nomic-embed-text:v1.5` model macchina uses.
+  operator and 768-dim `nomic-embed-text:v1.5` model that app uses.
 - Embeddings come from the owned spark-gateway `OllamaEmbedder` (unchanged, and
   already the only embedding path in the light image).
 
@@ -42,7 +42,7 @@ router) do not change. The backend is selected at construction time:
 - If `GRUGTHINK_DATABASE_URL` (or `GRUG_DATABASE_URL`) is set -> pgvector backend.
 - Otherwise -> the legacy SQLite+FAISS backend (dev/tests without a Postgres).
 
-## Invariants (mirrors macchina's NO FAKE DATA posture)
+## Invariants (mirrors that app's NO FAKE DATA posture)
 
 - `EMBED_DIM = 768` is the single source of truth the DDL and every insert read;
   a vector of any other length is rejected, never stored.

@@ -278,7 +278,7 @@ def _gather_flag_evidence(
     # severity high/critical). This means the finding(s) below may have
     # SHIPPED" - an alert naming zero findings, whose own quoted evidence read
     # "Elder clear - weak markings held back". Observed live on
-    # macchina#2115.
+    # a private app repo.
     #
     # A safety net that fires with no evidence is worse than none: it is
     # indistinguishable from the real grug#721 case (a critical secret-in-log

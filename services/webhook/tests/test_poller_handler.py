@@ -589,7 +589,7 @@ def test_enforcement_pass_emits_opted_out_instead_of_dropping_the_repo(monkeypat
     Not emitting is precisely what latched the enforcement-gap monitor:
     Datadog holds a silent multi-alert group in its last state for 24h, so a
     repo that was red when it opted out stayed red long after the decision.
-    Live on 2026-08-01, yuzu-yard-sale sat red for 3h18m with zero repos
+    Live on 2026-08-01, a private fleet repo sat red for 3h18m with zero repos
     actually in the gap.
 
     Still not DETECTED - opting out should not spend a GitHub API call. Only
