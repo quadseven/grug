@@ -18,7 +18,7 @@ OpenRouter fallback chain (see `bot/llm_clients.py`'s `_FALLBACK_TIMEOUT`
 comment and `bot/prompts.py`'s `query_model`) - this is a last-resort valve,
 not a second primary. You launch individual bots (Grug, Big Rob, ...) from the
 dashboard at runtime. Bot-specific secrets (Discord tokens, session secret)
-live in SSM under `/githumps/grugthink/*`; the fallback LLM keys live under
+live in SSM under `/quadseven/grugthink/*`; the fallback LLM keys live under
 the shared `/infra/llm/*` namespace grug's own webhook/consumer also read.
 
 ## 1. Build + push the image (arm64, to the cluster's registry)
@@ -43,7 +43,7 @@ credential + tailnet, same as grug's image build; in CI it belongs on the same
 kubectl create namespace grugthink --dry-run=client -o yaml | kubectl apply -f -
 kubectl create secret generic grugthink-secrets -n grugthink \
   --from-literal=SESSION_SECRET="$(aws ssm get-parameter \
-      --name /githumps/grugthink/session_secret --with-decryption \
+      --name /quadseven/grugthink/session_secret --with-decryption \
       --query Parameter.Value --output text)" \
   --dry-run=client -o yaml | kubectl apply -f -
 
@@ -73,7 +73,7 @@ umask 077
 token_file="$(mktemp)"
 trap 'rm -f "$token_file"' EXIT
 if ! aws ssm get-parameter \
-      --name /githumps/grugthink/github_checks_token --with-decryption \
+      --name /quadseven/grugthink/github_checks_token --with-decryption \
       --query Parameter.Value --output text >"$token_file" 2>/dev/null; then
   : >"$token_file"
 fi
@@ -98,7 +98,7 @@ kubectl port-forward -n grugthink svc/grugthink 8080:8080
 ```
 
 In the dashboard: add each Discord bot token (they're in SSM at
-`/githumps/grugthink/discord_token_*`), pick a personality template
+`/quadseven/grugthink/discord_token_*`), pick a personality template
 (Grug, Big Rob, ...), and Start. The gateway serves the LLM; the PVC persists
 config + memory across restarts.
 
