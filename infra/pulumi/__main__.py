@@ -140,7 +140,7 @@ gha_deploy_role = _deploy_role_bundle.role
 # people/product/codename terms with no generic shape - is the thing being
 # protected and is pre-loaded by hand per docs/HITL_PREREQUISITES.md, the same
 # way every other secret in this stack is. Keep this constant in step with the
-# DENY_LIST env in .github/workflows/guard.private-leaks.yml; a test pins them
+# deny-list-ssm-param in .github/workflows/guard.private-leaks.yml; a test pins them
 # together (infra/pulumi/tests/test_leak_guard_role.py).
 LEAK_GUARD_DENY_LIST_PARAM = "/grug/leak-guard-deny-list"
 _leak_guard_bundle = leak_guard_role.create(
