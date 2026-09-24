@@ -123,7 +123,7 @@ spec:
             # GRUGTHINK_DATABASE_URL -> Grug's long-term memory on Postgres+
             # pgvector (grugthink_facts) in the shared CNPG cluster, replacing the
             # node-pinned SQLite+FAISS PVC (#599, docs/pgvector-memory.md). The
-            # secret is created out-of-band from SSM /githumps/grugthink/database_url
+            # secret is created out-of-band from SSM /quadseven/grugthink/database_url
             # (grugthink role, infra cnpg-cluster tenant). Its presence flips
             # make_server_manager() to the pgvector backend.
             - secretRef: {name: grugthink-db}
@@ -148,7 +148,7 @@ spec:
             # result. Deliberately its own token, not Hermes' broader
             # GH_TOKEN: this module only ever reads check-run output, never
             # writes anything. Provisioned out-of-band from SSM
-            # /githumps/grugthink/github_checks_token, same pattern as
+            # /quadseven/grugthink/github_checks_token, same pattern as
             # grugthink-db above. optional:true - a missing token degrades to
             # "Grug can't answer that yet" (fetch_elder_verdict returns None),
             # it must not block the whole pod from starting.
