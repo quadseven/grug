@@ -122,7 +122,7 @@ spec:
             # Base settle; Swift Hunt zeros tiny PRs and caps medium (Steady) at 3s.
             - {name: GRUG_ELDER_SETTLE_SECONDS, value: "5"}
             # Keep review configuration on both Elder-capable workloads. The
-            # Opus override is review-only; judge, Teller, and /grug ask retain
+            # review-model override is review-only; judge, Teller, and /grug ask retain
             # their existing lower-cost OpenRouter model configuration.
             # Tiered Elder (#645): see consumer-deployment for full comments.
             - {name: GRUG_REVIEW_DEPTH, value: tiered}
@@ -137,10 +137,16 @@ spec:
             - {name: GRUG_DEEP_SAMPLE_RATE, value: "0.20"}
             - {name: GRUG_DEEP_DIFF_LINES, value: "200"}
             - {name: GRUG_DEEP_ASYNC, value: "1"}
+            # auto | on_demand. on_demand runs the deep pass only on a
+            # "deep review" marker in the PR title or body. Full comments in
+            # consumer-deployment.
+            - {name: GRUG_DEEP_ESCALATION, value: auto}
             # Keep the compatibility worker's staging policy identical to the
             # durable consumer even though production uses the consumer path.
             - {name: GRUG_STAGED_REVIEW_BUDGET_S, value: "700"}
-            - {name: GRUG_OPENROUTER_REVIEW_MODEL, value: anthropic/claude-opus-4.7}
+            # The key has a zero spend limit: a paid model here 403s on every
+            # call. Same :free model as the chain's tier 2.
+            - {name: GRUG_OPENROUTER_REVIEW_MODEL, value: "nvidia/nemotron-3-super-120b-a12b:free"}
             - {name: GITHUB_APP_ID_SSM, value: /grug/github-app-id}
             - {name: GITHUB_APP_PRIVATE_KEY_SSM, value: /grug/github-app-private-key}
             - {name: GITHUB_APP_WEBHOOK_SECRET_SSM, value: /grug/github-app-webhook-secret}
@@ -162,16 +168,17 @@ spec:
             # small/medium diffs fast (1-9s) and deterministic; occasional
             # instability on large diffs (grug#910's own evidence) - bounded
             # by the chain's 25s timeout, safe because Cave is the guaranteed
-            # fallback. GRUG_CLOUD_FREE_TIER_MODEL is deliberately UNSET: the
-            # OpenRouter `:free` tier (grug#916) is off the review chain. A
-            # tier-2 parse failure is returned as the answer and never falls
-            # through, so a garbled free response blocked the Cave fallback
-            # that works. Measured 2026-09-22: 212 free-tier parse failures in
-            # a week (42 from a content-safety classifier), and a head-to-head
-            # of six :free models on one real review returned zero usable
-            # JSON (two 429s, one 8191-token runaway, three past 120s), while
-            # the Sparks answered the same prompt in 13-25s. Setting the
-            # variable again restores the tier with no code change.
+            # fallback.
+            # 2026-09-26: the OpenRouter `:free` tier is back as tier 2. Its
+            # parse failure now counts as a miss and falls through to the
+            # Cave (grug#1025 fixed in code), so a garbled free answer can no
+            # longer block the fallback. Model chosen on `make elder-eval`:
+            # 17/17 cases scored, zero errors, catch 0.25 vs the bench
+            # baseline's 0.17; three other :free candidates 429ed or returned
+            # unparseable JSON. OpenCode Go has refused every call with "Go
+            # usage limit exceeded" since 2026-09-24, so without this tier
+            # every review cohort landed on the Sparks.
+            - {name: GRUG_CLOUD_FREE_TIER_MODEL, value: "nvidia/nemotron-3-super-120b-a12b:free"}
             - {name: GRUG_OPENCODE_GO_API_KEY_SSM, value: /infra/llm/opencode_go_api_key}
             - {name: GRUG_PROMPT_EXPERIMENT_SSM, value: /grug/elder-prompt-experiment}
             # In-cluster spark-gateway for the evidence-scoped judge. Keep the

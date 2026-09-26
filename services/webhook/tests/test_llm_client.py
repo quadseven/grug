@@ -1020,7 +1020,9 @@ def test_cave_reasoner_has_server_side_completion_budget() -> None:
     assert reasoner is not None
     assert reasoner.extra_body["max_tokens"] == 6_144
     assert coder is not None
-    assert "max_tokens" not in coder.extra_body
+    # 2026-09-26: the uncapped coder arm's 18-26k-token generations were
+    # the sustained load that overheated the Sparks.
+    assert coder.extra_body["max_tokens"] == lc._CLOUD_CHAIN_MAX_TOKENS
 
 
 def test_cave_reasoner_disables_default_thinking_like_the_judge() -> None:
@@ -1090,11 +1092,15 @@ def test_review_reasoner_diff_truncated_generation_is_not_a_clean_pass(monkeypat
     )
 
 
-def test_openrouter_review_uses_opus_with_high_adaptive_reasoning() -> None:
+def test_openrouter_review_defaults_to_a_free_model_with_reasoning_off() -> None:
+    """The OpenRouter key has a zero spend limit, so a paid review model
+    403s on every call. The default is a `:free` model, with OpenRouter's
+    reasoning toggle off so hidden reasoning cannot eat the budget."""
     config = lc._review_backend_config(Backend.OPENROUTER)
-    assert config.model == "anthropic/claude-opus-4.7"
-    assert config.extra_body["reasoning"] == {"effort": "high", "exclude": True}
-    assert config.extra_body["max_tokens"] == 32_768
+    assert config.model == "nvidia/nemotron-3-super-120b-a12b:free"
+    assert config.model.endswith(":free")
+    assert config.extra_body["reasoning"] == {"enabled": False}
+    assert config.extra_body["max_tokens"] == 8_192
     # Shared callers such as Teller and the judge remain on the cheap config.
     shared = lc._BACKEND_CONFIGS[Backend.OPENROUTER]
     assert shared.model == "anthropic/claude-haiku-4.5"
@@ -3981,6 +3987,9 @@ def test_free_tier_chain_config_uses_short_timeout_and_bounded_tokens(monkeypatc
     assert cfg.model == "z-ai/glm-5.2:free"
     assert cfg.timeout_seconds == lc._CLOUD_CHAIN_TIMEOUT_SECONDS
     assert cfg.extra_body["max_tokens"] == lc._CLOUD_CHAIN_MAX_TOKENS
+    # With reasoning on, a :free model ran 91-171s and once hit the token
+    # cap unparseable; the chain's 25s budget needs it off.
+    assert cfg.extra_body["reasoning"] == {"enabled": False}
 
 
 def test_opencode_go_chain_config_uses_short_timeout_and_bounded_tokens() -> None:
@@ -4503,3 +4512,126 @@ def test_classify_learning_permanent_4xx_plus_free_tier_refusal_defers() -> None
         with pytest.raises(lc.LearnClassifierUnavailable) as info:
             lc.classify_learning("q", "f", {"rule_name": "r"}, installation_id=2)
     assert info.value.statuses == ("openrouter:http_403",)
+
+
+# --- 2026-09-26: deep pass off the Sparks, capped Cave, on-demand switch ---
+
+
+def test_deep_append_under_cloud_priority_answers_from_cloud_not_cave(monkeypatch) -> None:
+    """Operator decision 2026-09-26: the deep pass moves to the cloud chain.
+    A healthy OpenCode Go answers it; the Cave reasoner is never called."""
+    monkeypatch.setenv("GRUG_REVIEW_BACKEND_PRIORITY", "cloud")
+    response = httpx.Response(200, json=_openai_json_response('{"findings": []}'))
+
+    with patch.object(httpx, "post", return_value=response) as post:
+        out = lc.review_reasoner_diff([_hunk()], installation_id=1)
+
+    assert out.kind == "reviewed"
+    assert out.backends_used == (Backend.OPENCODE_GO,)
+    post.assert_called_once()
+    assert post.call_args.kwargs["headers"].get("X-Spark-Caller") is None
+
+
+def test_deep_append_falls_back_to_capped_cave_reasoner_when_cloud_is_down(monkeypatch) -> None:
+    """The Cave stays the last fallback only, and with its completion cap."""
+    monkeypatch.setenv("GRUG_REVIEW_BACKEND_PRIORITY", "cloud")
+    cave = httpx.Response(200, json=_openai_json_response('{"findings": []}'))
+    go_429 = httpx.Response(429, json={"error": {"message": "Go usage limit exceeded"}})
+
+    with patch.object(httpx, "post", side_effect=[go_429, cave]) as post:
+        out = lc.review_reasoner_diff([_hunk()], installation_id=1)
+
+    assert out.kind == "reviewed"
+    assert out.backends_used == (Backend.CAVE_REASONER,)
+    assert post.call_count == 2
+    assert post.call_args_list[1].kwargs["json"]["max_tokens"] == 6_144
+
+
+def test_deep_append_under_cave_priority_is_unchanged(monkeypatch) -> None:
+    monkeypatch.delenv("GRUG_REVIEW_BACKEND_PRIORITY", raising=False)
+    response = httpx.Response(200, json=_openai_json_response('{"findings": []}'))
+
+    with patch.object(httpx, "post", return_value=response) as post:
+        out = lc.review_reasoner_diff([_hunk()], installation_id=1)
+
+    assert out.backends_used == (Backend.CAVE_REASONER,)
+    post.assert_called_once()
+
+
+def test_free_tier_parse_failure_falls_through_to_cave(monkeypatch) -> None:
+    """grug#1025: a garbled `:free` answer must not become the review and
+    block the Cave. OpenCode Go refuses, the free model returns junk, the
+    Cave answers."""
+    monkeypatch.setenv("GRUG_REVIEW_BACKEND_PRIORITY", "cloud")
+    monkeypatch.setenv("GRUG_CLOUD_FREE_TIER_MODEL", "z-ai/glm-5.2:free")
+    _admit_free_tier(monkeypatch)
+    go_429 = httpx.Response(429, json={"error": {"message": "Go usage limit exceeded"}})
+    junk = httpx.Response(200, json=_openai_json_response("not json at all"))
+    cave = httpx.Response(200, json=_openai_json_response('{"findings": []}'))
+
+    with patch.object(httpx, "post", side_effect=[go_429, junk, cave]) as post:
+        out = review_diff([_hunk()], installation_id=1)
+
+    assert out.kind == "reviewed"
+    assert out.backend_used == Backend.CAVE
+    assert post.call_count == 3
+
+
+def test_opencode_go_parse_failure_is_still_the_answer_after_a_free_tier_miss(
+    monkeypatch,
+) -> None:
+    """Only the free tier's parse failure is demoted to a miss; OpenCode Go's
+    stays the answer, so no Cave call doubles an answered review."""
+    monkeypatch.setenv("GRUG_REVIEW_BACKEND_PRIORITY", "cloud")
+    monkeypatch.setenv("GRUG_CLOUD_FREE_TIER_MODEL", "z-ai/glm-5.2:free")
+    _admit_free_tier(monkeypatch)
+    junk = httpx.Response(200, json=_openai_json_response("not json at all"))
+
+    with patch.object(httpx, "post", side_effect=[junk, junk]) as post:
+        out = review_diff([_hunk()], installation_id=1)
+
+    assert out.kind == "parse_failed"
+    assert out.backend_used == Backend.OPENCODE_GO
+    assert post.call_count == 2
+
+
+def _big_risky_hunks() -> list[Hunk]:
+    body = "@@ -0,0 +1,300 @@\n" + "\n".join(f"+line {i}" for i in range(300))
+    return [Hunk(path="src/auth/session.py", body=body)]
+
+
+def test_deep_escalation_on_demand_ignores_size_path_and_sample(monkeypatch) -> None:
+    monkeypatch.setenv("GRUG_DEEP_ESCALATION", "on_demand")
+    decision = lc.decide_deep_escalation(
+        _big_risky_hunks(), {"title": "t", "body": "b"},
+        sample_rate=1.0, diff_line_threshold=10,
+    )
+    assert decision.escalate is False
+    assert decision.reasons == ()
+
+
+def test_deep_escalation_on_demand_honors_an_explicit_request(monkeypatch) -> None:
+    monkeypatch.setenv("GRUG_DEEP_ESCALATION", "on_demand")
+    decision = lc.decide_deep_escalation(
+        [_hunk()], {"title": "fix: x", "body": "please deep review this"},
+        sample_rate=0.0,
+    )
+    assert decision.escalate is True
+    assert decision.reasons == ("explicit_deep_review",)
+
+
+def test_deep_escalation_auto_keeps_every_trigger(monkeypatch) -> None:
+    monkeypatch.delenv("GRUG_DEEP_ESCALATION", raising=False)
+    decision = lc.decide_deep_escalation(
+        _big_risky_hunks(), {"title": "t", "body": "b"},
+        sample_rate=1.0, diff_line_threshold=10,
+    )
+    assert decision.escalate is True
+    assert len(decision.reasons) >= 2
+
+
+def test_deep_escalation_invalid_mode_falls_back_to_auto(monkeypatch, caplog) -> None:
+    monkeypatch.setenv("GRUG_DEEP_ESCALATION", "sometimes")
+    with caplog.at_level("WARNING"):
+        assert lc._deep_escalation_mode() == "auto"
+    assert any("deep_escalation_mode_invalid" in r.message for r in caplog.records)

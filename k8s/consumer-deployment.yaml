@@ -120,8 +120,9 @@ spec:
             # Elder-capable workloads (this is the PRODUCTION review path).
             - {name: GRUG_REVIEW_BACKEND_PRIORITY, value: cloud}
             - {name: GRUG_OPENCODE_GO_API_KEY_SSM, value: /infra/llm/opencode_go_api_key}
-            # GRUG_CLOUD_FREE_TIER_MODEL deliberately unset - rationale in
-            # webhook-deployment.yaml.
+            # OpenRouter :free as the chain's tier 2 - rationale and eval
+            # evidence in webhook-deployment.yaml.
+            - {name: GRUG_CLOUD_FREE_TIER_MODEL, value: "nvidia/nemotron-3-super-120b-a12b:free"}
             - {name: GRUG_PROMPT_EXPERIMENT_SSM, value: /grug/elder-prompt-experiment}
             # Tiered Elder (#645): coder arm on every PR; reasoner only on
             # escalation / sample. Rollback to always-on dual-arm: deep.
@@ -148,7 +149,17 @@ spec:
             - {name: GRUG_DEEP_DIFF_LINES, value: "200"}
             # #646: reasoner after Tier-1 publish (0 = disable async deep)
             - {name: GRUG_DEEP_ASYNC, value: "1"}
-            - {name: GRUG_OPENROUTER_REVIEW_MODEL, value: anthropic/claude-opus-4.7}
+            # Which triggers start the deep pass. auto = size, risky paths,
+            # the 0.20 sample and an explicit request. on_demand = only a
+            # "deep review" marker in the PR title or body. Measured over the
+            # 7 days to 2026-09-26: 340 deep passes started, 118 came back
+            # unparseable, and about 16 posted a finding Tier 1 had not.
+            # Under cloud priority the deep pass runs on the cloud chain and
+            # reaches the Cave reasoner only when every cloud tier fails.
+            - {name: GRUG_DEEP_ESCALATION, value: auto}
+            # The key has a zero spend limit: a paid model here 403s on every
+            # call. Same :free model as the chain's tier 2.
+            - {name: GRUG_OPENROUTER_REVIEW_MODEL, value: "nvidia/nemotron-3-super-120b-a12b:free"}
             # Apex: more concurrent durable reviews so a busy multi-repo
             # night does not serialize Elder behind unrelated large PRs.
             # 3 per pod x 2 replicas (#701) = the same total 6 the single

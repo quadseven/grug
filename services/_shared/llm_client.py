@@ -266,12 +266,28 @@ _OPENCODE_GO_DEFAULT_WIRE = "chat"
 # their low-latency shared backend config; exhaustive reasoning belongs only on
 # the expensive generation pass. High leaves enough output budget for the JSON
 # findings, unlike max effort which can consume roughly 95% as reasoning.
+#
+# The default is a `:free` model: grug's OpenRouter key has a zero spend
+# limit, so a paid model here 403s on every call (read-only key check,
+# 2026-09-26: limit 0, lifetime usage 0). The model was picked on
+# `make elder-eval` evidence, not vendor claims: nvidia/nemotron-3-super-
+# 120b-a12b:free scored 17/17 cases with no errors (catch 0.25, noise 0.00,
+# against the committed bench baseline's 0.17), while qwen3.8-27b:free and
+# gemma-4-31b-it:free answered 429 on every case and north-mini-code:free
+# returned unparseable JSON.
 _OPENROUTER_REVIEW_MODEL = os.getenv(
-    "GRUG_OPENROUTER_REVIEW_MODEL", "anthropic/claude-opus-4.7",
+    "GRUG_OPENROUTER_REVIEW_MODEL", "nvidia/nemotron-3-super-120b-a12b:free",
 )
 _OPENROUTER_REVIEW_EXTRA_BODY: dict[str, Any] = {
     "max_tokens": 32_768,
     "reasoning": {"effort": "high", "exclude": True},
+}
+# A `:free` model does not honor `reasoning.exclude` the way a first-party
+# frontier model does: it can spend the whole budget on hidden reasoning and
+# return no content (grug#881). OpenRouter's own toggle turns it off.
+_OPENROUTER_FREE_REVIEW_EXTRA_BODY: dict[str, Any] = {
+    "max_tokens": 8_192,
+    "reasoning": {"enabled": False},
 }
 
 # Shared low-latency calls retain the historical 60-second timeout. Deep code
@@ -780,7 +796,11 @@ def _free_tier_chain_config() -> "BackendConfig | None":
         url=os.getenv("GRUG_BENCH_OPENROUTER_URL", _OPENROUTER_URL),
         model=model,
         key_loader=lambda: _load_openrouter_key(),
-        extra_body={"max_tokens": _CLOUD_CHAIN_MAX_TOKENS},
+        # Reasoning off: measured 2026-09-26 on a seeded-bug review prompt,
+        # nemotron-3-super:free with its default reasoning took 91s and 171s
+        # (the second a max_tokens runaway, unparseable). With reasoning off
+        # it answered in 3-5s with valid JSON naming the planted bugs.
+        extra_body={"max_tokens": _CLOUD_CHAIN_MAX_TOKENS, "reasoning": {"enabled": False}},
         timeout_seconds=_CLOUD_CHAIN_TIMEOUT_SECONDS,
         retry_attempts=1,
         transport_retry_attempts=1,
@@ -821,7 +841,14 @@ def _review_backend_config(backend: Backend) -> BackendConfig:
         return replace(
             config,
             model=_OPENROUTER_REVIEW_MODEL,
-            extra_body={**config.extra_body, **_OPENROUTER_REVIEW_EXTRA_BODY},
+            extra_body={
+                **config.extra_body,
+                **(
+                    _OPENROUTER_FREE_REVIEW_EXTRA_BODY
+                    if is_free_tier_model(_OPENROUTER_REVIEW_MODEL)
+                    else _OPENROUTER_REVIEW_EXTRA_BODY
+                ),
+            },
             timeout_seconds=_review_llm_timeout_s(),
             retry_attempts=_REVIEW_RETRY_ATTEMPTS,
             transport_retry_attempts=_REVIEW_TRANSPORT_RETRY_ATTEMPTS,
@@ -981,7 +1008,15 @@ def _cave_review_config(backend: Backend) -> "BackendConfig | None":
         }
     else:
         model = os.getenv("GRUG_CAVE_REVIEW_MODEL", _CAVE_REVIEW_CODER_DEFAULT_MODEL)
-        extra_body = {"response_format": _CAVE_FINDINGS_RESPONSE_FORMAT}
+        # Server-side completion cap, the same budget the cloud chain gets.
+        # The coder arm had none, and single generations of 18-26k tokens
+        # were the sustained load that overheated the Sparks (2026-09-26).
+        # A capped reply is detected as truncated in `_run_review_arm` and
+        # published as a partial review, never as a clean pass.
+        extra_body = {
+            "response_format": _CAVE_FINDINGS_RESPONSE_FORMAT,
+            "max_tokens": _CLOUD_CHAIN_MAX_TOKENS,
+        }
     return BackendConfig(
         backend=backend,
         url=f"{base}/v1/chat/completions",
@@ -3423,12 +3458,16 @@ def _review_reasoner_diff_once(
     cancel_event: threading.Event | None = None,
     review_map: str = "",
 ) -> LlmReviewResponse:
-    """Cave reasoner arm only — post-publish deep append for tiered mode (#646).
+    """Post-publish deep append for tiered mode (#646).
 
-    Uses the same prompt construction as deep/tiered (v2 recall). Never
-    falls back to SaaS here: overload insurance already ran on the Tier-1
-    path; a slow reasoner outage must not re-burn SaaS after the required
-    check already completed.
+    Uses the same prompt construction as deep/tiered (v2 recall). Under
+    `GRUG_REVIEW_BACKEND_PRIORITY=cloud` the cloud chain (OpenCode Go, then
+    the configured OpenRouter `:free` model) answers first, and the Cave
+    reasoner runs only when every cloud tier failed. The deep pass was the
+    main sustained load on the Sparks, which hard-cut on heat (operator
+    decision 2026-09-26). Under `cave` priority it is the Cave reasoner
+    alone, as before. Never falls back to the paid SaaS valve here:
+    overload insurance already ran on the Tier-1 path.
     """
     if not hunks:
         return LlmReviewResponse(kind="no_diff")
@@ -3444,6 +3483,12 @@ def _review_reasoner_diff_once(
         review_map=review_map,
     )
     pr_tags = _llmobs_tags(pr_context)
+    if _review_backend_priority() == "cloud":
+        cloud_result = _try_cloud_primary(
+            hunks, messages, variant, pr_tags, installation_id, pr_context, cancel_event,
+        )
+        if cloud_result is not None:
+            return cloud_result
     outcome = _run_review_arm(
         Backend.CAVE_REASONER, messages, variant, pr_tags, cancel_event,
     )
@@ -4010,6 +4055,26 @@ def _explicit_deep_request(pr_context: Optional[PrContext]) -> bool:
     return bool(_DEEP_REVIEW_MARKER_RE.search(blob))
 
 
+DeepEscalationMode = Literal["auto", "on_demand"]
+
+
+def _deep_escalation_mode() -> DeepEscalationMode:
+    """Resolve GRUG_DEEP_ESCALATION: which triggers may start the deep pass.
+
+    `auto` (default) keeps every trigger: size, risky paths, sampling and
+    an explicit request. `on_demand` keeps only the explicit request (a
+    "deep review" marker in the PR title or body), so one line of config
+    turns the deep pass from routine into opt-in. Measured over the 7 days
+    to 2026-09-26: 340 deep passes started and about 16 posted a finding
+    Tier 1 had not already posted. Unknown values fall back to `auto`,
+    logged, so a typo never silently disables the pass."""
+    raw = os.getenv("GRUG_DEEP_ESCALATION", "auto").strip().lower()
+    if raw in ("auto", "on_demand"):
+        return cast(DeepEscalationMode, raw)
+    log.warning("deep_escalation_mode_invalid", extra={"value": raw, "using": "auto"})
+    return "auto"
+
+
 @dataclass(frozen=True, slots=True)
 class DeepEscalationDecision:
     """Whether tiered mode should spend the reasoner arm, and why."""
@@ -4040,6 +4105,13 @@ def decide_deep_escalation(
     markers = _deep_path_markers() if path_markers is None else path_markers
     added = _count_added_lines(hunks)
     reasons: list[str] = []
+
+    if _deep_escalation_mode() == "on_demand":
+        if _explicit_deep_request(pr_context):
+            reasons.append("explicit_deep_review")
+        return DeepEscalationDecision(
+            escalate=bool(reasons), reasons=tuple(reasons), added_lines=added,
+        )
 
     # Exclusive bound: env value N means "more than N added lines" so
     # GRUG_DEEP_DIFF_LINES=500 escalates only above 500, not at exactly 500.
@@ -4143,9 +4215,22 @@ def _try_cloud_primary(
                 error=_truncation_error((backend,) if outcome.truncated else ()),
             )
         if outcome.kind == "parse_failed":
+            last_error = outcome.error_text
+            if is_free_tier_model(tier.model):
+                # grug#1025: a garbled `:free` answer used to become the
+                # review's answer and block the Cave fallback. Free output
+                # is best-effort, so its parse failure counts as a miss.
+                log.info(
+                    "llm_cloud_free_tier_parse_failed_falling_through",
+                    extra={
+                        "model": tier.model,
+                        "repo": (pr_context or {}).get("repo"),
+                        "pr_number": (pr_context or {}).get("pr_number"),
+                    },
+                )
+                continue
             if first_parse_fail is None:
                 first_parse_fail = (backend, outcome.model, outcome.parse_err)
-            last_error = outcome.error_text
             continue
         # config_error / transport_error / http_failed
         last_error = outcome.error_text
