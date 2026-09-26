@@ -25,6 +25,8 @@ def _patch_keys(monkeypatch):
     monkeypatch.setattr(lc, "_load_poolside_key", lambda: "test-pool-key")
     monkeypatch.setattr(lc, "_load_openrouter_key", lambda: "test-or-key")
     monkeypatch.setattr(lc, "_load_opencode_go_key", lambda: "test-ocg-key")
+    # Module-level breaker state must not leak between tests.
+    monkeypatch.setattr(lc, "_opencode_go_blocked_until", 0.0, raising=False)
     monkeypatch.delenv("GRUG_CLOUD_FREE_TIER_MODEL", raising=False)
     monkeypatch.setenv("GRUG_CAVE_GATEWAY_URL", "http://cave.test")
     # Fast = single (coder) arm; the deep tests below opt into both arms so a
@@ -3845,7 +3847,11 @@ def test_cloud_priority_total_cloud_failure_falls_through_to_cave(monkeypatch) -
 
     with patch.object(
         httpx, "post",
-        side_effect=[httpx.ConnectError("opencode go unreachable"), cave_response],
+        side_effect=[
+            httpx.ConnectError("opencode go unreachable"),
+            httpx.ConnectError("poolside unreachable"),
+            cave_response,
+        ],
     ) as mock_post:
         out = review_diff([_hunk()], installation_id=1)
 
@@ -3854,8 +3860,8 @@ def test_cloud_priority_total_cloud_failure_falls_through_to_cave(monkeypatch) -
         "total cloud failure must fall through to Cave, not surface as "
         "all_failed - the local hardware is the guaranteed fallback"
     )
-    assert mock_post.call_count == 2, (
-        "expected exactly opencode Go, then Cave - one call each, no "
+    assert mock_post.call_count == 3, (
+        "expected exactly opencode Go, Poolside, then Cave - one call each, no "
         "retries (transport_retry_attempts=1 for chain tiers)"
     )
 
@@ -3922,6 +3928,7 @@ def test_cloud_chain_all_tiers_fail_falls_through_to_cave_with_free_tier_configu
         side_effect=[
             httpx.ConnectError("opencode go unreachable"),
             httpx.ConnectError("free tier unreachable"),
+            httpx.ConnectError("poolside unreachable"),
             cave_response,
         ],
     ) as mock_post:
@@ -3929,7 +3936,7 @@ def test_cloud_chain_all_tiers_fail_falls_through_to_cave_with_free_tier_configu
 
     assert out.kind == "reviewed"
     assert out.backend_used == Backend.CAVE
-    assert mock_post.call_count == 3
+    assert mock_post.call_count == 4
 
 
 def test_cloud_priority_parse_failed_is_not_masked_by_a_cave_retry(monkeypatch) -> None:
@@ -3947,7 +3954,8 @@ def test_cloud_priority_parse_failed_is_not_masked_by_a_cave_retry(monkeypatch) 
 
     assert out.kind == "parse_failed"
     assert out.backend_used == Backend.OPENCODE_GO
-    mock_post.assert_called_once()
+    # Go, then Poolside (also unparseable here); never the Cave.
+    assert mock_post.call_count == 2
 
 
 def test_free_tier_chain_config_returns_none_when_unconfigured(monkeypatch) -> None:
@@ -4033,13 +4041,15 @@ def test_opencode_go_thinking_toggle_scope(monkeypatch) -> None:
     assert lc._opencode_go_extra_body("deepseek-v4.1-flash", "chat") == {}
 
 
-def test_poolside_never_appears_in_the_cloud_chain(monkeypatch) -> None:
-    """grug#910: Poolside is DROPPED, confirmed unfunded - not merely
-    deprioritized. Must never appear regardless of what else is configured."""
+def test_poolside_is_the_last_cloud_tier(monkeypatch) -> None:
+    """Poolside laguna-s-2.1 answers again and has the best eval record of the
+    reachable cloud models, so it is the last cloud tier, ahead of the Cave."""
     monkeypatch.setenv("GRUG_CLOUD_FREE_TIER_MODEL", "z-ai/glm-5.2:free")
     tiers = lc._cloud_chain_tiers()
-    assert all(t.backend != Backend.POOLSIDE for t in tiers)
-    assert [t.backend for t in tiers] == [Backend.OPENCODE_GO, Backend.OPENROUTER]
+    assert [t.backend for t in tiers] == [
+        Backend.OPENCODE_GO, Backend.OPENROUTER, Backend.POOLSIDE,
+    ]
+    assert tiers[-1].extra_body["max_tokens"] == lc._CLOUD_CHAIN_MAX_TOKENS
 
 
 def test_cave_priority_is_byte_identical_to_pre_906_behavior(monkeypatch) -> None:
@@ -4538,13 +4548,14 @@ def test_deep_append_falls_back_to_capped_cave_reasoner_when_cloud_is_down(monke
     cave = httpx.Response(200, json=_openai_json_response('{"findings": []}'))
     go_429 = httpx.Response(429, json={"error": {"message": "Go usage limit exceeded"}})
 
-    with patch.object(httpx, "post", side_effect=[go_429, cave]) as post:
+    pool_down = httpx.ConnectError("poolside unreachable")
+    with patch.object(httpx, "post", side_effect=[go_429, pool_down, cave]) as post:
         out = lc.review_reasoner_diff([_hunk()], installation_id=1)
 
     assert out.kind == "reviewed"
     assert out.backends_used == (Backend.CAVE_REASONER,)
-    assert post.call_count == 2
-    assert post.call_args_list[1].kwargs["json"]["max_tokens"] == 6_144
+    assert post.call_count == 3
+    assert post.call_args_list[2].kwargs["json"]["max_tokens"] == 6_144
 
 
 def test_deep_append_under_cave_priority_is_unchanged(monkeypatch) -> None:
@@ -4569,12 +4580,13 @@ def test_free_tier_parse_failure_falls_through_to_cave(monkeypatch) -> None:
     junk = httpx.Response(200, json=_openai_json_response("not json at all"))
     cave = httpx.Response(200, json=_openai_json_response('{"findings": []}'))
 
-    with patch.object(httpx, "post", side_effect=[go_429, junk, cave]) as post:
+    pool_down = httpx.ConnectError("poolside unreachable")
+    with patch.object(httpx, "post", side_effect=[go_429, junk, pool_down, cave]) as post:
         out = review_diff([_hunk()], installation_id=1)
 
     assert out.kind == "reviewed"
     assert out.backend_used == Backend.CAVE
-    assert post.call_count == 3
+    assert post.call_count == 4
 
 
 def test_opencode_go_parse_failure_is_still_the_answer_after_a_free_tier_miss(
@@ -4587,12 +4599,12 @@ def test_opencode_go_parse_failure_is_still_the_answer_after_a_free_tier_miss(
     _admit_free_tier(monkeypatch)
     junk = httpx.Response(200, json=_openai_json_response("not json at all"))
 
-    with patch.object(httpx, "post", side_effect=[junk, junk]) as post:
+    with patch.object(httpx, "post", side_effect=[junk, junk, junk]) as post:
         out = review_diff([_hunk()], installation_id=1)
 
     assert out.kind == "parse_failed"
     assert out.backend_used == Backend.OPENCODE_GO
-    assert post.call_count == 2
+    assert post.call_count == 3
 
 
 def _big_risky_hunks() -> list[Hunk]:
@@ -4635,3 +4647,124 @@ def test_deep_escalation_invalid_mode_falls_back_to_auto(monkeypatch, caplog) ->
     with caplog.at_level("WARNING"):
         assert lc._deep_escalation_mode() == "auto"
     assert any("deep_escalation_mode_invalid" in r.message for r in caplog.records)
+
+
+# --- 2026-09-26: Go breaker, degenerate empty reviews, cloud judge ---
+
+
+def _go_limit_429(retry_after: str = "3600") -> httpx.Response:
+    return httpx.Response(
+        429,
+        headers={"retry-after": retry_after},
+        json={
+            "type": "error",
+            "error": {"type": "GoUsageLimitError", "message": "Go usage limit exceeded"},
+            "metadata": {"limitName": "monthly"},
+        },
+    )
+
+
+def test_opencode_go_usage_limit_opens_breaker_and_skips_go_until_retry_after(
+    monkeypatch,
+) -> None:
+    """One refused call per window, not one per review."""
+    monkeypatch.setenv("GRUG_REVIEW_BACKEND_PRIORITY", "cloud")
+    ok = httpx.Response(200, json=_openai_json_response('{"findings": []}'))
+
+    with patch.object(httpx, "post", side_effect=[_go_limit_429("105419"), ok, ok]) as post:
+        review_diff([_hunk()], installation_id=1)
+        review_diff([_hunk()], installation_id=1)
+
+    urls = [c.args[0] for c in post.call_args_list]
+    assert sum("opencode.ai" in u for u in urls) == 1
+    assert not lc._opencode_go_available()
+    assert lc._opencode_go_available(now=lc.time.time() + 105_420)
+
+
+def test_ordinary_opencode_go_429_does_not_open_breaker() -> None:
+    lc._note_opencode_go_response(
+        httpx.Response(429, json={"error": {"message": "slow down"}}),
+    )
+    assert lc._opencode_go_available()
+
+
+def test_breaker_caps_an_absurd_retry_after() -> None:
+    lc._note_opencode_go_response(_go_limit_429("99999999"))
+    assert lc._opencode_go_available(
+        now=lc.time.time() + lc._OPENCODE_GO_MAX_BLOCK_SECONDS + 1,
+    )
+
+
+def test_open_breaker_drops_go_from_interactive_order(monkeypatch) -> None:
+    monkeypatch.setenv("GRUG_OPENCODE_GO_API_KEY_SSM", "/x")
+    assert Backend.OPENCODE_GO in lc._interactive_backend_order(1)
+    lc._note_opencode_go_response(_go_limit_429())
+    assert Backend.OPENCODE_GO not in lc._interactive_backend_order(1)
+
+
+def _usage_response(content: str, prompt_tokens: int, completion_tokens: int) -> httpx.Response:
+    body = _openai_json_response(content)
+    body["usage"] = {"prompt_tokens": prompt_tokens, "completion_tokens": completion_tokens}
+    return httpx.Response(200, json=body)
+
+
+def test_degenerate_empty_review_falls_through_to_the_next_tier(monkeypatch) -> None:
+    """Seen live: `{"findings": []}` in 7 output tokens for a 10-20k-token
+    diff, published as a clean pass. It is a miss; Poolside answers."""
+    monkeypatch.setenv("GRUG_REVIEW_BACKEND_PRIORITY", "cloud")
+    monkeypatch.setenv("GRUG_CLOUD_FREE_TIER_MODEL", "z-ai/glm-5.2:free")
+    _admit_free_tier(monkeypatch)
+    counted: list = []
+    import observability
+    monkeypatch.setattr(observability, "emit_count", lambda *a, **k: counted.append((a, k)))
+    degenerate = _usage_response('{"findings": []}', 15_000, 7)
+    real = _usage_response(
+        '{"findings": [{"path": "src/x.py", "line": 1, "rule": "r", '
+        '"severity": "medium", "message": "m"}]}', 15_000, 400,
+    )
+
+    with patch.object(
+        httpx, "post", side_effect=[_go_limit_429(), degenerate, real],
+    ) as post:
+        out = review_diff([_hunk()], installation_id=1)
+
+    assert out.kind == "reviewed"
+    assert out.backend_used == Backend.POOLSIDE
+    assert len(out.findings) == 1
+    assert post.call_count == 3
+    assert counted and counted[0][0][0] == "grug.elder.degenerate_empty_review"
+
+
+def test_small_empty_review_is_not_degenerate() -> None:
+    assert not lc._is_degenerate_empty_review((), {"input_tokens": 900, "output_tokens": 7})
+    assert not lc._is_degenerate_empty_review((), {"input_tokens": 15_000, "output_tokens": 300})
+    assert not lc._is_degenerate_empty_review((), {})
+    assert lc._is_degenerate_empty_review((), {"input_tokens": 15_000, "output_tokens": 7})
+
+
+def test_judge_truncated_at_output_cap_is_a_failure_not_a_verdict() -> None:
+    """Seen live: 33,857 input tokens, hit the 4,096 cap, empty preview."""
+    # Parseable on its own, so only the finish_reason check can reject it.
+    body = _openai_json_response(
+        '{"verdicts": [{"index": 0, "is_real_bug": false, "reasoning": "cut"}]}',
+    )
+    body["choices"][0]["finish_reason"] = "length"
+    finding = {"rule_name": "r", "file": "src/x.py", "line": 1,
+               "severity": "low", "message": "m"}
+    cave = lc._cave_judge_config()
+    with patch.object(httpx, "post", return_value=httpx.Response(200, json=body)):
+        assert lc.judge_findings([finding], [_hunk()], installation_id=1, config=cave) == ()
+
+
+def test_cloud_judge_configs_empty_under_cave_priority(monkeypatch) -> None:
+    monkeypatch.delenv("GRUG_REVIEW_BACKEND_PRIORITY", raising=False)
+    assert lc.cloud_judge_configs() == []
+
+
+def test_cloud_judge_configs_put_poolside_first_and_cap_output(monkeypatch) -> None:
+    monkeypatch.setenv("GRUG_REVIEW_BACKEND_PRIORITY", "cloud")
+    monkeypatch.setenv("GRUG_CLOUD_FREE_TIER_MODEL", "z-ai/glm-5.2:free")
+    configs = lc.cloud_judge_configs()
+    assert [c.backend for c in configs] == [Backend.POOLSIDE, Backend.OPENROUTER]
+    assert all(c.extra_body["max_tokens"] == 4_096 for c in configs)
+    assert all(c.backend != Backend.CAVE for c in configs)

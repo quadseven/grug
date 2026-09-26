@@ -142,6 +142,34 @@ def emit_gauge(
         )
 
 
+def emit_count(
+    metric: str,
+    value: float = 1,
+    tags: dict[str, str] | None = None,
+) -> None:
+    """DogStatsD count over UDP; same path, tagging and never-raise contract
+    as `emit_gauge`, for events a gauge would under-count."""
+    host = os.getenv("DD_AGENT_HOST", "")
+    lg = logging.getLogger("grug.observability")
+    if not host:
+        lg.warning("count_skipped_no_agent_host", extra={"metric": metric})
+        return
+    try:
+        env = os.getenv("DD_ENV") or os.getenv("GRUG_ENV", "prod")
+        parts = [
+            f"{_clean_tag(str(k))}:{_clean_tag(str(v))}"
+            for k, v in (tags or {}).items()
+            if str(k) != "env"
+        ] + [f"env:{env}"]
+        payload = f"{metric}:{value}|c|#{','.join(parts)}".encode()
+        _send_dogstatsd(payload, host)
+    except Exception as e:  # noqa: BLE001 - the never-raise contract is load-bearing
+        lg.warning(
+            "count_emit_failed",
+            extra={"metric": metric, "kind": type(e).__name__},
+        )
+
+
 def emit_enforcement_metric(
     repo: str,
     enforcement_type: str,
