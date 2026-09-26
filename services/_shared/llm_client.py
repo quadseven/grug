@@ -1683,6 +1683,34 @@ def _merged_headers(config: BackendConfig, key: str) -> dict[str, str]:
     }
 
 
+def _validated_transport_attempts(config: BackendConfig) -> int:
+    """Resolve and validate the retry budget; raises `_BackendConfigError`."""
+    if config.retry_attempts < 1:
+        raise _BackendConfigError(
+            f"{config.backend.value} retry_attempts must be positive"
+        )
+    transport_attempts = (
+        config.transport_retry_attempts
+        if config.transport_retry_attempts is not None
+        else config.retry_attempts
+    )
+    if transport_attempts < 1:
+        raise _BackendConfigError(
+            f"{config.backend.value} transport_retry_attempts must be positive"
+        )
+    if transport_attempts > config.retry_attempts:
+        # The dispatch loop is bounded by retry_attempts, so a larger transport
+        # budget can never be spent - and worse, a transport error on the final
+        # attempt takes the `continue` branch (attempt < transport_attempts - 1
+        # still holds), exhausts the loop, and raises the spurious
+        # AssertionError below instead of re-raising the real transport error.
+        raise _BackendConfigError(
+            f"{config.backend.value} transport_retry_attempts "
+            f"({transport_attempts}) must not exceed retry_attempts "
+            f"({config.retry_attempts})"
+        )
+    return transport_attempts
+
 def _call_backend(
     config: BackendConfig, messages: list[dict[str, str]],
     cancel_event: threading.Event | None = None,
@@ -1755,30 +1783,7 @@ def _call_backend(
     body = _build_request_body(config, messages)
     headers = _merged_headers(config, key)
 
-    if config.retry_attempts < 1:
-        raise _BackendConfigError(
-            f"{config.backend.value} retry_attempts must be positive"
-        )
-    transport_attempts = (
-        config.transport_retry_attempts
-        if config.transport_retry_attempts is not None
-        else config.retry_attempts
-    )
-    if transport_attempts < 1:
-        raise _BackendConfigError(
-            f"{config.backend.value} transport_retry_attempts must be positive"
-        )
-    if transport_attempts > config.retry_attempts:
-        # The dispatch loop is bounded by retry_attempts, so a larger transport
-        # budget can never be spent - and worse, a transport error on the final
-        # attempt takes the `continue` branch (attempt < transport_attempts - 1
-        # still holds), exhausts the loop, and raises the spurious
-        # AssertionError below instead of re-raising the real transport error.
-        raise _BackendConfigError(
-            f"{config.backend.value} transport_retry_attempts "
-            f"({transport_attempts}) must not exceed retry_attempts "
-            f"({config.retry_attempts})"
-        )
+    transport_attempts = _validated_transport_attempts(config)
     if cancel_event is None:
         resp = _post_with_retries(
             config.url, body, headers, config.timeout_seconds,
@@ -4328,6 +4333,31 @@ def _review_backend_priority() -> str:
     return raw
 
 
+def _cloud_tier_success(
+    outcome: "_ArmOutcome", hunks: list[Hunk], pr_context: Optional[PrContext],
+) -> "LlmReviewResponse":
+    """Wrap one cloud tier's successful arm as the review's answer."""
+    assert outcome.model is not None
+    backend = outcome.backend
+    origin = _finding_origin(
+        backend=backend, model=outcome.model,
+        review_span_context=outcome.span_context,
+        pr_context=pr_context, hunks=hunks,
+    )
+    return LlmReviewResponse(
+        kind="reviewed",
+        findings=tuple(
+            replace(finding, origins=(origin,)) for finding in outcome.findings
+        ),
+        backend_used=backend,
+        model_name=outcome.model,
+        review_span_context=outcome.span_context,
+        backends_used=(backend,),
+        models_used=(outcome.model,),
+        error=_truncation_error((backend,) if outcome.truncated else ()),
+    )
+
+
 def _try_cloud_primary(
     hunks: list[Hunk],
     messages: list[dict[str, str]],
@@ -4366,24 +4396,7 @@ def _try_cloud_primary(
             last_error = f"{backend.value}: degenerate empty review"
             continue
         if outcome.kind == "success":
-            assert outcome.model is not None
-            origin = _finding_origin(
-                backend=backend, model=outcome.model,
-                review_span_context=outcome.span_context,
-                pr_context=pr_context, hunks=hunks,
-            )
-            return LlmReviewResponse(
-                kind="reviewed",
-                findings=tuple(
-                    replace(finding, origins=(origin,)) for finding in outcome.findings
-                ),
-                backend_used=backend,
-                model_name=outcome.model,
-                review_span_context=outcome.span_context,
-                backends_used=(backend,),
-                models_used=(outcome.model,),
-                error=_truncation_error((backend,) if outcome.truncated else ()),
-            )
+            return _cloud_tier_success(outcome, hunks, pr_context)
         if outcome.kind == "parse_failed":
             last_error = outcome.error_text
             if is_free_tier_model(tier.model):
