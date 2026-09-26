@@ -15,7 +15,7 @@ def _user_row(**overrides):
     base = {
         "PK": "USER#100",
         "SK": "META",
-        "login": "evan",
+        "login": "alice",
         "role": "user",
         "tier": "free",
         "allowlisted": False,

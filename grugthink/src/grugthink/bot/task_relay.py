@@ -1,7 +1,7 @@
 """Relay implement/fix/review requests from Grug's chat identity to Hermes.
 
 Grug (this personality bot) has no tool-use of its own - implementing code,
-fixing bugs, and opening PRs is Hermes' job (infra repo, hermes-discord).
+fixing bugs, and opening PRs is Hermes' job (a separate Discord agent).
 When a mention looks like a work request rather than a chat/verify
 statement, Grug posts it into the repo channel Hermes already monitors,
 waits, and relays Hermes' own milestone messages back into the original
@@ -55,30 +55,29 @@ _ALLOWED_USERS_ENV_VAR = "TASK_RELAY_ALLOWED_USER_IDS"
 # module docstring's SECURITY MODEL section.
 _HERMES_USER_ID_ENV_VAR = "HERMES_BOT_USER_ID"
 
-# Mirrors infra's production/oke/manifests/hermes-discord/configmap.yaml
-# discord.free_response_channels (guild 781626163591249930, category
-# "Github"). A small duplicated map rather than a shared config source -
-# unifying the two is a later slice, not blocking this one. If this list
-# drifts from the configmap, relays silently 404 (handled below) rather
-# than reaching the wrong channel.
-REPO_CHANNELS: dict[str, int] = {
-    "grug": 1524605086263808113,
-    "infra": 1524605143210000464,
-    "macchina": 1524605185887043584,
-    "digital-ledger": 1524605284822155334,
-    "claude-stuff": 1524605321790623905,
-    "infra-public": 1524607466866868307,
-    "grugthink": 1524607693246169230,
-    "anna-personal": 1524607738997506099,
-    "macchina-ios-certs": 1524607771558023178,
-    "holdfast": 1524607875257860219,
-    "gemini-plugin-cc": 1524607911450513468,
-    "vroom-vroom": 1524608073698902146,
-    "conducted": 1524608164991865093,
-    "brother-claudius": 1524608246688776242,
-    "meow-now": 1524608364485677256,
-    "aws-solutions-architect-study": 1524608438120743043,
-}
+# Repo name -> the Discord channel Hermes monitors for that repo, as
+# comma-separated `name=channel_id` pairs (e.g. `grug=123,other-repo=456`).
+# Read at call time, not baked in: this repo is public, and the map names
+# private repos and a private guild's channel IDs. The deployment supplies it
+# alongside TASK_RELAY_ALLOWED_USER_IDS, mirroring the Hermes Discord
+# config's free-response channel list. Unset or empty means no repo resolves,
+# so a relay answers "which cave?" and sends nothing - the same fail-closed
+# stance as the allowlist. If the map drifts from Hermes' config, relays
+# silently 404 (handled below) rather than reaching the wrong channel.
+_REPO_CHANNELS_ENV_VAR = "TASK_RELAY_REPO_CHANNELS"
+
+
+def repo_channels() -> dict[str, int]:
+    """Parse TASK_RELAY_REPO_CHANNELS. Malformed pairs are skipped, the same
+    tolerance `_parse_id_list` gives the allowlist."""
+    out: dict[str, int] = {}
+    for part in (os.environ.get(_REPO_CHANNELS_ENV_VAR) or "").split(","):
+        name, sep, raw_id = part.partition("=")
+        name, raw_id = name.strip().lower(), raw_id.strip()
+        if sep and name and raw_id.isdigit():
+            out[name] = int(raw_id)
+    return out
+
 
 TaskKind = Literal["change", "review"]
 
@@ -227,11 +226,11 @@ async def _safe_send(channel, content: str) -> bool:
 def resolve_repo(clean_content: str) -> Optional[str]:
     """Find a known repo name mentioned in the request.
 
-    Longest name first so e.g. "digital-ledger" isn't shadowed by a
+    Longest name first so e.g. "grugthink" isn't shadowed by a
     shorter accidental substring match earlier in the dict.
     """
     lowered = clean_content.lower()
-    for repo in sorted(REPO_CHANNELS, key=len, reverse=True):
+    for repo in sorted(repo_channels(), key=len, reverse=True):
         if repo in lowered:
             return repo
     return None
@@ -259,19 +258,20 @@ async def relay_to_hermes(
         )
         return
 
+    channels = repo_channels()
     repo = resolve_repo(clean_content)
-    if repo is None:
+    if repo is None or repo not in channels:
         await _safe_send(
             original_message.channel,
-            f"{bot_name} no know which cave you mean. Say repo name - one of: {', '.join(sorted(REPO_CHANNELS))}.",
+            f"{bot_name} no know which cave you mean. Say repo name - one of: {', '.join(sorted(channels))}.",
         )
         return
 
-    channel = client.get_channel(REPO_CHANNELS[repo])
+    channel = client.get_channel(channels[repo])
     if channel is None:
         log.warning(
             "task_relay: cannot see Hermes repo channel - likely missing Discord permission grant",
-            extra={"repo": repo, "channel_id": REPO_CHANNELS[repo]},
+            extra={"repo": repo, "channel_id": channels[repo]},
         )
         await _safe_send(
             original_message.channel,

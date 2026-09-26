@@ -38,7 +38,7 @@ def test_delete_user_state_preserves_admin_metadata(_us):
     """Spec 0005 PurgeCorrupt: credential blobs go, identity stays.
     A KMS key rotation must NOT strip admin role or paid tier."""
     _us.upsert_oauth_user(
-        github_user_id="100", login="evan",
+        github_user_id="100", login="alice",
         oauth_access_token="ACCESS-1", oauth_refresh_token="REFRESH-1",
     )
     # Promote to admin / lifetime / allowlisted out-of-band.
@@ -60,14 +60,14 @@ def test_delete_user_state_preserves_admin_metadata(_us):
     assert item["tier"] == "lifetime"
     assert item["allowlisted"] is True
     assert item["allowlisted_by"] == "admin@grug.lol"
-    assert item["login"] == "evan"
+    assert item["login"] == "alice"
 
 
 def test_delete_user_state_is_idempotent_when_blobs_absent(_us):
     """Calling delete_user_state on a row that has no token blobs (e.g.
     a 2nd corruption-purge race) must not raise."""
     _us.upsert_oauth_user(
-        github_user_id="100", login="evan",
+        github_user_id="100", login="alice",
         oauth_access_token="x", oauth_refresh_token=None,
     )
     _us.delete_user_state("100")
@@ -78,7 +78,7 @@ def test_get_user_with_tokens_returns_none_on_corruption(_us):
     """When decrypt raises CredentialBlobCorrupt, the function must
     purge the credential blobs and return None for clean /signin redirect."""
     _us.upsert_oauth_user(
-        github_user_id="100", login="evan",
+        github_user_id="100", login="alice",
         oauth_access_token="ACCESS-1", oauth_refresh_token="REFRESH-1",
     )
     from crypto.kms_envelope import CredentialBlobCorrupt
@@ -106,7 +106,7 @@ def test_get_user_with_tokens_returns_none_even_when_purge_fails(_us):
     simulated failure is psycopg.Error — the class the purge guard
     actually catches."""
     _us.upsert_oauth_user(
-        github_user_id="100", login="evan",
+        github_user_id="100", login="alice",
         oauth_access_token="ACCESS-1", oauth_refresh_token=None,
     )
     from crypto.kms_envelope import CredentialBlobCorrupt
@@ -131,7 +131,7 @@ def test_upsert_oauth_user_admin_change_not_clobbered_by_oauth_refresh(_us):
     allowlisted=True back to False. The atomic jsonb-merge upsert preserves
     admin-side changes regardless of read ordering."""
     _us.upsert_oauth_user(
-        github_user_id="100", login="evan",
+        github_user_id="100", login="alice",
         oauth_access_token="ACCESS-1", oauth_refresh_token="REFRESH-1",
     )
     # Admin flips allowlisted -> True (the "concurrent admin write").
@@ -140,7 +140,7 @@ def test_upsert_oauth_user_admin_change_not_clobbered_by_oauth_refresh(_us):
     )
     # OAuth re-auth comes through (token rotation).
     _us.upsert_oauth_user(
-        github_user_id="100", login="evan",
+        github_user_id="100", login="alice",
         oauth_access_token="ACCESS-2", oauth_refresh_token="REFRESH-2",
     )
 

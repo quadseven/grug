@@ -303,7 +303,7 @@ The #389 retirement REMOVED the static key, the reserve Secret, and the
   no loss) until fixed or rolled back.
 - **"Untrusted certificate. Insufficient certificate"** from Roles
   Anywhere = the leaf lost the `digital signature` usage (the
-  infrastructure#1318 gotcha). Check `kubectl -n grug get certificate
+  infra#1318 gotcha). Check `kubectl -n grug get certificate
   grug-pki -o yaml` usages; `test_pki_manifests.py` pins them in CI.
 - **Deploy failed AFTER the seed step** (ARN lookup/sed/apply): the
   cluster is in the split-secret half-state - grug-secrets is keyless,
@@ -684,7 +684,7 @@ node stays silenced in DD until the MIN expiry):
    a real PR review
    completing end-to-end (open a throwaway test PR if no organic traffic,
    pattern: PR #705); plus every other product the node hosted (e.g.
-   `curl -fsS -m 10 https://macchina.app/` and
+   a `curl` of each hosted product's public URL and
    `kubectl logs -n home deploy/homey-thermostat -f --tail=5` streaming
    NEW reconcile decisions - a live follow proves the controller is
    deciding now, where a --since snapshot could show only pre-eviction
@@ -703,7 +703,7 @@ Observed 2026-07-18 (the numbers to beat next time):
   both endpoints served 200s throughout (~0.15-0.6s).
 - Every main-vlan home workload rescheduled to the other main-vlan node
   and was Running within ~1 minute; the thermostat resumed live Nest
-  reconciliation immediately. macchina's pods landed on OCI and stayed
+  reconciliation immediately. The private app's pods landed on OCI and stayed
   serving.
 - Three pods sat Pending for the whole outage window (the drill's real
   findings): grugthink and owntone are pinned by node-bound local-path

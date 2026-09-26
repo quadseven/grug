@@ -250,7 +250,7 @@ def compare_to_baseline(
     report: EvalReport,
     backend_baseline: dict,
     *,
-    # Measured run-to-run sampling swing on the 12-case corpus (sparkles,
+    # Measured run-to-run sampling swing on the 12-case corpus (the Cave,
     # 2026-07-05) was ~0.09 overall catch; a tolerance below the noise
     # floor would page on dice rolls, not regressions.
     catch_tolerance: float = 0.10,

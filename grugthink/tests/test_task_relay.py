@@ -25,7 +25,7 @@ from src.grugthink.bot import task_relay
         "open a pr for this",
         "create a pull request please",
         "review this PR",
-        "review the pr for macchina",
+        "review the pr for widget",
         "look at this diff",
         "can you do a code review",
         "audit the changes in grug",
@@ -89,9 +89,18 @@ def test_relay_instruction_sanitizes_requester_name():
     assert "@everyone" not in instruction
 
 
+_TEST_CHANNELS = "grug=10000000000000001,grugthink=10000000000000002,widget-api=10000000000000003"
+
+
+@pytest.fixture(autouse=True)
+def _repo_channels(monkeypatch):
+    # The real map is deployment config (it names private repos), so every
+    # test runs against this invented one.
+    monkeypatch.setenv("TASK_RELAY_REPO_CHANNELS", _TEST_CHANNELS)
+
+
 def test_resolve_repo_finds_known_repo():
-    assert task_relay.resolve_repo("implement X in the macchina repo") == "macchina"
-    assert task_relay.resolve_repo("fix a thing in digital-ledger please") == "digital-ledger"
+    assert task_relay.resolve_repo("fix a thing in widget-api please") == "widget-api"
     assert task_relay.resolve_repo("do something in grug") == "grug"
 
 
@@ -105,12 +114,21 @@ def test_resolve_repo_returns_none_when_no_repo_named():
     assert task_relay.resolve_repo("implement a thing somewhere") is None
 
 
-def test_repo_channels_cover_every_hermes_channel_key():
-    # Sanity: every entry is a plausible Discord snowflake (17-19 digit int),
-    # catching an obvious typo before it silently 404s at relay time.
-    for repo, channel_id in task_relay.REPO_CHANNELS.items():
-        assert isinstance(channel_id, int), repo
-        assert 10**16 <= channel_id < 10**19, repo
+def test_resolve_repo_fails_closed_when_map_unset(monkeypatch):
+    monkeypatch.delenv("TASK_RELAY_REPO_CHANNELS")
+    assert task_relay.repo_channels() == {}
+    assert task_relay.resolve_repo("do something in grug") is None
+
+
+def test_repo_channels_parses_pairs_and_skips_malformed(monkeypatch):
+    monkeypatch.setenv(
+        "TASK_RELAY_REPO_CHANNELS",
+        " Grug = 10000000000000001 ,bad,=5,noid=,widget=abc,other=10000000000000009",
+    )
+    assert task_relay.repo_channels() == {
+        "grug": 10000000000000001,
+        "other": 10000000000000009,
+    }
 
 
 # --- authorization / mention-sanitization (security model) ---

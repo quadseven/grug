@@ -2,20 +2,20 @@
 #
 # Records Elder's vuln recall+precision per backend over the committed corpus.
 # NOT a per-PR gate: it makes real LLM calls (free OpenRouter/Poolside keys +
-# the self-hosted Cave/sparkles over the tailnet), so it runs ONLY on manual
+# the self-hosted Cave over the tailnet), so it runs ONLY on manual
 # dispatch. The per-PR suite covers the pure scoring core (test_sast_benchmark)
 # with no keys. Backends with no configured secret are skipped (a partial run
 # still produces an honest partial baseline).
 #
 # PUBLIC-REPO DISCIPLINE: every endpoint/key arrives via secrets — the Cave
-# (sparkles) URL is a private tailnet address and is NEVER committed.
+# (Cave) URL is a private tailnet address and is NEVER committed.
 #
 # Required (operator-seeded; absent ones are skipped):
-#   secrets.TS_AUTHKEY                  - tag-scoped ephemeral tailnet join (for sparkles)
+#   secrets.TS_AUTHKEY                  - tag-scoped ephemeral tailnet join (for the Cave)
 #   secrets.GRUG_BENCH_OPENROUTER_KEY   - free OpenRouter key
 #   secrets.GRUG_BENCH_POOLSIDE_KEY     - free Poolside key
-#   secrets.GRUG_BENCH_CAVE_URL         - sparkles/Cave OpenAI-compatible endpoint (tailnet)
-#   secrets.GRUG_BENCH_CAVE_MODEL       - sparkles model id (e.g. an Ollama coder model)
+#   secrets.GRUG_BENCH_CAVE_URL         - Cave OpenAI-compatible endpoint (tailnet)
+#   secrets.GRUG_BENCH_CAVE_MODEL       - Cave model id (e.g. an Ollama coder model)
 #   secrets.GRUG_BENCH_CAVE_KEY         - optional (Ollama usually needs none)
 name: benchmark.sast
 
@@ -60,8 +60,8 @@ jobs:
     steps:
       - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
 
-      # Tailnet join so the Cave/sparkles endpoint is reachable. If TS_AUTHKEY
-      # is absent the step is skipped and sparkles is simply not benchmarked.
+      # Tailnet join so the Cave endpoint is reachable. If TS_AUTHKEY
+      # is absent the step is skipped and the Cave is simply not benchmarked.
       - name: Join tailnet (ephemeral)
         if: env.HAS_TS_AUTHKEY == 'true'
         uses: tailscale/github-action@306e68a486fd2350f2bfc3b19fcd143891a4a2d8 # v4

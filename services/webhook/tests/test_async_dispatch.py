@@ -36,7 +36,7 @@ def _full_gh_payload(body=""):
             "title": "Improve the reviewer",
             "body": body,
             "draft": False,
-            "user": {"login": "evan"},
+            "user": {"login": "alice"},
         },
         "repository": {
             "owner": {"login": "quadseven", "id": 999, "url": "https://x"},
@@ -61,7 +61,7 @@ def test_slim_payload_keeps_bounded_review_context():
             "title": "Improve the reviewer",
             "body": "m" * 5000,
             "draft": False,
-            "user": {"login": "evan"},
+            "user": {"login": "alice"},
         },
         "repository": {"owner": {"login": "quadseven"}, "name": "grug"},
         "installation": {"id": 555},
@@ -122,7 +122,7 @@ def test_enqueue_k8s_runtime_runs_in_process_thread(monkeypatch):
         "title": "Improve the reviewer",
         "body": "m" * 5000,
         "draft": False,
-        "user": {"login": "evan"},
+        "user": {"login": "alice"},
     }
     assert "sender" not in seen["payload"]
 

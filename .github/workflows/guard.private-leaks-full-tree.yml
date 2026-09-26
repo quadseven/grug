@@ -1,0 +1,52 @@
+name: Guard · Private leaks (full tree)
+
+# PURPOSE: the per-PR guard (guard.private-leaks.yml) scans only what a PR
+#   adds, so an identifier that was already in this PUBLIC tree when that
+#   guard went live is never flagged. infra#4639 found exactly that: private
+#   host names and repo names sitting in source, docs and tests. This sweeps
+#   every tracked file and path of main once a week and fails on any hit.
+#
+# SAME SCANNER, SAME LISTS. The fleet's shared reusable in `mode: full-tree`,
+#   with the same shared deny-list as the PR guard. Every hit is redacted in
+#   the log (shape hits too): a sweep's public log must not become an index
+#   of what it found. The path and line number are enough to fix it.
+#
+# DENY-LIST ON A SCHEDULE. A scheduled run's OIDC subject is main's ref, not
+#   `pull_request`, so the deny-list read role must trust that subject. If it
+#   does not, the run fails closed rather than quietly dropping to shapes
+#   only - the half that matches host codenames and people is the half this
+#   sweep exists for. The role also requires this job to run an AUDITED SHA
+#   of the reusable, so bumping the `uses:` pin below means first adding the
+#   new SHA to that role's allow-list in the private infra repo.
+#
+# ALLOWED REFS. Beyond this repo's own: `infra`/`infra-public` (bare refs are
+#   the documented citation form) and `zippie` (public). The ALL-CAPS names
+#   are sort-key prefixes in store tests (`USER#1`, `INST#42`, `REVIEW#7`,
+#   `CRCOMMENT#100`) and `PR#734`, not repositories.
+#
+# PULL_REQUEST on this file only, so a change to the sweep proves itself in
+#   the PR that makes it.
+
+on:
+  schedule:
+    - cron: "23 9 * * 1"  # Mondays 09:23 UTC
+  workflow_dispatch:
+  pull_request:
+    paths:
+      - ".github/workflows/guard.private-leaks-full-tree.yml"
+
+jobs:
+  leak-scan:
+    uses: quadseven/infra-public/.github/workflows/_reusable.leak-scan.yml@0cf16bf5d6163cb070b8cba66c493d7bfa993deb
+    permissions:
+      contents: read
+      # Mint the OIDC token for the deny-list read role.
+      id-token: write
+    with:
+      mode: full-tree
+      allowed-repo-refs: infra, infra-public, zippie, USER, INST, REVIEW, CRCOMMENT, PR
+      # Path, not a secret. The VALUES are the secret and live only in this
+      # SecureString, never in this repo.
+      deny-list-ssm-param: /infra/leak-scan/deny-list
+    secrets:
+      aws-role-arn: ${{ secrets.LEAK_SCAN_ROLE_ARN }}

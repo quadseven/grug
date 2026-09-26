@@ -94,7 +94,7 @@ def test_ruleset_covers_more_than_python():
 
 
 def test_swift_has_rule_coverage():
-    """The other half of #859's title: "macchina's Swift have none".
+    """The other half of #859's title: "the private app's Swift have none".
 
     #862 closed the YAML side; this is the Swift side. Before swift.yml
     existed, every Swift file staged for a scan was dropped before opengrep

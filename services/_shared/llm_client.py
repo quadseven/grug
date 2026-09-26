@@ -428,7 +428,7 @@ class Backend(str, Enum):
     OPENROUTER = "openrouter"
     # Owned in-cluster review ensemble (ADR-0009), both fronted by the same
     # spark-gateway (it routes by model name to whichever Spark carries it,
-    # warm-first). CAVE = the coder arm (qwen3-coder-next on sparkles),
+    # warm-first). CAVE = the coder arm (qwen3-coder-next on one GPU host),
     # CAVE_REASONER = the reasoner arm (default below is Laguna, and BOTH
     # deployments override it to `spark:warm-any` - see #843). Deep
     # review runs BOTH and merges - the brain+hands split that is now the
@@ -845,7 +845,7 @@ def _review_backend_config(backend: Backend) -> BackendConfig:
 # set that env var.
 #
 # #843 is open on this value: the eval that promoted Laguna
-# (docs/research/laguna-s-2.1-dgx-spark-elder-eval-2026-07-21.md) recommends
+# (docs/research/laguna-s-2.1-gpu-host-elder-eval-2026-07-21.md) recommends
 # AGAINST it as a blanket default and measures it at 0.000 on the test-gap
 # class. Do not read this line as a settled choice.
 _CAVE_JUDGE_DEFAULT_MODEL = "poolside/Laguna-S-2.1-NVFP4"
@@ -4614,8 +4614,8 @@ _JUDGE_SYSTEM_PROMPT = (
 # Refute-framed adjudication (#714): for HIGH/CRITICAL findings the burden
 # inverts - the adjudicator must ground the claim in QUOTED code or refute
 # it. Exists because the plausibility-framed prompt above passed two
-# same-day inverted-logic false positives (grug PR #710, digital-ledger
-# #208): grading "is this plausible?" from the reviewer's frame never
+# same-day inverted-logic false positives (grug PR #710 and one in a
+# private repo): grading "is this plausible?" from the reviewer's frame never
 # forces a line-level check of the claim itself.
 _REFUTE_SYSTEM_PROMPT = (
     "You are an adversarial verifier for a code reviewer's HIGH-SEVERITY "

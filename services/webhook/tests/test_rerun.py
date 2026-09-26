@@ -43,7 +43,7 @@ def _pr_data(
         "body": body,
         "state": state,
         "draft": draft,
-        "user": {"login": "evan"},
+        "user": {"login": "alice"},
         "head": {"sha": head_sha},
         "base": {"sha": base_sha, "repo": {"id": repo_id}},
     }
@@ -216,7 +216,7 @@ def test_enqueue_review_posts_in_progress_check_after_sqs(monkeypatch):
     assert result.head_sha == "head-123"
     assert result.status == "in_progress"
     assert result.conclusion is None
-    assert posted["external_id"] == "grug-cr-pending:myorg/myrepo#7:head-123"
+    assert posted["external_id"] == "grug-cr-pending:myorg/myrepo#7:head-123"  # leak-guard-allow: placeholder repo, not a real one
 
 
 
@@ -1353,7 +1353,7 @@ def test_rerun_dispatches_persona_on_current_head():
     assert payload["pull_request"]["head"]["sha"] == "deadbeef"
     assert payload["pull_request"]["base"]["sha"] == "base-sha"
     assert payload["pull_request"]["title"] == "Improve review depth"
-    assert payload["pull_request"]["user"]["login"] == "evan"
+    assert payload["pull_request"]["user"]["login"] == "alice"
     assert payload["repository"]["owner"]["login"] == "myorg"  # from the repo string
     assert payload["repository"]["name"] == "myrepo"
     assert payload["repository"]["id"] == 222  # from pr.base.repo.id

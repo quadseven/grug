@@ -143,7 +143,7 @@ def test_configured_backends_honors_env(monkeypatch):
     monkeypatch.setenv("GRUG_BENCH_CAVE_MODEL", "qwen-coder")
     configured = backends.configured_backends()
     names = {b.name for b in configured}
-    assert names == {"openrouter", "sparkles"}  # poolside absent (no key)
+    assert names == {"openrouter", "cave"}  # poolside absent (no key)
     openrouter = next(b for b in configured if b.name == "openrouter")
     assert openrouter.model == "anthropic/claude-opus-4.7"
     assert openrouter.extra_body["reasoning"] == {
@@ -245,7 +245,7 @@ def test_configured_backends_whitespace_model_env_falls_back_to_default(monkeypa
 
 
 def test_cave_needs_both_url_and_model(monkeypatch):
-    """sparkles only runs with BOTH a URL and a model (no partial/leaky default)."""
+    """cave only runs with BOTH a URL and a model (no partial/leaky default)."""
     from sast_benchmark import backends
 
     for var in ("GRUG_BENCH_OPENROUTER_KEY", "GRUG_BENCH_POOLSIDE_KEY", "GRUG_BENCH_CAVE_MODEL"):
@@ -270,7 +270,7 @@ def test_cave_carries_require_keys_json_schema_others_keep_json_object(monkeypat
 
     # The Cave's schema requires the findings envelope with the exact fields
     # Elder's parser (_coerce_finding) demands.
-    rf = configured["sparkles"].extra_body["response_format"]
+    rf = configured["cave"].extra_body["response_format"]
     assert rf["type"] == "json_schema"
     schema = rf["json_schema"]["schema"]
     assert schema["required"] == ["findings"]
@@ -295,7 +295,7 @@ def test_cave_carries_require_keys_json_schema_others_keep_json_object(monkeypat
         return _R()
 
     monkeypatch.setattr(runner.httpx, "post", _capture)
-    runner._post(configured["sparkles"], [{"role": "user", "content": "x"}])
+    runner._post(configured["cave"], [{"role": "user", "content": "x"}])
     runner._post(configured["openrouter"], [{"role": "user", "content": "x"}])
     assert sent["qwen-coder"] == "json_schema"
     assert sent["anthropic/claude-opus-4.7"] == "json_object"
@@ -318,13 +318,13 @@ def test_cave_and_poolside_disable_thinking_openrouter_untouched(monkeypatch):
     configured = {b.name: b for b in backends.configured_backends()}
 
     off = {"chat_template_kwargs": {"enable_thinking": False}}
-    assert configured["sparkles"].extra_body["chat_template_kwargs"] == off["chat_template_kwargs"]
+    assert configured["cave"].extra_body["chat_template_kwargs"] == off["chat_template_kwargs"]
     assert configured["poolside"].extra_body["chat_template_kwargs"] == off["chat_template_kwargs"]
     assert "chat_template_kwargs" not in configured["openrouter"].extra_body
 
     # The Cave's response_format override survives sitting alongside it -
     # two independent extra_body keys, not one clobbering the other.
-    assert configured["sparkles"].extra_body["response_format"]["type"] == "json_schema"
+    assert configured["cave"].extra_body["response_format"]["type"] == "json_schema"
 
     sent = {}
 
@@ -337,7 +337,7 @@ def test_cave_and_poolside_disable_thinking_openrouter_untouched(monkeypatch):
         return _R()
 
     monkeypatch.setattr(runner.httpx, "post", _capture)
-    runner._post(configured["sparkles"], [{"role": "user", "content": "x"}])
+    runner._post(configured["cave"], [{"role": "user", "content": "x"}])
     runner._post(configured["poolside"], [{"role": "user", "content": "x"}])
     runner._post(configured["openrouter"], [{"role": "user", "content": "x"}])
     assert sent["qwen-coder"] == {"enable_thinking": False}

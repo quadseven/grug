@@ -144,7 +144,7 @@ def _handle_installation_repositories(payload: dict[str, Any]) -> dict[str, Any]
     already exists (`installation` created it) - this only needs to close
     the enforcement gap: a repo added here got zero `installation.created`
     treatment, so without this it sat ungated until the enforcement-gap
-    monitor caught it (2026-08-08, quadseven/switch-tools, promoted by
+    monitor caught it (2026-08-08, a private fleet repo, promoted by
     hand in infra PR #2325). `repositories_removed` needs no action - a
     deleted/transferred-out repo's ruleset goes with it.
 

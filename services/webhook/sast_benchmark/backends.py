@@ -1,14 +1,14 @@
 """Backend configuration for the SAST benchmark live runner (#399, ADR-0006).
 
-Backend-pluggable: OpenRouter, Poolside, AND sparkles/the-Cave (Ollama) are
+Backend-pluggable: OpenRouter, Poolside, AND the Cave (Ollama) are
 all first-class backends, each configured ENTIRELY from env so NOTHING
-sensitive is committed to this public repo. The Cave/sparkles endpoint is a
+sensitive is committed to this public repo. The Cave endpoint is a
 private tailnet address and a key (if any) — supplied at run time via the
 benchmark CI job's secrets, never a literal here.
 
 `configured_backends()` returns whichever backends have an endpoint + (where
 required) a key present, so a run on a box that can only reach the public
-clouds still produces a partial baseline; adding the sparkles endpoint secret
+clouds still produces a partial baseline; adding the Cave endpoint secret
 enables it with NO code change.
 """
 
@@ -180,7 +180,7 @@ def configured_backends() -> list[BenchBackend]:
             )
         )
 
-    # sparkles / the Cave (Ollama, OpenAI-compatible). URL is a private tailnet
+    # the Cave (Ollama, OpenAI-compatible). URL is a private tailnet
     # address supplied via secret at run time — there is no default and no
     # literal. Key optional (Ollama typically needs none).
     cave_url = os.getenv("GRUG_BENCH_CAVE_URL", "")
@@ -188,7 +188,7 @@ def configured_backends() -> list[BenchBackend]:
     if cave_url and cave_model:
         out.append(
             BenchBackend(
-                name="sparkles",
+                name="cave",
                 url=cave_url,
                 model=cave_model,
                 api_key=os.getenv("GRUG_BENCH_CAVE_KEY", ""),

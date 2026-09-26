@@ -9,5 +9,5 @@ Do NOT edit these files in grug. Fix upstream in infra-public, then re-vendor:
     cp <infra-public>/python/spark_cave/spark_cave/*.py services/webhook/spark_cave/
 
 The shared SQS-airlock library (schema / packing / enqueue / results), public +
-zero-runtime-dep, so grug (public) and macchina (private) share one wire
+zero-runtime-dep, so grug (public) and a private consumer share one wire
 contract. See quadseven/infra-public for the canonical package + its tests.

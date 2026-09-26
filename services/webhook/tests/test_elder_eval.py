@@ -541,16 +541,16 @@ def test_score_unresolvable_case_excluded_and_reported_separately_from_errored()
 def test_merge_baseline_same_prompt_keeps_other_backends():
     existing = {
         "prompt_sha": "abc",
-        "backends": {"openrouter": {"overall_catch": 0.5}, "sparkles": {"overall_catch": 0.1}},
+        "backends": {"openrouter": {"overall_catch": 0.5}, "cave": {"overall_catch": 0.1}},
     }
     fresh = {
         "prompt_sha": "abc",
-        "backends": {"sparkles": {"overall_catch": 0.2}},
+        "backends": {"cave": {"overall_catch": 0.2}},
     }
     merged, dropped = merge_baseline(existing, fresh)
     assert dropped == []
     assert merged["backends"]["openrouter"] == {"overall_catch": 0.5}
-    assert merged["backends"]["sparkles"] == {"overall_catch": 0.2}
+    assert merged["backends"]["cave"] == {"overall_catch": 0.2}
 
 
 def test_merge_baseline_changed_prompt_drops_stale_backends():
@@ -558,15 +558,15 @@ def test_merge_baseline_changed_prompt_drops_stale_backends():
     under the new prompt_sha would re-bless stale data as fresh."""
     existing = {
         "prompt_sha": "old",
-        "backends": {"openrouter": {"overall_catch": 0.5}, "sparkles": {"overall_catch": 0.1}},
+        "backends": {"openrouter": {"overall_catch": 0.5}, "cave": {"overall_catch": 0.1}},
     }
     fresh = {
         "prompt_sha": "new",
-        "backends": {"sparkles": {"overall_catch": 0.2}},
+        "backends": {"cave": {"overall_catch": 0.2}},
     }
     merged, dropped = merge_baseline(existing, fresh)
     assert dropped == ["openrouter"]
-    assert set(merged["backends"]) == {"sparkles"}
+    assert set(merged["backends"]) == {"cave"}
     assert merged["prompt_sha"] == "new"
 
 
@@ -1616,7 +1616,7 @@ def test_methodology_note_states_one_call_when_nothing_staged():
     a self-contradiction. Unstaged, ONE call is still the honest claim."""
     from elder_eval.__main__ import _methodology_note
 
-    note = _methodology_note("sparkles", staged=False)
+    note = _methodology_note("cave", staged=False)
     assert "ONE monolithic backend call" in note
     assert "staged" not in note.lower()
 
@@ -1624,7 +1624,7 @@ def test_methodology_note_states_one_call_when_nothing_staged():
 def test_methodology_note_states_staged_calls_when_something_staged():
     from elder_eval.__main__ import _methodology_note
 
-    note = _methodology_note("sparkles", staged=True)
+    note = _methodology_note("cave", staged=True)
     assert "staged cohort calls" in note
     assert "ONE monolithic" not in note
     # The parts that remain true regardless of staging are preserved verbatim.
@@ -1643,8 +1643,8 @@ def test_methodology_note_derives_staged_from_the_report_not_hand_maintained():
     original = cli._methodology_note
     cli._methodology_note = lambda name, staged=False: calls.append(staged) or original(name, staged=staged)
     try:
-        _print_report("sparkles", _bare_report(staged_cases=("case-1",)))
-        _print_report("sparkles", _bare_report(staged_cases=()))
+        _print_report("cave", _bare_report(staged_cases=("case-1",)))
+        _print_report("cave", _bare_report(staged_cases=()))
     finally:
         cli._methodology_note = original
     assert calls == [True, False]

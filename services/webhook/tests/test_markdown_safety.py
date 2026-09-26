@@ -19,10 +19,10 @@ def test_neutralize_mentions_breaks_a_live_mention():
 
 
 def test_neutralize_mentions_breaks_every_mention_in_text():
-    out = neutralize_mentions("@evan and @cait should both see this")
-    assert "@evan" not in out
+    out = neutralize_mentions("@alice and @cait should both see this")
+    assert "@alice" not in out
     assert "@cait" not in out
-    assert f"@{_ZWSP}evan" in out
+    assert f"@{_ZWSP}alice" in out
     assert f"@{_ZWSP}cait" in out
 
 

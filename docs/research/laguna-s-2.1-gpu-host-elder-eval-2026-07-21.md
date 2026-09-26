@@ -1,4 +1,4 @@
-# Laguna S 2.1 on DGX Spark: Elder evaluation
+# Laguna S 2.1 on an owned GPU host: Elder evaluation
 
 Date: 2026-07-21
 
@@ -8,11 +8,11 @@ remains the review coder/security/test/upstream specialist
 ## Result
 
 Laguna S 2.1 NVFP4 ran Elder's complete 22-PR monolithic review evaluation on
-one 128 GB NVIDIA DGX Spark. All 22 requests returned HTTP 200 on their first
+one 128 GB unified-memory GPU host. All 22 requests returned HTTP 200 on their first
 attempt. There were no transport timeouts, retries, parse failures, length
 stops, request aborts, or emitted false-positive classes.
 
-Compared with the existing Sparkles baseline, Laguna improved overall catch
+Compared with the existing Cave baseline, Laguna improved overall catch
 from 13/71 (0.1831) to 15/71 (0.2113) while retaining zero measured noise.
 The improvement was not uniform:
 
@@ -39,7 +39,7 @@ gaps, and upstream semantics, so Grug retains its Qwen coder arm.
 - Model: `poolside/Laguna-S-2.1-NVFP4`
 - Model revision: `216d1f13878dd4e715bc7412848d0f330e95bba6`
 - DFlash revision: `723794750422b3efbf3a7b3af76dffb4ba035943`
-- Host: `srv-sparkles`, NVIDIA DGX Spark GB10, 128 GB unified memory
+- Host: the first GPU host, 128 GB unified memory
 - vLLM: `0.25.1`
 - FlashInfer: `0.6.15.dev20260712`
 - PyTorch: `2.11.0+cu130`
@@ -51,7 +51,7 @@ gaps, and upstream semantics, so Grug retains its Qwen coder arm.
 - Sampling: temperature 0.7, top-p 0.95, model top-k 20
 
 The checkpoint and draft model were loaded from their immutable local snapshot
-paths. The transient server used Poolside's published DGX Spark recipe:
+paths. The transient server used Poolside's published recipe for this hardware class:
 
 ```text
 vllm serve <model-snapshot> \
@@ -109,7 +109,7 @@ returned separated reasoning plus valid JSON in 10.20 seconds.
   The ledger and prompt are pinned above; the fetched PR representations are
   not. This prevents byte-for-byte replay of this exact run.
 - The existing baseline does not record its model revision, quantization,
-  runtime, or server configuration. It is the committed historical Sparkles
+  runtime, or server configuration. It is the committed historical Cave
   score and is treated as the Qwen comparison used by this repository, not as
   a fully reproducible external benchmark.
 - This is the monolithic Elder evaluation. It does not prove that substituting

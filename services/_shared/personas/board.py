@@ -1,7 +1,7 @@
 """One review comment per PR, assembled from per-persona sections.
 
 THE PROBLEM THIS SOLVES. Every persona posts its OWN top-level comment, so
-a single PR produced three of them - measured on macchina#2115:
+a single PR produced three of them - measured on a private app repo:
 
     03:38  <!-- grug-teller:walkthrough -->
     03:43  <!-- grug-elder-stack -->

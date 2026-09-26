@@ -30,7 +30,7 @@ from llm_client import Hunk
 from personas.tribe import CHECK_ELDER
 
 # Shared Spark-Cave airlock library (#1610). Vendored from quadseven/infra-public
-# (see spark_cave/VENDOR.md), so grug (public) and the macchina lane (private)
+# (see spark_cave/VENDOR.md), so grug (public) and a private consumer lane
 # share ONE persona-generic wire envelope read by one connector. grug's rich
 # review fields (install_id/repo/pr/head_sha/diff_ref) ride INSIDE the generic
 # `payload`; the DiffRef codec below still spills a large diff to S3 BEFORE the

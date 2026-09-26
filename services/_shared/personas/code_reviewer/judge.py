@@ -445,7 +445,7 @@ def refute_findings(
     that survived the deterministic verification pass. One refute-framed
     judge call (the burden inverts: the adjudicator must ground the claim
     in quoted code or refute it); the semantic-misreading class - two
-    same-day production instances (grug PR #710, digital-ledger#208) -
+    same-day production instances (grug PR #710, a private repo) -
     passed the plausibility judge because nothing forced a line-level
     check of the claim itself. Fail-OPEN like grade_findings: any error
     returns () and everything publishes. Callers pass ONLY the

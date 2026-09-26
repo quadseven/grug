@@ -1,5 +1,5 @@
 # Curated offline Opengrep rules for Swift (#859 - "infra's YAML and
-# macchina's Swift have none").
+# the private app's Swift have none").
 #
 # WHY THIS FILE EXISTS. Opengrep already ships with the vendored offline
 # ruleset invoked by sast.py; the engine was never the gap. Before this file,
