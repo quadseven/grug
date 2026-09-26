@@ -759,6 +759,77 @@ def _opencode_go_chain_config() -> BackendConfig:
     )
 
 
+# OpenCode Go circuit breaker. A usage-limit refusal (HTTP 429,
+# `GoUsageLimitError`) does not clear for hours or days: on 2026-09-26 it
+# carried `Retry-After: 105419` and `limitName: monthly`. Calling Go on every
+# review until then bought nothing but a refused request each time, so the
+# first such refusal opens this breaker and Go is skipped until Retry-After
+# has passed. Per process: each pod pays at most one refused call per window.
+_OPENCODE_GO_DEFAULT_BLOCK_SECONDS = 3600.0
+_OPENCODE_GO_MAX_BLOCK_SECONDS = 7 * 86400.0
+_opencode_go_breaker_lock = threading.Lock()
+_opencode_go_blocked_until = 0.0
+
+
+class OpencodeGoCircuitOpenError(httpx.RequestError):
+    """OpenCode Go is skipped: its usage-limit breaker is open. Subclasses
+    `httpx.RequestError` so every caller degrades exactly as it does for a
+    transport failure."""
+
+
+def _opencode_go_available(now: float | None = None) -> bool:
+    current = time.time() if now is None else now
+    with _opencode_go_breaker_lock:
+        return current >= _opencode_go_blocked_until
+
+
+def _retry_after_seconds(resp: httpx.Response) -> float:
+    raw = (resp.headers.get("retry-after") or "").strip()
+    try:
+        seconds = float(raw)
+    except ValueError:
+        return _OPENCODE_GO_DEFAULT_BLOCK_SECONDS
+    if not math.isfinite(seconds) or seconds <= 0:
+        return _OPENCODE_GO_DEFAULT_BLOCK_SECONDS
+    return min(seconds, _OPENCODE_GO_MAX_BLOCK_SECONDS)
+
+
+def _is_opencode_go_usage_limit(resp: httpx.Response) -> bool:
+    if resp.status_code != 429:
+        return False
+    try:
+        body = resp.json()
+    except (ValueError, json.JSONDecodeError):
+        return False
+    error = body.get("error") if isinstance(body, dict) else None
+    if not isinstance(error, dict):
+        return False
+    return (
+        error.get("type") == "GoUsageLimitError"
+        or "usage limit" in str(error.get("message", "")).lower()
+    )
+
+
+def _note_opencode_go_response(resp: httpx.Response) -> None:
+    """Open the breaker on a usage-limit 429; ordinary overload 429s pass."""
+    global _opencode_go_blocked_until
+    if not _is_opencode_go_usage_limit(resp):
+        return
+    seconds = _retry_after_seconds(resp)
+    limit_name = ""
+    try:
+        metadata = resp.json().get("metadata") or {}
+        limit_name = str(metadata.get("limitName", ""))
+    except (ValueError, AttributeError, json.JSONDecodeError):
+        pass
+    with _opencode_go_breaker_lock:
+        _opencode_go_blocked_until = max(_opencode_go_blocked_until, time.time() + seconds)
+    log.warning(
+        "opencode_go_circuit_open",
+        extra={"block_seconds": seconds, "limit_name": limit_name},
+    )
+
+
 def _free_tier_chain_config() -> "BackendConfig | None":
     """OpenRouter `:free` as the SECOND, best-effort chain tier (grug#910).
 
@@ -808,17 +879,54 @@ def _free_tier_chain_config() -> "BackendConfig | None":
 
 
 def _cloud_chain_tiers() -> list[BackendConfig]:
-    """The ordered grug#910 cloud chain: opencode Go first, OpenRouter
-    `:free` second (only if configured). Poolside is DROPPED - confirmed
-    unfunded (SSM key untouched since 2026-05-08, consistent with the
-    2026-06/07/08 http_402 "out of credits" failures), and the operator's own
-    2026-08-27 ordering omits it: "try opencode go first then openrouter
-    free tier 1000 limit then sparks last case." """
-    tiers = [_opencode_go_chain_config()]
+    """The ordered cloud chain: opencode Go (skipped while its usage-limit
+    breaker is open), OpenRouter `:free` (only if configured), then Poolside
+    laguna-s-2.1, with the Cave after all of them. Poolside was dropped in
+    grug#910 as unfunded; it answers again (2026-09-26) and has the best eval
+    record of the cloud models grug can reach (see `_poolside_chain_config`)."""
+    tiers: list[BackendConfig] = []
+    if _opencode_go_available():
+        tiers.append(_opencode_go_chain_config())
     free_tier = _free_tier_chain_config()
     if free_tier is not None:
         tiers.append(free_tier)
+    tiers.append(_poolside_chain_config())
     return tiers
+
+
+def _cloud_chain_worst_case_s() -> float:
+    """Seconds the cloud chain can spend on one cohort before the Cave runs;
+    0 under `cave` priority. Keeps the staged scheduler's reserve honest now
+    that a cohort can walk three cloud tiers first."""
+    if _review_backend_priority() != "cloud":
+        return 0.0
+    return sum(tier.timeout_seconds for tier in _cloud_chain_tiers())
+
+
+# Poolside tier: 45s, not the 25s shared by the other tiers. Its laguna-s-2.1
+# answered grug's calls in a median 9-14s and a max 79s over 2026-09-23..26.
+_POOLSIDE_CHAIN_TIMEOUT_SECONDS = 45.0
+
+
+def _poolside_chain_config() -> BackendConfig:
+    """Poolside laguna-s-2.1 as the last cloud tier, ahead of the Cave.
+
+    Chosen on grug's own eval data, not vendor claims: Laguna S 2.1 ran the
+    full 22-PR Elder evaluation with no failures, catch 0.211 against the
+    Cave baseline's 0.183 and zero noise
+    (docs/research/laguna-s-2.1-gpu-host-elder-eval-2026-07-21.md). The key
+    that was once unfunded answers again: Teller, learn and the judge get
+    real output from it (2026-09-26)."""
+    return replace(
+        _BACKEND_CONFIGS[Backend.POOLSIDE],
+        extra_body={
+            **_BACKEND_CONFIGS[Backend.POOLSIDE].extra_body,
+            "max_tokens": _CLOUD_CHAIN_MAX_TOKENS,
+        },
+        timeout_seconds=_POOLSIDE_CHAIN_TIMEOUT_SECONDS,
+        retry_attempts=1,
+        transport_retry_attempts=1,
+    )
 
 
 def _review_backend_config(backend: Backend) -> BackendConfig:
@@ -1619,6 +1727,8 @@ def _call_backend(
     is the entire cost this gate adds to their calls."""
     if cancel_event is not None and cancel_event.is_set():
         raise httpx.RequestError("cancelled before dispatch")
+    if config.backend == Backend.OPENCODE_GO and not _opencode_go_available():
+        raise OpencodeGoCircuitOpenError("opencode Go usage limit: breaker open")
     if config.backend == Backend.OPENROUTER and is_free_tier_model(config.model):
         outcome = acquire_free_tier_slot(config.model, cancel_event=cancel_event)
         if not outcome.admitted:
@@ -1670,13 +1780,17 @@ def _call_backend(
             f"({config.retry_attempts})"
         )
     if cancel_event is None:
-        return _post_with_retries(
+        resp = _post_with_retries(
             config.url, body, headers, config.timeout_seconds,
             config.retry_attempts, transport_attempts,
         )
-    return _post_with_retries_cancellable(
-        config, body, headers, transport_attempts, cancel_event,
-    )
+    else:
+        resp = _post_with_retries_cancellable(
+            config, body, headers, transport_attempts, cancel_event,
+        )
+    if config.backend == Backend.OPENCODE_GO:
+        _note_opencode_go_response(resp)
+    return resp
 
 
 def _post_with_retries_cancellable(
@@ -2116,7 +2230,7 @@ def _interactive_backend_order(installation_id: int) -> tuple[Backend, ...]:
     failover = (
         Backend.OPENROUTER if primary == Backend.POOLSIDE else Backend.POOLSIDE
     )
-    if os.getenv("GRUG_OPENCODE_GO_API_KEY_SSM", "").strip():
+    if os.getenv("GRUG_OPENCODE_GO_API_KEY_SSM", "").strip() and _opencode_go_available():
         return primary, failover, Backend.OPENCODE_GO
     return primary, failover
 
@@ -3637,6 +3751,7 @@ def review_diff(
         reserve_seconds=(
             _review_llm_timeout_s()
             + 2 * _SAAS_OVERLOAD_FALLBACK_TIMEOUT_SECONDS
+            + _cloud_chain_worst_case_s()
         ),
         cancel_event=cancel_event,
     )
@@ -3672,6 +3787,54 @@ class _ArmOutcome:
     # seam `_partial_review_reason` uses (see `evaluate_diff`'s
     # `error[:15] == "partial review:"` check), never treat it as clean.
     truncated: bool = False
+    # Only meaningful when kind == "success": no findings from a tiny
+    # completion over a large prompt (`_is_degenerate_empty_review`). The
+    # cloud chain treats it as a miss and moves to the next tier.
+    degenerate: bool = False
+
+
+# A model that answers a 10-20k-token diff with `{"findings": []}` in 7
+# output tokens and 2-4s did not review it (nemotron-3-super:free, 25 such
+# calls in 3 hours on 2026-09-26, each published as a clean pass).
+_DEGENERATE_MAX_OUTPUT_TOKENS = 50
+_DEGENERATE_MIN_INPUT_TOKENS = 2_000
+
+
+def _is_degenerate_empty_review(
+    findings: Sequence["Finding"], usage: dict[str, int | float],
+) -> bool:
+    """No findings, under 50 output tokens, over 2k input tokens. Missing
+    usage counts is not evidence either way, so it never flags."""
+    if findings:
+        return False
+    output_tokens = usage.get("output_tokens")
+    input_tokens = usage.get("input_tokens")
+    if output_tokens is None or input_tokens is None:
+        return False
+    return (
+        output_tokens < _DEGENERATE_MAX_OUTPUT_TOKENS
+        and input_tokens > _DEGENERATE_MIN_INPUT_TOKENS
+    )
+
+
+def _record_degenerate_review(backend: "Backend", model: str, usage: dict) -> None:
+    log.warning(
+        "llm_review_degenerate_empty",
+        extra={
+            "backend": backend.value,
+            "model": model,
+            "input_tokens": usage.get("input_tokens"),
+            "output_tokens": usage.get("output_tokens"),
+        },
+    )
+    try:
+        from observability import emit_count  # type: ignore  # late: webhook-image only
+    except Exception:  # noqa: BLE001 - telemetry must never break the review
+        return
+    emit_count(
+        "grug.elder.degenerate_empty_review", 1,
+        tags={"backend": backend.value, "model": model},
+    )
 
 
 def _truncation_error(backends: Sequence["Backend"]) -> str:
@@ -3907,9 +4070,13 @@ def _run_review_arm(
                     "finding_count": len(findings),
                 },
             )
+        degenerate = _is_degenerate_empty_review(findings, usage_metrics)
+        if degenerate:
+            _record_degenerate_review(backend, resolved_model, usage_metrics)
         return _ArmOutcome(
             backend=backend, kind="success", model=resolved_model,
             findings=findings, span_context=span_context, truncated=truncated,
+            degenerate=degenerate,
         )
     if resp.status_code == 200:
         # 200 + parse failure — the LLM responded but the content wasn't
@@ -4195,6 +4362,9 @@ def _try_cloud_primary(
         outcome = _run_review_arm(
             backend, messages, variant, pr_tags, cancel_event, config_override=tier,
         )
+        if outcome.kind == "success" and outcome.degenerate:
+            last_error = f"{backend.value}: degenerate empty review"
+            continue
         if outcome.kind == "success":
             assert outcome.model is not None
             origin = _finding_origin(
@@ -4903,6 +5073,38 @@ def _parse_judge_verdicts(content: str) -> tuple[FindingJudgement, ...]:
     return tuple(out)
 
 
+# Judge output cap on every cloud judge backend - the same budget the Cave
+# judge has always carried.
+_JUDGE_MAX_TOKENS = 4_096
+
+
+def cloud_judge_configs() -> list[BackendConfig]:
+    """Cloud judge backends, in order, for `GRUG_REVIEW_BACKEND_PRIORITY=cloud`.
+
+    Poolside laguna-s-2.1 first: it already answers grug's judge calls with
+    real verdicts, and Laguna is the model the Cave judge was running. Then
+    the configured OpenRouter `:free` model, reasoning off. Both are sent
+    redacted evidence by the caller. Empty under `cave` priority, which
+    keeps the Cave-first judge unchanged."""
+    if _review_backend_priority() != "cloud":
+        return []
+    poolside = _BACKEND_CONFIGS[Backend.POOLSIDE]
+    configs = [
+        replace(
+            poolside,
+            extra_body={**poolside.extra_body, "max_tokens": _JUDGE_MAX_TOKENS},
+        ),
+    ]
+    free_tier = _free_tier_chain_config()
+    if free_tier is not None:
+        configs.append(replace(
+            free_tier,
+            extra_body={**free_tier.extra_body, "max_tokens": _JUDGE_MAX_TOKENS},
+            timeout_seconds=_TIMEOUT_SECONDS,
+        ))
+    return configs
+
+
 def judge_findings(
     findings_repr: list[JudgeFindingRepr],
     hunks: list[Hunk],
@@ -4997,6 +5199,7 @@ def judge_findings(
             )
             return ()
         content = ""
+        finish_reason = ""
         try:
             body = resp.json() if resp.status_code == 200 else {}
         except (ValueError, json.JSONDecodeError):
@@ -5005,6 +5208,23 @@ def judge_findings(
             choices = body.get("choices") or []
             if choices and isinstance(choices[0], dict):
                 content = (choices[0].get("message") or {}).get("content", "")
+                finish_reason = choices[0].get("finish_reason") or ""
+        if finish_reason == "length":
+            # Hit its output cap (seen live: 33,857 input tokens, 4,096-token
+            # cap, empty preview). Whatever it wrote is not a verdict set:
+            # fail this judge call so the caller tries the next backend.
+            log.warning(
+                "judge_output_truncated",
+                extra={"backend": backend.value, "model": config.model},
+            )
+            _llmobs_annotate(
+                span=span, input_data=_redact_payload(messages),
+                metadata={"backend": backend.value, "judge": True,
+                          "status_code": resp.status_code, "error": "truncated"},
+                metrics={"latency_ms": _elapsed_ms(start_ns), **_extract_usage_metrics(body)},
+                tags=pr_tags,
+            )
+            return ()
         if resp.status_code == 200 and not content:
             # 200 but no usable content (empty body, wrong envelope
             # shape, CF interstitial). Without this log, a persistently

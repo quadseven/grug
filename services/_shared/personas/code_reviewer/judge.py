@@ -34,6 +34,7 @@ from llm_client import (
     JudgeFindingRepr,
     PrContext,
     _cave_judge_config,
+    cloud_judge_configs,
     judge_findings,
     submit_finding_evaluation,
 )
@@ -86,9 +87,18 @@ def _judge_evidence_packet(
     runtime_context: str | None,
     refute: bool = False,
 ) -> tuple[FindingJudgement, ...]:
-    """Use the owned hot reasoner first, then a redacted cloud fallback."""
-    cave_config: BackendConfig | None = _cave_judge_config()
-    if cave_config is not None:
+    """Grade one evidence packet, trying backends in order until one returns
+    a complete verdict set.
+
+    Under `GRUG_REVIEW_BACKEND_PRIORITY=cloud` (operator decision
+    2026-09-26: the Sparks overheat) the redacted cloud judges go first and
+    the in-cluster Cave judge, capped at 4,096 output tokens, is the last
+    resort. Under `cave` priority the Cave goes first, then the per-install
+    SaaS pick, as before. A partial or empty answer, including one cut off
+    at its output cap, is a failed attempt, never a verdict."""
+    expected_indices = set(range(len(findings)))
+
+    def attempt(config: BackendConfig | None, *, redact: bool, label: str):
         try:
             verdicts = judge_findings(
                 findings,
@@ -98,35 +108,47 @@ def _judge_evidence_packet(
                 file_contents=file_contents,
                 cross_file_contents=cross_file_contents,
                 runtime_context=runtime_context,
-                config=cave_config,
-                redact=False,
+                config=config,
+                redact=redact,
                 refute=refute,
-            )
-            expected_indices = set(range(len(findings)))
-            actual_indices = {verdict.finding_index for verdict in verdicts}
-            if (
-                len(verdicts) == len(findings)
-                and actual_indices == expected_indices
-            ):
-                return verdicts
-            log.warning(
-                "judge_owned_reasoner_incomplete_falling_back",
-                extra={
-                    "findings": len(findings),
-                    "verdicts": len(verdicts),
-                    "refute": refute,
-                },
             )
         except Exception as e:  # noqa: BLE001 - bounded fallback below
             log.error(
-                "judge_owned_reasoner_failed_falling_back",
-                extra={
-                    "kind": type(e).__name__,
-                    "findings": len(findings),
-                    "refute": refute,
-                },
+                "judge_backend_attempt_failed",
+                extra={"kind": type(e).__name__, "judge": label,
+                       "findings": len(findings), "refute": refute},
                 exc_info=True,
             )
+            return None
+        if (
+            len(verdicts) == len(findings)
+            and {verdict.finding_index for verdict in verdicts} == expected_indices
+        ):
+            return verdicts
+        log.warning(
+            "judge_backend_incomplete_falling_back",
+            extra={"judge": label, "findings": len(findings),
+                   "verdicts": len(verdicts), "refute": refute},
+        )
+        return None
+
+    cave_config: BackendConfig | None = _cave_judge_config()
+    cloud_configs = cloud_judge_configs()
+    if cloud_configs:
+        for config in cloud_configs:
+            verdicts = attempt(config, redact=True, label=config.backend.value)
+            if verdicts is not None:
+                return verdicts
+        if cave_config is not None:
+            verdicts = attempt(cave_config, redact=False, label="cave")
+            if verdicts is not None:
+                return verdicts
+        return ()
+
+    if cave_config is not None:
+        verdicts = attempt(cave_config, redact=False, label="cave")
+        if verdicts is not None:
+            return verdicts
     return judge_findings(
         findings,
         hunks,
