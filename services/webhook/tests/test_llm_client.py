@@ -4768,3 +4768,22 @@ def test_cloud_judge_configs_put_poolside_first_and_cap_output(monkeypatch) -> N
     assert [c.backend for c in configs] == [Backend.POOLSIDE, Backend.OPENROUTER]
     assert all(c.extra_body["max_tokens"] == 4_096 for c in configs)
     assert all(c.backend != Backend.CAVE for c in configs)
+
+
+def test_poolside_parse_failure_falls_through_to_cave(monkeypatch) -> None:
+    """2026-09-27: laguna-s-2.1 on Poolside answered in prose with no JSON
+    18 times in 45 minutes, and each became the review. A fallback tier's
+    parse failure is a miss; the Cave answers."""
+    monkeypatch.setenv("GRUG_REVIEW_BACKEND_PRIORITY", "cloud")
+    go_down = httpx.ConnectError("opencode go unreachable")
+    prose = httpx.Response(
+        200, json=_openai_json_response("Grug squint at the stone. One thing bites."),
+    )
+    cave = httpx.Response(200, json=_openai_json_response('{"findings": []}'))
+
+    with patch.object(httpx, "post", side_effect=[go_down, prose, cave]) as post:
+        out = review_diff([_hunk()], installation_id=1)
+
+    assert out.kind == "reviewed"
+    assert out.backend_used == Backend.CAVE
+    assert post.call_count == 3
