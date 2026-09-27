@@ -17,6 +17,7 @@ from __future__ import annotations
 
 import logging
 import os
+import re
 from collections.abc import Sequence
 from dataclasses import dataclass
 
@@ -49,7 +50,9 @@ class TpmEvaluation:
         # publish a red check while returning "pass" to the dispatcher.
         # Same construction-boundary discipline as CheckRunResult's
         # status/conclusion invariant.
-        if self.passed != (self.conclusion == "success"):
+        # `neutral` is the one other coherent pairing: an agent-authored PR
+        # Chief deliberately did not evaluate (passed, not earned).
+        if self.passed != (self.conclusion in ("success", "neutral")):
             raise ValueError(
                 f"TpmEvaluation incoherent: passed={self.passed} but "
                 f"conclusion={self.conclusion!r}",
@@ -61,6 +64,31 @@ class TpmEvaluation:
 log = logging.getLogger(f"{os.getenv('DD_SERVICE', 'grug')}.persona.tpm")
 
 _CHECK_NAME = CHECK_CHIEF
+
+# Agent-authored PR markers. The fleet's coding agents open PRs through the
+# operator's own account, so the author login cannot tell them apart from a
+# person. What CAN: the harness appends a `claude.ai/code/session_...` link
+# to every PR body it writes (660 of 667 marked PRs in a 7-day sample carry
+# it as the final line), and `<!-- grug:agent-authored -->` is the explicit
+# opt-in for any other agent tooling. Chief's Hunt Plan is a format gate for
+# people; an agent reformatting its own body to satisfy it is pure churn, so
+# such PRs get a NEUTRAL Chief (passes a required check) and Elder + Guard
+# still review the code unchanged.
+_AGENT_AUTHORED_RE = re.compile(
+    r"https://claude\.ai/code/session_[A-Za-z0-9]+|<!--\s*grug:agent-authored\s*-->",
+)
+_AGENT_SKIP_TITLE = "Hunt Plan skipped - agent-authored PR"
+_AGENT_SKIP_SUMMARY = (
+    "Chief did not check this Hunt Plan: the PR body carries an "
+    "agent-authored marker (a `claude.ai/code/session_` link or "
+    "`<!-- grug:agent-authored -->`). Hunt Plan format checks apply to "
+    "PRs written by people. Elder and Guard still review the code."
+)
+
+
+def is_agent_authored(pr_body: str) -> bool:
+    """True when the PR body carries an agent-authored marker."""
+    return bool(_AGENT_AUTHORED_RE.search(pr_body or ""))
 _ADVISORY_CHECKS: frozenset[str] = frozenset({"issue-link"})
 
 
@@ -154,6 +182,9 @@ def evaluate_pull_request(
 ) -> TpmEvaluation:
     """Pure: run all 7 DoR rules over pr_body and return the rollup.
 
+    An agent-authored body (`is_agent_authored`) short-circuits to a
+    NEUTRAL rollup with one skipped row: no rule runs, no issue fetch.
+
     No network IO, no AWS calls, no logging side-effects. Callers wrap
     the result in `publish_tpm_evaluation(...)` to POST the check-run.
 
@@ -165,6 +196,20 @@ def evaluate_pull_request(
     attestation (attest_persona_purity.py) sees only the allowlisted
     `run_all` call.
     """
+    if is_agent_authored(pr_body):
+        # No check runs, no issue fetch: the skip is decided on the body
+        # alone, so it stays pure and identical on the webhook and the
+        # `/grug recheck` paths.
+        return TpmEvaluation(
+            passed=True,
+            results=(
+                CheckResult(
+                    "agent-authored", True, "agent-authored PR; plan checks skipped",
+                    skipped=True,
+                ),
+            ),
+            conclusion="neutral",
+        )
     results = run_all(
         pr_body, fetch_issue=fetch_issue, fetch_issue_facts=fetch_issue_facts,
     )
@@ -198,7 +243,10 @@ def publish_tpm_evaluation(
     where result is "pass"/"fail" on a clean publish, "publish_failed"
     otherwise.
     """
-    title, summary = _summary(list(evaluation.results))
+    if evaluation.conclusion == "neutral":
+        title, summary = _AGENT_SKIP_TITLE, _AGENT_SKIP_SUMMARY
+    else:
+        title, summary = _summary(list(evaluation.results))
     log.info(
         "tpm_publishing",
         extra={

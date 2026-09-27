@@ -77,6 +77,11 @@ Before the tribe leave the cave, Chief reads the **Hunt Plan** on the PR body â€
 | yes | `scope-fence` | Has `## Out of scope` section | **yes** |
 | soft | `issue-link` | Body links an issue via `closes #N` | advisory |
 
+The Hunt Plan is for PRs written by people. A PR body carrying an
+agent-authored marker (a `claude.ai/code/session_` link, or
+`<!-- grug:agent-authored -->`) gets a **neutral** `Grug - Chief`, which still
+satisfies a required check. Elder and Guard review that PR as usual.
+
 ## What Elder and Guard check
 
 ### Elder: deep code review (Apex)
