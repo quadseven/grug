@@ -4399,13 +4399,18 @@ def _try_cloud_primary(
             return _cloud_tier_success(outcome, hunks, pr_context)
         if outcome.kind == "parse_failed":
             last_error = outcome.error_text
-            if is_free_tier_model(tier.model):
-                # grug#1025: a garbled `:free` answer used to become the
-                # review's answer and block the Cave fallback. Free output
-                # is best-effort, so its parse failure counts as a miss.
+            if backend != Backend.OPENCODE_GO:
+                # grug#1025: a garbled answer from a fallback tier used to
+                # become the review's answer and block the Cave. That held
+                # for the `:free` tier, and again for Poolside: after it
+                # joined the chain, 18 laguna-s-2.1 replies in 45 minutes
+                # were Grug-voice prose with no JSON (2026-09-27), each one
+                # published as "Grug eyes clouded". A fallback tier's parse
+                # failure is a miss; only OpenCode Go's stays the answer.
                 log.info(
-                    "llm_cloud_free_tier_parse_failed_falling_through",
+                    "llm_cloud_fallback_tier_parse_failed_falling_through",
                     extra={
+                        "backend": backend.value,
                         "model": tier.model,
                         "repo": (pr_context or {}).get("repo"),
                         "pr_number": (pr_context or {}).get("pr_number"),
