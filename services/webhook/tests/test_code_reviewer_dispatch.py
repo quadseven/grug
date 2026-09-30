@@ -3236,6 +3236,36 @@ def test_summary_does_not_call_an_unopened_cohort_a_failed_one():
     assert "failed: 2, 3, 4" not in summary
 
 
+def _zero_success_eval(unattempted):
+    from personas.code_reviewer.persona import CodeReviewEvaluation
+
+    return CodeReviewEvaluation(
+        findings=(),
+        conclusion="neutral",
+        degraded_reason="parse_failed",
+        coverage=ReviewCoverage(
+            total_cohorts=2,
+            completed_cohorts=0,
+            failed_cohorts=(1, 2),
+            unattempted_cohorts=unattempted,
+            cohort_labels=("a", "b"),
+        ),
+    )
+
+
+def test_summary_zero_successes_says_when_a_cohort_was_never_attempted():
+    """grug#985: cohort 1 broke and cohort 2 was starved. The headline must not
+    read the same as a review where both cohorts ran and broke."""
+    title, summary = cr_dispatch._summary_markdown(_zero_success_eval((2,)))
+    both_ran_title, _ = cr_dispatch._summary_markdown(_zero_success_eval(()))
+
+    assert "never attempted" in title
+    assert "never attempted" in summary
+    assert "failed: 1" in summary
+    assert "never attempted" not in both_ran_title
+    assert title != both_ran_title
+
+
 def _diff_status_error(
     status: int, body: str = "", headers: dict[str, str] | None = None,
 ) -> httpx.HTTPStatusError:

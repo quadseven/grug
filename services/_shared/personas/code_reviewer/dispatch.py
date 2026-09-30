@@ -875,12 +875,29 @@ def _summary_markdown(
             "not blocked."
         ) + held + hunt
     if evaluation.degraded_reason:
-        title = f"WARN Grug eyes clouded ({evaluation.degraded_reason})"
+        # grug#985: when some cohorts were never opened (starved of budget),
+        # the headline must not read like every cohort ran and broke.
+        starved = (
+            evaluation.coverage is not None
+            and bool(evaluation.coverage.unattempted_cohorts)
+        )
+        reason = evaluation.degraded_reason
+        title = (
+            f"WARN Grug eyes clouded ({reason}; some cohorts never attempted)"
+            if starved
+            else f"WARN Grug eyes clouded ({reason})"
+        )
+        starved_note = (
+            "\n\nSome cohorts were never opened - the review budget ran out "
+            "first - so part of this is not a broken read."
+            if starved
+            else ""
+        )
         return hunt_title(title), (
             "Grug Elder could not see the diff this pass. The mist: "
             f"`{evaluation.degraded_reason}`. Grug stay his club — this "
             "only counsel, merge not blocked."
-        ) + held + hunt
+        ) + starved_note + held + hunt
     if not evaluation.findings:
         title = (
             "Elder clear - no markings"
