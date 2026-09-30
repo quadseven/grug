@@ -242,9 +242,11 @@ def test_update_repo_config_complexity_caps_reach_set_repo_config():
 def test_repo_config_payload_rejects_out_of_range_complexity_cap(bad):
     """grug#1041: a cap of 0 or below would flag every function, and an absurd
     one disables the source; both 422 at the edge."""
-    with pytest.raises(Exception):
+    from pydantic import ValidationError
+
+    with pytest.raises(ValidationError):
         inst.RepoConfigPayload(complexity_cyclomatic_cap=bad)
-    with pytest.raises(Exception):
+    with pytest.raises(ValidationError):
         inst.RepoConfigPayload(complexity_cognitive_cap=bad)
 
 
