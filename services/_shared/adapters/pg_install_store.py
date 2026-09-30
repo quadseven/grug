@@ -224,6 +224,13 @@ _STR_REPO_FLAGS = frozenset({"elder_voice"})
 # per-flag below (list of non-empty str, or None to leave unchanged).
 _LIST_REPO_FLAGS = frozenset({"guard_hygiene_dead_ref_patterns"})
 
+# Repo-level flags whose value is a positive INTEGER (grug#1041: the Elder
+# complexity caps). Unset reads back as None, which the scanner resolves to its
+# env default, so the default is defined in exactly one place. The upper bound
+# keeps a typo from silently disabling the source.
+_INT_REPO_FLAGS = frozenset({"complexity_cyclomatic_cap", "complexity_cognitive_cap"})
+_INT_REPO_FLAG_MAX = 1000
+
 _DEFAULT_PERSONA_CONFIG = {
     "tpm_enabled": True,
     "code_reviewer_enabled": True,
@@ -291,6 +298,10 @@ def get_repo_config(install_id: int, repo_id: int) -> dict[str, Any]:
     cfg["guard_hygiene_dead_ref_patterns"] = tuple(
         str(p) for p in (item.get("guard_hygiene_dead_ref_patterns") or ())
     )
+    # grug#1041: None = unset; the scanner applies its env default.
+    for _flag in _INT_REPO_FLAGS:
+        raw = item.get(_flag)
+        cfg[_flag] = int(raw) if raw is not None else None
     return cfg
 
 
@@ -362,13 +373,32 @@ def _validate_list_repo_flags(persona_flags: dict[str, Any]) -> None:
             )
 
 
+def _validate_int_repo_flags(persona_flags: dict[str, Any]) -> None:
+    """Each supplied _INT_REPO_FLAGS value must be an int in
+    [1, _INT_REPO_FLAG_MAX]. bool is an int subclass, so it is refused
+    explicitly."""
+    for flag in _INT_REPO_FLAGS:
+        value = persona_flags.get(flag)
+        if value is None:
+            continue
+        if (
+            isinstance(value, bool)
+            or not isinstance(value, int)
+            or not 1 <= value <= _INT_REPO_FLAG_MAX
+        ):
+            raise ValueError(
+                f"{flag} must be a positive integer <= {_INT_REPO_FLAG_MAX}, "
+                f"got {value!r}"
+            )
+
+
 def set_repo_config(
     *,
     install_id: int,
     repo_id: int,
     repo_full_name: str,
     updated_by_user_id: str,
-    **persona_flags: bool | str | list[str] | None,
+    **persona_flags: bool | int | str | list[str] | None,
 ) -> dict[str, Any]:
     """Upsert per-repo override; returns the FIELDS THAT WERE UPDATED
     (same contract as the DDB adapter). Sparse merge preserves fields
@@ -386,6 +416,7 @@ def set_repo_config(
         - _EXTRA_REPO_FLAGS
         - _STR_REPO_FLAGS
         - _LIST_REPO_FLAGS
+        - _INT_REPO_FLAGS
     )
     if unknown:
         raise TypeError(
@@ -403,6 +434,7 @@ def set_repo_config(
         for flag, value in persona_flags.items()
         if flag not in _STR_REPO_FLAGS
         and flag not in _LIST_REPO_FLAGS
+        and flag not in _INT_REPO_FLAGS
         and value is not None
         and not isinstance(value, bool)
     }
@@ -412,6 +444,7 @@ def set_repo_config(
         )
     _validate_str_repo_flags(persona_flags, install_id)
     _validate_list_repo_flags(persona_flags)
+    _validate_int_repo_flags(persona_flags)
     now = datetime.now(timezone.utc).isoformat()
     updated_fields: dict[str, Any] = {
         flag: value for flag, value in persona_flags.items() if value is not None

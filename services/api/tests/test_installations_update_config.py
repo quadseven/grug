@@ -212,6 +212,42 @@ def test_update_repo_config_walkthrough_enabled_reaches_set_repo_config():
     assert mock_set.call_args.kwargs["walkthrough_enabled"] is False
 
 
+def test_update_repo_config_complexity_caps_reach_set_repo_config():
+    """grug#1041: an accepted cap flows payload -> set_repo_config."""
+    payload = inst.RepoConfigPayload(complexity_cyclomatic_cap=30)
+    install = {"installed_by_user_id": "100"}
+
+    def _retry(install_id, fn):
+        return fn("tok")
+
+    fake_resp = _ok_resp({"repositories": [{"id": 42, "full_name": "myorg/myrepo"}]})
+
+    with patch("installations.get_installation", return_value=install):
+        with patch("installations.with_install_token_retry", side_effect=_retry):
+            with patch("httpx.Client") as client_cls:
+                client = client_cls.return_value.__enter__.return_value
+                client.get.return_value = fake_resp
+                with patch("installations.get_repo_config", return_value={}), \
+                     patch("installations.set_repo_config") as mock_set:
+                    mock_set.return_value = {"complexity_cyclomatic_cap": 30}
+                    inst.update_repo_config(
+                        install_id=1, repo_id=42,
+                        body=payload, user=_user(user_id="100"),
+                    )
+
+    assert mock_set.call_args.kwargs["complexity_cyclomatic_cap"] == 30
+
+
+@pytest.mark.parametrize("bad", [0, -1, 100000])
+def test_repo_config_payload_rejects_out_of_range_complexity_cap(bad):
+    """grug#1041: a cap of 0 or below would flag every function, and an absurd
+    one disables the source; both 422 at the edge."""
+    with pytest.raises(Exception):
+        inst.RepoConfigPayload(complexity_cyclomatic_cap=bad)
+    with pytest.raises(Exception):
+        inst.RepoConfigPayload(complexity_cognitive_cap=bad)
+
+
 def test_repo_config_payload_rejects_unknown_field():
     """extra='forbid' still 422s a typo - walkthrough_enabled's addition
     must not have loosened this."""

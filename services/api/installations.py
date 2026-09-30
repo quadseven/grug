@@ -92,6 +92,11 @@ class RepoConfigPayload(BaseModel):
     issue_dor_enabled: bool | None = Field(default=None)
     # grug#947: opt-in for the check-run sweep/reconcile periodic pass.
     check_run_reconcile_enabled: bool | None = Field(default=None)
+    # grug#1041: per-repo Elder complexity caps. None = leave the stored value
+    # alone; unset falls back to the env default. ge=1 so a typo cannot flag
+    # every function; le keeps an absurd value from disabling the source.
+    complexity_cyclomatic_cap: int | None = Field(default=None, ge=1, le=1000)
+    complexity_cognitive_cap: int | None = Field(default=None, ge=1, le=1000)
 
 
 class RerunRequest(BaseModel):
@@ -480,6 +485,8 @@ def update_repo_config(
         guard_hygiene_watch_enabled=body.guard_hygiene_watch_enabled,
         issue_dor_enabled=body.issue_dor_enabled,
         check_run_reconcile_enabled=body.check_run_reconcile_enabled,
+        complexity_cyclomatic_cap=body.complexity_cyclomatic_cap,
+        complexity_cognitive_cap=body.complexity_cognitive_cap,
     )
     log.info(
         "repo_config_updated",
