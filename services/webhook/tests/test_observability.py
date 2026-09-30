@@ -135,8 +135,12 @@ def test_emit_enforcement_metric_value_mapping(monkeypatch):
     # #518: detection failure is its own state with a NEGATIVE value so an
     # auth/rate-limit outage can never masquerade as a real "none".
     emit_enforcement_metric("o/r", "error")
+    # grug#1001: a permission-denied check is its own state, distinct from
+    # both `none` and `error`, so the monitor group says why it is red.
+    emit_enforcement_metric("o/r", "permission_denied")
     values = [p.split(b":")[1].split(b"|")[0] for p, _ in sent]
-    assert values == [b"1.0", b"0.5", b"0.0", b"-1.0"]
+    assert values == [b"1.0", b"0.5", b"0.0", b"-1.0", b"-2.0"]
+    assert b"enforcement_type:permission_denied" in sent[-1][0]
 
 
 def test_emit_enforcement_metric_skips_without_agent_host(monkeypatch, caplog):

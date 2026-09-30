@@ -41,6 +41,21 @@ def test_ensure_creates_ruleset_when_none():
     mock_set.assert_called_once_with(100, 200, 42)
 
 
+def test_ensure_does_not_try_to_create_when_permission_denied():
+    """grug#1001: the App cannot write rulesets here, so a create would only
+    403 again. Report the state and stop; it is not "already enforced"."""
+    with patch("enforcement.detect_enforcement",
+               return_value=EnforcementDetection("permission_denied", None)), \
+         patch("adapters.install_store.get_enforcement_id", return_value=None), \
+         patch("enforcement.create_ruleset") as mock_create, \
+         patch("observability.emit_enforcement_metric") as mock_emit:
+        result = ensure_enforcement("tok", "o", "r", "main", 1, 2)
+
+    assert result == "permission_denied"
+    mock_create.assert_not_called()
+    mock_emit.assert_called_once_with("o/r", "permission_denied")
+
+
 def test_ensure_skips_when_grug_managed():
     """Already grug_managed → no-op."""
     with patch("enforcement.detect_enforcement", return_value=EnforcementDetection("grug_managed", None)), \
