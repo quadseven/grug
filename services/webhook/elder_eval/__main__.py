@@ -86,7 +86,13 @@ from .gate import (
     merge_baseline,
 )
 from .runner import run_eval, run_production_eval
-from .scoring import EvalReport, compare_to_baseline, score, to_baseline_dict
+from .scoring import (
+    EvalReport,
+    compare_to_baseline,
+    score,
+    staging_shift_notes,
+    to_baseline_dict,
+)
 
 _REPO_ROOT = Path(__file__).resolve().parents[3]
 _DEFAULT_JSONL = _REPO_ROOT / "logs" / "review-ledger.jsonl"
@@ -443,6 +449,11 @@ def _check_report(report: EvalReport, backend_name: str) -> int:
         print(f"baseline has no entry for backend {backend_name!r}", file=sys.stderr)
         return 2
     regressions = compare_to_baseline(report, backend_baseline)
+    shifts = staging_shift_notes(report, backend_baseline)
+    if shifts:
+        print("\nNOTE: staged-case set differs from baseline (advisory, not a gate):")
+        for shift in shifts:
+            print(f"  - {shift}")
     if regressions:
         print("\nREGRESSIONS vs baseline:")
         for regression in regressions:

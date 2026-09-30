@@ -29,6 +29,7 @@ from elder_eval.scoring import (
     EvalReport,
     compare_to_baseline,
     score,
+    staging_shift_notes,
     to_baseline_dict,
 )
 from ledger import LedgerRow
@@ -657,6 +658,61 @@ def test_score_threads_staged_cases_into_report_and_baseline():
     assert report.staged_cases == ("quadseven/grug#1",)
     baseline = to_baseline_dict(report, prompt_sha="abc", backend="cave")
     assert baseline["backends"]["cave"]["staged_cases"] == ["quadseven/grug#1"]
+
+
+def _staged_report(staged_ids):
+    rows = [_row(1, "correctness"), _row(2, "correctness")]
+    replays = {
+        f"quadseven/grug#{n}": CaseReplay(
+            case_id=f"quadseven/grug#{n}",
+            emitted={"correctness": 1},
+            errored=False,
+            staged=f"quadseven/grug#{n}" in staged_ids,
+        )
+        for n in (1, 2)
+    }
+    return _report(rows, replays)
+
+
+def test_staging_shift_notes_empty_when_staged_set_unchanged():
+    """grug#873: an unchanged staged set is not a methodology shift."""
+    report = _staged_report({"quadseven/grug#1"})
+    baseline = to_baseline_dict(report, prompt_sha="abc", backend="cave")
+    assert staging_shift_notes(report, baseline["backends"]["cave"]) == []
+
+
+def test_staging_shift_notes_names_newly_staged_and_unstaged_cases():
+    """grug#873: a DIFFERENT case staged instead - both directions named."""
+    base = to_baseline_dict(
+        _staged_report({"quadseven/grug#1"}), prompt_sha="abc", backend="cave"
+    )
+    now = _staged_report({"quadseven/grug#2"})
+    joined = " ".join(staging_shift_notes(now, base["backends"]["cave"]))
+    assert "newly staged" in joined and "quadseven/grug#2" in joined
+    assert "no longer staged" in joined and "quadseven/grug#1" in joined
+
+
+def test_staging_shift_is_advisory_and_does_not_fail_the_check(
+    monkeypatch, capsys, tmp_path
+):
+    """grug#873: the shift is printed by `--check` but exit stays 0."""
+    import json
+
+    from elder_eval import __main__ as cli
+    from elder_eval import gate
+
+    base = to_baseline_dict(
+        _staged_report({"quadseven/grug#1"}), prompt_sha="abc", backend="cave"
+    )
+    path = tmp_path / "baseline.json"
+    path.write_text(json.dumps(base))
+    monkeypatch.setattr(cli, "BASELINE_PATH", path)
+    monkeypatch.setattr(gate, "BASELINE_PATH", path)
+    rc = cli._check_report(_staged_report({"quadseven/grug#2"}), "cave")
+    out = capsys.readouterr().out
+    assert rc == 0
+    assert "newly staged" in out
+    assert "no regression vs baseline" in out
 
 
 # --- #859 follow-up: bench mode stages an oversized diff like production --

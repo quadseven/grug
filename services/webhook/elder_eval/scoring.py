@@ -296,3 +296,25 @@ def compare_to_baseline(
                 f"class {cls} catch regressed {float(base_catch):.2f} -> {new:.2f}"
             )
     return regressions
+
+
+def staging_shift_notes(report: EvalReport, backend_baseline: dict) -> list[str]:
+    """grug#873: advisory notes when the set of staged cases differs from the
+    baseline's. A staged case is measured by several bounded cohort calls, an
+    unstaged one by a single call, so a moved catch/noise rate may reflect the
+    methodology changing rather than Elder. Kept apart from
+    `compare_to_baseline` on purpose: these notes never gate `--check`."""
+    base = set(backend_baseline.get("staged_cases", []))
+    now = set(report.staged_cases)
+    notes: list[str] = []
+    if now - base:
+        notes.append(
+            "newly staged (baseline measured them unstaged): "
+            f"{', '.join(sorted(now - base))}"
+        )
+    if base - now:
+        notes.append(
+            "no longer staged (baseline measured them staged): "
+            f"{', '.join(sorted(base - now))}"
+        )
+    return notes
