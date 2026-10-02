@@ -3961,6 +3961,72 @@ class AttemptOutcome:
     raw_response: httpx.Response | None
 
 
+def _annotate_attempt_error(
+    *,
+    span: Any,
+    backend: Backend,
+    variant: PromptVariant,
+    pr_tags: dict[str, str],
+    messages: list[dict[str, str]],
+    start_ns: int,
+    error_label: str,
+) -> None:
+    """Annotate the attempt span for a caught config/transport error.
+
+    Small so `_run_llm_attempt` stays under Grug's complexity cap — the
+    two error exits share this shape exactly (Elder, #660 follow-up).
+    """
+    _llmobs_annotate(
+        span=span,
+        input_data=_redact_payload(messages),
+        metadata={
+            "backend": backend.value,
+            "variant_id": variant,
+            "error": error_label,
+        },
+        metrics={"latency_ms": _elapsed_ms(start_ns)},
+        tags=pr_tags,
+    )
+
+
+def _reparse_attempt_body(resp: httpx.Response, backend: Backend) -> dict:
+    """Re-parse the response body for content/usage extraction.
+
+    `httpx.Response.json()` re-parses from the cached `.content` bytes;
+    review bodies are small so the cost is negligible vs the LLM
+    round-trip. Returns {} (with a warning) when the body is not JSON —
+    the span would otherwise silently emit kind=reviewed with empty
+    content and undercount DD token-cost dashboards.
+    """
+    try:
+        body = resp.json() if resp.status_code == 200 else {}
+    except (ValueError, json.JSONDecodeError):
+        # Triggered when the first parse also failed (CF HTML
+        # interstitial, truncated body) OR — rarely — when the cache
+        # diverges. Either way the LLM Obs span must not claim a clean
+        # review it cannot describe.
+        log.warning(
+            "llm_body_reparse_failed",
+            extra={
+                "backend": backend.value,
+                "status_code": resp.status_code,
+            },
+        )
+        body = {}
+    return body if isinstance(body, dict) else {}
+
+
+def _extract_attempt_content(body: dict) -> tuple[str, str]:
+    """Pull (content, finish_reason) from a re-parsed response body."""
+    content = ""
+    finish_reason = ""
+    choices = body.get("choices") or []
+    if choices and isinstance(choices[0], dict):
+        content = (choices[0].get("message") or {}).get("content", "")
+        finish_reason = choices[0].get("finish_reason") or ""
+    return content, finish_reason
+
+
 def _run_llm_attempt(
     *,
     backend: Backend,
@@ -3999,16 +4065,14 @@ def _run_llm_attempt(
                 "llm_backend_misconfigured",
                 extra={"backend": backend.value, "detail": str(e)},
             )
-            _llmobs_annotate(
+            _annotate_attempt_error(
                 span=span,
-                input_data=_redact_payload(messages),
-                metadata={
-                    "backend": backend.value,
-                    "variant_id": variant,
-                    "error": "config",
-                },
-                metrics={"latency_ms": _elapsed_ms(start_ns)},
-                tags=pr_tags,
+                backend=backend,
+                variant=variant,
+                pr_tags=pr_tags,
+                messages=messages,
+                start_ns=start_ns,
+                error_label="config",
             )
             return AttemptOutcome(
                 backend=backend,
@@ -4028,16 +4092,14 @@ def _run_llm_attempt(
                 transport_log_event,
                 extra={"backend": backend.value, "kind": type(e).__name__},
             )
-            _llmobs_annotate(
+            _annotate_attempt_error(
                 span=span,
-                input_data=_redact_payload(messages),
-                metadata={
-                    "backend": backend.value,
-                    "variant_id": variant,
-                    "error": type(e).__name__,
-                },
-                metrics={"latency_ms": _elapsed_ms(start_ns)},
-                tags=pr_tags,
+                backend=backend,
+                variant=variant,
+                pr_tags=pr_tags,
+                messages=messages,
+                start_ns=start_ns,
+                error_label=type(e).__name__,
             )
             return AttemptOutcome(
                 backend=backend,
@@ -4054,33 +4116,9 @@ def _run_llm_attempt(
             )
         findings, model, err = _parse_response(resp)
         # Annotate AFTER the response so we capture the raw content
-        # + token counts. httpx.Response.json() re-parses from the
-        # cached .content bytes; review response bodies are small,
-        # so the cost is negligible vs the LLM round-trip.
-        try:
-            body = resp.json() if resp.status_code == 200 else {}
-        except (ValueError, json.JSONDecodeError):
-            # Triggered when the first parse also failed (CF HTML
-            # interstitial, truncated body) OR — rarely — when
-            # the cache diverges. Either way the LLM Obs span
-            # would otherwise silently emit kind=reviewed with
-            # empty content and undercount DD token-cost
-            # dashboards.
-            log.warning(
-                "llm_body_reparse_failed",
-                extra={
-                    "backend": backend.value,
-                    "status_code": resp.status_code,
-                },
-            )
-            body = {}
-        content = ""
-        finish_reason = ""
-        if isinstance(body, dict):
-            choices = body.get("choices") or []
-            if choices and isinstance(choices[0], dict):
-                content = (choices[0].get("message") or {}).get("content", "")
-                finish_reason = choices[0].get("finish_reason") or ""
+        # + token counts.
+        body = _reparse_attempt_body(resp, backend)
+        content, finish_reason = _extract_attempt_content(body)
         usage_metrics = _extract_usage_metrics(body)
         _llmobs_annotate(
             span=span,
