@@ -97,8 +97,38 @@ def test_summary_fail_counts_blocking():
     title, summary = persona._summary(results)
     assert "Hunt Plan hold" in title or "Chief hold" in title
     assert "2/3 plan checks fail" in title or "2/3 blocking" in title
+    # The hold title names the failed checks with their caveman labels when
+    # three or fewer fail, so the PR checks list says why, not just "hold".
+    assert "(what good look like, how big; see Details)" in title
     assert "| why hunt | pass |" in summary
     assert "| what good look like | fail |" in summary
+
+
+def test_summary_hold_names_failing_checks_when_four_fail_it_falls_back():
+    """More than three failures fall back to the short pointer so the
+    title stays a title; the breakdown still lives in Details."""
+    results = [
+        CheckResult("why", False, "missing"),
+        CheckResult("acceptance", False, "0 bullets"),
+        CheckResult("estimate", False, "no Size"),
+        CheckResult("scope-fence", False, "missing"),
+    ]
+    title, _ = persona._summary(results)
+    assert title == "Hunt Plan hold - 4/4 plan checks fail - see Details for which"
+
+
+def test_summary_hold_uses_caveman_labels_not_check_keys():
+    """The inline names use the same caveman labels the summary table
+    shows (ADR-0002): the key is what code matches on, the label is what
+    a human reads."""
+    results = [
+        CheckResult("why", True, "ok"),
+        CheckResult("linked-issue-epic", False, "no epic"),
+        CheckResult("estimate", True, "S"),
+    ]
+    title, _ = persona._summary(results)
+    assert "(which epic; see Details)" in title
+    assert "linked-issue-epic" not in title
 
 
 def test_summary_table_header_present():
@@ -134,6 +164,7 @@ def test_summary_hold_still_names_skipped_check():
     ]
     title, _ = persona._summary(results)
     assert "Hunt Plan hold - 1/2 plan checks fail" in title
+    assert "(why hunt; see Details)" in title
     assert "ticket done skipped" in title
 
 
@@ -212,7 +243,7 @@ def test_evaluate_mixed_advisory_and_blocking_failure():
     assert scope.passed is False
     assert link.passed is False
     title, summary = persona._summary(list(evaluation.results))
-    assert title == "Hunt Plan hold - 1/7 plan checks fail - see Details for which"
+    assert title == "Hunt Plan hold - 1/7 plan checks fail (where stop; see Details)"
 
 
 def test_summary_advisory_check_renders_warning_icon():
