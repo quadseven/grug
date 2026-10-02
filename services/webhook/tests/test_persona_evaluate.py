@@ -611,6 +611,25 @@ def test_non_session_claude_link_is_not_a_marker():
     assert persona.evaluate_pull_request(body).conclusion == "failure"
 
 
+def test_template_agent_footer_is_neutral():
+    """The repo's own PR template stamps
+    `Generated with [Claude Code](https://claude.com/claude-code)` at the
+    end of every agent-opened PR. A template-stamped body without a session
+    link is still agent-authored (mod-overseer #821: 4/7 Hunt Plan failures
+    on a body that carried the template footer but no session link)."""
+    body = _HUMAN_BODY_NO_PLAN + "\nGenerated with [Claude Code](https://claude.com/claude-code)\n"
+    assert persona.is_agent_authored(body) is True
+    assert persona.evaluate_pull_request(body).conclusion == "neutral"
+
+
+def test_prose_mention_of_claude_code_is_not_a_marker():
+    """A human writing 'I used claude code to draft this' in prose must not
+    switch Chief off — only the template's exact markdown footer counts."""
+    body = _HUMAN_BODY_NO_PLAN + "\nI used claude code to help draft this plan.\n"
+    assert persona.is_agent_authored(body) is False
+    assert persona.evaluate_pull_request(body).conclusion == "failure"
+
+
 def test_publish_agent_skip_posts_neutral_with_skip_title():
     evaluation = persona.evaluate_pull_request(_AGENT_BODY_NO_PLAN)
     posted: dict = {}
