@@ -1449,6 +1449,7 @@ def _build_review_parts(
     cross_file_contents: dict[str, str] | None = None,
     runtime_context: str | None = None,
     ci_context: str | None = None,
+    repo_docs_context: str | None = None,
     pr_context: Optional[PrContext] = None,
     review_map: str = "",
 ) -> tuple[list[str], bool]:
@@ -1505,6 +1506,11 @@ def _build_review_parts(
     # data for the model to weigh, never an instruction source.
     if ci_context:
         parts.append(f"### CI STATUS\n{ci_context}")
+    # Repo docs (#903): the repo's own CONTEXT.md glossary + path-relevant
+    # ADRs, as a block DISTINCT from learned team practices / lore and from
+    # the #674 agent-guideline block. None/empty ⇒ byte-identical to pre-#903.
+    if repo_docs_context:
+        parts.append(f"### REPO DOCS\n{repo_docs_context}")
     return parts, bool(intent)
 
 
@@ -1572,6 +1578,7 @@ def _build_messages(
     cross_file_contents: dict[str, str] | None = None,
     runtime_context: str | None = None,
     ci_context: str | None = None,
+    repo_docs_context: str | None = None,
     team_practices: str = "",
     few_shot_examples: str = "",
     learnings: str = "",
@@ -1586,6 +1593,7 @@ def _build_messages(
         cross_file_contents,
         runtime_context,
         ci_context,
+        repo_docs_context,
         pr_context,
         review_map,
     )
@@ -3498,6 +3506,7 @@ def review_reasoner_diff(
     cross_file_contents: dict[str, str] | None = None,
     runtime_context: str | None = None,
     ci_context: str | None = None,
+    repo_docs_context: str | None = None,
     voice: VoiceSelection = "caveman",
     cancel_event: threading.Event | None = None,
 ) -> LlmReviewResponse:
@@ -3514,7 +3523,7 @@ def review_reasoner_diff(
         return _review_reasoner_diff_once(
             hunks, installation_id, pr_context, file_contents,
             cross_file_contents, runtime_context, ci_context,
-            voice, cancel_event,
+            repo_docs_context, voice, cancel_event,
         )
 
     review_map = render_review_map(plan)
@@ -3563,6 +3572,7 @@ def review_reasoner_diff(
             cross_file_contents,
             runtime_context,
             ci_context,
+            repo_docs_context,
             voice,
             cancel_event,
             review_map,
@@ -3586,6 +3596,7 @@ def _review_reasoner_diff_once(
     cross_file_contents: dict[str, str] | None = None,
     runtime_context: str | None = None,
     ci_context: str | None = None,
+    repo_docs_context: str | None = None,
     voice: VoiceSelection = "caveman",
     cancel_event: threading.Event | None = None,
     review_map: str = "",
@@ -3606,6 +3617,7 @@ def _review_reasoner_diff_once(
     variant: PromptVariant = "v2"
     messages = _build_messages(
         hunks, variant, file_contents, cross_file_contents, runtime_context, ci_context,
+        repo_docs_context,
         team_practices=_team_practices_block(pr_context),
         few_shot_examples=_few_shot_block(pr_context),
         learnings=_repo_learnings_block(pr_context),
@@ -3669,6 +3681,7 @@ def review_diff(
     cross_file_contents: dict[str, str] | None = None,
     runtime_context: str | None = None,
     ci_context: str | None = None,
+    repo_docs_context: str | None = None,
     voice: VoiceSelection = "caveman",
     cancel_event: threading.Event | None = None,
 ) -> LlmReviewResponse:
@@ -3708,7 +3721,7 @@ def review_diff(
     if not plan.staged:
         return _review_diff_dispatch(
             hunks, installation_id, pr_context, file_contents, cross_file_contents,
-            runtime_context, ci_context, voice, cancel_event,
+            runtime_context, ci_context, repo_docs_context, voice, cancel_event,
         )
 
     review_map = render_review_map(plan)
@@ -3759,6 +3772,7 @@ def review_diff(
             cross_file_contents,
             runtime_context,
             ci_context,
+            repo_docs_context,
             voice,
             cancel_event,
             review_map,
@@ -4463,6 +4477,7 @@ def _review_diff_dispatch(
     cross_file_contents: dict[str, str] | None,
     runtime_context: str | None,
     ci_context: str | None,
+    repo_docs_context: str | None,
     voice: VoiceSelection,
     cancel_event: threading.Event | None,
     review_map: str = "",
@@ -4488,6 +4503,7 @@ def _review_diff_dispatch(
         )
         messages = _build_messages(
             hunks, variant, file_contents, cross_file_contents, runtime_context, ci_context,
+        repo_docs_context,
             team_practices=_team_practices_block(pr_context),
             few_shot_examples=_few_shot_block(pr_context),
             learnings=_repo_learnings_block(pr_context),
@@ -4507,7 +4523,7 @@ def _review_diff_dispatch(
         # sparks" (the operator, 2026-08-27) is not itself configurable away.
     return _review_diff_dispatch_cave_primary(
         hunks, installation_id, pr_context, file_contents, cross_file_contents,
-        runtime_context, ci_context, voice, cancel_event, review_map,
+        runtime_context, ci_context, repo_docs_context, voice, cancel_event, review_map,
     )
 
 
@@ -4519,6 +4535,7 @@ def _review_diff_dispatch_cave_primary(
     cross_file_contents: dict[str, str] | None,
     runtime_context: str | None,
     ci_context: str | None,
+    repo_docs_context: str | None,
     voice: VoiceSelection,
     cancel_event: threading.Event | None,
     review_map: str = "",
@@ -4538,6 +4555,7 @@ def _review_diff_dispatch_cave_primary(
     )
     messages = _build_messages(
         hunks, variant, file_contents, cross_file_contents, runtime_context, ci_context,
+        repo_docs_context,
         team_practices=_team_practices_block(pr_context),
         few_shot_examples=_few_shot_block(pr_context),
         learnings=_repo_learnings_block(pr_context),

@@ -78,6 +78,7 @@ from personas.code_reviewer.cross_file import (
     extract_symbols, fetch_cross_file_context,
 )
 from personas.code_reviewer.ci_status import build_ci_status_context
+from personas.code_reviewer.repo_docs import build_repo_docs_context
 from personas.code_reviewer.omen import build_runtime_context
 from personas.code_reviewer.judge import (
     eval_tags, grade_findings, partition_findings, partition_refuted,
@@ -485,6 +486,38 @@ def _fetch_file_contents(
                 extra={"path": path, "ref": ref, "error": str(e)},
             )
     return contents
+
+
+def _list_dir_contents(
+    install_token: str,
+    owner: str,
+    repo: str,
+    dir_path: str,
+    ref: str,
+) -> list[str] | None:
+    """List entry names under `dir_path` at `ref` via the contents API
+    (a directory listing returns a JSON array, not raw). Best-effort: any
+    failure returns None — the caller degrades, never raises."""
+    from urllib.parse import quote
+
+    try:
+        resp = httpx.get(
+            f"https://api.github.com/repos/{owner}/{repo}/contents/{quote(dir_path, safe='/')}",
+            params={"ref": ref},
+            headers={
+                "Authorization": f"Bearer {install_token}",
+                "Accept": "application/vnd.github+json",
+                "X-GitHub-Api-Version": "2022-11-28",
+            },
+            timeout=_DIFF_FETCH_TIMEOUT,
+        )
+        resp.raise_for_status()
+        data = resp.json()
+        if not isinstance(data, list):
+            return None
+        return [e["name"] for e in data if isinstance(e, dict) and e.get("name")]
+    except (httpx.HTTPStatusError, httpx.RequestError, ValueError):
+        return None
 
 
 # When a PR only retouches k8s/docs comments about settle/deep policy, the
@@ -2456,6 +2489,35 @@ def dispatch_code_review(
             },
         )
 
+    # Repo docs (#903): CONTEXT.md + path-relevant docs/adr/ entries as a
+    # DISTINCT review-context block (not merged into team-practices/Lore).
+    # FAIL-SAFE + additive: any failure degrades to None = today's review,
+    # never blocks. These docs already exist versioned in the repo; nothing
+    # new executes.
+    repo_docs_context: str | None = None
+    try:
+        repo_docs_context = with_install_token_retry(
+            installation_id,
+            lambda token: build_repo_docs_context(
+                fetch_file=lambda path: _fetch_file_contents(
+                    token, owner, repo_name, (path,), head_sha,
+                ).get(path),
+                list_dir=lambda path: _list_dir_contents(
+                    token, owner, repo_name, path, head_sha,
+                ),
+                hunks=hunks,
+            ),
+        )
+    except Exception as e:  # noqa: BLE001 — repo docs are additive; never break the review
+        log.info(
+            "repo_docs_degraded",
+            extra={
+                "stage": "dispatch",
+                "pr": f"{owner}/{repo_name}#{pull_number}",
+                "kind": type(e).__name__,
+            },
+        )
+
     # PR context supplies both trace identity and author intent. The prompt
     # treats title/body as untrusted repository data before sending it.
     llm_response: LlmReviewResponse = review_diff(
@@ -2465,6 +2527,7 @@ def dispatch_code_review(
         cross_file_contents=cross_file_contents,
         runtime_context=runtime_context,
         ci_context=ci_context,
+        repo_docs_context=repo_docs_context,
         pr_context=pr_context,
         voice=voice,
         cancel_event=cancel_event,
@@ -2948,6 +3011,7 @@ def dispatch_code_review(
             cross_file_contents=cross_file_contents,
             runtime_context=runtime_context,
             ci_context=ci_context,
+            repo_docs_context=repo_docs_context,
             voice=voice,
             living_range=living_range,
             evaluation=evaluation,
@@ -3462,6 +3526,7 @@ def _async_deep_append_if_needed(
     cross_file_contents: dict[str, str] | None,
     runtime_context: str | None,
     ci_context: str | None,
+    repo_docs_context: str | None,
     voice: VoiceSelection,
     living_range: str,
     evaluation: CodeReviewEvaluation,
@@ -3515,6 +3580,7 @@ def _async_deep_append_if_needed(
         cross_file_contents=cross_file_contents,
         runtime_context=runtime_context,
         ci_context=ci_context,
+        repo_docs_context=repo_docs_context,
         pr_context=pr_context,
         voice=voice,
         cancel_event=cancel_event,
