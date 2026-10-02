@@ -86,7 +86,7 @@ def test_dispatch_advisory_mode_posts_neutral_check_and_comment_review(monkeypat
     posted_check = []
     posted_review = []
 
-    def _fake_review_diff(hunks, installation_id, pr_context=None, file_contents=None, cross_file_contents=None, runtime_context=None, voice="caveman", cancel_event=None):
+    def _fake_review_diff(hunks, installation_id, pr_context=None, file_contents=None, cross_file_contents=None, runtime_context=None, ci_context=None, voice="caveman", cancel_event=None):
         return llm
 
     def _fake_post_check_run(install_token, owner, repo, result, external_id=None):
@@ -1041,7 +1041,7 @@ def test_dispatch_passes_identity_and_intent_to_review_diff(monkeypatch):
     """The review receives both trace coordinates and author intent."""
     captured = []
 
-    def _fake_review_diff(hunks, installation_id, pr_context=None, file_contents=None, cross_file_contents=None, runtime_context=None, voice="caveman", cancel_event=None):
+    def _fake_review_diff(hunks, installation_id, pr_context=None, file_contents=None, cross_file_contents=None, runtime_context=None, ci_context=None, voice="caveman", cancel_event=None):
         captured.append(pr_context)
         return LlmReviewResponse(kind="no_diff")
 

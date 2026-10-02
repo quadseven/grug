@@ -34,7 +34,12 @@ import httpx
 from activity_log import record_check_verdict
 from code_review_prompt import RULES
 from github_app_auth import get_app_id, with_install_token_retry
-from github_checks_client import CheckConclusion, CheckRunResult, post_check_run
+from github_checks_client import (
+    CheckConclusion,
+    CheckRunResult,
+    list_check_runs_for_ref,
+    post_check_run,
+)
 from github_reviews_client import (
     InlineComment, ReviewEvent, ReviewResult, get_review_comments, post_review,
 )
@@ -72,6 +77,7 @@ from personas.code_reviewer.lint import scan_ruff
 from personas.code_reviewer.cross_file import (
     extract_symbols, fetch_cross_file_context,
 )
+from personas.code_reviewer.ci_status import build_ci_status_context
 from personas.code_reviewer.omen import build_runtime_context
 from personas.code_reviewer.judge import (
     eval_tags, grade_findings, partition_findings, partition_refuted,
@@ -2423,6 +2429,33 @@ def dispatch_code_review(
             },
         )
 
+    # CI status (#902): the PR's OWN check-run status on the reviewed head
+    # SHA, injected as review context so Elder can see whether the PR's own
+    # tests passed. FAIL-SAFE + additive: any failure degrades to None =
+    # today's review, never blocks. The check-runs already ran in isolated
+    # CI; nothing new executes here.
+    ci_context: str | None = None
+    try:
+        ci_context = with_install_token_retry(
+            installation_id,
+            lambda token: build_ci_status_context(
+                fetch_check_runs=lambda: list_check_runs_for_ref(
+                    token, owner, repo_name, head_sha,
+                ),
+                head_sha=head_sha,
+                hunks=hunks,
+            ),
+        )
+    except Exception as e:  # noqa: BLE001 — ci status is additive; never break the review
+        log.info(
+            "ci_status_degraded",
+            extra={
+                "stage": "dispatch",
+                "pr": f"{owner}/{repo_name}#{pull_number}",
+                "kind": type(e).__name__,
+            },
+        )
+
     # PR context supplies both trace identity and author intent. The prompt
     # treats title/body as untrusted repository data before sending it.
     llm_response: LlmReviewResponse = review_diff(
@@ -2431,6 +2464,7 @@ def dispatch_code_review(
         file_contents=file_contents,
         cross_file_contents=cross_file_contents,
         runtime_context=runtime_context,
+        ci_context=ci_context,
         pr_context=pr_context,
         voice=voice,
         cancel_event=cancel_event,
@@ -2913,6 +2947,7 @@ def dispatch_code_review(
             file_contents=file_contents,
             cross_file_contents=cross_file_contents,
             runtime_context=runtime_context,
+            ci_context=ci_context,
             voice=voice,
             living_range=living_range,
             evaluation=evaluation,
@@ -3426,6 +3461,7 @@ def _async_deep_append_if_needed(
     file_contents: dict[str, str] | None,
     cross_file_contents: dict[str, str] | None,
     runtime_context: str | None,
+    ci_context: str | None,
     voice: VoiceSelection,
     living_range: str,
     evaluation: CodeReviewEvaluation,
@@ -3478,6 +3514,7 @@ def _async_deep_append_if_needed(
         file_contents=file_contents,
         cross_file_contents=cross_file_contents,
         runtime_context=runtime_context,
+        ci_context=ci_context,
         pr_context=pr_context,
         voice=voice,
         cancel_event=cancel_event,
