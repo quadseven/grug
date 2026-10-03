@@ -20,6 +20,7 @@ the historical published-neutral completion behavior.
 """
 from __future__ import annotations
 
+import contextlib
 import hashlib
 import json
 import logging
@@ -35,8 +36,9 @@ import boto3
 import httpx
 
 from adapters.install_store import get_repo_config  # type: ignore
-from github_app_auth import with_install_token_retry
+from github_app_auth import get_app_id, with_install_token_retry
 from github_checks_client import CheckRunResult, post_check_run
+from personas import board_client
 from personas.code_reviewer.dispatch import (
     DIFF_TOO_LARGE,
     RETRIED_DEGRADATIONS,
@@ -1455,6 +1457,174 @@ def release_active_review_claims() -> int:
     return released
 
 
+# --- In-progress board-note registry (#819) ---------------------------------
+# Mirrors the claim registry above: the re-review note is set when a review
+# starts and cleared when it ends, but a SIGTERM'd consumer never runs its
+# finally. Notes still registered at shutdown belong to reviews that will
+# not finish in this process, so the sweep restores their saved headers.
+_ACTIVE_BOARD_NOTES: dict[str, dict[str, Any]] = {}
+_ACTIVE_BOARD_NOTES_LOCK = threading.Lock()
+
+
+def _register_board_note(
+    install_id: int,
+    owner: str,
+    repo_name: str,
+    pr_number: int,
+    saved_header: str,
+) -> str:
+    token = f"{install_id}/{owner}/{repo_name}#{pr_number}"
+    with _ACTIVE_BOARD_NOTES_LOCK:
+        _ACTIVE_BOARD_NOTES[token] = {
+            "install_id": install_id,
+            "owner": owner,
+            "repo_name": repo_name,
+            "pr_number": pr_number,
+            "saved_header": saved_header,
+        }
+    return token
+
+
+def _unregister_board_note(token: str) -> None:
+    with _ACTIVE_BOARD_NOTES_LOCK:
+        _ACTIVE_BOARD_NOTES.pop(token, None)
+
+
+def clear_active_board_notes() -> int:
+    """Restore headers for every still-registered in-progress note (#819).
+
+    Called by the consumer's shutdown path alongside
+    `release_active_review_claims`: any note still registered belongs to a
+    review killed mid-flight. Best-effort per note. Returns the number
+    cleared."""
+    with _ACTIVE_BOARD_NOTES_LOCK:
+        notes = list(_ACTIVE_BOARD_NOTES.items())
+        _ACTIVE_BOARD_NOTES.clear()
+    cleared = 0
+    for _token, note in notes:
+        try:
+            if _clear_board_in_progress_note(
+                int(note["install_id"]),
+                str(note["owner"]),
+                str(note["repo_name"]),
+                int(note["pr_number"]),
+                str(note["saved_header"]),
+            ):
+                cleared += 1
+        except Exception:  # best-effort during shutdown
+            log.warning(
+                "board_in_progress_note_shutdown_clear_failed",
+                extra={
+                    "repo": f"{note.get('owner')}/{note.get('repo_name')}",
+                    "pr": note.get("pr_number"),
+                },
+                exc_info=True,
+            )
+    return cleared
+
+
+def _set_board_in_progress_note(
+    install_id: int,
+    owner: str,
+    repo_name: str,
+    pr_number: int,
+) -> str | None:
+    """Set the re-review in-progress board note (#819).
+
+    Returns the saved prior header, or None when there was no board (never
+    creates - the note is not worth an email) or the write failed. Never
+    raises: the note is cosmetic, the review is not.
+    """
+    try:
+        return with_install_token_retry(
+            install_id,
+            lambda token: board_client.mark_board_in_progress(
+                token,
+                owner,
+                repo_name,
+                pr_number,
+                app_id=get_app_id(),
+            ),
+        )
+    except Exception:  # note is best-effort; never fail a review for it
+        log.warning(
+            "board_in_progress_note_set_failed",
+            extra={"repo": f"{owner}/{repo_name}", "pr": pr_number},
+            exc_info=True,
+        )
+        return None
+
+
+def _clear_board_in_progress_note(
+    install_id: int,
+    owner: str,
+    repo_name: str,
+    pr_number: int,
+    saved_header: str,
+) -> bool:
+    """Restore a header saved by `_set_board_in_progress_note` (#819).
+
+    Only restores while the live header is still the in-progress note - if
+    the settled write already posted the final verdict, this is a no-op, so
+    calling it unconditionally from a finally can never clobber a real
+    verdict. Never raises."""
+    try:
+        return with_install_token_retry(
+            install_id,
+            lambda token: board_client.clear_board_in_progress(
+                token,
+                owner,
+                repo_name,
+                pr_number,
+                app_id=get_app_id(),
+                saved_header=saved_header,
+            ),
+        )
+    except Exception:  # note is best-effort; never fail a review for it
+        log.warning(
+            "board_in_progress_note_clear_failed",
+            extra={"repo": f"{owner}/{repo_name}", "pr": pr_number},
+            exc_info=True,
+        )
+        return False
+
+
+@contextlib.contextmanager
+def _board_in_progress_note(
+    install_id: int,
+    owner: str,
+    repo_name: str,
+    pr_number: int,
+):
+    """Set the re-review note for the duration of a review (#819).
+
+    Yields the saved prior header (None when no board existed). The finally
+    clears the note on EVERY exit - normal return, terminal-path return, or
+    exception (redrive/DLQ) - and unregisters it from the SIGTERM sweep. The
+    clear is guard-protected: when the settled write already posted the final
+    verdict, it does nothing.
+    """
+    saved = _set_board_in_progress_note(install_id, owner, repo_name, pr_number)
+    token = (
+        _register_board_note(install_id, owner, repo_name, pr_number, saved)
+        if saved is not None
+        else None
+    )
+    try:
+        yield saved
+    finally:
+        if token is not None:
+            _unregister_board_note(token)
+        if saved is not None:
+            _clear_board_in_progress_note(
+                install_id,
+                owner,
+                repo_name,
+                pr_number,
+                saved,
+            )
+
+
 def _start_review_claim_heartbeat(
     owned_claim_args: dict[str, Any],
 ) -> _ReviewClaimHeartbeat:
@@ -1737,207 +1907,214 @@ def _run_hot_review(
         # rides along for logging/diagnosis, not as the cancel trigger; it
         # hashes title and body, so using it aborted a running review whenever
         # the author edited their own PR description (infra#2157).
-        watch = _start_staleness_watch(
-            install_id, owner, repo_name, pr_number,
-            review_freshness_id_from_pr(after),
-            str((after.get("head") or {}).get("sha") or ""),
-        )
-        try:
-            result = dispatch_code_review(
-                _review_payload(
-                    install_id=install_id,
-                    owner=owner,
-                    repo_name=repo_name,
-                    pr_number=pr_number,
-                    pr=after,
-                ),
-                blocking=bool(cfg.get("code_reviewer_blocking", False)),
-                cancel_event=watch.cancel,
-            )
-        finally:
-            _stop_staleness_watch(watch)
-        degraded_reason = result.get("degraded_reason", "")
-        if degraded_reason == "stale_snapshot":
-            latest = _fetch_current_pr(
+        # #819: the board still shows the previous verdict while the
+        # re-review runs. Swap the header to an in-progress note for the
+        # duration (sections untouched, never creates); the context
+        # manager's finally clears it on every terminal path the settled
+        # board write doesn't cover - check-publish failure, DLQ/redrive
+        # raise, fail-open, or an unexpected result.
+        with _board_in_progress_note(install_id, owner, repo_name, pr_number):
+            watch = _start_staleness_watch(
                 install_id, owner, repo_name, pr_number,
+                review_freshness_id_from_pr(after),
+                str((after.get("head") or {}).get("sha") or ""),
             )
-            latest_head = str((latest.get("head") or {}).get("sha") or "")
-            if latest_head and latest_head != head_sha:
-                # Head actually moved: close the abandoned head's check so it
-                # never sticks in_progress. Best-effort - required-status
-                # evaluates the NEW head, so a failed post here is cosmetic.
-                _complete_elder_check_open(
+            try:
+                result = dispatch_code_review(
+                    _review_payload(
+                        install_id=install_id,
+                        owner=owner,
+                        repo_name=repo_name,
+                        pr_number=pr_number,
+                        pr=after,
+                    ),
+                    blocking=bool(cfg.get("code_reviewer_blocking", False)),
+                    cancel_event=watch.cancel,
+                )
+            finally:
+                _stop_staleness_watch(watch)
+            degraded_reason = result.get("degraded_reason", "")
+            if degraded_reason == "stale_snapshot":
+                latest = _fetch_current_pr(
+                    install_id, owner, repo_name, pr_number,
+                )
+                latest_head = str((latest.get("head") or {}).get("sha") or "")
+                if latest_head and latest_head != head_sha:
+                    # Head actually moved: close the abandoned head's check so it
+                    # never sticks in_progress. Best-effort - required-status
+                    # evaluates the NEW head, so a failed post here is cosmetic.
+                    _complete_elder_check_open(
+                        install_id=install_id,
+                        owner=owner,
+                        repo_name=repo_name,
+                        pr_number=pr_number,
+                        head_sha=head_sha,
+                        title="Elder superseded - new head",
+                        summary=(
+                            "A newer commit arrived while Elder was reviewing. "
+                            "This head is closed as neutral (fail-open). A fresh "
+                            "review is enqueued for the current head."
+                        ),
+                        conclusion="neutral",
+                    )
+                # Same-SHA staleness (title/body intent change): leave the check
+                # in_progress - the requeued review on this same head completes
+                # it. A terminal neutral here would prematurely green the merge
+                # button before the fresh review runs. Unless grug#773 AC3's
+                # redrive cap is exhausted, in which case _redrive_or_give_up
+                # itself posts the terminal neutral instead of redriving again.
+                redrived = (
+                    _redrive_or_give_up(
+                        install_id=install_id,
+                        owner=owner,
+                        repo_name=repo_name,
+                        pr_number=pr_number,
+                        pr=latest,
+                        settle_seconds=settle_seconds,
+                        claimed_head_sha=head_sha,
+                        current_head_sha=latest_head,
+                        job_redrive_count=int(job.get("redrive_count", 0)),
+                    )
+                    if _review_eligible(latest)
+                    else False
+                )
+                if not _stop_review_claim_heartbeat(heartbeat):
+                    raise RuntimeError(
+                        "Elder review claim ownership lost during dispatch"
+                    )
+                if not release_review_claim(**owned_claim_args):
+                    raise RuntimeError(
+                        "Elder review claim ownership lost after stale dispatch"
+                    )
+                if not _review_eligible(latest):
+                    return "pr_ineligible"
+                return "stale_snapshot" if redrived else "intent_drift_exhausted"
+            if degraded_reason == "pr_ineligible":
+                # NO terminal completion here: a draft/closed PR cannot merge, so
+                # a lingering in_progress check blocks nothing - but a terminal
+                # neutral on this head WOULD satisfy the required check the
+                # moment the PR is reopened/marked ready, before the freshly
+                # scheduled review posts. Leave the check pending; the
+                # ready_for_review/reopen enqueue completes it via a real review.
+                if not _stop_review_claim_heartbeat(heartbeat):
+                    raise RuntimeError(
+                        "Elder review claim ownership lost during dispatch"
+                    )
+                if not release_review_claim(**owned_claim_args):
+                    raise RuntimeError(
+                        "Elder review claim ownership lost for ineligible dispatch"
+                    )
+                return "pr_ineligible"
+            result_status = result.get("result")
+            if result_status == "publish_failed":
+                raise RuntimeError("Elder review publication failed")
+            # `review_rejected` (#770) is deliberately NOT in that raise: GitHub
+            # returned a deterministic 4xx on the inline review (422 for a
+            # comment outside the diff). The check-run already landed, so the
+            # merge gate is intact; redriving would re-send the identical
+            # payload and collect the identical answer five times over - which
+            # is exactly how four Elder jobs reached the DLQ. It completes below
+            # like pass/fail; dispatch already logged the status and body.
+            # Fail-open like FLINT: infra / GH brownout must COMPLETE the
+            # required check as neutral, never leave in_progress forever and
+            # never redrive forever. Real model findings still use pass/fail.
+            if result_status == "skipped" and degraded_reason == "freshness_check_failed":
+                posted = _complete_elder_check_open(
                     install_id=install_id,
                     owner=owner,
                     repo_name=repo_name,
                     pr_number=pr_number,
                     head_sha=head_sha,
-                    title="Elder superseded - new head",
+                    title="Elder eyes clouded - GitHub unavailable",
                     summary=(
-                        "A newer commit arrived while Elder was reviewing. "
-                        "This head is closed as neutral (fail-open). A fresh "
-                        "review is enqueued for the current head."
+                        "Could not re-fetch the PR to confirm snapshot freshness "
+                        "(GitHub 5xx / transport). Grug fail-open: required check "
+                        "concludes **neutral** so merge is not blocked by infra. "
+                        "Push again or re-run Elder when GitHub is healthy."
                     ),
                     conclusion="neutral",
                 )
-            # Same-SHA staleness (title/body intent change): leave the check
-            # in_progress - the requeued review on this same head completes
-            # it. A terminal neutral here would prematurely green the merge
-            # button before the fresh review runs. Unless grug#773 AC3's
-            # redrive cap is exhausted, in which case _redrive_or_give_up
-            # itself posts the terminal neutral instead of redriving again.
-            redrived = (
-                _redrive_or_give_up(
+                if not posted:
+                    # The same brownout ate the neutral completion: finishing the
+                    # job now would leave the required check in_progress forever
+                    # with no retry - the exact bug fail-open exists to prevent.
+                    # Raise for redrive; a later attempt reviews or re-posts.
+                    raise RuntimeError(
+                        "Elder fail-open completion did not land (freshness outage)"
+                    )
+                if not _stop_review_claim_heartbeat(heartbeat):
+                    raise RuntimeError(
+                        "Elder review claim ownership lost after fail-open"
+                    )
+                if not complete_review_claim(**owned_claim_args):
+                    # Prefer release over hang if complete fails - but if the
+                    # fallback release ALSO fails, the claim is still held and
+                    # silently returning would report success while blocking
+                    # every future attempt until lease expiry. Raise for redrive.
+                    if not release_review_claim(**owned_claim_args):
+                        raise RuntimeError(
+                            "Elder fail-open claim settlement failed (freshness)"
+                        )
+                return "fail_open_freshness"
+            if result_status == "skipped" and degraded_reason in _RETRYABLE_SKIP_REASONS:
+                # Model/content-side transient (backend outage, unparseable
+                # output, diff fetch blip): a retry can succeed, so release the
+                # claim and raise for SQS redrive instead of failing open. These
+                # paths publish their own completed degraded check (or redrive
+                # re-runs the review), so they cannot stick in_progress; the DLQ
+                # poison monitor covers a sustained outage.
+                raise RuntimeError(
+                    f"Elder review degraded: {degraded_reason}"
+                )
+            if (
+                result_status == "skipped"
+                and degraded_reason not in _SELF_COMPLETING_SKIP_REASONS
+            ):
+                # Unknown skip: still fail-open rather than infinite redrive.
+                posted = _complete_elder_check_open(
                     install_id=install_id,
                     owner=owner,
                     repo_name=repo_name,
                     pr_number=pr_number,
-                    pr=latest,
-                    settle_seconds=settle_seconds,
-                    claimed_head_sha=head_sha,
-                    current_head_sha=latest_head,
-                    job_redrive_count=int(job.get("redrive_count", 0)),
+                    head_sha=head_sha,
+                    title=f"Elder skipped - {degraded_reason or 'unknown'}",
+                    summary=(
+                        f"Review returned skipped ({degraded_reason or 'unknown'}). "
+                        "Grug fail-open: required check concludes **neutral** so "
+                        "infra cannot brick the merge. Re-run Elder if needed."
+                    ),
+                    conclusion="neutral",
                 )
-                if _review_eligible(latest)
-                else False
-            )
-            if not _stop_review_claim_heartbeat(heartbeat):
-                raise RuntimeError(
-                    "Elder review claim ownership lost during dispatch"
-                )
-            if not release_review_claim(**owned_claim_args):
-                raise RuntimeError(
-                    "Elder review claim ownership lost after stale dispatch"
-                )
-            if not _review_eligible(latest):
-                return "pr_ineligible"
-            return "stale_snapshot" if redrived else "intent_drift_exhausted"
-        if degraded_reason == "pr_ineligible":
-            # NO terminal completion here: a draft/closed PR cannot merge, so
-            # a lingering in_progress check blocks nothing - but a terminal
-            # neutral on this head WOULD satisfy the required check the
-            # moment the PR is reopened/marked ready, before the freshly
-            # scheduled review posts. Leave the check pending; the
-            # ready_for_review/reopen enqueue completes it via a real review.
-            if not _stop_review_claim_heartbeat(heartbeat):
-                raise RuntimeError(
-                    "Elder review claim ownership lost during dispatch"
-                )
-            if not release_review_claim(**owned_claim_args):
-                raise RuntimeError(
-                    "Elder review claim ownership lost for ineligible dispatch"
-                )
-            return "pr_ineligible"
-        result_status = result.get("result")
-        if result_status == "publish_failed":
-            raise RuntimeError("Elder review publication failed")
-        # `review_rejected` (#770) is deliberately NOT in that raise: GitHub
-        # returned a deterministic 4xx on the inline review (422 for a
-        # comment outside the diff). The check-run already landed, so the
-        # merge gate is intact; redriving would re-send the identical
-        # payload and collect the identical answer five times over - which
-        # is exactly how four Elder jobs reached the DLQ. It completes below
-        # like pass/fail; dispatch already logged the status and body.
-        # Fail-open like FLINT: infra / GH brownout must COMPLETE the
-        # required check as neutral, never leave in_progress forever and
-        # never redrive forever. Real model findings still use pass/fail.
-        if result_status == "skipped" and degraded_reason == "freshness_check_failed":
-            posted = _complete_elder_check_open(
-                install_id=install_id,
-                owner=owner,
-                repo_name=repo_name,
-                pr_number=pr_number,
-                head_sha=head_sha,
-                title="Elder eyes clouded - GitHub unavailable",
-                summary=(
-                    "Could not re-fetch the PR to confirm snapshot freshness "
-                    "(GitHub 5xx / transport). Grug fail-open: required check "
-                    "concludes **neutral** so merge is not blocked by infra. "
-                    "Push again or re-run Elder when GitHub is healthy."
-                ),
-                conclusion="neutral",
-            )
-            if not posted:
-                # The same brownout ate the neutral completion: finishing the
-                # job now would leave the required check in_progress forever
-                # with no retry - the exact bug fail-open exists to prevent.
-                # Raise for redrive; a later attempt reviews or re-posts.
-                raise RuntimeError(
-                    "Elder fail-open completion did not land (freshness outage)"
-                )
-            if not _stop_review_claim_heartbeat(heartbeat):
-                raise RuntimeError(
-                    "Elder review claim ownership lost after fail-open"
-                )
-            if not complete_review_claim(**owned_claim_args):
-                # Prefer release over hang if complete fails - but if the
-                # fallback release ALSO fails, the claim is still held and
-                # silently returning would report success while blocking
-                # every future attempt until lease expiry. Raise for redrive.
-                if not release_review_claim(**owned_claim_args):
+                if not posted:
+                    # Fail-open only counts if the completion landed; otherwise
+                    # redrive so the check cannot stay in_progress forever.
                     raise RuntimeError(
-                        "Elder fail-open claim settlement failed (freshness)"
-                    )
-            return "fail_open_freshness"
-        if result_status == "skipped" and degraded_reason in _RETRYABLE_SKIP_REASONS:
-            # Model/content-side transient (backend outage, unparseable
-            # output, diff fetch blip): a retry can succeed, so release the
-            # claim and raise for SQS redrive instead of failing open. These
-            # paths publish their own completed degraded check (or redrive
-            # re-runs the review), so they cannot stick in_progress; the DLQ
-            # poison monitor covers a sustained outage.
-            raise RuntimeError(
-                f"Elder review degraded: {degraded_reason}"
-            )
-        if (
-            result_status == "skipped"
-            and degraded_reason not in _SELF_COMPLETING_SKIP_REASONS
-        ):
-            # Unknown skip: still fail-open rather than infinite redrive.
-            posted = _complete_elder_check_open(
-                install_id=install_id,
-                owner=owner,
-                repo_name=repo_name,
-                pr_number=pr_number,
-                head_sha=head_sha,
-                title=f"Elder skipped - {degraded_reason or 'unknown'}",
-                summary=(
-                    f"Review returned skipped ({degraded_reason or 'unknown'}). "
-                    "Grug fail-open: required check concludes **neutral** so "
-                    "infra cannot brick the merge. Re-run Elder if needed."
-                ),
-                conclusion="neutral",
-            )
-            if not posted:
-                # Fail-open only counts if the completion landed; otherwise
-                # redrive so the check cannot stay in_progress forever.
-                raise RuntimeError(
-                    "Elder fail-open completion did not land "
-                    f"(skip: {degraded_reason or 'unknown'})"
-                )
-            if not _stop_review_claim_heartbeat(heartbeat):
-                raise RuntimeError(
-                    "Elder review claim ownership lost after fail-open skip"
-                )
-            if not complete_review_claim(**owned_claim_args):
-                # Same both-failed guard as the freshness branch above.
-                if not release_review_claim(**owned_claim_args):
-                    raise RuntimeError(
-                        "Elder fail-open claim settlement failed "
+                        "Elder fail-open completion did not land "
                         f"(skip: {degraded_reason or 'unknown'})"
                     )
-            return f"fail_open_{degraded_reason or 'skipped'}"
-        if (
-            result_status not in {"pass", "fail", "skipped", "review_rejected"}
-            and not str(result_status).startswith("fail_open")
-        ):
-            raise RuntimeError(
-                f"Elder review returned unexpected result: {result_status!r}"
-            )
-        if not _stop_review_claim_heartbeat(heartbeat):
-            raise RuntimeError("Elder review claim ownership lost during review")
-        if not complete_review_claim(**owned_claim_args):
-            raise RuntimeError("Elder review claim completion lost ownership")
+                if not _stop_review_claim_heartbeat(heartbeat):
+                    raise RuntimeError(
+                        "Elder review claim ownership lost after fail-open skip"
+                    )
+                if not complete_review_claim(**owned_claim_args):
+                    # Same both-failed guard as the freshness branch above.
+                    if not release_review_claim(**owned_claim_args):
+                        raise RuntimeError(
+                            "Elder fail-open claim settlement failed "
+                            f"(skip: {degraded_reason or 'unknown'})"
+                        )
+                return f"fail_open_{degraded_reason or 'skipped'}"
+            if (
+                result_status not in {"pass", "fail", "skipped", "review_rejected"}
+                and not str(result_status).startswith("fail_open")
+            ):
+                raise RuntimeError(
+                    f"Elder review returned unexpected result: {result_status!r}"
+                )
+            if not _stop_review_claim_heartbeat(heartbeat):
+                raise RuntimeError("Elder review claim ownership lost during review")
+            if not complete_review_claim(**owned_claim_args):
+                raise RuntimeError("Elder review claim completion lost ownership")
     except Exception:
         _stop_review_claim_heartbeat(heartbeat)
         try:

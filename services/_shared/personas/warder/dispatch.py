@@ -32,13 +32,12 @@ import re
 from urllib.parse import quote
 
 import httpx
-
-from activity_log import record_check_verdict
 from github_app_auth import with_install_token_retry
-from github_checks_client import CheckRunResult, post_check_run
+from secrets_loader import get_dd_api_key, get_dd_app_key, get_warder_slo_map
+
+from personas.publish_check import publish_persona_check
 from personas.tribe import CHECK_WARDER
 from personas.warder.slo_gate import is_healthy, query_monitor_state
-from secrets_loader import get_dd_api_key, get_dd_app_key, get_warder_slo_map
 
 log = logging.getLogger(f"{os.getenv('DD_SERVICE', 'grug')}.persona.warder")
 
@@ -238,46 +237,35 @@ def dispatch_warder_release(
             title += " — deploy gate FAILED"
         conclusion = gate_conclusion or conclusion
 
-    publish_failed = False
-    try:
-        with_install_token_retry(
-            installation_id,
-            lambda token: post_check_run(
-                token, owner, repo_name,
-                CheckRunResult(
-                    name=_CHECK_NAME, head_sha=head_sha, status="completed",
-                    conclusion=conclusion, title=title, summary=summary,
-                ),
-                external_id=f"grug-warder:{owner}/{repo_name}#{pr_number}:{head_sha}",
-            ),
-        )
-    except (httpx.HTTPStatusError, httpx.RequestError) as e:
-        log.error(
-            "warder_publish_failed",
-            extra={
-                "installation_id": installation_id,
-                "pr": f"{owner}/{repo_name}#{pr_number}",
-                "kind": type(e).__name__,
-            },
-        )
-        publish_failed = True
-
-    record_check_verdict(
-        install_id=installation_id,
+    # Publish + record via the shared seam (#551, #549): the verdict fields
+    # stay warder's own (fetch-degraded inputs ride in as degraded_reason,
+    # the grug-warder: external id comes from persona_prefix="warder"); the
+    # tail — check-run POST, publish-failure classification, honest-verdict
+    # merge — is the seam's. blocking keeps today's deploy-gate semantics
+    # (conclusion == "failure"), not the pre-#955 blocking=False the issue
+    # text was written against; findings_count likewise keeps #955's
+    # gate_breached shape. success_result mirrors the old tail's outcome
+    # mapping (skipped/fail/pass) so the return contract is unchanged.
+    result = publish_persona_check(
         persona_key="warder",
-        repo=f"{owner}/{repo_name}",
+        persona_prefix="warder",
+        check_name=_CHECK_NAME,
+        installation_id=installation_id,
+        owner=owner,
+        repo=repo_name,
         pr_number=pr_number,
         head_sha=head_sha,
         conclusion=conclusion,
-        summary=title,
+        title=title,
+        summary=summary,
         findings_count=1 if gate_breached else 0,
         blocking=conclusion == "failure",
-        degraded_reason=degraded_reason or ("check_publish_failed" if publish_failed else None),
+        degraded_reason=degraded_reason,
+        success_result=(
+            "skipped" if degraded_reason
+            else "fail" if conclusion == "failure"
+            else "pass"
+        ),
+        publish_failed_log_name="warder_publish_failed",
     )
-    if publish_failed:
-        return {"persona": "warder", "result": "publish_failed"}
-    if degraded_reason:
-        return {"persona": "warder", "result": "skipped"}
-    if conclusion == "failure":
-        return {"persona": "warder", "result": "fail"}
-    return {"persona": "warder", "result": "pass"}
+    return {"persona": "warder", "result": result["result"]}

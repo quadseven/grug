@@ -34,7 +34,12 @@ import httpx
 from activity_log import record_check_verdict
 from code_review_prompt import RULES
 from github_app_auth import get_app_id, with_install_token_retry
-from github_checks_client import CheckConclusion, CheckRunResult, post_check_run
+from github_checks_client import (
+    CheckConclusion,
+    CheckRunResult,
+    list_check_runs_for_ref,
+    post_check_run,
+)
 from github_reviews_client import (
     InlineComment, ReviewEvent, ReviewResult, get_review_comments, post_review,
 )
@@ -72,6 +77,8 @@ from personas.code_reviewer.lint import scan_ruff
 from personas.code_reviewer.cross_file import (
     extract_symbols, fetch_cross_file_context,
 )
+from personas.code_reviewer.ci_status import build_ci_status_context
+from personas.code_reviewer.repo_docs import build_repo_docs_context
 from personas.code_reviewer.omen import build_runtime_context
 from personas.code_reviewer.judge import (
     eval_tags, grade_findings, partition_findings, partition_refuted,
@@ -139,7 +146,7 @@ def _fetch_pr_diff(
     head_sha: str = "",
 ) -> str:
     """GET an immutable base/head diff, falling back when compare is unavailable."""
-    diff, _ = _fetch_pr_diff_with_scope(
+    diff, _, _ = _fetch_pr_diff_with_scope(
         install_token, owner, repo, pull_number,
         base_sha=base_sha, head_sha=head_sha,
     )
@@ -200,8 +207,14 @@ def _fetch_pr_diff_with_scope(
     *,
     base_sha: str = "",
     head_sha: str = "",
-) -> tuple[str, bool]:
-    """Return the diff and whether an immutable compare supplied it."""
+) -> tuple[str, bool, bool]:
+    """Return (diff, used_compare, baseline_rejected).
+
+    `used_compare` is whether an immutable compare supplied the diff.
+    `baseline_rejected` (#845) is True only when a baseline WAS supplied
+    but turned out not to be an ancestor of head (diverged/rewritten
+    history) - distinct from merely unavailable (404/422), so the caller
+    can report the rewrite instead of silently swallowing it."""
     repo_url = (
         f"https://api.github.com/repos/{quote(owner, safe='')}/"
         f"{quote(repo, safe='')}"
@@ -224,6 +237,7 @@ def _fetch_pr_diff_with_scope(
         timeout=_DIFF_FETCH_TIMEOUT,
     )
     used_compare = bool(base_sha and head_sha)
+    baseline_rejected = False
     if used_compare and resp.status_code in {404, 422}:
         # GitHub can reject compare requests for forked or recently rewritten
         # histories while the PR diff remains readable. Snapshot checks before
@@ -263,8 +277,9 @@ def _fetch_pr_diff_with_scope(
             timeout=_DIFF_FETCH_TIMEOUT,
         )
         used_compare = False
+        baseline_rejected = True
     resp.raise_for_status()
-    return resp.text, used_compare
+    return resp.text, used_compare, baseline_rejected
 
 
 def _fetch_current_review_snapshot(
@@ -479,6 +494,38 @@ def _fetch_file_contents(
                 extra={"path": path, "ref": ref, "error": str(e)},
             )
     return contents
+
+
+def _list_dir_contents(
+    install_token: str,
+    owner: str,
+    repo: str,
+    dir_path: str,
+    ref: str,
+) -> list[str] | None:
+    """List entry names under `dir_path` at `ref` via the contents API
+    (a directory listing returns a JSON array, not raw). Best-effort: any
+    failure returns None — the caller degrades, never raises."""
+    from urllib.parse import quote
+
+    try:
+        resp = httpx.get(
+            f"https://api.github.com/repos/{owner}/{repo}/contents/{quote(dir_path, safe='/')}",
+            params={"ref": ref},
+            headers={
+                "Authorization": f"Bearer {install_token}",
+                "Accept": "application/vnd.github+json",
+                "X-GitHub-Api-Version": "2022-11-28",
+            },
+            timeout=_DIFF_FETCH_TIMEOUT,
+        )
+        resp.raise_for_status()
+        data = resp.json()
+        if not isinstance(data, list):
+            return None
+        return [e["name"] for e in data if isinstance(e, dict) and e.get("name")]
+    except (httpx.HTTPStatusError, httpx.RequestError, ValueError):
+        return None
 
 
 # When a PR only retouches k8s/docs comments about settle/deep policy, the
@@ -816,6 +863,7 @@ def _summary_markdown(
     oversized_paths: tuple[str, ...] = (),
     duplicate_paths: tuple[tuple[str, str], ...] = (),
     living_range: str = "",
+    living_baseline_rejected: str = "",
     review_phase: Literal["tier1", "deep", "dual"] = "dual",
 ) -> tuple[str, str]:
     """Render a (title, summary) pair for the check-run output.
@@ -827,6 +875,10 @@ def _summary_markdown(
     finding is never a silent gap.
     `living_range` (#557) when set is the prior..head delta Elder reviewed
     (Living Hunt) instead of the full PR base..head.
+    `living_baseline_rejected` (#845) when set is the stored baseline SHA
+    that turned out not to be an ancestor of head (rewritten history) -
+    the delta was rejected and the full PR diff reviewed instead. Surfaced
+    as a summary note so the fallback is visible, not silent.
     `review_phase` (#646): tier1 = coder-only legend; deep = append legend;
     dual = both arms before publish (deep depth / rollback).
     """
@@ -843,6 +895,17 @@ def _summary_markdown(
         if living_range
         else ""
     )
+    if living_baseline_rejected:
+        # #845: the stored baseline was rejected as a non-ancestor - the
+        # range above is empty because no delta was reviewed, but the
+        # fallback must be visible in the check-run, not just the logs.
+        hunt += (
+            "\n\nLiving Hunt: the stored baseline `"
+            + living_baseline_rejected
+            + "` was not an ancestor of the current head (history was "
+            "rewritten) - Elder reviewed the full PR diff instead of the "
+            "delta since the last pass."
+        )
 
     def hunt_title(title: str) -> str:
         return f"Living Hunt {living_range} - {title}" if living_range else title
@@ -2140,6 +2203,10 @@ def dispatch_code_review(
     # full PR base..head. Best-effort: store blips fall back to full review.
     living_prior_sha = ""
     living_range = ""
+    # #845: set when the stored baseline turned out not to be an ancestor
+    # of head (rewritten history) - the delta was rejected and the full PR
+    # diff reviewed instead. Reported in the check-run summary, not silent.
+    living_baseline_rejected = ""
     try:
         from adapters.install_store import get_elder_last_reviewed
 
@@ -2203,16 +2270,18 @@ def dispatch_code_review(
     # format drift cannot 500 the webhook.
     try:
         if living_prior_sha:
-            diff_text, used_living_compare = with_install_token_retry(
-                installation_id,
-                lambda token: _fetch_pr_diff_with_scope(
-                    token,
-                    owner,
-                    repo_name,
-                    pull_number,
-                    base_sha=living_prior_sha,
-                    head_sha=head_sha,
-                ),
+            diff_text, used_living_compare, living_baseline_was_rejected = (
+                with_install_token_retry(
+                    installation_id,
+                    lambda token: _fetch_pr_diff_with_scope(
+                        token,
+                        owner,
+                        repo_name,
+                        pull_number,
+                        base_sha=living_prior_sha,
+                        head_sha=head_sha,
+                    ),
+                )
             )
         else:
             # Retain the established fetch seam for ordinary full reviews;
@@ -2230,6 +2299,11 @@ def dispatch_code_review(
             )
             used_living_compare = False
         if living_prior_sha and not used_living_compare:
+            # The delta was rejected (#845): keep the rejected SHA for the
+            # summary note, but clear the range so the title doesn't name a
+            # delta that was never reviewed.
+            if living_baseline_was_rejected:
+                living_baseline_rejected = living_prior_sha[:8]
             living_prior_sha = ""
             living_range = ""
         pr_context["base_sha"] = living_prior_sha or base_sha
@@ -2423,6 +2497,62 @@ def dispatch_code_review(
             },
         )
 
+    # CI status (#902): the PR's OWN check-run status on the reviewed head
+    # SHA, injected as review context so Elder can see whether the PR's own
+    # tests passed. FAIL-SAFE + additive: any failure degrades to None =
+    # today's review, never blocks. The check-runs already ran in isolated
+    # CI; nothing new executes here.
+    ci_context: str | None = None
+    try:
+        ci_context = with_install_token_retry(
+            installation_id,
+            lambda token: build_ci_status_context(
+                fetch_check_runs=lambda: list_check_runs_for_ref(
+                    token, owner, repo_name, head_sha,
+                ),
+                head_sha=head_sha,
+                hunks=hunks,
+            ),
+        )
+    except Exception as e:  # noqa: BLE001 — ci status is additive; never break the review
+        log.info(
+            "ci_status_degraded",
+            extra={
+                "stage": "dispatch",
+                "pr": f"{owner}/{repo_name}#{pull_number}",
+                "kind": type(e).__name__,
+            },
+        )
+
+    # Repo docs (#903): CONTEXT.md + path-relevant docs/adr/ entries as a
+    # DISTINCT review-context block (not merged into team-practices/Lore).
+    # FAIL-SAFE + additive: any failure degrades to None = today's review,
+    # never blocks. These docs already exist versioned in the repo; nothing
+    # new executes.
+    repo_docs_context: str | None = None
+    try:
+        repo_docs_context = with_install_token_retry(
+            installation_id,
+            lambda token: build_repo_docs_context(
+                fetch_file=lambda path: _fetch_file_contents(
+                    token, owner, repo_name, (path,), head_sha,
+                ).get(path),
+                list_dir=lambda path: _list_dir_contents(
+                    token, owner, repo_name, path, head_sha,
+                ),
+                hunks=hunks,
+            ),
+        )
+    except Exception as e:  # noqa: BLE001 — repo docs are additive; never break the review
+        log.info(
+            "repo_docs_degraded",
+            extra={
+                "stage": "dispatch",
+                "pr": f"{owner}/{repo_name}#{pull_number}",
+                "kind": type(e).__name__,
+            },
+        )
+
     # PR context supplies both trace identity and author intent. The prompt
     # treats title/body as untrusted repository data before sending it.
     llm_response: LlmReviewResponse = review_diff(
@@ -2431,6 +2561,8 @@ def dispatch_code_review(
         file_contents=file_contents,
         cross_file_contents=cross_file_contents,
         runtime_context=runtime_context,
+        ci_context=ci_context,
+        repo_docs_context=repo_docs_context,
         pr_context=pr_context,
         voice=voice,
         cancel_event=cancel_event,
@@ -2626,6 +2758,7 @@ def dispatch_code_review(
         oversized_paths=oversized_paths,
         duplicate_paths=duplicate_paths,
         living_range=living_range,
+        living_baseline_rejected=living_baseline_rejected,
         review_phase=tier1_phase,
     )
     check_result = CheckRunResult(
@@ -2913,8 +3046,11 @@ def dispatch_code_review(
             file_contents=file_contents,
             cross_file_contents=cross_file_contents,
             runtime_context=runtime_context,
+            ci_context=ci_context,
+            repo_docs_context=repo_docs_context,
             voice=voice,
             living_range=living_range,
+            living_baseline_rejected=living_baseline_rejected,
             evaluation=evaluation,
             prior_keys=prior_keys,
             check_publish_failed=check_publish_failed,
@@ -3426,8 +3562,11 @@ def _async_deep_append_if_needed(
     file_contents: dict[str, str] | None,
     cross_file_contents: dict[str, str] | None,
     runtime_context: str | None,
+    ci_context: str | None,
+    repo_docs_context: str | None,
     voice: VoiceSelection,
     living_range: str,
+    living_baseline_rejected: str,
     evaluation: CodeReviewEvaluation,
     prior_keys: frozenset[str],
     check_publish_failed: bool,
@@ -3478,6 +3617,8 @@ def _async_deep_append_if_needed(
         file_contents=file_contents,
         cross_file_contents=cross_file_contents,
         runtime_context=runtime_context,
+        ci_context=ci_context,
+        repo_docs_context=repo_docs_context,
         pr_context=pr_context,
         voice=voice,
         cancel_event=cancel_event,
@@ -3581,6 +3722,7 @@ def _async_deep_append_if_needed(
         combined,
         suppressed_count=deep_suppressed_count,
         living_range=living_range,
+        living_baseline_rejected=living_baseline_rejected,
         review_phase="deep",
     )
     title = f"{title} (deep append)"

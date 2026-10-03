@@ -13,6 +13,7 @@ import re
 from dataclasses import dataclass
 
 from markdown_safety import neutralize_mentions as _neutralize_mentions
+
 from personas.walkthrough.effort import ReviewEffort, effort_label
 
 MARKER = "<!-- grug-teller:walkthrough -->"
@@ -45,11 +46,7 @@ def _escape_html(text: str) -> str:
     File blurbs sit inside <details> blocks; a raw </details> (or any
     tag) would close the collapsible early and corrupt the comment.
     """
-    return (
-        text.replace("&", "&amp;")
-        .replace("<", "&lt;")
-        .replace(">", "&gt;")
-    )
+    return text.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
 
 
 def _escape_table_cell(text: str) -> str:
@@ -96,9 +93,14 @@ def changed_files_table(files: list[FileStat]) -> str:
     rows = ["| File | Summary | Changes |", "|---|---|---|"]
     for f in files[:_MAX_TABLE_ROWS]:
         path = _escape_code_span_cell(_neutralize_mentions(f.path))
-        summary = _escape_html(_escape_table_cell(_neutralize_mentions(
-            (f.summary or "")[:_MAX_FILE_SUMMARY_CHARS]
-        ))) or "-"
+        summary = (
+            _escape_html(
+                _escape_table_cell(
+                    _neutralize_mentions((f.summary or "")[:_MAX_FILE_SUMMARY_CHARS])
+                )
+            )
+            or "-"
+        )
         rows.append(f"| `{path}` | {summary} | +{f.additions}/-{f.deletions} |")
     table = "\n".join(rows)
     cut = len(files) - _MAX_TABLE_ROWS
@@ -109,12 +111,7 @@ def changed_files_table(files: list[FileStat]) -> str:
 
 def _details(summary: str, body: str) -> str:
     """Collapsible block. Keeps the default PR view short; expand for detail."""
-    return (
-        f"<details>\n"
-        f"<summary>{summary}</summary>\n\n"
-        f"{body}\n\n"
-        f"</details>"
-    )
+    return f"<details>\n<summary>{summary}</summary>\n\n{body}\n\n</details>"
 
 
 def walkthrough_body(
@@ -126,6 +123,7 @@ def walkthrough_body(
     head_sha: str,
     degraded: bool,
     files_truncated: bool = False,
+    related: list | None = None,
 ) -> str:
     """Assemble a short walkthrough comment (default-collapsed detail).
 
@@ -159,14 +157,24 @@ def walkthrough_body(
         )
     if files_truncated:
         notes.append(
-            f"File list is partial: first {len(files)} files only; "
-            "the PR has more."
+            f"File list is partial: first {len(files)} files only; the PR has more."
         )
     if notes:
         parts.append("")
         parts.extend(f"- {n}" for n in notes)
     parts.append("")
     parts.append(f"Review effort: {effort_label(effort)}")
+
+    if related:
+        # #675: possibly-related prior hunts. Omitted entirely when nothing
+        # cleared the relevance bar (honest empty - no filler).
+        parts.append("")
+        parts.append("**Possibly related hunts**")
+        parts.append("")
+        for r in related[:3]:
+            title = _neutralize_mentions(r.title)
+            reason = _neutralize_mentions(r.reason)
+            parts.append(f"- #{r.number} {title} — {reason}")
 
     table = changed_files_table(files)
     if table:
@@ -179,9 +187,7 @@ def walkthrough_body(
 
     if diagram:
         parts.append("")
-        parts.append(
-            _details("Shape of the change", f"```mermaid\n{diagram}\n```")
-        )
+        parts.append(_details("Shape of the change", f"```mermaid\n{diagram}\n```"))
     elif files:
         # Stated reason when files exist but diagram could not be drawn
         # (too many top-level dirs, balance check failed, and so on).

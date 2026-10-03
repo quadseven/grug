@@ -1,6 +1,7 @@
 """Tests for poller_handler.handler — the scheduled reaction-poll Lambda
 entry point (#247b). Mocks install_store / auth / reactions; no DDB or
 network. Webhook-only (the poller ships in the webhook image)."""
+
 from __future__ import annotations
 
 import poller_handler
@@ -18,7 +19,6 @@ def _no_ambient_ra_config(monkeypatch):
     monkeypatch.delenv("AWS_CONFIG_FILE", raising=False)
 
 
-
 def _wire(monkeypatch, *, installs, records_for, retry, poll):
     monkeypatch.setattr(poller_handler, "list_allowlisted_installs", lambda: installs)
     monkeypatch.setattr(poller_handler, "list_comment_records", records_for)
@@ -34,6 +34,8 @@ def _wire(monkeypatch, *, installs, records_for, retry, poll):
     # loop like before extraction), same reasoning already documented
     # below for the check-run reconcile pass.
     monkeypatch.setattr(poller_handler, "list_pulse_enabled_repos", lambda iid: [])
+    # #656: same, for the comment-nudge pass.
+    monkeypatch.setattr(poller_handler, "list_comment_nudge_repos", lambda iid: [])
     monkeypatch.setattr(poller_handler, "list_dep_watch_repos", lambda iid: [])
     # 2026-07-24: default the reopen-watch pass to idle (no enabled repos)
     # so the reaction-poll assertions stay about the reaction poll.
@@ -45,19 +47,23 @@ def _wire(monkeypatch, *, installs, records_for, retry, poll):
     # scope (not lazily inside a function like the passes above), so
     # patching adapters.install_store here would not reach it.
     monkeypatch.setattr(
-        "check_run_reconciler.list_check_run_reconcile_repos", lambda iid: [],
+        "check_run_reconciler.list_check_run_reconcile_repos",
+        lambda iid: [],
     )
     # #460: default the enforcement re-emission pass to idle (GitHub
     # reports no repos) so the reaction-poll assertions stay about the
     # reaction poll. NOTE the pass still acquires one token per install
     # (the repo listing itself is a GitHub call).
     monkeypatch.setattr(
-        "github_rulesets_client.list_installation_repos", lambda token: [],
+        "github_rulesets_client.list_installation_repos",
+        lambda token: [],
     )
     # grug#842: default the install-reconciliation pass to idle (no gap
     # found) so the reaction-poll assertions stay about the reaction poll.
     monkeypatch.setattr(
-        poller_handler, "_install_reconciliation_pass", lambda: (0, 0, 0),
+        poller_handler,
+        "_install_reconciliation_pass",
+        lambda: (0, 0, 0),
     )
 
 
@@ -68,8 +74,9 @@ def test_poller_polls_each_allowlisted_install(monkeypatch):
 
     def _poll(records, *, install_id, fetch_token):
         polled.append(install_id)
-        assert fetch_token() == "tok"   # thunk yields the retry's token
+        assert fetch_token() == "tok"  # thunk yields the retry's token
         return 2
+
     _wire(
         monkeypatch,
         installs=[11, 22],
@@ -79,7 +86,29 @@ def test_poller_polls_each_allowlisted_install(monkeypatch):
     )
     out = poller_handler.handler({}, None)
     assert polled == [11, 22]
-    assert out == {"installs": 2, "records": 2, "submitted": 4, "failed_installs": 0, "pulse_nudges": 0, "pulse_failed_installs": 0, "dep_watch_reports": 0, "dep_watch_failed_installs": 0, "reopen_watch_escalated": 0, "reopen_watch_failed_installs": 0, "hygiene_watch_reports": 0, "hygiene_watch_failed_installs": 0, "check_run_reconciled": 0, "check_run_reconcile_failed_installs": 0, "install_reconciliation_repaired": 0, "install_reconciliation_stale": 0, "install_reconciliation_failed": 0, "enforcement_emitted": 0, "enforcement_failed_installs": 0}
+    assert out == {
+        "installs": 2,
+        "records": 2,
+        "submitted": 4,
+        "failed_installs": 0,
+        "pulse_nudges": 0,
+        "pulse_failed_installs": 0,
+        "comment_nudges": 0,
+        "comment_nudge_failed_installs": 0,
+        "dep_watch_reports": 0,
+        "dep_watch_failed_installs": 0,
+        "reopen_watch_escalated": 0,
+        "reopen_watch_failed_installs": 0,
+        "hygiene_watch_reports": 0,
+        "hygiene_watch_failed_installs": 0,
+        "check_run_reconciled": 0,
+        "check_run_reconcile_failed_installs": 0,
+        "install_reconciliation_repaired": 0,
+        "install_reconciliation_stale": 0,
+        "install_reconciliation_failed": 0,
+        "enforcement_emitted": 0,
+        "enforcement_failed_installs": 0,
+    }
 
 
 def test_poller_one_install_failure_does_not_abort_cycle(monkeypatch, caplog):
@@ -93,6 +122,7 @@ def test_poller_one_install_failure_does_not_abort_cycle(monkeypatch, caplog):
         if iid == 1:
             raise RuntimeError("install 1 token fetch failed")
         return fn("tok")
+
     _wire(
         monkeypatch,
         installs=[1, 2],
@@ -104,8 +134,8 @@ def test_poller_one_install_failure_does_not_abort_cycle(monkeypatch, caplog):
         out = poller_handler.handler({}, None)
     assert out["installs"] == 2
     assert out["failed_installs"] == 1
-    assert out["submitted"] == 3   # install 2 still polled despite install 1 failing
-    assert out["records"] == 2     # both installs' records counted as attempted
+    assert out["submitted"] == 3  # install 2 still polled despite install 1 failing
+    assert out["records"] == 2  # both installs' records counted as attempted
     # partial failure → cycle-complete at INFO, NOT the all-failed error.
     cycle = [r for r in caplog.records if r.msg == "reaction_poll_cycle_complete"]
     assert cycle and cycle[0].levelno == _logging.INFO
@@ -116,10 +146,12 @@ def test_poller_records_listing_failure_is_best_effort(monkeypatch):
     """A CommentRecord LISTING failure (DDB error) for one install must be
     caught too — it's inside the per-install try — so the cron counts it
     failed and continues to the next install (codex BLOCK regression)."""
+
     def _records(iid):
         if iid == 1:
             raise RuntimeError("DDB list failure")
         return [{"comment_id": iid}]
+
     _wire(
         monkeypatch,
         installs=[1, 2],
@@ -129,8 +161,8 @@ def test_poller_records_listing_failure_is_best_effort(monkeypatch):
     )
     out = poller_handler.handler({}, None)
     assert out["installs"] == 2
-    assert out["failed_installs"] == 1   # install 1 listing failed
-    assert out["submitted"] == 5         # install 2 still polled
+    assert out["failed_installs"] == 1  # install 1 listing failed
+    assert out["submitted"] == 5  # install 2 still polled
 
 
 def test_poller_skips_installs_with_no_records(monkeypatch):
@@ -141,6 +173,8 @@ def test_poller_skips_installs_with_no_records(monkeypatch):
     the denominator - so exactly one retry call remains."""
     touched = []
     monkeypatch.setattr(poller_handler, "list_pulse_enabled_repos", lambda iid: [])
+    # #656: same, for the comment-nudge pass.
+    monkeypatch.setattr(poller_handler, "list_comment_nudge_repos", lambda iid: [])
     monkeypatch.setattr(poller_handler, "list_dep_watch_repos", lambda iid: [])
     _wire(
         monkeypatch,
@@ -150,8 +184,30 @@ def test_poller_skips_installs_with_no_records(monkeypatch):
         poll=lambda *a, **k: 0,
     )
     out = poller_handler.handler({}, None)
-    assert touched == [7]   # the enforcement pass's single token acquisition
-    assert out == {"installs": 1, "records": 0, "submitted": 0, "failed_installs": 0, "pulse_nudges": 0, "pulse_failed_installs": 0, "dep_watch_reports": 0, "dep_watch_failed_installs": 0, "reopen_watch_escalated": 0, "reopen_watch_failed_installs": 0, "hygiene_watch_reports": 0, "hygiene_watch_failed_installs": 0, "check_run_reconciled": 0, "check_run_reconcile_failed_installs": 0, "install_reconciliation_repaired": 0, "install_reconciliation_stale": 0, "install_reconciliation_failed": 0, "enforcement_emitted": 0, "enforcement_failed_installs": 0}
+    assert touched == [7]  # the enforcement pass's single token acquisition
+    assert out == {
+        "installs": 1,
+        "records": 0,
+        "submitted": 0,
+        "failed_installs": 0,
+        "pulse_nudges": 0,
+        "pulse_failed_installs": 0,
+        "comment_nudges": 0,
+        "comment_nudge_failed_installs": 0,
+        "dep_watch_reports": 0,
+        "dep_watch_failed_installs": 0,
+        "reopen_watch_escalated": 0,
+        "reopen_watch_failed_installs": 0,
+        "hygiene_watch_reports": 0,
+        "hygiene_watch_failed_installs": 0,
+        "check_run_reconciled": 0,
+        "check_run_reconcile_failed_installs": 0,
+        "install_reconciliation_repaired": 0,
+        "install_reconciliation_stale": 0,
+        "install_reconciliation_failed": 0,
+        "enforcement_emitted": 0,
+        "enforcement_failed_installs": 0,
+    }
 
 
 # --- grug#767: per-pass isolation --------------------------------------------
@@ -163,19 +219,24 @@ def test_poller_skips_installs_with_no_records(monkeypatch):
 # in one pass cannot be confused with a failure in another, and confirms
 # install 2 still runs despite install 1's runner blowing up.
 
+
 def _idle_wire(monkeypatch, *, installs):
     """Base wiring with every store-driven pass idle - callers then
     override exactly the one pass under test."""
     _wire(
-        monkeypatch, installs=installs, records_for=lambda iid: [],
-        retry=lambda iid, fn: fn("tok"), poll=lambda *a, **k: 0,
+        monkeypatch,
+        installs=installs,
+        records_for=lambda iid: [],
+        retry=lambda iid, fn: fn("tok"),
+        poll=lambda *a, **k: 0,
     )
 
 
 def test_pulse_pass_one_install_failure_does_not_abort_the_others(monkeypatch):
     _idle_wire(monkeypatch, installs=[1, 2])
     monkeypatch.setattr(
-        poller_handler, "list_pulse_enabled_repos",
+        poller_handler,
+        "list_pulse_enabled_repos",
         lambda iid: [{"id": iid, "full_name": f"o/r{iid}"}],
     )
 
@@ -183,11 +244,12 @@ def test_pulse_pass_one_install_failure_does_not_abort_the_others(monkeypatch):
         if install_id == 1:
             raise RuntimeError("pulse boom")
         return 3, 0
+
     monkeypatch.setattr(poller_handler, "_pulse_runner", _runner)
 
     out = poller_handler.handler({}, None)
-    assert out["pulse_nudges"] == 3            # install 2 still ran
-    assert out["pulse_failed_installs"] == 1   # install 1 counted, not silently dropped
+    assert out["pulse_nudges"] == 3  # install 2 still ran
+    assert out["pulse_failed_installs"] == 1  # install 1 counted, not silently dropped
     # unaffected: no cross-talk into the other passes' counters
     assert out["dep_watch_failed_installs"] == 0
     assert out["reopen_watch_failed_installs"] == 0
@@ -197,7 +259,8 @@ def test_pulse_pass_one_install_failure_does_not_abort_the_others(monkeypatch):
 def test_dep_watch_pass_one_install_failure_does_not_abort_the_others(monkeypatch):
     _idle_wire(monkeypatch, installs=[1, 2])
     monkeypatch.setattr(
-        poller_handler, "list_dep_watch_repos",
+        poller_handler,
+        "list_dep_watch_repos",
         lambda iid: [{"id": iid, "full_name": f"o/r{iid}"}],
     )
 
@@ -205,6 +268,7 @@ def test_dep_watch_pass_one_install_failure_does_not_abort_the_others(monkeypatc
         if install_id == 1:
             raise RuntimeError("dep_watch boom")
         return 2, 0
+
     monkeypatch.setattr(poller_handler, "_dep_watch_runner", _runner)
 
     out = poller_handler.handler({}, None)
@@ -218,7 +282,8 @@ def test_dep_watch_pass_one_install_failure_does_not_abort_the_others(monkeypatc
 def test_reopen_watch_pass_one_install_failure_does_not_abort_the_others(monkeypatch):
     _idle_wire(monkeypatch, installs=[1, 2])
     monkeypatch.setattr(
-        poller_handler, "list_reopen_watch_repos",
+        poller_handler,
+        "list_reopen_watch_repos",
         lambda iid: [{"id": iid, "full_name": f"o/r{iid}"}],
     )
 
@@ -226,6 +291,7 @@ def test_reopen_watch_pass_one_install_failure_does_not_abort_the_others(monkeyp
         if install_id == 1:
             raise RuntimeError("reopen_watch boom")
         return 4, 0
+
     monkeypatch.setattr(poller_handler, "_reopen_watch_runner", _runner)
 
     out = poller_handler.handler({}, None)
@@ -239,7 +305,8 @@ def test_reopen_watch_pass_one_install_failure_does_not_abort_the_others(monkeyp
 def test_hygiene_watch_pass_one_install_failure_does_not_abort_the_others(monkeypatch):
     _idle_wire(monkeypatch, installs=[1, 2])
     monkeypatch.setattr(
-        poller_handler, "list_hygiene_watch_repos",
+        poller_handler,
+        "list_hygiene_watch_repos",
         lambda iid: [{"id": iid, "full_name": f"o/r{iid}"}],
     )
 
@@ -247,6 +314,7 @@ def test_hygiene_watch_pass_one_install_failure_does_not_abort_the_others(monkey
         if install_id == 1:
             raise RuntimeError("hygiene_watch boom")
         return 1, 0
+
     monkeypatch.setattr(poller_handler, "_hygiene_watch_runner", _runner)
 
     out = poller_handler.handler({}, None)
@@ -260,7 +328,9 @@ def test_hygiene_watch_pass_one_install_failure_does_not_abort_the_others(monkey
 def test_run_repo_scoped_pass_skips_installs_the_lister_has_nothing_for(monkeypatch):
     """The shared helper itself, isolated from any real pass: an install
     with no opted-in repos costs no runner call at all."""
-    monkeypatch.setattr(poller_handler, "with_install_token_retry", lambda iid, fn: fn("tok"))
+    monkeypatch.setattr(
+        poller_handler, "with_install_token_retry", lambda iid, fn: fn("tok")
+    )
     calls = []
 
     def runner(token, install_id, repos):
@@ -315,7 +385,8 @@ def test_handler_merges_replay_counts(monkeypatch):
         poll=lambda *a, **k: 0,
     )
     monkeypatch.setattr(
-        poller_handler, "_replay_missed_deliveries",
+        poller_handler,
+        "_replay_missed_deliveries",
         lambda: {"replay_scanned": 9, "replay_redelivered": 3, "replay_errors": 0},
     )
     out = poller_handler.handler({}, None)
@@ -355,6 +426,7 @@ def test_poller_all_installs_fail_logs_error(monkeypatch, caplog):
 
     def _retry(iid, fn):
         raise RuntimeError("systemic token failure")
+
     _wire(
         monkeypatch,
         installs=[1, 2],
@@ -364,12 +436,36 @@ def test_poller_all_installs_fail_logs_error(monkeypatch, caplog):
     )
     with caplog.at_level(_logging.WARNING):
         out = poller_handler.handler({}, None)
-    assert out == {"installs": 2, "records": 2, "submitted": 0, "failed_installs": 2, "pulse_nudges": 0, "pulse_failed_installs": 0, "dep_watch_reports": 0, "dep_watch_failed_installs": 0, "reopen_watch_escalated": 0, "reopen_watch_failed_installs": 0, "hygiene_watch_reports": 0, "hygiene_watch_failed_installs": 0, "check_run_reconciled": 0, "check_run_reconcile_failed_installs": 0, "install_reconciliation_repaired": 0, "install_reconciliation_stale": 0, "install_reconciliation_failed": 0, "enforcement_emitted": 0, "enforcement_failed_installs": 2}
+    assert out == {
+        "installs": 2,
+        "records": 2,
+        "submitted": 0,
+        "failed_installs": 2,
+        "pulse_nudges": 0,
+        "pulse_failed_installs": 0,
+        "comment_nudges": 0,
+        "comment_nudge_failed_installs": 0,
+        "dep_watch_reports": 0,
+        "dep_watch_failed_installs": 0,
+        "reopen_watch_escalated": 0,
+        "reopen_watch_failed_installs": 0,
+        "hygiene_watch_reports": 0,
+        "hygiene_watch_failed_installs": 0,
+        "check_run_reconciled": 0,
+        "check_run_reconcile_failed_installs": 0,
+        "install_reconciliation_repaired": 0,
+        "install_reconciliation_stale": 0,
+        "install_reconciliation_failed": 0,
+        "enforcement_emitted": 0,
+        "enforcement_failed_installs": 2,
+    }
     errs = [r for r in caplog.records if r.msg == "reaction_poll_all_installs_failed"]
     assert errs and errs[0].levelno == _logging.ERROR
     # a partial failure (not ALL) must NOT escalate to error
-    assert not any(r.msg == "reaction_poll_cycle_complete" and r.levelno >= _logging.ERROR
-                   for r in caplog.records)
+    assert not any(
+        r.msg == "reaction_poll_cycle_complete" and r.levelno >= _logging.ERROR
+        for r in caplog.records
+    )
 
 
 def test_poller_no_installs_is_a_clean_noop(monkeypatch):
@@ -381,7 +477,29 @@ def test_poller_no_installs_is_a_clean_noop(monkeypatch):
         poll=lambda *a, **k: 1,
     )
     out = poller_handler.handler({}, None)
-    assert out == {"installs": 0, "records": 0, "submitted": 0, "failed_installs": 0, "pulse_nudges": 0, "pulse_failed_installs": 0, "dep_watch_reports": 0, "dep_watch_failed_installs": 0, "reopen_watch_escalated": 0, "reopen_watch_failed_installs": 0, "hygiene_watch_reports": 0, "hygiene_watch_failed_installs": 0, "check_run_reconciled": 0, "check_run_reconcile_failed_installs": 0, "install_reconciliation_repaired": 0, "install_reconciliation_stale": 0, "install_reconciliation_failed": 0, "enforcement_emitted": 0, "enforcement_failed_installs": 0}
+    assert out == {
+        "installs": 0,
+        "records": 0,
+        "submitted": 0,
+        "failed_installs": 0,
+        "pulse_nudges": 0,
+        "pulse_failed_installs": 0,
+        "comment_nudges": 0,
+        "comment_nudge_failed_installs": 0,
+        "dep_watch_reports": 0,
+        "dep_watch_failed_installs": 0,
+        "reopen_watch_escalated": 0,
+        "reopen_watch_failed_installs": 0,
+        "hygiene_watch_reports": 0,
+        "hygiene_watch_failed_installs": 0,
+        "check_run_reconciled": 0,
+        "check_run_reconcile_failed_installs": 0,
+        "install_reconciliation_repaired": 0,
+        "install_reconciliation_stale": 0,
+        "install_reconciliation_failed": 0,
+        "enforcement_emitted": 0,
+        "enforcement_failed_installs": 0,
+    }
 
 
 # --- grug#842: install reconciliation pass -----------------------------------
@@ -405,14 +523,19 @@ def test_install_reconciliation_repairs_missing_from_store(monkeypatch):
         lambda **kw: repaired.append(kw),
     )
     monkeypatch.setattr(
-        "observability.emit_gauge", lambda metric, value, tags=None: gauges.append((metric, value)),
+        "observability.emit_gauge",
+        lambda metric, value, tags=None: gauges.append((metric, value)),
     )
     out = poller_handler._install_reconciliation_pass()
     assert out == (1, 0, 0)  # repaired=1, stale=0, failed=0
-    assert repaired == [{
-        "install_id": 2, "account_login": "solo-dev",
-        "account_type": "User", "installed_by_user_id": 2002,
-    }]
+    assert repaired == [
+        {
+            "install_id": 2,
+            "account_login": "solo-dev",
+            "account_type": "User",
+            "installed_by_user_id": 2002,
+        }
+    ]
     assert ("grug.install_reconciliation.missing_from_store", 1.0) in gauges
     assert ("grug.install_reconciliation.stale_store_rows", 0.0) in gauges
 
@@ -423,16 +546,19 @@ def test_install_reconciliation_flags_stale_row_without_deleting(monkeypatch):
     repaired = []
     monkeypatch.setattr(
         "github_app_auth.list_app_installations",
-        lambda: [{"id": 1, "account": {"id": 1001, "login": "acme", "type": "Organization"}}],
+        lambda: [
+            {"id": 1, "account": {"id": 1001, "login": "acme", "type": "Organization"}}
+        ],
     )
     monkeypatch.setattr("adapters.install_store.list_all_install_ids", lambda: [1, 2])
     monkeypatch.setattr(
-        "adapters.install_store.record_installation", lambda **kw: repaired.append(kw),
+        "adapters.install_store.record_installation",
+        lambda **kw: repaired.append(kw),
     )
     monkeypatch.setattr("observability.emit_gauge", lambda *a, **k: None)
     out = poller_handler._install_reconciliation_pass()
     assert out == (0, 1, 0)  # repaired=0, stale=1, failed=0
-    assert repaired == []    # no repair action for a stale row
+    assert repaired == []  # no repair action for a stale row
 
 
 def test_install_reconciliation_stays_quiet_once_repaired(monkeypatch):
@@ -448,7 +574,8 @@ def test_install_reconciliation_stays_quiet_once_repaired(monkeypatch):
     )
     monkeypatch.setattr("adapters.install_store.list_all_install_ids", lambda: [1, 2])
     monkeypatch.setattr(
-        "adapters.install_store.record_installation", lambda **kw: repaired.append(kw),
+        "adapters.install_store.record_installation",
+        lambda **kw: repaired.append(kw),
     )
     monkeypatch.setattr("observability.emit_gauge", lambda *a, **k: None)
     assert poller_handler._install_reconciliation_pass() == (0, 0, 0)
@@ -477,7 +604,9 @@ def test_handler_surfaces_install_reconciliation_counts(monkeypatch):
         poll=lambda *a, **k: 0,
     )
     monkeypatch.setattr(
-        poller_handler, "_install_reconciliation_pass", lambda: (1, 2, 0),
+        poller_handler,
+        "_install_reconciliation_pass",
+        lambda: (1, 2, 0),
     )
     out = poller_handler.handler({}, None)
     assert out["install_reconciliation_repaired"] == 1
@@ -488,7 +617,9 @@ def test_handler_surfaces_install_reconciliation_counts(monkeypatch):
 # --- #460: enforcement-gauge re-emission pass --------------------------------
 
 
-def _wire_enforcement(monkeypatch, *, installs, gh_repos, detect, config=None, stored_ids=None):
+def _wire_enforcement(
+    monkeypatch, *, installs, gh_repos, detect, config=None, stored_ids=None
+):
     """Wire an idle reactions/pulse/dep-watch cycle with a live enforcement
     pass. `gh_repos` is what GitHub's /installation/repositories returns;
     `config` maps (install_id, repo_id) -> repo-config dict (default {} =
@@ -507,7 +638,8 @@ def _wire_enforcement(monkeypatch, *, installs, gh_repos, detect, config=None, s
         poll=lambda *a, **k: 0,
     )
     monkeypatch.setattr(
-        "github_rulesets_client.list_installation_repos", lambda token: gh_repos,
+        "github_rulesets_client.list_installation_repos",
+        lambda token: gh_repos,
     )
 
     def _get_repo_config(iid, rid):
@@ -546,6 +678,7 @@ def test_enforcement_pass_emits_live_state_per_github_repo(monkeypatch):
     out = poller_handler.handler({}, None)
     assert emitted == [("o/a", "grug_managed"), ("o/b", "none")]
     from enforcement import GRUG_DOR_CHECK_NAME
+
     assert detected == [
         ("o", "a", "trunk", GRUG_DOR_CHECK_NAME),
         ("o", "b", "main", GRUG_DOR_CHECK_NAME),
@@ -654,7 +787,9 @@ def test_enforcement_pass_treats_force_disable_as_an_opt_out(monkeypatch):
     assert out["enforcement_emitted"] == 1
 
 
-def test_enforcement_pass_one_repo_failure_does_not_starve_the_rest(monkeypatch, caplog):
+def test_enforcement_pass_one_repo_failure_does_not_starve_the_rest(
+    monkeypatch, caplog
+):
     """Per-REPO best-effort: one repo's GitHub error is logged, emits an
     explicit "error" gauge state (#518: a detection failure must never be a
     silent gap mistakable for real "none" rows), and the install's remaining
@@ -738,6 +873,7 @@ def test_enforcement_pass_one_install_failure_does_not_abort_cycle(monkeypatch, 
             _list.calls += 1
             raise RuntimeError("GitHub listing down")
         return [{"id": 5, "full_name": "o/ok", "default_branch": "main"}]
+
     _list.calls = 0
 
     _wire_enforcement(
@@ -905,7 +1041,11 @@ def test_identity_proof_rejects_malformed_expected_arn(monkeypatch):
     monkeypatch.delenv("AWS_SECRET_ACCESS_KEY", raising=False)
     import boto3
 
-    monkeypatch.setattr(boto3, "client", lambda s: type("S", (), {"get_caller_identity": lambda self: {"Arn": "x"}})())
+    monkeypatch.setattr(
+        boto3,
+        "client",
+        lambda s: type("S", (), {"get_caller_identity": lambda self: {"Arn": "x"}})(),
+    )
     import pytest as _pytest
 
     import poller_handler as ph
@@ -926,7 +1066,10 @@ def test_identity_proof_asserts_the_expected_role(monkeypatch):
 
     class _WrongSts:
         def get_caller_identity(self):
-            return {"Arn": "arn:aws:sts::999988887777:assumed-role/other-role/x", "Account": "999988887777"}
+            return {
+                "Arn": "arn:aws:sts::999988887777:assumed-role/other-role/x",
+                "Account": "999988887777",
+            }
 
     monkeypatch.setattr(boto3, "client", lambda service: _WrongSts())
     with pytest.raises(RuntimeError, match="wrong AWS identity"):
@@ -934,7 +1077,10 @@ def test_identity_proof_asserts_the_expected_role(monkeypatch):
 
     class _RightSts:
         def get_caller_identity(self):
-            return {"Arn": "arn:aws:sts::111122223333:assumed-role/ra-grug/session1", "Account": "111122223333"}
+            return {
+                "Arn": "arn:aws:sts::111122223333:assumed-role/ra-grug/session1",
+                "Account": "111122223333",
+            }
 
     monkeypatch.setattr(boto3, "client", lambda service: _RightSts())
     poller_handler._prove_roles_anywhere_identity()  # must not raise
