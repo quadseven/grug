@@ -8,7 +8,7 @@ rolls them into a `TpmEvaluation`. The GitHub check-run POST lives in
 `personas.publish_check` seam.
 
 A PR body carrying an agent-authored marker (a `claude.ai/code/session_`
-link, the repo template's `Generated with [Claude Code]` footer, or
+link, Claude Code's `Generated with [Claude Code]` attribution footer, or
 `<!-- grug:agent-authored -->`) skips the Hunt Plan and concludes NEUTRAL —
 the format gate applies to PRs written by people; Elder + Guard still review
 the code.
