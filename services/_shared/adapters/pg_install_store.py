@@ -195,17 +195,21 @@ def list_allowlisted_installs() -> list[int]:
 # Repo-level flags that are NOT persona enable/blocking pairs (those live
 # in _DEFAULT_PERSONA_CONFIG, locked to the registry). Writable through
 # set_repo_config; read with an explicit default in get_repo_config.
-_EXTRA_REPO_FLAGS = frozenset({
-    "dep_watch_enabled", "reopen_watch_enabled", "guard_hygiene_watch_enabled",
-    # Chief's ISSUE-time DoR advisory. Its OWN flag, not `tpm_enabled`:
-    # turning Chief on for pull requests must not silently start
-    # commenting on every issue in the repo. Default OFF.
-    "issue_dor_enabled",
-    # grug#947: opt-in for the check-run sweep/reconcile periodic pass -
-    # same store-driven targeting as dep_watch/pulse, not a blanket
-    # every-repo scan. Default OFF.
-    "check_run_reconcile_enabled",
-})
+_EXTRA_REPO_FLAGS = frozenset(
+    {
+        "dep_watch_enabled",
+        "reopen_watch_enabled",
+        "guard_hygiene_watch_enabled",
+        # Chief's ISSUE-time DoR advisory. Its OWN flag, not `tpm_enabled`:
+        # turning Chief on for pull requests must not silently start
+        # commenting on every issue in the repo. Default OFF.
+        "issue_dor_enabled",
+        # grug#947: opt-in for the check-run sweep/reconcile periodic pass -
+        # same store-driven targeting as dep_watch/pulse, not a blanket
+        # every-repo scan. Default OFF.
+        "check_run_reconcile_enabled",
+    }
+)
 
 # Repo-level flags whose value is a STRING, not a bool (the persona flags and
 # _EXTRA_REPO_FLAGS are all bool). elder_voice (#288/#578) is "caveman" | "sage".
@@ -267,7 +271,9 @@ def get_repo_config(install_id: int, repo_id: int) -> dict[str, Any]:
         for flag, default in _DEFAULT_PERSONA_CONFIG.items()
     }
     cfg["enforcement_ruleset_id"] = int(rid) if rid is not None else None
-    cfg["force_disable_enforcement"] = bool(item.get("force_disable_enforcement", False))
+    cfg["force_disable_enforcement"] = bool(
+        item.get("force_disable_enforcement", False)
+    )
     # Derived from _EXTRA_REPO_FLAGS rather than one hand-written line per
     # flag (#655). The old form needed an edit in TWO places to add a flag,
     # and nothing enforced the pair - a flag added to _EXTRA_REPO_FLAGS but
@@ -393,10 +399,12 @@ def set_repo_config(
     # (_LIST_REPO_FLAGS, e.g. guard_hygiene_dead_ref_patterns) are exempt
     # here and validated by their own per-kind helper below.
     non_bool = {
-        flag: value for flag, value in persona_flags.items()
+        flag: value
+        for flag, value in persona_flags.items()
         if flag not in _STR_REPO_FLAGS
         and flag not in _LIST_REPO_FLAGS
-        and value is not None and not isinstance(value, bool)
+        and value is not None
+        and not isinstance(value, bool)
     }
     if non_bool:
         raise TypeError(
@@ -406,9 +414,7 @@ def set_repo_config(
     _validate_list_repo_flags(persona_flags)
     now = datetime.now(timezone.utc).isoformat()
     updated_fields: dict[str, Any] = {
-        flag: value
-        for flag, value in persona_flags.items()
-        if value is not None
+        flag: value for flag, value in persona_flags.items() if value is not None
     }
     attrs: dict[str, Any] = {
         "repo_full_name": repo_full_name,
@@ -503,9 +509,7 @@ def put_comment_record(
     author_login: str = "",
     trust_reactors: bool = True,
 ) -> None:
-    ttl = int(
-        datetime.now(timezone.utc).timestamp() + _COMMENT_RECORD_TTL_DAYS * 86400
-    )
+    ttl = int(datetime.now(timezone.utc).timestamp() + _COMMENT_RECORD_TTL_DAYS * 86400)
     attrs = {
         "comment_id": int(comment_id),
         "repo": repo,
@@ -579,9 +583,7 @@ def put_check_verdict(
     """Upsert a Check verdict; the denormalized `verdict` badge is DERIVED
     via review_types.verdict (never a parameter) - ADR-0003 invariant
     enforced by construction, identical to the DDB adapter."""
-    ttl = int(
-        datetime.now(timezone.utc).timestamp() + _CHECK_VERDICT_TTL_DAYS * 86400
-    )
+    ttl = int(datetime.now(timezone.utc).timestamp() + _CHECK_VERDICT_TTL_DAYS * 86400)
     attrs: dict[str, Any] = {
         "persona": persona,
         "repo": repo,
@@ -619,7 +621,9 @@ def put_check_verdict(
 
 
 def get_check_verdict(
-    install_id: int, head_sha: str, persona: str,
+    install_id: int,
+    head_sha: str,
+    persona: str,
 ) -> Optional[CheckVerdictRecord]:
     """One persona's stored Check verdict for one commit, or None if that
     persona never posted a verdict for this head_sha (or it has expired
@@ -691,9 +695,7 @@ def put_elder_last_reviewed(
     """Record the head Elder just finished reviewing for this PR."""
     if not head_sha:
         return
-    ttl = int(
-        datetime.now(timezone.utc).timestamp() + _ELDER_LAST_TTL_DAYS * 86400
-    )
+    ttl = int(datetime.now(timezone.utc).timestamp() + _ELDER_LAST_TTL_DAYS * 86400)
     attrs = {
         "repo": repo,
         "pr_number": int(pr_number),
@@ -737,6 +739,7 @@ def get_elder_last_reviewed(
 # pattern is the SAME grug_kv prefix-scan the activity feed uses; the sk
 # encodes (class, pr, reviewer, seq) so a class prefix query is natural.
 
+
 def _ledger_pk(repo: str) -> str:
     return f"LEDGER#{repo}"
 
@@ -761,10 +764,14 @@ def _ledger_digest(row: dict[str, Any]) -> str:
     """Stable 12-hex identity of a finding from its content (finding text +
     timestamp + evidence) - independent of ingest order."""
     import hashlib
-    material = "\x1f".join((
-        str(row.get("finding", "")), str(row.get("ts", "")),
-        str(row.get("evidence", "")),
-    ))
+
+    material = "\x1f".join(
+        (
+            str(row.get("finding", "")),
+            str(row.get("ts", "")),
+            str(row.get("evidence", "")),
+        )
+    )
     return hashlib.sha256(material.encode("utf-8")).hexdigest()[:12]
 
 
@@ -895,6 +902,7 @@ def _learning_digest(text: str) -> str:
     """Stable 12-hex identity of a learning from its rule text, so the same
     preference taught twice heals in place instead of duplicating."""
     import hashlib
+
     return hashlib.sha256(text.strip().encode("utf-8")).hexdigest()[:12]
 
 
@@ -970,18 +978,20 @@ def put_learning(
                 "pk": _learning_pk(repo),
                 "sk": _learning_sk(_learning_digest(rule)),
                 "ttl": ttl,
-                "data": encode_attrs({
-                    "text": rule,
-                    "repo": repo,
-                    "scope_path": scope_path,
-                    "source_pr": int(source_pr),
-                    "source_comment_id": int(source_comment_id),
-                    "author": author,
-                    "created_at": now,
-                    "reinforced_at": now,
-                    "usage_count": 0,
-                    "last_used_at": "",
-                }),
+                "data": encode_attrs(
+                    {
+                        "text": rule,
+                        "repo": repo,
+                        "scope_path": scope_path,
+                        "source_pr": int(source_pr),
+                        "source_comment_id": int(source_comment_id),
+                        "author": author,
+                        "created_at": now,
+                        "reinforced_at": now,
+                        "usage_count": 0,
+                        "last_used_at": "",
+                    }
+                ),
             },
         )
 
@@ -1007,7 +1017,8 @@ def list_learnings(repo: str, limit: int | None = None) -> list[Learning]:
 
 
 def get_learning_by_source_comment(
-    repo: str, source_comment_id: int,
+    repo: str,
+    source_comment_id: int,
 ) -> Optional[Learning]:
     """The learning taught by a specific reply comment, or None. Lets an SQS
     redelivery detect that this reply was already classified-and-stored, so
@@ -1022,7 +1033,8 @@ def get_learning_by_source_comment(
 
 
 def get_comment_record(
-    install_id: int, comment_id: int | str,
+    install_id: int,
+    comment_id: int | str,
 ) -> Optional[CommentRecord]:
     """The stored CommentRecord for one of grug's own finding comments, or
     None. Used to join a maintainer's inline REPLY (via in_reply_to_id) back
@@ -1054,9 +1066,7 @@ def claim_delivery(delivery_id: str) -> bool:
     if not delivery_id:
         return True
     pg_base.maybe_purge_expired()
-    ttl = int(
-        datetime.now(timezone.utc).timestamp() + _DELIVERY_CLAIM_TTL_HOURS * 3600
-    )
+    ttl = int(datetime.now(timezone.utc).timestamp() + _DELIVERY_CLAIM_TTL_HOURS * 3600)
     with get_pool().connection() as conn:
         row = conn.execute(
             """
@@ -1087,9 +1097,7 @@ def claim_dep_watch_report(install_id: int, repo: str) -> bool:
     """Win-once weekly claim for a Guard dependency quarantine report
     (#491) - same shape as claim_pulse_nudge."""
     pg_base.maybe_purge_expired()
-    ttl = int(
-        datetime.now(timezone.utc).timestamp() + _DEP_WATCH_TTL_DAYS * 86400
-    )
+    ttl = int(datetime.now(timezone.utc).timestamp() + _DEP_WATCH_TTL_DAYS * 86400)
     with get_pool().connection() as conn:
         row = conn.execute(
             """
@@ -1181,9 +1189,7 @@ def claim_hygiene_watch_report(install_id: int, repo: str) -> bool:
     same shape as claim_dep_watch_report. A separate `sk` namespace so the
     two weekly reports never contend for one claim."""
     pg_base.maybe_purge_expired()
-    ttl = int(
-        datetime.now(timezone.utc).timestamp() + _HYGIENE_WATCH_TTL_DAYS * 86400
-    )
+    ttl = int(datetime.now(timezone.utc).timestamp() + _HYGIENE_WATCH_TTL_DAYS * 86400)
     with get_pool().connection() as conn:
         row = conn.execute(
             """
@@ -1221,9 +1227,7 @@ def claim_pulse_nudge(install_id: int, repo: str, pr_number: int) -> bool:
     concurrent poller run won). Same atomic upsert-if-expired shape as
     claim_delivery. Best-effort caller: any DB error propagates."""
     pg_base.maybe_purge_expired()
-    ttl = int(
-        datetime.now(timezone.utc).timestamp() + _PULSE_NUDGE_TTL_DAYS * 86400
-    )
+    ttl = int(datetime.now(timezone.utc).timestamp() + _PULSE_NUDGE_TTL_DAYS * 86400)
     with get_pool().connection() as conn:
         row = conn.execute(
             """
@@ -1279,10 +1283,11 @@ def list_comment_nudge_repos(install_id: int) -> list[dict[str, Any]]:
     never be starved by a discovery-page prefix. Returns [{"id", "full_name"}]."""
     with get_pool().connection() as conn:
         rows = conn.execute(
-            f"""  # noqa: S608 - only TTL_LIVE (a constant) is interpolated; install_id is a bound param
+            """
             SELECT sk, data FROM grug_kv
             WHERE pk = %s AND sk LIKE 'REPO#%%'
-              AND data->>'pulse_comment_nudge_enabled' = 'true' AND {TTL_LIVE}
+              AND data->>'pulse_comment_nudge_enabled' = 'true'
+              AND (ttl IS NULL OR ttl > EXTRACT(EPOCH FROM now()))
             """,
             (_inst_pk(install_id),),
         ).fetchall()
@@ -1348,9 +1353,7 @@ def claim_review(
     if not head_sha:
         return True
     pg_base.maybe_purge_expired()
-    ttl = int(
-        datetime.now(timezone.utc).timestamp() + _REVIEW_CLAIM_TTL_DAYS * 86400
-    )
+    ttl = int(datetime.now(timezone.utc).timestamp() + _REVIEW_CLAIM_TTL_DAYS * 86400)
     with get_pool().connection() as conn:
         row = conn.execute(
             """
@@ -1461,9 +1464,7 @@ def complete_review_claim(
         return True
     if not owner_token:
         raise ValueError("owner_token must be non-empty")
-    ttl = int(
-        datetime.now(timezone.utc).timestamp() + _REVIEW_CLAIM_TTL_DAYS * 86400
-    )
+    ttl = int(datetime.now(timezone.utc).timestamp() + _REVIEW_CLAIM_TTL_DAYS * 86400)
     with get_pool().connection() as conn:
         row = conn.execute(
             """
@@ -1476,13 +1477,19 @@ def complete_review_claim(
             """,
             {
                 "pk": _review_pk(
-                    install_id, repo, pr_number, persona, head_sha,
+                    install_id,
+                    repo,
+                    pr_number,
+                    persona,
+                    head_sha,
                 ),
                 "owner": owner_token,
-                "data": Jsonb({
-                    "review_claim_state": "completed",
-                    "ttl": ttl,
-                }),
+                "data": Jsonb(
+                    {
+                        "review_claim_state": "completed",
+                        "ttl": ttl,
+                    }
+                ),
                 "ttl": ttl,
             },
         ).fetchone()
@@ -1524,7 +1531,11 @@ def renew_review_claim(
             """,
             {
                 "pk": _review_pk(
-                    install_id, repo, pr_number, persona, head_sha,
+                    install_id,
+                    repo,
+                    pr_number,
+                    persona,
+                    head_sha,
                 ),
                 "owner": owner_token,
                 "lease_data": Jsonb(lease_data),
@@ -1566,7 +1577,11 @@ def release_review_claim(
             """,
             {
                 "pk": _review_pk(
-                    install_id, repo, pr_number, persona, head_sha,
+                    install_id,
+                    repo,
+                    pr_number,
+                    persona,
+                    head_sha,
                 ),
                 "owner": owner_token,
             },
@@ -1613,7 +1628,9 @@ def list_comment_records(install_id: int) -> list[CommentRecord]:
 
 
 def list_comment_records_for_pr(
-    install_id: int, repo: str, pr_number: int,
+    install_id: int,
+    repo: str,
+    pr_number: int,
 ) -> list[CommentRecord]:
     """CommentRecords for one PR (Sentinel's per-finding-resolution check,
     grug#743 audit) - same key shape as list_comment_records, filtered by
