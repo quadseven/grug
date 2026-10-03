@@ -230,6 +230,7 @@ _DEFAULT_PERSONA_CONFIG = {
     "warder_gate_blocking": False,  # grug#533: SLO/monitor deploy-gate, advisory by default
     "sentinel_enabled": True,  # safety net, not an opt-in tracer (grug#721)
     "pulse_enabled": False,
+    "pulse_comment_nudge_enabled": False,  # #656: suggested-fix replies on stale threads
     "smasher_enabled": False,  # execution tracer (#469): opt-in per repo
     "walkthrough_enabled": True,  # Teller PR-walkthrough comment (#554)
 }
@@ -1256,6 +1257,32 @@ def list_pulse_enabled_repos(install_id: int) -> list[dict[str, Any]]:
             SELECT sk, data FROM grug_kv
             WHERE pk = %s AND sk LIKE 'REPO#%%'
               AND data->>'pulse_enabled' = 'true' AND {TTL_LIVE}
+            """,
+            (_inst_pk(install_id),),
+        ).fetchall()
+    out: list[dict[str, Any]] = []
+    for sk, data in rows:
+        _, sep, id_str = sk.partition("#")
+        try:
+            rid = int(id_str)
+        except (TypeError, ValueError):
+            continue
+        full = (data or {}).get("repo_full_name", "")
+        if sep and full:
+            out.append({"id": rid, "full_name": full})
+    return out
+
+
+def list_comment_nudge_repos(install_id: int) -> list[dict[str, Any]]:
+    """Repo rows with pulse_comment_nudge_enabled=true (#656): mirrors
+    list_pulse_enabled_repos - store-driven targeting so an enabled repo can
+    never be starved by a discovery-page prefix. Returns [{"id", "full_name"}]."""
+    with get_pool().connection() as conn:
+        rows = conn.execute(
+            f"""
+            SELECT sk, data FROM grug_kv
+            WHERE pk = %s AND sk LIKE 'REPO#%%'
+              AND data->>'pulse_comment_nudge_enabled' = 'true' AND {TTL_LIVE}
             """,
             (_inst_pk(install_id),),
         ).fetchall()
