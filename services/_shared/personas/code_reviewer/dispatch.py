@@ -146,7 +146,7 @@ def _fetch_pr_diff(
     head_sha: str = "",
 ) -> str:
     """GET an immutable base/head diff, falling back when compare is unavailable."""
-    diff, _ = _fetch_pr_diff_with_scope(
+    diff, _, _ = _fetch_pr_diff_with_scope(
         install_token, owner, repo, pull_number,
         base_sha=base_sha, head_sha=head_sha,
     )
@@ -207,8 +207,14 @@ def _fetch_pr_diff_with_scope(
     *,
     base_sha: str = "",
     head_sha: str = "",
-) -> tuple[str, bool]:
-    """Return the diff and whether an immutable compare supplied it."""
+) -> tuple[str, bool, bool]:
+    """Return (diff, used_compare, baseline_rejected).
+
+    `used_compare` is whether an immutable compare supplied the diff.
+    `baseline_rejected` (#845) is True only when a baseline WAS supplied
+    but turned out not to be an ancestor of head (diverged/rewritten
+    history) - distinct from merely unavailable (404/422), so the caller
+    can report the rewrite instead of silently swallowing it."""
     repo_url = (
         f"https://api.github.com/repos/{quote(owner, safe='')}/"
         f"{quote(repo, safe='')}"
@@ -231,6 +237,7 @@ def _fetch_pr_diff_with_scope(
         timeout=_DIFF_FETCH_TIMEOUT,
     )
     used_compare = bool(base_sha and head_sha)
+    baseline_rejected = False
     if used_compare and resp.status_code in {404, 422}:
         # GitHub can reject compare requests for forked or recently rewritten
         # histories while the PR diff remains readable. Snapshot checks before
@@ -270,8 +277,9 @@ def _fetch_pr_diff_with_scope(
             timeout=_DIFF_FETCH_TIMEOUT,
         )
         used_compare = False
+        baseline_rejected = True
     resp.raise_for_status()
-    return resp.text, used_compare
+    return resp.text, used_compare, baseline_rejected
 
 
 def _fetch_current_review_snapshot(
@@ -855,6 +863,7 @@ def _summary_markdown(
     oversized_paths: tuple[str, ...] = (),
     duplicate_paths: tuple[tuple[str, str], ...] = (),
     living_range: str = "",
+    living_baseline_rejected: str = "",
     review_phase: Literal["tier1", "deep", "dual"] = "dual",
 ) -> tuple[str, str]:
     """Render a (title, summary) pair for the check-run output.
@@ -866,6 +875,10 @@ def _summary_markdown(
     finding is never a silent gap.
     `living_range` (#557) when set is the prior..head delta Elder reviewed
     (Living Hunt) instead of the full PR base..head.
+    `living_baseline_rejected` (#845) when set is the stored baseline SHA
+    that turned out not to be an ancestor of head (rewritten history) -
+    the delta was rejected and the full PR diff reviewed instead. Surfaced
+    as a summary note so the fallback is visible, not silent.
     `review_phase` (#646): tier1 = coder-only legend; deep = append legend;
     dual = both arms before publish (deep depth / rollback).
     """
@@ -882,6 +895,17 @@ def _summary_markdown(
         if living_range
         else ""
     )
+    if living_baseline_rejected:
+        # #845: the stored baseline was rejected as a non-ancestor - the
+        # range above is empty because no delta was reviewed, but the
+        # fallback must be visible in the check-run, not just the logs.
+        hunt += (
+            "\n\nLiving Hunt: the stored baseline `"
+            + living_baseline_rejected
+            + "` was not an ancestor of the current head (history was "
+            "rewritten) - Elder reviewed the full PR diff instead of the "
+            "delta since the last pass."
+        )
 
     def hunt_title(title: str) -> str:
         return f"Living Hunt {living_range} - {title}" if living_range else title
@@ -2179,6 +2203,10 @@ def dispatch_code_review(
     # full PR base..head. Best-effort: store blips fall back to full review.
     living_prior_sha = ""
     living_range = ""
+    # #845: set when the stored baseline turned out not to be an ancestor
+    # of head (rewritten history) - the delta was rejected and the full PR
+    # diff reviewed instead. Reported in the check-run summary, not silent.
+    living_baseline_rejected = ""
     try:
         from adapters.install_store import get_elder_last_reviewed
 
@@ -2242,16 +2270,18 @@ def dispatch_code_review(
     # format drift cannot 500 the webhook.
     try:
         if living_prior_sha:
-            diff_text, used_living_compare = with_install_token_retry(
-                installation_id,
-                lambda token: _fetch_pr_diff_with_scope(
-                    token,
-                    owner,
-                    repo_name,
-                    pull_number,
-                    base_sha=living_prior_sha,
-                    head_sha=head_sha,
-                ),
+            diff_text, used_living_compare, living_baseline_was_rejected = (
+                with_install_token_retry(
+                    installation_id,
+                    lambda token: _fetch_pr_diff_with_scope(
+                        token,
+                        owner,
+                        repo_name,
+                        pull_number,
+                        base_sha=living_prior_sha,
+                        head_sha=head_sha,
+                    ),
+                )
             )
         else:
             # Retain the established fetch seam for ordinary full reviews;
@@ -2269,6 +2299,11 @@ def dispatch_code_review(
             )
             used_living_compare = False
         if living_prior_sha and not used_living_compare:
+            # The delta was rejected (#845): keep the rejected SHA for the
+            # summary note, but clear the range so the title doesn't name a
+            # delta that was never reviewed.
+            if living_baseline_was_rejected:
+                living_baseline_rejected = living_prior_sha[:8]
             living_prior_sha = ""
             living_range = ""
         pr_context["base_sha"] = living_prior_sha or base_sha
@@ -2723,6 +2758,7 @@ def dispatch_code_review(
         oversized_paths=oversized_paths,
         duplicate_paths=duplicate_paths,
         living_range=living_range,
+        living_baseline_rejected=living_baseline_rejected,
         review_phase=tier1_phase,
     )
     check_result = CheckRunResult(
@@ -3014,6 +3050,7 @@ def dispatch_code_review(
             repo_docs_context=repo_docs_context,
             voice=voice,
             living_range=living_range,
+            living_baseline_rejected=living_baseline_rejected,
             evaluation=evaluation,
             prior_keys=prior_keys,
             check_publish_failed=check_publish_failed,
@@ -3529,6 +3566,7 @@ def _async_deep_append_if_needed(
     repo_docs_context: str | None,
     voice: VoiceSelection,
     living_range: str,
+    living_baseline_rejected: str,
     evaluation: CodeReviewEvaluation,
     prior_keys: frozenset[str],
     check_publish_failed: bool,
@@ -3684,6 +3722,7 @@ def _async_deep_append_if_needed(
         combined,
         suppressed_count=deep_suppressed_count,
         living_range=living_range,
+        living_baseline_rejected=living_baseline_rejected,
         review_phase="deep",
     )
     title = f"{title} (deep append)"
