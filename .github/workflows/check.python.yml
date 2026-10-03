@@ -6,12 +6,12 @@
 name: check.python
 
 on:
+  # No path filter on pull_request, on purpose: this job is the merge gate for
+  # agent-authored PRs (Chief skips those), and infra's ruleset for this repo
+  # requires it by name. A path filter would leave a docs-only PR waiting on a
+  # check that never starts. The suite takes about 2 minutes. Do not re-add a
+  # filter while the check is required.
   pull_request:
-    paths:
-      - 'services/**'
-      - 'scripts/**'
-      - 'Makefile'
-      - '.github/workflows/check.python.yml'
   push:
     branches: [main]
     paths:
@@ -23,6 +23,10 @@ permissions:
 
 jobs:
   tests:
+    # The required-check context. Distinct on purpose: a required check
+    # matches by name alone, so a generic "tests" could be satisfied by
+    # some other workflow's job.
+    name: grug python tests
     runs-on: ubuntu-latest
     timeout-minutes: 15
     services:
