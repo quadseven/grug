@@ -55,6 +55,113 @@ LEGACY_MARKERS: tuple[str, ...] = (
 )
 
 
+# Re-review in-progress note (#819). Push a new commit to a PR and the board
+# keeps showing the PREVIOUS verdict for the whole next review. While a
+# re-review runs, the header is swapped to this note; the settled write (or
+# the clear path) puts the real verdict back. Header-only by construction:
+# sections (prior findings) are never touched, and it never creates a board
+# (creating mails the author - the note is not worth an email).
+IN_PROGRESS_HEADER = "### Grug read new markings. Wait."
+
+
+def mark_board_in_progress(
+    token: str,
+    owner: str,
+    repo: str,
+    pr_number: int,
+    *,
+    app_id: str,
+) -> str | None:
+    """Swap the board header to the in-progress note (#819).
+
+    Finds the board with `app_id` (a human quoting the marker is never
+    selected), saves the current header, and PATCHes ONLY the header region
+    - prior findings stay visible byte-for-byte under the note. Never
+    creates: no board means no note (and no email).
+
+    Returns the saved header, or None when there was no board to update or
+    the write failed. Never raises: the note is cosmetic, the review is not.
+    """
+    try:
+        found = find_board(token, owner, repo, pr_number, app_id=app_id)
+        if found is None:
+            return None
+        comment_id, existing = found
+        saved = board.extract_header(existing)
+        if saved is None:
+            return None
+        body = board.set_header(existing, IN_PROGRESS_HEADER)
+        httpx.patch(
+            f"https://api.github.com/repos/{_repo(owner, repo)}"
+            f"/issues/comments/{comment_id}",
+            json={"body": body},
+            headers=_headers(token),
+            timeout=_TIMEOUT,
+        ).raise_for_status()
+        log.info(
+            "board_in_progress_note_set",
+            extra={"repo": f"{owner}/{repo}", "pr": pr_number},
+        )
+        return saved
+    except (httpx.HTTPStatusError, httpx.RequestError):
+        log.warning(
+            "board_in_progress_note_failed",
+            extra={"repo": f"{owner}/{repo}", "pr": pr_number},
+            exc_info=True,
+        )
+        return None
+
+
+def clear_board_in_progress(
+    token: str,
+    owner: str,
+    repo: str,
+    pr_number: int,
+    *,
+    app_id: str,
+    saved_header: str,
+) -> bool:
+    """Restore a header saved by `mark_board_in_progress` (#819).
+
+    Only restores when the live header is still the in-progress note: if the
+    settled write (or a newer review) already updated it, restoring the stale
+    saved header would be a lie, so it stays hands-off. Header-only PATCH,
+    never creates. Returns True when the header was restored. Never raises.
+    """
+    try:
+        found = find_board(token, owner, repo, pr_number, app_id=app_id)
+        if found is None:
+            return False
+        comment_id, existing = found
+        current = board.extract_header(existing)
+        if current != IN_PROGRESS_HEADER:
+            log.info(
+                "board_in_progress_note_already_cleared",
+                extra={"repo": f"{owner}/{repo}", "pr": pr_number},
+            )
+            return False
+        body = board.set_header(existing, saved_header)
+        httpx.patch(
+            f"https://api.github.com/repos/{_repo(owner, repo)}"
+            f"/issues/comments/{comment_id}",
+            json={"body": body},
+            headers=_headers(token),
+            timeout=_TIMEOUT,
+        ).raise_for_status()
+        log.info(
+            "board_in_progress_note_cleared",
+            extra={"repo": f"{owner}/{repo}", "pr": pr_number},
+        )
+        return True
+    except (httpx.HTTPStatusError, httpx.RequestError):
+        log.warning(
+            "board_in_progress_note_clear_failed",
+            extra={"repo": f"{owner}/{repo}", "pr": pr_number},
+            exc_info=True,
+        )
+        return False
+
+
 def _headers(token: str) -> dict[str, str]:
     return {
         "Authorization": f"Bearer {token}",

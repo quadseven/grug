@@ -102,3 +102,111 @@ def test_a_humans_comment_quoting_a_marker_is_never_edited(monkeypatch):
                                   header="### h", app_id="123")
     assert out["board"] == "created"          # ignored the human comment
     assert writes and "not ours" not in writes[0]
+
+
+def _grug_comment(body):
+    return {"id": 7, "body": body, "performed_via_github_app": {"id": 123}}
+
+
+def test_in_progress_note_swaps_header_only(monkeypatch):
+    """#819: the re-review note swaps the header; prior findings survive
+    byte-for-byte underneath it."""
+    existing = board.set_header(board.new_board(), "### Grug say WAIT, 3 findings")
+    existing = board.upsert_section(existing, "elder", "ELDER-FINDINGS")
+    writes = _wire(monkeypatch, [_grug_comment(existing)])
+
+    saved = bc.mark_board_in_progress("tok", "o", "r", 5, app_id="123")
+
+    assert saved == "### Grug say WAIT, 3 findings"
+    assert len(writes) == 1
+    verb, url, body = writes[0]
+    assert verb == "patch" and url.endswith("/issues/comments/7")
+    assert bc.IN_PROGRESS_HEADER in body
+    assert "ELDER-FINDINGS" in body
+    assert "Grug say WAIT, 3 findings" not in body
+
+
+def test_in_progress_note_ignores_human_comment_with_marker(monkeypatch):
+    """#819 requirement 1: a non-Grug comment carrying the marker is never
+    selected or modified, even though it matches the board marker."""
+    human = board.set_header(board.new_board(), "### human verdict")
+    writes = _wire(
+        monkeypatch,
+        [
+            {"id": 9, "body": human, "performed_via_github_app": {"id": 999}},
+        ],
+    )
+
+    saved = bc.mark_board_in_progress("tok", "o", "r", 5, app_id="123")
+
+    assert saved is None
+    assert writes == []
+
+
+def test_in_progress_note_never_creates(monkeypatch):
+    """#819 requirement 5: no board, no note, no email. create_if_absent is
+    always False for the in-progress note."""
+    writes = _wire(monkeypatch, [])
+
+    saved = bc.mark_board_in_progress("tok", "o", "r", 5, app_id="123")
+
+    assert saved is None
+    assert all(verb != "post" for verb, _, _ in writes)
+
+
+def test_clear_restores_saved_header(monkeypatch):
+    """#819 requirement 2: a dead review's note is cleared, prior verdict back."""
+    existing = board.set_header(board.new_board(), bc.IN_PROGRESS_HEADER)
+    existing = board.upsert_section(existing, "elder", "ELDER-FINDINGS")
+    writes = _wire(monkeypatch, [_grug_comment(existing)])
+
+    ok = bc.clear_board_in_progress(
+        "tok",
+        "o",
+        "r",
+        5,
+        app_id="123",
+        saved_header="### Grug say WAIT, 3 findings",
+    )
+
+    assert ok is True
+    body = writes[0][2]
+    assert "Grug say WAIT, 3 findings" in body
+    assert bc.IN_PROGRESS_HEADER not in body
+    assert "ELDER-FINDINGS" in body
+
+
+def test_clear_does_not_clobber_a_newer_header(monkeypatch):
+    """The settled write (or a newer review) already replaced the note -
+    restoring the stale saved header would be a lie."""
+    existing = board.set_header(board.new_board(), "### Grug say CLEAR, 0 findings")
+    writes = _wire(monkeypatch, [_grug_comment(existing)])
+
+    ok = bc.clear_board_in_progress(
+        "tok",
+        "o",
+        "r",
+        5,
+        app_id="123",
+        saved_header="### Grug say WAIT, 3 findings",
+    )
+
+    assert ok is False
+    assert writes == []
+
+
+def test_clear_when_board_vanished_is_quiet(monkeypatch):
+    """Board deleted mid-review: nothing to restore, no exception."""
+    writes = _wire(monkeypatch, [])
+
+    ok = bc.clear_board_in_progress(
+        "tok",
+        "o",
+        "r",
+        5,
+        app_id="123",
+        saved_header="### Grug say WAIT, 3 findings",
+    )
+
+    assert ok is False
+    assert writes == []
