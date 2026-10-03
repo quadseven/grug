@@ -556,6 +556,8 @@ def test_hot_review_requeues_latest_when_dispatch_detects_stale(monkeypatch):
         rerun, "with_install_token_retry", lambda iid, fn: next(pulls),
     )
     monkeypatch.setattr(rerun, "get_repo_config", lambda iid, rid: {})
+    # #819: board note not under test here
+    monkeypatch.setattr(rerun, "_set_board_in_progress_note", lambda *a: None)
     acquire, complete, release = _patch_hot_claims(monkeypatch)
     requeue = MagicMock()
     monkeypatch.setattr(rerun, "_enqueue_current_review", requeue)
@@ -606,6 +608,8 @@ def test_hot_review_gives_up_mid_flight_once_the_redrive_cap_is_exhausted(monkey
         lambda token, owner, repo, result, external_id=None: posted.append(result) or {"id": 1},
     )
     monkeypatch.setattr(rerun, "get_repo_config", lambda iid, rid: {})
+    # #819: board note not under test here
+    monkeypatch.setattr(rerun, "_set_board_in_progress_note", lambda *a: None)
     acquire, complete, release = _patch_hot_claims(monkeypatch)
     requeue = MagicMock()
     monkeypatch.setattr(rerun, "_enqueue_current_review", requeue)
@@ -750,6 +754,8 @@ def test_hot_review_stale_with_moved_head_closes_abandoned_check(monkeypatch):
         lambda token, owner, repo, result, external_id=None: posted.append(result) or {"id": 1},
     )
     monkeypatch.setattr(rerun, "get_repo_config", lambda iid, rid: {})
+    # #819: board note not under test here
+    monkeypatch.setattr(rerun, "_set_board_in_progress_note", lambda *a: None)
     acquire, complete, release = _patch_hot_claims(monkeypatch)
     requeue = MagicMock()
     monkeypatch.setattr(rerun, "_enqueue_current_review", requeue)
@@ -790,6 +796,8 @@ def test_hot_review_same_sha_stale_never_posts_terminal_neutral(monkeypatch):
         lambda *a, **kw: posted.append(a) or {"id": 1},
     )
     monkeypatch.setattr(rerun, "get_repo_config", lambda iid, rid: {})
+    # #819: board note not under test here
+    monkeypatch.setattr(rerun, "_set_board_in_progress_note", lambda *a: None)
     _patch_hot_claims(monkeypatch)
     monkeypatch.setattr(rerun, "_enqueue_current_review", MagicMock())
     monkeypatch.setattr(
@@ -2263,3 +2271,123 @@ def test_not_due_learn_first_receive_is_hidden_not_copied(monkeypatch):
                           "attributes": {"ApproximateReceiveCount": "1"}}]}
     with pytest.raises(JobNotDue):
         rerun.handle_rerun_jobs(event)
+
+
+def test_board_note_context_sets_and_clears(monkeypatch):
+    """#819: the re-review note is set on entry and cleared on every exit."""
+    calls = []
+    monkeypatch.setattr(
+        rerun,
+        "_set_board_in_progress_note",
+        lambda *a: calls.append("set") or "### saved",
+    )
+    monkeypatch.setattr(
+        rerun,
+        "_clear_board_in_progress_note",
+        lambda *a: calls.append("clear"),
+    )
+    monkeypatch.setattr(
+        rerun,
+        "_register_board_note",
+        lambda *a: calls.append("reg") or "tok",
+    )
+    monkeypatch.setattr(
+        rerun,
+        "_unregister_board_note",
+        lambda t: calls.append("unreg"),
+    )
+    with rerun._board_in_progress_note(11, "o", "r", 7):
+        calls.append("body")
+    assert calls == ["set", "reg", "body", "unreg", "clear"]
+
+
+def test_board_note_context_clears_on_exception(monkeypatch):
+    """#819 requirement 2: a dying review still clears the note (the DLQ /
+    redrive paths raise through here)."""
+    calls = []
+    monkeypatch.setattr(
+        rerun,
+        "_set_board_in_progress_note",
+        lambda *a: "### saved",
+    )
+    monkeypatch.setattr(
+        rerun,
+        "_clear_board_in_progress_note",
+        lambda *a: calls.append("clear"),
+    )
+    monkeypatch.setattr(rerun, "_register_board_note", lambda *a: "tok")
+    monkeypatch.setattr(rerun, "_unregister_board_note", lambda t: None)
+    with pytest.raises(RuntimeError, match="boom"), \
+            rerun._board_in_progress_note(11, "o", "r", 7):
+        raise RuntimeError("boom")
+    assert calls == ["clear"]
+
+
+def test_board_note_context_no_board_no_ops(monkeypatch):
+    """No board on the PR: nothing registered, nothing cleared, no error."""
+    calls = []
+    monkeypatch.setattr(rerun, "_set_board_in_progress_note", lambda *a: None)
+    monkeypatch.setattr(
+        rerun,
+        "_register_board_note",
+        lambda *a: calls.append("reg") or "tok",
+    )
+    monkeypatch.setattr(
+        rerun,
+        "_clear_board_in_progress_note",
+        lambda *a: calls.append("clear"),
+    )
+    with rerun._board_in_progress_note(11, "o", "r", 7):
+        pass
+    assert calls == []
+
+
+def test_set_board_note_uses_app_token_and_app_id(monkeypatch):
+    """The note write goes through the install token and passes app_id so a
+    human's marker-quoting comment is never selected."""
+    seen = {}
+
+    def _fake_retry(install_id, fn):
+        seen["install_id"] = install_id
+        return fn("fake-token")
+
+    def _fake_mark(token, owner, repo, pr_number, *, app_id):
+        seen.update(
+            token=token, owner=owner, repo=repo,
+            pr_number=pr_number, app_id=app_id,
+        )
+        return "### saved"
+
+    monkeypatch.setattr(rerun, "with_install_token_retry", _fake_retry)
+    monkeypatch.setattr(rerun, "get_app_id", lambda: "123")
+    monkeypatch.setattr(
+        rerun.board_client, "mark_board_in_progress", _fake_mark,
+    )
+    saved = rerun._set_board_in_progress_note(11, "o", "r", 7)
+    assert saved == "### saved"
+    assert seen == {
+        "install_id": 11, "token": "fake-token", "owner": "o", "repo": "r",
+        "pr_number": 7, "app_id": "123",
+    }
+
+
+def test_shutdown_sweep_clears_registered_board_notes(monkeypatch):
+    """#819 consumer SIGTERM: notes still registered belong to reviews that
+    will not finish in this process - the sweep restores their headers."""
+    calls = []
+    monkeypatch.setattr(
+        rerun,
+        "_clear_board_in_progress_note",
+        lambda install_id, owner, repo, pr_number, saved: (
+            calls.append(
+                (pr_number, saved),
+            )
+            or True
+        ),
+    )
+    token = rerun._register_board_note(11, "o", "r", 7, "### saved")
+    assert rerun.clear_active_board_notes() == 1
+    assert calls == [(7, "### saved")]
+    # The sweep unregisters: a second sweep finds nothing.
+    assert rerun.clear_active_board_notes() == 0
+    rerun._unregister_board_note(token)  # idempotent, no error
