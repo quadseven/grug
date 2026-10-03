@@ -136,6 +136,14 @@ def check_display_name(key: str) -> str:
     return _CHECK_DISPLAY.get(key, key)
 
 
+# How many failed checks the hold title names inline before falling back
+# to the generic "- see Details for which". #994 pointed the title at
+# Details after the operator could not tell why Chief failed; naming the
+# checks finishes that intent when the failure is small enough to fit in a
+# check-run title.
+_NAMED_FAIL_LIMIT = 3
+
+
 def _skipped(results: Sequence[CheckResult]) -> list[CheckResult]:
     """Checks that passed by fail-open without being evaluated (#782)."""
     return [r for r in results if r.skipped]
@@ -157,6 +165,19 @@ def _summary(results: list[CheckResult]) -> tuple[str, str]:
         title = f"Hunt Plan ready - all {total} checks"
         if skipped:
             title = f"Hunt Plan ready - {total - len(skipped)}/{total} checks"
+    elif len(blocking) <= _NAMED_FAIL_LIMIT:
+        # The per-check breakdown lives in this check-run's own
+        # `output.summary` (the table built below) - GitHub's PR checks
+        # list shows just this title inline, so when the failure is small
+        # enough the title names the failed checks directly (#994, and the
+        # operator confusion behind "4/7 plan checks fail" on mod-overseer
+        # #821). Larger failures keep the short pointer to Details so the
+        # title stays a title.
+        names = ", ".join(check_display_name(r.name) for r in blocking)
+        title = (
+            f"Hunt Plan hold - {len(blocking)}/{total} plan checks fail "
+            f"({names}; see Details)"
+        )
     else:
         # The per-check breakdown lives only in this check-run's own
         # `output.summary` (the table built below) - GitHub's PR checks
