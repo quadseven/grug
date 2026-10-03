@@ -30,9 +30,10 @@
 # needed to ship this.
 #
 # LICENSING. No third-party rule pack is vendored here - every rule below is
-# hand-authored in this repo, same as python.yml/yaml_ci_k8s.yml. That keeps
-# the free/open-source-only constraint trivially satisfied (there is no
-# licence to check) rather than relying on one.
+# hand-authored in this repo, same as python.yml/yaml_ci_k8s.yml, as original
+# work under the repo's own licence (GNU AGPL v3 - see LICENSE at the repo
+# root). That keeps the free/open-source-only constraint trivially satisfied
+# (there is no licence to check) rather than relying on one.
 rules:
   - id: grug-swift-hardcoded-credential
     languages: [swift]
