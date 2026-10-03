@@ -59,6 +59,13 @@ stranger from the first word, not just the code.
   `C:\Users\<name>\...`) or a real machine's hostname.
 - A quote attributed to a specific named person, even an accurate one.
   Paraphrase instead: "the operator decided..." not "Alice said...".
+- An `@`-mention of anyone who is not already part of the conversation.
+  A mention notifies that account and subscribes it to the thread, and
+  neither can be undone by editing or deleting the text. `@grug` in
+  particular is an unrelated real user, not the review bot: the bot is
+  `grug-tribe[bot]` and takes slash commands (`/grug improve` re-runs the
+  code review, `/grug recheck` re-runs the plan check). To name a handle
+  in prose, put it in backticks, which GitHub does not treat as a mention.
 - The name of another private repository, service, or internal system
   that isn't itself meant to be discoverable. Cross-repo references
   belong in the *private* tracker, not migrated wholesale into a public
