@@ -120,8 +120,9 @@ spec:
             # Elder-capable workloads (this is the PRODUCTION review path).
             - {name: GRUG_REVIEW_BACKEND_PRIORITY, value: cloud}
             - {name: GRUG_OPENCODE_GO_API_KEY_SSM, value: /infra/llm/opencode_go_api_key}
-            # GRUG_CLOUD_FREE_TIER_MODEL deliberately unset - rationale in
-            # webhook-deployment.yaml.
+            # OpenRouter :free as the chain's tier 2 - rationale and eval
+            # evidence in webhook-deployment.yaml.
+            - {name: GRUG_CLOUD_FREE_TIER_MODEL, value: "nvidia/nemotron-3-super-120b-a12b:free"}
             - {name: GRUG_PROMPT_EXPERIMENT_SSM, value: /grug/elder-prompt-experiment}
             # Tiered Elder (#645): coder arm on every PR; reasoner only on
             # escalation / sample. Rollback to always-on dual-arm: deep.
@@ -148,7 +149,17 @@ spec:
             - {name: GRUG_DEEP_DIFF_LINES, value: "200"}
             # #646: reasoner after Tier-1 publish (0 = disable async deep)
             - {name: GRUG_DEEP_ASYNC, value: "1"}
-            - {name: GRUG_OPENROUTER_REVIEW_MODEL, value: anthropic/claude-opus-4.7}
+            # Which triggers start the deep pass. auto = size, risky paths,
+            # the 0.20 sample and an explicit request. on_demand = only a
+            # "deep review" marker in the PR title or body. Measured over the
+            # 7 days to 2026-09-26: 340 deep passes started, 118 came back
+            # unparseable, and about 16 posted a finding Tier 1 had not.
+            # Under cloud priority the deep pass runs on the cloud chain and
+            # reaches the Cave reasoner only when every cloud tier fails.
+            - {name: GRUG_DEEP_ESCALATION, value: auto}
+            # The key has a zero spend limit: a paid model here 403s on every
+            # call. Same :free model as the chain's tier 2.
+            - {name: GRUG_OPENROUTER_REVIEW_MODEL, value: "nvidia/nemotron-3-super-120b-a12b:free"}
             # Apex: more concurrent durable reviews so a busy multi-repo
             # night does not serialize Elder behind unrelated large PRs.
             # 3 per pod x 2 replicas (#701) = the same total 6 the single
@@ -183,15 +194,15 @@ spec:
             # permanently hot reasoner adjudicates bounded candidate packets;
             # cloud fallback receives redacted evidence only.
             - {name: GRUG_CAVE_GATEWAY_URL, value: http://spark-gateway.spark-gateway.svc:8080}
-            # infra#2451/#2454 precedent: the sparkicus vLLM resident is not a
+            # infra#2451/#2454 precedent: the second GPU host's vLLM resident is not a
             # fixed identity (infra#2452 swapped poolside/Laguna-S-2.1-NVFP4 ->
             # Qwen/Qwen3.8-27B-FP8 same-day). spark_gateway.py's `spark:warm-any`
             # sentinel routes to whichever vLLM target is reachable and rewrites
             # the outgoing model name to what it actually serves, so this stops
-            # needing a lockstep edit on every future sparkicus swap - the same
-            # fix already applied to macchina-cave-connector/the judge (#2450)
+            # needing a lockstep edit on every future swap on that host - the same
+            # fix already applied to another owned consumer and the judge (#2450)
             # and hermes-discord (#2454). The review lane was pinned to a
-            # Qwen coder tag on Sparkles; both Sparks now serve ONE
+            # Qwen coder tag on the first GPU host; both GPU hosts now serve ONE
             # tensor-parallel DeepSeek and no Ollama, and an exact tag is a
             # strict membership test in the router, so all three lanes ask
             # for whatever is resident (2026-09-02).

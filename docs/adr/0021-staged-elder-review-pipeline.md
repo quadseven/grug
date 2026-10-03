@@ -79,7 +79,7 @@ Discovery and adjudication are separate model roles. The code-specialist model
 on the cold Spark finds candidates inside bounded cohorts. Each judge batch is
 then reduced again to an evidence packet containing only the changed hunks and
 full-file contents for the candidate files. The permanently resident
-`qwen3.5:122b` reasoner on sparkicus judges that packet; it does not reread the
+`qwen3.5:122b` reasoner on the second GPU host judges that packet; it does not reread the
 whole PR and does not compete with discovery for the cold Spark's model slot.
 
 An owned-judge response is usable only when it contains exactly one verdict for

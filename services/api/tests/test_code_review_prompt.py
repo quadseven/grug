@@ -168,7 +168,7 @@ def test_covers_core_audit_bug_classes():
 def test_subprocess_no_timeout_rule_present():
     """Weekly harvest: an external/blocking subprocess (or shell node/curl)
     call without a timeout is the runaway-process class — one wedged
-    provider hangs the whole chain (claude-stuff #356, #368)."""
+    provider hangs the whole chain (a private tooling repo)."""
     assert any(r.name == "subprocess-no-timeout" for r in crp.RULES)
     assert "subprocess-no-timeout" in crp.build_system_prompt()
 

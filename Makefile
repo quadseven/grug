@@ -134,7 +134,7 @@ docker-build-webhook:
 
 # SAST benchmark / eval harness (#399, ADR-0006). Measures Elder's vuln
 # recall+precision per backend over the committed corpus. Makes REAL backend
-# calls (free OpenRouter/Poolside keys; sparkles/Cave needs the tailnet) - set
+# calls (free OpenRouter/Poolside keys; Cave needs the tailnet) - set
 # GRUG_BENCH_{OPENROUTER,POOLSIDE}_KEY and/or GRUG_BENCH_CAVE_URL+MODEL.
 #   make sast-benchmark              # print report
 #   make sast-benchmark ARGS=--record  # write baseline.json
@@ -156,7 +156,7 @@ review-latency:
 # Elder replay eval harness (#361 slice 2, #537). Replays Elder over the
 # committed review-ledger corpus and scores catch-rate vs noise per class -
 # NOT a per-PR gate; makes REAL backend calls (free OpenRouter/Poolside
-# keys; sparkles/Cave needs the tailnet) - set GRUG_BENCH_{OPENROUTER,
+# keys; Cave needs the tailnet) - set GRUG_BENCH_{OPENROUTER,
 # POOLSIDE}_KEY and/or GRUG_BENCH_CAVE_URL+MODEL. Mirrors sast-benchmark
 # above; this harness had no make target before, which is part of why the
 # on-demand CI job (benchmark.elder-eval.yml) had a run count of zero.

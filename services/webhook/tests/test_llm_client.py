@@ -25,6 +25,8 @@ def _patch_keys(monkeypatch):
     monkeypatch.setattr(lc, "_load_poolside_key", lambda: "test-pool-key")
     monkeypatch.setattr(lc, "_load_openrouter_key", lambda: "test-or-key")
     monkeypatch.setattr(lc, "_load_opencode_go_key", lambda: "test-ocg-key")
+    # Module-level breaker state must not leak between tests.
+    monkeypatch.setattr(lc, "_opencode_go_blocked_until", 0.0, raising=False)
     monkeypatch.delenv("GRUG_CLOUD_FREE_TIER_MODEL", raising=False)
     monkeypatch.setenv("GRUG_CAVE_GATEWAY_URL", "http://cave.test")
     # Fast = single (coder) arm; the deep tests below opt into both arms so a
@@ -1020,7 +1022,9 @@ def test_cave_reasoner_has_server_side_completion_budget() -> None:
     assert reasoner is not None
     assert reasoner.extra_body["max_tokens"] == 6_144
     assert coder is not None
-    assert "max_tokens" not in coder.extra_body
+    # 2026-09-26: the uncapped coder arm's 18-26k-token generations were
+    # the sustained load that overheated the Sparks.
+    assert coder.extra_body["max_tokens"] == lc._CLOUD_CHAIN_MAX_TOKENS
 
 
 def test_cave_reasoner_disables_default_thinking_like_the_judge() -> None:
@@ -1090,11 +1094,15 @@ def test_review_reasoner_diff_truncated_generation_is_not_a_clean_pass(monkeypat
     )
 
 
-def test_openrouter_review_uses_opus_with_high_adaptive_reasoning() -> None:
+def test_openrouter_review_defaults_to_a_free_model_with_reasoning_off() -> None:
+    """The OpenRouter key has a zero spend limit, so a paid review model
+    403s on every call. The default is a `:free` model, with OpenRouter's
+    reasoning toggle off so hidden reasoning cannot eat the budget."""
     config = lc._review_backend_config(Backend.OPENROUTER)
-    assert config.model == "anthropic/claude-opus-4.7"
-    assert config.extra_body["reasoning"] == {"effort": "high", "exclude": True}
-    assert config.extra_body["max_tokens"] == 32_768
+    assert config.model == "nvidia/nemotron-3-super-120b-a12b:free"
+    assert config.model.endswith(":free")
+    assert config.extra_body["reasoning"] == {"enabled": False}
+    assert config.extra_body["max_tokens"] == 8_192
     # Shared callers such as Teller and the judge remain on the cheap config.
     shared = lc._BACKEND_CONFIGS[Backend.OPENROUTER]
     assert shared.model == "anthropic/claude-haiku-4.5"
@@ -3140,10 +3148,11 @@ def test_classify_learning_non_string_rule_is_one_off() -> None:
     assert out is not None and out["durable"] is False and out["learning"] == ""
 
 
-def test_classify_learning_returns_none_on_backend_failure() -> None:
+def test_classify_learning_defers_when_every_backend_is_unreachable() -> None:
+    # No backend reachable is an outage, not a verdict: the caller defers.
     with patch.object(httpx, "post", side_effect=httpx.ConnectError("down")):
-        out = lc.classify_learning("x", "y", {"rule_name": "r"}, installation_id=2)
-    assert out is None
+        with pytest.raises(lc.LearnClassifierUnavailable):
+            lc.classify_learning("x", "y", {"rule_name": "r"}, installation_id=2)
 
 
 def test_classify_learning_drops_a_scope_that_misses_the_findings_file() -> None:
@@ -3374,6 +3383,33 @@ def test_build_messages_threads_guidelines_into_the_system_prompt() -> None:
     assert "never use bare except" in system
 
 
+def test_claude_md_rule_reaches_system_prompt_end_to_end(monkeypatch) -> None:
+    """#674 fixture: the full pipeline, not just the last hop. A real
+    CLAUDE.md fetched from the repo ("never use bare except") flows through
+    `_repo_guidelines_block` into `_build_messages`, and the exact rule text
+    lands in the constructed system message the model receives. Proves the
+    distinguishing evidence survives fetch, render, and prompt threading."""
+    monkeypatch.setattr("github_app_auth.get_install_token", lambda *a, **k: "fake-token")
+
+    def _fake_get(url, params=None, headers=None, timeout=None):
+        if url.endswith("CLAUDE.md"):
+            return _gh_raw_response(200, "never use bare except")
+        return _gh_raw_response(404)
+
+    pr_context = {"repo": "quadseven/grug", "installation_id": 1, "head_sha": "abc123"}
+    with patch.object(httpx, "get", side_effect=_fake_get):
+        block = lc._repo_guidelines_block(pr_context)
+    assert "never use bare except" in block
+
+    hunks = [Hunk(path="a.py", body="+x = 1")]
+    messages = lc._build_messages(hunks, "v2", guidelines=block)
+    system = next(m["content"] for m in messages if m["role"] == "system")
+    assert "never use bare except" in system
+    # The precedence statement rides along: the model is told the carving
+    # outranks a taught preference.
+    assert "TRIBE'S OWN CARVINGS" in system
+
+
 def test_summarize_pr_tolerates_missing_optional_fields() -> None:
     payload = json.dumps({"summary": "A small fix."})
     response = httpx.Response(200, json=_openai_json_response(payload))
@@ -3561,19 +3597,20 @@ def test_classify_learning_raises_unusable_when_every_backend_is_terminal(status
     assert set(info.value.statuses) == {f"poolside:http_{status}", f"openrouter:http_{status}"}
 
 
-def test_classify_learning_one_terminal_one_transient_stays_retryable(monkeypatch) -> None:
-    # The live mix: one backend dead (403), the other merely flaky (503).
-    # A retry can still succeed on the flaky one, so this is a plain None.
+def test_classify_learning_one_terminal_one_transient_is_deferred(monkeypatch) -> None:
+    # One backend dead (403), the other merely flaky (503). A later try can
+    # still succeed on the flaky one, so the job defers rather than completes.
     monkeypatch.setattr(lc, "_RETRY_SLEEP", lambda s: None)
 
     def fake_post(url, **kw):
         return httpx.Response(403 if "openrouter" in url else 503, json={})
     with patch.object(httpx, "post", side_effect=fake_post):
-        out = lc.classify_learning("q", "f", {"rule_name": "r"}, installation_id=2)
-    assert out is None
+        with pytest.raises(lc.LearnClassifierUnavailable) as info:
+            lc.classify_learning("q", "f", {"rule_name": "r"}, installation_id=2)
+    assert set(info.value.statuses) == {"openrouter:http_403", "poolside:http_503"}
 
 
-def test_classify_learning_key_load_failure_stays_retryable(monkeypatch) -> None:
+def test_classify_learning_key_load_failure_is_deferred_not_unusable(monkeypatch) -> None:
     # _BackendConfigError also wraps a transient SSM failure loading the key,
     # which a retry clears, so it must never count as unusable.
     def ssm_blip():
@@ -3581,8 +3618,8 @@ def test_classify_learning_key_load_failure_stays_retryable(monkeypatch) -> None
     monkeypatch.setattr(lc, "_load_poolside_key", ssm_blip)
     monkeypatch.setattr(lc, "_load_openrouter_key", ssm_blip)
     with patch.object(httpx, "post") as post:
-        out = lc.classify_learning("q", "f", {"rule_name": "r"}, installation_id=2)
-    assert out is None
+        with pytest.raises(lc.LearnClassifierUnavailable):
+            lc.classify_learning("q", "f", {"rule_name": "r"}, installation_id=2)
     assert post.call_count == 0
 
 
@@ -3837,7 +3874,11 @@ def test_cloud_priority_total_cloud_failure_falls_through_to_cave(monkeypatch) -
 
     with patch.object(
         httpx, "post",
-        side_effect=[httpx.ConnectError("opencode go unreachable"), cave_response],
+        side_effect=[
+            httpx.ConnectError("opencode go unreachable"),
+            httpx.ConnectError("poolside unreachable"),
+            cave_response,
+        ],
     ) as mock_post:
         out = review_diff([_hunk()], installation_id=1)
 
@@ -3846,8 +3887,8 @@ def test_cloud_priority_total_cloud_failure_falls_through_to_cave(monkeypatch) -
         "total cloud failure must fall through to Cave, not surface as "
         "all_failed - the local hardware is the guaranteed fallback"
     )
-    assert mock_post.call_count == 2, (
-        "expected exactly opencode Go, then Cave - one call each, no "
+    assert mock_post.call_count == 3, (
+        "expected exactly opencode Go, Poolside, then Cave - one call each, no "
         "retries (transport_retry_attempts=1 for chain tiers)"
     )
 
@@ -3914,6 +3955,7 @@ def test_cloud_chain_all_tiers_fail_falls_through_to_cave_with_free_tier_configu
         side_effect=[
             httpx.ConnectError("opencode go unreachable"),
             httpx.ConnectError("free tier unreachable"),
+            httpx.ConnectError("poolside unreachable"),
             cave_response,
         ],
     ) as mock_post:
@@ -3921,7 +3963,7 @@ def test_cloud_chain_all_tiers_fail_falls_through_to_cave_with_free_tier_configu
 
     assert out.kind == "reviewed"
     assert out.backend_used == Backend.CAVE
-    assert mock_post.call_count == 3
+    assert mock_post.call_count == 4
 
 
 def test_cloud_priority_parse_failed_is_not_masked_by_a_cave_retry(monkeypatch) -> None:
@@ -3939,7 +3981,8 @@ def test_cloud_priority_parse_failed_is_not_masked_by_a_cave_retry(monkeypatch) 
 
     assert out.kind == "parse_failed"
     assert out.backend_used == Backend.OPENCODE_GO
-    mock_post.assert_called_once()
+    # Go, then Poolside (also unparseable here); never the Cave.
+    assert mock_post.call_count == 2
 
 
 def test_free_tier_chain_config_returns_none_when_unconfigured(monkeypatch) -> None:
@@ -3979,6 +4022,9 @@ def test_free_tier_chain_config_uses_short_timeout_and_bounded_tokens(monkeypatc
     assert cfg.model == "z-ai/glm-5.2:free"
     assert cfg.timeout_seconds == lc._CLOUD_CHAIN_TIMEOUT_SECONDS
     assert cfg.extra_body["max_tokens"] == lc._CLOUD_CHAIN_MAX_TOKENS
+    # With reasoning on, a :free model ran 91-171s and once hit the token
+    # cap unparseable; the chain's 25s budget needs it off.
+    assert cfg.extra_body["reasoning"] == {"enabled": False}
 
 
 def test_opencode_go_chain_config_uses_short_timeout_and_bounded_tokens() -> None:
@@ -4022,13 +4068,15 @@ def test_opencode_go_thinking_toggle_scope(monkeypatch) -> None:
     assert lc._opencode_go_extra_body("deepseek-v4.1-flash", "chat") == {}
 
 
-def test_poolside_never_appears_in_the_cloud_chain(monkeypatch) -> None:
-    """grug#910: Poolside is DROPPED, confirmed unfunded - not merely
-    deprioritized. Must never appear regardless of what else is configured."""
+def test_poolside_is_the_last_cloud_tier(monkeypatch) -> None:
+    """Poolside laguna-s-2.1 answers again and has the best eval record of the
+    reachable cloud models, so it is the last cloud tier, ahead of the Cave."""
     monkeypatch.setenv("GRUG_CLOUD_FREE_TIER_MODEL", "z-ai/glm-5.2:free")
     tiers = lc._cloud_chain_tiers()
-    assert all(t.backend != Backend.POOLSIDE for t in tiers)
-    assert [t.backend for t in tiers] == [Backend.OPENCODE_GO, Backend.OPENROUTER]
+    assert [t.backend for t in tiers] == [
+        Backend.OPENCODE_GO, Backend.OPENROUTER, Backend.POOLSIDE,
+    ]
+    assert tiers[-1].extra_body["max_tokens"] == lc._CLOUD_CHAIN_MAX_TOKENS
 
 
 def test_cave_priority_is_byte_identical_to_pre_906_behavior(monkeypatch) -> None:
@@ -4322,3 +4370,447 @@ def test_unwalked_paths_cover_failed_and_truncated_cohorts() -> None:
     )
     assert lc._unwalked_paths(plan, [2]) == ("b.py", "c.py", "z.py")
     assert lc._unwalked_paths(plan, []) == ("z.py",)
+
+
+# --- OpenRouter free-tier refusals are a retry-later outage (epic #869) -----
+#
+# Operator decision 2026-09-23: grug's OpenRouter key runs ONLY on the free
+# tier, which refuses intermittently with a 403 "Key limit exceeded" (or a 402
+# about credits). That is known flakiness, not a dead key: it must fall
+# through, defer the learn job, and never page. A real revoked key (401) still
+# must.
+
+_FREE_TIER_403 = {"error": {"code": 403, "message": "Key limit exceeded (total limit)"}}
+_FREE_TIER_402 = {"error": {"code": 402, "message": "Insufficient credits. Add more using https://openrouter.ai/settings/credits"}}
+_INVALID_KEY_401 = {"error": {"code": 401, "message": "User not found."}}
+
+
+@pytest.mark.parametrize("status,body", [
+    (403, _FREE_TIER_403),
+    (402, _FREE_TIER_402),
+    (429, {"error": {"code": 429, "message": "Rate limit exceeded: free-models-per-day"}}),
+])
+def test_openrouter_free_tier_refusals_classify_as_rate_limited(status, body) -> None:
+    text = lc._backend_error_message(httpx.Response(status, json=body))
+    assert lc.classify_backend_failure(
+        backend_value="openrouter", status=status, error_message=text,
+    ) == "rate_limited"
+
+
+@pytest.mark.parametrize("backend_value,status,body", [
+    ("openrouter", 401, _INVALID_KEY_401),
+    ("openrouter", 403, {"error": {"code": 403, "message": "Your input was flagged"}}),
+    ("openrouter", 403, {}),
+    ("openrouter", 404, {"error": {"message": "No endpoints found"}}),
+    # Only OpenRouter's refusal bodies are known to mean "free tier, later".
+    ("poolside", 402, {"error": {"message": "out of credits"}}),
+])
+def test_genuine_config_failures_stay_unusable(backend_value, status, body) -> None:
+    text = lc._backend_error_message(httpx.Response(status, json=body))
+    assert lc.classify_backend_failure(
+        backend_value=backend_value, status=status, error_message=text,
+    ) == "unusable"
+
+
+def test_free_tier_refusal_logs_the_non_paging_token(caplog) -> None:
+    # The llm_backend_unusable monitor pages. A free-tier refusal is expected
+    # flakiness on this deployment, so it gets its own token.
+    with caplog.at_level(logging.INFO, logger=lc.log.name):
+        lc._log_backend_failure(
+            backend_value="openrouter", status=403, error="http_403",
+            error_message="Key limit exceeded (total limit)",
+        )
+        lc._log_backend_failure(
+            backend_value="openrouter", status=401, error="http_401",
+            error_message="User not found.",
+        )
+    msgs = [r.msg for r in caplog.records]
+    assert msgs == ["llm_backend_rate_limited", "llm_backend_unusable"]
+
+
+def test_classify_learning_free_tier_403_falls_through_to_poolside(caplog) -> None:
+    # Odd install: OpenRouter is primary and refuses with the free-tier body;
+    # Poolside answers, so the reply is classified with no page.
+    def fake_post(url, **kw):
+        if "openrouter" in url:
+            return httpx.Response(403, json=_FREE_TIER_403)
+        return httpx.Response(200, json=_openai_json_response(
+            '{"durable": false, "learning": "", "scope_path": ""}'))
+    with caplog.at_level(logging.INFO, logger=lc.log.name):
+        with patch.object(httpx, "post", side_effect=fake_post):
+            out = lc.classify_learning("q", "f", {"rule_name": "r"}, installation_id=3)
+    assert out == {"durable": False, "learning": "", "scope_path": ""}
+    msgs = [r.msg for r in caplog.records]
+    assert "llm_backend_rate_limited" in msgs
+    assert "llm_backend_unusable" not in msgs
+
+
+def test_classify_learning_every_backend_free_tier_refusing_is_deferred(monkeypatch, caplog) -> None:
+    # Every backend refusing for a retry-later reason: not a verdict, not
+    # unusable. The caller defers the job instead of completing or DLQing it.
+    monkeypatch.setattr(lc, "_RETRY_SLEEP", lambda s: None)
+
+    def fake_post(url, **kw):
+        if "openrouter" in url:
+            return httpx.Response(403, json=_FREE_TIER_403)
+        return httpx.Response(429, json={"error": {"message": "slow down"}})
+    with caplog.at_level(logging.INFO, logger=lc.log.name):
+        with patch.object(httpx, "post", side_effect=fake_post):
+            with pytest.raises(lc.LearnClassifierUnavailable) as info:
+                lc.classify_learning("q", "f", {"rule_name": "r"}, installation_id=2)
+    assert set(info.value.statuses) == {"openrouter:http_403", "poolside:http_429"}
+    assert "llm_backend_unusable" not in [r.msg for r in caplog.records]
+
+
+def test_classify_learning_free_tier_plus_dead_backend_is_deferred(monkeypatch) -> None:
+    # The live 2026-09-23 mix: Poolside unfunded (402), OpenRouter free tier
+    # over its limit. The free tier recovers on its own, so this defers
+    # rather than dropping the reply as #1050 did.
+    def fake_post(url, **kw):
+        if "openrouter" in url:
+            return httpx.Response(403, json=_FREE_TIER_403)
+        return httpx.Response(402, json={"error": {"message": "payment required"}})
+    with patch.object(httpx, "post", side_effect=fake_post):
+        with pytest.raises(lc.LearnClassifierUnavailable):
+            lc.classify_learning("q", "f", {"rule_name": "r"}, installation_id=2)
+
+
+def test_classify_learning_invalid_key_401_everywhere_is_still_unusable(caplog) -> None:
+    response = httpx.Response(401, json=_INVALID_KEY_401)
+    with caplog.at_level(logging.ERROR, logger=lc.log.name):
+        with patch.object(httpx, "post", return_value=response):
+            with pytest.raises(lc.LearnClassifierUnusable):
+                lc.classify_learning("q", "f", {"rule_name": "r"}, installation_id=2)
+    assert [r.msg for r in caplog.records] == ["llm_backend_unusable"] * 2
+
+
+def test_interactive_order_adds_opencode_go_only_when_configured(monkeypatch) -> None:
+    monkeypatch.delenv("GRUG_OPENCODE_GO_API_KEY_SSM", raising=False)
+    assert lc._interactive_backend_order(2) == (Backend.POOLSIDE, Backend.OPENROUTER)
+    monkeypatch.setenv("GRUG_OPENCODE_GO_API_KEY_SSM", "/some/param")
+    assert lc._interactive_backend_order(3) == (
+        Backend.OPENROUTER, Backend.POOLSIDE, Backend.OPENCODE_GO,
+    )
+
+
+def test_classify_learning_falls_through_to_opencode_go(monkeypatch) -> None:
+    # Both free/unfunded backends refusing: the already-configured opencode Go
+    # tier answers, so the job needs no deferral at all.
+    monkeypatch.setenv("GRUG_OPENCODE_GO_API_KEY_SSM", "/some/param")
+
+    def fake_post(url, **kw):
+        if "openrouter" in url:
+            return httpx.Response(403, json=_FREE_TIER_403)
+        if "opencode" in url:
+            return httpx.Response(200, json=_openai_json_response(
+                '{"durable": false, "learning": "", "scope_path": ""}'))
+        return httpx.Response(402, json={})
+    with patch.object(httpx, "post", side_effect=fake_post) as post:
+        out = lc.classify_learning("q", "f", {"rule_name": "r"}, installation_id=2)
+    assert out == {"durable": False, "learning": "", "scope_path": ""}
+    assert post.call_count == 3
+
+
+def test_review_arm_free_tier_refusal_does_not_page(caplog) -> None:
+    # The review path logs through the same helper; its SaaS arm must not
+    # emit the paging token for a free-tier refusal either.
+    response = httpx.Response(403, json=_FREE_TIER_403)
+    with caplog.at_level(logging.INFO, logger=lc.log.name):
+        with patch.object(httpx, "post", return_value=response):
+            outcome = lc._run_review_arm(
+                Backend.OPENROUTER, [{"role": "user", "content": "x"}], "v1", {},
+                config_override=lc._BACKEND_CONFIGS[Backend.OPENROUTER],
+            )
+    assert outcome.kind == "http_failed"
+    msgs = [r.msg for r in caplog.records]
+    assert "llm_backend_rate_limited" in msgs
+    assert "llm_backend_unusable" not in msgs
+
+
+@pytest.mark.parametrize("status", [400, 422])
+def test_classify_learning_permanent_4xx_redrives_rather_than_defers(status) -> None:
+    # Codex adversarial review: a 400/422 is a request or wire regression
+    # that waiting never fixes. Deferring it would hide it for a week; it
+    # keeps the plain redrive toward the DLQ, whose monitor surfaces it.
+    response = httpx.Response(status, json={"error": {"message": "bad request"}})
+    with patch.object(httpx, "post", return_value=response):
+        out = lc.classify_learning("q", "f", {"rule_name": "r"}, installation_id=2)
+    assert out is None
+
+
+def test_classify_learning_permanent_4xx_plus_free_tier_refusal_defers() -> None:
+    # One backend has a request bug, the other is only rate limited: the
+    # rate-limited one can still answer later, so the job waits for it.
+    def fake_post(url, **kw):
+        if "openrouter" in url:
+            return httpx.Response(403, json=_FREE_TIER_403)
+        return httpx.Response(400, json={})
+    with patch.object(httpx, "post", side_effect=fake_post):
+        with pytest.raises(lc.LearnClassifierUnavailable) as info:
+            lc.classify_learning("q", "f", {"rule_name": "r"}, installation_id=2)
+    assert info.value.statuses == ("openrouter:http_403",)
+
+
+# --- 2026-09-26: deep pass off the Sparks, capped Cave, on-demand switch ---
+
+
+def test_deep_append_under_cloud_priority_answers_from_cloud_not_cave(monkeypatch) -> None:
+    """Operator decision 2026-09-26: the deep pass moves to the cloud chain.
+    A healthy OpenCode Go answers it; the Cave reasoner is never called."""
+    monkeypatch.setenv("GRUG_REVIEW_BACKEND_PRIORITY", "cloud")
+    response = httpx.Response(200, json=_openai_json_response('{"findings": []}'))
+
+    with patch.object(httpx, "post", return_value=response) as post:
+        out = lc.review_reasoner_diff([_hunk()], installation_id=1)
+
+    assert out.kind == "reviewed"
+    assert out.backends_used == (Backend.OPENCODE_GO,)
+    post.assert_called_once()
+    assert post.call_args.kwargs["headers"].get("X-Spark-Caller") is None
+
+
+def test_deep_append_falls_back_to_capped_cave_reasoner_when_cloud_is_down(monkeypatch) -> None:
+    """The Cave stays the last fallback only, and with its completion cap."""
+    monkeypatch.setenv("GRUG_REVIEW_BACKEND_PRIORITY", "cloud")
+    cave = httpx.Response(200, json=_openai_json_response('{"findings": []}'))
+    go_429 = httpx.Response(429, json={"error": {"message": "Go usage limit exceeded"}})
+
+    pool_down = httpx.ConnectError("poolside unreachable")
+    with patch.object(httpx, "post", side_effect=[go_429, pool_down, cave]) as post:
+        out = lc.review_reasoner_diff([_hunk()], installation_id=1)
+
+    assert out.kind == "reviewed"
+    assert out.backends_used == (Backend.CAVE_REASONER,)
+    assert post.call_count == 3
+    assert post.call_args_list[2].kwargs["json"]["max_tokens"] == 6_144
+
+
+def test_deep_append_under_cave_priority_is_unchanged(monkeypatch) -> None:
+    monkeypatch.delenv("GRUG_REVIEW_BACKEND_PRIORITY", raising=False)
+    response = httpx.Response(200, json=_openai_json_response('{"findings": []}'))
+
+    with patch.object(httpx, "post", return_value=response) as post:
+        out = lc.review_reasoner_diff([_hunk()], installation_id=1)
+
+    assert out.backends_used == (Backend.CAVE_REASONER,)
+    post.assert_called_once()
+
+
+def test_free_tier_parse_failure_falls_through_to_cave(monkeypatch) -> None:
+    """grug#1025: a garbled `:free` answer must not become the review and
+    block the Cave. OpenCode Go refuses, the free model returns junk, the
+    Cave answers."""
+    monkeypatch.setenv("GRUG_REVIEW_BACKEND_PRIORITY", "cloud")
+    monkeypatch.setenv("GRUG_CLOUD_FREE_TIER_MODEL", "z-ai/glm-5.2:free")
+    _admit_free_tier(monkeypatch)
+    go_429 = httpx.Response(429, json={"error": {"message": "Go usage limit exceeded"}})
+    junk = httpx.Response(200, json=_openai_json_response("not json at all"))
+    cave = httpx.Response(200, json=_openai_json_response('{"findings": []}'))
+
+    pool_down = httpx.ConnectError("poolside unreachable")
+    with patch.object(httpx, "post", side_effect=[go_429, junk, pool_down, cave]) as post:
+        out = review_diff([_hunk()], installation_id=1)
+
+    assert out.kind == "reviewed"
+    assert out.backend_used == Backend.CAVE
+    assert post.call_count == 4
+
+
+def test_opencode_go_parse_failure_is_still_the_answer_after_a_free_tier_miss(
+    monkeypatch,
+) -> None:
+    """Only the free tier's parse failure is demoted to a miss; OpenCode Go's
+    stays the answer, so no Cave call doubles an answered review."""
+    monkeypatch.setenv("GRUG_REVIEW_BACKEND_PRIORITY", "cloud")
+    monkeypatch.setenv("GRUG_CLOUD_FREE_TIER_MODEL", "z-ai/glm-5.2:free")
+    _admit_free_tier(monkeypatch)
+    junk = httpx.Response(200, json=_openai_json_response("not json at all"))
+
+    with patch.object(httpx, "post", side_effect=[junk, junk, junk]) as post:
+        out = review_diff([_hunk()], installation_id=1)
+
+    assert out.kind == "parse_failed"
+    assert out.backend_used == Backend.OPENCODE_GO
+    assert post.call_count == 3
+
+
+def _big_risky_hunks() -> list[Hunk]:
+    body = "@@ -0,0 +1,300 @@\n" + "\n".join(f"+line {i}" for i in range(300))
+    return [Hunk(path="src/auth/session.py", body=body)]
+
+
+def test_deep_escalation_on_demand_ignores_size_path_and_sample(monkeypatch) -> None:
+    monkeypatch.setenv("GRUG_DEEP_ESCALATION", "on_demand")
+    decision = lc.decide_deep_escalation(
+        _big_risky_hunks(), {"title": "t", "body": "b"},
+        sample_rate=1.0, diff_line_threshold=10,
+    )
+    assert decision.escalate is False
+    assert decision.reasons == ()
+
+
+def test_deep_escalation_on_demand_honors_an_explicit_request(monkeypatch) -> None:
+    monkeypatch.setenv("GRUG_DEEP_ESCALATION", "on_demand")
+    decision = lc.decide_deep_escalation(
+        [_hunk()], {"title": "fix: x", "body": "please deep review this"},
+        sample_rate=0.0,
+    )
+    assert decision.escalate is True
+    assert decision.reasons == ("explicit_deep_review",)
+
+
+def test_deep_escalation_auto_keeps_every_trigger(monkeypatch) -> None:
+    monkeypatch.delenv("GRUG_DEEP_ESCALATION", raising=False)
+    decision = lc.decide_deep_escalation(
+        _big_risky_hunks(), {"title": "t", "body": "b"},
+        sample_rate=1.0, diff_line_threshold=10,
+    )
+    assert decision.escalate is True
+    assert len(decision.reasons) >= 2
+
+
+def test_deep_escalation_invalid_mode_falls_back_to_auto(monkeypatch, caplog) -> None:
+    monkeypatch.setenv("GRUG_DEEP_ESCALATION", "sometimes")
+    with caplog.at_level("WARNING"):
+        assert lc._deep_escalation_mode() == "auto"
+    assert any("deep_escalation_mode_invalid" in r.message for r in caplog.records)
+
+
+# --- 2026-09-26: Go breaker, degenerate empty reviews, cloud judge ---
+
+
+def _go_limit_429(retry_after: str = "3600") -> httpx.Response:
+    return httpx.Response(
+        429,
+        headers={"retry-after": retry_after},
+        json={
+            "type": "error",
+            "error": {"type": "GoUsageLimitError", "message": "Go usage limit exceeded"},
+            "metadata": {"limitName": "monthly"},
+        },
+    )
+
+
+def test_opencode_go_usage_limit_opens_breaker_and_skips_go_until_retry_after(
+    monkeypatch,
+) -> None:
+    """One refused call per window, not one per review."""
+    monkeypatch.setenv("GRUG_REVIEW_BACKEND_PRIORITY", "cloud")
+    ok = httpx.Response(200, json=_openai_json_response('{"findings": []}'))
+
+    with patch.object(httpx, "post", side_effect=[_go_limit_429("105419"), ok, ok]) as post:
+        review_diff([_hunk()], installation_id=1)
+        review_diff([_hunk()], installation_id=1)
+
+    urls = [c.args[0] for c in post.call_args_list]
+    assert sum("opencode.ai" in u for u in urls) == 1
+    assert not lc._opencode_go_available()
+    assert lc._opencode_go_available(now=lc.time.time() + 105_420)
+
+
+def test_ordinary_opencode_go_429_does_not_open_breaker() -> None:
+    lc._note_opencode_go_response(
+        httpx.Response(429, json={"error": {"message": "slow down"}}),
+    )
+    assert lc._opencode_go_available()
+
+
+def test_breaker_caps_an_absurd_retry_after() -> None:
+    lc._note_opencode_go_response(_go_limit_429("99999999"))
+    assert lc._opencode_go_available(
+        now=lc.time.time() + lc._OPENCODE_GO_MAX_BLOCK_SECONDS + 1,
+    )
+
+
+def test_open_breaker_drops_go_from_interactive_order(monkeypatch) -> None:
+    monkeypatch.setenv("GRUG_OPENCODE_GO_API_KEY_SSM", "/x")
+    assert Backend.OPENCODE_GO in lc._interactive_backend_order(1)
+    lc._note_opencode_go_response(_go_limit_429())
+    assert Backend.OPENCODE_GO not in lc._interactive_backend_order(1)
+
+
+def _usage_response(content: str, prompt_tokens: int, completion_tokens: int) -> httpx.Response:
+    body = _openai_json_response(content)
+    body["usage"] = {"prompt_tokens": prompt_tokens, "completion_tokens": completion_tokens}
+    return httpx.Response(200, json=body)
+
+
+def test_degenerate_empty_review_falls_through_to_the_next_tier(monkeypatch) -> None:
+    """Seen live: `{"findings": []}` in 7 output tokens for a 10-20k-token
+    diff, published as a clean pass. It is a miss; Poolside answers."""
+    monkeypatch.setenv("GRUG_REVIEW_BACKEND_PRIORITY", "cloud")
+    monkeypatch.setenv("GRUG_CLOUD_FREE_TIER_MODEL", "z-ai/glm-5.2:free")
+    _admit_free_tier(monkeypatch)
+    counted: list = []
+    import observability
+    monkeypatch.setattr(observability, "emit_count", lambda *a, **k: counted.append((a, k)))
+    degenerate = _usage_response('{"findings": []}', 15_000, 7)
+    real = _usage_response(
+        '{"findings": [{"path": "src/x.py", "line": 1, "rule": "r", '
+        '"severity": "medium", "message": "m"}]}', 15_000, 400,
+    )
+
+    with patch.object(
+        httpx, "post", side_effect=[_go_limit_429(), degenerate, real],
+    ) as post:
+        out = review_diff([_hunk()], installation_id=1)
+
+    assert out.kind == "reviewed"
+    assert out.backend_used == Backend.POOLSIDE
+    assert len(out.findings) == 1
+    assert post.call_count == 3
+    assert counted and counted[0][0][0] == "grug.elder.degenerate_empty_review"
+
+
+def test_small_empty_review_is_not_degenerate() -> None:
+    assert not lc._is_degenerate_empty_review((), {"input_tokens": 900, "output_tokens": 7})
+    assert not lc._is_degenerate_empty_review((), {"input_tokens": 15_000, "output_tokens": 300})
+    assert not lc._is_degenerate_empty_review((), {})
+    assert lc._is_degenerate_empty_review((), {"input_tokens": 15_000, "output_tokens": 7})
+
+
+def test_judge_truncated_at_output_cap_is_a_failure_not_a_verdict() -> None:
+    """Seen live: 33,857 input tokens, hit the 4,096 cap, empty preview."""
+    # Parseable on its own, so only the finish_reason check can reject it.
+    body = _openai_json_response(
+        '{"verdicts": [{"index": 0, "is_real_bug": false, "reasoning": "cut"}]}',
+    )
+    body["choices"][0]["finish_reason"] = "length"
+    finding = {"rule_name": "r", "file": "src/x.py", "line": 1,
+               "severity": "low", "message": "m"}
+    cave = lc._cave_judge_config()
+    with patch.object(httpx, "post", return_value=httpx.Response(200, json=body)):
+        assert lc.judge_findings([finding], [_hunk()], installation_id=1, config=cave) == ()
+
+
+def test_cloud_judge_configs_empty_under_cave_priority(monkeypatch) -> None:
+    monkeypatch.delenv("GRUG_REVIEW_BACKEND_PRIORITY", raising=False)
+    assert lc.cloud_judge_configs() == []
+
+
+def test_cloud_judge_configs_put_poolside_first_and_cap_output(monkeypatch) -> None:
+    monkeypatch.setenv("GRUG_REVIEW_BACKEND_PRIORITY", "cloud")
+    monkeypatch.setenv("GRUG_CLOUD_FREE_TIER_MODEL", "z-ai/glm-5.2:free")
+    configs = lc.cloud_judge_configs()
+    assert [c.backend for c in configs] == [Backend.POOLSIDE, Backend.OPENROUTER]
+    assert all(c.extra_body["max_tokens"] == 4_096 for c in configs)
+    assert all(c.backend != Backend.CAVE for c in configs)
+
+
+def test_poolside_parse_failure_falls_through_to_cave(monkeypatch) -> None:
+    """2026-09-27: laguna-s-2.1 on Poolside answered in prose with no JSON
+    18 times in 45 minutes, and each became the review. A fallback tier's
+    parse failure is a miss; the Cave answers."""
+    monkeypatch.setenv("GRUG_REVIEW_BACKEND_PRIORITY", "cloud")
+    go_down = httpx.ConnectError("opencode go unreachable")
+    prose = httpx.Response(
+        200, json=_openai_json_response("Grug squint at the stone. One thing bites."),
+    )
+    cave = httpx.Response(200, json=_openai_json_response('{"findings": []}'))
+
+    with patch.object(httpx, "post", side_effect=[go_down, prose, cave]) as post:
+        out = review_diff([_hunk()], installation_id=1)
+
+    assert out.kind == "reviewed"
+    assert out.backend_used == Backend.CAVE
+    assert post.call_count == 3

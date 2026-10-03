@@ -46,7 +46,7 @@ def test_renamed_checks_keep_their_old_titles_as_aliases():
     """A live check-run, or a ruleset naming the old context, must keep
     resolving after the rename. Verified before renaming that no ruleset
     REQUIRED any of these three (only `Grug - Chief` is required across
-    grug/macchina/infra) - but a stale reference must still resolve, not
+    grug and two private repos) - but a stale reference must still resolve, not
     silently detach."""
     from personas import tribe
 

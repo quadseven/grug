@@ -48,7 +48,7 @@ def _learning_record(comment_id=1):
     record.update({
         "finding_text": "Optional value is dereferenced without a guard.",
         "head_sha": "abc123",
-        "author_login": "evan",
+        "author_login": "alice",
         "trust_reactors": True,
     })
     record["finding_tags"]["severity"] = "high"
@@ -144,13 +144,13 @@ def test_poll_uses_write_collaborator_reaction_and_ignores_outsider(
     monkeypatch.setattr(
         cr_reactions,
         "_has_write_permission",
-        lambda token, owner, repo, login: login == "evan",
+        lambda token, owner, repo, login: login == "alice",
     )
     response = MagicMock(spec=httpx.Response)
     response.raise_for_status = MagicMock()
     response.json = MagicMock(return_value=[
         {"content": "-1", "user": {"login": "outsider"}},
-        {"content": "+1", "user": {"login": "evan"}},
+        {"content": "+1", "user": {"login": "alice"}},
     ])
 
     with patch("httpx.get", return_value=response):
@@ -421,7 +421,7 @@ def test_poll_learns_without_span_when_trusted_fields_exist(monkeypatch, _patch_
     response = MagicMock(spec=httpx.Response)
     response.raise_for_status = MagicMock()
     response.json = MagicMock(return_value=[
-        {"content": "+1", "user": {"login": "evan"}},
+        {"content": "+1", "user": {"login": "alice"}},
     ])
 
     with patch("httpx.get", return_value=response):
@@ -450,8 +450,8 @@ def test_write_permission_check_uses_collaborator_endpoint(monkeypatch):
 
     monkeypatch.setattr(httpx, "get", get)
 
-    assert cr_reactions._has_write_permission("tok", "o", "r", "evan") is True
-    assert captured["url"].endswith("/repos/o/r/collaborators/evan/permission")
+    assert cr_reactions._has_write_permission("tok", "o", "r", "alice") is True
+    assert captured["url"].endswith("/repos/o/r/collaborators/alice/permission")
 
 
 def test_reaction_poll_quotes_repository_coordinates(monkeypatch):

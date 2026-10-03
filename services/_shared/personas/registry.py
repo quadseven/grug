@@ -20,8 +20,14 @@ from dataclasses import dataclass
 from typing import Any, Literal
 
 from personas.tribe import (
-    CHECK_CHIEF, CHECK_ELDER, CHECK_GUARD, CHECK_PULSE,
-    CHECK_SENTINEL, CHECK_SMASHER, CHECK_TELLER, CHECK_WARDER,
+    CHECK_CHIEF,
+    CHECK_ELDER,
+    CHECK_GUARD,
+    CHECK_PULSE,
+    CHECK_SENTINEL,
+    CHECK_SMASHER,
+    CHECK_TELLER,
+    CHECK_WARDER,
 )
 
 # How a persona runs relative to the webhook ACK path.
@@ -40,7 +46,11 @@ MissingRepoPolicy = Literal["enabled", "disabled"]
 # hand-wired set (moved here from the dispatcher gate with #471, which
 # added the first non-update action, "closed").
 PR_UPDATE_ACTIONS: tuple[str, ...] = (
-    "opened", "edited", "synchronize", "ready_for_review", "reopened",
+    "opened",
+    "edited",
+    "synchronize",
+    "ready_for_review",
+    "reopened",
 )
 
 
@@ -214,12 +224,12 @@ REGISTRY: tuple[PersonaSpec, ...] = (
         blocking_flag=None,  # purely advisory - the PR is already closed
         blocking_default=False,
         dispatch_style="inline",  # one store read + at most one comment,
-                                   # no LLM call
+        # no LLM call
         missing_repo_policy="enabled",
         events=("pull_request",),
         dispatch_module="personas.sentinel.webhook_dispatch",
         actions=("closed",),  # same seam as Warder (#471) - the PR's
-                               # terminal state, merged or not
+        # terminal state, merged or not
     ),
     PersonaSpec(
         key="smasher",
@@ -229,7 +239,7 @@ REGISTRY: tuple[PersonaSpec, ...] = (
         check_run_name=CHECK_SMASHER,
         enabled_flag="smasher_enabled",
         enabled_default=False,  # execution tracer: opt-in per repo (#469)
-        blocking_flag=None,     # mutation findings are inherently advisory
+        blocking_flag=None,  # mutation findings are inherently advisory
         blocking_default=False,
         dispatch_style="async",  # the Job round-trip is far over the ACK budget
         missing_repo_policy="disabled",  # never run author code blind
@@ -266,6 +276,22 @@ REGISTRY: tuple[PersonaSpec, ...] = (
         # the store flags + roster identity; the dispatch loop skips it.
         events=(),
         dispatch_module="personas.pulse.nudge",
+        actions=(),
+    ),
+    PersonaSpec(
+        key="pulse_comment_nudge",
+        canonical="drum-nudge",
+        check_run_name=CHECK_PULSE,
+        enabled_flag="pulse_comment_nudge_enabled",
+        enabled_default=False,  # tracer: opt-in per repo (#656)
+        blocking_flag=None,
+        blocking_default=False,
+        dispatch_style="inline",
+        missing_repo_policy="disabled",
+        # SCHEDULED persona: no webhook events - runs on the poller
+        # cadence (personas/pulse/comment_nudge.py), like pulse above.
+        events=(),
+        dispatch_module="personas.pulse.comment_nudge",
         actions=(),
     ),
 )

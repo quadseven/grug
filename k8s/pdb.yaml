@@ -1,6 +1,6 @@
 # PodDisruptionBudgets for the multi-replica stateless services (grug#697
 # follow-up: single-node blast-radius reduction). minAvailable: 1 means a
-# voluntary disruption (node drain for maintenance/reboot - see the k8s-oke
+# voluntary disruption (node drain for maintenance/reboot - see the cluster
 # reboot runbook) can never evict BOTH replicas at once. The deployments'
 # zone-spread/anti-affinity are SOFT (a scheduling bias, not a placement
 # guarantee), so drain-safety comes from the PDB itself: the replicas may

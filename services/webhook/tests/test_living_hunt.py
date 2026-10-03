@@ -75,7 +75,7 @@ def test_fetch_pr_diff_scope_reports_full_fallback(monkeypatch):
         cr_dispatch.httpx, "get", fake_get,
     )
 
-    diff, used_compare = cr_dispatch._fetch_pr_diff_with_scope(
+    diff, used_compare, _rejected = cr_dispatch._fetch_pr_diff_with_scope(
         "token", "owner", "repo", 7, base_sha="abc", head_sha="def",
     )
 
@@ -125,7 +125,7 @@ def test_fetch_pr_diff_scope_zippie_127_diverged_baseline_falls_back(monkeypatch
 
     monkeypatch.setattr(cr_dispatch.httpx, "get", fake_get)
 
-    diff, used_compare = cr_dispatch._fetch_pr_diff_with_scope(
+    diff, used_compare, _rejected = cr_dispatch._fetch_pr_diff_with_scope(
         "token", "quadseven", "zippie", 127,
         base_sha="4dbd2011", head_sha="2a913a31",
     )
@@ -154,7 +154,7 @@ def test_fetch_pr_diff_scope_behind_baseline_falls_back(monkeypatch):
     ]
     monkeypatch.setattr(cr_dispatch.httpx, "get", lambda url, **kw: responses.pop(0))
 
-    diff, used_compare = cr_dispatch._fetch_pr_diff_with_scope(
+    diff, used_compare, _rejected = cr_dispatch._fetch_pr_diff_with_scope(
         "token", "owner", "repo", 7, base_sha="abc", head_sha="def",
     )
     assert diff == "full diff"
@@ -173,11 +173,95 @@ def test_fetch_pr_diff_scope_clean_ahead_baseline_uses_compare(monkeypatch):
     ]
     monkeypatch.setattr(cr_dispatch.httpx, "get", lambda url, **kw: responses.pop(0))
 
-    diff, used_compare = cr_dispatch._fetch_pr_diff_with_scope(
+    diff, used_compare, _rejected = cr_dispatch._fetch_pr_diff_with_scope(
         "token", "owner", "repo", 7, base_sha="abc", head_sha="def",
     )
     assert diff == "the real delta diff"
     assert used_compare is True
+
+
+def test_fetch_pr_diff_scope_diverged_reports_baseline_rejected(monkeypatch):
+    """grug#845's last criterion: a rejected baseline must be REPORTED, not
+    just logged. The fetch layer distinguishes \"baseline unusable because
+    diverged\" (rejected=True) from \"baseline unavailable\" (404/422,
+    rejected=False) so the summary can say which happened."""
+    responses = [
+        httpx.Response(
+            200,
+            text="diff --git a/unrelated/x.kt b/unrelated/x.kt\n...",
+            request=httpx.Request("GET", "https://compare-diff"),
+        ),
+        httpx.Response(
+            200,
+            json={"status": "diverged", "ahead_by": 18, "behind_by": 2},
+            request=httpx.Request("GET", "https://compare-json"),
+        ),
+        httpx.Response(200, text="full diff", request=httpx.Request("GET", "https://pull")),
+    ]
+    monkeypatch.setattr(cr_dispatch.httpx, "get", lambda url, **kw: responses.pop(0))
+
+    diff, used_compare, baseline_rejected = cr_dispatch._fetch_pr_diff_with_scope(
+        "token",
+        "owner",
+        "repo",
+        7,
+        base_sha="abc",
+        head_sha="def",
+    )
+    assert diff == "full diff"
+    assert used_compare is False
+    assert baseline_rejected is True
+
+
+def test_fetch_pr_diff_scope_unavailable_baseline_is_not_rejected(monkeypatch):
+    """A 404/422 means the baseline is simply unavailable (never stored,
+    GC'd) - not a rejected one. The summary must not claim a rewrite."""
+    responses = [
+        httpx.Response(422, request=httpx.Request("GET", "https://compare")),
+        httpx.Response(200, text="full diff", request=httpx.Request("GET", "https://pull")),
+    ]
+    monkeypatch.setattr(cr_dispatch.httpx, "get", lambda url, **kw: responses.pop(0))
+
+    diff, used_compare, baseline_rejected = cr_dispatch._fetch_pr_diff_with_scope(
+        "token",
+        "owner",
+        "repo",
+        7,
+        base_sha="abc",
+        head_sha="def",
+    )
+    assert diff == "full diff"
+    assert used_compare is False
+    assert baseline_rejected is False
+
+
+def test_summary_marks_rejected_living_hunt_baseline():
+    """grug#845: when the stored Living Hunt baseline was rejected as a
+    non-ancestor, the check-run summary says so - the fallback to the full
+    PR diff is visible, not silent."""
+    from personas.code_reviewer.persona import CodeReviewEvaluation
+    ev = CodeReviewEvaluation(findings=(), conclusion="success")
+    title, summary = cr_dispatch._summary_markdown(
+        ev,
+        living_baseline_rejected="4dbd2011",
+    )
+    assert "4dbd2011" in summary
+    assert "not an ancestor" in summary
+    assert "full PR diff" in summary
+    # The title stays clean: no range to name, nothing to prefix.
+    assert "Living Hunt" not in title
+
+
+def test_summary_omits_rejected_note_without_rejection():
+    """No rejection, no note - ordinary reviews and clean Living Hunt
+    deltas render exactly as before."""
+    from personas.code_reviewer.persona import CodeReviewEvaluation
+    ev = CodeReviewEvaluation(findings=(), conclusion="success")
+    _, summary = cr_dispatch._summary_markdown(ev)
+    assert "not an ancestor" not in summary
+    _, summary = cr_dispatch._summary_markdown(ev, living_range="abc123..def456")
+    assert "not an ancestor" not in summary
+    assert "Living Hunt: reviewing `abc123..def456`" in summary
 
 
 def test_compare_is_clean_ancestor_fails_closed_on_transport_error(monkeypatch):
@@ -291,7 +375,7 @@ def test_living_hunt_delta_done_log_on_successful_persist(monkeypatch, caplog):
     monkeypatch.setattr(cr_dispatch, "grade_findings", lambda *a, **kw: ())
     monkeypatch.setattr(
         cr_dispatch, "_fetch_pr_diff_with_scope",
-        lambda *a, **k: ("diff --git a/x.py b/x.py\n--- a/x.py\n+++ b/x.py\n@@ -1 +1 @@\n-old\n+new\n", True),
+        lambda *a, **k: ("diff --git a/x.py b/x.py\n--- a/x.py\n+++ b/x.py\n@@ -1 +1 @@\n-old\n+new\n", True, False),
     )
     monkeypatch.setattr(
         cr_dispatch, "_fetch_current_review_snapshot",
@@ -325,7 +409,7 @@ def test_living_hunt_delta_done_log_on_successful_persist(monkeypatch, caplog):
                         "base": {"sha": "base5678ijkl"},
                         "title": "t",
                         "body": "b",
-                        "user": {"login": "evan"},
+                        "user": {"login": "alice"},
                     },
                 },
                 blocking=False,

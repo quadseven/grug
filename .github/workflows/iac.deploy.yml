@@ -119,7 +119,7 @@ jobs:
 
   # Public-endpoint smoke test, migrated to the shared reusable so the
   # curl-retry + status-assert pattern lives in one place (quadseven/infra-public
-  # #24, quadseven/infrastructure#840). SHA-pinned to PR #24's MERGE commit -
+  # #24, infra#840). SHA-pinned to PR #24's MERGE commit -
   # NEVER a PR-branch tip: the branch gets deleted after merge, the SHA goes
   # dangling, and Actions cross-repo resolution then fails the whole caller
   # with a zero-job 'workflow file issue' (broke every main deploy 2026-07-03).

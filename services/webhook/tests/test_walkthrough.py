@@ -258,21 +258,21 @@ def test_changed_files_table_strips_backtick_from_path_cell():
 
 
 def test_changed_files_table_neutralizes_mention_in_summary_and_path():
-    files = [FileStat(path="@evan/notes.py", additions=1, deletions=0,
+    files = [FileStat(path="@alice/notes.py", additions=1, deletions=0,
                        summary="ping @cait about this")]
     table = changed_files_table(files)
     assert "@cait" not in table  # the live mention form must not survive
     assert "@​cait" in table
-    assert "@​evan" in table
+    assert "@​alice" in table
 
 
 def test_walkthrough_body_neutralizes_mention_in_top_level_summary():
     body = walkthrough_body(
-        summary="hey @evan check this out", files=[], diagram=None,
+        summary="hey @alice check this out", files=[], diagram=None,
         effort="quick", head_sha="f" * 40, degraded=False,
     )
-    assert "@evan" not in body
-    assert "@​evan" in body
+    assert "@alice" not in body
+    assert "@​alice" in body
 
 
 def test_walkthrough_body_neutralizes_fake_heading_in_summary():

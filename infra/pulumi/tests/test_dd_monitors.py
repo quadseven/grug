@@ -65,6 +65,8 @@ def test_crashloop_query_detects_crashloopbackoff_per_pod() -> None:
     assert "kube_namespace:grug" in q
     assert "by {pod_name}" in q
     assert "> 0" in q
+    # infra#2081: healthy must read OK, not No Data.
+    assert q.startswith("max(last_5m):default_zero(max:")
 
 
 def test_restart_spike_query_is_namespace_scoped() -> None:
@@ -359,6 +361,8 @@ def test_deploy_rollback_query_shape() -> None:
     q = deploy_rollback_query("prod")
     assert "grug.deploy.rollback" in q and "env:prod" in q
     assert q.endswith("> 0") and ".as_count()" in q
+    # infra#2081: a quiet window must read OK, not No Data.
+    assert "default_zero(sum:grug.deploy.rollback{" in q
 
 
 @pulumi.runtime.test
@@ -538,6 +542,18 @@ def test_backend_unusable_query_targets_the_terminal_token_only() -> None:
         "alerting on the overload token would be pure noise"
     )
     assert "env:prod" in q
+
+
+def test_backend_unusable_monitor_does_not_page_on_free_tier_refusals() -> None:
+    """Operator decision 2026-09-23: the OpenRouter key runs only on the free
+    tier, which refuses intermittently with `403 Key limit exceeded`. grug logs
+    that as `llm_backend_rate_limited`, and the paging monitor must not match
+    it, or it pages on a dependency known to be flaky."""
+    from components.dd_monitors import backend_unusable_query
+
+    q = backend_unusable_query("prod")
+    assert "llm_backend_rate_limited" not in q
+    assert "rate_limited" not in q
 
 
 # --- #948: observing GitHub reachability from the outside -------------------

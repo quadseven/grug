@@ -6,7 +6,7 @@ pins the contract values a well-meaning cleanup would break:
 - The Certificate MUST carry BOTH `digital signature` AND `client auth`
   usages: `client auth` alone sets EKU but no keyUsage and Roles Anywhere
   rejects the leaf with "Insufficient certificate" (verified live,
-  infrastructure#1318 Phase 4 - the gotcha that cost a failed attempt).
+  infra#1318 Phase 4 - the gotcha that cost a failed attempt).
 - NO workload receives the static AWS key pair (#389 fleet rollout):
   env credentials out-rank credential_process in the SDK chain, silently
   bypassing the path the boot proofs assert.

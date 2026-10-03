@@ -81,6 +81,7 @@ class RepoConfigPayload(BaseModel):
     warder_gate_blocking: bool | None = Field(default=None)
     sentinel_enabled: bool | None = Field(default=None)
     pulse_enabled: bool | None = Field(default=None)
+    pulse_comment_nudge_enabled: bool | None = Field(default=None)
     smasher_enabled: bool | None = Field(default=None)
     walkthrough_enabled: bool | None = Field(default=None)
     dep_watch_enabled: bool | None = Field(default=None)
@@ -471,6 +472,7 @@ def update_repo_config(
         warder_gate_blocking=body.warder_gate_blocking,
         sentinel_enabled=body.sentinel_enabled,
         pulse_enabled=body.pulse_enabled,
+        pulse_comment_nudge_enabled=body.pulse_comment_nudge_enabled,
         smasher_enabled=body.smasher_enabled,
         walkthrough_enabled=body.walkthrough_enabled,
         dep_watch_enabled=body.dep_watch_enabled,

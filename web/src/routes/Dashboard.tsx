@@ -54,6 +54,7 @@ const PERSONAS = [
   { id: "warder", code: "F-06", name: "Warder", img: "grug_mystic.png", desc: "Shaman at the gate. Changelog scroll, semver hint, ward bad release from tribe.", meta: ["release scroll", "SLO gate"], modes: ["block", "warn", "off"] },
   { id: "pulse", code: "F-07", name: "Pulse", img: "grug_mullet.png", desc: "Walk the camp at night. Poke sleeping hunts Chief already blessed.", meta: ["stale nudge", "scheduled"], modes: [], info: "scheduled" },
   { id: "sentinel", code: "F-08", name: "Sentinel", img: "grug_guard.png", desc: "Watch hunts that end wrong. Name markings left unanswered when PR close or merge.", meta: ["abandoned findings", "safety net"], modes: [], info: "comment-only" },
+  { id: "pulse_comment_nudge", code: "F-09", name: "Pulse Nudge", img: "grug_mullet.png", desc: "Whisper fixes into stale threads. One suggested-fix reply per unanswered review thread.", meta: ["thread nudge", "scheduled"], modes: [], info: "scheduled" },
 ] as const;
 
 const SKINS = [
@@ -313,6 +314,9 @@ function ReposPanel({ show, installId, reposLoading, fireToast }: { show: boolea
             <RepoRow key={r.repo_id} repo={r} installId={installId!}
               onToggle={(enabled) => { setConfig.mutate({ repo_id: r.repo_id, tpm_enabled: enabled }); const nm = esc(r.full_name.split("/")[1] ?? ""); fireToast(enabled ? `Grug now guard <span class="am">${nm}</span>.` : `Grug sleep on <span class="am">${nm}</span>.`); }}
               onGuardToggle={(enabled) => { setConfig.mutate({ repo_id: r.repo_id, tpm_enabled: r.config.tpm_enabled, guard_enabled: enabled }); const nm = esc(r.full_name.split("/")[1] ?? ""); fireToast(enabled ? `Guard watch <span class="am">${nm}</span>. Evil shall not pass.` : `Guard sleep on <span class="am">${nm}</span>.`); }}
+              onDepWatchToggle={(enabled) => { setConfig.mutate({ repo_id: r.repo_id, tpm_enabled: r.config.tpm_enabled, dep_watch_enabled: enabled }); }}
+              onReopenWatchToggle={(enabled) => { setConfig.mutate({ repo_id: r.repo_id, tpm_enabled: r.config.tpm_enabled, reopen_watch_enabled: enabled }); }}
+              onGuardHygieneWatchToggle={(enabled) => { setConfig.mutate({ repo_id: r.repo_id, tpm_enabled: r.config.tpm_enabled, guard_hygiene_watch_enabled: enabled }); }}
               onFix={() => fixEnforcement.mutate(r.repo_id)}
               fixPending={fixEnforcement.isPending && fixEnforcement.variables === r.repo_id}
               fixError={fixEnforcement.isError && fixEnforcement.variables === r.repo_id ? ((fixEnforcement.error as Error)?.message ?? "fix failed") : undefined}
@@ -327,14 +331,18 @@ function ReposPanel({ show, installId, reposLoading, fireToast }: { show: boolea
   );
 }
 
-function RepoRow({ repo, installId, onToggle, onGuardToggle, onFix, fixPending, fixError }: {
-  repo: Repo; installId: number; onToggle: (e: boolean) => void; onGuardToggle: (e: boolean) => void; onFix: () => void; fixPending: boolean; fixError?: string;
+function RepoRow({ repo, installId, onToggle, onGuardToggle, onDepWatchToggle, onReopenWatchToggle, onGuardHygieneWatchToggle, onFix, fixPending, fixError }: {
+  repo: Repo; installId: number; onToggle: (e: boolean) => void; onGuardToggle: (e: boolean) => void; onDepWatchToggle: (e: boolean) => void; onReopenWatchToggle: (e: boolean) => void; onGuardHygieneWatchToggle: (e: boolean) => void; onFix: () => void; fixPending: boolean; fixError?: string;
 }) {
   const [owner, name] = repo.full_name.split("/");
   const on = repo.config.tpm_enabled;
   // Real backend flag (#483) - the roster tile stays cosmetic; THIS is
   // the per-repo truth ("no lies").
   const guardOn = repo.config.guard_enabled !== false;
+  // Watch flags (#768) - default off when unset (backend stores null).
+  const depWatchOn = repo.config.dep_watch_enabled === true;
+  const reopenWatchOn = repo.config.reopen_watch_enabled === true;
+  const guardHygieneWatchOn = repo.config.guard_hygiene_watch_enabled === true;
   const enforcement = useEnforcement(on ? installId : undefined, on ? repo.repo_id : undefined);
   const state = enforcement.data?.enforcement_state;
   const degraded = enforcement.data?.degraded === true;
@@ -360,6 +368,12 @@ function RepoRow({ repo, installId, onToggle, onGuardToggle, onFix, fixPending, 
       <div className={`sw${guardOn ? " on" : ""}`} onClick={() => onGuardToggle(!guardOn)} role="switch" aria-checked={guardOn} title="Toggle the Guard (security) persona for this repo"></div>
       <span className={`state ${on ? "live" : "paused"}`} title={on ? "GUARDED: Grug watches this repo and posts a Check Run on every PR. Toggle off to silence Grug here." : "PAUSED: Grug is asleep on this repo. Toggle on to guard it."}>{on ? "GUARDED" : "PAUSED"}</span>
       <div className={`sw${on ? " on" : ""}`} onClick={() => onToggle(!on)} role="switch" aria-checked={on}></div>
+      <span className={`state ${depWatchOn ? "live" : "paused"}`} title={depWatchOn ? "DEP WATCH ON: Grug watches for dependency updates." : "DEP WATCH OFF."}>{depWatchOn ? "DEP WATCH" : "DEP WATCH OFF"}</span>
+      <div className={`sw${depWatchOn ? " on" : ""}`} onClick={() => onDepWatchToggle(!depWatchOn)} role="switch" aria-checked={depWatchOn} title="Toggle dependency watch for this repo"></div>
+      <span className={`state ${reopenWatchOn ? "live" : "paused"}`} title={reopenWatchOn ? "REOPEN WATCH ON: Grug watches for reopened issues/PRs." : "REOPEN WATCH OFF."}>{reopenWatchOn ? "REOPEN WATCH" : "REOPEN WATCH OFF"}</span>
+      <div className={`sw${reopenWatchOn ? " on" : ""}`} onClick={() => onReopenWatchToggle(!reopenWatchOn)} role="switch" aria-checked={reopenWatchOn} title="Toggle reopen watch for this repo"></div>
+      <span className={`state ${guardHygieneWatchOn ? "live" : "paused"}`} title={guardHygieneWatchOn ? "GUARD HYGIENE WATCH ON." : "GUARD HYGIENE WATCH OFF."}>{guardHygieneWatchOn ? "HYGIENE WATCH" : "HYGIENE WATCH OFF"}</span>
+      <div className={`sw${guardHygieneWatchOn ? " on" : ""}`} onClick={() => onGuardHygieneWatchToggle(!guardHygieneWatchOn)} role="switch" aria-checked={guardHygieneWatchOn} title="Toggle guard hygiene watch for this repo"></div>
     </div>
   );
 }

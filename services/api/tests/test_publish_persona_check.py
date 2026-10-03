@@ -502,7 +502,7 @@ def _persona_kwargs(persona: str) -> dict:
 
 @pytest.mark.parametrize("persona", ["tpm", "guard"])
 def test_transient_connect_error_retries_then_succeeds(monkeypatch, persona):
-    """#697: a one-shot DNS/connect blip (the digital-ledger#204 incident)
+    """#697: a one-shot DNS/connect blip (the a private repo incident)
     must be absorbed by the bounded retry, not leave the check-run
     permanently un-posted."""
     from personas import publish_check

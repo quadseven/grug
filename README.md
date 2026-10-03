@@ -46,8 +46,8 @@ That's it. Webhook is wired, check-runs post on every PR.
 
 > **Note:** the hosted instance is **allowlist-gated**. Request access by
 > opening a GitHub issue on this repo (no bracket prefix needed, `gh issue
-> create` works fine) - a maintainer will pick it up even if `@evan`
-> specifically hasn't. Self-host (below) is the open path and needs nobody's
+> create` works fine) - a maintainer will pick it up.
+> Self-host (below) is the open path and needs nobody's
 > approval.
 
 ### Self-host (run Grug in your own cave)
@@ -76,6 +76,11 @@ Before the tribe leave the cave, Chief reads the **Hunt Plan** on the PR body â€
 | yes | `estimate` | Body or label includes `Size: XS/S/M/L` (XL must be split) | **yes** |
 | yes | `scope-fence` | Has `## Out of scope` section | **yes** |
 | soft | `issue-link` | Body links an issue via `closes #N` | advisory |
+
+The Hunt Plan is for PRs written by people. A PR body carrying an
+agent-authored marker (a `claude.ai/code/session_` link, or
+`<!-- grug:agent-authored -->`) gets a **neutral** `Grug - Chief`, which still
+satisfies a required check. Elder and Guard review that PR as usual.
 
 ## What Elder and Guard check
 

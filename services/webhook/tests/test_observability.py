@@ -112,7 +112,7 @@ def _sent_datagrams(monkeypatch):
 
 
 def test_emit_enforcement_metric_sends_dogstatsd_datagram(monkeypatch):
-    monkeypatch.setenv("DD_AGENT_HOST", "10.0.0.99")
+    monkeypatch.setenv("DD_AGENT_HOST", "192.0.2.99")
     monkeypatch.setenv("GRUG_ENV", "prod")
     monkeypatch.delenv("DD_ENV", raising=False)
     sent = _sent_datagrams(monkeypatch)
@@ -120,12 +120,12 @@ def test_emit_enforcement_metric_sends_dogstatsd_datagram(monkeypatch):
     assert sent == [(
         b"grug.enforcement.state:1.0|g|#repo:quadseven/infra,persona:tpm,"
         b"enforcement_type:grug_managed,env:prod",
-        ("10.0.0.99", 8125),
+        ("192.0.2.99", 8125),
     )]
 
 
 def test_emit_enforcement_metric_value_mapping(monkeypatch):
-    monkeypatch.setenv("DD_AGENT_HOST", "10.0.0.99")
+    monkeypatch.setenv("DD_AGENT_HOST", "192.0.2.99")
     monkeypatch.setenv("GRUG_ENV", "prod")
     monkeypatch.delenv("DD_ENV", raising=False)
     sent = _sent_datagrams(monkeypatch)
@@ -149,7 +149,7 @@ def test_emit_enforcement_metric_skips_without_agent_host(monkeypatch, caplog):
 
 
 def test_emit_enforcement_metric_does_not_raise_on_socket_failure(monkeypatch, caplog):
-    monkeypatch.setenv("DD_AGENT_HOST", "10.0.0.99")
+    monkeypatch.setenv("DD_AGENT_HOST", "192.0.2.99")
 
     def _boom(*a, **k):
         raise OSError("network unreachable")
@@ -165,14 +165,14 @@ def test_emit_enforcement_metric_does_not_raise_on_socket_failure(monkeypatch, c
 def test_emit_gauge_sends_datagram_with_env_tag(monkeypatch):
     from observability import emit_gauge
 
-    monkeypatch.setenv("DD_AGENT_HOST", "10.0.0.99")
+    monkeypatch.setenv("DD_AGENT_HOST", "192.0.2.99")
     monkeypatch.setenv("GRUG_ENV", "prod")
     monkeypatch.delenv("DD_ENV", raising=False)
     sent = _sent_datagrams(monkeypatch)
     emit_gauge("grug.sqs.messages_visible", 3.0, {"queue": "grug-rerun-jobs.fifo"})
     assert sent == [(
         b"grug.sqs.messages_visible:3.0|g|#queue:grug-rerun-jobs.fifo,env:prod",
-        ("10.0.0.99", 8125),
+        ("192.0.2.99", 8125),
     )]
 
 
@@ -190,7 +190,7 @@ def test_emit_gauge_skips_without_agent_host(monkeypatch, caplog):
 def test_emit_gauge_never_raises_on_socket_failure(monkeypatch, caplog):
     from observability import emit_gauge
 
-    monkeypatch.setenv("DD_AGENT_HOST", "10.0.0.99")
+    monkeypatch.setenv("DD_AGENT_HOST", "192.0.2.99")
 
     def _boom(*a, **k):
         raise OSError("network unreachable")
@@ -206,7 +206,7 @@ def test_emit_gauge_empty_or_none_tags_emit_env_only(monkeypatch):
     remains - DogStatsD drops malformed datagrams silently."""
     from observability import emit_gauge
 
-    monkeypatch.setenv("DD_AGENT_HOST", "10.0.0.99")
+    monkeypatch.setenv("DD_AGENT_HOST", "192.0.2.99")
     monkeypatch.setenv("GRUG_ENV", "prod")
     monkeypatch.delenv("DD_ENV", raising=False)
     sent = _sent_datagrams(monkeypatch)
@@ -218,7 +218,7 @@ def test_emit_gauge_empty_or_none_tags_emit_env_only(monkeypatch):
 def test_emit_gauge_prefers_dd_env_over_grug_env(monkeypatch):
     from observability import emit_gauge
 
-    monkeypatch.setenv("DD_AGENT_HOST", "10.0.0.99")
+    monkeypatch.setenv("DD_AGENT_HOST", "192.0.2.99")
     monkeypatch.setenv("DD_ENV", "staging")
     monkeypatch.setenv("GRUG_ENV", "prod")
     sent = _sent_datagrams(monkeypatch)
@@ -231,18 +231,18 @@ def test_emit_gauge_sanitizes_tags_and_reserves_env_key(monkeypatch):
     env key cannot shadow the auto env tag."""
     from observability import emit_gauge
 
-    monkeypatch.setenv("DD_AGENT_HOST", "10.0.0.99")
+    monkeypatch.setenv("DD_AGENT_HOST", "192.0.2.99")
     monkeypatch.setenv("GRUG_ENV", "prod")
     monkeypatch.delenv("DD_ENV", raising=False)
     sent = _sent_datagrams(monkeypatch)
     emit_gauge("m", 1.0, {"queue": "a|b,c#d", "env": "evil"})
-    assert sent == [(b"m:1.0|g|#queue:a_b_c_d,env:prod", ("10.0.0.99", 8125))]
+    assert sent == [(b"m:1.0|g|#queue:a_b_c_d,env:prod", ("192.0.2.99", 8125))]
 
 
 def test_emit_gauge_skips_non_finite_values(monkeypatch, caplog):
     from observability import emit_gauge
 
-    monkeypatch.setenv("DD_AGENT_HOST", "10.0.0.99")
+    monkeypatch.setenv("DD_AGENT_HOST", "192.0.2.99")
     sent = _sent_datagrams(monkeypatch)
     with caplog.at_level("WARNING", logger="grug.observability"):
         emit_gauge("m", float("nan"))

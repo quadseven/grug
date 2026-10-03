@@ -29,7 +29,7 @@ def test_get_user_unknown_returns_none(_us):
 
 def test_get_user_with_tokens_returns_decrypted_access_token(_us):
     _us.upsert_oauth_user(
-        github_user_id="100", login="evan",
+        github_user_id="100", login="alice",
         oauth_access_token="ACCESS-1", oauth_refresh_token="REFRESH-1",
     )
     u = _us.get_user_with_tokens("100")
@@ -37,12 +37,12 @@ def test_get_user_with_tokens_returns_decrypted_access_token(_us):
     assert u.oauth_access_token == "ACCESS-1"
     assert u.oauth_refresh_token == "REFRESH-1"
     # Identity nested attribute carries the same login + role.
-    assert u.identity.login == "evan"
+    assert u.identity.login == "alice"
 
 
 def test_get_user_with_tokens_no_refresh_returns_none_refresh(_us):
     _us.upsert_oauth_user(
-        github_user_id="100", login="evan",
+        github_user_id="100", login="alice",
         oauth_access_token="ACCESS-only", oauth_refresh_token=None,
     )
     u = _us.get_user_with_tokens("100")
@@ -54,7 +54,7 @@ def test_get_user_with_tokens_no_refresh_returns_none_refresh(_us):
 def test_get_user_does_not_carry_token_fields(_us):
     """Identity-only path must not expose token attrs (#103 invariant)."""
     _us.upsert_oauth_user(
-        github_user_id="100", login="evan",
+        github_user_id="100", login="alice",
         oauth_access_token="x", oauth_refresh_token=None,
     )
     u = _us.get_user("100")

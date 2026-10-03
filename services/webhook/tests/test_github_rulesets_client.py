@@ -675,19 +675,19 @@ def test_list_installation_repos_excludes_forks():
 
 def test_list_installation_repos_fork_exclusion_keeps_real_gaps():
     """The exclusion must NARROW the denominator, not empty it. A non-fork,
-    non-archived repo is exactly the `yuzu-yard-sale` case from the same live
+    non-archived repo is exactly the `not-a-fork` case from the same live
     alert: a genuine unenforced first-party repo that has to stay counted, or
     the exclusion would be hiding gaps rather than correcting the set."""
     from github_rulesets_client import list_installation_repos
 
     body = {"total_count": 2, "repositories": [
         {"id": 11, "full_name": "o/fork", "default_branch": "main", "fork": True},
-        {"id": 12, "full_name": "o/yuzu-yard-sale", "default_branch": "main",
+        {"id": 12, "full_name": "o/not-a-fork", "default_branch": "main",
          "fork": False, "archived": False},
     ]}
     with patch("httpx.get", return_value=_ok_response(body)):
         out = list_installation_repos("tok")
-    assert [r["full_name"] for r in out] == ["o/yuzu-yard-sale"]
+    assert [r["full_name"] for r in out] == ["o/not-a-fork"]
 
 
 def test_list_installation_repos_absent_fork_key_is_not_a_fork():

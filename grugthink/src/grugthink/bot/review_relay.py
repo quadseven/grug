@@ -40,7 +40,7 @@ CHECK_ELDER_NAMES = (
     f"Grug {_EM} Elder",
 )
 
-# Every repo in task_relay.REPO_CHANNELS lives under this GitHub org.
+# Every repo in task_relay.repo_channels() lives under this GitHub org.
 GITHUB_ORG = "quadseven"
 
 GITHUB_API = "https://api.github.com"

@@ -275,7 +275,7 @@ def test_publish_tpm_evaluation_posts_on_success():
 
     assert captured["status"] == "completed"
     assert captured["conclusion"] == "success"
-    assert captured["external_id"] == f"grug-tpm:myorg/myrepo#42:{'abc123def456' + '0' * 28}"
+    assert captured["external_id"] == f"grug-tpm:myorg/myrepo#42:{'abc123def456' + '0' * 28}"  # leak-guard-allow: placeholder repo, not a real one
     assert out == {"persona": "tpm", "result": "pass"}
 
 
@@ -341,7 +341,7 @@ def test_publish_tpm_evaluation_external_id_format():
                 pr_number=99,
             )
 
-    assert captured["external_id"] == "grug-tpm:myorg/myrepo#99:deadbeef" + "0" * 32
+    assert captured["external_id"] == "grug-tpm:myorg/myrepo#99:deadbeef" + "0" * 32  # leak-guard-allow: placeholder repo, not a real one
 
 
 # --- #550 regression: publish failure must leave an honest Activity row ---
@@ -556,3 +556,90 @@ def test_every_check_has_a_display_name():
     body = "## Why\nreal reason goes here\n## Acceptance criteria\n- [ ] a\n- [ ] b\n- [ ] c\nSize: M\n## Out of scope\nnot the db\n"
     for r in run_all(body):
         assert persona.check_display_name(r.name) != r.name, r.name
+
+
+# --- Agent-authored PRs skip the Hunt Plan (neutral, never red) ---
+
+_AGENT_BODY_NO_PLAN = """Fixes the thing.
+
+https://claude.ai/code/session_01Ht7JaVzv2aacJ9r6Srso9r
+"""
+
+_HUMAN_BODY_NO_PLAN = "Fixes the thing.\n"
+
+
+def test_agent_authored_pr_without_plan_is_neutral_not_failure():
+    """A body with no Why/acceptance/Size/scope fence fails Chief for a
+    person, but an agent-authored body (session link) concludes NEUTRAL:
+    passes the required `Grug - Chief` context without format edits."""
+    evaluation = persona.evaluate_pull_request(_AGENT_BODY_NO_PLAN)
+    assert evaluation.conclusion == "neutral"
+    assert evaluation.passed is True
+    assert all(r.skipped for r in evaluation.results)
+
+
+def test_explicit_agent_marker_is_neutral():
+    body = "No plan here.\n\n<!-- grug:agent-authored -->\n"
+    assert persona.evaluate_pull_request(body).conclusion == "neutral"
+
+
+def test_agent_skip_never_fetches_linked_issues():
+    """The skip is decided on the body alone: no issue fetch is spent."""
+    def boom(*_a, **_kw):
+        raise AssertionError("fetcher must not be called on an agent PR")
+    body = _GOOD_BODY + "\nhttps://claude.ai/code/session_abc123\n"
+    evaluation = persona.evaluate_pull_request(
+        body, fetch_issue=boom, fetch_issue_facts=boom,
+    )
+    assert evaluation.conclusion == "neutral"
+
+
+def test_human_pr_without_plan_still_fails():
+    """No marker -> Chief still enforces the Hunt Plan for people."""
+    evaluation = persona.evaluate_pull_request(_HUMAN_BODY_NO_PLAN)
+    assert evaluation.conclusion == "failure"
+    assert evaluation.passed is False
+    names = {r.name for r in evaluation.results if not r.passed}
+    assert {"why", "acceptance", "estimate", "scope-fence"} <= names
+
+
+def test_non_session_claude_link_is_not_a_marker():
+    """Only a session link counts; a plain claude.ai mention in a human
+    body must not switch Chief off."""
+    body = _HUMAN_BODY_NO_PLAN + "\nSee https://claude.ai/code for context.\n"
+    assert persona.is_agent_authored(body) is False
+    assert persona.evaluate_pull_request(body).conclusion == "failure"
+
+
+def test_publish_agent_skip_posts_neutral_with_skip_title():
+    evaluation = persona.evaluate_pull_request(_AGENT_BODY_NO_PLAN)
+    posted: dict = {}
+    recorded: dict = {}
+
+    def fake_post(*a, **kw):
+        posted.update(kw)
+        posted["args"] = a
+        return {"id": 1}
+
+    with patch.object(publish_check, "with_install_token_retry", side_effect=lambda i, fn: fn("t")):
+        with patch.object(publish_check, "post_check_run", side_effect=fake_post):
+            with patch.object(publish_check, "record_check_verdict", side_effect=lambda **kw: recorded.update(kw)):
+                result = persona.publish_tpm_evaluation(
+                    evaluation, installation_id=1, owner="o", repo="r",
+                    head_sha="z" * 40, pr_number=3,
+                )
+    assert result["result"] == "pass"
+    assert recorded["conclusion"] == "neutral"
+    assert recorded["findings_count"] == 0
+    check = posted["args"][3]
+    assert check.conclusion == "neutral"
+    assert check.title == "Hunt Plan skipped - agent-authored PR"
+
+
+def test_tpm_evaluation_rejects_failed_neutral():
+    with pytest.raises(ValueError, match="incoherent"):
+        persona.TpmEvaluation(
+            passed=False,
+            results=(CheckResult("why", True, "ok", skipped=True),),
+            conclusion="neutral",
+        )

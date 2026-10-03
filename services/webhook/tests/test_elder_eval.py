@@ -541,16 +541,16 @@ def test_score_unresolvable_case_excluded_and_reported_separately_from_errored()
 def test_merge_baseline_same_prompt_keeps_other_backends():
     existing = {
         "prompt_sha": "abc",
-        "backends": {"openrouter": {"overall_catch": 0.5}, "sparkles": {"overall_catch": 0.1}},
+        "backends": {"openrouter": {"overall_catch": 0.5}, "cave": {"overall_catch": 0.1}},
     }
     fresh = {
         "prompt_sha": "abc",
-        "backends": {"sparkles": {"overall_catch": 0.2}},
+        "backends": {"cave": {"overall_catch": 0.2}},
     }
     merged, dropped = merge_baseline(existing, fresh)
     assert dropped == []
     assert merged["backends"]["openrouter"] == {"overall_catch": 0.5}
-    assert merged["backends"]["sparkles"] == {"overall_catch": 0.2}
+    assert merged["backends"]["cave"] == {"overall_catch": 0.2}
 
 
 def test_merge_baseline_changed_prompt_drops_stale_backends():
@@ -558,15 +558,15 @@ def test_merge_baseline_changed_prompt_drops_stale_backends():
     under the new prompt_sha would re-bless stale data as fresh."""
     existing = {
         "prompt_sha": "old",
-        "backends": {"openrouter": {"overall_catch": 0.5}, "sparkles": {"overall_catch": 0.1}},
+        "backends": {"openrouter": {"overall_catch": 0.5}, "cave": {"overall_catch": 0.1}},
     }
     fresh = {
         "prompt_sha": "new",
-        "backends": {"sparkles": {"overall_catch": 0.2}},
+        "backends": {"cave": {"overall_catch": 0.2}},
     }
     merged, dropped = merge_baseline(existing, fresh)
     assert dropped == ["openrouter"]
-    assert set(merged["backends"]) == {"sparkles"}
+    assert set(merged["backends"]) == {"cave"}
     assert merged["prompt_sha"] == "new"
 
 
@@ -1616,7 +1616,7 @@ def test_methodology_note_states_one_call_when_nothing_staged():
     a self-contradiction. Unstaged, ONE call is still the honest claim."""
     from elder_eval.__main__ import _methodology_note
 
-    note = _methodology_note("sparkles", staged=False)
+    note = _methodology_note("cave", staged=False)
     assert "ONE monolithic backend call" in note
     assert "staged" not in note.lower()
 
@@ -1624,7 +1624,7 @@ def test_methodology_note_states_one_call_when_nothing_staged():
 def test_methodology_note_states_staged_calls_when_something_staged():
     from elder_eval.__main__ import _methodology_note
 
-    note = _methodology_note("sparkles", staged=True)
+    note = _methodology_note("cave", staged=True)
     assert "staged cohort calls" in note
     assert "ONE monolithic" not in note
     # The parts that remain true regardless of staging are preserved verbatim.
@@ -1643,8 +1643,8 @@ def test_methodology_note_derives_staged_from_the_report_not_hand_maintained():
     original = cli._methodology_note
     cli._methodology_note = lambda name, staged=False: calls.append(staged) or original(name, staged=staged)
     try:
-        _print_report("sparkles", _bare_report(staged_cases=("case-1",)))
-        _print_report("sparkles", _bare_report(staged_cases=()))
+        _print_report("cave", _bare_report(staged_cases=("case-1",)))
+        _print_report("cave", _bare_report(staged_cases=()))
     finally:
         cli._methodology_note = original
     assert calls == [True, False]
@@ -1658,3 +1658,47 @@ def test_methodology_note_production_mode_unaffected_by_staged_kwarg():
     assert _methodology_note("production", staged=True) == _methodology_note(
         "production", staged=False
     )
+
+
+def test_staged_cases_mismatch_surfaced_as_advisory():
+    """#873: a report whose staged-cases set differs from the baseline's
+    must surface the methodology shift in --check output (advisory only,
+    never a hard regression)."""
+    from elder_eval.scoring import staged_cases_advisories
+
+    rows = [_row(1, "correctness")]
+    replays = {
+        "quadseven/grug#1": CaseReplay(
+            case_id="quadseven/grug#1", emitted={"correctness": 1}, errored=False
+        ),
+    }
+    # Baseline recorded case #1 as staged; the new report stages #2 instead.
+    baseline_report = _report(rows, replays)
+    object.__setattr__(baseline_report, "staged_cases", ("quadseven/grug#1",))
+    baseline = to_baseline_dict(baseline_report, prompt_sha="abc", backend="cave")
+    new_report = _report(rows, replays)
+    object.__setattr__(new_report, "staged_cases", ("quadseven/grug#2",))
+
+    advisories = staged_cases_advisories(
+        new_report, baseline["backends"]["cave"]
+    )
+    joined = " ".join(advisories)
+    assert "quadseven/grug#2" in joined  # newly staged
+    assert "quadseven/grug#1" in joined  # no longer staged
+    # Advisory only: must NOT appear in the hard-regression list.
+    regressions = compare_to_baseline(new_report, baseline["backends"]["cave"])
+    assert not any("staged" in r for r in regressions)
+
+
+def test_staged_cases_match_produces_no_advisory():
+    from elder_eval.scoring import staged_cases_advisories
+
+    rows = [_row(1, "correctness")]
+    replays = {
+        "quadseven/grug#1": CaseReplay(
+            case_id="quadseven/grug#1", emitted={"correctness": 1}, errored=False
+        ),
+    }
+    report = _report(rows, replays)
+    baseline = to_baseline_dict(report, prompt_sha="abc", backend="cave")
+    assert staged_cases_advisories(report, baseline["backends"]["cave"]) == []

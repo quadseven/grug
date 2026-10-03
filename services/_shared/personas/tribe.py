@@ -43,7 +43,7 @@ LEGACY_CHECK_PULSE_EM = f"Grug {_EM} Pulse"
 # near-synonyms for "watcher" and read as sci-fi rather than tribe. The prior
 # ASCII titles are demoted to aliases here rather than deleted - a live
 # check-run, or a ruleset naming the old context, must keep resolving. No
-# ruleset required any of these three (verified across grug/macchina/infra:
+# ruleset required any of these three (verified across grug and two private repos:
 # only `Grug - Chief` is required), which is why this rename is safe at all.
 LEGACY_CHECK_WARDER_ASCII = "Grug - Warder"
 LEGACY_CHECK_PULSE_ASCII = "Grug - Pulse"

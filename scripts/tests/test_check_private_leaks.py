@@ -15,6 +15,7 @@ nothing. 91 of the first 99 hits on the existing tree were prose like
 """
 from __future__ import annotations
 
+import re
 import subprocess
 import sys
 from pathlib import Path
@@ -158,7 +159,7 @@ def test_deny_term_matches_on_word_boundaries():
     assert rx.search("ping ada now")
     assert rx.search("that is ADA's box")
     assert rx.search("host ada-mbp reported in")
-    assert rx.search("/Users/ada/dev/thing")
+    assert rx.search("/Users/ada/dev/thing")  # leak-guard-allow: invented fixture, not a real user
 
 
 def test_deny_term_does_not_match_inside_a_longer_word():
@@ -175,7 +176,7 @@ def test_deny_term_does_not_match_inside_a_longer_word():
 
 def test_deny_term_with_non_alphanumeric_edges_still_matches_in_context():
     """Path prefixes and domain suffixes must match mid-string."""
-    assert deny_rule("/users/ada").search("see /Users/ada/dev/x.py")
+    assert deny_rule("/users/ada").search("see /Users/ada/dev/x.py")  # leak-guard-allow: invented fixture, not a real user
     assert deny_rule(".example.net").search("box.example.net answered")
 
 
@@ -259,22 +260,55 @@ GUARD_WORKFLOW = REPO_ROOT / ".github" / "workflows" / "guard.private-leaks.yml"
 def test_ci_workflow_passes_the_deny_list_on_every_invocation():
     """The bug this whole change exists to close.
 
-    The workflow invoked the guard twice (diff scan, PR-text scan) and passed
-    --deny-list-ssm on neither, so CI ran with the people-catching layer off
-    while reporting a green check. Asserting it here means dropping the flag
-    again fails a test instead of silently un-arming the guard.
+    The workflow once invoked the guard twice and passed --deny-list-ssm on
+    neither, so CI ran with the people-catching layer off while reporting a
+    green check. CI now runs the fleet's shared reusable (infra#2997), which
+    scans the diff AND the PR text with the deny-list whenever
+    `deny-list-ssm-param` is set - so that input, and the credentials to read
+    it, are what must never be dropped.
     """
     text = GUARD_WORKFLOW.read_text(encoding="utf-8")
-    invocations = [
-        ln for ln in text.splitlines()
-        if "check_private_leaks.py" in ln and not ln.lstrip().startswith("#")
-    ]
-    # Two: the diff scan and the PR title/body scan. Both must be armed - the
-    # prose half is where most of the 2026-08-15 leaks actually were.
-    assert len(invocations) == 2, invocations
-    for line in invocations:
-        assert "--deny-list-ssm" in line, f"guard invoked without layer 2: {line}"
+    live = "\n".join(
+        ln for ln in text.splitlines() if not ln.lstrip().startswith("#")
+    )
+    assert "infra-public/.github/workflows/_reusable.leak-scan.yml@" in live
+    # The fleet's shared list (grug#1057), seeded from grug's own and
+    # holding the same terms.
+    assert "deny-list-ssm-param: /infra/leak-scan/deny-list" in live
+    assert "aws-role-arn: ${{ secrets.LEAK_SCAN_ROLE_ARN }}" in live, (
+        "deny-list set but no role to read it"
+    )
+    # enforce stays on: a finding must fail this check, not warn.
+    assert "enforce: false" not in live
+    assert "id-token: write" in live, "cannot mint OIDC without it"
+    # The old two local invocations must not linger as a second,
+    # un-armed path.
+    assert "check_private_leaks.py" not in live
 
+
+
+FULL_TREE_WORKFLOW = REPO_ROOT / ".github" / "workflows" / "guard.private-leaks-full-tree.yml"
+
+
+def test_full_tree_sweep_is_scheduled_armed_and_enforced():
+    """infra#4639: the per-PR guard never sees text already in the tree, so a
+    weekly sweep does. Pin its wiring the same way as the PR guard's: full-tree
+    mode, a schedule, the shared deny-list and a role to read it, enforce on."""
+    text = FULL_TREE_WORKFLOW.read_text(encoding="utf-8")
+    live = "\n".join(
+        ln for ln in text.splitlines() if not ln.lstrip().startswith("#")
+    )
+    # Pinned to a full commit SHA: the reusable is resolved before the job
+    # runs, so a placeholder or a moving ref is a sweep that never starts.
+    assert re.search(r"_reusable\.leak-scan\.yml@[0-9a-f]{40}\s", live), (
+        "full-tree caller must pin the reusable to a 40-hex commit SHA"
+    )
+    assert "mode: full-tree" in live
+    assert "schedule:" in live and "cron:" in live
+    assert "deny-list-ssm-param: /infra/leak-scan/deny-list" in live
+    assert "aws-role-arn: ${{ secrets.LEAK_SCAN_ROLE_ARN }}" in live
+    assert "id-token: write" in live
+    assert "enforce: false" not in live
 
 def test_cli_says_out_loud_when_layer_2_is_off(tmp_path):
     """A run with no deny-list must never print a bare 'clean'."""

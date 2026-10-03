@@ -92,7 +92,7 @@ def test_me_session_valid_but_user_missing_returns_authenticated_false(_oauth_mo
 def test_me_returns_user_fields(_oauth_mod):
     from adapters.user_store import UserIdentity
     user = UserIdentity(
-        github_user_id="100", login="evan", role="admin", tier="lifetime",
+        github_user_id="100", login="alice", role="admin", tier="lifetime",
         allowlisted=True, created_at="",
         allowlisted_at=None, allowlisted_by=None,
     )
@@ -102,7 +102,7 @@ def test_me_returns_user_fields(_oauth_mod):
     assert out == {
         "authenticated": True,
         "github_user_id": "100",
-        "login": "evan",
+        "login": "alice",
         "role": "admin",
         "tier": "lifetime",
         "allowlisted": True,

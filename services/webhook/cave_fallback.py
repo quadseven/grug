@@ -22,15 +22,12 @@ import os
 from typing import Any, Optional
 
 import boto3
-
-from activity_log import record_check_verdict
-from github_app_auth import with_install_token_retry
-from github_checks_client import CheckRunResult, post_check_run
 from llm_client import Hunk
+from personas.publish_check import PUBLISH_FAILED, publish_persona_check
 from personas.tribe import CHECK_ELDER
 
 # Shared Spark-Cave airlock library (#1610). Vendored from quadseven/infra-public
-# (see spark_cave/VENDOR.md), so grug (public) and the macchina lane (private)
+# (see spark_cave/VENDOR.md), so grug (public) and a private consumer lane
 # share ONE persona-generic wire envelope read by one connector. grug's rich
 # review fields (install_id/repo/pr/head_sha/diff_ref) ride INSIDE the generic
 # `payload`; the DiffRef codec below still spills a large diff to S3 BEFORE the
@@ -341,40 +338,34 @@ def _heal_one(body: str) -> None:
     findings = tuple(f for f in raw_findings if isinstance(f, dict)) if isinstance(raw_findings, list) else ()
     owner, _, repo_name = repo.partition("/")
     title, summary = _summarize(findings)
-    check = CheckRunResult(
-        name=_CHECK_NAME,
-        head_sha=head_sha,
-        status="completed",
-        # Elder is advisory-by-default; a healed fallback is advisory. Blocking-
-        # aware fallback (read RepoConfig, fail on high/critical) is a follow-up.
-        conclusion="neutral",
-        title=title,
-        summary=summary,
-    )
-    with_install_token_retry(
-        install_id,
-        lambda token: post_check_run(
-            token,
-            owner,
-            repo_name,
-            check,
-            external_id=f"grug-cr:{repo}#{pr_number}:{head_sha}",
-        ),
-    )
-    # Heal the Activity verdict: errored → reviewed (warn/pass). Idempotent per
-    # (persona, head_sha) at the store layer; never raises.
-    record_check_verdict(
-        install_id=install_id,
+    # Publish + heal via the shared seam (#551, #549): the neutral-advisory
+    # conclusion, the legacy persona key, and the grug-cr: external id
+    # (persona_prefix="cr") are preserved. Elder is advisory-by-default;
+    # blocking-aware fallback (read RepoConfig, fail on high/critical) is a
+    # follow-up. The seam records the verdict on both paths; a failed
+    # publish still raises so the record counts as failed (the verdict
+    # stays healable and re-triggers on the next push) instead of being
+    # silently counted as healed.
+    result = publish_persona_check(
         persona_key=_PERSONA_KEY,
-        repo=repo,
+        persona_prefix="cr",
+        check_name=_CHECK_NAME,
+        installation_id=install_id,
+        owner=owner,
+        repo=repo_name,
         pr_number=pr_number,
         head_sha=head_sha,
         conclusion="neutral",
-        summary=title,
+        title=title,
+        summary=summary,
         findings_count=len(findings),
         blocking=False,
         degraded_reason=None,
+        success_result="healed",
+        publish_failed_log_name="elder_fallback_publish_failed",
     )
+    if result["result"] == PUBLISH_FAILED:
+        raise RuntimeError("cave fallback check-run publish failed")
     log.info(
         "elder_fallback_healed",
         extra={"repo": repo, "pr": pr_number, "findings": len(findings)},

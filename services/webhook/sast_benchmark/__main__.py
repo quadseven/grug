@@ -7,7 +7,7 @@
 `--record`/`--check`/default all make REAL backend calls (whichever backends
 `configured_backends()` finds in the env). They are NOT run in the per-PR CI
 suite — only from the on-demand `benchmark.sast.yml` job or a manual run with
-the free-key (+ tailnet, for sparkles) env present. The pure scoring core is
+the free-key (+ tailnet, for the Cave) env present. The pure scoring core is
 what CI exercises (test_sast_benchmark.py).
 """
 
@@ -49,7 +49,7 @@ def main(argv: list[str] | None = None) -> int:
     if not backends:
         print(
             "No backends configured. Set GRUG_BENCH_{OPENROUTER,POOLSIDE}_KEY "
-            "and/or GRUG_BENCH_CAVE_URL+MODEL (sparkles).",
+            "and/or GRUG_BENCH_CAVE_URL+MODEL (the Cave).",
             file=sys.stderr,
         )
         return 2

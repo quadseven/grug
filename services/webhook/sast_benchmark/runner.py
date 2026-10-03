@@ -5,7 +5,7 @@ the recall/precision numbers are Elder's actual behavior (AC4: no fabricated
 verdicts). It reuses `llm_client._build_messages` (Elder's exact prompt) and
 `llm_client._parse_response` (Elder's exact parser) — only the TRANSPORT is
 the benchmark's own, so it can point at any OpenAI-compatible endpoint
-(OpenRouter / Poolside / sparkles-Cave) uniformly.
+(OpenRouter / Poolside / Cave) uniformly.
 
 This module makes network calls — it is NOT imported by the pure-scoring tests
 and never runs in the per-PR CI suite. It runs only from the on-demand

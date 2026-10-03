@@ -103,11 +103,11 @@ def test_valid_config_gemini(monkeypatch):
 
 def test_valid_config_ollama(monkeypatch):
     monkeypatch.delenv("GEMINI_API_KEY", raising=False)
-    monkeypatch.setenv("OLLAMA_URLS", "http://localhost:11434,http://192.168.1.100:11434")
+    monkeypatch.setenv("OLLAMA_URLS", "http://localhost:11434,http://192.0.2.100:11434")
     monkeypatch.setenv("OLLAMA_MODELS", "llama3.2:3b,grug:latest")
     config = _reload_config()
     assert config.USE_GEMINI is False
-    assert config.OLLAMA_URLS == ["http://localhost:11434", "http://192.168.1.100:11434"]
+    assert config.OLLAMA_URLS == ["http://localhost:11434", "http://192.0.2.100:11434"]
     assert config.OLLAMA_MODELS == ["llama3.2:3b", "grug:latest"]
 
 

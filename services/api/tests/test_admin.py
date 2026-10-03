@@ -22,7 +22,7 @@ def _adm(pg_store):
     yield admin
 
 
-def _seed_user(github_user_id, login="evan", role="admin", allowlisted=True):
+def _seed_user(github_user_id, login="alice", role="admin", allowlisted=True):
     _put_row(
         f"USER#{github_user_id}",
         {
@@ -47,7 +47,7 @@ def _admin_user(github_user_id="100", login="admin"):
 def test_list_users_returns_only_user_rows(_adm):
     _seed_user("1", "alice", "user")
     _seed_user("2", "bob", "user")
-    _put_row("INST#42", {"account_login": "evan"})  # noise
+    _put_row("INST#42", {"account_login": "alice"})  # noise
 
     out = _adm.list_users(_=_admin_user())
     logins = sorted(u["login"] for u in out["users"])
@@ -72,7 +72,7 @@ def test_list_users_excludes_oauth_blob(_adm):
 def test_list_installations(_adm):
     _put_row(
         "INST#42",
-        {"account_login": "evan", "account_type": "User",
+        {"account_login": "alice", "account_type": "User",
          "installed_by_user_id": "100", "installed_at": "now"},
     )
     out = _adm.list_all_installations(_=_admin_user())

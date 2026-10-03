@@ -112,10 +112,14 @@ def workload_not_ready_query() -> str:
 
 def crashloop_query() -> str:
     """Any grug pod (incl grug-consumer) in CrashLoopBackOff. DD lowercases
-    tag values, so the waiting reason is `crashloopbackoff`."""
+    tag values, so the waiting reason is `crashloopbackoff`.
+
+    default_zero (quadseven/infra#2081): the waiting gauge exists only while
+    a pod crash-loops, so a healthy namespace read No Data. Under max() a
+    filled 0 cannot hide a real crash-loop."""
     return (
-        "max(last_5m):max:kubernetes_state.container.status_report.count.waiting"
-        "{" + _NS + ",reason:crashloopbackoff} by {pod_name} > 0"
+        "max(last_5m):default_zero(max:kubernetes_state.container.status_report.count.waiting"
+        "{" + _NS + ",reason:crashloopbackoff} by {pod_name}) > 0"
     )
 
 
@@ -176,6 +180,12 @@ def backend_unusable_query(env: str) -> str:
     failing a review, so with it dead a Cave blip went straight to "Grug
     could not review this" - and the only person told was the PR author, who
     can do nothing about an unpaid invoice.
+
+    Free-tier refusals do not match. grug's OpenRouter key runs only on the
+    free tier, which answers `403 Key limit exceeded` sometimes and not others
+    (operator decision 2026-09-23). grug logs those, and any 429, as
+    `llm_backend_rate_limited`, which this query must never match: paging on
+    a dependency known to be flaky would get the real signal muted.
     """
     return (
         f'logs("service:grug-* env:{env} llm_backend_unusable")'
@@ -367,9 +377,12 @@ def deploy_rollback_query(env: str) -> str:
     digests were re-applied (or a manual rollback dispatch ran). The
     runner emits grug.deploy.rollback as a COUNT via DogStatsD to a
     node's agent hostPort; any occurrence pages - a rollback is always
-    operator-relevant. notify_no_data=false (fires rarely by design)."""
+    operator-relevant. notify_no_data=false (fires rarely by design).
+
+    default_zero (quadseven/infra#2081): only rollbacks send a point, so a
+    quiet 30 minutes read No Data instead of OK."""
     return (
-        f"sum(last_30m):sum:grug.deploy.rollback{{env:{env}}}.as_count() > 0"
+        f"sum(last_30m):default_zero(sum:grug.deploy.rollback{{env:{env}}}.as_count()) > 0"
     )
 
 
@@ -626,8 +639,9 @@ def create_all(
         query=crashloop_query(),
         tags=_common_tags(env, "grug"),  # all-workload (see workload-not-ready)
         # CONDITIONAL metric: the waiting-reason series only exists while a pod
-        # is actually in CrashLoopBackOff, so No Data == healthy here. (Unlike
-        # the continuous gauges above, which page on No Data.)
+        # is actually in CrashLoopBackOff. default_zero in the query makes that
+        # healthy absence read 0 (OK) instead of No Data. (Unlike the
+        # continuous gauges above, which page on No Data.)
         notify_no_data=False,
         priority=2,
         opts=opts,
@@ -865,7 +879,9 @@ def create_all(
             f"{_DIGEST}\n"
             "A review backend returned 401/402/403/404 - it is not overloaded, "
             "it is unusable. 402 = unpaid, 401/403 = key wrong or revoked, "
-            "404 = endpoint or model name gone.\n"
+            "404 = endpoint or model name gone. OpenRouter free-tier limit "
+            "refusals log llm_backend_rate_limited instead and do not fire "
+            "this.\n"
             "This does NOT fail reviews on its own: the Cave is the primary "
             "path. It removes the FALLBACK, so the next Cave outage has "
             "nothing behind it and authors get told Grug could not review.\n"

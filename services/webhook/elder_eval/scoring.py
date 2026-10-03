@@ -246,11 +246,42 @@ def to_baseline_dict(report: EvalReport, *, prompt_sha: str, backend: str) -> di
     }
 
 
+def staged_cases_advisories(
+    report: EvalReport, backend_baseline: dict
+) -> list[str]:
+    """Advisory-only methodology-shift notes for `--check` (#873).
+
+    Compares `report.staged_cases` against the baseline's recorded
+    `staged_cases`. A case that moved onto or off the staged path was
+    measured with a different methodology (several bounded cohort calls
+    sharing a review map, vs one monolithic call), so a catch/noise move
+    may reflect the methodology shift rather than a real regression in
+    what Elder catches. These are ADVISORY ONLY — they never fail the
+    gate (see `compare_to_baseline`); `--check` prints them separately.
+    """
+    base_staged = set(backend_baseline.get("staged_cases", []) or [])
+    new_staged = set(report.staged_cases or [])
+    advisories: list[str] = []
+    for case in sorted(new_staged - base_staged):
+        advisories.append(
+            f"case {case} is newly staged (methodology shift: staged cohort "
+            "calls vs monolithic call — catch/noise moves may reflect the "
+            "method, not a real regression)"
+        )
+    for case in sorted(base_staged - new_staged):
+        advisories.append(
+            f"case {case} is no longer staged (now measured the monolithic "
+            "way the baseline measured it staged — catch/noise moves may "
+            "reflect the method, not a real regression)"
+        )
+    return advisories
+
+
 def compare_to_baseline(
     report: EvalReport,
     backend_baseline: dict,
     *,
-    # Measured run-to-run sampling swing on the 12-case corpus (sparkles,
+    # Measured run-to-run sampling swing on the 12-case corpus (the Cave,
     # 2026-07-05) was ~0.09 overall catch; a tolerance below the noise
     # floor would page on dice rolls, not regressions.
     catch_tolerance: float = 0.10,

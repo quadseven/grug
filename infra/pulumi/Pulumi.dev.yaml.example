@@ -21,4 +21,4 @@ config:
   # cloudflare:apiToken: SET_AS_SECRET
 
   # Datadog notification handle for monitor pages (Slice 9).
-  grug:dd_notification_handle: "@evan@example.com"
+  grug:dd_notification_handle: "@ops@example.com"

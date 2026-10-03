@@ -28,7 +28,7 @@ from github_checks_client import CheckConclusion, CheckRunResult, post_check_run
 log = logging.getLogger(f"{os.getenv('DD_SERVICE', 'grug')}.persona.publish_check")
 
 # Transient-network retry budget (#697). A one-time DNS blip on the webhook
-# pod (httpx ConnectError, digital-ledger#204 2026-07-18) left Chief's and
+# pod (httpx ConnectError, a private repo 2026-07-18) left Chief's and
 # Guard's check-runs permanently un-posted - GitHub showed the REQUIRED
 # check stuck on "Expected - Waiting for status" with no self-healing,
 # because this synchronous publish path had no retry (Elder alone recovered,

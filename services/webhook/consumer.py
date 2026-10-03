@@ -42,6 +42,8 @@ from typing import Any, Callable
 import boto3
 from botocore.config import Config as _BotoConfig
 
+from rerun_queue import JobNotDue
+
 log = logging.getLogger(f"{os.getenv('DD_SERVICE', 'grug')}.consumer")
 
 _sqs = boto3.client("sqs")
@@ -85,6 +87,8 @@ _MAX_REVIEW_JOB_TIMEOUT_S = 840.0
 _REVIEW_CLEANUP_TIMEOUT_S = 5.0
 _REVIEW_VISIBILITY_LOCK_TIMEOUT_S = 1.0
 _DEFAULT_RERUN_WORKERS = 4
+# SQS rejects a visibility timeout above 12h; stay a minute under it.
+_MAX_NOT_DUE_HIDE_S = 43200 - 60
 _MAX_RERUN_WORKERS = 16
 
 _stop = threading.Event()
@@ -220,6 +224,14 @@ def _release_active_review_claims() -> int:
     return release_active_review_claims()
 
 
+def _clear_active_board_notes() -> int:
+    # #819: alongside the claim release, restore the headers of any
+    # in-progress board notes orphaned by the shutdown.
+    from rerun import clear_active_board_notes  # type: ignore[attr-defined]
+
+    return clear_active_board_notes()
+
+
 def _release_inflight_reviews() -> tuple[int, int]:
     """Return SQS work first, then release the claims required to retry it."""
     leases = _release_active_review_leases()
@@ -232,6 +244,14 @@ def _release_inflight_reviews() -> tuple[int, int]:
             exc_info=True,
         )
         claims = 0
+    try:
+        _clear_active_board_notes()
+    except Exception as e:  # termination must survive cleanup failure
+        log.warning(
+            "consumer_board_note_clear_failed",
+            extra={"kind": type(e).__name__},
+            exc_info=True,
+        )
     return leases, claims
 
 
@@ -609,6 +629,12 @@ def _poll_once(spec: QueueSpec, queue_url: str, arn: str) -> int:
     delete = True
     try:
         spec.handler(_esm_event(arn, message))
+    except JobNotDue as e:
+        # A deferred job arrived early. Hiding it for the remaining delay
+        # spends this one receive; it is not a failure, so no redrive
+        # warning and no DLQ announcement.
+        delete = False
+        _hide_until_due(spec, queue_url, receipt, message, e.delay_seconds)
     except Exception as e:  # noqa: BLE001 — the rerun contract REQUIRES surviving a raise
         delete = spec.delete_on_error
         receive_count = _receive_count(message)
@@ -646,6 +672,35 @@ def _poll_once(spec: QueueSpec, queue_url: str, arn: str) -> int:
                 extra={"queue": spec.kind, "kind": type(e).__name__},
             )
     return 1
+
+
+def _hide_until_due(
+    spec: QueueSpec, queue_url: str, receipt: str, message: dict,
+    delay_seconds: float,
+) -> None:
+    """Make a not-yet-due message invisible until it is due. On failure the
+    queue's base visibility timeout redelivers it early, which just repeats
+    this check."""
+    hide_s = max(1, min(_MAX_NOT_DUE_HIDE_S, math.ceil(delay_seconds)))
+    try:
+        _sqs.change_message_visibility(
+            QueueUrl=queue_url, ReceiptHandle=receipt, VisibilityTimeout=hide_s,
+        )
+    except Exception as e:  # noqa: BLE001 - base visibility is the fallback
+        log.warning(
+            "consumer_not_due_hide_failed",
+            extra={"queue": spec.kind, "kind": type(e).__name__, "err": str(e)[:200]},
+        )
+        return
+    log.info(
+        "consumer_job_not_due",
+        extra={
+            "queue": spec.kind,
+            "message_id": message.get("MessageId", ""),
+            "hide_s": hide_s,
+            "receive_count": _receive_count(message),
+        },
+    )
 
 
 def _receive_count(message: dict) -> int:

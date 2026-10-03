@@ -12,7 +12,7 @@ External SaaS the stack depends on (flat dependencies, not topology):
 - **Datadog US1** — APM + Logs + LLM Observability + RUM + Monitors.
 - **GitHub** — App registration (webhook source + OAuth identity provider) + Actions OIDC (deploys).
 - **Pulumi Cloud** — `grug/{dev,prod}` stacks (AWS-side infra only; the k8s manifests are applied by the deploy workflow, not Pulumi).
-- **OKE cluster + in-cluster registry** — private infra (the operator's homelab/cloud). Not addressable from this public repo; reached at deploy time over an ephemeral tailnet join.
+- **OKE cluster + in-cluster registry** — private infra (the operator's own hardware and cloud). Not addressable from this public repo; reached at deploy time over an ephemeral tailnet join.
 
 ---
 

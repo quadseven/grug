@@ -31,8 +31,8 @@ def _comment_payload(
     *,
     body: str,
     is_pr: bool = True,
-    sender_login: str = "evan",
-    pr_author: str = "evan",
+    sender_login: str = "alice",
+    pr_author: str = "alice",
     install_id: int = 1,
     repo_id: int = 100,
 ):
@@ -95,7 +95,7 @@ def test_non_created_action_no_ops(_no_install_lookups):
 
 
 def test_pr_author_authorized_path_dispatches(_no_install_lookups):
-    payload = _comment_payload(body="/grug recheck", sender_login="evan", pr_author="evan")
+    payload = _comment_payload(body="/grug recheck", sender_login="alice", pr_author="alice")
     fake_pr = {"head": {"sha": "abc123"}, "body": "## Why\nbecause closes #1\n## Acceptance criteria\n- [x] one\n- [x] two\n- [x] three\n## Out of scope\nnone\n\n**Size:** S"}
 
     class _Result:
@@ -121,7 +121,7 @@ def test_pr_author_authorized_path_dispatches(_no_install_lookups):
 
 
 def test_non_author_with_write_perm_authorized(_no_install_lookups):
-    payload = _comment_payload(body="/grug recheck", sender_login="bob", pr_author="evan")
+    payload = _comment_payload(body="/grug recheck", sender_login="bob", pr_author="alice")
     fake_pr = {"head": {"sha": "def456"}, "body": ""}
 
     class _Result:
@@ -158,7 +158,7 @@ def test_non_author_with_write_perm_authorized(_no_install_lookups):
 
 
 def test_non_author_with_read_perm_rejected(_no_install_lookups):
-    payload = _comment_payload(body="/grug recheck", sender_login="random", pr_author="evan")
+    payload = _comment_payload(body="/grug recheck", sender_login="random", pr_author="alice")
 
     def _httpx_get(*args, **kwargs):
         class _R:
@@ -202,7 +202,7 @@ def test_perm_lookup_transport_error_returns_skip(_no_install_lookups, mock_tran
     Real-transport-backed (issue #105): ConnectError comes from
     httpx.MockTransport handler raising.
     """
-    payload = _comment_payload(body="/grug recheck", sender_login="bob", pr_author="evan")
+    payload = _comment_payload(body="/grug recheck", sender_login="bob", pr_author="alice")
     client = mock_transport_client(raise_exc=httpx.ConnectError("DNS failure"))
 
     with patch("github_app_auth.with_install_token_retry", side_effect=lambda _i, fn: fn("tok")):
@@ -220,7 +220,7 @@ def test_pr_fetch_transport_error_returns_skip(_no_install_lookups, mock_transpo
     Real-transport-backed (issue #105): ReadTimeout comes from
     httpx.MockTransport handler raising.
     """
-    payload = _comment_payload(body="/grug recheck", sender_login="evan", pr_author="evan")
+    payload = _comment_payload(body="/grug recheck", sender_login="alice", pr_author="alice")
     client = mock_transport_client(raise_exc=httpx.ReadTimeout("github.com slow"))
 
     with patch("github_app_auth.with_install_token_retry", side_effect=lambda _i, fn: fn("tok")):
@@ -237,7 +237,7 @@ def test_recheck_unexpected_raise_contained_not_500(_no_install_lookups):
     unexpected raise from evaluate/publish must be contained by the
     recheck final guard (mirror of
     test_pull_request_publish_unexpected_raise_hits_final_guard)."""
-    payload = _comment_payload(body="/grug recheck", sender_login="evan", pr_author="evan")
+    payload = _comment_payload(body="/grug recheck", sender_login="alice", pr_author="alice")
     fake_pr = {"head": {"sha": "abc123"}, "body": "irrelevant"}
 
     with patch("github_app_auth.with_install_token_retry", side_effect=lambda _i, fn: fn("tok")):
@@ -256,7 +256,7 @@ def test_recheck_publish_failed_sentinel_returns_skip(_no_install_lookups):
     returns the sentinel. The recheck path must map it to the same
     skip/publish_failed shape it returned pre-migration (and the seam
     already recorded the honest errored Activity row)."""
-    payload = _comment_payload(body="/grug recheck", sender_login="evan", pr_author="evan")
+    payload = _comment_payload(body="/grug recheck", sender_login="alice", pr_author="alice")
     fake_pr = {"head": {"sha": "abc123"}, "body": "irrelevant"}
 
     with patch("github_app_auth.with_install_token_retry", side_effect=lambda _i, fn: fn("tok")):
@@ -278,7 +278,7 @@ def test_recheck_resultless_map_lands_in_guard_not_500(_no_install_lookups):
     yield skip/unhandled_error, not a webhook 500 (GitHub does not
     redeliver on 5xx). A refactor hoisting the subscript above the try
     fails this test."""
-    payload = _comment_payload(body="/grug recheck", sender_login="evan", pr_author="evan")
+    payload = _comment_payload(body="/grug recheck", sender_login="alice", pr_author="alice")
     fake_pr = {"head": {"sha": "abc123"}, "body": "irrelevant"}
 
     with patch("github_app_auth.with_install_token_retry", side_effect=lambda _i, fn: fn("tok")):
@@ -316,7 +316,7 @@ def _pull_request_payload():
             "number": 42,
             "body": _PR_BODY_CLOSES_7,
             "head": {"sha": "abc123"},
-            "user": {"login": "evan"},
+            "user": {"login": "alice"},
         },
         "repository": {
             "id": 100, "name": "myrepo",
@@ -381,7 +381,7 @@ def _run_both_paths(_github_get):
         webhook_out = d.dispatch("pull_request", _pull_request_payload())
         recheck_out = d.dispatch(
             "issue_comment",
-            _comment_payload(body="/grug recheck", sender_login="evan", pr_author="evan"),
+            _comment_payload(body="/grug recheck", sender_login="alice", pr_author="alice"),
         )
     assert len(captured) == 2, captured
     return webhook_out, captured[0], recheck_out, captured[1]

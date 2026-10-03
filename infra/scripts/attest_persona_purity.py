@@ -42,6 +42,12 @@ ALLOWED_CALL_NAMES: frozenset[str] = frozenset({
     # feeds _summary and the publish findings_count; deduplicated by the
     # #550 stage-1 audit)
     "_blocking_failures",
+    # Pure regex search over the PR body (agent-authored marker), defined
+    # in tpm/persona.py; the skip is decided on the body alone
+    "is_agent_authored",
+    # Pure frozen-dataclass constructor (dor_checks.CheckResult) for the
+    # single skipped row an agent-authored PR rolls up to
+    "CheckResult",
     # Stdlib pure builtins commonly used in rollup logic
     "tuple", "list", "len", "all", "any", "isinstance", "sorted", "filter", "map",
 })
