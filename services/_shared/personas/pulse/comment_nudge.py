@@ -292,6 +292,63 @@ def _post_nudge(
         return False
 
 
+def _open_prs(client: Any, token: str, owner: str, repo: str) -> list[dict[str, Any]]:
+    """Open PRs for a repo, bounded. Empty on any failure (best-effort)."""
+    try:
+        r = client.get(
+            f"https://api.github.com/repos/{quote(owner, safe='')}"
+            f"/{quote(repo, safe='')}/pulls",
+            params={"state": "open", "per_page": _MAX_PRS_PER_REPO},
+            headers=_headers(token),
+            timeout=_FETCH_TIMEOUT,
+        )
+        r.raise_for_status()
+        return r.json()
+    except Exception as e:  # noqa: BLE001 - one repo's failure never aborts the run
+        log.info(
+            "comment_nudge_repo_failed",
+            extra={"repo": f"{owner}/{repo}", "kind": type(e).__name__},
+        )
+        return []
+
+
+def _nudge_pr(
+    client: Any,
+    token: str,
+    owner: str,
+    repo: str,
+    pr: dict[str, Any],
+    now: datetime,
+    budget: int,
+) -> int:
+    """Nudge stale threads on one PR. Returns nudges posted (<= budget)."""
+    pr_number = int(pr.get("number", 0))
+    pr_author = (pr.get("user") or {}).get("login", "")
+    try:
+        threads = _threads_for_pr(client, token, owner, repo, pr_number, pr_author)
+    except Exception as e:  # noqa: BLE001 - one PR's failure never aborts the repo
+        log.info(
+            "comment_nudge_pr_failed",
+            extra={"pr": pr_number, "kind": type(e).__name__},
+        )
+        return 0
+    nudged = 0
+    for thread in find_stale_threads(threads, now=now):
+        if nudged >= budget:
+            break
+        if _post_nudge(client, token, owner, repo, thread):
+            nudged += 1
+            log.info(
+                "comment_nudge_posted",
+                extra={
+                    "repo": f"{owner}/{repo}",
+                    "pr": pr_number,
+                    "thread_id": thread["root_id"],
+                },
+            )
+    return nudged
+
+
 def run_comment_nudge_for_install(
     token: str,
     install_id: int,
@@ -311,48 +368,16 @@ def run_comment_nudge_for_install(
         if "/" not in full:
             continue
         owner, repo_name = full.split("/", 1)
-        try:
-            r = client.get(
-                f"https://api.github.com/repos/{quote(owner, safe='')}"
-                f"/{quote(repo_name, safe='')}/pulls",
-                params={"state": "open", "per_page": _MAX_PRS_PER_REPO},
-                headers=_headers(token),
-                timeout=_FETCH_TIMEOUT,
-            )
-            r.raise_for_status()
-            prs = r.json()
-        except Exception as e:  # noqa: BLE001 - one repo's failure never aborts the run
-            log.info(
-                "comment_nudge_repo_failed",
-                extra={"repo": full, "kind": type(e).__name__},
-            )
-            continue
-        for pr in prs:
+        for pr in _open_prs(client, token, owner, repo_name):
             if nudged >= _MAX_NUDGES_PER_INSTALL_RUN:
                 break
-            pr_number = int(pr.get("number", 0))
-            pr_author = (pr.get("user") or {}).get("login", "")
-            try:
-                threads = _threads_for_pr(
-                    client, token, owner, repo_name, pr_number, pr_author
-                )
-            except Exception as e:  # noqa: BLE001 - see above
-                log.info(
-                    "comment_nudge_pr_failed",
-                    extra={"pr": pr_number, "kind": type(e).__name__},
-                )
-                continue
-            for thread in find_stale_threads(threads, now=now):
-                if nudged >= _MAX_NUDGES_PER_INSTALL_RUN:
-                    break
-                if _post_nudge(client, token, owner, repo_name, thread):
-                    nudged += 1
-                    log.info(
-                        "comment_nudge_posted",
-                        extra={
-                            "repo": full,
-                            "pr": pr_number,
-                            "thread_id": thread["root_id"],
-                        },
-                    )
+            nudged += _nudge_pr(
+                client,
+                token,
+                owner,
+                repo_name,
+                pr,
+                now,
+                _MAX_NUDGES_PER_INSTALL_RUN - nudged,
+            )
     return nudged

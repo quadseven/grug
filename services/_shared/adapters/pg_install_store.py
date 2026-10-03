@@ -1279,7 +1279,7 @@ def list_comment_nudge_repos(install_id: int) -> list[dict[str, Any]]:
     never be starved by a discovery-page prefix. Returns [{"id", "full_name"}]."""
     with get_pool().connection() as conn:
         rows = conn.execute(
-            f"""
+            f"""  # noqa: S608 - only TTL_LIVE (a constant) is interpolated; install_id is a bound param
             SELECT sk, data FROM grug_kv
             WHERE pk = %s AND sk LIKE 'REPO#%%'
               AND data->>'pulse_comment_nudge_enabled' = 'true' AND {TTL_LIVE}
