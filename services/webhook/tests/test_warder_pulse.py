@@ -118,27 +118,18 @@ def test_warder_release_degrades_on_fetch_failure(monkeypatch):
         warder, "with_install_token_retry",
         lambda iid, fn: (_ for _ in ()).throw(httpx.ConnectTimeout("gh down", request=None)),
     )
-    # publish + verdict paths also use with_install_token_retry - the
-    # patched version raises there too, exercising publish_failed... use
-    # a two-phase patch instead: first call raises, later calls succeed.
-    calls = {"n": 0}
 
-    def fake_retry(iid, fn):
-        calls["n"] += 1
-        if calls["n"] == 1:
-            raise httpx.ConnectTimeout("gh down", request=None)
-        return fn("tok")
+    def fake_seam(**kw):
+        posted.append(kw)
+        return {"persona": "warder", "result": kw["success_result"]}
 
-    monkeypatch.setattr(warder, "with_install_token_retry", fake_retry)
-    monkeypatch.setattr(warder, "post_check_run", lambda *a, **kw: posted.append(kw) or {})
-    monkeypatch.setattr(warder, "record_check_verdict", lambda **kw: posted.append(kw))
+    monkeypatch.setattr(warder, "publish_persona_check", fake_seam)
     out = warder.dispatch_warder_release(
         installation_id=1, owner="o", repo_name="r", head_sha="s", pr_number=2,
     )
     assert out == {"persona": "warder", "result": "skipped"}  # degraded, honest
-    # verdict row recorded with the degraded reason
-    verdicts = [p for p in posted if p.get("persona_key") == "warder"]
-    assert verdicts and verdicts[0]["degraded_reason"] == "fetch_failed"
+    # verdict fields ride into the seam as inputs
+    assert posted and posted[0]["degraded_reason"] == "fetch_failed"
 
 
 # ── Warder: deploy gate (grug#533) ──────────────────────────────────────
@@ -191,7 +182,9 @@ def test_is_healthy():
 
 def _wire_release_happy(monkeypatch, posted):
     """No-monitor-configured baseline: release-tracer path succeeds,
-    checked-in helpers stubbed so only `_gate_verdict` varies per test."""
+    checked-in helpers stubbed so only `_gate_verdict` varies per test.
+    The publish tail is the shared seam (#551); its kwargs carry the
+    verdict fields the old record_check_verdict call carried."""
     monkeypatch.setattr(
         warder, "with_install_token_retry", lambda iid, fn: fn("tok"),
     )
@@ -199,8 +192,12 @@ def _wire_release_happy(monkeypatch, posted):
         warder, "_fetch_commits_since_last_tag",
         lambda token, owner, repo, sha: (("feat: thing",), "v1.0.0"),
     )
-    monkeypatch.setattr(warder, "post_check_run", lambda *a, **kw: posted.append(kw) or {})
-    monkeypatch.setattr(warder, "record_check_verdict", lambda **kw: posted.append(kw))
+
+    def fake_seam(**kw):
+        posted.append(kw)
+        return {"persona": "warder", "result": kw["success_result"]}
+
+    monkeypatch.setattr(warder, "publish_persona_check", fake_seam)
 
 
 def test_gate_no_monitor_configured_is_untouched():
@@ -268,7 +265,7 @@ def test_release_gate_healthy_keeps_neutral_pass(monkeypatch):
         gate_blocking=False,
     )
     assert out == {"persona": "warder", "result": "pass"}
-    verdict = next(p for p in posted if p.get("persona_key") == "warder")
+    verdict = posted[0]  # seam kwargs carry the verdict fields
     assert verdict["conclusion"] == "neutral" and verdict["findings_count"] == 0
 
 
@@ -286,7 +283,7 @@ def test_release_gate_breach_advisory_marks_warn_not_pass(monkeypatch):
         gate_blocking=False,
     )
     assert out == {"persona": "warder", "result": "pass"}  # never blocks - advisory
-    verdict = next(p for p in posted if p.get("persona_key") == "warder")
+    verdict = posted[0]  # seam kwargs carry the verdict fields
     assert verdict["conclusion"] == "neutral"  # tracer's own conclusion stands
     assert verdict["findings_count"] == 1  # but NOT a silent clean pass
     assert verdict["blocking"] is False
@@ -304,11 +301,11 @@ def test_release_gate_breach_blocking_fails_the_check_run(monkeypatch):
         gate_blocking=True,
     )
     assert out == {"persona": "warder", "result": "fail"}
-    verdict = next(p for p in posted if p.get("persona_key") == "warder")
+    verdict = posted[0]  # seam kwargs carry the verdict fields
     assert verdict["conclusion"] == "failure"
     assert verdict["blocking"] is True
     assert verdict["findings_count"] == 1
-    assert "deploy gate FAILED" in verdict["summary"]  # summary=title for the Activity row
+    assert "deploy gate FAILED" in verdict["title"]  # Activity row's summary is the title
 
 
 def test_webhook_dispatch_passes_ctx_blocking_as_gate_blocking(monkeypatch):
