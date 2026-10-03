@@ -12,6 +12,8 @@ and the walkthrough renders without the section.
 
 from __future__ import annotations
 
+import logging
+import os
 from collections.abc import Callable
 from dataclasses import dataclass
 from typing import Any
@@ -20,6 +22,9 @@ from urllib.parse import quote
 import httpx
 
 _API = "https://api.github.com"
+# Same logger as the walkthrough dispatcher, so a failed lookup shows up
+# next to the walkthrough it belongs to.
+log = logging.getLogger(f"{os.getenv('DD_SERVICE', 'grug')}.persona.walkthrough")
 _TIMEOUT = 10.0
 # Bounds for the whole retrieval: one list call + at most this many /files.
 _LIST_PER_PAGE = 20
@@ -111,7 +116,13 @@ def find_related_prs(
         )
         resp.raise_for_status()
         listed = resp.json()
-    except Exception:  # noqa: BLE001 - related hunts are best-effort enrichment
+    except Exception as e:  # noqa: BLE001 - related hunts are best-effort enrichment
+        # Best-effort, but never silent: an auth outage and an honest empty
+        # would otherwise look the same.
+        log.info(
+            "walkthrough_related_list_failed",
+            extra={"owner": owner, "repo": repo, "kind": type(e).__name__},
+        )
         return []
     candidates = [
         pr
@@ -141,7 +152,16 @@ def find_related_prs(
             )
             fresp.raise_for_status()
             cand_files = [str(f.get("filename", "")) for f in fresp.json()]
-        except Exception:  # noqa: BLE001 - one bad candidate must not kill the section
+        except Exception as e:  # noqa: BLE001 - one bad candidate must not kill the section
+            log.info(
+                "walkthrough_related_files_failed",
+                extra={
+                    "owner": owner,
+                    "repo": repo,
+                    "candidate": int(pr["number"]),
+                    "kind": type(e).__name__,
+                },
+            )
             cand_files = []
         ts = _title_score(current_title, str(pr.get("title", "")))
         fs = _file_score(current_files, cand_files)
@@ -152,7 +172,7 @@ def find_related_prs(
 
     scored.sort(key=lambda t: t[0], reverse=True)
     out: list[RelatedPR] = []
-    for total, pr, overlap in scored[:_MAX_RELATED]:
+    for _total, pr, overlap in scored[:_MAX_RELATED]:
         title = str(pr.get("title", ""))
         out.append(
             RelatedPR(
