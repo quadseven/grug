@@ -66,6 +66,7 @@ REGISTRY_KEY_TO_UI_ID: dict[str, str] = {
     "smasher": "smasher",
     "walkthrough": "teller",
     "pulse": "pulse",
+    "pulse_comment_nudge": "pulse_comment_nudge",
 }
 
 

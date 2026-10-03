@@ -47,6 +47,7 @@ OPERATOR_ONLY: dict[str, str] = {
     "warder_gate_blocking": "deploy-gate semantics; operator manages via API",
     "sentinel_enabled": "persona master switch; operator manages via API",
     "pulse_enabled": "persona master switch; operator manages via API",
+    "pulse_comment_nudge_enabled": "persona master switch; operator manages via API",
     "smasher_enabled": "persona master switch; operator manages via API",
     "walkthrough_enabled": "persona master switch; operator manages via API",
     "issue_dor_enabled": "Chief issue-time advisory; operator manages via API",
