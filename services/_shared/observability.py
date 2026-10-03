@@ -185,8 +185,10 @@ def emit_enforcement_metric(
     Extension; after the Lambda-to-k8s migration every emit was silently
     swallowed and the metric went dark.
 
-    Tags: repo, persona, enforcement_type (grug_managed|external|none|error),
-    env. Value: 1.0 grug_managed, 0.5 external, 0.0 none, -1.0 error (#518:
+    Tags: repo, persona, enforcement_type (grug_managed|external|none|error|
+    permission_denied),
+    env. Value: 1.0 grug_managed, 0.5 external, 0.0 none, -1.0 error, -2.0
+    permission_denied (grug#1001: 403 that is not a rate limit) (#518:
     a detection FAILURE must be distinguishable from a real "none" - the
     negative value makes an auth/rate-limit outage visually unmistakable on
     the gauge instead of masquerading as "nothing enforced").
@@ -205,6 +207,9 @@ def emit_enforcement_metric(
         "external": 0.5,
         "none": 0.0,
         "error": -1.0,
+        # grug#1001: GitHub denied the check (App grant lacks access). Its own
+        # negative value so the gap monitor's group says WHY it is red.
+        "permission_denied": -2.0,
     }
     value = value_map.get(enforcement_type, 0.0)
     env = os.getenv("DD_ENV") or os.getenv("GRUG_ENV", "prod")

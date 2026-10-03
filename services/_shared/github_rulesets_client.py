@@ -20,7 +20,10 @@ _GH_API = "https://api.github.com"
 GRUG_RULESET_PREFIX = "Grug - "
 GRUG_RULESET_PREFIXES = (GRUG_RULESET_PREFIX, "Grug " + "\u2014" + " ")
 
-EnforcementState = Literal["grug_managed", "external", "none"]
+# `permission_denied` (grug#1001): GitHub 403'd a check for a reason that is
+# not a rate limit (the App grant lacks administration access). Grug cannot see
+# enforcement there, which is different from "nothing enforces the check".
+EnforcementState = Literal["grug_managed", "external", "none", "permission_denied"]
 
 
 class EnforcementDetection(NamedTuple):
@@ -88,6 +91,11 @@ def _is_rate_limited(resp: httpx.Response) -> bool:
             or resp.headers.get("x-ratelimit-remaining") == "0"
         )
     return False
+
+
+def _is_permission_denied(resp: httpx.Response) -> bool:
+    """A 403 that is NOT a rate-limit signal: the App grant lacks the access."""
+    return resp.status_code == 403 and not _is_rate_limited(resp)
 
 
 def _retry_delay(attempt: int, resp: httpx.Response | None) -> float:
@@ -554,9 +562,18 @@ def detect_enforcement(
     most repos have 1-3 rulesets total. Short-circuits on the first
     grug_match, since that already wins the final classification below.
     """
-    ruleset_hit = _match_enforcing_ruleset(
-        install_token, owner, repo, check_name, stored_ruleset_id,
-    )
+    try:
+        ruleset_hit = _match_enforcing_ruleset(
+            install_token, owner, repo, check_name, stored_ruleset_id,
+        )
+    except httpx.HTTPStatusError as e:
+        if not _is_permission_denied(e.response):
+            raise
+        log.warning(
+            "enforcement_permission_denied",
+            extra={"owner": owner, "repo": repo, "op": "rulesets"},
+        )
+        return EnforcementDetection("permission_denied", None)
     if ruleset_hit is not None:
         return ruleset_hit
 
@@ -574,6 +591,12 @@ def detect_enforcement(
     except httpx.HTTPStatusError as e:
         if e.response.status_code not in (404, 403):
             raise
+        if _is_permission_denied(e.response):
+            log.warning(
+                "enforcement_permission_denied",
+                extra={"owner": owner, "repo": repo, "op": "legacy_branch_protection"},
+            )
+            return EnforcementDetection("permission_denied", None)
         log.debug(
             "legacy_branch_protection_unavailable",
             extra={"owner": owner, "repo": repo, "branch": branch,

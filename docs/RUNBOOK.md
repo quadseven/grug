@@ -735,8 +735,9 @@ did not exist until #716, so the anchor was dangling.
 | 0.5 | `external` | A non-Grug ruleset or legacy branch protection requires it |
 | 0.0 | `none` | **Nothing requires the check. PRs can merge ungated** |
 | -1.0 | `error` | Detection FAILED. Enforcement is UNKNOWN, not absent |
+| -2.0 | `permission_denied` | GitHub 403'd the check (not a rate limit). The App grant lacks administration access on this installation. Enforcement is UNKNOWN, not absent |
 
-So the alert covers two different situations, and they need different
+So the alert covers three different situations, and they need different
 responses.
 
 ### Triage
@@ -763,6 +764,14 @@ pup metrics query \
 **2b. If `error` (-1.0)** - detection itself is broken, usually auth or a
 GitHub rate limit. Check `enforcement_emit_repo_failed` in the poller logs.
 This is not an enforcement gap; it means you cannot currently tell.
+
+**2c. If `permission_denied` (-2.0)** - GitHub refused the read with a 403 that
+is not a rate limit. The installation has not granted the App the
+`administration` permission its manifest requests (compare `GET /app` with
+`GET /app/installations/{id}`). Grug cannot fix this itself: only the
+installation owner can approve the pending permission in GitHub's App settings.
+Ask them to approve it; the repo reports its real state on the next poll cycle.
+This is not evidence the repo is ungated.
 
 ### Reading the monitor state
 

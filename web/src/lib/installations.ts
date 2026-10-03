@@ -92,7 +92,10 @@ export function useInstallRepos(installId: number | undefined) {
 // "unknown" = the server couldn't reach GitHub (rate-limited) even after its
 // own retries and had no stored state to fall back to. Distinct from "none"
 // so the UI never renders a FALSE "not enforced" off a missing answer.
-export type EnforcementState = "grug_managed" | "external" | "none" | "unknown";
+// "permission_denied" (grug#1001) = GitHub refused the read with a 403 that is
+// not a rate limit: the installation has not granted the App administration
+// access. Enforcement is unknown there, not absent, and "fix" cannot help.
+export type EnforcementState = "grug_managed" | "external" | "none" | "unknown" | "permission_denied";
 
 // Jittered exponential backoff for the client retry. The dashboard fires one
 // of these per repo in parallel; without jitter their retries re-sync into a

@@ -169,6 +169,17 @@ def ensure_enforcement(
         stored_ruleset_id=stored_ruleset_id,
     )
     state = detection.state
+    if state == "permission_denied":
+        # grug#1001: the App cannot read or write rulesets here, so a create
+        # would only 403 again. This is not "already enforced" either.
+        log.warning(
+            "enforcement_permission_denied",
+            extra={"owner": owner, "repo": repo,
+                   "install_id": install_id, "repo_id": repo_id},
+        )
+        from observability import emit_enforcement_metric  # type: ignore
+        emit_enforcement_metric(f"{owner}/{repo}", state)
+        return state
     if state != "none":
         if state == "grug_managed":
             # #686: heal the ruleset detection ACTUALLY matched, not the one
