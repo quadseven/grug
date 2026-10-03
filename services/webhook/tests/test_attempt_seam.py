@@ -115,3 +115,5 @@ def test_run_review_arm_delegates_to_seam(monkeypatch):
     assert calls[0]["backend"] is Backend.CAVE
     assert isinstance(outcome, _ArmOutcome)
     assert outcome.kind == "success"
+
+# live-verify probe for #660 (temp PR, will close unmerged)
