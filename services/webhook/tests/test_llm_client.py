@@ -3383,6 +3383,33 @@ def test_build_messages_threads_guidelines_into_the_system_prompt() -> None:
     assert "never use bare except" in system
 
 
+def test_claude_md_rule_reaches_system_prompt_end_to_end(monkeypatch) -> None:
+    """#674 fixture: the full pipeline, not just the last hop. A real
+    CLAUDE.md fetched from the repo ("never use bare except") flows through
+    `_repo_guidelines_block` into `_build_messages`, and the exact rule text
+    lands in the constructed system message the model receives. Proves the
+    distinguishing evidence survives fetch, render, and prompt threading."""
+    monkeypatch.setattr("github_app_auth.get_install_token", lambda *a, **k: "fake-token")
+
+    def _fake_get(url, params=None, headers=None, timeout=None):
+        if url.endswith("CLAUDE.md"):
+            return _gh_raw_response(200, "never use bare except")
+        return _gh_raw_response(404)
+
+    pr_context = {"repo": "quadseven/grug", "installation_id": 1, "head_sha": "abc123"}
+    with patch.object(httpx, "get", side_effect=_fake_get):
+        block = lc._repo_guidelines_block(pr_context)
+    assert "never use bare except" in block
+
+    hunks = [Hunk(path="a.py", body="+x = 1")]
+    messages = lc._build_messages(hunks, "v2", guidelines=block)
+    system = next(m["content"] for m in messages if m["role"] == "system")
+    assert "never use bare except" in system
+    # The precedence statement rides along: the model is told the carving
+    # outranks a taught preference.
+    assert "TRIBE'S OWN CARVINGS" in system
+
+
 def test_summarize_pr_tolerates_missing_optional_fields() -> None:
     payload = json.dumps({"summary": "A small fix."})
     response = httpx.Response(200, json=_openai_json_response(payload))

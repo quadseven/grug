@@ -224,6 +224,14 @@ def _release_active_review_claims() -> int:
     return release_active_review_claims()
 
 
+def _clear_active_board_notes() -> int:
+    # #819: alongside the claim release, restore the headers of any
+    # in-progress board notes orphaned by the shutdown.
+    from rerun import clear_active_board_notes  # type: ignore[attr-defined]
+
+    return clear_active_board_notes()
+
+
 def _release_inflight_reviews() -> tuple[int, int]:
     """Return SQS work first, then release the claims required to retry it."""
     leases = _release_active_review_leases()
@@ -236,6 +244,14 @@ def _release_inflight_reviews() -> tuple[int, int]:
             exc_info=True,
         )
         claims = 0
+    try:
+        _clear_active_board_notes()
+    except Exception as e:  # termination must survive cleanup failure
+        log.warning(
+            "consumer_board_note_clear_failed",
+            extra={"kind": type(e).__name__},
+            exc_info=True,
+        )
     return leases, claims
 
 

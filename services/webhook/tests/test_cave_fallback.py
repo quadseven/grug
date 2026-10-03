@@ -131,64 +131,74 @@ def _event(*bodies) -> dict:
 
 
 def test_handle_result_heals_publishes_check_and_records_verdict():
-    with patch.object(cf, "with_install_token_retry", side_effect=lambda iid, fn: fn("tok")), \
-         patch.object(cf, "post_check_run") as post, \
-         patch.object(cf, "record_check_verdict") as rec:
+    calls = []
+    with patch.object(
+        cf, "publish_persona_check",
+        side_effect=lambda **kw: calls.append(kw) or {"persona": "code_reviewer", "result": "healed"},
+    ):
         out = cf.handle_fallback_result(_event(_result_body()))
     assert out == {"records": 1, "healed": 1, "failed": 0}
-    # Published to the SAME check name + head, so it heals (not duplicates).
-    _, args, kwargs = post.mock_calls[0]
-    assert args[0] == "tok" and args[1] == "acme" and args[2] == "widget"
-    check = args[3]
-    assert check.name == "Grug - Elder"
-    assert check.head_sha == "deadbeef0000"
-    assert check.conclusion == "neutral"
+    # Heals the SAME check-run (name + head) via the shared seam, with the
+    # legacy persona key and the grug-cr: external id (persona_prefix="cr").
+    (kw,) = calls
+    assert kw["check_name"] == "Grug - Elder"
+    assert kw["head_sha"] == "deadbeef0000"
+    assert kw["conclusion"] == "neutral"
     # Verdict healed: errored → reviewed, real findings_count, no degraded_reason.
-    rkw = rec.call_args.kwargs
-    assert rkw["persona_key"] == "code_reviewer"
-    assert rkw["findings_count"] == 1
-    assert rkw["degraded_reason"] is None
-    assert rkw["head_sha"] == "deadbeef0000"
-    assert rkw["repo"] == "acme/widget" and rkw["pr_number"] == 7
+    assert kw["persona_key"] == "code_reviewer"
+    assert kw["persona_prefix"] == "cr"
+    assert kw["findings_count"] == 1
+    assert kw["degraded_reason"] is None
+    assert kw["blocking"] is False
+    assert kw["owner"] == "acme" and kw["repo"] == "widget"
+    assert kw["pr_number"] == 7
 
 
 def test_handle_result_drops_non_dict_findings():
-    with patch.object(cf, "with_install_token_retry", side_effect=lambda iid, fn: fn("tok")), \
-         patch.object(cf, "post_check_run"), \
-         patch.object(cf, "record_check_verdict") as rec:
+    calls = []
+    with patch.object(
+        cf, "publish_persona_check",
+        side_effect=lambda **kw: calls.append(kw) or {"persona": "code_reviewer", "result": "healed"},
+    ):
         cf.handle_fallback_result(_event(_result_body(findings=["garbage", {"path": "x"}, 7])))
     # Only the one dict finding counts (tolerance preserved from the old shape).
-    assert rec.call_args.kwargs["findings_count"] == 1
+    assert calls[0]["findings_count"] == 1
 
 
 def test_handle_result_degraded_does_not_fake_a_review():
     # Cave ALSO failed (ok=False) → leave the verdict errored (no publish, no heal).
-    with patch.object(cf, "with_install_token_retry") as tok, \
-         patch.object(cf, "post_check_run") as post, \
-         patch.object(cf, "record_check_verdict") as rec:
+    with patch.object(cf, "publish_persona_check") as seam:
         out = cf.handle_fallback_result(
             _event(_result_body(ok=False, error="cave_unreachable"))
         )
     assert out == {"records": 1, "healed": 1, "failed": 0}  # processed, not failed
-    post.assert_not_called()
-    rec.assert_not_called()
-    tok.assert_not_called()
+    seam.assert_not_called()
 
 
 def test_handle_result_malformed_body_is_dropped_not_raised():
-    with patch.object(cf, "post_check_run") as post:
+    with patch.object(cf, "publish_persona_check") as seam:
         out = cf.handle_fallback_result(_event("this is not json"))
     assert out == {"records": 1, "healed": 0, "failed": 1}
-    post.assert_not_called()
+    seam.assert_not_called()
 
 
 def test_handle_result_publish_error_is_caught():
-    with patch.object(cf, "with_install_token_retry", side_effect=lambda iid, fn: fn("tok")), \
-         patch.object(cf, "post_check_run", side_effect=RuntimeError("GH 503")), \
-         patch.object(cf, "record_check_verdict") as rec:
+    # The seam owns the publish now: a failed POST still records the honest
+    # degraded verdict (check_publish_failed) via the seam's merge, and the
+    # heal still raises so the record counts as failed, never silently healed.
+    import personas.publish_check as seam_mod
+
+    with patch.object(
+        seam_mod, "post_check_run", side_effect=RuntimeError("GH 503"),
+    ), patch.object(seam_mod, "record_check_verdict") as rec, \
+         patch.object(seam_mod, "with_install_token_retry",
+                      side_effect=lambda iid, fn: fn("tok")), \
+         patch.object(seam_mod.time, "sleep"):
         out = cf.handle_fallback_result(_event(_result_body()))
     assert out == {"records": 1, "healed": 0, "failed": 1}  # never raises out
-    rec.assert_not_called()  # publish failed before the heal
+    rkw = rec.call_args.kwargs
+    assert rkw["degraded_reason"] == "check_publish_failed"
+    assert rkw["persona_key"] == "code_reviewer"
 
 
 def test_handle_result_empty_records():
@@ -196,12 +206,13 @@ def test_handle_result_empty_records():
 
 
 def test_handle_result_clean_review_titles_no_omens():
-    with patch.object(cf, "with_install_token_retry", side_effect=lambda iid, fn: fn("tok")), \
-         patch.object(cf, "post_check_run") as post, \
-         patch.object(cf, "record_check_verdict"):
+    calls = []
+    with patch.object(
+        cf, "publish_persona_check",
+        side_effect=lambda **kw: calls.append(kw) or {"persona": "code_reviewer", "result": "healed"},
+    ):
         cf.handle_fallback_result(_event(_result_body(findings=[])))
-    check = post.mock_calls[0].args[3]
-    assert "no bad omens" in check.title.lower()
+    assert "no bad omens" in calls[0]["title"].lower()
 
 
 # --- peer-review hardenings (#322): size guard + markdown safety -----------

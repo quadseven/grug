@@ -27,6 +27,7 @@ from typing import Any, Callable
 import delivery_replay
 from adapters.install_store import (  # type: ignore
     list_allowlisted_installs,
+    list_comment_nudge_repos,
     list_comment_records,
     list_dep_watch_repos,
     list_hygiene_watch_repos,
@@ -124,6 +125,15 @@ def _pulse_runner(token: str, install_id: int, repos: list[dict[str, Any]]) -> t
     from personas.pulse.nudge import run_pulse_for_install
 
     return run_pulse_for_install(token, install_id, repos), 0
+
+
+def _comment_nudge_runner(
+    token: str, install_id: int, repos: list[dict[str, Any]]
+) -> tuple[int, int]:
+    """Pulse comment-nudge (#656): same single-count shape as _pulse_runner."""
+    from personas.pulse.comment_nudge import run_comment_nudge_for_install
+
+    return run_comment_nudge_for_install(token, install_id, repos), 0
 
 
 def _dep_watch_runner(token: str, install_id: int, repos: list[dict[str, Any]]) -> tuple[int, int]:
@@ -394,6 +404,14 @@ def handler(event: dict[str, Any], context: Any) -> dict[str, int | str]:
         installs, list_pulse_enabled_repos, _pulse_runner, "pulse_install_failed",
     )
 
+    # Pulse comment-nudge (#656, epic #654): suggested-fix replies on stale
+    # review threads. Same store-driven, best-effort, capped shape as Pulse;
+    # default OFF per repo (pulse_comment_nudge_enabled).
+    comment_nudges, comment_nudge_failed = _run_repo_scoped_pass(
+        installs, list_comment_nudge_repos, _comment_nudge_runner,
+        "comment_nudge_install_failed",
+    )
+
     # Guard dependency watch (#491): the owned dependabot-class pass -
     # same store-driven, best-effort shape as Pulse.
     dep_reports, dep_watch_failed = _run_repo_scoped_pass(
@@ -450,6 +468,8 @@ def handler(event: dict[str, Any], context: Any) -> dict[str, int | str]:
         "failed_installs": failed_installs,
         "pulse_nudges": nudges,
         "pulse_failed_installs": pulse_failed,
+        "comment_nudges": comment_nudges,
+        "comment_nudge_failed_installs": comment_nudge_failed,
         "dep_watch_reports": dep_reports,
         "dep_watch_failed_installs": dep_watch_failed,
         "reopen_watch_escalated": reopen_escalated,

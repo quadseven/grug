@@ -1448,6 +1448,8 @@ def _build_review_parts(
     file_contents: dict[str, str] | None = None,
     cross_file_contents: dict[str, str] | None = None,
     runtime_context: str | None = None,
+    ci_context: str | None = None,
+    repo_docs_context: str | None = None,
     pr_context: Optional[PrContext] = None,
     review_map: str = "",
 ) -> tuple[list[str], bool]:
@@ -1498,6 +1500,17 @@ def _build_review_parts(
     # instruction source.
     if runtime_context:
         parts.append(f"### PRODUCTION SIGNAL\n{runtime_context}")
+    # CI status (#902): the PR's OWN check-run status on the reviewed head,
+    # appended after the production signal so the diff stays primary.
+    # None/empty ⇒ output byte-identical to the pre-#902 shape. Read-only
+    # data for the model to weigh, never an instruction source.
+    if ci_context:
+        parts.append(f"### CI STATUS\n{ci_context}")
+    # Repo docs (#903): the repo's own CONTEXT.md glossary + path-relevant
+    # ADRs, as a block DISTINCT from learned team practices / lore and from
+    # the #674 agent-guideline block. None/empty ⇒ byte-identical to pre-#903.
+    if repo_docs_context:
+        parts.append(f"### REPO DOCS\n{repo_docs_context}")
     return parts, bool(intent)
 
 
@@ -1512,7 +1525,18 @@ def _review_system_prompt(
     learnings: str,
     guidelines: str = "",
 ) -> str:
-    """Compose trusted review instructions separately from repository data."""
+    """Compose trusted review instructions separately from repository data.
+
+    Precedence (#674), highest to lowest: in-repo agent guidelines
+    (CLAUDE.md/AGENTS.md/etc. - the repo's own versioned, team-authored
+    standard) > operator-taught learnings (#670) > few-shot examples (#538)
+    > team practices (#527) > the static base prompt. Later blocks outrank
+    earlier ones per this prompt's recency=authority convention, and the
+    guidelines block itself tells the model to follow the carving over a
+    taught preference on conflict. (A future `path-instructions` layer -
+    directory-scoped rules - would slot above guidelines; it does not exist
+    yet, so the chain is currently guidelines > learnings.)
+    """
     # Redact secret-shaped values from the diff + file context BEFORE they reach
     # the backend (#438). The backend is a third-party SaaS endpoint, and a PR
     # diff can carry a committed credential; the Elder reviews code structure, not
@@ -1564,6 +1588,8 @@ def _build_messages(
     file_contents: dict[str, str] | None = None,
     cross_file_contents: dict[str, str] | None = None,
     runtime_context: str | None = None,
+    ci_context: str | None = None,
+    repo_docs_context: str | None = None,
     team_practices: str = "",
     few_shot_examples: str = "",
     learnings: str = "",
@@ -1577,6 +1603,8 @@ def _build_messages(
         file_contents,
         cross_file_contents,
         runtime_context,
+        ci_context,
+        repo_docs_context,
         pr_context,
         review_map,
     )
@@ -1798,6 +1826,94 @@ def _call_backend(
     return resp
 
 
+# --- abandoned-LLM-call in-flight metric (#638) ------------------------------
+
+# grug#637 added mid-flight review cancellation: when a newer commit lands,
+# the waiter stops waiting on an in-flight backend call and returns
+# immediately. The background call is abandoned, not killed - it keeps
+# running to its own natural conclusion and still competes for the
+# backend's generation slot (e.g. spark-gateway's single slot for the Cave
+# target). Under rapid PR churn several abandoned generations for stale
+# commits can stack up silently. This tracker counts the abandoned calls
+# that are still running so the pileup is observable.
+
+
+class _AbandonedCallTracker:
+    """Thread-safe count of abandoned `_do_call` background calls still
+    running. Incremented when the waiting side gives up on a still-running
+    call, decremented when that call's real request finishes - regardless
+    of whether the waiter already gave up. A call that finished before the
+    abandon is never counted: it was never in flight AS abandoned."""
+
+    def __init__(self) -> None:
+        self._lock = threading.Lock()
+        self._in_flight = 0
+
+    @property
+    def in_flight(self) -> int:
+        with self._lock:
+            return self._in_flight
+
+    def note_abandoned(self, call_state: dict, backend: str) -> None:
+        """The waiting side gave up. `call_state` is this call's
+        {"abandoned", "finished"} flags, shared with `_do_call`'s finally
+        block; both transitions hold the same lock, so the count is exact
+        even when abandon and finish race."""
+        emit_count: int | None = None
+        with self._lock:
+            call_state["abandoned"] = True
+            if not call_state["finished"]:
+                self._in_flight += 1
+                emit_count = self._in_flight
+        if emit_count is not None:
+            _emit_abandoned_in_flight_gauge(emit_count, backend)
+
+    def call_finished(self, call_state: dict, backend: str) -> None:
+        """The background call's real request finished (ok or error). Only
+        decrements if this call was previously counted as abandoned."""
+        emit_count: int | None = None
+        with self._lock:
+            call_state["finished"] = True
+            if call_state["abandoned"]:
+                self._in_flight -= 1
+                emit_count = self._in_flight
+        if emit_count is not None:
+            _emit_abandoned_in_flight_gauge(emit_count, backend)
+
+
+_abandoned_calls = _AbandonedCallTracker()
+
+
+def _emit_abandoned_in_flight_gauge(count: int, backend: str) -> None:
+    """Dual emission for the abandoned-call gauge, same shape as
+    `openrouter_free_limiter._emit_telemetry`: one structured log token
+    (the operator-grep / DD-log-monitor token) plus the DogStatsD gauge a
+    dashboard graphs directly. Emitted on every transition (abandon and
+    drain), so the gauge always reflects the current count - a silent
+    series must never be read as "zero abandoned".
+
+    Expected range, for a future alert (no alert yet - this ships the
+    signal, per #638's out-of-scope boundary):
+    - 0 nearly always: abandoned calls drain as their real requests finish.
+    - Brief 1-3 under rapid PR churn (several pushes inside one review's
+      ~330-660s budget): normal; each drains within the backend timeout.
+    - Sustained > 5, or a count that climbs without draining: abandoned
+      generations are piling up faster than they finish and competing
+      with live reviews for the backend slot - the silent pileup #638
+      describes. Alert candidate: max over 5m > 5.
+
+    Never raises into the call path it describes."""
+    log.info(
+        "llm_abandoned_call_in_flight",
+        extra={"backend": backend, "abandoned_in_flight": count},
+    )
+    try:
+        from observability import emit_gauge  # type: ignore  # late: webhook-image only
+    except Exception:  # noqa: BLE001 - telemetry must never break the call it describes
+        return
+    emit_gauge("grug.llm.abandoned_calls_in_flight", float(count), {"backend": backend})
+
+
 def _post_with_retries_cancellable(
     config: BackendConfig, body: dict[str, Any], headers: dict[str, str],
     transport_attempts: int, cancel_event: threading.Event,
@@ -1808,6 +1924,10 @@ def _post_with_retries_cancellable(
     whichever resolves first wins. See `_call_backend`'s docstring for why
     this is "abandon the loser", not "kill the loser"."""
     result_q: queue.Queue = queue.Queue(maxsize=1)
+    # Shared with _do_call's finally block; the tracker resolves the
+    # abandon-vs-finish race under its own lock (#638).
+    call_state = {"abandoned": False, "finished": False}
+    backend_tag = config.backend.value
 
     def _do_call() -> None:
         try:
@@ -1818,6 +1938,8 @@ def _post_with_retries_cancellable(
             result_q.put(("ok", resp))
         except Exception as e:  # noqa: BLE001 - re-raised on the waiting side
             result_q.put(("error", e))
+        finally:
+            _abandoned_calls.call_finished(call_state, backend_tag)
 
     # Re-check immediately before spawning (FLINT, #637): _call_backend's
     # own top-level guard only catches cancellation that was ALREADY set
@@ -1830,6 +1952,10 @@ def _post_with_retries_cancellable(
     threading.Thread(target=_do_call, daemon=True).start()
     while True:
         if cancel_event.is_set():
+            # The background call is abandoned, not killed: it keeps
+            # running to its own conclusion. Count it while it is still
+            # in flight (#638).
+            _abandoned_calls.note_abandoned(call_state, backend_tag)
             raise httpx.RequestError("cancelled mid-flight")
         try:
             kind, payload = result_q.get(timeout=0.25)
@@ -3488,6 +3614,8 @@ def review_reasoner_diff(
     file_contents: dict[str, str] | None = None,
     cross_file_contents: dict[str, str] | None = None,
     runtime_context: str | None = None,
+    ci_context: str | None = None,
+    repo_docs_context: str | None = None,
     voice: VoiceSelection = "caveman",
     cancel_event: threading.Event | None = None,
 ) -> LlmReviewResponse:
@@ -3503,7 +3631,8 @@ def review_reasoner_diff(
     if not plan.staged:
         return _review_reasoner_diff_once(
             hunks, installation_id, pr_context, file_contents,
-            cross_file_contents, runtime_context, voice, cancel_event,
+            cross_file_contents, runtime_context, ci_context,
+            repo_docs_context, voice, cancel_event,
         )
 
     review_map = render_review_map(plan)
@@ -3551,6 +3680,8 @@ def review_reasoner_diff(
             },
             cross_file_contents,
             runtime_context,
+            ci_context,
+            repo_docs_context,
             voice,
             cancel_event,
             review_map,
@@ -3573,6 +3704,8 @@ def _review_reasoner_diff_once(
     file_contents: dict[str, str] | None = None,
     cross_file_contents: dict[str, str] | None = None,
     runtime_context: str | None = None,
+    ci_context: str | None = None,
+    repo_docs_context: str | None = None,
     voice: VoiceSelection = "caveman",
     cancel_event: threading.Event | None = None,
     review_map: str = "",
@@ -3592,7 +3725,8 @@ def _review_reasoner_diff_once(
         return LlmReviewResponse(kind="no_diff")
     variant: PromptVariant = "v2"
     messages = _build_messages(
-        hunks, variant, file_contents, cross_file_contents, runtime_context,
+        hunks, variant, file_contents, cross_file_contents, runtime_context, ci_context,
+        repo_docs_context,
         team_practices=_team_practices_block(pr_context),
         few_shot_examples=_few_shot_block(pr_context),
         learnings=_repo_learnings_block(pr_context),
@@ -3655,6 +3789,8 @@ def review_diff(
     file_contents: dict[str, str] | None = None,
     cross_file_contents: dict[str, str] | None = None,
     runtime_context: str | None = None,
+    ci_context: str | None = None,
+    repo_docs_context: str | None = None,
     voice: VoiceSelection = "caveman",
     cancel_event: threading.Event | None = None,
 ) -> LlmReviewResponse:
@@ -3694,7 +3830,7 @@ def review_diff(
     if not plan.staged:
         return _review_diff_dispatch(
             hunks, installation_id, pr_context, file_contents, cross_file_contents,
-            runtime_context, voice, cancel_event,
+            runtime_context, ci_context, repo_docs_context, voice, cancel_event,
         )
 
     review_map = render_review_map(plan)
@@ -3744,6 +3880,8 @@ def review_diff(
             cohort_contents,
             cross_file_contents,
             runtime_context,
+            ci_context,
+            repo_docs_context,
             voice,
             cancel_event,
             review_map,
@@ -3905,6 +4043,233 @@ def _dual_arm_partial_error(
     return f"partial review: {'; '.join(reasons)}" if reasons else ""
 
 
+@dataclass(frozen=True)
+class AttemptOutcome:
+    """Result of ONE LLM attempt via `_run_llm_attempt` (#660).
+
+    The shared envelope — span-open → `_call_backend` → error-classify →
+    body-reparse → `_extract_usage_metrics` → `_llmobs_annotate` on every
+    caught exit path — lives in exactly one place. Callers
+    (`_run_review_arm`, the SaaS overload fallback loop) keep only their
+    own outcome mapping. `error_kind` is None on a completed attempt
+    (findings may still be empty when the body did not parse).
+    """
+
+    backend: Backend
+    model: str | None
+    findings: tuple[Finding, ...]
+    content: str
+    # None on a completed attempt; otherwise one of "config",
+    # "transport", "parse_failed", "http_error".
+    error_kind: str | None
+    error_text: str | None
+    status_code: int | None
+    finish_reason: str
+    usage_metrics: dict[str, int | float]
+    span_context: dict | None
+    raw_response: httpx.Response | None
+
+
+def _annotate_attempt_error(
+    *,
+    span: Any,
+    backend: Backend,
+    variant: PromptVariant,
+    pr_tags: dict[str, str],
+    messages: list[dict[str, str]],
+    start_ns: int,
+    error_label: str,
+) -> None:
+    """Annotate the attempt span for a caught config/transport error.
+
+    Small so `_run_llm_attempt` stays under Grug's complexity cap — the
+    two error exits share this shape exactly (Elder, #660 follow-up).
+    """
+    _llmobs_annotate(
+        span=span,
+        input_data=_redact_payload(messages),
+        metadata={
+            "backend": backend.value,
+            "variant_id": variant,
+            "error": error_label,
+        },
+        metrics={"latency_ms": _elapsed_ms(start_ns)},
+        tags=pr_tags,
+    )
+
+
+def _reparse_attempt_body(resp: httpx.Response, backend: Backend) -> dict:
+    """Re-parse the response body for content/usage extraction.
+
+    `httpx.Response.json()` re-parses from the cached `.content` bytes;
+    review bodies are small so the cost is negligible vs the LLM
+    round-trip. Returns {} (with a warning) when the body is not JSON —
+    the span would otherwise silently emit kind=reviewed with empty
+    content and undercount DD token-cost dashboards.
+    """
+    try:
+        body = resp.json() if resp.status_code == 200 else {}
+    except (ValueError, json.JSONDecodeError):
+        # Triggered when the first parse also failed (CF HTML
+        # interstitial, truncated body) OR — rarely — when the cache
+        # diverges. Either way the LLM Obs span must not claim a clean
+        # review it cannot describe.
+        log.warning(
+            "llm_body_reparse_failed",
+            extra={
+                "backend": backend.value,
+                "status_code": resp.status_code,
+            },
+        )
+        body = {}
+    return body if isinstance(body, dict) else {}
+
+
+def _extract_attempt_content(body: dict) -> tuple[str, str]:
+    """Pull (content, finish_reason) from a re-parsed response body."""
+    content = ""
+    finish_reason = ""
+    choices = body.get("choices") or []
+    if choices and isinstance(choices[0], dict):
+        content = (choices[0].get("message") or {}).get("content", "")
+        finish_reason = choices[0].get("finish_reason") or ""
+    return content, finish_reason
+
+
+def _run_llm_attempt(
+    *,
+    backend: Backend,
+    config: BackendConfig,
+    messages: list[dict[str, str]],
+    variant: PromptVariant,
+    pr_tags: dict[str, str],
+    cancel_event: threading.Event | None = None,
+    transport_log_event: str = "llm_backend_transport_failed",
+) -> AttemptOutcome:
+    """Run a single LLM attempt: open one `_llmobs_llm` span
+    (`elder_code_review`), call the backend, classify config/transport/parse
+    errors, re-parse the body, extract usage metrics, and annotate the span
+    on EVERY caught exit path (success + config + transport + parse/http).
+
+    `cancel_event` is passed straight through to `_call_backend`, which
+    aborts its in-flight request the moment the event is set.
+    `transport_log_event` preserves each caller's log name (the arm and the
+    SaaS fallback historically log transport failures under different
+    names that DD dashboards match on). A surprise exception escaping
+    `_call_backend` propagates without annotation — that's intentional
+    (it's a bug worth seeing, not a routine signal).
+    """
+    start_ns = time.monotonic_ns()
+    with _llmobs_llm(
+        model_name=config.model,
+        model_provider=backend.value,
+        name=_LLMOBS_NAME,
+    ) as span:
+        try:
+            resp = _call_backend(config, messages, cancel_event=cancel_event)
+        except _BackendConfigError as e:
+            # log.exception (not log.error) retains the traceback -
+            # FLINT #629, ruff TRY400.
+            log.exception(
+                "llm_backend_misconfigured",
+                extra={"backend": backend.value, "detail": str(e)},
+            )
+            _annotate_attempt_error(
+                span=span,
+                backend=backend,
+                variant=variant,
+                pr_tags=pr_tags,
+                messages=messages,
+                start_ns=start_ns,
+                error_label="config",
+            )
+            return AttemptOutcome(
+                backend=backend,
+                model=None,
+                findings=(),
+                content="",
+                error_kind="config",
+                error_text=f"{backend.value} misconfigured: {e}",
+                status_code=None,
+                finish_reason="",
+                usage_metrics={},
+                span_context=None,
+                raw_response=None,
+            )
+        except (httpx.RequestError, httpx.TimeoutException) as e:
+            log.warning(
+                transport_log_event,
+                extra={"backend": backend.value, "kind": type(e).__name__},
+            )
+            _annotate_attempt_error(
+                span=span,
+                backend=backend,
+                variant=variant,
+                pr_tags=pr_tags,
+                messages=messages,
+                start_ns=start_ns,
+                error_label=type(e).__name__,
+            )
+            return AttemptOutcome(
+                backend=backend,
+                model=None,
+                findings=(),
+                content="",
+                error_kind="transport",
+                error_text=f"{backend.value}: {type(e).__name__}",
+                status_code=None,
+                finish_reason="",
+                usage_metrics={},
+                span_context=None,
+                raw_response=None,
+            )
+        findings, model, err = _parse_response(resp)
+        # Annotate AFTER the response so we capture the raw content
+        # + token counts.
+        body = _reparse_attempt_body(resp, backend)
+        content, finish_reason = _extract_attempt_content(body)
+        usage_metrics = _extract_usage_metrics(body)
+        _llmobs_annotate(
+            span=span,
+            input_data=_redact_payload(messages),
+            output_data=_redact_payload(content) if content else None,
+            metadata={
+                "backend": backend.value,
+                "variant_id": variant,  # #191 prompt A/B arm
+                "status_code": resp.status_code,
+                "kind": "reviewed" if not err else (
+                    "parse_failed" if resp.status_code == 200 else "http_error"
+                ),
+                "finish_reason": finish_reason,
+            },
+            metrics={
+                "latency_ms": _elapsed_ms(start_ns),
+                **usage_metrics,
+            },
+            tags=pr_tags,
+        )
+        # Export inside the `with` block — the span must be active
+        # for export to capture its trace/span IDs.
+        span_context = _llmobs_export(span) if not err else None
+        return AttemptOutcome(
+            backend=backend,
+            model=model,
+            findings=findings,
+            content=content,
+            error_kind=(
+                None
+                if not err
+                else ("parse_failed" if resp.status_code == 200 else "http_error")
+            ),
+            error_text=err or None,
+            status_code=resp.status_code,
+            finish_reason=finish_reason,
+            usage_metrics=usage_metrics,
+            span_context=span_context,
+            raw_response=resp,
+        )
+
+
 def _run_review_arm(
     backend: "Backend",
     messages: list[dict[str, str]],
@@ -3932,179 +4297,131 @@ def _run_review_arm(
     `:free` fallback tier is a cheap best-effort attempt, not a primary
     discovery arm. None (the default) preserves every existing call site's
     behavior unchanged."""
-    try:
-        config = config_override if config_override is not None else _review_backend_config(backend)
-    except _BackendConfigError as e:
-        # Still emit a span so DD sees config errors (gateway/secret missing),
-        # not just transport errors - but do it here, BEFORE the main span,
-        # so a bad config can never raise out of review_diff.
-        cfg_start_ns = time.monotonic_ns()
-        with _llmobs_llm(
-            model_name=backend.value, model_provider=backend.value, name=_LLMOBS_NAME,
-        ) as cfg_span:
-            _llmobs_annotate(
-                span=cfg_span, input_data=_redact_payload(messages),
-                metadata={"backend": backend.value, "variant_id": variant, "error": "config"},
-                metrics={"latency_ms": _elapsed_ms(cfg_start_ns)},
-                tags=pr_tags,
-            )
-        # log.exception (not log.error) retains the traceback - FLINT
-        # #629, ruff TRY400 - same fix already applied to the SaaS-fallback
-        # block below.
-        log.exception("llm_backend_misconfigured", extra={"backend": backend.value, "detail": str(e)})
-        return _ArmOutcome(
-            backend=backend, kind="config_error",
-            error_text=f"{backend.value} misconfigured: {e}",
-        )
 
-    # Open one LLM Obs span per backend attempt. Annotate on every CAUGHT
-    # exit path (success + the three explicit `except` arms) so DD captures
-    # latency tails and per-backend error rates. A surprise exception
-    # escaping `_call_backend` would propagate without annotation - that's
-    # intentional (it's a bug worth seeing in Seer, not a routine signal).
-    start_ns = time.monotonic_ns()
-    with _llmobs_llm(
-        model_name=config.model,
-        model_provider=backend.value,
-        name=_LLMOBS_NAME,
-    ) as span:
-        try:
-            resp = _call_backend(config, messages, cancel_event=cancel_event)
-        except _BackendConfigError as e:
-            # log.exception (not log.error) retains the traceback -
-            # FLINT #629, ruff TRY400.
+    try:
+        config = (
+            config_override
+            if config_override is not None
+            else _review_backend_config(backend)
+        )
+    except _BackendConfigError as e:
+        # Config resolution happens BEFORE the span exists (no model name
+        # to tag yet) - open one so the misconfiguration is still recorded
+        # in LLM Obs, then fail fast. This is the only envelope piece that
+        # stays arm-specific: the SaaS fallback resolves a different
+        # config shape outside its own seam call.
+        with _llmobs_llm(
+            model_name=backend.value,
+            model_provider=backend.value,
+            name=_LLMOBS_NAME,
+        ) as span:
             log.exception(
                 "llm_backend_misconfigured",
                 extra={"backend": backend.value, "detail": str(e)},
             )
             _llmobs_annotate(
-                span=span, input_data=_redact_payload(messages),
-                metadata={"backend": backend.value, "variant_id": variant, "error": "config"},
-                metrics={"latency_ms": _elapsed_ms(start_ns)},
-                tags=pr_tags,
-            )
-            return _ArmOutcome(
-                backend=backend, kind="config_error",
-                error_text=f"{backend.value} misconfigured: {e}",
-            )
-        except (httpx.RequestError, httpx.TimeoutException) as e:
-            log.warning(
-                "llm_backend_transport_failed",
-                extra={"backend": backend.value, "kind": type(e).__name__},
-            )
-            _llmobs_annotate(
-                span=span, input_data=_redact_payload(messages),
-                metadata={"backend": backend.value, "variant_id": variant, "error": type(e).__name__},
-                metrics={"latency_ms": _elapsed_ms(start_ns)},
-                tags=pr_tags,
-            )
-            return _ArmOutcome(
-                backend=backend, kind="transport_error",
-                error_text=f"{backend.value}: {type(e).__name__}",
-            )
-        findings, model, err = _parse_response(resp)
-        # Annotate AFTER the response so we capture the raw content
-        # + token counts. httpx.Response.json() re-parses from the
-        # cached .content bytes; review response bodies are small,
-        # so the cost is negligible vs the LLM round-trip.
-        try:
-            body = resp.json() if resp.status_code == 200 else {}
-        except (ValueError, json.JSONDecodeError):
-            # Triggered when the first parse also failed (CF HTML
-            # interstitial, truncated body) OR — rarely — when
-            # the cache diverges. Either way the LLM Obs span
-            # would otherwise silently emit kind=reviewed with
-            # empty content and undercount DD token-cost
-            # dashboards.
-            log.warning(
-                "llm_body_reparse_failed",
-                extra={
+                span=span,
+                input_data=_redact_payload(messages),
+                metadata={
                     "backend": backend.value,
-                    "status_code": resp.status_code,
+                    "variant_id": variant,
+                    "error": "config",
                 },
+                metrics={"latency_ms": 0},
+                tags=pr_tags,
             )
-            body = {}
-        content = ""
-        finish_reason = ""
-        if isinstance(body, dict):
-            choices = body.get("choices") or []
-            if choices and isinstance(choices[0], dict):
-                content = (choices[0].get("message") or {}).get("content", "")
-                finish_reason = choices[0].get("finish_reason") or ""
-        usage_metrics = _extract_usage_metrics(body)
-        _llmobs_annotate(
-            span=span,
-            input_data=_redact_payload(messages),
-            output_data=_redact_payload(content) if content else None,
-            metadata={
-                "backend": backend.value,
-                "variant_id": variant,  # #191 prompt A/B arm
-                "status_code": resp.status_code,
-                "kind": "reviewed" if not err else (
-                    "parse_failed" if resp.status_code == 200 else "http_error"
-                ),
-                "finish_reason": finish_reason,
-            },
-            metrics={
-                "latency_ms": _elapsed_ms(start_ns),
-                **usage_metrics,
-            },
-            tags=pr_tags,
+        return _ArmOutcome(
+            backend=backend,
+            kind="config_error",
+            error_text=f"{backend.value} misconfigured: {e}",
         )
-        # Export inside the `with` block — the span must be active
-        # for export to capture its trace/span IDs.
-        span_context = _llmobs_export(span) if not err else None
+
+    attempt = _run_llm_attempt(
+        backend=backend,
+        config=config,
+        messages=messages,
+        variant=variant,
+        pr_tags=pr_tags,
+        cancel_event=cancel_event,
+    )
+    if attempt.error_kind == "config":
+        return _ArmOutcome(
+            backend=backend,
+            kind="config_error",
+            error_text=attempt.error_text or "",
+        )
+    if attempt.error_kind == "transport":
+        return _ArmOutcome(
+            backend=backend,
+            kind="transport_error",
+            error_text=attempt.error_text or "",
+        )
+    # Completed attempt: map to the arm's outcome. `raw_response` is never
+    # None here - config/transport errors returned above.
+    resp = attempt.raw_response
+    assert resp is not None
+    err = attempt.error_text or ""
+    model = attempt.model
+    findings = attempt.findings
 
     if not err:
         resolved_model = model or config.model
-        # grug#851: a completion that hit its max_tokens cap
-        # (finish_reason="length") parses as valid JSON (the constrained
-        # decoder legally closes it out, e.g. `{"findings": []}`) but is NOT
-        # a complete review -- the model may not have reasoned about most of
-        # the diff. Flagged here so every caller folds it into
-        # `LlmReviewResponse.error` via the `"partial review: "` seam
-        # instead of letting it read as a clean pass.
-        truncated = finish_reason == "length"
-        if truncated:
+        if attempt.finish_reason == "length":
             log.warning(
                 "llm_response_truncated",
                 extra={
                     "backend": backend.value,
                     "model": resolved_model,
-                    "finish_reason": finish_reason,
-                    "finding_count": len(findings),
+                    "variant": variant,
                 },
             )
-        degenerate = _is_degenerate_empty_review(findings, usage_metrics)
-        if degenerate:
-            _record_degenerate_review(backend, resolved_model, usage_metrics)
+        if _is_degenerate_empty_review(findings, attempt.usage_metrics):
+            # Model answered "no findings" while spending real tokens -
+            # keep a record of the (empty) LLM Obs span for
+            # post-incident forensics.
+            _record_degenerate_review(
+                backend, resolved_model, attempt.usage_metrics
+            )
+            return _ArmOutcome(
+                backend=backend,
+                kind="success",
+                model=resolved_model,
+                findings=findings,
+                span_context=attempt.span_context,
+                truncated=attempt.finish_reason == "length",
+                degenerate=True,
+            )
         return _ArmOutcome(
-            backend=backend, kind="success", model=resolved_model,
-            findings=findings, span_context=span_context, truncated=truncated,
-            degenerate=degenerate,
+            backend=backend,
+            kind="success",
+            model=resolved_model,
+            findings=findings,
+            span_context=attempt.span_context,
+            truncated=attempt.finish_reason == "length",
         )
     if resp.status_code == 200:
-        # 200 + parse failure — the LLM responded but the content wasn't
-        # usable JSON. FALL BACK to the other backend: the two backends run
-        # DIFFERENT models (OpenRouter=claude, Poolside=laguna), so a parse
-        # failure on one does NOT predict the other (the old "same prose"
-        # assumption is stale post the per-backend model split). Record the
-        # FIRST parse failure so a both-fail outcome still returns the
-        # specific `parse_failed` kind (caller posts an advisory check-run).
+        # Model replied 200 with an unusable body - parse failure.
         log.warning(
             "llm_response_parse_failed",
             extra={"backend": backend.value, "model": model, "error": err},
         )
         return _ArmOutcome(
-            backend=backend, kind="parse_failed", model=model,
-            error_text=f"{backend.value}: parse_failed: {err}", parse_err=err,
+            backend=backend,
+            kind="parse_failed",
+            model=model,
+            error_text=f"{backend.value}: parse_failed: {err}",
+            parse_err=err,
         )
     _log_backend_failure(
-        backend_value=backend.value, status=resp.status_code, error=err,
+        backend_value=backend.value,
+        status=resp.status_code,
+        error=err,
         error_message=_backend_error_message(resp),
     )
     return _ArmOutcome(
-        backend=backend, kind="http_failed",
+        backend=backend,
+        kind="http_failed",
+        model=model,
         error_text=f"{backend.value}: {err}",
     )
 
@@ -4447,6 +4764,8 @@ def _review_diff_dispatch(
     file_contents: dict[str, str] | None,
     cross_file_contents: dict[str, str] | None,
     runtime_context: str | None,
+    ci_context: str | None,
+    repo_docs_context: str | None,
     voice: VoiceSelection,
     cancel_event: threading.Event | None,
     review_map: str = "",
@@ -4471,7 +4790,8 @@ def _review_diff_dispatch(
             "v2" if depth != "fast" else select_prompt_variant(installation_id)
         )
         messages = _build_messages(
-            hunks, variant, file_contents, cross_file_contents, runtime_context,
+            hunks, variant, file_contents, cross_file_contents, runtime_context, ci_context,
+        repo_docs_context,
             team_practices=_team_practices_block(pr_context),
             few_shot_examples=_few_shot_block(pr_context),
             learnings=_repo_learnings_block(pr_context),
@@ -4491,7 +4811,7 @@ def _review_diff_dispatch(
         # sparks" (the operator, 2026-08-27) is not itself configurable away.
     return _review_diff_dispatch_cave_primary(
         hunks, installation_id, pr_context, file_contents, cross_file_contents,
-        runtime_context, voice, cancel_event, review_map,
+        runtime_context, ci_context, repo_docs_context, voice, cancel_event, review_map,
     )
 
 
@@ -4502,6 +4822,8 @@ def _review_diff_dispatch_cave_primary(
     file_contents: dict[str, str] | None,
     cross_file_contents: dict[str, str] | None,
     runtime_context: str | None,
+    ci_context: str | None,
+    repo_docs_context: str | None,
     voice: VoiceSelection,
     cancel_event: threading.Event | None,
     review_map: str = "",
@@ -4520,7 +4842,8 @@ def _review_diff_dispatch_cave_primary(
         "v2" if depth != "fast" else select_prompt_variant(installation_id)
     )
     messages = _build_messages(
-        hunks, variant, file_contents, cross_file_contents, runtime_context,
+        hunks, variant, file_contents, cross_file_contents, runtime_context, ci_context,
+        repo_docs_context,
         team_practices=_team_practices_block(pr_context),
         few_shot_examples=_few_shot_block(pr_context),
         learnings=_repo_learnings_block(pr_context),
@@ -4675,71 +4998,26 @@ def _review_diff_dispatch_cave_primary(
         # manifest comment on GRUG_REVIEW_JOB_TIMEOUT_S).
         for backend in (Backend.POOLSIDE, Backend.OPENROUTER):
             config = _saas_overload_fallback_config(backend)
-            start_ns = time.monotonic_ns()
-            with _llmobs_llm(
-                model_name=config.model, model_provider=backend.value, name=_LLMOBS_NAME,
-            ) as span:
-                try:
-                    resp = _call_backend(config, messages)
-                except _BackendConfigError as e:
-                    # log.exception (not log.error) retains the traceback -
-                    # FLINT #629, ruff TRY400.
-                    log.exception(
-                        "llm_backend_misconfigured",
-                        extra={"backend": backend.value, "detail": str(e)},
-                    )
-                    _llmobs_annotate(
-                        span=span, input_data=_redact_payload(messages),
-                        metadata={"backend": backend.value, "variant_id": variant, "error": "config"},
-                        metrics={"latency_ms": _elapsed_ms(start_ns)},
-                        tags=pr_tags,
-                    )
-                    last_error = f"{backend.value} misconfigured: {e}"
-                    continue
-                except (httpx.RequestError, httpx.TimeoutException) as e:
-                    log.warning(
-                        "llm_saas_overload_fallback_transport_failed",
-                        extra={"backend": backend.value, "kind": type(e).__name__},
-                    )
-                    _llmobs_annotate(
-                        span=span, input_data=_redact_payload(messages),
-                        metadata={"backend": backend.value, "variant_id": variant, "error": type(e).__name__},
-                        metrics={"latency_ms": _elapsed_ms(start_ns)},
-                        tags=pr_tags,
-                    )
-                    last_error = f"{backend.value}: {type(e).__name__}"
-                    continue
-                findings, model, err = _parse_response(resp)
-                try:
-                    body = resp.json() if resp.status_code == 200 else {}
-                except (ValueError, json.JSONDecodeError):
-                    log.warning(
-                        "llm_body_reparse_failed",
-                        extra={"backend": backend.value, "status_code": resp.status_code},
-                    )
-                    body = {}
-                content = ""
-                if isinstance(body, dict):
-                    choices = body.get("choices") or []
-                    if choices and isinstance(choices[0], dict):
-                        content = (choices[0].get("message") or {}).get("content", "")
-                usage_metrics = _extract_usage_metrics(body)
-                _llmobs_annotate(
-                    span=span,
-                    input_data=_redact_payload(messages),
-                    output_data=_redact_payload(content) if content else None,
-                    metadata={
-                        "backend": backend.value,
-                        "variant_id": variant,
-                        "status_code": resp.status_code,
-                        "kind": "reviewed" if not err else (
-                            "parse_failed" if resp.status_code == 200 else "http_error"
-                        ),
-                    },
-                    metrics={"latency_ms": _elapsed_ms(start_ns), **usage_metrics},
-                    tags=pr_tags,
-                )
-                span_context = _llmobs_export(span) if not err else None
+            attempt = _run_llm_attempt(
+                backend=backend,
+                config=config,
+                messages=messages,
+                variant=variant,
+                pr_tags=pr_tags,
+                transport_log_event="llm_saas_overload_fallback_transport_failed",
+            )
+            if attempt.error_kind in ("config", "transport"):
+                last_error = attempt.error_text or ""
+                continue
+            # Completed attempt: the seam annotated the span and classified
+            # the outcome. `raw_response` is never None here - config /
+            # transport errors continued above.
+            resp = attempt.raw_response
+            assert resp is not None
+            findings = attempt.findings
+            model = attempt.model
+            err = attempt.error_text or ""
+            span_context = attempt.span_context
             if not err:
                 resolved_model = model or config.model
                 log.info(
