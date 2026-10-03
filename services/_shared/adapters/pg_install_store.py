@@ -295,7 +295,8 @@ def get_repo_config(install_id: int, repo_id: int) -> dict[str, Any]:
     # Per-repo complexity caps (#1041): absent row/field falls through to the
     # env-var default (do not invent a third default). Stored as ints; a
     # non-positive or non-int value reads back as the default rather than
-    # disabling the source.
+    # disabling the source. Import is function-level to avoid widening this
+    # adapter's module-level dependency surface (personas layer).
     from personas.code_reviewer.complexity import (
         _DEFAULT_COGNITIVE_CAP,
         _DEFAULT_CYCLOMATIC_CAP,
