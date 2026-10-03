@@ -54,6 +54,7 @@ const PERSONAS = [
   { id: "warder", code: "F-06", name: "Warder", img: "grug_mystic.png", desc: "Shaman at the gate. Changelog scroll, semver hint, ward bad release from tribe.", meta: ["release scroll", "SLO gate"], modes: ["block", "warn", "off"] },
   { id: "pulse", code: "F-07", name: "Pulse", img: "grug_mullet.png", desc: "Walk the camp at night. Poke sleeping hunts Chief already blessed.", meta: ["stale nudge", "scheduled"], modes: [], info: "scheduled" },
   { id: "sentinel", code: "F-08", name: "Sentinel", img: "grug_guard.png", desc: "Watch hunts that end wrong. Name markings left unanswered when PR close or merge.", meta: ["abandoned findings", "safety net"], modes: [], info: "comment-only" },
+  { id: "pulse_comment_nudge", code: "F-09", name: "Pulse Nudge", img: "grug_mullet.png", desc: "Whisper fixes into stale threads. One suggested-fix reply per unanswered review thread.", meta: ["thread nudge", "scheduled"], modes: [], info: "scheduled" },
 ] as const;
 
 const SKINS = [
