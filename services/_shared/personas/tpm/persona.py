@@ -69,8 +69,9 @@ _CHECK_NAME = CHECK_CHIEF
 # operator's own account, so the author login cannot tell them apart from a
 # person. What CAN: the harness appends a `claude.ai/code/session_...` link
 # to every PR body it writes (660 of 667 marked PRs in a 7-day sample carry
-# it as the final line); the repo's own PR template stamps a
-# `Generated with [Claude Code](https://claude.com/claude-code)` footer; and
+# it as the final line); Claude Code's default PR attribution ends the body
+# with a `Generated with [Claude Code](https://claude.com/claude-code)`
+# footer; and
 # `<!-- grug:agent-authored -->` is the explicit opt-in for any other agent
 # tooling. Chief's Hunt Plan is a format gate for people; an agent
 # reformatting its own body to satisfy it is pure churn, so such PRs get a
@@ -79,16 +80,18 @@ _CHECK_NAME = CHECK_CHIEF
 _AGENT_AUTHORED_RE = re.compile(
     r"https://claude\.ai/code/session_[A-Za-z0-9]+"
     r"|<!--\s*grug:agent-authored\s*-->"
-    # The repo's own PR template footer (`.github/pull_request_template.md`).
-    # Matches the exact markdown-link form only — a human writing "I used
-    # claude code to draft this" in prose must NOT switch Chief off.
+    # Claude Code's default PR attribution footer. Matches the exact
+    # markdown-link form only: a human writing "I used claude code to draft
+    # this" in prose must NOT switch Chief off. No human-facing PR template
+    # may carry this line, or every PR opened from it would skip Chief;
+    # test_pr_template_is_not_agent_authored pins that for this repo.
     r"|Generated with \[Claude Code\]\(https://claude\.com/claude-code\)",
 )
 _AGENT_SKIP_TITLE = "Hunt Plan skipped - agent-authored PR"
 _AGENT_SKIP_SUMMARY = (
     "Chief did not check this Hunt Plan: the PR body carries an "
-    "agent-authored marker (a `claude.ai/code/session_` link, the template's "
-    "`Generated with [Claude Code]` footer, or "
+    "agent-authored marker (a `claude.ai/code/session_` link, Claude Code's "
+    "`Generated with [Claude Code]` attribution footer, or "
     "`<!-- grug:agent-authored -->`). Hunt Plan format checks apply to "
     "PRs written by people. Elder and Guard still review the code."
 )
