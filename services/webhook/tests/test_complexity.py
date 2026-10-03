@@ -226,3 +226,43 @@ def test_under_cap_function_is_neither_reported_nor_suppressed():
                                 base_contents={"services/y.py": src})
     assert scan.findings == ()
     assert scan.suppressed == ()
+
+
+# --- per-repo caps (grug#1041) ---------------------------------------------
+
+def test_repo_caps_come_from_the_repo_config():
+    from personas.code_reviewer import dispatch as cr_dispatch
+    from unittest.mock import patch
+
+    cfg = {"complexity_cyclomatic_cap": 30, "complexity_cognitive_cap": None}
+    with patch("adapters.install_store.get_repo_config", return_value=cfg):
+        assert cr_dispatch._repo_complexity_caps(7, 42) == (30, None)
+
+
+def test_repo_caps_fall_back_to_env_default_when_the_config_read_raises():
+    """A config-store hiccup must not abort the review: (None, None) makes the
+    scanner use its env default."""
+    from personas.code_reviewer import dispatch as cr_dispatch
+    from unittest.mock import patch
+
+    with patch("adapters.install_store.get_repo_config", side_effect=RuntimeError("db")):
+        assert cr_dispatch._repo_complexity_caps(7, 42) == (None, None)
+
+
+def test_a_repo_specific_cap_changes_which_functions_report():
+    cfg_loose = {"complexity_cyclomatic_cap": 500, "complexity_cognitive_cap": 500}
+    cfg_tight = {"complexity_cyclomatic_cap": 2, "complexity_cognitive_cap": 500}
+    from personas.code_reviewer import dispatch as cr_dispatch
+    from unittest.mock import patch
+
+    hunks, contents = _one_hunk(), {"a.py": _tangled()}
+    results = []
+    for cfg in (cfg_loose, cfg_tight):
+        with patch("adapters.install_store.get_repo_config", return_value=cfg):
+            cyclo, cog = cr_dispatch._repo_complexity_caps(7, 42)
+        results.append(
+            scan_complexity_full(hunks, contents, cyclomatic_cap=cyclo,
+                                 cognitive_cap=cog).findings
+        )
+    assert results[0] == ()
+    assert len(results[1]) == 1

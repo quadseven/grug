@@ -2168,6 +2168,29 @@ def _is_permanent_rejection(error: Exception) -> bool:
     return True
 
 
+def _repo_complexity_caps(
+    installation_id: int, repo_id: int,
+) -> tuple[int | None, int | None]:
+    """Per-repo (cyclomatic, cognitive) caps from repo config (grug#1041).
+
+    None means "use the scanner's env default". Best-effort: a config-store
+    hiccup must not fail a review, so any error returns (None, None)."""
+    try:
+        from adapters.install_store import get_repo_config
+
+        cfg = get_repo_config(installation_id, repo_id)
+        return (
+            cfg.get("complexity_cyclomatic_cap"),
+            cfg.get("complexity_cognitive_cap"),
+        )
+    except Exception as e:  # noqa: BLE001 - enrichment must never abort a review
+        log.info(
+            "code_review_complexity_caps_unavailable",
+            extra={"kind": type(e).__name__},
+        )
+        return None, None
+
+
 def dispatch_code_review(
     payload: dict[str, Any], *, blocking: bool,
     cancel_event: threading.Event | None = None,
@@ -2667,8 +2690,13 @@ def dispatch_code_review(
     # judge (it is precise by construction). It rides the SAME merge rule as the
     # SAST suite; MEDIUM means it never blocks a merge on its own.
     try:
+        cyclomatic_cap, cognitive_cap = _repo_complexity_caps(
+            installation_id, int(repo["id"]),
+        )
         complexity_scan = scan_complexity_full(
             hunks, file_contents,
+            cyclomatic_cap=cyclomatic_cap,
+            cognitive_cap=cognitive_cap,
             base_contents=base_file_contents or None,
         )
     except Exception as e:  # noqa: BLE001 - enrichment must never abort a review

@@ -1050,6 +1050,55 @@ def test_check_run_reconcile_flag_and_targeting(pg):
     assert store.list_check_run_reconcile_repos(5) == [{"id": 301, "full_name": "o/on"}]
 
 
+def test_complexity_caps_round_trip(pg):
+    """grug#1041: per-repo complexity caps are ints. An absent row and an
+    absent field both read back as None (the scanner then applies its env
+    default, so the default lives in one place); a set value round-trips; a
+    non-positive or non-int value is rejected at write time."""
+    from adapters import pg_install_store as store
+
+    # Absent row.
+    assert store.get_repo_config(5, 401)["complexity_cyclomatic_cap"] is None
+    # Absent field on an existing row.
+    store.set_repo_config(install_id=5, repo_id=402, repo_full_name="o/r",
+                          updated_by_user_id="9", tpm_enabled=True)
+    cfg = store.get_repo_config(5, 402)
+    assert cfg["complexity_cyclomatic_cap"] is None
+    assert cfg["complexity_cognitive_cap"] is None
+    # Set value.
+    store.set_repo_config(install_id=5, repo_id=402, repo_full_name="o/r",
+                          updated_by_user_id="9", complexity_cyclomatic_cap=30,
+                          complexity_cognitive_cap=40)
+    cfg = store.get_repo_config(5, 402)
+    assert cfg["complexity_cyclomatic_cap"] == 30
+    assert cfg["complexity_cognitive_cap"] == 40
+    # Rejected values.
+    for bad in (0, -3, "15", True, 2.5):
+        with pytest.raises(ValueError, match="positive integer"):
+            store.set_repo_config(install_id=5, repo_id=403, repo_full_name="o/r3",
+                                  updated_by_user_id="9",
+                                  complexity_cyclomatic_cap=bad)
+
+
+def test_complexity_caps_unreadable_stored_value_reads_back_unset(pg):
+    """grug#1041 review: `get_repo_config` is called by the dashboard listing and
+    the enforcement pass with no fallback around it, so a stored cap that is not
+    a clean in-range int (hand-edited row, legacy bool) must read back as unset
+    instead of raising and failing the whole call."""
+    from adapters import pg_install_store as store
+
+    for repo_id, bad in ((410, "abc"), (411, True), (412, 0), (413, 99999), (414, [1])):
+        store._merge_attrs(
+            store._inst_pk(5), store._repo_sk(repo_id),
+            {"repo_full_name": "o/r", "complexity_cyclomatic_cap": bad,
+             "complexity_cognitive_cap": 40},
+        )
+        cfg = store.get_repo_config(5, repo_id)
+        assert cfg["complexity_cyclomatic_cap"] is None, bad
+        # A readable sibling value on the same row is unaffected.
+        assert cfg["complexity_cognitive_cap"] == 40
+
+
 def test_guard_hygiene_dead_ref_patterns_round_trip(pg):
     """#778: dead-ref patterns are per-install DATA, not a bool flag - the
     store must round-trip a list of strings, default to an empty tuple on
