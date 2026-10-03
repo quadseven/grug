@@ -47,6 +47,23 @@ export interface RepoConfig {
   guard_enabled: boolean;
   guard_blocking: boolean;
   enforcement_ruleset_id: number | null;
+  // All backend repo-config flags (#768). Every field the API returns must
+  // be declared here so an undeclared flag is a type error, not an
+  // invisible one. Flags without a dashboard control are listed in
+  // scripts/attest_persona_surface_coherence.py OPERATOR_ONLY.
+  code_reviewer_enabled: boolean;
+  code_reviewer_blocking: boolean;
+  warder_enabled: boolean;
+  warder_gate_blocking: boolean;
+  sentinel_enabled: boolean;
+  pulse_enabled: boolean;
+  smasher_enabled: boolean;
+  walkthrough_enabled: boolean;
+  dep_watch_enabled: boolean;
+  reopen_watch_enabled: boolean;
+  guard_hygiene_watch_enabled: boolean;
+  issue_dor_enabled: boolean;
+  check_run_reconcile_enabled: boolean;
 }
 
 export interface Repo {
@@ -146,15 +163,25 @@ export function useActivity(installId: number | undefined, verdict?: string) {
 export function useSetRepoConfig(installId: number) {
   const qc = useQueryClient();
   return useMutation({
-    mutationFn: (vars: { repo_id: number; tpm_enabled: boolean; guard_enabled?: boolean }) =>
+    mutationFn: (vars: {
+      repo_id: number;
+      tpm_enabled: boolean;
+      guard_enabled?: boolean;
+      dep_watch_enabled?: boolean;
+      reopen_watch_enabled?: boolean;
+      guard_hygiene_watch_enabled?: boolean;
+    }) =>
       api(`/api/v1/installations/${installId}/repos/${vars.repo_id}/config`, {
         method: "PUT",
         headers: { "Content-Type": "application/json" },
-        // tpm_enabled is required by the payload model; guard_enabled is
+        // tpm_enabled is required by the payload model; the rest are
         // optional (omitted = leave the stored value alone, sparse merge).
         body: JSON.stringify({
           tpm_enabled: vars.tpm_enabled,
           ...(vars.guard_enabled !== undefined ? { guard_enabled: vars.guard_enabled } : {}),
+          ...(vars.dep_watch_enabled !== undefined ? { dep_watch_enabled: vars.dep_watch_enabled } : {}),
+          ...(vars.reopen_watch_enabled !== undefined ? { reopen_watch_enabled: vars.reopen_watch_enabled } : {}),
+          ...(vars.guard_hygiene_watch_enabled !== undefined ? { guard_hygiene_watch_enabled: vars.guard_hygiene_watch_enabled } : {}),
         }),
       }),
     onSuccess: () => qc.invalidateQueries({ queryKey: ["installations", installId, "repos"] }),
