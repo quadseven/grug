@@ -145,3 +145,40 @@ def test_find_related_prs_caps_at_three_and_bounds_file_fetches():
     assert len(out) <= 3
     file_calls = [u for u in fake_get.calls if u.endswith("/files")]
     assert len(file_calls) <= 5
+
+
+# --- failures are best-effort but never silent ---------------------------
+
+
+def test_list_failure_returns_empty_and_logs_the_kind(caplog):
+    """A failed list call still yields [] (the section is optional), but the
+    failure must leave a trace: an auth outage and an honest empty looked
+    the same before, and the section vanished with no record."""
+
+    def boom(url, headers=None, params=None, timeout=None):
+        raise RuntimeError("401 bad credentials")
+
+    with caplog.at_level("INFO"):
+        out = find_related_prs("tok", "o", "r", 12, ["a.py"], "t", http_get=boom)
+
+    assert out == []
+    rec = [r for r in caplog.records if r.getMessage() == "walkthrough_related_list_failed"]
+    assert rec and rec[0].kind == "RuntimeError"
+
+
+def test_candidate_file_failure_is_logged_and_skipped(caplog):
+    """One candidate's /files fetch failing must not kill the section, and
+    must not vanish either."""
+    pr_list = [{"number": 11, "title": "widget fix", "merged_at": "2026-01-02T00:00:00Z"}]
+
+    def get(url, headers=None, params=None, timeout=None):
+        if url.endswith("/files"):
+            raise ValueError("bad json")
+        return _FakeResp(pr_list)
+
+    with caplog.at_level("INFO"):
+        out = find_related_prs("tok", "o", "r", 12, ["a.py"], "widget fix", http_get=get)
+
+    assert isinstance(out, list)
+    rec = [r for r in caplog.records if r.getMessage() == "walkthrough_related_files_failed"]
+    assert rec and rec[0].kind == "ValueError" and rec[0].candidate == 11
