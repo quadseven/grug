@@ -1525,7 +1525,18 @@ def _review_system_prompt(
     learnings: str,
     guidelines: str = "",
 ) -> str:
-    """Compose trusted review instructions separately from repository data."""
+    """Compose trusted review instructions separately from repository data.
+
+    Precedence (#674), highest to lowest: in-repo agent guidelines
+    (CLAUDE.md/AGENTS.md/etc. - the repo's own versioned, team-authored
+    standard) > operator-taught learnings (#670) > few-shot examples (#538)
+    > team practices (#527) > the static base prompt. Later blocks outrank
+    earlier ones per this prompt's recency=authority convention, and the
+    guidelines block itself tells the model to follow the carving over a
+    taught preference on conflict. (A future `path-instructions` layer -
+    directory-scoped rules - would slot above guidelines; it does not exist
+    yet, so the chain is currently guidelines > learnings.)
+    """
     # Redact secret-shaped values from the diff + file context BEFORE they reach
     # the backend (#438). The backend is a third-party SaaS endpoint, and a PR
     # diff can carry a committed credential; the Elder reviews code structure, not
