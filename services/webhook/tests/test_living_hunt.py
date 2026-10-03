@@ -375,7 +375,7 @@ def test_living_hunt_delta_done_log_on_successful_persist(monkeypatch, caplog):
     monkeypatch.setattr(cr_dispatch, "grade_findings", lambda *a, **kw: ())
     monkeypatch.setattr(
         cr_dispatch, "_fetch_pr_diff_with_scope",
-        lambda *a, **k: ("diff --git a/x.py b/x.py\n--- a/x.py\n+++ b/x.py\n@@ -1 +1 @@\n-old\n+new\n", True),
+        lambda *a, **k: ("diff --git a/x.py b/x.py\n--- a/x.py\n+++ b/x.py\n@@ -1 +1 @@\n-old\n+new\n", True, False),
     )
     monkeypatch.setattr(
         cr_dispatch, "_fetch_current_review_snapshot",
