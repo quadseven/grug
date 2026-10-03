@@ -1368,3 +1368,77 @@ def test_reserve_slot_concurrent_processes_admit_exactly_the_limit(pg):
             (f"RATELIMIT#{name}",),
         ).fetchone()
     assert row is not None and int(row[0]) == limit
+
+
+def test_repo_complexity_caps_absent_row_reads_env_default(pg):
+    """#1041: absent row falls through to the env-var default."""
+    from adapters import pg_install_store as store
+    from personas.code_reviewer.complexity import (
+        _DEFAULT_COGNITIVE_CAP,
+        _DEFAULT_CYCLOMATIC_CAP,
+    )
+
+    cfg = store.get_repo_config(999999, 888888)
+    assert cfg["complexity_cyclomatic_cap"] == _DEFAULT_CYCLOMATIC_CAP
+    assert cfg["complexity_cognitive_cap"] == _DEFAULT_COGNITIVE_CAP
+
+
+def test_repo_complexity_caps_absent_field_reads_env_default(pg):
+    """#1041: row without the fields falls through to the env-var default."""
+    from adapters import pg_install_store as store
+    from personas.code_reviewer.complexity import (
+        _DEFAULT_COGNITIVE_CAP,
+        _DEFAULT_CYCLOMATIC_CAP,
+    )
+
+    store.record_installation(
+        install_id=4242, account_login="cap-town",
+        account_type="Organization", installed_by_user_id=7,
+    )
+    store.set_repo_config(
+        install_id=4242, repo_id=4343, repo_full_name="cap-town/repo",
+        updated_by_user_id="7", tpm_enabled=True,
+    )
+    cfg = store.get_repo_config(4242, 4343)
+    assert cfg["complexity_cyclomatic_cap"] == _DEFAULT_CYCLOMATIC_CAP
+    assert cfg["complexity_cognitive_cap"] == _DEFAULT_COGNITIVE_CAP
+
+
+def test_repo_complexity_caps_set_value_reads_back(pg):
+    """#1041: a set cap reads back the set value."""
+    from adapters import pg_install_store as store
+
+    store.record_installation(
+        install_id=4243, account_login="cap-town",
+        account_type="Organization", installed_by_user_id=7,
+    )
+    store.set_repo_config(
+        install_id=4243, repo_id=4344, repo_full_name="cap-town/repo",
+        updated_by_user_id="7",
+        complexity_cyclomatic_cap=10, complexity_cognitive_cap=20,
+    )
+    cfg = store.get_repo_config(4243, 4344)
+    assert cfg["complexity_cyclomatic_cap"] == 10
+    assert cfg["complexity_cognitive_cap"] == 20
+
+
+def test_repo_complexity_caps_reject_non_positive(pg):
+    """#1041: the write path rejects non-positive caps."""
+    from adapters import pg_install_store as store
+
+    store.record_installation(
+        install_id=4244, account_login="cap-town",
+        account_type="Organization", installed_by_user_id=7,
+    )
+    import pytest
+
+    with pytest.raises(ValueError):
+        store.set_repo_config(
+            install_id=4244, repo_id=4345, repo_full_name="cap-town/repo",
+            updated_by_user_id="7", complexity_cyclomatic_cap=0,
+        )
+    with pytest.raises(ValueError):
+        store.set_repo_config(
+            install_id=4244, repo_id=4345, repo_full_name="cap-town/repo",
+            updated_by_user_id="7", complexity_cognitive_cap=-5,
+        )

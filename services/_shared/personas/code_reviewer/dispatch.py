@@ -2614,10 +2614,27 @@ def dispatch_code_review(
     # cyclomatic/cognitive cap merges as an advisory MEDIUM finding - no LLM, no
     # judge (it is precise by construction). It rides the SAME merge rule as the
     # SAST suite; MEDIUM means it never blocks a merge on its own.
+    # Per-repo caps (#1041): best-effort, so a config-store hiccup falls back
+    # to the env default rather than failing the review.
+    _cyclo_cap: int | None = None
+    _cog_cap: int | None = None
+    try:
+        from adapters.install_store import get_repo_config as _get_cfg
+
+        _cfg = _get_cfg(installation_id, int(repo["id"])) or {}
+        _cyclo_cap = _cfg.get("complexity_cyclomatic_cap")
+        _cog_cap = _cfg.get("complexity_cognitive_cap")
+    except Exception as e:  # noqa: BLE001 - caps are best-effort; env default stands
+        log.debug(
+            "code_review_complexity_caps_unavailable",
+            extra={"pr": f"{owner}/{repo_name}#{pull_number}", "kind": type(e).__name__},
+        )
     try:
         complexity_scan = scan_complexity_full(
             hunks, file_contents,
             base_contents=base_file_contents or None,
+            cyclomatic_cap=_cyclo_cap,
+            cognitive_cap=_cog_cap,
         )
     except Exception as e:  # noqa: BLE001 - enrichment must never abort a review
         log.info(

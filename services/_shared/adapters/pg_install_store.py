@@ -220,6 +220,14 @@ _STR_REPO_FLAGS = frozenset({"elder_voice"})
 # per-flag below (list of non-empty str, or None to leave unchanged).
 _LIST_REPO_FLAGS = frozenset({"guard_hygiene_dead_ref_patterns"})
 
+# Repo-level flags whose value is a positive INT, not a bool (#1041:
+# per-repo complexity caps). Exempt from the bool-only value check;
+# validated per-flag below (positive int, or None to leave unchanged).
+_INT_REPO_FLAGS = frozenset({
+    "complexity_cyclomatic_cap",
+    "complexity_cognitive_cap",
+})
+
 _DEFAULT_PERSONA_CONFIG = {
     "tpm_enabled": True,
     "code_reviewer_enabled": True,
@@ -283,6 +291,27 @@ def get_repo_config(install_id: int, repo_id: int) -> dict[str, Any]:
     # that empty state, not this read path.
     cfg["guard_hygiene_dead_ref_patterns"] = tuple(
         str(p) for p in (item.get("guard_hygiene_dead_ref_patterns") or ())
+    )
+    # Per-repo complexity caps (#1041): absent row/field falls through to the
+    # env-var default (do not invent a third default). Stored as ints; a
+    # non-positive or non-int value reads back as the default rather than
+    # disabling the source.
+    from personas.code_reviewer.complexity import (
+        _DEFAULT_COGNITIVE_CAP,
+        _DEFAULT_CYCLOMATIC_CAP,
+    )
+
+    def _cap(name: str, default: int) -> int:
+        raw = item.get(name)
+        if isinstance(raw, bool) or not isinstance(raw, int):
+            return default
+        return raw if raw > 0 else default
+
+    cfg["complexity_cyclomatic_cap"] = _cap(
+        "complexity_cyclomatic_cap", _DEFAULT_CYCLOMATIC_CAP
+    )
+    cfg["complexity_cognitive_cap"] = _cap(
+        "complexity_cognitive_cap", _DEFAULT_COGNITIVE_CAP
     )
     return cfg
 
@@ -355,13 +384,28 @@ def _validate_list_repo_flags(persona_flags: dict[str, Any]) -> None:
             )
 
 
+def _validate_int_repo_flags(persona_flags: dict[str, Any]) -> None:
+    """Per-flag validation for _INT_REPO_FLAGS values (#1041).
+
+    Each supplied value must be a positive int; a non-positive cap would
+    disable the source it gates, and a bool is not an int here (bool is a
+    subclass of int in Python, so it needs an explicit exclusion).
+    """
+    for flag in _INT_REPO_FLAGS:
+        value = persona_flags.get(flag)
+        if value is None:
+            continue
+        if isinstance(value, bool) or not isinstance(value, int) or value <= 0:
+            raise ValueError(f"{flag} must be a positive int, got {value!r}")
+
+
 def set_repo_config(
     *,
     install_id: int,
     repo_id: int,
     repo_full_name: str,
     updated_by_user_id: str,
-    **persona_flags: bool | str | list[str] | None,
+    **persona_flags: bool | str | list[str] | int | None,
 ) -> dict[str, Any]:
     """Upsert per-repo override; returns the FIELDS THAT WERE UPDATED
     (same contract as the DDB adapter). Sparse merge preserves fields
@@ -379,6 +423,7 @@ def set_repo_config(
         - _EXTRA_REPO_FLAGS
         - _STR_REPO_FLAGS
         - _LIST_REPO_FLAGS
+        - _INT_REPO_FLAGS
     )
     if unknown:
         raise TypeError(
@@ -388,13 +433,15 @@ def set_repo_config(
     # Values get the same rigor as keys (audit #477 M3): bool(value)
     # would silently store True for a truthy non-bool like "false" if a
     # caller ever passed a query-string value through. String-valued flags
-    # (_STR_REPO_FLAGS, e.g. elder_voice) and list-valued flags
-    # (_LIST_REPO_FLAGS, e.g. guard_hygiene_dead_ref_patterns) are exempt
-    # here and validated by their own per-kind helper below.
+    # (_STR_REPO_FLAGS, e.g. elder_voice), list-valued flags
+    # (_LIST_REPO_FLAGS, e.g. guard_hygiene_dead_ref_patterns), and int-valued
+    # flags (_INT_REPO_FLAGS, e.g. complexity_cyclomatic_cap) are exempt here
+    # and validated by their own per-kind helper below.
     non_bool = {
         flag: value for flag, value in persona_flags.items()
         if flag not in _STR_REPO_FLAGS
         and flag not in _LIST_REPO_FLAGS
+        and flag not in _INT_REPO_FLAGS
         and value is not None and not isinstance(value, bool)
     }
     if non_bool:
@@ -403,6 +450,7 @@ def set_repo_config(
         )
     _validate_str_repo_flags(persona_flags, install_id)
     _validate_list_repo_flags(persona_flags)
+    _validate_int_repo_flags(persona_flags)
     now = datetime.now(timezone.utc).isoformat()
     updated_fields: dict[str, Any] = {
         flag: value

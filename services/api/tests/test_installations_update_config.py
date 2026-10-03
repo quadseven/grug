@@ -264,3 +264,21 @@ def test_sparse_update_does_not_resurrect_a_paused_repo():
     assert mock_set.call_args.kwargs["sentinel_enabled"] is True
     # The paused repo must NOT have been re-enforced.
     mock_toggle.assert_not_called()
+
+
+def test_update_config_rejects_non_positive_complexity_caps():
+    """#1041: the write path rejects non-positive complexity caps."""
+    from installations import RepoConfigPayload
+    from pydantic import ValidationError
+    import pytest
+
+    with pytest.raises(ValidationError):
+        RepoConfigPayload(tpm_enabled=True, complexity_cyclomatic_cap=0)
+    with pytest.raises(ValidationError):
+        RepoConfigPayload(tpm_enabled=True, complexity_cognitive_cap=-1)
+    # Valid positive caps pass.
+    p = RepoConfigPayload(
+        tpm_enabled=True, complexity_cyclomatic_cap=10, complexity_cognitive_cap=20
+    )
+    assert p.complexity_cyclomatic_cap == 10
+    assert p.complexity_cognitive_cap == 20
