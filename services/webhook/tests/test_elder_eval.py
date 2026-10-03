@@ -1658,3 +1658,47 @@ def test_methodology_note_production_mode_unaffected_by_staged_kwarg():
     assert _methodology_note("production", staged=True) == _methodology_note(
         "production", staged=False
     )
+
+
+def test_staged_cases_mismatch_surfaced_as_advisory():
+    """#873: a report whose staged-cases set differs from the baseline's
+    must surface the methodology shift in --check output (advisory only,
+    never a hard regression)."""
+    from elder_eval.scoring import staged_cases_advisories
+
+    rows = [_row(1, "correctness")]
+    replays = {
+        "quadseven/grug#1": CaseReplay(
+            case_id="quadseven/grug#1", emitted={"correctness": 1}, errored=False
+        ),
+    }
+    # Baseline recorded case #1 as staged; the new report stages #2 instead.
+    baseline_report = _report(rows, replays)
+    object.__setattr__(baseline_report, "staged_cases", ("quadseven/grug#1",))
+    baseline = to_baseline_dict(baseline_report, prompt_sha="abc", backend="cave")
+    new_report = _report(rows, replays)
+    object.__setattr__(new_report, "staged_cases", ("quadseven/grug#2",))
+
+    advisories = staged_cases_advisories(
+        new_report, baseline["backends"]["cave"]
+    )
+    joined = " ".join(advisories)
+    assert "quadseven/grug#2" in joined  # newly staged
+    assert "quadseven/grug#1" in joined  # no longer staged
+    # Advisory only: must NOT appear in the hard-regression list.
+    regressions = compare_to_baseline(new_report, baseline["backends"]["cave"])
+    assert not any("staged" in r for r in regressions)
+
+
+def test_staged_cases_match_produces_no_advisory():
+    from elder_eval.scoring import staged_cases_advisories
+
+    rows = [_row(1, "correctness")]
+    replays = {
+        "quadseven/grug#1": CaseReplay(
+            case_id="quadseven/grug#1", emitted={"correctness": 1}, errored=False
+        ),
+    }
+    report = _report(rows, replays)
+    baseline = to_baseline_dict(report, prompt_sha="abc", backend="cave")
+    assert staged_cases_advisories(report, baseline["backends"]["cave"]) == []
