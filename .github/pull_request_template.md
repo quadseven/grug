@@ -41,7 +41,3 @@ Adjacent changes not in this PR. Helps the reviewer skip past those.
 -->
 
 - 
-
----
-
-🤖 Generated with [Claude Code](https://claude.com/claude-code)

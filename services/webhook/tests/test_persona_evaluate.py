@@ -611,6 +611,24 @@ def test_non_session_claude_link_is_not_a_marker():
     assert persona.evaluate_pull_request(body).conclusion == "failure"
 
 
+def test_claude_code_attribution_footer_is_neutral():
+    """Claude Code's default PR attribution ends the body with
+    `Generated with [Claude Code](https://claude.com/claude-code)`. A body
+    carrying that footer without a session link is still agent-authored
+    (mod-overseer #821: 4/7 Hunt Plan failures on such a body)."""
+    body = _HUMAN_BODY_NO_PLAN + "\nGenerated with [Claude Code](https://claude.com/claude-code)\n"
+    assert persona.is_agent_authored(body) is True
+    assert persona.evaluate_pull_request(body).conclusion == "neutral"
+
+
+def test_prose_mention_of_claude_code_is_not_a_marker():
+    """A human writing 'I used claude code to draft this' in prose must not
+    switch Chief off — only the template's exact markdown footer counts."""
+    body = _HUMAN_BODY_NO_PLAN + "\nI used claude code to help draft this plan.\n"
+    assert persona.is_agent_authored(body) is False
+    assert persona.evaluate_pull_request(body).conclusion == "failure"
+
+
 def test_publish_agent_skip_posts_neutral_with_skip_title():
     evaluation = persona.evaluate_pull_request(_AGENT_BODY_NO_PLAN)
     posted: dict = {}
@@ -643,3 +661,15 @@ def test_tpm_evaluation_rejects_failed_neutral():
             results=(CheckResult("why", True, "ok", skipped=True),),
             conclusion="neutral",
         )
+
+
+def test_pr_template_is_not_agent_authored():
+    """The PR template is what a PERSON starts from in the GitHub UI. If it
+    carried an agent-authored marker, every PR opened from it would skip
+    Chief. It once ended with the Claude Code attribution footer, which the
+    detector now treats as an agent marker."""
+    from pathlib import Path
+
+    template = Path(__file__).resolve().parents[3] / ".github" / "pull_request_template.md"
+    assert template.is_file(), template
+    assert persona.is_agent_authored(template.read_text()) is False
