@@ -58,8 +58,10 @@
 #
 # Options (1) and (2) were not taken: no pack is vendored and no new scanner is
 # added, so there is no third-party rule licence to record - every rule below is
-# hand-authored in this repo. If a pack is ever adopted, its licence must be
-# checked against the free/open-source-only constraint first.
+# hand-authored in this repo, as original work under the repo's own licence
+# (GNU AGPL v3 - see LICENSE at the repo root). If a pack is ever adopted,
+# its licence must be checked against the free/open-source-only constraint
+# first.
 #
 # NOTE ON `severity:` BELOW. It is currently decorative - sast.py overrides it.
 # It is set honestly anyway so the intent survives if that ever changes.

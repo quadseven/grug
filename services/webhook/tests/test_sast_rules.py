@@ -106,6 +106,39 @@ def test_swift_has_rule_coverage():
     assert "swift" in langs, "no rule targets Swift - a Swift PR gets zero SAST coverage"
 
 
+# --- header records: license status (#859) -------------------------------------
+
+# The two rule files #859 added (yaml_ci_k8s.yml via #862, swift.yml via #868).
+_NEW_RULE_FILES = ("yaml_ci_k8s.yml", "swift.yml")
+
+
+def _header_comment(path: Path) -> str:
+    """The leading #-comment block of a rules file, joined. Stops at the
+    first non-comment line so only the file header is asserted on."""
+    lines = []
+    for line in path.read_text(encoding="utf-8").splitlines():
+        if not line.startswith("#"):
+            break
+        lines.append(line)
+    return "\n".join(lines)
+
+
+def test_new_rule_files_record_their_license():
+    """#859 AC: no third-party rule pack was adopted (Option 3 - fleet-specific
+    rules written by hand), so there is nothing to license-check. That must
+    be RECORDED in each new file's header - including which license the
+    original work is under - not left for a future reader to re-derive.
+    """
+    for name in _NEW_RULE_FILES:
+        header = _header_comment(RULES_DIR / name).lower()
+        assert "third-party" in header, (
+            f"{name} header does not record that no third-party rule pack was adopted"
+        )
+        assert "agpl" in header, (
+            f"{name} header does not name the repo license the original rules are under"
+        )
+
+
 # --- engine-backed: the checks that would have caught the real gap --------
 
 PLANTED = {
