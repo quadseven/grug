@@ -1815,6 +1815,94 @@ def _call_backend(
     return resp
 
 
+# --- abandoned-LLM-call in-flight metric (#638) ------------------------------
+
+# grug#637 added mid-flight review cancellation: when a newer commit lands,
+# the waiter stops waiting on an in-flight backend call and returns
+# immediately. The background call is abandoned, not killed - it keeps
+# running to its own natural conclusion and still competes for the
+# backend's generation slot (e.g. spark-gateway's single slot for the Cave
+# target). Under rapid PR churn several abandoned generations for stale
+# commits can stack up silently. This tracker counts the abandoned calls
+# that are still running so the pileup is observable.
+
+
+class _AbandonedCallTracker:
+    """Thread-safe count of abandoned `_do_call` background calls still
+    running. Incremented when the waiting side gives up on a still-running
+    call, decremented when that call's real request finishes - regardless
+    of whether the waiter already gave up. A call that finished before the
+    abandon is never counted: it was never in flight AS abandoned."""
+
+    def __init__(self) -> None:
+        self._lock = threading.Lock()
+        self._in_flight = 0
+
+    @property
+    def in_flight(self) -> int:
+        with self._lock:
+            return self._in_flight
+
+    def note_abandoned(self, call_state: dict, backend: str) -> None:
+        """The waiting side gave up. `call_state` is this call's
+        {"abandoned", "finished"} flags, shared with `_do_call`'s finally
+        block; both transitions hold the same lock, so the count is exact
+        even when abandon and finish race."""
+        emit_count: int | None = None
+        with self._lock:
+            call_state["abandoned"] = True
+            if not call_state["finished"]:
+                self._in_flight += 1
+                emit_count = self._in_flight
+        if emit_count is not None:
+            _emit_abandoned_in_flight_gauge(emit_count, backend)
+
+    def call_finished(self, call_state: dict, backend: str) -> None:
+        """The background call's real request finished (ok or error). Only
+        decrements if this call was previously counted as abandoned."""
+        emit_count: int | None = None
+        with self._lock:
+            call_state["finished"] = True
+            if call_state["abandoned"]:
+                self._in_flight -= 1
+                emit_count = self._in_flight
+        if emit_count is not None:
+            _emit_abandoned_in_flight_gauge(emit_count, backend)
+
+
+_abandoned_calls = _AbandonedCallTracker()
+
+
+def _emit_abandoned_in_flight_gauge(count: int, backend: str) -> None:
+    """Dual emission for the abandoned-call gauge, same shape as
+    `openrouter_free_limiter._emit_telemetry`: one structured log token
+    (the operator-grep / DD-log-monitor token) plus the DogStatsD gauge a
+    dashboard graphs directly. Emitted on every transition (abandon and
+    drain), so the gauge always reflects the current count - a silent
+    series must never be read as "zero abandoned".
+
+    Expected range, for a future alert (no alert yet - this ships the
+    signal, per #638's out-of-scope boundary):
+    - 0 nearly always: abandoned calls drain as their real requests finish.
+    - Brief 1-3 under rapid PR churn (several pushes inside one review's
+      ~330-660s budget): normal; each drains within the backend timeout.
+    - Sustained > 5, or a count that climbs without draining: abandoned
+      generations are piling up faster than they finish and competing
+      with live reviews for the backend slot - the silent pileup #638
+      describes. Alert candidate: max over 5m > 5.
+
+    Never raises into the call path it describes."""
+    log.info(
+        "llm_abandoned_call_in_flight",
+        extra={"backend": backend, "abandoned_in_flight": count},
+    )
+    try:
+        from observability import emit_gauge  # type: ignore  # late: webhook-image only
+    except Exception:  # noqa: BLE001 - telemetry must never break the call it describes
+        return
+    emit_gauge("grug.llm.abandoned_calls_in_flight", float(count), {"backend": backend})
+
+
 def _post_with_retries_cancellable(
     config: BackendConfig, body: dict[str, Any], headers: dict[str, str],
     transport_attempts: int, cancel_event: threading.Event,
@@ -1825,6 +1913,10 @@ def _post_with_retries_cancellable(
     whichever resolves first wins. See `_call_backend`'s docstring for why
     this is "abandon the loser", not "kill the loser"."""
     result_q: queue.Queue = queue.Queue(maxsize=1)
+    # Shared with _do_call's finally block; the tracker resolves the
+    # abandon-vs-finish race under its own lock (#638).
+    call_state = {"abandoned": False, "finished": False}
+    backend_tag = config.backend.value
 
     def _do_call() -> None:
         try:
@@ -1835,6 +1927,8 @@ def _post_with_retries_cancellable(
             result_q.put(("ok", resp))
         except Exception as e:  # noqa: BLE001 - re-raised on the waiting side
             result_q.put(("error", e))
+        finally:
+            _abandoned_calls.call_finished(call_state, backend_tag)
 
     # Re-check immediately before spawning (FLINT, #637): _call_backend's
     # own top-level guard only catches cancellation that was ALREADY set
@@ -1847,6 +1941,10 @@ def _post_with_retries_cancellable(
     threading.Thread(target=_do_call, daemon=True).start()
     while True:
         if cancel_event.is_set():
+            # The background call is abandoned, not killed: it keeps
+            # running to its own conclusion. Count it while it is still
+            # in flight (#638).
+            _abandoned_calls.note_abandoned(call_state, backend_tag)
             raise httpx.RequestError("cancelled mid-flight")
         try:
             kind, payload = result_q.get(timeout=0.25)
