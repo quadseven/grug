@@ -4332,6 +4332,31 @@ def test_unattempted_cohorts_are_a_subset_of_failed_not_a_replacement() -> None:
     assert set(coverage.unattempted_cohorts) <= set(coverage.failed_cohorts)
 
 
+def test_merge_with_zero_successes_keeps_failed_and_starved_apart() -> None:
+    """grug#985: one cohort really broke, the next was never opened, none
+    succeeded. The merged response keeps the honest split in `coverage` so the
+    renderer can tell this from every cohort having run and failed."""
+    plan = ReviewPlan(
+        cohorts=(_plan_cohort("a"), _plan_cohort("b")),
+        total_diff_chars=100,
+        total_cohorts_planned=2,
+    )
+    responses = [
+        LlmReviewResponse(kind="parse_failed", error="unparseable"),
+        LlmReviewResponse(
+            kind="all_failed",
+            error="cohort skipped: staged review budget exhausted",
+        ),
+    ]
+
+    merged = lc._merge_cohort_responses(responses, 1, None, plan)
+
+    assert merged.kind == "parse_failed"
+    assert merged.coverage.completed_cohorts == 0
+    assert merged.coverage.failed_cohorts == (1, 2)
+    assert merged.coverage.unattempted_cohorts == (2,)
+
+
 def test_cohort_failure_reasons_carry_the_cause_not_just_the_index() -> None:
     """grug#818 needs to tell transient from terminal in telemetry; the index
     alone cannot."""
