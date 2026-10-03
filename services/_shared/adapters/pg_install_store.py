@@ -265,6 +265,15 @@ def list_user_installations(github_user_id: str) -> list[dict[str, Any]]:
     return [decode_item(*r) for r in rows]
 
 
+def _read_int_repo_flag(raw: Any) -> int | None:
+    """The stored value of an _INT_REPO_FLAGS flag, or None when it is absent or
+    not an int in [1, _INT_REPO_FLAG_MAX] (the same range the write path
+    enforces). Never raises."""
+    if isinstance(raw, bool) or not isinstance(raw, int):
+        return None
+    return raw if 1 <= raw <= _INT_REPO_FLAG_MAX else None
+
+
 def get_repo_config(install_id: int, repo_id: int) -> dict[str, Any]:
     # A missing row and an empty row are the same shape: every field
     # falls through to its default below (no separate early-return to
@@ -298,10 +307,12 @@ def get_repo_config(install_id: int, repo_id: int) -> dict[str, Any]:
     cfg["guard_hygiene_dead_ref_patterns"] = tuple(
         str(p) for p in (item.get("guard_hygiene_dead_ref_patterns") or ())
     )
-    # grug#1041: None = unset; the scanner applies its env default.
+    # grug#1041: None = unset; the scanner applies its env default. A stored
+    # value that is not a clean in-range int (hand-edited row, legacy bool) also
+    # reads back as unset: callers like the dashboard listing and the
+    # enforcement pass have no fallback around this read.
     for _flag in _INT_REPO_FLAGS:
-        raw = item.get(_flag)
-        cfg[_flag] = int(raw) if raw is not None else None
+        cfg[_flag] = _read_int_repo_flag(item.get(_flag))
     return cfg
 
 
