@@ -16,9 +16,9 @@ from typing import Any
 from urllib.parse import quote
 
 import httpx
-
 from activity_log import record_check_verdict
 from github_app_auth import get_app_id, with_install_token_retry
+
 from personas.walkthrough.effort import estimate_effort
 from personas.walkthrough.render import MARKER, FileStat, walkthrough_body
 
@@ -52,7 +52,10 @@ def _fetch_pr_diff(token: str, owner: str, repo: str, pull_number: int) -> str:
 
 
 def _fetch_pr_files(
-    token: str, owner: str, repo: str, pull_number: int,
+    token: str,
+    owner: str,
+    repo: str,
+    pull_number: int,
 ) -> tuple[list[FileStat], bool]:
     """Paginated `/files` fetch -> (FileStat list, truncated). GitHub's own
     endpoint caps at 3000 files - well above our _MAX_FILE_PAGES bound - so
@@ -67,7 +70,8 @@ def _fetch_pr_files(
         resp = httpx.get(
             f"{_API}/repos/{_repo_path(owner, repo)}/pulls/{pull_number}/files",
             params={"per_page": 100, "page": page},
-            headers=_headers(token), timeout=_TIMEOUT,
+            headers=_headers(token),
+            timeout=_TIMEOUT,
         )
         resp.raise_for_status()
         batch = resp.json()
@@ -87,7 +91,10 @@ def _fetch_pr_files(
 
 
 def _find_marker_comment(
-    token: str, owner: str, repo: str, pr_number: int,
+    token: str,
+    owner: str,
+    repo: str,
+    pr_number: int,
 ) -> int | None:
     # `performed_via_github_app` is populated server-side ONLY for comments
     # created via a GitHub App installation token - a human contributor
@@ -99,10 +106,14 @@ def _find_marker_comment(
     # that produced `token` - so no fallback-on-failure path exists here.
     own_app_id = get_app_id()
     page = 1
-    while page <= 20:  # bound the scan (>2000 comments = give up, post fresh, warn below)
+    while (
+        page <= 20
+    ):  # bound the scan (>2000 comments = give up, post fresh, warn below)
         resp = httpx.get(
             f"{_API}/repos/{_repo_path(owner, repo)}/issues/{pr_number}/comments",
-            params={"per_page": 100, "page": page}, headers=_headers(token), timeout=_TIMEOUT,
+            params={"per_page": 100, "page": page},
+            headers=_headers(token),
+            timeout=_TIMEOUT,
         )
         resp.raise_for_status()
         batch = resp.json()
@@ -126,24 +137,37 @@ def _find_marker_comment(
 
 
 def _upsert_comment(
-    token: str, owner: str, repo: str, pr_number: int, body: str,
+    token: str,
+    owner: str,
+    repo: str,
+    pr_number: int,
+    body: str,
 ) -> None:
     existing = _find_marker_comment(token, owner, repo, pr_number)
     if existing is not None:
         httpx.patch(
             f"{_API}/repos/{_repo_path(owner, repo)}/issues/comments/{existing}",
-            json={"body": body}, headers=_headers(token), timeout=_TIMEOUT,
+            json={"body": body},
+            headers=_headers(token),
+            timeout=_TIMEOUT,
         ).raise_for_status()
     else:
         httpx.post(
             f"{_API}/repos/{_repo_path(owner, repo)}/issues/{pr_number}/comments",
-            json={"body": body}, headers=_headers(token), timeout=_TIMEOUT,
+            json={"body": body},
+            headers=_headers(token),
+            timeout=_TIMEOUT,
         ).raise_for_status()
 
 
 def _log_fetch_failed(
-    e: Exception, *, phase: str, installation_id: int,
-    owner: str, repo_name: str, pull_number: int,
+    e: Exception,
+    *,
+    phase: str,
+    installation_id: int,
+    owner: str,
+    repo_name: str,
+    pull_number: int,
 ) -> None:
     """Log a fetch failure with the PHASE it happened in + the real status
     code on an HTTPStatusError - "HTTPStatusError" alone can't distinguish
@@ -161,7 +185,10 @@ def _log_fetch_failed(
 
 
 def _self_recover(
-    installation_id: int, owner: str, repo_name: str, pull_number: int,
+    installation_id: int,
+    owner: str,
+    repo_name: str,
+    pull_number: int,
 ) -> None:
     """Enqueue ONE durable rerun on the SAME rerun lane Elder/Guard/Smasher
     use for an unhandled dispatch error (#554 peer review, CONFIRMED 3x -
@@ -179,8 +206,10 @@ def _self_recover(
         from rerun import enqueue_rerun  # lazy: webhook-only
 
         enqueue_rerun(
-            install_id=installation_id, repo=f"{owner}/{repo_name}",
-            pr_number=pull_number, persona="walkthrough",
+            install_id=installation_id,
+            repo=f"{owner}/{repo_name}",
+            pr_number=pull_number,
+            persona="walkthrough",
         )
     except Exception as e:  # noqa: BLE001 - best-effort, never escalate a degrade
         log.warning(
@@ -212,7 +241,9 @@ def _emit_degraded_metric(degraded: bool) -> None:
 
 
 def dispatch_walkthrough_review(
-    payload: dict[str, Any], *, blocking: bool,
+    payload: dict[str, Any],
+    *,
+    blocking: bool,
 ) -> dict[str, str]:
     """Entry point - one Teller walkthrough pass. `blocking` is unused
     (Teller has no blocking mode - registry requires the parameter for
@@ -237,8 +268,14 @@ def dispatch_walkthrough_review(
             lambda token: _fetch_pr_diff(token, owner, repo_name, pull_number),
         )
     except (httpx.HTTPStatusError, httpx.RequestError, RuntimeError) as e:
-        _log_fetch_failed(e, phase="diff", installation_id=installation_id,
-                           owner=owner, repo_name=repo_name, pull_number=pull_number)
+        _log_fetch_failed(
+            e,
+            phase="diff",
+            installation_id=installation_id,
+            owner=owner,
+            repo_name=repo_name,
+            pull_number=pull_number,
+        )
         _self_recover(installation_id, owner, repo_name, pull_number)
         return {"persona": "walkthrough", "result": "fetch_failed"}
 
@@ -252,8 +289,14 @@ def dispatch_walkthrough_review(
         # acceptable (the whole walkthrough needs both), but the log must
         # say WHICH call failed so a diff-outage and a files-outage don't
         # look identical.
-        _log_fetch_failed(e, phase="files", installation_id=installation_id,
-                           owner=owner, repo_name=repo_name, pull_number=pull_number)
+        _log_fetch_failed(
+            e,
+            phase="files",
+            installation_id=installation_id,
+            owner=owner,
+            repo_name=repo_name,
+            pull_number=pull_number,
+        )
         _self_recover(installation_id, owner, repo_name, pull_number)
         return {"persona": "walkthrough", "result": "fetch_failed"}
     if files_truncated:
@@ -264,14 +307,19 @@ def dispatch_walkthrough_review(
         # list; say so, never present it as exact.
         log.warning(
             "walkthrough_file_fetch_capped",
-            extra={"pr": f"{owner}/{repo_name}#{pull_number}", "files_seen": len(files)},
+            extra={
+                "pr": f"{owner}/{repo_name}#{pull_number}",
+                "files_seen": len(files),
+            },
         )
 
     lines_changed = sum(f.additions + f.deletions for f in files)
     degraded = False
     llm_summary = None
     try:
-        from llm_client import summarize_pr  # lazy: heavy import, webhook+api both use this module
+        from llm_client import (
+            summarize_pr,  # lazy: heavy import, webhook+api both use this module
+        )
 
         llm_summary = summarize_pr(
             diff_text,
@@ -287,7 +335,10 @@ def dispatch_walkthrough_review(
     except Exception as e:  # noqa: BLE001 - a summary hiccup must not drop the comment
         log.warning(
             "walkthrough_summarize_failed",
-            extra={"pr": f"{owner}/{repo_name}#{pull_number}", "kind": type(e).__name__},
+            extra={
+                "pr": f"{owner}/{repo_name}#{pull_number}",
+                "kind": type(e).__name__,
+            },
         )
 
     if llm_summary is not None:
@@ -295,8 +346,12 @@ def dispatch_walkthrough_review(
         blurbs = llm_summary.file_summaries
         model_effort = llm_summary.effort
         files = [
-            FileStat(path=f.path, additions=f.additions, deletions=f.deletions,
-                     summary=blurbs.get(f.path))
+            FileStat(
+                path=f.path,
+                additions=f.additions,
+                deletions=f.deletions,
+                summary=blurbs.get(f.path),
+            )
             for f in files
         ]
     else:
@@ -311,15 +366,50 @@ def dispatch_walkthrough_review(
         model_effort = None
 
     effort = estimate_effort(
-        file_count=len(files), lines_changed=lines_changed, model_effort=model_effort,
+        file_count=len(files),
+        lines_changed=lines_changed,
+        model_effort=model_effort,
     )
 
     from personas.walkthrough.mermaid import build_diagram
+
     diagram = build_diagram([f.path for f in files])
 
+    # #675: possibly-related prior hunts. Best-effort and bounded (one list
+    # call + at most 5 file fetches); a failure just omits the section.
+    related = []
+    try:
+        from personas.walkthrough.related import find_related_prs
+
+        related = with_install_token_retry(
+            installation_id,
+            lambda token: find_related_prs(
+                token,
+                owner,
+                repo_name,
+                pull_number,
+                [f.path for f in files],
+                pr.get("title", ""),
+            ),
+        )
+    except Exception as e:  # noqa: BLE001 - related hunts are enrichment
+        log.info(
+            "walkthrough_related_failed",
+            extra={
+                "pr": f"{owner}/{repo_name}#{pull_number}",
+                "kind": type(e).__name__,
+            },
+        )
+
     body = walkthrough_body(
-        summary=summary, files=files, diagram=diagram, effort=effort,
-        head_sha=head_sha, degraded=degraded, files_truncated=files_truncated,
+        summary=summary,
+        files=files,
+        diagram=diagram,
+        effort=effort,
+        head_sha=head_sha,
+        degraded=degraded,
+        files_truncated=files_truncated,
+        related=related,
     )
 
     try:
