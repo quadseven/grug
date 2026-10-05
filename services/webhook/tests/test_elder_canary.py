@@ -36,7 +36,7 @@ def test_fixtures_differ_only_in_the_query_and_planted_line_is_the_concat():
     planted = canary.PLANTED_HUNKS[0].body.splitlines()
     clean = canary.CLEAN_HUNKS[0].body.splitlines()
     assert len(planted) == len(clean) and len(planted) > 40
-    diff = [i for i, (a, b) in enumerate(zip(planted, clean)) if a != b]
+    diff = [i for i, (a, b) in enumerate(zip(planted, clean, strict=True)) if a != b]
     assert len(diff) == 1
     # body line 0 is the @@ header, so file line N is body index N.
     assert diff[0] == canary.PLANTED_LINE
@@ -134,6 +134,21 @@ def test_backend_and_model_tags_when_known_omitted_when_unknown(monkeypatch, emi
         "case": "planted", "outcome": "caught", "backend": "openrouter", "model": "m-1",
     }
     assert tags["clean"] == {"case": "clean", "outcome": "error"}
+
+
+def test_emit_failure_on_one_case_does_not_hide_the_other(monkeypatch, caplog):
+    seen = []
+
+    def flaky(metric, value, tags=None):
+        seen.append(tags["case"])
+        if tags["case"] == "planted":
+            raise OSError("udp")
+    monkeypatch.setattr(canary, "emit_gauge", flaky)
+    with caplog.at_level(logging.INFO):
+        _run(monkeypatch, _reviewed(), _reviewed())
+    assert seen == ["planted", "clean"]
+    assert any(r.getMessage() == "elder_canary_emit_failed" and r.kind == "OSError" for r in caplog.records)
+    assert sum(r.getMessage() == "elder_canary_result" for r in caplog.records) == 2
 
 
 def test_logs_elder_canary_result(monkeypatch, emitted, caplog):

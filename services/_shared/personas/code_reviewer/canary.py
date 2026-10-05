@@ -161,7 +161,10 @@ def _emit(result: CanaryResult) -> None:
     if result.model:
         tags["model"] = result.model
     ok = result.outcome in ("caught", "pass")
-    emit_gauge(METRIC, 1.0 if ok else 0.0, tags)
+    try:
+        emit_gauge(METRIC, 1.0 if ok else 0.0, tags)
+    except Exception as e:  # noqa: BLE001 - one telemetry fault must not hide the other case
+        log.warning("elder_canary_emit_failed", extra={"case": result.case, "kind": type(e).__name__})
     log.info(
         "elder_canary_result",
         extra={
@@ -205,7 +208,7 @@ def run_canary(timeout_s: float = 240.0) -> list[CanaryResult]:
         cancel.set()
 
     results: list[CanaryResult] = []
-    for (name, _, judge), t in zip(_CASES, threads):
+    for (name, _, judge), t in zip(_CASES, threads, strict=True):
         slot = slots[name]
         resp: LlmReviewResponse | None = None if t.is_alive() else slot.get("resp")
         outcome: Verdict = judge(resp) if resp is not None else "error"
