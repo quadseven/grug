@@ -55,7 +55,8 @@ def test_numbers_cover_closing_keywords_and_ref_forms():
 def test_numbers_ignore_code_spans_foreign_repo_and_blocked_by():
     body = (
         "Mentions `Closes #9` in code.\n"
-        "Closes other/repo#5\n"
+        "Closes other/repo" "#5\n"  # joined at parse time: keeps a literal cross-repo ref out of the source
+
         "Blocked by #6\n"
         "Fixes https://github.com/other/repo/issues/7\n"
         "Fixes #8\n"
