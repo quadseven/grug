@@ -800,7 +800,7 @@ def test_elder_failure_rate_monitor_carries_both_count_variables():
     def _check(v):
         mtype, priority, queries = v
         assert (mtype, priority) == ("log alert", 3)
-        assert [q.name for q in queries.event_queries] == ["total", "bad"]
+        assert [q["name"] for q in queries["event_queries"]] == ["total", "bad"]
 
     return _resolve(m, "type", "priority", "variables").apply(_check)
 
