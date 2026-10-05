@@ -70,8 +70,8 @@ def github_error_diagnostics(exc: BaseException) -> dict[str, object]:
         if isinstance(body, dict):
             out["gh_message"] = str(body.get("message") or "")[:300]
             out["gh_documentation_url"] = str(body.get("documentation_url") or "")[:300]
-    except Exception:  # noqa: BLE001 - diagnostics are best-effort by contract
-        pass
+    except Exception as e:  # noqa: BLE001 - diagnostics are best-effort by contract
+        log.debug("github_error_diagnostics_failed", extra={"kind": type(e).__name__})
     return out
 
 

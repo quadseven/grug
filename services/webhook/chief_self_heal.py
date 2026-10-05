@@ -24,8 +24,10 @@ GitHub call budget per poller run (all bounded):
   - per heal: what `/grug recheck` costs (issue fetches plus 1 check-run POST)
 The check-run lists are capped per run (`_MAX_CHECK_LISTS`), re-publish
 attempts are capped per run (`_MAX_ATTEMPTS`), and a wall-clock deadline
-(`_DEADLINE_S`) stops the pass early, so it cannot lengthen the poller by
-more than that deadline.
+(`_DEADLINE_S`) is a best-effort stop boundary: it is checked before every
+PR, repo, install and before each re-publish, but an operation already in
+flight is not cancelled. Each GitHub call has its own 10s timeout, so the
+overshoot is one PR's worth of calls, not the whole pass.
 """
 from __future__ import annotations
 
@@ -133,6 +135,8 @@ def _heal_pr(
         runs = list_check_runs_for_ref(token, owner, repo, head_sha)
         if any(str(r.get("name") or "") in _CHIEF_NAMES for r in runs):
             return
+        if run.exhausted():
+            return  # the check-run list may have eaten the last of the budget
         run.attempts += 1
         _, result_map = run_chief_recheck(
             installation_id=install_id, owner=owner, repo=repo,

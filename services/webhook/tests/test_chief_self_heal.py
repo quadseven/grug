@@ -193,3 +193,21 @@ def test_poller_handler_reports_self_heal_counts(monkeypatch):
     out = poller_handler.handler({}, None)
     assert out["chief_self_heal_published"] == 4
     assert out["chief_self_heal_failed"] == 1
+
+
+def test_budget_exhausted_by_the_check_list_skips_the_recheck(world, monkeypatch):
+    """The check-run list can consume the last of the deadline; Chief must
+    not start a re-publish after it."""
+    world.prs = [_pr(1)]
+    runs = []
+    real_run = heal._Run
+    monkeypatch.setattr(heal, "_Run", lambda deadline: runs.append(real_run(deadline)) or runs[-1])
+
+    def _list_then_expire(token, owner, repo, sha):
+        world.check_lists.append(sha)
+        runs[0].deadline = 0.0  # budget gone while the listing was in flight
+        return []
+
+    monkeypatch.setattr(heal, "list_check_runs_for_ref", _list_then_expire)
+    assert heal.self_heal_installs([99]) == (0, 0)
+    assert world.check_lists == ["sha001xxxx"] and world.rechecks == []
