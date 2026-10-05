@@ -284,3 +284,25 @@ def test_success_first_try_does_not_refresh(_stub_token):
     assert gh_auth.with_install_token_retry(123, fn) == "ok"
     assert len(calls) == 1
     assert calls[0] == "token-1-refresh=False"
+
+
+def test_primary_rate_limit_403_never_refreshes_the_token(_stub_token):
+    """`X-RateLimit-Remaining: 0` is the per-installation hourly limit; a
+    fresh token for the same installation cannot help, so it must not be
+    minted (Elder on grug#1112)."""
+    calls: list[str] = []
+
+    def fn(token: str) -> None:
+        calls.append(token)
+        raise httpx.HTTPStatusError(
+            "403",
+            request=httpx.Request("GET", "https://api.github.com/repos"),
+            response=httpx.Response(
+                403, headers={"X-RateLimit-Remaining": "0"},
+                json={"message": "API rate limit exceeded"},
+            ),
+        )
+
+    with pytest.raises(httpx.HTTPStatusError):
+        gh_auth.with_install_token_retry(123, fn)
+    assert calls == ["token-1-refresh=False"]

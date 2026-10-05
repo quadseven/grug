@@ -310,6 +310,9 @@ def with_install_token_retry(installation_id: int, fn):
                 status in (401, 403)
                 and not refreshed_401
                 and not _is_retryable_github_error(e.response)
+                # The primary hourly limit is per installation: a fresh
+                # token for it cannot help.
+                and e.response.headers.get("X-RateLimit-Remaining") != "0"
             ):
                 refreshed_401 = True
                 token = get_install_token(installation_id, force_refresh=True)
