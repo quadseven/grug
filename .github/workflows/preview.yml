@@ -64,11 +64,11 @@ jobs:
         with:
           kubeconfig-b64: ${{ secrets.KUBECONFIG_B64 }}
       - name: Registry login
-        env:
-          REGISTRY_HOST: ${{ vars.DEPLOY_REGISTRY_HOST }}
-          REGISTRY_USERNAME: ${{ secrets.REGISTRY_USERNAME }}
-          REGISTRY_PASSWORD: ${{ secrets.REGISTRY_PASSWORD }}
-        run: echo "$REGISTRY_PASSWORD" | docker login "$REGISTRY_HOST" --username "$REGISTRY_USERNAME" --password-stdin
+        uses: ./.github/actions/registry-login
+        with:
+          registry: ${{ vars.DEPLOY_REGISTRY_HOST }}
+          username: ${{ secrets.REGISTRY_USERNAME }}
+          password: ${{ secrets.REGISTRY_PASSWORD }}
       - name: Deploy preview
         env:
           REGISTRY_HOST: ${{ vars.DEPLOY_REGISTRY_HOST }}
