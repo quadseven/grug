@@ -178,6 +178,10 @@ spec:
             # unparseable JSON. OpenCode Go has refused every call with "Go
             # usage limit exceeded" since 2026-09-24, so without this tier
             # every review cohort landed on the Sparks.
+            # Second OpenCode Go model, tier 2: free, unlimited, 0-day
+            # retention. A second opinion on a short empty answer from the
+            # primary; two models agreeing on no findings ends the chain.
+            - {name: GRUG_OPENCODE_GO_SECOND_MODEL, value: "longcat-2.5-preview-free"}
             - {name: GRUG_CLOUD_FREE_TIER_MODEL, value: "nvidia/nemotron-3-super-120b-a12b:free"}
             - {name: GRUG_OPENCODE_GO_API_KEY_SSM, value: /infra/llm/opencode_go_api_key}
             - {name: GRUG_PROMPT_EXPERIMENT_SSM, value: /grug/elder-prompt-experiment}

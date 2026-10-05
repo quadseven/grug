@@ -4724,8 +4724,16 @@ def _go_limit_429(retry_after: str = "3600") -> httpx.Response:
 def test_opencode_go_usage_limit_opens_breaker_and_skips_go_until_retry_after(
     monkeypatch,
 ) -> None:
-    """One refused call per window, not one per review."""
+    """One refused call per window, not one per review. Pinned to a PAID
+    primary (the revert target): free models are exempt from the breaker
+    (test_usage_limit_breaker_never_blocks_the_free_models)."""
     monkeypatch.setenv("GRUG_REVIEW_BACKEND_PRIORITY", "cloud")
+    paid = "deepseek-v4.1-flash"
+    monkeypatch.setattr(lc, "_OPENCODE_GO_MODEL", paid)
+    monkeypatch.setitem(
+        lc._BACKEND_CONFIGS, Backend.OPENCODE_GO,
+        lc.replace(lc._BACKEND_CONFIGS[Backend.OPENCODE_GO], model=paid),
+    )
     ok = httpx.Response(200, json=_openai_json_response('{"findings": []}'))
 
     with patch.object(httpx, "post", side_effect=[_go_limit_429("105419"), ok, ok]) as post:
@@ -4878,3 +4886,128 @@ def test_space_bunny_is_the_default_and_runs_at_low_effort(monkeypatch) -> None:
     assert lc._opencode_go_extra_body("space-bunny-free", "chat") == {"reasoning_effort": "medium"}
     # Never on the Responses wire, where the field has a different shape.
     assert lc._opencode_go_extra_body("space-bunny-free", "responses") == {}
+
+
+# --- second OpenCode Go model + empty-review consensus --------------------
+
+
+def _degenerate_response() -> httpx.Response:
+    return _usage_response('{"findings": []}', 15_000, 7)
+
+
+def test_second_opencode_go_model_is_tier_two_when_configured(monkeypatch) -> None:
+    """A second free OpenCode Go model (longcat-2.5-preview-free) sits right
+    after the primary: same endpoint, its own model and body. Unset, the
+    chain is unchanged."""
+    monkeypatch.delenv("GRUG_OPENCODE_GO_SECOND_MODEL", raising=False)
+    assert [t.model for t in lc._cloud_chain_tiers()][:1] == [lc._OPENCODE_GO_MODEL]
+    assert all(t.model != "longcat-2.5-preview-free" for t in lc._cloud_chain_tiers())
+
+    monkeypatch.setenv("GRUG_OPENCODE_GO_SECOND_MODEL", "longcat-2.5-preview-free")
+    tiers = lc._cloud_chain_tiers()
+    assert tiers[1].backend is Backend.OPENCODE_GO
+    assert tiers[1].model == "longcat-2.5-preview-free"
+    assert tiers[1].url == lc._OPENCODE_GO_URL
+    # Its own body: never the primary's reasoning_effort, always the cap.
+    assert tiers[1].extra_body == {"max_tokens": lc._CLOUD_CHAIN_MAX_TOKENS}
+    assert tiers[1].timeout_seconds == lc._CLOUD_CHAIN_TIMEOUT_SECONDS
+
+
+def test_two_models_agreeing_on_no_findings_is_a_clean_review(monkeypatch, caplog) -> None:
+    """One short empty answer can be a skim (DeepSeek missed a cleanly placed
+    bug that way, 2026-10-05). Two DIFFERENT models both answering empty is
+    agreement: accept it instead of walking the rest of the chain, which
+    burned the staged budget and starved later cohorts."""
+    monkeypatch.setenv("GRUG_REVIEW_BACKEND_PRIORITY", "cloud")
+    monkeypatch.setenv("GRUG_OPENCODE_GO_SECOND_MODEL", "longcat-2.5-preview-free")
+    with caplog.at_level("INFO"), patch.object(
+        httpx, "post", side_effect=[_degenerate_response(), _degenerate_response()],
+    ) as post:
+        out = review_diff([_hunk()], installation_id=1)
+
+    assert out.kind == "reviewed"
+    assert out.findings == ()
+    assert post.call_count == 2  # no Poolside, no Cave
+    assert post.call_args_list[1].kwargs["json"]["model"] == "longcat-2.5-preview-free"
+    assert any(r.getMessage() == "llm_cloud_empty_consensus" for r in caplog.records)
+
+
+def test_second_model_findings_win_over_a_primary_skim(monkeypatch) -> None:
+    monkeypatch.setenv("GRUG_REVIEW_BACKEND_PRIORITY", "cloud")
+    monkeypatch.setenv("GRUG_OPENCODE_GO_SECOND_MODEL", "longcat-2.5-preview-free")
+    real = _usage_response(
+        '{"findings": [{"path": "src/x.py", "line": 1, "rule": "r", '
+        '"severity": "medium", "message": "m"}]}', 15_000, 400,
+    )
+    with patch.object(httpx, "post", side_effect=[_degenerate_response(), real]) as post:
+        out = review_diff([_hunk()], installation_id=1)
+
+    assert out.kind == "reviewed"
+    assert len(out.findings) == 1
+    assert post.call_count == 2
+
+
+def test_second_model_parse_failure_is_a_miss_not_the_answer(monkeypatch) -> None:
+    """grug#1025 applies to every fallback tier: only the PRIMARY model's
+    garbled answer stays the review. The second model returning prose moves
+    the chain on."""
+    monkeypatch.setenv("GRUG_REVIEW_BACKEND_PRIORITY", "cloud")
+    monkeypatch.setenv("GRUG_OPENCODE_GO_SECOND_MODEL", "longcat-2.5-preview-free")
+    junk = httpx.Response(200, json=_openai_json_response("I will now review the diff."))
+    real = _usage_response(
+        '{"findings": [{"path": "src/x.py", "line": 1, "rule": "r", '
+        '"severity": "medium", "message": "m"}]}', 15_000, 400,
+    )
+    with patch.object(
+        httpx, "post", side_effect=[httpx.ConnectError("go down"), junk, real],
+    ) as post:
+        out = review_diff([_hunk()], installation_id=1)
+
+    assert out.kind == "reviewed"
+    assert out.backend_used == Backend.POOLSIDE
+    assert post.call_count == 3
+
+
+def test_the_same_model_twice_is_not_consensus(monkeypatch) -> None:
+    """Agreement needs two different models; one empty answer then a dead
+    second tier still walks on."""
+    monkeypatch.setenv("GRUG_REVIEW_BACKEND_PRIORITY", "cloud")
+    monkeypatch.setenv("GRUG_OPENCODE_GO_SECOND_MODEL", "longcat-2.5-preview-free")
+    real = _usage_response(
+        '{"findings": [{"path": "src/x.py", "line": 1, "rule": "r", '
+        '"severity": "medium", "message": "m"}]}', 15_000, 400,
+    )
+    with patch.object(
+        httpx, "post",
+        side_effect=[_degenerate_response(), httpx.ConnectError("longcat down"), real],
+    ) as post:
+        out = review_diff([_hunk()], installation_id=1)
+
+    assert out.backend_used == Backend.POOLSIDE
+    assert post.call_count == 3
+
+
+def test_usage_limit_breaker_never_blocks_the_free_models(monkeypatch) -> None:
+    """The breaker exists for the PAID monthly quota. Free models
+    (`*-free`: space-bunny-free, longcat-2.5-preview-free) never count
+    against it, so an open breaker must not take them off the chain - that
+    would turn one paid refusal into hours with no OpenCode Go review."""
+    monkeypatch.setenv("GRUG_OPENCODE_GO_SECOND_MODEL", "longcat-2.5-preview-free")
+    monkeypatch.setattr(lc, "_opencode_go_blocked_until", lc.time.time() + 3600)
+    assert not lc._opencode_go_available()
+
+    models = [t.model for t in lc._cloud_chain_tiers()]
+    assert models[:2] == ["space-bunny-free", "longcat-2.5-preview-free"]
+
+    ok = _usage_response('{"findings": []}', 500, 20)
+    with patch.object(httpx, "post", return_value=ok) as post:
+        lc._call_backend(
+            lc.replace(lc._opencode_go_chain_config(), key_loader=lambda: "k"),
+            [{"role": "user", "content": "hi"}],
+        )
+    post.assert_called_once()
+
+    # A paid model is still gated.
+    paid = lc.replace(lc._opencode_go_chain_config(), model="deepseek-v4.1-flash", key_loader=lambda: "k")
+    with pytest.raises(lc.OpencodeGoCircuitOpenError):
+        lc._call_backend(paid, [{"role": "user", "content": "hi"}])
