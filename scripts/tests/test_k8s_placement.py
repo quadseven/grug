@@ -28,13 +28,15 @@ def _spec(name: str) -> dict:
 def test_prefers_oci_zones_softly(name):
     node_aff = _spec(name)["affinity"].get("nodeAffinity", {})
     assert "requiredDuringSchedulingIgnoredDuringExecution" not in node_aff
+    # Weight 100, the max: a low weight is outscored by the zone spread and
+    # the pods drift back onto the lan nodes.
     zones = [
-        set(e["values"])
+        (p["weight"], set(e["values"]))
         for p in node_aff.get("preferredDuringSchedulingIgnoredDuringExecution", [])
         for e in p["preference"]["matchExpressions"]
         if e["key"] == "topology.kubernetes.io/zone" and e["operator"] == "In"
     ]
-    assert {"oci-iad", "oci-ord"} in zones
+    assert (100, {"oci-iad", "oci-ord"}) in zones
 
 
 @pytest.mark.parametrize("name", _DEPLOYMENTS)
