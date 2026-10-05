@@ -5380,6 +5380,10 @@ def _build_judge_messages(
     intent = _render_pr_intent(pr_context)
     if intent:
         blocks.append(intent)
+    # #904: the judge and the refute gate need the same linked-issue
+    # criteria the reviewer saw. Without them a requirement finding looks
+    # unsupported by the code alone and is refuted (seen live 2026-10-05).
+    blocks.extend(_linked_issue_parts(pr_context))
     for h in hunks:
         ctx = ""
         if h.path not in shown:

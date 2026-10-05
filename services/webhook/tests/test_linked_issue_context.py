@@ -305,3 +305,27 @@ def test_dispatch_puts_block_in_pr_context_and_failure_degrades(monkeypatch):
     with patch("httpx.get", return_value=_diff_response()):
         cr_dispatch.dispatch_code_review(payload, blocking=False)
     assert "linked_issue_context" not in seen[-1]
+
+
+def test_judge_and_refute_prompts_carry_the_linked_issue_criteria():
+    """Live 2026-10-05: on a PR contradicting its linked issue's criteria,
+    the reviewer flagged the contradiction at high severity, and the refute
+    gate killed it as 'refuted' because the judge never saw the criteria and
+    the code alone looked fine. The judge must get the same block."""
+    import llm_client as lc
+    from llm_client import Hunk
+
+    block = "### LINKED ISSUE ACCEPTANCE CRITERIA\n#7 criterion 1 [open]: returns 0 for attempt 0"
+    ctx = {"title": "t", "body": "Closes #7", "linked_issue_context": block}
+    finding = {
+        "file": "a.py", "line": 1, "rule_name": "acceptance-criterion-contradicted",
+        "severity": "high", "message": "m",
+    }
+    for refute in (False, True):
+        msgs = lc._build_judge_messages(
+            [finding], [Hunk(path="a.py", body="+x = 1\n")],
+            pr_context=ctx, refute=refute,
+        )
+        text = "\n".join(m["content"] for m in msgs)
+        assert "LINKED ISSUE ACCEPTANCE CRITERIA" in text
+        assert "returns 0 for attempt 0" in text
