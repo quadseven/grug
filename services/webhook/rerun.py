@@ -757,56 +757,44 @@ def _defuse_md(s: str) -> str:
     return defused[:_DEFUSE_MD_CAP]
 
 
-def _learn_ack_body(learning: str, scope_path: str) -> str:
-    """The 'Markings remembered' threaded reply for a stored learning. The
-    model-produced fields are markdown-defused so they cannot corrupt the
-    comment's <details> rendering or inject unintended mentions."""
-    rule = _defuse_md(learning)
-    scope = f"\n> Scope: '{_defuse_md(scope_path)}'" if scope_path else ""
-    return (
-        "Grug remember this.\n\n"
-        "<details><summary>Markings remembered</summary>\n\n"
-        f"> {rule}{scope}\n\n"
-        "Grug will apply this to future reviews on this repo. "
-        "So speaks Grug.\n</details>"
-    )
 
 
-_LEARN_DECLINE_BODY = (
-    "Grug read this, but hear it as one-time talk for this hunt - "
-    "Grug did not carve a lasting marking. Tell Grug a rule for the whole "
-    "tribe if you want it remembered."
-)
 
 # Every classifier backend is refusing for a config/billing reason. The reply
 # was NOT judged; saying so (instead of silence) is the maintainer's cue that a
 # re-reply later is how it gets remembered.
-_LEARN_UNUSABLE_BODY = (
-    "Grug could not think on this right now - the thinking-stones are cold, "
-    "and Grug did not judge it. Nothing was remembered. If this is a rule for "
-    "the whole tribe, reply again later and Grug will carve it."
-)
 _LEARN_UNUSABLE: Any = object()  # sentinel: classifier refused, not a verdict
 # sentinel: backends stayed rate limited or down past the defer horizon
 _LEARN_DEFER_EXHAUSTED: Any = object()
 
 
-def _post_learn_reply(
-    install_id: int, owner: str, repo_name: str, pr_number: int,
-    parent_comment_id: int, body: str,
+
+
+# A reply to a finding is answered with a REACTION, never a comment: replies
+# are mostly agents talking to grug, and every grug comment is an email to a
+# person who is not reading them (operator, 2026-10-05). A reaction is visible
+# to the agent and the human, and notifies no one.
+LEARN_REACTION_LEARNED = "+1"      # stored as a lasting rule
+LEARN_REACTION_ONE_OFF = "eyes"    # read, applies to this PR only
+LEARN_REACTION_UNJUDGED = "confused"  # classifier down; reply again to retry
+
+
+def _react_to_learn_reply(
+    install_id: int, owner: str, repo_name: str, comment_id: int, content: str,
 ) -> None:
-    """Reply in the finding's review thread. Raises on failure; each caller
-    decides whether that failure is worth a redrive."""
+    """React to the person's (or agent's) reply comment. Raises on failure;
+    each caller decides whether that failure is worth a redrive. GitHub
+    de-duplicates a repeated reaction, so a redelivery is harmless."""
     from urllib.parse import quote as _q
 
-    def _reply(token: str) -> None:
+    def _react(token: str) -> None:
         _gh_post(
             token,
             f"{_GH_API}/repos/{_q(owner, safe='')}/{_q(repo_name, safe='')}"
-            f"/pulls/{pr_number}/comments/{parent_comment_id}/replies",
-            {"body": body},
+            f"/pulls/comments/{comment_id}/reactions",
+            {"content": content},
         )
-    with_install_token_retry(install_id, _reply)
+    with_install_token_retry(install_id, _react)
 
 
 def _defer_learn(
@@ -939,9 +927,8 @@ def _run_learn(
         # win-once claim (a claim taken before a failed post would swallow
         # the retry), and a failed post raises for redrive. A rare SQS
         # duplicate delivery can repeat it; a lost one cannot be recovered.
-        _post_learn_reply(
-            install_id, owner, repo_name, pr_number, parent_comment_id,
-            _LEARN_UNUSABLE_BODY,
+        _react_to_learn_reply(
+            install_id, owner, repo_name, comment_id, LEARN_REACTION_UNJUDGED,
         )
         result = (
             "learn_classifier_unusable" if classification is _LEARN_UNUSABLE
@@ -960,13 +947,11 @@ def _run_learn(
             source_comment_id=comment_id,
             author=author,  # the maintainer who TAUGHT it (reply sender)
         )
-        ack = _learn_ack_body(
-            classification["learning"], classification["scope_path"],
-        )
+        ack = LEARN_REACTION_LEARNED
         result = "learned"
     else:
         # Deliberate one-off: acknowledge without storing.
-        ack = _LEARN_DECLINE_BODY
+        ack = LEARN_REACTION_ONE_OFF
         result = "learn_one_off"
 
     # The claim guards ONLY the ack (the one non-idempotent side effect): a
@@ -981,9 +966,7 @@ def _run_learn(
     # failure must NOT redrive (which would re-classify + risk a wrong verdict)
     # nor raise - it just costs the courtesy ack, which a re-teach would repost.
     try:
-        _post_learn_reply(
-            install_id, owner, repo_name, pr_number, parent_comment_id, ack,
-        )
+        _react_to_learn_reply(install_id, owner, repo_name, comment_id, ack)
     except Exception as e:  # noqa: BLE001
         log.warning("learn_ack_post_failed", extra={
             "repo": repo_full, "pr": pr_number, "comment_id": comment_id,
