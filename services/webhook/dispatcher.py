@@ -720,10 +720,6 @@ def _handle_issue_comment(payload: dict[str, Any]) -> dict[str, str]:
     # cheap when only PR events fire.
     from github_app_auth import with_install_token_retry  # type: ignore
     from personas.publish_check import PUBLISH_FAILED  # type: ignore
-    from personas.tpm.issue_fetcher import (  # type: ignore
-        build_issue_facts_fetcher, build_issue_fetcher,
-    )
-    from personas.tpm.persona import evaluate_pull_request, publish_tpm_evaluation  # type: ignore
     import httpx  # type: ignore
 
     # URL-encode user-controlled path components. GitHub repo + login
@@ -811,35 +807,10 @@ def _handle_issue_comment(payload: dict[str, Any]) -> dict[str, str]:
     # /grug recheck silently do nothing. Mirror the pull_request
     # handler's containment: log with coords, return a skip.
     try:
-        # Same fetcher builder as the pull_request webhook path (#782).
-        # Pre-#782 this call was bare `evaluate_pull_request(pr_body)`,
-        # so `linked-issue-completeness` always hit its no-fetcher
-        # fail-open branch: a comment could turn a stale red row green
-        # without the check ever running, on a required_status_checks
-        # context. The builder is shared on purpose - a fetcher copied
-        # here would be the same divergence one refactor later.
-        fetcher = build_issue_fetcher(
-            installation_id=int(installation_id), owner=owner, repo=repo_name,
-        )
-        # Same shared builder for the `which epic` facts (grug#1034).
-        facts_fetcher = build_issue_facts_fetcher(
-            installation_id=int(installation_id), owner=owner, repo=repo_name,
-        )
-        evaluation = evaluate_pull_request(
-            pr_body, fetch_issue=fetcher, fetch_issue_facts=facts_fetcher,
-        )
-        # publish_tpm_evaluation never raises on a failed publish since
-        # #550 — the seam classifies ANY publish failure into the
-        # returned "publish_failed" sentinel, logs it under
-        # `tpm_publish_failed` (kind/status_code/error fields live on
-        # that seam log), and records the honest errored Activity row.
-        result_map = publish_tpm_evaluation(
-            evaluation,
-            installation_id=int(installation_id),
-            owner=owner,
-            repo=repo_name,
-            head_sha=head_sha,
-            pr_number=int(pr_number),
+        evaluation, result_map = run_chief_recheck(
+            installation_id=int(installation_id), owner=owner,
+            repo=repo_name, head_sha=head_sha, pr_number=int(pr_number),
+            pr_body=pr_body,
         )
         # Subscript INSIDE the guard: a seam regression returning a map
         # without "result" must land here (skip + coords), not 500 the
@@ -884,6 +855,54 @@ def _handle_issue_comment(payload: dict[str, Any]) -> dict[str, str]:
         "trigger": "recheck",
         "result": "pass" if evaluation.passed else "fail",
     }
+
+
+def run_chief_recheck(
+    *, installation_id: int, owner: str, repo: str, head_sha: str,
+    pr_number: int, pr_body: str,
+) -> tuple[Any, dict[str, str]]:
+    """Evaluate Chief's DoR checks for a PR and publish the check-run.
+
+    The ONE implementation behind `/grug recheck` and the poller's Chief
+    self-heal pass (a second copy would drift). Returns
+    `(evaluation, {"persona": "tpm", "result": ...})`; a failed publish is
+    the `publish_failed` sentinel in the map, never a raise (since #550).
+    Unexpected errors propagate; each caller owns its containment."""
+    from personas.tpm.issue_fetcher import (  # type: ignore
+        build_issue_facts_fetcher, build_issue_fetcher,
+    )
+    from personas.tpm.persona import evaluate_pull_request, publish_tpm_evaluation  # type: ignore
+
+    # Same fetcher builder as the pull_request webhook path (#782).
+    # Pre-#782 this call was bare `evaluate_pull_request(pr_body)`, so
+    # `linked-issue-completeness` always hit its no-fetcher fail-open
+    # branch: a comment could turn a stale red row green without the check
+    # ever running, on a required_status_checks context. The builder is
+    # shared on purpose - a fetcher copied here would be the same
+    # divergence one refactor later.
+    fetcher = build_issue_fetcher(
+        installation_id=installation_id, owner=owner, repo=repo,
+    )
+    # Same shared builder for the `which epic` facts (grug#1034).
+    facts_fetcher = build_issue_facts_fetcher(
+        installation_id=installation_id, owner=owner, repo=repo,
+    )
+    evaluation = evaluate_pull_request(
+        pr_body, fetch_issue=fetcher, fetch_issue_facts=facts_fetcher,
+    )
+    # publish_tpm_evaluation never raises on a failed publish since #550:
+    # the seam classifies ANY publish failure into the "publish_failed"
+    # sentinel, logs it under `tpm_publish_failed`, and records the honest
+    # errored Activity row.
+    result_map = publish_tpm_evaluation(
+        evaluation,
+        installation_id=installation_id,
+        owner=owner,
+        repo=repo,
+        head_sha=head_sha,
+        pr_number=pr_number,
+    )
+    return evaluation, result_map
 
 
 def _fetch_pr_for_rerequest(

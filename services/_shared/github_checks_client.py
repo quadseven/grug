@@ -47,6 +47,34 @@ class CheckRunResult:
             )
 
 
+def github_error_diagnostics(exc: BaseException) -> dict[str, object]:
+    """Why GitHub refused a request, for the failure log line.
+
+    Pulls only GitHub's own error `message` and `documentation_url` from the
+    response body plus the `X-GitHub-Request-Id` header (what GitHub support
+    asks for). Never reads the REQUEST (body or Authorization header), so no
+    token or PR content can reach a log. Returns {} for anything that is not
+    an HTTPStatusError, and never raises: diagnostics must not mask the
+    failure they describe (a 403 with an unexplained body is how the
+    2026-10-05 check-run outage stayed a mystery)."""
+    if not isinstance(exc, httpx.HTTPStatusError):
+        return {}
+    out: dict[str, object] = {}
+    try:
+        resp = exc.response
+        out["gh_request_id"] = resp.headers.get("x-github-request-id")
+        try:
+            body = resp.json()
+        except ValueError:
+            body = None
+        if isinstance(body, dict):
+            out["gh_message"] = str(body.get("message") or "")[:300]
+            out["gh_documentation_url"] = str(body.get("documentation_url") or "")[:300]
+    except Exception as e:  # noqa: BLE001 - diagnostics are best-effort by contract
+        log.debug("github_error_diagnostics_failed", extra={"kind": type(e).__name__})
+    return out
+
+
 # GitHub documented limit is 65535; leave headroom for the marker.
 _MAX_SUMMARY_CHARS = 65000
 
@@ -102,7 +130,20 @@ def post_check_run(
         },
         timeout=10,
     )
-    resp.raise_for_status()
+    try:
+        resp.raise_for_status()
+    except httpx.HTTPStatusError as e:
+        log.warning(
+            "check_run_post_http_error",
+            extra={
+                "repo": f"{owner}/{repo}",
+                "head_sha": result.head_sha[:8],
+                "check_name": result.name,
+                "status_code": resp.status_code,
+                **github_error_diagnostics(e),
+            },
+        )
+        raise
     return resp.json()
 
 

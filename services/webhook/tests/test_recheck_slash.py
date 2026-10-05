@@ -465,3 +465,32 @@ def test_recheck_and_webhook_pass_when_the_ticket_has_a_parent(_tpm_only):
     assert recheck_out["result"] == "pass"
     epic = {r.name: r for r in recheck_eval.results}["linked-issue-epic"]
     assert epic.passed is True and epic.skipped is False
+
+
+def test_run_chief_recheck_evaluates_then_publishes(monkeypatch):
+    """The shared function behind `/grug recheck` and the poller's Chief
+    self-heal: evaluate with the PR body, publish at the given head."""
+    import personas.tpm.issue_fetcher as fetchers
+
+    seen = {}
+    monkeypatch.setattr(fetchers, "build_issue_fetcher", lambda **kw: "F")
+    monkeypatch.setattr(fetchers, "build_issue_facts_fetcher", lambda **kw: "FF")
+
+    def _eval(body, fetch_issue=None, fetch_issue_facts=None):
+        seen["eval"] = (body, fetch_issue, fetch_issue_facts)
+        return "EVAL"
+
+    def _publish(evaluation, **kw):
+        seen["publish"] = (evaluation, kw)
+        return {"persona": "tpm", "result": "pass"}
+
+    monkeypatch.setattr(tpm_persona, "evaluate_pull_request", _eval)
+    monkeypatch.setattr(tpm_persona, "publish_tpm_evaluation", _publish)
+    evaluation, result_map = d.run_chief_recheck(
+        installation_id=5, owner="o", repo="r", head_sha="abc", pr_number=9, pr_body="B",
+    )
+    assert evaluation == "EVAL" and result_map["result"] == "pass"
+    assert seen["eval"] == ("B", "F", "FF")
+    assert seen["publish"][1] == {
+        "installation_id": 5, "owner": "o", "repo": "r", "head_sha": "abc", "pr_number": 9,
+    }

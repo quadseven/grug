@@ -20,6 +20,9 @@ def _no_ambient_ra_config(monkeypatch):
     # The hourly Elder canary would call real models on the wall-clock's
     # first poller slot; these tests are about the other passes.
     monkeypatch.setenv("GRUG_ELDER_CANARY", "off")
+    # The Chief self-heal pass has its own tests (test_chief_self_heal.py);
+    # here it must not reach GitHub through the real token wrapper.
+    monkeypatch.setattr("chief_self_heal.self_heal_installs", lambda installs: (0, 0))
 
 
 def _wire(monkeypatch, *, installs, records_for, retry, poll):
@@ -106,6 +109,8 @@ def test_poller_polls_each_allowlisted_install(monkeypatch):
         "hygiene_watch_failed_installs": 0,
         "check_run_reconciled": 0,
         "check_run_reconcile_failed_installs": 0,
+        "chief_self_heal_published": 0,
+        "chief_self_heal_failed": 0,
         "install_reconciliation_repaired": 0,
         "install_reconciliation_stale": 0,
         "install_reconciliation_failed": 0,
@@ -205,6 +210,8 @@ def test_poller_skips_installs_with_no_records(monkeypatch):
         "hygiene_watch_failed_installs": 0,
         "check_run_reconciled": 0,
         "check_run_reconcile_failed_installs": 0,
+        "chief_self_heal_published": 0,
+        "chief_self_heal_failed": 0,
         "install_reconciliation_repaired": 0,
         "install_reconciliation_stale": 0,
         "install_reconciliation_failed": 0,
@@ -456,6 +463,8 @@ def test_poller_all_installs_fail_logs_error(monkeypatch, caplog):
         "hygiene_watch_failed_installs": 0,
         "check_run_reconciled": 0,
         "check_run_reconcile_failed_installs": 0,
+        "chief_self_heal_published": 0,
+        "chief_self_heal_failed": 0,
         "install_reconciliation_repaired": 0,
         "install_reconciliation_stale": 0,
         "install_reconciliation_failed": 0,
@@ -497,6 +506,8 @@ def test_poller_no_installs_is_a_clean_noop(monkeypatch):
         "hygiene_watch_failed_installs": 0,
         "check_run_reconciled": 0,
         "check_run_reconcile_failed_installs": 0,
+        "chief_self_heal_published": 0,
+        "chief_self_heal_failed": 0,
         "install_reconciliation_repaired": 0,
         "install_reconciliation_stale": 0,
         "install_reconciliation_failed": 0,

@@ -23,7 +23,12 @@ import httpx
 
 from activity_log import record_check_verdict
 from github_app_auth import with_install_token_retry
-from github_checks_client import CheckConclusion, CheckRunResult, post_check_run
+from github_checks_client import (
+    CheckConclusion,
+    CheckRunResult,
+    github_error_diagnostics,
+    post_check_run,
+)
 
 log = logging.getLogger(f"{os.getenv('DD_SERVICE', 'grug')}.persona.publish_check")
 
@@ -247,6 +252,7 @@ def publish_persona_check(
                 "kind": type(e).__name__,
                 "status_code": getattr(getattr(e, "response", None), "status_code", None),
                 "error": str(e)[:500],
+                **github_error_diagnostics(e),
             },
             exc_info=True,
         )
