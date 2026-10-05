@@ -18,6 +18,13 @@ import pathlib
 import pulumi
 
 from components.dd_monitors import (
+    CHECK_RUN_PUBLISH_FAILED_EVENTS,
+    canary_clean_query,
+    canary_planted_query,
+    check_run_publish_failure_query,
+    elder_review_failure_rate_query,
+    elder_review_failure_searches,
+    model_benched_query,
     credential_acquisition_failure_query,
     all_ksm_monitor_queries,
     crashloop_query,
@@ -388,13 +395,15 @@ def test_deploy_monitor_pin():
 
 
 @pulumi.runtime.test
-def test_only_three_monitors_can_page_and_every_handle_is_recovery_gated():
+def test_only_four_monitors_can_page_and_every_handle_is_recovery_gated():
     """Pin the alert tiering, because its failure mode is silence, not noise.
 
     All 21 grug monitors used to carry a bare handle. That meant two pings per
     incident (broke, then fixed itself) and a page for things like "deploy
     auto-rollback fired", which is the rollback SUCCEEDING. Applying infra's
-    ALERTING-STANDARD bar leaves exactly three that qualify.
+    ALERTING-STANDARD bar leaves exactly three that qualify, plus the
+    check-run publish monitor added after the 2026-10-05 outage (every PR
+    merge-blocked for 35 minutes, nothing alerted).
 
     Both halves matter and neither is visible in review:
     - a monitor that quietly regains a handle starts paging again
@@ -418,6 +427,7 @@ def test_only_three_monitors_can_page_and_every_handle_is_recovery_gated():
     paging = {
         "workload_not_ready": bundle.workload_not_ready,
         "elder_llm_degraded": bundle.elder_llm_degraded,
+        "check_run_publish_failed": bundle.check_run_publish_failed,
     }
     silent = {
         "crashloop": bundle.crashloop,
@@ -432,6 +442,10 @@ def test_only_three_monitors_can_page_and_every_handle_is_recovery_gated():
         "inbound_webhook_silence": bundle.inbound_webhook_silence,
         "cf_secret_mismatch": bundle.cf_secret_mismatch,
         "credential_acquisition_fail": bundle.credential_acquisition_fail,
+        "elder_review_failure_rate": bundle.elder_review_failure_rate,
+        "model_benched": bundle.model_benched,
+        "canary_planted": bundle.canary_planted,
+        "canary_clean": bundle.canary_clean,
     }
 
     names = list(paging) + list(silent)
@@ -621,6 +635,11 @@ _ALL_MONITOR_FIELDS = (
     "cf_secret_mismatch",
     "uptime",
     "credential_acquisition_fail",
+    "check_run_publish_failed",
+    "elder_review_failure_rate",
+    "model_benched",
+    "canary_planted",
+    "canary_clean",
 )
 
 _ALL_QUEUE_MONITOR_FIELDS = (
@@ -670,3 +689,153 @@ def test_every_monitor_carries_managed_by_pulumi_tag():
             )
 
     return pulumi.Output.all(*[r.tags for _, r in resources]).apply(_check)
+
+
+# --- 2026-10-05: review failures must alert, not be discovered by users -----
+
+
+def test_check_run_publish_failure_query_pins_every_check_run_event() -> None:
+    q = check_run_publish_failure_query("prod")
+    assert q == (
+        'logs("service:grug-* env:prod (tpm_publish_failed OR recheck_publish_failed '
+        "OR warder_publish_failed OR guard_check_run_publish_failed "
+        "OR guard_degraded_publish_failed OR smasher_check_run_publish_failed "
+        "OR smasher_degraded_publish_failed OR code_review_check_run_publish_failed "
+        "OR code_review_degraded_publish_failed OR elder_async_deep_check_publish_failed "
+        'OR elder_fallback_publish_failed)")'
+        '.index("*").rollup("count").last("15m") > 2'
+    )
+    assert "env:dev" not in q
+
+
+def test_check_run_publish_events_exist_in_the_code() -> None:
+    """Every event name in the query must be a literal the services log, or the
+    monitor is silently blind to it (a rename would never be noticed)."""
+    root = pathlib.Path(__file__).resolve().parents[3] / "services"
+    src = "\n".join(p.read_text() for p in root.rglob("*.py") if "tests" not in p.parts)
+    for event in CHECK_RUN_PUBLISH_FAILED_EVENTS:
+        assert f'"{event}"' in src, f"{event} is not logged anywhere under services/"
+
+
+def test_check_run_publish_events_exclude_comment_publishes() -> None:
+    """Sentinel/Walkthrough post comments and the review-publish events post
+    review bodies; neither blocks a merge, so neither may page."""
+    for event in CHECK_RUN_PUBLISH_FAILED_EVENTS:
+        assert "review_publish" not in event
+        assert not event.startswith(("sentinel", "walkthrough"))
+
+
+def test_elder_review_failure_searches_pin_the_log_filters() -> None:
+    total, bad = elder_review_failure_searches("prod")
+    assert total == "service:grug-* env:prod code_reviewer_dispatched"
+    assert bad == (
+        "service:grug-* env:prod code_reviewer_dispatched "
+        "@degraded_reason:(parse_failed OR partial_review)"
+    )
+
+
+def test_elder_review_failure_rate_query_has_threshold_and_volume_guard() -> None:
+    q = elder_review_failure_rate_query()
+    assert q == 'formula("bad / clamp_min(total, 10) * 100").last("2h") > 25'
+    # Below 10 reviews the denominator is floored at 10: 1 failure of 2 reads
+    # 10%, and it takes 3 failures to clear 25%.
+    assert "clamp_min(total, 10)" in q
+
+
+def test_model_benched_query_is_env_scoped_and_any_occurrence() -> None:
+    assert model_benched_query("prod") == (
+        'logs("service:grug-* env:prod llm_model_benched")'
+        '.index("*").rollup("count").last("30m") > 0'
+    )
+
+
+def test_canary_planted_query_alerts_after_two_hours_of_misses() -> None:
+    assert canary_planted_query("prod") == (
+        "max(last_2h):max:grug.elder.canary{case:planted,env:prod} < 1"
+    )
+
+
+def test_canary_clean_query_is_the_false_positive_mirror() -> None:
+    assert canary_clean_query("prod") == (
+        "max(last_2h):max:grug.elder.canary{case:clean,env:prod} < 1"
+    )
+
+
+def _review_health_bundle(name: str):
+    import pulumi_datadog as datadog
+
+    from components import dd_monitors
+
+    provider = datadog.Provider(name, api_key="x", app_key="y")
+    return dd_monitors.create_all(
+        env="prod",
+        notify_handle="@h",
+        webhook_public_url="https://webhook.example/webhook/github",
+        api_public_url="https://api.example",
+        provider=provider,
+    )
+
+
+def _resolve(monitor, *fields):
+    """Resolve the named Monitor outputs to plain values for assertions."""
+    return pulumi.Output.all(*[getattr(monitor, f) for f in fields])
+
+
+@pulumi.runtime.test
+def test_check_run_publish_monitor_pages_at_top_priority():
+    m = _review_health_bundle("t-crp").check_run_publish_failed
+
+    def _check(v):
+        mtype, priority, message = v
+        assert (mtype, priority) == ("log alert", 2)
+        assert "MERGE" in message and "docs/RUNBOOK.md" in message
+
+    return _resolve(m, "type", "priority", "message").apply(_check)
+
+
+@pulumi.runtime.test
+def test_elder_failure_rate_monitor_carries_both_count_variables():
+    m = _review_health_bundle("t-efr").elder_review_failure_rate
+
+    def _check(v):
+        mtype, priority, queries = v
+        assert (mtype, priority) == ("log alert", 3)
+        assert [q["name"] for q in queries["event_queries"]] == ["total", "bad"]
+
+    return _resolve(m, "type", "priority", "variables").apply(_check)
+
+
+@pulumi.runtime.test
+def test_model_benched_monitor_is_low_priority_digest():
+    m = _review_health_bundle("t-mb").model_benched
+
+    def _check(v):
+        mtype, priority, message = v
+        assert (mtype, priority) == ("log alert", 4)
+        assert "fell back" in message and "docs/RUNBOOK.md" in message
+
+    return _resolve(m, "type", "priority", "message").apply(_check)
+
+
+@pulumi.runtime.test
+def test_planted_canary_monitor_alerts_on_no_data_after_three_hours():
+    m = _review_health_bundle("t-cp").canary_planted
+
+    def _check(v):
+        mtype, priority, notify_no_data, timeframe = v
+        assert (mtype, priority) == ("metric alert", 2)
+        assert notify_no_data is True and timeframe == 180
+
+    return _resolve(m, "type", "priority", "notify_no_data", "no_data_timeframe").apply(_check)
+
+
+@pulumi.runtime.test
+def test_clean_canary_monitor_is_warning_level_without_no_data():
+    m = _review_health_bundle("t-cc").canary_clean
+
+    def _check(v):
+        mtype, priority, notify_no_data = v
+        assert (mtype, priority) == ("metric alert", 4)
+        assert notify_no_data is False
+
+    return _resolve(m, "type", "priority", "notify_no_data").apply(_check)

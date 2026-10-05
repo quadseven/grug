@@ -29,6 +29,11 @@ import pulumi_datadog as datadog
 # something you look at when you are already investigating rather than
 # something that interrupts you.
 #
+# A fourth page was added after 2026-10-05: `check_run_publish_failed`. Chief
+# and Guard could not publish check runs for 35 minutes, so every PR was
+# merge-blocked, and nothing alerted. Same bar: users blocked, nothing
+# automatic will fix it.
+#
 # All 21 grug monitors used to page. Applying infra's ALERTING-STANDARD.md bar
 # -- users are affected or data is at risk, AND nothing automatic will fix it
 # -- leaves exactly three that qualify:
@@ -80,6 +85,11 @@ class _MonitorBundle:
     cf_secret_mismatch: datadog.Monitor
     uptime: datadog.SyntheticsTest
     credential_acquisition_fail: datadog.Monitor
+    check_run_publish_failed: datadog.Monitor
+    elder_review_failure_rate: datadog.Monitor
+    model_benched: datadog.Monitor
+    canary_planted: datadog.Monitor
+    canary_clean: datadog.Monitor
 
 
 def _common_tags(env: str, service: str) -> list[str]:
@@ -276,6 +286,95 @@ def inbound_webhook_silence_query(env: str) -> str:
         f'logs("service:grug-webhook env:{env} webhook_received")'
         '.index("*").rollup("count").last("4h") < 1'
     )
+
+
+# --- review health (2026-10-05 outage) --------------------------------------
+# From 15:30 to 16:05 UTC on 2026-10-05, Chief and Guard could not publish
+# check runs (403s logged as `tpm_publish_failed` and
+# `guard_check_run_publish_failed`), so every PR was merge-blocked. Nothing
+# alerted: `github_api_error_rate_query` averages ALL GitHub calls and Elder's
+# successful calls diluted it. These monitors watch the outcome per persona.
+
+# Every log event emitted when a persona fails to publish its CHECK RUN. A test
+# greps services/ for each literal, so a rename cannot leave the monitor blind.
+# Deliberately absent: `*_review_publish_failed` (review bodies) and
+# `sentinel_`/`walkthrough_publish_failed` (comments) - none block a merge.
+CHECK_RUN_PUBLISH_FAILED_EVENTS: tuple[str, ...] = (
+    "tpm_publish_failed",  # Chief, via the shared publish_check seam
+    "recheck_publish_failed",  # Chief recheck path (dispatcher)
+    "warder_publish_failed",
+    "guard_check_run_publish_failed",
+    "guard_degraded_publish_failed",
+    "smasher_check_run_publish_failed",
+    "smasher_degraded_publish_failed",
+    "code_review_check_run_publish_failed",  # Elder
+    "code_review_degraded_publish_failed",
+    "elder_async_deep_check_publish_failed",
+    "elder_fallback_publish_failed",  # Elder cave fallback, via the seam
+)
+
+
+def check_run_publish_failure_query(env: str) -> str:
+    """More than 2 check-run publish failures from any persona in 15m.
+
+    A required check that never lands blocks the merge button, so unlike a
+    rate this is a COUNT: any persona's failure is the signal, and a healthy
+    persona cannot dilute it (the mistake that hid 2026-10-05). `> 2` rides
+    out a single transient 5xx; the outage logged one failure per PR event,
+    so it clears 2 within minutes. A log rollup re-evaluates fresh each
+    cycle, so no dense-emission workaround is needed (see
+    `inbound_webhook_silence_query`)."""
+    events = " OR ".join(CHECK_RUN_PUBLISH_FAILED_EVENTS)
+    return (
+        f'logs("service:grug-* env:{env} ({events})")'
+        '.index("*").rollup("count").last("15m") > 2'
+    )
+
+
+def elder_review_failure_searches(env: str) -> tuple[str, str]:
+    """(all reviews, failed reviews) log searches over `code_reviewer_dispatched`,
+    which Elder logs once per review with `@degraded_reason` set when the
+    review did not complete cleanly. `parse_failed` is an unusable model
+    answer; `partial_review` is a review that walked only part of the diff."""
+    total = f"service:grug-* env:{env} code_reviewer_dispatched"
+    return total, f"{total} @degraded_reason:(parse_failed OR partial_review)"
+
+
+def elder_review_failure_rate_query() -> str:
+    """Failed share of Elder reviews over 2h, as a formula over two log counts
+    (`total` and `bad`, see `elder_review_failure_searches`) > 25 percent.
+
+    Volume guard: the denominator is floored at 10, so below 10 reviews in the
+    window the rate is bad/10 and it takes 3 failures to exceed 25 percent
+    (1 failure of 2 reads 10 percent and stays quiet)."""
+    return 'formula("bad / clamp_min(total, 10) * 100").last("2h") > 25'
+
+
+def model_benched_query(env: str) -> str:
+    """Any `llm_model_benched` in 30m: a model in Elder's chain was benched and
+    the chain fell back to the next one. Tags: backend, model, status."""
+    return (
+        f'logs("service:grug-* env:{env} llm_model_benched")'
+        '.index("*").rollup("count").last("30m") > 0'
+    )
+
+
+def _canary_query(env: str, case: str) -> str:
+    return f"max(last_2h):max:grug.elder.canary{{case:{case},env:{env}}} < 1"
+
+
+def canary_planted_query(env: str) -> str:
+    """`grug.elder.canary` is 1.0 when the review canary behaved and 0.0 when
+    not. `case:planted` is a diff with a planted defect Elder must catch:
+    `max(last_2h) < 1` means two hours of consecutive misses (any 1.0 in the
+    window clears it), i.e. Elder is not finding a known defect."""
+    return _canary_query(env, "planted")
+
+
+def canary_clean_query(env: str) -> str:
+    """`case:clean` is a diff with nothing wrong; a 0.0 sustained for 2h means
+    Elder is raising false positives."""
+    return _canary_query(env, "clean")
 
 
 def all_ksm_monitor_queries() -> list[str]:
@@ -988,6 +1087,156 @@ def create_all(
         opts=opts,
     )
 
+    # 8) Review health (2026-10-05): see the section above the query helpers.
+    #    Page tier: a persona that cannot publish its check run merge-blocks
+    #    every PR, and retries already ran inside the publish seam.
+    check_run_publish_failed = datadog.Monitor(
+        "grug-check-run-publish-failed",
+        type="log alert",
+        name="[grug] Check-run publish failing - PRs are MERGE-BLOCKED (15min)",
+        message=(
+            f"{_page(notify_handle)}\n"
+            "A persona (Chief, Guard, Elder, Smasher or Warder) failed to "
+            "publish its check run more than twice in 15 minutes. A required "
+            "check that never lands BLOCKS MERGES on every PR it gates. "
+            "Likely causes: the GitHub App lost a permission or a permission "
+            "change awaits approval, a revoked or suspended installation, an "
+            "expired App key, or GitHub degraded (the 2026-10-05 outage was "
+            "403s on Chief and Guard for 35 minutes while Elder kept "
+            "succeeding). First steps: read `status_code` and `error` on the "
+            "log lines (the event name says which persona), then check the "
+            "App's permissions and recent installation events in GitHub. "
+            "403 = permissions or installation; 401 = key or token; 5xx = "
+            "GitHub.\n"
+            "Runbook: docs/RUNBOOK.md#check-run-publish-failing"
+        ),
+        query=check_run_publish_failure_query(env),
+        tags=_common_tags(env, "grug") + ["check-run:publish-failed"],
+        notify_no_data=False,
+        priority=2,
+        opts=opts,
+    )
+
+    es_total, es_bad = elder_review_failure_searches(env)
+    elder_review_failure_rate = datadog.Monitor(
+        "grug-elder-review-failure-rate",
+        type="log alert",
+        name="[grug-elder] Reviews failing to parse or partial (>25% over 2h)",
+        message=(
+            f"{_DIGEST}\n"
+            "More than 25% of Elder reviews in the last 2 hours ended with "
+            "`degraded_reason` of `parse_failed` (the model answered but the "
+            "output was not usable) or `partial_review` (only part of the "
+            "diff was reviewed), with at least 3 failures so a quiet stretch "
+            "cannot trip it. Authors see degraded or advisory reviews. "
+            "Likely causes: a model or provider change, a truncating output "
+            "limit, a prompt regression after a deploy, or a benched model "
+            "leaving a weaker one in the chain. First steps: filter "
+            "`code_reviewer_dispatched` logs by `degraded_reason` and group "
+            "by `backend` and `model`; check for `llm_model_benched` and "
+            "recent deploys.\n"
+            "Runbook: docs/RUNBOOK.md#elder-review-failure-rate"
+        ),
+        query=elder_review_failure_rate_query(),
+        variables=datadog.MonitorVariablesArgs(
+            event_queries=[
+                datadog.MonitorVariablesEventQueryArgs(
+                    data_source="logs",
+                    name=name,
+                    indexes=["*"],
+                    computes=[
+                        datadog.MonitorVariablesEventQueryComputeArgs(
+                            aggregation="count",
+                        )
+                    ],
+                    search=datadog.MonitorVariablesEventQuerySearchArgs(query=search),
+                )
+                for name, search in (("total", es_total), ("bad", es_bad))
+            ],
+        ),
+        tags=_common_tags(env, "grug-consumer") + ["llm:review-quality"],
+        notify_no_data=False,
+        priority=3,
+        opts=opts,
+    )
+
+    model_benched = datadog.Monitor(
+        "grug-model-benched",
+        type="log alert",
+        name="[grug-elder] A review model was benched - chain fell back (30min)",
+        message=(
+            f"{_DIGEST}\n"
+            "Elder benched a model (`llm_model_benched`; the log carries "
+            "`backend`, `model` and `status`) and the review chain fell back "
+            "to the next model. Reviews still complete, on a weaker or "
+            "slower model. Likely causes: the provider rejected or removed "
+            "the model, a quota or key problem, repeated timeouts. First "
+            "steps: read `status`, then check the model name and the "
+            "model/key environment variables for that `backend` in the "
+            "grug-consumer config, and the backend's status page.\n"
+            "Runbook: docs/RUNBOOK.md#llm-backend-unusable"
+        ),
+        query=model_benched_query(env),
+        tags=_common_tags(env, "grug-consumer") + ["llm:backend"],
+        notify_no_data=False,
+        priority=4,
+        opts=opts,
+    )
+
+    canary_planted = datadog.Monitor(
+        "grug-elder-canary-planted",
+        type="metric alert",
+        name="[grug-elder] Review canary is MISSING its planted defect (2h)",
+        message=(
+            f"{_DIGEST}\n"
+            "The Elder canary reviewed a diff with a planted defect and did "
+            "not flag it in any run over the last 2 hours (`grug.elder.canary` "
+            "is 0.0; tags `outcome`, `backend`, `model`). Elder is effectively "
+            "not reviewing, even if it reports success. NO DATA for 3 hours "
+            "means the canary itself stopped running. Likely causes: a model "
+            "change, a prompt or parser regression, a degraded backend, a "
+            "stopped canary job. First steps: group the metric by "
+            "`outcome`, `backend` and `model`, check recent deploys and "
+            "`llm_model_benched`, and run the canary by hand.\n"
+            "Runbook: docs/RUNBOOK.md#elder-review-canary"
+        ),
+        query=canary_planted_query(env),
+        tags=_common_tags(env, "grug-consumer") + ["llm:canary"],
+        # The canary is a scheduled gauge: silence means the canary job (or
+        # the whole emitter) is gone, so No Data IS the failure here.
+        notify_no_data=True,
+        no_data_timeframe=180,
+        # False on purpose, like the owned queue gauges: the canary is a
+        # sparse scheduled gauge, and requiring a full window of points would
+        # leave the monitor unevaluated (blind) for part of every window.
+        require_full_window=False,
+        priority=2,
+        opts=opts,
+    )
+
+    canary_clean = datadog.Monitor(
+        "grug-elder-canary-clean",
+        type="metric alert",
+        name="[grug-elder] Review canary false positive on a clean diff (2h)",
+        message=(
+            f"{_DIGEST}\n"
+            "The Elder canary reviewed a CLEAN diff and flagged it in every "
+            "run over the last 2 hours (`grug.elder.canary` is 0.0 for "
+            "`case:clean`). Elder is raising false positives, which blocks "
+            "or noises up real PRs. Likely causes: a prompt change, a "
+            "stricter model in the chain, a parser regression. First steps: "
+            "group by `outcome`, `backend` and `model` and compare with the "
+            "last good hour.\n"
+            "Runbook: docs/RUNBOOK.md#elder-review-canary"
+        ),
+        query=canary_clean_query(env),
+        tags=_common_tags(env, "grug-consumer") + ["llm:canary"],
+        notify_no_data=False,
+        require_full_window=False,
+        priority=4,
+        opts=opts,
+    )
+
     # 6) CF→AWS auth-boundary header-mismatch rate. A burst means the
     #    secret got out of sync between the CF Worker binding and the
     #    SSM param the Lambda middleware reads — usually a rotation
@@ -1078,4 +1327,9 @@ def create_all(
         cf_secret_mismatch=cf_secret_mismatch,
         uptime=uptime,
         credential_acquisition_fail=credential_acquisition_fail,
+        check_run_publish_failed=check_run_publish_failed,
+        elder_review_failure_rate=elder_review_failure_rate,
+        model_benched=model_benched,
+        canary_planted=canary_planted,
+        canary_clean=canary_clean,
     )
