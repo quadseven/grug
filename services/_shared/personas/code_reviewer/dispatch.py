@@ -88,7 +88,12 @@ from personas.code_reviewer.repo_config import (
     split_ignored_hunks,
     with_instructions,
 )
+from personas.code_reviewer.linked_issue import (
+    RULE_CATEGORIES as _LINKED_ISSUE_RULE_CATEGORIES,
+)
+from personas.code_reviewer.linked_issue import build_linked_issue_context
 from personas.code_reviewer.repo_docs import build_repo_docs_context
+from personas.tpm.issue_fetcher import build_issue_fetcher
 from personas.code_reviewer.omen import build_runtime_context
 from personas.code_reviewer.judge import (
     eval_tags, grade_findings, partition_findings, partition_refuted,
@@ -1235,6 +1240,10 @@ _WHY_IT_MATTERS: dict[str, str] = {
     "performance": (
         "Hot-path waste compounds under concurrency and burns latency budget."
     ),
+    "requirements": (
+        "A PR that misses or contradicts its own issue's criteria ships the "
+        "wrong thing even when the code is clean."
+    ),
 }
 
 # CR-style agent contract: deterministic, no extra LLM call.
@@ -1262,7 +1271,9 @@ _STACK_COMMENT_TIMEOUT = 10.0
 def _category_for_rule(rule_name: str) -> str:
     """Display category from the RULES table; unknown rules stay general."""
     rule = _RULES_BY_NAME.get(rule_name)
-    return rule.bug_class if rule is not None else "general"
+    if rule is not None:
+        return rule.bug_class
+    return _LINKED_ISSUE_RULE_CATEGORIES.get(rule_name, "general")
 
 
 def _why_it_matters(rule_name: str) -> str:
@@ -2305,6 +2316,32 @@ def _repo_complexity_caps(
         return None, None
 
 
+def _attach_linked_issue_context(
+    pr_context: PrContext, *, installation_id: int, owner: str, repo_name: str,
+) -> None:
+    """Put the linked-issue criteria block on `pr_context` (#904) so every
+    cohort and the deep pass see it. Any failure leaves `pr_context`
+    untouched = today's review."""
+    try:
+        linked = build_linked_issue_context(
+            str(pr_context.get("body") or ""),
+            fetch_issue=build_issue_fetcher(
+                installation_id=installation_id, owner=owner, repo=repo_name,
+            ),
+        )
+        if linked:
+            pr_context["linked_issue_context"] = linked
+    except Exception as e:  # noqa: BLE001 - additive; never break the review
+        log.info(
+            "linked_issue_context_degraded",
+            extra={
+                "stage": "dispatch",
+                "pr": f"{owner}/{repo_name}#{pr_context.get('pr_number')}",
+                "kind": type(e).__name__,
+            },
+        )
+
+
 def dispatch_code_review(
     payload: dict[str, Any], *, blocking: bool,
     cancel_event: threading.Event | None = None,
@@ -2717,6 +2754,11 @@ def dispatch_code_review(
     # (tier-1, deep, cohorts) carries them without new plumbing.
     repo_docs_context = with_instructions(
         repo_docs_context, changed_paths, repo_config,
+    )
+
+    # Linked-issue acceptance criteria (#904): additive, never blocks.
+    _attach_linked_issue_context(
+        pr_context, installation_id=installation_id, owner=owner, repo_name=repo_name,
     )
 
     # PR context supplies both trace identity and author intent. The prompt
