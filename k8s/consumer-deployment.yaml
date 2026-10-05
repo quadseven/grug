@@ -126,6 +126,9 @@ spec:
             # retention. A second opinion on a short empty answer from the
             # primary; two models agreeing on no findings ends the chain.
             - {name: GRUG_OPENCODE_GO_SECOND_MODEL, value: "longcat-2.5-preview-free"}
+            # Paid fallback right after the free OpenCode Go tiers: keeps Elder on a cheap
+            # model when a free promotion ends. Unset = no tier.
+            - {name: GRUG_OPENCODE_GO_FALLBACK_MODEL, value: "deepseek-v4.1-flash"}
             - {name: GRUG_CLOUD_FREE_TIER_MODEL, value: "nvidia/nemotron-3-super-120b-a12b:free"}
             - {name: GRUG_PROMPT_EXPERIMENT_SSM, value: /grug/elder-prompt-experiment}
             # Tiered Elder (#645): coder arm on every PR; reasoner only on
