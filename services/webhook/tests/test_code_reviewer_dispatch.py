@@ -3417,3 +3417,21 @@ def test_degraded_review_never_resolves_threads(monkeypatch):
         llm=LlmReviewResponse(kind="timeout", findings=()),
     )
     assert calls == []
+
+
+@pytest.mark.parametrize("action", ["review", "reopened"])
+def test_durable_and_reopened_reviews_resolve_fixed_threads(monkeypatch, action):
+    """Production reviews arrive through the durable queue with
+    action="review" (rerun._review_payload), never "synchronize". Gating on
+    synchronize alone meant the resolver never ran live (2026-10-05: two
+    outdated, fixed Elder threads stayed open on a smoke PR)."""
+    calls = []
+    # The durable path re-checks the snapshot before spending tokens; this
+    # harness has no PR endpoint, so treat the snapshot as fresh.
+    monkeypatch.setattr(
+        cr_dispatch, "_review_snapshot_freshness_failure", lambda **kw: None,
+    )
+    _run_with_resolver(
+        monkeypatch, action, lambda *a, **kw: calls.append(1) or 1,
+    )
+    assert calls == [1]

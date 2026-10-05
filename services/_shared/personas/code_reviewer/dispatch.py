@@ -741,12 +741,16 @@ def _tidy_fixed_threads(
 ) -> None:
     """Resolve Elder's own fixed threads after a complete re-review (#1102).
 
-    Only a complete, published `synchronize` review may close threads: a
+    Only a complete, published re-review may close threads: a
     degraded or partial review has no findings because it did not look, and
     its silence must not read as "fixed". Never raises.
     """
+    # Any re-review of a PR that may already carry Elder threads. Production
+    # reviews arrive through the durable queue as action="review"
+    # (rerun._review_payload), so "synchronize" alone never matched live.
+    # Same set the prior-finding dedup uses.
     if (
-        action != "synchronize"
+        action not in {"synchronize", "reopened", "review"}
         or not review_published
         or evaluation.degraded_reason
     ):
