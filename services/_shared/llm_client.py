@@ -259,7 +259,15 @@ _OPENROUTER_MODEL = "anthropic/claude-haiku-4.5"
 # (bare "deepseek-v4.1-flash", no vendor prefix, matching this file's own
 # established practice of never trusting the docs-implied id format).
 _OPENCODE_GO_URL = "https://opencode.ai/zen/go/v1/chat/completions"
-_OPENCODE_GO_DEFAULT_MODEL = "deepseek-v4.1-flash"
+# 2026-10-05: space-bunny-free is free and unlimited on the same OpenCode Go
+# chat endpoint for a limited time (not used for training, 0-day retention),
+# so it takes the primary slot off the paid quota. It is a reasoning model;
+# `_opencode_go_extra_body` runs it at low effort. On real cohorts of a large infrastructure-repo PR,
+# default effort spent all 8192 output tokens reasoning (95-163s, no content);
+# low answered in 3-8s and caught 3/3 planted bugs twice, where DeepSeek
+# answered one cleanly placed bug with a 6-token empty review. When the promo
+# ends, set GRUG_OPENCODE_GO_MODEL=deepseek-v4.1-flash to revert.
+_OPENCODE_GO_DEFAULT_MODEL = "space-bunny-free"
 _OPENCODE_GO_DEFAULT_WIRE = "chat"
 
 # Review-only OpenRouter configuration. Teller, /grug ask, and the judge keep
@@ -680,7 +688,14 @@ def _opencode_go_extra_body(model: str, wire: str) -> dict:
     returned a complete review in 10s on 1.8k output tokens.
     `GRUG_OPENCODE_GO_THINKING=enabled` restores the vendor default.
     """
-    if wire != "chat" or not model.startswith("deepseek"):
+    if wire != "chat":
+        return {}
+    if model.startswith("space-bunny"):
+        # Rejects reasoning_effort none and thinking.disabled (HTTP 400), so
+        # low is the floor. Default effort reasons until max_tokens.
+        effort = os.getenv("GRUG_OPENCODE_GO_REASONING_EFFORT", "low").strip().lower()
+        return {"reasoning_effort": effort or "low"}
+    if not model.startswith("deepseek"):
         return {}
     if os.getenv("GRUG_OPENCODE_GO_THINKING", "disabled").strip().lower() == "enabled":
         return {}
