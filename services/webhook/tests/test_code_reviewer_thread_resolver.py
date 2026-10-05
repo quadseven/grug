@@ -213,3 +213,46 @@ def test_a_thread_already_answered_fixed_is_resolved_without_a_second_reply(run)
     assert run(gh) == 1
     assert gh.replies == []
     assert gh.resolved == ["T1"]
+
+
+class _GhForbiddenResolve(_Gh):
+    """GitHub's live answer for an app without permission to resolve:
+    `FORBIDDEN: Resource not accessible by integration` (2026-10-05)."""
+
+    def __init__(self, threads):
+        super().__init__(threads)
+        self.minimized: list[str] = []
+
+    def post(self, url, json=None, headers=None, timeout=None):
+        q, v = json["query"], json["variables"]
+        if "resolveReviewThread" in q:
+            return _Resp({"errors": [{"type": "FORBIDDEN",
+                                      "message": "Resource not accessible by integration"}]})
+        if "minimizeComment" in q:
+            self.minimized.append(v["subject"])
+            return _Resp({"data": {"minimizeComment": {"minimizedComment": {
+                "isMinimized": True, "minimizedReason": "outdated"}}}})
+        return super().post(url, json=json, headers=headers, timeout=timeout)
+
+
+def _with_node_id(thread, node_id="C1", minimized=False):
+    thread["comments"]["nodes"][0]["id"] = node_id
+    thread["comments"]["nodes"][0]["isMinimized"] = minimized
+    return thread
+
+
+def test_forbidden_resolve_falls_back_to_collapsing_the_comment(run):
+    """The app cannot resolve threads without broader permission, but it can
+    collapse its own comment as outdated. That is the fallback."""
+    gh = _GhForbiddenResolve([_with_node_id(_thread())])
+    assert run(gh) == 1
+    assert len(gh.replies) == 1
+    assert gh.resolved == []
+    assert gh.minimized == ["C1"]
+
+
+def test_an_already_collapsed_comment_is_left_alone(run):
+    """Once collapsed, later pushes must not reply or collapse again."""
+    gh = _GhForbiddenResolve([_with_node_id(_thread(), minimized=True)])
+    assert run(gh) == 0
+    assert gh.replies == [] and gh.minimized == []
