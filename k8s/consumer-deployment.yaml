@@ -66,6 +66,20 @@ spec:
           labelSelector:
             matchLabels: {app: grug-consumer}
       affinity:
+        # PREFER the OCI zones. The lan zone's arm64 nodes are the 8GB home
+        # mac-mini and mac-air, which also carry Homey and Scrypted on
+        # local-path volumes; a grug replica there pushed mac-mini past 90%
+        # of allocatable memory (2026-10-05) while oci-ord sat at 17%. Two
+        # OCI zones still give the zone spread above; soft, so a lan node
+        # still takes the pod when both OCI nodes are down.
+        nodeAffinity:
+          preferredDuringSchedulingIgnoredDuringExecution:
+            - weight: 100
+              preference:
+                matchExpressions:
+                  - key: topology.kubernetes.io/zone
+                    operator: In
+                    values: [oci-iad, oci-ord]
         podAntiAffinity:
           preferredDuringSchedulingIgnoredDuringExecution:
             - weight: 100
