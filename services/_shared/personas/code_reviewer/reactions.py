@@ -41,6 +41,7 @@ import httpx
 
 from adapters.install_store import CommentRecord, update_comment_record_reaction
 from llm_client import ReactionVerdict, submit_reaction_annotation
+from personas.code_reviewer.model_metrics import emit_verdict, origin_dims
 
 log = logging.getLogger(f"{os.getenv('DD_SERVICE', 'grug')}.persona.code_reviewer.reactions")
 
@@ -168,18 +169,11 @@ def _reaction_reviewers(record: CommentRecord) -> list[str]:
     to `grug-elder/<backend>` when a model has no name, and to the single legacy
     `grug-elder` when the finding carries no producer provenance. Order-stable
     and deduped so re-polls overwrite the same rows."""
-    seen: dict[str, None] = {}
-    for origin in record.get("finding_origins", []) or []:
-        model = origin.get("model")
-        backend = origin.get("backend")
-        label = None
-        if isinstance(model, str) and model:
-            label = f"grug-elder/{model}"
-        elif isinstance(backend, str) and backend:
-            label = f"grug-elder/{backend}"
-        if label is not None:
-            seen.setdefault(label, None)
-    return list(seen) or ["grug-elder"]
+    # origin_dims keys producers by (backend, model); the ledger key is the
+    # label alone, so dedupe again here or one verdict is written twice.
+    return list(dict.fromkeys(
+        label for label, _b, _m in origin_dims(record.get("finding_origins"))
+    ))
 
 
 def _record_reaction_learning(
@@ -237,6 +231,9 @@ def _record_reaction_learning(
         for raw in list_ledger_rows(record["repo"])
         if (parsed := parse_row(raw)) is not None
     ]
+    emit_verdict(
+        record.get("finding_origins"), verdict == "confirmed", parsed_rows,
+    )
     put_repo_practices(
         record["repo"], practices_to_dicts(derive_practices(parsed_rows)),
     )

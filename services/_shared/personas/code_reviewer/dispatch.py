@@ -71,6 +71,7 @@ from personas.code_reviewer.claim_check import (
     filter_novel_claim_findings,
     scan_claim_checks,
 )
+from personas.code_reviewer.model_metrics import emit_finding_posted
 from personas import board
 from personas.code_reviewer.complexity import ComplexityScan, scan_complexity_full
 from personas.code_reviewer.lint import scan_ruff
@@ -2098,6 +2099,7 @@ def _capture_comment_records(
                 trust_reactors=True,
             )
             persisted += 1
+            emit_finding_posted(finding_origins)
         except Exception as e:  # noqa: BLE001 — per-comment: one DDB blip
             # (throttle) must not drop the rest of the batch.
             log.warning(
