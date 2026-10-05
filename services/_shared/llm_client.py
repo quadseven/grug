@@ -760,6 +760,35 @@ _CLOUD_CHAIN_TIMEOUT_SECONDS = 25.0
 _CLOUD_CHAIN_MAX_TOKENS = 8192
 
 
+def _opencode_go_second_chain_config() -> "BackendConfig | None":
+    """A second OpenCode Go model as tier 2, or None when unset.
+
+    `GRUG_OPENCODE_GO_SECOND_MODEL` names it (production: the free,
+    unlimited `longcat-2.5-preview-free`, 0-day retention). It is a
+    different model on the same chat endpoint, so a short empty answer from
+    the primary gets a real second opinion before the chain walks on to
+    slower tiers. Measured 2026-10-05: 6/6 planted bugs caught, honest
+    `{"findings": []}` on a clean diff in about 70 tokens, 7-16s; it did
+    rate-limit (429) and time out on one 33k-token chunk, so it is a second
+    opinion, not the primary."""
+    model = os.getenv("GRUG_OPENCODE_GO_SECOND_MODEL", "").strip()
+    if not model:
+        return None
+    return replace(
+        _BACKEND_CONFIGS[Backend.OPENCODE_GO],
+        url=_OPENCODE_GO_URL,
+        model=model,
+        wire="chat",
+        extra_body={
+            **_opencode_go_extra_body(model, "chat"),
+            "max_tokens": _CLOUD_CHAIN_MAX_TOKENS,
+        },
+        timeout_seconds=_CLOUD_CHAIN_TIMEOUT_SECONDS,
+        retry_attempts=1,
+        transport_retry_attempts=1,
+    )
+
+
 def _opencode_go_chain_config() -> BackendConfig:
     """opencode Go as the FIRST cloud chain tier (grug#910)."""
     return replace(
@@ -790,6 +819,13 @@ class OpencodeGoCircuitOpenError(httpx.RequestError):
     """OpenCode Go is skipped: its usage-limit breaker is open. Subclasses
     `httpx.RequestError` so every caller degrades exactly as it does for a
     transport failure."""
+
+
+def _opencode_go_model_is_free(model: str) -> bool:
+    """OpenCode Go's free models (`space-bunny-free`,
+    `longcat-2.5-preview-free`) never count against the paid quota the
+    usage-limit breaker protects, so the breaker must not gate them."""
+    return model.endswith("-free")
 
 
 def _opencode_go_available(now: float | None = None) -> bool:
@@ -900,8 +936,11 @@ def _cloud_chain_tiers() -> list[BackendConfig]:
     grug#910 as unfunded; it answers again (2026-09-26) and has the best eval
     record of the cloud models grug can reach (see `_poolside_chain_config`)."""
     tiers: list[BackendConfig] = []
-    if _opencode_go_available():
+    if _opencode_go_available() or _opencode_go_model_is_free(_OPENCODE_GO_MODEL):
         tiers.append(_opencode_go_chain_config())
+    second = _opencode_go_second_chain_config()
+    if second is not None:
+        tiers.append(second)
     free_tier = _free_tier_chain_config()
     if free_tier is not None:
         tiers.append(free_tier)
@@ -1815,7 +1854,11 @@ def _call_backend(
     is the entire cost this gate adds to their calls."""
     if cancel_event is not None and cancel_event.is_set():
         raise httpx.RequestError("cancelled before dispatch")
-    if config.backend == Backend.OPENCODE_GO and not _opencode_go_available():
+    if (
+        config.backend == Backend.OPENCODE_GO
+        and not _opencode_go_model_is_free(config.model)
+        and not _opencode_go_available()
+    ):
         raise OpencodeGoCircuitOpenError("opencode Go usage limit: breaker open")
     if config.backend == Backend.OPENROUTER and is_free_tier_model(config.model):
         outcome = acquire_free_tier_slot(config.model, cancel_event=cancel_event)
@@ -4707,6 +4750,32 @@ def _cloud_tier_success(
     )
 
 
+def _empty_answers_agree(
+    first_empty: "tuple[Backend, str] | None",
+    current: "tuple[Backend, str]",
+    pr_context: "Optional[PrContext]",
+) -> bool:
+    """True when a second, DIFFERENT model also gave a short empty answer.
+
+    One short empty answer can be a skim; two independent models agreeing is
+    a clean review. Walking on burned the staged budget and starved later
+    cohorts (2026-10-05). The same model twice is not agreement."""
+    if first_empty is None or first_empty == current:
+        return False
+    log.info(
+        "llm_cloud_empty_consensus",
+        extra={
+            "first_backend": first_empty[0].value,
+            "first_model": first_empty[1],
+            "second_backend": current[0].value,
+            "second_model": current[1],
+            "repo": (pr_context or {}).get("repo"),
+            "pr_number": (pr_context or {}).get("pr_number"),
+        },
+    )
+    return True
+
+
 def _try_cloud_primary(
     hunks: list[Hunk],
     messages: list[dict[str, str]],
@@ -4735,6 +4804,9 @@ def _try_cloud_primary(
     as-is rather than masked by a Cave retry that would silently double
     the cost of an already-answered review."""
     first_parse_fail: tuple[Backend, str | None, str] | None = None
+    # The first model whose answer was a short empty review. A second,
+    # DIFFERENT model answering empty too is agreement, and ends the chain.
+    first_empty: tuple[Backend, str] | None = None
     last_error = ""
     for tier in _cloud_chain_tiers():
         backend = tier.backend
@@ -4743,12 +4815,19 @@ def _try_cloud_primary(
         )
         if outcome.kind == "success" and outcome.degenerate:
             last_error = f"{backend.value}: degenerate empty review"
+            key = (backend, tier.model)
+            if _empty_answers_agree(first_empty, key, pr_context):
+                return _cloud_tier_success(outcome, hunks, pr_context)
+            first_empty = first_empty or key
             continue
         if outcome.kind == "success":
             return _cloud_tier_success(outcome, hunks, pr_context)
         if outcome.kind == "parse_failed":
             last_error = outcome.error_text
-            if backend != Backend.OPENCODE_GO:
+            is_primary = (
+                backend == Backend.OPENCODE_GO and tier.model == _OPENCODE_GO_MODEL
+            )
+            if not is_primary:
                 # grug#1025: a garbled answer from a fallback tier used to
                 # become the review's answer and block the Cave. That held
                 # for the `:free` tier, and again for Poolside: after it
