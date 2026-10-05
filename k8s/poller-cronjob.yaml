@@ -83,6 +83,7 @@ spec:
                 - {name: GRUG_REVIEW_BACKEND_PRIORITY, value: cloud}
                 - {name: GRUG_OPENCODE_GO_API_KEY_SSM, value: /infra/llm/opencode_go_api_key}
                 - {name: GRUG_OPENCODE_GO_SECOND_MODEL, value: "longcat-2.5-preview-free"}
+                - {name: GRUG_OPENCODE_GO_FALLBACK_MODEL, value: "deepseek-v4.1-flash"}
                 - {name: GRUG_CLOUD_FREE_TIER_MODEL, value: "nvidia/nemotron-3-super-120b-a12b:free"}
                 - {name: GRUG_OPENROUTER_REVIEW_MODEL, value: "nvidia/nemotron-3-super-120b-a12b:free"}
                 - {name: GRUG_REVIEW_DEPTH, value: tiered}
