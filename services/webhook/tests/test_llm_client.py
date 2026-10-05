@@ -4910,7 +4910,7 @@ def test_second_opencode_go_model_is_tier_two_when_configured(monkeypatch) -> No
     assert tiers[1].url == lc._OPENCODE_GO_URL
     # Its own body: never the primary's reasoning_effort, always the cap.
     assert tiers[1].extra_body == {"max_tokens": lc._CLOUD_CHAIN_MAX_TOKENS}
-    assert tiers[1].timeout_seconds == lc._CLOUD_CHAIN_TIMEOUT_SECONDS
+    assert tiers[1].timeout_seconds == lc._POOLSIDE_CHAIN_TIMEOUT_SECONDS
 
 
 def test_two_models_agreeing_on_no_findings_is_a_clean_review(monkeypatch, caplog) -> None:
@@ -5011,3 +5011,40 @@ def test_usage_limit_breaker_never_blocks_the_free_models(monkeypatch) -> None:
     paid = lc.replace(lc._opencode_go_chain_config(), model="deepseek-v4.1-flash", key_loader=lambda: "k")
     with pytest.raises(lc.OpencodeGoCircuitOpenError):
         lc._call_backend(paid, [{"role": "user", "content": "hi"}])
+
+
+def test_the_free_openrouter_model_cannot_confirm_an_empty_answer(monkeypatch) -> None:
+    """Seen live 2026-10-05 on an infrastructure-repo PR: Space Bunny answered empty,
+    Longcat timed out, and the OpenRouter `:free` nemotron - which answers
+    `{"findings": []}` in 7 tokens almost every time, the very model the
+    degenerate rule was written for - cast the deciding vote. It must not
+    count as agreement; the chain walks on to Poolside."""
+    monkeypatch.setenv("GRUG_REVIEW_BACKEND_PRIORITY", "cloud")
+    monkeypatch.setenv("GRUG_OPENCODE_GO_SECOND_MODEL", "longcat-2.5-preview-free")
+    monkeypatch.setenv("GRUG_CLOUD_FREE_TIER_MODEL", "z-ai/glm-5.2:free")
+    _admit_free_tier(monkeypatch)
+    real = _usage_response(
+        '{"findings": [{"path": "src/x.py", "line": 1, "rule": "r", '
+        '"severity": "medium", "message": "m"}]}', 15_000, 400,
+    )
+    with patch.object(
+        httpx, "post",
+        side_effect=[
+            _degenerate_response(),
+            httpx.ReadTimeout("longcat slow"),
+            _degenerate_response(),
+            real,
+        ],
+    ) as post:
+        out = review_diff([_hunk()], installation_id=1)
+
+    assert out.backend_used == Backend.POOLSIDE
+    assert len(out.findings) == 1
+    assert post.call_count == 4
+
+
+def test_second_model_gets_the_longer_fallback_timeout(monkeypatch) -> None:
+    """Longcat answered in 7-16s in probes but hit the 25s chain timeout
+    live under load; it gets the same 45s as Poolside."""
+    monkeypatch.setenv("GRUG_OPENCODE_GO_SECOND_MODEL", "longcat-2.5-preview-free")
+    assert lc._opencode_go_second_chain_config().timeout_seconds == lc._POOLSIDE_CHAIN_TIMEOUT_SECONDS
