@@ -116,10 +116,16 @@ def test_block_empty_when_no_criteria():
 def test_block_bounds_count_length_and_total():
     huge = [("open", "x" * 5000) for _ in range(100)]
     block = render_linked_issue_block({1: huge, 2: huge, 3: huge})
-    assert len(block) <= linked_issue.MAX_BLOCK_CHARS + 200
+    assert len(block) <= linked_issue.MAX_BLOCK_CHARS
     assert "x" * (linked_issue.MAX_CRITERION_CHARS + 1) not in block
     assert len(re.findall(r"criterion \d+ \[", block)) <= 3 * linked_issue.MAX_CRITERIA_PER_ISSUE
     assert "omitted" in block
+
+
+@pytest.mark.parametrize("n", range(60, 140, 7))
+def test_block_never_exceeds_cap_at_any_line_length(n):
+    block = render_linked_issue_block({1: [("open", "y" * n)] * 15, 2: [("open", "z" * n)] * 15})
+    assert len(block) <= linked_issue.MAX_BLOCK_CHARS
 
 
 def test_block_sanitizes_mentions_fences_headings_and_control_chars():

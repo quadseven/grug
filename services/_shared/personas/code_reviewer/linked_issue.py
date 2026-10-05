@@ -120,6 +120,9 @@ _HEADER = (
 )
 
 
+_OMITTED = "\n... (further criteria omitted)"
+
+
 def render_linked_issue_block(criteria_by_issue: dict[int, list[Criterion]]) -> str:
     """Render the bounded, sanitized block; empty string when nothing to say."""
     lines: list[str] = []
@@ -133,10 +136,13 @@ def render_linked_issue_block(criteria_by_issue: dict[int, list[Criterion]]) -> 
             )
     if not lines:
         return ""
+    # Every line (the omission marker included) must fit under the cap, so the
+    # marker is only appended when it fits, and a line that would leave no
+    # room for it ends the block instead.
     body = ""
     for line in lines:
-        if len(_HEADER) + len(body) + len(line) + 1 > MAX_BLOCK_CHARS:
-            body += "\n... (further criteria omitted)"
+        if len(_HEADER) + len(body) + len(line) + 1 + len(_OMITTED) > MAX_BLOCK_CHARS:
+            body += _OMITTED
             break
         body += "\n" + line
     return _HEADER + body

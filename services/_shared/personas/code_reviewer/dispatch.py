@@ -2316,6 +2316,32 @@ def _repo_complexity_caps(
         return None, None
 
 
+def _attach_linked_issue_context(
+    pr_context: PrContext, *, installation_id: int, owner: str, repo_name: str,
+) -> None:
+    """Put the linked-issue criteria block on `pr_context` (#904) so every
+    cohort and the deep pass see it. Any failure leaves `pr_context`
+    untouched = today's review."""
+    try:
+        linked = build_linked_issue_context(
+            str(pr_context.get("body") or ""),
+            fetch_issue=build_issue_fetcher(
+                installation_id=installation_id, owner=owner, repo=repo_name,
+            ),
+        )
+        if linked:
+            pr_context["linked_issue_context"] = linked
+    except Exception as e:  # noqa: BLE001 - additive; never break the review
+        log.info(
+            "linked_issue_context_degraded",
+            extra={
+                "stage": "dispatch",
+                "pr": f"{owner}/{repo_name}#{pr_context.get('pr_number')}",
+                "kind": type(e).__name__,
+            },
+        )
+
+
 def dispatch_code_review(
     payload: dict[str, Any], *, blocking: bool,
     cancel_event: threading.Event | None = None,
@@ -2730,26 +2756,10 @@ def dispatch_code_review(
         repo_docs_context, changed_paths, repo_config,
     )
 
-    # Linked-issue acceptance criteria (#904): additive, never blocks. Rides
-    # `pr_context` so every cohort and the deep pass see it.
-    try:
-        linked = build_linked_issue_context(
-            str(pr_context.get("body") or ""),
-            fetch_issue=build_issue_fetcher(
-                installation_id=installation_id, owner=owner, repo=repo_name,
-            ),
-        )
-        if linked:
-            pr_context["linked_issue_context"] = linked
-    except Exception as e:  # noqa: BLE001 - additive; never break the review
-        log.info(
-            "linked_issue_context_degraded",
-            extra={
-                "stage": "dispatch",
-                "pr": f"{owner}/{repo_name}#{pull_number}",
-                "kind": type(e).__name__,
-            },
-        )
+    # Linked-issue acceptance criteria (#904): additive, never blocks.
+    _attach_linked_issue_context(
+        pr_context, installation_id=installation_id, owner=owner, repo_name=repo_name,
+    )
 
     # PR context supplies both trace identity and author intent. The prompt
     # treats title/body as untrusted repository data before sending it.

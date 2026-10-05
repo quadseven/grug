@@ -1518,6 +1518,12 @@ def _render_pr_intent(pr_context: Optional[PrContext]) -> str:
     )
 
 
+def _linked_issue_parts(pr_context: Optional[PrContext]) -> list[str]:
+    """The linked-issue criteria block (#904) as 0 or 1 prompt parts."""
+    block = (pr_context or {}).get("linked_issue_context")
+    return [block] if block else []
+
+
 def _build_review_parts(
     hunks: list[Hunk],
     file_contents: dict[str, str] | None = None,
@@ -1588,9 +1594,7 @@ def _build_review_parts(
         parts.append(f"### REPO DOCS\n{repo_docs_context}")
     # Linked-issue criteria (#904): already a labelled `###` block, sanitized
     # by `linked_issue.render_linked_issue_block`. Absent/empty => unchanged.
-    linked_issue_context = (pr_context or {}).get("linked_issue_context")
-    if linked_issue_context:
-        parts.append(linked_issue_context)
+    parts.extend(_linked_issue_parts(pr_context))
     return parts, bool(intent)
 
 
