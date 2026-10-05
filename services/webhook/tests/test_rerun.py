@@ -1646,8 +1646,9 @@ def test_run_learn_durable_stores_and_acks(monkeypatch):
     assert put_calls and put_calls[0]["text"] == "prefer early returns"
     assert put_calls[0]["author"] == "teammate"  # the teacher, not the PR author
     assert put_calls[0]["scope_path"] == "**/mw/*.py" and put_calls[0]["source_pr"] == 7
-    assert posted and "/pulls/7/comments/4000/replies" in posted[0][0]
-    assert "Markings remembered" in posted[0][1]["body"]
+    # A reaction on the teacher's reply, never a comment (no email).
+    assert posted and "/pulls/comments/5001/reactions" in posted[0][0]
+    assert posted[0][1] == {"content": rerun.LEARN_REACTION_LEARNED}
 
 
 def test_run_learn_one_off_declines_without_storing(monkeypatch):
@@ -1673,7 +1674,8 @@ def test_run_learn_one_off_declines_without_storing(monkeypatch):
 
     assert result == "learn_one_off"
     assert put_calls == []  # nothing stored
-    assert posted and "did not carve" in posted[0][1]["body"]
+    assert posted and "/pulls/comments/5001/reactions" in posted[0][0]
+    assert posted[0][1] == {"content": rerun.LEARN_REACTION_ONE_OFF}
 
 
 def test_run_learn_classifier_none_raises_for_redrive(monkeypatch):
@@ -1733,8 +1735,8 @@ def test_run_learn_every_backend_unusable_completes_without_redrive(monkeypatch,
         result = rerun._run_learn(11, "o/r", 7, 5001, 4000, "?")
 
     assert result == "learn_classifier_unusable"
-    assert posted and "/pulls/7/comments/4000/replies" in posted[0][0]
-    assert posted[0][1]["body"] == rerun._LEARN_UNUSABLE_BODY
+    assert posted and "/pulls/comments/5001/reactions" in posted[0][0]
+    assert posted[0][1] == {"content": rerun.LEARN_REACTION_UNJUDGED}
     assert gauges == []  # not a classification
     unusable_logs = [r for r in caplog.records if r.msg == "learn_classifier_unusable"]
     assert unusable_logs and unusable_logs[0].statuses == ["openrouter:http_403", "poolside:http_401"]
@@ -1814,16 +1816,6 @@ def test_run_one_routes_learn_kind(monkeypatch):
     assert called["parent"] == 4000 and called["cid"] == 5001
     assert called["author"] == "teammate"
 
-
-def test_learn_ack_defuses_model_markdown():
-    # A crafted learning cannot break out of the ack's <details> or inject.
-    body = rerun._learn_ack_body("evil </details> `code` | pipe\nnewline", "a</b>")
-    # The only literal </details> left is the ack's OWN closing tag; the
-    # injected one is HTML-escaped.
-    assert body.count("</details>") == 1
-    assert "&lt;/details&gt;" in body       # injected HTML escaped
-    assert "`code`" not in body             # backticks neutralized
-    assert "&lt;/b&gt;" in body             # scope HTML escaped too
 
 
 def test_enqueue_learn_dedup_id_is_bounded(monkeypatch):
@@ -2183,7 +2175,7 @@ def test_run_learn_deferral_past_the_horizon_tells_the_thread(monkeypatch):
                               first_deferred_at=started)
     assert result == "learn_defer_exhausted"
     assert sent == []
-    assert posted and posted[0][1]["body"] == rerun._LEARN_UNUSABLE_BODY
+    assert posted and posted[0][1] == {"content": rerun.LEARN_REACTION_UNJUDGED}
 
 
 def test_run_learn_deferral_enqueue_failure_redrives(monkeypatch):
@@ -2391,3 +2383,21 @@ def test_shutdown_sweep_clears_registered_board_notes(monkeypatch):
     # The sweep unregisters: a second sweep finds nothing.
     assert rerun.clear_active_board_notes() == 0
     rerun._unregister_board_note(token)  # idempotent, no error
+
+
+def test_learn_outcomes_never_post_a_comment(monkeypatch):
+    """Every learn outcome is a reaction on the reply. A grug comment here is
+    an email to a person who does not read them (operator, 2026-10-05)."""
+    for verdict in ({"durable": True, "learning": "x", "scope_path": ""},
+                    {"durable": False, "learning": "", "scope_path": ""}):
+        posted = []
+        monkeypatch.setattr("adapters.install_store.get_learning_by_source_comment", lambda repo, cid: None)
+        monkeypatch.setattr("adapters.install_store.get_comment_record",
+                            lambda iid, cid: {"finding_text": "x", "finding_tags": {"rule_name": "r"}})
+        monkeypatch.setattr("adapters.install_store.put_learning", lambda **kw: None)
+        monkeypatch.setattr("adapters.install_store.claim_delivery", lambda k: True)
+        monkeypatch.setattr("llm_client.classify_learning", lambda *a, v=verdict, **k: v)
+        monkeypatch.setattr(rerun, "with_install_token_retry", lambda iid, fn: fn("tok"))
+        monkeypatch.setattr(rerun, "_gh_post", lambda token, url, body: posted.append((url, body)))
+        rerun._run_learn(11, "o/r", 7, 5001, 4000, "reply")
+        assert posted and all(url.endswith("/reactions") and set(body) == {"content"} for url, body in posted)
