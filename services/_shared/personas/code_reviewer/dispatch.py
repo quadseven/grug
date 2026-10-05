@@ -89,6 +89,7 @@ from personas.code_reviewer.persona import (
     with_extra_findings, with_findings,
 )
 from personas.code_reviewer.snapshot import review_freshness_id_from_pr
+from personas.code_reviewer.thread_resolver import resolve_fixed_threads
 from personas.code_reviewer.verify import verify_findings
 from personas.tribe import CHECK_ELDER
 from adapters.install_store import (  # type: ignore
@@ -653,6 +654,38 @@ def _fetch_pr_review_comments(
                    "max_pages": _MAX_COMMENT_PAGES},
         )
     return out
+
+
+def _tidy_fixed_threads(
+    *, action: str, review_published: bool, evaluation: CodeReviewEvaluation,
+    installation_id: int, owner: str, repo_name: str, pull_number: int,
+    head_sha: str,
+) -> None:
+    """Resolve Elder's own fixed threads after a complete re-review (#1102).
+
+    Only a complete, published `synchronize` review may close threads: a
+    degraded or partial review has no findings because it did not look, and
+    its silence must not read as "fixed". Never raises.
+    """
+    if (
+        action != "synchronize"
+        or not review_published
+        or evaluation.degraded_reason
+    ):
+        return
+    try:
+        resolve_fixed_threads(
+            installation_id, owner, repo_name, pull_number,
+            head_sha=head_sha, findings=evaluation.findings,
+        )
+    except Exception as e:  # noqa: BLE001 - tidying never fails a review
+        log.warning(
+            "elder_thread_resolve_crashed",
+            extra={
+                "pr": f"{owner}/{repo_name}#{pull_number}",
+                "kind": type(e).__name__,
+            },
+        )
 
 
 def _prior_finding_keys(
@@ -3110,6 +3143,17 @@ def dispatch_code_review(
                 "kind": type(e).__name__,
             },
         )
+
+    # Close Elder's own threads the push fixed and this review does not
+    # re-raise (#1102). After the deep append so a deep-only re-raise has
+    # already posted its fresh thread.
+    _tidy_fixed_threads(
+        action=action,
+        review_published=not (review_publish_failed or review_publish_rejected),
+        evaluation=evaluation,
+        installation_id=installation_id, owner=owner, repo_name=repo_name,
+        pull_number=pull_number, head_sha=head_sha,
+    )
 
     # LLM-as-a-judge DD evals (#190) submit AFTER the review + check-run are
     # POSTed, so recording can't delay the developer seeing the review. The
