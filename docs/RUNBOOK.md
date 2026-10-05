@@ -152,6 +152,47 @@ grug#947) dispatches missing checks via grug's own outbound GitHub API
 calls, independent of inbound delivery — enabling it per-repo is a
 mitigation for this exact failure class, not a fix for the block itself.
 
+### Check-run publish failing
+
+`[grug] Check-run publish failing - PRs are MERGE-BLOCKED (15min)` pages when
+more than 2 check-run publishes fail in 15 minutes, from any persona. The
+log events counted are listed in `CHECK_RUN_PUBLISH_FAILED_EVENTS`
+(`infra/pulumi/components/dd_monitors.py`): `tpm_publish_failed` (Chief),
+`guard_check_run_publish_failed`, `code_review_check_run_publish_failed`
+(Elder) and their degraded and sibling variants.
+
+**Why a separate monitor:** on 2026-10-05, from 15:30 to 16:05 UTC, Chief and
+Guard got 403s publishing check runs and every PR was merge-blocked. The
+GitHub API error-rate monitor averages all calls, and Elder's successful calls
+diluted it below the threshold. This one counts failures, so a healthy persona
+cannot hide a broken one.
+
+Triage:
+
+1. Search logs for the event names above. The `status_code` and `error` fields
+   say why; the event name says which persona.
+2. `403`: the GitHub App lost a permission, a permission change is waiting for
+   approval on the installation, or the installation was suspended or removed.
+   Check the App's permissions and recent installation events in GitHub.
+   `401`: the App key or installation token path (see Secret rotation).
+   `5xx`: GitHub is degraded; it self-clears.
+3. After the cause is fixed, re-run the affected PRs' checks (the
+   `grug-poller` replay or a push) so the missing required checks land.
+
+### Elder review failure rate
+
+`[grug-elder] Reviews failing to parse or partial (>25% over 2h)` (digest tier)
+fires when more than 25% of `code_reviewer_dispatched` logs in 2 hours carry
+`degraded_reason` of `parse_failed` or `partial_review`. The denominator is
+floored at 10 reviews, so it takes at least 3 failures and a quiet stretch
+cannot trip it.
+
+Group the failing `code_reviewer_dispatched` logs by `backend` and `model`.
+One model concentrating the failures points at that model (or a benched
+model leaving a weaker one in the chain: search `llm_model_benched`); failures
+across every model right after a deploy point at a prompt or parser
+regression.
+
 ## Missed-delivery replay (#407)
 
 The DoR/TPM check runs inline on the webhook. GitHub does not automatically
