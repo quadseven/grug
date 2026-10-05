@@ -169,10 +169,11 @@ def _reaction_reviewers(record: CommentRecord) -> list[str]:
     to `grug-elder/<backend>` when a model has no name, and to the single legacy
     `grug-elder` when the finding carries no producer provenance. Order-stable
     and deduped so re-polls overwrite the same rows."""
-    return [
-        label for label, _b, _m in
-        origin_dims(record.get("finding_origins"))
-    ]
+    # origin_dims keys producers by (backend, model); the ledger key is the
+    # label alone, so dedupe again here or one verdict is written twice.
+    return list(dict.fromkeys(
+        label for label, _b, _m in origin_dims(record.get("finding_origins"))
+    ))
 
 
 def _record_reaction_learning(

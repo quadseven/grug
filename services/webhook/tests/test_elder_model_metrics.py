@@ -143,3 +143,17 @@ def test_same_model_name_on_two_backends_stays_two_producers():
         {"backend": "cave", "model": "m1"},
     ])
     assert [(b, m) for _l, b, m in dims] == [("cave", "m1"), ("openrouter", "m1")]
+
+
+def test_reaction_reviewer_labels_stay_deduped_across_backends():
+    """The same model served by two backends is two producers for telemetry
+    but ONE ledger label; writing that label twice would count one human
+    verdict twice in the precision corpus."""
+    from personas.code_reviewer.reactions import _reaction_reviewers
+
+    record = {"finding_origins": [
+        {"backend": "opencode-go", "model": "m"},
+        {"backend": "openrouter", "model": "m"},
+        {"backend": "cave", "model": "other"},
+    ]}
+    assert _reaction_reviewers(record) == ["grug-elder/m", "grug-elder/other"]
