@@ -3349,3 +3349,71 @@ def test_only_the_size_limit_406_is_terminal(monkeypatch, error):
 
     assert result["degraded_reason"] == "fetch_or_parse_failed"
     assert recorded["degraded_reason"] == "fetch_or_parse_failed"
+
+
+# --- #1102: resolve Elder's own fixed threads after a synchronize review ---
+
+def _run_with_resolver(monkeypatch, action, resolver, *, llm=None):
+    llm = llm or LlmReviewResponse(
+        kind="reviewed",
+        findings=(LlmFinding(
+            path="src/x.py", line=2, rule="silent-failure",
+            severity="medium", message="m",  # type: ignore[arg-type]
+        ),),
+        backend_used=Backend.POOLSIDE,
+    )
+    monkeypatch.setattr(cr_dispatch, "review_diff", lambda *a, **kw: llm)
+    monkeypatch.setattr(cr_dispatch, "post_check_run", lambda *a, **kw: {})
+    monkeypatch.setattr(cr_dispatch, "post_review", lambda *a, **kw: {})
+    monkeypatch.setattr(cr_dispatch, "resolve_fixed_threads", resolver)
+
+    def get(url, **kw):
+        if "/comments" in url:
+            r = MagicMock(spec=httpx.Response)
+            r.status_code = 200
+            r.raise_for_status = MagicMock()
+            r.json = MagicMock(return_value=[])
+            return r
+        return _diff_response()
+
+    with patch("httpx.get", side_effect=get):
+        return cr_dispatch.dispatch_code_review(
+            _payload(action=action), blocking=False,
+        )
+
+
+def test_synchronize_review_resolves_fixed_threads_with_review_findings(monkeypatch):
+    calls = []
+    out = _run_with_resolver(
+        monkeypatch, "synchronize",
+        lambda *a, **kw: calls.append((a, kw)) or 1,
+    )
+    assert len(calls) == 1
+    _, kw = calls[0]
+    assert [f.rule_name for f in kw["findings"]] == ["silent-failure"]
+    assert kw["head_sha"]
+    assert out["result"] == "pass"
+
+
+def test_first_review_does_not_try_to_resolve_threads(monkeypatch):
+    calls = []
+    _run_with_resolver(
+        monkeypatch, "opened", lambda *a, **kw: calls.append(1) or 0,
+    )
+    assert calls == []
+
+
+def test_resolver_crash_never_fails_the_review(monkeypatch):
+    def boom(*a, **kw):
+        raise RuntimeError("x")
+    out = _run_with_resolver(monkeypatch, "synchronize", boom)
+    assert out["result"] == "pass"
+
+
+def test_degraded_review_never_resolves_threads(monkeypatch):
+    calls = []
+    _run_with_resolver(
+        monkeypatch, "synchronize", lambda *a, **kw: calls.append(1) or 0,
+        llm=LlmReviewResponse(kind="timeout", findings=()),
+    )
+    assert calls == []
