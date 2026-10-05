@@ -269,7 +269,8 @@ def _emit_github_api_result(ok: bool) -> None:
 def with_install_token_retry(installation_id: int, fn):
     """Run `fn(token)`, retrying transient failures.
 
-    On httpx 401, invalidate the cached token and retry once - GitHub
+    On httpx 401, or a 403 that is not a rate limit, invalidate the cached
+    token and retry once - GitHub
     revokes tokens out-of-band on App reinstall, perm change, or secret
     rotation, and the long-lived process would otherwise reuse the bad
     cached token until the 55-min TTL elapsed (Codex post-review #50).
@@ -299,7 +300,17 @@ def with_install_token_retry(installation_id: int, fn):
             raise
         except httpx.HTTPStatusError as e:
             status = e.response.status_code
-            if status == 401 and not refreshed_401:
+            # A stale cached token answers 401, and also 403 "Resource not
+            # accessible by integration" after an App permission change:
+            # live 2026-10-05, every check-run POST from the webhook pods
+            # 403'd for 35 minutes while a fresh token for the same
+            # installation posted fine. One retry on a freshly minted token
+            # covers both; a genuine denial fails again and raises.
+            if (
+                status in (401, 403)
+                and not refreshed_401
+                and not _is_retryable_github_error(e.response)
+            ):
                 refreshed_401 = True
                 token = get_install_token(installation_id, force_refresh=True)
                 continue
