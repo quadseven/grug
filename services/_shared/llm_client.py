@@ -783,7 +783,9 @@ def _opencode_go_second_chain_config() -> "BackendConfig | None":
             **_opencode_go_extra_body(model, "chat"),
             "max_tokens": _CLOUD_CHAIN_MAX_TOKENS,
         },
-        timeout_seconds=_CLOUD_CHAIN_TIMEOUT_SECONDS,
+        # 45s like Poolside: 7-16s in probes, but it hit the 25s chain
+        # timeout live under load on 2026-10-05.
+        timeout_seconds=_POOLSIDE_CHAIN_TIMEOUT_SECONDS,
         retry_attempts=1,
         transport_retry_attempts=1,
     )
@@ -4761,6 +4763,11 @@ def _empty_answers_agree(
     a clean review. Walking on burned the staged budget and starved later
     cohorts (2026-10-05). The same model twice is not agreement."""
     if first_empty is None or first_empty == current:
+        return False
+    if current[0] == Backend.OPENROUTER and is_free_tier_model(current[1]):
+        # The `:free` model answers empty in about 7 tokens almost every
+        # time; it is the model the degenerate rule was written for, so its
+        # empty answer confirms nothing (seen deciding a vote 2026-10-05).
         return False
     log.info(
         "llm_cloud_empty_consensus",
