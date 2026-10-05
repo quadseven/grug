@@ -114,9 +114,12 @@ _HEADER = (
     "diff. Flag a criterion the diff plainly does not address with rule "
     "`acceptance-criterion-unmet`, and a change that contradicts a criterion "
     "with rule `acceptance-criterion-contradicted`, anchored on the diff line "
-    "and naming the issue and criterion number. This is advisory: stay "
-    "silent when unsure, the PR may be one slice of several, and a ticked "
-    "box is the author's claim, not evidence."
+    "and naming the issue and criterion number. When the diff implements "
+    "behavior a criterion describes and gets it observably wrong (different "
+    "values, a missing bound, a missing error), that is a contradiction: "
+    "always flag it at high severity. Stay silent only about criteria this "
+    "diff does not touch at all, since the PR may be one slice of several. "
+    "A ticked box is the author's claim, not evidence."
 )
 
 

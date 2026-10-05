@@ -4034,7 +4034,9 @@ def test_free_tier_chain_config_uses_short_timeout_and_bounded_tokens(monkeypatc
 def test_opencode_go_chain_config_uses_short_timeout_and_bounded_tokens() -> None:
     cfg = lc._opencode_go_chain_config()
     assert cfg.backend == Backend.OPENCODE_GO
-    assert cfg.timeout_seconds == lc._CLOUD_CHAIN_TIMEOUT_SECONDS
+    # The primary is a reasoning model; it gets the fallback-tier timeout
+    # (test_primary_reasoning_model_gets_the_longer_chain_timeout).
+    assert cfg.timeout_seconds == lc._POOLSIDE_CHAIN_TIMEOUT_SECONDS
     assert cfg.extra_body["max_tokens"] == lc._CLOUD_CHAIN_MAX_TOKENS
 
 
@@ -5197,7 +5199,7 @@ def test_benched_tiers_are_skipped_in_the_walk_and_the_worst_case(monkeypatch) -
     before = lc._cloud_chain_worst_case_s()
     for _ in range(3):
         _call(_go_cfg(), _err(404))
-    assert lc._cloud_chain_worst_case_s() == before - lc._CLOUD_CHAIN_TIMEOUT_SECONDS
+    assert lc._cloud_chain_worst_case_s() == before - lc._opencode_go_chain_config().timeout_seconds
     real = _usage_response(_JUNK_FINDING, 15_000, 400)
     with patch.object(httpx, "post", return_value=real) as post:
         out = review_diff([_hunk()], installation_id=1)
@@ -5295,3 +5297,10 @@ def test_bench_metric_failure_never_escapes(monkeypatch) -> None:
 
     monkeypatch.setattr(observability, "emit_count", boom)
     lc._announce_model_benched("opencode-go", "m", 404, 3600.0)  # must not raise
+
+
+def test_primary_reasoning_model_gets_the_longer_chain_timeout(monkeypatch) -> None:
+    """space-bunny-free at low effort took 17-25s on real 11-33k-token
+    chunks (2026-10-05) against a 25s chain timeout: 14 ReadTimeouts that
+    day, each a wasted tier walk. The primary gets the fallback-tier 45s."""
+    assert lc._opencode_go_chain_config().timeout_seconds == lc._POOLSIDE_CHAIN_TIMEOUT_SECONDS
