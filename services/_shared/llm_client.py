@@ -820,7 +820,10 @@ def _opencode_go_chain_config() -> BackendConfig:
             **_BACKEND_CONFIGS[Backend.OPENCODE_GO].extra_body,
             "max_tokens": _CLOUD_CHAIN_MAX_TOKENS,
         },
-        timeout_seconds=_CLOUD_CHAIN_TIMEOUT_SECONDS,
+        # The primary is a reasoning model (space-bunny-free at low effort):
+        # 17-25s on real 11-33k-token cohorts on 2026-10-05, against a 25s
+        # timeout, gave 14 ReadTimeouts that day. Same 45s as Poolside.
+        timeout_seconds=_POOLSIDE_CHAIN_TIMEOUT_SECONDS,
         retry_attempts=1,
         transport_retry_attempts=1,
     )
