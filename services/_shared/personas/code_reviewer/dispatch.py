@@ -196,7 +196,24 @@ def _compare_is_clean_ancestor(
     # trustworthy shape. "diverged" (both sides have commits the other
     # lacks - exactly a force-push/rebase/amend) and "behind" (head is
     # BEHIND base) both mean base is not a valid delta-review base point.
-    return body.get("status") == "ahead" and body.get("behind_by", 0) == 0
+    if not (body.get("status") == "ahead" and body.get("behind_by", 0) == 0):
+        return False
+    # grug#1092: "ahead" is also what a merge-from-main update reports, yet
+    # that range carries everything main gained, which is not the PR's work.
+    # Any merge commit in the range makes it unreviewable as a delta, so the
+    # caller falls back to the PR's own diff. The commit list is capped per
+    # page: one shorter than ahead_by cannot prove the absence of a merge.
+    commits = body.get("commits")
+    ahead_by = body.get("ahead_by", 0)
+    if not isinstance(commits, list) or not isinstance(ahead_by, int):
+        return False
+    if len(commits) < ahead_by:
+        return False
+    for commit in commits:
+        parents = commit.get("parents") if isinstance(commit, dict) else None
+        if not isinstance(parents, list) or len(parents) > 1:
+            return False
+    return True
 
 
 def _fetch_pr_diff_with_scope(
@@ -902,8 +919,8 @@ def _summary_markdown(
         hunt += (
             "\n\nLiving Hunt: the stored baseline `"
             + living_baseline_rejected
-            + "` was not an ancestor of the current head (history was "
-            "rewritten) - Elder reviewed the full PR diff instead of the "
+            + "` was not an ancestor of the current head, or the range held a "
+            "merge commit (history was rewritten or merged into) - Elder reviewed the full PR diff instead of the "
             "delta since the last pass."
         )
 

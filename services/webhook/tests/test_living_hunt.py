@@ -167,7 +167,12 @@ def test_fetch_pr_diff_scope_clean_ahead_baseline_uses_compare(monkeypatch):
     responses = [
         httpx.Response(200, text="the real delta diff", request=httpx.Request("GET", "https://compare-diff")),
         httpx.Response(
-            200, json={"status": "ahead", "ahead_by": 3, "behind_by": 0},
+            200,
+            json={
+                "status": "ahead", "ahead_by": 3, "behind_by": 0,
+                "commits": [_commit("c1", "p0"), _commit("c2", "c1"),
+                            _commit("c3", "c2")],
+            },
             request=httpx.Request("GET", "https://compare-json"),
         ),
     ]
@@ -178,6 +183,101 @@ def test_fetch_pr_diff_scope_clean_ahead_baseline_uses_compare(monkeypatch):
     )
     assert diff == "the real delta diff"
     assert used_compare is True
+
+
+def _commit(sha: str, *parents: str) -> dict:
+    return {"sha": sha, "parents": [{"sha": p} for p in parents]}
+
+
+def test_fetch_pr_diff_scope_merge_from_main_reviews_pr_own_diff(monkeypatch):
+    """grug#1092: reviewed SHA -> merge of main -> head. The compare is
+    `ahead` with behind_by 0, but its diff carries main's changes. The range
+    holds a merge commit, so the PR's own diff must be reviewed instead."""
+    main_only = "diff --git a/walkthrough/related.py b/walkthrough/related.py\n"
+    pr_only = "diff --git a/feature.py b/feature.py\n"
+    responses = [
+        httpx.Response(
+            200, text=pr_only + main_only,
+            request=httpx.Request("GET", "https://compare-diff"),
+        ),
+        httpx.Response(
+            200,
+            json={
+                "status": "ahead", "ahead_by": 3, "behind_by": 0,
+                "commits": [
+                    _commit("m1", "reviewed", "main-tip"),
+                    _commit("m0", "main-tip", "main-prev"),
+                    _commit("h1", "m1"),
+                ],
+            },
+            request=httpx.Request("GET", "https://compare-json"),
+        ),
+        httpx.Response(
+            200, text=pr_only, request=httpx.Request("GET", "https://pull"),
+        ),
+    ]
+    urls: list[str] = []
+
+    def fake_get(url: str, **_kw):
+        urls.append(url)
+        return responses.pop(0)
+
+    monkeypatch.setattr(cr_dispatch.httpx, "get", fake_get)
+
+    diff, used_compare, rejected = cr_dispatch._fetch_pr_diff_with_scope(
+        "token", "owner", "repo", 7, base_sha="reviewed", head_sha="h1",
+    )
+    assert "walkthrough/related.py" not in diff
+    assert "feature.py" in diff
+    assert used_compare is False
+    assert rejected is True
+    assert urls[-1] == "https://api.github.com/repos/owner/repo/pulls/7"
+
+
+def test_compare_is_clean_ancestor_rejects_range_with_merge_commit(monkeypatch):
+    body = {
+        "status": "ahead", "ahead_by": 2, "behind_by": 0,
+        "commits": [_commit("m1", "a", "b"), _commit("h1", "m1")],
+    }
+    monkeypatch.setattr(
+        cr_dispatch.httpx, "get",
+        lambda url, **kw: httpx.Response(
+            200, json=body, request=httpx.Request("GET", url)),
+    )
+    assert cr_dispatch._compare_is_clean_ancestor(
+        "token", "owner", "repo", "a", "h1") is False
+
+
+def test_compare_is_clean_ancestor_fails_closed_on_truncated_commit_list(
+    monkeypatch,
+):
+    """GitHub caps `commits` per page; a list shorter than ahead_by cannot
+    prove the absence of a merge commit."""
+    body = {
+        "status": "ahead", "ahead_by": 400, "behind_by": 0,
+        "commits": [_commit("c1", "c0")],
+    }
+    monkeypatch.setattr(
+        cr_dispatch.httpx, "get",
+        lambda url, **kw: httpx.Response(
+            200, json=body, request=httpx.Request("GET", url)),
+    )
+    assert cr_dispatch._compare_is_clean_ancestor(
+        "token", "owner", "repo", "a", "h1") is False
+
+
+def test_compare_is_clean_ancestor_accepts_linear_fast_forward(monkeypatch):
+    body = {
+        "status": "ahead", "ahead_by": 2, "behind_by": 0,
+        "commits": [_commit("c1", "a"), _commit("c2", "c1")],
+    }
+    monkeypatch.setattr(
+        cr_dispatch.httpx, "get",
+        lambda url, **kw: httpx.Response(
+            200, json=body, request=httpx.Request("GET", url)),
+    )
+    assert cr_dispatch._compare_is_clean_ancestor(
+        "token", "owner", "repo", "a", "c2") is True
 
 
 def test_fetch_pr_diff_scope_diverged_reports_baseline_rejected(monkeypatch):
