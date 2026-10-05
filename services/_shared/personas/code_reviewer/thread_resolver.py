@@ -126,14 +126,23 @@ def _fetch_threads(token: str, owner: str, repo: str, pr: int) -> list[dict]:
     return out
 
 
-def _owned_rule_and_line(thread: dict) -> tuple[str, str, int] | None:
-    """`(rule, path, original_line)` when the thread is wholly Elder's and
-    safe to close, else None."""
+def _only_grug_comments(thread: dict) -> list[dict] | None:
+    """The thread's comments when every one is Elder's and the list is
+    complete, else None (a person may be involved or we cannot see all)."""
     comments = thread.get("comments") or {}
     nodes = comments.get("nodes") or []
     if not nodes or int(comments.get("totalCount") or 0) > len(nodes):
         return None
     if not all(_is_grug((c.get("author") or {}).get("login")) for c in nodes):
+        return None
+    return nodes
+
+
+def _owned_rule_and_line(thread: dict) -> tuple[str, str, int] | None:
+    """`(rule, path, original_line)` when the thread is wholly Elder's and
+    safe to close, else None."""
+    nodes = _only_grug_comments(thread)
+    if nodes is None:
         return None
     first = nodes[0]
     rule = parse_rule(first.get("body") or "")
@@ -181,7 +190,7 @@ def resolve_fixed_threads(
     try:
         threads = with_install_token_retry(
             installation_id,
-            lambda token: _fetch_threads(token, owner, repo, pull_number),
+            lambda tok: _fetch_threads(tok, owner, repo, pull_number),
         )
         targets = select_fixed_threads(threads, findings)
     except Exception as e:  # noqa: BLE001 - never fail a review for tidying
@@ -194,10 +203,10 @@ def resolve_fixed_threads(
         try:
             with_install_token_retry(
                 installation_id,
-                lambda token, tid=thread_id: (
-                    _graphql(token, _REPLY_MUTATION,
+                lambda tok, tid=thread_id: (
+                    _graphql(tok, _REPLY_MUTATION,
                              {"thread": tid, "body": body}),
-                    _graphql(token, _RESOLVE_MUTATION, {"thread": tid}),
+                    _graphql(tok, _RESOLVE_MUTATION, {"thread": tid}),
                 ),
             )
             resolved += 1
