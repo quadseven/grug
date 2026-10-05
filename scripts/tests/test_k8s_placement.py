@@ -1,9 +1,9 @@
 """Long-running grug pods prefer the OCI zones over the home LAN nodes.
 
-The lan zone's arm64 nodes are 8GB home machines that also carry Homey and
-Scrypted on local-path volumes. With only a zone spread, one replica of each
-grug deployment landed on mac-mini and held it above 90% of allocatable
-memory (2026-10-05) while oci-ord was 17% requested. The preference must stay
+The lan zone's arm64 nodes are small and also carry pinned stateful
+workloads. With only a zone spread, one replica of each grug deployment
+landed on one of them and held it above 90% of allocatable memory
+(2026-10-05) while an OCI node was 17% requested. The preference must stay
 SOFT so a lan node still takes the pod when both OCI nodes are down.
 """
 
