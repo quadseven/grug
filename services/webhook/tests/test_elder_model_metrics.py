@@ -133,3 +133,13 @@ def test_metric_failure_never_breaks_capture(monkeypatch):
         install_id=1, repo="o/r", pr_number=1, review_span_context=None,
         head_sha="a", author_login="a",
     ) == 1
+
+
+def test_same_model_name_on_two_backends_stays_two_producers():
+    from personas.code_reviewer.model_metrics import origin_dims
+    dims = origin_dims([
+        {"backend": "cave", "model": "m1"},
+        {"backend": "openrouter", "model": "m1"},
+        {"backend": "cave", "model": "m1"},
+    ])
+    assert [(b, m) for _l, b, m in dims] == [("cave", "m1"), ("openrouter", "m1")]

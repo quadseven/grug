@@ -31,9 +31,9 @@ log = logging.getLogger("grug.persona.code_reviewer.model_metrics")
 def origin_dims(origins: Iterable[Mapping] | None) -> list[tuple[str, str, str]]:
     """(ledger reviewer label, backend, model) per DISTINCT producer, in order.
 
-    Label rule: `grug-elder/<model>`, else `grug-elder/<backend>`, else the
+    Distinct by (backend, model). Label rule: `grug-elder/<model>`, else `grug-elder/<backend>`, else the
     single legacy `grug-elder` with `unknown` tags when nothing is recorded."""
-    seen: dict[str, tuple[str, str, str]] = {}
+    seen: dict[tuple[str, str], tuple[str, str, str]] = {}
     for origin in origins or []:
         model = origin.get("model")
         backend = origin.get("backend")
@@ -45,11 +45,12 @@ def origin_dims(origins: Iterable[Mapping] | None) -> list[tuple[str, str, str]]
             label = f"{_LEGACY_LABEL}/{backend}"
         else:
             continue
-        seen.setdefault(label, (
-            label,
-            backend if has_backend else _UNKNOWN,
-            model if has_model else _UNKNOWN,
-        ))
+        b = backend if has_backend else _UNKNOWN
+        m = model if has_model else _UNKNOWN
+        # Keyed by (backend, model): the same model name served by two
+        # backends stays two producers for telemetry, while both share one
+        # ledger label (the ledger key is the label, so those rows merge).
+        seen.setdefault((b, m), (label, b, m))
     return list(seen.values()) or [(_LEGACY_LABEL, _UNKNOWN, _UNKNOWN)]
 
 
