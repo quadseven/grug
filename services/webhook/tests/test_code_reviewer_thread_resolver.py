@@ -201,3 +201,15 @@ def test_list_failure_never_raises(monkeypatch, caplog):
             1, "o", "r", 5, head_sha=HEAD, findings=(),
         ) == 0
     assert any(getattr(r, "kind", None) == "ConnectError" for r in caplog.records)
+
+
+def test_a_thread_already_answered_fixed_is_resolved_without_a_second_reply(run):
+    """If an earlier pass posted "Fixed in" but its resolve call failed, the
+    thread is still wholly Elder's and outdated. The next pass must resolve
+    it without stacking a second "Fixed in" reply."""
+    earlier = _comment(rule=None, db_id=2)
+    earlier["body"] = "Fixed in 1234567: the flagged code changed and this review does not raise it again."
+    gh = _Gh([_thread(comments=[_comment(), earlier])])
+    assert run(gh) == 1
+    assert gh.replies == []
+    assert gh.resolved == ["T1"]

@@ -156,6 +156,15 @@ def _owned_rule_and_line(thread: dict) -> tuple[str, str, int] | None:
     return rule, first["path"], int(line)
 
 
+_FIXED_REPLY_PREFIX = "Fixed in "
+
+
+def _already_answered(thread: dict) -> bool:
+    """An earlier pass posted the "Fixed in" reply but its resolve failed."""
+    nodes = (thread.get("comments") or {}).get("nodes") or []
+    return any((c.get("body") or "").startswith(_FIXED_REPLY_PREFIX) for c in nodes[1:])
+
+
 def select_fixed_threads(
     threads: list[dict], findings: tuple[Finding, ...],
 ) -> list[str]:
@@ -193,20 +202,32 @@ def resolve_fixed_threads(
             lambda tok: _fetch_threads(tok, owner, repo, pull_number),
         )
         targets = select_fixed_threads(threads, findings)
+        answered = {t["id"] for t in threads if t.get("id") in targets and _already_answered(t)}
     except Exception as e:  # noqa: BLE001 - never fail a review for tidying
         log.warning("elder_thread_list_failed",
                     extra={"pr": pr_ref, "kind": type(e).__name__})
         return 0
-    body = f"Fixed in {head_sha[:7]}: the flagged code changed and this review does not raise it again."
+    body = (
+        f"{_FIXED_REPLY_PREFIX}{head_sha[:7]}: the flagged code changed and "
+        "this review does not raise it again."
+    )
     resolved = 0
     for thread_id in targets:
         try:
+            # Reply and resolve are separate calls, each retried on its own,
+            # so a token retry never re-posts the reply, and a thread whose
+            # earlier resolve failed is resolved without a second reply.
+            if thread_id not in answered:
+                with_install_token_retry(
+                    installation_id,
+                    lambda tok, tid=thread_id: _graphql(
+                        tok, _REPLY_MUTATION, {"thread": tid, "body": body},
+                    ),
+                )
             with_install_token_retry(
                 installation_id,
-                lambda tok, tid=thread_id: (
-                    _graphql(tok, _REPLY_MUTATION,
-                             {"thread": tid, "body": body}),
-                    _graphql(tok, _RESOLVE_MUTATION, {"thread": tid}),
+                lambda tok, tid=thread_id: _graphql(
+                    tok, _RESOLVE_MUTATION, {"thread": tid},
                 ),
             )
             resolved += 1
