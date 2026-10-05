@@ -275,3 +275,43 @@ def test_patch_check_run_url_and_body():
     assert kwargs["json"]["conclusion"] == "failure"
     assert "head_sha" not in kwargs["json"], "PATCH targets an id, not a head_sha"
     assert out == {"id": 999, "status": "completed"}
+
+
+def _http_error(status: int, body, request_id: str | None = "ABCD:1234:5678"):
+    req = httpx.Request("POST", "https://api.github.com/repos/o/r/check-runs")
+    headers = {"x-github-request-id": request_id} if request_id else {}
+    return httpx.Response(status, json=body, headers=headers, request=req)
+
+
+def test_post_check_run_403_logs_message_doc_url_and_request_id(caplog):
+    import logging
+
+    result = CheckRunResult(
+        name="Grug - Chief", head_sha="abcdef123456", status="completed",
+        conclusion="success", title="t", summary="SECRET-SUMMARY-BODY",
+    )
+    resp = _http_error(
+        403,
+        {"message": "Resource not accessible by integration",
+         "documentation_url": "https://docs.github.com/rest/checks/runs#create"},
+    )
+    with patch("httpx.post", return_value=resp), caplog.at_level(logging.WARNING):
+        with pytest.raises(httpx.HTTPStatusError):
+            post_check_run("tok-SECRET", "o", "r", result)
+    rec = next(r for r in caplog.records if r.getMessage() == "check_run_post_http_error")
+    assert rec.status_code == 403
+    assert rec.gh_message == "Resource not accessible by integration"
+    assert rec.gh_documentation_url.startswith("https://docs.github.com/")
+    assert rec.gh_request_id == "ABCD:1234:5678"
+    dumped = repr(rec.__dict__)
+    assert "tok-SECRET" not in dumped and "SECRET-SUMMARY-BODY" not in dumped
+
+
+def test_github_error_diagnostics_tolerates_non_json_and_foreign_errors():
+    from github_checks_client import github_error_diagnostics
+
+    req = httpx.Request("POST", "https://api.github.com/x")
+    html = httpx.Response(502, text="<html>bad gateway</html>", request=req)
+    err = httpx.HTTPStatusError("bad", request=req, response=html)
+    assert github_error_diagnostics(err) == {"gh_request_id": None}
+    assert github_error_diagnostics(ValueError("x")) == {}

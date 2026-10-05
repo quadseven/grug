@@ -683,3 +683,40 @@ def test_cumulative_backoff_budget_is_capped(monkeypatch):
     # and the fourth attempt finds the budget exhausted - never 62s.
     assert slept == [2.0, 4.0, 2.0]
     assert sum(slept) <= publish_check._TRANSIENT_TOTAL_SLEEP_CAP_S
+
+
+def test_publish_failure_log_carries_github_403_diagnostics(monkeypatch, caplog):
+    """The 2026-10-05 outage: every check-run POST got a 403 whose body was
+    never logged. The existing failure event now carries GitHub's message,
+    documentation_url and request id - and never the token or the body."""
+    import httpx
+    from personas import publish_check
+
+    req = httpx.Request("POST", "https://api.github.com/repos/o/r/check-runs")
+    resp = httpx.Response(
+        403,
+        json={"message": "Resource not accessible by integration",
+              "documentation_url": "https://docs.github.com/rest/checks/runs#create"},
+        headers={"x-github-request-id": "REQ-1"},
+        request=req,
+    )
+
+    def _retry_403(installation_id, fn):
+        raise httpx.HTTPStatusError("403 Forbidden", request=req, response=resp)
+
+    monkeypatch.setattr(publish_check, "with_install_token_retry", _retry_403)
+    monkeypatch.setattr(publish_check, "record_check_verdict", lambda **kw: None)
+    with caplog.at_level(logging.ERROR):
+        publish_persona_check(
+            persona_key="tpm", persona_prefix="tpm", check_name="Grug - Chief",
+            installation_id=1, owner="o", repo="r", pr_number=2, head_sha="sha",
+            conclusion="success", title="t", summary="PRIVATE-SUMMARY",
+            findings_count=0, blocking=True, degraded_reason=None,
+            success_result="pass", publish_failed_log_name="tpm_publish_failed",
+        )
+    rec = next(r for r in caplog.records if r.getMessage() == "tpm_publish_failed")
+    assert rec.status_code == 403
+    assert rec.gh_message == "Resource not accessible by integration"
+    assert rec.gh_documentation_url.startswith("https://docs.github.com/")
+    assert rec.gh_request_id == "REQ-1"
+    assert "PRIVATE-SUMMARY" not in repr(rec.__dict__)

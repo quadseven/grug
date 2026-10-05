@@ -477,6 +477,12 @@ def handler(event: dict[str, Any], context: Any) -> dict[str, int | str]:
 
     check_run_reconciled, check_run_reconcile_failed = reconcile_installs(installs)
 
+    # Chief self-heal: re-run Chief (as `/grug recheck` does) on open PRs whose
+    # head has no `Grug - Chief` check-run. Own module, never raises.
+    from chief_self_heal import self_heal_installs
+
+    chief_healed, chief_heal_failed = self_heal_installs(installs)
+
     install_repaired, install_stale, install_reconciliation_failed = (
         _install_reconciliation_pass()
     )
@@ -512,6 +518,8 @@ def handler(event: dict[str, Any], context: Any) -> dict[str, int | str]:
         "hygiene_watch_failed_installs": hygiene_watch_failed,
         "check_run_reconciled": check_run_reconciled,
         "check_run_reconcile_failed_installs": check_run_reconcile_failed,
+        "chief_self_heal_published": chief_healed,
+        "chief_self_heal_failed": chief_heal_failed,
         "install_reconciliation_repaired": install_repaired,
         "install_reconciliation_stale": install_stale,
         "install_reconciliation_failed": install_reconciliation_failed,
