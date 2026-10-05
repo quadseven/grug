@@ -4750,6 +4750,32 @@ def _cloud_tier_success(
     )
 
 
+def _empty_answers_agree(
+    first_empty: "tuple[Backend, str] | None",
+    current: "tuple[Backend, str]",
+    pr_context: "Optional[PrContext]",
+) -> bool:
+    """True when a second, DIFFERENT model also gave a short empty answer.
+
+    One short empty answer can be a skim; two independent models agreeing is
+    a clean review. Walking on burned the staged budget and starved later
+    cohorts (2026-10-05). The same model twice is not agreement."""
+    if first_empty is None or first_empty == current:
+        return False
+    log.info(
+        "llm_cloud_empty_consensus",
+        extra={
+            "first_backend": first_empty[0].value,
+            "first_model": first_empty[1],
+            "second_backend": current[0].value,
+            "second_model": current[1],
+            "repo": (pr_context or {}).get("repo"),
+            "pr_number": (pr_context or {}).get("pr_number"),
+        },
+    )
+    return True
+
+
 def _try_cloud_primary(
     hunks: list[Hunk],
     messages: list[dict[str, str]],
@@ -4790,24 +4816,9 @@ def _try_cloud_primary(
         if outcome.kind == "success" and outcome.degenerate:
             last_error = f"{backend.value}: degenerate empty review"
             key = (backend, tier.model)
-            if first_empty is not None and first_empty != key:
-                # One short empty answer can be a skim; two independent
-                # models agreeing is a clean review. Walking on burned the
-                # staged budget and starved later cohorts (2026-10-05).
-                log.info(
-                    "llm_cloud_empty_consensus",
-                    extra={
-                        "first_backend": first_empty[0].value,
-                        "first_model": first_empty[1],
-                        "second_backend": backend.value,
-                        "second_model": tier.model,
-                        "repo": (pr_context or {}).get("repo"),
-                        "pr_number": (pr_context or {}).get("pr_number"),
-                    },
-                )
+            if _empty_answers_agree(first_empty, key, pr_context):
                 return _cloud_tier_success(outcome, hunks, pr_context)
-            if first_empty is None:
-                first_empty = key
+            first_empty = first_empty or key
             continue
         if outcome.kind == "success":
             return _cloud_tier_success(outcome, hunks, pr_context)
