@@ -1190,8 +1190,8 @@ def create_all(
         message=(
             f"{_DIGEST}\n"
             "The Elder canary reviewed a diff with a planted defect and did "
-            "not flag it for 2 consecutive hours (`grug.elder.canary` is "
-            "0.0; tags `outcome`, `backend`, `model`). Elder is effectively "
+            "not flag it in any run over the last 2 hours (`grug.elder.canary` "
+            "is 0.0; tags `outcome`, `backend`, `model`). Elder is effectively "
             "not reviewing, even if it reports success. NO DATA for 3 hours "
             "means the canary itself stopped running. Likely causes: a model "
             "change, a prompt or parser regression, a degraded backend, a "
@@ -1206,6 +1206,9 @@ def create_all(
         # the whole emitter) is gone, so No Data IS the failure here.
         notify_no_data=True,
         no_data_timeframe=180,
+        # False on purpose, like the owned queue gauges: the canary is a
+        # sparse scheduled gauge, and requiring a full window of points would
+        # leave the monitor unevaluated (blind) for part of every window.
         require_full_window=False,
         priority=2,
         opts=opts,
@@ -1217,8 +1220,8 @@ def create_all(
         name="[grug-elder] Review canary false positive on a clean diff (2h)",
         message=(
             f"{_DIGEST}\n"
-            "The Elder canary reviewed a CLEAN diff and flagged it for 2 "
-            "consecutive hours (`grug.elder.canary` is 0.0 for "
+            "The Elder canary reviewed a CLEAN diff and flagged it in every "
+            "run over the last 2 hours (`grug.elder.canary` is 0.0 for "
             "`case:clean`). Elder is raising false positives, which blocks "
             "or noises up real PRs. Likely causes: a prompt change, a "
             "stricter model in the chain, a parser regression. First steps: "

@@ -761,46 +761,81 @@ def test_canary_clean_query_is_the_false_positive_mirror() -> None:
     )
 
 
-@pulumi.runtime.test
-def test_review_health_monitor_shapes() -> None:
+def _review_health_bundle(name: str):
     import pulumi_datadog as datadog
 
     from components import dd_monitors
 
-    provider = datadog.Provider("test-dd-review-health", api_key="x", app_key="y")
-    b = dd_monitors.create_all(
+    provider = datadog.Provider(name, api_key="x", app_key="y")
+    return dd_monitors.create_all(
         env="prod",
         notify_handle="@h",
         webhook_public_url="https://webhook.example/webhook/github",
         api_public_url="https://api.example",
         provider=provider,
     )
-    mons = [
-        b.check_run_publish_failed, b.elder_review_failure_rate,
-        b.model_benched, b.canary_planted, b.canary_clean,
-    ]
+
+
+def _resolve(monitor, *fields):
+    """Resolve the named Monitor outputs to plain values for assertions."""
+    return pulumi.Output.all(*[getattr(monitor, f) for f in fields])
+
+
+@pulumi.runtime.test
+def test_check_run_publish_monitor_pages_at_top_priority():
+    m = _review_health_bundle("t-crp").check_run_publish_failed
 
     def _check(v):
-        (t1, p1, m1), (t2, p2, vars2), (t3, p3, m3), (t4, p4, nd4, ndt4), (t5, p5, nd5) = (
-            v[0:3], v[3:6], v[6:9], v[9:13], v[13:16],
-        )
-        assert t1 == "log alert" and p1 == 2 and "docs/RUNBOOK.md" in m1
-        assert "merge" in m1.lower()
-        assert t2 == "log alert" and p2 == 3
-        assert [q["name"] for q in vars2] == ["total", "bad"]
-        assert t3 == "log alert" and p3 == 4 and "docs/RUNBOOK.md" in m3
-        assert t4 == "metric alert" and p4 == 2 and nd4 is True and ndt4 == 180
-        assert t5 == "metric alert" and p5 == 4 and nd5 is False
+        mtype, priority, message = v
+        assert (mtype, priority) == ("log alert", 2)
+        assert "MERGE" in message and "docs/RUNBOOK.md" in message
 
-    outs = []
-    outs += [b.check_run_publish_failed.type, b.check_run_publish_failed.priority,
-             b.check_run_publish_failed.message]
-    outs += [b.elder_review_failure_rate.type, b.elder_review_failure_rate.priority,
-             b.elder_review_failure_rate.variables.apply(
-                 lambda x: [{"name": q.name} for q in x.event_queries])]
-    outs += [b.model_benched.type, b.model_benched.priority, b.model_benched.message]
-    outs += [b.canary_planted.type, b.canary_planted.priority,
-             b.canary_planted.notify_no_data, b.canary_planted.no_data_timeframe]
-    outs += [b.canary_clean.type, b.canary_clean.priority, b.canary_clean.notify_no_data]
-    assert len(mons) == 5
-    return pulumi.Output.all(*outs).apply(_check)
+    return _resolve(m, "type", "priority", "message").apply(_check)
+
+
+@pulumi.runtime.test
+def test_elder_failure_rate_monitor_carries_both_count_variables():
+    m = _review_health_bundle("t-efr").elder_review_failure_rate
+
+    def _check(v):
+        mtype, priority, queries = v
+        assert (mtype, priority) == ("log alert", 3)
+        assert [q.name for q in queries.event_queries] == ["total", "bad"]
+
+    return _resolve(m, "type", "priority", "variables").apply(_check)
+
+
+@pulumi.runtime.test
+def test_model_benched_monitor_is_low_priority_digest():
+    m = _review_health_bundle("t-mb").model_benched
+
+    def _check(v):
+        mtype, priority, message = v
+        assert (mtype, priority) == ("log alert", 4)
+        assert "fell back" in message and "docs/RUNBOOK.md" in message
+
+    return _resolve(m, "type", "priority", "message").apply(_check)
+
+
+@pulumi.runtime.test
+def test_planted_canary_monitor_alerts_on_no_data_after_three_hours():
+    m = _review_health_bundle("t-cp").canary_planted
+
+    def _check(v):
+        mtype, priority, notify_no_data, timeframe = v
+        assert (mtype, priority) == ("metric alert", 2)
+        assert notify_no_data is True and timeframe == 180
+
+    return _resolve(m, "type", "priority", "notify_no_data", "no_data_timeframe").apply(_check)
+
+
+@pulumi.runtime.test
+def test_clean_canary_monitor_is_warning_level_without_no_data():
+    m = _review_health_bundle("t-cc").canary_clean
+
+    def _check(v):
+        mtype, priority, notify_no_data = v
+        assert (mtype, priority) == ("metric alert", 4)
+        assert notify_no_data is False
+
+    return _resolve(m, "type", "priority", "notify_no_data").apply(_check)
