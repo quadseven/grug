@@ -204,6 +204,8 @@ class PrContext(TypedDict, total=False):
     review_phase: str
     cohort_index: int
     cohort_count: int
+    # Pre-rendered, already-sanitized linked-issue criteria block (#904).
+    linked_issue_context: str
 
 
 def _elapsed_ms(start_ns: int) -> int:
@@ -1584,6 +1586,11 @@ def _build_review_parts(
     # the #674 agent-guideline block. None/empty ⇒ byte-identical to pre-#903.
     if repo_docs_context:
         parts.append(f"### REPO DOCS\n{repo_docs_context}")
+    # Linked-issue criteria (#904): already a labelled `###` block, sanitized
+    # by `linked_issue.render_linked_issue_block`. Absent/empty => unchanged.
+    linked_issue_context = (pr_context or {}).get("linked_issue_context")
+    if linked_issue_context:
+        parts.append(linked_issue_context)
     return parts, bool(intent)
 
 
