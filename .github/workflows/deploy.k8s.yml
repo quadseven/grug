@@ -468,7 +468,13 @@ jobs:
           # CronJob smoke (F5): a broken image/command/secret must fail
           # THIS deploy, not the next scheduled tick.
           kubectl -n grug delete job poller-smoke --ignore-not-found
-          kubectl -n grug create job poller-smoke --from=cronjob/grug-poller
+          # GRUG_POLLER_SMOKE: prove identity, store and an App token, then
+          # stop. The full poll takes 4-7 minutes and failed a healthy deploy
+          # against this wait on 2026-10-05.
+          kubectl -n grug create job poller-smoke --from=cronjob/grug-poller \
+            --dry-run=client -o json \
+            | jq '.spec.template.spec.containers[0].env += [{"name":"GRUG_POLLER_SMOKE","value":"1"}]' \
+            | kubectl -n grug create -f -
           kubectl -n grug wait --for=condition=complete job/poller-smoke --timeout=300s || {
             echo "::error::poller-smoke failed - dumping job logs (identity proof / cert chain?)"
             kubectl -n grug logs job/poller-smoke --tail=50 || true
