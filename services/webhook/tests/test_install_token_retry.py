@@ -226,7 +226,33 @@ def test_permanent_403_does_not_retry(_stub_token, mock_transport_client):
 
     with pytest.raises(httpx.HTTPStatusError):
         gh_auth.with_install_token_retry(123, fn)
-    assert len(calls) == 1, "a genuine permission denial must NOT retry"
+    # One retry on a FRESH token (a stale token after an App permission
+    # change answers 403, not 401 - seen live 2026-10-05), never a backoff
+    # loop: a genuine denial still fails on the second call and raises.
+    assert len(calls) == 2
+    assert calls[1] == "token-2-refresh=True"
+
+
+def test_stale_token_403_succeeds_on_a_fresh_token(_stub_token, mock_transport_client):
+    """Live 2026-10-05: from 15:30 UTC every check-run POST from the webhook
+    pods got `403 Resource not accessible by integration` on a cached
+    installation token, while a freshly minted token for the same
+    installation posted fine. Chief and Guard stopped reporting on every PR
+    until the pods restarted. A fresh token must be tried once."""
+    client = mock_transport_client(
+        status_codes=[403, 201],
+        json_bodies=[{"message": "Resource not accessible by integration"}, {"id": 1}],
+    )
+    calls: list[str] = []
+
+    def fn(token: str) -> int:
+        calls.append(token)
+        resp = client.get("https://api.github.com/repos/o/r/check-runs")
+        resp.raise_for_status()
+        return resp.json()["id"]
+
+    assert gh_auth.with_install_token_retry(123, fn) == 1
+    assert calls == ["token-1-refresh=False", "token-2-refresh=True"]
 
 
 def test_retry_ceiling_stops_and_raises(_stub_token, mock_transport_client):
@@ -258,3 +284,25 @@ def test_success_first_try_does_not_refresh(_stub_token):
     assert gh_auth.with_install_token_retry(123, fn) == "ok"
     assert len(calls) == 1
     assert calls[0] == "token-1-refresh=False"
+
+
+def test_primary_rate_limit_403_never_refreshes_the_token(_stub_token):
+    """`X-RateLimit-Remaining: 0` is the per-installation hourly limit; a
+    fresh token for the same installation cannot help, so it must not be
+    minted (Elder on grug#1112)."""
+    calls: list[str] = []
+
+    def fn(token: str) -> None:
+        calls.append(token)
+        raise httpx.HTTPStatusError(
+            "403",
+            request=httpx.Request("GET", "https://api.github.com/repos"),
+            response=httpx.Response(
+                403, headers={"X-RateLimit-Remaining": "0"},
+                json={"message": "API rate limit exceeded"},
+            ),
+        )
+
+    with pytest.raises(httpx.HTTPStatusError):
+        gh_auth.with_install_token_retry(123, fn)
+    assert calls == ["token-1-refresh=False"]

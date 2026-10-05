@@ -137,7 +137,8 @@ def test_permanent_403_does_not_retry(_stub_token):
 
     with pytest.raises(httpx.HTTPStatusError):
         gh_auth.with_install_token_retry(123, fn)
-    assert len(calls) == 1, "a genuine permission denial must NOT retry"
+    # One retry on a fresh token (a stale token answers 403 too), then raise.
+    assert len(calls) == 2
 
 
 def test_retry_ceiling_stops_and_raises(_stub_token):
