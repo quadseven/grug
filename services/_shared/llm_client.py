@@ -983,6 +983,19 @@ def _review_backend_config(backend: Backend) -> BackendConfig:
 # (docs/research/laguna-s-2.1-gpu-host-elder-eval-2026-07-21.md) recommends
 # AGAINST it as a blanket default and measures it at 0.000 on the test-gap
 # class. Do not read this line as a settled choice.
+# Thinking OFF for every Cave arm, in both dialects the gateway's backends
+# speak. The arms ask for `spark:warm-any`, so the model is whatever is warm:
+# vLLM models honor `chat_template_kwargs.enable_thinking`, while the
+# Ollama-served nemotron ignores it and honors only `reasoning_effort: "none"`.
+# Measured 2026-10-05 through the gateway: enable_thinking=false alone still
+# produced 2339 chars of hidden reasoning on a 2-line diff (8.4s); adding
+# reasoning_effort none produced zero (0.8s). On real cohorts the reasoning
+# filled max_tokens and left content empty (finish_reason=length), failing
+# about 90 reviews in a week. All four served models accept both keys.
+_CAVE_THINKING_OFF: dict = {
+    "chat_template_kwargs": {"enable_thinking": False},
+    "reasoning_effort": "none",
+}
 _CAVE_JUDGE_DEFAULT_MODEL = "poolside/Laguna-S-2.1-NVFP4"
 
 
@@ -1008,7 +1021,7 @@ def _cave_judge_config() -> "BackendConfig | None":
         # into a five-minute constrained-decoding pass and triggered xgrammar
         # FSM errors live. Deep thinking remains enabled on the reasoner arm.
         extra_body={
-            "chat_template_kwargs": {"enable_thinking": False},
+            **_CAVE_THINKING_OFF,
             "max_tokens": 4_096,
         },
         # Short client timeout (_review_llm_timeout_s()) - must not queue
@@ -1112,7 +1125,7 @@ def _cave_review_config(backend: Backend) -> "BackendConfig | None":
         extra_body = {
             "response_format": _CAVE_FINDINGS_RESPONSE_FORMAT,
             "max_tokens": 6_144,
-            "chat_template_kwargs": {"enable_thinking": False},
+            **_CAVE_THINKING_OFF,
         }
     else:
         model = os.getenv("GRUG_CAVE_REVIEW_MODEL", _CAVE_REVIEW_CODER_DEFAULT_MODEL)
@@ -1124,6 +1137,10 @@ def _cave_review_config(backend: Backend) -> "BackendConfig | None":
         extra_body = {
             "response_format": _CAVE_FINDINGS_RESPONSE_FORMAT,
             "max_tokens": _CLOUD_CHAIN_MAX_TOKENS,
+            # The coder arm never turned thinking off: it was written for a
+            # non-reasoning coder model, but `spark:warm-any` now lands on
+            # whatever is warm, including nemotron.
+            **_CAVE_THINKING_OFF,
         }
     return BackendConfig(
         backend=backend,
