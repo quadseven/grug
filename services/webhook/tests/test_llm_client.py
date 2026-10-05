@@ -5285,3 +5285,13 @@ def test_fallback_empty_answer_agrees_with_a_free_empty_answer(monkeypatch) -> N
         out = review_diff([_hunk()], installation_id=1)
     assert out.kind == "reviewed" and out.findings == ()
     assert post.call_count == 2
+
+
+def test_bench_metric_failure_never_escapes(monkeypatch) -> None:
+    import observability
+
+    def boom(*a, **k):
+        raise RuntimeError("statsd down")
+
+    monkeypatch.setattr(observability, "emit_count", boom)
+    lc._announce_model_benched("opencode-go", "m", 404, 3600.0)  # must not raise

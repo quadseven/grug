@@ -977,12 +977,13 @@ def _announce_model_benched(backend: str, model: str, status: int, seconds: floa
     )
     try:
         from observability import emit_count  # type: ignore  # late: webhook-image only
-    except Exception:  # noqa: BLE001 - telemetry must never break the review
-        return
-    emit_count(
-        "grug.elder.model_benched", 1,
-        tags={"backend": backend, "model": model, "status": str(status)},
-    )
+
+        emit_count(
+            "grug.elder.model_benched", 1,
+            tags={"backend": backend, "model": model, "status": str(status)},
+        )
+    except Exception as e:  # noqa: BLE001 - telemetry must never break the review
+        log.debug("model_benched_metric_failed", extra={"kind": type(e).__name__})
 
 
 def _note_model_response(config: BackendConfig, resp: httpx.Response) -> None:
