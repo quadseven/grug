@@ -1044,11 +1044,13 @@ def test_cave_reasoner_disables_default_thinking_like_the_judge() -> None:
     assert judge is not None
     assert reasoner.extra_body["chat_template_kwargs"] == {"enable_thinking": False}
     assert reasoner.extra_body["chat_template_kwargs"] == judge.extra_body["chat_template_kwargs"]
-    # The coder arm's decode budget is short enough that this mitigation was
-    # never needed there; scoping the assertion to the reasoner only.
+    # The coder arm once skipped this on the theory that its model never
+    # reasoned. With every arm asking for `spark:warm-any`, the coder can land
+    # on nemotron, which does; it now carries the same switch
+    # (test_every_cave_arm_turns_thinking_off_in_both_dialects).
     coder = lc._cave_review_config(Backend.CAVE)
     assert coder is not None
-    assert "chat_template_kwargs" not in coder.extra_body
+    assert coder.extra_body["chat_template_kwargs"] == judge.extra_body["chat_template_kwargs"]
 
 
 def test_review_reasoner_diff_truncated_generation_is_not_a_clean_pass(monkeypatch) -> None:
@@ -4839,3 +4841,20 @@ def test_poolside_parse_failure_falls_through_to_cave(monkeypatch) -> None:
     assert out.kind == "reviewed"
     assert out.backend_used == Backend.CAVE
     assert post.call_count == 3
+
+
+@pytest.mark.parametrize("arm", ["judge", Backend.CAVE, Backend.CAVE_REASONER])
+def test_every_cave_arm_turns_thinking_off_in_both_dialects(arm, monkeypatch) -> None:
+    """The Cave arms ask the gateway for `spark:warm-any`, so the model is
+    whatever is warm. vLLM models honor `chat_template_kwargs.enable_thinking`;
+    the Ollama-served nemotron ignores it and only honors
+    `reasoning_effort: "none"`. Measured 2026-10-05 through the gateway: with
+    only enable_thinking=false, nemotron wrote 2339 chars of hidden reasoning
+    on a 2-line diff; with reasoning_effort none, zero. On real cohorts the
+    reasoning filled max_tokens and returned empty content (finish_reason
+    length): about 90 failed reviews in a week. The coder arm sent neither."""
+    monkeypatch.setenv("GRUG_CAVE_GATEWAY_URL", "http://gw.example.svc:8080")
+    cfg = lc._cave_judge_config() if arm == "judge" else lc._cave_review_config(arm)
+    assert cfg is not None
+    assert cfg.extra_body["reasoning_effort"] == "none"
+    assert cfg.extra_body["chat_template_kwargs"] == {"enable_thinking": False}
