@@ -762,6 +762,25 @@ _CLOUD_CHAIN_TIMEOUT_SECONDS = 25.0
 _CLOUD_CHAIN_MAX_TOKENS = 8192
 
 
+def _opencode_go_extra_model_config(model: str, timeout_seconds: float) -> BackendConfig:
+    """An OpenCode Go chain tier for a model other than the primary: same
+    chat endpoint, the model's own body (`_opencode_go_extra_body`) plus the
+    chain's output cap, one attempt per failure class."""
+    return replace(
+        _BACKEND_CONFIGS[Backend.OPENCODE_GO],
+        url=_OPENCODE_GO_URL,
+        model=model,
+        wire="chat",
+        extra_body={
+            **_opencode_go_extra_body(model, "chat"),
+            "max_tokens": _CLOUD_CHAIN_MAX_TOKENS,
+        },
+        timeout_seconds=timeout_seconds,
+        retry_attempts=1,
+        transport_retry_attempts=1,
+    )
+
+
 def _opencode_go_second_chain_config() -> "BackendConfig | None":
     """A second OpenCode Go model as tier 2, or None when unset.
 
@@ -776,21 +795,21 @@ def _opencode_go_second_chain_config() -> "BackendConfig | None":
     model = os.getenv("GRUG_OPENCODE_GO_SECOND_MODEL", "").strip()
     if not model:
         return None
-    return replace(
-        _BACKEND_CONFIGS[Backend.OPENCODE_GO],
-        url=_OPENCODE_GO_URL,
-        model=model,
-        wire="chat",
-        extra_body={
-            **_opencode_go_extra_body(model, "chat"),
-            "max_tokens": _CLOUD_CHAIN_MAX_TOKENS,
-        },
-        # 45s like Poolside: 7-16s in probes, but it hit the 25s chain
-        # timeout live under load on 2026-10-05.
-        timeout_seconds=_POOLSIDE_CHAIN_TIMEOUT_SECONDS,
-        retry_attempts=1,
-        transport_retry_attempts=1,
-    )
+    # 45s like Poolside: 7-16s in probes, but it hit the 25s chain timeout
+    # live under load on 2026-10-05.
+    return _opencode_go_extra_model_config(model, _POOLSIDE_CHAIN_TIMEOUT_SECONDS)
+
+
+def _opencode_go_fallback_chain_config() -> "BackendConfig | None":
+    """A PAID OpenCode Go model right after the free tiers, or None when
+    `GRUG_OPENCODE_GO_FALLBACK_MODEL` is unset. The free promotions are
+    limited-time; when they end this tier keeps Elder on a cheap, reliable
+    model instead of walking on to slower tiers. Unlike the free tiers it is
+    gated by the usage-limit breaker."""
+    model = os.getenv("GRUG_OPENCODE_GO_FALLBACK_MODEL", "").strip()
+    if not model:
+        return None
+    return _opencode_go_extra_model_config(model, _CLOUD_CHAIN_TIMEOUT_SECONDS)
 
 
 def _opencode_go_chain_config() -> BackendConfig:
@@ -885,6 +904,104 @@ def _note_opencode_go_response(resp: httpx.Response) -> None:
     )
 
 
+# Per-model bench. A withdrawn model (an ended free promotion, a retired
+# name) starts answering every call with the same client error. Three such
+# failures within ten minutes bench the (backend, model) pair for an hour,
+# doubling to twelve hours on repeat; a success un-benches it at once.
+# Transport errors and 5xx are outages, not withdrawal, and never count.
+# Rate limits and usage/quota refusals have their own handling, and a
+# request-specific error (oversized context) says nothing about the model.
+# Per process, like the usage-limit breaker above.
+_BENCH_FAILURE_THRESHOLD = 3
+_BENCH_WINDOW_SECONDS = 600.0
+_BENCH_BASE_SECONDS = 3600.0
+_BENCH_MAX_SECONDS = 12 * 3600.0
+_BENCH_CLOUD_BACKENDS = frozenset({Backend.OPENCODE_GO, Backend.OPENROUTER, Backend.POOLSIDE})
+# Statuses that are never withdrawal: timeout, too-large, rate limit.
+_BENCH_IGNORED_STATUSES = frozenset({408, 413, 425, 429})
+_BENCH_QUOTA_MARKERS = ("usage limit", "rate limit", "quota", "insufficient credit", "key limit")
+_BENCH_REQUEST_MARKERS = (
+    "context length", "context window", "context_length", "maximum context",
+    "too long", "too many tokens", "reduce the length", "prompt is too large",
+)
+
+
+@dataclass
+class _BenchEntry:
+    failures: list[float] = field(default_factory=list)
+    benched_until: float = 0.0
+    next_seconds: float = _BENCH_BASE_SECONDS
+
+
+_bench_lock = threading.Lock()
+_bench_state: dict[tuple[str, str], _BenchEntry] = {}
+
+
+def _model_is_benched(backend: str, model: str, now: float | None = None) -> bool:
+    current = time.time() if now is None else now
+    with _bench_lock:
+        entry = _bench_state.get((backend, model))
+        return entry is not None and current < entry.benched_until
+
+
+def _is_benchable_failure(resp: httpx.Response) -> bool:
+    """A 4xx that is not a rate limit, quota refusal, or request-specific."""
+    status = resp.status_code
+    if not 400 <= status < 500 or status in _BENCH_IGNORED_STATUSES:
+        return False
+    text = (resp.text or "").lower()
+    return not any(m in text for m in _BENCH_QUOTA_MARKERS + _BENCH_REQUEST_MARKERS)
+
+
+def _record_model_failure(backend: str, model: str, status: int, now: float) -> float | None:
+    """Count one failure; return the bench duration when it trips the bench."""
+    with _bench_lock:
+        entry = _bench_state.setdefault((backend, model), _BenchEntry())
+        if now < entry.benched_until:
+            return None
+        entry.failures = [t for t in entry.failures if now - t < _BENCH_WINDOW_SECONDS]
+        entry.failures.append(now)
+        if len(entry.failures) < _BENCH_FAILURE_THRESHOLD:
+            return None
+        seconds = entry.next_seconds
+        entry.benched_until = now + seconds
+        entry.next_seconds = min(seconds * 2, _BENCH_MAX_SECONDS)
+        entry.failures = []
+        return seconds
+
+
+def _announce_model_benched(backend: str, model: str, status: int, seconds: float) -> None:
+    log.warning(
+        "llm_model_benched",
+        extra={"backend": backend, "model": model, "status": status, "bench_seconds": seconds},
+    )
+    try:
+        from observability import emit_count  # type: ignore  # late: webhook-image only
+
+        emit_count(
+            "grug.elder.model_benched", 1,
+            tags={"backend": backend, "model": model, "status": str(status)},
+        )
+    except Exception as e:  # noqa: BLE001 - telemetry must never break the review
+        log.debug("model_benched_metric_failed", extra={"kind": type(e).__name__})
+
+
+def _note_model_response(config: BackendConfig, resp: httpx.Response) -> None:
+    """Feed one cloud response to the per-model bench."""
+    if config.backend not in _BENCH_CLOUD_BACKENDS:
+        return
+    key = (config.backend.value, config.model)
+    if resp.status_code < 400:
+        with _bench_lock:
+            _bench_state.pop(key, None)
+        return
+    if not _is_benchable_failure(resp):
+        return
+    seconds = _record_model_failure(*key, resp.status_code, time.time())
+    if seconds is not None:
+        _announce_model_benched(*key, resp.status_code, seconds)
+
+
 def _free_tier_chain_config() -> "BackendConfig | None":
     """OpenRouter `:free` as the SECOND, best-effort chain tier (grug#910).
 
@@ -935,21 +1052,36 @@ def _free_tier_chain_config() -> "BackendConfig | None":
 
 def _cloud_chain_tiers() -> list[BackendConfig]:
     """The ordered cloud chain: opencode Go (skipped while its usage-limit
-    breaker is open), OpenRouter `:free` (only if configured), then Poolside
+    breaker is open), an optional second free Go model, an optional paid Go
+    fallback model, OpenRouter `:free` (only if configured), then Poolside
     laguna-s-2.1, with the Cave after all of them. Poolside was dropped in
     grug#910 as unfunded; it answers again (2026-09-26) and has the best eval
-    record of the cloud models grug can reach (see `_poolside_chain_config`)."""
+    record of the cloud models grug can reach (see `_poolside_chain_config`).
+    Models on the per-model bench (`_note_model_response`) are skipped."""
+    candidates: list["BackendConfig | None"] = [
+        _opencode_go_chain_config(),
+        _opencode_go_second_chain_config(),
+        _opencode_go_fallback_chain_config(),
+        _free_tier_chain_config(),
+        _poolside_chain_config(),
+    ]
     tiers: list[BackendConfig] = []
-    if _opencode_go_available() or _opencode_go_model_is_free(_OPENCODE_GO_MODEL):
-        tiers.append(_opencode_go_chain_config())
-    second = _opencode_go_second_chain_config()
-    if second is not None:
-        tiers.append(second)
-    free_tier = _free_tier_chain_config()
-    if free_tier is not None:
-        tiers.append(free_tier)
-    tiers.append(_poolside_chain_config())
+    for tier in candidates:
+        if tier is not None and _tier_is_usable(tier, tiers):
+            tiers.append(tier)
     return tiers
+
+
+def _tier_is_usable(tier: BackendConfig, chosen: list[BackendConfig]) -> bool:
+    """A tier runs unless it duplicates one already chosen, is benched, or
+    is a paid OpenCode Go model while the usage-limit breaker is open."""
+    if any((c.backend, c.model) == (tier.backend, tier.model) for c in chosen):
+        return False
+    if _model_is_benched(tier.backend.value, tier.model):
+        return False
+    if tier.backend == Backend.OPENCODE_GO and not _opencode_go_model_is_free(tier.model):
+        return _opencode_go_available()
+    return True
 
 
 def _cloud_chain_worst_case_s() -> float:
@@ -1911,6 +2043,7 @@ def _call_backend(
         )
     if config.backend == Backend.OPENCODE_GO:
         _note_opencode_go_response(resp)
+    _note_model_response(config, resp)
     return resp
 
 

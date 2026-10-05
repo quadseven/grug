@@ -27,6 +27,8 @@ def _patch_keys(monkeypatch):
     monkeypatch.setattr(lc, "_load_opencode_go_key", lambda: "test-ocg-key")
     # Module-level breaker state must not leak between tests.
     monkeypatch.setattr(lc, "_opencode_go_blocked_until", 0.0, raising=False)
+    monkeypatch.setattr(lc, "_bench_state", {}, raising=False)
+    monkeypatch.delenv("GRUG_OPENCODE_GO_FALLBACK_MODEL", raising=False)
     monkeypatch.delenv("GRUG_CLOUD_FREE_TIER_MODEL", raising=False)
     monkeypatch.setenv("GRUG_CAVE_GATEWAY_URL", "http://cave.test")
     # Fast = single (coder) arm; the deep tests below opt into both arms so a
@@ -5048,3 +5050,248 @@ def test_second_model_gets_the_longer_fallback_timeout(monkeypatch) -> None:
     live under load; it gets the same 45s as Poolside."""
     monkeypatch.setenv("GRUG_OPENCODE_GO_SECOND_MODEL", "longcat-2.5-preview-free")
     assert lc._opencode_go_second_chain_config().timeout_seconds == lc._POOLSIDE_CHAIN_TIMEOUT_SECONDS
+
+
+# --- per-model bench and paid fallback tier --------------------------------
+
+_JUNK_FINDING = (
+    '{"findings": [{"path": "src/x.py", "line": 1, "rule": "r", '
+    '"severity": "medium", "message": "m"}]}'
+)
+
+
+def _go_cfg(model: str = "space-bunny-free") -> lc.BackendConfig:
+    return lc.replace(
+        lc._opencode_go_chain_config(), model=model, key_loader=lambda: "k",
+    )
+
+
+def _call(cfg: lc.BackendConfig, resp: httpx.Response) -> None:
+    with patch.object(httpx, "post", return_value=resp):
+        lc._call_backend(cfg, [{"role": "user", "content": "hi"}])
+
+
+def _err(status: int, message: str = "model not found") -> httpx.Response:
+    return httpx.Response(status, json={"error": {"message": message}})
+
+
+def _free_models() -> list[str]:
+    return [t.model for t in lc._cloud_chain_tiers()]
+
+
+@pytest.mark.parametrize("status", [400, 401, 402, 403, 404])
+def test_three_client_errors_bench_the_model(monkeypatch, caplog, status) -> None:
+    emitted: list[tuple] = []
+    import observability
+
+    monkeypatch.setattr(
+        observability, "emit_count",
+        lambda name, value, tags=None: emitted.append((name, value, tags)),
+    )
+    cfg = _go_cfg()
+    with caplog.at_level("WARNING"):
+        for _ in range(2):
+            _call(cfg, _err(status))
+        assert "space-bunny-free" in _free_models()
+        _call(cfg, _err(status))
+    assert "space-bunny-free" not in _free_models()
+    assert lc._model_is_benched("opencode-go", "space-bunny-free")
+    rec = [r for r in caplog.records if r.getMessage() == "llm_model_benched"]
+    assert len(rec) == 1
+    assert (rec[0].backend, rec[0].model, rec[0].status) == (
+        "opencode-go", "space-bunny-free", status,
+    )
+    assert emitted == [(
+        "grug.elder.model_benched", 1,
+        {"backend": "opencode-go", "model": "space-bunny-free", "status": str(status)},
+    )]
+
+
+def test_bench_lasts_an_hour_then_doubles_up_to_twelve(monkeypatch) -> None:
+    clock = [1000.0]
+    monkeypatch.setattr(lc.time, "time", lambda: clock[0])
+    cfg = _go_cfg()
+    durations = []
+    for _ in range(6):
+        for _ in range(3):
+            _call(cfg, _err(404))
+        entry = lc._bench_state[("opencode-go", "space-bunny-free")]
+        durations.append(entry.benched_until - clock[0])
+        clock[0] = entry.benched_until + 1
+    assert durations == [3600.0, 7200.0, 14400.0, 28800.0, 43200.0, 43200.0]
+
+
+def test_failures_outside_the_window_do_not_accumulate(monkeypatch) -> None:
+    clock = [1000.0]
+    monkeypatch.setattr(lc.time, "time", lambda: clock[0])
+    cfg = _go_cfg()
+    for _ in range(3):
+        _call(cfg, _err(404))
+        clock[0] += 400  # third lands 800s after the first
+    assert not lc._model_is_benched("opencode-go", "space-bunny-free")
+
+
+def test_a_success_unbenches_immediately(monkeypatch) -> None:
+    cfg = _go_cfg()
+    for _ in range(3):
+        _call(cfg, _err(404))
+    assert lc._model_is_benched("opencode-go", "space-bunny-free")
+    # A direct call (judge, a probe) that succeeds clears the bench.
+    _call(cfg, _usage_response('{"findings": []}', 500, 20))
+    assert not lc._model_is_benched("opencode-go", "space-bunny-free")
+    assert "space-bunny-free" in _free_models()
+
+
+def test_failures_before_a_success_do_not_carry_over() -> None:
+    cfg = _go_cfg()
+    for _ in range(2):
+        _call(cfg, _err(404))
+    _call(cfg, _usage_response('{"findings": []}', 500, 20))
+    for _ in range(2):
+        _call(cfg, _err(404))
+    assert not lc._model_is_benched("opencode-go", "space-bunny-free")
+
+
+@pytest.mark.parametrize("resp", [
+    httpx.Response(500, json={"error": {"message": "boom"}}),
+    httpx.Response(502, text="bad gateway"),
+    httpx.Response(503, text="unavailable"),
+    httpx.Response(429, json={"error": {"message": "slow down"}}),
+    httpx.Response(
+        429, json={"error": {"type": "GoUsageLimitError", "message": "usage limit"}},
+    ),
+    httpx.Response(402, json={"error": {"message": "Insufficient credits"}}),
+    httpx.Response(403, json={"error": {"message": "Key limit exceeded (total limit)"}}),
+    httpx.Response(413, text="payload too large"),
+    httpx.Response(400, json={"error": {"message": "maximum context length exceeded"}}),
+    httpx.Response(400, json={"error": {"message": "prompt is too long"}}),
+    httpx.Response(408, text="request timeout"),
+])
+def test_outages_limits_and_request_errors_never_bench(resp) -> None:
+    cfg = lc.replace(_go_cfg(), retry_attempts=1)
+    for _ in range(5):
+        _call(cfg, resp)
+    assert not lc._model_is_benched("opencode-go", "space-bunny-free")
+
+
+def test_transport_errors_never_bench() -> None:
+    cfg = _go_cfg()
+    for _ in range(5):
+        with patch.object(httpx, "post", side_effect=httpx.ConnectError("down")):
+            with pytest.raises(httpx.RequestError):
+                lc._call_backend(cfg, [{"role": "user", "content": "hi"}])
+    assert not lc._model_is_benched("opencode-go", "space-bunny-free")
+
+
+def test_the_bench_is_per_model(monkeypatch) -> None:
+    monkeypatch.setenv("GRUG_OPENCODE_GO_SECOND_MODEL", "longcat-2.5-preview-free")
+    for _ in range(3):
+        _call(_go_cfg("longcat-2.5-preview-free"), _err(404))
+    models = _free_models()
+    assert "longcat-2.5-preview-free" not in models
+    assert "space-bunny-free" in models
+
+
+def test_benched_tiers_are_skipped_in_the_walk_and_the_worst_case(monkeypatch) -> None:
+    monkeypatch.setenv("GRUG_REVIEW_BACKEND_PRIORITY", "cloud")
+    before = lc._cloud_chain_worst_case_s()
+    for _ in range(3):
+        _call(_go_cfg(), _err(404))
+    assert lc._cloud_chain_worst_case_s() == before - lc._CLOUD_CHAIN_TIMEOUT_SECONDS
+    real = _usage_response(_JUNK_FINDING, 15_000, 400)
+    with patch.object(httpx, "post", return_value=real) as post:
+        out = review_diff([_hunk()], installation_id=1)
+    assert out.backend_used == Backend.POOLSIDE
+    assert post.call_count == 1
+
+
+def test_fallback_tier_is_absent_when_unset() -> None:
+    assert lc._opencode_go_fallback_chain_config() is None
+    assert "deepseek-v4.1-flash" not in _free_models()
+
+
+def test_fallback_tier_sits_after_the_free_go_tiers_before_openrouter(monkeypatch) -> None:
+    monkeypatch.setenv("GRUG_OPENCODE_GO_SECOND_MODEL", "longcat-2.5-preview-free")
+    monkeypatch.setenv("GRUG_OPENCODE_GO_FALLBACK_MODEL", "deepseek-v4.1-flash")
+    monkeypatch.setenv("GRUG_CLOUD_FREE_TIER_MODEL", "z-ai/glm-5.2:free")
+    tiers = lc._cloud_chain_tiers()
+    assert [t.model for t in tiers][:4] == [
+        "space-bunny-free", "longcat-2.5-preview-free", "deepseek-v4.1-flash",
+        "z-ai/glm-5.2:free",
+    ]
+    assert tiers[-1].backend is Backend.POOLSIDE
+    fb = tiers[2]
+    assert fb.backend is Backend.OPENCODE_GO
+    assert fb.wire == "chat"
+    assert fb.url == lc._OPENCODE_GO_URL
+    assert fb.extra_body == {
+        "thinking": {"type": "disabled"}, "max_tokens": lc._CLOUD_CHAIN_MAX_TOKENS,
+    }
+
+
+def test_fallback_tier_follows_the_usage_limit_breaker(monkeypatch) -> None:
+    monkeypatch.setenv("GRUG_OPENCODE_GO_FALLBACK_MODEL", "deepseek-v4.1-flash")
+    assert "deepseek-v4.1-flash" in _free_models()
+    monkeypatch.setattr(lc, "_opencode_go_blocked_until", lc.time.time() + 3600)
+    models = _free_models()
+    assert "deepseek-v4.1-flash" not in models
+    assert "space-bunny-free" in models  # free primary still runs
+
+
+def test_fallback_equal_to_an_existing_tier_is_not_duplicated(monkeypatch) -> None:
+    monkeypatch.setenv("GRUG_OPENCODE_GO_FALLBACK_MODEL", "space-bunny-free")
+    assert _free_models().count("space-bunny-free") == 1
+
+
+def test_fallback_parse_failure_is_a_miss_not_the_answer(monkeypatch) -> None:
+    monkeypatch.setenv("GRUG_REVIEW_BACKEND_PRIORITY", "cloud")
+    monkeypatch.setenv("GRUG_OPENCODE_GO_FALLBACK_MODEL", "deepseek-v4.1-flash")
+    junk = httpx.Response(200, json=_openai_json_response("I will now review the diff."))
+    real = _usage_response(_JUNK_FINDING, 15_000, 400)
+    with patch.object(
+        httpx, "post", side_effect=[httpx.ConnectError("go down"), junk, real],
+    ) as post:
+        out = review_diff([_hunk()], installation_id=1)
+    assert out.kind == "reviewed"
+    assert out.backend_used == Backend.POOLSIDE
+    assert post.call_args_list[1].kwargs["json"]["model"] == "deepseek-v4.1-flash"
+    assert post.call_count == 3
+
+
+def test_primary_parse_failure_is_still_the_answer_with_a_fallback(monkeypatch) -> None:
+    monkeypatch.setenv("GRUG_REVIEW_BACKEND_PRIORITY", "cloud")
+    monkeypatch.setenv("GRUG_OPENCODE_GO_FALLBACK_MODEL", "deepseek-v4.1-flash")
+    junk = httpx.Response(200, json=_openai_json_response("I will now review the diff."))
+    calls = []
+
+    def fake_post(*args, **kwargs):
+        calls.append(kwargs["json"]["model"])
+        if len(calls) == 1:
+            return junk
+        raise httpx.ConnectError("down")
+
+    with patch.object(httpx, "post", side_effect=fake_post):
+        out = review_diff([_hunk()], installation_id=1)
+    assert out.kind == "parse_failed"
+    assert calls[:2] == ["space-bunny-free", "deepseek-v4.1-flash"]
+
+
+def test_fallback_empty_answer_agrees_with_a_free_empty_answer(monkeypatch) -> None:
+    monkeypatch.setenv("GRUG_REVIEW_BACKEND_PRIORITY", "cloud")
+    monkeypatch.setenv("GRUG_OPENCODE_GO_FALLBACK_MODEL", "deepseek-v4.1-flash")
+    with patch.object(
+        httpx, "post", side_effect=[_degenerate_response(), _degenerate_response()],
+    ) as post:
+        out = review_diff([_hunk()], installation_id=1)
+    assert out.kind == "reviewed" and out.findings == ()
+    assert post.call_count == 2
+
+
+def test_bench_metric_failure_never_escapes(monkeypatch) -> None:
+    import observability
+
+    def boom(*a, **k):
+        raise RuntimeError("statsd down")
+
+    monkeypatch.setattr(observability, "emit_count", boom)
+    lc._announce_model_benched("opencode-go", "m", 404, 3600.0)  # must not raise
