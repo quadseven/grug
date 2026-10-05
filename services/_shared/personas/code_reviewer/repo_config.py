@@ -19,6 +19,7 @@ from __future__ import annotations
 
 import re
 from collections.abc import Iterable
+from functools import lru_cache
 from dataclasses import dataclass
 
 import yaml
@@ -128,13 +129,8 @@ def parse_repo_config(text: str | None) -> RepoConfig:
     return RepoConfig(ignore, instructions, floor, tuple(problems))
 
 
-_GLOB_CACHE: dict[str, re.Pattern[str]] = {}
-
-
+@lru_cache(maxsize=256)
 def _glob_regex(pattern: str) -> re.Pattern[str]:
-    cached = _GLOB_CACHE.get(pattern)
-    if cached is not None:
-        return cached
     pat = pattern.lstrip("/")
     anywhere = "/" not in pat
     out: list[str] = []
@@ -156,9 +152,7 @@ def _glob_regex(pattern: str) -> re.Pattern[str]:
             out.append(re.escape(pat[i]))
             i += 1
     body = "".join(out)
-    regex = re.compile(f"(?:.*/)?{body}" if anywhere else body)
-    _GLOB_CACHE[pattern] = regex
-    return regex
+    return re.compile(f"(?:.*/)?{body}" if anywhere else body)
 
 
 def path_matches(path: str, pattern: str) -> bool:
@@ -232,3 +226,11 @@ def split_ignored_hunks(hunks, config: RepoConfig):
         else:
             kept.append(h)
     return tuple(kept), tuple(ignored)
+
+
+def with_instructions(
+    prompt_context: str | None, paths: Iterable[str], config: RepoConfig,
+) -> str | None:
+    """`prompt_context` with the matching path instructions appended."""
+    block = instructions_block(paths, config)
+    return "\n\n".join(p for p in (prompt_context, block) if p) or None

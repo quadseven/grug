@@ -83,10 +83,10 @@ from personas.code_reviewer.repo_config import (
     CONFIG_PATH as _REPO_CONFIG_PATH,
     RepoConfig,
     config_note as _repo_config_note,
-    instructions_block as _repo_instructions_block,
     meets_inline_floor,
     parse_repo_config,
     split_ignored_hunks,
+    with_instructions,
 )
 from personas.code_reviewer.repo_docs import build_repo_docs_context
 from personas.code_reviewer.omen import build_runtime_context
@@ -550,6 +550,24 @@ def _load_repo_config(
         )
         return RepoConfig()
     return parse_repo_config((fetched or {}).get(_REPO_CONFIG_PATH))
+
+
+def _apply_repo_config(
+    hunks: tuple[DiffHunk, ...], pr: dict[str, Any], installation_id: int,
+    owner: str, repo_name: str,
+) -> tuple[tuple[DiffHunk, ...], RepoConfig, str]:
+    """Load `.grug.yaml` from the PR base and drop `ignore`d hunks.
+
+    Returns (kept hunks, config, summary note). The base is the PR's own
+    base commit (falling back to the base branch name), never the head and
+    never the living-hunt baseline."""
+    base = pr.get("base") or {}
+    config = _load_repo_config(
+        installation_id, owner, repo_name,
+        str(base.get("sha") or base.get("ref") or ""),
+    )
+    kept, ignored = split_ignored_hunks(hunks, config)
+    return kept, config, _repo_config_note(config, ignored)
 
 
 def _list_dir_contents(
@@ -2459,12 +2477,9 @@ def dispatch_code_review(
             )
         # `.grug.yaml` from the BASE ref: `ignore` globs are dropped here,
         # before anything below (full-file fetch, prompt, judge) can see them.
-        repo_config = _load_repo_config(
-            installation_id, owner, repo_name,
-            base_sha or str((pr.get("base") or {}).get("ref") or ""),
+        hunks, repo_config, config_note = _apply_repo_config(
+            hunks, pr, installation_id, owner, repo_name,
         )
-        hunks, config_ignored = split_ignored_hunks(hunks, repo_config)
-        config_note = _repo_config_note(repo_config, config_ignored)
         # A hunk bigger than a whole cohort can never be reviewed - the
         # planner will not truncate it (line anchors), so it becomes a solo
         # cohort that is auto-failed, flips the check to `partial_review`,
@@ -2700,12 +2715,9 @@ def dispatch_code_review(
     # `.grug.yaml` path_instructions: only entries matching a file in THIS
     # diff reach the prompt, riding the repo-docs block so every review arm
     # (tier-1, deep, cohorts) carries them without new plumbing.
-    instructions = _repo_instructions_block(changed_paths, repo_config)
-    if instructions:
-        repo_docs_context = (
-            f"{repo_docs_context}\n\n{instructions}"
-            if repo_docs_context else instructions
-        )
+    repo_docs_context = with_instructions(
+        repo_docs_context, changed_paths, repo_config,
+    )
 
     # PR context supplies both trace identity and author intent. The prompt
     # treats title/body as untrusted repository data before sending it.
