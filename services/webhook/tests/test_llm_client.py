@@ -4036,11 +4036,13 @@ def test_opencode_go_chain_config_uses_short_timeout_and_bounded_tokens() -> Non
     assert cfg.extra_body["max_tokens"] == lc._CLOUD_CHAIN_MAX_TOKENS
 
 
-def test_opencode_go_chain_request_disables_deepseek_thinking(monkeypatch) -> None:
-    """Live 2026-09-22: deepseek-v4.1-flash with thinking on spent all 8192
-    output tokens on reasoning and returned no content - a billed call with
-    nothing to parse. The chain tier's actual request body must carry
-    `thinking: disabled` alongside its token cap."""
+def test_opencode_go_chain_request_caps_the_default_models_reasoning(monkeypatch) -> None:
+    """The chain tier's actual request body must hold the default model's
+    reasoning down alongside its token cap. Both models the slot has held
+    spent all 8192 output tokens reasoning when left at their default:
+    deepseek-v4.1-flash (2026-09-22, now `thinking: disabled`, covered by
+    test_opencode_go_thinking_toggle_scope) and space-bunny-free (2026-10-05,
+    now `reasoning_effort: low`)."""
     captured: dict = {}
 
     def fake_post(url, json=None, headers=None, timeout=None):
@@ -4053,7 +4055,8 @@ def test_opencode_go_chain_request_disables_deepseek_thinking(monkeypatch) -> No
     cfg = lc.replace(lc._opencode_go_chain_config(), key_loader=lambda: "k")
     lc._call_backend(cfg, [{"role": "user", "content": "hi"}])
 
-    assert captured["body"]["thinking"] == {"type": "disabled"}
+    assert captured["body"]["model"] == "space-bunny-free"
+    assert captured["body"]["reasoning_effort"] == "low"
     assert captured["body"]["max_tokens"] == lc._CLOUD_CHAIN_MAX_TOKENS
 
 
@@ -4858,3 +4861,20 @@ def test_every_cave_arm_turns_thinking_off_in_both_dialects(arm, monkeypatch) ->
     assert cfg is not None
     assert cfg.extra_body["reasoning_effort"] == "none"
     assert cfg.extra_body["chat_template_kwargs"] == {"enable_thinking": False}
+
+
+def test_space_bunny_is_the_default_and_runs_at_low_effort(monkeypatch) -> None:
+    """space-bunny-free is free and unlimited on OpenCode Go (limited-time
+    promotion), not used for training, 0-day retention. It is a reasoning
+    model: at its default effort it spent all 8192 output tokens reasoning on
+    real cohorts of a large infrastructure-repo PR (95-163s, no content). At reasoning_effort low it
+    answered in 3-8s and caught 3/3 planted bugs twice (2026-10-05). It
+    rejects reasoning_effort none and thinking.disabled with HTTP 400, so low
+    is the floor."""
+    monkeypatch.delenv("GRUG_OPENCODE_GO_REASONING_EFFORT", raising=False)
+    assert lc._OPENCODE_GO_DEFAULT_MODEL == "space-bunny-free"
+    assert lc._opencode_go_extra_body("space-bunny-free", "chat") == {"reasoning_effort": "low"}
+    monkeypatch.setenv("GRUG_OPENCODE_GO_REASONING_EFFORT", "medium")
+    assert lc._opencode_go_extra_body("space-bunny-free", "chat") == {"reasoning_effort": "medium"}
+    # Never on the Responses wire, where the field has a different shape.
+    assert lc._opencode_go_extra_body("space-bunny-free", "responses") == {}
