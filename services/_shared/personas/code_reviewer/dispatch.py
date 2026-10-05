@@ -79,6 +79,15 @@ from personas.code_reviewer.cross_file import (
     extract_symbols, fetch_cross_file_context,
 )
 from personas.code_reviewer.ci_status import build_ci_status_context
+from personas.code_reviewer.repo_config import (
+    CONFIG_PATH as _REPO_CONFIG_PATH,
+    RepoConfig,
+    config_note as _repo_config_note,
+    meets_inline_floor,
+    parse_repo_config,
+    split_ignored_hunks,
+    with_instructions,
+)
 from personas.code_reviewer.repo_docs import build_repo_docs_context
 from personas.code_reviewer.omen import build_runtime_context
 from personas.code_reviewer.judge import (
@@ -513,6 +522,52 @@ def _fetch_file_contents(
                 extra={"path": path, "ref": ref, "error": str(e)},
             )
     return contents
+
+
+def _load_repo_config(
+    installation_id: int, owner: str, repo_name: str, base_ref: str,
+) -> RepoConfig:
+    """Parse the repo's optional `.grug.yaml` as it exists at the PR BASE.
+
+    `base_ref` must be the base commit, never the head: a PR that edits
+    `.grug.yaml` is reviewed under the OLD file, so it cannot loosen its own
+    review. Absent file, empty ref, or any fetch failure = `RepoConfig()`
+    (today's behavior); parsing never raises.
+    """
+    if not base_ref:
+        return RepoConfig()
+    try:
+        fetched = with_install_token_retry(
+            installation_id,
+            lambda token: _fetch_file_contents(
+                token, owner, repo_name, (_REPO_CONFIG_PATH,), base_ref,
+            ),
+        )
+    except (httpx.HTTPStatusError, httpx.RequestError) as e:
+        log.info(
+            "repo_config_fetch_failed",
+            extra={"repo": f"{owner}/{repo_name}", "error": str(e)},
+        )
+        return RepoConfig()
+    return parse_repo_config((fetched or {}).get(_REPO_CONFIG_PATH))
+
+
+def _apply_repo_config(
+    hunks: tuple[DiffHunk, ...], pr: dict[str, Any], installation_id: int,
+    owner: str, repo_name: str,
+) -> tuple[tuple[DiffHunk, ...], RepoConfig, str]:
+    """Load `.grug.yaml` from the PR base and drop `ignore`d hunks.
+
+    Returns (kept hunks, config, summary note). The base is the PR's own
+    base commit (falling back to the base branch name), never the head and
+    never the living-hunt baseline."""
+    base = pr.get("base") or {}
+    config = _load_repo_config(
+        installation_id, owner, repo_name,
+        str(base.get("sha") or base.get("ref") or ""),
+    )
+    kept, ignored = split_ignored_hunks(hunks, config)
+    return kept, config, _repo_config_note(config, ignored)
 
 
 def _list_dir_contents(
@@ -1947,6 +2002,7 @@ def _build_review_result(
     evaluation: CodeReviewEvaluation, *, head_sha: str, event: ReviewEvent,
     prior_keys: frozenset[str] = frozenset(),
     precedent_notes: dict[str, str] | None = None,
+    repo_config: RepoConfig | None = None,
 ) -> tuple[ReviewResult | None, tuple[Finding, ...]]:
     """Build the ReviewResult, or (None, ()) if nothing NEW to post.
 
@@ -1968,6 +2024,12 @@ def _build_review_result(
     if evaluation.degraded_reason not in (None, "", "partial_review"):
         return None, ()
     new_findings = dedup_findings(evaluation.findings, prior_keys)
+    if repo_config is not None:
+        # `.grug.yaml` min_inline_severity: lower findings stay in the check
+        # summary (built from the full evaluation) but get no inline comment.
+        new_findings = tuple(
+            f for f in new_findings if meets_inline_floor(f.severity, repo_config)
+        )
     if not new_findings:
         return None, ()
     notes = precedent_notes or {}
@@ -2413,6 +2475,11 @@ def dispatch_code_review(
                     "count": len(excluded_paths),
                 },
             )
+        # `.grug.yaml` from the BASE ref: `ignore` globs are dropped here,
+        # before anything below (full-file fetch, prompt, judge) can see them.
+        hunks, repo_config, config_note = _apply_repo_config(
+            hunks, pr, installation_id, owner, repo_name,
+        )
         # A hunk bigger than a whole cohort can never be reviewed - the
         # planner will not truncate it (line anchors), so it becomes a solo
         # cohort that is auto-failed, flips the check to `partial_review`,
@@ -2645,6 +2712,13 @@ def dispatch_code_review(
             },
         )
 
+    # `.grug.yaml` path_instructions: only entries matching a file in THIS
+    # diff reach the prompt, riding the repo-docs block so every review arm
+    # (tier-1, deep, cohorts) carries them without new plumbing.
+    repo_docs_context = with_instructions(
+        repo_docs_context, changed_paths, repo_config,
+    )
+
     # PR context supplies both trace identity and author intent. The prompt
     # treats title/body as untrusted repository data before sending it.
     llm_response: LlmReviewResponse = review_diff(
@@ -2858,6 +2932,7 @@ def dispatch_code_review(
         living_baseline_rejected=living_baseline_rejected,
         review_phase=tier1_phase,
     )
+    summary += config_note
     check_result = CheckRunResult(
         name=_CHECK_NAME,
         head_sha=head_sha,
@@ -2910,7 +2985,7 @@ def dispatch_code_review(
     )
     review_result, posted_findings = _build_review_result(
         evaluation, head_sha=head_sha, event=event, prior_keys=prior_keys,
-        precedent_notes=precedent_notes,
+        precedent_notes=precedent_notes, repo_config=repo_config,
     )
     review_resp: dict[str, Any] | None = None
     if review_result is not None:
@@ -3153,6 +3228,8 @@ def dispatch_code_review(
             check_publish_failed=check_publish_failed,
             cancel_event=cancel_event,
             author_login=author_login,
+            repo_config=repo_config,
+            config_note=config_note,
         )
     except Exception as e:  # noqa: BLE001 - deep append is best-effort
         log.warning(
@@ -3534,6 +3611,7 @@ def _publish_deep_review(
     combined_eval: CodeReviewEvaluation,
     pr_title: str = "",
     base_sha: str = "",
+    repo_config: RepoConfig | None = None,
 ) -> None:
     """Publish the async deep review's novel findings as a GitHub review.
 
@@ -3551,6 +3629,7 @@ def _publish_deep_review(
         event=event,
         prior_keys=all_prior,
         precedent_notes={},
+        repo_config=repo_config,
     )
     if review_result is None:
         return
@@ -3680,6 +3759,8 @@ def _async_deep_append_if_needed(
     check_publish_failed: bool,
     cancel_event: threading.Event | None,
     author_login: str,
+    repo_config: RepoConfig | None = None,
+    config_note: str = "",
 ) -> None:
     """Run reasoner after Tier-1 publish when tiered escalation fires (#646).
 
@@ -3833,6 +3914,7 @@ def _async_deep_append_if_needed(
         living_baseline_rejected=living_baseline_rejected,
         review_phase="deep",
     )
+    summary += config_note
     title = f"{title} (deep append)"
     # The author-facing distinction #848 asks for: "the reasoner ran and
     # found nothing" and "the reasoner did not run" are different news, and
@@ -3878,6 +3960,7 @@ def _async_deep_append_if_needed(
         combined_eval=combined,
         pr_title=str(pr_context.get("title") or ""),
         base_sha=str(pr_context.get("base_sha") or ""),
+        repo_config=repo_config,
     )
     _submit_deep_evals(
         deep_graded,

@@ -32,3 +32,5 @@ psycopg[binary,pool]>=3.2,<4.0
 # ships requirements.txt into the image while CI installs unpinned, so an
 # unpinned tool can behave differently in CI than in prod.
 ruff>=0.16,<0.17
+# .grug.yaml parsing (repo_config.py): optional per-repo Elder config read from the PR base ref.
+pyyaml>=6,<7
