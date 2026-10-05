@@ -17,6 +17,9 @@ def _no_ambient_ra_config(monkeypatch):
     runners lack the env). The proof tests setenv explicitly, so they are
     unaffected by this delenv."""
     monkeypatch.delenv("AWS_CONFIG_FILE", raising=False)
+    # The hourly Elder canary would call real models on the wall-clock's
+    # first poller slot; these tests are about the other passes.
+    monkeypatch.setenv("GRUG_ELDER_CANARY", "off")
 
 
 def _wire(monkeypatch, *, installs, records_for, retry, poll):

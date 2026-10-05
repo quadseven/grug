@@ -383,6 +383,27 @@ def _install_reconciliation_pass() -> tuple[int, int, int]:
         return 0, 0, 1
 
 
+def _elder_canary_due(now: datetime | None = None) -> bool:
+    """Hourly gate for the Elder canary. The CronJob ticks every 15 minutes,
+    so the first slot of each UTC hour is the tick whose minute is below 15.
+    `GRUG_ELDER_CANARY=off` is the kill switch."""
+    if os.getenv("GRUG_ELDER_CANARY", "on").strip().lower() in ("off", "0", "false"):
+        return False
+    return (now or datetime.now(timezone.utc)).minute < 15
+
+
+def _elder_canary_pass() -> None:
+    """Run the Elder canary (personas/code_reviewer/canary.py). Runs LAST,
+    bounded by `GRUG_ELDER_CANARY_TIMEOUT_S`, and never raises: the canary
+    must not fail or slow the passes above it."""
+    try:
+        from personas.code_reviewer import canary
+
+        canary.run_canary(timeout_s=float(os.getenv("GRUG_ELDER_CANARY_TIMEOUT_S", "240")))
+    except Exception as e:  # noqa: BLE001 - the canary never aborts the poll cycle
+        log.warning("elder_canary_pass_failed", extra={"kind": type(e).__name__})
+
+
 def handler(event: dict[str, Any], context: Any) -> dict[str, int | str]:
     """Poll reactions for every allowlisted install. Returns a summary
     dict (installs scanned, records polled, verdicts submitted) — also
@@ -497,4 +518,11 @@ def handler(event: dict[str, Any], context: Any) -> dict[str, int | str]:
         log.error("reaction_poll_all_installs_failed", extra=result)
     else:
         log.info("reaction_poll_cycle_complete", extra=result)
+
+    # Elder review canary: hourly, last, fully isolated (see the helpers).
+    if _elder_canary_due():
+        try:
+            _elder_canary_pass()
+        except Exception as e:  # noqa: BLE001 - belt and braces over the pass's own guard
+            log.warning("elder_canary_pass_failed", extra={"kind": type(e).__name__})
     return result

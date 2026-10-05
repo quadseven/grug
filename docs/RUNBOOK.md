@@ -797,6 +797,47 @@ when a repo leaves the estate entirely - deleted, or its installation removed.
 That case is inherent and bounded: it needs a repo to disappear while red, and
 it clears itself within 24h.
 
+## Elder review canary
+
+The `grug-poller` CronJob runs a review-quality canary once per UTC hour (the
+tick whose minute is below 15). It sends two fixed diffs through the real
+`review_diff` chain, the same one production reviews use: a planted SQL
+injection (string-concatenated query) and the same file with the
+parameterized query. Nothing is posted to GitHub and no installation token is
+fetched. `GRUG_ELDER_CANARY=off` disables it; `GRUG_ELDER_CANARY_TIMEOUT_S`
+(default 240) bounds it.
+
+Each run emits `grug.elder.canary` for both cases, tagged `case:planted|clean`,
+`outcome:<verdict>`, plus `backend` and `model` when a backend answered. The
+value is 1.0 for `caught` (planted) and `pass` (clean), 0.0 for `missed`,
+`false_positive` and `error`. Every run also logs `elder_canary_result` with
+`case`, `outcome`, `backend`, `model`, `findings_count` and `elapsed_s`.
+
+| Outcome | Meaning |
+|---|---|
+| `caught` | A high or critical SQL/injection finding landed within 2 lines of the planted query |
+| `missed` | The chain answered but did not flag the planted query |
+| `pass` | The clean diff drew no high or critical finding |
+| `false_positive` | The clean diff drew a high or critical finding |
+| `error` | The review failed, was partial, raised or hit the timeout |
+
+A `missed` streak means Elder is approving real injection bugs: the answering
+model degraded or a fallback tier with weaker recall is carrying the chain. An
+`error` streak means the chain is down or too slow for the canary window, so
+production reviews are likely degraded too.
+
+First steps:
+
+1. Read the `elder_canary_result` logs for the failing case and note `backend`,
+   `model` and `elapsed_s`.
+2. Check whether that backend or model changed recently: search for
+   `llm_model_benched` and `llm_backend_unusable` logs.
+3. Check the provider's status page and the key or credit state (see "LLM
+   backend unusable").
+4. Run the same fixture against the answering model by hand before changing
+   the chain. A single `missed` among `caught` runs is model variance, not an
+   outage.
+
 ## LLM backend unusable
 
 The `[grug] LLM backend unusable` monitor fires when a review backend answers
