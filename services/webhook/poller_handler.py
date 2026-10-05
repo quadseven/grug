@@ -404,6 +404,17 @@ def _elder_canary_pass() -> None:
         log.warning("elder_canary_pass_failed", extra={"kind": type(e).__name__})
 
 
+def _smoke_check(installs: list[int]) -> dict[str, int | str]:
+    """Deploy smoke (GRUG_POLLER_SMOKE): identity and store access are
+    already proven by the caller; prove a GitHub App installation token too,
+    then stop. The full poll takes minutes and failed a deploy's 5-minute
+    smoke wait on 2026-10-05 while the image was healthy."""
+    if installs:
+        with_install_token_retry(installs[0], lambda token: bool(token))
+    log.info("poller_smoke_ok", extra={"installs": len(installs)})
+    return {"smoke": "ok", "installs": len(installs)}
+
+
 def handler(event: dict[str, Any], context: Any) -> dict[str, int | str]:
     """Poll reactions for every allowlisted install. Returns a summary
     dict (installs scanned, records polled, verdicts submitted) — also
@@ -411,6 +422,8 @@ def handler(event: dict[str, Any], context: Any) -> dict[str, int | str]:
     ran end-to-end."""
     _prove_roles_anywhere_identity()
     installs = list_allowlisted_installs()
+    if os.getenv("GRUG_POLLER_SMOKE", "").strip() not in ("", "0"):
+        return _smoke_check(installs)
     polled_records, submitted, failed_installs = _reaction_poll_pass(installs)
 
     # Pulse pass (#472): the first SCHEDULED persona rides the same

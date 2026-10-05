@@ -1087,3 +1087,23 @@ def test_identity_proof_asserts_the_expected_role(monkeypatch):
 
     monkeypatch.setattr(boto3, "client", lambda service: _RightSts())
     poller_handler._prove_roles_anywhere_identity()  # must not raise
+
+
+def test_smoke_mode_proves_identity_store_and_token_then_stops(monkeypatch):
+    """The deploy's poller-smoke job proves the image boots with its Roles
+    Anywhere identity, store access and a GitHub App token. Running the full
+    poll there took 4-7 minutes against a 5-minute wait and failed a deploy
+    on 2026-10-05. Smoke mode does the proofs and skips every pass."""
+    monkeypatch.setenv("GRUG_POLLER_SMOKE", "1")
+    calls = []
+    monkeypatch.setattr(poller_handler, "_prove_roles_anywhere_identity", lambda: calls.append("identity"))
+    monkeypatch.setattr(poller_handler, "list_allowlisted_installs", lambda: calls.append("store") or [111])
+    monkeypatch.setattr(poller_handler, "with_install_token_retry", lambda iid, fn: calls.append(("token", iid)) or fn("tok"))
+
+    def boom(*a, **k):
+        raise AssertionError("smoke mode must not run the poll passes")
+
+    monkeypatch.setattr(poller_handler, "_reaction_poll_pass", boom)
+    out = poller_handler.handler({}, None)
+    assert calls == ["identity", "store", ("token", 111)]
+    assert out["smoke"] == "ok"
