@@ -1,4 +1,4 @@
-"""Throwaway file for a live Elder smoke test; this PR is closed unmerged."""
+"""Throwaway file for a live Elder smoke test; this PR is closed unmerged (re-check)."""
 
 
 def find_user(db, name):
