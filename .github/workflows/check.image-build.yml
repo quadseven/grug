@@ -165,18 +165,22 @@ jobs:
           tags: tag:ci
           use-cache: 'true'
 
+      - name: Registry login
+        if: steps.seeding.outputs.seeded == 'true'
+        uses: ./.github/actions/registry-login
+        with:
+          registry: ${{ vars.DEPLOY_REGISTRY_HOST }}
+          username: ${{ secrets.CI_REGISTRY_USERNAME }}
+          password: ${{ secrets.CI_REGISTRY_PASSWORD }}
+
       - name: Push pr-tagged image
         if: steps.seeding.outputs.seeded == 'true'
         env:
           REGISTRY_HOST: ${{ vars.DEPLOY_REGISTRY_HOST }}
-          CI_REGISTRY_USERNAME: ${{ secrets.CI_REGISTRY_USERNAME }}
-          CI_REGISTRY_PASSWORD: ${{ secrets.CI_REGISTRY_PASSWORD }}
           PR_NUMBER: ${{ github.event.pull_request.number }}
           HEAD_SHA: ${{ github.event.pull_request.head.sha }}
         run: |
           set -euo pipefail
-          echo "$CI_REGISTRY_PASSWORD" | docker login "$REGISTRY_HOST" \
-            --username "$CI_REGISTRY_USERNAME" --password-stdin
           docker tag "grug-${{ matrix.svc }}:pr-smoke" \
             "$REGISTRY_HOST/grug-${{ matrix.svc }}:pr-${PR_NUMBER}"
           docker push "$REGISTRY_HOST/grug-${{ matrix.svc }}:pr-${PR_NUMBER}"

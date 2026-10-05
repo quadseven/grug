@@ -1,0 +1,56 @@
+name: Registry login (retried)
+description: >-
+  Shared docker login to the tailnet registry, with bounded retries. Was an
+  unretried inline `docker login` in 4 workflows (deploy.k8s.yml,
+  grugthink.deploy.yml, preview.yml, check.image-build.yml). deploy.k8s run
+  37360195280 failed `Registry login` with `context deadline exceeded`
+  seconds after joining the tailnet, failing a main deploy on one transient
+  miss. Retries back off 5s, 10s, 20s by default; a real auth failure still
+  fails the step, after the last attempt.
+
+inputs:
+  registry:
+    description: Registry host (callers pass vars.DEPLOY_REGISTRY_HOST).
+    required: true
+  username:
+    description: >-
+      Registry username (callers pass their own secret - a composite action
+      has no secrets context of its own).
+    required: true
+  password:
+    description: Registry password, passed on stdin, never on the command line.
+    required: true
+  attempts:
+    description: Total login attempts before the step fails.
+    default: '4'
+  retry-delay-seconds:
+    description: First backoff delay; doubles after each failed attempt.
+    default: '5'
+
+runs:
+  using: composite
+  steps:
+    - name: Registry login
+      shell: bash
+      env:
+        REGISTRY_HOST: ${{ inputs.registry }}
+        REGISTRY_USERNAME: ${{ inputs.username }}
+        REGISTRY_PASSWORD: ${{ inputs.password }}
+        ATTEMPTS: ${{ inputs.attempts }}
+        RETRY_DELAY_S: ${{ inputs.retry-delay-seconds }}
+      run: |
+        set -uo pipefail
+        delay="$RETRY_DELAY_S"
+        for attempt in $(seq 1 "$ATTEMPTS"); do
+          if echo "$REGISTRY_PASSWORD" | docker login "$REGISTRY_HOST" \
+              --username "$REGISTRY_USERNAME" --password-stdin; then
+            exit 0
+          fi
+          if [ "$attempt" -lt "$ATTEMPTS" ]; then
+            echo "::warning::registry login attempt ${attempt}/${ATTEMPTS} failed; retrying in ${delay}s"
+            sleep "$delay"
+            delay=$((delay * 2))
+          fi
+        done
+        echo "::error::registry login to ${REGISTRY_HOST} failed after ${ATTEMPTS} attempts"
+        exit 1
