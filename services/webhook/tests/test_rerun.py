@@ -2398,6 +2398,6 @@ def test_learn_outcomes_never_post_a_comment(monkeypatch):
         monkeypatch.setattr("adapters.install_store.claim_delivery", lambda k: True)
         monkeypatch.setattr("llm_client.classify_learning", lambda *a, v=verdict, **k: v)
         monkeypatch.setattr(rerun, "with_install_token_retry", lambda iid, fn: fn("tok"))
-        monkeypatch.setattr(rerun, "_gh_post", lambda token, url, body: posted.append((url, body)))
+        monkeypatch.setattr(rerun, "_gh_post", lambda token, url, body, sink=posted: sink.append((url, body)))
         rerun._run_learn(11, "o/r", 7, 5001, 4000, "reply")
         assert posted and all(url.endswith("/reactions") and set(body) == {"content"} for url, body in posted)
