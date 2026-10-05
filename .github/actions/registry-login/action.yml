@@ -26,6 +26,11 @@ inputs:
   retry-delay-seconds:
     description: First backoff delay; doubles after each failed attempt.
     default: '5'
+  attempt-timeout-seconds:
+    description: >-
+      Per-attempt bound on `docker login`, so one stalled connection cannot
+      hang the step until the job-wide timeout; a timed-out attempt is retried.
+    default: '60'
 
 runs:
   using: composite
@@ -38,11 +43,12 @@ runs:
         REGISTRY_PASSWORD: ${{ inputs.password }}
         ATTEMPTS: ${{ inputs.attempts }}
         RETRY_DELAY_S: ${{ inputs.retry-delay-seconds }}
+        ATTEMPT_TIMEOUT_S: ${{ inputs.attempt-timeout-seconds }}
       run: |
         set -uo pipefail
         delay="$RETRY_DELAY_S"
         for attempt in $(seq 1 "$ATTEMPTS"); do
-          if echo "$REGISTRY_PASSWORD" | docker login "$REGISTRY_HOST" \
+          if echo "$REGISTRY_PASSWORD" | timeout "${ATTEMPT_TIMEOUT_S}s" docker login "$REGISTRY_HOST" \
               --username "$REGISTRY_USERNAME" --password-stdin; then
             exit 0
           fi

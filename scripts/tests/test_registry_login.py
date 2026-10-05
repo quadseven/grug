@@ -41,16 +41,21 @@ def test_no_workflow_runs_docker_login_inline():
     )
 
 
-def _run_action(tmp_path: Path, fail_times: int, attempts: int) -> tuple[int, int, str]:
+def _run_action(
+    tmp_path: Path, fail_times: int, attempts: int, hang: bool = False
+) -> tuple[int, int, str]:
     """Run the action's script with a fake docker that fails `fail_times`
-    logins before succeeding. Returns (exit code, docker calls, output)."""
+    logins before succeeding (or, with `hang`, stalls on them instead).
+    Returns (exit code, docker calls, output)."""
     calls = tmp_path / "calls"
     calls.write_text("")
     fake = tmp_path / "docker"
     fake.write_text(
         "#!/usr/bin/env bash\n"
         f'cat >/dev/null; echo x >> "{calls}"\n'
-        f'n=$(wc -l < "{calls}"); [ "$n" -gt {fail_times} ]\n'
+        f'n=$(wc -l < "{calls}")\n'
+        + (f'[ "$n" -gt {fail_times} ] || sleep 30\n' if hang else "")
+        + f'[ "$n" -gt {fail_times} ]\n'
     )
     fake.chmod(fake.stat().st_mode | stat.S_IEXEC)
     env = {
@@ -61,6 +66,7 @@ def _run_action(tmp_path: Path, fail_times: int, attempts: int) -> tuple[int, in
         "REGISTRY_PASSWORD": "p",
         "ATTEMPTS": str(attempts),
         "RETRY_DELAY_S": "0",
+        "ATTEMPT_TIMEOUT_S": "1",
     }
     proc = subprocess.run(
         ["bash", "-c", _action_step()["run"]],
@@ -68,6 +74,7 @@ def _run_action(tmp_path: Path, fail_times: int, attempts: int) -> tuple[int, in
         capture_output=True,
         text=True,
         check=False,
+        timeout=20,
     )
     n = len(calls.read_text().splitlines())
     return proc.returncode, n, proc.stdout + proc.stderr
@@ -89,3 +96,9 @@ def test_gives_up_after_attempts_and_fails_loudly(tmp_path):
 def test_default_retries_more_than_once():
     inputs = yaml.safe_load(_ACTION.read_text())["inputs"]
     assert int(inputs["attempts"]["default"]) > 1
+
+
+def test_a_stalled_login_times_out_and_is_retried(tmp_path):
+    code, n, out = _run_action(tmp_path, fail_times=1, attempts=3, hang=True)
+    assert code == 0, out
+    assert n == 2
