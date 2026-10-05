@@ -56,7 +56,7 @@ query($owner: String!, $repo: String!, $pr: Int!, $after: String,
           comments(first: $perThread) {
             totalCount
             nodes {
-              databaseId body path line originalLine
+              id databaseId isMinimized body path line originalLine
               author { login }
               originalCommit { oid }
             }
@@ -81,8 +81,23 @@ mutation($thread: ID!) {
 """
 
 
+_MINIMIZE_MUTATION = """
+mutation($subject: ID!) {
+  minimizeComment(input: {subjectId: $subject, classifier: OUTDATED}) {
+    minimizedComment { isMinimized }
+  }
+}
+"""
+
+
 class GraphQLError(RuntimeError):
-    """GitHub answered 200 with an `errors` array."""
+    """GitHub answered 200 with an `errors` array. `types` holds GitHub's
+    error type codes (e.g. FORBIDDEN), never the messages, which can echo
+    request content."""
+
+    def __init__(self, types: tuple[str, ...] = ()):
+        super().__init__("graphql returned errors: " + ",".join(types))
+        self.types = types
 
 
 def _graphql(token: str, query: str, variables: dict[str, Any]) -> dict:
@@ -98,9 +113,11 @@ def _graphql(token: str, query: str, variables: dict[str, Any]) -> dict:
     resp.raise_for_status()
     payload = resp.json()
     if payload.get("errors"):
-        # Only the first message's presence matters; the text stays out of
-        # logs because it can echo request content.
-        raise GraphQLError("graphql returned errors")
+        # Messages stay out of logs because they can echo request content;
+        # the type codes are safe and say what went wrong.
+        raise GraphQLError(tuple(
+            str(e.get("type") or "") for e in payload["errors"] if isinstance(e, dict)
+        ))
     return payload.get("data") or {}
 
 
@@ -145,6 +162,9 @@ def _owned_rule_and_line(thread: dict) -> tuple[str, str, int] | None:
     if nodes is None:
         return None
     first = nodes[0]
+    if first.get("isMinimized"):
+        # Collapsed by an earlier pass (the resolve fallback): done.
+        return None
     rule = parse_rule(first.get("body") or "")
     line = first.get("originalLine") or first.get("line")
     if rule is None or not first.get("path") or not line:
@@ -187,6 +207,32 @@ def select_fixed_threads(
     return picked
 
 
+def _resolve_or_collapse(
+    installation_id: int, thread_id: str, comment_id: str | None,
+) -> None:
+    """Resolve the thread; if GitHub forbids it, collapse Elder's comment.
+
+    GitHub answers `FORBIDDEN: Resource not accessible by integration` when
+    the app lacks the permission resolving needs (seen live 2026-10-05),
+    but an app may always minimize its own comment. Collapsing it as
+    OUTDATED, under the "Fixed in" reply, is the same signal to the author.
+    """
+    try:
+        with_install_token_retry(
+            installation_id,
+            lambda tok: _graphql(tok, _RESOLVE_MUTATION, {"thread": thread_id}),
+        )
+        return
+    except GraphQLError as e:
+        if "FORBIDDEN" not in e.types or not comment_id:
+            raise
+    with_install_token_retry(
+        installation_id,
+        lambda tok: _graphql(tok, _MINIMIZE_MUTATION, {"subject": comment_id}),
+    )
+    log.info("elder_thread_collapsed_not_resolved", extra={"thread_id": thread_id})
+
+
 def resolve_fixed_threads(
     installation_id: int, owner: str, repo: str, pull_number: int,
     *, head_sha: str, findings: tuple[Finding, ...],
@@ -203,6 +249,10 @@ def resolve_fixed_threads(
         )
         targets = select_fixed_threads(threads, findings)
         answered = {t["id"] for t in threads if t.get("id") in targets and _already_answered(t)}
+        first_comment_ids = {
+            t["id"]: ((t.get("comments") or {}).get("nodes") or [{}])[0].get("id")
+            for t in threads if t.get("id") in targets
+        }
     except Exception as e:  # noqa: BLE001 - never fail a review for tidying
         log.warning("elder_thread_list_failed",
                     extra={"pr": pr_ref, "kind": type(e).__name__})
@@ -224,12 +274,7 @@ def resolve_fixed_threads(
                         tok, _REPLY_MUTATION, {"thread": tid, "body": body},
                     ),
                 )
-            with_install_token_retry(
-                installation_id,
-                lambda tok, tid=thread_id: _graphql(
-                    tok, _RESOLVE_MUTATION, {"thread": tid},
-                ),
-            )
+            _resolve_or_collapse(installation_id, thread_id, first_comment_ids.get(thread_id))
             resolved += 1
         except Exception as e:  # noqa: BLE001 - one bad thread must not stop the rest
             log.warning("elder_thread_resolve_failed",
