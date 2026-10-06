@@ -68,13 +68,12 @@ def create(
         f"{name}-rum-app",
         name=name,
         type="browser",
-        # ALL = capture every RUM event type (view/action/error/resource/
-        # long_task). The narrower ERROR_FOCUSED_MODE drops view/action
-        # events which would defeat the point of installing RUM.
-        rum_event_processing_state="ALL",
-        # MAX = keep Product Analytics aggregations long-term. NONE
-        # would disable Product Analytics derivation entirely.
-        product_analytics_retention_state="MAX",
+        # NONE (2026-10-05): the operator turned Datadog off for cost, so
+        # RUM ingests nothing. The SDK in web/ stays wired and is inert.
+        # To bring RUM back: ALL (every event type; ERROR_FOCUSED_MODE
+        # drops view/action events) and MAX (long-term Product Analytics).
+        rum_event_processing_state="NONE",
+        product_analytics_retention_state="NONE",
         opts=pulumi.ResourceOptions(provider=provider),
     )
 

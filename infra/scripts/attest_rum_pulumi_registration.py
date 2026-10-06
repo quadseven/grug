@@ -12,8 +12,9 @@ together:
   1. Define a `datadog.RumApplication` resource.
   2. Pass `name="grug-web"` (the canonical service tag — the RumInstrumentation contract).
   3. Use `type="browser"` (catches accidental drift to ios/android/etc).
-  4. Set `rum_event_processing_state="ALL"` (anything else drops event
-     types we want to capture).
+  4. Set `rum_event_processing_state="NONE"`: the operator turned Datadog
+     off on 2026-10-05 for cost, so RUM must ingest nothing. Set this back
+     to "ALL" together with dd_rum.py when RUM returns.
   5. Export `app.id` to SSM at name `/grug/dd-rum-application-id`.
   6. Export `app.client_token` to SSM at name `/grug/dd-rum-client-token`.
   7. Both SSM params wrap their value in `pulumi.Output.secret(...)`
@@ -34,7 +35,7 @@ COMPONENT_PY = REPO_ROOT / "infra/pulumi/components/dd_rum.py"
 
 CANONICAL_SERVICE_NAME = "grug-web"
 CANONICAL_TYPE = "browser"
-CANONICAL_PROCESSING_STATE = "ALL"
+CANONICAL_PROCESSING_STATE = "NONE"  # "ALL" while RUM was on (pre 2026-10-05)
 SSM_APP_ID_PATH = "/grug/dd-rum-application-id"
 SSM_CLIENT_TOKEN_PATH = "/grug/dd-rum-client-token"
 
