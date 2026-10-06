@@ -537,6 +537,9 @@ class CommentRecord(TypedDict):
     author_login: NotRequired[str]
     trust_reactors: NotRequired[bool]
     last_verdict: NotRequired[Optional[str]]
+    # Epoch seconds when the record expires (created + the record TTL); the
+    # reaction poll derives a comment's age from it.
+    ttl: NotRequired[int]
 
 
 def _comment_record_sk(comment_id: int | str) -> str:
@@ -1662,6 +1665,8 @@ def _decode_comment_record_rows(rows: list[tuple[Any, ...]]) -> list[CommentReco
             record["author_login"] = str(item["author_login"])
         if item.get("trust_reactors"):
             record["trust_reactors"] = True
+        if isinstance(item.get("ttl"), (int, float)):
+            record["ttl"] = int(item["ttl"])
         out.append(record)
     return out
 

@@ -30,6 +30,9 @@ def _wire(monkeypatch, *, installs, records_for, retry, poll):
     monkeypatch.setattr(poller_handler, "list_comment_records", records_for)
     monkeypatch.setattr(poller_handler, "with_install_token_retry", retry)
     monkeypatch.setattr(poller_handler, "poll_and_annotate", poll)
+    # The rate-limit read is a real GET; tests never reach GitHub, and an
+    # unreadable budget never blocks the poll.
+    monkeypatch.setattr(poller_handler, "_github_core_budget", lambda token: None)
     # #407: stub the auto-replay to a no-op so reaction-poll tests don't hit
     # GitHub and their exact-result assertions stay about the reaction poll.
     monkeypatch.setattr(poller_handler, "_replay_missed_deliveries", lambda: {})

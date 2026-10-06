@@ -306,3 +306,39 @@ def test_primary_rate_limit_403_never_refreshes_the_token(_stub_token):
     with pytest.raises(httpx.HTTPStatusError):
         gh_auth.with_install_token_retry(123, fn)
     assert calls == ["token-1-refresh=False"]
+
+
+def test_primary_rate_limit_exhaustion_is_logged_by_name(_stub_token, caplog):
+    """2026-10-05: grug exhausted its hourly GitHub budget twice and the only
+    trace was an anonymous 403 per call. Name it, with the reset time, so the
+    next occurrence is diagnosable from the logs alone."""
+    def fn(token: str) -> None:
+        raise httpx.HTTPStatusError(
+            "403",
+            request=httpx.Request("GET", "https://api.github.com/repos"),
+            response=httpx.Response(
+                403,
+                headers={"X-RateLimit-Remaining": "0", "X-RateLimit-Reset": "1791218759",
+                         "X-RateLimit-Resource": "core"},
+                json={"message": "API rate limit exceeded for installation ID 1."},
+            ),
+        )
+
+    with caplog.at_level("ERROR"), pytest.raises(httpx.HTTPStatusError):
+        gh_auth.with_install_token_retry(123, fn)
+    ev = [r for r in caplog.records if r.getMessage() == "github_primary_rate_limit_exhausted"]
+    assert ev and ev[0].reset_epoch == 1791218759 and ev[0].resource == "core"
+    assert ev[0].installation_id == 123
+
+
+def test_an_ordinary_403_is_not_reported_as_rate_limit_exhaustion(_stub_token, caplog):
+    def fn(token: str) -> None:
+        raise httpx.HTTPStatusError(
+            "403",
+            request=httpx.Request("GET", "https://api.github.com/repos"),
+            response=httpx.Response(403, json={"message": "Resource not accessible"}),
+        )
+
+    with caplog.at_level("ERROR"), pytest.raises(httpx.HTTPStatusError):
+        gh_auth.with_install_token_retry(123, fn)
+    assert not [r for r in caplog.records if r.getMessage() == "github_primary_rate_limit_exhausted"]

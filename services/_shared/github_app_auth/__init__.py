@@ -266,6 +266,31 @@ def _emit_github_api_result(ok: bool) -> None:
         log.debug("github_api_error_gauge_emit_failed", extra={"kind": type(e).__name__})
 
 
+def _log_if_primary_rate_limit(installation_id: int, response: httpx.Response) -> None:
+    """Name the installation's hourly budget running out.
+
+    On 2026-10-05 the budget was exhausted twice and the only trace was an
+    anonymous 403 per call: every read and write fails, no Retry-After, and a
+    fresh token does not help, until the window resets. This is the log line
+    that says so, with when it ends. Best-effort; never raises."""
+    try:
+        if response.status_code not in (403, 429):
+            return
+        if response.headers.get("X-RateLimit-Remaining") != "0":
+            return
+        reset = response.headers.get("X-RateLimit-Reset", "")
+        log.error(
+            "github_primary_rate_limit_exhausted",
+            extra={
+                "installation_id": installation_id,
+                "resource": response.headers.get("X-RateLimit-Resource", ""),
+                "reset_epoch": int(reset) if reset.isdigit() else None,
+            },
+        )
+    except Exception as e:  # noqa: BLE001 - diagnostics never mask the original error
+        log.debug("rate_limit_log_failed", extra={"kind": type(e).__name__})
+
+
 def with_install_token_retry(installation_id: int, fn):
     """Run `fn(token)`, retrying transient failures.
 
@@ -330,6 +355,7 @@ def with_install_token_retry(installation_id: int, fn):
                 )
                 time.sleep(sleep_seconds)
                 continue
+            _log_if_primary_rate_limit(installation_id, e.response)
             _emit_github_api_result(False)
             raise
         else:

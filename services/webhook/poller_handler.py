@@ -21,6 +21,7 @@ from __future__ import annotations
 
 import logging
 import os
+import time
 from datetime import datetime, timedelta, timezone
 from typing import Any, Callable
 
@@ -34,8 +35,10 @@ from adapters.install_store import (  # type: ignore
     list_pulse_enabled_repos,
     list_reopen_watch_repos,
 )
+import httpx
 from github_app_auth import with_install_token_retry
 from observability import configure_logging
+from personas.code_reviewer.reaction_cadence import reaction_poll_due
 from personas.code_reviewer.reactions import poll_and_annotate
 
 # The CronJob entry is a bare `python -c "... handler({}, None)"` - unlike
@@ -154,6 +157,34 @@ def _hygiene_watch_runner(token: str, install_id: int, repos: list[dict[str, Any
     return run_hygiene_watch_for_install(token, install_id, repos)
 
 
+# The reaction poll is calibration data; Chief and Elder are why the hourly
+# GitHub budget exists. Below this fraction remaining the poll yields.
+_LOW_BUDGET_FRACTION = 0.30
+
+
+def _now_epoch() -> float:
+    return time.time()
+
+
+def _github_core_budget(token: str) -> tuple[int, int] | None:
+    """(remaining, limit) of the installation's core REST budget, or None when
+    it cannot be read. `GET /rate_limit` does not count against the limit."""
+    try:
+        resp = httpx.get(
+            "https://api.github.com/rate_limit",
+            headers={
+                "Authorization": f"Bearer {token}",
+                "Accept": "application/vnd.github+json",
+            },
+            timeout=10,
+        )
+        resp.raise_for_status()
+        core = resp.json()["resources"]["core"]
+        return int(core["remaining"]), int(core["limit"])
+    except (httpx.HTTPError, ValueError, KeyError, TypeError):
+        return None
+
+
 def _reaction_poll_pass(installs: list[int]) -> tuple[int, int, int]:
     """The reactions poll itself (#247b) - the ORIGINAL scheduled pass,
     predating the store-driven shape `_run_repo_scoped_pass` covers
@@ -182,12 +213,30 @@ def _reaction_poll_pass(installs: list[int]) -> tuple[int, int, int]:
             records = list_comment_records(install_id)
             if not records:
                 continue
-            polled_records += len(records)
+            # Age-based cadence (reaction_cadence.py): old comments are
+            # re-checked far less often than new ones.
+            now = _now_epoch()
+            due = [r for r in records if reaction_poll_due(r, now)]
+            if not due:
+                continue
+            # Counted as attempted before the token fetch, as before.
+            polled_records += len(due)
+            budget = with_install_token_retry(install_id, _github_core_budget)
+            if budget is not None and budget[0] < budget[1] * _LOW_BUDGET_FRACTION:
+                polled_records -= len(due)
+                log.warning(
+                    "reaction_poll_skipped_low_budget",
+                    extra={
+                        "install_id": install_id, "remaining": budget[0],
+                        "limit": budget[1], "due": len(due),
+                    },
+                )
+                continue
             submitted += with_install_token_retry(
                 install_id,
-                lambda token: poll_and_annotate(
-                    records,
-                    install_id=install_id,
+                lambda token, batch=due, iid=install_id: poll_and_annotate(
+                    batch,
+                    install_id=iid,
                     fetch_token=lambda: token,
                 ),
             ) or 0
