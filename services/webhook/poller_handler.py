@@ -234,9 +234,9 @@ def _reaction_poll_pass(installs: list[int]) -> tuple[int, int, int]:
                 continue
             submitted += with_install_token_retry(
                 install_id,
-                lambda token: poll_and_annotate(
-                    due,
-                    install_id=install_id,
+                lambda token, batch=due, iid=install_id: poll_and_annotate(
+                    batch,
+                    install_id=iid,
                     fetch_token=lambda: token,
                 ),
             ) or 0
