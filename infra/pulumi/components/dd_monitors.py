@@ -1278,7 +1278,9 @@ def create_all(
         type="api",
         subtype="http",
         name=f"[grug-webhook][{env}] uptime — GET /livez → 200",
-        status="live",
+        # Paused 2026-10-05: the operator turned Datadog off for cost.
+        # Set back to "live" to resume the uptime check.
+        status="paused",
         locations=["aws:us-east-1"],
         message=(
             f"{_page(notify_handle)}\n"
