@@ -45,6 +45,15 @@ rather than repointing HOME, since the pods run readOnlyRootFilesystem as uid
 10001 with --no-create-home and a cache write is the thing that crashed
 semgrep there.
 
+TEST FILES. Bandit-style rules about hardcoded secrets (S105/S106/S107),
+`assert` (S101) and non-cryptographic randomness (S311) fire on fixtures,
+fake tokens and seeded randomness, which is what test code is made of. A fake
+`TOKEN = "abc123"` in a test file once raised a high-severity marking that
+alone failed a PR's review check. Those rules are therefore dropped for test
+files (see `_is_test_file`). Real committed secrets in tests are still caught
+by the separate `secret_scan` source, which matches key SHAPES, not names.
+Every other rule, and every rule in non-test files, is unchanged.
+
 Diff-anchored like every other source: only violations on lines THIS PR
 ADDED are reported, so Elder flags what the PR introduces rather than
 pre-existing debt the author did not touch.
@@ -170,6 +179,27 @@ _HIGH_PREFIXES = (
 )
 
 
+# Rules that are idiomatic noise in test code: assert (S101), hardcoded
+# password/token constants and arguments (S105-S107), seeded non-crypto
+# random (S311). Dropped for test files only.
+_TEST_NOISE_RULES = frozenset({"S101", "S105", "S106", "S107", "S311"})
+_TEST_DIRS = frozenset({"tests", "test", "testing"})
+
+
+def _is_test_file(path: str) -> bool:
+    """True for test files: a path COMPONENT named tests/test/testing, or a
+    basename of `test_*.py`, `*_test.py` or `conftest.py`. Component match,
+    not substring, so `contests/x.py` and `latest.py` are not test files."""
+    parts = path.split("/")
+    if any(p in _TEST_DIRS for p in parts[:-1]):
+        return True
+    name = parts[-1]
+    return name == "conftest.py" or (
+        name.endswith(".py")
+        and (name.startswith("test_") or name.endswith("_test.py"))
+    )
+
+
 def _severity_for(code: str) -> Severity:
     """`high` for the security families, `medium` for the rest.
 
@@ -292,6 +322,16 @@ def scan_ruff(
     return _map_results(results, prefix, added)
 
 
+def _is_reportable(
+    path: str, row: int, code: str, added: dict[str, set[int]]
+) -> bool:
+    """False for test-file noise rules and for pre-existing violations on
+    lines this PR did not add."""
+    if code in _TEST_NOISE_RULES and _is_test_file(path):
+        return False
+    return row in added.get(path, set())
+
+
 def _map_results(
     results: object, prefix: str, added: dict[str, set[int]]
 ) -> tuple[Finding, ...]:
@@ -312,8 +352,8 @@ def _map_results(
         msg = r.get("message")
         if not path or not isinstance(row, int) or not code or not msg:
             continue
-        if row not in added.get(path, set()):
-            continue  # pre-existing violation on an untouched line
+        if not _is_reportable(path, row, code, added):
+            continue
         findings.append(
             Finding(
                 file=path,
