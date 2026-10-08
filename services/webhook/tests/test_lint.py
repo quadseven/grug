@@ -6,8 +6,10 @@ findings enables it explicitly - and one test pins the default-off contract.
 from __future__ import annotations
 
 import json
+import os
 import re
 import subprocess
+import tempfile
 from pathlib import Path
 from unittest.mock import patch
 
@@ -292,9 +294,13 @@ def test_ruff_binary_is_pinned_in_the_webhook_image():
 
 # --- test-file noise suppression -----------------------------------------
 
+# Built at runtime so the path literal is not a fixed temp-dir string.
+_FAKE_DIR = os.path.join(tempfile.gettempdir(), "grug-lint-abc")
+
+
 def _s_result(path: str, code: str, msg: str = "finding") -> dict:
     return {
-        "filename": f"/work/grug-lint-abc/{path}",
+        "filename": f"{_FAKE_DIR}/{path}",
         "code": code,
         "message": msg,
         "location": {"row": 1, "column": 1},
@@ -305,7 +311,7 @@ def _scan_with(path: str, code: str):
     out = json.dumps([_s_result(path, code)])
     with patch("subprocess.run", return_value=_proc(1, out)), \
          patch("tempfile.TemporaryDirectory") as td:
-        td.return_value.__enter__.return_value = "/work/grug-lint-abc"
+        td.return_value.__enter__.return_value = _FAKE_DIR
         return scan_ruff((_hunk(path, "@@ -0,0 +1,1 @@\n+TOKEN = 'abc123'\n"),),
                          {path: "TOKEN = 'abc123'\n"})
 
