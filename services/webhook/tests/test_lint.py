@@ -358,10 +358,12 @@ def test_secret_scan_still_flags_key_shaped_literal_in_test_file():
     from personas.code_reviewer.secret_scan import scan_secrets
 
     path = "production/app/tests/test_setup.py"
+    # Assembled at runtime so this file carries no key-shaped literal itself.
+    fake_key = "ghp_" + "AbCdEfGhIjKlMnOpQrStUvWxYz0123456789"
     diff = (
         f"diff --git a/{path} b/{path}\n--- a/{path}\n+++ b/{path}\n"
         "@@ -0,0 +1,1 @@\n"
-        '+KEY = "ghp_AbCdEfGhIjKlMnOpQrStUvWxYz0123456789"\n'
+        f'+KEY = "{fake_key}"\n'
     )
     assert len(scan_secrets(parse_diff(diff))) == 1
     # ...while the lint S105 noise on the same file is dropped.
