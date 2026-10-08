@@ -261,17 +261,22 @@ _OPENROUTER_MODEL = "anthropic/claude-haiku-4.5"
 # (bare "deepseek-v4.1-flash", no vendor prefix, matching this file's own
 # established practice of never trusting the docs-implied id format).
 _OPENCODE_GO_URL = "https://opencode.ai/zen/go/v1/chat/completions"
-# The primary slot is the free `longcat-2.5-preview-free`. History: on
-# 2026-10-05 `space-bunny-free` (free, unlimited, limited-time) held it; the
-# promotion ended around 05:46 UTC on 2026-10-06 and the model began answering
-# HTTP 400 "Upstream request failed: Model is unavailable". The per-model bench
-# (`_note_model_response`) benched it within six minutes, so the chain already
-# ran Longcat first; this makes that the declared default instead of a dead
-# model that is re-probed (3 failed calls) every time its bench expires. The
-# paid `GRUG_OPENCODE_GO_FALLBACK_MODEL` (deepseek-v4.1-flash) follows it.
-# Space Bunny's low-effort body stays in `_opencode_go_extra_body` in case it
-# returns. Override the primary with GRUG_OPENCODE_GO_MODEL.
-_OPENCODE_GO_DEFAULT_MODEL = "longcat-2.5-preview-free"
+# The primary slot is paid `deepseek-v4.1-flash` (2026-10-08). OpenCode Go
+# limits are monthly dollars per model ($60 for this one on a $10 plan), and a
+# grug review (~25k uncached input, ~400 output tokens) costs about $0.004
+# off-peak, so one plan carries roughly 15k reviews a month against ~3k real
+# ones. Measured on a ~11k-token review payload: 3 s per call with thinking
+# disabled (`_opencode_go_extra_body`). The cheaper-per-token MiMo-V2.6/2.5 and
+# GLM-5.3-Flash were slower (10-17 s, frequent timeouts) and MiMo answered
+# empty on one of two tries; Hy3 answered HTTP 400. The free
+# `longcat-2.5-preview-free` (unlimited, limited-time) timed out on ~40k-token
+# cohorts, so it follows as the fallback tier (`GRUG_OPENCODE_GO_FALLBACK_MODEL`)
+# where an unreliable-but-free model costs nothing. History: space-bunny-free
+# held the slot until its promotion ended ~05:46 UTC 2026-10-06 (HTTP 400
+# "Model is unavailable"); its low-effort body stays in
+# `_opencode_go_extra_body` in case it returns. Override the primary with
+# GRUG_OPENCODE_GO_MODEL.
+_OPENCODE_GO_DEFAULT_MODEL = "deepseek-v4.1-flash"
 _OPENCODE_GO_DEFAULT_WIRE = "chat"
 
 # Review-only OpenRouter configuration. Teller, /grug ask, and the judge keep

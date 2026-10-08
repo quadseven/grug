@@ -191,9 +191,9 @@ spec:
             # unparseable JSON. OpenCode Go has refused every call with "Go
             # usage limit exceeded" since 2026-09-24, so without this tier
             # every review cohort landed on the Sparks.
-            # Paid fallback right after the free OpenCode Go tiers: keeps Elder on a cheap
-            # model when a free promotion ends. Unset = no tier.
-            - {name: GRUG_OPENCODE_GO_FALLBACK_MODEL, value: "deepseek-v4.1-flash"}
+            # Free fallback right after the paid DeepSeek primary (default model in
+            # llm_client.py): costs nothing when DeepSeek is benched. Unset = no tier.
+            - {name: GRUG_OPENCODE_GO_FALLBACK_MODEL, value: "longcat-2.5-preview-free"}
             - {name: GRUG_CLOUD_FREE_TIER_MODEL, value: "nvidia/nemotron-3-super-120b-a12b:free"}
             - {name: GRUG_OPENCODE_GO_API_KEY_SSM, value: /infra/llm/opencode_go_api_key}
             - {name: GRUG_PROMPT_EXPERIMENT_SSM, value: /grug/elder-prompt-experiment}
