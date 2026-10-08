@@ -4890,15 +4890,14 @@ def test_every_cave_arm_turns_thinking_off_in_both_dialects(arm, monkeypatch) ->
     assert cfg.extra_body["chat_template_kwargs"] == {"enable_thinking": False}
 
 
-def test_the_default_primary_is_paid_deepseek_flash() -> None:
-    """Quota math (docs prices x grug's ~25k-in/400-out review) puts one Go plan
-    at ~15k DeepSeek V4.1 Flash reviews a month against ~3k real ones, and it
-    answered in 3 s where MiMo/GLM timed out. The free Longcat is the fallback
-    tier via GRUG_OPENCODE_GO_FALLBACK_MODEL. The production default is read
-    from the constant, not the pinned test primary."""
-    assert lc._OPENCODE_GO_DEFAULT_MODEL == "deepseek-v4.1-flash"
+def test_the_default_primary_is_mimo_v2_5_with_thinking_off() -> None:
+    """assay review_quality (2026-10-08): mimo-v2.5 with thinking disabled caught
+    100% of planted defects at 10k and 40k tokens with 0% timeouts. The
+    production default is read from the constant, not the pinned test primary."""
+    assert lc._OPENCODE_GO_DEFAULT_MODEL == "mimo-v2.5"
+    assert lc._opencode_go_extra_body("mimo-v2.5", "chat") == {"thinking": {"type": "disabled"}}
     assert lc._opencode_go_extra_body("deepseek-v4.1-flash", "chat") == {"thinking": {"type": "disabled"}}
-    assert lc._opencode_go_extra_body("longcat-2.5-preview-free", "chat") == {}
+assert lc._opencode_go_extra_body("longcat-2.5-preview-free", "chat") == {}
 
 
 def test_space_bunny_keeps_its_low_effort_body_in_case_it_returns(monkeypatch) -> None:
