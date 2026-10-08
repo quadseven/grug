@@ -4890,14 +4890,15 @@ def test_every_cave_arm_turns_thinking_off_in_both_dialects(arm, monkeypatch) ->
     assert cfg.extra_body["chat_template_kwargs"] == {"enable_thinking": False}
 
 
-def test_the_default_primary_is_mimo_v2_6_flash_with_thinking_off() -> None:
-    """assay review_quality (2026-10-08, pooled): mimo-v2.6-flash with thinking
-    disabled caught 100% of planted defects at 10k and 40k tokens with 0-2%
-    timeouts. The
-    production default is read from the constant, not the pinned test primary."""
-    assert lc._OPENCODE_GO_DEFAULT_MODEL == "mimo-v2.6-flash"
-    assert lc._opencode_go_extra_body("mimo-v2.6-flash", "chat") == {"thinking": {"type": "disabled"}}
+def test_the_default_primary_is_deepseek_flash_with_thinking_off() -> None:
+    """assay review_quality under this reviewer's real system prompt (2026-10-08):
+    deepseek-v4.1-flash with thinking disabled caught 100% / 93% of planted
+    defects at 10k / 40k tokens with 0% timeouts; the MiMo models fell to
+    71-86% with timeouts. The production default is read from the constant,
+    not the pinned test primary."""
+    assert lc._OPENCODE_GO_DEFAULT_MODEL == "deepseek-v4.1-flash"
     assert lc._opencode_go_extra_body("deepseek-v4.1-flash", "chat") == {"thinking": {"type": "disabled"}}
+    assert lc._opencode_go_extra_body("mimo-v2.5", "chat") == {"thinking": {"type": "disabled"}}
 assert lc._opencode_go_extra_body("longcat-2.5-preview-free", "chat") == {}
 
 

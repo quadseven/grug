@@ -261,23 +261,22 @@ _OPENROUTER_MODEL = "anthropic/claude-haiku-4.5"
 # (bare "deepseek-v4.1-flash", no vendor prefix, matching this file's own
 # established practice of never trusting the docs-implied id format).
 _OPENCODE_GO_URL = "https://opencode.ai/zen/go/v1/chat/completions"
-# The primary slot is paid `mimo-v2.6-flash` (2026-10-08), chosen from the
-# pooled assay `review_quality` runs (suites/review_quality/results/index.md,
-# 50 calls per size): 100% catch of planted defects at 10k and 40k tokens, 0-2%
-# timeouts at the 45s deadline, p95 ~25s, about $0.0064 per 40k-token review.
-# OpenCode Go limits are monthly dollars per model ($60 on the $10 plan), so
-# that is ~9.4k reviews a month at 40k tokens and ~36k at 10k, against ~3k
-# real ones. Its clean-diff false-positive rate is high (53-67%) like
-# DeepSeek's; mimo-v2.5 is lower (20%) but missed 14% at 40k and timed out
-# 6-8%. Behind it: `GRUG_OPENCODE_GO_SECOND_MODEL=deepseek-v4.1-flash` (2-3s
-# median, 0% timeouts, 6% empty on 40k defect diffs) and the free
-# `GRUG_OPENCODE_GO_FALLBACK_MODEL=longcat-2.5-preview-free` (14-24%
-# timeouts). GLM-5.x, Hy3 and Kimi were slower, costlier or timed out more.
-# History: space-bunny-free held the slot until its promotion ended ~05:46 UTC
-# 2026-10-06 (HTTP 400 "Model is unavailable"); its low-effort body stays in
-# `_opencode_go_extra_body` in case it returns. Override with
-# GRUG_OPENCODE_GO_MODEL.
-_OPENCODE_GO_DEFAULT_MODEL = "mimo-v2.6-flash"
+# The primary slot is paid `deepseek-v4.1-flash` (2026-10-08), ranked in the
+# assay `review_quality` suite WITH THIS REVIEWER'S REAL SYSTEM PROMPT
+# (`--system-file`; a stand-in prompt had picked mimo-v2.6-flash, which then
+# timed out on live cohorts): 100% / 93% catch of planted defects at 10k / 40k
+# tokens, 0% timeouts, 3-4s median, about $0.0078 per 40k-token review. OpenCode
+# Go limits are monthly dollars per model ($60 on the $10 plan), so that is
+# ~7.7k reviews a month at 40k tokens and ~22k at 10k, against ~3k real ones.
+# Behind it: `GRUG_OPENCODE_GO_SECOND_MODEL=mimo-v2.5` (86% at 40k, no
+# timeouts, a different family for the second opinion) and the free
+# `GRUG_OPENCODE_GO_FALLBACK_MODEL=longcat-2.5-preview-free` (15-30%
+# timeouts). Kimi, Longcat-2.0, GLM-5.2 and Hy3 timed out or errored on 20-75%
+# of calls under the real prompt. History: space-bunny-free held the slot until
+# its promotion ended ~05:46 UTC 2026-10-06 (HTTP 400 "Model is unavailable");
+# its low-effort body stays in `_opencode_go_extra_body` in case it returns.
+# Override with GRUG_OPENCODE_GO_MODEL.
+_OPENCODE_GO_DEFAULT_MODEL = "deepseek-v4.1-flash"
 _OPENCODE_GO_DEFAULT_WIRE = "chat"
 
 # Review-only OpenRouter configuration. Teller, /grug ask, and the judge keep
@@ -691,7 +690,8 @@ def _opencode_go_extra_body(model: str, wire: str) -> dict:
     """Turn DeepSeek's and MiMo's hidden reasoning off on the chat wire.
 
     MiMo (2026-10-08, assay review_quality): `thinking: disabled` gave 100%
-    catch with 0-2% timeouts at 10k and 40k tokens.
+    catch with 0-2% timeouts at 10k and 40k tokens (stand-in prompt; under the
+    real prompt it ranks second to DeepSeek).
 
     Measured live 2026-09-22 on a real 7k-token review prompt: with thinking
     on, deepseek-v4.1-flash spent all 8192 output tokens on reasoning,
