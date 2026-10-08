@@ -68,6 +68,7 @@ import tempfile
 
 from personas.code_reviewer.diff_parser import DiffHunk
 from personas.code_reviewer.persona import Finding
+from personas.code_reviewer.test_paths import is_test_file
 from review_types import Severity  # single source (#250)
 # Reuse the canonical added-lines walk rather than a third copy of it
 # (standard-pattern-reuse-or-elect): complexity._changed_by_file already
@@ -183,21 +184,7 @@ _HIGH_PREFIXES = (
 # password/token constants and arguments (S105-S107), seeded non-crypto
 # random (S311). Dropped for test files only.
 _TEST_NOISE_RULES = frozenset({"S101", "S105", "S106", "S107", "S311"})
-_TEST_DIRS = frozenset({"tests", "test", "testing"})
-
-
-def _is_test_file(path: str) -> bool:
-    """True for test files: a path COMPONENT named tests/test/testing, or a
-    basename of `test_*.py`, `*_test.py` or `conftest.py`. Component match,
-    not substring, so `contests/x.py` and `latest.py` are not test files."""
-    parts = path.split("/")
-    if any(p in _TEST_DIRS for p in parts[:-1]):
-        return True
-    name = parts[-1]
-    return name == "conftest.py" or (
-        name.endswith(".py")
-        and (name.startswith("test_") or name.endswith("_test.py"))
-    )
+_is_test_file = is_test_file  # kept: lint tests and callers use this name
 
 
 def _severity_for(code: str) -> Severity:
