@@ -56,7 +56,7 @@ query($owner: String!, $repo: String!, $pr: Int!, $after: String,
           comments(first: $perThread) {
             totalCount
             nodes {
-              id databaseId isMinimized body path line originalLine
+              id databaseId isMinimized url body path line originalLine
               author { login }
               originalCommit { oid }
             }
@@ -236,17 +236,21 @@ def _resolve_or_collapse(
 def resolve_fixed_threads(
     installation_id: int, owner: str, repo: str, pull_number: int,
     *, head_sha: str, findings: tuple[Finding, ...],
+    threads: list[dict] | None = None,
 ) -> int:
     """Reply "fixed in <sha>" and resolve each qualifying Elder thread.
 
-    Returns the number resolved. Never raises.
+    `threads` is an already-fetched listing (shared with the carry-forward
+    pass so a review lists once); None fetches it here. Returns the number
+    resolved. Never raises.
     """
     pr_ref = f"{owner}/{repo}#{pull_number}"
     try:
-        threads = with_install_token_retry(
-            installation_id,
-            lambda tok: _fetch_threads(tok, owner, repo, pull_number),
-        )
+        if threads is None:
+            threads = with_install_token_retry(
+                installation_id,
+                lambda tok: _fetch_threads(tok, owner, repo, pull_number),
+            )
         targets = select_fixed_threads(threads, findings)
         answered = {t["id"] for t in threads if t.get("id") in targets and _already_answered(t)}
         first_comment_ids = {
