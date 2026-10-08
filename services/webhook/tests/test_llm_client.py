@@ -28,6 +28,7 @@ def _patch_keys(monkeypatch):
     # Module-level breaker state must not leak between tests.
     monkeypatch.setattr(lc, "_opencode_go_blocked_until", 0.0, raising=False)
     monkeypatch.setattr(lc, "_bench_state", {}, raising=False)
+    monkeypatch.setattr(lc, "_slow_bench_state", {}, raising=False)
     monkeypatch.delenv("GRUG_OPENCODE_GO_FALLBACK_MODEL", raising=False)
     monkeypatch.delenv("GRUG_CLOUD_FREE_TIER_MODEL", raising=False)
     monkeypatch.setenv("GRUG_CAVE_GATEWAY_URL", "http://cave.test")
@@ -5326,3 +5327,223 @@ def test_primary_reasoning_model_gets_the_longer_chain_timeout(monkeypatch) -> N
     chunks (2026-10-05) against a 25s chain timeout: 14 ReadTimeouts that
     day, each a wasted tier walk. The primary gets the fallback-tier 45s."""
     assert lc._opencode_go_chain_config().timeout_seconds == lc._POOLSIDE_CHAIN_TIMEOUT_SECONDS
+
+
+# --- slow bench: a model that keeps timing out -----------------------------
+
+_GO = "opencode-go"
+_MSG = [{"role": "user", "content": "hi"}]
+
+
+def _timeout(cfg: lc.BackendConfig, n: int = 1, kind=httpx.ReadTimeout) -> None:
+    """Drive n timeouts through the real attempt path (the failure has no
+    response object)."""
+    for _ in range(n):
+        with patch.object(httpx, "post", side_effect=kind("slow")):
+            out = lc._run_llm_attempt(
+                backend=cfg.backend, config=cfg, messages=_MSG, variant="v1", pr_tags={},
+            )
+        assert out.error_kind == "transport"
+
+
+def _slow_clock(monkeypatch, start: float = 1000.0) -> list[float]:
+    clock = [start]
+    monkeypatch.setattr(lc.time, "time", lambda: clock[0])
+    return clock
+
+
+def test_three_timeouts_slow_bench_the_model(monkeypatch, caplog) -> None:
+    import observability
+
+    emitted: list[tuple] = []
+    monkeypatch.setattr(
+        observability, "emit_count",
+        lambda name, value, tags=None: emitted.append((name, value, tags)),
+    )
+    monkeypatch.setenv("GRUG_OPENCODE_GO_FALLBACK_MODEL", "deepseek-v4.1-flash")
+    cfg = _go_cfg()
+    with caplog.at_level("WARNING"):
+        _timeout(cfg, 3)
+    assert lc._model_is_slow_benched(_GO, "space-bunny-free")
+    assert not lc._model_is_benched(_GO, "space-bunny-free")
+    assert "space-bunny-free" not in _free_models()
+    rec = [r for r in caplog.records if r.getMessage() == "llm_model_slow_benched"]
+    assert len(rec) == 1
+    assert (rec[0].backend, rec[0].model, rec[0].bench_seconds) == (_GO, "space-bunny-free", 600.0)
+    assert emitted == [(
+        "grug.elder.model_slow_benched", 1,
+        {"backend": _GO, "model": "space-bunny-free"},
+    )]
+
+
+def test_two_timeouts_do_not_slow_bench(monkeypatch) -> None:
+    monkeypatch.setenv("GRUG_OPENCODE_GO_FALLBACK_MODEL", "deepseek-v4.1-flash")
+    _timeout(_go_cfg(), 2)
+    assert not lc._model_is_slow_benched(_GO, "space-bunny-free")
+    assert "space-bunny-free" in _free_models()
+
+
+def test_timeouts_outside_the_window_do_not_add_up(monkeypatch) -> None:
+    clock = _slow_clock(monkeypatch)
+    cfg = _go_cfg()
+    _timeout(cfg, 2)
+    clock[0] += lc._SLOW_BENCH_WINDOW_SECONDS + 1
+    _timeout(cfg, 1)
+    assert not lc._model_is_slow_benched(_GO, "space-bunny-free")
+
+
+@pytest.mark.parametrize("kind", [httpx.ConnectTimeout, httpx.ReadTimeout, httpx.PoolTimeout])
+def test_every_timeout_kind_counts(monkeypatch, kind) -> None:
+    _timeout(_go_cfg(), 3, kind=kind)
+    assert lc._model_is_slow_benched(_GO, "space-bunny-free")
+
+
+def test_non_timeout_transport_errors_do_not_count(monkeypatch) -> None:
+    cfg = _go_cfg()
+    for _ in range(3):
+        with patch.object(httpx, "post", side_effect=httpx.ConnectError("down")):
+            lc._run_llm_attempt(
+                backend=cfg.backend, config=cfg, messages=_MSG, variant="v1", pr_tags={},
+            )
+    assert not lc._model_is_slow_benched(_GO, "space-bunny-free")
+
+
+def test_slow_bench_expires(monkeypatch) -> None:
+    clock = _slow_clock(monkeypatch)
+    _timeout(_go_cfg(), 3)
+    assert lc._model_is_slow_benched(_GO, "space-bunny-free")
+    clock[0] += lc._SLOW_BENCH_BASE_SECONDS + 1
+    assert not lc._model_is_slow_benched(_GO, "space-bunny-free")
+
+
+def test_slow_benched_tier_is_skipped_and_leaves_the_worst_case(monkeypatch) -> None:
+    monkeypatch.setenv("GRUG_REVIEW_BACKEND_PRIORITY", "cloud")
+    monkeypatch.setenv("GRUG_OPENCODE_GO_FALLBACK_MODEL", "deepseek-v4.1-flash")
+    before = lc._cloud_chain_worst_case_s()
+    primary = next(t for t in lc._cloud_chain_tiers() if t.model == "space-bunny-free")
+    _timeout(_go_cfg(), 3)
+    assert _free_models()[0] == "deepseek-v4.1-flash"
+    assert lc._cloud_chain_worst_case_s() == before - primary.timeout_seconds
+
+
+def test_a_success_clears_the_slow_bench_and_the_backoff(monkeypatch) -> None:
+    clock = _slow_clock(monkeypatch)
+    monkeypatch.setenv("GRUG_OPENCODE_GO_FALLBACK_MODEL", "deepseek-v4.1-flash")
+    cfg = _go_cfg()
+    _timeout(cfg, 3)
+    assert lc._model_is_slow_benched(_GO, "space-bunny-free")
+    _call(cfg, httpx.Response(200, json=_openai_json_response('{"findings": []}')))
+    assert not lc._model_is_slow_benched(_GO, "space-bunny-free")
+    assert (_GO, "space-bunny-free") not in lc._slow_bench_state
+    assert "space-bunny-free" in _free_models()
+    # Backoff reset: the next trip is the base length again.
+    clock[0] += 10
+    _timeout(cfg, 3)
+    assert lc._slow_bench_state[(_GO, "space-bunny-free")].benched_until == clock[0] + 600.0
+
+
+def test_slow_bench_doubles_up_to_an_hour(monkeypatch) -> None:
+    clock = _slow_clock(monkeypatch)
+    monkeypatch.setenv("GRUG_OPENCODE_GO_FALLBACK_MODEL", "deepseek-v4.1-flash")
+    cfg = _go_cfg()
+    lengths = []
+    for _ in range(6):
+        _timeout(cfg, 3)
+        entry = lc._slow_bench_state[(_GO, "space-bunny-free")]
+        lengths.append(entry.benched_until - clock[0])
+        clock[0] += lengths[-1] + 1
+    assert lengths == [600.0, 1200.0, 2400.0, 3600.0, 3600.0, 3600.0]
+
+
+def test_a_timeout_never_feeds_the_client_error_bench(monkeypatch) -> None:
+    _timeout(_go_cfg(), 6)
+    assert (_GO, "space-bunny-free") not in lc._bench_state or not lc._model_is_benched(
+        _GO, "space-bunny-free"
+    )
+    assert not lc._bench_state.get((_GO, "space-bunny-free"), lc._BenchEntry()).failures
+
+
+def test_a_client_error_never_feeds_the_slow_bench(monkeypatch) -> None:
+    cfg = _go_cfg()
+    for _ in range(2):
+        _call(cfg, _err(404))
+    _timeout(cfg, 2)
+    assert not lc._model_is_slow_benched(_GO, "space-bunny-free")
+    assert not lc._model_is_benched(_GO, "space-bunny-free")
+    for _ in range(3):
+        _call(cfg, _err(404))
+    assert not lc._model_is_slow_benched(_GO, "space-bunny-free")
+
+
+def test_the_cave_is_never_slow_benched(monkeypatch) -> None:
+    for arm in (Backend.CAVE, Backend.CAVE_REASONER):
+        cave = lc._cave_review_config(arm)
+        assert cave is not None and cave.backend not in lc._BENCH_CLOUD_BACKENDS
+        _timeout(cave, 5)
+        assert not lc._model_is_slow_benched(cave.backend.value, cave.model)
+    assert lc._slow_bench_state == {}
+
+
+def test_every_cloud_tier_slow_benched_still_leaves_one(monkeypatch) -> None:
+    monkeypatch.setenv("GRUG_OPENCODE_GO_FALLBACK_MODEL", "deepseek-v4.1-flash")
+    tiers = lc._cloud_chain_tiers()
+    assert len(tiers) >= 2
+    for tier in tiers:
+        _timeout(tier, 3)
+        assert lc._model_is_slow_benched(tier.backend.value, tier.model)
+    assert len(lc._cloud_chain_tiers()) == 1
+
+
+def test_a_lone_tier_stays_even_when_slow_benched(monkeypatch) -> None:
+    monkeypatch.setattr(lc, "_poolside_chain_config", lambda: None)
+    assert _free_models() == ["space-bunny-free"]
+    _timeout(_go_cfg(), 3)
+    assert lc._model_is_slow_benched(_GO, "space-bunny-free")
+    assert _free_models() == ["space-bunny-free"]
+
+
+def test_the_soonest_to_recover_tier_is_kept_when_all_are_slow_benched(monkeypatch) -> None:
+    clock = _slow_clock(monkeypatch)
+    monkeypatch.setenv("GRUG_OPENCODE_GO_FALLBACK_MODEL", "deepseek-v4.1-flash")
+    monkeypatch.setattr(lc, "_poolside_chain_config", lambda: None)
+    _timeout(_go_cfg(), 3)
+    clock[0] += 5
+    _timeout(_go_cfg("deepseek-v4.1-flash"), 3)
+    assert _free_models() == ["space-bunny-free"]
+
+
+def test_slow_bench_metric_failure_never_escapes(monkeypatch) -> None:
+    import observability
+
+    def boom(*a, **k):
+        raise RuntimeError("statsd down")
+
+    monkeypatch.setattr(observability, "emit_count", boom)
+    lc._announce_model_slow_benched(_GO, "m", 600.0)  # must not raise
+    _timeout(_go_cfg(), 3)  # the tripping path must not raise either
+    assert lc._model_is_slow_benched(_GO, "space-bunny-free")
+
+
+def test_a_slow_primary_is_skipped_on_the_next_review(monkeypatch) -> None:
+    """Longcat-like primary times out on three reviews, then the fourth goes
+    straight to the DeepSeek-like tier with no wait on the slow one."""
+    monkeypatch.setenv("GRUG_REVIEW_BACKEND_PRIORITY", "cloud")
+    monkeypatch.setenv("GRUG_OPENCODE_GO_FALLBACK_MODEL", "deepseek-v4.1-flash")
+    real = _usage_response(_JUNK_FINDING, 15_000, 400)
+    calls: list[str] = []
+
+    def fake_post(*args, **kwargs):
+        model = kwargs["json"]["model"]
+        calls.append(model)
+        if model == "space-bunny-free":
+            raise httpx.ReadTimeout("slow")
+        return real
+
+    with patch.object(httpx, "post", side_effect=fake_post):
+        for _ in range(3):
+            assert review_diff([_hunk()], installation_id=1).kind == "reviewed"
+        assert calls == ["space-bunny-free", "deepseek-v4.1-flash"] * 3
+        calls.clear()
+        out = review_diff([_hunk()], installation_id=1)
+    assert out.kind == "reviewed"
+    assert calls == ["deepseek-v4.1-flash"]
