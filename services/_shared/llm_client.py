@@ -261,15 +261,17 @@ _OPENROUTER_MODEL = "anthropic/claude-haiku-4.5"
 # (bare "deepseek-v4.1-flash", no vendor prefix, matching this file's own
 # established practice of never trusting the docs-implied id format).
 _OPENCODE_GO_URL = "https://opencode.ai/zen/go/v1/chat/completions"
-# 2026-10-05: space-bunny-free is free and unlimited on the same OpenCode Go
-# chat endpoint for a limited time (not used for training, 0-day retention),
-# so it takes the primary slot off the paid quota. It is a reasoning model;
-# `_opencode_go_extra_body` runs it at low effort. On real cohorts of a large infrastructure-repo PR,
-# default effort spent all 8192 output tokens reasoning (95-163s, no content);
-# low answered in 3-8s and caught 3/3 planted bugs twice, where DeepSeek
-# answered one cleanly placed bug with a 6-token empty review. When the promo
-# ends, set GRUG_OPENCODE_GO_MODEL=deepseek-v4.1-flash to revert.
-_OPENCODE_GO_DEFAULT_MODEL = "space-bunny-free"
+# The primary slot is the free `longcat-2.5-preview-free`. History: on
+# 2026-10-05 `space-bunny-free` (free, unlimited, limited-time) held it; the
+# promotion ended around 05:46 UTC on 2026-10-06 and the model began answering
+# HTTP 400 "Upstream request failed: Model is unavailable". The per-model bench
+# (`_note_model_response`) benched it within six minutes, so the chain already
+# ran Longcat first; this makes that the declared default instead of a dead
+# model that is re-probed (3 failed calls) every time its bench expires. The
+# paid `GRUG_OPENCODE_GO_FALLBACK_MODEL` (deepseek-v4.1-flash) follows it.
+# Space Bunny's low-effort body stays in `_opencode_go_extra_body` in case it
+# returns. Override the primary with GRUG_OPENCODE_GO_MODEL.
+_OPENCODE_GO_DEFAULT_MODEL = "longcat-2.5-preview-free"
 _OPENCODE_GO_DEFAULT_WIRE = "chat"
 
 # Review-only OpenRouter configuration. Teller, /grug ask, and the judge keep
@@ -820,9 +822,10 @@ def _opencode_go_chain_config() -> BackendConfig:
             **_BACKEND_CONFIGS[Backend.OPENCODE_GO].extra_body,
             "max_tokens": _CLOUD_CHAIN_MAX_TOKENS,
         },
-        # The primary is a reasoning model (space-bunny-free at low effort):
-        # 17-25s on real 11-33k-token cohorts on 2026-10-05, against a 25s
-        # timeout, gave 14 ReadTimeouts that day. Same 45s as Poolside.
+        # The free primary is slow on large cohorts (a reasoning model took
+        # 17-25s on 11-33k tokens against a 25s timeout, 14 ReadTimeouts on
+        # 2026-10-05; Longcat still times out at 45s on ~40k-token cohorts).
+        # Same 45s as Poolside.
         timeout_seconds=_POOLSIDE_CHAIN_TIMEOUT_SECONDS,
         retry_attempts=1,
         transport_retry_attempts=1,
@@ -848,9 +851,9 @@ class OpencodeGoCircuitOpenError(httpx.RequestError):
 
 
 def _opencode_go_model_is_free(model: str) -> bool:
-    """OpenCode Go's free models (`space-bunny-free`,
-    `longcat-2.5-preview-free`) never count against the paid quota the
-    usage-limit breaker protects, so the breaker must not gate them."""
+    """OpenCode Go's free models (`*-free`, e.g. `longcat-2.5-preview-free`)
+    never count against the paid quota the usage-limit breaker protects, so
+    the breaker must not gate them."""
     return model.endswith("-free")
 
 

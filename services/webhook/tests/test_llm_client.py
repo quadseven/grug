@@ -34,6 +34,20 @@ def _patch_keys(monkeypatch):
     # Fast = single (coder) arm; the deep tests below opt into both arms so a
     # second backend call cannot make every transport fixture run two reviews.
     monkeypatch.setenv("GRUG_REVIEW_DEPTH", "fast")
+    # The chain-mechanics tests below (bench, consensus, fallback order) use a
+    # fixed free primary named "space-bunny-free", so they do not churn when
+    # the production default model changes (it changed on 2026-10-08 when that
+    # model's free promotion ended; test_the_default_primary_is_the_free_longcat
+    # pins the real default).
+    monkeypatch.setattr(lc, "_OPENCODE_GO_MODEL", "space-bunny-free")
+    monkeypatch.setitem(
+        lc._BACKEND_CONFIGS, Backend.OPENCODE_GO,
+        replace(
+            lc._BACKEND_CONFIGS[Backend.OPENCODE_GO],
+            model="space-bunny-free",
+            extra_body=lc._opencode_go_extra_body("space-bunny-free", "chat"),
+        ),
+    )
 
 
 def _hunk(path="src/x.py", body="@@ -1 +1 @@\n-foo\n+bar") -> Hunk:
@@ -4875,7 +4889,16 @@ def test_every_cave_arm_turns_thinking_off_in_both_dialects(arm, monkeypatch) ->
     assert cfg.extra_body["chat_template_kwargs"] == {"enable_thinking": False}
 
 
-def test_space_bunny_is_the_default_and_runs_at_low_effort(monkeypatch) -> None:
+def test_the_default_primary_is_the_free_longcat() -> None:
+    """space-bunny-free's promotion ended around 05:46 UTC on 2026-10-06; it
+    answers HTTP 400 "Model is unavailable". The declared primary is the free
+    Longcat; the paid DeepSeek follows as the fallback tier. The production
+    default is read from the constant, not the pinned test primary."""
+    assert lc._OPENCODE_GO_DEFAULT_MODEL == "longcat-2.5-preview-free"
+    assert lc._opencode_go_extra_body("longcat-2.5-preview-free", "chat") == {}
+
+
+def test_space_bunny_keeps_its_low_effort_body_in_case_it_returns(monkeypatch) -> None:
     """space-bunny-free is free and unlimited on OpenCode Go (limited-time
     promotion), not used for training, 0-day retention. It is a reasoning
     model: at its default effort it spent all 8192 output tokens reasoning on
@@ -4884,7 +4907,6 @@ def test_space_bunny_is_the_default_and_runs_at_low_effort(monkeypatch) -> None:
     rejects reasoning_effort none and thinking.disabled with HTTP 400, so low
     is the floor."""
     monkeypatch.delenv("GRUG_OPENCODE_GO_REASONING_EFFORT", raising=False)
-    assert lc._OPENCODE_GO_DEFAULT_MODEL == "space-bunny-free"
     assert lc._opencode_go_extra_body("space-bunny-free", "chat") == {"reasoning_effort": "low"}
     monkeypatch.setenv("GRUG_OPENCODE_GO_REASONING_EFFORT", "medium")
     assert lc._opencode_go_extra_body("space-bunny-free", "chat") == {"reasoning_effort": "medium"}
