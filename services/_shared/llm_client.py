@@ -1000,12 +1000,77 @@ def _note_model_response(config: BackendConfig, resp: httpx.Response) -> None:
     if resp.status_code < 400:
         with _bench_lock:
             _bench_state.pop(key, None)
+            _slow_bench_state.pop(key, None)
         return
     if not _is_benchable_failure(resp):
         return
     seconds = _record_model_failure(*key, resp.status_code, time.time())
     if seconds is not None:
         _announce_model_benched(*key, resp.status_code, seconds)
+
+
+# Slow bench. A model that is merely slow (not withdrawn) times out on large
+# cohorts and burns its whole timeout before the next tier starts. Three
+# httpx timeouts within ten minutes bench the (backend, model) pair for ten
+# minutes, doubling per repeat up to an hour; any successful response clears
+# it at once. Separate from the 4xx bench above: a timeout never counts
+# there and a 4xx never counts here. Only cloud backends are covered (the
+# Cave is never slow-benched), and the chain never drops its last usable
+# cloud tier (`_cloud_chain_tiers`).
+_SLOW_BENCH_FAILURE_THRESHOLD = 3
+_SLOW_BENCH_WINDOW_SECONDS = 600.0
+_SLOW_BENCH_BASE_SECONDS = 600.0
+_SLOW_BENCH_MAX_SECONDS = 3600.0
+_slow_bench_state: dict[tuple[str, str], _BenchEntry] = {}
+
+
+def _model_is_slow_benched(backend: str, model: str, now: float | None = None) -> bool:
+    current = time.time() if now is None else now
+    with _bench_lock:
+        entry = _slow_bench_state.get((backend, model))
+        return entry is not None and current < entry.benched_until
+
+
+def _record_model_timeout(backend: str, model: str, now: float) -> float | None:
+    """Count one timeout; return the bench duration when it trips the bench."""
+    with _bench_lock:
+        entry = _slow_bench_state.setdefault(
+            (backend, model), _BenchEntry(next_seconds=_SLOW_BENCH_BASE_SECONDS),
+        )
+        if now < entry.benched_until:
+            return None
+        entry.failures = [t for t in entry.failures if now - t < _SLOW_BENCH_WINDOW_SECONDS]
+        entry.failures.append(now)
+        if len(entry.failures) < _SLOW_BENCH_FAILURE_THRESHOLD:
+            return None
+        seconds = entry.next_seconds
+        entry.benched_until = now + seconds
+        entry.next_seconds = min(seconds * 2, _SLOW_BENCH_MAX_SECONDS)
+        entry.failures = []
+        return seconds
+
+
+def _announce_model_slow_benched(backend: str, model: str, seconds: float) -> None:
+    log.warning(
+        "llm_model_slow_benched",
+        extra={"backend": backend, "model": model, "bench_seconds": seconds},
+    )
+    try:
+        from observability import emit_count  # type: ignore  # late: webhook-image only
+
+        emit_count("grug.elder.model_slow_benched", 1, tags={"backend": backend, "model": model})
+    except Exception as e:  # noqa: BLE001 - telemetry must never break the review
+        log.debug("model_slow_benched_metric_failed", extra={"kind": type(e).__name__})
+
+
+def _note_model_timeout(backend: Backend, model: str, exc: BaseException) -> None:
+    """Feed one transport failure to the slow bench (timeouts only)."""
+    if backend not in _BENCH_CLOUD_BACKENDS or not isinstance(exc, httpx.TimeoutException):
+        return
+    key = (backend.value, model)
+    seconds = _record_model_timeout(*key, time.time())
+    if seconds is not None:
+        _announce_model_slow_benched(*key, seconds)
 
 
 def _free_tier_chain_config() -> "BackendConfig | None":
@@ -1063,7 +1128,9 @@ def _cloud_chain_tiers() -> list[BackendConfig]:
     laguna-s-2.1, with the Cave after all of them. Poolside was dropped in
     grug#910 as unfunded; it answers again (2026-09-26) and has the best eval
     record of the cloud models grug can reach (see `_poolside_chain_config`).
-    Models on the per-model bench (`_note_model_response`) are skipped."""
+    Models on the per-model bench (`_note_model_response`) or the slow bench
+    (`_note_model_timeout`) are skipped, except that the last usable cloud
+    tier is never dropped for being slow."""
     candidates: list["BackendConfig | None"] = [
         _opencode_go_chain_config(),
         _opencode_go_second_chain_config(),
@@ -1071,19 +1138,43 @@ def _cloud_chain_tiers() -> list[BackendConfig]:
         _free_tier_chain_config(),
         _poolside_chain_config(),
     ]
+    tiers = _usable_tiers(candidates, skip_slow=True)
+    if tiers:
+        return tiers
+    # Every usable tier is slow-benched: keep the one that recovers soonest
+    # rather than send every review straight to the Cave.
+    return sorted(
+        _usable_tiers(candidates, skip_slow=False), key=_slow_bench_expiry,
+    )[:1]
+
+
+def _usable_tiers(
+    candidates: "list[BackendConfig | None]", *, skip_slow: bool,
+) -> list[BackendConfig]:
     tiers: list[BackendConfig] = []
     for tier in candidates:
-        if tier is not None and _tier_is_usable(tier, tiers):
+        if tier is not None and _tier_is_usable(tier, tiers, skip_slow=skip_slow):
             tiers.append(tier)
     return tiers
 
 
-def _tier_is_usable(tier: BackendConfig, chosen: list[BackendConfig]) -> bool:
-    """A tier runs unless it duplicates one already chosen, is benched, or
-    is a paid OpenCode Go model while the usage-limit breaker is open."""
+def _slow_bench_expiry(tier: BackendConfig) -> float:
+    with _bench_lock:
+        entry = _slow_bench_state.get((tier.backend.value, tier.model))
+        return entry.benched_until if entry is not None else 0.0
+
+
+def _tier_is_usable(
+    tier: BackendConfig, chosen: list[BackendConfig], *, skip_slow: bool = True,
+) -> bool:
+    """A tier runs unless it duplicates one already chosen, is benched (4xx
+    bench, or slow bench when `skip_slow`), or is a paid OpenCode Go model
+    while the usage-limit breaker is open."""
     if any((c.backend, c.model) == (tier.backend, tier.model) for c in chosen):
         return False
     if _model_is_benched(tier.backend.value, tier.model):
+        return False
+    if skip_slow and _model_is_slow_benched(tier.backend.value, tier.model):
         return False
     if tier.backend == Backend.OPENCODE_GO and not _opencode_go_model_is_free(tier.model):
         return _opencode_go_available()
@@ -4428,6 +4519,7 @@ def _run_llm_attempt(
                 transport_log_event,
                 extra={"backend": backend.value, "kind": type(e).__name__},
             )
+            _note_model_timeout(backend, config.model, e)
             _annotate_attempt_error(
                 span=span,
                 backend=backend,
