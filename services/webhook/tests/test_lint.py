@@ -288,3 +288,75 @@ def test_ruff_binary_is_pinned_in_the_webhook_image():
     )
     assert line is not None, "ruff missing from services/webhook/requirements.txt"
     assert re.search(r"ruff[><=]=?[\d.]", line), f"ruff pin looks unpinned: {line!r}"
+
+
+# --- test-file noise suppression -----------------------------------------
+
+def _s_result(path: str, code: str, msg: str = "finding") -> dict:
+    return {
+        "filename": f"/tmp/grug-lint-abc/{path}",
+        "code": code,
+        "message": msg,
+        "location": {"row": 1, "column": 1},
+    }
+
+
+def _scan_with(path: str, code: str):
+    out = json.dumps([_s_result(path, code)])
+    with patch("subprocess.run", return_value=_proc(1, out)), \
+         patch("tempfile.TemporaryDirectory") as td:
+        td.return_value.__enter__.return_value = "/tmp/grug-lint-abc"
+        return scan_ruff((_hunk(path, "@@ -0,0 +1,1 @@\n+TOKEN = 'abc123'\n"),),
+                         {path: "TOKEN = 'abc123'\n"})
+
+
+@pytest.mark.parametrize("code", ["S101", "S105", "S106", "S107", "S311"])
+def test_test_noise_rules_dropped_in_test_files(code):
+    assert _scan_with("pkg/tests/test_x.py", code) == ()
+
+
+def test_s105_kept_as_high_outside_tests():
+    found = _scan_with("src/mod.py", "S105")
+    assert len(found) == 1
+    assert found[0].severity == "high"
+    assert found[0].rule_name == "lint-security"
+
+
+def test_s101_kept_outside_tests_when_ruff_reports_it():
+    assert len(_scan_with("src/mod.py", "S101")) == 1
+
+
+@pytest.mark.parametrize("path", [
+    "tests/test_x.py", "a/test/x.py", "a/testing/x.py", "a/b/conftest.py",
+    "a/foo_test.py", "a/test_foo.py",
+])
+def test_test_file_detection_positive(path):
+    assert lint_mod._is_test_file(path)
+
+
+@pytest.mark.parametrize("path", [
+    "contests/x.py", "latest.py", "src/mod.py", "a/attests/x.py",
+    "a/testimony.py", "a/mytest_helper.py", "conftest_util.py",
+])
+def test_test_file_detection_negative(path):
+    assert not lint_mod._is_test_file(path)
+
+
+def test_non_noise_security_rule_kept_in_test_files():
+    # S608 (SQL injection) is a real finding even inside tests.
+    assert len(_scan_with("tests/test_x.py", "S608")) == 1
+
+
+def test_secret_scan_still_flags_key_shaped_literal_in_test_file():
+    from personas.code_reviewer.diff_parser import parse_diff
+    from personas.code_reviewer.secret_scan import scan_secrets
+
+    path = "production/app/tests/test_setup.py"
+    diff = (
+        f"diff --git a/{path} b/{path}\n--- a/{path}\n+++ b/{path}\n"
+        "@@ -0,0 +1,1 @@\n"
+        '+KEY = "ghp_AbCdEfGhIjKlMnOpQrStUvWxYz0123456789"\n'
+    )
+    assert len(scan_secrets(parse_diff(diff))) == 1
+    # ...while the lint S105 noise on the same file is dropped.
+    assert _scan_with(path, "S105") == ()
