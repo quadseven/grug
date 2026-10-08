@@ -104,6 +104,7 @@ from personas.code_reviewer.persona import (
     with_extra_findings, with_findings,
 )
 from personas.code_reviewer.snapshot import review_freshness_id_from_pr
+from personas.code_reviewer import carry_forward
 from personas.code_reviewer.thread_resolver import resolve_fixed_threads
 from personas.code_reviewer.verify import verify_findings
 from personas.tribe import CHECK_ELDER
@@ -734,10 +735,38 @@ def _fetch_pr_review_comments(
     return out
 
 
+_RE_REVIEW_ACTIONS = {"synchronize", "reopened", "review"}
+
+
+def _carry_into_check(
+    *, action: str, evaluation: CodeReviewEvaluation, mode: ReviewMode,
+    installation_id: int, owner: str, repo_name: str, pull_number: int,
+    conclusion: CheckConclusion, title: str, summary: str,
+) -> tuple[CheckConclusion, str, str, list[dict] | None]:
+    """Fold Elder's earlier, still-open findings into the check verdict.
+
+    One thread listing per re-review, returned so the thread resolver reuses
+    it. A listing failure leaves the check as it was. Never raises.
+    """
+    if action not in _RE_REVIEW_ACTIONS or evaluation.degraded_reason:
+        return conclusion, title, summary, None
+    threads = carry_forward.list_threads(
+        installation_id, owner, repo_name, pull_number,
+    )
+    if threads is None:
+        return conclusion, title, summary, None
+    carried = carry_forward.select_carried(threads, evaluation.findings)
+    new_conclusion, title, summary = carry_forward.apply_to_check(
+        carried, conclusion=conclusion, title=title, summary=summary,
+        blocking_mode=mode == "blocking",
+    )
+    return new_conclusion, title, summary, threads  # type: ignore[return-value]
+
+
 def _tidy_fixed_threads(
     *, action: str, review_published: bool, evaluation: CodeReviewEvaluation,
     installation_id: int, owner: str, repo_name: str, pull_number: int,
-    head_sha: str,
+    head_sha: str, threads: list[dict] | None = None,
 ) -> None:
     """Resolve Elder's own fixed threads after a complete re-review (#1102).
 
@@ -750,7 +779,7 @@ def _tidy_fixed_threads(
     # (rerun._review_payload), so "synchronize" alone never matched live.
     # Same set the prior-finding dedup uses.
     if (
-        action not in {"synchronize", "reopened", "review"}
+        action not in _RE_REVIEW_ACTIONS
         or not review_published
         or evaluation.degraded_reason
     ):
@@ -758,7 +787,7 @@ def _tidy_fixed_threads(
     try:
         resolve_fixed_threads(
             installation_id, owner, repo_name, pull_number,
-            head_sha=head_sha, findings=evaluation.findings,
+            head_sha=head_sha, findings=evaluation.findings, threads=threads,
         )
     except Exception as e:  # noqa: BLE001 - tidying never fails a review
         log.warning(
@@ -2979,6 +3008,12 @@ def dispatch_code_review(
         review_phase=tier1_phase,
     )
     summary += config_note
+    conclusion, title, summary, listed_threads = _carry_into_check(
+        action=action, evaluation=evaluation, mode=mode,
+        installation_id=installation_id, owner=owner, repo_name=repo_name,
+        pull_number=pull_number, conclusion=conclusion, title=title,
+        summary=summary,
+    )
     check_result = CheckRunResult(
         name=_CHECK_NAME,
         head_sha=head_sha,
@@ -3294,7 +3329,7 @@ def dispatch_code_review(
         review_published=not (review_publish_failed or review_publish_rejected),
         evaluation=evaluation,
         installation_id=installation_id, owner=owner, repo_name=repo_name,
-        pull_number=pull_number, head_sha=head_sha,
+        pull_number=pull_number, head_sha=head_sha, threads=listed_threads,
     )
 
     # LLM-as-a-judge DD evals (#190) submit AFTER the review + check-run are
