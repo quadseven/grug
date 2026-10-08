@@ -433,3 +433,45 @@ def test_dispatch_survives_secret_scan_failure(monkeypatch):
     with patch("httpx.get", return_value=r):
         guard_dispatch.dispatch_guard_review(_base_payload(), blocking=True)
     assert posted_check, "core review still publishes despite a scan failure"
+
+
+# --- test fixtures: placeholders are not leaked secrets --------------------
+# Live 2026-10-08: a test constant `TOKEN = "fake-token-for-tests-1234"` was
+# published as a HIGH `exposed-secret` marking (and, separately, as ruff S105),
+# which failed a PR's Elder check. Fake values in test files are everywhere.
+
+
+def _scan(path, line):
+    return scan_secrets(_hunks(_diff(path, line)))
+
+
+def test_a_placeholder_assignment_in_a_test_file_is_not_a_secret():
+    assert _scan("scratch/tests/test_smoke.py", 'TOKEN = "fake-token-for-tests-1234"') == ()
+    assert _scan("pkg/test_auth.py", 'api_key = "dummy-api-key-for-the-mock-0001"') == ()
+    assert _scan("pkg/auth_test.py", 'password = "example-password-value-xyz-99"') == ()
+    assert _scan("pkg/conftest.py", 'SECRET = "placeholder-secret-value-0000"') == ()
+
+
+def test_the_same_placeholder_outside_tests_is_still_a_candidate():
+    """Non-test files keep today's behavior exactly (the judge decides)."""
+    assert len(_scan("src/app.py", 'TOKEN = "fake-token-for-tests-1234"')) == 1
+
+
+def test_a_random_looking_value_in_a_test_file_is_still_flagged():
+    # ~5 bits/char, 40 chars, no placeholder word: a real key pasted into a test.
+    # Assembled at runtime: a single 40-char literal like this one trips the
+    # host's own push protection (it reads as an AWS secret key).
+    real = "".join(["q7Zr2kLp9W", "xVb4NcM8yT", "f3HjD6sGa1", "UeR5oXi0Yt"])
+    assert len(_scan("tests/test_live.py", f'API_KEY = "{real}"')) == 1
+
+
+def test_provider_formats_are_flagged_in_test_files_too():
+    """A recognizable credential format is real evidence wherever it lives."""
+    assert len(_scan("tests/test_aws.py", f'KEY = "{_AWS_KEY}"')) == 1
+    assert len(_scan("tests/test_gh.py", f'T = "{_GH_TOKEN}"')) == 1
+    assert len(_scan("tests/test_pem.py", '"-----BEGIN RSA PRIVATE KEY-----"')) == 1
+
+
+def test_test_file_detection_is_by_path_component_not_substring():
+    assert len(_scan("src/contests/x.py", 'TOKEN = "fake-token-for-tests-1234"')) == 1
+    assert len(_scan("src/latest.py", 'TOKEN = "fake-token-for-tests-1234"')) == 1

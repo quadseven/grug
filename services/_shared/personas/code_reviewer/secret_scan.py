@@ -35,6 +35,7 @@ from dataclasses import dataclass
 
 from .diff_parser import DiffHunk
 from .sast import EXPOSED_SECRET, Candidate
+from .test_paths import is_test_file
 
 __all__ = ["EXPOSED_SECRET", "scan_secrets"]
 
@@ -58,6 +59,19 @@ _MAX_SCAN_BYTES = 1_048_576
 # random tokens clear it.
 _MIN_GENERIC_LEN = 16
 _MIN_ENTROPY = 3.0
+
+# Test files are full of fake credential fixtures (`TOKEN = "fake-token-1234"`);
+# live 2026-10-08 one failed a PR's Elder check as a high `exposed-secret`. In
+# a test file the generic rule drops values that name themselves placeholders
+# and needs a much higher entropy bar (a real pasted key is near log2(alphabet)
+# bits/char; a hand-typed fixture sits around 3 to 3.8). Provider formats (rule
+# A) are unaffected: a recognizable AWS/GitHub/PEM credential is real evidence
+# wherever it lives.
+_MIN_ENTROPY_TEST_FILE = 4.2
+_PLACEHOLDER_WORDS = (
+    "fake", "dummy", "example", "placeholder", "mock", "sample", "changeme",
+    "redacted", "notreal", "not-a-real", "test", "xxxx",
+)
 
 
 @dataclass(frozen=True, slots=True)
@@ -207,7 +221,7 @@ def _mask(value: str) -> str:
     return f"{value[:4]}...{value[-4:]}"
 
 
-def _detect(text: str) -> tuple[tuple[str, str, str], ...]:
+def _detect(text: str, *, in_test_file: bool = False) -> tuple[tuple[str, str, str], ...]:
     """Return every ``(kind, raw, masked)`` secret detected on an added line.
 
     ``raw`` is used only for in-memory dedup and is never published or logged.
@@ -225,7 +239,10 @@ def _detect(text: str) -> tuple[tuple[str, str, str], ...]:
         value = _generic_literal_value(m)
         if value is None or value in provider_values:
             continue
-        if len(value) >= _MIN_GENERIC_LEN and _shannon_entropy(value) >= _MIN_ENTROPY:
+        if in_test_file and any(w in value.lower() for w in _PLACEHOLDER_WORDS):
+            continue
+        floor = _MIN_ENTROPY_TEST_FILE if in_test_file else _MIN_ENTROPY
+        if len(value) >= _MIN_GENERIC_LEN and _shannon_entropy(value) >= floor:
             hits.append((f"secret-like assignment to `{m.group('key')}`", value, _mask(value)))
     return tuple(hits)
 
@@ -245,13 +262,14 @@ def scan_secrets(hunks: tuple[DiffHunk, ...]) -> tuple[Candidate, ...]:
     seen: set[tuple[str, str]] = set()
     scanned = 0
     for hunk in hunks:
+        in_test = is_test_file(hunk.file_path)
         for lineno, text in _added_lines(hunk):
             if len(text) > _MAX_LINE_LEN:
                 continue
             scanned += len(text)
             if scanned > _MAX_SCAN_BYTES:
                 return _to_candidates(secrets)
-            for kind, raw, masked in _detect(text):
+            for kind, raw, masked in _detect(text, in_test_file=in_test):
                 key = (hunk.file_path, raw)
                 if key in seen:
                     continue
