@@ -294,7 +294,7 @@ def test_ruff_binary_is_pinned_in_the_webhook_image():
 
 def _s_result(path: str, code: str, msg: str = "finding") -> dict:
     return {
-        "filename": f"/tmp/grug-lint-abc/{path}",
+        "filename": f"/work/grug-lint-abc/{path}",
         "code": code,
         "message": msg,
         "location": {"row": 1, "column": 1},
@@ -305,7 +305,7 @@ def _scan_with(path: str, code: str):
     out = json.dumps([_s_result(path, code)])
     with patch("subprocess.run", return_value=_proc(1, out)), \
          patch("tempfile.TemporaryDirectory") as td:
-        td.return_value.__enter__.return_value = "/tmp/grug-lint-abc"
+        td.return_value.__enter__.return_value = "/work/grug-lint-abc"
         return scan_ruff((_hunk(path, "@@ -0,0 +1,1 @@\n+TOKEN = 'abc123'\n"),),
                          {path: "TOKEN = 'abc123'\n"})
 

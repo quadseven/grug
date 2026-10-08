@@ -322,6 +322,16 @@ def scan_ruff(
     return _map_results(results, prefix, added)
 
 
+def _is_reportable(
+    path: str, row: int, code: str, added: dict[str, set[int]]
+) -> bool:
+    """False for test-file noise rules and for pre-existing violations on
+    lines this PR did not add."""
+    if code in _TEST_NOISE_RULES and _is_test_file(path):
+        return False
+    return row in added.get(path, set())
+
+
 def _map_results(
     results: object, prefix: str, added: dict[str, set[int]]
 ) -> tuple[Finding, ...]:
@@ -342,10 +352,8 @@ def _map_results(
         msg = r.get("message")
         if not path or not isinstance(row, int) or not code or not msg:
             continue
-        if code in _TEST_NOISE_RULES and _is_test_file(path):
-            continue  # fixture/fake-secret noise, not a finding in tests
-        if row not in added.get(path, set()):
-            continue  # pre-existing violation on an untouched line
+        if not _is_reportable(path, row, code, added):
+            continue
         findings.append(
             Finding(
                 file=path,
