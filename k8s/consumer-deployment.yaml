@@ -135,7 +135,7 @@ spec:
             - {name: GRUG_OPENCODE_GO_API_KEY_SSM, value: /infra/llm/opencode_go_api_key}
             # OpenRouter :free as the chain's tier 2 - rationale and eval
             # evidence in webhook-deployment.yaml.
-            # Chain after the mimo-v2.5 primary (default in llm_client.py): paid
+            # Chain after the mimo-v2.6-flash primary (default in llm_client.py): paid
             # DeepSeek second opinion, then the free Longcat. Unset = no tier.
             - {name: GRUG_OPENCODE_GO_SECOND_MODEL, value: "deepseek-v4.1-flash"}
             - {name: GRUG_OPENCODE_GO_FALLBACK_MODEL, value: "longcat-2.5-preview-free"}

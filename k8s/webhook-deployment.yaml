@@ -191,7 +191,7 @@ spec:
             # unparseable JSON. OpenCode Go has refused every call with "Go
             # usage limit exceeded" since 2026-09-24, so without this tier
             # every review cohort landed on the Sparks.
-            # Chain after the mimo-v2.5 primary (default in llm_client.py): paid
+            # Chain after the mimo-v2.6-flash primary (default in llm_client.py): paid
             # DeepSeek second opinion, then the free Longcat. Unset = no tier.
             - {name: GRUG_OPENCODE_GO_SECOND_MODEL, value: "deepseek-v4.1-flash"}
             - {name: GRUG_OPENCODE_GO_FALLBACK_MODEL, value: "longcat-2.5-preview-free"}
