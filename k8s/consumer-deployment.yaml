@@ -224,7 +224,12 @@ spec:
             # strict membership test in the router, so all three lanes ask
             # for whatever is resident (2026-09-02).
             - {name: GRUG_CAVE_JUDGE_MODEL, value: "spark:warm-any"}
-            - {name: GRUG_CAVE_REVIEW_MODEL, value: "spark:warm-any"}
+            # Pinned, not warm-any: warm-any lands on whatever Ollama has resident, which
+            # was nemotron-3-nano (assay review_quality, real reviewer prompt, 10k tokens,
+            # on the Sparks: 64% catch, 36% empty on defect diffs, 33 s median). Same
+            # harness, qwen3-coder-next:q4_K_M: 86% catch, 14% empty, 14 s median, peak GPU
+            # 65 C. The tag lives on one Spark, so it is a strict gateway match.
+            - {name: GRUG_CAVE_REVIEW_MODEL, value: "qwen3-coder-next:q4_K_M"}
             - {name: GRUG_CAVE_REASONER_MODEL, value: "spark:warm-any"}
             # Omen production-signal fusion (#470). All three fail-open:
             # absent params/mapping = zero DD calls = today's review.
