@@ -98,64 +98,41 @@ Verify:
 
 ```bash
 aws ssm get-parameters-by-path --region us-east-1 --path /grug --recursive --query 'Parameters[].Name'
-# Expected: ["/grug/github-app-id", "/grug/github-app-private-key", "/grug/github-app-webhook-secret", "/grug/session-signing-secret", "/grug/leak-guard-deny-list"]
+# Expected: ["/grug/github-app-id", "/grug/github-app-private-key", "/grug/github-app-webhook-secret", "/grug/session-signing-secret"]
 aws ssm get-parameters-by-path --region us-east-1 --path /infra/llm --recursive --query 'Parameters[].Name'
 # Expected (shared): ["/infra/llm/openrouter_api_key", "/infra/llm/poolside_api_key"]
 ```
 
-## 3b. Pre-load the leak-guard deny-list (grug#921)
+## 3b. The leak-guard deny-list is NOT seeded here (grug#921, grug#1057)
+
+**This repo requires no deny-list parameter of its own.** Nothing to do in this
+section; it is kept because the deny-list is still load-bearing and an operator
+needs to know where it lives.
 
 `scripts/check_private_leaks.py` has two layers. Layer 1 is the generic SHAPES
 committed in that file. Layer 2 is the specific terms that have no shape -
-people, products, host codenames - and it is fetched at run time from
-`/grug/leak-guard-deny-list`. **The literal terms cannot live in this repo:
-this repo is public, and a file listing them would BE the leak it prevents.**
+people, products, host codenames - and it is fetched at run time. **The literal
+terms cannot live in this repo: this repo is public, and a file listing them
+would BE the leak it prevents.**
 
-CI (`guard.private-leaks.yml`) no longer reads this parameter. Since
-grug#1057 it reads the fleet's shared list, `/infra/leak-scan/deny-list`
-(seeded from this one, same terms), through the role in the
-`LEAK_SCAN_ROLE_ARN` repo secret, whose entire policy is "read that one
-parameter". Add a new term to the shared list; this parameter and
-`grug-gha-leak-guard` are retired under grug#1057. If the list CI reads is
-missing, unreadable, or holds no terms, the guard **fails the job** - it never
-degrades to layer 1 and reports green. That downgrade is exactly what shipped
-for months.
+CI (`guard.private-leaks.yml`) reads the fleet's shared list,
+`/infra/leak-scan/deny-list`, through the role in the `LEAK_SCAN_ROLE_ARN` repo
+secret, whose entire policy is "read that one parameter". That list is seeded
+and maintained in the operator's private infrastructure repo, not here - adding
+a term is a `put-parameter --overwrite` there, not a code change or a deploy in
+this repo. If the list CI reads is missing, unreadable, or holds no terms, the
+guard **fails the job** - it never degrades to layer 1 and reports green. That
+downgrade is exactly what shipped for months.
 
-Format: one term per line. Blank lines and `#` comments ignored. Matching is
-case-insensitive and anchored on word-ish boundaries, so a short first name
-does not fire on ordinary prose - and a line containing spaces is matched as a
-whole phrase, so a full name stays one term.
+Format, for whoever edits the shared list: one term per line. Blank lines and
+`#` comments ignored. Matching is case-insensitive and anchored on word-ish
+boundaries, so a short first name does not fire on ordinary prose - and a line
+containing spaces is matched as a whole phrase, so a full name stays one term.
 
-```bash
-# Build the value in a variable. Do NOT echo it, and do NOT write it to a file
-# in any repo - the values are the thing being protected.
-DENY=$(cat <<'TERMS'
-# operator identity: first name, surname, full name, personal email local-part
-# account handles and personal domains
-# private overlay network suffix
-# local workstation path prefixes, e.g. /users/<name>
-# self-hosted host + cluster codenames
-# a deliberately meaningless canary term, so the guard can be re-proved at any
-# time by seeding it into a throwaway PR without exposing a real value
-TERMS
-)
-aws ssm put-parameter --region us-east-1 \
-  --name /grug/leak-guard-deny-list \
-  --type SecureString --key-id alias/aws/ssm --tier Standard \
-  --value "$DENY" --overwrite
-unset DENY
-```
-
-Verify without printing it:
-
-```bash
-aws ssm get-parameter --region us-east-1 --name /grug/leak-guard-deny-list \
-  --with-decryption --query Parameter.Value --output text \
-  | grep -cvE '^\s*(#|$)'   # prints the number of active terms, not the terms
-```
-
-Adding a term later is a `put-parameter --overwrite`, not a code change or a
-deploy - which is the whole reason layer 2 lives in SSM.
+The per-repo predecessor (a `/grug/`-scoped parameter read through a
+`grug-gha-leak-guard` role) is retired under grug#1057: two copies of one list
+meant a term added to either was missing from the other. Its `infra/pulumi`
+declaration is the remaining half of that issue and is not removed here.
 
 ## 4. Reserve the OIDC role for GitHub Actions deploy
 
