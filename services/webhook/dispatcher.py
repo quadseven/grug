@@ -260,9 +260,14 @@ def _ensure_enforcement_on_pr(
     """
     if not is_persona_enabled(install_id, repo_id, "tpm"):
         return
+    from psycopg import Error as PsycopgError  # type: ignore
+
     try:
         cfg = get_repo_config(install_id, repo_id)
-    except Exception:
+    except PsycopgError:
+        # Store outage: fail open (skip the ensure), never block PR reviews.
+        # Narrow on purpose: a programming error in the config read itself
+        # must surface, not hide behind the outage posture.
         log.warning(
             "pr_enforcement_config_read_failed",
             extra={"install_id": install_id, "repo": f"{owner}/{repo_name}"},

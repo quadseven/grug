@@ -242,7 +242,19 @@ def ensure_enforcement(
         emit_enforcement_metric(f"{owner}/{repo}", state)
         return state
 
-    if repo_is_empty(install_token, owner, repo):
+    try:
+        empty = repo_is_empty(install_token, owner, repo)
+    except Exception as e:  # noqa: BLE001 - a hiccup here must not block creation
+        log.warning(
+            "enforcement_repo_is_empty_check_failed",
+            extra={
+                "owner": owner, "repo": repo,
+                "install_id": install_id, "repo_id": repo_id,
+                "kind": type(e).__name__,
+            },
+        )
+        empty = False
+    if empty:
         # Empty-repo bootstrap: creating a ruleset that requires Grug - Chief
         # on a repo with no commits deadlocks it. The required check can never
         # be satisfied - no PR can exist before the first commit lands - and

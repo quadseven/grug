@@ -64,6 +64,20 @@ def test_ensure_defers_when_repo_empty():
     mock_metric.assert_called_once_with("o/r", "none")
 
 
+def test_ensure_falls_back_to_create_when_empty_check_fails():
+    """A hiccup in repo_is_empty must not block enforcement creation -
+    fall back to the pre-existing create path."""
+    with patch("enforcement.detect_enforcement", return_value=EnforcementDetection("none", None)), \
+         patch("enforcement.repo_is_empty", side_effect=RuntimeError("api down")), \
+         patch("enforcement.create_ruleset", return_value={"id": 42}) as mock_create, \
+         patch("adapters.install_store.get_enforcement_id", return_value=None), \
+         patch("adapters.install_store.set_enforcement_id"):
+        result = ensure_enforcement("tok", "o", "r", "main", 1, 2)
+
+    assert result == "grug_managed"
+    mock_create.assert_called_once()
+
+
 def test_ensure_skips_empty_check_when_enforcement_exists():
     """The empty-repo check only gates creation, never the early-return paths."""
     with patch("enforcement.detect_enforcement", return_value=EnforcementDetection("grug_managed", None)), \

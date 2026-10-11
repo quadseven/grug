@@ -496,7 +496,7 @@ def repo_is_empty(install_token: str, owner: str, repo: str) -> bool:
     to avoid deadlocking brand-new repos (see ensure_enforcement).
     """
     resp = _get_with_retry(
-        f"{_GH_API}/repos/{owner}/{repo}",
+        f"{_GH_API}/repos/{quote(owner, safe='')}/{quote(repo, safe='')}",
         install_token=install_token,
         op="repo_is_empty",
     )
