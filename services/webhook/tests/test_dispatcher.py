@@ -13,6 +13,7 @@ import httpx
 import personas.tpm.persona  # noqa: F401 — register submodule for patch path
 import pytest
 from dispatcher import dispatch
+from dispatcher import _ensure_enforcement_on_pr as _real_ensure_enforcement_on_pr
 from personas import registry as persona_registry
 
 
@@ -158,58 +159,53 @@ def test_pull_request_skips_enforcement_when_no_repo_id():
 
 def test_ensure_enforcement_on_pr_skips_when_tpm_disabled():
     """Operator opt-out (tpm disabled) -> never gate the repo."""
-    from dispatcher import _ensure_enforcement_on_pr
 
     with patch("dispatcher.is_persona_enabled", return_value=False), \
          patch("dispatcher.get_repo_config") as mock_cfg:
-        _ensure_enforcement_on_pr(1, 2, "o", "r", "main")
+        _real_ensure_enforcement_on_pr(1, 2, "o", "r", "main")
     mock_cfg.assert_not_called()
 
 
 def test_ensure_enforcement_on_pr_skips_when_force_disabled():
     """Escape hatch (force_disable_enforcement) -> never gate the repo."""
-    from dispatcher import _ensure_enforcement_on_pr
 
     with patch("dispatcher.is_persona_enabled", return_value=True), \
          patch("dispatcher.get_repo_config", return_value={"force_disable_enforcement": True}), \
          patch("github_app_auth.with_install_token_retry") as mock_retry:
-        _ensure_enforcement_on_pr(1, 2, "o", "r", "main")
+        _real_ensure_enforcement_on_pr(1, 2, "o", "r", "main")
     mock_retry.assert_not_called()
 
 
 def test_ensure_enforcement_on_pr_calls_ensure():
     """Happy path: token minted, ensure_enforcement runs, never raises."""
-    from dispatcher import _ensure_enforcement_on_pr
 
     with patch("dispatcher.is_persona_enabled", return_value=True), \
          patch("dispatcher.get_repo_config", return_value={}), \
          patch("github_app_auth.with_install_token_retry") as mock_retry, \
          patch("enforcement.ensure_enforcement") as mock_ensure:
         mock_retry.side_effect = lambda install_id, fn: fn("tok")
-        _ensure_enforcement_on_pr(1, 2, "o", "r", "main")
+        _real_ensure_enforcement_on_pr(1, 2, "o", "r", "main")
     mock_ensure.assert_called_once_with("tok", "o", "r", "main", 1, 2)
 
 
 def test_ensure_enforcement_on_pr_failure_does_not_raise():
     """A token/API failure here must not block the persona reviews."""
-    from dispatcher import _ensure_enforcement_on_pr
 
     with patch("dispatcher.is_persona_enabled", return_value=True), \
          patch("dispatcher.get_repo_config", return_value={}), \
          patch("github_app_auth.with_install_token_retry", side_effect=RuntimeError("boom")):
-        _ensure_enforcement_on_pr(1, 2, "o", "r", "main")  # must not raise
+        _real_ensure_enforcement_on_pr(1, 2, "o", "r", "main")  # must not raise
 
 
 def test_ensure_enforcement_on_pr_store_outage_skips_silently():
     """A config-store outage fails open: skip the ensure, never block reviews."""
     from psycopg import Error as PsycopgError
 
-    from dispatcher import _ensure_enforcement_on_pr
 
     with patch("dispatcher.is_persona_enabled", return_value=True), \
          patch("dispatcher.get_repo_config", side_effect=PsycopgError("conn down")), \
          patch("github_app_auth.with_install_token_retry") as mock_retry:
-        _ensure_enforcement_on_pr(1, 2, "o", "r", "main")  # must not raise
+        _real_ensure_enforcement_on_pr(1, 2, "o", "r", "main")  # must not raise
     mock_retry.assert_not_called()
 
 
