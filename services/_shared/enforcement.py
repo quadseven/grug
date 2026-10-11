@@ -16,6 +16,7 @@ from github_rulesets_client import (
     detect_enforcement,
     get_ruleset,
     list_rulesets,
+    repo_is_empty,
     update_ruleset,
 )
 
@@ -160,6 +161,10 @@ def ensure_enforcement(
 ) -> EnforcementState:
     """Create a Grug-managed ruleset if no enforcement exists. Idempotent.
 
+    Defers (creates nothing) on a repo with no commits: a required check on
+    an empty repo deadlocks the first push. The pull_request handler re-runs
+    this on the first PR, when the repo necessarily has commits.
+
     Returns the resulting enforcement state after the operation.
     """
     from adapters.install_store import get_enforcement_id  # type: ignore
@@ -169,17 +174,6 @@ def ensure_enforcement(
         stored_ruleset_id=stored_ruleset_id,
     )
     state = detection.state
-    if state == "permission_denied":
-        # grug#1001: the App cannot read or write rulesets here, so a create
-        # would only 403 again. This is not "already enforced" either.
-        log.warning(
-            "enforcement_permission_denied",
-            extra={"owner": owner, "repo": repo,
-                   "install_id": install_id, "repo_id": repo_id},
-        )
-        from observability import emit_enforcement_metric  # type: ignore
-        emit_enforcement_metric(f"{owner}/{repo}", state)
-        return state
     if state != "none":
         if state == "grug_managed":
             # #686: heal the ruleset detection ACTUALLY matched, not the one
@@ -247,6 +241,27 @@ def ensure_enforcement(
         from observability import emit_enforcement_metric  # type: ignore
         emit_enforcement_metric(f"{owner}/{repo}", state)
         return state
+
+    if repo_is_empty(install_token, owner, repo):
+        # Empty-repo bootstrap: creating a ruleset that requires Grug - Chief
+        # on a repo with no commits deadlocks it. The required check can never
+        # be satisfied - no PR can exist before the first commit lands - and
+        # the push that would create the first commit is rejected by the
+        # unsatisfied required check. So defer: create nothing, and let the
+        # pull_request handler re-run ensure_enforcement on the first PR,
+        # when the repo necessarily has commits. Returns "none" (it IS
+        # unenforced); the enforcement-gap monitor excludes empty repos from
+        # its denominator for the same reason it excludes archived ones.
+        log.info(
+            "enforcement_deferred_empty_repo",
+            extra={
+                "owner": owner, "repo": repo,
+                "install_id": install_id, "repo_id": repo_id,
+            },
+        )
+        from observability import emit_enforcement_metric  # type: ignore
+        emit_enforcement_metric(f"{owner}/{repo}", "none")
+        return "none"
 
     result = create_ruleset(
         install_token, owner, repo,

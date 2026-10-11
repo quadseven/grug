@@ -124,6 +124,82 @@ def test_pull_request_incomplete_payload_skips():
     assert out["status"] == "skip" and out["reason"] == "incomplete_payload"
 
 
+def test_pull_request_ensures_enforcement():
+    """The first PR on a repo enrolled while empty is the moment the repo
+    provably has commits - the handler ensures the enforcement gate then
+    (idempotent when it already exists)."""
+    with patch("dispatcher.is_install_allowlisted", return_value=True), \
+         patch("dispatcher.is_persona_enabled", side_effect=lambda *a: _only_tpm(a[2])), \
+         patch("dispatcher._ensure_enforcement_on_pr") as mock_ensure, \
+         patch("personas.tpm.persona.evaluate_pull_request") as mock_eval, \
+         patch("personas.tpm.persona.publish_tpm_evaluation") as _mock_pub:
+        mock_eval.return_value = type("R", (), {"passed": True})()
+        _mock_pub.return_value = {"persona": "tpm", "result": "pass"}
+        dispatch("pull_request", _full_pr_payload())
+    mock_ensure.assert_called_once_with(999, 7777, "quadseven", "infra", "main")
+
+
+def test_pull_request_skips_enforcement_when_no_repo_id():
+    """No repository.id -> no enforcement ensure (can't key the store)."""
+    payload = _full_pr_payload()
+    payload["repository"]["owner"]["login"] = "o"
+    payload["repository"]["name"] = "r"
+    del payload["repository"]["id"]
+    with patch("dispatcher.is_install_allowlisted", return_value=True), \
+         patch("dispatcher.is_persona_enabled", side_effect=lambda *a: _only_tpm(a[2])), \
+         patch("dispatcher._ensure_enforcement_on_pr") as mock_ensure, \
+         patch("personas.tpm.persona.evaluate_pull_request") as mock_eval, \
+         patch("personas.tpm.persona.publish_tpm_evaluation") as _mock_pub:
+        mock_eval.return_value = type("R", (), {"passed": True})()
+        _mock_pub.return_value = {"persona": "tpm", "result": "pass"}
+        dispatch("pull_request", payload)
+    mock_ensure.assert_not_called()
+
+
+def test_ensure_enforcement_on_pr_skips_when_tpm_disabled():
+    """Operator opt-out (tpm disabled) -> never gate the repo."""
+    from dispatcher import _ensure_enforcement_on_pr
+
+    with patch("dispatcher.is_persona_enabled", return_value=False), \
+         patch("dispatcher.get_repo_config") as mock_cfg:
+        _ensure_enforcement_on_pr(1, 2, "o", "r", "main")
+    mock_cfg.assert_not_called()
+
+
+def test_ensure_enforcement_on_pr_skips_when_force_disabled():
+    """Escape hatch (force_disable_enforcement) -> never gate the repo."""
+    from dispatcher import _ensure_enforcement_on_pr
+
+    with patch("dispatcher.is_persona_enabled", return_value=True), \
+         patch("dispatcher.get_repo_config", return_value={"force_disable_enforcement": True}), \
+         patch("github_app_auth.with_install_token_retry") as mock_retry:
+        _ensure_enforcement_on_pr(1, 2, "o", "r", "main")
+    mock_retry.assert_not_called()
+
+
+def test_ensure_enforcement_on_pr_calls_ensure():
+    """Happy path: token minted, ensure_enforcement runs, never raises."""
+    from dispatcher import _ensure_enforcement_on_pr
+
+    with patch("dispatcher.is_persona_enabled", return_value=True), \
+         patch("dispatcher.get_repo_config", return_value={}), \
+         patch("github_app_auth.with_install_token_retry") as mock_retry, \
+         patch("enforcement.ensure_enforcement") as mock_ensure:
+        mock_retry.side_effect = lambda install_id, fn: fn("tok")
+        _ensure_enforcement_on_pr(1, 2, "o", "r", "main")
+    mock_ensure.assert_called_once_with("tok", "o", "r", "main", 1, 2)
+
+
+def test_ensure_enforcement_on_pr_failure_does_not_raise():
+    """A token/API failure here must not block the persona reviews."""
+    from dispatcher import _ensure_enforcement_on_pr
+
+    with patch("dispatcher.is_persona_enabled", return_value=True), \
+         patch("dispatcher.get_repo_config", return_value={}), \
+         patch("github_app_auth.with_install_token_retry", side_effect=RuntimeError("boom")):
+        _ensure_enforcement_on_pr(1, 2, "o", "r", "main")  # must not raise
+
+
 def _full_pr_payload():
     return {
         "action": "opened",
