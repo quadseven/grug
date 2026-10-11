@@ -242,6 +242,58 @@ def _heal_enforcement_on_repo(
         )
 
 
+def _ensure_enforcement_on_pr(
+    install_id: int,
+    repo_id: int,
+    owner: str,
+    repo_name: str,
+    default_branch: str,
+) -> None:
+    """Best-effort enforcement creation on PR events (empty-repo bootstrap).
+
+    A repo enrolled while empty defers enforcement at install time; the
+    first PR is the moment the repo provably has commits, so this closes
+    the gap then. Idempotent - ensure_enforcement no-ops when a gate
+    already exists. Respects the operator opt-outs (tpm disabled /
+    force_disable_enforcement): never gate an excluded repo. Never raises:
+    a failure here must not block the persona reviews on this PR.
+    """
+    if not is_persona_enabled(install_id, repo_id, "tpm"):
+        return
+    from psycopg import Error as PsycopgError  # type: ignore
+
+    try:
+        cfg = get_repo_config(install_id, repo_id)
+    except PsycopgError:
+        # Store outage: fail open (skip the ensure), never block PR reviews.
+        # Narrow on purpose: a programming error in the config read itself
+        # must surface, not hide behind the outage posture.
+        log.warning(
+            "pr_enforcement_config_read_failed",
+            extra={"install_id": install_id, "repo": f"{owner}/{repo_name}"},
+            exc_info=True,
+        )
+        return
+    if cfg.get("force_disable_enforcement", False):
+        return
+    from github_app_auth import with_install_token_retry  # type: ignore
+    from enforcement import ensure_enforcement  # type: ignore
+
+    try:
+        with_install_token_retry(
+            install_id,
+            lambda token, o=owner, r=repo_name, db=default_branch, iid=install_id, rid=repo_id: (
+                ensure_enforcement(token, o, r, db, iid, rid)
+            ),
+        )
+    except Exception:
+        log.warning(
+            "pr_enforcement_ensure_failed",
+            extra={"install_id": install_id, "repo": f"{owner}/{repo_name}"},
+            exc_info=True,
+        )
+
+
 def _enforce_on_repos(install_id: int, repositories: list[dict]) -> None:
     """Best-effort enforcement creation for repos in an install payload."""
     from github_app_auth import with_install_token_retry  # type: ignore
@@ -330,6 +382,19 @@ def _handle_pull_request(
     # a function-local re-import would shadow it and silently defeat
     # `patch("dispatcher.get_repo_config")` in tests (#272).
     repo_id = repo.get("id")
+
+    # Empty-repo bootstrap: a repo enrolled while empty defers enforcement
+    # creation at install time (see enforcement.ensure_enforcement) so the
+    # first push isn't deadlocked by an unsatisfiable required check. The
+    # first PR proves the repo has commits, so ensure the gate now -
+    # idempotent when enforcement already exists. Respects the same opt-outs
+    # as the ruleset self-heal (tpm disabled / force_disable): never gate a
+    # repo the operator excluded. Best-effort: must not block the reviews.
+    if repo_id is not None:
+        _ensure_enforcement_on_pr(
+            int(installation_id), int(repo_id), owner, repo_name,
+            repo.get("default_branch") or "main",
+        )
 
     # Registry dispatch loop (ADR-0010): every registered persona whose
     # events include pull_request dispatches from this handler on the
@@ -720,6 +785,10 @@ def _handle_issue_comment(payload: dict[str, Any]) -> dict[str, str]:
     # cheap when only PR events fire.
     from github_app_auth import with_install_token_retry  # type: ignore
     from personas.publish_check import PUBLISH_FAILED  # type: ignore
+    from personas.tpm.issue_fetcher import (  # type: ignore
+        build_issue_facts_fetcher, build_issue_fetcher,
+    )
+    from personas.tpm.persona import evaluate_pull_request, publish_tpm_evaluation  # type: ignore
     import httpx  # type: ignore
 
     # URL-encode user-controlled path components. GitHub repo + login
@@ -807,10 +876,35 @@ def _handle_issue_comment(payload: dict[str, Any]) -> dict[str, str]:
     # /grug recheck silently do nothing. Mirror the pull_request
     # handler's containment: log with coords, return a skip.
     try:
-        evaluation, result_map = run_chief_recheck(
-            installation_id=int(installation_id), owner=owner,
-            repo=repo_name, head_sha=head_sha, pr_number=int(pr_number),
-            pr_body=pr_body,
+        # Same fetcher builder as the pull_request webhook path (#782).
+        # Pre-#782 this call was bare `evaluate_pull_request(pr_body)`,
+        # so `linked-issue-completeness` always hit its no-fetcher
+        # fail-open branch: a comment could turn a stale red row green
+        # without the check ever running, on a required_status_checks
+        # context. The builder is shared on purpose - a fetcher copied
+        # here would be the same divergence one refactor later.
+        fetcher = build_issue_fetcher(
+            installation_id=int(installation_id), owner=owner, repo=repo_name,
+        )
+        # Same shared builder for the `which epic` facts (grug#1034).
+        facts_fetcher = build_issue_facts_fetcher(
+            installation_id=int(installation_id), owner=owner, repo=repo_name,
+        )
+        evaluation = evaluate_pull_request(
+            pr_body, fetch_issue=fetcher, fetch_issue_facts=facts_fetcher,
+        )
+        # publish_tpm_evaluation never raises on a failed publish since
+        # #550 — the seam classifies ANY publish failure into the
+        # returned "publish_failed" sentinel, logs it under
+        # `tpm_publish_failed` (kind/status_code/error fields live on
+        # that seam log), and records the honest errored Activity row.
+        result_map = publish_tpm_evaluation(
+            evaluation,
+            installation_id=int(installation_id),
+            owner=owner,
+            repo=repo_name,
+            head_sha=head_sha,
+            pr_number=int(pr_number),
         )
         # Subscript INSIDE the guard: a seam regression returning a map
         # without "result" must land here (skip + coords), not 500 the
@@ -855,54 +949,6 @@ def _handle_issue_comment(payload: dict[str, Any]) -> dict[str, str]:
         "trigger": "recheck",
         "result": "pass" if evaluation.passed else "fail",
     }
-
-
-def run_chief_recheck(
-    *, installation_id: int, owner: str, repo: str, head_sha: str,
-    pr_number: int, pr_body: str,
-) -> tuple[Any, dict[str, str]]:
-    """Evaluate Chief's DoR checks for a PR and publish the check-run.
-
-    The ONE implementation behind `/grug recheck` and the poller's Chief
-    self-heal pass (a second copy would drift). Returns
-    `(evaluation, {"persona": "tpm", "result": ...})`; a failed publish is
-    the `publish_failed` sentinel in the map, never a raise (since #550).
-    Unexpected errors propagate; each caller owns its containment."""
-    from personas.tpm.issue_fetcher import (  # type: ignore
-        build_issue_facts_fetcher, build_issue_fetcher,
-    )
-    from personas.tpm.persona import evaluate_pull_request, publish_tpm_evaluation  # type: ignore
-
-    # Same fetcher builder as the pull_request webhook path (#782).
-    # Pre-#782 this call was bare `evaluate_pull_request(pr_body)`, so
-    # `linked-issue-completeness` always hit its no-fetcher fail-open
-    # branch: a comment could turn a stale red row green without the check
-    # ever running, on a required_status_checks context. The builder is
-    # shared on purpose - a fetcher copied here would be the same
-    # divergence one refactor later.
-    fetcher = build_issue_fetcher(
-        installation_id=installation_id, owner=owner, repo=repo,
-    )
-    # Same shared builder for the `which epic` facts (grug#1034).
-    facts_fetcher = build_issue_facts_fetcher(
-        installation_id=installation_id, owner=owner, repo=repo,
-    )
-    evaluation = evaluate_pull_request(
-        pr_body, fetch_issue=fetcher, fetch_issue_facts=facts_fetcher,
-    )
-    # publish_tpm_evaluation never raises on a failed publish since #550:
-    # the seam classifies ANY publish failure into the "publish_failed"
-    # sentinel, logs it under `tpm_publish_failed`, and records the honest
-    # errored Activity row.
-    result_map = publish_tpm_evaluation(
-        evaluation,
-        installation_id=installation_id,
-        owner=owner,
-        repo=repo,
-        head_sha=head_sha,
-        pr_number=pr_number,
-    )
-    return evaluation, result_map
 
 
 def _fetch_pr_for_rerequest(

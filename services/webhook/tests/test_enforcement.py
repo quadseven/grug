@@ -27,6 +27,7 @@ def test_ensure_creates_ruleset_when_none():
     """No enforcement → create ruleset + store ID in DDB."""
     with patch("enforcement.detect_enforcement", return_value=EnforcementDetection("none", None)) as mock_detect, \
          patch("enforcement.create_ruleset", return_value={"id": 42}) as mock_create, \
+         patch("enforcement.repo_is_empty", return_value=False), \
          patch("adapters.install_store.get_enforcement_id", return_value=None), \
          patch("adapters.install_store.set_enforcement_id") as mock_set:
         result = ensure_enforcement("tok", "myorg", "myrepo", "main", 100, 200)
@@ -41,19 +42,53 @@ def test_ensure_creates_ruleset_when_none():
     mock_set.assert_called_once_with(100, 200, 42)
 
 
-def test_ensure_does_not_try_to_create_when_permission_denied():
-    """grug#1001: the App cannot write rulesets here, so a create would only
-    403 again. Report the state and stop; it is not "already enforced"."""
-    with patch("enforcement.detect_enforcement",
-               return_value=EnforcementDetection("permission_denied", None)), \
-         patch("adapters.install_store.get_enforcement_id", return_value=None), \
+def test_ensure_defers_when_repo_empty():
+    """Empty repo (no commits) -> create nothing, return "none".
+
+    A required check on an empty repo deadlocks the first push: the check
+    can never be satisfied because no PR can exist before the first commit
+    lands. Deferral leaves the push path open; the pull_request handler
+    re-runs ensure_enforcement on the first PR.
+    """
+    with patch("enforcement.detect_enforcement", return_value=EnforcementDetection("none", None)), \
+         patch("enforcement.repo_is_empty", return_value=True), \
          patch("enforcement.create_ruleset") as mock_create, \
-         patch("observability.emit_enforcement_metric") as mock_emit:
+         patch("adapters.install_store.get_enforcement_id", return_value=None), \
+         patch("adapters.install_store.set_enforcement_id") as mock_set, \
+         patch("observability.emit_enforcement_metric") as mock_metric:
         result = ensure_enforcement("tok", "o", "r", "main", 1, 2)
 
-    assert result == "permission_denied"
+    assert result == "none"
     mock_create.assert_not_called()
-    mock_emit.assert_called_once_with("o/r", "permission_denied")
+    mock_set.assert_not_called()
+    mock_metric.assert_called_once_with("o/r", "none")
+
+
+def test_ensure_falls_back_to_create_when_empty_check_fails():
+    """A hiccup in repo_is_empty must not block enforcement creation -
+    fall back to the pre-existing create path."""
+    with patch("enforcement.detect_enforcement", return_value=EnforcementDetection("none", None)), \
+         patch("enforcement.repo_is_empty", side_effect=RuntimeError("api down")), \
+         patch("enforcement.create_ruleset", return_value={"id": 42}) as mock_create, \
+         patch("adapters.install_store.get_enforcement_id", return_value=None), \
+         patch("adapters.install_store.set_enforcement_id"):
+        result = ensure_enforcement("tok", "o", "r", "main", 1, 2)
+
+    assert result == "grug_managed"
+    mock_create.assert_called_once()
+
+
+def test_ensure_skips_empty_check_when_enforcement_exists():
+    """The empty-repo check only gates creation, never the early-return paths."""
+    with patch("enforcement.detect_enforcement", return_value=EnforcementDetection("grug_managed", None)), \
+         patch("adapters.install_store.get_enforcement_id", return_value=None), \
+         patch("enforcement.repo_is_empty") as mock_empty, \
+         patch("enforcement.create_ruleset") as mock_create:
+        result = ensure_enforcement("tok", "o", "r", "main", 1, 2)
+
+    assert result == "grug_managed"
+    mock_empty.assert_not_called()
+    mock_create.assert_not_called()
 
 
 def test_ensure_skips_when_grug_managed():
@@ -82,6 +117,7 @@ def test_ensure_stores_ruleset_id_from_create_response():
     """Ruleset ID from GitHub's create response is persisted in DDB."""
     with patch("enforcement.detect_enforcement", return_value=EnforcementDetection("none", None)), \
          patch("enforcement.create_ruleset", return_value={"id": 777}), \
+         patch("enforcement.repo_is_empty", return_value=False), \
          patch("adapters.install_store.get_enforcement_id", return_value=None), \
          patch("adapters.install_store.set_enforcement_id") as mock_set:
         ensure_enforcement("tok", "o", "r", "main", 10, 20)
@@ -730,6 +766,7 @@ def test_enable_then_disable_lifecycle():
     """Full lifecycle: enable creates, disable deletes."""
     with patch("enforcement.detect_enforcement", return_value=EnforcementDetection("none", None)), \
          patch("enforcement.create_ruleset", return_value={"id": 55}), \
+         patch("enforcement.repo_is_empty", return_value=False), \
          patch("adapters.install_store.get_enforcement_id", return_value=None), \
          patch("adapters.install_store.set_enforcement_id") as mock_set:
         ensure_enforcement("tok", "o", "r", "main", 1, 2)
@@ -762,6 +799,7 @@ def test_heal_clears_stale_id_and_recreates():
     """Deleted Grug ruleset → clear old ID → ensure creates a new one."""
     with patch("enforcement.detect_enforcement", return_value=EnforcementDetection("none", None)), \
          patch("enforcement.create_ruleset", return_value={"id": 99}), \
+         patch("enforcement.repo_is_empty", return_value=False), \
          patch("adapters.install_store.get_enforcement_id", return_value=99), \
          patch("adapters.install_store.set_enforcement_id") as mock_set:
         result = heal_enforcement("tok", "o", "r", "main", 1, 2, old_ruleset_id=42)
@@ -777,6 +815,7 @@ def test_heal_returns_new_state():
     with patch("adapters.install_store.set_enforcement_id"), \
          patch("enforcement.detect_enforcement", return_value=EnforcementDetection("none", None)), \
          patch("enforcement.create_ruleset", return_value={"id": 50}), \
+         patch("enforcement.repo_is_empty", return_value=False), \
          patch("adapters.install_store.get_enforcement_id", return_value=50):
         result = heal_enforcement("tok", "o", "r", "main", 1, 2, old_ruleset_id=10)
 
