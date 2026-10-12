@@ -40,12 +40,9 @@ def _cap_env(name: str, default: int) -> int:
 _DEFAULT_CYCLOMATIC_CAP = _cap_env("GRUG_COMPLEXITY_CYCLO_CAP", 15)
 _DEFAULT_COGNITIVE_CAP = _cap_env("GRUG_COMPLEXITY_COGNITIVE_CAP", 25)
 
-# How much WORSE an already-over-cap function must get before it is worth an
-# inline comment. Small churn inside a tangled function is normal maintenance;
-# only a real step change is this PR's doing. Tunable, but not per-repo config
-# - a threshold nobody can explain is a threshold nobody trusts.
-_REGRESSION_CYCLO = _cap_env("GRUG_COMPLEXITY_REGRESSION_CYCLO", 3)
-_REGRESSION_COG = _cap_env("GRUG_COMPLEXITY_REGRESSION_COG", 5)
+# An inline comment needs either this much margin over the cap or this much
+# PR-caused rise. Smaller positive changes stay in the summary.
+_INLINE_MARGIN = 5
 
 _RULE = "high-complexity"
 
@@ -182,24 +179,20 @@ def _score_functions(source: str) -> dict[str, tuple[int, int]]:
     return out
 
 
-def _is_regression(
+def _is_material_complexity(
     base_cyclo: int | None, base_cog: int | None,
     cyclo: int, cog: int, cyclo_cap: int, cog_cap: int,
 ) -> bool:
-    """Did THIS PR cause the over-cap state, or was it already there?
+    """Does this function have the required margin or PR-caused rise?
 
-    No base (fetch failed, unparseable, or new file) -> True, i.e. fall back
-    to the old absolute behaviour. Going SILENT on a missing base would hide
-    real regressions; falling back only restores the previous noise level.
+    With no base, only the absolute margin can justify an inline comment.
     """
-    if base_cyclo is None or base_cog is None:
-        return True
-    crossed = (base_cyclo <= cyclo_cap < cyclo) or (base_cog <= cog_cap < cog)
-    worsened = (
-        cyclo - base_cyclo >= _REGRESSION_CYCLO
-        or cog - base_cog >= _REGRESSION_COG
+    margin = cyclo - cyclo_cap >= _INLINE_MARGIN or cog - cog_cap >= _INLINE_MARGIN
+    rise = base_cyclo is not None and base_cog is not None and (
+        cyclo - base_cyclo >= _INLINE_MARGIN
+        or cog - base_cog >= _INLINE_MARGIN
     )
-    return crossed or worsened
+    return margin or rise
 
 
 def _delta_phrase(
@@ -245,16 +238,19 @@ def _scan_one_file(
             continue
 
         base_cyclo, base_cog = base.get(node.name, (None, None))
-        if not _is_regression(base_cyclo, base_cog, cyclo, cog, cyclo_cap, cog_cap):
-            # Only a function WITH a base can land here (no base -> _is_regression
-            # always True), so base_cyclo/base_cog are never None here.
-            assert base_cyclo is not None and base_cog is not None
-            suppressed.append(SuppressedComplexity(
-                file=path, function=node.name,
-                cyclomatic=cyclo, cognitive=cog,
-                base_cyclomatic=base_cyclo, base_cognitive=base_cog,
-            ))
-            continue
+        material = _is_material_complexity(
+            base_cyclo, base_cog, cyclo, cog, cyclo_cap, cog_cap,
+        )
+        if not material and base_cyclo is not None and base_cog is not None:
+            if cyclo <= base_cyclo and cog <= base_cog:
+                suppressed.append(SuppressedComplexity(
+                    file=path, function=node.name,
+                    cyclomatic=cyclo, cognitive=cog,
+                    base_cyclomatic=base_cyclo, base_cognitive=base_cog,
+                ))
+                continue
+        # Still report small changes in the summary; omission from the inline
+        # channel happens in dispatch because no suggestion exists.
 
         over = []
         if cyclo > cyclo_cap:
@@ -265,15 +261,20 @@ def _scan_one_file(
         out.append(Finding(
             file=path,
             line=min(touched),
-            severity="low",  # complexity advice is never blocking
+            severity="medium",
             rule_name=_RULE,
             message=(
                 f"Function `{node.name}` too tangled -- "
                 f"{', '.join(over)}.{delta} Grug say: break into smaller "
                 f"pieces so next hunter read it without getting lost."
             ),
-            suggestion=None,
-            effort="heavy-lift",
+            suggestion=(
+                f"Extract the new branching in `{node.name}` into a focused helper, "
+                "keeping this function as orchestration."
+                if material else None
+            ),
+            effort="quick-win" if material else None,
+            complexity_function=node.name,
         ))
     return out, suppressed
 

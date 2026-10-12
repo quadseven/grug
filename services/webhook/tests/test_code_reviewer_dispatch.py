@@ -2133,6 +2133,23 @@ def test_complexity_with_concrete_split_can_thread_at_medium_or_lower():
     assert finding.severity in {"low", "medium"}
 
 
+def test_complexity_dedup_matches_function_after_anchor_moves():
+    from personas.code_reviewer.persona import Finding
+    from personas.code_reviewer.dedup import dedup_findings, prior_keys_from_comments
+
+    prior = prior_keys_from_comments([{
+        "path": "src/bridge.py", "line": None, "original_line": 12, "side": "RIGHT",
+        "body": "Function `forward_reports` is too tangled.\n<!-- grug-rule:high-complexity -->",
+    }])
+    moved = Finding(
+        file="src/bridge.py", line=28, severity="medium",
+        rule_name="high-complexity", message="Split this function.",
+        suggestion="Extract the branch into a helper.",
+        complexity_function="forward_reports",
+    )
+    assert dedup_findings((moved,), prior) == ()
+
+
 def test_board_speaks_partial_coverage_not_blackout():
     """One event, one vocabulary. The board used to render partial coverage
     with the total-blackout sentence ("Grug eyes cloudy - read for self"),

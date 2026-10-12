@@ -114,6 +114,8 @@ class Finding:
     # (review_types.Effort) so an off-vocabulary value is a type error at
     # the constructor, not a silently dropped chip. None = no estimate.
     effort: Effort | None = None
+    # Stable identity for deterministic complexity findings across pushes.
+    complexity_function: str | None = None
     # Producer attribution for ensemble findings. Excluded from equality so
     # finding identity remains (file, line, rule) rather than observability
     # metadata; dedup and publication behavior must not change with tracing.
@@ -341,7 +343,7 @@ def evaluate_diff(
                     raw.severity
                     if raw.rule not in {"high-complexity", "complexity-hotspot"}
                     or "correctness risk:" in raw.message.lower()
-                    else "low"
+                    else "medium"
                 ),
                 rule_name=raw.rule,
                 message=raw.message,

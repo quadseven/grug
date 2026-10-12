@@ -71,8 +71,9 @@ class TestScanComplexity:
         assert len(out) == 1
         f = out[0]
         assert f.rule_name == "high-complexity"
-        assert f.severity == "low"             # complexity is advisory
-        assert f.effort == "heavy-lift"
+        assert f.severity == "medium"
+        assert f.suggestion
+        assert f.effort == "quick-win"
         assert "tangled" in f.message
         assert f.line == 3                     # anchored on the changed line
 
@@ -136,6 +137,35 @@ def test_material_worsening_is_reported_with_the_delta():
     assert len(out) == 1
     assert "moved it" in out[0].message      # states what THIS PR did
     assert "->" in out[0].message
+    from personas.code_reviewer.persona import CodeReviewEvaluation
+    from personas.code_reviewer.dispatch import _build_review_result
+    evaluation = CodeReviewEvaluation(findings=out, conclusion="success")
+    result, posted = _build_review_result(evaluation, head_sha="a" * 40, event="COMMENT")
+    assert result is not None
+    assert len(result.comments) == 1
+    assert posted[0].severity == "medium"
+    assert "Extract the new branching" in posted[0].suggestion
+
+
+def test_one_or_two_point_rise_is_summary_advice_without_inline_suggestion():
+    base = _tangled()
+    for rise in (1, 2):
+        scan = scan_complexity_full(
+            _one_hunk(), {"a.py": _tangled(rise)},
+            cyclomatic_cap=19, cognitive_cap=100,
+            base_contents={"a.py": base},
+        )
+        out = scan.findings
+        assert len(out) == 1
+        assert scan.suppressed == ()
+        assert out[0].suggestion is None
+        from personas.code_reviewer.persona import CodeReviewEvaluation
+        from personas.code_reviewer.dispatch import _build_review_result, _summary_markdown
+        evaluation = CodeReviewEvaluation(findings=out, conclusion="success")
+        result, posted = _build_review_result(evaluation, head_sha="a" * 40, event="COMMENT")
+        assert result is None
+        assert posted == ()
+        assert "Maintainability notes" in _summary_markdown(evaluation)[1]
 
 
 def test_new_function_over_cap_is_reported():

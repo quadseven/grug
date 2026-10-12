@@ -255,7 +255,7 @@ RULES: tuple[ReviewRule, ...] = (
         "function's complexity and you can name a concrete split or "
         "simplification on changed lines. Do not report pre-existing length "
         "or branching. Otherwise leave one short maintainability note in the "
-        "summary. Never use more than low severity unless naming a specific "
+        "summary. Never use more than medium severity unless naming a specific "
         "correctness risk; never mark this heavy lift.",
         bad_example="A long function is complex, with no change-specific evidence",
         good_example="Split the newly added validation branch into "
