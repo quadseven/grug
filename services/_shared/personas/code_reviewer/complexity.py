@@ -261,7 +261,7 @@ def _scan_one_file(
         out.append(Finding(
             file=path,
             line=min(touched),
-            severity="medium",
+            severity="medium" if material else "low",
             rule_name=_RULE,
             message=(
                 f"Function `{node.name}` too tangled -- "

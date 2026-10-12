@@ -51,7 +51,6 @@ _MARKER_RE = re.compile(r"<!--\s*grug-rule:([A-Za-z0-9_-]+)\s*-->")
 _COMPLEXITY_FUNCTION_RE = re.compile(
     r"<!--\s*grug-complexity-function:([A-Za-z0-9_-]+)\s*-->"
 )
-_FUNCTION_MESSAGE_RE = re.compile(r"Function\s+`([A-Za-z0-9_-]+)`")
 
 
 def rule_marker(rule_name: str) -> str:
@@ -119,8 +118,6 @@ def prior_keys_from_comments(comments: list[dict]) -> set[str]:
         if rule == "high-complexity":
             body = c.get("body", "") or ""
             function_match = _COMPLEXITY_FUNCTION_RE.search(body)
-            if function_match is None:
-                function_match = _FUNCTION_MESSAGE_RE.search(body)
             if function_match:
                 keys.add(complexity_function_key(path, function_match.group(1)))
     return keys

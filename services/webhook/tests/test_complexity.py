@@ -159,6 +159,7 @@ def test_one_or_two_point_rise_is_summary_advice_without_inline_suggestion():
         assert len(out) == 1
         assert scan.suppressed == ()
         assert out[0].suggestion is None
+        assert out[0].severity == "low"
         from personas.code_reviewer.persona import CodeReviewEvaluation
         from personas.code_reviewer.dispatch import _build_review_result, _summary_markdown
         evaluation = CodeReviewEvaluation(findings=out, conclusion="success")
