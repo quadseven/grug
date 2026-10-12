@@ -26,6 +26,7 @@ import os
 import re
 import threading
 from collections import deque
+from dataclasses import replace
 from typing import Any, Literal
 from urllib.parse import quote
 
@@ -75,6 +76,7 @@ from personas.code_reviewer.model_metrics import emit_finding_posted
 from personas import board
 from personas.code_reviewer.complexity import ComplexityScan, scan_complexity_full
 from personas.code_reviewer.lint import scan_ruff
+from personas.code_reviewer.suggestion import checked_suggestion
 from personas.code_reviewer.cross_file import (
     extract_symbols, fetch_cross_file_context,
 )
@@ -1426,7 +1428,9 @@ def _provenance_block(f: Finding) -> str:
     return _details_block("Evidence and provenance", "\n".join(lines))
 
 
-def _inline_comment_body(f: Finding, precedent_note: str = "") -> str:
+def _inline_comment_body(
+    f: Finding, precedent_note: str = "", *, committable: bool = True,
+) -> str:
     """Format one finding as a structured Marking (#553 / #617 / Markings v2).
 
     Shape (Markings Board):
@@ -1441,7 +1445,10 @@ def _inline_comment_body(f: Finding, precedent_note: str = "") -> str:
     Appends a hidden `grug-rule` marker (rendered invisibly by GitHub)
     so a later `synchronize` push can recognise this comment as a Grug
     finding for dedup (#189) — see dedup.parse_rule. The marker stays
-    LAST (dedup.parse_rule reads the last marker in the body)."""
+    LAST (dedup.parse_rule reads the last marker in the body).
+
+    `committable=False` renders any suggestion as fenced prose: dispatch
+    passes it when `checked_suggestion` (#1149) could not verify the fix."""
     cat = _category_for_rule(f.rule_name)
     # CR-dense header: severity chip | category | rule | effort chip
     chip = (
@@ -1468,7 +1475,8 @@ def _inline_comment_body(f: Finding, precedent_note: str = "") -> str:
     # blank-line commit (FLINT finding on #558).
     stripped_suggestion = f.suggestion.strip("\n\r") if f.suggestion else ""
     if (
-        f.suggestion
+        committable
+        and f.suggestion
         and "```" not in f.suggestion
         and "\n" not in f.suggestion.strip()
         and stripped_suggestion
@@ -2042,11 +2050,21 @@ def _precedent_notes_for(
         return {}
 
 
+def _checked_comment_body(f: Finding, file_text: str, precedent_note: str) -> str:
+    """Inline body whose committable block, if any, passed `checked_suggestion`.
+    A fix that fails the check still renders, as prose under "Fix"."""
+    checked = checked_suggestion(f, f.line, file_text)
+    if checked is None:
+        return _inline_comment_body(f, precedent_note, committable=False)
+    return _inline_comment_body(replace(f, suggestion=checked), precedent_note)
+
+
 def _build_review_result(
     evaluation: CodeReviewEvaluation, *, head_sha: str, event: ReviewEvent,
     prior_keys: frozenset[str] = frozenset(),
     precedent_notes: dict[str, str] | None = None,
     repo_config: RepoConfig | None = None,
+    file_contents: dict[str, str] | None = None,
 ) -> tuple[ReviewResult | None, tuple[Finding, ...]]:
     """Build the ReviewResult, or (None, ()) if nothing NEW to post.
 
@@ -2064,7 +2082,11 @@ def _build_review_result(
     order. Callers MUST thread it into `_capture_review_comments` as
     `findings=`: that function pairs GitHub's freshly-fetched comments with
     this tuple by POSITION (grug#967), so an order mismatch here would
-    mis-attribute captured comments."""
+    mis-attribute captured comments.
+
+    `file_contents` is the head text dispatch already loaded. Every fix is
+    offered as a committable block only after `checked_suggestion` (#1149)
+    verifies it against that text; a file with no loaded text gets prose."""
     if evaluation.degraded_reason not in (None, "", "partial_review"):
         return None, ()
     new_findings = dedup_findings(evaluation.findings, prior_keys)
@@ -2077,11 +2099,13 @@ def _build_review_result(
     if not new_findings:
         return None, ()
     notes = precedent_notes or {}
+    texts = file_contents or {}
     comments = tuple(
         InlineComment(
             path=f.file, line=f.line,
-            body=_inline_comment_body(
-                f, precedent_note=notes.get(finding_key(f.file, f.line, f.rule_name), ""),
+            body=_checked_comment_body(
+                f, texts.get(f.file, ""),
+                notes.get(finding_key(f.file, f.line, f.rule_name), ""),
             ),
         )
         for f in new_findings
@@ -3067,6 +3091,7 @@ def dispatch_code_review(
     review_result, posted_findings = _build_review_result(
         evaluation, head_sha=head_sha, event=event, prior_keys=prior_keys,
         precedent_notes=precedent_notes, repo_config=repo_config,
+        file_contents=file_contents,
     )
     review_resp: dict[str, Any] | None = None
     if review_result is not None:
@@ -3693,6 +3718,7 @@ def _publish_deep_review(
     pr_title: str = "",
     base_sha: str = "",
     repo_config: RepoConfig | None = None,
+    file_contents: dict[str, str] | None = None,
 ) -> None:
     """Publish the async deep review's novel findings as a GitHub review.
 
@@ -3711,6 +3737,7 @@ def _publish_deep_review(
         prior_keys=all_prior,
         precedent_notes={},
         repo_config=repo_config,
+        file_contents=file_contents,
     )
     if review_result is None:
         return
@@ -4042,6 +4069,7 @@ def _async_deep_append_if_needed(
         pr_title=str(pr_context.get("title") or ""),
         base_sha=str(pr_context.get("base_sha") or ""),
         repo_config=repo_config,
+        file_contents=file_contents,
     )
     _submit_deep_evals(
         deep_graded,

@@ -2264,7 +2264,14 @@ def test_dispatch_suggestion_survives_pipe_to_inline_comment(monkeypatch):
         cr_dispatch, "post_review",
         lambda t, o, r, *, pull_number, result: posted_review.append(result) or {"id": 2},
     )
-    with patch("httpx.get", return_value=_diff_response()):
+    # The head text is what #1149's check verifies the block against, so
+    # the contents fetch returns real Python rather than the diff.
+    head_text = "import logging\nlogging.debug('x')\nnew2\n"
+
+    def _get(url, *a, **k):
+        return _diff_response(head_text if "/contents/" in url else _DIFF)
+
+    with patch("httpx.get", side_effect=_get):
         cr_dispatch.dispatch_code_review(_payload(), blocking=False)
     assert len(posted_review) == 1
     body = posted_review[0].comments[0].body

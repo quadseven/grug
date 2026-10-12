@@ -68,6 +68,7 @@ import tempfile
 
 from personas.code_reviewer.diff_parser import DiffHunk
 from personas.code_reviewer.persona import Finding
+from personas.code_reviewer.suggestion import ruff_fix_line
 from personas.code_reviewer.test_paths import is_test_file
 from review_types import Severity  # single source (#250)
 # Reuse the canonical added-lines walk rather than a third copy of it
@@ -306,7 +307,7 @@ def scan_ruff(
         log.warning("lint_ruff_unparseable", extra={"kind": type(e).__name__})
         return ()
 
-    return _map_results(results, prefix, added)
+    return _map_results(results, prefix, added, kept)
 
 
 def _is_reportable(
@@ -320,10 +321,15 @@ def _is_reportable(
 
 
 def _map_results(
-    results: object, prefix: str, added: dict[str, set[int]]
+    results: object, prefix: str, added: dict[str, set[int]],
+    sources: dict[str, str] | None = None,
 ) -> tuple[Finding, ...]:
     """Map ruff JSON to diff-anchored Findings. Tolerant of shape drift: a
-    result missing a field is skipped, never fatal."""
+    result missing a field is skipped, never fatal.
+
+    `sources` (path -> scanned text) lets ruff's own fix ride along as the
+    finding's suggestion when it is safe and confined to the flagged line
+    (#1149); dispatch still checks it before offering a committable block."""
     if not isinstance(results, list):
         return ()
     findings: list[Finding] = []
@@ -354,7 +360,7 @@ def _map_results(
                     f"whether the code matches it. Silence it with "
                     f"`# noqa: {code}` and a reason if it is wrong here."
                 ),
-                suggestion=None,
+                suggestion=_fix_suggestion(r.get("fix"), row, (sources or {}).get(path)),
                 effort=None,
             )
         )
@@ -362,3 +368,13 @@ def _map_results(
             log.info("lint_ruff_findings_capped", extra={"cap": _MAX_FINDINGS})
             break
     return tuple(findings)
+
+
+def _fix_suggestion(fix: object, row: int, text: str | None) -> str | None:
+    """Ruff's fix applied to line `row` of `text`, when it is one-line safe."""
+    if text is None:
+        return None
+    lines = text.splitlines()
+    if not 1 <= row <= len(lines):
+        return None
+    return ruff_fix_line(fix, row, lines[row - 1])
