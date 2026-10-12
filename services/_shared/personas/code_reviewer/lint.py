@@ -61,6 +61,7 @@ pre-existing debt the author did not touch.
 from __future__ import annotations
 
 import json
+import ast
 import logging
 import os
 import subprocess
@@ -74,6 +75,7 @@ from review_types import Severity  # single source (#250)
 # (standard-pattern-reuse-or-elect): complexity._changed_by_file already
 # walks the unified diff body and returns new-side ADDED line numbers.
 from personas.code_reviewer.complexity import _changed_by_file
+from personas.code_reviewer.repo_ruff_policy import RepoRuffPolicy
 
 log = logging.getLogger("grug.code_reviewer.lint")
 
@@ -183,7 +185,7 @@ _HIGH_PREFIXES = (
 # Rules that are idiomatic noise in test code: assert (S101), hardcoded
 # password/token constants and arguments (S105-S107), seeded non-crypto
 # random (S311). Dropped for test files only.
-_TEST_NOISE_RULES = frozenset({"S101", "S105", "S106", "S107", "S311"})
+_TEST_NOISE_RULES = frozenset({"S101", "S102", "S105", "S106", "S107", "S311"})
 _is_test_file = is_test_file  # kept: lint tests and callers use this name
 
 
@@ -250,7 +252,9 @@ def _write(tmp: str, files: dict[str, str]) -> None:
 
 
 def scan_ruff(
-    hunks: tuple[DiffHunk, ...], file_contents: dict[str, str]
+    hunks: tuple[DiffHunk, ...], file_contents: dict[str, str],
+    policy: RepoRuffPolicy | None = None,
+    policy_dropped: list[int] | None = None,
 ) -> tuple[Finding, ...]:
     """Ruff over the changed Python files, diff-anchored to added lines.
 
@@ -306,7 +310,7 @@ def scan_ruff(
         log.warning("lint_ruff_unparseable", extra={"kind": type(e).__name__})
         return ()
 
-    return _map_results(results, prefix, added)
+    return _map_results(results, prefix, added, kept, policy, policy_dropped)
 
 
 def _is_reportable(
@@ -320,13 +324,17 @@ def _is_reportable(
 
 
 def _map_results(
-    results: object, prefix: str, added: dict[str, set[int]]
+    results: object, prefix: str, added: dict[str, set[int]],
+    file_contents: dict[str, str] | None = None,
+    policy: RepoRuffPolicy | None = None,
+    policy_dropped: list[int] | None = None,
 ) -> tuple[Finding, ...]:
     """Map ruff JSON to diff-anchored Findings. Tolerant of shape drift: a
     result missing a field is skipped, never fatal."""
     if not isinstance(results, list):
         return ()
     findings: list[Finding] = []
+    dropped_policy = 0
     for r in results:
         if not isinstance(r, dict):
             continue
@@ -341,11 +349,17 @@ def _map_results(
             continue
         if not _is_reportable(path, row, code, added):
             continue
+        if policy and policy.drops(code, path):
+            dropped_policy += 1
+            continue
+        severity = _severity_for(code)
+        if code == "S608" and _s608_is_constant(file_contents.get(path, "") if file_contents else "", row):
+            severity = "medium"
         findings.append(
             Finding(
                 file=path,
                 line=row,
-                severity=_severity_for(code),
+                severity=severity,
                 rule_name=_rule_name_for(code),
                 message=(
                     f"ruff `{code}`: {msg}. Deterministic finding - MEASURED by "
@@ -361,4 +375,51 @@ def _map_results(
         if len(findings) >= _MAX_FINDINGS:
             log.info("lint_ruff_findings_capped", extra={"cap": _MAX_FINDINGS})
             break
+    if dropped_policy:
+        log.info("lint_ruff_policy_dropped", extra={"count": dropped_policy})
+        if policy_dropped is not None:
+            policy_dropped.append(dropped_policy)
     return tuple(findings)
+
+
+def _s608_is_constant(source: str, row: int) -> bool:
+    """Recognize literal SQL construction without evaluating repository code."""
+    try:
+        tree = ast.parse(source)
+    except SyntaxError:
+        return False
+    constants: dict[str, ast.expr] = {}
+    for node in tree.body:
+        if isinstance(node, (ast.Assign, ast.AnnAssign)):
+            value = node.value
+            targets = node.targets if isinstance(node, ast.Assign) else [node.target]
+            if isinstance(value, ast.expr):
+                for target in targets:
+                    if isinstance(target, ast.Name):
+                        constants[target.id] = value
+
+    def literal(node: ast.AST, seen: frozenset[str] = frozenset()) -> bool:
+        if isinstance(node, ast.Constant):
+            return isinstance(node.value, (str, bytes, int, float, bool, type(None)))
+        if isinstance(node, ast.Name) and node.id in constants and node.id not in seen:
+            return literal(constants[node.id], seen | {node.id})
+        if isinstance(node, ast.BinOp) and isinstance(node.op, ast.Add):
+            return literal(node.left, seen) and literal(node.right, seen)
+        if isinstance(node, (ast.Tuple, ast.List, ast.Set)):
+            return all(literal(item, seen) for item in node.elts)
+        if isinstance(node, ast.Dict):
+            return all(literal(k, seen) and literal(v, seen) for k, v in zip(node.keys, node.values) if k)
+        if isinstance(node, ast.Call):
+            return all(literal(arg, seen) for arg in node.args) and all(literal(k.value, seen) for k in node.keywords)
+        return False
+
+    for node in ast.walk(tree):
+        if getattr(node, "lineno", None) != row:
+            continue
+        candidates = [node]
+        if isinstance(node, ast.Call):
+            candidates.extend(node.args)
+        for candidate in candidates:
+            if literal(candidate) and isinstance(candidate, (ast.BinOp, ast.Call, ast.Constant, ast.Name)):
+                return True
+    return False

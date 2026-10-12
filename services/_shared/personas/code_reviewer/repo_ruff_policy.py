@@ -1,0 +1,58 @@
+"""Small, fail-closed parser for the Ruff policy relevant to review findings."""
+from __future__ import annotations
+
+import fnmatch
+import tomllib
+from dataclasses import dataclass
+
+
+@dataclass(frozen=True)
+class RepoRuffPolicy:
+    select: frozenset[str] = frozenset()
+    ignore: frozenset[str] = frozenset()
+    per_file_ignores: tuple[tuple[str, frozenset[str]], ...] = ()
+
+    def drops(self, code: str, path: str) -> bool:
+        if _matches(code, self.ignore) or _matches(code, self.select):
+            return True
+        return any(fnmatch.fnmatchcase(path, pattern) and _matches(code, codes)
+                   for pattern, codes in self.per_file_ignores)
+
+
+def _codes(value: object) -> frozenset[str]:
+    if isinstance(value, str):
+        value = [part.strip() for part in value.split(",")]
+    if not isinstance(value, list) or not all(isinstance(x, str) for x in value):
+        raise ValueError("expected rule-code list")
+    return frozenset(value)
+
+
+def _matches(code: str, patterns: frozenset[str]) -> bool:
+    return any(code == pattern or code.startswith(pattern.rstrip("*"))
+               for pattern in patterns)
+
+
+def parse_repo_ruff_policy(text: str | None) -> RepoRuffPolicy:
+    """Parse TOML policy. Missing, invalid, or unsupported input means no policy."""
+    if not text:
+        return RepoRuffPolicy()
+    try:
+        root = tomllib.loads(text)
+        ruff = root.get("tool", {}).get("ruff", {})
+        if not isinstance(ruff, dict):
+            return RepoRuffPolicy()
+        lint = ruff.get("lint", {})
+        if not isinstance(lint, dict):
+            lint = {}
+        select = _codes(lint.get("select", ruff.get("select", [])))
+        select |= _codes(lint.get("extend-select", ruff.get("extend-select", [])))
+        ignore = _codes(lint.get("ignore", ruff.get("ignore", [])))
+        ignore |= _codes(lint.get("extend-ignore", ruff.get("extend-ignore", [])))
+        pfi = lint.get("per-file-ignores", ruff.get("per-file-ignores", {}))
+        if not isinstance(pfi, dict):
+            raise ValueError("invalid per-file-ignores")
+        entries = tuple((pattern, _codes(codes)) for pattern, codes in pfi.items()
+                        if isinstance(pattern, str))
+        return RepoRuffPolicy(select, ignore, entries)
+    except (tomllib.TOMLDecodeError, ValueError, TypeError, AttributeError):
+        return RepoRuffPolicy()
