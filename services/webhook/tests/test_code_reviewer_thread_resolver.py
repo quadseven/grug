@@ -82,15 +82,24 @@ class _Resp:
         return self._p
 
 
+def _reply(author="alice", body="Fixed in abc1234", db_id=2):
+    return {
+        "databaseId": db_id, "author": {"login": author}, "body": body,
+        "path": "a.py", "line": None, "originalLine": 10,
+        "originalCommit": {"oid": "c0ffee"},
+    }
+
+
 @pytest.fixture
 def run(monkeypatch):
-    def _run(gh, findings=()):
+    def _run(gh, findings=(), pr_author=None):
         monkeypatch.setattr(tr.httpx, "post", gh.post)
         monkeypatch.setattr(
             tr, "with_install_token_retry", lambda iid, fn: fn("tok"),
         )
         return tr.resolve_fixed_threads(
             1, "o", "r", 5, head_sha=HEAD, findings=tuple(findings),
+            pr_author=pr_author,
         )
     return _run
 
@@ -165,6 +174,30 @@ def test_human_reply_in_grug_thread_blocks_resolution(run):
 def test_grug_own_followup_reply_does_not_block(run):
     gh = _Gh([_thread(comments=[_comment(), _comment(db_id=2)])])
     assert run(gh) == 1
+
+
+def test_author_fixed_in_reply_does_not_block_resolution(run):
+    """When the PR author has already replied 'Fixed in <sha>', Elder can
+    still resolve the thread without posting a second reply."""
+    gh = _Gh([_thread(comments=[_comment(), _reply(author="alice")])])
+    assert run(gh, pr_author="alice") == 1
+    assert gh.resolved == ["T1"]
+    assert gh.replies == []
+
+
+def test_non_author_fixed_in_reply_blocks_resolution(run):
+    """A non-author 'Fixed in' reply is treated as a person disagreeing."""
+    gh = _Gh([_thread(comments=[_comment(), _reply(author="bob")])])
+    assert run(gh, pr_author="alice") == 0
+    assert gh.resolved == [] and gh.replies == []
+
+
+def test_author_disagreeing_reply_blocks_resolution(run):
+    """A reply from the PR author that does not start with 'Fixed in' keeps
+    the thread open - the author may be pushing back."""
+    gh = _Gh([_thread(comments=[_comment(), _reply(author="alice", body="I disagree")])])
+    assert run(gh, pr_author="alice") == 0
+    assert gh.resolved == [] and gh.replies == []
 
 
 def test_truncated_comment_list_is_treated_as_touched(run):
@@ -256,3 +289,23 @@ def test_an_already_collapsed_comment_is_left_alone(run):
     gh = _GhForbiddenResolve([_with_node_id(_thread(), minimized=True)])
     assert run(gh) == 0
     assert gh.replies == [] and gh.minimized == []
+
+
+def test_structured_log_carries_resolution_counts(run, caplog):
+    """Every pass emits one line with resolved, collapsed, and skip counts."""
+    gh = _Gh([
+        _thread(),
+        _thread(tid="T2", comments=[_comment(), _reply(author="alice")]),
+        _thread(tid="T3", comments=[_comment(), _comment(author="bob", rule=None, db_id=2)]),
+        _thread(tid="T4", comments=[_comment(), _reply(author="alice", body="I disagree")]),
+    ])
+    with caplog.at_level("INFO"):
+        assert run(gh, pr_author="alice") == 2
+    log_records = [r for r in caplog.records if r.getMessage() == "elder_threads_resolved"]
+    assert len(log_records) == 1
+    extra = log_records[0].__dict__
+    assert extra["resolved"] == 2
+    assert extra["collapsed"] == 0
+    assert extra["skipped_person"] == 2
+    assert extra["skipped_reraised"] == 0
+    assert extra["candidates"] == 2
