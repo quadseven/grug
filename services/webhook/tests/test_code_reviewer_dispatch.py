@@ -2089,6 +2089,50 @@ def test_partial_review_stays_advisory_but_publishes_validated_findings():
     assert "could not see" not in summary
 
 
+def test_complexity_without_split_is_summary_only_and_other_kind_still_threads():
+    from personas.code_reviewer.persona import CodeReviewEvaluation, Finding
+
+    complexity = Finding(
+        file="src/bridge.py", line=12, severity="low",
+        rule_name="high-complexity", message="Pre-existing bridge remains long.",
+        suggestion=None, effort="heavy-lift",
+    )
+    correctness = Finding(
+        file="src/bridge.py", line=12, severity="high",
+        rule_name="null-deref", message="Possible null dereference.", suggestion=None,
+    )
+    evaluation = CodeReviewEvaluation(
+        findings=(complexity, correctness), conclusion="failure",
+    )
+
+    result, posted = cr_dispatch._build_review_result(
+        evaluation, head_sha="a" * 40, event="COMMENT",
+    )
+    assert result is not None
+    assert posted == (correctness,)
+    _, summary = cr_dispatch._summary_markdown(evaluation)
+    assert "## Maintainability notes" in summary
+    assert "Pre-existing bridge remains long." in summary
+
+
+def test_complexity_with_concrete_split_can_thread_at_medium_or_lower():
+    from personas.code_reviewer.persona import CodeReviewEvaluation, Finding
+
+    finding = Finding(
+        file="src/bridge.py", line=12, severity="medium",
+        rule_name="complexity-hotspot", message="New branching should be split.",
+        suggestion="Extract the new branch into _validate_payload().", effort="quick-win",
+    )
+    evaluation = CodeReviewEvaluation(findings=(finding,), conclusion="success")
+    result, posted = cr_dispatch._build_review_result(
+        evaluation, head_sha="a" * 40, event="COMMENT",
+    )
+    assert result is not None
+    assert len(result.comments) == 1
+    assert posted == (finding,)
+    assert finding.severity in {"low", "medium"}
+
+
 def test_board_speaks_partial_coverage_not_blackout():
     """One event, one vocabulary. The board used to render partial coverage
     with the total-blackout sentence ("Grug eyes cloudy - read for self"),

@@ -251,10 +251,15 @@ RULES: tuple[ReviewRule, ...] = (
     ReviewRule(
         name="complexity-hotspot",
         bug_class="maintainability",
-        description="A function with deep nesting / many branches doing "
-        "several jobs — hard to test, easy to break on edit.",
-        bad_example="def handle(): # 6 nested ifs, 80 lines",
-        good_example="def handle():\n    _validate(); _dispatch(); _publish()",
+        description="Report only when this diff materially raises the "
+        "function's complexity and you can name a concrete split or "
+        "simplification on changed lines. Do not report pre-existing length "
+        "or branching. Otherwise leave one short maintainability note in the "
+        "summary. Never use more than low severity unless naming a specific "
+        "correctness risk; never mark this heavy lift.",
+        bad_example="A long function is complex, with no change-specific evidence",
+        good_example="Split the newly added validation branch into "
+        "_validate_payload(); suggestion shows the changed lines",
         severity="low",
     ),
     ReviewRule(

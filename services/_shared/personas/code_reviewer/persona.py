@@ -337,7 +337,12 @@ def evaluate_diff(
             Finding(
                 file=raw.path,
                 line=raw.line,
-                severity=raw.severity,
+                severity=(
+                    raw.severity
+                    if raw.rule not in {"high-complexity", "complexity-hotspot"}
+                    or "correctness risk:" in raw.message.lower()
+                    else "low"
+                ),
                 rule_name=raw.rule,
                 message=raw.message,
                 # #553: wire fields carry through; the anti-hallucination

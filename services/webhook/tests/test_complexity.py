@@ -71,7 +71,7 @@ class TestScanComplexity:
         assert len(out) == 1
         f = out[0]
         assert f.rule_name == "high-complexity"
-        assert f.severity == "medium"          # advisory, never blocks alone
+        assert f.severity == "low"             # complexity is advisory
         assert f.effort == "heavy-lift"
         assert "tangled" in f.message
         assert f.line == 3                     # anchored on the changed line
