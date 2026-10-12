@@ -28,8 +28,7 @@ def _codes(value: object) -> frozenset[str]:
 
 
 def _matches(code: str, patterns: frozenset[str]) -> bool:
-    return any(code == pattern or code.startswith(pattern.rstrip("*"))
-               for pattern in patterns)
+    return any(fnmatch.fnmatchcase(code, pattern) for pattern in patterns)
 
 
 def parse_repo_ruff_policy(text: str | None) -> RepoRuffPolicy:
@@ -38,7 +37,8 @@ def parse_repo_ruff_policy(text: str | None) -> RepoRuffPolicy:
         return RepoRuffPolicy()
     try:
         root = tomllib.loads(text)
-        ruff = root.get("tool", {}).get("ruff", {})
+        tool = root.get("tool")
+        ruff = tool.get("ruff", {}) if isinstance(tool, dict) else {}
         if not isinstance(ruff, dict):
             return RepoRuffPolicy()
         lint = ruff.get("lint", {})

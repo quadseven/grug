@@ -373,11 +373,15 @@ def test_secret_scan_still_flags_key_shaped_literal_in_test_file():
 
 def _scan_s608(source: str, policy=None):
     path = "src/query.py"
-    payload = json.dumps([_s_result(path, "S608")])
+    row = next((i for i, line in enumerate(source.splitlines(), 1)
+                if line.lstrip().startswith("query =")), 1)
+    result = _s_result(path, "S608")
+    result["location"]["row"] = row
+    payload = json.dumps([result])
     with patch("subprocess.run", return_value=_proc(1, payload)), \
          patch("tempfile.TemporaryDirectory") as td:
         td.return_value.__enter__.return_value = _FAKE_DIR
-        return scan_ruff((_hunk(path, "@@ -0,0 +1,2 @@\n+query = 'SELECT ' + TABLE\n+cursor.execute(query)\n"),), {path: source}, policy)
+        return scan_ruff((_hunk(path, "@@ -0,0 +1,3 @@\n+TABLE = 'records'\n+query = 'SELECT ' + TABLE\n+cursor.execute(query)\n"),), {path: source}, policy)
 
 
 def test_s608_constant_concatenation_is_medium():

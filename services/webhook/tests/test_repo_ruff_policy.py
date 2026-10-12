@@ -7,6 +7,7 @@ from personas.code_reviewer.repo_ruff_policy import (
 def test_missing_or_malformed_config_means_no_policy():
     assert parse_repo_ruff_policy(None) == RepoRuffPolicy()
     assert parse_repo_ruff_policy("[tool.ruff\ninvalid") == RepoRuffPolicy()
+    assert parse_repo_ruff_policy('tool = "invalid"') == RepoRuffPolicy()
 
 
 def test_reads_select_ignore_and_per_file_ignores():
@@ -30,3 +31,9 @@ def test_reads_ruff_toplevel_legacy_keys():
     policy = parse_repo_ruff_policy('[tool.ruff]\nselect = ["S"]\nignore = ["S608"]\n')
     assert policy.drops("S102", "module.py")
     assert policy.drops("S608", "module.py")
+
+
+def test_rule_wildcards_match_as_globs():
+    policy = parse_repo_ruff_policy('[tool.ruff.lint]\nignore = ["S6*"]\n')
+    assert policy.drops("S608", "src/query.py")
+    assert not policy.drops("S708", "src/query.py")
