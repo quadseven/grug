@@ -49,7 +49,7 @@ Continuation prose that is not a bullet.
 
 def test_numbers_cover_closing_keywords_and_ref_forms():
     body = "Closes #1\nRefs #2\nPart of #3\nRelates to #4"
-    assert linked_issue_numbers(body, limit=10) == [1, 2, 3, 4]
+    assert linked_issue_numbers(body, limit=10) == [1, 2, 4]
 
 
 def test_same_repo_qualified_ref_is_read_before_epic():

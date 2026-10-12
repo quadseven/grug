@@ -2377,6 +2377,23 @@ def _attach_linked_issue_context(
         )
 
 
+def _linked_issue_summary_note(linked_context: str) -> str:
+    """Summarize which linked issue criteria were included in the review."""
+    if not linked_context:
+        return ""
+    issue_numbers = list(dict.fromkeys(
+        re.findall(r"^#(\d+) criterion ", linked_context, re.M),
+    ))
+    criteria_count = len(re.findall(r"^#\d+ criterion \d+ ", linked_context, re.M))
+    if not issue_numbers:
+        return ""
+    return (
+        "\n\nLinked issue criteria read: "
+        + ", ".join(f"#{number}" for number in issue_numbers)
+        + f" ({criteria_count} criteria)."
+    )
+
+
 def dispatch_code_review(
     payload: dict[str, Any], *, blocking: bool,
     cancel_event: threading.Event | None = None,
@@ -3010,16 +3027,9 @@ def dispatch_code_review(
         review_phase=tier1_phase,
     )
     summary += config_note
-    linked_context = str(pr_context.get("linked_issue_context") or "")
-    if linked_context:
-        issue_numbers = list(dict.fromkeys(re.findall(r"^#(\d+) criterion ", linked_context, re.M)))
-        criteria_count = len(re.findall(r"^#\d+ criterion \d+ ", linked_context, re.M))
-        if issue_numbers:
-            summary += (
-                "\n\nLinked issue criteria read: "
-                + ", ".join(f"#{number}" for number in issue_numbers)
-                + f" ({criteria_count} criteria)."
-            )
+    summary += _linked_issue_summary_note(
+        str(pr_context.get("linked_issue_context") or ""),
+    )
     conclusion, title, summary, listed_threads = _carry_into_check(
         action=action, evaluation=evaluation, mode=mode,
         installation_id=installation_id, owner=owner, repo_name=repo_name,
