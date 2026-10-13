@@ -33,7 +33,9 @@ import httpx
 
 from activity_log import record_check_verdict
 from code_review_prompt import RULES
-from github_app_auth import get_app_id, with_install_token_retry
+from github_app_auth import (
+    get_app_id, installation_permission_summary_note, with_install_token_retry,
+)
 from github_checks_client import (
     CheckConclusion,
     CheckRunResult,
@@ -3035,6 +3037,7 @@ def dispatch_code_review(
         review_phase=tier1_phase,
     )
     summary += config_note
+    summary += installation_permission_summary_note(installation_id)
     conclusion, title, summary, listed_threads = _carry_into_check(
         action=action, evaluation=evaluation, mode=mode,
         installation_id=installation_id, owner=owner, repo_name=repo_name,

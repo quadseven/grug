@@ -40,9 +40,15 @@ def _reset_cache():
     import github_app_auth as gh
     from ports.token_cache import InMemoryTokenCache
     original = gh._cache
+    original_checked = gh._checked_install_permissions
+    original_missing = gh._missing_install_permissions
     gh._cache = InMemoryTokenCache()
+    gh._checked_install_permissions = set()
+    gh._missing_install_permissions = {}
     yield
     gh._cache = original
+    gh._checked_install_permissions = original_checked
+    gh._missing_install_permissions = original_missing
 
 
 @pytest.fixture
@@ -103,6 +109,75 @@ def test_get_install_token_cache_hit_skips_http(_stub_secrets):
 
     assert t1 == t2 == "TOKEN-XYZ"
     assert mock_post.call_count == 1
+
+
+def test_missing_app_permission_is_reported_once_and_exposed_to_summary(
+    _stub_secrets, caplog,
+):
+    import logging
+    import github_app_auth as gh
+
+    payload = {
+        "token": "TOKEN-XYZ",
+        "permissions": {
+            "contents": "read", "pull_requests": "write", "issues": "write",
+            "checks": "write", "metadata": "read",
+        },
+    }
+    fake = MagicMock()
+    fake.raise_for_status = MagicMock()
+    fake.json = MagicMock(return_value=payload)
+    with patch("httpx.post", return_value=fake), caplog.at_level(logging.WARNING):
+        gh.get_install_token(123)
+        gh.get_install_token(123, force_refresh=True)
+
+    records = [r for r in caplog.records if r.getMessage() == "app_permissions_missing"]
+    assert len(records) == 1
+    assert records[0].missing == [{
+        "permission": "contents", "required_level": "write",
+        "feature": "Read code and resolve fixed review threads",
+    }]
+    assert gh.missing_install_permissions(123) == ("contents",)
+    assert gh.installation_permission_summary_note(123) == (
+        "\n\nResolving fixed threads needs Contents: write; "
+        "threads are collapsed instead"
+    )
+
+
+def test_full_app_permission_set_is_not_reported(_stub_secrets, caplog):
+    import logging
+    import github_app_auth as gh
+
+    fake = MagicMock()
+    fake.raise_for_status = MagicMock()
+    fake.json = MagicMock(return_value={
+        "token": "TOKEN-XYZ",
+        "permissions": {name: level for name, (level, _) in gh.REQUIRED_APP_PERMISSIONS.items()},
+    })
+    with patch("httpx.post", return_value=fake), caplog.at_level(logging.WARNING):
+        gh.get_install_token(123)
+
+    assert not [r for r in caplog.records if r.getMessage() == "app_permissions_missing"]
+    assert gh.missing_install_permissions(123) == ()
+    assert gh.installation_permission_summary_note(123) == ""
+
+
+def test_documented_app_permissions_match_runtime_inventory():
+    from pathlib import Path
+    import github_app_auth as gh
+
+    text = (Path(__file__).resolve().parents[3] / "docs/app-permissions.md").read_text()
+    documented = {}
+    for line in text.splitlines():
+        if line.startswith("| `"):
+            permission, level, feature = line.split("|", 4)[1:4]
+            documented[permission.strip(" `")] = (
+                level.strip(" `"), feature.strip()
+            )
+    assert documented == {
+        name: (level, feature)
+        for name, (level, feature) in gh.REQUIRED_APP_PERMISSIONS.items()
+    }
 
 
 def test_get_install_token_force_refresh_invalidates_then_refetches(_stub_secrets):
