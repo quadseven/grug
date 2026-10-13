@@ -26,6 +26,7 @@ import re
 from dataclasses import dataclass, field
 from typing import get_args
 
+from code_review_prompt import COMPLEXITY_CORRECTNESS_MARKER
 from github_checks_client import CheckConclusion
 from llm_client import FindingOrigin, LlmReviewResponse
 from personas.code_reviewer.diff_parser import DiffHunk
@@ -342,7 +343,9 @@ def evaluate_diff(
                 severity=(
                     raw.severity
                     if raw.rule not in {"high-complexity", "complexity-hotspot"}
-                    or "correctness risk:" in raw.message.lower()
+                    or raw.message.lstrip().lower().startswith(
+                        COMPLEXITY_CORRECTNESS_MARKER.lower()
+                    )
                     else "medium"
                 ),
                 rule_name=raw.rule,

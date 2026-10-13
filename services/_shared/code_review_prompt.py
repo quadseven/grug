@@ -25,6 +25,12 @@ from typing import Literal, get_args
 
 from review_types import SEVERITIES, Severity  # shared leaf — no cycle (#250)
 
+# The literal prefix a complexity finding must open its message with to keep
+# a severity above medium. The rule text below tells the model to write it,
+# and `personas.code_reviewer.persona.evaluate_diff` clamps on it, so the two
+# share this one constant.
+COMPLEXITY_CORRECTNESS_MARKER = "Correctness risk:"
+
 # Rule-name charset — must equal the dedup marker's capture class
 # (dedup._MARKER_RE) so a name round-trips through the comment marker
 # without the finding-side and prior-side dedup keys diverging.
@@ -255,7 +261,8 @@ RULES: tuple[ReviewRule, ...] = (
         "function's complexity and you can name a concrete split or "
         "simplification on changed lines. Do not report pre-existing length "
         "or branching. Otherwise leave one short maintainability note in the "
-        "summary. Never use more than medium severity unless naming a specific "
+        "summary. Never use more than medium severity unless the message "
+        f"starts with '{COMPLEXITY_CORRECTNESS_MARKER}' and names a specific "
         "correctness risk; never mark this heavy lift.",
         bad_example="A long function is complex, with no change-specific evidence",
         good_example="Split the newly added validation branch into "
