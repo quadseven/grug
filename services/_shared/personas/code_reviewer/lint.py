@@ -69,6 +69,7 @@ import tempfile
 
 from personas.code_reviewer.diff_parser import DiffHunk
 from personas.code_reviewer.persona import Finding
+from personas.code_reviewer.suggestion import ruff_fix_line
 from personas.code_reviewer.test_paths import is_test_file
 from review_types import Severity  # single source (#250)
 # Reuse the canonical added-lines walk rather than a third copy of it
@@ -330,7 +331,11 @@ def _map_results(
     policy_dropped: list[int] | None = None,
 ) -> tuple[Finding, ...]:
     """Map ruff JSON to diff-anchored Findings. Tolerant of shape drift: a
-    result missing a field is skipped, never fatal."""
+    result missing a field is skipped, never fatal.
+
+    `file_contents` (path -> scanned text) lets ruff's own fix ride along as the
+    finding's suggestion when it is safe and confined to the flagged line
+    (#1149); dispatch still checks it before offering a committable block."""
     if not isinstance(results, list):
         return ()
     findings: list[Finding] = []
@@ -345,7 +350,7 @@ def _map_results(
         if policy and policy.drops(code, path):
             dropped_policy += 1
             continue
-        findings.append(_finding(path, row, code, msg, file_contents))
+        findings.append(_finding(path, row, code, msg, file_contents, r.get("fix")))
         if len(findings) >= _MAX_FINDINGS:
             log.info("lint_ruff_findings_capped", extra={"cap": _MAX_FINDINGS})
             break
@@ -354,6 +359,16 @@ def _map_results(
         if policy_dropped is not None:
             policy_dropped.append(dropped_policy)
     return tuple(findings)
+
+
+def _fix_suggestion(fix: object, row: int, text: str | None) -> str | None:
+    """Ruff's fix applied to line `row` of `text`, when it is one-line safe."""
+    if text is None:
+        return None
+    lines = text.splitlines()
+    if not 1 <= row <= len(lines):
+        return None
+    return ruff_fix_line(fix, row, lines[row - 1])
 
 
 def _parse_result(r: object, prefix: str) -> tuple[str, int, str, str] | None:
@@ -376,6 +391,7 @@ def _parse_result(r: object, prefix: str) -> tuple[str, int, str, str] | None:
 def _finding(
     path: str, row: int, code: str, msg: str,
     file_contents: dict[str, str] | None,
+    fix: object = None,
 ) -> Finding:
     severity = _severity_for(code)
     if code == "S608" and file_contents and _s608_is_constant(file_contents.get(path, ""), row):
@@ -392,7 +408,7 @@ def _finding(
             f"whether the code matches it. Silence it with "
             f"`# noqa: {code}` and a reason if it is wrong here."
         ),
-        suggestion=None,
+        suggestion=_fix_suggestion(fix, row, (file_contents or {}).get(path)),
         effort=None,
     )
 

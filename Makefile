@@ -39,7 +39,7 @@ webhook-test:
 		echo "FATAL: store-backed tests would SKIP in CI (GRUG_TEST_DATABASE_URL unset) - a skipped gate is a silent pass (audit H4)"; exit 1; fi
 	@if [ -n "$$CI" ] && ! command -v opengrep >/dev/null 2>&1 && ! command -v semgrep >/dev/null 2>&1; then \
 		echo "FATAL: SAST engine-backed rule tests (test_sast_rules.py, test_sast.py) would SKIP in CI (no opengrep/semgrep on PATH) - a skipped gate is a silent pass, the same shape as the ruff evidence layer sitting dead for weeks (#859)"; exit 1; fi
-	cd services/webhook && uv run --with pytest --with httpx --with pyjwt --with cryptography --with boto3 --with moto --with fastapi --with 'psycopg[binary,pool]' --with 'ddtrace>=3.5,<4' --with 'datadog-lambda>=6.107,<7' pytest tests/ -q
+	cd services/webhook && uv run --with pytest --with httpx --with pyjwt --with cryptography --with boto3 --with moto --with fastapi --with 'psycopg[binary,pool]' --with 'ddtrace>=3.5,<4' --with 'datadog-lambda>=6.107,<7' --with 'ruff>=0.16,<0.17' pytest tests/ -q
 
 api-test:
 	@if [ -n "$$CI" ] && [ -z "$$GRUG_TEST_DATABASE_URL" ]; then \
