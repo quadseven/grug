@@ -2089,6 +2089,72 @@ def test_partial_review_stays_advisory_but_publishes_validated_findings():
     assert "could not see" not in summary
 
 
+def test_complexity_without_split_is_summary_only_and_other_kind_still_threads():
+    from personas.code_reviewer.persona import CodeReviewEvaluation, Finding
+
+    complexity = Finding(
+        file="src/bridge.py", line=12, severity="low",
+        rule_name="high-complexity", message="Pre-existing bridge remains long.",
+        suggestion=None, effort="heavy-lift",
+    )
+    correctness = Finding(
+        file="src/bridge.py", line=12, severity="high",
+        rule_name="null-deref", message="Possible null dereference.", suggestion=None,
+    )
+    evaluation = CodeReviewEvaluation(
+        findings=(complexity, correctness), conclusion="failure",
+    )
+
+    result, posted = cr_dispatch._build_review_result(
+        evaluation, head_sha="a" * 40, event="COMMENT",
+    )
+    assert result is not None
+    assert posted == (correctness,)
+    _, summary = cr_dispatch._summary_markdown(evaluation)
+    assert "## Maintainability notes" in summary
+    assert "Pre-existing bridge remains long." in summary
+
+
+def test_complexity_with_concrete_split_can_thread_at_medium_or_lower():
+    from personas.code_reviewer.persona import CodeReviewEvaluation, Finding
+
+    finding = Finding(
+        file="src/bridge.py", line=12, severity="medium",
+        rule_name="complexity-hotspot", message="New branching should be split.",
+        suggestion="Extract the new branch into _validate_payload().", effort="quick-win",
+    )
+    evaluation = CodeReviewEvaluation(findings=(finding,), conclusion="success")
+    result, posted = cr_dispatch._build_review_result(
+        evaluation, head_sha="a" * 40, event="COMMENT",
+    )
+    assert result is not None
+    assert len(result.comments) == 1
+    assert posted == (finding,)
+    assert finding.severity in {"low", "medium"}
+
+
+def test_complexity_dedup_matches_function_after_anchor_moves():
+    from personas.code_reviewer.persona import Finding
+    from personas.code_reviewer.dedup import dedup_findings, prior_keys_from_comments
+
+    prior = prior_keys_from_comments([{
+        "path": "src/bridge.py", "line": None, "original_line": 12, "side": "RIGHT",
+        # A thread posted before the function marker existed: only the
+        # scanner's fixed message names the function.
+        "body": (
+            "Function `forward_reports` too tangled -- cyclomatic 17 (cap 15).\n"
+            "<!-- grug-rule:high-complexity -->"
+        ),
+    }])
+    moved = Finding(
+        file="src/bridge.py", line=28, severity="medium",
+        rule_name="high-complexity", message="Split this function.",
+        suggestion="Extract the branch into a helper.",
+        complexity_function="forward_reports",
+    )
+    assert dedup_findings((moved,), prior) == ()
+
+
 def test_board_speaks_partial_coverage_not_blackout():
     """One event, one vocabulary. The board used to render partial coverage
     with the total-blackout sentence ("Grug eyes cloudy - read for self"),
@@ -2264,7 +2330,20 @@ def test_dispatch_suggestion_survives_pipe_to_inline_comment(monkeypatch):
         cr_dispatch, "post_review",
         lambda t, o, r, *, pull_number, result: posted_review.append(result) or {"id": 2},
     )
-    with patch("httpx.get", return_value=_diff_response()):
+    # The head text is what #1149's check verifies the block against, so
+    # the contents fetch returns real Python rather than the diff. A plain
+    # body is the real shape: _fetch_file_contents asks for the `.raw` media
+    # type, which returns the file itself, not base64 JSON. The assert pins
+    # that, so dropping the header fails here rather than in production.
+    head_text = "import logging\nlogging.debug('x')\nnew2\n"
+
+    def _get(url, *a, **k):
+        if "/contents/" in url:
+            assert k["headers"]["Accept"] == "application/vnd.github.raw"
+            return _diff_response(head_text)
+        return _diff_response(_DIFF)
+
+    with patch("httpx.get", side_effect=_get):
         cr_dispatch.dispatch_code_review(_payload(), blocking=False)
     assert len(posted_review) == 1
     body = posted_review[0].comments[0].body

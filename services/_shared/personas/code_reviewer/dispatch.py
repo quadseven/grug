@@ -26,6 +26,7 @@ import os
 import re
 import threading
 from collections import deque
+from dataclasses import replace
 from typing import Any, Literal
 from urllib.parse import quote
 
@@ -77,6 +78,8 @@ from personas.code_reviewer.model_metrics import emit_finding_posted
 from personas import board
 from personas.code_reviewer.complexity import ComplexityScan, scan_complexity_full
 from personas.code_reviewer.lint import scan_ruff
+from personas.code_reviewer.suggestion import checked_suggestion
+from personas.code_reviewer.repo_ruff_policy import parse_repo_ruff_policy
 from personas.code_reviewer.cross_file import (
     extract_symbols, fetch_cross_file_context,
 )
@@ -560,6 +563,26 @@ def _load_repo_config(
     return parse_repo_config((fetched or {}).get(_REPO_CONFIG_PATH))
 
 
+_RUFF_POLICY_PATHS = ("ruff.toml", ".ruff.toml", "pyproject.toml")
+
+
+def _load_repo_ruff_policy(installation_id: int, owner: str, repo_name: str, base_ref: str):
+    """Load the first Ruff config present at the PR base revision."""
+    if not base_ref:
+        return parse_repo_ruff_policy(None)
+    try:
+        fetched = with_install_token_retry(
+            installation_id,
+            lambda token: _fetch_file_contents(
+                token, owner, repo_name, _RUFF_POLICY_PATHS, base_ref,
+            ),
+        ) or {}
+    except (httpx.HTTPStatusError, httpx.RequestError) as exc:
+        log.info("repo_ruff_policy_fetch_failed", extra={"kind": type(exc).__name__})
+        return parse_repo_ruff_policy(None)
+    return parse_repo_ruff_policy(next((fetched[path] for path in _RUFF_POLICY_PATHS if path in fetched), None))
+
+
 def _apply_repo_config(
     hunks: tuple[DiffHunk, ...], pr: dict[str, Any], installation_id: int,
     owner: str, repo_name: str,
@@ -624,7 +647,7 @@ _CLAIM_HINT_RE = re.compile(
 )
 
 
-def _merge_lint_evidence(evaluation, hunks, file_contents):
+def _merge_lint_evidence(evaluation, hunks, file_contents, ruff_policy=None, policy_dropped=None):
     """Fold deterministic ruff findings into the evaluation (#681, epic #707).
 
     RECALL work: ruff catches the mechanical class the model skims past, and
@@ -639,7 +662,7 @@ def _merge_lint_evidence(evaluation, hunks, file_contents):
     not this slice's. Inert unless GRUG_LINT_EVIDENCE=ruff.
     """
     try:
-        lint_findings = scan_ruff(hunks, file_contents or {})
+        lint_findings = scan_ruff(hunks, file_contents or {}, ruff_policy, policy_dropped)
     except Exception:  # noqa: BLE001 - lint evidence must never break a review
         log.warning("code_review_lint_scan_failed", exc_info=True)
         return evaluation
@@ -769,6 +792,7 @@ def _tidy_fixed_threads(
     *, action: str, review_published: bool, evaluation: CodeReviewEvaluation,
     installation_id: int, owner: str, repo_name: str, pull_number: int,
     head_sha: str, threads: list[dict] | None = None,
+    pr_author: str | None = None,
 ) -> None:
     """Resolve Elder's own fixed threads after a complete re-review (#1102).
 
@@ -790,6 +814,7 @@ def _tidy_fixed_threads(
         resolve_fixed_threads(
             installation_id, owner, repo_name, pull_number,
             head_sha=head_sha, findings=evaluation.findings, threads=threads,
+            pr_author=pr_author,
         )
     except Exception as e:  # noqa: BLE001 - tidying never fails a review
         log.warning(
@@ -996,9 +1021,21 @@ def _findings_table(evaluation: CodeReviewEvaluation) -> str:
         f"| {_severity_chip(f.severity)} | {_effort_chip(f.effort)} | "
         f"`{_md_code_span(f.file)}` | {f.line} | "
         f"`{_md_code_span(f.rule_name)}` | {_md_table_cell(f.message)} |"
-        for f in evaluation.findings
+        for f in evaluation.findings if not _is_complexity_finding(f)
     )
     return "\n".join(rows)
+
+
+def _is_complexity_finding(finding: Finding) -> bool:
+    return finding.rule_name in {"high-complexity", "complexity-hotspot"}
+
+
+def _maintainability_notes(evaluation: CodeReviewEvaluation) -> str:
+    notes = [
+        f"- `{_md_code_span(f.file)}:{f.line}` {_md_table_cell(f.message)}"
+        for f in evaluation.findings if _is_complexity_finding(f)
+    ]
+    return "\n\n## Maintainability notes\n\n" + "\n".join(notes) if notes else ""
 
 
 def _summary_markdown(
@@ -1128,7 +1165,7 @@ def _summary_markdown(
         f"{phase_line} "
         "Inline comments carry Fix + agent prompt on each marking.\n\n"
     )
-    summary = f"{legend}{table}{held}{hunt}"
+    summary = f"{legend}{table}{_maintainability_notes(evaluation)}{held}{hunt}"
     agent = _consolidated_agent_prompt(evaluation)
     if agent:
         summary = f"{summary}\n\n{agent}"
@@ -1149,7 +1186,8 @@ def _consolidated_agent_prompt(evaluation: CodeReviewEvaluation) -> str:
     Returns empty string when there are no findings — never emit a hollow
     "Address each finding below" shell with nothing under it.
     """
-    if not evaluation.findings:
+    findings = tuple(f for f in evaluation.findings if not _is_complexity_finding(f))
+    if not findings:
         return ""
 
     header = [
@@ -1161,7 +1199,7 @@ def _consolidated_agent_prompt(evaluation: CodeReviewEvaluation) -> str:
     body: list[str] = []
     used = sum(len(x) + 1 for x in header)
     included = 0
-    for f in evaluation.findings:
+    for f in findings:
         cat = _category_for_rule(f.rule_name)
         entry = (
             f"- {_md_code_span(f.file)}:{f.line} "
@@ -1175,7 +1213,7 @@ def _consolidated_agent_prompt(evaluation: CodeReviewEvaluation) -> str:
         body.append(entry)
         used += len(entry) + 1
         included += 1
-    cut = len(evaluation.findings) - included
+    cut = len(findings) - included
     if cut:
         body.append(
             f"(+{cut} more finding(s) - see the findings table above)"
@@ -1428,7 +1466,9 @@ def _provenance_block(f: Finding) -> str:
     return _details_block("Evidence and provenance", "\n".join(lines))
 
 
-def _inline_comment_body(f: Finding, precedent_note: str = "") -> str:
+def _inline_comment_body(
+    f: Finding, precedent_note: str = "", *, committable: bool = True,
+) -> str:
     """Format one finding as a structured Marking (#553 / #617 / Markings v2).
 
     Shape (Markings Board):
@@ -1443,7 +1483,10 @@ def _inline_comment_body(f: Finding, precedent_note: str = "") -> str:
     Appends a hidden `grug-rule` marker (rendered invisibly by GitHub)
     so a later `synchronize` push can recognise this comment as a Grug
     finding for dedup (#189) — see dedup.parse_rule. The marker stays
-    LAST (dedup.parse_rule reads the last marker in the body)."""
+    LAST (dedup.parse_rule reads the last marker in the body).
+
+    `committable=False` renders any suggestion as fenced prose: dispatch
+    passes it when `checked_suggestion` (#1149) could not verify the fix."""
     cat = _category_for_rule(f.rule_name)
     # CR-dense header: severity chip | category | rule | effort chip
     chip = (
@@ -1470,7 +1513,8 @@ def _inline_comment_body(f: Finding, precedent_note: str = "") -> str:
     # blank-line commit (FLINT finding on #558).
     stripped_suggestion = f.suggestion.strip("\n\r") if f.suggestion else ""
     if (
-        f.suggestion
+        committable
+        and f.suggestion
         and "```" not in f.suggestion
         and "\n" not in f.suggestion.strip()
         and stripped_suggestion
@@ -1499,7 +1543,13 @@ def _inline_comment_body(f: Finding, precedent_note: str = "") -> str:
     provenance = _provenance_block(f)
     if provenance:
         body += f"\n\n{provenance}"
-    return f"{body}\n\n{_agent_prompt_block(f)}\n\n{rule_marker(f.rule_name)}"
+    function_marker = (
+        f"\n<!-- grug-complexity-function:{f.complexity_function} -->"
+        if f.complexity_function
+        and re.fullmatch(r"[A-Za-z0-9_-]+", f.complexity_function)
+        else ""
+    )
+    return f"{body}\n\n{_agent_prompt_block(f)}\n\n{rule_marker(f.rule_name)}{function_marker}"
 
 
 # Rows of the findings table carried in the board body. Ten, because the body
@@ -2044,11 +2094,21 @@ def _precedent_notes_for(
         return {}
 
 
+def _checked_comment_body(f: Finding, file_text: str, precedent_note: str) -> str:
+    """Inline body whose committable block, if any, passed `checked_suggestion`.
+    A fix that fails the check still renders, as prose under "Fix"."""
+    checked = checked_suggestion(f, f.line, file_text)
+    if checked is None:
+        return _inline_comment_body(f, precedent_note, committable=False)
+    return _inline_comment_body(replace(f, suggestion=checked), precedent_note)
+
+
 def _build_review_result(
     evaluation: CodeReviewEvaluation, *, head_sha: str, event: ReviewEvent,
     prior_keys: frozenset[str] = frozenset(),
     precedent_notes: dict[str, str] | None = None,
     repo_config: RepoConfig | None = None,
+    file_contents: dict[str, str] | None = None,
 ) -> tuple[ReviewResult | None, tuple[Finding, ...]]:
     """Build the ReviewResult, or (None, ()) if nothing NEW to post.
 
@@ -2066,10 +2126,22 @@ def _build_review_result(
     order. Callers MUST thread it into `_capture_review_comments` as
     `findings=`: that function pairs GitHub's freshly-fetched comments with
     this tuple by POSITION (grug#967), so an order mismatch here would
-    mis-attribute captured comments."""
+    mis-attribute captured comments.
+
+    `file_contents` is the head text dispatch already loaded. Every fix is
+    offered as a committable block only after `checked_suggestion` (#1149)
+    verifies it against that text; a file with no loaded text gets prose."""
     if evaluation.degraded_reason not in (None, "", "partial_review"):
         return None, ()
     new_findings = dedup_findings(evaluation.findings, prior_keys)
+    # Complexity is summary advice by default. An inline thread requires a
+    # changed-line suggestion the reviewer can apply in this PR; heavy-lift
+    # findings never create reply-required threads.
+    new_findings = tuple(
+        f for f in new_findings
+        if not _is_complexity_finding(f)
+        or (f.suggestion and f.effort != "heavy-lift" and f.severity in ("low", "medium"))
+    )
     if repo_config is not None:
         # `.grug.yaml` min_inline_severity: lower findings stay in the check
         # summary (built from the full evaluation) but get no inline comment.
@@ -2079,11 +2151,13 @@ def _build_review_result(
     if not new_findings:
         return None, ()
     notes = precedent_notes or {}
+    texts = file_contents or {}
     comments = tuple(
         InlineComment(
             path=f.file, line=f.line,
-            body=_inline_comment_body(
-                f, precedent_note=notes.get(finding_key(f.file, f.line, f.rule_name), ""),
+            body=_checked_comment_body(
+                f, texts.get(f.file, ""),
+                notes.get(finding_key(f.file, f.line, f.rule_name), ""),
             ),
         )
         for f in new_findings
@@ -2952,7 +3026,13 @@ def dispatch_code_review(
             },
         )
 
-    evaluation = _merge_lint_evidence(evaluation, hunks, file_contents)
+    ruff_policy_dropped: list[int] = []
+    ruff_policy = _load_repo_ruff_policy(
+        installation_id, owner, repo_name, str(pr_context.get("base_sha") or ""),
+    )
+    evaluation = _merge_lint_evidence(
+        evaluation, hunks, file_contents, ruff_policy, ruff_policy_dropped,
+    )
 
     # Deterministic docs/code claim check: catch comment/env prose that
     # asserts the wrong settle cap or deep-diff bound (the LORE/CR class
@@ -3028,6 +3108,12 @@ def dispatch_code_review(
         living_baseline_rejected=living_baseline_rejected,
         review_phase=tier1_phase,
     )
+    if ruff_policy_dropped:
+        summary += (
+            "\n\nRuff policy: " + str(sum(ruff_policy_dropped))
+            + " finding(s) were omitted because the repository configuration "
+            "ignores or explicitly selects those rules for the affected paths."
+        )
     summary += config_note
     summary += _linked_issue_summary_note(
         str(pr_context.get("linked_issue_context") or ""),
@@ -3092,6 +3178,7 @@ def dispatch_code_review(
     review_result, posted_findings = _build_review_result(
         evaluation, head_sha=head_sha, event=event, prior_keys=prior_keys,
         precedent_notes=precedent_notes, repo_config=repo_config,
+        file_contents=file_contents,
     )
     review_resp: dict[str, Any] | None = None
     if review_result is not None:
@@ -3355,6 +3442,7 @@ def dispatch_code_review(
         evaluation=evaluation,
         installation_id=installation_id, owner=owner, repo_name=repo_name,
         pull_number=pull_number, head_sha=head_sha, threads=listed_threads,
+        pr_author=author_login,
     )
 
     # LLM-as-a-judge DD evals (#190) submit AFTER the review + check-run are
@@ -3718,6 +3806,7 @@ def _publish_deep_review(
     pr_title: str = "",
     base_sha: str = "",
     repo_config: RepoConfig | None = None,
+    file_contents: dict[str, str] | None = None,
 ) -> None:
     """Publish the async deep review's novel findings as a GitHub review.
 
@@ -3736,6 +3825,7 @@ def _publish_deep_review(
         prior_keys=all_prior,
         precedent_notes={},
         repo_config=repo_config,
+        file_contents=file_contents,
     )
     if review_result is None:
         return
@@ -4067,6 +4157,7 @@ def _async_deep_append_if_needed(
         pr_title=str(pr_context.get("title") or ""),
         base_sha=str(pr_context.get("base_sha") or ""),
         repo_config=repo_config,
+        file_contents=file_contents,
     )
     _submit_deep_evals(
         deep_graded,

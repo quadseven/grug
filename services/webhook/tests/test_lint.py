@@ -18,6 +18,7 @@ import yaml
 from personas.code_reviewer.diff_parser import DiffHunk
 import personas.code_reviewer.lint as lint_mod
 from personas.code_reviewer.lint import scan_ruff
+from personas.code_reviewer.repo_ruff_policy import parse_repo_ruff_policy
 
 
 import pytest
@@ -316,7 +317,7 @@ def _scan_with(path: str, code: str):
                          {path: "TOKEN = 'abc123'\n"})
 
 
-@pytest.mark.parametrize("code", ["S101", "S105", "S106", "S107", "S311"])
+@pytest.mark.parametrize("code", ["S101", "S102", "S105", "S106", "S107", "S311"])
 def test_test_noise_rules_dropped_in_test_files(code):
     assert _scan_with("pkg/tests/test_x.py", code) == ()
 
@@ -368,3 +369,65 @@ def test_secret_scan_still_flags_key_shaped_literal_in_test_file():
     assert len(scan_secrets(parse_diff(diff))) == 1
     # ...while the lint S105 noise on the same file is dropped.
     assert _scan_with(path, "S105") == ()
+
+
+def _scan_s608(source: str, policy=None):
+    path = "src/query.py"
+    row = next((i for i, line in enumerate(source.splitlines(), 1)
+                if line.lstrip().startswith("query =")), 1)
+    result = _s_result(path, "S608")
+    result["location"]["row"] = row
+    payload = json.dumps([result])
+    with patch("subprocess.run", return_value=_proc(1, payload)), \
+         patch("tempfile.TemporaryDirectory") as td:
+        td.return_value.__enter__.return_value = _FAKE_DIR
+        return scan_ruff((_hunk(path, "@@ -0,0 +1,3 @@\n+TABLE = 'records'\n+query = 'SELECT ' + TABLE\n+cursor.execute(query)\n"),), {path: source}, policy)
+
+
+def test_s608_constant_concatenation_is_medium():
+    found = _scan_s608("TABLE = 'records'\nquery = 'SELECT * FROM ' + TABLE\ncursor.execute(query)\n")
+    assert len(found) == 1
+    assert found[0].severity == "medium"
+
+
+def test_s608_interpolated_parameter_stays_high():
+    found = _scan_s608("query = f'SELECT * FROM {table}'\ncursor.execute(query)\n")
+    assert len(found) == 1
+    assert found[0].severity == "high"
+
+
+def test_s608_literal_joined_to_parameter_stays_high():
+    """The literal "SELECT " inside the join is not the flagged SQL."""
+    found = _scan_s608("def f(table):\n    query = 'SELECT * FROM ' + table\n    cursor.execute(query)\n")
+    assert len(found) == 1
+    assert found[0].severity == "high"
+
+
+def test_s608_unparseable_source_stays_high_not_crash():
+    """`ast.parse` raises ValueError, not SyntaxError, on text it cannot
+    encode (a lone surrogate): the check must keep the high severity
+    instead of crashing the scan."""
+    assert lint_mod._s608_is_constant("query = 'SELECT \ud800'\n", 1) is False
+
+
+def test_s102_in_test_file_is_dropped():
+    assert _scan_with("tests/test_exec.py", "S102") == ()
+
+
+@pytest.mark.parametrize("config,code,path", [
+    ('[tool.ruff.lint]\nignore = ["S608"]\n', "S608", "src/query.py"),
+    ('[tool.ruff.lint]\nselect = ["S608"]\n', "S608", "src/query.py"),
+    ('[tool.ruff.lint.per-file-ignores]\n"tests/**" = ["S608"]\n', "S608", "tests/test_query.py"),
+])
+def test_repo_ruff_policy_drops_and_counts(config, code, path, caplog):
+    caplog.set_level("INFO")
+    dropped = []
+    policy = parse_repo_ruff_policy(config)
+    payload = json.dumps([_s_result(path, code)])
+    with patch("subprocess.run", return_value=_proc(1, payload)), \
+         patch("tempfile.TemporaryDirectory") as td:
+        td.return_value.__enter__.return_value = _FAKE_DIR
+        assert scan_ruff((_hunk(path, "@@ -0,0 +1,1 @@\n+x = 1\n"),),
+                         {path: "x = 1\n"}, policy, dropped) == ()
+    assert dropped == [1]
+    assert '"count": 1' in caplog.text or "lint_ruff_policy_dropped" in caplog.text

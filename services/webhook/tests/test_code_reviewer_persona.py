@@ -708,3 +708,28 @@ def test_evaluate_diff_carries_suggestion_and_effort():
     ev = evaluate_diff(hunks, resp)
     assert ev.findings[0].suggestion == "b = use(x) if x else None"
     assert ev.findings[0].effort == "quick-win"
+
+
+def test_complexity_severity_clamp_keys_on_the_marker_the_prompt_asks_for() -> None:
+    """The prompt tells the model which prefix keeps a complexity finding
+    above medium; the clamp must key on that same prefix, or the rule and
+    the code disagree about when `high` survives."""
+    from code_review_prompt import COMPLEXITY_CORRECTNESS_MARKER, build_system_prompt
+
+    assert COMPLEXITY_CORRECTNESS_MARKER in build_system_prompt()
+    hunks = parse_diff(_DIFF)
+    llm = LlmReviewResponse(
+        kind="reviewed",
+        findings=(
+            _llm_finding(line=2, severity="high", rule="complexity-hotspot",
+                         message="Split the new branch out."),
+            _llm_finding(line=3, severity="high", rule="complexity-hotspot",
+                         message=f"{COMPLEXITY_CORRECTNESS_MARKER} the new "
+                         "early return skips the lock release."),
+            _llm_finding(line=3, severity="high", rule="test-rule",
+                         message="Other kinds keep their severity."),
+        ),
+        backend_used=Backend.POOLSIDE,
+    )
+    out = evaluate_diff(hunks, llm)
+    assert [f.severity for f in out.findings] == ["medium", "high", "high"]

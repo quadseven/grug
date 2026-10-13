@@ -61,6 +61,9 @@ ALLOWED_IN_EVALUATE_DIFF: frozenset[str] = frozenset({
     # evaluate_diff/with_extra_findings/with_findings cannot drift into
     # three different answers (severity in -> conclusion out; no IO).
     "_derive_conclusion",
+    # grug#1144: complexity findings cap at medium unless they name a
+    # correctness risk (string in -> severity out; no IO).
+    "_capped_severity",
     "CodeReviewEvaluation", "Finding",
     "tuple", "list", "set", "frozenset", "len", "all", "any", "isinstance",
 })

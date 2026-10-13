@@ -26,6 +26,7 @@ import re
 from dataclasses import dataclass, field
 from typing import get_args
 
+from code_review_prompt import COMPLEXITY_CORRECTNESS_MARKER
 from github_checks_client import CheckConclusion
 from llm_client import FindingOrigin, LlmReviewResponse
 from personas.code_reviewer.diff_parser import DiffHunk
@@ -114,6 +115,8 @@ class Finding:
     # (review_types.Effort) so an off-vocabulary value is a type error at
     # the constructor, not a silently dropped chip. None = no estimate.
     effort: Effort | None = None
+    # Stable identity for deterministic complexity findings across pushes.
+    complexity_function: str | None = None
     # Producer attribution for ensemble findings. Excluded from equality so
     # finding identity remains (file, line, rule) rather than observability
     # metadata; dedup and publication behavior must not change with tracing.
@@ -282,6 +285,18 @@ def with_degradation(
     )
 
 
+def _capped_severity(rule: str, severity: Severity, message: str) -> Severity:
+    """A complexity finding is advice, so it stays at medium unless its
+    message opens with the correctness-risk marker and names a real bug
+    risk (grug#1144). Every other kind keeps the severity it came with.
+    """
+    if rule not in {"high-complexity", "complexity-hotspot"}:
+        return severity
+    if message.lstrip().lower().startswith(COMPLEXITY_CORRECTNESS_MARKER.lower()):
+        return severity
+    return "medium"
+
+
 def _hunk_line_index(hunks: tuple[DiffHunk, ...]) -> dict[str, set[int]]:
     """Build {file_path: union(new_lines)} for O(1) hallucination check.
 
@@ -337,7 +352,7 @@ def evaluate_diff(
             Finding(
                 file=raw.path,
                 line=raw.line,
-                severity=raw.severity,
+                severity=_capped_severity(raw.rule, raw.severity, raw.message),
                 rule_name=raw.rule,
                 message=raw.message,
                 # #553: wire fields carry through; the anti-hallucination
