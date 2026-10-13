@@ -108,7 +108,7 @@ def ruff_fix_line(fix: Any, row: int, line_text: str) -> str | None:
 
 def _edit_span(edit: Any, row: int) -> tuple[int, int, str] | None:
     """(start, end, content) as 0-based columns, or None when the edit is
-    malformed or reaches beyond `row`."""
+    malformed or touches any row other than `row`, before or after it."""
     if not isinstance(edit, dict):
         return None
     start, end = edit.get("location"), edit.get("end_location")

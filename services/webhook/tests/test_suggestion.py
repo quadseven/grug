@@ -8,10 +8,14 @@ fix) and the dispatch seam that renders the result.
 from __future__ import annotations
 
 import ast
+import os
+import shutil
 
 import pytest
 
+import personas.code_reviewer.lint as lint_mod
 from personas.code_reviewer import dispatch as cr_dispatch
+from personas.code_reviewer.diff_parser import DiffHunk
 from personas.code_reviewer.lint import _map_results
 from personas.code_reviewer.persona import CodeReviewEvaluation, Finding
 from personas.code_reviewer.suggestion import checked_suggestion, ruff_fix_line
@@ -83,6 +87,27 @@ def test_ruff_safe_fix_becomes_suggestion():
     (finding,) = _map_results(
         results, "/work/grug-lint-x/", {"app/read.py": {2}}, {"app/read.py": text},
     )
+    assert finding.suggestion == "    return cfg.name"
+    assert checked_suggestion(finding, 2, text) == "    return cfg.name"
+
+
+def test_real_ruff_safe_fix_becomes_suggestion(monkeypatch):
+    """The hand-built JSON above mirrors ruff's output; this runs the pinned
+    ruff binary itself, so a ruff release that renames `applicability` or
+    stops marking B009 safe fails here instead of silently offering no block.
+    """
+    if shutil.which("ruff") is None:
+        if os.getenv("CI"):
+            pytest.fail("ruff is not on PATH; make webhook-test installs it")
+        pytest.skip("ruff is not on PATH")
+    monkeypatch.setattr(lint_mod, "_ENABLED", True)
+    text = "def read(cfg):\n    return getattr(cfg, \"name\")\n"
+    hunk = DiffHunk(
+        file_path="app/read.py", new_start=1, new_lines=frozenset(),
+        body="@@ -0,0 +1,2 @@\n+def read(cfg):\n+    return getattr(cfg, \"name\")\n",
+    )
+    (finding,) = [f for f in lint_mod.scan_ruff((hunk,), {"app/read.py": text})
+                  if "B009" in f.message]
     assert finding.suggestion == "    return cfg.name"
     assert checked_suggestion(finding, 2, text) == "    return cfg.name"
 
