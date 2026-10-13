@@ -13,9 +13,10 @@ class RepoRuffPolicy:
     per_file_ignores: tuple[tuple[str, frozenset[str]], ...] = ()
 
     def drops(self, code: str, path: str) -> bool:
-        # A selected code is dropped on purpose, not treated as an ignore: the
-        # repo's own ruff run already enforces it, so a thread would only
-        # duplicate that CI failure.
+        # A selected code is dropped on purpose (#1148), not mistaken for an
+        # ignore: the repo's own ruff run already enforces it and fails CI on
+        # it, so a thread would only duplicate that failure. The drop is still
+        # visible, counted in the check summary.
         if _matches(code, self.ignore) or _matches(code, self.select):
             return True
         return any(fnmatch.fnmatchcase(path, pattern) and _matches(code, codes)

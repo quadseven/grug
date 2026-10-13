@@ -398,10 +398,11 @@ def _finding(
 
 
 def _s608_is_constant(source: str, row: int) -> bool:
-    """True when the expression ruff flagged on `row` is built only from
-    literals, module-level names bound to such values, and `+`. Calls never
-    count, even with literal arguments: their return value is unknown.
-    Repository code is parsed, never evaluated."""
+    """True when an expression ruff flagged on `row` is constant SQL by the
+    rules of `_literal_sql`. This function only gathers the module-level
+    assignments those rules may resolve names through, and picks the
+    candidate expressions on `row`. Repository code is parsed, never
+    evaluated."""
     try:
         tree = ast.parse(source)
     except SyntaxError:
@@ -443,6 +444,10 @@ def _s608_candidates(tree: ast.Module, row: int) -> list[ast.expr]:
 def _literal_sql(
     node: ast.AST, constants: dict[str, ast.expr], seen: frozenset[str] = frozenset()
 ) -> bool:
+    """True for literals, names in `constants` (module-level assignments)
+    whose value is itself constant, `+` of constants, and tuple, list, set or
+    dict displays of constants. Calls never count, even with literal
+    arguments: their return value is unknown."""
     if isinstance(node, ast.Constant):
         return isinstance(node.value, (str, bytes, int, float, bool, type(None)))
     if isinstance(node, ast.Name):
@@ -457,5 +462,4 @@ def _literal_sql(
         return all(key is not None and _literal_sql(key, constants, seen) and
                    _literal_sql(value, constants, seen)
                    for key, value in zip(node.keys, node.values, strict=True))
-    # Calls are not known constants merely because their arguments are.
     return False
