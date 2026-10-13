@@ -42,3 +42,11 @@ def test_rule_wildcards_match_as_globs():
 def test_all_selects_every_code():
     policy = parse_repo_ruff_policy('[tool.ruff.lint]\nselect = ["ALL"]\n')
     assert policy.drops("S608", "src/query.py")
+
+
+def test_empty_or_bare_star_selector_drops_nothing():
+    # Repo-authored input: a pattern that is empty once its asterisks are
+    # stripped must not behave like "ALL".
+    policy = parse_repo_ruff_policy('[tool.ruff.lint]\nignore = ["", "*", "**"]\nselect = "S1,"\n')
+    assert not policy.drops("S608", "src/query.py")
+    assert policy.drops("S102", "src/app.py")

@@ -33,7 +33,10 @@ def _codes(value: object) -> frozenset[str]:
 
 def _matches(code: str, patterns: frozenset[str]) -> bool:
     """Ruff selectors are code prefixes ("S" selects S608), plus "ALL". A
-    trailing "*" is accepted as the same prefix."""
+    trailing "*" is accepted as the same prefix. The codes come from a
+    repo-authored file, so a pattern that is empty once its asterisks are
+    stripped ("", "*", "**") is never a match: it cannot widen into "ALL"
+    and drop every finding. Only a literal "ALL" means every code."""
     return any(pattern == "ALL" or (pattern.rstrip("*") and code.startswith(pattern.rstrip("*")))
                for pattern in patterns)
 

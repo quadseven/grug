@@ -428,6 +428,10 @@ def _s608_candidates(tree: ast.Module, row: int) -> list[ast.expr]:
     candidates: list[ast.expr] = []
 
     def visit(node: ast.AST, inside: bool) -> None:
+        # `node.lineno` is safe: the AST grammar makes lineno a required
+        # attribute of every `ast.expr`, so `ast.parse` sets it on implicit
+        # concatenations and f-string parts too. Nodes without a position
+        # (contexts, operators) are not exprs and never reach this read.
         on_row = isinstance(node, ast.expr) and node.lineno == row
         assigned = isinstance(node, ast.Name) and isinstance(node.ctx, ast.Store)
         if on_row and not inside and not assigned and isinstance(
