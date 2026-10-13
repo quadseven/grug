@@ -82,7 +82,7 @@ class _Resp:
         return self._p
 
 
-def _reply(author="alice", body="Fixed in abc1234", db_id=2):
+def _reply(author="alice", body=f"Fixed in {HEAD[:7]}", db_id=2):
     return {
         "databaseId": db_id, "author": {"login": author}, "body": body,
         "path": "a.py", "line": None, "originalLine": 10,
@@ -213,9 +213,17 @@ def test_deleted_account_fixed_in_reply_blocks_resolution_without_author(run):
 def test_author_fixed_in_reply_is_not_answered_twice(run):
     """The author's own "Fixed in" counts as the answer: Elder resolves the
     thread without adding its own reply on top."""
-    gh = _Gh([_thread(comments=[_comment(), _reply(author="alice", body="fixed in abc1234")])])
+    gh = _Gh([_thread(comments=[_comment(), _reply(author="alice", body=f"fixed in {HEAD[:7]}: done")])])
     assert run(gh, pr_author="alice") == 1
     assert gh.resolved == ["T1"] and gh.replies == []
+
+
+def test_author_fixed_in_reply_for_old_head_is_answered_again(run):
+    gh = _Gh([_thread(comments=[_comment(), _reply(author="alice", body="Fixed in 1234567: done")])])
+    assert run(gh, pr_author="alice") == 1
+    assert gh.resolved == ["T1"]
+    assert len(gh.replies) == 1
+    assert HEAD[:7] in gh.replies[0][1]
 
 
 def test_author_reply_with_null_body_blocks_resolution_without_raising(run):
@@ -267,7 +275,7 @@ def test_a_thread_already_answered_fixed_is_resolved_without_a_second_reply(run)
     thread is still wholly Elder's and outdated. The next pass must resolve
     it without stacking a second "Fixed in" reply."""
     earlier = _comment(rule=None, db_id=2)
-    earlier["body"] = "Fixed in 1234567: the flagged code changed and this review does not raise it again."
+    earlier["body"] = f"Fixed in {HEAD[:7]}: the flagged code changed and this review does not raise it again."
     gh = _Gh([_thread(comments=[_comment(), earlier])])
     assert run(gh) == 1
     assert gh.replies == []
