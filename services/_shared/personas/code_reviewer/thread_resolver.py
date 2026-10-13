@@ -196,7 +196,7 @@ def _owned_rule_and_line(thread: dict, pr_author: str | None = None) -> tuple[st
 _FIXED_REPLY_PREFIX = "Fixed in "
 
 
-def _already_answered(thread: dict) -> bool:
+def _already_answered(thread: dict, head_sha: str) -> bool:
     """An earlier pass (or the PR author) posted a "Fixed in" reply but
     the resolve call failed or has not run yet.
 
@@ -208,7 +208,11 @@ def _already_answered(thread: dict) -> bool:
     Pinned by `test_author_fixed_in_reply_is_not_answered_twice`."""
     nodes = (thread.get("comments") or {}).get("nodes") or []
     prefix = _FIXED_REPLY_PREFIX.lower()
-    return any((c.get("body") or "").lower().startswith(prefix) for c in nodes[1:])
+    expected = head_sha[:7].lower()
+    return any(
+        (c.get("body") or "").lower().startswith(f"{prefix}{expected}:")
+        for c in nodes[1:]
+    )
 
 
 def _blocked_by_person_reply(thread: dict, pr_author: str | None) -> bool:
@@ -313,7 +317,10 @@ def resolve_fixed_threads(
         targets, skipped_person, skipped_reraised = select_fixed_threads(
             threads, findings, pr_author=pr_author,
         )
-        answered = {t["id"] for t in threads if t.get("id") in targets and _already_answered(t)}
+        answered = {
+            t["id"] for t in threads
+            if t.get("id") in targets and _already_answered(t, head_sha)
+        }
         first_comment_ids = {
             t["id"]: ((t.get("comments") or {}).get("nodes") or [{}])[0].get("id")
             for t in threads if t.get("id") in targets
