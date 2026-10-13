@@ -131,6 +131,38 @@ def test_improving_a_tangled_function_is_silent():
     assert out == ()
 
 
+def test_second_push_shrinking_function_under_cap_uses_head_source():
+    """A Living Hunt delta must measure the fetched second-push head."""
+    first_push = _tangled()
+    second_push = "def handler(x):\n    return 1\n"
+    # The delta has new-side line numbers from push 2. Supplying the old file
+    # here reproduces the stale-source failure; dispatch must supply second_push.
+    second_push_hunk = (
+        DiffHunk(
+            file_path="a.py", new_start=1, new_lines=frozenset({2}),
+            body="@@ -1,19 +1,2 @@\n def handler(x):\n+    return 1\n",
+        ),
+    )
+    assert scan_complexity(
+        second_push_hunk, {"a.py": second_push},
+        base_contents={"a.py": first_push},
+    ) == ()
+
+
+def test_second_push_over_cap_finding_uses_head_score_and_anchor():
+    first_push = _tangled()
+    second_push = _tangled(6)
+    hunks = (_hunk("a.py", 8, ["    if x6: pass"]),)
+    scan = scan_complexity_full(
+        hunks, {"a.py": second_push}, base_contents={"a.py": first_push},
+    )
+    assert len(scan.findings) == 1
+    finding = scan.findings[0]
+    assert finding.line == 8
+    assert "cyclomatic 25 (cap 15)" in finding.message
+    assert "moved it 19->25 cyclomatic" in finding.message
+
+
 def test_material_worsening_is_reported_with_the_delta():
     out = scan_complexity(_one_hunk(), {"a.py": _tangled(6)},
                           base_contents={"a.py": _tangled()})
