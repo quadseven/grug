@@ -53,13 +53,14 @@ def test_numbers_cover_closing_keywords_and_ref_forms():
 
 
 def test_same_repo_qualified_ref_is_read_before_epic():
-    body = "Part of #470\nRefs acme/widgets#893"
+    body = "Part of #470\nRefs acme/widgets" "#893"  # joined at parse time: keeps a literal cross-repo ref out of the source
     assert linked_issue_numbers(body, owner="acme", repo="widgets") == [893]
 
 
 def test_foreign_repo_qualified_ref_is_ignored():
     assert linked_issue_numbers(
-        "Refs other/widgets#893", owner="acme", repo="widgets",
+        "Refs other/widgets" "#893",  # joined at parse time: keeps a literal cross-repo ref out of the source
+        owner="acme", repo="widgets",
     ) == []
 
 
@@ -309,7 +310,7 @@ def test_dispatch_puts_block_in_pr_context_and_failure_degrades(monkeypatch):
     monkeypatch.setattr(cr_dispatch, "review_diff", fake_review)
 
     payload = _payload()
-    payload["pull_request"]["body"] = "Refs myorg/myrepo#904"
+    payload["pull_request"]["body"] = "Refs myorg/myrepo" "#904"  # joined at parse time: keeps a literal cross-repo ref out of the source
     monkeypatch.setattr(
         cr_dispatch, "build_issue_fetcher",
         lambda **kw: (lambda n: ISSUE),
