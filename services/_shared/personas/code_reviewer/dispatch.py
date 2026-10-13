@@ -792,6 +792,7 @@ def _tidy_fixed_threads(
     *, action: str, review_published: bool, evaluation: CodeReviewEvaluation,
     installation_id: int, owner: str, repo_name: str, pull_number: int,
     head_sha: str, threads: list[dict] | None = None,
+    pr_author: str | None = None,
 ) -> None:
     """Resolve Elder's own fixed threads after a complete re-review (#1102).
 
@@ -813,6 +814,7 @@ def _tidy_fixed_threads(
         resolve_fixed_threads(
             installation_id, owner, repo_name, pull_number,
             head_sha=head_sha, findings=evaluation.findings, threads=threads,
+            pr_author=pr_author,
         )
     except Exception as e:  # noqa: BLE001 - tidying never fails a review
         log.warning(
@@ -3418,6 +3420,7 @@ def dispatch_code_review(
         evaluation=evaluation,
         installation_id=installation_id, owner=owner, repo_name=repo_name,
         pull_number=pull_number, head_sha=head_sha, threads=listed_threads,
+        pr_author=author_login,
     )
 
     # LLM-as-a-judge DD evals (#190) submit AFTER the review + check-run are
