@@ -244,6 +244,35 @@ def _complexity_finding(
     )
 
 
+def _gate_function(
+    path: str, name: str, line: int, cyclo: int, cog: int,
+    base: dict[str, tuple[int, int]], had_base: bool,
+    cyclo_cap: int, cog_cap: int,
+) -> Finding | SuppressedComplexity:
+    """The regression gate for one over-cap, touched function: suppressed
+    when the PR did not make it worse, otherwise a finding. Split out of
+    `_scan_one_file` so that function stays under its own cap."""
+    base_cyclo, base_cog = base.get(name, (None, None))
+    material = _is_material_complexity(
+        base_cyclo, base_cog, cyclo, cog, cyclo_cap, cog_cap,
+    )
+    if (
+        not material and base_cyclo is not None and base_cog is not None
+        and cyclo <= base_cyclo and cog <= base_cog
+    ):
+        return SuppressedComplexity(
+            file=path, function=name,
+            cyclomatic=cyclo, cognitive=cog,
+            base_cyclomatic=base_cyclo, base_cognitive=base_cog,
+        )
+    # Still report small changes in the summary; omission from the inline
+    # channel happens in dispatch because no suggestion exists.
+    return _complexity_finding(
+        path, name, line, cyclo, cog,
+        base_cyclo, base_cog, had_base, cyclo_cap, cog_cap, material,
+    )
+
+
 def _scan_one_file(
     path: str, source: str, changed_lines: set[int],
     base: dict[str, tuple[int, int]], had_base: bool,
@@ -272,24 +301,14 @@ def _scan_one_file(
         if cyclo <= cyclo_cap and cog <= cog_cap:
             continue
 
-        base_cyclo, base_cog = base.get(node.name, (None, None))
-        material = _is_material_complexity(
-            base_cyclo, base_cog, cyclo, cog, cyclo_cap, cog_cap,
-        )
-        if not material and base_cyclo is not None and base_cog is not None:
-            if cyclo <= base_cyclo and cog <= base_cog:
-                suppressed.append(SuppressedComplexity(
-                    file=path, function=node.name,
-                    cyclomatic=cyclo, cognitive=cog,
-                    base_cyclomatic=base_cyclo, base_cognitive=base_cog,
-                ))
-                continue
-        # Still report small changes in the summary; omission from the inline
-        # channel happens in dispatch because no suggestion exists.
-        out.append(_complexity_finding(
+        result = _gate_function(
             path, node.name, min(touched), cyclo, cog,
-            base_cyclo, base_cog, had_base, cyclo_cap, cog_cap, material,
-        ))
+            base, had_base, cyclo_cap, cog_cap,
+        )
+        if isinstance(result, SuppressedComplexity):
+            suppressed.append(result)
+        else:
+            out.append(result)
     return out, suppressed
 
 
@@ -314,9 +333,10 @@ def scan_complexity_full(
     `poller_handler.handler` was cyclomatic 30 / cognitive 53 - exactly main's
     baseline, on a function it had not touched (#767). An adversarial audit of
     the last 120 findings put this rule at 85 of them, 71% of all output, with
-    most replies saying "pre-existing". With `base_contents`, only a crossed
-    cap, a material worsening, or a new over-cap function is published; the
-    rest come back as `suppressed` so the caller can log a count (#781) -
+    most replies saying "pre-existing". With `base_contents`, a function the
+    PR made worse (any amount) or a new over-cap function is published - as
+    a medium inline finding only past `_INLINE_MARGIN`, else as a low summary
+    note; the rest come back as `suppressed` so the caller can log a count (#781) -
     the #707 scoreboard otherwise has no way to measure how many markings
     this gate removes.
 
