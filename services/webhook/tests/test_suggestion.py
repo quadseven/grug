@@ -8,7 +8,6 @@ fix) and the dispatch seam that renders the result.
 from __future__ import annotations
 
 import ast
-import os
 import shutil
 
 import pytest
@@ -97,9 +96,7 @@ def test_real_ruff_safe_fix_becomes_suggestion(monkeypatch):
     stops marking B009 safe fails here instead of silently offering no block.
     """
     if shutil.which("ruff") is None:
-        if os.getenv("CI"):
-            pytest.fail("ruff is not on PATH; make webhook-test installs it")
-        pytest.skip("ruff is not on PATH")
+        pytest.fail("ruff is not on PATH; make webhook-test installs it")
     monkeypatch.setattr(lint_mod, "_ENABLED", True)
     text = "def read(cfg):\n    return getattr(cfg, \"name\")\n"
     hunk = DiffHunk(
