@@ -2330,7 +2330,20 @@ def test_dispatch_suggestion_survives_pipe_to_inline_comment(monkeypatch):
         cr_dispatch, "post_review",
         lambda t, o, r, *, pull_number, result: posted_review.append(result) or {"id": 2},
     )
-    with patch("httpx.get", return_value=_diff_response()):
+    # The head text is what #1149's check verifies the block against, so
+    # the contents fetch returns real Python rather than the diff. A plain
+    # body is the real shape: _fetch_file_contents asks for the `.raw` media
+    # type, which returns the file itself, not base64 JSON. The assert pins
+    # that, so dropping the header fails here rather than in production.
+    head_text = "import logging\nlogging.debug('x')\nnew2\n"
+
+    def _get(url, *a, **k):
+        if "/contents/" in url:
+            assert k["headers"]["Accept"] == "application/vnd.github.raw"
+            return _diff_response(head_text)
+        return _diff_response(_DIFF)
+
+    with patch("httpx.get", side_effect=_get):
         cr_dispatch.dispatch_code_review(_payload(), blocking=False)
     assert len(posted_review) == 1
     body = posted_review[0].comments[0].body
