@@ -183,6 +183,6 @@ def _still_parses(lines: list[str], anchored_line: int, candidate: str) -> bool:
         ast.parse("\n".join(lines))
         replaced = lines[: anchored_line - 1] + [candidate] + lines[anchored_line:]
         ast.parse("\n".join(replaced))
-    except (SyntaxError, ValueError):
+    except (SyntaxError, ValueError, RecursionError, MemoryError):
         return False
     return True

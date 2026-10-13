@@ -7,6 +7,10 @@ fix) and the dispatch seam that renders the result.
 """
 from __future__ import annotations
 
+import ast
+
+import pytest
+
 from personas.code_reviewer import dispatch as cr_dispatch
 from personas.code_reviewer.lint import _map_results
 from personas.code_reviewer.persona import CodeReviewEvaluation, Finding
@@ -145,3 +149,21 @@ def test_backslash_continued_line_offers_no_block():
     text = "total = 1 + \\\n    2\n"
     finding = _finding(suggestion="total = 5", line=1, file="app/t.py", rule="x")
     assert checked_suggestion(finding, 1, text) is None
+
+
+@pytest.mark.parametrize("parse_error", [RecursionError, MemoryError])
+@pytest.mark.parametrize("failed_parse", [1, 2])
+def test_parser_resource_error_offers_no_block(monkeypatch, parse_error, failed_parse):
+    parse = ast.parse
+    calls = 0
+
+    def fail_parse(source):
+        nonlocal calls
+        calls += 1
+        if calls == failed_parse:
+            raise parse_error
+        return parse(source)
+
+    monkeypatch.setattr("personas.code_reviewer.suggestion.ast.parse", fail_parse)
+    finding = _finding(suggestion="option = None")
+    assert checked_suggestion(finding, 2, _NULL_DEREF_FILE) is None
