@@ -77,6 +77,7 @@ from personas.code_reviewer.model_metrics import emit_finding_posted
 from personas import board
 from personas.code_reviewer.complexity import ComplexityScan, scan_complexity_full
 from personas.code_reviewer.lint import scan_ruff
+from personas.code_reviewer.repo_ruff_policy import parse_repo_ruff_policy
 from personas.code_reviewer.cross_file import (
     extract_symbols, fetch_cross_file_context,
 )
@@ -560,6 +561,26 @@ def _load_repo_config(
     return parse_repo_config((fetched or {}).get(_REPO_CONFIG_PATH))
 
 
+_RUFF_POLICY_PATHS = ("ruff.toml", ".ruff.toml", "pyproject.toml")
+
+
+def _load_repo_ruff_policy(installation_id: int, owner: str, repo_name: str, base_ref: str):
+    """Load the first Ruff config present at the PR base revision."""
+    if not base_ref:
+        return parse_repo_ruff_policy(None)
+    try:
+        fetched = with_install_token_retry(
+            installation_id,
+            lambda token: _fetch_file_contents(
+                token, owner, repo_name, _RUFF_POLICY_PATHS, base_ref,
+            ),
+        ) or {}
+    except (httpx.HTTPStatusError, httpx.RequestError) as exc:
+        log.info("repo_ruff_policy_fetch_failed", extra={"kind": type(exc).__name__})
+        return parse_repo_ruff_policy(None)
+    return parse_repo_ruff_policy(next((fetched[path] for path in _RUFF_POLICY_PATHS if path in fetched), None))
+
+
 def _apply_repo_config(
     hunks: tuple[DiffHunk, ...], pr: dict[str, Any], installation_id: int,
     owner: str, repo_name: str,
@@ -624,7 +645,7 @@ _CLAIM_HINT_RE = re.compile(
 )
 
 
-def _merge_lint_evidence(evaluation, hunks, file_contents):
+def _merge_lint_evidence(evaluation, hunks, file_contents, ruff_policy=None, policy_dropped=None):
     """Fold deterministic ruff findings into the evaluation (#681, epic #707).
 
     RECALL work: ruff catches the mechanical class the model skims past, and
@@ -639,7 +660,7 @@ def _merge_lint_evidence(evaluation, hunks, file_contents):
     not this slice's. Inert unless GRUG_LINT_EVIDENCE=ruff.
     """
     try:
-        lint_findings = scan_ruff(hunks, file_contents or {})
+        lint_findings = scan_ruff(hunks, file_contents or {}, ruff_policy, policy_dropped)
     except Exception:  # noqa: BLE001 - lint evidence must never break a review
         log.warning("code_review_lint_scan_failed", exc_info=True)
         return evaluation
@@ -2933,7 +2954,13 @@ def dispatch_code_review(
             },
         )
 
-    evaluation = _merge_lint_evidence(evaluation, hunks, file_contents)
+    ruff_policy_dropped: list[int] = []
+    ruff_policy = _load_repo_ruff_policy(
+        installation_id, owner, repo_name, str(pr_context.get("base_sha") or ""),
+    )
+    evaluation = _merge_lint_evidence(
+        evaluation, hunks, file_contents, ruff_policy, ruff_policy_dropped,
+    )
 
     # Deterministic docs/code claim check: catch comment/env prose that
     # asserts the wrong settle cap or deep-diff bound (the LORE/CR class
@@ -3009,6 +3036,12 @@ def dispatch_code_review(
         living_baseline_rejected=living_baseline_rejected,
         review_phase=tier1_phase,
     )
+    if ruff_policy_dropped:
+        summary += (
+            "\n\nRuff policy: " + str(sum(ruff_policy_dropped))
+            + " finding(s) were omitted because the repository configuration "
+            "ignores or explicitly selects those rules for the affected paths."
+        )
     summary += config_note
     summary += installation_permission_summary_note(installation_id)
     conclusion, title, summary, listed_threads = _carry_into_check(
