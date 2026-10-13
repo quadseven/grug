@@ -164,6 +164,8 @@ def _only_grug_comments(thread: dict, pr_author: str | None = None) -> list[dict
         # pr_author` check it would match an unknown author (None == None).
         if not pr_author or login != pr_author:
             return None
+        # GitHub may send a null body; `or ""` keeps `.lower()` safe and
+        # makes such a reply block like any non-"Fixed in" reply.
         body = (c.get("body") or "").lower()
         if not body.startswith(_FIXED_REPLY_PREFIX.lower()):
             return None
@@ -202,7 +204,8 @@ def _already_answered(thread: dict) -> bool:
     that passed `select_fixed_threads` reach this check, so every non-Elder
     reply is the PR author's own "Fixed in". A second "Fixed in" from Elder
     would add noise, and the resolve still requires GitHub's `isOutdated`
-    and no nearby re-raise, so the author's word alone never closes a thread."""
+    and no nearby re-raise, so the author's word alone never closes a thread.
+    Pinned by `test_author_fixed_in_reply_is_not_answered_twice`."""
     nodes = (thread.get("comments") or {}).get("nodes") or []
     prefix = _FIXED_REPLY_PREFIX.lower()
     return any((c.get("body") or "").lower().startswith(prefix) for c in nodes[1:])

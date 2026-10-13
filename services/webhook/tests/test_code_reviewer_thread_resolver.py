@@ -218,6 +218,14 @@ def test_author_fixed_in_reply_is_not_answered_twice(run):
     assert gh.resolved == ["T1"] and gh.replies == []
 
 
+def test_author_reply_with_null_body_blocks_resolution_without_raising(run):
+    """GitHub may send a null comment body. The author's reply then is not
+    a "Fixed in" and keeps the thread open, with no crash on `.lower()`."""
+    gh = _Gh([_thread(comments=[_comment(), _reply(author="alice", body=None)])])
+    assert run(gh, pr_author="alice") == 0
+    assert gh.resolved == [] and gh.replies == []
+
+
 def test_truncated_comment_list_is_treated_as_touched(run):
     gh = _Gh([_thread(total=40)])
     assert run(gh) == 0 and gh.resolved == []
