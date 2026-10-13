@@ -37,3 +37,8 @@ def test_rule_wildcards_match_as_globs():
     policy = parse_repo_ruff_policy('[tool.ruff.lint]\nignore = ["S6*"]\n')
     assert policy.drops("S608", "src/query.py")
     assert not policy.drops("S708", "src/query.py")
+
+
+def test_all_selects_every_code():
+    policy = parse_repo_ruff_policy('[tool.ruff.lint]\nselect = ["ALL"]\n')
+    assert policy.drops("S608", "src/query.py")

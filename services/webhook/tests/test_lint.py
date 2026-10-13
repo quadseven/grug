@@ -396,6 +396,13 @@ def test_s608_interpolated_parameter_stays_high():
     assert found[0].severity == "high"
 
 
+def test_s608_literal_joined_to_parameter_stays_high():
+    """The literal "SELECT " inside the join is not the flagged SQL."""
+    found = _scan_s608("def f(table):\n    query = 'SELECT * FROM ' + table\n    cursor.execute(query)\n")
+    assert len(found) == 1
+    assert found[0].severity == "high"
+
+
 def test_s102_in_test_file_is_dropped():
     assert _scan_with("tests/test_exec.py", "S102") == ()
 

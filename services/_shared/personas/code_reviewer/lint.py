@@ -336,17 +336,10 @@ def _map_results(
     findings: list[Finding] = []
     dropped_policy = 0
     for r in results:
-        if not isinstance(r, dict):
+        parsed = _parse_result(r, prefix)
+        if parsed is None:
             continue
-        path = str(r.get("filename") or "")
-        if path.startswith(prefix):
-            path = path[len(prefix):]
-        loc = r.get("location") or {}
-        row = loc.get("row") if isinstance(loc, dict) else None
-        code = r.get("code")
-        msg = r.get("message")
-        if not path or not isinstance(row, int) or not code or not msg:
-            continue
+        path, row, code, msg = parsed
         if not _is_reportable(path, row, code, added):
             continue
         if policy and policy.drops(code, path):
@@ -361,6 +354,23 @@ def _map_results(
         if policy_dropped is not None:
             policy_dropped.append(dropped_policy)
     return tuple(findings)
+
+
+def _parse_result(r: object, prefix: str) -> tuple[str, int, str, str] | None:
+    """(path, row, code, message) from one ruff JSON result, or None when a
+    field is missing."""
+    if not isinstance(r, dict):
+        return None
+    path = str(r.get("filename") or "")
+    if path.startswith(prefix):
+        path = path[len(prefix):]
+    loc = r.get("location") or {}
+    row = loc.get("row") if isinstance(loc, dict) else None
+    code = r.get("code")
+    msg = r.get("message")
+    if not path or not isinstance(row, int) or not code or not msg:
+        return None
+    return path, row, code, msg
 
 
 def _finding(
@@ -388,7 +398,10 @@ def _finding(
 
 
 def _s608_is_constant(source: str, row: int) -> bool:
-    """Recognize literal SQL construction without evaluating repository code."""
+    """True when the expression ruff flagged on `row` is built only from
+    literals, module-level names bound to such values, and `+`. Calls never
+    count, even with literal arguments: their return value is unknown.
+    Repository code is parsed, never evaluated."""
     try:
         tree = ast.parse(source)
     except SyntaxError:
@@ -408,14 +421,22 @@ def _s608_is_constant(source: str, row: int) -> bool:
 
 
 def _s608_candidates(tree: ast.Module, row: int) -> list[ast.expr]:
+    """The outermost expressions that start on `row`, plus the arguments of
+    calls there. Sub-expressions are not candidates: the literal "SELECT " in
+    `"SELECT " + table` or in an f-string is not the SQL ruff flagged."""
     candidates: list[ast.expr] = []
-    for node in ast.walk(tree):
-        if getattr(node, "lineno", None) != row:
-            continue
-        if isinstance(node, (ast.BinOp, ast.Call, ast.Constant, ast.Name)):
+
+    def visit(node: ast.AST, inside: bool) -> None:
+        on_row = isinstance(node, ast.expr) and node.lineno == row
+        assigned = isinstance(node, ast.Name) and isinstance(node.ctx, ast.Store)
+        if on_row and not inside and not assigned and isinstance(
+            node, (ast.BinOp, ast.Constant, ast.Name)
+        ):
             candidates.append(node)
-        if isinstance(node, ast.Call):
-            candidates.extend(arg for arg in node.args if getattr(arg, "lineno", None) == row)
+        for child in ast.iter_child_nodes(node):
+            visit(child, on_row and not isinstance(node, ast.Call))
+
+    visit(tree, False)
     return candidates
 
 

@@ -13,6 +13,9 @@ class RepoRuffPolicy:
     per_file_ignores: tuple[tuple[str, frozenset[str]], ...] = ()
 
     def drops(self, code: str, path: str) -> bool:
+        # A selected code is dropped on purpose, not treated as an ignore: the
+        # repo's own ruff run already enforces it, so a thread would only
+        # duplicate that CI failure.
         if _matches(code, self.ignore) or _matches(code, self.select):
             return True
         return any(fnmatch.fnmatchcase(path, pattern) and _matches(code, codes)
@@ -28,7 +31,10 @@ def _codes(value: object) -> frozenset[str]:
 
 
 def _matches(code: str, patterns: frozenset[str]) -> bool:
-    return any(fnmatch.fnmatchcase(code, pattern) for pattern in patterns)
+    """Ruff selectors are code prefixes ("S" selects S608), plus "ALL". A
+    trailing "*" is accepted as the same prefix."""
+    return any(pattern == "ALL" or (pattern.rstrip("*") and code.startswith(pattern.rstrip("*")))
+               for pattern in patterns)
 
 
 def parse_repo_ruff_policy(text: str | None) -> RepoRuffPolicy:
