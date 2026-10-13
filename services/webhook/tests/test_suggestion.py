@@ -151,6 +151,45 @@ def test_backslash_continued_line_offers_no_block():
     assert checked_suggestion(finding, 1, text) is None
 
 
+@pytest.mark.parametrize(("text", "candidate"), [
+    # A trailing backslash joins the next line: `x = f(y)`.
+    ("x = 1\n(y)\n", "x = f\\"),
+    # An unclosed triple quote runs to the `\"\"\"` in the next line's comment.
+    ('x = 1\ns = "a"  # """\n', 'x = """'),
+])
+def test_candidate_that_swallows_the_next_line_offers_no_block(text, candidate):
+    """The replaced file parses, but only because the candidate left a
+    statement open that the next line closes, so the commit rewrites two
+    lines while the block shows one."""
+    finding = _finding(suggestion=candidate, line=1, file="app/t.py", rule="x")
+    replaced = candidate + "\n" + text.splitlines()[1] + "\n"
+    ast.parse(replaced)
+    assert checked_suggestion(finding, 1, text) is None
+
+
+def test_open_candidate_for_an_open_line_is_still_checked_by_parse():
+    """Rewriting the head of a bracketed statement keeps the bracket open;
+    that is a real one-line fix, and the parse check covers it."""
+    text = "total = add(1,\n    2)\n"
+    finding = _finding(suggestion="total = mul(1,", line=1, file="app/t.py", rule="x")
+    assert checked_suggestion(finding, 1, text) == "total = mul(1,"
+
+
+def test_empty_suggestion_field_does_not_fall_back_to_prose():
+    """A suggestion field the model filled, even with nothing usable, is the
+    model's answer: the prose span is only read when the field is None."""
+    blank = _finding(_NULL_DEREF_MESSAGE, suggestion="")
+    assert checked_suggestion(blank, 2, _NULL_DEREF_FILE) is None
+    fenced = _finding(_NULL_DEREF_MESSAGE, suggestion="```\nx\n```")
+    assert checked_suggestion(fenced, 2, _NULL_DEREF_FILE) is None
+
+
+def test_prose_span_echoing_the_anchored_line_is_not_offered():
+    """A message quoting the flagged line itself is not a fix."""
+    msg = "this raises: `option = next(o for o in options if o.name == wanted)`"
+    assert checked_suggestion(_finding(msg), 2, _NULL_DEREF_FILE) is None
+
+
 @pytest.mark.parametrize("parse_error", [RecursionError, MemoryError])
 @pytest.mark.parametrize("failed_parse", [1, 2])
 def test_parser_resource_error_offers_no_block(monkeypatch, parse_error, failed_parse):

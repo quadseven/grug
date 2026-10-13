@@ -27,8 +27,10 @@ which is what every finding did before this module existed.
 from __future__ import annotations
 
 import ast
+import io
 import keyword
 import re
+import tokenize
 from typing import Any
 
 from personas.code_reviewer.persona import Finding
@@ -55,6 +57,9 @@ def checked_suggestion(
     if not 1 <= anchored_line <= len(lines):
         return None
     original = lines[anchored_line - 1]
+    # A filled field, even blank or fenced, is the model's own answer; the
+    # prose span is read only when the field is None. A span that merely
+    # quotes the anchored line is dropped by the unchanged-line check below.
     if finding.suggestion is not None:
         candidate = _single_line(finding.suggestion)
     else:
@@ -179,6 +184,11 @@ def _still_parses(lines: list[str], anchored_line: int, candidate: str) -> bool:
         # The line continues into the next one. Swapping only this line can
         # leave the tail parsing as a separate, different statement.
         return False
+    if _leaves_open(candidate) and not _leaves_open(lines[anchored_line - 1]):
+        # A trailing backslash, unclosed bracket or unclosed triple quote
+        # joins the next line. The result can still parse, but the commit
+        # then rewrites two statements while the block shows one line.
+        return False
     try:
         ast.parse("\n".join(lines))
         replaced = lines[: anchored_line - 1] + [candidate] + lines[anchored_line:]
@@ -186,3 +196,17 @@ def _still_parses(lines: list[str], anchored_line: int, candidate: str) -> bool:
     except (SyntaxError, ValueError, RecursionError, MemoryError):
         return False
     return True
+
+
+def _leaves_open(line: str) -> bool:
+    """True when `line` ends inside a multi-line construct: a backslash
+    continuation, an unclosed bracket or an unclosed triple-quoted string."""
+    try:
+        for _ in tokenize.generate_tokens(io.StringIO(line.lstrip()).readline):
+            pass
+    except tokenize.TokenError:
+        return True
+    except SyntaxError:
+        # Unbalanced closer or bad token; the parse check decides those.
+        return False
+    return False
