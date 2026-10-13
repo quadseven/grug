@@ -62,7 +62,7 @@ def test_ruff_safe_fix_becomes_suggestion():
     """Ruff's safe one-line fix rides through lint mapping and the check."""
     text = "def read(cfg):\n    return getattr(cfg, \"name\")\n"
     results = [{
-        "filename": "/tmp/grug-lint-x/app/read.py",
+        "filename": "/work/grug-lint-x/app/read.py",
         "code": "B009",
         "message": "Do not call `getattr` with a constant attribute value",
         "location": {"row": 2, "column": 12},
@@ -77,7 +77,7 @@ def test_ruff_safe_fix_becomes_suggestion():
         },
     }]
     (finding,) = _map_results(
-        results, "/tmp/grug-lint-x/", {"app/read.py": {2}}, {"app/read.py": text},
+        results, "/work/grug-lint-x/", {"app/read.py": {2}}, {"app/read.py": text},
     )
     assert finding.suggestion == "    return cfg.name"
     assert checked_suggestion(finding, 2, text) == "    return cfg.name"
@@ -137,3 +137,11 @@ def test_dispatch_inline_body_carries_checked_suggestion_block():
         "```suggestion\n    option = next((o for o in options if ...), None)\n```"
         in body
     )
+
+
+def test_backslash_continued_line_offers_no_block():
+    """Replacing only the first physical line of a continued statement leaves
+    its tail as a separate statement that can still parse, so no block."""
+    text = "total = 1 + \\\n    2\n"
+    finding = _finding(suggestion="total = 5", line=1, file="app/t.py", rule="x")
+    assert checked_suggestion(finding, 1, text) is None

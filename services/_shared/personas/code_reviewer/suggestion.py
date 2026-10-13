@@ -175,6 +175,10 @@ def _still_parses(lines: list[str], anchored_line: int, candidate: str) -> bool:
     """True when the file parses both as it stands and with the line
     replaced. A file that does not parse today gives no evidence either way,
     so it offers no block."""
+    if lines[anchored_line - 1].rstrip().endswith("\\"):
+        # The line continues into the next one. Swapping only this line can
+        # leave the tail parsing as a separate, different statement.
+        return False
     try:
         ast.parse("\n".join(lines))
         replaced = lines[: anchored_line - 1] + [candidate] + lines[anchored_line:]
