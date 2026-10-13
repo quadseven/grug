@@ -59,6 +59,23 @@ def test_prior_keys_extracts_grug_findings():
     assert dedup.finding_key("y.py", 9, "race-condition") in keys
 
 
+def test_complexity_identity_requires_machine_readable_function_marker():
+    body = (
+        "Function `quoted_name` was mentioned in prose.\n"
+        + dedup.rule_marker("high-complexity")
+    )
+    keys = dedup.prior_keys_from_comments([{
+        "path": "x.py", "line": 2, "body": body,
+    }])
+    assert dedup.complexity_function_key("x.py", "quoted_name") not in keys
+
+    marked = body + "\n<!-- grug-complexity-function:actual_name -->"
+    keys = dedup.prior_keys_from_comments([{
+        "path": "x.py", "line": 2, "body": marked,
+    }])
+    assert dedup.complexity_function_key("x.py", "actual_name") in keys
+
+
 def test_prior_keys_skips_non_grug_comments():
     """A human review comment (no marker) contributes no key — we only
     dedup against our OWN prior findings."""

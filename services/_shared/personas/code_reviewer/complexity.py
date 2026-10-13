@@ -40,12 +40,10 @@ def _cap_env(name: str, default: int) -> int:
 _DEFAULT_CYCLOMATIC_CAP = _cap_env("GRUG_COMPLEXITY_CYCLO_CAP", 15)
 _DEFAULT_COGNITIVE_CAP = _cap_env("GRUG_COMPLEXITY_COGNITIVE_CAP", 25)
 
-# How much WORSE an already-over-cap function must get before it is worth an
-# inline comment. Small churn inside a tangled function is normal maintenance;
-# only a real step change is this PR's doing. Tunable, but not per-repo config
-# - a threshold nobody can explain is a threshold nobody trusts.
-_REGRESSION_CYCLO = _cap_env("GRUG_COMPLEXITY_REGRESSION_CYCLO", 3)
-_REGRESSION_COG = _cap_env("GRUG_COMPLEXITY_REGRESSION_COG", 5)
+# The same five-point threshold intentionally applies to both comparisons:
+# the function ends at least five points over a cap, or the PR raises either
+# metric by at least five points. Smaller rises stay in the summary.
+_INLINE_MARGIN = 5
 
 _RULE = "high-complexity"
 
@@ -182,24 +180,20 @@ def _score_functions(source: str) -> dict[str, tuple[int, int]]:
     return out
 
 
-def _is_regression(
+def _is_material_complexity(
     base_cyclo: int | None, base_cog: int | None,
     cyclo: int, cog: int, cyclo_cap: int, cog_cap: int,
 ) -> bool:
-    """Did THIS PR cause the over-cap state, or was it already there?
+    """Does this function have the required margin or PR-caused rise?
 
-    No base (fetch failed, unparseable, or new file) -> True, i.e. fall back
-    to the old absolute behaviour. Going SILENT on a missing base would hide
-    real regressions; falling back only restores the previous noise level.
+    With no base, only the absolute margin can justify an inline comment.
     """
-    if base_cyclo is None or base_cog is None:
-        return True
-    crossed = (base_cyclo <= cyclo_cap < cyclo) or (base_cog <= cog_cap < cog)
-    worsened = (
-        cyclo - base_cyclo >= _REGRESSION_CYCLO
-        or cog - base_cog >= _REGRESSION_COG
+    margin = cyclo - cyclo_cap >= _INLINE_MARGIN or cog - cog_cap >= _INLINE_MARGIN
+    rise = base_cyclo is not None and base_cog is not None and (
+        cyclo - base_cyclo >= _INLINE_MARGIN
+        or cog - base_cog >= _INLINE_MARGIN
     )
-    return crossed or worsened
+    return margin or rise
 
 
 def _delta_phrase(
@@ -214,6 +208,69 @@ def _delta_phrase(
             f"{base_cog}->{cog} cognitive."
         )
     return " New function at this size." if had_base else ""
+
+
+def _complexity_finding(
+    path: str, name: str, line: int, cyclo: int, cog: int,
+    base_cyclo: int | None, base_cog: int | None, had_base: bool,
+    cyclo_cap: int, cog_cap: int, material: bool,
+) -> Finding:
+    """The published finding for one over-cap function. Only a material one
+    carries a split (and so an inline thread) and medium severity; the rest
+    are low-severity summary notes."""
+    over = []
+    if cyclo > cyclo_cap:
+        over.append(f"cyclomatic {cyclo} (cap {cyclo_cap})")
+    if cog > cog_cap:
+        over.append(f"cognitive {cog} (cap {cog_cap})")
+    delta = _delta_phrase(base_cyclo, base_cog, cyclo, cog, had_base)
+    return Finding(
+        file=path,
+        line=line,
+        severity="medium" if material else "low",
+        rule_name=_RULE,
+        message=(
+            f"Function `{name}` too tangled -- "
+            f"{', '.join(over)}.{delta} Grug say: break into smaller "
+            f"pieces so next hunter read it without getting lost."
+        ),
+        suggestion=(
+            f"Extract the new branching in `{name}` into a focused helper, "
+            "keeping this function as orchestration."
+            if material else None
+        ),
+        effort="quick-win" if material else None,
+        complexity_function=name,
+    )
+
+
+def _gate_function(
+    path: str, name: str, line: int, cyclo: int, cog: int,
+    base: dict[str, tuple[int, int]], had_base: bool,
+    cyclo_cap: int, cog_cap: int,
+) -> Finding | SuppressedComplexity:
+    """The regression gate for one over-cap, touched function: suppressed
+    when the PR did not make it worse, otherwise a finding. Split out of
+    `_scan_one_file` so that function stays under its own cap."""
+    base_cyclo, base_cog = base.get(name, (None, None))
+    material = _is_material_complexity(
+        base_cyclo, base_cog, cyclo, cog, cyclo_cap, cog_cap,
+    )
+    if (
+        not material and base_cyclo is not None and base_cog is not None
+        and cyclo <= base_cyclo and cog <= base_cog
+    ):
+        return SuppressedComplexity(
+            file=path, function=name,
+            cyclomatic=cyclo, cognitive=cog,
+            base_cyclomatic=base_cyclo, base_cognitive=base_cog,
+        )
+    # Still report small changes in the summary; omission from the inline
+    # channel happens in dispatch because no suggestion exists.
+    return _complexity_finding(
+        path, name, line, cyclo, cog,
+        base_cyclo, base_cog, had_base, cyclo_cap, cog_cap, material,
+    )
 
 
 def _scan_one_file(
@@ -244,37 +301,14 @@ def _scan_one_file(
         if cyclo <= cyclo_cap and cog <= cog_cap:
             continue
 
-        base_cyclo, base_cog = base.get(node.name, (None, None))
-        if not _is_regression(base_cyclo, base_cog, cyclo, cog, cyclo_cap, cog_cap):
-            # Only a function WITH a base can land here (no base -> _is_regression
-            # always True), so base_cyclo/base_cog are never None here.
-            assert base_cyclo is not None and base_cog is not None
-            suppressed.append(SuppressedComplexity(
-                file=path, function=node.name,
-                cyclomatic=cyclo, cognitive=cog,
-                base_cyclomatic=base_cyclo, base_cognitive=base_cog,
-            ))
-            continue
-
-        over = []
-        if cyclo > cyclo_cap:
-            over.append(f"cyclomatic {cyclo} (cap {cyclo_cap})")
-        if cog > cog_cap:
-            over.append(f"cognitive {cog} (cap {cog_cap})")
-        delta = _delta_phrase(base_cyclo, base_cog, cyclo, cog, had_base)
-        out.append(Finding(
-            file=path,
-            line=min(touched),
-            severity="medium",  # advisory: never blocks on its own
-            rule_name=_RULE,
-            message=(
-                f"Function `{node.name}` too tangled -- "
-                f"{', '.join(over)}.{delta} Grug say: break into smaller "
-                f"pieces so next hunter read it without getting lost."
-            ),
-            suggestion=None,
-            effort="heavy-lift",
-        ))
+        result = _gate_function(
+            path, node.name, min(touched), cyclo, cog,
+            base, had_base, cyclo_cap, cog_cap,
+        )
+        if isinstance(result, SuppressedComplexity):
+            suppressed.append(result)
+        else:
+            out.append(result)
     return out, suppressed
 
 
@@ -299,9 +333,10 @@ def scan_complexity_full(
     `poller_handler.handler` was cyclomatic 30 / cognitive 53 - exactly main's
     baseline, on a function it had not touched (#767). An adversarial audit of
     the last 120 findings put this rule at 85 of them, 71% of all output, with
-    most replies saying "pre-existing". With `base_contents`, only a crossed
-    cap, a material worsening, or a new over-cap function is published; the
-    rest come back as `suppressed` so the caller can log a count (#781) -
+    most replies saying "pre-existing". With `base_contents`, a function the
+    PR made worse (any amount) or a new over-cap function is published - as
+    a medium inline finding only past `_INLINE_MARGIN`, else as a low summary
+    note; the rest come back as `suppressed` so the caller can log a count (#781) -
     the #707 scoreboard otherwise has no way to measure how many markings
     this gate removes.
 

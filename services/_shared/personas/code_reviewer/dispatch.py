@@ -1019,9 +1019,21 @@ def _findings_table(evaluation: CodeReviewEvaluation) -> str:
         f"| {_severity_chip(f.severity)} | {_effort_chip(f.effort)} | "
         f"`{_md_code_span(f.file)}` | {f.line} | "
         f"`{_md_code_span(f.rule_name)}` | {_md_table_cell(f.message)} |"
-        for f in evaluation.findings
+        for f in evaluation.findings if not _is_complexity_finding(f)
     )
     return "\n".join(rows)
+
+
+def _is_complexity_finding(finding: Finding) -> bool:
+    return finding.rule_name in {"high-complexity", "complexity-hotspot"}
+
+
+def _maintainability_notes(evaluation: CodeReviewEvaluation) -> str:
+    notes = [
+        f"- `{_md_code_span(f.file)}:{f.line}` {_md_table_cell(f.message)}"
+        for f in evaluation.findings if _is_complexity_finding(f)
+    ]
+    return "\n\n## Maintainability notes\n\n" + "\n".join(notes) if notes else ""
 
 
 def _summary_markdown(
@@ -1151,7 +1163,7 @@ def _summary_markdown(
         f"{phase_line} "
         "Inline comments carry Fix + agent prompt on each marking.\n\n"
     )
-    summary = f"{legend}{table}{held}{hunt}"
+    summary = f"{legend}{table}{_maintainability_notes(evaluation)}{held}{hunt}"
     agent = _consolidated_agent_prompt(evaluation)
     if agent:
         summary = f"{summary}\n\n{agent}"
@@ -1172,7 +1184,8 @@ def _consolidated_agent_prompt(evaluation: CodeReviewEvaluation) -> str:
     Returns empty string when there are no findings — never emit a hollow
     "Address each finding below" shell with nothing under it.
     """
-    if not evaluation.findings:
+    findings = tuple(f for f in evaluation.findings if not _is_complexity_finding(f))
+    if not findings:
         return ""
 
     header = [
@@ -1184,7 +1197,7 @@ def _consolidated_agent_prompt(evaluation: CodeReviewEvaluation) -> str:
     body: list[str] = []
     used = sum(len(x) + 1 for x in header)
     included = 0
-    for f in evaluation.findings:
+    for f in findings:
         cat = _category_for_rule(f.rule_name)
         entry = (
             f"- {_md_code_span(f.file)}:{f.line} "
@@ -1198,7 +1211,7 @@ def _consolidated_agent_prompt(evaluation: CodeReviewEvaluation) -> str:
         body.append(entry)
         used += len(entry) + 1
         included += 1
-    cut = len(evaluation.findings) - included
+    cut = len(findings) - included
     if cut:
         body.append(
             f"(+{cut} more finding(s) - see the findings table above)"
@@ -1528,7 +1541,13 @@ def _inline_comment_body(
     provenance = _provenance_block(f)
     if provenance:
         body += f"\n\n{provenance}"
-    return f"{body}\n\n{_agent_prompt_block(f)}\n\n{rule_marker(f.rule_name)}"
+    function_marker = (
+        f"\n<!-- grug-complexity-function:{f.complexity_function} -->"
+        if f.complexity_function
+        and re.fullmatch(r"[A-Za-z0-9_-]+", f.complexity_function)
+        else ""
+    )
+    return f"{body}\n\n{_agent_prompt_block(f)}\n\n{rule_marker(f.rule_name)}{function_marker}"
 
 
 # Rows of the findings table carried in the board body. Ten, because the body
@@ -2113,6 +2132,14 @@ def _build_review_result(
     if evaluation.degraded_reason not in (None, "", "partial_review"):
         return None, ()
     new_findings = dedup_findings(evaluation.findings, prior_keys)
+    # Complexity is summary advice by default. An inline thread requires a
+    # changed-line suggestion the reviewer can apply in this PR; heavy-lift
+    # findings never create reply-required threads.
+    new_findings = tuple(
+        f for f in new_findings
+        if not _is_complexity_finding(f)
+        or (f.suggestion and f.effort != "heavy-lift" and f.severity in ("low", "medium"))
+    )
     if repo_config is not None:
         # `.grug.yaml` min_inline_severity: lower findings stay in the check
         # summary (built from the full evaluation) but get no inline comment.
