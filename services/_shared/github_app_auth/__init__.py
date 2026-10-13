@@ -8,6 +8,7 @@ from __future__ import annotations
 import logging
 import os
 import random
+import threading
 import time
 from datetime import datetime, timedelta, timezone
 
@@ -38,6 +39,66 @@ _RETRY_BACKOFF_FACTOR = 2.0
 _RETRY_MAX_SLEEP_SECONDS = 30.0
 _RETRYABLE_STATUS = frozenset({500, 502, 503, 504})
 _RATE_LIMIT_STATUS = frozenset({403, 429})
+
+# Keep this permission inventory aligned with docs/app-permissions.md. The
+# docs test reads the marked table rows below so the operator instructions
+# and runtime diagnostic cannot drift apart.
+REQUIRED_APP_PERMISSIONS = {
+    "contents": ("write", "Read code and resolve fixed review threads"),
+    "pull_requests": ("write", "Read PRs, publish reviews, and manage review threads"),
+    "issues": ("write", "Read and update issues and issue comments"),
+    "checks": ("write", "Publish Elder and other persona check runs"),
+    "metadata": ("read", "Required repository metadata access"),
+}
+_permission_lock = threading.Lock()
+_checked_install_permissions: set[int] = set()
+_missing_install_permissions: dict[int, tuple[str, ...]] = {}
+
+
+def missing_install_permissions(installation_id: int) -> tuple[str, ...]:
+    """Missing permission names for an installation checked in this process."""
+    with _permission_lock:
+        return _missing_install_permissions.get(installation_id, ())
+
+
+def installation_permission_summary_note(installation_id: int) -> str:
+    """Elder summary note for a missing permission that changes thread cleanup."""
+    if "contents" not in missing_install_permissions(installation_id):
+        return ""
+    level = REQUIRED_APP_PERMISSIONS["contents"][0]
+    return (
+        f"\n\nResolving fixed threads needs Contents: {level}; "
+        "threads are collapsed instead"
+    )
+
+
+def _record_install_permissions(installation_id: int, payload: dict) -> None:
+    with _permission_lock:
+        if installation_id in _checked_install_permissions:
+            return
+        granted = payload.get("permissions") or {}
+        missing = tuple(
+            name for name, (level, _) in REQUIRED_APP_PERMISSIONS.items()
+            if _permission_rank(granted.get(name)) < _permission_rank(level)
+        )
+        _checked_install_permissions.add(installation_id)
+        _missing_install_permissions[installation_id] = missing
+    if missing:
+        log.warning(
+            "app_permissions_missing",
+            extra={
+                "installation_id": installation_id,
+                "missing": [
+                    {"permission": name, "required_level": REQUIRED_APP_PERMISSIONS[name][0],
+                     "feature": REQUIRED_APP_PERMISSIONS[name][1]}
+                    for name in missing
+                ],
+            },
+        )
+
+
+def _permission_rank(level: object) -> int:
+    return {"none": 0, "read": 1, "write": 2, "admin": 3}.get(str(level), 0)
 
 
 def _app_id() -> str:
@@ -126,6 +187,7 @@ def get_install_token(installation_id: int, *, force_refresh: bool = False) -> s
             "GitHub returned a 200 without a usable installation token "
             f"(installation {installation_id}): {type(e).__name__}"
         ) from e
+    _record_install_permissions(installation_id, payload)
     # GitHub returns expires_at ISO; default 1hr from creation.
     _cache.put(key, token, ttl_seconds=55 * 60)
     return token
