@@ -135,12 +135,16 @@ def _high_severity_records(
 
 
 def _replied_to_comment_ids(token: str, owner: str, repo: str, pr_number: int) -> set[int]:
-    """Comment ids that have at least one HUMAN (non-bot) reply anywhere
-    in their thread - the per-finding "was this addressed" proxy. Not the
-    same as GitHub's thread `isResolved` (a human can reply substantively
-    without ever clicking Resolve - observed live on grug PR #694/#739),
-    so a reply is the more inclusive, REST-only signal."""
-    out: set[int] = set()
+    """Finding comments handled by a human reply or Elder's latest Fixed in.
+
+    REST review comments do not expose GraphQL's `isResolved`, so use the
+    reply chain as the per-finding addressed signal. Elder's own reply counts
+    only when it is the newest comment in the thread and starts with
+    `Fixed in`; other bot replies remain unhandled.
+    """
+    own_app_id = get_app_id()
+    comments_by_id: dict[int, dict] = {}
+    threads: dict[int, list[dict]] = {}
     page = 1
     while page <= _MAX_COMMENT_PAGES:
         resp = httpx.get(
@@ -150,20 +154,41 @@ def _replied_to_comment_ids(token: str, owner: str, repo: str, pr_number: int) -
         resp.raise_for_status()
         batch = resp.json()
         for c in batch:
+            comment_id = int(c["id"])
+            comments_by_id[comment_id] = c
             in_reply_to = c.get("in_reply_to_id")
-            if in_reply_to is None:
-                continue
-            if str((c.get("user") or {}).get("type", "")) == "Bot":
-                continue
-            out.add(int(in_reply_to))
+            if in_reply_to is not None:
+                threads.setdefault(int(in_reply_to), []).append(c)
         if len(batch) < 100:
-            return out
+            break
         page += 1
-    log.warning(
-        "sentinel_reply_scan_capped",
-        extra={"repo": f"{owner}/{repo}", "pr": pr_number},
-    )
-    return out
+    else:
+        log.warning(
+            "sentinel_reply_scan_capped",
+            extra={"repo": f"{owner}/{repo}", "pr": pr_number},
+        )
+
+    # API replies can target another reply. Walk each chain back to its
+    # finding comment so every reply is attributed to the right finding.
+    replies_by_root: dict[int, list[dict]] = {}
+    for parent_id, replies in threads.items():
+        root_id = parent_id
+        while root_id in comments_by_id and comments_by_id[root_id].get("in_reply_to_id") is not None:
+            root_id = int(comments_by_id[root_id]["in_reply_to_id"])
+        replies_by_root.setdefault(root_id, []).extend(replies)
+
+    handled: set[int] = set()
+    for root_id, replies in replies_by_root.items():
+        human_replied = any(str((reply.get("user") or {}).get("type", "")) != "Bot" for reply in replies)
+        latest = max(replies, key=lambda comment: int(comment["id"]))
+        app = latest.get("performed_via_github_app") or {}
+        elder_fixed = (
+            str(app.get("id", "")) == own_app_id
+            and (latest.get("body") or "").lstrip().lower().startswith("fixed in ")
+        )
+        if human_replied or elder_fixed:
+            handled.add(root_id)
+    return handled
 
 
 def _abandoned_findings(
