@@ -2139,7 +2139,12 @@ def test_complexity_dedup_matches_function_after_anchor_moves():
 
     prior = prior_keys_from_comments([{
         "path": "src/bridge.py", "line": None, "original_line": 12, "side": "RIGHT",
-        "body": "Function `forward_reports` is too tangled.\n<!-- grug-rule:high-complexity -->",
+        # A thread posted before the function marker existed: only the
+        # scanner's fixed message names the function.
+        "body": (
+            "Function `forward_reports` too tangled -- cyclomatic 17 (cap 15).\n"
+            "<!-- grug-rule:high-complexity -->"
+        ),
     }])
     moved = Finding(
         file="src/bridge.py", line=28, severity="medium",

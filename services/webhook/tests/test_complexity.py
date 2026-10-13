@@ -169,6 +169,21 @@ def test_one_or_two_point_rise_is_summary_advice_without_inline_suggestion():
         assert "Maintainability notes" in _summary_markdown(evaluation)[1]
 
 
+def test_severity_and_split_turn_on_exactly_at_the_inline_margin():
+    """A rise of 4 is one point short of the margin: low, no split, summary
+    only. A rise of 5 meets it: medium with a split. Pins the boundary so the
+    low arm cannot quietly drift back to medium."""
+    base = _tangled()
+    below, at = (
+        scan_complexity(_one_hunk(), {"a.py": _tangled(rise)},
+                        cyclomatic_cap=19, cognitive_cap=100,
+                        base_contents={"a.py": base})
+        for rise in (4, 5)
+    )
+    assert [(f.severity, f.suggestion is None) for f in below] == [("low", True)]
+    assert [(f.severity, f.suggestion is None) for f in at] == [("medium", False)]
+
+
 def test_new_function_over_cap_is_reported():
     out = scan_complexity(_one_hunk(), {"a.py": _tangled()},
                           base_contents={"a.py": "def other():\n    pass\n"})

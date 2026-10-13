@@ -51,6 +51,14 @@ _MARKER_RE = re.compile(r"<!--\s*grug-rule:([A-Za-z0-9_-]+)\s*-->")
 _COMPLEXITY_FUNCTION_RE = re.compile(
     r"<!--\s*grug-complexity-function:([A-Za-z0-9_-]+)\s*-->"
 )
+# Threads posted before the marker above existed carry only the scanner's
+# fixed message. Without this fallback the first push after deploy re-flags
+# every function those threads already named (the duplicate this dedup was
+# built to stop). It matches the exact scanner phrasing, not any mention of a
+# function in prose, so a stray name in an LLM body cannot pose as identity.
+_LEGACY_COMPLEXITY_MESSAGE_RE = re.compile(
+    r"Function `([A-Za-z0-9_-]+)` too tangled -- "
+)
 
 
 def rule_marker(rule_name: str) -> str:
@@ -117,7 +125,10 @@ def prior_keys_from_comments(comments: list[dict]) -> set[str]:
         keys.add(finding_key(path, line_int, rule))
         if rule == "high-complexity":
             body = c.get("body", "") or ""
-            function_match = _COMPLEXITY_FUNCTION_RE.search(body)
+            function_match = (
+                _COMPLEXITY_FUNCTION_RE.search(body)
+                or _LEGACY_COMPLEXITY_MESSAGE_RE.search(body)
+            )
             if function_match:
                 keys.add(complexity_function_key(path, function_match.group(1)))
     return keys

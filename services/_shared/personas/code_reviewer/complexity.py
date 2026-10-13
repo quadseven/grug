@@ -40,8 +40,9 @@ def _cap_env(name: str, default: int) -> int:
 _DEFAULT_CYCLOMATIC_CAP = _cap_env("GRUG_COMPLEXITY_CYCLO_CAP", 15)
 _DEFAULT_COGNITIVE_CAP = _cap_env("GRUG_COMPLEXITY_COGNITIVE_CAP", 25)
 
-# An inline comment needs either this much margin over the cap or this much
-# PR-caused rise. Smaller positive changes stay in the summary.
+# One threshold, used twice: an inline comment needs the function to end at
+# least this many points over the cap, OR the PR to raise it by at least this
+# many points (either metric). Smaller rises stay in the summary.
 _INLINE_MARGIN = 5
 
 _RULE = "high-complexity"
@@ -209,6 +210,40 @@ def _delta_phrase(
     return " New function at this size." if had_base else ""
 
 
+def _complexity_finding(
+    path: str, name: str, line: int, cyclo: int, cog: int,
+    base_cyclo: int | None, base_cog: int | None, had_base: bool,
+    cyclo_cap: int, cog_cap: int, material: bool,
+) -> Finding:
+    """The published finding for one over-cap function. Only a material one
+    carries a split (and so an inline thread) and medium severity; the rest
+    are low-severity summary notes."""
+    over = []
+    if cyclo > cyclo_cap:
+        over.append(f"cyclomatic {cyclo} (cap {cyclo_cap})")
+    if cog > cog_cap:
+        over.append(f"cognitive {cog} (cap {cog_cap})")
+    delta = _delta_phrase(base_cyclo, base_cog, cyclo, cog, had_base)
+    return Finding(
+        file=path,
+        line=line,
+        severity="medium" if material else "low",
+        rule_name=_RULE,
+        message=(
+            f"Function `{name}` too tangled -- "
+            f"{', '.join(over)}.{delta} Grug say: break into smaller "
+            f"pieces so next hunter read it without getting lost."
+        ),
+        suggestion=(
+            f"Extract the new branching in `{name}` into a focused helper, "
+            "keeping this function as orchestration."
+            if material else None
+        ),
+        effort="quick-win" if material else None,
+        complexity_function=name,
+    )
+
+
 def _scan_one_file(
     path: str, source: str, changed_lines: set[int],
     base: dict[str, tuple[int, int]], had_base: bool,
@@ -251,30 +286,9 @@ def _scan_one_file(
                 continue
         # Still report small changes in the summary; omission from the inline
         # channel happens in dispatch because no suggestion exists.
-
-        over = []
-        if cyclo > cyclo_cap:
-            over.append(f"cyclomatic {cyclo} (cap {cyclo_cap})")
-        if cog > cog_cap:
-            over.append(f"cognitive {cog} (cap {cog_cap})")
-        delta = _delta_phrase(base_cyclo, base_cog, cyclo, cog, had_base)
-        out.append(Finding(
-            file=path,
-            line=min(touched),
-            severity="medium" if material else "low",
-            rule_name=_RULE,
-            message=(
-                f"Function `{node.name}` too tangled -- "
-                f"{', '.join(over)}.{delta} Grug say: break into smaller "
-                f"pieces so next hunter read it without getting lost."
-            ),
-            suggestion=(
-                f"Extract the new branching in `{node.name}` into a focused helper, "
-                "keeping this function as orchestration."
-                if material else None
-            ),
-            effort="quick-win" if material else None,
-            complexity_function=node.name,
+        out.append(_complexity_finding(
+            path, node.name, min(touched), cyclo, cog,
+            base_cyclo, base_cog, had_base, cyclo_cap, cog_cap, material,
         ))
     return out, suppressed
 
