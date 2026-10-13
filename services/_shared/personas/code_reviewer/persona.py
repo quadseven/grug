@@ -285,6 +285,18 @@ def with_degradation(
     )
 
 
+def _capped_severity(rule: str, severity: Severity, message: str) -> Severity:
+    """A complexity finding is advice, so it stays at medium unless its
+    message opens with the correctness-risk marker and names a real bug
+    risk (grug#1144). Every other kind keeps the severity it came with.
+    """
+    if rule not in {"high-complexity", "complexity-hotspot"}:
+        return severity
+    if message.lstrip().lower().startswith(COMPLEXITY_CORRECTNESS_MARKER.lower()):
+        return severity
+    return "medium"
+
+
 def _hunk_line_index(hunks: tuple[DiffHunk, ...]) -> dict[str, set[int]]:
     """Build {file_path: union(new_lines)} for O(1) hallucination check.
 
@@ -340,14 +352,7 @@ def evaluate_diff(
             Finding(
                 file=raw.path,
                 line=raw.line,
-                severity=(
-                    raw.severity
-                    if raw.rule not in {"high-complexity", "complexity-hotspot"}
-                    or raw.message.lstrip().lower().startswith(
-                        COMPLEXITY_CORRECTNESS_MARKER.lower()
-                    )
-                    else "medium"
-                ),
+                severity=_capped_severity(raw.rule, raw.severity, raw.message),
                 rule_name=raw.rule,
                 message=raw.message,
                 # #553: wire fields carry through; the anti-hallucination
