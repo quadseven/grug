@@ -206,3 +206,16 @@ def test_parser_resource_error_offers_no_block(monkeypatch, parse_error, failed_
     monkeypatch.setattr("personas.code_reviewer.suggestion.ast.parse", fail_parse)
     finding = _finding(suggestion="option = None")
     assert checked_suggestion(finding, 2, _NULL_DEREF_FILE) is None
+
+
+@pytest.mark.parametrize(("text", "line", "candidate"), [
+    # A JSON "\\udcff" escape decodes to a lone surrogate in the field.
+    (_NULL_DEREF_FILE, 2, 'option = "\udcff"'),
+    # The anchored line itself carries one; the open candidate tokenizes it.
+    ('x = "\udcff"\ny = 1\n', 1, "x = f(1,"),
+])
+def test_unencodable_line_offers_no_block_instead_of_raising(text, line, candidate):
+    """The open-statement guard runs before the parse check's try; a line
+    the tokenizer cannot encode must not crash the review."""
+    finding = _finding(suggestion=candidate, line=line, file="app/t.py", rule="x")
+    assert checked_suggestion(finding, line, text) is None

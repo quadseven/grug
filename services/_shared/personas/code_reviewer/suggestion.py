@@ -206,7 +206,8 @@ def _leaves_open(line: str) -> bool:
             pass
     except tokenize.TokenError:
         return True
-    except SyntaxError:
-        # Unbalanced closer or bad token; the parse check decides those.
+    except (SyntaxError, ValueError):
+        # Unbalanced closer, bad token, or a lone surrogate the tokenizer
+        # cannot encode (UnicodeEncodeError); the parse check decides those.
         return False
     return False
