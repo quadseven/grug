@@ -209,8 +209,10 @@ def _already_answered(thread: dict, head_sha: str) -> bool:
     nodes = (thread.get("comments") or {}).get("nodes") or []
     prefix = _FIXED_REPLY_PREFIX.lower()
     expected = head_sha[:7].lower()
+    expected_reply = f"{prefix}{expected}"
     return any(
-        (c.get("body") or "").lower().startswith(f"{prefix}{expected}:")
+        (body := (c.get("body") or "").lower()) == expected_reply
+        or body.startswith(f"{expected_reply}:")
         for c in nodes[1:]
     )
 
