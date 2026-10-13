@@ -200,6 +200,24 @@ def test_author_disagreeing_reply_blocks_resolution(run):
     assert gh.resolved == [] and gh.replies == []
 
 
+def test_deleted_account_fixed_in_reply_blocks_resolution_without_author(run):
+    """A deleted account's comment has no login. With no PR author known it
+    must not pass as the author's reply (None == None)."""
+    ghost = _reply()
+    ghost["author"] = None
+    gh = _Gh([_thread(comments=[_comment(), ghost])])
+    assert run(gh) == 0
+    assert gh.resolved == [] and gh.replies == []
+
+
+def test_author_fixed_in_reply_is_not_answered_twice(run):
+    """The author's own "Fixed in" counts as the answer: Elder resolves the
+    thread without adding its own reply on top."""
+    gh = _Gh([_thread(comments=[_comment(), _reply(author="alice", body="fixed in abc1234")])])
+    assert run(gh, pr_author="alice") == 1
+    assert gh.resolved == ["T1"] and gh.replies == []
+
+
 def test_truncated_comment_list_is_treated_as_touched(run):
     gh = _Gh([_thread(total=40)])
     assert run(gh) == 0 and gh.resolved == []

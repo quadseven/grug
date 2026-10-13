@@ -160,7 +160,9 @@ def _only_grug_comments(thread: dict, pr_author: str | None = None) -> list[dict
         login = (c.get("author") or {}).get("login")
         if _is_grug(login):
             continue
-        if login != pr_author:
+        # A deleted account's comment has no login; without the `not
+        # pr_author` check it would match an unknown author (None == None).
+        if not pr_author or login != pr_author:
             return None
         body = (c.get("body") or "").lower()
         if not body.startswith(_FIXED_REPLY_PREFIX.lower()):
@@ -194,7 +196,13 @@ _FIXED_REPLY_PREFIX = "Fixed in "
 
 def _already_answered(thread: dict) -> bool:
     """An earlier pass (or the PR author) posted a "Fixed in" reply but
-    the resolve call failed or has not run yet."""
+    the resolve call failed or has not run yet.
+
+    Counting the author's reply here is deliberate (#1147): only threads
+    that passed `select_fixed_threads` reach this check, so every non-Elder
+    reply is the PR author's own "Fixed in". A second "Fixed in" from Elder
+    would add noise, and the resolve still requires GitHub's `isOutdated`
+    and no nearby re-raise, so the author's word alone never closes a thread."""
     nodes = (thread.get("comments") or {}).get("nodes") or []
     prefix = _FIXED_REPLY_PREFIX.lower()
     return any((c.get("body") or "").lower().startswith(prefix) for c in nodes[1:])
@@ -214,7 +222,7 @@ def _blocked_by_person_reply(thread: dict, pr_author: str | None) -> bool:
         login = (c.get("author") or {}).get("login")
         if _is_grug(login):
             continue
-        if login != pr_author:
+        if not pr_author or login != pr_author:
             return True
         if not (c.get("body") or "").lower().startswith(prefix):
             return True
