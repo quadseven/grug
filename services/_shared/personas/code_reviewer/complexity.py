@@ -40,9 +40,9 @@ def _cap_env(name: str, default: int) -> int:
 _DEFAULT_CYCLOMATIC_CAP = _cap_env("GRUG_COMPLEXITY_CYCLO_CAP", 15)
 _DEFAULT_COGNITIVE_CAP = _cap_env("GRUG_COMPLEXITY_COGNITIVE_CAP", 25)
 
-# One threshold, used twice: an inline comment needs the function to end at
-# least this many points over the cap, OR the PR to raise it by at least this
-# many points (either metric). Smaller rises stay in the summary.
+# The same five-point threshold intentionally applies to both comparisons:
+# the function ends at least five points over a cap, or the PR raises either
+# metric by at least five points. Smaller rises stay in the summary.
 _INLINE_MARGIN = 5
 
 _RULE = "high-complexity"
