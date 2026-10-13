@@ -405,7 +405,9 @@ def _s608_is_constant(source: str, row: int) -> bool:
     evaluated."""
     try:
         tree = ast.parse(source)
-    except SyntaxError:
+    except (SyntaxError, ValueError):
+        # ValueError: text ast.parse cannot encode (a lone surrogate raises
+        # UnicodeEncodeError). Unknown SQL keeps the high severity.
         return False
     constants: dict[str, ast.expr] = {}
     for node in tree.body:

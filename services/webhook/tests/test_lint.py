@@ -403,6 +403,13 @@ def test_s608_literal_joined_to_parameter_stays_high():
     assert found[0].severity == "high"
 
 
+def test_s608_unparseable_source_stays_high_not_crash():
+    """`ast.parse` raises ValueError, not SyntaxError, on text it cannot
+    encode (a lone surrogate): the check must keep the high severity
+    instead of crashing the scan."""
+    assert lint_mod._s608_is_constant("query = 'SELECT \ud800'\n", 1) is False
+
+
 def test_s102_in_test_file_is_dropped():
     assert _scan_with("tests/test_exec.py", "S102") == ()
 
