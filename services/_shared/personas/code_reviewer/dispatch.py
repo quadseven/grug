@@ -2529,6 +2529,26 @@ def _linked_issue_summary_note(linked_context: str) -> str:
     )
 
 
+def _filter_intent_mismatches(
+    evaluation: CodeReviewEvaluation, *, installation_id: int,
+    owner: str, repo_name: str, pull_number: int,
+) -> CodeReviewEvaluation:
+    """Apply the deterministic intent-mismatch evidence filter (#1170)."""
+    kept, dropped, lowered = filter_intent_mismatch_findings(evaluation.findings)
+    if dropped or lowered:
+        evaluation = with_findings(evaluation, kept)
+        log.info(
+            "code_review_intent_filter",
+            extra={
+                "installation_id": installation_id,
+                "pr": f"{owner}/{repo_name}#{pull_number}",
+                "dropped": dropped,
+                "lowered": lowered,
+            },
+        )
+    return evaluation
+
+
 def dispatch_code_review(
     payload: dict[str, Any], *, blocking: bool,
     cancel_event: threading.Event | None = None,
@@ -3021,26 +3041,14 @@ def dispatch_code_review(
         evaluation,
     )
 
-    # #1170: intent-mismatch post-filter. A negated acceptance criterion
-    # ("no X", "never X") is met when the diff removes the forbidden thing;
-    # the Elder header teaches this, but this deterministic gate holds the
-    # line when the model raises anyway: a finding that does not quote BOTH
-    # the criterion and the PR sentence is dropped, and one whose two quotes
-    # share the same negation is lowered to medium (advisory, never blocks).
-    _intent_kept, intent_dropped, intent_lowered = (
-        filter_intent_mismatch_findings(evaluation.findings)
+    # #1170: deterministic evidence filter for intent-mismatch findings.
+    evaluation = _filter_intent_mismatches(
+        evaluation,
+        installation_id=installation_id,
+        owner=owner,
+        repo_name=repo_name,
+        pull_number=pull_number,
     )
-    if intent_dropped or intent_lowered:
-        evaluation = with_findings(evaluation, _intent_kept)
-        log.info(
-            "code_review_intent_filter",
-            extra={
-                "installation_id": installation_id,
-                "pr": f"{owner}/{repo_name}#{pull_number}",
-                "dropped": intent_dropped,
-                "lowered": intent_lowered,
-            },
-        )
 
     # NOTE (#466, ADR-0012): the deterministic security suite (SAST + SCA +
     # secret + IaC scans -> exploitability judge) that used to merge into
