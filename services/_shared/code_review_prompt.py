@@ -272,7 +272,15 @@ RULES: tuple[ReviewRule, ...] = (
     ReviewRule(
         name="intent-mismatch",
         bug_class="correctness",
-        description="The implemented behavior contradicts a specific linked-issue acceptance criterion. Report the changed line that causes the contradiction, name the criterion in the message, and use high severity. Do not report a mismatch without explicit criterion evidence.",
+        description="The implemented behavior contradicts a specific "
+        "linked-issue acceptance criterion. Report the changed line that "
+        "causes the contradiction, quote the criterion AND the PR "
+        "sentence it claims contradicts it, name the diff hunk that does "
+        "the opposite of the criterion, and use high severity. A "
+        "criterion that forbids something ('no X', 'never X') is met when "
+        "the diff removes or prevents X: only a diff that ADDS or KEEPS "
+        "the forbidden thing is a mismatch. Do not report a mismatch "
+        "without explicit criterion evidence.",
         bad_example="Criterion says preserve existing access; changed code grants access to inactive users",
         good_example="Criterion requires expired records to remain hidden; this branch returns them. Restore the expiry check.",
         severity="high",
@@ -601,6 +609,25 @@ _MITIGATION_SCAN = (
     "secret-in-log-or-trace ONLY when the secret VALUE itself flows into a "
     "log, echo, trace, or env. "
 )
+# NEGATED CRITERIA (#1170). The intent check added by #1165 read a negated
+# acceptance criterion ("no X") as contradicted by a PR whose summary said
+# the same negative thing while its diff REMOVED X - a correct fix was
+# blocked on a person. A criterion that forbids something is MET when the
+# diff removes or prevents the forbidden thing.
+_NEGATED_CRITERION = (
+    "NEGATED CRITERIA: a criterion that forbids something (\"no X\", "
+    "\"never X\", \"X is not written\", \"stops X\") is met when the diff "
+    "removes or prevents X. A PR that deletes the forbidden code, or "
+    "narrows it so the forbidden case can no longer occur, SATISFIES the "
+    "criterion - a removal that carries out a prohibition is not a "
+    "contradiction. Do NOT raise intent-mismatch for it. Raise "
+    "intent-mismatch ONLY when the diff ADDS or KEEPS the forbidden "
+    "thing. Every intent-mismatch finding MUST quote the criterion text "
+    "AND the PR sentence it claims contradicts it, and must name the "
+    "diff hunk that does the opposite of the criterion. A finding that "
+    "fails to quote both is dropped downstream - if you cannot quote "
+    "both, OMIT the finding yourself."
+)
 # v1 — PRECISION-biased (default). A small model over-reports by pattern-
 # matching the vivid bad-examples; bias toward recall-loss over noise (an
 # advisory reviewer that cries wolf gets muted).
@@ -743,6 +770,7 @@ def build_system_prompt(variant: PromptVariant = "v1", extra_rules: str = "") ->
         + "\n"
         + _CONFIDENCE_CLAUSES[variant]
         + _MITIGATION_SCAN
+        + _NEGATED_CRITERION
         + _PREAMBLE_TAIL
     )
     rules_block = "\n".join(_render_rule(r) for r in RULES)

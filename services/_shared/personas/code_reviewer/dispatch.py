@@ -104,6 +104,7 @@ from personas.code_reviewer.judge import (
     eval_tags, grade_findings, partition_findings, partition_refuted,
     refute_findings, submit_evals,
 )
+from personas.code_reviewer.intent_filter import filter_intent_mismatch_findings
 from personas.code_reviewer.persona import (
     CodeReviewEvaluation, Finding, evaluate_diff, with_degradation,
     with_extra_findings, with_findings,
@@ -3019,6 +3020,27 @@ def dispatch_code_review(
     evaluation, defensive_dropped_count = _drop_unreachable_defensive_findings(
         evaluation,
     )
+
+    # #1170: intent-mismatch post-filter. A negated acceptance criterion
+    # ("no X", "never X") is met when the diff removes the forbidden thing;
+    # the Elder header teaches this, but this deterministic gate holds the
+    # line when the model raises anyway: a finding that does not quote BOTH
+    # the criterion and the PR sentence is dropped, and one whose two quotes
+    # share the same negation is lowered to medium (advisory, never blocks).
+    _intent_kept, intent_dropped, intent_lowered = (
+        filter_intent_mismatch_findings(evaluation.findings)
+    )
+    if intent_dropped or intent_lowered:
+        evaluation = with_findings(evaluation, _intent_kept)
+        log.info(
+            "code_review_intent_filter",
+            extra={
+                "installation_id": installation_id,
+                "pr": f"{owner}/{repo_name}#{pull_number}",
+                "dropped": intent_dropped,
+                "lowered": intent_lowered,
+            },
+        )
 
     # NOTE (#466, ADR-0012): the deterministic security suite (SAST + SCA +
     # secret + IaC scans -> exploitability judge) that used to merge into
