@@ -104,6 +104,7 @@ from personas.code_reviewer.judge import (
     eval_tags, grade_findings, partition_findings, partition_refuted,
     refute_findings, submit_evals,
 )
+from personas.code_reviewer.intent_filter import filter_intent_mismatch_findings
 from personas.code_reviewer.persona import (
     CodeReviewEvaluation, Finding, evaluate_diff, with_degradation,
     with_extra_findings, with_findings,
@@ -2528,6 +2529,26 @@ def _linked_issue_summary_note(linked_context: str) -> str:
     )
 
 
+def _filter_intent_mismatches(
+    evaluation: CodeReviewEvaluation, *, installation_id: int,
+    owner: str, repo_name: str, pull_number: int,
+) -> CodeReviewEvaluation:
+    """Apply the deterministic intent-mismatch evidence filter (#1170)."""
+    kept, dropped, lowered = filter_intent_mismatch_findings(evaluation.findings)
+    if dropped or lowered:
+        evaluation = with_findings(evaluation, kept)
+        log.info(
+            "code_review_intent_filter",
+            extra={
+                "installation_id": installation_id,
+                "pr": f"{owner}/{repo_name}#{pull_number}",
+                "dropped": dropped,
+                "lowered": lowered,
+            },
+        )
+    return evaluation
+
+
 def dispatch_code_review(
     payload: dict[str, Any], *, blocking: bool,
     cancel_event: threading.Event | None = None,
@@ -3018,6 +3039,15 @@ def dispatch_code_review(
         )
     evaluation, defensive_dropped_count = _drop_unreachable_defensive_findings(
         evaluation,
+    )
+
+    # #1170: deterministic evidence filter for intent-mismatch findings.
+    evaluation = _filter_intent_mismatches(
+        evaluation,
+        installation_id=installation_id,
+        owner=owner,
+        repo_name=repo_name,
+        pull_number=pull_number,
     )
 
     # NOTE (#466, ADR-0012): the deterministic security suite (SAST + SCA +
