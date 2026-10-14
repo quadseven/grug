@@ -2437,6 +2437,8 @@ def _attach_linked_issue_context(
             fetch_issue=build_issue_fetcher(
                 installation_id=installation_id, owner=owner, repo=repo_name,
             ),
+            owner=owner,
+            repo=repo_name,
         )
         if linked:
             pr_context["linked_issue_context"] = linked
@@ -2449,6 +2451,23 @@ def _attach_linked_issue_context(
                 "kind": type(e).__name__,
             },
         )
+
+
+def _linked_issue_summary_note(linked_context: str) -> str:
+    """Summarize which linked issue criteria were included in the review."""
+    if not linked_context:
+        return ""
+    issue_numbers = list(dict.fromkeys(
+        re.findall(r"^#(\d+) criterion ", linked_context, re.M),
+    ))
+    criteria_count = len(re.findall(r"^#\d+ criterion \d+ ", linked_context, re.M))
+    if not issue_numbers:
+        return ""
+    return (
+        "\n\nLinked issue criteria read: "
+        + ", ".join(f"#{number}" for number in issue_numbers)
+        + f" ({criteria_count} criteria)."
+    )
 
 
 def dispatch_code_review(
@@ -3096,6 +3115,9 @@ def dispatch_code_review(
             "ignores or explicitly selects those rules for the affected paths."
         )
     summary += config_note
+    summary += _linked_issue_summary_note(
+        str(pr_context.get("linked_issue_context") or ""),
+    )
     summary += installation_permission_summary_note(installation_id)
     conclusion, title, summary, listed_threads = _carry_into_check(
         action=action, evaluation=evaluation, mode=mode,

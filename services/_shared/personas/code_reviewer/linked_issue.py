@@ -47,8 +47,13 @@ MAX_BLOCK_CHARS = 4000
 # `Refs`/`Part of`/`Relates to #N`: the non-closing links Chief's
 # `_ISSUE_LINK_PAT` also accepts. `Blocked by` is deliberately absent: that
 # issue is a prerequisite, not the spec this PR claims to implement. The
-# `\s+#` form is same-repo only, so `owner/repo#N` never matches.
-_REF_RE = re.compile(r"\b(?:refs?|part\s+of|relates\s+to)\s+#(\d+)\b", re.IGNORECASE)
+# Qualified refs are checked against the PR's repository before they are read.
+_QUALIFIED_REF_RE = re.compile(
+    r"\b(?:closes?|fixes?|resolves?|refs?|relates\s+to)\s+"
+    r"([\w.-]+)/([\w.-]+)#(\d+)\b", re.IGNORECASE,
+)
+_BARE_REF_RE = re.compile(r"\b(?:refs?|relates\s+to)\s+#(\d+)\b", re.IGNORECASE)
+_PART_OF_RE = re.compile(r"\bpart\s+of\s+#(\d+)\b", re.IGNORECASE)
 _BULLET_RE = re.compile(r"^\s*[-*]\s+(?:\[( |x|X)\]\s+)?(\S.*?)\s*$")
 
 # Display category for the two findings the block asks for (#904). They are
@@ -66,14 +71,30 @@ IssueBodyFetcher = Callable[[int], str]
 Criterion = tuple[str, str]  # ("open" | "ticked", text)
 
 
-def linked_issue_numbers(pr_body: str, *, limit: int = MAX_LINKED_ISSUES) -> list[int]:
+def linked_issue_numbers(
+    pr_body: str, *, owner: str = "", repo: str = "",
+    limit: int = MAX_LINKED_ISSUES,
+) -> list[int]:
     """Same-repo issues the PR links, closing keywords first, deduped, capped."""
     body = pr_body or ""
     seen: dict[int, None] = {}
     for n in closes_refs(body):
         seen.setdefault(n, None)
-    for m in _REF_RE.finditer(strip_code_spans(body)):
+    clean_body = strip_code_spans(body)
+    qualified = []
+    for m in _QUALIFIED_REF_RE.finditer(clean_body):
+        if (
+            m.group(1).casefold() == owner.casefold()
+            and m.group(2).casefold() == repo.casefold()
+        ):
+            qualified.append(int(m.group(3)))
+    for n in qualified:
+        seen.setdefault(n, None)
+    for m in _BARE_REF_RE.finditer(clean_body):
         seen.setdefault(int(m.group(1)), None)
+    if not seen:
+        for m in _PART_OF_RE.finditer(clean_body):
+            seen.setdefault(int(m.group(1)), None)
     return list(seen)[:limit]
 
 
@@ -119,7 +140,10 @@ _HEADER = (
     "values, a missing bound, a missing error), that is a contradiction: "
     "always flag it at high severity. Stay silent only about criteria this "
     "diff does not touch at all, since the PR may be one slice of several. "
-    "A ticked box is the author's claim, not evidence."
+    "A criterion that names a test, says '(tests)', or says it fails on main/"
+    "without the change is `acceptance-criterion-unmet` when no added or "
+    "changed test in the diff exercises it. A ticked box is the author's "
+    "claim, not evidence."
 )
 
 
@@ -152,11 +176,11 @@ def render_linked_issue_block(criteria_by_issue: dict[int, list[Criterion]]) -> 
 
 
 def build_linked_issue_context(
-    pr_body: str, *, fetch_issue: IssueBodyFetcher,
+    pr_body: str, *, fetch_issue: IssueBodyFetcher, owner: str = "", repo: str = "",
 ) -> str | None:
     """The block for this PR's linked issues, or None. Never raises."""
     criteria_by_issue: dict[int, list[Criterion]] = {}
-    for number in linked_issue_numbers(pr_body):
+    for number in linked_issue_numbers(pr_body, owner=owner, repo=repo):
         try:
             issue_body = fetch_issue(number)
             if not isinstance(issue_body, str):
