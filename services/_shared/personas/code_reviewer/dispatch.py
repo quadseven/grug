@@ -1172,6 +1172,28 @@ def _summary_markdown(
     return title, summary
 
 
+def _intent_paragraph(pr_context: PrContext) -> str:
+    """Place the stated change and linked-issue comparison first."""
+    title = re.sub(r"\s+", " ", str(pr_context.get("title") or "")).strip()
+    body = re.sub(r"\s+", " ", str(pr_context.get("body") or "")).strip()
+    body_sentence = re.split(r"(?<=[.!?])\s+", body, maxsplit=1)[0][:240]
+    if body_sentence and body_sentence[-1] not in ".!?":
+        body_sentence += "."
+    intent = ". ".join(part.rstrip(".!?") for part in (title, body_sentence) if part)
+    if intent:
+        intent += ". "
+    else:
+        intent = "Change intent was not provided. "
+    sensitive = bool(pr_context.get("sensitive_review"))
+    if pr_context.get("linked_issue_context"):
+        assessment = "Linked acceptance criteria were checked; mismatches are reported as high intent-mismatch findings"
+    else:
+        assessment = "No linked issue acceptance criteria were available for comparison"
+    if sensitive:
+        assessment += "; this PR is class:sensitive and received full review depth"
+    return f"## Intent\n\n{intent}{assessment}.\n\n"
+
+
 # GitHub caps check-run summaries at 65536 chars; the findings table is
 # unbounded (message-length x count), so the consolidated prompt gets a
 # fixed budget well under the cap and truncates by WHOLE findings.
@@ -2516,6 +2538,12 @@ def dispatch_code_review(
         "title": str(pr.get("title") or ""),
         "body": str(pr.get("body") or ""),
     }
+    labels = {
+        str(label.get("name") or "").strip().lower()
+        for label in (pr.get("labels") or [])
+        if isinstance(label, dict)
+    }
+    pr_context["sensitive_review"] = "class:sensitive" in labels
 
     # Living Hunt (#557): if we already finished a review on an older head
     # for this PR, scope the LLM to the delta (prior..head) instead of the
@@ -2627,6 +2655,26 @@ def dispatch_code_review(
             living_range = ""
         pr_context["base_sha"] = living_prior_sha or base_sha
         hunks = parse_diff(diff_text)
+        paths = tuple(hunk.path for hunk in hunks)
+        def is_documentation(path: str) -> bool:
+            path = path.lower()
+            return path.endswith((".md", ".txt")) or path.startswith("docs/") or "/docs/" in path
+
+        def is_test(path: str) -> bool:
+            path = path.lower()
+            return (
+                "/tests/" in f"/{path}/"
+                or path.startswith(("tests/", "test/"))
+                or path.split("/")[-1].startswith("test_")
+                or path.split("/")[-1].endswith("_test.py")
+            )
+
+        docs_or_tests_only = bool(paths) and all(
+            is_documentation(path) or is_test(path)
+            for path in paths
+        )
+        if docs_or_tests_only or "class:docs" in labels or "class:tests" in labels:
+            pr_context["review_scope"] = "correctness findings only (documentation/tests change)"
         # #609: drop data/generated/vendored files from the LLM's plate - a
         # big JSONL/lockfile hunk balloons the prompt into parse_failed and
         # carries no review signal. Named in the summary, never silent.
@@ -2920,6 +2968,18 @@ def dispatch_code_review(
         )
 
     evaluation = evaluate_diff(hunks, llm_response)
+    correctness_only = bool(pr_context.get("review_scope"))
+    if correctness_only:
+        evaluation = with_findings(
+            evaluation,
+            tuple(
+                finding for finding in evaluation.findings
+                if finding.rule_name not in {
+                    "dead-code", "complexity-hotspot", "high-complexity",
+                    "type-safety-gap",
+                }
+            ),
+        )
 
     # NOTE (#466, ADR-0012): the deterministic security suite (SAST + SCA +
     # secret + IaC scans -> exploitability judge) that used to merge into
@@ -2989,11 +3049,14 @@ def dispatch_code_review(
         cyclomatic_cap, cognitive_cap = _repo_complexity_caps(
             installation_id, int(repo["id"]),
         )
-        complexity_scan = scan_complexity_full(
+        complexity_scan = (
+            ComplexityScan(findings=(), suppressed=())
+            if correctness_only else scan_complexity_full(
             hunks, file_contents,
             cyclomatic_cap=cyclomatic_cap,
             cognitive_cap=cognitive_cap,
             base_contents=base_file_contents or None,
+            )
         )
     except Exception as e:  # noqa: BLE001 - enrichment must never abort a review
         log.info(
@@ -3030,9 +3093,10 @@ def dispatch_code_review(
     ruff_policy = _load_repo_ruff_policy(
         installation_id, owner, repo_name, str(pr_context.get("base_sha") or ""),
     )
-    evaluation = _merge_lint_evidence(
-        evaluation, hunks, file_contents, ruff_policy, ruff_policy_dropped,
-    )
+    if not correctness_only:
+        evaluation = _merge_lint_evidence(
+            evaluation, hunks, file_contents, ruff_policy, ruff_policy_dropped,
+        )
 
     # Deterministic docs/code claim check: catch comment/env prose that
     # asserts the wrong settle cap or deep-diff bound (the LORE/CR class
@@ -3108,6 +3172,7 @@ def dispatch_code_review(
         living_baseline_rejected=living_baseline_rejected,
         review_phase=tier1_phase,
     )
+    summary = _intent_paragraph(pr_context) + summary
     if ruff_policy_dropped:
         summary += (
             "\n\nRuff policy: " + str(sum(ruff_policy_dropped))
@@ -3582,7 +3647,7 @@ def _async_deep_decision(
     )
     if unavailable:
         return None
-    if review_is_staged(llm_hunks):
+    if review_is_staged(llm_hunks) and not pr_context.get("sensitive_review"):
         log.info(
             "elder_async_deep_skipped_staged_review",
             extra={"pr": f"{owner}/{repo_name}#{pull_number}"},
@@ -4110,6 +4175,7 @@ def _async_deep_append_if_needed(
         living_baseline_rejected=living_baseline_rejected,
         review_phase="deep",
     )
+    summary = _intent_paragraph(pr_context) + summary
     summary += config_note
     title = f"{title} (deep append)"
     # The author-facing distinction #848 asks for: "the reasoner ran and

@@ -412,6 +412,8 @@ def test_summary_markdown_renders_findings_table():
     title, summary = cr_dispatch._summary_markdown(ev)
     assert "1 blocking" in title  # one critical, one low
     assert "Markings Board" in summary
+
+
     assert "| Severity | Effort | File | Line | Rule | Marking |" in summary
     assert "secret-in-log-or-trace" in summary and "dead-code" in summary
     assert "`x.py`" in summary
@@ -419,6 +421,19 @@ def test_summary_markdown_renders_findings_table():
     assert summary.count("| - |") + summary.count("| quick win |") + summary.count(
         "| heavy lift |"
     ) >= 2
+
+
+def test_intent_paragraph_is_first_and_sensitive_is_explicit():
+    context = {
+        "title": "Change retry behavior",
+        "sensitive_review": True,
+        "linked_issue_context": "Acceptance criteria: retry once.",
+    }
+    paragraph = cr_dispatch._intent_paragraph(context)
+    assert paragraph.startswith("## Intent")
+    assert paragraph.count(".") <= 3
+    assert "class:sensitive" in paragraph
+    assert "acceptance criteria were checked" in paragraph
 
 
 def test_summary_markdown_reports_exact_coverage_and_reviewability_debt():

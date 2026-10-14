@@ -270,6 +270,14 @@ RULES: tuple[ReviewRule, ...] = (
         severity="low",
     ),
     ReviewRule(
+        name="intent-mismatch",
+        bug_class="correctness",
+        description="The implemented behavior contradicts a specific linked-issue acceptance criterion. Report the changed line that causes the contradiction, name the criterion in the message, and use high severity. Do not report a mismatch without explicit criterion evidence.",
+        bad_example="Criterion says preserve existing access; changed code grants access to inactive users",
+        good_example="Criterion requires expired records to remain hidden; this branch returns them. Restore the expiry check.",
+        severity="high",
+    ),
+    ReviewRule(
         name="missing-test-coverage",
         bug_class="test coverage",
         description="New branch/error-path logic with no accompanying test — "
@@ -611,6 +619,11 @@ assert set(_CONFIDENCE_CLAUSES) == set(get_args(PromptVariant)), (
 )
 
 _PREAMBLE_TAIL = (
+    "Start by assessing the PR's intended behavior against the linked issue's "
+    "acceptance criteria. For a documentation-only or test-only scope, report "
+    "correctness defects only (wrong facts, broken links, or tests that cannot "
+    "fail); omit style, naming, and complexity findings. A class:sensitive PR "
+    "requires full review depth even when its diff is small. "
     "Report each line under AT MOST ONE rule (pick the most specific). "
     # Injection hardening: ALL repo-sourced content is untrusted data, not
     # commands — the diff hunks AND every file-context block (full-file
