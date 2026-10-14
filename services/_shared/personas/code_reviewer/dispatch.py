@@ -97,6 +97,16 @@ from personas.code_reviewer.linked_issue import (
     RULE_CATEGORIES as _LINKED_ISSUE_RULE_CATEGORIES,
 )
 from personas.code_reviewer.linked_issue import build_linked_issue_context
+from personas.code_reviewer.intent import (
+    build_intent_paragraph,
+    criteria_from_block,
+    detect_intent_mismatch,
+    filter_docs_tests_findings,
+    hunks_are_docs_tests_only,
+    is_sensitive,
+    labels_from_pr,
+    should_force_full_depth,
+)
 from personas.code_reviewer.repo_docs import build_repo_docs_context
 from personas.tpm.issue_fetcher import build_issue_fetcher
 from personas.code_reviewer.omen import build_runtime_context
@@ -1048,6 +1058,7 @@ def _summary_markdown(
     living_range: str = "",
     living_baseline_rejected: str = "",
     review_phase: Literal["tier1", "deep", "dual"] = "dual",
+    intent_paragraph: str = "",
 ) -> tuple[str, str]:
     """Render a (title, summary) pair for the check-run output.
 
@@ -1064,6 +1075,8 @@ def _summary_markdown(
     as a summary note so the fallback is visible, not silent.
     `review_phase` (#646): tier1 = coder-only legend; deep = append legend;
     dual = both arms before publish (deep depth / rollback).
+    `intent_paragraph` (#1165): the Intent paragraph (at most three
+    sentences) prepended as `## Intent` at the top of every summary.
     """
     held = _review_transparency(
         evaluation, suppressed_count, excluded_paths, oversized_paths,
@@ -1093,12 +1106,15 @@ def _summary_markdown(
     def hunt_title(title: str) -> str:
         return f"Living Hunt {living_range} - {title}" if living_range else title
 
+    from personas.code_reviewer.intent import intent_block as _intent_block
+    intent_prefix = _intent_block(intent_paragraph)
+
     if is_partial_coverage(evaluation.degraded_reason):
         # Reached the PR again only after grug#806: this branch existed but
         # rerun.py's fail-open re-posted "Elder skipped - partial_review" over
         # it, so nobody ever saw it. Same event, same words as the board now.
         title = "WARN Elder review coverage partial"
-        return hunt_title(title), (
+        return hunt_title(title), intent_prefix + (
             "Grug walked part of the diff - some ground did not fit one look, "
             "or a bounded cohort returned nothing usable. Validated markings "
             "from the ground Grug walked are published below; this check stays "
@@ -1113,7 +1129,7 @@ def _summary_markdown(
         # later if escalated") never happened, and this neutral is not the
         # reasoner agreeing.
         title = f"WARN Elder deep arm did not run ({evaluation.degraded_reason})"
-        return hunt_title(title), (
+        return hunt_title(title), intent_prefix + (
             "Tier-1 coder-arm review completed and its markings stand. The "
             "deep reasoner arm promised on escalation did not run this pass "
             f"- the mist: `{evaluation.degraded_reason}`. Grug not say the "
@@ -1139,7 +1155,7 @@ def _summary_markdown(
             if starved
             else ""
         )
-        return hunt_title(title), (
+        return hunt_title(title), intent_prefix + (
             "Grug Elder could not see the diff this pass. The mist: "
             f"`{evaluation.degraded_reason}`. Grug stay his club — this "
             "only counsel, merge not blocked."
@@ -1153,7 +1169,7 @@ def _summary_markdown(
         scope = _clean_review_scope(
             living_range, excluded_paths, oversized_paths, duplicate_paths,
         )
-        return hunt_title(title), ("## Markings Board\n\n" + scope) + held + hunt
+        return hunt_title(title), intent_prefix + ("## Markings Board\n\n" + scope) + held + hunt
 
     blocking = sum(1 for f in evaluation.findings if f.severity in ("high", "critical"))
     title = f"Elder markings - {blocking} blocking, {len(evaluation.findings)} total"
@@ -1165,7 +1181,7 @@ def _summary_markdown(
         f"{phase_line} "
         "Inline comments carry Fix + agent prompt on each marking.\n\n"
     )
-    summary = f"{legend}{table}{_maintainability_notes(evaluation)}{held}{hunt}"
+    summary = intent_prefix + f"{legend}{table}{_maintainability_notes(evaluation)}{held}{hunt}"
     agent = _consolidated_agent_prompt(evaluation)
     if agent:
         summary = f"{summary}\n\n{agent}"
@@ -1346,6 +1362,9 @@ def _category_for_rule(rule_name: str) -> str:
     rule = _RULES_BY_NAME.get(rule_name)
     if rule is not None:
         return rule.bug_class
+    from personas.code_reviewer.intent import RULE_CATEGORIES as _INTENT_RULE_CATEGORIES
+    if rule_name in _INTENT_RULE_CATEGORIES:
+        return _INTENT_RULE_CATEGORIES[rule_name]
     return _LINKED_ISSUE_RULE_CATEGORIES.get(rule_name, "general")
 
 
@@ -2470,6 +2489,92 @@ def _linked_issue_summary_note(linked_context: str) -> str:
     )
 
 
+def _intent_paragraph_for(
+    pr_context: PrContext,
+    hunks: tuple[DiffHunk, ...],
+    labels: tuple[str, ...],
+) -> str:
+    """Build the Intent paragraph (#1165) from title/body + linked criteria.
+
+    Pure read of already-fetched context: the linked-issue block is
+    re-parsed (no extra GitHub reads). Fail-open: a parse fault degrades
+    to no Intent block, with a debug omen so the drop is never silent.
+    """
+    try:
+        criteria = criteria_from_block(
+            str(pr_context.get("linked_issue_context") or ""),
+        )
+        changed = tuple(dict.fromkeys(h.file_path for h in hunks))
+        return build_intent_paragraph(
+            str(pr_context.get("title") or ""),
+            str(pr_context.get("body") or ""),
+            criteria,
+            labels,
+            changed,
+        )
+    except (ValueError, TypeError, KeyError) as e:  # intent is additive; never break a review
+        log.debug(
+            "elder_intent_paragraph_failed",
+            extra={"kind": type(e).__name__},
+        )
+        return ""
+
+
+def _apply_intent_scope(
+    evaluation: CodeReviewEvaluation,
+    hunks: tuple[DiffHunk, ...],
+    pr_context: PrContext,
+    labels: tuple[str, ...],
+) -> CodeReviewEvaluation:
+    """Apply the #1165 finding policy to an evaluation. Pure.
+
+    - Docs/tests-only diffs keep only correctness findings.
+    - An intent contradicting a linked criterion adds one high
+      ``intent-mismatch`` finding naming the criterion, anchored on the
+      first changed line.
+    """
+    scoped = evaluation
+    if hunks_are_docs_tests_only(hunks, labels):
+        kept = filter_docs_tests_findings(scoped.findings)
+        if len(kept) != len(scoped.findings):
+            scoped = with_findings(scoped, kept)
+    try:
+        criteria = criteria_from_block(
+            str(pr_context.get("linked_issue_context") or ""),
+        )
+        mismatch = detect_intent_mismatch(
+            str(pr_context.get("title") or ""),
+            str(pr_context.get("body") or ""),
+            criteria,
+        )
+    except (ValueError, TypeError, KeyError) as e:  # additive; never break a review
+        log.debug(
+            "elder_intent_mismatch_check_failed",
+            extra={"kind": type(e).__name__},
+        )
+        mismatch = None
+    if mismatch is not None:
+        anchor_file = hunks[0].file_path if hunks else mismatch.file
+        anchor_line = next(
+            (line for h in hunks for line in sorted(h.new_lines)),
+            mismatch.line,
+        )
+        anchored = Finding(
+            file=anchor_file,
+            line=max(1, anchor_line),
+            severity=mismatch.severity,
+            rule_name=mismatch.rule_name,
+            message=mismatch.message,
+            suggestion=None,
+        )
+        if not any(
+            f.rule_name == anchored.rule_name and f.message == anchored.message
+            for f in scoped.findings
+        ):
+            scoped = with_extra_findings(scoped, (anchored,))
+    return scoped
+
+
 def dispatch_code_review(
     payload: dict[str, Any], *, blocking: bool,
     cancel_event: threading.Event | None = None,
@@ -2516,6 +2621,15 @@ def dispatch_code_review(
         "title": str(pr.get("title") or ""),
         "body": str(pr.get("body") or ""),
     }
+    # #1165: PR labels drive intent scope (docs/tests-only, sensitive).
+    pr_labels = labels_from_pr(pr)
+    try:
+        pr_context["labels"] = list(pr_labels)  # type: ignore[typeddict-unknown-key]
+    except (TypeError, KeyError, AttributeError) as e:  # labels are additive only
+        log.debug(
+            "elder_pr_labels_store_failed",
+            extra={"kind": type(e).__name__},
+        )
 
     # Living Hunt (#557): if we already finished a review on an older head
     # for this PR, scope the LLM to the delta (prior..head) instead of the
@@ -3063,6 +3177,17 @@ def dispatch_code_review(
             },
         )
 
+    # #1165: intent scope runs AFTER every deterministic source merged
+    # (complexity, lint, claim-check) so style findings from any source are
+    # dropped on docs/tests-only diffs, and the intent-mismatch finding can
+    # still block when the stated intent contradicts a linked criterion.
+    evaluation = _apply_intent_scope(evaluation, hunks, pr_context, pr_labels)
+    if is_sensitive(pr_labels):
+        log.info(
+            "code_review_sensitive_full_depth",
+            extra={"pr": f"{owner}/{repo_name}#{pull_number}"},
+        )
+
     # Durable reviews can spend several minutes in inference. Re-check the
     # complete input after reasoning so changes to code, base, or intent cannot
     # publish a result for an obsolete snapshot. The durable caller enqueues the
@@ -3107,6 +3232,7 @@ def dispatch_code_review(
         living_range=living_range,
         living_baseline_rejected=living_baseline_rejected,
         review_phase=tier1_phase,
+        intent_paragraph=_intent_paragraph_for(pr_context, hunks, pr_labels),
     )
     if ruff_policy_dropped:
         summary += (
@@ -3582,6 +3708,14 @@ def _async_deep_decision(
     )
     if unavailable:
         return None
+    # #1165: a sensitive label forces full depth even on a small diff.
+    labels = tuple((pr_context.get("labels") or ()) if isinstance(pr_context, dict) else ())  # type: ignore[union-attr]
+    if should_force_full_depth(labels):
+        return DeepEscalationDecision(
+            escalate=True,
+            reasons=("class:sensitive",),
+            added_lines=sum(1 for h in llm_hunks for _ in h.body.splitlines() if _.startswith("+")),
+        )
     if review_is_staged(llm_hunks):
         log.info(
             "elder_async_deep_skipped_staged_review",
@@ -4103,12 +4237,14 @@ def _async_deep_append_if_needed(
     combined = with_degradation(combined, deep_eval)
 
     conclusion, event = _publish_shape(combined, mode=mode)
+    deep_labels = labels_from_pr({"labels": list(pr_context.get("labels") or ())})
     title, summary = _summary_markdown(
         combined,
         suppressed_count=deep_suppressed_count,
         living_range=living_range,
         living_baseline_rejected=living_baseline_rejected,
         review_phase="deep",
+        intent_paragraph=_intent_paragraph_for(pr_context, hunks, deep_labels),
     )
     summary += config_note
     title = f"{title} (deep append)"

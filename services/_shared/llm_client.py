@@ -206,6 +206,8 @@ class PrContext(TypedDict, total=False):
     cohort_count: int
     # Pre-rendered, already-sanitized linked-issue criteria block (#904).
     linked_issue_context: str
+    # PR labels (#1165): drives sensitive full-depth escalation.
+    labels: list[str]
 
 
 def _elapsed_ms(start_ns: int) -> int:
@@ -4922,6 +4924,15 @@ def decide_deep_escalation(
     markers = _deep_path_markers() if path_markers is None else path_markers
     added = _count_added_lines(hunks)
     reasons: list[str] = []
+
+    # #1165: a sensitive label forces full depth even on a small diff.
+    try:
+        raw_labels = (pr_context or {}).get("labels") or ()
+        normalized = {str(label).strip().lower() for label in raw_labels}
+    except (TypeError, AttributeError):
+        normalized = set()
+    if "class:sensitive" in normalized:
+        reasons.append("class:sensitive")
 
     if _deep_escalation_mode() == "on_demand":
         if _explicit_deep_request(pr_context):
