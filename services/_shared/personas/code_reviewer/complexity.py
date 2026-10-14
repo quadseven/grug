@@ -184,16 +184,21 @@ def _is_material_complexity(
     base_cyclo: int | None, base_cog: int | None,
     cyclo: int, cog: int, cyclo_cap: int, cog_cap: int,
 ) -> bool:
-    """Does this function have the required margin or PR-caused rise?
+    """Does this function earn an inline thread (medium) rather than a
+    summary note (low)?
 
-    With no base, only the absolute margin can justify an inline comment.
+    A function that already existed in the base is never material: growing
+    it, or touching one that was already over the cap, is a summary note
+    with its measured numbers. Measured on Loom lane PRs (2026-10-13/14):
+    of about 1,000 findings across 361 fix rounds, 220 were this rule, most
+    of them medium threads on long-lived functions a PR touched lightly
+    ("moved it 18->20"), each costing a full fix round. A NEW function (or
+    one measured without any base, when the base fetch failed) still opens
+    a thread once it ends `_INLINE_MARGIN` points over a cap.
     """
-    margin = cyclo - cyclo_cap >= _INLINE_MARGIN or cog - cog_cap >= _INLINE_MARGIN
-    rise = base_cyclo is not None and base_cog is not None and (
-        cyclo - base_cyclo >= _INLINE_MARGIN
-        or cog - base_cog >= _INLINE_MARGIN
-    )
-    return margin or rise
+    if base_cyclo is not None and base_cog is not None:
+        return False
+    return cyclo - cyclo_cap >= _INLINE_MARGIN or cog - cog_cap >= _INLINE_MARGIN
 
 
 def _delta_phrase(
