@@ -163,12 +163,53 @@ def test_second_push_over_cap_finding_uses_head_score_and_anchor():
     assert "moved it 19->25 cyclomatic" in finding.message
 
 
-def test_material_worsening_is_reported_with_the_delta():
+def test_existing_function_worsening_is_summary_advice_with_the_delta():
+    """An existing function made worse is advice in the summary, not a
+    thread: measured on Loom lane PRs, this rule was 220 of about 1,000
+    findings, most of them threads on long-lived functions a PR touched
+    lightly, each costing a fix round. The delta stays in the text."""
     out = scan_complexity(_one_hunk(), {"a.py": _tangled(6)},
                           base_contents={"a.py": _tangled()})
     assert len(out) == 1
     assert "moved it" in out[0].message      # states what THIS PR did
     assert "->" in out[0].message
+    assert out[0].severity == "low"
+    assert out[0].suggestion is None
+    from personas.code_reviewer.persona import CodeReviewEvaluation
+    from personas.code_reviewer.dispatch import _build_review_result, _summary_markdown
+    evaluation = CodeReviewEvaluation(findings=out, conclusion="success")
+    result, posted = _build_review_result(evaluation, head_sha="a" * 40, event="COMMENT")
+    assert result is None
+    assert posted == ()
+    assert "Maintainability notes" in _summary_markdown(evaluation)[1]
+
+
+def test_existing_function_grown_18_to_20_is_advisory_not_a_thread():
+    """The measured shape: a PR moved an existing function 18->20 against a
+    cap of 15. Before, ending five over the cap opened a medium thread."""
+    base = _tangled(-1)                      # 17 branches: cyclomatic 18
+    head = _tangled(1)                       # 19 branches: cyclomatic 20
+    out = scan_complexity(_one_hunk(), {"a.py": head},
+                          cyclomatic_cap=15, cognitive_cap=100,
+                          base_contents={"a.py": base})
+    assert len(out) == 1
+    assert "cyclomatic 20 (cap 15)" in out[0].message
+    assert "moved it 18->20 cyclomatic" in out[0].message
+    assert (out[0].severity, out[0].suggestion) == ("low", None)
+    from personas.code_reviewer.persona import CodeReviewEvaluation
+    from personas.code_reviewer.dispatch import _build_review_result
+    evaluation = CodeReviewEvaluation(findings=out, conclusion="success")
+    result, posted = _build_review_result(evaluation, head_sha="a" * 40, event="COMMENT")
+    assert result is None and posted == ()
+
+
+def test_new_function_over_cap_by_the_margin_is_a_medium_thread():
+    out = scan_complexity(_one_hunk(), {"a.py": _tangled(1)},
+                          cyclomatic_cap=15, cognitive_cap=100,
+                          base_contents={"a.py": "def other():\n    pass\n"})
+    assert len(out) == 1
+    assert "New function" in out[0].message
+    assert out[0].severity == "medium"
     from personas.code_reviewer.persona import CodeReviewEvaluation
     from personas.code_reviewer.dispatch import _build_review_result
     evaluation = CodeReviewEvaluation(findings=out, conclusion="success")
@@ -202,15 +243,15 @@ def test_one_or_two_point_rise_is_summary_advice_without_inline_suggestion():
 
 
 def test_severity_and_split_turn_on_exactly_at_the_inline_margin():
-    """A rise of 4 is one point short of the margin: low, no split, summary
-    only. A rise of 5 meets it: medium with a split. Pins the boundary so the
-    low arm cannot quietly drift back to medium."""
-    base = _tangled()
+    """For a new function, ending four points over the cap is low with no
+    split, summary only; five points over meets the margin: medium with a
+    split. Pins the boundary so the low arm cannot quietly drift back."""
+    base = "def other():\n    pass\n"
     below, at = (
-        scan_complexity(_one_hunk(), {"a.py": _tangled(rise)},
-                        cyclomatic_cap=19, cognitive_cap=100,
+        scan_complexity(_one_hunk(), {"a.py": _tangled(extra)},
+                        cyclomatic_cap=15, cognitive_cap=100,
                         base_contents={"a.py": base})
-        for rise in (4, 5)
+        for extra in (0, 1)
     )
     assert [(f.severity, f.suggestion is None) for f in below] == [("low", True)]
     assert [(f.severity, f.suggestion is None) for f in at] == [("medium", False)]
