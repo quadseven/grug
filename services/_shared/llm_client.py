@@ -4929,7 +4929,7 @@ def decide_deep_escalation(
     try:
         raw_labels = (pr_context or {}).get("labels") or ()
         normalized = {str(label).strip().lower() for label in raw_labels}
-    except Exception:
+    except (TypeError, AttributeError):
         normalized = set()
     if "class:sensitive" in normalized:
         reasons.append("class:sensitive")

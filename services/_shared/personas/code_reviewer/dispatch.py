@@ -2497,7 +2497,8 @@ def _intent_paragraph_for(
     """Build the Intent paragraph (#1165) from title/body + linked criteria.
 
     Pure read of already-fetched context: the linked-issue block is
-    re-parsed (no extra GitHub reads), so this never raises.
+    re-parsed (no extra GitHub reads). Fail-open: a parse fault degrades
+    to no Intent block, with a debug omen so the drop is never silent.
     """
     try:
         criteria = criteria_from_block(
@@ -2511,7 +2512,11 @@ def _intent_paragraph_for(
             labels,
             changed,
         )
-    except Exception:  # noqa: BLE001 - intent is additive; never break a review
+    except (ValueError, TypeError, KeyError) as e:  # intent is additive; never break a review
+        log.debug(
+            "elder_intent_paragraph_failed",
+            extra={"kind": type(e).__name__},
+        )
         return ""
 
 
@@ -2542,7 +2547,11 @@ def _apply_intent_scope(
             str(pr_context.get("body") or ""),
             criteria,
         )
-    except Exception:  # noqa: BLE001 - additive; never break a review
+    except (ValueError, TypeError, KeyError) as e:  # additive; never break a review
+        log.debug(
+            "elder_intent_mismatch_check_failed",
+            extra={"kind": type(e).__name__},
+        )
         mismatch = None
     if mismatch is not None:
         anchor_file = hunks[0].file_path if hunks else mismatch.file
@@ -2616,8 +2625,11 @@ def dispatch_code_review(
     pr_labels = labels_from_pr(pr)
     try:
         pr_context["labels"] = list(pr_labels)  # type: ignore[typeddict-unknown-key]
-    except Exception:  # noqa: BLE001 - labels are additive only
-        pass
+    except (TypeError, KeyError, AttributeError) as e:  # labels are additive only
+        log.debug(
+            "elder_pr_labels_store_failed",
+            extra={"kind": type(e).__name__},
+        )
 
     # Living Hunt (#557): if we already finished a review on an older head
     # for this PR, scope the LLM to the delta (prior..head) instead of the
