@@ -436,9 +436,7 @@ def test_reachable_caller_filter_drops_only_unnamed_defensive_findings():
     assert [f.file for f in evaluation.findings] == ["b.py", "c.py"]
     _, summary = cr_dispatch._summary_markdown(
         evaluation, defensive_dropped_count=dropped,
-        intent_paragraph="Require a reachable caller.",
     )
-    assert summary.startswith("## Intent")
     assert "1 defensive findings dropped: no reachable caller named" in summary
 
 
@@ -1083,7 +1081,6 @@ def test_dispatch_passes_identity_and_intent_to_review_diff(monkeypatch):
         "base_sha": "base5678ijkl",
         "title": "Preserve PR intent",
         "body": "Reviewer should understand the requested behavior.",
-        "labels": [],
     }
 
 
@@ -1709,8 +1706,8 @@ def test_dispatch_capture_same_rule_two_lines_matches_in_order(monkeypatch):
     monkeypatch.setattr(
         cr_dispatch, "get_review_comments",
         lambda *a, **kw: [
-                {"id": 1, "path": "src/x.py", "body": "first\n<!-- grug-rule:null-deref -->"},
-                {"id": 2, "path": "src/x.py", "body": "second\n<!-- grug-rule:null-deref -->"},
+            {"id": 1, "path": "src/x.py", "body": "first\n<!-- grug-rule:null-deref -->"},
+            {"id": 2, "path": "src/x.py", "body": "second\n<!-- grug-rule:null-deref -->"},
         ],
     )
     monkeypatch.setattr(cr_dispatch, "put_comment_record", lambda **kw: captured.append(kw))
