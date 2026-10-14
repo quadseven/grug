@@ -572,6 +572,13 @@ _PREAMBLE_HEAD = (
     "can point to a specific changed line for — not stylistic preferences. "
     "If the diff is clean, return an empty findings list.\n"
 )
+
+_REACHABLE_CALLER_RULE = (
+    "Before asking for a guard, validation, retry, or try/except, name the "
+    "specific caller or input that can reach the unguarded state. If none "
+    "can because the value is validated upstream in this diff or file, comes "
+    "from a constant, or the type forbids that state, do not raise the finding."
+)
 # WHOLE-TABLET WISDOM (#336). Two false positives on infra PR #1149 came from
 # judging a hunk blind: (1) flagging "no cleanup" for a resource when an
 # `if: always()` rm lived ~50 lines below the hunk, and (2) flagging
@@ -732,6 +739,8 @@ def build_system_prompt(variant: PromptVariant = "v1", extra_rules: str = "") ->
         )
     preamble = (
         _PREAMBLE_HEAD
+        + _REACHABLE_CALLER_RULE
+        + "\n"
         + _CONFIDENCE_CLAUSES[variant]
         + _MITIGATION_SCAN
         + _PREAMBLE_TAIL
