@@ -125,6 +125,14 @@ def test_block_is_labelled_data_and_numbers_criteria():
     assert "#904 criterion 2 [ticked]: Second criterion about logging" in block
 
 
+def test_elder_header_explains_negated_criteria_and_intent_mismatch_evidence():
+    header = linked_issue._HEADER
+    assert "a criterion that forbids X" in header
+    assert "removes or prevents X" in header
+    assert "quote the exact criterion" in header
+    assert "name the diff hunk" in header
+
+
 def test_block_empty_when_no_criteria():
     assert render_linked_issue_block({}) == ""
     assert render_linked_issue_block({5: []}) == ""
