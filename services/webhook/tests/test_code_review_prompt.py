@@ -175,6 +175,12 @@ def test_prompt_teaches_whole_file_mitigation_scan():
     assert "finally" in p
 
 
+def test_prompt_requires_reachable_caller_before_defensive_finding():
+    prompt = crp.build_system_prompt()
+    assert "specific caller or input that can reach the unguarded state" in prompt
+    assert "do not raise the finding" in prompt
+
+
 def test_prompt_teaches_path_is_not_secret():
     """#336: a file PATH is not a secret value — closes the #1149 CRITICAL
     secret-in-log false positive."""

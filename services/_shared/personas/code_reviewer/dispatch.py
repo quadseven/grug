@@ -118,6 +118,34 @@ from adapters.install_store import (  # type: ignore
     put_comment_record,
 )
 
+
+# Defensive model rules eligible for the reachable-caller post-filter. Security
+# rules and deterministic linter rule IDs are intentionally absent.
+_DEFENSIVE_RULES = frozenset({
+    "missing-error-handling", "missing-timeout", "missing-pagination",
+    "missing-validation", "unchecked-input", "null-deref",
+    "off-by-one-or-bounds", "type-safety-gap", "subprocess-no-timeout",
+    "hot-path-unguarded",
+})
+_REACHABLE_SOURCE_RE = re.compile(
+    r"\b(?:caller|input)\s+(?:`[^`]+`|[A-Za-z_][\w.]*)", re.IGNORECASE,
+)
+
+
+def _drop_unreachable_defensive_findings(evaluation: CodeReviewEvaluation):
+    dropped = tuple(
+        f for f in evaluation.findings
+        if f.rule_name in _DEFENSIVE_RULES
+        and f.severity in ("low", "medium")
+        and not _REACHABLE_SOURCE_RE.search(f.message)
+    )
+    if not dropped:
+        return evaluation, 0
+    removed = {id(f) for f in dropped}
+    return with_findings(
+        evaluation, tuple(f for f in evaluation.findings if id(f) not in removed),
+    ), len(dropped)
+
 log = logging.getLogger(f"{os.getenv('DD_SERVICE', 'grug')}.persona.code_reviewer")
 
 # Grug's face on the review comment. This dispatch IS the Elder (code-reviewer)
@@ -1048,6 +1076,7 @@ def _summary_markdown(
     living_range: str = "",
     living_baseline_rejected: str = "",
     review_phase: Literal["tier1", "deep", "dual"] = "dual",
+    defensive_dropped_count: int = 0,
 ) -> tuple[str, str]:
     """Render a (title, summary) pair for the check-run output.
 
@@ -1068,6 +1097,11 @@ def _summary_markdown(
     held = _review_transparency(
         evaluation, suppressed_count, excluded_paths, oversized_paths,
         duplicate_paths,
+    )
+    defensive_note = (
+        f"\n\n{defensive_dropped_count} defensive findings dropped: "
+        "no reachable caller named"
+        if defensive_dropped_count else ""
     )
     hunt = (
         (
@@ -1103,7 +1137,7 @@ def _summary_markdown(
             "or a bounded cohort returned nothing usable. Validated markings "
             "from the ground Grug walked are published below; this check stays "
             "advisory. Coverage detail is in the table above."
-        ) + held + hunt
+        ) + held + hunt + defensive_note
     if review_phase == "deep" and is_blackout(evaluation.degraded_reason):
         # grug#848: a blackout in the deep phase is the REASONER arm's -
         # `_async_deep_decision` never starts the deep append over a
@@ -1119,7 +1153,7 @@ def _summary_markdown(
             f"- the mist: `{evaluation.degraded_reason}`. Grug not say the "
             "deeper look agreed; it never looked. This only counsel, merge "
             "not blocked."
-        ) + held + hunt
+        ) + held + hunt + defensive_note
     if evaluation.degraded_reason:
         # grug#985: when some cohorts were never opened (starved of budget),
         # the headline must not read like every cohort ran and broke.
@@ -1143,7 +1177,7 @@ def _summary_markdown(
             "Grug Elder could not see the diff this pass. The mist: "
             f"`{evaluation.degraded_reason}`. Grug stay his club — this "
             "only counsel, merge not blocked."
-        ) + starved_note + held + hunt
+        ) + starved_note + held + hunt + defensive_note
     if not evaluation.findings:
         title = (
             "Elder clear - no markings"
@@ -1153,7 +1187,7 @@ def _summary_markdown(
         scope = _clean_review_scope(
             living_range, excluded_paths, oversized_paths, duplicate_paths,
         )
-        return hunt_title(title), ("## Markings Board\n\n" + scope) + held + hunt
+        return hunt_title(title), ("## Markings Board\n\n" + scope) + held + hunt + defensive_note
 
     blocking = sum(1 for f in evaluation.findings if f.severity in ("high", "critical"))
     title = f"Elder markings - {blocking} blocking, {len(evaluation.findings)} total"
@@ -1165,7 +1199,7 @@ def _summary_markdown(
         f"{phase_line} "
         "Inline comments carry Fix + agent prompt on each marking.\n\n"
     )
-    summary = f"{legend}{table}{_maintainability_notes(evaluation)}{held}{hunt}"
+    summary = f"{legend}{table}{_maintainability_notes(evaluation)}{held}{hunt}{defensive_note}"
     agent = _consolidated_agent_prompt(evaluation)
     if agent:
         summary = f"{summary}\n\n{agent}"
@@ -2919,7 +2953,9 @@ def dispatch_code_review(
             },
         )
 
-    evaluation = evaluate_diff(hunks, llm_response)
+    evaluation, defensive_dropped_count = _drop_unreachable_defensive_findings(
+        evaluate_diff(hunks, llm_response),
+    )
 
     # NOTE (#466, ADR-0012): the deterministic security suite (SAST + SCA +
     # secret + IaC scans -> exploitability judge) that used to merge into
@@ -3107,6 +3143,7 @@ def dispatch_code_review(
         living_range=living_range,
         living_baseline_rejected=living_baseline_rejected,
         review_phase=tier1_phase,
+        defensive_dropped_count=defensive_dropped_count,
     )
     if ruff_policy_dropped:
         summary += (

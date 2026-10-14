@@ -421,6 +421,25 @@ def test_summary_markdown_renders_findings_table():
     ) >= 2
 
 
+def test_reachable_caller_filter_drops_only_unnamed_defensive_findings():
+    from personas.code_reviewer.persona import CodeReviewEvaluation, Finding
+
+    findings = (
+        Finding("a.py", 1, "medium", "missing-error-handling", "Add handling.", None),
+        Finding("b.py", 2, "medium", "missing-error-handling", "caller `load_record` reaches this with malformed input.", None),
+        Finding("c.py", 3, "low", "ruff-F821", "Undefined name.", None),
+    )
+    evaluation, dropped = cr_dispatch._drop_unreachable_defensive_findings(
+        CodeReviewEvaluation(findings=findings, conclusion="success"),
+    )
+    assert dropped == 1
+    assert [f.file for f in evaluation.findings] == ["b.py", "c.py"]
+    _, summary = cr_dispatch._summary_markdown(
+        evaluation, defensive_dropped_count=dropped,
+    )
+    assert "1 defensive findings dropped: no reachable caller named" in summary
+
+
 def test_summary_markdown_reports_exact_coverage_and_reviewability_debt():
     from personas.code_reviewer.persona import CodeReviewEvaluation
 
@@ -1674,8 +1693,8 @@ def test_dispatch_capture_same_rule_two_lines_matches_in_order(monkeypatch):
     llm = LlmReviewResponse(
         kind="reviewed",
         findings=(
-            LlmFinding(path="src/x.py", line=2, rule="null-deref", severity="medium", message="first"),  # type: ignore[arg-type]
-            LlmFinding(path="src/x.py", line=3, rule="null-deref", severity="medium", message="second"),  # type: ignore[arg-type]
+            LlmFinding(path="src/x.py", line=2, rule="null-deref", severity="medium", message="caller `load_first` reaches first null value"),  # type: ignore[arg-type]
+            LlmFinding(path="src/x.py", line=3, rule="null-deref", severity="medium", message="caller `load_second` reaches second null value"),  # type: ignore[arg-type]
         ),
         backend_used=Backend.POOLSIDE,
         review_span_context={"span_id": "s", "trace_id": "t"},
@@ -1687,15 +1706,18 @@ def test_dispatch_capture_same_rule_two_lines_matches_in_order(monkeypatch):
     monkeypatch.setattr(
         cr_dispatch, "get_review_comments",
         lambda *a, **kw: [
-            {"id": 1, "path": "src/x.py", "body": "first\n<!-- grug-rule:null-deref -->"},
-            {"id": 2, "path": "src/x.py", "body": "second\n<!-- grug-rule:null-deref -->"},
+                {"id": 1, "path": "src/x.py", "body": "first\n<!-- grug-rule:null-deref -->"},
+                {"id": 2, "path": "src/x.py", "body": "second\n<!-- grug-rule:null-deref -->"},
         ],
     )
     monkeypatch.setattr(cr_dispatch, "put_comment_record", lambda **kw: captured.append(kw))
     with patch("httpx.get", return_value=_diff_response()):
         cr_dispatch.dispatch_code_review(_payload(), blocking=False)
     by_id = {c["comment_id"]: c["finding_text"] for c in captured}
-    assert by_id == {1: "first", 2: "second"}
+    assert by_id == {
+        1: "caller `load_first` reaches first null value",
+        2: "caller `load_second` reaches second null value",
+    }
 
 
 def test_dispatch_capture_zero_alarm_logged(monkeypatch, caplog):
