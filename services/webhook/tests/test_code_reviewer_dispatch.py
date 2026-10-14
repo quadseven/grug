@@ -436,7 +436,9 @@ def test_reachable_caller_filter_drops_only_unnamed_defensive_findings():
     assert [f.file for f in evaluation.findings] == ["b.py", "c.py"]
     _, summary = cr_dispatch._summary_markdown(
         evaluation, defensive_dropped_count=dropped,
+        intent_paragraph="Require a reachable caller.",
     )
+    assert summary.startswith("## Intent")
     assert "1 defensive findings dropped: no reachable caller named" in summary
 
 
@@ -1081,6 +1083,7 @@ def test_dispatch_passes_identity_and_intent_to_review_diff(monkeypatch):
         "base_sha": "base5678ijkl",
         "title": "Preserve PR intent",
         "body": "Reviewer should understand the requested behavior.",
+        "labels": [],
     }
 
 
