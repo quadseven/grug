@@ -18,6 +18,8 @@ the tests intercept keeps working.
 """
 from __future__ import annotations
 
+from collections.abc import Callable
+
 from personas.tpm.dor_checks import IssueFacts, IssueFactsFetcher, IssueFetcher
 
 
@@ -51,6 +53,35 @@ def build_issue_fetcher(
         return with_install_token_retry(installation_id, _get)
 
     return _fetch_issue_body
+
+
+def build_issue_details_fetcher(
+    *, installation_id: int, owner: str, repo: str,
+) -> Callable[[int], dict[str, str]]:
+    """Return a `number -> {title, body}` callable for review enrichment."""
+
+    def _fetch_issue_details(number: int) -> dict[str, str]:
+        from urllib.parse import quote
+        import httpx  # type: ignore
+
+        def _get(token: str) -> dict[str, str]:
+            response = httpx.get(
+                f"https://api.github.com/repos/{quote(owner, safe='')}/"
+                f"{quote(repo, safe='')}/issues/{int(number)}",
+                headers={
+                    "Authorization": f"token {token}",
+                    "Accept": "application/vnd.github+json",
+                },
+                timeout=10,
+            )
+            response.raise_for_status()
+            issue = response.json() or {}
+            return {"title": issue.get("title") or "", "body": issue.get("body") or ""}
+
+        from github_app_auth import with_install_token_retry  # type: ignore
+        return with_install_token_retry(installation_id, _get)
+
+    return _fetch_issue_details
 
 
 def issue_facts(token: str, owner: str, repo: str, number: int) -> IssueFacts:
