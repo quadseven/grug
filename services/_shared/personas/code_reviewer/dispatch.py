@@ -104,7 +104,7 @@ from personas.code_reviewer.linked_issue import (
 )
 from personas.tpm.ticket_compliance import closes_refs
 from personas.code_reviewer.repo_docs import build_repo_docs_context
-from personas.tpm.issue_fetcher import build_issue_fetcher
+from personas.tpm.issue_fetcher import build_issue_details_fetcher
 from personas.code_reviewer.omen import build_runtime_context
 from personas.code_reviewer.judge import (
     eval_tags, grade_findings, partition_findings, partition_refuted,
@@ -2499,7 +2499,7 @@ def _attach_linked_issue_context(
     try:
         linked = build_linked_issue_context(
             str(pr_context.get("body") or ""),
-            fetch_issue=build_issue_fetcher(
+            fetch_issue=build_issue_details_fetcher(
                 installation_id=installation_id, owner=owner, repo=repo_name,
             ),
             owner=owner,

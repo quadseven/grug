@@ -234,6 +234,43 @@ def test_build_non_string_issue_body_is_a_failure_not_a_crash():
     ) is None
 
 
+def test_health_ticket_reserve_change_context_requires_symptom_only_review():
+    from personas.code_reviewer.linked_issue import build_linked_issue_context
+
+    issue = {
+        "title": "Refund the waiting members",
+        "body": (
+            "<!-- loom:health key=bank-balance -->\n"
+            "## Finding evidence\n"
+            "> The guild bank holds under a gold while 65 members wait on refunds."
+        ),
+    }
+    block = build_linked_issue_context(
+        "Closes #42", fetch_issue=lambda _number: issue,
+    )
+    assert block is not None
+    assert "The guild bank holds under a gold while 65 members wait on refunds" in block
+    assert "symptom-only" in block
+    assert "reserve held back" in block
+    assert "emit a high" in block
+
+
+def test_health_ticket_context_distinguishes_improving_the_outcome():
+    from personas.code_reviewer.linked_issue import build_linked_issue_context
+
+    issue = {
+        "title": "Health: store income remains low",
+        "body": "> The store receives too little income to serve its customers.",
+    }
+    block = build_linked_issue_context(
+        "Closes #43", fetch_issue=lambda _number: issue,
+    )
+    assert block is not None
+    assert "health finding evidence" in block.lower()
+    assert "improves the outcome" in block
+    assert "not symptom-only" in block
+
+
 # --- prompt wiring ----------------------------------------------------------
 
 
@@ -312,7 +349,7 @@ def test_dispatch_puts_block_in_pr_context_and_failure_degrades(monkeypatch):
     payload = _payload()
     payload["pull_request"]["body"] = "Refs myorg/myrepo" "#904"  # joined at parse time: keeps a literal cross-repo ref out of the source
     monkeypatch.setattr(
-        cr_dispatch, "build_issue_fetcher",
+        cr_dispatch, "build_issue_details_fetcher",
         lambda **kw: (lambda n: ISSUE),
     )
     with patch("httpx.get", return_value=_diff_response()):
@@ -323,7 +360,7 @@ def test_dispatch_puts_block_in_pr_context_and_failure_degrades(monkeypatch):
     def broken(**kw):
         raise RuntimeError("no token")
 
-    monkeypatch.setattr(cr_dispatch, "build_issue_fetcher", broken)
+    monkeypatch.setattr(cr_dispatch, "build_issue_details_fetcher", broken)
     with patch("httpx.get", return_value=_diff_response()):
         cr_dispatch.dispatch_code_review(payload, blocking=False)
     assert "linked_issue_context" not in seen[-1]

@@ -15,7 +15,7 @@ from unittest.mock import patch
 import httpx
 import pytest
 
-from personas.tpm.issue_fetcher import build_issue_fetcher
+from personas.tpm.issue_fetcher import build_issue_details_fetcher, build_issue_fetcher
 
 _REPO_ROOT = Path(__file__).resolve().parents[3]
 
@@ -60,6 +60,23 @@ def test_fetcher_null_body_reads_as_empty():
     with patch("github_app_auth.with_install_token_retry", side_effect=lambda _i, fn: fn("t")), \
          patch("httpx.get", return_value=_R()):
         assert fetcher(1) == ""
+
+
+def test_details_fetcher_reads_title_and_body():
+    fetcher = build_issue_details_fetcher(installation_id=1, owner="o", repo="r")
+
+    class _R:
+        def raise_for_status(self):
+            pass
+
+        def json(self):
+            return {"title": "Health: low income", "body": "quoted evidence"}
+
+    with patch(
+        "github_app_auth.with_install_token_retry",
+        side_effect=lambda _i, fn: fn("t"),
+    ), patch("httpx.get", return_value=_R()):
+        assert fetcher(1) == {"title": "Health: low income", "body": "quoted evidence"}
 
 
 def test_fetcher_raises_on_http_error_so_check_can_fail_open(mock_transport_client):
