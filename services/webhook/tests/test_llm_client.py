@@ -655,16 +655,17 @@ def test_deep_review_consults_both_arms_and_merges_findings(monkeypatch) -> None
 
 def test_deep_review_runs_both_arms_concurrently_not_sequentially(monkeypatch) -> None:
     """Arm parallelization: deep mode's two arms must overlap in wall-clock,
-    not sum. Each mocked backend call sleeps 0.2s; sequential execution would
-    take >=0.4s, concurrent execution should finish close to 0.2s. A generous
-    upper bound (0.35s) absorbs scheduling/GIL-release jitter without letting
-    a regression back to sequential silently pass."""
+    not sum. Each mocked backend call sleeps 0.5s; sequential execution would
+    take >=1.0s, concurrent execution should finish close to 0.5s. The upper
+    bound (0.9s) leaves 0.4s for `review_diff`'s own overhead on a loaded
+    machine (a 0.15s margin flaked) while still failing on any regression
+    back to sequential."""
     import time
 
     monkeypatch.setenv("GRUG_REVIEW_DEPTH", "deep")
 
     def respond(url, **kwargs):
-        time.sleep(0.2)
+        time.sleep(0.5)
         content = '{"findings": []}'
         body = _openai_json_response(content)
         body["model"] = "poolside/Laguna-S-2.1-NVFP4" if _is_reasoner(kwargs) else "qwen3-coder-next:q8_0"
@@ -677,7 +678,7 @@ def test_deep_review_runs_both_arms_concurrently_not_sequentially(monkeypatch) -
 
     assert mock_post.call_count == 2
     assert out.kind == "reviewed"
-    assert elapsed < 0.35, f"expected concurrent arms (~0.2s), took {elapsed:.3f}s"
+    assert elapsed < 0.9, f"expected concurrent arms (~0.5s), took {elapsed:.3f}s"
 
 
 def test_call_backend_cancel_event_aborts_in_flight_request() -> None:

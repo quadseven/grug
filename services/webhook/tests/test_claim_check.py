@@ -5,9 +5,8 @@ from __future__ import annotations
 from personas.code_reviewer.claim_check import (
     filter_novel_claim_findings,
     scan_claim_checks,
-    _added_lines,
 )
-from personas.code_reviewer.diff_parser import DiffHunk
+from personas.code_reviewer.diff_parser import DiffHunk, added_lines
 from personas.code_reviewer.persona import Finding
 
 
@@ -204,7 +203,7 @@ class TestAddedLinesWalk:
             file_path="x.yaml", new_start=1,
             new_lines=frozenset({1, 2}), body=body,
         )
-        lines = _added_lines(h)
+        lines = added_lines(h)
         assert lines == [(1, "# caps medium at 5s"), (2, "more")]
 
     def test_plus_plus_content_is_added_line(self):
@@ -214,7 +213,7 @@ class TestAddedLinesWalk:
             file_path="x.txt", new_start=10,
             new_lines=frozenset({10}), body=body,
         )
-        lines = _added_lines(h)
+        lines = added_lines(h)
         assert lines == [(10, "++not a file header, content")]
 
 

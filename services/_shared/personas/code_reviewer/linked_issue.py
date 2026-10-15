@@ -56,7 +56,8 @@ _BARE_REF_RE = re.compile(r"\b(?:refs?|relates\s+to)\s+#(\d+)\b", re.IGNORECASE)
 _PART_OF_RE = re.compile(r"\bpart\s+of\s+#(\d+)\b", re.IGNORECASE)
 _BULLET_RE = re.compile(r"^\s*[-*]\s+(?:\[( |x|X)\]\s+)?(\S.*?)\s*$")
 
-# Display category for the two findings the block asks for (#904). They are
+# Display category for the two block-only findings (#904); the block also
+# asks for `intent-mismatch` (#1179), which RULES already defines. They are
 # named in the block, not in `code_review_prompt.RULES`: the static prompt is
 # pinned by the Elder eval baseline, and a conditional rule must not tax every
 # review (or force a re-record) when no issue is linked. Unknown to RULES, so
@@ -143,11 +144,19 @@ _HEADER = (
     "A criterion that names a test, says '(tests)', or says it fails on main/"
     "without the change is `acceptance-criterion-unmet` when no added or "
     "changed test in the diff exercises it. A ticked box is the author's "
-    "claim, not evidence."
+    "claim, not evidence. For each criterion, name the diff hunk that "
+    "satisfies it. When no hunk can satisfy a criterion that describes "
+    "runtime behavior (for example, the only new code is a function nothing "
+    "outside tests calls), report a high `intent-mismatch` that quotes the "
+    "unmet criterion and the PR sentence that claims it. Criteria starting "
+    "'Live:' are checked after deploy: do not map them to hunks."
 )
 
 
 _OMITTED = "\n... (further criteria omitted)"
+_RENDERED_CRITERION_RE = re.compile(
+    r"^#(\d+) criterion (\d+) \[(?:open|ticked)\]: (.*)$", re.MULTILINE,
+)
 
 
 def render_linked_issue_block(criteria_by_issue: dict[int, list[Criterion]]) -> str:
@@ -198,3 +207,12 @@ def build_linked_issue_context(
         if criteria:
             criteria_by_issue[number] = criteria
     return render_linked_issue_block(criteria_by_issue) or None
+
+
+def rendered_criteria(block: str) -> list[tuple[int, int, str]]:
+    """(issue, criterion number, text) for each criterion line in a block
+    `render_linked_issue_block` produced. The text is already cleaned."""
+    return [
+        (int(m.group(1)), int(m.group(2)), m.group(3))
+        for m in _RENDERED_CRITERION_RE.finditer(block or "")
+    ]

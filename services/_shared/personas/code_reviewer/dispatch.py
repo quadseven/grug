@@ -77,6 +77,9 @@ from personas.code_reviewer.claim_check import (
 from personas.code_reviewer.model_metrics import emit_finding_posted
 from personas import board
 from personas.code_reviewer.complexity import ComplexityScan, scan_complexity_full
+from personas.code_reviewer.criteria_coverage import (
+    LinkedCriterion, scan_criteria_coverage,
+)
 from personas.code_reviewer.lint import scan_ruff
 from personas.code_reviewer.suggestion import checked_suggestion
 from personas.code_reviewer.repo_ruff_policy import parse_repo_ruff_policy
@@ -96,7 +99,10 @@ from personas.code_reviewer.repo_config import (
 from personas.code_reviewer.linked_issue import (
     RULE_CATEGORIES as _LINKED_ISSUE_RULE_CATEGORIES,
 )
-from personas.code_reviewer.linked_issue import build_linked_issue_context
+from personas.code_reviewer.linked_issue import (
+    build_linked_issue_context, rendered_criteria,
+)
+from personas.tpm.ticket_compliance import closes_refs
 from personas.code_reviewer.repo_docs import build_repo_docs_context
 from personas.tpm.issue_fetcher import build_issue_fetcher
 from personas.code_reviewer.omen import build_runtime_context
@@ -2514,18 +2520,44 @@ def _attach_linked_issue_context(
 
 def _linked_issue_summary_note(linked_context: str) -> str:
     """Summarize which linked issue criteria were included in the review."""
-    if not linked_context:
+    criteria = rendered_criteria(linked_context)
+    if not criteria:
         return ""
-    issue_numbers = list(dict.fromkeys(
-        re.findall(r"^#(\d+) criterion ", linked_context, re.M),
-    ))
-    criteria_count = len(re.findall(r"^#\d+ criterion \d+ ", linked_context, re.M))
-    if not issue_numbers:
-        return ""
+    issue_numbers = list(dict.fromkeys(issue for issue, _, _ in criteria))
     return (
         "\n\nLinked issue criteria read: "
         + ", ".join(f"#{number}" for number in issue_numbers)
-        + f" ({criteria_count} criteria)."
+        + f" ({len(criteria)} criteria)."
+    )
+
+
+def _merge_criteria_coverage(
+    evaluation: CodeReviewEvaluation, hunks: tuple[DiffHunk, ...],
+    file_contents: dict[str, str], pr_context: PrContext, *,
+    correctness_only: bool,
+) -> CodeReviewEvaluation:
+    """Merge the deterministic criteria-coverage findings (#1179).
+
+    Only criteria of issues the PR CLOSES count: a `Refs`/`Part of` link
+    may be one slice of several and is not expected to meet them all.
+    Dead-code findings follow the correctness-only scope the LLM's do."""
+    body = str(pr_context.get("body") or "")
+    closed = set(closes_refs(body))
+    criteria = tuple(
+        LinkedCriterion(issue, number, text)
+        for issue, number, text in rendered_criteria(
+            str(pr_context.get("linked_issue_context") or ""),
+        )
+        if issue in closed
+    )
+    found = scan_criteria_coverage(
+        hunks, file_contents, criteria=criteria,
+        pr_title=str(pr_context.get("title") or ""), pr_body=body,
+    )
+    if correctness_only:
+        found = tuple(f for f in found if f.rule_name != "dead-code")
+    return with_extra_findings(
+        evaluation, filter_novel_claim_findings(found, evaluation.findings),
     )
 
 
@@ -2712,6 +2744,9 @@ def dispatch_code_review(
             living_range = ""
         pr_context["base_sha"] = living_prior_sha or base_sha
         hunks = parse_diff(diff_text)
+        # Criteria coverage (#1179) judges the WHOLE diff; any hunk dropped
+        # below (excluded, ignored, oversized, duplicate) voids that.
+        parsed_hunk_count = len(hunks)
         paths = tuple(hunk.file_path for hunk in hunks)
         def is_documentation(path: str) -> bool:
             path = path.lower()
@@ -3194,6 +3229,22 @@ def dispatch_code_review(
                 "pr": f"{owner}/{repo_name}#{pull_number}",
                 "count": len(claim_findings),
             },
+        )
+
+    # Deterministic criteria coverage (#1179): a new function nothing calls,
+    # and closing-issue criteria no hunk can satisfy. Pure; never aborts.
+    # A living delta or a narrowed hunk set hides callers and runtime
+    # hunks, so the check runs only when Elder saw the whole diff.
+    try:
+        if not living_range and len(hunks) == parsed_hunk_count:
+            evaluation = _merge_criteria_coverage(
+                evaluation, hunks, file_contents, pr_context,
+                correctness_only=correctness_only,
+            )
+    except Exception as e:  # noqa: BLE001 - enrichment must never abort a review
+        log.info(
+            "code_review_criteria_coverage_failed",
+            extra={"pr": f"{owner}/{repo_name}#{pull_number}", "kind": type(e).__name__},
         )
 
     # Durable reviews can spend several minutes in inference. Re-check the
