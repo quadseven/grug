@@ -252,6 +252,30 @@ def split_oversized_hunks(
     return tuple(kept), tuple(oversized)
 
 
+def added_lines(hunk: DiffHunk) -> list[tuple[int, str]]:
+    """New-side (lineno, text) for each ADDED line in a hunk.
+
+    Unified-diff walk: advance only on added/context lines. Annotation
+    lines (backslash + " No newline at end of file") never advance. A raw
+    line starting with ``+`` is always an addition (including content that
+    itself begins with ``++``) - do not special-case ``+++`` as a header
+    inside the hunk body (file headers live outside DiffHunk.body).
+    """
+    out: list[tuple[int, str]] = []
+    lineno = hunk.new_start
+    for raw in hunk.body.splitlines():
+        if raw.startswith("@@") or raw.startswith(chr(92)):
+            continue  # header / no-newline marker - no new-side advance
+        if raw.startswith("+"):
+            out.append((lineno, raw[1:]))
+            lineno += 1
+        elif raw.startswith("-"):
+            continue
+        else:
+            lineno += 1  # context (leading space or empty)
+    return out
+
+
 def parse_diff(unified_diff: str) -> tuple[DiffHunk, ...]:
     """Parse a unified diff into structured hunks.
 
