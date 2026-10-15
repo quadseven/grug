@@ -20,10 +20,7 @@ _GH_API = "https://api.github.com"
 GRUG_RULESET_PREFIX = "Grug - "
 GRUG_RULESET_PREFIXES = (GRUG_RULESET_PREFIX, "Grug " + "\u2014" + " ")
 
-# `permission_denied` (grug#1001): GitHub 403'd a check for a reason that is
-# not a rate limit (the App grant lacks administration access). Grug cannot see
-# enforcement there, which is different from "nothing enforces the check".
-EnforcementState = Literal["grug_managed", "external", "none", "permission_denied"]
+EnforcementState = Literal["grug_managed", "external", "none"]
 
 
 class EnforcementDetection(NamedTuple):
@@ -91,11 +88,6 @@ def _is_rate_limited(resp: httpx.Response) -> bool:
             or resp.headers.get("x-ratelimit-remaining") == "0"
         )
     return False
-
-
-def _is_permission_denied(resp: httpx.Response) -> bool:
-    """A 403 that is NOT a rate-limit signal: the App grant lacks the access."""
-    return resp.status_code == 403 and not _is_rate_limited(resp)
 
 
 def _retry_delay(attempt: int, resp: httpx.Response | None) -> float:
@@ -467,6 +459,23 @@ def list_installation_repos(install_token: str) -> list[dict]:
                     extra={"repo": r.get("full_name", "")},
                 )
                 continue
+            # EMPTY repos are excluded for the same denominator reason.
+            # Enforcement creation is deliberately deferred on a repo with
+            # no commits (see ensure_enforcement): a required check on an
+            # empty repo can never be satisfied, and creating it would
+            # deadlock the first push. An empty repo has no PRs to merge,
+            # so there is no enforcement to be missing - same logic as the
+            # archived exclusion above. The exclusion is self-correcting:
+            # the moment the repo gains a commit, `size` goes nonzero and
+            # it rejoins the denominator, so a repo that somehow never
+            # gets its enforcement still alerts once it has content.
+            # `size` absent defaults to included (never wrongly exclude).
+            if r.get("size", 1) == 0:
+                log.info(
+                    "installation_repo_empty_skipped",
+                    extra={"repo": r.get("full_name", "")},
+                )
+                continue
             out.append({
                 "id": r.get("id"),
                 "full_name": r.get("full_name", ""),
@@ -477,6 +486,22 @@ def list_installation_repos(install_token: str) -> list[dict]:
     else:
         log.warning("installation_repos_pagination_cap", extra={"count": len(out)})
     return out
+
+
+def repo_is_empty(install_token: str, owner: str, repo: str) -> bool:
+    """True when the repo has no commits at all.
+
+    `size == 0` on the repo object is the signal: GitHub reports size in KB
+    and a repo with zero commits has nothing to measure. Used by enforcement
+    to avoid deadlocking brand-new repos (see ensure_enforcement).
+    """
+    resp = _get_with_retry(
+        f"{_GH_API}/repos/{quote(owner, safe='')}/{quote(repo, safe='')}",
+        install_token=install_token,
+        op="repo_is_empty",
+    )
+    resp.raise_for_status()
+    return (resp.json() or {}).get("size", 0) == 0
 
 
 def _match_enforcing_ruleset(
@@ -562,18 +587,9 @@ def detect_enforcement(
     most repos have 1-3 rulesets total. Short-circuits on the first
     grug_match, since that already wins the final classification below.
     """
-    try:
-        ruleset_hit = _match_enforcing_ruleset(
-            install_token, owner, repo, check_name, stored_ruleset_id,
-        )
-    except httpx.HTTPStatusError as e:
-        if not _is_permission_denied(e.response):
-            raise
-        log.warning(
-            "enforcement_permission_denied",
-            extra={"owner": owner, "repo": repo, "op": "rulesets"},
-        )
-        return EnforcementDetection("permission_denied", None)
+    ruleset_hit = _match_enforcing_ruleset(
+        install_token, owner, repo, check_name, stored_ruleset_id,
+    )
     if ruleset_hit is not None:
         return ruleset_hit
 
@@ -591,12 +607,6 @@ def detect_enforcement(
     except httpx.HTTPStatusError as e:
         if e.response.status_code not in (404, 403):
             raise
-        if _is_permission_denied(e.response):
-            log.warning(
-                "enforcement_permission_denied",
-                extra={"owner": owner, "repo": repo, "op": "legacy_branch_protection"},
-            )
-            return EnforcementDetection("permission_denied", None)
         log.debug(
             "legacy_branch_protection_unavailable",
             extra={"owner": owner, "repo": repo, "branch": branch,

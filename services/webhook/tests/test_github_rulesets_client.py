@@ -465,45 +465,19 @@ def test_detect_legacy_transport_error_returns_none():
     assert result.state == "none"
 
 
-def _permission_403():
-    resp = MagicMock(spec=httpx.Response)
-    resp.status_code = 403
-    resp.headers = {}  # permission 403, not rate-limited -> no retry
-    resp.raise_for_status = MagicMock(
-        side_effect=httpx.HTTPStatusError("forbidden", request=MagicMock(), response=resp)
+def test_detect_none_when_legacy_403s():
+    """No rulesets, legacy endpoint 403s (insufficient perms) → none, not crash.
+    Peer-review finding: GitHub returns 403 when App lacks administration:read."""
+    rulesets_resp = _ok_response([])
+    legacy_403 = MagicMock(spec=httpx.Response)
+    legacy_403.status_code = 403
+    legacy_403.headers = {}  # permission 403, not rate-limited → no retry
+    legacy_403.raise_for_status = MagicMock(
+        side_effect=httpx.HTTPStatusError("forbidden", request=MagicMock(), response=legacy_403)
     )
-    return resp
 
-
-def test_detect_permission_denied_when_legacy_403s():
-    """grug#1001: no rulesets and the legacy endpoint 403s (the App lacks
-    administration:read). That is NOT "nothing enforces the check" - grug
-    cannot see - so it must not fold into `none`."""
-    responses = [_ok_response([]), _permission_403()]
+    responses = [rulesets_resp, legacy_403]
     with patch("httpx.get", side_effect=responses):
-        result = detect_enforcement("tok", "o", "r", "main", "Grug - Chief")
-
-    assert result.state == "permission_denied"
-    assert result.ruleset_id is None
-
-
-def test_detect_permission_denied_when_ruleset_list_403s():
-    """grug#1001: a permission 403 on the rulesets list is the same outcome."""
-    with patch("httpx.get", side_effect=[_permission_403()]):
-        result = detect_enforcement("tok", "o", "r", "main", "Grug - Chief")
-
-    assert result.state == "permission_denied"
-
-
-def test_detect_legacy_404_is_still_none():
-    """grug#1001: a 404 means the branch has no protection - a real `none`."""
-    legacy_404 = MagicMock(spec=httpx.Response)
-    legacy_404.status_code = 404
-    legacy_404.headers = {}
-    legacy_404.raise_for_status = MagicMock(
-        side_effect=httpx.HTTPStatusError("nf", request=MagicMock(), response=legacy_404)
-    )
-    with patch("httpx.get", side_effect=[_ok_response([]), legacy_404]):
         result = detect_enforcement("tok", "o", "r", "main", "Grug - Chief")
 
     assert result.state == "none"
@@ -697,6 +671,41 @@ def test_list_installation_repos_excludes_forks():
     with patch("httpx.get", return_value=_ok_response(body)):
         out = list_installation_repos("tok")
     assert [r["full_name"] for r in out] == ["o/first-party", "o/other"]
+
+
+def test_list_installation_repos_excludes_empty():
+    """An empty repo (no commits) has no PRs to merge, so there is no
+    enforcement to be missing - same denominator logic as the archived
+    exclusion. Enforcement creation is deliberately deferred there (see
+    ensure_enforcement) and the pull_request handler closes the gap on the
+    first PR. The exclusion is self-correcting: once the repo gains a
+    commit, size goes nonzero and it rejoins the denominator."""
+    from github_rulesets_client import list_installation_repos
+
+    body = {"total_count": 3, "repositories": [
+        {"id": 10, "full_name": "o/live", "default_branch": "main", "size": 42},
+        {"id": 11, "full_name": "o/empty", "default_branch": "main", "size": 0},
+        {"id": 12, "full_name": "o/no-size-field", "default_branch": "main"},
+    ]}
+    with patch("httpx.get", return_value=_ok_response(body)):
+        out = list_installation_repos("tok")
+    assert [r["full_name"] for r in out] == ["o/live", "o/no-size-field"]
+
+
+def test_repo_is_empty_true_when_size_zero():
+    from github_rulesets_client import repo_is_empty
+
+    with patch("httpx.get", return_value=_ok_response({"size": 0})) as mock_get:
+        assert repo_is_empty("tok", "o", "r") is True
+    url = mock_get.call_args[0][0]
+    assert url == "https://api.github.com/repos/o/r"
+
+
+def test_repo_is_empty_false_when_size_nonzero():
+    from github_rulesets_client import repo_is_empty
+
+    with patch("httpx.get", return_value=_ok_response({"size": 128})):
+        assert repo_is_empty("tok", "o", "r") is False
 
 
 def test_list_installation_repos_fork_exclusion_keeps_real_gaps():
