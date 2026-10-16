@@ -1855,15 +1855,25 @@ def _review_system_prompt(
 ) -> str:
     """Compose trusted review instructions separately from repository data.
 
-    Precedence (#674), highest to lowest: in-repo agent guidelines
-    (CLAUDE.md/AGENTS.md/etc. - the repo's own versioned, team-authored
-    standard) > operator-taught learnings (#670) > few-shot examples (#538)
-    > team practices (#527) > the static base prompt. Later blocks outrank
-    earlier ones per this prompt's recency=authority convention, and the
+    Precedence (#674), highest to lowest, WITHIN THE SYSTEM PROMPT: in-repo
+    agent guidelines (CLAUDE.md/AGENTS.md/etc. - the repo's own versioned,
+    team-authored standard) > operator-taught learnings (#670) > few-shot
+    examples (#538) > team practices (#527) > the static base prompt. Later
+    blocks outrank earlier ones per this prompt's recency=authority
+    convention (see the `system = f"{system}\n\n..."` appends below), and the
     guidelines block itself tells the model to follow the carving over a
-    taught preference on conflict. (A future `path-instructions` layer -
-    directory-scoped rules - would slot above guidelines; it does not exist
-    yet, so the chain is currently guidelines > learnings.)
+    taught preference on conflict.
+
+    `path_instructions` - directory-scoped `.grug.yaml` rules - DOES exist
+    and is live (`repo_config._KNOWN_KEYS`, applied by
+    `repo_config.with_instructions` from `dispatch.py`). It is deliberately
+    NOT a layer of the chain above, because it rides the USER prompt's
+    repo-docs block rather than the system prompt. The recency=authority
+    convention therefore cannot order it against guidelines or learnings at
+    all - they live in different messages, and neither block claims
+    authority over the other. NO precedence between a path instruction and a
+    repo guideline is defined or tested today; on conflict the model infers
+    one. Deciding that ordering and pinning it with a test is #1131.
     """
     # Redact secret-shaped values from the diff + file context BEFORE they reach
     # the backend (#438). The backend is a third-party SaaS endpoint, and a PR
