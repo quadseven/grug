@@ -80,6 +80,14 @@ _ISSUE_LINK_PAT = re.compile(
     r")",
     re.IGNORECASE | re.MULTILINE,
 )
+# A Loom factory PR names its ticket, lane, and model in an audit footer so
+# the dashboard can attribute the work later. Advisory only: the footer is
+# an audit nicety, never a merge gate.
+_LOOM_FOOTER_PAT = re.compile(r"^Loom ticket ", re.MULTILINE)
+_LOOM_TICKET_REF_PAT = re.compile(
+    r"\b(?:refs|part\s+of|fixes|closes)\s+quadseven/loom#\d+",
+    re.IGNORECASE,
+)
 
 # Closing keywords per GitHub's spec: close(s|d)?, fix(es|ed)?, resolve(s|d)?
 # followed by #N. Case-insensitive. Captures the issue number.
@@ -229,6 +237,22 @@ def check_issue_link(body: str) -> CheckResult:
     return CheckResult(
         "issue-link", False,
         "no `closes #N` / `fixes #N` / `Part of #N` link in body",
+    )
+
+
+def check_loom_footer(body: str) -> CheckResult:
+    if _LOOM_FOOTER_PAT.search(body):
+        return CheckResult("loom-footer", True, "Loom audit footer present")
+    if _LOOM_TICKET_REF_PAT.search(body):
+        return CheckResult(
+            "loom-footer", False,
+            "references a quadseven/loom ticket but has no Loom audit footer "
+            "(`Loom ticket ..., lane ..., model ...`) - the dashboard cannot "
+            "attribute this PR to a model",
+        )
+    return CheckResult(
+        "loom-footer", True, "not a Loom ticket PR; footer not required",
+        skipped=True,
     )
 
 
@@ -507,6 +531,7 @@ _PURE_CHECKS = (
     check_estimate,
     check_scope_fence,
     check_issue_link,
+    check_loom_footer,
 )
 
 ALL_CHECKS = (
