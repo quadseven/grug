@@ -17,8 +17,10 @@ HOW IT WORKS
 ------------
 1. Backend flags: parsed from the Pydantic model in services/api/installations.py
    (fields ending in `_enabled`, plus the non-boolean `elder_voice`).
-2. UI flags: parsed from web/src/routes/Dashboard.tsx — flags passed to
-   setConfig.mutate() in toggle handlers.
+2. UI flags: parsed from web/src/routes/Dashboard.tsx - flags passed to
+   setConfig.mutate() in toggle handlers, plus the persona-mode flags the
+   Personas panel writes (`flags: { enabled: "...", blocking: "..." }` on a
+   PERSONAS entry, grug#1206).
 3. OPERATOR_ONLY: explicit set below with a reason per flag.
 
 A flag in (1) but in neither (2) nor (3) fails the check.
@@ -36,19 +38,13 @@ REPO = Path(__file__).resolve().parents[1]
 # Every entry must have a non-empty reason — an unexplained omission is the
 # exact failure this script exists to catch.
 OPERATOR_ONLY: dict[str, str] = {
-    # Persona master switches beyond the two the dashboard advertises.
-    # Surfacing 8 persona toggles would clutter the repo row; the dashboard
-    # is for the common case (Grug on/off, Guard on/off, watches). Operators
-    # manage these via the API.
-    "code_reviewer_enabled": "persona master switch; operator manages via API",
-    "code_reviewer_blocking": "review-gating semantics; operator manages via API",
-    "guard_blocking": "enforcement-gating semantics; operator manages via API",
-    "warder_enabled": "persona master switch; operator manages via API",
-    "warder_gate_blocking": "deploy-gate semantics; operator manages via API",
+    # Persona master switches the Personas panel does not render as a mode
+    # control (comment-only / scheduled personas show an info chip; the
+    # BLOCK/WARN/OFF personas are wired since grug#1206). Operators manage
+    # these via the API.
     "sentinel_enabled": "persona master switch; operator manages via API",
     "pulse_enabled": "persona master switch; operator manages via API",
     "pulse_comment_nudge_enabled": "persona master switch; operator manages via API",
-    "smasher_enabled": "persona master switch; operator manages via API",
     "walkthrough_enabled": "persona master switch; operator manages via API",
     "issue_dor_enabled": "Chief issue-time advisory; operator manages via API",
     "check_run_reconcile_enabled": "periodic sweep opt-in; operator manages via API",
@@ -74,6 +70,9 @@ def ui_flags(repo: Path = REPO) -> set[str]:
     flags: set[str] = set()
     for m in re.finditer(r"setConfig\.mutate\(\{([^}]+)\}", text):
         flags.update(re.findall(r"(\w+_enabled)\s*:", m.group(1)))
+    # Personas panel mode flags (grug#1206): flags: { enabled: "x", blocking: "y" }
+    for m in re.finditer(r"flags:\s*\{([^}]+)\}", text):
+        flags.update(re.findall(r"(?:enabled|blocking):\s*\"(\w+)\"", m.group(1)))
     return flags
 
 

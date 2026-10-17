@@ -166,6 +166,9 @@
 .grug-dash .seg button[data-v="block"].on{ background:var(--tomato); color:#fff; }
 .grug-dash .seg button[data-v="warn"].on{ background:var(--amber); color:var(--ink); }
 .grug-dash .seg button[data-v="off"].on{ background:var(--bg-2); color:var(--muted); }
+/* grug#1206: a mode with no backend field, or a save in flight. */
+.grug-dash .seg button[disabled]{ cursor:not-allowed; opacity:0.5; }
+.grug-dash .seg button.on[disabled]{ opacity:1; }
 
 .grug-dash .skins{ display:flex; gap:12px; flex-wrap:wrap; }
 .grug-dash .skin{ width:84px; cursor:pointer; border:2px solid var(--ink); background:var(--paper); font-family:'JetBrains Mono', monospace; }
