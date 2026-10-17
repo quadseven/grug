@@ -117,6 +117,7 @@ from personas.code_reviewer.persona import (
 )
 from personas.code_reviewer.snapshot import review_freshness_id_from_pr
 from personas.code_reviewer import carry_forward
+from personas._review_publish import PublishOutcome, publish_outcome, publish_shape
 from personas.code_reviewer.thread_resolver import resolve_fixed_threads
 from personas.code_reviewer.verify import verify_findings
 from personas.tribe import CHECK_ELDER
@@ -2094,13 +2095,10 @@ def _resolve_result(
     about the deterministic findings that rode along), and above
     pass/fail so the dashboard never counts a lost review as a clean one.
     """
-    if check_publish_failed or review_publish_failed:
-        return "publish_failed"
-    if evaluation.degraded_reason:
-        return "skipped"
-    if review_publish_rejected:
-        return "review_rejected"
-    return "pass" if evaluation.passed else "fail"
+    return PublishOutcome(
+        "neutral", "COMMENT", check_publish_failed,
+        review_publish_failed, review_publish_rejected,
+    ).result_for(evaluation)
 
 
 def _publish_shape(
@@ -2117,11 +2115,7 @@ def _publish_shape(
     # Any degraded evaluation (LLM outage, parse failure, empty diff)
     # forces advisory regardless of mode — Elder cannot block a PR on
     # infrastructure flakiness or a non-reviewable shape.
-    if mode == "advisory" or evaluation.degraded_reason:
-        return "neutral", "COMMENT"
-    if evaluation.conclusion == "failure":
-        return "failure", "REQUEST_CHANGES"
-    return evaluation.conclusion, "COMMENT"
+    return publish_shape(evaluation, mode=mode)
 
 
 def _precedent_notes_for(
@@ -3460,12 +3454,12 @@ def dispatch_code_review(
                 },
             )
 
-    result = _resolve_result(
-        evaluation,
-        check_publish_failed=check_publish_failed,
-        review_publish_failed=review_publish_failed,
-        review_publish_rejected=review_publish_rejected,
+    outcome = publish_outcome(
+        evaluation, mode=mode, check_failed=check_publish_failed,
+        review_failed=review_publish_failed,
+        review_rejected=review_publish_rejected,
     )
+    result = outcome.result_for(evaluation)
     # Structured log carries everything needed to verify the persona
     # ran end-to-end on a real PR (operator AC). Backend + model
     # attribution lets DD LLM Obs slice metrics by which LLM produced
@@ -3518,14 +3512,11 @@ def dispatch_code_review(
         repo=f"{owner}/{repo_name}",
         pr_number=pull_number,
         head_sha=head_sha,
-        conclusion=conclusion,
+        conclusion=outcome.conclusion,
         summary=title,
         findings_count=len(evaluation.findings),
         blocking=blocking,
-        degraded_reason=(
-            evaluation.degraded_reason
-            or ("check_publish_failed" if check_publish_failed else None)
-        ),
+        degraded_reason=outcome.degraded_reason_for(evaluation),
     )
     # Living Hunt: remember this head only when the check actually landed
     # and the review was not an infra skip (so the next push can delta).

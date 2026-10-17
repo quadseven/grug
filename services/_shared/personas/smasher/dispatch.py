@@ -30,13 +30,9 @@ from github_app_auth import get_scoped_install_token, with_install_token_retry
 from github_checks_client import CheckRunResult, post_check_run
 from github_reviews_client import post_review
 from personas.code_reviewer.diff_parser import DiffParseError, parse_diff
-from personas.code_reviewer.dispatch import (
-    ReviewMode,
-    _build_review_result,
-    _fetch_pr_diff,
-    _prior_finding_keys,
-    _publish_shape,
-    _resolve_result,
+from personas._review_publish import (
+    ReviewMode, build_review_result, fetch_pr_diff, prior_finding_keys,
+    publish_outcome, publish_shape,
 )
 from personas.code_reviewer.persona import (
     CodeReviewEvaluation,
@@ -183,7 +179,7 @@ def dispatch_smasher_review(
     try:
         diff_text = with_install_token_retry(
             installation_id,
-            lambda token: _fetch_pr_diff(token, owner, repo_name, pull_number),
+            lambda token: fetch_pr_diff(token, owner, repo_name, pull_number),
         )
         hunks = parse_diff(diff_text)
     except (httpx.HTTPStatusError, httpx.RequestError, DiffParseError) as e:
@@ -315,7 +311,7 @@ def _publish(
 ) -> dict[str, str]:
     """Publish the Smasher check-run + inline review on independent surfaces
     (same dual-publish discipline as Guard/Elder) and record the verdict."""
-    conclusion, event = _publish_shape(evaluation, mode=mode)
+    conclusion, event = publish_shape(evaluation, mode=mode)
     title, summary = _summary_markdown(evaluation)
     check_publish_failed = False
     try:
@@ -344,10 +340,10 @@ def _publish(
     review_publish_failed = False
     prior_keys: frozenset[str] = frozenset()
     if action in {"synchronize", "reopened"}:
-        prior_keys, _dedup_degraded = _prior_finding_keys(
+        prior_keys, _dedup_degraded = prior_finding_keys(
             installation_id, owner, repo, pull_number,
         )
-    review_result, _posted_findings = _build_review_result(
+    review_result, _posted_findings = build_review_result(
         evaluation, head_sha=head_sha, event=event, prior_keys=prior_keys,
     )
     if review_result is not None:
@@ -370,21 +366,19 @@ def _publish(
             )
             review_publish_failed = True
 
+    outcome = publish_outcome(
+        evaluation, mode=mode, check_failed=check_publish_failed,
+        review_failed=review_publish_failed,
+    )
     record_check_verdict(
         install_id=installation_id, persona_key="smasher",
         repo=f"{owner}/{repo}", pr_number=pull_number, head_sha=head_sha,
-        conclusion=conclusion, summary=title,
+        conclusion=outcome.conclusion, summary=title,
         findings_count=len(evaluation.findings), blocking=False,
-        degraded_reason=(
-            evaluation.degraded_reason
-            or ("check_publish_failed" if check_publish_failed else None)
-        ),
+        degraded_reason=outcome.degraded_reason_for(evaluation),
     )
     return {
         "persona": "smasher",
-        "result": _resolve_result(
-            evaluation,
-            check_publish_failed=check_publish_failed,
-            review_publish_failed=review_publish_failed,
-        ),
+        "result": outcome.result_for(evaluation),
+
     }

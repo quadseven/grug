@@ -18,6 +18,21 @@ from llm_client import (
     LlmReviewResponse,
 )
 from personas.code_reviewer import dispatch as cr_dispatch
+
+
+def test_publish_outcome_is_shared_by_result_and_activity_degradation():
+    from personas._review_publish import PublishOutcome, publish_outcome
+    from personas.code_reviewer.persona import CodeReviewEvaluation
+
+    evaluation = CodeReviewEvaluation(findings=(), conclusion="failure")
+    outcome = publish_outcome(
+        evaluation, mode="blocking", check_failed=True,
+    )
+
+    assert isinstance(outcome, PublishOutcome)
+    assert outcome.result_for(evaluation) == "publish_failed"
+    assert outcome.degraded_reason_for(evaluation) == "check_publish_failed"
+    assert outcome.conclusion == "failure"
 from review_pipeline import ReviewCoverage, ReviewabilityConcern
 
 
