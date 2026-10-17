@@ -940,7 +940,7 @@ def _coverage_lines(coverage) -> str:
     lines = (
         f"\n\nCoverage: {coverage.completed_cohorts}/{coverage.total_cohorts} "
         f"cohorts completed{parts}."
-    )
+    ) + _coverage_file_lines(coverage)
     for concern in coverage.concerns:
         paths = ", ".join(f"`{_md_code_span(path)}`" for path in concern.paths[:6])
         lines += (
@@ -951,6 +951,57 @@ def _coverage_lines(coverage) -> str:
         marker = lines.index("\n- ", lines.index("Coverage:"))
         lines = f"{lines[:marker]}\n\n**Reviewability**{lines[marker:]}"
     return lines
+
+
+_COVERAGE_PATHS_SHOWN = 10
+
+
+def _path_list(paths: tuple[str, ...]) -> str:
+    shown = ", ".join(f"`{_md_code_span(path)}`" for path in paths[:_COVERAGE_PATHS_SHOWN])
+    return shown + _path_tail(paths, _COVERAGE_PATHS_SHOWN)
+
+
+def _coverage_file_lines(coverage) -> str:
+    """Which files were reviewed and which were not (grug#1196).
+
+    "2/3 cohorts completed" told the author how much, never where. A file is
+    reviewed only when every chunk holding part of it completed."""
+    reviewed = tuple(coverage.reviewed_paths)
+    unwalked = tuple(coverage.unwalked_paths)
+    if not reviewed and not unwalked:
+        return ""
+    lines = f"\n\nFiles reviewed ({len(reviewed)}): " + (
+        _path_list(reviewed) if reviewed else "none"
+    ) + "."
+    if unwalked:
+        lines += f"\nFiles not reviewed ({len(unwalked)}): {_path_list(unwalked)}."
+    return lines
+
+
+_TITLE_MODELS_SHOWN = 4
+
+
+def _tried_models_title(coverage) -> str:
+    """": tried m1 (reason), m2 (reason)" for a neutral title, or empty.
+
+    grug#1196: "eyes clouded (all_failed)" named no model and no cause, so a
+    reader could not tell a rate limit from a dead host from a model that
+    answered in prose."""
+    models = tuple(coverage.failed_models) if coverage is not None else ()
+    if not models:
+        return ""
+    shown = ", ".join(models[:_TITLE_MODELS_SHOWN])
+    extra = len(models) - _TITLE_MODELS_SHOWN
+    return f": tried {shown}" + (f" (+{extra} more)" if extra > 0 else "")
+
+
+def _tried_models_note(coverage) -> str:
+    """Every model tried and why it failed, for the neutral summary."""
+    models = tuple(coverage.failed_models) if coverage is not None else ()
+    if not models:
+        return ""
+    shown = ", ".join(f"`{_md_code_span(model)}`" for model in models[:12])
+    return f"\n\nModels tried: {shown}{_path_tail(models, 12)}."
 
 
 def _review_transparency(
@@ -1175,7 +1226,7 @@ def _summary_markdown(
             evaluation.coverage is not None
             and bool(evaluation.coverage.unattempted_cohorts)
         )
-        reason = evaluation.degraded_reason
+        reason = evaluation.degraded_reason + _tried_models_title(evaluation.coverage)
         title = (
             f"WARN Grug eyes clouded ({reason}; some cohorts never attempted)"
             if starved
@@ -1191,7 +1242,7 @@ def _summary_markdown(
             "Grug Elder could not see the diff this pass. The mist: "
             f"`{evaluation.degraded_reason}`. Grug stay his club — this "
             "only counsel, merge not blocked."
-        ) + starved_note + held + hunt + defensive_note
+        ) + _tried_models_note(evaluation.coverage) + starved_note + held + hunt + defensive_note
     if not evaluation.findings:
         title = (
             "Elder clear - no markings"

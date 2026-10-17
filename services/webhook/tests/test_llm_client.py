@@ -55,6 +55,18 @@ def _hunk(path="src/x.py", body="@@ -1 +1 @@\n-foo\n+bar") -> Hunk:
     return Hunk(path=path, body=body)
 
 
+def _one_ladder_walk(hunks: list[Hunk], installation_id: int) -> LlmReviewResponse:
+    """One walk down the model ladder, without review_diff's chunk retry.
+
+    grug#1196: review_diff retries a failed chunk once, starting at the next
+    model the first walk did not reach. Tests that pin what ONE walk does
+    (where it stops, what it attributes) call this instead."""
+    return lc._review_diff_dispatch(
+        hunks, installation_id, None, None, None, None, None, None,
+        "caveman", None,
+    )
+
+
 def _openai_json_response(findings_json: str) -> dict:
     """OpenAI-compatible chat completion shape both backends return."""
     return {
@@ -1557,7 +1569,7 @@ def test_saas_overload_fallback_skipped_when_cave_returns_parse_failed(monkeypat
         return httpx.Response(200, json=_openai_json_response("not json"))
 
     with patch.object(httpx, "post", side_effect=respond):
-        out = review_diff([_hunk()], installation_id=1)
+        out = _one_ladder_walk([_hunk()], installation_id=1)
 
     assert out.kind == "parse_failed"
     assert len(call_log) == 2  # both Cave arms only, no SaaS fallback
@@ -2205,7 +2217,7 @@ def test_llmobs_config_error_annotates_with_error_config(monkeypatch) -> None:
     # it a clean transport failure so its spans are distinguishable
     # (error=ConnectError, not error=config) from the Cave arms' spans.
     with patch.object(httpx, "post", side_effect=httpx.ConnectError("down")) as mock_post:
-        out = review_diff([_hunk()], installation_id=1)
+        out = _one_ladder_walk([_hunk()], installation_id=1)
 
     assert out.kind == "all_failed"
     # Cave never dialed HTTP; only the two overload-fallback attempts did.
@@ -3997,7 +4009,7 @@ def test_cloud_priority_parse_failed_is_not_masked_by_a_cave_retry(monkeypatch) 
     )
 
     with patch.object(httpx, "post", return_value=bad_response) as mock_post:
-        out = review_diff([_hunk()], installation_id=1)
+        out = _one_ladder_walk([_hunk()], installation_id=1)
 
     assert out.kind == "parse_failed"
     assert out.backend_used == Backend.OPENCODE_GO
@@ -4677,7 +4689,7 @@ def test_opencode_go_parse_failure_is_still_the_answer_after_a_free_tier_miss(
     junk = httpx.Response(200, json=_openai_json_response("not json at all"))
 
     with patch.object(httpx, "post", side_effect=[junk, junk, junk]) as post:
-        out = review_diff([_hunk()], installation_id=1)
+        out = _one_ladder_walk([_hunk()], installation_id=1)
 
     assert out.kind == "parse_failed"
     assert out.backend_used == Backend.OPENCODE_GO
