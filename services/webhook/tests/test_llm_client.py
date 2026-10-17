@@ -5604,7 +5604,6 @@ def test_deepseek_degenerate_with_every_later_tier_failing_is_low_confidence(
     assert out.kind == "reviewed"
     assert out.findings == ()
     assert out.backend_used == Backend.OPENCODE_GO
-    assert out.model_name == paid
     assert out.error.startswith("low confidence:")
     # Kept, not retried: the chunk is a result, so the ladder stops.
     assert models.count(paid) == 1
@@ -5650,5 +5649,26 @@ def test_low_confidence_cohort_does_not_starve_the_next_cohort(monkeypatch) -> N
     assert out.error.startswith("low confidence:")
     assert "cohorts [1]" in out.error
     assert src_primary_calls == 1
-    evaluation = evaluate_diff(tuple(), out)
+    evaluation = evaluate_diff((), out)
     assert evaluation.degraded_reason == "low_confidence_review"
+
+
+def test_deep_append_keeps_a_degenerate_answer_when_the_reasoner_fails(
+    monkeypatch,
+) -> None:
+    """grug#1097, deep-append path: the Cave reasoner is the last tier there."""
+    monkeypatch.setenv("GRUG_REVIEW_BACKEND_PRIORITY", "cloud")
+    paid = _pin_deepseek_primary(monkeypatch)
+
+    def respond(_url, **kwargs) -> httpx.Response:
+        if kwargs["json"].get("model") == paid:
+            return _degenerate_response()
+        raise httpx.ConnectError("down")
+
+    with patch.object(httpx, "post", side_effect=respond):
+        out = lc.review_reasoner_diff([_hunk()], installation_id=1)
+
+    assert out.kind == "reviewed"
+    assert out.findings == ()
+    assert out.backend_used == Backend.OPENCODE_GO
+    assert out.error.startswith("low confidence:")

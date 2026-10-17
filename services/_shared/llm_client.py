@@ -3843,6 +3843,27 @@ def _partial_review_reason(
     return f"partial review: {'; '.join(reasons)}" if reasons else ""
 
 
+def _with_low_confidence_cohorts(
+    error: str, responses: Sequence[LlmReviewResponse],
+) -> str:
+    """Name the cohorts kept as low-confidence clean results (grug#1097).
+
+    A partial review stays a partial review, with the low-confidence cohorts
+    added to its reason. Otherwise the merged review carries the
+    `low confidence:` prefix, so one short empty cohort still keeps the check
+    advisory instead of merging into a clean pass."""
+    indexes = [
+        index
+        for index, response in enumerate(responses, start=1)
+        if response.kind == "reviewed"
+        and response.error.startswith(_LOW_CONFIDENCE_PREFIX)
+    ]
+    if not indexes:
+        return error
+    note = f"cohorts {indexes} answered no findings too briefly to trust"
+    return f"{error}; {note}" if error else f"{_LOW_CONFIDENCE_PREFIX}{note}"
+
+
 def _merge_cohort_responses(
     responses: list[LlmReviewResponse],
     installation_id: int,
@@ -3876,7 +3897,10 @@ def _merge_cohort_responses(
             review_span_context=first.review_span_context,
             backends_used=backends,
             models_used=models,
-            error=_partial_review_reason(failed_indexes, plan, truncated_indexes),
+            error=_with_low_confidence_cohorts(
+                _partial_review_reason(failed_indexes, plan, truncated_indexes),
+                responses,
+            ),
             coverage=coverage,
         )
 
@@ -4191,12 +4215,15 @@ def _review_reasoner_diff_once(
         review_map=review_map,
     )
     pr_tags = _llmobs_tags(pr_context)
+    # grug#1097: a short empty cloud answer, kept if the reasoner fails too.
+    low_confidence: LlmReviewResponse | None = None
     if _review_backend_priority() == "cloud":
         cloud_result = _try_cloud_primary(
             hunks, messages, variant, pr_tags, installation_id, pr_context, cancel_event,
         )
-        if cloud_result is not None:
-            return cloud_result
+        if cloud_result.answer is not None:
+            return cloud_result.answer
+        low_confidence = cloud_result.low_confidence
     outcome = _run_review_arm(
         Backend.CAVE_REASONER, messages, variant, pr_tags, cancel_event,
     )
@@ -4223,6 +4250,8 @@ def _review_reasoner_diff_once(
                 (Backend.CAVE_REASONER,) if outcome.truncated else (),
             ),
         )
+    if low_confidence is not None:
+        return low_confidence
     if outcome.kind == "parse_failed":
         return LlmReviewResponse(
             kind="parse_failed",
@@ -4683,6 +4712,14 @@ class _ArmOutcome:
 # calls in 3 hours on 2026-09-26, each published as a clean pass).
 _DEGENERATE_MAX_OUTPUT_TOKENS = 50
 _DEGENERATE_MIN_INPUT_TOKENS = 2_000
+
+# grug#1097: the `error` prefix of a review whose only answer was a short empty
+# one. Some of those are real clean reviews, so when every later tier also
+# fails the answer is kept rather than failing the cohort. A failed cohort is
+# retried and split, which spent the staged budget and left later cohorts
+# unattempted. `evaluate_diff` maps this prefix to
+# degraded_reason="low_confidence_review", which keeps the check advisory.
+_LOW_CONFIDENCE_PREFIX = "low confidence: "
 
 
 def _is_degenerate_empty_review(
@@ -5475,6 +5512,40 @@ def _cloud_tier_success(
     )
 
 
+def _low_confidence_success(
+    outcome: _ArmOutcome, hunks: list[Hunk], pr_context: PrContext | None,
+) -> LlmReviewResponse:
+    """A short empty answer kept because no later tier answered (grug#1097).
+
+    Same attribution as `_cloud_tier_success`, with an `error` that marks it
+    low confidence so it never reads as a trusted clean pass. A truncated
+    generation keeps its stronger `partial review:` error instead."""
+    response = _cloud_tier_success(outcome, hunks, pr_context)
+    if response.error:
+        return response
+    return replace(
+        response,
+        error=(
+            f"{_LOW_CONFIDENCE_PREFIX}{outcome.backend.value} {outcome.model} "
+            f"answered no findings in under {_DEGENERATE_MAX_OUTPUT_TOKENS} "
+            "output tokens and no later model answered"
+        ),
+    )
+
+
+@dataclass(frozen=True, slots=True)
+class _CloudPrimaryResult:
+    """What the cloud chain produced for one review chunk.
+
+    `answer` is the review when a tier answered; the caller returns it as-is.
+    With no answer, `low_confidence` is the first short empty answer, if any:
+    the caller still tries the Cave and keeps this only when the Cave fails
+    too (grug#1097)."""
+
+    answer: LlmReviewResponse | None = None
+    low_confidence: LlmReviewResponse | None = None
+
+
 def _empty_answers_agree(
     first_empty: "tuple[Backend, str] | None",
     current: "tuple[Backend, str]",
@@ -5514,7 +5585,7 @@ def _try_cloud_primary(
     installation_id: int,
     pr_context: Optional[PrContext],
     cancel_event: threading.Event | None,
-) -> "LlmReviewResponse | None":
+) -> _CloudPrimaryResult:
     """Try the grug#910 cloud chain - opencode Go, then OpenRouter `:free`
     if configured - as the PRIMARY review attempt (grug#906).
 
@@ -5527,16 +5598,20 @@ def _try_cloud_primary(
     signal to move on, not something worth waiting out. Poolside is
     DROPPED (confirmed unfunded - see `_cloud_chain_tiers`'s docstring).
 
-    Returns None only on TOTAL failure (every configured tier errored or
-    timed out) - the caller's signal to fall through to the Cave path
-    unconditionally. A parse_failed cloud response is a real (if
-    degraded) answer from a backend that DID respond; it is returned
-    as-is rather than masked by a Cave retry that would silently double
-    the cost of an already-answered review."""
+    `answer` is None only on TOTAL failure (every configured tier errored,
+    timed out, or gave a short empty answer nobody confirmed) - the
+    caller's signal to fall through to the Cave path unconditionally. A
+    parse_failed cloud response is a real (if degraded) answer from a
+    backend that DID respond; it is returned as-is rather than masked by a
+    Cave retry that would silently double the cost of an already-answered
+    review. When a short empty answer exists it outranks that parse
+    failure, and on total failure it rides along as `low_confidence`
+    (grug#1097)."""
     first_parse_fail: tuple[Backend, str | None, str] | None = None
     # The first model whose answer was a short empty review. A second,
     # DIFFERENT model answering empty too is agreement, and ends the chain.
     first_empty: tuple[Backend, str] | None = None
+    first_empty_outcome: _ArmOutcome | None = None
     last_error = ""
     for tier in _cloud_chain_tiers():
         backend = tier.backend
@@ -5547,11 +5622,17 @@ def _try_cloud_primary(
             last_error = f"{backend.value}: degenerate empty review"
             key = (backend, tier.model)
             if _empty_answers_agree(first_empty, key, pr_context):
-                return _cloud_tier_success(outcome, hunks, pr_context)
-            first_empty = first_empty or key
+                return _CloudPrimaryResult(
+                    answer=_cloud_tier_success(outcome, hunks, pr_context),
+                )
+            if first_empty is None:
+                first_empty = key
+                first_empty_outcome = outcome
             continue
         if outcome.kind == "success":
-            return _cloud_tier_success(outcome, hunks, pr_context)
+            return _CloudPrimaryResult(
+                answer=_cloud_tier_success(outcome, hunks, pr_context),
+            )
         if outcome.kind == "parse_failed":
             last_error = outcome.error_text
             is_primary = (
@@ -5581,11 +5662,19 @@ def _try_cloud_primary(
         # config_error / transport_error / http_failed
         last_error = outcome.error_text
 
+    low_confidence = (
+        _low_confidence_success(first_empty_outcome, hunks, pr_context)
+        if first_empty_outcome is not None
+        else None
+    )
     if first_parse_fail is not None:
+        if low_confidence is not None:
+            # An empty answer is still an answer; a parse failure is not.
+            return _CloudPrimaryResult(answer=low_confidence)
         pf_backend, pf_model, pf_err = first_parse_fail
-        return LlmReviewResponse(
+        return _CloudPrimaryResult(answer=LlmReviewResponse(
             kind="parse_failed", backend_used=pf_backend, model_name=pf_model, error=pf_err,
-        )
+        ))
     log.info(
         "llm_cloud_primary_exhausted",
         extra={
@@ -5595,7 +5684,8 @@ def _try_cloud_primary(
             "last_error": last_error,
         },
     )
-    return None  # signal: fall through to the unmodified Cave path
+    # No answer: the caller falls through to the unmodified Cave path.
+    return _CloudPrimaryResult(low_confidence=low_confidence)
 
 
 def _review_diff_dispatch(
@@ -5624,7 +5714,12 @@ def _review_diff_dispatch(
     review pipeline, not a reimplementation of it. `messages`/`variant`
     get rebuilt a second time inside the cave-primary call on that
     (hopefully rare) fallback path - a deliberate, small cost accepted so
-    that function's body never has to know this caller exists."""
+    that function's body never has to know this caller exists.
+
+    grug#1097: when the cloud chain's only answer was a short empty one and
+    the Cave fails too, that answer is returned as a low-confidence clean
+    result instead of failing the chunk."""
+    low_confidence: LlmReviewResponse | None = None
     if _review_backend_priority() == "cloud":
         depth = _review_depth()
         variant: PromptVariant = (
@@ -5645,15 +5740,31 @@ def _review_diff_dispatch(
         cloud_result = _try_cloud_primary(
             hunks, messages, variant, pr_tags, installation_id, pr_context, cancel_event,
         )
-        if cloud_result is not None:
-            return cloud_result
+        if cloud_result.answer is not None:
+            return cloud_result.answer
+        low_confidence = cloud_result.low_confidence
         # Total cloud failure: fall through, unconditionally, to the exact
         # path every "cave" deployment runs - "if that fails, use my local
         # sparks" (the operator, 2026-08-27) is not itself configurable away.
-    return _review_diff_dispatch_cave_primary(
+    response = _review_diff_dispatch_cave_primary(
         hunks, installation_id, pr_context, file_contents, cross_file_contents,
         runtime_context, ci_context, repo_docs_context, voice, cancel_event, review_map,
     )
+    if low_confidence is not None and response.kind in ("all_failed", "parse_failed"):
+        log.warning(
+            "llm_review_low_confidence_kept",
+            extra={
+                "backend": low_confidence.backend_used.value
+                if low_confidence.backend_used is not None
+                else None,
+                "model": low_confidence.model_name,
+                "cave_kind": response.kind,
+                "repo": (pr_context or {}).get("repo"),
+                "pr_number": (pr_context or {}).get("pr_number"),
+            },
+        )
+        return low_confidence
+    return response
 
 
 def _review_diff_dispatch_cave_primary(

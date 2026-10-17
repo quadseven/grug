@@ -41,6 +41,7 @@ from github_checks_client import CheckRunResult, post_check_run
 from personas import board_client
 from personas.code_reviewer.dispatch import (
     DIFF_TOO_LARGE,
+    LOW_CONFIDENCE,
     RETRIED_DEGRADATIONS,
     dispatch_code_review,
 )
@@ -152,10 +153,14 @@ _RETRYABLE_SKIP_REASONS = RETRIED_DEGRADATIONS
 # DIFF_TOO_LARGE belongs here for the same reason: its degraded check already
 # says the diff is over GitHub's size limit and what to do about it, and no
 # retry changes GitHub's answer.
+#
+# LOW_CONFIDENCE (grug#1097) publishes its own advisory check the same way a
+# partial review does.
 _SELF_COMPLETING_SKIP_REASONS = frozenset({
     "no_diff",
     "fail_open_freshness",
     "partial_review",
+    LOW_CONFIDENCE,
     DIFF_TOO_LARGE,
 })
 
