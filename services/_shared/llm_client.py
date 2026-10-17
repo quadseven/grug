@@ -4089,13 +4089,12 @@ def _run_staged_cohorts(
 def _deadline_cut_as_skipped(response: LlmReviewResponse) -> LlmReviewResponse:
     """A cohort the staged deadline cut is budget-starved, not a model failure.
 
-    Its last error is `ReviewDeadlineReached` when the deadline stopped the
-    ladder (grug#1216). Reported with the skipped prefix, so coverage says
-    "never attempted" - the author needs a smaller diff or more budget, not a
-    re-run hoping the model recovers."""
-    if not _is_retryable_cohort_failure(response):
-        return response
-    if ReviewDeadlineReached.__name__ not in (response.error or ""):
+    Read from the deadline itself, not from the error text: when the cohort
+    ends without a review and the deadline has passed, the rest of its ladder
+    was never sent (grug#1216). Reported with the skipped prefix, so coverage
+    says "never attempted" - the author needs a smaller diff or more budget,
+    not a re-run hoping the model recovers."""
+    if not _is_retryable_cohort_failure(response) or not _deadline_passed():
         return response
     return replace(
         response,

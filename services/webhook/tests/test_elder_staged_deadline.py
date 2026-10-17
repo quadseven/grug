@@ -172,32 +172,35 @@ def test_the_deadline_reaches_calls_inside_the_block_only() -> None:
 
 
 def test_a_cohort_the_deadline_cut_is_reported_never_attempted() -> None:
-    responses = lc._run_staged_cohorts(
-        cohort_count=1,
-        run_cohort=lambda _index: LlmReviewResponse(
-            kind="all_failed", error="poolside: ReviewDeadlineReached",
-        ),
-        budget_seconds=700,
-        reserve_seconds=60,
-        cancel_event=None,
-        max_attempts=1,
-    )
+    with lc._review_deadline(time.monotonic() + 5.0):
+        responses = lc._run_staged_cohorts(
+            cohort_count=1,
+            run_cohort=lambda _index: LlmReviewResponse(
+                kind="all_failed", error="poolside: ReviewDeadlineReached",
+            ),
+            budget_seconds=700,
+            reserve_seconds=60,
+            cancel_event=None,
+            max_attempts=1,
+        )
 
     assert responses[0].error.startswith(lc._SKIPPED_COHORT_PREFIX)
     assert lc._unattempted_cohort_indexes(responses) == (1,)
 
 
 def test_a_cohort_that_really_failed_stays_failed() -> None:
-    responses = lc._run_staged_cohorts(
-        cohort_count=1,
-        run_cohort=lambda _index: LlmReviewResponse(
-            kind="all_failed", error="poolside: ReadTimeout",
-        ),
-        budget_seconds=700,
-        reserve_seconds=60,
-        cancel_event=None,
-        max_attempts=1,
-    )
+    """Failed with time still on the deadline: a real failure, not a cut."""
+    with lc._review_deadline(time.monotonic() + 600.0):
+        responses = lc._run_staged_cohorts(
+            cohort_count=1,
+            run_cohort=lambda _index: LlmReviewResponse(
+                kind="all_failed", error="poolside: ReadTimeout",
+            ),
+            budget_seconds=700,
+            reserve_seconds=60,
+            cancel_event=None,
+            max_attempts=1,
+        )
 
     assert responses[0].error == "poolside: ReadTimeout"
     assert lc._unattempted_cohort_indexes(responses) == ()
