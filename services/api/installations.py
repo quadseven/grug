@@ -444,6 +444,33 @@ def rerun_all_errored(
     return {"queued": queued}
 
 
+def _sync_enforcement_after_save(
+    install_id: int, repo_id: int, full_name: str, default_branch: str,
+    previous_cfg: dict[str, Any], cfg: dict[str, Any],
+) -> None:
+    """Bring the repo's ruleset in line with a settings save: a tpm toggle
+    creates or deletes it; otherwise a change to the required persona set
+    reconciles it (grug#1202). Pulled out of update_repo_config to keep that
+    route under the complexity cap."""
+    was_enabled = previous_cfg.get("tpm_enabled", True)
+    # Read the MERGED config, not the request body: on a sparse update the
+    # body's tpm_enabled is None and the stored value is what actually
+    # applies. Reading the body here would treat "not mentioned" as a change
+    # (FLINT, PR #751).
+    now_enabled = cfg.get("tpm_enabled", was_enabled)
+    if now_enabled and not was_enabled:
+        _toggle_enforcement(install_id, repo_id, full_name, default_branch, enable=True)
+    elif was_enabled and not now_enabled:
+        _toggle_enforcement(install_id, repo_id, full_name, default_branch, enable=False)
+    elif now_enabled and _required_checks_changed(previous_cfg, cfg):
+        # grug#1202: a persona mode flip (e.g. Elder WARN -> BLOCK) changes
+        # which checks the ruleset must require. Reconcile here, on the save
+        # itself, so the dashboard flip takes effect without a Fix click.
+        # The two branches above already cover a tpm toggle: enable runs
+        # ensure_enforcement (which applies the modes), disable deletes.
+        _reconcile_required_checks(install_id, repo_id, full_name, default_branch)
+
+
 @router.put("/installations/{install_id}/repos/{repo_id}/config")
 def update_repo_config(
     install_id: int,
@@ -538,23 +565,9 @@ def update_repo_config(
         },
     )
 
-    was_enabled = previous_cfg.get("tpm_enabled", True)
-    # Read the MERGED config, not the request body: on a sparse update the
-    # body's tpm_enabled is None and the stored value is what actually
-    # applies. Reading the body here would treat "not mentioned" as a change
-    # (FLINT, PR #751).
-    now_enabled = cfg.get("tpm_enabled", was_enabled)
-    if now_enabled and not was_enabled:
-        _toggle_enforcement(install_id, repo_id, full_name, default_branch, enable=True)
-    elif was_enabled and not now_enabled:
-        _toggle_enforcement(install_id, repo_id, full_name, default_branch, enable=False)
-    elif now_enabled and _required_checks_changed(previous_cfg, cfg):
-        # grug#1202: a persona mode flip (e.g. Elder WARN -> BLOCK) changes
-        # which checks the ruleset must require. Reconcile here, on the save
-        # itself, so the dashboard flip takes effect without a Fix click.
-        # The two branches above already cover a tpm toggle: enable runs
-        # ensure_enforcement (which applies the modes), disable deletes.
-        _reconcile_required_checks(install_id, repo_id, full_name, default_branch)
+    _sync_enforcement_after_save(
+        install_id, repo_id, full_name, default_branch, previous_cfg, cfg,
+    )
 
     return {"repo_id": repo_id, "full_name": full_name, "config": cfg}
 
