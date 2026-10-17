@@ -326,8 +326,8 @@ flowchart LR
 | **APM traces** | live | `ddtrace` on every workload (FastAPI auto-instrument for the HTTP pods; `ddtrace-run` for consumer/poller). Spans reach the **node-local** agent at `DD_AGENT_HOST=status.hostIP` (set per pod — a missing value silently drops APM). `DD_VERSION` = the build SHA. Verify via trace metrics, not raw span search (`feedback_verify_apm_via_trace_metrics`) |
 | **LLM Observability** | live | `DD_LLMOBS_ENABLED=true`, `DD_LLMOBS_ML_APP=grug-elder` on the LLM-calling workloads |
 | **Logs** | live | `DD_LOGS_INJECTION=true` correlates `trace_id`/`span_id`; service/env/version tags from the deploy |
-| **Monitors** | live | Pulumi-managed (`components/dd_monitors.py`), scoped `kube_namespace:grug`: KSM workload-not-ready / crashloop / restart-spike / poller-cronjob-unhealthy (#406) + SQS backlog + cave-fallback. Routed to the operator's Discord alert channel |
-| **RUM** | live | Frontend `service:grug-web` (unchanged). App id + client token in SSM, Pulumi-registered (`dd_rum`) |
+| **Monitors** | retired (#1223) | Were Pulumi-managed (`components/dd_monitors.py`, removed), scoped `kube_namespace:grug`: KSM workload-not-ready / crashloop / restart-spike / poller-cronjob-unhealthy (#406) + SQS backlog + cave-fallback. Routed to the operator's Discord alert channel |
+| **RUM** | retired (#1223) | Frontend `service:grug-web`. App id + client token stay in SSM; the RUM app is no longer Pulumi-registered (`dd_rum` removed) |
 
 ---
 

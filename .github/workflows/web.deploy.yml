@@ -84,8 +84,8 @@ jobs:
 
           # DD RUM credentials (RumInstrumentation contract). Both are public-by-design
           # (they live in the browser bundle) but sourced from SSM so a
-          # rotation is `pulumi up`, not a git commit. Pulumi component
-          # dd_rum.py owns the SSM values. If missing, the build still
+          # rotation is `pulumi up`, not a git commit. The SSM values were
+          # set by the retired dd_rum.py component (#1223). If missing, the build still
           # succeeds — the RUM init checks for placeholders and no-ops.
           DD_RUM_APP_ID=""
           DD_RUM_TOKEN=""

@@ -9,8 +9,8 @@
 // (VITE_DD_RUM_APPLICATION_ID + VITE_DD_RUM_CLIENT_TOKEN). The
 // web.deploy.yml workflow reads them from SSM
 // (/grug/dd-rum-application-id, /grug/dd-rum-client-token) and exports
-// them before `npm run build`. The Pulumi datadog.RumApplication
-// resource owns the SSM values (spec 0013, component dd_rum.py).
+// them before `npm run build`. The SSM values were set by the Pulumi
+// dd_rum.py component, retired in #1223 (spec 0013).
 //
 // If credentials are missing (e.g. local `npm run dev` without env
 // vars), the init is skipped — RUM stays dark instead of throwing.
