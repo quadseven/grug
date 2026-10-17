@@ -1126,6 +1126,152 @@ def _note_model_response(config: BackendConfig, resp: httpx.Response) -> None:
         _announce_model_benched(*key, resp.status_code, seconds)
 
 
+# Switched-off backends and the provider breaker (grug#1225).
+#
+# `GRUG_DISABLED_BACKENDS` turns a backend off by configuration: a comma-
+# separated list of backend names (`opencode-go`, `openrouter`, `poolside`),
+# each optionally narrowed to one pool with `:free` or `:paid`
+# (`openrouter:paid` keeps the `:free` models). A disabled backend is never
+# called: the cloud review chain, the SaaS overload fallback, the judge and
+# the interactive order all skip it, and `_call_backend` refuses it as the
+# last guard. Read on every call, so re-enabling one is removing its entry
+# and rolling out. Unset (the default) disables nothing.
+#
+# The provider breaker covers a provider nobody has switched off yet. A 401
+# (key wrong or expired), a 402 (unpaid), or a refusal whose body says a
+# limit is spent (OpenRouter's `403 Key limit exceeded (total limit)` and
+# `429 ... free-models-per-day`, OpenCode Go's monthly usage limit) does not
+# clear within a review, so the first one stops calls to that provider for
+# Retry-After, else an hour. A 401 covers the whole key; the others only the
+# pool (free or paid) that answered, because OpenRouter's free models keep
+# answering on a key whose paid limit is zero. A plain 429 is overload and
+# never trips it. Per process, like the bench above. Measured before it
+# existed (402 Elder runs, 2026-10-17): 36 OpenCode Go 401s, 11 OpenRouter
+# paid "total limit" refusals and 139 OpenRouter free per-day 429s, each one
+# spent cohort time before a working backend was reached.
+_PROVIDER_POOLS = ("free", "paid")
+_SPENT_LIMIT_MARKERS = (
+    "usage limit", "quota", "credit", "key limit", "total limit", "spend limit",
+)
+_SPENT_RATE_MARKERS = (
+    "per-day", "per day", "daily", "monthly", "usage limit", "quota", "gousagelimiterror",
+)
+_provider_breaker_lock = threading.Lock()
+_provider_blocked_until: dict[tuple[str, str], float] = {}
+_warned_disabled_entries: set[str] = set()
+
+
+class BackendDisabledError(httpx.RequestError):
+    """The backend is switched off (`GRUG_DISABLED_BACKENDS`) or its provider
+    breaker is open. Subclasses `httpx.RequestError` so every caller degrades
+    exactly as it does for a transport failure."""
+
+
+def _backend_pool(backend: Backend, model: str) -> str:
+    """"free" for a provider's no-cost models, "paid" for everything else."""
+    if backend == Backend.OPENROUTER and is_free_tier_model(model):
+        return "free"
+    if backend == Backend.OPENCODE_GO and _opencode_go_model_is_free(model):
+        return "free"
+    return "paid"
+
+
+def _disabled_backend_entries() -> frozenset[str]:
+    entries = frozenset(
+        e.strip().lower()
+        for e in os.getenv("GRUG_DISABLED_BACKENDS", "").split(",")
+        if e.strip()
+    )
+    known = {b.value for b in Backend}
+    for entry in entries - _warned_disabled_entries:
+        name, _, pool = entry.partition(":")
+        if name not in known or pool not in ("", *_PROVIDER_POOLS):
+            # A typo must not read as "switched off" while the backend runs.
+            log.warning("grug_disabled_backends_unknown_entry", extra={"entry": entry})
+        _warned_disabled_entries.add(entry)
+    return entries
+
+
+def _backend_enabled(backend: Backend, model: str) -> bool:
+    """False when `GRUG_DISABLED_BACKENDS` names this backend or its pool."""
+    entries = _disabled_backend_entries()
+    if not entries:
+        return True
+    name = backend.value
+    return name not in entries and f"{name}:{_backend_pool(backend, model)}" not in entries
+
+
+def _provider_available(backend: Backend, model: str, now: float | None = None) -> bool:
+    current = time.time() if now is None else now
+    key = (backend.value, _backend_pool(backend, model))
+    with _provider_breaker_lock:
+        return current >= _provider_blocked_until.get(key, 0.0)
+
+
+def _backend_usable(backend: Backend, model: str) -> bool:
+    """Switched on and its provider breaker closed."""
+    return _backend_enabled(backend, model) and _provider_available(backend, model)
+
+
+def _is_spent_quota_refusal(resp: httpx.Response) -> bool:
+    """A refusal that says the money or the allowance is gone, not overload."""
+    status = resp.status_code
+    if status == 402:
+        return True
+    if status not in (403, 429):
+        return False
+    text = (resp.text or "").lower()
+    markers = _SPENT_LIMIT_MARKERS if status == 403 else _SPENT_RATE_MARKERS
+    return any(m in text for m in markers)
+
+
+def _note_provider_response(config: BackendConfig, resp: httpx.Response) -> None:
+    """Open the provider breaker on a 401, a 402 or a spent-limit refusal."""
+    if config.backend not in _BENCH_CLOUD_BACKENDS:
+        return
+    if resp.status_code == 401:
+        pools: tuple[str, ...] = _PROVIDER_POOLS
+    elif _is_spent_quota_refusal(resp):
+        pools = (_backend_pool(config.backend, config.model),)
+    else:
+        return
+    # Same default (an hour) and cap (a week) as the OpenCode Go breaker.
+    seconds = _retry_after_seconds(resp)
+    until = time.time() + seconds
+    with _provider_breaker_lock:
+        for pool in pools:
+            key = (config.backend.value, pool)
+            _provider_blocked_until[key] = max(_provider_blocked_until.get(key, 0.0), until)
+    log.warning(
+        "llm_provider_circuit_open",
+        extra={
+            "backend": config.backend.value, "model": config.model,
+            "status": resp.status_code, "pools": list(pools), "block_seconds": seconds,
+        },
+    )
+
+
+def _refuse_unusable_backend(config: BackendConfig) -> None:
+    """`_call_backend`'s guard: raise before any network call to a backend
+    that is switched off or whose breaker is open."""
+    if not _backend_enabled(config.backend, config.model):
+        raise BackendDisabledError(
+            f"{config.backend.value} is switched off (GRUG_DISABLED_BACKENDS)"
+        )
+    if config.backend in _BENCH_CLOUD_BACKENDS and not _provider_available(
+        config.backend, config.model,
+    ):
+        raise BackendDisabledError(
+            f"{config.backend.value} provider breaker open after an auth or quota refusal"
+        )
+    if (
+        config.backend == Backend.OPENCODE_GO
+        and not _opencode_go_model_is_free(config.model)
+        and not _opencode_go_available()
+    ):
+        raise OpencodeGoCircuitOpenError("opencode Go usage limit: breaker open")
+
+
 # Slow bench. A model that is merely slow (not withdrawn) times out on large
 # cohorts and burns its whole timeout before the next tier starts. Three
 # httpx timeouts within ten minutes bench the (backend, model) pair for ten
@@ -1284,10 +1430,13 @@ def _slow_bench_expiry(tier: BackendConfig) -> float:
 def _tier_is_usable(
     tier: BackendConfig, chosen: list[BackendConfig], *, skip_slow: bool = True,
 ) -> bool:
-    """A tier runs unless it duplicates one already chosen, is benched (4xx
+    """A tier runs unless it duplicates one already chosen, is switched off
+    or behind an open provider breaker (`_backend_usable`), is benched (4xx
     bench, or slow bench when `skip_slow`), or is a paid OpenCode Go model
     while the usage-limit breaker is open."""
     if any((c.backend, c.model) == (tier.backend, tier.model) for c in chosen):
+        return False
+    if not _backend_usable(tier.backend, tier.model):
         return False
     if _model_is_benched(tier.backend.value, tier.model):
         return False
@@ -1585,6 +1734,15 @@ def _saas_overload_fallback_config(backend: Backend) -> BackendConfig:
     )
 
 
+def _usable_saas_fallback_backends() -> tuple[Backend, ...]:
+    """The overload valve's backends in order, minus any that are switched
+    off or behind an open provider breaker (grug#1225)."""
+    return tuple(
+        b for b in (Backend.POOLSIDE, Backend.OPENROUTER)
+        if _backend_usable(b, _BACKEND_CONFIGS[b].model)
+    )
+
+
 # A backend that answers with one of these is not busy - it is UNUSABLE, and
 # no amount of retrying or falling back changes that. 401/403 = the key is
 # wrong or revoked. 402 = the bill is unpaid. 404 = the endpoint or model name
@@ -1739,7 +1897,18 @@ def select_backend(installation_id: int) -> Backend:
         "select_backend assumes the Poolside/OpenRouter review pair; add a "
         "real selector before changing the review backends."
     )
-    return Backend.POOLSIDE if installation_id % 2 == 0 else Backend.OPENROUTER
+    preferred, other = (
+        (Backend.POOLSIDE, Backend.OPENROUTER) if installation_id % 2 == 0
+        else (Backend.OPENROUTER, Backend.POOLSIDE)
+    )
+    # A switched-off or breaker-blocked pick hands the call to the other one
+    # (grug#1225); with both unusable the pick stands and `_call_backend`
+    # refuses it before any network call.
+    if not _backend_usable(preferred, _BACKEND_CONFIGS[preferred].model) and _backend_usable(
+        other, _BACKEND_CONFIGS[other].model,
+    ):
+        return other
+    return preferred
 
 
 # Built once at import from the structured rule library (#188). The
@@ -2092,7 +2261,12 @@ def _post_with_retries(
                 _RETRY_SLEEP(_RETRY_BASE_DELAY * (2 ** attempt))
                 continue
             raise
-        if resp.status_code in _RETRYABLE_STATUSES and attempt < retry_attempts - 1:
+        if (
+            resp.status_code in _RETRYABLE_STATUSES
+            and attempt < retry_attempts - 1
+            # A spent daily or monthly allowance does not clear in a backoff.
+            and not _is_spent_quota_refusal(resp)
+        ):
             _RETRY_SLEEP(_RETRY_BASE_DELAY * (2 ** attempt))
             continue
         return resp
@@ -2229,12 +2403,7 @@ def _call_backend(
     is the entire cost this gate adds to their calls."""
     if cancel_event is not None and cancel_event.is_set():
         raise httpx.RequestError("cancelled before dispatch")
-    if (
-        config.backend == Backend.OPENCODE_GO
-        and not _opencode_go_model_is_free(config.model)
-        and not _opencode_go_available()
-    ):
-        raise OpencodeGoCircuitOpenError("opencode Go usage limit: breaker open")
+    _refuse_unusable_backend(config)
     if config.backend == Backend.OPENROUTER and is_free_tier_model(config.model):
         outcome = acquire_free_tier_slot(config.model, cancel_event=cancel_event)
         if not outcome.admitted:
@@ -2274,6 +2443,7 @@ def _call_backend(
         )
     if config.backend == Backend.OPENCODE_GO:
         _note_opencode_go_response(resp)
+    _note_provider_response(config, resp)
     _note_model_response(config, resp)
     return resp
 
@@ -2859,9 +3029,11 @@ def _interactive_backend_order(installation_id: int) -> tuple[Backend, ...]:
     failover = (
         Backend.OPENROUTER if primary == Backend.POOLSIDE else Backend.POOLSIDE
     )
+    order = [primary, failover]
     if os.getenv("GRUG_OPENCODE_GO_API_KEY_SSM", "").strip() and _opencode_go_available():
-        return primary, failover, Backend.OPENCODE_GO
-    return primary, failover
+        order.append(Backend.OPENCODE_GO)
+    # Switched-off and breaker-blocked backends are left out (grug#1225).
+    return tuple(b for b in order if _backend_usable(b, _BACKEND_CONFIGS[b].model))
 
 
 def _interactive_tags(
@@ -6079,7 +6251,7 @@ def _review_diff_dispatch_cave_primary(
         # slack GRUG_REVIEW_JOB_TIMEOUT_S reserves ahead of the Cave arms'
         # own worst-case 2x_review_llm_timeout_s() budget (see the k8s
         # manifest comment on GRUG_REVIEW_JOB_TIMEOUT_S).
-        for backend in (Backend.POOLSIDE, Backend.OPENROUTER):
+        for backend in _usable_saas_fallback_backends():
             config = _saas_overload_fallback_config(backend)
             attempt = _run_llm_attempt(
                 backend=backend,
