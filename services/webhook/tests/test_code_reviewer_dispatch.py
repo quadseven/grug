@@ -3552,3 +3552,109 @@ def test_durable_and_reopened_reviews_resolve_fixed_threads(monkeypatch, action)
         monkeypatch, action, lambda *a, **kw: calls.append(1) or 1,
     )
     assert calls == [1]
+
+
+# --- Elder withdraws its own stale block ------------------------------------
+
+_ELDER_TAG = "<!-- grug:review persona=elder -->"
+
+
+def _review(rid, *, state="CHANGES_REQUESTED", commit="old0000", body=_ELDER_TAG,
+            user_type="Bot"):
+    return {"id": rid, "state": state, "commit_id": commit, "body": body,
+            "user": {"login": "grug-tribe[bot]", "type": user_type}}
+
+
+def _run_dismiss(monkeypatch, llm, *, reviews, blocking=True):
+    dismissed = []
+    listed = []
+    monkeypatch.setattr(cr_dispatch, "review_diff", lambda *a, **kw: llm)
+    monkeypatch.setattr(cr_dispatch, "post_check_run", lambda *a, **kw: {})
+    monkeypatch.setattr(cr_dispatch, "post_review", lambda *a, **kw: {})
+    monkeypatch.setattr(
+        cr_dispatch, "list_reviews",
+        lambda *a, **kw: listed.append(kw["pull_number"]) or reviews,
+    )
+    monkeypatch.setattr(
+        cr_dispatch, "dismiss_review",
+        lambda *a, **kw: dismissed.append(kw["review_id"]) or {},
+    )
+    with patch("httpx.get", return_value=_diff_response()):
+        cr_dispatch.dispatch_code_review(_payload(action="synchronize"), blocking=blocking)
+    return listed, dismissed
+
+
+def test_clean_rereview_dismisses_only_elders_own_stale_block(monkeypatch):
+    """A clean re-review withdraws Elder's REQUEST_CHANGES on an earlier
+    commit. GitHub keeps that block until it is dismissed; a COMMENT review
+    does not replace it. Guard's block, a human's, an untagged one and a
+    block on the current head are all left alone."""
+    llm = LlmReviewResponse(kind="reviewed", findings=(), backend_used=Backend.POOLSIDE)
+    reviews = [
+        _review(1),                                                  # stale Elder block
+        _review(2, body="<!-- grug:review persona=guard -->"),       # Guard's block
+        _review(3, user_type="User"),                                # a human
+        _review(4, body="Grug Elder gaze upon your PR"),             # pre-tag review
+        _review(5, commit="abcd1234efgh"),                           # current head
+        _review(6, state="COMMENTED"),                               # not a block
+    ]
+    listed, dismissed = _run_dismiss(monkeypatch, llm, reviews=reviews)
+    assert listed == [7]
+    assert dismissed == [1]
+
+
+def test_failing_review_keeps_the_block(monkeypatch):
+    llm = LlmReviewResponse(
+        kind="reviewed",
+        findings=(LlmFinding(
+            path="src/x.py", line=2, rule="silent-failure",
+            severity="high", message="m",  # type: ignore[arg-type]
+        ),),
+        backend_used=Backend.POOLSIDE,
+    )
+    listed, dismissed = _run_dismiss(monkeypatch, llm, reviews=[_review(1)])
+    assert listed == []
+    assert dismissed == []
+
+
+def test_degraded_review_never_unblocks(monkeypatch):
+    """An LLM outage read nothing, so it must not withdraw a block."""
+    llm = LlmReviewResponse(kind="all_failed", error="poolside: timeout")
+    listed, dismissed = _run_dismiss(monkeypatch, llm, reviews=[_review(1)])
+    assert listed == []
+    assert dismissed == []
+
+
+def test_dismiss_failure_does_not_change_the_result(monkeypatch):
+    llm = LlmReviewResponse(kind="reviewed", findings=(), backend_used=Backend.POOLSIDE)
+    monkeypatch.setattr(cr_dispatch, "review_diff", lambda *a, **kw: llm)
+    monkeypatch.setattr(cr_dispatch, "post_check_run", lambda *a, **kw: {})
+    monkeypatch.setattr(cr_dispatch, "post_review", lambda *a, **kw: {})
+    monkeypatch.setattr(cr_dispatch, "list_reviews", lambda *a, **kw: [_review(1)])
+
+    def _boom(*a, **kw):
+        raise httpx.RequestError("down")
+
+    monkeypatch.setattr(cr_dispatch, "dismiss_review", _boom)
+    with patch("httpx.get", return_value=_diff_response()):
+        out = cr_dispatch.dispatch_code_review(_payload(action="synchronize"), blocking=True)
+    assert out["result"] == "pass"
+
+
+def test_review_body_carries_the_persona_tag():
+    from personas.code_reviewer.persona import CodeReviewEvaluation, Finding
+
+    evaluation = CodeReviewEvaluation(
+        findings=(Finding(
+            file="src/x.py", line=2, severity="medium",
+            rule_name="silent-failure", message="m", suggestion=None,
+        ),),
+        conclusion="success",
+    )
+    elder, _ = cr_dispatch._build_review_result(evaluation, head_sha="a" * 40, event="COMMENT")
+    guard, _ = cr_dispatch._build_review_result(
+        evaluation, head_sha="a" * 40, event="COMMENT", persona="guard",
+    )
+    assert _ELDER_TAG in elder.body
+    assert "<!-- grug:review persona=guard -->" in guard.body
+    assert _ELDER_TAG not in guard.body

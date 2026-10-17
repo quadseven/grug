@@ -163,7 +163,8 @@ REGISTRY: tuple[PersonaSpec, ...] = (
         # style) - conclusion "failure" + REQUEST_CHANGES. Safe because the gate
         # in dispatch.py fails OPEN on any degraded review (LLM outage, parse
         # failure, empty/huge diff) -> neutral, never a block; and the block
-        # clears when findings are fixed and re-pushed (Elder dedups + re-reviews).
+        # clears when findings are fixed and re-pushed: the clean re-review
+        # dismisses Elder's earlier REQUEST_CHANGES (a COMMENT alone would not).
         # NOTE: GitHub only *enforces* the block if "Grug - Elder" (or the
         # legacy alias "Grug - Code Review") is a REQUIRED status check -
         # the persona conclusion alone shows a red X but does not prevent merge.
