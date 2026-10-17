@@ -296,9 +296,12 @@ def _clean_tier1() -> LlmReviewResponse:
     )
 
 
-def _run_escalated_review(monkeypatch, *, deep: LlmReviewResponse) -> list[dict]:
+def _run_escalated_review(
+    monkeypatch, *, deep: LlmReviewResponse, blocking: bool = True,
+) -> list[dict]:
     """Drive one escalated tiered review (clean Tier-1, `deep` from the
-    reasoner) in blocking mode and return every posted check-run.
+    reasoner) in blocking mode (unless told otherwise) and return every
+    posted check-run.
 
     `blocking=True` on purpose: advisory mode forces `neutral` unconditionally
     and would hide a Tier-1 `success` left standing by a failed deep arm."""
@@ -325,7 +328,7 @@ def _run_escalated_review(monkeypatch, *, deep: LlmReviewResponse) -> list[dict]
     with patch("adapters.install_store.put_elder_last_reviewed", lambda **k: None), \
          patch("adapters.install_store.get_elder_last_reviewed", return_value=None), \
          patch("httpx.get", return_value=_diff_response()):
-        cr_dispatch.dispatch_code_review(_payload(), blocking=True)
+        cr_dispatch.dispatch_code_review(_payload(), blocking=blocking)
     return posted_checks
 
 
@@ -363,7 +366,9 @@ def test_async_deep_arm_failure_never_leaves_tier1_success_unqualified(
 
     MUST fail on main (no `grug-cr-deep:` check-run is ever posted) and pass
     once the failed arm folds into Tier-1 through `with_degradation` /
-    `_derive_conclusion` and completes the deep check-run `neutral`."""
+    `_derive_conclusion` and completes the deep check-run degraded - in
+    BLOCK mode that is `failure` (grug#1212): the escalated second look
+    never happened, so the required check must not pass."""
     with caplog.at_level("INFO"):
         posted = _run_escalated_review(monkeypatch, deep=failed_deep)
 
@@ -377,7 +382,11 @@ def test_async_deep_arm_failure_never_leaves_tier1_success_unqualified(
         "deep arm failed outright but no deep check-run was posted - the "
         "Tier-1 success stands unqualified"
     )
-    assert deep[-1]["conclusion"] == "neutral"
+    assert deep[-1]["conclusion"] == "failure"
+    assert deep[-1]["summary"].split("\n")[0] == (
+        f"Degraded review ({failed_deep.kind}): not a verdict. "
+        "Comment `/grug improve` to re-run once the backend recovers."
+    )
     assert "did not run" in deep[-1]["title"]
     assert failed_deep.kind in deep[-1]["title"]
     # The Tier-1 verdict is not disowned: this is "the second look never
@@ -387,6 +396,24 @@ def test_async_deep_arm_failure_never_leaves_tier1_success_unqualified(
     # Raw backend/parse error text never reaches the author-facing surface
     # (a parse failure's text can be model prose) - the log carries it.
     assert failed_deep.error not in deep[-1]["summary"]
+
+
+def test_async_deep_arm_failure_stays_neutral_in_warn_mode(monkeypatch):
+    """WARN mode is unchanged by grug#1212: the failed deep arm completes
+    its check `neutral`, still led by the degraded line."""
+    posted = _run_escalated_review(
+        monkeypatch,
+        deep=LlmReviewResponse(
+            kind="all_failed", error="cave-reasoner: ConnectError",
+            backend_used=Backend.CAVE_REASONER,
+        ),
+        blocking=False,
+    )
+
+    deep = _deep_checks(posted)
+    assert deep, "deep check-run was never posted"
+    assert deep[-1]["conclusion"] == "neutral"
+    assert deep[-1]["summary"].startswith("Degraded review (all_failed):")
 
 
 def test_async_deep_arm_ran_clean_still_publishes_success(monkeypatch):

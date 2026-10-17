@@ -11,7 +11,8 @@ End-to-end for one `pull_request` event:
 Advisory-first contract: when `blocking=False` (default per
 RepoConfig.code_reviewer_blocking) the check-run conclusion is forced to
 `neutral` and the review event to `COMMENT`, even when the evaluation
-itself returned `failure`. This lets us turn on the persona for every
+itself returned `failure`. In blocking mode a degraded review concludes
+`failure` (grug#1212, ADR-0023): a required neutral check passes. This lets us turn on the persona for every
 install without false-positive LLM findings blocking merges. Operator
 flips to blocking via dashboard once trust is established.
 
@@ -118,6 +119,9 @@ from personas.code_reviewer.persona import (
 )
 from personas.code_reviewer.snapshot import review_freshness_id_from_pr
 from personas.code_reviewer import carry_forward
+from personas.code_reviewer.degraded_gate import (
+    degraded_conclusion, gate_sentence, lead_with_degraded_line,
+)
 from personas.code_reviewer.thread_resolver import is_grug, resolve_fixed_threads
 from personas.code_reviewer.verify import verify_findings
 from personas.tribe import CHECK_ELDER
@@ -1146,6 +1150,7 @@ def _summary_markdown(
     living_baseline_rejected: str = "",
     review_phase: Literal["tier1", "deep", "dual"] = "dual",
     defensive_dropped_count: int = 0,
+    blocking: bool = False,
 ) -> tuple[str, str]:
     """Render a (title, summary) pair for the check-run output.
 
@@ -1162,6 +1167,9 @@ def _summary_markdown(
     as a summary note so the fallback is visible, not silent.
     `review_phase` (#646): tier1 = coder-only legend; deep = append legend;
     dual = both arms before publish (deep depth / rollback).
+    `blocking` (grug#1212) is the repo's Elder mode. It only changes what a
+    degraded summary says about the merge: in BLOCK mode a degraded review
+    fails closed, so "merge not blocked" would be false there.
     """
     held = _review_transparency(
         evaluation, suppressed_count, excluded_paths, oversized_paths,
@@ -1200,8 +1208,9 @@ def _summary_markdown(
         return hunt_title(title), (
             "Grug walked part of the diff - some ground did not fit one look, "
             "or a bounded cohort returned nothing usable. Validated markings "
-            "from the ground Grug walked are published below; this check stays "
-            "advisory. Coverage detail is in the table above."
+            "from the ground Grug walked are published below. "
+            + gate_sentence(blocking)
+            + " Coverage detail is in the table above."
         ) + held + hunt + defensive_note
     if is_low_confidence(evaluation.degraded_reason):
         title = "WARN Elder review low confidence"
@@ -1209,8 +1218,8 @@ def _summary_markdown(
             "Part of the diff got only a very short \"no findings\" answer "
             "that no other model confirmed, because every other model failed "
             "this pass. Grug keep the answer but not trust it. Validated "
-            "markings from the rest are published below; this check stays "
-            "advisory."
+            "markings from the rest are published below. "
+            + gate_sentence(blocking)
         ) + held + hunt + defensive_note
     if review_phase == "deep" and is_blackout(evaluation.degraded_reason):
         # grug#848: a blackout in the deep phase is the REASONER arm's -
@@ -1225,8 +1234,8 @@ def _summary_markdown(
             "Tier-1 coder-arm review completed and its markings stand. The "
             "deep reasoner arm promised on escalation did not run this pass "
             f"- the mist: `{evaluation.degraded_reason}`. Grug not say the "
-            "deeper look agreed; it never looked. This only counsel, merge "
-            "not blocked."
+            "deeper look agreed; it never looked. "
+            + gate_sentence(blocking)
         ) + held + hunt + defensive_note
     if evaluation.degraded_reason:
         # grug#985: when some cohorts were never opened (starved of budget),
@@ -1249,8 +1258,8 @@ def _summary_markdown(
         )
         return hunt_title(title), (
             "Grug Elder could not see the diff this pass. The mist: "
-            f"`{evaluation.degraded_reason}`. Grug stay his club — this "
-            "only counsel, merge not blocked."
+            f"`{evaluation.degraded_reason}`. "
+            + gate_sentence(blocking)
         ) + _tried_models_note(evaluation.coverage) + starved_note + held + hunt + defensive_note
     if not evaluation.findings:
         title = (
@@ -1831,6 +1840,7 @@ def _stack_detail_lines(
 
 def _stack_status_line(
     evaluation: CodeReviewEvaluation, n: int, sev_bits: str,
+    conclusion: str = "neutral",
 ) -> str:
     """The board section's one-line status.
 
@@ -1851,7 +1861,14 @@ def _stack_status_line(
             else "Low confidence - only a short empty answer, no other model confirmed it"
         )
     if is_real_degradation(evaluation.degraded_reason):
-        return f"Degraded (`{evaluation.degraded_reason}`) - advisory only"
+        # grug#1212: in BLOCK mode the degraded check fails closed, so
+        # "advisory only" would tell the author the opposite of the gate.
+        gate = (
+            "check fails until a full review lands"
+            if conclusion == "failure"
+            else "advisory only"
+        )
+        return f"Degraded (`{evaluation.degraded_reason}`) - {gate}"
     if n == 0:
         return "Clear - no markings published"
     return f"**{n} actionable marking(s)** ({sev_bits})"
@@ -1955,7 +1972,7 @@ def _review_stack_body(
     sev_bits = ", ".join(
         f"{k}={by_sev[k]}" for k in ("critical", "high", "medium", "low") if k in by_sev
     ) or "none"
-    status_line = _stack_status_line(evaluation, n, sev_bits)
+    status_line = _stack_status_line(evaluation, n, sev_bits, conclusion)
 
     # Ten, not twenty-five. <details> does NOT fold in Gmail - the raw
     # notification HTML for grug#799 carried a real <details>, and Gmail
@@ -2203,6 +2220,7 @@ def _resolve_result(
 
 def _publish_shape(
     evaluation: CodeReviewEvaluation, *, mode: ReviewMode,
+    degraded_fails_closed: bool = False,
 ) -> tuple[CheckConclusion, ReviewEvent]:
     """Single source of truth for the advisory-vs-blocking gate.
 
@@ -2211,10 +2229,23 @@ def _publish_shape(
     of bug where the check-run says "failure" but the inline review
     says "COMMENT" (or vice-versa) because the two if/else branches
     drifted.
+
+    `degraded_fails_closed` (grug#1212, ADR-0023) is Elder's: a required
+    check that concludes `neutral` passes on GitHub, so in BLOCK mode a
+    degraded Elder review (every model failed, a parse failure, a partial
+    or low-confidence review) concludes `failure`. The event stays
+    `COMMENT`: a degraded review is not a verdict to request changes on.
+    `no_diff` is not a degradation (nothing to review) and keeps neutral.
+    Guard and Smasher share this gate and do not opt in.
     """
-    # Any degraded evaluation (LLM outage, parse failure, empty diff)
-    # forces advisory regardless of mode — Elder cannot block a PR on
-    # infrastructure flakiness or a non-reviewable shape.
+    if (
+        degraded_fails_closed
+        and mode == "blocking"
+        and is_real_degradation(evaluation.degraded_reason)
+    ):
+        return "failure", "COMMENT"
+    # Otherwise a degraded evaluation (LLM outage, parse failure, empty
+    # diff) forces advisory regardless of mode.
     if mode == "advisory" or evaluation.degraded_reason:
         return "neutral", "COMMENT"
     if evaluation.conclusion == "failure":
@@ -2693,9 +2724,10 @@ def dispatch_code_review(
     verdict survives.
 
     Returns a structured-log dict; never raises a wire-level
-    exception — LLM outages, parse errors, and publish failures all
-    degrade to advisory neutral so this persona cannot 500 the
-    webhook handler.
+    exception - LLM outages, parse errors, and publish failures all
+    degrade to a published degraded check (neutral in advisory mode,
+    failure in blocking mode, grug#1212 / ADR-0023) so this persona
+    cannot 500 the webhook handler.
 
     `cancel_event` (#635 follow-up): passed straight through to
     `review_diff`, which aborts an in-flight Cave arm call the moment it
@@ -2952,8 +2984,8 @@ def dispatch_code_review(
             check_summary: str | None = (
                 "GitHub refused to serve this pull request's diff (HTTP 406): "
                 "it is over the API's diff size limit. Split the change into "
-                "smaller pull requests to get an Elder review. Advisory "
-                "neutral - PR merge is not blocked."
+                "smaller pull requests to get an Elder review. "
+                + gate_sentence(blocking)
             )
             verdict_summary = (
                 "Grug could not look - diff is over GitHub's size limit"
@@ -2964,7 +2996,7 @@ def dispatch_code_review(
             verdict_summary = "Grug could not look — diff fetch/parse failed"
         degraded = _publish_degraded(
             installation_id, owner, repo_name, pull_number, head_sha,
-            reason=reason, summary=check_summary,
+            reason=reason, summary=check_summary, blocking=blocking,
         )
         # Errored Activity row (PRD #301): Grug couldn't even fetch/parse the
         # diff — record it so it surfaces as `errored` (re-runnable in S3a),
@@ -2975,7 +3007,7 @@ def dispatch_code_review(
             repo=f"{owner}/{repo_name}",
             pr_number=pull_number,
             head_sha=head_sha,
-            conclusion="neutral",
+            conclusion=degraded_conclusion(blocking),
             summary=verdict_summary,
             findings_count=0,
             blocking=blocking,
@@ -3378,7 +3410,9 @@ def dispatch_code_review(
 
     # Both clients are independent — a 5xx on review post must not
     # skip the check-run post.
-    conclusion, event = _publish_shape(evaluation, mode=mode)
+    conclusion, event = _publish_shape(
+        evaluation, mode=mode, degraded_fails_closed=True,
+    )
     depth_now = os.getenv("GRUG_REVIEW_DEPTH", "tiered").strip().lower()
     tier1_phase: Literal["tier1", "deep", "dual"] = (
         "tier1" if depth_now == "tiered" else "dual"
@@ -3392,6 +3426,7 @@ def dispatch_code_review(
         living_baseline_rejected=living_baseline_rejected,
         review_phase=tier1_phase,
         defensive_dropped_count=defensive_dropped_count,
+        blocking=blocking,
     )
     summary = _intent_paragraph(pr_context) + summary
     if ruff_policy_dropped:
@@ -3411,6 +3446,10 @@ def dispatch_code_review(
         pull_number=pull_number, conclusion=conclusion, title=title,
         summary=summary,
     )
+    if is_real_degradation(evaluation.degraded_reason):
+        # grug#1212: the first line of a degraded summary says so, and how to
+        # re-run, ahead of the intent paragraph.
+        summary = lead_with_degraded_line(summary, str(evaluation.degraded_reason))
     check_result = CheckRunResult(
         name=_CHECK_NAME,
         head_sha=head_sha,
@@ -4232,7 +4271,9 @@ def _publish_deep_review(
     # Use combined_eval (Tier-1 + deep) so the stack preserves all findings,
     # severity, and actionable counts - not just novel_deep.
     try:
-        conclusion, _ = _publish_shape(combined_eval, mode=mode)
+        conclusion, _ = _publish_shape(
+            combined_eval, mode=mode, degraded_fails_closed=True,
+        )
         stack_body = _review_stack_body(
             combined_eval,
             conclusion=conclusion,
@@ -4459,13 +4500,16 @@ def _async_deep_append_if_needed(
     # ground the deep arm never finished walking.
     combined = with_degradation(combined, deep_eval)
 
-    conclusion, event = _publish_shape(combined, mode=mode)
+    conclusion, event = _publish_shape(
+        combined, mode=mode, degraded_fails_closed=True,
+    )
     title, summary = _summary_markdown(
         combined,
         suppressed_count=deep_suppressed_count,
         living_range=living_range,
         living_baseline_rejected=living_baseline_rejected,
         review_phase="deep",
+        blocking=blocking,
     )
     summary = _intent_paragraph(pr_context) + summary
     summary += config_note
@@ -4486,6 +4530,8 @@ def _async_deep_append_if_needed(
         )
     )
     summary = f"{preamble}\n\n{summary}"
+    if is_real_degradation(combined.degraded_reason):
+        summary = lead_with_degraded_line(summary, str(combined.degraded_reason))
     _publish_deep_check(
         installation_id=installation_id,
         owner=owner,
@@ -4541,15 +4587,20 @@ def _async_deep_append_if_needed(
 def _publish_degraded(
     installation_id: int, owner: str, repo_name: str, pull_number: int,
     head_sha: str, *, reason: str, summary: str | None = None,
+    blocking: bool = False,
 ) -> dict[str, str]:
-    """Post the "skipped" check-run when fetch/parse fails. Best-effort —
+    """Post the "skipped" check-run when fetch/parse fails. Best-effort -
     a publish failure here is also swallowed since we can't do anything
-    useful with it (would need its own degraded publish, etc)."""
+    useful with it (would need its own degraded publish, etc).
+
+    grug#1212: concludes `failure` when the repo's Elder is blocking (no
+    review happened, and a neutral required check would pass), `neutral`
+    in WARN mode; the summary leads with the degraded line either way."""
     title = f"WARN Elder review skipped ({reason})"
-    summary = summary or (
-        f"Elder could not run this pass: `{reason}`. Advisory neutral "
-        "— PR merge is not blocked."
-    )
+    summary = lead_with_degraded_line(summary or (
+        f"Elder could not run this pass: `{reason}`. " + gate_sentence(blocking)
+    ), reason)
+    conclusion = degraded_conclusion(blocking)
     publish_failed = False
     try:
         with_install_token_retry(
@@ -4558,7 +4609,7 @@ def _publish_degraded(
                 token, owner, repo_name,
                 CheckRunResult(
                     name=_CHECK_NAME, head_sha=head_sha, status="completed",
-                    conclusion="neutral", title=title, summary=summary,
+                    conclusion=conclusion, title=title, summary=summary,
                 ),
                 external_id=(
                     f"grug-cr:{owner}/{repo_name}#{pull_number}:{head_sha}"

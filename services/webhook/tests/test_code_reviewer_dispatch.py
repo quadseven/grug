@@ -601,10 +601,11 @@ def test_dispatch_no_findings_posts_clean_pass(monkeypatch):
     assert posted_review == []
 
 
-def test_dispatch_llm_outage_does_not_block_pr(monkeypatch):
-    """LLM all_failed → advisory check-run posted with conclusion=neutral
-    and degraded_reason message. No inline review (nothing to comment
-    on). Elder must not 500 the dispatcher on LLM outages."""
+def test_dispatch_llm_outage_fails_closed_in_block_mode(monkeypatch):
+    """LLM all_failed in BLOCK mode -> the check concludes `failure`
+    (grug#1212, ADR-0023: a required neutral would pass the merge with no
+    review behind it), led by the degraded line. No inline review (nothing
+    to comment on). Elder must not 500 the dispatcher on LLM outages."""
     llm = LlmReviewResponse(kind="all_failed", error="poolside: timeout")
     posted_check, posted_review = [], []
     monkeypatch.setattr(cr_dispatch, "review_diff", lambda *a, **kw: llm)
@@ -620,9 +621,11 @@ def test_dispatch_llm_outage_does_not_block_pr(monkeypatch):
     with patch("httpx.get", return_value=_diff_response()):
         out = cr_dispatch.dispatch_code_review(_payload(), blocking=True)
 
-    # Even in blocking mode, an LLM outage degrades to neutral —
-    # advisory-first contract.
-    assert posted_check[0].conclusion == "neutral"
+    assert posted_check[0].conclusion == "failure"
+    assert posted_check[0].summary.split("\n")[0] == (
+        "Degraded review (all_failed): not a verdict. "
+        "Comment `/grug improve` to re-run once the backend recovers."
+    )
     assert posted_review == []
     assert out == {
         "persona": "code_reviewer",
@@ -2108,9 +2111,14 @@ def test_partial_review_stays_advisory_but_publishes_validated_findings():
         degraded_reason="partial_review",
     )
 
+    # The shared gate (Guard, Smasher) keeps partial coverage advisory ...
     assert cr_dispatch._publish_shape(
         evaluation, mode="blocking",
     ) == ("neutral", "COMMENT")
+    # ... while Elder's BLOCK mode fails closed on it (grug#1212).
+    assert cr_dispatch._publish_shape(
+        evaluation, mode="blocking", degraded_fails_closed=True,
+    ) == ("failure", "COMMENT")
     result, posted_findings = cr_dispatch._build_review_result(
         evaluation, head_sha="a" * 40, event="COMMENT",
     )
