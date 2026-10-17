@@ -4303,7 +4303,7 @@ def _file_split_targets(
     in a way a smaller input could fix, and span more than one file."""
     return [
         index
-        for index, (cohort, response) in enumerate(zip(plan.cohorts, responses))
+        for index, (cohort, response) in enumerate(zip(plan.cohorts, responses, strict=True))
         if len(cohort.paths) > 1
         and not cohort.oversized
         and _is_retryable_cohort_failure(response)
@@ -4350,7 +4350,7 @@ def _splice_file_chunks(
     pending = iter(sub_responses)
     cohorts: list[ReviewCohort] = []
     merged: list[LlmReviewResponse] = []
-    for index, (cohort, response) in enumerate(zip(plan.cohorts, responses)):
+    for index, (cohort, response) in enumerate(zip(plan.cohorts, responses, strict=True)):
         if index not in chunks:
             cohorts.append(cohort)
             merged.append(response)
