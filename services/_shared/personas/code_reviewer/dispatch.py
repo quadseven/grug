@@ -1203,6 +1203,15 @@ def _summary_markdown(
             "from the ground Grug walked are published below; this check stays "
             "advisory. Coverage detail is in the table above."
         ) + held + hunt + defensive_note
+    if is_low_confidence(evaluation.degraded_reason):
+        title = "WARN Elder review low confidence"
+        return hunt_title(title), (
+            "Part of the diff got only a very short \"no findings\" answer "
+            "that no other model confirmed, because every other model failed "
+            "this pass. Grug keep the answer but not trust it. Validated "
+            "markings from the rest are published below; this check stays "
+            "advisory."
+        ) + held + hunt + defensive_note
     if review_phase == "deep" and is_blackout(evaluation.degraded_reason):
         # grug#848: a blackout in the deep phase is the REASONER arm's -
         # `_async_deep_decision` never starts the deep append over a
@@ -1696,6 +1705,17 @@ BENIGN_DEGRADATIONS = frozenset({"no_diff"})
 PARTIAL_COVERAGE = "partial_review"
 
 
+# grug#1097: the only answer for some of the diff was a short empty one that
+# no other model confirmed, kept because every later model failed. It is a
+# clean result, not a trusted one: findings from the rest still publish, the
+# check stays advisory, and the surfaces say low confidence rather than
+# "could not see".
+LOW_CONFIDENCE = "low_confidence_review"
+
+# Degradations whose findings are real, diff-anchored evidence and publish.
+PUBLISHABLE_DEGRADATIONS = frozenset({PARTIAL_COVERAGE, LOW_CONFIDENCE})
+
+
 def is_real_degradation(reason: str | None) -> bool:
     return bool(reason) and reason not in BENIGN_DEGRADATIONS
 
@@ -1705,13 +1725,18 @@ def is_partial_coverage(reason: str | None) -> bool:
     return reason == PARTIAL_COVERAGE
 
 
+def is_low_confidence(reason: str | None) -> bool:
+    """Elder has an answer, but a short empty one nobody confirmed."""
+    return reason == LOW_CONFIDENCE
+
+
 def is_blackout(reason: str | None) -> bool:
     """Elder produced nothing usable this pass - the 'could not see' case.
 
     Split out from `is_real_degradation` so partial coverage stops borrowing
     the blackout vocabulary. Both are still 'news' for `worth_an_email`; they
     are simply not the same news."""
-    return is_real_degradation(reason) and not is_partial_coverage(reason)
+    return is_real_degradation(reason) and reason not in PUBLISHABLE_DEGRADATIONS
 
 
 # Degradations the durable lane re-drives (rerun's `_RETRYABLE_SKIP_REASONS`
@@ -1819,6 +1844,12 @@ def _stack_status_line(
             if n
             else "Partial coverage - no markings on the ground Grug walked"
         )
+    if is_low_confidence(evaluation.degraded_reason):
+        return (
+            f"Low confidence - {n} marking(s); some ground got only a short empty answer"
+            if n
+            else "Low confidence - only a short empty answer, no other model confirmed it"
+        )
     if is_real_degradation(evaluation.degraded_reason):
         return f"Degraded (`{evaluation.degraded_reason}`) - advisory only"
     if n == 0:
@@ -1875,6 +1906,17 @@ def _stack_closing_note(evaluation: CodeReviewEvaluation) -> list[str]:
         # Elder DID review - just not all of it. "Grug could not see" would
         # discard real work and read as a tool failure.
         return ["", "---", "", _unwalked_ground_note(evaluation), ""]
+    if is_low_confidence(evaluation.degraded_reason):
+        return [
+            "",
+            "---",
+            "",
+            (
+                "Some ground got only a very short \"no findings\" answer and "
+                "no other model answered. Grug not say trail safe there."
+            ),
+            "",
+        ]
     if is_real_degradation(evaluation.degraded_reason):
         # Degraded with empty findings is not a clean review, and the one thing
         # that must never happen is a reader taking it for one.
@@ -1990,7 +2032,7 @@ def _review_stack_body(
         board.render_header(
             pr_title, blocking, advisory,
             degraded=is_blackout(evaluation.degraded_reason),
-            partial=is_partial_coverage(evaluation.degraded_reason),
+            partial=evaluation.degraded_reason in PUBLISHABLE_DEGRADATIONS,
         ),
     )
     return board.upsert_section(body, "elder", "\n".join(parts).strip())
@@ -2253,7 +2295,7 @@ def _build_review_result(
     `file_contents` is the head text dispatch already loaded. Every fix is
     offered as a committable block only after `checked_suggestion` (#1149)
     verifies it against that text; a file with no loaded text gets prose."""
-    if evaluation.degraded_reason not in (None, "", "partial_review"):
+    if evaluation.degraded_reason not in (None, "", *PUBLISHABLE_DEGRADATIONS):
         return None, ()
     new_findings = dedup_findings(evaluation.findings, prior_keys)
     # Complexity is summary advice by default. An inline thread requires a
@@ -3416,7 +3458,7 @@ def dispatch_code_review(
     precedent_notes = (
         _precedent_notes_for(f"{owner}/{repo_name}", evaluation.findings)
         if evaluation.findings
-        and evaluation.degraded_reason in (None, "", "partial_review")
+        and evaluation.degraded_reason in (None, "", *PUBLISHABLE_DEGRADATIONS)
         else {}
     )
     review_result, posted_findings = _build_review_result(
@@ -3838,7 +3880,8 @@ def _async_deep_decision(
         check_publish_failed
         or not _async_deep_enabled()
         or depth != "tiered"
-        or evaluation.degraded_reason not in (None, "", "no_diff", "partial_review")
+        or evaluation.degraded_reason
+        not in (None, "", "no_diff", *PUBLISHABLE_DEGRADATIONS)
         or (cancel_event is not None and cancel_event.is_set())
     )
     if unavailable:

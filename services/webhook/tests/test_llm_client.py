@@ -5563,3 +5563,112 @@ def test_a_slow_primary_is_skipped_on_the_next_review(monkeypatch) -> None:
         out = review_diff([_hunk()], installation_id=1)
     assert out.kind == "reviewed"
     assert calls == ["deepseek-v4.1-flash"]
+
+
+# --- grug#1097: a short empty answer is kept when nothing better answers ---
+
+
+def _pin_deepseek_primary(monkeypatch) -> str:
+    paid = "deepseek-v4.1-flash"
+    monkeypatch.setattr(lc, "_OPENCODE_GO_MODEL", paid)
+    monkeypatch.setitem(
+        lc._BACKEND_CONFIGS, Backend.OPENCODE_GO,
+        lc.replace(lc._BACKEND_CONFIGS[Backend.OPENCODE_GO], model=paid),
+    )
+    return paid
+
+
+def test_deepseek_degenerate_with_every_later_tier_failing_is_low_confidence(
+    monkeypatch,
+) -> None:
+    """grug#1097: DeepSeek answered `{"findings": []}` in a few tokens, then
+    every later tier (the free tier, Poolside, the Cave) failed. The answer
+    used to be discarded and the cohort failed, which spent the staged budget
+    on retries. It is kept as a clean result with its own degraded reason."""
+    monkeypatch.setenv("GRUG_REVIEW_BACKEND_PRIORITY", "cloud")
+    monkeypatch.setenv("GRUG_CLOUD_FREE_TIER_MODEL", "z-ai/glm-5.2:free")
+    _admit_free_tier(monkeypatch)
+    paid = _pin_deepseek_primary(monkeypatch)
+    models: list[str] = []
+
+    def respond(_url, **kwargs) -> httpx.Response:
+        model = kwargs["json"].get("model", "")
+        models.append(model)
+        if model == paid:
+            return _degenerate_response()
+        raise httpx.ConnectError("down")
+
+    with patch.object(httpx, "post", side_effect=respond):
+        out = review_diff([_hunk()], installation_id=1)
+
+    assert out.kind == "reviewed"
+    assert out.findings == ()
+    assert out.backend_used == Backend.OPENCODE_GO
+    assert out.error.startswith("low confidence:")
+    # Kept, not retried: the chunk is a result, so the ladder stops.
+    assert models.count(paid) == 1
+    evaluation = evaluate_diff((), out)
+    assert evaluation.degraded_reason == "low_confidence_review"
+    assert evaluation.conclusion == "neutral"
+
+
+def test_low_confidence_cohort_does_not_starve_the_next_cohort(monkeypatch) -> None:
+    """grug#1097: one degenerate cohort walked the whole chain, failed, and
+    was retried, so later cohorts went unreviewed. Now the degenerate cohort
+    keeps its answer, the next cohort is reviewed, and nothing is failed."""
+    monkeypatch.setenv("GRUG_REVIEW_BACKEND_PRIORITY", "cloud")
+    monkeypatch.setenv("GRUG_REVIEW_COHORT_CHARS", "8000")
+    paid = _pin_deepseek_primary(monkeypatch)
+    hunks = [
+        _hunk("src/x.py", "@@ -1 +1 @@\n+SRC_CHANGE\n" + "s" * 4100),
+        _hunk("tests/test_x.py", "@@ -1 +1 @@\n+TEST_CHANGE\n" + "t" * 4100),
+    ]
+    src_primary_calls = 0
+
+    def respond(_url, **kwargs) -> httpx.Response:
+        nonlocal src_primary_calls
+        body = kwargs["json"]
+        prompt = body["messages"][1]["content"]
+        if body.get("model") != paid:
+            raise httpx.ConnectError("down")
+        if "SRC_CHANGE" in prompt:
+            src_primary_calls += 1
+            return _degenerate_response()
+        return _usage_response(
+            '{"findings": [{"path": "tests/test_x.py", "line": 1, "rule": "r", '
+            '"severity": "medium", "message": "m"}]}', 15_000, 400,
+        )
+
+    with patch.object(httpx, "post", side_effect=respond):
+        out = review_diff(hunks, installation_id=1)
+
+    assert out.kind == "reviewed"
+    assert [f.path for f in out.findings] == ["tests/test_x.py"]
+    assert out.coverage is not None
+    assert out.coverage.failed_cohorts == ()
+    assert out.error.startswith("low confidence:")
+    assert "cohorts [1]" in out.error
+    assert src_primary_calls == 1
+    evaluation = evaluate_diff((), out)
+    assert evaluation.degraded_reason == "low_confidence_review"
+
+
+def test_deep_append_keeps_a_degenerate_answer_when_the_reasoner_fails(
+    monkeypatch,
+) -> None:
+    """grug#1097, deep-append path: the Cave reasoner is the last tier there."""
+    monkeypatch.setenv("GRUG_REVIEW_BACKEND_PRIORITY", "cloud")
+    paid = _pin_deepseek_primary(monkeypatch)
+
+    def respond(_url, **kwargs) -> httpx.Response:
+        if kwargs["json"].get("model") == paid:
+            return _degenerate_response()
+        raise httpx.ConnectError("down")
+
+    with patch.object(httpx, "post", side_effect=respond):
+        out = lc.review_reasoner_diff([_hunk()], installation_id=1)
+
+    assert out.kind == "reviewed"
+    assert out.findings == ()
+    assert out.backend_used == Backend.OPENCODE_GO
+    assert out.error.startswith("low confidence:")
