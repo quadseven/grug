@@ -265,6 +265,9 @@ def test_the_free_per_day_cap_blocks_the_free_tier_and_is_not_retried() -> None:
 
 
 @pytest.mark.parametrize("resp", [
+    # Poolside's short-lived throttle (live 2026-10-17, no Retry-After).
+    _err(429, "usage limit exceeded"),
+    _err(429, "quota exceeded, try again shortly"),
     _err(429, "Rate limit exceeded: free-models-per-min."),
     _err(429, "slow down"),
     _err(500, "boom"),
@@ -338,3 +341,24 @@ def test_a_review_skips_a_provider_after_its_first_auth_refusal(monkeypatch) -> 
         second = review_diff([_hunk()], installation_id=1)
     assert second.backend_used == Backend.POOLSIDE
     assert fake.hosts() == {_POOLSIDE_URL}
+
+
+def test_a_poolside_usage_limit_429_keeps_poolside_in_the_chain() -> None:
+    """The live regression: one `429 usage limit exceeded` from Poolside
+    blocked the only working cloud tier for an hour. It is throttling: the
+    call is retried by the backoff loop and Poolside stays in the chain."""
+    cfg = lc.replace(lc._BACKEND_CONFIGS[Backend.POOLSIDE], retry_attempts=2)
+    with patch.object(
+        httpx, "post", side_effect=[_err(429, "usage limit exceeded"), _ok()],
+    ) as post:
+        assert lc._call_backend(cfg, _MESSAGES).status_code == 200
+    assert post.call_count == 2
+    assert lc._provider_available(Backend.POOLSIDE, lc._POOLSIDE_MODEL)
+    assert Backend.POOLSIDE in [t.backend for t in lc._cloud_chain_tiers()]
+
+
+def test_opencode_go_monthly_usage_limit_still_trips_the_breaker() -> None:
+    body = {"error": {"type": "GoUsageLimitError", "message": "Go usage limit exceeded"}}
+    with patch.object(httpx, "post", return_value=httpx.Response(429, json=body)):
+        lc._call_backend(_go("longcat-2.5-preview-free"), _MESSAGES)
+    assert not lc._provider_available(Backend.OPENCODE_GO, "longcat-2.5-preview-free")
