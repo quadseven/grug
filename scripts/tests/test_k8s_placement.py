@@ -43,3 +43,16 @@ def test_prefers_oci_zones_softly(name):
 def test_zone_spread_stays_soft(name):
     for c in _spec(name)["topologySpreadConstraints"]:
         assert c["whenUnsatisfiable"] == "ScheduleAnyway"
+
+
+def _env(name: str) -> dict:
+    (container,) = [c for c in _spec(name)["containers"] if c.get("env")][:1]
+    return {e["name"]: e.get("value") for e in container["env"]}
+
+
+def test_cave_models_match_the_webhook():
+    # Both services call the same Cave arms; a model only one of them asks for
+    # can name a model no Spark serves while the other keeps working.
+    consumer, webhook = _env("consumer-deployment.yaml"), _env("webhook-deployment.yaml")
+    for key in ("GRUG_CAVE_JUDGE_MODEL", "GRUG_CAVE_REVIEW_MODEL", "GRUG_CAVE_REASONER_MODEL"):
+        assert consumer.get(key) == webhook.get(key), key
