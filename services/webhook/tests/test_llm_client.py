@@ -5233,12 +5233,17 @@ def test_the_bench_is_per_model(monkeypatch) -> None:
     assert "space-bunny-free" in models
 
 
+def _cloud_chain_worst_case_s() -> float:
+    """Seconds one walk of the cloud chain can take: every tier's timeout."""
+    return sum(tier.timeout_seconds for tier in lc._cloud_chain_tiers())
+
+
 def test_benched_tiers_are_skipped_in_the_walk_and_the_worst_case(monkeypatch) -> None:
     monkeypatch.setenv("GRUG_REVIEW_BACKEND_PRIORITY", "cloud")
-    before = lc._cloud_chain_worst_case_s()
+    before = _cloud_chain_worst_case_s()
     for _ in range(3):
         _call(_go_cfg(), _err(404))
-    assert lc._cloud_chain_worst_case_s() == before - lc._opencode_go_chain_config().timeout_seconds
+    assert _cloud_chain_worst_case_s() == before - lc._opencode_go_chain_config().timeout_seconds
     real = _usage_response(_JUNK_FINDING, 15_000, 400)
     with patch.object(httpx, "post", return_value=real) as post:
         out = review_diff([_hunk()], installation_id=1)
@@ -5435,11 +5440,11 @@ def test_slow_bench_expires(monkeypatch) -> None:
 def test_slow_benched_tier_is_skipped_and_leaves_the_worst_case(monkeypatch) -> None:
     monkeypatch.setenv("GRUG_REVIEW_BACKEND_PRIORITY", "cloud")
     monkeypatch.setenv("GRUG_OPENCODE_GO_FALLBACK_MODEL", "deepseek-v4.1-flash")
-    before = lc._cloud_chain_worst_case_s()
+    before = _cloud_chain_worst_case_s()
     primary = next(t for t in lc._cloud_chain_tiers() if t.model == "space-bunny-free")
     _timeout(_go_cfg(), 3)
     assert _free_models()[0] == "deepseek-v4.1-flash"
-    assert lc._cloud_chain_worst_case_s() == before - primary.timeout_seconds
+    assert _cloud_chain_worst_case_s() == before - primary.timeout_seconds
 
 
 def test_a_success_clears_the_slow_bench_and_the_backoff(monkeypatch) -> None:
