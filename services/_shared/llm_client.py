@@ -31,6 +31,7 @@ paths so this module only ever runs from the webhook process.
 """
 from __future__ import annotations
 
+import contextlib
 import contextvars
 import hashlib
 import fnmatch
@@ -46,7 +47,7 @@ import uuid
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, field, replace
 from enum import Enum
-from typing import Any, Callable, Literal, Optional, Sequence, TypedDict, cast, get_args
+from typing import Any, Callable, Iterator, Literal, Optional, Sequence, TypedDict, cast, get_args
 
 import httpx
 
@@ -375,6 +376,65 @@ _OVERSIZED_COHORT_ERROR = "cohort budget exceeded"
 # diff is split or the budget rises (grug#939). The prefix is matched, not
 # re-spelled, so the classifier cannot drift from the reason strings below.
 _SKIPPED_COHORT_PREFIX = "cohort skipped: "
+
+# The staged review's deadline (grug#1216), as a `time.monotonic()` value.
+# The scheduler used to reserve one worst-case ladder walk (Cave timeout +
+# two SaaS fallbacks + every cloud tier, 480-575s of a 600-700s budget)
+# before starting each cohort, so cohorts could only START in the first
+# ~30-220s and the rest were "never attempted". Under a deadline every model
+# call is clamped to the time left instead, so a started cohort still cannot
+# overrun the budget and the scheduler only has to hold back the time one
+# cohort needs to be worth starting.
+_REVIEW_DEADLINE: contextvars.ContextVar[float | None] = contextvars.ContextVar(
+    "grug_review_deadline", default=None,
+)
+# A call with less than this left is not sent: it could not finish a review.
+_DEADLINE_CALL_FLOOR_SECONDS = 10.0
+# What a cohort needs to be worth starting under a deadline: one slow cloud
+# answer (Poolside's 45s chain timeout) plus parsing. Replaces the
+# worst-case ladder walk as the scheduler's reserve.
+_MIN_DEADLINE_COHORT_SECONDS = 60.0
+
+
+class ReviewDeadlineReached(httpx.RequestError):
+    """A model call was cut, or never sent, because the staged review's
+    deadline passed. A RequestError (not a TimeoutException) on purpose:
+    every caller already treats it as a transport failure, and the slow bench
+    only counts real timeouts - a deadline cut says nothing about the model."""
+
+
+@contextlib.contextmanager
+def _review_deadline(deadline: float) -> Iterator[None]:
+    """Run the block under `deadline` (monotonic), or an earlier one already set."""
+    current = _REVIEW_DEADLINE.get()
+    token = _REVIEW_DEADLINE.set(deadline if current is None else min(current, deadline))
+    try:
+        yield
+    finally:
+        _REVIEW_DEADLINE.reset(token)
+
+
+def _deadline_passed() -> bool:
+    """Whether a deadline is set and too little of it is left for one call."""
+    deadline = _REVIEW_DEADLINE.get()
+    return deadline is not None and (
+        deadline - time.monotonic() < _DEADLINE_CALL_FLOOR_SECONDS
+    )
+
+
+def _deadline_timeout(timeout_seconds: float, deadline: float | None) -> float:
+    """`timeout_seconds` clamped to the time left before `deadline`.
+
+    Raises `ReviewDeadlineReached` when less than the call floor is left, so a
+    call that could not finish is never sent."""
+    if deadline is None:
+        return timeout_seconds
+    left = deadline - time.monotonic()
+    if left < _DEADLINE_CALL_FLOOR_SECONDS:
+        raise ReviewDeadlineReached(
+            f"staged review deadline reached ({max(left, 0.0):.1f}s left)"
+        )
+    return min(timeout_seconds, left)
 
 # One extra attempt per cohort. A second failure is treated as real: further
 # attempts spend budget the remaining cohorts need, and the failure modes that
@@ -1238,15 +1298,6 @@ def _tier_is_usable(
     return True
 
 
-def _cloud_chain_worst_case_s() -> float:
-    """Seconds the cloud chain can spend on one cohort before the Cave runs;
-    0 under `cave` priority. Keeps the staged scheduler's reserve honest now
-    that a cohort can walk three cloud tiers first."""
-    if _review_backend_priority() != "cloud":
-        return 0.0
-    return sum(tier.timeout_seconds for tier in _cloud_chain_tiers())
-
-
 # Poolside tier: 45s, not the 25s shared by the other tiers. Its laguna-s-2.1
 # answered grug's calls in a median 9-14s and a max 79s over 2026-09-23..26.
 _POOLSIDE_CHAIN_TIMEOUT_SECONDS = 45.0
@@ -2017,15 +2068,26 @@ class _BackendConfigError(Exception):
 def _post_with_retries(
     url: str, body: dict[str, Any], headers: dict[str, str],
     timeout_seconds: float, retry_attempts: int, transport_attempts: int,
+    deadline: float | None = None,
 ) -> httpx.Response:
     """The actual 429/503-retrying HTTP call, shared by both `_call_backend`
     paths below. Always goes through the bare `httpx.post()` convenience
     function (not an explicit `httpx.Client`) - tests mock `httpx.post`
-    directly, and this keeps that working unmodified for every caller."""
+    directly, and this keeps that working unmodified for every caller.
+
+    `deadline` (grug#1216) is passed explicitly, not read from the context
+    var, because the cancellable path runs this on a fresh thread that does
+    not inherit it. Each attempt is clamped to the time left; a timeout that
+    only fired because of the clamp is re-raised as `ReviewDeadlineReached`."""
     for attempt in range(retry_attempts):
+        attempt_timeout = _deadline_timeout(timeout_seconds, deadline)
         try:
-            resp = httpx.post(url, json=body, headers=headers, timeout=timeout_seconds)
-        except (httpx.RequestError, httpx.TimeoutException):
+            resp = httpx.post(url, json=body, headers=headers, timeout=attempt_timeout)
+        except httpx.RequestError as e:
+            if isinstance(e, httpx.TimeoutException) and attempt_timeout < timeout_seconds:
+                raise ReviewDeadlineReached(
+                    f"staged review deadline cut the call after {attempt_timeout:.1f}s"
+                ) from e
             if attempt < transport_attempts - 1:
                 _RETRY_SLEEP(_RETRY_BASE_DELAY * (2 ** attempt))
                 continue
@@ -2200,14 +2262,15 @@ def _call_backend(
     headers = _merged_headers(config, key)
 
     transport_attempts = _validated_transport_attempts(config)
+    deadline = _REVIEW_DEADLINE.get()
     if cancel_event is None:
         resp = _post_with_retries(
             config.url, body, headers, config.timeout_seconds,
-            config.retry_attempts, transport_attempts,
+            config.retry_attempts, transport_attempts, deadline,
         )
     else:
         resp = _post_with_retries_cancellable(
-            config, body, headers, transport_attempts, cancel_event,
+            config, body, headers, transport_attempts, cancel_event, deadline,
         )
     if config.backend == Backend.OPENCODE_GO:
         _note_opencode_go_response(resp)
@@ -2306,6 +2369,7 @@ def _emit_abandoned_in_flight_gauge(count: int, backend: str) -> None:
 def _post_with_retries_cancellable(
     config: BackendConfig, body: dict[str, Any], headers: dict[str, str],
     transport_attempts: int, cancel_event: threading.Event,
+    deadline: float | None = None,
 ) -> httpx.Response:
     """`_call_backend`'s cancellable path (#635 follow-up), split out to keep
     that function's own branch count down. Runs the real call on a
@@ -2322,7 +2386,7 @@ def _post_with_retries_cancellable(
         try:
             resp = _post_with_retries(
                 config.url, body, headers, config.timeout_seconds,
-                config.retry_attempts, transport_attempts,
+                config.retry_attempts, transport_attempts, deadline,
             )
             result_q.put(("ok", resp))
         except Exception as e:  # noqa: BLE001 - re-raised on the waiting side
@@ -4034,8 +4098,25 @@ def _run_staged_cohorts(
                 },
             )
             response = run_cohort(cohort_index)
-        responses.append(response)
+        responses.append(_deadline_cut_as_skipped(response))
     return responses
+
+
+def _deadline_cut_as_skipped(response: LlmReviewResponse) -> LlmReviewResponse:
+    """A cohort the staged deadline cut is budget-starved, not a model failure.
+
+    Read from the deadline itself, not from the error text: when the cohort
+    ends without a review and the deadline has passed, the rest of its ladder
+    was never sent (grug#1216). Reported with the skipped prefix, so coverage
+    says "never attempted" - the author needs a smaller diff or more budget,
+    not a re-run hoping the model recovers."""
+    if not _is_retryable_cohort_failure(response) or not _deadline_passed():
+        return response
+    return replace(
+        response,
+        kind="all_failed",
+        error=_SKIPPED_COHORT_PREFIX + "staged review budget exhausted",
+    )
 
 
 def review_is_staged(hunks: list[Hunk]) -> bool:
@@ -4425,6 +4506,11 @@ class _Tier1Review:
        and each file chunk is reviewed on its own, inside the remaining
        staged budget (grug#1196). Markings from every chunk merge into one
        response, and coverage names the files reviewed and not reviewed.
+
+    The whole review runs under one deadline, `started_at` + the staged
+    budget (grug#1216): every model call is clamped to the time left, so the
+    scheduler reserves only what one cohort needs to be worth starting
+    instead of a whole worst-case ladder walk before every cohort.
     """
 
     hunks: list[Hunk]
@@ -4441,11 +4527,13 @@ class _Tier1Review:
 
     @staticmethod
     def reserve_s() -> float:
-        return (
-            _review_llm_timeout_s()
-            + 2 * _SAAS_OVERLOAD_FALLBACK_TIMEOUT_SECONDS
-            + _cloud_chain_worst_case_s()
-        )
+        # Not the ladder's worst case (Cave timeout + two SaaS fallbacks +
+        # every cloud tier, 480-575s live): calls are clamped to the
+        # deadline, so a started cohort cannot overrun the budget (grug#1216).
+        return _MIN_DEADLINE_COHORT_SECONDS
+
+    def _deadline(self) -> contextlib.AbstractContextManager[None]:
+        return _review_deadline(self.started_at + _staged_review_budget_s())
 
     def _dispatch(
         self,
@@ -4513,6 +4601,10 @@ class _Tier1Review:
     def run_whole_diff(self, plan: ReviewPlan) -> LlmReviewResponse:
         """One chunk. A success returns unchanged, exactly as before staging
         existed; a failure gets the next-model retry, then the file split."""
+        with self._deadline():
+            return self._run_whole_diff(plan)
+
+    def _run_whole_diff(self, plan: ReviewPlan) -> LlmReviewResponse:
         ladder = _ChunkLadder()
 
         def call() -> LlmReviewResponse:
@@ -4559,14 +4651,15 @@ class _Tier1Review:
             },
         )
         count = len(plan.cohorts)
-        responses = self._schedule(
-            plan.cohorts,
-            lambda index: self._run_cohort(
-                plan.cohorts[index], index, count, review_map,
-            ),
-            _staged_review_budget_s(),
-        )
-        return self._split_and_merge(plan, responses)
+        with self._deadline():
+            responses = self._schedule(
+                plan.cohorts,
+                lambda index: self._run_cohort(
+                    plan.cohorts[index], index, count, review_map,
+                ),
+                _staged_review_budget_s(),
+            )
+            return self._split_and_merge(plan, responses)
 
     def _split_and_merge(
         self, plan: ReviewPlan, responses: list[LlmReviewResponse],

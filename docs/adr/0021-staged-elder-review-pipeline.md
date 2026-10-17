@@ -77,6 +77,17 @@ file chunk is reviewed inside the remaining staged budget. Coverage names the
 files reviewed and not reviewed, and a neutral check title names each model
 tried with its failure reason.
 
+Amendment (grug#1216, 2026-10-17). The Tier-1 review runs under one deadline,
+its start plus `GRUG_STAGED_REVIEW_BUDGET_S`. Every model call made under it is
+clamped to the time left, and a call with under 10 seconds left is not sent.
+Because a started cohort can no longer cross the budget, the scheduler reserves
+only 60 seconds (what one cohort needs to be worth starting), not one full
+model timeout plus the cloud-fallback allowance: that reserve was 480-575
+seconds of a 600-700 second budget, so later cohorts and file chunks were
+never attempted. A deadline-cut call does not feed the slow bench, and a cohort
+the deadline cut is reported as never attempted. The post-publish reasoner
+append keeps the full-timeout reserve.
+
 The post-publish reasoner append uses the same cohort plan when invoked
 directly. Tiered reviews that already required staging do not start that second
 discovery pass inside the same durable job: their findings still receive the
