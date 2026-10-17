@@ -223,6 +223,39 @@ def _handler_assigns_true(handler: ast.ExceptHandler, name: str) -> bool:
     return False
 
 
+def _check_fail_closed_branch(
+    f: ast.FunctionDef, path: Path, neutral_if: ast.If | None,
+) -> list[str]:
+    """grug#1212: BLOCK + real degradation -> ("failure","COMMENT"), ahead
+    of the neutral branch, so a degraded Elder review cannot pass a required
+    check as neutral."""
+    closed_if = _if_returning(f, ("failure", "COMMENT"))
+    if closed_if is None:
+        return [
+            f"FAIL: {path} - no `if` returns ('failure','COMMENT'); a degraded "
+            "Elder review in BLOCK mode must fail closed (grug#1212)"
+        ]
+    fails: list[str] = []
+    test_src = ast.unparse(closed_if.test)
+    is_and = isinstance(closed_if.test, ast.BoolOp) and isinstance(closed_if.test.op, ast.And)
+    if not is_and:
+        fails.append(
+            f"FAIL: {path} - fail-closed branch is not an AND over the "
+            "opt-in, BLOCK mode and a real degradation"
+        )
+    fails.extend(
+        f"FAIL: {path} - fail-closed branch does not test `{needle}`"
+        for needle in ("degraded_fails_closed", "blocking", "is_real_degradation")
+        if needle not in test_src
+    )
+    if neutral_if is not None and closed_if.lineno > neutral_if.lineno:
+        fails.append(
+            f"FAIL: {path} - fail-closed branch comes after the neutral "
+            "branch, which would shadow it for every degraded review"
+        )
+    return fails
+
+
 def _check_publish_shape(tree: ast.AST, path: Path) -> list[str]:
     f = _find_funcdef(tree, "_publish_shape")
     if f is None:
@@ -258,32 +291,7 @@ def _check_publish_shape(tree: ast.AST, path: Path) -> list[str]:
                 "evaluation must force advisory regardless of mode"
             )
 
-    # grug#1212: BLOCK + real degradation -> ("failure","COMMENT"), ahead of
-    # the neutral branch, so a degraded Elder review cannot pass a required
-    # check as neutral.
-    closed_if = _if_returning(f, ("failure", "COMMENT"))
-    if closed_if is None:
-        fails.append(
-            f"FAIL: {path} - no `if` returns ('failure','COMMENT'); a degraded "
-            "Elder review in BLOCK mode must fail closed (grug#1212)"
-        )
-    else:
-        test_src = ast.unparse(closed_if.test)
-        if not isinstance(closed_if.test, ast.BoolOp) or not isinstance(closed_if.test.op, ast.And):
-            fails.append(
-                f"FAIL: {path} - fail-closed branch is not an AND over the "
-                "opt-in, BLOCK mode and a real degradation"
-            )
-        for needle in ("degraded_fails_closed", "blocking", "is_real_degradation"):
-            if needle not in test_src:
-                fails.append(
-                    f"FAIL: {path} - fail-closed branch does not test `{needle}`"
-                )
-        if neutral_if is not None and closed_if.lineno > neutral_if.lineno:
-            fails.append(
-                f"FAIL: {path} - fail-closed branch comes after the neutral "
-                "branch, which would shadow it for every degraded review"
-            )
+    fails.extend(_check_fail_closed_branch(f, path, neutral_if))
 
     # blocking failure → ("failure","REQUEST_CHANGES"), reachable + on conclusion.
     fail_if = _if_returning(f, ("failure", "REQUEST_CHANGES"))

@@ -2218,6 +2218,15 @@ def _resolve_result(
     return "pass" if evaluation.passed else "fail"
 
 
+def _lead_if_degraded(summary: str, evaluation: CodeReviewEvaluation) -> str:
+    """grug#1212: a degraded summary's first line says so and how to re-run,
+    ahead of everything else (intent paragraph, deep preamble). A clean or
+    `no_diff` summary is returned unchanged."""
+    if not is_real_degradation(evaluation.degraded_reason):
+        return summary
+    return lead_with_degraded_line(summary, str(evaluation.degraded_reason))
+
+
 def _publish_shape(
     evaluation: CodeReviewEvaluation, *, mode: ReviewMode,
     degraded_fails_closed: bool = False,
@@ -3446,10 +3455,7 @@ def dispatch_code_review(
         pull_number=pull_number, conclusion=conclusion, title=title,
         summary=summary,
     )
-    if is_real_degradation(evaluation.degraded_reason):
-        # grug#1212: the first line of a degraded summary says so, and how to
-        # re-run, ahead of the intent paragraph.
-        summary = lead_with_degraded_line(summary, str(evaluation.degraded_reason))
+    summary = _lead_if_degraded(summary, evaluation)
     check_result = CheckRunResult(
         name=_CHECK_NAME,
         head_sha=head_sha,
@@ -4530,8 +4536,7 @@ def _async_deep_append_if_needed(
         )
     )
     summary = f"{preamble}\n\n{summary}"
-    if is_real_degradation(combined.degraded_reason):
-        summary = lead_with_degraded_line(summary, str(combined.degraded_reason))
+    summary = _lead_if_degraded(summary, combined)
     _publish_deep_check(
         installation_id=installation_id,
         owner=owner,

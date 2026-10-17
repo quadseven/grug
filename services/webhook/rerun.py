@@ -1923,6 +1923,10 @@ def _run_hot_review(
             return "stale_snapshot" if redrived else "intent_drift_exhausted"
 
         cfg = get_repo_config(install_id, repo_id)
+        # The Elder mode is read ONCE and frozen for this pass: the review
+        # and every degraded terminal check below conclude under the same
+        # mode (grug#1212), even if the toggle flips mid-flight.
+        elder_blocking = bool(cfg.get("code_reviewer_blocking", False))
         # Mid-flight cancellation (#635 follow-up): current_snapshot_id is the
         # snapshot this job is ABOUT to spend the Elder budget on (checked
         # fresh, immediately above). The watch loop re-fetches the PR every
@@ -1960,7 +1964,7 @@ def _run_hot_review(
                         pr_number=pr_number,
                         pr=after,
                     ),
-                    blocking=bool(cfg.get("code_reviewer_blocking", False)),
+                    blocking=elder_blocking,
                     cancel_event=watch.cancel,
                 )
             finally:
@@ -2050,9 +2054,9 @@ def _run_hot_review(
             # Infra / GH brownout must COMPLETE the required check, never
             # leave in_progress forever and never redrive forever. No review
             # landed, so the conclusion follows the repo's Elder mode
-            # (grug#1212): `failure` in BLOCK, `neutral` in WARN. Real model
+            # (grug#1212): `failure` in BLOCK, `neutral` in WARN - the same
+            # `elder_blocking` the review itself ran under. Real model
             # findings still use pass/fail.
-            elder_blocking = bool(cfg.get("code_reviewer_blocking", False))
             if result_status == "skipped" and degraded_reason == "freshness_check_failed":
                 posted = _complete_elder_check_open(
                     install_id=install_id,
@@ -2118,7 +2122,7 @@ def _run_hot_review(
                         f"Review returned skipped ({degraded_reason or 'unknown'}). "
                         + gate_sentence(elder_blocking)
                         + " Re-run Elder if needed.",
-                        degraded_reason or "unknown",
+                        degraded_reason,
                     ),
                     conclusion=degraded_conclusion(elder_blocking),
                 )

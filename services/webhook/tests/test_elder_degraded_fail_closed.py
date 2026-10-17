@@ -323,6 +323,49 @@ def test_rerun_fail_open_terminal_check_honours_the_mode(
     assert posted[0].summary.split("\n")[0] == _lead(reason)
 
 
+def test_rerun_terminal_check_uses_the_mode_the_review_ran_under(monkeypatch):
+    """The mode is read once per pass and frozen: a toggle flip after the
+    review started cannot change the terminal check's conclusion."""
+    import rerun
+
+    modes = iter(({"code_reviewer_blocking": True}, {"code_reviewer_blocking": False}))
+    reads: list = []
+
+    def flipping_config(iid, rid):
+        reads.append(rid)
+        return next(modes)
+
+    _run_terminal(monkeypatch, degraded_reason="freshness_check_failed", blocking=True)
+    monkeypatch.setattr(rerun, "get_repo_config", flipping_config)
+    dispatched = MagicMock(return_value={
+        "persona": "code_reviewer", "result": "skipped",
+        "degraded_reason": "freshness_check_failed",
+    })
+    monkeypatch.setattr(rerun, "dispatch_code_review", dispatched)
+    pr = _pr_data()
+    fetches = iter((pr, pr))
+    posted: list = []
+
+    def _fake_token_retry(iid, fn):
+        try:
+            return next(fetches)
+        except StopIteration:
+            return fn("tok")
+
+    monkeypatch.setattr(rerun, "with_install_token_retry", _fake_token_retry)
+    monkeypatch.setattr(
+        rerun, "post_check_run",
+        lambda token, owner, repo, result, external_id=None: (
+            posted.append(result) or {"id": 1}
+        ),
+    )
+    rerun._run_one(_job())
+
+    assert len(reads) == 1
+    assert dispatched.call_args.kwargs["blocking"] is True
+    assert posted[-1].conclusion == "failure"
+
+
 @pytest.mark.parametrize("blocking, want", [(True, "failure"), (False, "neutral")])
 def test_rerun_intent_drift_give_up_honours_the_mode(monkeypatch, blocking, want):
     """Giving up on a PR that kept changing mid-review leaves no review on
