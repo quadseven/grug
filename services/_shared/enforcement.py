@@ -3,11 +3,20 @@
 Called from dispatcher.py (on installation) and installations.py (on
 persona toggle). Functions take install_token directly — callers wrap
 with with_install_token_retry.
+
+Required contexts (grug#1202): the ruleset always requires Chief, plus the
+check run of every persona that is at BLOCK on the repo and is marked
+`may_be_required` in the persona registry. `ensure_enforcement` applies that
+on create and on every pass over an existing Grug-managed ruleset;
+`reconcile_required_checks` is the settings-save entry point, which only
+edits an existing Grug ruleset and never creates one.
 """
 
 from __future__ import annotations
 
 import logging
+from collections.abc import Mapping
+from typing import Any
 
 from github_rulesets_client import (
     EnforcementState,
@@ -19,11 +28,13 @@ from github_rulesets_client import (
     update_ruleset,
 )
 
+from personas.registry import REGISTRY
 from personas.tribe import (
     CHECK_CHIEF,
     LEGACY_RULESET_CHIEF,
     RULESET_CHIEF,
     is_enforcement_ruleset_name,
+    primary_check_name,
 )
 
 log = logging.getLogger("grug.enforcement")
@@ -34,6 +45,132 @@ GRUG_TPM_RULESET_NAME = RULESET_CHIEF
 GRUG_DOR_CHECK_NAME = CHECK_CHIEF
 # Back-compat spellings for scripts / tests that imported the old literals.
 LEGACY_TPM_RULESET_NAME = LEGACY_RULESET_CHIEF
+
+# The persona contexts enforcement adds and removes. Anything else on the
+# ruleset - Chief, a non-Grug CI check, or a non-requirable persona an admin
+# required by hand - is never touched by the persona reconcile.
+_MANAGED_PERSONA_CHECKS: frozenset[str] = frozenset(
+    spec.check_run_name for spec in REGISTRY if spec.may_be_required
+)
+
+
+def required_persona_checks(cfg: Mapping[str, Any]) -> list[str]:
+    """Check-run names to require for this repo's persona modes, in registry
+    order: every `may_be_required` persona that is enabled AND blocking.
+
+    An unset flag falls back to the registry default, the same rule the
+    dispatcher applies when it resolves a persona's mode."""
+    out: list[str] = []
+    for spec in REGISTRY:
+        if not spec.may_be_required or spec.blocking_flag is None:
+            continue
+        enabled = bool(cfg.get(spec.enabled_flag, spec.enabled_default))
+        blocking = bool(cfg.get(spec.blocking_flag, spec.blocking_default))
+        if enabled and blocking:
+            out.append(spec.check_run_name)
+    return out
+
+
+def _with_checks(rule: dict, checks: list[dict]) -> dict:
+    """Copy of a required_status_checks rule with its contexts replaced and
+    every other parameter kept. A null integration_id is dropped from each
+    entry because GitHub 422s the whole PUT on it (same rule as
+    migrate_check_context)."""
+    cleaned = [
+        {k: v for k, v in c.items() if not (k == "integration_id" and v is None)}
+        for c in checks
+    ]
+    return {
+        **rule,
+        "parameters": {**rule.get("parameters", {}), "required_status_checks": cleaned},
+    }
+
+
+def _canonical(check: dict) -> str | None:
+    ctx = check.get("context")
+    return primary_check_name(ctx) if isinstance(ctx, str) else None
+
+
+def _drop_unwanted(
+    rules: list[dict], wanted: frozenset[str],
+) -> tuple[list[dict], set[str], int | None, bool]:
+    """Remove managed persona contexts that are not wanted. Returns the new
+    rules, the managed contexts still present, the index of the first rule
+    that requires Chief (where a missing persona context goes), and whether
+    anything was removed."""
+    new_rules: list[dict] = []
+    present: set[str] = set()
+    chief_rule: int | None = None
+    changed = False
+    for rule in rules:
+        if rule.get("type") != "required_status_checks":
+            new_rules.append(rule)
+            continue
+        checks = rule.get("parameters", {}).get("required_status_checks", [])
+        kept = [
+            c for c in checks
+            if _canonical(c) not in _MANAGED_PERSONA_CHECKS or _canonical(c) in wanted
+        ]
+        present.update(
+            name for c in kept
+            if (name := _canonical(c)) in _MANAGED_PERSONA_CHECKS
+        )
+        if chief_rule is None and any(_canonical(c) == CHECK_CHIEF for c in kept):
+            chief_rule = len(new_rules)
+        if len(kept) != len(checks):
+            changed = True
+            new_rules.append(_with_checks(rule, kept))
+        else:
+            new_rules.append(rule)
+    return new_rules, present, chief_rule, changed
+
+
+def reconcile_persona_contexts(
+    install_token: str,
+    owner: str,
+    repo: str,
+    ruleset_id: int,
+    wanted_persona_checks: list[str],
+) -> bool:
+    """Make a Grug-managed ruleset require exactly the wanted persona checks
+    out of the managed set (grug#1202). Returns True if it PUT an update.
+
+    Same discipline as migrate_check_context: fetch the ruleset, change only
+    the managed persona contexts, and send the FULL rules array back so
+    every other rule and every other context passes through unchanged. A
+    legacy alias of a managed check counts as that check, so a ruleset that
+    already names it (the hand-added interim edit, possibly scoped by an
+    integration_id) gets no PUT and no duplicate. A missing context joins
+    the rule that requires Chief; with no such rule there is nowhere safe
+    to put it, so it is logged and skipped rather than inventing a rule."""
+    wanted = frozenset(wanted_persona_checks) & _MANAGED_PERSONA_CHECKS
+    ruleset = get_ruleset(install_token, owner, repo, ruleset_id)
+    new_rules, present, chief_rule, changed = _drop_unwanted(
+        ruleset.get("rules", []), wanted,
+    )
+    missing = [c for c in wanted_persona_checks if c in wanted and c not in present]
+    if missing and chief_rule is None:
+        log.warning(
+            "enforcement_persona_context_no_chief_rule",
+            extra={"owner": owner, "repo": repo, "ruleset_id": ruleset_id,
+                   "missing": missing},
+        )
+    elif missing:
+        host = new_rules[chief_rule]
+        checks = list(host.get("parameters", {}).get("required_status_checks", []))
+        new_rules[chief_rule] = _with_checks(
+            host, checks + [{"context": c} for c in missing],
+        )
+        changed = True
+    if not changed:
+        return False
+    update_ruleset(install_token, owner, repo, ruleset_id, new_rules)
+    log.info(
+        "enforcement_persona_contexts_reconciled",
+        extra={"owner": owner, "repo": repo, "ruleset_id": ruleset_id,
+               "required_personas": sorted(wanted)},
+    )
+    return True
 
 
 def migrate_check_context(
@@ -92,8 +229,6 @@ def migrate_check_context(
     passed to primary_check_name (LORE #685: a malformed entry must not
     make the healed PUT itself malformed).
     """
-    from personas.tribe import primary_check_name
-
     ruleset = get_ruleset(install_token, owner, repo, ruleset_id)
     rules = ruleset.get("rules", [])
     new_rules: list[dict] = []
@@ -187,7 +322,7 @@ def ensure_enforcement(
             # name-prefix heuristic on a ruleset whose id differs from the
             # stored one (a rename or other drift - grug#565). Healing the
             # stale stored id calls get_ruleset(stale), 404s, gets swallowed
-            # by the broad except below, and the repo silently never heals.
+            # by the heal's broad except, and the repo silently never heals.
             ruleset_id = detection.ruleset_id or stored_ruleset_id
             if ruleset_id is not None and ruleset_id != stored_ruleset_id:
                 # Persist the correction so the NEXT pass starts from truth -
@@ -215,27 +350,9 @@ def ensure_enforcement(
                         },
                     )
             if ruleset_id is not None:
-                try:
-                    if migrate_check_context(install_token, owner, repo, ruleset_id):
-                        log.info(
-                            "enforcement_check_context_healed",
-                            extra={
-                                "owner": owner, "repo": repo,
-                                "install_id": install_id, "repo_id": repo_id,
-                                "ruleset_id": ruleset_id,
-                            },
-                        )
-                except Exception as e:  # noqa: BLE001 - self-heal never blocks the existing-state return
-                    log.warning(
-                        "enforcement_check_context_heal_failed",
-                        extra={
-                            "owner": owner, "repo": repo,
-                            "install_id": install_id, "repo_id": repo_id,
-                            "ruleset_id": ruleset_id,
-                            "kind": type(e).__name__,
-                            "detail": str(e)[:200],
-                        },
-                    )
+                _heal_managed_ruleset(
+                    install_token, owner, repo, install_id, repo_id, ruleset_id,
+                )
         log.info(
             "enforcement_already_present",
             extra={
@@ -248,9 +365,11 @@ def ensure_enforcement(
         emit_enforcement_metric(f"{owner}/{repo}", state)
         return state
 
+    from adapters.install_store import get_repo_config  # type: ignore
     result = create_ruleset(
         install_token, owner, repo,
-        GRUG_TPM_RULESET_NAME, [GRUG_DOR_CHECK_NAME],
+        GRUG_TPM_RULESET_NAME,
+        [GRUG_DOR_CHECK_NAME, *required_persona_checks(get_repo_config(install_id, repo_id))],
     )
     ruleset_id = result["id"]
 
@@ -268,6 +387,75 @@ def ensure_enforcement(
     from observability import emit_enforcement_metric  # type: ignore
     emit_enforcement_metric(f"{owner}/{repo}", "grug_managed")
     return "grug_managed"
+
+
+def _heal_managed_ruleset(
+    install_token: str,
+    owner: str,
+    repo: str,
+    install_id: int,
+    repo_id: int,
+    ruleset_id: int,
+) -> None:
+    """Self-heal an existing Grug-managed ruleset: canonicalize stale legacy
+    check aliases, then bring the persona contexts in line with the repo's
+    modes (grug#1202). Each step is best-effort and isolated: a failure is
+    logged and never blocks ensure_enforcement's existing-state return."""
+    ids = {"owner": owner, "repo": repo, "install_id": install_id,
+           "repo_id": repo_id, "ruleset_id": ruleset_id}
+    try:
+        if migrate_check_context(install_token, owner, repo, ruleset_id):
+            log.info("enforcement_check_context_healed", extra=ids)
+    except Exception as e:  # noqa: BLE001 - self-heal never blocks the existing-state return
+        log.warning(
+            "enforcement_check_context_heal_failed",
+            extra={**ids, "kind": type(e).__name__, "detail": str(e)[:200]},
+        )
+    try:
+        from adapters.install_store import get_repo_config  # type: ignore
+        wanted = required_persona_checks(get_repo_config(install_id, repo_id))
+        reconcile_persona_contexts(install_token, owner, repo, ruleset_id, wanted)
+    except Exception as e:  # noqa: BLE001 - self-heal never blocks the existing-state return
+        log.warning(
+            "enforcement_persona_contexts_reconcile_failed",
+            extra={**ids, "kind": type(e).__name__, "detail": str(e)[:200]},
+        )
+
+
+def reconcile_required_checks(
+    install_token: str,
+    owner: str,
+    repo: str,
+    default_branch: str,
+    install_id: int,
+    repo_id: int,
+) -> EnforcementState:
+    """Settings-save entry point (grug#1202): after a persona mode flip,
+    bring the repo's EXISTING Grug-managed ruleset's required persona
+    contexts in line with the stored modes. Returns the detected state.
+
+    Unlike ensure_enforcement this never creates a ruleset - creating one
+    is the tpm toggle's and the Fix button's job, and
+    force_disable_enforcement exists to stop exactly that - and it never
+    edits an external ruleset. Errors propagate so the caller can log them;
+    the flag is already stored, and the next ensure pass reconciles again."""
+    from adapters.install_store import get_enforcement_id, get_repo_config  # type: ignore
+    stored_ruleset_id = get_enforcement_id(install_id, repo_id)
+    detection = detect_enforcement(
+        install_token, owner, repo, default_branch, GRUG_DOR_CHECK_NAME,
+        stored_ruleset_id=stored_ruleset_id,
+    )
+    ruleset_id = detection.ruleset_id or stored_ruleset_id
+    if detection.state != "grug_managed" or ruleset_id is None:
+        log.info(
+            "enforcement_reconcile_skipped",
+            extra={"owner": owner, "repo": repo, "install_id": install_id,
+                   "repo_id": repo_id, "state": detection.state},
+        )
+        return detection.state
+    wanted = required_persona_checks(get_repo_config(install_id, repo_id))
+    reconcile_persona_contexts(install_token, owner, repo, ruleset_id, wanted)
+    return detection.state
 
 
 def heal_enforcement(

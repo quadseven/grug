@@ -22,8 +22,6 @@ import copy
 from unittest.mock import patch
 
 import pytest
-from github_rulesets_client import EnforcementDetection
-
 from enforcement import (
     GRUG_DOR_CHECK_NAME,
     GRUG_TPM_RULESET_NAME,
@@ -31,6 +29,7 @@ from enforcement import (
     reconcile_required_checks,
     required_persona_checks,
 )
+from github_rulesets_client import EnforcementDetection
 from personas import registry
 from personas.tribe import (
     CHECK_ELDER,
