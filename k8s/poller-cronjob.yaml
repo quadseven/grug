@@ -48,8 +48,9 @@ spec:
           containers:
             - name: poller
               image: REGISTRY_PLACEHOLDER/grug-webhook:TAG_PLACEHOLDER
-              # ddtrace-run so poller spans are not silently dropped (review F4).
-              command: ["ddtrace-run", "python", "-c", "from poller_handler import handler; handler({}, None)"]
+              # ddtrace-run (via datadog_switch, only when GRUG_DATADOG_ENABLED is on,
+              # #1208) so poller spans are not silently dropped (review F4).
+              command: ["python", "-m", "datadog_switch", "python", "-c", "from poller_handler import handler; handler({}, None)"]
               # envFrom is APP CONFIG ONLY: env credentials would out-rank
               # credential_process in the SDK chain and silently bypass the
               # Roles Anywhere path the boot proof asserts (#388/#389; the

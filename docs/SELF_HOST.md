@@ -160,6 +160,21 @@ For self-hosters:
 - You control your own DD alert routing (or remove DD entirely)
 - You run your own cluster's Datadog agent (or drop `DD_*` from the manifests)
 
+### Datadog switch (`GRUG_DATADOG_ENABLED`)
+
+Every runtime Datadog integration is OFF unless `GRUG_DATADOG_ENABLED` is
+truthy (`1`, `true`, `yes`, `on`). Off is the default, and it covers ddtrace
+APM (the `python -m datadog_switch` launcher only prepends `ddtrace-run` when
+on), LLM Observability, the DogStatsD gauges and counts, the consumer's
+queue-depth sweep, Omen and the Warder SLO gate (Datadog HTTP API), the
+review-latency bench export, and grugthink's ddtrace + LLMObs. With it off,
+grug makes no call to Datadog or to a node agent and logs nothing about
+either. To turn Datadog back on, set `GRUG_DATADOG_ENABLED=true` in the
+env of each Deployment and CronJob that should report.
+For the web app's RUM, set the repository Actions variable
+`GRUG_DATADOG_ENABLED=true` (read by `web.deploy.yml`).
+The Pulumi `datadog` resources are not behind this switch (#1208).
+
 ## Smasher Trial (mutation testing) — enablement + preconditions (#469)
 
 The Smasher persona runs diff-scoped MUTATION TESTING: it launches a

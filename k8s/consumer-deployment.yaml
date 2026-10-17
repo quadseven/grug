@@ -96,7 +96,7 @@ spec:
         - name: consumer
           image: REGISTRY_PLACEHOLDER/grug-webhook:TAG_PLACEHOLDER
           imagePullPolicy: Always
-          command: ["ddtrace-run", "python", "consumer.py"]
+          command: ["python", "-m", "datadog_switch", "python", "consumer.py"]
           envFrom:
             - secretRef: {name: grug-secrets}
             # Roles Anywhere ONLY (#389 retirement): the static key and its

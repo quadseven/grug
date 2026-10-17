@@ -576,3 +576,34 @@ class TestQueryOllamaApiLlmObs:
         assert call["metadata"]["error"] == "ValueError"
         assert "output_data" not in call
         assert call["metrics"]["latency_ms"] >= 0
+
+
+class TestLlmObsDatadogSwitch:
+    """grug#1208: the LLMObs seams make no SDK call unless
+    GRUG_DATADOG_ENABLED is on (off by default)."""
+
+    def test_seams_do_not_touch_the_sdk_when_switch_unset(self, monkeypatch):
+        from unittest.mock import MagicMock
+
+        import src.grugthink.bot.llm_clients as llm_clients
+
+        monkeypatch.delenv("GRUG_DATADOG_ENABLED", raising=False)
+        monkeypatch.setenv("DD_LLMOBS_ENABLED", "true")
+        sdk = MagicMock()
+        monkeypatch.setattr(llm_clients, "_LLMObs", sdk)
+        with llm_clients._llmobs_llm(model_name="m", model_provider="ollama", name="x"):
+            llm_clients._llmobs_annotate(metrics={"input_tokens": 1})
+        assert sdk.mock_calls == []
+
+    def test_seams_call_the_sdk_when_switch_on(self, monkeypatch):
+        from unittest.mock import MagicMock
+
+        import src.grugthink.bot.llm_clients as llm_clients
+
+        monkeypatch.setenv("GRUG_DATADOG_ENABLED", "true")
+        sdk = MagicMock()
+        monkeypatch.setattr(llm_clients, "_LLMObs", sdk)
+        llm_clients._llmobs_llm(model_name="m", model_provider="ollama", name="x")
+        llm_clients._llmobs_annotate(metrics={"input_tokens": 1})
+        assert sdk.llm.call_count == 1
+        assert sdk.annotate.call_count == 1

@@ -513,8 +513,13 @@ def _emit_queue_depth_once() -> int:
     sustained nor an INTERMITTENT partial failure can silently re-blind
     that queue's depth monitor (audit stage-2 HIGH + codex peer review,
     PR #516)."""
+    from datadog_switch import datadog_enabled
     from observability import emit_gauge  # late: patchable, and webhook-image only
 
+    if not datadog_enabled():
+        # #1208: the sweep exists only to feed Datadog gauges. Off = no SQS
+        # probes and no log line, rather than 12 probes a minute into a no-op.
+        return 0
     if not os.getenv("DD_AGENT_HOST", ""):
         # Sweep-level guard: without an agent host every emit would
         # skip-warn individually (12 lines/min forever); one line per
@@ -834,6 +839,10 @@ def _warm_trace_writer() -> None:
     expected -> debug; ddtrace present but warmup raised (typically the
     writer-service start failure) -> warning (visible at the default level), so
     a regression to zero-spans is not itself silent."""
+    from datadog_switch import datadog_enabled
+
+    if not datadog_enabled():
+        return  # #1208: no tracer to warm while Datadog is switched off
     try:
         import ddtrace
     except ImportError:
@@ -898,6 +907,10 @@ def _flush_tracer() -> None:
     runners - it passed locally and flaked red on CI, which is what this seam
     retires. grug-local: this is a webhook-service test seam, NOT a reusable /
     CI-workflow concern."""
+    from datadog_switch import datadog_enabled
+
+    if not datadog_enabled():
+        return  # #1208: a flush with no agent blocks ~2s per watchdog tick
     try:
         import ddtrace
     except ImportError:

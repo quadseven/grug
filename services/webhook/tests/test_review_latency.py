@@ -16,6 +16,14 @@ from review_latency.scoring import (
 )
 
 
+@pytest.fixture(autouse=True)
+def _datadog_switch_on(monkeypatch):
+    """These tests pin the Datadog integration's own behavior, which only
+    runs with GRUG_DATADOG_ENABLED on (#1208). The off path is pinned in
+    test_datadog_switch.py."""
+    monkeypatch.setenv("GRUG_DATADOG_ENABLED", "true")
+
+
 def test_default_fixtures_build_elder_shaped_prompts():
     fixtures = default_fixtures()
     names = {f.name for f in fixtures}
