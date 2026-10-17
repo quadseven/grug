@@ -80,10 +80,9 @@ GH App -> Generate new client secret -> `aws ssm put-parameter --overwrite --nam
 Shared cross-project SecureStrings. Update in SSM -> re-seed + roll.
 
 ### Datadog / Discord notify
-DD keys live at `/infra/datadog/{api,app}_key`; the monitor notify channel is a
-Datadog Webhook integration sourced from `/infra/discord/monitoring-alerts`
-(set in `infra/pulumi/__main__.py`). Rotating these is an `iac.deploy.yml`
-concern, not a pod re-seed.
+Retired: the Pulumi program no longer reads the Datadog keys or builds the
+Datadog Webhook integration that `/infra/discord/monitoring-alerts` fed
+(#1223). Nothing in `iac.deploy.yml` rotates them any more.
 
 ### AWS pod credentials
 RETIRED as a stored secret (#389): no static AWS key exists anywhere.
@@ -157,7 +156,8 @@ mitigation for this exact failure class, not a fix for the block itself.
 `[grug] Check-run publish failing - PRs are MERGE-BLOCKED (15min)` pages when
 more than 2 check-run publishes fail in 15 minutes, from any persona. The
 log events counted are listed in `CHECK_RUN_PUBLISH_FAILED_EVENTS`
-(`infra/pulumi/components/dd_monitors.py`): `tpm_publish_failed` (Chief),
+(`infra/pulumi/components/dd_monitors.py`, removed in #1223 with the other
+Datadog monitors): `tpm_publish_failed` (Chief),
 `guard_check_run_publish_failed`, `code_review_check_run_publish_failed`
 (Elder) and their degraded and sibling variants.
 

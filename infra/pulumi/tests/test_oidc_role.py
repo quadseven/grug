@@ -41,7 +41,6 @@ from components import oidc_role  # noqa: E402
 EXPECTED_SSM_READ_PATHS = {
     "arn:aws:ssm:*:*:parameter/grug/*",
     "arn:aws:ssm:*:*:parameter/shared/*",
-    "arn:aws:ssm:*:*:parameter/infra/datadog/*",
     "arn:aws:ssm:*:*:parameter/infra/llm/*",
     "arn:aws:ssm:*:*:parameter/infra/discord/*",
     # #388: Roles Anywhere tenant ARNs for the grug-aws-config seed.

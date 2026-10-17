@@ -11,8 +11,9 @@ doc covers running it yourself.
 - Cloudflare account (for proxied DNS + Workers + Pages)
 - Pulumi Cloud account (free tier OK; alternative is self-managed S3
   backend — see `infra/pulumi/__main__.py` + `docs/NETWORK-TOPOLOGY.md` for the layout)
-- Datadog account (free tier OK; or skip the dd_monitors component
-  entirely by removing it from `infra/pulumi/__main__.py`)
+- No Datadog account is needed: the Pulumi program manages nothing in
+  Datadog (#1223). The runtime Datadog paths stay off unless
+  `GRUG_DATADOG_ENABLED` is set.
 - A registered GitHub App (you create this once via UI)
 - Python 3.13, uv, Docker, gh CLI
 
@@ -43,11 +44,6 @@ aws ssm put-parameter --name /grug/github-app-private-key --value "$(cat path/to
 aws ssm put-parameter --name /grug/cloudflare-api-token --value "<your_cf_token>" --type SecureString
 aws ssm put-parameter --name /grug/cloudflare-zone-id --value "<your_zone_id>" --type String
 aws ssm put-parameter --name /grug/cloudflare-account-id --value "<your_account_id>" --type String
-
-# Datadog (optional — skip if you removed dd_monitors). The Pulumi program
-# reads these shared-infra paths (NOT the retired /shared/datadog-* paths).
-aws ssm put-parameter --name /infra/datadog/api_key --value "<dd_api_key>" --type SecureString
-aws ssm put-parameter --name /infra/datadog/app_key --value "<dd_app_key>" --type SecureString
 
 # Pulumi access token
 aws ssm put-parameter --name /shared/pulumi-access-token --value "<pulumi_token>" --type SecureString
@@ -140,12 +136,9 @@ make seed-admin
   toggle the user.
 - **Per-repo persona toggles:** install on the target repo via the
   GitHub App's install URL, then toggle in the dashboard.
-- **Monitors + alerts:** the Datadog monitors + dashboard wire
-  automatically via `infra/pulumi/components/dd_monitors.py`
-  (Kubernetes-State-Metrics-based since #406). Notifications route to a
-  Datadog Webhook the Pulumi program builds from SSM
-  `/infra/discord/monitoring-alerts` (the old `/grug/dd-notify-handle`
-  placeholder is retired).
+- **Monitors + alerts:** none are provisioned today. The Datadog
+  monitors, dashboard and RUM app were removed from the Pulumi program
+  (#1223); the replacement signals are tracked in epic #1129.
 
 ## Differences from the hosted SaaS
 

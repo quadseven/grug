@@ -176,37 +176,14 @@ to create the Pages project + apex domain binding (idempotent — safe
 to re-run if you forget). After that, the `web.deploy.yml` workflow
 handles every subsequent build/deploy via `wrangler pages deploy`.
 
-## 6. Datadog alert routing (Slice 9 #30)
+## 6. Datadog alert routing (retired)
 
-DD monitors fire on workload-not-ready, CrashLoopBackOff, sig-verify
-failures, etc. (Kubernetes-State-Metrics-based since #406). Routing is
-NOT a free-form handle anymore: the Pulumi program builds a Datadog
-Webhook integration (`grug-discord-monitoring`) from a Discord webhook
-URL in SSM, and every monitor references `@webhook-grug-discord-monitoring`.
-Pre-load the Discord webhook URL (the old `/grug/dd-notify-handle`
-placeholder is retired — it pointed at an undeliverable `@grug-stub`):
-
-```bash
-aws ssm put-parameter --region us-east-1 \
-  --name /infra/discord/monitoring-alerts --type SecureString \
-  --value "https://discord.com/api/webhooks/<id>/<token>"
-```
-
-(To route somewhere other than Discord, swap the `Webhook`/notify-handle
-wiring in `infra/pulumi/__main__.py` for your target.)
-
-DD also needs an App key (in addition to the API key) for monitor
-creation. Both are the shared-infra keys (`/shared/datadog-*` were
-revoked):
-
-```bash
-aws ssm put-parameter --region us-east-1 \
-  --name /infra/datadog/app_key --type SecureString --value "<app key>"
-```
-
-(The API key `/infra/datadog/api_key` ships traces/logs via the
-cluster's node-local Datadog agent; the App key is admin-scoped and
-only needed by the deploy role for monitor/dashboard/RUM management.)
+Nothing to pre-load. The Pulumi program used to build Datadog monitors
+and a Datadog Webhook integration from `/infra/discord/monitoring-alerts`
+and read the shared Datadog API and App keys. Datadog is off, and the
+program manages nothing in Datadog since #1223, so neither the keys nor
+the Discord webhook URL are needed for `pulumi up`. Replacement alerting
+is tracked in epic #1129.
 
 ## When done
 
