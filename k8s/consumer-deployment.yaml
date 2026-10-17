@@ -140,6 +140,12 @@ spec:
             - {name: GRUG_OPENCODE_GO_SECOND_MODEL, value: "mimo-v2.5"}
             - {name: GRUG_OPENCODE_GO_FALLBACK_MODEL, value: "longcat-2.5-preview-free"}
             - {name: GRUG_CLOUD_FREE_TIER_MODEL, value: "nvidia/nemotron-3-super-120b-a12b:free"}
+            # grug#1225: switched off 2026-10-17, the OpenCode Go allowance and
+            # the OpenRouter credit are spent and not being refilled (36 Go 401s,
+            # 11 OpenRouter paid refusals, 139 free per-day 429s over 402 Elder
+            # runs). A listed backend is never called. Re-enable one by deleting
+            # its entry; `openrouter:free` or `openrouter:paid` narrows to one pool.
+            - {name: GRUG_DISABLED_BACKENDS, value: "opencode-go,openrouter"}
             - {name: GRUG_PROMPT_EXPERIMENT_SSM, value: /grug/elder-prompt-experiment}
             # Tiered Elder (#645): coder arm on every PR; reasoner only on
             # escalation / sample. Rollback to always-on dual-arm: deep.

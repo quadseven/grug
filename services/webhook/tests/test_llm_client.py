@@ -5129,6 +5129,9 @@ def test_three_client_errors_bench_the_model(monkeypatch, caplog, status) -> Non
         observability, "emit_count",
         lambda name, value, tags=None: emitted.append((name, value, tags)),
     )
+    # The provider breaker (grug#1225) stops calls after the first 401/402;
+    # this test isolates the per-model bench underneath it.
+    monkeypatch.setattr(lc, "_note_provider_response", lambda *_: None)
     cfg = _go_cfg()
     with caplog.at_level("WARNING"):
         for _ in range(2):
@@ -5208,7 +5211,10 @@ def test_failures_before_a_success_do_not_carry_over() -> None:
     httpx.Response(400, json={"error": {"message": "prompt is too long"}}),
     httpx.Response(408, text="request timeout"),
 ])
-def test_outages_limits_and_request_errors_never_bench(resp) -> None:
+def test_outages_limits_and_request_errors_never_bench(monkeypatch, resp) -> None:
+    # Spent-limit refusals trip the provider breaker (grug#1225), which would
+    # refuse the repeat calls this test needs; the bench is what it checks.
+    monkeypatch.setattr(lc, "_note_provider_response", lambda *_: None)
     cfg = lc.replace(_go_cfg(), retry_attempts=1)
     for _ in range(5):
         _call(cfg, resp)
