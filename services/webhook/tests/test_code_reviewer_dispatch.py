@@ -3691,3 +3691,34 @@ def test_review_body_carries_the_persona_tag():
     assert _ELDER_TAG in elder.body
     assert "<!-- grug:review persona=guard -->" in guard.body
     assert _ELDER_TAG not in guard.body
+
+
+def test_low_confidence_review_publishes_findings_and_says_low_confidence():
+    """grug#1097: a low-confidence clean cohort is its own reason. Findings
+    from the other cohorts still publish, the check stays advisory, and the
+    title names the low confidence instead of 'eyes clouded'."""
+    from personas.code_reviewer.persona import CodeReviewEvaluation, Finding
+
+    evaluation = CodeReviewEvaluation(
+        findings=(Finding(
+            file="src/x.py",
+            line=2,
+            severity="high",
+            rule_name="null-deref",
+            message="finding from another cohort",
+            suggestion=None,
+        ),),
+        conclusion="neutral",
+        degraded_reason="low_confidence_review",
+    )
+
+    result, posted_findings = cr_dispatch._build_review_result(
+        evaluation, head_sha="a" * 40, event="COMMENT",
+    )
+    assert result is not None
+    assert posted_findings == evaluation.findings
+    title, summary = cr_dispatch._summary_markdown(evaluation)
+    assert "low confidence" in title
+    assert "clouded" not in title
+    assert "could not see" not in summary
+    assert not cr_dispatch.is_blackout("low_confidence_review")
