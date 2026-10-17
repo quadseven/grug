@@ -3560,14 +3560,25 @@ _ELDER_TAG = "<!-- grug:review persona=elder -->"
 
 
 def _review(rid, *, state="CHANGES_REQUESTED", commit="old0000", body=_ELDER_TAG,
-            user_type="Bot"):
+            login="grug-tribe[bot]"):
     return {"id": rid, "state": state, "commit_id": commit, "body": body,
-            "user": {"login": "grug-tribe[bot]", "type": user_type}}
+            "user": {"login": login}}
 
 
-def _run_dismiss(monkeypatch, llm, *, reviews, blocking=True):
+def _run_dismiss(monkeypatch, llm, *, reviews, blocking=True, threads=(),
+                 carried_conclusion=None):
     dismissed = []
     listed = []
+    monkeypatch.setattr(
+        cr_dispatch.carry_forward, "list_threads",
+        lambda *a, **kw: None if threads is None else list(threads),
+    )
+    if carried_conclusion is not None:
+        monkeypatch.setattr(
+            cr_dispatch.carry_forward, "apply_to_check",
+            lambda carried, *, conclusion, title, summary, blocking_mode:
+                (carried_conclusion, title, summary),
+        )
     monkeypatch.setattr(cr_dispatch, "review_diff", lambda *a, **kw: llm)
     monkeypatch.setattr(cr_dispatch, "post_check_run", lambda *a, **kw: {})
     monkeypatch.setattr(cr_dispatch, "post_review", lambda *a, **kw: {})
@@ -3593,7 +3604,8 @@ def test_clean_rereview_dismisses_only_elders_own_stale_block(monkeypatch):
     reviews = [
         _review(1),                                                  # stale Elder block
         _review(2, body="<!-- grug:review persona=guard -->"),       # Guard's block
-        _review(3, user_type="User"),                                # a human
+        _review(3, login="a-human"),                                 # a human
+        _review(7, login="other-app[bot]"),                          # another bot quoting the tag
         _review(4, body="Grug Elder gaze upon your PR"),             # pre-tag review
         _review(5, commit="abcd1234efgh"),                           # current head
         _review(6, state="COMMENTED"),                               # not a block
@@ -3601,6 +3613,26 @@ def test_clean_rereview_dismisses_only_elders_own_stale_block(monkeypatch):
     listed, dismissed = _run_dismiss(monkeypatch, llm, reviews=reviews)
     assert listed == [7]
     assert dismissed == [1]
+
+
+def test_carried_open_finding_keeps_the_block(monkeypatch):
+    """A living-range review can be clean while an earlier finding is still
+    open; carry-forward turns the verdict to failure and the block stays."""
+    llm = LlmReviewResponse(kind="reviewed", findings=(), backend_used=Backend.POOLSIDE)
+    listed, dismissed = _run_dismiss(
+        monkeypatch, llm, reviews=[_review(1)], carried_conclusion="failure",
+    )
+    assert listed == []
+    assert dismissed == []
+
+
+def test_unknown_carry_forward_keeps_the_block(monkeypatch):
+    """No thread listing means the carry-forward check could not run, so a
+    clean review cannot vouch for earlier commits."""
+    llm = LlmReviewResponse(kind="reviewed", findings=(), backend_used=Backend.POOLSIDE)
+    listed, dismissed = _run_dismiss(monkeypatch, llm, reviews=[_review(1)], threads=None)
+    assert listed == []
+    assert dismissed == []
 
 
 def test_failing_review_keeps_the_block(monkeypatch):
@@ -3631,6 +3663,7 @@ def test_dismiss_failure_does_not_change_the_result(monkeypatch):
     monkeypatch.setattr(cr_dispatch, "post_check_run", lambda *a, **kw: {})
     monkeypatch.setattr(cr_dispatch, "post_review", lambda *a, **kw: {})
     monkeypatch.setattr(cr_dispatch, "list_reviews", lambda *a, **kw: [_review(1)])
+    monkeypatch.setattr(cr_dispatch.carry_forward, "list_threads", lambda *a, **kw: [])
 
     def _boom(*a, **kw):
         raise httpx.RequestError("down")

@@ -118,7 +118,7 @@ from personas.code_reviewer.persona import (
 )
 from personas.code_reviewer.snapshot import review_freshness_id_from_pr
 from personas.code_reviewer import carry_forward
-from personas.code_reviewer.thread_resolver import resolve_fixed_threads
+from personas.code_reviewer.thread_resolver import is_grug, resolve_fixed_threads
 from personas.code_reviewer.verify import verify_findings
 from personas.tribe import CHECK_ELDER
 from adapters.install_store import (  # type: ignore
@@ -3408,9 +3408,17 @@ def dispatch_code_review(
 
     # A blocking review from an earlier commit stays GitHub's standing verdict
     # until it is dismissed; a clean re-review alone does not clear it.
-    # Only a real, non-failing review withdraws it: a degraded run read
-    # nothing, so it must not unblock anything.
-    if not evaluation.degraded_reason and evaluation.conclusion != "failure":
+    # Withdraw it only when the FINAL verdict is clean: a degraded run read
+    # nothing, `conclusion` already folds in earlier findings still open
+    # (carry-forward), and `listed_threads is None` means that fold could not
+    # run, so a living-range review cannot vouch for the commits it skipped.
+    if (
+        not evaluation.degraded_reason
+        and evaluation.conclusion != "failure"
+        and conclusion != "failure"
+        and listed_threads is not None
+        and not check_publish_failed
+    ):
         _dismiss_stale_blocks(
             installation_id, owner, repo_name, pull_number, head_sha,
         )
@@ -3928,8 +3936,9 @@ def _dismiss_stale_blocks(
     """Dismiss Elder's own REQUEST_CHANGES reviews on earlier commits.
 
     Best-effort: a failure is logged and never changes the review outcome.
-    Matches only bot reviews tagged `persona=elder`, so a Guard or Smasher
-    block and every human review stay untouched. Returns how many were
+    Matches only reviews by the Grug app itself that carry the
+    `persona=elder` tag, so a Guard or Smasher block, a human's review, and
+    another bot quoting the tag all stay untouched. Returns how many were
     dismissed.
     """
     pr = f"{owner}/{repo_name}#{pull_number}"
@@ -3945,7 +3954,7 @@ def _dismiss_stale_blocks(
         for review in reviews:
             if (
                 review.get("state") != "CHANGES_REQUESTED"
-                or (review.get("user") or {}).get("type") != "Bot"
+                or not is_grug((review.get("user") or {}).get("login"))
                 or tag not in (review.get("body") or "")
                 or review.get("commit_id") == head_sha
             ):
