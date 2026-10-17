@@ -54,7 +54,9 @@ def main(argv: list[str] | None = None) -> None:
         sys.stderr.write("usage: python -m datadog_switch <command> [args...]\n")
         raise SystemExit(2)
     cmd, env = launch_argv(args)
-    os.execvpe(cmd[0], cmd, env)
+    # argv is the container's own entrypoint (Dockerfile CMD / manifest
+    # command), never request input; exec without a shell is the point.
+    os.execvpe(cmd[0], cmd, env)  # noqa: S606 - fixed entrypoint argv, no shell by design
 
 
 if __name__ == "__main__":  # pragma: no cover - exercised via main()
