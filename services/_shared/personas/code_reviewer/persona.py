@@ -373,7 +373,7 @@ def evaluate_diff(
     # is a clean result, but not a trusted one. Partial coverage outranks it.
     if llm_response.error[:15] == "partial review:":
         degraded_reason: str | None = "partial_review"
-    elif llm_response.error.startswith("low confidence:"):
+    elif llm_response.error[:15] == "low confidence:":
         degraded_reason = "low_confidence_review"
     else:
         degraded_reason = None

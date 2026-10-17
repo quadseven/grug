@@ -5577,6 +5577,41 @@ def _empty_answers_agree(
     return True
 
 
+def _cloud_chain_exhausted(
+    first_parse_fail: tuple[Backend, str | None, str] | None,
+    first_empty_outcome: _ArmOutcome | None,
+    hunks: list[Hunk],
+    pr_context: PrContext | None,
+    installation_id: int,
+    last_error: str,
+) -> _CloudPrimaryResult:
+    """Resolve `_try_cloud_primary` once no tier gave a trusted answer."""
+    low_confidence = (
+        _low_confidence_success(first_empty_outcome, hunks, pr_context)
+        if first_empty_outcome is not None
+        else None
+    )
+    if first_parse_fail is not None:
+        if low_confidence is not None:
+            # An empty answer is still an answer; a parse failure is not.
+            return _CloudPrimaryResult(answer=low_confidence)
+        pf_backend, pf_model, pf_err = first_parse_fail
+        return _CloudPrimaryResult(answer=LlmReviewResponse(
+            kind="parse_failed", backend_used=pf_backend, model_name=pf_model, error=pf_err,
+        ))
+    log.info(
+        "llm_cloud_primary_exhausted",
+        extra={
+            "installation_id": installation_id,
+            "repo": (pr_context or {}).get("repo"),
+            "pr_number": (pr_context or {}).get("pr_number"),
+            "last_error": last_error,
+        },
+    )
+    # No answer: the caller falls through to the unmodified Cave path.
+    return _CloudPrimaryResult(low_confidence=low_confidence)
+
+
 def _try_cloud_primary(
     hunks: list[Hunk],
     messages: list[dict[str, str]],
@@ -5662,30 +5697,10 @@ def _try_cloud_primary(
         # config_error / transport_error / http_failed
         last_error = outcome.error_text
 
-    low_confidence = (
-        _low_confidence_success(first_empty_outcome, hunks, pr_context)
-        if first_empty_outcome is not None
-        else None
+    return _cloud_chain_exhausted(
+        first_parse_fail, first_empty_outcome, hunks, pr_context,
+        installation_id, last_error,
     )
-    if first_parse_fail is not None:
-        if low_confidence is not None:
-            # An empty answer is still an answer; a parse failure is not.
-            return _CloudPrimaryResult(answer=low_confidence)
-        pf_backend, pf_model, pf_err = first_parse_fail
-        return _CloudPrimaryResult(answer=LlmReviewResponse(
-            kind="parse_failed", backend_used=pf_backend, model_name=pf_model, error=pf_err,
-        ))
-    log.info(
-        "llm_cloud_primary_exhausted",
-        extra={
-            "installation_id": installation_id,
-            "repo": (pr_context or {}).get("repo"),
-            "pr_number": (pr_context or {}).get("pr_number"),
-            "last_error": last_error,
-        },
-    )
-    # No answer: the caller falls through to the unmodified Cave path.
-    return _CloudPrimaryResult(low_confidence=low_confidence)
 
 
 def _review_diff_dispatch(
