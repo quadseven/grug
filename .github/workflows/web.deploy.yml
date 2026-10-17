@@ -30,6 +30,11 @@ permissions:
 # Force JS actions to Node 24. See iac.deploy.yml. Closes #71.
 env:
   FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: "true"
+  # grug#1208: Datadog RUM is OFF unless the repo variable
+  # GRUG_DATADOG_ENABLED is set to `true`. Off, no RUM credentials are read,
+  # the SPA skips datadogRum.init and the static pages never load the CDN
+  # script.
+  GRUG_DATADOG_ENABLED: ${{ vars.GRUG_DATADOG_ENABLED == 'true' && 'true' || 'false' }}
 
 jobs:
   build-and-deploy:
@@ -82,12 +87,16 @@ jobs:
           # rotation is `pulumi up`, not a git commit. Pulumi component
           # dd_rum.py owns the SSM values. If missing, the build still
           # succeeds — the RUM init checks for placeholders and no-ops.
-          DD_RUM_APP_ID=$(aws ssm get-parameter \
-            --name /grug/dd-rum-application-id --with-decryption \
-            --query 'Parameter.Value' --output text 2>/dev/null || echo "")
-          DD_RUM_TOKEN=$(aws ssm get-parameter \
-            --name /grug/dd-rum-client-token --with-decryption \
-            --query 'Parameter.Value' --output text 2>/dev/null || echo "")
+          DD_RUM_APP_ID=""
+          DD_RUM_TOKEN=""
+          if [ "$GRUG_DATADOG_ENABLED" = "true" ]; then
+            DD_RUM_APP_ID=$(aws ssm get-parameter \
+              --name /grug/dd-rum-application-id --with-decryption \
+              --query 'Parameter.Value' --output text 2>/dev/null || echo "")
+            DD_RUM_TOKEN=$(aws ssm get-parameter \
+              --name /grug/dd-rum-client-token --with-decryption \
+              --query 'Parameter.Value' --output text 2>/dev/null || echo "")
+          fi
           # Mask both — they're not high-sensitivity but masking
           # prevents accidental log leaks.
           [ -n "$DD_RUM_APP_ID" ] && echo "::add-mask::$DD_RUM_APP_ID"
@@ -109,6 +118,7 @@ jobs:
       - name: 07. Build
         working-directory: web
         env:
+          VITE_GRUG_DATADOG_ENABLED: ${{ env.GRUG_DATADOG_ENABLED }}
           VITE_DD_RUM_APPLICATION_ID: ${{ env.DD_RUM_APP_ID }}
           VITE_DD_RUM_CLIENT_TOKEN: ${{ env.DD_RUM_TOKEN }}
           VITE_DD_RUM_ENV: ${{ (github.ref == 'refs/heads/main' || startsWith(github.ref, 'refs/tags/v')) && 'prod' || 'dev' }}
@@ -122,7 +132,7 @@ jobs:
       # No-op when DD_RUM_APP_ID is empty so local-preview builds work
       # without breaking the deploy.
       - name: 07b. Inject DD RUM credentials into static HTML
-        if: env.DD_RUM_APP_ID != ''
+        if: env.GRUG_DATADOG_ENABLED == 'true' && env.DD_RUM_APP_ID != ''
         working-directory: web/dist
         env:
           DD_RUM_ENV: ${{ (github.ref == 'refs/heads/main' || startsWith(github.ref, 'refs/tags/v')) && 'prod' || 'dev' }}
@@ -137,6 +147,7 @@ jobs:
             # don't break the regex. -i.bak for macOS portability; .bak
             # files removed below.
             sed -i.bak \
+              -e "s|__GRUG_DATADOG_ENABLED__|true|g" \
               -e "s|__DD_RUM_APPLICATION_ID__|${DD_RUM_APP_ID}|g" \
               -e "s|__DD_RUM_CLIENT_TOKEN__|${DD_RUM_TOKEN}|g" \
               -e "s|__DD_RUM_ENV__|${DD_RUM_ENV}|g" \

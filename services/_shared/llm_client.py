@@ -67,6 +67,7 @@ from review_pipeline import (
     plan_review,
     render_review_map,
 )
+from datadog_switch import datadog_enabled
 from secrets_loader import (
     get_opencode_go_api_key,
     get_openrouter_api_key,
@@ -84,61 +85,76 @@ log = logging.getLogger(f"{os.getenv('DD_SERVICE', 'grug')}.llm_client")
 #      not at import time.
 #   3. If `DD_LLMOBS_ENABLED` is unset (local dev, tests), the span
 #      becomes a no-op rather than failing loudly.
-try:  # pragma: no cover — import-time guard
-    from ddtrace.llmobs import LLMObs as _LLMObs
+#   4. GRUG_DATADOG_ENABLED off (the default, #1208) routes every seam to
+#      the no-op: LLMObs.llm() on a disabled LLMObs logs a warning per
+#      call, and with no agent an enabled one has nowhere to send.
 
-    def _llmobs_llm(**kwargs: Any) -> Any:
-        return _LLMObs.llm(**kwargs)
 
-    def _llmobs_annotate(**kwargs: Any) -> None:
-        # Observability must stay strictly additive: an annotate failure
-        # (SDK validation drift, non-serializable value) must never discard
-        # an already-computed model result or fail a job.
-        try:
-            _LLMObs.annotate(**kwargs)
-        except Exception as e:  # noqa: BLE001 - o11y never outranks the result
-            log.warning(
-                "llmobs_annotate_failed", extra={"kind": type(e).__name__},
-            )
+class _NoopSpan:
+    def __enter__(self) -> "_NoopSpan":
+        return self
+    def __exit__(self, *a: Any) -> bool:
+        return False
 
-    def _llmobs_export(span: Any) -> Optional[dict]:
-        return cast(Optional[dict], _LLMObs.export_span(span=span))
 
-    def _llmobs_submit_evaluation(**kwargs: Any) -> None:
-        # `submit_evaluation` (NOT the deprecated `submit_evaluation_for`,
-        # removed in ddtrace 4.0). The `span=` param takes the
-        # `{'span_id','trace_id'}` dict returned by `export_span` — the
-        # documented out-of-band attach: it lands the eval on the prior
-        # (closed) review span, no active-context requirement.
-        _LLMObs.submit_evaluation(**kwargs)
-except ImportError:  # pragma: no cover — local dev without ddtrace
+_LLMObs: Any = None
+try:  # pragma: no cover - import-time guard
+    from ddtrace.llmobs import LLMObs as _LLMObsSdk
 
-    class _NoopSpan:
-        def __enter__(self) -> "_NoopSpan":
-            return self
-        def __exit__(self, *a: Any) -> bool:
-            return False
-
-    def _llmobs_llm(**kwargs: Any) -> Any:
-        return _NoopSpan()
-
-    def _llmobs_annotate(**kwargs: Any) -> None:
-        return None
-
-    def _llmobs_export(span: Any) -> Optional[dict]:
-        return None
-
-    def _llmobs_submit_evaluation(**kwargs: Any) -> None:
-        return None
-
+    _LLMObs = _LLMObsSdk
+except ImportError:  # pragma: no cover - local dev without ddtrace
     # Loud signal so a layer-drift / partial-install in Lambda doesn't
     # silently turn off DD LLM Obs. AWS_LAMBDA_FUNCTION_NAME is the
     # canonical Lambda-environment marker; in local dev it's unset.
-    if os.environ.get("AWS_LAMBDA_FUNCTION_NAME"):
+    if os.environ.get("AWS_LAMBDA_FUNCTION_NAME") and datadog_enabled():
         log.warning(
             "llmobs_import_failed_falling_back_to_noop",
             extra={"lambda_fn": os.environ["AWS_LAMBDA_FUNCTION_NAME"]},
         )
+
+
+def _llmobs_live() -> bool:
+    return _LLMObs is not None and datadog_enabled()
+
+
+def _llmobs_llm(**kwargs: Any) -> Any:
+    if not _llmobs_live():
+        return _NoopSpan()
+    return _LLMObs.llm(**kwargs)
+
+
+def _llmobs_annotate(**kwargs: Any) -> None:
+    if not _llmobs_live():
+        return None
+    # Observability must stay strictly additive: an annotate failure
+    # (SDK validation drift, non-serializable value) must never discard
+    # an already-computed model result or fail a job.
+    try:
+        _LLMObs.annotate(**kwargs)
+    except Exception as e:  # noqa: BLE001 - o11y never outranks the result
+        log.warning(
+            "llmobs_annotate_failed", extra={"kind": type(e).__name__},
+        )
+    return None
+
+
+def _llmobs_export(span: Any) -> Optional[dict]:
+    if not _llmobs_live() or isinstance(span, _NoopSpan):
+        return None
+    return cast(Optional[dict], _LLMObs.export_span(span=span))
+
+
+def _llmobs_submit_evaluation(**kwargs: Any) -> None:
+    if not _llmobs_live():
+        return None
+    # `submit_evaluation` (NOT the deprecated `submit_evaluation_for`,
+    # removed in ddtrace 4.0). The `span=` param takes the
+    # `{'span_id','trace_id'}` dict returned by `export_span` - the
+    # documented out-of-band attach: it lands the eval on the prior
+    # (closed) review span, no active-context requirement.
+    _LLMObs.submit_evaluation(**kwargs)
+    return None
+
 
 _LLMOBS_NAME = "elder_code_review"
 # Teller walkthrough + /grug ask are separate span names so DD can filter

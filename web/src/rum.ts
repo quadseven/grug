@@ -21,7 +21,14 @@ const clientToken = import.meta.env.VITE_DD_RUM_CLIENT_TOKEN;
 const env = import.meta.env.VITE_DD_RUM_ENV ?? "dev";
 const version = import.meta.env.VITE_DD_RUM_VERSION ?? "local";
 
+// grug#1208: Datadog is off unless the build sets VITE_GRUG_DATADOG_ENABLED
+// (web.deploy.yml maps the repo variable GRUG_DATADOG_ENABLED onto it).
+const datadogEnabled = import.meta.env.VITE_GRUG_DATADOG_ENABLED === "true";
+
 export function initRum(): void {
+  if (!datadogEnabled) {
+    return;
+  }
   if (!applicationId || !clientToken) {
     // Local dev path — leave a breadcrumb in the console but don't throw.
     console.info("[rum] init skipped — missing VITE_DD_RUM_APPLICATION_ID or VITE_DD_RUM_CLIENT_TOKEN");

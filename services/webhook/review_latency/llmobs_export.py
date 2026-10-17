@@ -6,6 +6,7 @@ model bakeoffs (north-mini, Nemotron, ...) never appear in
 https://app.datadoghq.com/llm/evaluations .
 
 Enable when:
+  - GRUG_DATADOG_ENABLED=true (the master switch, #1208), AND
   - DD_LLMOBS_ENABLED=true  OR  GRUG_BENCH_LLMOBS=1
   - DD_API_KEY is set (agentless path; no local DD agent required)
 
@@ -41,6 +42,12 @@ _enable_attempted = False
 
 
 def _want_llmobs() -> bool:
+    # #1208: the master switch gates the bench export too - the manifests
+    # still carry DD_LLMOBS_ENABLED=true, which alone must not turn it on.
+    from datadog_switch import datadog_enabled
+
+    if not datadog_enabled():
+        return False
     if os.getenv("GRUG_BENCH_LLMOBS", "").strip().lower() in ("1", "true", "yes", "on"):
         return True
     return os.getenv("DD_LLMOBS_ENABLED", "").strip().lower() in (

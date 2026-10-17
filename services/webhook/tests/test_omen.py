@@ -7,6 +7,7 @@ from __future__ import annotations
 from unittest.mock import patch
 
 import httpx
+import pytest
 
 from personas.code_reviewer import omen
 from personas.code_reviewer.diff_parser import parse_diff
@@ -18,6 +19,14 @@ _DIFF = """diff --git a/src/dispatcher.py b/src/dispatcher.py
  import os
 +data = payload[key]
 """
+
+
+@pytest.fixture(autouse=True)
+def _datadog_switch_on(monkeypatch):
+    """These tests pin the Datadog integration's own behavior, which only
+    runs with GRUG_DATADOG_ENABLED on (#1208). The off path is pinned in
+    test_datadog_switch.py."""
+    monkeypatch.setenv("GRUG_DATADOG_ENABLED", "true")
 
 
 def _dd_response(count):

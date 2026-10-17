@@ -103,8 +103,10 @@ spec:
             # ml_app:grug-elder spans (services/webhook, services/api); grugthink's
             # Discord chat had none at all - a genuine gap, not a UI/filter issue.
             # Distinct ml_app so the two review/chat pipelines don't merge into one
-            # DD "application". Activated via ddtrace-run (Dockerfile CMD); the
-            # actual span is emitted by bot/llm_clients.py's query_ollama_api.
+            # DD "application". Activated via ddtrace-run (Dockerfile CMD) ONLY
+            # when GRUG_DATADOG_ENABLED is on (grug#1208, off by default - this
+            # value is then overridden to false); the actual span is emitted by
+            # bot/llm_clients.py's query_ollama_api.
             - {name: DD_LLMOBS_ENABLED, value: "true"}
             - {name: DD_LLMOBS_ML_APP, value: grugthink-chat}
             # Task-relay-to-Hermes feature (bot/task_relay.py, bot/review_relay.py):

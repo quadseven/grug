@@ -33,6 +33,7 @@ from urllib.parse import quote
 
 import httpx
 from github_app_auth import with_install_token_retry
+from datadog_switch import datadog_enabled
 from secrets_loader import get_dd_api_key, get_dd_app_key, get_warder_slo_map
 
 from personas.publish_check import publish_persona_check
@@ -154,6 +155,8 @@ def _gate_verdict(
     (blocking or not) so the caller can mark it in `findings_count` -
     otherwise an advisory breach would read as a clean "pass" in the
     Activity feed (ADR-0003 "no lies")."""
+    if not datadog_enabled():
+        return "", None, False  # #1208: no SSM key read, no Datadog query
     monitor_id = (get_warder_slo_map() or {}).get(f"{owner}/{repo_name}")
     if monitor_id is None:
         return "", None, False
