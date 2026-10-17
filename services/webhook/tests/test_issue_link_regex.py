@@ -45,10 +45,10 @@ def test_rejected_bodies(body):
 @pytest.mark.parametrize(
     "body",
     [
-        "Refs owner/name#42",
-        "refs Owner/Name#42",
-        "REFS my-org/my.repo_2#42",
-        "Closes owner/name#42",
+        "Refs owner/name#42",  # leak-guard-allow: placeholder repo, not a real one
+        "refs Owner/Name#42",  # leak-guard-allow: placeholder repo, not a real one
+        "REFS my-org/my.repo_2#42",  # leak-guard-allow: placeholder repo, not a real one
+        "Closes owner/name#42",  # leak-guard-allow: placeholder repo, not a real one
         "Part of owner/name#42",
     ],
 )
