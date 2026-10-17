@@ -49,7 +49,7 @@ def test_rejected_bodies(body):
         "refs Owner/Name#42",  # leak-guard-allow: placeholder repo, not a real one
         "REFS my-org/my.repo_2#42",  # leak-guard-allow: placeholder repo, not a real one
         "Closes owner/name#42",  # leak-guard-allow: placeholder repo, not a real one
-        "Part of owner/name#42",
+        "Part of owner/name#42",  # leak-guard-allow: placeholder repo, not a real one
     ],
 )
 def test_accepts_qualified_same_or_cross_repo_ref(body):
