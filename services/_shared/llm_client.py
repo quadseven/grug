@@ -1153,9 +1153,12 @@ _PROVIDER_POOLS = ("free", "paid")
 _SPENT_LIMIT_MARKERS = (
     "usage limit", "quota", "credit", "key limit", "total limit", "spend limit",
 )
-_SPENT_RATE_MARKERS = (
-    "per-day", "per day", "daily", "monthly", "usage limit", "quota", "gousagelimiterror",
-)
+# A 429 trips it only when the body names a daily or monthly allowance.
+# Poolside answers short-lived throttling with `429 usage limit exceeded` and
+# no Retry-After; reading that as spent blocked the one working cloud tier
+# for an hour (live, 2026-10-17). OpenCode Go's monthly 429 carries the
+# `GoUsageLimitError` type, and its own breaker above honours Retry-After.
+_SPENT_RATE_MARKERS = ("per-day", "per day", "daily", "monthly", "gousagelimiterror")
 _provider_breaker_lock = threading.Lock()
 _provider_blocked_until: dict[tuple[str, str], float] = {}
 _warned_disabled_entries: set[str] = set()

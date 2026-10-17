@@ -917,7 +917,9 @@ refusal whose body says a limit is spent (`total limit`, credits,
 `free-models-per-day`, a monthly usage limit) stops calls to that provider in
 that pod for its Retry-After, else an hour, and logs
 `llm_provider_circuit_open`. A 401 covers the whole key; the others only the
-free or paid pool that answered. A plain 429 or a 5xx never trips it.
+free or paid pool that answered. A 429 trips it only when its body names a
+daily or monthly allowance; a plain 429 (including Poolside's short-lived
+`usage limit exceeded`) or a 5xx never does.
 
 ### Why it matters even though reviews still work
 
