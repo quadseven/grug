@@ -44,7 +44,8 @@ from github_checks_client import (
     post_check_run,
 )
 from github_reviews_client import (
-    InlineComment, ReviewEvent, ReviewResult, get_review_comments, post_review,
+    InlineComment, ReviewEvent, ReviewResult, dismiss_review, get_review_comments,
+    list_reviews, post_review,
 )
 from llm_client import (
     DeepEscalationDecision,
@@ -117,7 +118,7 @@ from personas.code_reviewer.persona import (
 )
 from personas.code_reviewer.snapshot import review_freshness_id_from_pr
 from personas.code_reviewer import carry_forward
-from personas.code_reviewer.thread_resolver import resolve_fixed_threads
+from personas.code_reviewer.thread_resolver import is_grug, resolve_fixed_threads
 from personas.code_reviewer.verify import verify_findings
 from personas.tribe import CHECK_ELDER
 from adapters.install_store import (  # type: ignore
@@ -161,6 +162,10 @@ log = logging.getLogger(f"{os.getenv('DD_SERVICE', 'grug')}.persona.code_reviewe
 # face, not a giant banner.
 _PERSONA = "Elder"
 _PERSONA_PORTRAIT = "https://grug.lol/assets/grug_elder.png"
+# Hidden tag naming the persona that posted a review. Guard and Smasher build
+# their reviews with `_build_review_result` too, so the visible header cannot
+# tell them apart; Elder withdraws only reviews carrying its own tag.
+_REVIEW_PERSONA_TAG = "<!-- grug:review persona={} -->"
 
 _CHECK_NAME = CHECK_ELDER
 # 10s (was 30s) — a GitHub diff fetch is fast; the over-generous 30s let a
@@ -2174,6 +2179,7 @@ def _build_review_result(
     precedent_notes: dict[str, str] | None = None,
     repo_config: RepoConfig | None = None,
     file_contents: dict[str, str] | None = None,
+    persona: str = "elder",
 ) -> tuple[ReviewResult | None, tuple[Finding, ...]]:
     """Build the ReviewResult, or (None, ()) if nothing NEW to post.
 
@@ -2233,6 +2239,7 @@ def _build_review_result(
         body=(
             f'<img src="{_PERSONA_PORTRAIT}" width="46" align="left" alt="Grug {_PERSONA}" />'
             f"\n\n**Grug {_PERSONA}** gaze upon your PR · {len(comments)} finding(s)"
+            f"\n\n{_REVIEW_PERSONA_TAG.format(persona)}"
         ),
         comments=comments,
     ), new_findings
@@ -3399,6 +3406,23 @@ def dispatch_code_review(
             else:
                 review_publish_failed = True
 
+    # A blocking review from an earlier commit stays GitHub's standing verdict
+    # until it is dismissed; a clean re-review alone does not clear it.
+    # Withdraw it only when the FINAL verdict is clean: a degraded run read
+    # nothing, `conclusion` already folds in earlier findings still open
+    # (carry-forward), and `listed_threads is None` means that fold could not
+    # run, so a living-range review cannot vouch for the commits it skipped.
+    if (
+        not evaluation.degraded_reason
+        and evaluation.conclusion != "failure"
+        and conclusion != "failure"
+        and listed_threads is not None
+        and not check_publish_failed
+    ):
+        _dismiss_stale_blocks(
+            installation_id, owner, repo_name, pull_number, head_sha,
+        )
+
     # Capture inline-comment IDs for later reaction polling (#247). BEST-
     # EFFORT, post-publish, own try/except — a capture failure must never
     # change the review outcome (`result` is computed below, unaffected).
@@ -3903,6 +3927,59 @@ def _publish_deep_check(
                 "kind": type(error).__name__,
             },
         )
+
+
+def _dismiss_stale_blocks(
+    installation_id: int, owner: str, repo_name: str, pull_number: int,
+    head_sha: str,
+) -> int:
+    """Dismiss Elder's own REQUEST_CHANGES reviews on earlier commits.
+
+    Best-effort: a failure is logged and never changes the review outcome.
+    Matches only reviews by the Grug app itself that carry the
+    `persona=elder` tag, so a Guard or Smasher block, a human's review, and
+    another bot quoting the tag all stay untouched. Returns how many were
+    dismissed.
+    """
+    pr = f"{owner}/{repo_name}#{pull_number}"
+    tag = _REVIEW_PERSONA_TAG.format("elder")
+    dismissed = 0
+    try:
+        reviews = with_install_token_retry(
+            installation_id,
+            lambda token: list_reviews(
+                token, owner, repo_name, pull_number=pull_number,
+            ),
+        )
+        for review in reviews:
+            if (
+                review.get("state") != "CHANGES_REQUESTED"
+                or not is_grug((review.get("user") or {}).get("login"))
+                or tag not in (review.get("body") or "")
+                or review.get("commit_id") == head_sha
+            ):
+                continue
+            review_id = review["id"]
+            with_install_token_retry(
+                installation_id,
+                lambda token, rid=review_id: dismiss_review(
+                    token, owner, repo_name, pull_number=pull_number,
+                    review_id=rid,
+                    message=(
+                        f"Superseded: Elder re-reviewed {head_sha[:7]} and "
+                        "found nothing blocking."
+                    ),
+                ),
+            )
+            dismissed += 1
+    except (httpx.HTTPStatusError, httpx.RequestError) as e:
+        log.warning(
+            "elder_stale_block_dismiss_failed",
+            extra={"pr": pr, "kind": type(e).__name__, **_http_error_detail(e)},
+        )
+    if dismissed:
+        log.info("elder_stale_blocks_dismissed", extra={"pr": pr, "count": dismissed})
+    return dismissed
 
 
 def _capture_review_comments(

@@ -337,3 +337,28 @@ def test_get_review_comments_page_cap_logs(caplog):
     assert len(calls) == _MAX_REVIEW_COMMENT_PAGES
     assert len(out) == 100 * _MAX_REVIEW_COMMENT_PAGES
     assert any(r.msg == "get_review_comments_page_cap_hit" for r in caplog.records)
+
+
+def test_dismiss_review_puts_a_dismissal():
+    from github_reviews_client import dismiss_review
+
+    with patch("httpx.put", return_value=_ok_response({"state": "DISMISSED"})) as mock_put:
+        out = dismiss_review(
+            "tok", "o", "r", pull_number=5, review_id=42, message="superseded",
+        )
+    assert out == {"state": "DISMISSED"}
+    url = mock_put.call_args.args[0]
+    assert url.endswith("/repos/o/r/pulls/5/reviews/42/dismissals")
+    assert mock_put.call_args.kwargs["json"] == {"message": "superseded", "event": "DISMISS"}
+    assert mock_put.call_args.kwargs["headers"]["Authorization"] == "Bearer tok"
+
+
+def test_list_reviews_paginates_until_a_short_page():
+    from github_reviews_client import list_reviews
+
+    pages = [_ok_response([{"id": i} for i in range(100)]), _ok_response([{"id": 100}])]
+    with patch("httpx.get", side_effect=pages) as mock_get:
+        out = list_reviews("tok", "o", "r", pull_number=5)
+    assert len(out) == 101
+    assert mock_get.call_count == 2
+    assert mock_get.call_args.args[0].endswith("/repos/o/r/pulls/5/reviews")
