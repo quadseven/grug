@@ -1294,6 +1294,7 @@ def test_terminal_failure_completes_the_elder_check(monkeypatch):
         return True
 
     monkeypatch.setattr(rerun, "_complete_elder_check_open", fake_complete)
+    monkeypatch.setattr(rerun, "elder_blocking_for", lambda *a: False)
     spec = types.SimpleNamespace(kind="rerun")
     consumer._announce_terminal_failure(
         spec, _dlq_message(5), httpx.HTTPStatusError(
@@ -1332,6 +1333,7 @@ def test_terminal_announce_never_masks_the_original_error(monkeypatch):
         raise RuntimeError("check post exploded")
 
     monkeypatch.setattr(rerun, "_complete_elder_check_open", boom)
+    monkeypatch.setattr(rerun, "elder_blocking_for", lambda *a: False)
     spec = types.SimpleNamespace(kind="rerun")
     consumer._announce_terminal_failure(spec, _dlq_message(5), RuntimeError("orig"))
 
