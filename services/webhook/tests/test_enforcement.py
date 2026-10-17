@@ -19,6 +19,20 @@ from enforcement import (
     GRUG_TPM_RULESET_NAME,
     GRUG_DOR_CHECK_NAME,
 )
+from personas.tribe import CHECK_ELDER
+
+
+@pytest.fixture(autouse=True)
+def _default_repo_config():
+    """ensure_enforcement reads the repo's persona modes (grug#1202) to pick
+    the ruleset's required contexts. These lifecycle tests predate that and
+    run against the store's defaults (Elder enabled + blocking); the mode
+    matrix itself lives in test_enforcement_required_personas.py."""
+    from adapters.pg_install_store import _DEFAULT_PERSONA_CONFIG
+
+    with patch("adapters.install_store.get_repo_config",
+               return_value=dict(_DEFAULT_PERSONA_CONFIG)):
+        yield
 
 
 # ── ensure_enforcement ───────────────────────────────────────────────
@@ -35,8 +49,10 @@ def test_ensure_creates_ruleset_when_none():
     mock_detect.assert_called_once_with(
         "tok", "myorg", "myrepo", "main", GRUG_DOR_CHECK_NAME, stored_ruleset_id=None,
     )
+    # Default config has Elder at BLOCK, so Elder is required too (grug#1202).
     mock_create.assert_called_once_with(
-        "tok", "myorg", "myrepo", GRUG_TPM_RULESET_NAME, [GRUG_DOR_CHECK_NAME],
+        "tok", "myorg", "myrepo", GRUG_TPM_RULESET_NAME,
+        [GRUG_DOR_CHECK_NAME, CHECK_ELDER],
     )
     mock_set.assert_called_once_with(100, 200, 42)
 
