@@ -31,6 +31,7 @@ paths so this module only ever runs from the webhook process.
 """
 from __future__ import annotations
 
+import contextvars
 import hashlib
 import fnmatch
 import json
@@ -663,6 +664,35 @@ class LlmReviewResponse:
     backends_used: tuple[Backend, ...] = field(default_factory=tuple)
     models_used: tuple[str, ...] = field(default_factory=tuple)
     coverage: ReviewCoverage | None = None
+    # grug#1196: every model call that failed for this review chunk, as
+    # "model (reason)" labels in ladder order. Set only on a failed chunk, so
+    # a neutral check can name what was tried instead of a bare `all_failed`.
+    attempts: tuple[str, ...] = field(default_factory=tuple)
+
+
+# grug#1196: one failed model call inside a chunk's ladder walk.
+@dataclass(frozen=True, slots=True)
+class _LadderAttempt:
+    backend: str
+    model: str
+    reason: str
+
+    @property
+    def label(self) -> str:
+        return f"{self.model} ({self.reason})"
+
+
+# Set by `_ChunkLadder.run` around one chunk's dispatch. `_run_llm_attempt` is
+# the single seam every review model call passes through, so it records each
+# failure into the trail and skips models the chunk already saw fail. Both
+# default to "off", so every other caller (judge, deep append, ask) is
+# unaffected.
+_LADDER_TRAIL: contextvars.ContextVar[list[_LadderAttempt] | None] = (
+    contextvars.ContextVar("grug_ladder_trail", default=None)
+)
+_LADDER_SKIP: contextvars.ContextVar[frozenset[tuple[str, str]]] = (
+    contextvars.ContextVar("grug_ladder_skip", default=frozenset())
+)
 
 
 # Test hook — replaced with a no-op in unit tests to avoid real sleeps.
@@ -2420,6 +2450,51 @@ def _recover_fenced_json(content: str) -> object | None:
     return None
 
 
+# Bounds the embedded-object scan: at most this many `{` starts are tried.
+_EMBEDDED_JSON_MAX_STARTS = 200
+
+
+def _recover_embedded_json(content: str) -> dict | None:
+    """Repair an answer whose findings object is wrapped in prose (grug#1196).
+
+    Live 2026-10-17: a cloud model answered with a sentence and then a valid
+    `{"findings": []}`, or the object first and a paragraph after it. Both are
+    real answers, but `json.loads` rejects them and there is no fence to
+    recover, so Elder published "eyes clouded (parse_failed)". This decodes
+    one JSON value at each `{` and keeps the first object that carries a
+    `findings` list. Stricter than the fenced path on purpose: prose can quote
+    an unrelated example object, and only the documented envelope is taken."""
+    decoder = json.JSONDecoder()
+    scan = content[:_FENCE_SCAN_CHARS]
+    start = scan.find("{")
+    tries = 0
+    while start != -1 and tries < _EMBEDDED_JSON_MAX_STARTS:
+        tries += 1
+        try:
+            parsed, _end = decoder.raw_decode(scan, start)
+        except json.JSONDecodeError:
+            parsed = None
+        if isinstance(parsed, dict) and isinstance(parsed.get("findings"), list):
+            return parsed
+        start = scan.find("{", start + 1)
+    return None
+
+
+def _recover_wrapped_json(content: str, model_name: str) -> object | None:
+    """A fenced block first (grug#883), then one repair of a findings object
+    wrapped in prose (grug#1196), before the answer counts as unparseable."""
+    parsed = _recover_fenced_json(content)
+    if parsed is not None:
+        return parsed
+    repaired = _recover_embedded_json(content)
+    if repaired is not None:
+        log.info(
+            "llm_response_json_repaired",
+            extra={"model": model_name, "content_len": len(content)},
+        )
+    return repaired
+
+
 def _describe_unparseable(content: str) -> str:
     """Name what actually arrived when no JSON could be recovered.
 
@@ -2600,7 +2675,7 @@ def _parse_response(
     except json.JSONDecodeError:
         # grug#883: a fenced answer is a REAL review, not a failure. Recover it
         # before giving up, and if there is nothing to recover say what arrived.
-        parsed = _recover_fenced_json(content)
+        parsed = _recover_wrapped_json(content, model_name)
         if parsed is None:
             return (), model_name, _describe_unparseable(content)
     # Models sometimes return a bare JSON array of findings instead of the
@@ -3621,6 +3696,7 @@ def _cohort_coverage(
     and `fraction` exactly as before, so the eval harness's numbers do not move
     (grug#939). What it adds is which of those the scheduler never reached.
     """
+    unwalked = _unwalked_paths(plan, failed_indexes)
     return ReviewCoverage(
         total_cohorts=plan.total_cohorts_planned,
         completed_cohorts=len(responses) - len(failed_indexes),
@@ -3628,8 +3704,40 @@ def _cohort_coverage(
         unattempted_cohorts=_unattempted_cohort_indexes(responses),
         cohort_labels=tuple(cohort.label for cohort in plan.cohorts),
         concerns=plan.concerns,
-        unwalked_paths=_unwalked_paths(plan, failed_indexes),
+        unwalked_paths=unwalked,
+        reviewed_paths=_reviewed_paths(plan, responses, failed_indexes, unwalked),
+        failed_models=_failed_models(responses, failed_indexes),
     )
+
+
+def _reviewed_paths(
+    plan: ReviewPlan,
+    responses: Sequence[LlmReviewResponse],
+    failed_indexes: Sequence[int],
+    unwalked: Sequence[str],
+) -> tuple[str, ...]:
+    """Files in completed cohorts that no failed or dropped cohort shares."""
+    failed = set(failed_indexes)
+    skip = set(unwalked)
+    paths = {
+        path
+        for index, cohort in enumerate(plan.cohorts[: len(responses)], start=1)
+        if index not in failed
+        for path in cohort.paths
+        if path not in skip
+    }
+    return tuple(sorted(paths))
+
+
+def _failed_models(
+    responses: Sequence[LlmReviewResponse], failed_indexes: Sequence[int],
+) -> tuple[str, ...]:
+    """Deduplicated "model (reason)" labels from the chunks that failed."""
+    labels: dict[str, None] = {}
+    for index in failed_indexes:
+        if 1 <= index <= len(responses):
+            labels.update(dict.fromkeys(responses[index - 1].attempts))
+    return tuple(labels)
 
 
 def _unwalked_paths(plan: ReviewPlan, failed_indexes: Sequence[int]) -> tuple[str, ...]:
@@ -3779,6 +3887,10 @@ def _merge_cohort_responses(
     if parse_failed is not None:
         return replace(parse_failed, coverage=coverage)
     errors = "; ".join(response.error for response in responses if response.error)
+    if coverage.failed_models:
+        errors = f"{errors or 'all review cohorts failed'}; models tried: " + (
+            ", ".join(coverage.failed_models)
+        )
     return LlmReviewResponse(
         kind="all_failed",
         error=errors or "all review cohorts failed",
@@ -4125,6 +4237,350 @@ def _review_reasoner_diff_once(
     )
 
 
+class _ChunkLadder:
+    """Per-chunk memory of failed model calls across attempts (grug#1196).
+
+    The staged scheduler retries a failed chunk once. That retry used to walk
+    the same ladder again from the top, so it re-asked the models that had
+    just failed and was a coin flip (one large PR failed three times in a row).
+    Here the retry skips every model that already failed on this chunk and
+    goes on to the next one in the ladder; when none is left it costs no
+    network call. A failed chunk's response carries every attempt so the
+    neutral check can name the models tried and why each failed."""
+
+    def __init__(self) -> None:
+        self._tried: dict[int, list[_LadderAttempt]] = {}
+        self._parse_failed: dict[int, LlmReviewResponse] = {}
+
+    def run(
+        self, key: int, call: Callable[[], LlmReviewResponse],
+    ) -> LlmReviewResponse:
+        response = self._run_once(key, call)
+        # A model that answered unparseably is a more specific failure than a
+        # retry that reached no model at all, so `parse_failed` keeps winning
+        # over `all_failed` across attempts, exactly as it does inside one.
+        # The FIRST unparseable answer keeps the attribution, as it does there.
+        if response.kind == "parse_failed":
+            self._parse_failed.setdefault(key, response)
+        if response.kind != "reviewed" and key in self._parse_failed:
+            response = replace(self._parse_failed[key], attempts=response.attempts)
+        return response
+
+    def _run_once(
+        self, key: int, call: Callable[[], LlmReviewResponse],
+    ) -> LlmReviewResponse:
+        tried = self._tried.setdefault(key, [])
+        skip = frozenset((attempt.backend, attempt.model) for attempt in tried)
+        trail: list[_LadderAttempt] = []
+        trail_token = _LADDER_TRAIL.set(trail)
+        skip_token = _LADDER_SKIP.set(skip)
+        try:
+            response = call()
+        finally:
+            _LADDER_SKIP.reset(skip_token)
+            _LADDER_TRAIL.reset(trail_token)
+        if skip:
+            log.info(
+                "llm_chunk_retry_next_model",
+                extra={
+                    "chunk": key + 1,
+                    "skipped_models": sorted(model for _, model in skip),
+                    "new_attempts": [attempt.label for attempt in trail],
+                    "kind": response.kind,
+                },
+            )
+        tried.extend(trail)
+        if response.kind in ("all_failed", "parse_failed") and tried:
+            labels = tuple(dict.fromkeys(attempt.label for attempt in tried))
+            return replace(response, attempts=labels)
+        return response
+
+
+def _file_split_targets(
+    plan: ReviewPlan, responses: Sequence[LlmReviewResponse],
+) -> list[int]:
+    """0-based cohorts worth re-reviewing one file at a time: they ran, failed
+    in a way a smaller input could fix, and span more than one file."""
+    return [
+        index
+        for index, (cohort, response) in enumerate(zip(plan.cohorts, responses))
+        if len(cohort.paths) > 1
+        and not cohort.oversized
+        and _is_retryable_cohort_failure(response)
+        and not (response.error or "").startswith(_SKIPPED_COHORT_PREFIX)
+    ]
+
+
+def _file_chunks(cohort: ReviewCohort, hunks: list[Hunk]) -> tuple[ReviewCohort, ...]:
+    """Re-pack one failed cohort with one file per chunk, indexes into `hunks`."""
+    sub_plan = plan_review(
+        [hunks[index] for index in cohort.hunk_indexes],
+        max_cohort_chars=_review_cohort_chars(),
+        max_cohort_paths=1,
+        max_cohorts=_MAX_REVIEW_COHORTS,
+    )
+    return tuple(
+        replace(
+            sub,
+            label=f"{cohort.label} / {sub.label}",
+            hunk_indexes=tuple(cohort.hunk_indexes[i] for i in sub.hunk_indexes),
+        )
+        for sub in sub_plan.cohorts
+    )
+
+
+def _with_parent_attempts(
+    response: LlmReviewResponse, parent: LlmReviewResponse,
+) -> LlmReviewResponse:
+    """A failed file chunk also names what failed on the cohort it came from."""
+    if response.kind == "reviewed" or not parent.attempts:
+        return response
+    labels = tuple(dict.fromkeys(parent.attempts + response.attempts))
+    return replace(response, attempts=labels)
+
+
+def _splice_file_chunks(
+    plan: ReviewPlan,
+    responses: Sequence[LlmReviewResponse],
+    chunks: dict[int, tuple[ReviewCohort, ...]],
+    sub_responses: Sequence[LlmReviewResponse],
+) -> tuple[ReviewPlan, list[LlmReviewResponse]]:
+    """Replace each split cohort, in place, with its file chunks and results,
+    so coverage counts and names the chunks that actually ran."""
+    pending = iter(sub_responses)
+    cohorts: list[ReviewCohort] = []
+    merged: list[LlmReviewResponse] = []
+    for index, (cohort, response) in enumerate(zip(plan.cohorts, responses)):
+        if index not in chunks:
+            cohorts.append(cohort)
+            merged.append(response)
+            continue
+        cohorts.extend(chunks[index])
+        merged.extend(
+            _with_parent_attempts(next(pending), response) for _ in chunks[index]
+        )
+    added = sum(len(files) for files in chunks.values()) - len(chunks)
+    return ReviewPlan(
+        cohorts=tuple(cohorts),
+        total_diff_chars=plan.total_diff_chars,
+        concerns=plan.concerns,
+        total_cohorts_planned=plan.total_cohorts_planned + added,
+    ), merged
+
+
+@dataclass(frozen=True, slots=True)
+class _Tier1Review:
+    """The Tier-1 review of one diff: whole, staged, then split by file.
+
+    1. A diff under the cohort budget is one chunk; a larger one is packed
+       into bounded cohorts by `plan_review` (ADR-0021).
+    2. Each chunk walks the model ladder, then gets one retry that starts at
+       the next untried model (`_ChunkLadder`).
+    3. A chunk that still failed and spans several files is split by file
+       and each file chunk is reviewed on its own, inside the remaining
+       staged budget (grug#1196). Markings from every chunk merge into one
+       response, and coverage names the files reviewed and not reviewed.
+    """
+
+    hunks: list[Hunk]
+    installation_id: int
+    pr_context: PrContext | None
+    file_contents: dict[str, str] | None
+    cross_file_contents: dict[str, str] | None
+    runtime_context: str | None
+    ci_context: str | None
+    repo_docs_context: str | None
+    voice: VoiceSelection
+    cancel_event: threading.Event | None
+    started_at: float = field(default_factory=time.monotonic)
+
+    @staticmethod
+    def reserve_s() -> float:
+        return (
+            _review_llm_timeout_s()
+            + 2 * _SAAS_OVERLOAD_FALLBACK_TIMEOUT_SECONDS
+            + _cloud_chain_worst_case_s()
+        )
+
+    def _dispatch(
+        self,
+        hunks: list[Hunk],
+        pr_context: PrContext | None,
+        file_contents: dict[str, str] | None,
+        review_map: str = "",
+    ) -> LlmReviewResponse:
+        return _review_diff_dispatch(
+            hunks,
+            self.installation_id,
+            pr_context,
+            file_contents,
+            self.cross_file_contents,
+            self.runtime_context,
+            self.ci_context,
+            self.repo_docs_context,
+            self.voice,
+            self.cancel_event,
+            review_map,
+        )
+
+    def _run_cohort(
+        self, cohort: ReviewCohort, index: int, count: int, review_map: str,
+    ) -> LlmReviewResponse:
+        oversized = _oversized_cohort_failure(
+            cohort,
+            phase="tier1",
+            index=index + 1,
+            count=count,
+            installation_id=self.installation_id,
+            pr_context=self.pr_context,
+        )
+        if oversized is not None:
+            return oversized
+        cohort_paths = set(cohort.paths)
+        return self._dispatch(
+            [self.hunks[i] for i in cohort.hunk_indexes],
+            _cohort_pr_context(
+                self.pr_context, phase="tier1", index=index + 1, count=count,
+            ),
+            {
+                path: content
+                for path, content in (self.file_contents or {}).items()
+                if path in cohort_paths
+            },
+            review_map,
+        )
+
+    def _schedule(
+        self,
+        cohorts: Sequence[ReviewCohort],
+        run_chunk: Callable[[int], LlmReviewResponse],
+        budget_seconds: float,
+    ) -> list[LlmReviewResponse]:
+        ladder = _ChunkLadder()
+        return _run_staged_cohorts(
+            cohort_count=len(cohorts),
+            run_cohort=lambda index: ladder.run(index, lambda: run_chunk(index)),
+            budget_seconds=budget_seconds,
+            reserve_seconds=self.reserve_s(),
+            cancel_event=self.cancel_event,
+        )
+
+    def run_whole_diff(self, plan: ReviewPlan) -> LlmReviewResponse:
+        """One chunk. A success returns unchanged, exactly as before staging
+        existed; a failure gets the next-model retry, then the file split."""
+        ladder = _ChunkLadder()
+
+        def call() -> LlmReviewResponse:
+            return self._dispatch(self.hunks, self.pr_context, self.file_contents)
+
+        response = ladder.run(0, call)
+        if _is_retryable_cohort_failure(response) and self._can_retry():
+            log.warning(
+                "llm_staged_review_cohort_retry",
+                extra={
+                    "cohort": 1,
+                    "attempt": 2,
+                    "kind": response.kind,
+                    "error": (response.error or "")[:200],
+                },
+            )
+            response = ladder.run(0, call)
+        if response.kind == "reviewed" or self._cancelled():
+            return response
+        return self._split_and_merge(plan, [response])
+
+    def _cancelled(self) -> bool:
+        return self.cancel_event is not None and self.cancel_event.is_set()
+
+    def _can_retry(self) -> bool:
+        elapsed = time.monotonic() - self.started_at
+        return not self._cancelled() and (
+            elapsed + self.reserve_s() <= _staged_review_budget_s()
+        )
+
+    def run_staged(self, plan: ReviewPlan) -> LlmReviewResponse:
+        review_map = render_review_map(plan)
+        ctx = self.pr_context or {}
+        log.info(
+            "llm_staged_review_planned",
+            extra={
+                "phase": "tier1",
+                "cohort_count": len(plan.cohorts),
+                "cohort_chars": [cohort.diff_chars for cohort in plan.cohorts],
+                "total_diff_chars": plan.total_diff_chars,
+                "installation_id": self.installation_id,
+                "repo": ctx.get("repo"),
+                "pr_number": ctx.get("pr_number"),
+            },
+        )
+        count = len(plan.cohorts)
+        responses = self._schedule(
+            plan.cohorts,
+            lambda index: self._run_cohort(
+                plan.cohorts[index], index, count, review_map,
+            ),
+            _staged_review_budget_s(),
+        )
+        return self._split_and_merge(plan, responses)
+
+    def _split_and_merge(
+        self, plan: ReviewPlan, responses: list[LlmReviewResponse],
+    ) -> LlmReviewResponse:
+        plan, responses = self._file_split(plan, responses)
+        return _merge_cohort_responses(
+            responses, self.installation_id, self.pr_context, plan,
+        )
+
+    def _split_budget_s(self) -> float | None:
+        """Seconds left for a file split, or None when it cannot afford one."""
+        if self._cancelled():
+            return None
+        remaining = _staged_review_budget_s() - (time.monotonic() - self.started_at)
+        return remaining if remaining > self.reserve_s() else None
+
+    def _file_split(
+        self, plan: ReviewPlan, responses: list[LlmReviewResponse],
+    ) -> tuple[ReviewPlan, list[LlmReviewResponse]]:
+        targets = _file_split_targets(plan, responses)
+        if not targets:
+            return plan, responses
+        budget = self._split_budget_s()
+        ctx = self.pr_context or {}
+        if budget is None:
+            log.warning(
+                "llm_review_file_split_skipped",
+                extra={
+                    "cohorts": [index + 1 for index in targets],
+                    "reason": "no budget left",
+                    "repo": ctx.get("repo"),
+                    "pr_number": ctx.get("pr_number"),
+                },
+            )
+            return plan, responses
+        chunks = {index: _file_chunks(plan.cohorts[index], self.hunks) for index in targets}
+        flat = [chunk for index in targets for chunk in chunks[index]]
+        review_map = render_review_map(
+            ReviewPlan(cohorts=tuple(flat), total_diff_chars=sum(c.diff_chars for c in flat)),
+        )
+        log.info(
+            "llm_review_file_split",
+            extra={
+                "cohorts": [index + 1 for index in targets],
+                "file_chunks": len(flat),
+                "budget_s": round(budget, 1),
+                "installation_id": self.installation_id,
+                "repo": ctx.get("repo"),
+                "pr_number": ctx.get("pr_number"),
+            },
+        )
+        sub_responses = self._schedule(
+            flat,
+            lambda index: self._run_cohort(flat[index], index, len(flat), review_map),
+            budget,
+        )
+        return _splice_file_chunks(plan, responses, chunks, sub_responses)
+
+
 def review_diff(
     hunks: list[Hunk],
     installation_id: int,
@@ -4170,78 +4626,21 @@ def review_diff(
         max_cohort_paths=_review_cohort_paths(),
         max_cohorts=_review_max_cohorts(),
     )
-    if not plan.staged:
-        return _review_diff_dispatch(
-            hunks, installation_id, pr_context, file_contents, cross_file_contents,
-            runtime_context, ci_context, repo_docs_context, voice, cancel_event,
-        )
-
-    review_map = render_review_map(plan)
-    ctx = pr_context or {}
-    log.info(
-        "llm_staged_review_planned",
-        extra={
-            "phase": "tier1",
-            "cohort_count": len(plan.cohorts),
-            "cohort_chars": [cohort.diff_chars for cohort in plan.cohorts],
-            "total_diff_chars": plan.total_diff_chars,
-            "installation_id": installation_id,
-            "repo": ctx.get("repo"),
-            "pr_number": ctx.get("pr_number"),
-        },
-    )
-
-    def run_cohort(cohort_index: int) -> LlmReviewResponse:
-        cohort = plan.cohorts[cohort_index]
-        oversized = _oversized_cohort_failure(
-            cohort,
-            phase="tier1",
-            index=cohort_index + 1,
-            count=len(plan.cohorts),
-            installation_id=installation_id,
-            pr_context=pr_context,
-        )
-        if oversized is not None:
-            return oversized
-        cohort_hunks = [hunks[index] for index in cohort.hunk_indexes]
-        cohort_paths = set(cohort.paths)
-        cohort_context = _cohort_pr_context(
-            pr_context,
-            phase="tier1",
-            index=cohort_index + 1,
-            count=len(plan.cohorts),
-        )
-        cohort_contents = {
-            path: content
-            for path, content in (file_contents or {}).items()
-            if path in cohort_paths
-        }
-        return _review_diff_dispatch(
-            cohort_hunks,
-            installation_id,
-            cohort_context,
-            cohort_contents,
-            cross_file_contents,
-            runtime_context,
-            ci_context,
-            repo_docs_context,
-            voice,
-            cancel_event,
-            review_map,
-        )
-
-    responses = _run_staged_cohorts(
-        cohort_count=len(plan.cohorts),
-        run_cohort=run_cohort,
-        budget_seconds=_staged_review_budget_s(),
-        reserve_seconds=(
-            _review_llm_timeout_s()
-            + 2 * _SAAS_OVERLOAD_FALLBACK_TIMEOUT_SECONDS
-            + _cloud_chain_worst_case_s()
-        ),
+    review = _Tier1Review(
+        hunks=hunks,
+        installation_id=installation_id,
+        pr_context=pr_context,
+        file_contents=file_contents,
+        cross_file_contents=cross_file_contents,
+        runtime_context=runtime_context,
+        ci_context=ci_context,
+        repo_docs_context=repo_docs_context,
+        voice=voice,
         cancel_event=cancel_event,
     )
-    return _merge_cohort_responses(responses, installation_id, pr_context, plan)
+    if not plan.staged:
+        return review.run_whole_diff(plan)
+    return review.run_staged(plan)
 
 
 @dataclass
@@ -4479,7 +4878,59 @@ def _extract_attempt_content(body: dict) -> tuple[str, str]:
     return content, finish_reason
 
 
+def _ladder_failure_reason(outcome: AttemptOutcome) -> str | None:
+    """Short reason for a failed attempt, or None when it answered usably."""
+    if outcome.error_kind is None:
+        return None
+    if outcome.error_kind == "config":
+        return "misconfigured"
+    if outcome.error_kind == "parse_failed":
+        return "parse_failed"
+    text = outcome.error_text or outcome.error_kind
+    return text.rsplit(": ", 1)[-1]
+
+
 def _run_llm_attempt(
+    *,
+    backend: Backend,
+    config: BackendConfig,
+    messages: list[dict[str, str]],
+    variant: PromptVariant,
+    pr_tags: dict[str, str],
+    cancel_event: threading.Event | None = None,
+    transport_log_event: str = "llm_backend_transport_failed",
+) -> AttemptOutcome:
+    """`_call_llm_attempt` plus the chunk ladder bookkeeping (grug#1196).
+
+    Inside `_ChunkLadder.run`, a model that already failed on this chunk is
+    skipped without a network call, so a retry moves on to the next model in
+    the ladder instead of re-asking the one that just failed. The skip reads
+    as a config miss, which every caller already steps past. Each real
+    failure is appended to the chunk's trail so the neutral check can name
+    it. Outside a chunk both context variables are empty and this is a plain
+    pass-through."""
+    key = (backend.value, config.model)
+    if key in _LADDER_SKIP.get():
+        return AttemptOutcome(
+            backend=backend, model=None, findings=(), content="",
+            error_kind="config",
+            error_text=f"{backend.value}: {config.model} already failed on this chunk",
+            status_code=None, finish_reason="", usage_metrics={},
+            span_context=None, raw_response=None,
+        )
+    outcome = _call_llm_attempt(
+        backend=backend, config=config, messages=messages, variant=variant,
+        pr_tags=pr_tags, cancel_event=cancel_event,
+        transport_log_event=transport_log_event,
+    )
+    trail = _LADDER_TRAIL.get()
+    reason = _ladder_failure_reason(outcome)
+    if trail is not None and reason is not None:
+        trail.append(_LadderAttempt(backend=key[0], model=key[1], reason=reason))
+    return outcome
+
+
+def _call_llm_attempt(
     *,
     backend: Backend,
     config: BackendConfig,
@@ -5287,9 +5738,16 @@ def _review_diff_dispatch_cave_primary(
         # input order so downstream tie-breaks stay (coder, reasoner).
         # `list(...)` fully consumes the lazy iterator before the with-block
         # exits so both outcomes are captured.
+        # One context copy per arm, taken on THIS thread, so a worker still
+        # sees the chunk ladder's trail and skip set (grug#1196). Pool
+        # threads do not inherit context variables on their own.
+        arm_contexts = [contextvars.copy_context() for _ in review_backends]
         with ThreadPoolExecutor(max_workers=len(review_backends)) as pool:
             arm_outcomes = list(pool.map(
-                lambda b: _run_review_arm(b, messages, variant, pr_tags, cancel_event),
+                lambda ctx, b: ctx.run(
+                    _run_review_arm, b, messages, variant, pr_tags, cancel_event,
+                ),
+                arm_contexts,
                 review_backends,
             ))
     elif depth == "fast":

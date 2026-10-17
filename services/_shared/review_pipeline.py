@@ -113,6 +113,14 @@ class ReviewCoverage:
     # Files in any cohort that did not complete, sorted. What a reader of a
     # partial review needs: WHERE Elder did not look, not how many cohorts.
     unwalked_paths: tuple[str, ...] = ()
+    # grug#1196: files every chunk touching them completed, sorted. With
+    # `unwalked_paths`, the check summary can say which files were reviewed
+    # and which were not.
+    reviewed_paths: tuple[str, ...] = ()
+    # grug#1196: "model (reason)" for every model call that failed on a chunk
+    # that never completed, in ladder order, deduplicated. Lets a neutral
+    # check name what was tried instead of a bare `all_failed`.
+    failed_models: tuple[str, ...] = ()
 
     @property
     def complete(self) -> bool:
