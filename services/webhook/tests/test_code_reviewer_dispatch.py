@@ -423,6 +423,7 @@ def test_summary_markdown_renders_findings_table():
     title, summary = cr_dispatch._summary_markdown(ev)
     assert "1 blocking" in title  # one critical, one low
     assert "Markings Board" in summary
+    assert "grug-review-badge.svg" in summary
 
 
     assert "| Severity | Effort | File | Line | Rule | Marking |" in summary
@@ -2047,6 +2048,7 @@ def test_review_stack_body_has_marker_and_actionable_count():
     )
     body = cr_dispatch._review_stack_body(
         ev, conclusion="neutral", living_range="abc..def", review_phase="tier1",
+        review_url="https://github.com/example/project/pull/42/checks",
     )
     assert cr_dispatch._STACK_MARKER in body
     assert "2 actionable marking" in body
@@ -2058,6 +2060,9 @@ def test_review_stack_body_has_marker_and_actionable_count():
     # information a reader needs. The old "Tier-1 coder arm (deep may append
     # later)" said it in vocabulary only this repo understands.
     assert "deep look may add more" in body
+    assert "grug-review-badge.svg" in body
+    assert "View full review" in body
+    assert "https://github.com/example/project/pull/42/checks" in body
 
 
 def test_review_stack_and_summary_omit_empty_agent_prompt():

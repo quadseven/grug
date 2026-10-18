@@ -1,0 +1,8 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="300" height="48" viewBox="0 0 300 48" role="img" aria-labelledby="title">
+  <title id="title">Grug Elder - Read the Markings</title>
+  <rect width="300" height="48" rx="8" fill="#292524"/>
+  <path d="M23 12c-7 0-12 5-12 12s5 12 12 12c4 0 7-2 9-5v4h6V13h-6v4c-2-3-5-5-9-5Zm1 6c4 0 7 3 7 7s-3 7-7 7-7-3-7-7 3-7 7-7Z" fill="#fbbf24"/>
+  <text x="49" y="21" fill="#fafaf9" font-family="Arial, sans-serif" font-size="12" font-weight="700">GRUG ELDER</text>
+  <rect x="48" y="26" width="238" height="1" fill="#57534e"/>
+  <text x="49" y="40" fill="#fbbf24" font-family="Arial, sans-serif" font-size="12" font-weight="700">READ THE MARKINGS  &#8594;</text>
+</svg>

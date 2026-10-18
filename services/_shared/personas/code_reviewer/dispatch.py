@@ -33,6 +33,11 @@ from urllib.parse import quote
 
 import httpx
 
+_REVIEW_BADGE_URL = (
+    "https://raw.githubusercontent.com/quadseven/grug/main/"
+    "web/public/assets/grug-review-badge.svg"
+)
+
 from activity_log import record_check_verdict
 from code_review_prompt import RULES
 from github_app_auth import (
@@ -827,7 +832,7 @@ def _defensive_drop_note(count: int) -> str:
     return f"\n\n{count} defensive findings dropped: no reachable caller named"
 
 
-def _summary_markdown(
+def _summary_markdown_content(
     evaluation: CodeReviewEvaluation,
     *,
     suppressed_count: int = 0,
@@ -975,6 +980,20 @@ def _summary_markdown(
     if agent:
         summary = f"{summary}\n\n{agent}"
     return title, summary
+
+
+def _summary_markdown(
+    evaluation: CodeReviewEvaluation,
+    *,
+    review_url: str = "",
+    **kwargs: Any,
+) -> tuple[str, str]:
+    """Render Elder check-run Markdown with its branded review badge."""
+    title, summary = _summary_markdown_content(evaluation, **kwargs)
+    badge = f"![View full review]({_REVIEW_BADGE_URL})"
+    if review_url:
+        badge = f"[{badge}]({review_url})"
+    return title, f"{badge}\n\n{summary}"
 
 
 def _intent_paragraph(pr_context: PrContext) -> str:
@@ -1594,6 +1613,7 @@ def _review_stack_body(
     pr_title: str = "",
     head_sha: str = "",
     base_sha: str = "",
+    review_url: str = "",
 ) -> str:
     """PR-timeline review stack comment (Markings v2 / FLINT-style shell).
 
@@ -1680,9 +1700,13 @@ def _review_stack_body(
     # `grug-board` and not one `grug-sec:` region. The board_client unit tests
     # never caught it because they call the client directly; nothing asserted
     # that what Elder actually produces is something the client can merge.
+    badge = (
+        f"[![View full review]({_REVIEW_BADGE_URL})]({review_url})"
+        if review_url else f"![Grug Elder]({_REVIEW_BADGE_URL})"
+    )
     body = board.set_header(
         board.new_board(),
-        board.render_header(
+        badge + "\n\n" + board.render_header(
             pr_title, blocking, advisory,
             degraded=is_blackout(evaluation.degraded_reason),
             partial=evaluation.degraded_reason in PUBLISHABLE_DEGRADATIONS,
@@ -3019,6 +3043,10 @@ def dispatch_code_review(
         review_phase=tier1_phase,
         defensive_dropped_count=defensive_dropped_count,
         blocking=blocking,
+        review_url=(
+            f"https://github.com/{quote(owner, safe='')}/"
+            f"{quote(repo_name, safe='')}/pull/{pull_number}/checks"
+        ),
     )
     summary = _intent_paragraph(pr_context) + summary
     if ruff_policy_dropped:
@@ -3179,6 +3207,10 @@ def dispatch_code_review(
                 pr_title=str(pr_context.get("title") or ""),
                 head_sha=head_sha,
                 base_sha=str(pr_context.get("base_sha") or ""),
+                review_url=(
+                    f"https://github.com/{quote(owner, safe='')}/"
+                    f"{quote(repo_name, safe='')}/pull/{pull_number}/checks"
+                ),
             )
             with_install_token_retry(
                 installation_id,
@@ -3265,6 +3297,10 @@ def dispatch_code_review(
         summary=title,
         findings_count=len(evaluation.findings),
         blocking=blocking,
+        review_url=(
+            f"https://github.com/{quote(owner, safe='')}/"
+            f"{quote(repo_name, safe='')}/pull/{pull_number}/checks"
+        ),
         degraded_reason=outcome.feed_degraded_reason,
     )
     # Living Hunt: remember this head only when the check actually landed
@@ -3912,6 +3948,10 @@ def _publish_deep_review(
             pr_title=pr_title,
             head_sha=head_sha,
             base_sha=base_sha,
+            review_url=(
+                f"https://github.com/{quote(owner, safe='')}/"
+                f"{quote(repo_name, safe='')}/pull/{pull_number}/checks"
+            ),
         )
         with_install_token_retry(
             installation_id,
