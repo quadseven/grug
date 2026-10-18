@@ -467,3 +467,28 @@ def test_non_positive_timeout_falls_back_and_warns(monkeypatch, caplog):
             got = runner._positive_float_env("GRUG_BENCH_TIMEOUT_SECONDS", 150.0)
         assert got == 150.0, f"{bad} must not become the ceiling"
         assert [r for r in caplog.records if r.msg == "bench_env_not_positive"]
+
+
+def test_the_cave_backend_names_itself_to_the_gateway(monkeypatch):
+    """#989: without X-Spark-Caller the gateway clamps the bench to its default
+    output cap, and long findings lists come back truncated."""
+    import httpx
+
+    from sast_benchmark import backends, runner
+
+    for var in ("GRUG_BENCH_OPENROUTER_KEY", "GRUG_BENCH_POOLSIDE_KEY"):
+        monkeypatch.delenv(var, raising=False)
+    monkeypatch.setenv("GRUG_BENCH_CAVE_URL", "http://cave.example/v1/chat/completions")
+    monkeypatch.setenv("GRUG_BENCH_CAVE_MODEL", "spark:warm-any")
+    (cave,) = [b for b in backends.configured_backends() if b.name == "cave"]
+    assert cave.headers == {"X-Spark-Caller": backends.CAVE_BENCH_CALLER}
+
+    sent = {}
+
+    def fake_post(url, json, headers, timeout):
+        sent.update(headers)
+        return httpx.Response(200, json={"choices": [{"message": {"content": "{}"}}]})
+
+    monkeypatch.setattr(runner.httpx, "post", fake_post)
+    runner._post(cave, [{"role": "user", "content": "x"}])
+    assert sent.get("X-Spark-Caller") == "grug-bench"
