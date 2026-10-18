@@ -123,6 +123,7 @@ from personas.code_reviewer.persona import (
     CodeReviewEvaluation, Finding, evaluate_diff, with_degradation,
     with_extra_findings, with_findings,
 )
+from personas.code_reviewer.shell_flow_filter import filter_checked_shell_findings
 from personas.code_reviewer.snapshot import review_freshness_id_from_pr
 from personas.code_reviewer import carry_forward
 from personas.code_reviewer.degraded_gate import (
@@ -2265,6 +2266,28 @@ def _merge_criteria_coverage(
     )
 
 
+def _filter_checked_shell_commands(
+    evaluation: CodeReviewEvaluation, file_contents: dict[str, str], *,
+    installation_id: int, owner: str, repo_name: str, pull_number: int,
+) -> CodeReviewEvaluation:
+    """Drop `missing-error-handling` findings on shell commands whose exit
+    status control flow or errexit already checks (#771)."""
+    kept, dropped = filter_checked_shell_findings(
+        evaluation.findings, file_contents,
+    )
+    if not dropped:
+        return evaluation
+    log.info(
+        "code_review_shell_flow_filter",
+        extra={
+            "installation_id": installation_id,
+            "pr": f"{owner}/{repo_name}#{pull_number}",
+            "dropped": dropped,
+        },
+    )
+    return with_findings(evaluation, kept)
+
+
 def _filter_intent_mismatches(
     evaluation: CodeReviewEvaluation, *, installation_id: int,
     owner: str, repo_name: str, pull_number: int, pr_context: PrContext,
@@ -2792,6 +2815,16 @@ def dispatch_code_review(
         )
     evaluation, defensive_dropped_count = _drop_unreachable_defensive_findings(
         evaluation,
+    )
+
+    # #771: a shell command inside `if`/`while`/`&&`/`||` or under errexit
+    # has its exit status checked; drop the "unchecked" finding on it.
+    evaluation = _filter_checked_shell_commands(
+        evaluation, file_contents,
+        installation_id=installation_id,
+        owner=owner,
+        repo_name=repo_name,
+        pull_number=pull_number,
     )
 
     # #1170: deterministic evidence filter for intent-mismatch findings.
