@@ -83,6 +83,15 @@ spec:
                 topologyKey: kubernetes.io/hostname
                 labelSelector:
                   matchLabels: {app: grug-webhook}
+      # 30s is the Kubernetes default, written down on purpose (grug#1238):
+      # the webhook holds no claim to release on shutdown (unlike the
+      # consumer's 60s sweep, #607), and uvicorn's own
+      # --timeout-graceful-shutdown 20 (services/Dockerfile) drains in-flight
+      # requests inside it. deploy.k8s run 39097624374 held an old pod in
+      # "pending termination" for 2m42s, far past any grace period, so a
+      # bigger number would not have helped. Revisit (and add a preStop) only
+      # if a scripts/rollout_gate.sh capture shows draining is the cause.
+      terminationGracePeriodSeconds: 30
       imagePullSecrets:
         - name: registry-pull
       securityContext:

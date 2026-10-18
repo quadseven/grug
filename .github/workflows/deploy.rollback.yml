@@ -76,9 +76,9 @@ jobs:
           # it back so a bad webhook digest doesn't linger on the hourly
           # cleanup CronJob.
           kubectl -n grug set image cronjob/grug-preview-janitor janitor="$W"
-          for d in grug-webhook grug-api grug-consumer; do
-            kubectl -n grug rollout status "deploy/$d" --timeout=180s
-          done
+          # Same gate as deploy.k8s: a stuck rollout captures pods,
+          # describe and events into the step summary (#1238).
+          bash scripts/rollout_gate.sh grug 180s grug-webhook grug-api grug-consumer
           kubectl -n grug annotate --overwrite \
             deploy/grug-webhook deploy/grug-api deploy/grug-consumer cronjob/grug-poller \
             "grug.dev/image-source=rollback-last-good" \
