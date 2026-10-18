@@ -88,6 +88,7 @@ from personas.code_reviewer.criteria_coverage import (
 )
 from personas.code_reviewer.lint import scan_ruff
 from personas.code_reviewer.suggestion import checked_suggestion
+from markdown_safety import neutralize_mentions
 from personas.code_reviewer.repo_ruff_policy import parse_repo_ruff_policy
 from personas.code_reviewer.cross_file import (
     extract_symbols, fetch_cross_file_context,
@@ -1195,13 +1196,19 @@ def _details_block(summary: str, content: str) -> str:
 
 
 def _defused(prose: str) -> str:
-    """Neutralize fence-capable runs in PROSE surfaces (comment head,
-    table cells): an unterminated ``` or ~~~ in a model message would
-    open a fence that swallows the rest of the body - including the
-    dedup marker and the suggestion block. Inline code spans (1-2
-    backticks) render untouched."""
+    """Neutralize fence-capable runs and mentions in PROSE surfaces
+    (comment head, table cells): an unterminated ``` or ~~~ in a model
+    message would open a fence that swallows the rest of the body -
+    including the dedup marker and the suggestion block. Inline code
+    spans (1-2 backticks) render untouched.
+
+    Mentions are broken too (#709): a marking posts with the app's own
+    authority, so a live `@user` in model-authored prose would notify a
+    real account. Fenced payloads (the suggestion block, the agent prompt)
+    do not pass through here: a fence renders no mention, and the
+    suggestion must stay byte-exact to commit cleanly."""
     out = re.sub(r"`{3,}", "``", prose)
-    return re.sub(r"~{3,}", "~~", out)
+    return neutralize_mentions(re.sub(r"~{3,}", "~~", out))
 
 
 def _md_code_span(text: str) -> str:
@@ -1345,13 +1352,16 @@ def _inline_comment_body(
         and f.suggestion
         and "```" not in f.suggestion
         and "\n" not in f.suggestion.strip()
+        and "\r" not in stripped_suggestion
         and stripped_suggestion
     ):
         # GitHub-native committable block - one click REPLACES the single
         # anchored line. Committable ONLY when the suggestion is itself
         # single-line and fence-safe: the comment anchors one line, so a
         # multi-line suggestion applied there duplicates the following
-        # original lines - confident-looking one-click corruption.
+        # original lines - confident-looking one-click corruption. A bare
+        # CR is a line ending to CommonMark, so it counts as multi-line
+        # (#709), the same rule as suggestion._single_line.
         body = (
             f"{head}\n\n**Fix** (one-click, line-exact):\n"
             f"```suggestion\n{stripped_suggestion}\n```"
