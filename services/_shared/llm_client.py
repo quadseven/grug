@@ -2762,6 +2762,59 @@ def _describe_unparseable(content: str) -> str:
     )
 
 
+# grug#1231: the reason a findings answer cut off at the output cap carries.
+# Live 2026-10-17 (the Elder eval record run on the Cave, #989): 4 of 18 cases
+# answered `{"findings": [{...}, {...}, ...` for 28-30k characters and stopped
+# mid-object at the gateway's ~8192-token output cap. Every complete finding
+# before the cut was a real answer, but the whole reply failed as non-json.
+TRUNCATED_FINDINGS = "truncated_findings"
+
+# The answer must OPEN as the documented envelope (an optional opening fence
+# allowed), so prose that merely quotes `{"findings": [` is never taken.
+_TRUNCATED_ENVELOPE_RE = re.compile(
+    r'\A\s*(?:```[a-zA-Z0-9_-]*\s*)?\{\s*"findings"\s*:\s*\['
+)
+# A reply that ends by closing the list and the object finished its envelope;
+# if it still did not parse, it is malformed somewhere, not cut off.
+_CLOSED_ENVELOPE_RE = re.compile(r"\]\s*\}\s*(?:```)?\s*\Z")
+
+
+def _skip_json_whitespace(content: str, pos: int) -> int:
+    while pos < len(content) and content[pos] in " \t\r\n":
+        pos += 1
+    return pos
+
+
+def _recover_truncated_findings(content: str) -> list[Any] | None:
+    """The complete items of a findings list cut off before it closed, or None.
+
+    Decodes one list item at a time and stops at the first that does not
+    decode - the partial last one. Returns None (the answer stays a parse
+    failure) unless the reply opens as the findings envelope, never closes
+    it, and holds at least one complete item, so an answer that is
+    malformed in some other way is not relabelled as truncated. The items
+    are returned raw: the caller validates each one with `_coerce_findings`,
+    the same as a complete answer."""
+    match = _TRUNCATED_ENVELOPE_RE.match(content)
+    if match is None or _CLOSED_ENVELOPE_RE.search(content):
+        return None
+    decoder = json.JSONDecoder()
+    items: list[Any] = []
+    pos = _skip_json_whitespace(content, match.end())
+    while pos < len(content):
+        try:
+            item, pos = decoder.raw_decode(content, pos)
+        except json.JSONDecodeError:
+            break
+        items.append(item)
+        pos = _skip_json_whitespace(content, pos)
+        if pos < len(content) and content[pos] != ",":
+            # `]` would mean the list closed; anything else is not a list.
+            return None
+        pos = _skip_json_whitespace(content, pos + 1)
+    return items or None
+
+
 def _diagnose_non_string_content(choice: object, message: object, content: object) -> str:
     """Describe a `message.content` that is not a usable str - the wrong
     type, null, or empty - well enough to fix it from ONE log line: the
@@ -2869,11 +2922,86 @@ def _coerce_findings(raw_findings: list[Any], model_name: str) -> tuple[Finding,
     return tuple(coerced)
 
 
+@dataclass(frozen=True, slots=True)
+class ParsedReview:
+    """One parsed review answer (`_parse_review`).
+
+    `error` is empty when the answer parsed. `truncated_findings` (grug#1231)
+    is True when the answer was a findings list cut off before it closed:
+    `findings` then holds only the complete items before the cut, so the
+    review is PARTIAL - fewer findings than the model meant to write - and a
+    caller must never read it as a complete clean review."""
+
+    findings: tuple[Finding, ...]
+    model_name: str
+    error: str
+    truncated_findings: bool = False
+
+
 def _parse_response(
     resp: httpx.Response,
 ) -> tuple[tuple[Finding, ...], str, str]:
     """Returns (findings, model_name, error). On parse failure returns
     ((), model_name, error_message).
+
+    A truncated findings list (grug#1231) is a failure HERE, with an error
+    that starts with `truncated_findings`: a caller that reads only this
+    tuple cannot tell partial from complete, so it keeps failing the answer
+    as it did before. Callers that can carry the partial state use
+    `_parse_review` instead (the live review seam, the Elder eval)."""
+    parsed = _parse_review(resp)
+    if parsed.truncated_findings:
+        return (), parsed.model_name, (
+            f"{TRUNCATED_FINDINGS}: findings list cut off before it closed "
+            f"({len(parsed.findings)} complete findings kept)"
+        )
+    return parsed.findings, parsed.model_name, parsed.error
+
+
+def _parse_findings_content(content: str, model_name: str) -> ParsedReview:
+    """Parse a non-empty `message.content` into findings (split out of
+    `_parse_review` to keep each under the complexity cap)."""
+    try:
+        parsed = json.loads(content)
+    except json.JSONDecodeError:
+        # grug#883: a fenced answer is a REAL review, not a failure. Recover it
+        # before giving up, and if there is nothing to recover say what arrived.
+        parsed = _recover_wrapped_json(content, model_name)
+        if parsed is None:
+            items = _recover_truncated_findings(content)
+            if items is None:
+                return ParsedReview((), model_name, _describe_unparseable(content))
+            log.warning(
+                "llm_response_findings_truncated",
+                extra={
+                    "model": model_name,
+                    "content_len": len(content),
+                    "complete_items": len(items),
+                },
+            )
+            return ParsedReview(
+                _coerce_findings(items, model_name), model_name, "",
+                truncated_findings=True,
+            )
+    # Models sometimes return a bare JSON array of findings instead of the
+    # documented {"findings": [...]} object (#416 - Poolside did this and the
+    # old `parsed.get(...)` crashed with `'list' object has no attribute 'get'`,
+    # dropping a live review). Accept both shapes; anything else is a graceful
+    # parse failure, never an unhandled crash.
+    if isinstance(parsed, list):
+        raw_findings = parsed
+    elif isinstance(parsed, dict):
+        raw_findings = parsed.get("findings", [])
+    else:
+        return ParsedReview((), model_name, "llm content is neither object nor array")
+    if not isinstance(raw_findings, list):
+        return ParsedReview((), model_name, "findings field is not a list")
+    return ParsedReview(_coerce_findings(raw_findings, model_name), model_name, "")
+
+
+def _parse_review(resp: httpx.Response) -> ParsedReview:
+    """Parse one completion into a `ParsedReview`. Every failure is RETURNED
+    as `error`, never raised.
 
     grug#881: a THINKING model under `response_format={"type":
     "json_object"}` can legally return `content: null` (or `""`, or some
@@ -2891,16 +3019,16 @@ def _parse_response(
     RETURNED, diagnosable error (offending field + `finish_reason`) like
     every other malformed shape here, never an unhandled raise."""
     if resp.status_code != 200:
-        return (), "", f"http_{resp.status_code}"
+        return ParsedReview((), "", f"http_{resp.status_code}")
     try:
         body = resp.json()
     except (json.JSONDecodeError, ValueError):
         # Cloudflare HTML interstitial, gateway error page, truncated
         # body — all return 200 + non-JSON. Surface as parse failure
         # instead of crashing the webhook handler.
-        return (), "", "envelope_json_decode_failed"
+        return ParsedReview((), "", "envelope_json_decode_failed")
     if not isinstance(body, dict):
-        return (), "", "envelope_not_a_dict"
+        return ParsedReview((), "", "envelope_not_a_dict")
     if "choices" not in body and "output" in body:
         # Responses API reply (BackendConfig.wire == "responses"). Normalise
         # to the chat-completions shape so everything below - and all six
@@ -2918,33 +3046,14 @@ def _parse_response(
         message = choice["message"]
         content = message["content"]
     except (KeyError, IndexError, TypeError):
-        return (), model_name, "missing choices/message/content"
+        return ParsedReview((), model_name, "missing choices/message/content")
     if not isinstance(content, str) or not content.strip():
         # Null, wrong type, or empty: nothing to parse. Diagnose the shape
         # (with finish_reason) rather than reporting a zero-length non-json.
-        return (), model_name, _diagnose_non_string_content(choice, message, content)
-    try:
-        parsed = json.loads(content)
-    except json.JSONDecodeError:
-        # grug#883: a fenced answer is a REAL review, not a failure. Recover it
-        # before giving up, and if there is nothing to recover say what arrived.
-        parsed = _recover_wrapped_json(content, model_name)
-        if parsed is None:
-            return (), model_name, _describe_unparseable(content)
-    # Models sometimes return a bare JSON array of findings instead of the
-    # documented {"findings": [...]} object (#416 — Poolside did this and the
-    # old `parsed.get(...)` crashed with `'list' object has no attribute 'get'`,
-    # dropping a live review). Accept both shapes; anything else is a graceful
-    # parse failure, never an unhandled crash.
-    if isinstance(parsed, list):
-        raw_findings = parsed
-    elif isinstance(parsed, dict):
-        raw_findings = parsed.get("findings", [])
-    else:
-        return (), model_name, "llm content is neither object nor array"
-    if not isinstance(raw_findings, list):
-        return (), model_name, "findings field is not a list"
-    return _coerce_findings(raw_findings, model_name), model_name, ""
+        return ParsedReview(
+            (), model_name, _diagnose_non_string_content(choice, message, content),
+        )
+    return _parse_findings_content(content, model_name)
 
 
 def _llmobs_tags(pr_context: Optional[PrContext]) -> dict[str, str]:
@@ -4977,7 +5086,9 @@ class _ArmOutcome:
     # this exact raw value, unpacked into `LlmReviewResponse.error`.
     parse_err: str = ""
     # Only meaningful when kind == "success": the completion hit its
-    # max_tokens cap (`finish_reason == "length"`) before the model finished.
+    # max_tokens cap (`finish_reason == "length"`, or a findings list cut off
+    # mid-item, grug#1231 - see `AttemptOutcome.truncated`) before the model
+    # finished.
     # A schema-constrained decoder cut off mid-thought can legally close out
     # valid-but-incomplete JSON (e.g. `{"findings": []}`), structurally
     # identical to a genuinely clean review -- grug#851. Callers must fold
@@ -5059,7 +5170,7 @@ def _truncation_error(backends: Sequence["Backend"]) -> str:
     names = ", ".join(b.value for b in backends)
     return (
         f"partial review: {names} hit the generation token cap before "
-        "finishing (finish_reason=length)"
+        f"finishing (finish_reason=length or {TRUNCATED_FINDINGS})"
     )
 
 
@@ -5131,6 +5242,16 @@ class AttemptOutcome:
     usage_metrics: dict[str, int | float]
     span_context: dict | None
     raw_response: httpx.Response | None
+    # grug#1231: the answer was a findings list cut off before it closed;
+    # `findings` holds only its complete items (`ParsedReview`).
+    findings_truncated: bool = False
+
+    @property
+    def truncated(self) -> bool:
+        """The generation stopped before the model finished: the provider
+        said so (`finish_reason=length`, grug#851) or the findings list was
+        cut off mid-item (grug#1231). Either way the review is partial."""
+        return self.finish_reason == "length" or self.findings_truncated
 
 
 def _annotate_attempt_error(
@@ -5339,7 +5460,8 @@ def _call_llm_attempt(
                 span_context=None,
                 raw_response=None,
             )
-        findings, model, err = _parse_response(resp)
+        parsed = _parse_review(resp)
+        findings, model, err = parsed.findings, parsed.model_name, parsed.error
         # Annotate AFTER the response so we capture the raw content
         # + token counts.
         body = _reparse_attempt_body(resp, backend)
@@ -5357,6 +5479,7 @@ def _call_llm_attempt(
                     "parse_failed" if resp.status_code == 200 else "http_error"
                 ),
                 "finish_reason": finish_reason,
+                "findings_truncated": parsed.truncated_findings,
             },
             metrics={
                 "latency_ms": _elapsed_ms(start_ns),
@@ -5383,6 +5506,7 @@ def _call_llm_attempt(
             usage_metrics=usage_metrics,
             span_context=span_context,
             raw_response=resp,
+            findings_truncated=parsed.truncated_findings,
         )
 
 
@@ -5482,13 +5606,15 @@ def _run_review_arm(
 
     if not err:
         resolved_model = model or config.model
-        if attempt.finish_reason == "length":
+        if attempt.truncated:
             log.warning(
                 "llm_response_truncated",
                 extra={
                     "backend": backend.value,
                     "model": resolved_model,
                     "variant": variant,
+                    "finish_reason": attempt.finish_reason,
+                    "findings_truncated": attempt.findings_truncated,
                 },
             )
         if _is_degenerate_empty_review(findings, attempt.usage_metrics):
@@ -5504,7 +5630,7 @@ def _run_review_arm(
                 model=resolved_model,
                 findings=findings,
                 span_context=attempt.span_context,
-                truncated=attempt.finish_reason == "length",
+                truncated=attempt.truncated,
                 degenerate=True,
             )
         return _ArmOutcome(
@@ -5513,7 +5639,7 @@ def _run_review_arm(
             model=resolved_model,
             findings=findings,
             span_context=attempt.span_context,
-            truncated=attempt.finish_reason == "length",
+            truncated=attempt.truncated,
         )
     if resp.status_code == 200:
         # Model replied 200 with an unusable body - parse failure.
@@ -6299,6 +6425,9 @@ def _review_diff_dispatch_cave_primary(
                     review_span_context=span_context,
                     backends_used=(backend,),
                     models_used=(resolved_model,),
+                    # grug#1231: a cut-off answer is partial on this last-
+                    # resort path too, never a clean complete review.
+                    error=_truncation_error((backend,) if attempt.truncated else ()),
                 )
             if resp.status_code == 200:
                 log.warning(

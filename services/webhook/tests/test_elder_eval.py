@@ -1702,3 +1702,96 @@ def test_staged_cases_match_produces_no_advisory():
     report = _report(rows, replays)
     baseline = to_baseline_dict(report, prompt_sha="abc", backend="cave")
     assert staged_cases_advisories(report, baseline["backends"]["cave"]) == []
+
+
+# --- grug#1231: an answer cut off at the output cap still scores ----------
+
+
+def _cut_off_response(findings: list[dict]):
+    """A 200 whose answer is the observed #989 shape: a findings list that
+    opens, holds complete items, and stops mid-object at the output cap."""
+    import httpx
+    import json as _json
+
+    complete = ", ".join(_json.dumps(f) for f in findings)
+    content = '{"findings": [' + complete + ', {"path": "x.py", "line": 1, "ru'
+    return httpx.Response(
+        200,
+        json={
+            "model": "m",
+            "choices": [{"message": {"content": content}, "finish_reason": "length"}],
+        },
+        request=httpx.Request("POST", "http://x"),
+    )
+
+
+def test_run_case_scores_an_answer_cut_off_at_the_output_cap(monkeypatch):
+    """The #989 record run lost 4 of 18 cases to this: the model's JSON was
+    cut off mid-list, the case errored, and `--record` refused the run. The
+    complete findings before the cut are the model's real answer, so the
+    case must score, and say it was cut off. Fails on main (errored)."""
+    from elder_eval import runner
+    from sast_benchmark.backends import BenchBackend
+
+    monkeypatch.setattr(
+        runner, "_post", lambda b, m: _cut_off_response([_finding("x.py")] * 3),
+    )
+    (case,) = build_cases([_row(1, "correctness")])
+    backend = BenchBackend(name="fake", url="http://invalid", model="m", api_key="")
+    replay = runner.run_case(backend, case, _diff_for("x.py"))
+
+    assert replay.errored is False
+    assert replay.output_truncated is True
+    assert replay.truncated is False, "the INPUT diff was not bounded"
+    assert replay.emitted == {"correctness": 3}
+
+    report = score([case], {case.case_id: replay})
+    assert report.cases_scored == 1
+    assert report.errored_cases == ()
+    assert report.output_truncated_cases == (case.case_id,)
+    assert report.truncated_cases == ()
+    baseline = to_baseline_dict(report, prompt_sha="abc", backend="cave")
+    assert baseline["backends"]["cave"]["output_truncated_cases"] == [case.case_id]
+
+
+def test_report_names_the_cases_cut_off_at_the_output_cap(capsys):
+    """The run report lists which cases were cut off, apart from the
+    hunk-bounded `truncated_cases`, so a reader sees the caveat."""
+    from elder_eval.__main__ import _print_exclusion_notes
+
+    report = EvalReport(
+        per_class_catch={}, overall_catch=0.0, noise_rate=0.0,
+        errored_cases=(), truncated_cases=(), out_of_taxonomy={},
+        unknown_verdicts={}, cases_scored=2,
+        output_truncated_cases=("grug#480", "grug#501"),
+    )
+    _print_exclusion_notes(report)
+    out = capsys.readouterr().out
+    assert "output cap" in out
+    assert "grug#480, grug#501" in out
+
+
+def test_run_case_still_errors_on_a_non_json_answer_after_the_cut_off_fix(monkeypatch):
+    """The recovery is for a cut-off findings list only; prose is still a
+    non-run, never a fabricated zero."""
+    import httpx
+
+    from elder_eval import runner
+    from sast_benchmark.backends import BenchBackend
+
+    monkeypatch.setattr(
+        runner, "_post",
+        lambda b, m: httpx.Response(
+            200,
+            json={"model": "m", "choices": [{"message": {
+                "content": "Grug look. Grug see many problems, write no tablets.",
+            }}]},
+            request=httpx.Request("POST", "http://x"),
+        ),
+    )
+    (case,) = build_cases([_row(1, "correctness")])
+    backend = BenchBackend(name="fake", url="http://invalid", model="m", api_key="")
+    replay = runner.run_case(backend, case, _diff_for("x.py"))
+
+    assert replay.errored is True
+    assert replay.output_truncated is False
