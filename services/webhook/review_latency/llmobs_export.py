@@ -68,7 +68,7 @@ def maybe_enable() -> bool:
     if not api_key:
         log.warning(
             "review_latency_llmobs_missing_api_key",
-            extra={"hint": "set DD_API_KEY (SSM /grug/dd-api-key) for agentless export"},
+            extra={"hint": "set DD_API_KEY for agentless export; Datadog is off"},
         )
         return False
     ml_app = (os.getenv("DD_LLMOBS_ML_APP") or _DEFAULT_ML_APP).strip() or _DEFAULT_ML_APP
