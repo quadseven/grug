@@ -376,7 +376,8 @@ def dispatch_walkthrough_review(
     diagram = build_diagram([f.path for f in files])
 
     # #675: possibly-related prior hunts. Best-effort and bounded (one list
-    # call + at most 5 file fetches); a failure just omits the section.
+    # call + at most 5 file fetches, all inside one 12s budget); a failure
+    # just omits the section.
     related = []
     try:
         from personas.walkthrough.related import find_related_prs
