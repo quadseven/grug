@@ -28,6 +28,16 @@ All keys are optional.
 
 At most 20 `path_instructions` entries are used, each truncated to 2000 characters.
 
+### Precedence
+
+Elder also reads the repo's agent-guideline files (`CLAUDE.md`, `AGENTS.md`, `.cursorrules`, `.github/copilot-instructions.md`, `.windsurfrules`) and rules the team has taught it. When they conflict, the order, highest first, is:
+
+1. `path_instructions`, for the files they name.
+2. The agent-guideline files.
+3. Taught rules (learnings).
+
+Path instructions come first because `.grug.yaml` is read from the base commit, while the guideline files are read from the PR head. A PR cannot use its own `CLAUDE.md` to overrule a maintainer's instruction. Both prompt blocks state this order to the model.
+
 ## Example
 
 ```yaml
