@@ -6,7 +6,10 @@ work instead of an island.
 
 Bounded by design (the issue's latency AC): one bounded list call for
 recent closed PRs, then file fetches for at most 5 title-similar
-candidates. Never a list-all scan. Best-effort: any failure yields [],
+candidates. Never a list-all scan. All of those calls share one
+aggregate budget (_BUDGET): each call's timeout is capped at what is
+left of it, and once it is spent the remaining candidates are scored on
+title alone with no further calls. Best-effort: any failure yields [],
 and the walkthrough renders without the section.
 """
 
@@ -14,6 +17,7 @@ from __future__ import annotations
 
 import logging
 import os
+import time
 from collections.abc import Callable
 from dataclasses import dataclass
 from typing import Any
@@ -26,6 +30,10 @@ _API = "https://api.github.com"
 # next to the walkthrough it belongs to.
 log = logging.getLogger(f"{os.getenv('DD_SERVICE', 'grug')}.persona.walkthrough")
 _TIMEOUT = 10.0
+# One wall-clock budget across the whole retrieval (list + file fetches),
+# so six calls cannot each take a full _TIMEOUT (#675 AC3). Each call's
+# timeout is capped at what is left of it.
+_BUDGET = 12.0
 # Bounds for the whole retrieval: one list call + at most this many /files.
 _LIST_PER_PAGE = 20
 _MAX_FILE_FETCHES = 5
@@ -90,6 +98,37 @@ def _one_line_reason(
     return "touched nearby files"
 
 
+def _fetch_files(
+    get: Callable[..., Any],
+    token: str,
+    owner: str,
+    repo: str,
+    number: int,
+    timeout: float,
+) -> list[str]:
+    try:
+        fresp = get(
+            f"{_API}/repos/{quote(owner, safe='')}/{quote(repo, safe='')}"
+            f"/pulls/{number}/files",
+            params={"per_page": 30},
+            headers=_headers(token),
+            timeout=timeout,
+        )
+        fresp.raise_for_status()
+        return [str(f.get("filename", "")) for f in fresp.json()]
+    except Exception as e:  # noqa: BLE001 - one bad candidate must not kill the section
+        log.info(
+            "walkthrough_related_files_failed",
+            extra={
+                "owner": owner,
+                "repo": repo,
+                "candidate": number,
+                "kind": type(e).__name__,
+            },
+        )
+        return []
+
+
 def find_related_prs(
     token: str,
     owner: str,
@@ -99,9 +138,15 @@ def find_related_prs(
     current_title: str,
     *,
     http_get: Callable[..., Any] | None = None,
+    clock: Callable[[], float] | None = None,
 ) -> list[RelatedPR]:
-    """Up to 3 related merged PRs, best-effort. `http_get` is injectable for tests."""
+    """Up to 3 related merged PRs, best-effort, within one _BUDGET.
+
+    `http_get` and `clock` are injectable for tests.
+    """
     get = http_get or httpx.get
+    now = clock or time.monotonic
+    deadline = now() + _BUDGET
     try:
         resp = get(
             f"{_API}/repos/{quote(owner, safe='')}/{quote(repo, safe='')}/pulls",
@@ -112,7 +157,7 @@ def find_related_prs(
                 "per_page": _LIST_PER_PAGE,
             },
             headers=_headers(token),
-            timeout=_TIMEOUT,
+            timeout=min(_TIMEOUT, _BUDGET),
         )
         resp.raise_for_status()
         listed = resp.json()
@@ -141,28 +186,26 @@ def find_related_prs(
     )[:_MAX_FILE_FETCHES]
 
     scored: list[tuple[float, dict[str, Any], list[str]]] = []
+    budget_logged = False
     for pr in ranked:
-        try:
-            fresp = get(
-                f"{_API}/repos/{quote(owner, safe='')}/{quote(repo, safe='')}"
-                f"/pulls/{int(pr['number'])}/files",
-                params={"per_page": 30},
-                headers=_headers(token),
-                timeout=_TIMEOUT,
+        left = deadline - now()
+        if left <= 0:
+            # Budget spent: score the rest on title alone, no more calls.
+            if not budget_logged:
+                log.info(
+                    "walkthrough_related_budget_exhausted",
+                    extra={
+                        "owner": owner,
+                        "repo": repo,
+                        "first_skipped": int(pr["number"]),
+                    },
+                )
+                budget_logged = True
+            cand_files: list[str] = []
+        else:
+            cand_files = _fetch_files(
+                get, token, owner, repo, int(pr["number"]), min(_TIMEOUT, left)
             )
-            fresp.raise_for_status()
-            cand_files = [str(f.get("filename", "")) for f in fresp.json()]
-        except Exception as e:  # noqa: BLE001 - one bad candidate must not kill the section
-            log.info(
-                "walkthrough_related_files_failed",
-                extra={
-                    "owner": owner,
-                    "repo": repo,
-                    "candidate": int(pr["number"]),
-                    "kind": type(e).__name__,
-                },
-            )
-            cand_files = []
         ts = _title_score(current_title, str(pr.get("title", "")))
         fs = _file_score(current_files, cand_files)
         total = ts + fs

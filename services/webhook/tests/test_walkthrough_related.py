@@ -182,3 +182,62 @@ def test_candidate_file_failure_is_logged_and_skipped(caplog):
     assert isinstance(out, list)
     rec = [r for r in caplog.records if r.getMessage() == "walkthrough_related_files_failed"]
     assert rec and rec[0].kind == "ValueError" and rec[0].candidate == 11
+
+
+# --- #675 AC3: one aggregate latency budget across all calls -------------
+
+
+def _slow_world(step):
+    """A fake clock that advances `step` seconds per GitHub call, plus a
+    getter that records each call's timeout."""
+    state = {"t": 0.0}
+    timeouts = []
+    pr_list = [
+        {"number": n, "title": "widget fix iteration", "merged_at": "2026-01-01T00:00:00Z"}
+        for n in range(1, 11)
+    ]
+    inner = _fake_get_factory(pr_list, {n: ["src/widget.py"] for n in range(1, 11)})
+
+    def get(url, headers=None, params=None, timeout=None):
+        timeouts.append(timeout)
+        state["t"] += step
+        return inner(url, headers=headers, params=params, timeout=timeout)
+
+    get.calls = inner.calls  # type: ignore[attr-defined]
+    return get, (lambda: state["t"]), timeouts
+
+
+def test_slow_github_stops_file_fetches_once_the_budget_is_spent(caplog):
+    """Six calls must not each get a full per-call timeout: with every call
+    taking 5s, the 12s budget allows the list call and two file fetches,
+    then the rest are scored on title alone with no more calls."""
+    from personas.walkthrough import related as rel
+
+    get, clock, _ = _slow_world(5.0)
+    with caplog.at_level("INFO"):
+        out = find_related_prs(
+            "tok", "o", "r", 99, ["src/widget.py"], "widget fix",
+            http_get=get, clock=clock,
+        )
+
+    assert clock() <= rel._BUDGET + rel._TIMEOUT
+    file_calls = [u for u in get.calls if u.endswith("/files")]
+    assert len(file_calls) == 2
+    assert 1 <= len(out) <= 3
+    rec = [r for r in caplog.records if r.getMessage() == "walkthrough_related_budget_exhausted"]
+    assert len(rec) == 1
+
+
+def test_each_call_timeout_is_capped_by_what_is_left_of_the_budget():
+    from personas.walkthrough import related as rel
+
+    get, clock, timeouts = _slow_world(4.0)
+    find_related_prs(
+        "tok", "o", "r", 99, ["src/widget.py"], "widget fix",
+        http_get=get, clock=clock,
+    )
+
+    # Elapsed before call i is 4*i; its timeout must fit in what is left.
+    for i, t in enumerate(timeouts):
+        assert t <= rel._BUDGET - 4.0 * i
+    assert sum(t for t in timeouts) <= rel._BUDGET + rel._TIMEOUT
