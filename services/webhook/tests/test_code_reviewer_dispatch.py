@@ -3771,3 +3771,52 @@ def test_low_confidence_review_publishes_findings_and_says_low_confidence():
     assert "clouded" not in title
     assert "could not see" not in summary
     assert not cr_dispatch.is_blackout("low_confidence_review")
+
+
+def test_inline_comment_body_neutralizes_mentions_in_prose():
+    """#709: a marking posts with the app's own authority, so a live
+    `@user` in model-authored prose (the message, the Lore note) would
+    notify a real account. The prose surfaces break every mention."""
+    from personas.code_reviewer.persona import Finding
+    f = Finding(
+        file="x.py", line=1, severity="high", rule_name="null-deref",
+        message="ask @octocat to review", suggestion=None,
+    )
+    body = cr_dispatch._inline_comment_body(f, "seen before by @hubot")
+    # The agent prompt carries the message too, inside a fence (no mention
+    # renders there), so check the rendered prose, which ends at the prompt.
+    prose = body.split(cr_dispatch._agent_prompt_block(f))[0]
+    assert "ask @\u200boctocat to review" in prose
+    assert "> seen before by @\u200bhubot" in prose
+    assert "@octocat" not in prose
+    assert "@hubot" not in prose
+
+
+def test_committable_suggestion_keeps_mentions_and_markup_verbatim():
+    """#709: inside the suggestion fence a mention does not render and markup
+    is inert, so the replacement line stays byte-exact: neutralizing there
+    would commit a zero-width space into code such as a decorator. The
+    message prose around it is still neutralized."""
+    from personas.code_reviewer.persona import Finding
+    line = "    @property  # <b>see</b> [x](http://e) @octocat"
+    f = Finding(
+        file="x.py", line=1, severity="high", rule_name="null-deref",
+        message="decorate for @octocat", suggestion=line,
+    )
+    body = cr_dispatch._inline_comment_body(f)
+    assert f"```suggestion\n{line}\n```" in body
+    assert "decorate for @\u200boctocat" in body
+
+
+def test_carriage_return_suggestion_is_never_committable():
+    """#709: CommonMark ends a line at a bare CR, so a suggestion carrying
+    one is two lines once rendered and would replace the one anchored line
+    with two. It degrades to contained prose, like any multi-line fix."""
+    from personas.code_reviewer.persona import Finding
+    f = Finding(
+        file="x.py", line=1, severity="high", rule_name="null-deref",
+        message="m", suggestion="x = 1\ry = 2",
+    )
+    body = cr_dispatch._inline_comment_body(f)
+    assert "```suggestion" not in body
+    assert "verify scope before applying" in body
