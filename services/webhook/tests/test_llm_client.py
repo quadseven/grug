@@ -2519,6 +2519,56 @@ def test_judge_findings_emits_its_own_llmobs_span(monkeypatch) -> None:
     assert annotate_calls[0]["metadata"]["judge"] is True
 
 
+def test_judge_findings_stays_off_the_review_seam(monkeypatch) -> None:
+    """grug#662 decision: the judge keeps its own envelope instead of
+    `_run_llm_attempt`. Pins the two reasons that would break silently on
+    a naive move: the span stays `elder_judge` (not `elder_code_review`),
+    and a judge call never reads or writes the chunk ladder, so a model
+    the review chunk already saw fail is still asked, and a judge failure
+    is not recorded against the review chunk."""
+    monkeypatch.setattr(lc, "_RETRY_SLEEP", lambda s: None)
+    annotate_calls = _capture_llmobs(monkeypatch)
+    span_names: list[str] = []
+
+    class _FakeSpan:
+        def __enter__(self): return self
+        def __exit__(self, *a): return False
+
+    def _record_span(**kw):
+        span_names.append(kw["name"])
+        return _FakeSpan()
+
+    monkeypatch.setattr(lc, "_llmobs_llm", _record_span)
+
+    def _seam_must_not_run(**kw):
+        raise AssertionError("judge_findings must not use the review seam")
+
+    monkeypatch.setattr(lc, "_run_llm_attempt", _seam_must_not_run)
+    monkeypatch.setattr(lc, "_call_llm_attempt", _seam_must_not_run)
+    config = lc._BACKEND_CONFIGS[lc.select_backend(1)]
+    trail: list = []
+    trail_token = lc._LADDER_TRAIL.set(trail)
+    skip_token = lc._LADDER_SKIP.set(
+        frozenset({(config.backend.value, config.model)}),
+    )
+    findings_repr = [{"rule_name": "r", "file": "x.py", "line": 2, "message": "m"}]
+    try:
+        with patch.object(
+            httpx, "post", side_effect=httpx.ReadTimeout("judge backend down"),
+        ) as mock_post:
+            out = lc.judge_findings(findings_repr, [_hunk()], installation_id=1)
+    finally:
+        lc._LADDER_SKIP.reset(skip_token)
+        lc._LADDER_TRAIL.reset(trail_token)
+
+    assert out == ()
+    mock_post.assert_called()  # the ladder skip set did not apply
+    assert trail == []  # the failure was not recorded against the chunk
+    assert span_names == [lc._LLMOBS_JUDGE_NAME]
+    assert lc._LLMOBS_JUDGE_NAME == "elder_judge"
+    assert annotate_calls[0]["metadata"]["judge"] is True
+
+
 def test_judge_findings_returns_empty_on_llm_failure(monkeypatch) -> None:
     """If the judge LLM call fails (transport / parse), return empty —
     the judge is best-effort observability, never blocks the review."""
