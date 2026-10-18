@@ -307,7 +307,7 @@ _PR_BODY_CLOSES_7 = (
 _ISSUE_7_ONE_BOX_OPEN = "## Acceptance criteria\n- [x] done\n- [ ] still open\n"
 
 
-def _pull_request_payload():
+def _pull_request_payload(pr_extra=None):
     """The same PR as `_comment_payload` (myorg/myrepo #42, install 1),
     arriving as a `pull_request` webhook instead of a comment."""
     return {
@@ -317,6 +317,7 @@ def _pull_request_payload():
             "body": _PR_BODY_CLOSES_7,
             "head": {"sha": "abc123"},
             "user": {"login": "alice"},
+            **(pr_extra or {}),
         },
         "repository": {
             "id": 100, "name": "myrepo",
@@ -326,7 +327,9 @@ def _pull_request_payload():
     }
 
 
-def _fake_github(issue_7=_ISSUE_7_ONE_BOX_OPEN, *, issue_exc=None, parent_of_7=1):
+def _fake_github(
+    issue_7=_ISSUE_7_ONE_BOX_OPEN, *, issue_exc=None, parent_of_7=1, pr_extra=None,
+):
     """One fake GitHub for BOTH paths: the PR re-fetch only recheck needs,
     and the linked-issue fetch both paths must make. Anything else is a
     call the test did not model and must not be silently absorbed."""
@@ -344,7 +347,10 @@ def _fake_github(issue_7=_ISSUE_7_ONE_BOX_OPEN, *, issue_exc=None, parent_of_7=1
                 return self._body
 
         if url.endswith("/repos/myorg/myrepo/pulls/42"):
-            return _R({"head": {"sha": "abc123"}, "body": _PR_BODY_CLOSES_7})
+            return _R({
+                "head": {"sha": "abc123"}, "body": _PR_BODY_CLOSES_7,
+                **(pr_extra or {}),
+            })
         if url.endswith("/repos/myorg/myrepo/issues/7/parent"):
             # grug#1034's facts fetcher: 404 means "no parent", not a failure.
             if issue_exc is not None:
@@ -362,7 +368,7 @@ def _fake_github(issue_7=_ISSUE_7_ONE_BOX_OPEN, *, issue_exc=None, parent_of_7=1
     return _get
 
 
-def _run_both_paths(_github_get):
+def _run_both_paths(_github_get, pr_extra=None):
     """Drive the pull_request webhook AND `/grug recheck` for the same PR
     through the REAL evaluator, capturing the TpmEvaluation each path
     hands to the publisher. Returns (webhook_out, webhook_eval,
@@ -378,7 +384,7 @@ def _run_both_paths(_github_get):
          patch("personas.tpm.persona.publish_tpm_evaluation", side_effect=_publish), \
          patch("personas.tpm.ticket_compliance_run.run_ticket_compliance",
                return_value={"status": "ok"}):
-        webhook_out = d.dispatch("pull_request", _pull_request_payload())
+        webhook_out = d.dispatch("pull_request", _pull_request_payload(pr_extra))
         recheck_out = d.dispatch(
             "issue_comment",
             _comment_payload(body="/grug recheck", sender_login="alice", pr_author="alice"),
@@ -467,6 +473,43 @@ def test_recheck_and_webhook_pass_when_the_ticket_has_a_parent(_tpm_only):
     assert epic.passed is True and epic.skipped is False
 
 
+_OPERATOR_FOOTER_NO_WHY = {
+    # grug#1251: an operator session's PR - agent footer, no `## Why`.
+    "body": _PR_BODY_CLOSES_7.replace("## Why\n", "## Context\n")
+    + "\nhttps://claude.ai/code/session_01Ht7JaVzv2aacJ9r6Srso9r\n",
+    "user": {"login": "alice", "type": "User"},
+    "author_association": "COLLABORATOR",
+}
+
+
+def test_recheck_and_webhook_both_check_an_operator_agent_pr(_tpm_only):
+    """grug#1251 through the REAL evaluator on both paths: the operator's
+    agent footer no longer switches Chief off, so the missing `## Why`
+    fails on the webhook AND on `/grug recheck`."""
+    webhook_out, webhook_eval, recheck_out, recheck_eval = _run_both_paths(
+        _fake_github(
+            issue_7="## Acceptance criteria\n- [x] done\n",
+            pr_extra=_OPERATOR_FOOTER_NO_WHY,
+        ),
+        pr_extra=_OPERATOR_FOOTER_NO_WHY,
+    )
+    assert recheck_eval.results == webhook_eval.results
+    assert webhook_eval.conclusion == recheck_eval.conclusion == "failure"
+    assert webhook_eval.rule == recheck_eval.rule == tpm_persona.RULE_OPERATOR_CHECKED
+    assert [r.name for r in recheck_eval.results if not r.passed] == ["why"]
+    assert webhook_out["personas"][0]["result"] == "fail"
+    assert recheck_out["result"] == "fail"
+
+
+def test_recheck_and_webhook_skip_an_agent_pr_from_a_non_operator(_tpm_only):
+    extra = {**_OPERATOR_FOOTER_NO_WHY, "author_association": "CONTRIBUTOR"}
+    _, webhook_eval, _, recheck_eval = _run_both_paths(
+        _fake_github(pr_extra=extra), pr_extra=extra,
+    )
+    assert webhook_eval.conclusion == recheck_eval.conclusion == "neutral"
+    assert webhook_eval.rule == tpm_persona.RULE_SKIP_NOT_OPERATOR
+
+
 def test_run_chief_recheck_evaluates_then_publishes(monkeypatch):
     """The shared function behind `/grug recheck` and the poller's Chief
     self-heal: evaluate with the PR body, publish at the given head."""
@@ -476,8 +519,9 @@ def test_run_chief_recheck_evaluates_then_publishes(monkeypatch):
     monkeypatch.setattr(fetchers, "build_issue_fetcher", lambda **kw: "F")
     monkeypatch.setattr(fetchers, "build_issue_facts_fetcher", lambda **kw: "FF")
 
-    def _eval(body, fetch_issue=None, fetch_issue_facts=None):
+    def _eval(body, fetch_issue=None, fetch_issue_facts=None, author_trusted=False):
         seen["eval"] = (body, fetch_issue, fetch_issue_facts)
+        seen["trusted"] = author_trusted
         return "EVAL"
 
     def _publish(evaluation, **kw):
@@ -491,6 +535,7 @@ def test_run_chief_recheck_evaluates_then_publishes(monkeypatch):
     )
     assert evaluation == "EVAL" and result_map["result"] == "pass"
     assert seen["eval"] == ("B", "F", "FF")
+    assert seen["trusted"] is False  # default keeps the pre-#1251 skip
     assert seen["publish"][1] == {
         "installation_id": 5, "owner": "o", "repo": "r", "head_sha": "abc", "pr_number": 9,
     }

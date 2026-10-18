@@ -126,6 +126,7 @@ def _heal_pr(
     raises: a failure is logged with its exception kind and counted."""
     from dispatcher import run_chief_recheck  # local import: heavy persona graph
     from personas.publish_check import PUBLISH_FAILED
+    from personas.tpm.persona import is_trusted_operator
 
     pr_number = pr.get("number")
     head_sha = (pr.get("head") or {}).get("sha")
@@ -142,6 +143,7 @@ def _heal_pr(
             installation_id=install_id, owner=owner, repo=repo,
             head_sha=head_sha, pr_number=int(pr_number),
             pr_body=pr.get("body") or "",
+            author_trusted=is_trusted_operator(pr),
         )
         if result_map.get("result") == PUBLISH_FAILED:
             raise RuntimeError("chief publish failed")

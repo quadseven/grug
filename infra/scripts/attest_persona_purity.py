@@ -45,6 +45,10 @@ ALLOWED_CALL_NAMES: frozenset[str] = frozenset({
     # Pure regex search over the PR body (agent-authored marker), defined
     # in tpm/persona.py; the skip is decided on the body alone
     "is_agent_authored",
+    # Pure rule picker over the body + a caller-supplied bool (grug#1251):
+    # regex searches only, defined in tpm/persona.py; the author's trust is
+    # resolved at the impure call site and passed in, never fetched here
+    "chief_rule",
     # Pure frozen-dataclass constructor (dor_checks.CheckResult) for the
     # single skipped row an agent-authored PR rolls up to
     "CheckResult",

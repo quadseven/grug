@@ -77,10 +77,15 @@ Before the tribe leave the cave, Chief reads the **Hunt Plan** on the PR body â€
 | yes | `scope-fence` | Has `## Out of scope` section | **yes** |
 | soft | `issue-link` | Body links an issue via `closes #N` | advisory |
 
-The Hunt Plan is for PRs written by people. A PR body carrying an
-agent-authored marker (a `claude.ai/code/session_` link, or
-`<!-- grug:agent-authored -->`) gets a **neutral** `Grug - Chief`, which still
-satisfies a required check. Elder and Guard review that PR as usual.
+The Hunt Plan is for PRs written by people and by operator sessions. A PR
+body carrying an agent-authored marker (a `claude.ai/code/session_` link or
+Claude Code's attribution footer) is still checked when its author is a
+trusted operator (a human owner, member or collaborator on the repo). It gets
+a **neutral** `Grug - Chief`, which still satisfies a required check, when it
+is a fleet lane PR (agent marker plus the Loom audit footer), carries the
+explicit `<!-- grug:agent-authored -->` opt-out, or comes from any other
+author. The check-run title names the rule that applied. Elder and Guard
+review every PR as usual.
 
 ## What Elder and Guard check
 
