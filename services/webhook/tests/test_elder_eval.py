@@ -393,7 +393,7 @@ def test_baseline_roundtrip_and_no_regression_on_identical():
         ),
     }
     report = _report(rows, replays)
-    baseline = to_baseline_dict(report, prompt_sha="abc", backend="cave")
+    baseline = to_baseline_dict(report, prompt_sha="abc", backend="cave", model="m")
     assert baseline["prompt_sha"] == "abc"
     assert compare_to_baseline(report, baseline["backends"]["cave"]) == []
 
@@ -415,7 +415,7 @@ def test_compare_to_baseline_flags_catch_drop_and_noise_rise():
             errored=False,
         ),
     }
-    baseline = to_baseline_dict(_report(rows, good), prompt_sha="abc", backend="cave")
+    baseline = to_baseline_dict(_report(rows, good), prompt_sha="abc", backend="cave", model="m")
     regressions = compare_to_baseline(
         _report(rows, bad), baseline["backends"]["cave"]
     )
@@ -442,7 +442,7 @@ def test_compare_to_baseline_flags_coverage_loss():
             case_id="quadseven/grug#2", emitted={}, errored=True
         ),
     }
-    baseline = to_baseline_dict(_report(rows, full), prompt_sha="abc", backend="cave")
+    baseline = to_baseline_dict(_report(rows, full), prompt_sha="abc", backend="cave", model="m")
     # Rates are identical (1.0) over the surviving case - but the errored
     # case + shrunken coverage must fail the check anyway.
     regressions = compare_to_baseline(
@@ -464,7 +464,7 @@ def test_compare_to_baseline_tolerates_within_tolerance():
         ),
     }
     report = _report(rows, full)
-    baseline = to_baseline_dict(report, prompt_sha="abc", backend="cave")
+    baseline = to_baseline_dict(report, prompt_sha="abc", backend="cave", model="m")
     # A drop smaller than the tolerance passes.
     assert (
         compare_to_baseline(report, baseline["backends"]["cave"], catch_tolerance=0.5)
@@ -612,7 +612,7 @@ def test_score_threads_truncated_cases_into_report():
     }
     report = score(cases, replays)
     assert report.truncated_cases == ("quadseven/grug#1",)
-    baseline = to_baseline_dict(report, prompt_sha="abc", backend="cave")
+    baseline = to_baseline_dict(report, prompt_sha="abc", backend="cave", model="m")
     assert baseline["backends"]["cave"]["truncated_cases"] == ["quadseven/grug#1"]
 
 
@@ -635,7 +635,7 @@ def test_score_threads_anchored_cases_into_report_and_baseline():
     report = score(cases, replays)
     assert report.anchored_cases == ("quadseven/grug#1",)
     assert report.cases_scored == 2
-    baseline = to_baseline_dict(report, prompt_sha="abc", backend="cave")
+    baseline = to_baseline_dict(report, prompt_sha="abc", backend="cave", model="m")
     assert baseline["backends"]["cave"]["anchored_cases"] == ["quadseven/grug#1"]
 
 
@@ -655,7 +655,7 @@ def test_score_threads_staged_cases_into_report_and_baseline():
     }
     report = score(cases, replays)
     assert report.staged_cases == ("quadseven/grug#1",)
-    baseline = to_baseline_dict(report, prompt_sha="abc", backend="cave")
+    baseline = to_baseline_dict(report, prompt_sha="abc", backend="cave", model="m")
     assert baseline["backends"]["cave"]["staged_cases"] == ["quadseven/grug#1"]
 
 
@@ -1571,7 +1571,7 @@ def test_score_aggregates_backend_attribution_over_scored_cases():
     report = score(cases, replays)
 
     assert report.backend_attribution == {"opencode-go": 1, "cave": 1}
-    assert to_baseline_dict(report, prompt_sha="x", backend="production")[
+    assert to_baseline_dict(report, prompt_sha="x", backend="production", model="")[
         "backends"
     ]["production"]["backend_attribution"] == {"cave": 1, "opencode-go": 1}
 
@@ -1694,7 +1694,7 @@ def test_staged_cases_mismatch_surfaced_as_advisory():
     # Baseline recorded case #1 as staged; the new report stages #2 instead.
     baseline_report = _report(rows, replays)
     object.__setattr__(baseline_report, "staged_cases", ("quadseven/grug#1",))
-    baseline = to_baseline_dict(baseline_report, prompt_sha="abc", backend="cave")
+    baseline = to_baseline_dict(baseline_report, prompt_sha="abc", backend="cave", model="m")
     new_report = _report(rows, replays)
     object.__setattr__(new_report, "staged_cases", ("quadseven/grug#2",))
 
@@ -1719,7 +1719,7 @@ def test_staged_cases_match_produces_no_advisory():
         ),
     }
     report = _report(rows, replays)
-    baseline = to_baseline_dict(report, prompt_sha="abc", backend="cave")
+    baseline = to_baseline_dict(report, prompt_sha="abc", backend="cave", model="m")
     assert staged_cases_advisories(report, baseline["backends"]["cave"]) == []
 
 
@@ -1769,7 +1769,7 @@ def test_run_case_scores_an_answer_cut_off_at_the_output_cap(monkeypatch):
     assert report.errored_cases == ()
     assert report.output_truncated_cases == (case.case_id,)
     assert report.truncated_cases == ()
-    baseline = to_baseline_dict(report, prompt_sha="abc", backend="cave")
+    baseline = to_baseline_dict(report, prompt_sha="abc", backend="cave", model="m")
     assert baseline["backends"]["cave"]["output_truncated_cases"] == [case.case_id]
 
 
@@ -1873,3 +1873,154 @@ def test_run_case_still_errors_on_a_non_json_answer_after_the_cut_off_fix(monkey
 
     assert replay.errored is True
     assert replay.output_truncated is False
+
+
+# --- grug#843: a baseline names the model its numbers belong to -------------
+
+
+def _one_case_report(served_models=()):
+    rows = [_row(1, "correctness")]
+    replays = {
+        "quadseven/grug#1": CaseReplay(
+            case_id="quadseven/grug#1",
+            emitted={"correctness": 1},
+            errored=False,
+            served_models=tuple(served_models),
+        ),
+    }
+    return _report(rows, replays)
+
+
+def test_committed_baseline_names_one_concrete_model_per_backend():
+    """grug#843: the committed baseline was keyed by a host name with no
+    model field, so a Qwen run's scores were read as Laguna's. Every entry
+    must now name a model id that is not a routing alias."""
+    from elder_eval.scoring import model_identity
+
+    for name, entry in load_baseline()["backends"].items():
+        assert "model" in entry, f"baseline entry {name!r} records no model"
+        assert model_identity(entry), (
+            f"baseline entry {name!r} has no single concrete model: "
+            f"model={entry.get('model')!r}, "
+            f"served_models={entry.get('served_models')!r}"
+        )
+
+
+def test_to_baseline_dict_records_configured_and_served_models():
+    report = _one_case_report(served_models=["nemotron-x:30b"])
+    entry = to_baseline_dict(
+        report, prompt_sha="abc", backend="cave", model="spark:warm-any"
+    )["backends"]["cave"]
+    assert entry["model"] == "spark:warm-any"
+    assert entry["served_models"] == {"nemotron-x:30b": 1}
+
+
+def test_model_identity_prefers_the_served_model():
+    from elder_eval.scoring import model_identity
+
+    assert model_identity(
+        {"model": "spark:warm-any", "served_models": {"tag-a": 3}}
+    ) == "tag-a"
+    assert model_identity({"model": "tag-b", "served_models": {}}) == "tag-b"
+
+
+def test_model_identity_is_unknown_for_an_alias_or_a_mixed_run():
+    from elder_eval.scoring import model_identity
+
+    assert model_identity({"model": "spark:warm-any", "served_models": {}}) is None
+    assert model_identity({"model": "", "served_models": {}}) is None
+    assert model_identity({}) is None
+    assert model_identity(
+        {"model": "tag-a", "served_models": {"tag-a": 2, "tag-b": 1}}
+    ) is None
+
+
+def test_model_mismatch_refuses_a_different_or_unknown_model():
+    from elder_eval.scoring import model_mismatch
+
+    report = _one_case_report(served_models=["tag-b"])
+    same = {"model": "tag-b", "served_models": {}}
+    other = {"model": "tag-a", "served_models": {}}
+    legacy = {"overall_catch": 0.5}  # the pre-#843 shape: no model at all
+    assert model_mismatch(report, same, model="spark:warm-any") is None
+    assert "tag-a" in model_mismatch(report, other, model="spark:warm-any")
+    assert "unknown model" in model_mismatch(report, legacy, model="tag-b")
+
+
+def test_score_counts_served_models_per_scored_case():
+    rows = [_row(1, "correctness"), _row(2, "correctness")]
+    replays = {
+        "quadseven/grug#1": CaseReplay(
+            case_id="quadseven/grug#1", emitted={}, errored=False,
+            served_models=("tag-a",),
+        ),
+        "quadseven/grug#2": CaseReplay(
+            case_id="quadseven/grug#2", emitted={}, errored=False,
+            served_models=("tag-a", "tag-b"),
+        ),
+    }
+    assert _report(rows, replays).served_models == {"tag-a": 2, "tag-b": 1}
+
+
+def test_run_case_records_the_model_each_response_names(monkeypatch):
+    """The gateway rewrites `spark:warm-any` to the tag it chose, and the
+    response's `model` field carries it back: that is what was measured."""
+    from elder_eval import runner
+    from sast_benchmark.backends import BenchBackend
+
+    monkeypatch.setattr(runner, "_post", lambda b, m: _bench_response([]))
+    (case,) = build_cases([_row(1, "correctness")])
+    backend = BenchBackend(
+        name="cave", url="http://invalid", model="spark:warm-any", api_key=""
+    )
+    replay = runner.run_case(backend, case, _diff_for("x.py"))
+    assert replay.errored is False
+    assert replay.served_models == ("m",)
+
+
+def _record_into(tmp_path, monkeypatch):
+    from elder_eval import __main__ as cli
+
+    path = tmp_path / "baseline.json"
+    monkeypatch.setattr(cli, "BASELINE_PATH", path)
+    monkeypatch.setattr(cli, "compute_prompt_sha", lambda: "abc")
+    return cli, path
+
+
+def test_record_refuses_when_no_single_model_answered(tmp_path, monkeypatch):
+    cli, path = _record_into(tmp_path, monkeypatch)
+    assert cli._record_report(_one_case_report(), "cave", "spark:warm-any") == 3
+    assert not path.exists()
+    mixed = _one_case_report(served_models=["tag-a", "tag-b"])
+    assert cli._record_report(mixed, "cave", "tag-a") == 3
+    assert not path.exists()
+
+
+def test_record_writes_the_served_model(tmp_path, monkeypatch):
+    import json
+
+    cli, path = _record_into(tmp_path, monkeypatch)
+    report = _one_case_report(served_models=["tag-a"])
+    assert cli._record_report(report, "cave", "spark:warm-any") == 0
+    entry = json.loads(path.read_text())["backends"]["cave"]
+    assert entry["model"] == "spark:warm-any"
+    assert entry["served_models"] == {"tag-a": 1}
+
+
+def test_check_refuses_to_compare_across_models(tmp_path, monkeypatch):
+    import json
+
+    cli, path = _record_into(tmp_path, monkeypatch)
+    monkeypatch.setattr(cli, "load_baseline", lambda: json.loads(path.read_text()))
+    assert cli._record_report(_one_case_report(["tag-a"]), "cave", "tag-a") == 0
+    # Same model, same scores: an ordinary pass.
+    assert cli._check_report(_one_case_report(["tag-a"]), "cave", "tag-a") == 0
+    # A different model must not be scored as a regression (or a pass).
+    assert cli._check_report(_one_case_report(["tag-b"]), "cave", "tag-b") == 2
+
+
+def test_report_prints_the_models_that_answered(capsys):
+    from elder_eval import __main__ as cli
+
+    cli._print_report("cave", _one_case_report(served_models=["tag-a"]))
+    assert "model(s) that actually answered: tag-ax1" in capsys.readouterr().out

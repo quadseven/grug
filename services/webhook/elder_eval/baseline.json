@@ -3,6 +3,7 @@
     "cave": {
       "cases_scored": 17,
       "errored_cases": [],
+      "model": "qwen3-coder-next:q8_0",
       "noise_rate": 0.0,
       "overall_catch": 0.1746031746031746,
       "per_class_catch": {
@@ -14,6 +15,7 @@
         "type-design": 0.0,
         "upstream-semantics": 0.2857142857142857
       },
+      "served_models": {},
       "truncated_cases": [
         "githumps/grug#366",
         "githumps/grug#494"
