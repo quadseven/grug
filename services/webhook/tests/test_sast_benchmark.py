@@ -354,6 +354,26 @@ def test_cave_finding_messages_are_bounded_like_production(monkeypatch):
     assert worst_case_chars < 32_768 * 4
 
 
+def test_every_cave_finding_string_is_bounded():
+    """grug#989: with maxItems in place, grug#494 still came back as 144k
+    characters of truncated JSON, so one string ran until the token cap.
+    Every string the model writes must carry a maxLength, and the object must
+    take no undeclared key (an unbounded escape hatch). The suggestion bound
+    equals the parse-time cap, as the message bound does."""
+    import llm_client
+
+    item = llm_client._CAVE_FINDINGS_RESPONSE_FORMAT["json_schema"]["schema"][
+        "properties"
+    ]["findings"]["items"]
+    assert item["additionalProperties"] is False
+    for name, prop in item["properties"].items():
+        if prop["type"] == "string" and "enum" not in prop:
+            assert prop.get("maxLength"), f"{name} has no maxLength"
+    assert {"suggestion", "effort"} <= set(item["properties"])
+    props = item["properties"]
+    assert props["suggestion"]["maxLength"] == llm_client._MAX_SUGGESTION_CHARS
+
+
 def test_cave_and_poolside_disable_thinking_openrouter_untouched(monkeypatch):
     """#894: production sends chat_template_kwargs.enable_thinking=False at
     three llm_client.py call sites; the Cave bench backend didn't, so a
