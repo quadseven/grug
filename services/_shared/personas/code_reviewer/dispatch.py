@@ -123,7 +123,7 @@ from personas.code_reviewer.degraded_gate import (
     degraded_conclusion, gate_sentence, lead_with_degraded_line,
 )
 from personas.code_reviewer.thread_resolver import is_grug, resolve_fixed_threads
-from personas.code_reviewer.verify import verify_findings
+from personas.code_reviewer.verify import downgrade_bound_names, verify_findings
 from personas.tribe import CHECK_ELDER
 from adapters.install_store import (  # type: ignore
     CommentFindingOrigin,
@@ -3276,6 +3276,10 @@ def dispatch_code_review(
         killed, installation_id=installation_id, owner=owner,
         repo_name=repo_name, pull_number=pull_number, arm="tier1",
     )
+    evaluation = _apply_bound_name_downgrade(
+        evaluation, file_contents, installation_id=installation_id,
+        owner=owner, repo_name=repo_name, pull_number=pull_number, arm="tier1",
+    )
     surviving = _apply_refute_gate(
         evaluation.findings, hunks, installation_id,
         pr_context=pr_context, file_contents=file_contents,
@@ -3866,6 +3870,38 @@ def _apply_refute_gate(
     return tuple(f for f in findings if id(f) not in dead)
 
 
+def _apply_bound_name_downgrade(
+    evaluation: CodeReviewEvaluation, file_contents, *, installation_id: int,
+    owner: str, repo_name: str, pull_number: int, arm: str,
+) -> CodeReviewEvaluation:
+    """Bound-name downgrade (#1227): a blocking "is not defined" marking
+    whose every named identifier is bound in an enclosing scope of the
+    post-change file becomes a non-blocking note. Runs after the
+    verification kills and before the refute gate, so a downgraded finding
+    no longer spends a refute call. One structured row per downgrade."""
+    findings, downgraded = downgrade_bound_names(
+        evaluation.findings, file_contents or {},
+    )
+    if not downgraded:
+        return evaluation
+    for d in downgraded:
+        log.info(
+            "code_review_verification_downgraded",
+            extra={
+                "installation_id": installation_id,
+                "pr": f"{owner}/{repo_name}#{pull_number}",
+                "path": d.finding.file,
+                "line": d.finding.line,
+                "rule": d.finding.rule_name,
+                "severity": d.finding.severity,
+                "reason": "bound_name",
+                "names": list(d.names),
+                "arm": arm,
+            },
+        )
+    return with_findings(evaluation, findings)
+
+
 def _record_verification_kills(
     killed, *, installation_id: int, owner: str, repo_name: str,
     pull_number: int, arm: str,
@@ -4010,6 +4046,10 @@ def _grade_deep_response(
         repo_name=repo_name,
         pull_number=pull_number,
         arm="deep",
+    )
+    deep_eval = _apply_bound_name_downgrade(
+        deep_eval, file_contents or {}, installation_id=installation_id,
+        owner=owner, repo_name=repo_name, pull_number=pull_number, arm="deep",
     )
     deep_surviving = _apply_refute_gate(
         deep_eval.findings,

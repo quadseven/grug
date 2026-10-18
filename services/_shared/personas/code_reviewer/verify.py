@@ -401,3 +401,200 @@ def verify_findings(
         else:
             killed.append(KilledFinding(finding=f, reason=reason))
     return tuple(kept), tuple(killed)
+
+
+# --- bound-name downgrade (#1227) -----------------------------------------
+#
+# Live instance 2026-10-17: three blocking markings on one pull request
+# claimed NameErrors for `now` and `authors`, both parameters of the
+# enclosing method whose signature sat ~40 lines above the hunk. This is a
+# DOWNGRADE, not a kill: the claim is contradicted by the post-change file,
+# but a name being bound does not prove every neighbouring claim wrong, so
+# the finding still publishes - as a non-blocking note that cannot stop a
+# correct merge. Same asymmetric bias as the kills above: anything
+# inconclusive (no source, unparseable, no extractable name, any named
+# identifier not provably bound) keeps the finding exactly as it was.
+
+
+@dataclass(frozen=True, slots=True)
+class DowngradedFinding:
+    finding: "Finding"  # the finding as the model produced it
+    names: tuple[str, ...]  # the claimed-undefined names, all proven bound
+
+
+# "is not defined" class: NameError, undefined/unbound/unresolved name.
+_NOT_DEFINED_RE = re.compile(
+    r"nameerror|not\s+defined|undefined|unbound|unresolved\s+(?:name|reference)"
+    r"|undeclared",
+    re.IGNORECASE,
+)
+
+# Bare identifiers quoted in the message: `now`, 'now', "now".
+_QUOTED_NAME_RE = re.compile(r"[`'\"]([A-Za-z_][A-Za-z0-9_]*)[`'\"]")
+
+# The note appended to a downgraded marking so a reader sees why it no
+# longer blocks.
+_DOWNGRADE_NOTE = (
+    " [Downgraded to a note: {names} bound in an enclosing scope of the "
+    "post-change file.]"
+)
+
+_DOWNGRADED_SEVERITY = "low"
+_BLOCKING = ("high", "critical")
+
+
+def _is_not_defined_claim(finding: "Finding") -> bool:
+    return bool(
+        _NOT_DEFINED_RE.search(finding.rule_name)
+        or _NOT_DEFINED_RE.search(finding.message)
+    )
+
+
+def _claimed_names(message: str) -> tuple[str, ...]:
+    seen: list[str] = []
+    for name in _QUOTED_NAME_RE.findall(message):
+        if name not in seen and name != "NameError":
+            seen.append(name)
+    return tuple(seen)
+
+
+def _target_names(node: ast.AST) -> set[str]:
+    return {n.id for n in ast.walk(node) if isinstance(n, ast.Name)}
+
+
+def _bindings_in(stmts: list[ast.stmt], before_line: int | None) -> set[str]:
+    """Names bound by `stmts` at their own scope level (not descending into
+    nested functions/classes/lambdas/comprehensions). With `before_line`,
+    only bindings that START before that line count - a local assigned
+    after its use is a real unbound-local bug, not a false marking."""
+    bound: set[str] = set()
+
+    def visit(node: ast.AST) -> None:
+        line = getattr(node, "lineno", None)
+        early = before_line is None or (line is not None and line < before_line)
+        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
+            if early:
+                bound.add(node.name)
+            return  # its body is a different scope
+        if isinstance(node, (ast.Lambda, ast.ListComp, ast.SetComp,
+                             ast.DictComp, ast.GeneratorExp)):
+            return
+        if early:
+            if isinstance(node, (ast.Import, ast.ImportFrom)):
+                for alias in node.names:
+                    if alias.name == "*":
+                        continue
+                    bound.add((alias.asname or alias.name).split(".")[0])
+            elif isinstance(node, ast.Assign):
+                for t in node.targets:
+                    bound.update(_target_names(t))
+            elif isinstance(node, (ast.AnnAssign, ast.AugAssign)) and getattr(
+                node, "value", None
+            ) is not None:
+                bound.update(_target_names(node.target))
+            elif isinstance(node, (ast.For, ast.AsyncFor, ast.NamedExpr)):
+                bound.update(_target_names(node.target))
+            elif isinstance(node, (ast.With, ast.AsyncWith)):
+                for item in node.items:
+                    if item.optional_vars is not None:
+                        bound.update(_target_names(item.optional_vars))
+            elif isinstance(node, ast.ExceptHandler) and node.name:
+                bound.add(node.name)
+            elif isinstance(node, (ast.Global, ast.Nonlocal)):
+                bound.update(node.names)
+        for child in ast.iter_child_nodes(node):
+            visit(child)
+
+    for stmt in stmts:
+        visit(stmt)
+    return bound
+
+
+def _function_chain(tree: ast.Module, line: int) -> list[ast.AST]:
+    """Outermost-to-innermost FUNCTIONS whose span holds `line` (class
+    bodies are not enclosing scopes for their methods)."""
+    chain: list[ast.AST] = []
+    for node in ast.walk(tree):
+        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
+            end = node.end_lineno or node.lineno
+            if node.lineno <= line <= end:
+                chain.append(node)
+    chain.sort(key=lambda n: n.lineno)
+    return chain
+
+
+def _params(fn: ast.AST) -> set[str]:
+    a = fn.args  # type: ignore[attr-defined]
+    names = {p.arg for p in (*a.posonlyargs, *a.args, *a.kwonlyargs)}
+    if a.vararg is not None:
+        names.add(a.vararg.arg)
+    if a.kwarg is not None:
+        names.add(a.kwarg.arg)
+    return names
+
+
+def _bound_at(source: str, line: int) -> set[str] | None:
+    """Every name provably bound at `line` of `source`: enclosing-function
+    parameters, earlier bindings in those functions, module-level bindings
+    and builtins. None when the module does not parse."""
+    try:
+        tree = ast.parse(source)
+    except (SyntaxError, ValueError):
+        return None
+    import builtins
+
+    bound = set(dir(builtins))
+    bound |= _bindings_in(tree.body, None)
+    for fn in _function_chain(tree, line):
+        bound |= _params(fn)
+        bound |= _bindings_in(fn.body, line)  # type: ignore[attr-defined]
+    return bound
+
+
+def downgrade_bound_names(
+    findings: tuple["Finding", ...], file_contents: dict[str, str],
+) -> tuple[tuple["Finding", ...], tuple[DowngradedFinding, ...]]:
+    """Downgrade blocking "is not defined" findings whose every named
+    identifier is bound in an enclosing scope of the post-change file to a
+    non-blocking note (#1227). Returns (findings, downgraded); order is
+    preserved and untouched findings are returned as the same objects.
+    Never raises: any per-finding error keeps the finding as it was."""
+    from dataclasses import replace
+
+    out: list["Finding"] = []
+    downgraded: list[DowngradedFinding] = []
+    for f in findings:
+        try:
+            names = _maybe_bound_names(f, file_contents)
+        except Exception:  # noqa: BLE001 - verification must never abort a review
+            names = None
+        if not names:
+            out.append(f)
+            continue
+        shown = ", ".join(f"`{n}`" for n in names)
+        verb = "is" if len(names) == 1 else "are"
+        note = _DOWNGRADE_NOTE.format(names=f"{shown} {verb}")
+        out.append(replace(f, severity=_DOWNGRADED_SEVERITY, message=f.message + note))
+        downgraded.append(DowngradedFinding(finding=f, names=names))
+    return tuple(out), tuple(downgraded)
+
+
+def _maybe_bound_names(
+    finding: "Finding", file_contents: dict[str, str],
+) -> tuple[str, ...] | None:
+    if finding.severity not in _BLOCKING:
+        return None
+    if not finding.file.endswith((".py", ".pyi")):
+        return None
+    if not _is_not_defined_claim(finding):
+        return None
+    source = file_contents.get(finding.file)
+    if source is None:
+        return None
+    names = _claimed_names(finding.message)
+    if not names:
+        return None
+    bound = _bound_at(source, finding.line)
+    if bound is None or not all(n in bound for n in names):
+        return None
+    return names
