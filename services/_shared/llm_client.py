@@ -1607,6 +1607,16 @@ _CAVE_REVIEW_REASONER_DEFAULT_MODEL = "poolside/Laguna-S-2.1-NVFP4"
 # additional fields (e.g. `suggestion`) remain allowed. SaaS-style backends
 # keep plain json_object via the default body (this rides extra_body, which
 # merges AFTER the default response_format and so replaces it per-backend).
+# grug#989: an upper bound on the findings array, enforced by vLLM's guided
+# decoding. On large diffs Nemotron 3.5 Super VL kept emitting findings until
+# the token cap cut it off: three eval cases came back as truncated JSON of
+# about 120k characters, at both an 8192 and a 32768 output cap, so raising
+# the cap only let it run longer. 50 sits above the most findings any eval
+# case's ledger holds (36, grug#366) and below what the judge grades in one
+# review (JUDGE_MAX_FINDINGS = 75), so a real review loses nothing and a
+# runaway list ends as valid JSON well inside the coder arm's token budget.
+CAVE_MAX_FINDINGS = 50
+
 _CAVE_FINDINGS_RESPONSE_FORMAT = {
     "type": "json_schema",
     "json_schema": {
@@ -1616,6 +1626,7 @@ _CAVE_FINDINGS_RESPONSE_FORMAT = {
             "properties": {
                 "findings": {
                     "type": "array",
+                    "maxItems": CAVE_MAX_FINDINGS,
                     "items": {
                         "type": "object",
                         "properties": {

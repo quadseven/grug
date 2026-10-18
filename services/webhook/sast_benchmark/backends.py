@@ -17,6 +17,7 @@ from __future__ import annotations
 import os
 from dataclasses import dataclass, field
 
+from llm_client import CAVE_MAX_FINDINGS
 from openrouter_free_limiter import is_free_tier_model
 
 
@@ -112,6 +113,8 @@ _CAVE_FINDINGS_RESPONSE_FORMAT = {
             "properties": {
                 "findings": {
                     "type": "array",
+                    # Same bound as production's Cave arms (grug#989).
+                    "maxItems": CAVE_MAX_FINDINGS,
                     "items": {
                         "type": "object",
                         "properties": {
