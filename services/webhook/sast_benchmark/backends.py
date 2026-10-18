@@ -20,6 +20,11 @@ from dataclasses import dataclass, field
 from openrouter_free_limiter import is_free_tier_model
 
 
+# The name the bench gives itself at the spark-gateway, which keys its
+# per-caller output cap (SPARK_GATEWAY_CALLER_MAX_OUTPUT_TOKENS) on it.
+CAVE_BENCH_CALLER = "grug-bench"
+
+
 @dataclass(frozen=True, slots=True)
 class BenchBackend:
     """One OpenAI-compatible chat-completions endpoint to benchmark.
@@ -35,6 +40,10 @@ class BenchBackend:
     model: str
     api_key: str
     extra_body: dict = field(default_factory=dict)
+    # Extra request headers. The Cave sends X-Spark-Caller so the
+    # spark-gateway applies the bench caller's own output cap instead of its
+    # default (#989: findings lists ran past 8192 tokens and were truncated).
+    headers: dict = field(default_factory=dict)
 
 
 # Default models mirror llm_client's choices so the benchmark measures the same
@@ -203,6 +212,7 @@ def configured_backends() -> list[BenchBackend]:
                     "response_format": _CAVE_FINDINGS_RESPONSE_FORMAT,
                     **_DISABLE_THINKING_EXTRA_BODY,
                 },
+                headers={"X-Spark-Caller": CAVE_BENCH_CALLER},
             )
         )
 
