@@ -182,20 +182,8 @@ def test_evaluate_pull_request_passes_on_good_body():
 
     assert evaluation.passed is True
     assert evaluation.conclusion == "success"
-    assert len(evaluation.results) == 8  # 8 dor checks
+    assert len(evaluation.results) == 7  # 7 dor checks
     assert all(r.passed for r in evaluation.results)
-
-
-def test_evaluate_pull_request_loom_footer_failure_is_advisory():
-    """grug#1201: a Loom-ticket ref with no audit footer fails `loom-footer`
-    but never blocks merge - it sits in _ADVISORY_CHECKS like `issue-link`."""
-    body = _GOOD_BODY + "\nRefs quadseven/loom#510\n"  # leak-guard-allow: public repo; the input the check parses
-    evaluation = persona.evaluate_pull_request(body)
-
-    footer = next(r for r in evaluation.results if r.name == "loom-footer")
-    assert footer.passed is False
-    assert evaluation.passed is True
-    assert evaluation.conclusion == "success"
 
 
 def test_evaluate_pull_request_without_fetcher_marks_linked_issue_skipped():
@@ -208,9 +196,9 @@ def test_evaluate_pull_request_without_fetcher_marks_linked_issue_skipped():
     lic = next(r for r in evaluation.results if r.name == "linked-issue-completeness")
     assert lic.skipped is True
     title, _ = persona._summary(list(evaluation.results))
-    assert "all 8 checks" not in title
+    assert "all 7 checks" not in title
     # Both IO checks name the ticket and have no fetcher here (grug#1034).
-    assert "6/8 checks (ticket done, which epic skipped)" in title
+    assert "5/7 checks (ticket done, which epic skipped)" in title
 
 
 def test_evaluate_pull_request_fails_on_empty_body():
@@ -255,7 +243,7 @@ def test_evaluate_mixed_advisory_and_blocking_failure():
     assert scope.passed is False
     assert link.passed is False
     title, summary = persona._summary(list(evaluation.results))
-    assert title == "Hunt Plan hold - 1/8 plan checks fail (where stop; see Details)"
+    assert title == "Hunt Plan hold - 1/7 plan checks fail (where stop; see Details)"
 
 
 def test_summary_advisory_check_renders_warning_icon():

@@ -100,7 +100,7 @@ _AGENT_SKIP_SUMMARY = (
 def is_agent_authored(pr_body: str) -> bool:
     """True when the PR body carries an agent-authored marker."""
     return bool(_AGENT_AUTHORED_RE.search(pr_body or ""))
-_ADVISORY_CHECKS: frozenset[str] = frozenset({"issue-link", "loom-footer"})
+_ADVISORY_CHECKS: frozenset[str] = frozenset({"issue-link"})
 
 
 def _blocking_failures(results: Sequence[CheckResult]) -> list[CheckResult]:
@@ -122,7 +122,6 @@ _CHECK_DISPLAY: dict[str, str] = {
     "estimate": "how big",
     "scope-fence": "where stop",
     "issue-link": "which ticket",
-    "loom-footer": "loom mark",
     "linked-issue-completeness": "ticket done",
     "linked-issue-epic": "which epic",
 }

@@ -6,7 +6,7 @@ Proves:
 
 Two-layer proof:
   Layer 1 (AST): _ADVISORY_CHECKS is defined, is a frozenset literal,
-  and every entry is one of the 6 canonical check names.
+  and every entry is one of the 5 canonical check names.
   Layer 2 (AST): evaluate_pull_request filters blocking via
   `r.name not in _ADVISORY_CHECKS` — advisory failures cannot block.
 """
@@ -22,8 +22,7 @@ PERSONA_PATHS = (
     REPO_ROOT / "services/_shared/personas/tpm/persona.py",
 )
 
-# `loom-footer` is the advisory Loom audit-footer check (grug#1201).
-CANONICAL_NAMES = frozenset({"why", "acceptance", "estimate", "scope-fence", "issue-link", "loom-footer"})
+CANONICAL_NAMES = frozenset({"why", "acceptance", "estimate", "scope-fence", "issue-link"})
 
 
 def _find_advisory_set(tree: ast.Module) -> frozenset[str] | None:

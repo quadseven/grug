@@ -15,7 +15,6 @@ from personas.tpm.dor_checks import (
     check_issue_link,
     check_linked_issue_completeness,
     check_linked_issue_in_epic,
-    check_loom_footer,
     check_scope_fence,
     IssueFacts,
     check_why,
@@ -138,33 +137,12 @@ def test_issue_link_missing():
     assert not check_issue_link("just text").passed
 
 
-def test_loom_footer_passes_when_present():
-    body = ("## Why\nx\n\n---\n"
-            "Loom ticket quadseven.loom-510, lane claude, model claude-opus-5-5.")
-    r = check_loom_footer(body)
-    assert r.passed and not r.skipped
-
-
-def test_loom_footer_fails_for_loom_ticket_ref_without_footer():
-    body = "## Why\nx\n\nRefs quadseven/loom#510"  # leak-guard-allow: loom is a public repo; this is the input the check parses
-    r = check_loom_footer(body)
-    assert r.name == "loom-footer"
-    assert not r.passed
-
-
-def test_loom_footer_passes_not_skipped_for_non_loom_pr():
-    # Not applicable is an earned pass, not a skip: `skipped` would drop
-    # "all N checks" from the Chief title of every non-Loom PR.
-    r = check_loom_footer("## Why\nplain PR with no loom references")
-    assert r.passed and not r.skipped
-
-
-def test_run_all_returns_8():
+def test_run_all_returns_7():
     results = run_all("")
-    assert len(results) == 8
+    assert len(results) == 7
     assert {r.name for r in results} == {
         "why", "acceptance", "estimate", "scope-fence", "issue-link",
-        "loom-footer", "linked-issue-completeness", "linked-issue-epic",
+        "linked-issue-completeness", "linked-issue-epic",
     }
 
 
