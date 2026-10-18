@@ -39,7 +39,7 @@ def dispatch_pull_request(ctx: PullRequestContext) -> dict[str, str]:
             build_issue_facts_fetcher, build_issue_fetcher,
         )
         from personas.tpm.persona import (  # type: ignore
-            evaluate_pull_request, publish_tpm_evaluation,
+            evaluate_pull_request, is_trusted_operator, publish_tpm_evaluation,
         )
         # The fetcher is the only impure boundary of the evaluation:
         # evaluate_pull_request itself stays pure (spec 0002) -- the
@@ -54,8 +54,13 @@ def dispatch_pull_request(ctx: PullRequestContext) -> dict[str, str]:
             installation_id=ctx.installation_id,
             owner=ctx.owner, repo=ctx.repo_name,
         )
+        # The author's trust is read here, at the impure edge, so the
+        # evaluation stays pure (grug#1251).
         evaluation = evaluate_pull_request(
             ctx.pr_body, fetch_issue=fetcher, fetch_issue_facts=facts_fetcher,
+            author_trusted=is_trusted_operator(
+                (ctx.payload or {}).get("pull_request"),
+            ),
         )
         result_map = publish_tpm_evaluation(
             evaluation,

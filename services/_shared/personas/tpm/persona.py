@@ -18,13 +18,14 @@ from __future__ import annotations
 import logging
 import os
 import re
-from collections.abc import Sequence
+from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
+from typing import Any
 
 from github_checks_client import CheckConclusion
 from personas.publish_check import PUBLISH_FAILED, publish_persona_check
 from personas.tpm.dor_checks import CheckResult, IssueFactsFetcher, run_all
-from personas.tpm.dor_checks import IssueFetcher
+from personas.tpm.dor_checks import IssueFetcher, has_loom_footer
 from personas.tribe import CHECK_CHIEF
 
 
@@ -41,6 +42,10 @@ class TpmEvaluation:
     passed: bool
     results: tuple[CheckResult, ...]
     conclusion: CheckConclusion
+    # Which Chief rule produced this rollup (grug#1251): one of the RULE_*
+    # constants below. The check-run title names it, so a reader can tell
+    # "skipped, and why" from "checked" without opening Details.
+    rule: str = ""
 
     def __post_init__(self) -> None:
         # passed and conclusion are two encodings of the same rollup —
@@ -66,8 +71,8 @@ log = logging.getLogger(f"{os.getenv('DD_SERVICE', 'grug')}.persona.tpm")
 _CHECK_NAME = CHECK_CHIEF
 
 # Agent-authored PR markers. The fleet's coding agents open PRs through the
-# operator's own account, so the author login cannot tell them apart from a
-# person. What CAN: the harness appends a `claude.ai/code/session_...` link
+# operator's own account, so the author login alone cannot tell them apart
+# from a person. What CAN: the harness appends a `claude.ai/code/session_...` link
 # to every PR body it writes (660 of 667 marked PRs in a 7-day sample carry
 # it as the final line); Claude Code's default PR attribution ends the body
 # with a `Generated with [Claude Code](https://claude.com/claude-code)`
@@ -77,6 +82,14 @@ _CHECK_NAME = CHECK_CHIEF
 # reformatting its own body to satisfy it is pure churn, so such PRs get a
 # NEUTRAL Chief (passes a required check) and Elder + Guard still review the
 # code unchanged.
+#
+# grug#1251 narrowed that skip. Operator sessions must put the attribution
+# footer on every PR, so "agent marker -> skip" meant Chief never checked an
+# operator's plan at all (a missing `## Why` or an epic-less ticket merged
+# silently). The marker now skips only where it was meant to: a fleet lane
+# PR (agent marker + the Loom audit footer), the explicit
+# `<!-- grug:agent-authored -->` opt-out, or an author who is not a trusted
+# operator. A trusted operator's PR with the footer gets the full plan.
 _AGENT_AUTHORED_RE = re.compile(
     r"https://claude\.ai/code/session_[A-Za-z0-9]+"
     r"|<!--\s*grug:agent-authored\s*-->"
@@ -87,19 +100,94 @@ _AGENT_AUTHORED_RE = re.compile(
     # test_pr_template_is_not_agent_authored pins that for this repo.
     r"|Generated with \[Claude Code\]\(https://claude\.com/claude-code\)",
 )
-_AGENT_SKIP_TITLE = "Hunt Plan skipped - agent-authored PR"
-_AGENT_SKIP_SUMMARY = (
-    "Chief did not check this Hunt Plan: the PR body carries an "
-    "agent-authored marker (a `claude.ai/code/session_` link, Claude Code's "
-    "`Generated with [Claude Code]` attribution footer, or "
-    "`<!-- grug:agent-authored -->`). Hunt Plan format checks apply to "
-    "PRs written by people. Elder and Guard still review the code."
+_OPT_OUT_RE = re.compile(r"<!--\s*grug:agent-authored\s*-->")
+
+# The rule behind each rollup (TpmEvaluation.rule). Values are stable keys,
+# not display text: the titles below are built from them.
+RULE_CHECKED = "checked"
+RULE_OPERATOR_CHECKED = "operator-checked"
+RULE_SKIP_LOOM_LANE = "skip-loom-lane"
+RULE_SKIP_OPT_OUT = "skip-opt-out"
+RULE_SKIP_NOT_OPERATOR = "skip-not-operator"
+
+_SKIP_TITLES: dict[str, str] = {
+    RULE_SKIP_LOOM_LANE: "Hunt Plan skipped - Loom lane PR",
+    RULE_SKIP_OPT_OUT: "Hunt Plan skipped - agent opt-out marker",
+    RULE_SKIP_NOT_OPERATOR: (
+        "Hunt Plan skipped - agent-authored PR, author not an operator"
+    ),
+}
+_SKIP_WHY: dict[str, str] = {
+    RULE_SKIP_LOOM_LANE: (
+        "it is a fleet lane PR (an agent marker plus the Loom audit footer "
+        "`Loom ticket ...`)"
+    ),
+    RULE_SKIP_OPT_OUT: (
+        "the PR body carries the explicit `<!-- grug:agent-authored -->` "
+        "opt-out"
+    ),
+    RULE_SKIP_NOT_OPERATOR: (
+        "the PR body carries an agent-authored marker (a "
+        "`claude.ai/code/session_` link or Claude Code's `Generated with "
+        "[Claude Code]` footer) and its author is not a trusted operator "
+        "(a human with owner, member or collaborator access)"
+    ),
+}
+_OPERATOR_CHECKED_SUFFIX = " - operator PR, agent footer checked"
+
+# A trusted operator is a human with write-level standing on the repo.
+# GitHub's own `author_association` on the PR says so without an extra API
+# call, on the webhook payload and on the REST pull object alike.
+_OPERATOR_ASSOCIATIONS: frozenset[str] = frozenset(
+    {"OWNER", "MEMBER", "COLLABORATOR"},
 )
 
 
 def is_agent_authored(pr_body: str) -> bool:
     """True when the PR body carries an agent-authored marker."""
     return bool(_AGENT_AUTHORED_RE.search(pr_body or ""))
+
+
+def is_trusted_operator(pr: Mapping[str, Any] | None) -> bool:
+    """True when the PR's author is a human owner, member or collaborator.
+
+    Reads the PR object GitHub sends (webhook `pull_request`, or a REST
+    pull). Unknown shape -> False, which keeps the pre-#1251 skip: an
+    untrusted or unreadable author never turns a skip into a check.
+    """
+    if not isinstance(pr, Mapping):
+        return False
+    user = pr.get("user")
+    if not isinstance(user, Mapping) or user.get("type") != "User":
+        return False
+    return pr.get("author_association") in _OPERATOR_ASSOCIATIONS
+
+
+def chief_rule(pr_body: str, *, author_trusted: bool) -> str:
+    """Pure: which Chief rule applies to this PR body and author.
+
+    No agent marker -> checked. With a marker: the explicit opt-out and a
+    Loom lane footer skip for anyone; otherwise a trusted operator's PR is
+    checked and anyone else's is skipped (grug#1251).
+    """
+    body = pr_body or ""
+    if not is_agent_authored(body):
+        return RULE_CHECKED
+    if _OPT_OUT_RE.search(body):
+        return RULE_SKIP_OPT_OUT
+    if has_loom_footer(body):
+        return RULE_SKIP_LOOM_LANE
+    if author_trusted:
+        return RULE_OPERATOR_CHECKED
+    return RULE_SKIP_NOT_OPERATOR
+
+
+def _skip_summary(rule: str) -> str:
+    return (
+        f"Chief did not check this Hunt Plan: {_SKIP_WHY[rule]}. Hunt Plan "
+        "format checks apply to PRs written by people and by operator "
+        "sessions. Elder and Guard still review the code."
+    )
 _ADVISORY_CHECKS: frozenset[str] = frozenset({"issue-link", "loom-footer"})
 
 
@@ -212,11 +300,16 @@ def evaluate_pull_request(
     *,
     fetch_issue: IssueFetcher | None = None,
     fetch_issue_facts: IssueFactsFetcher | None = None,
+    author_trusted: bool = False,
 ) -> TpmEvaluation:
     """Pure: run all 7 DoR rules over pr_body and return the rollup.
 
-    An agent-authored body (`is_agent_authored`) short-circuits to a
-    NEUTRAL rollup with one skipped row: no rule runs, no issue fetch.
+    `chief_rule` decides first. A skip rule (Loom lane, explicit opt-out,
+    or an agent marker from an author who is not a trusted operator)
+    short-circuits to a NEUTRAL rollup with one skipped row: no rule runs,
+    no issue fetch. `author_trusted` comes from `is_trusted_operator` on
+    the PR object at the impure call site; the default False keeps the
+    pre-#1251 skip for a caller that cannot say.
 
     No network IO, no AWS calls, no logging side-effects. Callers wrap
     the result in `publish_tpm_evaluation(...)` to POST the check-run.
@@ -229,19 +322,21 @@ def evaluate_pull_request(
     attestation (attest_persona_purity.py) sees only the allowlisted
     `run_all` call.
     """
-    if is_agent_authored(pr_body):
+    rule = chief_rule(pr_body, author_trusted=author_trusted)
+    if rule not in (RULE_CHECKED, RULE_OPERATOR_CHECKED):
         # No check runs, no issue fetch: the skip is decided on the body
-        # alone, so it stays pure and identical on the webhook and the
-        # `/grug recheck` paths.
+        # and the author flag alone, so it stays pure and identical on the
+        # webhook, `/grug recheck` and self-heal paths.
         return TpmEvaluation(
             passed=True,
             results=(
                 CheckResult(
-                    "agent-authored", True, "agent-authored PR; plan checks skipped",
+                    "agent-authored", True, f"{rule}; plan checks skipped",
                     skipped=True,
                 ),
             ),
             conclusion="neutral",
+            rule=rule,
         )
     results = run_all(
         pr_body, fetch_issue=fetch_issue, fetch_issue_facts=fetch_issue_facts,
@@ -252,6 +347,7 @@ def evaluate_pull_request(
         passed=not blocking,
         results=tuple(results),
         conclusion=conclusion,
+        rule=rule,
     )
 
 
@@ -277,9 +373,15 @@ def publish_tpm_evaluation(
     otherwise.
     """
     if evaluation.conclusion == "neutral":
-        title, summary = _AGENT_SKIP_TITLE, _AGENT_SKIP_SUMMARY
+        skip_rule = (
+            evaluation.rule if evaluation.rule in _SKIP_TITLES
+            else RULE_SKIP_NOT_OPERATOR
+        )
+        title, summary = _SKIP_TITLES[skip_rule], _skip_summary(skip_rule)
     else:
         title, summary = _summary(list(evaluation.results))
+        if evaluation.rule == RULE_OPERATOR_CHECKED:
+            title += _OPERATOR_CHECKED_SUFFIX
     log.info(
         "tpm_publishing",
         extra={

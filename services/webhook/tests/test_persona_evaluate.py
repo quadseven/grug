@@ -694,7 +694,7 @@ def test_publish_agent_skip_posts_neutral_with_skip_title():
     assert recorded["findings_count"] == 0
     check = posted["args"][3]
     assert check.conclusion == "neutral"
-    assert check.title == "Hunt Plan skipped - agent-authored PR"
+    assert check.title == "Hunt Plan skipped - agent-authored PR, author not an operator"
 
 
 def test_tpm_evaluation_rejects_failed_neutral():
@@ -716,3 +716,132 @@ def test_pr_template_is_not_agent_authored():
     template = Path(__file__).resolve().parents[3] / ".github" / "pull_request_template.md"
     assert template.is_file(), template
     assert persona.is_agent_authored(template.read_text()) is False
+
+
+# --- grug#1251: operator PRs with an agent footer still get the plan ---
+
+_OPERATOR_PR = {"user": {"login": "op", "type": "User"}, "author_association": "OWNER"}
+_LOOM_FOOTER = "\nLoom ticket quadseven/loom#7, lane fix, model opus\n"
+
+
+@pytest.mark.parametrize("association", ["OWNER", "MEMBER", "COLLABORATOR"])
+def test_trusted_operator_is_a_write_level_human(association):
+    pr = {"user": {"login": "op", "type": "User"}, "author_association": association}
+    assert persona.is_trusted_operator(pr) is True
+
+
+@pytest.mark.parametrize("pr", [
+    {"user": {"login": "dependabot[bot]", "type": "Bot"}, "author_association": "OWNER"},
+    {"user": {"login": "stranger", "type": "User"}, "author_association": "CONTRIBUTOR"},
+    {"user": {"login": "stranger", "type": "User"}, "author_association": "NONE"},
+    {"user": {"login": "op", "type": "User"}},
+    {},
+    None,
+])
+def test_untrusted_or_unknown_author_is_not_an_operator(pr):
+    assert persona.is_trusted_operator(pr) is False
+
+
+def test_operator_pr_with_footer_and_no_why_fails():
+    """The gap #1251 closes: an operator session's PR carries the agent
+    footer, and on main that switched Chief off (neutral). A missing
+    `## Why` must now fail."""
+    body = _GOOD_BODY.replace("## Why\n", "## Context\n") + (
+        "\nGenerated with [Claude Code](https://claude.com/claude-code)\n"
+        "https://claude.ai/code/session_01Ht7JaVzv2aacJ9r6Srso9r\n"
+    )
+    evaluation = persona.evaluate_pull_request(body, author_trusted=True)
+    assert evaluation.conclusion == "failure"
+    assert evaluation.passed is False
+    assert [r.name for r in evaluation.results if not r.passed] == ["why"]
+
+
+def test_operator_pr_with_footer_and_full_plan_succeeds():
+    body = _GOOD_BODY + "\nhttps://claude.ai/code/session_abc123\n"
+    evaluation = persona.evaluate_pull_request(body, author_trusted=True)
+    assert evaluation.conclusion == "success"
+    assert evaluation.rule == persona.RULE_OPERATOR_CHECKED
+
+
+def test_operator_check_uses_the_issue_fetchers():
+    seen: list[str] = []
+
+    def fetch(*_a, **_kw):
+        seen.append("called")
+        return "- [x] done\n"
+
+    body = _GOOD_BODY + "\nhttps://claude.ai/code/session_abc123\n"
+    persona.evaluate_pull_request(body, author_trusted=True, fetch_issue=fetch)
+    assert seen
+
+
+def test_loom_lane_pr_still_skips_for_an_operator_author():
+    """Fleet lane PRs open through the operator's account too; the Loom
+    audit footer is what marks them, and they keep the neutral skip."""
+    body = _AGENT_BODY_NO_PLAN + _LOOM_FOOTER
+    evaluation = persona.evaluate_pull_request(body, author_trusted=True)
+    assert evaluation.conclusion == "neutral"
+    assert evaluation.rule == persona.RULE_SKIP_LOOM_LANE
+
+
+def test_explicit_opt_out_still_skips_for_an_operator_author():
+    body = "No plan here.\n\n<!-- grug:agent-authored -->\n"
+    evaluation = persona.evaluate_pull_request(body, author_trusted=True)
+    assert evaluation.conclusion == "neutral"
+    assert evaluation.rule == persona.RULE_SKIP_OPT_OUT
+
+
+def test_agent_footer_from_an_untrusted_author_still_skips():
+    evaluation = persona.evaluate_pull_request(_AGENT_BODY_NO_PLAN)
+    assert evaluation.conclusion == "neutral"
+    assert evaluation.rule == persona.RULE_SKIP_NOT_OPERATOR
+
+
+def test_loom_footer_without_agent_marker_is_still_checked():
+    """A Loom footer alone was never a skip; only footer + agent marker is."""
+    evaluation = persona.evaluate_pull_request(
+        _HUMAN_BODY_NO_PLAN + _LOOM_FOOTER, author_trusted=True,
+    )
+    assert evaluation.conclusion == "failure"
+
+
+def _publish_title(evaluation) -> str:
+    posted: dict = {}
+
+    def fake_post(*a, **kw):
+        posted["args"] = a
+        return {"id": 1}
+
+    with patch.object(publish_check, "with_install_token_retry", side_effect=lambda i, fn: fn("t")):
+        with patch.object(publish_check, "post_check_run", side_effect=fake_post):
+            with patch.object(publish_check, "record_check_verdict", side_effect=lambda **kw: None):
+                persona.publish_tpm_evaluation(
+                    evaluation, installation_id=1, owner="o", repo="r",
+                    head_sha="z" * 40, pr_number=3,
+                )
+    return posted["args"][3].title
+
+
+@pytest.mark.parametrize(("body", "trusted", "expected"), [
+    (_AGENT_BODY_NO_PLAN + _LOOM_FOOTER, True, "Hunt Plan skipped - Loom lane PR"),
+    ("x\n<!-- grug:agent-authored -->\n", True, "Hunt Plan skipped - agent opt-out marker"),
+    (_AGENT_BODY_NO_PLAN, False,
+     "Hunt Plan skipped - agent-authored PR, author not an operator"),
+])
+def test_skip_title_names_the_rule(body, trusted, expected):
+    evaluation = persona.evaluate_pull_request(body, author_trusted=trusted)
+    assert _publish_title(evaluation) == expected
+
+
+def test_checked_operator_title_says_it_was_checked():
+    body = _GOOD_BODY + "\nhttps://claude.ai/code/session_abc123\n"
+    title = _publish_title(persona.evaluate_pull_request(body, author_trusted=True))
+    assert title.startswith("Hunt Plan ready - ")
+    assert title.endswith(" - operator PR, agent footer checked")
+
+
+def test_failed_operator_title_says_it_was_checked():
+    body = _HUMAN_BODY_NO_PLAN + "\nhttps://claude.ai/code/session_abc123\n"
+    title = _publish_title(persona.evaluate_pull_request(body, author_trusted=True))
+    assert title.startswith("Hunt Plan hold - ")
+    assert title.endswith(" - operator PR, agent footer checked")

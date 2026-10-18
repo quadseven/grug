@@ -247,8 +247,16 @@ def check_issue_link(body: str) -> CheckResult:
     )
 
 
+def has_loom_footer(body: str) -> bool:
+    """True when the body carries the Loom audit footer (`Loom ticket ...`
+    at the start of a line). Chief's persona uses the same predicate to tell
+    a fleet lane PR from an operator PR (grug#1251), so the two cannot
+    drift."""
+    return bool(_LOOM_FOOTER_PAT.search(body or ""))
+
+
 def check_loom_footer(body: str) -> CheckResult:
-    if _LOOM_FOOTER_PAT.search(body):
+    if has_loom_footer(body):
         return CheckResult("loom-footer", True, "Loom audit footer present")
     if _LOOM_TICKET_REF_PAT.search(body):
         return CheckResult(
