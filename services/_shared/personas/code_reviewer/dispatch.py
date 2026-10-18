@@ -4282,12 +4282,15 @@ def _publish_deep_review(
     """
     if not novel_deep:
         return
+    precedent_notes = _precedent_notes_for(
+        f"{owner}/{repo_name}", deep_eval.findings,
+    )
     review_result, posted_findings = _build_review_result(
         deep_eval,
         head_sha=head_sha,
         event=event,
         prior_keys=all_prior,
-        precedent_notes={},
+        precedent_notes=precedent_notes,
         repo_config=repo_config,
         file_contents=file_contents,
     )
