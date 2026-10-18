@@ -212,6 +212,126 @@ def split_duplicate_hunks(
     return tuple(kept), tuple(duplicates)
 
 
+# `index <old>..<new>[ <mode>]` - git's abbreviated blob ids for the file.
+_INDEX_RE = re.compile(r"^index ([0-9a-f]+)\.\.([0-9a-f]+)(?: \d+)?$")
+# Below this, an abbreviated blob id is too short to trust as a prefix.
+_MIN_BLOB_ABBREV = 7
+
+
+def new_file_blob_ids(unified_diff: str) -> dict[str, str]:
+    """`{path: abbreviated new-side blob id}` for each file the diff ADDS.
+
+    Read from the per-file header (`new file mode` + `index 0000000..<id>`),
+    keyed by the `+++ b/<path>` path when present so it lines up with
+    `DiffHunk.file_path`. An added file with no index line is left out, so
+    it can never be matched against anything. Pure."""
+    out: dict[str, str] = {}
+    for header in _file_headers(unified_diff):
+        found = _added_file_blob(header)
+        if found:
+            out[found[0]] = found[1]
+    return out
+
+
+def _file_headers(unified_diff: str) -> list[list[str]]:
+    """Each file's header lines: `diff --git` up to its first `@@`. Body
+    lines never land here, so a content line that happens to read like
+    `+++ b/x` or `index 0..1` cannot be mistaken for a header. Pure."""
+    headers: list[list[str]] = []
+    collecting = False
+    for line in unified_diff.splitlines():
+        if line.startswith("diff --git "):
+            headers.append([line])
+            collecting = True
+        elif line.startswith("@@"):
+            collecting = False
+        elif collecting:
+            headers[-1].append(line)
+    return headers
+
+
+def _added_file_blob(header: list[str]) -> tuple[str, str] | None:
+    """`(path, abbreviated blob id)` when this header ADDS a file and carries
+    its index line; `None` for an edit, rename, deletion or a header with no
+    index line. Pure."""
+    if not any(line.startswith("new file mode ") for line in header):
+        return None
+    m = _DIFF_GIT_RE.match(header[0])
+    path = m.group(2) if m else ""
+    blob = ""
+    for line in header[1:]:
+        plus = _NEW_FILE_RE.match(line) if line.startswith("+++ ") else None
+        if plus and plus.group(1) != "/dev/null":
+            path = plus.group(1)
+        index = _INDEX_RE.match(line)
+        if index and set(index.group(1)) == {"0"}:
+            blob = index.group(2)
+    return (path, blob) if path and blob else None
+
+
+def split_tree_copy_hunks(
+    hunks: tuple[DiffHunk, ...],
+    new_blob_ids: dict[str, str],
+    head_blobs: dict[str, str],
+) -> tuple[tuple[DiffHunk, ...], tuple[tuple[str, str], ...]]:
+    """Partition hunks into (reviewable, copies) using the HEAD tree.
+
+    `copies` is `((path, original_path), ...)`: an ADDED file whose blob is
+    byte-identical to `original_path`, a path that exists at head and is
+    NOT itself added by this diff - so it was already in the repo, either
+    untouched (pre-existing bytes) or edited here (its edit is reviewed
+    through its own hunks). This is #813's literal repro: six modules copied under a build
+    tool's root, the originals untouched, and the copies ate the budget
+    the novel logic needed.
+
+    `new_blob_ids` is `new_file_blob_ids(diff)`; `head_blobs` is
+    `{path: full blob sha}` from the head commit's tree. Byte identity is
+    git's own blob hash, never a rebuild of the content from diff lines.
+    The head tree must CONFIRM the diff's abbreviated id for the added
+    path itself, so a tree read at any other commit excludes nothing.
+    Only whole-new-file hunks at or above `_MIN_DUPLICATE_CHARS` qualify,
+    like `split_duplicate_hunks`. The original is the lexically first
+    match, so the board names the same path on every run. Pure - no IO."""
+    if not (new_blob_ids and head_blobs):
+        return hunks, ()
+    originals_by_blob: dict[str, list[str]] = {}
+    for path, blob in head_blobs.items():
+        if path not in new_blob_ids:
+            originals_by_blob.setdefault(blob, []).append(path)
+    kept: list[DiffHunk] = []
+    copies: list[tuple[str, str]] = []
+    for h in hunks:
+        originals = (
+            originals_by_blob.get(head_blobs.get(h.file_path, ""))
+            if is_tree_copy_candidate(h, new_blob_ids, head_blobs)
+            else None
+        )
+        if originals:
+            copies.append((h.file_path, min(originals)))
+        else:
+            kept.append(h)
+    return tuple(kept), tuple(copies)
+
+
+def is_tree_copy_candidate(
+    hunk: DiffHunk,
+    new_blob_ids: dict[str, str],
+    head_blobs: dict[str, str] | None = None,
+) -> bool:
+    """Whether `hunk` is an added whole file big enough to be worth matching
+    against the head tree. With `head_blobs`, also require that the tree
+    confirms the diff's own abbreviated blob id for this path. The caller
+    uses the tree-free form to skip the tree fetch for PRs with nothing to
+    match. Pure."""
+    abbrev = new_blob_ids.get(hunk.file_path, "")
+    if len(abbrev) < _MIN_BLOB_ABBREV:
+        return False
+    if head_blobs is not None and not head_blobs.get(hunk.file_path, "").startswith(abbrev):
+        return False
+    content = _whole_new_file_content(hunk)
+    return content is not None and len(content) >= _MIN_DUPLICATE_CHARS
+
+
 def split_oversized_hunks(
     hunks: tuple[DiffHunk, ...], max_hunk_chars: int,
 ) -> tuple[tuple[DiffHunk, ...], tuple[str, ...]]:

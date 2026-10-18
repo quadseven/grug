@@ -70,8 +70,9 @@ from personas.code_reviewer.dedup import (
     dedup_findings, finding_key, parse_rule, rule_marker,
 )
 from personas.code_reviewer.diff_parser import (
-    DiffHunk, DiffParseError, parse_diff, split_duplicate_hunks,
-    split_oversized_hunks, split_reviewable_hunks,
+    DiffHunk, DiffParseError, is_tree_copy_candidate, new_file_blob_ids,
+    parse_diff, split_duplicate_hunks, split_oversized_hunks,
+    split_reviewable_hunks, split_tree_copy_hunks,
 )
 from personas.code_reviewer.precedent import (
     class_precision, match_precedent, render_precedent_note,
@@ -341,6 +342,77 @@ def _fetch_base_contents(
             extra={"pr": f"{owner}/{repo_name}#{pull_number}", "error": str(e)},
         )
         return {}
+
+
+def _fetch_head_blobs(
+    installation_id: int, owner: str, repo_name: str, pull_number: int,
+    head_sha: str,
+) -> dict[str, str]:
+    """`{path: blob sha}` for every file in the head commit's tree (#813).
+
+    One recursive git-trees call. Best-effort: any failure or malformed
+    body returns {}, which `split_tree_copy_hunks` reads as "no proof of a
+    copy" and reviews everything - a missing tree can only cost budget,
+    never hide a change. A truncated tree is still used: every entry it
+    does list is a real blob at head."""
+    if not head_sha:
+        return {}
+
+    def _get(token: str) -> Any:
+        resp = httpx.get(
+            f"https://api.github.com/repos/{quote(owner, safe='')}/"
+            f"{quote(repo_name, safe='')}/git/trees/{quote(head_sha, safe='')}",
+            params={"recursive": "1"},
+            headers={
+                "Authorization": f"Bearer {token}",
+                "Accept": "application/vnd.github+json",
+                "X-GitHub-Api-Version": "2022-11-28",
+            },
+            timeout=DIFF_FETCH_TIMEOUT,
+        )
+        resp.raise_for_status()
+        return resp.json()
+
+    try:
+        data = with_install_token_retry(installation_id, _get)
+    except (httpx.HTTPStatusError, httpx.RequestError, ValueError) as e:
+        log.info(
+            "code_review_head_tree_unavailable",
+            extra={"pr": f"{owner}/{repo_name}#{pull_number}", "kind": type(e).__name__},
+        )
+        return {}
+    tree = data.get("tree") if isinstance(data, dict) else None
+    if not isinstance(tree, list):
+        return {}
+    return {
+        entry["path"]: entry["sha"]
+        for entry in tree
+        if isinstance(entry, dict)
+        and entry.get("type") == "blob"
+        and isinstance(entry.get("path"), str)
+        and isinstance(entry.get("sha"), str)
+    }
+
+
+def _split_copied_hunks(
+    hunks: tuple[DiffHunk, ...], diff_text: str, installation_id: int,
+    owner: str, repo_name: str, pull_number: int, head_sha: str,
+) -> tuple[tuple[DiffHunk, ...], tuple[tuple[str, str], ...]]:
+    """Drop byte-identical whole-file copies before cohort planning (#813).
+
+    First against the head tree (a copy of a file already in the repo -
+    #813's six copied modules), then within the diff itself (one
+    file added under two paths). The tree is fetched only when the diff
+    adds a file big enough to be a candidate, so most PRs pay nothing."""
+    blob_ids = new_file_blob_ids(diff_text)
+    tree_copies: tuple[tuple[str, str], ...] = ()
+    if any(is_tree_copy_candidate(h, blob_ids) for h in hunks):
+        head_blobs = _fetch_head_blobs(
+            installation_id, owner, repo_name, pull_number, head_sha,
+        )
+        hunks, tree_copies = split_tree_copy_hunks(hunks, blob_ids, head_blobs)
+    hunks, same_diff = split_duplicate_hunks(hunks)
+    return hunks, tree_copies + same_diff
 
 
 def _load_repo_config(
@@ -747,8 +819,9 @@ def _review_transparency(
         more = _path_tail(duplicate_paths)
         lines += (
             f"\n\nGrug not spend budget re-reading {len(duplicate_paths)} "
-            f"file(s) byte-identical to a path already in this diff: "
-            f"{shown}{more}."
+            f"file(s) byte-identical to another file in this diff or "
+            f"already in the repo at this head: {shown}{more}. Any change "
+            f"this diff makes to the original is still reviewed."
         )
     return lines
 
@@ -2596,15 +2669,19 @@ def dispatch_code_review(
                     "cohort_budget_chars": cohort_budget,
                 },
             )
-        # #813: a byte-identical whole-file copy of another file already IN
-        # this diff (e.g. one file added under two paths because a build
-        # tool can't symlink outside its root) is provably unchanged
-        # content. Reviewing it again spends full cohort budget re-reading
-        # bytes Elder already judged this pass, which was measured to push
-        # the genuinely novel logic in the SAME diff out of the budget
-        # entirely. Drop it HERE, named against the path it duplicates, so
-        # the budget goes to content nobody has looked at yet.
-        hunks, duplicate_paths = split_duplicate_hunks(hunks)
+        # #813: a byte-identical whole-file copy - of a file already in the
+        # repo at head, or of another file IN this diff (one file added
+        # under two paths because a build tool can't symlink outside its
+        # root) - is provably unchanged content. Reviewing it spends full
+        # cohort budget on bytes nobody wrote here, which was measured to
+        # push the genuinely novel logic in the SAME diff out of the budget
+        # entirely. Drop it HERE, before cohort planning, named against the
+        # path it duplicates, so the budget goes to content nobody has
+        # looked at yet.
+        hunks, duplicate_paths = _split_copied_hunks(
+            hunks, diff_text, installation_id, owner, repo_name,
+            pull_number, head_sha,
+        )
         if duplicate_paths:
             log.info(
                 "code_review_hunks_deduplicated",
