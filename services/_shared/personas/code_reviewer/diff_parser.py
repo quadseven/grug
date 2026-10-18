@@ -226,26 +226,47 @@ def new_file_blob_ids(unified_diff: str) -> dict[str, str]:
     `DiffHunk.file_path`. An added file with no index line is left out, so
     it can never be matched against anything. Pure."""
     out: dict[str, str] = {}
-    path: str | None = None
-    is_new = False
-    blob = ""
-    for line in unified_diff.splitlines() + ["diff --git "]:
-        if line.startswith(("diff --git ", "@@")):
-            if path and is_new and blob:
-                out[path] = blob
-            m = _DIFF_GIT_RE.match(line)
-            path, is_new, blob = (m.group(2) if m else None), False, ""
-        elif path is None:
-            continue
-        elif line.startswith("new file mode "):
-            is_new = True
-        elif line.startswith("+++ "):
-            m = _NEW_FILE_RE.match(line)
-            if m and m.group(1) != "/dev/null":
-                path = m.group(1)
-        elif (m := _INDEX_RE.match(line)) and set(m.group(1)) == {"0"}:
-            blob = m.group(2)
+    for header in _file_headers(unified_diff):
+        found = _added_file_blob(header)
+        if found:
+            out[found[0]] = found[1]
     return out
+
+
+def _file_headers(unified_diff: str) -> list[list[str]]:
+    """Each file's header lines: `diff --git` up to its first `@@`. Body
+    lines never land here, so a content line that happens to read like
+    `+++ b/x` or `index 0..1` cannot be mistaken for a header. Pure."""
+    headers: list[list[str]] = []
+    collecting = False
+    for line in unified_diff.splitlines():
+        if line.startswith("diff --git "):
+            headers.append([line])
+            collecting = True
+        elif line.startswith("@@"):
+            collecting = False
+        elif collecting:
+            headers[-1].append(line)
+    return headers
+
+
+def _added_file_blob(header: list[str]) -> tuple[str, str] | None:
+    """`(path, abbreviated blob id)` when this header ADDS a file and carries
+    its index line; `None` for an edit, rename, deletion or a header with no
+    index line. Pure."""
+    if not any(line.startswith("new file mode ") for line in header):
+        return None
+    m = _DIFF_GIT_RE.match(header[0])
+    path = m.group(2) if m else ""
+    blob = ""
+    for line in header[1:]:
+        plus = _NEW_FILE_RE.match(line) if line.startswith("+++ ") else None
+        if plus and plus.group(1) != "/dev/null":
+            path = plus.group(1)
+        index = _INDEX_RE.match(line)
+        if index and set(index.group(1)) == {"0"}:
+            blob = index.group(2)
+    return (path, blob) if path and blob else None
 
 
 def split_tree_copy_hunks(
