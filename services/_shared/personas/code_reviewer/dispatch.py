@@ -102,7 +102,7 @@ from personas.code_reviewer.linked_issue import (
     RULE_CATEGORIES as _LINKED_ISSUE_RULE_CATEGORIES,
 )
 from personas.code_reviewer.linked_issue import (
-    build_linked_issue_context, rendered_criteria,
+    build_linked_issue_context, rendered_criteria, rendered_criteria_with_state,
 )
 from personas.tpm.ticket_compliance import closes_refs
 from personas.code_reviewer.repo_docs import build_repo_docs_context
@@ -112,7 +112,9 @@ from personas.code_reviewer.judge import (
     eval_tags, grade_findings, partition_findings, partition_refuted,
     refute_findings, submit_evals,
 )
-from personas.code_reviewer.intent_filter import filter_intent_mismatch_findings
+from personas.code_reviewer.intent_filter import (
+    filter_intent_mismatch_findings, scope_intent_mismatch_to_claimed_boxes,
+)
 from personas.code_reviewer.persona import (
     CodeReviewEvaluation, Finding, evaluate_diff, with_degradation,
     with_extra_findings, with_findings,
@@ -2703,12 +2705,23 @@ def _merge_criteria_coverage(
 
 def _filter_intent_mismatches(
     evaluation: CodeReviewEvaluation, *, installation_id: int,
-    owner: str, repo_name: str, pull_number: int,
+    owner: str, repo_name: str, pull_number: int, pr_context: PrContext,
 ) -> CodeReviewEvaluation:
-    """Apply the deterministic intent-mismatch evidence filter (#1170)."""
+    """Apply the deterministic intent-mismatch evidence filter (#1170), then
+    scope what is left to the boxes a Refs-only PR claims (#1218)."""
     kept, dropped, lowered = filter_intent_mismatch_findings(evaluation.findings)
-    if dropped or lowered:
+    body = str(pr_context.get("body") or "")
+    kept, scope_dropped, scope_lowered = scope_intent_mismatch_to_claimed_boxes(
+        kept,
+        boxes=rendered_criteria_with_state(
+            str(pr_context.get("linked_issue_context") or ""),
+        ),
+        closed_issues=closes_refs(body),
+        pr_body=body,
+    )
+    if kept != evaluation.findings:
         evaluation = with_findings(evaluation, kept)
+    if dropped or lowered or scope_dropped or scope_lowered:
         log.info(
             "code_review_intent_filter",
             extra={
@@ -2716,6 +2729,8 @@ def _filter_intent_mismatches(
                 "pr": f"{owner}/{repo_name}#{pull_number}",
                 "dropped": dropped,
                 "lowered": lowered,
+                "scope_dropped": scope_dropped,
+                "scope_lowered": scope_lowered,
             },
         )
     return evaluation
@@ -3224,6 +3239,7 @@ def dispatch_code_review(
         owner=owner,
         repo_name=repo_name,
         pull_number=pull_number,
+        pr_context=pr_context,
     )
 
     # NOTE (#466, ADR-0012): the deterministic security suite (SAST + SCA +
@@ -4020,6 +4036,12 @@ def _grade_deep_response(
     pull_number: int,
 ) -> tuple[CodeReviewEvaluation, tuple[Finding, ...], tuple[Any, ...], int]:
     deep_eval = evaluate_diff(hunks, deep_llm)
+    # The reasoner reads the same linked criteria, so its intent-mismatch
+    # findings get the same evidence filter and box scope (#1170, #1218).
+    deep_eval = _filter_intent_mismatches(
+        deep_eval, installation_id=installation_id, owner=owner,
+        repo_name=repo_name, pull_number=pull_number, pr_context=pr_context,
+    )
     deep_graded = deep_eval.findings
     deep_verdicts = grade_findings(
         deep_eval,
