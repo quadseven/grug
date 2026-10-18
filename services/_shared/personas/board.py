@@ -41,6 +41,16 @@ import re
 
 BOARD_MARKER = "<!-- grug-board -->"
 
+
+def branded_review_output(content: str, pr_url: str) -> str:
+    """Compact GitHub markdown shared by review comments and check runs."""
+    return (
+        '<img src="https://grug.lol/assets/grug.png" width="40" alt="Grug" />\n\n'
+        f"{content.strip()}\n\n"
+        "[![Read the Markings](https://grug.lol/assets/grug_review_cta.png)]"
+        f"({pr_url})"
+    )
+
 # Fixed render order. A persona missing from a given pass simply has no
 # region; it does not shift the others.
 SECTION_ORDER: tuple[str, ...] = (

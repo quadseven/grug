@@ -174,6 +174,11 @@ def _repo(owner: str, repo: str) -> str:
     return f"{quote(owner, safe='')}/{quote(repo, safe='')}"
 
 
+def _branded_header(header: str, owner: str, repo: str, pr_number: int) -> str:
+    pr_url = f"https://github.com/{_repo(owner, repo)}/pull/{pr_number}"
+    return board.branded_review_output(header, pr_url)
+
+
 def find_board(
     token: str, owner: str, repo: str, pr_number: int, *, app_id: str | None = None,
 ) -> tuple[int, str] | None:
@@ -254,7 +259,10 @@ def upsert_board_section(
         # creator without one gets its create-only line, then a placeholder.
         body = board.set_header(
             board.new_board(),
-            next((h for h in (header, header_on_create) if h), "### Grug look."),
+            _branded_header(
+                next((h for h in (header, header_on_create) if h), "### Grug look."),
+                owner, repo, pr_number,
+            ),
         )
         body = board.upsert_section(body, key, section)
         try:
@@ -276,14 +284,20 @@ def upsert_board_section(
     if not board.is_board(existing):
         legacy = existing
         existing = board.set_header(
-            board.new_board(), header if header is not None else "### Grug look.",
+            board.new_board(),
+            _branded_header(
+                header if header is not None else "### Grug look.",
+                owner, repo, pr_number,
+            ),
         )
         if key != "elder":
             existing = board.upsert_section(existing, "elder", legacy)
 
     merged = board.upsert_section(existing, key, section)
     if header is not None:
-        merged = board.set_header(merged, header)
+        merged = board.set_header(
+            merged, _branded_header(header, owner, repo, pr_number),
+        )
 
     httpx.patch(
         f"{base}/issues/comments/{comment_id}",

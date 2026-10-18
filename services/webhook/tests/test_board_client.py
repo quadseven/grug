@@ -73,6 +73,32 @@ def test_absent_board_is_created_with_a_header(monkeypatch):
     assert "Grug look hard." in body
 
 
+def test_created_board_has_branded_header_and_button_link(monkeypatch):
+    writes = _wire(monkeypatch, [])
+    bc.upsert_board_section("tok", "o", "r", 5, key="chief", section="C",
+                            header_on_create="### Grug say WAIT.")
+
+    body = writes[0][2]
+    header = board.extract_header(body)
+    assert header is not None
+    assert '<img src="https://grug.lol/assets/grug.png" width="40" alt="Grug" />' in header
+    assert '[![Read the Markings](https://grug.lol/assets/grug_review_cta.png)](https://github.com/o/r/pull/5)' in header
+    assert "Grug say WAIT." in header
+
+
+def test_refreshed_board_keeps_one_header_and_button(monkeypatch):
+    existing = board.set_header(board.new_board(), "### old")
+    writes = _wire(monkeypatch, [{"id": 7, "body": existing}])
+    bc.upsert_board_section("tok", "o", "r", 5, key="elder", section="E",
+                            header="### new verdict")
+
+    header = board.extract_header(writes[0][2])
+    assert header is not None
+    assert header.count("grug_review_cta.png") == 1
+    assert header.count('alt="Grug"') == 1
+    assert "new verdict" in header and "old" not in header
+
+
 def test_legacy_elder_comment_is_converted_not_duplicated(monkeypatch):
     """A pre-board Elder comment must be rewritten IN PLACE. Posting a board
     beside it is the duplicate comment - and duplicate email - the board

@@ -71,6 +71,7 @@ def test_advisory_lists_unaddressed_with_marker():
     assert "grug-chief:ticket-compliance" in md
     assert "#42" in md and "thing one" in md and "thing two" in md
     assert "Advisory only" in md
+    assert "- [ ] thing one\n- [ ] thing two" in md
 
 
 def test_multi_criteria_mixed():

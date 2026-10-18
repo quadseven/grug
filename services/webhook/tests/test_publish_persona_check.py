@@ -87,7 +87,9 @@ def test_publish_success_records_honest_verdict_and_matching_external_id(monkeyp
     assert posted["result"].name == "Grug - Guard"
     assert posted["result"].conclusion == "neutral"
     assert posted["result"].title == "t"
-    assert posted["result"].summary == "s"
+    assert '<img src="https://grug.lol/assets/grug.png" width="40" alt="Grug" />' in posted["result"].summary
+    assert "s" in posted["result"].summary
+    assert '[![Read the Markings](https://grug.lol/assets/grug_review_cta.png)](https://github.com/o/r/pull/7)' in posted["result"].summary
     assert posted["result"].head_sha == "abc123"
     assert posted["result"].status == "completed"
     assert recorded["persona_key"] == "guard"

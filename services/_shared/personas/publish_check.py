@@ -18,10 +18,12 @@ import logging
 import math
 import os
 import time
+from urllib.parse import quote
 
 import httpx
 
 from activity_log import record_check_verdict
+from personas import board
 from github_app_auth import with_install_token_retry
 from github_checks_client import (
     CheckConclusion,
@@ -205,6 +207,10 @@ def publish_persona_check(
 
     full_repo = f"{owner}/{repo}"
     pr_ref = f"{full_repo}#{pr_number}"
+    pr_url = (
+        f"https://github.com/{quote(owner, safe='')}/"
+        f"{quote(repo, safe='')}/pull/{pr_number}"
+    )
 
     check_result = CheckRunResult(
         name=check_name,
@@ -212,7 +218,7 @@ def publish_persona_check(
         status="completed",
         conclusion=conclusion,
         title=title,
-        summary=summary,
+        summary=board.branded_review_output(summary, pr_url),
     )
     external_id = f"grug-{persona_prefix}:{full_repo}#{pr_number}:{head_sha}"
 

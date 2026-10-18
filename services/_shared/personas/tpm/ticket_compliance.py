@@ -184,7 +184,7 @@ def advisory_markdown(issue_number: int, unaddressed: list[str]) -> str | None:
     comment instead of duplicating."""
     if not unaddressed:
         return None
-    lines = "\n".join(f"- {c}" for c in unaddressed)
+    lines = "\n".join(f"- [ ] {c}" for c in unaddressed)
     return (
         f"{_MARKER}\n"
         f"{CHIEF_PORTRAIT_IMG}\n\n"
