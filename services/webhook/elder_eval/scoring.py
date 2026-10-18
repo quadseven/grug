@@ -146,6 +146,28 @@ def _bucket_case(
     return replay
 
 
+def _note_caveats(
+    case_id: str,
+    replay: CaseReplay,
+    *,
+    truncated: list[str],
+    anchored: list[str],
+    staged: list[str],
+    output_truncated: list[str],
+) -> None:
+    """Append a scored replay's case id to each caveat bucket it belongs to
+    (split out of `score()` to keep its branching under the complexity cap;
+    the buckets are independent flags with no shared state)."""
+    for flag, bucket in (
+        (replay.truncated, truncated),
+        (replay.anchored, anchored),
+        (replay.staged, staged),
+        (replay.output_truncated, output_truncated),
+    ):
+        if flag:
+            bucket.append(case_id)
+
+
 def score(
     cases: Sequence[EvalCase], replays: Mapping[str, CaseReplay]
 ) -> EvalReport:
@@ -178,14 +200,11 @@ def score(
         replay = _bucket_case(case, replays, unresolvable=unresolvable, errored=errored)
         if replay is None:
             continue
-        if replay.truncated:
-            truncated.append(case.case_id)
-        if replay.anchored:
-            anchored.append(case.case_id)
-        if replay.staged:
-            staged.append(case.case_id)
-        if replay.output_truncated:
-            output_truncated.append(case.case_id)
+        _note_caveats(
+            case.case_id, replay,
+            truncated=truncated, anchored=anchored, staged=staged,
+            output_truncated=output_truncated,
+        )
         for backend_name in replay.backends:
             attribution[backend_name] += 1
         scored += 1

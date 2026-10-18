@@ -5174,6 +5174,12 @@ def _truncation_error(backends: Sequence["Backend"]) -> str:
     )
 
 
+def _attempt_truncation_error(attempt: "AttemptOutcome") -> str:
+    """`_truncation_error` for one completed attempt (empty unless it was
+    cut off), kept out of the dispatch function's branch count."""
+    return _truncation_error((attempt.backend,) if attempt.truncated else ())
+
+
 def _dual_arm_partial_error(
     expected: Sequence["Backend"],
     successes: Sequence["_SuccessfulReview"],
@@ -6427,7 +6433,7 @@ def _review_diff_dispatch_cave_primary(
                     models_used=(resolved_model,),
                     # grug#1231: a cut-off answer is partial on this last-
                     # resort path too, never a clean complete review.
-                    error=_truncation_error((backend,) if attempt.truncated else ()),
+                    error=_attempt_truncation_error(attempt),
                 )
             if resp.status_code == 200:
                 log.warning(
