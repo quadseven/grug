@@ -1617,6 +1617,17 @@ _CAVE_REVIEW_REASONER_DEFAULT_MODEL = "poolside/Laguna-S-2.1-NVFP4"
 # runaway list ends as valid JSON well inside the coder arm's token budget.
 CAVE_MAX_FINDINGS = 50
 
+# Message length cap (#553 audit): the check-run findings table repeats
+# every message and GitHub 422s past 65536 chars - an uncapped verbose
+# model could vanish the whole check-run. `_coerce_finding` truncates past
+# it, visibly, never silently. grug#989: the Cave schema also carries it as
+# `maxLength`, because the bound on the list alone did not end the runaway:
+# on the next record run one cohort's FIRST finding never closed, its
+# message ran to about 144k characters at the 32768-token cap, and with no
+# complete item there was nothing to recover. The coercer would have kept
+# only 1500 of those characters anyway, so the schema loses nothing.
+MAX_FINDING_MESSAGE_CHARS = 1500
+
 _CAVE_FINDINGS_RESPONSE_FORMAT = {
     "type": "json_schema",
     "json_schema": {
@@ -1637,7 +1648,10 @@ _CAVE_FINDINGS_RESPONSE_FORMAT = {
                                 "type": "string",
                                 "enum": ["low", "medium", "high", "critical"],
                             },
-                            "message": {"type": "string"},
+                            "message": {
+                                "type": "string",
+                                "maxLength": MAX_FINDING_MESSAGE_CHARS,
+                            },
                         },
                         "required": ["path", "line", "rule", "severity", "message"],
                     },
@@ -2722,10 +2736,8 @@ def _post_with_retries_cancellable(
     return payload
 
 
-# Message length cap (#553 audit): the check-run findings table repeats
-# every message and GitHub 422s past 65536 chars - an uncapped verbose
-# model could vanish the whole check-run. Visible truncation, never silent.
-_MAX_FINDING_MESSAGE_CHARS = 1500
+# Defined with the Cave schema above, which enforces it too (grug#989).
+_MAX_FINDING_MESSAGE_CHARS = MAX_FINDING_MESSAGE_CHARS
 _MAX_SUGGESTION_CHARS = 2000
 
 

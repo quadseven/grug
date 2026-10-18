@@ -325,6 +325,35 @@ def test_cave_findings_are_bounded_like_production(monkeypatch):
     assert 36 < llm_client.CAVE_MAX_FINDINGS <= llm_client.JUDGE_MAX_FINDINGS
 
 
+def test_cave_finding_messages_are_bounded_like_production(monkeypatch):
+    """grug#989: with the list bounded, the next record run still lost a
+    case: one cohort's FIRST finding never closed, its message ran to about
+    144k characters at the 32768-token cap, so no complete item was left to
+    recover. `maxLength` on the message is the bound guided decoding
+    enforces inside one finding. It equals the cap `_coerce_finding` already
+    truncates at, so the schema drops nothing a parsed review would keep,
+    and the bench carries the same bound as production."""
+    import llm_client
+    from sast_benchmark import backends
+
+    monkeypatch.setenv("GRUG_BENCH_CAVE_URL", "http://cave.example/v1/chat/completions")
+    monkeypatch.setenv("GRUG_BENCH_CAVE_MODEL", "qwen-coder")
+    configured = {b.name: b for b in backends.configured_backends()}
+    bench = configured["cave"].extra_body["response_format"]["json_schema"]["schema"]
+    prod = llm_client._CAVE_FINDINGS_RESPONSE_FORMAT["json_schema"]["schema"]
+
+    for schema in (bench, prod):
+        message = schema["properties"]["findings"]["items"]["properties"]["message"]
+        assert message["maxLength"] == llm_client.MAX_FINDING_MESSAGE_CHARS
+    assert llm_client.MAX_FINDING_MESSAGE_CHARS == llm_client._MAX_FINDING_MESSAGE_CHARS
+    # A bounded list of bounded messages fits the bench's 32768-token cap
+    # (about 4 characters a token), so a runaway now ends as valid JSON.
+    worst_case_chars = llm_client.CAVE_MAX_FINDINGS * (
+        llm_client.MAX_FINDING_MESSAGE_CHARS + 200
+    )
+    assert worst_case_chars < 32_768 * 4
+
+
 def test_cave_and_poolside_disable_thinking_openrouter_untouched(monkeypatch):
     """#894: production sends chat_template_kwargs.enable_thinking=False at
     three llm_client.py call sites; the Cave bench backend didn't, so a
