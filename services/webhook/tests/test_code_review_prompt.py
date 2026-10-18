@@ -338,3 +338,17 @@ def test_intent_mismatch_rule_requires_both_quotes():
     assert rule is not None, "intent-mismatch missing from RULES"
     assert "removes or prevents" in rule.description
     assert "quote the criterion" in rule.description
+
+
+def test_intent_mismatch_rule_contract():
+    """#1174: pin the intent-mismatch contract the generic suite does not:
+    a correctness-class rule at high default severity whose description
+    renders verbatim into BOTH prompt variants."""
+    rule = next((r for r in crp.RULES if r.name == "intent-mismatch"), None)
+    assert rule is not None, "intent-mismatch missing from RULES"
+    assert rule.severity == "high"
+    assert rule.bug_class == "correctness"
+    for variant in ("v1", "v2"):
+        prompt = crp.build_system_prompt(variant)
+        assert "intent-mismatch" in prompt
+        assert rule.description in prompt, f"variant {variant} lost the rule text"

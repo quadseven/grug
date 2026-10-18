@@ -2236,6 +2236,66 @@ def _linked_issue_summary_note(linked_context: str) -> str:
     )
 
 
+CORRECTNESS_ONLY_SCOPE = "correctness findings only (documentation/tests change)"
+
+# Rules a docs/tests-only review drops: shape and style findings, not
+# correctness (#1172).
+_NON_CORRECTNESS_RULES = frozenset({
+    "dead-code", "complexity-hotspot", "high-complexity", "type-safety-gap",
+})
+
+
+def _pr_labels(pr: dict[str, Any]) -> frozenset[str]:
+    """The PR's label names, trimmed and lowercased; non-dict entries skipped."""
+    return frozenset(
+        str(label.get("name") or "").strip().lower()
+        for label in (pr.get("labels") or [])
+        if isinstance(label, dict)
+    )
+
+
+def _is_documentation_path(path: str) -> bool:
+    path = path.lower()
+    return path.endswith((".md", ".txt")) or path.startswith("docs/") or "/docs/" in path
+
+
+def _is_test_path(path: str) -> bool:
+    path = path.lower()
+    name = path.split("/")[-1]
+    return (
+        "/tests/" in f"/{path}/"
+        or path.startswith(("tests/", "test/"))
+        or name.startswith("test_")
+        or name.endswith("_test.py")
+    )
+
+
+def _correctness_only_scope(paths: tuple[str, ...], labels: frozenset[str]) -> str:
+    """The review scope note for a docs/tests change, or "" for a full review.
+
+    A diff touching only documentation and tests, or a PR labelled
+    class:docs / class:tests, gets correctness findings only (#1172)."""
+    docs_or_tests_only = bool(paths) and all(
+        _is_documentation_path(path) or _is_test_path(path) for path in paths
+    )
+    if docs_or_tests_only or "class:docs" in labels or "class:tests" in labels:
+        return CORRECTNESS_ONLY_SCOPE
+    return ""
+
+
+def _drop_non_correctness_findings(
+    evaluation: CodeReviewEvaluation,
+) -> CodeReviewEvaluation:
+    """Keep only correctness findings for a correctness-only review."""
+    return with_findings(
+        evaluation,
+        tuple(
+            finding for finding in evaluation.findings
+            if finding.rule_name not in _NON_CORRECTNESS_RULES
+        ),
+    )
+
+
 def _merge_criteria_coverage(
     evaluation: CodeReviewEvaluation, hunks: tuple[DiffHunk, ...],
     file_contents: dict[str, str], pr_context: PrContext, *,
@@ -2368,11 +2428,7 @@ def dispatch_code_review(
         "title": str(pr.get("title") or ""),
         "body": str(pr.get("body") or ""),
     }
-    labels = {
-        str(label.get("name") or "").strip().lower()
-        for label in (pr.get("labels") or [])
-        if isinstance(label, dict)
-    }
+    labels = _pr_labels(pr)
     pr_context["sensitive_review"] = "class:sensitive" in labels
 
     # Living Hunt (#557): if we already finished a review on an older head
@@ -2488,26 +2544,11 @@ def dispatch_code_review(
         # Criteria coverage (#1179) judges the WHOLE diff; any hunk dropped
         # below (excluded, ignored, oversized, duplicate) voids that.
         parsed_hunk_count = len(hunks)
-        paths = tuple(hunk.file_path for hunk in hunks)
-        def is_documentation(path: str) -> bool:
-            path = path.lower()
-            return path.endswith((".md", ".txt")) or path.startswith("docs/") or "/docs/" in path
-
-        def is_test(path: str) -> bool:
-            path = path.lower()
-            return (
-                "/tests/" in f"/{path}/"
-                or path.startswith(("tests/", "test/"))
-                or path.split("/")[-1].startswith("test_")
-                or path.split("/")[-1].endswith("_test.py")
-            )
-
-        docs_or_tests_only = bool(paths) and all(
-            is_documentation(path) or is_test(path)
-            for path in paths
+        review_scope = _correctness_only_scope(
+            tuple(hunk.file_path for hunk in hunks), labels,
         )
-        if docs_or_tests_only or "class:docs" in labels or "class:tests" in labels:
-            pr_context["review_scope"] = "correctness findings only (documentation/tests change)"
+        if review_scope:
+            pr_context["review_scope"] = review_scope
         # #609: drop data/generated/vendored files from the LLM's plate - a
         # big JSONL/lockfile hunk balloons the prompt into parse_failed and
         # carries no review signal. Named in the summary, never silent.
@@ -2803,16 +2844,7 @@ def dispatch_code_review(
     evaluation = evaluate_diff(hunks, llm_response)
     correctness_only = bool(pr_context.get("review_scope"))
     if correctness_only:
-        evaluation = with_findings(
-            evaluation,
-            tuple(
-                finding for finding in evaluation.findings
-                if finding.rule_name not in {
-                    "dead-code", "complexity-hotspot", "high-complexity",
-                    "type-safety-gap",
-                }
-            ),
-        )
+        evaluation = _drop_non_correctness_findings(evaluation)
     evaluation, defensive_dropped_count = _drop_unreachable_defensive_findings(
         evaluation,
     )
