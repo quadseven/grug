@@ -156,7 +156,7 @@ _HEADER = (
 
 _OMITTED = "\n... (further criteria omitted)"
 _RENDERED_CRITERION_RE = re.compile(
-    r"^#(\d+) criterion (\d+) \[(?:open|ticked)\]: (.*)$", re.MULTILINE,
+    r"^#(\d+) criterion (\d+) \[(open|ticked)\]: (.*)$", re.MULTILINE,
 )
 
 
@@ -268,6 +268,15 @@ def rendered_criteria(block: str) -> list[tuple[int, int, str]]:
     """(issue, criterion number, text) for each criterion line in a block
     `render_linked_issue_block` produced. The text is already cleaned."""
     return [
-        (int(m.group(1)), int(m.group(2)), m.group(3))
+        (issue, number, text)
+        for issue, number, _state, text in rendered_criteria_with_state(block)
+    ]
+
+
+def rendered_criteria_with_state(block: str) -> list[tuple[int, int, str, str]]:
+    """(issue, criterion number, "open" | "ticked", text) for each criterion
+    line in a block `render_linked_issue_block` produced (#1218)."""
+    return [
+        (int(m.group(1)), int(m.group(2)), m.group(3), m.group(4))
         for m in _RENDERED_CRITERION_RE.finditer(block or "")
     ]
