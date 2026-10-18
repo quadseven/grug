@@ -32,11 +32,11 @@ What this asserts (NECESSARY conditions, deliberately not sufficient):
      display names: tpm->chief, code_reviewer->elder, walkthrough->teller).
 
 Intentionally NOT asserted: that the dashboard's BLOCK/WARN/OFF controls
-actually persist to the backend. They currently do NOT (they are
-localStorage-only; only tpm_enabled/guard_enabled are wired to the API).
-That is a real, separate gap tracked on its own - pinning it here would
-either fail permanently or bless the current behavior. This attester
-covers PRESENCE, not persistence.
+actually persist to the backend. Since grug#1206 they write the selected
+repo's config through the API, and the web test suite
+(web/src/routes/Dashboard.test.tsx) pins that against a mocked API; the
+flag-to-control mapping is checked by scripts/attest_persona_surface_coherence.py.
+This attester covers PRESENCE, not persistence.
 """
 from __future__ import annotations
 

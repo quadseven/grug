@@ -48,6 +48,7 @@ REQUIRED_PLACEHOLDERS = [
     "__DD_RUM_ENV__",
     "__DD_RUM_VERSION__",
 ]
+SWITCH_PLACEHOLDER = "__GRUG_DATADOG_ENABLED__"
 STATIC_HTMLS = ("index.html", "Privacy.html", "Terms.html")
 
 
@@ -96,6 +97,11 @@ def _attest_spa_chain(failures: list[str]) -> None:
         )
 
     # rum.ts calls datadogRum.init({...})
+    if "import.meta.env.VITE_GRUG_DATADOG_ENABLED" not in rum_src:
+        failures.append(
+            "web/src/rum.ts: initRum() is not gated on VITE_GRUG_DATADOG_ENABLED (#1208)"
+        )
+
     if not re.search(r"datadogRum\.init\s*\(", rum_src):
         failures.append("web/src/rum.ts: no `datadogRum.init(...)` call found")
 
@@ -140,6 +146,14 @@ def _attest_static_snippets(failures: list[str]) -> None:
         if not re.search(rf"""service:\s*['"]{re.escape(CANONICAL_SERVICE)}['"]""", body):
             failures.append(
                 f"web/public/{name}: missing `service: '{CANONICAL_SERVICE}'` in CDN snippet"
+            )
+
+        # grug#1208: the snippet must sit behind the GRUG_DATADOG_ENABLED
+        # gate so a page never fetches the CDN script while Datadog is off.
+        if f"if ('{SWITCH_PLACEHOLDER}' !== 'true') return;" not in body:
+            failures.append(
+                f"web/public/{name}: RUM snippet is not gated on "
+                f"`{SWITCH_PLACEHOLDER}` (#1208) - it would load with Datadog off"
             )
 
         # All four placeholders must be present so the build-time sed

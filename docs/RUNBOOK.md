@@ -80,10 +80,9 @@ GH App -> Generate new client secret -> `aws ssm put-parameter --overwrite --nam
 Shared cross-project SecureStrings. Update in SSM -> re-seed + roll.
 
 ### Datadog / Discord notify
-DD keys live at `/infra/datadog/{api,app}_key`; the monitor notify channel is a
-Datadog Webhook integration sourced from `/infra/discord/monitoring-alerts`
-(set in `infra/pulumi/__main__.py`). Rotating these is an `iac.deploy.yml`
-concern, not a pod re-seed.
+Retired: the Pulumi program no longer reads the Datadog keys or builds the
+Datadog Webhook integration that `/infra/discord/monitoring-alerts` fed
+(#1223). Nothing in `iac.deploy.yml` rotates them any more.
 
 ### AWS pod credentials
 RETIRED as a stored secret (#389): no static AWS key exists anywhere.
@@ -157,7 +156,8 @@ mitigation for this exact failure class, not a fix for the block itself.
 `[grug] Check-run publish failing - PRs are MERGE-BLOCKED (15min)` pages when
 more than 2 check-run publishes fail in 15 minutes, from any persona. The
 log events counted are listed in `CHECK_RUN_PUBLISH_FAILED_EVENTS`
-(`infra/pulumi/components/dd_monitors.py`): `tpm_publish_failed` (Chief),
+(`infra/pulumi/components/dd_monitors.py`, removed in #1223 with the other
+Datadog monitors): `tpm_publish_failed` (Chief),
 `guard_check_run_publish_failed`, `code_review_check_run_publish_failed`
 (Elder) and their degraded and sibling variants.
 
@@ -898,6 +898,28 @@ or invalid key still pages.
 | 401 / 403 | API key wrong or revoked | Rotate the key in SSM, redeploy |
 | 402 | Unpaid / out of credits | Top up the account |
 | 404 | Endpoint or model name gone | Check the vendor changed neither |
+
+### Switching a backend off, and the provider breaker
+
+When a provider will stay dead for a while (an allowance or credit nobody
+will refill), switch it off instead of letting every review walk it. The
+manifests' `GRUG_DISABLED_BACKENDS` lists the backends grug never calls, as
+comma-separated names (`opencode-go`, `openrouter`, `poolside`), each
+optionally narrowed to one pool (`openrouter:free`, `openrouter:paid`). The
+review chain, the overload fallback, the judge and Teller / ask / learn all
+skip a listed backend. To re-enable one, delete its entry from that line and
+let the deploy roll it out. Since 2026-10-17 the deployed value is
+`opencode-go,openrouter` (grug#1225). An entry that names no known backend or
+pool logs `grug_disabled_backends_unknown_entry` and disables nothing.
+
+Without the switch, the provider breaker limits the waste. A 401, a 402, or a
+refusal whose body says a limit is spent (`total limit`, credits,
+`free-models-per-day`, a monthly usage limit) stops calls to that provider in
+that pod for its Retry-After, else an hour, and logs
+`llm_provider_circuit_open`. A 401 covers the whole key; the others only the
+free or paid pool that answered. A 429 trips it only when its body names a
+daily or monthly allowance; a plain 429 (including Poolside's short-lived
+`usage limit exceeded`) or a 5xx never does.
 
 ### Why it matters even though reviews still work
 

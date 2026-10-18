@@ -92,6 +92,18 @@ def mock_transport_client() -> Iterator[Callable[..., httpx.Client]]:
 
 
 @pytest.fixture(autouse=True)
+def _reset_llm_provider_switches(monkeypatch: pytest.MonkeyPatch) -> None:
+    """grug#1225: the LLM provider breaker is module state, and a shell's
+    GRUG_DISABLED_BACKENDS must not reach a test. Without the reset, one test
+    whose fake backend answers 401 would block that provider for every later
+    test in the session."""
+    monkeypatch.delenv("GRUG_DISABLED_BACKENDS", raising=False)
+    lc = sys.modules.get("llm_client")
+    if lc is not None:
+        monkeypatch.setattr(lc, "_provider_blocked_until", {}, raising=False)
+
+
+@pytest.fixture(autouse=True)
 def _mock_pr_enforcement_ensure(monkeypatch):
     """Neutralize the PR-path enforcement ensure by default.
 

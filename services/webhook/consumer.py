@@ -513,8 +513,13 @@ def _emit_queue_depth_once() -> int:
     sustained nor an INTERMITTENT partial failure can silently re-blind
     that queue's depth monitor (audit stage-2 HIGH + codex peer review,
     PR #516)."""
+    from datadog_switch import datadog_enabled
     from observability import emit_gauge  # late: patchable, and webhook-image only
 
+    if not datadog_enabled():
+        # #1208: the sweep exists only to feed Datadog gauges. Off = no SQS
+        # probes and no log line, rather than 12 probes a minute into a no-op.
+        return 0
     if not os.getenv("DD_AGENT_HOST", ""):
         # Sweep-level guard: without an agent host every emit would
         # skip-warn individually (12 lines/min forever); one line per
@@ -755,31 +760,42 @@ def _announce_terminal_failure(spec: QueueSpec, message: dict, error: Exception)
     Elder that reviewed and found nothing are the same pixel, so #2511 merged
     with no verdict on the commit that landed and nothing surfaced it.
 
-    Deliberately NOT a new merge gate. `_complete_elder_check_open` completes
-    fail-open as `neutral` on purpose, so a GitHub brownout does not start
-    blocking every merge; the title carries the honesty. Changing that is an
-    operator policy decision, not a logging fix."""
+    No review landed, so this is a degraded exit like any other (grug#1212,
+    ADR-0023): `failure` when the repo's Elder is blocking - a `neutral`
+    required check would pass the merge with no verdict behind it - and
+    `neutral` in WARN mode. A mode that cannot be read (the same outage
+    that dead-lettered the job) fails closed."""
     try:
         body = json.loads(message.get("Body", "") or "{}")
         if body.get("kind") != "review" or body.get("persona") != "elder":
             return
         owner, _, repo_name = str(body.get("repo", "")).partition("/")
-        from rerun import _complete_elder_check_open  # local: avoids import cycle
+        # local: avoids import cycle
+        from rerun import _complete_elder_check_open, elder_blocking_for
+        from personas.code_reviewer.degraded_gate import (
+            degraded_conclusion,
+            lead_with_degraded_line,
+        )
 
+        install_id = int(body.get("install_id", 0))
+        pr_number = int(body.get("pr_number", 0))
+        blocking = elder_blocking_for(install_id, owner, repo_name, pr_number)
         _complete_elder_check_open(
-            install_id=int(body.get("install_id", 0)),
+            install_id=install_id,
             owner=owner,
             repo_name=repo_name,
-            pr_number=int(body.get("pr_number", 0)),
+            pr_number=pr_number,
             head_sha=str(body.get("requested_head_sha", "")),
             title="Elder could not review this diff",
-            summary=(
+            summary=lead_with_degraded_line(
                 "Grug tried and failed. The review job exhausted its retries "
                 f"and was dead-lettered, so **no Elder verdict exists for this "
                 f"commit** - this check is not a pass.\n\n"
                 f"Last error: `{type(error).__name__}: {str(error)[:200]}`\n\n"
-                "Re-run Elder once the underlying cause is cleared."
+                "Re-run Elder once the underlying cause is cleared.",
+                "retries_exhausted",
             ),
+            conclusion=degraded_conclusion(blocking),
         )
     except Exception as e:  # noqa: BLE001 - a failed announcement must not mask the original
         log.warning(
@@ -834,6 +850,10 @@ def _warm_trace_writer() -> None:
     expected -> debug; ddtrace present but warmup raised (typically the
     writer-service start failure) -> warning (visible at the default level), so
     a regression to zero-spans is not itself silent."""
+    from datadog_switch import datadog_enabled
+
+    if not datadog_enabled():
+        return  # #1208: no tracer to warm while Datadog is switched off
     try:
         import ddtrace
     except ImportError:
@@ -898,6 +918,10 @@ def _flush_tracer() -> None:
     runners - it passed locally and flaked red on CI, which is what this seam
     retires. grug-local: this is a webhook-service test seam, NOT a reusable /
     CI-workflow concern."""
+    from datadog_switch import datadog_enabled
+
+    if not datadog_enabled():
+        return  # #1208: a flush with no agent blocks ~2s per watchdog tick
     try:
         import ddtrace
     except ImportError:

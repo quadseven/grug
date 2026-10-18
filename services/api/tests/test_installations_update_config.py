@@ -302,3 +302,106 @@ def test_sparse_update_does_not_resurrect_a_paused_repo():
     assert mock_set.call_args.kwargs["sentinel_enabled"] is True
     # The paused repo must NOT have been re-enforced.
     mock_toggle.assert_not_called()
+
+
+# grug#1202: a persona mode flip reconciles the ruleset without a Fix click.
+
+def _put_config(payload, *, previous_cfg, updated_fields):
+    """Drive update_repo_config for repo 42 with the given stored config
+    before the write and the fields set_repo_config reports as updated.
+    Returns (toggle mock, reconcile mock)."""
+    install = {"installed_by_user_id": "100"}
+
+    def _retry(install_id, fn):
+        return fn("tok")
+
+    fake_resp = _ok_resp({"repositories": [{"id": 42, "full_name": "myorg/myrepo"}]})
+    with patch("installations.get_installation", return_value=install), \
+         patch("installations.with_install_token_retry", side_effect=_retry), \
+         patch("httpx.Client") as client_cls, \
+         patch("installations.get_repo_config", return_value=previous_cfg), \
+         patch("installations.set_repo_config", return_value=updated_fields), \
+         patch("installations._toggle_enforcement") as mock_toggle, \
+         patch("installations._reconcile_required_checks") as mock_reconcile:
+        client_cls.return_value.__enter__.return_value.get.return_value = fake_resp
+        inst.update_repo_config(
+            install_id=1, repo_id=42, body=payload, user=_user(user_id="100"),
+        )
+    return mock_toggle, mock_reconcile
+
+
+@pytest.mark.parametrize(
+    ("previous", "body"),
+    [
+        # WARN -> BLOCK
+        ({"code_reviewer_enabled": True, "code_reviewer_blocking": False},
+         {"code_reviewer_blocking": True}),
+        # BLOCK -> WARN
+        ({"code_reviewer_enabled": True, "code_reviewer_blocking": True},
+         {"code_reviewer_blocking": False}),
+        # BLOCK -> OFF
+        ({"code_reviewer_enabled": True, "code_reviewer_blocking": True},
+         {"code_reviewer_enabled": False}),
+        # OFF -> BLOCK (blocking flag already stored True)
+        ({"code_reviewer_enabled": False, "code_reviewer_blocking": True},
+         {"code_reviewer_enabled": True}),
+    ],
+    ids=["warn-to-block", "block-to-warn", "block-to-off", "off-to-block"],
+)
+def test_elder_mode_flip_reconciles_the_ruleset(previous, body):
+    previous_cfg = {"tpm_enabled": True, **previous}
+    mock_toggle, mock_reconcile = _put_config(
+        inst.RepoConfigPayload(**body),
+        previous_cfg=previous_cfg, updated_fields=dict(body),
+    )
+    mock_toggle.assert_not_called()
+    mock_reconcile.assert_called_once_with(1, 42, "myorg/myrepo", "main")
+
+
+@pytest.mark.parametrize(
+    "body",
+    [
+        {"code_reviewer_blocking": True},  # already BLOCK: no change
+        {"guard_blocking": True},  # Guard may not be required
+        {"sentinel_enabled": False},  # unrelated flag
+    ],
+    ids=["no-op-elder", "guard", "unrelated"],
+)
+def test_save_that_does_not_change_required_checks_skips_github(body):
+    previous_cfg = {
+        "tpm_enabled": True,
+        "code_reviewer_enabled": True, "code_reviewer_blocking": True,
+        "guard_enabled": True, "guard_blocking": False,
+    }
+    _, mock_reconcile = _put_config(
+        inst.RepoConfigPayload(**body),
+        previous_cfg=previous_cfg, updated_fields=dict(body),
+    )
+    mock_reconcile.assert_not_called()
+
+
+def test_mode_flip_on_a_paused_repo_does_not_reconcile():
+    """tpm_enabled=False means there is no Grug ruleset to edit."""
+    previous_cfg = {
+        "tpm_enabled": False,
+        "code_reviewer_enabled": True, "code_reviewer_blocking": False,
+    }
+    mock_toggle, mock_reconcile = _put_config(
+        inst.RepoConfigPayload(code_reviewer_blocking=True),
+        previous_cfg=previous_cfg,
+        updated_fields={"code_reviewer_blocking": True},
+    )
+    mock_toggle.assert_not_called()
+    mock_reconcile.assert_not_called()
+
+
+def test_reconcile_helper_is_best_effort(caplog):
+    """A GitHub failure while reconciling must not fail the settings save:
+    the flag is already stored, and the next Fix / install event reconciles
+    again. It is logged, never swallowed silently."""
+    with patch("installations.with_install_token_retry",
+               side_effect=RuntimeError("github down")):
+        inst._reconcile_required_checks(1, 42, "myorg/myrepo", "main")
+    assert any(
+        r.getMessage() == "enforcement_reconcile_failed" for r in caplog.records
+    )

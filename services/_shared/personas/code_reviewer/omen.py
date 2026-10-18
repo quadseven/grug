@@ -32,6 +32,7 @@ from urllib.parse import quote
 import httpx
 
 from personas.code_reviewer.diff_parser import DiffHunk
+from datadog_switch import datadog_enabled
 from secrets_loader import get_dd_api_key, get_dd_app_key, get_omen_service_map
 
 log = logging.getLogger(f"{os.getenv('DD_SERVICE', 'grug')}.persona.code_reviewer.omen")
@@ -92,6 +93,8 @@ def build_runtime_context(
 ) -> str | None:
     """The PRODUCTION SIGNAL block for the review prompt, or None when
     Omen has nothing (no mapping, no creds, no hits, or degraded)."""
+    if not datadog_enabled():
+        return None  # #1208: no SSM key read, no Datadog query
     service = (get_omen_service_map() or {}).get(f"{owner}/{repo}", "")
     if not service:
         return None  # explicit-allow gate: zero DD calls without a mapping

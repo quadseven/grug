@@ -175,6 +175,12 @@ def test_prompt_teaches_whole_file_mitigation_scan():
     assert "finally" in p
 
 
+def test_prompt_requires_reachable_caller_before_defensive_finding():
+    prompt = crp.build_system_prompt()
+    assert "specific caller or input that can reach the unguarded state" in prompt
+    assert "do not raise the finding" in prompt
+
+
 def test_prompt_teaches_path_is_not_secret():
     """#336: a file PATH is not a secret value — closes the #1149 CRITICAL
     secret-in-log false positive."""
@@ -306,3 +312,29 @@ def test_voice_has_mandatory_bookend_structure():
     assert "STOP and re-cast" in p          # the anti-plain-English clause
     assert "await fetch_user" in p          # the modern high-density example
     assert "WRAPPER" in p                    # cadence-wraps, core-stays-exact
+
+
+def test_negated_criterion_guidance_in_elder_header():
+    """#1170: a criterion that forbids something ("no X", "never X") is MET
+    when the diff removes or prevents X. That guidance must reach the Elder
+    prompt header itself (both A/B arms), not just the rule description, so
+    the model reads it before judging any intent-mismatch."""
+    for variant in ("v1", "v2"):
+        prompt = crp.build_system_prompt(variant)
+        assert "NEGATED CRITERIA" in prompt, f"variant {variant} missing header"
+        assert "is met when the diff removes or prevents" in prompt
+        assert "quote the criterion" in prompt
+        assert "name the diff hunk" in prompt
+
+
+def test_intent_mismatch_rule_requires_both_quotes():
+    """#1170: the intent-mismatch rule itself must carry the negated-criterion
+    reading and the both-quotes mandate, so the rule rendering (not only the
+    header) teaches the removal-carries-out-a-prohibition distinction."""
+    rule = next(
+        (r for r in crp.RULES if r.name == "intent-mismatch"),
+        None,
+    )
+    assert rule is not None, "intent-mismatch missing from RULES"
+    assert "removes or prevents" in rule.description
+    assert "quote the criterion" in rule.description

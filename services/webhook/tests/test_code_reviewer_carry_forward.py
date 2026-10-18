@@ -13,6 +13,7 @@ import pytest
 
 from llm_client import Backend, Finding as LlmFinding, LlmReviewResponse
 from personas.code_reviewer import carry_forward as cf
+from personas import review_publish
 from personas.code_reviewer import dispatch as cr_dispatch
 from personas.code_reviewer.dedup import rule_marker
 from personas.code_reviewer.persona import Finding
@@ -171,6 +172,9 @@ def _payload(action="synchronize"):
 def _run(monkeypatch, *, blocking, threads, action="synchronize", llm=None):
     monkeypatch.setattr(
         cr_dispatch, "with_install_token_retry",
+        lambda install_id, fn: fn("tok"))
+    monkeypatch.setattr(
+        review_publish, "with_install_token_retry",
         lambda install_id, fn: fn("tok"))
     llm = llm or LlmReviewResponse(kind="reviewed", findings=(),
                                    backend_used=Backend.POOLSIDE)

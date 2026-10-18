@@ -48,6 +48,17 @@ from personas.code_reviewer.persona import Finding
 # Hidden machine-readable marker carrying the rule name. GitHub renders
 # HTML comments invisibly, so it doesn't clutter the developer's view.
 _MARKER_RE = re.compile(r"<!--\s*grug-rule:([A-Za-z0-9_-]+)\s*-->")
+_COMPLEXITY_FUNCTION_RE = re.compile(
+    r"<!--\s*grug-complexity-function:([A-Za-z0-9_-]+)\s*-->"
+)
+# Threads posted before the marker above existed carry only the scanner's
+# fixed message. Without this fallback the first push after deploy re-flags
+# every function those threads already named (the duplicate this dedup was
+# built to stop). It matches the exact scanner phrasing, not any mention of a
+# function in prose, so a stray name in an LLM body cannot pose as identity.
+_LEGACY_COMPLEXITY_MESSAGE_RE = re.compile(
+    r"Function `([A-Za-z0-9_-]+)` too tangled -- "
+)
 
 
 def rule_marker(rule_name: str) -> str:
@@ -94,7 +105,9 @@ def prior_keys_from_comments(comments: list[dict]) -> set[str]:
     set → post-extra, never skip-a-real-finding."""
     keys: set[str] = set()
     for c in comments:
-        line = c.get("line")
+        # GitHub clears `line` when a push moves the anchor, but preserves
+        # `original_line`; complexity identity remains useful in that case.
+        line = c.get("line") or c.get("original_line")
         path = c.get("path")
         if line is None or path is None:
             continue
@@ -110,6 +123,14 @@ def prior_keys_from_comments(comments: list[dict]) -> set[str]:
             # dedup (the caller only catches httpx errors).
             continue
         keys.add(finding_key(path, line_int, rule))
+        if rule == "high-complexity":
+            body = c.get("body", "") or ""
+            function_match = (
+                _COMPLEXITY_FUNCTION_RE.search(body)
+                or _LEGACY_COMPLEXITY_MESSAGE_RE.search(body)
+            )
+            if function_match:
+                keys.add(complexity_function_key(path, function_match.group(1)))
     return keys
 
 
@@ -122,4 +143,13 @@ def dedup_findings(
     return tuple(
         f for f in findings
         if finding_key(f.file, f.line, f.rule_name) not in prior_keys
+        and not (
+            f.complexity_function
+            and complexity_function_key(f.file, f.complexity_function) in prior_keys
+        )
     )
+
+
+def complexity_function_key(file: str, function: str) -> str:
+    """Stable complexity identity for the same named function across pushes."""
+    return f"complexity-function@{file}:{function}"

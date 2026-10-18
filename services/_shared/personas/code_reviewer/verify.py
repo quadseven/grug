@@ -38,6 +38,15 @@ evidence contradicts:
   ``quote(..., safe='')`` sat inline on the very line cited. The
   suggestion said "validate"/"allowlist", which appears nowhere, so no
   token matched and all three shipped.
+- ``collection_lockstep``: a ``caller-not-updated`` claim whose only
+  evidence is that one collection grew, so a SECOND collection must grow
+  in lockstep (registry gained an entry, therefore the allowlist must
+  too), anchored on a line that is not a def/raise/return. The rule is
+  scoped to a changed signature, return shape or raise; two lists that
+  share vocabulary do not share a membership rule. Live instance (#763):
+  PR #762 grew the DoR rule registry and Elder demanded the persona-purity
+  call-target allowlist grow with it, while the new rule dispatches inside
+  ``run_all`` and the purity attester passed on the reviewed head.
 
 Inconclusive is NOT a kill: a missing file, an unparseable module, a
 module-level line, or a suggestion with no code tokens all keep the
@@ -66,7 +75,7 @@ if TYPE_CHECKING:  # import cycle guard: persona imports nothing from here
 class KilledFinding:
     finding: "Finding"
     # "non_code_file" | "sync_context" | "fix_already_present" |
-    # "fix_block_present" | "mitigation_present"
+    # "fix_block_present" | "mitigation_present" | "collection_lockstep"
     reason: str
 
 
@@ -159,6 +168,67 @@ def _all_interpolations_sanitized(line: str) -> bool | None:
         ):
             return False
     return True
+
+
+# collection_lockstep (#763). The rule this kill is scoped to: a changed
+# signature, return shape or raise with a stale caller.
+_CALLER_NOT_UPDATED = "caller-not-updated"
+
+# Collection nouns. The kill needs TWO mentions: the lockstep shape names
+# the list that grew AND the list that supposedly must follow it. One
+# collection plus its consumer (an enum gained a member that a match does
+# not handle) is a different claim and is kept.
+_COLLECTION_NOUN_RE = re.compile(
+    r"(?<![a-z0-9])(?:allow-?list|allowed list|deny-?list|white-?list"
+    r"|registry|list|set|frozenset|tuple|enum|mapping)(?![a-z0-9])"
+)
+
+# Lockstep-growth vocabulary: "A grows, so B must also add ...".
+_LOCKSTEP_RE = re.compile(
+    r"(?<![a-z0-9])(?:grows?|grew|grown|lockstep|in step|must also"
+    r"|also (?:add|include|list|name)s?|still (?:names|lists|has|holds)"
+    r" only|still only)(?![a-z0-9])"
+)
+
+# The rule's REAL shape. Any of these in the message means the claim may be
+# about a signature/return/raise change, so the kill never applies.
+_SIGNATURE_CLAIM_RE = re.compile(
+    r"(?<![a-z0-9])(?:signature|arguments?|args?|parameters?|params?"
+    r"|kwargs?|keyword|positional|arity|returns?|returned|returning"
+    r"|raises?|raised|raising|exceptions?|throws?|thrown)(?![a-z0-9])"
+)
+
+# An anchored line that defines a callable or changes what it raises or
+# returns may be the rule's real shape, whatever the message says.
+_SIGNATURE_LINE_RE = re.compile(
+    r"^\s*(?:async\s+def|def|class|function|func|fn|raise|return|throw)\b"
+    r"|\blambda\b|=>"
+)
+
+
+def _kills_as_collection_lockstep(finding: "Finding", source: str) -> bool:
+    """A caller-not-updated claim that is really "list A grew, so list B
+    must grow" (#763, the PR #762 marking).
+
+    Every condition must hold, so the kill only fires on the lockstep shape:
+    the rule is caller-not-updated, the message names two collections and a
+    lockstep-growth phrase, the message names no signature/return/raise
+    change, and the anchored line (which the rule requires to be the changed
+    signature or raise) is none of those either.
+    """
+    if finding.rule_name != _CALLER_NOT_UPDATED:
+        return False
+    message = finding.message.lower()
+    if _SIGNATURE_CLAIM_RE.search(message):
+        return False
+    if len(_COLLECTION_NOUN_RE.findall(message)) < 2:
+        return False
+    if not _LOCKSTEP_RE.search(message):
+        return False
+    lines = source.splitlines()
+    if not 1 <= finding.line <= len(lines):
+        return False  # anchor outside the snapshot - inconclusive, keep
+    return not _SIGNATURE_LINE_RE.search(lines[finding.line - 1])
 
 
 def _is_prose_file(path: str) -> bool:
@@ -378,6 +448,12 @@ def _verify_one(finding: "Finding", contents: dict[str, str]) -> str | None:
     if _kills_as_mitigation_present(finding, source):
         return "mitigation_present"
 
+    # Collection-lockstep kill (#763): "registry grew, so the allowlist must
+    # grow" is not a stale caller. Needs the source so the anchored line can
+    # be checked for a real signature/raise/return change.
+    if _kills_as_collection_lockstep(finding, source):
+        return "collection_lockstep"
+
     return None
 
 
@@ -401,3 +477,224 @@ def verify_findings(
         else:
             killed.append(KilledFinding(finding=f, reason=reason))
     return tuple(kept), tuple(killed)
+
+
+# --- bound-name downgrade (#1227) -----------------------------------------
+#
+# Live instance 2026-10-17: three blocking markings on one pull request
+# claimed NameErrors for `now` and `authors`, both parameters of the
+# enclosing method whose signature sat ~40 lines above the hunk. This is a
+# DOWNGRADE, not a kill: the claim is contradicted by the post-change file,
+# but a name being bound does not prove every neighbouring claim wrong, so
+# the finding still publishes - as a non-blocking note that cannot stop a
+# correct merge. Same asymmetric bias as the kills above: anything
+# inconclusive (no source, unparseable, no extractable name, any named
+# identifier not provably bound) keeps the finding exactly as it was.
+
+
+@dataclass(frozen=True, slots=True)
+class DowngradedFinding:
+    finding: "Finding"  # the finding as the model produced it
+    names: tuple[str, ...]  # the claimed-undefined names, all proven bound
+
+
+# "is not defined" class: NameError, undefined/unbound/unresolved name.
+_NOT_DEFINED_RE = re.compile(
+    r"nameerror|not\s+defined|undefined|unbound|unresolved\s+(?:name|reference)"
+    r"|undeclared",
+    re.IGNORECASE,
+)
+
+# Bare identifiers quoted in the message: `now`, 'now', "now".
+_QUOTED_NAME_RE = re.compile(r"[`'\"]([A-Za-z_][A-Za-z0-9_]*)[`'\"]")
+
+# The note appended to a downgraded marking so a reader sees why it no
+# longer blocks.
+_DOWNGRADE_NOTE = (
+    " [Downgraded to a note: {names} bound in an enclosing scope of the "
+    "post-change file.]"
+)
+
+_DOWNGRADED_SEVERITY = "low"
+_BLOCKING = ("high", "critical")
+
+
+def _is_not_defined_claim(finding: "Finding") -> bool:
+    return bool(
+        _NOT_DEFINED_RE.search(finding.rule_name)
+        or _NOT_DEFINED_RE.search(finding.message)
+    )
+
+
+def _claimed_names(message: str) -> tuple[str, ...]:
+    seen: list[str] = []
+    for name in _QUOTED_NAME_RE.findall(message):
+        if name not in seen and name != "NameError":
+            seen.append(name)
+    return tuple(seen)
+
+
+def _target_names(node: ast.AST) -> set[str]:
+    return {n.id for n in ast.walk(node) if isinstance(n, ast.Name)}
+
+
+def _import_names(node: ast.AST) -> set[str]:
+    return {
+        (a.asname or a.name).split(".")[0]
+        for a in node.names  # type: ignore[attr-defined]
+        if a.name != "*"
+    }
+
+
+def _with_names(node: ast.AST) -> set[str]:
+    out: set[str] = set()
+    for item in node.items:  # type: ignore[attr-defined]
+        if item.optional_vars is not None:
+            out |= _target_names(item.optional_vars)
+    return out
+
+
+def _assign_names(node: ast.AST) -> set[str]:
+    out: set[str] = set()
+    for t in node.targets:  # type: ignore[attr-defined]
+        out |= _target_names(t)
+    return out
+
+
+# Node type -> the names that node binds at its OWN scope level. An
+# annotation without a value (`x: int`) binds nothing.
+_BINDERS = {
+    ast.Import: _import_names,
+    ast.ImportFrom: _import_names,
+    ast.Assign: _assign_names,
+    ast.AugAssign: lambda n: _target_names(n.target),
+    ast.AnnAssign: lambda n: _target_names(n.target) if n.value is not None else set(),
+    ast.For: lambda n: _target_names(n.target),
+    ast.AsyncFor: lambda n: _target_names(n.target),
+    ast.NamedExpr: lambda n: _target_names(n.target),
+    ast.With: _with_names,
+    ast.AsyncWith: _with_names,
+    ast.ExceptHandler: lambda n: {n.name} if n.name else set(),
+    ast.Global: lambda n: set(n.names),
+    ast.Nonlocal: lambda n: set(n.names),
+    ast.FunctionDef: lambda n: {n.name},
+    ast.AsyncFunctionDef: lambda n: {n.name},
+    ast.ClassDef: lambda n: {n.name},
+}
+
+# Nodes whose bodies are a different scope: their own name binds, their
+# contents do not.
+_NEW_SCOPE_NODES = (
+    ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef, ast.Lambda,
+    ast.ListComp, ast.SetComp, ast.DictComp, ast.GeneratorExp,
+)
+
+
+def _bindings_in(stmts: list[ast.stmt], before_line: int | None) -> set[str]:
+    """Names bound by `stmts` at their own scope level (not descending into
+    nested functions/classes/lambdas/comprehensions). With `before_line`,
+    only bindings that START before that line count - a local assigned
+    after its use is a real unbound-local bug, not a false marking."""
+    bound: set[str] = set()
+    stack: list[ast.AST] = list(stmts)
+    while stack:
+        node = stack.pop()
+        line = getattr(node, "lineno", None)
+        binder = _BINDERS.get(type(node))
+        if binder is not None and (
+            before_line is None or (line is not None and line < before_line)
+        ):
+            bound |= binder(node)
+        if not isinstance(node, _NEW_SCOPE_NODES):
+            stack.extend(ast.iter_child_nodes(node))
+    return bound
+
+
+def _function_chain(tree: ast.Module, line: int) -> list[ast.AST]:
+    """Outermost-to-innermost FUNCTIONS whose span holds `line` (class
+    bodies are not enclosing scopes for their methods)."""
+    chain: list[ast.AST] = []
+    for node in ast.walk(tree):
+        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
+            end = node.end_lineno or node.lineno
+            if node.lineno <= line <= end:
+                chain.append(node)
+    chain.sort(key=lambda n: n.lineno)
+    return chain
+
+
+def _params(fn: ast.AST) -> set[str]:
+    a = fn.args  # type: ignore[attr-defined]
+    names = {p.arg for p in (*a.posonlyargs, *a.args, *a.kwonlyargs)}
+    if a.vararg is not None:
+        names.add(a.vararg.arg)
+    if a.kwarg is not None:
+        names.add(a.kwarg.arg)
+    return names
+
+
+def _bound_at(source: str, line: int) -> set[str] | None:
+    """Every name provably bound at `line` of `source`: enclosing-function
+    parameters, earlier bindings in those functions, module-level bindings
+    and builtins. None when the module does not parse."""
+    try:
+        tree = ast.parse(source)
+    except (SyntaxError, ValueError):
+        return None
+    import builtins
+
+    bound = set(dir(builtins))
+    bound |= _bindings_in(tree.body, None)
+    for fn in _function_chain(tree, line):
+        bound |= _params(fn)
+        bound |= _bindings_in(fn.body, line)  # type: ignore[attr-defined]
+    return bound
+
+
+def downgrade_bound_names(
+    findings: tuple["Finding", ...], file_contents: dict[str, str],
+) -> tuple[tuple["Finding", ...], tuple[DowngradedFinding, ...]]:
+    """Downgrade blocking "is not defined" findings whose every named
+    identifier is bound in an enclosing scope of the post-change file to a
+    non-blocking note (#1227). Returns (findings, downgraded); order is
+    preserved and untouched findings are returned as the same objects.
+    Never raises: any per-finding error keeps the finding as it was."""
+    from dataclasses import replace
+
+    out: list["Finding"] = []
+    downgraded: list[DowngradedFinding] = []
+    for f in findings:
+        try:
+            names = _maybe_bound_names(f, file_contents)
+        except Exception:  # noqa: BLE001 - verification must never abort a review
+            names = None
+        if not names:
+            out.append(f)
+            continue
+        shown = ", ".join(f"`{n}`" for n in names)
+        verb = "is" if len(names) == 1 else "are"
+        note = _DOWNGRADE_NOTE.format(names=f"{shown} {verb}")
+        out.append(replace(f, severity=_DOWNGRADED_SEVERITY, message=f.message + note))
+        downgraded.append(DowngradedFinding(finding=f, names=names))
+    return tuple(out), tuple(downgraded)
+
+
+def _maybe_bound_names(
+    finding: "Finding", file_contents: dict[str, str],
+) -> tuple[str, ...] | None:
+    if finding.severity not in _BLOCKING:
+        return None
+    if not finding.file.endswith((".py", ".pyi")):
+        return None
+    if not _is_not_defined_claim(finding):
+        return None
+    source = file_contents.get(finding.file)
+    if source is None:
+        return None
+    names = _claimed_names(finding.message)
+    if not names:
+        return None
+    bound = _bound_at(source, finding.line)
+    if bound is None or not all(n in bound for n in names):
+        return None
+    return names

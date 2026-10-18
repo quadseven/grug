@@ -19,6 +19,20 @@ from enforcement import (
     GRUG_TPM_RULESET_NAME,
     GRUG_DOR_CHECK_NAME,
 )
+from personas.tribe import CHECK_ELDER
+
+
+@pytest.fixture(autouse=True)
+def _default_repo_config():
+    """ensure_enforcement reads the repo's persona modes (grug#1202) to pick
+    the ruleset's required contexts. These lifecycle tests predate that and
+    run against the store's defaults (Elder enabled + blocking); the mode
+    matrix itself lives in test_enforcement_required_personas.py."""
+    from adapters.pg_install_store import _DEFAULT_PERSONA_CONFIG
+
+    with patch("adapters.install_store.get_repo_config",
+               return_value=dict(_DEFAULT_PERSONA_CONFIG)):
+        yield
 
 
 # ── ensure_enforcement ───────────────────────────────────────────────
@@ -36,10 +50,27 @@ def test_ensure_creates_ruleset_when_none():
     mock_detect.assert_called_once_with(
         "tok", "myorg", "myrepo", "main", GRUG_DOR_CHECK_NAME, stored_ruleset_id=None,
     )
+    # Default config has Elder at BLOCK, so Elder is required too (grug#1202).
     mock_create.assert_called_once_with(
-        "tok", "myorg", "myrepo", GRUG_TPM_RULESET_NAME, [GRUG_DOR_CHECK_NAME],
+        "tok", "myorg", "myrepo", GRUG_TPM_RULESET_NAME,
+        [GRUG_DOR_CHECK_NAME, CHECK_ELDER],
     )
     mock_set.assert_called_once_with(100, 200, 42)
+
+
+def test_ensure_does_not_try_to_create_when_permission_denied():
+    """grug#1001: the App cannot write rulesets here, so a create would only
+    403 again. Report the state and stop; it is not "already enforced"."""
+    with patch("enforcement.detect_enforcement",
+               return_value=EnforcementDetection("permission_denied", None)), \
+         patch("adapters.install_store.get_enforcement_id", return_value=None), \
+         patch("enforcement.create_ruleset") as mock_create, \
+         patch("observability.emit_enforcement_metric") as mock_emit:
+        result = ensure_enforcement("tok", "o", "r", "main", 1, 2)
+
+    assert result == "permission_denied"
+    mock_create.assert_not_called()
+    mock_emit.assert_called_once_with("o/r", "permission_denied")
 
 
 def test_ensure_defers_when_repo_empty():
@@ -87,6 +118,22 @@ def test_ensure_skips_empty_check_when_enforcement_exists():
         result = ensure_enforcement("tok", "o", "r", "main", 1, 2)
 
     assert result == "grug_managed"
+    mock_empty.assert_not_called()
+    mock_create.assert_not_called()
+
+
+def test_ensure_skips_empty_check_when_permission_denied():
+    """grug#1001 stays intact: a permission_denied repo returns before the
+    empty-repo check, so the deferral never masks it as "none"."""
+    with patch("enforcement.detect_enforcement",
+               return_value=EnforcementDetection("permission_denied", None)), \
+         patch("adapters.install_store.get_enforcement_id", return_value=None), \
+         patch("enforcement.repo_is_empty") as mock_empty, \
+         patch("enforcement.create_ruleset") as mock_create, \
+         patch("observability.emit_enforcement_metric"):
+        result = ensure_enforcement("tok", "o", "r", "main", 1, 2)
+
+    assert result == "permission_denied"
     mock_empty.assert_not_called()
     mock_create.assert_not_called()
 

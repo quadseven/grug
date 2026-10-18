@@ -35,20 +35,19 @@ from github_checks_client import CheckRunResult, post_check_run
 from github_reviews_client import post_review
 from llm_client import _JUDGE_MAX_FINDINGS
 from personas.code_reviewer.diff_parser import DiffParseError, parse_diff
-from personas.code_reviewer.dispatch import (
-    ReviewMode,
-    _build_review_result,
-    _fetch_file_contents,
-    _fetch_pr_diff,
-    _prior_finding_keys,
-    _publish_shape,
-    _resolve_result,
-)
+from personas.code_reviewer.dispatch import build_review_result
 from personas.code_reviewer.iac_scan import scan_iac
 from personas.code_reviewer.persona import CodeReviewEvaluation, with_extra_findings
 from personas.code_reviewer.sast import judge_candidates, scan_candidates
 from personas.code_reviewer.sca import scan_dependencies
 from personas.code_reviewer.secret_scan import scan_secrets
+from personas.review_publish import (
+    ReviewMode,
+    fetch_file_contents,
+    fetch_pr_diff,
+    plan_publish,
+    prior_finding_keys,
+)
 from personas.tribe import CHECK_GUARD
 
 log = logging.getLogger(f"{os.getenv('DD_SERVICE', 'grug')}.persona.guard")
@@ -59,7 +58,7 @@ _CHECK_NAME = CHECK_GUARD
 def _summary_markdown(evaluation: CodeReviewEvaluation) -> tuple[str, str]:
     """Guard-voice (title, summary) for the check-run output."""
     # Same closed caveman chip alphabet as Elder Markings (CR-dense scan).
-    from personas.code_reviewer.dispatch import _severity_chip
+    from personas.code_reviewer.dispatch import severity_chip
 
     if evaluation.degraded_reason:
         title = f"👁 Guard eyes clouded ({evaluation.degraded_reason})"
@@ -84,7 +83,7 @@ def _summary_markdown(evaluation: CodeReviewEvaluation) -> tuple[str, str]:
     rows = ["| Severity | File | Line | Rule | Message |", "|---|---|---|---|---|"]
     for f in evaluation.findings:
         rows.append(
-            f"| {_severity_chip(f.severity)} | `{f.file}` | {f.line} | "
+            f"| {severity_chip(f.severity)} | `{f.file}` | {f.line} | "
             f"`{f.rule_name}` | {f.message} |"
         )
     return title, "\n".join(rows)
@@ -144,7 +143,7 @@ def dispatch_guard_review(
     try:
         diff_text = with_install_token_retry(
             installation_id,
-            lambda token: _fetch_pr_diff(token, owner, repo_name, pull_number),
+            lambda token: fetch_pr_diff(token, owner, repo_name, pull_number),
         )
         hunks = parse_diff(diff_text)
     except (httpx.HTTPStatusError, httpx.RequestError, DiffParseError) as e:
@@ -180,7 +179,7 @@ def dispatch_guard_review(
     try:
         file_contents = with_install_token_retry(
             installation_id,
-            lambda token: _fetch_file_contents(
+            lambda token: fetch_file_contents(
                 token, owner, repo_name, changed_paths, head_sha
             ),
         )
@@ -248,7 +247,8 @@ def dispatch_guard_review(
     # Publish: check-run + inline review on independent surfaces, same
     # dual-publish discipline as Elder. The dedup path is SHARED (Elder's
     # helpers + the grug-rule comment markers), not forked.
-    conclusion, event = _publish_shape(evaluation, mode=mode)
+    outcome = plan_publish(evaluation, mode=mode)
+    conclusion, event = outcome.conclusion, outcome.event
     title, summary = _summary_markdown(evaluation)
     check_publish_failed = False
     try:
@@ -277,11 +277,12 @@ def dispatch_guard_review(
     review_publish_failed = False
     prior_keys: frozenset[str] = frozenset()
     if action in {"synchronize", "reopened"}:
-        prior_keys, _dedup_degraded = _prior_finding_keys(
+        prior_keys, _dedup_degraded = prior_finding_keys(
             installation_id, owner, repo_name, pull_number,
         )
-    review_result, _posted_findings = _build_review_result(
+    review_result, _posted_findings = build_review_result(
         evaluation, head_sha=head_sha, event=event, prior_keys=prior_keys,
+        persona="guard",
     )
     if review_result is not None:
         try:
@@ -303,6 +304,10 @@ def dispatch_guard_review(
             )
             review_publish_failed = True
 
+    outcome = outcome.settled(
+        check_publish_failed=check_publish_failed,
+        review_publish_failed=review_publish_failed,
+    )
     record_check_verdict(
         install_id=installation_id,
         persona_key="guard",
@@ -313,16 +318,9 @@ def dispatch_guard_review(
         summary=title,
         findings_count=len(evaluation.findings),
         blocking=blocking,
-        degraded_reason=(
-            evaluation.degraded_reason
-            or ("check_publish_failed" if check_publish_failed else None)
-        ),
+        degraded_reason=outcome.feed_degraded_reason,
     )
     return {
         "persona": "guard",
-        "result": _resolve_result(
-            evaluation,
-            check_publish_failed=check_publish_failed,
-            review_publish_failed=review_publish_failed,
-        ),
+        "result": outcome.result,
     }

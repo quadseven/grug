@@ -17,7 +17,9 @@ from llm_client import (
     FindingOrigin,
     LlmReviewResponse,
 )
+from personas import review_publish
 from personas.code_reviewer import dispatch as cr_dispatch
+from personas.review_publish import plan_publish
 from review_pipeline import ReviewCoverage, ReviewabilityConcern
 
 
@@ -30,6 +32,11 @@ _DIFF = """diff --git a/src/x.py b/src/x.py
 +new1
 +new2
 """
+
+
+def _result(evaluation, **settled):
+    """The persona result string `plan_publish(...).settled(...)` resolves."""
+    return plan_publish(evaluation, mode="advisory").settled(**settled).result
 
 
 def _payload(action: str = "opened") -> dict:
@@ -58,6 +65,10 @@ def _patch_token(monkeypatch):
     the wrapped function directly with a fake token."""
     monkeypatch.setattr(
         cr_dispatch, "with_install_token_retry",
+        lambda inst_id, fn: fn("fake-token"),
+    )
+    monkeypatch.setattr(
+        review_publish, "with_install_token_retry",
         lambda inst_id, fn: fn("fake-token"),
     )
 
@@ -254,7 +265,7 @@ def test_fetch_pr_review_comments_non_list_body_breaks(monkeypatch, caplog):
     r.json = MagicMock(return_value={"message": "Moved"})
     with caplog.at_level("WARNING"):
         with patch("httpx.get", return_value=r):
-            out = cr_dispatch._fetch_pr_review_comments("tok", "o", "r", 7)
+            out = review_publish._fetch_pr_review_comments("tok", "o", "r", 7)
     assert out == []
     assert any("comments_non_list_body" in rec.message for rec in caplog.records)
 
@@ -274,9 +285,9 @@ def test_fetch_pr_review_comments_uses_short_timeout(monkeypatch):
         return r
 
     with patch("httpx.get", side_effect=cap):
-        cr_dispatch._fetch_pr_review_comments("tok", "o", "r", 7)
-    assert captured["timeout"] == cr_dispatch._COMMENT_FETCH_TIMEOUT
-    assert cr_dispatch._COMMENT_FETCH_TIMEOUT < cr_dispatch._DIFF_FETCH_TIMEOUT
+        review_publish._fetch_pr_review_comments("tok", "o", "r", 7)
+    assert captured["timeout"] == review_publish._COMMENT_FETCH_TIMEOUT
+    assert review_publish._COMMENT_FETCH_TIMEOUT < review_publish.DIFF_FETCH_TIMEOUT
 
 
 def test_fetch_pr_review_comments_accumulates_across_pages(monkeypatch):
@@ -299,7 +310,7 @@ def test_fetch_pr_review_comments_accumulates_across_pages(monkeypatch):
         return r
 
     with patch("httpx.get", side_effect=staged):
-        out = cr_dispatch._fetch_pr_review_comments("tok", "o", "r", 7)
+        out = review_publish._fetch_pr_review_comments("tok", "o", "r", 7)
     assert len(out) == 101  # both pages accumulated, not reset
     assert idx["n"] == 2
 
@@ -412,6 +423,8 @@ def test_summary_markdown_renders_findings_table():
     title, summary = cr_dispatch._summary_markdown(ev)
     assert "1 blocking" in title  # one critical, one low
     assert "Markings Board" in summary
+
+
     assert "| Severity | Effort | File | Line | Rule | Marking |" in summary
     assert "secret-in-log-or-trace" in summary and "dead-code" in summary
     assert "`x.py`" in summary
@@ -419,6 +432,38 @@ def test_summary_markdown_renders_findings_table():
     assert summary.count("| - |") + summary.count("| quick win |") + summary.count(
         "| heavy lift |"
     ) >= 2
+
+
+def test_intent_paragraph_is_first_and_sensitive_is_explicit():
+    context = {
+        "title": "Change retry behavior",
+        "sensitive_review": True,
+        "linked_issue_context": "Acceptance criteria: retry once.",
+    }
+    paragraph = cr_dispatch._intent_paragraph(context)
+    assert paragraph.startswith("## Intent")
+    assert paragraph.count(".") <= 3
+    assert "class:sensitive" in paragraph
+    assert "acceptance criteria were checked" in paragraph
+
+
+def test_reachable_caller_filter_drops_only_unnamed_defensive_findings():
+    from personas.code_reviewer.persona import CodeReviewEvaluation, Finding
+
+    findings = (
+        Finding("a.py", 1, "medium", "missing-error-handling", "Add handling.", None),
+        Finding("b.py", 2, "medium", "missing-error-handling", "caller `load_record` reaches this with malformed input.", None),
+        Finding("c.py", 3, "low", "ruff-F821", "Undefined name.", None),
+    )
+    evaluation, dropped = cr_dispatch._drop_unreachable_defensive_findings(
+        CodeReviewEvaluation(findings=findings, conclusion="success"),
+    )
+    assert dropped == 1
+    assert [f.file for f in evaluation.findings] == ["b.py", "c.py"]
+    _, summary = cr_dispatch._summary_markdown(
+        evaluation, defensive_dropped_count=dropped,
+    )
+    assert "1 defensive findings dropped: no reachable caller named" in summary
 
 
 def test_summary_markdown_reports_exact_coverage_and_reviewability_debt():
@@ -483,9 +528,9 @@ def test_fetch_pr_review_comments_caps_pages(monkeypatch, caplog):
         return r
     with caplog.at_level("WARNING"):
         with patch("httpx.get", side_effect=full_page):
-            out = cr_dispatch._fetch_pr_review_comments("tok", "o", "r", 7)
+            out = review_publish._fetch_pr_review_comments("tok", "o", "r", 7)
     # Exactly _MAX_COMMENT_PAGES pages fetched, then cap.
-    assert len(out) == cr_dispatch._MAX_COMMENT_PAGES * 100
+    assert len(out) == review_publish._MAX_COMMENT_PAGES * 100
     assert any("page_cap_hit" in rec.message for rec in caplog.records)
 
 
@@ -567,10 +612,11 @@ def test_dispatch_no_findings_posts_clean_pass(monkeypatch):
     assert posted_review == []
 
 
-def test_dispatch_llm_outage_does_not_block_pr(monkeypatch):
-    """LLM all_failed → advisory check-run posted with conclusion=neutral
-    and degraded_reason message. No inline review (nothing to comment
-    on). Elder must not 500 the dispatcher on LLM outages."""
+def test_dispatch_llm_outage_fails_closed_in_block_mode(monkeypatch):
+    """LLM all_failed in BLOCK mode -> the check concludes `failure`
+    (grug#1212, ADR-0023: a required neutral would pass the merge with no
+    review behind it), led by the degraded line. No inline review (nothing
+    to comment on). Elder must not 500 the dispatcher on LLM outages."""
     llm = LlmReviewResponse(kind="all_failed", error="poolside: timeout")
     posted_check, posted_review = [], []
     monkeypatch.setattr(cr_dispatch, "review_diff", lambda *a, **kw: llm)
@@ -586,9 +632,11 @@ def test_dispatch_llm_outage_does_not_block_pr(monkeypatch):
     with patch("httpx.get", return_value=_diff_response()):
         out = cr_dispatch.dispatch_code_review(_payload(), blocking=True)
 
-    # Even in blocking mode, an LLM outage degrades to neutral —
-    # advisory-first contract.
-    assert posted_check[0].conclusion == "neutral"
+    assert posted_check[0].conclusion == "failure"
+    assert posted_check[0].summary.split("\n")[0] == (
+        "Degraded review (all_failed): not a verdict. "
+        "Comment `/grug improve` to re-run once the backend recovers."
+    )
     assert posted_review == []
     assert out == {
         "persona": "code_reviewer",
@@ -785,9 +833,7 @@ def test_resolve_result_publish_failed_wins_over_skipped():
     degraded = CodeReviewEvaluation(
         findings=(), conclusion="neutral", degraded_reason="all_failed",
     )
-    assert cr_dispatch._resolve_result(
-        degraded, check_publish_failed=True,
-    ) == "publish_failed"
+    assert _result(degraded, check_publish_failed=True) == "publish_failed"
 
 
 def test_dispatch_emits_structured_log_on_success(monkeypatch, caplog):
@@ -902,7 +948,7 @@ def test_resolve_result_both_publishes_failed_returns_publish_failed():
         ),),
         conclusion="failure",
     )
-    out = cr_dispatch._resolve_result(
+    out = _result(
         failing_eval,
         check_publish_failed=True,
         review_publish_failed=True,
@@ -910,7 +956,7 @@ def test_resolve_result_both_publishes_failed_returns_publish_failed():
     assert out == "publish_failed"
     # Single-publish-failure ALSO returns publish_failed (not "fail")
     # even when verdict is failure.
-    out_review_only = cr_dispatch._resolve_result(
+    out_review_only = _result(
         failing_eval,
         check_publish_failed=False,
         review_publish_failed=True,
@@ -1062,6 +1108,7 @@ def test_dispatch_passes_identity_and_intent_to_review_diff(monkeypatch):
         "base_sha": "base5678ijkl",
         "title": "Preserve PR intent",
         "body": "Reviewer should understand the requested behavior.",
+        "sensitive_review": False,
     }
 
 
@@ -1086,7 +1133,7 @@ def test_dispatch_fetches_immutable_base_head_diff(monkeypatch):
     assert captured[0]["headers"]["Accept"] == "application/vnd.github.diff"
     assert "myorg/myrepo" in captured[0]["url"]
     assert "/compare/base5678ijkl...abcd1234efgh" in captured[0]["url"]
-    assert captured[0]["timeout"] == cr_dispatch._DIFF_FETCH_TIMEOUT
+    assert captured[0]["timeout"] == review_publish.DIFF_FETCH_TIMEOUT
     # #336: subsequent GET(s) fetch full file content with the `.raw` Accept
     # header so the Elder sees mitigations outside the diff hunk.
     raw_gets = [c for c in captured if c["headers"].get("Accept") == "application/vnd.github.raw"]
@@ -1103,7 +1150,7 @@ def test_fetch_pr_diff_falls_back_when_immutable_compare_is_unavailable(
     fallback = _diff_response("fallback diff")
 
     with patch("httpx.get", side_effect=[unavailable, fallback]) as get:
-        diff = cr_dispatch._fetch_pr_diff(
+        diff = cr_dispatch.fetch_pr_diff(
             "token", "myorg", "myrepo", 7,
             base_sha="base", head_sha="head",
         )
@@ -1285,8 +1332,8 @@ def test_no_single_webhook_timeout_reaches_lambda_budget():
     # 420s: the post-#272 async-offload webhook Lambda timeout (the function
     # that runs the Elder dispatch). The old 60 here predated that bump.
     _WEBHOOK_LAMBDA_BUDGET = 420  # keep in sync w/ infra/pulumi/__main__ webhook
-    assert cr_dispatch._DIFF_FETCH_TIMEOUT < _WEBHOOK_LAMBDA_BUDGET
-    assert cr_dispatch._COMMENT_FETCH_TIMEOUT < _WEBHOOK_LAMBDA_BUDGET
+    assert review_publish.DIFF_FETCH_TIMEOUT < _WEBHOOK_LAMBDA_BUDGET
+    assert review_publish._COMMENT_FETCH_TIMEOUT < _WEBHOOK_LAMBDA_BUDGET
     assert llm_client._TIMEOUT_SECONDS < _WEBHOOK_LAMBDA_BUDGET
 
 
@@ -1670,12 +1717,12 @@ def test_dispatch_capture_same_rule_two_lines_matches_in_order(monkeypatch):
     """(file, rule) alone is ambiguous when the SAME rule fires twice in one
     file at different lines - capture must not cross-wire them. Each
     matching comment claims the next unclaimed finding for that (file,
-    rule) in the order `_build_review_result` posted them."""
+    rule) in the order `build_review_result` posted them."""
     llm = LlmReviewResponse(
         kind="reviewed",
         findings=(
-            LlmFinding(path="src/x.py", line=2, rule="null-deref", severity="medium", message="first"),  # type: ignore[arg-type]
-            LlmFinding(path="src/x.py", line=3, rule="null-deref", severity="medium", message="second"),  # type: ignore[arg-type]
+            LlmFinding(path="src/x.py", line=2, rule="null-deref", severity="medium", message="caller `load_first` reaches first null value"),  # type: ignore[arg-type]
+            LlmFinding(path="src/x.py", line=3, rule="null-deref", severity="medium", message="caller `load_second` reaches second null value"),  # type: ignore[arg-type]
         ),
         backend_used=Backend.POOLSIDE,
         review_span_context={"span_id": "s", "trace_id": "t"},
@@ -1695,7 +1742,10 @@ def test_dispatch_capture_same_rule_two_lines_matches_in_order(monkeypatch):
     with patch("httpx.get", return_value=_diff_response()):
         cr_dispatch.dispatch_code_review(_payload(), blocking=False)
     by_id = {c["comment_id"]: c["finding_text"] for c in captured}
-    assert by_id == {1: "first", 2: "second"}
+    assert by_id == {
+        1: "caller `load_first` reaches first null value",
+        2: "caller `load_second` reaches second null value",
+    }
 
 
 def test_dispatch_capture_zero_alarm_logged(monkeypatch, caplog):
@@ -1845,7 +1895,7 @@ def test_fetch_file_contents_url_encodes_path(monkeypatch):
         return r
 
     with patch("httpx.get", side_effect=cap):
-        out = cr_dispatch._fetch_file_contents(
+        out = cr_dispatch.fetch_file_contents(
             "tok", "o", "r", ("dir/a b#c.py",), "deadbeef"
         )
     assert out == {"dir/a b#c.py": "x"}
@@ -2070,10 +2120,13 @@ def test_partial_review_stays_advisory_but_publishes_validated_findings():
         degraded_reason="partial_review",
     )
 
-    assert cr_dispatch._publish_shape(
-        evaluation, mode="blocking",
-    ) == ("neutral", "COMMENT")
-    result, posted_findings = cr_dispatch._build_review_result(
+    # The shared gate (Guard, Smasher) keeps partial coverage advisory ...
+    shared = plan_publish(evaluation, mode="blocking")
+    assert (shared.conclusion, shared.event) == ("neutral", "COMMENT")
+    # ... while Elder's BLOCK mode fails closed on it (grug#1212).
+    elder = plan_publish(evaluation, mode="blocking", degraded_fails_closed=True)
+    assert (elder.conclusion, elder.event) == ("failure", "COMMENT")
+    result, posted_findings = cr_dispatch.build_review_result(
         evaluation, head_sha="a" * 40, event="COMMENT",
     )
     assert result is not None
@@ -2087,6 +2140,72 @@ def test_partial_review_stays_advisory_but_publishes_validated_findings():
     # Partial coverage must not borrow the blackout vocabulary: Elder saw
     # most of this diff, so "could not see" would discard real work.
     assert "could not see" not in summary
+
+
+def test_complexity_without_split_is_summary_only_and_other_kind_still_threads():
+    from personas.code_reviewer.persona import CodeReviewEvaluation, Finding
+
+    complexity = Finding(
+        file="src/bridge.py", line=12, severity="low",
+        rule_name="high-complexity", message="Pre-existing bridge remains long.",
+        suggestion=None, effort="heavy-lift",
+    )
+    correctness = Finding(
+        file="src/bridge.py", line=12, severity="high",
+        rule_name="null-deref", message="Possible null dereference.", suggestion=None,
+    )
+    evaluation = CodeReviewEvaluation(
+        findings=(complexity, correctness), conclusion="failure",
+    )
+
+    result, posted = cr_dispatch.build_review_result(
+        evaluation, head_sha="a" * 40, event="COMMENT",
+    )
+    assert result is not None
+    assert posted == (correctness,)
+    _, summary = cr_dispatch._summary_markdown(evaluation)
+    assert "## Maintainability notes" in summary
+    assert "Pre-existing bridge remains long." in summary
+
+
+def test_complexity_with_concrete_split_can_thread_at_medium_or_lower():
+    from personas.code_reviewer.persona import CodeReviewEvaluation, Finding
+
+    finding = Finding(
+        file="src/bridge.py", line=12, severity="medium",
+        rule_name="complexity-hotspot", message="New branching should be split.",
+        suggestion="Extract the new branch into _validate_payload().", effort="quick-win",
+    )
+    evaluation = CodeReviewEvaluation(findings=(finding,), conclusion="success")
+    result, posted = cr_dispatch.build_review_result(
+        evaluation, head_sha="a" * 40, event="COMMENT",
+    )
+    assert result is not None
+    assert len(result.comments) == 1
+    assert posted == (finding,)
+    assert finding.severity in {"low", "medium"}
+
+
+def test_complexity_dedup_matches_function_after_anchor_moves():
+    from personas.code_reviewer.persona import Finding
+    from personas.code_reviewer.dedup import dedup_findings, prior_keys_from_comments
+
+    prior = prior_keys_from_comments([{
+        "path": "src/bridge.py", "line": None, "original_line": 12, "side": "RIGHT",
+        # A thread posted before the function marker existed: only the
+        # scanner's fixed message names the function.
+        "body": (
+            "Function `forward_reports` too tangled -- cyclomatic 17 (cap 15).\n"
+            "<!-- grug-rule:high-complexity -->"
+        ),
+    }])
+    moved = Finding(
+        file="src/bridge.py", line=28, severity="medium",
+        rule_name="high-complexity", message="Split this function.",
+        suggestion="Extract the branch into a helper.",
+        complexity_function="forward_reports",
+    )
+    assert dedup_findings((moved,), prior) == ()
 
 
 def test_board_speaks_partial_coverage_not_blackout():
@@ -2242,7 +2361,7 @@ def test_consolidated_prompt_hard_ceiling_degrades_loudly():
 
 def test_dispatch_suggestion_survives_pipe_to_inline_comment(monkeypatch):
     """#553 E2E: suggestion + effort survive review_diff -> evaluate_diff ->
-    dedup -> _build_review_result into the POSTED InlineComment body - a
+    dedup -> build_review_result into the POSTED InlineComment body - a
     dedup/build refactor that rebuilds findings could drop them with every
     unit test still green."""
     llm = LlmReviewResponse(
@@ -2264,7 +2383,20 @@ def test_dispatch_suggestion_survives_pipe_to_inline_comment(monkeypatch):
         cr_dispatch, "post_review",
         lambda t, o, r, *, pull_number, result: posted_review.append(result) or {"id": 2},
     )
-    with patch("httpx.get", return_value=_diff_response()):
+    # The head text is what #1149's check verifies the block against, so
+    # the contents fetch returns real Python rather than the diff. A plain
+    # body is the real shape: fetch_file_contents asks for the `.raw` media
+    # type, which returns the file itself, not base64 JSON. The assert pins
+    # that, so dropping the header fails here rather than in production.
+    head_text = "import logging\nlogging.debug('x')\nnew2\n"
+
+    def _get(url, *a, **k):
+        if "/contents/" in url:
+            assert k["headers"]["Accept"] == "application/vnd.github.raw"
+            return _diff_response(head_text)
+        return _diff_response(_DIFF)
+
+    with patch("httpx.get", side_effect=_get):
         cr_dispatch.dispatch_code_review(_payload(), blocking=False)
     assert len(posted_review) == 1
     body = posted_review[0].comments[0].body
@@ -2381,7 +2513,7 @@ def test_dispatch_verification_kills_contradicted_finding(monkeypatch, caplog):
         lambda *a, **kw: (FindingJudgement(0, True, "real", 0.9),),
     )
     monkeypatch.setattr(
-        cr_dispatch, "_fetch_file_contents",
+        cr_dispatch, "fetch_file_contents",
         lambda token, owner, repo, paths, sha: {
             "src/x.py": "def handler(fn):\n    fn()\n    return 1\n",
         },
@@ -2438,7 +2570,7 @@ def test_dispatch_refute_gate_kills_confidently_refuted_high_finding(monkeypatch
         lambda *a, **kw: (FJ(0, True, "plausible", 0.9), FJ(1, True, "real nit", 0.9)),
     )
     monkeypatch.setattr(
-        cr_dispatch, "_fetch_file_contents",
+        cr_dispatch, "fetch_file_contents",
         lambda token, owner, repo, paths, sha: {"src/x.py": "x = 1\ny = 2\nz = 3\n"},
     )
     refute_calls = []
@@ -2530,7 +2662,7 @@ def test_deep_review_publishes_and_captures_comment_records(monkeypatch):
         lambda *a, **kw: deep_llm,
     )
     monkeypatch.setattr(
-        cr_dispatch, "_fetch_file_contents",
+        cr_dispatch, "fetch_file_contents",
         lambda token, owner, repo, paths, sha: {"src/x.py": "def f():\n    pass\n"},
     )
     monkeypatch.setattr(
@@ -2550,6 +2682,40 @@ def test_deep_review_publishes_and_captures_comment_records(monkeypatch):
     assert rec["review_span_context"] == {"span_id": "deep-span", "trace_id": "deep-trace"}
     assert rec["finding_tags"]["rule_name"] == "deep-bug"
     assert rec["author_login"] == "alice"
+
+
+def test_deep_review_includes_matching_precedent_citation(monkeypatch):
+    """Deep-arm findings receive ledger citations when a row matches."""
+    from personas.code_reviewer.persona import CodeReviewEvaluation, Finding
+
+    finding = Finding(
+        file="src/xray.py", line=2, severity="high", rule_name="deep-bug",
+        message="deep finding", suggestion=None,
+    )
+    monkeypatch.setattr(
+        "adapters.install_store.list_ledger_rows",
+        lambda repo, *a, **kw: [{
+            "repo": "owner/repo", "pr": 400, "reviewer": "reviewer",
+            "severity": "HIGH", "class": "deep-bug", "finding": "deep finding xray",
+            "verdict": "fixed", "evidence": "src/xray.py", "ts": "2026-06-10T00:00:00Z",
+        }],
+        raising=False,
+    )
+    captured = {}
+    monkeypatch.setattr(
+        cr_dispatch, "build_review_result",
+        lambda evaluation, **kwargs: captured.update(kwargs) or (None, ()),
+    )
+    cr_dispatch._publish_deep_review(
+        CodeReviewEvaluation(findings=(finding,), conclusion="success"),
+        novel_deep=(finding,), head_sha="abc", event=MagicMock(),
+        all_prior=frozenset(), installation_id=1, owner="owner", repo_name="repo",
+        pull_number=2, deep_llm=_deep_llm_with_finding(), author_login="reviewer",
+        mode=MagicMock(), living_range="", deep_suppressed_count=0,
+        combined_eval=CodeReviewEvaluation(findings=(finding,), conclusion="success"),
+    )
+
+    assert "#400" in next(iter(captured["precedent_notes"].values()))
 
 
 def test_deep_review_capture_failure_does_not_change_result(monkeypatch):
@@ -2577,7 +2743,7 @@ def test_deep_review_capture_failure_does_not_change_result(monkeypatch):
     )
     monkeypatch.setattr(cr_dispatch, "review_reasoner_diff", lambda *a, **kw: deep_llm)
     monkeypatch.setattr(
-        cr_dispatch, "_fetch_file_contents",
+        cr_dispatch, "fetch_file_contents",
         lambda token, owner, repo, paths, sha: {"src/x.py": "def f():\n    pass\n"},
     )
     monkeypatch.setattr(
@@ -2636,7 +2802,7 @@ def test_deep_review_refreshes_stack_comment_with_tier1_findings(monkeypatch):
     )
     monkeypatch.setattr(cr_dispatch, "review_reasoner_diff", lambda *a, **kw: deep_llm)
     monkeypatch.setattr(
-        cr_dispatch, "_fetch_file_contents",
+        cr_dispatch, "fetch_file_contents",
         lambda token, owner, repo, paths, sha: {"src/x.py": "def f():\n    pass\n"},
     )
     monkeypatch.setattr(
@@ -3189,20 +3355,20 @@ def test_resolve_result_rejected_review_precedence():
     from personas.code_reviewer.persona import CodeReviewEvaluation
 
     clean = CodeReviewEvaluation(findings=(), conclusion="success")
-    assert cr_dispatch._resolve_result(
+    assert _result(
         clean, check_publish_failed=False, review_publish_rejected=True,
     ) == "review_rejected"
-    assert cr_dispatch._resolve_result(
+    assert _result(
         clean, check_publish_failed=True, review_publish_rejected=True,
     ) == "publish_failed"
-    assert cr_dispatch._resolve_result(
+    assert _result(
         clean, check_publish_failed=False, review_publish_failed=True,
         review_publish_rejected=True,
     ) == "publish_failed"
     degraded = CodeReviewEvaluation(
         findings=(), conclusion="neutral", degraded_reason="all_failed",
     )
-    assert cr_dispatch._resolve_result(
+    assert _result(
         degraded, check_publish_failed=False, review_publish_rejected=True,
     ) == "skipped"
 
@@ -3435,3 +3601,173 @@ def test_durable_and_reopened_reviews_resolve_fixed_threads(monkeypatch, action)
         monkeypatch, action, lambda *a, **kw: calls.append(1) or 1,
     )
     assert calls == [1]
+
+
+# --- Elder withdraws its own stale block ------------------------------------
+
+_ELDER_TAG = "<!-- grug:review persona=elder -->"
+
+
+def _review(rid, *, state="CHANGES_REQUESTED", commit="old0000", body=_ELDER_TAG,
+            login="grug-tribe[bot]"):
+    return {"id": rid, "state": state, "commit_id": commit, "body": body,
+            "user": {"login": login}}
+
+
+def _run_dismiss(monkeypatch, llm, *, reviews, blocking=True, threads=(),
+                 carried_conclusion=None):
+    dismissed = []
+    listed = []
+    monkeypatch.setattr(
+        cr_dispatch.carry_forward, "list_threads",
+        lambda *a, **kw: None if threads is None else list(threads),
+    )
+    if carried_conclusion is not None:
+        monkeypatch.setattr(
+            cr_dispatch.carry_forward, "apply_to_check",
+            lambda carried, *, conclusion, title, summary, blocking_mode:
+                (carried_conclusion, title, summary),
+        )
+    monkeypatch.setattr(cr_dispatch, "review_diff", lambda *a, **kw: llm)
+    monkeypatch.setattr(cr_dispatch, "post_check_run", lambda *a, **kw: {})
+    monkeypatch.setattr(cr_dispatch, "post_review", lambda *a, **kw: {})
+    monkeypatch.setattr(
+        cr_dispatch, "list_reviews",
+        lambda *a, **kw: listed.append(kw["pull_number"]) or reviews,
+    )
+    monkeypatch.setattr(
+        cr_dispatch, "dismiss_review",
+        lambda *a, **kw: dismissed.append(kw["review_id"]) or {},
+    )
+    with patch("httpx.get", return_value=_diff_response()):
+        cr_dispatch.dispatch_code_review(_payload(action="synchronize"), blocking=blocking)
+    return listed, dismissed
+
+
+def test_clean_rereview_dismisses_only_elders_own_stale_block(monkeypatch):
+    """A clean re-review withdraws Elder's REQUEST_CHANGES on an earlier
+    commit. GitHub keeps that block until it is dismissed; a COMMENT review
+    does not replace it. Guard's block, a human's, an untagged one and a
+    block on the current head are all left alone."""
+    llm = LlmReviewResponse(kind="reviewed", findings=(), backend_used=Backend.POOLSIDE)
+    reviews = [
+        _review(1),                                                  # stale Elder block
+        _review(2, body="<!-- grug:review persona=guard -->"),       # Guard's block
+        _review(3, login="a-human"),                                 # a human
+        _review(7, login="other-app[bot]"),                          # another bot quoting the tag
+        _review(4, body="Grug Elder gaze upon your PR"),             # pre-tag review
+        _review(5, commit="abcd1234efgh"),                           # current head
+        _review(6, state="COMMENTED"),                               # not a block
+    ]
+    listed, dismissed = _run_dismiss(monkeypatch, llm, reviews=reviews)
+    assert listed == [7]
+    assert dismissed == [1]
+
+
+def test_carried_open_finding_keeps_the_block(monkeypatch):
+    """A living-range review can be clean while an earlier finding is still
+    open; carry-forward turns the verdict to failure and the block stays."""
+    llm = LlmReviewResponse(kind="reviewed", findings=(), backend_used=Backend.POOLSIDE)
+    listed, dismissed = _run_dismiss(
+        monkeypatch, llm, reviews=[_review(1)], carried_conclusion="failure",
+    )
+    assert listed == []
+    assert dismissed == []
+
+
+def test_unknown_carry_forward_keeps_the_block(monkeypatch):
+    """No thread listing means the carry-forward check could not run, so a
+    clean review cannot vouch for earlier commits."""
+    llm = LlmReviewResponse(kind="reviewed", findings=(), backend_used=Backend.POOLSIDE)
+    listed, dismissed = _run_dismiss(monkeypatch, llm, reviews=[_review(1)], threads=None)
+    assert listed == []
+    assert dismissed == []
+
+
+def test_failing_review_keeps_the_block(monkeypatch):
+    llm = LlmReviewResponse(
+        kind="reviewed",
+        findings=(LlmFinding(
+            path="src/x.py", line=2, rule="silent-failure",
+            severity="high", message="m",  # type: ignore[arg-type]
+        ),),
+        backend_used=Backend.POOLSIDE,
+    )
+    listed, dismissed = _run_dismiss(monkeypatch, llm, reviews=[_review(1)])
+    assert listed == []
+    assert dismissed == []
+
+
+def test_degraded_review_never_unblocks(monkeypatch):
+    """An LLM outage read nothing, so it must not withdraw a block."""
+    llm = LlmReviewResponse(kind="all_failed", error="poolside: timeout")
+    listed, dismissed = _run_dismiss(monkeypatch, llm, reviews=[_review(1)])
+    assert listed == []
+    assert dismissed == []
+
+
+def test_dismiss_failure_does_not_change_the_result(monkeypatch):
+    llm = LlmReviewResponse(kind="reviewed", findings=(), backend_used=Backend.POOLSIDE)
+    monkeypatch.setattr(cr_dispatch, "review_diff", lambda *a, **kw: llm)
+    monkeypatch.setattr(cr_dispatch, "post_check_run", lambda *a, **kw: {})
+    monkeypatch.setattr(cr_dispatch, "post_review", lambda *a, **kw: {})
+    monkeypatch.setattr(cr_dispatch, "list_reviews", lambda *a, **kw: [_review(1)])
+    monkeypatch.setattr(cr_dispatch.carry_forward, "list_threads", lambda *a, **kw: [])
+
+    def _boom(*a, **kw):
+        raise httpx.RequestError("down")
+
+    monkeypatch.setattr(cr_dispatch, "dismiss_review", _boom)
+    with patch("httpx.get", return_value=_diff_response()):
+        out = cr_dispatch.dispatch_code_review(_payload(action="synchronize"), blocking=True)
+    assert out["result"] == "pass"
+
+
+def test_review_body_carries_the_persona_tag():
+    from personas.code_reviewer.persona import CodeReviewEvaluation, Finding
+
+    evaluation = CodeReviewEvaluation(
+        findings=(Finding(
+            file="src/x.py", line=2, severity="medium",
+            rule_name="silent-failure", message="m", suggestion=None,
+        ),),
+        conclusion="success",
+    )
+    elder, _ = cr_dispatch.build_review_result(evaluation, head_sha="a" * 40, event="COMMENT")
+    guard, _ = cr_dispatch.build_review_result(
+        evaluation, head_sha="a" * 40, event="COMMENT", persona="guard",
+    )
+    assert _ELDER_TAG in elder.body
+    assert "<!-- grug:review persona=guard -->" in guard.body
+    assert _ELDER_TAG not in guard.body
+
+
+def test_low_confidence_review_publishes_findings_and_says_low_confidence():
+    """grug#1097: a low-confidence clean cohort is its own reason. Findings
+    from the other cohorts still publish, the check stays advisory, and the
+    title names the low confidence instead of 'eyes clouded'."""
+    from personas.code_reviewer.persona import CodeReviewEvaluation, Finding
+
+    evaluation = CodeReviewEvaluation(
+        findings=(Finding(
+            file="src/x.py",
+            line=2,
+            severity="high",
+            rule_name="null-deref",
+            message="finding from another cohort",
+            suggestion=None,
+        ),),
+        conclusion="neutral",
+        degraded_reason="low_confidence_review",
+    )
+
+    result, posted_findings = cr_dispatch.build_review_result(
+        evaluation, head_sha="a" * 40, event="COMMENT",
+    )
+    assert result is not None
+    assert posted_findings == evaluation.findings
+    title, summary = cr_dispatch._summary_markdown(evaluation)
+    assert "low confidence" in title
+    assert "clouded" not in title
+    assert "could not see" not in summary
+    assert not cr_dispatch.is_blackout("low_confidence_review")

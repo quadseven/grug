@@ -190,6 +190,12 @@ def _print_exclusion_notes(report: EvalReport) -> None:
             "  !! diff hunk-bounded (misses may be amputation, not Elder): "
             f"{', '.join(report.truncated_cases)}"
         )
+    if report.output_truncated_cases:
+        print(
+            "  !! answer cut off at the output cap (scored on the complete "
+            "findings before the cut, grug#1231): "
+            f"{', '.join(report.output_truncated_cases)}"
+        )
     if report.staged_cases:
         print(
             "  staged (too big for one cohort call - reviewed via several "

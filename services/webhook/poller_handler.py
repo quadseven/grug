@@ -8,7 +8,7 @@ ground-truth that calibrates the LLM judge.
 
 Reuses the webhook container image (same `reactions` / `install_store` /
 `llm_client` / `github_app_auth` code); the CronJob runs
-`ddtrace-run python -c "from poller_handler import handler; handler({}, None)"`
+`python -m datadog_switch python -c "from poller_handler import handler; handler({}, None)"`
 (the `(event, context)` signature is a legacy of the EventBridge-scheduled
 Lambda this CronJob replaced at the #354 cutover).
 

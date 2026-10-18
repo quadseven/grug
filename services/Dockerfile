@@ -4,8 +4,9 @@
 # Build:  docker build services -f services/Dockerfile --build-arg SERVICE=<api|webhook>
 # CONTEXT=services/ (ADR-0014: the image carries services/_shared/ - the
 # single copy of the cross-service modules - alongside the service tree)
-# FastAPI app served by uvicorn under ddtrace-run (APM via the node's
-# Datadog agent - DD_AGENT_HOST is injected by the Deployment).
+# FastAPI app served by uvicorn, under ddtrace-run only when
+# GRUG_DATADOG_ENABLED is on (#1208; APM via the node's Datadog agent -
+# DD_AGENT_HOST is injected by the Deployment).
 # Build the AWS Roles Anywhere credential helper from source at a PINNED
 # tag (#388, ADR-0008): the public binary distribution URLs are not
 # reliably fetchable, and a source build pins provenance to the aws/
@@ -120,5 +121,7 @@ USER 10001
 EXPOSE 8080
 # Single worker is INTENTIONAL at replicas:1 (the in-process token
 # cache assumes one process; scale via replicas, not workers).
-CMD ["ddtrace-run", "uvicorn", "main:app", "--host", "0.0.0.0", "--port", "8080", \
+# `python -m datadog_switch` (services/_shared, #1208) prepends ddtrace-run
+# only when GRUG_DATADOG_ENABLED is on; off (the default) runs uvicorn bare.
+CMD ["python", "-m", "datadog_switch", "uvicorn", "main:app", "--host", "0.0.0.0", "--port", "8080", \
      "--workers", "1", "--timeout-keep-alive", "15", "--timeout-graceful-shutdown", "20"]

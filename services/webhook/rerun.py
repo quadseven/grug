@@ -44,6 +44,12 @@ from personas.code_reviewer.dispatch import (
     RETRIED_DEGRADATIONS,
     dispatch_code_review,
 )
+from personas.review_publish import LOW_CONFIDENCE
+from personas.code_reviewer.degraded_gate import (
+    degraded_conclusion,
+    gate_sentence,
+    lead_with_degraded_line,
+)
 from personas.code_reviewer.snapshot import (
     review_freshness_id_from_pr,
     review_snapshot_id,
@@ -152,10 +158,14 @@ _RETRYABLE_SKIP_REASONS = RETRIED_DEGRADATIONS
 # DIFF_TOO_LARGE belongs here for the same reason: its degraded check already
 # says the diff is over GitHub's size limit and what to do about it, and no
 # retry changes GitHub's answer.
+#
+# LOW_CONFIDENCE (grug#1097) publishes its own advisory check the same way a
+# partial review does.
 _SELF_COMPLETING_SKIP_REASONS = frozenset({
     "no_diff",
     "fail_open_freshness",
     "partial_review",
+    LOW_CONFIDENCE,
     DIFF_TOO_LARGE,
 })
 
@@ -321,9 +331,12 @@ def _complete_elder_check_open(
 ) -> bool:
     """Post a TERMINAL Elder check so required-status never sticks in_progress.
 
-    FLINT-style fail-open: infra failure / GH brownout / superseded head
-    must complete the required check as neutral (passes merge) with an honest
-    title, never leave "in_progress" forever. Never raises. Returns False
+    Infra failure / GH brownout / superseded head must complete the required
+    check with an honest title, never leave "in_progress" forever. A
+    superseded head completes `neutral` (it is not the head that merges);
+    a degraded exit on the current head passes `degraded_conclusion(...)`,
+    which is `failure` when the repo's Elder is blocking (grug#1212,
+    ADR-0023) and `neutral` in WARN mode. Never raises. Returns False
     only on a transient post failure (the completion did NOT land, so the
     check may still be stuck); callers on a current-head exit should redrive
     in that case rather than silently finishing the job."""
@@ -1112,6 +1125,40 @@ def _fetch_current_pr(
     )
 
 
+def _elder_blocking_from_pr(install_id: int, pr: dict[str, Any]) -> bool | None:
+    """The repo's `code_reviewer_blocking` for an already-fetched PR, or
+    None when it cannot be read. Callers hand None to `degraded_conclusion`,
+    which fails closed (grug#1212). Never raises."""
+    try:
+        repo_id = int(((pr.get("base") or {}).get("repo") or {})["id"])
+        return bool(
+            get_repo_config(install_id, repo_id).get("code_reviewer_blocking", False)
+        )
+    except Exception as error:  # noqa: BLE001 - unknown mode fails closed
+        log.warning(
+            "elder_blocking_mode_unreadable",
+            extra={"install_id": install_id, "kind": type(error).__name__},
+        )
+        return None
+
+
+def elder_blocking_for(
+    install_id: int, owner: str, repo_name: str, pr_number: int,
+) -> bool | None:
+    """The repo's Elder mode for a PR known only by coordinates (the DLQ
+    announcement), or None when the PR or the config cannot be read.
+    Never raises."""
+    try:
+        pr = _fetch_current_pr(install_id, owner, repo_name, pr_number)
+    except Exception as error:  # noqa: BLE001 - unknown mode fails closed
+        log.warning(
+            "elder_blocking_mode_unreadable",
+            extra={"install_id": install_id, "kind": type(error).__name__},
+        )
+        return None
+    return _elder_blocking_from_pr(install_id, pr)
+
+
 def _review_payload(
     *,
     install_id: int,
@@ -1197,9 +1244,9 @@ def _redrive_or_give_up(
 
     A genuinely NEW commit (current_head_sha != claimed_head_sha) always
     redrives with a fresh count - AC3 is about looping on an UNCHANGED sha,
-    never about penalizing an ordinary incremental push. Fail-open (neutral,
-    not failure) on giving up, matching the advisory posture every other
-    degraded path here already takes.
+    never about penalizing an ordinary incremental push. Giving up completes
+    the check as a degraded exit (`neutral` in WARN mode, `failure` in BLOCK
+    mode): no review landed on this head (grug#1212).
 
     Returns True if re-enqueued, False if it gave up instead."""
     repo_full = f"{owner}/{repo_name}"
@@ -1215,6 +1262,7 @@ def _redrive_or_give_up(
                 "redrive_count": job_redrive_count,
             },
         )
+        blocking = _elder_blocking_from_pr(install_id, pr)
         _complete_elder_check_open(
             install_id=install_id,
             owner=owner,
@@ -1222,15 +1270,16 @@ def _redrive_or_give_up(
             pr_number=pr_number,
             head_sha=claimed_head_sha,
             title="Elder gave up - PR kept changing mid-review",
-            summary=(
+            summary=lead_with_degraded_line(
                 f"This PR's title or body changed {job_redrive_count} times "
                 "while Elder was reviewing the same commit, faster than a "
                 "review could finish. Elder gave up rather than loop "
-                "forever (fail-open, merge not blocked). Push a no-op "
+                "forever. " + gate_sentence(blocking) + " Push a no-op "
                 "commit, or wait for edits to settle, then re-request "
-                "review."
+                "review.",
+                "intent_drift_exhausted",
             ),
-            conclusion="neutral",
+            conclusion=degraded_conclusion(blocking),
         )
         return False
     _enqueue_current_review(
@@ -1874,6 +1923,10 @@ def _run_hot_review(
             return "stale_snapshot" if redrived else "intent_drift_exhausted"
 
         cfg = get_repo_config(install_id, repo_id)
+        # The Elder mode is read ONCE and frozen for this pass: the review
+        # and every degraded terminal check below conclude under the same
+        # mode (grug#1212), even if the toggle flips mid-flight.
+        elder_blocking = bool(cfg.get("code_reviewer_blocking", False))
         # Mid-flight cancellation (#635 follow-up): current_snapshot_id is the
         # snapshot this job is ABOUT to spend the Elder budget on (checked
         # fresh, immediately above). The watch loop re-fetches the PR every
@@ -1911,7 +1964,7 @@ def _run_hot_review(
                         pr_number=pr_number,
                         pr=after,
                     ),
-                    blocking=bool(cfg.get("code_reviewer_blocking", False)),
+                    blocking=elder_blocking,
                     cancel_event=watch.cancel,
                 )
             finally:
@@ -1998,9 +2051,12 @@ def _run_hot_review(
             # payload and collect the identical answer five times over - which
             # is exactly how four Elder jobs reached the DLQ. It completes below
             # like pass/fail; dispatch already logged the status and body.
-            # Fail-open like FLINT: infra / GH brownout must COMPLETE the
-            # required check as neutral, never leave in_progress forever and
-            # never redrive forever. Real model findings still use pass/fail.
+            # Infra / GH brownout must COMPLETE the required check, never
+            # leave in_progress forever and never redrive forever. No review
+            # landed, so the conclusion follows the repo's Elder mode
+            # (grug#1212): `failure` in BLOCK, `neutral` in WARN - the same
+            # `elder_blocking` the review itself ran under. Real model
+            # findings still use pass/fail.
             if result_status == "skipped" and degraded_reason == "freshness_check_failed":
                 posted = _complete_elder_check_open(
                     install_id=install_id,
@@ -2009,13 +2065,14 @@ def _run_hot_review(
                     pr_number=pr_number,
                     head_sha=head_sha,
                     title="Elder eyes clouded - GitHub unavailable",
-                    summary=(
+                    summary=lead_with_degraded_line(
                         "Could not re-fetch the PR to confirm snapshot freshness "
-                        "(GitHub 5xx / transport). Grug fail-open: required check "
-                        "concludes **neutral** so merge is not blocked by infra. "
-                        "Push again or re-run Elder when GitHub is healthy."
+                        "(GitHub 5xx / transport). "
+                        + gate_sentence(elder_blocking)
+                        + " Push again or re-run Elder when GitHub is healthy.",
+                        degraded_reason,
                     ),
-                    conclusion="neutral",
+                    conclusion=degraded_conclusion(elder_blocking),
                 )
                 if not posted:
                     # The same brownout ate the neutral completion: finishing the
@@ -2053,7 +2110,7 @@ def _run_hot_review(
                 result_status == "skipped"
                 and degraded_reason not in _SELF_COMPLETING_SKIP_REASONS
             ):
-                # Unknown skip: still fail-open rather than infinite redrive.
+                # Unknown skip: complete the check rather than redrive forever.
                 posted = _complete_elder_check_open(
                     install_id=install_id,
                     owner=owner,
@@ -2061,12 +2118,13 @@ def _run_hot_review(
                     pr_number=pr_number,
                     head_sha=head_sha,
                     title=f"Elder skipped - {degraded_reason or 'unknown'}",
-                    summary=(
+                    summary=lead_with_degraded_line(
                         f"Review returned skipped ({degraded_reason or 'unknown'}). "
-                        "Grug fail-open: required check concludes **neutral** so "
-                        "infra cannot brick the merge. Re-run Elder if needed."
+                        + gate_sentence(elder_blocking)
+                        + " Re-run Elder if needed.",
+                        degraded_reason,
                     ),
-                    conclusion="neutral",
+                    conclusion=degraded_conclusion(elder_blocking),
                 )
                 if not posted:
                     # Fail-open only counts if the completion landed; otherwise

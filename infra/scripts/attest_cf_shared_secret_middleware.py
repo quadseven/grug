@@ -34,15 +34,14 @@ MAIN_PATHS = (
 )
 
 # Cross-source structural-drift guard: the header literal must match
-# across the shared middleware, the CF Worker code, the deploy script
-# that templates the Workers, and the DD monitor that alerts on
-# mismatches. If any side renames the header without the others, the
-# auth boundary silently fails and the monitor stops alerting.
+# across the shared middleware and the deploy script that templates the
+# CF Workers. If either side renames the header without the other, the
+# auth boundary silently fails. (The Datadog mismatch monitor that also
+# carried it was retired with the Datadog components, #1223.)
 HEADER_LITERAL = "X-Grug-CF-Secret"
 HEADER_LITERAL_SOURCES = (
     REPO_ROOT / "services/_shared/cf_auth.py",
     REPO_ROOT / "infra/cloudflare/deploy.sh",
-    REPO_ROOT / "infra/pulumi/components/dd_monitors.py",
 )
 
 
@@ -139,7 +138,7 @@ def main() -> int:
             failures.append(
                 f"FAIL: {path} — missing header literal '{HEADER_LITERAL}'. "
                 "Renaming the header requires updating ALL of: "
-                "cf_auth.py (services/_shared/), deploy.sh, dd_monitors.py."
+                "cf_auth.py (services/_shared/) and deploy.sh."
             )
 
     # 2 + 3. cf_auth.py-side bools
@@ -174,7 +173,7 @@ def main() -> int:
         "exempt, hmac.compare_digest used for header validation, and the "
         f"'{HEADER_LITERAL}' literal is present in all "
         f"{len(HEADER_LITERAL_SOURCES)} cross-source sites "
-        "(cf_auth.py x2, deploy.sh, dd_monitors.py)."
+        "(cf_auth.py, deploy.sh)."
     )
     return 0
 

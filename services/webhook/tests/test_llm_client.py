@@ -55,6 +55,18 @@ def _hunk(path="src/x.py", body="@@ -1 +1 @@\n-foo\n+bar") -> Hunk:
     return Hunk(path=path, body=body)
 
 
+def _one_ladder_walk(hunks: list[Hunk], installation_id: int) -> LlmReviewResponse:
+    """One walk down the model ladder, without review_diff's chunk retry.
+
+    grug#1196: review_diff retries a failed chunk once, starting at the next
+    model the first walk did not reach. Tests that pin what ONE walk does
+    (where it stops, what it attributes) call this instead."""
+    return lc._review_diff_dispatch(
+        hunks, installation_id, None, None, None, None, None, None,
+        "caveman", None,
+    )
+
+
 def _openai_json_response(findings_json: str) -> dict:
     """OpenAI-compatible chat completion shape both backends return."""
     return {
@@ -655,16 +667,17 @@ def test_deep_review_consults_both_arms_and_merges_findings(monkeypatch) -> None
 
 def test_deep_review_runs_both_arms_concurrently_not_sequentially(monkeypatch) -> None:
     """Arm parallelization: deep mode's two arms must overlap in wall-clock,
-    not sum. Each mocked backend call sleeps 0.2s; sequential execution would
-    take >=0.4s, concurrent execution should finish close to 0.2s. A generous
-    upper bound (0.35s) absorbs scheduling/GIL-release jitter without letting
-    a regression back to sequential silently pass."""
+    not sum. Each mocked backend call sleeps 0.5s; sequential execution would
+    take >=1.0s, concurrent execution should finish close to 0.5s. The upper
+    bound (0.9s) leaves 0.4s for `review_diff`'s own overhead on a loaded
+    machine (a 0.15s margin flaked) while still failing on any regression
+    back to sequential."""
     import time
 
     monkeypatch.setenv("GRUG_REVIEW_DEPTH", "deep")
 
     def respond(url, **kwargs):
-        time.sleep(0.2)
+        time.sleep(0.5)
         content = '{"findings": []}'
         body = _openai_json_response(content)
         body["model"] = "poolside/Laguna-S-2.1-NVFP4" if _is_reasoner(kwargs) else "qwen3-coder-next:q8_0"
@@ -677,7 +690,7 @@ def test_deep_review_runs_both_arms_concurrently_not_sequentially(monkeypatch) -
 
     assert mock_post.call_count == 2
     assert out.kind == "reviewed"
-    assert elapsed < 0.35, f"expected concurrent arms (~0.2s), took {elapsed:.3f}s"
+    assert elapsed < 0.9, f"expected concurrent arms (~0.5s), took {elapsed:.3f}s"
 
 
 def test_call_backend_cancel_event_aborts_in_flight_request() -> None:
@@ -1556,7 +1569,7 @@ def test_saas_overload_fallback_skipped_when_cave_returns_parse_failed(monkeypat
         return httpx.Response(200, json=_openai_json_response("not json"))
 
     with patch.object(httpx, "post", side_effect=respond):
-        out = review_diff([_hunk()], installation_id=1)
+        out = _one_ladder_walk([_hunk()], installation_id=1)
 
     assert out.kind == "parse_failed"
     assert len(call_log) == 2  # both Cave arms only, no SaaS fallback
@@ -2204,7 +2217,7 @@ def test_llmobs_config_error_annotates_with_error_config(monkeypatch) -> None:
     # it a clean transport failure so its spans are distinguishable
     # (error=ConnectError, not error=config) from the Cave arms' spans.
     with patch.object(httpx, "post", side_effect=httpx.ConnectError("down")) as mock_post:
-        out = review_diff([_hunk()], installation_id=1)
+        out = _one_ladder_walk([_hunk()], installation_id=1)
 
     assert out.kind == "all_failed"
     # Cave never dialed HTTP; only the two overload-fallback attempts did.
@@ -3840,6 +3853,128 @@ def test_parse_response_recovers_the_fence_even_when_backtick_soup_follows() -> 
     assert len(findings) == 1
 
 
+# --- grug#1231: a findings list cut off at the output cap ------------------
+
+
+def _cut_off_findings(count: int, *, severity: str = "low") -> str:
+    """The #989 shape: `{"findings": [` then `count` complete findings, then
+    a partial one cut off mid-string at the output cap. With 135 findings
+    this is about 29k characters, the observed 28-30k."""
+    complete = ", ".join(
+        json.dumps({
+            "path": "src/x.py", "line": 2, "rule": f"rule-{i}",
+            "severity": severity,
+            "message": f"Grug see problem number {i} in this stone. " * 3,
+        })
+        for i in range(count)
+    )
+    return (
+        '{"findings": [' + complete
+        + ', {"path": "src/x.py", "line": 3, "rule": "lost-err", "message": "Grug se'
+    )
+
+
+def test_parse_review_keeps_every_complete_finding_of_a_cut_off_list() -> None:
+    """grug#1231: the 4 errored #989 eval cases and a measured share of live
+    `parse_failed` reviews were this shape. Every closed finding is a real
+    answer; only the partial last one is dropped, and the result says it
+    was cut off. Fails on main (`_parse_review` does not exist; the old
+    parser returned `llm returned non-json` and no findings)."""
+    content = _cut_off_findings(135)
+    assert 28_000 < len(content) < 30_000
+
+    parsed = lc._parse_review(_fenced_response(content))
+
+    assert parsed.error == ""
+    assert parsed.truncated_findings is True
+    assert len(parsed.findings) == 135
+    assert [f.rule for f in parsed.findings[:2]] == ["rule-0", "rule-1"]
+    assert "lost-err" not in {f.rule for f in parsed.findings}
+
+
+def test_parse_review_validates_recovered_findings_like_complete_ones() -> None:
+    """A recovered item gets the same `_coerce_finding` validation as a normal
+    answer: an invalid severity is dropped, nothing is invented."""
+    good = {"path": "a.py", "line": 1, "rule": "null-deref",
+            "severity": "high", "message": "m"}
+    bad = {"path": "a.py", "line": 1, "rule": "x", "severity": "urgent",
+           "message": "m"}
+    content = (
+        '```json\n{"findings": [' + json.dumps(good) + ", " + json.dumps(bad)
+        + ', {"path": "a.py", "li'
+    )
+
+    parsed = lc._parse_review(_fenced_response(content))
+
+    assert parsed.truncated_findings is True
+    assert [f.rule for f in parsed.findings] == ["null-deref"]
+
+
+@pytest.mark.parametrize("content", [
+    "Grug think hard but Grug write only words, no tablets.",
+    # Cut inside the FIRST finding: nothing complete to keep.
+    '{"findings": [{"path": "a.py", "line": 1, "ru',
+    # The envelope closed, so it was not cut off; it is malformed (no comma).
+    '{"findings": [{"path": "a.py", "line": 1} {"path": "b.py", "line": 2}]}',
+    # Prose that quotes the envelope is not the envelope.
+    'Grug would answer {"findings": [{"path": "a.py", "line": 1}, {"pa',
+])
+def test_parse_review_non_json_still_fails_as_before(content: str) -> None:
+    parsed = lc._parse_review(_fenced_response(content))
+
+    assert parsed.findings == ()
+    assert parsed.truncated_findings is False
+    assert parsed.error.startswith("llm returned non-json")
+
+
+def test_parse_response_tuple_still_fails_a_cut_off_list_with_a_named_reason() -> None:
+    """A caller that only reads the old 3-tuple cannot tell partial from
+    complete, so it keeps failing the answer, now naming why."""
+    findings, _model, err = lc._parse_response(_fenced_response(_cut_off_findings(3)))
+
+    assert findings == ()
+    assert err.startswith("truncated_findings")
+    assert "3 complete findings" in err
+
+
+def test_review_reasoner_diff_cut_off_findings_is_partial_not_clean(monkeypatch) -> None:
+    """grug#1231 live half: a recovered cut-off answer publishes its findings
+    as a PARTIAL review (the grug#851 `partial review:` seam), never as a
+    complete one - even when the provider reports `finish_reason=stop`, so
+    the cut itself is the only signal. Fails on main (parse_failed)."""
+    monkeypatch.setenv("GRUG_CAVE_GATEWAY_URL", "http://cave.test")
+    body = _openai_json_response(_cut_off_findings(5))
+    body["choices"][0]["finish_reason"] = "stop"
+
+    with patch.object(httpx, "post", return_value=httpx.Response(200, json=body)):
+        out = lc.review_reasoner_diff([_hunk()], installation_id=1)
+
+    assert out.kind == "reviewed"
+    assert len(out.findings) == 5
+    assert out.error.startswith("partial review:"), out.error
+    assert "truncated_findings" in out.error
+
+
+def test_saas_overload_fallback_cut_off_findings_is_partial(monkeypatch) -> None:
+    """The last-resort SaaS path builds its own response; a cut-off answer
+    there must read as partial too."""
+    monkeypatch.setattr(lc, "_RETRY_SLEEP", lambda s: None)
+
+    def respond(url, **kwargs):
+        model = (kwargs.get("json") or {}).get("model", "")
+        if model in ("qwen3-coder-next:q8_0", "poolside/Laguna-S-2.1-NVFP4"):
+            raise httpx.ConnectTimeout("cave overloaded")
+        return httpx.Response(200, json=_openai_json_response(_cut_off_findings(2)))
+
+    with patch.object(httpx, "post", side_effect=respond):
+        out = review_diff([_hunk()], installation_id=1)
+
+    assert out.kind == "reviewed"
+    assert out.backend_used == Backend.POOLSIDE
+    assert len(out.findings) == 2
+    assert out.error.startswith("partial review:"), out.error
+
+
 # --- grug#906: configurable review backend priority (cloud-first option) ---
 
 
@@ -3996,7 +4131,7 @@ def test_cloud_priority_parse_failed_is_not_masked_by_a_cave_retry(monkeypatch) 
     )
 
     with patch.object(httpx, "post", return_value=bad_response) as mock_post:
-        out = review_diff([_hunk()], installation_id=1)
+        out = _one_ladder_walk([_hunk()], installation_id=1)
 
     assert out.kind == "parse_failed"
     assert out.backend_used == Backend.OPENCODE_GO
@@ -4676,7 +4811,7 @@ def test_opencode_go_parse_failure_is_still_the_answer_after_a_free_tier_miss(
     junk = httpx.Response(200, json=_openai_json_response("not json at all"))
 
     with patch.object(httpx, "post", side_effect=[junk, junk, junk]) as post:
-        out = review_diff([_hunk()], installation_id=1)
+        out = _one_ladder_walk([_hunk()], installation_id=1)
 
     assert out.kind == "parse_failed"
     assert out.backend_used == Backend.OPENCODE_GO
@@ -5116,6 +5251,9 @@ def test_three_client_errors_bench_the_model(monkeypatch, caplog, status) -> Non
         observability, "emit_count",
         lambda name, value, tags=None: emitted.append((name, value, tags)),
     )
+    # The provider breaker (grug#1225) stops calls after the first 401/402;
+    # this test isolates the per-model bench underneath it.
+    monkeypatch.setattr(lc, "_note_provider_response", lambda *_: None)
     cfg = _go_cfg()
     with caplog.at_level("WARNING"):
         for _ in range(2):
@@ -5195,7 +5333,10 @@ def test_failures_before_a_success_do_not_carry_over() -> None:
     httpx.Response(400, json={"error": {"message": "prompt is too long"}}),
     httpx.Response(408, text="request timeout"),
 ])
-def test_outages_limits_and_request_errors_never_bench(resp) -> None:
+def test_outages_limits_and_request_errors_never_bench(monkeypatch, resp) -> None:
+    # Spent-limit refusals trip the provider breaker (grug#1225), which would
+    # refuse the repeat calls this test needs; the bench is what it checks.
+    monkeypatch.setattr(lc, "_note_provider_response", lambda *_: None)
     cfg = lc.replace(_go_cfg(), retry_attempts=1)
     for _ in range(5):
         _call(cfg, resp)
@@ -5220,12 +5361,17 @@ def test_the_bench_is_per_model(monkeypatch) -> None:
     assert "space-bunny-free" in models
 
 
+def _cloud_chain_worst_case_s() -> float:
+    """Seconds one walk of the cloud chain can take: every tier's timeout."""
+    return sum(tier.timeout_seconds for tier in lc._cloud_chain_tiers())
+
+
 def test_benched_tiers_are_skipped_in_the_walk_and_the_worst_case(monkeypatch) -> None:
     monkeypatch.setenv("GRUG_REVIEW_BACKEND_PRIORITY", "cloud")
-    before = lc._cloud_chain_worst_case_s()
+    before = _cloud_chain_worst_case_s()
     for _ in range(3):
         _call(_go_cfg(), _err(404))
-    assert lc._cloud_chain_worst_case_s() == before - lc._opencode_go_chain_config().timeout_seconds
+    assert _cloud_chain_worst_case_s() == before - lc._opencode_go_chain_config().timeout_seconds
     real = _usage_response(_JUNK_FINDING, 15_000, 400)
     with patch.object(httpx, "post", return_value=real) as post:
         out = review_diff([_hunk()], installation_id=1)
@@ -5422,11 +5568,11 @@ def test_slow_bench_expires(monkeypatch) -> None:
 def test_slow_benched_tier_is_skipped_and_leaves_the_worst_case(monkeypatch) -> None:
     monkeypatch.setenv("GRUG_REVIEW_BACKEND_PRIORITY", "cloud")
     monkeypatch.setenv("GRUG_OPENCODE_GO_FALLBACK_MODEL", "deepseek-v4.1-flash")
-    before = lc._cloud_chain_worst_case_s()
+    before = _cloud_chain_worst_case_s()
     primary = next(t for t in lc._cloud_chain_tiers() if t.model == "space-bunny-free")
     _timeout(_go_cfg(), 3)
     assert _free_models()[0] == "deepseek-v4.1-flash"
-    assert lc._cloud_chain_worst_case_s() == before - primary.timeout_seconds
+    assert _cloud_chain_worst_case_s() == before - primary.timeout_seconds
 
 
 def test_a_success_clears_the_slow_bench_and_the_backoff(monkeypatch) -> None:
@@ -5550,3 +5696,112 @@ def test_a_slow_primary_is_skipped_on_the_next_review(monkeypatch) -> None:
         out = review_diff([_hunk()], installation_id=1)
     assert out.kind == "reviewed"
     assert calls == ["deepseek-v4.1-flash"]
+
+
+# --- grug#1097: a short empty answer is kept when nothing better answers ---
+
+
+def _pin_deepseek_primary(monkeypatch) -> str:
+    paid = "deepseek-v4.1-flash"
+    monkeypatch.setattr(lc, "_OPENCODE_GO_MODEL", paid)
+    monkeypatch.setitem(
+        lc._BACKEND_CONFIGS, Backend.OPENCODE_GO,
+        lc.replace(lc._BACKEND_CONFIGS[Backend.OPENCODE_GO], model=paid),
+    )
+    return paid
+
+
+def test_deepseek_degenerate_with_every_later_tier_failing_is_low_confidence(
+    monkeypatch,
+) -> None:
+    """grug#1097: DeepSeek answered `{"findings": []}` in a few tokens, then
+    every later tier (the free tier, Poolside, the Cave) failed. The answer
+    used to be discarded and the cohort failed, which spent the staged budget
+    on retries. It is kept as a clean result with its own degraded reason."""
+    monkeypatch.setenv("GRUG_REVIEW_BACKEND_PRIORITY", "cloud")
+    monkeypatch.setenv("GRUG_CLOUD_FREE_TIER_MODEL", "z-ai/glm-5.2:free")
+    _admit_free_tier(monkeypatch)
+    paid = _pin_deepseek_primary(monkeypatch)
+    models: list[str] = []
+
+    def respond(_url, **kwargs) -> httpx.Response:
+        model = kwargs["json"].get("model", "")
+        models.append(model)
+        if model == paid:
+            return _degenerate_response()
+        raise httpx.ConnectError("down")
+
+    with patch.object(httpx, "post", side_effect=respond):
+        out = review_diff([_hunk()], installation_id=1)
+
+    assert out.kind == "reviewed"
+    assert out.findings == ()
+    assert out.backend_used == Backend.OPENCODE_GO
+    assert out.error.startswith("low confidence:")
+    # Kept, not retried: the chunk is a result, so the ladder stops.
+    assert models.count(paid) == 1
+    evaluation = evaluate_diff((), out)
+    assert evaluation.degraded_reason == "low_confidence_review"
+    assert evaluation.conclusion == "neutral"
+
+
+def test_low_confidence_cohort_does_not_starve_the_next_cohort(monkeypatch) -> None:
+    """grug#1097: one degenerate cohort walked the whole chain, failed, and
+    was retried, so later cohorts went unreviewed. Now the degenerate cohort
+    keeps its answer, the next cohort is reviewed, and nothing is failed."""
+    monkeypatch.setenv("GRUG_REVIEW_BACKEND_PRIORITY", "cloud")
+    monkeypatch.setenv("GRUG_REVIEW_COHORT_CHARS", "8000")
+    paid = _pin_deepseek_primary(monkeypatch)
+    hunks = [
+        _hunk("src/x.py", "@@ -1 +1 @@\n+SRC_CHANGE\n" + "s" * 4100),
+        _hunk("tests/test_x.py", "@@ -1 +1 @@\n+TEST_CHANGE\n" + "t" * 4100),
+    ]
+    src_primary_calls = 0
+
+    def respond(_url, **kwargs) -> httpx.Response:
+        nonlocal src_primary_calls
+        body = kwargs["json"]
+        prompt = body["messages"][1]["content"]
+        if body.get("model") != paid:
+            raise httpx.ConnectError("down")
+        if "SRC_CHANGE" in prompt:
+            src_primary_calls += 1
+            return _degenerate_response()
+        return _usage_response(
+            '{"findings": [{"path": "tests/test_x.py", "line": 1, "rule": "r", '
+            '"severity": "medium", "message": "m"}]}', 15_000, 400,
+        )
+
+    with patch.object(httpx, "post", side_effect=respond):
+        out = review_diff(hunks, installation_id=1)
+
+    assert out.kind == "reviewed"
+    assert [f.path for f in out.findings] == ["tests/test_x.py"]
+    assert out.coverage is not None
+    assert out.coverage.failed_cohorts == ()
+    assert out.error.startswith("low confidence:")
+    assert "cohorts [1]" in out.error
+    assert src_primary_calls == 1
+    evaluation = evaluate_diff((), out)
+    assert evaluation.degraded_reason == "low_confidence_review"
+
+
+def test_deep_append_keeps_a_degenerate_answer_when_the_reasoner_fails(
+    monkeypatch,
+) -> None:
+    """grug#1097, deep-append path: the Cave reasoner is the last tier there."""
+    monkeypatch.setenv("GRUG_REVIEW_BACKEND_PRIORITY", "cloud")
+    paid = _pin_deepseek_primary(monkeypatch)
+
+    def respond(_url, **kwargs) -> httpx.Response:
+        if kwargs["json"].get("model") == paid:
+            return _degenerate_response()
+        raise httpx.ConnectError("down")
+
+    with patch.object(httpx, "post", side_effect=respond):
+        out = lc.review_reasoner_diff([_hunk()], installation_id=1)
+
+    assert out.kind == "reviewed"
+    assert out.findings == ()
+    assert out.backend_used == Backend.OPENCODE_GO
+    assert out.error.startswith("low confidence:")

@@ -48,7 +48,7 @@ def _wire(monkeypatch, *, diff=_DIFF, trial=None, enabled=True):
         sm_dispatch, "with_install_token_retry",
         lambda _iid, fn: fn("tok"),
     )
-    monkeypatch.setattr(sm_dispatch, "_fetch_pr_diff", lambda *a, **k: diff)
+    monkeypatch.setattr(sm_dispatch, "fetch_pr_diff", lambda *a, **k: diff)
     monkeypatch.setattr(sm_dispatch, "get_scoped_install_token", lambda *a, **k: "scoped")
     monkeypatch.setattr(
         sm_dispatch, "post_check_run",

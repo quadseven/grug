@@ -39,7 +39,7 @@ webhook-test:
 		echo "FATAL: store-backed tests would SKIP in CI (GRUG_TEST_DATABASE_URL unset) - a skipped gate is a silent pass (audit H4)"; exit 1; fi
 	@if [ -n "$$CI" ] && ! command -v opengrep >/dev/null 2>&1 && ! command -v semgrep >/dev/null 2>&1; then \
 		echo "FATAL: SAST engine-backed rule tests (test_sast_rules.py, test_sast.py) would SKIP in CI (no opengrep/semgrep on PATH) - a skipped gate is a silent pass, the same shape as the ruff evidence layer sitting dead for weeks (#859)"; exit 1; fi
-	cd services/webhook && uv run --with pytest --with httpx --with pyjwt --with cryptography --with boto3 --with moto --with fastapi --with 'psycopg[binary,pool]' --with 'ddtrace>=3.5,<4' --with 'datadog-lambda>=6.107,<7' pytest tests/ -q
+	cd services/webhook && uv run --with pytest --with httpx --with pyjwt --with cryptography --with boto3 --with moto --with fastapi --with 'psycopg[binary,pool]' --with 'ddtrace>=3.5,<4' --with 'datadog-lambda>=6.107,<7' --with 'ruff>=0.16,<0.17' pytest tests/ -q
 
 api-test:
 	@if [ -n "$$CI" ] && [ -z "$$GRUG_TEST_DATABASE_URL" ]; then \
@@ -74,7 +74,7 @@ tear-down:
 
 # Round-trip verifier per Slice 10 #31, post-#354 (k8s). Steps:
 #   1. tear-down (pulumi destroy --stack dev) — AWS infra only
-#   2. pulumi up — recreate the AWS infra (SSM refs, KMS, SQS, S3, IAM, DD).
+#   2. pulumi up - recreate the AWS infra (SSM refs, KMS, SQS, S3, IAM).
 #      No ECR/bootstrap-image dance: the app no longer runs on Lambda.
 #   3. trigger deploy.k8s.yml to build + push the arm64 images, seed the
 #      in-cluster Secrets, and `kubectl apply -k k8s/`.
@@ -85,7 +85,7 @@ tear-down:
 #      PR check).
 #   5. smoke test all three public URLs.
 rebuild: tear-down
-	@echo ">> step 2/5: pulumi up — recreate AWS infra (SSM/KMS/SQS/S3/IAM/DD)"
+	@echo ">> step 2/5: pulumi up - recreate AWS infra (SSM/KMS/SQS/S3/IAM)"
 	cd infra/pulumi && pulumi up --stack dev --yes
 	@echo ">> step 3/5: trigger deploy.k8s.yml — build+push images, apply k8s/"
 	gh workflow run deploy.k8s.yml --ref $$(git branch --show-current) --repo quadseven/grug

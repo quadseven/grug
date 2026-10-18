@@ -11,6 +11,8 @@ Ownership is conservative on every axis:
     the hidden `grug-rule` marker;
   - any comment in the thread by anyone else (a person may be disagreeing)
     leaves it untouched, as does a comment list too long to inspect in full;
+  - a reply from the PR author that starts with "Fixed in" is treated as
+    the author confirming the fix, so the thread may still be resolved;
   - "code changed" is GitHub's own `isOutdated`, which flips only when a
     later commit changed or removed the anchored lines;
   - a thread whose original commit is gone (force-push) is skipped.
@@ -121,7 +123,7 @@ def _graphql(token: str, query: str, variables: dict[str, Any]) -> dict:
     return payload.get("data") or {}
 
 
-def _is_grug(login: str | None) -> bool:
+def is_grug(login: str | None) -> bool:
     return (login or "").removesuffix("[bot]") == _BOT_LOGIN
 
 
@@ -143,22 +145,37 @@ def _fetch_threads(token: str, owner: str, repo: str, pr: int) -> list[dict]:
     return out
 
 
-def _only_grug_comments(thread: dict) -> list[dict] | None:
-    """The thread's comments when every one is Elder's and the list is
-    complete, else None (a person may be involved or we cannot see all)."""
+def _only_grug_comments(thread: dict, pr_author: str | None = None) -> list[dict] | None:
+    """The thread's comments when the first is Elder's, the list is
+    complete, and any remaining comments are either Elder or the PR author
+    replying "Fixed in" (case-insensitive). Returns None when a person may
+    be disagreeing or we cannot see all comments."""
     comments = thread.get("comments") or {}
     nodes = comments.get("nodes") or []
     if not nodes or int(comments.get("totalCount") or 0) > len(nodes):
         return None
-    if not all(_is_grug((c.get("author") or {}).get("login")) for c in nodes):
+    if not is_grug((nodes[0].get("author") or {}).get("login")):
         return None
+    for c in nodes[1:]:
+        login = (c.get("author") or {}).get("login")
+        if is_grug(login):
+            continue
+        # A deleted account's comment has no login; without the `not
+        # pr_author` check it would match an unknown author (None == None).
+        if not pr_author or login != pr_author:
+            return None
+        # GitHub may send a null body; `or ""` keeps `.lower()` safe and
+        # makes such a reply block like any non-"Fixed in" reply.
+        body = (c.get("body") or "").lower()
+        if not body.startswith(_FIXED_REPLY_PREFIX.lower()):
+            return None
     return nodes
 
 
-def _owned_rule_and_line(thread: dict) -> tuple[str, str, int] | None:
-    """`(rule, path, original_line)` when the thread is wholly Elder's and
-    safe to close, else None."""
-    nodes = _only_grug_comments(thread)
+def _owned_rule_and_line(thread: dict, pr_author: str | None = None) -> tuple[str, str, int] | None:
+    """`(rule, path, original_line)` when the thread is Elder's (or the
+    author has already answered "Fixed in") and safe to close, else None."""
+    nodes = _only_grug_comments(thread, pr_author)
     if nodes is None:
         return None
     first = nodes[0]
@@ -179,22 +196,64 @@ def _owned_rule_and_line(thread: dict) -> tuple[str, str, int] | None:
 _FIXED_REPLY_PREFIX = "Fixed in "
 
 
-def _already_answered(thread: dict) -> bool:
-    """An earlier pass posted the "Fixed in" reply but its resolve failed."""
+def _already_answered(thread: dict, head_sha: str) -> bool:
+    """An earlier pass (or the PR author) posted a "Fixed in" reply but
+    the resolve call failed or has not run yet.
+
+    Counting the author's reply here is deliberate (#1147): only threads
+    that passed `select_fixed_threads` reach this check, so every non-Elder
+    reply is the PR author's own "Fixed in". A second "Fixed in" from Elder
+    would add noise, and the resolve still requires GitHub's `isOutdated`
+    and no nearby re-raise, so the author's word alone never closes a thread.
+    Pinned by `test_author_fixed_in_reply_is_not_answered_twice`."""
     nodes = (thread.get("comments") or {}).get("nodes") or []
-    return any((c.get("body") or "").startswith(_FIXED_REPLY_PREFIX) for c in nodes[1:])
+    prefix = _FIXED_REPLY_PREFIX.lower()
+    expected = head_sha[:7].lower()
+    expected_reply = f"{prefix}{expected}"
+    return any(
+        (body := (c.get("body") or "").lower()) == expected_reply
+        or body.startswith(f"{expected_reply}:")
+        for c in nodes[1:]
+    )
+
+
+def _blocked_by_person_reply(thread: dict, pr_author: str | None) -> bool:
+    """True when a non-author person has commented, making the thread unsafe
+    to close automatically."""
+    comments = thread.get("comments") or {}
+    nodes = comments.get("nodes") or []
+    if not nodes or int(comments.get("totalCount") or 0) > len(nodes):
+        return False
+    if not is_grug((nodes[0].get("author") or {}).get("login")):
+        return True
+    prefix = _FIXED_REPLY_PREFIX.lower()
+    for c in nodes[1:]:
+        login = (c.get("author") or {}).get("login")
+        if is_grug(login):
+            continue
+        if not pr_author or login != pr_author:
+            return True
+        if not (c.get("body") or "").lower().startswith(prefix):
+            return True
+    return False
 
 
 def select_fixed_threads(
     threads: list[dict], findings: tuple[Finding, ...],
-) -> list[str]:
-    """Node ids of threads that are Elder's, outdated, and not re-raised."""
+    *, pr_author: str | None = None,
+) -> tuple[list[str], int, int]:
+    """Node ids of threads that are Elder's, outdated, and not re-raised,
+    plus skip counts for person replies and re-raised findings."""
     picked: list[str] = []
+    skipped_person = 0
+    skipped_reraised = 0
     for t in threads:
         if t.get("isResolved") or not t.get("isOutdated"):
             continue
-        owned = _owned_rule_and_line(t)
+        owned = _owned_rule_and_line(t, pr_author)
         if owned is None:
+            if _blocked_by_person_reply(t, pr_author):
+                skipped_person += 1
             continue
         rule, path, line = owned
         if any(
@@ -202,27 +261,30 @@ def select_fixed_threads(
             and abs(f.line - line) <= _NEARBY_LINES
             for f in findings
         ):
+            skipped_reraised += 1
             continue
         picked.append(t["id"])
-    return picked
+    return picked, skipped_person, skipped_reraised
 
 
 def _resolve_or_collapse(
     installation_id: int, thread_id: str, comment_id: str | None,
-) -> None:
+) -> str:
     """Resolve the thread; if GitHub forbids it, collapse Elder's comment.
 
     GitHub answers `FORBIDDEN: Resource not accessible by integration` when
     the app lacks the permission resolving needs (seen live 2026-10-05),
     but an app may always minimize its own comment. Collapsing it as
     OUTDATED, under the "Fixed in" reply, is the same signal to the author.
+
+    Returns ``resolved`` or ``collapsed``.
     """
     try:
         with_install_token_retry(
             installation_id,
             lambda tok: _graphql(tok, _RESOLVE_MUTATION, {"thread": thread_id}),
         )
-        return
+        return "resolved"
     except GraphQLError as e:
         if "FORBIDDEN" not in e.types or not comment_id:
             raise
@@ -231,18 +293,21 @@ def _resolve_or_collapse(
         lambda tok: _graphql(tok, _MINIMIZE_MUTATION, {"subject": comment_id}),
     )
     log.info("elder_thread_collapsed_not_resolved", extra={"thread_id": thread_id})
+    return "collapsed"
 
 
 def resolve_fixed_threads(
     installation_id: int, owner: str, repo: str, pull_number: int,
     *, head_sha: str, findings: tuple[Finding, ...],
     threads: list[dict] | None = None,
+    pr_author: str | None = None,
 ) -> int:
     """Reply "fixed in <sha>" and resolve each qualifying Elder thread.
 
     `threads` is an already-fetched listing (shared with the carry-forward
-    pass so a review lists once); None fetches it here. Returns the number
-    resolved. Never raises.
+    pass so a review lists once); None fetches it here. `pr_author` lets
+    threads the PR author already answered "Fixed in" be closed without a
+    second reply. Returns the number of threads touched. Never raises.
     """
     pr_ref = f"{owner}/{repo}#{pull_number}"
     try:
@@ -251,8 +316,13 @@ def resolve_fixed_threads(
                 installation_id,
                 lambda tok: _fetch_threads(tok, owner, repo, pull_number),
             )
-        targets = select_fixed_threads(threads, findings)
-        answered = {t["id"] for t in threads if t.get("id") in targets and _already_answered(t)}
+        targets, skipped_person, skipped_reraised = select_fixed_threads(
+            threads, findings, pr_author=pr_author,
+        )
+        answered = {
+            t["id"] for t in threads
+            if t.get("id") in targets and _already_answered(t, head_sha)
+        }
         first_comment_ids = {
             t["id"]: ((t.get("comments") or {}).get("nodes") or [{}])[0].get("id")
             for t in threads if t.get("id") in targets
@@ -266,6 +336,8 @@ def resolve_fixed_threads(
         "this review does not raise it again."
     )
     resolved = 0
+    collapsed = 0
+    failed = 0
     for thread_id in targets:
         try:
             # Reply and resolve are separate calls, each retried on its own,
@@ -278,14 +350,21 @@ def resolve_fixed_threads(
                         tok, _REPLY_MUTATION, {"thread": tid, "body": body},
                     ),
                 )
-            _resolve_or_collapse(installation_id, thread_id, first_comment_ids.get(thread_id))
-            resolved += 1
+            outcome = _resolve_or_collapse(
+                installation_id, thread_id, first_comment_ids.get(thread_id),
+            )
+            if outcome == "resolved":
+                resolved += 1
+            else:
+                collapsed += 1
         except Exception as e:  # noqa: BLE001 - one bad thread must not stop the rest
+            failed += 1
             log.warning("elder_thread_resolve_failed",
                         extra={"pr": pr_ref, "thread_id": thread_id,
                                "kind": type(e).__name__})
-    if targets:
-        log.info("elder_threads_resolved",
-                 extra={"pr": pr_ref, "resolved": resolved,
-                        "candidates": len(targets)})
-    return resolved
+    log.info("elder_threads_resolved",
+             extra={"pr": pr_ref, "resolved": resolved, "collapsed": collapsed,
+                    "skipped_person": skipped_person,
+                    "skipped_reraised": skipped_reraised,
+                    "candidates": len(targets), "failed": failed})
+    return resolved + collapsed

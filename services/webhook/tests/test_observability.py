@@ -22,6 +22,14 @@ import pytest
 from observability import JsonFormatter, configure_logging, emit_enforcement_metric
 
 
+@pytest.fixture(autouse=True)
+def _datadog_switch_on(monkeypatch):
+    """These tests pin the Datadog integration's own behavior, which only
+    runs with GRUG_DATADOG_ENABLED on (#1208). The off path is pinned in
+    test_datadog_switch.py."""
+    monkeypatch.setenv("GRUG_DATADOG_ENABLED", "true")
+
+
 def _format_record(level=logging.INFO, msg="hello", **extra):
     record = logging.LogRecord(
         name="grug.test", level=level, pathname="/tmp/x.py", lineno=1,

@@ -4,8 +4,9 @@ Wraps `POST /repos/{owner}/{repo}/pulls/{pull_number}/reviews` for the
 Elder (code-reviewer) persona. Supports two events:
 
   - COMMENT: advisory mode — reports findings but does not block merge.
-  - REQUEST_CHANGES: blocking mode — blocks merge until a follow-up
-    review approves or the PR is updated.
+  - REQUEST_CHANGES: blocking mode — blocks merge until the same
+    reviewer approves or the review is dismissed. A new push does NOT
+    clear it; see `dismiss_review`.
 
 `APPROVE` is intentionally not modeled. Grug does not automatically
 approve PRs (it would short-circuit human review and is not what an
@@ -144,6 +145,77 @@ def post_review(
     resp = httpx.post(
         f"{_GH_API}/repos/{quote(owner, safe='')}/{quote(repo, safe='')}/pulls/{pull_number}/reviews",
         json=asdict(result),
+        headers={
+            "Authorization": f"Bearer {install_token}",
+            "Accept": "application/vnd.github+json",
+            "X-GitHub-Api-Version": "2022-11-28",
+        },
+        timeout=10,
+    )
+    resp.raise_for_status()
+    return resp.json()
+
+
+def list_reviews(
+    install_token: str,
+    owner: str,
+    repo: str,
+    *,
+    pull_number: int,
+) -> list[dict]:
+    """List every review on a PR, oldest first.
+
+    Paginates the same way as `get_review_comments`. Does NOT catch 401:
+    `with_install_token_retry` at the call site owns invalidate + retry.
+    """
+    out: list[dict] = []
+    for page in range(1, _MAX_REVIEW_COMMENT_PAGES + 1):
+        resp = httpx.get(
+            f"{_GH_API}/repos/{quote(owner, safe='')}/{quote(repo, safe='')}/pulls/{pull_number}/reviews",
+            params={"per_page": 100, "page": page},
+            headers={
+                "Authorization": f"Bearer {install_token}",
+                "Accept": "application/vnd.github+json",
+                "X-GitHub-Api-Version": "2022-11-28",
+            },
+            timeout=10,
+        )
+        resp.raise_for_status()
+        body = resp.json()
+        if not isinstance(body, list):
+            break
+        out.extend(body)
+        if len(body) < 100:
+            break
+    else:
+        _log.warning(
+            "list_reviews_page_cap_hit",
+            extra={"repo": f"{owner}/{repo}", "pull_number": pull_number,
+                   "max_pages": _MAX_REVIEW_COMMENT_PAGES},
+        )
+    return out
+
+
+def dismiss_review(
+    install_token: str,
+    owner: str,
+    repo: str,
+    *,
+    pull_number: int,
+    review_id: int,
+    message: str,
+) -> dict:
+    """Dismiss one review (`PUT .../reviews/{id}/dismissals`).
+
+    A REQUEST_CHANGES review stays the reviewer's standing verdict until
+    the same reviewer approves or the review is dismissed; a later COMMENT
+    review does not replace it. Grug never approves, so dismissal is the
+    only way it can withdraw its own block. Needs `pull_requests: write`,
+    which the app already holds.
+    """
+    resp = httpx.put(
+        f"{_GH_API}/repos/{quote(owner, safe='')}/{quote(repo, safe='')}/pulls/{pull_number}/reviews/{review_id}/dismissals",
+        json={"message": message, "event": "DISMISS"},
         headers={
             "Authorization": f"Bearer {install_token}",
             "Accept": "application/vnd.github+json",

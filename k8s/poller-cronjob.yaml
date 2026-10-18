@@ -48,8 +48,9 @@ spec:
           containers:
             - name: poller
               image: REGISTRY_PLACEHOLDER/grug-webhook:TAG_PLACEHOLDER
-              # ddtrace-run so poller spans are not silently dropped (review F4).
-              command: ["ddtrace-run", "python", "-c", "from poller_handler import handler; handler({}, None)"]
+              # ddtrace-run (via datadog_switch, only when GRUG_DATADOG_ENABLED is on,
+              # #1208) so poller spans are not silently dropped (review F4).
+              command: ["python", "-m", "datadog_switch", "python", "-c", "from poller_handler import handler; handler({}, None)"]
               # envFrom is APP CONFIG ONLY: env credentials would out-rank
               # credential_process in the SDK chain and silently bypass the
               # Roles Anywhere path the boot proof asserts (#388/#389; the
@@ -85,6 +86,12 @@ spec:
                 - {name: GRUG_OPENCODE_GO_SECOND_MODEL, value: "mimo-v2.5"}
                 - {name: GRUG_OPENCODE_GO_FALLBACK_MODEL, value: "longcat-2.5-preview-free"}
                 - {name: GRUG_CLOUD_FREE_TIER_MODEL, value: "nvidia/nemotron-3-super-120b-a12b:free"}
+                # grug#1225: switched off 2026-10-17, the OpenCode Go allowance and
+                # the OpenRouter credit are spent and not being refilled (36 Go 401s,
+                # 11 OpenRouter paid refusals, 139 free per-day 429s over 402 Elder
+                # runs). A listed backend is never called. Re-enable one by deleting
+                # its entry; `openrouter:free` or `openrouter:paid` narrows to one pool.
+                - {name: GRUG_DISABLED_BACKENDS, value: "opencode-go,openrouter"}
                 - {name: GRUG_OPENROUTER_REVIEW_MODEL, value: "nvidia/nemotron-3-super-120b-a12b:free"}
                 - {name: GRUG_REVIEW_DEPTH, value: tiered}
                 - {name: GRUG_PROMPT_EXPERIMENT_SSM, value: /grug/elder-prompt-experiment}

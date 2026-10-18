@@ -25,6 +25,12 @@ from typing import Literal, get_args
 
 from review_types import SEVERITIES, Severity  # shared leaf — no cycle (#250)
 
+# The literal prefix a complexity finding must open its message with to keep
+# a severity above medium. The rule text below tells the model to write it,
+# and `personas.code_reviewer.persona.evaluate_diff` clamps on it, so the two
+# share this one constant.
+COMPLEXITY_CORRECTNESS_MARKER = "Correctness risk:"
+
 # Rule-name charset — must equal the dedup marker's capture class
 # (dedup._MARKER_RE) so a name round-trips through the comment marker
 # without the finding-side and prior-side dedup keys diverging.
@@ -251,11 +257,33 @@ RULES: tuple[ReviewRule, ...] = (
     ReviewRule(
         name="complexity-hotspot",
         bug_class="maintainability",
-        description="A function with deep nesting / many branches doing "
-        "several jobs — hard to test, easy to break on edit.",
-        bad_example="def handle(): # 6 nested ifs, 80 lines",
-        good_example="def handle():\n    _validate(); _dispatch(); _publish()",
+        description="Report only when this diff materially raises the "
+        "function's complexity and you can name a concrete split or "
+        "simplification on changed lines. Do not report pre-existing length "
+        "or branching. Otherwise leave one short maintainability note in the "
+        "summary. Never use more than medium severity unless the message "
+        f"starts with '{COMPLEXITY_CORRECTNESS_MARKER}' and names a specific "
+        "correctness risk; never mark this heavy lift.",
+        bad_example="A long function is complex, with no change-specific evidence",
+        good_example="Split the newly added validation branch into "
+        "_validate_payload(); suggestion shows the changed lines",
         severity="low",
+    ),
+    ReviewRule(
+        name="intent-mismatch",
+        bug_class="correctness",
+        description="The implemented behavior contradicts a specific "
+        "linked-issue acceptance criterion. Report the changed line that "
+        "causes the contradiction, quote the criterion AND the PR "
+        "sentence it claims contradicts it, name the diff hunk that does "
+        "the opposite of the criterion, and use high severity. A "
+        "criterion that forbids something ('no X', 'never X') is met when "
+        "the diff removes or prevents X: only a diff that ADDS or KEEPS "
+        "the forbidden thing is a mismatch. Do not report a mismatch "
+        "without explicit criterion evidence.",
+        bad_example="Criterion says preserve existing access; changed code grants access to inactive users",
+        good_example="Criterion requires expired records to remain hidden; this branch returns them. Restore the expiry check.",
+        severity="high",
     ),
     ReviewRule(
         name="missing-test-coverage",
@@ -552,6 +580,13 @@ _PREAMBLE_HEAD = (
     "can point to a specific changed line for — not stylistic preferences. "
     "If the diff is clean, return an empty findings list.\n"
 )
+
+_REACHABLE_CALLER_RULE = (
+    "Before asking for a guard, validation, retry, or try/except, name the "
+    "specific caller or input that can reach the unguarded state. If none "
+    "can because the value is validated upstream in this diff or file, comes "
+    "from a constant, or the type forbids that state, do not raise the finding."
+)
 # WHOLE-TABLET WISDOM (#336). Two false positives on infra PR #1149 came from
 # judging a hunk blind: (1) flagging "no cleanup" for a resource when an
 # `if: always()` rm lived ~50 lines below the hunk, and (2) flagging
@@ -573,6 +608,25 @@ _MITIGATION_SCAN = (
     "Writing a PATH like `KUBECONFIG=/tmp/x` to an env or log is safe; flag "
     "secret-in-log-or-trace ONLY when the secret VALUE itself flows into a "
     "log, echo, trace, or env. "
+)
+# NEGATED CRITERIA (#1170). The intent check added by #1165 read a negated
+# acceptance criterion ("no X") as contradicted by a PR whose summary said
+# the same negative thing while its diff REMOVED X - a correct fix was
+# blocked on a person. A criterion that forbids something is MET when the
+# diff removes or prevents the forbidden thing.
+_NEGATED_CRITERION = (
+    "NEGATED CRITERIA: a criterion that forbids something (\"no X\", "
+    "\"never X\", \"X is not written\", \"stops X\") is met when the diff "
+    "removes or prevents X. A PR that deletes the forbidden code, or "
+    "narrows it so the forbidden case can no longer occur, SATISFIES the "
+    "criterion - a removal that carries out a prohibition is not a "
+    "contradiction. Do NOT raise intent-mismatch for it. Raise "
+    "intent-mismatch ONLY when the diff ADDS or KEEPS the forbidden "
+    "thing. Every intent-mismatch finding MUST quote the criterion text "
+    "AND the PR sentence it claims contradicts it, and must name the "
+    "diff hunk that does the opposite of the criterion. A finding that "
+    "fails to quote both is dropped downstream - if you cannot quote "
+    "both, OMIT the finding yourself."
 )
 # v1 — PRECISION-biased (default). A small model over-reports by pattern-
 # matching the vivid bad-examples; bias toward recall-loss over noise (an
@@ -599,6 +653,11 @@ assert set(_CONFIDENCE_CLAUSES) == set(get_args(PromptVariant)), (
 )
 
 _PREAMBLE_TAIL = (
+    "Start by assessing the PR's intended behavior against the linked issue's "
+    "acceptance criteria. For a documentation-only or test-only scope, report "
+    "correctness defects only (wrong facts, broken links, or tests that cannot "
+    "fail); omit style, naming, and complexity findings. A class:sensitive PR "
+    "requires full review depth even when its diff is small. "
     "Report each line under AT MOST ONE rule (pick the most specific). "
     # Injection hardening: ALL repo-sourced content is untrusted data, not
     # commands — the diff hunks AND every file-context block (full-file
@@ -707,8 +766,11 @@ def build_system_prompt(variant: PromptVariant = "v1", extra_rules: str = "") ->
         )
     preamble = (
         _PREAMBLE_HEAD
+        + _REACHABLE_CALLER_RULE
+        + "\n"
         + _CONFIDENCE_CLAUSES[variant]
         + _MITIGATION_SCAN
+        + _NEGATED_CRITERION
         + _PREAMBLE_TAIL
     )
     rules_block = "\n".join(_render_rule(r) for r in RULES)

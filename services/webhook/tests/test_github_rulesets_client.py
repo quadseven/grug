@@ -465,19 +465,45 @@ def test_detect_legacy_transport_error_returns_none():
     assert result.state == "none"
 
 
-def test_detect_none_when_legacy_403s():
-    """No rulesets, legacy endpoint 403s (insufficient perms) → none, not crash.
-    Peer-review finding: GitHub returns 403 when App lacks administration:read."""
-    rulesets_resp = _ok_response([])
-    legacy_403 = MagicMock(spec=httpx.Response)
-    legacy_403.status_code = 403
-    legacy_403.headers = {}  # permission 403, not rate-limited → no retry
-    legacy_403.raise_for_status = MagicMock(
-        side_effect=httpx.HTTPStatusError("forbidden", request=MagicMock(), response=legacy_403)
+def _permission_403():
+    resp = MagicMock(spec=httpx.Response)
+    resp.status_code = 403
+    resp.headers = {}  # permission 403, not rate-limited -> no retry
+    resp.raise_for_status = MagicMock(
+        side_effect=httpx.HTTPStatusError("forbidden", request=MagicMock(), response=resp)
     )
+    return resp
 
-    responses = [rulesets_resp, legacy_403]
+
+def test_detect_permission_denied_when_legacy_403s():
+    """grug#1001: no rulesets and the legacy endpoint 403s (the App lacks
+    administration:read). That is NOT "nothing enforces the check" - grug
+    cannot see - so it must not fold into `none`."""
+    responses = [_ok_response([]), _permission_403()]
     with patch("httpx.get", side_effect=responses):
+        result = detect_enforcement("tok", "o", "r", "main", "Grug - Chief")
+
+    assert result.state == "permission_denied"
+    assert result.ruleset_id is None
+
+
+def test_detect_permission_denied_when_ruleset_list_403s():
+    """grug#1001: a permission 403 on the rulesets list is the same outcome."""
+    with patch("httpx.get", side_effect=[_permission_403()]):
+        result = detect_enforcement("tok", "o", "r", "main", "Grug - Chief")
+
+    assert result.state == "permission_denied"
+
+
+def test_detect_legacy_404_is_still_none():
+    """grug#1001: a 404 means the branch has no protection - a real `none`."""
+    legacy_404 = MagicMock(spec=httpx.Response)
+    legacy_404.status_code = 404
+    legacy_404.headers = {}
+    legacy_404.raise_for_status = MagicMock(
+        side_effect=httpx.HTTPStatusError("nf", request=MagicMock(), response=legacy_404)
+    )
+    with patch("httpx.get", side_effect=[_ok_response([]), legacy_404]):
         result = detect_enforcement("tok", "o", "r", "main", "Grug - Chief")
 
     assert result.state == "none"

@@ -4,12 +4,13 @@ Ported from scripts/tpm.py with the bullet-count regex tightened per
 quadseven/grug#20: empty `- [ ]` placeholders no longer count toward the
 >=3 minimum (security: an unfilled template should NOT pass).
 
-7 checks (per PRD #21 + memory `feedback_health_endpoint_standard`):
+8 checks (per PRD #21 + memory `feedback_health_endpoint_standard`):
   why          - ## Why >=5 words
   acceptance   - ## Acceptance criteria (or ## Test plan) >=3 NON-EMPTY bullets
   estimate     - Size: XS|S|M|L|XL anywhere in body
   scope-fence  - ## Out of scope present
-  issue-link   - closes #N OR Part of #N OR fixes #N
+  issue-link   - Refs #N / Refs owner/name#N / Part of #N / closes #N ... (advisory)
+  loom-footer  - a Loom-ticket PR carries the Loom audit footer (advisory)
   linked-issue-completeness - linked issue(s) have all non-exempt checkboxes ticked
   linked-issue-epic - every ticket the PR names is an epic or belongs to one (grug#1034)
 """
@@ -74,11 +75,23 @@ _SIZE_PAT = re.compile(
 # Accept the closing keywords + reference keywords + bare `#N` at line
 # start (the legacy gate's behavior). Codex post-review #49 -- earlier
 # regex regressed valid PR bodies using `Refs #N` / `Blocked by #N`.
+# #1214: a keyword may also name the ticket as `owner/name#N` - lane PRs
+# write `Refs owner/name#N`, and some operators never use a closing
+# keyword because a ticket closes only after its boxes are ticked.
 _ISSUE_LINK_PAT = re.compile(
-    r"(?:\b(?:closes|fixes|resolves|part\s+of|refs|relates\s+to|blocked\s+by)\s+#\d+"
+    r"(?:\b(?:closes|fixes|resolves|part\s+of|refs|relates\s+to|blocked\s+by)\s+"
+    r"(?:[A-Za-z0-9][\w.-]*/[\w.-]+)?#\d+"
     r"|^\s*#\d+\b"
     r")",
     re.IGNORECASE | re.MULTILINE,
+)
+# A Loom factory PR names its ticket, lane, and model in an audit footer so
+# the dashboard can attribute the work later. Advisory only: the footer is
+# an audit nicety, never a merge gate.
+_LOOM_FOOTER_PAT = re.compile(r"^Loom ticket ", re.MULTILINE)
+_LOOM_TICKET_REF_PAT = re.compile(
+    r"\b(?:refs|part\s+of|fixes|closes)\s+quadseven/loom#\d+",
+    re.IGNORECASE,
 )
 
 # Closing keywords per GitHub's spec: close(s|d)?, fix(es|ed)?, resolve(s|d)?
@@ -228,7 +241,27 @@ def check_issue_link(body: str) -> CheckResult:
         return CheckResult("issue-link", True, "issue link present")
     return CheckResult(
         "issue-link", False,
-        "no `closes #N` / `fixes #N` / `Part of #N` link in body",
+        "no issue link in body - any of these counts: `Refs #N`, "
+        "`Refs owner/name#N`, `Part of #N`, `Relates to #N`, `Blocked by #N`, "
+        "`closes #N` / `fixes #N` / `resolves #N`, or a bare `#N` line",
+    )
+
+
+def check_loom_footer(body: str) -> CheckResult:
+    if _LOOM_FOOTER_PAT.search(body):
+        return CheckResult("loom-footer", True, "Loom audit footer present")
+    if _LOOM_TICKET_REF_PAT.search(body):
+        return CheckResult(
+            "loom-footer", False,
+            "references a quadseven/loom ticket but has no Loom audit footer "
+            "(`Loom ticket ..., lane ..., model ...`) - the dashboard cannot "
+            "attribute this PR to a model",
+        )
+    # Not skipped: the check DID run and found nothing to require. `skipped`
+    # means "could not be evaluated" (#782), and marking every non-Loom PR
+    # skipped would strip "all N checks" from nearly every Chief title.
+    return CheckResult(
+        "loom-footer", True, "not a Loom ticket PR; footer not required",
     )
 
 
@@ -507,6 +540,7 @@ _PURE_CHECKS = (
     check_estimate,
     check_scope_fence,
     check_issue_link,
+    check_loom_footer,
 )
 
 ALL_CHECKS = (

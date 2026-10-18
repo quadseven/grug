@@ -41,6 +41,8 @@ HEALTHCHECK --interval=30s --timeout=5s --start-period=30s --retries=3 \
 
 # Multi-bot manager + dashboard on 8080. init-config seeds a default config
 # into the (persistent) /data volume on first start. `ddtrace-run` (same
-# process-wrapper convention as grug's own services, k8s/consumer-deployment.yaml)
-# activates APM + LLM Obs; harmless no-op when DD_LLMOBS_ENABLED is unset.
-CMD ["/bin/bash", "-c", "/usr/local/bin/init-config.sh && exec ddtrace-run python grugthink.py multi-bot --api-port 8080"]
+# process-wrapper convention as grug's own services) activates APM + LLM Obs
+# ONLY when GRUG_DATADOG_ENABLED is truthy (grug#1208, off by default). Off,
+# the bot runs without ddtrace and with tracing/LLMObs forced off, so the
+# DD_LLMOBS_ENABLED=true the manifest still carries cannot start a writer.
+CMD ["/bin/bash", "-c", "/usr/local/bin/init-config.sh && case \"${GRUG_DATADOG_ENABLED:-}\" in 1|[Tt]rue|TRUE|[Yy]es|YES|[Oo]n|ON) exec ddtrace-run python grugthink.py multi-bot --api-port 8080 ;; *) DD_TRACE_ENABLED=false DD_LLMOBS_ENABLED=false exec python grugthink.py multi-bot --api-port 8080 ;; esac"]

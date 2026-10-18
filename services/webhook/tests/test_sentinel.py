@@ -305,6 +305,67 @@ def test_blocking_verdict_with_zero_findings_does_not_warn(monkeypatch):
     assert posted == []          # no comment, therefore no email
 
 
+def test_skips_merged_pr_when_elder_fixed_reply_is_latest(monkeypatch):
+    """Elder's own Fixed in reply is evidence the finding was handled."""
+    rec = _record()
+    monkeypatch.setattr(sentinel, "get_check_verdict", lambda iid, sha, persona: _verdict(blocking=False))
+    monkeypatch.setattr(sentinel, "_high_severity_records", lambda iid, o, r, pr: [rec])
+    monkeypatch.setattr(sentinel, "_replied_to_comment_ids", lambda token, o, r, pr: {1})
+    monkeypatch.setattr(sentinel, "with_install_token_retry", lambda iid, fn: fn("tok"))
+    monkeypatch.setattr(
+        sentinel.httpx, "post",
+        lambda url, **kw: (_ for _ in ()).throw(AssertionError("no Haunt notice expected")),
+    )
+
+    out = sentinel.dispatch_pull_request(_ctx({"action": "closed", "pull_request": {"merged": True}}))
+
+    assert out == {"persona": "sentinel", "result": "skipped"}
+
+
+def test_unresolved_or_unreplied_high_finding_still_warns(monkeypatch):
+    """No reply remains the conservative behavior for unresolved findings."""
+    rec = _record()
+    monkeypatch.setattr(sentinel, "get_check_verdict", lambda iid, sha, persona: _verdict(blocking=False))
+    monkeypatch.setattr(sentinel, "_high_severity_records", lambda iid, o, r, pr: [rec])
+    monkeypatch.setattr(sentinel, "_replied_to_comment_ids", lambda token, o, r, pr: set())
+    monkeypatch.setattr(sentinel, "_find_marker_comment", lambda token, o, r, pr: None)
+    monkeypatch.setattr(sentinel, "with_install_token_retry", lambda iid, fn: fn("tok"))
+    monkeypatch.setattr(sentinel, "record_check_verdict", lambda **kw: None)
+    monkeypatch.setattr(
+        sentinel.httpx, "post",
+        lambda url, **kw: httpx.Response(201, request=httpx.Request("POST", url), json={}),
+    )
+
+    out = sentinel.dispatch_pull_request(_ctx({"action": "closed", "pull_request": {"merged": True}}))
+
+    assert out == {"persona": "sentinel", "result": "flagged"}
+
+
+def test_reply_scan_counts_latest_own_app_fixed_in_but_not_other_bot(monkeypatch):
+    monkeypatch.setattr(sentinel, "get_app_id", lambda: "42")
+    comments = [
+        {"id": 1, "in_reply_to_id": None, "user": {"type": "Bot"}},
+        {"id": 2, "in_reply_to_id": 1, "user": {"type": "Bot"},
+         "body": "Fixed in abc123", "performed_via_github_app": {"id": 42}},
+        {"id": 3, "in_reply_to_id": None, "user": {"type": "Bot"}},
+        {"id": 4, "in_reply_to_id": 3, "user": {"type": "Bot"},
+         "body": "Fixed in abc123", "performed_via_github_app": {"id": 99}},
+        {"id": 5, "in_reply_to_id": 4, "user": {"type": "Bot"},
+         "body": "Follow-up", "performed_via_github_app": {"id": 42}},
+    ]
+
+    class _Response:
+        def raise_for_status(self):
+            pass
+
+        def json(self):
+            return comments
+
+    monkeypatch.setattr(sentinel.httpx, "get", lambda *args, **kwargs: _Response())
+
+    assert sentinel._replied_to_comment_ids("tok", "owner", "repo", 5) == {1}
+
+
 def test_blocking_verdict_with_real_findings_still_warns(monkeypatch):
     """The grug#721 case this persona exists for - a critical finding that
     genuinely shipped - must keep firing. The gate removes noise, not the
