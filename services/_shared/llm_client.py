@@ -6994,14 +6994,31 @@ def judge_findings(
         )
         return ()
 
-    # WHY the backend loop here is NOT shared with review_diff's: the
-    # judge hits a SINGLE backend (no fallback — a judge outage is
-    # acceptable, the review already shipped), tags its span `judge:
-    # True`, and returns () on any error. review_diff iterates two
-    # backends with fallback + parse-failed semantics. Extracting a
-    # shared helper would need callbacks for the divergent annotate
-    # metadata + fallback control flow — more complex than the ~25-line
-    # overlap. Extract at the 3rd backend (rule-of-three), not now.
+    # WHY this envelope does NOT go through `_run_llm_attempt` (grug#662,
+    # decided after the #660 seam landed). The old note deferred sharing
+    # "until the 3rd backend (rule-of-three)". That count has fired, but
+    # not where the note expected: the seam has 2 callers (the review arm
+    # and the SaaS overload fallback loop), and the hand-rolled envelopes
+    # are the 4 NON-review calls - this judge plus Teller, ask and learn.
+    # The seam is review-shaped, so moving the judge onto it would need 4
+    # knobs for a ~25-line overlap:
+    #   1. it always opens an `elder_code_review` span and annotates
+    #      review metadata (variant_id, kind, findings_truncated); the
+    #      judge needs `elder_judge` + `judge: True`;
+    #   2. it parses the body with `_parse_review`, which reads a verdicts
+    #      array as a clean review with zero findings (kind=reviewed) and
+    #      exports the span as a review span;
+    #   3. it reads and writes the chunk-ladder skip/trail (grug#1196) and
+    #      `_note_model_timeout`, so a judge failure would make a review
+    #      chunk skip that model, and vice versa;
+    #   4. it treats finish_reason=length as a partial review; for the
+    #      judge a truncated answer is a failed call that returns ().
+    # Per call the judge still hits ONE backend and returns () on any
+    # error; trying the next backend is `personas/code_reviewer/judge.py`'s
+    # job. If the non-review envelopes are ever unified, they share a
+    # helper of their own (Teller/ask/learn already share
+    # `_annotate_interactive`), not the review seam.
+    # test_judge_findings_stays_off_the_review_seam pins 1 and 3.
     # `config` override routes this judge call to a specific backend - the
     # exposed-secret class goes to the in-cluster Cave (#439, ADR-0009);
     # default None keeps today's per-install SaaS pick. `redact` masks
