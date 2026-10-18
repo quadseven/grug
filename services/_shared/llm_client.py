@@ -2053,6 +2053,22 @@ def _scope_chain(tree: ast.AST, line: int) -> list[ast.AST]:
         node = nxt
 
 
+def _signature_lines(node: ast.AST, src: list[str], hunk_start: int) -> list[str]:
+    """Numbered header lines of one class/def: from its `def`/`class` line
+    to the line before its first body statement, minus trailing blank or
+    comment-only lines, capped and never reaching into the hunk."""
+    start = node.lineno  # type: ignore[attr-defined]
+    body_nodes = getattr(node, "body", None) or []
+    first_body = body_nodes[0].lineno if body_nodes else start + 1
+    end = max(start, first_body - 1)
+    while end > start and (
+        not src[end - 1].strip() or src[end - 1].lstrip().startswith("#")
+    ):
+        end -= 1
+    end = min(end, start + _MAX_SIGNATURE_LINES - 1, hunk_start - 1)
+    return [f"{i}: {src[i - 1]}" for i in range(start, end + 1)]
+
+
 def _render_enclosing_signature(path: str, content: str | None, body: str) -> str:
     """Numbered signature lines of every class/def enclosing a Python hunk,
     for the hunks whose file is too large for the full-file block (#1227).
@@ -2076,24 +2092,12 @@ def _render_enclosing_signature(path: str, content: str | None, body: str) -> st
     except (SyntaxError, ValueError):
         return ""
     src = content.splitlines()
+    above = [n for n in _scope_chain(tree, line) if n.lineno < hunk_start]
+    if all(isinstance(n, ast.ClassDef) for n in above):
+        return ""  # no def above the hunk; a lone class header binds nothing used
     rendered: list[str] = []
-    has_function = False
-    for node in _scope_chain(tree, line):
-        if node.lineno >= hunk_start:
-            continue
-        has_function = has_function or not isinstance(node, ast.ClassDef)
-        body_nodes = getattr(node, "body", None) or []
-        first_body = body_nodes[0].lineno if body_nodes else node.lineno + 1
-        end = max(node.lineno, first_body - 1)
-        # Trim blank and comment-only lines between the colon and the body.
-        while end > node.lineno and (
-            not src[end - 1].strip() or src[end - 1].lstrip().startswith("#")
-        ):
-            end -= 1
-        end = min(end, node.lineno + _MAX_SIGNATURE_LINES - 1, hunk_start - 1)
-        rendered.extend(f"{i}: {src[i - 1]}" for i in range(node.lineno, end + 1))
-    if not has_function:
-        return ""  # a lone class header names no binding the hunk uses
+    for node in above:
+        rendered.extend(_signature_lines(node, src, hunk_start))
     return (
         "ENCLOSING SCOPE (signature lines above this hunk, from the current "
         "file; parameters named here are in scope in the hunk; context only, do not "

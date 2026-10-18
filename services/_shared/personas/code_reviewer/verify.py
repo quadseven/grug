@@ -462,51 +462,75 @@ def _target_names(node: ast.AST) -> set[str]:
     return {n.id for n in ast.walk(node) if isinstance(n, ast.Name)}
 
 
+def _import_names(node: ast.AST) -> set[str]:
+    return {
+        (a.asname or a.name).split(".")[0]
+        for a in node.names  # type: ignore[attr-defined]
+        if a.name != "*"
+    }
+
+
+def _with_names(node: ast.AST) -> set[str]:
+    out: set[str] = set()
+    for item in node.items:  # type: ignore[attr-defined]
+        if item.optional_vars is not None:
+            out |= _target_names(item.optional_vars)
+    return out
+
+
+def _assign_names(node: ast.AST) -> set[str]:
+    out: set[str] = set()
+    for t in node.targets:  # type: ignore[attr-defined]
+        out |= _target_names(t)
+    return out
+
+
+# Node type -> the names that node binds at its OWN scope level. An
+# annotation without a value (`x: int`) binds nothing.
+_BINDERS = {
+    ast.Import: _import_names,
+    ast.ImportFrom: _import_names,
+    ast.Assign: _assign_names,
+    ast.AugAssign: lambda n: _target_names(n.target),
+    ast.AnnAssign: lambda n: _target_names(n.target) if n.value is not None else set(),
+    ast.For: lambda n: _target_names(n.target),
+    ast.AsyncFor: lambda n: _target_names(n.target),
+    ast.NamedExpr: lambda n: _target_names(n.target),
+    ast.With: _with_names,
+    ast.AsyncWith: _with_names,
+    ast.ExceptHandler: lambda n: {n.name} if n.name else set(),
+    ast.Global: lambda n: set(n.names),
+    ast.Nonlocal: lambda n: set(n.names),
+    ast.FunctionDef: lambda n: {n.name},
+    ast.AsyncFunctionDef: lambda n: {n.name},
+    ast.ClassDef: lambda n: {n.name},
+}
+
+# Nodes whose bodies are a different scope: their own name binds, their
+# contents do not.
+_NEW_SCOPE_NODES = (
+    ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef, ast.Lambda,
+    ast.ListComp, ast.SetComp, ast.DictComp, ast.GeneratorExp,
+)
+
+
 def _bindings_in(stmts: list[ast.stmt], before_line: int | None) -> set[str]:
     """Names bound by `stmts` at their own scope level (not descending into
     nested functions/classes/lambdas/comprehensions). With `before_line`,
     only bindings that START before that line count - a local assigned
     after its use is a real unbound-local bug, not a false marking."""
     bound: set[str] = set()
-
-    def visit(node: ast.AST) -> None:
+    stack: list[ast.AST] = list(stmts)
+    while stack:
+        node = stack.pop()
         line = getattr(node, "lineno", None)
-        early = before_line is None or (line is not None and line < before_line)
-        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
-            if early:
-                bound.add(node.name)
-            return  # its body is a different scope
-        if isinstance(node, (ast.Lambda, ast.ListComp, ast.SetComp,
-                             ast.DictComp, ast.GeneratorExp)):
-            return
-        if early:
-            if isinstance(node, (ast.Import, ast.ImportFrom)):
-                for alias in node.names:
-                    if alias.name == "*":
-                        continue
-                    bound.add((alias.asname or alias.name).split(".")[0])
-            elif isinstance(node, ast.Assign):
-                for t in node.targets:
-                    bound.update(_target_names(t))
-            elif isinstance(node, (ast.AnnAssign, ast.AugAssign)) and getattr(
-                node, "value", None
-            ) is not None:
-                bound.update(_target_names(node.target))
-            elif isinstance(node, (ast.For, ast.AsyncFor, ast.NamedExpr)):
-                bound.update(_target_names(node.target))
-            elif isinstance(node, (ast.With, ast.AsyncWith)):
-                for item in node.items:
-                    if item.optional_vars is not None:
-                        bound.update(_target_names(item.optional_vars))
-            elif isinstance(node, ast.ExceptHandler) and node.name:
-                bound.add(node.name)
-            elif isinstance(node, (ast.Global, ast.Nonlocal)):
-                bound.update(node.names)
-        for child in ast.iter_child_nodes(node):
-            visit(child)
-
-    for stmt in stmts:
-        visit(stmt)
+        binder = _BINDERS.get(type(node))
+        if binder is not None and (
+            before_line is None or (line is not None and line < before_line)
+        ):
+            bound |= binder(node)
+        if not isinstance(node, _NEW_SCOPE_NODES):
+            stack.extend(ast.iter_child_nodes(node))
     return bound
 
 
