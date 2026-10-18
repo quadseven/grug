@@ -2282,25 +2282,29 @@ def _review_system_prompt(
 ) -> str:
     """Compose trusted review instructions separately from repository data.
 
-    Precedence (#674), highest to lowest, WITHIN THE SYSTEM PROMPT: in-repo
-    agent guidelines (CLAUDE.md/AGENTS.md/etc. - the repo's own versioned,
-    team-authored standard) > operator-taught learnings (#670) > few-shot
-    examples (#538) > team practices (#527) > the static base prompt. Later
-    blocks outrank earlier ones per this prompt's recency=authority
-    convention (see the `system = f"{system}\n\n..."` appends below), and the
-    guidelines block itself tells the model to follow the carving over a
-    taught preference on conflict.
+    Precedence (#674), highest to lowest: `.grug.yaml` path instructions >
+    in-repo agent guidelines (CLAUDE.md/AGENTS.md/etc. - the repo's own
+    versioned, team-authored standard) > operator-taught learnings (#670) >
+    few-shot examples (#538) > team practices (#527) > the static base
+    prompt.
 
-    `path_instructions` - directory-scoped `.grug.yaml` rules - DOES exist
-    and is live (`repo_config._KNOWN_KEYS`, applied by
-    `repo_config.with_instructions` from `dispatch.py`). It is deliberately
-    NOT a layer of the chain above, because it rides the USER prompt's
-    repo-docs block rather than the system prompt. The recency=authority
-    convention therefore cannot order it against guidelines or learnings at
-    all - they live in different messages, and neither block claims
-    authority over the other. NO precedence between a path instruction and a
-    repo guideline is defined or tested today; on conflict the model infers
-    one. Deciding that ordering and pinning it with a test is #1131.
+    WITHIN THE SYSTEM PROMPT (guidelines and below), later blocks outrank
+    earlier ones per this prompt's recency=authority convention (see the
+    `system = f"{system}\n\n..."` appends below), and the guidelines block
+    itself tells the model to follow the carving over a taught preference
+    on conflict.
+
+    `path_instructions` (directory-scoped `.grug.yaml` rules,
+    `repo_config._KNOWN_KEYS`) ride the USER prompt's repo-docs block
+    instead, applied by `repo_config.with_instructions` from `dispatch.py`,
+    so recency cannot order them against the system prompt. Their top place
+    is therefore stated in words, in BOTH blocks (#1131): the guidelines
+    block names a path instruction as the one thing that outranks a carving,
+    and `repo_config.instructions_block` says it outranks the agent-guideline
+    files for the files it names. The reason is trust, not taste: `.grug.yaml`
+    is read from the base branch, the guideline files from the PR head, so a
+    PR cannot use its own CLAUDE.md to overrule a maintainer's instruction.
+    Pinned by `test_path_instructions_outrank_guidelines_in_both_blocks`.
     """
     # Redact secret-shaped values from the diff + file context BEFORE they reach
     # the backend (#438). The backend is a third-party SaaS endpoint, and a PR
@@ -3994,7 +3998,10 @@ def _render_guidelines_block(files: dict[str, str]) -> str:
         "TRIBE'S OWN CARVINGS (this repo's own agent-guideline files - "
         "versioned, team-authored standards; if one of these conflicts with "
         "a taught preference above, follow the carving - it is the current, "
-        "official word):\n\n" + body
+        "official word. One thing outranks a carving: a `.grug.yaml` review "
+        "instruction in the REPO DOCS block, for the files it names, because "
+        "it is read from the base branch and these files from the PR "
+        "head):\n\n" + body
     )
 
 

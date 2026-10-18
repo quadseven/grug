@@ -3442,6 +3442,51 @@ def test_claude_md_rule_reaches_system_prompt_end_to_end(monkeypatch) -> None:
     assert "TRIBE'S OWN CARVINGS" in system
 
 
+def test_path_instructions_outrank_guidelines_in_both_blocks() -> None:
+    """#674 criterion 2 / #1131: path-instructions > guidelines > learnings.
+
+    Guidelines and learnings share the system prompt, where recency orders
+    them (pinned by `test_review_system_prompt_places_guidelines_after_learnings`).
+    A `.grug.yaml` path instruction rides the USER prompt's REPO DOCS block,
+    so recency cannot order it against a guideline; the precedence has to be
+    stated in words, and stated the same way from both sides. This builds
+    the real messages with a CLAUDE.md rule and a conflicting path
+    instruction and checks each block says the path instruction wins."""
+    from personas.code_reviewer import repo_config as rc
+
+    guidelines = lc._render_guidelines_block({"CLAUDE.md": "never use bare except"})
+    cfg = rc.RepoConfig(path_instructions=(
+        rc.PathInstruction("legacy/**", "bare except is allowed here"),
+    ))
+    repo_docs = rc.with_instructions(None, ["legacy/old.py"], cfg)
+    messages = lc._build_messages(
+        [Hunk(path="legacy/old.py", body="+try:\n+    x()\n+except:\n+    pass")],
+        "v2",
+        repo_docs_context=repo_docs,
+        learnings="WHAT YOUR TRIBE TOLD GRUG: some learning",
+        guidelines=guidelines,
+    )
+    system = next(m["content"] for m in messages if m["role"] == "system")
+    user = next(m["content"] for m in messages if m["role"] == "user")
+
+    # Channels: the guideline is in the system prompt, the path instruction
+    # in the user prompt's REPO DOCS block.
+    assert "never use bare except" in system
+    assert "bare except is allowed here" not in system
+    assert "### REPO DOCS" in user and "bare except is allowed here" in user
+
+    # Guidelines side: the carving names the path instruction as the one
+    # thing that outranks it.
+    carvings = system[system.index("TRIBE'S OWN CARVINGS"):]
+    assert "One thing outranks a carving: a `.grug.yaml` review instruction" in carvings
+    # Path-instruction side: it claims precedence over the guideline files.
+    block = user[user.index("--- review instructions from the repo's .grug.yaml"):]
+    assert "OUTRANKS the repo's agent-guideline files" in block
+    assert "TRIBE'S OWN CARVINGS" in block
+    # And guidelines > learnings still holds within the system prompt.
+    assert system.index("some learning") < system.index("never use bare except")
+
+
 def test_summarize_pr_tolerates_missing_optional_fields() -> None:
     payload = json.dumps({"summary": "A small fix."})
     response = httpx.Response(200, json=_openai_json_response(payload))
