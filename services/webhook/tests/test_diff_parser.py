@@ -447,7 +447,9 @@ class TestOversizedHunkSplit:
 # --- #813: byte-identical whole-file duplicate split ------------------------
 
 from personas.code_reviewer.diff_parser import (  # noqa: E402
+    new_file_blob_ids,
     split_duplicate_hunks,
+    split_tree_copy_hunks,
 )
 
 
@@ -538,3 +540,157 @@ class TestDuplicateHunkSplit:
 
     def test_no_hunks_is_a_no_op(self):
         assert split_duplicate_hunks(()) == ((), ())
+
+
+def _new_file_diff(path: str, content: str, blob: str) -> str:
+    """GitHub's unified-diff shape for one ADDED file, index line included."""
+    lines = content.splitlines()
+    body = "\n".join(f"+{line}" for line in lines)
+    return (
+        f"diff --git a/{path} b/{path}\n"
+        "new file mode 100644\n"
+        f"index 0000000..{blob}\n"
+        "--- /dev/null\n"
+        f"+++ b/{path}\n"
+        f"@@ -0,0 +1,{len(lines)} @@\n"
+        f"{body}\n"
+    )
+
+
+_EDIT_DIFF = """diff --git a/src/edited.py b/src/edited.py
+index 1111111..2222222 100644
+--- a/src/edited.py
++++ b/src/edited.py
+@@ -1,2 +1,2 @@
+ keep
+-old
++new
+"""
+
+
+class TestNewFileBlobIds:
+    def test_maps_each_added_file_to_its_new_side_blob(self):
+        diff = (
+            _new_file_diff("a/one.py", "x\n" * 5, "abc1234")
+            + _EDIT_DIFF
+            + _new_file_diff("b/two.py", "y\n" * 5, "def5678")
+        )
+        assert new_file_blob_ids(diff) == {
+            "a/one.py": "abc1234", "b/two.py": "def5678",
+        }
+
+    def test_an_edited_file_is_not_an_added_file(self):
+        assert new_file_blob_ids(_EDIT_DIFF) == {}
+
+    def test_a_new_file_without_an_index_line_is_left_out(self):
+        diff = _new_file_diff("a/one.py", "x\n", "abc1234").replace(
+            "index 0000000..abc1234\n", "",
+        )
+        assert new_file_blob_ids(diff) == {}
+
+    def test_empty_diff(self):
+        assert new_file_blob_ids("") == {}
+
+
+class TestTreeCopyHunkSplit:
+    """#813's literal repro: an ADDED file whose bytes equal a
+    file that already exists in the repo, untouched by the diff. The
+    same-diff split above cannot see the original; the head tree can."""
+
+    _CONTENT = "def transport():\n    return 1\n" * 20  # over the min size
+    _FULL = "abc1234" + "0" * 33
+
+    def _hunk(self, path, content=None):
+        content = self._CONTENT if content is None else content
+        hunks = parse_diff(_new_file_diff(path, content, "abc1234"))
+        assert len(hunks) == 1
+        return hunks[0]
+
+    def test_copy_of_an_untouched_tree_file_is_excluded_and_named(self):
+        copy = self._hunk("manifests/pkg/transport.py")
+        kept, copies = split_tree_copy_hunks(
+            (copy,),
+            {"manifests/pkg/transport.py": "abc1234"},
+            {
+                "agent/core/transport.py": self._FULL,
+                "manifests/pkg/transport.py": self._FULL,
+                "README.md": "f" * 40,
+            },
+        )
+        assert kept == ()
+        assert copies == (
+            ("manifests/pkg/transport.py", "agent/core/transport.py"),
+        )
+
+    def test_near_duplicate_is_reviewed_in_full(self):
+        """A copy that is NOT byte-identical has a different blob, so it
+        never matches - the tree says so even when the diff abbreviation
+        would collide."""
+        near = self._hunk("manifests/pkg/transport.py", self._CONTENT + "x = 2\n")
+        kept, copies = split_tree_copy_hunks(
+            (near,),
+            {"manifests/pkg/transport.py": "abc1234"},
+            {
+                "agent/core/transport.py": self._FULL,
+                "manifests/pkg/transport.py": "abc1234" + "9" * 33,
+            },
+        )
+        assert kept == (near,)
+        assert copies == ()
+
+    def test_tree_that_disagrees_with_the_diff_excludes_nothing(self):
+        """The head tree must confirm the diff's own blob id; a tree read at
+        some other commit is not proof of anything."""
+        copy = self._hunk("manifests/pkg/transport.py")
+        other = "fff0000" + "0" * 33
+        kept, copies = split_tree_copy_hunks(
+            (copy,),
+            {"manifests/pkg/transport.py": "abc1234"},
+            {"agent/core/transport.py": other, "manifests/pkg/transport.py": other},
+        )
+        assert kept == (copy,)
+        assert copies == ()
+
+    def test_original_must_not_itself_be_added_by_this_diff(self):
+        """Two new identical files are the same-diff split's job (first one
+        kept). Matching them against each other here would drop BOTH and
+        leave no reviewed instance of those bytes."""
+        a = self._hunk("a/one.py")
+        b = self._hunk("b/two.py")
+        kept, copies = split_tree_copy_hunks(
+            (a, b),
+            {"a/one.py": "abc1234", "b/two.py": "abc1234"},
+            {"a/one.py": self._FULL, "b/two.py": self._FULL},
+        )
+        assert kept == (a, b)
+        assert copies == ()
+
+    def test_small_file_and_edits_are_never_candidates(self):
+        tiny = self._hunk("pkg/__init__.py", "x = 1\n")
+        edit = parse_diff(_EDIT_DIFF)[0]
+        kept, copies = split_tree_copy_hunks(
+            (tiny, edit),
+            {"pkg/__init__.py": "abc1234"},
+            {
+                "pkg/__init__.py": self._FULL,
+                "other/__init__.py": self._FULL,
+                "src/edited.py": self._FULL,
+            },
+        )
+        assert kept == (tiny, edit)
+        assert copies == ()
+
+    def test_no_tree_means_no_exclusion(self):
+        copy = self._hunk("manifests/pkg/transport.py")
+        assert split_tree_copy_hunks(
+            (copy,), {"manifests/pkg/transport.py": "abc1234"}, {},
+        ) == ((copy,), ())
+
+    def test_original_is_chosen_deterministically(self):
+        copy = self._hunk("z/copy.py")
+        _, copies = split_tree_copy_hunks(
+            (copy,),
+            {"z/copy.py": "abc1234"},
+            {"m/b.py": self._FULL, "m/a.py": self._FULL, "z/copy.py": self._FULL},
+        )
+        assert copies == (("z/copy.py", "m/a.py"),)

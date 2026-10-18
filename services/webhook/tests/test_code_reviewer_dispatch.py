@@ -3820,3 +3820,102 @@ def test_carriage_return_suggestion_is_never_committable():
     body = cr_dispatch._inline_comment_body(f)
     assert "```suggestion" not in body
     assert "verify scope before applying" in body
+
+
+def test_dispatch_skips_a_byte_identical_copy_of_an_untouched_repo_file(monkeypatch):
+    """#813: a PR that copies an existing module under a new
+    path (its build tool cannot symlink outside its root) must not spend review
+    budget on the copy. The head tree proves the bytes match a file already
+    in the repo; the copy is dropped before review and named in the board
+    against that file, while the genuinely edited file is still reviewed."""
+    content_lines = [f"def step_{i}(x):" for i in range(30)]
+    copy_path = "manifests/pkg/transport.py"
+    original_path = "agent/core/transport.py"
+    full_blob = "abc1234" + "5" * 33
+    diff = _DIFF + (
+        f"diff --git a/{copy_path} b/{copy_path}\n"
+        "new file mode 100644\n"
+        "index 0000000..abc1234\n"
+        "--- /dev/null\n"
+        f"+++ b/{copy_path}\n"
+        f"@@ -0,0 +1,{len(content_lines)} @@\n"
+        + "".join(f"+{line}\n" for line in content_lines)
+    )
+    reviewed_paths: list[str] = []
+    posted_check = []
+
+    def _fake_review_diff(hunks, installation_id, **kwargs):
+        reviewed_paths.extend(h.path for h in hunks)
+        return LlmReviewResponse(
+            kind="reviewed", findings=(),
+            backend_used=Backend.POOLSIDE, model_name="laguna",
+        )
+
+    def _fake_get(url, *args, **kwargs):
+        if "/git/trees/" in url:
+            assert url.endswith("/git/trees/abcd1234efgh")
+            tree = MagicMock(spec=httpx.Response)
+            tree.status_code = 200
+            tree.raise_for_status = MagicMock()
+            tree.json = MagicMock(return_value={"tree": [
+                {"path": "src/x.py", "type": "blob", "sha": "1" * 40},
+                {"path": original_path, "type": "blob", "sha": full_blob},
+                {"path": copy_path, "type": "blob", "sha": full_blob},
+                {"path": "agent", "type": "tree", "sha": full_blob},
+            ]})
+            return tree
+        return _diff_response(diff)
+
+    monkeypatch.setattr(cr_dispatch, "review_diff", _fake_review_diff)
+    monkeypatch.setattr(
+        cr_dispatch, "post_check_run",
+        lambda token, owner, repo, result, external_id=None: (
+            posted_check.append(result) or {"id": 1}
+        ),
+    )
+    monkeypatch.setattr(cr_dispatch, "post_review", lambda *a, **k: {"id": 2})
+
+    with patch("httpx.get", side_effect=_fake_get):
+        cr_dispatch.dispatch_code_review(_payload(), blocking=False)
+
+    assert reviewed_paths == ["src/x.py"]
+    summary = posted_check[-1].summary
+    assert f"`{copy_path}` (= `{original_path}`)" in summary
+    assert "already in the repo at this head" in summary
+
+
+def test_dispatch_reviews_a_copy_when_the_head_tree_is_unreadable(monkeypatch):
+    """A failed tree read is no proof of a copy: everything is reviewed."""
+    content_lines = [f"def step_{i}(x):" for i in range(30)]
+    copy_path = "manifests/pkg/transport.py"
+    diff = (
+        f"diff --git a/{copy_path} b/{copy_path}\n"
+        "new file mode 100644\n"
+        "index 0000000..abc1234\n"
+        "--- /dev/null\n"
+        f"+++ b/{copy_path}\n"
+        f"@@ -0,0 +1,{len(content_lines)} @@\n"
+        + "".join(f"+{line}\n" for line in content_lines)
+    )
+    reviewed_paths: list[str] = []
+
+    def _fake_review_diff(hunks, installation_id, **kwargs):
+        reviewed_paths.extend(h.path for h in hunks)
+        return LlmReviewResponse(
+            kind="reviewed", findings=(),
+            backend_used=Backend.POOLSIDE, model_name="laguna",
+        )
+
+    def _fake_get(url, *args, **kwargs):
+        if "/git/trees/" in url:
+            raise httpx.ConnectError("tree read down")
+        return _diff_response(diff)
+
+    monkeypatch.setattr(cr_dispatch, "review_diff", _fake_review_diff)
+    monkeypatch.setattr(cr_dispatch, "post_check_run", lambda *a, **k: {"id": 1})
+    monkeypatch.setattr(cr_dispatch, "post_review", lambda *a, **k: {"id": 2})
+
+    with patch("httpx.get", side_effect=_fake_get):
+        cr_dispatch.dispatch_code_review(_payload(), blocking=False)
+
+    assert reviewed_paths == [copy_path]
