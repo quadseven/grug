@@ -343,6 +343,20 @@ def _bench_plan(hunks: list[Hunk]) -> ReviewPlan:
     )
 
 
+def _findings_bound(backend: BenchBackend) -> int | None:
+    """The `maxItems` the backend's response schema puts on the findings
+    array (grug#989: the Cave's), or None when it sets none. A cohort that
+    returns this many findings was stopped by the bound, not finished."""
+    response_format = backend.extra_body.get("response_format")
+    if not isinstance(response_format, dict):
+        return None
+    schema = (response_format.get("json_schema") or {}).get("schema") or {}
+    bound = (
+        (schema.get("properties") or {}).get("findings", {}).get("maxItems")
+    )
+    return bound if isinstance(bound, int) and bound > 0 else None
+
+
 def run_case(
     backend: BenchBackend,
     case: EvalCase,
@@ -410,6 +424,7 @@ def run_case(
         review_map = render_review_map(plan) if plan.staged else ""
         findings: list[Finding] = []
         output_truncated = False
+        findings_bound = _findings_bound(backend)
         for cohort in plan.cohorts:
             cohort_hunks = [hunks[index] for index in cohort.hunk_indexes]
             messages = _build_messages(
@@ -437,6 +452,16 @@ def run_case(
                 log.warning(
                     "eval_case_output_truncated case=%s kept=%d",
                     case.case_id, len(parsed.findings),
+                )
+                output_truncated = True
+            elif findings_bound is not None and len(parsed.findings) >= findings_bound:
+                # grug#989: the schema's maxItems closed the list as valid
+                # JSON, so nothing above fired, but the model was still
+                # listing findings. Same caveat as a cut-off answer: it
+                # scores on the findings it wrote, and the report names it.
+                log.warning(
+                    "eval_case_findings_bound_hit case=%s kept=%d bound=%d",
+                    case.case_id, len(parsed.findings), findings_bound,
                 )
                 output_truncated = True
             findings.extend(parsed.findings)

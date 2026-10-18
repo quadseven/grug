@@ -63,6 +63,8 @@ class CaseReplay:
     backends: tuple[str, ...] = ()
     # grug#1231: the model's answer hit the output cap before its findings
     # list closed; the replay scored the complete findings before the cut.
+    # grug#989: also set when a cohort returned exactly the response
+    # schema's `maxItems`, which stops a runaway list as valid JSON.
     # A different fact from `truncated` (the INPUT diff was bounded).
     output_truncated: bool = False
 
@@ -102,8 +104,9 @@ class EvalReport:
     # report must name who actually answered rather than let the reader
     # assume it was whoever they configured.
     backend_attribution: dict[str, int] = field(default_factory=dict)
-    # grug#1231: scored cases whose answer was cut off at the output cap and
-    # scored on the complete findings before the cut. Kept apart from
+    # grug#1231: scored cases whose answer was cut off at the output cap (or,
+    # grug#989, stopped at the findings bound) and scored on the complete
+    # findings before the cut. Kept apart from
     # `truncated_cases` (input diff bounded) so neither caveat hides the other.
     output_truncated_cases: tuple[str, ...] = ()
 
