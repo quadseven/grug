@@ -447,6 +447,50 @@ def test_intent_paragraph_is_first_and_sensitive_is_explicit():
     assert "acceptance criteria were checked" in paragraph
 
 
+def test_pr_labels_normalises_and_skips_malformed():
+    """#1174: label parsing lifted out of dispatch_code_review."""
+    pr = {"labels": [{"name": " Class:Sensitive "}, "bare-string", {"name": None}]}
+    assert cr_dispatch._pr_labels(pr) == frozenset({"class:sensitive", ""})
+    assert cr_dispatch._pr_labels({}) == frozenset()
+
+
+@pytest.mark.parametrize(
+    ("paths", "labels", "scoped"),
+    [
+        (("README.md", "docs/a.rst"), frozenset(), True),
+        (("services/x/tests/test_a.py", "pkg/b_test.py"), frozenset(), True),
+        (("README.md", "src/x.py"), frozenset(), False),
+        (("src/x.py",), frozenset({"class:docs"}), True),
+        (("src/x.py",), frozenset({"class:tests"}), True),
+        ((), frozenset(), False),
+    ],
+)
+def test_correctness_only_scope(paths, labels, scoped):
+    """#1174: a docs/tests-only diff, or a class:docs / class:tests label,
+    narrows the review to correctness findings; anything else does not."""
+    scope = cr_dispatch._correctness_only_scope(paths, labels)
+    if scoped:
+        assert scope == "correctness findings only (documentation/tests change)"
+    else:
+        assert scope == ""
+
+
+def test_drop_non_correctness_findings_keeps_correctness():
+    from personas.code_reviewer.persona import CodeReviewEvaluation, Finding
+
+    findings = (
+        Finding("a.py", 1, "low", "dead-code", "Unused.", None),
+        Finding("a.py", 2, "medium", "high-complexity", "Tangled.", None),
+        Finding("a.py", 3, "low", "complexity-hotspot", "Hot.", None),
+        Finding("a.py", 4, "low", "type-safety-gap", "Any.", None),
+        Finding("a.py", 5, "high", "intent-mismatch", "Contradicts.", None),
+    )
+    evaluation = cr_dispatch._drop_non_correctness_findings(
+        CodeReviewEvaluation(findings=findings, conclusion="success"),
+    )
+    assert [f.rule_name for f in evaluation.findings] == ["intent-mismatch"]
+
+
 def test_reachable_caller_filter_drops_only_unnamed_defensive_findings():
     from personas.code_reviewer.persona import CodeReviewEvaluation, Finding
 
