@@ -19,4 +19,7 @@ for (const name of ["localStorage", "sessionStorage"] as const) {
 }
 
 // jsdom does not implement scrolling; the dashboard's rail calls it.
-window.scrollTo = (() => {}) as typeof window.scrollTo;
+// Guarded because node-environment tests (tailwind.test.ts) have no window.
+if (typeof window !== "undefined") {
+  window.scrollTo = (() => {}) as typeof window.scrollTo;
+}

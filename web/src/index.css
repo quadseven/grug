@@ -1,6 +1,74 @@
-@tailwind base;
-@tailwind components;
-@tailwind utilities;
+/*
+  Tailwind v4 (grug PR 1211). source(none) plus the @source below keeps the
+  scan to what the v3 `content` globs covered, so v4's automatic detection
+  does not pick up words from public/index.html or docs and emit stray
+  utilities such as .hidden or .outline. Tests are left out so words in
+  them do not ship as CSS.
+*/
+@import 'tailwindcss' source(none);
+@source "./**/*.{ts,tsx}";
+@source not "./**/*.test.{ts,tsx}";
+
+@theme {
+  --font-mono: 'JetBrains Mono', ui-monospace, monospace;
+  --font-grotesk: 'Space Grotesk', system-ui, sans-serif;
+  --font-display: 'Instrument Serif', 'Times New Roman', serif;
+
+  --color-cave-bg: #faf6ee;
+  --color-cave-bg2: #f3ecdb;
+  --color-cave-paper: #fffbf2;
+  --color-cave-ink: #181613;
+  --color-cave-ink2: #3a342c;
+  --color-cave-muted: #7a7064;
+  --color-cave-amber: #fbbf24;
+  --color-cave-amber-deep: #d97706;
+  --color-cave-tomato: #e0502a;
+  --color-cave-moss: #3f6b3a;
+  --color-cave-sky: #2e5d8a;
+
+  --shadow-brutal: 6px 6px 0 0 #181613;
+  --shadow-brutal-sm: 3px 3px 0 0 #181613;
+  --shadow-brutal-lg: 10px 10px 0 0 #181613;
+
+  --animate-tape-scroll: tape-scroll 40s linear infinite;
+  --animate-blink: blink 1.6s ease-in-out infinite;
+
+  @keyframes tape-scroll {
+    from {
+      transform: translateX(0);
+    }
+    to {
+      transform: translateX(-100%);
+    }
+  }
+  @keyframes blink {
+    0%,
+    100% {
+      opacity: 1;
+    }
+    50% {
+      opacity: 0.2;
+    }
+  }
+}
+
+/*
+  The default border color has changed to `currentcolor` in Tailwind CSS v4,
+  so we've added these compatibility styles to make sure everything still
+  looks the same as it did with Tailwind CSS v3.
+
+  If we ever want to remove these styles, we need to add an explicit border
+  color utility to any element that depends on these defaults.
+*/
+@layer base {
+  *,
+  ::after,
+  ::before,
+  ::backdrop,
+  ::file-selector-button {
+    border-color: var(--color-gray-200, currentcolor);
+  }
+}
 
 @layer base {
   :root {
