@@ -423,6 +423,7 @@ def run_case(
 
         review_map = render_review_map(plan) if plan.staged else ""
         findings: list[Finding] = []
+        served_models: set[str] = set()
         output_truncated = False
         findings_bound = _findings_bound(backend)
         for cohort in plan.cohorts:
@@ -434,6 +435,7 @@ def run_case(
                 review_map=review_map,
             )
             resp = _post(backend, messages)
+            served_models.update(_served_model(resp))
             parsed = _parse_review(resp)
             if parsed.error and not parsed.findings:
                 # ALL-OR-NOTHING (see docstring): one bad cohort must not
@@ -484,7 +486,24 @@ def run_case(
         anchored=anchored,
         staged=plan.staged,
         output_truncated=output_truncated,
+        served_models=tuple(sorted(served_models)),
     )
+
+
+def _served_model(resp: httpx.Response) -> tuple[str, ...]:
+    """The model id this chat-completions response says answered it, as a
+    0- or 1-tuple (grug#843). The spark gateway rewrites `spark:warm-any`
+    to the tag it chose, so this is the model that was measured. A body
+    that is not JSON, or names no model, yields () - the parse step below
+    decides whether the case errors, not this lookup."""
+    try:
+        body = resp.json()
+    except (AttributeError, TypeError, ValueError):
+        # Not a JSON response object at all: leave the error to
+        # `_parse_review`, whose message names the real fault.
+        return ()
+    model = body.get("model") if isinstance(body, dict) else None
+    return (model,) if isinstance(model, str) and model else ()
 
 
 def _response_backends(response: LlmReviewResponse) -> tuple[str, ...]:

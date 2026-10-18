@@ -67,6 +67,13 @@ class CaseReplay:
     # schema's `maxItems`, which stops a runaway list as valid JSON.
     # A different fact from `truncated` (the INPUT diff was bounded).
     output_truncated: bool = False
+    # grug#843: the model id(s) the backend's responses said answered this
+    # replay (the chat-completions `model` field), distinct and sorted. The
+    # spark gateway rewrites `spark:warm-any` to whichever tag it picked,
+    # so this, not the configured id, is what the replay measured. Empty =
+    # the response named no model (production mode, or a server that omits
+    # the field).
+    served_models: tuple[str, ...] = ()
 
 
 @dataclass(frozen=True)
@@ -109,6 +116,10 @@ class EvalReport:
     # findings before the cut. Kept apart from
     # `truncated_cases` (input diff bounded) so neither caveat hides the other.
     output_truncated_cases: tuple[str, ...] = ()
+    # grug#843: served model id -> scored cases it answered. More than one
+    # key means the run was answered by several models, so its rates are
+    # not any one model's score.
+    served_models: dict[str, int] = field(default_factory=dict)
 
     @property
     def all_errored(self) -> bool:
@@ -186,6 +197,7 @@ def score(
     staged: list[str] = []
     output_truncated: list[str] = []
     attribution: Counter[str] = Counter()
+    served: Counter[str] = Counter()
     out_of_taxonomy: Counter[str] = Counter()
     unknown_verdicts: Counter[str] = Counter()
     unresolvable: dict[str, str] = {}
@@ -208,8 +220,8 @@ def score(
             truncated=truncated, anchored=anchored, staged=staged,
             output_truncated=output_truncated,
         )
-        for backend_name in replay.backends:
-            attribution[backend_name] += 1
+        attribution.update(replay.backends)
+        served.update(replay.served_models)
         scored += 1
         emitted_classes = {c for c, n in replay.emitted.items() if n > 0}
         for ledger_cls, elder_set in case.expected_classes.items():
@@ -240,17 +252,103 @@ def score(
         staged_cases=tuple(staged),
         output_truncated_cases=tuple(output_truncated),
         backend_attribution=dict(attribution),
+        served_models=dict(served),
         unresolvable_cases=unresolvable,
     )
 
 
-def to_baseline_dict(report: EvalReport, *, prompt_sha: str, backend: str) -> dict:
+# grug#843: a model id with this prefix is a spark-gateway ROUTING ALIAS
+# (`spark:warm-any`), not a model. It names whichever tag is warm when the
+# request lands, so on its own it can never say which model a score
+# belongs to.
+_ROUTING_ALIAS_PREFIX = "spark:"
+
+
+def is_routing_alias(model: str) -> bool:
+    """True when `model` is a gateway routing alias rather than a model id."""
+    return model.startswith(_ROUTING_ALIAS_PREFIX)
+
+
+def model_identity(entry: Mapping) -> str | None:
+    """The ONE model a baseline entry measured, or None when that cannot be
+    known (grug#843).
+
+    The served model (what the responses said answered) wins over the
+    configured one, because an alias or a gateway fallback can hand the
+    request to a different model than the one asked for. With no served
+    model on record, a concrete configured id stands in for it; a routing
+    alias does not. Several served models mean the rates mix models, so
+    there is no single identity to attribute them to."""
+    served = entry.get("served_models") or {}
+    if len(served) == 1:
+        return next(iter(served))
+    if served:
+        return None
+    configured = str(entry.get("model") or "")
+    if not configured or is_routing_alias(configured):
+        return None
+    return configured
+
+
+def describe_models(entry: Mapping) -> str:
+    """One line naming what an entry says about its model, for messages."""
+    served = entry.get("served_models") or {}
+    served_text = (
+        ", ".join(f"{name} x{n}" for name, n in sorted(served.items()))
+        if served
+        else "none reported"
+    )
+    return f"configured {entry.get('model') or '(none)'!s}, served {served_text}"
+
+
+def model_entry(report: EvalReport, *, model: str) -> dict:
+    """The two model-identity fields of a baseline entry, for `report` run
+    against configured model id `model` (grug#843)."""
+    return {
+        "model": model,
+        "served_models": dict(sorted(report.served_models.items())),
+    }
+
+
+def model_mismatch(
+    report: EvalReport, backend_baseline: Mapping, *, model: str
+) -> str | None:
+    """Why `report` cannot be checked against `backend_baseline`, or None
+    when both name the same single model (grug#843).
+
+    A different model is not a regression: the old baseline's numbers say
+    nothing about the new model, so comparing them would report a model
+    swap as a prompt regression, or hide a worse model behind the old
+    model's scores. Unknown on either side refuses too - that is the
+    hostname-keyed baseline this issue was filed about."""
+    run = model_entry(report, model=model)
+    base_id = model_identity(backend_baseline)
+    run_id = model_identity(run)
+    if base_id is not None and base_id == run_id:
+        return None
+    return (
+        f"baseline measured {base_id or 'an unknown model'} "
+        f"({describe_models(backend_baseline)}); this run measured "
+        f"{run_id or 'an unknown model'} ({describe_models(run)}). "
+        "Scores from different or unknown models are not a regression "
+        "signal - record a baseline for this model first"
+    )
+
+
+def to_baseline_dict(
+    report: EvalReport, *, prompt_sha: str, backend: str, model: str
+) -> dict:
     """Serialize one backend's report as the committed-baseline shape. The
-    top level carries `prompt_sha` - the #537 CI gate key."""
+    top level carries `prompt_sha` - the #537 CI gate key. `model` is the
+    model id the run was CONFIGURED with (grug#843): a backend name alone
+    once let a baseline recorded on one model be read as another's."""
     return {
         "prompt_sha": prompt_sha,
         "backends": {
             backend: {
+                # grug#843: which model these numbers belong to. See
+                # `model_identity` for how the two fields combine.
+                **model_entry(report, model=model),
                 "overall_catch": report.overall_catch,
                 "per_class_catch": dict(sorted(report.per_class_catch.items())),
                 "noise_rate": report.noise_rate,

@@ -89,6 +89,9 @@ from .runner import run_eval, run_production_eval
 from .scoring import (
     EvalReport,
     compare_to_baseline,
+    describe_models,
+    model_identity,
+    model_mismatch,
     score,
     staged_cases_advisories,
     to_baseline_dict,
@@ -245,6 +248,12 @@ def _print_report(name: str, report: EvalReport) -> None:
                 "the fallback. This number measures the FALLBACK, not the "
                 "cloud backend you configured."
             )
+    if report.served_models:
+        models = ", ".join(
+            f"{model}x{n}" for model, n in sorted(report.served_models.items())
+        )
+        # grug#843: the model the responses named, not the configured id.
+        print(f"  model(s) that actually answered: {models}")
     _print_exclusion_notes(report)
 
 
@@ -421,7 +430,7 @@ def _run_ab_modes(args, rows, all_cases, cases, token, report, backend) -> None:
         )
 
 
-def _record_report(report: EvalReport, backend_name: str) -> int:
+def _record_report(report: EvalReport, backend_name: str, model: str) -> int:
     if report.errored_cases:
         print(
             "refusing --record: "
@@ -432,8 +441,20 @@ def _record_report(report: EvalReport, backend_name: str) -> int:
         )
         return 3
     fresh = to_baseline_dict(
-        report, prompt_sha=compute_prompt_sha(), backend=backend_name
+        report, prompt_sha=compute_prompt_sha(), backend=backend_name, model=model
     )
+    entry = fresh["backends"][backend_name]
+    if model_identity(entry) is None:
+        # grug#843: a baseline that cannot say which model produced it is
+        # how a model's eval was once read as another model's.
+        print(
+            "refusing --record: cannot tell which single model produced "
+            f"these numbers ({describe_models(entry)}). Configure a "
+            "concrete model id rather than a routing alias, and make sure "
+            "the run is not split across models",
+            file=sys.stderr,
+        )
+        return 3
     if BASELINE_PATH.exists():
         fresh, dropped = merge_baseline(load_baseline(), fresh)
         if dropped:
@@ -447,13 +468,17 @@ def _record_report(report: EvalReport, backend_name: str) -> int:
     return 0
 
 
-def _check_report(report: EvalReport, backend_name: str) -> int:
+def _check_report(report: EvalReport, backend_name: str, model: str) -> int:
     if not BASELINE_PATH.exists():
         print("no baseline.json to check against - record one first", file=sys.stderr)
         return 2
     backend_baseline = load_baseline().get("backends", {}).get(backend_name)
     if backend_baseline is None:
         print(f"baseline has no entry for backend {backend_name!r}", file=sys.stderr)
+        return 2
+    mismatch = model_mismatch(report, backend_baseline, model=model)
+    if mismatch is not None:
+        print(f"refusing --check for {backend_name!r}: {mismatch}", file=sys.stderr)
         return 2
     regressions = compare_to_baseline(report, backend_baseline)
     advisories = staged_cases_advisories(report, backend_baseline)
@@ -503,11 +528,14 @@ def main(argv: list[str] | None = None) -> int:
     if backend is not None:
         _run_ab_modes(args, rows, all_cases, cases, token, report, backend)
 
+    # grug#843: the configured model id. `--production` runs a multi-arm,
+    # multi-backend chain with no single configured model, so it has none.
+    model = backend.model if backend is not None else ""
     if args.record:
-        return _record_report(report, backend_name)
+        return _record_report(report, backend_name, model)
 
     if args.check:
-        return _check_report(report, backend_name)
+        return _check_report(report, backend_name, model)
     return 0
 
 
