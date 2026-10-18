@@ -3889,7 +3889,7 @@ def _fetch_guideline_files(
     installation_id: int, owner: str, repo: str, ref: str,
 ) -> dict[str, str]:
     """Fetch whichever of `_GUIDELINE_CANDIDATES` exist at `ref`. Per-file
-    best-effort (mirrors `dispatch._fetch_file_contents`'s contract, not
+    best-effort (mirrors `dispatch.fetch_file_contents`'s contract, not
     imported from it - llm_client must not import the persona layer): a
     404/binary/timeout on one candidate is skipped, never raised, so one
     unreadable file cannot cost the others."""

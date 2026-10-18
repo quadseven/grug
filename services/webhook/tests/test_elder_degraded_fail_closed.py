@@ -26,6 +26,7 @@ from personas.code_reviewer.degraded_gate import (
     degraded_lead_line,
 )
 from personas.code_reviewer.persona import CodeReviewEvaluation
+from personas.review_publish import plan_publish
 from review_pipeline import ReviewCoverage
 
 
@@ -273,17 +274,16 @@ def test_fetch_or_parse_fallback_honours_the_mode(monkeypatch, blocking, want):
 
 
 def test_shared_gate_is_unchanged_for_personas_that_do_not_opt_in():
-    """Guard and Smasher share `_publish_shape`; #1212 is Elder's policy."""
+    """Guard and Smasher share `plan_publish`; #1212 is Elder's policy."""
     ev = CodeReviewEvaluation(
         findings=(), conclusion="neutral", degraded_reason="all_failed",
     )
-    assert cr_dispatch._publish_shape(ev, mode="blocking") == ("neutral", "COMMENT")
-    assert cr_dispatch._publish_shape(
-        ev, mode="blocking", degraded_fails_closed=True,
-    ) == ("failure", "COMMENT")
-    assert cr_dispatch._publish_shape(
-        ev, mode="advisory", degraded_fails_closed=True,
-    ) == ("neutral", "COMMENT")
+    shared = plan_publish(ev, mode="blocking")
+    assert (shared.conclusion, shared.event) == ("neutral", "COMMENT")
+    elder = plan_publish(ev, mode="blocking", degraded_fails_closed=True)
+    assert (elder.conclusion, elder.event) == ("failure", "COMMENT")
+    advisory = plan_publish(ev, mode="advisory", degraded_fails_closed=True)
+    assert (advisory.conclusion, advisory.event) == ("neutral", "COMMENT")
 
 
 def test_degraded_gate_helpers():

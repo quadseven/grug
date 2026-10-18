@@ -3,7 +3,7 @@
 ## Status
 
 Accepted (2026-10-17). Decided by the owner on grug#1212. Refines the
-advisory-first gate in `_publish_shape` (personas/code_reviewer/dispatch.py)
+advisory-first gate behind `plan_publish` (personas/review_publish.py)
 for Elder only; Guard and Smasher share that gate and are unchanged.
 
 ## Context
@@ -94,7 +94,7 @@ degraded reason. WARN mode is unchanged and stays `neutral`.**
 
 The policy lives in one module, `personas/code_reviewer/degraded_gate.py`:
 `degraded_conclusion(blocking)`, `degraded_lead_line(reason)` and the
-merge sentence the summaries use. Every exit asks it. `_publish_shape`
+merge sentence the summaries use. Every exit asks it. `plan_publish`
 takes `degraded_fails_closed=True` at Elder's call sites only, and the
 `attest_code_reviewer_dispatch.py` attester checks that the fail-closed
 branch exists, comes before the neutral branch, and that every Elder call

@@ -29,7 +29,11 @@ Three design questions had real alternatives:
 exploitability judge STAY under `personas/code_reviewer/`; the new
 `personas/guard/dispatch.py` imports them (and Elder's fetch/publish
 helpers: `_fetch_pr_diff`, `_fetch_file_contents`, `_build_review_result`,
-`_publish_shape`, `_prior_finding_keys`, `_resolve_result`). Moving five
+`_publish_shape`, `_prior_finding_keys`, `_resolve_result`). Since #1185 the
+fetch/publish helpers live in the public `personas/review_publish.py` seam
+(`fetch_pr_diff`, `fetch_file_contents`, `prior_finding_keys`, and
+`plan_publish` returning a `PublishOutcome`); the detectors are unchanged.
+Moving five
 mirrored files would churn the drift-lint list, the SAST benchmark imports,
 and every historical reference for zero behavior; the issue's own
 acceptance ("the benchmark harness targets the shared detector code")

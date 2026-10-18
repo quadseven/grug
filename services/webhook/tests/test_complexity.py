@@ -176,9 +176,9 @@ def test_existing_function_worsening_is_summary_advice_with_the_delta():
     assert out[0].severity == "low"
     assert out[0].suggestion is None
     from personas.code_reviewer.persona import CodeReviewEvaluation
-    from personas.code_reviewer.dispatch import _build_review_result, _summary_markdown
+    from personas.code_reviewer.dispatch import build_review_result, _summary_markdown
     evaluation = CodeReviewEvaluation(findings=out, conclusion="success")
-    result, posted = _build_review_result(evaluation, head_sha="a" * 40, event="COMMENT")
+    result, posted = build_review_result(evaluation, head_sha="a" * 40, event="COMMENT")
     assert result is None
     assert posted == ()
     assert "Maintainability notes" in _summary_markdown(evaluation)[1]
@@ -197,9 +197,9 @@ def test_existing_function_grown_18_to_20_is_advisory_not_a_thread():
     assert "moved it 18->20 cyclomatic" in out[0].message
     assert (out[0].severity, out[0].suggestion) == ("low", None)
     from personas.code_reviewer.persona import CodeReviewEvaluation
-    from personas.code_reviewer.dispatch import _build_review_result
+    from personas.code_reviewer.dispatch import build_review_result
     evaluation = CodeReviewEvaluation(findings=out, conclusion="success")
-    result, posted = _build_review_result(evaluation, head_sha="a" * 40, event="COMMENT")
+    result, posted = build_review_result(evaluation, head_sha="a" * 40, event="COMMENT")
     assert result is None and posted == ()
 
 
@@ -211,9 +211,9 @@ def test_new_function_over_cap_by_the_margin_is_a_medium_thread():
     assert "New function" in out[0].message
     assert out[0].severity == "medium"
     from personas.code_reviewer.persona import CodeReviewEvaluation
-    from personas.code_reviewer.dispatch import _build_review_result
+    from personas.code_reviewer.dispatch import build_review_result
     evaluation = CodeReviewEvaluation(findings=out, conclusion="success")
-    result, posted = _build_review_result(evaluation, head_sha="a" * 40, event="COMMENT")
+    result, posted = build_review_result(evaluation, head_sha="a" * 40, event="COMMENT")
     assert result is not None
     assert len(result.comments) == 1
     assert posted[0].severity == "medium"
@@ -234,9 +234,9 @@ def test_one_or_two_point_rise_is_summary_advice_without_inline_suggestion():
         assert out[0].suggestion is None
         assert out[0].severity == "low"
         from personas.code_reviewer.persona import CodeReviewEvaluation
-        from personas.code_reviewer.dispatch import _build_review_result, _summary_markdown
+        from personas.code_reviewer.dispatch import build_review_result, _summary_markdown
         evaluation = CodeReviewEvaluation(findings=out, conclusion="success")
-        result, posted = _build_review_result(evaluation, head_sha="a" * 40, event="COMMENT")
+        result, posted = build_review_result(evaluation, head_sha="a" * 40, event="COMMENT")
         assert result is None
         assert posted == ()
         assert "Maintainability notes" in _summary_markdown(evaluation)[1]

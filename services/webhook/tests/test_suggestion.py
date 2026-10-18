@@ -55,7 +55,7 @@ def test_suggestion_that_breaks_parse_renders_as_prose():
     evaluation = CodeReviewEvaluation(
         findings=(broken,), conclusion="failure", degraded_reason=None,
     )
-    result, _ = cr_dispatch._build_review_result(
+    result, _ = cr_dispatch.build_review_result(
         evaluation, head_sha="a" * 40, event="COMMENT",
         file_contents={"app/pick.py": _NULL_DEREF_FILE},
     )
@@ -152,7 +152,7 @@ def test_dispatch_inline_body_carries_checked_suggestion_block():
     evaluation = CodeReviewEvaluation(
         findings=(finding,), conclusion="failure", degraded_reason=None,
     )
-    result, posted = cr_dispatch._build_review_result(
+    result, posted = cr_dispatch.build_review_result(
         evaluation, head_sha="a" * 40, event="COMMENT",
         file_contents={"app/pick.py": _NULL_DEREF_FILE},
     )

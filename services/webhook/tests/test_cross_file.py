@@ -115,7 +115,7 @@ def test_fetch_cross_file_context_fail_safe_on_search_error():
 
 def test_fetch_cross_file_context_partial_on_content_error():
     """A per-file content failure skips THAT file only (same degrade
-    contract as #336's _fetch_file_contents)."""
+    contract as #336's fetch_file_contents)."""
     calls = {"n": 0}
 
     def fake_get(url, **kw):
@@ -241,12 +241,12 @@ def test_dispatch_threads_cross_file_context_to_review(monkeypatch):
         lambda iid, fn: fn("tok"),
     )
     monkeypatch.setattr(
-        cr_dispatch, "_fetch_pr_diff",
+        cr_dispatch, "fetch_pr_diff",
         lambda token, o, r, n, **kw: "diff --git a/src/api.py b/src/api.py\n"
         "--- a/src/api.py\n+++ b/src/api.py\n@@ -1,1 +1,2 @@\n context\n"
         "+def fetch_user(user_id, *, tenant):\n",
     )
-    monkeypatch.setattr(cr_dispatch, "_fetch_file_contents", lambda *a: {})
+    monkeypatch.setattr(cr_dispatch, "fetch_file_contents", lambda *a: {})
     monkeypatch.setattr(
         cr_dispatch, "fetch_cross_file_context",
         lambda token, o, r, syms, head_sha, exclude_paths: {"src/caller.py": "fetch_user(1)"},
@@ -287,12 +287,12 @@ def test_dispatch_cross_file_failure_degrades_to_diff_only(monkeypatch):
         lambda iid, fn: fn("tok"),
     )
     monkeypatch.setattr(
-        cr_dispatch, "_fetch_pr_diff",
+        cr_dispatch, "fetch_pr_diff",
         lambda token, o, r, n, **kw: "diff --git a/src/api.py b/src/api.py\n"
         "--- a/src/api.py\n+++ b/src/api.py\n@@ -1,1 +1,2 @@\n context\n"
         "+def fetch_user(user_id, *, tenant):\n",
     )
-    monkeypatch.setattr(cr_dispatch, "_fetch_file_contents", lambda *a: {})
+    monkeypatch.setattr(cr_dispatch, "fetch_file_contents", lambda *a: {})
 
     def _boom(*a, **kw):
         raise RuntimeError("code-search exploded")
