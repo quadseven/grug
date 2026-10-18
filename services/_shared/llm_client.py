@@ -1604,7 +1604,8 @@ _CAVE_REVIEW_REASONER_DEFAULT_MODEL = "poolside/Laguna-S-2.1-NVFP4"
 # silently TRUNCATES multi-item answers (the known estate trap; same fix as
 # the bench transport, #544) - a large diff reliably came back unparseable
 # (parse_failed). The schema mirrors exactly what `_coerce_finding` requires;
-# additional fields (e.g. `suggestion`) remain allowed. SaaS-style backends
+# the optional `suggestion` and `effort` are declared, and no other key is
+# allowed (grug#989). SaaS-style backends
 # keep plain json_object via the default body (this rides extra_body, which
 # merges AFTER the default response_format and so replaces it per-backend).
 # grug#989: an upper bound on the findings array, enforced by vLLM's guided
@@ -1616,6 +1617,14 @@ _CAVE_REVIEW_REASONER_DEFAULT_MODEL = "poolside/Laguna-S-2.1-NVFP4"
 # review (JUDGE_MAX_FINDINGS = 75), so a real review loses nothing and a
 # runaway list ends as valid JSON well inside the coder arm's token budget.
 CAVE_MAX_FINDINGS = 50
+# grug#989, the rest of the item: with the list and the message bounded,
+# every other string the model writes is bounded as well, and the object
+# takes no undeclared key (each was another place a runaway could write
+# without end). Like the message bound below, the suggestion bound equals
+# the cap `_coerce_finding` already truncates at (_MAX_SUGGESTION_CHARS).
+CAVE_MAX_PATH_CHARS = 512
+CAVE_MAX_RULE_CHARS = 200
+CAVE_MAX_SUGGESTION_CHARS = 2000
 
 # Message length cap (#553 audit): the check-run findings table repeats
 # every message and GitHub 422s past 65536 chars - an uncapped verbose
@@ -1641,9 +1650,9 @@ _CAVE_FINDINGS_RESPONSE_FORMAT = {
                     "items": {
                         "type": "object",
                         "properties": {
-                            "path": {"type": "string"},
+                            "path": {"type": "string", "maxLength": CAVE_MAX_PATH_CHARS},
                             "line": {"type": "integer"},
-                            "rule": {"type": "string"},
+                            "rule": {"type": "string", "maxLength": CAVE_MAX_RULE_CHARS},
                             "severity": {
                                 "type": "string",
                                 "enum": ["low", "medium", "high", "critical"],
@@ -1652,8 +1661,14 @@ _CAVE_FINDINGS_RESPONSE_FORMAT = {
                                 "type": "string",
                                 "maxLength": MAX_FINDING_MESSAGE_CHARS,
                             },
+                            "suggestion": {
+                                "type": "string",
+                                "maxLength": CAVE_MAX_SUGGESTION_CHARS,
+                            },
+                            "effort": {"type": "string", "enum": sorted(EFFORTS)},
                         },
                         "required": ["path", "line", "rule", "severity", "message"],
+                        "additionalProperties": False,
                     },
                 },
             },
@@ -2738,7 +2753,7 @@ def _post_with_retries_cancellable(
 
 # Defined with the Cave schema above, which enforces it too (grug#989).
 _MAX_FINDING_MESSAGE_CHARS = MAX_FINDING_MESSAGE_CHARS
-_MAX_SUGGESTION_CHARS = 2000
+_MAX_SUGGESTION_CHARS = CAVE_MAX_SUGGESTION_CHARS
 
 
 def _coerce_finding(raw: Any) -> tuple[Optional[Finding], str]:

@@ -17,7 +17,9 @@ from __future__ import annotations
 import os
 from dataclasses import dataclass, field
 
-from llm_client import CAVE_MAX_FINDINGS, MAX_FINDING_MESSAGE_CHARS
+from llm_client import (
+    _CAVE_FINDINGS_RESPONSE_FORMAT as _PROD_CAVE_FINDINGS_RESPONSE_FORMAT,
+)
 from openrouter_free_limiter import is_free_tier_model
 
 
@@ -104,41 +106,9 @@ _POOLSIDE_EXTRA_BODY = _DISABLE_THINKING_EXTRA_BODY
 # requires: {"findings": [{path, line, rule, severity, message}]} with
 # severity from review_types.SEVERITIES. Cloud backends KEEP json_object so
 # their numbers stay comparable with the #537 baselines.
-_CAVE_FINDINGS_RESPONSE_FORMAT = {
-    "type": "json_schema",
-    "json_schema": {
-        "name": "review_findings",
-        "schema": {
-            "type": "object",
-            "properties": {
-                "findings": {
-                    "type": "array",
-                    # Same bound as production's Cave arms (grug#989).
-                    "maxItems": CAVE_MAX_FINDINGS,
-                    "items": {
-                        "type": "object",
-                        "properties": {
-                            "path": {"type": "string"},
-                            "line": {"type": "integer"},
-                            "rule": {"type": "string"},
-                            "severity": {
-                                "type": "string",
-                                "enum": ["low", "medium", "high", "critical"],
-                            },
-                            # Same bound as production (grug#989).
-                            "message": {
-                                "type": "string",
-                                "maxLength": MAX_FINDING_MESSAGE_CHARS,
-                            },
-                        },
-                        "required": ["path", "line", "rule", "severity", "message"],
-                    },
-                },
-            },
-            "required": ["findings"],
-        },
-    },
-}
+# grug#989: the bench sends production's own schema object, not a copy, so
+# a bound added to production (maxItems, maxLength) is measured here too.
+_CAVE_FINDINGS_RESPONSE_FORMAT = _PROD_CAVE_FINDINGS_RESPONSE_FORMAT
 
 
 def configured_backends() -> list[BenchBackend]:
