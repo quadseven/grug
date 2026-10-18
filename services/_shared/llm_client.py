@@ -31,6 +31,7 @@ paths so this module only ever runs from the webhook process.
 """
 from __future__ import annotations
 
+import ast
 import contextlib
 import contextvars
 import hashlib
@@ -2002,6 +2003,124 @@ def _render_file_block(path: str, content: str | None) -> str:
     )
 
 
+# Hunk header new-side start: `@@ -a[,b] +c[,d] @@`.
+_HUNK_NEW_START_RE = re.compile(r"^@@ -\d+(?:,\d+)? \+(\d+)(?:,\d+)? @@")
+# A signature longer than this is cut: the parameter names are what the
+# model needs, not a pathological 200-line argument list.
+_MAX_SIGNATURE_LINES = 30
+
+
+def _first_changed_new_line(body: str) -> int | None:
+    """New-side line number of the hunk's first added line (or its start
+    when the hunk only removes lines). None if the header does not parse."""
+    lines = body.splitlines()
+    if not lines:
+        return None
+    m = _HUNK_NEW_START_RE.match(lines[0])
+    if not m:
+        return None
+    start = int(m.group(1))
+    n = start
+    for ln in lines[1:]:
+        if ln.startswith("+"):
+            return n
+        if ln.startswith(("-", "\\")):
+            continue
+        n += 1
+    return start
+
+
+def _scope_chain(tree: ast.AST, line: int) -> list[ast.AST]:
+    """Outermost-to-innermost class/function nodes whose span holds `line`."""
+    chain: list[ast.AST] = []
+    node: ast.AST = tree
+    while True:
+        nxt = None
+        # Descend through ANY statement holding the line (if/try/with
+        # bodies too), recording only the class/def nodes on the way.
+        for child in ast.iter_child_nodes(node):
+            start = getattr(child, "lineno", None)
+            if start is None:
+                continue
+            end = getattr(child, "end_lineno", None) or start
+            if start <= line <= end:
+                nxt = child
+                break
+        if nxt is None:
+            return chain
+        if isinstance(nxt, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
+            chain.append(nxt)
+        node = nxt
+
+
+def _signature_lines(node: ast.AST, src: list[str], hunk_start: int) -> list[str]:
+    """Numbered header lines of one class/def: from its `def`/`class` line
+    to the line before its first body statement, minus trailing blank or
+    comment-only lines, capped and never reaching into the hunk."""
+    start = node.lineno  # type: ignore[attr-defined]
+    body_nodes = getattr(node, "body", None) or []
+    first_body = body_nodes[0].lineno if body_nodes else start + 1
+    end = max(start, first_body - 1)
+    while end > start and (
+        not src[end - 1].strip() or src[end - 1].lstrip().startswith("#")
+    ):
+        end -= 1
+    end = min(end, start + _MAX_SIGNATURE_LINES - 1, hunk_start - 1)
+    return [f"{i}: {src[i - 1]}" for i in range(start, end + 1)]
+
+
+def _render_enclosing_signature(path: str, content: str | None, body: str) -> str:
+    """Numbered signature lines of every class/def enclosing a Python hunk,
+    for the hunks whose file is too large for the full-file block (#1227).
+
+    Live instance 2026-10-17: a method's parameters `now` and `authors`
+    were flagged as undefined because the signature sat ~40 lines above the
+    hunk, outside the 3-line diff context and outside any full-file block.
+    Only signatures that start ABOVE the hunk are rendered (one inside the
+    hunk is already visible). Anything inconclusive - not Python, no
+    content, an unparseable module, a module-level hunk - renders "".
+    """
+    if not content or not path.endswith((".py", ".pyi")):
+        return ""
+    line = _first_changed_new_line(body)
+    m = _HUNK_NEW_START_RE.match(body)
+    if line is None or m is None:
+        return ""
+    hunk_start = int(m.group(1))
+    try:
+        tree = ast.parse(content)
+    except (SyntaxError, ValueError):
+        return ""
+    src = content.splitlines()
+    above = [n for n in _scope_chain(tree, line) if n.lineno < hunk_start]
+    if all(isinstance(n, ast.ClassDef) for n in above):
+        return ""  # no def above the hunk; a lone class header binds nothing used
+    rendered: list[str] = []
+    for node in above:
+        rendered.extend(_signature_lines(node, src, hunk_start))
+    return (
+        "ENCLOSING SCOPE (signature lines above this hunk, from the current "
+        "file; parameters named here are in scope in the hunk; context only, do not "
+        "flag these lines):\n```\n" + "\n".join(rendered) + "\n```\n"
+    )
+
+
+def _render_hunk_context(
+    path: str, content: str | None, body: str, shown: dict[str, bool],
+) -> str:
+    """Per-hunk context prefix shared by the review and judge prompts: the
+    full-file block on a path's first hunk, else - when the file is too
+    large for that block - the enclosing signature of THIS hunk (#1227)."""
+    if path not in shown:
+        block = _render_file_block(path, content)
+        shown[path] = bool(block)
+        if block:
+            return block
+    if shown[path]:
+        return ""
+    return _render_enclosing_signature(path, content, body)
+
+
 def _render_pr_intent(pr_context: Optional[PrContext]) -> str:
     """Render bounded PR intent as data, never as model instructions."""
     if not pr_context:
@@ -2052,7 +2171,9 @@ def _build_review_parts(
     # output is byte-identical to the pre-#336 diff-only shape. The full-file
     # block is rendered ONCE per path (on its first hunk), not per hunk.
     contents = file_contents or {}
-    shown: set[str] = set()
+    # path -> whether its full-file block was rendered (#1227: a path whose
+    # file was too large gets each hunk's enclosing signature instead).
+    shown: dict[str, bool] = {}
     parts: list[str] = []
     intent = _render_pr_intent(pr_context)
     if intent:
@@ -2060,10 +2181,7 @@ def _build_review_parts(
     if review_map:
         parts.append(review_map)
     for h in hunks:
-        ctx = ""
-        if h.path not in shown:
-            ctx = _render_file_block(h.path, contents.get(h.path))
-            shown.add(h.path)
+        ctx = _render_hunk_context(h.path, contents.get(h.path), h.body, shown)
         parts.append(f"### {h.path}\n{ctx}```diff\n{h.body}\n```")
     # Cross-file context (#468): bounded SNIPPETS (already carrying their
     # ORIGINAL line numbers, produced by cross_file._symbol_snippet) from
@@ -6639,7 +6757,7 @@ def _build_judge_messages(
     richer review pass correctly found.
     """
     contents = file_contents or {}
-    shown: set[str] = set()
+    shown: dict[str, bool] = {}
     blocks: list[str] = []
     intent = _render_pr_intent(pr_context)
     if intent:
@@ -6649,10 +6767,7 @@ def _build_judge_messages(
     # unsupported by the code alone and is refuted (seen live 2026-10-05).
     blocks.extend(_linked_issue_parts(pr_context))
     for h in hunks:
-        ctx = ""
-        if h.path not in shown:
-            ctx = _render_file_block(h.path, contents.get(h.path))
-            shown.add(h.path)
+        ctx = _render_hunk_context(h.path, contents.get(h.path), h.body, shown)
         blocks.append(f"### {h.path}\n{ctx}```diff\n{h.body}\n```")
     for path, content in (cross_file_contents or {}).items():
         if path in shown or not content:
