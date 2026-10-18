@@ -41,10 +41,10 @@ from github_checks_client import CheckRunResult, post_check_run
 from personas import board_client
 from personas.code_reviewer.dispatch import (
     DIFF_TOO_LARGE,
-    LOW_CONFIDENCE,
     RETRIED_DEGRADATIONS,
     dispatch_code_review,
 )
+from personas.review_publish import LOW_CONFIDENCE
 from personas.code_reviewer.degraded_gate import (
     degraded_conclusion,
     gate_sentence,

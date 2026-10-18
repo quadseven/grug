@@ -7,6 +7,7 @@ from unittest.mock import MagicMock, patch
 
 import httpx
 
+from personas import review_publish
 from personas.code_reviewer import dispatch as cr_dispatch
 from personas.code_reviewer.persona import CodeReviewEvaluation, Finding
 from personas.code_reviewer.diff_parser import DiffHunk
@@ -75,7 +76,7 @@ def test_fetch_pr_diff_scope_reports_full_fallback(monkeypatch):
         cr_dispatch.httpx, "get", fake_get,
     )
 
-    diff, used_compare, _rejected = cr_dispatch._fetch_pr_diff_with_scope(
+    diff, used_compare, _rejected = cr_dispatch.fetch_pr_diff_with_scope(
         "token", "owner", "repo", 7, base_sha="abc", head_sha="def",
     )
 
@@ -125,7 +126,7 @@ def test_fetch_pr_diff_scope_zippie_127_diverged_baseline_falls_back(monkeypatch
 
     monkeypatch.setattr(cr_dispatch.httpx, "get", fake_get)
 
-    diff, used_compare, _rejected = cr_dispatch._fetch_pr_diff_with_scope(
+    diff, used_compare, _rejected = cr_dispatch.fetch_pr_diff_with_scope(
         "token", "quadseven", "zippie", 127,
         base_sha="4dbd2011", head_sha="2a913a31",
     )
@@ -154,7 +155,7 @@ def test_fetch_pr_diff_scope_behind_baseline_falls_back(monkeypatch):
     ]
     monkeypatch.setattr(cr_dispatch.httpx, "get", lambda url, **kw: responses.pop(0))
 
-    diff, used_compare, _rejected = cr_dispatch._fetch_pr_diff_with_scope(
+    diff, used_compare, _rejected = cr_dispatch.fetch_pr_diff_with_scope(
         "token", "owner", "repo", 7, base_sha="abc", head_sha="def",
     )
     assert diff == "full diff"
@@ -178,7 +179,7 @@ def test_fetch_pr_diff_scope_clean_ahead_baseline_uses_compare(monkeypatch):
     ]
     monkeypatch.setattr(cr_dispatch.httpx, "get", lambda url, **kw: responses.pop(0))
 
-    diff, used_compare, _rejected = cr_dispatch._fetch_pr_diff_with_scope(
+    diff, used_compare, _rejected = cr_dispatch.fetch_pr_diff_with_scope(
         "token", "owner", "repo", 7, base_sha="abc", head_sha="def",
     )
     assert diff == "the real delta diff"
@@ -224,7 +225,7 @@ def test_fetch_pr_diff_scope_merge_from_main_reviews_pr_own_diff(monkeypatch):
 
     monkeypatch.setattr(cr_dispatch.httpx, "get", fake_get)
 
-    diff, used_compare, rejected = cr_dispatch._fetch_pr_diff_with_scope(
+    diff, used_compare, rejected = cr_dispatch.fetch_pr_diff_with_scope(
         "token", "owner", "repo", 7, base_sha="reviewed", head_sha="h1",
     )
     assert "walkthrough/related.py" not in diff
@@ -244,7 +245,7 @@ def test_compare_is_clean_ancestor_rejects_range_with_merge_commit(monkeypatch):
         lambda url, **kw: httpx.Response(
             200, json=body, request=httpx.Request("GET", url)),
     )
-    assert cr_dispatch._compare_is_clean_ancestor(
+    assert review_publish._compare_is_clean_ancestor(
         "token", "owner", "repo", "a", "h1") is False
 
 
@@ -262,7 +263,7 @@ def test_compare_is_clean_ancestor_fails_closed_on_truncated_commit_list(
         lambda url, **kw: httpx.Response(
             200, json=body, request=httpx.Request("GET", url)),
     )
-    assert cr_dispatch._compare_is_clean_ancestor(
+    assert review_publish._compare_is_clean_ancestor(
         "token", "owner", "repo", "a", "h1") is False
 
 
@@ -276,7 +277,7 @@ def test_compare_is_clean_ancestor_accepts_linear_fast_forward(monkeypatch):
         lambda url, **kw: httpx.Response(
             200, json=body, request=httpx.Request("GET", url)),
     )
-    assert cr_dispatch._compare_is_clean_ancestor(
+    assert review_publish._compare_is_clean_ancestor(
         "token", "owner", "repo", "a", "c2") is True
 
 
@@ -300,7 +301,7 @@ def test_fetch_pr_diff_scope_diverged_reports_baseline_rejected(monkeypatch):
     ]
     monkeypatch.setattr(cr_dispatch.httpx, "get", lambda url, **kw: responses.pop(0))
 
-    diff, used_compare, baseline_rejected = cr_dispatch._fetch_pr_diff_with_scope(
+    diff, used_compare, baseline_rejected = cr_dispatch.fetch_pr_diff_with_scope(
         "token",
         "owner",
         "repo",
@@ -322,7 +323,7 @@ def test_fetch_pr_diff_scope_unavailable_baseline_is_not_rejected(monkeypatch):
     ]
     monkeypatch.setattr(cr_dispatch.httpx, "get", lambda url, **kw: responses.pop(0))
 
-    diff, used_compare, baseline_rejected = cr_dispatch._fetch_pr_diff_with_scope(
+    diff, used_compare, baseline_rejected = cr_dispatch.fetch_pr_diff_with_scope(
         "token",
         "owner",
         "repo",
@@ -371,7 +372,7 @@ def test_compare_is_clean_ancestor_fails_closed_on_transport_error(monkeypatch):
         raise httpx.ConnectTimeout("gh down", request=httpx.Request("GET", url))
 
     monkeypatch.setattr(cr_dispatch.httpx, "get", _raise)
-    assert cr_dispatch._compare_is_clean_ancestor(
+    assert review_publish._compare_is_clean_ancestor(
         "token", "owner", "repo", "abc", "def",
     ) is False
 
@@ -381,7 +382,7 @@ def test_compare_is_clean_ancestor_fails_closed_on_malformed_body(monkeypatch):
         cr_dispatch.httpx, "get",
         lambda url, **kw: httpx.Response(200, text="not json", request=httpx.Request("GET", url)),
     )
-    assert cr_dispatch._compare_is_clean_ancestor(
+    assert review_publish._compare_is_clean_ancestor(
         "token", "owner", "repo", "abc", "def",
     ) is False
 
@@ -463,6 +464,10 @@ def test_living_hunt_delta_done_log_on_successful_persist(monkeypatch, caplog):
         cr_dispatch, "with_install_token_retry",
         lambda inst_id, fn: fn("fake-token"),
     )
+    monkeypatch.setattr(
+        review_publish, "with_install_token_retry",
+        lambda inst_id, fn: fn("fake-token"),
+    )
     monkeypatch.setattr(cr_dispatch, "review_diff", lambda *a, **k: llm)
     monkeypatch.setattr(
         cr_dispatch, "post_check_run",
@@ -474,7 +479,7 @@ def test_living_hunt_delta_done_log_on_successful_persist(monkeypatch, caplog):
     )
     monkeypatch.setattr(cr_dispatch, "grade_findings", lambda *a, **kw: ())
     monkeypatch.setattr(
-        cr_dispatch, "_fetch_pr_diff_with_scope",
+        cr_dispatch, "fetch_pr_diff_with_scope",
         lambda *a, **k: ("diff --git a/x.py b/x.py\n--- a/x.py\n+++ b/x.py\n@@ -1 +1 @@\n-old\n+new\n", True, False),
     )
     monkeypatch.setattr(

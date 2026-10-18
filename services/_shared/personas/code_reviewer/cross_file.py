@@ -312,7 +312,7 @@ def fetch_cross_file_context(
                 continue
             contents[path] = snippet
         except (httpx.HTTPStatusError, httpx.RequestError) as e:
-            # Same per-file degrade contract as #336's _fetch_file_contents:
+            # Same per-file degrade contract as #336's fetch_file_contents:
             # skip this file, keep the rest.
             log.info(
                 "cross_file_context_degraded",
