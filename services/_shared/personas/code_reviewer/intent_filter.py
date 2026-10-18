@@ -220,6 +220,57 @@ _ADVISORY_NOTE = (
 )
 
 
+@dataclasses.dataclass(frozen=True, slots=True)
+class _BoxScope:
+    """What the scope knows about one PR's linked boxes."""
+
+    boxes: tuple[LinkedBox, ...]
+    closed: frozenset[int]
+    single_issue: int | None
+    pr_body: str
+    any_claim: bool
+    any_closed: bool
+
+    def claims(self, box: LinkedBox) -> bool:
+        return box[2] == "open" and _body_claims(box, self.pr_body, self.single_issue)
+
+
+def _build_scope(
+    boxes: tuple[LinkedBox, ...], closed_issues: Iterable[int], pr_body: str,
+) -> _BoxScope:
+    closed = frozenset(closed_issues)
+    issues = {b[0] for b in boxes}
+    single_issue = next(iter(issues)) if len(issues) == 1 else None
+    body = pr_body or ""
+    scope = _BoxScope(boxes, closed, single_issue, body, False, bool(issues & closed))
+    any_claim = any(scope.claims(b) for b in boxes if b[0] not in closed)
+    return dataclasses.replace(scope, any_claim=any_claim)
+
+
+def _advisory(finding: Finding, boxes: list[LinkedBox]) -> Finding:
+    return dataclasses.replace(
+        _annotated(finding, boxes, _ADVISORY_NOTE), severity="medium",
+    )
+
+
+def _scoped(finding: Finding, scope: _BoxScope) -> tuple[Finding | None, str]:
+    """One intent-mismatch under the scope: (finding or None, outcome), where
+    outcome is "kept", "dropped" or "lowered"."""
+    matched = _boxes_for_finding(finding.message, scope.boxes, scope.single_issue)
+    blocking = finding.severity in ("high", "critical")
+    if not matched:
+        if blocking and not scope.any_closed and not scope.any_claim:
+            return _advisory(finding, []), "lowered"
+        return finding, "kept"
+    if any(b[0] in scope.closed for b in matched):
+        return _annotated(finding, matched), "kept"
+    if all(b[2] == "ticked" for b in matched):
+        return None, "dropped"
+    if not blocking or any(scope.claims(b) for b in matched):
+        return _annotated(finding, matched), "kept"
+    return _advisory(finding, matched), "lowered"
+
+
 def scope_intent_mismatch_to_claimed_boxes(
     findings: Iterable[Finding],
     *,
@@ -228,47 +279,15 @@ def scope_intent_mismatch_to_claimed_boxes(
     pr_body: str,
 ) -> tuple[tuple[Finding, ...], int, int]:
     """Apply the #1218 scope. Returns (kept, dropped, lowered)."""
-    all_boxes = tuple(boxes)
-    closed = set(closed_issues)
-    issues = {b[0] for b in all_boxes}
-    single_issue = next(iter(issues)) if len(issues) == 1 else None
-    refs_only = {b for b in all_boxes if b[0] not in closed}
-    body = pr_body or ""
-    any_claim = any(
-        _body_claims(b, body, single_issue) for b in refs_only if b[2] == "open"
-    )
+    scope = _build_scope(tuple(boxes), closed_issues, pr_body)
     kept: list[Finding] = []
-    dropped = 0
-    lowered = 0
+    counts = {"kept": 0, "dropped": 0, "lowered": 0}
     for finding in findings:
-        if finding.rule_name != _INTENT_MISMATCH or not all_boxes:
+        if finding.rule_name != _INTENT_MISMATCH or not scope.boxes:
             kept.append(finding)
             continue
-        matched = _boxes_for_finding(finding.message, all_boxes, single_issue)
-        blocking = finding.severity in ("high", "critical")
-        if not matched:
-            if blocking and not (issues & closed) and not any_claim:
-                kept.append(dataclasses.replace(
-                    _annotated(finding, [], _ADVISORY_NOTE), severity="medium",
-                ))
-                lowered += 1
-            else:
-                kept.append(finding)
-            continue
-        if any(b[0] in closed for b in matched):
-            kept.append(_annotated(finding, matched))
-            continue
-        if all(b[2] == "ticked" for b in matched):
-            dropped += 1
-            continue
-        claimed = any(
-            b[2] == "open" and _body_claims(b, body, single_issue) for b in matched
-        )
-        if claimed or not blocking:
-            kept.append(_annotated(finding, matched))
-            continue
-        kept.append(dataclasses.replace(
-            _annotated(finding, matched, _ADVISORY_NOTE), severity="medium",
-        ))
-        lowered += 1
-    return tuple(kept), dropped, lowered
+        result, outcome = _scoped(finding, scope)
+        counts[outcome] += 1
+        if result is not None:
+            kept.append(result)
+    return tuple(kept), counts["dropped"], counts["lowered"]
