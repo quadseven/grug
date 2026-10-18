@@ -646,8 +646,9 @@ export GRUG_BENCH_CAVE_MODEL='qwen3-coder-next:q8_0'   # or reasoner model
 # Ship each trial as an LLMObs span + parse_ok/complete_s evaluations
 # (ml_app=grug-elder-bakeoff by default; agentless, no local DD agent):
 export GRUG_BENCH_LLMOBS=1
-export DD_API_KEY="$(aws ssm get-parameter --name /grug/dd-api-key \
-  --with-decryption --query Parameter.Value --output text)"
+# Datadog is off since 2026-10-05 and /grug/dd-api-key is deleted.
+# To use LLMObs again, mint a key and export it here:
+# export DD_API_KEY=<a live Datadog API key>
 # optional: export DD_LLMOBS_ML_APP=grug-elder-bakeoff
 
 make -C ../.. review-latency
