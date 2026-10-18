@@ -83,6 +83,15 @@ class PersonaSpec:
     # its own dispatch). Filtered BEFORE enablement in the loop, so a
     # non-matching action costs no store read.
     actions: tuple[str, ...] = PR_UPDATE_ACTIONS
+    # grug#1202: True only for a persona whose check run is PROVEN to reach a
+    # terminal conclusion on every PR head it is dispatched for. Enforcement
+    # then makes `check_run_name` a REQUIRED context on the Grug-managed
+    # ruleset while the repo's mode is BLOCK (enabled + blocking flag), and
+    # removes it at WARN/OFF. A persona that can end without posting a
+    # terminal check would leave a PR waiting forever on a required check
+    # that never arrives, so the default is False; flipping it needs the
+    # proof written next to the spec and a test.
+    may_be_required: bool = False
 
     def __post_init__(self) -> None:
         # The store's is_persona_enabled derives its lookup key as
@@ -101,6 +110,13 @@ class PersonaSpec:
         if self.blocking_flag is None and self.blocking_default:
             raise ValueError(
                 f"PersonaSpec({self.key!r}): blocking_default=True "
+                "requires a blocking_flag"
+            )
+        # Required-while-BLOCK needs a BLOCK mode to key off; without a
+        # blocking flag the persona would be required unconditionally.
+        if self.may_be_required and self.blocking_flag is None:
+            raise ValueError(
+                f"PersonaSpec({self.key!r}): may_be_required=True "
                 "requires a blocking_flag"
             )
 
@@ -163,7 +179,8 @@ REGISTRY: tuple[PersonaSpec, ...] = (
         # style) - conclusion "failure" + REQUEST_CHANGES. Safe because the gate
         # in dispatch.py fails OPEN on any degraded review (LLM outage, parse
         # failure, empty/huge diff) -> neutral, never a block; and the block
-        # clears when findings are fixed and re-pushed (Elder dedups + re-reviews).
+        # clears when findings are fixed and re-pushed: the clean re-review
+        # dismisses Elder's earlier REQUEST_CHANGES (a COMMENT alone would not).
         # NOTE: GitHub only *enforces* the block if "Grug - Elder" (or the
         # legacy alias "Grug - Code Review") is a REQUIRED status check -
         # the persona conclusion alone shows a red X but does not prevent merge.
@@ -177,6 +194,22 @@ REGISTRY: tuple[PersonaSpec, ...] = (
         missing_repo_policy="enabled",
         events=("pull_request",),
         dispatch_module="personas.code_reviewer.webhook_dispatch",
+        # grug#1202: Elder always reaches a terminal conclusion on a PR that
+        # can merge. The enqueue posts `in_progress` first, so the required
+        # check reads "pending", never "missing" (rerun.py
+        # _post_elder_in_progress_check). The durable consumer then either
+        # publishes a real pass/fail or completes the check neutral through
+        # _complete_elder_check_open ("Post a TERMINAL Elder check so
+        # required-status never sticks in_progress"): superseded head,
+        # freshness outage, unknown skip, and the intent-drift redrive cap
+        # all end there, and a completion that did not land raises for SQS
+        # redrive instead of finishing silently. The only exits that leave
+        # the check pending are draft/closed PRs (which cannot merge) and
+        # same-head redrives (a fresh review on that head completes it).
+        # Residual: a job exhausted to the DLQ stays in_progress until a
+        # push, `/grug improve`, or the opt-in check-run sweeper closes it -
+        # that is fail-closed, the posture a BLOCK mode asks for.
+        may_be_required=True,
     ),
     PersonaSpec(
         key="guard",
@@ -190,6 +223,13 @@ REGISTRY: tuple[PersonaSpec, ...] = (
         missing_repo_policy="disabled",
         events=("pull_request",),
         dispatch_module="personas.guard.webhook_dispatch",
+        # grug#1202: NOT requirable yet. Guard posts no in_progress check at
+        # enqueue, and dispatch_guard_review logs and returns when its
+        # completed check-run POST fails (guard_check_run_publish_failed,
+        # guard_degraded_publish_failed) with no redrive - that head then
+        # has no Guard check at all, and a required context would wait on
+        # it forever. Prove a terminal-or-redrive guarantee before flipping.
+        may_be_required=False,
     ),
     PersonaSpec(
         key="warder",
@@ -207,6 +247,10 @@ REGISTRY: tuple[PersonaSpec, ...] = (
         events=("pull_request",),
         dispatch_module="personas.warder.webhook_dispatch",
         actions=("closed",),  # merged-PR seam; merged flag checked in-module
+        # grug#1202: never requirable. Totem runs only after merge, so an
+        # open PR head never gets its check; requiring it would block every
+        # merge. Its BLOCK flag gates the release-time SLO section only.
+        may_be_required=False,
     ),
     PersonaSpec(
         key="sentinel",

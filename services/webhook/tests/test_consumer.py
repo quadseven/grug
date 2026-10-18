@@ -909,6 +909,7 @@ _BOTH_ATTRS = {"ApproximateNumberOfMessages", "ApproximateNumberOfMessagesNotVis
 @pytest.fixture
 def telemetry_env(monkeypatch):
     """Baseline env for a sweep: known queue URL + agent host present."""
+    monkeypatch.setenv("GRUG_DATADOG_ENABLED", "true")  # #1208: sweep is DD-only
     monkeypatch.setenv("GRUG_RERUN_QUEUE_URL", _RERUN_URL)
     monkeypatch.setenv("DD_AGENT_HOST", "192.0.2.99")
     return _BASE
@@ -1112,6 +1113,7 @@ def test_emit_queue_depth_skips_sweep_without_agent_host(monkeypatch, caplog):
     12 per-emit lines) and zero pointless SQS calls."""
     import logging as _logging
 
+    monkeypatch.setenv("GRUG_DATADOG_ENABLED", "true")
     monkeypatch.setenv("GRUG_RERUN_QUEUE_URL", _RERUN_URL)
     monkeypatch.delenv("DD_AGENT_HOST", raising=False)
     with patch.object(consumer._sqs_telemetry, "get_queue_attributes") as mock_attrs:
@@ -1125,6 +1127,7 @@ def test_emit_queue_depth_skips_sweep_without_agent_host(monkeypatch, caplog):
 def test_emit_queue_depth_warns_without_base_url(monkeypatch, caplog):
     import logging as _logging
 
+    monkeypatch.setenv("GRUG_DATADOG_ENABLED", "true")
     monkeypatch.setenv("DD_AGENT_HOST", "192.0.2.99")
     monkeypatch.delenv("GRUG_RERUN_QUEUE_URL", raising=False)
     monkeypatch.delenv("GRUG_CAVE_RESULTS_QUEUE_URL", raising=False)
@@ -1291,6 +1294,7 @@ def test_terminal_failure_completes_the_elder_check(monkeypatch):
         return True
 
     monkeypatch.setattr(rerun, "_complete_elder_check_open", fake_complete)
+    monkeypatch.setattr(rerun, "elder_blocking_for", lambda *a: False)
     spec = types.SimpleNamespace(kind="rerun")
     consumer._announce_terminal_failure(
         spec, _dlq_message(5), httpx.HTTPStatusError(
@@ -1329,6 +1333,7 @@ def test_terminal_announce_never_masks_the_original_error(monkeypatch):
         raise RuntimeError("check post exploded")
 
     monkeypatch.setattr(rerun, "_complete_elder_check_open", boom)
+    monkeypatch.setattr(rerun, "elder_blocking_for", lambda *a: False)
     spec = types.SimpleNamespace(kind="rerun")
     consumer._announce_terminal_failure(spec, _dlq_message(5), RuntimeError("orig"))
 

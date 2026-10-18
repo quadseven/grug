@@ -2,7 +2,7 @@
 
 Fetches each corpus case's REAL PR diff from GitHub and drives it through
 Elder's actual review path - `_build_messages` (Elder's exact prompt,
-production variant) and `_parse_response` (Elder's exact parser) - via the
+production variant) and `_parse_review` (Elder's exact parser) - via the
 SAST benchmark's backend transport, so the catch/noise numbers are Elder's
 real behavior, never a reimplementation's.
 
@@ -69,7 +69,7 @@ from llm_client import (
     Hunk,
     LlmReviewResponse,
     _build_messages,
-    _parse_response,
+    _parse_review,
     _review_cohort_paths,
     review_cohort_char_budget,
     review_diff,
@@ -409,6 +409,7 @@ def run_case(
 
         review_map = render_review_map(plan) if plan.staged else ""
         findings: list[Finding] = []
+        output_truncated = False
         for cohort in plan.cohorts:
             cohort_hunks = [hunks[index] for index in cohort.hunk_indexes]
             messages = _build_messages(
@@ -418,16 +419,27 @@ def run_case(
                 review_map=review_map,
             )
             resp = _post(backend, messages)
-            cohort_findings, _model, err = _parse_response(resp)
-            if err and not cohort_findings:
+            parsed = _parse_review(resp)
+            if parsed.error and not parsed.findings:
                 # ALL-OR-NOTHING (see docstring): one bad cohort must not
                 # silently shrink a staged case's findings into a fake
                 # complete-looking replay.
                 log.warning(
-                    "eval_case_parse_failed case=%s err=%s", case.case_id, err
+                    "eval_case_parse_failed case=%s err=%s",
+                    case.case_id, parsed.error,
                 )
                 return CaseReplay(case_id=case.case_id, emitted={}, errored=True)
-            findings.extend(cohort_findings)
+            if parsed.truncated_findings:
+                # grug#1231: the answer hit the output cap mid-list. Its
+                # complete findings are the model's real answer, so the case
+                # scores, and `output_truncated` names it in the report: the
+                # model meant to write more, so a miss here may be the cap.
+                log.warning(
+                    "eval_case_output_truncated case=%s kept=%d",
+                    case.case_id, len(parsed.findings),
+                )
+                output_truncated = True
+            findings.extend(parsed.findings)
     except Exception as e:  # noqa: BLE001 - one case must not abort the sweep
         # grug#881: a run that logged only `kind=TypeError` (no message, no
         # offending field) cost 90 minutes of CI to diagnose by inference.
@@ -446,6 +458,7 @@ def run_case(
         truncated=truncated,
         anchored=anchored,
         staged=plan.staged,
+        output_truncated=output_truncated,
     )
 
 

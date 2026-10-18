@@ -8,7 +8,7 @@ name: Check · attesters
 # These ran under the temper spec cascade until temper was retired.
 # They never needed it: every script is pure stdlib, reads only the
 # repo tree, and exits non-zero on violation. This workflow runs the
-# same 24 checks with no Rust toolchain and no SMT solver.
+# same 23 checks with no Rust toolchain and no SMT solver.
 
 on:
   pull_request:
@@ -31,8 +31,6 @@ on:
       - 'web/src/main.tsx'
       - 'web/src/rum.ts'
       - 'web/package.json'
-      - 'infra/pulumi/components/dd_rum.py'
-      - 'infra/pulumi/__main__.py'
       - '.github/workflows/check.attesters.yml'
   workflow_dispatch:
 
@@ -110,9 +108,6 @@ jobs:
 
       - name: attest repo config default dict
         run: python3 infra/scripts/attest_repo_config_default_dict.py
-
-      - name: attest rum pulumi registration
-        run: python3 infra/scripts/attest_rum_pulumi_registration.py
 
       - name: attest rum sdk in html
         run: python3 infra/scripts/attest_rum_sdk_in_html.py

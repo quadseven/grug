@@ -234,6 +234,43 @@ def test_build_non_string_issue_body_is_a_failure_not_a_crash():
     ) is None
 
 
+def test_health_ticket_reserve_change_context_requires_symptom_only_review():
+    from personas.code_reviewer.linked_issue import build_linked_issue_context
+
+    issue = {
+        "title": "Refund the waiting members",
+        "body": (
+            "<!-- loom:health key=bank-balance -->\n"
+            "## Finding evidence\n"
+            "> The guild bank holds under a gold while 65 members wait on refunds."
+        ),
+    }
+    block = build_linked_issue_context(
+        "Closes #42", fetch_issue=lambda _number: issue,
+    )
+    assert block is not None
+    assert "The guild bank holds under a gold while 65 members wait on refunds" in block
+    assert "symptom-only" in block
+    assert "reserve held back" in block
+    assert "emit a high" in block
+
+
+def test_health_ticket_context_distinguishes_improving_the_outcome():
+    from personas.code_reviewer.linked_issue import build_linked_issue_context
+
+    issue = {
+        "title": "Health: store income remains low",
+        "body": "> The store receives too little income to serve its customers.",
+    }
+    block = build_linked_issue_context(
+        "Closes #43", fetch_issue=lambda _number: issue,
+    )
+    assert block is not None
+    assert "health finding evidence" in block.lower()
+    assert "improves the outcome" in block
+    assert "not symptom-only" in block
+
+
 # --- prompt wiring ----------------------------------------------------------
 
 
@@ -312,7 +349,7 @@ def test_dispatch_puts_block_in_pr_context_and_failure_degrades(monkeypatch):
     payload = _payload()
     payload["pull_request"]["body"] = "Refs myorg/myrepo" "#904"  # joined at parse time: keeps a literal cross-repo ref out of the source
     monkeypatch.setattr(
-        cr_dispatch, "build_issue_fetcher",
+        cr_dispatch, "build_issue_details_fetcher",
         lambda **kw: (lambda n: ISSUE),
     )
     with patch("httpx.get", return_value=_diff_response()):
@@ -323,7 +360,7 @@ def test_dispatch_puts_block_in_pr_context_and_failure_degrades(monkeypatch):
     def broken(**kw):
         raise RuntimeError("no token")
 
-    monkeypatch.setattr(cr_dispatch, "build_issue_fetcher", broken)
+    monkeypatch.setattr(cr_dispatch, "build_issue_details_fetcher", broken)
     with patch("httpx.get", return_value=_diff_response()):
         cr_dispatch.dispatch_code_review(payload, blocking=False)
     assert "linked_issue_context" not in seen[-1]
@@ -371,3 +408,24 @@ def test_header_identifies_test_named_criteria_without_changed_test():
     assert "names a test" in _HEADER
     assert "no added or changed test" in _HEADER
     assert "acceptance-criterion-unmet" in _HEADER
+
+
+def test_header_asks_for_a_hunk_per_criterion_and_exempts_live():
+    """#1179: Elder read a ticket's criteria and stayed clear on a diff that
+    could meet none of them. The header now asks for the hunk that meets
+    each criterion and a high intent-mismatch when none can."""
+    from personas.code_reviewer.linked_issue import _HEADER
+
+    assert "name the diff hunk that satisfies it" in _HEADER
+    assert "high `intent-mismatch`" in _HEADER
+    assert "'Live:' are checked after deploy" in _HEADER
+
+
+def test_rendered_criteria_round_trips_the_block():
+    block = render_linked_issue_block({904: extract_criteria(ISSUE)})
+    assert linked_issue.rendered_criteria(block) == [
+        (904, 1, "First criterion about caching"),
+        (904, 2, "Second criterion about logging"),
+        (904, 3, "Third criterion without a box"),
+    ]
+    assert linked_issue.rendered_criteria("") == []

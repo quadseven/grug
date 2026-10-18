@@ -12,6 +12,8 @@ import {
   useRerun,
   useRerunAll,
   type Repo,
+  type RepoConfig,
+  type RepoConfigPatch,
 } from "../lib/installations";
 import "./dashboard-grug.css";
 
@@ -25,8 +27,10 @@ import "./dashboard-grug.css";
 // honest empty state — never a fabricated number. Where no backend exists
 // yet (checks-today, now-blocking, usage/billing $, the Activity check-run
 // feed) we render "—" / "no data yet", NOT the prototype's invented figures.
-// The interactive localStorage toggles (skin/tone/notif/persona mode) stay —
-// they're settings, not fabricated readouts.
+// The interactive localStorage toggles (skin/tone/notif) stay - they're
+// browser-side settings, not fabricated readouts. Persona modes are NOT local:
+// the Personas panel reads and writes the selected repo's real config
+// (grug#1206), and a persona with no backend mode field renders disabled.
 
 type Panel =
   | "repos" | "personas" | "appearance" | "usage" | "notifications" | "account" | "activity";
@@ -41,21 +45,55 @@ const PANELS: { id: Panel; idx: string; label: string; badge?: string }[] = [
   { id: "activity", idx: "07", label: "Activity" },
 ];
 
-// `modes`: which of BLOCK/WARN/OFF the backend can actually honor for this
-// persona. Comment-only or scheduled personas (no merge-gating check-run)
-// list none and render an informational chip instead of the segmented
-// control, so users can never select a mode the backend ignores.
-const PERSONAS = [
-  { id: "smasher", code: "F-01", name: "Smasher", img: "grug_smasher.png", desc: "Hunt bugs that hide. Mutate markings, run the tribe's own tests, name what still lives.", meta: ["mutation trial", "diff-scoped"], modes: ["warn", "off"] },
-  { id: "guard", code: "F-02", name: "Guard", img: "grug_guard.png", desc: "Watch the cave mouth. Secrets, sick deps, weak IaC, SAST. Evil shall not pass.", meta: ["SCA + secrets", "SAST on diff"], modes: ["block", "warn", "off"] },
-  { id: "elder", code: "F-03", name: "Elder", img: "grug_elder.png", desc: "Read markings one line at a time. Name the bad omen before it bite. Lore + Omen fused.", meta: ["Cave review", "Markings Board"], modes: ["block", "warn", "off"] },
-  { id: "chief", code: "F-04", name: "Chief", img: "grug_chief.png", desc: "Before the hunt, Chief ask: plan have name? meat counted? path home known?", meta: ["plan checks", "strict mode"], modes: ["block", "warn", "off"] },
+type PMode = "block" | "warn" | "off";
+
+// The repo-config booleans that carry one persona's mode. OFF = enabled
+// false; WARN = enabled and not blocking; BLOCK = enabled and blocking. A
+// persona with no `blocking` flag can only be WARN or OFF.
+type ModeFlag = keyof RepoConfigPatch & keyof RepoConfig;
+interface PersonaFlags { enabled: ModeFlag; blocking?: ModeFlag }
+
+interface PersonaDef {
+  id: string; code: string; name: string; img: string; desc: string;
+  meta: readonly string[];
+  // `modes`: which of BLOCK/WARN/OFF the backend can honor for this persona.
+  modes: readonly PMode[];
+  // Where those modes live in the repo config. Absent on a persona that
+  // lists modes = no backend field yet: the control renders disabled with
+  // `unwired` as the note, never as a working-looking toggle.
+  flags?: PersonaFlags;
+  unwired?: string;
+  // Comment-only or scheduled personas (no merge-gating check-run) list no
+  // modes and render this informational chip instead.
+  info?: string;
+}
+
+const PERSONAS: readonly PersonaDef[] = [
+  { id: "smasher", code: "F-01", name: "Smasher", img: "grug_smasher.png", desc: "Hunt bugs that hide. Mutate markings, run the tribe's own tests, name what still lives.", meta: ["mutation trial", "diff-scoped"], modes: ["warn", "off"], flags: { enabled: "smasher_enabled" } },
+  { id: "guard", code: "F-02", name: "Guard", img: "grug_guard.png", desc: "Watch the cave mouth. Secrets, sick deps, weak IaC, SAST. Evil shall not pass.", meta: ["SCA + secrets", "SAST on diff"], modes: ["block", "warn", "off"], flags: { enabled: "guard_enabled", blocking: "guard_blocking" } },
+  { id: "elder", code: "F-03", name: "Elder", img: "grug_elder.png", desc: "Read markings one line at a time. Name the bad omen before it bite. Lore + Omen fused.", meta: ["Cave review", "Markings Board"], modes: ["block", "warn", "off"], flags: { enabled: "code_reviewer_enabled", blocking: "code_reviewer_blocking" } },
+  { id: "chief", code: "F-04", name: "Chief", img: "grug_chief.png", desc: "Before the hunt, Chief ask: plan have name? meat counted? path home known?", meta: ["plan checks", "strict mode"], modes: ["block", "warn", "off"], unwired: "Mode not configurable yet. Chief runs while the repo is GUARDED (Repositories panel)." },
   { id: "teller", code: "F-05", name: "Teller", img: "grug_smile.png", desc: "Tell the tale of the hunt before Elder judge. Walkthrough, map, effort chip.", meta: ["walkthrough", "mermaid"], modes: [], info: "comment-only" },
-  { id: "warder", code: "F-06", name: "Warder", img: "grug_mystic.png", desc: "Shaman at the gate. Changelog scroll, semver hint, ward bad release from tribe.", meta: ["release scroll", "SLO gate"], modes: ["block", "warn", "off"] },
+  { id: "warder", code: "F-06", name: "Warder", img: "grug_mystic.png", desc: "Shaman at the gate. Changelog scroll, semver hint, ward bad release from tribe.", meta: ["release scroll", "SLO gate"], modes: ["block", "warn", "off"], flags: { enabled: "warder_enabled", blocking: "warder_gate_blocking" } },
   { id: "pulse", code: "F-07", name: "Pulse", img: "grug_mullet.png", desc: "Walk the camp at night. Poke sleeping hunts Chief already blessed.", meta: ["stale nudge", "scheduled"], modes: [], info: "scheduled" },
   { id: "sentinel", code: "F-08", name: "Sentinel", img: "grug_guard.png", desc: "Watch hunts that end wrong. Name markings left unanswered when PR close or merge.", meta: ["abandoned findings", "safety net"], modes: [], info: "comment-only" },
   { id: "pulse_comment_nudge", code: "F-09", name: "Pulse Nudge", img: "grug_mullet.png", desc: "Whisper fixes into stale threads. One suggested-fix reply per unanswered review thread.", meta: ["thread nudge", "scheduled"], modes: [], info: "scheduled" },
-] as const;
+];
+
+// A persona's current mode, read from the repo's stored config.
+function modeFromConfig(flags: PersonaFlags, cfg: RepoConfig): PMode {
+  if (!cfg[flags.enabled]) return "off";
+  return flags.blocking && cfg[flags.blocking] ? "block" : "warn";
+}
+
+// The sparse config write that puts a persona in `mode`. OFF leaves the
+// blocking flag as stored, so turning the persona back on restores it.
+function patchForMode(flags: PersonaFlags, mode: PMode): RepoConfigPatch {
+  if (mode === "off") return { [flags.enabled]: false };
+  const patch: RepoConfigPatch = { [flags.enabled]: true };
+  if (flags.blocking) patch[flags.blocking] = mode === "block";
+  return patch;
+}
 
 const SKINS = [
   { id: "classic", cap: "Classic", img: "grug-angry.png" },
@@ -73,7 +111,6 @@ const NOTIF = [
   { id: "weekly", name: "Weekly digest", desc: "Monday summary of what Grug crushed last week." },
 ];
 
-type PMode = "block" | "warn" | "off";
 const LS = "grug_dash_v2";
 
 // HTML-escape any dynamic value before it flows into the toast / ascii
@@ -85,41 +122,23 @@ const esc = (s: string) =>
     { "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" }[c] as string
   ));
 
-// Clamp a persona's mode to the ones the backend can honor for it (a stale
-// default or an old localStorage value - e.g. smasher="block" before Smasher
-// was capped to warn/off - would otherwise render the control with nothing
-// selected). An invalid value falls back to the persona's CONFIGURED default
-// when that is itself supported, otherwise to its first supported mode, then
-// "off" for informational personas.
-function clampPersonaMode(id: string, mode: PMode, configuredDefault?: PMode): PMode {
-  const supported = (PERSONAS.find((p) => p.id === id)?.modes ?? []) as readonly PMode[];
-  if (supported.length === 0) return "off"; // informational persona
-  if (supported.includes(mode)) return mode;
-  if (configuredDefault && supported.includes(configuredDefault)) return configuredDefault;
-  return supported[0];
-}
-
 function loadLocal() {
   const def = {
-    personas: { smasher: "warn", guard: "block", elder: "warn", chief: "block", teller: "off", warder: "warn", pulse: "off" } as Record<string, PMode>,
     skin: "classic",
     tone: "caveman",
     mood: "GRUG.MOOD = ANGRY",
     cap: "50",
     notif: { checkruns: true, email: true, slack: false, stale: true, weekly: false } as Record<string, boolean>,
-    pauseAll: false,
   };
   try {
     const s = JSON.parse(localStorage.getItem(LS) || "{}");
-    const mergedPersonas = { ...def.personas, ...(s.personas || {}) };
-    const personas = Object.fromEntries(
-      Object.entries(mergedPersonas).map(
-        ([id, m]) => [id, clampPersonaMode(id, m as PMode, def.personas[id])],
-      ),
-    ) as Record<string, PMode>;
+    // Only the keys this file still owns: an old blob's `personas` /
+    // `pauseAll` (grug#1206) are ignored, and rewritten away on next save.
     return {
-      ...def, ...s,
-      personas,
+      skin: typeof s.skin === "string" ? s.skin : def.skin,
+      tone: typeof s.tone === "string" ? s.tone : def.tone,
+      mood: typeof s.mood === "string" ? s.mood : def.mood,
+      cap: typeof s.cap === "string" ? s.cap : def.cap,
       notif: { ...def.notif, ...(s.notif || {}) },
     };
   } catch { return def; }
@@ -219,11 +238,11 @@ export function Dashboard() {
 
           <main className="main">
             <ReposPanel show={panel === "repos"} installId={installId} reposLoading={installs.isLoading} fireToast={fireToast} />
-            <PersonasPanel show={panel === "personas"} modes={local.personas} setMode={(id, v) => { setLocal({ personas: { ...local.personas, [id]: v } }); fireToast(`${id.toUpperCase()} → <span class="am">${v.toUpperCase()}</span>`); }} />
+            <PersonasPanel show={panel === "personas"} installId={installId} fireToast={fireToast} />
             <AppearancePanel show={panel === "appearance"} local={local} setLocal={setLocal} fireToast={fireToast} />
             <UsagePanel show={panel === "usage"} />
             <NotificationsPanel show={panel === "notifications"} notif={local.notif} toggle={(id) => setLocal({ notif: { ...local.notif, [id]: !local.notif[id] } })} />
-            <AccountPanel show={panel === "account"} me={{ login: me.data.login ?? "you", role: me.data.role ?? "user" }} pauseAll={local.pauseAll} setPause={(v) => { setLocal({ pauseAll: v }); fireToast(v ? 'All personas <span class="am">PAUSED</span>. Grug nap.' : 'Grug <span class="am">AWAKE</span>. Back to work.'); }} />
+            <AccountPanel show={panel === "account"} me={{ login: me.data.login ?? "you", role: me.data.role ?? "user" }} />
             <ActivityPanel show={panel === "activity"} installId={installId} />
           </main>
         </div>
@@ -379,36 +398,82 @@ function RepoRow({ repo, installId, onToggle, onGuardToggle, onDepWatchToggle, o
   );
 }
 
-function PersonasPanel({ show, modes, setMode }: { show: boolean; modes: Record<string, PMode>; setMode: (id: string, v: PMode) => void }) {
+function PersonasPanel({ show, installId, fireToast }: { show: boolean; installId?: number; fireToast: (h: string) => void }) {
+  // grug#1206: modes are per repo (the backend setting is), so the panel
+  // edits ONE selected repo - the same scope as the Repositories panel's
+  // switches - and shows what that repo's stored config says.
+  const repos = useInstallRepos(installId);
+  const setConfig = useSetRepoConfig(installId ?? 0);
+  const list = repos.data?.repos ?? [];
+  const [selectedId, setSelectedId] = useState<number | undefined>(undefined);
+  const repo = list.find((r) => r.repo_id === selectedId) ?? list[0];
+  const [saving, setSaving] = useState<string | null>(null);
+
+  const setMode = (p: PersonaDef, flags: PersonaFlags, mode: PMode) => {
+    if (!repo) return;
+    const nm = esc(repo.full_name.split("/")[1] ?? repo.full_name);
+    setSaving(p.id);
+    setConfig.mutate(
+      { repo_id: repo.repo_id, tpm_enabled: repo.config.tpm_enabled, ...patchForMode(flags, mode) },
+      {
+        // Toast only once the API confirmed the save ("no lies").
+        onSuccess: () => fireToast(`${esc(p.name.toUpperCase())} -> <span class="am">${mode.toUpperCase()}</span> on ${nm}`),
+        onError: (e) => fireToast(`Save failed on ${nm}: <span class="am">${esc((e as Error)?.message ?? "error")}</span>`),
+        onSettled: () => setSaving(null),
+      },
+    );
+  };
+
   return (
     <section className={`panel${show ? " show" : ""}`}>
       <div className="panel-head">
         <h2>Many Grugs. <em>One cave.</em></h2>
-        <p className="note">// Each persona is its own Check Run. Set it to BLOCK merge, WARN only, or OFF.</p>
+        <p className="note">// Each persona is its own Check Run. Set it to BLOCK merge, WARN only, or OFF, per repo.</p>
       </div>
       <div className="card">
-        <div className="card-head"><span>Personas</span></div>
+        <div className="card-head">
+          <span>Personas</span>
+          <span className="mono" style={{ textTransform: "none", letterSpacing: 0, marginLeft: "auto", display: "flex", gap: 8, alignItems: "center" }}>
+            <label htmlFor="persona-repo">Repository</label>
+            <select id="persona-repo" className="text" value={repo?.repo_id ?? ""} disabled={list.length === 0}
+              onChange={(e) => setSelectedId(Number(e.target.value))}>
+              {list.map((r) => <option key={r.repo_id} value={r.repo_id}>{r.full_name}</option>)}
+            </select>
+          </span>
+        </div>
         <div className="card-body">
+          {repos.isLoading && <div className="mono" style={{ fontSize: 12, color: "var(--muted)", padding: 8 }}>loading repos...</div>}
+          {repos.isError && <div className="mono" style={{ fontSize: 12, color: "var(--tomato)", padding: 8 }}>failed to load repos - modes unknown</div>}
+          {!repos.isLoading && !repos.isError && !repo && <div className="mono" style={{ fontSize: 12, color: "var(--muted)", padding: 8 }}>No repo installed. Modes are set per repo.</div>}
+          {repo && !repo.config.tpm_enabled && <div className="mono" style={{ fontSize: 12, color: "var(--muted)", padding: 8 }}>Grug is PAUSED on this repo; modes are saved but take effect once it is GUARDED.</div>}
           {PERSONAS.map((p) => {
-            const mode = modes[p.id] ?? "off";
+            const flags = p.flags;
+            const mode = repo && flags ? modeFromConfig(flags, repo.config) : undefined;
+            const busy = saving === p.id;
             return (
-              <div key={p.id} className={`pcard${"soon" in p && p.soon ? " soon" : ""}`}>
+              <div key={p.id} className={`pcard${p.modes.length > 0 && !flags ? " soon" : ""}`}>
                 <div className="portrait"><img src={`/assets/${p.img}`} alt="" /></div>
                 <div className="body">
                   <div className="row1"><span className="tag">{p.code} · {p.name.toUpperCase()}</span></div>
                   <h3>{p.name}</h3>
                   <p className="desc">{p.desc}</p>
                   <div className="meta">{p.meta.map((m) => <span key={m}>{m}</span>)}</div>
+                  {p.modes.length > 0 && !flags && (
+                    <p className="mono" style={{ fontSize: 11, color: "var(--muted)", marginTop: 6 }}>{p.unwired ?? "Mode not configurable yet."}</p>
+                  )}
                 </div>
                 <div className="ctrl">
                   {p.modes.length > 0 ? (
-                    <div className="seg">
-                      {(p.modes as readonly PMode[]).map((v) => (
-                        <button key={v} data-v={v} className={mode === v ? "on" : ""} onClick={() => setMode(p.id, v)}>{v.toUpperCase()}</button>
+                    <div className="seg" aria-busy={busy}>
+                      {p.modes.map((v) => (
+                        <button key={v} data-v={v} className={mode === v ? "on" : ""}
+                          disabled={!flags || !repo || busy}
+                          title={flags ? undefined : "Not configurable yet - no backend setting for this persona's mode."}
+                          onClick={() => flags && mode !== v && setMode(p, flags, v)}>{v.toUpperCase()}</button>
                       ))}
                     </div>
                   ) : (
-                    <span className="state paused" title="No merge-gating check-run for this persona - it is informational by design.">{"info" in p ? p.info : "advisory"}</span>
+                    <span className="state paused" title="No merge-gating check-run for this persona - it is informational by design.">{p.info ?? "advisory"}</span>
                   )}
                 </div>
               </div>
@@ -511,7 +576,7 @@ function NotificationsPanel({ show, notif, toggle }: { show: boolean; notif: Rec
   );
 }
 
-function AccountPanel({ show, me, pauseAll, setPause }: { show: boolean; me: { login: string; role: string }; pauseAll: boolean; setPause: (v: boolean) => void }) {
+function AccountPanel({ show, me }: { show: boolean; me: { login: string; role: string } }) {
   return (
     <section className={`panel${show ? " show" : ""}`}>
       <div className="panel-head">
@@ -535,8 +600,8 @@ function AccountPanel({ show, me, pauseAll, setPause }: { show: boolean; me: { l
         <div className="card-head">Danger zone</div>
         <div className="card-body">
           <div className="field">
-            <div className="lbl"><b>Pause all personas</b><span>Grug stops posting Check Runs everywhere until you flip it back.</span></div>
-            <div className={`sw${pauseAll ? " on" : ""}`} onClick={() => setPause(!pauseAll)} role="switch" aria-checked={pauseAll}></div>
+            <div className="lbl"><b>Pause all personas</b><span>Grug stops posting Check Runs everywhere until you flip it back. <span className="mono" style={{ color: "var(--muted)" }}>// not configurable yet - pause a repo from the Repositories panel</span></span></div>
+            <div className="sw" role="switch" aria-checked={false} aria-disabled={true} title="Not configurable yet - there is no account-wide pause setting." style={{ opacity: 0.4, cursor: "not-allowed" }}></div>
           </div>
           <div className="field">
             <div className="lbl"><b>Uninstall Grug</b><span>Removes the GitHub App and deletes all cave settings. Grug sad.</span></div>

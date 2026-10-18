@@ -9,7 +9,7 @@ quadseven/grug#20: empty `- [ ]` placeholders no longer count toward the
   acceptance   - ## Acceptance criteria (or ## Test plan) >=3 NON-EMPTY bullets
   estimate     - Size: XS|S|M|L|XL anywhere in body
   scope-fence  - ## Out of scope present
-  issue-link   - closes #N OR Part of #N OR fixes #N
+  issue-link   - Refs #N / Refs owner/name#N / Part of #N / closes #N ... (advisory)
   linked-issue-completeness - linked issue(s) have all non-exempt checkboxes ticked
   linked-issue-epic - every ticket the PR names is an epic or belongs to one (grug#1034)
 """
@@ -74,8 +74,12 @@ _SIZE_PAT = re.compile(
 # Accept the closing keywords + reference keywords + bare `#N` at line
 # start (the legacy gate's behavior). Codex post-review #49 -- earlier
 # regex regressed valid PR bodies using `Refs #N` / `Blocked by #N`.
+# #1214: a keyword may also name the ticket as `owner/name#N` - lane PRs
+# write `Refs owner/name#N`, and some operators never use a closing
+# keyword because a ticket closes only after its boxes are ticked.
 _ISSUE_LINK_PAT = re.compile(
-    r"(?:\b(?:closes|fixes|resolves|part\s+of|refs|relates\s+to|blocked\s+by)\s+#\d+"
+    r"(?:\b(?:closes|fixes|resolves|part\s+of|refs|relates\s+to|blocked\s+by)\s+"
+    r"(?:[A-Za-z0-9][\w.-]*/[\w.-]+)?#\d+"
     r"|^\s*#\d+\b"
     r")",
     re.IGNORECASE | re.MULTILINE,
@@ -236,7 +240,9 @@ def check_issue_link(body: str) -> CheckResult:
         return CheckResult("issue-link", True, "issue link present")
     return CheckResult(
         "issue-link", False,
-        "no `closes #N` / `fixes #N` / `Part of #N` link in body",
+        "no issue link in body - any of these counts: `Refs #N`, "
+        "`Refs owner/name#N`, `Part of #N`, `Relates to #N`, `Blocked by #N`, "
+        "`closes #N` / `fixes #N` / `resolves #N`, or a bare `#N` line",
     )
 
 

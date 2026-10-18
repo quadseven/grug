@@ -20,13 +20,9 @@ import json
 
 import pulumi
 import pulumi_aws as aws
-import pulumi_datadog as _datadog
 
 from components import (
     cf_shared_secret,
-    dd_dashboard,
-    dd_monitors,
-    dd_rum,
     ddb_table,
     kms_cmk,
     leak_guard_role,
@@ -63,16 +59,6 @@ secrets = ssm_secrets.reference_existing(
 # lost zone DNS. The Worker scripts themselves deploy via
 # infra/cloudflare/deploy.sh (CF API), not Pulumi.
 
-# Datadog API key — the shared INFRA DD key (`/infra/datadog/api_key`), the
-# same pair the operator's shared infrastructure Pulumi uses. Consolidated here
-# (#258 follow-up) so grug doesn't maintain its own DD credentials: grug had
-# no reason to carry a separate key. The prior per-project keys are gone.
-# Lambda extension reads DD_API_KEY to ship traces/logs.
-_dd_api_key = aws.ssm.get_parameter(
-    name="/infra/datadog/api_key",
-    with_decryption=True,
-)
-
 # OpenRouter API key — shared cross-project SecureString at the canonical
 # `/infra/llm/<provider>_api_key` path (not a grug-specific copy), so the
 # key is minted/rotated once. Consumed by the webhook Lambda only — Elder
@@ -92,12 +78,6 @@ _poolside_api_key = aws.ssm.get_parameter(
     name="/infra/llm/poolside_api_key",
     with_decryption=True,
 )
-
-# DD extension version baked into the Lambda image (per Dockerfile.lambda).
-# Lambda Container package_type can't attach layers; extension binary is
-# COPYd from public.ecr.aws/datadog/lambda-extension-arm:<v>. Bump here
-# triggers an image rebuild via CI on next merge/dispatch.
-_dd_extension_version = config.get("dd_extension_version") or "65"
 
 # OIDC trust for GitHub Actions deploys from quadseven/grug. Per
 # `feedback_prefer_ssm_over_1p` — no long-lived AWS creds in the repo.
@@ -427,124 +407,12 @@ _rerun_jobs_queue = aws.sqs.Queue(
 # (infra#239). The api record was likewise hand-PATCHed to its tunnel
 # origin + state-deleted at the api cutover (#1172).
 
-# Datadog monitors (Slice 9 #30). Provider reads DD creds from SSM — the
-# shared INFRA DD app key (`/infra/datadog/app_key`), paired with the infra
-# API key above. One shared DD key pair rather than a grug-specific one
-# (consolidating removes a key grug had no reason to own). The old per-project
-# app key outlived that move and was revoked on 2026-09-24.
-_dd_app_key = aws.ssm.get_parameter(
-    name="/infra/datadog/app_key", with_decryption=True,
-)
-_dd_provider = _datadog.Provider(
-    "datadog-grug",
-    api_key=pulumi.Output.secret(_dd_api_key.value),
-    app_key=pulumi.Output.secret(_dd_app_key.value),
-    api_url="https://api.datadoghq.com/",
-)
-
-# Notification routing → a Discord webhook the operator already runs. The old
-# `/grug/dd-notify-handle` was the placeholder `@grug-stub`, which Datadog does
-# not recognise as any target — so EVERY monitor notified into the void (the
-# Elder LLM outage ran ~5 days with no page). Register a real DD webhook
-# integration that POSTs to the pre-existing Discord webhook secret, and route
-# all monitors at it. `@webhook-<name>` is how a DD monitor references a webhook
-# integration entry. The webhook URL is an SSM SecureString (set out-of-band,
-# like the other `/infra/*` shared params) — one param, all stacks.
-_discord_webhook_url = pulumi.Output.secret(
-    aws.ssm.get_parameter(
-        name="/infra/discord/monitoring-alerts",
-        with_decryption=True,
-    ).value
-)
-_dd_discord = _datadog.Webhook(
-    "grug-discord-monitoring",
-    name="grug-discord-monitoring",
-    url=_discord_webhook_url,
-    encode_as="json",
-    # Discord's native webhook body. DD substitutes the $-variables at send
-    # time; keep it short — Discord rejects content > 2000 chars. `\n` in the
-    # source becomes a JSON newline escape Discord renders as a line break.
-    payload='{"content": "$EVENT_TITLE\\n$EVENT_MSG\\n$LINK"}',
-    opts=pulumi.ResourceOptions(provider=_dd_provider),
-)
-# Plain handle on purpose. dd_monitors decides BOTH whether a given monitor may
-# page at all and how the recipient is recovery-gated, so those properties are
-# structural rather than dependent on what this file happens to pass in. See
-# `_page` / `_DIGEST` there, and infra's production/docs/ALERTING-STANDARD.md,
-# which this repo consumes as the upstream contract.
-_dd_notify = "@webhook-grug-discord-monitoring"
-
-monitors = dd_monitors.create_all(
-    env=env,
-    notify_handle=_dd_notify,
-    webhook_public_url=f"https://webhook.{domain}/webhook/github",
-    api_public_url=f"https://api.{domain}",
-    provider=_dd_provider,
-)
-
-# Owned-gauge queue monitors (#379): five monitors (cave-jobs backlog,
-# rerun DLQ, cave DLQs, consumer backlog, telemetry health) built in the
-# component so the synth test pins each (query, notify_no_data) pair. The
-# telemetry-health monitor is the family's ONLY no-data pager.
-_queue_monitors = dd_monitors.create_owned_queue_monitors(
-    env=env,
-    provider=_dd_provider,
-)
-
-# Release-chain monitors (#499): rollback-fired pager.
-_deploy_monitors = dd_monitors.create_deploy_monitors(
-    env=env,
-    provider=_dd_provider,
-)
-
-# Fallback-fired rate (#312): the operator's awareness signal that the owned
-# backstop actually activated (both cloud LLMs were down and a job was enqueued).
-# Informational (P4) — it won't fire until the fallback is enabled (#313). Built
-# from the producer's `elder_fallback_enqueued` log.
-_cave_fallback_fired_monitor = _datadog.Monitor(
-    "grug-cave-fallback-fired",
-    type="log alert",
-    name="[grug-webhook] Cave fallback fired (1h)",
-    message=(
-        # No recipient: digest tier, like the 17 in dd_monitors. This monitor's
-        # own comment above calls it informational (P4), and it fires when the
-        # BACKSTOP WORKED -- both cloud backends were down and the fallback
-        # caught it. That is automation succeeding, which must never page.
-        #
-        # It lives here rather than in the component, which is why the tiering
-        # sweep in #789 missed it: the component's `_page` / `_DIGEST` split
-        # could not reach a monitor defined in the composition root. Found by
-        # querying Datadog after that deploy went green, not by reading code.
-        "Elder's owned cave fallback was enqueued >= 1 time in the last hour — "
-        "both cloud LLM backends were down and the backstop kicked in. Expected "
-        "to be rare; sustained firing means the SaaS backends are persistently "
-        "out (which is by design, ADR-0005)."
-    ),
-    query=(
-        f'logs("service:grug-webhook env:{env} elder_fallback_enqueued")'
-        '.index("*").rollup("count").last("1h") >= 1'
-    ),
-    tags=[f"env:{env}", "service:grug-webhook", "team:grug", "managed_by:pulumi"],
-    notify_no_data=False,
-    priority=4,
-    opts=pulumi.ResourceOptions(provider=_dd_provider),
-)
-
-# DD RUM Application for grug.lol (spec 0013 RumInstrumentation).
-# `name="grug-web"` is the canonical service tag the browser SDK must
-# pass to DD_RUM.init(...) — same name used in attest_rum_*.py.
-# Application ID + client token exported to SSM so web.deploy.yml can
-# substitute them into the build at deploy time without committing
-# either value to the repo.
-rum = dd_rum.create(
-    name="grug-web", provider=_dd_provider,
-    iam_propagation_wait=_iam_propagation_wait,
-)
-
-# Elder code-review health dashboard (#192). LLM Obs span metrics +
-# dispatch-log outcomes; eval-based surfaces deep-link to the LLM Obs
-# explorer (evaluations aren't dashboard metrics — see component docstring).
-elder_dashboard = dd_dashboard.create_elder_health(env=env, provider=_dd_provider)
+# Datadog: this stack manages NOTHING in Datadog anymore (#1223, epic #1129).
+# Datadog was turned off and its keys revoked; the operator's decision was to
+# `pulumi state delete` the monitors, synthetic, RUM app, dashboard, webhook
+# integration and provider, and leave the objects in Datadog. The program
+# reads no Datadog key and builds no Datadog provider; tests/test_no_datadog.py
+# keeps it that way.
 
 
 pulumi.export("webhook_public_url", f"https://webhook.{domain}/webhook/github")
@@ -554,23 +422,6 @@ pulumi.export("ddb_table_name", grug_main_table.name)
 pulumi.export("ddb_table_arn", grug_main_table.arn)
 pulumi.export("kms_cmk_arn", grug_tokens_cmk.arn)
 pulumi.export("kms_cmk_alias", grug_tokens_cmk.alias.name)
-pulumi.export("elder_dashboard_url", elder_dashboard.url)
-pulumi.export("monitor_workload_not_ready_id", monitors.workload_not_ready.id)
-pulumi.export("monitor_crashloop_id", monitors.crashloop.id)
-pulumi.export("monitor_restart_spike_id", monitors.restart_spike.id)
-pulumi.export("monitor_poller_cronjob_id", monitors.poller_cronjob.id)
-pulumi.export("monitor_sig_verify_fail_id", monitors.sig_verify_fail.id)
-pulumi.export("monitor_enforcement_gap_id", monitors.enforcement_gap.id)
-pulumi.export("monitor_persona_dispatch_unhandled_id", monitors.persona_dispatch_unhandled.id)
-pulumi.export("monitor_elder_llm_degraded_id", monitors.elder_llm_degraded.id)
-pulumi.export("dd_discord_webhook_name", _dd_discord.name)
-pulumi.export("monitor_cf_secret_mismatch_id", monitors.cf_secret_mismatch.id)
-pulumi.export("synthetic_uptime_id", monitors.uptime.id)
-
-# DD RUM (spec 0013). Outputs are non-sensitive references — the actual
-# values live in SSM SecureStrings managed by the same component.
-pulumi.export("rum_application_id_ssm_name", rum.ssm_application_id.name)
-pulumi.export("rum_client_token_ssm_name", rum.ssm_client_token.name)
 
 # CF→AWS auth boundary (issue #231 / parent #173). Sibling slice #232
 # (infra/cloudflare/deploy.sh) reads this SSM param name and PUTs the

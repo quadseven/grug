@@ -1,4 +1,7 @@
-"""Structured JSON logging configuration.
+"""Structured JSON logging configuration, plus the DogStatsD emitters.
+
+The emitters (`emit_gauge`, `emit_count`, `emit_enforcement_metric`) are
+no-ops unless GRUG_DATADOG_ENABLED is on (`datadog_switch`, #1208).
 
 DD Lambda extension layer (added in Slice 9 via Pulumi) auto-ships
 stdout/stderr to Datadog. This module configures Python's stdlib logging
@@ -18,6 +21,8 @@ import os
 import secrets
 import socket
 import sys
+
+from datadog_switch import datadog_enabled
 
 # Per-process random key for fingerprint(). Stable for the lifetime of a
 # warm Lambda container; rotated on every cold start. Identifiers logged
@@ -116,6 +121,8 @@ def emit_gauge(
     the host check runs inside the try; failures log a WARNING carrying
     the metric name and exception class.
     """
+    if not datadog_enabled():
+        return  # #1208: switch off = no datagram and no log line
     host = os.getenv("DD_AGENT_HOST", "")
     lg = logging.getLogger("grug.observability")
     if not host:
@@ -149,6 +156,8 @@ def emit_count(
 ) -> None:
     """DogStatsD count over UDP; same path, tagging and never-raise contract
     as `emit_gauge`, for events a gauge would under-count."""
+    if not datadog_enabled():
+        return  # #1208: switch off = no datagram and no log line
     host = os.getenv("DD_AGENT_HOST", "")
     lg = logging.getLogger("grug.observability")
     if not host:
@@ -212,6 +221,8 @@ def emit_enforcement_metric(
         "permission_denied": -2.0,
     }
     value = value_map.get(enforcement_type, 0.0)
+    if not datadog_enabled():
+        return  # #1208: switch off = no datagram and no log line
     env = os.getenv("DD_ENV") or os.getenv("GRUG_ENV", "prod")
     host = os.getenv("DD_AGENT_HOST", "")
     if not host:

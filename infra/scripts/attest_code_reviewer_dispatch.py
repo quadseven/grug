@@ -21,6 +21,12 @@ wire 5xx). This version asserts AST *shape and reachability*:
       + degraded_evaluation_forces_advisory_regardless_of_mode_per_dispatch
         → the branch returning ("neutral","COMMENT") is guarded by an
           OR over `mode == "advisory"` and `…degraded_reason`.
+    - elder_degraded_review_fails_closed_in_block_mode (grug#1212, ADR-0023)
+        -> an `if` returning ("failure","COMMENT") is guarded by an AND over
+          `degraded_fails_closed`, `mode == "blocking"` and
+          `is_real_degradation(...)`, and sits BEFORE the neutral branch (so
+          the neutral branch cannot shadow it); every `_publish_shape` call
+          in `dispatch_code_review` passes `degraded_fails_closed=True`.
     - blocking_failure_yields_failure_and_request_changes_per_dispatch
         → ("failure","REQUEST_CHANGES") is returned under a non-constant
           test referencing `conclusion`/`"failure"`.
@@ -217,6 +223,39 @@ def _handler_assigns_true(handler: ast.ExceptHandler, name: str) -> bool:
     return False
 
 
+def _check_fail_closed_branch(
+    f: ast.FunctionDef, path: Path, neutral_if: ast.If | None,
+) -> list[str]:
+    """grug#1212: BLOCK + real degradation -> ("failure","COMMENT"), ahead
+    of the neutral branch, so a degraded Elder review cannot pass a required
+    check as neutral."""
+    closed_if = _if_returning(f, ("failure", "COMMENT"))
+    if closed_if is None:
+        return [
+            f"FAIL: {path} - no `if` returns ('failure','COMMENT'); a degraded "
+            "Elder review in BLOCK mode must fail closed (grug#1212)"
+        ]
+    fails: list[str] = []
+    test_src = ast.unparse(closed_if.test)
+    is_and = isinstance(closed_if.test, ast.BoolOp) and isinstance(closed_if.test.op, ast.And)
+    if not is_and:
+        fails.append(
+            f"FAIL: {path} - fail-closed branch is not an AND over the "
+            "opt-in, BLOCK mode and a real degradation"
+        )
+    fails.extend(
+        f"FAIL: {path} - fail-closed branch does not test `{needle}`"
+        for needle in ("degraded_fails_closed", "blocking", "is_real_degradation")
+        if needle not in test_src
+    )
+    if neutral_if is not None and closed_if.lineno > neutral_if.lineno:
+        fails.append(
+            f"FAIL: {path} - fail-closed branch comes after the neutral "
+            "branch, which would shadow it for every degraded review"
+        )
+    return fails
+
+
 def _check_publish_shape(tree: ast.AST, path: Path) -> list[str]:
     f = _find_funcdef(tree, "_publish_shape")
     if f is None:
@@ -251,6 +290,8 @@ def _check_publish_shape(tree: ast.AST, path: Path) -> list[str]:
                 f"FAIL: {path} — neutral branch ignores degraded_reason; a degraded "
                 "evaluation must force advisory regardless of mode"
             )
+
+    fails.extend(_check_fail_closed_branch(f, path, neutral_if))
 
     # blocking failure → ("failure","REQUEST_CHANGES"), reachable + on conclusion.
     fail_if = _if_returning(f, ("failure", "REQUEST_CHANGES"))
@@ -446,6 +487,16 @@ def _check_dispatch(tree: ast.AST, path: Path) -> list[str]:
     # the value handed to _publish_shape must be the `mode` Name, not a literal.
     ps_calls, mode_fails = _check_publish_shape_mode(f, path)
     fails.extend(mode_fails)
+
+    # grug#1212: Elder opts into the fail-closed branch at every call.
+    for c in ps_calls:
+        opt_in = _kwarg_value(c, "degraded_fails_closed")
+        if not (isinstance(opt_in, ast.Constant) and opt_in.value is True):
+            fails.append(
+                f"FAIL: {path} - _publish_shape at line {c.lineno} does not pass "
+                "`degraded_fails_closed=True`; a degraded Elder review in BLOCK "
+                "mode would conclude neutral"
+            )
 
     # SSOT no-drift: the (conclusion, event) pair _publish_shape returns must
     # be the SAME values published — conclusion into CheckRunResult(conclusion=),

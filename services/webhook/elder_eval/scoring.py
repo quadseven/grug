@@ -61,6 +61,10 @@ class CaseReplay:
     # the configured tier. Empty = the replay carried no attribution
     # (bench mode, where the single configured backend IS the answer).
     backends: tuple[str, ...] = ()
+    # grug#1231: the model's answer hit the output cap before its findings
+    # list closed; the replay scored the complete findings before the cut.
+    # A different fact from `truncated` (the INPUT diff was bounded).
+    output_truncated: bool = False
 
 
 @dataclass(frozen=True)
@@ -98,6 +102,10 @@ class EvalReport:
     # report must name who actually answered rather than let the reader
     # assume it was whoever they configured.
     backend_attribution: dict[str, int] = field(default_factory=dict)
+    # grug#1231: scored cases whose answer was cut off at the output cap and
+    # scored on the complete findings before the cut. Kept apart from
+    # `truncated_cases` (input diff bounded) so neither caveat hides the other.
+    output_truncated_cases: tuple[str, ...] = ()
 
     @property
     def all_errored(self) -> bool:
@@ -138,6 +146,28 @@ def _bucket_case(
     return replay
 
 
+def _note_caveats(
+    case_id: str,
+    replay: CaseReplay,
+    *,
+    truncated: list[str],
+    anchored: list[str],
+    staged: list[str],
+    output_truncated: list[str],
+) -> None:
+    """Append a scored replay's case id to each caveat bucket it belongs to
+    (split out of `score()` to keep its branching under the complexity cap;
+    the buckets are independent flags with no shared state)."""
+    for flag, bucket in (
+        (replay.truncated, truncated),
+        (replay.anchored, anchored),
+        (replay.staged, staged),
+        (replay.output_truncated, output_truncated),
+    ):
+        if flag:
+            bucket.append(case_id)
+
+
 def score(
     cases: Sequence[EvalCase], replays: Mapping[str, CaseReplay]
 ) -> EvalReport:
@@ -151,6 +181,7 @@ def score(
     truncated: list[str] = []
     anchored: list[str] = []
     staged: list[str] = []
+    output_truncated: list[str] = []
     attribution: Counter[str] = Counter()
     out_of_taxonomy: Counter[str] = Counter()
     unknown_verdicts: Counter[str] = Counter()
@@ -169,12 +200,11 @@ def score(
         replay = _bucket_case(case, replays, unresolvable=unresolvable, errored=errored)
         if replay is None:
             continue
-        if replay.truncated:
-            truncated.append(case.case_id)
-        if replay.anchored:
-            anchored.append(case.case_id)
-        if replay.staged:
-            staged.append(case.case_id)
+        _note_caveats(
+            case.case_id, replay,
+            truncated=truncated, anchored=anchored, staged=staged,
+            output_truncated=output_truncated,
+        )
         for backend_name in replay.backends:
             attribution[backend_name] += 1
         scored += 1
@@ -205,6 +235,7 @@ def score(
         cases_scored=scored,
         anchored_cases=tuple(anchored),
         staged_cases=tuple(staged),
+        output_truncated_cases=tuple(output_truncated),
         backend_attribution=dict(attribution),
         unresolvable_cases=unresolvable,
     )
@@ -234,6 +265,9 @@ def to_baseline_dict(report: EvalReport, *, prompt_sha: str, backend: str) -> di
                 # request - the comparability caveat a reader needs before
                 # treating those cases' numbers as a like-for-like rerun.
                 "staged_cases": sorted(report.staged_cases),
+                # grug#1231: which scored cases' answers were cut off at the
+                # output cap and scored on their complete findings only.
+                "output_truncated_cases": sorted(report.output_truncated_cases),
                 # grug#916: who actually answered. A baseline that does not
                 # record this cannot be compared against a later run - the
                 # two may name the same configured backend and have been

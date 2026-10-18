@@ -262,6 +262,47 @@ def _toggle_enforcement(
         )
 
 
+def _reconcile_required_checks(
+    install_id: int, repo_id: int, full_name: str, default_branch: str,
+) -> None:
+    """Best-effort ruleset reconcile after a persona mode flip (grug#1202),
+    so BLOCK takes effect on GitHub without a manual Fix click. Same
+    best-effort posture as _toggle_enforcement: the flag is already stored,
+    and a failure is logged (the next Fix / install pass reconciles again)."""
+    from enforcement import reconcile_required_checks  # type: ignore
+
+    parts = full_name.split("/", 1)
+    if len(parts) != 2:
+        return
+    owner, repo_name = parts
+    try:
+        with_install_token_retry(
+            install_id,
+            lambda token: reconcile_required_checks(
+                token, owner, repo_name, default_branch, install_id, repo_id,
+            ),
+        )
+    except Exception:
+        log.warning(
+            "enforcement_reconcile_failed",
+            extra={"install_id": install_id, "repo_id": repo_id,
+                   "full_name": full_name},
+            exc_info=True,
+        )
+
+
+def _required_checks_changed(
+    previous_cfg: dict[str, Any], updated_fields: dict[str, Any],
+) -> bool:
+    """True when a save changes which persona checks the ruleset must
+    require. `updated_fields` is set_repo_config's return: only the fields
+    the save actually wrote, so it is merged over the stored config."""
+    from enforcement import required_persona_checks  # type: ignore
+
+    merged = {**previous_cfg, **updated_fields}
+    return required_persona_checks(previous_cfg) != required_persona_checks(merged)
+
+
 @router.get("/installations/{install_id}/activity")
 def list_activity(
     install_id: int,
@@ -403,6 +444,33 @@ def rerun_all_errored(
     return {"queued": queued}
 
 
+def _sync_enforcement_after_save(
+    install_id: int, repo_id: int, full_name: str, default_branch: str,
+    previous_cfg: dict[str, Any], cfg: dict[str, Any],
+) -> None:
+    """Bring the repo's ruleset in line with a settings save: a tpm toggle
+    creates or deletes it; otherwise a change to the required persona set
+    reconciles it (grug#1202). Pulled out of update_repo_config to keep that
+    route under the complexity cap."""
+    was_enabled = previous_cfg.get("tpm_enabled", True)
+    # Read the MERGED config, not the request body: on a sparse update the
+    # body's tpm_enabled is None and the stored value is what actually
+    # applies. Reading the body here would treat "not mentioned" as a change
+    # (FLINT, PR #751).
+    now_enabled = cfg.get("tpm_enabled", was_enabled)
+    if now_enabled and not was_enabled:
+        _toggle_enforcement(install_id, repo_id, full_name, default_branch, enable=True)
+    elif was_enabled and not now_enabled:
+        _toggle_enforcement(install_id, repo_id, full_name, default_branch, enable=False)
+    elif now_enabled and _required_checks_changed(previous_cfg, cfg):
+        # grug#1202: a persona mode flip (e.g. Elder WARN -> BLOCK) changes
+        # which checks the ruleset must require. Reconcile here, on the save
+        # itself, so the dashboard flip takes effect without a Fix click.
+        # The two branches above already cover a tpm toggle: enable runs
+        # ensure_enforcement (which applies the modes), disable deletes.
+        _reconcile_required_checks(install_id, repo_id, full_name, default_branch)
+
+
 @router.put("/installations/{install_id}/repos/{repo_id}/config")
 def update_repo_config(
     install_id: int,
@@ -497,16 +565,9 @@ def update_repo_config(
         },
     )
 
-    was_enabled = previous_cfg.get("tpm_enabled", True)
-    # Read the MERGED config, not the request body: on a sparse update the
-    # body's tpm_enabled is None and the stored value is what actually
-    # applies. Reading the body here would treat "not mentioned" as a change
-    # (FLINT, PR #751).
-    now_enabled = cfg.get("tpm_enabled", was_enabled)
-    if now_enabled and not was_enabled:
-        _toggle_enforcement(install_id, repo_id, full_name, default_branch, enable=True)
-    elif was_enabled and not now_enabled:
-        _toggle_enforcement(install_id, repo_id, full_name, default_branch, enable=False)
+    _sync_enforcement_after_save(
+        install_id, repo_id, full_name, default_branch, previous_cfg, cfg,
+    )
 
     return {"repo_id": repo_id, "full_name": full_name, "config": cfg}
 

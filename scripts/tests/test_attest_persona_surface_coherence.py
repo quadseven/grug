@@ -51,3 +51,23 @@ def test_attest_fails_on_silently_absent_flag(tmp_path):
         assert missing == {"sneaky_new_flag"}
     finally:
         sys.path.remove(str(REPO / "scripts"))
+
+
+def test_persona_panel_mode_flags_count_as_ui_controls():
+    """grug#1206: the Personas panel's BLOCK/WARN/OFF controls write the
+    flags named on each PERSONAS entry, so those flags are UI-surfaced and
+    must not also sit in OPERATOR_ONLY."""
+    sys.path.insert(0, str(REPO / "scripts"))
+    try:
+        import attest_persona_surface_coherence as attest
+
+        ui = attest.ui_flags()
+        for flag in (
+            "code_reviewer_enabled", "code_reviewer_blocking",
+            "guard_enabled", "guard_blocking",
+            "warder_enabled", "warder_gate_blocking", "smasher_enabled",
+        ):
+            assert flag in ui, f"{flag} not parsed as a dashboard control"
+            assert flag not in attest.OPERATOR_ONLY, f"{flag} is wired; drop it from OPERATOR_ONLY"
+    finally:
+        sys.path.remove(str(REPO / "scripts"))

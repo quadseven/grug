@@ -61,7 +61,15 @@ jobs:
           set -euo pipefail
           npm ci
 
-      - name: 04. Build (tsc -b && vite build)
+      # Web unit tests (grug#1206): component tests against a mocked API,
+      # e.g. the Personas panel must save through the config PUT.
+      - name: 04. Test (vitest)
+        working-directory: web
+        run: |
+          set -euo pipefail
+          npm test
+
+      - name: 05. Build (tsc -b && vite build)
         working-directory: web
         run: |
           set -euo pipefail

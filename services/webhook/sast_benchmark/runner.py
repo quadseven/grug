@@ -93,7 +93,7 @@ def _post(backend: BenchBackend, messages: list[dict[str, str]]) -> httpx.Respon
         "seed": 0,
         **backend.extra_body,
     }
-    headers = {}
+    headers = dict(backend.headers)
     if backend.api_key:
         headers["Authorization"] = f"Bearer {backend.api_key}"
     last_exc: Exception | None = None

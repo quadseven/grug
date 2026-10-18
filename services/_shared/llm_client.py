@@ -31,6 +31,8 @@ paths so this module only ever runs from the webhook process.
 """
 from __future__ import annotations
 
+import contextlib
+import contextvars
 import hashlib
 import fnmatch
 import json
@@ -45,7 +47,7 @@ import uuid
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, field, replace
 from enum import Enum
-from typing import Any, Callable, Literal, Optional, Sequence, TypedDict, cast, get_args
+from typing import Any, Callable, Iterator, Literal, Optional, Sequence, TypedDict, cast, get_args
 
 import httpx
 
@@ -66,6 +68,7 @@ from review_pipeline import (
     plan_review,
     render_review_map,
 )
+from datadog_switch import datadog_enabled
 from secrets_loader import (
     get_opencode_go_api_key,
     get_openrouter_api_key,
@@ -83,61 +86,76 @@ log = logging.getLogger(f"{os.getenv('DD_SERVICE', 'grug')}.llm_client")
 #      not at import time.
 #   3. If `DD_LLMOBS_ENABLED` is unset (local dev, tests), the span
 #      becomes a no-op rather than failing loudly.
-try:  # pragma: no cover — import-time guard
-    from ddtrace.llmobs import LLMObs as _LLMObs
+#   4. GRUG_DATADOG_ENABLED off (the default, #1208) routes every seam to
+#      the no-op: LLMObs.llm() on a disabled LLMObs logs a warning per
+#      call, and with no agent an enabled one has nowhere to send.
 
-    def _llmobs_llm(**kwargs: Any) -> Any:
-        return _LLMObs.llm(**kwargs)
 
-    def _llmobs_annotate(**kwargs: Any) -> None:
-        # Observability must stay strictly additive: an annotate failure
-        # (SDK validation drift, non-serializable value) must never discard
-        # an already-computed model result or fail a job.
-        try:
-            _LLMObs.annotate(**kwargs)
-        except Exception as e:  # noqa: BLE001 - o11y never outranks the result
-            log.warning(
-                "llmobs_annotate_failed", extra={"kind": type(e).__name__},
-            )
+class _NoopSpan:
+    def __enter__(self) -> "_NoopSpan":
+        return self
+    def __exit__(self, *a: Any) -> bool:
+        return False
 
-    def _llmobs_export(span: Any) -> Optional[dict]:
-        return cast(Optional[dict], _LLMObs.export_span(span=span))
 
-    def _llmobs_submit_evaluation(**kwargs: Any) -> None:
-        # `submit_evaluation` (NOT the deprecated `submit_evaluation_for`,
-        # removed in ddtrace 4.0). The `span=` param takes the
-        # `{'span_id','trace_id'}` dict returned by `export_span` — the
-        # documented out-of-band attach: it lands the eval on the prior
-        # (closed) review span, no active-context requirement.
-        _LLMObs.submit_evaluation(**kwargs)
-except ImportError:  # pragma: no cover — local dev without ddtrace
+_LLMObs: Any = None
+try:  # pragma: no cover - import-time guard
+    from ddtrace.llmobs import LLMObs as _LLMObsSdk
 
-    class _NoopSpan:
-        def __enter__(self) -> "_NoopSpan":
-            return self
-        def __exit__(self, *a: Any) -> bool:
-            return False
-
-    def _llmobs_llm(**kwargs: Any) -> Any:
-        return _NoopSpan()
-
-    def _llmobs_annotate(**kwargs: Any) -> None:
-        return None
-
-    def _llmobs_export(span: Any) -> Optional[dict]:
-        return None
-
-    def _llmobs_submit_evaluation(**kwargs: Any) -> None:
-        return None
-
+    _LLMObs = _LLMObsSdk
+except ImportError:  # pragma: no cover - local dev without ddtrace
     # Loud signal so a layer-drift / partial-install in Lambda doesn't
     # silently turn off DD LLM Obs. AWS_LAMBDA_FUNCTION_NAME is the
     # canonical Lambda-environment marker; in local dev it's unset.
-    if os.environ.get("AWS_LAMBDA_FUNCTION_NAME"):
+    if os.environ.get("AWS_LAMBDA_FUNCTION_NAME") and datadog_enabled():
         log.warning(
             "llmobs_import_failed_falling_back_to_noop",
             extra={"lambda_fn": os.environ["AWS_LAMBDA_FUNCTION_NAME"]},
         )
+
+
+def _llmobs_live() -> bool:
+    return _LLMObs is not None and datadog_enabled()
+
+
+def _llmobs_llm(**kwargs: Any) -> Any:
+    if not _llmobs_live():
+        return _NoopSpan()
+    return _LLMObs.llm(**kwargs)
+
+
+def _llmobs_annotate(**kwargs: Any) -> None:
+    if not _llmobs_live():
+        return None
+    # Observability must stay strictly additive: an annotate failure
+    # (SDK validation drift, non-serializable value) must never discard
+    # an already-computed model result or fail a job.
+    try:
+        _LLMObs.annotate(**kwargs)
+    except Exception as e:  # noqa: BLE001 - o11y never outranks the result
+        log.warning(
+            "llmobs_annotate_failed", extra={"kind": type(e).__name__},
+        )
+    return None
+
+
+def _llmobs_export(span: Any) -> Optional[dict]:
+    if not _llmobs_live() or isinstance(span, _NoopSpan):
+        return None
+    return cast(Optional[dict], _LLMObs.export_span(span=span))
+
+
+def _llmobs_submit_evaluation(**kwargs: Any) -> None:
+    if not _llmobs_live():
+        return None
+    # `submit_evaluation` (NOT the deprecated `submit_evaluation_for`,
+    # removed in ddtrace 4.0). The `span=` param takes the
+    # `{'span_id','trace_id'}` dict returned by `export_span` - the
+    # documented out-of-band attach: it lands the eval on the prior
+    # (closed) review span, no active-context requirement.
+    _LLMObs.submit_evaluation(**kwargs)
+    return None
+
 
 _LLMOBS_NAME = "elder_code_review"
 # Teller walkthrough + /grug ask are separate span names so DD can filter
@@ -358,6 +376,65 @@ _OVERSIZED_COHORT_ERROR = "cohort budget exceeded"
 # diff is split or the budget rises (grug#939). The prefix is matched, not
 # re-spelled, so the classifier cannot drift from the reason strings below.
 _SKIPPED_COHORT_PREFIX = "cohort skipped: "
+
+# The staged review's deadline (grug#1216), as a `time.monotonic()` value.
+# The scheduler used to reserve one worst-case ladder walk (Cave timeout +
+# two SaaS fallbacks + every cloud tier, 480-575s of a 600-700s budget)
+# before starting each cohort, so cohorts could only START in the first
+# ~30-220s and the rest were "never attempted". Under a deadline every model
+# call is clamped to the time left instead, so a started cohort still cannot
+# overrun the budget and the scheduler only has to hold back the time one
+# cohort needs to be worth starting.
+_REVIEW_DEADLINE: contextvars.ContextVar[float | None] = contextvars.ContextVar(
+    "grug_review_deadline", default=None,
+)
+# A call with less than this left is not sent: it could not finish a review.
+_DEADLINE_CALL_FLOOR_SECONDS = 10.0
+# What a cohort needs to be worth starting under a deadline: one slow cloud
+# answer (Poolside's 45s chain timeout) plus parsing. Replaces the
+# worst-case ladder walk as the scheduler's reserve.
+_MIN_DEADLINE_COHORT_SECONDS = 60.0
+
+
+class ReviewDeadlineReached(httpx.RequestError):
+    """A model call was cut, or never sent, because the staged review's
+    deadline passed. A RequestError (not a TimeoutException) on purpose:
+    every caller already treats it as a transport failure, and the slow bench
+    only counts real timeouts - a deadline cut says nothing about the model."""
+
+
+@contextlib.contextmanager
+def _review_deadline(deadline: float) -> Iterator[None]:
+    """Run the block under `deadline` (monotonic), or an earlier one already set."""
+    current = _REVIEW_DEADLINE.get()
+    token = _REVIEW_DEADLINE.set(deadline if current is None else min(current, deadline))
+    try:
+        yield
+    finally:
+        _REVIEW_DEADLINE.reset(token)
+
+
+def _deadline_passed() -> bool:
+    """Whether a deadline is set and too little of it is left for one call."""
+    deadline = _REVIEW_DEADLINE.get()
+    return deadline is not None and (
+        deadline - time.monotonic() < _DEADLINE_CALL_FLOOR_SECONDS
+    )
+
+
+def _deadline_timeout(timeout_seconds: float, deadline: float | None) -> float:
+    """`timeout_seconds` clamped to the time left before `deadline`.
+
+    Raises `ReviewDeadlineReached` when less than the call floor is left, so a
+    call that could not finish is never sent."""
+    if deadline is None:
+        return timeout_seconds
+    left = deadline - time.monotonic()
+    if left < _DEADLINE_CALL_FLOOR_SECONDS:
+        raise ReviewDeadlineReached(
+            f"staged review deadline reached ({max(left, 0.0):.1f}s left)"
+        )
+    return min(timeout_seconds, left)
 
 # One extra attempt per cohort. A second failure is treated as real: further
 # attempts spend budget the remaining cohorts need, and the failure modes that
@@ -663,6 +740,35 @@ class LlmReviewResponse:
     backends_used: tuple[Backend, ...] = field(default_factory=tuple)
     models_used: tuple[str, ...] = field(default_factory=tuple)
     coverage: ReviewCoverage | None = None
+    # grug#1196: every model call that failed for this review chunk, as
+    # "model (reason)" labels in ladder order. Set only on a failed chunk, so
+    # a neutral check can name what was tried instead of a bare `all_failed`.
+    attempts: tuple[str, ...] = field(default_factory=tuple)
+
+
+# grug#1196: one failed model call inside a chunk's ladder walk.
+@dataclass(frozen=True, slots=True)
+class _LadderAttempt:
+    backend: str
+    model: str
+    reason: str
+
+    @property
+    def label(self) -> str:
+        return f"{self.model} ({self.reason})"
+
+
+# Set by `_ChunkLadder.run` around one chunk's dispatch. `_run_llm_attempt` is
+# the single seam every review model call passes through, so it records each
+# failure into the trail and skips models the chunk already saw fail. Both
+# default to "off", so every other caller (judge, deep append, ask) is
+# unaffected.
+_LADDER_TRAIL: contextvars.ContextVar[list[_LadderAttempt] | None] = (
+    contextvars.ContextVar("grug_ladder_trail", default=None)
+)
+_LADDER_SKIP: contextvars.ContextVar[frozenset[tuple[str, str]]] = (
+    contextvars.ContextVar("grug_ladder_skip", default=frozenset())
+)
 
 
 # Test hook — replaced with a no-op in unit tests to avoid real sleeps.
@@ -1020,6 +1126,155 @@ def _note_model_response(config: BackendConfig, resp: httpx.Response) -> None:
         _announce_model_benched(*key, resp.status_code, seconds)
 
 
+# Switched-off backends and the provider breaker (grug#1225).
+#
+# `GRUG_DISABLED_BACKENDS` turns a backend off by configuration: a comma-
+# separated list of backend names (`opencode-go`, `openrouter`, `poolside`),
+# each optionally narrowed to one pool with `:free` or `:paid`
+# (`openrouter:paid` keeps the `:free` models). A disabled backend is never
+# called: the cloud review chain, the SaaS overload fallback, the judge and
+# the interactive order all skip it, and `_call_backend` refuses it as the
+# last guard. Read on every call, so re-enabling one is removing its entry
+# and rolling out. Unset (the default) disables nothing.
+#
+# The provider breaker covers a provider nobody has switched off yet. A 401
+# (key wrong or expired), a 402 (unpaid), or a refusal whose body says a
+# limit is spent (OpenRouter's `403 Key limit exceeded (total limit)` and
+# `429 ... free-models-per-day`, OpenCode Go's monthly usage limit) does not
+# clear within a review, so the first one stops calls to that provider for
+# Retry-After, else an hour. A 401 covers the whole key; the others only the
+# pool (free or paid) that answered, because OpenRouter's free models keep
+# answering on a key whose paid limit is zero. A plain 429 is overload and
+# never trips it. Per process, like the bench above. Measured before it
+# existed (402 Elder runs, 2026-10-17): 36 OpenCode Go 401s, 11 OpenRouter
+# paid "total limit" refusals and 139 OpenRouter free per-day 429s, each one
+# spent cohort time before a working backend was reached.
+_PROVIDER_POOLS = ("free", "paid")
+_SPENT_LIMIT_MARKERS = (
+    "usage limit", "quota", "credit", "key limit", "total limit", "spend limit",
+)
+# A 429 trips it only when the body names a daily or monthly allowance.
+# Poolside answers short-lived throttling with `429 usage limit exceeded` and
+# no Retry-After; reading that as spent blocked the one working cloud tier
+# for an hour (live, 2026-10-17). OpenCode Go's monthly 429 carries the
+# `GoUsageLimitError` type, and its own breaker above honours Retry-After.
+_SPENT_RATE_MARKERS = ("per-day", "per day", "daily", "monthly", "gousagelimiterror")
+_provider_breaker_lock = threading.Lock()
+_provider_blocked_until: dict[tuple[str, str], float] = {}
+_warned_disabled_entries: set[str] = set()
+
+
+class BackendDisabledError(httpx.RequestError):
+    """The backend is switched off (`GRUG_DISABLED_BACKENDS`) or its provider
+    breaker is open. Subclasses `httpx.RequestError` so every caller degrades
+    exactly as it does for a transport failure."""
+
+
+def _backend_pool(backend: Backend, model: str) -> str:
+    """"free" for a provider's no-cost models, "paid" for everything else."""
+    if backend == Backend.OPENROUTER and is_free_tier_model(model):
+        return "free"
+    if backend == Backend.OPENCODE_GO and _opencode_go_model_is_free(model):
+        return "free"
+    return "paid"
+
+
+def _disabled_backend_entries() -> frozenset[str]:
+    entries = frozenset(
+        e.strip().lower()
+        for e in os.getenv("GRUG_DISABLED_BACKENDS", "").split(",")
+        if e.strip()
+    )
+    known = {b.value for b in Backend}
+    for entry in entries - _warned_disabled_entries:
+        name, _, pool = entry.partition(":")
+        if name not in known or pool not in ("", *_PROVIDER_POOLS):
+            # A typo must not read as "switched off" while the backend runs.
+            log.warning("grug_disabled_backends_unknown_entry", extra={"entry": entry})
+        _warned_disabled_entries.add(entry)
+    return entries
+
+
+def _backend_enabled(backend: Backend, model: str) -> bool:
+    """False when `GRUG_DISABLED_BACKENDS` names this backend or its pool."""
+    entries = _disabled_backend_entries()
+    if not entries:
+        return True
+    name = backend.value
+    return name not in entries and f"{name}:{_backend_pool(backend, model)}" not in entries
+
+
+def _provider_available(backend: Backend, model: str, now: float | None = None) -> bool:
+    current = time.time() if now is None else now
+    key = (backend.value, _backend_pool(backend, model))
+    with _provider_breaker_lock:
+        return current >= _provider_blocked_until.get(key, 0.0)
+
+
+def _backend_usable(backend: Backend, model: str) -> bool:
+    """Switched on and its provider breaker closed."""
+    return _backend_enabled(backend, model) and _provider_available(backend, model)
+
+
+def _is_spent_quota_refusal(resp: httpx.Response) -> bool:
+    """A refusal that says the money or the allowance is gone, not overload."""
+    status = resp.status_code
+    if status == 402:
+        return True
+    if status not in (403, 429):
+        return False
+    text = (resp.text or "").lower()
+    markers = _SPENT_LIMIT_MARKERS if status == 403 else _SPENT_RATE_MARKERS
+    return any(m in text for m in markers)
+
+
+def _note_provider_response(config: BackendConfig, resp: httpx.Response) -> None:
+    """Open the provider breaker on a 401, a 402 or a spent-limit refusal."""
+    if config.backend not in _BENCH_CLOUD_BACKENDS:
+        return
+    if resp.status_code == 401:
+        pools: tuple[str, ...] = _PROVIDER_POOLS
+    elif _is_spent_quota_refusal(resp):
+        pools = (_backend_pool(config.backend, config.model),)
+    else:
+        return
+    # Same default (an hour) and cap (a week) as the OpenCode Go breaker.
+    seconds = _retry_after_seconds(resp)
+    until = time.time() + seconds
+    with _provider_breaker_lock:
+        for pool in pools:
+            key = (config.backend.value, pool)
+            _provider_blocked_until[key] = max(_provider_blocked_until.get(key, 0.0), until)
+    log.warning(
+        "llm_provider_circuit_open",
+        extra={
+            "backend": config.backend.value, "model": config.model,
+            "status": resp.status_code, "pools": list(pools), "block_seconds": seconds,
+        },
+    )
+
+
+def _refuse_unusable_backend(config: BackendConfig) -> None:
+    """`_call_backend`'s guard: raise before any network call to a backend
+    that is switched off or whose breaker is open."""
+    if not _backend_enabled(config.backend, config.model):
+        raise BackendDisabledError(
+            f"{config.backend.value} is switched off (GRUG_DISABLED_BACKENDS)"
+        )
+    if config.backend in _BENCH_CLOUD_BACKENDS and not _provider_available(
+        config.backend, config.model,
+    ):
+        raise BackendDisabledError(
+            f"{config.backend.value} provider breaker open after an auth or quota refusal"
+        )
+    if (
+        config.backend == Backend.OPENCODE_GO
+        and not _opencode_go_model_is_free(config.model)
+        and not _opencode_go_available()
+    ):
+        raise OpencodeGoCircuitOpenError("opencode Go usage limit: breaker open")
+
+
 # Slow bench. A model that is merely slow (not withdrawn) times out on large
 # cohorts and burns its whole timeout before the next tier starts. Three
 # httpx timeouts within ten minutes bench the (backend, model) pair for ten
@@ -1178,10 +1433,13 @@ def _slow_bench_expiry(tier: BackendConfig) -> float:
 def _tier_is_usable(
     tier: BackendConfig, chosen: list[BackendConfig], *, skip_slow: bool = True,
 ) -> bool:
-    """A tier runs unless it duplicates one already chosen, is benched (4xx
+    """A tier runs unless it duplicates one already chosen, is switched off
+    or behind an open provider breaker (`_backend_usable`), is benched (4xx
     bench, or slow bench when `skip_slow`), or is a paid OpenCode Go model
     while the usage-limit breaker is open."""
     if any((c.backend, c.model) == (tier.backend, tier.model) for c in chosen):
+        return False
+    if not _backend_usable(tier.backend, tier.model):
         return False
     if _model_is_benched(tier.backend.value, tier.model):
         return False
@@ -1190,15 +1448,6 @@ def _tier_is_usable(
     if tier.backend == Backend.OPENCODE_GO and not _opencode_go_model_is_free(tier.model):
         return _opencode_go_available()
     return True
-
-
-def _cloud_chain_worst_case_s() -> float:
-    """Seconds the cloud chain can spend on one cohort before the Cave runs;
-    0 under `cave` priority. Keeps the staged scheduler's reserve honest now
-    that a cohort can walk three cloud tiers first."""
-    if _review_backend_priority() != "cloud":
-        return 0.0
-    return sum(tier.timeout_seconds for tier in _cloud_chain_tiers())
 
 
 # Poolside tier: 45s, not the 25s shared by the other tiers. Its laguna-s-2.1
@@ -1488,6 +1737,15 @@ def _saas_overload_fallback_config(backend: Backend) -> BackendConfig:
     )
 
 
+def _usable_saas_fallback_backends() -> tuple[Backend, ...]:
+    """The overload valve's backends in order, minus any that are switched
+    off or behind an open provider breaker (grug#1225)."""
+    return tuple(
+        b for b in (Backend.POOLSIDE, Backend.OPENROUTER)
+        if _backend_usable(b, _BACKEND_CONFIGS[b].model)
+    )
+
+
 # A backend that answers with one of these is not busy - it is UNUSABLE, and
 # no amount of retrying or falling back changes that. 401/403 = the key is
 # wrong or revoked. 402 = the bill is unpaid. 404 = the endpoint or model name
@@ -1642,7 +1900,18 @@ def select_backend(installation_id: int) -> Backend:
         "select_backend assumes the Poolside/OpenRouter review pair; add a "
         "real selector before changing the review backends."
     )
-    return Backend.POOLSIDE if installation_id % 2 == 0 else Backend.OPENROUTER
+    preferred, other = (
+        (Backend.POOLSIDE, Backend.OPENROUTER) if installation_id % 2 == 0
+        else (Backend.OPENROUTER, Backend.POOLSIDE)
+    )
+    # A switched-off or breaker-blocked pick hands the call to the other one
+    # (grug#1225); with both unusable the pick stands and `_call_backend`
+    # refuses it before any network call.
+    if not _backend_usable(preferred, _BACKEND_CONFIGS[preferred].model) and _backend_usable(
+        other, _BACKEND_CONFIGS[other].model,
+    ):
+        return other
+    return preferred
 
 
 # Built once at import from the structured rule library (#188). The
@@ -1855,15 +2124,25 @@ def _review_system_prompt(
 ) -> str:
     """Compose trusted review instructions separately from repository data.
 
-    Precedence (#674), highest to lowest: in-repo agent guidelines
-    (CLAUDE.md/AGENTS.md/etc. - the repo's own versioned, team-authored
-    standard) > operator-taught learnings (#670) > few-shot examples (#538)
-    > team practices (#527) > the static base prompt. Later blocks outrank
-    earlier ones per this prompt's recency=authority convention, and the
+    Precedence (#674), highest to lowest, WITHIN THE SYSTEM PROMPT: in-repo
+    agent guidelines (CLAUDE.md/AGENTS.md/etc. - the repo's own versioned,
+    team-authored standard) > operator-taught learnings (#670) > few-shot
+    examples (#538) > team practices (#527) > the static base prompt. Later
+    blocks outrank earlier ones per this prompt's recency=authority
+    convention (see the `system = f"{system}\n\n..."` appends below), and the
     guidelines block itself tells the model to follow the carving over a
-    taught preference on conflict. (A future `path-instructions` layer -
-    directory-scoped rules - would slot above guidelines; it does not exist
-    yet, so the chain is currently guidelines > learnings.)
+    taught preference on conflict.
+
+    `path_instructions` - directory-scoped `.grug.yaml` rules - DOES exist
+    and is live (`repo_config._KNOWN_KEYS`, applied by
+    `repo_config.with_instructions` from `dispatch.py`). It is deliberately
+    NOT a layer of the chain above, because it rides the USER prompt's
+    repo-docs block rather than the system prompt. The recency=authority
+    convention therefore cannot order it against guidelines or learnings at
+    all - they live in different messages, and neither block claims
+    authority over the other. NO precedence between a path instruction and a
+    repo guideline is defined or tested today; on conflict the model infers
+    one. Deciding that ordering and pinning it with a test is #1131.
     """
     # Redact secret-shaped values from the diff + file context BEFORE they reach
     # the backend (#438). The backend is a third-party SaaS endpoint, and a PR
@@ -1961,20 +2240,36 @@ class _BackendConfigError(Exception):
 def _post_with_retries(
     url: str, body: dict[str, Any], headers: dict[str, str],
     timeout_seconds: float, retry_attempts: int, transport_attempts: int,
+    deadline: float | None = None,
 ) -> httpx.Response:
     """The actual 429/503-retrying HTTP call, shared by both `_call_backend`
     paths below. Always goes through the bare `httpx.post()` convenience
     function (not an explicit `httpx.Client`) - tests mock `httpx.post`
-    directly, and this keeps that working unmodified for every caller."""
+    directly, and this keeps that working unmodified for every caller.
+
+    `deadline` (grug#1216) is passed explicitly, not read from the context
+    var, because the cancellable path runs this on a fresh thread that does
+    not inherit it. Each attempt is clamped to the time left; a timeout that
+    only fired because of the clamp is re-raised as `ReviewDeadlineReached`."""
     for attempt in range(retry_attempts):
+        attempt_timeout = _deadline_timeout(timeout_seconds, deadline)
         try:
-            resp = httpx.post(url, json=body, headers=headers, timeout=timeout_seconds)
-        except (httpx.RequestError, httpx.TimeoutException):
+            resp = httpx.post(url, json=body, headers=headers, timeout=attempt_timeout)
+        except httpx.RequestError as e:
+            if isinstance(e, httpx.TimeoutException) and attempt_timeout < timeout_seconds:
+                raise ReviewDeadlineReached(
+                    f"staged review deadline cut the call after {attempt_timeout:.1f}s"
+                ) from e
             if attempt < transport_attempts - 1:
                 _RETRY_SLEEP(_RETRY_BASE_DELAY * (2 ** attempt))
                 continue
             raise
-        if resp.status_code in _RETRYABLE_STATUSES and attempt < retry_attempts - 1:
+        if (
+            resp.status_code in _RETRYABLE_STATUSES
+            and attempt < retry_attempts - 1
+            # A spent daily or monthly allowance does not clear in a backoff.
+            and not _is_spent_quota_refusal(resp)
+        ):
             _RETRY_SLEEP(_RETRY_BASE_DELAY * (2 ** attempt))
             continue
         return resp
@@ -2111,12 +2406,7 @@ def _call_backend(
     is the entire cost this gate adds to their calls."""
     if cancel_event is not None and cancel_event.is_set():
         raise httpx.RequestError("cancelled before dispatch")
-    if (
-        config.backend == Backend.OPENCODE_GO
-        and not _opencode_go_model_is_free(config.model)
-        and not _opencode_go_available()
-    ):
-        raise OpencodeGoCircuitOpenError("opencode Go usage limit: breaker open")
+    _refuse_unusable_backend(config)
     if config.backend == Backend.OPENROUTER and is_free_tier_model(config.model):
         outcome = acquire_free_tier_slot(config.model, cancel_event=cancel_event)
         if not outcome.admitted:
@@ -2144,17 +2434,19 @@ def _call_backend(
     headers = _merged_headers(config, key)
 
     transport_attempts = _validated_transport_attempts(config)
+    deadline = _REVIEW_DEADLINE.get()
     if cancel_event is None:
         resp = _post_with_retries(
             config.url, body, headers, config.timeout_seconds,
-            config.retry_attempts, transport_attempts,
+            config.retry_attempts, transport_attempts, deadline,
         )
     else:
         resp = _post_with_retries_cancellable(
-            config, body, headers, transport_attempts, cancel_event,
+            config, body, headers, transport_attempts, cancel_event, deadline,
         )
     if config.backend == Backend.OPENCODE_GO:
         _note_opencode_go_response(resp)
+    _note_provider_response(config, resp)
     _note_model_response(config, resp)
     return resp
 
@@ -2250,6 +2542,7 @@ def _emit_abandoned_in_flight_gauge(count: int, backend: str) -> None:
 def _post_with_retries_cancellable(
     config: BackendConfig, body: dict[str, Any], headers: dict[str, str],
     transport_attempts: int, cancel_event: threading.Event,
+    deadline: float | None = None,
 ) -> httpx.Response:
     """`_call_backend`'s cancellable path (#635 follow-up), split out to keep
     that function's own branch count down. Runs the real call on a
@@ -2266,7 +2559,7 @@ def _post_with_retries_cancellable(
         try:
             resp = _post_with_retries(
                 config.url, body, headers, config.timeout_seconds,
-                config.retry_attempts, transport_attempts,
+                config.retry_attempts, transport_attempts, deadline,
             )
             result_q.put(("ok", resp))
         except Exception as e:  # noqa: BLE001 - re-raised on the waiting side
@@ -2410,6 +2703,51 @@ def _recover_fenced_json(content: str) -> object | None:
     return None
 
 
+# Bounds the embedded-object scan: at most this many `{` starts are tried.
+_EMBEDDED_JSON_MAX_STARTS = 200
+
+
+def _recover_embedded_json(content: str) -> dict | None:
+    """Repair an answer whose findings object is wrapped in prose (grug#1196).
+
+    Live 2026-10-17: a cloud model answered with a sentence and then a valid
+    `{"findings": []}`, or the object first and a paragraph after it. Both are
+    real answers, but `json.loads` rejects them and there is no fence to
+    recover, so Elder published "eyes clouded (parse_failed)". This decodes
+    one JSON value at each `{` and keeps the first object that carries a
+    `findings` list. Stricter than the fenced path on purpose: prose can quote
+    an unrelated example object, and only the documented envelope is taken."""
+    decoder = json.JSONDecoder()
+    scan = content[:_FENCE_SCAN_CHARS]
+    start = scan.find("{")
+    tries = 0
+    while start != -1 and tries < _EMBEDDED_JSON_MAX_STARTS:
+        tries += 1
+        try:
+            parsed, _end = decoder.raw_decode(scan, start)
+        except json.JSONDecodeError:
+            parsed = None
+        if isinstance(parsed, dict) and isinstance(parsed.get("findings"), list):
+            return parsed
+        start = scan.find("{", start + 1)
+    return None
+
+
+def _recover_wrapped_json(content: str, model_name: str) -> object | None:
+    """A fenced block first (grug#883), then one repair of a findings object
+    wrapped in prose (grug#1196), before the answer counts as unparseable."""
+    parsed = _recover_fenced_json(content)
+    if parsed is not None:
+        return parsed
+    repaired = _recover_embedded_json(content)
+    if repaired is not None:
+        log.info(
+            "llm_response_json_repaired",
+            extra={"model": model_name, "content_len": len(content)},
+        )
+    return repaired
+
+
 def _describe_unparseable(content: str) -> str:
     """Name what actually arrived when no JSON could be recovered.
 
@@ -2422,6 +2760,59 @@ def _describe_unparseable(content: str) -> str:
         f"llm returned non-json — parse failed "
         f"(len={len(content)}, no recoverable fenced json, starts: {preview!r})"
     )
+
+
+# grug#1231: the reason a findings answer cut off at the output cap carries.
+# Live 2026-10-17 (the Elder eval record run on the Cave, #989): 4 of 18 cases
+# answered `{"findings": [{...}, {...}, ...` for 28-30k characters and stopped
+# mid-object at the gateway's ~8192-token output cap. Every complete finding
+# before the cut was a real answer, but the whole reply failed as non-json.
+TRUNCATED_FINDINGS = "truncated_findings"
+
+# The answer must OPEN as the documented envelope (an optional opening fence
+# allowed), so prose that merely quotes `{"findings": [` is never taken.
+_TRUNCATED_ENVELOPE_RE = re.compile(
+    r'\A\s*(?:```[a-zA-Z0-9_-]*\s*)?\{\s*"findings"\s*:\s*\['
+)
+# A reply that ends by closing the list and the object finished its envelope;
+# if it still did not parse, it is malformed somewhere, not cut off.
+_CLOSED_ENVELOPE_RE = re.compile(r"\]\s*\}\s*(?:```)?\s*\Z")
+
+
+def _skip_json_whitespace(content: str, pos: int) -> int:
+    while pos < len(content) and content[pos] in " \t\r\n":
+        pos += 1
+    return pos
+
+
+def _recover_truncated_findings(content: str) -> list[Any] | None:
+    """The complete items of a findings list cut off before it closed, or None.
+
+    Decodes one list item at a time and stops at the first that does not
+    decode - the partial last one. Returns None (the answer stays a parse
+    failure) unless the reply opens as the findings envelope, never closes
+    it, and holds at least one complete item, so an answer that is
+    malformed in some other way is not relabelled as truncated. The items
+    are returned raw: the caller validates each one with `_coerce_findings`,
+    the same as a complete answer."""
+    match = _TRUNCATED_ENVELOPE_RE.match(content)
+    if match is None or _CLOSED_ENVELOPE_RE.search(content):
+        return None
+    decoder = json.JSONDecoder()
+    items: list[Any] = []
+    pos = _skip_json_whitespace(content, match.end())
+    while pos < len(content):
+        try:
+            item, pos = decoder.raw_decode(content, pos)
+        except json.JSONDecodeError:
+            break
+        items.append(item)
+        pos = _skip_json_whitespace(content, pos)
+        if pos < len(content) and content[pos] != ",":
+            # `]` would mean the list closed; anything else is not a list.
+            return None
+        pos = _skip_json_whitespace(content, pos + 1)
+    return items or None
 
 
 def _diagnose_non_string_content(choice: object, message: object, content: object) -> str:
@@ -2531,11 +2922,86 @@ def _coerce_findings(raw_findings: list[Any], model_name: str) -> tuple[Finding,
     return tuple(coerced)
 
 
+@dataclass(frozen=True, slots=True)
+class ParsedReview:
+    """One parsed review answer (`_parse_review`).
+
+    `error` is empty when the answer parsed. `truncated_findings` (grug#1231)
+    is True when the answer was a findings list cut off before it closed:
+    `findings` then holds only the complete items before the cut, so the
+    review is PARTIAL - fewer findings than the model meant to write - and a
+    caller must never read it as a complete clean review."""
+
+    findings: tuple[Finding, ...]
+    model_name: str
+    error: str
+    truncated_findings: bool = False
+
+
 def _parse_response(
     resp: httpx.Response,
 ) -> tuple[tuple[Finding, ...], str, str]:
     """Returns (findings, model_name, error). On parse failure returns
     ((), model_name, error_message).
+
+    A truncated findings list (grug#1231) is a failure HERE, with an error
+    that starts with `truncated_findings`: a caller that reads only this
+    tuple cannot tell partial from complete, so it keeps failing the answer
+    as it did before. Callers that can carry the partial state use
+    `_parse_review` instead (the live review seam, the Elder eval)."""
+    parsed = _parse_review(resp)
+    if parsed.truncated_findings:
+        return (), parsed.model_name, (
+            f"{TRUNCATED_FINDINGS}: findings list cut off before it closed "
+            f"({len(parsed.findings)} complete findings kept)"
+        )
+    return parsed.findings, parsed.model_name, parsed.error
+
+
+def _parse_findings_content(content: str, model_name: str) -> ParsedReview:
+    """Parse a non-empty `message.content` into findings (split out of
+    `_parse_review` to keep each under the complexity cap)."""
+    try:
+        parsed = json.loads(content)
+    except json.JSONDecodeError:
+        # grug#883: a fenced answer is a REAL review, not a failure. Recover it
+        # before giving up, and if there is nothing to recover say what arrived.
+        parsed = _recover_wrapped_json(content, model_name)
+        if parsed is None:
+            items = _recover_truncated_findings(content)
+            if items is None:
+                return ParsedReview((), model_name, _describe_unparseable(content))
+            log.warning(
+                "llm_response_findings_truncated",
+                extra={
+                    "model": model_name,
+                    "content_len": len(content),
+                    "complete_items": len(items),
+                },
+            )
+            return ParsedReview(
+                _coerce_findings(items, model_name), model_name, "",
+                truncated_findings=True,
+            )
+    # Models sometimes return a bare JSON array of findings instead of the
+    # documented {"findings": [...]} object (#416 - Poolside did this and the
+    # old `parsed.get(...)` crashed with `'list' object has no attribute 'get'`,
+    # dropping a live review). Accept both shapes; anything else is a graceful
+    # parse failure, never an unhandled crash.
+    if isinstance(parsed, list):
+        raw_findings = parsed
+    elif isinstance(parsed, dict):
+        raw_findings = parsed.get("findings", [])
+    else:
+        return ParsedReview((), model_name, "llm content is neither object nor array")
+    if not isinstance(raw_findings, list):
+        return ParsedReview((), model_name, "findings field is not a list")
+    return ParsedReview(_coerce_findings(raw_findings, model_name), model_name, "")
+
+
+def _parse_review(resp: httpx.Response) -> ParsedReview:
+    """Parse one completion into a `ParsedReview`. Every failure is RETURNED
+    as `error`, never raised.
 
     grug#881: a THINKING model under `response_format={"type":
     "json_object"}` can legally return `content: null` (or `""`, or some
@@ -2553,16 +3019,16 @@ def _parse_response(
     RETURNED, diagnosable error (offending field + `finish_reason`) like
     every other malformed shape here, never an unhandled raise."""
     if resp.status_code != 200:
-        return (), "", f"http_{resp.status_code}"
+        return ParsedReview((), "", f"http_{resp.status_code}")
     try:
         body = resp.json()
     except (json.JSONDecodeError, ValueError):
         # Cloudflare HTML interstitial, gateway error page, truncated
         # body — all return 200 + non-JSON. Surface as parse failure
         # instead of crashing the webhook handler.
-        return (), "", "envelope_json_decode_failed"
+        return ParsedReview((), "", "envelope_json_decode_failed")
     if not isinstance(body, dict):
-        return (), "", "envelope_not_a_dict"
+        return ParsedReview((), "", "envelope_not_a_dict")
     if "choices" not in body and "output" in body:
         # Responses API reply (BackendConfig.wire == "responses"). Normalise
         # to the chat-completions shape so everything below - and all six
@@ -2580,33 +3046,14 @@ def _parse_response(
         message = choice["message"]
         content = message["content"]
     except (KeyError, IndexError, TypeError):
-        return (), model_name, "missing choices/message/content"
+        return ParsedReview((), model_name, "missing choices/message/content")
     if not isinstance(content, str) or not content.strip():
         # Null, wrong type, or empty: nothing to parse. Diagnose the shape
         # (with finish_reason) rather than reporting a zero-length non-json.
-        return (), model_name, _diagnose_non_string_content(choice, message, content)
-    try:
-        parsed = json.loads(content)
-    except json.JSONDecodeError:
-        # grug#883: a fenced answer is a REAL review, not a failure. Recover it
-        # before giving up, and if there is nothing to recover say what arrived.
-        parsed = _recover_fenced_json(content)
-        if parsed is None:
-            return (), model_name, _describe_unparseable(content)
-    # Models sometimes return a bare JSON array of findings instead of the
-    # documented {"findings": [...]} object (#416 — Poolside did this and the
-    # old `parsed.get(...)` crashed with `'list' object has no attribute 'get'`,
-    # dropping a live review). Accept both shapes; anything else is a graceful
-    # parse failure, never an unhandled crash.
-    if isinstance(parsed, list):
-        raw_findings = parsed
-    elif isinstance(parsed, dict):
-        raw_findings = parsed.get("findings", [])
-    else:
-        return (), model_name, "llm content is neither object nor array"
-    if not isinstance(raw_findings, list):
-        return (), model_name, "findings field is not a list"
-    return _coerce_findings(raw_findings, model_name), model_name, ""
+        return ParsedReview(
+            (), model_name, _diagnose_non_string_content(choice, message, content),
+        )
+    return _parse_findings_content(content, model_name)
 
 
 def _llmobs_tags(pr_context: Optional[PrContext]) -> dict[str, str]:
@@ -2694,9 +3141,11 @@ def _interactive_backend_order(installation_id: int) -> tuple[Backend, ...]:
     failover = (
         Backend.OPENROUTER if primary == Backend.POOLSIDE else Backend.POOLSIDE
     )
+    order = [primary, failover]
     if os.getenv("GRUG_OPENCODE_GO_API_KEY_SSM", "").strip() and _opencode_go_available():
-        return primary, failover, Backend.OPENCODE_GO
-    return primary, failover
+        order.append(Backend.OPENCODE_GO)
+    # Switched-off and breaker-blocked backends are left out (grug#1225).
+    return tuple(b for b in order if _backend_usable(b, _BACKEND_CONFIGS[b].model))
 
 
 def _interactive_tags(
@@ -3611,6 +4060,7 @@ def _cohort_coverage(
     and `fraction` exactly as before, so the eval harness's numbers do not move
     (grug#939). What it adds is which of those the scheduler never reached.
     """
+    unwalked = _unwalked_paths(plan, failed_indexes)
     return ReviewCoverage(
         total_cohorts=plan.total_cohorts_planned,
         completed_cohorts=len(responses) - len(failed_indexes),
@@ -3618,8 +4068,40 @@ def _cohort_coverage(
         unattempted_cohorts=_unattempted_cohort_indexes(responses),
         cohort_labels=tuple(cohort.label for cohort in plan.cohorts),
         concerns=plan.concerns,
-        unwalked_paths=_unwalked_paths(plan, failed_indexes),
+        unwalked_paths=unwalked,
+        reviewed_paths=_reviewed_paths(plan, responses, failed_indexes, unwalked),
+        failed_models=_failed_models(responses, failed_indexes),
     )
+
+
+def _reviewed_paths(
+    plan: ReviewPlan,
+    responses: Sequence[LlmReviewResponse],
+    failed_indexes: Sequence[int],
+    unwalked: Sequence[str],
+) -> tuple[str, ...]:
+    """Files in completed cohorts that no failed or dropped cohort shares."""
+    failed = set(failed_indexes)
+    skip = set(unwalked)
+    paths = {
+        path
+        for index, cohort in enumerate(plan.cohorts[: len(responses)], start=1)
+        if index not in failed
+        for path in cohort.paths
+        if path not in skip
+    }
+    return tuple(sorted(paths))
+
+
+def _failed_models(
+    responses: Sequence[LlmReviewResponse], failed_indexes: Sequence[int],
+) -> tuple[str, ...]:
+    """Deduplicated "model (reason)" labels from the chunks that failed."""
+    labels: dict[str, None] = {}
+    for index in failed_indexes:
+        if 1 <= index <= len(responses):
+            labels.update(dict.fromkeys(responses[index - 1].attempts))
+    return tuple(labels)
 
 
 def _unwalked_paths(plan: ReviewPlan, failed_indexes: Sequence[int]) -> tuple[str, ...]:
@@ -3725,6 +4207,27 @@ def _partial_review_reason(
     return f"partial review: {'; '.join(reasons)}" if reasons else ""
 
 
+def _with_low_confidence_cohorts(
+    error: str, responses: Sequence[LlmReviewResponse],
+) -> str:
+    """Name the cohorts kept as low-confidence clean results (grug#1097).
+
+    A partial review stays a partial review, with the low-confidence cohorts
+    added to its reason. Otherwise the merged review carries the
+    `low confidence:` prefix, so one short empty cohort still keeps the check
+    advisory instead of merging into a clean pass."""
+    indexes = [
+        index
+        for index, response in enumerate(responses, start=1)
+        if response.kind == "reviewed"
+        and response.error.startswith(_LOW_CONFIDENCE_PREFIX)
+    ]
+    if not indexes:
+        return error
+    note = f"cohorts {indexes} answered no findings too briefly to trust"
+    return f"{error}; {note}" if error else f"{_LOW_CONFIDENCE_PREFIX}{note}"
+
+
 def _merge_cohort_responses(
     responses: list[LlmReviewResponse],
     installation_id: int,
@@ -3758,7 +4261,10 @@ def _merge_cohort_responses(
             review_span_context=first.review_span_context,
             backends_used=backends,
             models_used=models,
-            error=_partial_review_reason(failed_indexes, plan, truncated_indexes),
+            error=_with_low_confidence_cohorts(
+                _partial_review_reason(failed_indexes, plan, truncated_indexes),
+                responses,
+            ),
             coverage=coverage,
         )
 
@@ -3769,6 +4275,10 @@ def _merge_cohort_responses(
     if parse_failed is not None:
         return replace(parse_failed, coverage=coverage)
     errors = "; ".join(response.error for response in responses if response.error)
+    if coverage.failed_models:
+        errors = f"{errors or 'all review cohorts failed'}; models tried: " + (
+            ", ".join(coverage.failed_models)
+        )
     return LlmReviewResponse(
         kind="all_failed",
         error=errors or "all review cohorts failed",
@@ -3872,8 +4382,25 @@ def _run_staged_cohorts(
                 },
             )
             response = run_cohort(cohort_index)
-        responses.append(response)
+        responses.append(_deadline_cut_as_skipped(response))
     return responses
+
+
+def _deadline_cut_as_skipped(response: LlmReviewResponse) -> LlmReviewResponse:
+    """A cohort the staged deadline cut is budget-starved, not a model failure.
+
+    Read from the deadline itself, not from the error text: when the cohort
+    ends without a review and the deadline has passed, the rest of its ladder
+    was never sent (grug#1216). Reported with the skipped prefix, so coverage
+    says "never attempted" - the author needs a smaller diff or more budget,
+    not a re-run hoping the model recovers."""
+    if not _is_retryable_cohort_failure(response) or not _deadline_passed():
+        return response
+    return replace(
+        response,
+        kind="all_failed",
+        error=_SKIPPED_COHORT_PREFIX + "staged review budget exhausted",
+    )
 
 
 def review_is_staged(hunks: list[Hunk]) -> bool:
@@ -4069,12 +4596,15 @@ def _review_reasoner_diff_once(
         review_map=review_map,
     )
     pr_tags = _llmobs_tags(pr_context)
+    # grug#1097: a short empty cloud answer, kept if the reasoner fails too.
+    low_confidence: LlmReviewResponse | None = None
     if _review_backend_priority() == "cloud":
         cloud_result = _try_cloud_primary(
             hunks, messages, variant, pr_tags, installation_id, pr_context, cancel_event,
         )
-        if cloud_result is not None:
-            return cloud_result
+        if cloud_result.answer is not None:
+            return cloud_result.answer
+        low_confidence = cloud_result.low_confidence
     outcome = _run_review_arm(
         Backend.CAVE_REASONER, messages, variant, pr_tags, cancel_event,
     )
@@ -4101,6 +4631,8 @@ def _review_reasoner_diff_once(
                 (Backend.CAVE_REASONER,) if outcome.truncated else (),
             ),
         )
+    if low_confidence is not None:
+        return low_confidence
     if outcome.kind == "parse_failed":
         return LlmReviewResponse(
             kind="parse_failed",
@@ -4113,6 +4645,362 @@ def _review_reasoner_diff_once(
         error=outcome.error_text or "cave-reasoner failed",
         backend_used=Backend.CAVE_REASONER,
     )
+
+
+class _ChunkLadder:
+    """Per-chunk memory of failed model calls across attempts (grug#1196).
+
+    The staged scheduler retries a failed chunk once. That retry used to walk
+    the same ladder again from the top, so it re-asked the models that had
+    just failed and was a coin flip (one large PR failed three times in a row).
+    Here the retry skips every model that already failed on this chunk and
+    goes on to the next one in the ladder; when none is left it costs no
+    network call. A failed chunk's response carries every attempt so the
+    neutral check can name the models tried and why each failed."""
+
+    def __init__(self) -> None:
+        self._tried: dict[int, list[_LadderAttempt]] = {}
+        self._parse_failed: dict[int, LlmReviewResponse] = {}
+
+    def run(
+        self, key: int, call: Callable[[], LlmReviewResponse],
+    ) -> LlmReviewResponse:
+        response = self._run_once(key, call)
+        # A model that answered unparseably is a more specific failure than a
+        # retry that reached no model at all, so `parse_failed` keeps winning
+        # over `all_failed` across attempts, exactly as it does inside one.
+        # The FIRST unparseable answer keeps the attribution, as it does there.
+        if response.kind == "parse_failed":
+            self._parse_failed.setdefault(key, response)
+        if response.kind != "reviewed" and key in self._parse_failed:
+            response = replace(self._parse_failed[key], attempts=response.attempts)
+        return response
+
+    def _run_once(
+        self, key: int, call: Callable[[], LlmReviewResponse],
+    ) -> LlmReviewResponse:
+        tried = self._tried.setdefault(key, [])
+        skip = frozenset((attempt.backend, attempt.model) for attempt in tried)
+        trail: list[_LadderAttempt] = []
+        trail_token = _LADDER_TRAIL.set(trail)
+        skip_token = _LADDER_SKIP.set(skip)
+        try:
+            response = call()
+        finally:
+            _LADDER_SKIP.reset(skip_token)
+            _LADDER_TRAIL.reset(trail_token)
+        if skip:
+            log.info(
+                "llm_chunk_retry_next_model",
+                extra={
+                    "chunk": key + 1,
+                    "skipped_models": sorted(model for _, model in skip),
+                    "new_attempts": [attempt.label for attempt in trail],
+                    "kind": response.kind,
+                },
+            )
+        tried.extend(trail)
+        if response.kind in ("all_failed", "parse_failed") and tried:
+            labels = tuple(dict.fromkeys(attempt.label for attempt in tried))
+            return replace(response, attempts=labels)
+        return response
+
+
+def _file_split_targets(
+    plan: ReviewPlan, responses: Sequence[LlmReviewResponse],
+) -> list[int]:
+    """0-based cohorts worth re-reviewing one file at a time: they ran, failed
+    in a way a smaller input could fix, and span more than one file."""
+    return [
+        index
+        for index, (cohort, response) in enumerate(zip(plan.cohorts, responses, strict=True))
+        if len(cohort.paths) > 1
+        and not cohort.oversized
+        and _is_retryable_cohort_failure(response)
+        and not (response.error or "").startswith(_SKIPPED_COHORT_PREFIX)
+    ]
+
+
+def _file_chunks(cohort: ReviewCohort, hunks: list[Hunk]) -> tuple[ReviewCohort, ...]:
+    """Re-pack one failed cohort with one file per chunk, indexes into `hunks`."""
+    sub_plan = plan_review(
+        [hunks[index] for index in cohort.hunk_indexes],
+        max_cohort_chars=_review_cohort_chars(),
+        max_cohort_paths=1,
+        max_cohorts=_MAX_REVIEW_COHORTS,
+    )
+    return tuple(
+        replace(
+            sub,
+            label=f"{cohort.label} / {sub.label}",
+            hunk_indexes=tuple(cohort.hunk_indexes[i] for i in sub.hunk_indexes),
+        )
+        for sub in sub_plan.cohorts
+    )
+
+
+def _with_parent_attempts(
+    response: LlmReviewResponse, parent: LlmReviewResponse,
+) -> LlmReviewResponse:
+    """A failed file chunk also names what failed on the cohort it came from."""
+    if response.kind == "reviewed" or not parent.attempts:
+        return response
+    labels = tuple(dict.fromkeys(parent.attempts + response.attempts))
+    return replace(response, attempts=labels)
+
+
+def _splice_file_chunks(
+    plan: ReviewPlan,
+    responses: Sequence[LlmReviewResponse],
+    chunks: dict[int, tuple[ReviewCohort, ...]],
+    sub_responses: Sequence[LlmReviewResponse],
+) -> tuple[ReviewPlan, list[LlmReviewResponse]]:
+    """Replace each split cohort, in place, with its file chunks and results,
+    so coverage counts and names the chunks that actually ran."""
+    pending = iter(sub_responses)
+    cohorts: list[ReviewCohort] = []
+    merged: list[LlmReviewResponse] = []
+    for index, (cohort, response) in enumerate(zip(plan.cohorts, responses, strict=True)):
+        if index not in chunks:
+            cohorts.append(cohort)
+            merged.append(response)
+            continue
+        cohorts.extend(chunks[index])
+        merged.extend(
+            _with_parent_attempts(next(pending), response) for _ in chunks[index]
+        )
+    added = sum(len(files) for files in chunks.values()) - len(chunks)
+    return ReviewPlan(
+        cohorts=tuple(cohorts),
+        total_diff_chars=plan.total_diff_chars,
+        concerns=plan.concerns,
+        total_cohorts_planned=plan.total_cohorts_planned + added,
+    ), merged
+
+
+@dataclass(frozen=True, slots=True)
+class _Tier1Review:
+    """The Tier-1 review of one diff: whole, staged, then split by file.
+
+    1. A diff under the cohort budget is one chunk; a larger one is packed
+       into bounded cohorts by `plan_review` (ADR-0021).
+    2. Each chunk walks the model ladder, then gets one retry that starts at
+       the next untried model (`_ChunkLadder`).
+    3. A chunk that still failed and spans several files is split by file
+       and each file chunk is reviewed on its own, inside the remaining
+       staged budget (grug#1196). Markings from every chunk merge into one
+       response, and coverage names the files reviewed and not reviewed.
+
+    The whole review runs under one deadline, `started_at` + the staged
+    budget (grug#1216): every model call is clamped to the time left, so the
+    scheduler reserves only what one cohort needs to be worth starting
+    instead of a whole worst-case ladder walk before every cohort.
+    """
+
+    hunks: list[Hunk]
+    installation_id: int
+    pr_context: PrContext | None
+    file_contents: dict[str, str] | None
+    cross_file_contents: dict[str, str] | None
+    runtime_context: str | None
+    ci_context: str | None
+    repo_docs_context: str | None
+    voice: VoiceSelection
+    cancel_event: threading.Event | None
+    started_at: float = field(default_factory=time.monotonic)
+
+    @staticmethod
+    def reserve_s() -> float:
+        # Not the ladder's worst case (Cave timeout + two SaaS fallbacks +
+        # every cloud tier, 480-575s live): calls are clamped to the
+        # deadline, so a started cohort cannot overrun the budget (grug#1216).
+        return _MIN_DEADLINE_COHORT_SECONDS
+
+    def _deadline(self) -> contextlib.AbstractContextManager[None]:
+        return _review_deadline(self.started_at + _staged_review_budget_s())
+
+    def _dispatch(
+        self,
+        hunks: list[Hunk],
+        pr_context: PrContext | None,
+        file_contents: dict[str, str] | None,
+        review_map: str = "",
+    ) -> LlmReviewResponse:
+        return _review_diff_dispatch(
+            hunks,
+            self.installation_id,
+            pr_context,
+            file_contents,
+            self.cross_file_contents,
+            self.runtime_context,
+            self.ci_context,
+            self.repo_docs_context,
+            self.voice,
+            self.cancel_event,
+            review_map,
+        )
+
+    def _run_cohort(
+        self, cohort: ReviewCohort, index: int, count: int, review_map: str,
+    ) -> LlmReviewResponse:
+        oversized = _oversized_cohort_failure(
+            cohort,
+            phase="tier1",
+            index=index + 1,
+            count=count,
+            installation_id=self.installation_id,
+            pr_context=self.pr_context,
+        )
+        if oversized is not None:
+            return oversized
+        cohort_paths = set(cohort.paths)
+        return self._dispatch(
+            [self.hunks[i] for i in cohort.hunk_indexes],
+            _cohort_pr_context(
+                self.pr_context, phase="tier1", index=index + 1, count=count,
+            ),
+            {
+                path: content
+                for path, content in (self.file_contents or {}).items()
+                if path in cohort_paths
+            },
+            review_map,
+        )
+
+    def _schedule(
+        self,
+        cohorts: Sequence[ReviewCohort],
+        run_chunk: Callable[[int], LlmReviewResponse],
+        budget_seconds: float,
+    ) -> list[LlmReviewResponse]:
+        ladder = _ChunkLadder()
+        return _run_staged_cohorts(
+            cohort_count=len(cohorts),
+            run_cohort=lambda index: ladder.run(index, lambda: run_chunk(index)),
+            budget_seconds=budget_seconds,
+            reserve_seconds=self.reserve_s(),
+            cancel_event=self.cancel_event,
+        )
+
+    def run_whole_diff(self, plan: ReviewPlan) -> LlmReviewResponse:
+        """One chunk. A success returns unchanged, exactly as before staging
+        existed; a failure gets the next-model retry, then the file split."""
+        with self._deadline():
+            return self._run_whole_diff(plan)
+
+    def _run_whole_diff(self, plan: ReviewPlan) -> LlmReviewResponse:
+        ladder = _ChunkLadder()
+
+        def call() -> LlmReviewResponse:
+            return self._dispatch(self.hunks, self.pr_context, self.file_contents)
+
+        response = ladder.run(0, call)
+        if _is_retryable_cohort_failure(response) and self._can_retry():
+            log.warning(
+                "llm_staged_review_cohort_retry",
+                extra={
+                    "cohort": 1,
+                    "attempt": 2,
+                    "kind": response.kind,
+                    "error": (response.error or "")[:200],
+                },
+            )
+            response = ladder.run(0, call)
+        if response.kind == "reviewed" or self._cancelled():
+            return response
+        return self._split_and_merge(plan, [response])
+
+    def _cancelled(self) -> bool:
+        return self.cancel_event is not None and self.cancel_event.is_set()
+
+    def _can_retry(self) -> bool:
+        elapsed = time.monotonic() - self.started_at
+        return not self._cancelled() and (
+            elapsed + self.reserve_s() <= _staged_review_budget_s()
+        )
+
+    def run_staged(self, plan: ReviewPlan) -> LlmReviewResponse:
+        review_map = render_review_map(plan)
+        ctx = self.pr_context or {}
+        log.info(
+            "llm_staged_review_planned",
+            extra={
+                "phase": "tier1",
+                "cohort_count": len(plan.cohorts),
+                "cohort_chars": [cohort.diff_chars for cohort in plan.cohorts],
+                "total_diff_chars": plan.total_diff_chars,
+                "installation_id": self.installation_id,
+                "repo": ctx.get("repo"),
+                "pr_number": ctx.get("pr_number"),
+            },
+        )
+        count = len(plan.cohorts)
+        with self._deadline():
+            responses = self._schedule(
+                plan.cohorts,
+                lambda index: self._run_cohort(
+                    plan.cohorts[index], index, count, review_map,
+                ),
+                _staged_review_budget_s(),
+            )
+            return self._split_and_merge(plan, responses)
+
+    def _split_and_merge(
+        self, plan: ReviewPlan, responses: list[LlmReviewResponse],
+    ) -> LlmReviewResponse:
+        plan, responses = self._file_split(plan, responses)
+        return _merge_cohort_responses(
+            responses, self.installation_id, self.pr_context, plan,
+        )
+
+    def _split_budget_s(self) -> float | None:
+        """Seconds left for a file split, or None when it cannot afford one."""
+        if self._cancelled():
+            return None
+        remaining = _staged_review_budget_s() - (time.monotonic() - self.started_at)
+        return remaining if remaining > self.reserve_s() else None
+
+    def _file_split(
+        self, plan: ReviewPlan, responses: list[LlmReviewResponse],
+    ) -> tuple[ReviewPlan, list[LlmReviewResponse]]:
+        targets = _file_split_targets(plan, responses)
+        if not targets:
+            return plan, responses
+        budget = self._split_budget_s()
+        ctx = self.pr_context or {}
+        if budget is None:
+            log.warning(
+                "llm_review_file_split_skipped",
+                extra={
+                    "cohorts": [index + 1 for index in targets],
+                    "reason": "no budget left",
+                    "repo": ctx.get("repo"),
+                    "pr_number": ctx.get("pr_number"),
+                },
+            )
+            return plan, responses
+        chunks = {index: _file_chunks(plan.cohorts[index], self.hunks) for index in targets}
+        flat = [chunk for index in targets for chunk in chunks[index]]
+        review_map = render_review_map(
+            ReviewPlan(cohorts=tuple(flat), total_diff_chars=sum(c.diff_chars for c in flat)),
+        )
+        log.info(
+            "llm_review_file_split",
+            extra={
+                "cohorts": [index + 1 for index in targets],
+                "file_chunks": len(flat),
+                "budget_s": round(budget, 1),
+                "installation_id": self.installation_id,
+                "repo": ctx.get("repo"),
+                "pr_number": ctx.get("pr_number"),
+            },
+        )
+        sub_responses = self._schedule(
+            flat,
+            lambda index: self._run_cohort(flat[index], index, len(flat), review_map),
+            budget,
+        )
+        return _splice_file_chunks(plan, responses, chunks, sub_responses)
 
 
 def review_diff(
@@ -4160,78 +5048,21 @@ def review_diff(
         max_cohort_paths=_review_cohort_paths(),
         max_cohorts=_review_max_cohorts(),
     )
-    if not plan.staged:
-        return _review_diff_dispatch(
-            hunks, installation_id, pr_context, file_contents, cross_file_contents,
-            runtime_context, ci_context, repo_docs_context, voice, cancel_event,
-        )
-
-    review_map = render_review_map(plan)
-    ctx = pr_context or {}
-    log.info(
-        "llm_staged_review_planned",
-        extra={
-            "phase": "tier1",
-            "cohort_count": len(plan.cohorts),
-            "cohort_chars": [cohort.diff_chars for cohort in plan.cohorts],
-            "total_diff_chars": plan.total_diff_chars,
-            "installation_id": installation_id,
-            "repo": ctx.get("repo"),
-            "pr_number": ctx.get("pr_number"),
-        },
-    )
-
-    def run_cohort(cohort_index: int) -> LlmReviewResponse:
-        cohort = plan.cohorts[cohort_index]
-        oversized = _oversized_cohort_failure(
-            cohort,
-            phase="tier1",
-            index=cohort_index + 1,
-            count=len(plan.cohorts),
-            installation_id=installation_id,
-            pr_context=pr_context,
-        )
-        if oversized is not None:
-            return oversized
-        cohort_hunks = [hunks[index] for index in cohort.hunk_indexes]
-        cohort_paths = set(cohort.paths)
-        cohort_context = _cohort_pr_context(
-            pr_context,
-            phase="tier1",
-            index=cohort_index + 1,
-            count=len(plan.cohorts),
-        )
-        cohort_contents = {
-            path: content
-            for path, content in (file_contents or {}).items()
-            if path in cohort_paths
-        }
-        return _review_diff_dispatch(
-            cohort_hunks,
-            installation_id,
-            cohort_context,
-            cohort_contents,
-            cross_file_contents,
-            runtime_context,
-            ci_context,
-            repo_docs_context,
-            voice,
-            cancel_event,
-            review_map,
-        )
-
-    responses = _run_staged_cohorts(
-        cohort_count=len(plan.cohorts),
-        run_cohort=run_cohort,
-        budget_seconds=_staged_review_budget_s(),
-        reserve_seconds=(
-            _review_llm_timeout_s()
-            + 2 * _SAAS_OVERLOAD_FALLBACK_TIMEOUT_SECONDS
-            + _cloud_chain_worst_case_s()
-        ),
+    review = _Tier1Review(
+        hunks=hunks,
+        installation_id=installation_id,
+        pr_context=pr_context,
+        file_contents=file_contents,
+        cross_file_contents=cross_file_contents,
+        runtime_context=runtime_context,
+        ci_context=ci_context,
+        repo_docs_context=repo_docs_context,
+        voice=voice,
         cancel_event=cancel_event,
     )
-    return _merge_cohort_responses(responses, installation_id, pr_context, plan)
+    if not plan.staged:
+        return review.run_whole_diff(plan)
+    return review.run_staged(plan)
 
 
 @dataclass
@@ -4255,7 +5086,9 @@ class _ArmOutcome:
     # this exact raw value, unpacked into `LlmReviewResponse.error`.
     parse_err: str = ""
     # Only meaningful when kind == "success": the completion hit its
-    # max_tokens cap (`finish_reason == "length"`) before the model finished.
+    # max_tokens cap (`finish_reason == "length"`, or a findings list cut off
+    # mid-item, grug#1231 - see `AttemptOutcome.truncated`) before the model
+    # finished.
     # A schema-constrained decoder cut off mid-thought can legally close out
     # valid-but-incomplete JSON (e.g. `{"findings": []}`), structurally
     # identical to a genuinely clean review -- grug#851. Callers must fold
@@ -4274,6 +5107,14 @@ class _ArmOutcome:
 # calls in 3 hours on 2026-09-26, each published as a clean pass).
 _DEGENERATE_MAX_OUTPUT_TOKENS = 50
 _DEGENERATE_MIN_INPUT_TOKENS = 2_000
+
+# grug#1097: the `error` prefix of a review whose only answer was a short empty
+# one. Some of those are real clean reviews, so when every later tier also
+# fails the answer is kept rather than failing the cohort. A failed cohort is
+# retried and split, which spent the staged budget and left later cohorts
+# unattempted. `evaluate_diff` maps this prefix to
+# degraded_reason="low_confidence_review", which keeps the check advisory.
+_LOW_CONFIDENCE_PREFIX = "low confidence: "
 
 
 def _is_degenerate_empty_review(
@@ -4329,8 +5170,14 @@ def _truncation_error(backends: Sequence["Backend"]) -> str:
     names = ", ".join(b.value for b in backends)
     return (
         f"partial review: {names} hit the generation token cap before "
-        "finishing (finish_reason=length)"
+        f"finishing (finish_reason=length or {TRUNCATED_FINDINGS})"
     )
+
+
+def _attempt_truncation_error(attempt: "AttemptOutcome") -> str:
+    """`_truncation_error` for one completed attempt (empty unless it was
+    cut off), kept out of the dispatch function's branch count."""
+    return _truncation_error((attempt.backend,) if attempt.truncated else ())
 
 
 def _dual_arm_partial_error(
@@ -4401,6 +5248,16 @@ class AttemptOutcome:
     usage_metrics: dict[str, int | float]
     span_context: dict | None
     raw_response: httpx.Response | None
+    # grug#1231: the answer was a findings list cut off before it closed;
+    # `findings` holds only its complete items (`ParsedReview`).
+    findings_truncated: bool = False
+
+    @property
+    def truncated(self) -> bool:
+        """The generation stopped before the model finished: the provider
+        said so (`finish_reason=length`, grug#851) or the findings list was
+        cut off mid-item (grug#1231). Either way the review is partial."""
+        return self.finish_reason == "length" or self.findings_truncated
 
 
 def _annotate_attempt_error(
@@ -4469,7 +5326,59 @@ def _extract_attempt_content(body: dict) -> tuple[str, str]:
     return content, finish_reason
 
 
+def _ladder_failure_reason(outcome: AttemptOutcome) -> str | None:
+    """Short reason for a failed attempt, or None when it answered usably."""
+    if outcome.error_kind is None:
+        return None
+    if outcome.error_kind == "config":
+        return "misconfigured"
+    if outcome.error_kind == "parse_failed":
+        return "parse_failed"
+    text = outcome.error_text or outcome.error_kind
+    return text.rsplit(": ", 1)[-1]
+
+
 def _run_llm_attempt(
+    *,
+    backend: Backend,
+    config: BackendConfig,
+    messages: list[dict[str, str]],
+    variant: PromptVariant,
+    pr_tags: dict[str, str],
+    cancel_event: threading.Event | None = None,
+    transport_log_event: str = "llm_backend_transport_failed",
+) -> AttemptOutcome:
+    """`_call_llm_attempt` plus the chunk ladder bookkeeping (grug#1196).
+
+    Inside `_ChunkLadder.run`, a model that already failed on this chunk is
+    skipped without a network call, so a retry moves on to the next model in
+    the ladder instead of re-asking the one that just failed. The skip reads
+    as a config miss, which every caller already steps past. Each real
+    failure is appended to the chunk's trail so the neutral check can name
+    it. Outside a chunk both context variables are empty and this is a plain
+    pass-through."""
+    key = (backend.value, config.model)
+    if key in _LADDER_SKIP.get():
+        return AttemptOutcome(
+            backend=backend, model=None, findings=(), content="",
+            error_kind="config",
+            error_text=f"{backend.value}: {config.model} already failed on this chunk",
+            status_code=None, finish_reason="", usage_metrics={},
+            span_context=None, raw_response=None,
+        )
+    outcome = _call_llm_attempt(
+        backend=backend, config=config, messages=messages, variant=variant,
+        pr_tags=pr_tags, cancel_event=cancel_event,
+        transport_log_event=transport_log_event,
+    )
+    trail = _LADDER_TRAIL.get()
+    reason = _ladder_failure_reason(outcome)
+    if trail is not None and reason is not None:
+        trail.append(_LadderAttempt(backend=key[0], model=key[1], reason=reason))
+    return outcome
+
+
+def _call_llm_attempt(
     *,
     backend: Backend,
     config: BackendConfig,
@@ -4557,7 +5466,8 @@ def _run_llm_attempt(
                 span_context=None,
                 raw_response=None,
             )
-        findings, model, err = _parse_response(resp)
+        parsed = _parse_review(resp)
+        findings, model, err = parsed.findings, parsed.model_name, parsed.error
         # Annotate AFTER the response so we capture the raw content
         # + token counts.
         body = _reparse_attempt_body(resp, backend)
@@ -4575,6 +5485,7 @@ def _run_llm_attempt(
                     "parse_failed" if resp.status_code == 200 else "http_error"
                 ),
                 "finish_reason": finish_reason,
+                "findings_truncated": parsed.truncated_findings,
             },
             metrics={
                 "latency_ms": _elapsed_ms(start_ns),
@@ -4601,6 +5512,7 @@ def _run_llm_attempt(
             usage_metrics=usage_metrics,
             span_context=span_context,
             raw_response=resp,
+            findings_truncated=parsed.truncated_findings,
         )
 
 
@@ -4700,13 +5612,15 @@ def _run_review_arm(
 
     if not err:
         resolved_model = model or config.model
-        if attempt.finish_reason == "length":
+        if attempt.truncated:
             log.warning(
                 "llm_response_truncated",
                 extra={
                     "backend": backend.value,
                     "model": resolved_model,
                     "variant": variant,
+                    "finish_reason": attempt.finish_reason,
+                    "findings_truncated": attempt.findings_truncated,
                 },
             )
         if _is_degenerate_empty_review(findings, attempt.usage_metrics):
@@ -4722,7 +5636,7 @@ def _run_review_arm(
                 model=resolved_model,
                 findings=findings,
                 span_context=attempt.span_context,
-                truncated=attempt.finish_reason == "length",
+                truncated=attempt.truncated,
                 degenerate=True,
             )
         return _ArmOutcome(
@@ -4731,7 +5645,7 @@ def _run_review_arm(
             model=resolved_model,
             findings=findings,
             span_context=attempt.span_context,
-            truncated=attempt.finish_reason == "length",
+            truncated=attempt.truncated,
         )
     if resp.status_code == 200:
         # Model replied 200 with an unusable body - parse failure.
@@ -5014,6 +5928,40 @@ def _cloud_tier_success(
     )
 
 
+def _low_confidence_success(
+    outcome: _ArmOutcome, hunks: list[Hunk], pr_context: PrContext | None,
+) -> LlmReviewResponse:
+    """A short empty answer kept because no later tier answered (grug#1097).
+
+    Same attribution as `_cloud_tier_success`, with an `error` that marks it
+    low confidence so it never reads as a trusted clean pass. A truncated
+    generation keeps its stronger `partial review:` error instead."""
+    response = _cloud_tier_success(outcome, hunks, pr_context)
+    if response.error:
+        return response
+    return replace(
+        response,
+        error=(
+            f"{_LOW_CONFIDENCE_PREFIX}{outcome.backend.value} {outcome.model} "
+            f"answered no findings in under {_DEGENERATE_MAX_OUTPUT_TOKENS} "
+            "output tokens and no later model answered"
+        ),
+    )
+
+
+@dataclass(frozen=True, slots=True)
+class _CloudPrimaryResult:
+    """What the cloud chain produced for one review chunk.
+
+    `answer` is the review when a tier answered; the caller returns it as-is.
+    With no answer, `low_confidence` is the first short empty answer, if any:
+    the caller still tries the Cave and keeps this only when the Cave fails
+    too (grug#1097)."""
+
+    answer: LlmReviewResponse | None = None
+    low_confidence: LlmReviewResponse | None = None
+
+
 def _empty_answers_agree(
     first_empty: "tuple[Backend, str] | None",
     current: "tuple[Backend, str]",
@@ -5045,6 +5993,41 @@ def _empty_answers_agree(
     return True
 
 
+def _cloud_chain_exhausted(
+    first_parse_fail: tuple[Backend, str | None, str] | None,
+    first_empty_outcome: _ArmOutcome | None,
+    hunks: list[Hunk],
+    pr_context: PrContext | None,
+    installation_id: int,
+    last_error: str,
+) -> _CloudPrimaryResult:
+    """Resolve `_try_cloud_primary` once no tier gave a trusted answer."""
+    low_confidence = (
+        _low_confidence_success(first_empty_outcome, hunks, pr_context)
+        if first_empty_outcome is not None
+        else None
+    )
+    if first_parse_fail is not None:
+        if low_confidence is not None:
+            # An empty answer is still an answer; a parse failure is not.
+            return _CloudPrimaryResult(answer=low_confidence)
+        pf_backend, pf_model, pf_err = first_parse_fail
+        return _CloudPrimaryResult(answer=LlmReviewResponse(
+            kind="parse_failed", backend_used=pf_backend, model_name=pf_model, error=pf_err,
+        ))
+    log.info(
+        "llm_cloud_primary_exhausted",
+        extra={
+            "installation_id": installation_id,
+            "repo": (pr_context or {}).get("repo"),
+            "pr_number": (pr_context or {}).get("pr_number"),
+            "last_error": last_error,
+        },
+    )
+    # No answer: the caller falls through to the unmodified Cave path.
+    return _CloudPrimaryResult(low_confidence=low_confidence)
+
+
 def _try_cloud_primary(
     hunks: list[Hunk],
     messages: list[dict[str, str]],
@@ -5053,7 +6036,7 @@ def _try_cloud_primary(
     installation_id: int,
     pr_context: Optional[PrContext],
     cancel_event: threading.Event | None,
-) -> "LlmReviewResponse | None":
+) -> _CloudPrimaryResult:
     """Try the grug#910 cloud chain - opencode Go, then OpenRouter `:free`
     if configured - as the PRIMARY review attempt (grug#906).
 
@@ -5066,16 +6049,20 @@ def _try_cloud_primary(
     signal to move on, not something worth waiting out. Poolside is
     DROPPED (confirmed unfunded - see `_cloud_chain_tiers`'s docstring).
 
-    Returns None only on TOTAL failure (every configured tier errored or
-    timed out) - the caller's signal to fall through to the Cave path
-    unconditionally. A parse_failed cloud response is a real (if
-    degraded) answer from a backend that DID respond; it is returned
-    as-is rather than masked by a Cave retry that would silently double
-    the cost of an already-answered review."""
+    `answer` is None only on TOTAL failure (every configured tier errored,
+    timed out, or gave a short empty answer nobody confirmed) - the
+    caller's signal to fall through to the Cave path unconditionally. A
+    parse_failed cloud response is a real (if degraded) answer from a
+    backend that DID respond; it is returned as-is rather than masked by a
+    Cave retry that would silently double the cost of an already-answered
+    review. When a short empty answer exists it outranks that parse
+    failure, and on total failure it rides along as `low_confidence`
+    (grug#1097)."""
     first_parse_fail: tuple[Backend, str | None, str] | None = None
     # The first model whose answer was a short empty review. A second,
     # DIFFERENT model answering empty too is agreement, and ends the chain.
     first_empty: tuple[Backend, str] | None = None
+    first_empty_outcome: _ArmOutcome | None = None
     last_error = ""
     for tier in _cloud_chain_tiers():
         backend = tier.backend
@@ -5086,11 +6073,17 @@ def _try_cloud_primary(
             last_error = f"{backend.value}: degenerate empty review"
             key = (backend, tier.model)
             if _empty_answers_agree(first_empty, key, pr_context):
-                return _cloud_tier_success(outcome, hunks, pr_context)
-            first_empty = first_empty or key
+                return _CloudPrimaryResult(
+                    answer=_cloud_tier_success(outcome, hunks, pr_context),
+                )
+            if first_empty is None:
+                first_empty = key
+                first_empty_outcome = outcome
             continue
         if outcome.kind == "success":
-            return _cloud_tier_success(outcome, hunks, pr_context)
+            return _CloudPrimaryResult(
+                answer=_cloud_tier_success(outcome, hunks, pr_context),
+            )
         if outcome.kind == "parse_failed":
             last_error = outcome.error_text
             is_primary = (
@@ -5120,21 +6113,10 @@ def _try_cloud_primary(
         # config_error / transport_error / http_failed
         last_error = outcome.error_text
 
-    if first_parse_fail is not None:
-        pf_backend, pf_model, pf_err = first_parse_fail
-        return LlmReviewResponse(
-            kind="parse_failed", backend_used=pf_backend, model_name=pf_model, error=pf_err,
-        )
-    log.info(
-        "llm_cloud_primary_exhausted",
-        extra={
-            "installation_id": installation_id,
-            "repo": (pr_context or {}).get("repo"),
-            "pr_number": (pr_context or {}).get("pr_number"),
-            "last_error": last_error,
-        },
+    return _cloud_chain_exhausted(
+        first_parse_fail, first_empty_outcome, hunks, pr_context,
+        installation_id, last_error,
     )
-    return None  # signal: fall through to the unmodified Cave path
 
 
 def _review_diff_dispatch(
@@ -5163,7 +6145,12 @@ def _review_diff_dispatch(
     review pipeline, not a reimplementation of it. `messages`/`variant`
     get rebuilt a second time inside the cave-primary call on that
     (hopefully rare) fallback path - a deliberate, small cost accepted so
-    that function's body never has to know this caller exists."""
+    that function's body never has to know this caller exists.
+
+    grug#1097: when the cloud chain's only answer was a short empty one and
+    the Cave fails too, that answer is returned as a low-confidence clean
+    result instead of failing the chunk."""
+    low_confidence: LlmReviewResponse | None = None
     if _review_backend_priority() == "cloud":
         depth = _review_depth()
         variant: PromptVariant = (
@@ -5184,15 +6171,31 @@ def _review_diff_dispatch(
         cloud_result = _try_cloud_primary(
             hunks, messages, variant, pr_tags, installation_id, pr_context, cancel_event,
         )
-        if cloud_result is not None:
-            return cloud_result
+        if cloud_result.answer is not None:
+            return cloud_result.answer
+        low_confidence = cloud_result.low_confidence
         # Total cloud failure: fall through, unconditionally, to the exact
         # path every "cave" deployment runs - "if that fails, use my local
         # sparks" (the operator, 2026-08-27) is not itself configurable away.
-    return _review_diff_dispatch_cave_primary(
+    response = _review_diff_dispatch_cave_primary(
         hunks, installation_id, pr_context, file_contents, cross_file_contents,
         runtime_context, ci_context, repo_docs_context, voice, cancel_event, review_map,
     )
+    if low_confidence is not None and response.kind in ("all_failed", "parse_failed"):
+        log.warning(
+            "llm_review_low_confidence_kept",
+            extra={
+                "backend": low_confidence.backend_used.value
+                if low_confidence.backend_used is not None
+                else None,
+                "model": low_confidence.model_name,
+                "cave_kind": response.kind,
+                "repo": (pr_context or {}).get("repo"),
+                "pr_number": (pr_context or {}).get("pr_number"),
+            },
+        )
+        return low_confidence
+    return response
 
 
 def _review_diff_dispatch_cave_primary(
@@ -5277,9 +6280,16 @@ def _review_diff_dispatch_cave_primary(
         # input order so downstream tie-breaks stay (coder, reasoner).
         # `list(...)` fully consumes the lazy iterator before the with-block
         # exits so both outcomes are captured.
+        # One context copy per arm, taken on THIS thread, so a worker still
+        # sees the chunk ladder's trail and skip set (grug#1196). Pool
+        # threads do not inherit context variables on their own.
+        arm_contexts = [contextvars.copy_context() for _ in review_backends]
         with ThreadPoolExecutor(max_workers=len(review_backends)) as pool:
             arm_outcomes = list(pool.map(
-                lambda b: _run_review_arm(b, messages, variant, pr_tags, cancel_event),
+                lambda ctx, b: ctx.run(
+                    _run_review_arm, b, messages, variant, pr_tags, cancel_event,
+                ),
+                arm_contexts,
                 review_backends,
             ))
     elif depth == "fast":
@@ -5376,7 +6386,7 @@ def _review_diff_dispatch_cave_primary(
         # slack GRUG_REVIEW_JOB_TIMEOUT_S reserves ahead of the Cave arms'
         # own worst-case 2x_review_llm_timeout_s() budget (see the k8s
         # manifest comment on GRUG_REVIEW_JOB_TIMEOUT_S).
-        for backend in (Backend.POOLSIDE, Backend.OPENROUTER):
+        for backend in _usable_saas_fallback_backends():
             config = _saas_overload_fallback_config(backend)
             attempt = _run_llm_attempt(
                 backend=backend,
@@ -5421,6 +6431,9 @@ def _review_diff_dispatch_cave_primary(
                     review_span_context=span_context,
                     backends_used=(backend,),
                     models_used=(resolved_model,),
+                    # grug#1231: a cut-off answer is partial on this last-
+                    # resort path too, never a clean complete review.
+                    error=_attempt_truncation_error(attempt),
                 )
             if resp.status_code == 200:
                 log.warning(

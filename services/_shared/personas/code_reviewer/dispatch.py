@@ -11,7 +11,8 @@ End-to-end for one `pull_request` event:
 Advisory-first contract: when `blocking=False` (default per
 RepoConfig.code_reviewer_blocking) the check-run conclusion is forced to
 `neutral` and the review event to `COMMENT`, even when the evaluation
-itself returned `failure`. This lets us turn on the persona for every
+itself returned `failure`. In blocking mode a degraded review concludes
+`failure` (grug#1212, ADR-0023): a required neutral check passes. This lets us turn on the persona for every
 install without false-positive LLM findings blocking merges. Operator
 flips to blocking via dashboard once trust is established.
 
@@ -44,7 +45,8 @@ from github_checks_client import (
     post_check_run,
 )
 from github_reviews_client import (
-    InlineComment, ReviewEvent, ReviewResult, get_review_comments, post_review,
+    InlineComment, ReviewEvent, ReviewResult, dismiss_review, get_review_comments,
+    list_reviews, post_review,
 )
 from llm_client import (
     DeepEscalationDecision,
@@ -77,6 +79,9 @@ from personas.code_reviewer.claim_check import (
 from personas.code_reviewer.model_metrics import emit_finding_posted
 from personas import board
 from personas.code_reviewer.complexity import ComplexityScan, scan_complexity_full
+from personas.code_reviewer.criteria_coverage import (
+    LinkedCriterion, scan_criteria_coverage,
+)
 from personas.code_reviewer.lint import scan_ruff
 from personas.code_reviewer.suggestion import checked_suggestion
 from personas.code_reviewer.repo_ruff_policy import parse_repo_ruff_policy
@@ -96,21 +101,28 @@ from personas.code_reviewer.repo_config import (
 from personas.code_reviewer.linked_issue import (
     RULE_CATEGORIES as _LINKED_ISSUE_RULE_CATEGORIES,
 )
-from personas.code_reviewer.linked_issue import build_linked_issue_context
+from personas.code_reviewer.linked_issue import (
+    build_linked_issue_context, rendered_criteria,
+)
+from personas.tpm.ticket_compliance import closes_refs
 from personas.code_reviewer.repo_docs import build_repo_docs_context
-from personas.tpm.issue_fetcher import build_issue_fetcher
+from personas.tpm.issue_fetcher import build_issue_details_fetcher
 from personas.code_reviewer.omen import build_runtime_context
 from personas.code_reviewer.judge import (
     eval_tags, grade_findings, partition_findings, partition_refuted,
     refute_findings, submit_evals,
 )
+from personas.code_reviewer.intent_filter import filter_intent_mismatch_findings
 from personas.code_reviewer.persona import (
     CodeReviewEvaluation, Finding, evaluate_diff, with_degradation,
     with_extra_findings, with_findings,
 )
 from personas.code_reviewer.snapshot import review_freshness_id_from_pr
 from personas.code_reviewer import carry_forward
-from personas.code_reviewer.thread_resolver import resolve_fixed_threads
+from personas.code_reviewer.degraded_gate import (
+    degraded_conclusion, gate_sentence, lead_with_degraded_line,
+)
+from personas.code_reviewer.thread_resolver import is_grug, resolve_fixed_threads
 from personas.code_reviewer.verify import verify_findings
 from personas.tribe import CHECK_ELDER
 from adapters.install_store import (  # type: ignore
@@ -154,6 +166,10 @@ log = logging.getLogger(f"{os.getenv('DD_SERVICE', 'grug')}.persona.code_reviewe
 # face, not a giant banner.
 _PERSONA = "Elder"
 _PERSONA_PORTRAIT = "https://grug.lol/assets/grug_elder.png"
+# Hidden tag naming the persona that posted a review. Guard and Smasher build
+# their reviews with `_build_review_result` too, so the visible header cannot
+# tell them apart; Elder withdraws only reviews carrying its own tag.
+_REVIEW_PERSONA_TAG = "<!-- grug:review persona={} -->"
 
 _CHECK_NAME = CHECK_ELDER
 # 10s (was 30s) — a GitHub diff fetch is fast; the over-generous 30s let a
@@ -928,7 +944,7 @@ def _coverage_lines(coverage) -> str:
     lines = (
         f"\n\nCoverage: {coverage.completed_cohorts}/{coverage.total_cohorts} "
         f"cohorts completed{parts}."
-    )
+    ) + _coverage_file_lines(coverage)
     for concern in coverage.concerns:
         paths = ", ".join(f"`{_md_code_span(path)}`" for path in concern.paths[:6])
         lines += (
@@ -939,6 +955,57 @@ def _coverage_lines(coverage) -> str:
         marker = lines.index("\n- ", lines.index("Coverage:"))
         lines = f"{lines[:marker]}\n\n**Reviewability**{lines[marker:]}"
     return lines
+
+
+_COVERAGE_PATHS_SHOWN = 10
+
+
+def _path_list(paths: tuple[str, ...]) -> str:
+    shown = ", ".join(f"`{_md_code_span(path)}`" for path in paths[:_COVERAGE_PATHS_SHOWN])
+    return shown + _path_tail(paths, _COVERAGE_PATHS_SHOWN)
+
+
+def _coverage_file_lines(coverage) -> str:
+    """Which files were reviewed and which were not (grug#1196).
+
+    "2/3 cohorts completed" told the author how much, never where. A file is
+    reviewed only when every chunk holding part of it completed."""
+    reviewed = tuple(coverage.reviewed_paths)
+    unwalked = tuple(coverage.unwalked_paths)
+    if not reviewed and not unwalked:
+        return ""
+    lines = f"\n\nFiles reviewed ({len(reviewed)}): " + (
+        _path_list(reviewed) if reviewed else "none"
+    ) + "."
+    if unwalked:
+        lines += f"\nFiles not reviewed ({len(unwalked)}): {_path_list(unwalked)}."
+    return lines
+
+
+_TITLE_MODELS_SHOWN = 4
+
+
+def _tried_models_title(coverage) -> str:
+    """": tried m1 (reason), m2 (reason)" for a neutral title, or empty.
+
+    grug#1196: "eyes clouded (all_failed)" named no model and no cause, so a
+    reader could not tell a rate limit from a dead host from a model that
+    answered in prose."""
+    models = tuple(coverage.failed_models) if coverage is not None else ()
+    if not models:
+        return ""
+    shown = ", ".join(models[:_TITLE_MODELS_SHOWN])
+    extra = len(models) - _TITLE_MODELS_SHOWN
+    return f": tried {shown}" + (f" (+{extra} more)" if extra > 0 else "")
+
+
+def _tried_models_note(coverage) -> str:
+    """Every model tried and why it failed, for the neutral summary."""
+    models = tuple(coverage.failed_models) if coverage is not None else ()
+    if not models:
+        return ""
+    shown = ", ".join(f"`{_md_code_span(model)}`" for model in models[:12])
+    return f"\n\nModels tried: {shown}{_path_tail(models, 12)}."
 
 
 def _review_transparency(
@@ -1083,6 +1150,7 @@ def _summary_markdown(
     living_baseline_rejected: str = "",
     review_phase: Literal["tier1", "deep", "dual"] = "dual",
     defensive_dropped_count: int = 0,
+    blocking: bool = False,
 ) -> tuple[str, str]:
     """Render a (title, summary) pair for the check-run output.
 
@@ -1099,6 +1167,9 @@ def _summary_markdown(
     as a summary note so the fallback is visible, not silent.
     `review_phase` (#646): tier1 = coder-only legend; deep = append legend;
     dual = both arms before publish (deep depth / rollback).
+    `blocking` (grug#1212) is the repo's Elder mode. It only changes what a
+    degraded summary says about the merge: in BLOCK mode a degraded review
+    fails closed, so "merge not blocked" would be false there.
     """
     held = _review_transparency(
         evaluation, suppressed_count, excluded_paths, oversized_paths,
@@ -1137,8 +1208,18 @@ def _summary_markdown(
         return hunt_title(title), (
             "Grug walked part of the diff - some ground did not fit one look, "
             "or a bounded cohort returned nothing usable. Validated markings "
-            "from the ground Grug walked are published below; this check stays "
-            "advisory. Coverage detail is in the table above."
+            "from the ground Grug walked are published below. "
+            + gate_sentence(blocking)
+            + " Coverage detail is in the table above."
+        ) + held + hunt + defensive_note
+    if is_low_confidence(evaluation.degraded_reason):
+        title = "WARN Elder review low confidence"
+        return hunt_title(title), (
+            "Part of the diff got only a very short \"no findings\" answer "
+            "that no other model confirmed, because every other model failed "
+            "this pass. Grug keep the answer but not trust it. Validated "
+            "markings from the rest are published below. "
+            + gate_sentence(blocking)
         ) + held + hunt + defensive_note
     if review_phase == "deep" and is_blackout(evaluation.degraded_reason):
         # grug#848: a blackout in the deep phase is the REASONER arm's -
@@ -1153,8 +1234,8 @@ def _summary_markdown(
             "Tier-1 coder-arm review completed and its markings stand. The "
             "deep reasoner arm promised on escalation did not run this pass "
             f"- the mist: `{evaluation.degraded_reason}`. Grug not say the "
-            "deeper look agreed; it never looked. This only counsel, merge "
-            "not blocked."
+            "deeper look agreed; it never looked. "
+            + gate_sentence(blocking)
         ) + held + hunt + defensive_note
     if evaluation.degraded_reason:
         # grug#985: when some cohorts were never opened (starved of budget),
@@ -1163,7 +1244,7 @@ def _summary_markdown(
             evaluation.coverage is not None
             and bool(evaluation.coverage.unattempted_cohorts)
         )
-        reason = evaluation.degraded_reason
+        reason = evaluation.degraded_reason + _tried_models_title(evaluation.coverage)
         title = (
             f"WARN Grug eyes clouded ({reason}; some cohorts never attempted)"
             if starved
@@ -1177,9 +1258,9 @@ def _summary_markdown(
         )
         return hunt_title(title), (
             "Grug Elder could not see the diff this pass. The mist: "
-            f"`{evaluation.degraded_reason}`. Grug stay his club — this "
-            "only counsel, merge not blocked."
-        ) + starved_note + held + hunt + defensive_note
+            f"`{evaluation.degraded_reason}`. "
+            + gate_sentence(blocking)
+        ) + _tried_models_note(evaluation.coverage) + starved_note + held + hunt + defensive_note
     if not evaluation.findings:
         title = (
             "Elder clear - no markings"
@@ -1633,6 +1714,17 @@ BENIGN_DEGRADATIONS = frozenset({"no_diff"})
 PARTIAL_COVERAGE = "partial_review"
 
 
+# grug#1097: the only answer for some of the diff was a short empty one that
+# no other model confirmed, kept because every later model failed. It is a
+# clean result, not a trusted one: findings from the rest still publish, the
+# check stays advisory, and the surfaces say low confidence rather than
+# "could not see".
+LOW_CONFIDENCE = "low_confidence_review"
+
+# Degradations whose findings are real, diff-anchored evidence and publish.
+PUBLISHABLE_DEGRADATIONS = frozenset({PARTIAL_COVERAGE, LOW_CONFIDENCE})
+
+
 def is_real_degradation(reason: str | None) -> bool:
     return bool(reason) and reason not in BENIGN_DEGRADATIONS
 
@@ -1642,13 +1734,18 @@ def is_partial_coverage(reason: str | None) -> bool:
     return reason == PARTIAL_COVERAGE
 
 
+def is_low_confidence(reason: str | None) -> bool:
+    """Elder has an answer, but a short empty one nobody confirmed."""
+    return reason == LOW_CONFIDENCE
+
+
 def is_blackout(reason: str | None) -> bool:
     """Elder produced nothing usable this pass - the 'could not see' case.
 
     Split out from `is_real_degradation` so partial coverage stops borrowing
     the blackout vocabulary. Both are still 'news' for `worth_an_email`; they
     are simply not the same news."""
-    return is_real_degradation(reason) and not is_partial_coverage(reason)
+    return is_real_degradation(reason) and reason not in PUBLISHABLE_DEGRADATIONS
 
 
 # Degradations the durable lane re-drives (rerun's `_RETRYABLE_SKIP_REASONS`
@@ -1743,6 +1840,7 @@ def _stack_detail_lines(
 
 def _stack_status_line(
     evaluation: CodeReviewEvaluation, n: int, sev_bits: str,
+    conclusion: str = "neutral",
 ) -> str:
     """The board section's one-line status.
 
@@ -1756,8 +1854,21 @@ def _stack_status_line(
             if n
             else "Partial coverage - no markings on the ground Grug walked"
         )
+    if is_low_confidence(evaluation.degraded_reason):
+        return (
+            f"Low confidence - {n} marking(s); some ground got only a short empty answer"
+            if n
+            else "Low confidence - only a short empty answer, no other model confirmed it"
+        )
     if is_real_degradation(evaluation.degraded_reason):
-        return f"Degraded (`{evaluation.degraded_reason}`) - advisory only"
+        # grug#1212: in BLOCK mode the degraded check fails closed, so
+        # "advisory only" would tell the author the opposite of the gate.
+        gate = (
+            "check fails until a full review lands"
+            if conclusion == "failure"
+            else "advisory only"
+        )
+        return f"Degraded (`{evaluation.degraded_reason}`) - {gate}"
     if n == 0:
         return "Clear - no markings published"
     return f"**{n} actionable marking(s)** ({sev_bits})"
@@ -1812,6 +1923,17 @@ def _stack_closing_note(evaluation: CodeReviewEvaluation) -> list[str]:
         # Elder DID review - just not all of it. "Grug could not see" would
         # discard real work and read as a tool failure.
         return ["", "---", "", _unwalked_ground_note(evaluation), ""]
+    if is_low_confidence(evaluation.degraded_reason):
+        return [
+            "",
+            "---",
+            "",
+            (
+                "Some ground got only a very short \"no findings\" answer and "
+                "no other model answered. Grug not say trail safe there."
+            ),
+            "",
+        ]
     if is_real_degradation(evaluation.degraded_reason):
         # Degraded with empty findings is not a clean review, and the one thing
         # that must never happen is a reader taking it for one.
@@ -1850,7 +1972,7 @@ def _review_stack_body(
     sev_bits = ", ".join(
         f"{k}={by_sev[k]}" for k in ("critical", "high", "medium", "low") if k in by_sev
     ) or "none"
-    status_line = _stack_status_line(evaluation, n, sev_bits)
+    status_line = _stack_status_line(evaluation, n, sev_bits, conclusion)
 
     # Ten, not twenty-five. <details> does NOT fold in Gmail - the raw
     # notification HTML for grug#799 carried a real <details>, and Gmail
@@ -1927,7 +2049,7 @@ def _review_stack_body(
         board.render_header(
             pr_title, blocking, advisory,
             degraded=is_blackout(evaluation.degraded_reason),
-            partial=is_partial_coverage(evaluation.degraded_reason),
+            partial=evaluation.degraded_reason in PUBLISHABLE_DEGRADATIONS,
         ),
     )
     return board.upsert_section(body, "elder", "\n".join(parts).strip())
@@ -2096,8 +2218,18 @@ def _resolve_result(
     return "pass" if evaluation.passed else "fail"
 
 
+def _lead_if_degraded(summary: str, evaluation: CodeReviewEvaluation) -> str:
+    """grug#1212: a degraded summary's first line says so and how to re-run,
+    ahead of everything else (intent paragraph, deep preamble). A clean or
+    `no_diff` summary is returned unchanged."""
+    if not is_real_degradation(evaluation.degraded_reason):
+        return summary
+    return lead_with_degraded_line(summary, str(evaluation.degraded_reason))
+
+
 def _publish_shape(
     evaluation: CodeReviewEvaluation, *, mode: ReviewMode,
+    degraded_fails_closed: bool = False,
 ) -> tuple[CheckConclusion, ReviewEvent]:
     """Single source of truth for the advisory-vs-blocking gate.
 
@@ -2106,10 +2238,23 @@ def _publish_shape(
     of bug where the check-run says "failure" but the inline review
     says "COMMENT" (or vice-versa) because the two if/else branches
     drifted.
+
+    `degraded_fails_closed` (grug#1212, ADR-0023) is Elder's: a required
+    check that concludes `neutral` passes on GitHub, so in BLOCK mode a
+    degraded Elder review (every model failed, a parse failure, a partial
+    or low-confidence review) concludes `failure`. The event stays
+    `COMMENT`: a degraded review is not a verdict to request changes on.
+    `no_diff` is not a degradation (nothing to review) and keeps neutral.
+    Guard and Smasher share this gate and do not opt in.
     """
-    # Any degraded evaluation (LLM outage, parse failure, empty diff)
-    # forces advisory regardless of mode — Elder cannot block a PR on
-    # infrastructure flakiness or a non-reviewable shape.
+    if (
+        degraded_fails_closed
+        and mode == "blocking"
+        and is_real_degradation(evaluation.degraded_reason)
+    ):
+        return "failure", "COMMENT"
+    # Otherwise a degraded evaluation (LLM outage, parse failure, empty
+    # diff) forces advisory regardless of mode.
     if mode == "advisory" or evaluation.degraded_reason:
         return "neutral", "COMMENT"
     if evaluation.conclusion == "failure":
@@ -2167,6 +2312,7 @@ def _build_review_result(
     precedent_notes: dict[str, str] | None = None,
     repo_config: RepoConfig | None = None,
     file_contents: dict[str, str] | None = None,
+    persona: str = "elder",
 ) -> tuple[ReviewResult | None, tuple[Finding, ...]]:
     """Build the ReviewResult, or (None, ()) if nothing NEW to post.
 
@@ -2189,7 +2335,7 @@ def _build_review_result(
     `file_contents` is the head text dispatch already loaded. Every fix is
     offered as a committable block only after `checked_suggestion` (#1149)
     verifies it against that text; a file with no loaded text gets prose."""
-    if evaluation.degraded_reason not in (None, "", "partial_review"):
+    if evaluation.degraded_reason not in (None, "", *PUBLISHABLE_DEGRADATIONS):
         return None, ()
     new_findings = dedup_findings(evaluation.findings, prior_keys)
     # Complexity is summary advice by default. An inline thread requires a
@@ -2226,6 +2372,7 @@ def _build_review_result(
         body=(
             f'<img src="{_PERSONA_PORTRAIT}" width="46" align="left" alt="Grug {_PERSONA}" />'
             f"\n\n**Grug {_PERSONA}** gaze upon your PR · {len(comments)} finding(s)"
+            f"\n\n{_REVIEW_PERSONA_TAG.format(persona)}"
         ),
         comments=comments,
     ), new_findings
@@ -2492,7 +2639,7 @@ def _attach_linked_issue_context(
     try:
         linked = build_linked_issue_context(
             str(pr_context.get("body") or ""),
-            fetch_issue=build_issue_fetcher(
+            fetch_issue=build_issue_details_fetcher(
                 installation_id=installation_id, owner=owner, repo=repo_name,
             ),
             owner=owner,
@@ -2513,19 +2660,65 @@ def _attach_linked_issue_context(
 
 def _linked_issue_summary_note(linked_context: str) -> str:
     """Summarize which linked issue criteria were included in the review."""
-    if not linked_context:
+    criteria = rendered_criteria(linked_context)
+    if not criteria:
         return ""
-    issue_numbers = list(dict.fromkeys(
-        re.findall(r"^#(\d+) criterion ", linked_context, re.M),
-    ))
-    criteria_count = len(re.findall(r"^#\d+ criterion \d+ ", linked_context, re.M))
-    if not issue_numbers:
-        return ""
+    issue_numbers = list(dict.fromkeys(issue for issue, _, _ in criteria))
     return (
         "\n\nLinked issue criteria read: "
         + ", ".join(f"#{number}" for number in issue_numbers)
-        + f" ({criteria_count} criteria)."
+        + f" ({len(criteria)} criteria)."
     )
+
+
+def _merge_criteria_coverage(
+    evaluation: CodeReviewEvaluation, hunks: tuple[DiffHunk, ...],
+    file_contents: dict[str, str], pr_context: PrContext, *,
+    correctness_only: bool,
+) -> CodeReviewEvaluation:
+    """Merge the deterministic criteria-coverage findings (#1179).
+
+    Only criteria of issues the PR CLOSES count: a `Refs`/`Part of` link
+    may be one slice of several and is not expected to meet them all.
+    Dead-code findings follow the correctness-only scope the LLM's do."""
+    body = str(pr_context.get("body") or "")
+    closed = set(closes_refs(body))
+    criteria = tuple(
+        LinkedCriterion(issue, number, text)
+        for issue, number, text in rendered_criteria(
+            str(pr_context.get("linked_issue_context") or ""),
+        )
+        if issue in closed
+    )
+    found = scan_criteria_coverage(
+        hunks, file_contents, criteria=criteria,
+        pr_title=str(pr_context.get("title") or ""), pr_body=body,
+    )
+    if correctness_only:
+        found = tuple(f for f in found if f.rule_name != "dead-code")
+    return with_extra_findings(
+        evaluation, filter_novel_claim_findings(found, evaluation.findings),
+    )
+
+
+def _filter_intent_mismatches(
+    evaluation: CodeReviewEvaluation, *, installation_id: int,
+    owner: str, repo_name: str, pull_number: int,
+) -> CodeReviewEvaluation:
+    """Apply the deterministic intent-mismatch evidence filter (#1170)."""
+    kept, dropped, lowered = filter_intent_mismatch_findings(evaluation.findings)
+    if dropped or lowered:
+        evaluation = with_findings(evaluation, kept)
+        log.info(
+            "code_review_intent_filter",
+            extra={
+                "installation_id": installation_id,
+                "pr": f"{owner}/{repo_name}#{pull_number}",
+                "dropped": dropped,
+                "lowered": lowered,
+            },
+        )
+    return evaluation
 
 
 def dispatch_code_review(
@@ -2540,9 +2733,10 @@ def dispatch_code_review(
     verdict survives.
 
     Returns a structured-log dict; never raises a wire-level
-    exception — LLM outages, parse errors, and publish failures all
-    degrade to advisory neutral so this persona cannot 500 the
-    webhook handler.
+    exception - LLM outages, parse errors, and publish failures all
+    degrade to a published degraded check (neutral in advisory mode,
+    failure in blocking mode, grug#1212 / ADR-0023) so this persona
+    cannot 500 the webhook handler.
 
     `cancel_event` (#635 follow-up): passed straight through to
     `review_diff`, which aborts an in-flight Cave arm call the moment it
@@ -2691,6 +2885,9 @@ def dispatch_code_review(
             living_range = ""
         pr_context["base_sha"] = living_prior_sha or base_sha
         hunks = parse_diff(diff_text)
+        # Criteria coverage (#1179) judges the WHOLE diff; any hunk dropped
+        # below (excluded, ignored, oversized, duplicate) voids that.
+        parsed_hunk_count = len(hunks)
         paths = tuple(hunk.file_path for hunk in hunks)
         def is_documentation(path: str) -> bool:
             path = path.lower()
@@ -2796,8 +2993,8 @@ def dispatch_code_review(
             check_summary: str | None = (
                 "GitHub refused to serve this pull request's diff (HTTP 406): "
                 "it is over the API's diff size limit. Split the change into "
-                "smaller pull requests to get an Elder review. Advisory "
-                "neutral - PR merge is not blocked."
+                "smaller pull requests to get an Elder review. "
+                + gate_sentence(blocking)
             )
             verdict_summary = (
                 "Grug could not look - diff is over GitHub's size limit"
@@ -2808,7 +3005,7 @@ def dispatch_code_review(
             verdict_summary = "Grug could not look — diff fetch/parse failed"
         degraded = _publish_degraded(
             installation_id, owner, repo_name, pull_number, head_sha,
-            reason=reason, summary=check_summary,
+            reason=reason, summary=check_summary, blocking=blocking,
         )
         # Errored Activity row (PRD #301): Grug couldn't even fetch/parse the
         # diff — record it so it surfaces as `errored` (re-runnable in S3a),
@@ -2819,7 +3016,7 @@ def dispatch_code_review(
             repo=f"{owner}/{repo_name}",
             pr_number=pull_number,
             head_sha=head_sha,
-            conclusion="neutral",
+            conclusion=degraded_conclusion(blocking),
             summary=verdict_summary,
             findings_count=0,
             blocking=blocking,
@@ -3020,6 +3217,15 @@ def dispatch_code_review(
         evaluation,
     )
 
+    # #1170: deterministic evidence filter for intent-mismatch findings.
+    evaluation = _filter_intent_mismatches(
+        evaluation,
+        installation_id=installation_id,
+        owner=owner,
+        repo_name=repo_name,
+        pull_number=pull_number,
+    )
+
     # NOTE (#466, ADR-0012): the deterministic security suite (SAST + SCA +
     # secret + IaC scans -> exploitability judge) that used to merge into
     # THIS evaluation now runs as the GUARD persona with its own check-run
@@ -3166,6 +3372,22 @@ def dispatch_code_review(
             },
         )
 
+    # Deterministic criteria coverage (#1179): a new function nothing calls,
+    # and closing-issue criteria no hunk can satisfy. Pure; never aborts.
+    # A living delta or a narrowed hunk set hides callers and runtime
+    # hunks, so the check runs only when Elder saw the whole diff.
+    try:
+        if not living_range and len(hunks) == parsed_hunk_count:
+            evaluation = _merge_criteria_coverage(
+                evaluation, hunks, file_contents, pr_context,
+                correctness_only=correctness_only,
+            )
+    except Exception as e:  # noqa: BLE001 - enrichment must never abort a review
+        log.info(
+            "code_review_criteria_coverage_failed",
+            extra={"pr": f"{owner}/{repo_name}#{pull_number}", "kind": type(e).__name__},
+        )
+
     # Durable reviews can spend several minutes in inference. Re-check the
     # complete input after reasoning so changes to code, base, or intent cannot
     # publish a result for an obsolete snapshot. The durable caller enqueues the
@@ -3197,7 +3419,9 @@ def dispatch_code_review(
 
     # Both clients are independent — a 5xx on review post must not
     # skip the check-run post.
-    conclusion, event = _publish_shape(evaluation, mode=mode)
+    conclusion, event = _publish_shape(
+        evaluation, mode=mode, degraded_fails_closed=True,
+    )
     depth_now = os.getenv("GRUG_REVIEW_DEPTH", "tiered").strip().lower()
     tier1_phase: Literal["tier1", "deep", "dual"] = (
         "tier1" if depth_now == "tiered" else "dual"
@@ -3211,6 +3435,7 @@ def dispatch_code_review(
         living_baseline_rejected=living_baseline_rejected,
         review_phase=tier1_phase,
         defensive_dropped_count=defensive_dropped_count,
+        blocking=blocking,
     )
     summary = _intent_paragraph(pr_context) + summary
     if ruff_policy_dropped:
@@ -3230,6 +3455,7 @@ def dispatch_code_review(
         pull_number=pull_number, conclusion=conclusion, title=title,
         summary=summary,
     )
+    summary = _lead_if_degraded(summary, evaluation)
     check_result = CheckRunResult(
         name=_CHECK_NAME,
         head_sha=head_sha,
@@ -3277,7 +3503,7 @@ def dispatch_code_review(
     precedent_notes = (
         _precedent_notes_for(f"{owner}/{repo_name}", evaluation.findings)
         if evaluation.findings
-        and evaluation.degraded_reason in (None, "", "partial_review")
+        and evaluation.degraded_reason in (None, "", *PUBLISHABLE_DEGRADATIONS)
         else {}
     )
     review_result, posted_findings = _build_review_result(
@@ -3317,6 +3543,23 @@ def dispatch_code_review(
                 review_publish_rejected = True
             else:
                 review_publish_failed = True
+
+    # A blocking review from an earlier commit stays GitHub's standing verdict
+    # until it is dismissed; a clean re-review alone does not clear it.
+    # Withdraw it only when the FINAL verdict is clean: a degraded run read
+    # nothing, `conclusion` already folds in earlier findings still open
+    # (carry-forward), and `listed_threads is None` means that fold could not
+    # run, so a living-range review cannot vouch for the commits it skipped.
+    if (
+        not evaluation.degraded_reason
+        and evaluation.conclusion != "failure"
+        and conclusion != "failure"
+        and listed_threads is not None
+        and not check_publish_failed
+    ):
+        _dismiss_stale_blocks(
+            installation_id, owner, repo_name, pull_number, head_sha,
+        )
 
     # Capture inline-comment IDs for later reaction polling (#247). BEST-
     # EFFORT, post-publish, own try/except — a capture failure must never
@@ -3682,7 +3925,8 @@ def _async_deep_decision(
         check_publish_failed
         or not _async_deep_enabled()
         or depth != "tiered"
-        or evaluation.degraded_reason not in (None, "", "no_diff", "partial_review")
+        or evaluation.degraded_reason
+        not in (None, "", "no_diff", *PUBLISHABLE_DEGRADATIONS)
         or (cancel_event is not None and cancel_event.is_set())
     )
     if unavailable:
@@ -3822,6 +4066,59 @@ def _publish_deep_check(
                 "kind": type(error).__name__,
             },
         )
+
+
+def _dismiss_stale_blocks(
+    installation_id: int, owner: str, repo_name: str, pull_number: int,
+    head_sha: str,
+) -> int:
+    """Dismiss Elder's own REQUEST_CHANGES reviews on earlier commits.
+
+    Best-effort: a failure is logged and never changes the review outcome.
+    Matches only reviews by the Grug app itself that carry the
+    `persona=elder` tag, so a Guard or Smasher block, a human's review, and
+    another bot quoting the tag all stay untouched. Returns how many were
+    dismissed.
+    """
+    pr = f"{owner}/{repo_name}#{pull_number}"
+    tag = _REVIEW_PERSONA_TAG.format("elder")
+    dismissed = 0
+    try:
+        reviews = with_install_token_retry(
+            installation_id,
+            lambda token: list_reviews(
+                token, owner, repo_name, pull_number=pull_number,
+            ),
+        )
+        for review in reviews:
+            if (
+                review.get("state") != "CHANGES_REQUESTED"
+                or not is_grug((review.get("user") or {}).get("login"))
+                or tag not in (review.get("body") or "")
+                or review.get("commit_id") == head_sha
+            ):
+                continue
+            review_id = review["id"]
+            with_install_token_retry(
+                installation_id,
+                lambda token, rid=review_id: dismiss_review(
+                    token, owner, repo_name, pull_number=pull_number,
+                    review_id=rid,
+                    message=(
+                        f"Superseded: Elder re-reviewed {head_sha[:7]} and "
+                        "found nothing blocking."
+                    ),
+                ),
+            )
+            dismissed += 1
+    except (httpx.HTTPStatusError, httpx.RequestError) as e:
+        log.warning(
+            "elder_stale_block_dismiss_failed",
+            extra={"pr": pr, "kind": type(e).__name__, **_http_error_detail(e)},
+        )
+    if dismissed:
+        log.info("elder_stale_blocks_dismissed", extra={"pr": pr, "count": dismissed})
+    return dismissed
 
 
 def _capture_review_comments(
@@ -3980,7 +4277,9 @@ def _publish_deep_review(
     # Use combined_eval (Tier-1 + deep) so the stack preserves all findings,
     # severity, and actionable counts - not just novel_deep.
     try:
-        conclusion, _ = _publish_shape(combined_eval, mode=mode)
+        conclusion, _ = _publish_shape(
+            combined_eval, mode=mode, degraded_fails_closed=True,
+        )
         stack_body = _review_stack_body(
             combined_eval,
             conclusion=conclusion,
@@ -4207,13 +4506,16 @@ def _async_deep_append_if_needed(
     # ground the deep arm never finished walking.
     combined = with_degradation(combined, deep_eval)
 
-    conclusion, event = _publish_shape(combined, mode=mode)
+    conclusion, event = _publish_shape(
+        combined, mode=mode, degraded_fails_closed=True,
+    )
     title, summary = _summary_markdown(
         combined,
         suppressed_count=deep_suppressed_count,
         living_range=living_range,
         living_baseline_rejected=living_baseline_rejected,
         review_phase="deep",
+        blocking=blocking,
     )
     summary = _intent_paragraph(pr_context) + summary
     summary += config_note
@@ -4234,6 +4536,7 @@ def _async_deep_append_if_needed(
         )
     )
     summary = f"{preamble}\n\n{summary}"
+    summary = _lead_if_degraded(summary, combined)
     _publish_deep_check(
         installation_id=installation_id,
         owner=owner,
@@ -4289,15 +4592,20 @@ def _async_deep_append_if_needed(
 def _publish_degraded(
     installation_id: int, owner: str, repo_name: str, pull_number: int,
     head_sha: str, *, reason: str, summary: str | None = None,
+    blocking: bool = False,
 ) -> dict[str, str]:
-    """Post the "skipped" check-run when fetch/parse fails. Best-effort —
+    """Post the "skipped" check-run when fetch/parse fails. Best-effort -
     a publish failure here is also swallowed since we can't do anything
-    useful with it (would need its own degraded publish, etc)."""
+    useful with it (would need its own degraded publish, etc).
+
+    grug#1212: concludes `failure` when the repo's Elder is blocking (no
+    review happened, and a neutral required check would pass), `neutral`
+    in WARN mode; the summary leads with the degraded line either way."""
     title = f"WARN Elder review skipped ({reason})"
-    summary = summary or (
-        f"Elder could not run this pass: `{reason}`. Advisory neutral "
-        "— PR merge is not blocked."
-    )
+    summary = lead_with_degraded_line(summary or (
+        f"Elder could not run this pass: `{reason}`. " + gate_sentence(blocking)
+    ), reason)
+    conclusion = degraded_conclusion(blocking)
     publish_failed = False
     try:
         with_install_token_retry(
@@ -4306,7 +4614,7 @@ def _publish_degraded(
                 token, owner, repo_name,
                 CheckRunResult(
                     name=_CHECK_NAME, head_sha=head_sha, status="completed",
-                    conclusion="neutral", title=title, summary=summary,
+                    conclusion=conclusion, title=title, summary=summary,
                 ),
                 external_id=(
                     f"grug-cr:{owner}/{repo_name}#{pull_number}:{head_sha}"

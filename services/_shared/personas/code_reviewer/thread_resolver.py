@@ -123,7 +123,7 @@ def _graphql(token: str, query: str, variables: dict[str, Any]) -> dict:
     return payload.get("data") or {}
 
 
-def _is_grug(login: str | None) -> bool:
+def is_grug(login: str | None) -> bool:
     return (login or "").removesuffix("[bot]") == _BOT_LOGIN
 
 
@@ -154,11 +154,11 @@ def _only_grug_comments(thread: dict, pr_author: str | None = None) -> list[dict
     nodes = comments.get("nodes") or []
     if not nodes or int(comments.get("totalCount") or 0) > len(nodes):
         return None
-    if not _is_grug((nodes[0].get("author") or {}).get("login")):
+    if not is_grug((nodes[0].get("author") or {}).get("login")):
         return None
     for c in nodes[1:]:
         login = (c.get("author") or {}).get("login")
-        if _is_grug(login):
+        if is_grug(login):
             continue
         # A deleted account's comment has no login; without the `not
         # pr_author` check it would match an unknown author (None == None).
@@ -224,12 +224,12 @@ def _blocked_by_person_reply(thread: dict, pr_author: str | None) -> bool:
     nodes = comments.get("nodes") or []
     if not nodes or int(comments.get("totalCount") or 0) > len(nodes):
         return False
-    if not _is_grug((nodes[0].get("author") or {}).get("login")):
+    if not is_grug((nodes[0].get("author") or {}).get("login")):
         return True
     prefix = _FIXED_REPLY_PREFIX.lower()
     for c in nodes[1:]:
         login = (c.get("author") or {}).get("login")
-        if _is_grug(login):
+        if is_grug(login):
             continue
         if not pr_author or login != pr_author:
             return True

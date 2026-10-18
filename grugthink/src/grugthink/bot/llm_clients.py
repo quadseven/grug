@@ -39,28 +39,44 @@ session = requests.Session()
 # grug-elder's review pipeline was already emitting real ml_app:grug-elder
 # spans, but Discord chat was invisible in the DD LLM Obs UI because there
 # was genuinely nothing shipping, not because of a filter/view issue.
-try:  # pragma: no cover — import-time guard
-    from ddtrace.llmobs import LLMObs as _LLMObs
+# GRUG_DATADOG_ENABLED (off by default, grug#1208) gates both seams: off
+# means a no-op span and no SDK call, so a disabled LLMObs does not log a
+# warning per reply and nothing is queued for an agent that is gone.
+_DATADOG_SWITCH = "GRUG_DATADOG_ENABLED"
 
-    def _llmobs_llm(**kwargs: Any) -> Any:
-        return _LLMObs.llm(**kwargs)
 
-    def _llmobs_annotate(**kwargs: Any) -> None:
-        _LLMObs.annotate(**kwargs)
-except ImportError:  # pragma: no cover — local dev without ddtrace
+def _datadog_enabled() -> bool:
+    return os.getenv(_DATADOG_SWITCH, "").strip().lower() in ("1", "true", "yes", "on")
 
-    class _NoopSpan:
-        def __enter__(self) -> "_NoopSpan":
-            return self
 
-        def __exit__(self, *a: Any) -> bool:
-            return False
+class _NoopSpan:
+    def __enter__(self) -> "_NoopSpan":
+        return self
 
-    def _llmobs_llm(**kwargs: Any) -> Any:
+    def __exit__(self, *a: Any) -> bool:
+        return False
+
+
+_LLMObs: Any = None
+try:  # pragma: no cover - import-time guard
+    from ddtrace.llmobs import LLMObs as _LLMObsSdk
+
+    _LLMObs = _LLMObsSdk
+except ImportError:  # pragma: no cover - local dev without ddtrace
+    pass
+
+
+def _llmobs_llm(**kwargs: Any) -> Any:
+    if _LLMObs is None or not _datadog_enabled():
         return _NoopSpan()
+    return _LLMObs.llm(**kwargs)
 
-    def _llmobs_annotate(**kwargs: Any) -> None:
+
+def _llmobs_annotate(**kwargs: Any) -> None:
+    if _LLMObs is None or not _datadog_enabled():
         return None
+    _LLMObs.annotate(**kwargs)
+    return None
 
 
 _LLMOBS_NAME = "grugthink_chat_reply"

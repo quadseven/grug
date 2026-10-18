@@ -163,30 +163,32 @@ export function useActivity(installId: number | undefined, verdict?: string) {
   });
 }
 
+// The writable repo-config booleans the dashboard sends. `tpm_enabled` is
+// always sent (the payload's original required field); every other key is
+// optional and omitted keys are left alone by the API (sparse merge).
+export type RepoConfigPatch = Partial<Pick<RepoConfig,
+  | "guard_enabled" | "guard_blocking"
+  | "code_reviewer_enabled" | "code_reviewer_blocking"
+  | "warder_enabled" | "warder_gate_blocking"
+  | "smasher_enabled"
+  | "dep_watch_enabled" | "reopen_watch_enabled" | "guard_hygiene_watch_enabled"
+>>;
+
 export function useSetRepoConfig(installId: number) {
   const qc = useQueryClient();
   return useMutation({
-    mutationFn: (vars: {
-      repo_id: number;
-      tpm_enabled: boolean;
-      guard_enabled?: boolean;
-      dep_watch_enabled?: boolean;
-      reopen_watch_enabled?: boolean;
-      guard_hygiene_watch_enabled?: boolean;
-    }) =>
-      api(`/api/v1/installations/${installId}/repos/${vars.repo_id}/config`, {
-        method: "PUT",
-        headers: { "Content-Type": "application/json" },
-        // tpm_enabled is required by the payload model; the rest are
-        // optional (omitted = leave the stored value alone, sparse merge).
-        body: JSON.stringify({
-          tpm_enabled: vars.tpm_enabled,
-          ...(vars.guard_enabled !== undefined ? { guard_enabled: vars.guard_enabled } : {}),
-          ...(vars.dep_watch_enabled !== undefined ? { dep_watch_enabled: vars.dep_watch_enabled } : {}),
-          ...(vars.reopen_watch_enabled !== undefined ? { reopen_watch_enabled: vars.reopen_watch_enabled } : {}),
-          ...(vars.guard_hygiene_watch_enabled !== undefined ? { guard_hygiene_watch_enabled: vars.guard_hygiene_watch_enabled } : {}),
-        }),
-      }),
+    mutationFn: ({ repo_id, tpm_enabled, ...patch }: { repo_id: number; tpm_enabled: boolean } & RepoConfigPatch) =>
+      api<{ repo_id: number; full_name: string; config: RepoConfig }>(
+        `/api/v1/installations/${installId}/repos/${repo_id}/config`,
+        {
+          method: "PUT",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({
+            tpm_enabled,
+            ...Object.fromEntries(Object.entries(patch).filter(([, v]) => v !== undefined)),
+          }),
+        },
+      ),
     onSuccess: () => qc.invalidateQueries({ queryKey: ["installations", installId, "repos"] }),
   });
 }

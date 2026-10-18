@@ -369,11 +369,14 @@ def evaluate_diff(
     # `max_cohorts` truncated the plan before it ran, #813/#707), but the
     # check must say coverage was partial and stay advisory. The inline
     # findings are still valid, diff-anchored evidence.
-    degraded_reason = (
-        "partial_review"
-        if llm_response.error[:15] == "partial review:"
-        else None
-    )
+    # grug#1097: a short empty answer kept because no other model answered
+    # is a clean result, but not a trusted one. Partial coverage outranks it.
+    if llm_response.error[:15] == "partial review:":
+        degraded_reason: str | None = "partial_review"
+    elif llm_response.error[:15] == "low confidence:":
+        degraded_reason = "low_confidence_review"
+    else:
+        degraded_reason = None
     return CodeReviewEvaluation(
         findings=kept_findings,
         # SAME rule with_extra_findings/with_findings use (_derive_conclusion):

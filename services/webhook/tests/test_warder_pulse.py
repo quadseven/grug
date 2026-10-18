@@ -8,10 +8,19 @@ from __future__ import annotations
 from unittest.mock import patch
 
 import httpx
+import pytest
 
 from personas.warder import dispatch as warder
 from personas.warder import slo_gate
 from personas.pulse import nudge as pulse
+
+
+@pytest.fixture(autouse=True)
+def _datadog_switch_on(monkeypatch):
+    """These tests pin the Datadog integration's own behavior, which only
+    runs with GRUG_DATADOG_ENABLED on (#1208). The off path is pinned in
+    test_datadog_switch.py."""
+    monkeypatch.setenv("GRUG_DATADOG_ENABLED", "true")
 
 
 # ── Warder: pure grouping/semver ──────────────────────────────────────

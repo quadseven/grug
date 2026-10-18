@@ -446,8 +446,10 @@ def test_hot_review_cancels_when_snapshot_moves_during_quiet_window(monkeypatch)
 def test_hot_review_gives_up_at_entry_once_the_redrive_cap_is_exhausted(monkeypatch):
     """grug#773 AC3: a review discarded and re-enqueued against the SAME
     head_sha _MAX_INTENT_DRIFT_REDRIVES times running gives up with a
-    terminal neutral check instead of looping forever - the backstop for a
-    PR whose title/body keeps changing faster than Elder can finish."""
+    terminal check instead of looping forever - the backstop for a PR whose
+    title/body keeps changing faster than Elder can finish. WARN mode here
+    (neutral); BLOCK mode fails closed, see
+    test_elder_degraded_fail_closed.py (grug#1212)."""
     pulls = iter((
         _pr_data(head_sha="same-head", title="Before"),
         _pr_data(head_sha="same-head", title="After"),
@@ -466,6 +468,7 @@ def test_hot_review_gives_up_at_entry_once_the_redrive_cap_is_exhausted(monkeypa
         lambda token, owner, repo, result, external_id=None: posted.append(result) or {"id": 1},
     )
     acquire, complete, release = _patch_hot_claims(monkeypatch)
+    monkeypatch.setattr(rerun, "get_repo_config", lambda iid, rid: {})
     monkeypatch.setattr(rerun.time, "sleep", lambda seconds: None)
     requeue = MagicMock()
     monkeypatch.setattr(rerun, "_enqueue_current_review", requeue)

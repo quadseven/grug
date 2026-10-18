@@ -38,6 +38,15 @@ evidence contradicts:
   ``quote(..., safe='')`` sat inline on the very line cited. The
   suggestion said "validate"/"allowlist", which appears nowhere, so no
   token matched and all three shipped.
+- ``collection_lockstep``: a ``caller-not-updated`` claim whose only
+  evidence is that one collection grew, so a SECOND collection must grow
+  in lockstep (registry gained an entry, therefore the allowlist must
+  too), anchored on a line that is not a def/raise/return. The rule is
+  scoped to a changed signature, return shape or raise; two lists that
+  share vocabulary do not share a membership rule. Live instance (#763):
+  PR #762 grew the DoR rule registry and Elder demanded the persona-purity
+  call-target allowlist grow with it, while the new rule dispatches inside
+  ``run_all`` and the purity attester passed on the reviewed head.
 
 Inconclusive is NOT a kill: a missing file, an unparseable module, a
 module-level line, or a suggestion with no code tokens all keep the
@@ -66,7 +75,7 @@ if TYPE_CHECKING:  # import cycle guard: persona imports nothing from here
 class KilledFinding:
     finding: "Finding"
     # "non_code_file" | "sync_context" | "fix_already_present" |
-    # "fix_block_present" | "mitigation_present"
+    # "fix_block_present" | "mitigation_present" | "collection_lockstep"
     reason: str
 
 
@@ -159,6 +168,67 @@ def _all_interpolations_sanitized(line: str) -> bool | None:
         ):
             return False
     return True
+
+
+# collection_lockstep (#763). The rule this kill is scoped to: a changed
+# signature, return shape or raise with a stale caller.
+_CALLER_NOT_UPDATED = "caller-not-updated"
+
+# Collection nouns. The kill needs TWO mentions: the lockstep shape names
+# the list that grew AND the list that supposedly must follow it. One
+# collection plus its consumer (an enum gained a member that a match does
+# not handle) is a different claim and is kept.
+_COLLECTION_NOUN_RE = re.compile(
+    r"(?<![a-z0-9])(?:allow-?list|allowed list|deny-?list|white-?list"
+    r"|registry|list|set|frozenset|tuple|enum|mapping)(?![a-z0-9])"
+)
+
+# Lockstep-growth vocabulary: "A grows, so B must also add ...".
+_LOCKSTEP_RE = re.compile(
+    r"(?<![a-z0-9])(?:grows?|grew|grown|lockstep|in step|must also"
+    r"|also (?:add|include|list|name)s?|still (?:names|lists|has|holds)"
+    r" only|still only)(?![a-z0-9])"
+)
+
+# The rule's REAL shape. Any of these in the message means the claim may be
+# about a signature/return/raise change, so the kill never applies.
+_SIGNATURE_CLAIM_RE = re.compile(
+    r"(?<![a-z0-9])(?:signature|arguments?|args?|parameters?|params?"
+    r"|kwargs?|keyword|positional|arity|returns?|returned|returning"
+    r"|raises?|raised|raising|exceptions?|throws?|thrown)(?![a-z0-9])"
+)
+
+# An anchored line that defines a callable or changes what it raises or
+# returns may be the rule's real shape, whatever the message says.
+_SIGNATURE_LINE_RE = re.compile(
+    r"^\s*(?:async\s+def|def|class|function|func|fn|raise|return|throw)\b"
+    r"|\blambda\b|=>"
+)
+
+
+def _kills_as_collection_lockstep(finding: "Finding", source: str) -> bool:
+    """A caller-not-updated claim that is really "list A grew, so list B
+    must grow" (#763, the PR #762 marking).
+
+    Every condition must hold, so the kill only fires on the lockstep shape:
+    the rule is caller-not-updated, the message names two collections and a
+    lockstep-growth phrase, the message names no signature/return/raise
+    change, and the anchored line (which the rule requires to be the changed
+    signature or raise) is none of those either.
+    """
+    if finding.rule_name != _CALLER_NOT_UPDATED:
+        return False
+    message = finding.message.lower()
+    if _SIGNATURE_CLAIM_RE.search(message):
+        return False
+    if len(_COLLECTION_NOUN_RE.findall(message)) < 2:
+        return False
+    if not _LOCKSTEP_RE.search(message):
+        return False
+    lines = source.splitlines()
+    if not 1 <= finding.line <= len(lines):
+        return False  # anchor outside the snapshot - inconclusive, keep
+    return not _SIGNATURE_LINE_RE.search(lines[finding.line - 1])
 
 
 def _is_prose_file(path: str) -> bool:
@@ -377,6 +447,12 @@ def _verify_one(finding: "Finding", contents: dict[str, str]) -> str | None:
     # line where EVERY interpolation is wrapped can contradict the claim.
     if _kills_as_mitigation_present(finding, source):
         return "mitigation_present"
+
+    # Collection-lockstep kill (#763): "registry grew, so the allowlist must
+    # grow" is not a stale caller. Needs the source so the anchored line can
+    # be checked for a real signature/raise/return change.
+    if _kills_as_collection_lockstep(finding, source):
+        return "collection_lockstep"
 
     return None
 

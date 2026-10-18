@@ -181,10 +181,11 @@ def create(
                     {
                         # SSM reads. The stack's own `/grug/*`, the cross-repo
                         # Pulumi token at `/shared/*`, AND the shared `/infra/*`
-                        # params the PROGRAM reads at invoke time: the Datadog
-                        # provider creds (/infra/datadog/api_key + app_key), the
-                        # LLM keys (/infra/llm/*), and the Discord alert handle
-                        # (/infra/discord/*). Missing /infra here 403s every
+                        # params the PROGRAM reads at invoke time: the LLM keys
+                        # (/infra/llm/*). /infra/discord/* fed the Datadog
+                        # webhook integration and is unread since the stack
+                        # stopped managing Datadog (#1223); the Datadog creds
+                        # grant (/infra/datadog/*) went with it. Missing /infra here 403s every
                         # `pulumi up` at program-eval before any apply - the
                         # first deploy that RUNS under the scoped role dies (the
                         # initial scope-down deploy passed only because it ran
@@ -195,7 +196,6 @@ def create(
                         "Resource": [
                             "arn:aws:ssm:*:*:parameter/grug/*",
                             "arn:aws:ssm:*:*:parameter/shared/*",
-                            "arn:aws:ssm:*:*:parameter/infra/datadog/*",
                             "arn:aws:ssm:*:*:parameter/infra/llm/*",
                             "arn:aws:ssm:*:*:parameter/infra/discord/*",
                             # Roles Anywhere tenant ARNs (#388): deploy.k8s.yml
@@ -236,12 +236,10 @@ def create(
                         # this role's POV — Pulumi for `/shared/*` lives
                         # in infrastructure/pulumi/aws-cicd-bootstrap).
                         #
-                        # Spec 0013 (RumInstrumentation) needs PutParameter
-                        # so the dd_rum component can persist the
-                        # `datadog.RumApplication` ID + client token to
-                        # SSM after creation. Caught when Pulumi #166's
-                        # iac.deploy got past the DD scope check but
-                        # failed with `AccessDeniedException: ssm:PutParameter`.
+                        # PutParameter was first needed by the dd_rum
+                        # component (spec 0013, retired in #1223); the
+                        # stack's own `/grug/*` operator toggles (e.g.
+                        # /grug/elder-prompt-experiment) still need it.
                         "Effect": "Allow",
                         "Action": [
                             "ssm:PutParameter",

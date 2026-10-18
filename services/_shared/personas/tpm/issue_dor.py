@@ -14,8 +14,8 @@ himself across surfaces.
 
 TWO CHECKS ARE DELIBERATELY EXCLUDED (`_ISSUE_CHECKS` below):
 
-  - `check_issue_link` requires `closes #N`. That is a PR asking "what
-    ticket does this close?". An issue closing another issue is not the
+  - `check_issue_link` wants a ticket link (`Refs #N`, `closes #N`, ...).
+    That is a PR asking "what ticket is this for?". An issue closing another issue is not the
     normal shape, and demanding it would fail nearly every ticket.
   - `check_linked_issue_completeness` walks a PR's linked issues. At
     issue time there is no PR and nothing to walk.

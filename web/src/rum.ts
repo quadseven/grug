@@ -9,8 +9,8 @@
 // (VITE_DD_RUM_APPLICATION_ID + VITE_DD_RUM_CLIENT_TOKEN). The
 // web.deploy.yml workflow reads them from SSM
 // (/grug/dd-rum-application-id, /grug/dd-rum-client-token) and exports
-// them before `npm run build`. The Pulumi datadog.RumApplication
-// resource owns the SSM values (spec 0013, component dd_rum.py).
+// them before `npm run build`. The SSM values were set by the Pulumi
+// dd_rum.py component, retired in #1223 (spec 0013).
 //
 // If credentials are missing (e.g. local `npm run dev` without env
 // vars), the init is skipped — RUM stays dark instead of throwing.
@@ -21,7 +21,14 @@ const clientToken = import.meta.env.VITE_DD_RUM_CLIENT_TOKEN;
 const env = import.meta.env.VITE_DD_RUM_ENV ?? "dev";
 const version = import.meta.env.VITE_DD_RUM_VERSION ?? "local";
 
+// grug#1208: Datadog is off unless the build sets VITE_GRUG_DATADOG_ENABLED
+// (web.deploy.yml maps the repo variable GRUG_DATADOG_ENABLED onto it).
+const datadogEnabled = import.meta.env.VITE_GRUG_DATADOG_ENABLED === "true";
+
 export function initRum(): void {
+  if (!datadogEnabled) {
+    return;
+  }
   if (!applicationId || !clientToken) {
     // Local dev path — leave a breadcrumb in the console but don't throw.
     console.info("[rum] init skipped — missing VITE_DD_RUM_APPLICATION_ID or VITE_DD_RUM_CLIENT_TOKEN");

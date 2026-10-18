@@ -282,6 +282,7 @@ def dispatch_guard_review(
         )
     review_result, _posted_findings = _build_review_result(
         evaluation, head_sha=head_sha, event=event, prior_keys=prior_keys,
+        persona="guard",
     )
     if review_result is not None:
         try:
