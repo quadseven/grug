@@ -4,12 +4,13 @@ Ported from scripts/tpm.py with the bullet-count regex tightened per
 quadseven/grug#20: empty `- [ ]` placeholders no longer count toward the
 >=3 minimum (security: an unfilled template should NOT pass).
 
-7 checks (per PRD #21 + memory `feedback_health_endpoint_standard`):
+8 checks (per PRD #21 + memory `feedback_health_endpoint_standard`):
   why          - ## Why >=5 words
   acceptance   - ## Acceptance criteria (or ## Test plan) >=3 NON-EMPTY bullets
   estimate     - Size: XS|S|M|L|XL anywhere in body
   scope-fence  - ## Out of scope present
   issue-link   - Refs #N / Refs owner/name#N / Part of #N / closes #N ... (advisory)
+  loom-footer  - a Loom-ticket PR carries the Loom audit footer (advisory)
   linked-issue-completeness - linked issue(s) have all non-exempt checkboxes ticked
   linked-issue-epic - every ticket the PR names is an epic or belongs to one (grug#1034)
 """
@@ -256,9 +257,11 @@ def check_loom_footer(body: str) -> CheckResult:
             "(`Loom ticket ..., lane ..., model ...`) - the dashboard cannot "
             "attribute this PR to a model",
         )
+    # Not skipped: the check DID run and found nothing to require. `skipped`
+    # means "could not be evaluated" (#782), and marking every non-Loom PR
+    # skipped would strip "all N checks" from nearly every Chief title.
     return CheckResult(
         "loom-footer", True, "not a Loom ticket PR; footer not required",
-        skipped=True,
     )
 
 

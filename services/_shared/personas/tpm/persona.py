@@ -122,6 +122,7 @@ _CHECK_DISPLAY: dict[str, str] = {
     "estimate": "how big",
     "scope-fence": "where stop",
     "issue-link": "which ticket",
+    "loom-footer": "loom mark",
     "linked-issue-completeness": "ticket done",
     "linked-issue-epic": "which epic",
 }

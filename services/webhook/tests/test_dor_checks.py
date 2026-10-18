@@ -146,15 +146,17 @@ def test_loom_footer_passes_when_present():
 
 
 def test_loom_footer_fails_for_loom_ticket_ref_without_footer():
-    body = "## Why\nx\n\nRefs quadseven/loom#510"
+    body = "## Why\nx\n\nRefs quadseven/loom#510"  # leak-guard-allow: loom is a public repo; this is the input the check parses
     r = check_loom_footer(body)
     assert r.name == "loom-footer"
     assert not r.passed
 
 
-def test_loom_footer_skipped_for_non_loom_pr():
+def test_loom_footer_passes_not_skipped_for_non_loom_pr():
+    # Not applicable is an earned pass, not a skip: `skipped` would drop
+    # "all N checks" from the Chief title of every non-Loom PR.
     r = check_loom_footer("## Why\nplain PR with no loom references")
-    assert r.passed and r.skipped
+    assert r.passed and not r.skipped
 
 
 def test_run_all_returns_8():

@@ -437,8 +437,8 @@ def test_recheck_fetch_failure_still_fails_open_but_visibly_skipped(_tpm_only):
     assert lic.passed is True and lic.skipped is True
 
     title, summary = tpm_persona._summary(list(recheck_eval.results))
-    assert "all 7 checks" not in title
-    assert "5/7 checks" in title and "ticket done, which epic skipped" in title
+    assert "all 8 checks" not in title
+    assert "6/8 checks" in title and "ticket done, which epic skipped" in title
     assert "| ticket done | skipped |" in summary
 
 
