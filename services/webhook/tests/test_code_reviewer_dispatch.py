@@ -2677,6 +2677,40 @@ def test_deep_review_publishes_and_captures_comment_records(monkeypatch):
     assert rec["author_login"] == "alice"
 
 
+def test_deep_review_includes_matching_precedent_citation(monkeypatch):
+    """Deep-arm findings receive ledger citations when a row matches."""
+    from personas.code_reviewer.persona import CodeReviewEvaluation, Finding
+
+    finding = Finding(
+        file="src/xray.py", line=2, severity="high", rule_name="deep-bug",
+        message="deep finding", suggestion=None,
+    )
+    monkeypatch.setattr(
+        "adapters.install_store.list_ledger_rows",
+        lambda repo, *a, **kw: [{
+            "repo": "owner/repo", "pr": 400, "reviewer": "reviewer",
+            "severity": "HIGH", "class": "deep-bug", "finding": "deep finding xray",
+            "verdict": "fixed", "evidence": "src/xray.py", "ts": "2026-06-10T00:00:00Z",
+        }],
+        raising=False,
+    )
+    captured = {}
+    monkeypatch.setattr(
+        cr_dispatch, "_build_review_result",
+        lambda evaluation, **kwargs: captured.update(kwargs) or (None, ()),
+    )
+    cr_dispatch._publish_deep_review(
+        CodeReviewEvaluation(findings=(finding,), conclusion="success"),
+        novel_deep=(finding,), head_sha="abc", event=MagicMock(),
+        all_prior=frozenset(), installation_id=1, owner="owner", repo_name="repo",
+        pull_number=2, deep_llm=_deep_llm_with_finding(), author_login="reviewer",
+        mode=MagicMock(), living_range="", deep_suppressed_count=0,
+        combined_eval=CodeReviewEvaluation(findings=(finding,), conclusion="success"),
+    )
+
+    assert "#400" in next(iter(captured["precedent_notes"].values()))
+
+
 def test_deep_review_capture_failure_does_not_change_result(monkeypatch):
     """#730: a capture failure (GH 5xx or DDB error) must be swallowed -
     the deep review already posted, so dispatch's outer result is unaffected.
