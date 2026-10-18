@@ -301,6 +301,30 @@ def test_cave_carries_require_keys_json_schema_others_keep_json_object(monkeypat
     assert sent["anthropic/claude-opus-4.7"] == "json_object"
 
 
+def test_cave_findings_are_bounded_like_production(monkeypatch):
+    """grug#989: on large diffs a Cave model emitted findings until the token
+    cap cut it off (truncated JSON of about 120k characters on three eval
+    cases, at both 8192 and 32768 output tokens). The schema's maxItems is
+    the bound guided decoding enforces, so a runaway list ends as valid JSON.
+    The bench must carry the same bound as production's Cave arms, or the eval
+    stops measuring the reviewer that actually runs."""
+    import llm_client
+    from sast_benchmark import backends
+
+    monkeypatch.setenv("GRUG_BENCH_CAVE_URL", "http://cave.example/v1/chat/completions")
+    monkeypatch.setenv("GRUG_BENCH_CAVE_MODEL", "qwen-coder")
+    configured = {b.name: b for b in backends.configured_backends()}
+    bench = configured["cave"].extra_body["response_format"]["json_schema"]["schema"]
+    prod = llm_client._CAVE_FINDINGS_RESPONSE_FORMAT["json_schema"]["schema"]
+
+    for schema in (bench, prod):
+        assert schema["properties"]["findings"]["maxItems"] == llm_client.CAVE_MAX_FINDINGS
+    # Above the most findings any eval case's ledger holds (36), and no more
+    # than the judge grades in one review, so the bound never drops a finding
+    # a real review would have kept.
+    assert 36 < llm_client.CAVE_MAX_FINDINGS <= llm_client.JUDGE_MAX_FINDINGS
+
+
 def test_cave_and_poolside_disable_thinking_openrouter_untouched(monkeypatch):
     """#894: production sends chat_template_kwargs.enable_thinking=False at
     three llm_client.py call sites; the Cave bench backend didn't, so a
