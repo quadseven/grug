@@ -25,7 +25,6 @@ from components import (
     cf_shared_secret,
     ddb_table,
     kms_cmk,
-    leak_guard_role,
     oidc_role,
     ssm_secrets,
 )
@@ -112,27 +111,11 @@ _deploy_role_bundle = oidc_role.create(
 )
 gha_deploy_role = _deploy_role_bundle.role
 
-# Read-only OIDC role for the private-leaks guard (grug#921). Separate from the
-# deploy role ON PURPOSE: the guard runs on `pull_request`, and trusting the
-# deploy role from that subject would let anyone who can open a PR assume a
-# principal that writes SSM, IAM and S3. This one can read exactly one
-# parameter. The parameter NAME is public (it is a path); its VALUE - the
-# people/product/codename terms with no generic shape - is the thing being
-# protected and is pre-loaded by hand per docs/HITL_PREREQUISITES.md, the same
-# way every other secret in this stack is. Since grug#1057,
-# .github/workflows/guard.private-leaks.yml reads the fleet's shared deny-list
-# through the shared LEAK_SCAN_ROLE_ARN role instead, so nothing assumes this
-# role any more; grug#1057 retires it.
-LEAK_GUARD_DENY_LIST_PARAM = "/grug/leak-guard-deny-list"
-_leak_guard_bundle = leak_guard_role.create(
-    name="grug-gha-leak-guard",
-    deny_list_param=LEAK_GUARD_DENY_LIST_PARAM,
-    # Both OIDC subject shapes, same reason as the deploy role above: the
-    # ID-anchored form is what a real token carries after the 2026-07-18
-    # account rename; the name form is kept for any legacy token shape.
-    repos=["quadseven/grug", "quadseven@59060157/grug@1227364190"],
-)
-gha_leak_guard_role = _leak_guard_bundle.role
+# The private-leaks guard's per-repo read role (grug-gha-leak-guard, grug#921)
+# was retired under grug#1057: the guard reads the fleet's shared deny-list
+# through the shared LEAK_SCAN_ROLE_ARN role, so nothing assumed it.
+# tests/test_leak_guard_retired.py keeps it from being declared again.
+
 # Sleep waiter that gates KMS-using Lambda Function ops on the deploy
 # role's IAM policy having propagated. Closes #88 — replaces workflow-
 # layer retry hack with in-IaC dependency edge.

@@ -131,8 +131,9 @@ containing spaces is matched as a whole phrase, so a full name stays one term.
 
 The per-repo predecessor (a `/grug/`-scoped parameter read through a
 `grug-gha-leak-guard` role) is retired under grug#1057: two copies of one list
-meant a term added to either was missing from the other. Its `infra/pulumi`
-declaration is the remaining half of that issue and is not removed here.
+meant a term added to either was missing from the other. The role is no
+longer declared in `infra/pulumi`; the next `pulumi up` deletes it. Deleting
+the old `/grug/`-scoped parameter itself is a one-off operator step.
 
 ## 4. Reserve the OIDC role for GitHub Actions deploy
 
