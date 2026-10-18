@@ -192,8 +192,9 @@ def _print_exclusion_notes(report: EvalReport) -> None:
         )
     if report.output_truncated_cases:
         print(
-            "  !! answer cut off at the output cap (scored on the complete "
-            "findings before the cut, grug#1231): "
+            "  !! answer cut off at the output cap or the findings bound "
+            "(scored on the complete findings before the cut, grug#1231, "
+            "grug#989): "
             f"{', '.join(report.output_truncated_cases)}"
         )
     if report.staged_cases:

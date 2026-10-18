@@ -1773,6 +1773,65 @@ def test_run_case_scores_an_answer_cut_off_at_the_output_cap(monkeypatch):
     assert baseline["backends"]["cave"]["output_truncated_cases"] == [case.case_id]
 
 
+def _cave_backend(monkeypatch):
+    """The bench's real Cave backend, so the test reads the bound from the
+    schema the run actually sends (grug#989)."""
+    from sast_benchmark import backends
+
+    monkeypatch.setenv("GRUG_BENCH_CAVE_URL", "http://cave.example/v1/chat/completions")
+    monkeypatch.setenv("GRUG_BENCH_CAVE_MODEL", "m")
+    return {b.name: b for b in backends.configured_backends()}["cave"]
+
+
+def test_run_case_names_a_cohort_stopped_at_the_findings_bound(monkeypatch):
+    """grug#989: the Cave schema's maxItems closes a runaway findings list as
+    valid JSON, so the cut-off recovery never fires. A cohort that returns
+    exactly the bound was stopped, not finished: the case scores on what it
+    wrote and the report must still name it. Fails without the bound check
+    (the replay reads as a complete answer)."""
+    from elder_eval import runner
+    from llm_client import CAVE_MAX_FINDINGS
+
+    monkeypatch.setattr(
+        runner, "_post",
+        lambda b, m: _bench_response([_finding("x.py")] * CAVE_MAX_FINDINGS),
+    )
+    (case,) = build_cases([_row(1, "correctness")])
+    replay = runner.run_case(_cave_backend(monkeypatch), case, _diff_for("x.py"))
+
+    assert replay.errored is False
+    assert replay.output_truncated is True
+    assert replay.emitted == {"correctness": CAVE_MAX_FINDINGS}
+    report = score([case], {case.case_id: replay})
+    assert report.output_truncated_cases == (case.case_id,)
+
+
+def test_run_case_below_the_findings_bound_is_a_complete_answer(monkeypatch):
+    """One finding under the bound is a list the model closed itself, and a
+    backend whose schema sets no bound never trips the check at any size."""
+    from elder_eval import runner
+    from llm_client import CAVE_MAX_FINDINGS
+    from sast_benchmark.backends import BenchBackend
+
+    (case,) = build_cases([_row(1, "correctness")])
+    monkeypatch.setattr(
+        runner, "_post",
+        lambda b, m: _bench_response([_finding("x.py")] * (CAVE_MAX_FINDINGS - 1)),
+    )
+    replay = runner.run_case(_cave_backend(monkeypatch), case, _diff_for("x.py"))
+    assert replay.errored is False
+    assert replay.output_truncated is False
+
+    monkeypatch.setattr(
+        runner, "_post",
+        lambda b, m: _bench_response([_finding("x.py")] * (CAVE_MAX_FINDINGS + 5)),
+    )
+    unbounded = BenchBackend(name="fake", url="http://invalid", model="m", api_key="")
+    replay = runner.run_case(unbounded, case, _diff_for("x.py"))
+    assert replay.errored is False
+    assert replay.output_truncated is False
+
+
 def test_report_names_the_cases_cut_off_at_the_output_cap(capsys):
     """The run report lists which cases were cut off, apart from the
     hunk-bounded `truncated_cases`, so a reader sees the caveat."""
