@@ -721,7 +721,7 @@ def test_pr_template_is_not_agent_authored():
 # --- grug#1251: operator PRs with an agent footer still get the plan ---
 
 _OPERATOR_PR = {"user": {"login": "op", "type": "User"}, "author_association": "OWNER"}
-_LOOM_FOOTER = "\nLoom ticket quadseven/loom#7, lane fix, model opus\n"
+_LOOM_FOOTER = "\nLoom ticket #7, lane fix, model opus\n"
 
 
 @pytest.mark.parametrize("association", ["OWNER", "MEMBER", "COLLABORATOR"])
