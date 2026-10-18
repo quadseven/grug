@@ -557,3 +557,118 @@ def test_short_suggestion_block_never_proves_anything():
     )
     kept, _ = verify_findings((f,), {"map_server.py": _MEMBERS_MODULE})
     assert kept == (f,)
+
+
+# --- class 6: collection-lockstep caller-not-updated (grug #763, the
+# PR #762 marking) ------------------------------------------------------
+#
+# Elder saw the DoR rule registry grow by one entry and asserted that the
+# persona-purity call-target ALLOWLIST had to grow in lockstep. It did not:
+# the new rule dispatches inside run_all, so it is never a call target of
+# evaluate_pull_request, and the attester passed on the reviewed head. The
+# caller-not-updated rule is scoped to a changed signature, return shape or
+# raise; a "list A grew, so list B must grow" claim is outside it.
+
+# infra/scripts/attest_dor_checks_five_rules.py at the PR #762 review head
+# (9f7c499), lines 20-32. The marking anchored on line 29 (the registry entry).
+_ATTESTER_AT_762_HEAD = "\n" * 19 + '''"""
+from __future__ import annotations
+
+import ast
+import re
+import sys
+from pathlib import Path
+
+CANONICAL_RULES: frozenset[str] = frozenset(
+    {"check_why", "check_acceptance", "check_estimate", "check_scope_fence", "check_issue_link", "check_linked_issue_completeness"}
+)
+
+DOR_CHECK_PATHS: tuple[Path, ...] = (
+'''
+
+# The marking Elder published on PR #762, verbatim.
+_PR_762_MESSAGE = (
+    "Grug see the attester's CANONICAL_RULES list grows to include "
+    "'check_linked_issue_completeness', but the attest persona purity "
+    "allowlist in services/_shared/personas/tpm/dor_checks.py still names "
+    "only five rules. The pure-call-list in attest_persona_purity.py line "
+    "35-37 must also add check_linked_issue_completeness, else the "
+    "attestation will flag an extra call target that does not exist in the "
+    "spec's allowed list. So speaks Grug."
+)
+_ATTESTER_PATH = "infra/scripts/attest_dor_checks_five_rules.py"
+
+
+def test_pr_762_registry_vs_allowlist_marking_is_killed():
+    f = _finding(
+        file=_ATTESTER_PATH, line=29, severity="medium",
+        rule_name="caller-not-updated", message=_PR_762_MESSAGE,
+    )
+    kept, killed = verify_findings((f,), {_ATTESTER_PATH: _ATTESTER_AT_762_HEAD})
+    assert kept == ()
+    assert [k.reason for k in killed] == ["collection_lockstep"]
+    assert killed[0].finding is f
+
+
+def test_real_stale_caller_marking_survives():
+    """The rule's own shape - a changed signature with a stale caller -
+    must never die, even when the message also mentions a list."""
+    source = "\n" * 4 + "def fetch(id, *, tenant):\n    return ids_list\n"
+    f = _finding(
+        line=5, rule_name="caller-not-updated",
+        message="fetch's signature grew a required tenant parameter, but "
+        "caller src/jobs.py:42 still passes the old 1-arg form from its "
+        "ids list; the retry list must also add tenant.",
+    )
+    kept, killed = verify_findings((f,), {"services/webhook/x.py": source})
+    assert kept == (f,)
+    assert killed == ()
+
+
+def test_lockstep_claim_anchored_on_a_signature_line_survives():
+    """Message vocabulary alone never kills: when the anchored line IS a
+    def/raise/return, the change may be the rule's real shape."""
+    source = "\n" * 4 + "def handlers(registry):\n"
+    f = _finding(
+        line=5, rule_name="caller-not-updated",
+        message="the HANDLERS list grows, so the dispatch allowlist must "
+        "also add the new handler",
+    )
+    kept, killed = verify_findings((f,), {"services/webhook/x.py": source})
+    assert kept == (f,)
+    assert killed == ()
+
+
+def test_single_collection_claim_survives():
+    """One collection plus its consumer (an enum gained a member, a match
+    does not handle it) is not the two-list lockstep shape - keep it."""
+    source = "\n" * 4 + "    NEW_STATE = 'new'\n"
+    f = _finding(
+        line=5, rule_name="caller-not-updated",
+        message="the State enum grows NEW_STATE but the dispatcher in "
+        "jobs.py still only handles the old members",
+    )
+    kept, killed = verify_findings((f,), {"services/webhook/x.py": source})
+    assert kept == (f,)
+    assert killed == ()
+
+
+def test_lockstep_kill_needs_the_source():
+    """No source snapshot is no evidence: keep (inconclusive-keeps bias)."""
+    f = _finding(
+        file=_ATTESTER_PATH, line=29, rule_name="caller-not-updated",
+        message=_PR_762_MESSAGE,
+    )
+    kept, killed = verify_findings((f,), {})
+    assert kept == (f,)
+    assert killed == ()
+
+
+def test_lockstep_kill_is_scoped_to_caller_not_updated():
+    f = _finding(
+        file=_ATTESTER_PATH, line=29, rule_name="logic-error",
+        message=_PR_762_MESSAGE,
+    )
+    kept, killed = verify_findings((f,), {_ATTESTER_PATH: _ATTESTER_AT_762_HEAD})
+    assert kept == (f,)
+    assert killed == ()

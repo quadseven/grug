@@ -1473,6 +1473,25 @@ def test_committed_corpus_yields_no_prless_cases():
     assert not any("#None" in c.case_id for c in cases)
 
 
+def test_committed_corpus_carries_the_pr_762_labelled_negative():
+    """grug#763: the PR #762 registry-vs-allowlist caller-not-updated FP is
+    a labelled negative, so a replay that re-emits correctness on that PR
+    scores as noise, anchored on the head Elder actually reviewed."""
+    from pathlib import Path
+
+    from elder_eval.corpus import build_cases
+    from ledger import parse_jsonl
+
+    p = Path(__file__).resolve().parents[3] / "logs" / "review-ledger.jsonl"
+    cases = {
+        (c.repo, c.pr): c for c in build_cases(parse_jsonl(p.read_text()))
+    }
+    case = cases[("quadseven/grug", 762)]
+    assert case.fp_only_classes == frozenset({"correctness"})
+    assert case.expected_classes == {}
+    assert case.anchor_head_sha == "9f7c499ec3c463a095ba7b403ddb56d9904476a5"
+
+
 # --- grug#916: backend attribution + the anonymous-GitHub guard ------------
 
 
