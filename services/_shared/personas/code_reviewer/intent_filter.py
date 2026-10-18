@@ -127,3 +127,167 @@ def filter_intent_mismatch_findings(
             continue
         kept.append(finding)
     return tuple(kept), dropped, lowered
+
+
+# --- #1218: scope intent-mismatch to the boxes a Refs-only PR claims ------
+#
+# A PR that links an issue with `Refs #N` (not a closing keyword) is one
+# slice of that issue. Elder graded such a PR against EVERY box on the
+# issue, including boxes earlier PRs had already delivered and ticked, and
+# blocked a correct change once per box, one re-run at a time. The rule:
+# - a finding about a box already ticked on a Refs-only issue is dropped;
+# - a finding about an open box the PR body does not claim is lowered to
+#   medium (advisory, never merge-blocking);
+# - a finding about an open box the PR body claims, or about any box of an
+#   issue the PR closes, is untouched (the closing case is out of scope);
+# - every finding the scope can attribute names the box and whether it is
+#   ticked on the issue.
+# Fail-open: a finding the scope cannot attribute to a box is kept as is,
+# unless every linked issue is Refs-only and the body claims no box at all.
+
+# (issue, criterion number, "open" | "ticked", cleaned text), the shape
+# `linked_issue.rendered_criteria_with_state` returns.
+LinkedBox = tuple[int, int, str, str]
+
+_BOX_REF_RE = re.compile(
+    r"#(\d+)[\s,:]*(?:acceptance\s+)?(?:criterion|criteria|box)\s*#?(\d+)\b"
+    r"|(?:criterion|box)\s*#?(\d+)\s+(?:of|on|in|from)\s+(?:issue\s+)?#(\d+)\b",
+    re.IGNORECASE,
+)
+_BARE_BOX_REF_RE = re.compile(r"\b(?:criterion|box)\s*#?(\d+)\b", re.IGNORECASE)
+_MIN_TEXT_MATCH = 12
+_CLAIM_PREFIX = 60
+
+
+def _normalized(text: str) -> str:
+    """Lowercase words joined by single spaces: punctuation and markup out."""
+    return " ".join(re.findall(r"[a-z0-9]+", (text or "").lower()))
+
+
+def _explicit_box_refs(text: str, single_issue: int | None) -> set[tuple[int, int]]:
+    """(issue, criterion) pairs the text names by number."""
+    refs: set[tuple[int, int]] = set()
+    for m in _BOX_REF_RE.finditer(text or ""):
+        if m.group(1):
+            refs.add((int(m.group(1)), int(m.group(2))))
+        else:
+            refs.add((int(m.group(4)), int(m.group(3))))
+    if not refs and single_issue is not None:
+        refs = {(single_issue, int(m.group(1))) for m in _BARE_BOX_REF_RE.finditer(text or "")}
+    return refs
+
+
+def _boxes_for_finding(
+    message: str, boxes: tuple[LinkedBox, ...], single_issue: int | None,
+) -> list[LinkedBox]:
+    """The linked boxes a finding is about: named by number, else quoted."""
+    refs = _explicit_box_refs(message, single_issue)
+    named = [b for b in boxes if (b[0], b[1]) in refs]
+    if named:
+        return named
+    spans = [_normalized(s) for s in _quoted_spans(message)]
+    spans = [s for s in spans if len(s) >= _MIN_TEXT_MATCH]
+    quoted = []
+    for box in boxes:
+        text = _normalized(box[3])
+        if len(text) >= _MIN_TEXT_MATCH and any(s in text or text in s for s in spans):
+            quoted.append(box)
+    return quoted
+
+
+def _body_claims(box: LinkedBox, pr_body: str, single_issue: int | None) -> bool:
+    """The PR body names this box by number or repeats its text."""
+    if (box[0], box[1]) in _explicit_box_refs(pr_body, single_issue):
+        return True
+    text = _normalized(box[3])[:_CLAIM_PREFIX]
+    return len(text) >= _MIN_TEXT_MATCH and text in _normalized(pr_body)
+
+
+def _box_label(box: LinkedBox) -> str:
+    return f"#{box[0]} criterion {box[1]} ({box[2]} on the issue)"
+
+
+def _annotated(finding: Finding, boxes: list[LinkedBox], note: str = "") -> Finding:
+    noun = "Box" if len(boxes) == 1 else "Boxes"
+    labels = ", ".join(_box_label(b) for b in boxes)
+    tail = f" {noun}: {labels}." if boxes else ""
+    return dataclasses.replace(finding, message=f"{finding.message}{tail}{note}")
+
+
+_ADVISORY_NOTE = (
+    " This PR links the issue with Refs, not a closing keyword, and its body "
+    "does not claim this box, so the finding is advisory."
+)
+
+
+@dataclasses.dataclass(frozen=True, slots=True)
+class _BoxScope:
+    """What the scope knows about one PR's linked boxes."""
+
+    boxes: tuple[LinkedBox, ...]
+    closed: frozenset[int]
+    single_issue: int | None
+    pr_body: str
+    any_claim: bool
+    any_closed: bool
+
+    def claims(self, box: LinkedBox) -> bool:
+        return box[2] == "open" and _body_claims(box, self.pr_body, self.single_issue)
+
+
+def _build_scope(
+    boxes: tuple[LinkedBox, ...], closed_issues: Iterable[int], pr_body: str,
+) -> _BoxScope:
+    closed = frozenset(closed_issues)
+    issues = {b[0] for b in boxes}
+    single_issue = next(iter(issues)) if len(issues) == 1 else None
+    body = pr_body or ""
+    scope = _BoxScope(boxes, closed, single_issue, body, False, bool(issues & closed))
+    any_claim = any(scope.claims(b) for b in boxes if b[0] not in closed)
+    return dataclasses.replace(scope, any_claim=any_claim)
+
+
+def _advisory(finding: Finding, boxes: list[LinkedBox]) -> Finding:
+    return dataclasses.replace(
+        _annotated(finding, boxes, _ADVISORY_NOTE), severity="medium",
+    )
+
+
+def _scoped(finding: Finding, scope: _BoxScope) -> tuple[Finding | None, str]:
+    """One intent-mismatch under the scope: (finding or None, outcome), where
+    outcome is "kept", "dropped" or "lowered"."""
+    matched = _boxes_for_finding(finding.message, scope.boxes, scope.single_issue)
+    blocking = finding.severity in ("high", "critical")
+    if not matched:
+        if blocking and not scope.any_closed and not scope.any_claim:
+            return _advisory(finding, []), "lowered"
+        return finding, "kept"
+    if any(b[0] in scope.closed for b in matched):
+        return _annotated(finding, matched), "kept"
+    if all(b[2] == "ticked" for b in matched):
+        return None, "dropped"
+    if not blocking or any(scope.claims(b) for b in matched):
+        return _annotated(finding, matched), "kept"
+    return _advisory(finding, matched), "lowered"
+
+
+def scope_intent_mismatch_to_claimed_boxes(
+    findings: Iterable[Finding],
+    *,
+    boxes: Iterable[LinkedBox],
+    closed_issues: Iterable[int],
+    pr_body: str,
+) -> tuple[tuple[Finding, ...], int, int]:
+    """Apply the #1218 scope. Returns (kept, dropped, lowered)."""
+    scope = _build_scope(tuple(boxes), closed_issues, pr_body)
+    kept: list[Finding] = []
+    counts = {"kept": 0, "dropped": 0, "lowered": 0}
+    for finding in findings:
+        if finding.rule_name != _INTENT_MISMATCH or not scope.boxes:
+            kept.append(finding)
+            continue
+        result, outcome = _scoped(finding, scope)
+        counts[outcome] += 1
+        if result is not None:
+            kept.append(result)
+    return tuple(kept), counts["dropped"], counts["lowered"]
