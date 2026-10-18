@@ -467,6 +467,23 @@ def list_installation_repos(install_token: str) -> list[dict]:
                     extra={"repo": r.get("full_name", "")},
                 )
                 continue
+            # EMPTY repos are excluded for the same denominator reason.
+            # Enforcement creation is deliberately deferred on a repo with
+            # no commits (see ensure_enforcement): a required check on an
+            # empty repo can never be satisfied, and creating it would
+            # deadlock the first push. An empty repo has no PRs to merge,
+            # so there is no enforcement to be missing - same logic as the
+            # archived exclusion above. The exclusion is self-correcting:
+            # the moment the repo gains a commit, `size` goes nonzero and
+            # it rejoins the denominator, so a repo that somehow never
+            # gets its enforcement still alerts once it has content.
+            # `size` absent defaults to included (never wrongly exclude).
+            if r.get("size", 1) == 0:
+                log.info(
+                    "installation_repo_empty_skipped",
+                    extra={"repo": r.get("full_name", "")},
+                )
+                continue
             out.append({
                 "id": r.get("id"),
                 "full_name": r.get("full_name", ""),
@@ -477,6 +494,22 @@ def list_installation_repos(install_token: str) -> list[dict]:
     else:
         log.warning("installation_repos_pagination_cap", extra={"count": len(out)})
     return out
+
+
+def repo_is_empty(install_token: str, owner: str, repo: str) -> bool:
+    """True when the repo has no commits at all.
+
+    `size == 0` on the repo object is the signal: GitHub reports size in KB
+    and a repo with zero commits has nothing to measure. Used by enforcement
+    to avoid deadlocking brand-new repos (see ensure_enforcement).
+    """
+    resp = _get_with_retry(
+        f"{_GH_API}/repos/{quote(owner, safe='')}/{quote(repo, safe='')}",
+        install_token=install_token,
+        op="repo_is_empty",
+    )
+    resp.raise_for_status()
+    return (resp.json() or {}).get("size", 0) == 0
 
 
 def _match_enforcing_ruleset(

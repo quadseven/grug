@@ -242,6 +242,58 @@ def _heal_enforcement_on_repo(
         )
 
 
+def _ensure_enforcement_on_pr(
+    install_id: int,
+    repo_id: int,
+    owner: str,
+    repo_name: str,
+    default_branch: str,
+) -> None:
+    """Best-effort enforcement creation on PR events (empty-repo bootstrap).
+
+    A repo enrolled while empty defers enforcement at install time; the
+    first PR is the moment the repo provably has commits, so this closes
+    the gap then. Idempotent - ensure_enforcement no-ops when a gate
+    already exists. Respects the operator opt-outs (tpm disabled /
+    force_disable_enforcement): never gate an excluded repo. Never raises:
+    a failure here must not block the persona reviews on this PR.
+    """
+    if not is_persona_enabled(install_id, repo_id, "tpm"):
+        return
+    from psycopg import Error as PsycopgError  # type: ignore
+
+    try:
+        cfg = get_repo_config(install_id, repo_id)
+    except PsycopgError:
+        # Store outage: fail open (skip the ensure), never block PR reviews.
+        # Narrow on purpose: a programming error in the config read itself
+        # must surface, not hide behind the outage posture.
+        log.warning(
+            "pr_enforcement_config_read_failed",
+            extra={"install_id": install_id, "repo": f"{owner}/{repo_name}"},
+            exc_info=True,
+        )
+        return
+    if cfg.get("force_disable_enforcement", False):
+        return
+    from github_app_auth import with_install_token_retry  # type: ignore
+    from enforcement import ensure_enforcement  # type: ignore
+
+    try:
+        with_install_token_retry(
+            install_id,
+            lambda token, o=owner, r=repo_name, db=default_branch, iid=install_id, rid=repo_id: (
+                ensure_enforcement(token, o, r, db, iid, rid)
+            ),
+        )
+    except Exception:
+        log.warning(
+            "pr_enforcement_ensure_failed",
+            extra={"install_id": install_id, "repo": f"{owner}/{repo_name}"},
+            exc_info=True,
+        )
+
+
 def _enforce_on_repos(install_id: int, repositories: list[dict]) -> None:
     """Best-effort enforcement creation for repos in an install payload."""
     from github_app_auth import with_install_token_retry  # type: ignore
@@ -330,6 +382,19 @@ def _handle_pull_request(
     # a function-local re-import would shadow it and silently defeat
     # `patch("dispatcher.get_repo_config")` in tests (#272).
     repo_id = repo.get("id")
+
+    # Empty-repo bootstrap: a repo enrolled while empty defers enforcement
+    # creation at install time (see enforcement.ensure_enforcement) so the
+    # first push isn't deadlocked by an unsatisfiable required check. The
+    # first PR proves the repo has commits, so ensure the gate now -
+    # idempotent when enforcement already exists. Respects the same opt-outs
+    # as the ruleset self-heal (tpm disabled / force_disable): never gate a
+    # repo the operator excluded. Best-effort: must not block the reviews.
+    if repo_id is not None:
+        _ensure_enforcement_on_pr(
+            int(installation_id), int(repo_id), owner, repo_name,
+            repo.get("default_branch") or "main",
+        )
 
     # Registry dispatch loop (ADR-0010): every registered persona whose
     # events include pull_request dispatches from this handler on the

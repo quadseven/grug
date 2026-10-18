@@ -699,6 +699,41 @@ def test_list_installation_repos_excludes_forks():
     assert [r["full_name"] for r in out] == ["o/first-party", "o/other"]
 
 
+def test_list_installation_repos_excludes_empty():
+    """An empty repo (no commits) has no PRs to merge, so there is no
+    enforcement to be missing - same denominator logic as the archived
+    exclusion. Enforcement creation is deliberately deferred there (see
+    ensure_enforcement) and the pull_request handler closes the gap on the
+    first PR. The exclusion is self-correcting: once the repo gains a
+    commit, size goes nonzero and it rejoins the denominator."""
+    from github_rulesets_client import list_installation_repos
+
+    body = {"total_count": 3, "repositories": [
+        {"id": 10, "full_name": "o/live", "default_branch": "main", "size": 42},
+        {"id": 11, "full_name": "o/empty", "default_branch": "main", "size": 0},
+        {"id": 12, "full_name": "o/no-size-field", "default_branch": "main"},
+    ]}
+    with patch("httpx.get", return_value=_ok_response(body)):
+        out = list_installation_repos("tok")
+    assert [r["full_name"] for r in out] == ["o/live", "o/no-size-field"]
+
+
+def test_repo_is_empty_true_when_size_zero():
+    from github_rulesets_client import repo_is_empty
+
+    with patch("httpx.get", return_value=_ok_response({"size": 0})) as mock_get:
+        assert repo_is_empty("tok", "o", "r") is True
+    url = mock_get.call_args[0][0]
+    assert url == "https://api.github.com/repos/o/r"
+
+
+def test_repo_is_empty_false_when_size_nonzero():
+    from github_rulesets_client import repo_is_empty
+
+    with patch("httpx.get", return_value=_ok_response({"size": 128})):
+        assert repo_is_empty("tok", "o", "r") is False
+
+
 def test_list_installation_repos_fork_exclusion_keeps_real_gaps():
     """The exclusion must NARROW the denominator, not empty it. A non-fork,
     non-archived repo is exactly the `not-a-fork` case from the same live

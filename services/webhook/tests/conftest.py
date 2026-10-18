@@ -101,3 +101,21 @@ def _reset_llm_provider_switches(monkeypatch: pytest.MonkeyPatch) -> None:
     lc = sys.modules.get("llm_client")
     if lc is not None:
         monkeypatch.setattr(lc, "_provider_blocked_until", {}, raising=False)
+
+
+@pytest.fixture(autouse=True)
+def _mock_pr_enforcement_ensure(monkeypatch):
+    """Neutralize the PR-path enforcement ensure by default.
+
+    `_handle_pull_request` re-runs `ensure_enforcement` on every PR (the
+    empty-repo bootstrap). Without this, tests that exercise the PR handler
+    would reach `get_repo_config` (real DB in CI) and `with_install_token_retry`
+    (real GitHub App token) - side effects the pre-existing tests never
+    expected. Tests that specifically verify the ensure behavior patch
+    `dispatcher._ensure_enforcement_on_pr` themselves (innermost patch wins).
+    """
+    from unittest.mock import MagicMock
+
+    import dispatcher
+
+    monkeypatch.setattr(dispatcher, "_ensure_enforcement_on_pr", MagicMock())
