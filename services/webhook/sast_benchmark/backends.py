@@ -17,7 +17,7 @@ from __future__ import annotations
 import os
 from dataclasses import dataclass, field
 
-from llm_client import CAVE_MAX_FINDINGS
+from llm_client import CAVE_MAX_FINDINGS, MAX_FINDING_MESSAGE_CHARS
 from openrouter_free_limiter import is_free_tier_model
 
 
@@ -125,7 +125,11 @@ _CAVE_FINDINGS_RESPONSE_FORMAT = {
                                 "type": "string",
                                 "enum": ["low", "medium", "high", "critical"],
                             },
-                            "message": {"type": "string"},
+                            # Same bound as production (grug#989).
+                            "message": {
+                                "type": "string",
+                                "maxLength": MAX_FINDING_MESSAGE_CHARS,
+                            },
                         },
                         "required": ["path", "line", "rule", "severity", "message"],
                     },
