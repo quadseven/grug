@@ -29,6 +29,7 @@ on:
       - 'services/**'
       - 'k8s/**'
       - 'scripts/promotion.py'
+      - 'scripts/rollout_gate.sh'
       - '.github/workflows/deploy.k8s.yml'
   workflow_dispatch: {}
 
@@ -460,9 +461,10 @@ jobs:
             echo "::error::unsubstituted placeholder in k8s/"; exit 1
           fi
           kubectl apply -k k8s/
-          for d in grug-webhook grug-api grug-consumer; do
-            kubectl -n grug rollout status deploy/$d --timeout=180s
-          done
+          # The rollout gate captures pods, describe and events into the
+          # step summary on a timeout, BEFORE the auto-rollback below
+          # restarts the deployment and the stuck pod is gone (#1238).
+          bash scripts/rollout_gate.sh grug 180s grug-webhook grug-api grug-consumer
           # CronJob smoke (F5): a broken image/command/secret must fail
           # THIS deploy, not the next scheduled tick.
           kubectl -n grug delete job poller-smoke --ignore-not-found
@@ -648,6 +650,15 @@ jobs:
           # revert + redeploy.
           # Container names per the live manifests: webhook/webhook,
           # api/webhook (historical), consumer/consumer, poller/poller.
+          # Record WHAT moved, not only the anchor's SHA (#1238): the
+          # digests restored and the ones they replaced, so a reader can
+          # tell from the run page whether production actually moved or
+          # the restore was a no-op. Digest only (the part after @): the
+          # image ref carries the registry host, which this public repo
+          # never prints.
+          short_ref() { case "$1" in "") echo unknown ;; *@*) echo "${1##*@}" ;; *) echo "${1##*/}" ;; esac; }
+          WAS_W=$(kubectl -n grug get deploy grug-webhook -o jsonpath='{.spec.template.spec.containers[?(@.name=="webhook")].image}' 2>/dev/null || echo "")
+          WAS_A=$(kubectl -n grug get deploy grug-api -o jsonpath='{.spec.template.spec.containers[?(@.name=="webhook")].image}' 2>/dev/null || echo "")
           kubectl -n grug set image deploy/grug-webhook webhook="$W"
           kubectl -n grug set image deploy/grug-api webhook="$A"
           kubectl -n grug set image deploy/grug-consumer consumer="$W"
@@ -662,15 +673,20 @@ jobs:
           # it back so a bad webhook digest doesn't linger on the hourly
           # cleanup CronJob.
           kubectl -n grug set image cronjob/grug-preview-janitor janitor="$W"
+          {
+            echo "restored webhook image (webhook, consumer, cronjobs): $(short_ref "$W") (was $(short_ref "$WAS_W"))"
+            echo "restored api image: $(short_ref "$A") (was $(short_ref "$WAS_A"))"
+            if [ "$W" = "$WAS_W" ] && [ "$A" = "$WAS_A" ]; then
+              echo "image restore was a NO-OP: production was already on the last-good digests"
+            fi
+          } >> "$GITHUB_STEP_SUMMARY"
           # set image is a no-op when digests match (a config-only bad
           # deploy) - force pod restarts so the restored secret is
           # actually mounted.
           for d in grug-webhook grug-api grug-consumer; do
             kubectl -n grug rollout restart "deploy/$d"
           done
-          for d in grug-webhook grug-api grug-consumer; do
-            kubectl -n grug rollout status "deploy/$d" --timeout=180s
-          done
+          bash scripts/rollout_gate.sh grug 180s grug-webhook grug-api grug-consumer
           kubectl -n grug annotate --overwrite \
             deploy/grug-webhook deploy/grug-api deploy/grug-consumer cronjob/grug-poller \
             "grug.dev/image-source=rollback-last-good" \
