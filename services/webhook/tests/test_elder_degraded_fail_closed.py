@@ -194,6 +194,63 @@ def test_block_mode_no_diff_is_not_a_degraded_review(elder):
     assert not posted[0].summary.startswith("Degraded review")
 
 
+# --- grug#1231: a findings answer cut off at the output cap -----------------
+
+def _cut_off_review(monkeypatch, severity: str) -> LlmReviewResponse:
+    """Run a cut-off findings answer through the REAL review path (parser,
+    arm, response) so the dispatch test sees what production would."""
+    import llm_client as lc
+
+    monkeypatch.setenv("GRUG_CAVE_GATEWAY_URL", "http://cave.test")
+
+    complete = ", ".join(
+        json.dumps({"path": "src/x.py", "line": 2, "rule": f"rule-{i}",
+                    "severity": severity, "message": "Grug see a problem."})
+        for i in range(3)
+    )
+    content = '{"findings": [' + complete + ', {"path": "src/x.py", "li'
+    body = {
+        "model": "m",
+        "choices": [{"message": {"content": content}, "finish_reason": "stop"}],
+    }
+    with patch.object(httpx, "post", return_value=httpx.Response(200, json=body)):
+        return lc.review_diff([lc.Hunk(path="src/x.py", body="@@ -1 +1 @@\n-a\n+b")],
+                              installation_id=1)
+
+
+def _publish_offline(elder, llm: LlmReviewResponse, *, blocking: bool) -> list:
+    """Publish with every later model call (judge, refute) failing fast
+    instead of reaching the network."""
+    with patch.object(httpx, "post", side_effect=httpx.ConnectError("offline")):
+        return elder(llm, blocking=blocking)
+
+
+@pytest.mark.parametrize("blocking, want", [(True, "failure"), (False, "neutral")])
+def test_cut_off_findings_answer_is_a_degraded_partial_review(
+    elder, monkeypatch, blocking, want,
+):
+    """grug#1231: a recovered cut-off answer holds fewer findings than the
+    model meant to write. It must never read as a clean complete review:
+    it is `partial_review`, so BLOCK fails closed (grug#1222) and WARN stays
+    neutral. Fails on main (the answer was parse_failed with no findings)."""
+    llm = _cut_off_review(monkeypatch, "low")
+    assert llm.kind == "reviewed" and len(llm.findings) == 3
+
+    posted = _publish_offline(elder, llm, blocking=blocking)
+
+    assert posted[0].conclusion == want
+    assert posted[0].summary.split("\n")[0] == _lead("partial_review")
+
+
+def test_cut_off_findings_with_a_blocking_finding_fails_in_block_mode(elder, monkeypatch):
+    """A recovered blocking finding is a real failure either way."""
+    llm = _cut_off_review(monkeypatch, "high")
+
+    posted = _publish_offline(elder, llm, blocking=True)
+
+    assert posted[0].conclusion == "failure"
+
+
 @pytest.mark.parametrize("blocking, want", [(True, "failure"), (False, "neutral")])
 def test_fetch_or_parse_fallback_honours_the_mode(monkeypatch, blocking, want):
     """`_publish_degraded` (diff fetch/parse failed) is a degraded exit too."""

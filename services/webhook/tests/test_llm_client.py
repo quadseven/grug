@@ -3853,6 +3853,128 @@ def test_parse_response_recovers_the_fence_even_when_backtick_soup_follows() -> 
     assert len(findings) == 1
 
 
+# --- grug#1231: a findings list cut off at the output cap ------------------
+
+
+def _cut_off_findings(count: int, *, severity: str = "low") -> str:
+    """The #989 shape: `{"findings": [` then `count` complete findings, then
+    a partial one cut off mid-string at the output cap. With 135 findings
+    this is about 29k characters, the observed 28-30k."""
+    complete = ", ".join(
+        json.dumps({
+            "path": "src/x.py", "line": 2, "rule": f"rule-{i}",
+            "severity": severity,
+            "message": f"Grug see problem number {i} in this stone. " * 3,
+        })
+        for i in range(count)
+    )
+    return (
+        '{"findings": [' + complete
+        + ', {"path": "src/x.py", "line": 3, "rule": "lost-err", "message": "Grug se'
+    )
+
+
+def test_parse_review_keeps_every_complete_finding_of_a_cut_off_list() -> None:
+    """grug#1231: the 4 errored #989 eval cases and a measured share of live
+    `parse_failed` reviews were this shape. Every closed finding is a real
+    answer; only the partial last one is dropped, and the result says it
+    was cut off. Fails on main (`_parse_review` does not exist; the old
+    parser returned `llm returned non-json` and no findings)."""
+    content = _cut_off_findings(135)
+    assert 28_000 < len(content) < 30_000
+
+    parsed = lc._parse_review(_fenced_response(content))
+
+    assert parsed.error == ""
+    assert parsed.truncated_findings is True
+    assert len(parsed.findings) == 135
+    assert [f.rule for f in parsed.findings[:2]] == ["rule-0", "rule-1"]
+    assert "lost-err" not in {f.rule for f in parsed.findings}
+
+
+def test_parse_review_validates_recovered_findings_like_complete_ones() -> None:
+    """A recovered item gets the same `_coerce_finding` validation as a normal
+    answer: an invalid severity is dropped, nothing is invented."""
+    good = {"path": "a.py", "line": 1, "rule": "null-deref",
+            "severity": "high", "message": "m"}
+    bad = {"path": "a.py", "line": 1, "rule": "x", "severity": "urgent",
+           "message": "m"}
+    content = (
+        '```json\n{"findings": [' + json.dumps(good) + ", " + json.dumps(bad)
+        + ', {"path": "a.py", "li'
+    )
+
+    parsed = lc._parse_review(_fenced_response(content))
+
+    assert parsed.truncated_findings is True
+    assert [f.rule for f in parsed.findings] == ["null-deref"]
+
+
+@pytest.mark.parametrize("content", [
+    "Grug think hard but Grug write only words, no tablets.",
+    # Cut inside the FIRST finding: nothing complete to keep.
+    '{"findings": [{"path": "a.py", "line": 1, "ru',
+    # The envelope closed, so it was not cut off; it is malformed (no comma).
+    '{"findings": [{"path": "a.py", "line": 1} {"path": "b.py", "line": 2}]}',
+    # Prose that quotes the envelope is not the envelope.
+    'Grug would answer {"findings": [{"path": "a.py", "line": 1}, {"pa',
+])
+def test_parse_review_non_json_still_fails_as_before(content: str) -> None:
+    parsed = lc._parse_review(_fenced_response(content))
+
+    assert parsed.findings == ()
+    assert parsed.truncated_findings is False
+    assert parsed.error.startswith("llm returned non-json")
+
+
+def test_parse_response_tuple_still_fails_a_cut_off_list_with_a_named_reason() -> None:
+    """A caller that only reads the old 3-tuple cannot tell partial from
+    complete, so it keeps failing the answer, now naming why."""
+    findings, _model, err = lc._parse_response(_fenced_response(_cut_off_findings(3)))
+
+    assert findings == ()
+    assert err.startswith("truncated_findings")
+    assert "3 complete findings" in err
+
+
+def test_review_reasoner_diff_cut_off_findings_is_partial_not_clean(monkeypatch) -> None:
+    """grug#1231 live half: a recovered cut-off answer publishes its findings
+    as a PARTIAL review (the grug#851 `partial review:` seam), never as a
+    complete one - even when the provider reports `finish_reason=stop`, so
+    the cut itself is the only signal. Fails on main (parse_failed)."""
+    monkeypatch.setenv("GRUG_CAVE_GATEWAY_URL", "http://cave.test")
+    body = _openai_json_response(_cut_off_findings(5))
+    body["choices"][0]["finish_reason"] = "stop"
+
+    with patch.object(httpx, "post", return_value=httpx.Response(200, json=body)):
+        out = lc.review_reasoner_diff([_hunk()], installation_id=1)
+
+    assert out.kind == "reviewed"
+    assert len(out.findings) == 5
+    assert out.error.startswith("partial review:"), out.error
+    assert "truncated_findings" in out.error
+
+
+def test_saas_overload_fallback_cut_off_findings_is_partial(monkeypatch) -> None:
+    """The last-resort SaaS path builds its own response; a cut-off answer
+    there must read as partial too."""
+    monkeypatch.setattr(lc, "_RETRY_SLEEP", lambda s: None)
+
+    def respond(url, **kwargs):
+        model = (kwargs.get("json") or {}).get("model", "")
+        if model in ("qwen3-coder-next:q8_0", "poolside/Laguna-S-2.1-NVFP4"):
+            raise httpx.ConnectTimeout("cave overloaded")
+        return httpx.Response(200, json=_openai_json_response(_cut_off_findings(2)))
+
+    with patch.object(httpx, "post", side_effect=respond):
+        out = review_diff([_hunk()], installation_id=1)
+
+    assert out.kind == "reviewed"
+    assert out.backend_used == Backend.POOLSIDE
+    assert len(out.findings) == 2
+    assert out.error.startswith("partial review:"), out.error
+
+
 # --- grug#906: configurable review backend priority (cloud-first option) ---
 
 
