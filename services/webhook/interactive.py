@@ -10,6 +10,8 @@ comment_id so a re-delivered webhook doesn't double-act.
 - ask <q>   -> LLM Q&A over the PR diff, posted as a reply
 - resume    -> lift Elder's auto-pause and enqueue an Elder re-run (grug#1188)
 - review    -> enqueue one Elder re-run; an auto-pause stays
+- learnings list  -> list the repo's remembered markings (read-only reply)
+- learnings delete <digest>  -> forget one remembered marking by digest
 """
 
 from __future__ import annotations
@@ -19,6 +21,8 @@ import os
 from urllib.parse import quote as _q
 
 import httpx  # type: ignore
+
+from adapters.pg_install_store import _learning_digest  # type: ignore
 
 log = logging.getLogger(f"{os.getenv('DD_SERVICE', 'grug')}.interactive")
 
@@ -33,6 +37,12 @@ def _post_reply(token: str, owner: str, repo: str, pr_number: int, body: str) ->
         headers={"Authorization": f"token {token}", "Accept": "application/vnd.github+json"},
         timeout=_TIMEOUT,
     ).raise_for_status()
+
+
+def _escape_html(s: str) -> str:
+    """Escape HTML-significant chars in a displayed learning so a taught
+    rule can't break out of the comment markup or inject tags."""
+    return str(s).replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
 
 
 def _pause_after_wake(
@@ -160,4 +170,83 @@ def run_command(
             return {"status": "no_op", "reason": "comment already handled", "verb": verb}
         return {"status": "dispatched", "verb": verb}
 
+    if verb == "learnings":
+        parts = arg.split(None, 1)
+        sub = parts[0].lower() if parts else ""
+        rest = parts[1].strip() if len(parts) > 1 else ""
+
+        if sub == "list":
+            try:
+                rows = _wake_learnings_list(repo_full)
+            except Exception as e:  # noqa: BLE001
+                log.warning("interactive_learnings_list_failed",
+                            extra={"kind": type(e).__name__})
+                rows = []
+            lines = [f"Grug's remembered markings for `{repo_full}` (active, newest first):"]
+            for row in reversed(rows):
+                text = str(row.get("text", "")).strip()
+                digest = _learning_digest(text)
+                scope = str(row.get("scope_path", "")).strip()
+                scope_txt = f", scoped to `{_escape_html(scope)}`" if scope else ""
+                lines.append(
+                    f"- `{digest}`: {_escape_html(text)}{scope_txt} | "
+                    f"taught by `{_escape_html(str(row.get('author', '')))}` on PR #{row.get('source_pr', 0)} | "
+                    f"used {int(row.get('usage_count', 0) or 0)}"
+                )
+            if not rows:
+                lines.append("(none)")
+            lines.append("")
+            lines.append("Use `/grug learnings delete <digest>` to forget one.")
+            body = "\n".join(lines)
+            try:
+                token_fn(lambda t: _post_reply(t, owner, repo, pr_number, body))
+            except Exception:  # noqa: BLE001 - the list is read-only; a failed post is cosmetic
+                log.warning("interactive_learnings_list_post_failed")
+            return {"status": "dispatched", "verb": "learnings", "sub": "list"}
+
+        if sub == "delete":
+            if not rest:
+                try:
+                    token_fn(lambda t: _post_reply(t, owner, repo, pr_number,
+                                                   "Usage: `/grug learnings delete <digest>`."))
+                except Exception:  # noqa: BLE001
+                    pass
+                return {"status": "no_op", "reason": "missing digest", "verb": verb}
+            digest = rest.strip().strip("`")
+            removed = False
+            if claim(f"learnings:{comment_id}"):
+                try:
+                    removed = _wake_learnings_delete(repo_full, digest)
+                except Exception as e:  # noqa: BLE001
+                    log.warning("interactive_learnings_delete_failed",
+                                extra={"digest": digest, "kind": type(e).__name__})
+            if removed:
+                body = f"Forgot marking `{digest}` on `{repo_full}`."
+            else:
+                body = f"No such marking `{digest}` on `{repo_full}`."
+            try:
+                token_fn(lambda t: _post_reply(t, owner, repo, pr_number, body))
+            except Exception:  # noqa: BLE001
+                pass
+            return {"status": "dispatched", "verb": "learnings", "sub": "delete"}
+
+        try:
+            token_fn(lambda t: _post_reply(t, owner, repo, pr_number,
+                                           "Usage: `/grug learnings list` or `/grug learnings delete <digest>`."))
+        except Exception:  # noqa: BLE001
+            pass
+        return {"status": "no_op", "reason": "unknown learnings sub-command", "verb": verb}
+
     return {"status": "no_op", "reason": f"unknown verb {verb}", "verb": verb}
+
+
+def _wake_learnings_list(repo: str) -> list[dict]:
+    """Fetch the repo's active learnings (store seam - monkeypatched in tests)."""
+    from adapters.install_store import list_learnings  # type: ignore
+    return list_learnings(repo)
+
+
+def _wake_learnings_delete(repo: str, digest: str) -> bool:
+    """Forget one learning by digest (store seam - monkeypatched in tests)."""
+    from adapters.install_store import delete_learning  # type: ignore
+    return delete_learning(repo, digest)

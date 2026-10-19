@@ -46,3 +46,12 @@ def test_parses_resume_and_review_verbs():
 def test_review_is_a_whole_word():
     """`/grug reviewed it` is prose, not the review command."""
     assert parse_command("/grug reviewed it") is None
+
+
+def test_learnings_list_and_delete_parse():
+    c = parse_command("/grug learnings list")
+    assert c.verb == "learnings" and c.arg == "list"
+    c = parse_command("/grug learnings delete abc123456789")
+    assert c.verb == "learnings" and c.arg == "delete abc123456789"
+    c = parse_command("/GRUG LearNInGs DeLeTe deadbeef")
+    assert c.verb == "learnings" and c.arg == "DeLeTe deadbeef"

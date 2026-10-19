@@ -953,6 +953,8 @@ def _run_learn(
             "result": result})
         return result
     if classification["durable"]:
+        # Org-configurable approval delay: default 0 = active immediately.
+        delay = _org_learning_approval_delay(install_id, repo_full)
         put_learning(
             repo=repo_full,
             text=classification["learning"],
@@ -960,6 +962,7 @@ def _run_learn(
             source_pr=pr_number,
             source_comment_id=comment_id,
             author=author,  # the maintainer who TAUGHT it (reply sender)
+            approval_delay_seconds=delay,
         )
         ack = LEARN_REACTION_LEARNED
         result = "learned"
@@ -985,6 +988,19 @@ def _run_learn(
         log.warning("learn_ack_post_failed", extra={
             "repo": repo_full, "pr": pr_number, "comment_id": comment_id,
             "kind": type(e).__name__})
+    # Collapsible acknowledgment section in the thread: durable = "Markings
+    # remembered", one-off = explicit decline. Best-effort; never redrive on
+    # ack failure.
+    try:
+        body = _learn_ack_body(
+            repo_full, classification["learning"], classification["scope_path"],
+            author, pr_number, classification["durable"],
+        )
+        _post_learn_reply(install_id, owner, repo_name, comment_id, body)
+    except Exception as e:  # noqa: BLE001
+        log.warning("learn_ack_comment_failed", extra={
+            "repo": repo_full, "pr": pr_number, "comment_id": comment_id,
+            "kind": type(e).__name__})
     try:
         emit_gauge("grug.learnings.classified", 1)
     except Exception:  # noqa: BLE001
@@ -998,6 +1014,91 @@ def _run_learn(
         "repo": repo_full, "pr": pr_number, "comment_id": comment_id,
         "result": result})
     return result
+
+
+def _org_learning_approval_delay(install_id: int, repo_full: str) -> int:
+    """The repo's org learning-approval delay in seconds (default 0 =
+    active immediately). Best-effort: any store/GitHub read failure yields 0
+    so a newly-taught learning activates immediately rather than stalling
+    pending. The org config field is `learning_approval_delay_seconds`."""
+    owner, _, repo_name = repo_full.partition("/")
+
+    def _repo_id(token: str) -> int | None:
+        r = httpx.get(
+            f"{_GH_API}/repos/{quote(owner, safe='')}/{quote(repo_name, safe='')}",
+            headers={
+                "Authorization": f"token {token}",
+                "Accept": "application/vnd.github+json",
+            },
+            timeout=10,
+        )
+        r.raise_for_status()
+        return int((r.json() or {}).get("id", 0))
+
+    try:
+        repo_id = with_install_token_retry(install_id, _repo_id)
+    except Exception:  # noqa: BLE001 - best-effort; default to immediate
+        log.warning("learning_approval_delay_lookup_failed", extra={
+            "install_id": install_id, "repo": repo_full})
+        return 0
+    if not repo_id:
+        return 0
+    from adapters.install_store import get_repo_config  # type: ignore
+    try:
+        cfg = get_repo_config(install_id, repo_id)
+    except Exception:  # noqa: BLE001 - store read failure; default immediate
+        log.warning("learning_approval_delay_config_failed", extra={
+            "install_id": install_id, "repo": repo_full, "repo_id": repo_id})
+        return 0
+    return int(cfg.get("learning_approval_delay_seconds") or 0)
+
+
+def _post_learn_reply(
+    install_id: int, owner: str, repo_name: str, comment_id: int, body: str,
+) -> None:
+    """Post a reply to the maintainer's review comment (same finding thread).
+    GitHub dedupes identical replies, so a redelivery is harmless."""
+    from urllib.parse import quote as _q
+
+    def _post(token: str) -> None:
+        _gh_post(
+            token,
+            f"{_GH_API}/repos/{_q(owner, safe='')}/{_q(repo_name, safe='')}"
+            f"/pulls/comments/{int(comment_id)}/replies",
+            {"body": body},
+        )
+    with_install_token_retry(install_id, _post)
+
+
+def _learn_ack_body(
+    repo_full: str, text: str, scope_path: str, author: str,
+    source_pr: int, durable: bool,
+) -> str:
+    """Collapsible acknowledgment for a reply-mined learning. `text`/`scope`/
+    `author` are defused (classifier-/reply-produced, untrusted) so a hostile
+    reply can't break out of the <details> or inject mentions."""
+    text_d = _defuse_md(text)
+    scope_d = _defuse_md(scope_path)
+    author_d = _defuse_md(author)
+    scope_line = f", scoped to `{scope_d}`" if scope_d else ""
+    if durable:
+        return (
+            "<details>\n"
+            "<summary>Markings remembered</summary>\n\n"
+            f"Grug remembered this preference for future reviews on `{repo_full}`:\n"
+            f"- `{text_d}`{scope_line}\n\n"
+            f"Taught by `{author_d}` (PR #{source_pr}). Grug will apply it to the "
+            "next Elder review of this repo.\n"
+            "</details>"
+        )
+    return (
+        "<details>\n"
+        "<summary>Not remembered (one reply only)</summary>\n\n"
+        f"Grug read your reply but will NOT carry this into future reviews on "
+        f"`{repo_full}`. It applies to this PR only.\n\n"
+        f"Replied by `{author_d}` (PR #{source_pr}).\n"
+        "</details>"
+    )
 
 
 def _hold_or_requeue_learn(
