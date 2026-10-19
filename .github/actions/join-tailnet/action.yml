@@ -24,3 +24,4 @@ runs:
         authkey: ${{ inputs.authkey }}
         tags: tag:ci
         use-cache: 'true'
+# probe for grug#1278 (do not merge)
