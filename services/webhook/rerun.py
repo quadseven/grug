@@ -35,7 +35,7 @@ from urllib.parse import quote
 import boto3
 import httpx
 
-from adapters.install_store import get_repo_config  # type: ignore
+from adapters.install_store import get_repo_config, is_elder_paused  # type: ignore
 from github_app_auth import get_app_id, with_install_token_retry
 from github_checks_client import CheckRunResult, post_check_run
 from personas import board_client
@@ -1250,7 +1250,12 @@ def _redrive_or_give_up(
     the check as a degraded exit (`neutral` in WARN mode, `failure` in BLOCK
     mode): no review landed on this head (grug#1212).
 
-    Returns True if re-enqueued, False if it gave up instead."""
+    A new head is not re-enqueued while Elder's auto-pause holds the PR
+    (grug#1188): that push was held on purpose, and `/grug resume` or
+    `/grug review` reviews it. That case also returns True - nothing gave up.
+
+    Returns True if re-enqueued (or held by the pause), False if it gave up
+    instead."""
     repo_full = f"{owner}/{repo_name}"
     same_sha = current_head_sha == claimed_head_sha
     next_redrive_count = job_redrive_count + 1 if same_sha else 0
@@ -1284,6 +1289,8 @@ def _redrive_or_give_up(
             conclusion=degraded_conclusion(blocking),
         )
         return False
+    if not same_sha and _held_by_autopause(install_id, repo_full, pr_number, current_head_sha):
+        return True
     _enqueue_current_review(
         install_id=install_id,
         repo_full=repo_full,
@@ -1293,6 +1300,31 @@ def _redrive_or_give_up(
         redrive_count=next_redrive_count,
     )
     return True
+
+
+def _held_by_autopause(
+    install_id: int, repo_full: str, pr_number: int, head_sha: str,
+) -> bool:
+    """True when Elder's auto-pause (grug#1188) holds this PR's pushes.
+
+    The webhook enqueued nothing for a held push, so a redrive onto that new
+    head would review it behind the pause's back. A store error reads as
+    not paused: the redrive goes ahead, as it did before the pause existed.
+    """
+    try:
+        paused = is_elder_paused(install_id=install_id, repo=repo_full, pr_number=pr_number)
+    except Exception as e:  # noqa: BLE001 - fail open: redrive as before
+        log.warning(
+            "elder_redrive_pause_lookup_failed",
+            extra={"repo": repo_full, "pr": pr_number, "kind": type(e).__name__},
+        )
+        return False
+    if paused:
+        log.info(
+            "elder_review_redrive_held_by_pause",
+            extra={"repo": repo_full, "pr": pr_number, "head_sha": head_sha[:8]},
+        )
+    return paused
 
 
 def _review_claim_heartbeat_loop(
@@ -1991,7 +2023,8 @@ def _run_hot_review(
                         summary=(
                             "A newer commit arrived while Elder was reviewing. "
                             "This head is closed as neutral (fail-open). A fresh "
-                            "review is enqueued for the current head."
+                            "review is enqueued for the current head, unless "
+                            "Elder is paused for rapid pushes."
                         ),
                         conclusion="neutral",
                     )

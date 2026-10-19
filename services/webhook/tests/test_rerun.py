@@ -523,6 +523,95 @@ def test_hot_review_new_head_resets_the_redrive_count(monkeypatch):
     )
 
 
+def test_hot_review_new_head_is_not_redriven_while_elder_is_paused(monkeypatch):
+    """grug#1188: a push held by auto-pause enqueued nothing on the webhook
+    side; the consumer cancelling a superseded review must not enqueue that
+    held head behind the pause's back."""
+    pulls = iter((
+        _pr_data(head_sha="same-head", title="Before"),
+        _pr_data(head_sha="new-head", title="Before"),
+    ))
+    monkeypatch.setattr(
+        rerun, "with_install_token_retry", lambda iid, fn: next(pulls),
+    )
+    _patch_hot_claims(monkeypatch)
+    monkeypatch.setattr(rerun.time, "sleep", lambda seconds: None)
+    paused_lookups: list[dict] = []
+    monkeypatch.setattr(
+        rerun, "is_elder_paused",
+        lambda **k: paused_lookups.append(k) or True,
+    )
+    requeue = MagicMock()
+    monkeypatch.setattr(rerun, "_enqueue_current_review", requeue)
+    dispatch = MagicMock()
+    monkeypatch.setattr(rerun, "dispatch_code_review", dispatch)
+
+    status = rerun._run_one(_job(
+        kind="review", requested_head_sha="same-head", settle_seconds=90,
+    ))
+
+    assert status == "stale_snapshot"
+    requeue.assert_not_called()
+    dispatch.assert_not_called()
+    assert paused_lookups == [
+        {"install_id": 11, "repo": "myorg/myrepo", "pr_number": 7},
+    ]
+
+
+def test_hot_review_same_head_redrive_ignores_the_pause(monkeypatch):
+    """A title/body change on the head already under review is not a held
+    push: it redrives as before, without consulting the pause."""
+    pulls = iter((
+        _pr_data(head_sha="same-head", title="Before"),
+        _pr_data(head_sha="same-head", title="After"),
+    ))
+    monkeypatch.setattr(
+        rerun, "with_install_token_retry", lambda iid, fn: next(pulls),
+    )
+    _patch_hot_claims(monkeypatch)
+    monkeypatch.setattr(rerun.time, "sleep", lambda seconds: None)
+
+    def _no_lookup(**_k):
+        raise AssertionError("pause consulted for a same-head redrive")
+
+    monkeypatch.setattr(rerun, "is_elder_paused", _no_lookup)
+    requeue = MagicMock()
+    monkeypatch.setattr(rerun, "_enqueue_current_review", requeue)
+    monkeypatch.setattr(rerun, "dispatch_code_review", MagicMock())
+
+    assert rerun._run_one(_job(
+        kind="review", requested_head_sha="same-head", settle_seconds=90,
+    )) == "stale_snapshot"
+    requeue.assert_called_once()
+
+
+def test_hot_review_pause_lookup_failure_redrives_the_new_head(monkeypatch, caplog):
+    """The pause check fails open: a store error redrives as before."""
+    pulls = iter((
+        _pr_data(head_sha="same-head", title="Before"),
+        _pr_data(head_sha="new-head", title="Before"),
+    ))
+    monkeypatch.setattr(
+        rerun, "with_install_token_retry", lambda iid, fn: next(pulls),
+    )
+    _patch_hot_claims(monkeypatch)
+    monkeypatch.setattr(rerun.time, "sleep", lambda seconds: None)
+
+    def _down(**_k):
+        raise RuntimeError("db down")
+
+    monkeypatch.setattr(rerun, "is_elder_paused", _down)
+    requeue = MagicMock()
+    monkeypatch.setattr(rerun, "_enqueue_current_review", requeue)
+    monkeypatch.setattr(rerun, "dispatch_code_review", MagicMock())
+
+    assert rerun._run_one(_job(
+        kind="review", requested_head_sha="same-head", settle_seconds=90,
+    )) == "stale_snapshot"
+    requeue.assert_called_once()
+    assert "elder_redrive_pause_lookup_failed" in caplog.text
+
+
 def test_hot_review_stops_when_pr_becomes_draft_during_settle(monkeypatch):
     pulls = iter((
         _pr_data(head_sha="same-head"),

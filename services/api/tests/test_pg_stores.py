@@ -1417,3 +1417,86 @@ def test_reserve_slot_concurrent_processes_admit_exactly_the_limit(pg):
             (f"RATELIMIT#{name}",),
         ).fetchone()
     assert row is not None and int(row[0]) == limit
+
+
+# --- grug#1188: Elder auto-pause push log + pause row ------------------------
+
+
+def test_record_elder_push_counts_pushes_inside_the_window(pg):
+    """Each push appends; the returned count covers only the window, so
+    pushes older than it fall out on the next write."""
+    from adapters import pg_install_store as store
+
+    pr = dict(install_id=7, repo="o/r", pr_number=3, window_seconds=600)
+    now = int(time.time())
+    assert store.record_elder_push(**pr, pushed_at=now - 900) == 1
+    # the first push is 15 min old: outside a 10 min window
+    assert store.record_elder_push(**pr, pushed_at=now - 60) == 1
+    assert store.record_elder_push(**pr, pushed_at=now) == 2
+    # a different PR keeps its own log
+    assert store.record_elder_push(
+        install_id=7, repo="o/r", pr_number=4, window_seconds=600, pushed_at=now,
+    ) == 1
+
+
+def test_record_elder_push_is_atomic_under_concurrent_pushes(pg):
+    """Rapid pushes arrive as concurrent webhook deliveries; a read-modify-
+    write would lose some and the pause would never engage."""
+    from adapters import pg_install_store as store
+
+    n = 8
+    barrier = threading.Barrier(n)
+    now = int(time.time())
+
+    def push():
+        barrier.wait()
+        store.record_elder_push(
+            install_id=7, repo="o/r", pr_number=3, window_seconds=600,
+            pushed_at=now,
+        )
+
+    threads = [threading.Thread(target=push) for _ in range(n)]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join(timeout=30)
+    assert store.record_elder_push(
+        install_id=7, repo="o/r", pr_number=3, window_seconds=600, pushed_at=now,
+    ) == n + 1
+
+
+def test_pause_elder_wins_once_and_resume_clears_pause_and_push_log(pg):
+    from adapters import pg_install_store as store
+
+    pr = dict(install_id=7, repo="o/r", pr_number=3)
+    assert store.is_elder_paused(**pr) is False
+    assert store.resume_elder(**pr) is False  # nothing to lift
+    assert store.pause_elder(**pr, head_sha="sha-a") is True
+    assert store.pause_elder(**pr, head_sha="sha-b") is False  # already paused
+    assert store.is_elder_paused(**pr) is True
+    # another PR is unaffected
+    assert store.is_elder_paused(install_id=7, repo="o/r", pr_number=4) is False
+
+    now = int(time.time())
+    for _ in range(3):
+        store.record_elder_push(**pr, window_seconds=600, pushed_at=now)
+    assert store.resume_elder(**pr) is True
+    assert store.is_elder_paused(**pr) is False
+    # the push log went with the pause: the next push starts a fresh count,
+    # it does not re-pause on pushes made before the resume
+    assert store.record_elder_push(**pr, window_seconds=600, pushed_at=now) == 1
+
+
+def test_expired_pause_reads_as_not_paused(pg):
+    from adapters import pg_install_store as store
+
+    pr = dict(install_id=7, repo="o/r", pr_number=3)
+    assert store.pause_elder(**pr, head_sha="sha-a") is True
+    with store.get_pool().connection() as conn:
+        conn.execute(
+            "UPDATE grug_kv SET ttl = EXTRACT(EPOCH FROM now())::bigint - 10 "
+            "WHERE sk = %s",
+            ("ELDER#PAUSED#o/r#3",),
+        )
+    assert store.is_elder_paused(**pr) is False
+    assert store.pause_elder(**pr, head_sha="sha-b") is True
