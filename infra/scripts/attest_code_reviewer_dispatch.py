@@ -37,11 +37,11 @@ wire 5xx). This version asserts AST *shape and reachability*:
 
   Publish-independence contract (`dispatch_code_review`):
     - check_run_and_review_publish_independently_per_dispatch
-        → post_check_run + post_review each in their own try; the
-          check-run handler sets `check_publish_failed = True` (an Assign,
-          not a string) and does NOT early-return; the planned outcome is
-          passed through `PublishOutcome.settled` with both publish-failed
-          kwargs, and the persona result is read off that settled outcome.
+        → `publish_persona_check` owns the check-run try/except and recording;
+          `post_review` remains in its own try so the two surfaces are
+          independent. The planned outcome is passed through
+          `PublishOutcome.settled` with both publish-failed kwargs, and the
+          persona result is read off that settled outcome.
     - dispatch_never_raises_wire_exception_degrades_to_neutral_per_dispatch
         → every wire-call try catches an allowed wire exception type
           (httpx.*/DiffParseError/Exception), and `_publish_degraded`
@@ -380,15 +380,18 @@ def _check_ssot_flow(
         ]
     conclusion_name, event_name = names
     fails: list[str] = []
-    crr = _calls_named(f, "CheckRunResult")
+    # CheckRunResult construction and check publication now live in the
+    # shared publish seam. Verify the dispatch passes the planned conclusion
+    # into that seam instead of requiring an inline post_check_run call.
+    crr = _calls_named(f, "publish_persona_check")
     if not any(
         isinstance(_kwarg_value(c, "conclusion"), ast.Name)
         and _kwarg_value(c, "conclusion").id == conclusion_name  # type: ignore[union-attr]
         for c in crr
     ):
         fails.append(
-            f"FAIL: {path} - CheckRunResult(conclusion=) is not the `{conclusion_name}` "
-            "from plan_publish; check-run conclusion may drift from the gate"
+            f"FAIL: {path} - publish_persona_check(conclusion=) is not the "
+            f"`{conclusion_name}` from plan_publish; check-run conclusion may drift from the gate"
         )
     brr = _calls_named(f, "build_review_result")
     if not any(
@@ -533,16 +536,16 @@ def _check_dispatch(tree: ast.AST, path: Path) -> list[str]:
     fails.extend(_check_ssot_flow(f, path, ps_calls))
 
     # check-run + review on independent surfaces.
-    check_tries = _try_blocks_containing(f, "post_check_run")
+    seam_calls = _calls_named(f, "publish_persona_check")
     review_tries = _try_blocks_containing(f, "post_review")
-    if not check_tries:
-        fails.append(f"FAIL: {path} — post_check_run is not wrapped in try/except")
+    if not seam_calls:
+        fails.append(f"FAIL: {path} — check-run is not routed through publish_persona_check")
     if not review_tries:
         fails.append(
             f"FAIL: {path} — post_review not wrapped in its own try (independent surface)"
         )
 
-    fails.extend(_check_publish_handlers(path, check_tries, review_tries))
+    fails.extend(_check_publish_handlers(path, [], review_tries))
 
     # never-raise: fetch/parse degrade fallback present.
     if not _calls_named(f, "_publish_degraded"):
