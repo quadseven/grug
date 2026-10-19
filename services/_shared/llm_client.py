@@ -618,6 +618,10 @@ class Backend(str, Enum):
     # in the default ("cave") priority path.
     OPENCODE_GO = "opencode-go"
     CAVE_REASONER = "cave-reasoner"
+    # The spark-gateway's free provider pool on its free route (grug#1269):
+    # free cloud models only, never a Spark. The last cloud chain tier, ahead
+    # of the Cave.
+    FREE_POOL = "free-pool"
 
 
 # `Severity` + `SEVERITIES` now live in the shared leaf `review_types` (#250)
@@ -1241,6 +1245,8 @@ def _backend_pool(backend: Backend, model: str) -> str:
         return "free"
     if backend == Backend.OPENCODE_GO and _opencode_go_model_is_free(model):
         return "free"
+    if backend == Backend.FREE_POOL:
+        return "free"
     return "paid"
 
 
@@ -1455,8 +1461,9 @@ def _free_tier_chain_config() -> "BackendConfig | None":
 def _cloud_chain_tiers() -> list[BackendConfig]:
     """The ordered cloud chain: opencode Go (skipped while its usage-limit
     breaker is open), an optional second free Go model, an optional paid Go
-    fallback model, OpenRouter `:free` (only if configured), then Poolside
-    laguna-s-2.1, with the Cave after all of them. Poolside was dropped in
+    fallback model, OpenRouter `:free` (only if configured), Poolside
+    laguna-s-2.1, then the spark-gateway's free provider pool (grug#1269),
+    with the Cave after all of them. Poolside was dropped in
     grug#910 as unfunded; it answers again (2026-09-26) and has the best eval
     record of the cloud models grug can reach (see `_poolside_chain_config`).
     Models on the per-model bench (`_note_model_response`) or the slow bench
@@ -1468,6 +1475,7 @@ def _cloud_chain_tiers() -> list[BackendConfig]:
         _opencode_go_fallback_chain_config(),
         _free_tier_chain_config(),
         _poolside_chain_config(),
+        _free_pool_chain_config(),
     ]
     tiers = _usable_tiers(candidates, skip_slow=True)
     if tiers:
@@ -1535,6 +1543,37 @@ def _poolside_chain_config() -> BackendConfig:
             **_BACKEND_CONFIGS[Backend.POOLSIDE].extra_body,
             "max_tokens": _CLOUD_CHAIN_MAX_TOKENS,
         },
+        timeout_seconds=_POOLSIDE_CHAIN_TIMEOUT_SECONDS,
+        retry_attempts=1,
+        transport_retry_attempts=1,
+    )
+
+
+def _free_pool_chain_config() -> BackendConfig | None:
+    """The spark-gateway's free provider pool as the last cloud tier, after
+    Poolside and ahead of the Sparks (grug#1269). The operator, 2026-10-19:
+    "I want to use free cloud models first". The free route never reaches a
+    Spark, holds every model to its free check, and sends a private repo only
+    to the providers allowed private code (`/free`); a known-public repo goes
+    to every free provider (`/free-public`). Opt-in: None unless
+    `GRUG_CLOUD_FREE_POOL` is true and the gateway URL is set, so a
+    deployment that has not asked for it keeps its chain unchanged."""
+    if os.getenv("GRUG_CLOUD_FREE_POOL", "").strip().lower() not in ("1", "true", "yes"):
+        return None
+    base = os.getenv("GRUG_CAVE_GATEWAY_URL", "").strip().rstrip("/")
+    if not base:
+        return None
+    route = "free-public" if _spark_data_class_header() == "public" else "free"
+    return BackendConfig(
+        backend=Backend.FREE_POOL,
+        url=f"{base}/{route}/v1/chat/completions",
+        # The gateway picks the provider's own free model id; this name only
+        # labels the tier until the reply names the model that served it.
+        model="free-pool",
+        key_loader=lambda: "in-cluster",  # gateway is unauthenticated in-cluster
+        extra_body={"max_tokens": _CLOUD_CHAIN_MAX_TOKENS},
+        extra_headers={"X-Spark-Priority": "interactive", "X-Spark-Caller": "grug-elder-free"},
+        dynamic_headers=dict(_CAVE_JOB_HEADERS),
         timeout_seconds=_POOLSIDE_CHAIN_TIMEOUT_SECONDS,
         retry_attempts=1,
         transport_retry_attempts=1,
