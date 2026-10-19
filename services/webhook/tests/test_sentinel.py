@@ -370,7 +370,7 @@ def test_reply_scan_counts_elder_fixed_in_from_real_rest_payload(monkeypatch):
     """grug#1162: the REST pulls/N/comments payload carries NO
     performed_via_github_app key, so keying "Elder's own reply" on the app
     id never matched and every Elder-answered finding still drew a Haunt
-    notice (loom#207: 3 high threads, each with Elder's Fixed in as the
+    notice (a lane PR in the factory repo: 3 high threads, each with Elder's Fixed in as the
     newest reply). Shapes below are trimmed from that PR's real REST
     payload: the author is identified only by user.login + user.type."""
     monkeypatch.setattr(sentinel, "get_app_id", lambda: "42")
