@@ -103,6 +103,70 @@ def test_dispatch_posts_new_comment_when_no_marker_exists(monkeypatch):
     assert mock_rcv.call_args.kwargs["conclusion"] == "success"
 
 
+def test_dispatch_posts_nothing_when_the_pr_closed_before_publish(monkeypatch):
+    """A lane pull request got its walkthrough 6.5 minutes after the merge
+    (2026-10-18), one more email with nothing left to review."""
+    monkeypatch.setattr(
+        wt_dispatch, "with_install_token_retry",
+        lambda inst_id, fn: fn("tok"),
+    )
+
+    def fake_get(url, **kwargs):
+        if url.endswith("/files"):
+            return _files_response([{"filename": "x.py", "additions": 3, "deletions": 1}])
+        if "/comments" in url:
+            return _empty_comments_response()
+        if kwargs["headers"]["Accept"] == "application/vnd.github+json":
+            r = MagicMock(spec=httpx.Response)
+            r.raise_for_status = MagicMock()
+            r.json = MagicMock(return_value={"state": "closed", "merged": True})
+            return r
+        return _diff_response()
+
+    with patch("httpx.get", side_effect=fake_get), \
+         patch("httpx.post") as mock_post, \
+         patch("httpx.patch") as mock_patch, \
+         patch("personas.walkthrough.dispatch.record_check_verdict"), \
+         patch("llm_client.summarize_pr", return_value=None):
+        out = wt_dispatch.dispatch_walkthrough_review(_payload(), blocking=False)
+
+    assert out == {"persona": "walkthrough", "result": "skipped_closed"}
+    mock_post.assert_not_called()
+    mock_patch.assert_not_called()
+
+
+def test_dispatch_still_posts_when_the_state_read_fails(monkeypatch):
+    monkeypatch.setattr(
+        wt_dispatch, "with_install_token_retry",
+        lambda inst_id, fn: fn("tok"),
+    )
+    posted = {}
+
+    def fake_get(url, **kwargs):
+        if url.endswith("/files"):
+            return _files_response([{"filename": "x.py", "additions": 3, "deletions": 1}])
+        if "/comments" in url:
+            return _empty_comments_response()
+        if kwargs["headers"]["Accept"] == "application/vnd.github+json":
+            raise httpx.ConnectError("down")
+        return _diff_response()
+
+    def fake_post(url, **kwargs):
+        posted["body"] = kwargs["json"]["body"]
+        r = MagicMock(spec=httpx.Response)
+        r.raise_for_status = MagicMock()
+        return r
+
+    with patch("httpx.get", side_effect=fake_get), \
+         patch("httpx.post", side_effect=fake_post), \
+         patch("personas.walkthrough.dispatch.record_check_verdict"), \
+         patch("llm_client.summarize_pr", return_value=None):
+        out = wt_dispatch.dispatch_walkthrough_review(_payload(), blocking=False)
+
+    assert out == {"persona": "walkthrough", "result": "degraded"}
+    assert MARKER in posted["body"]
+
+
 def test_dispatch_patches_existing_marker_comment_in_place(monkeypatch):
     """Acceptance criterion: updated IN PLACE on a re-dispatch (synchronize)."""
     monkeypatch.setattr(
