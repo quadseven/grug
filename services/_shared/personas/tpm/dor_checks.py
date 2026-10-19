@@ -4,7 +4,7 @@ Ported from scripts/tpm.py with the bullet-count regex tightened per
 quadseven/grug#20: empty `- [ ]` placeholders no longer count toward the
 >=3 minimum (security: an unfilled template should NOT pass).
 
-8 checks (per PRD #21 + memory `feedback_health_endpoint_standard`):
+9 checks (per PRD #21 + memory `feedback_health_endpoint_standard`):
   why          - ## Why >=5 words
   acceptance   - ## Acceptance criteria (or ## Test plan) >=3 NON-EMPTY bullets
   estimate     - Size: XS|S|M|L|XL anywhere in body
@@ -13,6 +13,7 @@ quadseven/grug#20: empty `- [ ]` placeholders no longer count toward the
   loom-footer  - a Loom-ticket PR carries the Loom audit footer (advisory)
   linked-issue-completeness - linked issue(s) have all non-exempt checkboxes ticked
   linked-issue-epic - every ticket the PR names is an epic or belongs to one (grug#1034)
+  in-scope     - all changed files trace to the linked issue's scope (advisory)
 """
 
 from __future__ import annotations
@@ -542,6 +543,121 @@ def check_linked_issue_in_epic(
     )
 
 
+# --- in-scope: does the PR's diff stay inside the linked issue's scope? ---
+
+# Lowercase word tokens from free text or a file path (len >= 3 to drop
+# noise like "a", "of", "it"). Mirrors ticket_compliance's heuristic so a
+# changed file reads as "in scope" when its path vocabulary appears in the
+# linked issue body (the scope oracle), and as an out-of-scope rider
+# otherwise.
+_TEXT_TOKEN_RE = re.compile(r"[a-z0-9]+")
+
+
+def _text_tokens(text: str) -> set[str]:
+    """Lowercase word tokens from free text (len >= 3 to drop noise)."""
+    raw = (text or "").lower()
+    raw = raw.replace("/", " ").replace("_", " ").replace("-", " ").replace(".", " ")
+    return {t for t in _TEXT_TOKEN_RE.findall(raw) if len(t) >= 3}
+
+
+def _linked_issue_numbers(body: str) -> list[int]:
+    """Issue numbers the PR body links via a closing keyword
+    (`Closes`/`Fixes`/`Resolves #N`), order-preserving and deduped.
+
+    Same extraction the DoR `linked-issue-completeness` check uses, so "the
+    linked issue" is one stable concept across Chief's rules. A `Refs #N` /
+    `Part of #N` link names related work, not the issue this PR is scoped to,
+    so it does not activate the in-scope check."""
+    seen: dict[int, None] = {}
+    for n in _CLOSING_KEYWORD_PAT.findall(strip_code_spans(body or "")):
+        seen.setdefault(int(n), None)
+    return list(seen)
+
+
+def check_in_scope(
+    body: str,
+    *,
+    fetch_issue: IssueFetcher | None = None,
+    fetch_changed_files: Callable[[], list[str]] | None = None,
+) -> CheckResult:
+    """Is every file the PR touches inside the linked issue's scope?
+
+    The linked issue body is the scope oracle. A changed file is "in scope"
+    when its path tokens overlap the issue body's tokens; anything else is an
+    out-of-scope rider the issue never asked for.
+
+    Activates only when the PR body links an issue (closing keyword). No link
+    -> pass, gracefully (mirrors `issue-link`). Fetch failure -> fail-open,
+    marked `skipped` (#782): a GitHub blip never freezes merges and never
+    reads as an earned pass. Advisory by default: a failure warns and names
+    the rider files, never blocks; org/repo config can promote it to blocking
+    via `advisory_checks` at the publish layer (see `personas.tpm.persona`).
+    """
+    numbers = _linked_issue_numbers(body)
+    if not numbers:
+        return CheckResult(
+            "in-scope", True,
+            "no linked issue in body; in-scope not applicable",
+        )
+    if fetch_issue is None or fetch_changed_files is None:
+        return CheckResult(
+            "in-scope", True,
+            f"linked issue(s) #{numbers} but a fetcher is missing (fail-open)",
+            skipped=True,
+        )
+
+    issue_tokens: set[str] = set()
+    fetch_failures: list[int] = []
+    for num in numbers:
+        try:
+            issue_tokens |= _text_tokens(fetch_issue(num) or "")
+        except Exception as exc:  # noqa: BLE001 - a blip must not freeze merges
+            log.warning(
+                "in_scope_issue_fetch_failed",
+                extra={"issue_number": num, "error": str(exc)},
+            )
+            fetch_failures.append(num)
+    # Nothing fetched at all: we have no scope oracle to compare against, so
+    # fail open (skipped) rather than comparing changed files to an empty
+    # token set and calling everything out of scope.
+    if fetch_failures and not issue_tokens:
+        return CheckResult(
+            "in-scope", True,
+            f"linked issue(s) #{numbers}; issue fetch failed (fail-open)",
+            skipped=True,
+        )
+
+    try:
+        changed = fetch_changed_files() or []
+    except Exception as exc:  # noqa: BLE001 - same fail-open posture for the diff
+        log.warning(
+            "in_scope_changed_files_fetch_failed",
+            extra={"error": str(exc)},
+        )
+        return CheckResult(
+            "in-scope", True,
+            f"linked issue(s) #{numbers}; changed-files fetch failed (fail-open)",
+            skipped=True,
+        )
+
+    out_of_scope = [p for p in changed if not (_text_tokens(p) & issue_tokens)]
+    if out_of_scope:
+        named = ", ".join(out_of_scope)
+        detail = (
+            f"out of scope vs linked issue(s) #{numbers}: {named} - "
+            "these files are not covered by the linked issue's scope; "
+            "split to a separate PR or link an issue that covers them"
+        )
+        return CheckResult("in-scope", False, detail)
+
+    count = len(changed)
+    tail = f"; fetch failed for #{fetch_failures}" if fetch_failures else ""
+    return CheckResult(
+        "in-scope", True,
+        f"all {count} changed file(s) within linked issue scope{tail}",
+    )
+
+
 _PURE_CHECKS = (
     check_why,
     check_acceptance,
@@ -563,16 +679,24 @@ def run_all(
     *,
     fetch_issue: IssueFetcher | None = None,
     fetch_issue_facts: IssueFactsFetcher | None = None,
+    fetch_changed_files: Callable[[], list[str]] | None = None,
 ) -> list[CheckResult]:
     """Run all DoR checks over the PR body.
 
-    `fetch_issue` is passed through to check_linked_issue_completeness and
-    `fetch_issue_facts` to check_linked_issue_in_epic. When either is None,
-    its check fails open (pass, marked `skipped`).
+    `fetch_issue` is passed through to `check_linked_issue_completeness` and
+    `check_in_scope`; `fetch_issue_facts` to `check_linked_issue_in_epic`;
+    `fetch_changed_files` to `check_in_scope`. When either IO fetcher is
+    None, its check fails open (pass, marked `skipped`).
+
+    The first 5 checks are pure (body -> CheckResult); the last 3 need IO
+    through their injected fetchers.
     """
-    # The first 5 checks are pure (body -> CheckResult); the last two need IO
+    # The first 5 checks are pure (body -> CheckResult); the last 3 need IO
     # through their injected fetchers.
     results = [check(body) for check in _PURE_CHECKS]
     results.append(check_linked_issue_completeness(body, fetch_issue=fetch_issue))
     results.append(check_linked_issue_in_epic(body, fetch_issue_facts=fetch_issue_facts))
+    results.append(
+        check_in_scope(body, fetch_issue=fetch_issue, fetch_changed_files=fetch_changed_files)
+    )
     return results
