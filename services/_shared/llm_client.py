@@ -6360,6 +6360,22 @@ class _CloudPrimaryResult:
     low_confidence: LlmReviewResponse | None = None
 
 
+def _empty_confirms_nothing(key: "tuple[Backend, str]") -> bool:
+    """A short empty answer from a model that gives one almost every time.
+
+    OpenRouter's `:free` model answers empty in about 7 tokens on 10k-44k
+    token cohorts (seen deciding a vote 2026-10-05, and on every call
+    2026-10-19). The gateway's free pool is whichever free model had room,
+    gemma4:31b among them, which did the same on 2026-10-19. Neither side of
+    a vote may be one of these: with the free tiers first in the chain
+    (grug#1269), the first empty was always one, and the old check looked
+    only at the second, so two lazy answers passed PRs as clean."""
+    backend, model = key
+    if backend == Backend.OPENROUTER and is_free_tier_model(model):
+        return True
+    return backend == Backend.FREE_POOL
+
+
 def _empty_answers_agree(
     first_empty: "tuple[Backend, str] | None",
     current: "tuple[Backend, str]",
@@ -6372,10 +6388,7 @@ def _empty_answers_agree(
     cohorts (2026-10-05). The same model twice is not agreement."""
     if first_empty is None or first_empty == current:
         return False
-    if current[0] == Backend.OPENROUTER and is_free_tier_model(current[1]):
-        # The `:free` model answers empty in about 7 tokens almost every
-        # time; it is the model the degenerate rule was written for, so its
-        # empty answer confirms nothing (seen deciding a vote 2026-10-05).
+    if _empty_confirms_nothing(first_empty) or _empty_confirms_nothing(current):
         return False
     log.info(
         "llm_cloud_empty_consensus",
