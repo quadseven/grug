@@ -41,6 +41,7 @@ def _full_gh_payload(body=""):
         "repository": {
             "owner": {"login": "quadseven", "id": 999, "url": "https://x"},
             "name": "grug",
+            "private": False,
             "description": "x" * 1000,  # bulky — must be dropped
         },
         "installation": {"id": 555},
@@ -63,7 +64,9 @@ def test_slim_payload_keeps_bounded_review_context():
             "draft": False,
             "user": {"login": "alice"},
         },
-        "repository": {"owner": {"login": "quadseven"}, "name": "grug"},
+        "repository": {
+            "owner": {"login": "quadseven"}, "name": "grug", "private": False,
+        },
         "installation": {"id": 555},
     }
 
