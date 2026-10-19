@@ -3021,15 +3021,17 @@ def test_review_diff_injects_cached_exemplars(monkeypatch) -> None:
     assert "cached exemplar finding" in system
 
 
-def test_coerce_finding_parses_suggestion_and_effort() -> None:
+def test_coerce_finding_parses_suggestion_effort_and_outside_diff_reason() -> None:
     """#553 wire format: optional suggestion (non-empty str else None) and
     effort (closed enum else "")."""
     ok, reason = lc._coerce_finding({
         "path": "x.py", "line": 1, "rule": "null-deref", "severity": "high",
         "message": "m", "suggestion": "fixed line", "effort": "quick-win",
+        "outside_diff_reason": "Same changed contract applies to sibling call.",
     })
     assert reason == "" and ok is not None
     assert ok.suggestion == "fixed line" and ok.effort == "quick-win"
+    assert ok.outside_diff_reason == "Same changed contract applies to sibling call."
 
     # hostile/malformed values degrade, never reject the finding
     ok2, _ = lc._coerce_finding({

@@ -694,6 +694,10 @@ class Finding:
     # (mirrors suggestion's None-for-absent).
     suggestion: str | None = None
     effort: Effort | None = None
+    # Explicit justification is required to request a cross-file anchor.
+    # `evaluate_diff` additionally verifies that the exact line was supplied
+    # in bounded cross-file context before accepting it.
+    outside_diff_reason: str | None = None
     # A duplicate candidate can be independently produced by both models. Keep
     # every source so judge and human feedback train both originating spans.
     origins: tuple[FindingOrigin, ...] = field(default_factory=tuple, compare=False)
@@ -1772,6 +1776,9 @@ _CAVE_FINDINGS_RESPONSE_FORMAT = {
                                 "maxLength": CAVE_MAX_SUGGESTION_CHARS,
                             },
                             "effort": {"type": "string", "enum": sorted(EFFORTS)},
+                            "outside_diff_reason": {
+                                "type": "string", "maxLength": MAX_FINDING_MESSAGE_CHARS,
+                            },
                         },
                         "required": ["path", "line", "rule", "severity", "message"],
                         "additionalProperties": False,
@@ -2937,6 +2944,12 @@ def _coerce_finding(raw: Any) -> tuple[Optional[Finding], str]:
         if isinstance(raw_effort, str) and raw_effort in EFFORTS
         else None
     )
+    raw_outside_reason = raw.get("outside_diff_reason")
+    outside_diff_reason = (
+        _redact_secrets(raw_outside_reason[:MAX_FINDING_MESSAGE_CHARS])
+        if isinstance(raw_outside_reason, str) and raw_outside_reason.strip()
+        else None
+    )
     # Output-side redaction at the ONE choke point: the model can ECHO a
     # secret from the diff into message/suggestion, and a posted comment
     # OUTLIVES a force-push that scrubs the diff. Every downstream surface
@@ -2958,6 +2971,7 @@ def _coerce_finding(raw: Any) -> tuple[Optional[Finding], str]:
     return Finding(
         path=path, line=line, rule=rule, severity=severity, message=message,  # type: ignore[arg-type]
         suggestion=suggestion, effort=effort,
+        outside_diff_reason=outside_diff_reason,
     ), ""
 
 
