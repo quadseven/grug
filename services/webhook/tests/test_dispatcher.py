@@ -1141,7 +1141,10 @@ def test_dispatch_rerequest_for_pr_builds_synthetic_pull_request_event():
     the raw check_run/check_suite payload only ever carries a minimal
     pull_requests entry with no body, and TPM's DoR check needs the real
     one."""
-    pr_json = {"number": 42, "body": "## Why\nreal body\n", "head": {"sha": "freshsha"}}
+    pr_json = {
+        "number": 42, "body": "## Why\nreal body\n", "head": {"sha": "freshsha"},
+        "base": {"repo": {"private": True}},
+    }
     with patch("dispatcher.is_install_allowlisted", return_value=True), \
          patch("dispatcher._fetch_pr_for_rerequest", return_value=pr_json), \
          patch("dispatcher.dispatch") as mock_dispatch:
@@ -1159,6 +1162,8 @@ def test_dispatch_rerequest_for_pr_builds_synthetic_pull_request_event():
     assert synthetic["repository"] == {
         "id": 7777, "name": "infra", "full_name": "quadseven/infra",
         "owner": {"login": "quadseven"},
+        # grug#1269: the re-fetched PR's visibility rides along.
+        "private": True,
     }
     assert synthetic["installation"] == {"id": 999}
 

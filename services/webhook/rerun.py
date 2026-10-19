@@ -1178,6 +1178,8 @@ def _review_payload(
             "id": int(base_repo["id"]),
             "name": repo_name,
             "owner": {"login": owner},
+            # grug#1269: Elder tells the spark-gateway whether it is public.
+            "private": base_repo.get("private"),
         },
         "pull_request": {
             "number": pr_number,
