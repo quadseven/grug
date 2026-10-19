@@ -70,6 +70,7 @@ from review_pipeline import (
 )
 from review_evidence import Hunk, ElderEvidence, seal
 from datadog_switch import datadog_enabled
+import call_report
 import deep_shadow
 from secrets_loader import (
     get_opencode_go_api_key,
@@ -5407,6 +5408,37 @@ def _ladder_failure_reason(outcome: AttemptOutcome) -> str | None:
     return text.rsplit(": ", 1)[-1]
 
 
+# Backends Elder calls directly, past the inference gateway. The gateway
+# records every call routed through it (the Cave arms, the judge, the free
+# pool); these it never sees, so `call_report` posts them to its ledger
+# (grug#1286).
+_DIRECT_BACKENDS = frozenset({Backend.OPENROUTER, Backend.POOLSIDE, Backend.OPENCODE_GO})
+
+
+def _report_direct_call(
+    backend: Backend, config: BackendConfig, outcome: "AttemptOutcome", latency_s: float,
+) -> None:
+    """One `call_report` row for a direct call that reached the network. A
+    config miss made no call and is not reported. Never raises."""
+    if backend not in _DIRECT_BACKENDS or outcome.error_kind == "config":
+        return
+    try:
+        degenerate = outcome.error_kind is None and _is_degenerate_empty_review(
+            outcome.findings, outcome.usage_metrics,
+        )
+        result, reason = call_report.outcome_for(
+            outcome.error_kind, outcome.status_code, degenerate,
+        )
+        job = _SPARK_JOB.get()
+        call_report.record(
+            backend=backend.value, model=config.model, served_model=outcome.model,
+            job=job.job if job is not None else None, status=outcome.status_code,
+            outcome=result, reason=reason, latency_s=latency_s,
+        )
+    except Exception as e:  # noqa: BLE001 - statistics must never break a review
+        log.debug("call_report_record_failed", extra={"kind": type(e).__name__})
+
+
 def _run_llm_attempt(
     *,
     backend: Backend,
@@ -5435,11 +5467,13 @@ def _run_llm_attempt(
             status_code=None, finish_reason="", usage_metrics={},
             span_context=None, raw_response=None,
         )
+    started = time.monotonic()
     outcome = _call_llm_attempt(
         backend=backend, config=config, messages=messages, variant=variant,
         pr_tags=pr_tags, cancel_event=cancel_event,
         transport_log_event=transport_log_event,
     )
+    _report_direct_call(backend, config, outcome, time.monotonic() - started)
     trail = _LADDER_TRAIL.get()
     reason = _ladder_failure_reason(outcome)
     if trail is not None and reason is not None:
