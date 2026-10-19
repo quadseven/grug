@@ -115,32 +115,71 @@ def test_a_pool_entry_disables_only_that_pool(monkeypatch) -> None:
     assert lc._usable_saas_fallback_backends() == (Backend.POOLSIDE,)
 
 
-def _shipped_switch() -> str:
-    """The `GRUG_DISABLED_BACKENDS` value every k8s manifest ships."""
+def _shipped_env(name: str) -> str:
+    """The value every k8s manifest ships for `name`."""
     root = Path(__file__).resolve().parents[3] / "k8s"
     found = {
         m.group(1)
-        for name in ("consumer-deployment.yaml", "webhook-deployment.yaml", "poller-cronjob.yaml")
+        for manifest in ("consumer-deployment.yaml", "webhook-deployment.yaml", "poller-cronjob.yaml")
         for m in re.finditer(
-            r'name: GRUG_DISABLED_BACKENDS, value: "([^"]*)"', (root / name).read_text()
+            r'name: ' + name + r', value: "([^"]*)"', (root / manifest).read_text()
         )
     }
     assert len(found) == 1, found
     return found.pop()
 
 
-def test_the_shipped_chain_is_free_tiers_only_openrouter_free_first(monkeypatch) -> None:
-    """grug#1269: the operator wants the free tiers used up first. OpenRouter's
-    free pool leads the cloud chain, Poolside follows, and nothing paid can be
-    called: OpenCode Go is off and OpenRouter's paid pool is off."""
-    monkeypatch.setenv("GRUG_DISABLED_BACKENDS", _shipped_switch())
+def test_the_shipped_chain_is_free_cloud_tiers_only_then_the_cave(monkeypatch) -> None:
+    """grug#1269: the operator wants the free cloud models used first.
+    OpenRouter's free pool leads, then Poolside, then the gateway's free
+    provider pool, and only then the Cave. Nothing paid can be called:
+    OpenCode Go is off and OpenRouter's paid pool is off."""
+    monkeypatch.setenv("GRUG_DISABLED_BACKENDS", _shipped_env("GRUG_DISABLED_BACKENDS"))
+    monkeypatch.setenv("GRUG_CLOUD_FREE_POOL", _shipped_env("GRUG_CLOUD_FREE_POOL"))
     assert [(t.backend, t.model) for t in lc._cloud_chain_tiers()] == [
         (Backend.OPENROUTER, _FREE),
         (Backend.POOLSIDE, lc._POOLSIDE_MODEL),
+        (Backend.FREE_POOL, "free-pool"),
     ]
     assert not lc._backend_enabled(Backend.OPENCODE_GO, "longcat-2.5-preview-free")
     assert not lc._backend_enabled(Backend.OPENROUTER, "anthropic/claude-opus-4.7")
     assert lc._backend_enabled(Backend.OPENROUTER, _FREE)
+
+
+def test_the_free_pool_tier_is_opt_in(monkeypatch) -> None:
+    monkeypatch.delenv("GRUG_CLOUD_FREE_POOL", raising=False)
+    assert lc._free_pool_chain_config() is None
+    monkeypatch.setenv("GRUG_CLOUD_FREE_POOL", "true")
+    monkeypatch.delenv("GRUG_CAVE_GATEWAY_URL")
+    assert lc._free_pool_chain_config() is None
+
+
+def test_the_free_pool_sends_a_private_repo_only_to_private_safe_providers(monkeypatch) -> None:
+    monkeypatch.setenv("GRUG_CLOUD_FREE_POOL", "true")
+    public = {"repo": "o/r", "pr_number": 1, "repo_private": False}
+    with lc._spark_job_scope(public):
+        assert lc._free_pool_chain_config().url == "http://cave.test/free-public/v1/chat/completions"
+    for ctx in ({"repo": "o/r", "pr_number": 1, "repo_private": True}, {}, None):
+        with lc._spark_job_scope(ctx):
+            assert lc._free_pool_chain_config().url == "http://cave.test/free/v1/chat/completions"
+
+
+def test_the_free_pool_answers_before_any_spark_is_asked(monkeypatch) -> None:
+    monkeypatch.setenv("GRUG_REVIEW_BACKEND_PRIORITY", "cloud")
+    monkeypatch.setenv("GRUG_DISABLED_BACKENDS", "opencode-go,openrouter:paid")
+    monkeypatch.setenv("GRUG_CLOUD_FREE_POOL", "true")
+    fake = _Recorder({
+        _OR_URL: httpx.ConnectTimeout("openrouter down"),
+        _POOLSIDE_URL: httpx.ConnectTimeout("poolside down"),
+        "cave.test/free/": _finding_response(),
+    })
+    with patch.object(httpx, "post", side_effect=fake):
+        out = review_diff([_hunk()], installation_id=1)
+    assert out.kind == "reviewed"
+    assert out.backend_used == Backend.FREE_POOL
+    assert [u for u in fake.urls if "cave.test" in u] == [
+        "http://cave.test/free/v1/chat/completions"
+    ]
 
 
 def test_cloud_review_never_calls_a_disabled_backend(monkeypatch) -> None:

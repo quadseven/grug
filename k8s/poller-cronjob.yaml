@@ -83,7 +83,6 @@ spec:
                 # reviews use, so these mirror consumer-deployment.yaml.
                 - {name: GRUG_REVIEW_BACKEND_PRIORITY, value: cloud}
                 - {name: GRUG_OPENCODE_GO_API_KEY_SSM, value: /infra/llm/opencode_go_api_key}
-                - {name: GRUG_OPENCODE_GO_SECOND_MODEL, value: "mimo-v2.5"}
                 - {name: GRUG_OPENCODE_GO_FALLBACK_MODEL, value: "longcat-2.5-preview-free"}
                 - {name: GRUG_CLOUD_FREE_TIER_MODEL, value: "nvidia/nemotron-3-super-120b-a12b:free"}
                 # grug#1225: switched off 2026-10-17, the OpenCode Go allowance and
@@ -94,6 +93,9 @@ spec:
                 # grug#1269: OpenRouter's free pool is back on 2026-10-19 (the operator
                 # wants the free tiers used up first); its paid pool stays off.
                 - {name: GRUG_DISABLED_BACKENDS, value: "opencode-go,openrouter:paid"}
+                # grug#1269: the gateway's free provider pool is a cloud tier after
+                # Poolside, ahead of the Sparks (free cloud models first).
+                - {name: GRUG_CLOUD_FREE_POOL, value: "true"}
                 - {name: GRUG_OPENROUTER_REVIEW_MODEL, value: "nvidia/nemotron-3-super-120b-a12b:free"}
                 - {name: GRUG_REVIEW_DEPTH, value: tiered}
                 - {name: GRUG_PROMPT_EXPERIMENT_SSM, value: /grug/elder-prompt-experiment}
