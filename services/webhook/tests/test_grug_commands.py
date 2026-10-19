@@ -34,3 +34,15 @@ def test_case_insensitive():
 
 def test_first_command_wins():
     assert parse_command("/grug improve\n/grug recheck").verb == "improve"
+
+
+def test_parses_resume_and_review_verbs():
+    """grug#1188: the auto-pause note names both commands."""
+    assert parse_command("/grug resume") == GrugCommand(verb="resume", arg="")
+    assert parse_command("/grug review") == GrugCommand(verb="review", arg="")
+    assert parse_command("/GRUG Resume").verb == "resume"
+
+
+def test_review_is_a_whole_word():
+    """`/grug reviewed it` is prose, not the review command."""
+    assert parse_command("/grug reviewed it") is None

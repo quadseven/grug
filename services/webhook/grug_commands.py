@@ -9,6 +9,8 @@ Supported verbs (all default-safe - none mutate code):
   /grug improve        Elder re-reviews and re-posts its findings
   /grug ask <question> scoped Q&A over the PR diff, answered as a reply
   /grug test-gaps      the pr-test lens on demand
+  /grug resume         lift Elder's auto-pause and review since the last look
+  /grug review         one Elder review now; an auto-pause stays (grug#1188)
 """
 
 from __future__ import annotations
@@ -20,12 +22,12 @@ from dataclasses import dataclass
 # line in a longer comment; the verb is a known token, everything after is
 # the arg (only `ask` uses it). Case-insensitive.
 _CMD_RE = re.compile(
-    r"^\s*/grug\s+(recheck|improve|ask|test-gaps|test_gaps)\b[ \t]*(.*)$",
+    r"^\s*/grug\s+(recheck|improve|ask|test-gaps|test_gaps|resume|review)\b[ \t]*(.*)$",
     re.IGNORECASE | re.MULTILINE,
 )
 
 _CANON = {"test_gaps": "test-gaps"}
-VERBS = frozenset({"recheck", "improve", "ask", "test-gaps"})
+VERBS = frozenset({"recheck", "improve", "ask", "test-gaps", "resume", "review"})
 
 
 @dataclass(frozen=True)

@@ -206,6 +206,10 @@ REGISTRY: tuple[PersonaSpec, ...] = (
         # redrive instead of finishing silently. The only exits that leave
         # the check pending are draft/closed PRs (which cannot merge) and
         # same-head redrives (a fresh review on that head completes it).
+        # A push held by auto-pause (grug#1188) enqueues nothing, so that
+        # head has no Elder check until `/grug resume` or `/grug review`
+        # reviews it: the PR waits on the required check, fail-closed, and
+        # the pause note on the PR names both commands.
         # Residual: a job exhausted to the DLQ stays in_progress until a
         # push, `/grug improve`, or the opt-in check-run sweeper closes it -
         # that is fail-closed, the posture a BLOCK mode asks for.

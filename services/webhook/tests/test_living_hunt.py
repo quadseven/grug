@@ -529,3 +529,68 @@ def test_living_hunt_delta_done_log_on_successful_persist(monkeypatch, caplog):
     ) or any(
         "elder_living_hunt_delta_done" in r.getMessage() for r in caplog.records
     )
+
+
+def test_push_after_first_review_is_a_scoped_delta_review(monkeypatch):
+    """grug#1188 AC: a push after the first review fetches the diff from the
+    last reviewed head, never the full PR diff, and the check names the
+    commit range it reviewed."""
+    from github_checks_client import CheckRunResult
+    from llm_client import Backend, LlmReviewResponse
+
+    llm = LlmReviewResponse(
+        kind="reviewed", findings=(), backend_used=Backend.CAVE, model_name="coder",
+    )
+    scoped_calls: list[dict] = []
+    titles: list[str] = []
+
+    def _scoped(*_a, **k):
+        scoped_calls.append(k)
+        return ("diff --git a/x.py b/x.py\n--- a/x.py\n+++ b/x.py\n@@ -1 +1 @@\n-old\n+new\n", True, False)
+
+    def _full(*_a, **_k):
+        raise AssertionError("full PR diff fetched on a push after a review")
+
+    def _check(*a, **k):
+        result = k.get("result") or next(x for x in a if isinstance(x, CheckRunResult))
+        titles.append(result.title)
+        return {"id": 1}
+
+    monkeypatch.setattr(cr_dispatch, "with_install_token_retry", lambda _i, fn: fn("t"))
+    monkeypatch.setattr(review_publish, "with_install_token_retry", lambda _i, fn: fn("t"))
+    monkeypatch.setattr(cr_dispatch, "review_diff", lambda *a, **k: llm)
+    monkeypatch.setattr(cr_dispatch, "post_check_run", _check)
+    monkeypatch.setattr(cr_dispatch, "post_review", lambda *a, **k: {"id": 2})
+    monkeypatch.setattr(cr_dispatch, "grade_findings", lambda *a, **kw: ())
+    monkeypatch.setattr(cr_dispatch, "fetch_pr_diff_with_scope", _scoped)
+    monkeypatch.setattr(cr_dispatch, "fetch_pr_diff", _full)
+    monkeypatch.setattr(
+        cr_dispatch, "_fetch_current_review_snapshot",
+        lambda *a, **k: ("base5678ijkl", "abcd1234efgh", "t", "b"),
+    )
+
+    with patch(
+        "adapters.install_store.get_elder_last_reviewed",
+        return_value="prior0001head",
+    ), patch("adapters.install_store.put_elder_last_reviewed", lambda **k: None):
+        cr_dispatch.dispatch_code_review(
+            {
+                "action": "synchronize",
+                "installation": {"id": 11},
+                "repository": {"id": 22, "name": "myrepo", "owner": {"login": "myorg"}},
+                "pull_request": {
+                    "number": 7,
+                    "head": {"sha": "abcd1234efgh"},
+                    "base": {"sha": "base5678ijkl"},
+                    "title": "t",
+                    "body": "b",
+                    "user": {"login": "alice"},
+                },
+            },
+            blocking=False,
+        )
+
+    assert len(scoped_calls) == 1
+    assert scoped_calls[0]["base_sha"] == "prior0001head"
+    assert scoped_calls[0]["head_sha"] == "abcd1234efgh"
+    assert titles and titles[-1].startswith("Living Hunt prior000..abcd1234")

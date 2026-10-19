@@ -396,6 +396,15 @@ for a comment outside the diff - and the job completes with
 `result:review_rejected` instead of redriving (#770); `permanent:false` is a
 5xx/transport/429 and redrives as `publish_failed`); webhook 500 -> DD `@event:(tpm_dispatch_unhandled OR code_review_dispatch_unhandled)` (last-resort guards, empty in steady state).
 
+**Auto-pause checks (grug#1188):** a push that got no Elder check while
+others did -> DD `@event:elder_autopause_held_push` (the PR is paused; the
+note on the PR names `/grug resume` and `/grug review`). A pause that should
+have engaged but did not -> `@event:elder_autopause_gate_failed` (store
+error, failed open to review) or `@event:elder_autopause_note_failed` (note
+did not post, pause lifted again). Set `GRUG_ELDER_AUTOPAUSE_PUSHES=0` on
+`grug-webhook` to turn auto-pause off; `GRUG_ELDER_AUTOPAUSE_WINDOW_MINUTES`
+sets the window (defaults 5 pushes / 10 minutes).
+
 **Security-suite checks (SAST/SCA/secret/IaC):** the four candidate sources
 are best-effort - a detector failure returns `()` and never breaks the core
 review, which also means a silently-broken detector looks like "no findings."
