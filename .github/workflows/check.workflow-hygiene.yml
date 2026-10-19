@@ -14,9 +14,13 @@ name: Check · workflow hygiene
 on:
   pull_request:
     branches: [main]
+    # Every file the pinned linter reads is under .github/: workflows, every
+    # .sh, and the composite actions' action.yml (#1278 - the old list named
+    # only workflows and .sh, so an action.yml-only PR started no run).
+    # scripts/tests/test_workflow_hygiene_trigger_scope.py pins this filter
+    # against the linter's scope, so narrowing it fails CI.
     paths:
-      - '.github/workflows/**'
-      - '.github/**/*.sh'
+      - '.github/**'
   workflow_dispatch:
 
 permissions:
@@ -41,16 +45,17 @@ jobs:
           persist-credentials: false
 
       # The scanned-file count is asserted, not just the exit status: a glob
-      # that silently matched nothing would also print "clean". 16 is the
-      # workflow count when this gate was added; lower it only when workflows
-      # are actually removed.
+      # that silently matched nothing would also print "clean". 18 is what the
+      # pinned linter counted when #1278 widened the trigger (18 workflows, no
+      # .sh); a pin whose linter also counts the three action.yml files reads
+      # higher. Lower it only when workflows are actually removed.
       - name: 03. Lint workflows
         run: |
           set -euo pipefail
           out=$(python3 .hygiene/infra-public/.github/scripts/workflow_hygiene.py) || { echo "$out"; exit 1; }
           echo "$out"
           n=$(printf '%s\n' "$out" | sed -n 's/.*clean (\([0-9][0-9]*\) files checked).*/\1/p')
-          if [ -z "$n" ] || [ "$n" -lt 16 ]; then
-            echo "::error::workflow-hygiene scanned ${n:-no} files, expected at least 16 - a sweep that matches nothing must not pass as clean"
+          if [ -z "$n" ] || [ "$n" -lt 18 ]; then
+            echo "::error::workflow-hygiene scanned ${n:-no} files, expected at least 18 - a sweep that matches nothing must not pass as clean"
             exit 1
           fi
