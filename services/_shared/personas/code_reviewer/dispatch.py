@@ -87,7 +87,10 @@ from personas.code_reviewer.complexity import ComplexityScan, scan_complexity_fu
 from personas.code_reviewer.criteria_coverage import (
     LinkedCriterion, scan_criteria_coverage,
 )
-from personas.code_reviewer.lint import scan_ruff
+from personas.code_reviewer.analyzers import (
+    RepoAnalyzerConfig, configured_engines, merge_analyzer_findings,
+    run_analyzers,
+)
 from personas.code_reviewer.suggestion import checked_suggestion
 from markdown_safety import neutralize_mentions
 from personas.code_reviewer.repo_ruff_policy import parse_repo_ruff_policy
@@ -527,29 +530,83 @@ _CLAIM_HINT_RE = re.compile(
 )
 
 
-def _merge_lint_evidence(evaluation, hunks, file_contents, ruff_policy=None, policy_dropped=None):
-    """Fold deterministic ruff findings into the evaluation (#681, epic #707).
+def _merge_lint_evidence(
+    evaluation, hunks, file_contents, ruff_policy=None, policy_dropped=None,
+    *, semgrepignore=None, skipped=None, engines=None,
+):
+    """Fold the configured OSS analyzers' findings into the evaluation
+    (#681 / #1254, epic #707).
 
-    RECALL work: ruff catches the mechanical class the model skims past, and
-    cannot hallucinate because the findings are measured rather than
+    RECALL work: ruff (Python) and opengrep over grug's own rule pack
+    (JavaScript/TypeScript) catch the mechanical class the model skims past,
+    and cannot hallucinate because the findings are measured rather than
     generated. Merged with the other deterministic sources - i.e. AFTER the
     verification pass and refute gate, both of which exist to police MODEL
-    judgment and should not second-guess a linter.
+    judgment and should not second-guess a linter. An analyzer finding on the
+    same line as one of the model's own findings is folded into it rather
+    than posted twice (`merge_analyzer_findings`).
 
     Extracted rather than inlined so it costs `dispatch_code_review` ONE
-    branch instead of four: that function already measures cyclomatic 61 /
-    cognitive 62 against caps of 15/25, and its decomposition is #725's job,
-    not this slice's. Inert unless GRUG_LINT_EVIDENCE=ruff.
+    branch: that function's decomposition is #725's job, not this slice's.
+    Inert unless GRUG_ELDER_ANALYZERS (or the older GRUG_LINT_EVIDENCE=ruff)
+    names an engine. `skipped`, when given, collects (engine, reason) for the
+    check summary.
     """
+    engines = configured_engines() if engines is None else engines
+    if not engines:
+        return evaluation
     try:
-        lint_findings = scan_ruff(hunks, file_contents or {}, ruff_policy, policy_dropped)
+        run = run_analyzers(
+            hunks, file_contents or {}, engines,
+            RepoAnalyzerConfig(ruff_policy=ruff_policy, semgrepignore=semgrepignore),
+        )
     except Exception:  # noqa: BLE001 - lint evidence must never break a review
         log.warning("code_review_lint_scan_failed", exc_info=True)
         return evaluation
-    if not lint_findings:
+    if policy_dropped is not None and run.policy_dropped:
+        policy_dropped.append(run.policy_dropped)
+    if skipped is not None:
+        skipped.extend(run.skipped)
+    if not run.findings:
         return evaluation
-    log.info("code_review_lint_findings", extra={"count": len(lint_findings)})
-    return with_extra_findings(evaluation, lint_findings)
+    existing, extra = merge_analyzer_findings(evaluation.findings, run.findings)
+    log.info("code_review_lint_findings", extra={
+        "count": len(extra), "folded": len(run.findings) - len(extra),
+        "engines": ",".join(run.ran),
+    })
+    return with_extra_findings(with_findings(evaluation, existing), extra)
+
+
+def _analyzer_skip_note(skipped: list[tuple[str, str]]) -> str:
+    """One summary line naming each analyzer that degraded to a skip."""
+    if not skipped:
+        return ""
+    return "\n\nAnalyzers skipped: " + ", ".join(
+        f"{engine} ({reason})" for engine, reason in skipped
+    ) + ". The review went on without them."
+
+
+_SEMGREPIGNORE_PATH = ".semgrepignore"
+
+
+def _load_repo_semgrepignore(
+    installation_id: int, owner: str, repo_name: str, base_ref: str,
+) -> str | None:
+    """The repo's `.semgrepignore` at the PR base, or None. Read at the BASE
+    so a PR cannot widen its own ignore list to hide its own findings."""
+    if not base_ref:
+        return None
+    try:
+        fetched = with_install_token_retry(
+            installation_id,
+            lambda token: fetch_file_contents(
+                token, owner, repo_name, (_SEMGREPIGNORE_PATH,), base_ref,
+            ),
+        ) or {}
+    except (httpx.HTTPStatusError, httpx.RequestError) as exc:
+        log.info("repo_semgrepignore_fetch_failed", extra={"kind": type(exc).__name__})
+        return None
+    return fetched.get(_SEMGREPIGNORE_PATH)
 
 
 def _enrich_claim_check_sources(
@@ -3117,12 +3174,18 @@ def dispatch_code_review(
         )
 
     ruff_policy_dropped: list[int] = []
-    ruff_policy = _load_repo_ruff_policy(
-        installation_id, owner, repo_name, str(pr_context.get("base_sha") or ""),
-    )
-    if not correctness_only:
+    analyzer_skips: list[tuple[str, str]] = []
+    policy_base = str(pr_context.get("base_sha") or "")
+    ruff_policy = _load_repo_ruff_policy(installation_id, owner, repo_name, policy_base)
+    analyzer_engines = configured_engines()
+    if not correctness_only and analyzer_engines:
         evaluation = _merge_lint_evidence(
             evaluation, hunks, file_contents, ruff_policy, ruff_policy_dropped,
+            semgrepignore=(
+                _load_repo_semgrepignore(installation_id, owner, repo_name, policy_base)
+                if "opengrep" in analyzer_engines else None
+            ),
+            skipped=analyzer_skips, engines=analyzer_engines,
         )
 
     # Deterministic docs/code claim check: catch comment/env prose that
@@ -3227,6 +3290,7 @@ def dispatch_code_review(
             + " finding(s) were omitted because the repository configuration "
             "ignores or explicitly selects those rules for the affected paths."
         )
+    summary += _analyzer_skip_note(analyzer_skips)
     summary += config_note
     summary += _linked_issue_summary_note(
         str(pr_context.get("linked_issue_context") or ""),
