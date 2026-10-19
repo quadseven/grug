@@ -2465,6 +2465,19 @@ def _filter_intent_mismatches(
     return evaluation
 
 
+def _repo_private(payload: dict[str, Any]) -> bool | None:
+    """The payload's repo visibility, or None when it does not say (grug#1269).
+
+    Elder tells the spark-gateway whether a review is public work, and an
+    unknown repo counts as private, so only a real bool is trusted."""
+    private = (payload.get("repository") or {}).get("private")
+    if isinstance(private, bool):
+        return private
+    base_repo = ((payload.get("pull_request") or {}).get("base") or {}).get("repo") or {}
+    private = base_repo.get("private")
+    return private if isinstance(private, bool) else None
+
+
 def dispatch_code_review(
     payload: dict[str, Any], *, blocking: bool,
     cancel_event: threading.Event | None = None,
@@ -2512,6 +2525,9 @@ def dispatch_code_review(
         "title": str(pr.get("title") or ""),
         "body": str(pr.get("body") or ""),
     }
+    private = _repo_private(payload)
+    if private is not None:
+        pr_context["repo_private"] = private
     labels = _pr_labels(pr)
     pr_context["sensitive_review"] = "class:sensitive" in labels
 

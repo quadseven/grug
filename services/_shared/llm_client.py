@@ -227,6 +227,9 @@ class PrContext(TypedDict, total=False):
     linked_issue_context: str
     review_scope: str
     sensitive_review: bool
+    # The webhook's `repository.private` (grug#1269). Unset means unknown,
+    # which every reader treats as private.
+    repo_private: bool
 
 
 def _elapsed_ms(start_ns: int) -> int:
@@ -413,6 +416,65 @@ def _review_deadline(deadline: float) -> Iterator[None]:
         yield
     finally:
         _REVIEW_DEADLINE.reset(token)
+
+
+@dataclass(frozen=True, slots=True)
+class _SparkJob:
+    """What the spark-gateway is told about the review a Cave call serves."""
+
+    job: str | None  # "owner/repo#N", or None when either part is unknown
+    public: bool  # True only when the repo is known to be public
+
+
+# The review's job and data class (grug#1269), set beside the deadline so the
+# same context copies carry it into the arm threads. The gateway names the PR
+# from X-Spark-Job and sends only `public` work to its free remote providers.
+_SPARK_JOB: contextvars.ContextVar[_SparkJob | None] = contextvars.ContextVar(
+    "grug_spark_job", default=None,
+)
+# The gateway accepts X-Spark-Job only as owner/repo#N.
+_SPARK_JOB_REPO = re.compile(r"[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+")
+
+
+def _spark_job(pr_context: PrContext | None) -> _SparkJob:
+    ctx = pr_context or {}
+    repo = ctx.get("repo")
+    number = ctx.get("pr_number")
+    job = None
+    if (
+        isinstance(repo, str) and _SPARK_JOB_REPO.fullmatch(repo)
+        and type(number) is int and number > 0
+    ):
+        job = f"{repo}#{number}"
+    return _SparkJob(job=job, public=ctx.get("repo_private") is False)
+
+
+@contextlib.contextmanager
+def _spark_job_scope(pr_context: PrContext | None) -> Iterator[None]:
+    """Run the block with `pr_context` as the Cave calls' job."""
+    token = _SPARK_JOB.set(_spark_job(pr_context))
+    try:
+        yield
+    finally:
+        _SPARK_JOB.reset(token)
+
+
+def _spark_job_header() -> str | None:
+    job = _SPARK_JOB.get()
+    return job.job if job is not None else None
+
+
+def _spark_data_class_header() -> str:
+    job = _SPARK_JOB.get()
+    return "public" if job is not None and job.public else "private"
+
+
+# Cave arms only: a SaaS backend has no use for either, and the repo name is
+# not its business.
+_CAVE_JOB_HEADERS: dict[str, Callable[[], str | None]] = {
+    "X-Spark-Job": _spark_job_header,
+    "X-Spark-Data-Class": _spark_data_class_header,
+}
 
 
 def _deadline_passed() -> bool:
@@ -670,8 +732,9 @@ class BackendConfig:
     # -scoped traffic opencode Go's abuse monitoring is watching for.
     # Callable, same lazy-at-call-time shape as `key_loader` above, for
     # the same reason: a bare value captured here would be frozen at
-    # `_BACKEND_CONFIGS` module-load time, not regenerated per call.
-    dynamic_headers: dict[str, Callable[[], str]] = field(default_factory=dict)
+    # `_BACKEND_CONFIGS` module-load time, not regenerated per call. A
+    # callable that returns None leaves its header off that call.
+    dynamic_headers: dict[str, Callable[[], str | None]] = field(default_factory=dict)
     timeout_seconds: float = _TIMEOUT_SECONDS
     retry_attempts: int = _RETRY_ATTEMPTS
     # Long review calls should still retry quick 429/503 responses, but must not
@@ -1579,6 +1642,8 @@ def _cave_judge_config() -> "BackendConfig | None":
         # highest-volume consumer; the gateway's dashboard/metrics `source`
         # tag fell back to a pod-IP guess for every one of its requests).
         extra_headers={"X-Spark-Priority": "interactive", "X-Spark-Caller": "grug-elder-judge"},
+        # X-Spark-Job and X-Spark-Data-Class (grug#1269), from `_SPARK_JOB`.
+        dynamic_headers=dict(_CAVE_JOB_HEADERS),
     )
 
 
@@ -1748,6 +1813,8 @@ def _cave_review_config(backend: Backend) -> "BackendConfig | None":
                 "grug-elder-reasoner" if backend == Backend.CAVE_REASONER else "grug-elder-coder"
             ),
         },
+        # X-Spark-Job and X-Spark-Data-Class (grug#1269), from `_SPARK_JOB`.
+        dynamic_headers=dict(_CAVE_JOB_HEADERS),
     )
 
 
@@ -2489,9 +2556,10 @@ def _merged_headers(config: BackendConfig, key: str) -> dict[str, str]:
         raise _BackendConfigError(
             f"{config.backend.value} extra_headers must not contain Authorization"
         )
+    dynamic = {name: fn() for name, fn in config.dynamic_headers.items()}
     return {
         **config.extra_headers,
-        **{name: fn() for name, fn in config.dynamic_headers.items()},
+        **{name: value for name, value in dynamic.items() if value is not None},
         "Authorization": f"Bearer {key}",
     }
 
@@ -4979,8 +5047,14 @@ class _Tier1Review:
         # deadline, so a started cohort cannot overrun the budget (grug#1216).
         return _MIN_DEADLINE_COHORT_SECONDS
 
-    def _deadline(self) -> contextlib.AbstractContextManager[None]:
-        return _review_deadline(self.started_at + _staged_review_budget_s())
+    @contextlib.contextmanager
+    def _deadline(self) -> Iterator[None]:
+        # The job rides along: every Cave call this review makes names it.
+        with (
+            _review_deadline(self.started_at + _staged_review_budget_s()),
+            _spark_job_scope(self.pr_context),
+        ):
+            yield
 
     def _dispatch(
         self,
@@ -7054,7 +7128,10 @@ def judge_findings(
         name=_LLMOBS_JUDGE_NAME,
     ) as span:
         try:
-            resp = _call_backend(config, messages)
+            # The judge runs outside the review's deadline, so it sets the
+            # Cave job itself.
+            with _spark_job_scope(pr_context):
+                resp = _call_backend(config, messages)
         except (_BackendConfigError, httpx.RequestError, httpx.TimeoutException) as e:
             log.warning(
                 "judge_backend_failed",

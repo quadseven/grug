@@ -1051,6 +1051,8 @@ def _dispatch_rerequest_for_pr(
             "name": repo_name,
             "full_name": f"{owner}/{repo_name}",
             "owner": {"login": owner},
+            # grug#1269: Elder tells the spark-gateway whether it is public.
+            "private": ((pr.get("base") or {}).get("repo") or {}).get("private"),
         },
         "installation": {"id": installation_id},
     }

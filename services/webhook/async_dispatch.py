@@ -198,6 +198,8 @@ def _slim_payload(payload: dict[str, Any]) -> dict[str, Any]:
         "repository": {
             "owner": {"login": (repo.get("owner") or {}).get("login")},
             "name": repo.get("name"),
+            # grug#1269: Elder tells the spark-gateway whether it is public.
+            "private": repo.get("private"),
         },
         "installation": {"id": (payload.get("installation") or {}).get("id")},
     }
