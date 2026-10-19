@@ -18,6 +18,18 @@ from personas.walkthrough.effort import ReviewEffort, effort_label
 
 MARKER = "<!-- grug-teller:walkthrough -->"
 
+# Teller portrait (repo-hosted on grug.lol) - matches Chief's pattern
+TELLER_PORTRAIT = "https://grug.lol/assets/grug_teller.png"
+TELLER_PORTRAIT_IMG = (
+    f'<img src="{TELLER_PORTRAIT}" width="46" align="left" alt="Grug Teller" />'
+)
+
+# Badge for the "View full review" button (shields.io style)
+REVIEW_BADGE = (
+    "https://img.shields.io/badge/View_full_review-181613"
+    "?style=for-the-badge&labelColor=181613"
+)
+
 # Bound the table + summary text so a sweeping PR can't blow the comment
 # body past GitHub's cap; excess files are counted, not silently dropped.
 _MAX_TABLE_ROWS = 60
@@ -124,6 +136,7 @@ def walkthrough_body(
     degraded: bool,
     files_truncated: bool = False,
     related: list | None = None,
+    pr_url: str | None = None,
 ) -> str:
     """Assemble a short walkthrough comment (default-collapsed detail).
 
@@ -144,11 +157,18 @@ def walkthrough_body(
     is then a floor, not an exact count. `summary` is model-authored:
     mentions and line-leading `#` headings are neutralized before this
     prose posts under the app's own installation-token identity.
+    `pr_url` is the PR/review URL; when provided it's rendered as a
+    badge-image button after the header.
     """
-    parts = [MARKER, "## Walkthrough", ""]
+    parts = [MARKER, TELLER_PORTRAIT_IMG, "", "## Walkthrough", ""]
     parts.append(
         _neutralize_headings(_neutralize_mentions(summary[:_MAX_SUMMARY_CHARS]))
     )
+    if pr_url:
+        parts.append("")
+        parts.append(
+            f'<a href="{pr_url}"><img src="{REVIEW_BADGE}" alt="View full review" /></a>'
+        )
     notes: list[str] = []
     if degraded:
         notes.append(

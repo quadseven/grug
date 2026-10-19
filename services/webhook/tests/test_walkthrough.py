@@ -159,6 +159,31 @@ def test_walkthrough_body_carries_marker_summary_table_diagram_effort():
     assert "deterministic sketch" not in body  # not degraded
 
 
+def test_walkthrough_body_has_branded_header_and_pr_button():
+    """T1256: walkthrough comment has a branded header image and the PR
+    link rendered as a badge-image button."""
+    files = [FileStat(path="x.py", additions=2, deletions=0, summary="tweak")]
+    pr_url = "https://github.com/o/r/pull/7"
+    body = walkthrough_body(
+        summary="Adds a guard clause.",
+        files=files,
+        diagram="graph TD\n  subgraph \"x\"\n    N0[\"x.py\"]\n  end",
+        effort="quick",
+        head_sha="a" * 40,
+        degraded=False,
+        pr_url=pr_url,
+    )
+    # Starts with marker + branded header image (Teller portrait)
+    assert body.startswith(MARKER)
+    assert 'grug_teller.png' in body
+    assert '<img src="https://grug.lol/assets/grug_teller.png"' in body
+    # Primary link (the PR) rendered as a badge-image button
+    assert pr_url in body
+    # Badge-image button: an <a> wrapping an <img> with badge styling
+    assert f'<a href="{pr_url}">' in body
+    assert 'alt="View full review"' in body
+
+
 def test_walkthrough_body_no_diagram_and_no_files_omits_the_section_silently():
     """With zero changed files there is nothing to explain - the whole
     comment is otherwise near-empty, so no degradation note is added."""
