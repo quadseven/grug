@@ -3865,7 +3865,6 @@ def classify_learning(
     When durable, `learning` is the reply restated as a short self-instructive
     rule Grug can apply verbatim, and `scope_path` is an optional glob (e.g.
     `**/middleware/*.py`) or "" for repo-wide. Emits a `grug_learn` span."""
-    import json as _json
     rule = finding_tags.get("rule_name", "")
     reply = _redact_secrets(reply_text)[:4000]
     finding = _redact_secrets(finding_text)[:2000]
@@ -3975,7 +3974,7 @@ def _repo_learnings_block(pr_context: Optional[PrContext]) -> str:
         return ""
     try:
         from adapters.pg_install_store import (  # type: ignore
-            increment_learning_usage, list_learnings,
+            list_learnings,
         )
         rows = list_learnings(str(pr_context["repo"]))
         if not rows:
