@@ -1523,3 +1523,108 @@ def test_expired_pause_reads_as_not_paused(pg):
         )
     assert store.is_elder_paused(**pr) is False
     assert store.pause_elder(**pr, head_sha="sha-b") is True
+
+
+# ---------------------------------------------------------------------------
+# Hunt Board review session: compare-and-swap row per PR (grug#1207)
+# ---------------------------------------------------------------------------
+
+
+def _session_store(store, pr_number=3):
+    pr = dict(install_id=7, repo="o/r", pr_number=pr_number)
+
+    def load():
+        return store.get_review_session(**pr)
+
+    def save(data, expected):
+        return store.put_review_session(**pr, data=data, expected_version=expected)
+
+    return load, save
+
+
+def test_review_session_put_is_compare_and_swap(pg):
+    from adapters import pg_install_store as store
+
+    pr = dict(install_id=7, repo="o/r", pr_number=3)
+    assert store.get_review_session(**pr) is None
+    assert store.put_review_session(**pr, data={"version": 1, "x": "a"}, expected_version=0)
+    # a second creator loses
+    assert not store.put_review_session(**pr, data={"version": 1, "x": "b"}, expected_version=0)
+    # a stale updater loses, the current one wins
+    assert not store.put_review_session(**pr, data={"version": 3, "x": "c"}, expected_version=2)
+    assert store.put_review_session(**pr, data={"version": 2, "x": "d"}, expected_version=1)
+    assert store.get_review_session(**pr) == {"version": 2, "x": "d"}
+    # another PR is a separate row
+    assert store.get_review_session(install_id=7, repo="o/r", pr_number=4) is None
+
+
+def test_expired_review_session_reads_absent_and_can_be_recreated(pg):
+    from adapters import pg_install_store as store
+
+    pr = dict(install_id=7, repo="o/r", pr_number=3)
+    assert store.put_review_session(**pr, data={"version": 5}, expected_version=0)
+    with store.get_pool().connection() as conn:
+        conn.execute(
+            "UPDATE grug_kv SET ttl = EXTRACT(EPOCH FROM now())::bigint - 10 "
+            "WHERE sk = %s",
+            ("HUNT#o/r#3",),
+        )
+    assert store.get_review_session(**pr) is None
+    assert not store.put_review_session(**pr, data={"version": 6}, expected_version=5)
+    assert store.put_review_session(**pr, data={"version": 1}, expected_version=0)
+
+
+def test_review_session_concurrent_personas_all_land(pg):
+    """Personas finishing at the same moment each run update_session against
+    the real row; the CAS loop must land every run and every finding."""
+    from adapters import pg_install_store as store
+    import review_session as rs
+
+    load, save = _session_store(store)
+    personas = ["elder", "guard", "teller", "smasher", "chief", "warder"]
+    barrier = threading.Barrier(len(personas))
+    errors: list[BaseException] = []
+
+    def finish(persona):
+        run = rs.ReviewRun(
+            run_id=f"{persona}-1", persona=persona, head_sha="aaa111",
+            trigger="opened", started_at="2026-10-19T10:00:00Z",
+            backend="b", model="m",
+        )
+        found = rs.ObservedFinding(
+            persona=persona, path="a.py", line=1, rule=f"{persona}-rule",
+            category="c", severity="low", confidence=None, message="m",
+            evidence=f"{persona} code",
+        )
+
+        def mutate(s):
+            s = rs.start_run(s, run)
+            return rs.complete_run(s, run.run_id, findings=[found], anchors={},
+                                   at="2026-10-19T10:05:00Z", check_run_id=1)
+
+        barrier.wait()
+        try:
+            rs.update_session(load, save, "o/r", 3, mutate,
+                              at="2026-10-19T10:00:00Z", max_attempts=50)
+        except BaseException as exc:  # surfaced by the assert below
+            errors.append(exc)
+
+    threads = [threading.Thread(target=finish, args=(p,)) for p in personas]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join(timeout=60)
+    assert errors == []
+    final = rs.from_dict(load())
+    assert final.version == len(personas)
+    assert sorted(r.persona for r in final.runs) == sorted(personas)
+    assert sorted(f.rule for f in final.findings) == sorted(f"{p}-rule" for p in personas)
+    assert final.status == "complete"
+
+    # a retried delivery of one completion is a no-op: no version bump
+    again = rs.update_session(
+        load, save, "o/r", 3,
+        lambda s: rs.complete_run(s, "elder-1", findings=[], anchors={}, at="x"),
+        at="x",
+    )
+    assert again.version == len(personas)
