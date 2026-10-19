@@ -119,3 +119,19 @@ def _mock_pr_enforcement_ensure(monkeypatch):
     import dispatcher
 
     monkeypatch.setattr(dispatcher, "_ensure_enforcement_on_pr", MagicMock())
+
+
+@pytest.fixture(autouse=True)
+def _mock_learn_living_review_sync(monkeypatch):
+    """Neutralize the learn lane's living-review sync (#1187) by default.
+
+    `rerun._run_learn` ends by syncing the PR's Elder findings, which lists
+    review threads on GitHub and reads CommentRecords from the store - side
+    effects the learn tests never expected. Tests that verify the sync patch
+    `rerun._sync_living_review` themselves (innermost patch wins).
+    """
+    from unittest.mock import MagicMock
+
+    import rerun
+
+    monkeypatch.setattr(rerun, "_sync_living_review", MagicMock(return_value=0))

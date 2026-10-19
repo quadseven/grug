@@ -3655,6 +3655,87 @@ def test_durable_and_reopened_reviews_resolve_fixed_threads(monkeypatch, action)
     assert calls == [1]
 
 
+# --- #1187: living review edits Elder's findings after a re-review ----------
+
+def _elder_thread(*, outdated=True, line=40, rule="null-deref"):
+    from personas.code_reviewer.dedup import rule_marker
+
+    root = {
+        "id": "C1", "databaseId": 1, "isMinimized": False, "url": "",
+        "author": {"login": "grug-tribe"}, "path": "src/x.py", "line": None,
+        "originalLine": line, "originalCommit": {"oid": "c0ffee"},
+        "body": f"high | _correctness_ | `{rule}`\n\nx\n\n" + rule_marker(rule),
+    }
+    return {"id": "T1", "isResolved": False, "isOutdated": outdated,
+            "comments": {"totalCount": 1, "nodes": [root]}}
+
+
+def _run_living(monkeypatch, *, threads, llm=None):
+    from personas.code_reviewer import living_review
+
+    synced: list[dict] = []
+    recorded: dict = {}
+    monkeypatch.setattr(
+        cr_dispatch.carry_forward, "list_threads",
+        lambda *a, **kw: None if threads is None else list(threads),
+    )
+    monkeypatch.setattr(
+        living_review, "sync_pr",
+        lambda *a, **kw: synced.append({"args": a, **kw}) or 0,
+    )
+    monkeypatch.setattr(cr_dispatch, "record_check_verdict", lambda **kw: recorded.update(kw))
+    _run_with_resolver(monkeypatch, "synchronize", lambda *a, **kw: 0, llm=llm)
+    return synced, recorded
+
+
+def test_rereview_syncs_living_review_with_the_listing_and_its_findings(monkeypatch):
+    threads = [_elder_thread()]
+    synced, _ = _run_living(monkeypatch, threads=threads)
+    [call] = synced
+    assert call["args"] == (11, "myorg", "myrepo", 7)
+    assert call["threads"] == threads
+    assert call["review"].head_sha == "abcd1234efgh"
+    assert [f.rule_name for f in call["review"].findings] == ["silent-failure"]
+    assert call["review"].trusted_push is False  # _payload has no head repo
+
+
+def test_only_a_same_repo_head_is_a_trusted_push():
+    """Pushing to a branch of the base repository needs write access;
+    pushing to a fork does not, and a deleted fork has no head repo."""
+    repo = {"id": 22}
+    assert cr_dispatch._head_is_same_repo({"head": {"repo": {"id": 22}}}, repo)
+    assert not cr_dispatch._head_is_same_repo({"head": {"repo": {"id": 99}}}, repo)
+    assert not cr_dispatch._head_is_same_repo({"head": {"repo": None}}, repo)
+    assert not cr_dispatch._head_is_same_repo({"head": {"sha": "x"}}, repo)
+
+
+def test_failed_listing_skips_living_review(monkeypatch):
+    synced, _ = _run_living(monkeypatch, threads=None)
+    assert synced == []
+
+
+def test_degraded_rereview_never_marks_findings_addressed(monkeypatch):
+    synced, _ = _run_living(
+        monkeypatch, threads=[_elder_thread()],
+        llm=LlmReviewResponse(kind="timeout", findings=()),
+    )
+    assert synced == []
+
+
+def test_addressed_findings_are_named_on_the_activity_row(monkeypatch):
+    """The check title is the summary the Activity feed records; a finding
+    whose line this push changed shows up there."""
+    _, recorded = _run_living(monkeypatch, threads=[_elder_thread()])
+    assert "1 earlier finding(s) addressed in abcd123" in recorded["summary"]
+
+
+def test_reraised_finding_is_not_named_addressed(monkeypatch):
+    _, recorded = _run_living(
+        monkeypatch, threads=[_elder_thread(line=3, rule="silent-failure")],
+    )
+    assert "addressed in" not in recorded["summary"]
+
+
 # --- Elder withdraws its own stale block ------------------------------------
 
 _ELDER_TAG = "<!-- grug:review persona=elder -->"

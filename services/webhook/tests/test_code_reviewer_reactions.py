@@ -281,6 +281,46 @@ def test_false_positive_reaction_refreshes_negative_prompt_guidance(monkeypatch)
     assert exemplars == [[]]
 
 
+@pytest.mark.parametrize("verdict, state, label", [
+    ("false_positive", None, "false-positive"),
+    ("false_positive", "addressed", "false-positive"),
+    (None, "dismissed", "false-positive"),
+    ("confirmed", "addressed", "fixed"),
+    (None, "addressed", "fixed"),
+    ("confirmed", None, "declined"),
+    ("confirmed", "resolved", "declined"),
+    (None, "resolved", None),
+    (None, None, None),
+])
+def test_ledger_label_combines_reaction_and_living_review_state(verdict, state, label):
+    """#1187: a resolve alone is not ground truth; a changed line is `fixed`
+    and outranks a thumbs-up; a thumbs-down or dismissal always wins."""
+    resolution = {"state": state, "sha": ""} if state else None
+    assert cr_reactions.ledger_label(verdict, resolution) == label
+
+
+def test_late_thumbs_up_keeps_an_addressed_findings_fixed_row(monkeypatch):
+    """#1187: the reaction writer and the living-review writer share one
+    evidence row; a thumbs-up after a push fixed the line must not
+    downgrade `fixed` to `declined`, and the resolution evidence stays."""
+    from adapters import install_store
+
+    rows: list[dict] = []
+    monkeypatch.setattr(install_store, "put_ledger_row", lambda row: rows.__setitem__(slice(None), [row]))
+    monkeypatch.setattr(install_store, "list_ledger_rows", lambda repo: list(rows))
+    monkeypatch.setattr(install_store, "put_repo_practices", lambda repo, data: None)
+    monkeypatch.setattr(install_store, "put_repo_exemplars", lambda repo, data: None)
+    record = _learning_record(comment_id=5)
+    record["resolution"] = {"state": "addressed", "sha": "def4567"}
+
+    assert cr_reactions._record_reaction_learning(record, "confirmed") is True
+
+    assert rows[0]["verdict"] == "fixed"
+    assert rows[0]["resolution"] == "addressed"
+    assert rows[0]["resolution_sha"] == "def4567"
+    assert rows[0]["evidence"] == "github-review-comment:5"
+
+
 def test_untrusted_record_cannot_update_learning_store():
     record = _learning_record(comment_id=6)
     record["trust_reactors"] = False

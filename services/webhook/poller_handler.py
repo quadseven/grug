@@ -15,7 +15,9 @@ Lambda this CronJob replaced at the #354 cutover).
 Best-effort by construction: one install's failure (GH 5xx, token error) logs
 and continues — a single bad install must never abort the whole poll cycle.
 The reaction engine itself dedups via `CommentRecord.last_verdict`, so a
-stale verdict isn't re-submitted every cycle.
+stale verdict isn't re-submitted every cycle. The same due records then
+drive living review (#1187), which edits each PR's Elder comments to their
+current Resolved / Dismissed state.
 """
 from __future__ import annotations
 
@@ -38,6 +40,7 @@ from adapters.install_store import (  # type: ignore
 import httpx
 from github_app_auth import with_install_token_retry
 from observability import configure_logging
+from personas.code_reviewer.living_review import sync_due_prs
 from personas.code_reviewer.reaction_cadence import reaction_poll_due
 from personas.code_reviewer.reactions import poll_and_annotate
 
@@ -240,6 +243,10 @@ def _reaction_poll_pass(installs: list[int]) -> tuple[int, int, int]:
                     fetch_token=lambda: token,
                 ),
             ) or 0
+            # Living review (#1187): bring the due records' PRs' Elder
+            # comments to their current state (Resolved / Dismissed) on the
+            # same cadence and budget gate. Never raises.
+            sync_due_prs(due, install_id=install_id)
         except Exception as e:  # noqa: BLE001 — per-install best-effort: one
             # install's listing/GH/token failure must not abort the cron cycle.
             log.warning(
