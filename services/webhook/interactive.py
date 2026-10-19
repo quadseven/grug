@@ -209,7 +209,7 @@ def run_command(
                 try:
                     token_fn(lambda t: _post_reply(t, owner, repo, pr_number,
                                                    "Usage: `/grug learnings delete <digest>`."))
-                except Exception:  # noqa: BLE001
+                except Exception:  # noqa: BLE001, S110 - cosmetic reply; a failed post must not fail the command
                     pass
                 return {"status": "no_op", "reason": "missing digest", "verb": verb}
             digest = rest.strip().strip("`")
@@ -226,14 +226,14 @@ def run_command(
                 body = f"No such marking `{digest}` on `{repo_full}`."
             try:
                 token_fn(lambda t: _post_reply(t, owner, repo, pr_number, body))
-            except Exception:  # noqa: BLE001
+            except Exception:  # noqa: BLE001, S110 - cosmetic reply; a failed post must not fail the command
                 pass
             return {"status": "dispatched", "verb": "learnings", "sub": "delete"}
 
         try:
             token_fn(lambda t: _post_reply(t, owner, repo, pr_number,
                                            "Usage: `/grug learnings list` or `/grug learnings delete <digest>`."))
-        except Exception:  # noqa: BLE001
+        except Exception:  # noqa: BLE001, S110 - cosmetic reply; a failed post must not fail the command
             pass
         return {"status": "no_op", "reason": "unknown learnings sub-command", "verb": verb}
 
@@ -242,11 +242,11 @@ def run_command(
 
 def _wake_learnings_list(repo: str) -> list[dict]:
     """Fetch the repo's active learnings (store seam - monkeypatched in tests)."""
-    from adapters.install_store import list_learnings  # type: ignore
+    from adapters.pg_install_store import list_learnings  # type: ignore
     return list_learnings(repo)
 
 
 def _wake_learnings_delete(repo: str, digest: str) -> bool:
     """Forget one learning by digest (store seam - monkeypatched in tests)."""
-    from adapters.install_store import delete_learning  # type: ignore
+    from adapters.pg_install_store import delete_learning  # type: ignore
     return delete_learning(repo, digest)
