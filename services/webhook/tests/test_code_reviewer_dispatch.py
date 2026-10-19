@@ -2186,6 +2186,30 @@ def test_partial_review_stays_advisory_but_publishes_validated_findings():
     assert "could not see" not in summary
 
 
+def test_outside_diff_findings_remain_summary_only():
+    from personas.code_reviewer.persona import CodeReviewEvaluation, Finding
+
+    finding = Finding(
+        file="src/sibling.py", line=42, severity="medium",
+        rule_name="caller-not-updated",
+        message="OUTSIDE DIFF (advisory): sibling call remains stale.",
+        suggestion=None, outside_diff_reason="Changed contract also applies here.",
+    )
+    evaluation = CodeReviewEvaluation(
+        findings=(finding,), conclusion="success",
+    )
+
+    result, posted = cr_dispatch.build_review_result(
+        evaluation, head_sha="a" * 40, event="COMMENT",
+    )
+
+    assert result is None
+    assert posted == ()
+    _, summary = cr_dispatch._summary_markdown(evaluation)
+    assert "src/sibling.py:42" in summary
+    assert "OUTSIDE DIFF (advisory)" in summary
+
+
 def test_complexity_without_split_is_summary_only_and_other_kind_still_threads():
     from personas.code_reviewer.persona import CodeReviewEvaluation, Finding
 

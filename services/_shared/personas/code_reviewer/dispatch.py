@@ -2012,6 +2012,10 @@ def build_review_result(
     if evaluation.degraded_reason not in (None, "", *PUBLISHABLE_DEGRADATIONS):
         return None, ()
     new_findings = dedup_findings(evaluation.findings, prior_keys)
+    # GitHub inline review comments must anchor to the PR diff. Outside-diff
+    # findings remain visible in the check summary, where their advisory label
+    # and file:line are retained, but are not submitted as invalid inline rows.
+    new_findings = tuple(f for f in new_findings if f.outside_diff_reason is None)
     # Complexity is summary advice by default. An inline thread requires a
     # changed-line suggestion the reviewer can apply in this PR; heavy-lift
     # findings never create reply-required threads.
@@ -2970,7 +2974,9 @@ def dispatch_code_review(
             },
         )
 
-    evaluation = evaluate_diff(hunks, llm_response)
+    evaluation = evaluate_diff(
+        hunks, llm_response, cross_file_contents=cross_file_contents,
+    )
     correctness_only = bool(pr_context.get("review_scope"))
     if correctness_only:
         evaluation = _drop_non_correctness_findings(evaluation)
@@ -3787,7 +3793,9 @@ def _grade_deep_response(
     repo_name: str,
     pull_number: int,
 ) -> tuple[CodeReviewEvaluation, tuple[Finding, ...], tuple[Any, ...], int]:
-    deep_eval = evaluate_diff(hunks, deep_llm)
+    deep_eval = evaluate_diff(
+        hunks, deep_llm, cross_file_contents=cross_file_contents,
+    )
     # The reasoner reads the same linked criteria, so its intent-mismatch
     # findings get the same evidence filter and box scope (#1170, #1218).
     deep_eval = _filter_intent_mismatches(
@@ -4255,7 +4263,9 @@ def _async_deep_append_if_needed(
         # `_derive_conclusion` seam #844 established for partial coverage.
         # The deep check-run then completes `neutral`, naming the arm that
         # never ran, in place of the unqualified Tier-1 `success`.
-        deep_eval = evaluate_diff(hunks, deep_llm)
+        deep_eval = evaluate_diff(
+            hunks, deep_llm, cross_file_contents=cross_file_contents,
+        )
         deep_graded: tuple[Finding, ...] = ()
         deep_verdicts: tuple[Any, ...] = ()
         deep_suppressed_count = 0

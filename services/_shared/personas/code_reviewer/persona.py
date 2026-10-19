@@ -88,6 +88,15 @@ def _is_static_declarative_scalar(
     return False
 
 
+def _snippet_has_line(snippet: str, line: int) -> bool:
+    """Check for an original line number in the bounded cross-file snippet."""
+    return any(
+        raw.partition(":")[0].strip().isdigit()
+        and int(raw.partition(":")[0].strip()) == line
+        for raw in snippet.splitlines()
+    )
+
+
 @dataclass(frozen=True, slots=True)
 class Finding:
     """Persona-level finding posted as a GitHub inline review comment.
@@ -117,6 +126,9 @@ class Finding:
     effort: Effort | None = None
     # Stable identity for deterministic complexity findings across pushes.
     complexity_function: str | None = None
+    # Set only for a validated cross-file snippet anchor. These findings are
+    # advisory even when the model requested a higher severity.
+    outside_diff_reason: str | None = None
     # Producer attribution for ensemble findings. Excluded from equality so
     # finding identity remains (file, line, rule) rather than observability
     # metadata; dedup and publication behavior must not change with tracing.
@@ -312,6 +324,7 @@ def _hunk_line_index(hunks: tuple[DiffHunk, ...]) -> dict[str, set[int]]:
 
 def evaluate_diff(
     hunks: tuple[DiffHunk, ...], llm_response: LlmReviewResponse,
+    *, cross_file_contents: dict[str, str] | None = None,
 ) -> CodeReviewEvaluation:
     """Pure: build a `CodeReviewEvaluation` from hunks + LLM output.
 
@@ -332,7 +345,13 @@ def evaluate_diff(
     dropped = 0
     for raw in llm_response.findings:
         allowed_lines = line_index.get(raw.path)
-        if allowed_lines is None or raw.line not in allowed_lines:
+        outside_diff = allowed_lines is None or raw.line not in allowed_lines
+        outside_reason = raw.outside_diff_reason
+        if outside_diff and not (
+            outside_reason
+            and raw.path in (cross_file_contents or {})
+            and _snippet_has_line((cross_file_contents or {})[raw.path], raw.line)
+        ):
             # Anti-hallucination: the LLM named a file/line that isn't
             # in the diff. Drop + count. Count is surfaced on the
             # evaluation so the dispatch layer can metric and tell
@@ -348,19 +367,23 @@ def evaluate_diff(
             and _is_static_declarative_scalar(raw.path, raw.line, hunks)
         ):
             continue
+        message = raw.message
+        if outside_diff:
+            message = f"OUTSIDE DIFF (advisory): {outside_reason} {message}"
         kept.append(
             Finding(
                 file=raw.path,
                 line=raw.line,
-                severity=_capped_severity(raw.rule, raw.severity, raw.message),
+                severity=("medium" if outside_diff else _capped_severity(raw.rule, raw.severity, message)),
                 rule_name=raw.rule,
-                message=raw.message,
+                message=message,
                 # #553: wire fields carry through; the anti-hallucination
                 # line gate above already guarantees a suggestion only
                 # anchors on a line the LLM actually saw.
                 suggestion=raw.suggestion,
                 effort=raw.effort,
                 origins=raw.origins,
+                outside_diff_reason=outside_reason if outside_diff else None,
             )
         )
 
