@@ -23,6 +23,7 @@ from admin import router as admin_router
 from auth.github_oauth import router as github_oauth_router
 from cf_auth import CfAuthMiddleware
 from installations import router as installations_router
+from learnings import router as learnings_router
 from aws_identity import prove_roles_anywhere_identity
 from observability import configure_logging
 
@@ -103,6 +104,7 @@ def readyz(response: Response) -> dict[str, object]:
 app.include_router(github_oauth_router)
 app.include_router(installations_router)
 app.include_router(admin_router)
+app.include_router(learnings_router)
 
 
 @app.get("/api/v1/health")
