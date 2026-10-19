@@ -9,7 +9,7 @@ prompt next to the other context blocks.
 
 Reuse, not re-implementation: closing-keyword parsing and code-span
 stripping come from Chief (`ticket_compliance.closes_refs` /
-`strip_code_spans`), section lookup from `dor_checks._section_text`, and the
+`strip_code_spans`), section lookup from `dor_checks.section_text`, and the
 fetch is Chief's `issue_fetcher.build_issue_fetcher` (injected by dispatch,
 so this module stays pure and unit-testable).
 
@@ -30,7 +30,7 @@ from collections.abc import Callable
 
 import httpx
 from markdown_safety import neutralize_mentions
-from personas.tpm.dor_checks import _section_text
+from personas.tpm.dor_checks import section_text
 from personas.tpm.ticket_compliance import closes_refs, strip_code_spans
 
 log = logging.getLogger(
@@ -105,7 +105,7 @@ def extract_criteria(issue_body: str) -> list[Criterion]:
 
     Ticked boxes are kept (marked) because a ticked box is the author's claim,
     not proof; bullets inside fences are skipped. No section => empty."""
-    text = _section_text(issue_body or "", "Acceptance criteria")
+    text = section_text(issue_body or "", "Acceptance criteria")
     if not text:
         return []
     out: list[Criterion] = []

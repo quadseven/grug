@@ -138,7 +138,7 @@ def _heading_matches(heading: str, name: str) -> bool:
     return h.startswith(n) and len(h) > len(n) and not h[len(n)].isalnum()
 
 
-def _section_text(body: str, *names: str) -> str | None:
+def section_text(body: str, *names: str) -> str | None:
     """Return text under the first matching ## section, or None.
 
     Matches case-insensitively and tolerates a trailing qualifier on the heading
@@ -155,7 +155,7 @@ def _section_text(body: str, *names: str) -> str | None:
 
 
 def check_why(body: str) -> CheckResult:
-    text = _section_text(body, "Why", "Summary")
+    text = section_text(body, "Why", "Summary")
     if text is None:
         return CheckResult("why", False, "missing ## Why (or ## Summary) section")
     word_count = len(text.split())
@@ -174,9 +174,9 @@ def check_acceptance(body: str) -> CheckResult:
     # "Test plan" was present, sending users hunting for a section that
     # doesn't exist.
     matched_name = "Acceptance criteria"
-    text = _section_text(body, "Acceptance criteria")
+    text = section_text(body, "Acceptance criteria")
     if text is None:
-        text = _section_text(body, "Test plan")
+        text = section_text(body, "Test plan")
         matched_name = "Test plan"
     if text is None:
         return CheckResult(
@@ -224,7 +224,7 @@ def check_scope_fence(body: str) -> CheckResult:
     padding. `## Why` earns its 5-word floor because a one-word why is never a
     why; a one-word fence often is a fence.
     """
-    text = _section_text(body, "Out of scope")
+    text = section_text(body, "Out of scope")
     if text is None:
         return CheckResult("scope-fence", False, "missing ## Out of scope section")
     words = len(text.split())
