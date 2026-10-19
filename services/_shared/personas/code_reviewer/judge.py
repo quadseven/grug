@@ -378,9 +378,13 @@ def run_judge(
 ) -> None:
     """Grade the evaluation's findings and submit DD LLM Obs evals - the
     eval-only compose (`grade_findings` + `submit_evals`), NO publication
-    filtering. Retained for callers/tests that only want to record evals;
-    the judge-gated publish path (dispatch, #467) calls the primitives
-    directly so it can filter between them. Best-effort - never raises."""
+    filtering. No production code calls it; only the judge test suites do.
+    The judge-gated publish path (dispatch, #467) calls `grade_findings`
+    directly so it can filter between grading and submission, and sast
+    calls `judge_findings`. Each of those callers passes an `ElderEvidence`
+    from `assemble_evidence`, and dispatch reuses the one it built for the
+    reviewer (#1189).
+    Best-effort - never raises."""
     if not any(
         _eval_targets(finding, review_span_context)
         for finding in evaluation.findings
