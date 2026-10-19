@@ -70,6 +70,8 @@ from review_pipeline import (
     render_review_map,
 )
 from datadog_switch import datadog_enabled
+import call_report
+import deep_shadow
 from secrets_loader import (
     get_opencode_go_api_key,
     get_openrouter_api_key,
@@ -617,6 +619,10 @@ class Backend(str, Enum):
     # in the default ("cave") priority path.
     OPENCODE_GO = "opencode-go"
     CAVE_REASONER = "cave-reasoner"
+    # The spark-gateway's free provider pool on its free route (grug#1269):
+    # free cloud models only, never a Spark. The last cloud chain tier, ahead
+    # of the Cave.
+    FREE_POOL = "free-pool"
 
 
 # `Severity` + `SEVERITIES` now live in the shared leaf `review_types` (#250)
@@ -1240,6 +1246,8 @@ def _backend_pool(backend: Backend, model: str) -> str:
         return "free"
     if backend == Backend.OPENCODE_GO and _opencode_go_model_is_free(model):
         return "free"
+    if backend == Backend.FREE_POOL:
+        return "free"
     return "paid"
 
 
@@ -1454,8 +1462,9 @@ def _free_tier_chain_config() -> "BackendConfig | None":
 def _cloud_chain_tiers() -> list[BackendConfig]:
     """The ordered cloud chain: opencode Go (skipped while its usage-limit
     breaker is open), an optional second free Go model, an optional paid Go
-    fallback model, OpenRouter `:free` (only if configured), then Poolside
-    laguna-s-2.1, with the Cave after all of them. Poolside was dropped in
+    fallback model, OpenRouter `:free` (only if configured), Poolside
+    laguna-s-2.1, then the spark-gateway's free provider pool (grug#1269),
+    with the Cave after all of them. Poolside was dropped in
     grug#910 as unfunded; it answers again (2026-09-26) and has the best eval
     record of the cloud models grug can reach (see `_poolside_chain_config`).
     Models on the per-model bench (`_note_model_response`) or the slow bench
@@ -1467,6 +1476,7 @@ def _cloud_chain_tiers() -> list[BackendConfig]:
         _opencode_go_fallback_chain_config(),
         _free_tier_chain_config(),
         _poolside_chain_config(),
+        _free_pool_chain_config(),
     ]
     tiers = _usable_tiers(candidates, skip_slow=True)
     if tiers:
@@ -1534,6 +1544,37 @@ def _poolside_chain_config() -> BackendConfig:
             **_BACKEND_CONFIGS[Backend.POOLSIDE].extra_body,
             "max_tokens": _CLOUD_CHAIN_MAX_TOKENS,
         },
+        timeout_seconds=_POOLSIDE_CHAIN_TIMEOUT_SECONDS,
+        retry_attempts=1,
+        transport_retry_attempts=1,
+    )
+
+
+def _free_pool_chain_config() -> BackendConfig | None:
+    """The spark-gateway's free provider pool as the last cloud tier, after
+    Poolside and ahead of the Sparks (grug#1269). The operator, 2026-10-19:
+    "I want to use free cloud models first". The free route never reaches a
+    Spark, holds every model to its free check, and sends a private repo only
+    to the providers allowed private code (`/free`); a known-public repo goes
+    to every free provider (`/free-public`). Opt-in: None unless
+    `GRUG_CLOUD_FREE_POOL` is true and the gateway URL is set, so a
+    deployment that has not asked for it keeps its chain unchanged."""
+    if os.getenv("GRUG_CLOUD_FREE_POOL", "").strip().lower() not in ("1", "true", "yes"):
+        return None
+    base = os.getenv("GRUG_CAVE_GATEWAY_URL", "").strip().rstrip("/")
+    if not base:
+        return None
+    route = "free-public" if _spark_data_class_header() == "public" else "free"
+    return BackendConfig(
+        backend=Backend.FREE_POOL,
+        url=f"{base}/{route}/v1/chat/completions",
+        # The gateway picks the provider's own free model id; this name only
+        # labels the tier until the reply names the model that served it.
+        model="free-pool",
+        key_loader=lambda: "in-cluster",  # gateway is unauthenticated in-cluster
+        extra_body={"max_tokens": _CLOUD_CHAIN_MAX_TOKENS},
+        extra_headers={"X-Spark-Priority": "interactive", "X-Spark-Caller": "grug-elder-free"},
+        dynamic_headers=dict(_CAVE_JOB_HEADERS),
         timeout_seconds=_POOLSIDE_CHAIN_TIMEOUT_SECONDS,
         retry_attempts=1,
         transport_retry_attempts=1,
@@ -1815,6 +1856,35 @@ def _cave_review_config(backend: Backend) -> "BackendConfig | None":
         },
         # X-Spark-Job and X-Spark-Data-Class (grug#1269), from `_SPARK_JOB`.
         dynamic_headers=dict(_CAVE_JOB_HEADERS),
+    )
+
+
+# grug#1191: the optional vLLM deep arm (see `deep_shadow`). Same schema,
+# completion cap, and thinking switch as the Cave reasoner it shadows or
+# replaces, so a comparison measures the model and runtime, not a different
+# request. The elder_eval `deep-shadow` bench backend sends this same body.
+DEEP_VLLM_EXTRA_BODY: dict = {
+    "response_format": _CAVE_FINDINGS_RESPONSE_FORMAT,
+    "max_tokens": 6_144,
+    **_CAVE_THINKING_OFF,
+}
+
+
+def _deep_vllm_config(arm: deep_shadow.DeepArm) -> BackendConfig:
+    """BackendConfig for the vLLM deep arm. It keeps the CAVE_REASONER
+    identity (it is the reasoner arm on another runtime); `model` tells the
+    two apart in attribution. Called directly, never through the gateway, so
+    no gateway failover can turn it into a cold load."""
+    return BackendConfig(
+        backend=Backend.CAVE_REASONER,
+        url=f"{arm.base_url}/v1/chat/completions",
+        model=arm.model,
+        key_loader=lambda: "in-cluster",  # a vLLM started without --api-key ignores it
+        extra_body=dict(DEEP_VLLM_EXTRA_BODY),
+        extra_headers={"X-Spark-Caller": f"grug-elder-deep-{arm.mode}"},
+        timeout_seconds=_review_llm_timeout_s(),
+        retry_attempts=_REVIEW_RETRY_ATTEMPTS,
+        transport_retry_attempts=_REVIEW_TRANSPORT_RETRY_ATTEMPTS,
     )
 
 
@@ -4811,6 +4881,10 @@ def _review_reasoner_diff_once(
     decision 2026-09-26). Under `cave` priority it is the Cave reasoner
     alone, as before. Never falls back to the paid SaaS valve here:
     overload insurance already ran on the Tier-1 path.
+
+    `GRUG_DEEP_ARM_MODE` (grug#1191, `deep_shadow`) can replay this prompt
+    against a vLLM arm after the answer is in (`shadow`, logged only), or
+    let that arm take the Cave reasoner call (`serve`).
     """
     if not hunks:
         return LlmReviewResponse(kind="no_diff")
@@ -4827,6 +4901,31 @@ def _review_reasoner_diff_once(
         review_map=review_map,
     )
     pr_tags = _llmobs_tags(pr_context)
+    arm = deep_shadow.resolve_deep_arm()
+    response = _deep_response(
+        hunks, messages, variant, pr_tags, installation_id, pr_context,
+        cancel_event, arm,
+    )
+    cancelled = cancel_event is not None and cancel_event.is_set()
+    if arm is not None and arm.mode == "shadow" and not cancelled:
+        deep_shadow.submit(
+            lambda: _shadow_deep_vllm(arm, messages, variant, pr_tags, pr_context, response),
+        )
+    return response
+
+
+def _deep_response(
+    hunks: list[Hunk],
+    messages: list[dict[str, str]],
+    variant: PromptVariant,
+    pr_tags: dict[str, str],
+    installation_id: int,
+    pr_context: Optional[PrContext],
+    cancel_event: threading.Event | None,
+    arm: "deep_shadow.DeepArm | None",
+) -> LlmReviewResponse:
+    """The deep pass's published answer: the cloud chain under `cloud`
+    priority, then the reasoner arm (`_run_deep_arm`)."""
     # grug#1097: a short empty cloud answer, kept if the reasoner fails too.
     low_confidence: LlmReviewResponse | None = None
     if _review_backend_priority() == "cloud":
@@ -4836,9 +4935,7 @@ def _review_reasoner_diff_once(
         if cloud_result.answer is not None:
             return cloud_result.answer
         low_confidence = cloud_result.low_confidence
-    outcome = _run_review_arm(
-        Backend.CAVE_REASONER, messages, variant, pr_tags, cancel_event,
-    )
+    outcome = _run_deep_arm(messages, variant, pr_tags, cancel_event, arm)
     if outcome.kind == "success":
         assert outcome.model is not None
         origin = _finding_origin(
@@ -4875,6 +4972,71 @@ def _review_reasoner_diff_once(
         kind="all_failed",
         error=outcome.error_text or "cave-reasoner failed",
         backend_used=Backend.CAVE_REASONER,
+    )
+
+
+def _run_deep_arm(
+    messages: list[dict[str, str]],
+    variant: PromptVariant,
+    pr_tags: dict[str, str],
+    cancel_event: threading.Event | None,
+    arm: "deep_shadow.DeepArm | None",
+) -> _ArmOutcome:
+    """The reasoner arm's one call (grug#1191). In `serve` mode the resident
+    vLLM arm answers; when it is not resident or fails, the Cave reasoner
+    answers as it does in every other mode."""
+    if arm is not None and arm.mode == "serve" and deep_shadow.is_resident(arm):
+        served = _run_review_arm(
+            Backend.CAVE_REASONER, messages, variant, pr_tags, cancel_event,
+            config_override=_deep_vllm_config(arm),
+        )
+        if served.kind == "success":
+            return served
+        log.warning(
+            "deep_vllm_failed_falling_back",
+            extra={"model": arm.model, "kind": served.kind, "error": served.error_text[:200]},
+        )
+    return _run_review_arm(
+        Backend.CAVE_REASONER, messages, variant, pr_tags, cancel_event,
+    )
+
+
+def _shadow_deep_vllm(
+    arm: deep_shadow.DeepArm,
+    messages: list[dict[str, str]],
+    variant: PromptVariant,
+    pr_tags: dict[str, str],
+    pr_context: Optional[PrContext],
+    published: LlmReviewResponse,
+) -> None:
+    """Replay the deep prompt against the vLLM arm and log how its findings
+    compare with what was published. Runs on the `deep_shadow` worker after
+    the review has its answer; its findings are dropped here, by design."""
+    if not deep_shadow.is_resident(arm):
+        return
+    started = time.monotonic()
+    outcome = _run_review_arm(
+        Backend.CAVE_REASONER, messages, variant, pr_tags,
+        config_override=_deep_vllm_config(arm),
+    )
+    shadow = deep_shadow.finding_keys(outcome.findings)
+    production = deep_shadow.finding_keys(published.findings)
+    ctx = pr_context or {}
+    log.info(
+        "deep_shadow_compared",
+        extra={
+            "repo": ctx.get("repo"),
+            "pr_number": ctx.get("pr_number"),
+            "shadow_model": arm.model,
+            "shadow_kind": outcome.kind,
+            "shadow_truncated": outcome.truncated,
+            "shadow_latency_ms": int((time.monotonic() - started) * 1000),
+            "production_kind": published.kind,
+            "production_models": list(published.models_used),
+            "production_count": len(production),
+            "shadow_count": len(shadow),
+            "overlap": len(production & shadow),
+        },
     )
 
 
@@ -5575,6 +5737,37 @@ def _ladder_failure_reason(outcome: AttemptOutcome) -> str | None:
     return text.rsplit(": ", 1)[-1]
 
 
+# Backends Elder calls directly, past the inference gateway. The gateway
+# records every call routed through it (the Cave arms, the judge, the free
+# pool); these it never sees, so `call_report` posts them to its ledger
+# (grug#1286).
+_DIRECT_BACKENDS = frozenset({Backend.OPENROUTER, Backend.POOLSIDE, Backend.OPENCODE_GO})
+
+
+def _report_direct_call(
+    backend: Backend, config: BackendConfig, outcome: "AttemptOutcome", latency_s: float,
+) -> None:
+    """One `call_report` row for a direct call that reached the network. A
+    config miss made no call and is not reported. Never raises."""
+    if backend not in _DIRECT_BACKENDS or outcome.error_kind == "config":
+        return
+    try:
+        degenerate = outcome.error_kind is None and _is_degenerate_empty_review(
+            outcome.findings, outcome.usage_metrics,
+        )
+        result, reason = call_report.outcome_for(
+            outcome.error_kind, outcome.status_code, degenerate,
+        )
+        job = _SPARK_JOB.get()
+        call_report.record(
+            backend=backend.value, model=config.model, served_model=outcome.model,
+            job=job.job if job is not None else None, status=outcome.status_code,
+            outcome=result, reason=reason, latency_s=latency_s,
+        )
+    except Exception as e:  # noqa: BLE001 - statistics must never break a review
+        log.debug("call_report_record_failed", extra={"kind": type(e).__name__})
+
+
 def _run_llm_attempt(
     *,
     backend: Backend,
@@ -5603,11 +5796,13 @@ def _run_llm_attempt(
             status_code=None, finish_reason="", usage_metrics={},
             span_context=None, raw_response=None,
         )
+    started = time.monotonic()
     outcome = _call_llm_attempt(
         backend=backend, config=config, messages=messages, variant=variant,
         pr_tags=pr_tags, cancel_event=cancel_event,
         transport_log_event=transport_log_event,
     )
+    _report_direct_call(backend, config, outcome, time.monotonic() - started)
     trail = _LADDER_TRAIL.get()
     reason = _ladder_failure_reason(outcome)
     if trail is not None and reason is not None:
@@ -6199,6 +6394,22 @@ class _CloudPrimaryResult:
     low_confidence: LlmReviewResponse | None = None
 
 
+def _empty_confirms_nothing(key: "tuple[Backend, str]") -> bool:
+    """A short empty answer from a model that gives one almost every time.
+
+    OpenRouter's `:free` model answers empty in about 7 tokens on 10k-44k
+    token cohorts (seen deciding a vote 2026-10-05, and on every call
+    2026-10-19). The gateway's free pool is whichever free model had room,
+    gemma4:31b among them, which did the same on 2026-10-19. Neither side of
+    a vote may be one of these: with the free tiers first in the chain
+    (grug#1269), the first empty was always one, and the old check looked
+    only at the second, so two lazy answers passed PRs as clean."""
+    backend, model = key
+    if backend == Backend.OPENROUTER and is_free_tier_model(model):
+        return True
+    return backend == Backend.FREE_POOL
+
+
 def _empty_answers_agree(
     first_empty: "tuple[Backend, str] | None",
     current: "tuple[Backend, str]",
@@ -6211,10 +6422,7 @@ def _empty_answers_agree(
     cohorts (2026-10-05). The same model twice is not agreement."""
     if first_empty is None or first_empty == current:
         return False
-    if current[0] == Backend.OPENROUTER and is_free_tier_model(current[1]):
-        # The `:free` model answers empty in about 7 tokens almost every
-        # time; it is the model the degenerate rule was written for, so its
-        # empty answer confirms nothing (seen deciding a vote 2026-10-05).
+    if _empty_confirms_nothing(first_empty) or _empty_confirms_nothing(current):
         return False
     log.info(
         "llm_cloud_empty_consensus",

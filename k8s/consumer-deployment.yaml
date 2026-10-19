@@ -137,7 +137,6 @@ spec:
             # evidence in webhook-deployment.yaml.
             # Chain after the deepseek-v4.1-flash primary (default in llm_client.py): paid
             # mimo-v2.5 second opinion, then the free Longcat. Unset = no tier.
-            - {name: GRUG_OPENCODE_GO_SECOND_MODEL, value: "mimo-v2.5"}
             - {name: GRUG_OPENCODE_GO_FALLBACK_MODEL, value: "longcat-2.5-preview-free"}
             - {name: GRUG_CLOUD_FREE_TIER_MODEL, value: "nvidia/nemotron-3-super-120b-a12b:free"}
             # grug#1225: switched off 2026-10-17, the OpenCode Go allowance and
@@ -145,7 +144,15 @@ spec:
             # 11 OpenRouter paid refusals, 139 free per-day 429s over 402 Elder
             # runs). A listed backend is never called. Re-enable one by deleting
             # its entry; `openrouter:free` or `openrouter:paid` narrows to one pool.
-            - {name: GRUG_DISABLED_BACKENDS, value: "opencode-go,openrouter"}
+            # grug#1269: OpenRouter's free pool is back on 2026-10-19 (the operator
+            # wants the free tiers used up first); its paid pool stays off.
+            - {name: GRUG_DISABLED_BACKENDS, value: "opencode-go,openrouter:paid"}
+            # grug#1269: the gateway's free provider pool is a cloud tier after
+            # Poolside, ahead of the Sparks (free cloud models first).
+            - {name: GRUG_CLOUD_FREE_POOL, value: "true"}
+            # grug#1286: post Elder's direct calls (OpenRouter, Poolside, OpenCode
+            # Go) to the inference gateway's call ledger, beside the calls it routes.
+            - {name: GRUG_CALL_REPORT, value: "true"}
             - {name: GRUG_PROMPT_EXPERIMENT_SSM, value: /grug/elder-prompt-experiment}
             # Tiered Elder (#645): coder arm on every PR; reasoner only on
             # escalation / sample. Rollback to always-on dual-arm: deep.
@@ -236,6 +243,12 @@ spec:
             # Same value as the webhook; test_cave_models_match_the_webhook holds them.
             - {name: GRUG_CAVE_REVIEW_MODEL, value: "spark:warm-any"}
             - {name: GRUG_CAVE_REASONER_MODEL, value: "spark:warm-any"}
+            # grug#1191: the optional vLLM deep arm (services/_shared/deep_shadow.py).
+            # off = the reasoner above, unchanged. shadow = also replay the deep
+            # prompt against GRUG_DEEP_SHADOW_URL/_MODEL and log a comparison only.
+            # serve = that arm answers the reasoner call; CI refuses it until the
+            # elder_eval gate passes for the model. Rollback is setting this to off.
+            - {name: GRUG_DEEP_ARM_MODE, value: "off"}
             # Omen production-signal fusion (#470). Fails open: no DD key env
             # (its params were deleted with Datadog) = zero DD
             # calls = today's review.
