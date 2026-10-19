@@ -81,6 +81,32 @@ def test_threads_that_no_longer_stand_are_not_carried(thread):
     assert cf.select_carried([thread], ()) == ()
 
 
+def _wrapped(state):
+    """A thread whose Elder comment living review (#1187) has annotated."""
+    from personas.code_reviewer import living_review as lr
+
+    t = _thread()
+    root = t["comments"]["nodes"][0]
+    root["body"] = lr.render(root["body"], state)
+    return t
+
+
+def test_dismissed_finding_is_not_carried():
+    """#1187: a maintainer's thumbs-down dismissed it; it no longer stands."""
+    from personas.code_reviewer import living_review as lr
+
+    assert cf.select_carried([_wrapped(lr.DISMISSED)], ()) == ()
+
+
+def test_annotated_body_still_reads_its_severity():
+    """A stale Resolved chip on a thread a person reopened is still an open
+    finding: the severity comes from the preserved original header."""
+    from personas.code_reviewer import living_review as lr
+
+    [c] = cf.select_carried([_wrapped(lr.RESOLVED)], ())
+    assert c.severity == "high"
+
+
 def test_reraised_finding_is_not_double_counted():
     assert cf.select_carried([_thread()], (_finding(line=14),)) == ()
     # a different rule, a different file, or a far line is a separate finding
