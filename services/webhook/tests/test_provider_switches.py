@@ -175,7 +175,7 @@ def test_the_free_pool_answers_before_any_spark_is_asked(monkeypatch) -> None:
         "cave.test/free/": _finding_response(),
     })
     with patch.object(httpx, "post", side_effect=fake):
-        out = review_diff([_hunk()], installation_id=1)
+        out = review_diff(assemble_evidence([_hunk()]), installation_id=1)
     assert out.kind == "reviewed"
     assert out.backend_used == Backend.FREE_POOL
     assert [u for u in fake.urls if "cave.test" in u] == [
@@ -209,7 +209,7 @@ def test_free_tier_empties_never_pass_a_pr_the_sparks_review_it(monkeypatch) -> 
         _CAVE_URL: _finding_response(),
     })
     with patch.object(httpx, "post", side_effect=fake):
-        out = review_diff([_hunk()], installation_id=1)
+        out = review_diff(assemble_evidence([_hunk()]), installation_id=1)
     assert out.kind == "reviewed"
     assert out.backend_used == Backend.CAVE
     assert len(out.findings) == 1
