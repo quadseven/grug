@@ -302,6 +302,31 @@ def test_unbounded_fanout_shared_backend_rule_present():
     assert "unbounded-fanout-shared-backend" in crp.build_system_prompt()
 
 
+def test_unbounded_structured_output_schema_rule_present():
+    """Weekly harvest 2026-10-19: a guided-decoding schema whose array has no
+    `maxItems`, or whose free-text string has no `maxLength`, lets the output
+    budget end a runaway generation mid-token -- so the whole payload is
+    unparseable and the COMPLETE items in it are lost with the rest. #1249
+    bounded the Cave findings array (`maxItems` 50) after three eval cases came
+    back as ~120k characters of truncated JSON; raising the cap from 8192 to
+    32768 had only made the lists run longer, which is why the fix belongs in
+    the schema and not the cap. #1252 then had to bound the finding message as
+    well: with the list bounded, one message ran away inside it and grug#494
+    still returned 143949 characters whose first finding never closed."""
+    rule = next(
+        (r for r in crp.RULES if r.name == "unbounded-structured-output-schema"),
+        None,
+    )
+    assert rule is not None, (
+        "unbounded-structured-output-schema missing from RULES"
+    )
+    assert rule.bug_class == "robustness"
+    assert "unbounded-structured-output-schema" in crp.build_system_prompt()
+    # The remedy, not just the name, has to reach the prompt: the cap is not
+    # the fix, and the bound is what makes a runaway end as valid JSON.
+    assert "maxItems" in rule.description and "maxLength" in rule.description
+
+
 def test_voice_has_mandatory_bookend_structure():
     """#343: the voice instruction mandates the structural bookends that
     keep the caveman cadence from slipping to plain English under technical
