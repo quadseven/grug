@@ -402,6 +402,7 @@ def dispatch_walkthrough_review(
             },
         )
 
+    pr_url = f"https://github.com/{owner}/{repo_name}/pull/{pull_number}"
     body = walkthrough_body(
         summary=summary,
         files=files,
@@ -411,6 +412,7 @@ def dispatch_walkthrough_review(
         degraded=degraded,
         files_truncated=files_truncated,
         related=related,
+        pr_url=pr_url,
     )
 
     try:
