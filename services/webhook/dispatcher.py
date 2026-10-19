@@ -939,9 +939,12 @@ def run_chief_recheck(
     the `publish_failed` sentinel in the map, never a raise (since #550).
     Unexpected errors propagate; each caller owns its containment."""
     from personas.tpm.issue_fetcher import (  # type: ignore
-        build_issue_facts_fetcher, build_issue_fetcher,
+        build_changed_files_fetcher, build_issue_facts_fetcher,
+        build_issue_fetcher,
     )
-    from personas.tpm.persona import evaluate_pull_request, publish_tpm_evaluation  # type: ignore
+    from personas.tpm.persona import (  # type: ignore
+        _ADVISORY_CHECKS, evaluate_pull_request, publish_tpm_evaluation,
+    )
 
     # Same fetcher builder as the pull_request webhook path (#782).
     # Pre-#782 this call was bare `evaluate_pull_request(pr_body)`, so
@@ -957,9 +960,21 @@ def run_chief_recheck(
     facts_fetcher = build_issue_facts_fetcher(
         installation_id=installation_id, owner=owner, repo=repo,
     )
+    # Same shared builder for the PR's changed files, so the in-scope check
+    # evaluates identically on the webhook and `/grug recheck` paths.
+    fetch_changed_files = build_changed_files_fetcher(
+        installation_id=installation_id, owner=owner, repo=repo,
+        pr_number=pr_number,
+    )
+    # in-scope is advisory by default here (no repo config read at this
+    # surface); the pull_request webhook path may promote it to blocking.
+    advisory_checks = _ADVISORY_CHECKS
     evaluation = evaluate_pull_request(
-        pr_body, fetch_issue=fetcher, fetch_issue_facts=facts_fetcher,
+        pr_body,
+        fetch_issue=fetcher, fetch_issue_facts=facts_fetcher,
+        fetch_changed_files=fetch_changed_files,
         author_trusted=author_trusted,
+        advisory_checks=advisory_checks,
     )
     # publish_tpm_evaluation never raises on a failed publish since #550:
     # the seam classifies ANY publish failure into the "publish_failed"
@@ -972,6 +987,7 @@ def run_chief_recheck(
         repo=repo,
         head_sha=head_sha,
         pr_number=pr_number,
+        advisory_checks=advisory_checks,
     )
     return evaluation, result_map
 

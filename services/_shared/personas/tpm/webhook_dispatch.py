@@ -36,10 +36,12 @@ def dispatch_pull_request(ctx: PullRequestContext) -> dict[str, str]:
     try:
         from personas.publish_check import PUBLISH_FAILED  # type: ignore
         from personas.tpm.issue_fetcher import (  # type: ignore
-            build_issue_facts_fetcher, build_issue_fetcher,
+            build_changed_files_fetcher, build_issue_facts_fetcher,
+            build_issue_fetcher,
         )
         from personas.tpm.persona import (  # type: ignore
-            evaluate_pull_request, is_trusted_operator, publish_tpm_evaluation,
+            _ADVISORY_CHECKS, evaluate_pull_request, is_trusted_operator,
+            publish_tpm_evaluation,
         )
         # The fetcher is the only impure boundary of the evaluation:
         # evaluate_pull_request itself stays pure (spec 0002) -- the
@@ -54,13 +56,45 @@ def dispatch_pull_request(ctx: PullRequestContext) -> dict[str, str]:
             installation_id=ctx.installation_id,
             owner=ctx.owner, repo=ctx.repo_name,
         )
+
+        # The PR's changed files: the in-scope check compares them against
+        # the linked issue body (the scope oracle). Built as a no-arg
+        # callable capturing the PR coordinates, so evaluate_pull_request
+        # stays pure (the fetcher is a parameter, not a call inside it).
+        fetch_changed_files = build_changed_files_fetcher(
+            installation_id=ctx.installation_id,
+            owner=ctx.owner, repo=ctx.repo_name, pr_number=ctx.pr_number,
+        )
+
+        # Advisory vs blocking: `in-scope` is advisory by default; org/repo
+        # config (`tpm_in_scope_blocking`) promotes it to blocking. Repo id
+        # lives on the webhook payload's repository object.
+        advisory_checks = set(_ADVISORY_CHECKS)
+        try:
+            from adapters.install_store import get_repo_config  # type: ignore
+            repo_id = ((ctx.payload or {}).get("repository") or {}).get("id")
+            if isinstance(repo_id, int):
+                cfg = get_repo_config(ctx.installation_id, repo_id) or {}
+                if cfg.get("tpm_in_scope_blocking"):
+                    advisory_checks.discard("in-scope")
+        except Exception as exc:  # noqa: BLE001 - config read must not freeze Chief
+            log.warning(
+                "tpm_in_scope_config_read_failed",
+                extra={"pr_number": ctx.pr_number, "kind": type(exc).__name__},
+            )
+        advisory_checks = frozenset(advisory_checks)
+
         # The author's trust is read here, at the impure edge, so the
         # evaluation stays pure (grug#1251).
         evaluation = evaluate_pull_request(
-            ctx.pr_body, fetch_issue=fetcher, fetch_issue_facts=facts_fetcher,
+            ctx.pr_body,
+            fetch_issue=fetcher,
+            fetch_issue_facts=facts_fetcher,
+            fetch_changed_files=fetch_changed_files,
             author_trusted=is_trusted_operator(
                 (ctx.payload or {}).get("pull_request"),
             ),
+            advisory_checks=advisory_checks,
         )
         result_map = publish_tpm_evaluation(
             evaluation,
@@ -69,6 +103,7 @@ def dispatch_pull_request(ctx: PullRequestContext) -> dict[str, str]:
             repo=ctx.repo_name,
             head_sha=ctx.head_sha,
             pr_number=ctx.pr_number,
+            advisory_checks=advisory_checks,
         )
         if result_map["result"] == PUBLISH_FAILED:
             # Pre-#550 a failed publish raised past the compliance block,
