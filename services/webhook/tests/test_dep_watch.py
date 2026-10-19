@@ -32,7 +32,7 @@ def _wire(monkeypatch, *, enabled=True, vulns=None, existing_report=None):
     monkeypatch.setattr(dw, "_discover_manifests", lambda t, o, r: ["requirements.txt"])
     monkeypatch.setattr(dw, "_fetch_manifest",
                         lambda t, o, r, p: "requests==2.19.0\n" if p == "requirements.txt" else None)
-    monkeypatch.setattr(dw, "_audit", lambda deps, *, strict=False: vulns if vulns is not None else {})
+    monkeypatch.setattr(dw, "audit_deps", lambda deps, *, strict=False: vulns if vulns is not None else {})
     monkeypatch.setattr(dw, "claim_dep_watch_report", lambda i, r: True)
     monkeypatch.setattr(dw, "_existing_report", lambda t, o, r: existing_report)
     writes = []
@@ -100,7 +100,7 @@ def test_definite_write_failure_releases_claim(monkeypatch):
     monkeypatch.setattr(dw, "_discover_manifests", lambda t, o, r: ["requirements.txt"])
     monkeypatch.setattr(dw, "_fetch_manifest",
                         lambda t, o, r, p: "requests==2.19.0\n" if p == "requirements.txt" else None)
-    monkeypatch.setattr(dw, "_audit", lambda deps, *, strict=False: {("requests", "2.19.0"): ["GHSA-x"]})
+    monkeypatch.setattr(dw, "audit_deps", lambda deps, *, strict=False: {("requests", "2.19.0"): ["GHSA-x"]})
     monkeypatch.setattr(dw, "_existing_report", lambda t, o, r: None)
     monkeypatch.setattr(dw, "claim_dep_watch_report", lambda i, r: True)
     released = []
@@ -123,7 +123,7 @@ def test_lookup_failure_does_not_burn_claim(monkeypatch):
     monkeypatch.setattr(dw, "_discover_manifests", lambda t, o, r: ["requirements.txt"])
     monkeypatch.setattr(dw, "_fetch_manifest",
                         lambda t, o, r, p: "requests==2.19.0\n" if p == "requirements.txt" else None)
-    monkeypatch.setattr(dw, "_audit", lambda deps, *, strict=False: {("requests", "2.19.0"): ["GHSA-x"]})
+    monkeypatch.setattr(dw, "audit_deps", lambda deps, *, strict=False: {("requests", "2.19.0"): ["GHSA-x"]})
     monkeypatch.setattr(
         dw, "_existing_report",
         lambda t, o, r: (_ for _ in ()).throw(httpx.ConnectTimeout("gh down", request=None)),
@@ -184,7 +184,7 @@ def test_osv_outage_counts_failed_not_clean(monkeypatch):
     monkeypatch.setattr(dw, "_fetch_manifest", lambda t, o, r, p: "requests==2.19.0\n")
     def _osv_down(deps, *, strict=False):
         raise httpx.ConnectTimeout("osv down", request=None)
-    monkeypatch.setattr(dw, "_audit", _osv_down)
+    monkeypatch.setattr(dw, "audit_deps", _osv_down)
     claims = []
     monkeypatch.setattr(dw, "claim_dep_watch_report", lambda i, r: claims.append(r) or True)
     filed, failed = dw.run_dep_watch_for_install("tok", 1, [{"id": 9, "full_name": "o/r"}])
@@ -202,7 +202,7 @@ def test_sca_audit_strict_reraises(monkeypatch):
         lambda *a, **kw: (_ for _ in ()).throw(httpx.ConnectTimeout("osv down", request=None)),
     )
     dep = sca.ChangedDep(file="requirements.txt", line=1, name="requests", version="2.19.0")
-    assert sca._audit((dep,)) == {}  # diff path: fail-open
+    assert sca.audit_deps((dep,)) == {}  # diff path: fail-open
     import pytest
     with pytest.raises(httpx.ConnectTimeout):
-        sca._audit((dep,), strict=True)
+        sca.audit_deps((dep,), strict=True)

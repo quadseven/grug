@@ -103,3 +103,28 @@ def test_no_module_imports_a_private_name_from_the_code_reviewer_dispatch():
                     if a.name.startswith("_")
                 ]
     assert offenders == []
+
+
+def test_no_persona_imports_a_private_name_from_another_persona():
+    """The issue's first criterion in full (#511): a persona may share code
+    with another persona only through public names, so a rename inside one
+    persona cannot silently break another."""
+    offenders = []
+    for path in _PERSONAS.rglob("*.py"):
+        rel = path.relative_to(_PERSONAS).parts
+        own = rel[0] if len(rel) > 1 else None
+        for node in ast.walk(ast.parse(path.read_text())):
+            if not (
+                isinstance(node, ast.ImportFrom)
+                and node.module
+                and node.module.startswith("personas.")
+            ):
+                continue
+            other = node.module.split(".")[1]
+            if other == own:
+                continue
+            offenders += [
+                f"{'/'.join(rel)}: {node.module}.{a.name}"
+                for a in node.names if a.name.startswith("_")
+            ]
+    assert offenders == []

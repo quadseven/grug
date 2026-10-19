@@ -21,6 +21,7 @@ from __future__ import annotations
 import logging
 import os
 
+from personas.code_reviewer import autopause
 from personas.registry import PullRequestContext
 
 log = logging.getLogger(f"{os.getenv('DD_SERVICE', 'grug')}.persona.code_reviewer.webhook_dispatch")
@@ -30,8 +31,15 @@ def dispatch_pull_request(ctx: PullRequestContext) -> dict[str, str]:
     """Enqueue the Elder review. `ctx.blocking` carries the repo's
     `code_reviewer_blocking` flag (defaults False; operator flips via
     dashboard once LLM-finding trust is established - advisory-first
-    prevents false positives from blocking velocity)."""
+    prevents false positives from blocking velocity).
+
+    A push during rapid development may be held instead (grug#1188, see
+    `autopause`): nothing is enqueued and the result names the pause."""
     from async_dispatch import enqueue_elder_review  # lazy: webhook-only + keeps cold-start cheap
+
+    decision = autopause.gate_push(ctx)
+    if decision != "review":
+        return {"persona": "code_reviewer", "result": decision}
 
     enqueued = enqueue_elder_review(
         payload=ctx.payload,

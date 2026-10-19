@@ -396,6 +396,15 @@ for a comment outside the diff - and the job completes with
 `result:review_rejected` instead of redriving (#770); `permanent:false` is a
 5xx/transport/429 and redrives as `publish_failed`); webhook 500 -> DD `@event:(tpm_dispatch_unhandled OR code_review_dispatch_unhandled)` (last-resort guards, empty in steady state).
 
+**Auto-pause checks (grug#1188):** a push that got no Elder check while
+others did -> DD `@event:elder_autopause_held_push` (the PR is paused; the
+note on the PR names `/grug resume` and `/grug review`). A pause that should
+have engaged but did not -> `@event:elder_autopause_gate_failed` (store
+error, failed open to review) or `@event:elder_autopause_note_failed` (note
+did not post, pause lifted again). Set `GRUG_ELDER_AUTOPAUSE_PUSHES=0` on
+`grug-webhook` to turn auto-pause off; `GRUG_ELDER_AUTOPAUSE_WINDOW_MINUTES`
+sets the window (defaults 5 pushes / 10 minutes).
+
 **Security-suite checks (SAST/SCA/secret/IaC):** the four candidate sources
 are best-effort - a detector failure returns `()` and never breaks the core
 review, which also means a silently-broken detector looks like "no findings."
@@ -664,7 +673,113 @@ and production Elder traffic under `ml_app:grug-elder`.
 Compare a candidate runtime (e.g. vLLM) by pointing `GRUG_BENCH_CAVE_URL`
 at that server with the same model id and re-running; keep the fixture
 set identical. Decision rule for #649: only cut over if p95 complete at
-C=4/8 improves without a parse-fail regression.
+C=4/8 improves without a parse-fail regression. That cutover now goes
+through the optional vLLM deep arm below (grug#1191).
+
+### Optional vLLM deep arm: shadow, eval gate, serve (grug#1191)
+
+The deep (reasoner) pass can use a dedicated vLLM server. One env var,
+`GRUG_DEEP_ARM_MODE`, set the same on `grug-webhook` and `grug-consumer`,
+controls it (a test keeps the two equal):
+
+| Mode | What publishes | What the vLLM arm does |
+|---|---|---|
+| `off` (default) | the deep pass as before | nothing |
+| `shadow` | the deep pass as before | replays the same prompt on one background worker; logs `deep_shadow_compared` only |
+| `serve` | the vLLM arm, in place of the Cave reasoner call | answers; when it is not resident or fails, the Cave reasoner answers (`deep_vllm_failed_falling_back`) |
+
+`GRUG_DEEP_SHADOW_URL` is the server's base URL (no `/v1` suffix) and
+`GRUG_DEEP_SHADOW_MODEL` the id it serves (`--served-model-name`). Point
+the URL at vLLM itself, never at the spark-gateway: a gateway can fail
+over to a cold Ollama load, which is the failure this arm must not repeat.
+The real host and model belong in the operator's private ops notes and
+the deployment's env, not in this file.
+
+**Order of work.** Each step needs the one before it.
+
+1. Latency baseline. Run the review latency harness above against the
+   current reasoner and the vLLM server with the same fixtures, and keep
+   the result. Shadow traffic starts only after this.
+2. Shadow. Set `GRUG_DEEP_ARM_MODE=shadow` plus the URL and model. Read
+   `deep_shadow_compared` (production vs shadow counts, `overlap`,
+   `shadow_latency_ms`, `shadow_kind`). `deep_shadow_skipped_busy` means a
+   review finished while the previous shadow call was still running; that
+   review is not shadowed, by design, so a slow host never builds a queue.
+3. Eval gate. Record the candidate as its own baseline entry, then commit
+   the refreshed `baseline.json`:
+
+   ```bash
+   export GRUG_BENCH_DEEP_SHADOW_URL='https://<your-vllm-host>/v1/chat/completions'
+   export GRUG_BENCH_DEEP_SHADOW_MODEL='<served-model-name>'
+   make elder-eval ARGS="--backend deep-shadow --record"
+   ```
+
+   `elder_eval.gate.deep_cutover_regressions` passes only when the
+   `deep-shadow` entry measured that exact model, scored at least as many
+   cases as the `cave` entry with none errored, and is no worse on overall
+   catch or noise. Both entries come from the same bench mode.
+4. Serve. Set `GRUG_DEEP_ARM_MODE=serve` in `k8s/*-deployment.yaml`. CI
+   (`test_a_committed_serve_mode_has_passed_the_eval_gate`) refuses the
+   change until step 3 passes for the model in `GRUG_DEEP_SHADOW_MODEL`. A
+   live `kubectl set env` skips that check, so do not cut over that way.
+
+**Always hot.** Before every call the arm reads `GET <url>/v1/models`
+(cached 60s) and goes ahead only when the configured id is listed with
+`owned_by: "vllm"`. vLLM loads its one model when the process starts, so a
+listed model is resident. An Ollama-style front lists models it would load
+on demand and is refused (`deep_vllm_not_resident`). To check by hand:
+
+```bash
+curl -s <url>/v1/models | jq '.data[] | {id, owned_by}'
+```
+
+A fresh `deep_vllm_not_resident` or `deep_vllm_probe_failed` in the pod
+logs means the arm is being skipped, not cold-loaded. Look at the server.
+
+**Running the server.** Pin the image by digest, never by tag, and record
+the digest in the private ops notes next to the host:
+
+```bash
+docker run -d --restart unless-stopped --gpus all --ipc host -p 8000:8000 \
+  -e TORCH_CUDA_ARCH_LIST='<sm of the GPU, e.g. 12.1 for GB10, 9.0 for H100>' \
+  -e VLLM_ATTENTION_BACKEND=FLASHINFER \
+  -v <model-cache>:/root/.cache/huggingface \
+  vllm/vllm-openai@sha256:<digest> \
+  --model <hf-model-id> --served-model-name <served-model-name> \
+  --max-model-len <fits the largest cohort prompt> \
+  --gpu-memory-utilization <0.85-0.92; leave room for the KV cache> \
+  --enable-prefix-caching --enable-chunked-prefill
+```
+
+- `TORCH_CUDA_ARCH_LIST`: the GPU's SM version, used for kernels that
+  are compiled when the server starts. Check that the image's release
+  notes cover that SM before you pin its digest. A digest that does not
+  cover it can fail at load or run slow fallback kernels.
+- `VLLM_ATTENTION_BACKEND=FLASHINFER`: FlashInfer attention, set
+  explicitly so an image bump that changes vLLM's default backend shows up
+  as a diff in the ops notes, not as a quiet change in latency. If the
+  image cannot run it on that SM, expect a startup failure. That is the
+  failure you want, because it shows before any review reaches the arm.
+- `--enable-prefix-caching` and `--enable-chunked-prefill`: Elder prompts
+  share a long system prefix, and cohorts are long prefills. These two
+  flags are the continuous-batching gain this arm exists to measure.
+- `--restart unless-stopped`, no idle timeout, no scale-to-zero: the model
+  must stay loaded. Anything that unloads it on idle breaks the always-hot
+  rule, and the probe above will then skip the arm.
+- No `--api-key` is assumed. If the server is reachable from outside the
+  cluster network, put it behind a network policy instead.
+
+**Rollback** is one change from either mode:
+
+```bash
+kubectl -n grug set env deploy/grug-webhook deploy/grug-consumer GRUG_DEEP_ARM_MODE=off
+```
+
+Then commit `GRUG_DEEP_ARM_MODE: "off"` in both manifests so the next
+deploy does not undo it. The current reasoner (spark-gateway,
+`GRUG_CAVE_REASONER_MODEL`) is never removed by this arm, so `off` always
+has something to go back to. Leave the existing Ollama install on its
+host as the gateway's rollback target. Nothing here uninstalls it.
 
 ### Rollback
 

@@ -113,6 +113,11 @@ the adaptive quiet window:
   exists - a moat that comes from owning the stack end-to-end.
 - **Stable snapshot identity** - bot HTML footers no longer thrash mid-flight
   reviews; only base/head or real human intent changes re-queue Elder.
+- **Living Hunt + auto-pause** - a push after Elder's first review gets a delta
+  review of only what changed since the last reviewed head, with the commit
+  range in the check title. Five pushes inside ten minutes pause Elder with one
+  note on the PR; `/grug resume` lifts the pause and reviews the delta, and
+  `/grug review` takes one look while the pause stays (grug#1188).
 - **Feedback learning** - judge labels and write-authorized maintainer reactions
   retain per-model provenance. Confirmed findings refresh positive practices and
   few-shot examples; false positives become bounded AVOID guidance for later

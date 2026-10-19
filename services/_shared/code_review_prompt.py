@@ -562,6 +562,33 @@ RULES: tuple[ReviewRule, ...] = (
         "verdicts = await asyncio.gather(*(_bounded(c) for c in candidates))",
         severity="medium",
     ),
+    # ── unbounded guided-decoding schema (harvest 2026-10-19: #1249, #1252) ──
+    ReviewRule(
+        name="unbounded-structured-output-schema",
+        bug_class="robustness",
+        description="A JSON schema that CONSTRAINS model output -- a "
+        "`response_format` / `json_schema` block, or a tool/function "
+        "parameter schema fed to guided decoding -- carrying an array with "
+        "no `maxItems`, or a free-text string with no `maxLength`. The token "
+        "budget, not the schema, then ends a runaway generation, and it ends "
+        "it MID-TOKEN: the whole payload is unparseable, so every item in it "
+        "is lost including the complete ones. With a bound the decoder closes "
+        "the structure itself, so the worst case degrades to a short but "
+        "VALID answer. Raising the output cap is NOT the fix -- a bigger cap "
+        "only lets the runaway run longer. Size each bound from what the "
+        "consumer already keeps: its own truncation cap, or the most it will "
+        "grade or display. Flag ONLY schemas that constrain generation; a "
+        "schema used to validate an already-received payload, and enum or "
+        "fixed-width fields, are not this.",
+        bad_example='"findings": {"type": "array",            # no maxItems\n'
+        '             "items": {"properties": {\n'
+        '                 "message": {"type": "string"}}}}    # no maxLength',
+        good_example='"findings": {"type": "array", "maxItems": MAX_FINDINGS,\n'
+        '             "items": {"properties": {\n'
+        '                 "message": {"type": "string",\n'
+        '                             "maxLength": MAX_MESSAGE_CHARS}}}}',
+        severity="medium",
+    ),
 )
 
 
@@ -676,9 +703,13 @@ _OUTPUT_CONTRACT = (
     '{"findings": [{"path": str, "line": int, "rule": str, '
     '"severity": "low"|"medium"|"high"|"critical", "message": str, '
     '"suggestion": str (OPTIONAL), "effort": "quick-win"|"heavy-lift" '
-    '(OPTIONAL)}]}. '
+    '(OPTIONAL), "outside_diff_reason": str (OPTIONAL)}]}. '
     "`rule` MUST be one of the rule names above. `line` is the new-side "
-    "line number from the diff. `severity` reflects THIS instance "
+    "line number from the diff. A finding on an UNCHANGED cross-file context "
+    "line is allowed only when you provide `outside_diff_reason`, naming the "
+    "specific changed behavior and why this sibling site is also wrong. "
+    "Such findings are advisory. Never use any other repository line. "
+    "`severity` reflects THIS instance "
     "(the per-rule severity is only a default hint). `suggestion` is the "
     "EXACT replacement text for ONLY the flagged line - plain code, no "
     "diff syntax, no backticks; include it ONLY when you are confident "

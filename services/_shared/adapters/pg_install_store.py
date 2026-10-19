@@ -791,6 +791,134 @@ def get_elder_last_reviewed(
     return str(head) if head else None
 
 
+# --- Elder auto-pause: push log + pause row per PR (grug#1188) -----------
+# Two rows beside ELDER#LAST. The push log holds the epoch seconds of the
+# PR's recent pushes; the pause row exists while Elder is paused. Both are
+# install-scoped like ELDER#LAST.
+
+
+def _elder_pushes_sk(repo: str, pr_number: int) -> str:
+    return f"ELDER#PUSHES#{repo}#{int(pr_number)}"
+
+
+def _elder_paused_sk(repo: str, pr_number: int) -> str:
+    return f"ELDER#PAUSED#{repo}#{int(pr_number)}"
+
+
+def record_elder_push(
+    *,
+    install_id: int,
+    repo: str,
+    pr_number: int,
+    window_seconds: int,
+    pushed_at: int | None = None,
+) -> int:
+    """Append one push and return how many pushes fall inside the window.
+
+    One atomic statement: rapid pushes arrive as concurrent webhook
+    deliveries, and a read-modify-write would drop some of them. Entries
+    older than the window are pruned on the same write. The row's TTL is
+    one window past the newest push, so an expired row only holds pushes
+    the cutoff would drop anyway.
+    """
+    now = int(pushed_at if pushed_at is not None else datetime.now(timezone.utc).timestamp())
+    cutoff = now - int(window_seconds)
+    attrs = {"repo": repo, "pr_number": int(pr_number), "pushes": [now]}
+    with get_pool().connection() as conn:
+        row = conn.execute(
+            """
+            INSERT INTO grug_kv (pk, sk, data, ttl)
+            VALUES (%(pk)s, %(sk)s, %(data)s, %(ttl)s)
+            ON CONFLICT (pk, sk) DO UPDATE
+                SET data = jsonb_set(
+                        grug_kv.data, '{pushes}',
+                        COALESCE(
+                            (SELECT jsonb_agg(p)
+                             FROM jsonb_array_elements(grug_kv.data->'pushes') AS p
+                             WHERE p::numeric > %(cutoff)s),
+                            '[]'::jsonb
+                        ) || to_jsonb(%(now)s::bigint)
+                    ),
+                    ttl = %(ttl)s
+            RETURNING jsonb_array_length(data->'pushes')
+            """,
+            {
+                "pk": _inst_pk(install_id),
+                "sk": _elder_pushes_sk(repo, pr_number),
+                "data": encode_attrs(attrs),
+                "ttl": now + int(window_seconds),
+                "cutoff": cutoff,
+                "now": now,
+            },
+        ).fetchone()
+    return int(row[0]) if row else 1
+
+
+def pause_elder(
+    *,
+    install_id: int,
+    repo: str,
+    pr_number: int,
+    head_sha: str,
+) -> bool:
+    """Pause Elder's per-push reviews for this PR. True only for the caller
+    that moved it from not paused to paused, so the pause note posts once.
+    An expired pause row reads as free (same TTL takeover as claim_delivery).
+    """
+    ttl = int(datetime.now(timezone.utc).timestamp() + _ELDER_LAST_TTL_DAYS * 86400)
+    attrs = {
+        "repo": repo,
+        "pr_number": int(pr_number),
+        "head_sha": head_sha,
+        "paused_at": datetime.now(timezone.utc).isoformat(),
+    }
+    with get_pool().connection() as conn:
+        row = conn.execute(
+            """
+            INSERT INTO grug_kv (pk, sk, data, ttl)
+            VALUES (%(pk)s, %(sk)s, %(data)s, %(ttl)s)
+            ON CONFLICT (pk, sk) DO UPDATE
+                SET data = %(data)s, ttl = %(ttl)s
+                WHERE grug_kv.ttl IS NOT NULL
+                  AND grug_kv.ttl <= EXTRACT(EPOCH FROM now())
+            RETURNING pk
+            """,
+            {
+                "pk": _inst_pk(install_id),
+                "sk": _elder_paused_sk(repo, pr_number),
+                "data": encode_attrs(attrs),
+                "ttl": ttl,
+            },
+        ).fetchone()
+    return row is not None
+
+
+def is_elder_paused(*, install_id: int, repo: str, pr_number: int) -> bool:
+    """True while Elder's per-push reviews are paused for this PR."""
+    return _get_item(_inst_pk(install_id), _elder_paused_sk(repo, pr_number)) is not None
+
+
+def resume_elder(*, install_id: int, repo: str, pr_number: int) -> bool:
+    """Lift the pause and clear the push log. True when a live pause was
+    lifted. The push log goes too: pushes made before the resume must not
+    re-pause Elder on the first push after it."""
+    with get_pool().connection() as conn:
+        rows = conn.execute(
+            f"""
+            DELETE FROM grug_kv
+            WHERE pk = %(pk)s AND sk IN (%(paused)s, %(pushes)s)
+            RETURNING sk, {TTL_LIVE}
+            """,  # noqa: S608 - TTL_LIVE is a fixed pg_base clause, not input
+            {
+                "pk": _inst_pk(install_id),
+                "paused": _elder_paused_sk(repo, pr_number),
+                "pushes": _elder_pushes_sk(repo, pr_number),
+            },
+        ).fetchall()
+    paused_sk = _elder_paused_sk(repo, pr_number)
+    return any(sk == paused_sk and live for sk, live in rows)
+
+
 # --- Review-findings ledger (#361 slice 1) ------------------------------
 # Ledger rows are REPO-scoped (not install-scoped like the activity feed),
 # so they live under their own pk=`LEDGER#<repo>` partition. The access

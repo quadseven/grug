@@ -55,6 +55,41 @@ def test_evaluate_diff_returns_code_review_evaluation() -> None:
     assert out.findings[0].line == 2
 
 
+
+def test_explicit_cross_file_finding_is_advisory_and_requires_snippet_line() -> None:
+    """An explicitly linked sibling line may be reported from bounded context."""
+    hunks = parse_diff(_DIFF)
+    llm = LlmReviewResponse(
+        kind="reviewed",
+        findings=(
+            LlmFinding(
+                path="src/sibling.py", line=42, rule="caller-not-updated",
+                severity="critical", message="Old call shape remains.",
+                outside_diff_reason="The changed parse_result contract also applies here.",
+            ),
+            LlmFinding(
+                path="src/sibling.py", line=43, rule="caller-not-updated",
+                severity="high", message="This line was not supplied.",
+                outside_diff_reason="The changed parse_result contract also applies here.",
+            ),
+        ),
+        backend_used=Backend.POOLSIDE,
+    )
+    out = evaluate_diff(
+        hunks, llm,
+        cross_file_contents={"src/sibling.py": "40: def caller():\n41:     pass\n42:     parse_result()\n"},
+    )
+    assert len(out.findings) == 1
+    finding = out.findings[0]
+    assert finding.file == "src/sibling.py"
+    assert finding.line == 42
+    assert finding.outside_diff_reason.startswith("The changed")
+    assert finding.severity == "medium"
+    assert "OUTSIDE DIFF" in finding.message
+    assert out.conclusion == "success"
+    assert out.dropped_hallucinations == 1
+
+
 def test_finding_outside_diff_lines_is_dropped() -> None:
     """LLM hallucinates a finding on line 999 (not in any hunk's
     new_lines). Drop it — Elder's value is anti-hallucination."""

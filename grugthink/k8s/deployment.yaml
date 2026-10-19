@@ -9,23 +9,13 @@ metadata:
   name: grugthink
   labels: {app.kubernetes.io/part-of: grug}
 ---
-# Config + bot data (faiss index, grugthink_config.yaml the dashboard writes)
-# must survive restarts - the #1 grugthink prod bug was losing config on
-# restart because it lived on ephemeral container storage.
-apiVersion: v1
-kind: PersistentVolumeClaim
-metadata:
-  name: grugthink-data
-  namespace: grugthink
-spec:
-  accessModes: [ReadWriteOnce]
-  # local-path (node-local disk): the pod is pinned to a BYON LAN node (mac-air)
-  # via nodeSelector, and OCI block volumes (oci-bv, the cluster default) can't
-  # attach to non-OCI nodes. The Postgres/pgvector rearchitecture will retire
-  # this PVC entirely.
-  storageClassName: local-path
-  resources:
-    requests: {storage: 5Gi}
+# Bot configuration now lives in Postgres (the grugthink_config table, written
+# through the dashboard exactly as before) and long-term memory lives in the
+# grugthink_facts pgvector table - so the node-pinned grugthink-data local-path
+# PVC is gone (grug#1190). It used to block rescheduling: the local-path
+# PersistentVolume's node affinity only matched the node it was provisioned
+# on. /data below is now an emptyDir for ephemeral per-bot runtime scratch
+# only (personalities.db, chat frequencies); nothing durable lives there.
 ---
 apiVersion: apps/v1
 kind: Deployment
@@ -38,9 +28,9 @@ metadata:
     tags.datadoghq.com/env: prod
 spec:
   replicas: 1
-  # RWO PVC - one writer at a time; recreate so the old pod releases the
-  # volume before the new one mounts it.
-  strategy: {type: Recreate}
+  # No PersistentVolume anymore (grug#1190): nothing pins the pod to a node,
+  # so the default RollingUpdate strategy is safe and the pod reschedules
+  # onto any arm64 node.
   selector:
     matchLabels: {app: grugthink}
   template:
@@ -88,6 +78,10 @@ spec:
             - {name: GRUGTHINK_EMBED_URL, value: "http://embed.embed.svc.cluster.local:11434"}
             - {name: GRUGTHINK_LLM_API, value: "openai"}
             - {name: USE_OLLAMA_EMBEDDINGS, value: "true"}
+            # Per-bot runtime scratch dir (emptyDir, grug#1190). Durable memory
+            # is in Postgres+pgvector; bot configuration is in the
+            # grugthink_config table (GRUGTHINK_CONFIG_PATH is only the
+            # first-boot seed path now).
             - {name: GRUGBOT_DATA_DIR, value: /data}
             - {name: LOG_LEVEL, value: INFO}
             - {name: MULTIBOT_API_PORT, value: "8080"}
@@ -185,8 +179,13 @@ spec:
             - {name: data, mountPath: /data}
             - {name: tmp, mountPath: /tmp}
       volumes:
+        # Ephemeral scratch for per-bot runtime state (personalities.db, chat
+        # frequencies, FAISS files in local-dev fallback mode). Durable state
+        # lives in Postgres: config in grugthink_config, memory in
+        # grugthink_facts (pgvector). Nothing here needs to survive a
+        # reschedule, so no PVC (grug#1190).
         - name: data
-          persistentVolumeClaim: {claimName: grugthink-data}
+          emptyDir: {sizeLimit: 512Mi}
         - name: tmp
           emptyDir: {sizeLimit: 128Mi}
 ---
