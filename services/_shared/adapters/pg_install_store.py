@@ -908,7 +908,7 @@ def resume_elder(*, install_id: int, repo: str, pr_number: int) -> bool:
             DELETE FROM grug_kv
             WHERE pk = %(pk)s AND sk IN (%(paused)s, %(pushes)s)
             RETURNING sk, {TTL_LIVE}
-            """,
+            """,  # noqa: S608 - TTL_LIVE is a fixed pg_base clause, not input
             {
                 "pk": _inst_pk(install_id),
                 "paused": _elder_paused_sk(repo, pr_number),
