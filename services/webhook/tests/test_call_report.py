@@ -9,6 +9,7 @@ import httpx
 import llm_client as lc
 import pytest
 from llm_client import Backend, Hunk, review_diff
+from review_evidence import assemble_evidence
 
 _FREE = "nvidia/nemotron-3-super-120b-a12b:free"
 
@@ -94,7 +95,7 @@ def test_a_direct_call_is_reported_and_a_cave_call_is_not(monkeypatch) -> None:
     monkeypatch.setenv("GRUG_CLOUD_FREE_TIER_MODEL", _FREE)
     ctx = {"repo": "o/r", "pr_number": 7, "repo_private": False}
     with patch.object(httpx, "post", return_value=_ok(_FINDING)):
-        out = review_diff([_hunk()], installation_id=1, pr_context=ctx)
+        out = review_diff(assemble_evidence([_hunk()], pr_context=ctx), installation_id=1)
     assert out.backend_used == Backend.OPENROUTER
     rows = list(call_report._queue)
     assert len(rows) == 1
@@ -107,7 +108,7 @@ def test_a_direct_call_is_reported_and_a_cave_call_is_not(monkeypatch) -> None:
     call_report._queue.clear()
     monkeypatch.setenv("GRUG_REVIEW_BACKEND_PRIORITY", "cave")
     with patch.object(httpx, "post", return_value=_ok(_FINDING)):
-        out = review_diff([_hunk()], installation_id=1, pr_context=ctx)
+        out = review_diff(assemble_evidence([_hunk()], pr_context=ctx), installation_id=1)
     assert out.backend_used == Backend.CAVE
     assert not call_report._queue
 
@@ -119,7 +120,7 @@ def test_a_lazy_empty_answer_is_reported_as_an_error(monkeypatch) -> None:
     monkeypatch.setenv("GRUG_CLOUD_FREE_TIER_MODEL", _FREE)
     responses = [_ok('{"findings": []}', completion_tokens=7), _ok(_FINDING)]
     with patch.object(httpx, "post", side_effect=responses):
-        review_diff([_hunk()], installation_id=1)
+        review_diff(assemble_evidence([_hunk()]), installation_id=1)
     rows = list(call_report._queue)
     assert [(r["target"], r["outcome"], r.get("reason")) for r in rows] == [
         ("openrouter", "error", "degenerate_empty"),
@@ -159,5 +160,5 @@ def test_reporting_never_breaks_a_review(monkeypatch) -> None:
 
     monkeypatch.setattr(call_report, "record", boom)
     with patch.object(httpx, "post", return_value=_ok(_FINDING)):
-        out = review_diff([_hunk()], installation_id=1)
+        out = review_diff(assemble_evidence([_hunk()]), installation_id=1)
     assert out.kind == "reviewed"
