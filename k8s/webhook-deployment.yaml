@@ -202,7 +202,6 @@ spec:
             # every review cohort landed on the Sparks.
             # Chain after the deepseek-v4.1-flash primary (default in llm_client.py): paid
             # mimo-v2.5 second opinion, then the free Longcat. Unset = no tier.
-            - {name: GRUG_OPENCODE_GO_SECOND_MODEL, value: "mimo-v2.5"}
             - {name: GRUG_OPENCODE_GO_FALLBACK_MODEL, value: "longcat-2.5-preview-free"}
             - {name: GRUG_CLOUD_FREE_TIER_MODEL, value: "nvidia/nemotron-3-super-120b-a12b:free"}
             # grug#1225: switched off 2026-10-17, the OpenCode Go allowance and
@@ -210,7 +209,12 @@ spec:
             # 11 OpenRouter paid refusals, 139 free per-day 429s over 402 Elder
             # runs). A listed backend is never called. Re-enable one by deleting
             # its entry; `openrouter:free` or `openrouter:paid` narrows to one pool.
-            - {name: GRUG_DISABLED_BACKENDS, value: "opencode-go,openrouter"}
+            # grug#1269: OpenRouter's free pool is back on 2026-10-19 (the operator
+            # wants the free tiers used up first); its paid pool stays off.
+            - {name: GRUG_DISABLED_BACKENDS, value: "opencode-go,openrouter:paid"}
+            # grug#1269: the gateway's free provider pool is a cloud tier after
+            # Poolside, ahead of the Sparks (free cloud models first).
+            - {name: GRUG_CLOUD_FREE_POOL, value: "true"}
             - {name: GRUG_OPENCODE_GO_API_KEY_SSM, value: /infra/llm/opencode_go_api_key}
             - {name: GRUG_PROMPT_EXPERIMENT_SSM, value: /grug/elder-prompt-experiment}
             # In-cluster spark-gateway for the evidence-scoped judge. Keep the
