@@ -13,6 +13,7 @@ from pathlib import Path
 from typing import Any, Dict
 
 from ..grug_structured_logger import get_logger
+from . import pg_store
 
 log = get_logger(__name__)
 
@@ -31,8 +32,21 @@ def is_yaml_available() -> bool:
     return _YAML_AVAILABLE
 
 
-def load_config(config_file: str) -> Dict[str, Any]:
-    """Load configuration from file."""
+def load_config(config_file: str, templates: Dict = None) -> Dict[str, Any]:
+    """Load configuration.
+
+    With a Postgres DSN configured the config document lives in the
+    ``grugthink_config`` table (see pg_store) and ``config_file`` is only the
+    first-boot seed path. Otherwise the YAML/JSON file is read as before.
+    """
+    if pg_store.pg_config_enabled():
+        return pg_store.load_or_seed(config_file, templates or {})
+
+    return _load_file_config(config_file)
+
+
+def _load_file_config(config_file: str) -> Dict[str, Any]:
+    """Load configuration from a YAML/JSON file (the no-database backend)."""
     try:
         if os.path.exists(config_file):
             # Treat zero-byte or whitespace-only files as uninitialized
@@ -68,7 +82,16 @@ def load_config(config_file: str) -> Dict[str, Any]:
 
 
 def save_config(config_file: str, config_data: Dict[str, Any]):
-    """Save current configuration to file."""
+    """Save current configuration.
+
+    With a Postgres DSN configured the document is upserted into the
+    ``grugthink_config`` table (``config_file`` is ignored); otherwise the
+    file is written atomically as before.
+    """
+    if pg_store.pg_config_enabled():
+        pg_store.save_config(config_data)
+        return
+
     try:
         # Atomic write: write to temp then replace
         cfg_path = Path(config_file)
@@ -99,9 +122,9 @@ def save_config(config_file: str, config_data: Dict[str, Any]):
         raise
 
 
-def create_default_config(config_file: str, templates: Dict) -> Dict[str, Any]:
-    """Create default configuration file."""
-    default_config = {
+def build_default_config(templates: Dict) -> Dict[str, Any]:
+    """Build the default configuration document (no I/O)."""
+    return {
         "version": "2.0",
         "description": "GrugThink Multi-Bot Configuration",
         "global_settings": {
@@ -118,6 +141,11 @@ def create_default_config(config_file: str, templates: Dict) -> Dict[str, Any]:
         },
         "bot_templates": {template_id: asdict(template) for template_id, template in templates.items()},
     }
+
+
+def create_default_config(config_file: str, templates: Dict) -> Dict[str, Any]:
+    """Create default configuration file."""
+    default_config = build_default_config(templates)
 
     try:
         with open(config_file, "w") as f:
@@ -140,7 +168,7 @@ def create_default_config(config_file: str, templates: Dict) -> Dict[str, Any]:
 
 def reload_config(config_manager, old_config: Dict[str, Any], old_env: Dict[str, str]):
     """Reload configuration and notify callbacks."""
-    config_data = load_config(config_manager.config_file)
+    config_data = load_config(config_manager.config_file, config_manager.templates)
 
     # Load external personalities
     from .personalities import load_external_personalities
