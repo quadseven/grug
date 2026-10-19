@@ -287,6 +287,10 @@ def _record_transition(
     )
     resolution = {"state": state, "sha": sha} if state else None
     verdict = _trusted_verdict(record)
+    # The label comes from this transition: `record` was listed before the
+    # update above, so its `resolution` is the previous state.
+    # record_ledger_learning writes the label it is given and never derives
+    # one from the record.
     label = ledger_label(verdict, resolution if t.teaches or verdict else None)
     if label is not None:
         record_ledger_learning(record, label, resolution)

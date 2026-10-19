@@ -284,6 +284,20 @@ def test_dismissed_from_the_stored_verdict_writes_false_positive_evidence(wired)
     assert (row["verdict"], row["resolution"]) == ("false-positive", "dismissed")
 
 
+def test_ledger_label_follows_the_transition_not_the_stale_stored_state(wired):
+    """The record is listed before its resolution is updated, so it still
+    holds the previous state. The ledger row must take this transition's
+    label (addressed = fixed), not one derived from that stale state."""
+    gh = _Gh([_thread(outdated=True)])
+    state = wired(gh)
+    record = _learning_record()
+    record["resolution"] = {"state": "resolved", "sha": ""}
+    state["records"] = [record]
+    assert lr.sync_pr(1, "o", "r", 5, review=_review()) == 1
+    [row] = state["ledger"]
+    assert (row["verdict"], row["resolution"]) == ("fixed", "addressed")
+
+
 def test_given_threads_are_reused_without_a_second_listing(wired, monkeypatch):
     gh = _Gh([])
     wired(gh)
