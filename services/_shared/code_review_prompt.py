@@ -703,9 +703,13 @@ _OUTPUT_CONTRACT = (
     '{"findings": [{"path": str, "line": int, "rule": str, '
     '"severity": "low"|"medium"|"high"|"critical", "message": str, '
     '"suggestion": str (OPTIONAL), "effort": "quick-win"|"heavy-lift" '
-    '(OPTIONAL)}]}. '
+    '(OPTIONAL), "outside_diff_reason": str (OPTIONAL)}]}. '
     "`rule` MUST be one of the rule names above. `line` is the new-side "
-    "line number from the diff. `severity` reflects THIS instance "
+    "line number from the diff. A finding on an UNCHANGED cross-file context "
+    "line is allowed only when you provide `outside_diff_reason`, naming the "
+    "specific changed behavior and why this sibling site is also wrong. "
+    "Such findings are advisory. Never use any other repository line. "
+    "`severity` reflects THIS instance "
     "(the per-rule severity is only a default hint). `suggestion` is the "
     "EXACT replacement text for ONLY the flagged line - plain code, no "
     "diff syntax, no backticks; include it ONLY when you are confident "
