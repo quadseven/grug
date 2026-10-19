@@ -51,6 +51,21 @@ def _fetch_pr_diff(token: str, owner: str, repo: str, pull_number: int) -> str:
     return resp.text
 
 
+def _pr_is_closed(token: str, owner: str, repo: str, pull_number: int) -> bool:
+    """Whether the pull request is closed (merged or not) now. A failed read
+    says False, so the walkthrough still posts as before."""
+    try:
+        resp = httpx.get(
+            f"{_API}/repos/{_repo_path(owner, repo)}/pulls/{pull_number}",
+            headers=_headers(token),
+            timeout=_TIMEOUT,
+        )
+        resp.raise_for_status()
+        return resp.json().get("state") == "closed"
+    except (httpx.HTTPError, ValueError, AttributeError):
+        return False
+
+
 def _fetch_pr_files(
     token: str,
     owner: str,
@@ -401,6 +416,23 @@ def dispatch_walkthrough_review(
                 "kind": type(e).__name__,
             },
         )
+
+    # A walkthrough that lands after the merge is one more email with nothing
+    # left to review: a lane pull request got one 6.5 minutes after it merged
+    # (2026-10-18). Checked here, after the slow summary, not at the start.
+    try:
+        closed = with_install_token_retry(
+            installation_id,
+            lambda token: _pr_is_closed(token, owner, repo_name, pull_number),
+        )
+    except RuntimeError:
+        closed = False
+    if closed is True:
+        log.info(
+            "walkthrough_skipped_closed",
+            extra={"pr": f"{owner}/{repo_name}#{pull_number}"},
+        )
+        return {"persona": "walkthrough", "result": "skipped_closed"}
 
     pr_url = f"https://github.com/{owner}/{repo_name}/pull/{pull_number}"
     body = walkthrough_body(
