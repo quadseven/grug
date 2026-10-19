@@ -6,6 +6,8 @@ the automatic half for a provider nobody has switched off yet."""
 from __future__ import annotations
 
 import json
+import re
+from pathlib import Path
 from unittest.mock import patch
 
 import httpx
@@ -111,6 +113,34 @@ def test_a_pool_entry_disables_only_that_pool(monkeypatch) -> None:
         (Backend.POOLSIDE, lc._POOLSIDE_MODEL),
     ]
     assert lc._usable_saas_fallback_backends() == (Backend.POOLSIDE,)
+
+
+def _shipped_switch() -> str:
+    """The `GRUG_DISABLED_BACKENDS` value every k8s manifest ships."""
+    root = Path(__file__).resolve().parents[3] / "k8s"
+    found = {
+        m.group(1)
+        for name in ("consumer-deployment.yaml", "webhook-deployment.yaml", "poller-cronjob.yaml")
+        for m in re.finditer(
+            r'name: GRUG_DISABLED_BACKENDS, value: "([^"]*)"', (root / name).read_text()
+        )
+    }
+    assert len(found) == 1, found
+    return found.pop()
+
+
+def test_the_shipped_chain_is_free_tiers_only_openrouter_free_first(monkeypatch) -> None:
+    """grug#1269: the operator wants the free tiers used up first. OpenRouter's
+    free pool leads the cloud chain, Poolside follows, and nothing paid can be
+    called: OpenCode Go is off and OpenRouter's paid pool is off."""
+    monkeypatch.setenv("GRUG_DISABLED_BACKENDS", _shipped_switch())
+    assert [(t.backend, t.model) for t in lc._cloud_chain_tiers()] == [
+        (Backend.OPENROUTER, _FREE),
+        (Backend.POOLSIDE, lc._POOLSIDE_MODEL),
+    ]
+    assert not lc._backend_enabled(Backend.OPENCODE_GO, "longcat-2.5-preview-free")
+    assert not lc._backend_enabled(Backend.OPENROUTER, "anthropic/claude-opus-4.7")
+    assert lc._backend_enabled(Backend.OPENROUTER, _FREE)
 
 
 def test_cloud_review_never_calls_a_disabled_backend(monkeypatch) -> None:
