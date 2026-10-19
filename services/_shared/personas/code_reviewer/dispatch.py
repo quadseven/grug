@@ -66,6 +66,7 @@ from personas.review_publish import (
     fetch_pr_diff, fetch_pr_diff_with_scope, is_blackout, is_low_confidence,
     is_partial_coverage, is_real_degradation, plan_publish, prior_finding_keys,
 )
+from personas.publish_check import publish_persona_check
 from personas.code_reviewer.dedup import (
     dedup_findings, finding_key, parse_rule, rule_marker,
 )
@@ -2731,26 +2732,11 @@ def dispatch_code_review(
             reason = "fetch_or_parse_failed"
             check_summary = None
             verdict_summary = "Grug could not look — diff fetch/parse failed"
-        degraded = _publish_degraded(
+        return _publish_degraded(
             installation_id, owner, repo_name, pull_number, head_sha,
             reason=reason, summary=check_summary, blocking=blocking,
+            verdict_summary=verdict_summary,
         )
-        # Errored Activity row (PRD #301): Grug couldn't even fetch/parse the
-        # diff — record it so it surfaces as `errored` (re-runnable in S3a),
-        # never a silent gap. Best-effort.
-        record_check_verdict(
-            install_id=installation_id,
-            persona_key="code_reviewer",
-            repo=f"{owner}/{repo_name}",
-            pr_number=pull_number,
-            head_sha=head_sha,
-            conclusion=degraded_conclusion(blocking),
-            summary=verdict_summary,
-            findings_count=0,
-            blocking=blocking,
-            degraded_reason=reason,
-        )
-        return degraded
 
     # Full-file context (#336): fetch the whole current content of each changed
     # file at head SHA so the Elder + judge can see mitigations OUTSIDE the diff
@@ -3191,35 +3177,6 @@ def dispatch_code_review(
         summary=summary,
     )
     summary = _lead_if_degraded(summary, evaluation)
-    check_result = CheckRunResult(
-        name=_CHECK_NAME,
-        head_sha=head_sha,
-        status="completed",
-        conclusion=conclusion,
-        title=title,
-        summary=summary,
-    )
-    check_publish_failed = False
-    try:
-        with_install_token_retry(
-            installation_id,
-            lambda token: post_check_run(
-                token, owner, repo_name, check_result,
-                external_id=f"grug-cr:{owner}/{repo_name}#{pull_number}:{head_sha}",
-            ),
-        )
-    except (httpx.HTTPStatusError, httpx.RequestError) as e:
-        log.error(
-            "code_review_check_run_publish_failed",
-            extra={
-                "installation_id": installation_id,
-                "pr": f"{owner}/{repo_name}#{pull_number}",
-                "kind": type(e).__name__,
-            },
-        )
-        check_publish_failed = True
-        # Continue to attempt the review post — independent surface.
-
     review_publish_failed = False
     review_publish_rejected = False
     # On a re-review (synchronize/reopened), dedup findings already
@@ -3278,6 +3235,41 @@ def dispatch_code_review(
                 review_publish_rejected = True
             else:
                 review_publish_failed = True
+
+    # Publish the check and record both surface outcomes at the shared seam.
+    # Keep the inline review attempt independent of check publication.
+    published = publish_persona_check(
+        persona_key="code_reviewer", persona_prefix="cr", check_name=_CHECK_NAME,
+        installation_id=installation_id, owner=owner, repo=repo_name,
+        pr_number=pull_number, head_sha=head_sha, conclusion=conclusion,
+        title=title, summary=summary, findings_count=len(evaluation.findings),
+        blocking=blocking, degraded_reason=outcome.feed_degraded_reason,
+        success_result=(
+            "pass"
+            if outcome.settled(
+                review_publish_failed=review_publish_failed,
+                review_publish_rejected=review_publish_rejected,
+            ).result == "publish_failed"
+            else outcome.settled(
+                review_publish_failed=review_publish_failed,
+                review_publish_rejected=review_publish_rejected,
+            ).result
+        ),
+        publish_failed_log_name="code_review_check_run_publish_failed",
+        review_publish_failed=review_publish_failed,
+        token_retry_fn=lambda install_id, fn: with_install_token_retry(install_id, fn),
+        post_check_run_fn=lambda *args, **kwargs: post_check_run(*args, **kwargs),
+        record_check_verdict_fn=lambda **kwargs: record_check_verdict(**kwargs),
+    )
+    check_publish_failed = published["result"] == "publish_failed"
+    if review_publish_failed and published["result"] != "publish_failed":
+        published["result"] = "publish_failed"
+    outcome = outcome.settled(
+        check_publish_failed=check_publish_failed,
+        review_publish_failed=review_publish_failed,
+        review_publish_rejected=review_publish_rejected,
+    )
+    result = outcome.result
 
     # A blocking review from an earlier commit stays GitHub's standing verdict
     # until it is dismissed; a clean re-review alone does not clear it.
@@ -3357,12 +3349,6 @@ def dispatch_code_review(
                 },
             )
 
-    outcome = outcome.settled(
-        check_publish_failed=check_publish_failed,
-        review_publish_failed=review_publish_failed,
-        review_publish_rejected=review_publish_rejected,
-    )
-    result = outcome.result
     # Structured log carries everything needed to verify the persona
     # ran end-to-end on a real PR (operator AC). Backend + model
     # attribution lets DD LLM Obs slice metrics by which LLM produced
@@ -3407,18 +3393,6 @@ def dispatch_code_review(
     # degraded reason comes from the same `outcome` as `result` above, so the
     # feed resolves to `errored` (never a fake pass/block) exactly when the
     # LLM degraded or the check-run never reached GitHub ("no lies").
-    record_check_verdict(
-        install_id=installation_id,
-        persona_key="code_reviewer",
-        repo=f"{owner}/{repo_name}",
-        pr_number=pull_number,
-        head_sha=head_sha,
-        conclusion=conclusion,
-        summary=title,
-        findings_count=len(evaluation.findings),
-        blocking=blocking,
-        degraded_reason=outcome.feed_degraded_reason,
-    )
     # Living Hunt: remember this head only when the check actually landed
     # and the review was not an infra skip (so the next push can delta).
     if (
@@ -4366,7 +4340,7 @@ def _async_deep_append_if_needed(
 def _publish_degraded(
     installation_id: int, owner: str, repo_name: str, pull_number: int,
     head_sha: str, *, reason: str, summary: str | None = None,
-    blocking: bool = False,
+    blocking: bool = False, verdict_summary: str | None = None,
 ) -> dict[str, str]:
     """Post the "skipped" check-run when fetch/parse fails. Best-effort -
     a publish failure here is also swallowed since we can't do anything
@@ -4380,38 +4354,17 @@ def _publish_degraded(
         f"Elder could not run this pass: `{reason}`. " + gate_sentence(blocking)
     ), reason)
     conclusion = degraded_conclusion(blocking)
-    publish_failed = False
-    try:
-        with_install_token_retry(
-            installation_id,
-            lambda token: post_check_run(
-                token, owner, repo_name,
-                CheckRunResult(
-                    name=_CHECK_NAME, head_sha=head_sha, status="completed",
-                    conclusion=conclusion, title=title, summary=summary,
-                ),
-                external_id=(
-                    f"grug-cr:{owner}/{repo_name}#{pull_number}:{head_sha}"
-                ),
-            ),
-        )
-    except (httpx.HTTPStatusError, httpx.RequestError) as e:
-        # No recovery path beyond logging — but a silent miss here
-        # means the PR shows NO check-run at all, indistinguishable
-        # from persona-disabled. Surface as a discrete signal so the
-        # dispatcher result reflects it.
-        log.error(
-            "code_review_degraded_publish_failed",
-            extra={
-                "installation_id": installation_id,
-                "pr": f"{owner}/{repo_name}#{pull_number}",
-                "kind": type(e).__name__,
-                "reason": reason,
-            },
-        )
-        publish_failed = True
-    return {
-        "persona": "code_reviewer",
-        "result": "publish_failed" if publish_failed else "skipped",
-        "degraded_reason": reason,
-    }
+    verdict_summary = verdict_summary or title
+    published = publish_persona_check(
+        persona_key="code_reviewer", persona_prefix="cr", check_name=_CHECK_NAME,
+        installation_id=installation_id, owner=owner, repo=repo_name,
+        pr_number=pull_number, head_sha=head_sha, conclusion=conclusion,
+        title=title, summary=summary, findings_count=0, blocking=blocking,
+        degraded_reason=reason, success_result="skipped",
+        publish_failed_log_name="code_review_degraded_publish_failed",
+        record_summary=verdict_summary,
+        token_retry_fn=lambda install_id, fn: with_install_token_retry(install_id, fn),
+        post_check_run_fn=lambda *args, **kwargs: post_check_run(*args, **kwargs),
+        record_check_verdict_fn=lambda **kwargs: record_check_verdict(**kwargs),
+    )
+    return {**published, "degraded_reason": reason}

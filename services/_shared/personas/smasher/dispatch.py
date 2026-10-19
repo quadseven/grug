@@ -27,7 +27,7 @@ import httpx
 
 from activity_log import record_check_verdict
 from github_app_auth import get_scoped_install_token, with_install_token_retry
-from github_checks_client import CheckRunResult, post_check_run
+from github_checks_client import post_check_run
 from github_reviews_client import post_review
 from personas.code_reviewer.diff_parser import DiffParseError, parse_diff
 from personas.code_reviewer.dispatch import build_review_result
@@ -42,6 +42,7 @@ from personas.review_publish import (
     plan_publish,
     prior_finding_keys,
 )
+from personas.publish_check import publish_persona_check
 from personas.smasher.sandbox import SurvivedMutant, TrialResult, extract_target_lines
 from personas.tribe import CHECK_SMASHER
 
@@ -107,34 +108,18 @@ def _publish_degraded(
         findings=(), conclusion="neutral", degraded_reason=reason,
     )
     title, summary = _summary_markdown(evaluation)
-    try:
-        with_install_token_retry(
-            installation_id,
-            lambda token: post_check_run(
-                token, owner, repo,
-                CheckRunResult(
-                    name=_CHECK_NAME, head_sha=head_sha, status="completed",
-                    conclusion="neutral", title=title, summary=summary,
-                ),
-                external_id=f"grug-smasher:{owner}/{repo}#{pull_number}:{head_sha}",
-            ),
-        )
-    except (httpx.HTTPStatusError, httpx.RequestError) as e:
-        log.error(
-            "smasher_degraded_publish_failed",
-            extra={
-                "installation_id": installation_id,
-                "pr": f"{owner}/{repo}#{pull_number}",
-                "kind": type(e).__name__,
-            },
-        )
-    record_check_verdict(
-        install_id=installation_id, persona_key="smasher",
-        repo=f"{owner}/{repo}", pr_number=pull_number, head_sha=head_sha,
-        conclusion="neutral", summary=title, findings_count=0,
-        blocking=False, degraded_reason=reason,
+    published = publish_persona_check(
+        persona_key="smasher", persona_prefix="smasher", check_name=_CHECK_NAME,
+        installation_id=installation_id, owner=owner, repo=repo,
+        pr_number=pull_number, head_sha=head_sha, conclusion="neutral",
+        title=title, summary=summary, findings_count=0, blocking=False,
+        degraded_reason=reason, success_result="degraded",
+        publish_failed_log_name="smasher_degraded_publish_failed",
+        token_retry_fn=lambda install_id, fn: with_install_token_retry(install_id, fn),
+        post_check_run_fn=lambda *args, **kwargs: post_check_run(*args, **kwargs),
+        record_check_verdict_fn=lambda **kwargs: record_check_verdict(**kwargs),
     )
-    return {"persona": "smasher", "result": "degraded"}
+    return published
 
 
 def dispatch_smasher_review(
@@ -202,7 +187,11 @@ def dispatch_smasher_review(
     targets = extract_target_lines(hunks)
     if not targets:
         # No changed Python lines to mutate -> a clean advisory pass.
-        return _publish_clean(installation_id, owner, repo_name, pull_number, head_sha)
+        return _publish(
+            installation_id, owner, repo_name, pull_number, head_sha,
+            CodeReviewEvaluation(findings=(), conclusion="success"),
+            mode="advisory", action="",
+        )
 
     # Mint a DOWN-SCOPED, single-repo, contents:read token for the sandbox
     # clone (ADR-0013). Never the full-scope cached token.
@@ -297,17 +286,6 @@ def dispatch_smasher_review(
     )
 
 
-def _publish_clean(
-    installation_id: int, owner: str, repo: str, pull_number: int, head_sha: str,
-) -> dict[str, str]:
-    """Advisory pass check when the PR changed no Python lines to mutate."""
-    evaluation = CodeReviewEvaluation(findings=(), conclusion="success")
-    return _publish(
-        installation_id, owner, repo, pull_number, head_sha,
-        evaluation, mode="advisory", action="",
-    )
-
-
 def _publish(
     installation_id: int, owner: str, repo: str, pull_number: int, head_sha: str,
     evaluation: CodeReviewEvaluation, *, mode: ReviewMode, action: str,
@@ -317,30 +295,6 @@ def _publish(
     outcome = plan_publish(evaluation, mode=mode)
     conclusion, event = outcome.conclusion, outcome.event
     title, summary = _summary_markdown(evaluation)
-    check_publish_failed = False
-    try:
-        with_install_token_retry(
-            installation_id,
-            lambda token: post_check_run(
-                token, owner, repo,
-                CheckRunResult(
-                    name=_CHECK_NAME, head_sha=head_sha, status="completed",
-                    conclusion=conclusion, title=title, summary=summary,
-                ),
-                external_id=f"grug-smasher:{owner}/{repo}#{pull_number}:{head_sha}",
-            ),
-        )
-    except (httpx.HTTPStatusError, httpx.RequestError) as e:
-        log.error(
-            "smasher_check_run_publish_failed",
-            extra={
-                "installation_id": installation_id,
-                "pr": f"{owner}/{repo}#{pull_number}",
-                "kind": type(e).__name__,
-            },
-        )
-        check_publish_failed = True
-
     review_publish_failed = False
     prior_keys: frozenset[str] = frozenset()
     if action in {"synchronize", "reopened"}:
@@ -371,18 +325,19 @@ def _publish(
             )
             review_publish_failed = True
 
-    outcome = outcome.settled(
-        check_publish_failed=check_publish_failed,
+    published = publish_persona_check(
+        persona_key="smasher", persona_prefix="smasher", check_name=_CHECK_NAME,
+        installation_id=installation_id, owner=owner, repo=repo,
+        pr_number=pull_number, head_sha=head_sha, conclusion=conclusion,
+        title=title, summary=summary, findings_count=len(evaluation.findings),
+        blocking=False, degraded_reason=outcome.feed_degraded_reason,
+        success_result="pass" if review_publish_failed else outcome.result,
+        publish_failed_log_name="smasher_check_run_publish_failed",
         review_publish_failed=review_publish_failed,
+        token_retry_fn=lambda install_id, fn: with_install_token_retry(install_id, fn),
+        post_check_run_fn=lambda *args, **kwargs: post_check_run(*args, **kwargs),
+        record_check_verdict_fn=lambda **kwargs: record_check_verdict(**kwargs),
     )
-    record_check_verdict(
-        install_id=installation_id, persona_key="smasher",
-        repo=f"{owner}/{repo}", pr_number=pull_number, head_sha=head_sha,
-        conclusion=conclusion, summary=title,
-        findings_count=len(evaluation.findings), blocking=False,
-        degraded_reason=outcome.feed_degraded_reason,
-    )
-    return {
-        "persona": "smasher",
-        "result": outcome.result,
-    }
+    if review_publish_failed and published["result"] != "publish_failed":
+        published["result"] = "publish_failed"
+    return published

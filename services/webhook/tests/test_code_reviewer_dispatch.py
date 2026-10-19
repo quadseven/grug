@@ -71,6 +71,9 @@ def _patch_token(monkeypatch):
         review_publish, "with_install_token_retry",
         lambda inst_id, fn: fn("fake-token"),
     )
+    monkeypatch.setattr(
+        cr_dispatch, "record_check_verdict", lambda **kwargs: None,
+    )
 
 
 def _diff_response(diff: str = _DIFF):
@@ -761,6 +764,10 @@ def test_dispatch_review_publish_failure_returns_publish_failed(monkeypatch):
     )
     monkeypatch.setattr(cr_dispatch, "review_diff", lambda *a, **kw: llm)
     monkeypatch.setattr(cr_dispatch, "post_check_run", lambda *a, **kw: {})
+    recorded = {}
+    monkeypatch.setattr(
+        cr_dispatch, "record_check_verdict", lambda **kw: recorded.update(kw),
+    )
 
     def _raise(*a, **kw):
         raise httpx.ConnectError("reviews API down")
@@ -771,6 +778,7 @@ def test_dispatch_review_publish_failure_returns_publish_failed(monkeypatch):
         out = cr_dispatch.dispatch_code_review(_payload(), blocking=False)
 
     assert out["result"] == "publish_failed"
+    assert recorded["degraded_reason"] == "review_publish_failed"
 
 
 def test_dispatch_check_run_publish_failure_returns_publish_failed(monkeypatch):

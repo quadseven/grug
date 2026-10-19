@@ -720,3 +720,26 @@ def test_publish_failure_log_carries_github_403_diagnostics(monkeypatch, caplog)
     assert rec.gh_documentation_url.startswith("https://docs.github.com/")
     assert rec.gh_request_id == "REQ-1"
     assert "PRIVATE-SUMMARY" not in repr(rec.__dict__)
+
+
+def test_review_publish_failure_is_recorded_as_degraded(monkeypatch):
+    from personas import publish_check
+
+    recorded = {}
+    monkeypatch.setattr(publish_check, "with_install_token_retry", _fake_retry_ok)
+    monkeypatch.setattr(publish_check, "post_check_run", lambda *a, **kw: {})
+    monkeypatch.setattr(
+        publish_check, "record_check_verdict", lambda **kw: recorded.update(kw),
+    )
+
+    publish_persona_check(
+        persona_key="guard", persona_prefix="guard",
+        check_name="Grug - Guard", installation_id=1, owner="o", repo="r",
+        pr_number=2, head_sha="sha", conclusion="neutral", title="t",
+        summary="s", findings_count=0, blocking=False, degraded_reason=None,
+        success_result="pass",
+        publish_failed_log_name="guard_check_run_publish_failed",
+        review_publish_failed=True,
+    )
+
+    assert recorded["degraded_reason"] == "review_publish_failed"

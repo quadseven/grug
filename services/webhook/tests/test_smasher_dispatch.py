@@ -169,5 +169,5 @@ def test_diff_fetch_failure_degrades(monkeypatch):
 
     monkeypatch.setattr(sm_dispatch, "with_install_token_retry", lambda _iid, fn: boom())
     out = sm_dispatch.dispatch_smasher_review(_payload(), blocking=False)
-    assert out["result"] == "degraded"
+    assert out["result"] == "publish_failed"
     assert captured["verdicts"][0]["degraded_reason"] == "fetch_or_parse_failed"

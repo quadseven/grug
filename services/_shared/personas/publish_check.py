@@ -18,6 +18,8 @@ import logging
 import math
 import os
 import time
+from collections.abc import Callable
+from typing import Any
 
 import httpx
 
@@ -166,6 +168,11 @@ def publish_persona_check(
     degraded_reason: str | None,
     success_result: str,
     publish_failed_log_name: str,
+    review_publish_failed: bool = False,
+    record_summary: str | None = None,
+    token_retry_fn: Callable[..., Any] | None = None,
+    post_check_run_fn: Callable[..., Any] | None = None,
+    record_check_verdict_fn: Callable[..., Any] | None = None,
 ) -> dict[str, str]:
     """Publish one persona's check-run and record its Check verdict.
 
@@ -185,6 +192,8 @@ def publish_persona_check(
     failed for ANY reason (a bad HTTP response to the check-run POST, or a
     raise anywhere earlier in the token-retry/auth chain — token exchange,
     JWT signing, the SSM secret fetch, or a malformed response body).
+    Callers may supply their auth, HTTP, and record functions to keep the
+    seam on the same configured boundaries as the persona's other requests.
 
     Raises:
         ValueError: if `success_result == "publish_failed"` — that string
@@ -205,6 +214,9 @@ def publish_persona_check(
 
     full_repo = f"{owner}/{repo}"
     pr_ref = f"{full_repo}#{pr_number}"
+    token_retry = token_retry_fn or with_install_token_retry
+    post_check = post_check_run_fn or post_check_run
+    record_verdict = record_check_verdict_fn or record_check_verdict
 
     check_result = CheckRunResult(
         name=check_name,
@@ -221,9 +233,9 @@ def publish_persona_check(
         _publish_with_transient_retry(
             persona_key,
             installation_id,
-            lambda: with_install_token_retry(
+            lambda: token_retry(
                 installation_id,
-                lambda token: post_check_run(
+                lambda token: post_check(
                     token, owner, repo, check_result, external_id=external_id,
                 ),
             ),
@@ -270,18 +282,20 @@ def publish_persona_check(
     # from "something escaped record_check_verdict's never-raise contract
     # entirely" (this one — always unexpected).
     try:
-        record_check_verdict(
+        record_verdict(
             install_id=installation_id,
             persona_key=persona_key,
             repo=full_repo,
             pr_number=pr_number,
             head_sha=head_sha,
             conclusion=conclusion,
-            summary=title,
+            summary=record_summary if record_summary is not None else title,
             findings_count=findings_count,
             blocking=blocking,
             degraded_reason=(
-                degraded_reason or ("check_publish_failed" if publish_failed else None)
+                degraded_reason
+                or ("check_publish_failed" if publish_failed else None)
+                or ("review_publish_failed" if review_publish_failed else None)
             ),
         )
     except Exception as e:  # noqa: BLE001 — best-effort per this module's own contract
