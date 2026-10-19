@@ -17,6 +17,7 @@ from __future__ import annotations
 import os
 from dataclasses import dataclass, field
 
+from llm_client import DEEP_VLLM_EXTRA_BODY
 from llm_client import (
     _CAVE_FINDINGS_RESPONSE_FORMAT as _PROD_CAVE_FINDINGS_RESPONSE_FORMAT,
 )
@@ -189,6 +190,24 @@ def configured_backends() -> list[BenchBackend]:
                     "response_format": _CAVE_FINDINGS_RESPONSE_FORMAT,
                     **_DISABLE_THINKING_EXTRA_BODY,
                 },
+                headers={"X-Spark-Caller": CAVE_BENCH_CALLER},
+            )
+        )
+
+    # grug#1191: the candidate vLLM deep arm, recorded as its own baseline
+    # entry (`elder_eval.gate.DEEP_CANDIDATE`) so the cutover gate can compare
+    # it with the Cave entry. It sends the body the production arm sends.
+    # Point the URL at the vLLM server's chat-completions path, not the gateway.
+    deep_url = os.getenv("GRUG_BENCH_DEEP_SHADOW_URL", "")
+    deep_model = os.getenv("GRUG_BENCH_DEEP_SHADOW_MODEL", "")
+    if deep_url and deep_model:
+        out.append(
+            BenchBackend(
+                name="deep-shadow",
+                url=deep_url,
+                model=deep_model,
+                api_key=os.getenv("GRUG_BENCH_DEEP_SHADOW_KEY", ""),
+                extra_body=dict(DEEP_VLLM_EXTRA_BODY),
                 headers={"X-Spark-Caller": CAVE_BENCH_CALLER},
             )
         )

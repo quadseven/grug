@@ -1,4 +1,6 @@
 """The #537 CI gate: prompt changes require a re-recorded eval baseline.
+Also the grug#1191 cutover gate for the vLLM deep arm
+(`deep_cutover_regressions`).
 
 `baseline.json` records `prompt_sha` = sha256 of `code_review_prompt.py`
 at record time. The per-PR test suite asserts it matches the committed
@@ -16,7 +18,14 @@ from pathlib import Path
 
 import code_review_prompt
 
+from .scoring import model_identity
+
 BASELINE_PATH = Path(__file__).resolve().parent / "baseline.json"
+
+# grug#1191: the baseline entry the vLLM deep arm is recorded under (the
+# `deep-shadow` bench backend), and the entry it must not do worse than.
+DEEP_CANDIDATE = "deep-shadow"
+DEEP_INCUMBENT = "cave"
 
 
 def compute_prompt_sha() -> str:
@@ -51,3 +60,42 @@ def merge_baseline(existing: dict, fresh: dict) -> tuple[dict, list[str]]:
         return merged, []
     dropped = sorted(set(existing.get("backends", {})) - set(fresh["backends"]))
     return dict(fresh), dropped
+
+
+def deep_cutover_regressions(baseline: dict, model: str) -> list[str]:
+    """Why the vLLM deep arm may not yet serve `model`; empty means it may.
+
+    A manifest may set `GRUG_DEEP_ARM_MODE=serve` only when the baseline
+    holds a `deep-shadow` entry that measured `model` itself, scored every
+    case the incumbent did with none errored, and is no worse than the
+    incumbent on overall catch or noise. Both entries come from the same
+    bench mode, so they are comparable; a changed prompt drops the entry
+    (`merge_baseline`), and serving then waits for a re-record."""
+    entries = baseline.get("backends", {})
+    candidate = entries.get(DEEP_CANDIDATE)
+    incumbent = entries.get(DEEP_INCUMBENT)
+    if candidate is None or incumbent is None:
+        missing = DEEP_CANDIDATE if candidate is None else DEEP_INCUMBENT
+        hint = f"`python -m elder_eval --backend {missing} --record`"
+        return [f"baseline has no {missing!r} entry - record it with {hint}"]
+    measured = model_identity(candidate)
+    if measured != model:
+        return [f"{DEEP_CANDIDATE!r} measured {measured or 'an unknown model'}, not {model!r}"]
+    return _score_regressions(candidate, incumbent)
+
+
+def _score_regressions(candidate: dict, incumbent: dict) -> list[str]:
+    """The candidate-vs-incumbent comparison behind `deep_cutover_regressions`."""
+    reasons: list[str] = []
+    if candidate.get("errored_cases"):
+        reasons.append(f"{len(candidate['errored_cases'])} case(s) errored")
+    cases, base_cases = int(candidate.get("cases_scored", 0)), int(incumbent.get("cases_scored", 0))
+    if cases < base_cases:
+        reasons.append(f"cases_scored {cases} < incumbent {base_cases}")
+    catch, base_catch = float(candidate.get("overall_catch", 0.0)), float(incumbent.get("overall_catch", 0.0))
+    if catch < base_catch:
+        reasons.append(f"overall_catch {catch:.2f} < incumbent {base_catch:.2f}")
+    noise, base_noise = float(candidate.get("noise_rate", 0.0)), float(incumbent.get("noise_rate", 0.0))
+    if noise > base_noise:
+        reasons.append(f"noise_rate {noise:.2f} > incumbent {base_noise:.2f}")
+    return reasons
