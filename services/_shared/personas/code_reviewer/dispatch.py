@@ -3286,17 +3286,7 @@ def dispatch_code_review(
         pr_number=pull_number, head_sha=head_sha, conclusion=conclusion,
         title=title, summary=summary, findings_count=len(evaluation.findings),
         blocking=blocking, degraded_reason=outcome.feed_degraded_reason,
-        success_result=(
-            "pass"
-            if outcome.settled(
-                review_publish_failed=review_publish_failed,
-                review_publish_rejected=review_publish_rejected,
-            ).result == "publish_failed"
-            else outcome.settled(
-                review_publish_failed=review_publish_failed,
-                review_publish_rejected=review_publish_rejected,
-            ).result
-        ),
+        success_result=outcome.result,
         publish_failed_log_name="code_review_check_run_publish_failed",
         review_publish_failed=review_publish_failed,
         token_retry_fn=lambda install_id, fn: with_install_token_retry(install_id, fn),
@@ -3304,8 +3294,6 @@ def dispatch_code_review(
         record_check_verdict_fn=lambda **kwargs: record_check_verdict(**kwargs),
     )
     check_publish_failed = published["result"] == "publish_failed"
-    if review_publish_failed and published["result"] != "publish_failed":
-        published["result"] = "publish_failed"
     outcome = outcome.settled(
         check_publish_failed=check_publish_failed,
         review_publish_failed=review_publish_failed,

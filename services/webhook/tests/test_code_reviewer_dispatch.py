@@ -781,6 +781,30 @@ def test_dispatch_review_publish_failure_returns_publish_failed(monkeypatch):
     assert recorded["degraded_reason"] == "review_publish_failed"
 
 
+def test_dispatch_settles_publish_outcome_once(monkeypatch):
+    llm = LlmReviewResponse(
+        kind="reviewed", findings=(), backend_used=Backend.POOLSIDE,
+    )
+    monkeypatch.setattr(cr_dispatch, "review_diff", lambda *a, **kw: llm)
+    monkeypatch.setattr(cr_dispatch, "post_check_run", lambda *a, **kw: {})
+    monkeypatch.setattr(cr_dispatch, "post_review", lambda *a, **kw: {})
+
+    calls = []
+    original = review_publish.PublishOutcome.settled
+
+    def track_settled(self, **kwargs):
+        calls.append(kwargs)
+        return original(self, **kwargs)
+
+    monkeypatch.setattr(review_publish.PublishOutcome, "settled", track_settled)
+
+    with patch("httpx.get", return_value=_diff_response()):
+        out = cr_dispatch.dispatch_code_review(_payload(), blocking=False)
+
+    assert out["result"] == "pass"
+    assert len(calls) == 1
+
+
 def test_dispatch_check_run_publish_failure_returns_publish_failed(monkeypatch):
     """Check-run is the load-bearing GH surface (flips mergeability in
     blocking mode). If it fails to publish, the persona result must be

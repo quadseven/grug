@@ -241,6 +241,7 @@ def publish_persona_check(
             ),
         )
     except Exception as e:  # noqa: BLE001 — this IS the total publish boundary
+        # Non-httpx auth failures also need an Activity row and a traceback.
         # every persona hand-rolled the same way (guard/warder/smasher/
         # code_reviewer all use httpx-only excepts here today); a narrower
         # catch would let a token-exchange RuntimeError, a botocore SSM
