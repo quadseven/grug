@@ -59,6 +59,12 @@ _MAX_COMMENT_PAGES = 20
 # internals across a persona boundary.
 _HIGH_SEVERITY = frozenset(("high", "critical"))
 MARKER = "<!-- grug-sentinel:abandoned-review -->"
+# Elder's author login on REST review comments (pulls/N/comments) and on
+# webhook comment payloads. Neither carries performed_via_github_app, so the
+# login is the only own-app signal there (grug#1162). Literal for the same
+# reason as _HIGH_SEVERITY; Elder's GraphQL form, without the [bot] suffix,
+# is personas.code_reviewer.thread_resolver._BOT_LOGIN.
+_ELDER_BOT_LOGIN = "grug-tribe[bot]"
 
 
 def _headers(token: str) -> dict[str, str]:
@@ -134,6 +140,18 @@ def _high_severity_records(
     return [r for r in records if r.get("finding_tags", {}).get("severity") in _HIGH_SEVERITY]
 
 
+def _is_own_bot(comment: dict, own_app_id: str) -> bool:
+    """True when Elder (this app) wrote the comment. Issue-comment payloads
+    carry performed_via_github_app; REST review comments and webhook review
+    comment payloads do not, so fall back to the bot account itself. The
+    user.type check keeps a human account out even if its login matched."""
+    app = comment.get("performed_via_github_app") or {}
+    if str(app.get("id", "")) == own_app_id:
+        return True
+    user = comment.get("user") or {}
+    return user.get("type") == "Bot" and user.get("login") == _ELDER_BOT_LOGIN
+
+
 def _replied_to_comment_ids(token: str, owner: str, repo: str, pr_number: int) -> set[int]:
     """Finding comments handled by a human reply or Elder's latest Fixed in.
 
@@ -181,9 +199,8 @@ def _replied_to_comment_ids(token: str, owner: str, repo: str, pr_number: int) -
     for root_id, replies in replies_by_root.items():
         human_replied = any(str((reply.get("user") or {}).get("type", "")) != "Bot" for reply in replies)
         latest = max(replies, key=lambda comment: int(comment["id"]))
-        app = latest.get("performed_via_github_app") or {}
         elder_fixed = (
-            str(app.get("id", "")) == own_app_id
+            _is_own_bot(latest, own_app_id)
             and (latest.get("body") or "").lstrip().lower().startswith("fixed in ")
         )
         if human_replied or elder_fixed:

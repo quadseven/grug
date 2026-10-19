@@ -366,6 +366,48 @@ def test_reply_scan_counts_latest_own_app_fixed_in_but_not_other_bot(monkeypatch
     assert sentinel._replied_to_comment_ids("tok", "owner", "repo", 5) == {1}
 
 
+def test_reply_scan_counts_elder_fixed_in_from_real_rest_payload(monkeypatch):
+    """grug#1162: the REST pulls/N/comments payload carries NO
+    performed_via_github_app key, so keying "Elder's own reply" on the app
+    id never matched and every Elder-answered finding still drew a Haunt
+    notice (a lane PR in the factory repo: 3 high threads, each with Elder's Fixed in as the
+    newest reply). Shapes below are trimmed from that PR's real REST
+    payload: the author is identified only by user.login + user.type."""
+    monkeypatch.setattr(sentinel, "get_app_id", lambda: "42")
+    elder = {"login": "grug-tribe[bot]", "type": "Bot"}
+    other_bot = {"login": "some-other-app[bot]", "type": "Bot"}
+    impostor = {"login": "grug-tribe", "type": "Bot"}  # not the [bot] login
+    finding = "high | _general_ | `lint-security`"
+    fixed = "Fixed in 1359413: the flagged code changed and this finding no longer applies."
+    comments = [
+        # Elder answered its own finding: handled.
+        {"id": 4263832298, "in_reply_to_id": None, "user": elder, "body": finding},
+        {"id": 4264259749, "in_reply_to_id": 4263832298, "user": elder, "body": fixed},
+        # Another app's Fixed in is not Elder's: unhandled.
+        {"id": 4263832304, "in_reply_to_id": None, "user": elder, "body": finding},
+        {"id": 4264260126, "in_reply_to_id": 4263832304, "user": other_bot, "body": fixed},
+        # Elder's Fixed in followed by a newer Elder comment: unhandled.
+        {"id": 4263832318, "in_reply_to_id": None, "user": elder, "body": finding},
+        {"id": 4264260605, "in_reply_to_id": 4263832318, "user": elder, "body": fixed},
+        {"id": 4264260700, "in_reply_to_id": 4264260605, "user": elder, "body": "Still open."},
+        # A bot whose login only resembles Elder's: unhandled.
+        {"id": 4263832400, "in_reply_to_id": None, "user": elder, "body": finding},
+        {"id": 4264260800, "in_reply_to_id": 4263832400, "user": impostor, "body": fixed},
+    ]
+    assert not any("performed_via_github_app" in c for c in comments)
+
+    class _Response:
+        def raise_for_status(self):
+            pass
+
+        def json(self):
+            return comments
+
+    monkeypatch.setattr(sentinel.httpx, "get", lambda *args, **kwargs: _Response())
+
+    assert sentinel._replied_to_comment_ids("tok", "owner", "repo", 207) == {4263832298}
+
+
 def test_blocking_verdict_with_real_findings_still_warns(monkeypatch):
     """The grug#721 case this persona exists for - a critical finding that
     genuinely shipped - must keep firing. The gate removes noise, not the
