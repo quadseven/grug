@@ -24,11 +24,13 @@ import os
 import threading
 from typing import Any, Dict
 
+from psycopg import sql
 from ..grug_structured_logger import get_logger
 
 log = get_logger(__name__)
 
 _TABLE = "grugthink_config"
+_TABLE_IDENT = sql.Identifier(_TABLE)
 
 _pool = None
 _pool_lock = threading.Lock()
@@ -47,15 +49,16 @@ def pg_config_enabled() -> bool:
 
 def _bootstrap_schema(conn) -> None:
     """Idempotently create the single-row config table."""
-    conn.execute(
-        f"""
-        CREATE TABLE IF NOT EXISTS {_TABLE} (
+    query = sql.SQL(
+        """
+        CREATE TABLE IF NOT EXISTS {} (
             id         integer PRIMARY KEY CHECK (id = 1),
             data       jsonb NOT NULL,
             updated_at timestamptz NOT NULL DEFAULT now()
         )
         """
-    )
+    ).format(_TABLE_IDENT)
+    conn.execute(query)
     conn.commit()
 
 
@@ -94,9 +97,10 @@ def get_pool():
 def load_config() -> Dict[str, Any]:
     """Load the config document from Postgres. Returns {} when unset."""
     pool = get_pool()
+    query = sql.SQL("SELECT data FROM {} WHERE id = 1").format(_TABLE_IDENT)
     with pool.connection() as conn:
         with conn.cursor() as cur:
-            cur.execute(f"SELECT data FROM {_TABLE} WHERE id = 1")
+            cur.execute(query)
             row = cur.fetchone()
     if not row or not row[0]:
         return {}
@@ -109,17 +113,17 @@ def load_config() -> Dict[str, Any]:
 def save_config(config_data: Dict[str, Any]) -> None:
     """Upsert the whole config document as the single row."""
     pool = get_pool()
+    query = sql.SQL(
+        """
+        INSERT INTO {} (id, data, updated_at)
+        VALUES (1, %s::jsonb, now())
+        ON CONFLICT (id) DO UPDATE
+        SET data = EXCLUDED.data, updated_at = now()
+        """
+    ).format(_TABLE_IDENT)
     with pool.connection() as conn:
         with conn.cursor() as cur:
-            cur.execute(
-                f"""
-                INSERT INTO {_TABLE} (id, data, updated_at)
-                VALUES (1, %s::jsonb, now())
-                ON CONFLICT (id) DO UPDATE
-                SET data = EXCLUDED.data, updated_at = now()
-                """,
-                (json.dumps(config_data),),
-            )
+            cur.execute(query, (json.dumps(config_data),))
         conn.commit()
     log.info("Configuration saved to Postgres", extra={"table": _TABLE})
 
@@ -155,7 +159,12 @@ def load_or_seed(seed_path: str, templates: Dict) -> Dict[str, Any]:
 
 
 def reset_pool_for_tests() -> None:
-    """Drop the module pool (tests only)."""
+    """Drop the module pool (test utility).
+
+    This is a test-only entry point used by integration tests that exercise
+    the live Postgres backend (tests/unit/config/test_pg_store.py::test_pg_config_roundtrip).
+    It is not called from production code.
+    """
     global _pool, _bootstrapped
     with _pool_lock:
         if _pool is not None:
