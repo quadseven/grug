@@ -70,6 +70,7 @@ from review_pipeline import (
 )
 from review_evidence import Hunk, ElderEvidence, seal
 from datadog_switch import datadog_enabled
+import deep_shadow
 from secrets_loader import (
     get_opencode_go_api_key,
     get_openrouter_api_key,
@@ -1807,6 +1808,35 @@ def _cave_review_config(backend: Backend) -> "BackendConfig | None":
         },
         # X-Spark-Job and X-Spark-Data-Class (grug#1269), from `_SPARK_JOB`.
         dynamic_headers=dict(_CAVE_JOB_HEADERS),
+    )
+
+
+# grug#1191: the optional vLLM deep arm (see `deep_shadow`). Same schema,
+# completion cap, and thinking switch as the Cave reasoner it shadows or
+# replaces, so a comparison measures the model and runtime, not a different
+# request. The elder_eval `deep-shadow` bench backend sends this same body.
+DEEP_VLLM_EXTRA_BODY: dict = {
+    "response_format": _CAVE_FINDINGS_RESPONSE_FORMAT,
+    "max_tokens": 6_144,
+    **_CAVE_THINKING_OFF,
+}
+
+
+def _deep_vllm_config(arm: deep_shadow.DeepArm) -> BackendConfig:
+    """BackendConfig for the vLLM deep arm. It keeps the CAVE_REASONER
+    identity (it is the reasoner arm on another runtime); `model` tells the
+    two apart in attribution. Called directly, never through the gateway, so
+    no gateway failover can turn it into a cold load."""
+    return BackendConfig(
+        backend=Backend.CAVE_REASONER,
+        url=f"{arm.base_url}/v1/chat/completions",
+        model=arm.model,
+        key_loader=lambda: "in-cluster",  # a vLLM started without --api-key ignores it
+        extra_body=dict(DEEP_VLLM_EXTRA_BODY),
+        extra_headers={"X-Spark-Caller": f"grug-elder-deep-{arm.mode}"},
+        timeout_seconds=_review_llm_timeout_s(),
+        retry_attempts=_REVIEW_RETRY_ATTEMPTS,
+        transport_retry_attempts=_REVIEW_TRANSPORT_RETRY_ATTEMPTS,
     )
 
 
@@ -4506,6 +4536,10 @@ def _review_reasoner_diff_once(
     decision 2026-09-26). Under `cave` priority it is the Cave reasoner
     alone, as before. Never falls back to the paid SaaS valve here:
     overload insurance already ran on the Tier-1 path.
+
+    `GRUG_DEEP_ARM_MODE` (grug#1191, `deep_shadow`) can replay this prompt
+    against a vLLM arm after the answer is in (`shadow`, logged only), or
+    let that arm take the Cave reasoner call (`serve`).
     """
     hunks = list(evidence.hunks)
     if not hunks:
@@ -4522,6 +4556,31 @@ def _review_reasoner_diff_once(
         review_map=review_map,
     )
     pr_tags = _llmobs_tags(pr_context)
+    arm = deep_shadow.resolve_deep_arm()
+    response = _deep_response(
+        hunks, messages, variant, pr_tags, installation_id, pr_context,
+        cancel_event, arm,
+    )
+    cancelled = cancel_event is not None and cancel_event.is_set()
+    if arm is not None and arm.mode == "shadow" and not cancelled:
+        deep_shadow.submit(
+            lambda: _shadow_deep_vllm(arm, messages, variant, pr_tags, pr_context, response),
+        )
+    return response
+
+
+def _deep_response(
+    hunks: list[Hunk],
+    messages: list[dict[str, str]],
+    variant: PromptVariant,
+    pr_tags: dict[str, str],
+    installation_id: int,
+    pr_context: Optional[PrContext],
+    cancel_event: threading.Event | None,
+    arm: "deep_shadow.DeepArm | None",
+) -> LlmReviewResponse:
+    """The deep pass's published answer: the cloud chain under `cloud`
+    priority, then the reasoner arm (`_run_deep_arm`)."""
     # grug#1097: a short empty cloud answer, kept if the reasoner fails too.
     low_confidence: LlmReviewResponse | None = None
     if _review_backend_priority() == "cloud":
@@ -4531,9 +4590,7 @@ def _review_reasoner_diff_once(
         if cloud_result.answer is not None:
             return cloud_result.answer
         low_confidence = cloud_result.low_confidence
-    outcome = _run_review_arm(
-        Backend.CAVE_REASONER, messages, variant, pr_tags, cancel_event,
-    )
+    outcome = _run_deep_arm(messages, variant, pr_tags, cancel_event, arm)
     if outcome.kind == "success":
         assert outcome.model is not None
         origin = _finding_origin(
@@ -4570,6 +4627,71 @@ def _review_reasoner_diff_once(
         kind="all_failed",
         error=outcome.error_text or "cave-reasoner failed",
         backend_used=Backend.CAVE_REASONER,
+    )
+
+
+def _run_deep_arm(
+    messages: list[dict[str, str]],
+    variant: PromptVariant,
+    pr_tags: dict[str, str],
+    cancel_event: threading.Event | None,
+    arm: "deep_shadow.DeepArm | None",
+) -> _ArmOutcome:
+    """The reasoner arm's one call (grug#1191). In `serve` mode the resident
+    vLLM arm answers; when it is not resident or fails, the Cave reasoner
+    answers as it does in every other mode."""
+    if arm is not None and arm.mode == "serve" and deep_shadow.is_resident(arm):
+        served = _run_review_arm(
+            Backend.CAVE_REASONER, messages, variant, pr_tags, cancel_event,
+            config_override=_deep_vllm_config(arm),
+        )
+        if served.kind == "success":
+            return served
+        log.warning(
+            "deep_vllm_failed_falling_back",
+            extra={"model": arm.model, "kind": served.kind, "error": served.error_text[:200]},
+        )
+    return _run_review_arm(
+        Backend.CAVE_REASONER, messages, variant, pr_tags, cancel_event,
+    )
+
+
+def _shadow_deep_vllm(
+    arm: deep_shadow.DeepArm,
+    messages: list[dict[str, str]],
+    variant: PromptVariant,
+    pr_tags: dict[str, str],
+    pr_context: Optional[PrContext],
+    published: LlmReviewResponse,
+) -> None:
+    """Replay the deep prompt against the vLLM arm and log how its findings
+    compare with what was published. Runs on the `deep_shadow` worker after
+    the review has its answer; its findings are dropped here, by design."""
+    if not deep_shadow.is_resident(arm):
+        return
+    started = time.monotonic()
+    outcome = _run_review_arm(
+        Backend.CAVE_REASONER, messages, variant, pr_tags,
+        config_override=_deep_vllm_config(arm),
+    )
+    shadow = deep_shadow.finding_keys(outcome.findings)
+    production = deep_shadow.finding_keys(published.findings)
+    ctx = pr_context or {}
+    log.info(
+        "deep_shadow_compared",
+        extra={
+            "repo": ctx.get("repo"),
+            "pr_number": ctx.get("pr_number"),
+            "shadow_model": arm.model,
+            "shadow_kind": outcome.kind,
+            "shadow_truncated": outcome.truncated,
+            "shadow_latency_ms": int((time.monotonic() - started) * 1000),
+            "production_kind": published.kind,
+            "production_models": list(published.models_used),
+            "production_count": len(production),
+            "shadow_count": len(shadow),
+            "overlap": len(production & shadow),
+        },
     )
 
 
