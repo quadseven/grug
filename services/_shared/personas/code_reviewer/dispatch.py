@@ -127,7 +127,7 @@ from personas.code_reviewer.persona import (
 )
 from personas.code_reviewer.shell_flow_filter import filter_checked_shell_findings
 from personas.code_reviewer.snapshot import review_freshness_id_from_pr
-from personas.code_reviewer import carry_forward
+from personas.code_reviewer import carry_forward, living_review
 from personas.code_reviewer.degraded_gate import (
     degraded_conclusion, gate_sentence, lead_with_degraded_line,
 )
@@ -601,12 +601,15 @@ _RE_REVIEW_ACTIONS = {"synchronize", "reopened", "review"}
 def _carry_into_check(
     *, action: str, evaluation: CodeReviewEvaluation, mode: ReviewMode,
     installation_id: int, owner: str, repo_name: str, pull_number: int,
-    conclusion: CheckConclusion, title: str, summary: str,
+    head_sha: str, conclusion: CheckConclusion, title: str, summary: str,
 ) -> tuple[CheckConclusion, str, str, list[dict] | None]:
-    """Fold Elder's earlier, still-open findings into the check verdict.
+    """Fold Elder's earlier findings into the check verdict: still-open ones
+    via carry-forward, and ones this push addressed as a title note (#1187),
+    which the Activity feed records as the review's summary.
 
-    One thread listing per re-review, returned so the thread resolver reuses
-    it. A listing failure leaves the check as it was. Never raises.
+    One thread listing per re-review, returned so the thread resolver and
+    living review reuse it. A listing failure leaves the check as it was.
+    Never raises.
     """
     if action not in _RE_REVIEW_ACTIONS or evaluation.degraded_reason:
         return conclusion, title, summary, None
@@ -620,20 +623,36 @@ def _carry_into_check(
         carried, conclusion=conclusion, title=title, summary=summary,
         blocking_mode=mode == "blocking",
     )
+    addressed = living_review.count_addressed(
+        threads, living_review.ReviewEvidence(head_sha, evaluation.findings),
+    )
+    title = living_review.note_on_title(title, addressed, head_sha)
     return new_conclusion, title, summary, threads  # type: ignore[return-value]
+
+
+def _head_is_same_repo(pr: dict, repo: dict) -> bool:
+    """True when the PR's head branch lives in the base repository, so the
+    pusher has write access. A fork, or a deleted fork's null head repo, is
+    not; living review lets only a trusted push teach the ledger (#1187)."""
+    head_repo = (pr.get("head") or {}).get("repo") or {}
+    return head_repo.get("id") is not None and head_repo.get("id") == repo.get("id")
 
 
 def _tidy_fixed_threads(
     *, action: str, review_published: bool, evaluation: CodeReviewEvaluation,
     installation_id: int, owner: str, repo_name: str, pull_number: int,
     head_sha: str, threads: list[dict] | None = None,
-    pr_author: str | None = None,
+    pr_author: str | None = None, trusted_push: bool = False,
 ) -> None:
-    """Resolve Elder's own fixed threads after a complete re-review (#1102).
+    """Resolve Elder's own fixed threads after a complete re-review (#1102),
+    then edit each Elder finding in place to its current state (#1187).
 
-    Only a complete, published re-review may close threads: a
-    degraded or partial review has no findings because it did not look, and
-    its silence must not read as "fixed". Never raises.
+    Only a complete, published re-review may close threads or mark a
+    finding addressed: a degraded or partial review has no findings because
+    it did not look, and its silence must not read as "fixed". Living review
+    reuses the listing taken before the resolver ran, so a thread the
+    resolver just closed still reads as changed, and reads addressed; with
+    no listing it is skipped (the failure is already logged). Never raises.
     """
     # Any re-review of a PR that may already carry Elder threads. Production
     # reviews arrive through the durable queue as action="review"
@@ -658,6 +677,13 @@ def _tidy_fixed_threads(
                 "pr": f"{owner}/{repo_name}#{pull_number}",
                 "kind": type(e).__name__,
             },
+        )
+    if threads is not None:
+        living_review.sync_pr(
+            installation_id, owner, repo_name, pull_number, threads=threads,
+            review=living_review.ReviewEvidence(
+                head_sha, evaluation.findings, trusted_push=trusted_push,
+            ),
         )
 
 
@@ -3203,8 +3229,8 @@ def dispatch_code_review(
     conclusion, title, summary, listed_threads = _carry_into_check(
         action=action, evaluation=evaluation, mode=mode,
         installation_id=installation_id, owner=owner, repo_name=repo_name,
-        pull_number=pull_number, conclusion=conclusion, title=title,
-        summary=summary,
+        pull_number=pull_number, head_sha=head_sha, conclusion=conclusion,
+        title=title, summary=summary,
     )
     summary = _lead_if_degraded(summary, evaluation)
     check_result = CheckRunResult(
@@ -3536,7 +3562,7 @@ def dispatch_code_review(
         evaluation=evaluation,
         installation_id=installation_id, owner=owner, repo_name=repo_name,
         pull_number=pull_number, head_sha=head_sha, threads=listed_threads,
-        pr_author=author_login,
+        pr_author=author_login, trusted_push=_head_is_same_repo(pr, repo),
     )
 
     # LLM-as-a-judge DD evals (#190) submit AFTER the review + check-run are

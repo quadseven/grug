@@ -466,6 +466,29 @@ def test_list_comment_records_for_pr_filters_by_repo_and_pr(pg):
     assert [r["comment_id"] for r in recs] == [200]
 
 
+def test_comment_record_resolution_merges_and_clears(pg):
+    """#1187: living review stores the finding's state beside its reaction
+    verdict; the sparse merge leaves `last_verdict` intact, and the PR
+    lister must decode the field (it whitelists fields)."""
+    from adapters import pg_install_store as store
+
+    store.put_comment_record(
+        install_id=1, comment_id=300, repo="o/r", pr_number=5,
+        review_span_context=None, finding_tags={"severity": "high"},
+    )
+    store.update_comment_record_reaction(install_id=1, comment_id=300, verdict="confirmed")
+    store.update_comment_record_resolution(
+        install_id=1, comment_id=300, state="addressed", sha="abc1234",
+    )
+    [rec] = store.list_comment_records_for_pr(1, "o/r", 5)
+    assert rec["resolution"] == {"state": "addressed", "sha": "abc1234"}
+    assert rec["last_verdict"] == "confirmed"
+
+    store.update_comment_record_resolution(install_id=1, comment_id=300, state=None)
+    [rec] = store.list_comment_records_for_pr(1, "o/r", 5)
+    assert "resolution" not in rec
+
+
 def test_learnings_roundtrip_dedup_and_ttl(pg):
     from adapters import pg_install_store as store
 

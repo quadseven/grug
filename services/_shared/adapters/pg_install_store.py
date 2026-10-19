@@ -537,6 +537,10 @@ class CommentRecord(TypedDict):
     author_login: NotRequired[str]
     trust_reactors: NotRequired[bool]
     last_verdict: NotRequired[Optional[str]]
+    # Living review (#1187): the finding's annotated state, `{"state":
+    # "addressed"|"resolved"|"dismissed", "sha": <short sha or "">}`, or
+    # absent/None while the finding is open.
+    resolution: NotRequired[Optional[dict[str, str]]]
     # Epoch seconds when the record expires (created + the record TTL); the
     # reaction poll derives a comment's age from it.
     ttl: NotRequired[int]
@@ -1795,6 +1799,8 @@ def _decode_comment_record_rows(rows: list[tuple[Any, ...]]) -> list[CommentReco
             record["trust_reactors"] = True
         if isinstance(item.get("ttl"), (int, float)):
             record["ttl"] = int(item["ttl"])
+        if isinstance(item.get("resolution"), dict):
+            record["resolution"] = item["resolution"]
         out.append(record)
     return out
 
@@ -1842,4 +1848,22 @@ def update_comment_record_reaction(
         _inst_pk(install_id),
         _comment_record_sk(comment_id),
         {"last_verdict": verdict},
+    )
+
+
+def update_comment_record_resolution(
+    *,
+    install_id: int,
+    comment_id: int,
+    state: Optional[str],
+    sha: str = "",
+) -> None:
+    """Record a finding's living-review state (#1187). `state=None` clears
+    it (the finding is open again). Sparse merge, so the reaction fields on
+    the same row are untouched."""
+    resolution = {"state": state, "sha": sha} if state else None
+    _merge_attrs(
+        _inst_pk(install_id),
+        _comment_record_sk(comment_id),
+        {"resolution": resolution},
     )

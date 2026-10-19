@@ -2493,3 +2493,48 @@ def test_learn_outcomes_never_post_a_comment(monkeypatch):
         monkeypatch.setattr(rerun, "_gh_post", lambda token, url, body, sink=posted: sink.append((url, body)))
         rerun._run_learn(11, "o/r", 7, 5001, 4000, "reply")
         assert posted and all(url.endswith("/reactions") and set(body) == {"content"} for url, body in posted)
+
+
+def test_learn_reply_syncs_the_findings_living_review_state(monkeypatch):
+    """#1187: a maintainer reply that resolved the thread is answered by
+    the in-place Resolved chip, via the learn lane, never a comment."""
+    from unittest.mock import MagicMock
+
+    synced = MagicMock(return_value=1)
+    monkeypatch.setattr(rerun, "_sync_living_review", synced)
+    monkeypatch.setattr("adapters.install_store.get_learning_by_source_comment", lambda repo, cid: None)
+    monkeypatch.setattr("adapters.install_store.get_comment_record",
+                        lambda iid, cid: {"finding_text": "x", "finding_tags": {"rule_name": "r"}})
+    monkeypatch.setattr("adapters.install_store.put_learning", lambda **kw: None)
+    monkeypatch.setattr("adapters.install_store.claim_delivery", lambda k: True)
+    monkeypatch.setattr("llm_client.classify_learning",
+                        lambda *a, **k: {"durable": False, "learning": "", "scope_path": ""})
+    monkeypatch.setattr(rerun, "with_install_token_retry", lambda iid, fn: fn("tok"))
+    monkeypatch.setattr(rerun, "_gh_post", lambda token, url, body: None)
+    assert rerun._run_learn(11, "o/r", 7, 5001, 4000, "done, resolving") == "learn_one_off"
+    synced.assert_called_once_with(11, "o", "r", 7)
+
+
+def test_learn_reply_to_an_untracked_comment_does_not_sync(monkeypatch):
+    from unittest.mock import MagicMock
+
+    synced = MagicMock(return_value=0)
+    monkeypatch.setattr(rerun, "_sync_living_review", synced)
+    monkeypatch.setattr("adapters.install_store.get_comment_record", lambda iid, cid: None)
+    assert rerun._run_learn(11, "o/r", 7, 5001, 4000, "reply") == "learn_no_parent"
+    synced.assert_not_called()
+
+
+def test_review_payload_keeps_the_head_repo_for_the_fork_check():
+    """#1187: living review trusts a same-repo push to label a finding
+    `fixed`; the durable payload must carry the head repo id to say so."""
+    pr = {"head": {"sha": "h", "repo": {"id": 99}},
+          "base": {"sha": "b", "repo": {"id": 7}}}
+    payload = rerun._review_payload(
+        install_id=1, owner="o", repo_name="r", pr_number=2, pr=pr,
+    )
+    assert payload["pull_request"]["head"] == {"sha": "h", "repo": {"id": 99}}
+    deleted_fork = {"head": {"sha": "h", "repo": None}, "base": {"sha": "b", "repo": {"id": 7}}}
+    assert rerun._review_payload(
+        install_id=1, owner="o", repo_name="r", pr_number=2, pr=deleted_fork,
+    )["pull_request"]["head"] == {"sha": "h", "repo": None}
