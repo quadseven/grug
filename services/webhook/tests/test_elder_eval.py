@@ -983,9 +983,9 @@ def test_production_case_uses_full_diff_and_scores_complete_staged_result():
     )
     seen = {}
 
-    def review(hunks, **kwargs):
-        seen["paths"] = [h.path for h in hunks]
-        seen["context"] = kwargs["pr_context"]
+    def review(evidence, **kwargs):
+        seen["paths"] = [h.path for h in evidence.hunks]
+        seen["context"] = evidence.pr_context
         return LlmReviewResponse(
             kind="reviewed",
             findings=(Finding(

@@ -17,8 +17,10 @@ Two halves of the fix, one contract each:
 from __future__ import annotations
 
 import llm_client as lc
-from llm_client import Hunk, _build_review_parts
+import review_evidence as ev
+from llm_client import Hunk
 from personas.code_reviewer.persona import CodeReviewEvaluation, Finding, with_findings
+from review_evidence import assemble_evidence
 
 
 def _big_module() -> tuple[str, int, int]:
@@ -28,7 +30,7 @@ def _big_module() -> tuple[str, int, int]:
     Returns (source, signature_line, changed_line)."""
     lines: list[str] = ["import datetime", ""]
     # Filler so the file exceeds the full-file context budget.
-    for i in range(lc._MAX_FILE_CONTEXT_LINES):
+    for i in range(ev.MAX_FILE_CONTEXT_LINES):
         lines.append(f"CONST_{i} = {i}")
     lines.append("")
     lines.append("")
@@ -73,10 +75,11 @@ def test_hunk_40_lines_below_signature_carries_signature_in_review_context():
     assert changed - sig_line >= 40
     # Precondition: the file is too large for the full-file block, so on
     # main the signature is nowhere in the prompt.
-    assert lc._render_file_block("svc/reviewer.py", source) == ""
-    parts, _ = _build_review_parts(
-        [_hunk_at(changed)], file_contents={"svc/reviewer.py": source},
-    )
+    assert ev._render_file_block("svc/reviewer.py", source) == ""
+    parts, _ = assemble_evidence(
+        [_hunk_at(changed)],
+        file_contents={"svc/reviewer.py": source},
+    ).reviewer_view()
     joined = "\n".join(parts)
     assert "ENCLOSING SCOPE" in joined
     assert f"{sig_line}:     def score(" in joined
@@ -93,8 +96,7 @@ def test_judge_context_carries_the_same_signature():
         [{"severity": "high", "rule_name": "undefined-name",
           "file": "svc/reviewer.py", "line": changed,
           "message": "`now` is not defined"}],
-        [_hunk_at(changed)],
-        {"svc/reviewer.py": source},
+        assemble_evidence([_hunk_at(changed)], file_contents={"svc/reviewer.py": source}),
     )
     user = msgs[1]["content"]
     assert "ENCLOSING SCOPE" in user
@@ -106,7 +108,7 @@ def test_no_signature_block_when_full_file_is_shown():
     signature would only spend tokens."""
     src = "def f(a, b):\n    x = 1\n    y = 2\n    return a + b\n"
     hunk = Hunk(path="s.py", body="@@ -4 +4 @@\n-    return a\n+    return a + b")
-    parts, _ = _build_review_parts([hunk], file_contents={"s.py": src})
+    parts, _ = assemble_evidence([hunk], file_contents={"s.py": src}).reviewer_view()
     joined = "\n".join(parts)
     assert "FULL FILE" in joined
     assert "ENCLOSING SCOPE" not in joined
@@ -114,13 +116,13 @@ def test_no_signature_block_when_full_file_is_shown():
 
 def test_no_signature_block_without_content_or_for_non_python():
     hunk = Hunk(path="a.py", body="@@ -5 +5 @@\n+x")
-    parts, _ = _build_review_parts([hunk])
+    parts, _ = assemble_evidence([hunk]).reviewer_view()
     assert "ENCLOSING SCOPE" not in "\n".join(parts)
     big_yaml = "\n".join(f"k{i}: v" for i in range(900))
-    parts, _ = _build_review_parts(
+    parts, _ = assemble_evidence(
         [Hunk(path="a.yml", body="@@ -850 +850 @@\n+k: v")],
         file_contents={"a.yml": big_yaml},
-    )
+    ).reviewer_view()
     assert "ENCLOSING SCOPE" not in "\n".join(parts)
 
 
@@ -133,19 +135,19 @@ def test_signature_inside_hunk_is_not_repeated():
         "-        now,\n"
         "+        now: datetime.datetime,"
     )
-    parts, _ = _build_review_parts(
+    parts, _ = assemble_evidence(
         [Hunk(path="svc/reviewer.py", body=body)],
         file_contents={"svc/reviewer.py": source},
-    )
+    ).reviewer_view()
     assert "ENCLOSING SCOPE" not in "\n".join(parts)
 
 
 def test_unparseable_source_degrades_to_diff_only():
     bad = "def f(:\n" + "\n".join("x" for _ in range(900))
-    parts, _ = _build_review_parts(
+    parts, _ = assemble_evidence(
         [Hunk(path="b.py", body="@@ -850 +850 @@\n+x")],
         file_contents={"b.py": bad},
-    )
+    ).reviewer_view()
     assert "ENCLOSING SCOPE" not in "\n".join(parts)
 
 

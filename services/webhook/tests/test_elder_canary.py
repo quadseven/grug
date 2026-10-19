@@ -103,9 +103,13 @@ def test_clean_partial_review_is_error():
 
 # ---- emission ----------------------------------------------------------
 
+def _planted(evidence) -> bool:
+    return list(evidence.hunks) == list(canary.PLANTED_HUNKS)
+
+
 def _run(monkeypatch, planted, clean):
-    def fake(hunks, installation_id, pr_context=None, **kw):
-        return planted if hunks is canary.PLANTED_HUNKS else clean
+    def fake(evidence, installation_id, **kw):
+        return planted if _planted(evidence) else clean
     monkeypatch.setattr(canary, "review_diff", fake)
     return canary.run_canary(timeout_s=5)
 
@@ -162,8 +166,8 @@ def test_logs_elder_canary_result(monkeypatch, emitted, caplog):
 
 
 def test_exception_in_review_is_error_and_still_emits_both(monkeypatch, emitted):
-    def fake(hunks, installation_id, pr_context=None, **kw):
-        if hunks is canary.PLANTED_HUNKS:
+    def fake(evidence, installation_id, **kw):
+        if _planted(evidence):
             raise RuntimeError("provider down")
         return _reviewed()
     monkeypatch.setattr(canary, "review_diff", fake)
@@ -176,8 +180,8 @@ def test_timeout_emits_error_for_the_hung_case_and_cancels(monkeypatch, emitted)
     release = threading.Event()
     seen_cancel: list[threading.Event] = []
 
-    def fake(hunks, installation_id, pr_context=None, cancel_event=None, **kw):
-        if hunks is canary.PLANTED_HUNKS:
+    def fake(evidence, installation_id, cancel_event=None, **kw):
+        if _planted(evidence):
             seen_cancel.append(cancel_event)
             release.wait(5)
         return _reviewed()
@@ -192,8 +196,8 @@ def test_timeout_emits_error_for_the_hung_case_and_cancels(monkeypatch, emitted)
 def test_never_posts_to_github_and_uses_fake_context(monkeypatch, emitted):
     captured = {}
 
-    def fake(hunks, installation_id, pr_context=None, **kw):
-        captured.update(iid=installation_id, ctx=pr_context)
+    def fake(evidence, installation_id, **kw):
+        captured.update(iid=installation_id, ctx=evidence.pr_context)
         return _reviewed()
     monkeypatch.setattr(canary, "review_diff", fake)
     import github_app_auth

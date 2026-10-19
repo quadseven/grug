@@ -28,19 +28,17 @@ from llm_client import (
     BackendConfig,
     FindingJudgement,
     FindingOrigin,
-    Hunk,
     JUDGE_BATCH_SIZE,
     JUDGE_MAX_FINDINGS,
     JudgeFindingRepr,
-    PrContext,
     _cave_judge_config,
     cloud_judge_configs,
     judge_findings,
     submit_finding_evaluation,
 )
-from personas.code_reviewer.diff_parser import DiffHunk
 from personas.code_reviewer.persona import CodeReviewEvaluation, Finding
 from personas.code_reviewer.sast import EXPOSED_SECRET
+from review_evidence import ElderEvidence
 from review_types import Severity
 
 log = logging.getLogger(f"{os.getenv('DD_SERVICE', 'grug')}.persona.code_reviewer.judge")
@@ -55,36 +53,24 @@ _JUDGE_CONFIDENCE_FLOOR = 0.7
 _SUPPRESSIBLE_SEVERITIES: frozenset[Severity] = frozenset(("low", "medium"))
 
 
-def _scope_evidence(
-    findings: list[JudgeFindingRepr],
-    hunks: list[Hunk],
-    file_contents: Optional[dict[str, str]],
-) -> tuple[list[Hunk], Optional[dict[str, str]]]:
-    """Build the smallest evidence packet that can prove this batch.
+def _batch_evidence(
+    findings: list[JudgeFindingRepr], evidence: ElderEvidence,
+) -> ElderEvidence:
+    """The smallest evidence packet that can prove this batch: the review's
+    assembled evidence narrowed to the batch's files.
 
     Discovery may inspect an entire review cohort, but adjudication should not
     recreate a whole-PR prompt. Cross-file snippets stay available because
     they were selected upstream as bounded dependency evidence.
     """
-    paths = {finding["file"] for finding in findings}
-    scoped_hunks = [hunk for hunk in hunks if hunk.path in paths]
-    scoped_files = (
-        {path: body for path, body in file_contents.items() if path in paths}
-        if file_contents is not None
-        else None
-    )
-    return scoped_hunks, scoped_files
+    return evidence.scoped_to(finding["file"] for finding in findings)
 
 
 def _judge_evidence_packet(
     findings: list[JudgeFindingRepr],
-    hunks: list[Hunk],
+    evidence: ElderEvidence,
     installation_id: int,
     *,
-    pr_context: Optional[PrContext],
-    file_contents: Optional[dict[str, str]],
-    cross_file_contents: Optional[dict[str, str]],
-    runtime_context: str | None,
     refute: bool = False,
 ) -> tuple[FindingJudgement, ...]:
     """Grade one evidence packet, trying backends in order until one returns
@@ -102,12 +88,8 @@ def _judge_evidence_packet(
         try:
             verdicts = judge_findings(
                 findings,
-                hunks,
+                evidence,
                 installation_id=installation_id,
-                pr_context=pr_context,
-                file_contents=file_contents,
-                cross_file_contents=cross_file_contents,
-                runtime_context=runtime_context,
                 config=config,
                 redact=redact,
                 refute=refute,
@@ -151,12 +133,8 @@ def _judge_evidence_packet(
             return verdicts
     return judge_findings(
         findings,
-        hunks,
+        evidence,
         installation_id=installation_id,
-        pr_context=pr_context,
-        file_contents=file_contents,
-        cross_file_contents=cross_file_contents,
-        runtime_context=runtime_context,
         config=None,
         redact=True,
         refute=refute,
@@ -223,13 +201,8 @@ def _eval_targets(
 
 def grade_findings(
     evaluation: CodeReviewEvaluation,
-    hunks: tuple[DiffHunk, ...],
+    evidence: ElderEvidence,
     installation_id: int,
-    *,
-    pr_context: Optional[PrContext] = None,
-    file_contents: Optional[dict[str, str]] = None,
-    cross_file_contents: Optional[dict[str, str]] = None,
-    runtime_context: str | None = None,
 ) -> tuple[FindingJudgement, ...]:
     """Run the judge LLM over the evaluation's findings and return its
     verdicts (#467). Fail-OPEN: an empty finding set or an LLM/parse error
@@ -238,12 +211,10 @@ def grade_findings(
     is the ONLY function that makes the judge LLM call; both the
     publication gate (`partition_findings`) and the DD evals (`submit_evals`)
     consume its result. Large ensemble outputs are split into bounded batches;
-    one failed batch does not discard verdicts for the others."""
+    one failed batch does not discard verdicts for the others. `evidence` is
+    the review's own assembled evidence, never re-collected here."""
     if not evaluation.findings:
         return ()
-    # Convert parser DiffHunks -> wire `Hunk`s (path/body) the same way the
-    # review path does. Passing raw DiffHunks once crashed every judge call.
-    wire_hunks = [Hunk(path=h.file_path, body=h.body) for h in hunks]
     finding_reprs = [_finding_to_repr(f) for f in evaluation.findings]
     verdicts: list[FindingJudgement] = []
     failed_batches = 0
@@ -260,18 +231,11 @@ def grade_findings(
         )
     for start in range(0, len(graded_reprs), JUDGE_BATCH_SIZE):
         batch = graded_reprs[start:start + JUDGE_BATCH_SIZE]
-        scoped_hunks, scoped_files = _scope_evidence(
-            batch, wire_hunks, file_contents,
-        )
         try:
             batch_verdicts = _judge_evidence_packet(
                 batch,
-                scoped_hunks,
+                _batch_evidence(batch, evidence),
                 installation_id=installation_id,
-                pr_context=pr_context,
-                file_contents=scoped_files,
-                cross_file_contents=cross_file_contents,
-                runtime_context=runtime_context,
             )
         except Exception as e:  # noqa: BLE001 - fail-open per bounded batch
             failed_batches += 1
@@ -407,14 +371,10 @@ def submit_evals(
 
 def run_judge(
     evaluation: CodeReviewEvaluation,
-    hunks: tuple[DiffHunk, ...],
+    evidence: ElderEvidence,
     installation_id: int,
     *,
     review_span_context: Optional[dict],
-    pr_context: Optional[PrContext] = None,
-    file_contents: Optional[dict[str, str]] = None,
-    cross_file_contents: Optional[dict[str, str]] = None,
-    runtime_context: str | None = None,
 ) -> None:
     """Grade the evaluation's findings and submit DD LLM Obs evals - the
     eval-only compose (`grade_findings` + `submit_evals`), NO publication
@@ -431,13 +391,7 @@ def run_judge(
                 extra={"findings": len(evaluation.findings)},
             )
         return
-    verdicts = grade_findings(
-        evaluation, hunks, installation_id,
-        pr_context=pr_context,
-        file_contents=file_contents,
-        cross_file_contents=cross_file_contents,
-        runtime_context=runtime_context,
-    )
+    verdicts = grade_findings(evaluation, evidence, installation_id)
     submit_evals(
         evaluation.findings, verdicts, review_span_context=review_span_context,
     )
@@ -455,13 +409,8 @@ _REFUTE_CONFIDENCE_FLOOR = 0.9
 
 def refute_findings(
     findings: tuple[Finding, ...],
-    hunks: tuple[DiffHunk, ...],
+    evidence: ElderEvidence,
     installation_id: int,
-    *,
-    pr_context: Optional[PrContext] = None,
-    file_contents: Optional[dict[str, str]] = None,
-    cross_file_contents: Optional[dict[str, str]] = None,
-    runtime_context: str | None = None,
 ) -> tuple[FindingJudgement, ...]:
     """Adversarial evidence-check (#714) for the HIGH/CRITICAL findings
     that survived the deterministic verification pass. One refute-framed
@@ -474,20 +423,12 @@ def refute_findings(
     high/critical subset (cost bound: typically 0-2 findings)."""
     if not findings:
         return ()
-    wire_hunks = [Hunk(path=h.file_path, body=h.body) for h in hunks]
     reprs = [_finding_to_repr(f) for f in findings[:JUDGE_BATCH_SIZE]]
-    scoped_hunks, scoped_files = _scope_evidence(
-        reprs, wire_hunks, file_contents,
-    )
     try:
         return _judge_evidence_packet(
             reprs,
-            scoped_hunks,
+            _batch_evidence(reprs, evidence),
             installation_id=installation_id,
-            pr_context=pr_context,
-            file_contents=scoped_files,
-            cross_file_contents=cross_file_contents,
-            runtime_context=runtime_context,
             refute=True,
         )
     except Exception as e:  # noqa: BLE001 - fail-open, mirror grade_findings

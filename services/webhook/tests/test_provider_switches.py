@@ -12,6 +12,7 @@ import httpx
 import llm_client as lc
 import pytest
 from llm_client import Backend, Hunk, review_diff
+from review_evidence import assemble_evidence
 
 _GO_URL = "opencode.ai"
 _OR_URL = "openrouter.ai"
@@ -118,7 +119,7 @@ def test_cloud_review_never_calls_a_disabled_backend(monkeypatch) -> None:
     monkeypatch.setenv("GRUG_DISABLED_BACKENDS", "opencode-go,openrouter")
     fake = _Recorder({_POOLSIDE_URL: _finding_response()})
     with patch.object(httpx, "post", side_effect=fake):
-        out = review_diff([_hunk()], installation_id=1)
+        out = review_diff(assemble_evidence([_hunk()]), installation_id=1)
     assert out.kind == "reviewed"
     assert out.backend_used == Backend.POOLSIDE
     assert fake.hosts() == {_POOLSIDE_URL}
@@ -135,7 +136,7 @@ def test_saas_overload_fallback_never_calls_a_disabled_backend(monkeypatch) -> N
         _OR_URL: _finding_response(),
     })
     with patch.object(httpx, "post", side_effect=fake):
-        out = review_diff([_hunk()], installation_id=1)
+        out = review_diff(assemble_evidence([_hunk()]), installation_id=1)
     assert out.kind == "all_failed"
     assert _OR_URL not in fake.hosts()
     assert _POOLSIDE_URL in fake.hosts()
@@ -150,7 +151,7 @@ def test_judge_moves_off_a_disabled_backend(monkeypatch) -> None:
     fake = _Recorder({_POOLSIDE_URL: verdicts})
     findings = [{"rule_name": "r", "file": "src/x.py", "line": 1, "message": "m"}]
     with patch.object(httpx, "post", side_effect=fake):
-        out = lc.judge_findings(findings, [_hunk()], installation_id=1)
+        out = lc.judge_findings(findings, assemble_evidence([_hunk()]), installation_id=1)
     assert len(out) == 1
     assert fake.hosts() == {_POOLSIDE_URL}
 
@@ -159,7 +160,7 @@ def test_judge_with_every_backend_disabled_makes_no_call(monkeypatch) -> None:
     monkeypatch.setenv("GRUG_DISABLED_BACKENDS", "openrouter,poolside")
     findings = [{"rule_name": "r", "file": "src/x.py", "line": 1, "message": "m"}]
     with patch.object(httpx, "post") as post:
-        assert lc.judge_findings(findings, [_hunk()], installation_id=1) == ()
+        assert lc.judge_findings(findings, assemble_evidence([_hunk()]), installation_id=1) == ()
     post.assert_not_called()
 
 
@@ -332,13 +333,13 @@ def test_a_review_skips_a_provider_after_its_first_auth_refusal(monkeypatch) -> 
         _POOLSIDE_URL: _finding_response(),
     })
     with patch.object(httpx, "post", side_effect=fake):
-        first = review_diff([_hunk()], installation_id=1)
+        first = review_diff(assemble_evidence([_hunk()]), installation_id=1)
     assert first.backend_used == Backend.POOLSIDE
     assert sum(_GO_URL in u for u in fake.urls) == 1
     assert sum(_OR_URL in u for u in fake.urls) == 1
     fake.urls.clear()
     with patch.object(httpx, "post", side_effect=fake):
-        second = review_diff([_hunk()], installation_id=1)
+        second = review_diff(assemble_evidence([_hunk()]), installation_id=1)
     assert second.backend_used == Backend.POOLSIDE
     assert fake.hosts() == {_POOLSIDE_URL}
 

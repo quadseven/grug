@@ -13,6 +13,7 @@ from llm_client import Backend, FindingJudgement, Hunk, _build_judge_messages, _
 from personas.code_reviewer import sast
 from personas.code_reviewer.diff_parser import parse_diff
 from personas.code_reviewer.sast import EXPOSED_SECRET, Candidate, judge_candidates
+from review_evidence import assemble_evidence
 
 
 _DIFF = """diff --git a/.env b/.env
@@ -72,8 +73,8 @@ def test_judge_messages_redact_masks_secret():
     reprs = [{"rule_name": "sqli", "file": "a.py", "line": 2,
               "severity": "high", "message": "m"}]
     hunks = [Hunk(path=".env", body="+AWS_SECRET_ACCESS_KEY=AKIAIOSFODNN7REALKEY")]
-    raw = _build_judge_messages(reprs, hunks)[1]["content"]
-    redacted = _build_judge_messages(reprs, hunks, redact=True)[1]["content"]
+    raw = _build_judge_messages(reprs, assemble_evidence(hunks))[1]["content"]
+    redacted = _build_judge_messages(reprs, assemble_evidence(hunks), redact=True)[1]["content"]
     assert "AKIAIOSFODNN7REALKEY" in raw
     assert "AKIAIOSFODNN7REALKEY" not in redacted
 
@@ -197,7 +198,10 @@ def test_real_judge_findings_uses_cave_backend(monkeypatch):
     reprs = [{"rule_name": EXPOSED_SECRET, "file": ".env", "line": 1,
               "severity": "high", "message": "masked"}]
     verdicts = llm_client.judge_findings(
-        reprs, [Hunk(path=".env", body="+k=v")], 1, config=cfg,
+        reprs,
+        assemble_evidence([Hunk(path=".env", body="+k=v")]),
+        1,
+        config=cfg,
     )
     assert seen["backend"] == "cave"
     assert seen["url"] == "http://gw.example.svc:8080/v1/chat/completions"

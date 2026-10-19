@@ -97,7 +97,7 @@ def test_dispatch_advisory_mode_posts_neutral_check_and_comment_review(monkeypat
     posted_check = []
     posted_review = []
 
-    def _fake_review_diff(hunks, installation_id, pr_context=None, file_contents=None, cross_file_contents=None, runtime_context=None, ci_context=None, repo_docs_context=None, voice="caveman", cancel_event=None):
+    def _fake_review_diff(evidence, installation_id, voice="caveman", cancel_event=None):
         return llm
 
     def _fake_post_check_run(install_token, owner, repo, result, external_id=None):
@@ -1131,8 +1131,8 @@ def test_dispatch_passes_identity_and_intent_to_review_diff(monkeypatch):
     """The review receives both trace coordinates and author intent."""
     captured = []
 
-    def _fake_review_diff(hunks, installation_id, pr_context=None, file_contents=None, cross_file_contents=None, runtime_context=None, ci_context=None, repo_docs_context=None, voice="caveman", cancel_event=None):
-        captured.append(pr_context)
+    def _fake_review_diff(evidence, installation_id, voice="caveman", cancel_event=None):
+        captured.append(evidence.pr_context)
         return LlmReviewResponse(kind="no_diff")
 
     monkeypatch.setattr(cr_dispatch, "review_diff", _fake_review_diff)
@@ -3969,8 +3969,8 @@ def test_dispatch_skips_a_byte_identical_copy_of_an_untouched_repo_file(monkeypa
     reviewed_paths: list[str] = []
     posted_check = []
 
-    def _fake_review_diff(hunks, installation_id, **kwargs):
-        reviewed_paths.extend(h.path for h in hunks)
+    def _fake_review_diff(evidence, installation_id, **kwargs):
+        reviewed_paths.extend(h.path for h in evidence.hunks)
         return LlmReviewResponse(
             kind="reviewed", findings=(),
             backend_used=Backend.POOLSIDE, model_name="laguna",
@@ -4024,8 +4024,8 @@ def test_dispatch_reviews_a_copy_when_the_head_tree_is_unreadable(monkeypatch):
     )
     reviewed_paths: list[str] = []
 
-    def _fake_review_diff(hunks, installation_id, **kwargs):
-        reviewed_paths.extend(h.path for h in hunks)
+    def _fake_review_diff(evidence, installation_id, **kwargs):
+        reviewed_paths.extend(h.path for h in evidence.hunks)
         return LlmReviewResponse(
             kind="reviewed", findings=(),
             backend_used=Backend.POOLSIDE, model_name="laguna",

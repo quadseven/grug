@@ -9,9 +9,10 @@ from __future__ import annotations
 
 from types import SimpleNamespace
 
-from llm_client import Hunk, _build_review_parts
+from llm_client import Hunk
 from personas.code_reviewer import repo_docs
 from personas.code_reviewer.repo_docs import build_repo_docs_context
+from review_evidence import assemble_evidence
 
 CONTEXT_TEXT = """# CONTEXT.md — grug domain glossary
 
@@ -151,24 +152,24 @@ def test_block_header_is_distinct():
     assert "authoritative" in ctx
 
 
-def test_build_review_parts_accepts_repo_docs_context():
-    # Threading contract: _build_review_parts takes the new kwarg.
+def test_reviewer_view_accepts_repo_docs_context():
+    # Threading contract: the review evidence carries the new signal.
     hunks = [Hunk(path="a.py", body="diff")]
-    parts, _ = _build_review_parts(hunks, repo_docs_context="docs!")
+    parts, _ = assemble_evidence(hunks, repo_docs_context="docs!").reviewer_view()
     assert any("### REPO DOCS" in p and "docs!" in p for p in parts)
 
 
-def test_build_review_parts_renders_after_ci_status():
+def test_reviewer_view_renders_after_ci_status():
     hunks = [Hunk(path="a.py", body="diff")]
-    parts, _ = _build_review_parts(hunks, ci_context="ci!", repo_docs_context="docs!")
+    parts, _ = assemble_evidence(hunks, ci_context="ci!", repo_docs_context="docs!").reviewer_view()
     joined = "\n".join(parts)
     assert joined.index("### CI STATUS") < joined.index("### REPO DOCS")
 
 
-def test_build_review_parts_omits_block_when_none():
+def test_reviewer_view_omits_block_when_none():
     hunks = [Hunk(path="a.py", body="diff")]
-    parts_none, _ = _build_review_parts(hunks, repo_docs_context=None)
-    parts_absent, _ = _build_review_parts(hunks)
+    parts_none, _ = assemble_evidence(hunks).reviewer_view()
+    parts_absent, _ = assemble_evidence(hunks).reviewer_view()
     assert parts_none == parts_absent
     assert not any("### REPO DOCS" in p for p in parts_none)
 
