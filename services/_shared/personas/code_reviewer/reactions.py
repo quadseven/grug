@@ -176,18 +176,52 @@ def _reaction_reviewers(record: CommentRecord) -> list[str]:
     ))
 
 
+def ledger_label(
+    verdict: Optional[str], resolution: Optional[dict],
+) -> Optional[str]:
+    """The ledger verdict for a finding from its trusted reaction verdict and
+    its living-review state (#1187), or None when neither is ground truth.
+
+    A thumbs-down or a dismissal is a false positive whatever else happened.
+    Code a later push changed (`addressed`) is `fixed`, which outranks a
+    thumbs-up's `declined` so a late reaction never downgrades the row. A
+    resolve alone is no label: people resolve threads for false positives too.
+    """
+    state = (resolution or {}).get("state")
+    if verdict == "false_positive" or state == "dismissed":
+        return "false-positive"
+    if state == "addressed":
+        return "fixed"
+    if verdict == "confirmed":
+        return "declined"
+    return None
+
+
 def _record_reaction_learning(
     record: CommentRecord, verdict: ReactionVerdict,
 ) -> bool:
     """Persist trusted feedback and refresh the repo's bounded prompt cache."""
-    if not record.get("trust_reactors", False):
+    resolution = record.get("resolution")
+    label = ledger_label(verdict, resolution)
+    if label is None:
+        return False
+    return record_ledger_learning(record, label, resolution)
+
+
+def record_ledger_learning(
+    record: CommentRecord, ledger_verdict: str,
+    resolution: Optional[dict] = None,
+) -> bool:
+    """Write the finding's stable evidence row(s) with `ledger_verdict` and
+    refresh the repo's practices/examples. `resolution` adds the living-review
+    state (#1187) as `resolution` / `resolution_sha`. Returns False when the
+    record lacks the trusted-learning fields."""
+    if not _can_learn(record):
         return False
     finding_text = record.get("finding_text", "")
     tags = record.get("finding_tags", {})
     rule_name = tags.get("rule_name", "")
     severity = tags.get("severity", "")
-    if not all((finding_text, rule_name, severity)):
-        return False
 
     from adapters.install_store import (  # type: ignore
         list_ledger_rows,
@@ -199,8 +233,7 @@ def _record_reaction_learning(
     from few_shot import exemplars_from_rows, exemplars_to_dicts
     from ledger import accepted_findings_by_class, parse_row
 
-    ledger_verdict = "declined" if verdict == "confirmed" else "false-positive"
-    base_row = {
+    base_row: dict = {
         "repo": record["repo"],
         "pr": record["pr_number"],
         "severity": severity,
@@ -220,6 +253,12 @@ def _record_reaction_learning(
         # (older hand-appended ledger rows use `commit` that way).
         "head_sha": record.get("head_sha") or None,
     }
+    if resolution and resolution.get("state"):
+        # #1187: the evidence for HOW the finding resolved. Not part of the
+        # row key (finding + ts + evidence), so this heals the same row.
+        base_row["resolution"] = resolution["state"]
+        if resolution.get("sha"):
+            base_row["resolution_sha"] = resolution["sha"]
     # #540: attribute the human verdict to the MODEL(s) that produced the
     # finding, so reviewer_precision() splits per backend/model -> the routing
     # signal (a low-precision arm gets weighted down). One row per distinct
@@ -232,7 +271,8 @@ def _record_reaction_learning(
         if (parsed := parse_row(raw)) is not None
     ]
     emit_verdict(
-        record.get("finding_origins"), verdict == "confirmed", parsed_rows,
+        record.get("finding_origins"), ledger_verdict != "false-positive",
+        parsed_rows,
     )
     put_repo_practices(
         record["repo"], practices_to_dicts(derive_practices(parsed_rows)),

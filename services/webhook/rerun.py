@@ -45,6 +45,7 @@ from personas.code_reviewer.dispatch import (
     dispatch_code_review,
 )
 from personas.review_publish import LOW_CONFIDENCE
+from personas.code_reviewer.living_review import sync_pr as _sync_living_review
 from personas.code_reviewer.degraded_gate import (
     degraded_conclusion,
     gate_sentence,
@@ -988,6 +989,11 @@ def _run_learn(
         emit_gauge("grug.learnings.classified", 1)
     except Exception:  # noqa: BLE001
         pass
+    # Living review (#1187): a maintainer who replied may have resolved the
+    # thread too; the Resolved chip on Elder's comment is the in-place
+    # acknowledgement (the reply itself only ever gets a reaction). Never
+    # raises; the reaction-poll lane catches a resolve that lands later.
+    _sync_living_review(install_id, owner, repo_name, pr_number)
     log.info("learn_classified", extra={
         "repo": repo_full, "pr": pr_number, "comment_id": comment_id,
         "result": result})
@@ -1159,6 +1165,10 @@ def elder_blocking_for(
     return _elder_blocking_from_pr(install_id, pr)
 
 
+def _repo_id_only(repo: Any) -> dict[str, Any] | None:
+    return {"id": repo.get("id")} if isinstance(repo, dict) else None
+
+
 def _review_payload(
     *,
     install_id: int,
@@ -1187,7 +1197,12 @@ def _review_payload(
             "user": {
                 "login": str((pr.get("user") or {}).get("login") or ""),
             },
-            "head": {"sha": (pr.get("head") or {})["sha"]},
+            # head.repo: living review's fork check (#1187). A deleted
+            # fork's head repo is null and stays null (untrusted).
+            "head": {
+                "sha": (pr.get("head") or {})["sha"],
+                "repo": _repo_id_only((pr.get("head") or {}).get("repo")),
+            },
             "base": {"sha": base.get("sha")},
         },
     }

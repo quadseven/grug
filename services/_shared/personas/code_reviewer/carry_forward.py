@@ -13,8 +13,10 @@ thread resolver already needs, and folds them into the check verdict:
     changed, so an untouched line means the finding still stands);
   - a finding the new review raises again is not carried (it is already
     counted among the fresh findings);
+  - a finding a maintainer dismissed (living review, #1187) is not carried;
   - severity comes from the first line of the inline comment body, which
-    `dispatch._inline_comment_body` renders as `<chip> | <category> | ...`.
+    `dispatch._inline_comment_body` renders as `<chip> | <category> | ...`
+    (read from the original body when living review has annotated it).
 
 Everything here is pure except `list_threads`, which fails open: a listing
 error logs `elder_carry_forward_failed` and the check publishes as before.
@@ -27,6 +29,7 @@ import re
 from dataclasses import dataclass
 
 from github_app_auth import with_install_token_retry
+from personas.code_reviewer import living_review
 from personas.code_reviewer.persona import Finding
 from personas.code_reviewer.thread_resolver import (
     _NEARBY_LINES,
@@ -69,6 +72,15 @@ def parse_severity(body: str) -> str | None:
     return word if word in _RANK else None
 
 
+def _standing_severity(body: str) -> str | None:
+    """The finding's severity, or None when it no longer stands: a
+    maintainer dismissed it (#1187) or its header does not parse. Living
+    review's annotated bodies are read from the preserved original."""
+    if living_review.parse_state(body) == living_review.DISMISSED:
+        return None
+    return parse_severity(living_review.original_body(body))
+
+
 def select_carried(
     threads: list[dict], findings: tuple[Finding, ...],
 ) -> tuple[CarriedFinding, ...]:
@@ -82,7 +94,7 @@ def select_carried(
             continue
         rule, path, original_line = owned
         first = ((t.get("comments") or {}).get("nodes") or [{}])[0]
-        severity = parse_severity(first.get("body") or "")
+        severity = _standing_severity(first.get("body") or "")
         if severity is None:
             continue
         line = int(first.get("line") or original_line)

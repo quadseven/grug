@@ -30,6 +30,11 @@ def _wire(monkeypatch, *, installs, records_for, retry, poll):
     monkeypatch.setattr(poller_handler, "list_comment_records", records_for)
     monkeypatch.setattr(poller_handler, "with_install_token_retry", retry)
     monkeypatch.setattr(poller_handler, "poll_and_annotate", poll)
+    # #1187: default the living-review sync to idle so the reaction-poll
+    # assertions stay about the reaction poll; it lists threads on GitHub.
+    monkeypatch.setattr(
+        poller_handler, "sync_due_prs", lambda records, *, install_id: 0,
+    )
     # The rate-limit read is a real GET; tests never reach GitHub, and an
     # unreadable budget never blocks the poll.
     monkeypatch.setattr(poller_handler, "_github_core_budget", lambda token: None)
@@ -120,6 +125,51 @@ def test_poller_polls_each_allowlisted_install(monkeypatch):
         "enforcement_emitted": 0,
         "enforcement_failed_installs": 0,
     }
+
+
+def test_poller_syncs_living_review_for_the_due_records(monkeypatch):
+    """#1187: the reaction-poll lane carries living review - each install's
+    due records go to sync_due_prs after their reactions are polled."""
+    order: list[str] = []
+    synced: list[tuple] = []
+
+    def _poll(records, *, install_id, fetch_token):
+        order.append("poll")
+        return 0
+
+    _wire(
+        monkeypatch,
+        installs=[11],
+        records_for=lambda iid: [{"comment_id": 1, "repo": "o/r", "pr_number": 5}],
+        retry=lambda iid, fn: fn("tok"),
+        poll=_poll,
+    )
+    monkeypatch.setattr(
+        poller_handler, "sync_due_prs",
+        lambda records, *, install_id: order.append("sync")
+        or synced.append((install_id, [r["comment_id"] for r in records])) or 1,
+    )
+    poller_handler.handler({}, None)
+    assert order == ["poll", "sync"]
+    assert synced == [(11, [1])]
+
+
+def test_poller_low_budget_skips_living_review_too(monkeypatch):
+    synced: list[int] = []
+    _wire(
+        monkeypatch,
+        installs=[11],
+        records_for=lambda iid: [{"comment_id": 1, "repo": "o/r", "pr_number": 5}],
+        retry=lambda iid, fn: fn("tok"),
+        poll=lambda records, **kw: 0,
+    )
+    monkeypatch.setattr(poller_handler, "_github_core_budget", lambda token: (10, 5000))
+    monkeypatch.setattr(
+        poller_handler, "sync_due_prs",
+        lambda records, *, install_id: synced.append(install_id) or 0,
+    )
+    poller_handler.handler({}, None)
+    assert synced == []
 
 
 def test_poller_one_install_failure_does_not_abort_cycle(monkeypatch, caplog):
