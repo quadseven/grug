@@ -298,6 +298,25 @@ def test_ledger_label_follows_the_transition_not_the_stale_stored_state(wired):
     assert (row["verdict"], row["resolution"]) == ("fixed", "addressed")
 
 
+def test_ledger_learning_gets_a_record_with_the_current_resolution(wired, monkeypatch):
+    """The record handed to the ledger writer carries this transition's
+    resolution, not the stale stored one, so nothing downstream can label
+    from the previous state."""
+    gh = _Gh([_thread(outdated=True)])
+    state = wired(gh)
+    record = _learning_record()
+    record["resolution"] = {"state": "resolved", "sha": ""}
+    state["records"] = [record]
+    seen = []
+    monkeypatch.setattr(
+        lr, "record_ledger_learning",
+        lambda rec, label, resolution: seen.append((rec, label, resolution)),
+    )
+    assert lr.sync_pr(1, "o", "r", 5, review=_review()) == 1
+    current = {"state": "addressed", "sha": HEAD[:7]}
+    assert seen == [({**record, "resolution": current}, "fixed", current)]
+
+
 def test_given_threads_are_reused_without_a_second_listing(wired, monkeypatch):
     gh = _Gh([])
     wired(gh)
