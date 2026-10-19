@@ -26,7 +26,7 @@ import httpx
 from adapters.install_store import (
     claim_dep_watch_report, get_repo_config, release_dep_watch_report,
 )
-from personas.code_reviewer.sca import ChangedDep, _audit, _MANIFEST_RE, _PINNED_DEP_RE
+from personas.code_reviewer.sca import ChangedDep, audit_deps, MANIFEST_RE, PINNED_DEP_RE
 
 log = logging.getLogger(f"{os.getenv('DD_SERVICE', 'grug')}.persona.guard.dep_watch")
 
@@ -49,7 +49,7 @@ def parse_manifest_pins(path: str, text: str) -> tuple[ChangedDep, ...]:
         line = raw.strip()
         if not line or line.startswith("#"):
             continue
-        m = _PINNED_DEP_RE.match(line)
+        m = PINNED_DEP_RE.match(line)
         if not m:
             continue
         key = (m.group("name").lower(), m.group("version"))
@@ -74,7 +74,7 @@ def _discover_manifests(token: str, owner: str, repo: str) -> list[str]:
     """Manifest paths across the WHOLE default-branch tree (codex PR
     #492: root-only fetching silently skipped requirements-dev.txt,
     constraints.txt, setup.cfg, and nested manifests that the diff-time
-    SCA already covers). Matches sca's own _MANIFEST_RE so the two
+    SCA already covers). Matches sca's own MANIFEST_RE so the two
     scanners can never disagree about what counts as a manifest. Capped
     + truncation logged (no silent caps)."""
     resp = httpx.get(
@@ -93,7 +93,7 @@ def _discover_manifests(token: str, owner: str, repo: str) -> list[str]:
         log.info("dep_watch_tree_truncated", extra={"repo": f"{owner}/{repo}"})
     paths = [
         t.get("path", "") for t in payload.get("tree", [])
-        if t.get("type") == "blob" and _MANIFEST_RE.search(t.get("path", ""))
+        if t.get("type") == "blob" and MANIFEST_RE.search(t.get("path", ""))
     ]
     if len(paths) > _MAX_MANIFESTS:
         log.info(
@@ -189,7 +189,7 @@ def run_dep_watch_for_install(
                 continue
             # strict: an OSV outage RAISES (counted as a failed repo)
             # instead of masquerading as a clean scan (codex r3).
-            vulns = _audit(tuple(pins), strict=True)
+            vulns = audit_deps(tuple(pins), strict=True)
             if not vulns:
                 log.info("dep_watch_clean", extra={"repo": full, "pins": len(pins)})
                 continue

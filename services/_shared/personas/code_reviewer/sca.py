@@ -37,11 +37,11 @@ log = logging.getLogger(f"{os.getenv('DD_SERVICE', 'grug')}.persona.code_reviewe
 VULNERABLE_DEPENDENCY = "vulnerable-dependency"
 
 # Manifest files whose added `name==version` lines we audit. Python-first.
-_MANIFEST_RE = re.compile(r"(^|/)(requirements[^/]*\.txt|pyproject\.toml|setup\.cfg|constraints[^/]*\.txt)$")
+MANIFEST_RE = re.compile(r"(^|/)(requirements[^/]*\.txt|pyproject\.toml|setup\.cfg|constraints[^/]*\.txt)$")
 # A PINNED dependency spec on an added line: `name==1.2.3` (extras/markers
 # tolerated). Only `==` is deterministically auditable; unpinned bumps are a
 # follow-up (which version is live is ambiguous).
-_PINNED_DEP_RE = re.compile(
+PINNED_DEP_RE = re.compile(
     r'^[\'"]?(?P<name>[A-Za-z0-9_.-]+)(?:\[[A-Za-z0-9_,.-]+\])?\s*==\s*(?P<version>[A-Za-z0-9_.!+-]+)'
 )
 # AC5 cost bound: cap how many changed deps we audit per review.
@@ -85,10 +85,10 @@ def extract_changed_deps(hunks: tuple[DiffHunk, ...]) -> tuple[ChangedDep, ...]:
     out: list[ChangedDep] = []
     seen: set[tuple[str, str, str]] = set()
     for hunk in hunks:
-        if not _MANIFEST_RE.search(hunk.file_path):
+        if not MANIFEST_RE.search(hunk.file_path):
             continue
         for lineno, text in _added_lines(hunk):
-            m = _PINNED_DEP_RE.match(text.strip())
+            m = PINNED_DEP_RE.match(text.strip())
             if not m:
                 continue
             name = m.group("name")
@@ -101,7 +101,7 @@ def extract_changed_deps(hunks: tuple[DiffHunk, ...]) -> tuple[ChangedDep, ...]:
     return tuple(out[:_MAX_DEPS])
 
 
-def _audit(
+def audit_deps(
     deps: tuple[ChangedDep, ...], *, strict: bool = False,
 ) -> dict[tuple[str, str], list[str]]:
     """Query the OSV batch API for the changed deps; return {(name_lower,
@@ -146,7 +146,7 @@ def scan_dependencies(hunks: tuple[DiffHunk, ...]) -> tuple[Candidate, ...]:
     deps = extract_changed_deps(hunks)
     if not deps:
         return ()
-    vulns = _audit(deps)
+    vulns = audit_deps(deps)
     if not vulns:
         return ()
     candidates: list[Candidate] = []
