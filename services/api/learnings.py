@@ -23,6 +23,7 @@ event naming the actor, the same posture as admin.py.
 from __future__ import annotations
 
 import logging
+import re
 from typing import Any
 
 import httpx
@@ -52,6 +53,7 @@ router = APIRouter(prefix="/api/v1/admin/learnings")
 
 _GH_API = "https://api.github.com"
 _ID_PATTERN = r"^[0-9a-f]{12}$"
+_REF_RE = re.compile(r"^[A-Za-z0-9._/-]+$")
 
 
 class LearningPatch(BaseModel):
@@ -90,8 +92,6 @@ def _repo_or_400(repo: str) -> str:
 
 
 def _id_or_404(learning_id: str) -> str:
-    import re
-
     if not re.match(_ID_PATTERN, learning_id):
         raise HTTPException(status.HTTP_404_NOT_FOUND, detail="learning not found")
     return learning_id
@@ -255,6 +255,10 @@ def preview_learning_paths(
     if body.paths is not None:
         paths = body.paths
     elif body.repo and body.install_id:
+        # The ref is interpolated into the GitHub API path: refuse anything
+        # that could step out of the trees endpoint or add a query.
+        if not _REF_RE.match(body.ref) or ".." in body.ref:
+            raise HTTPException(status.HTTP_400_BAD_REQUEST, detail="invalid ref")
         paths = _fetch_repo_paths(body.install_id, _repo_or_400(body.repo), body.ref)
     else:
         raise HTTPException(

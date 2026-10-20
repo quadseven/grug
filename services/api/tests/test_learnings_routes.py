@@ -127,6 +127,15 @@ def test_preview_fetches_the_repo_tree_when_no_paths_are_given(api, monkeypatch)
     assert out["matches"] == ["a/mw/x.py"] and calls == [(5, "o/r", "HEAD")]
 
 
+@pytest.mark.parametrize("ref", ["../../orgs/x", "main?x=1", "a b", "main#frag"])
+def test_preview_rejects_a_ref_that_could_leave_the_trees_endpoint(api, monkeypatch, ref):
+    monkeypatch.setattr(api, "_fetch_repo_paths", lambda *a: pytest.fail("fetched"))
+    body = api.PreviewRequest(scope_path="*.py", repo="o/r", install_id=5, ref=ref)
+    with pytest.raises(HTTPException) as e:
+        api.preview_learning_paths(body, user=_admin())
+    assert e.value.status_code == 400
+
+
 def test_preview_rejects_invalid_paths_and_missing_sources(api):
     with pytest.raises(HTTPException) as e:
         api.preview_learning_paths(api.PreviewRequest(scope_path="../x", paths=[]), user=_admin())
