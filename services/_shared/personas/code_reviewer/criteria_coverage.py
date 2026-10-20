@@ -295,12 +295,12 @@ def _dead_code_finding(root: _NewDef, stranded: list[_NewDef]) -> Finding:
     if stranded:
         names = ", ".join(f"`{d.name}`" for d in stranded)
         helpers = (
-            f"the new helper it calls ({names})" if len(stranded) == 1
-            else f"the {len(stranded)} new helpers it calls ({names})"
+            f"does the new helper it calls ({names})" if len(stranded) == 1
+            else f"do the {len(stranded)} new helpers it calls ({names})"
         )
         claim = (
             f"New function `{root.name}` has no caller outside test files, "
-            f"and neither does {helpers}, so nothing this PR ships runs them."
+            f"and neither {helpers}, so nothing this PR ships runs them."
         )
     else:
         claim = (

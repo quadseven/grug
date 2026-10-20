@@ -216,6 +216,7 @@ def test_uncalled_root_and_its_private_helpers_are_one_marking():
     assert len(dead) == 1, findings
     assert (dead[0].file, dead[0].line) == ("station/verify.py", 10)
     assert dead[0].message.split("`")[1] == "publish_report"
+    assert "neither do the 3 new helpers it calls" in dead[0].message
     for helper in ("_clean", "_group", "_render"):
         assert f"`{helper}`" in dead[0].message
 
