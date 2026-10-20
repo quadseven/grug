@@ -3913,13 +3913,20 @@ def _repo_learnings_block(pr_context: Optional[PrContext]) -> str:
     if not pr_context or "repo" not in pr_context:
         return ""
     try:
-        from adapters.pg_install_store import list_learnings  # type: ignore
+        from adapters.pg_install_store import (  # type: ignore
+            list_learnings,
+        )
         rows = list_learnings(str(pr_context["repo"]))
         if not rows:
             return ""
         # Redaction happens PER ROW inside the renderer (before truncation),
         # so a secret cut at the byte boundary cannot leak a partial value.
-        return _render_learnings_block(cast("list[dict[str, Any]]", rows))
+        block = _render_learnings_block(cast("list[dict[str, Any]]", rows))
+        # Track usage: every learning that made it into the prompt is marked
+        # used (bump usage_count, stamp last_used_at). Best-effort, never
+        # fails a review.
+        _mark_learnings_used(str(pr_context["repo"]), rows)
+        return block
     except Exception as e:  # noqa: BLE001 - learnings never break a review, but log
         log.warning("repo_learnings_fetch_failed", extra={
             "repo": str(pr_context.get("repo", "")), "kind": type(e).__name__})
@@ -3973,6 +3980,25 @@ def _render_learnings_block(
         "past findings - apply them, and do not re-flag what they tell you to "
         "allow):\n" + body
     )
+
+
+def _mark_learnings_used(repo: str, rows: list[dict[str, Any]]) -> None:
+    """Bump usage_count and stamp last_used_at for the learnings rendered
+    into the prompt (newest-first, count-capped, non-empty). Best-effort:
+    a store failure never surfaces here."""
+    from adapters.pg_install_store import (  # type: ignore
+        _learning_digest, increment_learning_usage,
+    )
+    seen: set[str] = set()
+    for row in list(reversed(rows))[:_MAX_LEARNINGS_IN_PROMPT]:
+        text = str(row.get("text", "")).strip()
+        if not text:
+            continue
+        digest = _learning_digest(text)
+        if digest in seen:
+            continue
+        seen.add(digest)
+        increment_learning_usage(repo, digest)
 
 
 def _repo_guidelines_block(pr_context: Optional[PrContext]) -> str:
