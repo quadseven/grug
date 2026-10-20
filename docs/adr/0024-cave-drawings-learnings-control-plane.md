@@ -52,5 +52,9 @@ review of its repository, unaudited.
 
 - Operators can audit and correct what Grug believes without touching the
   database, and every mutation is logged with its actor.
-- Org-wide scope, an install-owner (non-admin) view, a dashboard page, and
-  an approval delay for newly mined learnings remain open on #1203.
+- The approval delay for newly mined learnings (an `active` flag plus a
+  per-repo delay, from PR 1296) composes with this lifecycle through the
+  same `effective_status`: an explicit status wins, otherwise the delay
+  decides. A row that has neither field predates both and stays active.
+- Org-wide scope, an install-owner (non-admin) view, and a dashboard page
+  remain open on #1203.
