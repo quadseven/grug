@@ -81,6 +81,29 @@ def test_rows_without_status_are_active_for_back_compat():
     assert cd.effective_status({"text": "x"}) == cd.STATUS_ACTIVE
 
 
+def test_approval_delay_keeps_a_mined_learning_pending_until_it_elapses():
+    from datetime import datetime, timezone
+
+    row = {"text": "x", "active": False, "approval_delay_seconds": 3600,
+           "created_at": "2026-01-01T00:00:00+00:00"}
+    early = datetime(2026, 1, 1, 0, 30, tzinfo=timezone.utc)
+    late = datetime(2026, 1, 1, 1, 0, tzinfo=timezone.utc)
+    assert cd.effective_status(row, now=early) == cd.STATUS_PENDING
+    assert cd.effective_status(row, now=late) == cd.STATUS_ACTIVE
+    # An operator's explicit status overrides the timer either way.
+    assert cd.effective_status({**row, "status": "disabled"}, now=late) == cd.STATUS_DISABLED
+    assert cd.effective_status({**row, "status": "active"}, now=early) == cd.STATUS_ACTIVE
+    # Inactive with no delay never activates on its own.
+    assert cd.effective_status({"text": "x", "active": False}) == cd.STATUS_PENDING
+
+
+def test_plan_import_bounds_the_document_size():
+    doc = cd.export_document([])
+    doc["learnings"] = [{"text": f"r{i}", "repo": "o/r"} for i in range(cd.MAX_IMPORT_LEARNINGS + 1)]
+    plan = cd.plan_import(doc, target_repo=None, existing_ids=set())
+    assert plan.errors and plan.items == []
+
+
 def test_only_active_learnings_are_selected_for_the_prompt():
     rows = [
         _row("active rule"),

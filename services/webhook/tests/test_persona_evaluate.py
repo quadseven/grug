@@ -182,7 +182,7 @@ def test_evaluate_pull_request_passes_on_good_body():
 
     assert evaluation.passed is True
     assert evaluation.conclusion == "success"
-    assert len(evaluation.results) == 8  # 8 dor checks
+    assert len(evaluation.results) == 9  # 9 dor checks
     assert all(r.passed for r in evaluation.results)
 
 
@@ -208,9 +208,10 @@ def test_evaluate_pull_request_without_fetcher_marks_linked_issue_skipped():
     lic = next(r for r in evaluation.results if r.name == "linked-issue-completeness")
     assert lic.skipped is True
     title, _ = persona._summary(list(evaluation.results))
-    assert "all 8 checks" not in title
-    # Both IO checks name the ticket and have no fetcher here (grug#1034).
-    assert "6/8 checks (ticket done, which epic skipped)" in title
+    assert "all 9 checks" not in title
+    # All three IO checks name the ticket and have no fetcher here (grug#1034,
+    # plus the new in-scope check).
+    assert "6/9 checks (ticket done, which epic, in scope skipped)" in title
 
 
 def test_evaluate_pull_request_fails_on_empty_body():
@@ -255,7 +256,73 @@ def test_evaluate_mixed_advisory_and_blocking_failure():
     assert scope.passed is False
     assert link.passed is False
     title, summary = persona._summary(list(evaluation.results))
-    assert title == "Hunt Plan hold - 1/8 plan checks fail (where stop; see Details)"
+    assert title == "Hunt Plan hold - 1/9 plan checks fail (where stop; see Details)"
+
+
+def test_evaluate_in_scope_fail_is_advisory_by_default():
+    """Out-of-scope changed files fail `in-scope` but never block merge
+    (advisory by default)."""
+    body = """## Why
+we need this for the launch tomorrow morning
+
+## Acceptance criteria
+- [x] one
+- [x] two
+- [x] three
+
+## Out of scope
+nothing
+
+closes #42
+
+**Size:** M
+"""
+    def fetcher(_num: int) -> str:
+        return "the foo handler\n"
+    evaluation = persona.evaluate_pull_request(
+        body,
+        fetch_issue=fetcher,
+        fetch_changed_files=lambda: ["src/foo.py", "src/billing/billing.py"],
+    )
+    inscope = next(r for r in evaluation.results if r.name == "in-scope")
+    assert not inscope.passed
+    assert "src/billing/billing.py" in inscope.detail
+    # Advisory: the verdict stays green.
+    assert evaluation.passed is True
+    assert evaluation.conclusion == "success"
+
+
+def test_evaluate_in_scope_fail_blocks_when_config_promotes():
+    """org/repo config can promote `in-scope` to blocking: pass a smaller
+    advisory set and the same out-of-scope rider turns the verdict red."""
+    body = """## Why
+we need this for the launch tomorrow morning
+
+## Acceptance criteria
+- [x] one
+- [x] two
+- [x] three
+
+## Out of scope
+nothing
+
+closes #42
+
+**Size:** M
+"""
+    def fetcher(_num: int) -> str:
+        return "the foo handler\n"
+    advisory = frozenset({"issue-link", "loom-footer"})  # in-scope not advisory
+    evaluation = persona.evaluate_pull_request(
+        body,
+        fetch_issue=fetcher,
+        fetch_changed_files=lambda: ["src/foo.py", "src/billing/billing.py"],
+        advisory_checks=advisory,
+    )
+    inscope = next(r for r in evaluation.results if r.name == "in-scope")
+    assert not inscope.passed
+    assert evaluation.passed is False
+    assert evaluation.conclusion == "failure"
 
 
 def test_summary_advisory_check_renders_warning_icon():

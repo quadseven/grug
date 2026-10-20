@@ -66,6 +66,15 @@ def test_list_across_repos_with_search_and_status_filter(api, store):
     assert [v["id"] for v in off] == [b]
 
 
+def test_list_is_capped_and_says_when_it_truncated(api, store):
+    for i in range(3):
+        _teach(store, f"rule {i}")
+    out = api.list_learnings(repo="o/r", q="", status="", limit=2, user=_admin())
+    assert len(out["learnings"]) == 2 and out["truncated"] is True
+    out = api.list_learnings(repo="o/r", q="", status="", limit=3, user=_admin())
+    assert len(out["learnings"]) == 3 and out["truncated"] is False
+
+
 def test_list_rejects_a_malformed_repo_or_status(api):
     with pytest.raises(HTTPException) as e:
         api.list_learnings(repo="no-slash", q="", status="", user=_admin())
@@ -168,7 +177,7 @@ def test_export_import_round_trip_is_dry_run_first_then_pending(api, store):
         api.ImportRequest(document=doc, target_repo="o/dst", dry_run=False), user=_admin(),
     )
     assert applied["applied"] is True and len(applied["created"]) == 2
-    rows = store.list_learnings("o/dst")
+    rows = store.list_learnings("o/dst", include_inactive=True)
     assert {r["status"] for r in rows} == {cd.STATUS_PENDING}
     assert {r["text"] for r in rows} == {"rule one", "rule two"}
 

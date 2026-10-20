@@ -4,13 +4,16 @@ Pure: turn an issue-comment body into a (verb, arg) command or None. The
 dispatcher gates (allowlist, collaborator, tpm-enabled) and executes; this
 just recognizes the command, so the recognition has a unit-test seam.
 
-Supported verbs (all default-safe - none mutate code):
+Supported verbs (all default-safe - none mutate code, except `learnings
+delete` which forgets a taught preference):
   /grug recheck        re-run Chief's DoR check (NOT Elder - use improve)
   /grug improve        Elder re-reviews and re-posts its findings
   /grug ask <question> scoped Q&A over the PR diff, answered as a reply
   /grug test-gaps      the pr-test lens on demand
   /grug resume         lift Elder's auto-pause and review since the last look
   /grug review         one Elder review now; an auto-pause stays (grug#1188)
+  /grug learnings list list the repo's remembered markings (usage counts)
+  /grug learnings delete <digest>  forget one remembered marking by digest
 """
 
 from __future__ import annotations
@@ -20,14 +23,14 @@ from dataclasses import dataclass
 
 # Anchored at line start (MULTILINE) so a command can appear on its own
 # line in a longer comment; the verb is a known token, everything after is
-# the arg (only `ask` uses it). Case-insensitive.
+# the arg (only `ask` and `learnings` consume it). Case-insensitive.
 _CMD_RE = re.compile(
-    r"^\s*/grug\s+(recheck|improve|ask|test-gaps|test_gaps|resume|review)\b[ \t]*(.*)$",
+    r"^\s*/grug\s+(recheck|improve|ask|test-gaps|test_gaps|resume|review|learnings)\b[ \t]*(.*)$",
     re.IGNORECASE | re.MULTILINE,
 )
 
 _CANON = {"test_gaps": "test-gaps"}
-VERBS = frozenset({"recheck", "improve", "ask", "test-gaps", "resume", "review"})
+VERBS = frozenset({"recheck", "improve", "ask", "test-gaps", "resume", "review", "learnings"})
 
 
 @dataclass(frozen=True)

@@ -4,7 +4,7 @@ Ported from scripts/tpm.py with the bullet-count regex tightened per
 quadseven/grug#20: empty `- [ ]` placeholders no longer count toward the
 >=3 minimum (security: an unfilled template should NOT pass).
 
-8 checks (per PRD #21 + memory `feedback_health_endpoint_standard`):
+9 checks (per PRD #21 + memory `feedback_health_endpoint_standard`):
   why          - ## Why >=5 words
   acceptance   - ## Acceptance criteria (or ## Test plan) >=3 NON-EMPTY bullets
   estimate     - Size: XS|S|M|L|XL anywhere in body
@@ -13,6 +13,7 @@ quadseven/grug#20: empty `- [ ]` placeholders no longer count toward the
   loom-footer  - a Loom-ticket PR carries the Loom audit footer (advisory)
   linked-issue-completeness - linked issue(s) have all non-exempt checkboxes ticked
   linked-issue-epic - every ticket the PR names is an epic or belongs to one (grug#1034)
+  in-scope     - all changed files trace to the linked issue's scope (advisory)
 """
 
 from __future__ import annotations
@@ -23,6 +24,7 @@ from collections.abc import Callable
 from dataclasses import dataclass
 
 from personas.tpm.ticket_compliance import strip_code_spans
+from personas.tpm.in_scope import check_in_scope
 
 
 log = logging.getLogger("grug.persona.tpm.dor_checks")
@@ -563,16 +565,24 @@ def run_all(
     *,
     fetch_issue: IssueFetcher | None = None,
     fetch_issue_facts: IssueFactsFetcher | None = None,
+    fetch_changed_files: Callable[[], list[str]] | None = None,
 ) -> list[CheckResult]:
     """Run all DoR checks over the PR body.
 
-    `fetch_issue` is passed through to check_linked_issue_completeness and
-    `fetch_issue_facts` to check_linked_issue_in_epic. When either is None,
-    its check fails open (pass, marked `skipped`).
+    `fetch_issue` is passed through to `check_linked_issue_completeness` and
+    `check_in_scope`; `fetch_issue_facts` to `check_linked_issue_in_epic`;
+    `fetch_changed_files` to `check_in_scope`. When either IO fetcher is
+    None, its check fails open (pass, marked `skipped`).
+
+    The first 5 checks are pure (body -> CheckResult); the last 3 need IO
+    through their injected fetchers.
     """
-    # The first 5 checks are pure (body -> CheckResult); the last two need IO
+    # The first 5 checks are pure (body -> CheckResult); the last 3 need IO
     # through their injected fetchers.
     results = [check(body) for check in _PURE_CHECKS]
     results.append(check_linked_issue_completeness(body, fetch_issue=fetch_issue))
     results.append(check_linked_issue_in_epic(body, fetch_issue_facts=fetch_issue_facts))
+    results.append(
+        check_in_scope(body, fetch_issue=fetch_issue, fetch_changed_files=fetch_changed_files)
+    )
     return results

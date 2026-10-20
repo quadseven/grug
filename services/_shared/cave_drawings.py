@@ -46,6 +46,7 @@ _PORTABLE_FIELDS = (
 
 MAX_TEXT_CHARS = 1000
 MAX_SCOPE_CHARS = 200
+MAX_IMPORT_LEARNINGS = 2000
 _REPO_RE = re.compile(r"^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+$")
 
 
@@ -54,9 +55,34 @@ def learning_id(text: str) -> str:
     return hashlib.sha256(text.strip().encode("utf-8")).hexdigest()[:12]
 
 
-def effective_status(row: dict[str, Any]) -> str:
+def effective_status(row: dict[str, Any], now: datetime | None = None) -> str:
+    """The one lifecycle rule every reader uses.
+
+    An operator's explicit `status` wins. Otherwise the reply-mined
+    approval delay decides: a row taught with `active: false` is pending
+    until `created_at + approval_delay_seconds` has passed. A row with
+    neither field predates both features, when every stored learning was
+    applied, so it stays active."""
     status = row.get("status")
-    return status if status in STATUSES else STATUS_ACTIVE
+    if status in STATUSES:
+        return str(status)
+    if row.get("active", True):
+        return STATUS_ACTIVE
+    return STATUS_ACTIVE if _delay_elapsed(row, now) else STATUS_PENDING
+
+
+def _delay_elapsed(row: dict[str, Any], now: datetime | None) -> bool:
+    delay = int(row.get("approval_delay_seconds") or 0)
+    if delay <= 0:
+        return False
+    try:
+        started = datetime.fromisoformat(str(row.get("created_at") or ""))
+    except ValueError:
+        return False
+    if started.tzinfo is None:
+        started = started.replace(tzinfo=timezone.utc)
+    current = now or datetime.now(timezone.utc)
+    return started.timestamp() + delay <= current.timestamp()
 
 
 def is_valid_repo(repo: str) -> bool:
@@ -274,6 +300,8 @@ def _document_learnings(doc: Any) -> tuple[list[Any], str | None]:
     learnings = doc.get("learnings")
     if not isinstance(learnings, list):
         return [], "learnings must be a list"
+    if len(learnings) > MAX_IMPORT_LEARNINGS:
+        return [], f"more than {MAX_IMPORT_LEARNINGS} learnings in one document"
     return learnings, None
 
 

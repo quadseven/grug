@@ -31,6 +31,27 @@ def test_rows_carry_their_id_and_read_back_by_id(store):
     assert store.list_learning_repos() == ["o/r"]
 
 
+def test_review_reads_skip_inactive_rows_but_the_operator_sees_them(store):
+    on = _teach(store, "on")
+    off = _teach(store, "off")
+    store.set_learning_status("o/r", off, cd.STATUS_DISABLED, actor="op")
+    assert [r["id"] for r in store.list_learnings("o/r")] == [on]
+    assert {r["id"] for r in store.list_learnings("o/r", include_inactive=True)} == {on, off}
+
+
+def test_a_row_written_before_the_active_flag_stays_active(store):
+    _teach(store, "legacy rule")
+    with store.get_pool().connection() as conn:
+        conn.execute("UPDATE grug_kv SET data = data - 'active' WHERE pk = 'LEARN#o/r'")
+    assert [r["text"] for r in store.list_learnings("o/r")] == ["legacy rule"]
+
+
+def test_redelivery_detection_sees_a_disabled_learning(store):
+    lid = _teach(store, "rule", source_comment_id=77)
+    store.set_learning_status("o/r", lid, cd.STATUS_DISABLED, actor="op")
+    assert store.get_learning_by_source_comment("o/r", 77)["id"] == lid
+
+
 def test_disable_then_approve_records_history(store):
     lid = _teach(store, "rule")
     row = store.set_learning_status("o/r", lid, cd.STATUS_DISABLED, actor="op")
@@ -113,7 +134,8 @@ def test_import_lands_pending_until_approved(store):
     doc = cd.export_document([{"text": "imported rule", "repo": "src/repo", "source_pr": 1}])
     plan = cd.plan_import(doc, target_repo="o/new", existing_ids=set())
     ids = store.import_learnings("o/new", plan.to_create, actor="op")
-    [row] = store.list_learnings("o/new")
+    assert store.list_learnings("o/new") == []  # nothing reaches a review yet
+    [row] = store.list_learnings("o/new", include_inactive=True)
     assert row["id"] == ids[0] and row["status"] == cd.STATUS_PENDING
     assert row["history"][0]["action"] == "imported"
     assert cd.select_for_prompt([row]).selected == []

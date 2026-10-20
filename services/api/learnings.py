@@ -24,10 +24,10 @@ from __future__ import annotations
 
 import logging
 import re
-from typing import Any
+from typing import Annotated, Any
 
 import httpx
-from fastapi import APIRouter, Depends, HTTPException, status
+from fastapi import APIRouter, Depends, HTTPException, Query, status
 from pydantic import BaseModel, ConfigDict, Field
 
 from adapters import install_store
@@ -54,6 +54,7 @@ router = APIRouter(prefix="/api/v1/admin/learnings")
 _GH_API = "https://api.github.com"
 _ID_PATTERN = r"^[0-9a-f]{12}$"
 _REF_RE = re.compile(r"^[A-Za-z0-9._/-]+$")
+_MAX_LIST = 2000
 
 
 class LearningPatch(BaseModel):
@@ -161,10 +162,12 @@ def list_learnings(
     repo: str = "",
     q: str = "",
     status: str = "",  # noqa: A002 - query parameter name the SPA sends
+    limit: Annotated[int, Query(ge=1, le=_MAX_LIST)] = 500,
     user: UserIdentity = Depends(require_admin),
 ) -> dict[str, Any]:
-    """Every learning (or one repo's), filtered by a text search and a
-    lifecycle status. Includes pending, disabled and superseded rows."""
+    """Learnings (all repos, or one), filtered by a text search and a
+    lifecycle status, at most `limit` of them (`truncated` says when more
+    matched). Includes pending, disabled and superseded rows."""
     if status and status not in STATUSES:
         raise HTTPException(
             400, detail=f"status must be one of {list(STATUSES)}",
@@ -172,14 +175,16 @@ def list_learnings(
     repos = [_repo_or_400(repo)] if repo else install_store.list_learning_repos()
     out: list[dict[str, Any]] = []
     for r in repos:
-        for row in install_store.list_learnings(r):
+        for row in install_store.list_learnings(r, include_inactive=True):
             row_d = dict(row)
             if status and effective_status(row_d) != status:
                 continue
             if not matches_query(row_d, q):
                 continue
+            if len(out) == limit:
+                return {"learnings": out, "truncated": True}
             out.append(_view(row_d))
-    return {"learnings": out}
+    return {"learnings": out, "truncated": False}
 
 
 @router.get("/export")
@@ -189,7 +194,7 @@ def export_learnings(
 ) -> dict[str, Any]:
     """A portable document of one repo's learnings (any status) that
     another Grug instance can import."""
-    rows = [dict(r) for r in install_store.list_learnings(_repo_or_400(repo))]
+    rows = [dict(r) for r in install_store.list_learnings(_repo_or_400(repo), include_inactive=True)]
     _audit("learnings_exported", user, repo, "", count=len(rows))
     return export_document(rows)
 
@@ -209,7 +214,7 @@ def import_learnings(
     probe = plan_import(body.document, target_repo=target, existing_ids=set())
     existing: set[str] = set()
     if probe.repo:
-        existing = {str(r.get("id", "")) for r in install_store.list_learnings(probe.repo)}
+        existing = {str(r.get("id", "")) for r in install_store.list_learnings(probe.repo, include_inactive=True)}
     plan = plan_import(body.document, target_repo=target, existing_ids=existing)
     result = {**plan.as_dict(), "applied": False, "created": []}
     if body.dry_run:
