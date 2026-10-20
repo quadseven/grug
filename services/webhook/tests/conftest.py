@@ -123,6 +123,23 @@ def _mock_pr_enforcement_ensure(monkeypatch):
 
 
 @pytest.fixture(autouse=True)
+def _mock_chief_ticket_recheck(monkeypatch):
+    """Neutralize the ticket-change Chief re-run by default.
+
+    `sub_issues` and `issues.edited` (body) also re-run Chief on the open PRs
+    naming the ticket, which reads the store (`is_persona_enabled`) and lists
+    open PRs on GitHub - side effects the issue-advisory tests never
+    expected. Tests that verify the re-run patch the real
+    `dispatcher._recheck_chief_for_ticket` back in (innermost patch wins).
+    """
+    from unittest.mock import MagicMock
+
+    import dispatcher
+
+    monkeypatch.setattr(dispatcher, "_recheck_chief_for_ticket", MagicMock(return_value={}))
+
+
+@pytest.fixture(autouse=True)
 def _mock_learn_living_review_sync(monkeypatch):
     """Neutralize the learn lane's living-review sync (#1187) by default.
 

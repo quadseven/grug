@@ -20,6 +20,7 @@ from personas.tpm.dor_checks import (
     check_scope_fence,
     IssueFacts,
     check_why,
+    named_ticket_numbers,
     run_all,
 )
 from personas.tpm.dor_checks import _scan_checklist
@@ -664,3 +665,11 @@ def test_an_orphan_still_blocks_when_another_fetch_failed():
         fetch_issue_facts=_fetcher(i5=_facts(5), i6=RuntimeError("down")),
     )
     assert r.passed is False and "#5" in r.detail
+
+
+def test_named_ticket_numbers_is_the_set_the_epic_check_reads():
+    """The webhook trigger that re-runs Chief on a ticket change matches PRs
+    with this same function, so it must read exactly what the check reads."""
+    body = "Refs #42\nPart of #3\nFixes #42\nBlocked by #9\n`Refs #77`"
+    assert named_ticket_numbers(body) == [3, 42]
+    assert named_ticket_numbers("") == []

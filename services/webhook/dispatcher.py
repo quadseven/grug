@@ -644,10 +644,19 @@ def _handle_issues(payload: dict[str, Any]) -> dict[str, str]:
     if issue.get("pull_request"):
         return {"status": "no_op", "reason": "issues event on a PR"}
 
-    return _run_issue_dor_for(
+    out = _run_issue_dor_for(
         payload.get("installation") or {}, payload.get("repository") or {},
         issue, refresh_only=False,
     )
+    # A body edit can add or drop `Part of #<epic>`, which flips the `which
+    # epic` row on every PR naming this ticket. A title or label edit cannot
+    # change that line, so only a body change re-runs Chief.
+    if action == "edited" and "body" in (payload.get("changes") or {}):
+        out = {**out, **_recheck_chief_for_ticket(
+            payload.get("installation") or {}, payload.get("repository") or {},
+            [issue.get("number")],
+        )}
+    return out
 
 
 def _handle_sub_issues(payload: dict[str, Any]) -> dict[str, str]:
@@ -674,9 +683,114 @@ def _handle_sub_issues(payload: dict[str, Any]) -> dict[str, str]:
         return {"status": "no_op", "reason": f"sub_issues action={action} not gated"}
     if issue.get("pull_request"):
         return {"status": "no_op", "reason": "sub_issues event on a PR"}
-    return _run_issue_dor_for(
+    out = _run_issue_dor_for(
         payload.get("installation") or {}, repo, issue, refresh_only=True,
     )
+    # The same membership change flips Chief's `which epic` row on every PR
+    # naming this issue. Separate from the advisory and its flag: Chief on
+    # the PR is on by default, the issue-time advisory is not.
+    return {**out, **_recheck_chief_for_ticket(
+        payload.get("installation") or {}, repo, [issue.get("number")],
+    )}
+
+
+# At most this many open PRs get Chief re-run per ticket event: one ticket is
+# normally named by one PR, and each re-run costs what `/grug recheck` costs.
+_TICKET_RECHECK_MAX_PRS = 5
+
+
+def _recheck_chief_for_ticket(
+    installation: dict[str, Any],
+    repo: dict[str, Any],
+    issue_numbers: list[Any],
+) -> dict[str, str]:
+    """Re-run Chief on the open PRs whose body names one of `issue_numbers`.
+
+    The `which epic` row is blocking, and its documented fix (make the ticket
+    a sub-issue of an epic, or write `Part of #N` in it) changes the TICKET.
+    Without this the PR keeps its red Chief until its body is edited or
+    someone comments `/grug recheck`, and the self-heal pass does not help
+    because the head SHA already has a Chief run.
+
+    Gates: an allowlisted install, a known repo id, and Chief (tpm) enabled
+    for the repo. NOT `issue_dor_enabled`: that flag is the issue-time
+    advisory's, and Chief on the PR does not depend on it. One open-PR list
+    (the 50 most recently updated, the self-heal pass's own call), PRs
+    matched with the same extractor the check uses, then the same
+    `run_chief_recheck` `/grug recheck` calls, at most
+    `_TICKET_RECHECK_MAX_PRS` of them, each best-effort. Never raises: the
+    result is one `chief_recheck` audit key the caller merges in.
+    """
+    numbers = set()
+    for n in issue_numbers:
+        try:
+            numbers.add(int(n))
+        except (TypeError, ValueError):
+            continue
+    installation_id = installation.get("id")
+    owner = (repo.get("owner") or {}).get("login") or repo.get("full_name", "").split("/")[0]
+    repo_name = repo.get("name")
+    repo_id = repo.get("id")
+    if not numbers or not all([installation_id, owner, repo_name]):
+        return {"chief_recheck": "skip: incomplete payload"}
+
+    coords = {"installation_id": installation_id, "owner": owner,
+              "repo": repo_name, "tickets": sorted(numbers)}
+    try:
+        if not is_install_allowlisted(int(installation_id)):
+            return {"chief_recheck": "no_op: installer not allowlisted"}
+        if repo_id is None:
+            return {"chief_recheck": "no_op: no repo_id"}
+        if not is_persona_enabled(int(installation_id), int(repo_id), "tpm"):
+            return {"chief_recheck": "no_op: tpm disabled for this repo"}
+
+        import chief_self_heal  # local import: module attribute, so tests can fake the list
+        from github_app_auth import with_install_token_retry  # type: ignore
+        from personas.publish_check import PUBLISH_FAILED  # type: ignore
+        from personas.tpm.dor_checks import named_ticket_numbers  # type: ignore
+        from personas.tpm.persona import is_trusted_operator  # type: ignore
+
+        prs = with_install_token_retry(
+            int(installation_id),
+            lambda token: chief_self_heal._list_recent_open_prs(token, owner, repo_name),
+        ) or []
+    except Exception as e:  # noqa: BLE001 - a webhook 500 is never redelivered
+        log.warning("chief_ticket_recheck_failed",
+                    extra={**coords, "stage": "list_prs", "kind": type(e).__name__})
+        return {"chief_recheck": "skip: open PR list failed"}
+
+    matched = [
+        pr for pr in prs
+        if pr.get("number") and (pr.get("head") or {}).get("sha")
+        and numbers.intersection(named_ticket_numbers(pr.get("body") or ""))
+    ]
+    rechecked = failed = 0
+    for pr in matched[:_TICKET_RECHECK_MAX_PRS]:
+        pr_number = int(pr["number"])
+        head_sha = str(pr["head"]["sha"])
+        try:
+            _, result_map = run_chief_recheck(
+                installation_id=int(installation_id), owner=owner,
+                repo=repo_name, head_sha=head_sha, pr_number=pr_number,
+                pr_body=pr.get("body") or "",
+                author_trusted=is_trusted_operator(pr),
+            )
+            if result_map.get("result") == PUBLISH_FAILED:
+                raise RuntimeError("chief publish failed")
+        except Exception as e:  # noqa: BLE001 - one PR must not stop the rest
+            failed += 1
+            log.warning("chief_ticket_recheck_failed",
+                        extra={**coords, "pr_number": pr_number,
+                               "head_sha": head_sha[:8], "kind": type(e).__name__})
+            continue
+        rechecked += 1
+    log.info("chief_ticket_rechecked",
+             extra={**coords, "matched": len(matched), "rechecked": rechecked,
+                    "failed": failed})
+    return {"chief_recheck": (
+        f"rechecked {rechecked}, failed {failed} of {len(matched)} open PR(s) "
+        f"naming #{sorted(numbers)}"
+    )}
 
 
 def _run_issue_dor_for(
