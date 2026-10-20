@@ -10,6 +10,8 @@ actually supports (or cannot refute).
 
 from __future__ import annotations
 
+import pytest
+
 from personas.code_reviewer.persona import Finding
 from personas.code_reviewer.verify import verify_findings
 
@@ -670,5 +672,137 @@ def test_lockstep_kill_is_scoped_to_caller_not_updated():
         message=_PR_762_MESSAGE,
     )
     kept, killed = verify_findings((f,), {_ATTESTER_PATH: _ATTESTER_AT_762_HEAD})
+    assert kept == (f,)
+    assert killed == ()
+
+
+# --- return_value_used: a "return value discarded" claim refuted by the
+# file's own call sites (mod-overseer PR 1083: a dead-code marking on the
+# definition said the result "is discarded" while the only caller tested it
+# in an `if (!...)`) ------------------------------------------------------
+
+_CPP_PATH = "src/overseer_decisions.cpp"
+_CPP_DEFINITION_LINE = 2
+
+
+def _gear_source(call_line: str) -> str:
+    return (
+        "// GearReadOneEquipSpell(...) reads one spell; true on success\n"
+        "bool GearReadOneEquipSpell(SpellEffects const& effects, Resolved& resolved)\n"
+        "{\n"
+        "    return effects.valid;\n"
+        "}\n"
+        "\n"
+        "void GearReadItemSpells(Item const& spell, Resolved& resolved)\n"
+        "{\n"
+        f"    {call_line}\n"
+        "}\n"
+    )
+
+
+_GEAR_CONSUMED = _gear_source(
+    "if (!GearReadOneEquipSpell(spell.effects, resolved)) resolved.unresolved = true;"
+)
+_GEAR_BARE = _gear_source("GearReadOneEquipSpell(spell.effects, resolved);")
+_DISCARDED_MESSAGE = (
+    "the return value of `GearReadOneEquipSpell` is discarded, so a failed "
+    "read is never reported"
+)
+
+
+def _discarded_finding(**kw) -> Finding:
+    base = {
+        "file": _CPP_PATH, "line": _CPP_DEFINITION_LINE,
+        "rule_name": "dead-code", "message": _DISCARDED_MESSAGE,
+    }
+    base.update(kw)
+    return _finding(**base)
+
+
+def test_discarded_return_claim_is_killed_when_every_caller_uses_it():
+    f = _discarded_finding()
+    kept, killed = verify_findings((f,), {_CPP_PATH: _GEAR_CONSUMED})
+    assert kept == ()
+    assert [k.reason for k in killed] == ["return_value_used"]
+    assert killed[0].finding is f
+
+
+def test_discarded_return_claim_reads_callers_in_other_fetched_files():
+    """The caller may live in another file the dispatch fetched."""
+    header = "bool GearReadOneEquipSpell(SpellEffects const& e, Resolved& r);\n"
+    caller = "void f() {\n    bool ok = GearReadOneEquipSpell(e, r);\n}\n"
+    f = _discarded_finding(file="src/gear.h", line=1)
+    kept, killed = verify_findings(
+        (f,), {"src/gear.h": header, "src/gear.cpp": caller},
+    )
+    assert kept == ()
+    assert [k.reason for k in killed] == ["return_value_used"]
+
+
+def test_discarded_return_claim_survives_a_bare_call():
+    """A bare statement call really discards the result: keep."""
+    f = _discarded_finding()
+    kept, killed = verify_findings((f,), {_CPP_PATH: _GEAR_BARE})
+    assert kept == (f,)
+    assert killed == ()
+
+
+def test_discarded_return_claim_survives_when_one_of_two_callers_is_bare():
+    source = _GEAR_CONSUMED + "void g() {\n    GearReadOneEquipSpell(e, r);\n}\n"
+    f = _discarded_finding()
+    kept, killed = verify_findings((f,), {_CPP_PATH: source})
+    assert kept == (f,)
+    assert killed == ()
+
+
+@pytest.mark.parametrize("call_line", [
+    "(void)GearReadOneEquipSpell(spell.effects, resolved);",
+    "if (spell.valid) GearReadOneEquipSpell(spell.effects, resolved);",
+    'Log("GearReadOneEquipSpell(spell) failed");',
+])
+def test_discarded_return_claim_survives_a_discard_or_unreadable_site(call_line):
+    """An explicit discard is evidence for the claim; a call after `)` or
+    inside a string is no evidence either way. Both keep the finding."""
+    source = _GEAR_CONSUMED + "void g() {\n    " + call_line + "\n}\n"
+    f = _discarded_finding()
+    kept, killed = verify_findings((f,), {_CPP_PATH: source})
+    assert kept == (f,)
+    assert killed == ()
+
+
+def test_discarded_return_claim_with_no_call_site_is_kept():
+    """Only the definition and a comment mention it: inconclusive, keep."""
+    source = _gear_source("return;")
+    f = _discarded_finding()
+    kept, killed = verify_findings((f,), {_CPP_PATH: source})
+    assert kept == (f,)
+    assert killed == ()
+
+
+def test_discarded_return_claim_in_python_reads_not_and_assignment():
+    source = (
+        "def save(row):\n"
+        "    return db.write(row)\n"
+        "\n"
+        "def handler(row):\n"
+        "    if not save(row):\n"
+        "        raise RuntimeError('lost')\n"
+        "    ok = save(row)\n"
+    )
+    f = _finding(
+        line=1, rule_name="unused-return-value",
+        message="the result of `save` is ignored by its callers",
+    )
+    kept, killed = verify_findings((f,), {"services/webhook/x.py": source})
+    assert kept == ()
+    assert [k.reason for k in killed] == ["return_value_used"]
+
+
+def test_other_dead_code_claims_are_not_read_as_return_value_claims():
+    """A dead-code marking about an unused function is a different claim."""
+    f = _discarded_finding(
+        message="`GearReadOneEquipSpell` is never called and can be removed",
+    )
+    kept, killed = verify_findings((f,), {_CPP_PATH: _GEAR_CONSUMED})
     assert kept == (f,)
     assert killed == ()

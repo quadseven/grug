@@ -47,6 +47,15 @@ evidence contradicts:
   PR #762 grew the DoR rule registry and Elder demanded the persona-purity
   call-target allowlist grow with it, while the new rule dispatches inside
   ``run_all`` and the purity attester passed on the reviewed head.
+- ``return_value_used``: a "return value is discarded / ignored / never
+  read" claim naming its callee, where every call site of that callee in
+  the fetched files consumes the result (a condition, an assignment, a
+  return, an argument) and none is a bare statement. Live instance:
+  mod-overseer PR 1083 marked ``GearReadOneEquipSpell``'s result as
+  discarded while its only caller read
+  ``if (!GearReadOneEquipSpell(spell.effects, resolved)) ...``. Callers in
+  files the dispatch did not fetch are a residual risk, accepted under the
+  inconclusive-keeps bias like ``sync_context``'s cross-file callers.
 
 Inconclusive is NOT a kill: a missing file, an unparseable module, a
 module-level line, or a suggestion with no code tokens all keep the
@@ -75,7 +84,8 @@ if TYPE_CHECKING:  # import cycle guard: persona imports nothing from here
 class KilledFinding:
     finding: "Finding"
     # "non_code_file" | "sync_context" | "fix_already_present" |
-    # "fix_block_present" | "mitigation_present" | "collection_lockstep"
+    # "fix_block_present" | "mitigation_present" | "collection_lockstep" |
+    # "return_value_used"
     reason: str
 
 
@@ -229,6 +239,119 @@ def _kills_as_collection_lockstep(finding: "Finding", source: str) -> bool:
     if not 1 <= finding.line <= len(lines):
         return False  # anchor outside the snapshot - inconclusive, keep
     return not _SIGNATURE_LINE_RE.search(lines[finding.line - 1])
+
+
+# return_value_used. The claim family: the result of a call is thrown away.
+# Both halves must appear (rule slug or message), so a dead-code marking
+# about an unused FUNCTION never reads as a return-value claim.
+_DISCARDED_CLAIM_RE = re.compile(
+    r"discard|ignor|never (?:read|used|checked)|not (?:read|used|checked)"
+    r"|unused[-_ ]return|dead[-_ ]code"
+)
+_RETURN_SUBJECT_RE = re.compile(r"return(?:ed)?[-_ ]values?|(?<![a-z0-9])results?(?![a-z0-9])")
+
+# The callee the message names, in the three phrasings models use. A
+# qualified name (`Foo::bar`, `obj.bar`) and trailing `()` are accepted;
+# only the last segment is searched for.
+_CALLEE = r"`(?:[A-Za-z_][\w]*(?:::|\.|->))*([A-Za-z_]\w*)(?:\([^`]*\))?`"
+_CLAIMED_CALLEE_RES = (
+    re.compile(r"return(?:ed)?[-_ ]value of\s+(?:the\s+)?(?:call\s+to\s+)?" + _CALLEE),
+    re.compile(_CALLEE + r"(?:'s|\s+call's)\s+return(?:ed)?[-_ ]value"),
+    re.compile(r"result of\s+(?:the\s+)?(?:call\s+to\s+)?" + _CALLEE),
+)
+
+# Line comments (`//`, `#`) are stripped before call sites are read, so a
+# comment naming the callee is neither evidence nor counter-evidence.
+_LINE_COMMENT_RE = re.compile(r"//.*$|#.*$")
+
+# The receiver chain right before a call (`obj.`, `self->`, `ns::`), which is
+# dropped so the classification reads what precedes the whole expression.
+_RECEIVER_RE = re.compile(r"(?:(?:[A-Za-z_]\w*)?(?:::|\.|->))+$")
+
+# What precedes a call whose result is CONSUMED: a condition, assignment,
+# comparison, return, boolean operand, argument, subscript or ternary arm.
+_CONSUMED_PUNCT = ("=", "(", ",", "[", "!", "?", "&&", "||", "+", "-", "<<")
+_CONSUMED_WORDS = frozenset({
+    "return", "not", "and", "or", "if", "elif", "while", "assert", "yield",
+    "in", "is",
+})
+
+# What precedes a BARE statement call: nothing, a block or statement
+# boundary, or an explicit discard (`(void)`, `_ =`, `else`, `do`, and
+# Go's `go`/`defer`, which drop the result).
+_BARE_PUNCT = ("{", "}", ";")
+_BARE_WORDS = frozenset({"else", "do", "go", "defer"})
+_EXPLICIT_DISCARD_RE = re.compile(r"\(\s*void\s*\)$|(?<![\w.])_\s*=$")
+
+# A trailing identifier that is not a keyword above is a type or a
+# definition keyword (`bool X(`, `def X(`, `static int X(`): a declaration,
+# which says nothing about callers.
+_TRAILING_WORD_RE = re.compile(r"([A-Za-z_]\w*)$")
+
+
+def _claimed_discarded_callee(finding: "Finding") -> str | None:
+    """The callee a "return value discarded" claim names, or None when the
+    finding is not that claim or names no callee."""
+    text = f"{finding.rule_name} {finding.message}".lower()
+    if not (_DISCARDED_CLAIM_RE.search(text) and _RETURN_SUBJECT_RE.search(text)):
+        return None
+    for pattern in _CLAIMED_CALLEE_RES:
+        m = pattern.search(finding.message)
+        if m:
+            return m.group(1)
+    return None
+
+
+def _call_site_kind(prefix: str) -> str:
+    """Classify a call by the text before it on its line: "consumed",
+    "bare", "definition", or "unknown" (inconclusive)."""
+    head = _RECEIVER_RE.sub("", prefix).rstrip()
+    for awaiting in ("co_await", "await"):
+        if head.endswith(awaiting) and not head[: -len(awaiting)][-1:].isalnum():
+            head = head[: -len(awaiting)].rstrip()
+    if not head or head.endswith(_BARE_PUNCT) or _EXPLICIT_DISCARD_RE.search(head):
+        return "bare"
+    if head.endswith(_CONSUMED_PUNCT):
+        return "consumed"
+    word = _TRAILING_WORD_RE.search(head)
+    if word:
+        name = word.group(1)
+        if name in _CONSUMED_WORDS:
+            return "consumed"
+        if name in _BARE_WORDS:
+            return "bare"
+        return "definition"
+    return "unknown"
+
+
+def _kills_as_return_value_used(
+    finding: "Finding", contents: dict[str, str],
+) -> bool:
+    """A "return value is discarded" claim whose callee is consumed at every
+    call site in the fetched files (mod-overseer PR 1083).
+
+    Kills only when at least one site consumes the result and no site is a
+    bare statement or unreadable: one bare call proves the claim may be
+    right, and an unknown shape (a call inside a string, after a `:`, on a
+    continuation line) is no evidence either way.
+    """
+    callee = _claimed_discarded_callee(finding)
+    if callee is None:
+        return False
+    call_re = re.compile(rf"(?<![\w$]){re.escape(callee)}\s*\(")
+    consumed = 0
+    for text in contents.values():
+        if callee not in text:
+            continue
+        for raw in text.splitlines():
+            line = _LINE_COMMENT_RE.sub("", raw)
+            for m in call_re.finditer(line):
+                kind = _call_site_kind(line[: m.start()])
+                if kind in ("bare", "unknown"):
+                    return False
+                if kind == "consumed":
+                    consumed += 1
+    return consumed > 0
 
 
 def _is_prose_file(path: str) -> bool:
@@ -447,6 +570,14 @@ def _verify_one(finding: "Finding", contents: dict[str, str]) -> str | None:
     # line where EVERY interpolation is wrapped can contradict the claim.
     if _kills_as_mitigation_present(finding, source):
         return "mitigation_present"
+
+    # Return-value-used kill (mod-overseer PR 1083): "the result is
+    # discarded" while every fetched call site reads it. Takes the whole
+    # contents dict, since callers usually live outside the anchored file.
+    if not _is_prose_file(finding.file) and _kills_as_return_value_used(
+        finding, contents,
+    ):
+        return "return_value_used"
 
     # Collection-lockstep kill (#763): "registry grew, so the allowlist must
     # grow" is not a stale caller. Needs the source so the anchored line can
