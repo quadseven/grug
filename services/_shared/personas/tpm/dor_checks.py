@@ -496,6 +496,18 @@ def belongs_to_epic(facts: IssueFacts) -> bool:
     )
 
 
+def named_ticket_numbers(body: str) -> list[int]:
+    """The ticket numbers a PR body names, sorted and de-duplicated.
+
+    The one extractor behind `which epic` and the webhook trigger that re-runs
+    Chief when a named ticket gains or loses an epic (dispatcher
+    `_recheck_chief_for_ticket`). Shared so the trigger and the check can
+    never disagree on which PRs a ticket change affects. Code spans are
+    stripped first: a `Refs #N` quoted in backticks names nothing.
+    """
+    return sorted({int(n) for n in _TICKET_REF_PAT.findall(strip_code_spans(body or ""))})
+
+
 def check_linked_issue_in_epic(
     body: str,
     *,
@@ -513,7 +525,7 @@ def check_linked_issue_in_epic(
     never read as a pass either. A PR naming no ticket passes here with
     nothing to check - `which ticket` already speaks to that.
     """
-    numbers = sorted({int(n) for n in _TICKET_REF_PAT.findall(strip_code_spans(body))})
+    numbers = named_ticket_numbers(body)
     if not numbers:
         return CheckResult(
             "linked-issue-epic", True, "no ticket named, so no epic to check",
