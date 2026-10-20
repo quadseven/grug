@@ -91,6 +91,12 @@ _ISSUE_LINK_PAT = re.compile(
 # the dashboard can attribute the work later. Advisory only: the footer is
 # an audit nicety, never a merge gate.
 _LOOM_FOOTER_PAT = re.compile(r"^Loom ticket ", re.MULTILINE)
+# The lane the footer names (`Loom ticket #N, lane <name>, model ...`).
+# Chief reads it to tell an operator session (lane `operator-session`)
+# from a fleet lane (#1318).
+_LOOM_FOOTER_LANE_PAT = re.compile(
+    r"^Loom ticket [^\n]*?,\s*lane\s+([\w.-]+)", re.MULTILINE,
+)
 _LOOM_TICKET_REF_PAT = re.compile(
     r"\b(?:refs|part\s+of|fixes|closes)\s+quadseven/loom#\d+",
     re.IGNORECASE,
@@ -255,6 +261,15 @@ def has_loom_footer(body: str) -> bool:
     a fleet lane PR from an operator PR (grug#1251), so the two cannot
     drift."""
     return bool(_LOOM_FOOTER_PAT.search(body or ""))
+
+
+def loom_footer_lane(body: str) -> str | None:
+    """The lane the Loom audit footer names, or None when there is no
+    footer or it names no lane. Lives next to `has_loom_footer` so Chief's
+    persona and the footer check share one parser (#1318)."""
+    match = _LOOM_FOOTER_LANE_PAT.search(body or "")
+    # A sentence-final footer (`..., lane x.`) keeps its dot off the name.
+    return match.group(1).rstrip(".") if match else None
 
 
 def check_loom_footer(body: str) -> CheckResult:
