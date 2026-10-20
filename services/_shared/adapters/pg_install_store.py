@@ -823,6 +823,80 @@ def get_elder_last_reviewed(
     return str(head) if head else None
 
 
+# --- Hunt Board: canonical review session per PR (grug#1207) --------------
+# One row per PR holding `review_session.to_dict` output. Writes are
+# compare-and-swap on the session's `version` so concurrent personas never
+# overwrite each other (`review_session.update_session` re-reads and
+# re-applies on a lost race). Install-scoped like ELDER#LAST.
+
+_REVIEW_SESSION_TTL_DAYS = 90
+
+
+def _review_session_sk(repo: str, pr_number: int) -> str:
+    return f"HUNT#{repo}#{int(pr_number)}"
+
+
+def get_review_session(
+    *, install_id: int, repo: str, pr_number: int,
+) -> dict[str, Any] | None:
+    """The stored session dict (with its `version`), or None for none yet."""
+    item = _get_item(_inst_pk(install_id), _review_session_sk(repo, pr_number))
+    if not item:
+        return None
+    item.pop("PK", None)
+    item.pop("SK", None)
+    item.pop("ttl", None)
+    return item
+
+
+def put_review_session(
+    *,
+    install_id: int,
+    repo: str,
+    pr_number: int,
+    data: dict[str, Any],
+    expected_version: int,
+) -> bool:
+    """Store `data` only if the stored version is still `expected_version`
+    (0 = no live row). Returns False when another writer got there first.
+
+    An expired row counts as absent, the same takeover rule as
+    claim_delivery, since reads already treat it as gone.
+    """
+    ttl = int(datetime.now(timezone.utc).timestamp() + _REVIEW_SESSION_TTL_DAYS * 86400)
+    params = {
+        "pk": _inst_pk(install_id),
+        "sk": _review_session_sk(repo, pr_number),
+        "data": encode_attrs({**data, "ttl": ttl}),
+        "ttl": ttl,
+        "expected": str(int(expected_version)),
+    }
+    with get_pool().connection() as conn:
+        if int(expected_version) == 0:
+            cur = conn.execute(
+                """
+                INSERT INTO grug_kv (pk, sk, data, ttl)
+                VALUES (%(pk)s, %(sk)s, %(data)s, %(ttl)s)
+                ON CONFLICT (pk, sk) DO UPDATE
+                    SET data = EXCLUDED.data, ttl = EXCLUDED.ttl
+                    WHERE grug_kv.ttl IS NOT NULL
+                      AND grug_kv.ttl <= EXTRACT(EPOCH FROM now())
+                """,
+                params,
+            )
+        else:
+            cur = conn.execute(
+                f"""
+                UPDATE grug_kv SET data = %(data)s, ttl = %(ttl)s
+                WHERE pk = %(pk)s AND sk = %(sk)s
+                  AND data->>'version' = %(expected)s
+                  AND {TTL_LIVE}
+                """,  # noqa: S608 - TTL_LIVE is a fixed pg_base clause, not input
+                params,
+            )
+        return cur.rowcount == 1
+
+
 # --- Elder auto-pause: push log + pause row per PR (grug#1188) -----------
 # Two rows beside ELDER#LAST. The push log holds the epoch seconds of the
 # PR's recent pushes; the pause row exists while Elder is paused. Both are

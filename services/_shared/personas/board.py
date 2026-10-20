@@ -45,7 +45,8 @@ BOARD_MARKER = "<!-- grug-board -->"
 # region; it does not shift the others.
 SECTION_ORDER: tuple[str, ...] = (
     "chief",      # DoR / ticket readiness - gate first
-    "teller",     # walkthrough - what changed
+    "hunt",       # Hunt Board - the review session summary (hunt_board.py)
+    "teller",    # walkthrough - what changed
     "elder",      # the review itself
     "guard",      # security / dependency
     "smasher",    # execution-class findings
