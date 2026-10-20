@@ -10,9 +10,15 @@ outcome does not hang on the model noticing.
 Two findings, both anchored on a diff line:
 - `dead-code` (medium): a function or method this diff adds to a
   non-test Python file that no non-test code reaches. A helper called
-  only by another uncalled new helper is dead too. Exempt: decorated
-  defs (the decorator registers them), dunder methods, and names the PR
-  body declares an entry point (a CLI command, a route, an exported API).
+  only by another uncalled new helper is dead too, but an uncalled call
+  tree gets ONE marking, on its root, naming the helpers it strands: one
+  marking per helper buried a single wiring gap under dozens of threads.
+  Exempt, because something other than a by-name call runs them:
+  decorated defs (the decorator registers them), dunder methods, methods
+  of a class with a base other than `object` (an override the base class
+  dispatches to), `upgrade`/`downgrade` hooks in an Alembic revision
+  file, and names the PR body declares an entry point (a CLI command, a
+  route, an exported API).
 - `intent-mismatch` (high): when no non-test hunk can change runtime
   behavior (every production change is docs, imports, or an uncalled new
   function), every linked criterion that describes runtime behavior is
@@ -52,6 +58,10 @@ _ENTRY_POINT_RE = re.compile(
 )
 
 _FuncDef = ast.FunctionDef | ast.AsyncFunctionDef
+
+# Alembic loads a revision module and calls these by convention.
+_ALEMBIC_MARKERS = frozenset({"revision", "down_revision"})
+_ALEMBIC_HOOK_RE = re.compile(r"^(?:upgrade|downgrade)(?:_\w+)?$")
 
 
 @dataclass(frozen=True, slots=True)
@@ -94,23 +104,50 @@ def _parse(source: str | None) -> ast.Module | None:
         return None
 
 
-def _defs(tree: ast.Module) -> Iterator[_FuncDef]:
-    """Module-level functions and the methods of module-level classes."""
+def _defs(tree: ast.Module) -> Iterator[tuple[_FuncDef, ast.ClassDef | None]]:
+    """Module-level functions and the methods of module-level classes,
+    each with its enclosing class."""
     for node in tree.body:
         if isinstance(node, _FuncDef):
-            yield node
+            yield node, None
         elif isinstance(node, ast.ClassDef):
-            yield from (n for n in node.body if isinstance(n, _FuncDef))
+            yield from ((n, node) for n in node.body if isinstance(n, _FuncDef))
+
+
+def _has_base(cls: ast.ClassDef | None) -> bool:
+    """A base other than `object`: the base class may call any method by
+    dispatch, which a by-name search cannot see."""
+    if cls is None:
+        return False
+    return any(not (isinstance(b, ast.Name) and b.id == "object") for b in cls.bases)
+
+
+def _is_alembic_revision(tree: ast.Module) -> bool:
+    """Module-level `revision` and `down_revision` assignments."""
+    assigned: set[str] = set()
+    for stmt in tree.body:
+        if isinstance(stmt, ast.Assign):
+            targets = stmt.targets
+        elif isinstance(stmt, ast.AnnAssign):
+            targets = [stmt.target]
+        else:
+            continue
+        assigned.update(t.id for t in targets if isinstance(t, ast.Name))
+    return _ALEMBIC_MARKERS <= assigned
 
 
 def _new_defs(path: str, parsed: _ParsedFile) -> list[_NewDef]:
-    """Undecorated, non-dunder defs whose `def` line this diff adds."""
+    """Defs whose `def` line this diff adds, minus those something other
+    than a by-name call runs (see the module docstring)."""
+    alembic = _is_alembic_revision(parsed.tree)
     return [
         _NewDef(path, node.lineno, node.name, node.end_lineno or node.lineno)
-        for node in _defs(parsed.tree)
+        for node, cls in _defs(parsed.tree)
         if node.lineno in parsed.added
         and not node.decorator_list
         and not (node.name.startswith("__") and node.name.endswith("__"))
+        and not _has_base(cls)
+        and not (alembic and cls is None and _ALEMBIC_HOOK_RE.match(node.name))
     ]
 
 
@@ -151,19 +188,61 @@ def _reached(
 
 
 def _dead_defs(
-    parsed: dict[str, _ParsedFile], other_text: str, pr_body: str,
+    parsed: dict[str, _ParsedFile], py_refs: dict[str, list[tuple[str, int]]],
+    other_text: str, pr_body: str,
 ) -> set[_NewDef]:
     """New defs no non-test code reaches, to a fixpoint: a def reached only
     from inside another dead def stays dead."""
     candidates = {d for path, p in parsed.items() for d in _new_defs(path, p)}
     exempt = _declared_entry_points(pr_body, {d.name for d in candidates})
     dead = {d for d in candidates if d.name not in exempt}
-    py_refs = {path: list(_references(p.tree)) for path, p in parsed.items()}
     while True:
         live = {d for d in dead if _reached(d, dead, py_refs, other_text)}
         if not live:
             return dead
         dead -= live
+
+
+def _callees(
+    dead: list[_NewDef], py_refs: dict[str, list[tuple[str, int]]],
+) -> dict[_NewDef, set[_NewDef]]:
+    """For each dead def, the other dead defs it names inside its body."""
+    by_name: dict[str, list[_NewDef]] = {}
+    for d in dead:
+        by_name.setdefault(d.name, []).append(d)
+    edges: dict[_NewDef, set[_NewDef]] = {d: set() for d in dead}
+    for caller in dead:
+        for name, line in py_refs.get(caller.file, ()):
+            if caller.line <= line <= caller.end:
+                edges[caller].update(c for c in by_name.get(name, ()) if c != caller)
+    return edges
+
+
+def _call_trees(
+    dead: list[_NewDef], py_refs: dict[str, list[tuple[str, int]]],
+) -> list[tuple[_NewDef, list[_NewDef]]]:
+    """Each uncalled root with the dead helpers it reaches, in `dead`'s
+    order. A root is a dead def no other dead def names; a cycle with no
+    such root takes its first def as the root, so every dead def is
+    reported once at least."""
+    edges = _callees(dead, py_refs)
+    called: set[_NewDef] = set().union(*edges.values())
+    roots = [d for d in dead if d not in called]
+    covered: set[_NewDef] = set()
+    trees: list[tuple[_NewDef, list[_NewDef]]] = []
+    # Roots first; then any def left over (a cycle) roots its own tree.
+    for root in roots + [d for d in dead if d in called]:
+        if root in covered:
+            continue
+        seen, stack = {root}, [root]
+        while stack:
+            for callee in edges[stack.pop()] - seen:
+                seen.add(callee)
+                stack.append(callee)
+        covered |= seen
+        trees.append((root, [d for d in dead if d in seen and d != root]))
+    order = {d: i for i, d in enumerate(dead)}
+    return sorted(trees, key=lambda t: order[t[0]])
 
 
 def _statement_lines(stmt: ast.stmt) -> range:
@@ -212,17 +291,31 @@ def _is_runtime_criterion(text: str) -> bool:
     )
 
 
-def _dead_code_finding(d: _NewDef) -> Finding:
+def _dead_code_finding(root: _NewDef, stranded: list[_NewDef]) -> Finding:
+    if stranded:
+        names = ", ".join(f"`{d.name}`" for d in stranded)
+        helpers = (
+            f"does the new helper it calls ({names})" if len(stranded) == 1
+            else f"do the {len(stranded)} new helpers it calls ({names})"
+        )
+        claim = (
+            f"New function `{root.name}` has no caller outside test files, "
+            f"and neither {helpers}, so nothing this PR ships runs them."
+        )
+    else:
+        claim = (
+            f"New function `{root.name}` has no caller outside test files, "
+            "so nothing this PR ships runs it."
+        )
     return Finding(
-        file=d.file,
-        line=d.line,
+        file=root.file,
+        line=root.line,
         severity="medium",
         rule_name="dead-code",
         message=(
-            f"New function `{d.name}` has no caller outside test files, so "
-            "nothing this PR ships runs it. Call it from the code path that "
-            "needs it, or say in the PR body that it is an entry point (a "
-            "CLI command, a route or an exported API)."
+            f"{claim} Call it from the code path that needs it, or say in "
+            "the PR body that it is an entry point (a CLI command, a route "
+            "or an exported API)."
         ),
         suggestion=None,
         effort="quick-win",
@@ -308,11 +401,15 @@ def scan_criteria_coverage(
     """Dead new functions, and runtime criteria no hunk can satisfy."""
     production = [h for h in hunks if _is_production(h.file_path)]
     parsed, other_text = _parse_production(production, file_contents)
+    py_refs = {path: list(_references(p.tree)) for path, p in parsed.items()}
     dead = sorted(
-        _dead_defs(parsed, other_text, pr_body or ""),
+        _dead_defs(parsed, py_refs, other_text, pr_body or ""),
         key=lambda d: (d.file, d.line),
     )
-    findings = [_dead_code_finding(d) for d in dead]
+    findings = [
+        _dead_code_finding(root, stranded)
+        for root, stranded in _call_trees(dead, py_refs)
+    ]
     unmet = [c for c in criteria if _is_runtime_criterion(c.text)]
     anchor = _anchor(hunks, dead)
     if unmet and anchor and not _diff_changes_runtime(production, parsed, dead):
