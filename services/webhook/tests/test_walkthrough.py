@@ -369,3 +369,14 @@ def test_every_grug_lol_asset_a_service_links_is_shipped_by_the_site():
     assert linked, "no grug.lol asset links found; the scan is broken"
     missing = {name: str(src) for name, src in linked.items() if name not in shipped}
     assert missing == {}
+
+
+def test_assets_already_linked_by_posted_comments_stay_shipped():
+    """Comments already posted keep their image links: walkthroughs before
+    the Teller portrait moved to grug_smile.png (2026-10-20) link
+    grug_teller.png, so the site keeps serving that name."""
+    from pathlib import Path
+
+    assets = Path(__file__).resolve().parents[3] / "web" / "public" / "assets"
+    for name in ("grug_teller.png",):
+        assert (assets / name).is_file(), name
