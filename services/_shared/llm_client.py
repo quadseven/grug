@@ -35,7 +35,6 @@ import ast
 import contextlib
 import contextvars
 import hashlib
-import fnmatch
 import json
 import logging
 import math
@@ -3797,9 +3796,10 @@ def _scope_covering_finding(scope: str, finding_file: str) -> str:
     even cover its own source file is wrong; repo-wide is the safe fallback."""
     if not scope or not finding_file:
         return scope
-    if fnmatch.fnmatch(finding_file, scope) or fnmatch.fnmatch(
-        finding_file, scope.replace("**/", "")
-    ):
+    # The same deterministic matcher the path preview uses (#1203), so a
+    # scope kept here covers exactly the files the operator is shown.
+    from cave_drawings import path_matches
+    if path_matches(scope, finding_file):
         return scope
     log.info("learning_scope_dropped", extra={"scope": scope[:120], "file": finding_file[:200]})
     return ""
@@ -3933,25 +3933,47 @@ def _repo_learnings_block(pr_context: Optional[PrContext]) -> str:
     text is repo DATA riding the SYSTEM prompt to a third-party backend."""
     if not pr_context or "repo" not in pr_context:
         return ""
+    repo = str(pr_context["repo"])
     try:
-        from adapters.pg_install_store import (  # type: ignore
-            list_learnings,
-        )
-        rows = list_learnings(str(pr_context["repo"]))
+        from adapters.pg_install_store import list_learnings  # type: ignore
+        from cave_drawings import select_for_prompt
+        rows = list_learnings(repo)
         if not rows:
             return ""
+        # Cave Drawings (#1203): only ACTIVE learnings, and never both sides
+        # of a declared conflict or supersedes link. A suppression is logged,
+        # so two contradictory rules are never handed over silently.
+        selection = select_for_prompt(cast("list[dict[str, Any]]", rows))
+        for dropped in selection.suppressed:
+            log.info("repo_learning_suppressed", extra={"repo": repo, **dropped})
         # Redaction happens PER ROW inside the renderer (before truncation),
         # so a secret cut at the byte boundary cannot leak a partial value.
-        block = _render_learnings_block(cast("list[dict[str, Any]]", rows))
-        # Track usage: every learning that made it into the prompt is marked
-        # used (bump usage_count, stamp last_used_at). Best-effort, never
-        # fails a review.
-        _mark_learnings_used(str(pr_context["repo"]), rows)
-        return block
+        block, supplied = _render_learnings_block_with_ids(selection.selected)
     except Exception as e:  # noqa: BLE001 - learnings never break a review, but log
         log.warning("repo_learnings_fetch_failed", extra={
             "repo": str(pr_context.get("repo", "")), "kind": type(e).__name__})
         return ""
+    _record_learnings_supplied(pr_context, repo, supplied)
+    return block
+
+
+def _record_learnings_supplied(
+    pr_context: PrContext, repo: str, supplied: list[str],
+) -> None:
+    """Count a use for exactly the learnings rendered into this prompt
+    (#1203). Keyed by PR number and head sha, so the several prompt builds
+    of one review (chunks, judge, fallback) count once. Best-effort: a
+    failed counter write never costs the review its learnings."""
+    pr_number = pr_context.get("pr_number")
+    head_sha = str(pr_context.get("head_sha", "") or "")
+    if not (supplied and pr_number and head_sha):
+        return
+    try:
+        from adapters.pg_install_store import record_learning_usage  # type: ignore
+        record_learning_usage(repo, sorted(supplied), review_key=f"{pr_number}@{head_sha}")
+    except Exception as e:  # noqa: BLE001 - usage metadata never breaks a review
+        log.warning("repo_learnings_usage_failed", extra={
+            "repo": repo, "kind": type(e).__name__})
 
 
 # Cap the NUMBER of learnings in the prompt, newest first, before the byte
@@ -3975,9 +3997,21 @@ def _render_learnings_block(
     order); this renders NEWEST first and bounds by count then bytes, so a
     flood cannot crowd out the static rules AND the most recent teaching
     always survives truncation."""
+    return _render_learnings_block_with_ids(rows, max_chars=max_chars)[0]
+
+
+def _render_learnings_block_with_ids(
+    rows: list[dict[str, Any]], *, max_chars: int = _LEARNINGS_BLOCK_MAX_CHARS,
+) -> tuple[str, list[str]]:
+    """`_render_learnings_block` plus the ids of the learnings that made it
+    into the block, newest first (#1203). The byte bound drops WHOLE rows
+    (only the newest row is ever cut mid-text, when it alone exceeds the
+    bound), so the id list is exactly what the model was given."""
     from best_practices import _sanitize  # type: ignore
+    from cave_drawings import learning_id
     newest_first = list(reversed(rows))[:_MAX_LEARNINGS_IN_PROMPT]
     lines: list[str] = []
+    ids: list[str] = []
     for row in newest_first:
         text = str(row.get("text", "")).strip()
         if not text:
@@ -3991,35 +4025,31 @@ def _render_learnings_block(
         scope = _sanitize(_redact_secrets(str(row.get("scope_path", "")).strip()))
         prefix = f"({scope}) " if scope else ""
         lines.append(f"- {prefix}{text}")
+        ids.append(str(row.get("id") or learning_id(str(row.get("text", "")))))
     if not lines:
-        return ""
-    body = "\n".join(lines)
+        return "", []
+    kept: list[str] = []
+    used = 0
+    for line in lines:
+        cost = len(line) + (1 if kept else 0)
+        if kept and used + cost > max_chars:
+            break
+        kept.append(line)
+        used += cost
+    omitted = len(kept) < len(lines)
+    body = "\n".join(kept)
     if len(body) > max_chars:
-        body = body[:max_chars].rstrip() + "\n- ... (older learnings omitted)"
+        # The newest row alone exceeds the bound: keep its head so a
+        # just-taught rule always reaches the prompt.
+        body = body[:max_chars].rstrip()
+        omitted = True
+    if omitted:
+        body += "\n- ... (older learnings omitted)"
     return (
         "WHAT YOUR TRIBE TOLD GRUG (team-taught preferences from replies to "
         "past findings - apply them, and do not re-flag what they tell you to "
         "allow):\n" + body
-    )
-
-
-def _mark_learnings_used(repo: str, rows: list[dict[str, Any]]) -> None:
-    """Bump usage_count and stamp last_used_at for the learnings rendered
-    into the prompt (newest-first, count-capped, non-empty). Best-effort:
-    a store failure never surfaces here."""
-    from adapters.pg_install_store import (  # type: ignore
-        _learning_digest, increment_learning_usage,
-    )
-    seen: set[str] = set()
-    for row in list(reversed(rows))[:_MAX_LEARNINGS_IN_PROMPT]:
-        text = str(row.get("text", "")).strip()
-        if not text:
-            continue
-        digest = _learning_digest(text)
-        if digest in seen:
-            continue
-        seen.add(digest)
-        increment_learning_usage(repo, digest)
+    ), ids[: len(kept)]
 
 
 def _repo_guidelines_block(pr_context: Optional[PrContext]) -> str:
