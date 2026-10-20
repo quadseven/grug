@@ -76,7 +76,10 @@ class FakeGh:
                 })
             if path == f"repos/{REPO}/issues/12/parent":
                 if self.parent_error:
-                    raise RuntimeError("connection reset")
+                    # What the real runner raises on a non-404 failure: a
+                    # GhError that fetch_issue_facts must re-raise, not
+                    # mistake for "no parent".
+                    raise chief_check.GhError("gh: Bad Gateway (HTTP 502)")
                 if self.parent is None:
                     raise chief_check.GhError("gh: Not Found (HTTP 404)")
                 return json.dumps({"number": self.parent})
