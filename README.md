@@ -71,12 +71,20 @@ Before the tribe leave the cave, Chief reads the **Hunt Plan** on the PR body â€
 
 | | Plan check | Pass when | Blocks? |
 |---|---|---|---|
-| yes | `why` | Has `## Why` (or `## Summary`) section, enough words to name the hunt | **yes** |
-| yes | `acceptance` | Has `## Acceptance criteria` (or `## Test plan`) with enough bullets | **yes** |
-| yes | `estimate` | Body or label includes `Size: XS/S/M/L` (XL must be split) | **yes** |
-| yes | `scope-fence` | Has `## Out of scope` section | **yes** |
-| soft | `issue-link` | Body links an issue via `closes #N` | advisory |
-| soft | `in-scope` | All changed files trace to the linked issue's scope (grug#1195) | advisory |
+| yes | `why` (why hunt) | Has `## Why` (or `## Summary`) with at least 5 words | **yes** |
+| yes | `acceptance` (what good look like) | Has `## Acceptance criteria` (or `## Test plan`) with at least 3 non-empty bullets | **yes** |
+| yes | `estimate` (how big) | Body includes `Size: XS/S/M/L` (XL must be split) | **yes** |
+| yes | `scope-fence` (where stop) | Has a non-empty `## Out of scope` section | **yes** |
+| yes | `linked-issue-completeness` (ticket done) | Every ticket closed by a closing keyword has its checkboxes ticked | **yes** |
+| yes | `linked-issue-epic` (which epic) | Every ticket the body names is an epic or belongs to one (grug#1034) | **yes** |
+| soft | `issue-link` (which ticket) | Body links a ticket, e.g. `Refs #N` or `Part of #N` | advisory |
+| soft | `loom-footer` (loom mark) | A PR naming a loom ticket carries the Loom audit footer | advisory |
+| soft | `in-scope` (in scope) | All changed files trace to the linked issue's scope (grug#1195) | advisory |
+
+Text inside HTML comments counts for nothing, and neither does a bare `-`
+or empty checkbox: a PR body left as the template ships fails the plan.
+Write `Refs #N` and `Part of #N`, not a closing keyword: a ticket closes
+once its boxes are ticked, not when the PR merges.
 
 The `in-scope` check names any rider files the linked issue never asked for
 and is advisory by default; org/repo config can promote it to blocking.
@@ -199,7 +207,7 @@ PRD #21 + slice issues #22-#34 track v1.
 
 Issues + PRs welcome. Use the Hunt Plan template â€” Grug will gate your own PR. Fair is fair.
 
-PR body must have `## Why`, `## Acceptance criteria`, `## Out of scope`, `Size:`, and `closes #N`.
+PR body must have `## Why`, `## Acceptance criteria`, `## Out of scope`, `Size:`, and `Refs #N` (plus `Part of #N` naming the epic).
 
 ## Related docs
 

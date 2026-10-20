@@ -2,7 +2,9 @@
 
 Ported from scripts/tpm.py with the bullet-count regex tightened per
 quadseven/grug#20: empty `- [ ]` placeholders no longer count toward the
->=3 minimum (security: an unfilled template should NOT pass).
+>=3 minimum (security: an unfilled template should NOT pass). Text inside
+HTML comments counts for nothing either (#1330): a template's guidance and
+example bullets live in comments the rendered PR never shows.
 
 9 checks (per PRD #21 + memory `feedback_health_endpoint_standard`):
   why          - ## Why >=5 words
@@ -59,6 +61,23 @@ class CheckResult:
 _BULLET_PAT = re.compile(
     r"^[ \t]*-[ \t]+(?:\[[ x]\][ \t]+\S|(?!\[)\S)",
     re.MULTILINE,
+)
+# An HTML comment, or an unclosed one running to the end of the body: GitHub
+# hides both on the rendered PR, so neither is content the author wrote (#1330).
+# Code is matched first and kept: a `<!--` quoted in backticks or a fence is
+# literal text, and an unclosed one there must not swallow the rest of the body.
+_HTML_COMMENT_PAT = re.compile(
+    r"(?P<code>```.*?(?:```|\Z)|`[^`\n]+`)|<!--.*?(?:-->|\Z)", re.DOTALL,
+)
+# A line that is only a list marker, optionally with an empty or ticked box:
+# `-`, `*`, `- [ ]`, `- [x]`. The template's placeholder, not a word of text.
+_PLACEHOLDER_LINE_PAT = re.compile(r"^[ \t]*[-*+][ \t]*(?:\[[ xX]\][ \t]*)?$", re.MULTILINE)
+# A line holding only the size label (`**Size:** S`, or bare `Size:` once its
+# comment is gone). Templates put it after the last section, so it lands in
+# `## Out of scope`; it is the estimate, not a fence.
+_SIZE_LINE_PAT = re.compile(
+    r"^[ \t]*[*_]*Size[*_]*:?[*_]*[ \t]*(?:XS|S|M|L|XL)?[*_]*[ \t]*$",
+    re.IGNORECASE | re.MULTILINE,
 )
 # Match `## Heading` only -- NOT `### Sub`. Earlier `##+` ate H3+
 # headings as section dividers, so any H3 inside `## Acceptance
@@ -146,12 +165,31 @@ def _heading_matches(heading: str, name: str) -> bool:
     return h.startswith(n) and len(h) > len(n) and not h[len(n)].isalnum()
 
 
+def strip_html_comments(body: str) -> str:
+    """`body` without its HTML comments (#1330).
+
+    The Loom footer and agent-marker checks read the RAW body on purpose:
+    their markers live in comments. Only the content checks strip them.
+    """
+    return _HTML_COMMENT_PAT.sub(lambda m: m.group("code") or "", body)
+
+
+def _content_word_count(text: str) -> int:
+    """Words in `text`, not counting placeholder-only lines (`-`, `- [ ]`)
+    or a size-label line."""
+    text = _SIZE_LINE_PAT.sub("", text)
+    return len(_PLACEHOLDER_LINE_PAT.sub("", text).split())
+
+
 def section_text(body: str, *names: str) -> str | None:
     """Return text under the first matching ## section, or None.
 
     Matches case-insensitively and tolerates a trailing qualifier on the heading
-    (see `_heading_matches`); `names` provided in priority order.
+    (see `_heading_matches`); `names` provided in priority order. HTML comments
+    are stripped first, so a `## Heading` inside one is no section and the
+    guidance inside one is no content (#1330).
     """
+    body = strip_html_comments(body)
     sections = list(_SECTION_PAT.finditer(body))
     for name in names:
         for i, m in enumerate(sections):
@@ -166,7 +204,7 @@ def check_why(body: str) -> CheckResult:
     text = section_text(body, "Why", "Summary")
     if text is None:
         return CheckResult("why", False, "missing ## Why (or ## Summary) section")
-    word_count = len(text.split())
+    word_count = _content_word_count(text)
     if word_count < 5:
         return CheckResult(
             "why", False,
@@ -201,7 +239,7 @@ def check_acceptance(body: str) -> CheckResult:
 
 
 def check_estimate(body: str) -> CheckResult:
-    m = _SIZE_PAT.search(body)
+    m = _SIZE_PAT.search(strip_html_comments(body))
     if not m:
         return CheckResult(
             "estimate", False, "no Size: XS/S/M/L/XL in body",
@@ -230,12 +268,13 @@ def check_scope_fence(body: str) -> CheckResult:
     and the existing suite rejected it: `Deferred.` and `Not now.` are real
     answers to "what is out of scope", and a gate that demands padding gets
     padding. `## Why` earns its 5-word floor because a one-word why is never a
-    why; a one-word fence often is a fence.
+    why; a one-word fence often is a fence. A bare `-` placeholder is no word
+    at all (#1330).
     """
     text = section_text(body, "Out of scope")
     if text is None:
         return CheckResult("scope-fence", False, "missing ## Out of scope section")
-    words = len(text.split())
+    words = _content_word_count(text)
     if not words:
         return CheckResult(
             "scope-fence", False,
