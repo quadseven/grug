@@ -180,9 +180,66 @@ def test_helper_called_only_by_another_uncalled_helper_is_still_dead():
         criteria=_RUNTIME_CRITERIA, pr_title=_TITLE, pr_body=_BODY,
     )
     assert len(_by_rule(findings, "intent-mismatch")) == 1
-    assert {f.message.split("`")[1] for f in _by_rule(findings, "dead-code")} == {
-        "verify_due", "verify_batch",
-    }
+    dead = _by_rule(findings, "dead-code")
+    # One marking for the call tree, on its root, naming the stranded helper.
+    assert len(dead) == 1, findings
+    assert dead[0].line == 15  # `def verify_batch(`
+    assert dead[0].message.split("`")[1] == "verify_batch"
+    assert "`verify_due`" in dead[0].message
+
+
+def test_uncalled_root_and_its_private_helpers_are_one_marking():
+    added = [
+        "",
+        "",
+        "def publish_report(rows):",
+        "    return _render(_group(_clean(rows)))",
+        "",
+        "",
+        "def _clean(rows):",
+        "    return [r for r in rows if r]",
+        "",
+        "",
+        "def _group(rows):",
+        "    return sorted(rows)",
+        "",
+        "",
+        "def _render(rows):",
+        "    return ', '.join(rows)",
+    ]
+    head = _VERIFY_BASE + "\n".join(added) + "\n"
+    findings = scan_criteria_coverage(
+        (_hunk("station/verify.py", 8, added),), {"station/verify.py": head},
+        criteria=(), pr_title=_TITLE, pr_body=_BODY,
+    )
+    dead = _by_rule(findings, "dead-code")
+    assert len(dead) == 1, findings
+    assert (dead[0].file, dead[0].line) == ("station/verify.py", 10)
+    assert dead[0].message.split("`")[1] == "publish_report"
+    for helper in ("_clean", "_group", "_render"):
+        assert f"`{helper}`" in dead[0].message
+
+
+def test_mutually_recursive_uncalled_defs_still_get_a_marking():
+    added = [
+        "",
+        "",
+        "def ping(n):",
+        "    return pong(n - 1) if n else 0",
+        "",
+        "",
+        "def pong(n):",
+        "    return ping(n - 1) if n else 1",
+    ]
+    head = _VERIFY_BASE + "\n".join(added) + "\n"
+    findings = scan_criteria_coverage(
+        (_hunk("station/verify.py", 8, added),), {"station/verify.py": head},
+        criteria=(), pr_title=_TITLE, pr_body=_BODY,
+    )
+    dead = _by_rule(findings, "dead-code")
+    assert len(dead) == 1, findings
+    assert dead[0].message.split("`")[1] == "ping"
+    assert "`pong`" in dead[0].message
 
 
 # --- exemptions --------------------------------------------------------------
@@ -237,6 +294,72 @@ def test_decorated_and_dunder_defs_are_not_dead():
         criteria=(), pr_title=_TITLE, pr_body=_BODY,
     )
     assert not _by_rule(findings, "dead-code"), findings
+
+
+def test_alembic_revision_hooks_are_not_dead():
+    head = (
+        '"""add verify table"""\n'
+        "from alembic import op\n"
+        "\n"
+        "revision = '0042'\n"
+        "down_revision = '0041'\n"
+        "\n"
+        "\n"
+        "def upgrade():\n"
+        "    op.create_table('verify')\n"
+        "\n"
+        "\n"
+        "def downgrade():\n"
+        "    op.drop_table('verify')\n"
+    )
+    path = "migrations/versions/0042_verify.py"
+    findings = scan_criteria_coverage(
+        (_hunk(path, 1, head.rstrip("\n").split("\n")),), {path: head},
+        criteria=_RUNTIME_CRITERIA, pr_title=_TITLE, pr_body=_BODY,
+    )
+    assert findings == ()
+
+
+def test_upgrade_outside_an_alembic_revision_is_still_dead():
+    added = ["", "", "def upgrade(ticket):", "    return ticket"]
+    head = _VERIFY_BASE + "\n".join(added) + "\n"
+    findings = scan_criteria_coverage(
+        (_hunk("station/verify.py", 8, added),), {"station/verify.py": head},
+        criteria=(), pr_title=_TITLE, pr_body=_BODY,
+    )
+    assert len(_by_rule(findings, "dead-code")) == 1, findings
+
+
+def test_override_on_a_subclass_is_not_dead():
+    # urllib calls `redirect_request` by dispatch through the base class,
+    # so no caller names it.
+    head = (
+        "import urllib.request\n"
+        "\n"
+        "\n"
+        "class _NoRedirects(urllib.request.HTTPRedirectHandler):\n"
+        "    def redirect_request(self, req, fp, code, msg, headers, newurl):\n"
+        "        return None\n"
+        "\n"
+        "\n"
+        "OPENER = urllib.request.build_opener(_NoRedirects)\n"
+    )
+    path = "station/http.py"
+    findings = scan_criteria_coverage(
+        (_hunk(path, 1, head.rstrip("\n").split("\n")),), {path: head},
+        criteria=(), pr_title=_TITLE, pr_body=_BODY,
+    )
+    assert not _by_rule(findings, "dead-code"), findings
+
+
+def test_method_of_a_baseless_class_is_still_dead():
+    added = ["", "", "class Proof(object):", "    def check(self):", "        return True"]
+    head = _VERIFY_BASE + "\n".join(added) + "\n"
+    findings = scan_criteria_coverage(
+        (_hunk("station/verify.py", 8, added),), {"station/verify.py": head},
+        criteria=(), pr_title=_TITLE, pr_body=_BODY,
+    )
+    assert [f.message.split("`")[1] for f in _by_rule(findings, "dead-code")] == ["check"]
 
 
 def test_defs_in_test_files_are_ignored():
