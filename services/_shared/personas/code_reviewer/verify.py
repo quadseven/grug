@@ -468,6 +468,21 @@ def _kills_as_callee_not_async(
     callees = _claimed_async_callees(finding)
     if not callees:
         return False
+    trees = _parsed_python(contents, callees)
+    if trees is None:
+        return False
+    async_names = {
+        n.name for t in trees for n in ast.walk(t)
+        if isinstance(n, ast.AsyncFunctionDef)
+    }
+    return all(_is_plain_sync_callee(c, trees, async_names) for c in callees)
+
+
+def _parsed_python(
+    contents: dict[str, str], callees: tuple[str, ...],
+) -> list[ast.Module] | None:
+    """Every fetched Python file, parsed. None (inconclusive) when a file
+    that mentions a callee does not parse."""
     trees: list[ast.Module] = []
     for path, text in contents.items():
         if not path.endswith((".py", ".pyi")):
@@ -476,25 +491,24 @@ def _kills_as_callee_not_async(
             trees.append(ast.parse(text))
         except (SyntaxError, ValueError):
             if any(c in text for c in callees):
-                return False
-    async_names = {
-        n.name for t in trees for n in ast.walk(t)
-        if isinstance(n, ast.AsyncFunctionDef)
-    }
-    for callee in callees:
-        if callee in async_names:
-            return False
-        defs = [
-            n for t in trees for n in ast.walk(t)
-            if isinstance(n, ast.FunctionDef) and n.name == callee
-        ]
-        if not defs:
-            return False
-        if any(_returns_awaitable(d, async_names) for d in defs):
-            return False
-        if any(_is_rebound(t, callee) for t in trees):
-            return False
-    return True
+                return None
+    return trees
+
+
+def _is_plain_sync_callee(
+    callee: str, trees: list[ast.Module], async_names: set[str],
+) -> bool:
+    """`callee` has a plain def, no async def, no def that may return an
+    awaitable, and no rebinding in the fetched files."""
+    if callee in async_names:
+        return False
+    defs = [
+        n for t in trees for n in ast.walk(t)
+        if isinstance(n, ast.FunctionDef) and n.name == callee
+    ]
+    if not defs or any(_returns_awaitable(d, async_names) for d in defs):
+        return False
+    return not any(_is_rebound(t, callee) for t in trees)
 
 
 # redaction_artifact. Grug's own placeholders, and the one pattern whose
