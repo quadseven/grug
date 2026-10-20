@@ -91,6 +91,24 @@ explicit `<!-- grug:agent-authored -->` opt-out, or comes from any other
 author. The check-run title names the rule that applied. Elder and Guard
 review every PR as usual.
 
+### Check a Hunt Plan before you open the PR
+
+`gh pr create --body` skips the repo's PR template, so a missing section or a
+ticket with no epic usually shows up as a red `Grug - Chief` after the PR is
+open. `scripts/chief_check.py` runs the same evaluator Chief runs, against
+your `gh` login, and prints the same title and table:
+
+```bash
+make chief-check REPO=owner/name BODY=pr.md      # a body you are about to post
+make chief-check REPO=owner/name PR=123          # an open PR's current body
+gh pr create --body-file pr.md                   # once it exits 0
+```
+
+It exits 0 when Chief would pass (or skip), 1 when Chief would hold the PR,
+and 2 on a usage error. When `which epic` fails it lists the repo's open
+`Epic: ...` issues and the two fixes: add the ticket as a sub-issue of an
+epic, or write `Part of #<epic>` in the ticket's body.
+
 ## What Elder and Guard check
 
 ### Elder: deep code review (Apex)
