@@ -699,6 +699,80 @@ def _handle_sub_issues(payload: dict[str, Any]) -> dict[str, str]:
 _TICKET_RECHECK_MAX_PRS = 5
 
 
+def _ticket_numbers(values: list[Any]) -> set[int]:
+    """The integer issue numbers in `values`, dropping anything unparseable."""
+    numbers: set[int] = set()
+    for value in values:
+        try:
+            numbers.add(int(value))
+        except (TypeError, ValueError):
+            continue
+    return numbers
+
+
+def _ticket_recheck_blocked(installation_id: Any, repo_id: Any) -> str | None:
+    """Why the ticket-change Chief re-run must not run here, or None.
+
+    Chief (tpm) on the PR is the gate, not `issue_dor_enabled`: that flag is
+    the issue-time advisory's, and Chief on the PR does not depend on it."""
+    if not is_install_allowlisted(int(installation_id)):
+        return "no_op: installer not allowlisted"
+    if repo_id is None:
+        return "no_op: no repo_id"
+    if not is_persona_enabled(int(installation_id), int(repo_id), "tpm"):
+        return "no_op: tpm disabled for this repo"
+    return None
+
+
+def _open_prs_naming(
+    installation_id: int, owner: str, repo_name: str, numbers: set[int],
+) -> list[dict[str, Any]]:
+    """The open PRs whose body names one of `numbers`: one list call (the 50
+    most recently updated, the self-heal pass's own call), matched with the
+    same extractor the `which epic` check uses. Raises on a list failure."""
+    import chief_self_heal  # local import: module attribute, so tests can fake the list
+    from github_app_auth import with_install_token_retry  # type: ignore
+    from personas.tpm.dor_checks import named_ticket_numbers  # type: ignore
+
+    prs = with_install_token_retry(
+        installation_id,
+        lambda token: chief_self_heal._list_recent_open_prs(token, owner, repo_name),
+    ) or []
+    return [
+        pr for pr in prs
+        if pr.get("number") and (pr.get("head") or {}).get("sha")
+        and numbers.intersection(named_ticket_numbers(pr.get("body") or ""))
+    ]
+
+
+def _recheck_chief_on_pr(
+    installation_id: int, owner: str, repo_name: str, pr: dict[str, Any],
+    coords: dict[str, Any],
+) -> bool:
+    """Re-run Chief on one PR through `run_chief_recheck`. Returns whether it
+    published; never raises, so one PR cannot stop the rest."""
+    from personas.publish_check import PUBLISH_FAILED  # type: ignore
+    from personas.tpm.persona import is_trusted_operator  # type: ignore
+
+    pr_number = int(pr["number"])
+    head_sha = str(pr["head"]["sha"])
+    try:
+        _, result_map = run_chief_recheck(
+            installation_id=installation_id, owner=owner, repo=repo_name,
+            head_sha=head_sha, pr_number=pr_number,
+            pr_body=pr.get("body") or "",
+            author_trusted=is_trusted_operator(pr),
+        )
+        if result_map.get("result") == PUBLISH_FAILED:
+            raise RuntimeError("chief publish failed")
+    except Exception as e:  # noqa: BLE001 - one PR must not stop the rest
+        log.warning("chief_ticket_recheck_failed",
+                    extra={**coords, "pr_number": pr_number,
+                           "head_sha": head_sha[:8], "kind": type(e).__name__})
+        return False
+    return True
+
+
 def _recheck_chief_for_ticket(
     installation: dict[str, Any],
     repo: dict[str, Any],
@@ -712,78 +786,36 @@ def _recheck_chief_for_ticket(
     someone comments `/grug recheck`, and the self-heal pass does not help
     because the head SHA already has a Chief run.
 
-    Gates: an allowlisted install, a known repo id, and Chief (tpm) enabled
-    for the repo. NOT `issue_dor_enabled`: that flag is the issue-time
-    advisory's, and Chief on the PR does not depend on it. One open-PR list
-    (the 50 most recently updated, the self-heal pass's own call), PRs
-    matched with the same extractor the check uses, then the same
-    `run_chief_recheck` `/grug recheck` calls, at most
-    `_TICKET_RECHECK_MAX_PRS` of them, each best-effort. Never raises: the
-    result is one `chief_recheck` audit key the caller merges in.
+    Gated by `_ticket_recheck_blocked`; PRs found by `_open_prs_naming`; at
+    most `_TICKET_RECHECK_MAX_PRS` of them re-run through the same
+    `run_chief_recheck` `/grug recheck` calls, each best-effort. Never
+    raises: the result is one `chief_recheck` audit key the caller merges in.
     """
-    numbers = set()
-    for n in issue_numbers:
-        try:
-            numbers.add(int(n))
-        except (TypeError, ValueError):
-            continue
+    numbers = _ticket_numbers(issue_numbers)
     installation_id = installation.get("id")
     owner = (repo.get("owner") or {}).get("login") or repo.get("full_name", "").split("/")[0]
     repo_name = repo.get("name")
-    repo_id = repo.get("id")
     if not numbers or not all([installation_id, owner, repo_name]):
         return {"chief_recheck": "skip: incomplete payload"}
 
     coords = {"installation_id": installation_id, "owner": owner,
               "repo": repo_name, "tickets": sorted(numbers)}
     try:
-        if not is_install_allowlisted(int(installation_id)):
-            return {"chief_recheck": "no_op: installer not allowlisted"}
-        if repo_id is None:
-            return {"chief_recheck": "no_op: no repo_id"}
-        if not is_persona_enabled(int(installation_id), int(repo_id), "tpm"):
-            return {"chief_recheck": "no_op: tpm disabled for this repo"}
-
-        import chief_self_heal  # local import: module attribute, so tests can fake the list
-        from github_app_auth import with_install_token_retry  # type: ignore
-        from personas.publish_check import PUBLISH_FAILED  # type: ignore
-        from personas.tpm.dor_checks import named_ticket_numbers  # type: ignore
-        from personas.tpm.persona import is_trusted_operator  # type: ignore
-
-        prs = with_install_token_retry(
-            int(installation_id),
-            lambda token: chief_self_heal._list_recent_open_prs(token, owner, repo_name),
-        ) or []
+        blocked = _ticket_recheck_blocked(installation_id, repo.get("id"))
+        if blocked:
+            return {"chief_recheck": blocked}
+        matched = _open_prs_naming(int(installation_id), owner, repo_name, numbers)
     except Exception as e:  # noqa: BLE001 - a webhook 500 is never redelivered
         log.warning("chief_ticket_recheck_failed",
                     extra={**coords, "stage": "list_prs", "kind": type(e).__name__})
         return {"chief_recheck": "skip: open PR list failed"}
 
-    matched = [
-        pr for pr in prs
-        if pr.get("number") and (pr.get("head") or {}).get("sha")
-        and numbers.intersection(named_ticket_numbers(pr.get("body") or ""))
+    results = [
+        _recheck_chief_on_pr(int(installation_id), owner, repo_name, pr, coords)
+        for pr in matched[:_TICKET_RECHECK_MAX_PRS]
     ]
-    rechecked = failed = 0
-    for pr in matched[:_TICKET_RECHECK_MAX_PRS]:
-        pr_number = int(pr["number"])
-        head_sha = str(pr["head"]["sha"])
-        try:
-            _, result_map = run_chief_recheck(
-                installation_id=int(installation_id), owner=owner,
-                repo=repo_name, head_sha=head_sha, pr_number=pr_number,
-                pr_body=pr.get("body") or "",
-                author_trusted=is_trusted_operator(pr),
-            )
-            if result_map.get("result") == PUBLISH_FAILED:
-                raise RuntimeError("chief publish failed")
-        except Exception as e:  # noqa: BLE001 - one PR must not stop the rest
-            failed += 1
-            log.warning("chief_ticket_recheck_failed",
-                        extra={**coords, "pr_number": pr_number,
-                               "head_sha": head_sha[:8], "kind": type(e).__name__})
-            continue
-        rechecked += 1
+    rechecked = sum(results)
+    failed = len(results) - rechecked
     log.info("chief_ticket_rechecked",
              extra={**coords, "matched": len(matched), "rechecked": rechecked,
                     "failed": failed})
