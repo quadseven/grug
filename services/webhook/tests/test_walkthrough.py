@@ -175,8 +175,8 @@ def test_walkthrough_body_has_branded_header_and_pr_button():
     )
     # Starts with marker + branded header image (Teller portrait)
     assert body.startswith(MARKER)
-    assert 'grug_teller.png' in body
-    assert '<img src="https://grug.lol/assets/grug_teller.png"' in body
+    assert 'grug_smile.png' in body
+    assert '<img src="https://grug.lol/assets/grug_smile.png"' in body
     # Primary link (the PR) rendered as a badge-image button
     assert pr_url in body
     # Badge-image button: an <a> wrapping an <img> with badge styling
@@ -349,3 +349,23 @@ def test_changed_files_table_escapes_html_that_could_close_details():
     assert "</details>" not in table
     assert "&lt;/details&gt;" in table
     assert "&lt;script&gt;" in table
+
+
+def test_every_grug_lol_asset_a_service_links_is_shipped_by_the_site():
+    """A bot comment links its portrait from grug.lol/assets, which serves
+    web/public/assets; a missing file answers with the site's HTML page and
+    the comment shows a broken image (grug_teller.png, 2026-10-19)."""
+    import re
+    from pathlib import Path
+
+    root = Path(__file__).resolve().parents[3]
+    shipped = {p.name for p in (root / "web" / "public" / "assets").iterdir()}
+    linked = {}
+    for source in (root / "services").rglob("*.py"):
+        if "tests" in source.parts:
+            continue
+        for name in re.findall(r"grug\.lol/assets/([\w.-]+)", source.read_text()):
+            linked.setdefault(name, source.relative_to(root))
+    assert linked, "no grug.lol asset links found; the scan is broken"
+    missing = {name: str(src) for name, src in linked.items() if name not in shipped}
+    assert missing == {}
