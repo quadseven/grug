@@ -944,7 +944,6 @@ _BINDERS = {
     ast.NamedExpr: lambda n: _target_names(n.target),
     ast.With: _with_names,
     ast.AsyncWith: _with_names,
-    ast.ExceptHandler: lambda n: {n.name} if n.name else set(),
     ast.Global: lambda n: set(n.names),
     ast.Nonlocal: lambda n: set(n.names),
     ast.FunctionDef: lambda n: {n.name},
@@ -960,22 +959,41 @@ _NEW_SCOPE_NODES = (
 )
 
 
+def _is_type_checking_test(test: ast.expr) -> bool:
+    """`TYPE_CHECKING` or `<module>.TYPE_CHECKING`: a block that never runs."""
+    if isinstance(test, ast.Name):
+        return test.id == "TYPE_CHECKING"
+    return isinstance(test, ast.Attribute) and test.attr == "TYPE_CHECKING"
+
+
 def _bindings_in(stmts: list[ast.stmt], before_line: int | None) -> set[str]:
     """Names bound by `stmts` at their own scope level (not descending into
     nested functions/classes/lambdas/comprehensions). With `before_line`,
     only bindings that START before that line count - a local assigned
-    after its use is a real unbound-local bug, not a false marking."""
+    after its use is a real unbound-local bug, not a false marking.
+
+    Two bindings never exist at runtime and are skipped (#1338): the body
+    of `if TYPE_CHECKING:` (its `else` still runs), and an `except ... as
+    err` name outside its own handler - Python deletes it when the handler
+    ends, so only a line inside the handler sees it (never module scope,
+    where `before_line` is None)."""
     bound: set[str] = set()
     stack: list[ast.AST] = list(stmts)
     while stack:
         node = stack.pop()
         line = getattr(node, "lineno", None)
+        if isinstance(node, ast.ExceptHandler):
+            end = node.end_lineno or node.lineno
+            if node.name and before_line is not None and node.lineno <= before_line <= end:
+                bound.add(node.name)
         binder = _BINDERS.get(type(node))
         if binder is not None and (
             before_line is None or (line is not None and line < before_line)
         ):
             bound |= binder(node)
-        if not isinstance(node, _NEW_SCOPE_NODES):
+        if isinstance(node, ast.If) and _is_type_checking_test(node.test):
+            stack.extend(node.orelse)
+        elif not isinstance(node, _NEW_SCOPE_NODES):
             stack.extend(ast.iter_child_nodes(node))
     return bound
 
