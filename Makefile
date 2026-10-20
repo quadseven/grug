@@ -49,6 +49,8 @@ chief-check:
 	uv run --with httpx --with pyjwt --with cryptography --with boto3 --with 'psycopg[binary,pool]' \
 		python scripts/chief_check.py --repo $(REPO) $(if $(PR),--pr $(PR),--body-file $(BODY))
 
+# webhook-test / api-test are hermetic against your ~/.aws: the shared
+# conftest pins fake AWS keys at import (#1340), so no extra env is needed.
 webhook-test:
 	@if [ -n "$$CI" ] && [ -z "$$GRUG_TEST_DATABASE_URL" ]; then \
 		echo "FATAL: store-backed tests would SKIP in CI (GRUG_TEST_DATABASE_URL unset) - a skipped gate is a silent pass (audit H4)"; exit 1; fi
