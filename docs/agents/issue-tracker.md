@@ -9,14 +9,15 @@ Issues and PRDs for this repo live as GitHub issues at `quadseven/grug`. Use the
   - `## Why` — one paragraph, why this work exists.
   - `## Acceptance criteria` — >=3 checkbox bullets, each independently verifiable.
   - `## Size` — `**Size:** XS|S|M|L|XL` (`XS` <=30min, `S` <=2h, `M` <=1d, `L` <=3d; split `XL` into sub-issues first).
-  - `## Dependencies` — `Blocked by #N`, `Refs #N`, or `closes #N` (plain text, not markdown-linked) so Grug's issue-link check passes. **Must carry an epic link** - see "Epic-link filing rule" below.
+  - `## Dependencies` - `Blocked by #N`, `Refs #N` or `Part of #N` (plain text, not markdown-linked) so Grug's issue-link check passes. Never a closing keyword (see the PR bullet below). **Must carry an epic link** - see "Epic-link filing rule" below.
   - `## Out of scope` — adjacent work intentionally not covered.
-  - The implementing PR mirrors this shape and links its ticket in plain text (not markdown-linked) for Chief's advisory `issue-link` check: `Refs #<n>` or `Refs owner/name#<n>` counts as well as `closes #<n>`. Use `Refs` when the ticket should close only after its acceptance boxes are ticked from evidence, since a closing keyword auto-closes it on merge.
-- **Labels (full live set, verify with `gh label list --repo quadseven/grug` before relying on this list — it drifts):**
+  - The implementing PR mirrors this shape and links its ticket in plain text (not markdown-linked) for Chief's advisory `issue-link` check: `Refs #<n>`, `Refs owner/name#<n>` or `Part of #<n>`. Never a closing keyword (close, fix, resolve and their forms): it auto-closes the ticket on merge, before its acceptance boxes are ticked from evidence, and Chief's blocking `linked-issue-completeness` check fails a PR that closes a ticket with an open box. Close the ticket by hand once its boxes are ticked.
+- **Labels (the ones triage applies by hand; this list drifts, so the live set is `gh label list --repo quadseven/grug --limit 200`):**
   - State-role (who can act next): `needs-triage` (not yet looked at), `ready-for-agent` (the body alone is enough for an agent to ship it: what, why, acceptance criteria, bounded scope, no open design question), `ready-for-human` (blocked on an operator action or product call - secrets, dashboard toggles, policy), `arch-review` (a design decision must be written into the body first; once it is, relabel `ready-for-agent`), `wontfix`. `needs-info` is not defined here.
   - Priority: `P1` (live user-visible harm, or unblocks other work), `P2` (correctness or precision gap with no live harm today), `P3` (cleanup, measurement, nice-to-have). Every triaged open issue carries exactly one state-role label and one priority.
-  - Category/other: `arch-review`, `bug`, `dependencies`, `documentation`, `duplicate`, `enhancement`, `feature`, `gh-app-best-practice`, `good first issue`, `grug-pulse`, `help wanted`, `invalid`, `javascript`, `likely-resolved`, `nightly-bot`, `prd`, `preview`, `question`, `stale`.
-  - Live epic groups: `epic-arch-hygiene` (umbrella #823), `epic-deploy-reliability` (umbrella #824). Both now have a real epic ISSUE; the label is a filter, the sub-issue link is the membership.
+  - Category/other: `arch-review`, `bug`, `dependencies`, `documentation`, `duplicate`, `enhancement`, `feature`, `gh-app-best-practice`, `good first issue`, `grug-pulse`, `help wanted`, `invalid`, `javascript`, `likely-resolved`, `nightly-bot`, `prd`, `preview`, `question`, `stale`, `stale-reopened`, `chore`, `epic`, `workflow`, `needs-brain`, `needs-operator`.
+  - Applied by tools or the claim protocol, not by triage: `claim:<login>` (who is working the issue), `needs:<login>` (waiting on that person), `loom:*` (Loom factory state), `lane:*` (the Loom lane on it), `class:*` (Loom's ticket class), `wait:*` (why Loom is holding it).
+  - Epic group labels: `epic-arch-hygiene` (umbrella #823, live). `epic-deploy-reliability` (umbrella #824) is CLOSED: the label stays on its issues for history, do not apply it to new work. The label is a filter; the sub-issue link is the membership.
   - Retired (history only, never apply): `archived-epic-security` (28/28), `archived-epic-grug-saas` (40/40), `archived-epic-resiliency` (5/5), `archived-epic-enforcement` (11/11). Renamed rather than deleted so the association survives on the closed issues that carry them.
   - Deleted: `orphan-ok` (2026-08-06) - see the filing rule below.
 
@@ -53,7 +54,7 @@ gh issue list --repo quadseven/grug --state open --search "epic in:title" \
   --json number,title --jq '.[] | "#\(.number) \(.title)"'
 ```
 
-The `orphan-ok` label is RETIRED (deleted 2026-08-06). It was the escape hatch in the first version of this rule; in practice it became the place work went to be forgotten. If something genuinely has no home, that is a signal the epic set is wrong - add an umbrella epic rather than an exception. Two were added this way: #823 (architecture hygiene) and #824 (deploy-pipeline reliability), both replacing bare `epic-*` labels that had no issue behind them.
+The `orphan-ok` label is RETIRED (deleted 2026-08-06). It was the escape hatch in the first version of this rule; in practice it became the place work went to be forgotten. If something genuinely has no home, that is a signal the epic set is wrong - add an umbrella epic rather than an exception. Two were added this way: #823 (architecture hygiene) and #824 (deploy-pipeline reliability, since closed), both replacing bare `epic-*` labels that had no issue behind them.
 
 Epic ROOTS have no parent, by definition: the epic issues themselves, and PRD umbrellas like #346. Everything else does.
 - **Create an issue**: `gh issue create --repo quadseven/grug --title "feat(grug): ..." --body "..."`. Use a heredoc for multi-line bodies; follow the template's five-section shape above.
