@@ -21,6 +21,14 @@ the exact one-line fix out in prose (a null-deref finding gave
       is marked safe and confined to the anchored line (`ruff_fix_line`,
       used by lint.py), then pass the same check as (a).
 
+Only Python is parse-checked. For every other file the gate still refuses a
+candidate that reads as English prose: the review's "So speaks Grug." sign-off,
+or three or more distinct common English words outside string literals and
+the comment tail. Live instance: mod-overseer PR 1083 offered a one-click
+block that would have replaced a C++ line with the sentence describing the
+fix. Document formats (markdown, rst, plain text) are exempt from the word
+count, since a fix there is prose by nature; the sign-off is refused anywhere.
+
 Pure: no I/O, no logging. A None answer means "render the fix as prose",
 which is what every finding did before this module existed.
 """
@@ -47,6 +55,27 @@ _ASSIGN_TARGET = re.compile(
 )
 _LEADING_WORD = re.compile(r"^([A-Za-z_]\w*)")
 
+# Prose detection for files the gate cannot parse-check (mod-overseer PR
+# 1083). The sign-off closes every review message, so it never belongs in
+# code. The stopwords are common in English instructions and rare as bare
+# words in code; three distinct ones outside strings and comments is prose.
+_SIGN_OFF = "so speaks grug"
+_PROSE_STOPWORDS = frozenset({
+    "the", "and", "when", "it", "only", "should", "call", "set", "in", "of",
+    "for", "then",
+})
+_PROSE_STOPWORD_MIN = 3
+# Document formats, where a one-line fix is itself prose. Not .txt:
+# CMakeLists.txt is build code (same call as verify._PROSE_SUFFIXES).
+_DOC_SUFFIXES = (".md", ".markdown", ".rst", ".adoc")
+_STRING_LITERAL = re.compile(
+    r""""(?:[^"\\\n]|\\.)*"|'(?:[^'\\\n]|\\.)*'|`[^`\n]*`"""
+)
+_COMMENT_TAIL = re.compile(r"(?://|/\*|#).*$")
+# A bare word: not part of a dotted name and not the name of a call, so
+# `set(item)` and `obj.then` stay code.
+_BARE_WORD = re.compile(r"(?<![\w.])([A-Za-z]+)(?![\w(])")
+
 
 def checked_suggestion(
     finding: Finding, anchored_line: int, file_text: str,
@@ -69,11 +98,24 @@ def checked_suggestion(
     candidate = _with_indent_of(candidate, original)
     if candidate.rstrip() == original.rstrip():
         return None
-    if finding.file.endswith(_PYTHON_SUFFIXES) and not _still_parses(
-        lines, anchored_line, candidate,
-    ):
+    if finding.file.endswith(_PYTHON_SUFFIXES):
+        if not _still_parses(lines, anchored_line, candidate):
+            return None
+    elif _reads_as_prose(candidate, finding.file):
         return None
     return candidate
+
+
+def _reads_as_prose(candidate: str, path: str) -> bool:
+    """True when a candidate for a file the gate cannot parse is English
+    prose rather than code (see the module docstring)."""
+    if _SIGN_OFF in candidate.lower():
+        return True
+    if path.lower().endswith(_DOC_SUFFIXES):
+        return False
+    code = _COMMENT_TAIL.sub("", _STRING_LITERAL.sub('""', candidate))
+    words = {w.lower() for w in _BARE_WORD.findall(code)}
+    return len(words & _PROSE_STOPWORDS) >= _PROSE_STOPWORD_MIN
 
 
 def ruff_fix_line(fix: Any, row: int, line_text: str) -> str | None:
