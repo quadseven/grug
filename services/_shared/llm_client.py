@@ -383,6 +383,11 @@ _OVERSIZED_COHORT_ERROR = "cohort budget exceeded"
 # re-spelled, so the classifier cannot drift from the reason strings below.
 _SKIPPED_COHORT_PREFIX = "cohort skipped: "
 
+# What `_truncation_error` says about a parseable answer the model stopped at
+# its max_tokens cap (grug#851). Matched, not re-spelled, so a cohort that hit
+# the cap is told apart from any other "partial review:" cause.
+_TOKEN_CAP_MARKER = "hit the generation token cap"
+
 # The staged review's deadline (grug#1216), as a `time.monotonic()` value.
 # The scheduler used to reserve one worst-case ladder walk (Cave timeout +
 # two SaaS fallbacks + every cloud tier, 480-575s of a 600-700s budget)
@@ -4402,6 +4407,20 @@ def _cohort_coverage(
         unwalked_paths=unwalked,
         reviewed_paths=_reviewed_paths(plan, responses, failed_indexes, unwalked),
         failed_models=_failed_models(responses, failed_indexes),
+        capped_cohorts=tuple(
+            index
+            for index, response in enumerate(responses, start=1)
+            if _hit_token_cap(response)
+        ),
+    )
+
+
+def _hit_token_cap(response: LlmReviewResponse) -> bool:
+    """A cohort that answered, but whose answer stopped at the token cap."""
+    return (
+        response.kind == "reviewed"
+        and response.error.startswith("partial review:")
+        and _TOKEN_CAP_MARKER in response.error
     )
 
 
@@ -5133,13 +5152,17 @@ def _file_split_targets(
     plan: ReviewPlan, responses: Sequence[LlmReviewResponse],
 ) -> list[int]:
     """0-based cohorts worth re-reviewing one file at a time: they ran, failed
-    in a way a smaller input could fix, and span more than one file."""
+    in a way a smaller input could fix, and span more than one file.
+
+    A cohort whose answer hit the token cap counts too. It is `reviewed`, so
+    the retry predicate treats it as final, but one file asks for a shorter
+    answer and may well finish under the cap."""
     return [
         index
         for index, (cohort, response) in enumerate(zip(plan.cohorts, responses, strict=True))
         if len(cohort.paths) > 1
         and not cohort.oversized
-        and _is_retryable_cohort_failure(response)
+        and (_is_retryable_cohort_failure(response) or _hit_token_cap(response))
         and not (response.error or "").startswith(_SKIPPED_COHORT_PREFIX)
     ]
 
@@ -5172,6 +5195,33 @@ def _with_parent_attempts(
     return replace(response, attempts=labels)
 
 
+def _with_capped_parent(
+    files: tuple[ReviewCohort, ...],
+    results: list[LlmReviewResponse],
+    parent: LlmReviewResponse,
+) -> list[LlmReviewResponse]:
+    """Keep a token-capped parent's findings when its file chunks replace it.
+
+    The capped answer was real, diff-anchored evidence, so a split must never
+    drop it. Each parent finding goes to the chunk holding its file (the first
+    chunk when no chunk does), where `_merge_review_findings` dedups it against
+    what the chunk found. A chunk that did not complete falls back to the
+    parent's capped answer for its files: no worse than before the split, and
+    still named as capped, so the review stays partial."""
+    if not _hit_token_cap(parent):
+        return results
+    owner = {path: slot for slot, chunk in enumerate(files) for path in chunk.paths}
+    carried: list[list[Finding]] = [[] for _ in files]
+    for finding in parent.findings:
+        carried[owner.get(finding.path, 0)].append(finding)
+    return [
+        replace(result, findings=result.findings + tuple(kept))
+        if result.kind == "reviewed"
+        else replace(parent, findings=tuple(kept))
+        for result, kept in zip(results, carried, strict=True)
+    ]
+
+
 def _splice_file_chunks(
     plan: ReviewPlan,
     responses: Sequence[LlmReviewResponse],
@@ -5189,9 +5239,10 @@ def _splice_file_chunks(
             merged.append(response)
             continue
         cohorts.extend(chunks[index])
-        merged.extend(
+        results = [
             _with_parent_attempts(next(pending), response) for _ in chunks[index]
-        )
+        ]
+        merged.extend(_with_capped_parent(chunks[index], results, response))
     added = sum(len(files) for files in chunks.values()) - len(chunks)
     return ReviewPlan(
         cohorts=tuple(cohorts),
@@ -5313,7 +5364,8 @@ class _Tier1Review:
 
     def run_whole_diff(self, plan: ReviewPlan) -> LlmReviewResponse:
         """One chunk. A success returns unchanged, exactly as before staging
-        existed; a failure gets the next-model retry, then the file split."""
+        existed; a failure gets the next-model retry, then the file split. An
+        answer that hit the token cap skips the retry and goes to the split."""
         with self._deadline():
             return self._run_whole_diff(plan)
 
@@ -5335,7 +5387,11 @@ class _Tier1Review:
                 },
             )
             response = ladder.run(0, call)
-        if response.kind == "reviewed" or self._cancelled():
+        # A capped answer is `reviewed` but partial: it goes on to the file
+        # split like a failure does, and through the merge, so coverage names
+        # the cap even when one file leaves nothing to split.
+        clean = response.kind == "reviewed" and not _hit_token_cap(response)
+        if clean or self._cancelled():
             return response
         return self._split_and_merge(plan, [response])
 
@@ -5598,7 +5654,7 @@ def _truncation_error(backends: Sequence["Backend"]) -> str:
         return ""
     names = ", ".join(b.value for b in backends)
     return (
-        f"partial review: {names} hit the generation token cap before "
+        f"partial review: {names} {_TOKEN_CAP_MARKER} before "
         f"finishing (finish_reason=length or {TRUNCATED_FINDINGS})"
     )
 

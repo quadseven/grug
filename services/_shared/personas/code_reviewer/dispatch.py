@@ -786,6 +786,11 @@ def _coverage_lines(coverage) -> str:
         parts += f"; failed: {', '.join(str(i) for i in ran_and_failed)}"
     if unattempted:
         parts += f"; never attempted: {', '.join(str(i) for i in unattempted)}"
+    # Completed but cut off at the token cap: without this a capped review read
+    # "N/N cohorts completed" and still failed as partial with no cause shown.
+    capped = coverage.capped_cohorts
+    if capped:
+        parts += f"; hit the token cap: {', '.join(str(i) for i in capped)}"
     lines = (
         f"\n\nCoverage: {coverage.completed_cohorts}/{coverage.total_cohorts} "
         f"cohorts completed{parts}."

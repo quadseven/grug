@@ -254,3 +254,100 @@ def test_merge_reports_failed_models_only_for_chunks_that_failed() -> None:
     assert out.coverage.failed_models == ("coder (http_503)",)
     assert out.coverage.reviewed_paths == ("a.py",)
     assert out.coverage.unwalked_paths == ("b.py",)
+
+
+def _capped_completion(content: str) -> httpx.Response:
+    """A parseable answer the model stopped at its max_tokens cap (grug#851)."""
+    return httpx.Response(
+        200,
+        json={
+            "choices": [{
+                "message": {"role": "assistant", "content": content},
+                "finish_reason": "length",
+            }],
+            "model": "test-model-id",
+        },
+    )
+
+
+def test_a_token_capped_two_file_cohort_is_reviewed_one_file_at_a_time() -> None:
+    """The whole diff answers with one finding but hits the token cap, so the
+    review used to fail as partial with no retry. Each file alone reviews
+    cleanly, so the split completes the review, and the capped answer's
+    finding is kept: a split never drops evidence."""
+    hunks = [
+        Hunk(path="src/a.py", body="@@ -1 +1 @@\n+A_CHANGE"),
+        Hunk(path="src/b.py", body="@@ -1 +1 @@\n+B_CHANGE"),
+    ]
+    prompts: list[str] = []
+
+    def respond(_url, **kwargs) -> httpx.Response:
+        prompt = kwargs["json"]["messages"][1]["content"]
+        prompts.append(prompt)
+        if "A_CHANGE" in prompt and "B_CHANGE" in prompt:
+            return _capped_completion(
+                json.dumps({"findings": [_finding("src/a.py", "capped-bug")]}),
+            )
+        if "A_CHANGE" in prompt:
+            return _completion(json.dumps({"findings": [_finding("src/a.py", "a-bug")]}))
+        return _completion(json.dumps({"findings": []}))
+
+    with patch.object(httpx, "post", side_effect=respond):
+        out = review_diff(hunks, installation_id=2)
+
+    assert out.kind == "reviewed", out.error
+    assert out.error == ""
+    assert {finding.rule for finding in out.findings} == {"capped-bug", "a-bug"}
+    assert out.coverage is not None
+    assert out.coverage.capped_cohorts == ()
+    assert out.coverage.reviewed_paths == ("src/a.py", "src/b.py")
+    single_file = [p for p in prompts if ("A_CHANGE" in p) != ("B_CHANGE" in p)]
+    assert len(single_file) == 2, "each file chunk is one model call"
+
+
+def test_a_capped_file_chunk_keeps_the_parent_finding_and_stays_partial() -> None:
+    """A file chunk that fails after the split falls back to the capped
+    answer for that file: its finding survives and the review stays partial."""
+    hunks = [Hunk(path="a.py", body="+a"), Hunk(path="b.py", body="+b")]
+    plan = lc.plan_review(
+        hunks, max_cohort_chars=8000, max_cohort_paths=5, max_cohorts=10,
+    )
+    finding = lc.Finding(path="b.py", line=1, rule="b-bug", severity="medium", message="m")
+    capped = LlmReviewResponse(
+        kind="reviewed", findings=(finding,),
+        backend_used=Backend.CAVE, model_name="coder",
+        error=lc._truncation_error((Backend.CAVE,)),
+    )
+    chunks = {0: lc._file_chunks(plan.cohorts[0], hunks)}
+    sub = [
+        LlmReviewResponse(kind="reviewed", backend_used=Backend.CAVE, model_name="coder"),
+        LlmReviewResponse(kind="all_failed", error="down"),
+    ]
+    spliced_plan, spliced = lc._splice_file_chunks(plan, [capped], chunks, sub)
+    out = lc._merge_cohort_responses(spliced, 1, None, spliced_plan)
+    assert [finding.rule for finding in out.findings] == ["b-bug"]
+    assert out.error.startswith("partial review:")
+    assert out.coverage is not None
+    assert out.coverage.capped_cohorts == (2,)
+    assert out.coverage.reviewed_paths == ("a.py", "b.py")
+
+
+def test_a_capped_single_file_cohort_is_named_in_the_coverage_line() -> None:
+    """One file cannot be split smaller, so the review stays partial, and the
+    summary now says why instead of a bare "1/1 cohorts completed"."""
+    plan = lc.plan_review(
+        [Hunk(path="a.py", body="+a")],
+        max_cohort_chars=8000, max_cohort_paths=1, max_cohorts=10,
+    )
+    responses = [
+        LlmReviewResponse(
+            kind="reviewed", backend_used=Backend.CAVE, model_name="coder",
+            error=lc._truncation_error((Backend.CAVE,)),
+        ),
+    ]
+    out = lc._merge_cohort_responses(responses, 1, None, plan)
+    assert out.error.startswith("partial review:")
+    evaluation = evaluate_diff((), out)
+    assert evaluation.degraded_reason == "partial_review"
+    _title, summary = cr_dispatch._summary_markdown(evaluation, review_phase="tier1")
+    assert "Coverage: 1/1 cohorts completed; hit the token cap: 1." in summary
