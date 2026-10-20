@@ -97,44 +97,54 @@ def _id_or_404(learning_id: str) -> str:
     return learning_id
 
 
+# String fields copied into the view as-is ("" when absent).
+_VIEW_STR_FIELDS = (
+    "id", "text", "created_at", "last_used_at", "supersedes", "superseded_by",
+    "approved_by", "approved_at",
+)
+
+
+def _text(row: dict[str, Any], key: str) -> str:
+    return str(row.get(key) or "")
+
+
+def _source(row: dict[str, Any], repo: str) -> dict[str, Any]:
+    """Provenance: the PR and review thread the learning was taught in."""
+    pr = int(row.get("source_pr") or 0)
+    comment_id = int(row.get("source_comment_id") or 0)
+    thread_url = f"https://github.com/{repo}/pull/{pr}" if repo and pr else ""
+    if thread_url and comment_id:
+        thread_url += f"#discussion_r{comment_id}"
+    return {
+        "pr": pr, "comment_id": comment_id,
+        "author": _text(row, "author"), "thread_url": thread_url,
+    }
+
+
+def _updated_at(row: dict[str, Any], history: list[dict[str, Any]]) -> str:
+    """The last lifecycle change, else the last re-teach, else creation."""
+    last_change = str(history[-1].get("at") or "") if history else ""
+    return last_change or _text(row, "reinforced_at") or _text(row, "created_at")
+
+
 def _view(row: dict[str, Any]) -> dict[str, Any]:
     """The operator's view of one learning: scope, the deterministic
     matcher, provenance, lifecycle, usage, and history."""
-    repo = str(row.get("repo", ""))
-    pr = int(row.get("source_pr") or 0)
-    comment_id = int(row.get("source_comment_id") or 0)
-    thread_url = ""
-    if repo and pr:
-        thread_url = f"https://github.com/{repo}/pull/{pr}"
-        if comment_id:
-            thread_url += f"#discussion_r{comment_id}"
+    repo = _text(row, "repo")
     history = list(row.get("history") or [])
-    scope_path = str(row.get("scope_path", "") or "")
+    scope_path = _text(row, "scope_path")
     return {
-        "id": str(row.get("id", "")),
-        "text": str(row.get("text", "")),
+        **{key: _text(row, key) for key in _VIEW_STR_FIELDS},
         "repo": repo,
         "status": effective_status(row),
         "scope": {"kind": "repo", "repo": repo, "org": repo.split("/", 1)[0]},
         "scope_path": scope_path,
         "matcher": {"glob": scope_path, "repo_wide": not scope_path, "engine": "fnmatchcase"},
-        "source": {
-            "pr": pr, "comment_id": comment_id,
-            "author": str(row.get("author", "") or ""), "thread_url": thread_url,
-        },
-        "created_at": str(row.get("created_at", "") or ""),
-        "updated_at": str(
-            (history[-1].get("at") if history else "")
-            or row.get("reinforced_at") or row.get("created_at") or ""
-        ),
+        "source": _source(row, repo),
+        "updated_at": _updated_at(row, history),
         "usage_count": int(row.get("usage_count") or 0),
-        "last_used_at": str(row.get("last_used_at", "") or ""),
         "version": int(row.get("version") or 1),
-        "supersedes": str(row.get("supersedes", "") or ""),
-        "superseded_by": str(row.get("superseded_by", "") or ""),
         "conflicts_with": list(row.get("conflicts_with") or []),
-        "approved_by": str(row.get("approved_by", "") or ""),
-        "approved_at": str(row.get("approved_at", "") or ""),
         "history": history,
     }
 

@@ -145,27 +145,42 @@ def select_for_prompt(rows: list[dict[str, Any]]) -> Selection:
     contradictory rules or dropping one silently."""
     active = [r for r in rows if effective_status(r) == STATUS_ACTIVE]
     by_id = {_row_id(r): r for r in active}
+    drop = _supersede_drops(active, by_id)
+    for lose_id, entry in _conflict_drops(active, by_id).items():
+        drop.setdefault(lose_id, entry)
+    selected = [r for r in active if _row_id(r) not in drop]
+    suppressed = [drop[_row_id(r)] for r in active if _row_id(r) in drop]
+    return Selection(selected=selected, suppressed=suppressed)
+
+
+def _supersede_drops(
+    active: list[dict[str, Any]], by_id: dict[str, dict[str, Any]],
+) -> dict[str, dict[str, str]]:
+    """Active predecessors of an active successor: the successor wins."""
     drop: dict[str, dict[str, str]] = {}
     for row in active:
         rid = _row_id(row)
         old = str(row.get("supersedes") or "")
-        if old and old in by_id and old != rid:
+        if old in by_id and old != rid:
             drop.setdefault(old, {"id": old, "reason": "superseded", "kept": rid})
+    return drop
+
+
+def _conflict_drops(
+    active: list[dict[str, Any]], by_id: dict[str, dict[str, Any]],
+) -> dict[str, dict[str, str]]:
+    """For each declared conflict between two active rows, the older one.
+    Ties break on id so the choice is deterministic."""
+    drop: dict[str, dict[str, str]] = {}
     for row in active:
         rid = _row_id(row)
-        for other in row.get("conflicts_with") or []:
-            other = str(other)
+        for other in (str(o) for o in row.get("conflicts_with") or []):
             if other == rid or other not in by_id:
                 continue
-            a, b = row, by_id[other]
-            # Newer wins; ties break on id so the choice is deterministic.
-            keep, lose = (a, b) if (_recency(a), _row_id(a)) >= (_recency(b), _row_id(b)) else (b, a)
-            lose_id = _row_id(lose)
-            if lose_id not in drop:
-                drop[lose_id] = {"id": lose_id, "reason": "conflict", "kept": _row_id(keep)}
-    selected = [r for r in active if _row_id(r) not in drop]
-    suppressed = [drop[_row_id(r)] for r in active if _row_id(r) in drop]
-    return Selection(selected=selected, suppressed=suppressed)
+            pair = sorted((row, by_id[other]), key=lambda r: (_recency(r), _row_id(r)))
+            lose_id, keep_id = _row_id(pair[0]), _row_id(pair[1])
+            drop.setdefault(lose_id, {"id": lose_id, "reason": "conflict", "kept": keep_id})
+    return drop
 
 
 # --- export / import --------------------------------------------------------
@@ -236,63 +251,76 @@ def plan_import(
 ) -> ImportPlan:
     """Validate and deduplicate an export document without writing."""
     plan = ImportPlan()
-    if not isinstance(doc, dict) or doc.get("format") != EXPORT_FORMAT:
-        plan.errors.append(f"not a {EXPORT_FORMAT} document")
-        return plan
-    if doc.get("version") != EXPORT_VERSION:
-        plan.errors.append(f"unsupported version {doc.get('version')!r}; expected {EXPORT_VERSION}")
-        return plan
-    learnings = doc.get("learnings")
-    if not isinstance(learnings, list):
-        plan.errors.append("learnings must be a list")
-        return plan
-    repo, err = _resolve_repo(learnings, target_repo)
+    learnings, err = _document_learnings(doc)
+    if not err:
+        plan.repo, err = _resolve_repo(learnings, target_repo)
     if err:
         plan.errors.append(err)
         return plan
-    plan.repo = repo
     seen: set[str] = set()
-    for index, raw in enumerate(learnings):
-        entry: dict[str, Any] = {"index": index}
-        if not isinstance(raw, dict):
-            plan.items.append({**entry, "action": "invalid", "reason": "not an object"})
-            continue
-        text = str(raw.get("text", "")).strip()
-        scope = str(raw.get("scope_path", "") or "")
-        reason = None
-        if not text:
-            reason = "empty text"
-        elif len(text) > MAX_TEXT_CHARS:
-            reason = f"text longer than {MAX_TEXT_CHARS} characters"
-        else:
-            reason = validate_scope_path(scope)
-        if reason:
-            plan.items.append({**entry, "action": "invalid", "reason": reason, "text": text[:120]})
-            continue
-        lid = learning_id(text)
-        entry["id"] = lid
-        if lid in existing_ids:
-            plan.items.append({**entry, "action": "duplicate", "reason": "already on this instance"})
-            continue
-        if lid in seen:
-            plan.items.append({**entry, "action": "duplicate", "reason": "repeated in the document"})
-            continue
-        seen.add(lid)
-        conflicts = raw.get("conflicts_with") or []
-        plan.items.append({
-            **entry,
-            "action": "create",
-            "learning": {
-                "text": text,
-                "repo": repo,
-                "scope_path": scope,
-                "source_pr": _int_or_zero(raw.get("source_pr")),
-                "source_comment_id": _int_or_zero(raw.get("source_comment_id")),
-                "author": str(raw.get("author", "") or ""),
-                "created_at": str(raw.get("created_at", "") or ""),
-                "supersedes": str(raw.get("supersedes", "") or ""),
-                "conflicts_with": [str(c) for c in conflicts if isinstance(c, str)]
-                if isinstance(conflicts, list) else [],
-            },
-        })
+    plan.items = [
+        _plan_item(index, raw, plan.repo, existing_ids, seen)
+        for index, raw in enumerate(learnings)
+    ]
     return plan
+
+
+def _document_learnings(doc: Any) -> tuple[list[Any], str | None]:
+    """The document's learnings list, or the reason it is not importable."""
+    if not isinstance(doc, dict) or doc.get("format") != EXPORT_FORMAT:
+        return [], f"not a {EXPORT_FORMAT} document"
+    if doc.get("version") != EXPORT_VERSION:
+        return [], f"unsupported version {doc.get('version')!r}; expected {EXPORT_VERSION}"
+    learnings = doc.get("learnings")
+    if not isinstance(learnings, list):
+        return [], "learnings must be a list"
+    return learnings, None
+
+
+def _invalid_reason(raw: Any) -> str | None:
+    """Why one exported learning cannot be imported, or None."""
+    if not isinstance(raw, dict):
+        return "not an object"
+    text = str(raw.get("text", "")).strip()
+    if not text:
+        return "empty text"
+    if len(text) > MAX_TEXT_CHARS:
+        return f"text longer than {MAX_TEXT_CHARS} characters"
+    return validate_scope_path(str(raw.get("scope_path", "") or ""))
+
+
+def _portable_learning(raw: dict[str, Any], repo: str) -> dict[str, Any]:
+    """The fields of one valid exported learning that an import writes."""
+    conflicts = raw.get("conflicts_with")
+    return {
+        "text": str(raw.get("text", "")).strip(),
+        "repo": repo,
+        "scope_path": str(raw.get("scope_path", "") or ""),
+        "source_pr": _int_or_zero(raw.get("source_pr")),
+        "source_comment_id": _int_or_zero(raw.get("source_comment_id")),
+        "author": str(raw.get("author", "") or ""),
+        "created_at": str(raw.get("created_at", "") or ""),
+        "supersedes": str(raw.get("supersedes", "") or ""),
+        "conflicts_with": [c for c in conflicts if isinstance(c, str)]
+        if isinstance(conflicts, list) else [],
+    }
+
+
+def _plan_item(
+    index: int, raw: Any, repo: str, existing_ids: set[str], seen: set[str],
+) -> dict[str, Any]:
+    """One row of the plan: create, duplicate or invalid. Adds a created id
+    to `seen`, so a later repeat in the same document is a duplicate."""
+    reason = _invalid_reason(raw)
+    if reason:
+        text = str(raw.get("text", "")).strip()[:120] if isinstance(raw, dict) else ""
+        return {"index": index, "action": "invalid", "reason": reason, "text": text}
+    learning = _portable_learning(raw, repo)
+    lid = learning_id(learning["text"])
+    entry: dict[str, Any] = {"index": index, "id": lid}
+    if lid in existing_ids:
+        return {**entry, "action": "duplicate", "reason": "already on this instance"}
+    if lid in seen:
+        return {**entry, "action": "duplicate", "reason": "repeated in the document"}
+    seen.add(lid)
+    return {**entry, "action": "create", "learning": learning}

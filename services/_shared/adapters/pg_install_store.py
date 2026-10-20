@@ -1283,7 +1283,7 @@ def _learning_data(row: Mapping[str, Any]) -> dict[str, Any]:
 
 def _lock_learning(conn: Any, repo: str, learning_id: str) -> Optional[Learning]:
     row = conn.execute(
-        f"SELECT pk, sk, data FROM grug_kv WHERE pk = %s AND sk = %s AND {TTL_LIVE} "
+        f"SELECT pk, sk, data FROM grug_kv WHERE pk = %s AND sk = %s AND {TTL_LIVE} "  # noqa: S608 - TTL_LIVE is a fixed pg_base clause, not input
         "FOR UPDATE",
         (_learning_pk(repo), _learning_sk(learning_id)),
     ).fetchone()
@@ -1317,7 +1317,7 @@ def list_learning_repos() -> list[str]:
             f"""
             SELECT DISTINCT pk FROM grug_kv
             WHERE pk LIKE 'LEARN#%%' AND sk LIKE 'LEARNING#%%' AND {TTL_LIVE}
-            """,
+            """,  # noqa: S608 - TTL_LIVE is a fixed pg_base clause, not input
         ).fetchall()
     return sorted(pk.split("#", 1)[1] for (pk,) in rows)
 
@@ -1357,6 +1357,94 @@ def set_learning_status(
     return cast("Learning", out)
 
 
+def _validated_edit_text(text: str | None, scope_path: str | None) -> str | None:
+    """The stripped new text (None = unchanged). Raises ValueError on a
+    scope or text that no learning may carry."""
+    from cave_drawings import MAX_TEXT_CHARS, validate_scope_path
+
+    reason = validate_scope_path(scope_path) if scope_path is not None else None
+    if reason:
+        raise ValueError(reason)
+    new_text = text.strip() if text is not None else None
+    if new_text is not None and not (0 < len(new_text) <= MAX_TEXT_CHARS):
+        raise ValueError(f"text must be 1..{MAX_TEXT_CHARS} characters")
+    return new_text
+
+
+def _in_place_changes(
+    row: Learning, scope_path: str | None, conflicts_with: list[str] | None,
+) -> tuple[dict[str, Any], dict[str, Any]]:
+    """The row with its new scope and conflict links, and a record of what
+    actually changed (for the history entry)."""
+    changes: dict[str, Any] = {}
+    out: dict[str, Any] = dict(row)
+    if scope_path is not None and scope_path != row.get("scope_path", ""):
+        changes["scope_path"] = {"from": row.get("scope_path", ""), "to": scope_path}
+        out["scope_path"] = scope_path
+    if conflicts_with is not None:
+        links = sorted(set(conflicts_with))
+        if links != sorted(row.get("conflicts_with") or []):
+            changes["conflicts_with"] = links
+        out["conflicts_with"] = links
+    return out, changes
+
+
+def _clear_expired_learning(conn: Any, repo: str, learning_id: str) -> None:
+    """An expired row is gone as far as every read is concerned; delete it
+    so it cannot block an insert under the same key."""
+    conn.execute(
+        f"DELETE FROM grug_kv WHERE pk = %s AND sk = %s AND NOT {TTL_LIVE}",  # noqa: S608 - TTL_LIVE is a fixed pg_base clause, not input
+        (_learning_pk(repo), _learning_sk(learning_id)),
+    )
+
+
+def _supersede_learning(
+    conn: Any, repo: str, row: Learning, edited: dict[str, Any],
+    *, new_text: str, actor: str, changes: dict[str, Any],
+) -> dict[str, Any]:
+    """Insert the successor of `row` carrying `new_text`, and retire `row`
+    as superseded. Both rows keep the full history."""
+    from cave_drawings import STATUS_SUPERSEDED, effective_status, learning_id as _lid
+
+    old_id = str(row.get("id", ""))
+    new_id = _lid(new_text)
+    if _lock_learning(conn, repo, new_id) is not None:
+        raise ValueError("a learning with that text already exists")
+    history = list(row.get("history") or [])
+    successor: dict[str, Any] = {
+        **_learning_data(edited),
+        "text": new_text,
+        # The successor keeps the predecessor's state: editing a pending
+        # rule does not approve it, editing a disabled one does not switch
+        # it back on.
+        "status": effective_status(cast("dict[str, Any]", row)),
+        "version": int(row.get("version") or 1) + 1,
+        "supersedes": old_id,
+        "reinforced_at": _now_iso(),
+        "usage_count": 0,
+        "last_used_at": "",
+        "last_used_review": "",
+        "history": [*history, _history_entry(
+            "edited", actor, previous_id=old_id,
+            previous_text=row.get("text", ""), changes=changes,
+        )],
+    }
+    successor.pop("superseded_by", None)
+    _clear_expired_learning(conn, repo, new_id)
+    conn.execute(
+        "INSERT INTO grug_kv (pk, sk, data, ttl) VALUES (%s, %s, %s, %s)",
+        (_learning_pk(repo), _learning_sk(new_id), encode_attrs(successor), _learning_ttl()),
+    )
+    retired: dict[str, Any] = {
+        **row,
+        "status": STATUS_SUPERSEDED,
+        "superseded_by": new_id,
+        "history": [*history, _history_entry("superseded", actor, superseded_by=new_id)],
+    }
+    _write_learning(conn, repo, old_id, retired)
+    return {**successor, "id": new_id}
+
+
 def edit_learning(
     repo: str,
     learning_id: str,
@@ -1371,86 +1459,29 @@ def edit_learning(
     `supersedes`, a bumped version and the full history, and the old row
     becomes `superseded` (kept, never injected). One transaction.
     Raises LookupError when missing, ValueError on invalid input."""
-    from cave_drawings import (
-        MAX_TEXT_CHARS, STATUS_SUPERSEDED, effective_status,
-        learning_id as _lid, validate_scope_path,
-    )
+    from cave_drawings import STATUS_SUPERSEDED, effective_status
 
-    if scope_path is not None:
-        reason = validate_scope_path(scope_path)
-        if reason:
-            raise ValueError(reason)
-    new_text = text.strip() if text is not None else None
-    if new_text is not None and not (0 < len(new_text) <= MAX_TEXT_CHARS):
-        raise ValueError(f"text must be 1..{MAX_TEXT_CHARS} characters")
+    new_text = _validated_edit_text(text, scope_path)
     with get_pool().connection() as conn, conn.transaction():
         row = _lock_learning(conn, repo, learning_id)
         if row is None:
             raise LookupError(learning_id)
-        status = effective_status(cast("dict[str, Any]", row))
-        if status == STATUS_SUPERSEDED:
+        if effective_status(cast("dict[str, Any]", row)) == STATUS_SUPERSEDED:
             raise ValueError("a superseded learning is history; edit its successor")
-        if conflicts_with is not None:
-            for other in conflicts_with:
-                if other == learning_id or _lock_learning(conn, repo, other) is None:
-                    raise ValueError(f"conflicts_with names an unknown learning {other!r}")
-        changes: dict[str, Any] = {}
-        out: dict[str, Any] = dict(row)
-        if scope_path is not None and scope_path != row.get("scope_path", ""):
-            changes["scope_path"] = {"from": row.get("scope_path", ""), "to": scope_path}
-            out["scope_path"] = scope_path
-        if conflicts_with is not None:
-            links = sorted(set(conflicts_with))
-            if links != sorted(row.get("conflicts_with") or []):
-                changes["conflicts_with"] = links
-            out["conflicts_with"] = links
-        if new_text is None or new_text == row.get("text"):
-            if changes:
-                out["history"] = [
-                    *(row.get("history") or []), _history_entry("edited", actor, changes=changes),
-                ]
-                _write_learning(conn, repo, learning_id, out)
-            return cast("Learning", out)
-        new_id = _lid(new_text)
-        if _lock_learning(conn, repo, new_id) is not None:
-            raise ValueError("a learning with that text already exists")
-        now = _now_iso()
-        successor: dict[str, Any] = {
-            **_learning_data(out),
-            "text": new_text,
-            # The successor keeps the predecessor's state: editing a pending
-            # rule does not approve it, editing a disabled one does not
-            # switch it back on.
-            "status": status,
-            "version": int(row.get("version") or 1) + 1,
-            "supersedes": learning_id,
-            "reinforced_at": now,
-            "usage_count": 0,
-            "last_used_at": "",
-            "last_used_review": "",
-            "history": [
-                *(row.get("history") or []),
-                _history_entry(
-                    "edited", actor, previous_id=learning_id,
-                    previous_text=row.get("text", ""), changes=changes,
-                ),
-            ],
-        }
-        successor.pop("superseded_by", None)
-        conn.execute(
-            "INSERT INTO grug_kv (pk, sk, data, ttl) VALUES (%s, %s, %s, %s)",
-            (_learning_pk(repo), _learning_sk(new_id), encode_attrs(successor), _learning_ttl()),
-        )
-        retired: dict[str, Any] = dict(row)
-        retired["status"] = STATUS_SUPERSEDED
-        retired["superseded_by"] = new_id
-        retired["history"] = [
-            *(row.get("history") or []),
-            _history_entry("superseded", actor, superseded_by=new_id),
-        ]
-        _write_learning(conn, repo, learning_id, retired)
-    successor["id"] = new_id
-    return cast("Learning", successor)
+        for other in conflicts_with or []:
+            if other == learning_id or _lock_learning(conn, repo, other) is None:
+                raise ValueError(f"conflicts_with names an unknown learning {other!r}")
+        out, changes = _in_place_changes(row, scope_path, conflicts_with)
+        if new_text is not None and new_text != row.get("text"):
+            return cast("Learning", _supersede_learning(
+                conn, repo, row, out, new_text=new_text, actor=actor, changes=changes,
+            ))
+        if changes:
+            out["history"] = [
+                *(row.get("history") or []), _history_entry("edited", actor, changes=changes),
+            ]
+            _write_learning(conn, repo, learning_id, out)
+    return cast("Learning", out)
 
 
 def delete_learning(repo: str, learning_id: str) -> bool:
@@ -1483,12 +1514,7 @@ def import_learnings(
                 text = str(item.get("text", "")).strip()
                 lid = _lid(text)
                 pk, sk = _learning_pk(repo), _learning_sk(lid)
-                # An expired row is gone as far as every read is concerned;
-                # clear it so it cannot block the insert.
-                conn.execute(
-                    f"DELETE FROM grug_kv WHERE pk = %s AND sk = %s AND NOT {TTL_LIVE}",
-                    (pk, sk),
-                )
+                _clear_expired_learning(conn, repo, lid)
                 data: dict[str, Any] = {
                     "text": text,
                     "repo": repo,
@@ -1537,7 +1563,7 @@ def record_learning_usage(
             )
             WHERE pk = %(pk)s AND sk = ANY(%(sks)s) AND {TTL_LIVE}
               AND COALESCE(data->>'last_used_review', '') <> %(key)s
-            """,
+            """,  # noqa: S608 - TTL_LIVE is a fixed pg_base clause, not input
             {
                 "now": _now_iso(),
                 "key": review_key,

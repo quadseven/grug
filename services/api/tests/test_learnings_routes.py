@@ -75,33 +75,40 @@ def test_list_rejects_a_malformed_repo_or_status(api):
     assert e.value.status_code == 400
 
 
-def test_inspect_edit_disable_approve_delete(api, store):
+def _status_code(call, *args) -> int:
+    with pytest.raises(HTTPException) as e:
+        call(*args, user=_admin())
+    return e.value.status_code
+
+
+def test_inspect_returns_the_view_or_404(api, store):
     lid = _teach(store, "rule v1")
     assert api.get_learning("o", "r", lid, user=_admin())["text"] == "rule v1"
-    with pytest.raises(HTTPException) as e:
-        api.get_learning("o", "r", "000000000000", user=_admin())
-    assert e.value.status_code == 404
+    assert _status_code(api.get_learning, "o", "r", "000000000000") == 404
 
+
+def test_edit_text_supersedes_and_rejects_an_invalid_scope(api, store):
+    lid = _teach(store, "rule v1")
     edited = api.patch_learning("o", "r", lid, api.LearningPatch(text="rule v2"), user=_admin())
-    new_id = edited["id"]
-    assert edited["supersedes"] == lid and edited["version"] == 2
+    assert (edited["supersedes"], edited["version"]) == (lid, 2)
     old = api.get_learning("o", "r", lid, user=_admin())
-    assert old["status"] == cd.STATUS_SUPERSEDED and old["superseded_by"] == new_id
+    assert (old["status"], old["superseded_by"]) == (cd.STATUS_SUPERSEDED, edited["id"])
+    bad = api.LearningPatch(scope_path="/abs")
+    assert _status_code(api.patch_learning, "o", "r", edited["id"], bad) == 400
 
-    with pytest.raises(HTTPException) as e:
-        api.patch_learning("o", "r", new_id, api.LearningPatch(scope_path="/abs"), user=_admin())
-    assert e.value.status_code == 400
 
+def test_disable_approve_and_a_superseded_row_stays_retired(api, store):
+    lid = _teach(store, "rule v1")
+    new_id = api.patch_learning("o", "r", lid, api.LearningPatch(text="rule v2"), user=_admin())["id"]
     assert api.disable_learning("o", "r", new_id, user=_admin())["status"] == "disabled"
     assert api.approve_learning("o", "r", new_id, user=_admin())["status"] == "active"
-    with pytest.raises(HTTPException) as e:
-        api.approve_learning("o", "r", lid, user=_admin())  # superseded
-    assert e.value.status_code == 409
+    assert _status_code(api.approve_learning, "o", "r", lid) == 409
 
-    assert api.delete_learning("o", "r", new_id, user=_admin()) == {"deleted": True, "id": new_id}
-    with pytest.raises(HTTPException) as e:
-        api.delete_learning("o", "r", new_id, user=_admin())
-    assert e.value.status_code == 404
+
+def test_delete_then_404(api, store):
+    lid = _teach(store, "rule")
+    assert api.delete_learning("o", "r", lid, user=_admin()) == {"deleted": True, "id": lid}
+    assert _status_code(api.delete_learning, "o", "r", lid) == 404
 
 
 def test_preview_lists_exactly_the_matching_files(api):
