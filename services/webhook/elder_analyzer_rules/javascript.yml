@@ -1,0 +1,58 @@
+# Elder analyzer rules for JavaScript and TypeScript (#1254).
+#
+# Run by personas/code_reviewer/analyzers.py through Opengrep (LGPL-2.1) with
+# `--config <this dir>`, offline. These are MECHANICAL markings - a pattern
+# either matches or it does not - so they skip the exploitability judge and
+# publish as advisory Elder Markings, never as a blocking verdict.
+#
+# Hand-written on purpose: the semgrep community registry is licensed for
+# internal use only and forbids offering its rules as a service, so grug may
+# not vendor or run it (see lint.py). Every rule id starts `elder-` and must be
+# pinned by a planted case in tests/test_elder_analyzer_rules.py.
+#
+# A repo silences one line with `// nosemgrep: <rule id>` and whole paths with
+# its own `.semgrepignore`; the runner honors both.
+rules:
+  - id: elder-js-unescaped-html-sink
+    languages: [javascript, typescript]
+    severity: WARNING
+    message: >-
+      Unescaped HTML sink - a non-literal value is written as HTML, so any
+      markup in it is parsed and run. Set textContent, or escape or sanitize
+      the value first.
+    patterns:
+      - pattern-either:
+          - pattern: $EL.innerHTML = $V
+          - pattern: $EL.outerHTML = $V
+          - pattern: $EL.innerHTML += $V
+          - pattern: $EL.insertAdjacentHTML($POS, $V)
+          - pattern: document.write($V)
+          - pattern: document.writeln($V)
+      - pattern-not: $EL.innerHTML = "..."
+      - pattern-not: $EL.outerHTML = "..."
+      - pattern-not: $EL.innerHTML += "..."
+      - pattern-not: $EL.insertAdjacentHTML($POS, "...")
+      - pattern-not: document.write("...")
+      - pattern-not: document.writeln("...")
+
+  - id: elder-js-dynamic-eval
+    languages: [javascript, typescript]
+    severity: WARNING
+    message: >-
+      Dynamic code evaluation - eval, new Function or a string passed to a
+      timer runs text as code. Call a function directly instead.
+    pattern-either:
+      - pattern: eval($X)
+      - pattern: new Function(...)
+      - pattern: setTimeout("...", ...)
+      - pattern: setInterval("...", ...)
+
+  - id: elder-js-react-dangerous-html
+    languages: [javascript, typescript]
+    severity: WARNING
+    message: >-
+      dangerouslySetInnerHTML with a non-literal value - React stops escaping
+      it. Sanitize the HTML first, or render it as text.
+    patterns:
+      - pattern: '<$TAG dangerouslySetInnerHTML={{__html: $V}} />'
+      - pattern-not: '<$TAG dangerouslySetInnerHTML={{__html: "..."}} />'

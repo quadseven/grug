@@ -267,6 +267,11 @@ spec:
             # workloads, same shape as GRUG_SAST_ENGINE above. The ruff CLI
             # ships in the image (services/webhook/requirements.txt).
             - {name: GRUG_LINT_EVIDENCE, value: ruff}
+            # Elder's analyzer set (#1254): engines matched by language -
+            # ruff for Python, opengrep over grug's own elder_analyzer_rules/
+            # for JavaScript/TypeScript. Each is time-capped and degrades to a
+            # skip; findings are advisory. Unset runs none.
+            - {name: GRUG_ELDER_ANALYZERS, value: "ruff,opengrep"}
             # Smasher Trial (#469): global master kill switch (default OFF - the
             # SSM param is absent/false until the operator opts in) + the image
             # the sandbox Job runs (the SAME webhook image, so personas.smasher
