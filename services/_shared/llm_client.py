@@ -5751,6 +5751,21 @@ def _ladder_failure_reason(outcome: AttemptOutcome) -> str | None:
 _DIRECT_BACKENDS = frozenset({Backend.OPENROUTER, Backend.POOLSIDE, Backend.OPENCODE_GO})
 
 
+def _begin_direct_call(backend: Backend, config: BackendConfig) -> int | None:
+    """Show a direct call on the gateway page while it runs (`call_report`).
+    Returns the token `call_report.end` takes, or None. Never raises."""
+    if backend not in _DIRECT_BACKENDS:
+        return None
+    try:
+        job = _SPARK_JOB.get()
+        return call_report.begin(
+            backend=backend.value, model=config.model, job=job.job if job is not None else None,
+        )
+    except Exception as e:  # noqa: BLE001 - the page must never break a review
+        log.debug("call_report_begin_failed", extra={"kind": type(e).__name__})
+        return None
+
+
 def _report_direct_call(
     backend: Backend, config: BackendConfig, outcome: "AttemptOutcome", latency_s: float,
 ) -> None:
@@ -5809,13 +5824,17 @@ def _run_llm_attempt(
             span_context=None, raw_response=None,
         )
     started = time.monotonic()
-    outcome = _call_llm_attempt(
-        backend=backend, config=config, messages=messages, variant=variant,
-        pr_tags=pr_tags, cancel_event=cancel_event,
-        transport_log_event=transport_log_event,
-        span_name=span_name, success_kind=success_kind,
-        response_parser=response_parser,
-    )
+    running = _begin_direct_call(backend, config) if report_direct_call else None
+    try:
+        outcome = _call_llm_attempt(
+            backend=backend, config=config, messages=messages, variant=variant,
+            pr_tags=pr_tags, cancel_event=cancel_event,
+            transport_log_event=transport_log_event,
+            span_name=span_name, success_kind=success_kind,
+            response_parser=response_parser,
+        )
+    finally:
+        call_report.end(running)
     if report_direct_call:
         _report_direct_call(backend, config, outcome, time.monotonic() - started)
     trail = _LADDER_TRAIL.get()
