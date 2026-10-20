@@ -673,3 +673,110 @@ def test_named_ticket_numbers_is_the_set_the_epic_check_reads():
     body = "Refs #42\nPart of #3\nFixes #42\nBlocked by #9\n`Refs #77`"
     assert named_ticket_numbers(body) == [3, 42]
     assert named_ticket_numbers("") == []
+
+
+# --- An unfilled template must not pass through its HTML comments ---
+#
+# The #20 defect (an unfilled template passes) came back through comments:
+# guidance text and example bullets inside `<!-- -->` are invisible on the
+# rendered PR, yet they counted as section content. This fixture is the
+# shape of a real deploy repo's template, left exactly as a PR opens it.
+_UNFILLED_COMMENTED_TEMPLATE = """\
+<!--
+The plan check is BLOCKING on this repo. Keep ALL sections below or the
+PR will not merge.
+-->
+
+Refs #<!-- issue number; never a closing keyword -->
+Part of #<!-- epic number -->
+
+## Why
+<!-- 1-3 sentences. The motivation, not the diff. At least 5 words. -->
+
+## What changed
+<!-- Bulleted list of substantive edits. -->
+-
+
+## Acceptance criteria
+<!--
+At least 3 bullets describing observable post-merge state. DELETE this
+comment AND write real bullets, not empty placeholders.
+
+Example:
+- [x] `git grep` for the old import returns zero matches
+- [ ] Next scheduled run reads its state from the new path
+- [ ] No regressions in the nightly job (verify next 24h)
+-->
+
+## Out of scope
+<!-- Things deliberately not done in this PR. At least 1 bullet. -->
+-
+
+**Size:** <!-- XS | S | M | L | XL -->
+"""
+
+
+def test_why_ignores_html_comment_guidance():
+    r = check_why(_UNFILLED_COMMENTED_TEMPLATE)
+    assert not r.passed, r.detail
+
+
+def test_acceptance_ignores_example_bullets_inside_a_comment():
+    r = check_acceptance(_UNFILLED_COMMENTED_TEMPLATE)
+    assert not r.passed, r.detail
+    assert "0 non-empty bullets" in r.detail
+
+
+def test_scope_fence_ignores_comment_and_bare_dash():
+    r = check_scope_fence(_UNFILLED_COMMENTED_TEMPLATE)
+    assert not r.passed, r.detail
+
+
+def test_scope_fence_bare_dash_is_empty():
+    assert not check_scope_fence("## Out of scope\n\n-").passed
+
+
+@pytest.mark.parametrize("size_line", ["**Size:** S", "Size: M", "**Size:**", "_Size_: xs"])
+def test_scope_fence_does_not_count_a_trailing_size_line(size_line):
+    # Templates put the size label after the last section, inside the fence.
+    assert not check_scope_fence(f"## Out of scope\n-\n\n{size_line}\n").passed
+    assert check_scope_fence(f"## Out of scope\n- Deferred.\n\n{size_line}\n").passed
+
+
+@pytest.mark.parametrize("placeholder", ["-", "*", "- [ ]", "- [x]", "* [X]", "  -  "])
+def test_placeholder_only_lines_count_no_words(placeholder):
+    assert not check_scope_fence(f"## Out of scope\n{placeholder}\n").passed
+    assert not check_why(f"## Why\n{placeholder}\n{placeholder}\n").passed
+
+
+@pytest.mark.parametrize("body", [
+    "Size: <!-- S -->",
+    "<!-- Size: S -->",
+    "<!--\nPick one, e.g. **Size:** M\n-->\n",
+])
+def test_estimate_ignores_size_inside_a_comment(body):
+    assert not check_estimate(body).passed
+
+
+def test_heading_inside_a_comment_is_not_a_section():
+    body = "<!--\n## Why\nthis guidance text is long enough here\n-->\n"
+    assert not check_why(body).passed
+
+
+def test_unterminated_comment_hides_the_rest_of_the_body():
+    # GitHub renders an unclosed `<!--` as hiding everything after it.
+    body = "## Why\n<!-- guidance that never closes\nwe need this for the launch"
+    assert not check_why(body).passed
+
+
+def test_real_text_next_to_a_comment_still_counts():
+    body = (
+        "## Why\n<!-- guidance -->\nWe need this for the launch tomorrow.\n\n"
+        "## Acceptance criteria\n<!-- 3 bullets -->\n- one\n- [x] two\n- [ ] three\n\n"
+        "## Out of scope\n<!-- what not -->\n- Deferred.\n\n"
+        "Size: <!-- pick one --> S\n"
+    )
+    assert check_why(body).passed
+    assert check_acceptance(body).passed
+    assert check_scope_fence(body).passed
+    assert check_estimate(body).passed
