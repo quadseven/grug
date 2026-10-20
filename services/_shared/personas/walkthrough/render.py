@@ -19,7 +19,7 @@ from personas.walkthrough.effort import ReviewEffort, effort_label
 MARKER = "<!-- grug-teller:walkthrough -->"
 
 # Teller portrait (repo-hosted on grug.lol) - matches Chief's pattern
-TELLER_PORTRAIT = "https://grug.lol/assets/grug_teller.png"
+TELLER_PORTRAIT = "https://grug.lol/assets/grug_smile.png"
 TELLER_PORTRAIT_IMG = (
     f'<img src="{TELLER_PORTRAIT}" width="46" align="left" alt="Grug Teller" />'
 )
