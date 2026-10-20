@@ -27,7 +27,8 @@ os.environ.pop("AWS_CONFIG_FILE", None)
 for _var in ("AWS_PROFILE", "AWS_DEFAULT_PROFILE", "AWS_SESSION_TOKEN"):
     os.environ.pop(_var, None)
 os.environ["AWS_ACCESS_KEY_ID"] = "testing"
-os.environ["AWS_SECRET_ACCESS_KEY"] = "testing"
+# Not a secret: moto's documented fake value, identical to check.python.yml.
+os.environ["AWS_SECRET_ACCESS_KEY"] = "testing"  # noqa: S105
 os.environ["AWS_DEFAULT_REGION"] = "us-east-1"
 
 
