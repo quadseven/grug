@@ -2,6 +2,9 @@
 a restart, and the shared store never fails or delays a review."""
 from __future__ import annotations
 
+import threading
+import time
+
 import httpx
 import llm_client as lc
 import pytest
@@ -9,6 +12,7 @@ import shared_benches
 from llm_client import Backend, BackendConfig
 
 _MODEL = "laguna-s-2.1"
+_REAL_ENSURE_THREAD = shared_benches._ensure_thread
 _POOLSIDE = BackendConfig(
     backend=Backend.POOLSIDE, url="https://poolside.test/v1/chat/completions",
     model=_MODEL, key_loader=lambda: "k",
@@ -92,7 +96,7 @@ def test_a_model_benched_in_one_pod_is_skipped_by_another_and_after_a_restart(ta
     assert not lc._tier_is_usable(_POOLSIDE, [])
 
 
-def test_a_success_clears_the_shared_bench_for_every_pod(table, monkeypatch):
+def test_a_success_clears_the_shared_bench_for_pods_that_did_not_open_it(table, monkeypatch):
     _bench_poolside()
     shared_benches.sync()
     _other_pod(monkeypatch)
@@ -164,3 +168,76 @@ def test_nothing_is_shared_unless_switched_on(table, monkeypatch):
     shared_benches.sync()
     assert table.rows == {}
     assert len(shared_benches._queue) == 0
+
+
+def test_a_clear_made_while_the_store_is_down_is_applied_when_it_is_back(table, monkeypatch):
+    _bench_poolside()
+    shared_benches.sync()
+    _other_pod(monkeypatch)
+    table.down = True
+    lc._note_model_response(_POOLSIDE, _resp(200, {"choices": []}))
+    shared_benches.sync()
+    table.down = False
+    shared_benches.sync()
+    assert table.rows == {}, "the dropped clear let the bench come back"
+
+
+def test_an_entry_shared_between_write_and_reread_is_not_lost(table, monkeypatch):
+    real_read = table.read
+
+    def read_after_a_trip():
+        _bench_poolside()  # another thread trips a bench mid-sync
+        return real_read()
+
+    monkeypatch.setattr(shared_benches, "_read_live", read_after_a_trip)
+    shared_benches.sync()
+    assert shared_benches.blocked_until("bench", "poolside", _MODEL) > 0
+    monkeypatch.setattr(shared_benches, "_read_live", real_read)
+    shared_benches.sync()
+    assert "bench#poolside#laguna-s-2.1" in table.rows
+
+
+def test_a_short_lived_run_shares_its_bench_at_exit(table, monkeypatch):
+    _bench_poolside()
+    assert table.rows == {}
+    shared_benches._flush_at_exit()
+    assert "bench#poolside#laguna-s-2.1" in table.rows
+
+
+def _fresh_process(monkeypatch, read) -> None:
+    """A process that just started: the real thread start, no snapshot yet."""
+    monkeypatch.setattr(shared_benches, "_ensure_thread", _REAL_ENSURE_THREAD)
+    monkeypatch.setattr(shared_benches, "_read_live", read)
+    monkeypatch.setattr(shared_benches, "_thread", None)
+    monkeypatch.setattr(shared_benches, "_first_sync", threading.Event())
+    monkeypatch.setattr(shared_benches, "_first_load_deadline", 0.0)
+    monkeypatch.setattr(shared_benches, "REFRESH_INTERVAL_S", 3600.0)
+
+
+def test_a_fresh_process_reads_the_table_before_its_first_answer(table, monkeypatch):
+    table.rows["bench#poolside#laguna-s-2.1"] = time.time() + 600
+
+    def slow_read():
+        time.sleep(0.1)  # a real store round trip, slower than the first lookup
+        return table.read()
+
+    _fresh_process(monkeypatch, slow_read)
+    assert shared_benches.blocked_until("bench", "poolside", _MODEL) > time.time()
+
+
+def test_a_store_that_never_answers_delays_a_process_once_and_briefly(table, monkeypatch):
+    hang = threading.Event()
+    _fresh_process(monkeypatch, lambda: hang.wait(30) and [])
+    monkeypatch.setattr(shared_benches, "FIRST_LOAD_WAIT_S", 0.2)
+    started = time.monotonic()
+    try:
+        for _ in range(5):
+            assert shared_benches.blocked_until("bench", "poolside", _MODEL) == 0.0
+        assert time.monotonic() - started < 1.0, "every read waited, not just the first"
+    finally:
+        hang.set()
+
+
+def test_an_unknown_kind_is_a_programming_error(table):
+    with pytest.raises(ValueError):
+        shared_benches.publish("bnech", "poolside", _MODEL, 1.0)
