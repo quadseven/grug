@@ -25,7 +25,11 @@ from typing import Any
 from github_checks_client import CheckConclusion
 from personas.publish_check import PUBLISH_FAILED, publish_persona_check
 from personas.tpm.dor_checks import CheckResult, IssueFactsFetcher, run_all
-from personas.tpm.dor_checks import IssueFetcher, has_loom_footer
+from personas.tpm.dor_checks import (
+    IssueFetcher,
+    has_loom_footer,
+    loom_footer_lane,
+)
 from personas.tribe import CHECK_CHIEF
 
 
@@ -110,6 +114,12 @@ RULE_SKIP_LOOM_LANE = "skip-loom-lane"
 RULE_SKIP_OPT_OUT = "skip-opt-out"
 RULE_SKIP_NOT_OPERATOR = "skip-not-operator"
 
+# The lane an operator session names in its Loom audit footer. Fleet lanes
+# use other names (claude, codex-2, spark-3, ...), so this one marks an
+# operator session, which gets the plan check when its author is trusted
+# (#1318).
+OPERATOR_SESSION_LANE = "operator-session"
+
 _SKIP_TITLES: dict[str, str] = {
     RULE_SKIP_LOOM_LANE: "Hunt Plan skipped - Loom lane PR",
     RULE_SKIP_OPT_OUT: "Hunt Plan skipped - agent opt-out marker",
@@ -120,7 +130,8 @@ _SKIP_TITLES: dict[str, str] = {
 _SKIP_WHY: dict[str, str] = {
     RULE_SKIP_LOOM_LANE: (
         "it is a fleet lane PR (an agent marker plus the Loom audit footer "
-        "`Loom ticket ...`)"
+        "`Loom ticket ...`). A footer naming lane `operator-session` is "
+        "checked only when the author is a trusted operator"
     ),
     RULE_SKIP_OPT_OUT: (
         "the PR body carries the explicit `<!-- grug:agent-authored -->` "
@@ -166,9 +177,12 @@ def is_trusted_operator(pr: Mapping[str, Any] | None) -> bool:
 def chief_rule(pr_body: str, *, author_trusted: bool) -> str:
     """Pure: which Chief rule applies to this PR body and author.
 
-    No agent marker -> checked. With a marker: the explicit opt-out and a
-    Loom lane footer skip for anyone; otherwise a trusted operator's PR is
-    checked and anyone else's is skipped (grug#1251).
+    No agent marker -> checked. With a marker: the explicit opt-out skips
+    for anyone. A Loom footer skips too, except a footer naming lane
+    `operator-session` on a trusted operator's PR, which is checked
+    (#1318); an untrusted author cannot use that lane name to get checked.
+    Otherwise a trusted operator's PR is checked and anyone else's is
+    skipped (grug#1251).
     """
     body = pr_body or ""
     if not is_agent_authored(body):
@@ -176,6 +190,8 @@ def chief_rule(pr_body: str, *, author_trusted: bool) -> str:
     if _OPT_OUT_RE.search(body):
         return RULE_SKIP_OPT_OUT
     if has_loom_footer(body):
+        if author_trusted and loom_footer_lane(body) == OPERATOR_SESSION_LANE:
+            return RULE_OPERATOR_CHECKED
         return RULE_SKIP_LOOM_LANE
     if author_trusted:
         return RULE_OPERATOR_CHECKED
@@ -313,12 +329,13 @@ def evaluate_pull_request(
 ) -> TpmEvaluation:
     """Pure: run all 9 DoR rules over pr_body and return the rollup.
 
-    `chief_rule` decides first. A skip rule (Loom lane, explicit opt-out,
-    or an agent marker from an author who is not a trusted operator)
-    short-circuits to a NEUTRAL rollup with one skipped row: no rule runs,
-    no issue fetch. `author_trusted` comes from `is_trusted_operator` on
+    `chief_rule` decides first. A skip rule (a fleet Loom lane footer,
+    explicit opt-out, or an agent marker from an author who is not a
+    trusted operator) short-circuits to a NEUTRAL rollup with one skipped
+    row: no rule runs, no issue fetch. `author_trusted` comes from `is_trusted_operator` on
     the PR object at the impure call site; the default False keeps the
-    pre-#1251 skip for a caller that cannot say.
+    pre-#1251 skip for a caller that cannot say. A trusted operator's
+    footer naming lane `operator-session` is checked, not skipped (#1318).
 
     No network IO, no AWS calls, no logging side-effects. Callers wrap
     the result in `publish_tpm_evaluation(...)` to POST the check-run.

@@ -851,6 +851,53 @@ def test_loom_lane_pr_still_skips_for_an_operator_author():
     assert evaluation.rule == persona.RULE_SKIP_LOOM_LANE
 
 
+_SESSION_LINK = "\nhttps://claude.ai/code/session_01Ht7JaVzv2aacJ9r6Srso9r\n"
+_OPERATOR_SESSION_FOOTER = (
+    "\nLoom ticket #5690, lane operator-session, model claude-opus-5-5.\n"
+)
+
+
+def test_operator_session_footer_without_why_fails_for_an_operator():
+    """Operator sessions are told to write the Loom footer with lane
+    `operator-session`. That footer used to switch Chief off (neutral
+    skip-loom-lane) before the trusted-author check ever ran, so a
+    missing `## Why` went through unchecked."""
+    body = (
+        _GOOD_BODY.replace("## Why\n", "## Context\n")
+        + _SESSION_LINK + _OPERATOR_SESSION_FOOTER
+    )
+    evaluation = persona.evaluate_pull_request(body, author_trusted=True)
+    assert evaluation.conclusion == "failure"
+    assert evaluation.rule == persona.RULE_OPERATOR_CHECKED
+    assert [r.name for r in evaluation.results if not r.passed] == ["why"]
+
+
+def test_operator_session_footer_with_full_plan_succeeds():
+    body = _GOOD_BODY + _SESSION_LINK + _OPERATOR_SESSION_FOOTER
+    evaluation = persona.evaluate_pull_request(body, author_trusted=True)
+    assert evaluation.conclusion == "success"
+    assert evaluation.rule == persona.RULE_OPERATOR_CHECKED
+
+
+def test_operator_session_footer_from_an_untrusted_author_still_skips():
+    """The lane name alone cannot turn a skip into a check: an untrusted
+    author who writes `lane operator-session` keeps the Loom-lane skip."""
+    body = _AGENT_BODY_NO_PLAN + _OPERATOR_SESSION_FOOTER
+    evaluation = persona.evaluate_pull_request(body, author_trusted=False)
+    assert evaluation.conclusion == "neutral"
+    assert evaluation.rule == persona.RULE_SKIP_LOOM_LANE
+
+
+def test_fleet_lane_footer_still_skips_for_an_operator_author():
+    body = (
+        _AGENT_BODY_NO_PLAN
+        + "\nLoom ticket #5690, lane spark-3, model qwen3-coder.\n"
+    )
+    evaluation = persona.evaluate_pull_request(body, author_trusted=True)
+    assert evaluation.conclusion == "neutral"
+    assert evaluation.rule == persona.RULE_SKIP_LOOM_LANE
+
+
 def test_explicit_opt_out_still_skips_for_an_operator_author():
     body = "No plan here.\n\n<!-- grug:agent-authored -->\n"
     evaluation = persona.evaluate_pull_request(body, author_trusted=True)
