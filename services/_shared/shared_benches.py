@@ -234,9 +234,8 @@ def _read_live() -> list[tuple[str, float]]:
     from adapters.pg_base import TTL_LIVE, get_pool
 
     with get_pool().connection() as conn:
-        # TTL_LIVE is pg_base's constant fragment; the key is a bound parameter.
         rows = conn.execute(
-            f"SELECT sk, (data->>'until')::float8 FROM grug_kv WHERE pk = %s AND {TTL_LIVE}",
+            f"SELECT sk, (data->>'until')::float8 FROM grug_kv WHERE pk = %s AND {TTL_LIVE}",  # noqa: S608 - TTL_LIVE is a fixed pg_base clause, not input
             (PK,),
         ).fetchall()
     return [(sk, float(until)) for sk, until in rows if until is not None]
