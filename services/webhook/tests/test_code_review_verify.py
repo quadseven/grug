@@ -806,3 +806,210 @@ def test_other_dead_code_claims_are_not_read_as_return_value_claims():
     kept, killed = verify_findings((f,), {_CPP_PATH: _GEAR_CONSUMED})
     assert kept == (f,)
     assert killed == ()
+
+
+# --- callee_not_async: a missing-await claim whose callee is a plain `def`
+# in the fetched files (every sampled marking of this class was declined;
+# one PR got the same claim three times). Adding the `await` it asks for
+# would raise TypeError on the returned value. ------------------------------
+
+_LEGS_PATH = "services/probe/legs.py"
+_RUNNER_PATH = "services/probe/runner.py"
+_RUNNER = (
+    "from probe.legs import Legs\n"
+    "\n"
+    "\n"
+    "async def run(a: Legs) -> bool:\n"
+    "    ok = a._probe(a.paths[0])\n"
+    "    return ok\n"
+)
+_RUNNER_LINE = 5
+_AWAIT_MESSAGE = (
+    "`a._probe(a.paths[0])` is a coroutine that is never awaited, so `ok` "
+    "is always a truthy coroutine object"
+)
+
+
+def _legs(prefix: str = "def") -> str:
+    return (
+        "class Legs:\n"
+        "    paths = ()\n"
+        "\n"
+        f"    {prefix} _probe(self, leg):\n"
+        "        return leg.ok\n"
+    )
+
+
+def _await_finding(**kw) -> Finding:
+    base = {
+        "file": _RUNNER_PATH, "line": _RUNNER_LINE,
+        "rule_name": "missing-await", "message": _AWAIT_MESSAGE,
+    }
+    base.update(kw)
+    return _finding(**base)
+
+
+def test_missing_await_on_a_plain_def_callee_is_killed():
+    f = _await_finding()
+    kept, killed = verify_findings(
+        (f,), {_RUNNER_PATH: _RUNNER, _LEGS_PATH: _legs()},
+    )
+    assert kept == ()
+    assert [k.reason for k in killed] == ["callee_not_async"]
+    assert killed[0].finding is f
+
+
+def test_missing_await_claim_in_the_message_alone_is_read():
+    """The slug may be generic; the claim can live in the message only."""
+    f = _await_finding(rule_name="async-correctness")
+    kept, killed = verify_findings(
+        (f,), {_RUNNER_PATH: _RUNNER, _LEGS_PATH: _legs()},
+    )
+    assert kept == ()
+    assert [k.reason for k in killed] == ["callee_not_async"]
+
+
+def test_missing_await_on_an_async_def_callee_survives():
+    f = _await_finding()
+    kept, killed = verify_findings(
+        (f,), {_RUNNER_PATH: _RUNNER, _LEGS_PATH: _legs("async def")},
+    )
+    assert kept == (f,)
+    assert killed == ()
+
+
+def test_missing_await_on_a_callee_in_no_fetched_file_survives():
+    """The definition was not fetched: inconclusive, keep."""
+    f = _await_finding()
+    kept, killed = verify_findings((f,), {_RUNNER_PATH: _RUNNER})
+    assert kept == (f,)
+    assert killed == ()
+
+
+def test_missing_await_survives_when_any_same_named_def_is_async():
+    """Two classes share the method name and one is async: keep."""
+    other = "class Other:\n    async def _probe(self, leg):\n        return leg\n"
+    f = _await_finding()
+    kept, killed = verify_findings(
+        (f,),
+        {_RUNNER_PATH: _RUNNER, _LEGS_PATH: _legs(), "services/probe/o.py": other},
+    )
+    assert kept == (f,)
+    assert killed == ()
+
+
+@pytest.mark.parametrize("legs", [
+    # a plain def that hands back a coroutine still has to be awaited
+    (
+        "async def _real(leg):\n    return leg\n\n"
+        "class Legs:\n    def _probe(self, leg):\n        return _real(leg)\n"
+    ),
+    (
+        "import asyncio\n\nclass Legs:\n    def _probe(self, leg):\n"
+        "        return asyncio.ensure_future(leg)\n"
+    ),
+    (
+        "from typing import Awaitable\n\nclass Legs:\n"
+        "    def _probe(self, leg) -> Awaitable[bool]:\n        return leg\n"
+    ),
+    # rebound to something awaitable elsewhere in the fetched files
+    (
+        "class Legs:\n    def _probe(self, leg):\n        return leg\n\n"
+        "def patch(a):\n    a._probe = make_async(a._probe)\n"
+    ),
+])
+def test_missing_await_survives_a_plain_def_that_may_return_an_awaitable(legs):
+    f = _await_finding()
+    kept, killed = verify_findings(
+        (f,), {_RUNNER_PATH: _RUNNER, _LEGS_PATH: legs},
+    )
+    assert kept == (f,)
+    assert killed == ()
+
+
+def test_missing_await_on_a_non_python_anchor_survives():
+    f = _await_finding(file="web/src/run.ts", line=1)
+    kept, killed = verify_findings(
+        (f,), {"web/src/run.ts": "const ok = a._probe(a.paths[0]);\n",
+               _LEGS_PATH: _legs()},
+    )
+    assert kept == (f,)
+    assert killed == ()
+
+
+# --- redaction_artifact: a finding built on Grug's own input redaction.
+# The env-secret pattern rewrote a test lambda's `api_key: fake_achievements`
+# to `api_key: [REDACTED:env-secret]`, and Elder posted two high findings
+# (a NameError, and "str has no .get") against a test that passes. ---------
+
+_TEST_PATH = "tests/test_achievements.py"
+_TEST_SOURCE = (
+    "from unittest import mock\n"
+    "\n"
+    "fake_achievements = {1: ['a']}\n"
+    "\n"
+    "def test_sync():\n"
+    "    client = mock.Mock()\n"
+    "    client.side_effect = lambda steam_id, app_id, api_key: fake_achievements.get(app_id, [])\n"
+    "    assert client(1, 1, 'k') == ['a']\n"
+)
+_TEST_LINE = 7
+
+
+def _redaction_finding(**kw) -> Finding:
+    base = {
+        "file": _TEST_PATH, "line": _TEST_LINE,
+        "rule_name": "test-fidelity",
+        "message": (
+            "`[REDACTED:env-secret].get(app_id, [])` calls .get on a str, "
+            "so the side_effect raises AttributeError"
+        ),
+    }
+    base.update(kw)
+    return _finding(**base)
+
+
+def test_finding_built_on_the_redaction_placeholder_is_killed():
+    f = _redaction_finding()
+    kept, killed = verify_findings((f,), {_TEST_PATH: _TEST_SOURCE})
+    assert kept == ()
+    assert [k.reason for k in killed] == ["redaction_artifact"]
+    assert killed[0].finding is f
+
+
+def test_secret_class_finding_citing_a_placeholder_survives():
+    f = _redaction_finding(
+        rule_name="secret-in-log-or-trace",
+        message="`[REDACTED:github-pat]` is written to the trace output",
+    )
+    kept, killed = verify_findings((f,), {_TEST_PATH: _TEST_SOURCE})
+    assert kept == (f,)
+    assert killed == ()
+
+
+def test_placeholder_that_really_is_in_the_head_file_survives():
+    """The code itself carries the placeholder text: not our artifact."""
+    source = _TEST_SOURCE.replace(
+        "fake_achievements.get(app_id, [])", "'[REDACTED:env-secret]'.get(app_id, [])",
+    )
+    f = _redaction_finding()
+    kept, killed = verify_findings((f,), {_TEST_PATH: source})
+    assert kept == (f,)
+    assert killed == ()
+
+
+@pytest.mark.parametrize("line", [
+    # a quoted literal is a real secret, whatever the rule says
+    "    client.side_effect = lambda steam_id, app_id, api_key='hunter2222xy': None\n",
+    # a key=value inside a string is a real secret too
+    "    client.side_effect = 'password=hunter2222xy'\n",
+    # nothing near the anchor matches the redaction pattern at all
+    "    client.side_effect = lambda steam_id, app_id, key: fake.get(app_id, [])\n",
+])
+def test_placeholder_over_a_literal_or_unmatched_line_survives(line):
+    source = _TEST_SOURCE.splitlines(keepends=True)
+    source[_TEST_LINE - 1] = line
+    f = _redaction_finding()
+    kept, killed = verify_findings((f,), {_TEST_PATH: "".join(source)})
+    assert kept == (f,)
+    assert killed == ()

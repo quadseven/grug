@@ -56,6 +56,24 @@ evidence contradicts:
   ``if (!GearReadOneEquipSpell(spell.effects, resolved)) ...``. Callers in
   files the dispatch did not fetch are a residual risk, accepted under the
   inconclusive-keeps bias like ``sync_context``'s cross-file callers.
+- ``callee_not_async``: a missing-await claim on a Python anchor whose
+  every named callee is a plain ``def`` in the fetched files, with no
+  ``async def`` of that name, no awaitable return, and no rebinding.
+  ``sync_context`` leaves missing-await out on purpose, so nothing checked
+  the callee. Live instances: every sampled marking of this class was
+  declined (one public PR got the same claim three times); each named a
+  plain ``def`` from the same diff, where the ``await`` it asked for would
+  raise TypeError.
+- ``redaction_artifact``: a non-secret finding built on Grug's OWN input
+  redaction. The ``env-secret`` pattern in ``redact.py`` matches plain
+  code (``api_key: fake_achievements``, ``token = get_app_jwt()``), so
+  the model sees ``[REDACTED:env-secret]`` where a name sits in the head
+  file. Live instance: a test lambda
+  ``lambda steam_id, app_id, api_key: fake_achievements.get(...)`` drew
+  two high markings (a NameError, and "str has no .get") on a test that
+  passes. Kills only when the pattern re-matches the raw lines near the
+  anchor and every value it would hide there is a name the module uses
+  as code; a quoted literal is a real secret and keeps the finding.
 
 Inconclusive is NOT a kill: a missing file, an unparseable module, a
 module-level line, or a suggestion with no code tokens all keep the
@@ -76,6 +94,8 @@ import re
 from dataclasses import dataclass
 from typing import TYPE_CHECKING
 
+from redact import SECRET_PATTERNS
+
 if TYPE_CHECKING:  # import cycle guard: persona imports nothing from here
     from personas.code_reviewer.persona import Finding
 
@@ -85,7 +105,7 @@ class KilledFinding:
     finding: "Finding"
     # "non_code_file" | "sync_context" | "fix_already_present" |
     # "fix_block_present" | "mitigation_present" | "collection_lockstep" |
-    # "return_value_used"
+    # "return_value_used" | "callee_not_async" | "redaction_artifact"
     reason: str
 
 
@@ -354,6 +374,214 @@ def _kills_as_return_value_used(
     return consumed > 0
 
 
+# callee_not_async. The claim family: a call's coroutine is never awaited.
+_MISSING_AWAIT_RE = re.compile(
+    r"missing[-_ ]await|(?:not|never)[-_ ]awaited|un-?awaited"
+    r"|without (?:an? )?`?await|must be awaited|needs? to be awaited"
+    r"|forgot(?:ten)? to await"
+)
+
+# The callees a missing-await message names: the identifier right before
+# the first `(` in each backticked span (`a._probe(a.paths[0])` -> _probe).
+_BACKTICK_SPAN_RE = re.compile(r"`([^`]+)`")
+_SPAN_CALL_RE = re.compile(r"([A-Za-z_]\w*)\s*\(")
+
+# Return annotations and returned calls that make a plain def hand back an
+# awaitable anyway; such a callee still needs its `await`.
+_AWAITABLE_HINT_RE = re.compile(r"Awaitable|Coroutine|Future|Task|AsyncIterator|AsyncGenerator")
+_AWAITABLE_FACTORIES = frozenset({
+    "create_task", "ensure_future", "gather", "wait_for", "run_in_executor",
+    "to_thread", "run_coroutine_threadsafe", "sleep", "shield",
+})
+
+
+def _claimed_async_callees(finding: "Finding") -> tuple[str, ...]:
+    """The callees a missing-await claim names, or () when the finding is
+    not that claim or names no call."""
+    if not _MISSING_AWAIT_RE.search(f"{finding.rule_name} {finding.message}".lower()):
+        return ()
+    names: list[str] = []
+    for span in _BACKTICK_SPAN_RE.findall(finding.message):
+        m = _SPAN_CALL_RE.search(span)
+        if m and m.group(1) != "await" and m.group(1) not in names:
+            names.append(m.group(1))
+    return tuple(names)
+
+
+def _call_name(node: ast.AST) -> str | None:
+    if isinstance(node, ast.Call):
+        func = node.func
+        if isinstance(func, ast.Name):
+            return func.id
+        if isinstance(func, ast.Attribute):
+            return func.attr
+    return None
+
+
+def _returns_awaitable(fn: ast.FunctionDef, async_names: set[str]) -> bool:
+    """A plain def that can still hand back an awaitable: an awaitable
+    return annotation, an async-ish decorator, or a returned call to an
+    async def or a known awaitable factory."""
+    if fn.returns is not None and _AWAITABLE_HINT_RE.search(ast.unparse(fn.returns)):
+        return True
+    if any("async" in ast.unparse(d).lower() for d in fn.decorator_list):
+        return True
+    for node in ast.walk(fn):
+        if isinstance(node, ast.Return) and node.value is not None:
+            name = _call_name(node.value)
+            if name in async_names or name in _AWAITABLE_FACTORIES:
+                return True
+    return False
+
+
+def _is_rebound(tree: ast.Module, name: str) -> bool:
+    """`name` is assigned anywhere (`x._probe = AsyncMock()`): whatever it
+    is bound to may be awaitable, so the def alone proves nothing."""
+    for node in ast.walk(tree):
+        targets: list[ast.AST] = []
+        if isinstance(node, ast.Assign):
+            targets = list(node.targets)
+        elif isinstance(node, (ast.AnnAssign, ast.AugAssign)):
+            targets = [node.target]
+        for t in targets:
+            for sub in ast.walk(t):
+                if (isinstance(sub, ast.Name) and sub.id == name) or (
+                    isinstance(sub, ast.Attribute) and sub.attr == name
+                ):
+                    return True
+    return False
+
+
+def _kills_as_callee_not_async(
+    finding: "Finding", contents: dict[str, str],
+) -> bool:
+    """A missing-await claim whose every named callee is provably sync.
+
+    Kills only when each callee has at least one plain ``def`` in the
+    fetched Python files and no ``async def`` of that name, no definition
+    that may return an awaitable, and no rebinding anywhere. A callee in
+    none of the fetched files, or any unparseable file that mentions it,
+    is inconclusive and keeps the finding.
+    """
+    if not finding.file.endswith((".py", ".pyi")):
+        return False
+    callees = _claimed_async_callees(finding)
+    if not callees:
+        return False
+    trees = _parsed_python(contents, callees)
+    if trees is None:
+        return False
+    async_names = {
+        n.name for t in trees for n in ast.walk(t)
+        if isinstance(n, ast.AsyncFunctionDef)
+    }
+    return all(_is_plain_sync_callee(c, trees, async_names) for c in callees)
+
+
+def _parsed_python(
+    contents: dict[str, str], callees: tuple[str, ...],
+) -> list[ast.Module] | None:
+    """Every fetched Python file, parsed. None (inconclusive) when a file
+    that mentions a callee does not parse."""
+    trees: list[ast.Module] = []
+    for path, text in contents.items():
+        if not path.endswith((".py", ".pyi")):
+            continue
+        try:
+            trees.append(ast.parse(text))
+        except (SyntaxError, ValueError):
+            if any(c in text for c in callees):
+                return None
+    return trees
+
+
+def _is_plain_sync_callee(
+    callee: str, trees: list[ast.Module], async_names: set[str],
+) -> bool:
+    """`callee` has a plain def, no async def, no def that may return an
+    awaitable, and no rebinding in the fetched files."""
+    if callee in async_names:
+        return False
+    defs = [
+        n for t in trees for n in ast.walk(t)
+        if isinstance(n, ast.FunctionDef) and n.name == callee
+    ]
+    if not defs or any(_returns_awaitable(d, async_names) for d in defs):
+        return False
+    return not any(_is_rebound(t, callee) for t in trees)
+
+
+# redaction_artifact. Grug's own placeholders, and the one pattern whose
+# false positives on plain code produce them. Every other pattern matches a
+# real token format, so a placeholder of any other kind is never an
+# artifact.
+_PLACEHOLDER_RE = re.compile(r"\[REDACTED:([a-z0-9-]+)\]")
+_ARTIFACT_KIND = "env-secret"
+_ENV_SECRET_RE = next(
+    (p for p, repl in SECRET_PATTERNS if f"[REDACTED:{_ARTIFACT_KIND}]" in repl),
+    None,
+)
+
+# Secret-class claims always keep: a placeholder in a leak finding may be
+# hiding exactly the secret the finding is about. Checked with the
+# placeholders stripped, since the label itself says "secret".
+_SECRET_CLASS_RE = re.compile(
+    r"secret|credential|token|leak|passw|hard-?coded|exposed"
+)
+
+
+def _code_names(tree: ast.Module) -> set[str]:
+    """Every identifier the module uses as code: names, attributes,
+    parameters and definitions. String contents never land here."""
+    out: set[str] = set()
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Name):
+            out.add(node.id)
+        elif isinstance(node, ast.Attribute):
+            out.add(node.attr)
+        elif isinstance(node, ast.arg):
+            out.add(node.arg)
+        elif isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
+            out.add(node.name)
+    return out
+
+
+def _kills_as_redaction_artifact(finding: "Finding", source: str) -> bool:
+    """A non-secret claim built on the ``env-secret`` placeholder our own
+    input redaction put over plain code.
+
+    Every condition must hold: the anchor is Python; the message cites only
+    ``env-secret`` placeholders; the claim is not secret-class; the raw head
+    text within 2 lines of the anchor carries no placeholder of its own; and
+    the redaction pattern re-matches there with every hidden value an
+    unquoted identifier the module uses as code. A quoted literal, or a
+    ``key=value`` inside a string, is a real secret and keeps the finding.
+    """
+    if _ENV_SECRET_RE is None or not finding.file.endswith((".py", ".pyi")):
+        return False
+    kinds = _PLACEHOLDER_RE.findall(finding.message)
+    if not kinds or any(k != _ARTIFACT_KIND for k in kinds):
+        return False
+    claim = _PLACEHOLDER_RE.sub(" ", f"{finding.rule_name} {finding.message}").lower()
+    if _SECRET_CLASS_RE.search(claim):
+        return False
+    window = _anchor_window(source, finding.line, radius=2)
+    if "[REDACTED" in window:
+        return False
+    matches = list(_ENV_SECRET_RE.finditer(window))
+    if not matches:
+        return False
+    try:
+        names = _code_names(ast.parse(source))
+    except (SyntaxError, ValueError):
+        return False
+    for m in matches:
+        value = m.group(0)[len(m.group(1)):]
+        if not re.fullmatch(r"[A-Za-z_]\w*", value) or value not in names:
+            return False
+    return True
+
+
 def _is_prose_file(path: str) -> bool:
     return path.lower().endswith(_PROSE_SUFFIXES)
 
@@ -578,6 +806,17 @@ def _verify_one(finding: "Finding", contents: dict[str, str]) -> str | None:
         finding, contents,
     ):
         return "return_value_used"
+
+    # Callee-not-async kill: "this call is never awaited" while every named
+    # callee is a plain def in the fetched files. Takes the whole contents
+    # dict, since the definition usually lives outside the anchored file.
+    if _kills_as_callee_not_async(finding, contents):
+        return "callee_not_async"
+
+    # Redaction-artifact kill: the claim reads Grug's own env-secret
+    # placeholder as code, where the raw head file has a plain name.
+    if _kills_as_redaction_artifact(finding, source):
+        return "redaction_artifact"
 
     # Collection-lockstep kill (#763): "registry grew, so the allowlist must
     # grow" is not a stale caller. Needs the source so the anchored line can
