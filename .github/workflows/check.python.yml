@@ -65,16 +65,23 @@ jobs:
       # OPENGREP_VERSION as services/Dockerfile's opengrep-fetch stage - bump
       # both together. amd64/x86 asset: hosted ubuntu-latest runners are
       # x86_64 (the Dockerfile's arm64 asset is for the arm64 k8s nodes, a
-      # different target).
+      # different target). The digest is the Dockerfile's
+      # OPENGREP_SHA256_X86 (#1334): a release asset can be replaced after
+      # publication, so the version alone pins a name, not the bytes.
+      # test_supply_chain_pins.py fails if the two copies disagree.
       - name: install opengrep (pinned to match services/Dockerfile)
+        env:
+          OPENGREP_VERSION: "1.27.1"
+          OPENGREP_SHA256_X86: 58053da76672bbeb5b0a5441021c58338707052e10f81d777140ca879bd491ce
         run: |
           # #896: a ~100MB fetch over a public CDN is not fast, so
           # --max-time is generous (5 min); --retry covers a transient
           # stall without failing the whole job for it.
           curl -fsSL --connect-timeout 10 --max-time 300 --retry 3 \
-            --retry-connrefused -o /usr/local/bin/opengrep \
-            "https://github.com/opengrep/opengrep/releases/download/v1.27.1/opengrep_manylinux_x86"
-          chmod 0755 /usr/local/bin/opengrep
+            --retry-connrefused -o "$RUNNER_TEMP/opengrep" \
+            "https://github.com/opengrep/opengrep/releases/download/v${OPENGREP_VERSION}/opengrep_manylinux_x86"
+          echo "${OPENGREP_SHA256_X86}  $RUNNER_TEMP/opengrep" | sha256sum -c -
+          install -m 0755 "$RUNNER_TEMP/opengrep" /usr/local/bin/opengrep
           opengrep --version
       - name: webhook tests
         run: make webhook-test

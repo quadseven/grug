@@ -12,8 +12,15 @@
 # reliably fetchable, and a source build pins provenance to the aws/
 # rolesanywhere-credential-helper tag. Used by the SDK
 # credential_process on every workload since the #389 rollout.
+#
+# A tag can be moved, so the tag alone pins a name, not the source (#1334).
+# SIGNING_HELPER_COMMIT is the commit the tag resolved to when it was pinned;
+# the build checks the clone against it before compiling, so a moved tag
+# fails the build instead of shipping different code. Bump both together:
+#   gh api repos/aws/rolesanywhere-credential-helper/commits/<tag> --jq .sha
 FROM golang:1.26-bookworm AS signing-helper
 ARG SIGNING_HELPER_VERSION=v1.8.4
+ARG SIGNING_HELPER_COMMIT=98b276b61378af7d233b077f0fe5d44e85253ece
 # CGO stays ON: the helper's pkcs11 support (miekg/pkcs11) is cgo-only
 # and CGO_ENABLED=0 fails compilation. The binary links the BUILDER's
 # glibc, so the invariant is DIRECTIONAL: runtime glibc >= builder glibc
@@ -22,6 +29,8 @@ ARG SIGNING_HELPER_VERSION=v1.8.4
 # runtime image, so a violation dies pre-merge, not in a pod.
 RUN git clone --depth 1 --branch ${SIGNING_HELPER_VERSION} \
       https://github.com/aws/rolesanywhere-credential-helper /src \
+ && { test "$(git -C /src rev-parse HEAD)" = "${SIGNING_HELPER_COMMIT}" \
+      || { echo "${SIGNING_HELPER_VERSION} no longer resolves to ${SIGNING_HELPER_COMMIT}" >&2; exit 1; }; } \
  && cd /src \
  && go build -trimpath -ldflags "-s -w" \
       -o /aws_signing_helper . \
@@ -36,9 +45,18 @@ RUN git clone --depth 1 --branch ${SIGNING_HELPER_VERSION} \
 #
 # Pinned, not floating: a scanner whose engine changes under you is how a
 # security control drifts without anyone noticing.
+#
+# Pinned to the bytes, not just the version (#1334): a release asset can be
+# replaced after publication, so the download is checked against the sha256
+# GitHub's release API publishes for it before it is made executable. Bump the
+# version and both digests together, and the copy in check.python.yml. Read
+# the digests with `gh api repos/opengrep/opengrep/releases/tags/v<version>`
+# (each asset's `digest` field).
 FROM debian:bookworm-slim AS opengrep-fetch
 ARG TARGETARCH
 ARG OPENGREP_VERSION=1.27.1
+ARG OPENGREP_SHA256_AARCH64=96ee2caddd5f17821ae6952774a91c8781778bfa9af1ace83645444c0edc6c97
+ARG OPENGREP_SHA256_X86=58053da76672bbeb5b0a5441021c58338707052e10f81d777140ca879bd491ce
 # TARGETARCH is supplied by BuildKit; it is EMPTY under the legacy builder, so
 # fall back to dpkg's architecture rather than trusting it to be set.
 #
@@ -51,12 +69,13 @@ RUN apt-get update && apt-get install -y --no-install-recommends curl ca-certifi
  && rm -rf /var/lib/apt/lists/* \
  && ARCH="${TARGETARCH:-$(dpkg --print-architecture)}" \
  && case "$ARCH" in \
-      arm64|aarch64) OG_ASSET=opengrep_manylinux_aarch64 ;; \
-      amd64|x86_64)  OG_ASSET=opengrep_manylinux_x86 ;; \
+      arm64|aarch64) OG_ASSET=opengrep_manylinux_aarch64 OG_SHA="${OPENGREP_SHA256_AARCH64}" ;; \
+      amd64|x86_64)  OG_ASSET=opengrep_manylinux_x86 OG_SHA="${OPENGREP_SHA256_X86}" ;; \
       *) echo "unsupported architecture: $ARCH" >&2; exit 1 ;; \
     esac \
  && curl -fsSL -o /opengrep \
       "https://github.com/opengrep/opengrep/releases/download/v${OPENGREP_VERSION}/${OG_ASSET}" \
+ && echo "${OG_SHA}  /opengrep" | sha256sum -c - \
  && chmod 0755 /opengrep
 
 FROM python:3.13-slim AS runtime
