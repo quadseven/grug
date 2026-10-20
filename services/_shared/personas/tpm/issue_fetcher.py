@@ -55,6 +55,40 @@ def build_issue_fetcher(
     return _fetch_issue_body
 
 
+def build_changed_files_fetcher(
+    *, installation_id: int, owner: str, repo: str, pr_number: int,
+) -> Callable[[], list[str]]:
+    """Return a `() -> changed file paths` callable for the PR's diff.
+
+    The in-scope check compares the PR's changed files against the linked
+    issue's body (the scope oracle). Built as a no-arg callable capturing
+    the PR coordinates, so `evaluate_pull_request` stays pure (the fetcher
+    is a parameter, not a call inside it). Raises on fetch failure; the
+    check fails OPEN with the check marked `skipped`."""
+
+    def _fetch_changed_files() -> list[str]:
+        from urllib.parse import quote
+        import httpx  # type: ignore
+
+        def _get(token: str) -> list[str]:
+            r = httpx.get(
+                f"https://api.github.com/repos/{quote(owner, safe='')}/"
+                f"{quote(repo, safe='')}/pulls/{int(pr_number)}/files",
+                headers={
+                    "Authorization": f"token {token}",
+                    "Accept": "application/vnd.github+json",
+                },
+                timeout=10,
+            )
+            r.raise_for_status()
+            return [f["filename"] for f in (r.json() or [])]
+
+        from github_app_auth import with_install_token_retry  # type: ignore
+        return with_install_token_retry(installation_id, _get)
+
+    return _fetch_changed_files
+
+
 def build_issue_details_fetcher(
     *, installation_id: int, owner: str, repo: str,
 ) -> Callable[[int], dict[str, str]]:

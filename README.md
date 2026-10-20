@@ -67,7 +67,7 @@ pulumi up                   # provision AWS infra (SSM refs, SQS, KMS, DD monito
 ## What Chief checks (Hunt Plan)
 
 Before the tribe leave the cave, Chief reads the **Hunt Plan** on the PR body â€”
-**4 blocking plan checks, 1 advisory:**
+**6 blocking plan checks, 3 advisory:**
 
 | | Plan check | Pass when | Blocks? |
 |---|---|---|---|
@@ -76,6 +76,10 @@ Before the tribe leave the cave, Chief reads the **Hunt Plan** on the PR body â€
 | yes | `estimate` | Body or label includes `Size: XS/S/M/L` (XL must be split) | **yes** |
 | yes | `scope-fence` | Has `## Out of scope` section | **yes** |
 | soft | `issue-link` | Body links an issue via `closes #N` | advisory |
+| soft | `in-scope` | All changed files trace to the linked issue's scope (grug#1195) | advisory |
+
+The `in-scope` check names any rider files the linked issue never asked for
+and is advisory by default; org/repo config can promote it to blocking.
 
 The Hunt Plan is for PRs written by people and by operator sessions. A PR
 body carrying an agent-authored marker (a `claude.ai/code/session_` link or
