@@ -14,12 +14,21 @@ unchanged. A review never waits on it: `record` appends to a bounded deque
 seconds with a short timeout, dropping a batch the gateway refuses. It uses
 its own `httpx.Client`, never the module-level `httpx.post` the review path
 uses.
+
+The same thread also sends the calls running now (`begin`/`end`) to the
+gateway's `POST /ui/inflight`, so the gateway page shows what Elder is calling
+while it runs: the whole set every few seconds while any runs, then one empty
+set to clear it. The gateway expires a set that stops arriving, so a pod that
+dies leaves no rows behind.
 """
 from __future__ import annotations
 
+import itertools
 import logging
 import os
+import re
 import threading
+import time
 from collections import deque
 from typing import Any
 
@@ -32,11 +41,18 @@ MAX_QUEUE = 1000
 BATCH_ROWS = 200
 TIMEOUT_S = 5.0
 CALLER = "grug-elder"
+INFLIGHT_MAX_CALLS = 200
+_REPORTER_UNSAFE = re.compile(r"[^A-Za-z0-9._-]")
 
 _queue: deque[dict[str, Any]] = deque(maxlen=MAX_QUEUE)
 _lock = threading.Lock()
 _thread: threading.Thread | None = None
 _client: httpx.Client | None = None
+# token -> (backend, model, job, monotonic start)
+_inflight: dict[int, tuple[str, str, str | None, float]] = {}
+_inflight_lock = threading.Lock()
+_inflight_ids = itertools.count(1)
+_inflight_shown = False
 
 
 def enabled() -> bool:
@@ -46,9 +62,15 @@ def enabled() -> bool:
     )
 
 
-def _endpoint() -> str:
+def _endpoint(path: str = "/ui/calls") -> str:
     base = os.getenv("GRUG_CAVE_GATEWAY_URL", "").strip().rstrip("/")
-    return f"{base}/ui/calls" if base else ""
+    return f"{base}{path}" if base else ""
+
+
+def _reporter() -> str:
+    """This pod's name, as the gateway keys its in-flight set."""
+    name = _REPORTER_UNSAFE.sub("-", os.getenv("HOSTNAME", "").strip())[:64]
+    return name or "grug"
 
 
 def outcome_for(error_kind: str | None, status: int | None, degenerate: bool) -> tuple[str, str | None]:
@@ -117,10 +139,31 @@ def _ensure_thread() -> None:
         _thread.start()
 
 
+def begin(*, backend: str, model: str, job: str | None) -> int | None:
+    """Mark one direct call as running; returns the token `end` takes, or
+    None when reporting is off. Never raises."""
+    if not enabled():
+        return None
+    with _inflight_lock:
+        token = next(_inflight_ids)
+        _inflight[token] = (backend, model, job, time.monotonic())
+    _ensure_thread()
+    return token
+
+
+def end(token: int | None) -> None:
+    """The call `token` names is over. Idempotent."""
+    if token is None:
+        return
+    with _inflight_lock:
+        _inflight.pop(token, None)
+
+
 def _run() -> None:
-    stop = threading.Event()
-    while not stop.wait(FLUSH_INTERVAL_S):
+    while True:
+        time.sleep(FLUSH_INTERVAL_S)
         flush()
+        flush_inflight()
 
 
 def flush() -> int:
@@ -142,3 +185,37 @@ def flush() -> int:
         except Exception as e:  # noqa: BLE001 - statistics must never break Elder
             log.warning("call_report_failed", extra={"kind": type(e).__name__, "rows": len(batch)})
     return accepted
+
+
+def _inflight_rows() -> list[dict[str, Any]]:
+    now = time.monotonic()
+    with _inflight_lock:
+        running = sorted(_inflight.values(), key=lambda call: call[3])
+    rows = []
+    for backend, model, job, started in running[:INFLIGHT_MAX_CALLS]:
+        row: dict[str, Any] = {
+            "target": backend, "model": model, "age_s": round(min(now - started, 3600.0), 2),
+        }
+        if job:
+            row["job"] = job
+        rows.append(row)
+    return rows
+
+
+def flush_inflight() -> bool:
+    """Send the calls running now; returns True when the gateway took them.
+    Sends nothing when none run and the last set sent was already empty."""
+    global _client, _inflight_shown
+    calls = _inflight_rows()
+    if not calls and not _inflight_shown:
+        return False
+    body = {"reporter": _reporter(), "caller": CALLER, "calls": calls}
+    try:
+        if _client is None:
+            _client = httpx.Client(timeout=TIMEOUT_S)
+        _client.post(_endpoint("/ui/inflight"), json=body).raise_for_status()
+    except Exception as e:  # noqa: BLE001 - the page must never break Elder
+        log.warning("call_report_inflight_failed", extra={"kind": type(e).__name__})
+        return False
+    _inflight_shown = bool(calls)
+    return True
