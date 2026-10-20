@@ -386,7 +386,7 @@ _SKIPPED_COHORT_PREFIX = "cohort skipped: "
 # What `_truncation_error` says about a parseable answer the model stopped at
 # its max_tokens cap (grug#851). Matched, not re-spelled, so a cohort that hit
 # the cap is told apart from any other "partial review:" cause.
-_TOKEN_CAP_MARKER = "hit the generation token cap"
+_CAPPED_ANSWER_MARKER = "hit the generation token cap"
 
 # The staged review's deadline (grug#1216), as a `time.monotonic()` value.
 # The scheduler used to reserve one worst-case ladder walk (Cave timeout +
@@ -4420,7 +4420,7 @@ def _hit_token_cap(response: LlmReviewResponse) -> bool:
     return (
         response.kind == "reviewed"
         and response.error.startswith("partial review:")
-        and _TOKEN_CAP_MARKER in response.error
+        and _CAPPED_ANSWER_MARKER in response.error
     )
 
 
@@ -5654,7 +5654,7 @@ def _truncation_error(backends: Sequence["Backend"]) -> str:
         return ""
     names = ", ".join(b.value for b in backends)
     return (
-        f"partial review: {names} {_TOKEN_CAP_MARKER} before "
+        f"partial review: {names} {_CAPPED_ANSWER_MARKER} before "
         f"finishing (finish_reason=length or {TRUNCATED_FINDINGS})"
     )
 
