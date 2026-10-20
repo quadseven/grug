@@ -121,6 +121,12 @@ class ReviewCoverage:
     # that never completed, in ladder order, deduplicated. Lets a neutral
     # check name what was tried instead of a bare `all_failed`.
     failed_models: tuple[str, ...] = ()
+    # Completed cohorts whose answer hit the generation token cap (grug#851).
+    # They count as completed (their findings are real evidence), yet they
+    # make the review partial, so the summary names them. Without this a
+    # capped review read "2/2 cohorts completed" and still failed as partial
+    # with no cause shown.
+    capped_cohorts: tuple[int, ...] = ()
 
     @property
     def complete(self) -> bool:
