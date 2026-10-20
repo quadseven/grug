@@ -193,6 +193,24 @@ def test_publish_does_not_create_a_board_by_default(monkeypatch):
     assert writes == []
 
 
+def test_publish_reports_failed_instead_of_raising_on_github_errors(monkeypatch):
+    """A transient GitHub fault must not kill the review that called publish;
+    the stored session is the record and the next publish heals the board."""
+    def boom(url, **kw):
+        raise httpx.ConnectTimeout("timed out", request=httpx.Request("GET", url))
+
+    monkeypatch.setattr(bc.httpx, "get", boom)
+    assert hb.publish("tok", "acme", "widgets", PR, _session())["board"] == "failed"
+
+    existing = _board_with(elder="E")
+    writes = _wire(monkeypatch, [{"id": 7, "body": existing}])
+    monkeypatch.setattr(
+        bc.httpx, "patch",
+        lambda url, **kw: writes.append("patch") or _resp(502, {}))
+    assert hb.publish("tok", "acme", "widgets", PR, _session())["board"] == "failed"
+    assert writes == ["patch"]
+
+
 def test_hunt_section_sits_after_chief_and_before_teller():
     body = _board_with(chief="C", teller="T", elder="E")
     body = board.upsert_section(body, "hunt", "H")

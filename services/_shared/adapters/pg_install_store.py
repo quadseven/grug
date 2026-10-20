@@ -859,7 +859,7 @@ def put_review_session(
                 WHERE pk = %(pk)s AND sk = %(sk)s
                   AND data->>'version' = %(expected)s
                   AND {TTL_LIVE}
-                """,
+                """,  # noqa: S608 - TTL_LIVE is a fixed pg_base clause, not input
                 params,
             )
         return cur.rowcount == 1

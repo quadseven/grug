@@ -23,12 +23,18 @@ projection that misses a write is healed by the next publish.
 """
 from __future__ import annotations
 
+import logging
+import os
 import re
 from typing import Any, Optional
+
+import httpx
 
 from markdown_safety import neutralize_mentions
 from personas import board, board_client
 from review_session import FindingRecord, ReviewSession
+
+log = logging.getLogger(f"{os.getenv('DD_SERVICE', 'grug')}.personas.hunt_board")
 
 SECTION_KEY = "hunt"
 MARKER_PREFIX = "<!-- grug-hunt-board:v1"
@@ -205,19 +211,33 @@ def publish(
 
     Does not start a board by default: creating the board is the email
     decision, which belongs to the persona with a verdict to send.
+
+    Never raises on a GitHub error: the projection is cosmetic next to the
+    review that produced it, and the stored session is the record, so a
+    failed write logs `hunt_board_publish_failed`, returns `failed`, and the
+    next publish heals the board. A failed read is NOT treated as "no board":
+    that would skip the stale-version guard.
     """
     section = render(session)
-    found = board_client.find_board(token, owner, repo, pr_number, app_id=app_id)
-    if found is not None:
-        current = board.extract_section(found[1], SECTION_KEY)
-        if current is not None:
-            if current == section.strip():
-                return {"board": "unchanged", "section": SECTION_KEY}
-            shown = parse_version(current)
-            if shown is not None and shown > session.version:
-                return {"board": "stale", "section": SECTION_KEY, "shown": shown}
-    return board_client.upsert_board_section(
-        token, owner, repo, pr_number,
-        key=SECTION_KEY, section=section, app_id=app_id,
-        create_if_absent=create_if_absent,
-    )
+    try:
+        found = board_client.find_board(token, owner, repo, pr_number, app_id=app_id)
+        if found is not None:
+            current = board.extract_section(found[1], SECTION_KEY)
+            if current is not None:
+                if current == section.strip():
+                    return {"board": "unchanged", "section": SECTION_KEY}
+                shown = parse_version(current)
+                if shown is not None and shown > session.version:
+                    return {"board": "stale", "section": SECTION_KEY, "shown": shown}
+        return board_client.upsert_board_section(
+            token, owner, repo, pr_number,
+            key=SECTION_KEY, section=section, app_id=app_id,
+            create_if_absent=create_if_absent,
+        )
+    except (httpx.HTTPStatusError, httpx.RequestError) as exc:
+        log.warning(
+            "hunt_board_publish_failed",
+            extra={"repo": f"{owner}/{repo}", "pr": pr_number,
+                   "version": session.version, "error": type(exc).__name__},
+        )
+        return {"board": "failed", "section": SECTION_KEY}
