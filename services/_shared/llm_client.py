@@ -3236,7 +3236,7 @@ def _coerce_findings(raw_findings: list[Any], model_name: str) -> tuple[Finding,
 
 @dataclass(frozen=True, slots=True)
 class ParsedReview:
-    """One parsed review answer (`_parse_review`).
+    """One parsed LLM answer (review or interactive JSON).
 
     `error` is empty when the answer parsed. `truncated_findings` (grug#1231)
     is True when the answer was a findings list cut off before it closed:
@@ -3343,13 +3343,12 @@ def _parse_review(resp: httpx.Response) -> ParsedReview:
         return ParsedReview((), "", "envelope_not_a_dict")
     if "choices" not in body and "output" in body:
         # Responses API reply (BackendConfig.wire == "responses"). Normalise
-        # to the chat-completions shape so everything below - and all six
-        # _call_backend call sites - stay unchanged.
+        # to the chat-completions shape so the parser below can use one shape.
         #
         # Detected by SHAPE rather than threaded through as a flag: the
         # discriminator is unambiguous (`output` and `choices` never co-occur)
         # and _parse_response only receives an httpx.Response, so a flag would
-        # mean touching every call site to carry information the payload
+        # mean touching its call sites to carry information the payload
         # already states.
         body = _responses_envelope_to_chat(body)
     model_name = body.get("model", "")
@@ -3483,6 +3482,36 @@ def _choices_content(body: Any) -> str:
     return ""
 
 
+def _interactive_payload(content: str, field: str) -> dict | None:
+    """Return a usable JSON object for one interactive response."""
+    if not content:
+        return None
+    try:
+        data = json.loads(content)
+    except (ValueError, TypeError):
+        return None
+    if not isinstance(data, dict):
+        return None
+    value = data.get(field)
+    if not isinstance(value, str) or not value.strip():
+        return None
+    return data
+
+
+def _parse_interactive_attempt(resp: httpx.Response, field: str) -> ParsedReview:
+    """Validate interactive JSON within the shared attempt's span."""
+    if not 200 <= resp.status_code < 300:
+        return ParsedReview((), "", f"http_{resp.status_code}")
+    try:
+        body = resp.json()
+    except ValueError:
+        return ParsedReview((), "", "envelope_json_decode_failed")
+    content = _choices_content(body)
+    model = body.get("model", "") if isinstance(body, dict) else ""
+    error = "" if _interactive_payload(content, field) is not None else "interactive_json_invalid"
+    return ParsedReview((), model, error)
+
+
 def _annotate_interactive(
     span: Any,
     *,
@@ -3496,11 +3525,7 @@ def _annotate_interactive(
     status_code: Optional[int] = None,
     error: str = "",
 ) -> None:
-    """One span annotation for an interactive (Teller / /grug ask) attempt.
-
-    `kind` taxonomy: transport_error (no response), http_error (non-2xx -
-    availability, NOT model output), parse_failed (2xx but unusable model
-    output), summarized/answered (success)."""
+    """Annotate the learning classifier's interactive span."""
     metadata: dict[str, Any] = {"backend": backend.value, "kind": kind}
     if status_code is not None:
         metadata["status_code"] = status_code
@@ -3534,8 +3559,6 @@ def summarize_pr(
     Emits one `teller_walkthrough` LLMObs span per backend attempt so DD
     can filter walkthrough latency/quality separately from Elder review.
     Optional `pr_context` attaches repo/pr_number/head_sha tags."""
-    import json as _json
-
     diff_text = _redact_secrets(diff_text)[:24000]
     paths_block = "\n".join(file_paths[:200])
     messages = [
@@ -3558,67 +3581,28 @@ def summarize_pr(
     pr_tags = _interactive_tags(installation_id, pr_context)
     for backend in _interactive_backend_order(installation_id):
         config = _BACKEND_CONFIGS[backend]
-        start_ns = time.monotonic_ns()
-        with _llmobs_llm(
-            model_name=config.model,
-            model_provider=backend.value,
-            name=_LLMOBS_TELLER_NAME,
-        ) as span:
-            try:
-                resp = _call_backend(config, messages)
-            except (_BackendConfigError, httpx.RequestError, httpx.TimeoutException) as e:
-                _annotate_interactive(
-                    span, backend=backend, kind="transport_error",
-                    messages=messages, start_ns=start_ns, pr_tags=pr_tags,
-                    error=type(e).__name__,
-                )
-                continue
-            if not 200 <= resp.status_code < 300:
-                # Availability, not model output: a 429/5xx storm must not
-                # read as parse failures in the DD kind facet.
-                _annotate_interactive(
-                    span, backend=backend, kind="http_error",
-                    messages=messages, start_ns=start_ns, pr_tags=pr_tags,
-                    status_code=resp.status_code,
-                )
-                continue
-            try:
-                body = resp.json()
-            except ValueError:
-                body = {}
-            if not isinstance(body, dict):
-                body = {}
-            content = _choices_content(body)
-            summary = ""
-            file_summaries: dict[str, str] = {}
-            effort: str | None = None
-            try:
-                data = _json.loads(content) if content else {}
-                if not isinstance(data, dict):
-                    raise ValueError("summary payload not a dict")
-                summary = str(data.get("summary", "")).strip()
-                raw_files = data.get("file_summaries")
-                if isinstance(raw_files, dict):
-                    file_summaries = {str(k): str(v) for k, v in raw_files.items()}
-                raw_effort = data.get("effort")
-                effort = raw_effort if isinstance(raw_effort, str) else None
-            except (KeyError, ValueError, TypeError, AttributeError, json.JSONDecodeError):
-                summary = ""
-            if not summary:
-                _annotate_interactive(
-                    span, backend=backend, kind="parse_failed",
-                    messages=messages, start_ns=start_ns, pr_tags=pr_tags,
-                    content=content, body=body, status_code=resp.status_code,
-                )
-                continue
-            _annotate_interactive(
-                span, backend=backend, kind="summarized",
-                messages=messages, start_ns=start_ns, pr_tags=pr_tags,
-                content=content, body=body, status_code=resp.status_code,
-            )
-            return WalkthroughSummary(
-                summary=summary, file_summaries=file_summaries, effort=effort,
-            )
+        attempt = _run_llm_attempt(
+            backend=backend, config=config, messages=messages, variant="default",
+            pr_tags=pr_tags, span_name=_LLMOBS_TELLER_NAME,
+            success_kind="summarized",
+            response_parser=lambda resp: _parse_interactive_attempt(resp, "summary"),
+            report_direct_call=False,
+        )
+        if attempt.error_kind is not None:
+            continue
+        data = _interactive_payload(attempt.content, "summary")
+        if data is None:
+            continue
+        raw_files = data.get("file_summaries")
+        file_summaries = (
+            {str(k): str(v) for k, v in raw_files.items()}
+            if isinstance(raw_files, dict) else {}
+        )
+        raw_effort = data.get("effort")
+        return WalkthroughSummary(
+            summary=data["summary"].strip(), file_summaries=file_summaries,
+            effort=raw_effort if isinstance(raw_effort, str) else None,
+        )
     return None
 
 
@@ -3635,7 +3619,6 @@ def answer_pr_question(
 
     Emits one `grug_ask` LLMObs span per backend attempt. Optional
     `pr_context` attaches repo/pr_number tags for DD filtering."""
-    import json as _json
     diff_text = _redact_secrets(diff_text)[:24000]  # bound the context + scrub secrets
     system = (
         "You are Grug, a terse code-review assistant. Answer the maintainer's "
@@ -3656,61 +3639,18 @@ def answer_pr_question(
     pr_tags = _interactive_tags(installation_id, pr_context)
     for backend in _interactive_backend_order(installation_id):
         config = _BACKEND_CONFIGS[backend]
-        start_ns = time.monotonic_ns()
-        with _llmobs_llm(
-            model_name=config.model,
-            model_provider=backend.value,
-            name=_LLMOBS_ASK_NAME,
-        ) as span:
-            try:
-                resp = _call_backend(config, messages)
-            except (_BackendConfigError, httpx.RequestError, httpx.TimeoutException) as e:
-                _annotate_interactive(
-                    span, backend=backend, kind="transport_error",
-                    messages=messages, start_ns=start_ns, pr_tags=pr_tags,
-                    error=type(e).__name__,
-                )
-                continue
-            if not 200 <= resp.status_code < 300:
-                # Availability, not model output: a 429/5xx storm must not
-                # read as parse failures in the DD kind facet.
-                _annotate_interactive(
-                    span, backend=backend, kind="http_error",
-                    messages=messages, start_ns=start_ns, pr_tags=pr_tags,
-                    status_code=resp.status_code,
-                )
-                continue
-            try:
-                body = resp.json()
-            except ValueError:
-                body = {}
-            if not isinstance(body, dict):
-                body = {}
-            content = _choices_content(body)
-            answer = ""
-            try:
-                data = _json.loads(content) if content else {}
-                if not isinstance(data, dict):
-                    raise ValueError("ask payload not a dict")
-                raw_answer = data.get("answer", "")
-                # A non-string answer (dict/list) is a parse failure, never
-                # str()-coerced into a Python repr posted on the PR.
-                answer = raw_answer.strip() if isinstance(raw_answer, str) else ""
-            except (KeyError, ValueError, TypeError, AttributeError, json.JSONDecodeError):
-                answer = ""
-            if not answer:
-                _annotate_interactive(
-                    span, backend=backend, kind="parse_failed",
-                    messages=messages, start_ns=start_ns, pr_tags=pr_tags,
-                    content=content, body=body, status_code=resp.status_code,
-                )
-                continue
-            _annotate_interactive(
-                span, backend=backend, kind="answered",
-                messages=messages, start_ns=start_ns, pr_tags=pr_tags,
-                content=content, body=body, status_code=resp.status_code,
-            )
-            return answer
+        attempt = _run_llm_attempt(
+            backend=backend, config=config, messages=messages, variant="default",
+            pr_tags=pr_tags, span_name=_LLMOBS_ASK_NAME,
+            success_kind="answered",
+            response_parser=lambda resp: _parse_interactive_attempt(resp, "answer"),
+            report_direct_call=False,
+        )
+        if attempt.error_kind is not None:
+            continue
+        data = _interactive_payload(attempt.content, "answer")
+        if data is not None:
+            return data["answer"].strip()
     return None
 
 
@@ -5669,7 +5609,8 @@ class AttemptOutcome:
     body-reparse → `_extract_usage_metrics` → `_llmobs_annotate` on every
     caught exit path — lives in exactly one place. Callers
     (`_run_review_arm`, the SaaS overload fallback loop) keep only their
-    own outcome mapping. `error_kind` is None on a completed attempt
+    own outcome mapping. Teller and /grug ask also supply their span name
+    and response parser. `error_kind` is None on a completed attempt
     (findings may still be empty when the body did not parse).
     """
 
@@ -5707,11 +5648,12 @@ def _annotate_attempt_error(
     messages: list[dict[str, str]],
     start_ns: int,
     error_label: str,
+    kind: str | None = None,
 ) -> None:
     """Annotate the attempt span for a caught config/transport error.
 
     Small so `_run_llm_attempt` stays under Grug's complexity cap — the
-    two error exits share this shape exactly (Elder, #660 follow-up).
+    two error exits share this shape exactly.
     """
     _llmobs_annotate(
         span=span,
@@ -5720,6 +5662,7 @@ def _annotate_attempt_error(
             "backend": backend.value,
             "variant_id": variant,
             "error": error_label,
+            **({"kind": kind} if kind else {}),
         },
         metrics={"latency_ms": _elapsed_ms(start_ns)},
         tags=pr_tags,
@@ -5736,7 +5679,7 @@ def _reparse_attempt_body(resp: httpx.Response, backend: Backend) -> dict:
     content and undercount DD token-cost dashboards.
     """
     try:
-        body = resp.json() if resp.status_code == 200 else {}
+        body = resp.json() if 200 <= resp.status_code < 300 else {}
     except (ValueError, json.JSONDecodeError):
         # Triggered when the first parse also failed (CF HTML
         # interstitial, truncated body) OR — rarely — when the cache
@@ -5750,7 +5693,11 @@ def _reparse_attempt_body(resp: httpx.Response, backend: Backend) -> dict:
             },
         )
         body = {}
-    return body if isinstance(body, dict) else {}
+    if not isinstance(body, dict):
+        return {}
+    if "choices" not in body and "output" in body:
+        return _responses_envelope_to_chat(body)
+    return body
 
 
 def _extract_attempt_content(body: dict) -> tuple[str, str]:
@@ -5816,6 +5763,10 @@ def _run_llm_attempt(
     pr_tags: dict[str, str],
     cancel_event: threading.Event | None = None,
     transport_log_event: str = "llm_backend_transport_failed",
+    span_name: str = _LLMOBS_NAME,
+    success_kind: str = "reviewed",
+    response_parser: Callable[[httpx.Response], ParsedReview] = _parse_review,
+    report_direct_call: bool = True,
 ) -> AttemptOutcome:
     """`_call_llm_attempt` plus the chunk ladder bookkeeping (grug#1196).
 
@@ -5825,7 +5776,8 @@ def _run_llm_attempt(
     as a config miss, which every caller already steps past. Each real
     failure is appended to the chunk's trail so the neutral check can name
     it. Outside a chunk both context variables are empty and this is a plain
-    pass-through."""
+    pass-through. Interactive callers supply a response parser and span name;
+    they skip review-specific direct-call reporting."""
     key = (backend.value, config.model)
     if key in _LADDER_SKIP.get():
         return AttemptOutcome(
@@ -5840,8 +5792,11 @@ def _run_llm_attempt(
         backend=backend, config=config, messages=messages, variant=variant,
         pr_tags=pr_tags, cancel_event=cancel_event,
         transport_log_event=transport_log_event,
+        span_name=span_name, success_kind=success_kind,
+        response_parser=response_parser,
     )
-    _report_direct_call(backend, config, outcome, time.monotonic() - started)
+    if report_direct_call:
+        _report_direct_call(backend, config, outcome, time.monotonic() - started)
     trail = _LADDER_TRAIL.get()
     reason = _ladder_failure_reason(outcome)
     if trail is not None and reason is not None:
@@ -5858,9 +5813,12 @@ def _call_llm_attempt(
     pr_tags: dict[str, str],
     cancel_event: threading.Event | None = None,
     transport_log_event: str = "llm_backend_transport_failed",
+    span_name: str = _LLMOBS_NAME,
+    success_kind: str = "reviewed",
+    response_parser: Callable[[httpx.Response], ParsedReview] = _parse_review,
 ) -> AttemptOutcome:
-    """Run a single LLM attempt: open one `_llmobs_llm` span
-    (`elder_code_review`), call the backend, classify config/transport/parse
+    """Run a single LLM attempt: open one `_llmobs_llm` span,
+    call the backend, classify config/transport/parse
     errors, re-parse the body, extract usage metrics, and annotate the span
     on EVERY caught exit path (success + config + transport + parse/http).
 
@@ -5876,7 +5834,7 @@ def _call_llm_attempt(
     with _llmobs_llm(
         model_name=config.model,
         model_provider=backend.value,
-        name=_LLMOBS_NAME,
+        name=span_name,
     ) as span:
         try:
             resp = _call_backend(config, messages, cancel_event=cancel_event)
@@ -5895,6 +5853,7 @@ def _call_llm_attempt(
                 messages=messages,
                 start_ns=start_ns,
                 error_label="config",
+                kind="transport_error" if success_kind != "reviewed" else None,
             )
             return AttemptOutcome(
                 backend=backend,
@@ -5923,6 +5882,7 @@ def _call_llm_attempt(
                 messages=messages,
                 start_ns=start_ns,
                 error_label=type(e).__name__,
+                kind="transport_error" if success_kind != "reviewed" else None,
             )
             return AttemptOutcome(
                 backend=backend,
@@ -5937,8 +5897,12 @@ def _call_llm_attempt(
                 span_context=None,
                 raw_response=None,
             )
-        parsed = _parse_review(resp)
+        parsed = response_parser(resp)
         findings, model, err = parsed.findings, parsed.model_name, parsed.error
+        parsed_status = (
+            resp.status_code == 200 if success_kind == "reviewed"
+            else 200 <= resp.status_code < 300
+        )
         # Annotate AFTER the response so we capture the raw content
         # + token counts.
         body = _reparse_attempt_body(resp, backend)
@@ -5952,8 +5916,8 @@ def _call_llm_attempt(
                 "backend": backend.value,
                 "variant_id": variant,  # #191 prompt A/B arm
                 "status_code": resp.status_code,
-                "kind": "reviewed" if not err else (
-                    "parse_failed" if resp.status_code == 200 else "http_error"
+                "kind": success_kind if not err else (
+                    "parse_failed" if parsed_status else "http_error"
                 ),
                 "finish_reason": finish_reason,
                 "findings_truncated": parsed.truncated_findings,
@@ -5975,7 +5939,7 @@ def _call_llm_attempt(
             error_kind=(
                 None
                 if not err
-                else ("parse_failed" if resp.status_code == 200 else "http_error")
+                else ("parse_failed" if parsed_status else "http_error")
             ),
             error_text=err or None,
             status_code=resp.status_code,
@@ -7337,8 +7301,8 @@ def judge_findings(
     # Per call the judge still hits ONE backend and returns () on any
     # error; trying the next backend is `personas/code_reviewer/judge.py`'s
     # job. If the non-review envelopes are ever unified, they share a
-    # helper of their own (Teller/ask/learn already share
-    # `_annotate_interactive`), not the review seam.
+    # helper of their own. Teller and /grug ask use the attempt seam with
+    # a dedicated JSON parser; the judge's other constraints still apply.
     # test_judge_findings_stays_off_the_review_seam pins 1 and 3.
     # `config` override routes this judge call to a specific backend - the
     # exposed-secret class goes to the in-cluster Cave (#439, ADR-0009);
