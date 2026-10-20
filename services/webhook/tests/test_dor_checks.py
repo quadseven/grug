@@ -13,6 +13,7 @@ from personas.tpm.dor_checks import (
     check_acceptance,
     check_estimate,
     check_issue_link,
+    check_in_scope,
     check_linked_issue_completeness,
     check_linked_issue_in_epic,
     check_loom_footer,
@@ -159,13 +160,91 @@ def test_loom_footer_passes_not_skipped_for_non_loom_pr():
     assert r.passed and not r.skipped
 
 
-def test_run_all_returns_8():
+def test_run_all_returns_9():
     results = run_all("")
-    assert len(results) == 8
+    assert len(results) == 9
     assert {r.name for r in results} == {
         "why", "acceptance", "estimate", "scope-fence", "issue-link",
         "loom-footer", "linked-issue-completeness", "linked-issue-epic",
+        "in-scope",
     }
+
+
+# --- in-scope (#1195) ---
+
+
+def _files(*paths):
+    return lambda: list(paths)
+
+
+def test_in_scope_no_linked_issue_degrades_gracefully():
+    """No issue link in the body -> pass, no fetcher required."""
+    body = "## Why\nreal reason here\n## Acceptance criteria\n- [x] a\n- [x] b\n- [x] c\n**Size:** M\n"
+    r = check_in_scope(body)
+    assert r.passed and not r.skipped
+    assert "no linked issue" in r.detail
+
+
+def test_in_scope_all_changed_files_in_scope_passes():
+    body = "closes #42\n**Size:** M\n"
+    def fetcher(_num: int) -> str:
+        return "Add the foo handler in src/foo.py.\n"
+    r = check_in_scope(body, fetch_issue=fetcher, fetch_changed_files=_files("src/foo.py"))
+    assert r.passed and not r.skipped
+    assert "within linked issue scope" in r.detail
+
+
+def test_in_scope_unrelated_feature_rider_warns_and_names_it():
+    body = "closes #42\n**Size:** M\n"
+    def fetcher(_num: int) -> str:
+        return "Add the foo handler.\n"
+    r = check_in_scope(
+        body, fetch_issue=fetcher,
+        fetch_changed_files=_files("src/foo.py", "src/billing/billing.py"),
+    )
+    assert not r.passed and not r.skipped
+    assert "src/billing/billing.py" in r.detail
+    assert "split to a separate PR or link an issue that covers them" in r.detail
+    # The in-scope file is NOT named as out of scope.
+    assert "src/foo.py" not in r.detail
+
+
+def test_in_scope_no_fetcher_fails_open_skipped():
+    body = "closes #42\n**Size:** M\n"
+    r = check_in_scope(body)
+    assert r.passed and r.skipped
+    assert "fail-open" in r.detail
+
+
+def test_in_scope_issue_fetch_failure_fails_open_skipped():
+    body = "closes #42\n**Size:** M\n"
+    def fetcher(_num: int) -> str:
+        raise RuntimeError("network blip")
+    r = check_in_scope(body, fetch_issue=fetcher, fetch_changed_files=_files("src/foo.py"))
+    assert r.passed and r.skipped
+    assert "fail-open" in r.detail
+
+
+def test_in_scope_changed_files_fetch_failure_fails_open_skipped():
+    body = "closes #42\n**Size:** M\n"
+    def fetcher(_num: int) -> str:
+        return "src/foo.py\n"
+    def boom():
+        raise RuntimeError("diff unavailable")
+    r = check_in_scope(body, fetch_issue=fetcher, fetch_changed_files=boom)
+    assert r.passed and r.skipped
+    assert "fail-open" in r.detail
+
+
+def test_in_scope_multiple_linked_issues_any_match_is_in_scope():
+    body = "closes #10 closes #20\n**Size:** M\n"
+    def fetcher(num: int) -> str:
+        return "the foo handler" if num == 10 else "billing cycle\n"
+    r = check_in_scope(
+        body, fetch_issue=fetcher,
+        fetch_changed_files=_files("src/foo.py", "src/billing/billing.py"),
+    )
+    assert r.passed and not r.skipped
 
 
 # --- Tolerant heading matching (qualifier suffix after the canonical name) ---

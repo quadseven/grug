@@ -218,6 +218,7 @@ spec:
             # grug#1286: post Elder's direct calls (OpenRouter, Poolside, OpenCode
             # Go) to the inference gateway's call ledger, beside the calls it routes.
             - {name: GRUG_CALL_REPORT, value: "true"}
+            - {name: GRUG_SHARED_BENCHES, value: "true"}
             - {name: GRUG_OPENCODE_GO_API_KEY_SSM, value: /infra/llm/opencode_go_api_key}
             - {name: GRUG_PROMPT_EXPERIMENT_SSM, value: /grug/elder-prompt-experiment}
             # In-cluster spark-gateway for the evidence-scoped judge. Keep the

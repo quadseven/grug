@@ -443,9 +443,10 @@ def test_recheck_fetch_failure_still_fails_open_but_visibly_skipped(_tpm_only):
     assert lic.passed is True and lic.skipped is True
 
     title, summary = tpm_persona._summary(list(recheck_eval.results))
-    assert "all 8 checks" not in title
-    assert "6/8 checks" in title and "ticket done, which epic skipped" in title
+    assert "all 9 checks" not in title
+    assert "6/9 checks" in title and "ticket done, which epic, in scope skipped" in title
     assert "| ticket done | skipped |" in summary
+    assert "| in scope | skipped |" in summary
 
 
 def test_recheck_and_webhook_agree_that_an_orphan_ticket_blocks(_tpm_only):
@@ -519,8 +520,10 @@ def test_run_chief_recheck_evaluates_then_publishes(monkeypatch):
     monkeypatch.setattr(fetchers, "build_issue_fetcher", lambda **kw: "F")
     monkeypatch.setattr(fetchers, "build_issue_facts_fetcher", lambda **kw: "FF")
 
-    def _eval(body, fetch_issue=None, fetch_issue_facts=None, author_trusted=False):
-        seen["eval"] = (body, fetch_issue, fetch_issue_facts)
+    def _eval(body, fetch_issue=None, fetch_issue_facts=None, author_trusted=False,
+              fetch_changed_files=None, advisory_checks=None):
+        seen["eval"] = (body, fetch_issue, fetch_issue_facts, fetch_changed_files,
+                        advisory_checks)
         seen["trusted"] = author_trusted
         return "EVAL"
 
@@ -534,8 +537,12 @@ def test_run_chief_recheck_evaluates_then_publishes(monkeypatch):
         installation_id=5, owner="o", repo="r", head_sha="abc", pr_number=9, pr_body="B",
     )
     assert evaluation == "EVAL" and result_map["result"] == "pass"
-    assert seen["eval"] == ("B", "F", "FF")
+    body, fi, ff, fcf, ac = seen["eval"]
+    assert body == "B" and fi == "F" and ff == "FF"
+    assert callable(fcf)  # the shared changed-files fetcher is wired through
+    assert "in-scope" in ac  # advisory set passed through
     assert seen["trusted"] is False  # default keeps the pre-#1251 skip
     assert seen["publish"][1] == {
-        "installation_id": 5, "owner": "o", "repo": "r", "head_sha": "abc", "pr_number": 9,
+        "installation_id": 5, "owner": "o", "repo": "r", "head_sha": "abc",
+        "pr_number": 9, "advisory_checks": ac,
     }

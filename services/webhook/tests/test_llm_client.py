@@ -3182,6 +3182,112 @@ def test_answer_pr_question_returns_none_on_backend_failure(monkeypatch) -> None
     assert all(c["metadata"]["kind"] == "transport_error" for c in annotate_calls)
 
 
+@pytest.mark.parametrize(
+    ("caller", "payload", "span_name", "success_kind"),
+    [
+        ("summarize_pr", '{"summary":"Ready"}', "teller_walkthrough", "summarized"),
+        ("answer_pr_question", '{"answer":"Ready"}', "grug_ask", "answered"),
+    ],
+)
+def test_interactive_call_uses_attempt_seam_with_one_usage_span(
+    monkeypatch, caller, payload, span_name, success_kind,
+) -> None:
+    calls = []
+    real_seam = lc._run_llm_attempt
+
+    def record_seam(**kwargs):
+        calls.append(kwargs)
+        return real_seam(**kwargs)
+
+    monkeypatch.setattr(lc, "_run_llm_attempt", record_seam)
+    spans = []
+    annotations = _capture_llmobs(monkeypatch)
+
+    class Span:
+        def __enter__(self): return self
+        def __exit__(self, *args): return False
+
+    def record_span(**kwargs):
+        spans.append(kwargs)
+        return Span()
+
+    monkeypatch.setattr(lc, "_llmobs_llm", record_span)
+    response = httpx.Response(200, json={
+        **_openai_json_response(payload),
+        "usage": {"prompt_tokens": 11, "completion_tokens": 7},
+    })
+    with patch.object(httpx, "post", return_value=response):
+        result = (
+            lc.summarize_pr("diff", ["x.py"], installation_id=2)
+            if caller == "summarize_pr"
+            else lc.answer_pr_question("q", "diff", installation_id=2)
+        )
+    assert result is not None
+    assert len(calls) == len(spans) == len(annotations) == 1
+    assert spans[0]["name"] == span_name
+    assert annotations[0]["metadata"]["kind"] == success_kind
+    assert annotations[0]["metrics"]["input_tokens"] == 11
+
+
+@pytest.mark.parametrize("caller", ["summarize_pr", "answer_pr_question"])
+def test_interactive_transport_failures_use_attempt_seam(monkeypatch, caller) -> None:
+    calls = []
+    real_seam = lc._run_llm_attempt
+
+    def record_seam(**kwargs):
+        calls.append(kwargs)
+        return real_seam(**kwargs)
+
+    monkeypatch.setattr(lc, "_run_llm_attempt", record_seam)
+    annotations = _capture_llmobs(monkeypatch)
+    with patch.object(httpx, "post", side_effect=httpx.ConnectError("down")):
+        result = (
+            lc.summarize_pr("diff", ["x.py"], installation_id=2)
+            if caller == "summarize_pr"
+            else lc.answer_pr_question("q", "diff", installation_id=2)
+        )
+    assert result is None
+    assert len(calls) == len(annotations) == 2
+    assert all(call["metadata"]["error"] == "ConnectError" for call in annotations)
+
+
+@pytest.mark.parametrize(
+    ("caller", "payload"),
+    [
+        ("summarize_pr", '{"summary":"Recovered"}'),
+        ("answer_pr_question", '{"answer":"Recovered"}'),
+    ],
+)
+def test_interactive_failover_keeps_redacted_diff_bound(
+    monkeypatch, caller, payload,
+) -> None:
+    calls = []
+    real_seam = lc._run_llm_attempt
+
+    def record_seam(**kwargs):
+        calls.append(kwargs)
+        return real_seam(**kwargs)
+
+    monkeypatch.setattr(lc, "_run_llm_attempt", record_seam)
+    annotations = _capture_llmobs(monkeypatch)
+    response = httpx.Response(200, json=_openai_json_response(payload))
+    with patch.object(
+        lc, "_call_backend", side_effect=[httpx.ConnectError("down"), response],
+    ):
+        result = (
+            lc.summarize_pr("x" * 24001, ["x.py"], installation_id=2)
+            if caller == "summarize_pr"
+            else lc.answer_pr_question("q", "x" * 24001, installation_id=2)
+        )
+    assert result is not None
+    assert len(calls) == len(annotations) == 2
+    assert [call["metadata"].get("kind") for call in annotations] == [
+        "transport_error", "summarized" if caller == "summarize_pr" else "answered",
+    ]
+    assert all("x" * 24000 in call["messages"][1]["content"] for call in calls)
+    assert all("x" * 24001 not in call["messages"][1]["content"] for call in calls)
+
+
 # --- reply-mined learnings (#670, ADR-0020) --------------------------------
 
 def test_classify_learning_durable_returns_rule_and_scope() -> None:

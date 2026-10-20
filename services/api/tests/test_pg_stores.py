@@ -1628,3 +1628,51 @@ def test_review_session_concurrent_personas_all_land(pg):
         at="x",
     )
     assert again.version == len(personas)
+
+
+# --- grug#1286: Elder's benches and breakers, shared across pods ------------
+
+
+def _shared_benches(monkeypatch):
+    if _SHARED_DIR not in sys.path:
+        sys.path.insert(0, _SHARED_DIR)
+    import shared_benches
+
+    monkeypatch.setenv("GRUG_SHARED_BENCHES", "true")
+    monkeypatch.setattr(shared_benches, "_ensure_thread", lambda: None)
+    monkeypatch.setattr(shared_benches, "_snapshot", {})
+    shared_benches._queue.clear()
+    return shared_benches
+
+
+def test_a_shared_bench_reaches_a_fresh_process_and_keeps_the_later_end(pg, monkeypatch):
+    sb = _shared_benches(monkeypatch)
+    now = time.time()
+    sb.publish("bench", "poolside", "laguna-s-2.1", now + 3600)
+    sb.publish("bench", "poolside", "laguna-s-2.1", now + 600)  # an earlier end never shortens it
+    sb.publish("provider", "openrouter", "free", now + 900)
+    sb.sync()
+
+    monkeypatch.setattr(sb, "_snapshot", {})  # a restarted pod
+    assert sb.refresh() == 2
+    assert sb.blocked_until("bench", "poolside", "laguna-s-2.1") == pytest.approx(now + 3600)
+    assert sb.blocked_until("provider", "openrouter", "free") == pytest.approx(now + 900)
+
+
+def test_a_cleared_or_expired_shared_bench_is_gone(pg, monkeypatch):
+    sb = _shared_benches(monkeypatch)
+    now = time.time()
+    sb.publish("slow", "openrouter", "m:free", now + 600)
+    sb.publish("go", "opencode-go", "", now + 600)
+    sb.sync()
+    sb.clear("slow", "openrouter", "m:free")
+    sb.sync()
+    with pg.get_pool().connection() as conn:
+        conn.execute(
+            "UPDATE grug_kv SET ttl = EXTRACT(EPOCH FROM now())::bigint - 10 WHERE pk = %s",
+            (sb.PK,),
+        )
+
+    monkeypatch.setattr(sb, "_snapshot", {})
+    assert sb.refresh() == 0
+    assert sb.blocked_until("go", "opencode-go") == 0.0

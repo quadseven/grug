@@ -7,8 +7,9 @@ Proves:
 Two-layer proof:
   Layer 1 (AST): _ADVISORY_CHECKS is defined, is a frozenset literal,
   and every entry is one of the 6 canonical check names.
-  Layer 2 (AST): evaluate_pull_request filters blocking via
-  `r.name not in _ADVISORY_CHECKS` — advisory failures cannot block.
+  Layer 2 (AST): evaluate_pull_request routes blocking through
+  `_blocking_failures`, which filters on the `advisory_checks` parameter
+  (defaulting to `_ADVISORY_CHECKS`) — advisory failures cannot block.
 """
 from __future__ import annotations
 
@@ -22,8 +23,9 @@ PERSONA_PATHS = (
     REPO_ROOT / "services/_shared/personas/tpm/persona.py",
 )
 
-# `loom-footer` is the advisory Loom audit-footer check (grug#1201).
-CANONICAL_NAMES = frozenset({"why", "acceptance", "estimate", "scope-fence", "issue-link", "loom-footer"})
+# `loom-footer` is the advisory Loom audit-footer check (grug#1201),
+# `in-scope` is the advisory diff-vs-issue-scope check (grug#1195).
+CANONICAL_NAMES = frozenset({"why", "acceptance", "estimate", "scope-fence", "issue-link", "loom-footer", "in-scope"})
 
 
 def _find_advisory_set(tree: ast.Module) -> frozenset[str] | None:
@@ -51,7 +53,11 @@ def _find_advisory_set(tree: ast.Module) -> frozenset[str] | None:
 
 def _evaluate_filters_by_advisory(tree: ast.Module) -> bool:
     source = ast.dump(tree)
-    return "_ADVISORY_CHECKS" in source and "not in _ADVISORY_CHECKS" in ast.unparse(tree)
+    # `evaluate_pull_request` routes blocking through `_blocking_failures`,
+    # which filters on the `advisory_checks` parameter (defaulting to
+    # `_ADVISORY_CHECKS`): advisory failures cannot block.
+    return ("_ADVISORY_CHECKS" in source
+            and "not in advisory_checks" in ast.unparse(tree))
 
 
 def main() -> int:
