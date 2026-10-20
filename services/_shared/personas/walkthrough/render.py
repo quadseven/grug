@@ -157,8 +157,8 @@ def walkthrough_body(
     is then a floor, not an exact count. `summary` is model-authored:
     mentions and line-leading `#` headings are neutralized before this
     prose posts under the app's own installation-token identity.
-    `pr_url` is the PR/review URL; when provided it's rendered as a
-    badge-image button after the header.
+    `pr_url` is where the full review is (the PR's Checks tab); when
+    provided it's rendered as a badge-image button after the header.
     """
     parts = [MARKER, TELLER_PORTRAIT_IMG, "", "## Walkthrough", ""]
     parts.append(

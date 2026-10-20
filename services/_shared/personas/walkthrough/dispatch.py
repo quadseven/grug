@@ -434,7 +434,10 @@ def dispatch_walkthrough_review(
         )
         return {"persona": "walkthrough", "result": "skipped_closed"}
 
-    pr_url = f"https://github.com/{owner}/{repo_name}/pull/{pull_number}"
+    # The full review is Elder's check run output on the Checks tab: the
+    # walkthrough is a comment on the PR page, so linking that page only
+    # reloaded it.
+    pr_url = f"https://github.com/{owner}/{repo_name}/pull/{pull_number}/checks"
     body = walkthrough_body(
         summary=summary,
         files=files,

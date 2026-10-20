@@ -103,6 +103,41 @@ def test_dispatch_posts_new_comment_when_no_marker_exists(monkeypatch):
     assert mock_rcv.call_args.kwargs["conclusion"] == "success"
 
 
+def test_dispatch_view_full_review_opens_the_checks_tab_not_the_pr_itself(monkeypatch):
+    """The walkthrough is a comment on the PR, so a button linking the PR
+    page reloaded the page it sits on; the full review is Elder's check run
+    output on the PR's Checks tab."""
+    monkeypatch.setattr(
+        wt_dispatch, "with_install_token_retry",
+        lambda inst_id, fn: fn("tok"),
+    )
+    posted = {}
+
+    def fake_get(url, **kwargs):
+        if url.endswith("/files"):
+            return _files_response([
+                {"filename": "x.py", "additions": 3, "deletions": 1},
+            ])
+        if "/comments" in url:
+            return _empty_comments_response()
+        return _diff_response()
+
+    def fake_post(url, **kwargs):
+        posted["body"] = kwargs["json"]["body"]
+        r = MagicMock(spec=httpx.Response)
+        r.raise_for_status = MagicMock()
+        return r
+
+    with patch("httpx.get", side_effect=fake_get), \
+         patch("httpx.post", side_effect=fake_post), \
+         patch("personas.walkthrough.dispatch.record_check_verdict"), \
+         patch("llm_client.summarize_pr", return_value=None):
+        wt_dispatch.dispatch_walkthrough_review(_payload(), blocking=False)
+
+    assert '<a href="https://github.com/o/r/pull/7/checks">' in posted["body"]
+    assert '<a href="https://github.com/o/r/pull/7">' not in posted["body"]
+
+
 def test_dispatch_posts_nothing_when_the_pr_closed_before_publish(monkeypatch):
     """A lane pull request got its walkthrough 6.5 minutes after the merge
     (2026-10-18), one more email with nothing left to review."""
