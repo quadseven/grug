@@ -180,3 +180,81 @@ def test_wake_already_handled_comment_is_a_no_op(monkeypatch):
     res, _, state = _wake("resume", paused=True, claim_ok=False)
     assert res["status"] == "no_op" and "already" in res["reason"]
     assert state["resumed"] == 0
+
+
+def test_learnings_list_posts_rows(monkeypatch):
+    """`/grug learnings list` posts the remembered markings as a reply."""
+    fake = _FakeHttp(); monkeypatch.setattr(interactive, "httpx", fake)
+
+    def fake_list(repo):
+        return [
+            {"text": "no secrets in fixtures", "scope_path": "", "author": "a",
+             "source_pr": 3, "usage_count": 2},
+            {"text": "always add a test", "scope_path": "tests/*", "author": "b",
+             "source_pr": 5, "usage_count": 0},
+        ]
+
+    calls = []
+    monkeypatch.setattr(interactive, "_wake_learnings_list", lambda repo: fake_list(repo))
+
+    res = interactive.run_command(
+        "learnings", "list", install_id=1, owner="o", repo="r", pr_number=2,
+        comment_id=1, token_fn=_tok, claim=lambda k: True,
+    )
+    assert res["status"] == "dispatched" and res["sub"] == "list"
+    body = str([c[2] for c in fake.calls if c[0] == "post"][0])
+    assert "no secrets in fixtures" in body and "tests/*" in body
+    assert "used 2" in body and "used 0" in body
+
+
+def test_learnings_delete_removes_and_replies(monkeypatch):
+    """`/grug learnings delete <digest>` calls delete_learning and reports."""
+    fake = _FakeHttp(); monkeypatch.setattr(interactive, "httpx", fake)
+
+    deleted = []
+    def fake_delete(repo, digest):
+        deleted.append(digest); return True
+
+    monkeypatch.setattr(interactive, "_wake_learnings_delete", lambda repo, d: fake_delete(repo, d))
+
+    res = interactive.run_command(
+        "learnings", "delete abc123", install_id=1, owner="o", repo="r", pr_number=2,
+        comment_id=1, token_fn=_tok, claim=lambda k: True,
+    )
+    assert res["status"] == "dispatched" and res["sub"] == "delete"
+    assert deleted == ["abc123"]
+    body = str([c[2] for c in fake.calls if c[0] == "post"][0])
+    assert "Forgot marking" in body
+
+
+def test_learnings_delete_unknown_reports_none(monkeypatch):
+    fake = _FakeHttp(); monkeypatch.setattr(interactive, "httpx", fake)
+    monkeypatch.setattr(interactive, "_wake_learnings_delete", lambda repo, d: False)
+
+    res = interactive.run_command(
+        "learnings", "delete nope", install_id=1, owner="o", repo="r", pr_number=2,
+        comment_id=1, token_fn=_tok, claim=lambda k: True,
+    )
+    assert res["status"] == "dispatched" and res["sub"] == "delete"
+    body = str([c[2] for c in fake.calls if c[0] == "post"][0])
+    assert "No such marking" in body
+
+
+def test_learnings_empty_sub_posts_usage(monkeypatch):
+    fake = _FakeHttp(); monkeypatch.setattr(interactive, "httpx", fake)
+    res = interactive.run_command(
+        "learnings", "", install_id=1, owner="o", repo="r", pr_number=2,
+        comment_id=1, token_fn=_tok, claim=lambda k: True,
+    )
+    assert res["status"] == "no_op" and "unknown" in res["reason"]
+    assert any("Usage" in str(c[2]) for c in fake.calls if c[0] == "post")
+
+
+def test_learnings_delete_missing_arg_posts_usage(monkeypatch):
+    fake = _FakeHttp(); monkeypatch.setattr(interactive, "httpx", fake)
+    res = interactive.run_command(
+        "learnings", "delete", install_id=1, owner="o", repo="r", pr_number=2,
+        comment_id=1, token_fn=_tok, claim=lambda k: True,
+    )
+    assert res["status"] == "no_op" and "missing" in res["reason"]
+    assert any("Usage" in str(c[2]) for c in fake.calls if c[0] == "post")

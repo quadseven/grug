@@ -1731,6 +1731,8 @@ def test_run_learn_durable_stores_and_acks(monkeypatch):
     )
     monkeypatch.setattr(rerun, "with_install_token_retry", lambda iid, fn: fn("tok"))
     monkeypatch.setattr(rerun, "_gh_post", lambda token, url, body: posted.append((url, body)))
+    monkeypatch.setattr(rerun, "_org_learning_approval_delay",
+                        lambda install_id, repo_full: 0)
 
     result = rerun._run_learn(11, "o/r", 7, 5001, 4000, "we prefer early returns", "teammate")
 
@@ -1738,9 +1740,11 @@ def test_run_learn_durable_stores_and_acks(monkeypatch):
     assert put_calls and put_calls[0]["text"] == "prefer early returns"
     assert put_calls[0]["author"] == "teammate"  # the teacher, not the PR author
     assert put_calls[0]["scope_path"] == "**/mw/*.py" and put_calls[0]["source_pr"] == 7
-    # A reaction on the teacher's reply, never a comment (no email).
+    # A reaction on the teacher's reply, plus a collapsible acknowledgment.
     assert posted and "/pulls/comments/5001/reactions" in posted[0][0]
     assert posted[0][1] == {"content": rerun.LEARN_REACTION_LEARNED}
+    comments = [b["body"] for (_u, b) in posted if "/pulls/comments/5001/replies" in _u]
+    assert comments and "Markings remembered" in comments[0] and "prefer early returns" in comments[0]
 
 
 def test_run_learn_one_off_declines_without_storing(monkeypatch):
@@ -1768,6 +1772,9 @@ def test_run_learn_one_off_declines_without_storing(monkeypatch):
     assert put_calls == []  # nothing stored
     assert posted and "/pulls/comments/5001/reactions" in posted[0][0]
     assert posted[0][1] == {"content": rerun.LEARN_REACTION_ONE_OFF}
+    # Declining is explicit in the acknowledgment comment (not just a reaction).
+    bodies = [b["body"] for (_u, b) in posted if "/pulls/comments/5001/replies" in _u]
+    assert bodies and "Not remembered" in bodies[0] and "one reply only" in bodies[0]
 
 
 def test_run_learn_classifier_none_raises_for_redrive(monkeypatch):
@@ -1973,6 +1980,8 @@ def test_run_learn_redelivery_skips_classifier_and_reuses_stored_rule(monkeypatc
     # Ack already claimed on the first delivery -> no duplicate ack.
     monkeypatch.setattr("adapters.install_store.claim_delivery", lambda k: False)
     monkeypatch.setattr(rerun, "_gh_post", lambda token, url, body: posted.append(body))
+    monkeypatch.setattr(rerun, "_org_learning_approval_delay",
+                        lambda install_id, repo_full: 0)
 
     assert rerun._run_learn(11, "o/r", 7, 5001, 4000, "x", "dev") == "learn_duplicate"
     assert posted == []
@@ -2477,11 +2486,16 @@ def test_shutdown_sweep_clears_registered_board_notes(monkeypatch):
     rerun._unregister_board_note(token)  # idempotent, no error
 
 
-def test_learn_outcomes_never_post_a_comment(monkeypatch):
-    """Every learn outcome is a reaction on the reply. A grug comment here is
-    an email to a person who does not read them (operator, 2026-10-05)."""
-    for verdict in ({"durable": True, "learning": "x", "scope_path": ""},
-                    {"durable": False, "learning": "", "scope_path": ""}):
+def test_learn_acks_post_collapsible_comment(monkeypatch):
+    """#1194: every durable/one-off learn outcome posts a collapsible
+    acknowledgment comment on the finding thread (plus a reaction), so the
+    team sees what was or wasn't remembered."""
+    for verdict, expect_summary in (
+        ({"durable": True, "learning": "prefer early returns", "scope_path": "**/mw/*.py"},
+         "Markings remembered"),
+        ({"durable": False, "learning": "", "scope_path": ""},
+         "Not remembered"),
+    ):
         posted = []
         monkeypatch.setattr("adapters.install_store.get_learning_by_source_comment", lambda repo, cid: None)
         monkeypatch.setattr("adapters.install_store.get_comment_record",
@@ -2491,8 +2505,14 @@ def test_learn_outcomes_never_post_a_comment(monkeypatch):
         monkeypatch.setattr("llm_client.classify_learning", lambda *a, v=verdict, **k: v)
         monkeypatch.setattr(rerun, "with_install_token_retry", lambda iid, fn: fn("tok"))
         monkeypatch.setattr(rerun, "_gh_post", lambda token, url, body, sink=posted: sink.append((url, body)))
+        monkeypatch.setattr(rerun, "_org_learning_approval_delay", lambda install_id, repo_full: 0)
         rerun._run_learn(11, "o/r", 7, 5001, 4000, "reply")
-        assert posted and all(url.endswith("/reactions") and set(body) == {"content"} for url, body in posted)
+
+        reactions = [b for (_u, b) in posted if _u.endswith("/reactions")]
+        comments = [b["body"] for (_u, b) in posted if "/pulls/comments/5001/replies" in _u]
+        assert reactions, "expected a reaction ack"
+        assert comments, "expected a collapsible acknowledgment comment"
+        assert expect_summary in comments[0], f"expected {expect_summary!r} in comment"
 
 
 def test_learn_reply_syncs_the_findings_living_review_state(monkeypatch):

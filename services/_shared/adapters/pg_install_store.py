@@ -231,6 +231,11 @@ _LIST_REPO_FLAGS = frozenset({"guard_hygiene_dead_ref_patterns"})
 _INT_REPO_FLAGS = frozenset({"complexity_cyclomatic_cap", "complexity_cognitive_cap"})
 _INT_REPO_FLAG_MAX = 1000
 
+# Repo-level flags whose value is a non-negative INTEGER SECONDS duration
+# (learning approval delay). Zero means "immediate / active on teach".
+_DURATION_REPO_FLAGS = frozenset({"learning_approval_delay_seconds"})
+_LEARNING_APPROVAL_DELAY_MAX_SECONDS = 30 * 86400  # 30 days cap
+
 _DEFAULT_PERSONA_CONFIG = {
     "tpm_enabled": True,
     "code_reviewer_enabled": True,
@@ -296,6 +301,11 @@ def get_repo_config(install_id: int, repo_id: int) -> dict[str, Any]:
     cfg["enforcement_ruleset_id"] = int(rid) if rid is not None else None
     cfg["force_disable_enforcement"] = bool(
         item.get("force_disable_enforcement", False)
+    )
+    # Learning approval delay: seconds a newly-taught learning stays pending
+    # before becoming active. Zero (default) = active immediately.
+    cfg["learning_approval_delay_seconds"] = int(
+        item.get("learning_approval_delay_seconds") or 0
     )
     # Derived from _EXTRA_REPO_FLAGS rather than one hand-written line per
     # flag (#655). The old form needed an edit in TWO places to add a flag,
@@ -410,6 +420,25 @@ def _validate_int_repo_flags(persona_flags: dict[str, Any]) -> None:
             )
 
 
+def _validate_duration_repo_flags(persona_flags: dict[str, Any]) -> None:
+    """Each supplied _DURATION_REPO_FLAGS value must be a non-negative int
+    of seconds, capped at _LEARNING_APPROVAL_DELAY_MAX_SECONDS. Zero means
+    "active immediately" (the default)."""
+    for flag in _DURATION_REPO_FLAGS:
+        value = persona_flags.get(flag)
+        if value is None:
+            continue
+        if (
+            isinstance(value, bool)
+            or not isinstance(value, int)
+            or not 0 <= value <= _LEARNING_APPROVAL_DELAY_MAX_SECONDS
+        ):
+            raise ValueError(
+                f"{flag} must be a non-negative integer of seconds "
+                f"<= {_LEARNING_APPROVAL_DELAY_MAX_SECONDS}, got {value!r}"
+            )
+
+
 def set_repo_config(
     *,
     install_id: int,
@@ -435,6 +464,7 @@ def set_repo_config(
         - _STR_REPO_FLAGS
         - _LIST_REPO_FLAGS
         - _INT_REPO_FLAGS
+        - _DURATION_REPO_FLAGS
     )
     if unknown:
         raise TypeError(
@@ -453,6 +483,7 @@ def set_repo_config(
         if flag not in _STR_REPO_FLAGS
         and flag not in _LIST_REPO_FLAGS
         and flag not in _INT_REPO_FLAGS
+        and flag not in _DURATION_REPO_FLAGS
         and value is not None
         and not isinstance(value, bool)
     }
@@ -463,6 +494,7 @@ def set_repo_config(
     _validate_str_repo_flags(persona_flags, install_id)
     _validate_list_repo_flags(persona_flags)
     _validate_int_repo_flags(persona_flags)
+    _validate_duration_repo_flags(persona_flags)
     now = datetime.now(timezone.utc).isoformat()
     updated_fields: dict[str, Any] = {
         flag: value for flag, value in persona_flags.items() if value is not None
@@ -1127,23 +1159,29 @@ def put_learning(
     source_comment_id: int = 0,
     author: str = "",
     created_at: str = "",
+    approval_delay_seconds: int = 0,
+    active: bool | None = None,
 ) -> None:
     """Upsert one durable learning under LEARN#<repo>. Keyed by the rule
     text's content digest. A re-teach of the same text REFRESHES the mutable
     metadata (scope, source, author), the TTL, and `reinforced_at`, but
     PRESERVES the original created_at and usage counters. Listing orders by
     reinforced_at, so a re-taught old rule moves back into the prompt window
-    (matching the 'remembered' ack) while first-taught provenance survives."""
+    (matching the 'remembered' ack) while first-taught provenance survives.
+
+    `approval_delay_seconds` (org-configurable, default 0) is how long a
+    newly-taught learning stays pending before becoming active. Zero =
+    active immediately. When `active` is not given it is derived:
+    active iff `approval_delay_seconds <= 0`. A pending learning is stored
+    but not returned by `list_learnings` until its delay has elapsed."""
     rule = text.strip()
     if not (repo and rule):
         return
-    # Normalize the timestamp to a uniform UTC ISO format: listing orders by
-    # this value AS TEXT, and lexicographic == chronological only when every
-    # stored stamp shares one format/offset. A caller-supplied stamp in
-    # another offset or precision would misorder the newest-first prompt
-    # window (LORE correctness).
     now = _normalize_utc_iso(created_at)
     ttl = int(datetime.now(timezone.utc).timestamp() + _LEARNING_TTL_DAYS * 86400)
+    delay = int(approval_delay_seconds)
+    is_active = (delay <= 0) if active is None else bool(active)
+    activated_at = now if is_active else ""
     with get_pool().connection() as conn:
         conn.execute(
             """
@@ -1174,6 +1212,9 @@ def put_learning(
                         "author": author,
                         "created_at": now,
                         "reinforced_at": now,
+                        "active": is_active,
+                        "approval_delay_seconds": delay,
+                        "activated_at": activated_at,
                         "usage_count": 0,
                         "last_used_at": "",
                     }
@@ -1182,9 +1223,58 @@ def put_learning(
         )
 
 
+def increment_learning_usage(repo: str, digest: str) -> None:
+    """Mark one learning as used: bump usage_count and stamp last_used_at.
+    Called when a learning is rendered into a review or /grug ask prompt.
+    Best-effort: never blocks a review. TTL and reinforced_at are untouched
+    (re-teaching is what refreshes relevance)."""
+    now = datetime.now(timezone.utc).isoformat()
+    try:
+        with get_pool().connection() as conn:
+            conn.execute(
+                """
+                UPDATE grug_kv
+                SET data = jsonb_set(
+                    jsonb_set(data, '{usage_count}',
+                        to_jsonb(COALESCE((data->>'usage_count')::int, 0) + 1)),
+                    '{last_used_at}', to_jsonb(%(now)s)
+                )
+                WHERE pk = %(pk)s AND sk = %(sk)s AND {TTL_LIVE}
+                """,
+                {"now": now, "pk": _learning_pk(repo), "sk": _learning_sk(digest)},
+            )
+    except Exception as e:  # noqa: BLE001 - usage tracking must not fail a review
+        log.warning(
+            "learning_increment_usage_failed",
+            extra={"repo": repo, "digest": digest, "kind": type(e).__name__},
+        )
+
+
+def delete_learning(repo: str, digest: str) -> bool:
+    """Delete one learning by (repo, text-digest). Returns True if a row
+    was removed. Used by the /grug learnings delete command."""
+    try:
+        with get_pool().connection() as conn:
+            cur = conn.execute(
+                "DELETE FROM grug_kv WHERE pk = %s AND sk = %s",
+                (_learning_pk(repo), _learning_sk(digest)),
+            )
+    except Exception as e:  # noqa: BLE001 - never crash the command path
+        log.warning(
+            "learning_delete_failed",
+            extra={"repo": repo, "digest": digest, "kind": type(e).__name__},
+        )
+        return False
+    return bool(cur.rowcount)
+
+
 def list_learnings(repo: str, limit: int | None = None) -> list[Learning]:
-    """Every durable learning for a repo, oldest first. Read at review time
-    to steer Elder's prompt (ADR-0020). Empty list when none taught yet."""
+    """Every durable learning for a repo that is ACTIVE now, oldest first.
+    Read at review time to steer Elder's prompt (ADR-0020). Empty list when
+    none taught (or none yet active) yet. A learning taught with a positive
+    org approval delay stays pending until `created_at + delay` has elapsed;
+    read-time activation needs no background job.
+    """
     with get_pool().connection() as conn:
         rows = conn.execute(
             f"""
@@ -1198,8 +1288,31 @@ def list_learnings(repo: str, limit: int | None = None) -> list[Learning]:
             """,
             (_learning_pk(repo),),
         ).fetchall()
-    out = [cast("Learning", decode_item(pk, sk, data)) for pk, sk, data in rows]
+    now = datetime.now(timezone.utc)
+    out: list[Learning] = []
+    for pk, sk, data in rows:
+        row = cast("Learning", decode_item(pk, sk, data))
+        if _learning_is_active(row, now):
+            out.append(row)
     return out if limit is None else out[:limit]
+
+
+def _learning_is_active(row: Learning, now: datetime) -> bool:
+    """True when this learning is active at `now`: active flag set and (no
+    approval delay or the delay has elapsed since created_at)."""
+    if not row.get("active"):
+        delay = int(row.get("approval_delay_seconds") or 0)
+        if delay <= 0:
+            return False
+        created = row.get("created_at") or ""
+        try:
+            started = datetime.fromisoformat(created)
+            if started.tzinfo is None:
+                started = started.replace(tzinfo=timezone.utc)
+        except ValueError:
+            return False
+        return started.timestamp() + delay <= now.timestamp()
+    return True
 
 
 def get_learning_by_source_comment(
