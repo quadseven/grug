@@ -18,6 +18,18 @@ import pytest
 # proof tests setenv explicitly and are unaffected.
 os.environ.pop("AWS_CONFIG_FILE", None)
 
+# Same reason, credential side (#1340): service modules build boto3 clients
+# at import, and with no keys in the env botocore walks into the developer's
+# ambient profile - a login/SSO profile then fails collection with
+# MissingDependencyException, a static-key one hands real keys to moto-backed
+# suites. Pin the fake pair CI sets at job level (check.python.yml). An
+# explicit profile makes botocore skip env keys, so the profile vars go too.
+for _var in ("AWS_PROFILE", "AWS_DEFAULT_PROFILE", "AWS_SESSION_TOKEN"):
+    os.environ.pop(_var, None)
+os.environ["AWS_ACCESS_KEY_ID"] = "testing"
+os.environ["AWS_SECRET_ACCESS_KEY"] = "testing"
+os.environ["AWS_DEFAULT_REGION"] = "us-east-1"
+
 
 @pytest.fixture(autouse=True)
 def _cf_auth_bringup_mode(monkeypatch):
