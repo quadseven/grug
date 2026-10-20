@@ -64,7 +64,11 @@ _BULLET_PAT = re.compile(
 )
 # An HTML comment, or an unclosed one running to the end of the body: GitHub
 # hides both on the rendered PR, so neither is content the author wrote (#1330).
-_HTML_COMMENT_PAT = re.compile(r"<!--.*?(?:-->|\Z)", re.DOTALL)
+# Code is matched first and kept: a `<!--` quoted in backticks or a fence is
+# literal text, and an unclosed one there must not swallow the rest of the body.
+_HTML_COMMENT_PAT = re.compile(
+    r"(?P<code>```.*?(?:```|\Z)|`[^`\n]+`)|<!--.*?(?:-->|\Z)", re.DOTALL,
+)
 # A line that is only a list marker, optionally with an empty or ticked box:
 # `-`, `*`, `- [ ]`, `- [x]`. The template's placeholder, not a word of text.
 _PLACEHOLDER_LINE_PAT = re.compile(r"^[ \t]*[-*+][ \t]*(?:\[[ xX]\][ \t]*)?$", re.MULTILINE)
@@ -167,7 +171,7 @@ def strip_html_comments(body: str) -> str:
     The Loom footer and agent-marker checks read the RAW body on purpose:
     their markers live in comments. Only the content checks strip them.
     """
-    return _HTML_COMMENT_PAT.sub("", body)
+    return _HTML_COMMENT_PAT.sub(lambda m: m.group("code") or "", body)
 
 
 def _content_word_count(text: str) -> int:

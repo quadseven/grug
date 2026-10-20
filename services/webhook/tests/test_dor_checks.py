@@ -769,6 +769,21 @@ def test_unterminated_comment_hides_the_rest_of_the_body():
     assert not check_why(body).passed
 
 
+def test_comment_opener_quoted_in_code_is_literal_text():
+    # A real merged body quoted the health marker `<!-- loom:health key=` in
+    # backticks; read as an unclosed comment it hid every later section.
+    body = (
+        "## Why\nTickets carrying `<!-- loom:health key=` get the finding.\n\n"
+        "```\n<!-- an example opener in a fence\n```\n\n"
+        "## Acceptance criteria\n- one\n- two\n- three\n\n"
+        "Size: M\n\n## Out of scope\n- Deferred.\n"
+    )
+    assert check_why(body).passed
+    assert check_acceptance(body).passed
+    assert check_estimate(body).passed
+    assert check_scope_fence(body).passed
+
+
 def test_real_text_next_to_a_comment_still_counts():
     body = (
         "## Why\n<!-- guidance -->\nWe need this for the launch tomorrow.\n\n"
