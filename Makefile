@@ -4,6 +4,8 @@
 #   make test               — all tests (no AWS calls)
 #   make webhook-test       — webhook unit tests
 #   make api-test           — api unit tests
+#   make chief-check REPO=owner/name BODY=pr.md (or PR=N)
+#                           - run Chief's Hunt Plan checks before opening a PR
 #   make pulumi-preview     — preview infra changes (read-only)
 #   make pulumi-up          — apply infra changes (interactive confirm)
 #
@@ -15,7 +17,7 @@
 
 .PHONY: test webhook-test api-test pg-test pulumi-preview pulumi-up \
         tear-down rebuild smoke docker-build-webhook sast-benchmark \
-        review-latency elder-eval
+        review-latency elder-eval scripts-test chief-check
 
 # Admin seed values — the row (re)installed after a tear-down so the
 # allowlist gate works on the first PR after rebuild. NO DEFAULTS on
@@ -31,8 +33,21 @@ test: webhook-test api-test scripts-test
 
 # scripts/ tests (promotion decision #498 + enforcement migration). Was
 # NEVER wired into CI before #498 - a test that never runs is fiction.
+# psycopg because chief_check imports Chief's persona, whose publish seam
+# pulls the activity log's Postgres store in at import time.
 scripts-test:
-	uv run --with pytest --with boto3 --with moto --with httpx --with pyjwt --with cryptography --with pyyaml pytest scripts/tests/ -q
+	uv run --with pytest --with boto3 --with moto --with httpx --with pyjwt --with cryptography --with pyyaml --with 'psycopg[binary,pool]' pytest scripts/tests/ -q
+
+# Chief's Hunt Plan checks on a PR body, before the PR exists (#1327). Same
+# evaluator Chief runs; reads tickets with your gh login. Exit 1 = Chief
+# would hold the PR.
+#   make chief-check REPO=owner/name BODY=pr.md
+#   make chief-check REPO=owner/name PR=123
+chief-check:
+	@if [ -z "$(REPO)" ] || { [ -z "$(BODY)" ] && [ -z "$(PR)" ]; }; then \
+		echo "usage: make chief-check REPO=owner/name BODY=pr.md  (or PR=N)"; exit 2; fi
+	uv run --with httpx --with pyjwt --with cryptography --with boto3 --with 'psycopg[binary,pool]' \
+		python scripts/chief_check.py --repo $(REPO) $(if $(PR),--pr $(PR),--body-file $(BODY))
 
 webhook-test:
 	@if [ -n "$$CI" ] && [ -z "$$GRUG_TEST_DATABASE_URL" ]; then \
