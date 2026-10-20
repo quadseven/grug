@@ -71,6 +71,7 @@ from review_pipeline import (
 )
 from datadog_switch import datadog_enabled
 import call_report
+import shared_benches
 import deep_shadow
 from secrets_loader import (
     get_opencode_go_api_key,
@@ -1028,7 +1029,9 @@ def _opencode_go_chain_config() -> BackendConfig:
 # carried `Retry-After: 105419` and `limitName: monthly`. Calling Go on every
 # review until then bought nothing but a refused request each time, so the
 # first such refusal opens this breaker and Go is skipped until Retry-After
-# has passed. Per process: each pod pays at most one refused call per window.
+# has passed. The open breaker is shared with every pod and survives a
+# restart (`shared_benches`, grug#1286), so the account pays one refused call
+# per window rather than one per pod.
 _OPENCODE_GO_DEFAULT_BLOCK_SECONDS = 3600.0
 _OPENCODE_GO_MAX_BLOCK_SECONDS = 7 * 86400.0
 _opencode_go_breaker_lock = threading.Lock()
@@ -1051,7 +1054,8 @@ def _opencode_go_model_is_free(model: str) -> bool:
 def _opencode_go_available(now: float | None = None) -> bool:
     current = time.time() if now is None else now
     with _opencode_go_breaker_lock:
-        return current >= _opencode_go_blocked_until
+        local = _opencode_go_blocked_until
+    return current >= max(local, shared_benches.blocked_until("go", Backend.OPENCODE_GO.value))
 
 
 def _retry_after_seconds(resp: httpx.Response) -> float:
@@ -1095,6 +1099,8 @@ def _note_opencode_go_response(resp: httpx.Response) -> None:
         pass
     with _opencode_go_breaker_lock:
         _opencode_go_blocked_until = max(_opencode_go_blocked_until, time.time() + seconds)
+        until = _opencode_go_blocked_until
+    shared_benches.publish("go", Backend.OPENCODE_GO.value, "", until)
     log.warning(
         "opencode_go_circuit_open",
         extra={"block_seconds": seconds, "limit_name": limit_name},
@@ -1108,7 +1114,8 @@ def _note_opencode_go_response(resp: httpx.Response) -> None:
 # Transport errors and 5xx are outages, not withdrawal, and never count.
 # Rate limits and usage/quota refusals have their own handling, and a
 # request-specific error (oversized context) says nothing about the model.
-# Per process, like the usage-limit breaker above.
+# Counted per process; an open bench is shared with every pod and survives
+# a restart through `shared_benches` (grug#1286), like both breakers.
 _BENCH_FAILURE_THRESHOLD = 3
 _BENCH_WINDOW_SECONDS = 600.0
 _BENCH_BASE_SECONDS = 3600.0
@@ -1138,7 +1145,8 @@ def _model_is_benched(backend: str, model: str, now: float | None = None) -> boo
     current = time.time() if now is None else now
     with _bench_lock:
         entry = _bench_state.get((backend, model))
-        return entry is not None and current < entry.benched_until
+        local = entry.benched_until if entry is not None else 0.0
+    return current < max(local, shared_benches.blocked_until("bench", backend, model))
 
 
 def _is_benchable_failure(resp: httpx.Response) -> bool:
@@ -1192,11 +1200,15 @@ def _note_model_response(config: BackendConfig, resp: httpx.Response) -> None:
         with _bench_lock:
             _bench_state.pop(key, None)
             _slow_bench_state.pop(key, None)
+        shared_benches.clear("bench", *key)
+        shared_benches.clear("slow", *key)
         return
     if not _is_benchable_failure(resp):
         return
-    seconds = _record_model_failure(*key, resp.status_code, time.time())
+    now = time.time()
+    seconds = _record_model_failure(*key, resp.status_code, now)
     if seconds is not None:
+        shared_benches.publish("bench", *key, now + seconds)
         _announce_model_benched(*key, resp.status_code, seconds)
 
 
@@ -1222,7 +1234,8 @@ def _note_model_response(config: BackendConfig, resp: httpx.Response) -> None:
 # never trips it. Per process, like the bench above. Measured before it
 # existed (402 Elder runs, 2026-10-17): 36 OpenCode Go 401s, 11 OpenRouter
 # paid "total limit" refusals and 139 OpenRouter free per-day 429s, each one
-# spent cohort time before a working backend was reached.
+# spent cohort time before a working backend was reached. An open breaker is
+# shared with every pod and survives a restart (`shared_benches`, grug#1286).
 _PROVIDER_POOLS = ("free", "paid")
 _SPENT_LIMIT_MARKERS = (
     "usage limit", "quota", "credit", "key limit", "total limit", "spend limit",
@@ -1284,7 +1297,8 @@ def _provider_available(backend: Backend, model: str, now: float | None = None) 
     current = time.time() if now is None else now
     key = (backend.value, _backend_pool(backend, model))
     with _provider_breaker_lock:
-        return current >= _provider_blocked_until.get(key, 0.0)
+        local = _provider_blocked_until.get(key, 0.0)
+    return current >= max(local, shared_benches.blocked_until("provider", *key))
 
 
 def _backend_usable(backend: Backend, model: str) -> bool:
@@ -1321,6 +1335,8 @@ def _note_provider_response(config: BackendConfig, resp: httpx.Response) -> None
         for pool in pools:
             key = (config.backend.value, pool)
             _provider_blocked_until[key] = max(_provider_blocked_until.get(key, 0.0), until)
+    for pool in pools:
+        shared_benches.publish("provider", config.backend.value, pool, until)
     log.warning(
         "llm_provider_circuit_open",
         extra={
@@ -1370,7 +1386,8 @@ def _model_is_slow_benched(backend: str, model: str, now: float | None = None) -
     current = time.time() if now is None else now
     with _bench_lock:
         entry = _slow_bench_state.get((backend, model))
-        return entry is not None and current < entry.benched_until
+        local = entry.benched_until if entry is not None else 0.0
+    return current < max(local, shared_benches.blocked_until("slow", backend, model))
 
 
 def _record_model_timeout(backend: str, model: str, now: float) -> float | None:
@@ -1410,8 +1427,10 @@ def _note_model_timeout(backend: Backend, model: str, exc: BaseException) -> Non
     if backend not in _BENCH_CLOUD_BACKENDS or not isinstance(exc, httpx.TimeoutException):
         return
     key = (backend.value, model)
-    seconds = _record_model_timeout(*key, time.time())
+    now = time.time()
+    seconds = _record_model_timeout(*key, now)
     if seconds is not None:
+        shared_benches.publish("slow", *key, now + seconds)
         _announce_model_slow_benched(*key, seconds)
 
 
@@ -1503,9 +1522,11 @@ def _usable_tiers(
 
 
 def _slow_bench_expiry(tier: BackendConfig) -> float:
+    key = (tier.backend.value, tier.model)
     with _bench_lock:
-        entry = _slow_bench_state.get((tier.backend.value, tier.model))
-        return entry.benched_until if entry is not None else 0.0
+        entry = _slow_bench_state.get(key)
+        local = entry.benched_until if entry is not None else 0.0
+    return max(local, shared_benches.blocked_until("slow", *key))
 
 
 def _tier_is_usable(

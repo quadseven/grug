@@ -98,6 +98,7 @@ def _reset_llm_provider_switches(monkeypatch: pytest.MonkeyPatch) -> None:
     whose fake backend answers 401 would block that provider for every later
     test in the session."""
     monkeypatch.delenv("GRUG_DISABLED_BACKENDS", raising=False)
+    monkeypatch.delenv("GRUG_SHARED_BENCHES", raising=False)
     lc = sys.modules.get("llm_client")
     if lc is not None:
         monkeypatch.setattr(lc, "_provider_blocked_until", {}, raising=False)
