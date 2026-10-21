@@ -24,10 +24,39 @@ def _spec(name: str) -> dict:
     return dep["spec"]["template"]["spec"]
 
 
+def _required_terms(name: str) -> list[dict]:
+    node_aff = _spec(name)["affinity"].get("nodeAffinity", {})
+    return node_aff.get("requiredDuringSchedulingIgnoredDuringExecution", {}).get("nodeSelectorTerms", [])
+
+
+@pytest.mark.parametrize("name", _DEPLOYMENTS)
+def test_never_schedules_on_memory_constrained_nodes(name):
+    # infra#5502. Terms are ORed, so EVERY term must carry the exclusion.
+    terms = _required_terms(name)
+    assert terms
+    for term in terms:
+        assert any(
+            e["key"] == "memory-constrained" and e["operator"] == "DoesNotExist" for e in term["matchExpressions"]
+        ), term
+
+
+@pytest.mark.parametrize("name", _DEPLOYMENTS)
+def test_still_requires_arm64(name):
+    assert _spec(name)["nodeSelector"]["kubernetes.io/arch"] == "arm64"
+    for term in _required_terms(name):
+        assert any(
+            e["key"] == "kubernetes.io/arch" and e["operator"] == "In" and e["values"] == ["arm64"]
+            for e in term["matchExpressions"]
+        ), term
+
+
 @pytest.mark.parametrize("name", _DEPLOYMENTS)
 def test_prefers_oci_zones_softly(name):
     node_aff = _spec(name)["affinity"].get("nodeAffinity", {})
-    assert "requiredDuringSchedulingIgnoredDuringExecution" not in node_aff
+    # The only REQUIRED terms are the arch pin and the mini exclusion; a
+    # required zone term would turn this soft preference hard.
+    for term in _required_terms(name):
+        assert all(e["key"] != "topology.kubernetes.io/zone" for e in term["matchExpressions"])
     # Weight 100, the max: a low weight is outscored by the zone spread and
     # the pods drift back onto the lan nodes.
     zones = [
