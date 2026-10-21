@@ -9,7 +9,7 @@ timestamps, and the publish that follows a write.
 BEST-EFFORT BY DESIGN. The session is a record of a review that already
 happened, so a store or GitHub failure here must never fail that review. Every
 entry point returns None on failure after logging `hunt_session_update_failed`
-with the error kind; the next run or event re-applies its mutation and heals
+with the error kind (an unexpected kind is logged at error with its traceback); the next run or event re-applies its mutation and heals
 the record.
 
 RETRIES. A persona run is keyed (persona, head sha, trigger). A webhook that
@@ -27,6 +27,9 @@ from dataclasses import dataclass
 from datetime import datetime, timezone
 from typing import Callable, Iterable, Mapping, Optional
 
+import httpx
+import psycopg
+
 import review_session as rs
 from github_app_auth import with_install_token_retry
 from personas import hunt_board
@@ -36,6 +39,9 @@ log = logging.getLogger(f"{os.getenv('DD_SERVICE', 'grug')}.personas.hunt_record
 # The trigger of a run a person asked for (also the prefix of its deep
 # append, `rerun:deep`); never treated as a retry.
 RERUN_TRIGGER = "rerun"
+
+# Failures a store or GitHub outage produces; any other kind is unexpected.
+_EXPECTED_FAILURES = (psycopg.Error, httpx.HTTPError, rs.SessionConflict)
 
 Anchors = Callable[[tuple[rs.FindingRecord, ...]], Mapping[str, rs.AnchorStatus]]
 
@@ -91,6 +97,17 @@ def _begin(session: rs.ReviewSession, meta: RunMeta) -> rs.ReviewSession:
     ))
 
 
+def _log_failure(event: str, ref: PrRef, e: Exception) -> None:
+    """Log a swallowed failure. The expected kinds (store, transport, lost
+    race) are a warning; anything else is a bug in this seam and is logged
+    at error with its traceback, so best-effort never hides it."""
+    extra = {"pr": f"{ref.full_name}#{ref.pr_number}", "kind": type(e).__name__}
+    if isinstance(e, _EXPECTED_FAILURES):
+        log.warning(event, extra=extra)
+    else:
+        log.error(event, extra=extra, exc_info=e)
+
+
 def _update(
     ref: PrRef, mutate: Callable[[rs.ReviewSession], rs.ReviewSession],
 ) -> Optional[rs.ReviewSession]:
@@ -106,10 +123,7 @@ def _update(
             ref.full_name, ref.pr_number, mutate, at=now(),
         )
     except Exception as e:  # noqa: BLE001 - the record must not fail the review
-        log.warning(
-            "hunt_session_update_failed",
-            extra={"pr": f"{ref.full_name}#{ref.pr_number}", "kind": type(e).__name__},
-        )
+        _log_failure("hunt_session_update_failed", ref, e)
         return None
     _publish(ref, session)
     return session
@@ -125,10 +139,7 @@ def _publish(ref: PrRef, session: rs.ReviewSession) -> None:
                 token, ref.owner, ref.repo, ref.pr_number, session),
         )
     except Exception as e:  # noqa: BLE001 - the projection is cosmetic
-        log.warning(
-            "hunt_board_publish_failed",
-            extra={"pr": f"{ref.full_name}#{ref.pr_number}", "kind": type(e).__name__},
-        )
+        _log_failure("hunt_board_publish_failed", ref, e)
 
 
 def record_run(

@@ -286,3 +286,36 @@ def test_a_store_outage_never_raises_into_the_review(env, monkeypatch, caplog):
         )
     assert out is None
     assert any(r.message == "hunt_session_update_failed" for r in caplog.records)
+
+
+def test_evidence_line_is_one_based():
+    contents = _contents("first", "second", "third")
+    assert hunt_link.evidence_line(contents, PATH, 1) == "first"
+    assert hunt_link.evidence_line(contents, PATH, 3) == "third"
+    assert hunt_link.evidence_line(contents, PATH, 0) == ""
+    assert hunt_link.evidence_line(contents, PATH, 4) == ""
+
+
+def test_an_unexpected_failure_is_logged_at_error_with_a_traceback(env, monkeypatch, caplog):
+    def boom(**_kw):
+        raise KeyError("bug")
+
+    monkeypatch.setattr("adapters.install_store.get_review_session", boom)
+    with caplog.at_level("WARNING"):
+        out = hunt_recorder.record_comment_event(
+            hunt_recorder.PrRef(INSTALL, OWNER, NAME, PR), 1, "thumbs_down", sha="aaaaaaa1")
+    assert out is None
+    rec = next(r for r in caplog.records if r.message == "hunt_session_update_failed")
+    assert rec.levelname == "ERROR" and rec.exc_info
+
+
+def test_an_expected_store_failure_is_only_a_warning(env, monkeypatch, caplog):
+    def boom(**_kw):
+        raise rs.SessionConflict("lost the race")
+
+    monkeypatch.setattr("adapters.install_store.get_review_session", boom)
+    with caplog.at_level("WARNING"):
+        hunt_recorder.record_comment_event(
+            hunt_recorder.PrRef(INSTALL, OWNER, NAME, PR), 1, "thumbs_down", sha="aaaaaaa1")
+    rec = next(r for r in caplog.records if r.message == "hunt_session_update_failed")
+    assert rec.levelname == "WARNING"
