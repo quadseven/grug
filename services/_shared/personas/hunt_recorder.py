@@ -9,8 +9,9 @@ timestamps, and the publish that follows a write.
 BEST-EFFORT BY DESIGN. The session is a record of a review that already
 happened, so a store or GitHub failure here must never fail that review. Every
 entry point returns None on failure after logging `hunt_session_update_failed`
-with the error kind (an unexpected kind is logged at error with its traceback); the next run or event re-applies its mutation and heals
-the record.
+with the error kind (an unexpected kind is logged at error with its
+traceback); the next run or event re-applies its mutation and heals the
+record.
 
 RETRIES. A persona run is keyed (persona, head sha, trigger). A webhook that
 is delivered twice replays the key of a run that already completed, and the
