@@ -618,9 +618,9 @@ def test_cave_arms_carry_require_keys_json_schema(monkeypatch) -> None:
 
 
 def _is_reasoner(kwargs) -> bool:
-    """True when this request targets the reasoner arm (Laguna-S-2.1), by inspecting
+    """True when this request targets the reasoner arm (qwen3.5:122b), by inspecting
     the model in the outgoing body - both arms share the gateway URL now."""
-    return "Laguna-S-2.1" in (kwargs.get("json") or {}).get("model", "")
+    return "qwen3.5" in (kwargs.get("json") or {}).get("model", "")
 
 
 def test_deep_review_consults_both_arms_and_merges_findings(monkeypatch) -> None:
@@ -641,7 +641,7 @@ def test_deep_review_consults_both_arms_and_merges_findings(monkeypatch) -> None
                 '"rule": "null-deref", "severity": "high", '
                 '"message": "unchecked optional"}]}'
             )
-            model = "poolside/Laguna-S-2.1-NVFP4"
+            model = "qwen3.5:122b"
         else:
             content = '{"findings": []}'
             model = "qwen3-coder-next:q8_0"
@@ -656,7 +656,7 @@ def test_deep_review_consults_both_arms_and_merges_findings(monkeypatch) -> None
     assert out.kind == "reviewed"
     assert out.backends_used == (Backend.CAVE, Backend.CAVE_REASONER)
     assert out.models_used == (
-        "qwen3-coder-next:q8_0", "poolside/Laguna-S-2.1-NVFP4",
+        "qwen3-coder-next:q8_0", "qwen3.5:122b",
     )
     assert len(out.findings) == 1
     assert out.findings[0].origins[0].backend == Backend.CAVE_REASONER
@@ -680,7 +680,7 @@ def test_deep_review_runs_both_arms_concurrently_not_sequentially(monkeypatch) -
         time.sleep(0.5)
         content = '{"findings": []}'
         body = _openai_json_response(content)
-        body["model"] = "poolside/Laguna-S-2.1-NVFP4" if _is_reasoner(kwargs) else "qwen3-coder-next:q8_0"
+        body["model"] = "qwen3.5:122b" if _is_reasoner(kwargs) else "qwen3-coder-next:q8_0"
         return httpx.Response(200, json=body)
 
     with patch.object(httpx, "post", side_effect=respond) as mock_post:
@@ -1168,7 +1168,7 @@ def test_timeout_treated_as_failure(monkeypatch) -> None:
         model = (kwargs.get("json") or {}).get("model", "")
         call_log.append(model)
         # Coder arm times out; the reasoner arm answers.
-        if "Laguna-S-2.1" in model:
+        if "qwen3.5" in model:
             return success
         raise httpx.ReadTimeout("timeout")
 
@@ -1177,7 +1177,7 @@ def test_timeout_treated_as_failure(monkeypatch) -> None:
 
     assert out.kind == "reviewed"
     assert out.backend_used == Backend.CAVE_REASONER
-    assert any("Laguna-S-2.1" in m for m in call_log)
+    assert any("qwen3.5" in m for m in call_log)
 
 
 def test_request_uses_openai_chat_completions_shape() -> None:
@@ -1281,7 +1281,7 @@ def test_cave_calls_carry_per_arm_caller_attribution(monkeypatch) -> None:
     assert len(captured) == 2
     callers_by_model = dict(captured)
     assert callers_by_model["qwen3-coder-next:q8_0"] == "grug-elder-coder"
-    assert callers_by_model["poolside/Laguna-S-2.1-NVFP4"] == "grug-elder-reasoner"
+    assert callers_by_model["qwen3.5:122b"] == "grug-elder-reasoner"
 
 
 def test_extra_headers_cannot_override_authorization(monkeypatch) -> None:
@@ -1436,8 +1436,8 @@ def test_transport_failure_on_both_backends_returns_all_failed(monkeypatch) -> N
     assert len(call_log) == 4
     # Both Cave arms represented (coder + reasoner models). Assert the coder
     # substring explicitly: "qwen" alone also matches the reasoner
-    # (Laguna-S-2.1), so it could pass on two reasoner calls.
-    assert any("Laguna-S-2.1" in m for m in call_log)
+    # (qwen3.5:122b), so it could pass on two reasoner calls.
+    assert any("qwen3.5" in m for m in call_log)
     assert any("qwen3-coder" in m for m in call_log)
     # The overload fallback tier also fired, in order, after both Cave arms -
     # each backend's fast default model (not the Opus review override).
@@ -1475,7 +1475,7 @@ def test_saas_overload_fallback_rescues_review_when_cave_fully_down(monkeypatch)
 
     def respond(url, **kwargs):
         model = (kwargs.get("json") or {}).get("model", "")
-        if model in ("qwen3-coder-next:q8_0", "poolside/Laguna-S-2.1-NVFP4"):
+        if model in ("qwen3-coder-next:q8_0", "qwen3.5:122b"):
             raise httpx.ConnectTimeout("cave overloaded")
         assert model == lc._POOLSIDE_MODEL  # Poolside tried before OpenRouter
         return httpx.Response(
@@ -1522,7 +1522,7 @@ def test_saas_overload_fallback_uses_fast_default_model_not_review_opus(monkeypa
 
     def respond(url, **kwargs):
         model = (kwargs.get("json") or {}).get("model", "")
-        if model in ("qwen3-coder-next:q8_0", "poolside/Laguna-S-2.1-NVFP4"):
+        if model in ("qwen3-coder-next:q8_0", "qwen3.5:122b"):
             raise httpx.ConnectTimeout("cave overloaded")
         captured.append(kwargs)
         return httpx.Response(200, json=_openai_json_response('{"findings":[]}'))
@@ -1678,7 +1678,7 @@ def test_openrouter_free_tier_limiter_exhaustion_never_reads_as_clean_review(mon
         # Both Cave arms (same models test_saas_overload_fallback_rescues_
         # review_when_cave_fully_down fails) and Poolside - forces the SaaS
         # loop all the way to OpenRouter, the model under test here.
-        if model in ("qwen3-coder-next:q8_0", "poolside/Laguna-S-2.1-NVFP4", lc._POOLSIDE_MODEL):
+        if model in ("qwen3-coder-next:q8_0", "qwen3.5:122b", lc._POOLSIDE_MODEL):
             raise httpx.ConnectTimeout("down")
         raise AssertionError(
             f"httpx.post must never be reached for the rate-limited model "
@@ -1710,7 +1710,7 @@ def test_parse_failed_attributes_secondary_backend(monkeypatch) -> None:
     parse_fail_envelope = _openai_json_response("sorry, I cannot do that")
 
     def staged(url, *args, **kwargs):
-        if "Laguna-S-2.1" not in (kwargs.get("json") or {}).get("model", ""):
+        if "qwen3.5" not in (kwargs.get("json") or {}).get("model", ""):
             raise httpx.ReadTimeout("coder arm down")
         return httpx.Response(200, json=parse_fail_envelope)
 
@@ -1724,7 +1724,7 @@ def test_parse_failed_attributes_secondary_backend(monkeypatch) -> None:
 
 def test_parse_failure_on_primary_falls_back_to_secondary(monkeypatch) -> None:
     """A 200-but-unparseable response from the PRIMARY must fall back to the
-    secondary — the two backends run different models (claude vs laguna), so a
+    secondary — the two backends run different models (claude vs qwen3.5), so a
     parse failure on one doesn't predict the other. Primary parse-fails,
     secondary returns clean JSON → kind=reviewed, attributed to the secondary.
     """
@@ -1737,7 +1737,7 @@ def test_parse_failure_on_primary_falls_back_to_secondary(monkeypatch) -> None:
 
     def staged(url, *args, **kwargs):
         # Coder arm (primary) parse-fails; reasoner arm (secondary) returns clean.
-        if "Laguna-S-2.1" not in (kwargs.get("json") or {}).get("model", ""):
+        if "qwen3.5" not in (kwargs.get("json") or {}).get("model", ""):
             return httpx.Response(200, json=bad)
         return httpx.Response(200, json=good)
 
@@ -4165,7 +4165,7 @@ def test_saas_overload_fallback_cut_off_findings_is_partial(monkeypatch) -> None
 
     def respond(url, **kwargs):
         model = (kwargs.get("json") or {}).get("model", "")
-        if model in ("qwen3-coder-next:q8_0", "poolside/Laguna-S-2.1-NVFP4"):
+        if model in ("qwen3-coder-next:q8_0", "qwen3.5:122b"):
             raise httpx.ConnectTimeout("cave overloaded")
         return httpx.Response(200, json=_openai_json_response(_cut_off_findings(2)))
 

@@ -1677,7 +1677,7 @@ _CAVE_THINKING_OFF: dict = {
     "chat_template_kwargs": {"enable_thinking": False},
     "reasoning_effort": "none",
 }
-_CAVE_JUDGE_DEFAULT_MODEL = "poolside/Laguna-S-2.1-NVFP4"
+_CAVE_JUDGE_DEFAULT_MODEL = "qwen3.5:122b"
 
 
 def _cave_judge_config() -> "BackendConfig | None":
@@ -1727,12 +1727,14 @@ def _cave_judge_config() -> "BackendConfig | None":
 # per review that read-timed out every Elder call (llm_backend_transport_failed)
 # and starved the coder Spark.
 #
-# The reasoner default was qwen3.5 when that was written; it is Laguna now
-# (#728). As with the judge above, production does not use this literal -
-# both deployments set GRUG_CAVE_REASONER_MODEL=spark:warm-any - and #843 is
-# open on whether Laguna should be the default at all.
+# The reasoner default was qwen3.5 when that was written; it became Laguna
+# (#728) but reverted back to qwen3.5 per the evaluation in
+# docs/research/laguna-s-2.1-gpu-host-elder-eval-2026-07-21.md which shows
+# Laguna scores 0/12 on test-gap and regresses security/upstream-semantics.
+# Production does not use this literal - both deployments set
+# GRUG_CAVE_REASONER_MODEL=spark:warm-any.
 _CAVE_REVIEW_CODER_DEFAULT_MODEL = "qwen3-coder-next:q8_0"
-_CAVE_REVIEW_REASONER_DEFAULT_MODEL = "poolside/Laguna-S-2.1-NVFP4"
+_CAVE_REVIEW_REASONER_DEFAULT_MODEL = "qwen3.5:122b"
 
 # #609: require-keys response schema for the Cave arms. The gateway's ollama
 # backends map a bare `{"type": "json_object"}` to `format=json`, which
