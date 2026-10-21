@@ -289,7 +289,7 @@ def test_a_store_outage_never_raises_into_the_review(env, monkeypatch, caplog):
 
 
 def test_evidence_line_is_one_based():
-    contents = _contents("first", "second", "third")
+    contents = {PATH: "first\nsecond\nthird\n"}
     assert hunt_link.evidence_line(contents, PATH, 1) == "first"
     assert hunt_link.evidence_line(contents, PATH, 3) == "third"
     assert hunt_link.evidence_line(contents, PATH, 0) == ""
