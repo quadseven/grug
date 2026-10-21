@@ -117,6 +117,36 @@ and 2 on a usage error. When `which epic` fails it lists the repo's open
 `Epic: ...` issues and the two fixes: add the ticket as a sub-issue of an
 epic, or write `Part of #<epic>` in the ticket's body.
 
+### Verify stated claims after a deploy
+
+`scripts/shepherd_verify.py` reads the PR's `## Acceptance criteria` bullets
+and checks explicitly named `Metric`, `Log event`, `Endpoint`, or `GET`
+signals. Names may be in backticks, and metric names or URLs may be plain
+text. It does not infer a signal from prose elsewhere in the PR. The caller
+runs it after deploy completion and supplies source-specific query commands
+and known-live baselines:
+
+```bash
+python3 scripts/shepherd_verify.py --pr 123 --repo example-org/example-repo \
+  --since-epoch "$DEPLOY_FINISHED_UNIX" \
+  --query-command /path/to/your-query-adapter \
+  --baseline metric=your.known_live.metric
+```
+
+The adapter receives `source signal start_epoch end_epoch criterion` as
+arguments and prints one nonnegative integer count. It must query the named
+source over that window, including both the target and its baseline from the
+same source. For an endpoint, it must count only responses matching the
+criterion's expected status or body. A nonzero exit or invalid count makes
+the result unverifiable.
+Supply a baseline for each source used by the PR. The baseline must be known
+to emit during the post-deploy window; a historical signal is not enough.
+The default is two checks 30 seconds apart. An absent target is `missing`
+only after both checks find its baseline live. An empty baseline, missing
+baseline configuration, failed lookup, or PR with no explicit observable is
+`unverifiable`. The output includes each criterion and the counts from each
+attempt. Exit codes are 0 observed, 1 missing, and 2 unverifiable.
+
 ## What Elder and Guard check
 
 ### Elder: deep code review (Apex)
