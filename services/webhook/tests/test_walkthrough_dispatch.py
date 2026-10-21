@@ -103,6 +103,46 @@ def test_dispatch_posts_new_comment_when_no_marker_exists(monkeypatch):
     assert mock_rcv.call_args.kwargs["conclusion"] == "success"
 
 
+def test_dispatch_records_the_walkthrough_in_the_canonical_review_session(monkeypatch):
+    """#1207: the published summary and related hunts also land in the PR's
+    review session, which the Hunt Board renders."""
+    monkeypatch.setattr(
+        wt_dispatch, "with_install_token_retry",
+        lambda inst_id, fn: fn("tok"),
+    )
+    recorded = []
+
+    def fake_get(url, **kwargs):
+        if url.endswith("/files"):
+            return _files_response([
+                {"filename": "x.py", "additions": 3, "deletions": 1},
+            ])
+        if "/comments" in url:
+            return _empty_comments_response()
+        return _diff_response()
+
+    def fake_post(url, **kwargs):
+        r = MagicMock(spec=httpx.Response)
+        r.raise_for_status = MagicMock()
+        return r
+
+    with patch("httpx.get", side_effect=fake_get), \
+         patch("httpx.post", side_effect=fake_post), \
+         patch("personas.walkthrough.dispatch.record_check_verdict"), \
+         patch.object(
+             wt_dispatch.hunt_recorder, "record_walkthrough",
+             side_effect=lambda ref, **kw: recorded.append((ref, kw)),
+         ), \
+         patch("llm_client.summarize_pr", return_value=None):
+        wt_dispatch.dispatch_walkthrough_review(_payload(), blocking=False)
+
+    [(ref, kw)] = recorded
+    assert (ref.install_id, ref.owner, ref.repo, ref.pr_number) == (1, "o", "r", 7)
+    assert kw["head_sha"] == "a" * 40 and kw["trigger"] == "opened"
+    assert "x.py" in kw["text"] or "file(s) changed" in kw["text"]
+    assert kw["model"] == "deterministic-fallback"
+
+
 def test_dispatch_view_full_review_opens_the_checks_tab_not_the_pr_itself(monkeypatch):
     """The walkthrough is a comment on the PR, so a button linking the PR
     page reloaded the page it sits on; the full review is Elder's check run

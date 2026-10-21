@@ -131,7 +131,8 @@ from personas.code_reviewer.persona import (
 )
 from personas.code_reviewer.shell_flow_filter import filter_checked_shell_findings
 from personas.code_reviewer.snapshot import review_freshness_id_from_pr
-from personas.code_reviewer import carry_forward, living_review
+from personas.code_reviewer import carry_forward, hunt_link, living_review
+from personas.hunt_recorder import PrRef, now as hunt_now
 from personas.code_reviewer.degraded_gate import (
     degraded_conclusion, gate_sentence, lead_with_degraded_line,
 )
@@ -2150,6 +2151,32 @@ def _comment_record_origins(
     return finding_origins, review_span_context
 
 
+def _pair_comments(
+    comments: list[dict], findings: tuple[Finding, ...],
+) -> list[tuple[int, Finding]]:
+    """Match each posted inline comment to the Finding that produced it, by
+    (file, RULE) - recovered from the comment's `path` and its hidden
+    `<!-- grug-rule:NAME -->` marker (parsed by `parse_rule`, the same marker
+    `dedup` uses) - never by re-deriving a line number from anything GitHub
+    computes. See `_capture_comment_records` for why, and for the FIFO rule
+    that settles two findings of one rule in one file."""
+    queues: dict[tuple[str, str], deque[Finding]] = {}
+    for f in findings:
+        queues.setdefault((f.file, f.rule_name), deque()).append(f)
+    pairs: list[tuple[int, Finding]] = []
+    for c in comments:
+        cid, path = c.get("id"), c.get("path")
+        if cid is None or path is None:
+            continue
+        rule = parse_rule(c.get("body", ""))
+        if rule is None:
+            continue
+        queue = queues.get((path, rule))
+        if queue:
+            pairs.append((int(cid), queue.popleft()))
+    return pairs
+
+
 def _capture_comment_records(
     comments: list[dict],
     findings: tuple[Finding, ...],
@@ -2193,29 +2220,15 @@ def _capture_comment_records(
     is simply skipped, same as a stale prior-review comment always was.
     Best-effort per comment: a single DDB blip is skipped, never raised.
     Returns count persisted."""
-    queues: dict[tuple[str, str], deque[Finding]] = {}
-    for f in findings:
-        queues.setdefault((f.file, f.rule_name), deque()).append(f)
-
     persisted = 0
-    for c in comments:
-        cid, path = c.get("id"), c.get("path")
-        if cid is None or path is None:
-            continue
-        rule = parse_rule(c.get("body", ""))
-        if rule is None:
-            continue
-        queue = queues.get((path, rule))
-        if not queue:
-            continue
-        finding = queue.popleft()
+    for cid, finding in _pair_comments(comments, findings):
         finding_origins, fallback_span_context = _comment_record_origins(
             finding, review_span_context,
         )
         try:
             put_comment_record(
                 install_id=install_id,
-                comment_id=int(cid),
+                comment_id=cid,
                 repo=repo,
                 pr_number=pr_number,
                 review_span_context=fallback_span_context,
@@ -2597,6 +2610,7 @@ def dispatch_code_review(
     # earlier blocks on this head from one another run posts mid-flight.
     run_started_at = datetime.now(timezone.utc)
     mode: ReviewMode = "blocking" if blocking else "advisory"
+    started_at = hunt_now()
     action = payload.get("action", "")
     pr = payload["pull_request"]
     repo = payload["repository"]
@@ -3321,14 +3335,16 @@ def dispatch_code_review(
         summary=summary,
     )
     check_publish_failed = False
+    check_run_id: int | None = None
     try:
-        with_install_token_retry(
+        check_resp = with_install_token_retry(
             installation_id,
             lambda token: post_check_run(
                 token, owner, repo_name, check_result,
                 external_id=f"grug-cr:{owner}/{repo_name}#{pull_number}:{head_sha}",
             ),
         )
+        check_run_id = (check_resp or {}).get("id")
     except (httpx.HTTPStatusError, httpx.RequestError) as e:
         log.error(
             "code_review_check_run_publish_failed",
@@ -3425,8 +3441,9 @@ def dispatch_code_review(
     # maintainer reaction can still teach the repository ledger without DD span
     # attribution.
     review_id = review_resp.get("id") if review_resp else None
+    comment_ids: hunt_link.CommentIds = {}
     if review_id is not None:
-        _capture_review_comments(
+        comment_ids = _capture_review_comments(
             installation_id=installation_id,
             owner=owner,
             repo_name=repo_name,
@@ -3438,6 +3455,20 @@ def dispatch_code_review(
             author_login=author_login,
             failure_log="code_review_comment_capture_failed",
         )
+
+    # Hunt Board (#1207): the canonical session learns this pass, and the
+    # board's `hunt` section is refreshed from it. Before the stack comment so
+    # the two projections read the same record. A delta review (living range)
+    # only speaks for the files it read.
+    _record_hunt_run(
+        installation_id=installation_id, owner=owner, repo_name=repo_name,
+        pull_number=pull_number, head_sha=head_sha, trigger=action,
+        started_at=started_at, llm=llm_response, findings=evaluation.findings,
+        file_contents=file_contents,
+        diff_paths=frozenset(h.file_path for h in hunks),
+        delta=bool(living_range), comment_ids=comment_ids,
+        check_run_id=check_run_id, degraded_reason=evaluation.degraded_reason,
+    )
 
     # Markings v2 review stack: upsert PR-timeline summary (actionable count
     # + consolidated agent prompt). Best-effort — never fails the check/review
@@ -4039,6 +4070,46 @@ def _dismiss_stale_blocks(
     return dismissed
 
 
+def _record_hunt_run(
+    *,
+    installation_id: int,
+    owner: str,
+    repo_name: str,
+    pull_number: int,
+    head_sha: str,
+    trigger: str,
+    started_at: str,
+    llm: LlmReviewResponse,
+    findings: tuple[Finding, ...],
+    file_contents: dict[str, str],
+    diff_paths: frozenset[str],
+    delta: bool,
+    comment_ids: hunt_link.CommentIds,
+    check_run_id: int | None,
+    degraded_reason: str | None,
+) -> None:
+    """Record this pass in the PR's canonical review session (#1207) and
+    refresh the Hunt Board. Best-effort: never raises, never changes the
+    review outcome. A benign degradation (`no_diff`) is a clean pass."""
+    real = degraded_reason if is_real_degradation(degraded_reason) else ""
+    hunt_link.record_elder_run(
+        PrRef(installation_id, owner, repo_name, pull_number),
+        head_sha=head_sha,
+        trigger=trigger,
+        started_at=started_at,
+        backend=llm.backend_used.value if llm.backend_used is not None else "",
+        model=llm.model_name or "",
+        findings=findings,
+        file_contents=file_contents,
+        diff_paths=diff_paths,
+        delta=delta,
+        comment_ids=comment_ids,
+        check_run_id=check_run_id,
+        category_of=_category_for_rule,
+        degraded_reason=real,
+    )
+
+
 def _capture_review_comments(
     *,
     installation_id: int,
@@ -4051,7 +4122,7 @@ def _capture_review_comments(
     head_sha: str,
     author_login: str,
     failure_log: str,
-) -> None:
+) -> hunt_link.CommentIds:
     """Fetch a review's inline comments and persist them for reaction polling.
 
     Shared by the synchronous publish path (#247) and the async deep path
@@ -4065,6 +4136,9 @@ def _capture_review_comments(
     `_capture_comment_records` for how it matches them to comments (grug#967:
     no retry here anymore, since a fresh fetch already carries everything
     this function needs).
+
+    Returns the inline comment id each posted finding got, keyed (file, rule,
+    line), for the Hunt Board to link its records to; {} when the fetch failed.
     """
     try:
         comments = with_install_token_retry(
@@ -4096,6 +4170,10 @@ def _capture_review_comments(
                     "fetched": len(comments),
                 },
             )
+        return {
+            (f.file, f.rule_name, f.line): cid
+            for cid, f in _pair_comments(comments, findings)
+        }
     except Exception as error:  # noqa: BLE001 - capture is best-effort
         log.warning(
             failure_log,
@@ -4104,6 +4182,7 @@ def _capture_review_comments(
                 "kind": type(error).__name__,
             },
         )
+        return {}
 
 
 def _publish_deep_review(
@@ -4127,6 +4206,7 @@ def _publish_deep_review(
     base_sha: str = "",
     repo_config: RepoConfig | None = None,
     file_contents: dict[str, str] | None = None,
+    action: str = "review",
 ) -> None:
     """Publish the async deep review's novel findings as a GitHub review.
 
@@ -4179,8 +4259,9 @@ def _publish_deep_review(
     # durable contract the synchronous path uses (#247). Best-effort: a
     # capture failure must never change the deep review outcome.
     review_id = review_resp.get("id") if review_resp else None
+    comment_ids: hunt_link.CommentIds = {}
     if review_id is not None:
-        _capture_review_comments(
+        comment_ids = _capture_review_comments(
             installation_id=installation_id,
             owner=owner,
             repo_name=repo_name,
@@ -4192,6 +4273,18 @@ def _publish_deep_review(
             author_login=author_login,
             failure_log="elder_async_deep_comment_capture_failed",
         )
+
+    # Hunt Board (#1207): the deep pass is a second Elder run on this head.
+    # It reads only what Tier-1 already fetched, so it is recorded as a
+    # delta: it adds findings, it never closes one.
+    _record_hunt_run(
+        installation_id=installation_id, owner=owner, repo_name=repo_name,
+        pull_number=pull_number, head_sha=head_sha, trigger=f"{action}:deep",
+        started_at=hunt_now(), llm=deep_llm, findings=combined_eval.findings,
+        file_contents=file_contents or {}, diff_paths=frozenset(),
+        delta=True, comment_ids=comment_ids, check_run_id=None,
+        degraded_reason=combined_eval.degraded_reason,
+    )
 
     # #730: refresh the PR-timeline stack comment so the deep findings appear
     # in the canonical review projection alongside the Tier-1 findings.
@@ -4489,6 +4582,7 @@ def _async_deep_append_if_needed(
         base_sha=str(pr_context.get("base_sha") or ""),
         repo_config=repo_config,
         file_contents=file_contents,
+        action=action,
     )
     _submit_deep_evals(
         deep_graded,
