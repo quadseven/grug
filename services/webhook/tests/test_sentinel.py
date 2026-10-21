@@ -490,3 +490,61 @@ def test_comment_never_contradicts_the_summary_it_quotes():
     )
     assert summary in body
     assert not ("0 blocking" in body and "severity high/critical" in body)
+
+
+def test_reply_scan_counts_configured_agent_bot_as_handled(monkeypatch):
+    """A reply from a configured agent bot counts as handled finding."""
+    monkeypatch.setattr(sentinel, "get_app_id", lambda: "42")
+    # Simulate GRUG_AGENT_REPLY_BOTS environment variable
+    configured_bots = ["loom-lanes[bot]", "loom-station[bot]"]
+    monkeypatch.setattr(sentinel, "_AGENT_REPLY_BOTS", configured_bots)
+
+    comments = [
+        # Finding with a configured agent bot reply
+        {"id": 1, "in_reply_to_id": None, "user": {"login": "Elder[bot]", "type": "Bot"}},
+        {"id": 2, "in_reply_to_id": 1, "user": {"login": "loom-lanes[bot]", "type": "Bot"}},
+        # Finding with an unconfigured bot reply (should NOT be handled)
+        {"id": 3, "in_reply_to_id": None, "user": {"login": "Elder[bot]", "type": "Bot"}},
+        {"id": 4, "in_reply_to_id": 3, "user": {"login": "some-other-app[bot]", "type": "Bot"}},
+    ]
+
+    class _Response:
+        def raise_for_status(self):
+            pass
+
+        def json(self):
+            return comments
+
+    monkeypatch.setattr(sentinel.httpx, "get", lambda *args, **kwargs: _Response())
+
+    # The finding with the configured agent bot should be marked as handled
+    assert sentinel._replied_to_comment_ids("tok", "owner", "repo", 5) == {1}
+
+
+def test_reply_scan_excludes_unconfigured_bot_replies(monkeypatch):
+    """A reply from an unconfigured bot is NOT counted as a handled finding."""
+    monkeypatch.setattr(sentinel, "get_app_id", lambda: "42")
+    # No configured bots
+    configured_bots = []
+    monkeypatch.setattr(sentinel, "_AGENT_REPLY_BOTS", configured_bots)
+
+    comments = [
+        # Finding with an unconfigured bot reply
+        {"id": 1, "in_reply_to_id": None, "user": {"login": "Elder[bot]", "type": "Bot"}},
+        {"id": 2, "in_reply_to_id": 1, "user": {"login": "some-other-app[bot]", "type": "Bot"}},
+        # Finding with a human reply
+        {"id": 3, "in_reply_to_id": None, "user": {"login": "evan", "type": "User"}},
+        {"id": 4, "in_reply_to_id": 3, "user": {"login": "evan", "type": "User"}},
+    ]
+
+    class _Response:
+        def raise_for_status(self):
+            pass
+
+        def json(self):
+            return comments
+
+    monkeypatch.setattr(sentinel.httpx, "get", lambda *args, **kwargs: _Response())
+
+    # Only the finding with the human reply should be handled
+    assert sentinel._replied_to_comment_ids("tok", "owner", "repo", 5) == {3}
