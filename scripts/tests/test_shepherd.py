@@ -10,6 +10,17 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parents[1].parent))
 from shepherd import check_deployment, get_latest_digest, get_latest_push_digest
 
+
+def test_merged_but_not_deployed_is_a_distinct_loud_state(monkeypatch, capsys):
+    import shepherd
+
+    monkeypatch.setattr(shepherd, "get_latest_digest", lambda service: ("old", "old-digest"))
+    monkeypatch.setattr(shepherd, "get_latest_push_digest", lambda service: ("new", "new-digest"))
+
+    assert shepherd.deployment_status("service") == "merged-but-not-deployed"
+    assert shepherd.main("service") == 1
+    assert "MERGED-BUT-NOT-DEPLOYED" in capsys.readouterr().err
+
 # Helper to patch functions
 
 def make_patch(set_digest, set_push):

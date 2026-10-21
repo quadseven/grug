@@ -6,8 +6,8 @@ actually deployed.
 It is intentionally minimal for the current exercise but should be
 expanded to interact with the registry and the k8s deployments.
 
-The core entry point is :func:`check_deployment` which currently
-returns ``False`` to indicate that the deployment is not verified.
+The CLI reports a digest mismatch as merged-but-not-deployed and missing
+reference evidence as unverified.
 """
 
 from typing import Tuple
@@ -40,16 +40,35 @@ def check_deployment(service: str) -> bool:
     The function compares the digests of the latest deployed
     instance and the most recent tag pushed for the service.
     """
+    return deployment_status(service) == "deployed"
+
+
+def deployment_status(service: str) -> str:
+    """Distinguish a stale deployment from missing reference evidence."""
     _, deployed_digest = get_latest_digest(service)
     _, pushed_digest = get_latest_push_digest(service)
-    return bool(deployed_digest and pushed_digest and deployed_digest == pushed_digest)
+    if not deployed_digest or not pushed_digest:
+        return "unverified"
+    if deployed_digest != pushed_digest:
+        return "merged-but-not-deployed"
+    return "deployed"
+
+
+def main(service: str) -> int:
+    import sys
+
+    status = deployment_status(service)
+    if status == "deployed":
+        print(f"{service} is deployed correctly")
+        return 0
+    if status == "merged-but-not-deployed":
+        print(f"MERGED-BUT-NOT-DEPLOYED: {service} differs from the published image", file=sys.stderr)
+    else:
+        print(f"UNVERIFIED: {service} is missing a published or deployed digest", file=sys.stderr)
+    return 1
 
 
 if __name__ == "__main__":
     import sys
     svc = sys.argv[1] if len(sys.argv) > 1 else "webhook"
-    if check_deployment(svc):
-        print(f"{svc} is deployed correctly")
-    else:
-        print(f"{svc} is NOT deployed correctly")
-        sys.exit(1)
+    sys.exit(main(svc))
