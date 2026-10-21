@@ -3792,9 +3792,17 @@ _ELDER_TAG = "<!-- grug:review persona=elder -->"
 
 
 def _review(rid, *, state="CHANGES_REQUESTED", commit="old0000", body=_ELDER_TAG,
-            login="grug-tribe[bot]"):
+            login="grug-tribe[bot]", submitted_at=None):
     return {"id": rid, "state": state, "commit_id": commit, "body": body,
-            "user": {"login": login}}
+            "user": {"login": login}, "submitted_at": submitted_at}
+
+
+# #1350: stand-ins for "before this run started" and "after it started"; the
+# run start is read from the clock inside dispatch, so these are far enough
+# out that no real clock reading can land on the wrong side.
+_BEFORE_RUN = "2000-01-01T00:00:00Z"
+_AFTER_RUN = "2999-01-01T00:00:00Z"
+_HEAD = "abcd1234efgh"
 
 
 def _run_dismiss(monkeypatch, llm, *, reviews, blocking=True, threads=(),
@@ -3844,6 +3852,48 @@ def test_clean_rereview_dismisses_only_elders_own_stale_block(monkeypatch):
     ]
     listed, dismissed = _run_dismiss(monkeypatch, llm, reviews=reviews)
     assert listed == [7]
+    assert dismissed == [1]
+
+
+def test_clean_rereview_dismisses_elders_same_head_block_from_before_the_run(monkeypatch):
+    """#1350: a passing re-review on the same head withdraws Elder's own
+    earlier block on that head, or the PR stays unmergeable."""
+    llm = LlmReviewResponse(kind="reviewed", findings=(), backend_used=Backend.POOLSIDE)
+    reviews = [_review(1, commit=_HEAD, submitted_at=_BEFORE_RUN)]
+    _, dismissed = _run_dismiss(monkeypatch, llm, reviews=reviews)
+    assert dismissed == [1]
+
+
+def test_same_head_block_posted_after_the_run_started_is_kept(monkeypatch):
+    """#1350: a block another run posted while this one was in flight was not
+    judged by this run, so this run must not withdraw it."""
+    llm = LlmReviewResponse(kind="reviewed", findings=(), backend_used=Backend.POOLSIDE)
+    reviews = [
+        _review(1, commit=_HEAD, submitted_at=_AFTER_RUN),
+        _review(2, commit=_HEAD, submitted_at=None),  # no timestamp: cannot prove it is older
+    ]
+    _, dismissed = _run_dismiss(monkeypatch, llm, reviews=reviews)
+    assert dismissed == []
+
+
+def test_same_head_blocks_of_other_authors_are_kept(monkeypatch):
+    """#1350: the same-head rule keeps the persona and author filters."""
+    llm = LlmReviewResponse(kind="reviewed", findings=(), backend_used=Backend.POOLSIDE)
+    reviews = [
+        _review(1, commit=_HEAD, submitted_at=_BEFORE_RUN,
+                body="<!-- grug:review persona=guard -->"),
+        _review(2, commit=_HEAD, submitted_at=_BEFORE_RUN, login="a-human"),
+        _review(3, commit=_HEAD, submitted_at=_BEFORE_RUN, state="COMMENTED"),
+    ]
+    _, dismissed = _run_dismiss(monkeypatch, llm, reviews=reviews)
+    assert dismissed == []
+
+
+def test_earlier_commit_block_is_dismissed_even_if_submitted_after_run_start(monkeypatch):
+    """#1350: the earlier-commit rule does not depend on timing."""
+    llm = LlmReviewResponse(kind="reviewed", findings=(), backend_used=Backend.POOLSIDE)
+    reviews = [_review(1, commit="old0000", submitted_at=_AFTER_RUN)]
+    _, dismissed = _run_dismiss(monkeypatch, llm, reviews=reviews)
     assert dismissed == [1]
 
 
