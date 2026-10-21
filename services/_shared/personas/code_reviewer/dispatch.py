@@ -27,6 +27,7 @@ import os
 import re
 import threading
 from collections import deque
+from datetime import datetime, timezone
 from dataclasses import replace
 from typing import Any, Literal
 from urllib.parse import quote
@@ -2592,6 +2593,9 @@ def dispatch_code_review(
     background watcher that re-fetches the PR every few seconds for as long
     as this call is running.
     """
+    # #1350: when this run began, so a clean verdict can tell Elder's own
+    # earlier blocks on this head from one another run posts mid-flight.
+    run_started_at = datetime.now(timezone.utc)
     mode: ReviewMode = "blocking" if blocking else "advisory"
     action = payload.get("action", "")
     pr = payload["pull_request"]
@@ -3411,6 +3415,7 @@ def dispatch_code_review(
     ):
         _dismiss_stale_blocks(
             installation_id, owner, repo_name, pull_number, head_sha,
+            run_started_at,
         )
 
     # Capture inline-comment IDs for later reaction polling (#247). BEST-
@@ -3959,11 +3964,30 @@ def _publish_deep_check(
         )
 
 
+def _submitted_before(review: dict[str, Any], moment: datetime) -> bool:
+    """True when the review's `submitted_at` parses and precedes `moment`."""
+    raw = review.get("submitted_at")
+    if not isinstance(raw, str):
+        return False
+    try:
+        submitted = datetime.fromisoformat(raw.replace("Z", "+00:00"))
+    except ValueError:
+        return False
+    if submitted.tzinfo is None:
+        return False
+    return submitted < moment
+
+
 def _dismiss_stale_blocks(
     installation_id: int, owner: str, repo_name: str, pull_number: int,
-    head_sha: str,
+    head_sha: str, run_started_at: datetime,
 ) -> int:
-    """Dismiss Elder's own REQUEST_CHANGES reviews on earlier commits.
+    """Dismiss Elder's own REQUEST_CHANGES reviews this clean run supersedes.
+
+    That is every block on an earlier commit, plus a block on the current
+    head submitted before `run_started_at` (#1350): a same-head block that
+    landed after this run began was never weighed by it and stays. A
+    same-head block with no usable `submitted_at` stays too.
 
     Best-effort: a failure is logged and never changes the review outcome.
     Matches only reviews by the Grug app itself that carry the
@@ -3986,7 +4010,10 @@ def _dismiss_stale_blocks(
                 review.get("state") != "CHANGES_REQUESTED"
                 or not is_grug((review.get("user") or {}).get("login"))
                 or tag not in (review.get("body") or "")
-                or review.get("commit_id") == head_sha
+                or (
+                    review.get("commit_id") == head_sha
+                    and not _submitted_before(review, run_started_at)
+                )
             ):
                 continue
             review_id = review["id"]
@@ -3996,7 +4023,7 @@ def _dismiss_stale_blocks(
                     token, owner, repo_name, pull_number=pull_number,
                     review_id=rid,
                     message=(
-                        f"Superseded: Elder re-reviewed {head_sha[:7]} and "
+                        f"Superseded: a later Elder review of {head_sha[:7]} "
                         "found nothing blocking."
                     ),
                 ),
