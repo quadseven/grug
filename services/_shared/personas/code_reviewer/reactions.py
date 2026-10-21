@@ -41,6 +41,7 @@ import httpx
 
 from adapters.install_store import CommentRecord, update_comment_record_reaction
 from llm_client import ReactionVerdict, submit_reaction_annotation
+from personas import hunt_recorder
 from personas.code_reviewer.model_metrics import emit_verdict, origin_dims
 
 log = logging.getLogger(f"{os.getenv('DD_SERVICE', 'grug')}.persona.code_reviewer.reactions")
@@ -326,6 +327,19 @@ def poll_comment_reactions(
     return body if isinstance(body, list) else []
 
 
+def _dismiss_in_session(
+    rec: CommentRecord, *, install_id: int, owner: str, name: str,
+) -> None:
+    """A trusted thumbs-down is a maintainer dismissing the finding: record
+    it on the PR's canonical review session (#1207), where no later rerun
+    reopens it. Best-effort, like the rest of the poll."""
+    hunt_recorder.record_comment_event(
+        hunt_recorder.PrRef(install_id, owner, name, int(rec["pr_number"])),
+        int(rec["comment_id"]), "dismissed", sha=str(rec.get("head_sha", "")),
+        reason="thumbs-down from a maintainer",
+    )
+
+
 def poll_and_annotate(
     records: list[CommentRecord],
     *,
@@ -435,6 +449,8 @@ def poll_and_annotate(
                 install_id=install_id, comment_id=comment_id, verdict=verdict,
             )
             submitted += 1
+            if verdict == "false_positive":
+                _dismiss_in_session(rec, install_id=install_id, owner=owner, name=name)
         except Exception as e:  # noqa: BLE001 — best-effort per-record
             log.warning(
                 "reaction_submit_or_persist_failed",

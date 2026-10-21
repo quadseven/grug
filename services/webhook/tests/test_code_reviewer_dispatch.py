@@ -1434,6 +1434,40 @@ def test_dispatch_captures_comment_records_on_publish(monkeypatch):
     assert rec["trust_reactors"] is True
 
 
+def test_dispatch_records_the_pass_in_the_canonical_review_session(monkeypatch):
+    """#1207: the pass lands in the PR's review session with the check-run it
+    published and the inline comment each finding got, so every GitHub
+    surface links back to the same record."""
+    recorded = []
+    monkeypatch.setattr(cr_dispatch, "review_diff", lambda *a, **kw: _llm_with_span())
+    monkeypatch.setattr(cr_dispatch, "post_check_run", lambda *a, **kw: {"id": 9001})
+    monkeypatch.setattr(cr_dispatch, "post_review", lambda *a, **kw: {"id": 77})
+    monkeypatch.setattr(
+        cr_dispatch, "get_review_comments",
+        lambda *a, **kw: [{
+            "id": 555, "path": "src/x.py", "line": 2,
+            "body": "m\n<!-- grug-rule:silent-failure -->",
+        }],
+    )
+    monkeypatch.setattr(cr_dispatch, "put_comment_record", lambda **kw: None)
+    monkeypatch.setattr(
+        cr_dispatch.hunt_link, "record_elder_run",
+        lambda ref, **kw: recorded.append((ref, kw)),
+    )
+    with patch("httpx.get", return_value=_diff_response()):
+        out = cr_dispatch.dispatch_code_review(_payload(), blocking=False)
+
+    assert out["result"] == "pass"
+    [(ref, kw)] = recorded
+    assert (ref.install_id, ref.owner, ref.repo, ref.pr_number) == (11, "myorg", "myrepo", 7)
+    assert kw["head_sha"] == "abcd1234efgh" and kw["trigger"] == "opened"
+    assert kw["check_run_id"] == 9001
+    assert kw["comment_ids"] == {("src/x.py", "silent-failure", 2): 555}
+    assert kw["delta"] is False and "src/x.py" in kw["diff_paths"]
+    assert kw["degraded_reason"] == ""
+    assert [f.rule_name for f in kw["findings"]] == ["silent-failure"]
+
+
 def test_dispatch_captures_all_origin_spans_without_global_span(monkeypatch):
     """Ensemble findings remain reaction-trainable even when the legacy
     response-level span is absent: persist every finding origin on the

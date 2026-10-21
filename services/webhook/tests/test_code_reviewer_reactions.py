@@ -103,11 +103,20 @@ def test_classify_empty_returns_none():
 # --- poll_and_annotate orchestration ---
 
 @pytest.fixture
-def _patch_store(monkeypatch):
+def dismissals() -> list:
+    return []
+
+
+@pytest.fixture
+def _patch_store(monkeypatch, dismissals):
     updates: list[dict] = []
     monkeypatch.setattr(
         cr_reactions, "update_comment_record_reaction",
         lambda **kw: updates.append(kw),
+    )
+    monkeypatch.setattr(
+        cr_reactions.hunt_recorder, "record_comment_event",
+        lambda *a, **kw: dismissals.append((a, kw)),
     )
     return updates
 
@@ -121,7 +130,7 @@ def _patch_annotate(monkeypatch):
     return submitted
 
 
-def test_poll_and_annotate_submits_on_new_thumbs_down(monkeypatch, _patch_store):
+def test_poll_and_annotate_submits_on_new_thumbs_down(monkeypatch, _patch_store, dismissals):
     submitted = _patch_annotate(monkeypatch)
     with patch("httpx.get", return_value=_reactions_response(["-1"])):
         n = cr_reactions.poll_and_annotate(
@@ -133,6 +142,18 @@ def test_poll_and_annotate_submits_on_new_thumbs_down(monkeypatch, _patch_store)
     assert submitted[0]["tags"]["rule_name"] == "null-deref"
     # dedup baseline updated.
     assert _patch_store[0] == {"install_id": 1, "comment_id": 5, "verdict": "false_positive"}
+    # and the PR's canonical review session hears the maintainer dismissed it.
+    [(args, kw)] = dismissals
+    assert args[1:3] == (5, "dismissed") and kw["reason"]
+
+
+def test_a_thumbs_up_does_not_dismiss_the_finding(monkeypatch, _patch_store, dismissals):
+    _patch_annotate(monkeypatch)
+    with patch("httpx.get", return_value=_reactions_response(["+1"])):
+        cr_reactions.poll_and_annotate(
+            [_record(comment_id=5)], install_id=1, fetch_token=lambda: "tok",
+        )
+    assert dismissals == []
 
 
 def test_poll_uses_write_collaborator_reaction_and_ignores_outsider(
