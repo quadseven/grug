@@ -40,14 +40,13 @@ from adapters.install_store import (
 from adapters.user_store import UserIdentity
 from auth.dependencies import require_authenticated
 from github_app_auth import with_install_token_retry
+from github_rest import GitHubMalformedPayload, _GH_API, paginate_all
 from rerun_personas import requestable_pattern
 from review_types import verdict as derive_verdict
 
 log = logging.getLogger("grug.api.installations")
 
 router = APIRouter(prefix="/api/v1")
-
-_GH_API = "https://api.github.com"
 
 
 class RepoConfigPayload(BaseModel):
@@ -175,51 +174,29 @@ def list_install_repos(
     # before retry. Otherwise the warm Lambda burns the bad token for
     # up to 55min. Closes #50.
     def _fetch(token: str) -> list[dict[str, Any]]:
+        try:
+            repos = paginate_all(
+                token, f"{_GH_API}/installation/repositories",
+                item_key="repositories", max_pages=10,
+            )
+        except GitHubMalformedPayload:
+            # GH returned 200 but a malformed payload — distinguish from
+            # "0 repos" so the caller doesn't show an empty dashboard for
+            # what's really upstream broken. silent-failure-hunter P1 #3.
+            log.error("gh_install_repos_malformed", extra={"install_id": install_id})
+            raise HTTPException(
+                status_code=status.HTTP_502_BAD_GATEWAY, detail="gh_upstream_malformed",
+            )
         out: list[dict[str, Any]] = []
-        page = 1
-        with httpx.Client(timeout=10) as client:
-            while True:
-                resp = client.get(
-                    f"{_GH_API}/installation/repositories",
-                    headers={
-                        "Authorization": f"token {token}",
-                        "Accept": "application/vnd.github+json",
-                    },
-                    params={"per_page": 100, "page": page},
-                )
-                resp.raise_for_status()
-                body = resp.json()
-                if "repositories" not in body:
-                    # GH returned 200 but malformed payload — distinguish
-                    # from "0 repos" so the caller doesn't show an empty
-                    # dashboard for what's really upstream broken.
-                    # silent-failure-hunter P1 #3.
-                    log.error(
-                        "gh_install_repos_malformed",
-                        extra={"install_id": install_id, "page": page},
-                    )
-                    raise HTTPException(
-                        status_code=status.HTTP_502_BAD_GATEWAY,
-                        detail="gh_upstream_malformed",
-                    )
-                for r in body["repositories"]:
-                    cfg = get_repo_config(install_id, r["id"])
-                    out.append({
-                        "repo_id": r["id"],
-                        "full_name": r["full_name"],
-                        "private": r.get("private", False),
-                        "default_branch": r.get("default_branch", "main"),
-                        "config": cfg,
-                    })
-                if len(body["repositories"]) < 100:
-                    break
-                page += 1
-                if page > 10:  # 1000 repos is plenty for v1
-                    log.warning(
-                        "list_repos_pagination_cap",
-                        extra={"install_id": install_id, "user": user.login},
-                    )
-                    break
+        for r in repos:
+            cfg = get_repo_config(install_id, r["id"])
+            out.append({
+                "repo_id": r["id"],
+                "full_name": r["full_name"],
+                "private": r.get("private", False),
+                "default_branch": r.get("default_branch", "main"),
+                "config": cfg,
+            })
         return out
 
     repos = with_install_token_retry(install_id, _fetch)
@@ -494,39 +471,28 @@ def update_repo_config(
     # membership.
     # Wrapped in with_install_token_retry — see list_repos above.
     def _lookup(token: str) -> tuple[bool, str, str]:
-        page = 1
-        with httpx.Client(timeout=10) as client:
-            while True:
-                resp = client.get(
-                    f"{_GH_API}/installation/repositories",
-                    headers={
-                        "Authorization": f"token {token}",
-                        "Accept": "application/vnd.github+json",
-                    },
-                    params={"per_page": 100, "page": page},
-                )
-                resp.raise_for_status()
-                body_json = resp.json()
-                if "repositories" not in body_json:
-                    log.error(
-                        "gh_install_repos_malformed",
-                        extra={"install_id": install_id, "page": page,
-                               "context": "update_repo_config"},
-                    )
-                    raise HTTPException(
-                        status_code=status.HTTP_502_BAD_GATEWAY,
-                        detail="gh_upstream_malformed",
-                    )
-                for r in body_json["repositories"]:
-                    if r["id"] == repo_id:
-                        return True, r["full_name"], r.get("default_branch", "main")
-                if len(body_json["repositories"]) < 100:
-                    return False, "", ""
-                page += 1
-                # No page cap — single-repo membership lookup must scan
-                # all pages on large org installs (>1000 repos). Codex
-                # P2 follow-up to the Seer CRITICAL fix. Worst case
-                # ~Npages*100ms; acceptable for an admin write path.
+        try:
+            # No page cap — single-repo membership lookup must scan all
+            # pages on large org installs (>1000 repos). Codex P2
+            # follow-up to the Seer CRITICAL fix. Worst case
+            # ~Npages*100ms; acceptable for an admin write path.
+            repos = paginate_all(
+                token, f"{_GH_API}/installation/repositories",
+                item_key="repositories", max_pages=None,
+            )
+        except GitHubMalformedPayload:
+            log.error(
+                "gh_install_repos_malformed",
+                extra={"install_id": install_id, "context": "update_repo_config"},
+            )
+            raise HTTPException(
+                status_code=status.HTTP_502_BAD_GATEWAY,
+                detail="gh_upstream_malformed",
+            )
+        for r in repos:
+            if r["id"] == repo_id:
+                return True, r["full_name"], r.get("default_branch", "main")
+        return False, "", ""
 
     found, full_name, default_branch = with_install_token_retry(install_id, _lookup)
     if not found:
@@ -696,31 +662,19 @@ def _resolve_repo(
 
     Capped at 10 pages (1000 repos) — same limit as `_fetch` — so a
     large install can't exhaust the api Lambda's 15s budget on a repo
-    not found in its first N pages. Logs a warning when the cap is hit
-    so an over-large install is visible in DD.
+    not found in its first N pages. paginate_all logs a warning when the
+    cap is hit so an over-large install is visible in DD.
     """
-    with httpx.Client(timeout=10) as client:
-        page = 1
-        while True:
-            resp = client.get(
-                f"{_GH_API}/installation/repositories",
-                headers={
-                    "Authorization": f"token {token}",
-                    "Accept": "application/vnd.github+json",
-                },
-                params={"per_page": 100, "page": page},
-            )
-            resp.raise_for_status()
-            body = resp.json()
-            for r in body.get("repositories", []):
-                if r["id"] == repo_id:
-                    return r["full_name"], r.get("default_branch", "main")
-            if len(body.get("repositories", [])) < 100:
-                return None
-            page += 1
-            if page > 10:  # 1000 repos is plenty for v1; same cap as _fetch
-                log.warning(
-                    "resolve_repo_pagination_cap",
-                    extra={"install_id": install_id, "repo_id": repo_id},
-                )
-                return None
+    try:
+        repos = paginate_all(
+            token, f"{_GH_API}/installation/repositories",
+            item_key="repositories", max_pages=10,
+        )
+    except GitHubMalformedPayload:
+        # Preserve the old lenient shape: a malformed page reads as empty,
+        # so the repo simply isn't found and the caller 404s.
+        return None
+    for r in repos:
+        if r["id"] == repo_id:
+            return r["full_name"], r.get("default_branch", "main")
+    return None
