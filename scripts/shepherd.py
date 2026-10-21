@@ -42,7 +42,7 @@ def check_deployment(service: str) -> bool:
     """
     _, deployed_digest = get_latest_digest(service)
     _, pushed_digest = get_latest_push_digest(service)
-    return deployed_digest == pushed_digest
+    return bool(deployed_digest and pushed_digest and deployed_digest == pushed_digest)
 
 
 if __name__ == "__main__":
