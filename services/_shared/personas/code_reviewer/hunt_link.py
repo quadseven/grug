@@ -47,7 +47,8 @@ def evidence_line(file_contents: Mapping[str, str], path: str, line: int) -> str
     """The exact anchored line at the reviewed head, or "" when unread.
 
     `line` is 1-based, the new-file line number a diff hunk and a GitHub
-    inline comment use (the same one `Finding.line` carries)."""
+    inline comment use. `Finding.__post_init__` rejects zero, and the diff
+    parser's new-side cursor starts at the hunk's 1-based `new_start`."""
     lines = file_contents.get(path, "").splitlines()
     return lines[line - 1] if 0 < line <= len(lines) else ""
 

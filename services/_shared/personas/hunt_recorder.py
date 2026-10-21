@@ -123,6 +123,9 @@ def _update(
                 **kw, data=data, expected_version=expected),
             ref.full_name, ref.pr_number, mutate, at=now(),
         )
+    # The store can also fail before issuing SQL (for example, missing
+    # database configuration). Keep the completed review intact; unexpected
+    # errors are logged with a traceback by _log_failure, never silently lost.
     except Exception as e:  # noqa: BLE001 - the record must not fail the review
         _log_failure("hunt_session_update_failed", ref, e)
         return None
