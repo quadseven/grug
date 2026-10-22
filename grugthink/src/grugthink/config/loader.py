@@ -32,39 +32,44 @@ def is_yaml_available() -> bool:
 
 
 def load_config(config_file: str) -> Dict[str, Any]:
-    """Load configuration from file."""
+    """Load configuration from file.
+
+    Returns {} only when the file is missing or holds no document (zero
+    bytes, whitespace or comments only): the caller then writes a default
+    config. An unreadable or unparseable file raises instead, because a
+    default written over it would destroy the real configuration.
+    """
     try:
-        if os.path.exists(config_file):
-            # Treat zero-byte or whitespace-only files as uninitialized
-            try:
-                if os.path.getsize(config_file) == 0:
-                    raise ValueError("Config file is empty")
-            except OSError:
-                pass
-
-            with open(config_file, "r") as f:
-                if config_file.endswith(".yaml") or config_file.endswith(".yml"):
-                    if _YAML_AVAILABLE:
-                        data = yaml.safe_load(f)
-                        if not data:
-                            # Empty or invalid YAML
-                            raise ValueError("Empty or invalid YAML config")
-                    else:
-                        log.warning("YAML config file found but PyYAML not available, skipping")
-                        data = {}
+        with open(config_file, "r") as f:
+            if config_file.endswith(".yaml") or config_file.endswith(".yml"):
+                if _YAML_AVAILABLE:
+                    data = yaml.safe_load(f)
                 else:
-                    data = json.load(f)
-
-            log.info(
-                "Configuration loaded", extra={"config_file": config_file, "env_vars": len(data.get("environment", {}))}
-            )
-            return data
-        else:
-            return {}
-
-    except Exception as e:
-        log.error("Failed to load configuration", extra={"error": str(e), "config_file": config_file})
+                    log.warning("YAML config file found but PyYAML not available, skipping")
+                    data = {}
+            else:
+                text = f.read()
+                data = json.loads(text) if text.strip() else {}
+    except FileNotFoundError:
         return {}
+    except (OSError, ValueError) as e:
+        # json.JSONDecodeError is a ValueError; yaml.YAMLError is handled below.
+        log.error("Failed to load configuration", extra={"error": str(e), "config_file": config_file})
+        raise
+    except Exception as e:
+        if yaml is not None and isinstance(e, yaml.YAMLError):
+            log.error("Failed to parse configuration", extra={"error": str(e), "config_file": config_file})
+        raise
+
+    if not data:
+        log.warning("Configuration file holds no document", extra={"config_file": config_file})
+        return {}
+    if not isinstance(data, dict):
+        log.error("Configuration is not a mapping", extra={"config_file": config_file})
+        raise ValueError(f"Configuration in {config_file} is not a mapping")
+
+    log.info("Configuration loaded", extra={"config_file": config_file, "env_vars": len(data.get("environment", {}))})
+    return data
 
 
 def save_config(config_file: str, config_data: Dict[str, Any]):
@@ -139,8 +144,19 @@ def create_default_config(config_file: str, templates: Dict) -> Dict[str, Any]:
 
 
 def reload_config(config_manager, old_config: Dict[str, Any], old_env: Dict[str, str]):
-    """Reload configuration and notify callbacks."""
-    config_data = load_config(config_manager.config_file)
+    """Reload configuration and notify callbacks.
+
+    A file that cannot be read or parsed (a torn write, a bad hand edit)
+    leaves the running configuration in place rather than replacing it.
+    """
+    try:
+        config_data = load_config(config_manager.config_file)
+    except Exception as e:
+        log.error(
+            "Config reload failed; keeping the running configuration",
+            extra={"error": str(e), "config_file": config_manager.config_file},
+        )
+        return
 
     # Load external personalities
     from .personalities import load_external_personalities
