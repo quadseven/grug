@@ -20,7 +20,10 @@ Two rules, each one finding per file, anchored on a new-side line:
   `assertFalse`, `In` and `NotIn`, `assert x` and `assert not x`, `True`
   and `False` as the expected value). High when `DELETED_HIGH` or more
   deleted tests in a file are not mentioned by the title or the linked
-  criteria, or when the PR flips
+  criteria, when an unmentioned deleted test goes with the production
+  lines it pinned (`_goes_with_guard`: the diff also deletes non-test
+  lines that carry most of the test's name, as a guard and its comment,
+  or a docstring that states the pinned rule), or when the PR flips
   `FLIPS_HIGH` or more assertions none of whose strings or names the
   ticket mentions. Medium otherwise: the ticket names the test, asks to
   remove or retire something, or the PR flips fewer assertions.
@@ -64,6 +67,16 @@ FLIPS_HIGH = 3
 # good work (a behavior the ticket changed on purpose) as in damaging work,
 # so one deleted test is medium; two or more unnamed ones were damaging only.
 DELETED_HIGH = 2
+# A deleted test goes with its guard when at least this many of its name
+# words, and at least half of them, appear in non-test lines the same diff
+# deletes, one of them a word that states a limit (#1382, #1383).
+GUARD_WORDS = 2
+# Words that state a limit or a refusal: what a guard keeps from happening.
+_LIMIT_WORDS = frozenset([
+    "never", "held", "hold", "holds", "block", "blocked", "refuse", "refused", "deny",
+    "denied", "reject", "rejected", "forbid", "forbidden", "prevent", "prevents",
+    "skip", "skipped", "cap", "capped", "limit", "limited", "max", "only", "without",
+])
 # Share of a renamed test's name words a replacement must keep to count as
 # the same test under a new name.
 RENAME_KEEP = 0.6
@@ -111,6 +124,8 @@ _REMOVAL_RE = re.compile(
     r"|disabl(?:e|es|ed|ing)|rip(?:s|ped)? out)\b",
     re.IGNORECASE,
 )
+
+_DOC_SUFFIXES = (".md", ".rst", ".txt", ".adoc")
 
 _CI_PATH_RE = re.compile(
     r"(?:^|/)\.github/workflows/[^/]+\.ya?ml$|(?:^|/)action\.ya?ml$"
@@ -327,6 +342,34 @@ def _deleted_tests(tf: _TestFile) -> list[_Deleted]:
     ]
 
 
+def _removed_code_stems(by_file: dict[str, list[DiffHunk]]) -> frozenset[str]:
+    """Word stems of the lines the diff deletes from non-test, non-doc
+    files: the guards, constants, comments and docstrings that go."""
+    stems: set[str] = set()
+    for path, own in by_file.items():
+        if is_test_file(path) or path.lower().endswith(_DOC_SUFFIXES):
+            continue
+        for hunk in own:
+            for raw in hunk.body.splitlines()[1:]:
+                if raw.startswith("-") and len(raw) <= _MAX_LINE:
+                    stems.update(_stem(w) for w in re.findall(r"[a-z0-9]+", raw[1:].lower()))
+    return frozenset(stems)
+
+
+def _goes_with_guard(name: str, removed_stems: frozenset[str]) -> bool:
+    """Most of the deleted test's name words appear in production lines the
+    same diff deletes, one of them a limit ("never", "held", "blocked"):
+    the guard and the test that pinned it go together, and nothing is left
+    to notice."""
+    words = {_stem(w) for w in _name_words(name)}
+    shared = words & removed_stems
+    limit = {_stem(w) for w in _LIMIT_WORDS}
+    return (
+        len(shared) >= GUARD_WORDS and len(shared) * 2 >= len(words)
+        and bool(shared & limit)
+    )
+
+
 def _mentioned(name: str, ticket_stems: frozenset[str]) -> bool:
     words = _name_words(name)
     if not words:
@@ -401,7 +444,14 @@ def _change_parts(tf: _TestFile, deleted: list[_Deleted]) -> list[str]:
     return parts
 
 
-def _why(*, high: bool, unnamed: bool) -> str:
+def _why(*, high: bool, unnamed: bool, guarded: list[str] = ()) -> str:
+    if high and guarded:
+        return (
+            f"The diff also deletes the production lines {_named_list(guarded)} "
+            "pinned, and neither the PR title nor the linked criteria ask for "
+            "that, so the rule and the test that held it go together and "
+            "nothing is left to catch the change."
+        )
     if high:
         return (
             "Neither the PR title nor the linked criteria name these tests or "
@@ -421,6 +471,7 @@ def _why(*, high: bool, unnamed: bool) -> str:
 
 def _test_file_finding(
     tf: _TestFile, hunks: tuple[DiffHunk, ...], ticket: _Ticket, unasked_flips: int,
+    removed_stems: frozenset[str] = frozenset(),
 ) -> Finding | None:
     """The `weakened-test` finding for one test file, or None."""
     deleted = _deleted_tests(tf)
@@ -430,7 +481,10 @@ def _test_file_finding(
     if not deleted and unasked_flips < 2:
         return None
     unnamed = [d for d in deleted if not _mentioned(d.name, ticket.stems)]
-    high = (len(unnamed) >= DELETED_HIGH and not ticket.removal) or (
+    guarded = [] if ticket.removal else [
+        d.name for d in unnamed if _goes_with_guard(d.name, removed_stems)
+    ]
+    high = (len(unnamed) >= DELETED_HIGH and not ticket.removal) or bool(guarded) or (
         bool(_unasked(tf.flips, ticket)) and unasked_flips >= FLIPS_HIGH
     )
     anchor = _anchor(tf.hunks, hunks)
@@ -442,7 +496,7 @@ def _test_file_finding(
         rule_name=RULE_TEST,
         message=(
             f"In `{tf.path}`, this diff " + " and ".join(_change_parts(tf, deleted))
-            + ". " + _why(high=high, unnamed=bool(unnamed))
+            + ". " + _why(high=high, unnamed=bool(unnamed), guarded=guarded)
             + " Restore the tests that pinned behavior the ticket did not "
             "change, or name the change in the ticket."
         ),
@@ -471,13 +525,16 @@ def _removed_file_findings(
 
 def _test_findings(
     files: list[_TestFile], removed_files: list[str], hunks: tuple[DiffHunk, ...],
-    ticket: str,
+    ticket: str, removed_stems: frozenset[str] = frozenset(),
 ) -> list[Finding]:
     asked = _Ticket.of(ticket)
     complete = [tf for tf in files if not tf.incomplete]
     unasked_flips = sum(len(_unasked(tf.flips, asked)) for tf in complete)
     findings = [
-        f for f in (_test_file_finding(tf, hunks, asked, unasked_flips) for tf in complete)
+        f for f in (
+            _test_file_finding(tf, hunks, asked, unasked_flips, removed_stems)
+            for tf in complete
+        )
         if f is not None
     ]
     return findings + _removed_file_findings(removed_files, hunks)
@@ -595,4 +652,7 @@ def scan_weakened_verification(
     layer = _layer_findings(by_file, hunks, ticket, budget)
     if layer is None:
         return ()
-    return tuple(_test_findings(tests, removed_files, hunks, ticket) + layer)
+    return tuple(
+        _test_findings(tests, removed_files, hunks, ticket, _removed_code_stems(by_file))
+        + layer
+    )
