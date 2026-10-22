@@ -107,6 +107,7 @@ from personas.code_reviewer.repo_config import (
     split_ignored_hunks,
     with_instructions,
 )
+from personas.code_reviewer.criteria_judge import criteria_judge_for
 from personas.code_reviewer.lane_work import lane_work_findings
 from personas.code_reviewer.linked_issue import (
     RULE_CATEGORIES as _LINKED_ISSUE_RULE_CATEGORIES,
@@ -2514,6 +2515,7 @@ def _merge_lane_work(
         health_issues=rendered_health_issues(
             str(pr_context.get("linked_issue_context") or ""),
         ),
+        criteria_judge=criteria_judge_for(pr_context),
     )
     if correctness_only:
         found = tuple(f for f in found if f.rule_name != "dead-code")

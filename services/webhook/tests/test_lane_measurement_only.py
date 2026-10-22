@@ -49,7 +49,11 @@ def _recorded_diff() -> str:
 
 
 def _acting_diff() -> str:
-    return _changed("guildfund.py", ["def refunds(bank):"], ["    pay_waiting_members(bank)"])
+    # With its test: a fix with none would also lack evidence for criterion 2
+    # (partial delivery, #1389), which is not what this file tests.
+    return _changed("guildfund.py", ["def refunds(bank):"], ["    pay_waiting_members(bank)"]) + _changed(
+        "tests/test_guildfund.py", ["import guildfund"], ["def test_waiting_members_are_paid():"],
+    )
 
 
 def _findings(diff: str, *, boxes=_INTAKE_BOXES, title=_TITLE, health_issues=()):
