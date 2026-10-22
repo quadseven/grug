@@ -180,3 +180,34 @@ def test_llm_client_has_no_second_evidence_renderer():
     for needle in ("FULL FILE (", "cross-file context)", "MAX_FILE_CONTEXT",
                    "PULL REQUEST INTENT\\n", "ENCLOSING SCOPE ("):
         assert needle not in source, needle
+
+
+_SECRET_FINDING = [{"rule_name": "exposed-secret", "file": "src/a.py", "line": 1,
+                    "severity": "low", "message": f"key {_SECRET} committed"}]
+
+
+def test_saas_judge_path_redacts_a_secret_quoted_in_a_finding(monkeypatch):
+    """The finding lines are sealed with the evidence: a finding can quote
+    the secret it flags, and a SaaS judge must not receive it."""
+    monkeypatch.setenv("GRUG_REVIEW_BACKEND_PRIORITY", "cloud")
+    monkeypatch.setenv("GRUG_CAVE_GATEWAY_URL", "http://cave.test")
+    sent = _capture_judge_prompt(monkeypatch)
+
+    judge._judge_evidence_packet(_SECRET_FINDING, _evidence(), 1)
+
+    assert len(sent) == 1
+    assert _SECRET not in sent[0][1]["content"]
+
+
+def test_cave_refute_path_keeps_the_raw_evidence(monkeypatch):
+    """Refute mode follows the same ADR-0009 split as grading: the Cave
+    call gets the raw value."""
+    monkeypatch.delenv("GRUG_REVIEW_BACKEND_PRIORITY", raising=False)
+    monkeypatch.setenv("GRUG_CAVE_GATEWAY_URL", "http://cave.test")
+    sent = _capture_judge_prompt(monkeypatch)
+    evidence = _evidence(file_contents={"src/a.py": f"KEY = '{_SECRET}'\n"})
+
+    judge._judge_evidence_packet(_FINDINGS, evidence, 1, refute=True)
+
+    assert len(sent) == 1
+    assert _SECRET in sent[0][1]["content"]

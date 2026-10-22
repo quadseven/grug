@@ -3063,7 +3063,7 @@ def dispatch_code_review(
         )
 
     evaluation = evaluate_diff(
-        hunks, llm_response, cross_file_contents=cross_file_contents,
+        hunks, llm_response, cross_file_contents=evidence.cross_file_contents,
     )
     correctness_only = bool(pr_context.get("review_scope"))
     if correctness_only:

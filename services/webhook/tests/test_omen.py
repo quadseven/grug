@@ -138,7 +138,9 @@ def test_prompt_renders_production_signal_block():
     )
     assert "### PRODUCTION SIGNAL" in msgs[1]["content"]
     without = _build_messages(assemble_evidence([Hunk(path="a.py", body="+x=1")]), "v1")
-    with_none = _build_messages(assemble_evidence([Hunk(path="a.py", body="+x=1")]), "v1")
+    with_none = _build_messages(
+        assemble_evidence([Hunk(path="a.py", body="+x=1")], runtime_context=None), "v1",
+    )
     assert without == with_none  # byte-identical when absent
 
 
