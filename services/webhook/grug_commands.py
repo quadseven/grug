@@ -32,6 +32,13 @@ _CMD_RE = re.compile(
 _CANON = {"test_gaps": "test-gaps"}
 VERBS = frozenset({"recheck", "improve", "ask", "test-gaps", "resume", "review", "learnings"})
 
+# The verbs that start an ELDER re-run. They are the ones that must not
+# overlap with a review already in flight, that must carry the
+# `grug:reviewing` label while they run, and that must be KEPT (deferred to
+# the GitHub budget's reset) instead of dropped when the installation's
+# hourly budget is spent (grug#1270).
+ELDER_RERUN_VERBS = frozenset({"improve", "resume", "review"})
+
 
 @dataclass(frozen=True)
 class GrugCommand:

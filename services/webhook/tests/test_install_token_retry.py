@@ -342,3 +342,56 @@ def test_an_ordinary_403_is_not_reported_as_rate_limit_exhaustion(_stub_token, c
     with caplog.at_level("ERROR"), pytest.raises(httpx.HTTPStatusError):
         gh_auth.with_install_token_retry(123, fn)
     assert not [r for r in caplog.records if r.getMessage() == "github_primary_rate_limit_exhausted"]
+
+
+# --- grug#1270: the budget helpers the command path paces itself with ------
+
+
+def _rate_limited_response(**headers: str) -> httpx.Response:
+    return httpx.Response(403, headers=headers, json={"message": "rate limit"})
+
+
+def test_primary_rate_limit_reset_epoch_names_the_window():
+    """The command path needs to know WHEN the budget resets, so a refused
+    command can be kept and run then."""
+    resp = _rate_limited_response(
+        **{"X-RateLimit-Remaining": "0", "X-RateLimit-Reset": "1791218759"},
+    )
+    assert gh_auth.primary_rate_limit_reset_epoch(resp) == 1791218759
+
+
+def test_primary_rate_limit_reset_epoch_is_zero_for_a_plain_403():
+    """A permission 403 is not a budget problem: waiting for the window to
+    reset would never help."""
+    resp = _rate_limited_response(**{"X-RateLimit-Remaining": "42"})
+    assert gh_auth.primary_rate_limit_reset_epoch(resp) == 0
+
+
+def test_primary_rate_limit_reset_epoch_is_zero_without_a_reset_stamp():
+    resp = _rate_limited_response(**{"X-RateLimit-Remaining": "0"})
+    assert gh_auth.primary_rate_limit_reset_epoch(resp) == 0
+
+
+def test_core_rate_limit_reads_the_budget_without_spending_it(monkeypatch):
+    """`GET /rate_limit` does not count against the limit, so asking what is
+    left is free - which is what makes it usable as a pacing gate."""
+    def _get(url, **kw):
+        assert url.endswith("/rate_limit")
+        return httpx.Response(
+            200,
+            json={"resources": {"core": {
+                "limit": 5000, "remaining": 42, "reset": 1791218759,
+            }}},
+            request=httpx.Request("GET", url),
+        )
+
+    monkeypatch.setattr(gh_auth.httpx, "get", _get)
+    assert gh_auth.core_rate_limit("tok") == (42, 5000, 1791218759)
+
+
+def test_core_rate_limit_is_none_when_it_cannot_be_read(monkeypatch):
+    def _get(url, **kw):
+        raise httpx.ConnectError("github down")
+
+    monkeypatch.setattr(gh_auth.httpx, "get", _get)
+    assert gh_auth.core_rate_limit("tok") is None

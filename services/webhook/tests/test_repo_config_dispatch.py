@@ -81,12 +81,9 @@ class _Run:
         r.text = _DIFF
         return r
 
-    def review_diff(self, hunks, installation_id, pr_context=None,
-                    file_contents=None, cross_file_contents=None,
-                    runtime_context=None, ci_context=None,
-                    repo_docs_context=None, voice="caveman", cancel_event=None):
-        self.seen_paths = [h.path for h in hunks]
-        self.docs_context = repo_docs_context
+    def review_diff(self, evidence, installation_id, voice="caveman", cancel_event=None):
+        self.seen_paths = [h.path for h in evidence.hunks]
+        self.docs_context = evidence.repo_docs_context
         return LlmReviewResponse(
             kind="reviewed", findings=tuple(self.findings),
             backend_used=Backend.POOLSIDE, model_name="m",
