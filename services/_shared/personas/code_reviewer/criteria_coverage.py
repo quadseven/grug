@@ -706,6 +706,18 @@ def _names_changed_doc(hunks: tuple[DiffHunk, ...], pr_title: str) -> bool:
     )
 
 
+def _state_criteria(
+    criteria: tuple[LinkedCriterion, ...], renamed: tuple[tuple[str, str], ...],
+) -> list[LinkedCriterion]:
+    """The runtime and `Live:` criteria a change must make true, less those
+    a production rename in the diff meets (#1379)."""
+    return [
+        c for c in criteria
+        if (_is_runtime_criterion(c.text) or _is_live_criterion(c.text))
+        and not _met_by_rename(c.text, renamed)
+    ]
+
+
 def _unmet_criteria_finding(
     criteria: tuple[LinkedCriterion, ...], hunks: tuple[DiffHunk, ...],
     production: list[DiffHunk], parsed: dict[str, _ParsedFile],
@@ -726,11 +738,7 @@ def _unmet_criteria_finding(
     if any(is_production_path(p) for p in removed_files) or _names_changed_doc(hunks, pr_title):
         return None
     anchor = _anchor(hunks, dead)
-    state = [
-        c for c in criteria
-        if (_is_runtime_criterion(c.text) or _is_live_criterion(c.text))
-        and not _met_by_rename(c.text, renamed)
-    ]
+    state = _state_criteria(criteria, renamed)
     if not (state and anchor):
         return None
     if not _diff_changes_runtime(production, parsed, dead, inert):
