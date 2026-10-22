@@ -315,17 +315,25 @@ def _unconstructed_classes(
     )
     live: set[_NewClass] = set()
     for path, lines in sources:
-        if _is_test_like(path) or path.lower().endswith(_DOC_SUFFIXES):
-            continue
-        for lineno, text in lines:
-            for word in set(_JS_WORD_RE.findall(text)) & by_name.keys():
-                if _only_typed(text, word):
-                    continue
-                live.update(
+        if not (_is_test_like(path) or path.lower().endswith(_DOC_SUFFIXES)):
+            live |= _classes_used(path, lines, by_name)
+    return [c for c in classes if c not in live]
+
+
+def _classes_used(
+    path: str, lines: Iterable[tuple[int, str]], by_name: dict[str, list[_NewClass]],
+) -> set[_NewClass]:
+    """Classes these lines use as more than an import or a type, outside
+    each class's own body."""
+    used: set[_NewClass] = set()
+    for lineno, text in lines:
+        for word in set(_JS_WORD_RE.findall(text)) & by_name.keys():
+            if not _only_typed(text, word):
+                used.update(
                     c for c in by_name[word]
                     if not (c.file == path and c.line <= lineno <= c.end)
                 )
-    return [c for c in classes if c not in live]
+    return used
 
 
 def _unconstructed_finding(cls: _NewClass) -> Finding:

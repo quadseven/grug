@@ -174,10 +174,8 @@ def _finding(path: str, line: int, message: str) -> Finding:
     )
 
 
-def _impossible_rate(
-    path: str, lines: list[tuple[str, int, str]], budget: list[int],
-) -> Finding | None:
-    """`budget` is the shared count of pair checks left, one cell."""
+def _stated_sizes(lines: list[tuple[str, int, str]]) -> set[int]:
+    """Sample sizes the file states, at most `MAX_SIZES`."""
     sizes: set[int] = set()
     for _kind, _line, text in lines:
         for size_re in _SIZE_RES:
@@ -185,20 +183,37 @@ def _impossible_rate(
                 n = int(m.group(1))
                 if 2 <= n <= 1_000_000 and len(sizes) < MAX_SIZES:
                     sizes.add(n)
+    return sizes
+
+
+def _impossible_in(text: str, sizes: set[int], budget: list[int]) -> list[str] | None:
+    """The line's percentages no stated size can give, or None once the
+    shared check budget runs out (not evaluated)."""
+    bad = []
+    for m in _DECIMAL_PCT_RE.finditer(text):
+        budget[0] -= len(sizes)
+        if budget[0] < 0:
+            return None
+        if float(f"{m.group(1)}.{m.group(2)}") <= 100 and not _possible(
+            m.group(1), m.group(2), sizes,
+        ):
+            bad.append(f"{m.group(1)}.{m.group(2)}%")
+    return bad
+
+
+def _impossible_rate(
+    path: str, lines: list[tuple[str, int, str]], budget: list[int],
+) -> Finding | None:
+    """`budget` is the shared count of pair checks left, one cell."""
+    sizes = _stated_sizes(lines)
     if not sizes:
         return None
     for kind, line, text in lines:
         if kind != "+" or not _RATE_WORD_RE.search(text):
             continue
-        bad = []
-        for m in _DECIMAL_PCT_RE.finditer(text):
-            budget[0] -= len(sizes)
-            if budget[0] < 0:
-                return None
-            if float(f"{m.group(1)}.{m.group(2)}") <= 100 and not _possible(
-                m.group(1), m.group(2), sizes,
-            ):
-                bad.append(f"{m.group(1)}.{m.group(2)}%")
+        bad = _impossible_in(text, sizes, budget)
+        if bad is None:
+            return None
         if bad:
             stated = ", ".join(str(n) for n in sorted(sizes)[:6])
             return _finding(path, line, (
@@ -227,17 +242,23 @@ def _simulated_result(path: str, lines: list[tuple[str, int, str]]) -> Finding |
     ))
 
 
-def _unbacked_audit(
-    path: str, lines: list[tuple[str, int, str]], raw_elsewhere: bool,
-) -> Finding | None:
-    added = [(line, text) for kind, line, text in lines if kind == "+"]
-    if not added:
-        return None
+def _dated_audit_claim(path: str, added: list[tuple[int, str]]) -> int | None:
+    """The line of an audit claim in a dated audit doc, or None."""
     title = next((t for _ln, t in added if t.lstrip().startswith("#")), "")
     if not (_AUDIT_TITLE_RE.search(path.rsplit("/", 1)[-1]) or _AUDIT_TITLE_RE.search(title)):
         return None
     claim = next((ln for ln, t in added if _AUDIT_CLAIM_RE.search(t)), None)
     if claim is None or not any(_DATE_RE.search(t) for _ln, t in added):
+        return None
+    return claim
+
+
+def _unbacked_audit(
+    path: str, lines: list[tuple[str, int, str]], raw_elsewhere: bool,
+) -> Finding | None:
+    added = [(line, text) for kind, line, text in lines if kind == "+"]
+    claim = _dated_audit_claim(path, added)
+    if claim is None:
         return None
     if raw_elsewhere or any(_FENCE_RE.match(t) or _RUN_LINK_RE.search(t) for _ln, t in added):
         return None
@@ -284,17 +305,23 @@ def scan_fabricated_results(
     paths = {c.path for c in changes} | set(by_path)
     raw_elsewhere = any(_RAW_OUTPUT_PATH_RE.search(p) for p in paths)
     budget = [MAX_RATE_CHECKS]
-    findings: list[Finding] = []
-    for path, lines in by_path.items():
-        if is_test_file(path):
-            continue
-        found = None
-        if _suffix(path, _RESULT_SUFFIXES):
-            found = _impossible_rate(path, lines, budget) or _simulated_result(path, lines)
-            if found is None and path in added_files and _suffix(path, _DOC_SUFFIXES):
-                found = _unbacked_audit(path, lines, raw_elsewhere)
-        elif _suffix(path, _CODE_SUFFIXES):
-            found = _percent_from_count(path, lines)
-        if found is not None:
-            findings.append(found)
-    return tuple(findings)
+    found = (
+        _file_finding(path, lines, budget, path in added_files, raw_elsewhere)
+        for path, lines in by_path.items() if not is_test_file(path)
+    )
+    return tuple(f for f in found if f is not None)
+
+
+def _file_finding(
+    path: str, lines: list[tuple[str, int, str]], budget: list[int],
+    added: bool, raw_elsewhere: bool,
+) -> Finding | None:
+    """The one finding a results file or a code file can carry, or None."""
+    if _suffix(path, _CODE_SUFFIXES) and not _suffix(path, _RESULT_SUFFIXES):
+        return _percent_from_count(path, lines)
+    if not _suffix(path, _RESULT_SUFFIXES):
+        return None
+    found = _impossible_rate(path, lines, budget) or _simulated_result(path, lines)
+    if found is None and added and _suffix(path, _DOC_SUFFIXES):
+        found = _unbacked_audit(path, lines, raw_elsewhere)
+    return found
