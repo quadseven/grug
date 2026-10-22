@@ -362,6 +362,43 @@ def _mentions(text: str, index: dict[str, set[str]]) -> set[str]:
     return found
 
 
+def _reference_candidates(new_files: frozenset[str]) -> set[str]:
+    """New production scripts and modules outside discovered locations,
+    with a stem specific enough to prove a mention."""
+    return {
+        path for path in new_files
+        if _is_production(path)
+        and path.endswith(_SCRIPT_SUFFIXES)
+        and not _is_discovered(path)
+        and path.rsplit("/", 1)[-1].rsplit(".", 1)[0].lower() not in _GENERIC_STEMS
+    }
+
+
+def _added_text_by_file(hunks: tuple[DiffHunk, ...]) -> dict[str, str] | None:
+    """Each file's added text, or None past `MAX_REFERENCE_SCAN_CHARS`."""
+    lines_by_file: dict[str, list[str]] = {}
+    size = 0
+    for hunk in hunks:
+        for _, text in added_lines(hunk):
+            size += len(text) + 1
+            lines_by_file.setdefault(hunk.file_path, []).append(text)
+        if size > MAX_REFERENCE_SCAN_CHARS:
+            return None
+    return {path: "\n".join(lines) for path, lines in lines_by_file.items()}
+
+
+def _reached_candidates(candidates: set[str], edges: dict[str, set[str]]) -> set[str]:
+    """Candidates some non-candidate file reaches through the name graph."""
+    stack = [p for p in edges if p not in candidates]
+    seen = set(stack)
+    while stack:
+        for target in edges.get(stack.pop(), ()):
+            if target not in seen:
+                seen.add(target)
+                stack.append(target)
+    return candidates & seen
+
+
 def _unreferenced_new_files(
     new_files: frozenset[str], hunks: tuple[DiffHunk, ...], pr_body: str,
 ) -> frozenset[str] | None:
@@ -376,47 +413,22 @@ def _unreferenced_new_files(
 
     Cost: one index of candidate spellings, one linear word scan of each
     file's added text, one graph traversal."""
-    candidates = {
-        path for path in new_files
-        if _is_production(path)
-        and path.endswith(_SCRIPT_SUFFIXES)
-        and not _is_discovered(path)
-        and path.rsplit("/", 1)[-1].rsplit(".", 1)[0].lower() not in _GENERIC_STEMS
-    }
+    candidates = _reference_candidates(new_files)
     if not candidates:
         return frozenset()
     if len(candidates) > MAX_REFERENCE_CANDIDATES:
         return None
-    added_by_file: dict[str, list[str]] = {}
-    size = 0
-    for hunk in hunks:
-        for _, text in added_lines(hunk):
-            size += len(text) + 1
-            added_by_file.setdefault(hunk.file_path, []).append(text)
-        if size > MAX_REFERENCE_SCAN_CHARS:
-            return None
+    added = _added_text_by_file(hunks)
+    if added is None:
+        return None
     index: dict[str, set[str]] = {}
     for path in candidates:
         for token in _name_tokens(path):
             index.setdefault(token, set()).add(path)
-    declared = _mentions(_entry_point_text(pr_body), index)
-    candidates -= declared
+    candidates -= _mentions(_entry_point_text(pr_body), index)
     # Edges: file -> candidates its added text names (never itself).
-    edges = {
-        path: _mentions("\n".join(lines), index) - {path}
-        for path, lines in added_by_file.items()
-    }
-    referenced: set[str] = set()
-    stack = [p for p in edges if p not in candidates]
-    seen = set(stack)
-    while stack:
-        for target in edges.get(stack.pop(), ()):
-            if target in candidates and target not in referenced:
-                referenced.add(target)
-            if target not in seen:
-                seen.add(target)
-                stack.append(target)
-    return frozenset(candidates - referenced)
+    edges = {path: _mentions(text, index) - {path} for path, text in added.items()}
+    return frozenset(candidates - _reached_candidates(candidates, edges))
 
 
 def _statement_lines(stmt: ast.stmt) -> range:
@@ -629,6 +641,35 @@ def _diff_changes_runtime(
     )
 
 
+def _unmet_criteria_finding(
+    criteria: tuple[LinkedCriterion, ...], hunks: tuple[DiffHunk, ...],
+    production: list[DiffHunk], parsed: dict[str, _ParsedFile],
+    dead: list[_NewDef], inert: frozenset[str], new_files: frozenset[str],
+    pr_title: str,
+) -> Finding | None:
+    """One high `intent-mismatch` for the criteria no hunk can meet, or None.
+
+    First: nothing in the diff runs, so every runtime and `Live:` criterion
+    is unmet. Else: every such criterion is a live-state check, and nothing
+    in the diff manages that state."""
+    anchor = _anchor(hunks, dead)
+    state = [
+        c for c in criteria
+        if _is_runtime_criterion(c.text) or _is_live_criterion(c.text)
+    ]
+    if not (state and anchor):
+        return None
+    if not _diff_changes_runtime(production, parsed, dead, inert):
+        stranded = tuple(sorted(p for p in inert if any(h.file_path == p for h in hunks)))
+        return _mismatch_finding(state, anchor, dead, pr_title, stranded)
+    if all(_is_live_state_criterion(c.text) for c in state) and not _manages_state(
+        production, new_files,
+    ):
+        scripts = tuple(sorted({h.file_path for h in production}))
+        return _live_state_finding(state, anchor, scripts, pr_title)
+    return None
+
+
 def scan_criteria_coverage(
     hunks: tuple[DiffHunk, ...],
     file_contents: dict[str, str],
@@ -656,23 +697,7 @@ def scan_criteria_coverage(
     ]
     # None (past the scan bounds) means not evaluated: nothing is inert.
     inert = _unreferenced_new_files(new_files, hunks, pr_body or "") or frozenset()
-    runtime_criteria = [c for c in criteria if _is_runtime_criterion(c.text)]
-    live_criteria = [c for c in criteria if _is_live_criterion(c.text)]
-    anchor = _anchor(hunks, dead)
-    if (
-        (runtime_criteria or live_criteria) and anchor
-        and not _diff_changes_runtime(production, parsed, dead, inert)
-    ):
-        unmet = [c for c in criteria if c in runtime_criteria or c in live_criteria]
-        stranded = tuple(sorted(p for p in inert if any(h.file_path == p for h in hunks)))
-        findings.append(_mismatch_finding(unmet, anchor, dead, pr_title, stranded))
-        return tuple(findings)
-    state_criteria = runtime_criteria + [c for c in live_criteria if c not in runtime_criteria]
-    if (
-        state_criteria and anchor
-        and all(_is_live_state_criterion(c.text) for c in state_criteria)
-        and not _manages_state(production, new_files)
-    ):
-        scripts = tuple(sorted({h.file_path for h in production}))
-        findings.append(_live_state_finding(state_criteria, anchor, scripts, pr_title))
-    return tuple(findings)
+    unmet = _unmet_criteria_finding(
+        criteria, hunks, production, parsed, dead, inert, new_files, pr_title,
+    )
+    return tuple(findings + ([unmet] if unmet else []))

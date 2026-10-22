@@ -559,6 +559,32 @@ class FileChange:
 _SIMILARITY_RE = re.compile(r"^similarity index (\d+)%$")
 
 
+def _block_header(
+    lines: list[str], old: str, new: str,
+) -> tuple[str, str | None, int | None, str, int]:
+    """(status, previous path, similarity, new path, index of the first
+    hunk line) from one file block's extended header."""
+    status, previous, similarity = "modified", None, None
+    for i, line in enumerate(lines):
+        if line.startswith("@@"):
+            return status, previous, similarity, new, i
+        if line.startswith("new file mode"):
+            status = "added"
+        elif line.startswith("deleted file mode"):
+            status = "removed"
+        elif line.startswith("rename from "):
+            status, previous = "renamed", line[len("rename from "):]
+        elif line.startswith("+++ "):
+            target = _NEW_FILE_RE.match(line)
+            if target and target.group(1) != "/dev/null":
+                new = target.group(1)
+        elif sim := _SIMILARITY_RE.match(line):
+            similarity = int(sim.group(1))
+    if status == "renamed" and previous is None:
+        previous = old
+    return status, previous, similarity, new, len(lines)
+
+
 def file_changes(unified_diff: str) -> tuple[FileChange, ...]:
     """Per-file status and line counts, in diff order.
 
@@ -569,40 +595,14 @@ def file_changes(unified_diff: str) -> tuple[FileChange, ...]:
     out: list[FileChange] = []
     for block in re.split(r"(?m)^(?=diff --git )", unified_diff or ""):
         lines = block.splitlines()
-        if not lines:
-            continue
-        m = _DIFF_GIT_RE.match(lines[0])
+        m = _DIFF_GIT_RE.match(lines[0]) if lines else None
         if not m:
             continue
-        old, new = m.group(1), m.group(2)
-        status, previous, similarity = "modified", None, None
-        added = removed = 0
-        in_hunk = False
-        for line in lines[1:]:
-            if not in_hunk:
-                if line.startswith("new file mode"):
-                    status = "added"
-                elif line.startswith("deleted file mode"):
-                    status = "removed"
-                elif line.startswith("rename from "):
-                    status, previous = "renamed", line[len("rename from "):]
-                elif line.startswith("+++ "):
-                    target = _NEW_FILE_RE.match(line)
-                    if target and target.group(1) != "/dev/null":
-                        new = target.group(1)
-                else:
-                    sim = _SIMILARITY_RE.match(line)
-                    if sim:
-                        similarity = int(sim.group(1))
-                if line.startswith("@@"):
-                    in_hunk = True
-                continue
-            if line.startswith("+"):
-                added += 1
-            elif line.startswith("-"):
-                removed += 1
-        if status == "renamed" and previous is None:
-            previous = old
+        old = m.group(1)
+        status, previous, similarity, new, start = _block_header(lines[1:], old, m.group(2))
+        body = lines[1 + start:]
+        added = sum(1 for line in body if line.startswith("+"))
+        removed = sum(1 for line in body if line.startswith("-"))
         path = old if status == "removed" else new
         out.append(FileChange(path, status, previous, similarity, added, removed))
     return tuple(out)

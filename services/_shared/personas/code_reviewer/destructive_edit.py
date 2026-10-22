@@ -136,6 +136,29 @@ def _finding(
     )
 
 
+def _check(
+    change: FileChange, base_line_counts: dict[str, int], asked: str,
+    hunks: tuple[DiffHunk, ...],
+) -> Finding | None:
+    """The finding for one changed file, or None."""
+    old = change.previous_path or change.path
+    if change.status not in ("modified", "renamed"):
+        return None
+    if is_test_file(old) or is_review_excluded_path(old):
+        return None
+    floor = MIN_DELETED_FRONT_DOOR if _is_front_door(old) else MIN_DELETED
+    base_lines = base_line_counts.get(old)
+    share = _deleted_share(change, base_lines)
+    if change.removed < floor or share is None or share < REPLACED_SHARE:
+        return None
+    if _named(old, asked) or _named(change.path, asked):
+        return None
+    if _moved_share(change.path, hunks) >= MOVED_SHARE:
+        return None
+    anchor = _anchor(change.path, hunks)
+    return _finding(change, anchor, base_lines, share) if anchor else None
+
+
 def scan_destructive_edits(
     changes: Iterable[FileChange],
     base_line_counts: dict[str, int],
@@ -146,26 +169,5 @@ def scan_destructive_edits(
 ) -> tuple[Finding, ...]:
     """One finding per mostly-deleted file the title and criteria do not name."""
     asked = "\n".join([pr_title or "", *(c.text for c in criteria)])
-    findings: list[Finding] = []
-    for change in changes:
-        if change.status not in ("modified", "renamed"):
-            continue
-        old = change.previous_path or change.path
-        if is_test_file(old) or is_review_excluded_path(old):
-            continue
-        floor = MIN_DELETED_FRONT_DOOR if _is_front_door(old) else MIN_DELETED
-        if change.removed < floor:
-            continue
-        base_lines = base_line_counts.get(old)
-        share = _deleted_share(change, base_lines)
-        if share is None or share < REPLACED_SHARE:
-            continue
-        if _named(old, asked) or _named(change.path, asked):
-            continue
-        if _moved_share(change.path, hunks) >= MOVED_SHARE:
-            continue
-        anchor = _anchor(change.path, hunks)
-        if anchor is None:
-            continue
-        findings.append(_finding(change, anchor, base_lines, share))
-    return tuple(findings)
+    found = (_check(change, base_line_counts, asked, hunks) for change in changes)
+    return tuple(f for f in found if f is not None)
